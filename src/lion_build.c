@@ -107,6 +107,15 @@
  * the real page's image overwrites them), and the fork is fsynced at the end
  * unless the relation is temporary, because none of these writes went through
  * shared buffers and a checkpoint during the build cannot know about them.
+ *
+ * The writer keeps the Relation, not its SMgrRelation, and asks
+ * RelationGetSmgr() for the handle at every write, as 16's nbtsort.c does:
+ * the handle does not survive a relcache flush, and an sinval reset during
+ * the write phase - which any lock taken meanwhile can bring, a spilling
+ * tuplesort's PrepareTempTablespaces() for one - closes every handle there is
+ * (RelationCacheInvalidate() calls smgrcloseall()).  From 17 on a handle
+ * stays valid to the end of the transaction, which is what lets 17's own bulk
+ * writer keep one.
  */
 #define LION_BULK_PENDING	64
 
@@ -119,7 +128,7 @@ typedef struct LionPendingWrite
 
 struct BulkWriteState
 {
-	SMgrRelation smgr;
+	Relation	rel;			/* RelationGetSmgr() at every use: see above */
 	ForkNumber	forknum;
 	RelFileLocator locator;
 	bool		use_wal;
@@ -144,12 +153,12 @@ smgr_bulk_start_rel(Relation rel, ForkNumber forknum)
 {
 	BulkWriteState *bw = palloc0(sizeof(BulkWriteState));
 
-	bw->smgr = RelationGetSmgr(rel);
+	bw->rel = rel;
 	bw->forknum = forknum;
 	bw->locator = rel->rd_locator;
 	bw->use_wal = RelationNeedsWAL(rel) || forknum == INIT_FORKNUM;
 	bw->need_sync = !RelationUsesLocalBuffers(rel);
-	bw->pages_written = smgrnblocks(bw->smgr, forknum);
+	bw->pages_written = smgrnblocks(RelationGetSmgr(rel), forknum);
 	bw->memcxt = CurrentMemoryContext;
 
 	return bw;
@@ -199,19 +208,21 @@ lion_bulk_flush(BulkWriteState *bw)
 				bw->zeropage = MemoryContextAllocAligned(bw->memcxt, BLCKSZ,
 														 PG_IO_ALIGN_SIZE,
 														 MCXT_ALLOC_ZERO);
-			smgrextend(bw->smgr, bw->forknum, bw->pages_written++,
-					   bw->zeropage->data, true);
+			smgrextend(RelationGetSmgr(bw->rel), bw->forknum,
+					   bw->pages_written++, bw->zeropage->data, true);
 		}
 
 		PageSetChecksumInplace(page, blkno);
 
 		if (blkno == bw->pages_written)
 		{
-			smgrextend(bw->smgr, bw->forknum, blkno, page, true);
+			smgrextend(RelationGetSmgr(bw->rel), bw->forknum, blkno, page,
+					   true);
 			bw->pages_written++;
 		}
 		else
-			smgrwrite(bw->smgr, bw->forknum, blkno, page, true);
+			smgrwrite(RelationGetSmgr(bw->rel), bw->forknum, blkno, page,
+					  true);
 
 		pfree(page);
 	}
@@ -238,7 +249,7 @@ smgr_bulk_finish(BulkWriteState *bw)
 {
 	lion_bulk_flush(bw);
 	if (bw->need_sync)
-		smgrimmedsync(bw->smgr, bw->forknum);
+		smgrimmedsync(RelationGetSmgr(bw->rel), bw->forknum);
 	if (bw->zeropage != NULL)
 		pfree(bw->zeropage);
 	pfree(bw);
@@ -1386,6 +1397,16 @@ typedef struct LionSumBucketHdr
 } LionSumBucketHdr;
 
 /*
+ * What a column's summaries take of maintenance_work_mem while its values are
+ * written: LION_SUM_SHARE_KB for the codes of the bucket being collected and,
+ * once a bucket outgrows that, as much for the tuplesort that takes them over
+ * (lion_sum_add()).  The two meet only while the codes move from one to the
+ * other, and the spool leaves the summaries both (lionbuild()).
+ */
+#define LION_SUM_SHARE_KB	Max(maintenance_work_mem / 8, 64)
+#define LION_SUM_MEMORY		((Size) LION_SUM_SHARE_KB * 1024 * 2)
+
+/*
  * Does the key column being written get summaries?  Only an ordered scalar
  * column can: a summary is the union of a RUN of keys, which needs an order,
  * and a multi-key column's entries are extracted keys, not column values.
@@ -1413,12 +1434,11 @@ lion_sum_begin(LionBuildState *bs, LionState *col)
 	/*
 	 * A bucket is normally summary_tids codes and a key's worth more, which
 	 * is a few hundred kilobytes.  One key can be far larger than that - a
-	 * column of few keys with summaries = on - and past a quarter of
-	 * maintenance_work_mem the rest of such a bucket is sorted by a tuplesort,
-	 * which spills.
+	 * column of few keys with summaries = on - and past LION_SUM_SHARE_KB
+	 * kilobytes of codes the rest of such a bucket is sorted by a tuplesort of
+	 * as much, which spills, and the array goes (lion_sum_add()).
 	 */
-	sum->maxcodes = Max((int64) maintenance_work_mem * 1024L / 4 /
-						(int64) sizeof(uint64), (int64) 8192);
+	sum->maxcodes = (int64) LION_SUM_SHARE_KB * 1024 / (int64) sizeof(uint64);
 	sum->sorted = true;
 	sum->lastrawcap = 64;
 	sum->lastraw = (char *) MemoryContextAlloc(sum->cxt, sum->lastrawcap);
@@ -1442,6 +1462,14 @@ lion_sum_add(LionSumBuild *sum, uint64 code)
 		sum->sorted = false;
 	sum->lastcode = code;
 
+	/* the first code after a bucket the tuplesort took (see below) */
+	if (sum->codes == NULL)
+	{
+		sum->capcodes = 1024;
+		sum->codes = (uint64 *) MemoryContextAlloc(sum->cxt,
+												   sizeof(uint64) * sum->capcodes);
+	}
+
 	if (sum->ncodes >= sum->capcodes)
 	{
 		if (sum->ncodes >= sum->maxcodes)
@@ -1451,7 +1479,7 @@ lion_sum_add(LionSumBuild *sum, uint64 code)
 
 			sum->sort = tuplesort_begin_datum(INT8OID, Int8LessOperator,
 											  InvalidOid, false,
-											  maintenance_work_mem / 4, NULL,
+											  LION_SUM_SHARE_KB, NULL,
 											  TUPLESORT_NONE);
 			MemoryContextSwitchTo(old);
 			for (i = 0; i < sum->ncodes; i++)
@@ -1459,6 +1487,14 @@ lion_sum_add(LionSumBuild *sum, uint64 code)
 								   Int64GetDatum((int64) sum->codes[i]), false);
 			tuplesort_putdatum(sum->sort, Int64GetDatum((int64) code), false);
 			sum->ncodes++;
+
+			/*
+			 * The array's share is the tuplesort's now: the array goes, and
+			 * the bucket after this one starts a small one again.
+			 */
+			pfree(sum->codes);
+			sum->codes = NULL;
+			sum->capcodes = 0;
 			return;
 		}
 		sum->capcodes = Min(sum->capcodes * 2, sum->maxcodes);
@@ -2158,6 +2194,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	LionOptions *opts = (LionOptions *) index->rd_options;
 	double		reltuples;
 	BulkWriteBuffer metabuf;
+	Size		sumreserve;
 	int			ncols;
 	int			c;
 
@@ -2277,13 +2314,18 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 		/*
 		 * A column's summaries (DESIGN.md §32) are collected while its values
-		 * are written and written after them, which is where they sort.
+		 * are written and written after them, which is where they sort.  What
+		 * they take comes out of the spool's maintenance_work_mem, not on top
+		 * of it.
 		 */
 		bs.sum = lion_sum_begin(&bs, bs.cur);
+		sumreserve = (bs.sum != NULL) ? LION_SUM_MEMORY : 0;
 		if (bs.reader != NULL)
-			lion_spool_reader_emit_column(bs.reader, c, lion_build_emit, &bs);
+			lion_spool_reader_emit_column(bs.reader, c, lion_build_emit, &bs,
+										  sumreserve);
 		else
-			lion_spool_emit_column(bs.spool, c, lion_build_emit, &bs);
+			lion_spool_emit_column(bs.spool, c, lion_build_emit, &bs,
+								   sumreserve);
 		if (bs.sum != NULL)
 		{
 			lion_sum_finish(&bs, bs.sum);

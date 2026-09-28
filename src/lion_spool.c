@@ -41,12 +41,23 @@
  * MEMORY is one budget for all the key columns together, not an even share
  * each (which the tuplesorts needed): a column takes what its keys cost, so a
  * boolean column takes a few bytes a row and a column of unique keys takes
- * the most.  It is checked when the scan moves to the next heap page, and
- * when it is exceeded the LARGEST columns are spilled until half of it is
- * free.  Spilling a column sorts its entries into directory order and writes
- * them to a logical tape as one RUN, after which its memory is reset; runs
- * only ever start and end at a page boundary, so no page's codes are split
- * between two of them.
+ * the most.  It is checked when the scan moves to the next heap page and
+ * after every LION_CHECK_KEYS keys - one row of a multi-key column can bring
+ * any number of them - and when it is exceeded the LARGEST columns are
+ * spilled until half of it is free.  Spilling a column sorts its entries into
+ * directory order and writes them to a logical tape as one RUN, after which
+ * its memory is reset.  A run can therefore end in the middle of a heap page,
+ * or of a row, and the codes one key has on that page then sit in two runs,
+ * out of order between them if a HOT chain's root offset came late.  Nothing
+ * minds: each run holds a key's codes in ascending order, and the merge
+ * orders a key's codes across its inputs whatever their order.
+ *
+ * The budget holds while the columns are written out too.  The entries of
+ * the columns not written yet are still in memory then, so before a column is
+ * merged the largest columns, that one included, are spilled until what is
+ * left, the merge's read buffers and what the caller needs besides - the
+ * build's summaries (DESIGN.md §32) - fit it together
+ * (lion_spool_merge_column()).
  *
  * The MERGE takes a column's runs and what is still in memory, k-way by key
  * (lion_merge_column()).  The inputs holding equal keys are merged by CODE,
@@ -56,7 +67,10 @@
  * smallest code came with, which matters for an opclass whose equality is
  * coarser than the bytes ('Alice' and 'alice' under citext, 1.0 and 1.00 as
  * numeric) and is what the sorted build wrote: its sort put the smallest code
- * of a key first.
+ * of a key first.  The keys of a colliding hash are one GROUP: the merge that
+ * feeds the build sorts their codes by a tuplesort in what the budget has
+ * left (lion_merge_materialise()), and a merge into a run copies their
+ * records as they are and leaves them to the next (lion_merge_copy_group()).
  *
  * A PARALLEL build (lion_build.c) gives each participant a spool of its own
  * and a shared fileset; at the end of its part of the scan a participant
@@ -70,13 +84,18 @@
  */
 #include "postgres.h"
 
+#include "access/tupdesc.h"
+#include "catalog/pg_operator_d.h"
+#include "catalog/pg_type_d.h"
 #include "commands/tablespace.h"
 #include "common/hashfn.h"
+#include "executor/tuptable.h"
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
 #include "utils/logtape.h"
 #include "utils/memutils.h"
 #include "utils/sortsupport.h"
+#include "utils/tuplesort.h"
 #include "varatt.h"
 
 #include "lion.h"
@@ -96,6 +115,12 @@
 
 /* The most codes one key can have on one heap page. */
 #define LION_PAGE_CODES		(1 << LION_OFFSET_BITS)
+
+/*
+ * The budget is checked at every heap page and every this many keys, which
+ * one row of a multi-key column can bring any number of.
+ */
+#define LION_CHECK_KEYS		1024
 
 /*
  * A record's flags.  TIED: the next record of the same run has the same
@@ -190,6 +215,7 @@ struct LionSpool
 	bool		haveblk;
 	double		ntids;			/* (key, code) pairs added */
 	int			nspills;		/* runs spilled, all columns together */
+	int			unchecked;		/* pairs added since the budget was checked */
 };
 
 struct LionSpoolReader
@@ -200,6 +226,8 @@ struct LionSpoolReader
 	LogicalTapeSet *tapes;
 	int			nparts;
 	struct LionRunCursor **curs;
+	Size		membytes;		/* what the merge may use */
+	Size		readbuf;		/* the read buffer of one participant's tape */
 };
 
 /* A record's header on a tape, followed by its key and its code chunks. */
@@ -290,6 +318,8 @@ typedef struct LionMerge
 	LionState  *state;
 	SortSupportData ssup;		/* an ordered column's full comparison */
 	MemoryContext cxt;			/* a materialised group, reset after it */
+	int			workmem;		/* ... whose sort may use this many kB */
+	LionRunWriter *out;			/* a merge into a run: the run, or NULL */
 } LionMerge;
 
 struct LionSpoolGroup
@@ -305,11 +335,21 @@ struct LionSpoolGroup
 	uint64		limit;			/* ... while its codes stay below this */
 	bool		havelimit;
 
-	/* a hash collision: every entry's codes, sorted */
+	/*
+	 * A hash collision: (code, distinct key) pairs through a sort, and the
+	 * entries of the code being handed out (lion_merge_materialise()).
+	 */
 	bool		materialised;
-	uint64	  **codes;
-	uint64	   *ncodes;
-	uint64	   *pos;
+	Tuplesortstate *sort;
+	TupleTableSlot *slot;
+	int		   *entrypos;		/* a distinct key's place in entries[] */
+	bool		havenext;		/* the sort's next pair, read ahead */
+	uint64		nextcode;
+	int			nextentry;
+	uint64		tiecode;
+	int		   *tie;			/* its entries, in entries[] order */
+	int			ntie;
+	int			itie;
 };
 
 static void lion_spool_spill_column(LionSpool *sp, LionAccCol *col);
@@ -551,6 +591,7 @@ lion_acc_add(LionSpool *sp, LionAccCol *col, Datum key, uint64 code)
 		lion_acc_append(col, e, code);
 	}
 	sp->ntids += 1;
+	sp->unchecked++;
 }
 
 static void
@@ -564,6 +605,7 @@ lion_acc_add_reserved(LionSpool *sp, LionAccCol *col, int kind, uint64 code)
 	else
 		lion_acc_append(col, col->reserved[i], code);
 	sp->ntids += 1;
+	sp->unchecked++;
 }
 
 /* ---------------------------------------------------------------------
@@ -1099,6 +1141,40 @@ lion_cursor_next_record(LionRunCursor *c)
  * Groups
  * --------------------------------------------------------------------- */
 
+static int
+lion_int_cmp(const void *a, const void *b)
+{
+	int			x = *(const int *) a;
+	int			y = *(const int *) b;
+
+	return (x > y) - (x < y);
+}
+
+/* A materialised group's next (code, entry) pair, read ahead from its sort. */
+static void
+lion_group_read(LionSpoolGroup *g)
+{
+	bool		isnull;
+
+	g->havenext = tuplesort_gettupleslot(g->sort, true, false, g->slot, NULL);
+	if (g->havenext)
+	{
+		g->nextcode = (uint64) DatumGetInt64(slot_getattr(g->slot, 1,
+														  &isnull));
+		g->nextentry = g->entrypos[DatumGetInt32(slot_getattr(g->slot, 2,
+															  &isnull))];
+	}
+}
+
+/* The sort of a materialised group, once everything has been read from it. */
+static void
+lion_group_end(LionSpoolGroup *g)
+{
+	ExecClearTuple(g->slot);
+	tuplesort_end(g->sort);
+	g->sort = NULL;
+}
+
 int
 lion_spool_group_size(const LionSpoolGroup *group)
 {
@@ -1186,63 +1262,58 @@ lion_spool_group_next(LionSpoolGroup *group, int *entry, uint64 *code)
 		return true;
 	}
 
-	/* a materialised group: the same, over its arrays */
+	/*
+	 * A materialised group: its sort's pairs, which come in code order.  A
+	 * code more than one entry has - a row of a multi-key column with two
+	 * keys of one hash - goes to them in their order in entries[].
+	 */
+	if (group->itie >= group->ntie)
 	{
-		int			best = -1;
-
-		if (group->active >= 0 &&
-			group->pos[group->active] < group->ncodes[group->active] &&
-			(!group->havelimit ||
-			 group->codes[group->active][group->pos[group->active]] < group->limit))
-			best = group->active;
-		else
+		if (!group->havenext)
+			return false;
+		group->tiecode = group->nextcode;
+		group->ntie = 0;
+		group->itie = 0;
+		do
 		{
-			uint64		second = 0;
-			bool		havesecond = false;
+			/* more of them than entries means an entry has it twice */
+			if (group->ntie >= group->nentries)
+				elog(ERROR, "lion index build: a code appears twice under one key");
+			group->tie[group->ntie++] = group->nextentry;
+			lion_group_read(group);
+		} while (group->havenext && group->nextcode == group->tiecode);
 
-			for (i = 0; i < group->nentries; i++)
+		if (group->ntie > 1)
+		{
+			qsort(group->tie, group->ntie, sizeof(int), lion_int_cmp);
+			for (i = 1; i < group->ntie; i++)
 			{
-				uint64		x;
-
-				if (group->pos[i] >= group->ncodes[i])
-					continue;
-				x = group->codes[i][group->pos[i]];
-				if (best < 0 || x < group->codes[best][group->pos[best]])
-				{
-					if (best >= 0)
-					{
-						second = group->codes[best][group->pos[best]];
-						havesecond = true;
-					}
-					best = i;
-				}
-				else if (!havesecond || x < second)
-				{
-					second = x;
-					havesecond = true;
-				}
+				if (group->tie[i - 1] == group->tie[i])
+					elog(ERROR, "lion index build: a code appears twice under one key");
 			}
-			if (best < 0)
-				return false;
-			group->active = best;
-			group->limit = second;
-			group->havelimit = havesecond;
 		}
-		*entry = best;
-		*code = group->codes[best][group->pos[best]++];
-		return true;
 	}
+	*entry = group->tie[group->itie++];
+	*code = group->tiecode;
+	return true;
 }
 
 /* ---------------------------------------------------------------------
  * The merge
  * --------------------------------------------------------------------- */
 
+/*
+ * A merge of one column.  With out, it writes a run; otherwise a group of
+ * more than one key is sorted in cxt, in workmem kB.
+ */
 static void
-lion_merge_init(LionMerge *m, LionState *state, MemoryContext cxt)
+lion_merge_init(LionMerge *m, LionState *state, MemoryContext cxt,
+				LionRunWriter *out, int workmem)
 {
 	m->state = state;
 	m->cxt = cxt;
+	m->out = out;
+	m->workmem = workmem;
 	if (state->ordered)
 	{
 		memset(&m->ssup, 0, sizeof(m->ssup));
@@ -1286,23 +1357,18 @@ lion_merge_heap_cmp(Datum a, Datum b, void *arg)
 	return -c;
 }
 
-typedef struct LionMatRecord
+/*
+ * One distinct key of a materialised group, under the record its smallest
+ * code came with (see the file header).
+ */
+typedef struct LionMatEntry
 {
 	int			kind;
 	uint32		hash;
-	char	   *raw;
+	char	   *raw;			/* that record's stored bytes */
 	Size		rawlen;
-	Datum		key;
-	uint64	   *codes;
-	uint64		ncodes;
-	int			distinct;		/* the entry it is part of */
-} LionMatRecord;
-
-typedef struct LionMatEntry
-{
-	LionMatRecord *rep;			/* the record with the smallest code */
-	uint64		ncodes;
-	uint64	   *codes;
+	Datum		key;			/* lion_fetch_key() of raw */
+	uint64		firstcode;		/* ... and its smallest code */
 } LionMatEntry;
 
 typedef struct LionMatSortArg
@@ -1315,8 +1381,8 @@ static int
 lion_mat_entry_cmp(const void *a, const void *b, void *arg)
 {
 	LionMatSortArg *s = (LionMatSortArg *) arg;
-	const LionMatRecord *x = s->ents[*(const int *) a].rep;
-	const LionMatRecord *y = s->ents[*(const int *) b].rep;
+	const LionMatEntry *x = &s->ents[*(const int *) a];
+	const LionMatEntry *y = &s->ents[*(const int *) b];
 	int			c;
 
 	if (x->kind != y->kind)
@@ -1333,61 +1399,110 @@ lion_mat_entry_cmp(const void *a, const void *b, void *arg)
 }
 
 /*
- * The group's inputs hold more than one key between them: an unordered
- * opclass's hash collided, within one run or across several.  Read every
- * record of the group into memory, gather the records of each distinct key,
- * and order the keys by the directory's full order.  Collisions are rare and
- * this is the only place a key's codes are ever all in memory at once.
+ * The key a distinct key of a materialised group is written with: the bytes
+ * of the record its smallest code came with (see the file header).
+ */
+static void
+lion_mat_set_rep(LionMerge *m, LionMatEntry *e, LionRunCursor *c)
+{
+	if (e->raw != NULL)
+		pfree(e->raw);
+	e->kind = c->kind;
+	e->hash = c->hash;
+	e->rawlen = c->rawlen;
+	e->raw = palloc(Max(MAXALIGN(c->rawlen), 8));
+	if (c->rawlen > 0)
+		memcpy(e->raw, c->raw, c->rawlen);
+	e->key = (c->kind == LION_KIND_VALUE) ?
+		lion_fetch_key(m->state, e->raw) : (Datum) 0;
+	e->firstcode = c->firstcode;
+}
+
+/*
+ * The group's inputs hold more than one key between them - an unordered
+ * opclass's hash collided, within one run or across several, or an ordered
+ * one's comparison tied two keys its equality tells apart - and the group is
+ * for the build, which takes their codes interleaved in code order.  An input
+ * holds the group's records one after the other, so they cannot all be read
+ * at once; each is read once instead, its key matched to the group's distinct
+ * keys by the opclass equality and its codes put into a tuplesort as (code,
+ * distinct key) pairs.  The sort keeps what the group holds in memory within
+ * the merge's workmem however many codes its keys have - a key of a hundred
+ * million rows that collides with another brings all of them - and spills
+ * the rest.  The distinct keys are then put in the directory's full order,
+ * and lion_spool_group_next() hands the sorted pairs out.
+ *
+ * Matching costs an equality call per record and distinct key: for an
+ * opclass whose hash collides freely, one group holding the whole column,
+ * that is quadratic in the column's keys - as its accumulator's hash table
+ * already was, and as every lookup in its directory will be.
  */
 static void
 lion_merge_materialise(LionMerge *m, LionSpoolGroup *g, LionRunCursor **grp,
 					   int ngrp)
 {
 	MemoryContext old = MemoryContextSwitchTo(m->cxt);
-	LionMatRecord *recs;
-	int			nrecs = 0;
-	int			maxrecs = 8;
 	LionMatEntry *ents;
 	int			nents = 0;
+	int			maxents = 8;
 	int		   *order;
 	LionMatSortArg sarg;
+	TupleDesc	desc;
+	AttrNumber	sortcol = 1;
+	Oid			sortop = Int8LessOperator;
+	Oid			sortcoll = InvalidOid;
+	bool		nullsfirst = false;
+	TupleTableSlot *slot;
 	int			i;
 	int			j;
 
-	recs = palloc(sizeof(LionMatRecord) * maxrecs);
+	/* pairs go in through a virtual slot and come out through a minimal one */
+	desc = CreateTemplateTupleDesc(2);
+	TupleDescInitBuiltinEntry(desc, (AttrNumber) 1, "code", INT8OID, -1, 0);
+	TupleDescInitBuiltinEntry(desc, (AttrNumber) 2, "entry", INT4OID, -1, 0);
+	TupleDescFinalize(desc);
+	slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	g->slot = MakeSingleTupleTableSlot(desc, &TTSOpsMinimalTuple);
+	g->sort = tuplesort_begin_heap(desc, 1, &sortcol, &sortop, &sortcoll,
+								   &nullsfirst, m->workmem, NULL,
+								   TUPLESORT_NONE);
+
+	ents = palloc(sizeof(LionMatEntry) * maxents);
 	for (i = 0; i < ngrp; i++)
 	{
 		LionRunCursor *c = grp[i];
 
 		for (;;)
 		{
-			LionMatRecord *r;
-			uint64		cap = 64;
-
-			if (nrecs >= maxrecs)
+			for (j = 0; j < nents; j++)
 			{
-				maxrecs *= 2;
-				recs = repalloc(recs, sizeof(LionMatRecord) * maxrecs);
+				if (ents[j].kind == c->kind &&
+					(c->kind != LION_KIND_VALUE ||
+					 lion_keys_equal(m->state, ents[j].key, c->key)))
+					break;
 			}
-			r = &recs[nrecs++];
-			r->kind = c->kind;
-			r->hash = c->hash;
-			r->rawlen = c->rawlen;
-			r->raw = palloc(Max(MAXALIGN(c->rawlen), 8));
-			if (c->rawlen > 0)
-				memcpy(r->raw, c->raw, c->rawlen);
-			r->key = (c->kind == LION_KIND_VALUE) ?
-				lion_fetch_key(m->state, r->raw) : (Datum) 0;
-			r->codes = MemoryContextAllocHuge(m->cxt, sizeof(uint64) * cap);
-			r->ncodes = 0;
+			if (j == nents)
+			{
+				if (nents >= maxents)
+				{
+					maxents *= 2;
+					ents = repalloc(ents, sizeof(LionMatEntry) * maxents);
+				}
+				ents[nents].raw = NULL;
+				nents++;
+			}
+			if (ents[j].raw == NULL || c->firstcode < ents[j].firstcode)
+				lion_mat_set_rep(m, &ents[j], c);
+
 			while (c->hascode)
 			{
-				if (r->ncodes >= cap)
-				{
-					cap *= 2;
-					r->codes = repalloc_huge(r->codes, sizeof(uint64) * cap);
-				}
-				r->codes[r->ncodes++] = c->code;
+				ExecClearTuple(slot);
+				slot->tts_values[0] = Int64GetDatum((int64) c->code);
+				slot->tts_isnull[0] = false;
+				slot->tts_values[1] = Int32GetDatum(j);
+				slot->tts_isnull[1] = false;
+				ExecStoreVirtualTuple(slot);
+				tuplesort_puttupleslot(g->sort, slot);
 				lion_cursor_step(c);
 			}
 
@@ -1398,57 +1513,8 @@ lion_merge_materialise(LionMerge *m, LionSpoolGroup *g, LionRunCursor **grp,
 				elog(ERROR, "lion index build: a spilled run is out of order");
 		}
 	}
-
-	/* one entry per distinct key */
-	ents = palloc(sizeof(LionMatEntry) * nrecs);
-	for (i = 0; i < nrecs; i++)
-	{
-		LionMatRecord *r = &recs[i];
-
-		for (j = 0; j < nents; j++)
-		{
-			LionMatRecord *d = ents[j].rep;
-
-			if (d->kind == r->kind &&
-				(r->kind != LION_KIND_VALUE ||
-				 lion_keys_equal(m->state, d->key, r->key)))
-				break;
-		}
-		if (j == nents)
-		{
-			ents[nents].rep = r;
-			ents[nents].ncodes = 0;
-			nents++;
-		}
-		else if (r->codes[0] < ents[j].rep->codes[0])
-			ents[j].rep = r;
-		r->distinct = j;
-		ents[j].ncodes += r->ncodes;
-	}
-	for (j = 0; j < nents; j++)
-	{
-		uint64		n = 0;
-		int			nparts = 0;
-
-		ents[j].codes = MemoryContextAllocHuge(m->cxt,
-											   sizeof(uint64) * ents[j].ncodes);
-		for (i = 0; i < nrecs; i++)
-		{
-			if (recs[i].distinct != j)
-				continue;
-			memcpy(ents[j].codes + n, recs[i].codes,
-				   sizeof(uint64) * recs[i].ncodes);
-			n += recs[i].ncodes;
-			nparts++;
-		}
-		if (nparts > 1)
-			qsort(ents[j].codes, n, sizeof(uint64), lion_code_cmp);
-		for (i = 1; i < (int64) n; i++)
-		{
-			if (ents[j].codes[i - 1] >= ents[j].codes[i])
-				elog(ERROR, "lion index build: a code appears twice under one key");
-		}
-	}
+	ExecClearTuple(slot);
+	tuplesort_performsort(g->sort);
 
 	order = palloc(sizeof(int) * nents);
 	for (j = 0; j < nents; j++)
@@ -1460,30 +1526,89 @@ lion_merge_materialise(LionMerge *m, LionSpoolGroup *g, LionRunCursor **grp,
 	g->materialised = true;
 	g->nentries = nents;
 	g->entries = palloc(sizeof(LionSpoolEntry) * nents);
-	g->codes = palloc(sizeof(uint64 *) * nents);
-	g->ncodes = palloc(sizeof(uint64) * nents);
-	g->pos = palloc0(sizeof(uint64) * nents);
-	g->active = -1;
-	g->havelimit = false;
+	g->entrypos = palloc(sizeof(int) * nents);
+	g->tie = palloc(sizeof(int) * nents);
+	g->ntie = 0;
+	g->itie = 0;
 	for (j = 0; j < nents; j++)
 	{
 		LionMatEntry *e = &ents[order[j]];
 
-		g->entries[j].kind = e->rep->kind;
-		g->entries[j].hash = e->rep->hash;
-		g->entries[j].key = e->rep->key;
-		g->entries[j].raw = e->rep->raw;
-		g->entries[j].rawlen = e->rep->rawlen;
-		g->codes[j] = e->codes;
-		g->ncodes[j] = e->ncodes;
+		g->entries[j].kind = e->kind;
+		g->entries[j].hash = e->hash;
+		g->entries[j].key = e->key;
+		g->entries[j].raw = e->raw;
+		g->entries[j].rawlen = e->rawlen;
+		g->entrypos[order[j]] = j;
 	}
+	lion_group_read(g);
 
 	MemoryContextSwitchTo(old);
 }
 
 /*
+ * The same group in a merge that writes a run: its records are copied to the
+ * run as they are, one after the other and all of them but the last TIED to
+ * the next, and the merge that reads the run gathers them again.  Nothing of
+ * the group is held in memory, and the entries that come out of the last
+ * merge are the same: their keys are the records' with the smallest codes
+ * wherever those records went, and their codes are all of their records'.
+ */
+static void
+lion_merge_copy_group(LionMerge *m, LionRunCursor **grp, int ngrp)
+{
+	LionRunWriter *w = m->out;
+	int			i;
+
+	for (i = 0; i < ngrp; i++)
+	{
+		LionRunCursor *c = grp[i];
+
+		for (;;)
+		{
+			bool		more = (c->flags & LION_RUN_TIED) != 0;
+
+			lion_run_begin_record(w, c->kind,
+								  (more || i + 1 < ngrp) ? LION_RUN_TIED : 0,
+								  c->hash, c->raw, c->rawlen);
+			while (c->hascode)
+			{
+				lion_run_put_code(w, c->code);
+				lion_cursor_step(c);
+			}
+			lion_run_end_record(w);
+
+			if (!more)
+				break;
+			lion_cursor_next_record(c);
+			if (c->eos || lion_merge_prefix_cmp(m, c, grp[0]) != 0)
+				elog(ERROR, "lion index build: a spilled run is out of order");
+		}
+	}
+}
+
+/*
+ * One entry in a merge that writes a run, as one record: its key, and its
+ * codes merged from every input that has some.
+ */
+static void
+lion_run_emit(LionRunWriter *w, LionSpoolGroup *group)
+{
+	const LionSpoolEntry *e = &group->entries[0];
+	int			which;
+	uint64		code;
+
+	Assert(!group->materialised && group->nentries == 1);
+	lion_run_begin_record(w, (uint8) e->kind, 0, e->hash, e->raw, e->rawlen);
+	while (lion_spool_group_next(group, &which, &code))
+		lion_run_put_code(w, code);
+	lion_run_end_record(w);
+}
+
+/*
  * Merge one column's inputs, each already on its first record, and hand
- * every entry to emit in directory order.
+ * every entry to emit in directory order - or, in a merge into a run (m->out),
+ * write them to the run.
  */
 static void
 lion_merge_column(LionMerge *m, LionRunCursor **in, int nin,
@@ -1552,17 +1677,30 @@ lion_merge_column(LionMerge *m, LionRunCursor **in, int nin,
 			group.curs = grp;
 			group.ncurs = ngrp;
 			group.active = -1;
+			if (m->out != NULL)
+				lion_run_emit(m->out, &group);
+			else
+				emit(arg, &group);
 		}
+		else if (m->out != NULL)
+			lion_merge_copy_group(m, grp, ngrp);
 		else
+		{
 			lion_merge_materialise(m, &group, grp, ngrp);
-
-		emit(arg, &group);
+			emit(arg, &group);
+		}
 
 		/* whatever emit did not take is not wanted */
-		while (lion_spool_group_next(&group, &which, &code))
-			;
+		if (streaming || m->out == NULL)
+		{
+			while (lion_spool_group_next(&group, &which, &code))
+				;
+		}
 		if (group.materialised)
+		{
+			lion_group_end(&group);
 			MemoryContextReset(m->cxt);
+		}
 
 		for (i = 0; i < ngrp; i++)
 		{
@@ -1576,42 +1714,6 @@ lion_merge_column(LionMerge *m, LionRunCursor **in, int nin,
 
 	binaryheap_free(heap);
 	pfree(grp);
-}
-
-/* An emit that writes the entries to a run instead. */
-static void
-lion_run_emit(void *arg, LionSpoolGroup *group)
-{
-	LionRunWriter *w = (LionRunWriter *) arg;
-	int			which;
-	uint64		code;
-	int			i;
-
-	if (!group->materialised)
-	{
-		const LionSpoolEntry *e = &group->entries[0];
-
-		lion_run_begin_record(w, (uint8) e->kind, 0, e->hash, e->raw,
-							  e->rawlen);
-		while (lion_spool_group_next(group, &which, &code))
-			lion_run_put_code(w, code);
-		lion_run_end_record(w);
-		return;
-	}
-
-	for (i = 0; i < group->nentries; i++)
-	{
-		const LionSpoolEntry *e = &group->entries[i];
-		uint64		j;
-
-		lion_run_begin_record(w, (uint8) e->kind,
-							  (i + 1 < group->nentries) ? LION_RUN_TIED : 0,
-							  e->hash, e->raw, e->rawlen);
-		for (j = 0; j < group->ncodes[i]; j++)
-			lion_run_put_code(w, group->codes[i][j]);
-		group->pos[i] = group->ncodes[i];
-		lion_run_end_record(w);
-	}
 }
 
 /* ---------------------------------------------------------------------
@@ -1748,6 +1850,7 @@ lion_spool_spill_column(LionSpool *sp, LionAccCol *col)
 	int			n;
 	LogicalTape *tape;
 	LionRunWriter *w;
+	uint64	   *page = NULL;
 	int			i;
 
 	if (col->nentries == 0)
@@ -1773,7 +1876,16 @@ lion_spool_spill_column(LionSpool *sp, LionAccCol *col)
 		{
 			LionRunCursor c;
 
+			/*
+			 * A cursor of its own for each unsorted entry, and one page
+			 * buffer for all of them: a cursor allocates its own otherwise,
+			 * and nothing frees it before the spill is over, which with many
+			 * HOT-updated keys is many times the budget.
+			 */
+			if (page == NULL)
+				page = palloc(sizeof(uint64) * LION_PAGE_CODES);
 			lion_cursor_init_memory(&c, col->state, 0, &items[i], NULL, 1);
+			c.page = page;
 			lion_cursor_next_record(&c);
 			while (c.hascode)
 			{
@@ -1795,37 +1907,44 @@ lion_spool_spill_column(LionSpool *sp, LionAccCol *col)
 	sp->nspills++;
 }
 
+/* The column whose entries take the most, or NULL when none has any. */
+static LionAccCol *
+lion_spool_largest(LionSpool *sp)
+{
+	Size		largest = 0;
+	LionAccCol *victim = NULL;
+	int			c;
+
+	for (c = 0; c < sp->ncols; c++)
+	{
+		LionAccCol *col = &sp->cols[c];
+		Size		size = lion_acc_used(col);
+
+		if (col->nentries > 0 && size > largest)
+		{
+			largest = size;
+			victim = col;
+		}
+	}
+	return victim;
+}
+
 /*
- * Over the budget: spill the largest columns until half of it is free.  A
- * column of few keys takes little and is left alone, so it ends up with few
- * runs or none.
+ * The budget (see the file header).  Over it, spill the largest columns until
+ * half of it is free: a column of few keys takes little and is left alone, so
+ * it ends up with few runs or none.
  */
 static void
-lion_spool_spill_largest(LionSpool *sp)
+lion_spool_check(LionSpool *sp)
 {
-	for (;;)
-	{
-		Size		total = 0;
-		Size		largest = 0;
-		LionAccCol *victim = NULL;
-		int			c;
+	LionAccCol *victim;
 
-		for (c = 0; c < sp->ncols; c++)
-		{
-			LionAccCol *col = &sp->cols[c];
-			Size		size = lion_acc_used(col);
-
-			total += size;
-			if (col->nentries > 0 && size > largest)
-			{
-				largest = size;
-				victim = col;
-			}
-		}
-		if (victim == NULL || total <= sp->membytes / 2)
-			break;
+	sp->unchecked = 0;
+	if (lion_spool_memory(sp) <= sp->membytes)
+		return;
+	while (lion_spool_memory(sp) > sp->membytes / 2 &&
+		   (victim = lion_spool_largest(sp)) != NULL)
 		lion_spool_spill_column(sp, victim);
-	}
 }
 
 void
@@ -1838,19 +1957,17 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 
 	lion_check_key_offset(tid);
 
-	/* only ever between two heap pages (see the file header) */
-	if (!sp->haveblk || blk != sp->curblk)
+	/* the budget, at every heap page and every LION_CHECK_KEYS keys */
+	if (sp->haveblk && blk < sp->curblk)
 	{
-		if (sp->haveblk && blk < sp->curblk)
-		{
-			for (c = 0; c < sp->ncols; c++)
-				lion_spool_spill_column(sp, &sp->cols[c]);
-		}
-		else if (lion_spool_memory(sp) > sp->membytes)
-			lion_spool_spill_largest(sp);
-		sp->curblk = blk;
-		sp->haveblk = true;
+		for (c = 0; c < sp->ncols; c++)
+			lion_spool_spill_column(sp, &sp->cols[c]);
 	}
+	else if (!sp->haveblk || blk != sp->curblk ||
+			 sp->unchecked >= LION_CHECK_KEYS)
+		lion_spool_check(sp);
+	sp->curblk = blk;
+	sp->haveblk = true;
 
 	code = lion_tid_to_code(tid);
 	old = MemoryContextSwitchTo(sp->rowcxt);
@@ -1879,7 +1996,12 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 			if (nkeys == 0)
 				lion_acc_add_reserved(sp, col, LION_KIND_EMPTY, code);
 			for (i = 0; i < nkeys; i++)
+			{
 				lion_acc_add(sp, col, keys[i], code);
+				/* one row can have any number of them */
+				if (sp->unchecked >= LION_CHECK_KEYS)
+					lion_spool_check(sp);
+			}
 		}
 		else
 		{
@@ -1941,11 +2063,8 @@ lion_spool_reduce_runs(LionSpool *sp, LionAccCol *col, bool inmemory)
 			lion_cursor_next_record(in[i]);
 		}
 		w->tape = tape;
-		lion_merge_init(&m, col->state,
-						AllocSetContextCreate(sp->mergecxt,
-											  "lion build spool group",
-											  ALLOCSET_DEFAULT_SIZES));
-		lion_merge_column(&m, in, k, lion_run_emit, w);
+		lion_merge_init(&m, col->state, NULL, w, 0);
+		lion_merge_column(&m, in, k, NULL, NULL);
 		lion_run_end_column(tape);
 		LogicalTapeRewindForRead(tape, sp->readbuf);
 
@@ -1960,19 +2079,59 @@ lion_spool_reduce_runs(LionSpool *sp, LionAccCol *col, bool inmemory)
 	}
 }
 
-/* Merge a column's runs and what it has in memory into emit, and forget it. */
+/*
+ * What merging a column takes besides its entries: a read buffer and a chunk
+ * buffer for each run a merge pass reads, and while the column has entries in
+ * memory, the sorted list of them it reads them through.
+ */
+static Size
+lion_spool_merge_need(LionSpool *sp, LionAccCol *col)
+{
+	Size		need;
+
+	need = (Size) Min(col->nruns, sp->maxorder) *
+		(sp->readbuf + LION_RUN_CHUNK + LION_ESCAPED_MAX);
+	if (col->nentries > 0)
+		need += (Size) (col->nentries + 2) * (sizeof(LionSortItem) + 1);
+	return need;
+}
+
+/*
+ * Merge a column's runs and what it has in memory into emit - or, with out,
+ * into that run - and forget it.
+ *
+ * The entries of the columns not merged yet are still in memory, so before
+ * the merge the largest columns, this one included, are spilled until what is
+ * left, the merge's buffers and reserve - what emit needs for itself - fit the
+ * budget together; a group of more than one key is sorted in whatever it has
+ * left over (lion_merge_materialise()).
+ */
 static void
 lion_spool_merge_column(LionSpool *sp, int colno, LionSpoolEmit emit,
-						void *arg)
+						void *arg, LionRunWriter *out, Size reserve)
 {
 	LionAccCol *col = &sp->cols[colno];
-	bool		inmemory = (col->nentries > 0);
+	bool		inmemory;
 	MemoryContext old;
 	LionRunCursor **in;
 	int			nin = 0;
 	LionMerge	m;
+	Size		used;
+	int			workmem;
 	int			i;
 
+	for (;;)
+	{
+		LionAccCol *victim;
+
+		used = lion_spool_memory(sp) + lion_spool_merge_need(sp, col) + reserve;
+		if (used <= sp->membytes || (victim = lion_spool_largest(sp)) == NULL)
+			break;
+		lion_spool_spill_column(sp, victim);
+	}
+	workmem = (used < sp->membytes) ? (int) ((sp->membytes - used) / 1024) : 0;
+
+	inmemory = (col->nentries > 0);
 	if (col->nruns > 0)
 		lion_spool_reduce_runs(sp, col, inmemory);
 
@@ -1999,7 +2158,8 @@ lion_spool_merge_column(LionSpool *sp, int colno, LionSpoolEmit emit,
 
 	lion_merge_init(&m, col->state,
 					AllocSetContextCreate(sp->mergecxt, "lion build spool group",
-										  ALLOCSET_DEFAULT_SIZES));
+										  ALLOCSET_DEFAULT_SIZES),
+					out, Max(workmem, 64));
 	lion_merge_column(&m, in, nin, emit, arg);
 
 	for (i = 0; i < col->nruns; i++)
@@ -2011,10 +2171,11 @@ lion_spool_merge_column(LionSpool *sp, int colno, LionSpoolEmit emit,
 }
 
 void
-lion_spool_emit_column(LionSpool *sp, int col, LionSpoolEmit emit, void *arg)
+lion_spool_emit_column(LionSpool *sp, int col, LionSpoolEmit emit, void *arg,
+					   Size reserve)
 {
 	Assert(col >= 0 && col < sp->ncols);
-	lion_spool_merge_column(sp, col, emit, arg);
+	lion_spool_merge_column(sp, col, emit, arg, NULL, reserve);
 }
 
 /*
@@ -2037,7 +2198,7 @@ lion_spool_export(LionSpool *sp, TapeShare *share)
 	w->tape = out;
 	for (c = 0; c < sp->ncols; c++)
 	{
-		lion_spool_merge_column(sp, c, lion_run_emit, w);
+		lion_spool_merge_column(sp, c, NULL, NULL, w, 0);
 		lion_run_end_column(out);
 	}
 	old = MemoryContextSwitchTo(sp->cxt);
@@ -2078,6 +2239,8 @@ lion_spool_reader_begin(LionIndexState *ix, SharedFileSet *fileset,
 	rd->tapes = LogicalTapeSetCreate(false, fileset, -1);
 	readbuf = Max((Size) BLCKSZ,
 				  Min((Size) BLCKSZ * 32, membytes / 2 / Max(nparticipants, 1)));
+	rd->membytes = membytes;
+	rd->readbuf = readbuf;
 	rd->curs = palloc(sizeof(LionRunCursor *) * nparticipants);
 	for (i = 0; i < nparticipants; i++)
 	{
@@ -2099,15 +2262,22 @@ lion_spool_reader_begin(LionIndexState *ix, SharedFileSet *fileset,
 /*
  * One column's entries from every participant.  Each participant's tape holds
  * the columns in order, so the cursors carry on from where the column before
- * left them.
+ * left them.  A group of more than one key is sorted in what the budget has
+ * left once the tapes' buffers and reserve, what emit needs, are counted.
  */
 void
 lion_spool_reader_emit_column(LionSpoolReader *rd, int col,
-							  LionSpoolEmit emit, void *arg)
+							  LionSpoolEmit emit, void *arg, Size reserve)
 {
 	MemoryContext old = MemoryContextSwitchTo(rd->mergecxt);
 	LionMerge	m;
+	Size		used;
+	int			workmem;
 	int			i;
+
+	used = (Size) rd->nparts * (rd->readbuf + LION_RUN_CHUNK + LION_ESCAPED_MAX) +
+		reserve;
+	workmem = (used < rd->membytes) ? (int) ((rd->membytes - used) / 1024) : 0;
 
 	for (i = 0; i < rd->nparts; i++)
 	{
@@ -2116,7 +2286,8 @@ lion_spool_reader_emit_column(LionSpoolReader *rd, int col,
 	}
 	lion_merge_init(&m, &rd->ix->cols[col],
 					AllocSetContextCreate(rd->mergecxt, "lion build spool group",
-										  ALLOCSET_DEFAULT_SIZES));
+										  ALLOCSET_DEFAULT_SIZES),
+					NULL, Max(workmem, 64));
 	lion_merge_column(&m, rd->curs, rd->nparts, emit, arg);
 
 	MemoryContextSwitchTo(old);
