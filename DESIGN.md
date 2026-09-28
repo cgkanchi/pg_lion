@@ -5227,7 +5227,11 @@ list's union are `lion_cost_set_clause()`'s, what the driver walks and the other
 `lion_cost_set_pages()`'s, and the directory leaves the lookups read - one each, and no more of an
 index than its directory has - `lion_cost_leaf_pages()`'s; `lion_cost_set_and()` puts them
 together with `lion_merge_cpu_cost()` exactly as an ungrouped count does, and `lioncostestimate()`
-charges that for a scan's AND of two sets or more.
+charges that for a scan's AND of two sets or more. The rows the recheck is priced for
+(`lion_probe_rel_rows()`) are corrected by the intersection probe where the WHERE sets of one index
+are correlated (§29.11, "Correlated sets"). It measures what the open item below says nothing in
+the model could see - whether a count's sets are independent or correlated - but its answer is not
+yet used for the merge's own `1 - exp(-lambda)`.
 
 ### The open item: the node is charged for pages, its competitor for tuples
 
@@ -9150,7 +9154,8 @@ Lion's cost model now makes the same correction itself, from lion's directory (`
   index path - the selectivity `genericcostestimate()` prorates the index by, the entries
   `lion_range_entry_cost()` prices, the heap side priced from them, and so LionOrdered's lion side -
   and the count pushdown's paths (`lion_try_count_path()`: the range's share of its entries, and the
-  rows `lion_cost_count_rel()` and `lion_cost_range_sum()` recheck, `lion_probe_rel_rows()`). The
+  rows `lion_cost_count_rel()` and `lion_cost_range_sum()` recheck, `lion_probe_rel_rows()`, which
+  since 2026-09-28 also carries the intersection probe's correction, §29.11). The
   relation's row count and every other path's estimates stay core's. Core caches a clause's
   selectivity in its RestrictInfo the first time it is asked (`clause_selectivity_ext()`), so the
   scope clears that cache on each clause it corrects and puts it back when it ends.
@@ -9934,8 +9939,9 @@ sets", below: the merge is still the count's, and now so is everything else abou
 **One price for the AND of sets** (2026-09-28, `lion_cost_set_and()`). The count pushdown and a
 lion index scan make the same AND of the same posting sets, and were priced for it by two models.
 A benchmark's count over several correlated filters answered by one multicolumn index ran faster
-as `LionCount` than as the plain lion scan the planner chose, and was priced well above it. For
-the same clauses the two prices differed in:
+as `LionCount` than as the plain lion scan the planner chose, and was priced well above it, for
+two reasons; this is the first ("Correlated sets", below, is the second). For the same clauses
+the two prices differed in:
 
 - **the lookups.** The count charged each clause's directory leaf at `random_page_cost` and its
   descent, `LION_DESCENT_COST` a level (§21), and an IN list's values their leaves, read in key
@@ -10012,6 +10018,102 @@ not do: core prices a disabled bitmap path out of the lion-only relation the nod
 side from, and the node then shows `a = 3` whatever the price. The §31 comparison above of four
 sets against a btree's bitmap heap scan was made with the model this replaces and has not been made
 again.
+
+**Correlated sets** (2026-09-28, the intersection probe, `lion_isect_factor()` in
+lion_selfuncs.c; `pg_lion.enable_intersection_probe`, bool, default on, `PGC_USERSET`). The second
+reason: core estimates a conjunction as the product of its clauses' selectivities, and filters on
+columns derived from one hidden attribute are far from independent. The benchmark's came out a
+small fraction of their rows, the heap paths were priced for that, and the count, whose price
+barely depends on the rows, lost to them on paper. Each such clause is a posting set with an exact
+row count, and the index can AND the sets' containers at any container key, so lion measures the
+AND for its own estimates.
+
+- **What.** The probe locates each clause's sets as a scan locates them (`lion_scankey_sets()`,
+  §29.2's per-column trees), takes the source of the fewest rows as the driver, and reads it a
+  container at a time: the heap's container keys in strata, and the driver's first container in each
+  (`lion_stream_at()`), so that the sample spreads over the heap - every container of a heap of no
+  more container keys than strata. At each it ANDs the other sources' containers at that key, the
+  sources of fewer rows first, and stops at the first that has none. A sample counts for its
+  stratum's width, and the strata still ahead widen when the samples so far, at what they have cost,
+  would overrun the probe's budget, so that the sample covers the heap whatever the seeks cost
+  (`lion_isect_pass()`); a driver found in fewer than `LION_ISECT_MIN_KEYS` strata - rows in one
+  stretch of the heap, as a hidden attribute that follows the order the rows came in lays them out -
+  is sampled again, in strata of that stretch. The share of the driver's rows that survive, times
+  the driver's rows, is the conjunction's rows: the sets' exact count for one set or an IN list's
+  disjoint entries, core's estimate for a multi-key query of several keys, whose sets overlap.
+- **Where it can matter.** Two or more set clauses of one lion index with a value to look up at
+  plan time - an equality, an IN list of at most `LION_ISECT_MAX_SETS` values, `IS NULL`, a
+  multi-key query, each with a constant (a Param has none) - on an index that is neither partial
+  nor hypothetical, of a relation that is not an inheritance parent; and core's estimate of their
+  AND at most a third (`LION_ISECT_ERROR`) of the smallest clause's own, which is the most the AND
+  can hold. Independent clauses that are both selective pass that test as well; the probe then
+  finds what core estimated, and changes nothing. And only where the user may read every row of
+  those columns - SELECT on the table or on each column, no security barrier view's or row-level
+  policy's quals, an inheritance child judged by the table the query names - which is what core
+  asks before a column's statistics reach a user's function (`all_rows_selectable()`): the probe
+  counts the rows themselves, the ones the user may not see included, and EXPLAIN shows the
+  estimate.
+- **What it corrects.** A factor on core's estimate of the same clauses, applied when the probe
+  finds it `LION_ISECT_ERROR` (3) times off or more, either way: less is within what ANALYZE's
+  per-column estimates and the sample leave of an independent conjunction, and would move plans on
+  noise. It applies to lion's OWN estimates: the selectivity `lioncostestimate()` returns for a
+  plain or bitmap path - the Bitmap Index Scan's rows, the heap side of both paths, LionOrdered's
+  lion side (§30.3) - and the rows the count pushdown's recheck is priced for
+  (`lion_probe_rel_rows()`, the relation's restriction clauses on the lion index that answers most
+  of them). Whatever else a conjunction holds - a range, a clause without a constant - is taken as
+  independent of them, as core takes it.
+- **What it leaves.** `rel->rows`, and every other path's estimate, stay core's. Core sizes the
+  relation (`set_baserel_size_estimates()`) before it builds any of its paths; a row count
+  rewritten from `set_rel_pathlist_hook` would leave the paths built before it priced for another
+  relation than the ones built after, and core has no hook between the two, nor one for a
+  conjunction's selectivity. A future hook would have to run once the relation's restriction
+  clauses are attached and before its first path is built, and be allowed to read an index there.
+  Core's own answer to correlated columns applies to every path: `CREATE STATISTICS ...
+  (dependencies, mcv)` on them corrects core's estimate, and the probe then agrees with it and
+  changes nothing. Nor does the probe correct the merge's guess of how often the later sources are
+  sought (`lion_merge_cpu_cost()`'s `1 - exp(-lambda)`, §22's open item), which still takes the
+  sets as independent; both paths share that guess.
+- **Visibility.** The TIDs are counted whatever their visibility: the probe reads no heap page and
+  holds no lock or pin from one container to the next (the sets are located and their pins let go
+  of before the first container is read, and the streams copy each posting leaf and release it,
+  §29.5), so it has none of the endpoint probe's heap bounds to keep (§28). A dead row not yet
+  vacuumed is a row of its sets, as in their own counts, and dilutes the driver and the survivors
+  alike; a heap path fetches it too. What that misjudges is an AND whose rows were deleted in bulk
+  and not yet vacuumed, which is measured as still there until VACUUM - where the endpoint probe,
+  which stakes an estimate on one key at one end, must and does test liveness.
+- **Bounded.** At most `LION_ISECT_KEYS` (32) driver containers, fewer when the clauses locate
+  many sets - `LION_ISECT_SEEKS` (128) seeks of a set in all, each a descent of a posting tree or a
+  step to the next leaf - down to `LION_ISECT_MIN_KEYS` (8); at most `LION_ISECT_MAX_SETS` (32)
+  sets located; at most `LION_ISECT_BUFFERS` (256) buffer accesses a probe and
+  `LION_ISECT_RUN_BUFFERS` (1,024) a planner run (`pgBufferUsage`), past which a probe gives up and
+  core's estimate stands, as it does when the heap has outgrown `rel->pages` twice over; at most
+  `LION_ISECT_RUN_PROBES` (8) probes a planner run, and each conjunction measured once in it
+  (cached beside the endpoint probe's ends, per `PlannerGlobal`). The budget is checked before each
+  clause is located and each sample taken, so a probe overruns it by one IN list's lookups or one
+  sample's seeks at most: a planner run accesses about 1,000 buffers at worst, the scale of a few
+  endpoint probes (100 heap pages and 100 leaves an end, §28).
+
+  Measured on PostgreSQL 16 (2026-09-28: `EXPLAIN (BUFFERS)`'s planning buffers with the probe on
+  and off, and each probe's own count). The five-clause count of `isectprobe.sql` plans with 79
+  buffer accesses against 20 without the probe - two conjunctions, of 22 and 37 - and the same shape
+  on 2M rows (782 container keys) with 530 against 20: 198 and 237, the second's 21 strata widened
+  to 19 to fit its budget. Other conjunctions of two to five clauses on 2M rows took 13 to 155 a
+  probe, three clauses one of them an IN list of 20 values 126. The first version - 64 containers,
+  2,048 buffers a probe and 8,192 a run - took 547 for the five clauses on 2M rows and 889 for the
+  planning. Every one of those conjunctions came out within 6% of its true count, uniform, clustered
+  in one stretch of the heap, or sparse, where the decision needs a factor of three: the containers
+  are a small multiple of what it needs, a probe's budget is the dearest probe measured, and a run's
+  four of them, where a query measures one or two conjunctions a relation. Planning rose from 0.12
+  to 0.74 ms for the 2M-row count and from about 0.17 to 0.3 to 0.5 ms for the test's, every page in
+  shared buffers; on a cold cache the accesses are reads, about 1,000 a planner run at most.
+
+`test/sql/isectprobe.sql` pins it: five filters derived from one hidden group, whose product is
+two rows for 2,000, estimated at 2,000 with the probe and at 2 without it; a pair of independent
+columns whose estimate the probe leaves exactly as it was; and the ungrouped and the GROUP BY count
+going to `LionCount` only with the probe. Without it the lion scan that leaves the IN list to its
+heap filter and ANDs the other four sets is priced for two rows, a third of the ungrouped count
+and a ninth of the grouped one; with it, at fourteen and four times theirs. The ungrouped count ran
+in 0.2 ms against that scan's 1.2 to 1.7.
 
 **A WALK is priced as a heap pass per entry** (2026-09-27). A range alone - one column's entries
 in key order, each entry's TIDs in heap order (§29.3) - got the column's correlation, as a scan not in
@@ -10353,6 +10455,30 @@ queries with two set quals on one column - now charged their merge on a one-colu
 (`lion_set_merge_cost()`; `lion_cost_set_and()` since, §29.11) - force their scan or are counts,
 which the dearer scan leaves to the pushdown, and the qual evaluation per row a plain scan saves
 on an implied `IS NOT NULL` is far below any margin a pinned plan has.
+
+`test/sql/isectprobe.sql` (2026-09-28, §29.11 "One price for the AND of sets" and "Correlated
+sets"), on 100,000 rows in 50 hidden groups that take turns row by row, sampled whole so the
+statistics are exact, and alike in every container, so that the probe's share is the table's
+whichever containers it samples: the Bitmap Index Scan's rows for five filters derived from the
+group - equalities, an IN list, a multi-key `&&` - within twice the true count with the probe and
+fifty times short or more without it, and for two of them likewise; a pair of independent columns
+and a single clause estimated exactly as without the probe; the ungrouped and the GROUP BY count
+going to `LionCount` only with the probe, by margins of three to fourteen times either way; and
+every answer the sequential scan's. Its expected output, and every other line this change moved,
+come from a run on PostgreSQL 16. The first version of this change expected the ungrouped count
+to be `LionCount`'s without the probe as well, on the argument that a count costs no more than a
+scan of the same sets and its heap; but the scan need not AND the same sets - it leaves the dense
+IN list to its heap filter, the count cannot - and priced for two rows it won by three times.
+
+The tests whose plans pin a lion path of two sets or more - `plaincost.sql` (the 13%, 43%, 0.1%
+and 0.01% queries), `rangeprobe.sql` (a range beside two equalities), `multicolumn.sql`,
+`countbudget.sql`, `pinbudget.sql`, `fkjoin_semi.sql`, `fkjoin_nonunique.sql` (a dimension's two
+equalities) and `samecolumn_scan.sql` - keep their plans, run on PostgreSQL 16 in both WAL modes.
+The correlated shapes among them (`multicolumn.sql`'s `k = 7 AND t = 't47'`, whose `t` implies
+`k`, and the five-clause contradiction over `lion_mcp`; `rangeprobe.sql`'s `c = 0 AND v = -700`)
+are corrected by the probe, and their plans are the ones pinned already; `ordered.sql`'s
+LionOrdered, the one plan that moved, moved with the price (§29.11, "One price for the AND of
+sets").
 
 ### 29.13 Measured (2026-09-24, the prune slot's PostgreSQL 20devel, assert-enabled: ratios, not absolute numbers)
 
