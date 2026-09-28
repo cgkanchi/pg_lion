@@ -171,6 +171,33 @@ extern uint32 lion_container_remove_range(LionContainer *c, uint16 lo_start, uin
 extern void lion_container_or_into_bitset(const LionContainer *c, uint64 *w);
 
 /*
+ * Dense accumulation of a union that grows a few members at a time (a
+ * range's sets, collected or probed: DESIGN.md §32, "Summed ranges: dense
+ * and probed").
+ *
+ * lion_container_or_inplace(): acc |= c for an acc that is a BITSET with its
+ * full LION_CONTAINER_MAX_SIZE bytes, in place and without optimizing it;
+ * acc's cardinality is kept, and the members that were new are returned.
+ *
+ * lion_container_add_many(): acc ∪= the n values of vals - any order,
+ * repeats allowed - through the caller's image w of LION_BITSET_WORDS words
+ * (not overlapping acc); acc (capacity LION_CONTAINER_MAX_SIZE) comes back
+ * optimized, and its cardinality is returned.
+ *
+ * lion_container_mark_members(): for every j < n with sorted[j] a member of
+ * c, set bit j of marks ((n + 63) / 64 words); sorted is strictly ascending,
+ * below LION_CONTAINER_RANGE.  Returns how many bits were newly set.
+ *
+ * c may come off a page in all three, and is taken as iterate() takes it.
+ */
+extern uint32 lion_container_or_inplace(LionContainer *acc, const LionContainer *c);
+extern uint32 lion_container_add_many(LionContainer *acc, const uint16 *vals,
+									  uint32 n, uint64 *w);
+extern uint32 lion_container_mark_members(const LionContainer *c,
+										  const uint16 *sorted, uint32 n,
+										  uint64 *marks);
+
+/*
  * Which of the LION_BLOCKS_PER_CONTAINER heap blocks the container covers
  * hold a member: bit b for the block of lo values b << LION_OFFSET_BITS ..
  * ((b + 1) << LION_OFFSET_BITS) - 1, which is the count engine's

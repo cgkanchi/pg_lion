@@ -1,0 +1,172 @@
+-- Summed ranges over a column whose rows lie all over the heap (DESIGN.md
+-- §32, "Summed ranges: dense and probed").
+--
+-- The keys below are a permutation of the row number, so each bucket's
+-- summary has a member or two at nearly every container key of the heap.  A
+-- sum over such a range beside a clause with fewer rows is PROBED once its
+-- walk has handed out twice that clause's rows: the rest of its sets are read
+-- only at the clause's container keys, and the rows they hold among the
+-- clause's are counted once.  A range taken as a source is collected into a
+-- union that grows in place.  Every count is checked against a sequential
+-- scan with the pushdown off (same); probed is EXPLAIN ANALYZE's "Range Walks
+-- Probed", collected its "Range Sources Collected".
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+
+/*
+ * lion_sc() runs q with the pushdown on and every other scan disabled, and
+ * again as a sequential scan with the pushdown off.  same: it was pushed down
+ * and the answers agree.
+ */
+CREATE FUNCTION lion_sc(q text, OUT same boolean, OUT probed boolean,
+						OUT collected boolean)
+LANGUAGE plpgsql AS $$
+DECLARE
+	j jsonb;
+	node jsonb;
+	got text;
+	want text;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) '
+		|| q INTO j;
+	node := jsonb_path_query_first(j, 'strict $.** ? (@."Custom Plan Provider" == "LionCount")');
+	probed := coalesce((node ->> 'Range Walks Probed')::int, 0) > 0;
+	collected := coalesce((node ->> 'Range Sources Collected')::int, 0) > 0;
+	EXECUTE format('SELECT coalesce(string_agg(s::text, '' '' ORDER BY s::text), ''(none)'') FROM (%s) s', q)
+		INTO got;
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	EXECUTE format('SELECT coalesce(string_agg(s::text, '' '' ORDER BY s::text), ''(none)'') FROM (%s) s', q)
+		INTO want;
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	same := node IS NOT NULL AND got IS NOT DISTINCT FROM want;
+END $$;
+
+-- ---------- the table ----------
+-- k: a permutation of 1 .. 30010, one row each, in no heap order; ts: the
+-- same as minutes; g: 7 values; s: 997 values of some 30 rows each, all over
+-- the heap; c: 30 values of 1000 rows each, each in one run of the heap; n:
+-- NULL in every fifth row.  Rows wide enough for a score of container keys.
+CREATE TABLE lion_sc (id int NOT NULL, k int NOT NULL, ts timestamptz NOT NULL,
+					  g int NOT NULL, s int NOT NULL, c int NOT NULL, n int,
+					  pad text NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lion_sc
+SELECT i, (i * 7919) % 30011,
+	   '2025-01-01 00:00:00+00'::timestamptz + ((i * 7919) % 30011) * interval '1 minute',
+	   i % 7, i % 997, i / 1000, CASE WHEN i % 5 = 0 THEN NULL ELSE i % 11 END,
+	   repeat('p', 300)
+  FROM generate_series(1, 30000) i;
+-- small buckets; the timestamp's summaries are posting trees of their own
+CREATE INDEX lion_sc_k ON lion_sc USING lion (k)
+	WITH (summaries = on, summary_tids = 64);
+CREATE INDEX lion_sc_ts ON lion_sc USING lion (ts)
+	WITH (summaries = on, summary_tids = 128, inline_limit = 64);
+CREATE INDEX lion_sc_g ON lion_sc USING lion (g);
+CREATE INDEX lion_sc_s ON lion_sc USING lion (s);
+CREATE INDEX lion_sc_c ON lion_sc USING lion (c);
+CREATE INDEX lion_sc_n ON lion_sc USING lion (n);
+VACUUM (FREEZE, ANALYZE) lion_sc;
+SELECT summary_tids = ntids AS covers, summary_pages > 0 AS chained
+  FROM lion_index_stats('lion_sc_ts');
+
+-- ---------- 1. sums: probed beside a clause with fewer rows ----------
+-- Alone, within a bucket, or beside a clause with more rows than the walk
+-- hands out, the sets are counted one by one as before.  s = 7 has 31 rows,
+-- c = 7 and c = 3 1000, g = 3 4286; the complement's walks below and above
+-- the range are probed on their own.
+CREATE TABLE lion_sc_q (n int, q text);
+INSERT INTO lion_sc_q VALUES
+	(1, 'k BETWEEN 1000 AND 1300'),
+	(2, 'k >= 15000'),
+	(3, 'k BETWEEN 1000 AND 4000 AND s = 7'),
+	(4, 'k BETWEEN 1000 AND 1040 AND s = 7'),
+	(5, 'k >= 500 AND s = 7'),
+	(6, 'k BETWEEN 1000 AND 4000 AND c = 7'),
+	(7, 'k BETWEEN 1000 AND 1500 AND c = 7'),
+	(8, 'k BETWEEN 1000 AND 4000 AND g = 3'),
+	(9, 'k BETWEEN 1000 AND 20000 AND g = 3'),
+	(10, 'k BETWEEN 3000 AND 9000 AND (s = 7 OR c = 3)'),
+	(11, 'k BETWEEN 3000 AND 9000 AND s = 7 AND n IS NOT NULL'),
+	(12, 'k >= 300 AND g = 3 AND s = 7'),
+	(13, 'ts < ''2025-01-15 00:00:00+00'''),
+	(14, 'ts >= ''2025-01-10 00:00:00+00'' AND s = 7'),
+	(15, 'ts BETWEEN ''2025-01-03 00:00:00+00'' AND ''2025-01-05 00:00:00+00'' AND s IN (7, 8, 9)');
+SELECT q.q AS predicate, s.same, s.probed
+  FROM lion_sc_q q, LATERAL lion_sc('SELECT count(*) FROM lion_sc WHERE ' || q.q) s
+ ORDER BY q.n;
+
+-- ---------- 2. a dirty heap: new row versions, keys moved above every key, deletes ----------
+UPDATE lion_sc SET pad = 'u' || pad WHERE id % 10 = 0;
+UPDATE lion_sc SET k = k + 40000, ts = ts + interval '40000 minutes' WHERE id % 97 = 0;
+DELETE FROM lion_sc WHERE id % 13 = 0;
+INSERT INTO lion_sc_q VALUES
+	(16, 'k >= 20000 AND s = 7'),
+	(17, 'k > 30000 AND c = 3');
+SELECT q.q AS predicate, s.same, s.probed
+  FROM lion_sc_q q, LATERAL lion_sc('SELECT count(*) FROM lion_sc WHERE ' || q.q) s
+ ORDER BY q.n;
+VACUUM lion_sc;
+SELECT lion_index_verify('lion_sc_k', true);
+SELECT lion_index_verify('lion_sc_ts', true);
+SELECT q.q AS predicate, s.same, s.probed
+  FROM lion_sc_q q, LATERAL lion_sc('SELECT count(*) FROM lion_sc WHERE ' || q.q) s
+ ORDER BY q.n;
+
+-- ---------- 3. ranges as sources, collected into a union that grows in place ----------
+SELECT s.same, s.probed, s.collected
+  FROM lion_sc('SELECT g, count(*) FROM lion_sc WHERE k BETWEEN 2000 AND 25000 GROUP BY g') s;
+SELECT s.same, s.probed, s.collected
+  FROM lion_sc('SELECT c, count(*) FROM lion_sc WHERE ts >= ''2025-01-04 00:00:00+00'' GROUP BY c') s;
+
+-- ---------- 4. a narrow table: bitset containers on both sides ----------
+-- Some two hundred rows a page and a heap of 17 container keys: g = 3 is a
+-- fifth of every page, a bitset at each key, so a sum beside it is probed
+-- into images; s = 7 is a dozen rows at each, an ARRAY whose members are
+-- marked.  A range over half the rows is a bitset at each key too.
+CREATE TABLE lion_sc_w (r int NOT NULL, g int NOT NULL, s int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lion_sc_w
+SELECT (i * 7919) % 200003, i % 5, i % 1009 FROM generate_series(1, 200000) i;
+CREATE INDEX lion_sc_w_r ON lion_sc_w USING lion (r)
+	WITH (summaries = on, summary_tids = 64);
+CREATE INDEX lion_sc_w_g ON lion_sc_w USING lion (g);
+CREATE INDEX lion_sc_w_s ON lion_sc_w USING lion (s);
+VACUUM (FREEZE, ANALYZE) lion_sc_w;
+SELECT s.same, s.probed, s.collected
+  FROM lion_sc('SELECT count(*) FROM lion_sc_w WHERE r BETWEEN 5000 AND 50000 AND s = 7') s;
+SELECT s.same, s.probed, s.collected
+  FROM lion_sc('SELECT count(*) FROM lion_sc_w WHERE r BETWEEN 20000 AND 110000 AND g = 3') s;
+SELECT s.same, s.probed, s.collected
+  FROM lion_sc('SELECT g, count(*) FROM lion_sc_w WHERE r BETWEEN 5000 AND 50000 GROUP BY g') s;
+SELECT s.same, s.probed, s.collected
+  FROM lion_sc('SELECT g, count(*) FROM lion_sc_w WHERE r < 196000 GROUP BY g') s;
+-- At work_mem's floor a range over most rows is a bitset at every key, more
+-- than 64 kB: it is walked at each group's count, and each walk is probed at
+-- the rows of the group and s = 7 (DESIGN.md §32, "A range as a source").
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT s.same, s.probed, s.collected
+  FROM lion_sc('SELECT g, count(*) FROM lion_sc_w WHERE r BETWEEN 5000 AND 150000 AND s = 7 GROUP BY g') s;
+SELECT s.same, s.probed, s.collected
+  FROM lion_sc('SELECT count(*) FROM lion_sc_w WHERE r BETWEEN 5000 AND 150000 AND s = 7') s;
+RESET work_mem;
+RESET hash_mem_multiplier;
+
+DROP TABLE lion_sc, lion_sc_q, lion_sc_w;
+DROP FUNCTION lion_sc(text);

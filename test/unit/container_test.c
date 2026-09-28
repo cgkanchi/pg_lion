@@ -2979,6 +2979,303 @@ test_inplace_growth(void)
 }
 
 /* ----------------------------------------------------------------
+ *		dense accumulation (DESIGN.md §32, "dense and probed")
+ *
+ * or_inplace(), add_many() and mark_members() against the reference: the
+ * union a range's sets are collected into, a few members at a time, and the
+ * members of a probe's container a range holds.
+ * ----------------------------------------------------------------
+ */
+
+/* A container of a random shape: small or large ARRAY, RUN or BITSET. */
+static void
+gen_any(Ref *r, CBuf *b)
+{
+	switch (rng_below(6))
+	{
+		case 0:
+			gen_random(r, 1 + rng_below(3));	/* what a sparse segment emits */
+			build_by_append(b, r);
+			break;
+		case 1:
+			gen_random(r, rng_below(LION_ARRAY_MAX_CARD));
+			build_by_append(b, r);
+			lion_container_optimize(&b->c);
+			break;
+		case 2:
+			gen_typed(r, b, LION_CT_ARRAY);
+			break;
+		case 3:
+			gen_typed(r, b, LION_CT_RUN);
+			break;
+		case 4:
+			gen_typed(r, b, LION_CT_BITSET);
+			break;
+		default:
+			gen_runs(r, 1 + rng_below(3), 1, 40);
+			build_run_direct(b, r);
+			break;
+	}
+}
+
+/* ref_r |= r */
+static void
+ref_union_into(Ref *acc, const Ref *r)
+{
+	uint32		i;
+
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
+		if (r->m[i])
+			(void) ref_add(acc, i);
+}
+
+static void
+test_or_inplace(void)
+{
+	uint32		k;
+	uint32		i;
+
+	phase("or_inplace(): a BITSET accumulator, then optimized");
+	rng_seed(UINT64CONST(0x5EED4001));
+	for (k = 0; k < 40; k++)
+	{
+		uint32		nadd = 1 + rng_below(k < 20 ? 400 : 20);
+		uint32		bad = 0;
+
+		/* start empty, or from a random set, as a BITSET */
+		if (k % 3 == 0)
+			ref_init(&ref_r);
+		else
+			gen_random(&ref_r, rng_below(4000));
+		build_by_append(&buf_d, &ref_r);
+		lion_container_to_bitset(&buf_d.c);
+		CHECK(buf_d.c.type == LION_CT_BITSET, "the accumulator is a BITSET");
+
+		for (i = 0; i < nadd; i++)
+		{
+			uint32		before = ref_r.card;
+			uint32		added;
+
+			gen_any(&ref_a, &buf_a);
+			added = lion_container_or_inplace(&buf_d.c, &buf_a.c);
+			ref_union_into(&ref_r, &ref_a);
+			if (added != ref_r.card - before)
+				bad++;
+			if (buf_d.c.type != LION_CT_BITSET ||
+				buf_d.c.cardinality != ref_r.card)
+				bad++;
+		}
+		CHECK(bad == 0, "or_inplace() counts exactly the new members and stays a BITSET");
+		verify_light(&buf_d.c, &ref_r);
+		lion_container_optimize(&buf_d.c);
+		verify_full(&buf_d.c, &ref_r);
+	}
+
+	/* a run over the whole range, and one into a full bitset */
+	ref_init(&ref_r);
+	build_by_append(&buf_d, &ref_r);
+	lion_container_to_bitset(&buf_d.c);
+	ref_init(&ref_a);
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
+		(void) ref_add(&ref_a, i);
+	build_run_direct(&buf_a, &ref_a);
+	CHECK(lion_container_or_inplace(&buf_d.c, &buf_a.c) == LION_CONTAINER_RANGE,
+		  "a full run adds 32768 members");
+	CHECK(lion_container_or_inplace(&buf_d.c, &buf_a.c) == 0,
+		  "... and nothing a second time");
+	lion_container_optimize(&buf_d.c);
+	verify_full(&buf_d.c, &ref_a);
+}
+
+static void
+test_add_many(void)
+{
+	static uint16 vals[3 * LION_CONTAINER_RANGE];
+	uint32		k;
+
+	phase("add_many(): values in any order, repeated, past the range");
+	rng_seed(UINT64CONST(0x5EED4002));
+	for (k = 0; k < 60; k++)
+	{
+		uint32		n;
+		uint32		i;
+		uint32		card;
+
+		gen_any(&ref_r, &buf_d);
+		switch (k % 4)
+		{
+			case 0:
+				n = rng_below(8);
+				break;
+			case 1:
+				n = rng_below(LION_ARRAY_MAX_CARD);
+				break;
+			case 2:
+				n = LION_ARRAY_MAX_CARD + rng_below(4000);
+				break;
+			default:
+				n = rng_below(3 * LION_CONTAINER_RANGE);
+				break;
+		}
+		for (i = 0; i < n; i++)
+		{
+			/* a repeat of the one before, or a value past the range */
+			if (i > 0 && rng_below(8) == 0)
+				vals[i] = vals[i - 1];
+			else if (rng_below(16) == 0)
+				vals[i] = (uint16) (LION_CONTAINER_RANGE + rng_below(LION_CONTAINER_RANGE));
+			else
+				vals[i] = (uint16) rng_below(LION_CONTAINER_RANGE);
+			(void) ref_add(&ref_r, vals[i] & (LION_CONTAINER_RANGE - 1));
+		}
+		memset(scratch_img, 0xA5, sizeof(scratch_img));
+		card = lion_container_add_many(&buf_d.c, vals, n, scratch_img);
+		CHECK(card == ref_r.card, "add_many() returns the union's cardinality");
+		verify_full(&buf_d.c, &ref_r);
+	}
+}
+
+/* Bit j of marks, and the reference's answer for it. */
+static bool
+mark_test(const uint64 *marks, uint32 j)
+{
+	return ((marks[j >> 6] >> (j & 63)) & 1) != 0;
+}
+
+static void
+test_mark_members(void)
+{
+	static uint16 sorted[LION_CONTAINER_RANGE];
+	uint32		k;
+
+	phase("mark_members(): a probe's members that a container holds");
+	rng_seed(UINT64CONST(0x5EED4003));
+	for (k = 0; k < 120; k++)
+	{
+		uint32		n;
+		uint32		i;
+		uint32		words;
+		uint32		added;
+		uint32		expect = 0;
+		uint32		bad = 0;
+		uint64	   *marks;
+
+		/* the probe: from empty to every value, as an ascending array */
+		switch (k % 5)
+		{
+			case 0:
+				gen_random(&ref_b, rng_below(4));
+				break;
+			case 1:
+				gen_random(&ref_b, rng_below(200));
+				break;
+			case 2:
+				gen_random(&ref_b, rng_below(LION_ARRAY_MAX_CARD + 1));
+				break;
+			case 3:
+				gen_runs(&ref_b, 1 + rng_below(30), 1, 300);
+				break;
+			default:
+				gen_random(&ref_b, k == 4 ? LION_CONTAINER_RANGE :
+						   rng_below(LION_CONTAINER_RANGE));
+				break;
+		}
+		n = 0;
+		for (i = 0; i < LION_CONTAINER_RANGE; i++)
+			if (ref_b.m[i])
+				sorted[n++] = (uint16) i;
+
+		gen_any(&ref_a, &buf_a);
+		/* ... and now and then a container that shares many of them */
+		if (k % 7 == 0 && n > 0)
+		{
+			ref_init(&ref_a);
+			for (i = 0; i < n; i += 1 + rng_below(3))
+				(void) ref_add(&ref_a, sorted[i]);
+			build_by_append(&buf_a, &ref_a);
+			lion_container_optimize(&buf_a.c);
+		}
+
+		/* marks in an exact buffer; a few bits set beforehand */
+		words = (n + 63) / 64;
+		marks = exact_alloc(Max(words, 1) * sizeof(uint64));
+		memset(marks, 0, Max(words, 1) * sizeof(uint64));
+		for (i = 0; i < n; i += 97)
+			marks[i >> 6] |= UINT64CONST(1) << (i & 63);
+
+		for (i = 0; i < n; i++)
+			if (ref_a.m[sorted[i]] && i % 97 != 0)
+				expect++;
+		added = lion_container_mark_members(&buf_a.c, sorted, n, marks);
+		CHECK(added == expect, "mark_members() counts the bits it set");
+		for (i = 0; i < n; i++)
+			if (mark_test(marks, i) != (ref_a.m[sorted[i]] || i % 97 == 0))
+				bad++;
+		for (i = n; i < words * 64; i++)
+			if (mark_test(marks, i))
+				bad++;
+		CHECK(bad == 0, "mark_members() marks exactly the members it holds");
+		CHECK(guard_ok(marks, Max(words, 1) * sizeof(uint64)),
+			  "mark_members() writes nothing past the marks");
+		free(marks);
+	}
+
+	phase("mark_members(): damaged containers stay inside the marks");
+	for (k = 0; k < 3; k++)
+	{
+		uint32		n = 5;
+		uint64	   *marks = exact_alloc(sizeof(uint64));
+		uint32		i;
+
+		for (i = 0; i < n; i++)
+			sorted[i] = (uint16) (i * 7000);
+		lion_container_init(dmg_a, TEST_CKEY);
+		if (k == 0)
+		{
+			/* members past the range and out of order */
+			dmg_a->cardinality = 4;
+			LION_ARRAY_DATA(dmg_a)[0] = 65535;
+			LION_ARRAY_DATA(dmg_a)[1] = 7000;
+			LION_ARRAY_DATA(dmg_a)[2] = 32768 + 14000;
+			LION_ARRAY_DATA(dmg_a)[3] = 0;
+		}
+		else if (k == 1)
+		{
+			/* runs past the range and overlapping */
+			dmg_a->type = LION_CT_RUN;
+			dmg_a->cardinality = 65535;
+			LION_RUN_NRUNS(dmg_a) = 3;
+			LION_RUN_DATA(dmg_a)[0].start = 20000;
+			LION_RUN_DATA(dmg_a)[0].len_minus_1 = 65535;
+			LION_RUN_DATA(dmg_a)[1].start = 0;
+			LION_RUN_DATA(dmg_a)[1].len_minus_1 = 7000;
+			LION_RUN_DATA(dmg_a)[2].start = 65535;
+			LION_RUN_DATA(dmg_a)[2].len_minus_1 = 65535;
+		}
+		else
+		{
+			/* a header claiming more members than an ARRAY may hold */
+			dmg_a->cardinality = 60000;
+			for (i = 0; i < LION_ARRAY_MAX_CARD; i++)
+				LION_ARRAY_DATA(dmg_a)[i] = (uint16) (i * 16);
+		}
+		marks[0] = 0;
+		(void) lion_container_mark_members(dmg_a, sorted, n, marks);
+		CHECK((marks[0] >> n) == 0, "no bit at or past n");
+		CHECK(guard_ok(marks, sizeof(uint64)), "nothing past the marks");
+		free(marks);
+
+		/* the same containers into a BITSET accumulator */
+		lion_container_init(dmg_b, TEST_CKEY);
+		lion_container_to_bitset(dmg_b);
+		(void) lion_container_or_inplace(dmg_b, dmg_a);
+		CHECK(guard_ok(dmg_b, LION_CONTAINER_MAX_SIZE) &&
+			  dmg_b->cardinality == img_card(LION_BITSET_DATA(dmg_b)),
+			  "or_inplace() of a damaged container stays inside the bitset, counted");
+	}
+}
+
+/* ----------------------------------------------------------------
  *					representative sizes (informational)
  * ----------------------------------------------------------------
  */
@@ -3113,6 +3410,9 @@ main(void)
 	test_damaged_results();
 	test_damaged_random(3000, UINT64CONST(0x5EED3002));
 	test_inplace_growth();
+	test_or_inplace();
+	test_add_many();
+	test_mark_members();
 
 	test_random_ops(3, "random ops @ 0.01% density", 20000, UINT64CONST(0x5EED1001));
 	test_random_ops(328, "random ops @ 1% density", 20000, UINT64CONST(0x5EED1002));

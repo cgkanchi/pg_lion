@@ -600,6 +600,32 @@ extern bool lion_range_collect(Relation index, AttrNumber attno,
 							   int64 *nsummaries);
 
 /*
+ * A summed range PROBED at the rows of the other sources F (DESIGN.md §32,
+ * "Summed ranges: dense and probed"): F is collected once, every set a walk
+ * of the range hands out is read only at F's container keys and marked
+ * against F's rows, and the rows marked are counted once, ANDed with F.  The
+ * same answer as the sum of the sets' counts, for a walk whose sets are
+ * disjoint - a summed walk's are - in one count instead of one per set.
+ *
+ * lion_range_probe_begin() returns NULL when it cannot be taken: F has no
+ * positive source, holds a range still to be walked (rangewalk), has no
+ * positive source that carries the §9 interlock, or would not fit maxbytes
+ * with the marks.  F must stay located until lion_range_probe_end().
+ */
+typedef struct LionRangeProbe LionRangeProbe;
+
+extern LionRangeProbe *lion_range_probe_begin(Relation heap, Snapshot snapshot,
+											  int nsources,
+											  LionCountSource *sources,
+											  Size maxbytes,
+											  LionCountStats *stats);
+extern void lion_range_probe_add(LionRangeProbe *rp, LionPostingSet *set);
+extern int64 lion_range_probe_count(LionRangeProbe *rp, Relation heap,
+									Snapshot snapshot, LionCountStats *stats,
+									LionVisCache *cache, bool rel_read_only);
+extern void lion_range_probe_end(LionRangeProbe *rp);
+
+/*
  * The DESIGN.md section 9 entry point: locate nkeys (index, key) pairs and
  * count the intersection of their posting sets.  keytypes may be NULL, which
  * means every key already has its index's opcintype.
