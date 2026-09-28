@@ -36,6 +36,7 @@
       "test": {
          "requires": {
             "citext": "0",
+            "pageinspect": "0",
             "pg_buffercache": "0",
             "pg_walinspect": "0"
          },
