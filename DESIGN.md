@@ -9299,7 +9299,9 @@ the large ones go to the parallel sequential or bitmap scan, before and after.
 
 There is no parallel plain lion scan (`amcanparallel` is false, §29.1): the planner compares the
 serial plain scan with a parallel bitmap heap scan, and it credits the parallel one with its CPU
-divided among the workers and nothing for its I/O, as it does for every AM. Index-only scans keep the
+divided among the workers and nothing for its I/O, as it does for every AM - which is why, against a
+parallel bitmap heap scan, the plain scan's pages are now priced as one process's reads ("One process
+against several", below). Index-only scans keep the
 column's correlation: lion's are of queries that need no column, and the one kind in heap order, a
 multi-key UNION, fetches every TID it hands out whatever the visibility map says, which
 cost_index()'s all-visible fraction would not describe.
@@ -9389,6 +9391,74 @@ On that million-row table with nothing disabled: the 2000-, 200000- and 400000-r
 a smaller table and shows the plain scan reading within twice the bitmap scan's buffers, where it
 read 36 to 390 times as many.
 
+**One process against several** (2026-09-28). Pricing a scan in heap order as the bitmap heap scan
+of the same pages compares one process with one process. A benchmark found the planner taking the
+plain scan where the other side was a PARALLEL bitmap heap scan: large results from a large table,
+and counts the count pushdown did not answer, ran many times slower on the plain scan than on the
+parallel bitmap heap scan the planner used to choose. The plain scan is one process
+(`amcanparallel` is false, so cost_index() divides none of its price, and none of lion's own terms
+divide either) that reads a heap page when it needs it and waits for the read. The bitmap heap scan
+reads ahead of itself (`effective_io_concurrency`; a read stream from 18 on), and in parallel several
+processes do, each over its share of the pages. core's cost model prices neither:
+`effective_io_concurrency` appears nowhere in it, and a parallel path is credited with its CPU divided
+among the participants and nothing for its reads. The one term that stands for the bitmap heap
+scan's way of reading is cost_bitmap_heap_scan()'s price of a page - random_page_cost falling to
+seq_page_cost with the square root of the share of the heap it reads - and that is the credit the
+plain scan took over above.
+
+So where core would run the bitmap heap scan of the same pages in parallel - the relation may be
+scanned in parallel and compute_parallel_worker() gives compute_bitmap_pages()'s count of them a
+worker, which is what create_partial_bitmap_paths() asks (`lion_plain_meets_workers()`) - the plain
+scan's pages are priced as one process's reads: random_page_cost, but seq_page_cost for a page that
+follows the page read before it, which the kernel's read-ahead of a consecutive run serves. For
+pages spread over the heap that is their share of it, `d`, where the bitmap heap scan's price takes
+`sqrt(d)`; a WALK's passes are priced so pass by pass. The rest is as before: the fetches past the
+first on a page, each pass's stream, the packed end the correlation interpolates towards (a run of
+consecutive pages, read ahead by the kernel for one process as for several), the remainder charged
+to the path. A synthetic example, the index side left out since both paths share it: 300,000 rows
+scattered over a 1,000,000-page heap lie on 260,870 pages, `d` = 0.26. The plain scan used to come
+out 0.13% above the parallel bitmap heap scan (two workers) at the default random_page_cost and 0.3%
+above it at 1.1 - within add_path()'s 1% fuzz, where the plain scan's lower startup cost wins - and
+is now 30% and 2.7% above it.
+
+Why not everywhere: a walk priced so at every size would take every scattered result of more than a
+page or two off the plain scan. 20 rows over a 1,112-page heap lie on 20 pages, `d` = 0.018: at the
+default random_page_cost 3.60 a page at the bitmap heap scan's price and 3.95 at a single reader's,
+7 units more on 72, against the 0.05 the plain scan saves by not rechecking its qual. That is how core prices a btree's scan of scattered
+rows against its bitmap scan; lion's plain scan was measured as fast as the bitmap scan or faster
+there (above), one process against one, and a selective result stays on it. So below core's
+parallel size, and wherever no parallel plan can be made (max_parallel_workers_per_gather at 0, a
+parallel-unsafe query, a temporary table, a cursor, a table whose `parallel_workers` is 0), the two
+are compared as before. An inheritance child is given a worker whatever its size, for a Parallel
+Append to combine; below min_parallel_table_scan_size a child is taken as a base relation is.
+
+Not offering the plain path at all above some number of rows was considered and not done: the model
+has no such number. Past core's parallel size the plain scan still wins on the model's own terms
+where the bitmap heap scan goes lossy at a low `work_mem` (compute_bitmap_pages() charges it every
+row of its lossy pages), under a LIMIT (the plain scan's startup cost is the index's, the bitmap
+scan's the whole bitmap), and over a column stored in heap order (the packed end); with the walk
+priced as a single reader's the planner makes the comparison itself.
+
+**Plain scans switched off** (2026-09-28, `pg_lion.enable_plain_scan`, bool, default on,
+`PGC_USERSET`). Off, the planner plans lion indexes as it plans GIN's, for bitmap scans only: no
+plain and no index-only scan of a lion index is offered, parameterized or not, and every other
+access method's index scans are left alone - `enable_indexscan = off`, the only switch before it,
+takes btree's away as well. The mechanism is the one core has for an access method without
+`amgettuple`. get_index_paths() builds an index's IndexPaths - costing each through amcostestimate -
+and then offers them as plain or index-only scans only if the IndexOptInfo's `amhasgettuple` is set;
+the bitmap paths are built from the same IndexPaths. `lioncostestimate()` clears the flag, so no
+plain path of the index reaches add_path() in that planning run, and the next run reads it from the
+handler again (plancat.c). The two ways first considered both come too late or land wrong: a plain
+path removed from the set_rel_pathlist hook, or given a `disable_cost` / `disabled_nodes` penalty
+there, has already made add_path() discard the paths it dominated, of which the hook can offer back
+the bitmap scan of the same index and the sequential and TID scans (as it does for a remainder,
+above) but not another index's scans or a BitmapAnd; and a penalty in amcostestimate lands in the
+index cost the bitmap path shares. LionOrdered, which runs create_index_paths() over a copy of the
+relation that sees only its lion indexes, takes its lion side from a bitmap path when no plain path
+is offered - the same lion access (§30.2). It is a planner setting: an exclusion constraint's check
+calls `amgettuple` whatever it says, and a plan cached before it changed is not planned again for
+it, as with core's `enable_*` settings.
+
 ### 29.12 Tests
 
 `test/sql/indexscan.sql`, written before the code and failing on HEAD (no plan can show an Index
@@ -9446,6 +9516,22 @@ takes 10 ms - the price of a numeric `=`, one cpu_operator_cost like any other, 
 2026-09-27 (above: no index qual charged where it is not evaluated, no operator per index tuple)
 it prints the bitmap scan, the fastest of the three: 2.5 ms of CPU on the release build against
 the plain scan's 3.0 and the sequential scan's 5.3.
+
+`test/sql/plainscan.sql` (2026-09-28, §29.11 "One process against several" and "Plain scans
+switched off"), on 20,000 rows of 18 to a page placed at random: a sixtieth of the rows, on about a
+quarter of the pages, goes to the plain scan with parallel plans off and while its pages are fewer
+than min_parallel_table_scan_size, and to the bitmap scan once core would give the bitmap scan of
+those pages a worker (the plain scan some 30% dearer); 20 rows stay on the plain scan either way.
+With `pg_lion.enable_plain_scan` off the plain scan of the lion index gives way to its bitmap scan
+and the primary key's btree keeps its index scan; with the other scans disabled, the index-only scan
+of a partial lion index and the parameterized lion scan inside a nested loop are made with the
+setting on and not with it off, the btree's scan is made either way, and LionOrdered (every core
+scan disabled) is chosen either way - each with the sequential scan's answers. The existing pinned
+plans do not move: every test that pins a plain lion scan sets max_parallel_workers_per_gather to 0,
+or pins a result of a few hundred pages at most under the default min_parallel_table_scan_size, and
+the tests that lower min_parallel_table_scan_size to 0 (`fkjoin_parallel.sql`,
+`fkjoin_nonunique.sql`, `countmultikey.sql`) print which count node is chosen, which a dearer plain
+scan does not change.
 
 ### 29.13 Measured (2026-09-24, the prune slot's PostgreSQL 20devel, assert-enabled: ratios, not absolute numbers)
 

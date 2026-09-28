@@ -29,6 +29,7 @@
 #include "nodes/pathnodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/paths.h"
 #include "parser/parsetree.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
@@ -75,6 +76,9 @@ PG_FUNCTION_INFO_V1(lion_handler);
 /* Kind of relation options for lion indexes */
 static relopt_kind lion_relopt_kind;
 
+/* GUC pg_lion.enable_plain_scan (DESIGN.md §29.11, lioncostestimate()) */
+static bool lion_enable_plain_scan = true;
+
 static const relopt_parse_elt lion_relopt_tab[] = {
 	{"buckets", RELOPT_TYPE_INT, offsetof(LionOptions, buckets)},
 	{"inline_limit", RELOPT_TYPE_INT, offsetof(LionOptions, inline_limit)},
@@ -103,8 +107,8 @@ static relopt_enum_elt_def lion_wal_mode_options[] = {
 
 /*
  * Module initialisation: register the reloptions of the roaring AM, the
- * count-pushdown GUC and the planner hook that plants the LionCount
- * CustomScan (DESIGN.md section 10, implemented in lion_customscan.c).
+ * planner GUCs and the planner hook that plants the LionCount CustomScan
+ * (DESIGN.md section 10, implemented in lion_customscan.c).
  *
  * This runs the first time the library is loaded into a backend, which for
  * any query over a lion index happens in get_relation_info() when the
@@ -206,6 +210,22 @@ _PG_init(void)
 							 "Answer count(*) over lion indexes from the index and the visibility map.",
 							 NULL,
 							 &lion_enable_count_pushdown,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §29.11, "Plain scans switched off": whether the planner may
+	 * scan a lion index with a plain or an index-only scan.  Off, it plans
+	 * lion indexes as it plans GIN's, for bitmap scans only, where
+	 * enable_indexscan = off would take every other access method's index
+	 * scans away as well.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_plain_scan",
+							 "Enables the planner's use of plain and index-only scans of lion indexes.",
+							 "Off, lion indexes are planned for bitmap scans only; other index access methods are unaffected.",
+							 &lion_enable_plain_scan,
 							 true,
 							 PGC_USERSET,
 							 0,
@@ -1310,6 +1330,29 @@ lion_plain_walk_entries(PlannerInfo *root, IndexPath *path, int c)
 #define LION_WALK_PASS_COST		5.0
 
 /*
+ * Does a plain scan whose rows lie on `pages` heap pages compete with a
+ * PARALLEL bitmap heap scan of them (DESIGN.md §29.11, "One process against
+ * several")?  core's own answer, create_partial_bitmap_paths()'s: the
+ * relation may be scanned in parallel and compute_parallel_worker() gives
+ * that many pages a worker - never below min_parallel_table_scan_size, at a
+ * max_parallel_workers_per_gather of 0 or for a table whose parallel_workers
+ * is 0.  An inheritance child is given one whatever its size, for a Parallel
+ * Append to combine; below that size a child's plain scan is taken as a base
+ * relation's is, against one process's bitmap heap scan.
+ */
+static bool
+lion_plain_meets_workers(RelOptInfo *rel, double pages)
+{
+	if (!rel->consider_parallel || max_parallel_workers_per_gather <= 0)
+		return false;
+	if (rel->reloptkind != RELOPT_BASEREL &&
+		pages < (double) min_parallel_table_scan_size)
+		return false;
+	return compute_parallel_worker(rel, pages, -1,
+								   max_parallel_workers_per_gather) > 0;
+}
+
+/*
  * The correlation handed to cost_index() for a plain scan (DESIGN.md
  * §29.11).  A LIST, which restarts the heap for every batch, gets the
  * column's, as btree's does (lion_index_correlation()).
@@ -1339,6 +1382,22 @@ lion_plain_walk_entries(PlannerInfo *root, IndexPath *path, int c)
  * measurement behind that constant the plain scan spent 0.4 us a page LESS
  * than the bitmap heap scan, which is not credited: with one row to a page
  * the two cost about the same.
+ *
+ * That is one process against one process.  Against a PARALLEL bitmap heap
+ * scan - where core would give the bitmap heap scan of the same pages
+ * workers (lion_plain_meets_workers()) - it is not.  The plain scan is one
+ * process (amcanparallel is false: cost_index() divides none of its price)
+ * that reads a page when it needs it; the parallel scan reads its pages in
+ * several processes, each reading ahead.  core credits that scan with its CPU
+ * divided and nothing for its reads, so the plain scan gives back the credit
+ * it took from cost_bitmap_heap_scan() for reading in block order: a page is
+ * priced as one process's read, random_page_cost but for the pages that
+ * follow the one read before them, which the kernel's read-ahead of a
+ * consecutive run serves - their share of the heap, where the bitmap heap
+ * scan's price takes its square root.  Below that size, and wherever no
+ * parallel plan can be made, it is one process against one, priced alike,
+ * which is what keeps a selective result on the plain scan (DESIGN.md
+ * §29.11, "One process against several").
  *
  * A WALK hands out one entry's TIDs in heap order, then the next entry's:
  * it is a pass over the heap per entry, each reading its entry's pages in
@@ -1385,6 +1444,9 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
 	double		passes = 1.0;	/* heap passes: the entries of a WALK */
 	double		passpages;		/* the pages one pass reads */
 	double		visits;			/* the page visits of all the passes */
+	double		bmpages;		/* the pages a bitmap heap scan reads */
+	double		share;			/* of the price between random and seq */
+	bool		serial;			/* against a parallel bitmap heap scan */
 	int			walkcol;
 	int			shape;
 
@@ -1427,10 +1489,26 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
 	else
 		passpages = pages;
 	visits = Min(passes * passpages, tuples);
-	target = pages * ((passpages >= 2.0) ?
-					  spc_random_page_cost -
-					  (spc_random_page_cost - spc_seq_page_cost) * sqrt(passpages / T) :
-					  spc_random_page_cost);
+
+	/*
+	 * The price of a page.  Against one process's bitmap heap scan, that
+	 * scan's: random_page_cost falling to seq_page_cost with the square root
+	 * of the share of the heap a pass reads.  Against a parallel one, over
+	 * the pages compute_bitmap_pages() counts for it, one process's reading a
+	 * page when it needs it: random_page_cost, and seq_page_cost for a page
+	 * that follows the one read before it - the share itself, not its root.
+	 */
+	bmpages = Min(ceil((2.0 * T * tuples) / (2.0 * T + tuples)), T);
+	serial = loop_count <= 1.0 && path->path.param_info == NULL &&
+		lion_plain_meets_workers(baserel, bmpages);
+	if (passpages < 2.0)
+		share = 0.0;
+	else if (serial)
+		share = passpages / T;
+	else
+		share = sqrt(passpages / T);
+	target = pages * (spc_random_page_cost -
+					  (spc_random_page_cost - spc_seq_page_cost) * share);
 
 	/* cost_index()'s ends: uncorrelated (max_io) and packed (min_io) */
 	if (loop_count > 1)
@@ -1659,7 +1737,8 @@ lion_set_merge_cost(PlannerInfo *root, IndexPath *path, double *pages)
  * plain scan's per-row work (lion_plain_heap_correlation()), otherwise the
  * column's correlation as btree's is (lion_index_correlation(), DESIGN.md
  * §29.11); a bitmap path, which shares this estimate, does not read that
- * last number.
+ * last number.  With pg_lion.enable_plain_scan off there is no plain path to
+ * price.
  */
 void
 lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
@@ -1671,6 +1750,22 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	bool		emits_all_rows;
 	bool		fullscan = lion_scan_walks_whole_index(path, &emits_all_rows);
 	double		walkrows = 0.0;
+
+	/*
+	 * pg_lion.enable_plain_scan off (DESIGN.md §29.11, "Plain scans switched
+	 * off"): the planner is to plan this index as it plans a GIN index, for
+	 * bitmap scans only.  get_index_paths() offers an IndexPath as a plain or
+	 * index-only scan only when the index's amhasgettuple says so, and asks
+	 * once the path is built and costed - here - so clearing the flag now
+	 * keeps every plain path of the index, parameterized ones included, out
+	 * of this planning run before add_path() has compared one with anything
+	 * else.  The bitmap paths are built from the same IndexPaths and do not
+	 * change, nor does what reads them: LionOrdered takes its lion side from
+	 * a bitmap path when there is no plain one (lion_ordered.c).  The next
+	 * planning run reads the flag from the handler again.
+	 */
+	if (!lion_enable_plain_scan)
+		path->indexinfo->amhasgettuple = false;
 
 	/*
 	 * A full walk visits every index tuple, and genericcostestimate() then
@@ -1837,8 +1932,9 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	*indexStartupCost = costs.indexStartupCost;
 	*indexTotalCost = costs.indexTotalCost;
 	*indexSelectivity = costs.indexSelectivity;
-	*indexCorrelation = lion_plain_heap_correlation(root, path, loop_count,
-													costs.indexSelectivity);
+	*indexCorrelation = lion_enable_plain_scan ?
+		lion_plain_heap_correlation(root, path, loop_count,
+									costs.indexSelectivity) : 0.0;
 	*indexPages = costs.numIndexPages;
 }
 

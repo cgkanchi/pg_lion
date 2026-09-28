@@ -356,6 +356,25 @@ bulk-built index has none of either.  The counters that describe the
 relation rather than a column - the directory's shape, free and deleted pages - are repeated on
 every row.
 
+## Settings
+
+Planner switches, each on by default and settable per session (`SET`), for comparing plans and
+working around a bad choice:
+
+- `pg_lion.enable_count_pushdown`: answer `count(*)` from Lion indexes with the `LionCount`
+  custom scan (DESIGN.md §10).
+- `pg_lion.enable_ordered_scan`: offer `LionOrdered`, a Lion-filtered walk of a B-tree, for an
+  `ORDER BY` (DESIGN.md §30).
+- `pg_lion.enable_plain_scan`: let the planner use plain and index-only scans of Lion indexes
+  (`amgettuple`, DESIGN.md §29). Off, Lion indexes are planned for bitmap scans only, as GIN
+  indexes are, and every other index's scans are unaffected - where `enable_indexscan = off` would
+  also take away B-tree index scans. The count pushdown and `LionOrdered` still use Lion indexes.
+
+Testing knobs rather than tuning ones: `pg_lion.scan_window_floor` (4 MB), the least memory a plain
+scan's window of container keys takes (DESIGN.md §29.3), and `pg_lion.vacuum_barrier_ranges`
+(superuser), how many visited-block ranges VACUUM batches in rmgr mode (DESIGN.md §25).
+`pg_lion.rmgr_id` is described under `wal_mode` above.
+
 ## Known limitations
 
 Equality, `IN` lists, scalar ranges and the multi-key operators above are supported, through bitmap
