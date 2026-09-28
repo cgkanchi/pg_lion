@@ -1,26 +1,25 @@
 # pg_lion explained (video)
 
-`pg_lion_explained.mp4` (6:54, 1080p, 14 MB) is a narrated explainer of Lion for people who *use* PostgreSQL:
-DBAs and application developers, not people who build database internals.  It covers what Lion is,
-how it differs from the B-tree and GIN indexes they already use, where it wins, where it doesn't,
-and how to try it.  Every number in it comes from the README's "Latest benchmarks" (PostgreSQL
-18.6, commit `118f623`).
+`pg_lion_explained.mp4` (1:10, 1080p, 2.6 MB) is a short, narrated pitch for Lion, aimed at the
+people who decide which index a table gets: developers, DBAs and their leads.  It shows the problem
+(counting matches row by row), how Lion counts instead, the headline numbers, how little it takes to
+adopt, and where B-tree and GIN still fit.  Every number comes from the README's "Latest
+benchmarks" (PostgreSQL 18.6, commit `118f623`), and the end card carries the caveats: a
+prototype, fastest on vacuumed tables, slower inserts than a B-tree.
 
-| # | Chapter | What it shows |
+| Time | Beat | On screen |
 |---|---|---|
-| 0 | Introduction | the one question Lion answers: how many rows match? |
-| 1 | The question dashboards ask | `count(*)` + `WHERE` + `GROUP BY`; 5M rows, half of them matching |
-| 2 | B-tree: a sorted list | a quick descent, then one step per matching row: 157 ms |
-| 3 | GIN: an inverted index | key → rows; arrays, JSONB, full text; counting reads the table: 665 ms |
-| 4 | Lion: sets of rows, in chunks | 64-page chunks, one container each: sorted list, bitmap or runs |
-| 5 | Counting without walking rows | adding container totals; the visibility map and VACUUM; 1.7 ms |
-| 6 | Filters and groups | AND of two sets, GROUP BY, and the other measured speedups |
-| 7 | Where Lion doesn't win | rare keys, fetching rows, ORDER BY, phrase/prefix, dirty pages, writes |
-| 8 | Using it | `CREATE INDEX ... USING lion`, `EXPLAIN` showing `LionCount`, `summaries = auto` |
-| 9 | Which index, when | the cheat sheet |
+| 0:00 | How many rows match? | every dashboard, filter and report asks it |
+| 0:08 | Counting is slow | 5M rows, half matching: B-tree 157 ms, GIN 665 ms |
+| 0:16 | Meet Lion | a roaring-bitmap index for Postgres |
+| 0:21 | How it counts | 64-page chunks, compressed containers, each with its count; add them up |
+| 0:31 | The numbers | 1.7 ms, 90× B-tree; 9× two filters, 24× GROUP BY, 168× array tags vs GIN |
+| 0:47 | Just an index | `CREATE INDEX ... USING lion`, `VACUUM`, and the plan says `LionCount` |
+| 0:55 | Where it fits | B-tree for lookups and ORDER BY, GIN for text, Lion for counts |
+| 1:02 | Try it | the repository, and the fine print |
 
 The MP4 carries chapters and an English subtitle track, and the captions are also burned into the
-picture.
+picture for muted playback.
 
 ## Rebuilding it
 
@@ -33,7 +32,7 @@ The video is generated, not edited: the narration is `script.json`, the pictures
     curl -LO https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
     curl -LO https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
     python build_audio.py kokoro-v1.0.onnx voices-v1.0.bin build    # narration.wav, timeline.js, captions.srt
-    python render.py build stills 60 190 232                         # check a few frames
+    python render.py build stills 14 34 50                           # check a few frames
     python render.py build video --jobs 4                            # build/pg_lion_explained.mp4
 
 `build_audio.py` speaks each sentence of `script.json` separately and lays them out on a timeline
@@ -43,7 +42,7 @@ change the words and the pictures follow.  `scenes.html` is a deterministic page
 headless Chromium and encodes the frames with ffmpeg.  Open `build/scenes.html?play` in a browser
 to watch the animation live (without sound), or `?t=190` to see a single instant.
 
-Words the voice gets wrong are spelled for it in `say` ("B tree", "gin", "P G Lion", "JSON-B"),
+Words the voice gets wrong are spelled for it in `say` ("Postgress", "B tree", "gin", "P G Lion"),
 and the caption keeps the written form (`cap`, or a default mapping in `build_audio.py`).  Set
 `CHROMIUM=/path/to/chrome` when Playwright's own browser download is not the one installed.
 

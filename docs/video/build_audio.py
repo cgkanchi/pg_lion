@@ -22,7 +22,6 @@ from kokoro_onnx import Kokoro
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SR = 24000
-SENTENCE_GAP = 0.28
 
 
 def split_sentences(text):
@@ -33,6 +32,7 @@ def split_sentences(text):
 def default_caption(say):
     cap = re.sub(r"\bgin\b", "GIN", say, flags=re.IGNORECASE)
     cap = cap.replace("P G Lion", "pg_lion").replace("count star", "count(*)").replace("B tree", "B-tree")
+    cap = cap.replace("Postgress", "Postgres")
     return cap
 
 
@@ -65,7 +65,7 @@ def main():
     for si, scene in enumerate(script["scenes"]):
         sc = {"id": scene["id"], "title": scene["title"], "start": 0.0 if si == 0 else t, "cues": []}
         if si > 0:
-            t += 0.9                # the new scene settles before it speaks
+            t += script["settle"]   # the new scene settles before it speaks
         for cue in scene["cues"]:
             says = split_sentences(cue["say"])
             caps = split_sentences(cue.get("cap") or default_caption(cue["say"]))
@@ -74,7 +74,7 @@ def main():
             c = {"id": cue["id"], "start": t, "sentences": []}
             for i, (say, cap) in enumerate(zip(says, caps)):
                 if i > 0:
-                    t += SENTENCE_GAP
+                    t += script["sentence_gap"]
                 samples = speak(say)
                 clips.append((t, samples))
                 dur = len(samples) / SR
