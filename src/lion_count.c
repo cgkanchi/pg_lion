@@ -3460,11 +3460,15 @@ lion_cursor_close(LionSetCursor *cur)
  *			re-optimize an intermediate container.  Both costs are then
  *			proportional to the containers that actually take part rather
  *			than to the length of the list.
- *	AND		the intersection (`tags @> '{a,b}'`, and the AND nodes of a
- *			tsquery, DESIGN.md §17): the children are wound forward until
- *			they all stand at one container key, and the container is the AND
- *			of theirs.  A container key whose intersection comes out empty is
- *			skipped here rather than handed up.
+ *	AND		the intersection (`tags @> '{a,b}'`, the AND nodes of a tsquery,
+ *			DESIGN.md §17, and a lion index scan's AND of its quals' sets,
+ *			§29.2): the children are wound forward until they all stand at
+ *			one container key, and the container is the AND of theirs.  A
+ *			container key whose intersection comes out empty is skipped here
+ *			rather than handed up.  The winding is the count's own leapfrog
+ *			(lion_leapfrog()): the child with the fewest members drives, the
+ *			others are sought to its keys fewest first, and a key is given up
+ *			at the first child that rules it out.
  *
  * THE PIN RULE (DESIGN.md §9) IS UNCHANGED BY EITHER OPERATOR.  Every leaf
  * that contributed a container to the result still pins the page that
@@ -3572,6 +3576,13 @@ typedef struct LionExprCursor
 	LionContainer *acc[2];		/* AND/OR accumulators, only when nsub > 1 */
 
 	/*
+	 * LION_KN_AND, the leapfrog (lion_leapfrog()): the children in the order
+	 * they are sought, fewest members first (lion_node_members()), so that
+	 * sub[order[0]] drives.
+	 */
+	int		   *order;
+
+	/*
 	 * LION_KN_OR, the k-way merge.  heap[0 .. nheap-1] is a min-heap of every
 	 * child that still has a container and is not standing at the current
 	 * key; hot[0 .. nhot-1] are the children that are, the ones whose
@@ -3612,6 +3623,215 @@ static void lion_ecursor_build(LionExprCursor *c);
 static void lion_ecursor_next(LionExprCursor *c);
 static void lion_ecursor_seek(LionExprCursor *c, uint32 target);
 static void lion_ecursor_close(LionExprCursor *c);
+
+/* ---- the leapfrog: the AND of cursors ---- */
+
+/*
+ * How many rows a node's sets hold, from what the located sets carry already
+ * (`ntids`, the entries' own counts), so that no page is read to decide it:
+ * a set's own, a union's sets together - an upper bound - and the least of an
+ * intersection's children, which it cannot exceed.  It orders the sources of
+ * a leapfrog (lion_leapfrog()); a wrong guess costs pages, never an answer.
+ */
+static double
+lion_node_members(const LionKeyNode *node, const LionPostingSet *sets)
+{
+	double		m = 0;
+	int			i;
+
+	check_stack_depth();
+
+	if (node == NULL)
+		return 0;
+	if (node->kind == LION_KN_KEY)
+		return sets[node->keyno].found ? (double) sets[node->keyno].ntids : 0;
+	for (i = 0; i < node->nargs; i++)
+	{
+		double		c = lion_node_members(node->args[i], sets);
+
+		if (node->kind == LION_KN_OR)
+			m += c;
+		else if (i == 0 || c < m)
+			m = c;
+	}
+	return m;
+}
+
+/*
+ * order[0 .. n-1] = 0 .. n-1 sorted by est[], ascending.  An insertion sort,
+ * because an AND has a handful of sources and this runs once per cursor; it
+ * is STABLE, so of equal estimates the first comes first.
+ */
+static void
+lion_leapfrog_order(const double *est, int n, int *order)
+{
+	int			i;
+	int			j;
+
+	for (i = 0; i < n; i++)
+	{
+		for (j = i; j > 0 && est[order[j - 1]] > est[i]; j--)
+			order[j] = order[j - 1];
+		order[j] = i;
+	}
+}
+
+/*
+ * THE LEAPFROG (DESIGN.md §22, §25): the AND of cursors, as the count's merge
+ * makes it (lion_run_merge()) and as an AND node of the evaluator makes it
+ * (lion_ecursor_build()) - which is what a lion index scan's AND of its quals'
+ * sets is, in its stream and in its bitmap (DESIGN.md §29.2), and what the
+ * count's multi-key AND trees are.  One function, so that the two cannot do
+ * different work on the same sets.
+ *
+ * It winds cur[order[0 .. n-1]] forward to the next container key at which
+ * every one of them has a container and their AND holds a member, and
+ * returns that AND, its key in *key; NULL once one of them runs out, or the
+ * key reaches `hi` (a chunk of a collection, LionCollect.ranged).
+ *
+ * order[0] is the DRIVER, the cursor with the fewest members, and the others
+ * follow in ascending members.  The driver is the only one that ever steps
+ * past a key; the others are left standing and are SOUGHT to the key the
+ * driver has reached, which costs each one probe instead of a walk - stepping
+ * all of them would cost each a container at key + 1 that the seek is about
+ * to skip anyway.  They are taken in that order, each sought and folded into
+ * the running intersection before the next one is touched at all, and the key
+ * is ABANDONED the moment the intersection is empty, or a cursor sought lands
+ * past the key: the ones after it in the order are neither sought nor read.
+ * The fewer members a cursor has, the likelier it is to be the one that kills
+ * the key, and the smaller the containers ANDed early are, which is what
+ * keeps the dense ones - a bitset a key - out of all but the last ANDs.  Any
+ * other order is still correct, and reads more.
+ *
+ * The AND is built in work[0] and work[1] alternately; *w comes back as the
+ * one it is NOT in, for a caller that goes on with it (the merge's negated
+ * sources).  With `raw`, the containers are left unoptimized
+ * (lion_container_and_raw()): a count's, which are ANDed again or counted and
+ * never kept (DESIGN.md §15, "Unions and intersections unoptimized").  With n = 1 it is the cursor's own container.  `stats`, when not
+ * NULL, counts the seeks an abandoned key saved (EXPLAIN's Probes Avoided):
+ * a cursor standing at the key or beyond would not have been sought anyway,
+ * so only the ones still below it count.
+ *
+ * THE DESIGN.md §9 PIN DISCIPLINE IS UNCHANGED, and this is the argument.
+ * The rule is that the visibility-map question about a container's heap
+ * blocks is asked before the pin on the page that container came from is
+ * released.  A key that is abandoned asks NO such question - nothing of it
+ * reaches the count - so there is no obligation to discharge for any of the
+ * pages it touched, sought or not.  The cursors that are not sought keep
+ * their PINS exactly where they stood: a pin too many never makes a count
+ * wrong, it only makes VACUUM wait (see lion_ecursor_next()).  The pages the
+ * sought ones let go of are let go by lion_ecursor_seek(), at keys nothing
+ * was counted from.  And the key that is returned has every cursor standing
+ * on it, each with the pin its container came with: the caller asks the map
+ * before it steps the driver (lion_count_container()), and an AND node hands
+ * the key up to a caller that does.
+ */
+static const LionContainer *
+lion_leapfrog(LionExprCursor *cur, const int *order, int n,
+			  LionContainer *const *work, int *w, bool raw, uint64 hi,
+			  LionCountStats *stats, uint32 *key)
+{
+	for (;;)
+	{
+		const LionContainer *acc = NULL;
+		uint32		target;
+		int			k;
+		int			m;
+
+		for (k = 0; k < n; k++)
+		{
+			if (!cur[order[k]].valid)
+				return NULL;	/* one ran out: so has the intersection */
+		}
+
+		target = cur[order[0]].ckey;
+		for (k = 1; k < n; k++)
+		{
+			if (cur[order[k]].ckey > target)
+				target = cur[order[k]].ckey;
+		}
+		if ((uint64) target >= hi)
+			return NULL;
+
+		*w = 0;
+		for (k = 0; k < n; k++)
+		{
+			LionExprCursor *c = &cur[order[k]];
+
+			if (c->ckey < target)
+			{
+				lion_ecursor_seek(c, target);
+				if (!c->valid)
+					return NULL;
+			}
+
+			if (c->ckey > target)
+			{
+				/*
+				 * No container at the target at all: the key is dead, as with
+				 * an empty intersection, one step earlier.  The cursors after
+				 * this one are left standing, and the round starts again at
+				 * the key it found, the next one that can possibly survive -
+				 * the driver sought there first.
+				 */
+				if (stats != NULL)
+				{
+					for (m = k + 1; m < n; m++)
+					{
+						if (cur[order[m]].ckey < target)
+							stats->probes_avoided++;
+					}
+				}
+				target = c->ckey;
+				if ((uint64) target >= hi)
+					return NULL;
+				acc = NULL;
+				*w = 0;
+				k = -1;
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+
+			if (acc == NULL)
+				acc = c->cur;
+			else
+			{
+				if (raw)
+					lion_container_and_raw(acc, c->cur, work[*w]);
+				else
+					lion_container_and(acc, c->cur, work[*w]);
+				acc = work[*w];
+				*w ^= 1;
+			}
+
+			if (lion_container_cardinality(acc) == 0)
+				break;
+		}
+
+		if (k >= n)
+		{
+			*key = target;
+			return acc;
+		}
+
+		/*
+		 * Abandoned: nothing of this key survives, so nothing asks the map
+		 * about it and the driver's page may go.  Only the driver steps; the
+		 * others still stand at or below the key it leaves and are sought
+		 * from there on the next round.
+		 */
+		if (stats != NULL)
+		{
+			for (m = k + 1; m < n; m++)
+			{
+				if (cur[order[m]].ckey < target)
+					stats->probes_avoided++;
+			}
+		}
+		lion_ecursor_next(&cur[order[0]]);
+		CHECK_FOR_INTERRUPTS();
+	}
+}
 
 /* ---- planning a tree against the open budget ---- */
 
@@ -3666,6 +3886,8 @@ lion_node_overhead(LionKeyNodeKind kind, int nargs)
 
 	if (nargs > 1)
 		mem += 2 * lion_alloc_size(LION_CONTAINER_MAX_SIZE);	/* acc[] */
+	if (kind == LION_KN_AND)
+		mem += (Size) nargs * sizeof(int);	/* order */
 	if (kind == LION_KN_OR)
 	{
 		mem += 2 * (Size) nargs * sizeof(LionOrHeapEnt);	/* heap, hot */
@@ -4321,6 +4543,18 @@ lion_ecursor_init(LionExprCursor *c, const LionNodePlan *plan,
 			c->acc[1] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 		}
 
+		if (node->kind == LION_KN_AND)
+		{
+			/* the leapfrog's order: fewest members first (lion_leapfrog()) */
+			double	   *est = (double *) palloc(sizeof(double) * c->nsub);
+
+			for (i = 0; i < c->nsub; i++)
+				est[i] = lion_node_members(node->args[i], sets);
+			c->order = (int *) palloc(sizeof(int) * c->nsub);
+			lion_leapfrog_order(est, c->nsub, c->order);
+			pfree(est);
+		}
+
 		if (node->kind == LION_KN_OR)
 		{
 			c->hot = (LionOrHeapEnt *) palloc(sizeof(LionOrHeapEnt) * c->nsub);
@@ -4431,75 +4665,21 @@ lion_ecursor_build(LionExprCursor *c)
 
 	Assert(c->kind == LION_KN_AND);
 
-	for (;;)
-	{
-		uint32		maxckey;
-		bool		alleq = true;
-
-		for (i = 0; i < c->nsub; i++)
-		{
-			if (!c->sub[i].valid)
-				return;			/* a child ran out: so has the intersection */
-		}
-
-		maxckey = c->sub[0].ckey;
-		for (i = 1; i < c->nsub; i++)
-		{
-			if (c->sub[i].ckey > maxckey)
-				maxckey = c->sub[i].ckey;
-		}
-
-		/*
-		 * Wind the laggards forward; their containers cannot contribute.
-		 * DESIGN.md §22: a laggard SEEKS to the key the others stand at
-		 * instead of stepping through everything in between, which is the
-		 * whole point of the posting tree.  Nothing of the keys it skips ever
-		 * reaches the visibility map, so the §9 rule is untouched - this is
-		 * the same window the code used to call lion_ecursor_next() in.
-		 */
-		for (i = 0; i < c->nsub; i++)
-		{
-			if (c->sub[i].ckey != maxckey)
-			{
-				alleq = false;
-				lion_ecursor_seek(&c->sub[i], maxckey);
-			}
-		}
-		if (!alleq)
-		{
-			CHECK_FOR_INTERRUPTS();
-			continue;
-		}
-
-		acc = c->sub[0].cur;
-		w = 0;
-		for (i = 1; i < c->nsub; i++)
-		{
-			if (c->raw)
-				lion_container_and_raw(acc, c->sub[i].cur, c->acc[w]);
-			else
-				lion_container_and(acc, c->sub[i].cur, c->acc[w]);
-			acc = c->acc[w];
-			w ^= 1;
-		}
-
-		if (lion_container_cardinality(acc) > 0)
-		{
-			c->ckey = maxckey;
-			c->cur = acc;
-			c->valid = true;
-			return;
-		}
-
-		/*
-		 * Nothing of this container key survives the intersection, so nothing
-		 * will ask the visibility map about it and every child may move on.
-		 */
-		for (i = 0; i < c->nsub; i++)
-			lion_ecursor_next(&c->sub[i]);
-
-		CHECK_FOR_INTERRUPTS();
-	}
+	/*
+	 * The children, wound forward to the next key their AND holds a member
+	 * at, as the count's merge winds its sources (lion_leapfrog(), DESIGN.md
+	 * §22): the one with the fewest members drives, the others are sought to
+	 * its keys in ascending members, and a key is abandoned as soon as the
+	 * intersection is empty.  Nothing of the keys they pass over ever reaches
+	 * the visibility map, so the §9 rule is untouched - this is the same
+	 * window the code has always wound laggards forward in.
+	 */
+	acc = lion_leapfrog(c->sub, c->order, c->nsub, c->acc, &w, c->raw,
+						LION_WIDE_END, NULL, &c->ckey);
+	if (acc == NULL)
+		return;
+	c->cur = acc;
+	c->valid = true;
 }
 
 /*
@@ -4551,13 +4731,14 @@ lion_ecursor_next(LionExprCursor *c)
 		case LION_KN_AND:
 
 			/*
-			 * Every child stands at c->ckey, but only ONE of them has to step:
-			 * lion_ecursor_build() then finds it ahead of the others and SEEKS
-			 * them to it (DESIGN.md §22), which is one probe each instead of a
-			 * walk.  Stepping all of them would cost every child a container
-			 * at c->ckey + 1 that the seek is about to skip anyway.
+			 * Every child stands at c->ckey, but only ONE of them has to step,
+			 * the driver: lion_ecursor_build() then finds it ahead of the
+			 * others and SEEKS them to it (DESIGN.md §22), which is one probe
+			 * each instead of a walk.  Stepping all of them would cost every
+			 * child a container at c->ckey + 1 that the seek is about to skip
+			 * anyway.
 			 */
-			lion_ecursor_next(&c->sub[0]);
+			lion_ecursor_next(&c->sub[c->order[0]]);
 			break;
 	}
 
@@ -4623,9 +4804,13 @@ lion_ecursor_seek(LionExprCursor *c, uint32 target)
 			break;
 
 		case LION_KN_AND:
-			/* every child stands at c->ckey, and the result needs all of them */
-			for (i = 0; i < c->nsub; i++)
-				lion_ecursor_seek(&c->sub[i], target);
+
+			/*
+			 * Only the driver: lion_ecursor_build() seeks the others to
+			 * wherever it lands, one at a time, and not at all past a child
+			 * that rules the key out (lion_leapfrog()).
+			 */
+			lion_ecursor_seek(&c->sub[c->order[0]], target);
 			break;
 	}
 
@@ -6590,6 +6775,7 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 	int		   *probeord;		/* the positive sources, least first */
 	int			nprobe = 0;
 	int			driver;
+	uint64		hi;				/* the merge ends before this key */
 	int			i;
 
 	cursors = (LionExprCursor *) palloc0(sizeof(LionExprCursor) * nsources);
@@ -6680,8 +6866,8 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 	 * A chunk of a shared copy (LionCollect.ranged) begins at its first key:
 	 * the positive sources are sought there - a collection holds no pin, so
 	 * nothing they pass over carries an answer - and the merge ends where the
-	 * chunk does (lion_collect_past(), below).  The negated ones are sought
-	 * when they are needed, as always.
+	 * chunk does (`hi`, below).  The negated ones are sought when they are
+	 * needed, as always.
 	 */
 	if (cx->collect != NULL && cx->collect->ranged && cx->collect->lo > 0)
 	{
@@ -6693,6 +6879,19 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 	}
 
 	/*
+	 * Past a container key only the DRIVER steps; the others are left standing
+	 * where they are and are sought to wherever the driver has got to
+	 * (DESIGN.md §22).  A cursor that keeps its place also keeps its pin,
+	 * which is a pin too many and never a wrong answer (see
+	 * lion_ecursor_next()).
+	 */
+	for (i = 0; i < nsources; i++)
+		cursors[i].advance = false;
+	cursors[driver].advance = true;
+	hi = (cx->collect != NULL && cx->collect->ranged) ?
+		cx->collect->hi : LION_WIDE_END;
+
+	/*
 	 * Merge the sources by container key.  Containers are stored in ascending
 	 * ckey order both inline and along a chain, and an expression cursor
 	 * preserves that, so a single forward pass over all of them is enough.
@@ -6700,156 +6899,28 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 	for (;;)
 	{
 		uint32		maxckey;
-		const LionContainer *acc = NULL;
-		bool		abandoned = false;
-		int			w = 0;
-		int			k;
-
-		/* The positive sources drive the merge; all must still have data. */
-		for (k = 0; k < nprobe; k++)
-		{
-			if (!cursors[probeord[k]].valid)
-				goto merge_done;
-		}
-
-		maxckey = cursors[probeord[0]].ckey;
-		for (k = 1; k < nprobe; k++)
-		{
-			if (cursors[probeord[k]].ckey > maxckey)
-				maxckey = cursors[probeord[k]].ckey;
-		}
-		if (lion_collect_past(cx, maxckey))
-			goto merge_done;
-
-		/*
-		 * Past this container key only the DRIVER steps; the others are left
-		 * standing where they are and the next round of this loop seeks them
-		 * to wherever the driver has got to (DESIGN.md §22).  A cursor that
-		 * keeps its place also keeps its pin, which is a pin too many and
-		 * never a wrong answer (see lion_ecursor_next()).
-		 */
-		for (i = 0; i < nsources; i++)
-			cursors[i].advance = false;
-		cursors[driver].advance = true;
+		const LionContainer *acc;
+		int			w;
 
 		/*
 		 * THE INTERSECTION OF THE POSITIVE SOURCES, BUILT AS THEY ARE SOUGHT
-		 * (DESIGN.md §25).  The sources are taken in probe order - the driver,
-		 * which stands at or below the target already, then the others least
-		 * selective-first - and each one is sought to the target and folded
-		 * into the accumulator before the next one is touched at all.  The
-		 * moment the accumulator is empty the container key is ABANDONED: the
-		 * sources after it in the order are not sought, and the pages their
-		 * probes would have read are not read.  Before this the whole round of
+		 * (DESIGN.md §25): the leapfrog every AND of posting sets is made by,
+		 * a lion index scan's included (lion_leapfrog(), which carries the §9
+		 * argument).  The sources are taken in probe order, each sought to the
+		 * driver's key and folded into the accumulator before the next one is
+		 * touched at all, and a key is abandoned - the sources after it in the
+		 * order not sought, the pages their probes would have read not read -
+		 * the moment the accumulator is empty.  Before §25 the whole round of
 		 * seeks was made first and the intersection looked at afterwards,
 		 * which read a dense source's leaf at every container key the driver
-		 * produced, including the ones where the selective sources had already
-		 * ruled the key out.
-		 *
-		 * THE DESIGN.md §9 PIN DISCIPLINE IS UNCHANGED, and this is the
-		 * argument.  The rule is that the visibility-map question about a
-		 * container's heap blocks is asked before the pin on the page that
-		 * container came from is released.  An abandoned container key asks NO
-		 * such question - nothing of it reaches lion_count_container(), so
-		 * nothing of it reaches the count - so there is no obligation to
-		 * discharge for any of the pages it touched, sought or not.  What the
-		 * sources that were not sought keep is their PINS, exactly where they
-		 * stood: a pin too many never makes a count wrong, it only makes
-		 * VACUUM wait (see lion_ecursor_next()).  The pages the sources that
-		 * WERE sought let go of are let go by lion_ecursor_seek(), which is
-		 * the same window, at the same kind of key, as before §25.
+		 * produced, including the ones where the selective sources had
+		 * already ruled the key out.  A chunk of a collection ends at its last
+		 * key (lion_collect_past()).
 		 */
-		for (k = 0; k < nprobe; k++)
-		{
-			int			s = probeord[k];
-			int			m;
-
-			if (cursors[s].ckey < maxckey)
-			{
-				/*
-				 * DESIGN.md §22: a lagging source SEEKS to the largest key any
-				 * positive source stands at rather than stepping one container
-				 * at a time.  That is the leapfrog join the posting tree
-				 * exists for.
-				 */
-				lion_ecursor_seek(&cursors[s], maxckey);
-				if (!cursors[s].valid)
-					goto merge_done;
-			}
-
-			if (cursors[s].ckey > maxckey)
-			{
-				/*
-				 * This source has no container at the target at all, so the
-				 * intersection there is empty and the key is dead - the same
-				 * abandonment as an empty accumulator, one step earlier.  The
-				 * sources after it in the order are left standing; the round
-				 * starts again at the key this one found, which is the next
-				 * one that can possibly survive.
-				 */
-				for (m = k + 1; m < nprobe; m++)
-				{
-					if (cursors[probeord[m]].ckey < maxckey)
-						cx->stats.probes_avoided++;
-				}
-
-				maxckey = cursors[s].ckey;
-				if (lion_collect_past(cx, maxckey))
-					goto merge_done;
-				acc = NULL;
-				w = 0;
-				k = -1;
-				CHECK_FOR_INTERRUPTS();
-				continue;
-			}
-
-			if (acc == NULL)
-				acc = cursors[s].cur;
-			else
-			{
-				/* unoptimized: it is ANDed again or counted, never kept */
-				lion_container_and_raw(acc, cursors[s].cur, work[w]);
-				acc = work[w];
-				w ^= 1;
-			}
-
-			if (lion_container_cardinality(acc) == 0)
-			{
-				/*
-				 * Nothing can come back once the accumulator is empty, so the
-				 * rest of the order is not sought.  What that saves is one
-				 * seek each - a descent, or a step or two right - and it is
-				 * counted for EXPLAIN: a source standing at the target or
-				 * beyond it would not have been sought anyway, so only the
-				 * ones still below it count.
-				 */
-				for (m = k + 1; m < nprobe; m++)
-				{
-					if (cursors[probeord[m]].ckey < maxckey)
-						cx->stats.probes_avoided++;
-				}
-				abandoned = true;
-				break;
-			}
-		}
-
-		if (abandoned)
-		{
-			/*
-			 * Nothing of this container key survives, so no visibility-map
-			 * question is asked about it and the driver's page may go.  Only
-			 * the driver steps: the others are still standing at (or below)
-			 * the key it is leaving and are sought from there on the next
-			 * round.
-			 */
-			for (i = 0; i < nsources; i++)
-			{
-				if (cursors[i].advance)
-					lion_ecursor_next(&cursors[i]);
-			}
-			CHECK_FOR_INTERRUPTS();
-			continue;
-		}
+		acc = lion_leapfrog(cursors, probeord, nprobe, work, &w, true, hi,
+							&cx->stats, &maxckey);
+		if (acc == NULL)
+			goto merge_done;
 
 		/* ... minus the negated ones (DESIGN.md §14, `col IS NOT NULL`). */
 		for (i = 0; i < nsources; i++)
