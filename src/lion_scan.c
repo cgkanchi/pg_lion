@@ -25,7 +25,11 @@
  * independent set of entries, so that a scan key resolves to its column by
  * sk_attno.  The AND goes through the very expression evaluator a multi-key
  * query already uses, because "the sets of a and the sets of b" is an AND of
- * set trees whatever produced them.  A qual
+ * set trees whatever produced them, and its AND node is the count's own
+ * leapfrog (lion_leapfrog(), DESIGN.md §29.11): the tree of fewest rows
+ * drives, whatever the order of the index's columns, the others are sought
+ * to its keys fewest first, and a key is given up at the first tree that
+ * rules it out.  A qual
  * the sets cannot express (`IS NOT NULL`, a multi-key query that needs the
  * whole index) is dropped and the TIDs are marked for recheck, which is
  * always correct: the bitmap heap scan re-applies the original quals.  A
