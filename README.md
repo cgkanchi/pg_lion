@@ -161,6 +161,15 @@ rather than once per group; `EXPLAIN ANALYZE` prints `WHERE Sets Collected` when
 §10). The set stays within a hash table's memory (`work_mem` times `hash_mem_multiplier`) and goes
 to a temporary file past it.
 
+On a partitioned table the pushdown counts each partition the planner keeps, with that partition's
+own Lion indexes (DESIGN.md §16), and every `WHERE` clause needs one in every partition counted -
+except a clause the partition's bounds imply. `kind = 'a'` over a table partitioned by `kind`,
+once pruning has left only the `kind = 'a'` partitions (sub-partitions included), is true of every
+row they hold: it needs no index there and is left out of their counts, and `EXPLAIN` lists it
+under `Implied by Partition Bounds`. The proof is PostgreSQL's own, the one partial indexes use, so
+a partition that also takes NULLs, a default partition, or a generic plan's parameter implies
+only what that proof can show.
+
 A count over a fact table joined to a filtered dimension (DESIGN.md §27) is pushed down too, when the
 fact's foreign-key column has a Lion index and its own filters are ones Lion answers: the dimension
 side runs as an ordinary plan (its own Lion index serves its filters through a bitmap scan), and for

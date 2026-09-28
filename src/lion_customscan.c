@@ -105,6 +105,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
+#include "optimizer/appendinfo.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "parser/parse_coerce.h"
@@ -117,6 +118,7 @@
 #include "optimizer/prep.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
+#include "rewrite/rewriteManip.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/array.h"
@@ -126,6 +128,7 @@
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/partcache.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
 #include "utils/selfuncs.h"
@@ -701,7 +704,9 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *	4	IntList: LION_CLAUSE_* for each WHERE clause
  *	5	List of OidList, one per live leaf partition and empty for a plain
  *		table (DESIGN.md §16): heap Oid, the outer and inner group index Oids
- *		(InvalidOid if none), then one index Oid per WHERE clause
+ *		(InvalidOid if none), then one index Oid per WHERE clause - or
+ *		InvalidOid for a clause the partition's bounds imply, which it leaves
+ *		out (§16, "Clauses the partition bounds imply")
  *	6	OidList: the operator of each WHERE clause (InvalidOid for a null
  *		test), which is what EXPLAIN prints a multi-key clause with
  *	7	List of IntList, one per OR restriction (DESIGN.md §19):
@@ -742,7 +747,12 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *		c, then an OidList of the grouping equality operator and collation,
  *		with which the entry walk recognises c's own entry.  The group
  *		column in member 2 is col
- *	13	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	13	List of String: the WHERE clauses no posting set answers that every
+ *		partition's bounds imply, left out of the plan altogether (DESIGN.md
+ *		§16, "Clauses the partition bounds imply"), as EXPLAIN prints them -
+ *		deparsed when the plan is made, since it carries no expression of
+ *		them to deparse later
+ *	14	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -758,7 +768,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_PRIV_JOIN		10
 #define LION_PRIV_EXECUTE	11
 #define LION_PRIV_COALESCE	12
-#define LION_PRIV_TLKINDS	13
+#define LION_PRIV_IMPLIED	13
+#define LION_PRIV_TLKINDS	14
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -794,6 +805,11 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * Shape 14 added the COALESCE member (12) in front of the target-list kinds
  * (GROUP BY coalesce(col, c), DESIGN.md §10).
  *
+ * Shape 15 let a partition's index Oid in member 5 be InvalidOid: a clause
+ * the partition's bounds imply, which it leaves out (DESIGN.md §16), and
+ * added the IMPLIED member (13), the clauses every partition leaves out, in
+ * front of the target-list kinds.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -806,8 +822,8 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x5242490e
-#define LION_PRIV_NMEMBERS	14
+#define LION_PRIV_MAGIC		0x5242490f
+#define LION_PRIV_NMEMBERS	15
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -1059,6 +1075,17 @@ typedef struct LionCountScanState
 	bool	   *inor;			/* one per clause */
 	int			nitem;
 	LionSourceItem *item;
+
+	/*
+	 * The items of the plan, which item and nitem are for a plain table.  A
+	 * partition leaves out the clauses its bounds imply (DESIGN.md §16,
+	 * "Clauses the partition bounds imply"): its item and nitem are the
+	 * plan's without them, made when it is opened (lion_relation_items()),
+	 * and those clauses have no index open while it is (idx NULL).
+	 */
+	int			nplanitem;
+	LionSourceItem *planitem;
+	List	   *implied;		/* LION_PRIV_IMPLIED, for EXPLAIN */
 
 	/*
 	 * The relations to count.  npart is 0 for a plain table, whose heap and
@@ -2079,6 +2106,11 @@ typedef struct LionCountTarget
 												 * estimate_num_groups() needs;
 												 * NULL when nothing drives the
 												 * scan */
+	bool	   *dropped;		/* one per WHERE clause: this partition's
+								 * bounds imply it, and it is no source here
+								 * (DESIGN.md §16, "Clauses the partition
+								 * bounds imply"); NULL when none is */
+	int			ndropped;
 } LionCountTarget;
 
 /*
@@ -2141,6 +2173,10 @@ lion_child_attno(PlannerInfo *root, Index childrelid, AttrNumber parentattno)
  * without a usable lion index on one of the columns.  An empty *targets
  * means everything was pruned away; the caller leaves that to the planner's
  * own dummy-rel handling.
+ *
+ * With `imply` (a partitioned table) a leaf leaves out the WHERE clauses its
+ * partition bounds imply (lion_leaf_drops()), and needs no index for them:
+ * its target's `dropped` says which, and its whereidx holds NULL there.
  */
 /*
  * Everything lion_match_index() needs about one clause, gathered once by the
@@ -2158,7 +2194,29 @@ typedef struct LionClauseInfo
 	bool		valueout;		/* the target list prints this column's value,
 								 * so the index has to be able to produce it
 								 * (lion_index_can_emit_value()) */
+	bool		inor;			/* a leaf of an OR restriction (§19) */
+	int			rinfono;		/* the restriction it came from, its position
+								 * in the relation's baserestrictinfo; -1 for
+								 * the FK-side join's key, which is none */
 } LionClauseInfo;
+
+/*
+ * What a leaf partition's bounds may make of the WHERE clauses (DESIGN.md
+ * §16, "Clauses the partition bounds imply"): the relation the clauses were
+ * written against - the partitioned table the query names, whose numbering
+ * they are in - and each restriction's clause by its position; and whether
+ * something other than the WHERE clauses drives the count, so that a
+ * partition left with no clause that selects rows still has its rows counted.
+ */
+typedef struct LionImply
+{
+	RelOptInfo *toprel;
+	List	   *clauses;		/* Expr, one per baserestrictinfo entry */
+	bool		driven;
+	List	   *skipped;		/* String: the clauses no posting set answers
+								 * that every partition implies, which are no
+								 * clauses of the plan (LION_PRIV_IMPLIED) */
+} LionImply;
 
 /*
  * Everything the driving index of one relation has to satisfy, gathered once
@@ -2179,16 +2237,365 @@ typedef struct LionDriveInfo
 	bool		valueout;		/* the group key appears in the output */
 } LionDriveInfo;
 
+/*
+ * The constraint every row of leaf partition `relation` satisfies, as an
+ * implicit-AND list over the leaf's own columns under range table index
+ * `relid`, or NIL for a table that is not a partition.  It is the whole of it
+ * - RelationGetPartitionQual() adds every ancestor's bound to the leaf's own,
+ * so a sub-partition's includes the bound its parent has in the table above -
+ * made ready for the planner as get_relation_constraints() makes it for
+ * constraint exclusion.
+ *
+ * Partition constraints never evaluate to NULL (partbounds.c builds them with
+ * explicit null tests, and says so where it negates one for a default
+ * partition), and a row is in a partition only if its constraint is not false
+ * - tuple routing puts it there by its bound, and ExecPartitionCheck() lets
+ * nothing else in, nor ATTACH PARTITION without proving or scanning for it.
+ * So every row of the leaf makes it TRUE, and a clause it strongly implies is
+ * TRUE of every row: exactly what a WHERE clause asks.
+ */
+static List *
+lion_leaf_partition_qual(Relation relation, Index relid)
+{
+	List	   *qual = RelationGetPartitionQual(relation);
+
+	if (qual == NIL)
+		return NIL;
+	qual = (List *) expression_planner((Expr *) qual);
+	if (relid != 1)
+		ChangeVarNodes((Node *) qual, 1, (int) relid, 0);
+	return qual;
+}
+
+/*
+ * Does leaf partition `leaf`'s constraint (lion_leaf_partition_qual()) imply
+ * `clause`, a WHERE clause over `toprel`'s columns?  The clause is mapped onto
+ * the leaf's columns through every level of partitioning between them, which
+ * is what the planner does to the restrictions it hands the leaf itself, and
+ * the proof is core's own predicate_implied_by(), the one partial indexes and
+ * constraint exclusion are decided by.  A clause with a volatile function or
+ * a subquery in it is never taken as implied: dropping it would change how
+ * often it runs, and the query asked for it per row.
+ */
+static bool
+lion_leaf_implies(PlannerInfo *root, RelOptInfo *leaf, RelOptInfo *toprel,
+				  List *partqual, Node *clause)
+{
+	Node	   *leafclause;
+
+	if (partqual == NIL || leaf == toprel)
+		return false;
+	if (contain_volatile_functions(clause) || contain_subplans(clause))
+		return false;
+	leafclause = adjust_appendrel_attrs_multilevel(root, clause, leaf, toprel);
+	return predicate_implied_by(list_make1(leafclause), partqual, false);
+}
+
+/*
+ * A WHERE clause of range table entry rti as EXPLAIN prints a qual on it:
+ * for a clause the plan does not carry at all (LION_PRIV_IMPLIED), and so
+ * deparsed when the plan is made, against the relation alone.
+ */
+static char *
+lion_deparse_rel_clause(PlannerInfo *root, Index rti, Node *clause)
+{
+	RangeTblEntry *rte = root->simple_rte_array[rti];
+	Node	   *copy = copyObject(clause);
+
+	if (rti != 1)
+		ChangeVarNodes(copy, (int) rti, 1, 0);
+	return deparse_expression(copy,
+							  deparse_context_for(get_rel_name(rte->relid),
+												  rte->relid),
+							  false, false);
+}
+
+/*
+ * Is `clause`, over partitioned table toprel's columns, implied by the bounds
+ * of every live leaf partition under `rel` (toprel itself, or one of its
+ * sub-partitioned descendants)?  The leaves are the ones lion_collect_targets()
+ * walks.  A clause no posting set can answer is no reason to decline a query
+ * whose partitions all imply it: every row they hold satisfies it, and it is
+ * left out of the count altogether (DESIGN.md §16, "Clauses the partition
+ * bounds imply").
+ */
+static bool
+lion_implied_everywhere(PlannerInfo *root, RelOptInfo *toprel, RelOptInfo *rel,
+						Node *clause)
+{
+	RangeTblEntry *rte;
+	Relation	relation;
+	List	   *partqual;
+
+	check_stack_depth();
+
+	if (rel == NULL || rel->relid == 0 ||
+		rel->relid >= (Index) root->simple_rel_array_size)
+		return false;
+	rte = root->simple_rte_array[rel->relid];
+	if (rte == NULL || rte->rtekind != RTE_RELATION)
+		return false;
+
+	if (rte->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		int			i;
+
+		if (IS_DUMMY_REL(rel))
+			return true;
+		if (!IS_PARTITIONED_REL(rel))
+			return false;
+		for (i = 0; i < rel->nparts; i++)
+		{
+			RelOptInfo *child = rel->part_rels[i];
+
+			if (child == NULL || !bms_is_member(i, rel->live_parts) ||
+				IS_DUMMY_REL(child))
+				continue;
+			if (!lion_implied_everywhere(root, toprel, child, clause))
+				return false;
+		}
+		return true;
+	}
+
+	relation = table_open(rte->relid, NoLock);
+	partqual = lion_leaf_partition_qual(relation, rel->relid);
+	table_close(relation, NoLock);
+
+	return lion_leaf_implies(root, rel, toprel, partqual, clause);
+}
+
+/*
+ * Is there still a clause that selects rows and carries the §9 interlock among
+ * the ones a partition keeps (drop[] says which restrictions it leaves out):
+ * a positive clause other than a range collected into memory, or an OR
+ * without one among its leaves (lion_leaf_drops())?
+ */
+static bool
+lion_leaf_selects(List *clauseinfos, const bool *drop, const bool *orrange)
+{
+	ListCell   *lc;
+
+	foreach(lc, clauseinfos)
+	{
+		LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
+		int			r = ci->rinfono;
+
+		if ((r >= 0 && drop[r]) || !LION_CLAUSE_IS_POSITIVE(ci->kind))
+			continue;
+		if (ci->inor ? (r < 0 || !orrange[r]) :
+			ci->kind != LION_CLAUSE_RANGESRC)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Are all of `rinfos` (RestrictInfos over toprel) implied by the bounds of
+ * every partition counted (lion_implied_everywhere())?
+ */
+static bool
+lion_rinfos_implied_everywhere(PlannerInfo *root, RelOptInfo *toprel,
+							   List *rinfos)
+{
+	ListCell   *lc;
+
+	foreach(lc, rinfos)
+	{
+		if (!lion_implied_everywhere(root, toprel, toprel,
+									 (Node *) ((RestrictInfo *) lfirst(lc))->clause))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Is there a WHERE clause that selects rows and carries the §9 interlock -
+ * as lion_leaf_selects() asks it of one partition - that not every partition
+ * counted leaves out?  `clauses` is each restriction's clause by position.
+ */
+static bool
+lion_pinned_not_implied(PlannerInfo *root, RelOptInfo *toprel,
+						List *clauseinfos, List *clauses)
+{
+	ListCell   *lc;
+
+	foreach(lc, clauseinfos)
+	{
+		LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
+		ListCell   *l2;
+		bool		pinned = true;
+
+		if (!LION_CLAUSE_IS_POSITIVE(ci->kind) || ci->rinfono < 0)
+			continue;
+		if (ci->inor)
+		{
+			/* an OR carries the pin when no leaf of it is a range */
+			foreach(l2, clauseinfos)
+			{
+				LionClauseInfo *other = (LionClauseInfo *) lfirst(l2);
+
+				if (other->rinfono == ci->rinfono &&
+					other->kind == LION_CLAUSE_RANGESRC)
+					pinned = false;
+			}
+		}
+		else if (ci->kind == LION_CLAUSE_RANGESRC)
+			pinned = false;
+		if (pinned &&
+			!lion_implied_everywhere(root, toprel, toprel,
+									 (Node *) list_nth(clauses, ci->rinfono)))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Which WHERE clauses one leaf partition leaves out (DESIGN.md §16, "Clauses
+ * the partition bounds imply"), given the index idxs[i] it has for each clause
+ * i, NULL where it has none.  A restriction the partition's bounds imply is
+ * TRUE of every row the partition holds, so it selects nothing there and
+ * needs no index: it is left out of the partition's count - all of it, every
+ * leaf of an OR together, since the proof is about the whole restriction.
+ *
+ *	- A restriction the partition has no index for HAS to be left out, and
+ *	  one its bounds do not imply then declines the query, as it always did.
+ *	- One it has indexes for is left out too, which saves its lookups and the
+ *	  AND with a set that holds every row - but not where the count would be
+ *	  left with nothing that selects rows (below).
+ *	- Never left out: a range that bounds the walk driving the count (§28),
+ *	  which walks the same entries with it or without it and whose index is
+ *	  the driver's, and a pinned column whose value the target list prints,
+ *	  which comes out of the index's stored key (§10's value gate).
+ *
+ * A count that nothing but the WHERE clauses drives - no GROUP BY, no sum
+ * over a column's entries, no fk key - needs one of them to select rows, and
+ * one that carries the §9 interlock: a positive clause, or an OR of them,
+ * other than a range collected into memory (§32).  The planner asked the same
+ * of the query as a whole (pinnedsrc); here it is asked of what the partition
+ * keeps.  A partition that has to leave out every such clause declines the
+ * query, as it did before.
+ *
+ * On success *droppedp is NULL when nothing is left out, and otherwise one
+ * flag per clause; false declines the query.
+ */
+static bool
+lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
+				const LionImply *imply, List *clauseinfos,
+				IndexOptInfo **idxs, bool **droppedp, int *ndroppedp)
+{
+	int			nr = list_length(imply->clauses);
+	int			nclause = list_length(clauseinfos);
+	int8	   *implied;		/* -1 not asked yet, 0 no, 1 yes */
+	bool	   *present;		/* some clause came of the restriction */
+	bool	   *need;			/* ... and this partition has no index for it */
+	bool	   *keep;			/* ... and it may not be left out */
+	bool	   *orrange;		/* an OR with a range leaf: carries no pin */
+	bool	   *drop;
+	bool	   *dropped;
+	int			ndropped = 0;
+	int			i;
+	int			r;
+	ListCell   *lc;
+
+	*droppedp = NULL;
+	*ndroppedp = 0;
+	if (partqual == NIL || nr == 0)
+		return true;
+
+	implied = (int8 *) palloc(sizeof(int8) * nr);
+	memset(implied, -1, sizeof(int8) * nr);
+	present = (bool *) palloc0(sizeof(bool) * nr);
+	need = (bool *) palloc0(sizeof(bool) * nr);
+	keep = (bool *) palloc0(sizeof(bool) * nr);
+	orrange = (bool *) palloc0(sizeof(bool) * nr);
+	drop = (bool *) palloc0(sizeof(bool) * nr);
+
+	i = 0;
+	foreach(lc, clauseinfos)
+	{
+		LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
+
+		r = ci->rinfono;
+		if (r >= 0 && r < nr)
+		{
+			present[r] = true;
+			if (idxs[i] == NULL)
+				need[r] = true;
+			if (ci->kind == LION_CLAUSE_RANGE || (ci->valueout && !ci->inor))
+				keep[r] = true;
+			if (ci->inor && ci->kind == LION_CLAUSE_RANGESRC)
+				orrange[r] = true;
+		}
+		i++;
+	}
+
+#define LION_IMPLIED(r) \
+	(implied[r] < 0 ? \
+	 (implied[r] = lion_leaf_implies(root, leaf, imply->toprel, partqual, \
+									 (Node *) list_nth(imply->clauses, r)) ? 1 : 0) : \
+	 implied[r])
+
+	/* What the partition cannot answer, it must be able to leave out. */
+	for (r = 0; r < nr; r++)
+	{
+		if (!need[r])
+			continue;
+		if (keep[r] || !LION_IMPLIED(r))
+			return false;
+		drop[r] = true;
+	}
+	if (!imply->driven && !lion_leaf_selects(clauseinfos, drop, orrange))
+		return false;
+
+	/* ... and what it can, it leaves out where something else selects rows */
+	for (r = 0; r < nr; r++)
+	{
+		if (!present[r] || need[r] || keep[r] || !LION_IMPLIED(r))
+			continue;
+		drop[r] = true;
+		if (!imply->driven && !lion_leaf_selects(clauseinfos, drop, orrange))
+			drop[r] = false;
+	}
+#undef LION_IMPLIED
+
+	dropped = (bool *) palloc0(sizeof(bool) * Max(nclause, 1));
+	i = 0;
+	foreach(lc, clauseinfos)
+	{
+		LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
+
+		if (ci->rinfono >= 0 && ci->rinfono < nr && drop[ci->rinfono])
+		{
+			dropped[i] = true;
+			ndropped++;
+		}
+		i++;
+	}
+	if (ndropped == 0)
+	{
+		pfree(dropped);
+		return true;
+	}
+	*droppedp = dropped;
+	*ndroppedp = ndropped;
+	return true;
+}
+
 static bool
 lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 					const LionDriveInfo *drive, int ndrive, List *whereattnos,
-					List *clauseinfos, List **targets)
+					List *clauseinfos, const LionImply *imply, List **targets)
 {
 	RangeTblEntry *rte;
 	LionCountTarget *t;
+	List	   *partqual = NIL;
+	int			nclause = list_length(clauseinfos);
+	IndexOptInfo **idxs;
+	AttrNumber *cols;
 	ListCell   *l1;
 	ListCell   *l2;
 	int			d;
+	int			i;
 
 	/* Sub-partitioning nests, exactly as expand_partitioned_rtentry() does. */
 	check_stack_depth();
@@ -2204,8 +2611,6 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 
 	if (rte->relkind == RELKIND_PARTITIONED_TABLE)
 	{
-		int			i;
-
 		/* Pruned down to nothing: no targets, but no reason to bail either. */
 		if (IS_DUMMY_REL(rel))
 			return true;
@@ -2245,7 +2650,7 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 			}
 
 			if (!lion_collect_targets(root, child, cdrive, ndrive, cattnos,
-									 clauseinfos, targets))
+									 clauseinfos, imply, targets))
 				return false;
 		}
 		return true;
@@ -2272,6 +2677,9 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 		Relation	relation = table_open(rte->relid, NoLock);
 		bool		supported = lion_table_am_supported(relation);
 
+		/* ... and the bounds that may imply WHERE clauses (below) */
+		if (supported && imply != NULL)
+			partqual = lion_leaf_partition_qual(relation, rel->relid);
 		table_close(relation, NoLock);
 		if (!supported)
 			return false;
@@ -2331,6 +2739,9 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 			return false;
 	}
 
+	idxs = (IndexOptInfo **) palloc0(sizeof(IndexOptInfo *) * Max(nclause, 1));
+	cols = (AttrNumber *) palloc0(sizeof(AttrNumber) * Max(nclause, 1));
+	i = 0;
 	forboth(l1, whereattnos, l2, clauseinfos)
 	{
 		LionClauseInfo *ci = (LionClauseInfo *) lfirst(l2);
@@ -2340,15 +2751,36 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 											ci->strategy, ci->extractquery,
 											ci->collation, &col);
 
-		if (idx == NULL)
-			return false;
+		/*
+		 * Same rule for a pinned column whose value the output prints: an
+		 * index that cannot print it is no index for the clause.
+		 */
+		if (idx != NULL && ci->valueout &&
+			!lion_index_can_emit_value(idx, col))
+			idx = NULL;
 
-		/* Same rule for a pinned column whose value the output prints. */
-		if (ci->valueout && !lion_index_can_emit_value(idx, col))
-			return false;
+		idxs[i] = idx;
+		cols[i] = (idx != NULL) ? col : 0;
+		i++;
+	}
 
-		t->whereidx = lappend(t->whereidx, idx);
-		t->wherecol = lappend_int(t->wherecol, (int) col);
+	/*
+	 * A clause this partition's bounds imply needs no index here, and is left
+	 * out of its count (DESIGN.md §16, "Clauses the partition bounds
+	 * imply"); every other clause needs one, as it always did.
+	 */
+	if (imply != NULL &&
+		!lion_leaf_drops(root, rel, partqual, imply, clauseinfos, idxs,
+						 &t->dropped, &t->ndropped))
+		return false;
+	for (i = 0; i < nclause; i++)
+	{
+		bool		dropped = (t->dropped != NULL && t->dropped[i]);
+
+		if (idxs[i] == NULL && !dropped)
+			return false;
+		t->whereidx = lappend(t->whereidx, dropped ? NULL : idxs[i]);
+		t->wherecol = lappend_int(t->wherecol, dropped ? 0 : (int) cols[i]);
 	}
 
 	*targets = lappend(*targets, t);
@@ -4956,12 +5388,73 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * The clause lists as one relation counts them: without the clauses its
+ * partition bounds imply (DESIGN.md §16, "Clauses the partition bounds
+ * imply"), which it leaves out - a whole OR restriction at a time, whose
+ * position in the lists `ors` renumbers - and *joinclause, the FK-side join's
+ * key, where it lands.  A relation that leaves nothing out counts the lists as
+ * they are, and gets them back unchanged.
+ */
+static void
+lion_target_lists(const LionCountTarget *t, List *whereclauses,
+				  List *wherekinds, List *ors, List **idx, List **col,
+				  List **clauses, List **kinds, List **tors, int *joinclause)
+{
+	int			nclause = list_length(whereclauses);
+	int		   *pos;
+	int			n = 0;
+	int			i;
+	ListCell   *lc;
+
+	*idx = t->whereidx;
+	*col = t->wherecol;
+	*clauses = whereclauses;
+	*kinds = wherekinds;
+	*tors = ors;
+	if (t->ndropped == 0)
+		return;
+
+	*idx = NIL;
+	*col = NIL;
+	*clauses = NIL;
+	*kinds = NIL;
+	*tors = NIL;
+	pos = (int *) palloc(sizeof(int) * Max(nclause, 1));
+	for (i = 0; i < nclause; i++)
+	{
+		pos[i] = n;
+		if (t->dropped[i])
+			continue;
+		*idx = lappend(*idx, list_nth(t->whereidx, i));
+		*col = lappend_int(*col, list_nth_int(t->wherecol, i));
+		*clauses = lappend(*clauses, list_nth(whereclauses, i));
+		*kinds = lappend_int(*kinds, list_nth_int(wherekinds, i));
+		n++;
+	}
+	foreach(lc, ors)
+	{
+		List	   *one = (List *) lfirst(lc);
+		int			first = linitial_int(one);
+
+		if (t->dropped[first])
+			continue;
+		one = list_copy(one);
+		linitial_int(one) = pos[first];
+		*tors = lappend(*tors, one);
+	}
+	if (joinclause != NULL && *joinclause >= 0)
+		*joinclause = pos[*joinclause];
+	pfree(pos);
+}
+
+/*
  * Sum the per-relation costs over every relation the node will count and put
  * the result on the path.  The WHERE clauses that do not select rows
  * (`IS NOT NULL`, DESIGN.md §14) are left out of the per-relation estimate,
  * as they were before partitions existed - by lion_cost_count_rel() itself
  * rather than by filtering the lists here, because the OR structure of
- * DESIGN.md §19 names its leaves by their position in them.
+ * DESIGN.md §19 names its leaves by their position in them.  A partition
+ * prices only the clauses its bounds do not imply (lion_target_lists()).
  */
 static void
 lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
@@ -4979,6 +5472,14 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 		int			tranged = ranged;
 		double		tfrac = drivefrac;
 		Var		   *rangevar;
+		List	   *tidx;
+		List	   *tcol;
+		List	   *tclauses;
+		List	   *tkinds;
+		List	   *tors;
+
+		lion_target_lists(t, whereclauses, wherekinds, ors, &tidx, &tcol,
+						  &tclauses, &tkinds, &tors, NULL);
 
 		/*
 		 * The sum over every entry of a summarized column (DESIGN.md §32) is
@@ -5002,8 +5503,7 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 		run += lion_cost_count_rel(root, t->rel,
 								  t->driveidx[0], t->drivecol[0],
 								  t->driveidx[1], t->drivecol[1],
-								  t->whereidx, t->wherecol,
-								  whereclauses, wherekinds, ors, numgroups,
+								  tidx, tcol, tclauses, tkinds, tors, numgroups,
 								  outer_entries, inner_entries, distinct,
 								  tfrac, rangevar,
 								  tranged == LION_RANGED_SUM && rangevar != NULL &&
@@ -5014,10 +5514,9 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 		 * candidates rechecked in the heap, one count - one group, one test -
 		 * at a time (DESIGN.md §17, "A query known only at run time").
 		 */
-		run += lion_cost_recheck(root, t->rel, t->whereidx, t->wherecol,
-								 whereclauses, wherekinds, ors,
-								 lion_probe_rel_rows(root, t->rel), numgroups,
-								 t->rel->tuples);
+		run += lion_cost_recheck(root, t->rel, tidx, tcol, tclauses, tkinds,
+								 tors, lion_probe_rel_rows(root, t->rel),
+								 numgroups, t->rel->tuples);
 
 		/*
 		 * A range-bounded GROUP BY walk (DESIGN.md §28) pays a fixed cost per
@@ -6393,6 +6892,8 @@ lion_append_clause(const LionLeafInfo *leaf, Node *clause, bool inor,
 	ci->strategy = leaf->strategy;
 	ci->extractquery = leaf->extractquery;
 	ci->collation = leaf->collation;
+	ci->inor = inor;
+	ci->rinfono = -1;			/* the caller's to say */
 
 	*whereattnos = lappend_int(*whereattnos, (int) leaf->var->varattno);
 	*clauseinfos = lappend(*clauseinfos, ci);
@@ -7633,7 +8134,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 					 const LionFkJoin *fj, List *having,
 					 List *whereattnos, List *clauseinfos, List *whereclauses,
 					 List *whereconsts, List *wherekinds, List *whereopnos,
-					 List *whereinor, List *ors)
+					 List *whereinor, List *ors, const LionImply *imply)
 {
 	RangeTblEntry *rte = root->simple_rte_array[rel->relid];
 	List	   *exprs;
@@ -7858,7 +8359,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	memset(nodrive, 0, sizeof(nodrive));
 	if (!lion_collect_targets(root, rel, nodrive, 0, whereattnos, clauseinfos,
-							 &targets))
+							 imply, &targets))
 		return;
 	if (list_length(targets) != 1)
 		return;
@@ -7929,6 +8430,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 												 output_rel->reltarget->exprs,
 												 having, NIL, fj));
 	base = lappend(base, NIL);	/* coalesce: the fact side groups nothing */
+	base = lappend(base, (imply != NULL) ? imply->skipped : NIL);
 
 	/*
 	 * ---- may it run in a worker ----
@@ -8101,6 +8603,10 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	List	   *whereopnos = NIL;	/* the clause's operator (0 for a null test) */
 	List	   *whereinor = NIL;	/* 1 when the clause is a leaf of an OR */
 	List	   *ors = NIL;		/* one IntList per OR restriction (§19) */
+	List	   *rinfoclauses = NIL; /* each restriction's clause, by position */
+	List	   *impliedtexts = NIL; /* the ones left out altogether (§16) */
+	int			rinfono = -1;	/* ... and the one being analysed */
+	LionImply	imply;			/* what a partition's bounds may leave out */
 	List	   *posattnos = NIL;	/* columns with a positive clause */
 	List	   *eqattnos = NIL;		/* columns pinned to one value */
 	List	   *nonnullattnos = NIL;	/* columns a clause proves non-null */
@@ -8330,16 +8836,28 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		}
 	}
 
-	/* ---- every WHERE clause must be one the posting sets can answer ---- */
+	/*
+	 * ---- every WHERE clause must be one the posting sets can answer ----
+	 *
+	 * ... or, over a partitioned table, one the bounds of every partition
+	 * counted imply (DESIGN.md §16, "Clauses the partition bounds imply"),
+	 * which selects nothing there and is left out of the count.  Each clause
+	 * remembers the restriction it came from (rinfono), so that a partition
+	 * whose bounds imply that restriction can leave out all of it
+	 * (lion_collect_targets()).
+	 */
 	foreach(lc, input_rel->baserestrictinfo)
 	{
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 		Node	   *clause;
 		LionLeafInfo leaf;
+		int			startlen = list_length(whereattnos);
 
 		if (!IsA(rinfo, RestrictInfo) || rinfo->pseudoconstant)
 			return;
 
+		rinfono++;
+		rinfoclauses = lappend(rinfoclauses, rinfo->clause);
 		clause = (Node *) rinfo->clause;
 
 		/*
@@ -8407,11 +8925,11 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			ListCell   *la;
 
 			if (list_length(((BoolExpr *) clause)->args) < 2)
-				return;
+				goto unanswerable;
 
 			arms = lion_or_arms(clause);
 			if (arms == NIL)
-				return;
+				goto unanswerable;
 
 			foreach(la, arms)
 			{
@@ -8422,7 +8940,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				{
 					if (!lion_analyze_leaf(root, (Node *) lfirst(lb), rti,
 										  false, true, false, &leaf))
-						return;
+						goto unanswerable;
 
 					/*
 					 * A range in an arm is a leaf of the union like any other:
@@ -8437,6 +8955,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 									  &whereattnos, &clauseinfos,
 									  &whereclauses, &whereconsts,
 									  &wherekinds, &whereopnos, &whereinor);
+					((LionClauseInfo *) llast(clauseinfos))->rinfono = rinfono;
 				}
 				armlens = lappend_int(armlens, list_length(arm));
 			}
@@ -8460,7 +8979,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		}
 
 		if (!lion_analyze_leaf(root, clause, rti, true, true, true, &leaf))
-			return;
+			goto unanswerable;
 
 		/*
 		 * A range comparison (DESIGN.md §28) bounds the entry walk that DRIVES
@@ -8503,6 +9022,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 							  &whereattnos, &clauseinfos, &whereclauses,
 							  &whereconsts, &wherekinds, &whereopnos,
 							  &whereinor);
+			((LionClauseInfo *) llast(clauseinfos))->rinfono = rinfono;
 			continue;
 		}
 
@@ -8620,6 +9140,31 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		lion_append_clause(&leaf, clause, false,
 						  &whereattnos, &clauseinfos, &whereclauses,
 						  &whereconsts, &wherekinds, &whereopnos, &whereinor);
+		((LionClauseInfo *) llast(clauseinfos))->rinfono = rinfono;
+		continue;
+
+unanswerable:
+
+		/*
+		 * No posting set answers the clause.  That declines the query - unless
+		 * every partition it counts has bounds that imply the clause, when no
+		 * row it counts can fail it, and it is left out.  Whatever of it was
+		 * taken already (the first arms of an OR) goes too.
+		 */
+		if (!partitioned ||
+			!lion_implied_everywhere(root, input_rel, input_rel,
+									 (Node *) rinfo->clause))
+			return;
+		impliedtexts = lappend(impliedtexts,
+							   makeString(lion_deparse_rel_clause(root, rti,
+																  (Node *) rinfo->clause)));
+		whereattnos = list_truncate(whereattnos, startlen);
+		clauseinfos = list_truncate(clauseinfos, startlen);
+		whereclauses = list_truncate(whereclauses, startlen);
+		whereconsts = list_truncate(whereconsts, startlen);
+		wherekinds = list_truncate(wherekinds, startlen);
+		whereopnos = list_truncate(whereopnos, startlen);
+		whereinor = list_truncate(whereinor, startlen);
 	}
 
 	/*
@@ -8642,10 +9187,15 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 */
 	if (fj != NULL)
 	{
+		/* the fk key's set of each dimension row drives every count */
+		imply.toprel = input_rel;
+		imply.clauses = rinfoclauses;
+		imply.driven = true;
+		imply.skipped = impliedtexts;
 		lion_try_fkjoin_path(root, input_rel, output_rel, extra, fj, having,
 							 whereattnos, clauseinfos, whereclauses,
 							 whereconsts, wherekinds, whereopnos, whereinor,
-							 ors);
+							 ors, partitioned ? &imply : NULL);
 		return;
 	}
 
@@ -8889,6 +9439,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		int			best = -1;
 		double		bestsel = -1.0;
 		int			r = 0;
+		int			otherpin = -1;	/* not asked yet */
 		ListCell   *l1;
 		ListCell   *l2;
 
@@ -8902,6 +9453,22 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				{
 					if (v->varattno == driveattno)
 						best = r;
+				}
+				else if (partitioned &&
+						 lion_rinfos_implied_everywhere(root, input_rel,
+														(List *) lfirst(l2)) &&
+						 (otherpin >= 0 ? otherpin :
+						  (otherpin = lion_pinned_not_implied(root, input_rel,
+															  clauseinfos,
+															  rinfoclauses))))
+				{
+					/*
+					 * A range every partition's bounds imply walks all of
+					 * each partition's keys: as a source it is left out
+					 * instead (DESIGN.md §16, "Clauses the partition bounds
+					 * imply"), when another clause is there to select the
+					 * rows and carry the §9 interlock.
+					 */
 				}
 				else
 				{
@@ -9109,8 +9676,13 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 			distest = lion_range_entries(root, input_rel, distvar, rangesel);
 	}
 
+	imply.toprel = input_rel;
+	imply.clauses = rinfoclauses;
+	imply.driven = (ndrive > 0);
+	imply.skipped = impliedtexts;
 	if (!lion_collect_targets(root, input_rel, drive, ndrive, whereattnos,
-							 clauseinfos, &targets))
+							 clauseinfos, partitioned ? &imply : NULL,
+							 &targets))
 		return;
 	if (targets == NIL)
 		return;					/* everything was pruned: leave it to the planner */
@@ -9237,8 +9809,11 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 								 InvalidOid,
 								 t->driveidx[1] ? t->driveidx[1]->indexoid :
 								 InvalidOid);
+			/* InvalidOid: a clause the partition's bounds imply (§16) */
 			foreach(l1, t->whereidx)
-				one = lappend_oid(one, ((IndexOptInfo *) lfirst(l1))->indexoid);
+				one = lappend_oid(one, lfirst(l1) != NULL ?
+								  ((IndexOptInfo *) lfirst(l1))->indexoid :
+								  InvalidOid);
 			parts = lappend(parts, one);
 		}
 	}
@@ -9368,6 +9943,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 						   list_make2_oid(groupeqop[0],
 										  groupvar[0]->varcollid)) :
 				NIL);
+	cpath->custom_private = lappend(cpath->custom_private, impliedtexts);
 	cpath->methods = &lion_count_path_methods;
 
 	/*
@@ -10314,6 +10890,65 @@ lion_rel_read_only(LionCountScanState *st, Relation heap)
 	return result;
 }
 
+/*
+ * The items - the sources after slot 0 - of the partition just opened: the
+ * plan's, less the clauses its bounds imply (DESIGN.md §16, "Clauses the
+ * partition bounds imply"), whose indexes lion_open_relation() left closed.
+ * An OR is left out whole or not at all (the planner decides for the whole
+ * restriction); a range taken as a source stands for all of its bounds, and
+ * is left out when every one of them is, and otherwise opened by the first
+ * one the partition keeps.  The inner group of a two-column GROUP BY follows
+ * the items, so its slot moves with their number.
+ */
+static void
+lion_relation_items(LionCountScanState *st)
+{
+	int			n = 0;
+	int			k;
+
+	for (k = 0; k < st->nplanitem; k++)
+	{
+		LionSourceItem it = st->planitem[k];
+
+		if (it.orno >= 0)
+		{
+			if (st->clause[st->ors[it.orno].first].idx == NULL)
+				continue;
+		}
+		else if (it.rangesrc)
+		{
+			AttrNumber	attno = st->clause[it.clauseno].attno;
+			int			j;
+
+			for (j = 0; j < st->nclause; j++)
+			{
+				if (st->clause[j].kind == LION_CLAUSE_RANGESRC &&
+					!st->inor[j] && st->clause[j].attno == attno &&
+					st->clause[j].idx != NULL)
+					break;
+			}
+			if (j == st->nclause)
+				continue;
+			it.clauseno = j;
+		}
+		else if (st->clause[it.clauseno].idx == NULL)
+			continue;
+		st->item[n++] = it;
+	}
+	st->nitem = n;
+
+	st->nsource = n + 1 + (st->innerattno != 0 ? 1 : 0);
+	memset(st->sources, 0, sizeof(LionCountSource) * (st->nplanitem + 1 +
+													  (st->innerattno != 0 ? 1 : 0)));
+	st->sources[0].nsets = 1;
+	st->sources[0].sets = &st->groupset;
+	if (st->innerattno != 0)
+	{
+		st->sources[n + 1].nsets = 1;
+		st->sources[n + 1].sets = &st->groupset2;
+	}
+}
+
 static void
 lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 				  Oid groupidxoid2, const Oid *clauseidxoid)
@@ -10335,6 +10970,9 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 
 	for (i = 0; i < st->nclause; i++)
 	{
+		/* a clause the partition's bounds imply (DESIGN.md §16) */
+		if (clauseidxoid != NULL && !OidIsValid(clauseidxoid[i]))
+			continue;
 		st->clause[i].idx = index_open(clauseidxoid != NULL ?
 									   clauseidxoid[i] : st->clause[i].idxoid,
 									   AccessShareLock);
@@ -10344,6 +10982,8 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 												  st->clause[i].attno),
 							   st->clause[i].kind == LION_CLAUSE_MULTI);
 	}
+	if (clauseidxoid != NULL)
+		lion_relation_items(st);
 
 	/*
 	 * The driving index's key column comes from the index that was really
@@ -10383,7 +11023,10 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 		Snapshot	snapshot = st->css.ss.ps.state->es_snapshot;
 
 		for (i = 0; i < st->nclause; i++)
-			PredicateLockRelation(st->clause[i].idx, snapshot);
+		{
+			if (st->clause[i].idx != NULL)
+				PredicateLockRelation(st->clause[i].idx, snapshot);
+		}
 		if (st->groupidx != NULL)
 			PredicateLockRelation(st->groupidx, snapshot);
 		if (st->groupidx2 != NULL)
@@ -10529,6 +11172,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	join = (List *) list_nth(cscan->custom_private, LION_PRIV_JOIN);
 	coal = (List *) list_nth(cscan->custom_private, LION_PRIV_COALESCE);
 	kinds = (List *) list_nth(cscan->custom_private, LION_PRIV_TLKINDS);
+	st->implied = (List *) list_nth(cscan->custom_private, LION_PRIV_IMPLIED);
 
 	st->heapoid = linitial_oid(oids);
 	st->groupidxoid = lsecond_oid(oids);
@@ -10883,6 +11527,8 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		st->item[st->nitem].orno = orno;
 		st->nitem++;
 	}
+	st->planitem = st->item;
+	st->nplanitem = st->nitem;
 
 	/* One target per live leaf partition, in the planner's order. */
 	st->npart = list_length(partlist);
@@ -10901,7 +11547,26 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 				palloc0(sizeof(Oid) * Max(st->nclause, 1));
 			for (j = 0; j < st->nclause; j++)
 				st->part[i].clauseidxoid[j] = list_nth_oid(one, 3 + j);
+
+			/*
+			 * A clause a partition leaves out has to be one the executor
+			 * can do without there (lion_leaf_drops()): never the join's
+			 * key, nor a range that bounds the driving walk.
+			 */
+			for (j = 0; j < st->nclause; j++)
+			{
+				if (!OidIsValid(st->part[i].clauseidxoid[j]) &&
+					(j == st->joinclause ||
+					 st->clause[j].kind == LION_CLAUSE_RANGE))
+					elog(ERROR, "LionCount: a partition leaves out a clause it needs");
+			}
 		}
+
+		/* ... whose items are the plan's, less what each leaves out */
+		st->item = (LionSourceItem *)
+			palloc0(sizeof(LionSourceItem) * Max(st->nplanitem, 1));
+		memcpy(st->item, st->planitem,
+			   sizeof(LionSourceItem) * st->nplanitem);
 	}
 
 	st->located = false;
@@ -11650,7 +12315,7 @@ lion_rangesrc_range(LionCountScanState *st, int first, int n, bool toplevel,
 		StrategyNumber strategy;
 
 		if (cl->kind != LION_CLAUSE_RANGESRC || cl->attno != attno ||
-			(toplevel && st->inor[i]))
+			(toplevel && st->inor[i]) || cl->idx == NULL)
 			continue;
 		if (rs->index == NULL)
 		{
@@ -11985,11 +12650,12 @@ lion_build_filter(LionCountScanState *st)
 	st->filter = NULL;
 	lion_vis_cache_set_filter(st->viscache, NULL);
 
+	/* not a clause the relation's partition bounds imply (DESIGN.md §16) */
 	for (i = 0; i < st->nclause; i++)
 	{
 		LionClauseState *cl = &st->clause[i];
 
-		if (cl->kind == LION_CLAUSE_MULTI && !st->inor[i] &&
+		if (cl->kind == LION_CLAUSE_MULTI && !st->inor[i] && cl->idx != NULL &&
 			(cl->qmode == LION_QMODE_LOSSY || cl->qmode == LION_QMODE_ALL))
 			n++;
 	}
@@ -12018,6 +12684,7 @@ lion_build_filter(LionCountScanState *st)
 		bool		typbyval;
 
 		if (!(cl->kind == LION_CLAUSE_MULTI && !st->inor[i] &&
+			  cl->idx != NULL &&
 			  (cl->qmode == LION_QMODE_LOSSY || cl->qmode == LION_QMODE_ALL)))
 			continue;
 
@@ -16001,6 +16668,90 @@ lion_explain_clause_col(const LionClauseState *cl)
 							cl->kind == LION_CLAUSE_MULTI);
 }
 
+/* An OR restriction (DESIGN.md §19): `((a = 1) OR ((b = 2) AND (c = 3)))`. */
+static void
+lion_explain_or(LionCountScanState *st, LionOrState *o, List *ancestors,
+				ExplainState *es, StringInfo buf)
+{
+	int			leaf = 0;
+	int			arm;
+	int			j;
+
+	appendStringInfoChar(buf, '(');
+	for (arm = 0; arm < o->narms; arm++)
+	{
+		if (arm > 0)
+			appendStringInfoString(buf, " OR ");
+		if (o->armlen[arm] > 1)
+			appendStringInfoChar(buf, '(');
+		for (j = 0; j < o->armlen[arm]; j++, leaf++)
+		{
+			if (j > 0)
+				appendStringInfoString(buf, " AND ");
+			appendStringInfoChar(buf, '(');
+			lion_explain_clause(st, &st->clause[o->first + leaf], ancestors,
+							   es, buf);
+			appendStringInfoChar(buf, ')');
+		}
+		if (o->armlen[arm] > 1)
+			appendStringInfoChar(buf, ')');
+	}
+	appendStringInfoChar(buf, ')');
+}
+
+/*
+ * How many of the partitions leave clause i out, because their bounds imply
+ * it (DESIGN.md §16, "Clauses the partition bounds imply"): the ones whose
+ * index for it is InvalidOid.
+ */
+static int
+lion_explain_dropped(LionCountScanState *st, int i)
+{
+	int			n = 0;
+	int			p;
+
+	for (p = 0; p < st->npart; p++)
+	{
+		if (!OidIsValid(st->part[p].clauseidxoid[i]))
+			n++;
+	}
+	return n;
+}
+
+/* ... and whether that is every partition, so that no index answers it */
+static bool
+lion_explain_dropped_all(LionCountScanState *st, int i)
+{
+	return st->npart > 0 && lion_explain_dropped(st, i) == st->npart;
+}
+
+/*
+ * One entry of "Implied by Partition Bounds": clause i - the OR `o` it is the
+ * first leaf of, when there is one - if any partition leaves it out, with how
+ * many do when not all of them.
+ */
+static void
+lion_explain_implied(LionCountScanState *st, int i, LionOrState *o,
+					 List *ancestors, ExplainState *es, StringInfo buf)
+{
+	int			n = lion_explain_dropped(st, i);
+
+	if (n == 0)
+		return;
+	if (buf->len > 0)
+		appendStringInfoString(buf, ", ");
+	if (o != NULL)
+		lion_explain_or(st, o, ancestors, es, buf);
+	else
+	{
+		appendStringInfoChar(buf, '(');
+		lion_explain_clause(st, &st->clause[i], ancestors, es, buf);
+		appendStringInfoChar(buf, ')');
+	}
+	if (n < st->npart)
+		appendStringInfo(buf, " in %d of %d partitions", n, st->npart);
+}
+
 static void
 lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 						ExplainState *es)
@@ -16088,23 +16839,39 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		appendStringInfoChar(&buf, ')');
 	}
 
-	for (i = 0; i < st->nitem; i++)
+	/*
+	 * The plan's items (a partition's own may leave some out).  One that
+	 * every partition leaves out, because their bounds imply it, reads no
+	 * index at all, and is printed on a line of its own below (DESIGN.md §16,
+	 * "Clauses the partition bounds imply").
+	 */
+	for (i = 0; i < st->nplanitem; i++)
 	{
-		int			orno = st->item[i].orno;
+		LionSourceItem *it = &st->planitem[i];
+		int			orno = it->orno;
 
-		if (buf.len > 0)
-			appendStringInfoString(&buf, ", ");
-
-		if (orno < 0 && st->item[i].rangesrc)
+		if (orno < 0 && it->rangesrc)
 		{
 			/*
 			 * A range taken as a source (DESIGN.md §32): its index and all
 			 * of its bounds, `ix (k >= 10 AND k < 20)`.
 			 */
-			LionClauseState *first = &st->clause[st->item[i].clauseno];
+			LionClauseState *first = &st->clause[it->clauseno];
 			bool		firstbound = true;
 			int			j;
 
+			for (j = 0; j < st->nclause; j++)
+			{
+				if (st->clause[j].kind == LION_CLAUSE_RANGESRC &&
+					!st->inor[j] && st->clause[j].attno == first->attno &&
+					!lion_explain_dropped_all(st, j))
+					break;
+			}
+			if (j == st->nclause)
+				continue;
+
+			if (buf.len > 0)
+				appendStringInfoString(&buf, ", ");
 			if (st->npart == 0)
 				appendStringInfo(&buf, "%s%s ", get_rel_name(first->idxoid),
 								 lion_explain_clause_col(first));
@@ -16112,7 +16879,8 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 			for (j = 0; j < st->nclause; j++)
 			{
 				if (st->clause[j].kind != LION_CLAUSE_RANGESRC || st->inor[j] ||
-					st->clause[j].attno != first->attno)
+					st->clause[j].attno != first->attno ||
+					lion_explain_dropped_all(st, j))
 					continue;
 				if (!firstbound)
 					appendStringInfoString(&buf, " AND ");
@@ -16120,18 +16888,25 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 				firstbound = false;
 			}
 			appendStringInfoChar(&buf, ')');
+			continue;
 		}
-		else if (orno < 0)
+
+		if (lion_explain_dropped_all(st, orno < 0 ? it->clauseno :
+									 st->ors[orno].first))
+			continue;
+		if (buf.len > 0)
+			appendStringInfoString(&buf, ", ");
+		if (orno < 0)
 		{
 			if (st->npart == 0)
 			{
-				LionClauseState *cl = &st->clause[st->item[i].clauseno];
+				LionClauseState *cl = &st->clause[it->clauseno];
 
 				appendStringInfo(&buf, "%s%s ", get_rel_name(cl->idxoid),
 								 lion_explain_clause_col(cl));
 			}
 			appendStringInfoChar(&buf, '(');
-			lion_explain_clause(st, &st->clause[st->item[i].clauseno],
+			lion_explain_clause(st, &st->clause[it->clauseno],
 							   ancestors, es, &buf);
 			appendStringInfoChar(&buf, ')');
 		}
@@ -16144,8 +16919,6 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 			 */
 			LionOrState *o = &st->ors[orno];
 			int			leaf;
-			int			arm;
-			int			j;
 
 			if (st->npart == 0)
 			{
@@ -16160,33 +16933,57 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 				}
 				appendStringInfoChar(&buf, ' ');
 			}
-
-			appendStringInfoChar(&buf, '(');
-			leaf = 0;
-			for (arm = 0; arm < o->narms; arm++)
-			{
-				if (arm > 0)
-					appendStringInfoString(&buf, " OR ");
-				if (o->armlen[arm] > 1)
-					appendStringInfoChar(&buf, '(');
-				for (j = 0; j < o->armlen[arm]; j++, leaf++)
-				{
-					if (j > 0)
-						appendStringInfoString(&buf, " AND ");
-					appendStringInfoChar(&buf, '(');
-					lion_explain_clause(st, &st->clause[o->first + leaf],
-									   ancestors, es, &buf);
-					appendStringInfoChar(&buf, ')');
-				}
-				if (o->armlen[arm] > 1)
-					appendStringInfoChar(&buf, ')');
-			}
-			appendStringInfoChar(&buf, ')');
+			lion_explain_or(st, o, ancestors, es, &buf);
 		}
 	}
 
 	ExplainPropertyText("Lion Indexes", buf.data, es);
 	pfree(buf.data);
+
+	/*
+	 * The clauses partitions leave out because their bounds imply them
+	 * (DESIGN.md §16), each followed by how many of the partitions do when it
+	 * is not all of them.  A range taken as a source is a restriction per
+	 * bound, and so is printed a bound at a time.
+	 */
+	if (st->npart > 0)
+	{
+		ListCell   *lc;
+
+		initStringInfo(&buf);
+		foreach(lc, st->implied)
+		{
+			if (buf.len > 0)
+				appendStringInfoString(&buf, ", ");
+			appendStringInfoString(&buf, strVal(lfirst(lc)));
+		}
+		for (i = 0; i < st->nplanitem; i++)
+		{
+			LionSourceItem *it = &st->planitem[i];
+			int			j;
+
+			if (it->orno < 0 && it->rangesrc)
+			{
+				for (j = 0; j < st->nclause; j++)
+				{
+					if (st->clause[j].kind != LION_CLAUSE_RANGESRC ||
+						st->inor[j] ||
+						st->clause[j].attno != st->clause[it->clauseno].attno)
+						continue;
+					lion_explain_implied(st, j, NULL, ancestors, es, &buf);
+				}
+			}
+			else if (it->orno < 0)
+				lion_explain_implied(st, it->clauseno, NULL, ancestors, es,
+									 &buf);
+			else
+				lion_explain_implied(st, st->ors[it->orno].first,
+									 &st->ors[it->orno], ancestors, es, &buf);
+		}
+		if (buf.len > 0)
+			ExplainPropertyText("Implied by Partition Bounds", buf.data, es);
+		pfree(buf.data);
+	}
 
 	/*
 	 * The FK-side join (DESIGN.md §27): what a dimension row counts - its
