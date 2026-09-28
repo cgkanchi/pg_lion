@@ -8041,6 +8041,19 @@ the directory stays in the cache.
 lands on (`PrefetchBuffer()`), after letting go of its lock, where the tablespace's io concurrency
 is above zero: a leaf the next keys will want, read while the current key's set is counted.
 
+**The fact filters' copy, probed per key.** Each count of an fk set against the collected copy of
+the fact filters ("The fact filters, collected once") is driven by the source with the fewer rows -
+the fk set, a few rows, against a copy of many - and seeks the copy with a binary search at each of
+the set's container keys (`lion_cursor_seek()`), over the keys memory keeps of it when it is
+spilled; no count passes over the copy. What each count did read that it did not need was the copy's
+FIRST container: a cursor is built standing at it, and a spilled copy read it back from its
+temporary file at every count, a second read of the file for every key. The spilled copy now keeps
+that one container in memory as well (`LionMatSet.first`), so a count reads the file once, for the
+container it is sought to. So does a GROUP BY's spilled copy of its WHERE items (§10, "The WHERE
+sets, collected once"), which `lion_sources_collect()` makes the same way and every group's count
+reads the same way; a range taken as a source (§32) is collected by a union of its own and is left
+as it was.
+
 **EXPLAIN** prints `Join Key Lookups: in index order` under the join's other properties, and with
 ANALYZE `Join Key Batches`, the batches of every participant and run. `Directory Pages Read` is the
 walk's pages: about the leaves the keys cover plus a descent a batch, and a leaf again after each

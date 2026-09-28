@@ -300,7 +300,12 @@ StaticAssertDecl(LION_BATCH_MIN_SETS <= LION_OPEN_MIN_PINS,
  * may keep them elsewhere: containers[] then points at wherever they are
  * (a range's union, lion_range_collect()), or - SPILLED - containers is NULL
  * and they are in `file`, described by spill[] (LionSpillEnt), which the set
- * owns and lion_posting_set_release() closes.
+ * owns and lion_posting_set_release() closes.  A spilled intersection
+ * (lion_sources_collect()) keeps its FIRST container in memory as well
+ * (first): every cursor over it reads that one when it is built, and the
+ * FK-side join's copy of its fact filters (DESIGN.md §27) and a GROUP BY's of
+ * its WHERE items (§10) get a cursor per count, which read it back from the
+ * file each time.
  */
 typedef struct LionMatSet
 {
@@ -311,6 +316,7 @@ typedef struct LionMatSet
 	LionContainer **containers;
 	BufFile    *file;			/* spilled: the containers, or NULL */
 	LionSpillEnt *spill;		/* spilled: where each one is */
+	LionContainer *first;		/* spilled: container 0, or NULL */
 } LionMatSet;
 
 /*
@@ -2474,6 +2480,23 @@ lion_spill_read(const LionMatSet *mat, int i, LionContainer *buf)
 	BufFileReadExact(mat->file, buf, e->size);
 }
 
+/*
+ * Keep a finished spill's first container in memory (LionMatSet.first): what
+ * every cursor built over the set reads first, whatever it is sought to next.
+ */
+static void
+lion_spill_keep_first(LionMatSet *mat, MemoryContext cxt)
+{
+	Size		size;
+
+	if (mat->ncontainers == 0)
+		return;
+	size = MAXALIGN(Max((Size) mat->spill[0].size, LION_CONTAINER_HDRSZ));
+	mat->first = (LionContainer *) MemoryContextAlloc(cxt, size);
+	lion_spill_read(mat, 0, mat->first);
+	mat->held += size;
+}
+
 
 /* ---------------------------------------------------------------------
  * Container cursors
@@ -2629,6 +2652,11 @@ lion_cursor_next_item(LionSetCursor *cur)
 			return NULL;
 		if (mat->file != NULL)
 		{
+			if (cur->matidx == 0 && mat->first != NULL)
+			{
+				cur->matidx++;
+				return mat->first;
+			}
 			lion_spill_read(mat, cur->matidx++, cur->cbuf);
 			return cur->cbuf;
 		}
@@ -6724,6 +6752,15 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 	if (col.spilled)
 	{
 		mat = lion_spill_finish(&col.sp);
+
+		/*
+		 * Every count against the copy - the FK-side join's per dimension
+		 * key, a GROUP BY's per group - builds a cursor over it, and a cursor
+		 * starts at the first container: keep that one in memory, so that a
+		 * count reads the file once, for the container it is sought to, and
+		 * not twice.
+		 */
+		lion_spill_keep_first(mat, CurrentMemoryContext);
 		out->found = true;
 		out->mat = mat;
 		out->ntids = col.members;
