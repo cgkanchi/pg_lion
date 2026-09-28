@@ -4175,6 +4175,14 @@ Readers, below, for how a LIST of cross-type values is sorted.)*
 - **The root** is cached in `LionState` and validated by the LION_PAGE_ROOT flag, which a root split
   clears on the page it demotes - nbtree's BTP_ROOT trick. A lookup therefore costs no meta-page
   visit at all until the root really moves.
+  A root split can also land between reading the meta page and locking the root it names, and then
+  that page is demoted too. `lion_dir_get_root()` reads the meta page again for as long as the
+  height it names keeps growing - a root split raises it in the very record that demotes the old
+  root, and nothing lowers it - and refuses as damage only a meta page that names the same height
+  again with a page that is not the root. It used to allow one refresh, which made a root split
+  racing it a spurious "is not the root page" ERROR (2026-09-27 review). nbtree's `_bt_getroot()`
+  descends from the demoted page instead, which would do for a search but not for the split repair's
+  `lion_dir_find_parent()`, whose parent may be on the new level above it.
 - **Insert of a new entry**: descend with the leaf EXCLUSIVE; scan the prefix run for the key; if it
   is absent, walk back to its exact bytewise position on that leaf and insert. On no room, split.
   **Find-or-create is one serialised operation**: the directory holds one entry per equality class,

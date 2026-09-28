@@ -476,20 +476,42 @@ lion_dir_root(Relation index, LionIndexState *ix, uint32 *height)
  * validated by the LION_PAGE_ROOT flag, which a root split clears on the page
  * it demotes - exactly nbtree's BTP_ROOT trick, so the common case costs no
  * meta-page visit at all.
+ *
+ * A root split can also land between reading the meta page and locking the
+ * root it names, and then that page is not the root any more either.  That is
+ * a race, not damage, and it can happen any number of times in a row - but
+ * each time the meta page then names a TALLER directory than it did, because
+ * a root split writes the demotion and the meta page's new root and height in
+ * one record (lion_dir_split()), and nothing ever makes the directory
+ * shorter.  So the meta page is read again for as long as the height it names
+ * keeps growing, and only one that names the same height as before, with a
+ * page that is not the root, is damage.  This used to allow a single refresh,
+ * which turned a root split racing it into a spurious ERROR (2026-09-27
+ * review).  nbtree's _bt_getroot() would instead descend from the demoted
+ * page, which is correct for a search but not for lion_dir_find_parent(),
+ * whose parent may be on the new level above it.
  */
 static Buffer
 lion_dir_get_root(Relation index, LionIndexState *ix)
 {
-	bool		refreshed = false;
 	BlockNumber blk;
+	uint32		height = 0;
+	bool		fresh = false;
 
-	blk = BlockNumberIsValid(ix->meta.root) ? ix->meta.root :
-		lion_dir_root(index, ix, NULL);
+	if (BlockNumberIsValid(ix->meta.root))
+		blk = ix->meta.root;
+	else
+	{
+		blk = lion_dir_root(index, ix, &height);
+		fresh = true;
+	}
 
 	for (;;)
 	{
 		Buffer		buf = lion_dir_readbuf(index, blk);
 		Page		page;
+		BlockNumber newblk;
+		uint32		newheight;
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
@@ -499,11 +521,19 @@ lion_dir_get_root(Relation index, LionIndexState *ix)
 			return buf;
 
 		UnlockReleaseBuffer(buf);
-		if (refreshed)
-			elog(ERROR, "lion index \"%s\": block %u is not the root page",
-				 RelationGetRelationName(index), blk);
-		blk = lion_dir_root(index, ix, NULL);
-		refreshed = true;
+		CHECK_FOR_INTERRUPTS();
+
+		newblk = lion_dir_root(index, ix, &newheight);
+		if (fresh && newheight <= height)
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": block %u is not the root page",
+							RelationGetRelationName(index), blk),
+					 errdetail("The meta page names it the root of a directory of height %u.",
+							   height)));
+		blk = newblk;
+		height = newheight;
+		fresh = true;
 	}
 }
 
