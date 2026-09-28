@@ -6448,12 +6448,30 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
  * Only the container keys in [lo, hi) are kept: all of them, until a
  * WINDOWED collection runs out of memory and lowers hi
  * (lion_range_union_evict()).
+ *
+ * DENSE ACCUMULATION (DESIGN.md §32, "Summed ranges: dense and probed").  A
+ * range over a column in no heap order gives every container key a member or
+ * two from each summary, and folding each of them in with a
+ * lion_container_or() rebuilt the union so far every time: a merge of the
+ * whole ARRAY while it was one, and past 2048 members a 4 KB image filled,
+ * counted, optimized and copied back, per member.  So a union keeps the form
+ * it grows in instead.  Once it is a BITSET the containers are ORed into it
+ * in place (lion_container_or_inplace()) and it is optimized once, when the
+ * walk is over (lion_range_union_finish()).  While it is an ARRAY the
+ * members of incoming ARRAYs are only appended to `pend`, and folded in -
+ * one pass through an image, lion_container_add_many() - once half as many
+ * as the union holds have come: each member is then moved a bounded number
+ * of times, and `pend` is at most half the union's own size.  Anything else
+ * (a RUN on either side, a column in heap order) is folded as before.
  */
 typedef struct LionRangeUnionEnt
 {
 	uint32		ckey;			/* hash key */
 	uint32		size;
 	LionContainer *c;
+	uint16	   *pend;			/* members still to fold into c, any order */
+	uint32		npend;
+	uint32		pendcap;
 } LionRangeUnionEnt;
 
 typedef struct LionRangeUnion
@@ -6467,7 +6485,11 @@ typedef struct LionRangeUnion
 	uint64		lo;				/* the container keys kept: [lo, hi) */
 	uint64		hi;
 	LionContainer *tmp;			/* LION_CONTAINER_MAX_SIZE bytes */
+	uint64	   *img;			/* LION_BITSET_BYTES: a fold's image */
 } LionRangeUnion;
+
+/* The fewest pending members an ARRAY union waits for before a fold. */
+#define LION_RANGE_UNION_PEND_MIN	32
 
 /* No upper bound on the container keys of a window. */
 #define LION_CKEY_END				((uint64) PG_UINT32_MAX + 1)
@@ -6529,9 +6551,86 @@ lion_range_union_evict(LionRangeUnion *u)
 		u->held -= Min(u->held,
 					   GetMemoryChunkSpace(e->c) + LION_RANGE_UNION_OVERHEAD);
 		pfree(e->c);
+		if (e->pend != NULL)
+		{
+			u->held -= Min(u->held, GetMemoryChunkSpace(e->pend));
+			pfree(e->pend);
+		}
 		(void) hash_search(u->byckey, &ckey, HASH_REMOVE, NULL);
 	}
 	u->hi = cut;
+}
+
+/* Make src, a container of e's key, e's union: at its own size. */
+static void
+lion_range_union_store(LionRangeUnion *u, LionRangeUnionEnt *e,
+					   const LionContainer *src)
+{
+	Size		size = lion_container_size(src);
+
+	if (size != e->size)
+	{
+		u->held -= Min(u->held, GetMemoryChunkSpace(e->c));
+		pfree(e->c);
+		e->c = (LionContainer *) MemoryContextAlloc(u->cxt, size);
+		u->held += GetMemoryChunkSpace(e->c);
+		e->size = (uint32) size;
+	}
+	memcpy(e->c, src, size);
+}
+
+/*
+ * Fold e's pending members into its union, in one pass through an image
+ * (lion_container_add_many()).  A union that is no ARRAY afterwards takes
+ * no more pending members, and gives their buffer back.
+ */
+static void
+lion_range_union_fold(LionRangeUnion *u, LionRangeUnionEnt *e)
+{
+	if (e->npend == 0)
+		return;
+	memcpy(u->tmp, e->c, e->size);
+	(void) lion_container_add_many(u->tmp, e->pend, e->npend, u->img);
+	e->npend = 0;
+	lion_range_union_store(u, e, u->tmp);
+	if (e->c->type != LION_CT_ARRAY)
+	{
+		u->held -= Min(u->held, GetMemoryChunkSpace(e->pend));
+		pfree(e->pend);
+		e->pend = NULL;
+		e->pendcap = 0;
+	}
+}
+
+/*
+ * The walk is over: every union folded and optimized, which is the form it
+ * is handed out in.  A BITSET that was ORed into in place may now be smaller
+ * as an ARRAY or a RUN.
+ */
+static void
+lion_range_union_finish(LionRangeUnion *u)
+{
+	HASH_SEQ_STATUS seq;
+	LionRangeUnionEnt *e;
+
+	hash_seq_init(&seq, u->byckey);
+	while ((e = (LionRangeUnionEnt *) hash_seq_search(&seq)) != NULL)
+	{
+		lion_range_union_fold(u, e);
+		if (e->pend != NULL)
+		{
+			u->held -= Min(u->held, GetMemoryChunkSpace(e->pend));
+			pfree(e->pend);
+			e->pend = NULL;
+			e->pendcap = 0;
+		}
+		if (e->c->type == LION_CT_BITSET)
+		{
+			memcpy(u->tmp, e->c, e->size);
+			lion_container_optimize(u->tmp);
+			lion_range_union_store(u, e, u->tmp);
+		}
+	}
 }
 
 static bool
@@ -6562,21 +6661,55 @@ lion_range_union_cb(const LionContainer *c, void *arg)
 		e->c = (LionContainer *) MemoryContextAlloc(u->cxt, size);
 		memcpy(e->c, c, size);
 		e->size = (uint32) size;
+		e->pend = NULL;
+		e->npend = 0;
+		e->pendcap = 0;
 		u->held += GetMemoryChunkSpace(e->c) + LION_RANGE_UNION_OVERHEAD;
+	}
+	else if (e->c->type == LION_CT_BITSET)
+	{
+		/* dense: ORed in place, optimized once the walk is over */
+		(void) lion_container_or_inplace(e->c, c);
+	}
+	else if (e->c->type == LION_CT_ARRAY && c->type == LION_CT_ARRAY &&
+			 c->cardinality <= LION_RANGE_UNION_PEND_MIN)
+	{
+		/*
+		 * A few members: pending, until half as many as the union holds
+		 * have come.  The buffer grows with the union, never past that.
+		 */
+		uint32		fold = Max((uint32) LION_RANGE_UNION_PEND_MIN,
+							   (uint32) e->c->cardinality / 2);
+		uint32		want = fold + LION_RANGE_UNION_PEND_MIN;
+
+		if (e->pendcap < want)
+		{
+			Size		had = (e->pend != NULL) ?
+				GetMemoryChunkSpace(e->pend) : 0;
+
+			e->pend = (e->pend != NULL) ?
+				(uint16 *) repalloc(e->pend, sizeof(uint16) * want) :
+				(uint16 *) MemoryContextAlloc(u->cxt, sizeof(uint16) * want);
+			e->pendcap = want;
+			u->held += GetMemoryChunkSpace(e->pend);
+			u->held -= Min(u->held, had);
+		}
+		memcpy(&e->pend[e->npend], LION_ARRAY_DATA((LionContainer *) c),
+			   sizeof(uint16) * c->cardinality);
+		e->npend += c->cardinality;
+		if (e->npend >= fold)
+			lion_range_union_fold(u, e);
 	}
 	else
 	{
-		(void) lion_container_or(e->c, c, u->tmp);
-		size = lion_container_size(u->tmp);
-		if (size != e->size)
+		lion_range_union_fold(u, e);
+		if (e->c->type == LION_CT_BITSET)
+			(void) lion_container_or_inplace(e->c, c);
+		else
 		{
-			u->held -= Min(u->held, GetMemoryChunkSpace(e->c));
-			pfree(e->c);
-			e->c = (LionContainer *) MemoryContextAlloc(u->cxt, size);
-			u->held += GetMemoryChunkSpace(e->c);
-			e->size = (uint32) size;
+			(void) lion_container_or(e->c, c, u->tmp);
+			lion_range_union_store(u, e, u->tmp);
 		}
-		memcpy(e->c, u->tmp, size);
 	}
 
 	if (u->held > u->maxbytes)
@@ -6745,6 +6878,7 @@ lion_range_collect(Relation index, AttrNumber attno, LionRange *range,
 		u.hi = LION_CKEY_END;
 		u.tmp = (LionContainer *) MemoryContextAlloc(cxt,
 													 LION_CONTAINER_MAX_SIZE);
+		u.img = (uint64 *) MemoryContextAlloc(cxt, LION_BITSET_BYTES);
 		memset(&ctl, 0, sizeof(ctl));
 		ctl.keysize = sizeof(uint32);
 		ctl.entrysize = sizeof(LionRangeUnionEnt);
@@ -6764,6 +6898,7 @@ lion_range_collect(Relation index, AttrNumber attno, LionRange *range,
 			return false;
 		}
 
+		lion_range_union_finish(&u);
 		ents = lion_range_union_sorted(&u, &n);
 
 		if (!windowed && u.hi == LION_CKEY_END)
@@ -6790,6 +6925,7 @@ lion_range_collect(Relation index, AttrNumber attno, LionRange *range,
 			}
 			pfree(ents);
 			pfree(u.tmp);
+			pfree(u.img);
 			hash_destroy(u.byckey);
 			mat->held = sizeof(LionMatSet) + sizeof(LionContainer *) * n +
 				MemoryContextMemAllocated(cxt, true);
