@@ -847,6 +847,7 @@ typedef struct LionCountScanState
 	 */
 	int64		rangesrc_collected;
 	int64		rangesrc_walked;
+	int64		rangesrc_spilled;	/* of the collected: in a temporary file */
 	Size		rangesrc_held;
 	int			nclause;
 	LionClauseState *clause;
@@ -1061,6 +1062,7 @@ typedef struct LionCountScanState
 	LionPostingSet joinfilter;
 	LionCountSource joinsources[2];
 	int64		joinfilterrows;
+	int64		joinspilled;	/* copies that went to a temporary file */
 
 	/*
 	 * The forward semi join over a non-unique key (DESIGN.md §27, "Forward
@@ -1110,6 +1112,7 @@ typedef struct LionCountScanState
 	int64		joinworkerdirpages;
 	int64		joinworkerfilterrows;
 	int64		joinworkersorted;
+	int64		joinworkerspilled;
 } LionCountScanState;
 
 /*
@@ -1134,6 +1137,7 @@ typedef struct LionJoinShared
 	int64		missing;
 	int64		dirpages;
 	int64		filterrows;
+	int64		spilled;
 	int64		sorted;
 	int64		sortedruns;
 	pg_atomic_uint32 nextchunk;
@@ -4729,8 +4733,14 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, LionCountTarget *t,
 							  (LION_FKJOIN_COPY_PROBE_COST +
 							   perkey / cfk * LION_FKJOIN_COPY_MEMBER_COST));
 
+		/*
+		 * A hot standby never makes the copy (lion_join_collect()), so there
+		 * every count probes, and is priced so (2026-09-28 review): a plan
+		 * made there as if the copy would be made chose the node where each
+		 * dimension row then built the filters' unions again.
+		 */
 		if (copybytes <= (double) get_hash_memory_limit() &&
-			collected < probed)
+			collected < probed && !RecoveryInProgress())
 			*collect = true;
 	}
 	run += *collect ? collected : probed;
@@ -9760,8 +9770,11 @@ lion_rangesrc_range(LionCountScanState *st, int first, int n, bool toplevel,
  * range of the relation), which the counts then read like any other set.
  * One that does not fit is left to be walked at every count instead
  * (src->rangewalk, lion_node_count()) - unless it is an OR's leaf, which
- * cannot be taken apart that way and is collected whatever it takes
- * (`walkable` false; the planner declines one it expects to be large).
+ * cannot be taken apart that way (`walkable` false; the planner declines one
+ * it expects to be large).  That one used to be collected whatever it took,
+ * in memory; it gets the same memory as the others now, and past it is
+ * collected a window of container keys at a time into a temporary file
+ * (lion_range_collect(), 2026-09-28 review).
  *
  * Returns the source's tree the way lion_locate_leaf() does: NULL when the
  * range selects nothing - an empty range, a NULL bound, or no row in it - and
@@ -9775,6 +9788,7 @@ lion_locate_range(LionCountScanState *st, LionRangeSource *rs, bool walkable,
 	Size		budget;
 	LionPostingSet ps;
 	Size		held;
+	bool		spilled;
 	int64		nread;
 	int64		nsums;
 
@@ -9786,9 +9800,8 @@ lion_locate_range(LionCountScanState *st, LionRangeSource *rs, bool walkable,
 		return NULL;
 
 	budget = (st->rangesrc_held < limit) ? limit - st->rangesrc_held : 0;
-	if (!lion_range_collect(rs->index, rs->col, &rs->range,
-							walkable ? budget : SIZE_MAX, &ps, &held, &nread,
-							&nsums))
+	if (!lion_range_collect(rs->index, rs->col, &rs->range, budget, !walkable,
+							&ps, &held, &spilled, &nread, &nsums))
 	{
 		st->rangesrc_walked++;
 		*walked = true;
@@ -9796,6 +9809,8 @@ lion_locate_range(LionCountScanState *st, LionRangeSource *rs, bool walkable,
 	}
 
 	st->rangesrc_collected++;
+	if (spilled)
+		st->rangesrc_spilled++;
 	st->summaries += nsums;
 	if (!ps.found)
 		return NULL;
@@ -11799,8 +11814,16 @@ lion_next_group_any(LionCountScanState *st, bool *exhausted)
  * a source that does.  The WHERE sets themselves stay located, as they always
  * are for the length of a run.  Not on a standby, where the interlock depends
  * on the WAL mode of every index read (lion_count_sources_cached()) and the
- * ordinary counts are left to decide it; and not past a hash join's memory,
- * where the copy gives up and the counts read the filters as they always did.
+ * ordinary counts are left to decide it - the planner prices a standby's
+ * counts as the probing they are (lion_cost_fkjoin_rel()).
+ *
+ * Past a hash join's memory the copy SPILLS to a temporary file, as the hash
+ * join would (2026-09-28 review).  It used to give up there, and every
+ * dimension row's count then read the filters themselves: for an IN list of
+ * a parameter the planner had estimated at ten values, a union of every one
+ * of its sets built again for each row - hour-scale for a long list over many
+ * dimension rows.  A spilled copy is read a container at a time, and a count
+ * seeks it with a binary search over what memory keeps of it.
  */
 static void
 lion_join_collect(LionCountScanState *st)
@@ -11808,6 +11831,7 @@ lion_join_collect(LionCountScanState *st)
 	EState	   *estate = st->css.ss.ps.state;
 	MemoryContext oldcxt;
 	bool		ok;
+	bool		spilled;
 	int			k;
 
 	st->joincollected = true;
@@ -11847,14 +11871,16 @@ lion_join_collect(LionCountScanState *st)
 	 */
 	oldcxt = MemoryContextSwitchTo(st->outercxt);
 	ok = lion_sources_collect(st->heap, estate->es_snapshot, st->nitem,
-							  &st->sources[1], get_hash_memory_limit(),
-							  &st->joinfilter, &st->stats);
+							  &st->sources[1], get_hash_memory_limit(), true,
+							  &st->joinfilter, &spilled, &st->stats);
 	MemoryContextSwitchTo(oldcxt);
 	if (!ok)
 		return;
 
 	st->joinfiltered = true;
 	st->joinfilterrows = (int64) st->joinfilter.ntids;
+	if (spilled)
+		st->joinspilled++;
 
 	/* The filters select no row at all: as a clause with no entry does. */
 	if (!st->joinfilter.found)
@@ -12600,6 +12626,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		shared->missing += st->joinmissing;
 		shared->dirpages += st->dirpages;
 		shared->filterrows = Max(shared->filterrows, st->joinfilterrows);
+		shared->spilled += st->joinspilled;
 		shared->sorted = Max(shared->sorted, st->joinsorted);
 		SpinLockRelease(&shared->mutex);
 		st->joinreported = true;
@@ -12612,6 +12639,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 	st->joinworkermissing = shared->missing;
 	st->joinworkerdirpages = shared->dirpages;
 	st->joinworkerfilterrows = shared->filterrows;
+	st->joinworkerspilled = shared->spilled;
 	st->joinworkersorted = shared->sortedruns + shared->sorted;
 	SpinLockRelease(&shared->mutex);
 }
@@ -13141,6 +13169,10 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		if (st->rangesrc_walked > 0)
 			ExplainPropertyInteger("Range Sources Walked", NULL,
 								   st->rangesrc_walked, es);
+		/* ... and of the collected, those an OR's leaf spilled to a file */
+		if (st->rangesrc_spilled > 0)
+			ExplainPropertyInteger("Range Sources Spilled", NULL,
+								   st->rangesrc_spilled, es);
 
 		/*
 		 * The batches an IN list too long to locate at once was counted in
@@ -13205,6 +13237,16 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 				ExplainPropertyInteger("Fact Filter Rows Collected", NULL,
 									   Max(st->joinfilterrows,
 										   st->joinworkerfilterrows), es);
+
+			/*
+			 * Copies past a hash join's memory, which went to a temporary
+			 * file instead: one per participant and run.  Only when there
+			 * were any.
+			 */
+			if (st->joinspilled + st->joinworkerspilled > 0)
+				ExplainPropertyInteger("Fact Filter Copies Spilled", NULL,
+									   st->joinspilled + st->joinworkerspilled,
+									   es);
 		}
 	}
 }

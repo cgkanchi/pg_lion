@@ -559,26 +559,32 @@ extern bool lion_exists_sources_cached(Relation heap, Snapshot snapshot,
  * intersects one fixed set of sources with many located sets in turn builds
  * once.  Nothing is checked against the visibility map or the heap, so the
  * copy may only ever be counted beside a located set that carries the §9
- * interlock.  False when it would take more than maxbytes.
+ * interlock.  False when it would take more than maxbytes - unless spill
+ * allows the copy to go on in a temporary file past them, and *spilled then
+ * says whether it did.
  */
 extern bool lion_sources_collect(Relation heap, Snapshot snapshot,
 								 int nsources, LionCountSource *sources,
-								 Size maxbytes, LionPostingSet *out,
+								 Size maxbytes, bool spill,
+								 LionPostingSet *out, bool *spilled,
 								 LionCountStats *stats);
 
 /*
  * The rows of one range over key column `attno` of index - every set a walk of
  * the range's INSIDE hands out, summaries included (DESIGN.md §32) - as ONE
- * private, pinless posting set: their union, copied into memory.  Like a
+ * private, pinless posting set: their union, collected in memory.  Like a
  * collected intersection it may only ever be counted beside a located set that
- * carries the §9 interlock.  False, with nothing allocated, when the copy
- * would take more than maxbytes.  *held is what the copy takes, and *nsets
- * and *nsummaries say what the walk read.
+ * carries the §9 interlock.  False, with nothing allocated, when the union
+ * would take more than maxbytes - unless spill allows it to be built a window
+ * of container keys at a time into a temporary file, and *spilled then says
+ * whether it was.  *held is what the set takes in memory, and *nsets and
+ * *nsummaries say what the walk read.
  */
 struct LionRange;
 extern bool lion_range_collect(Relation index, AttrNumber attno,
 							   struct LionRange *range, Size maxbytes,
-							   LionPostingSet *out, Size *held, int64 *nsets,
+							   bool spill, LionPostingSet *out, Size *held,
+							   bool *spilled, int64 *nsets,
 							   int64 *nsummaries);
 
 /*

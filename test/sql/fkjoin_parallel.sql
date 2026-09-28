@@ -284,8 +284,10 @@ RESET plan_cache_mode;
 
 -- ---- 6. each participant's copy of the fact filters, and its budget -----------
 -- Half of 250000 narrow rows is a bitset in each of 22 containers, some 90 kB:
--- more than a hash join's memory at 64 kB, so every participant that tries
--- gives up and reads the filters per count - with the same answer.
+-- more than a hash join's memory at 64 kB, so every participant that makes
+-- one goes on in a temporary file, as a hash join's batches would, and reads
+-- it back at every count - with the same answer.  (Each used to give up and
+-- read the filters per count.)
 CREATE TABLE lion_pfw (fk int8, x int NOT NULL);
 INSERT INTO lion_pfw SELECT abs(hashint4(i)) % 360 + 1, abs(hashint4(i + 1000000)) % 10
 FROM generate_series(1, 250000) i;
@@ -302,7 +304,8 @@ EXECUTE lion_pj_big;
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
 SELECT count(*) FILTER (WHERE p ~ 'Fact Filters: collected once') AS planned_to_collect,
-	   count(*) FILTER (WHERE p ~ 'Fact Filter Rows Collected: -1') AS could_not
+	   count(*) FILTER (WHERE p ~ 'Fact Filter Rows Collected: -1') AS could_not,
+	   count(*) FILTER (WHERE p ~ 'Fact Filter Copies Spilled: [1-9]') AS spilled
 FROM (SELECT * FROM lion_pj_analyze('EXECUTE lion_pj_big')) AS e(p);
 EXECUTE lion_pj_big;
 RESET work_mem;

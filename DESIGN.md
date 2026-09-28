@@ -6714,8 +6714,10 @@ expression's array at its plan-time estimate, which the clause analysis puts in 
 and probed, per dimension row, as the longest list a literal may be (LION_MAX_ARRAY_ELEMS). A
 wrong guess about a scan's one-off work costs little; a wrong guess about a dimension row's costs
 that many times over, which is what the review measured. So the copy is what is chosen whenever it
-is expected to fit, and a copy that does not fit at run time falls back to the probes, as a literal
-list's does. `IN ($1, $2)` keeps its length at plan time and is priced like a literal list.
+is expected to fit, and a copy that does not fit at run time spills to a temporary file ("The fact
+filters, collected once" below; it used to fall back to the probes, the very per-row work the
+guess was meant to avoid). `IN ($1, $2)` keeps its length at plan time and is priced like a literal
+list.
 
 **Measured** (2026-09-23, prune slot's PostgreSQL 20devel install - assert-enabled, so ratios and
 not absolute numbers; two million fact rows over 22,728 heap pages with a 40-byte pad, `fk` = a
@@ -6849,11 +6851,23 @@ count seeks by a binary search in memory. The same forward count takes 135 ms (t
   `hash_mem_multiplier` - and not by a setting of its own: the copy stands where the ordinary
   plan's hash table would, over the same rows, and is the same kind of memory; in a parallel plan
   each participant makes its own, as each participant of a hash join below a Gather builds its
-  own table ("Parallel" below). A copy that would outgrow it is abandoned at the container where it
-  does (the merge stops there: `lion_exists_settled()` reads the collection's `failed`), and that
-  run reads the filters per count as before; EXPLAIN ANALYZE then prints `Fact Filter Rows
-  Collected: -1`. The same on a hot standby, where whether the map may be trusted depends on the
-  WAL mode of every index read.
+  own table ("Parallel" below). A copy that outgrows it SPILLS, as a hash join's table would
+  (2026-09-28 review): what it holds so far goes to a temporary file (`LionSpill`, lion_count.c),
+  and so does every container after it, in key order; memory keeps sixteen bytes a container - its
+  key, where it is and its size - and a count reads the file a container at a time, a seek being a
+  binary search over those keys. EXPLAIN ANALYZE prints `Fact Filter Copies Spilled`. It used to be
+  abandoned there, and the run read the filters per count - for an IN list whose length the planner
+  could not see (a parameter, priced at `estimate_array_length()`'s ten values) that is the union
+  of every one of its sets built again for every dimension row, hour-scale for a long list over
+  many rows, and exactly the plan the cost model had just refused. The temporary file honours
+  `temp_tablespaces`, which are looked up before the merge starts (a lookup reads catalogs, which
+  may process invalidations, and must not do so in the middle of a walk of the index); it belongs
+  to the copy and is closed when the copy is released, and on an error with the resource owner it
+  was opened under.
+- On a hot standby, where whether the map may be trusted depends on the WAL mode of every index
+  read, no copy is made, and the run reads the filters per count, as before. The planner now knows
+  it: in recovery `lion_cost_fkjoin_rel()` never prices the copy, and a plan is chosen for the
+  probing it will do.
 - An IN list too long to open at once used to be refused a copy as well: a count takes such a list
   in batches (§15, "Bounded cursors"), each yielding every container key of its own, which would
   reach a copy out of order. A collection is never batched now (2026-09-27): the batches exist to
@@ -6901,7 +6915,18 @@ the join member of `custom_private` became `{clause, kind of join, flags [, chil
   `LION_FKJOIN_COPY_COUNT_COST`, and per fk container `LION_FKJOIN_COPY_PROBE_COST` and
   `LION_FKJOIN_COPY_MEMBER_COST` per member it holds. Only when the copy is expected to fit in
   the same `get_hash_memory_limit()` the executor gives it: a container's members at two bytes
-  each, a bitset's 4 kB at most.
+  each, a bitset's 4 kB at most - and never on a hot standby, which makes no copy.
+
+A copy the estimate said would fit and that does not is spilled, not abandoned (above), so the plan
+the estimate chose runs as collected whatever the fact filters turn out to hold; an IN list of a
+parameter that was estimated at ten values and holds a hundred thousand costs its one merge and a
+file, not a union per dimension row. That is why the probed price of such a list (the longest
+literal list, "An IN list whose array is a PARAMETER" in "Planner integration" above) is only the
+price of the probed PLAN: the review
+that found the fallback proposed pricing a list of unknown length at the worse of the two, which
+with the spill would refuse plans that run as collected. What still reads the filters per count is
+a run without a copy: a hot standby, which is priced so, and fact filters with a range too large
+to collect (§32), which is priced as walked by every count.
 
 A directory descent costs `LION_DESCENT_COST` (120 `cpu_operator_cost`) a level, as every lookup
 of the count does (§10, "The units"). A semi or anti join's existence test reads the share of the
@@ -7104,7 +7129,9 @@ it is offered, besides the serial path, over the dimension's cheapest partial pa
   counter to do it: "Forward semi joins over a non-unique key".)
 - **Nothing is shared but EXPLAIN's counters.** Each participant locates the fact filters and makes
   its own copy of them (`lion_sources_collect()`) under its own `get_hash_memory_limit()`, and
-  falls back to probing on its own when its copy does not fit. The copy is not built once in
+  spills it to a temporary file of its own when it does not fit (it used to fall back to probing
+  on its own). Each locates its lists under its share of the list pin budget (§15). The copy is
+  not built once in
   dynamic shared memory: its size is known only once the merge has run, after the Gather has sized
   its DSM, and one copy would make every worker wait for its builder (the barrier a Parallel Hash
   needs) to save a merge that took 0.8 ms for 1,500 containers of one set ("Cost, revisited"). It
@@ -9838,12 +9865,39 @@ as a source only beside something that does: the walk that drives the count (a G
 over another range, a count(DISTINCT) walk), the fk set of a join, or a clause - or an OR of
 clauses - outside the ranges. `count(*) WHERE k < 10 OR a = 3` alone is left to the ordinary plan.
 An OR's leaf cannot be walked (the union's other arms would have to be subtracted from each piece),
-so it is collected whatever it takes, and the planner prices one it expects not to fit out of the
-plan (`lion_cost_range_source()`). **Flagged:** a walked OR arm by inclusion-exclusion -
-`|X ∩ ((R ∩ Z) ∪ Y)| = |X ∩ Y| + Σ_B |X ∩ B ∩ Z − Y|` over R's pieces B - is the way to lift that.
+and the planner prices one it expects not to fit out of the plan (`lion_cost_range_source()`). One
+that does not fit anyway - the estimate was wrong - used to be collected whatever it took, with no
+limit, and at about twice the union at the peak: the hash table still held every container while
+the final copy was built. Both are gone (2026-09-28 review):
+
+- **The union is the set.** A collection that fits keeps its containers where the union built them,
+  and the set's `containers[]` points at them in key order; there is no second copy. The containers
+  live in a context whose chunk limit is a kilobyte (`ALLOCSET_SMALL_SIZES`), so a bitset or a long
+  array is a block of its own at its own size, where the default context rounded a 4104-byte bitset
+  up to 8 kB; and what the union holds is counted as the allocator hands it out
+  (`GetMemoryChunkSpace()`), where it used to be counted at the containers' own sizes.
+- **An OR's leaf is collected in WINDOWS past the memory**, into a temporary file (`LionSpill`, the
+  same the FK-side join's copy spills into, §27). It gets what every range of the relation gets -
+  what is left of the hash table's memory, and never less than `LION_RANGE_WINDOW_MIN` (32 kB,
+  several bitsets, so that a window always gets on).
+  A window keeps the container keys from where the last one ended; when its memory runs out it
+  gives back the upper half of the keys it holds and ends where they began
+  (`lion_range_union_evict()`); at the end of its walk its containers go to the file in key order,
+  and the next window walks the range again from there. The set reads the file a container at a
+  time and seeks it by the keys it keeps in memory, sixteen bytes a container key. Every window is
+  read after the snapshot, as the one walk always was, and the windows are disjoint ranges of TIDs,
+  so the file holds every row of the range once and none twice - the collected set's argument
+  unchanged. A union n times the memory costs about 2n walks of the range: a price for a
+  misestimate, not a plan, and bounded where it was not. EXPLAIN ANALYZE counts `Range Sources
+  Spilled`.
+
+**Flagged:** a walked OR arm by inclusion-exclusion - `|X ∩ ((R ∩ Z) ∪ Y)| = |X ∩ Y| + Σ_B |X ∩ B
+∩ Z − Y|` over R's pieces B - would answer such a leaf without its union, and is still the way to
+let the planner take one it expects to be large.
 
 EXPLAIN names each range with all of its bounds (`lion_src_ur.u (u > 100 AND u <= 900)`), and
-EXPLAIN ANALYZE counts `Range Sources Collected` and `Range Sources Walked` when there are any.
+EXPLAIN ANALYZE counts `Range Sources Collected` and `Range Sources Walked` when there are any, and
+of the collected, `Range Sources Spilled`.
 
 ### Costs (lion_customscan.c)
 
@@ -9912,6 +9966,11 @@ leave out.
   fact filters, on a partitioned table; collected and - at work_mem's floor, over 200,000 rows -
   walked, inside and as its complement, and in existence tests; generic plans with Param bounds, a
   NULL one, and multi-key Params beside it; a dirty heap and VACUUM.
+- `test/sql/spill.sql` (2026-09-28): an OR's range leaf planned where its union fits and run at
+  64 kB, collected into memory and then windowed into a temporary file (`Range Sources Spilled`),
+  on a clean and a dirty heap; and an FK-side join whose fact filter is `= ANY ($1)`, planned to
+  collect at the ten values a parameter is guessed at and run with 5000, its copy spilled (`Fact
+  Filter Copies Spilled`) - each against the ordinary plan's answer.
 - `test/sql/corrupt.sql` section 4, and `test/sql/rangesum.sql`'s two-bounds case; `range.sql`,
   `distinct.sql` and `fkjoin.sql` keep their formerly declined shapes, now answered, beside a clause
   no posting set answers.
