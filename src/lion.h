@@ -1791,4 +1791,12 @@ extern void lion_chain_put_container_locked_ext(Relation index, Relation heaprel
  */
 extern PGDLLIMPORT int64 lion_dir_pages_read;
 
+/*
+ * The same for the pages of POSTING TREES (DESIGN.md §22) the current backend
+ * has read: every page a descent of one reads and every leaf a cursor steps
+ * or seeks to.  The FK-side join reports the difference over its counts as
+ * "Join Key Posting Pages Read" (DESIGN.md §27, "Where a key's time goes").
+ */
+extern PGDLLIMPORT int64 lion_posting_pages_read;
+
 #endif							/* LION_H */

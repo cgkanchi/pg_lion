@@ -83,6 +83,9 @@
 
 #include "lion.h"
 
+/* DESIGN.md §27: EXPLAIN ANALYZE's "Join Key Posting Pages Read". */
+int64		lion_posting_pages_read = 0;
+
 /*
  * THE PAGES A SPLIT REPAIR HOLDS.  Finishing a split
  * (lion_posting_finish_split_ext()) recurses: UP, when the page that takes
@@ -327,6 +330,7 @@ lion_posting_getbuf(Relation index, BlockNumber blk, BlockNumber head,
 		return InvalidBuffer;
 	}
 
+	lion_posting_pages_read++;
 	buf = ReadBuffer(index, blk);
 	LockBuffer(buf, lockmode);
 	page = BufferGetPage(buf);
