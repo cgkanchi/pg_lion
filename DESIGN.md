@@ -1228,6 +1228,24 @@ taken (§21), and a coercion merely existing is not enough: text is binary-coerc
 rows bpchar's own equality would count. The resolved type is what the lookup is made as and what
 the EXECUTE check names the equality by (enum_eq, texteq; test/sql/security_exec.sql).
 `lion_index_count_any()` resolves its array's element type the same way.
+**So is its collation** (`lion_count_check_collation()`, 2026-09-28 review; the functions used to
+look every key up under the index's collation whatever the call said). The index hashed and
+compared its keys under its own collation; `col = key` compares under the key's when the key brings
+one of its own - an explicit COLLATE, or a column of another collation, read from the argument's own
+expression (`lion_count_arg_collation()`, so that the two-key form's keys are taken one by one, as
+the two clauses of its query are) - and otherwise under the column's: a literal or a parameter brings
+the default collation, which gives way to the column's in the parser's rule for an operator's inputs
+(an explicit COLLATE "default" therefore reads as none). The column's collation is the table
+column's, or the expression's for an expression column, and need not be the index's: `(c COLLATE
+"x")` keeps c and compares under x. Two deterministic collations agree on which values are equal -
+each calls two values equal when their bytes are - so a count under another deterministic collation
+than the index's is made, and is the query's. A nondeterministic one agrees with no other: a
+case-insensitive index counts 'ABC' under the key 'abc', and `c = 'abc'` under the column's own
+collation does not; so where either collation is nondeterministic and the two differ the count is
+an ERROR (`collation_mismatch`), never a different number. `lion_index_count_group_stats()` stands for
+`GROUP BY col`, which groups under the column's collation, and is refused the same way.
+`test/sql/countcoll.sql` covers both halves; the nondeterministic one needs ICU and a UTF8 database
+and is skipped without them (`countcoll_1.out`), as it is on CI's source builds.
 **A NULL argument answers NULL**, where `count(*) WHERE col = NULL` answers 0: the functions are
 STRICT, deliberately (2026-09-25 review, kept). PostgreSQL never calls a STRICT function with a NULL
 argument - a NULL constant folds the call away when the query is planned - so no count is made,

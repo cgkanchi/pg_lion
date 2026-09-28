@@ -1,0 +1,155 @@
+-- The SQL counts under the collation of the query they stand for (DESIGN.md
+-- §9, "SQL surface").
+--
+-- lion_index_count(idx, key) is `SELECT count(*) ... WHERE col = key`, and
+-- that query compares under the key's collation when the key brings one of
+-- its own, and under the column's otherwise.  The functions used to look
+-- every key up under the INDEX's collation, whatever the call said, which is
+-- the same thing only while both collations are deterministic: a
+-- case-insensitive index counted 'ABC' under 'abc' where the query under the
+-- column's own collation does not.  A count under another collation than the
+-- index's is now refused when either of the two is nondeterministic.
+--
+-- Nondeterministic collations need ICU; the second half is skipped without
+-- it (test/expected/countcoll_1.out).
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET max_parallel_workers_per_gather = 0;
+-- ---------- two deterministic collations agree on equality: counted ----------
+CREATE TABLE lcc_d (id int, t text) WITH (autovacuum_enabled = off);
+INSERT INTO lcc_d SELECT g, (ARRAY['abc', 'ABC', 'Abc', 'xyz'])[1 + g % 4]
+  FROM generate_series(1, 400) g;
+CREATE INDEX lcc_d_c ON lcc_d USING lion (t COLLATE "C");
+CREATE INDEX lcc_d_t ON lcc_d USING lion (t);
+SELECT lion_index_count('lcc_d_c', 'abc'::text) AS c_index,
+	   lion_index_count('lcc_d_t', 'abc' COLLATE "C") AS c_key,
+	   (SELECT count(*) FROM lcc_d WHERE t = 'abc') AS query;
+ c_index | c_key | query 
+---------+-------+-------
+     100 |   100 |   100
+(1 row)
+
+SELECT lion_index_count_any('lcc_d_c', ARRAY['abc', 'xyz']) AS c_index,
+	   (SELECT count(*) FROM lcc_d WHERE t = ANY (ARRAY['abc', 'xyz'])) AS query;
+ c_index | query 
+---------+-------
+     200 |   200
+(1 row)
+
+SELECT groups, count FROM lion_index_count_group_stats('lcc_d_c');
+ groups | count 
+--------+-------
+      4 |   400
+(1 row)
+
+DROP TABLE lcc_d;
+-- ---------- a nondeterministic collation agrees with no other ----------
+SELECT getdatabaseencoding() <> 'UTF8' OR
+	   NOT EXISTS (SELECT 1 FROM pg_collation WHERE collprovider = 'i')
+	   AS lcc_skip \gset
+\if :lcc_skip
+\echo 'no ICU collations, or not a UTF8 database: skipped'
+\else
+SET client_min_messages = warning;
+CREATE COLLATION lcc_ci (provider = icu, locale = 'und-u-ks-level2',
+						 deterministic = false);
+RESET client_min_messages;
+-- a column of the default collation, and an index under the
+-- case-insensitive one: 'abc', 'ABC' and 'Abc' are one key of the index
+CREATE TABLE lcc (id int, m int, t text) WITH (autovacuum_enabled = off);
+INSERT INTO lcc SELECT g, g % 2, (ARRAY['abc', 'ABC', 'Abc', 'xyz'])[1 + g % 4]
+  FROM generate_series(1, 400) g;
+CREATE INDEX lcc_ci_i ON lcc USING lion (t COLLATE lcc_ci);
+CREATE INDEX lcc_m ON lcc USING lion (m);
+-- `t = 'abc'` compares under the column's collation, and counts 100 rows
+SELECT count(*) FROM lcc WHERE t = 'abc';
+ count 
+-------
+   100
+(1 row)
+
+SELECT lion_index_count('lcc_ci_i', 'abc'::text);
+ERROR:  cannot count through index "lcc_ci_i" under collation "default"
+SELECT count FROM lion_index_count_stats('lcc_ci_i', 'abc'::text);
+ERROR:  cannot count through index "lcc_ci_i" under collation "default"
+SELECT lion_index_count_any('lcc_ci_i', ARRAY['abc', 'xyz']);
+ERROR:  cannot count through index "lcc_ci_i" under collation "default"
+SELECT lion_index_count('lcc_m', 0, 'lcc_ci_i', 'abc'::text);
+ERROR:  cannot count through index "lcc_ci_i" under collation "default"
+SELECT groups, count FROM lion_index_count_group_stats('lcc_ci_i');
+ERROR:  cannot count through index "lcc_ci_i" under collation "default"
+-- under the index's own collation, the count is the query's
+SELECT lion_index_count('lcc_ci_i', 'abc' COLLATE lcc_ci) AS lion,
+	   (SELECT count(*) FROM lcc WHERE t COLLATE lcc_ci = 'abc') AS query;
+ lion | query 
+------+-------
+  300 |   300
+(1 row)
+
+SELECT count FROM lion_index_count_stats('lcc_ci_i', 'abc' COLLATE lcc_ci);
+ count 
+-------
+   300
+(1 row)
+
+SELECT lion_index_count_any('lcc_ci_i', ARRAY['abc', 'xyz'] COLLATE lcc_ci) AS lion,
+	   (SELECT count(*) FROM lcc WHERE t COLLATE lcc_ci = ANY (ARRAY['abc', 'xyz'])) AS query;
+ lion | query 
+------+-------
+  400 |   400
+(1 row)
+
+-- each key of the two-index form under its own collation
+SELECT lion_index_count('lcc_ci_i', 'abc' COLLATE lcc_ci, 'lcc_m', 0) AS lion,
+	   (SELECT count(*) FROM lcc WHERE t COLLATE lcc_ci = 'abc' AND m = 0) AS query;
+ lion | query 
+------+-------
+  200 |   200
+(1 row)
+
+-- a column of the case-insensitive collation: its own index counts as its
+-- queries do, an index under "C" does not
+CREATE TABLE lcc2 (id int, t text COLLATE lcc_ci) WITH (autovacuum_enabled = off);
+INSERT INTO lcc2 SELECT g, (ARRAY['abc', 'ABC', 'Abc', 'xyz'])[1 + g % 4]
+  FROM generate_series(1, 400) g;
+CREATE INDEX lcc2_i ON lcc2 USING lion (t);
+CREATE INDEX lcc2_c ON lcc2 USING lion (t COLLATE "C");
+SELECT lion_index_count('lcc2_i', 'abc'::text) AS lion,
+	   (SELECT count(*) FROM lcc2 WHERE t = 'abc') AS query;
+ lion | query 
+------+-------
+  300 |   300
+(1 row)
+
+SELECT lion_index_count_any('lcc2_i', ARRAY['abc', 'xyz']) AS lion,
+	   (SELECT count(*) FROM lcc2 WHERE t = ANY (ARRAY['abc', 'xyz'])) AS query;
+ lion | query 
+------+-------
+  400 |   400
+(1 row)
+
+SELECT groups, count FROM lion_index_count_group_stats('lcc2_i');
+ groups | count 
+--------+-------
+      2 |   400
+(1 row)
+
+SELECT lion_index_count('lcc2_i', 'abc' COLLATE "C");
+ERROR:  cannot count through index "lcc2_i" under collation "C"
+SELECT lion_index_count('lcc2_c', 'abc'::text);
+ERROR:  cannot count through index "lcc2_c" under collation "lcc_ci"
+SELECT groups, count FROM lion_index_count_group_stats('lcc2_c');
+ERROR:  cannot count through index "lcc2_c" under collation "lcc_ci"
+SELECT lion_index_count('lcc2_c', 'abc' COLLATE "C") AS lion,
+	   (SELECT count(*) FROM lcc2 WHERE t = 'abc' COLLATE "C") AS query;
+ lion | query 
+------+-------
+  100 |   100
+(1 row)
+
+DROP TABLE lcc, lcc2;
+DROP COLLATION lcc_ci;
+\endif

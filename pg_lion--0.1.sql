@@ -454,7 +454,12 @@ CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING lion AS
  * the column's operator family compares it with (an int8 key on an int4
  * column), or a binary coercion to the column's type (varchar on text); a
  * domain as its base type; and for enum_ops the column's own enum and no
- * other (DESIGN.md section 9, "SQL surface").
+ * other (DESIGN.md section 9, "SQL surface").  It is compared under the
+ * collation `col = key` would use - the key's own when it brings one (an
+ * explicit COLLATE), otherwise the column's - and where that is not the
+ * index's collation and either of the two is nondeterministic, the count is
+ * refused: the index's equality is not the query's then.  The grouped form
+ * groups under the column's collation, as `GROUP BY col` does.
  *
  * They are STRICT: a NULL index or key answers NULL - no count is made -
  * where `count(*) WHERE col = NULL` answers 0 (section 9 says why).  A NULL

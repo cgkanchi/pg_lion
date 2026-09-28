@@ -61,6 +61,7 @@
 #include "catalog/objectaddress.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -8513,15 +8514,109 @@ lion_count_key_type(Relation index, AttrNumber col, Oid keytype)
 }
 
 /*
+ * The collation a SQL count's argument argnum brings to `col = key`: that of
+ * its expression in the call, or - called with none, from C - the call's own.
+ * The two-key form has one call collation for both keys, where the query it
+ * stands for compares each under its own; so each is taken from its own
+ * argument.
+ */
+static Oid
+lion_count_arg_collation(FunctionCallInfo fcinfo, int argnum)
+{
+	Node	   *expr = (fcinfo->flinfo != NULL) ? fcinfo->flinfo->fn_expr : NULL;
+
+	if (expr != NULL && IsA(expr, FuncExpr))
+	{
+		List	   *args = ((FuncExpr *) expr)->args;
+
+		if (argnum < list_length(args))
+			return exprCollation((Node *) list_nth(args, argnum));
+	}
+	return PG_GET_COLLATION();
+}
+
+/*
+ * The collation key column col's own values bring to `col = key`: the table
+ * column's, or its expression's when the column is an expression.  The
+ * index's may be another - `(c COLLATE "x")` keeps c, and compares under x.
+ */
+static Oid
+lion_count_column_collation(Relation heap, Relation index, AttrNumber col)
+{
+	AttrNumber	attnum = index->rd_index->indkey.values[col - 1];
+	List	   *exprs;
+	int			nth = 0;
+	int			c;
+
+	if (attnum != 0)
+		return TupleDescAttr(RelationGetDescr(heap), attnum - 1)->attcollation;
+
+	for (c = 0; c < col - 1; c++)
+	{
+		if (index->rd_index->indkey.values[c] == 0)
+			nth++;
+	}
+	exprs = lion_index_stored_exprs(index, Anum_pg_index_indexprs);
+	if (nth >= list_length(exprs))
+		elog(ERROR, "index \"%s\" has too few expressions",
+			 RelationGetRelationName(index));
+	return exprCollation((Node *) list_nth(exprs, nth));
+}
+
+/*
+ * Would the index answer `col = key` - or, with no key, `GROUP BY col` - as
+ * the query does, collation and all?  The index hashed and compared its keys
+ * under its own collation; the query compares under the key's, when the key
+ * brings one of its own (an explicit COLLATE, or a column of another
+ * collation), and otherwise under the column's: a literal or a parameter
+ * brings the default collation, which gives way to the column's in the
+ * parser's rule for an operator's inputs.  (So an explicit COLLATE "default"
+ * is taken for no COLLATE at all.)  Two deterministic collations agree on
+ * which values are equal - each calls them equal when their bytes are - and
+ * a nondeterministic one agrees with no other: `c COLLATE case_insensitive =
+ * 'abc'` counts 'ABC' and `c = 'abc'` does not.  So a count under another
+ * collation than the index's is refused when either is nondeterministic, and
+ * made otherwise.
+ */
+static void
+lion_count_check_collation(Relation heap, Relation index, AttrNumber col,
+						   Oid keycoll)
+{
+	Oid			idxcoll = index->rd_indcollation[col - 1];
+	Oid			collation = keycoll;
+
+	if (!OidIsValid(idxcoll))
+		return;					/* the key type is not collatable */
+	if (!OidIsValid(collation) || collation == DEFAULT_COLLATION_OID)
+		collation = lion_count_column_collation(heap, index, col);
+	if (!OidIsValid(collation) || collation == idxcoll)
+		return;
+	if (get_collation_isdeterministic(collation) &&
+		get_collation_isdeterministic(idxcoll))
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_COLLATION_MISMATCH),
+			 errmsg("cannot count through index \"%s\" under collation \"%s\"",
+					RelationGetRelationName(index),
+					get_collation_name(collation)),
+			 errdetail("Key column %d of the index is under collation \"%s\", and a nondeterministic collation does not agree with any other on which values are equal.",
+					   col, get_collation_name(idxcoll)),
+			 errhint("Count with the query itself, or through an index built under the collation it compares with.")));
+}
+
+/*
  * Open and vet the indexes of one SQL count: relkind, access method, key
- * type, privileges, row-level security and snapshot eligibility.  keytype may
- * be NULL, which means the caller has no search key at all (the grouped form
- * below, which walks every entry instead of looking one up).
+ * type, collation, privileges, row-level security and snapshot eligibility.
+ * keytype and keycoll may be NULL, which means the caller has no search key
+ * at all (the grouped form below, which walks every entry instead of looking
+ * one up); keycoll[i] is the collation key i brings
+ * (lion_count_arg_collation()).
  */
 static void
 lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
-					   const Oid *keytype, AttrNumber wantcol,
-					   LionCountCall *call)
+					   const Oid *keytype, const Oid *keycoll,
+					   AttrNumber wantcol, LionCountCall *call)
 {
 	Oid			heapoid = InvalidOid;
 	char	   *heapname;
@@ -8662,6 +8757,10 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("key column %d of index \"%s\" has a multi-key operator class, whose entries are not column values",
 								col, RelationGetRelationName(index))));
+
+			lion_count_check_collation(call->heap, index, col,
+									   (keycoll != NULL) ? keycoll[i] :
+									   InvalidOid);
 		}
 	}
 
@@ -8841,6 +8940,7 @@ lion_count_sql_open(FunctionCallInfo fcinfo, int nkeys, Snapshot snapshot,
 {
 	Oid			idxoid[2];
 	Oid			keytype[2];
+	Oid			keycoll[2];
 	Datum		key[2];
 	int			i;
 
@@ -8853,9 +8953,11 @@ lion_count_sql_open(FunctionCallInfo fcinfo, int nkeys, Snapshot snapshot,
 		keytype[i] = get_fn_expr_argtype(fcinfo->flinfo, 2 * i + 1);
 		if (!OidIsValid(keytype[i]))
 			elog(ERROR, "could not determine the type of the search key");
+		keycoll[i] = lion_count_arg_collation(fcinfo, 2 * i + 1);
 	}
 
-	lion_count_open_indexes(snapshot, nkeys, idxoid, keytype, 0, call);
+	lion_count_open_indexes(snapshot, nkeys, idxoid, keytype, keycoll, 0,
+						   call);
 
 	for (i = 0; i < nkeys; i++)
 		call->key[i] = key[i];
@@ -8962,6 +9064,7 @@ lion_index_count_any(PG_FUNCTION_ARGS)
 	Oid			idxoid = PG_GETARG_OID(0);
 	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(1);
 	Oid			elemtype = ARR_ELEMTYPE(arr);
+	Oid			keycoll;
 	LionCountCall call;
 	LionCountSource src;
 	LionPostingSet *sets;
@@ -8981,7 +9084,9 @@ lion_index_count_any(PG_FUNCTION_ARGS)
 	if (snapshot == NULL)
 		elog(ERROR, "lion index count requires an active snapshot");
 
-	lion_count_open_indexes(snapshot, 1, &idxoid, &elemtype, 0, &call);
+	keycoll = lion_count_arg_collation(fcinfo, 1);
+	lion_count_open_indexes(snapshot, 1, &idxoid, &elemtype, &keycoll, 0,
+						   &call);
 	PredicateLockRelation(call.index[0], snapshot);
 
 	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
@@ -9082,7 +9187,7 @@ lion_index_count_group_stats(PG_FUNCTION_ARGS)
 						idxname, attno)));
 	}
 
-	lion_count_open_indexes(snapshot, 1, &idxoid, NULL, attno, &call);
+	lion_count_open_indexes(snapshot, 1, &idxoid, NULL, NULL, attno, &call);
 
 	PredicateLockRelation(call.index[0], snapshot);
 
