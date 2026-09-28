@@ -9342,6 +9342,8 @@ nothing disabled; "core" marks core's own choice with the pushdown off.
 | f2 JOIN (d ⋉ f1), `GROUP BY d.region` | **963** (203,356) | 15,911 (308,025) core | 1,066 (433,004) |
 | (A), 3,831 dimension rows (`grade < 5`) | 655 (176,910); probed 738 (183,117) | **601-660** (121,671) core | 914 (284,603) |
 | (B), 3,831 dimension rows | **637** (176,917) | 1,335 (209,420) core; 1,737 (280,004) | 862 (285,122) |
+| (A), 14,947 dimension rows (`grade < 20`) | 715 (181,619); probed 993 (208,275) | **1,349** (137,687) core | 956 (285,840) |
+| (B), 14,947 dimension rows | **737** (181,619); probed 1,133 (208,274) | 3,337 (267,891) core; 3,772 (337,255) | 889 (286,343) |
 | **two workers** | | | |
 | (A) | 398 (162,699) | **1,935** (158,588) core | 749 (264,593) |
 | (B) | **405** (162,699) | | 501 (261,361) core |
@@ -9358,10 +9360,11 @@ over one table's child ran in 0.2 to 0.4 s in the benchmark's two-table queries;
 dimension the child is the other half of the query, and costs what core's plan of it costs.
 
 Where the node loses, it loses on cost to a nested loop that core underprices: the anti join
-(253,200 against 243,309; 767 ms against 5,336) and (A) in parallel (162,699 against 158,588; 398 ms
-against 1,935). The node's own price there is its child's plus the lookups, as for one table, and
-nothing is taken off it; the nested loop's estimate is core's. For (A) over 3,831 dimension rows the
-nested loop is priced right and about as fast as the node (0.6 s against 0.66 s), and is chosen.
+(253,200 against 243,309; 767 ms against 5,336), (A) in parallel (162,699 against 158,588; 398 ms
+against 1,935) and (A) over 14,947 dimension rows (181,619 against 137,687; 715 ms against 1,349).
+The node's own price there is its child's plus the lookups, as for one table, and nothing is taken
+off it; the nested loop's estimate is core's. For (A) over 3,831 dimension rows the nested loop is
+priced about right and is about as fast as the node (0.6 s against 0.66 s), and is chosen.
 
 f1 is never the node's fact here. Forced with f2 inside the dimension (a filter `f1.id > 0` that no
 posting set answers keeps f1 out of the other orientation), the node over f1 is priced above
@@ -9371,12 +9374,17 @@ node, ran in 792 ms at 426,754 against the hash semi join's 698 ms at 176,583. S
 Sources Collected: 5`), outside the node's timers - the costing gap "A partitioned fact table"
 leaves open - and the rest is 143,331 lookups, 75,000 keys in up to four partitions.
 
-**Probe or collect for a few thousand dimension rows.** For (A) and (B) over 3,831 dimension rows
-(884 estimated in the child) the model collects f2's filter: 3,059 for the node's own work against
-9,265 probed, 655 ms against 738 measured with the copy priced out
-(`pg_lion.fkjoin_copy_container_cost = 1e9`). Both are small beside the child's 173,851, which is
-what puts the node above the nested loop's 121,671 for (A) - the nested loop probes f1 for the 805
-rows core expects the dimension semi-joined to f2 to have, a plan whose price is close to its time.
+**Probe or collect for a few thousand dimension rows.** The model collects f2's filter in every
+plan above, and probing it is dearer in the model and slower in fact. Over 14,947 dimension rows
+(`grade < 20`; 3,527 estimated in the child) the node's own work is 6,568 collected against 33,224
+probed, 715 ms against 993 measured with the copy priced out (`pg_lion.fkjoin_copy_container_cost =
+1e9`); over 3,831 (884 estimated in the child), 3,059 against 9,265, 655 ms against 738. Both are
+small beside the child's 173,851 to 175,051. For (A) that puts the node above core's nested loop:
+at 14,947 dimension rows the loop is priced at 137,687 and runs in 1,349 ms, against the node's
+181,619 and 715 ms - it probes f1 for the 3,211 rows core expects the dimension semi-joined to f2 to
+have, at the fact's average rows a key again; at 3,831 it is priced at 121,671 and runs in 601 to
+660 ms, about as fast as the node, and is chosen rightly. For (B) the node is chosen at both sizes,
+the probed plan never.
 
 ### Declined in v1, and why
 
