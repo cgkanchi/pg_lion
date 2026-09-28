@@ -1,0 +1,373 @@
+{
+  "voice": "af_heart",
+  "speed": 0.92,
+  "lead_in": 1.6,
+  "cue_gap": 0.45,
+  "scene_gap": 1.1,
+  "tail": 3.0,
+  "scenes": [
+    {
+      "id": "intro",
+      "title": "Introduction",
+      "cues": [
+        {
+          "id": "i1",
+          "say": "Meet P G Lion, a new kind of index for Postgres.",
+          "cap": "Meet pg_lion, a new kind of index for Postgres."
+        },
+        {
+          "id": "i2",
+          "say": "It's built to answer one question very fast: how many rows match?"
+        },
+        {
+          "id": "i3",
+          "say": "In the next few minutes: how it works, how it compares with the B tree and gin indexes you already use, and when to reach for it, and when not to.",
+          "hold": 0.6
+        }
+      ]
+    },
+    {
+      "id": "question",
+      "title": "The question dashboards ask",
+      "cues": [
+        {
+          "id": "q1",
+          "say": "Dashboards, search filters and reports keep asking the same kind of question."
+        },
+        {
+          "id": "q2",
+          "say": "How many events came from Japan? How many of those were purchases? How many per country?"
+        },
+        {
+          "id": "q3",
+          "say": "In SQL, that's count star, with a WHERE clause, and often a GROUP BY.",
+          "cap": "In SQL, that's count(*), with a WHERE clause, and often a GROUP BY.",
+          "hold": 0.4
+        },
+        {
+          "id": "q4",
+          "say": "Our example table has five million rows, and half of them match."
+        },
+        {
+          "id": "q5",
+          "say": "So Postgres has to count two and a half million rows. How long that takes depends on the index.",
+          "hold": 0.6
+        }
+      ]
+    },
+    {
+      "id": "btree",
+      "title": "B-tree: a sorted list",
+      "cues": [
+        {
+          "id": "b1",
+          "say": "Start with the B tree, the index Postgres gives you by default."
+        },
+        {
+          "id": "b2",
+          "say": "A B tree is a sorted list of keys, like a phone book. Each entry points to one row in the table.",
+          "hold": 0.4
+        },
+        {
+          "id": "b3",
+          "say": "Finding a key is quick: a few hops down the tree, and you're there.",
+          "hold": 0.4
+        },
+        {
+          "id": "b4",
+          "say": "That's why B trees are so good at fetching a few rows, reading ranges in order, ORDER BY with LIMIT, and enforcing uniqueness.",
+          "hold": 0.4
+        },
+        {
+          "id": "b5",
+          "say": "But to count, a B tree walks its entries one by one, and hands every single row to count star.",
+          "cap": "But to count, a B-tree walks its entries one by one, and hands every single row to count(*).",
+          "hold": 0.8
+        },
+        {
+          "id": "b6",
+          "say": "Two and a half million matches means two and a half million steps. On our test machine, that took about a hundred and fifty-seven milliseconds.",
+          "cap": "2.5 million matches means 2.5 million steps. On our test machine, that took about 157 milliseconds.",
+          "hold": 0.8
+        }
+      ]
+    },
+    {
+      "id": "gin",
+      "title": "GIN: an inverted index",
+      "cues": [
+        {
+          "id": "g1",
+          "say": "Gin turns that around. It's an inverted index."
+        },
+        {
+          "id": "g2",
+          "say": "For every key, a word, a tag, or a JSON value, it keeps a list of the rows that contain it.",
+          "cap": "For every key (a word, a tag, or a JSON value) it keeps a list of the rows that contain it.",
+          "hold": 0.3
+        },
+        {
+          "id": "g3",
+          "say": "That's exactly what arrays, JSON-B and full-text search need, because one row can hold many keys.",
+          "cap": "That's exactly what arrays, JSONB and full-text search need, because one row can hold many keys.",
+          "hold": 0.3
+        },
+        {
+          "id": "g4",
+          "say": "Its keys are sorted, so gin can match a prefix, and it narrows phrase searches before checking the table.",
+          "hold": 0.4
+        },
+        {
+          "id": "g5",
+          "say": "But for a count, gin can only hand Postgres a bitmap of matching rows. Postgres then reads the table pages and counts rows there.",
+          "hold": 0.6
+        },
+        {
+          "id": "g6",
+          "say": "Our count took about six hundred sixty-five milliseconds.",
+          "cap": "Our count took about 665 milliseconds.",
+          "hold": 0.9
+        }
+      ]
+    },
+    {
+      "id": "lion",
+      "title": "Lion: sets of rows, in chunks",
+      "cues": [
+        {
+          "id": "l1",
+          "say": "Lion is an inverted index too: every key maps to the set of rows that have it, just like gin."
+        },
+        {
+          "id": "l2",
+          "say": "What's different is how that set is stored."
+        },
+        {
+          "id": "l3",
+          "say": "Lion splits the table into chunks of sixty-four pages. For each key, each chunk gets one small container.",
+          "cap": "Lion splits the table into chunks of 64 pages. For each key, each chunk gets one small container.",
+          "hold": 0.6
+        },
+        {
+          "id": "l4",
+          "say": "Each container takes whichever shape is smallest."
+        },
+        {
+          "id": "l5",
+          "say": "Only a few matching rows? A short sorted list.",
+          "hold": 0.5
+        },
+        {
+          "id": "l6",
+          "say": "Lots of them? A bitmap, with one bit for every row slot in the chunk.",
+          "hold": 0.5
+        },
+        {
+          "id": "l7",
+          "say": "Long unbroken stretches? Just a start and a length.",
+          "hold": 0.5
+        },
+        {
+          "id": "l8",
+          "say": "This trick is called a roaring bitmap. Hence, the lion.",
+          "hold": 0.4
+        },
+        {
+          "id": "l9",
+          "say": "And every container records how many rows it holds.",
+          "hold": 0.8
+        }
+      ]
+    },
+    {
+      "id": "count",
+      "title": "Counting without walking rows",
+      "cues": [
+        {
+          "id": "c1",
+          "say": "So Lion doesn't walk rows to count. It adds up the containers' totals: one step per chunk, instead of one step per row.",
+          "hold": 1.0
+        },
+        {
+          "id": "c2",
+          "say": "There's one catch, and it's the same one index-only scans have."
+        },
+        {
+          "id": "c3",
+          "say": "An index can't tell whether a row is visible to your transaction. Only the table knows."
+        },
+        {
+          "id": "c4",
+          "say": "So Postgres keeps a visibility map: one flag per table page, meaning every row here is visible to everyone. Vacuum sets those flags.",
+          "cap": "So Postgres keeps a visibility map: one flag per table page, meaning every row here is visible to everyone. VACUUM sets those flags.",
+          "hold": 0.4
+        },
+        {
+          "id": "c5",
+          "say": "Where the flags are set, Lion trusts the container's total.",
+          "hold": 0.6
+        },
+        {
+          "id": "c6",
+          "say": "Where a page changed recently, Lion checks those rows in the table, one by one. So the answer is always exact.",
+          "hold": 0.8
+        },
+        {
+          "id": "c7",
+          "say": "The result: the same count in one point seven milliseconds. Ninety times faster than the B tree, and nearly four hundred times faster than gin.",
+          "cap": "The result: the same count in 1.7 milliseconds. 90\u00d7 faster than the B-tree, and nearly 400\u00d7 faster than GIN.",
+          "hold": 1.6
+        }
+      ]
+    },
+    {
+      "id": "combine",
+      "title": "Filters and groups",
+      "cues": [
+        {
+          "id": "m1",
+          "say": "Because every set is a bitmap, combining filters is cheap."
+        },
+        {
+          "id": "m2",
+          "say": "Country is Japan, and type is purchase? Lion lines up the two sets chunk by chunk, keeps the overlap, and counts it.",
+          "hold": 0.8
+        },
+        {
+          "id": "m3",
+          "say": "GROUP BY works the same way: one count per key, without reading the rows.",
+          "hold": 0.8
+        },
+        {
+          "id": "m4",
+          "say": "In our benchmark, two filters ran about nine times faster than the B tree, and counting two hundred groups about twenty-four times faster.",
+          "cap": "In our benchmark, two filters ran about 9\u00d7 faster than the B-tree, and counting 200 groups about 24\u00d7 faster.",
+          "hold": 0.3
+        },
+        {
+          "id": "m5",
+          "say": "A thousand-value IN list, or a range, about two and a half times. And counting array tags beat gin by up to a hundred and sixty-eight times.",
+          "cap": "A 1,000-value IN list, or a range, about 2.5\u00d7. And counting array tags beat GIN by up to 168\u00d7.",
+          "hold": 1.4
+        }
+      ]
+    },
+    {
+      "id": "limits",
+      "title": "Where Lion doesn't win",
+      "cues": [
+        {
+          "id": "x1",
+          "say": "Now, the honest part. Lion isn't a better B tree, and it isn't a better gin.",
+          "hold": 0.3
+        },
+        {
+          "id": "x2",
+          "say": "Looking up a rare key is a tie: both finish in tens of microseconds.",
+          "hold": 0.3
+        },
+        {
+          "id": "x3",
+          "say": "Fetching the matching rows is a tie too, because reading the table dominates.",
+          "hold": 0.3
+        },
+        {
+          "id": "x4",
+          "say": "Lion can't return rows in order, so ORDER BY with LIMIT needs a B tree. So do unique constraints and primary keys.",
+          "hold": 0.3
+        },
+        {
+          "id": "x5",
+          "say": "Lion stores no word positions, so phrase and prefix searches belong to gin.",
+          "hold": 0.3
+        },
+        {
+          "id": "x6",
+          "say": "Frequent changes slow it down. After updating one percent of rows without a vacuum, our count went from under two milliseconds to eighty-one. Still well ahead of the B tree, but the gap shrinks.",
+          "cap": "Frequent changes slow it down. After updating 1% of rows without a VACUUM, our count went from under 2 ms to 81 ms. Still well ahead of the B-tree, but the gap shrinks.",
+          "hold": 0.3
+        },
+        {
+          "id": "x7",
+          "say": "And writes cost more. Inserts were about a quarter slower than with B trees, wrote about one and a half times the write-ahead log, and index builds took nearly three times as long.",
+          "cap": "And writes cost more. Inserts were about 25% slower than with B-trees, wrote about 1.5\u00d7 the WAL, and index builds took nearly 3\u00d7 as long.",
+          "hold": 1.2
+        }
+      ]
+    },
+    {
+      "id": "use",
+      "title": "Using it",
+      "cues": [
+        {
+          "id": "u1",
+          "say": "Using Lion is plain SQL."
+        },
+        {
+          "id": "u2",
+          "say": "Create the extension, add Lion indexes on the columns you filter and group by, then vacuum analyze the table.",
+          "cap": "Create the extension, add Lion indexes on the columns you filter and group by, then VACUUM ANALYZE the table.",
+          "hold": 0.4
+        },
+        {
+          "id": "u3",
+          "say": "Write your queries as usual. There are no special functions to call.",
+          "hold": 0.3
+        },
+        {
+          "id": "u4",
+          "say": "In EXPLAIN, look for Custom Scan, Lion Count. That means the count came straight from the index.",
+          "cap": "In EXPLAIN, look for Custom Scan (LionCount). That means the count came straight from the index.",
+          "hold": 0.6
+        },
+        {
+          "id": "u5",
+          "say": "For range queries on timestamps or ID columns, build the index with summaries set to auto.",
+          "cap": "For range queries on timestamps or ID columns, build the index WITH (summaries = auto).",
+          "hold": 0.6
+        },
+        {
+          "id": "u6",
+          "say": "And keep your other indexes. Lion, B tree and gin can all sit on the same table.",
+          "hold": 1.0
+        }
+      ]
+    },
+    {
+      "id": "summary",
+      "title": "Which index when",
+      "cues": [
+        {
+          "id": "s1",
+          "say": "So, the short version."
+        },
+        {
+          "id": "s2",
+          "say": "Counting, filtering and grouping, for dashboards and facets: Lion.",
+          "hold": 0.3
+        },
+        {
+          "id": "s3",
+          "say": "Fetching rows by key, ordered results, and uniqueness: B tree.",
+          "hold": 0.3
+        },
+        {
+          "id": "s4",
+          "say": "Full-text phrase and prefix search, and JSON documents: gin.",
+          "hold": 0.3
+        },
+        {
+          "id": "s5",
+          "say": "Busy, write-heavy tables that rarely get vacuumed: measure carefully first.",
+          "hold": 0.6
+        },
+        {
+          "id": "s6",
+          "say": "P G Lion is still a prototype. These numbers come from one benchmark, on PostgreSQL eighteen with five million rows. Measure it on your own data before you depend on it.",
+          "cap": "pg_lion is still a prototype. These numbers come from one benchmark, on PostgreSQL 18 with 5 million rows. Measure it on your own data before you depend on it.",
+          "hold": 1.0
+        }
+      ]
+    }
+  ]
+}
