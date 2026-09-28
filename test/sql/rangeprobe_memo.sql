@@ -53,7 +53,7 @@ CREATE INDEX lpm_lion ON lpm USING lion (ts);
 VACUUM (ANALYZE) lpm;
 INSERT INTO lpm SELECT g, '2026-01-01'::timestamptz + g * interval '1 minute'
   FROM generate_series(1501, 30000) g;
-VACUUM lpm;
+VACUUM (FREEZE) lpm;
 CREATE TABLE lpm_est (step text, est bigint);
 INSERT INTO lpm_est
 	SELECT 'probed', lpm_rows($$SELECT * FROM lpm WHERE ts >= '2026-01-10'$$);
@@ -62,7 +62,7 @@ INSERT INTO lpm_est
 -- than the probe reads.  The first plan reads a hundred of them and gives up;
 -- the next one reads none.
 DELETE FROM lpm WHERE id > 20000;
-VACUUM lpm;
+VACUUM (FREEZE) lpm;
 CREATE TABLE lpm_io (step text, bufs bigint);
 INSERT INTO lpm_io
 	SELECT 'first', lpm_bufs($$SELECT * FROM lpm WHERE ts >= '2026-01-10'$$);
