@@ -183,8 +183,8 @@ END $$;
 -- ---------- 1. every answer, each way ----------
 -- The rows each filter holds, the path each is forced through, and what the
 -- count's merge did with its unions.  Where the intersection is small by the
--- time a list is met, the list is probed (5, 10); where it is dense, built (6,
--- 7); the lists of 1 to 4, 9 and 14 meet an intersection of a hundred-odd
+-- time a list is met, the list is probed (10); where it is dense, built (6,
+-- 7); the lists of 1 to 5, 9 and 14 meet an intersection of a hundred-odd
 -- members at the first list and of a few at the next, and are built there and
 -- probed here, as 8's are where z is dense and where it is sparse.  A list
 -- that is empty or names no entry has nothing to meet (11, 12), and one of a
@@ -201,7 +201,7 @@ SELECT n, upt_rows(q) AS rows,
   2 |    808 | t          | t          | t           | t     | t
   3 |   2001 | t          | t          | t           | t     | t
   4 |   3967 | t          | t          | t           | t     | t
-  5 |    580 | t          | t          | t           | f     | t
+  5 |    580 | t          | t          | t           | t     | t
   6 | 128240 | t          | t          | t           | t     | f
   7 |  93837 | t          | t          | t           | t     | f
   8 |   7152 | t          | t          | t           | t     | t
