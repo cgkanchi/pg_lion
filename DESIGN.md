@@ -3758,15 +3758,15 @@ the refuted arms on a line of their own and the implied leaves with the implied 
                     ((kind = 'b') AND ...) in 2 of 4 partitions, (kind = 'c') in 3 of 4
                     partitions, (kind = 'd') in 3 of 4 partitions
 
-**Not done: GROUP BY the partition key.** `SELECT kind, count(*) ... GROUP BY kind` still needs a
-lion index on kind in every partition, although in a partition whose bounds give kind one value
-every row is one group and its count the partition's count. Taking the value from the bound needs
-what §10's value gate asks of an index's stored key - the partition key's equality has to be the
-grouping's and has to preserve the representation (`numeric` 1.0 and 1.00 are one partition
+**GROUP BY the partition key.** The FK-side join takes the value from the bound (§27, "Grouped by a
+fact column"): in a partition whose bounds give kind one value every row is one group, and its
+count the partition's count, once §10's value gate is asked of the grouping equality itself - it
+has to be the type's and preserve the representation (`numeric` 1.0 and 1.00 are one partition
 value; a nondeterministic collation groups different strings), which an opclass says for an index
-but the partition key has to be asked for - and an executor mode that counts one partition as one
-group; the FK-side join would also have to put a fact column in its output, which §27 declines.
-It is left for a change of its own.
+but the partition key has to be asked for (`lion_leaf_bound_value()`). A count of one table, `SELECT
+kind, count(*) ... GROUP BY kind`, still needs a lion index on kind in every partition: it would
+need an executor mode that counts one partition as one group, and a partition count with nothing
+left to select its rows by is one the node has never made.
 
 ## 17. Multi-key operator classes: arrays and tsvector (v1, implemented)
 
@@ -7704,8 +7704,9 @@ the fact's or the dimension's ("Grouped by the join key"), a partitioned fact ta
 partitioned fact table"), and a dimension that is itself a join of a table and the tables
 semi- or anti-joined to it ("A dimension that is a join"); on 2026-09-29, a run that probes the fact
 filters and collects them part way through once probing has cost what collecting would ("Probed,
-then collected"), and the semi and anti join offered as a join path of its own, whose rows are the
-outer side's ("The semi and anti join as a join path"). The shape is the star-schema aggregate
+then collected"), the semi and anti join offered as a join path of its own, whose rows are the
+outer side's ("The semi and anti join as a join path"), and a GROUP BY of a fact column, each key
+counted once per group of it ("Grouped by a fact column"). The shape is the star-schema aggregate
 
     SELECT d.attr, count(*)
     FROM fact f JOIN dim d ON f.fk = d.pk
@@ -10388,6 +10389,87 @@ What they say:
   226,000 for 500,000): the join path's rows are the join rel's, and everything above them is
   priced for half the rows it gets, whichever path the join rel takes.
 
+### Grouped by a fact column (2026-09-29)
+
+`SELECT f.kind, count(*) FROM fact f JOIN dim d ON f.fk = d.pk WHERE ... GROUP BY f.kind` used to
+be declined whatever indexes there were: the node's row for a dimension row is one count, the rows
+of `fk = d.pk` ANDed with the fact filters, and nothing in that number says how the rows it counts
+divide among `f.kind`'s values. A lion index on `kind` did not help, because the join never asked
+for one. So the query was core's - over a partitioned fact table with an OR of a filter per kind, a
+nested loop into every partition, at every dimension row. Written as a UNION of one ungrouped count
+per kind, each branch was the node's, which is the whole of what this adds: the node counts each
+dimension row once per GROUP of the fact column instead.
+
+**What is counted.** For a dimension row `d` and a value `v` of the fact column `g`, the rows the
+Finalize Agg's group `v` wants from `d` are `F(d) ∩ {g = v}`: the key's set, the fact filters, and
+the posting set of `g = v` - one more source of the same count. The node counts that for each
+group, and hands up a partial row `(d's columns, v, count)` for each count that is not 0; the
+Finalize Agg adds up the rows of each `(v, d's grouped columns)` as it adds up a dimension column's.
+A dimension row's rows in different groups are disjoint (a fact row has one value of `g`), so the
+counts are exact per group and add up to the row's count. Grouping by `g` beside dimension columns,
+or beside the fact's join key ("Grouped by the join key"), is the same rows with more columns.
+
+**The groups are a relation's own.** In the plain table, and in a partition whose bounds leave `g`
+several values, they are the entries of a lion index on `g` there: an entry is one group exactly
+when the index's strategy 1 is the grouping equality under the grouping collation, and its stored
+key is what the row prints, so the index has to pass §10's value gate - the same rules as a GROUP
+BY's own driving index (`lion_collect_targets()`, given `g` as a driving column), which is why a
+numeric `g` declines. A partition whose bounds give `g` one value needs no index at all: every row
+of it is of that group, and a key's count there is the group's count, made as any partition's is
+(`lion_leaf_bound_value()`). The proof is §16's for an implied clause - the constraint strongly
+implies `g = c` under the grouping's own equality and collation - taken for the few constants the
+constraint compares `g` with; and since `c` is what the rows print, the grouping equality has to be
+the type's and imply an identical representation under that collation (`lion_type_equalimage()`),
+which is §10's rule for a stored key. A partition of the NULLs alone gives the NULL group. So a
+fact table LIST-partitioned by `kind`, one partition per kind, needs no index on `kind` for this; a
+partition of several kinds, or a default one, needs one.
+
+**Executing it** (`lion_next_join_group()`). The keys are read a batch at a time - the batches of
+"Lookups in key order", taken for a plain table too - and each batch is taken to each relation in
+turn, the plain table or every leaf partition. In a partition whose bounds give `g` its value, the
+turn is the partition's ordinary turn (`lion_join_lookup_ent()`, with its copy of the filters and
+its account of what probing them costs), each count put by with that value. Otherwise the entries
+of `g`'s index are walked a chunk of 64 at a time: the chunk's sets located - and pinned, as an IN
+list's are - each key of the batch looked up once and counted against each of them
+(`lion_join_count_groups()`: the key's set, the filters or their copy, and the group's set, ANDed
+by the one count function every count goes through), and the chunk let go of before the next. The
+cost model takes this for columns of few values; a column of more is correct, only slower, and a
+chunk after the first walks the fk index from its start again. The rows a turn counted go up once
+the turn is over: after the partition is closed, as a partitioned fact's rows always are (§16), or,
+over the plain table, once its sets have let go of their pins (`lion_pause_run()`). They wait in
+memory until then - at most one per key and group with rows in the relation, no more than the
+batch's join rows there. A turn whose filters select nothing has none. `Fact Group Key` names the
+column in EXPLAIN, `Fact Groups From Partition Bounds` how many partitions' bounds give it, and
+EXPLAIN ANALYZE's `Fact Group Counts` how many counts were made per group - none in a partition
+whose bounds give the value.
+
+**What is taken.** An inner join, and the forward semi join over its distinct keys, whose rows
+stand for the fact's; a semi or anti join's rows are the dimension's, and the query above them names
+no fact column. One fact column other than the join key, itself a column of the GROUP BY (an
+expression of it is the Agg's, above the node), hashable, with counts alone beside it: the rows
+carry no count per group for "Every aggregate over the node's rows" to rewrite, and a
+`count(DISTINCT)` or a sum beside a fact column declines. Each row is a dimension row's in one
+group - in one partition, over a partitioned fact - so "Grouped by the join key"'s rows-as-groups
+Agg is never taken beside it. Parallel plans divide the dimension rows as for any FK-side join, and
+each participant counts its share in every group.
+
+**Cost.** A relation counts each key once per group, so `lion_cost_fkjoin_path()` multiplies its
+per-key counts - against the filters or their copy - by its groups: one where the bounds give the
+value, and otherwise the column's distinct values in the relation (`estimate_num_groups()` over its
+rows, since every entry is counted whether or not the filters leave it rows). The key's lookup is
+made once. The node's rows are its keys' times the groups, as many as the join's rows at most.
+
+`test/sql/fkjoin_factgroup.sql`: every query against the pushdown off and serially, over a fact
+table LIST-partitioned by kind (a sub-partitioned list, a list of one kind, one of two and a
+default, NULL kind included) and a plain copy of it - grouped by the partition key, alone, beside
+dimension columns and the join key, under an OR of a filter per kind with a range beside it and an
+IN list of a dimension's keys, and by other columns, one of a hundred values and NULL, more groups
+than one chunk; the forward semi join; HAVING, ORDER BY, LIMIT; filters that select nothing in some
+partitions and in all; batches at a small work_mem; rescans and a dirty heap; the counters; and the
+declines (an expression, two fact columns, a `count(DISTINCT)` beside, a numeric column, and a
+partition of several kinds without an index on kind - which declines only where a partition needs
+it).
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
@@ -10403,10 +10485,10 @@ What they say:
   that is a join is taken only as one table with others semi- or anti-joined to it ("A dimension
   that is a join"), whose rows are that table's, each once; an inner join to a unique key would
   keep that too (core's `innerrel_is_unique()` proves it) and is the natural next step.
-- **Fact columns in the output** (`GROUP BY d.attr, f.x`): per dimension row that is a §10 GROUP BY
-  over `f.x`, which composes, but is not in v1. It is also every GROUP BY of a forward semi join,
-  whose dimension the query above the EXISTS cannot name. The one exception is the fact's join
-  column, which stands for the dimension's key ("Grouped by the join key"). That exception does not
+- **Fact columns in the output** but for one fact column grouped by ("Grouped by a fact column")
+  and the fact's join column, which stands for the dimension's key ("Grouped by the join key"): two
+  fact columns, an expression of one as a grouping column, a fact column beside aggregates other
+  than counts, and a column whose index cannot print its keys. The join key's exception does not
   cover an fk of another type than the key, a key whose equal values may be spelled differently
   (numeric, citext, bpchar, the floats, a nondeterministic collation), the key under another
   collation than the join's, or an expression of it.

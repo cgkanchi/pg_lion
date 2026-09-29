@@ -346,11 +346,12 @@ INSERT INTO lion_fdn SELECT i % 50, i % 3 FROM generate_series(1, 100) i;
 CREATE INDEX ON lion_fdn (k);
 ANALYZE lion_fdn;
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdn d ON f.fk = d.k GROUP BY d.attr');
--- a second join clause, an outer join, a fact column in the output, a
--- volatile grouping expression, another aggregate, a fact column counted
+-- a second join clause, an outer join, two fact columns in the output (one
+-- is grouped by: fkjoin_factgroup.sql), a volatile grouping expression,
+-- another aggregate, a fact column counted
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk AND f.x < d.attr GROUP BY d.attr');
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f LEFT JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr');
-SELECT lion_fj('SELECT d.attr, f.x, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr, f.x');
+SELECT lion_fj('SELECT d.attr, f.x, f.y, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr, f.x, f.y');
 SELECT lion_fj('SELECT d.attr + (random() * 0)::int AS a, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk GROUP BY 1');
 SELECT lion_fj('SELECT d.attr, sum(f.x) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr');
 SELECT lion_fj('SELECT d.attr, count(f.y) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr');

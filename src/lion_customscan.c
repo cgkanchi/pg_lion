@@ -870,7 +870,15 @@ set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook = NULL;
  *		§16, "Clauses the partition bounds imply"), as EXPLAIN prints them -
  *		deparsed when the plan is made, since it carries no expression of
  *		them to deparse later
- *	14	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	14	List: the FK-side join's GROUP BY of a fact column (DESIGN.md §27,
+ *		"Grouped by a fact column"), or empty: an IntList of the column's
+ *		attnum; an OidList, one per relation counted - the table, or each
+ *		live leaf partition in member 5's order - of the lion index whose
+ *		entries are its groups there, or InvalidOid where the partition's
+ *		bounds give the column one value; and a List of Const, one per
+ *		relation, that value (a NULL Const for the NULL group) where the
+ *		index Oid is InvalidOid, and read by nothing where it is not
+ *	15	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -887,7 +895,8 @@ set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook = NULL;
 #define LION_PRIV_EXECUTE	11
 #define LION_PRIV_COALESCE	12
 #define LION_PRIV_IMPLIED	13
-#define LION_PRIV_TLKINDS	14
+#define LION_PRIV_FACTGROUP	14
+#define LION_PRIV_TLKINDS	15
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -934,6 +943,10 @@ set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook = NULL;
  * §27, "The semi and anti join as a join path").  Read by an older build, such
  * a plan would be taken for the rows of a count(DISTINCT).
  *
+ * Shape 17 added the FACTGROUP member (14) in front of the target-list
+ * kinds: an FK-side join grouped by a fact column (DESIGN.md §27, "Grouped by
+ * a fact column"), whose groups an older build would have summed into one.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -946,8 +959,8 @@ set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook = NULL;
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424910
-#define LION_PRIV_NMEMBERS	15
+#define LION_PRIV_MAGIC		0x52424911
+#define LION_PRIV_NMEMBERS	16
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -1054,7 +1067,25 @@ typedef struct LionPartState
 	Oid			groupidxoid;	/* InvalidOid when no index drives the scan */
 	Oid			groupidxoid2;	/* the inner one of a two-column GROUP BY */
 	Oid		   *clauseidxoid;	/* one per WHERE clause */
+	Oid			fgidxoid;		/* the FK-side join's fact group: the index
+								 * of its groups here, or InvalidOid ... */
+	Const	   *fgconst;		/* ... and then the one value the bounds give
+								 * it (DESIGN.md §27, "Grouped by a fact
+								 * column") */
 } LionPartState;
+
+/*
+ * A dimension row's count in one group of the fact column an FK-side join
+ * groups by (DESIGN.md §27, "Grouped by a fact column"), waiting to go up:
+ * the batch entry it is of, the group's value, and the count.
+ */
+typedef struct LionJoinGroupRow
+{
+	int			ent;
+	Datum		key;
+	bool		isnull;
+	int64		count;
+} LionJoinGroupRow;
 
 /*
  * One child row of a batch the FK-side join looks up in key order (DESIGN.md
@@ -1711,6 +1742,38 @@ typedef struct LionCountScanState
 	int64		joinworkerchildrows;
 	int64		joinworkerposting;
 	instr_time	joinworkertime[LION_JT_N];
+
+	/*
+	 * The FK-side join grouped by a fact column (DESIGN.md §27, "Grouped by a
+	 * fact column"): fgattno is the column, in the parent's numbering, or 0.
+	 * Each batch of keys is taken to each relation in turn - the plain table
+	 * once, or every leaf partition (fgturn is the next) - and each key is
+	 * counted there once per group of the column: in a partition whose
+	 * bounds give it one value, the key's count with that value; otherwise
+	 * once per entry of the column's lion index (fgidxoid, or the
+	 * partition's), a chunk of up to LION_FKJOIN_GROUP_CHUNK located sets at a
+	 * time (fgsets and fgkey, in fgcxt), each ANDed into the count as one more
+	 * source (fgsrc).  The counts that are not 0 wait in fgrows - their keys
+	 * in fgrowcxt - until the relation's turn is over, and go up one a call.
+	 * fggroupcounts is how many counts there were, for EXPLAIN ANALYZE.
+	 */
+	AttrNumber	fgattno;
+	Oid			fgidxoid;
+	int			fgturn;
+	MemoryContext fgcxt;
+	MemoryContext fgrowcxt;
+	LionPostingSet *fgsets;
+	Datum	   *fgkey;
+	bool	   *fgnull;
+	int			fgn;
+	LionCountSource *fgsrc;
+	int			fgnsrc;
+	LionJoinGroupRow *fgrows;
+	int			fgnrows;
+	int			fgrowcap;
+	int			fgrowpos;
+	int64		fggroupcounts;
+	int64		fgworkergroupcounts;
 } LionCountScanState;
 
 /*
@@ -1766,6 +1829,7 @@ typedef struct LionJoinShared
 	int64		wherespilled;
 	int64		groupbatches;
 	int64		groupsbatched;
+	int64		factgroupcounts;
 	pg_atomic_uint32 nextchunk;
 	int			participants;
 	int			nranges;
@@ -2421,6 +2485,12 @@ typedef struct LionCountTarget
 								 * (DESIGN.md §16, "Clauses the partition
 								 * bounds imply"); NULL when none is */
 	int			ndropped;
+	Const	   *driveconst[LION_MAX_GROUPCOLS];	/* the one value the leaf's
+												 * bounds give a driving
+												 * column that asks for it
+												 * (LionDriveInfo.bound), with
+												 * no index in driveidx; NULL
+												 * otherwise */
 } LionCountTarget;
 
 /*
@@ -2551,6 +2621,14 @@ typedef struct LionDriveInfo
 								 * DESIGN.md §14 does not care how the entries
 								 * partition the rows) */
 	bool		valueout;		/* the group key appears in the output */
+
+	/*
+	 * A leaf partition whose bounds give the column one value may take it
+	 * from there instead of from an index (lion_leaf_bound_value()): every row
+	 * of it is one group.  Only the FK-side join's fact group asks it
+	 * (DESIGN.md §27, "Grouped by a fact column").
+	 */
+	bool		bound;
 } LionDriveInfo;
 
 /*
@@ -2605,6 +2683,121 @@ lion_leaf_implies(PlannerInfo *root, RelOptInfo *leaf, RelOptInfo *toprel,
 		return false;
 	leafclause = adjust_appendrel_attrs_multilevel(root, clause, leaf, toprel);
 	return predicate_implied_by(list_make1(leafclause), partqual, false);
+}
+
+/*
+ * The constants a leaf partition's constraint compares column `var` with by
+ * an operator (`var = c`, either way round) - the candidates for the one
+ * value its bounds may give the column (lion_leaf_bound_value()).  A LIST
+ * bound of one value is such a clause, in the leaf's own bound or in an
+ * ancestor's; a bound of several is a ScalarArrayOpExpr, which gives the
+ * column no one value, and is not looked into.  A few at most: a constraint
+ * is a partition's bound and its ancestors'.
+ */
+#define LION_BOUND_CANDIDATES	16
+
+typedef struct LionBoundCands
+{
+	Var		   *var;
+	List	   *cands;
+} LionBoundCands;
+
+static bool
+lion_bound_cands_walker(Node *node, LionBoundCands *cx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, OpExpr) && list_length(((OpExpr *) node)->args) == 2 &&
+		list_length(cx->cands) < LION_BOUND_CANDIDATES)
+	{
+		OpExpr	   *op = (OpExpr *) node;
+		Node	   *l = lion_strip((Node *) linitial(op->args));
+		Node	   *r = lion_strip((Node *) lsecond(op->args));
+		int			side;
+
+		for (side = 0; side < 2; side++)
+		{
+			Node	   *v = side ? r : l;
+			Node	   *c = side ? l : r;
+
+			if (v != NULL && IsA(v, Var) && c != NULL && IsA(c, Const) &&
+				((Var *) v)->varno == cx->var->varno &&
+				((Var *) v)->varattno == cx->var->varattno &&
+				((Var *) v)->varlevelsup == 0 &&
+				!((Const *) c)->constisnull &&
+				((Const *) c)->consttype == cx->var->vartype)
+				cx->cands = lappend(cx->cands, c);
+		}
+		return false;
+	}
+	return expression_tree_walker(node, lion_bound_cands_walker, (void *) cx);
+}
+
+/*
+ * The one value leaf partition `partqual`'s bounds give column `drive->var`,
+ * as a Const of the column's type - a NULL one for a partition of the NULLs
+ * alone - or NULL when they give it none (DESIGN.md §27, "Grouped by a fact
+ * column").  Every row of such a partition is then one group of a GROUP BY of
+ * the column, which the FK-side join counts as its partition's count, with no
+ * index on the column at all.
+ *
+ * The proof is the one "Clauses the partition bounds imply" makes (§16): the
+ * constraint is TRUE for every row the partition holds, so when it strongly
+ * implies `var = c` - under the GROUPING's own equality and collation, which
+ * is what makes the rows one group and not merely rows of one partition - every
+ * row's value is equal to c in the sense the Agg above groups by.  And since
+ * c is what the node prints for them, equal has to mean identical, as it does
+ * for a key an index stored (§10's value gate, lion_index_can_emit_value()):
+ * the grouping equality has to be the type's own, and to imply an identical
+ * representation under that collation (lion_type_equalimage()).  numeric's
+ * 1.0 and 1.00 are one partition value and print differently; a text bound
+ * under a case-insensitive collation holds spellings its rows need not have.
+ */
+static Const *
+lion_leaf_bound_value(List *partqual, const LionDriveInfo *drive)
+{
+	Var		   *var = drive->var;
+	TypeCacheEntry *typentry;
+	LionBoundCands cx;
+	NullTest   *nt;
+	ListCell   *lc;
+
+	if (partqual == NIL || var == NULL || !OidIsValid(drive->eqop))
+		return NULL;
+
+	typentry = lookup_type_cache(var->vartype,
+								 TYPECACHE_EQ_OPR | TYPECACHE_BTREE_OPFAMILY);
+	if (!OidIsValid(typentry->eq_opr) || typentry->eq_opr != drive->eqop ||
+		!OidIsValid(typentry->btree_opintype) ||
+		!lion_type_equalimage(typentry->btree_opintype, drive->collation))
+		return NULL;
+
+	cx.var = var;
+	cx.cands = NIL;
+	(void) lion_bound_cands_walker((Node *) partqual, &cx);
+	foreach(lc, cx.cands)
+	{
+		Const	   *c = (Const *) lfirst(lc);
+		OpExpr	   *eq;
+
+		eq = (OpExpr *) make_opclause(drive->eqop, BOOLOID, false,
+									  (Expr *) copyObject(var),
+									  (Expr *) copyObject(c),
+									  InvalidOid, drive->collation);
+		set_opfuncid(eq);
+		if (predicate_implied_by(list_make1(eq), partqual, false))
+			return (Const *) copyObject(c);
+	}
+
+	/* ... or a partition of the NULLs alone: its one group is the NULL one */
+	nt = makeNode(NullTest);
+	nt->arg = (Expr *) copyObject(var);
+	nt->nulltesttype = IS_NULL;
+	nt->argisrow = false;
+	nt->location = -1;
+	if (predicate_implied_by(list_make1(nt), partqual, false))
+		return makeNullConst(var->vartype, var->vartypmod, var->varcollid);
+	return NULL;
 }
 
 /*
@@ -3099,9 +3292,16 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 	{
 		Relation	relation = table_open(rte->relid, NoLock);
 		bool		supported = lion_table_am_supported(relation);
+		bool		bound = false;
 
-		/* ... and the bounds that may imply WHERE clauses (below) */
-		if (supported && imply != NULL)
+		for (d = 0; d < ndrive; d++)
+			bound |= (drive[d].attno != 0 && drive[d].bound);
+
+		/*
+		 * ... and the bounds that may imply WHERE clauses (below), or give a
+		 * driving column its one value
+		 */
+		if (supported && (imply != NULL || bound))
 			partqual = lion_leaf_partition_qual(relation, rel->relid);
 		table_close(relation, NoLock);
 		if (!supported)
@@ -3122,6 +3322,18 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 		t->drivevar[d] = drive[d].var;
 		if (drive[d].attno == 0)
 			continue;
+
+		/*
+		 * A column the leaf's bounds give one value to groups nothing there:
+		 * the leaf is one group, of that value, and needs no index on it
+		 * (DESIGN.md §27, "Grouped by a fact column").
+		 */
+		if (drive[d].bound)
+		{
+			t->driveconst[d] = lion_leaf_bound_value(partqual, &drive[d]);
+			if (t->driveconst[d] != NULL)
+				continue;
+		}
 
 		t->drivecol[d] = 1;
 		t->driveidx[d] = lion_find_roaring_index(rel, drive[d].attno, false,
@@ -8671,6 +8883,92 @@ lion_fkjoin_fk_groups_ok(PlannerInfo *root, PathTarget *target,
 }
 
 /*
+ * The fact column the query's GROUP BY groups an FK-side join by, other than
+ * its join key (DESIGN.md §27, "Grouped by a fact column"), or NULL - and in
+ * *drive what lion_collect_targets() is to find for it in each relation
+ * counted.
+ *
+ * A dimension row's count is one number, the rows of one posting set ANDed
+ * with the fact filters, which says nothing of how the rows it counts divide
+ * among the fact column's values; so the node counts each dimension row once
+ * per GROUP of the column instead, ANDing in that group's own posting set -
+ * an entry of a lion index on the column - and hands up a partial count per
+ * dimension row and group, which the Finalize Agg adds up per group, as it
+ * adds up a dimension column's.  The column is then printed from the entry's
+ * stored key, so it takes what a GROUP BY's own driving index takes: a scalar
+ * lion index whose strategy 1 is the grouping equality, under the grouping
+ * collation, that can print its keys (§10) - or, in a partition whose bounds
+ * give the column one value, no index at all (lion_leaf_bound_value()).
+ *
+ * Only for an inner join, and the forward semi join over its distinct keys:
+ * the rows of a semi or anti join are the dimension's, whose query sees no
+ * fact column.  One such column, grouped by itself - a plain Var of the
+ * GROUP BY, hashed by the Finalize Agg - beside any dimension columns; the
+ * join key has its own rules (lion_fkjoin_fk_is_key()).
+ */
+static Var *
+lion_fkjoin_fact_group(PlannerInfo *root, PathTarget *target,
+					   const LionFkJoin *fj, LionDriveInfo *drive)
+{
+	Var		   *found = NULL;
+	List	   *vars;
+	ListCell   *lc;
+	int			i = 0;
+
+	if (fj->jointype != JOIN_INNER && fj->jointype != JOIN_UNIQUE_INNER)
+		return NULL;
+
+	vars = pull_var_clause((Node *) target->exprs,
+						   PVC_INCLUDE_AGGREGATES |
+						   PVC_RECURSE_WINDOWFUNCS |
+						   PVC_INCLUDE_PLACEHOLDERS);
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!IsA(v, Var) || v->varno != fj->fkvar->varno ||
+			v->varlevelsup != 0 || v->varattno <= 0 ||
+			v->varattno == fj->fkvar->varattno)
+			continue;
+		if (found != NULL && found->varattno != v->varattno)
+			return NULL;
+		found = v;
+	}
+	list_free(vars);
+	if (found == NULL)
+		return NULL;
+
+	foreach(lc, target->exprs)
+	{
+		Node	   *expr = (Node *) lfirst(lc);
+		Index		sgref = get_pathtarget_sortgroupref(target, i++);
+		SortGroupClause *sgc;
+		Var		   *v;
+
+		if (sgref == 0)
+			continue;
+		v = (Var *) lion_strip(expr);
+		if (v == NULL || !IsA(v, Var) || v->varno != found->varno ||
+			v->varattno != found->varattno || v->varlevelsup != 0)
+			continue;
+		sgc = get_sortgroupref_clause_noerr(sgref, root->parse->groupClause);
+		if (sgc == NULL || !OidIsValid(sgc->eqop) || !sgc->hashable ||
+			exprCollation(expr) != v->varcollid)
+			return NULL;
+
+		memset(drive, 0, sizeof(*drive));
+		drive->attno = v->varattno;
+		drive->var = v;
+		drive->collation = v->varcollid;
+		drive->eqop = sgc->eqop;
+		drive->valueout = true;
+		drive->bound = true;
+		return v;
+	}
+	return NULL;
+}
+
+/*
  * Is each group of the query's GROUP BY one row of the FK-side join's
  * (DESIGN.md §27, "Grouped by the join key")?  It is when one of the grouping
  * columns is a key the node's rows never repeat, grouped by an equality
@@ -9246,6 +9544,48 @@ lion_leaf_turn_share(PlannerInfo *root, RelOptInfo *rel)
 }
 
 /*
+ * How many groups of the fact column a GROUP BY groups an FK-side join by
+ * (DESIGN.md §27, "Grouped by a fact column") relation t counts each of its
+ * keys in: every entry of the column's lion index there - the relation's
+ * distinct values, whether or not the fact filters leave them any row - or
+ * one, where the partition's bounds give the column its value, or nothing is
+ * grouped by.
+ */
+static double
+lion_fact_groups(PlannerInfo *root, const LionCountTarget *t)
+{
+	if (t->driveidx[0] == NULL || t->drivevar[0] == NULL)
+		return 1.0;
+	return clamp_row_est(estimate_num_groups(root, list_make1(t->drivevar[0]),
+											 Max(t->rel->tuples, 1.0), NULL,
+											 NULL));
+}
+
+/*
+ * The fact column an FK-side join's custom_private (or the base of it, which
+ * lion_fkjoin_setup() makes) groups by, or 0 (LION_PRIV_FACTGROUP).
+ */
+static AttrNumber
+lion_fact_group_attno(List *priv)
+{
+	List	   *fg = (List *) list_nth(priv, LION_PRIV_FACTGROUP);
+
+	return (fg != NIL) ? (AttrNumber) linitial_int((List *) linitial(fg)) : 0;
+}
+
+/* ... summed over the relations: the groups a key is counted in, all told */
+static double
+lion_fact_groups_all(PlannerInfo *root, List *targets)
+{
+	double		groups = 0;
+	ListCell   *lc;
+
+	foreach(lc, targets)
+		groups += lion_fact_groups(root, (LionCountTarget *) lfirst(lc));
+	return groups;
+}
+
+/*
  * What the FK-side join does over the fact relation `rel` (DESIGN.md §27),
  * for `dimrows` dimension rows `found` of which have fact rows: its lookups
  * and counts (lion_cost_fkjoin_rel()), and the heap recheck of a multi-key
@@ -9312,12 +9652,22 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 		double		reach = Min(found * tuples /
 								lion_fkjoin_fk_ndistinct(root, rel, fkvar),
 								tuples);
+		double		groups = lion_fact_groups(root, first);
+		LionFkJoinCost parts;
 
 		run = lion_cost_fkjoin_rel(root, rel, first->whereidx,
 								   first->wherecol, fkvar, joinclause,
 								   whereclauses, wherekinds, ors, dimrows,
 								   found, exists, rowbytes, workers,
-								   collect, walk, force, NULL);
+								   collect, walk, force, &parts);
+
+		/*
+		 * A fact column grouped by counts each key once per group
+		 * ("Grouped by a fact column"): the counts, against the filters or
+		 * their copy, that many times over - the key looked up once.
+		 */
+		if (groups > 1.0)
+			run += (groups - 1.0) * (*collect ? parts.collected : parts.probed);
 		run += lion_cost_recheck(root, rel, first->whereidx, first->wherecol,
 								 whereclauses, wherekinds, ors,
 								 reach * Min(Max(rel->rows, 1.0) / tuples, 1.0),
@@ -9346,6 +9696,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 		LionFkJoinCost parts;
 		bool		tcollect;
 		bool		twalk;
+		double		tgroups;
 
 		if (leafvar == NULL)
 			leafvar = fkvar;	/* lion_collect_targets() found the column */
@@ -9368,18 +9719,21 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 									tclauses, tkinds, tors, tdim, tfound,
 									exists, rowbytes, workers, &tcollect,
 									&twalk, false, &parts);
+
+		/* ... and a fact column's groups count each key once per group */
+		tgroups = lion_fact_groups(root, t);
 		other += parts.other;
 		descents += parts.descents;
 		walked += parts.walked;
-		probed += parts.probed;
+		probed += parts.probed * tgroups;
 		located += parts.located;
 		if (parts.cancollect)
 		{
-			collected += parts.collected;
+			collected += parts.collected * tgroups;
 			copybytes += parts.copybytes;
 		}
 		else
-			collected += parts.probed;
+			collected += parts.probed * tgroups;
 
 		reach = Min(tfound * tuples / nd, tuples);
 		other += lion_cost_recheck(root, t->rel, tidx, tcol, tclauses, tkinds,
@@ -9640,6 +9994,15 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 		(jointype == LION_JOIN_INNER) ? childrows :
 		clamp_row_est(Min(fj->joinrel->rows * share, childrows));
 
+	/*
+	 * ... or one per group of a fact column grouped by, in each relation
+	 * counted, that has rows: no more than the join's own ("Grouped by a
+	 * fact column")
+	 */
+	if (lion_fact_group_attno(base) != 0)
+		rows = clamp_row_est(Min(rows * lion_fact_groups_all(root, targets),
+								 fj->joinrel->rows * share));
+
 	/* ... or one, their sum, when that is all the target wants */
 	if (sum)
 		rows = 1.0;
@@ -9807,7 +10170,8 @@ lion_fkjoin_setup(PlannerInfo *root, RelOptInfo *rel, const LionFkJoin *fj,
 				  List *whereattnos, List *clauseinfos, List *whereclauses,
 				  List *whereconsts, List *wherekinds, List *whereopnos,
 				  List *whereinor, List *ors, const LionImply *imply,
-				  List *tlexprs, List *having, LionFkJoinSetup *out)
+				  List *tlexprs, List *having, const LionDriveInfo *fgdrive,
+				  LionFkJoinSetup *out)
 {
 	RangeTblEntry *rte = root->simple_rte_array[rel->relid];
 	LionLeafInfo leaf;
@@ -9850,11 +10214,17 @@ lion_fkjoin_setup(PlannerInfo *root, RelOptInfo *rel, const LionFkJoin *fj,
 	 * partitioned fact rel is one target per live leaf partition, each with
 	 * its own fk index and its own fact filters, less the ones its bounds
 	 * imply (DESIGN.md §27, "A partitioned fact table"); all of them pruned
-	 * away leaves the join to the planner, which knows it is empty.
+	 * away leaves the join to the planner, which knows it is empty.  A fact
+	 * column the GROUP BY groups by is a driving column of each relation
+	 * (fgdrive, "Grouped by a fact column"): the lion index whose entries are
+	 * its groups there - one of the rules of a GROUP BY's own driver, which
+	 * prints the key it stored - or, in a partition whose bounds give it one
+	 * value, that value.
 	 */
 	memset(nodrive, 0, sizeof(nodrive));
-	if (!lion_collect_targets(root, rel, nodrive, 0, whereattnos, clauseinfos,
-							 imply, &targets))
+	if (!lion_collect_targets(root, rel, fgdrive != NULL ? fgdrive : nodrive,
+							 fgdrive != NULL ? 1 : 0, whereattnos,
+							 clauseinfos, imply, &targets))
 		return false;
 	if (targets == NIL)
 		return false;
@@ -9914,6 +10284,34 @@ lion_fkjoin_setup(PlannerInfo *root, RelOptInfo *rel, const LionFkJoin *fj,
 												 fj));
 	base = lappend(base, NIL);	/* coalesce: the fact side groups nothing */
 	base = lappend(base, (imply != NULL) ? imply->skipped : NIL);
+
+	/* a fact column grouped by: each relation's index for it, or its value */
+	if (fgdrive != NULL)
+	{
+		List	   *fgoids = NIL;
+		List	   *fgconsts = NIL;
+
+		foreach(lc, targets)
+		{
+			LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+
+			if (t->driveconst[0] != NULL)
+			{
+				fgoids = lappend_oid(fgoids, InvalidOid);
+				fgconsts = lappend(fgconsts, copyObject(t->driveconst[0]));
+			}
+			else
+			{
+				Assert(t->driveidx[0] != NULL);
+				fgoids = lappend_oid(fgoids, t->driveidx[0]->indexoid);
+				fgconsts = lappend(fgconsts, makeBoolConst(false, true));
+			}
+		}
+		base = lappend(base, list_make3(list_make1_int((int) fgdrive->attno),
+										fgoids, fgconsts));
+	}
+	else
+		base = lappend(base, NIL);
 
 	out->joinclause = joinclause;
 	out->targets = targets;
@@ -9996,6 +10394,8 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	LionFkJoinAgg *rowagg = NULL;
 	bool		fkkey;
 	bool		perrow;
+	Var		   *fgvar;
+	LionDriveInfo fgdrive;
 	ListCell   *lc;
 
 	/*
@@ -10005,6 +10405,13 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	fkkey = lion_fkjoin_fk_is_key(fj) &&
 		lion_fkjoin_fk_groups_ok(root, output_rel->reltarget, fj);
+
+	/*
+	 * ... and another fact column may be grouped by, each row of the node a
+	 * dimension row's count in one of its groups ("Grouped by a fact
+	 * column").
+	 */
+	fgvar = lion_fkjoin_fact_group(root, output_rel->reltarget, fj, &fgdrive);
 
 	/* ---- the target and the HAVING: dimension columns and counts ---- */
 	exprs = list_copy(output_rel->reltarget->exprs);
@@ -10035,10 +10442,10 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 
 			/*
 			 * Only the dimension's own columns: they come out of the child's
-			 * rows, which have to carry them (lion_fkjoin_child_has()).  A
-			 * fact column would have to be a group of the posting sets under
-			 * each dimension row, which v1 does not build - but for the
-			 * fact's join column where it stands for the key.
+			 * rows, which have to carry them (lion_fkjoin_child_has()) - but
+			 * for the fact's join column where it stands for the key, and a
+			 * fact column the GROUP BY groups by, whose groups the node counts
+			 * each dimension row in (fgvar).
 			 */
 			if (v->varattno <= 0 || v->varlevelsup != 0)
 				return;
@@ -10050,6 +10457,9 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 			}
 			if (fkkey && v->varno == fj->fkvar->varno &&
 				v->varattno == fj->fkvar->varattno)
+				continue;
+			if (fgvar != NULL && v->varno == fgvar->varno &&
+				v->varattno == fgvar->varattno)
 				continue;
 			return;
 		}
@@ -10082,6 +10492,12 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	if (nagg[LION_FKAGG_DISTINCT] + nagg[LION_FKAGG_ROWS] +
 		nagg[LION_FKAGG_COUNTCOL] + nagg[LION_FKAGG_SUM] > 0)
 	{
+		/*
+		 * The rows of a fact column's groups are partial counts; a dimension
+		 * row's row per group, with anything but its count, is not built.
+		 */
+		if (fgvar != NULL)
+			return;
 		memset(&rowaggdata, 0, sizeof(rowaggdata));
 		rowagg = &rowaggdata;
 		rowagg->target = output_rel->reltarget;
@@ -10204,7 +10620,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	if (!lion_fkjoin_setup(root, rel, fj, whereattnos, clauseinfos,
 						   whereclauses, whereconsts, wherekinds, whereopnos,
 						   whereinor, ors, imply, output_rel->reltarget->exprs,
-						   having, &setup))
+						   having, fgvar != NULL ? &fgdrive : NULL, &setup))
 		return;
 	joinclause = setup.joinclause;
 	targets = setup.targets;
@@ -10269,9 +10685,11 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 
 	/*
 	 * A GROUP BY of a key the rows never repeat makes each row its own group,
-	 * and the Agg above them a trivial one (lion_add_fkjoin_paths()).
+	 * and the Agg above them a trivial one (lion_add_fkjoin_paths()) - which
+	 * the rows of a fact column's groups never are: a dimension row has one
+	 * in each of its groups, and a partitioned fact's in each partition.
 	 */
-	perrow = lion_fkjoin_groups_per_row(root, fj, fkkey);
+	perrow = (fgvar == NULL) && lion_fkjoin_groups_per_row(root, fj, fkkey);
 
 	lion_add_fkjoin_paths(root, rel, output_rel, fj, having, targets,
 						  fj->dimpath, 0, nodetarget, base, joinclause,
@@ -10604,7 +11022,8 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 	/* ---- the join key and the fact's indexes ---- */
 	if (!lion_fkjoin_setup(root, rel, fj, whereattnos, clauseinfos,
 						   whereclauses, whereconsts, wherekinds, whereopnos,
-						   whereinor, ors, imply, target->exprs, NIL, &setup))
+						   whereinor, ors, imply, target->exprs, NIL, NULL,
+						   &setup))
 		return;
 	jointype = (fj->jointype == JOIN_SEMI) ? LION_JOIN_SEMI : LION_JOIN_ANTI;
 
@@ -11934,6 +12353,7 @@ unanswerable:
 		driveattno = groupattno[0];
 	}
 
+	memset(drive, 0, sizeof(drive));
 	if (ngroup > 0)
 	{
 		for (g = 0; g < ngroup; g++)
@@ -12270,6 +12690,7 @@ unanswerable:
 										  groupvar[0]->varcollid)) :
 				NIL);
 	cpath->custom_private = lappend(cpath->custom_private, impliedtexts);
+	cpath->custom_private = lappend(cpath->custom_private, NIL);	/* fact group */
 	cpath->methods = &lion_count_path_methods;
 
 	/*
@@ -12530,6 +12951,7 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	Var		   *keyvar;
 	Index		factrelid;
 	AttrNumber	fkattno;
+	AttrNumber	fgattno;
 	AttrNumber	keyresno;
 	ListCell   *lc;
 
@@ -12556,6 +12978,13 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	ints = (List *) list_nth(best_path->custom_private, LION_PRIV_INTS);
 	factrelid = (Index) linitial_int(ints);
 	fkattno = (AttrNumber) list_nth_int(ints, 4 + joinclause);
+
+	/*
+	 * ... and a fact column grouped by, whose value each row carries as the
+	 * group it counts ("Grouped by a fact column"): the entry's stored key,
+	 * or the value the partition's bounds give it.
+	 */
+	fgattno = lion_fact_group_attno(best_path->custom_private);
 
 	want = pull_var_clause((Node *) tlist,
 						   PVC_INCLUDE_AGGREGATES |
@@ -12586,6 +13015,10 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 			((Var *) expr)->varattno == fkattno &&
 			lsecond_int(join) != LION_JOIN_ANTI)
 			kind = LION_TL_CHILDCOL(keyresno);
+		else if (IsA(expr, Var) && fgattno != 0 &&
+				 ((Var *) expr)->varno == (int) factrelid &&
+				 ((Var *) expr)->varattno == fgattno)
+			kind = LION_TL_GROUPKEY;
 		else if (IsA(expr, Var))
 			kind = LION_TL_CHILDCOL(lion_child_resno(child, (Var *) expr));
 		else if (IsA(expr, Aggref))
@@ -13568,6 +14001,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	List	   *dist;
 	List	   *join;
 	List	   *coal;
+	List	   *fg;
 	int			flags;
 	int			i;
 	int			k;
@@ -14008,6 +14442,66 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 			   sizeof(LionSourceItem) * st->nplanitem);
 	}
 
+	/*
+	 * An FK-side join grouped by a fact column (DESIGN.md §27, "Grouped by a
+	 * fact column"): the column, and each relation's index for its groups -
+	 * or, for a partition, the value its bounds give the column.
+	 */
+	st->fgattno = 0;
+	st->fgidxoid = InvalidOid;
+	fg = (List *) list_nth(cscan->custom_private, LION_PRIV_FACTGROUP);
+	if (fg != NIL)
+	{
+		List	   *fgoids;
+		List	   *fgconsts;
+
+		if (list_length(fg) != 3 || !IsA(linitial(fg), IntList) ||
+			list_length((List *) linitial(fg)) != 1 ||
+			!IsA(lsecond(fg), OidList) || !IsA(lthird(fg), List) ||
+			st->joinclause < 0 || st->jointype != LION_JOIN_INNER ||
+			st->joinrows || st->joinsum || st->joinouter)
+			elog(ERROR, "LionCount: malformed fact group");
+		st->fgattno = (AttrNumber) linitial_int((List *) linitial(fg));
+		fgoids = (List *) lsecond(fg);
+		fgconsts = (List *) lthird(fg);
+		if (st->fgattno <= 0 ||
+			list_length(fgoids) != Max(st->npart, 1) ||
+			list_length(fgconsts) != Max(st->npart, 1))
+			elog(ERROR, "LionCount: malformed fact group");
+		if (st->npart == 0)
+		{
+			st->fgidxoid = linitial_oid(fgoids);
+			if (!OidIsValid(st->fgidxoid))
+				elog(ERROR, "LionCount: malformed fact group");
+		}
+		for (i = 0; i < st->npart; i++)
+		{
+			st->part[i].fgidxoid = list_nth_oid(fgoids, i);
+			st->part[i].fgconst = NULL;
+			if (!OidIsValid(st->part[i].fgidxoid))
+			{
+				st->part[i].fgconst = (Const *) list_nth(fgconsts, i);
+				if (!IsA(st->part[i].fgconst, Const))
+					elog(ERROR, "LionCount: malformed fact group");
+			}
+		}
+	}
+	st->fgturn = 0;
+	st->fgcxt = NULL;
+	st->fgrowcxt = NULL;
+	st->fgsets = NULL;
+	st->fgkey = NULL;
+	st->fgnull = NULL;
+	st->fgn = 0;
+	st->fgsrc = NULL;
+	st->fgnsrc = 0;
+	st->fgrows = NULL;
+	st->fgnrows = 0;
+	st->fgrowcap = 0;
+	st->fgrowpos = 0;
+	st->fggroupcounts = 0;
+	st->fgworkergroupcounts = 0;
+
 	st->located = false;
 	st->valsdone = false;
 	st->wheremissing = false;
@@ -14073,6 +14567,25 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->valcxt = AllocSetContextCreate(estate->es_query_cxt,
 									   "LionCount clause values",
 									   ALLOCSET_SMALL_SIZES);
+
+	/*
+	 * A fact column's groups (DESIGN.md §27, "Grouped by a fact column"): a
+	 * chunk of them located at a time, and the rows counted in them until
+	 * they go up.  A count reads the key's set, the fact filters - or their
+	 * copy - and one group's set: at most every source of the plan and one.
+	 */
+	if (st->fgattno != 0)
+	{
+		st->fgcxt = AllocSetContextCreate(estate->es_query_cxt,
+										  "LionCount fact groups",
+										  ALLOCSET_DEFAULT_SIZES);
+		st->fgrowcxt = AllocSetContextCreate(estate->es_query_cxt,
+											 "LionCount fact group rows",
+											 ALLOCSET_DEFAULT_SIZES);
+		st->fgnsrc = Max(st->nplanitem + 1, 2) + 1;
+		st->fgsrc = (LionCountSource *)
+			palloc0(sizeof(LionCountSource) * st->fgnsrc);
+	}
 	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
 	st->filter = NULL;
 	st->writtenrels = lion_statement_written_rels(estate);
@@ -14241,7 +14754,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		}
 	}
 
-	if (st->joinwalk || st->joinpart != NULL)
+	if (st->joinwalk || st->joinpart != NULL || st->fgattno != 0)
 	{
 		TupleDesc	childdesc = ExecGetResultType(st->child);
 		Form_pg_attribute keyatt;
@@ -19296,6 +19809,343 @@ lion_join_next_parts(LionCountScanState *st, int64 *countp)
 }
 
 /*
+ * GROUPED BY A FACT COLUMN (DESIGN.md §27, "Grouped by a fact column").  A
+ * dimension row's count is one posting set ANDed with the fact filters, and
+ * says nothing of how the rows it counts divide among a fact column's values.
+ * So each key is counted once per GROUP of the column instead - the column's
+ * posting set for the group ANDed in as one more source - and each count that
+ * is not 0 goes up as a partial row of its own: the dimension row's columns,
+ * the group's value and the count, which the Finalize Agg adds up per group
+ * as it adds up a dimension column's.
+ *
+ * The groups are a relation's own.  In the plain table, and in a partition
+ * whose bounds leave the column several values, they are the entries of the
+ * column's lion index there, walked a chunk of LION_FKJOIN_GROUP_CHUNK at a
+ * time: the chunk's sets located - pinned, as the sets of an IN list are -
+ * each key of the batch looked up once and counted in every one of them, and
+ * the chunk let go of before the next; one chunk, for the few groups the cost
+ * model takes this for.  In a partition whose bounds give the column one
+ * value, every row is of that group, and the key's count there is the
+ * group's: counted as any partition's is, with no index on the column at all.
+ *
+ * The keys go a batch at a time (the batches of "Lookups in key order"),
+ * each batch to each relation in turn; the rows a turn counted go up once
+ * the turn is over and the partition closed, as a partitioned fact's always
+ * do, or - over the plain table - once its sets have let go of their pins
+ * (lion_pause_run()).  A turn holds its rows until then: at most one for
+ * each key and group with rows in the relation, which is no more than the
+ * batch's join rows there.
+ */
+#define LION_FKJOIN_GROUP_CHUNK		64
+
+/* A row counted in a group, put by until the turn is over. */
+static void
+lion_join_group_row(LionCountScanState *st, int ent, Datum key, bool isnull,
+					int64 count)
+{
+	LionJoinGroupRow *r;
+
+	if (st->fgnrows >= st->fgrowcap)
+	{
+		Size		cap = (st->fgrowcap == 0) ? 256 : (Size) st->fgrowcap * 2;
+
+		if (st->fgrows == NULL)
+			st->fgrows = (LionJoinGroupRow *)
+				MemoryContextAllocExtended(st->fgrowcxt,
+										   sizeof(LionJoinGroupRow) * cap,
+										   MCXT_ALLOC_HUGE);
+		else
+			st->fgrows = (LionJoinGroupRow *)
+				repalloc_huge(st->fgrows, sizeof(LionJoinGroupRow) * cap);
+		st->fgrowcap = (int) Min(cap, (Size) INT_MAX);
+	}
+	r = &st->fgrows[st->fgnrows++];
+	r->ent = ent;
+	r->key = key;
+	r->isnull = isnull;
+	r->count = count;
+}
+
+/*
+ * Batch entry k's key looked up in the relation being counted and counted in
+ * each group of the chunk located (fgsets), the counts that are not 0 put by.
+ */
+static void
+lion_join_count_groups(LionCountScanState *st, int k, bool walked)
+{
+	LionJoinEnt *ent = &st->joinbatch[k];
+	MemoryContext oldcxt;
+	instr_time	t;
+	bool		found;
+	int			j;
+
+	INSTR_TIME_SET_ZERO(t);
+	lion_join_clock(st, -1, &t);
+	MemoryContextReset(st->pergroup);
+	oldcxt = MemoryContextSwitchTo(st->pergroup);
+	found = walked ?
+		lion_lookup_walk_find(&st->joinwalker, ent->key, ent->hash,
+							  &st->groupset) :
+		lion_lookup_walk_descend(&st->joinwalker, ent->key, &st->groupset);
+	lion_join_clock(st, LION_JT_LOOKUP, &t);
+	if (!found)
+		st->joinmissing++;
+	else
+	{
+		LionCountSource *base = st->joinfiltered ? st->joinsources : st->sources;
+		int			nbase = st->joinfiltered ? 2 : st->nsource;
+		int64		pages = lion_posting_pages_read;
+
+		/* the key's set and the filters - or their copy - and one group */
+		Assert(nbase + 1 <= st->fgnsrc);
+		for (j = 0; j < st->fgn; j++)
+		{
+			int64		count;
+
+			memcpy(st->fgsrc, base, sizeof(LionCountSource) * nbase);
+			memset(&st->fgsrc[nbase], 0, sizeof(LionCountSource));
+			st->fgsrc[nbase].nsets = 1;
+			st->fgsrc[nbase].sets = &st->fgsets[j];
+			count = lion_node_count(st, nbase + 1, st->fgsrc, false);
+			st->fggroupcounts++;
+			if (count > 0)
+				lion_join_group_row(st, k, st->fgkey[j], st->fgnull[j], count);
+		}
+		st->joinposting += lion_posting_pages_read - pages;
+	}
+	lion_posting_set_release(&st->groupset);
+	MemoryContextSwitchTo(oldcxt);
+	lion_join_clock(st, LION_JT_COUNT, &t);
+}
+
+/*
+ * Relation p's turn with the batch - leaf partition p, or the plain table for
+ * p < 0: every key counted in every group of the fact column there, and the
+ * counts that are not 0 put by to go up.
+ */
+static void
+lion_join_group_turn(LionCountScanState *st, int p)
+{
+	Oid			fgidxoid = (p < 0) ? st->fgidxoid : st->part[p].fgidxoid;
+	Const	   *fgconst = (p < 0) ? NULL : st->part[p].fgconst;
+	Relation	fgidx;
+	AttrNumber	fgidxcol;
+	LionState  *istate;
+	LionEntryScan es;
+	MemoryContext oldcxt;
+	bool		walked;
+	bool		more = true;
+	bool		first = true;
+	int			k;
+	int			j;
+
+	if (p >= 0)
+	{
+		lion_join_part_open(st, p);
+		if (st->wheremissing)
+		{
+			lion_join_part_close(st);
+			return;
+		}
+	}
+	walked = (st->joinwalk && lion_lookup_walk_ordered(&st->joinwalker));
+	if (p >= 0 && walked)
+		lion_join_part_sort(st);
+
+	if (fgconst != NULL)
+	{
+		/*
+		 * The partition's bounds give the column one value: a key's count
+		 * there is its count in that group, a partition's as any other.
+		 */
+		for (k = 0; k < st->joinbatchn; k++)
+		{
+			LionJoinEnt *ent = &st->joinbatch[k];
+			bool		found;
+			int64		count;
+
+			if (ent->isnull)
+				continue;
+			CHECK_FOR_INTERRUPTS();
+			st->joinlookups++;
+			count = lion_join_lookup_ent(st, ent, walked, p, &found);
+			if (!found)
+				st->joinmissing++;
+			if (count > 0)
+				lion_join_group_row(st, k, fgconst->constvalue,
+									fgconst->constisnull, count);
+
+			/* a copy made part way through that selects nothing */
+			if (st->wheremissing)
+				break;
+		}
+		lion_join_part_close(st);
+		return;
+	}
+
+	/*
+	 * The groups are the entries of the column's index here, its key column
+	 * derived from the index as it was opened (DESIGN.md §24), and the index
+	 * predicate-locked as every index the node reads is (lion_open_relation()).
+	 */
+	fgidx = index_open(fgidxoid, AccessShareLock);
+	PredicateLockRelation(fgidx, st->css.ss.ps.state->es_snapshot);
+	fgidxcol = lion_index_col_for(fgidx,
+								  lion_heap_attno_in(st->heap, st->heapoid,
+													 st->fgattno),
+								  false);
+	istate = lion_index_column_state(fgidx, fgidxcol);
+
+	/* the walk lives for the turn; the rows' keys with it, until they go up */
+	oldcxt = MemoryContextSwitchTo(st->fgrowcxt);
+	lion_entry_scan_begin_col(&es, fgidx, fgidxcol);
+	MemoryContextSwitchTo(oldcxt);
+
+	while (more)
+	{
+		int			n = 0;
+
+		MemoryContextReset(st->fgcxt);
+		oldcxt = MemoryContextSwitchTo(st->fgcxt);
+		st->fgsets = (LionPostingSet *)
+			palloc0(sizeof(LionPostingSet) * LION_FKJOIN_GROUP_CHUNK);
+		st->fgkey = (Datum *) palloc(sizeof(Datum) * LION_FKJOIN_GROUP_CHUNK);
+		st->fgnull = (bool *) palloc(sizeof(bool) * LION_FKJOIN_GROUP_CHUNK);
+		while (n < LION_FKJOIN_GROUP_CHUNK)
+		{
+			Datum		key;
+
+			CHECK_FOR_INTERRUPTS();
+			if (!lion_entry_scan_next(&es, &key, &st->fgsets[n]))
+			{
+				more = false;
+				break;
+			}
+			st->fgnull[n] = st->fgsets[n].keyisnull;
+			st->fgkey[n] = (Datum) 0;
+			if (!st->fgnull[n])
+			{
+				/* the key goes up with the rows, after the chunk is gone */
+				MemoryContextSwitchTo(st->fgrowcxt);
+				st->fgkey[n] = datumCopy(key, istate->typbyval,
+										 istate->typlen);
+				MemoryContextSwitchTo(st->fgcxt);
+			}
+			n++;
+		}
+		MemoryContextSwitchTo(oldcxt);
+		st->fgn = n;
+		if (n == 0)
+			break;
+
+		/* a chunk after the first walks the fk index from its start again */
+		if (!first && st->joinwalkbegun)
+			lion_lookup_walk_restart(&st->joinwalker);
+		first = false;
+
+		for (k = 0; k < st->joinbatchn; k++)
+		{
+			if (st->joinbatch[k].isnull)
+				continue;
+			CHECK_FOR_INTERRUPTS();
+			st->joinlookups++;
+			lion_join_count_groups(st, k, walked);
+		}
+
+		for (j = 0; j < n; j++)
+			lion_posting_set_release(&st->fgsets[j]);
+		st->fgn = 0;
+	}
+	lion_entry_scan_end(&es);
+	index_close(fgidx, AccessShareLock);
+	MemoryContextReset(st->fgcxt);
+	st->fgsets = NULL;
+	st->fgkey = NULL;
+	st->fgnull = NULL;
+
+	if (p >= 0)
+		lion_join_part_close(st);
+	else
+		lion_pause_run(st);
+}
+
+/*
+ * lion_next_join_row() grouped by a fact column: the next row put by, or the
+ * next relation's turn with the batch, or the next batch.
+ */
+static TupleTableSlot *
+lion_next_join_group(LionCountScanState *st)
+{
+	int			nturn = Max(st->npart, 1);
+
+	/*
+	 * A plain table's fact filters are located - and collected, where the
+	 * plan says - once for the run, and its fk index's walk begun once, in
+	 * the query's memory, before the first batch is sorted into its order.
+	 * A partition's are its turn's (lion_join_part_open()).
+	 */
+	if (st->joinpart == NULL)
+	{
+		LionClauseState *jcl = &st->clause[st->joinclause];
+
+		if (!st->joincollected)
+			lion_join_collect(st);
+		if (st->wheremissing)
+		{
+			st->done = true;
+			return NULL;
+		}
+		if (!st->joinwalkbegun)
+		{
+			MemoryContext oldcxt =
+				MemoryContextSwitchTo(st->css.ss.ps.state->es_query_cxt);
+
+			lion_lookup_walk_begin(&st->joinwalker, jcl->idx, jcl->idxcol,
+								   jcl->valtype);
+			MemoryContextSwitchTo(oldcxt);
+			st->joinwalkbegun = true;
+		}
+	}
+	if (st->joinunique && !st->joinsortdone)
+		lion_join_sort_keys(st);
+
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+		if (st->fgrowpos < st->fgnrows)
+		{
+			LionJoinGroupRow *r = &st->fgrows[st->fgrowpos++];
+
+			lion_join_batch_row(st, &st->joinbatch[r->ent]);
+			return lion_emit_tuple(st, r->key, r->isnull, (Datum) 0, true,
+								   r->count);
+		}
+
+		/* every row of the last turn has gone up */
+		st->fgnrows = 0;
+		st->fgrowpos = 0;
+		st->fgrowcap = 0;
+		st->fgrows = NULL;
+		MemoryContextReset(st->fgrowcxt);
+
+		if (st->fgturn >= nturn || st->joinbatchn == 0)
+		{
+			if (!lion_join_fill_batch(st))
+			{
+				lion_join_batch_reset(st);
+				st->childslot = NULL;
+				st->done = true;
+				return NULL;
+			}
+			st->fgturn = 0;
+			memset(&st->joinorder, 0, sizeof(st->joinorder));
+		}
+		lion_join_group_turn(st, (st->joinpart != NULL) ? st->fgturn : -1);
+		st->fgturn++;
+	}
+}
+
+/*
  * The FK-side join's next row (DESIGN.md §27): one PARTIAL row per dimension
  * row with fact rows - its dimension columns and its count - which core's
  * Finalize Agg above groups by the dimension columns and adds up, the join's
@@ -19326,6 +20176,10 @@ lion_next_join_row(LionCountScanState *st)
 	bool		walked = false;
 	int64		count;
 	MemoryContext oldcxt;
+
+	/* grouped by a fact column: each key counted once per group */
+	if (st->fgattno != 0)
+		return lion_next_join_group(st);
 
 	/* a partitioned fact table: every batch to every partition in turn */
 	if (st->joinpart != NULL)
@@ -19909,6 +20763,21 @@ lion_reset_run(LionCountScanState *st)
 	lion_join_batch_reset(st);
 	st->joinchilddone = false;
 
+	/* ... and a fact column's groups: the rows put by, and the next turn */
+	st->fgturn = 0;
+	st->fgnrows = 0;
+	st->fgrowpos = 0;
+	st->fgrowcap = 0;
+	st->fgrows = NULL;
+	st->fgn = 0;
+	st->fgsets = NULL;
+	st->fgkey = NULL;
+	st->fgnull = NULL;
+	if (st->fgcxt != NULL)
+		MemoryContextReset(st->fgcxt);
+	if (st->fgrowcxt != NULL)
+		MemoryContextReset(st->fgrowcxt);
+
 	if (st->npart > 0)
 		lion_close_relation(st);
 	if (st->joinvisitcxt != NULL)
@@ -20284,6 +21153,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		shared->wherespilled += st->wherespilled;
 		shared->groupbatches += st->groupbatches;
 		shared->groupsbatched += st->groupsbatched;
+		shared->factgroupcounts += st->fggroupcounts;
 		SpinLockRelease(&shared->mutex);
 		st->joinreported = true;
 		return;
@@ -20311,6 +21181,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 	st->workerwherespilled = shared->wherespilled;
 	st->workergroupbatches = shared->groupbatches;
 	st->workergroupsbatched = shared->groupsbatched;
+	st->fgworkergroupcounts = shared->factgroupcounts;
 	SpinLockRelease(&shared->mutex);
 }
 
@@ -20390,6 +21261,16 @@ lion_end_custom_scan(CustomScanState *node)
 		st->joinpartcxt = NULL;
 	}
 	st->joinpart = NULL;
+	if (st->fgcxt != NULL)
+	{
+		MemoryContextDelete(st->fgcxt);
+		st->fgcxt = NULL;
+	}
+	if (st->fgrowcxt != NULL)
+	{
+		MemoryContextDelete(st->fgrowcxt);
+		st->fgrowcxt = NULL;
+	}
 	if (st->viscache != NULL)
 	{
 		lion_vis_cache_destroy(st->viscache);
@@ -21030,6 +21911,31 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		else if (es->analyze &&
 				 st->joinswitches + st->joinworkerswitches > 0)
 			ExplainPropertyText("Fact Filters", "probed, then collected", es);
+
+		/*
+		 * A fact column grouped by ("Grouped by a fact column"): each key is
+		 * counted once per group of it - an entry of its index, or, in a
+		 * partition whose bounds give it one value, that value.
+		 */
+		if (st->fgattno != 0)
+		{
+			int			bound = 0;
+
+			ExplainPropertyText("Fact Group Key",
+								get_attname(st->heapoid, st->fgattno, false),
+								es);
+			for (i = 0; i < st->npart; i++)
+				bound += (st->part[i].fgconst != NULL) ? 1 : 0;
+			if (bound > 0)
+			{
+				initStringInfo(&buf);
+				appendStringInfo(&buf, "%d of %d partitions", bound,
+								 st->npart);
+				ExplainPropertyText("Fact Groups From Partition Bounds",
+									buf.data, es);
+				pfree(buf.data);
+			}
+		}
 	}
 
 	if (st->hasgroupidx && st->groupattno != 0 && st->hascoal)
@@ -21331,6 +22237,12 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 								   st->joinlookups + st->joinworkerlookups, es);
 			ExplainPropertyInteger("Join Keys Without Entry", NULL,
 								   st->joinmissing + st->joinworkermissing, es);
+
+			/* ... and counted in each group of a fact column grouped by */
+			if (st->fgattno != 0)
+				ExplainPropertyInteger("Fact Group Counts", NULL,
+									   st->fggroupcounts +
+									   st->fgworkergroupcounts, es);
 
 			/*
 			 * ... what their counts read of the keys' own fk sets - their

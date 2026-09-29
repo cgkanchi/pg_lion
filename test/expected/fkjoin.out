@@ -644,8 +644,9 @@ SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdn d ON f.fk =
  not pushed down, 3 rows
 (1 row)
 
--- a second join clause, an outer join, a fact column in the output, a
--- volatile grouping expression, another aggregate, a fact column counted
+-- a second join clause, an outer join, two fact columns in the output (one
+-- is grouped by: fkjoin_factgroup.sql), a volatile grouping expression,
+-- another aggregate, a fact column counted
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk AND f.x < d.attr GROUP BY d.attr');
          lion_fj         
 -------------------------
@@ -658,10 +659,10 @@ SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f LEFT JOIN lion_fd d ON f.
  not pushed down, 8 rows
 (1 row)
 
-SELECT lion_fj('SELECT d.attr, f.x, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr, f.x');
-         lion_fj          
---------------------------
- not pushed down, 74 rows
+SELECT lion_fj('SELECT d.attr, f.x, f.y, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr, f.x, f.y');
+          lion_fj          
+---------------------------
+ not pushed down, 108 rows
 (1 row)
 
 SELECT lion_fj('SELECT d.attr + (random() * 0)::int AS a, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk GROUP BY 1');
