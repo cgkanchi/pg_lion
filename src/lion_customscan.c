@@ -10270,7 +10270,13 @@ lion_add_semijoin_path(PlannerInfo *root, const LionFkJoin *fj,
 #if PG_VERSION_NUM >= 180000
 	cpath->path.disabled_nodes = child->disabled_nodes;
 #endif
-	cpath->flags = 0;
+
+	/*
+	 * It projects, as core's joins do: a target list other than the join
+	 * rel's - the query's own, over the topmost join - is computed by the
+	 * node from its row (lion_plan_fkjoin_path()), with no Result above it.
+	 */
+	cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cpath->custom_paths = list_make1(child);
 #if PG_VERSION_NUM >= 170000
 	cpath->custom_restrictinfo = NIL;
@@ -12288,6 +12294,18 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 						   PVC_INCLUDE_AGGREGATES |
 						   PVC_RECURSE_WINDOWFUNCS |
 						   PVC_INCLUDE_PLACEHOLDERS);
+
+	/*
+	 * A semi or anti join path projects (CUSTOMPATH_SUPPORT_PROJECTION): the
+	 * target list core hands it may be another than its path's - or none, when
+	 * core means to put its own on the plan afterwards (a ProjectionPath above,
+	 * create_projection_plan()) - so its tuple is every column of the join
+	 * rel's rows, from which any such target list is computed.
+	 */
+	if ((lthird_int(join) & LION_JOINFLAG_OUTER) != 0)
+		want = list_concat(want,
+						   pull_var_clause((Node *) best_path->path.pathtarget->exprs,
+										   PVC_RECURSE_PLACEHOLDERS));
 	want = lappend(want, keyvar);
 
 	foreach(lc, want)
