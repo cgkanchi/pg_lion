@@ -4550,6 +4550,21 @@ lion_or_hot_raw(LionExprCursor *c, uint32 ckey)
 }
 
 /*
+ * Is a node that drives a leapfrog still to be lazy there?  A union, yes: the
+ * leapfrog asks for its container at the keys it keeps, and building it at
+ * every key the union stands at would build it at keys the leapfrog gives up
+ * as well.  An AND node, no (DESIGN.md §29.11, "Trees probed"): wound to a
+ * key it seeks every child there before intersecting any, where its own
+ * leapfrog stops at the first child that empties the key - and as the driver
+ * it is intersected at every key it stands at anyway.
+ */
+static bool
+lion_leapfrog_lazy(const LionKeyNode *node)
+{
+	return node == NULL || node->kind != LION_KN_AND;
+}
+
+/*
  * Build the cursor of one planned node (lion_plan_node()).  droppins: carry
  * no interlock anywhere below - a child of a wide union, a child of a
  * trimmed AND other than the one that keeps its pins.  Its container is
@@ -4629,17 +4644,6 @@ lion_ecursor_init_ex(LionExprCursor *c, const LionNodePlan *plan,
 		Assert(node->nargs >= 1 && plan->nsub == node->nargs);
 		c->nsub = node->nargs;
 		c->sub = (LionExprCursor *) palloc0(sizeof(LionExprCursor) * c->nsub);
-		for (i = 0; i < c->nsub; i++)
-			lion_ecursor_init_ex(&c->sub[i], &plan->sub[i], sets, nsets, cx,
-								 droppins ||
-								 (plan->keep != LION_KEEP_ALL && plan->keep != i),
-								 under || raw, sublazy);
-
-		if (c->nsub > 1)
-		{
-			c->acc[0] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
-			c->acc[1] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
-		}
 
 		if (node->kind == LION_KN_AND)
 		{
@@ -4651,6 +4655,27 @@ lion_ecursor_init_ex(LionExprCursor *c, const LionNodePlan *plan,
 			c->order = (int *) palloc(sizeof(int) * c->nsub);
 			lion_leapfrog_order(est, c->nsub, c->order);
 			pfree(est);
+		}
+
+		/*
+		 * ... but the child that drives an AND node's leapfrog is always
+		 * asked for its container, and an AND node there is built as it is
+		 * sought, with the early exit of its own leapfrog, rather than wound
+		 * to a key first (lion_leapfrog_lazy()).
+		 */
+		for (i = 0; i < c->nsub; i++)
+			lion_ecursor_init_ex(&c->sub[i], &plan->sub[i], sets, nsets, cx,
+								 droppins ||
+								 (plan->keep != LION_KEEP_ALL && plan->keep != i),
+								 under || raw,
+								 sublazy &&
+								 !(under && i == c->order[0] &&
+								   !lion_leapfrog_lazy(node->args[i])));
+
+		if (c->nsub > 1)
+		{
+			c->acc[0] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+			c->acc[1] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 		}
 
 		if (node->kind == LION_KN_OR)
@@ -7634,14 +7659,18 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 	}
 
 	/*
-	 * The positive sources are lazy: a union among them is built only when
-	 * the leapfrog finds that cheaper than probing its members (DESIGN.md
-	 * §29.11, "Unions probed").  A negated one is subtracted whole.
+	 * The positive sources are lazy: a union or a tree among them is built
+	 * only when the leapfrog finds that cheaper than probing its members
+	 * (DESIGN.md §29.11, "Unions probed", "Trees probed") - but for a tree
+	 * that drives, which is built as it is sought (lion_leapfrog_lazy()).  A
+	 * negated one is subtracted whole.
 	 */
 	for (i = 0; i < nsources; i++)
 		lion_ecursor_init_ex(&cursors[i], plans[i], sources[i].sets,
 							 sources[i].nsets, cx, false, cx->raw,
-							 !sources[i].negated);
+							 !sources[i].negated &&
+							 (i != driver ||
+							  lion_leapfrog_lazy(plans[i]->node)));
 
 	/*
 	 * A chunk of a shared copy (LionCollect.ranged) begins at its first key:
