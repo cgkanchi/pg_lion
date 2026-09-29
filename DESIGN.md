@@ -11809,9 +11809,9 @@ after, and at a `random_page_cost` of 4 as well.
 | C4 = U1 over t_c | 5,356,870 | 64,108 / 20.2 -> 15,009 / 19.8 | 325,425 / 652 -> 276,326 / 560 | 333,252 / 728 -> 284,153 / 614 | |
 | C5 = U2 over t_c | 599,393 | 27,994 / 6.9 -> 6,799 / 6.9 | 158,058 / 163.4 -> 136,863 / 117.0 | 159,202 / 180.4 -> 138,006 / 138.4 | |
 
-(`k IN (n)` is a list of n values and `arr && (n)` an overlap of n keys; `e`, `k1` and `k2` of 500,
-100 and 50 values and `k3` and `k4` of 20 and 8 follow the hidden group eight times in ten, and `b1`,
-`b2` and `d = 0` are true on 80 to 90% of the rows at random.) Where the intersection is small by the
+(`k IN (n)` is a list of n values and `arr && (n)` an overlap of n keys; `b1`, `b2` and `d = 0` are
+the dense clauses, `e = v` the selective equality, and the lists' columns follow a hidden group, as
+the table's rows do.) Where the intersection is small by the
 time a list is met, the count is faster by up to 40% (W1 40%, W2 31%, S1 and C2 20%; S5, whose
 five keys' images cost about what probing them does, and C1, which probes a key in seven, even) and
 the scans by two to six and a half times:
