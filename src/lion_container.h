@@ -157,6 +157,66 @@ extern uint32 lion_container_andnot(const LionContainer *a, const LionContainer 
 extern uint32 lion_container_and_cardinality(const LionContainer *a, const LionContainer *b);
 
 /*
+ * The same algebra, UNOPTIMIZED: for a caller that counts the result or hands
+ * it on to the next operation and never stores it (the count engine's merge,
+ * DESIGN.md §15, "Unions and intersections unoptimized").  The result is left
+ * in the representation the operation builds it in -
+ *
+ *	and		an ARRAY when either operand is one, a RUN when both are RUNs and
+ *			the runs fit, else a BITSET;
+ *	andnot	an ARRAY when a is one, else a BITSET;
+ *	or		an ARRAY when both are ARRAYs whose members fit one, else a BITSET
+ *
+ * - and may be larger than lion_container_optimize() would make it (a BITSET
+ * of a few members), but it holds exactly the members the optimizing form's
+ * result holds, with the cardinality set, and every function here takes it.
+ * A caller that keeps one optimizes it first.  dest (capacity
+ * LION_CONTAINER_MAX_SIZE) must not overlap a or b: it is written in place.
+ */
+extern uint32 lion_container_and_raw(const LionContainer *a, const LionContainer *b,
+									 LionContainer *dest);
+extern uint32 lion_container_andnot_raw(const LionContainer *a, const LionContainer *b,
+										LionContainer *dest);
+extern uint32 lion_container_or_raw(const LionContainer *a, const LionContainer *b,
+									LionContainer *dest);
+
+/*
+ * dest = a AND (b[0] OR ... OR b[nb - 1]), without building the union: each
+ * of a's members is looked up in b[0], the ones not found in b[1], and so on
+ * (the count engine's AND of a running intersection with an IN list's or a
+ * multi-key `&&`'s containers at one key, DESIGN.md §29.11, "Unions
+ * probed").  a holds at most LION_ARRAY_MAX_CARD members, which the caller
+ * checks by its cardinality; the result is an ARRAY of those found, not
+ * optimized, with a's ckey, and its cardinality is returned.  Every b has
+ * a's ckey; dest (capacity LION_CONTAINER_MAX_SIZE) overlaps none of them.
+ * a and the b's may come off pages.
+ */
+extern uint32 lion_container_and_union_raw(const LionContainer *a,
+										   const LionContainer *const *b,
+										   uint32 nb, LionContainer *dest);
+
+/*
+ * A BITSET a caller ORs containers into (the count engine's union of several
+ * containers of one key): bitset_init() makes dest (capacity
+ * LION_CONTAINER_MAX_SIZE) an empty BITSET of ckey, whose words
+ * lion_container_or_into_bitset(c, LION_BITSET_DATA(dest)) sets, and
+ * bitset_recount() sets its cardinality from them, which it returns.  The
+ * result is not optimized either.
+ */
+extern void lion_container_bitset_init(LionContainer *dest, uint32 ckey);
+extern uint32 lion_container_bitset_recount(LionContainer *c);
+
+/*
+ * The members of an ARRAY c that are set in the image w (LION_BITSET_WORDS
+ * words): how many, returned, and in *blocks the heap blocks they lie on, in
+ * lion_container_block_mask()'s numbering - the cardinality and block mask of
+ * c AND w, without building it (the count engine's grouped walk, DESIGN.md
+ * §10, "The groups of a walk, counted together").  c may come off a page.
+ */
+extern uint32 lion_container_and_image_count(const LionContainer *c,
+											 const uint64 *w, uint64 *blocks);
+
+/*
  * Range helpers used by the phase-2 visibility-map mask: number of members
  * with lo in [lo_start, lo_end] inclusive, and removal of that whole range.
  */

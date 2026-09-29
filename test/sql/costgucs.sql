@@ -6,9 +6,9 @@
 -- price is written in, so that the model can be calibrated on a workload as
 -- core's is with random_page_cost.  The defaults are the values the prices
 -- had as constants, so every other test plans exactly as before.  This one
--- lists them, shows that three of them - an index scan's, a count's and the
--- FK-side join's - are read by the planner, and that a SET LOCAL of one ends
--- with its transaction.
+-- lists them, shows that four of them - an index scan's, a count's, the
+-- FK-side join's and a collected range's - are read by the planner, and that
+-- a SET LOCAL of one ends with its transaction.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -140,6 +140,15 @@ SELECT lcg_cost(q, s, '0', sw) < lcg_cost(q, s, NULL, sw) AS lowered_cheaper,
 				'{enable_hashjoin, off, enable_mergejoin, off, enable_nestloop, off}'::text[])) v(q, s, sw);
 SELECT lcg_plan('SELECT d.attr, count(*) FROM lcf f JOIN lcd d ON f.fk = d.pk WHERE d.region = ''r1'' GROUP BY d.attr', 'pg_lion.fkjoin_count_cost', NULL);
 SELECT lcg_plan('SELECT d.attr, count(*) FROM lcf f JOIN lcd d ON f.fk = d.pk WHERE d.region = ''r1'' GROUP BY d.attr', 'pg_lion.fkjoin_count_cost', '2500');
+
+-- A range collected as a source's (DESIGN.md §32, "What collecting a range
+-- costs"): each fold of the union it is collected into.  fk < 1000 is half
+-- of lcf's keys, scattered over its heap, and a source of the GROUP BY x.
+SELECT lcg_cost(q, s, '0', sw) < lcg_cost(q, s, NULL, sw) AS lowered_cheaper,
+	   lcg_cost(q, s, '100000', sw) > lcg_cost(q, s, NULL, sw) AS raised_dearer
+  FROM (VALUES ('SELECT x, count(*) FROM lcf WHERE fk < 1000 GROUP BY x',
+				'pg_lion.range_fold_cost',
+				'{enable_seqscan, off, enable_bitmapscan, off, enable_indexscan, off, enable_indexonlyscan, off}'::text[])) v(q, s, sw);
 
 -- ---------- 3. a SET LOCAL ends with its transaction ----------
 SELECT lcg_cost('SELECT g, count(*) FROM lcg GROUP BY g') AS before \gset

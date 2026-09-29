@@ -33,6 +33,8 @@ extern PGDLLIMPORT double lion_member_cost;
 extern PGDLLIMPORT double lion_probe_cost;
 extern PGDLLIMPORT double lion_memory_probe_cost;
 extern PGDLLIMPORT double lion_and_member_cost;
+extern PGDLLIMPORT double lion_union_key_cost;
+extern PGDLLIMPORT double lion_union_member_cost;
 extern PGDLLIMPORT double lion_descent_cost;
 extern PGDLLIMPORT double lion_union_set_cost;
 extern PGDLLIMPORT double lion_recheck_tid_cost;
@@ -45,6 +47,7 @@ extern PGDLLIMPORT double lion_distinct_test_cost;
 extern PGDLLIMPORT double lion_range_entry_cost;
 extern PGDLLIMPORT double lion_range_union_entry_cost;
 extern PGDLLIMPORT double lion_probe_step_cost;
+extern PGDLLIMPORT double lion_range_fold_cost;
 
 /* The FK-side join (§27) */
 extern PGDLLIMPORT double lion_fkjoin_count_cost;
