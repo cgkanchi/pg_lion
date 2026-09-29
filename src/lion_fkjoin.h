@@ -80,6 +80,10 @@ typedef struct LionFkJoin
 								 * operator's btree family for the dimension
 								 * key's type, which the keys are sorted by
 								 * to make them distinct; else InvalidOid */
+	bool		joinpath;		/* the semi or anti join as a JOIN path of
+								 * joinrel, which emits the outer side's rows
+								 * (lion_fkjoin_recognize_join()), and not an
+								 * aggregate over the query's join */
 } LionFkJoin;
 
 /*
@@ -92,6 +96,23 @@ typedef struct LionFkJoin
  */
 extern int	lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel,
 								  LionFkJoin **out);
+
+/*
+ * Whether one call of set_join_pathlist_hook - joinrel made of outerrel and
+ * innerrel as `jointype` - is the FK-side semi or anti join as a JOIN path
+ * (DESIGN.md §27, "The semi and anti join as a join path"): a plain JOIN_SEMI
+ * or JOIN_ANTI whose inner side is one fact table alone, joined on one
+ * equality between its column and a column of the outer side, whatever the
+ * outer side is.  Fills *fj (dimchild is outerrel, dimpath its cheapest total
+ * path, joinpath true) when it is.  What the fact side needs - a lion index
+ * on the fk and on every fact filter - is the caller's to find.
+ */
+extern bool lion_fkjoin_recognize_join(PlannerInfo *root, RelOptInfo *joinrel,
+									   RelOptInfo *outerrel,
+									   RelOptInfo *innerrel,
+									   JoinType jointype,
+									   JoinPathExtraData *extra,
+									   LionFkJoin *fj);
 
 /*
  * Whether rel's column attno is provably unique under the equality opno

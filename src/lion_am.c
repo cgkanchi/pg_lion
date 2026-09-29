@@ -233,6 +233,22 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §27, "The semi and anti join as a join path": whether the
+	 * planner may answer a semi or anti join whose inner side is a fact table
+	 * with a lion-indexed fk by looking each outer row's key up in the fact's
+	 * posting sets (LionSemiJoin, LionAntiJoin).  pg_lion.enable_count_pushdown
+	 * switches it off as well: it is part of the same pushdown.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_semijoin",
+							 "Enables lion's semi and anti join paths over a fact table's lion-indexed foreign key.",
+							 "Off, a semi or anti join is left to the planner's own join methods; pg_lion.enable_count_pushdown = off turns it off too.",
+							 &lion_enable_semijoin,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
 	 * DESIGN.md §29.11, "Plain scans switched off": whether the planner may
 	 * scan a lion index with a plain or an index-only scan.  Off, it plans
 	 * lion indexes as it plans GIN's, for bitmap scans only, where
@@ -309,6 +325,10 @@ _PG_init(void)
 
 	lion_prev_create_upper_paths_hook = create_upper_paths_hook;
 	create_upper_paths_hook = lion_create_upper_paths;
+
+	/* ... and the semi and anti join paths (DESIGN.md §27) */
+	lion_prev_set_join_pathlist_hook = set_join_pathlist_hook;
+	set_join_pathlist_hook = lion_set_join_pathlist;
 }
 
 /*
