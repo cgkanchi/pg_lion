@@ -3695,6 +3695,316 @@ test_and_union(void)
 }
 
 /* ----------------------------------------------------------------
+ *		a few members evaluated in a tree (DESIGN.md §29.11)
+ *
+ * extract_members(), probe_members() and array_from_marks() against the
+ * reference, each on its own, and together as the count engine combines
+ * them: a random tree of ANDs and ORs over containers of every
+ * representation, evaluated for a's members position by position - a leaf
+ * probed with the positions still wanted, an AND's children each with the
+ * positions the one before kept, an OR's with those none before found - and
+ * compared with a AND the tree built from the reference.  Damaged inputs on
+ * every side stay inside what they are given.
+ * ----------------------------------------------------------------
+ */
+
+#define TP_LEAVES	10
+
+typedef struct TpNode
+{
+	int			kind;			/* 0 leaf, 1 AND, 2 OR */
+	int			leaf;
+	int			nargs;
+	struct TpNode *args[4];
+} TpNode;
+
+static CBuf tp_buf[TP_LEAVES];
+static Ref	tp_ref[TP_LEAVES];
+static TpNode tp_nodes[64];
+static int	tp_nnodes;
+static int	tp_nleaves;
+
+static TpNode *
+tp_gen(int depth)
+{
+	TpNode	   *n = &tp_nodes[tp_nnodes++];
+	int			i;
+
+	if (depth == 0 || tp_nleaves >= TP_LEAVES - 4 || rng_below(3) == 0)
+	{
+		n->kind = 0;
+		n->leaf = tp_nleaves;
+		gen_any(&tp_ref[tp_nleaves], &tp_buf[tp_nleaves]);
+		tp_nleaves++;
+		return n;
+	}
+	n->kind = 1 + rng_below(2);
+	n->nargs = 2 + rng_below(2);
+	for (i = 0; i < n->nargs; i++)
+		n->args[i] = tp_gen(depth - 1);
+	return n;
+}
+
+static void
+tp_ref_eval(const TpNode *n, Ref *out)
+{
+	static Ref	stack[16];
+	static int	sp = 0;
+	Ref		   *sub;
+	Ref		   *tmp;
+	int			i;
+
+	if (n->kind == 0)
+	{
+		memcpy(out, &tp_ref[n->leaf], sizeof(Ref));
+		return;
+	}
+	sub = &stack[sp++];
+	tmp = &stack[sp++];
+	tp_ref_eval(n->args[0], out);
+	for (i = 1; i < n->nargs; i++)
+	{
+		tp_ref_eval(n->args[i], sub);
+		ref_binop(out, sub, tmp, n->kind == 1 ? OP_AND : OP_OR);
+		memcpy(out, tmp, sizeof(Ref));
+	}
+	sp -= 2;
+}
+
+/* found |= the positions of pend[] whose values the tree holds */
+static void
+tp_eval(const TpNode *n, const uint16 *vals, const uint16 *pend, uint32 np,
+		uint64 *found)
+{
+	uint16		rest[LION_ARRAY_MAX_CARD];
+	uint64		f[LION_ARRAY_MAX_CARD / 64];
+	uint32		nr = np;
+	uint32		j;
+	uint32		k;
+	int			i;
+
+	memcpy(rest, pend, sizeof(uint16) * np);
+	if (n->kind == 0)
+	{
+		(void) lion_container_probe_members(&tp_buf[n->leaf].c, vals, rest,
+											nr, found);
+		return;
+	}
+	for (i = 0; i < n->nargs && nr > 0; i++)
+	{
+		memset(f, 0, sizeof(f));
+		tp_eval(n->args[i], vals, rest, nr, f);
+		for (j = k = 0; j < nr; j++)
+		{
+			uint32		p = rest[j];
+			bool		hit = (f[p >> 6] >> (p & 63)) & 1;
+
+			if (n->kind == 2 && hit)
+				found[p >> 6] |= UINT64CONST(1) << (p & 63);
+			if ((n->kind == 1) == hit)
+				rest[k++] = (uint16) p;
+		}
+		nr = k;
+	}
+	if (n->kind == 1)
+		for (j = 0; j < nr; j++)
+			found[rest[j] >> 6] |= UINT64CONST(1) << (rest[j] & 63);
+}
+
+static void
+test_tree_probe(void)
+{
+	uint16		vals[LION_CONTAINER_RANGE];
+	uint16		pend[LION_ARRAY_MAX_CARD];
+	uint16		keep[LION_ARRAY_MAX_CARD];
+	uint64		found[LION_ARRAY_MAX_CARD / 64];
+	uint64		want[LION_ARRAY_MAX_CARD / 64];
+	uint32		k;
+	uint32		v;
+
+	phase("extract_members(): a container's members, bounded");
+	rng_seed(UINT64CONST(0x5EED6001));
+	for (k = 0; k < 400; k++)
+	{
+		uint32		cap = (k % 4 == 0) ? rng_below(LION_ARRAY_MAX_CARD + 1) :
+			LION_CONTAINER_RANGE;
+		uint16	   *out = exact_alloc(sizeof(uint16) * Max(cap, 1));
+		uint32		n;
+		uint32		i = 0;
+		bool		same = true;
+
+		gen_any(&ref_a, &buf_a);
+		n = lion_container_extract_members(&buf_a.c, out, cap);
+		if (ref_a.card > cap)
+			CHECK(n == cap + 1, "extract_members() says there are more than cap");
+		else
+		{
+			CHECK(n == ref_a.card, "extract_members() returns the cardinality");
+			for (v = 0; v < LION_CONTAINER_RANGE && i < n; v++)
+				if (ref_a.m[v])
+					same = same && (out[i++] == v);
+			CHECK(same, "extract_members() writes the members, ascending");
+		}
+		CHECK(guard_ok(out, sizeof(uint16) * Max(cap, 1)),
+			  "extract_members() writes no more than cap");
+		free(out);
+	}
+
+	phase("probe_members(): positions still wanted, looked up in one container");
+	for (k = 0; k < 600; k++)
+	{
+		uint32		n = 0;
+		uint32		np = 0;
+		uint32		kept;
+		uint32		i;
+		uint32		j = 0;
+		bool		ok = true;
+
+		gen_random(&ref_a, 1 + rng_below(LION_ARRAY_MAX_CARD));
+		for (v = 0; v < LION_CONTAINER_RANGE; v++)
+			if (ref_a.m[v])
+				vals[n++] = (uint16) v;
+		for (i = 0; i < n; i++)
+			if (rng_below(3) != 0)
+				pend[np++] = (uint16) i;
+		gen_any(&ref_b, &buf_b);
+
+		/* bits already set elsewhere stay set */
+		memset(found, 0, sizeof(found));
+		memset(want, 0, sizeof(want));
+		for (i = 0; i < n; i++)
+			if (rng_below(7) == 0)
+				found[i >> 6] |= UINT64CONST(1) << (i & 63);
+		memcpy(want, found, sizeof(found));
+		memcpy(keep, pend, sizeof(uint16) * np);
+
+		kept = lion_container_probe_members(&buf_b.c, vals, pend, np, found);
+		for (i = 0; i < np; i++)
+		{
+			uint32		p = keep[i];
+
+			if (ref_b.m[vals[p]])
+				want[p >> 6] |= UINT64CONST(1) << (p & 63);
+			else
+				ok = ok && j < kept && pend[j++] == p;
+		}
+		CHECK(ok && j == kept,
+			  "probe_members() keeps the positions not found, in order");
+		CHECK(memcmp(found, want, sizeof(found)) == 0,
+			  "probe_members() marks exactly the positions found");
+	}
+
+	phase("array_from_marks(): the marked positions, as an ARRAY");
+	for (k = 0; k < 400; k++)
+	{
+		uint32		n = 0;
+		uint32		i;
+		uint32		card;
+
+		gen_random(&ref_a, rng_below(LION_ARRAY_MAX_CARD + 1));
+		for (v = 0; v < LION_CONTAINER_RANGE; v++)
+			if (ref_a.m[v])
+				vals[n++] = (uint16) v;
+		ref_init(&ref_r);
+		memset(found, 0xFF, sizeof(found));	/* bits past n are ignored */
+		for (i = 0; i < n; i++)
+		{
+			if (rng_below(2) == 0)
+				found[i >> 6] &= ~(UINT64CONST(1) << (i & 63));
+			else
+				(void) ref_add(&ref_r, vals[i]);
+		}
+		memset(&buf_d, 0x5A, sizeof(buf_d));
+		card = lion_container_array_from_marks(&buf_d.c, TEST_CKEY, vals, n,
+											   found);
+		CHECK(card == ref_r.card && buf_d.c.type == LION_CT_ARRAY &&
+			  buf_d.c.ckey == TEST_CKEY,
+			  "array_from_marks() leaves an ARRAY of the marked members");
+		verify_full(&buf_d.c, &ref_r);
+	}
+
+	phase("a few members evaluated in a tree of ANDs and ORs");
+	for (k = 0; k < 800; k++)
+	{
+		TpNode	   *root;
+		uint32		n;
+		uint32		i;
+		uint32		card;
+
+		tp_nnodes = 0;
+		tp_nleaves = 0;
+		root = tp_gen(1 + rng_below(3));
+		tp_ref_eval(root, &ref_b);
+
+		/* a: a few members, or up to an ARRAY's worth, any representation */
+		if (k % 3 == 0)
+			gen_any(&ref_a, &buf_a);
+		else
+		{
+			gen_random(&ref_a, (k % 3 == 1) ? 1 + rng_below(4) :
+					   rng_below(LION_ARRAY_MAX_CARD + 1));
+			build_by_append(&buf_a, &ref_a);
+		}
+		if (ref_a.card > LION_ARRAY_MAX_CARD)
+			continue;			/* the engine never probes with more */
+		ref_binop(&ref_a, &ref_b, &ref_r, OP_AND);
+
+		n = lion_container_extract_members(&buf_a.c, vals, LION_ARRAY_MAX_CARD);
+		CHECK(n == ref_a.card, "a's members, extracted");
+		for (i = 0; i < n; i++)
+			pend[i] = (uint16) i;
+		memset(found, 0, sizeof(found));
+		tp_eval(root, vals, pend, n, found);
+		card = lion_container_array_from_marks(&buf_d.c, TEST_CKEY, vals, n,
+											   found);
+		CHECK(card == ref_r.card, "a AND the tree, probed: its cardinality");
+		verify_full(&buf_d.c, &ref_r);
+	}
+
+	phase("the tree probe's steps: damaged inputs stay inside what they are given");
+	for (k = 0; k < 400; k++)
+	{
+		uint32		n;
+		uint32		np;
+		uint32		i;
+		uint16	   *out = exact_alloc(sizeof(uint16) * LION_ARRAY_MAX_CARD);
+		const char *why = NULL;
+
+		damage_randomize(dmg_a);
+		n = lion_container_extract_members(dmg_a, out, LION_ARRAY_MAX_CARD);
+		CHECK(guard_ok(out, sizeof(uint16) * LION_ARRAY_MAX_CARD),
+			  "damaged: extract_members() writes no more than cap");
+		if (n > LION_ARRAY_MAX_CARD)
+			n = 0;
+
+		/* damaged vals too: unsorted, repeated */
+		for (i = 0; i < n; i++)
+			if (rng_below(8) == 0)
+				out[i] = (uint16) rng_next();
+		np = n;
+		for (i = 0; i < n; i++)
+			pend[i] = (uint16) i;
+		memset(found, 0, sizeof(found));
+		if (rng_below(2) == 0)
+			damage_randomize(dmg_b);
+		else
+		{
+			gen_any(&ref_b, &buf_b);
+			memcpy(dmg_b, &buf_b, lion_container_size(&buf_b.c));
+		}
+		np = lion_container_probe_members(dmg_b, out, pend, np, found);
+		CHECK(np <= n, "damaged: probe_members() keeps no more than it is given");
+		for (i = 0; i < np; i++)
+			CHECK(pend[i] < n, "damaged: probe_members() keeps positions it was given");
+		(void) lion_container_array_from_marks(dmg_dst, TEST_CKEY, out, n, found);
+		CHECK(lion_container_check(dmg_dst, LION_CONTAINER_MAX_SIZE, &why) &&
+			  guard_ok(dmg_dst, LION_CONTAINER_MAX_SIZE),
+			  "damaged: array_from_marks() leaves a well-formed ARRAY");
+		free(out);
+	}
+}
+
+/* ----------------------------------------------------------------
  *					representative sizes (informational)
  * ----------------------------------------------------------------
  */
@@ -3835,6 +4145,7 @@ main(void)
 	test_add_many();
 	test_mark_members();
 	test_and_union();
+	test_tree_probe();
 
 	test_random_ops(3, "random ops @ 0.01% density", 20000, UINT64CONST(0x5EED1001));
 	test_random_ops(328, "random ops @ 1% density", 20000, UINT64CONST(0x5EED1002));
