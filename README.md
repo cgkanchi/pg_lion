@@ -265,7 +265,9 @@ Entry`, the containers the counts read from each key's FK set (`Join Key Contain
 collected copy of the fact filters (`Fact Filter Copy Containers Read`, `Seeks`, and `File Reads`
 when the copy spilled), the posting-tree pages they read (`Join Posting Pages Read`) and the
 visibility map (`Visibility Map Checks`, `Pages Pinned`); with `TIMING` on, also `Join Child Time`,
-`Join Lookup Time`, `Join Count Time` and `Fact Filter Collect Time`, summed over parallel workers.
+`Join Lookup Time`, `Join Count Time`, `Fact Filter Locate Time` (the fact filters located, a range
+among them collected into memory, which can be most of a run) and `Fact Filter Collect Time`, summed
+over parallel workers and the partitions of a partitioned fact table.
 A join whose result is counts alone (no `GROUP BY`, no dimension column in the output) adds the
 dimension rows' counts up inside the node and hands up one row per process.
 
@@ -507,6 +509,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `range_entry_cost` | 40 | `cpu_tuple_cost` | an entry of a range walk counted on its own |
 | `range_union_entry_cost` | 12 | `cpu_tuple_cost` | a small entry of a summed range, counted with its leaf |
 | `probe_step_cost` | 2.0 | `cpu_operator_cost` | a container of a set a summed range probes |
+| `range_fold_cost` | 420 | `cpu_operator_cost` | a fold into a container of a range's union, collected as a source, that is not a bitset |
 | `fkjoin_count_cost` | 25 | `cpu_tuple_cost` | an FK-side join's count, a dimension row |
 | `fkjoin_row_cost` | 10 | `cpu_tuple_cost` | a row the FK-side join hands up |
 | `fkjoin_probe_cost` | 80 | `cpu_operator_cost` | a probe of such a count into a fact filter |
