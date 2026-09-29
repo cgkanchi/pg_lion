@@ -3,9 +3,9 @@
 # The extension is built against the PGDG PostgreSQL 18 headers under
 # cov-build, which records every compilation; the capture is uploaded to the
 # project on scan.coverity.com, where the analysis runs and the defects are
-# listed.  Coverity limits how many builds a project may submit a week, so
-# this runs once a day on the default branch and by hand (workflow_dispatch),
-# not on every push.
+# listed.  Coverity limits how many builds a project may submit, and its
+# shared queue can hold a build for hours, so this runs once a week on the
+# default branch (Mondays) and by hand (workflow_dispatch), not on every push.
 #
 # It needs two repository secrets (Settings -> Secrets and variables ->
 # Actions):
@@ -22,7 +22,7 @@ name: Coverity Scan
 
 on:
   schedule:
-    - cron: "37 4 * * *"
+    - cron: "37 4 * * 1"
   workflow_dispatch:
 
 permissions:
