@@ -539,12 +539,13 @@ lion_check_replaced_execute(List *exec, int eflags)
 		lion_check_aggregate_execute(lfirst_oid(lc));
 }
 
-void
-lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
+/*
+ * The members of custom_private - and custom_exprs - that the phases of
+ * lion_begin_custom_scan() read, once lion_begin_decode() has taken them out
+ * of their positions.
+ */
+typedef struct LionBeginPrivate
 {
-	LionCountScanState *st = (LionCountScanState *) node;
-	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
-	List	   *shape;
 	List	   *oids;
 	List	   *ints;
 	List	   *exprs;
@@ -556,18 +557,20 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	List	   *dist;
 	List	   *join;
 	List	   *coal;
-	List	   *fg;
-	int			flags;
-	int			i;
-	int			k;
+} LionBeginPrivate;
 
-	/*
-	 * custom_private is read positionally, so check that it is the list this
-	 * build writes before reading a single offset of it.  A mismatch means
-	 * the planner half and the executor half of this file have drifted apart
-	 * (or a plan from another build has been handed to us); saying so is far
-	 * better than decoding Oids out of the wrong member.
-	 */
+/*
+ * custom_private is read positionally, so check that it is the list this
+ * build writes before reading a single offset of it.  A mismatch means
+ * the planner half and the executor half of this file have drifted apart
+ * (or a plan from another build has been handed to us); saying so is far
+ * better than decoding Oids out of the wrong member.
+ */
+static void
+lion_begin_check_shape(CustomScan *cscan)
+{
+	List	   *shape;
+
 	shape = (list_length(cscan->custom_private) == LION_PRIV_NMEMBERS) ?
 		(List *) list_nth(cscan->custom_private, LION_PRIV_VERSION) : NIL;
 	if (shape == NIL || !IsA(shape, IntList) || list_length(shape) != 2 ||
@@ -575,43 +578,57 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		lsecond_int(shape) != LION_PRIV_NMEMBERS)
 		elog(ERROR, "LionCount: unrecognized custom_private shape (%d members)",
 			 list_length(cscan->custom_private));
+}
 
-	/* Before anything is opened or read (DESIGN.md §9, "Privileges"). */
-	lion_check_replaced_execute((List *) list_nth(cscan->custom_private,
-												  LION_PRIV_EXECUTE),
-								eflags);
+/*
+ * Take custom_private apart: the lists the phases below read go into *priv,
+ * and the plan's Oids, attribute numbers and flags into the scan state.
+ */
+static void
+lion_begin_decode(LionCountScanState *st, CustomScan *cscan,
+				  LionBeginPrivate *priv)
+{
+	int			flags;
 
-	oids = (List *) list_nth(cscan->custom_private, LION_PRIV_OIDS);
-	ints = (List *) list_nth(cscan->custom_private, LION_PRIV_INTS);
-	ckinds = (List *) list_nth(cscan->custom_private, LION_PRIV_CLAUSEKINDS);
-	exprs = cscan->custom_exprs;
-	partlist = (List *) list_nth(cscan->custom_private, LION_PRIV_PARTS);
-	clauseops = (List *) list_nth(cscan->custom_private, LION_PRIV_CLAUSEOPS);
-	orlist = (List *) list_nth(cscan->custom_private, LION_PRIV_ORS);
-	dist = (List *) list_nth(cscan->custom_private, LION_PRIV_DISTINCT);
-	join = (List *) list_nth(cscan->custom_private, LION_PRIV_JOIN);
-	coal = (List *) list_nth(cscan->custom_private, LION_PRIV_COALESCE);
-	kinds = (List *) list_nth(cscan->custom_private, LION_PRIV_TLKINDS);
+	priv->oids = (List *) list_nth(cscan->custom_private, LION_PRIV_OIDS);
+	priv->ints = (List *) list_nth(cscan->custom_private, LION_PRIV_INTS);
+	priv->ckinds = (List *) list_nth(cscan->custom_private,
+									 LION_PRIV_CLAUSEKINDS);
+	priv->exprs = cscan->custom_exprs;
+	priv->partlist = (List *) list_nth(cscan->custom_private,
+									   LION_PRIV_PARTS);
+	priv->clauseops = (List *) list_nth(cscan->custom_private,
+										LION_PRIV_CLAUSEOPS);
+	priv->orlist = (List *) list_nth(cscan->custom_private, LION_PRIV_ORS);
+	priv->dist = (List *) list_nth(cscan->custom_private,
+								   LION_PRIV_DISTINCT);
+	priv->join = (List *) list_nth(cscan->custom_private, LION_PRIV_JOIN);
+	priv->coal = (List *) list_nth(cscan->custom_private,
+								   LION_PRIV_COALESCE);
+	priv->kinds = (List *) list_nth(cscan->custom_private,
+									LION_PRIV_TLKINDS);
 	st->implied = (List *) list_nth(cscan->custom_private, LION_PRIV_IMPLIED);
 
-	st->heapoid = linitial_oid(oids);
-	st->groupidxoid = lsecond_oid(oids);
-	st->groupidxoid2 = lthird_oid(oids);
-	st->scanrelid = (Index) linitial_int(ints);
-	st->groupattno = (AttrNumber) lsecond_int(ints);
-	st->groupattno2 = (AttrNumber) lthird_int(ints);
-	flags = lfourth_int(ints);
+	st->heapoid = linitial_oid(priv->oids);
+	st->groupidxoid = lsecond_oid(priv->oids);
+	st->groupidxoid2 = lthird_oid(priv->oids);
+	st->scanrelid = (Index) linitial_int(priv->ints);
+	st->groupattno = (AttrNumber) lsecond_int(priv->ints);
+	st->groupattno2 = (AttrNumber) lthird_int(priv->ints);
+	flags = lfourth_int(priv->ints);
 	st->singlegroup = (flags & LION_FLAG_SINGLEGROUP) != 0;
 	st->sumall = (flags & LION_FLAG_SUMALL) != 0;
 	st->hasgroupidx = (flags & LION_FLAG_GROUPIDX) != 0;
 	st->hasrange = (flags & LION_FLAG_RANGE) != 0;
-	st->nclause = list_length(ckinds);
-	st->distattno = (dist != NIL) ? (AttrNumber) linitial_int(dist) : 0;
+	st->nclause = list_length(priv->ckinds);
+	st->distattno = (priv->dist != NIL) ?
+		(AttrNumber) linitial_int(priv->dist) : 0;
+}
 
-	/* GROUP BY coalesce(g, c) (DESIGN.md §10): c and its equality */
-	st->hascoal = false;
-	st->coalcount = 0;
-	st->coalwalked = false;
+/* GROUP BY coalesce(g, c) (DESIGN.md §10): c and its equality */
+static void
+lion_begin_coalesce(LionCountScanState *st, List *coal, EState *estate)
+{
 	if (coal != NIL)
 	{
 		List	   *ops;
@@ -632,34 +649,18 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 					  estate->es_query_cxt);
 		st->hascoal = true;
 	}
+}
 
-	/*
-	 * One value expression per clause, in custom_exprs (see the shape marker
-	 * above).  A mismatch is planner/executor drift, exactly like a wrong
-	 * shape marker, and is said rather than decoded.
-	 */
-	if (list_length(exprs) != st->nclause)
-		elog(ERROR, "LionCount: %d clauses but %d value expressions",
-			 st->nclause, list_length(exprs));
-
-	/*
-	 * The FK-side join (DESIGN.md §27): which clause is the join key, and
-	 * which column of the child's rows carries its value.  Every other shape
-	 * has neither, and no child.
-	 */
+/*
+ * The FK-side join (DESIGN.md §27): which clause is the join key, and
+ * which column of the child's rows carries its value.  Every other shape
+ * has neither, and no child.
+ */
+static void
+lion_begin_join(LionCountScanState *st, CustomScan *cscan, List *join)
+{
 	st->joinclause = -1;
-	st->joinkeyresno = 0;
 	st->jointype = LION_JOIN_INNER;
-	st->joincollect = false;
-	st->joinrows = false;
-	st->joinsum = false;
-	st->joincounts = false;
-	st->joinouter = false;
-	st->joinordered = false;
-	st->joinunique = false;
-	st->joinwalk = false;
-	st->joinsortop = InvalidOid;
-	st->joinsortcoll = InvalidOid;
 	if (join != NIL)
 	{
 		if (list_length(join) != 6 ||
@@ -695,6 +696,16 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 			(st->joinordered && !st->joinouter))
 			elog(ERROR, "LionCount: malformed join");
 	}
+}
+
+/*
+ * The kinds of the plan's target list (LION_TL_*), and what they ask of the
+ * scan.
+ */
+static void
+lion_begin_target_list(LionCountScanState *st, CustomScan *cscan, List *kinds)
+{
+	int			i;
 
 	st->ntlist = list_length(kinds);
 	st->tlkind = (int *) palloc(sizeof(int) * Max(st->ntlist, 1));
@@ -738,8 +749,6 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	 * other count is a sum over k's entries; beside one, count(k) is a sum
 	 * over the (g, k) pairs, and count(*) and count(g) are the group's own.
 	 */
-	st->distfull = false;
-	st->distgroupcount = false;
 	for (i = 0; st->distattno != 0 && i < st->ntlist; i++)
 	{
 		switch (st->tlkind[i])
@@ -759,6 +768,17 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 				break;
 		}
 	}
+}
+
+/*
+ * The plan's clauses, one LionClauseState each: what kind, on which column
+ * and index, under which operator, and how its value is had.
+ */
+static void
+lion_begin_clauses(LionCountScanState *st, CustomScanState *node,
+				   const LionBeginPrivate *priv)
+{
+	int			i;
 
 	st->clause = (LionClauseState *)
 		palloc0(sizeof(LionClauseState) * Max(st->nclause, 1));
@@ -766,10 +786,10 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	{
 		LionClauseState *cl = &st->clause[i];
 
-		cl->kind = list_nth_int(ckinds, i);
-		cl->idxoid = list_nth_oid(oids, 3 + i);
-		cl->attno = (AttrNumber) list_nth_int(ints, 4 + i);
-		cl->opno = list_nth_oid(clauseops, i);
+		cl->kind = list_nth_int(priv->ckinds, i);
+		cl->idxoid = list_nth_oid(priv->oids, 3 + i);
+		cl->attno = (AttrNumber) list_nth_int(priv->ints, 4 + i);
+		cl->opno = list_nth_oid(priv->clauseops, i);
 		cl->strategy = 0;
 
 		/*
@@ -778,7 +798,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		 * generic IN list, a stable expression - gets an ExprState and is
 		 * evaluated at the start of each scan (lion_eval_clause_values()).
 		 */
-		cl->valexpr = (Expr *) list_nth(exprs, i);
+		cl->valexpr = (Expr *) list_nth(priv->exprs, i);
 		cl->valtype = exprType((Node *) cl->valexpr);
 
 		/*
@@ -806,6 +826,16 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 			cl->valstate = ExecInitExpr(cl->valexpr, &node->ss.ps);
 		}
 	}
+}
+
+/*
+ * The heap columns the driving walk and the inner walk are on, and the check
+ * that the range clauses bound the driving one.
+ */
+static void
+lion_begin_driving_column(LionCountScanState *st)
+{
+	int			i;
 
 	/*
 	 * Which HEAP column the driving index's entries belong to (DESIGN.md §24
@@ -869,14 +899,21 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 			st->clause[i].attno != st->driveattno)
 			elog(ERROR, "LionCount: a range clause that does not bound the driving walk");
 	}
+}
 
-	/*
-	 * The OR restrictions (DESIGN.md §19) and the sources the clauses make
-	 * up: one per plain clause, one per OR.  A clause that is an OR leaf has
-	 * no source of its own - its posting sets go into the OR's, which is the
-	 * union of the arms - and that is the only thing that tells the two apart
-	 * anywhere below.
-	 */
+/*
+ * The OR restrictions (DESIGN.md §19) and the sources the clauses make
+ * up: one per plain clause, one per OR.  A clause that is an OR leaf has
+ * no source of its own - its posting sets go into the OR's, which is the
+ * union of the arms - and that is the only thing that tells the two apart
+ * anywhere below.
+ */
+static void
+lion_begin_ors_and_items(LionCountScanState *st, List *orlist)
+{
+	int			i;
+	int			k;
+
 	st->nor = list_length(orlist);
 	st->inor = lion_or_leaf_map(orlist, st->nclause);
 	if (st->nor > 0)
@@ -957,8 +994,14 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	}
 	st->planitem = st->item;
 	st->nplanitem = st->nitem;
+}
 
-	/* One target per live leaf partition, in the planner's order. */
+/* One target per live leaf partition, in the planner's order. */
+static void
+lion_begin_partitions(LionCountScanState *st, List *partlist)
+{
+	int			i;
+
 	st->npart = list_length(partlist);
 	if (st->npart > 0)
 	{
@@ -996,14 +1039,19 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		memcpy(st->item, st->planitem,
 			   sizeof(LionSourceItem) * st->nplanitem);
 	}
+}
 
-	/*
-	 * An FK-side join grouped by a fact column (DESIGN.md §27, "Grouped by a
-	 * fact column"): the column, and each relation's index for its groups -
-	 * or, for a partition, the value its bounds give the column.
-	 */
-	st->fgattno = 0;
-	st->fgidxoid = InvalidOid;
+/*
+ * An FK-side join grouped by a fact column (DESIGN.md §27, "Grouped by a
+ * fact column"): the column, and each relation's index for its groups -
+ * or, for a partition, the value its bounds give the column.
+ */
+static void
+lion_begin_fact_group(LionCountScanState *st, CustomScan *cscan)
+{
+	List	   *fg;
+	int			i;
+
 	fg = (List *) list_nth(cscan->custom_private, LION_PRIV_FACTGROUP);
 	if (fg != NIL)
 	{
@@ -1041,48 +1089,17 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 			}
 		}
 	}
-	st->fgturn = 0;
-	st->fgcxt = NULL;
-	st->fgrowcxt = NULL;
-	st->fgsets = NULL;
-	st->fgkey = NULL;
-	st->fgnull = NULL;
-	st->fgn = 0;
-	st->fgsrc = NULL;
-	st->fgnsrc = 0;
-	st->fgrows = NULL;
-	st->fgnrows = 0;
-	st->fgrowcap = 0;
-	st->fgrowpos = 0;
-	st->fggroupcounts = 0;
-	st->fgworkergroupcounts = 0;
+}
 
-	st->located = false;
-	st->valsdone = false;
-	st->wheremissing = false;
-	st->scanning = false;
-	st->done = false;
-	st->curpart = 0;
-	st->partopen = false;
-	memset(&st->stats, 0, sizeof(st->stats));
-	memset(st->rangeeval, 0, sizeof(st->rangeeval));
-	st->summaries = 0;
-	st->rangeprobed = 0;
-	st->rangesrc_collected = 0;
-	st->rangesrc_walked = 0;
-	st->rangesrc_held = 0;
-	st->wherecollected = 0;
-	st->wherespilled = 0;
-	memset(&st->wherecoll, 0, sizeof(st->wherecoll));
+/*
+ * What a run starts from, and the one shape of a parallel GROUP BY, whose
+ * ranges are handed out as it runs.
+ */
+static void
+lion_begin_run_state(LionCountScanState *st, CustomScan *cscan)
+{
 	st->wherecoll.pinbuf = InvalidBuffer;
-	st->ingroupleft = 0;
 	st->gbatchcxt = NULL;		/* made by the first batch */
-	st->gbmax = 0;
-	st->gbimages = NULL;
-	st->gbn = 0;
-	st->gbpos = 0;
-	st->groupbatches = 0;
-	st->groupsbatched = 0;
 
 	/*
 	 * A parallel-aware node that is no join is a parallel GROUP BY (DESIGN.md
@@ -1097,13 +1114,15 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		elog(ERROR, "LionCount: malformed parallel GROUP BY");
 	st->grange = -1;
 	st->grangecxt = NULL;		/* made by the first range */
-	st->granges = 0;
-	st->workerranges = 0;
-	st->workerwherecollected = 0;
-	st->workerwherespilled = 0;
-	st->workergroupbatches = 0;
-	st->workergroupsbatched = 0;
+}
 
+/*
+ * The scan's memory contexts, all under the query's: the ones every scan
+ * has, and a fact column's, with the source list its counts use.
+ */
+static void
+lion_begin_contexts(LionCountScanState *st, EState *estate)
+{
 	st->pergroup = AllocSetContextCreate(estate->es_query_cxt,
 										 "LionCount per-group",
 										 ALLOCSET_SMALL_SIZES);
@@ -1141,56 +1160,24 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		st->fgsrc = (LionCountSource *)
 			palloc0(sizeof(LionCountSource) * st->fgnsrc);
 	}
-	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
-	st->filter = NULL;
-	st->writtenrels = lion_statement_written_rels(estate);
-	st->rel_read_only = false;
+}
 
-	/*
-	 * The FK-side join's dimension side (DESIGN.md §27) is an ordinary plan,
-	 * initialised here - EXPLAIN without ANALYZE prints it too - and run
-	 * under the same snapshot as the counts.
-	 */
-	st->child = NULL;
-	st->childslot = NULL;
-	st->joinlookups = 0;
-	st->joinmissing = 0;
-	st->joincollected = false;
-	st->joinfiltered = false;
+/*
+ * The FK-side join's dimension side (DESIGN.md §27) is an ordinary plan,
+ * initialised here - EXPLAIN without ANALYZE prints it too - and run
+ * under the same snapshot as the counts.
+ */
+static void
+lion_begin_join_child(LionCountScanState *st, CustomScanState *node,
+					  CustomScan *cscan, EState *estate, int eflags)
+{
+	int			i;
+
 	st->joinfilterrows = -1;
-	st->joinshared = NULL;
-	st->joinreported = false;
-	st->joinsharedcopy = NULL;
-	st->joinpcxt = NULL;
-	st->joinviewshared = false;
-	st->joincopies = 0;
-	st->joincopychunks = 0;
-	st->joinworkercopies = 0;
-	st->joinworkercopychunks = 0;
-	memset(&st->joinworkerstats, 0, sizeof(st->joinworkerstats));
-	st->joinworkerlookups = 0;
-	st->joinworkermissing = 0;
-	st->joinworkerdirpages = 0;
 	st->joinworkerfilterrows = -1;
-	memset(&st->joinfilter, 0, sizeof(st->joinfilter));
 	st->joinfilter.pinbuf = InvalidBuffer;
-	st->joinsort = NULL;
-	st->joinsortdone = false;
-	st->joinsortslot = NULL;
-	st->joinkeycxt = NULL;
-	st->joinhaveprev = false;
-	st->joinkeypos = 0;
 	st->joinchunk = -1;
-	st->joinsorted = 0;
-	st->joinhavesortstats = false;
-	st->joinworkersorted = 0;
-	st->joinchildrows = 0;
-	st->joinposting = 0;
 	lion_join_switch_reset(st);
-	st->joinswitches = 0;
-	st->joinswitchkeys = 0;
-	st->joinworkerswitches = 0;
-	st->joinworkerswitchkeys = 0;
 
 	/*
 	 * Timed only when core times the nodes: under EXPLAIN ANALYZE with its
@@ -1198,8 +1185,6 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	 * every participant, as it says so to InstrAlloc() for each node.
 	 */
 	st->jointiming = (estate->es_instrument & INSTRUMENT_TIMER) != 0;
-	st->joinworkerchildrows = 0;
-	st->joinworkerposting = 0;
 	for (i = 0; i < LION_JT_N; i++)
 	{
 		INSTR_TIME_SET_ZERO(st->jointime[i]);
@@ -1211,13 +1196,19 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 								 estate, eflags);
 		node->custom_ps = list_make1(st->child);
 	}
+}
 
-	/*
-	 * A forward semi join over a non-unique key (DESIGN.md §27) sorts the
-	 * child's rows by their key and compares neighbours with the equality of
-	 * the sort operator's btree family, which is the join operator's family
-	 * (lion_fkjoin_recognize()) for the key's own type.
-	 */
+/*
+ * A forward semi join over a non-unique key (DESIGN.md §27) sorts the
+ * child's rows by their key and compares neighbours with the equality of
+ * the sort operator's btree family, which is the join operator's family
+ * (lion_fkjoin_recognize()) for the key's own type.
+ */
+static void
+lion_begin_join_distinct_key(LionCountScanState *st, EState *estate)
+{
+	int			i;
+
 	if (st->joinunique)
 	{
 		TupleDesc	childdesc = ExecGetResultType(st->child);
@@ -1255,29 +1246,18 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 											   "LionCount join key",
 											   ALLOCSET_SMALL_SIZES);
 	}
+}
 
-	/*
-	 * Lookups in key order (DESIGN.md §27): the batches of rows - or of the
-	 * distinct keys, which the target list reads through joinsortslot above -
-	 * live in a context of their own, emptied at every batch, and a batched
-	 * row goes back to the target list through a slot of the child's shape.
-	 */
-	st->joinwalkbegun = false;
-	st->joinbatchcxt = NULL;
-	st->joinbatch = NULL;
-	st->joinbatchn = 0;
-	st->joinbatchcap = 0;
-	st->joinbatchpos = 0;
-	st->joinchilddone = false;
-	st->joinbatchslot = NULL;
-	st->joinbatches = 0;
-	st->joinlasthave = false;
-	st->joinworkerbatches = 0;
-	st->joinpart = NULL;
-	st->joinpartcxt = NULL;
-	st->joinvisitcxt = NULL;
-	st->joinrunfilterrows = 0;
-	memset(&st->joinorder, 0, sizeof(st->joinorder));
+/*
+ * Lookups in key order (DESIGN.md §27): the batches of rows - or of the
+ * distinct keys, which the target list reads through joinsortslot above -
+ * live in a context of their own, emptied at every batch, and a batched
+ * row goes back to the target list through a slot of the child's shape.
+ */
+static void
+lion_begin_join_batches(LionCountScanState *st, EState *estate)
+{
+	int			i;
 
 	/*
 	 * A partitioned fact table's keys are looked up a batch at a time
@@ -1336,19 +1316,20 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		st->joinbatchslot = ExecInitExtraTupleSlot(estate, childdesc,
 												   &TTSOpsMinimalTuple);
 	}
+}
 
-	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
-		return;
-
-	/*
-	 * A plain table is opened once and stays open.  The executor already
-	 * holds locks on every range table entry, so the heap is opened without
-	 * taking another one.  The indexes are not range table entries, so they
-	 * get their own AccessShareLock.
-	 *
-	 * A partitioned one opens nothing here: lion_open_relation() opens one
-	 * partition at a time (DESIGN.md §16).
-	 */
+/*
+ * A plain table is opened once and stays open.  The executor already
+ * holds locks on every range table entry, so the heap is opened without
+ * taking another one.  The indexes are not range table entries, so they
+ * get their own AccessShareLock.
+ *
+ * A partitioned one opens nothing here: lion_open_relation() opens one
+ * partition at a time (DESIGN.md §16).
+ */
+static void
+lion_begin_open_table(LionCountScanState *st, int eflags)
+{
 	if (st->npart == 0)
 	{
 		lion_open_relation(st, st->heapoid, st->groupidxoid, st->groupidxoid2,
@@ -1371,7 +1352,15 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 							RelationGetRelationName(st->heap)),
 					 errhint("Use the REFRESH MATERIALIZED VIEW command.")));
 	}
+}
 
+/*
+ * The source lists a count is made from: the plan's, a driver's alternative
+ * and the one a count against the collected WHERE uses.
+ */
+static void
+lion_begin_sources(LionCountScanState *st)
+{
 	/*
 	 * Slot 0 is the (outer) group's posting set, 1 .. nitem the WHERE items,
 	 * and - for a two-column GROUP BY (DESIGN.md §20), or the (g, k) pairs of
@@ -1400,7 +1389,6 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->sumallitem = -1;
 	st->dsources = (LionCountSource *)
 		palloc0(sizeof(LionCountSource) * st->nsource);
-	st->disttests = 0;
 	st->batchitem = -1;
 
 	/*
@@ -1409,4 +1397,52 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	 */
 	st->wsources = (LionCountSource *)
 		palloc0(sizeof(LionCountSource) * (st->nsource + 1));
+}
+
+void
+lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
+{
+	LionCountScanState *st = (LionCountScanState *) node;
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	LionBeginPrivate priv;
+
+	lion_begin_check_shape(cscan);
+
+	/* Before anything is opened or read (DESIGN.md §9, "Privileges"). */
+	lion_check_replaced_execute((List *) list_nth(cscan->custom_private,
+												  LION_PRIV_EXECUTE),
+								eflags);
+
+	lion_begin_decode(st, cscan, &priv);
+	lion_begin_coalesce(st, priv.coal, estate);
+
+	/*
+	 * One value expression per clause, in custom_exprs (see the shape marker
+	 * above).  A mismatch is planner/executor drift, exactly like a wrong
+	 * shape marker, and is said rather than decoded.
+	 */
+	if (list_length(priv.exprs) != st->nclause)
+		elog(ERROR, "LionCount: %d clauses but %d value expressions",
+			 st->nclause, list_length(priv.exprs));
+
+	lion_begin_join(st, cscan, priv.join);
+	lion_begin_target_list(st, cscan, priv.kinds);
+	lion_begin_clauses(st, node, &priv);
+	lion_begin_driving_column(st);
+	lion_begin_ors_and_items(st, priv.orlist);
+	lion_begin_partitions(st, priv.partlist);
+	lion_begin_fact_group(st, cscan);
+	lion_begin_run_state(st, cscan);
+	lion_begin_contexts(st, estate);
+	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
+	st->writtenrels = lion_statement_written_rels(estate);
+	lion_begin_join_child(st, node, cscan, estate, eflags);
+	lion_begin_join_distinct_key(st, estate);
+	lion_begin_join_batches(st, estate);
+
+	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
+		return;
+
+	lion_begin_open_table(st, eflags);
+	lion_begin_sources(st);
 }
