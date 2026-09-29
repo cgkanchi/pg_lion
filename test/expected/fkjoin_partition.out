@@ -322,10 +322,9 @@ SELECT * FROM lion_xj_explain('SELECT count(*) FROM lion_xf f WHERE f.kind = ''b
                Implied by Partition Bounds: (kind = 'b'::text)
                Join Type: Semi
                Join Keys: distinct, sorted
-               Join Key Lookups: in index order
                Fact Filters: collected once
                ->  (the dimension's plan)
-(12 rows)
+(11 rows)
 
 -- a filter per kind, ORed: each partition leaves out the arms its bounds
 -- refute and, in the arm it keeps, the kind its bounds imply; lion_xf_cd's
