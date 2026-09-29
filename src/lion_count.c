@@ -3924,6 +3924,14 @@ lion_leaf_cost(const LionPostingSet *ps, bool droppins, Size *mem, int *pins)
 		*pins = 1;
 }
 
+/*
+ * What each child of an OR adds to it: its heap and hot entries, and the
+ * container it stands on (hotc).  lion_batch_end() sizes a batch's union by
+ * the same amount, so that a batch that fits is never planned wide.
+ */
+#define LION_OR_CHILD_OVERHEAD \
+	(2 * sizeof(LionOrHeapEnt) + sizeof(LionContainer *))
+
 /* What an OR or AND node of nargs children adds to them. */
 static inline Size
 lion_node_overhead(LionKeyNodeKind kind, int nargs)
@@ -3936,8 +3944,7 @@ lion_node_overhead(LionKeyNodeKind kind, int nargs)
 		mem += (Size) nargs * sizeof(int);	/* order */
 	if (kind == LION_KN_OR)
 	{
-		mem += 2 * (Size) nargs * sizeof(LionOrHeapEnt);	/* heap, hot */
-		mem += (Size) nargs * sizeof(LionContainer *);	/* hotc */
+		mem += (Size) nargs * LION_OR_CHILD_OVERHEAD;	/* heap, hot, hotc */
 		if (nargs > 2)
 			mem += lion_alloc_size(LION_BITSET_BYTES);	/* bits */
 	}
@@ -7594,7 +7601,7 @@ lion_batch_end(const LionCountSource *src, int start,
 			   const LionOpenBudget *budget)
 {
 	Size		mem = lion_node_overhead(LION_KN_OR, 3) -
-		3 * 2 * sizeof(LionOrHeapEnt);
+		3 * LION_OR_CHILD_OVERHEAD;
 	int			pins = 0;
 	int			n = 0;
 	int			end;
@@ -7607,7 +7614,7 @@ lion_batch_end(const LionCountSource *src, int start,
 		if (!src->sets[end].found)
 			continue;
 		lion_leaf_cost(&src->sets[end], false, &m, &p);
-		m += 2 * sizeof(LionOrHeapEnt);
+		m += LION_OR_CHILD_OVERHEAD;
 		if (n >= LION_BATCH_MIN_SETS &&
 			(mem + m > budget->mem || pins + p > budget->pins))
 			break;
