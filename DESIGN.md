@@ -2235,6 +2235,8 @@ probed pages):
 | `LION_PROBE_COST` | 40 `cpu_operator_cost` | 210 ns | a seek of another source's posting tree to a driver key, and the container found; the leaves the seeks cross fit at 0.7 us a page and are charged as I/O (`lion_probed_pages()`) |
 | `LION_MEMORY_PROBE_COST` | 30 `cpu_operator_cost` | 100 to 200 ns | the same into a set copied into memory (a GROUP BY's WHERE sets after their first use, §9; a two-column GROUP BY's outer set); 20,000 groups of 219 containers and 1,000 of 38 |
 | `LION_AND_MEMBER_COST` | 0.8 `cpu_operator_cost` | 4 to 5 ns | a member of the running intersection ANDed with what a probe found |
+| `LION_UNION_KEY_COST` (2026-09-28) | 30 `cpu_operator_cost` | 150 ns | the union of a list's containers built at a key: a bitset image cleared and counted (§29.11, "Unions probed") |
+| `LION_UNION_MEMBER_COST` (2026-09-28) | 0.25 `cpu_operator_cost` | 1.2 to 1.5 ns | a member set in that image, or of the intersection tested against it |
 
 The k'th source is sought only at the keys the first k - 1 left a row at, `1 - exp(-lambda)` of
 them (§25's early exit, which was never priced). Median residual 27%. Re-costing the 35 counts
@@ -3420,7 +3422,19 @@ twice the reference (1,000 to 1,260 units a millisecond, against 500). Both erro
 of refusing the node, and no plan the regression suite pins moved. Refitting `LION_AND_MEMBER_COST`
 (4 to 5 ns a member when it was fitted; about a nanosecond now for the dense sides) and
 `LION_PROBE_COST` on §31's counts is the open item. `lion_merge_ops()` still prices a union by
-`LION_OR_BITSET_MIN` alone.
+`LION_OR_BITSET_MIN` alone. *(Refitted 2026-09-28, §29.11, "Unions probed", on 77 counts of three
+synthetic tables of the same build, §31's sets still not at hand. What was out of the band was the
+unions: an AND's IN lists, `&&` and ORs were charged every container of their sets and
+`lion_merge_ops()`'s `members x log2(k)` comparisons at 5 ns each, a median of 1,785 units a
+millisecond and up to 7,349, where a raw union costs a nanosecond or so a member - and once they
+were probed, less. They are priced as the leapfrog meets them now (`lion_merge_cpu_cost_sets()`),
+at 688 units a millisecond (462 to 1,213 for nine in ten). The AND's own terms held: the 22 counts
+of sets alone ran at 773 units a millisecond, the page reads priced as I/O by the convention of §10
+("The reference") making up most of what is above 500, and their CPU as the constants say it - so
+`LION_PROBE_COST` and `LION_AND_MEMBER_COST` stand. What they misprice is the AND of two dense RUN
+containers of hundreds of runs each (`run_and_run()`'s merge, 7 ns a run), which `LION_MEMBER_CAP`
+charges as a thousand members: 335 to 375 units a millisecond, on the side of taking the node, whose
+competitor for such a count is a sequential scan thirty times its price.)*
 
 ## 16. Partitioned tables (v1, implemented)
 
@@ -3982,6 +3996,12 @@ of all the sets", which is what every pre-§17 caller gets.
     AND    winds the children forward until they all stand at one container key; the container is
            the AND of theirs, and a container key whose intersection comes out empty is skipped
            here rather than handed up
+
+Since 2026-09-28 an OR that an AND meets - a source of the count's merge, a child of an AND node -
+is lazy: it stands at the key with its children's containers and builds their union only when the
+leapfrog asks for it, which it does for the driver and where building it is the cheaper way to AND
+it; elsewhere the running intersection's members are looked up in the children's containers
+(§29.11, "Unions probed").
 
 The §9 pin rule survives both operators: a leaf is only advanced by `lion_ecursor_next()`, and the
 merge only calls that from `lion_count_container()`, after the visibility map has been consulted - so
@@ -5620,7 +5640,9 @@ Operations.
   **Since 2026-09-28 an AND node is the same leapfrog** (`lion_leapfrog()`, one function for both):
   it used to step its FIRST child, seek every other one to it at every key and AND all of their
   containers, and it is what a lion index scan's AND of its quals' sets is (§29.11, "The AND, as
-  the count makes it").
+  the count makes it").  And a union it meets is built at a key only where that is the cheaper
+  way to AND it; elsewhere the intersection's members are looked up in the union's containers
+  (§29.11, "Unions probed").
 - **The §9 pin discipline is unchanged.** A leaf stays pinned until the container taken from it has
   passed the visibility-map check, and a seek releases the previous leaf's pin only at that same
   point: the two callers of `seek` are the merge's "this container key is missing from some set"
@@ -11678,12 +11700,193 @@ shared, the runs spread by 20 to 40%); no price changed, so no plan did:
   same AND before its walk (§30.4); the six-clause rows stay the plain scan, a tie with the bitmap
   scan. A parallel bitmap heap scan's bitmap is still built by one process, as core builds it, and
   that process's AND is the table's bitmap index side.
-- **Not done.** The lists' unions are the larger part of both executors' time on such filters: each
-  key's union of a list's containers is built whole, and optimized, before the running
-  intersection, a few rows or none, is ANDed with it. Probing the intersection's members in each set
-  of the list instead would take most of that out of the scan and the count alike, but it needs the
-  evaluator's OR node to build its union only when it is asked for, and the merge's constants were
-  fitted on the unions as they are.
+- **The unions** (this item said "not done" until 2026-09-28). The lists' unions were the larger
+  part of both executors' time on such filters: each key's union of a list's containers was built
+  whole, and optimized, before the running intersection, a few rows or none, was ANDed with it.
+  The evaluator's OR node now builds its union only when it is asked for, the intersection's members
+  are looked up in each set of the list where that is cheaper, and the merge's constants were
+  refitted on the unions as they are met: "Unions probed", below.
+
+**Unions probed** (2026-09-28, `lion_leapfrog()`, `lion_or_probe_pays()`,
+`lion_container_and_union_raw()`, `lion_merge_cpu_cost_sets()`). A filter of several IN lists - or a
+multi-key `&&`, or an OR of equalities, which is its IN list - beside other clauses is an AND some of
+whose sources are unions of posting sets. The leapfrog met every such union with the union built:
+seeking it to a key built it there in full - every member's container ORed into a bitset image, or
+folded pairwise - and only then was the running intersection ANDed with it. On a synthetic table
+(8M rows in random order, 70 to a heap page, 1,786 container keys; one lion index over a few dense
+columns, the columns of short IN lists and an `int[]` column; the filter: three dense clauses, four
+IN lists of two to four values and a three-key `&&`, eighteen posting sets, 4,573 rows),
+`LionCount` took 28 ms and the plain and bitmap scans 89 and 92. The profiles (`perf`, the backend
+alone, each path forced and run for eight seconds): the plain scan spent 38% in
+`lion_container_optimize()` and 34% in `array_union()` - the pairwise fold of each list's
+containers, optimized at each step - and the count 19% in `container_or_bitset()`, the images of
+the unions, and 36% ANDing what came out of them: an image of a hundred-odd members is a BITSET, and
+a BITSET ANDed with a dense RUN set fills the image and clears each gap between its runs
+(`bits_clear_range()` 26%). Where the intersection has a few rows at a key, all of that is spent to
+keep those few.
+
+- **The choice, per key.** An OR that an AND meets - a positive source of the count's merge, a
+  child of an AND node - is lazy (`LionExprCursor.lazy`): it seeks its children and stands at the
+  key with the ones that have a container there, as before, and does not build their union until
+  `lion_ecursor_container()` asks. The leapfrog asks for the driver's, since the intersection
+  starts from it, and for any other only where `lion_or_probe_pays()` finds building it the
+  cheaper way; elsewhere `lion_or_probe()` looks the intersection's members up in the children's
+  containers, a member once found not again, and keeps the ones found. Both give acc ∩ (c1 ∪ ... ∪
+  ck), the same members. The estimate reads the containers' headers: probing costs acc's members
+  a child - a bit test in a BITSET (2 ns), a galloping search of an ARRAY of s members (1 +
+  log2(1 + s/acc) steps of 3 ns), a search or a merge of a RUN's runs - and acc's extraction when
+  it is not an ARRAY; building costs the image's clear and count (150 ns) and each member (1 ns for
+  an ARRAY's, 170 ns for a BITSET, 2 ns a run), or for ARRAYs of 128 members together or fewer
+  the fold, and acc's AND with it. It is taken as though every member of acc were looked up in
+  every child, which errs towards the union, and an intersection of more members than an ARRAY
+  holds is never probed. The numbers are a harness's beside the container library (the gallop's
+  2 ns there is 3 in a count, whose containers are not all in the first-level cache); the estimate
+  is integer arithmetic with a fixed-point logarithm, because in floating point it took 2 to 3% of
+  a count that builds its unions anyway, and rounded to whole steps it probed 120 members against
+  two ARRAYs of 90 - one step each, where they take 1.8 - and the count went from 2.8 ms to 4.2.
+- **The primitive.** `lion_container_and_union_raw(a, b[], n, dest)` extracts a's members - an
+  ARRAY's in place - keeps the positions not found yet in a list that each pass over one b
+  shortens, marks the ones found in a bitmap, and writes the found members, in a's order, as an
+  ARRAY. A position is written back and kept by adding a comparison rather than branching on it.
+  Against an ARRAY it gallops (a merge of the two sorted sides is a chain of dependent loads and
+  never won: 16 values against 450 members 0.19 us galloped against 1.6 merged, 256 against 97
+  0.84 against 1.6); against a RUN it searches the runs for fewer values than one in eight runs,
+  else merges with them. Damaged containers are handled as the rest of the library handles them: a
+  well-formed ARRAY comes out whatever a was, no index leaves a or b, and an a whose payload holds
+  more than an ARRAY's worth is taken as empty (lion_container.c, "untrusted containers").
+  `container_test.c` checks it against the reference over a's of every representation and lists
+  of every shape, disjoint, overlapping, holding all of a or none, empty, and damaged on either
+  side.
+- **An AND node's intermediates are raw.** A scan's AND node used to make its intersection with the
+  optimizing `lion_container_and()` - every step counted its runs and picked a representation - and
+  its OR children built their unions the same way. The children of an AND node are raw now (their
+  unions `lion_or_hot_raw()`'s, as a count's), the leapfrog's steps are `lion_container_and_raw()`,
+  and the node optimizes what it hands out, once, where a stream's caller keeps it
+  (`LionExprCursor.raw`, `lion_ecursor_init_ex()`); the output is the same container, byte for
+  byte, since the smallest representation depends only on the members. An OR at the top of a
+  stream (one list alone) builds its union as before.
+- **§9.** The argument on `lion_leapfrog()` holds unchanged, and a probed union adds nothing to it:
+  its children were sought to the key exactly as for a union built - `lion_ecursor_seek()` pops
+  every child below the key off the OR's heap and seeks it, under the same rule that a cursor sought
+  past a key lets its page go only where nothing of that key is counted - the ones standing at the
+  key keep the pins their containers came with until the OR moves past it, and what the probe
+  keeps is a subset of the running intersection, every member of which lies in a container that
+  the cursors before it stand on with their pins. Nothing is probed that is not a child standing
+  at the key, and no child is left below it.
+- **What shows it.** `LionCount`'s `EXPLAIN ANALYZE` prints `Unions Built` and `Unions Probed`
+  where there was a union to meet: the container keys at which a union of two containers or more
+  was built, and those at which the intersection was looked up in the containers instead.
+  `pg_lion.enable_union_probe` (on) is a testing knob: off, every union is built, as before, and
+  the answers are the same.
+
+Measured on that table and on the same rows clustered by the hidden group, PostgreSQL 18.6's
+packaged release build, a cluster of 2.5 GB of shared buffers holding both tables and their indexes,
+`random_page_cost` 1.1, 8 GB of `effective_cache_size`, serial plans; the old and the new library
+alternated, installed and the server restarted each time, two rounds each; each path forced
+(`LionCount` with the scans off, the plain and the bitmap scan with the pushdown and the other scan
+off), and each figure the lower of the two rounds' medians of 3 to 9 warm runs (the machine was
+shared, and a query's runs spread by 10 to 20% from one round to the next). The U rows are filters
+whose unions should still be built: dense sets before a list of dense values, or lists of dense
+values alone. The plan chosen with nothing disabled was `LionCount` for every one, before and
+after, and at a `random_page_cost` of 4 as well.
+
+| query (t_r: random order; t_c: clustered) | rows | `LionCount`: cost / ms, before -> after | plain + Aggregate | bitmap + Aggregate | unions built / probed |
+|---|---|---|---|---|---|
+| W1 `b1 AND b2 AND d = 0 AND k1 IN (3) AND k2 IN (2) AND k3 IN (4) AND k4 IN (3) AND arr && (3)` | 4,573 | 31,675 / 28.0 -> 9,285 / 16.8 | 34,765 / 89.0 -> 12,375 / 20.5 | 34,751 / 92.3 -> 12,360 / 19.9 | 5,371 / 3,558 |
+| W2 the same `AND e = v` | 1,496 | 25,730 / 14.3 -> 2,359 / 9.9 | 26,624 / 75.7 -> 3,253 / 11.4 | 26,620 / 70.8 -> 3,249 / 12.2 | 477 / 7,864 |
+| S1 `e = v AND k1 IN (3) AND k3 IN (3)` | 8,600 | 7,149 / 4.2 -> 1,570 / 3.3 | 15,621 / 22.1 -> 10,042 / 6.1 | 15,697 / 27.7 -> 10,118 / 9.4 | 477 / 3,088 |
+| S2 `k3 = v AND k4 IN (4) AND b1` | 180,205 | 25,935 / 10.0 -> 6,948 / 11.3 | 128,657 / 134.5 -> 109,670 / 93.1 | 129,214 / 172.8 -> 110,227 / 136.9 | 1,786 / 0 |
+| S3 `arr && (3) AND b1 AND b2 AND k4 IN (2)` | 157,719 | 12,773 / 18.0 -> 8,107 / 18.6 | 100,673 / 168.5 -> 96,007 / 140.7 | 99,562 / 156.3 -> 94,897 / 137.2 | 3,572 / 0 |
+| S4 `k1 IN (3) AND k2 IN (2)` | 54,437 | 3,020 / 2.9 -> 1,452 / 3.0 | 49,067 / 45.6 -> 47,499 / 44.8 | 49,289 / 60.5 -> 47,721 / 57.8 | 3,572 / 0 |
+| S5 `e = v AND arr && (5)` | 6,482 | 1,050 / 2.8 -> 1,892 / 2.8 | 3,478 / 28.4 -> 4,320 / 7.7 | 3,478 / 32.9 -> 4,320 / 8.6 | 210 / 1,576 |
+| S6 `e = v AND b1 AND d = 0` (no union) | 12,276 | 3,664 / 1.6 -> 3,664 / 1.5 | 16,313 / 6.8 -> 16,313 / 8.1 | 16,368 / 16.4 -> 16,368 / 12.6 | |
+| U1 `d = 0 AND b1 AND k4 IN (7)` | 5,356,870 | 65,136 / 22.4 -> 16,315 / 22.3 | 326,957 / 741 -> 278,136 / 615 | 334,799 / 748 -> 285,978 / 636 | 1,786 / 0 |
+| U2 `k4 IN (2) AND k3 IN (6)` | 599,393 | 28,162 / 8.3 -> 7,072 / 8.2 | 158,044 / 248.0 -> 136,954 / 186.8 | 159,187 / 299.7 -> 138,097 / 230.6 | 3,572 / 0 |
+| U3 `k3 IN (2) AND k4 IN (5) AND b1` | 393,201 | 39,522 / 15.7 -> 9,730 / 15.9 | 164,845 / 201.7 -> 135,053 / 159.4 | 165,444 / 254.3 -> 135,652 / 212.6 | 3,572 / 0 |
+| C1 = W1 over t_c | 4,573 | 26,674 / 3.8 -> 3,946 / 3.7 | 26,676 / 11.8 -> 3,948 / 5.1 | 26,676 / 11.4 -> 3,948 / 4.5 | 3,642 / 621 |
+| C2 = S1 over t_c | 8,600 | 6,955 / 1.5 -> 969 / 1.2 | 6,957 / 4.0 -> 971 / 2.0 | 6,957 / 4.2 -> 971 / 2.1 | 11 / 1,555 |
+| C3 = S3 over t_c | 157,719 | 11,560 / 16.4 -> 6,977 / 17.6 | 97,942 / 101.1 -> 93,359 / 98.7 | 96,885 / 83.8 -> 92,302 / 81.6 | |
+| C4 = U1 over t_c | 5,356,870 | 64,108 / 20.2 -> 15,009 / 19.8 | 325,425 / 652 -> 276,326 / 560 | 333,252 / 728 -> 284,153 / 614 | |
+| C5 = U2 over t_c | 599,393 | 27,994 / 6.9 -> 6,799 / 6.9 | 158,058 / 163.4 -> 136,863 / 117.0 | 159,202 / 180.4 -> 138,006 / 138.4 | |
+
+(`k IN (n)` is a list of n values and `arr && (n)` an overlap of n keys; `e`, `k1` and `k2` of 500,
+100 and 50 values and `k3` and `k4` of 20 and 8 follow the hidden group eight times in ten, and `b1`,
+`b2` and `d = 0` are true on 80 to 90% of the rows at random.) Where the intersection is small by the
+time a list is met, the count is faster by up to 40% (W1 40%, W2 31%, S1 and C2 20%; S5, whose
+five keys' images cost about what probing them does, and C1, which probes a key in seven, even) and
+the scans by two to six and a half times:
+they gained the probing and, where no list is probed, the raw intersection (S2, S3, U1 to U3: 12 to
+31% off paths that fetch 150,000 to 5.4 million rows). Where every union is built the count is where
+it was:
+interleaved in one session, S2, S3, C3 and U2 ran within the machine's noise of the old library
+(S2 9.6 to 11.3 ms against 10.1 to 12.3, S3 19.1 to 27.8 against 18.6 to 23.0, U2 7.8 to 8.4
+against 7.7 to 8.2), and S4, whose work is two small unions a key and nothing else, 5 to 7% slower
+(3.0 ms against 2.8), which is what the laziness costs a key where there is nothing else to spend
+on. The profiles after: the plain scan of W1 spends 0.1% in `lion_container_optimize()`, 8%
+building the unions it builds and 23% probing (`array_gallop()` 13%, the primitive 6%, the
+extraction of an image's members 4%), 31% seeking and 11% on the heap; the count 10% building, 23%
+probing and 45% in its seeks - the page copies of `lion_cursor_take_page()` 16%, buffer lookups
+10% - which is where its time is now.
+
+**The price** (the AND's, one for a count and a scan: "One price for the AND of sets", above). The
+model charged a union source of an AND every container of its sets read (`LION_CONTAINER_COST` and
+`LION_MEMBER_COST` each) and `lion_merge_ops()`'s k-way merge - a sift per container and
+`members x log2(k)` comparisons at a `cpu_operator_cost`, 5 ns, each - whether it drove the AND or
+was sought at a few of the driver's keys; and it took a multi-key `&&` for one set, though the
+executor meets it as the union of its keys. That part had never been fitted: §31's fit was of
+single sets, pairs, triples and a quadruple. `lion_merge_cpu_cost_sets()` prices each union as the
+leapfrog meets it, from its sets and their containers (`nsets`, `setcontainers`, `setpages`: a
+list's values, a `&&`'s keys where its extraction ORs them, `lion_multikey_cost_mode_ex()`, an OR's
+leaves):
+
+- one that DRIVES reads its sets' containers (`LION_CONTAINER_COST` each) and builds its union at
+  each of its keys, `LION_UNION_KEY_COST` a key and `LION_UNION_MEMBER_COST` a member;
+- one that is SOUGHT seeks its sets at the keys it is sought at, no more of them than they have
+  containers - a probe each (`LION_PROBE_COST`) for a set on posting pages of its own, a container
+  read for an INLINE one, whose seek steps over the items of a payload in memory - and pays at each
+  key the cheaper of the union built and ANDed (`LION_UNION_KEY_COST`, and `LION_UNION_MEMBER_COST`
+  each of its members and of the intersection's) and the intersection's members looked up in its
+  sets' containers (`LION_AND_MEMBER_COST` a member a container), as the executor chooses.
+
+`lion_cost_set_and()` (the scans) and an ungrouped count's merge use it in place of the old terms;
+a grouped count and the FK-side join rebuild their unions per group or per key and price them as
+they did (`LION_UNION_SET_COST`, `lion_merge_ops()`). The two new constants are settings,
+`pg_lion.union_key_cost` (30 `cpu_operator_cost`, 150 ns) and `pg_lion.union_member_cost` (0.25,
+1.25 ns). They and the seeks' prices come from series that vary one thing each over the 8M-row
+table - a list of 2 to 16 values driving an AND; one sought beside a set of a few rows a key (2 to
+32 values: probed) and beside one of a few hundred (2 to 12: built); a `&&` of 3 and 6 keys -
+where a set of a list costs 110 to 400 ns a key, about 130 of it the seek, a member of a union 1.2 to
+1.5 ns and a member looked up 1.5 to 3.6. A seek priced at `LION_PROBE_COST` for every set made
+`inlist.sql`'s `k = ANY (1000 values) AND lo = 1`, whose sets are INLINE, cost 4,517 for 2.45 ms
+and lose to a bitmap heap scan of `lo = 1` and a filter (3,688, 6.1 ms); priced as a container read
+for an INLINE set it costs 1,479 and is the plan again.
+
+Over 77 counts of the three tables of these measurements (the two above and 3M narrower rows of a
+second shape) - sets alone, pairs to quadruples, lists driving and sought, `&&`, ORs across columns
+and the series - the model now prices the counts at a median of 711 units a millisecond, nine in
+ten between 399 and 1,237 (a standard deviation of 0.45 in the logarithm); it priced them at 1,289,
+412 to 4,098 (0.81). The 55 with a union moved from a median of 1,785 (up to 7,349) to 688 (462 to
+1,213); the 22 of sets alone did not move, at 773. What is above §10's 500 is mostly their pages,
+priced as I/O by §10's convention where these were warm; the plain and the bitmap scans of 54 of
+the same filters, whose heap core prices, ran at medians of 1,011 and 795 units a millisecond, and
+their AND is the count's, priced alike - one price, now for the same work. What the model still
+misprices, and was left: the AND of two dense RUN containers of hundreds of runs each (335 to 375
+units a millisecond: `LION_MEMBER_CAP` charges a thousand members where `run_and_run()` steps
+through every run of both); a wide correlated filter whose later sources the leapfrog seeks at
+nearly every key where the model, the intersection probe's factor and all, has them sought at a few
+(W2, 239); and counts over the narrower rows whose ARRAYs of 1,500 members are ANDed through an
+image of the larger side (269 to 332). The AND's existing constants were confirmed by the same
+data, `LION_PROBE_COST` and `LION_AND_MEMBER_COST` among them, and stand.
+
+`test/sql/unionprobe.sql` checks the answers of both ways against a sequential scan, through the
+count, the plain and the bitmap scan with probing on and off, over fourteen filters that probe,
+build, or do both at different keys (a column dense on the first fifth of the heap and sparse on
+the rest), with a NULL in a list and an `IS NULL`, an empty list, lists naming no entry, a one-entry
+list, two lists on one column, `&&`, `@>` and an OR across columns; through a cursor fetching one
+row at a time with other scans of the index between, and parameterized inner scans rescanned per
+outer row, plain and bitmap; on a heap made dirty by updates and deletes, and after VACUUM. It shows
+the count's counters making each choice, and every union built with the knob off. `costgucs.out`
+lists the two new settings.
 
 **A WALK is priced as a heap pass per entry** (2026-09-27). A range alone - one column's entries
 in key order, each entry's TIDs in heap order (§29.3) - got the column's correlation, as a scan not in
