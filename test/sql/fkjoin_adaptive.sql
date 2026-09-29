@@ -232,20 +232,20 @@ RESET work_mem;
 RESET hash_mem_multiplier;
 
 -- 6. Rescans: the node below a correlated subquery, its dimension filtered
--- by the outer row, starts its account again at each run - four runs, four
--- switches.
+-- by the outer row, starts its account again at each run - two runs of
+-- twenty heavy keys each, two switches.
 SELECT (n->>'Actual Loops')::int AS loops,
 	   (n->>'Fact Filter Switches')::int AS switches
 FROM lion_aj_node($$
 	SELECT g, (SELECT count(*) FROM lion_adf f JOIN lion_add d ON d.pk = f.fk
-			   WHERE d.h1 AND d.h2 AND d.attr = g
+			   WHERE d.h1 AND d.h2 AND d.attr / 2 = g
 			   AND f.doc @@ '(da | db | dc) & (dd | de)')
-	FROM generate_series(0, 3) g$$) n;
+	FROM generate_series(0, 1) g$$) n;
 SELECT lion_aj($$
 	SELECT g, (SELECT count(*) FROM lion_adf f JOIN lion_add d ON d.pk = f.fk
-			   WHERE d.h1 AND d.h2 AND d.attr = g
+			   WHERE d.h1 AND d.h2 AND d.attr / 2 = g
 			   AND f.doc @@ '(da | db | dc) & (dd | de)')
-	FROM generate_series(0, 3) g$$);
+	FROM generate_series(0, 1) g$$);
 
 -- 7. A partitioned fact: each leaf keeps its own account and switches on
 -- its own, and its copy serves its later turns.
