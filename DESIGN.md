@@ -12617,12 +12617,13 @@ replaces native ordered lion scans (§29.8, `amcanorder` on 18+), which stay def
 
 - **The relation.** A plain base relation (`RELOPT_BASEREL`, `RTE_RELATION`, relkind table or
   materialized view, not an inheritance parent, no TABLESAMPLE) of the heap table AM
-  (`lion_table_am_supported()`, §2), with at least one lion index and one ordered index. Declined:
+  (`lion_table_am_supported()`, §2), or since 2026-09-29 a leaf partition (§30.11), with at least
+  one lion index and one ordered index - or an ordered lion column (§30.11). Declined:
   a relation with security quals - RLS policies or a security-barrier view, i.e. an RTE with
   `securityQuals` or any restriction clause with `security_level > 0` - exactly as LionCount
   declines them (§9, "Row-level security"): the ordinary plan applies them with core's
-  leakproofness rules. The target relation of an UPDATE, DELETE or MERGE is declined, and so are
-  partitioned tables and their partitions, in v1 (§30.8).
+  leakproofness rules. The target relation of an UPDATE, DELETE or MERGE is declined, and so,
+  until 2026-09-29, were partitioned tables and their partitions (§30.8, §30.11).
 - **The WHERE.** The relation's restriction clauses, an implicit AND. Some of them are answered by
   lion indexes and the rest stay a heap-side filter. WHICH of them lion answers, and how, is not
   decided here but by core's own index matching: every shape the bitmap path supports - `=`, IN /
@@ -12635,7 +12636,8 @@ replaces native ordered lion scans (§29.8, `amcanorder` on 18+), which stay def
   NULLS placement, multi-column prefixes, expression indexes, opclass orderings, the btree's own
   index quals) is never re-implemented. An index scanned with ORDER BY operators (KNN) is not an
   ordered path in this sense and is skipped, and a lion index has no order (§29.1). In core this
-  means a btree.
+  means a btree. Since 2026-09-29 the order may also be a lion index's own ordered scalar column,
+  walked by the node itself, for the ORDER BY's first pathkey (§30.11).
 - **LIMIT** is optional: the node is priced like any path, with a start-up and a total cost
   (§30.3), and core's LIMIT and sort planning choose. Without a LIMIT it can still beat a Sort for a
   selective result, and loses for a large one; the cost decides.
@@ -12959,6 +12961,8 @@ untaken branch) built no set and prints neither of the last two.
   ordered paths, and the hook also runs for each partition (`RELOPT_OTHER_MEMBER_REL`), so
   offering the path there might just work; but run-time pruning, a partition's translated security
   quals and the pathkeys of child rels are a surface of their own to test. The natural v2.
+  *(Done 2026-09-29, §30.11: each leaf partition is scanned like a table, under core's Append or
+  MergeAppend, with its pruning.)*
 - **The target relation of an UPDATE, DELETE or MERGE**, which a merge join's ordered input could
   otherwise make the node scan: its row identity and EvalPlanQual rechecks would work as they do
   for `SELECT ... FOR UPDATE` (tested), but nothing needs it and nothing tests it.
@@ -13056,6 +13060,253 @@ The first is still chosen by the planner (it cannot see the correlation) and now
 80,000 entries, fetching and sorting the 2,500 members: 3.5x the best plan instead of 50x. The
 second is not chosen here; forced, it switches after 80,000 entries and fetches 2,500 members that
 all fail `g = 1`.
+
+### 30.11 A lion column's own order, and partitions (2026-09-29)
+
+A benchmark's feed page is the latest few fact rows whose fk is in a filtered dimension:
+
+    SELECT f.fk, f.kind, f.ts, f.name FROM fact f
+    WHERE f.kind = 'a' AND f.tags && ARRAY[<three common tags>] AND f.ts >= now() - interval '...'
+      AND f.fk IN (SELECT d.pk FROM dim d WHERE <dimension filters>)
+    ORDER BY f.ts DESC LIMIT 100;
+
+`fact` is LIST-partitioned by kind, and the kind prunes it to one leaf; the leaf has a lion index
+over `(tags, ts, fk)` with summaries and btrees on `(fk, ts, ...)`, none of which leads with `ts`;
+the dimension has a unique key and a covering btree for its filter. Core's plan is a nested loop
+from the dimension's kept keys into the leaf's `(fk, ts)` btree that fetches every matching fact
+row and keeps the latest hundred in a top-N sort. The fast plan walks the leaf in `ts DESC` order
+through the filters, tests each row against the dimension, and stops at the hundredth.
+
+**Why the planner made no ordered plan.** No path of the fact had the order `ts DESC`, so core had
+nothing to put under a nested loop and a Limit: its only order for `ts` was a Sort.
+
+1. `LionOrdered` took its order from a btree only (§30.2), and the fact had none that orders by
+   `ts`: the column is a key column of the lion index and nothing else. Lion's directory holds each
+   ordered scalar column's keys in the column's order (§21), but nothing read them in that order
+   for a query - native ordered scans were deferred (§29.8).
+2. `LionOrdered` declined partitions (§30.8), and the relation the kind prunes to is a leaf
+   partition, an `RELOPT_OTHER_MEMBER_REL`.
+
+Core's LIMIT costing over the semi join was not the obstacle. Once the ordered path exists, core's
+own composition - `Limit -> Nested Loop (outer: the ordered fact, inner: the dimension probed by its
+unique key)` - is what it builds (the semi join over a unique key is an inner join to it,
+`reduce_unique_semijoins()`), and it wins at core's own estimates, which are the underestimated
+ones: the Limit takes `100 / estimated rows` of the nested loop's run cost, and the walk's share of
+that is still far below what the nested loop from the dimension costs (the measurements below).
+The underestimate makes the ordered plan look EXPENSIVE, not cheap - fewer join rows means a larger
+share of the walk per hundred rows - but not expensive enough: on the data below the Limit over the
+nested loop is priced at 8.4 + 8,035,000 x 100 / (estimated join rows), against 368,351 for the
+nested loop from the dimension and its sort, so it loses only below about 2,200 estimated rows - a
+320-fold underestimate of the 707,196 rows there are, where core's was 14-fold there and the
+benchmark's 84-fold. The hashed variant - hash the kept keys once, stream the ordered fact
+through them - is not a plan core can make: a hash join claims no order, since its batches would
+reorder the outer side. So the change is the ordered path, and nothing about the join.
+
+**The walk** (`lion_order_walk_begin()`, `_next()`, `_end()`, lion_scan.c). The TIDs of one ordered
+scalar key column in its order, ascending or descending, bounded by the column's range keys:
+
+- **Ascending** it is the bitmap scan's leaf walk (§28): the leaf the tightest lower bound lands on
+  (`lion_range_first_leaf()`), then the right links, each leaf copied under a share lock and let go,
+  and the entries the range selects handed out until the first past an upper bound.
+- **Descending** it starts on the leaf the tightest upper bound lands on (`lion_range_last_leaf()`,
+  new: the first entry not below the bound is there, so every entry the range selects is on that
+  leaf or to its left), or where the column's VALUE entries end (`lion_dir_value_end()`), hands the
+  leaf's entries out from its last to its first, passing over those above an upper bound, and goes
+  to the LEFT sibling: the page whose right link is this leaf, found from the left link by walking
+  right (`lion_dir_step_left()`, which the endpoint probe of §28 uses), since the page the link
+  names may have split since. It ends at the first entry below a lower bound. A leaf with a left
+  link whose sibling cannot be found is reported as corruption: nothing but damage makes the
+  sibling unreachable, and a walk that ended there would return too few rows.
+- Either way it keeps to the column's VALUE entries (§24: an earlier column's entries and the
+  column's reserved ones sort before them, its summaries of §32 and a later column's after them)
+  and does not use summaries: it needs keys. The NULL entry is walked before the values or after
+  them, as the ORDER BY puts NULLs, or not at all when a clause on the column is strict (a range
+  bound, `IS NOT NULL`). An entry's TIDs come in heap order - rows with equal keys in no order the
+  pathkeys promise anything about - from its INLINE payload or its posting tree, a leaf at a time
+  from the leftmost, each leaf copied and let go (`lion_emit_chain()`'s walk); a posting leaf that
+  no longer belongs to the set ends it, as there.
+- Between two calls it holds no pin and no lock: what it hands out is a heap TID for the caller to
+  look up under an MVCC snapshot (§29.5), and the node refuses any other (§30.4).
+
+*Why it misses no row and returns none twice.* A row visible to the snapshot was inserted by a
+transaction that committed before the snapshot was taken, after writing the row's key into every
+index; the walk begins after the snapshot. Its entry is removed only once VACUUM finds all its rows
+dead to every snapshot, this one included. Directory splits move entries only to a new page right
+of the one they split, and no directory page is unlinked (§21): an ascending walk that follows the
+right links of its copies meets every entry that existed when it began, and a descending one does
+too - when the left neighbour of a leaf it has copied splits, the neighbour's upper half goes to the
+new page, which is the page whose right link names that leaf, and so the one the walk reads next;
+when the leaf it holds a copy of splits, the half that moves is the upper one, which the copy holds
+and a descending walk has handed out or is about to. Entries inserted after the walk began hold
+rows no older snapshot sees. Each
+row version is under exactly one key of the column - a HOT chain's versions share the key and the
+root TID (§30.5), and an update of the column is not HOT and puts the new version's TID under its
+new key - so a TID the walk meets twice is a slot VACUUM freed and an insert took after the walk
+had passed it, and the row there is invisible to the snapshot, as §30.4's recycled TID is; with a
+set, §30.4's record of the members met keeps the early stop from counting it twice.
+
+**Planner** (`lo_lion_walks()`, lion_ordered.c). For each ordered scalar key column of a lion index
+of the relation - a plain column of the table, under the column's own collation, whose key type is
+the column's and whose comparison is the type's default btree comparison (the rule by which a GROUP
+BY walk claims its order, §21 "Planner"): the directory is then in the order of that btree's `<` -
+the ascending pathkey is looked up among the query's equivalence classes
+(`build_expression_pathkey()`, which for a partition finds its member of the parent's class). When
+it is the first of the ORDER BY's pathkeys, the walk gives that pathkey, whatever its direction and
+NULLS placement. A partial index needs its predicate implied
+(`predOK`), as core asks of an ordered index path. Only the ORDER BY: a GROUP BY, a DISTINCT or a
+merge join over the column wants every row, which the count pushdown counts from the same entries,
+and a hash or a Sort takes from the heap in its order where the walk would fetch them in key order.
+(The first version offered the walk for the query's first pathkey whatever it was for, and the plans
+of twelve regression tests' GROUP BY and DISTINCT queries changed - most of them forced ones, where
+the walk under a sorted aggregate replaced the count pushdown.)
+
+The restriction clauses the walk answers exactly bound it: a range comparison of the column - `<`,
+`<=`, `>=`, `>` of the column's operator family, either way round - with a value that does not
+depend on the row (a Const, a Param, a stable expression such as `now() - interval '...'`: evaluated
+when the walk starts, as an Index Scan's run-time keys are; no subplan), and `IS NOT NULL`. They
+leave the filter and are the plan's `Index Cond`. The other clauses may be a lion SET: core's lion
+accesses are built as for a btree's walk (§30.2), on a scratch copy of the relation whose lion
+`IndexOptInfo`s are copied too, with the walk's clauses taken out of the clauses they may match
+(`lo_lion_accesses()`) - a set that collected the range would read all of it, which is what the walk
+exists not to do. Or no set at all: every row the walk meets is fetched, and the clauses are the
+filter. One path per (walk, set) and one with no set, and add_path() keeps what is cheaper. The
+walk needs no restriction clause at all: `ORDER BY ts DESC LIMIT 10` over a table whose only index
+on `ts` is a lion index is a walk with nothing to filter, where it was a whole scan and a Sort.
+
+**Cost** (`lo_cost_walk()`). With `T` the relation's tuples, `s_w` the selectivity of the walk's
+clauses, `nd` the column's distinct values, and a set of selectivity `s` and index cost `C_lion`
+(§30.3):
+
+- start-up: a descent, `2 random_page_cost`, and the set's `C_lion` plus copying its answer, as
+  §30.3;
+- the walk: `W = s_w T` TIDs and `E = min(W, s_w nd)` entries; each entry
+  `range_union_entry_cost` (a small entry of a walk, §28, "Counting a walk"), each TID
+  `cpu_operator_cost`, and the directory leaves under them at `seq_page_cost` - `E` entries of a
+  key and an INLINE set of two bytes a row, and, for keys past a quarter of a page, their posting
+  pages;
+- the heap: `F = s W` rows fetched (`W` without a set), priced as `cost_index()` prices fetches, the
+  column's correlation with the heap interpolating (`lion_var_heap_correlation()`), plus
+  `cpu_tuple_cost` and the filter per row fetched and the target per row returned;
+- rows: `lion_probe_rel_rows()`, as §30.3. Core's LIMIT scaling of the run cost is the walk's
+  behaviour: it stops when the Limit stops pulling.
+
+**Executor.** The node is §30.4's with the walk in place of the btree scan: `BeginCustomScan` opens
+the lion index as the ordered index and builds its scan keys the same way, takes a relation
+predicate lock on it (the walk reads it without `index_beginscan()`, as the set does), and - on 16
+.. 19 - an index scan's heap fetch state (`table_index_fetch_begin()`), through which each TID is
+looked up as an index scan looks one up (`table_index_fetch_tuple()`: the HOT chain from its root,
+the pin on the last heap page kept between calls); on 20 `table_fetch_tid()` and the row version it
+moves to. Each start of the walk evaluates its keys, so a rescan with a new Param restarts it with
+the new bound, and the set is rebuilt only when a Param of the lion quals changed, as before. The
+walk is exact - its entries are tested with the column's own comparison - so nothing is rechecked
+for it but, after §30.4's fetch-and-sort switch, the rows that did not come through it (its
+clauses are the plan's `ordorig`, as a btree's are). Without a set there is no set to test, no early
+stop and no switch; with one, both work as §30.4 says. EXPLAIN reads
+
+    Limit
+      ->  Nested Loop
+            ->  Custom Scan (LionOrdered) on fact_a f
+                  Filter: ((tags && '{t1,t2,t3}'::text[]) AND (kind = 'a'::text))
+                  Rows Removed by Filter: 997
+                  Ordered By: fact_a_tags_ts_fk_idx (ts, backward)
+                  Index Cond: (f.ts >= (now() - '365 days'::interval))
+                  Index Entries Walked: 1367
+                  Lion Keys Walked: 1167
+                  Heap Fetches: 1367
+            ->  Index Scan using dim_pkey on dim d
+                  Index Cond: (pk = f.fk)
+                  Filter: (flag AND (lvl < 40) AND (grp = 1))
+
+`Ordered By` names the lion index and the column walked, `backward` for a descending walk, and
+`nulls first` or `nulls last` when the NULL entry is walked; `Index Cond` is the walk's clauses;
+with ANALYZE, `Index Entries Walked` counts the TIDs the walk met and `Lion Keys Walked` the entries
+they came from. `Lion Cond`, `Lion Indexes` and the set's counters appear only with a set.
+
+**Partitions.** A leaf partition (`RELOPT_OTHER_MEMBER_REL`) is now scanned like a table, a btree's
+walk and a lion column's walk alike: the node is a path of each partition, and core's Append - or a
+MergeAppend, for several - puts them together with its own pruning at plan time and run time. A
+partition of a table being updated is declined as the table is (`all_result_relids`), and a
+partition's translated security quals decline as a table's do (they carry `security_level > 0`).
+The fetch-and-sort switch sorts by the relation's own member of each pathkey's class, which for a
+partition is a child member - 18 keeps those apart from the class's members and hands them out
+through `setup_eclass_member_iterator()` - so `lo_sort_keys()` asks for the partition's; it used to
+skip child members, and the switch would have been off on every partition.
+
+**Declined, and not done.**
+
+- **The semi join inside the walk** (the dimension's kept keys as a posting-set filter of the fact,
+  or a hash of them tested per row, in the ORDER BY/LIMIT position): core's composition works, so
+  it was not built. What it would add is run-time protection. The ordered plan follows core's
+  estimate of the join: a semi join that keeps few rows where core expects many would walk the whole
+  range under the nested loop - the hazard every core plan over an ordered index scan and a LIMIT
+  has (§30.3). A node that held the dimension's keys could count, or switch to the per-key lookups
+  of §27 once the walk had cost what they would. The measured selective case below goes to core's
+  plan at core's estimate.
+- **More than the first pathkey**: a lion column orders one column; core sorts the rest
+  incrementally. **Expression columns**, multi-key columns, a column in hash order (§21), and a key
+  type other than the column's type: no order to walk, or not the query's.
+- **Summaries** are not read by the walk (it needs keys). **Parallel**: the node stays
+  `parallel_safe = false`.
+- **A btree's walk beside a range its set collects.** The lion side of a btree's walk is still
+  core's lion access over every restriction clause (§30.2), so a range on the btree's own column
+  that a lion index also matches is collected into the set - read in full at start-up - although
+  the btree's walk is bounded by it already; §30.3 only divides it out of the fetches. Leaving the
+  btree's index clauses out of the set, as a lion column's walk leaves out its own, would be the
+  same change there; no measured query needed it.
+
+**Tests.** `test/sql/orderedsemi.sql`: a fact LIST-partitioned by kind and a plain copy, each with a
+lion index over `(tags, ts, fk)` with summaries and a btree on `(fk, ts)`, ts with three rows a
+value and NULLs, NULL fks, and a dimension with a unique key and a covering btree; the plans chosen
+with nothing disabled (the feed with its semi join, over the pruned partition and the plain table;
+the feed alone; a set; a selective semi join, which keeps core's plan; two partitions under a
+MergeAppend); answers compared in order with the node off - the semi join as IN and EXISTS, LIMIT
+with OFFSET, both directions, ranges bounded on one side and two, a stable bound, NULLs first and
+last each way with no range, `IS NOT NULL`, NULL fks, a set, an empty set, two partitions and all
+of them, `FOR UPDATE`; the walk's counters and the fetch-and-sort switch after a sparse set; a
+generic plan with Params in the kind, the tags, the bound (a NULL one too) and the LIMIT; LATERAL
+subqueries rescanned with the outer value in the bound and in the set; a cursor fetched in pieces,
+and one paused after fifty rows while 6,000 new keys go into the fifty hours it walks next, both
+ways - a descending walk that took the left link of its copy of a leaf, not the page whose right
+link is the leaf, fails it; a dirty heap - ts moved past every key and to NULL and back, tags
+changed, HOT updates, deletes - before and after VACUUM, and `lion_index_verify()`; a parallel
+plan's shape and answer; a btree's walk over partitions; and the GUC and a GROUP BY, which get no
+walk. `pinbudget.out` changed: the
+subquery `SELECT k FROM lion_pin ORDER BY k LIMIT 100` that builds its list is now a walk of the
+lion index on `k`, and the plan the test prints shows it.
+
+**Measured** (2026-09-29, PostgreSQL 18, packaged build, `shared_buffers` 3 GB, `work_mem` 4 MB,
+warm cache, four cores that other work shared; medians of five runs after one, ms). A synthetic
+star of the benchmark's character: a fact of 22,000,000 rows LIST-partitioned by kind, the leaf the
+kind prunes to 20,000,000 rows (a 2.2 GB heap; the lion index over `(tags, ts, fk)` with
+summaries, 2.4 GB; the btree on `(fk, ts)`, 600 MB), `ts` at random over two years and a range of
+one, three of eleven tag values (27% of the rows); a dimension of 500,000 keys whose three filter
+columns are correlated, so that the filter keeps 200,000 keys where core expects 49,823, and whose
+kept keys hold a quarter of the fact's rows, most of the rest being on keys the dimension does not
+hold. Core estimates the semi join at 51,245 rows; it has 707,196, 14 times as many. "Before" is
+the library before this change; "node off" is this one with `pg_lion.enable_ordered_scan = off`,
+and "forced" the plan without core's Sort (`enable_sort = off`). Serial, then with two workers:
+
+| query | before: chosen plan, cost, ms | after: chosen plan, cost, ms | node off: cost, ms | forced walk: cost, ms |
+|---|---|---|---|---|
+| semi join, LIMIT 100 | nested loop from the dimension, top-N sort: 368,351, 4,672; with a Gather Merge: 155,663, 2,305 | walk under a nested loop: 15,689, 2.6; the same with workers, 1.8 | 368,351, 4,725; 155,663, 2,636 | the chosen plan |
+| semi join, LIMIT 10 | 367,499, 4,854; 155,297, 2,383 | 1,576, 0.25; 0.24 | 367,499, 4,993; 155,297, 2,697 | the chosen plan |
+| semi join, LIMIT 1000 | 369,204, 4,666; 156,122, 2,683 | 156,811, 28.8; 24.9 | 369,204, 4,739; 156,122, 2,223 | the chosen plan |
+| no semi join, LIMIT 100 | lion index scan and top-N sort: 775,383, 2,603; parallel seq scan, Gather Merge: 513,920, 3,752 | walk: 268, 0.42; 0.42 | 775,380, 2,637; 513,919, 3,434 | the chosen plan |
+| selective semi join (596 dimension keys, 79 rows), LIMIT 100 | nested loop from the dimension, sort: 8,052, 1.75; 1.79 | the same: 8,052, 1.83; 1.84 | 8,052, 1.59; 1.70 | 842,251, 21,946; 29,569 |
+
+The feed with its semi join went from 4.7 s (2.3 s with workers) to 2.6 ms: the walk met 1,367
+rows of 1,167 keys, 370 passed the filter, 100 of those the dimension (`EXPLAIN ANALYZE`). A
+thousand rows took 3,699 rows that passed the filter, 29 ms. With two workers the chosen plan is
+the serial one - the node is not parallel-safe, and at LIMIT 1000 core's parallel plan is priced
+0.4% below it, within add_path()'s fuzz, where the walk's start-up wins. The selective semi join
+keeps core's plan: the walk would meet the whole year, ten million rows of 8.6 million keys, fetch
+every one and probe the dimension for the 2.7 million that pass the filter - 22 to 35 s for 79
+rows - and is priced at a hundred times core's plan, which reads the 596 keys' rows. That margin is core's estimate of the
+join (954 rows for 79); an estimate a hundred times too high would choose the walk, and that is
+the hazard the semi join inside the walk would guard against (above). At `work_mem` 64 MB the
+plans are the same but for a Memoize core puts over the dimension's probe, which spends 40 to 75 ms
+of a 50 to 80 ms query setting up its cache - a hash table core sizes from its estimates and does
+not price - where the plan without it takes 2.9 ms.
 
 ## 31. Cost calibration on the release build (2026-09-27)
 

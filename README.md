@@ -339,7 +339,7 @@ expressions as the table's owner (DESIGN.md §7).
     src/lion_customscan.c   create_upper_paths_hook -> CustomPath/CustomScan "LionCount"
     src/lion_costs.[ch]     the cost model's constants as planner settings (pg_lion.*_cost)
     src/lion_fkjoin.[ch]    the FK-side joins a LionCount answers (fact JOIN dim, EXISTS / NOT EXISTS)
-    src/lion_ordered.c      CustomScan "LionOrdered": lion-filtered, btree-ordered scans
+    src/lion_ordered.c      CustomScan "LionOrdered": lion-filtered scans in a btree's or a lion column's order
     src/lion_multikey.c     array_ops/tsvector_ops: GIN-style extraction and tsquery key trees
     test/sql, test/isolation, test/unit, test/recovery, test/modules
 
@@ -448,8 +448,11 @@ working around a bad choice:
 
 - `pg_lion.enable_count_pushdown`: answer `count(*)` from Lion indexes with the `LionCount`
   custom scan (DESIGN.md §10).
-- `pg_lion.enable_ordered_scan`: offer `LionOrdered`, a Lion-filtered walk of a B-tree, for an
-  `ORDER BY` (DESIGN.md §30).
+- `pg_lion.enable_ordered_scan`: offer `LionOrdered` for an `ORDER BY`: a walk of a B-tree filtered
+  by a Lion set, or a walk of a Lion index's own ordered scalar column in either direction (`ORDER
+  BY ts DESC LIMIT n` over a Lion index on `ts`), filtered by a Lion set of the other clauses or by
+  the clauses themselves; on a table, or on each partition of one (DESIGN.md §30, §30.11). EXPLAIN
+  names a column's walk `Ordered By: <index> (<column>[, backward])`.
 - `pg_lion.enable_plain_scan`: let the planner use plain and index-only scans of Lion indexes
   (`amgettuple`, DESIGN.md §29). Off, Lion indexes are planned for bitmap scans only, as GIN
   indexes are, and every other index's scans are unaffected - where `enable_indexscan = off` would
@@ -527,8 +530,9 @@ was fitted at, and changing one changes plans, not results. Settable per session
 ## Known limitations
 
 Equality, `IN` lists, scalar ranges and the multi-key operators above are supported, through bitmap
-scans and plain index scans (`amgettuple`, DESIGN.md §29). There are no ordered index scans (an
-`ORDER BY` needs a B-tree, which `LionOrdered` combines with a lion filter, §30), no index-only scans
+scans and plain index scans (`amgettuple`, DESIGN.md §29). There are no ordered scans of the
+access method itself (an `ORDER BY` is `LionOrdered`'s: a B-tree walked with a lion filter, or a
+lion index's own ordered column walked, §30), no index-only scans
 that return a column (only those that need none, like `count(*)`), no INCLUDE columns, no
 parallel build or scan, no reclaim of an emptied directory leaf or of an emptied posting-tree leaf
 (both wait for the whole set or the whole index to go). Inserts serialise on the directory
