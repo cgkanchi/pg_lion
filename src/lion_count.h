@@ -48,6 +48,17 @@
 #endif
 
 /*
+ * Two more the cost model shares with the executor: how small a posting set
+ * is worth a private copy (lion_posting_set_materialize() in lion_count.c,
+ * where the argument is) - which decides whether a GROUP BY's lone WHERE set
+ * is collected (DESIGN.md §10) - and the most groups one walk of
+ * lion_count_groups_copy() counts together.
+ */
+#define LION_MATERIALIZE_MAX_CONTAINERS	64
+#define LION_MATERIALIZE_MAX_BYTES		(256 * 1024)
+#define LION_GROUP_BATCH_MAX	256
+
+/*
  * Instrumentation, reported by lion_index_count_stats() and by
  * EXPLAIN ANALYZE of the LionCount node.
  */
@@ -71,6 +82,17 @@ typedef struct LionCountStats
 	 * what a set of dense, uncorrelated sources looks like.
 	 */
 	int64		probes_avoided;
+
+	/*
+	 * How the AND met its unions (DESIGN.md §29.11, "Unions probed"): the
+	 * container keys at which the union of two or more containers of an IN
+	 * list, a multi-key `&&` or an OR across columns was built, and the ones
+	 * at which the running intersection was looked up in those containers
+	 * instead and the union never built.  A union that drives the AND, or is
+	 * the only source, is always built.
+	 */
+	int64		unions_built;
+	int64		unions_probed;
 
 	/*
 	 * The per-query visibility cache (LionVisCache below).  cache_hits counts
@@ -595,6 +617,29 @@ extern void lion_lookup_walk_pause(LionLookupWalk *walk);
 extern void lion_lookup_walk_restart(LionLookupWalk *walk);
 
 /*
+ * What the order lion_lookup_walk_cmp() sorts keys into is made of: the
+ * probe's comparison, its hash and the collation both are called under.  Two
+ * walks whose orders are equal (the leaf partitions of a partitioned fact
+ * table, whose fk indexes are usually one partitioned index's) take keys
+ * sorted for either; others each need the keys sorted for themselves
+ * (DESIGN.md §27, "A partitioned fact table").  `valid` is false for a walk
+ * whose keys cannot be sorted at all (lion_lookup_walk_ordered()).
+ */
+typedef struct LionWalkOrder
+{
+	bool		valid;
+	bool		hassort;
+	Oid			sortproc;
+	Oid			hashproc;
+	Oid			collation;
+} LionWalkOrder;
+
+extern void lion_lookup_walk_order(const LionLookupWalk *walk,
+								   LionWalkOrder *order);
+extern bool lion_walk_order_equal(const LionWalkOrder *a,
+								  const LionWalkOrder *b);
+
+/*
  * One key in any order, by a descent of its own - what
  * lion_posting_set_lookup_col() does - with the probe the walk resolved once
  * instead of one resolved for every key (DESIGN.md §27, "The per-key path,
@@ -671,6 +716,48 @@ extern bool lion_sources_collect(Relation heap, Snapshot snapshot,
 								 LionCountStats *stats);
 
 /*
+ * The heap's container keys cut into ranges for the participants of a
+ * parallel plan: how many, and the keys they are cut from - no fewer than
+ * minkeys a range, which the executor takes from pg_lion.parallel_range_keys
+ * and the planner prices at its default.  lion_key_range() gives range r's
+ * first key and the key past its last, the last range having no end
+ * (LION_KEYS_END); lion_sources_collect_range() is the copy above of the keys
+ * of one range alone.
+ */
+#define LION_KEYS_END	((uint64) PG_UINT32_MAX + 1)
+#define LION_PARALLEL_RANGE_KEYS	16	/* pg_lion.parallel_range_keys */
+extern PGDLLIMPORT int lion_parallel_range_keys;
+extern int	lion_key_ranges(BlockNumber heapblocks, int participants,
+							int minkeys, uint32 *ckeys);
+extern void lion_key_range(int nranges, uint32 ckeys, int r, uint32 *lo,
+						   uint64 *hi);
+extern bool lion_sources_collect_range(Relation heap, Snapshot snapshot,
+									   int nsources, LionCountSource *sources,
+									   Size maxbytes, bool spill, uint32 lo,
+									   uint64 hi, LionPostingSet *out,
+									   bool *spilled, LionCountStats *stats);
+
+/*
+ * The counts of many located sets against ONE such copy, made in one walk of
+ * container keys for all of them (DESIGN.md §10, "The groups of a walk,
+ * counted together"): counts[g] is what lion_count_sources_cached() answers
+ * for the AND of groups[g] and copy, a collected set (lion_sources_collect())
+ * - each group's own set carrying the §9 interlock, as it does there.  The
+ * copy's container at each key is read once and made a bitset image that
+ * every group's container there is tested against, and the visibility map is
+ * asked once per key for all of them.  The sets stay the caller's to release.
+ * images is NULL, or ngroups page images the cursors may use as theirs.
+ */
+extern void lion_count_groups_copy(Relation heap, Snapshot snapshot,
+								   int ngroups, LionPostingSet *groups,
+								   const LionPostingSet *copy, int64 *counts,
+								   LionCountStats *stats, LionVisCache *cache,
+								   bool rel_read_only, PGAlignedBlock *images);
+
+/* How many groups of index one lion_count_groups_copy() may take. */
+extern int	lion_count_groups_batch(Relation index);
+
+/*
  * The same intersection collected ONCE for all the participants of a parallel
  * plan, into its dynamic shared memory (DESIGN.md §27, "One copy per query"):
  * the participants divide its container keys into chunks and collect them
@@ -711,6 +798,16 @@ extern void lion_shared_copy_collect(LionSharedCopy *sc, struct dsa_area *area,
  * "The WHERE sets, collected once").
  */
 extern bool lion_posting_set_rewalked(const LionPostingSet *ps);
+
+/*
+ * How a collected range's union grows (lion_range_union_cb()), which the
+ * planner prices (lion_cost_range_union(), DESIGN.md §32, "What collecting a
+ * range costs"): an ARRAY container of at most this many members that comes
+ * to an ARRAY union waits with the others that came, and is folded in once
+ * the waiting members are LION_RANGE_UNION_PEND_MIN or half the union's,
+ * whichever is more; anything larger is merged in at once.
+ */
+#define LION_RANGE_UNION_PEND_MIN	32
 
 /*
  * The rows of one range over key column `attno` of index - every set a walk of
@@ -1228,6 +1325,13 @@ extern void lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 extern double lion_merge_cpu_cost(int nsrc, const double *members,
 								  const double *containers, const bool *inmem,
 								  double tuples, double isect, double *probes);
+extern double lion_merge_cpu_cost_sets(int nsrc, const double *members,
+									   const double *containers,
+									   const double *nsets,
+									   const double *setcontainers,
+									   const double *setpages,
+									   const bool *inmem, double tuples,
+									   double isect, double *probes);
 
 /*
  * The AND of the posting sets of n clauses of one relation (DESIGN.md §29.11,
@@ -1309,6 +1413,13 @@ extern double lion_probe_rel_factor(PlannerInfo *root, RelOptInfo *rel);
  * lion_probe_rel_rows() applies it to rel's own restriction clauses.
  */
 extern PGDLLIMPORT bool lion_enable_intersection_probe;
+
+/*
+ * Whether an AND of posting sets may look its running intersection up in the
+ * containers of a union at a key instead of building the union (DESIGN.md
+ * §29.11, "Unions probed"): an executor setting, for comparing the two.
+ */
+extern PGDLLIMPORT bool lion_enable_union_probe;
 extern double lion_isect_factor(PlannerInfo *root, RelOptInfo *rel,
 								IndexOptInfo *idx, int n,
 								const AttrNumber *cols, Node **clauses);

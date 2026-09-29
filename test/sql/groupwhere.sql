@@ -9,8 +9,10 @@
 -- Now the filters are collected once per relation into one private set, and
 -- every group is counted against it.  Every query below is checked against a
 -- sequential scan with the pushdown off; the node's EXPLAIN ANALYZE says how
--- often it collected the filters; and the shared buffers a grouped count
--- reads are compared with those of the same count ungrouped.
+-- often it collected the filters, and in how many batches the groups were
+-- then counted against them ("The groups of a walk, counted together"); and
+-- the shared buffers a grouped count reads are compared with those of the
+-- same count ungrouped.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -26,8 +28,9 @@ SET max_parallel_workers_per_gather = 0;
  * that is built at all is the plan: under EXPLAIN ANALYZE, and again for its
  * rows.  Then it runs want (q itself when NULL) as a sequential scan with the
  * pushdown off.  It says whether the node ran, how often it collected its
- * WHERE and how often the collection spilled, and whether the answer has more
- * than one row, after proving the two answers equal as multisets.
+ * WHERE, how often the collection spilled and in how many batches the groups
+ * were counted against it, and whether the answer has more than one row,
+ * after proving the two answers equal as multisets.
  */
 CREATE FUNCTION lgw_check(q text, want text DEFAULT NULL) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -36,6 +39,7 @@ DECLARE
 	pushed boolean := false;
 	collected int := 0;
 	spilled int := 0;
+	batches int := 0;
 	nrows bigint;
 	ndiff bigint;
 BEGIN
@@ -51,6 +55,8 @@ BEGIN
 			collected := substring(ln FROM 'WHERE Sets Collected: (\d+)')::int;
 		ELSIF ln ~ 'WHERE Sets Spilled: ' THEN
 			spilled := substring(ln FROM 'WHERE Sets Spilled: (\d+)')::int;
+		ELSIF ln ~ 'Group Batches: ' THEN
+			batches := substring(ln FROM 'Group Batches: (\d+)')::int;
 		END IF;
 	END LOOP;
 	EXECUTE format('CREATE TEMP TABLE lgw_on AS %s', q);
@@ -72,9 +78,9 @@ BEGIN
 	IF ndiff <> 0 THEN
 		RETURN format('MISMATCH: %s rows differ', ndiff);
 	END IF;
-	RETURN format('%s, collected %s, spilled %s, %s',
+	RETURN format('%s, collected %s, spilled %s, batches %s, %s',
 				  CASE WHEN pushed THEN 'pushed down' ELSE 'NOT PUSHED DOWN' END,
-				  collected, spilled,
+				  collected, spilled, batches,
 				  CASE WHEN nrows > 1 THEN 'several rows'
 					   WHEN nrows = 1 THEN 'one row' ELSE 'no row' END);
 END $$;
@@ -325,4 +331,70 @@ SELECT lgw_check('SELECT g, count(*) FROM lgw_s WHERE x IN (0, 1, 2) AND y IN (0
 RESET work_mem;
 RESET hash_mem_multiplier;
 DROP TABLE lgw_s;
+
+-- ---------- 8. the groups of a walk, counted together ----------
+/*
+ * Once the WHERE is collected, the rest of the walk is counted a batch of
+ * groups at a time, in one walk of container keys a batch (DESIGN.md §10,
+ * "The groups of a walk, counted together"): at most 256 groups, fewer when
+ * work_mem holds fewer cursors.  g has 600 groups, and NULL, of about eight
+ * rows a container key each - ARRAYs and sparse segments; k 300 and no NULL;
+ * h two, a RUN and an ARRAY; a is every other row, so that a WHERE of
+ * `a = 1` alone is a BITSET at each key; b three values, r scattered over
+ * 997, all three on one multicolumn index.  About 13 container keys.
+ */
+CREATE TABLE lgw_b (g int, k int NOT NULL, h int NOT NULL, a int NOT NULL,
+					b int NOT NULL, r int NOT NULL, pad text NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lgw_b
+SELECT CASE WHEN i % 101 = 0 THEN NULL ELSE (i * 7) % 600 END, (i * 13) % 300,
+	   CASE WHEN i % 1000 < 900 THEN 1 ELSE 2 END, i % 2, i % 3,
+	   (i * 7919) % 997, repeat('z', 30)
+  FROM generate_series(1, 60000) i;
+CREATE INDEX lgw_b_g ON lgw_b USING lion (g);
+CREATE INDEX lgw_b_k ON lgw_b USING lion (k);
+CREATE INDEX lgw_b_h ON lgw_b USING lion (h);
+CREATE INDEX lgw_b_abr ON lgw_b USING lion (a, b, r);
+VACUUM (FREEZE, ANALYZE) lgw_b;
+-- 601 groups: the first counted on its own, the rest in three batches
+SELECT lgw_check('SELECT g, count(*) FROM lgw_b WHERE a = 1 AND b = 2 GROUP BY g');
+-- the WHERE a BITSET at every key, which the groups are tested against as it is
+SELECT lgw_check('SELECT g, count(*) FROM lgw_b WHERE a = 1 AND b IN (0, 1, 2) GROUP BY g');
+-- two groups whose containers are a RUN and an ARRAY
+SELECT lgw_check('SELECT h, count(*) FROM lgw_b WHERE a = 0 AND b IN (0, 2) GROUP BY h');
+-- a WHERE of a row or two a key, which each group ANDs directly
+SELECT lgw_check('SELECT h, count(*) FROM lgw_b WHERE a = 0 AND r = 5 GROUP BY h');
+SELECT lgw_check('SELECT g, count(*) FROM lgw_b WHERE a = 0 AND r = 5 GROUP BY g');
+-- a HAVING that turns some of a batch's rows away, and a LIMIT inside one
+SELECT lgw_check('SELECT g, count(*) FROM lgw_b WHERE a = 1 AND b = 2 GROUP BY g HAVING count(*) > 17');
+SELECT lgw_check('SELECT k, count(*) FROM lgw_b WHERE a = 1 AND b = 2 GROUP BY k ORDER BY k LIMIT 10');
+-- a work_mem of a few dozen cursors: many batches
+SET work_mem = '64kB';
+SELECT lgw_check('SELECT g, count(*) FROM lgw_b WHERE a = 1 AND b = 2 GROUP BY g');
+RESET work_mem;
+-- serializable: the pages counted from the map are predicate-locked
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT lgw_check('SELECT g, count(*) FROM lgw_b WHERE a = 0 AND b = 1 GROUP BY g');
+COMMIT;
+-- the batches keep the walk's order, for which an ORDER BY of a column
+-- without NULLs needs no Sort
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+EXPLAIN (COSTS OFF)
+SELECT k, count(*) FROM lgw_b WHERE a = 1 AND b = 2 GROUP BY k ORDER BY k;
+SELECT count(*) AS groups, array_agg(k) = array_agg(k ORDER BY k) AS in_order
+  FROM (SELECT k, count(*) FROM lgw_b WHERE a = 1 AND b = 2
+		 GROUP BY k ORDER BY k) s;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+RESET enable_indexonlyscan;
+-- a heap the map cannot vouch for: every group's rows go to the heap
+UPDATE lgw_b SET pad = pad || 'w' WHERE g % 7 = 3;
+DELETE FROM lgw_b WHERE g % 11 = 4;
+SELECT lgw_check('SELECT g, count(*) FROM lgw_b WHERE a = 1 AND b = 2 GROUP BY g');
+SELECT lgw_check('SELECT h, count(*) FROM lgw_b WHERE a = 0 AND b IN (0, 2) GROUP BY h');
+DROP TABLE lgw_b;
 DROP FUNCTION lgw_check(text, text);

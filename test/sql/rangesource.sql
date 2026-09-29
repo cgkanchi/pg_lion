@@ -279,6 +279,96 @@ RESET enable_bitmapscan;
 RESET enable_indexscan;
 RESET enable_indexonlyscan;
 
+-- ---------- 9. what collecting a range costs (DESIGN.md §32, 2026-09-29) ----------
+-- The FK-side join collects a range among its fact filters once, and its
+-- union is most of what that costs: a fold of every container of it that is
+-- not a bitset yet, each time a set of the range brings it members.  Over a
+-- few dimension rows that is more than a nested loop's handful of index
+-- probes, and the planner now says so; over more keys and a narrower range
+-- the node wins.  200,000 narrow rows lie on some seventeen container keys,
+-- and a summary of 1024 scattered rows puts sixty members at each: the
+-- union of a range over nearly all of them is merged into, summary by
+-- summary, until it is a bitset.  The statistics read every row, so the
+-- plans do not depend on a sample.
+SET default_statistics_target = 1000;
+CREATE TABLE lion_src_cd (pk int PRIMARY KEY, sel int NOT NULL, attr int NOT NULL);
+INSERT INTO lion_src_cd
+SELECT i, (hashint4(i) & 2147483647) % 1000000, i % 5 FROM generate_series(0, 4999) i;
+CREATE INDEX lion_src_cd_sel ON lion_src_cd (sel) INCLUDE (pk, attr);
+CREATE TABLE lion_src_cf (fk int NOT NULL, ts int NOT NULL, v int NOT NULL);
+INSERT INTO lion_src_cf
+SELECT (hashint4(i + 7) & 2147483647) % 5000, hashint4(i) & 1048575, i % 11
+  FROM generate_series(1, 200000) i;
+CREATE INDEX lion_src_cf_fk ON lion_src_cf USING lion (fk);
+CREATE INDEX lion_src_cf_bfk ON lion_src_cf (fk);
+CREATE INDEX lion_src_cf_ts ON lion_src_cf USING lion (ts)
+	WITH (summaries = on, summary_tids = 1024);
+VACUUM (FREEZE, ANALYZE) lion_src_cf;
+VACUUM (FREEZE, ANALYZE) lion_src_cd;
+RESET default_statistics_target;
+
+/*
+ * lion_src_chosen() says which plan the planner, left alone, takes for q -
+ * the count pushdown or core's - and checks its answer against the pushdown
+ * off.
+ */
+CREATE FUNCTION lion_src_chosen(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	j jsonb;
+	pushed boolean;
+	got text;
+	want text;
+BEGIN
+	EXECUTE 'EXPLAIN (COSTS OFF, FORMAT JSON) ' || q INTO j;
+	pushed := jsonb_path_exists(j, 'strict $.** ? (@."Custom Plan Provider" == "LionCount")');
+	EXECUTE format('SELECT coalesce(string_agg(s::text, '' '' ORDER BY s::text), ''(none)'') FROM (%s) s', q)
+		INTO got;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('SELECT coalesce(string_agg(s::text, '' '' ORDER BY s::text), ''(none)'') FROM (%s) s', q)
+		INTO want;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	IF got IS DISTINCT FROM want THEN
+		RETURN format('MISMATCH: pushed %s, not pushed %s', got, want);
+	END IF;
+	RETURN CASE WHEN pushed THEN 'the node' ELSE 'core''s plan' END || ': ' ||
+		left(got, 120);
+END $$;
+
+-- ten dimension rows and a range over nearly every row: the collection
+-- costs more than ten probes of the fk btree (the node was chosen before it
+-- was priced, and ran three times slower than the nested loop)
+SELECT lion_src_chosen('SELECT d.attr, count(*) FROM lion_src_cf f JOIN lion_src_cd d ON f.fk = d.pk WHERE d.sel < 2000 AND f.ts < 1000000 GROUP BY d.attr');
+-- a hundred, and a range over a tenth of the rows: the node
+SELECT lion_src_chosen('SELECT d.attr, count(*) FROM lion_src_cf f JOIN lion_src_cd d ON f.fk = d.pk WHERE d.sel < 20000 AND f.ts < 100000 GROUP BY d.attr');
+
+-- The collection is timed, under EXPLAIN ANALYZE with TIMING, in `Fact
+-- Filter Locate Time`: it happens while the fact filters are located, which
+-- was in none of the node's timers.
+CREATE FUNCTION lion_src_timers(q text, timing boolean) RETURNS TABLE (locate boolean, collect boolean, ranges int)
+LANGUAGE plpgsql AS $$
+DECLARE
+	j jsonb;
+	node jsonb;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	EXECUTE format('EXPLAIN (ANALYZE, TIMING %s, COSTS OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) %s',
+				   CASE WHEN timing THEN 'ON' ELSE 'OFF' END, q) INTO j;
+	node := jsonb_path_query_first(j, 'strict $.** ? (@."Custom Plan Provider" == "LionCount")');
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	RETURN QUERY SELECT node ? 'Fact Filter Locate Time', node ? 'Fact Filter Collect Time',
+		(node ->> 'Range Sources Collected')::int;
+END $$;
+SELECT * FROM lion_src_timers('SELECT d.attr, count(*) FROM lion_src_cf f JOIN lion_src_cd d ON f.fk = d.pk WHERE d.sel < 2000 AND f.ts < 1000000 GROUP BY d.attr', true);
+SELECT * FROM lion_src_timers('SELECT d.attr, count(*) FROM lion_src_cf f JOIN lion_src_cd d ON f.fk = d.pk WHERE d.sel < 2000 AND f.ts < 1000000 GROUP BY d.attr', false);
+DROP FUNCTION lion_src_chosen(text);
+DROP FUNCTION lion_src_timers(text, boolean);
+DROP TABLE lion_src_cf, lion_src_cd;
+
 DROP TABLE lion_src_t, lion_src_p, lion_src_fact, lion_src_dim;
 DROP FUNCTION lion_src(text);
 DROP FUNCTION lion_src_prep(text, text);

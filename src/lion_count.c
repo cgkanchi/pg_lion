@@ -154,14 +154,14 @@ PG_FUNCTION_INFO_V1(lion_index_count_any);
  */
 
 /*
- * A posting set is worth materializing (DESIGN.md section 9 and the comment
- * on lion_posting_set_materialize()) when it is this small.  Either bound is
+ * LION_MATERIALIZE_MAX_CONTAINERS and LION_MATERIALIZE_MAX_BYTES (lion_count.h,
+ * because the cost model needs them too): a posting set is worth
+ * materializing (DESIGN.md section 9 and the comment on
+ * lion_posting_set_materialize()) when it is this small.  Either bound is
  * enough: 64 containers cover 4096 heap blocks however fat they are, and a
  * set of many thin containers is cheap to keep as long as it stays under the
  * byte budget.  A set that fails both bounds keeps being walked page by page.
  */
-#define LION_MATERIALIZE_MAX_CONTAINERS	64
-#define LION_MATERIALIZE_MAX_BYTES		(256 * 1024)
 
 /*
  * Per-call state of one count.  The visibility map buffer is kept for the
@@ -188,6 +188,12 @@ typedef struct LionCountCtx
 								 * an MVCC snapshot, DESIGN.md §29.5) */
 	bool		farseeks;		/* every seek is to a key many leaves past the
 								 * last: descend at once (lion_stream_far()) */
+	bool		raw;			/* the merge's intermediate containers are
+								 * left unoptimized: every one is counted or
+								 * handed to the next operation, never kept
+								 * (DESIGN.md §15, "Unions and intersections
+								 * unoptimized").  A stream's are optimized:
+								 * its callers copy them. */
 	LionVisCache *cache;			/* per-query visibility cache, or NULL */
 
 	/*
@@ -292,7 +298,8 @@ typedef struct LionCollect
 	/*
 	 * A chunk of the intersection only (ranged): its container keys from lo
 	 * up to, not including, hi - what one participant of a parallel plan
-	 * collects of a shared copy (LionSharedCopy).
+	 * collects of a shared copy (LionSharedCopy), or of the WHERE of a
+	 * parallel GROUP BY for one range of keys (lion_sources_collect_range()).
 	 */
 	bool		ranged;
 	uint32		lo;
@@ -500,6 +507,8 @@ typedef struct LionSetCursor
 static void lion_cursor_next(LionSetCursor *cur);
 static void lion_cursor_seek(LionSetCursor *cur, uint32 target);
 static void lion_recheck_flush(LionCountCtx *cx);
+static void lion_count_container_masks(LionCountCtx *cx, const LionContainer *c,
+									   uint64 members, uint64 allvis);
 static bool lion_exists_settled(LionCountCtx *cx);
 
 /*
@@ -1852,6 +1861,28 @@ lion_lookup_walk_cmp(LionLookupWalk *walk, Datum a, uint32 ahash, Datum b,
 	return 0;
 }
 
+/* The order of lion_lookup_walk_cmp(), as lion_walk_order_equal() compares it. */
+void
+lion_lookup_walk_order(const LionLookupWalk *walk, LionWalkOrder *order)
+{
+	memset(order, 0, sizeof(LionWalkOrder));
+	order->valid = walk->probe.walk;
+	order->hassort = walk->probe.hassort;
+	if (walk->probe.hassort)
+		order->sortproc = walk->probe.sortproc.fn_oid;
+	order->hashproc = walk->probe.crosstype ? walk->probe.hashinfo.fn_oid :
+		walk->state->hashproc.fn_oid;
+	order->collation = walk->state->collation;
+}
+
+bool
+lion_walk_order_equal(const LionWalkOrder *a, const LionWalkOrder *b)
+{
+	return a->valid && b->valid && a->hassort == b->hassort &&
+		a->sortproc == b->sortproc && a->hashproc == b->hashproc &&
+		a->collation == b->collation;
+}
+
 /* Let go of the leaf the walk stands on, and remember where it was. */
 void
 lion_lookup_walk_pause(LionLookupWalk *walk)
@@ -2833,9 +2864,23 @@ lion_inline_stage_size(Size paylen)
 	return MAXALIGN(Min(size, LION_CONTAINER_MAX_SIZE));
 }
 
+static void lion_inline_skip(const char *payload, Size paylen, Size *off,
+							 uint32 target, LionContainer *buf);
+
+/*
+ * A cursor over `set`, standing at its first container whose key is at or
+ * above `target` - lion_cursor_seek() from nothing in hand: a CHAIN set's
+ * first leaf comes from a descent for that key rather than for key 0 and the
+ * leaves between.  Nothing below the target is read, so nothing of it is
+ * counted or pinned (§9 asks nothing of it).  `image` is where a CHAIN set's
+ * leaves are copied to, the caller's to keep - a walk that sets up many
+ * cursors again and again gives each the same one every time - or NULL for
+ * one of the cursor's own.
+ */
 static void
-lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx,
-				 bool droppins)
+lion_cursor_init_at(LionSetCursor *cur, const LionPostingSet *set,
+					LionCountCtx *cx, bool droppins, uint32 target,
+					PGAlignedBlock *image)
 {
 	memset(cur, 0, sizeof(LionSetCursor));
 	cur->set = set;
@@ -2843,6 +2888,7 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 	cur->pinbuf = InvalidBuffer;
 	cur->nextblk = InvalidBlockNumber;
 	cur->droppins = droppins || cx->droppins;
+	cur->mintarget = target;
 
 	if (!set->found)
 		return;
@@ -2851,6 +2897,11 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 	{
 		/* a private copy: nothing to pin, nothing to walk */
 		cur->matidx = 0;
+		if (target > 0)
+		{
+			cx->stats.copy_seeks++;
+			cur->matidx = lion_mat_seek(set->mat, 0, target);
+		}
 
 		/* ... and when it is spilled, a container at a time is read back */
 		if (lion_mat_spills(set->mat))
@@ -2861,6 +2912,9 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 	{
 		cur->cbuf = (LionContainer *) palloc(lion_inline_stage_size(set->paylen));
 		cur->payoff = 0;
+		if (target > 0)
+			lion_inline_skip(set->payload, set->paylen, &cur->payoff, target,
+							 cur->cbuf);
 		/* borrowed, not owned: the LionPostingSet releases it */
 		cur->pinbuf = set->pinbuf;
 		cur->ownpin = false;
@@ -2869,15 +2923,17 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 	{
 		/*
 		 * The entry's head block is the ROOT of the posting tree (DESIGN.md
-		 * §22), so the first leaf comes from a descent for container key 0 -
-		 * which is also how a root push-down cannot be raced: the descent
-		 * hands back a page that WAS a leaf under the lock it read it with.
+		 * §22), so the first leaf comes from a descent for the first key
+		 * wanted - which is also how a root push-down cannot be raced: the
+		 * descent hands back a page that WAS a leaf under the lock it read it
+		 * with.
 		 */
-		cur->imgbuf = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
+		cur->imgbuf = (image != NULL) ? image :
+			(PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 		cur->img = (Page) cur->imgbuf->data;
 		cur->nextblk = InvalidBlockNumber;
 		cur->descend = true;
-		cur->seekckey = 0;
+		cur->seekckey = target;
 
 		/*
 		 * Test hook: the entry has been copied and its leaf released, and
@@ -2890,6 +2946,14 @@ lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx
 	}
 
 	lion_cursor_next(cur);
+}
+
+/* A cursor over `set`, standing at its first container. */
+static void
+lion_cursor_init(LionSetCursor *cur, const LionPostingSet *set, LionCountCtx *cx,
+				 bool droppins)
+{
+	lion_cursor_init_at(cur, set, cx, droppins, 0, NULL);
 }
 
 /*
@@ -3396,11 +3460,15 @@ lion_cursor_close(LionSetCursor *cur)
  *			re-optimize an intermediate container.  Both costs are then
  *			proportional to the containers that actually take part rather
  *			than to the length of the list.
- *	AND		the intersection (`tags @> '{a,b}'`, and the AND nodes of a
- *			tsquery, DESIGN.md §17): the children are wound forward until
- *			they all stand at one container key, and the container is the AND
- *			of theirs.  A container key whose intersection comes out empty is
- *			skipped here rather than handed up.
+ *	AND		the intersection (`tags @> '{a,b}'`, the AND nodes of a tsquery,
+ *			DESIGN.md §17, and a lion index scan's AND of its quals' sets,
+ *			§29.2): the children are wound forward until they all stand at
+ *			one container key, and the container is the AND of theirs.  A
+ *			container key whose intersection comes out empty is skipped here
+ *			rather than handed up.  The winding is the count's own leapfrog
+ *			(lion_leapfrog()): the child with the fewest members drives, the
+ *			others are sought to its keys fewest first, and a key is given up
+ *			at the first child that rules it out.
  *
  * THE PIN RULE (DESIGN.md §9) IS UNCHANGED BY EITHER OPERATOR.  Every leaf
  * that contributed a container to the result still pins the page that
@@ -3508,6 +3576,13 @@ typedef struct LionExprCursor
 	LionContainer *acc[2];		/* AND/OR accumulators, only when nsub > 1 */
 
 	/*
+	 * LION_KN_AND, the leapfrog (lion_leapfrog()): the children in the order
+	 * they are sought, fewest members first (lion_node_members()), so that
+	 * sub[order[0]] drives.
+	 */
+	int		   *order;
+
+	/*
 	 * LION_KN_OR, the k-way merge.  heap[0 .. nheap-1] is a min-heap of every
 	 * child that still has a container and is not standing at the current
 	 * key; hot[0 .. nhot-1] are the children that are, the ones whose
@@ -3531,6 +3606,26 @@ typedef struct LionExprCursor
 	int			nhot;
 	uint64	   *bits;
 
+	/*
+	 * LION_KN_OR under a leapfrog (DESIGN.md §29.11, "Unions probed"): a
+	 * source of the count's merge or a child of an AND node, whose container
+	 * is only ever ANDed with the running intersection.  `lazy` says the
+	 * union of the children standing at a key is not built when the cursor
+	 * gets there; `pending` that it has not been built for the key it
+	 * stands on, and cur is NULL until lion_ecursor_container() builds it -
+	 * or never, when lion_leapfrog() looks the intersection's few members up
+	 * in the children's containers instead (lion_or_probe()), which hotc[]
+	 * holds for it.
+	 */
+	bool		lazy;
+	bool		pending;
+	const LionContainer **hotc;
+	struct LionCountCtx *cx;	/* the statistics its unions are counted in */
+
+	bool		raw;			/* its container may be left unoptimized:
+								 * the count's, and a child's of an AND node
+								 * or of a raw OR (lion_ecursor_init_ex()) */
+
 	/* the container the cursor currently stands on */
 	bool		valid;
 	uint32		ckey;
@@ -3542,10 +3637,247 @@ typedef struct LionExprCursor
 static void lion_ecursor_init(LionExprCursor *c, const LionNodePlan *plan,
 							  LionPostingSet *sets, int nsets,
 							  LionCountCtx *cx, bool droppins);
+static void lion_ecursor_init_ex(LionExprCursor *c, const LionNodePlan *plan,
+								 LionPostingSet *sets, int nsets,
+								 LionCountCtx *cx, bool droppins, bool raw,
+								 bool lazy);
+static const LionContainer *lion_ecursor_container(LionExprCursor *c);
+static bool lion_or_probe_pays(const LionExprCursor *c,
+							   const LionContainer *acc);
+static void lion_or_probe(LionExprCursor *c, const LionContainer *acc,
+						  LionContainer *dest);
 static void lion_ecursor_build(LionExprCursor *c);
 static void lion_ecursor_next(LionExprCursor *c);
 static void lion_ecursor_seek(LionExprCursor *c, uint32 target);
 static void lion_ecursor_close(LionExprCursor *c);
+
+/* ---- the leapfrog: the AND of cursors ---- */
+
+/*
+ * How many rows a node's sets hold, from what the located sets carry already
+ * (`ntids`, the entries' own counts), so that no page is read to decide it:
+ * a set's own, a union's sets together - an upper bound - and the least of an
+ * intersection's children, which it cannot exceed.  It orders the sources of
+ * a leapfrog (lion_leapfrog()); a wrong guess costs pages, never an answer.
+ */
+static double
+lion_node_members(const LionKeyNode *node, const LionPostingSet *sets)
+{
+	double		m = 0;
+	int			i;
+
+	check_stack_depth();
+
+	if (node == NULL)
+		return 0;
+	if (node->kind == LION_KN_KEY)
+		return sets[node->keyno].found ? (double) sets[node->keyno].ntids : 0;
+	for (i = 0; i < node->nargs; i++)
+	{
+		double		c = lion_node_members(node->args[i], sets);
+
+		if (node->kind == LION_KN_OR)
+			m += c;
+		else if (i == 0 || c < m)
+			m = c;
+	}
+	return m;
+}
+
+/*
+ * order[0 .. n-1] = 0 .. n-1 sorted by est[], ascending.  An insertion sort,
+ * because an AND has a handful of sources and this runs once per cursor; it
+ * is STABLE, so of equal estimates the first comes first.
+ */
+static void
+lion_leapfrog_order(const double *est, int n, int *order)
+{
+	int			i;
+	int			j;
+
+	for (i = 0; i < n; i++)
+	{
+		for (j = i; j > 0 && est[order[j - 1]] > est[i]; j--)
+			order[j] = order[j - 1];
+		order[j] = i;
+	}
+}
+
+/*
+ * THE LEAPFROG (DESIGN.md §22, §25): the AND of cursors, as the count's merge
+ * makes it (lion_run_merge()) and as an AND node of the evaluator makes it
+ * (lion_ecursor_build()) - which is what a lion index scan's AND of its quals'
+ * sets is, in its stream and in its bitmap (DESIGN.md §29.2), and what the
+ * count's multi-key AND trees are.  One function, so that the two cannot do
+ * different work on the same sets.
+ *
+ * It winds cur[order[0 .. n-1]] forward to the next container key at which
+ * every one of them has a container and their AND holds a member, and
+ * returns that AND, its key in *key; NULL once one of them runs out, or the
+ * key reaches `hi` (a chunk of a collection, LionCollect.ranged).
+ *
+ * order[0] is the DRIVER, the cursor with the fewest members, and the others
+ * follow in ascending members.  The driver is the only one that ever steps
+ * past a key; the others are left standing and are SOUGHT to the key the
+ * driver has reached, which costs each one probe instead of a walk - stepping
+ * all of them would cost each a container at key + 1 that the seek is about
+ * to skip anyway.  They are taken in that order, each sought and folded into
+ * the running intersection before the next one is touched at all, and the key
+ * is ABANDONED the moment the intersection is empty, or a cursor sought lands
+ * past the key: the ones after it in the order are neither sought nor read.
+ * The fewer members a cursor has, the likelier it is to be the one that kills
+ * the key, and the smaller the containers ANDed early are, which is what
+ * keeps the dense ones - a bitset a key - out of all but the last ANDs.  Any
+ * other order is still correct, and reads more.
+ *
+ * The AND is built in work[0] and work[1] alternately; *w comes back as the
+ * one it is NOT in, for a caller that goes on with it (the merge's negated
+ * sources).  The containers are left unoptimized (lion_container_and_raw()):
+ * they are ANDed again, counted, or optimized once by an AND node whose
+ * caller keeps what it hands out (DESIGN.md §15, "Unions and intersections
+ * unoptimized").  With n = 1 it is the cursor's own container.  `stats`,
+ * when not NULL, counts the seeks an abandoned key saved (EXPLAIN's Probes
+ * Avoided): a cursor standing at the key or beyond would not have been
+ * sought anyway, so only the ones still below it count.
+ *
+ * A UNION IS BUILT ONLY WHEN IT PAYS (DESIGN.md §29.11, "Unions probed").  A
+ * cursor that is an IN list, a multi-key `&&` or an OR across columns stands
+ * at a key with the children that have a container there, and - a lazy one,
+ * which every OR under a leapfrog is - without their union built.  The
+ * driver's union is built, since the intersection starts from it.  Any other
+ * one's is built and ANDed with the running intersection only when that is
+ * the cheaper way (lion_or_probe_pays()); otherwise the intersection's
+ * members are looked up in the children's containers and the ones found
+ * kept (lion_or_probe()), which is the same AND - acc ∩ (c1 ∪ ... ∪ ck) - at
+ * the cost of the members the intersection has rather than of those the
+ * union would have.
+ *
+ * THE DESIGN.md §9 PIN DISCIPLINE IS UNCHANGED, and this is the argument.
+ * The rule is that the visibility-map question about a container's heap
+ * blocks is asked before the pin on the page that container came from is
+ * released.  A key that is abandoned asks NO such question - nothing of it
+ * reaches the count - so there is no obligation to discharge for any of the
+ * pages it touched, sought or not.  The cursors that are not sought keep
+ * their PINS exactly where they stood: a pin too many never makes a count
+ * wrong, it only makes VACUUM wait (see lion_ecursor_next()).  The pages the
+ * sought ones let go of are let go by lion_ecursor_seek(), at keys nothing
+ * was counted from.  And the key that is returned has every cursor standing
+ * on it, each with the pin its container came with: the caller asks the map
+ * before it steps the driver (lion_count_container()), and an AND node hands
+ * the key up to a caller that does.  A union probed rather than built changes
+ * none of it: its children were sought to the key exactly as they are for a
+ * union built (lion_ecursor_seek()), the ones standing there keep the pins
+ * their containers came with until the cursor moves past the key, and what
+ * the probe keeps is a subset of the running intersection, whose members lie
+ * in containers the cursors before it stand on with their pins.
+ */
+static const LionContainer *
+lion_leapfrog(LionExprCursor *cur, const int *order, int n,
+			  LionContainer *const *work, int *w, uint64 hi,
+			  LionCountStats *stats, uint32 *key)
+{
+	for (;;)
+	{
+		const LionContainer *acc = NULL;
+		uint32		target;
+		int			k;
+		int			m;
+
+		for (k = 0; k < n; k++)
+		{
+			if (!cur[order[k]].valid)
+				return NULL;	/* one ran out: so has the intersection */
+		}
+
+		target = cur[order[0]].ckey;
+		for (k = 1; k < n; k++)
+		{
+			if (cur[order[k]].ckey > target)
+				target = cur[order[k]].ckey;
+		}
+		if ((uint64) target >= hi)
+			return NULL;
+
+		*w = 0;
+		for (k = 0; k < n; k++)
+		{
+			LionExprCursor *c = &cur[order[k]];
+
+			if (c->ckey < target)
+			{
+				lion_ecursor_seek(c, target);
+				if (!c->valid)
+					return NULL;
+			}
+
+			if (c->ckey > target)
+			{
+				/*
+				 * No container at the target at all: the key is dead, as with
+				 * an empty intersection, one step earlier.  The cursors after
+				 * this one are left standing, and the round starts again at
+				 * the key it found, the next one that can possibly survive -
+				 * the driver sought there first.
+				 */
+				if (stats != NULL)
+				{
+					for (m = k + 1; m < n; m++)
+					{
+						if (cur[order[m]].ckey < target)
+							stats->probes_avoided++;
+					}
+				}
+				target = c->ckey;
+				if ((uint64) target >= hi)
+					return NULL;
+				acc = NULL;
+				*w = 0;
+				k = -1;
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+
+			if (acc == NULL)
+				acc = lion_ecursor_container(c);	/* a union is built here */
+			else
+			{
+				if (c->pending && lion_or_probe_pays(c, acc))
+					lion_or_probe(c, acc, work[*w]);
+				else
+					lion_container_and_raw(acc, lion_ecursor_container(c),
+										   work[*w]);
+				acc = work[*w];
+				*w ^= 1;
+			}
+
+			if (lion_container_cardinality(acc) == 0)
+				break;
+		}
+
+		if (k >= n)
+		{
+			*key = target;
+			return acc;
+		}
+
+		/*
+		 * Abandoned: nothing of this key survives, so nothing asks the map
+		 * about it and the driver's page may go.  Only the driver steps; the
+		 * others still stand at or below the key it leaves and are sought
+		 * from there on the next round.
+		 */
+		if (stats != NULL)
+		{
+			for (m = k + 1; m < n; m++)
+			{
+				if (cur[order[m]].ckey < target)
+					stats->probes_avoided++;
+			}
+		}
+		lion_ecursor_next(&cur[order[0]]);
+		CHECK_FOR_INTERRUPTS();
+	}
+}
 
 /* ---- planning a tree against the open budget ---- */
 
@@ -3592,6 +3924,14 @@ lion_leaf_cost(const LionPostingSet *ps, bool droppins, Size *mem, int *pins)
 		*pins = 1;
 }
 
+/*
+ * What each child of an OR adds to it: its heap and hot entries, and the
+ * container it stands on (hotc).  lion_batch_end() sizes a batch's union by
+ * the same amount, so that a batch that fits is never planned wide.
+ */
+#define LION_OR_CHILD_OVERHEAD \
+	(2 * sizeof(LionOrHeapEnt) + sizeof(LionContainer *))
+
 /* What an OR or AND node of nargs children adds to them. */
 static inline Size
 lion_node_overhead(LionKeyNodeKind kind, int nargs)
@@ -3600,9 +3940,11 @@ lion_node_overhead(LionKeyNodeKind kind, int nargs)
 
 	if (nargs > 1)
 		mem += 2 * lion_alloc_size(LION_CONTAINER_MAX_SIZE);	/* acc[] */
+	if (kind == LION_KN_AND)
+		mem += (Size) nargs * sizeof(int);	/* order */
 	if (kind == LION_KN_OR)
 	{
-		mem += 2 * (Size) nargs * sizeof(LionOrHeapEnt);	/* heap, hot */
+		mem += (Size) nargs * LION_OR_CHILD_OVERHEAD;	/* heap, hot, hotc */
 		if (nargs > 2)
 			mem += lion_alloc_size(LION_BITSET_BYTES);	/* bits */
 	}
@@ -4146,14 +4488,93 @@ lion_bits_to_container(const uint64 *w, uint32 ckey, LionContainer *dest)
 }
 
 /*
+ * The union of the containers standing at one key, for a count (c->raw;
+ * DESIGN.md §15, "Unions and intersections unoptimized"), whose merge ANDs
+ * it with the other sources and counts it and never keeps it.  Unoptimized:
+ *
+ *	- ARRAYs of LION_OR_FOLD_MEMBERS members or fewer together are folded
+ *	  pairwise, each union a merge of two arrays and nothing else - the
+ *	  fold's cost grows with the containers times their members, so only
+ *	  while those are small;
+ *	- anything else is ORed into one bitset image, written in place as the
+ *	  payload of a BITSET container and counted once.  The image costs a
+ *	  fixed 4 kB clear and count, which a union of a hundred-odd members
+ *	  already repays: the pairwise fold of four dense ARRAYs merged, counted
+ *	  its runs and converted to a RUN three times over at every key, only for
+ *	  the AND after it to fill it back into a bitset; and three ARRAYs of 110
+ *	  members, folded in two merges, took a sixth longer than their image on
+ *	  the repro of §15's measurements.
+ *
+ * Which of the two the old rule took depended on the containers alone
+ * (LION_OR_BITSET_MIN), which is still where a fold stops.
+ */
+#define LION_OR_FOLD_MEMBERS	128
+
+static const LionContainer *
+lion_or_hot_raw(LionExprCursor *c, uint32 ckey)
+{
+	const LionContainer *a;
+	uint32		members = 0;
+	bool		arrays = true;
+	int			w = 0;
+	int			i;
+
+	for (i = 0; i < c->nhot; i++)
+	{
+		members += lion_container_cardinality(c->hot[i].cur);
+		if (c->hot[i].cur->type != LION_CT_ARRAY)
+			arrays = false;
+	}
+
+	if (arrays && members <= LION_OR_FOLD_MEMBERS &&
+		c->nhot < LION_OR_BITSET_MIN)
+	{
+		a = c->hot[0].cur;
+		for (i = 1; i < c->nhot; i++)
+		{
+			lion_container_or_raw(a, c->hot[i].cur, c->acc[w]);
+			a = c->acc[w];
+			w ^= 1;
+		}
+		return a;
+	}
+
+	lion_container_bitset_init(c->acc[0], ckey);
+	for (i = 0; i < c->nhot; i++)
+		lion_container_or_into_bitset(c->hot[i].cur,
+									  LION_BITSET_DATA(c->acc[0]));
+	(void) lion_container_bitset_recount(c->acc[0]);
+	return c->acc[0];
+}
+
+/*
  * Build the cursor of one planned node (lion_plan_node()).  droppins: carry
  * no interlock anywhere below - a child of a wide union, a child of a
- * trimmed AND other than the one that keeps its pins.
+ * trimmed AND other than the one that keeps its pins.  Its container is
+ * what cx->raw says: unoptimized for a count, optimized for a stream, whose
+ * caller copies it.
  */
 static void
 lion_ecursor_init(LionExprCursor *c, const LionNodePlan *plan,
 				 LionPostingSet *sets, int nsets, LionCountCtx *cx,
 				 bool droppins)
+{
+	lion_ecursor_init_ex(c, plan, sets, nsets, cx, droppins, cx->raw, false);
+}
+
+/*
+ * ... with raw: its containers may be left unoptimized - a count's, and those
+ * of every child of an AND node, which the leapfrog ANDs and never hands on
+ * as they are (the node optimizes what it hands up when it is not raw
+ * itself); and lazy: under a leapfrog, whose OR is not built until it is
+ * asked for (lion_ecursor_container(), DESIGN.md §29.11, "Unions probed").
+ * An OR's children are what the OR is: its union of one child is that
+ * child's container.
+ */
+static void
+lion_ecursor_init_ex(LionExprCursor *c, const LionNodePlan *plan,
+					 LionPostingSet *sets, int nsets, LionCountCtx *cx,
+					 bool droppins, bool raw, bool lazy)
 {
 	const LionKeyNode *node = plan->node;
 	int			i;
@@ -4163,10 +4584,13 @@ lion_ecursor_init(LionExprCursor *c, const LionNodePlan *plan,
 	memset(c, 0, sizeof(LionExprCursor));
 	c->node = node;
 	c->plan = plan;
+	c->raw = raw;
+	c->cx = cx;
 	if (node == NULL)
 		return;					/* a source with no sets at all */
 
 	c->kind = node->kind;
+	c->lazy = lazy && node->kind == LION_KN_OR && !plan->wide;
 
 	if (node->kind == LION_KN_KEY)
 	{
@@ -4180,18 +4604,34 @@ lion_ecursor_init(LionExprCursor *c, const LionNodePlan *plan,
 	}
 	else
 	{
+		/* the children of a leapfrog: raw, and lazy where they are unions */
+		bool		under = (node->kind == LION_KN_AND && node->nargs > 1);
+
 		Assert(node->nargs >= 1 && plan->nsub == node->nargs);
 		c->nsub = node->nargs;
 		c->sub = (LionExprCursor *) palloc0(sizeof(LionExprCursor) * c->nsub);
 		for (i = 0; i < c->nsub; i++)
-			lion_ecursor_init(&c->sub[i], &plan->sub[i], sets, nsets, cx,
-							  droppins ||
-							  (plan->keep != LION_KEEP_ALL && plan->keep != i));
+			lion_ecursor_init_ex(&c->sub[i], &plan->sub[i], sets, nsets, cx,
+								 droppins ||
+								 (plan->keep != LION_KEEP_ALL && plan->keep != i),
+								 under || raw, under);
 
 		if (c->nsub > 1)
 		{
 			c->acc[0] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 			c->acc[1] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+		}
+
+		if (node->kind == LION_KN_AND)
+		{
+			/* the leapfrog's order: fewest members first (lion_leapfrog()) */
+			double	   *est = (double *) palloc(sizeof(double) * c->nsub);
+
+			for (i = 0; i < c->nsub; i++)
+				est[i] = lion_node_members(node->args[i], sets);
+			c->order = (int *) palloc(sizeof(int) * c->nsub);
+			lion_leapfrog_order(est, c->nsub, c->order);
+			pfree(est);
 		}
 
 		if (node->kind == LION_KN_OR)
@@ -4200,6 +4640,9 @@ lion_ecursor_init(LionExprCursor *c, const LionNodePlan *plan,
 			c->heap = (LionOrHeapEnt *) palloc(sizeof(LionOrHeapEnt) * c->nsub);
 			if (c->nsub > 2)
 				c->bits = (uint64 *) palloc(LION_BITSET_BYTES);
+			if (c->lazy)
+				c->hotc = (const LionContainer **)
+					palloc(sizeof(LionContainer *) * c->nsub);
 
 			/*
 			 * Every child that has a container goes on the heap; build()
@@ -4217,6 +4660,207 @@ lion_ecursor_init(LionExprCursor *c, const LionNodePlan *plan,
 }
 
 /*
+ * The union of the children standing at the key, c->hot[] (at least two), in
+ * c->cur - unoptimized for a raw cursor (lion_or_hot_raw()), else in the
+ * smallest representation, as a stream's caller copies it.
+ */
+static void
+lion_or_build(LionExprCursor *c)
+{
+	int			w = 0;
+	int			i;
+
+	Assert(c->kind == LION_KN_OR && c->nhot > 1);
+	c->cx->stats.unions_built++;
+	c->pending = false;
+
+	if (c->raw)
+		c->cur = lion_or_hot_raw(c, c->ckey);
+	else if (c->nhot < LION_OR_BITSET_MIN)
+	{
+		const LionContainer *a = c->hot[0].cur;
+
+		for (i = 1; i < c->nhot; i++)
+		{
+			lion_container_or(a, c->hot[i].cur, c->acc[w]);
+			a = c->acc[w];
+			w ^= 1;
+		}
+		c->cur = a;
+	}
+	else
+	{
+		/* One pass over the containers, one container built at the end. */
+		memset(c->bits, 0, LION_BITSET_BYTES);
+		for (i = 0; i < c->nhot; i++)
+			lion_container_or_into_bitset(c->hot[i].cur, c->bits);
+		lion_bits_to_container(c->bits, c->ckey, c->acc[0]);
+		c->cur = c->acc[0];
+	}
+}
+
+/*
+ * The container the cursor stands on, the union of a lazy OR's children
+ * built if it has not been (lion_leapfrog()).
+ */
+static const LionContainer *
+lion_ecursor_container(LionExprCursor *c)
+{
+	Assert(c->valid);
+	if (c->pending)
+		lion_or_build(c);
+	return c->cur;
+}
+
+/*
+ * BUILD THE UNION, OR PROBE ITS MEMBERS (DESIGN.md §29.11, "Unions probed").
+ *
+ * The AND of a running intersection acc with the union of the containers a
+ * lazy OR's children have at the key can be made two ways, with the same
+ * members as the result: build the union (lion_or_build()) and AND acc with
+ * it, or look acc's members up in each child's container in turn, a member
+ * once found not again, and keep the ones found (lion_or_probe(),
+ * lion_container_and_union_raw()).  The first costs every member of the
+ * union - a bitset image cleared, filled and counted, or for a few small
+ * ARRAYs a fold of merges - and then the AND; the second costs acc's members
+ * a child - a bit test in a BITSET, a galloping search through an ARRAY, a
+ * search of a RUN's runs or a merge with them - and acc's extraction when
+ * acc is not an ARRAY.  So the probe wins where the intersection is small
+ * against the union - a few rows of a selective AND against a list's
+ * containers of hundreds or thousands - and the union where the intersection
+ * is dense, or the list's containers are small.
+ *
+ * Which is cheaper is estimated here from what the containers' headers say,
+ * in quarters of a nanosecond as a harness beside the container library
+ * measured them (-O2, containers of a heap of 70 rows a block, members at
+ * every offset a row can have): a bit test 2 ns; a gallop through an ARRAY
+ * of s members 2 ns a step there and 3 in a count, whose containers are not
+ * all in the first-level cache, 1 + log2(1 + s/a) steps a member of acc; a
+ * search of r runs 1.5 ns a step, a merge with them 0.75 ns a run and 3 a
+ * member; and for the union a member of an ARRAY 1 ns, a BITSET 170, a run 2,
+ * the image's clear and count 150 (52 ns of which is the count on PostgreSQL
+ * 18's AVX-512 popcount; 16's takes 670), a fold 1.25 ns a member a fold,
+ * and acc's AND with it 1.5 ns a member.  The estimate is integer
+ * arithmetic and its logarithms fixed point (lion_log2_16()): it is made at
+ * every key a union is met at, and made in floating point it took 2 to 3%
+ * of a count that builds its unions anyway.  Rounded to whole steps instead,
+ * it took 120 members against two ARRAYs of 90 for one step each where they
+ * take 1.8, probed them, and the count that built its union in 2.8 ms took
+ * 4.2.  It takes every member of acc to be looked up in every child, where
+ * one found is not looked up again: it errs towards the union.  An acc of
+ * more than an ARRAY's worth of members is never probed.
+ */
+#define LION_UP_BIT			8	/* quarters of a nanosecond */
+#define LION_UP_GALLOP		12
+#define LION_UP_RUNSEARCH	6
+#define LION_UP_RUNMERGE	3
+#define LION_UP_RUNMERGE_A	12
+#define LION_UP_EXTRACT		400 /* a BITSET's 512 words scanned */
+#define LION_UP_MEMBER_OR	4
+#define LION_UP_BITSET_OR	680
+#define LION_UP_RUN_OR		8
+#define LION_UP_IMAGE		600
+#define LION_UP_FOLD		5
+#define LION_UP_AND			6
+
+/* GUC pg_lion.enable_union_probe (DESIGN.md §29.11, "Unions probed") */
+bool		lion_enable_union_probe = true;
+
+/*
+ * 16 log2(x) for x >= 1, within a sixteenth or so: the leading bit's position
+ * and the four bits after it, as a straight line between two powers of two.
+ */
+static inline uint32
+lion_log2_16(uint32 x)
+{
+	int			k = pg_leftmost_one_pos32(x);
+	uint32		rest = x - ((uint32) 1 << k);
+
+	return (uint32) k * 16 + ((k >= 4) ? rest >> (k - 4) : rest << (4 - k));
+}
+
+static bool
+lion_or_probe_pays(const LionExprCursor *c, const LionContainer *acc)
+{
+	uint64		a = lion_container_cardinality(acc);
+	uint64		probe = 0;
+	uint64		unite = 0;
+	uint64		members = 0;
+	bool		arrays = true;
+	int			i;
+
+	Assert(c->pending && c->nhot > 1);
+	if (!lion_enable_union_probe || a > LION_ARRAY_MAX_CARD)
+		return false;
+	a = Max(a, 1);
+
+	if (acc->type == LION_CT_BITSET)
+		probe += LION_UP_EXTRACT + 4 * a;
+	else if (acc->type == LION_CT_RUN)
+		probe += 4 * a;
+
+	for (i = 0; i < c->nhot; i++)
+	{
+		const LionContainer *h = c->hot[i].cur;
+		uint64		m = lion_container_cardinality(h);
+
+		members += m;
+		if (h->type == LION_CT_BITSET)
+		{
+			probe += LION_UP_BIT * a;
+			unite += LION_UP_BITSET_OR;
+			arrays = false;
+		}
+		else if (h->type == LION_CT_RUN)
+		{
+			uint32		r = Min((uint32) LION_RUN_NRUNS((LionContainer *) h),
+								(uint32) LION_RUN_MAX_NRUNS);
+
+			probe += ((uint64) r >= 8 * a) ?
+				LION_UP_RUNSEARCH * a * lion_log2_16(r + 1) / 16 :
+				LION_UP_RUNMERGE * r + LION_UP_RUNMERGE_A * a;
+			unite += LION_UP_RUN_OR * (uint64) r;
+			arrays = false;
+		}
+		else
+		{
+			/* 1 + log2(1 + m/a) steps: 16 + 16 log2(16 + 16 m/a) - 64 sixteenths */
+			probe += LION_UP_GALLOP * a *
+				(lion_log2_16((uint32) (16 * m / a) + 16) - 48) / 16;
+			unite += LION_UP_MEMBER_OR * m;
+		}
+	}
+
+	/* lion_or_hot_raw()'s two ways, and acc's AND with what it builds */
+	if (arrays && members <= LION_OR_FOLD_MEMBERS &&
+		c->nhot < LION_OR_BITSET_MIN)
+		unite = LION_UP_FOLD * members * (uint64) c->nhot +
+			LION_UP_AND * (a + members);
+	else
+		unite += LION_UP_IMAGE +
+			((acc->type == LION_CT_ARRAY) ? LION_UP_AND * a : LION_UP_IMAGE);
+
+	return probe < unite;
+}
+
+/*
+ * dest = acc AND the union of c->hot[], without building it: acc's members
+ * looked up in the children's containers (lion_container_and_union_raw()).
+ * The union stays unbuilt; nothing else asks for it at this key.
+ */
+static void
+lion_or_probe(LionExprCursor *c, const LionContainer *acc, LionContainer *dest)
+{
+	int			i;
+
+	Assert(c->pending && c->hotc != NULL);
+	for (i = 0; i < c->nhot; i++)
+		c->hotc[i] = c->hot[i].cur;
+	(void) lion_container_and_union_raw(acc, c->hotc, (uint32) c->nhot, dest);
+	c->cx->stats.unions_probed++;
+}
+
+/*
  * Recompute the cursor's current container from its children.
  */
 static void
@@ -4224,9 +4868,9 @@ lion_ecursor_build(LionExprCursor *c)
 {
 	const LionContainer *acc;
 	int			w = 0;
-	int			i;
 
 	c->valid = false;
+	c->pending = false;
 	c->cur = NULL;
 
 	if (c->node == NULL)
@@ -4271,103 +4915,53 @@ lion_ecursor_build(LionExprCursor *c)
 			c->hot[c->nhot++] = lion_or_heap_pop(c);
 		} while (c->nheap > 0 && c->heap[0].ckey == minckey);
 
-		if (c->nhot == 1)
-			c->cur = c->hot[0].cur;
-		else if (c->nhot < LION_OR_BITSET_MIN)
-		{
-			const LionContainer *a = c->hot[0].cur;
-
-			for (i = 1; i < c->nhot; i++)
-			{
-				lion_container_or(a, c->hot[i].cur, c->acc[w]);
-				a = c->acc[w];
-				w ^= 1;
-			}
-			c->cur = a;
-		}
-		else
-		{
-			/* One pass over the containers, one container built at the end. */
-			memset(c->bits, 0, LION_BITSET_BYTES);
-			for (i = 0; i < c->nhot; i++)
-				lion_container_or_into_bitset(c->hot[i].cur, c->bits);
-			lion_bits_to_container(c->bits, minckey, c->acc[0]);
-			c->cur = c->acc[0];
-		}
-
 		c->ckey = minckey;
 		c->valid = true;
+
+		/*
+		 * The union of one child is its container.  A lazy cursor's of more
+		 * is built when lion_leapfrog() asks for it, which it does only for
+		 * the driver and where building it is the cheaper way to AND it
+		 * (DESIGN.md §29.11, "Unions probed").
+		 */
+		if (c->nhot == 1)
+			c->cur = c->hot[0].cur;
+		else if (c->lazy)
+			c->pending = true;
+		else
+			lion_or_build(c);
 		return;
 	}
 
 	Assert(c->kind == LION_KN_AND);
 
-	for (;;)
+	/*
+	 * The children, wound forward to the next key their AND holds a member
+	 * at, as the count's merge winds its sources (lion_leapfrog(), DESIGN.md
+	 * §22): the one with the fewest members drives, the others are sought to
+	 * its keys in ascending members, and a key is abandoned as soon as the
+	 * intersection is empty.  Nothing of the keys they pass over ever reaches
+	 * the visibility map, so the §9 rule is untouched - this is the same
+	 * window the code has always wound laggards forward in.
+	 */
+	acc = lion_leapfrog(c->sub, c->order, c->nsub, c->acc, &w, LION_WIDE_END,
+						NULL, &c->ckey);
+	if (acc == NULL)
+		return;
+
+	/*
+	 * The AND was made of unoptimized containers, and the one handed up is
+	 * optimized here when the caller copies it (a stream's, DESIGN.md
+	 * §29.3) - once, rather than at every step of the AND as it was.  With
+	 * two children or more it is in c->acc[].
+	 */
+	if (!c->raw && c->nsub > 1)
 	{
-		uint32		maxckey;
-		bool		alleq = true;
-
-		for (i = 0; i < c->nsub; i++)
-		{
-			if (!c->sub[i].valid)
-				return;			/* a child ran out: so has the intersection */
-		}
-
-		maxckey = c->sub[0].ckey;
-		for (i = 1; i < c->nsub; i++)
-		{
-			if (c->sub[i].ckey > maxckey)
-				maxckey = c->sub[i].ckey;
-		}
-
-		/*
-		 * Wind the laggards forward; their containers cannot contribute.
-		 * DESIGN.md §22: a laggard SEEKS to the key the others stand at
-		 * instead of stepping through everything in between, which is the
-		 * whole point of the posting tree.  Nothing of the keys it skips ever
-		 * reaches the visibility map, so the §9 rule is untouched - this is
-		 * the same window the code used to call lion_ecursor_next() in.
-		 */
-		for (i = 0; i < c->nsub; i++)
-		{
-			if (c->sub[i].ckey != maxckey)
-			{
-				alleq = false;
-				lion_ecursor_seek(&c->sub[i], maxckey);
-			}
-		}
-		if (!alleq)
-		{
-			CHECK_FOR_INTERRUPTS();
-			continue;
-		}
-
-		acc = c->sub[0].cur;
-		w = 0;
-		for (i = 1; i < c->nsub; i++)
-		{
-			lion_container_and(acc, c->sub[i].cur, c->acc[w]);
-			acc = c->acc[w];
-			w ^= 1;
-		}
-
-		if (lion_container_cardinality(acc) > 0)
-		{
-			c->ckey = maxckey;
-			c->cur = acc;
-			c->valid = true;
-			return;
-		}
-
-		/*
-		 * Nothing of this container key survives the intersection, so nothing
-		 * will ask the visibility map about it and every child may move on.
-		 */
-		for (i = 0; i < c->nsub; i++)
-			lion_ecursor_next(&c->sub[i]);
-
-		CHECK_FOR_INTERRUPTS();
+		Assert(acc == c->acc[0] || acc == c->acc[1]);
+		lion_container_optimize((LionContainer *) acc);
 	}
+	c->cur = acc;
+	c->valid = true;
 }
 
 /*
@@ -4419,13 +5013,14 @@ lion_ecursor_next(LionExprCursor *c)
 		case LION_KN_AND:
 
 			/*
-			 * Every child stands at c->ckey, but only ONE of them has to step:
-			 * lion_ecursor_build() then finds it ahead of the others and SEEKS
-			 * them to it (DESIGN.md §22), which is one probe each instead of a
-			 * walk.  Stepping all of them would cost every child a container
-			 * at c->ckey + 1 that the seek is about to skip anyway.
+			 * Every child stands at c->ckey, but only ONE of them has to step,
+			 * the driver: lion_ecursor_build() then finds it ahead of the
+			 * others and SEEKS them to it (DESIGN.md §22), which is one probe
+			 * each instead of a walk.  Stepping all of them would cost every
+			 * child a container at c->ckey + 1 that the seek is about to skip
+			 * anyway.
 			 */
-			lion_ecursor_next(&c->sub[0]);
+			lion_ecursor_next(&c->sub[c->order[0]]);
 			break;
 	}
 
@@ -4491,9 +5086,13 @@ lion_ecursor_seek(LionExprCursor *c, uint32 target)
 			break;
 
 		case LION_KN_AND:
-			/* every child stands at c->ckey, and the result needs all of them */
-			for (i = 0; i < c->nsub; i++)
-				lion_ecursor_seek(&c->sub[i], target);
+
+			/*
+			 * Only the driver: lion_ecursor_build() seeks the others to
+			 * wherever it lands, one at a time, and not at all past a child
+			 * that rules the key out (lion_leapfrog()).
+			 */
+			lion_ecursor_seek(&c->sub[c->order[0]], target);
 			break;
 	}
 
@@ -5491,11 +6090,21 @@ lion_recheck_cb(uint16 lo, void *arg)
  * order a LionMatSet keeps.  A copy that would outgrow its budget is given up
  * on: failed is set, the merge stops at the next container boundary
  * (lion_exists_settled()), and the caller counts the ordinary way instead.
+ *
+ * The merge's results come unoptimized (LionCountCtx.raw): what is kept is
+ * the smallest representation, as the optimizing set algebra used to leave
+ * it, so that a copy takes what it always took.
  */
 static void
 lion_collect_container(LionCollect *col, const LionContainer *c)
 {
-	Size		sz = lion_item_size(c);
+	union
+	{
+		LionContainer hdr;
+		uint64		align;
+		char		data[LION_CONTAINER_MAX_SIZE];
+	}			opt;
+	Size		sz;
 	MemoryContext oldcxt;
 	int			i;
 
@@ -5503,6 +6112,11 @@ lion_collect_container(LionCollect *col, const LionContainer *c)
 		return;
 	if (lion_container_cardinality(c) == 0)
 		return;
+
+	memcpy(opt.data, c, lion_container_size(c));
+	lion_container_optimize(&opt.hdr);
+	c = &opt.hdr;
+	sz = lion_item_size(c);
 	if (!col->spilled &&
 		sizeof(LionMatSet) + MAXALIGN(col->used + sz) +
 		(sizeof(LionContainer *) + sizeof(uint32)) * (col->noffs + 1) >
@@ -5579,7 +6193,6 @@ lion_count_container_vm(LionCountCtx *cx, const LionContainer *c)
 	BlockNumber firstblk = lion_ckey_first_block(c->ckey);
 	uint64		members;		/* blocks of this container that have members */
 	uint64		allvis;			/* blocks marked all-visible in the VM */
-	uint64		dirty;			/* blocks with members that need a heap recheck */
 
 	/* A collection copies the container and asks nothing (DESIGN.md §27). */
 	if (cx->collect != NULL)
@@ -5621,6 +6234,25 @@ lion_count_container_vm(LionCountCtx *cx, const LionContainer *c)
 		lion_vm_mask_check(cx->heap, firstblk, members, allvis, &cx->vmbuf);
 #endif
 	}
+	lion_count_container_masks(cx, c, members, allvis);
+}
+
+/*
+ * Step 2 of counting a container, once the visibility map has been asked
+ * about its blocks under the pins of DESIGN.md section 9: `members` has the
+ * bit of every heap block c has a member on (lion_container_block_mask()),
+ * `allvis` those the map marks all-visible.  Count the members of those
+ * blocks outright, and queue the others' TIDs for the heap recheck.  The
+ * grouped walk (lion_count_groups_copy()) comes here too, with one answer of
+ * the map for all the groups' containers at a key.
+ */
+static void
+lion_count_container_masks(LionCountCtx *cx, const LionContainer *c,
+						   uint64 members, uint64 allvis)
+{
+	BlockNumber firstblk = lion_ckey_first_block(c->ckey);
+	uint64		dirty;			/* blocks with members that need a heap recheck */
+
 	dirty = members & ~allvis;
 
 	if (dirty == 0)
@@ -5807,11 +6439,10 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 		}
 	}
 
-	lion_cursor_init(&cur, ps, cx, false);
-
-	/* a chunk of a shared copy: from its first key, up to its end */
-	if (cx->collect != NULL && cx->collect->ranged)
-		lion_cursor_seek(&cur, cx->collect->lo);
+	/* a chunk of a collection (ranged): from its first key, up to its end */
+	lion_cursor_init_at(&cur, ps, cx, false,
+						(cx->collect != NULL && cx->collect->ranged) ?
+						cx->collect->lo : 0, NULL);
 	while (cur.valid)
 	{
 		if (lion_collect_past(cx, cur.cur->ckey))
@@ -6381,9 +7012,9 @@ lion_run_merge_copy(LionCountCtx *cx, LionCountSource *drvsrc,
 			continue;
 		}
 
-		if (lion_container_and(drv.cur,
-							   lion_mat_container(cx, mat, idx, buf),
-							   work) > 0)
+		if (lion_container_and_raw(drv.cur,
+								   lion_mat_container(cx, mat, idx, buf),
+								   work) > 0)
 		{
 			/* the map is asked before the driver lets its page go */
 			lion_count_container_vm(cx, work);
@@ -6426,6 +7057,7 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 	int		   *probeord;		/* the positive sources, least first */
 	int			nprobe = 0;
 	int			driver;
+	uint64		hi;				/* the merge ends before this key */
 	int			i;
 
 	cursors = (LionExprCursor *) palloc0(sizeof(LionExprCursor) * nsources);
@@ -6508,16 +7140,22 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 		work[1] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	}
 
+	/*
+	 * The positive sources are lazy: a union among them is built only when
+	 * the leapfrog finds that cheaper than probing its members (DESIGN.md
+	 * §29.11, "Unions probed").  A negated one is subtracted whole.
+	 */
 	for (i = 0; i < nsources; i++)
-		lion_ecursor_init(&cursors[i], plans[i], sources[i].sets,
-						 sources[i].nsets, cx, false);
+		lion_ecursor_init_ex(&cursors[i], plans[i], sources[i].sets,
+							 sources[i].nsets, cx, false, cx->raw,
+							 !sources[i].negated);
 
 	/*
 	 * A chunk of a shared copy (LionCollect.ranged) begins at its first key:
 	 * the positive sources are sought there - a collection holds no pin, so
 	 * nothing they pass over carries an answer - and the merge ends where the
-	 * chunk does (lion_collect_past(), below).  The negated ones are sought
-	 * when they are needed, as always.
+	 * chunk does (`hi`, below).  The negated ones are sought when they are
+	 * needed, as always.
 	 */
 	if (cx->collect != NULL && cx->collect->ranged && cx->collect->lo > 0)
 	{
@@ -6529,6 +7167,19 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 	}
 
 	/*
+	 * Past a container key only the DRIVER steps; the others are left standing
+	 * where they are and are sought to wherever the driver has got to
+	 * (DESIGN.md §22).  A cursor that keeps its place also keeps its pin,
+	 * which is a pin too many and never a wrong answer (see
+	 * lion_ecursor_next()).
+	 */
+	for (i = 0; i < nsources; i++)
+		cursors[i].advance = false;
+	cursors[driver].advance = true;
+	hi = (cx->collect != NULL && cx->collect->ranged) ?
+		cx->collect->hi : LION_WIDE_END;
+
+	/*
 	 * Merge the sources by container key.  Containers are stored in ascending
 	 * ckey order both inline and along a chain, and an expression cursor
 	 * preserves that, so a single forward pass over all of them is enough.
@@ -6536,155 +7187,28 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 	for (;;)
 	{
 		uint32		maxckey;
-		const LionContainer *acc = NULL;
-		bool		abandoned = false;
-		int			w = 0;
-		int			k;
-
-		/* The positive sources drive the merge; all must still have data. */
-		for (k = 0; k < nprobe; k++)
-		{
-			if (!cursors[probeord[k]].valid)
-				goto merge_done;
-		}
-
-		maxckey = cursors[probeord[0]].ckey;
-		for (k = 1; k < nprobe; k++)
-		{
-			if (cursors[probeord[k]].ckey > maxckey)
-				maxckey = cursors[probeord[k]].ckey;
-		}
-		if (lion_collect_past(cx, maxckey))
-			goto merge_done;
-
-		/*
-		 * Past this container key only the DRIVER steps; the others are left
-		 * standing where they are and the next round of this loop seeks them
-		 * to wherever the driver has got to (DESIGN.md §22).  A cursor that
-		 * keeps its place also keeps its pin, which is a pin too many and
-		 * never a wrong answer (see lion_ecursor_next()).
-		 */
-		for (i = 0; i < nsources; i++)
-			cursors[i].advance = false;
-		cursors[driver].advance = true;
+		const LionContainer *acc;
+		int			w;
 
 		/*
 		 * THE INTERSECTION OF THE POSITIVE SOURCES, BUILT AS THEY ARE SOUGHT
-		 * (DESIGN.md §25).  The sources are taken in probe order - the driver,
-		 * which stands at or below the target already, then the others least
-		 * selective-first - and each one is sought to the target and folded
-		 * into the accumulator before the next one is touched at all.  The
-		 * moment the accumulator is empty the container key is ABANDONED: the
-		 * sources after it in the order are not sought, and the pages their
-		 * probes would have read are not read.  Before this the whole round of
+		 * (DESIGN.md §25): the leapfrog every AND of posting sets is made by,
+		 * a lion index scan's included (lion_leapfrog(), which carries the §9
+		 * argument).  The sources are taken in probe order, each sought to the
+		 * driver's key and folded into the accumulator before the next one is
+		 * touched at all, and a key is abandoned - the sources after it in the
+		 * order not sought, the pages their probes would have read not read -
+		 * the moment the accumulator is empty.  Before §25 the whole round of
 		 * seeks was made first and the intersection looked at afterwards,
 		 * which read a dense source's leaf at every container key the driver
-		 * produced, including the ones where the selective sources had already
-		 * ruled the key out.
-		 *
-		 * THE DESIGN.md §9 PIN DISCIPLINE IS UNCHANGED, and this is the
-		 * argument.  The rule is that the visibility-map question about a
-		 * container's heap blocks is asked before the pin on the page that
-		 * container came from is released.  An abandoned container key asks NO
-		 * such question - nothing of it reaches lion_count_container(), so
-		 * nothing of it reaches the count - so there is no obligation to
-		 * discharge for any of the pages it touched, sought or not.  What the
-		 * sources that were not sought keep is their PINS, exactly where they
-		 * stood: a pin too many never makes a count wrong, it only makes
-		 * VACUUM wait (see lion_ecursor_next()).  The pages the sources that
-		 * WERE sought let go of are let go by lion_ecursor_seek(), which is
-		 * the same window, at the same kind of key, as before §25.
+		 * produced, including the ones where the selective sources had
+		 * already ruled the key out.  A chunk of a collection ends at its last
+		 * key (lion_collect_past()).
 		 */
-		for (k = 0; k < nprobe; k++)
-		{
-			int			s = probeord[k];
-			int			m;
-
-			if (cursors[s].ckey < maxckey)
-			{
-				/*
-				 * DESIGN.md §22: a lagging source SEEKS to the largest key any
-				 * positive source stands at rather than stepping one container
-				 * at a time.  That is the leapfrog join the posting tree
-				 * exists for.
-				 */
-				lion_ecursor_seek(&cursors[s], maxckey);
-				if (!cursors[s].valid)
-					goto merge_done;
-			}
-
-			if (cursors[s].ckey > maxckey)
-			{
-				/*
-				 * This source has no container at the target at all, so the
-				 * intersection there is empty and the key is dead - the same
-				 * abandonment as an empty accumulator, one step earlier.  The
-				 * sources after it in the order are left standing; the round
-				 * starts again at the key this one found, which is the next
-				 * one that can possibly survive.
-				 */
-				for (m = k + 1; m < nprobe; m++)
-				{
-					if (cursors[probeord[m]].ckey < maxckey)
-						cx->stats.probes_avoided++;
-				}
-
-				maxckey = cursors[s].ckey;
-				if (lion_collect_past(cx, maxckey))
-					goto merge_done;
-				acc = NULL;
-				w = 0;
-				k = -1;
-				CHECK_FOR_INTERRUPTS();
-				continue;
-			}
-
-			if (acc == NULL)
-				acc = cursors[s].cur;
-			else
-			{
-				lion_container_and(acc, cursors[s].cur, work[w]);
-				acc = work[w];
-				w ^= 1;
-			}
-
-			if (lion_container_cardinality(acc) == 0)
-			{
-				/*
-				 * Nothing can come back once the accumulator is empty, so the
-				 * rest of the order is not sought.  What that saves is one
-				 * seek each - a descent, or a step or two right - and it is
-				 * counted for EXPLAIN: a source standing at the target or
-				 * beyond it would not have been sought anyway, so only the
-				 * ones still below it count.
-				 */
-				for (m = k + 1; m < nprobe; m++)
-				{
-					if (cursors[probeord[m]].ckey < maxckey)
-						cx->stats.probes_avoided++;
-				}
-				abandoned = true;
-				break;
-			}
-		}
-
-		if (abandoned)
-		{
-			/*
-			 * Nothing of this container key survives, so no visibility-map
-			 * question is asked about it and the driver's page may go.  Only
-			 * the driver steps: the others are still standing at (or below)
-			 * the key it is leaving and are sought from there on the next
-			 * round.
-			 */
-			for (i = 0; i < nsources; i++)
-			{
-				if (cursors[i].advance)
-					lion_ecursor_next(&cursors[i]);
-			}
-			CHECK_FOR_INTERRUPTS();
-			continue;
-		}
+		acc = lion_leapfrog(cursors, probeord, nprobe, work, &w, hi,
+							&cx->stats, &maxckey);
+		if (acc == NULL)
+			goto merge_done;
 
 		/* ... minus the negated ones (DESIGN.md §14, `col IS NOT NULL`). */
 		for (i = 0; i < nsources; i++)
@@ -6698,7 +7222,7 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 
 			if (lion_container_cardinality(acc) > 0)
 			{
-				lion_container_andnot(acc, cursors[i].cur, work[w]);
+				lion_container_andnot_raw(acc, cursors[i].cur, work[w]);
 				acc = work[w];
 				w ^= 1;
 			}
@@ -7077,7 +7601,7 @@ lion_batch_end(const LionCountSource *src, int start,
 			   const LionOpenBudget *budget)
 {
 	Size		mem = lion_node_overhead(LION_KN_OR, 3) -
-		3 * 2 * sizeof(LionOrHeapEnt);
+		3 * LION_OR_CHILD_OVERHEAD;
 	int			pins = 0;
 	int			n = 0;
 	int			end;
@@ -7090,7 +7614,7 @@ lion_batch_end(const LionCountSource *src, int start,
 		if (!src->sets[end].found)
 			continue;
 		lion_leaf_cost(&src->sets[end], false, &m, &p);
-		m += 2 * sizeof(LionOrHeapEnt);
+		m += LION_OR_CHILD_OVERHEAD;
 		if (n >= LION_BATCH_MIN_SETS &&
 			(mem + m > budget->mem || pins + p > budget->pins))
 			break;
@@ -7264,11 +7788,52 @@ lion_exists_sources_cached(Relation heap, Snapshot snapshot, int nsources,
  * way it would otherwise fall back to seeks every source at every container
  * key of every located set it is counted beside - for a long IN list among
  * the sources, a union of all its sets built again for each of them.
+ *
+ * It returns false as well where no source has a found set to copy from.
  */
+static bool lion_sources_collect_keys(Relation heap, Snapshot snapshot,
+									  int nsources, LionCountSource *sources,
+									  Size maxbytes, bool spill, bool ranged,
+									  uint32 lo, uint64 hi,
+									  LionPostingSet *out, bool *spilled,
+									  LionCountStats *stats);
+
 bool
 lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 					 LionCountSource *sources, Size maxbytes, bool spill,
 					 LionPostingSet *out, bool *spilled, LionCountStats *stats)
+{
+	return lion_sources_collect_keys(heap, snapshot, nsources, sources,
+									 maxbytes, spill, false, 0, 0,
+									 out, spilled, stats);
+}
+
+/*
+ * The same copy of the container keys from lo up to, not including, hi alone
+ * (LION_KEYS_END: every key from lo on) - one range of lion_key_ranges()'s
+ * cut, which one participant of a parallel GROUP BY counts its groups against
+ * (DESIGN.md §10, "A GROUP BY in parallel").  The sources are sought to lo and
+ * the merge stops at hi, as for a chunk of a shared copy (LionCollect.ranged);
+ * what it holds is the whole copy's containers at those keys, on the same
+ * terms.
+ */
+bool
+lion_sources_collect_range(Relation heap, Snapshot snapshot, int nsources,
+						   LionCountSource *sources, Size maxbytes, bool spill,
+						   uint32 lo, uint64 hi, LionPostingSet *out,
+						   bool *spilled, LionCountStats *stats)
+{
+	return lion_sources_collect_keys(heap, snapshot, nsources, sources,
+									 maxbytes, spill, true, lo, hi,
+									 out, spilled, stats);
+}
+
+static bool
+lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
+						  LionCountSource *sources, Size maxbytes, bool spill,
+						  bool ranged, uint32 lo, uint64 hi,
+						  LionPostingSet *out, bool *spilled,
+						  LionCountStats *stats)
 {
 	LionCollect col;
 	LionMatSet *mat;
@@ -7303,6 +7868,9 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 	col.cxt = CurrentMemoryContext;
 	col.maxbytes = maxbytes;
 	col.spill = spill;
+	col.ranged = ranged;
+	col.lo = lo;
+	col.hi = hi;
 	col.cap = 8192;
 	col.buf = (char *) palloc(col.cap);
 	col.offcap = 256;
@@ -7388,6 +7956,436 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 
 
 /* ---------------------------------------------------------------------
+ * The groups of a walk, counted together (DESIGN.md §10)
+ * --------------------------------------------------------------------- */
+
+/*
+ * A group's cursor on the grouped walk's heap: the container key it stands
+ * at, and which group it is.
+ */
+typedef struct LionGroupEnt
+{
+	uint32		ckey;
+	int32		g;
+} LionGroupEnt;
+
+static void
+lion_group_heap_push(LionGroupEnt *heap, int *nheap, uint32 ckey, int g)
+{
+	int			i = (*nheap)++;
+
+	while (i > 0)
+	{
+		int			parent = (i - 1) / 2;
+
+		if (heap[parent].ckey <= ckey)
+			break;
+		heap[i] = heap[parent];
+		i = parent;
+	}
+	heap[i].ckey = ckey;
+	heap[i].g = g;
+}
+
+static LionGroupEnt
+lion_group_heap_pop(LionGroupEnt *heap, int *nheap)
+{
+	LionGroupEnt top = heap[0];
+	LionGroupEnt last;
+	int			i = 0;
+
+	Assert(*nheap > 0);
+	if (--(*nheap) == 0)
+		return top;
+
+	last = heap[*nheap];
+	for (;;)
+	{
+		int			l = 2 * i + 1;
+		int			r = l + 1;
+		int			small = i;
+		uint32		smallkey = last.ckey;
+
+		if (l < *nheap && heap[l].ckey < smallkey)
+		{
+			small = l;
+			smallkey = heap[l].ckey;
+		}
+		if (r < *nheap && heap[r].ckey < smallkey)
+			small = r;
+		if (small == i)
+			break;
+		heap[i] = heap[small];
+		i = small;
+	}
+	heap[i] = last;
+	return top;
+}
+
+/*
+ * How many groups one lion_count_groups_copy() takes at most.  Each holds a
+ * cursor - a page image for a CHAIN set - and a pin on the posting leaf it
+ * stands on, so a batch takes what the cursors of one count may hold open
+ * (LionOpenBudget, DESIGN.md §15 "Bounded cursors"): work_mem of cursors, and
+ * the pins the lists have left.  Never fewer than LION_OPEN_MIN_PINS, nor
+ * more than LION_GROUP_BATCH_MAX (lion_count.h): past a few hundred groups a
+ * batch saves nothing more, each reading of the copy being shared by that
+ * many already.
+ */
+
+/*
+ * The members of the copy's container at a key, times the groups that stand
+ * there, from which the grouped walk makes that container a bitset image to
+ * test the groups against; below it each group ANDs its container with the
+ * copy's directly.  An image costs a clear and a count of 4 kB, 0.3 to 0.4 us
+ * shared by the groups, and a test against it a nanosecond a member of a
+ * group's container; the direct AND looks the copy's few members up in the
+ * group's container, or merges the two.  A WHERE of one or two rows a key
+ * against twenty dense groups is the case below it; a hundred groups against
+ * a WHERE of twenty rows a key, above.
+ */
+#define LION_GROUP_IMAGE_MIN	128
+
+int
+lion_count_groups_batch(Relation index)
+{
+	LionOpenBudget budget;
+	Size		per = sizeof(LionSetCursor) + sizeof(LionCountCtx) +
+		sizeof(PGAlignedBlock) + 4 * sizeof(int64);
+	Size		n;
+
+	lion_open_budget_init(&budget, index);
+	n = Min(budget.mem / per, (Size) budget.pins);
+	n = Min(n, (Size) LION_GROUP_BATCH_MAX);
+	return (int) Max(n, (Size) LION_OPEN_MIN_PINS);
+}
+
+/*
+ * THE GROUPS OF A WALK, COUNTED TOGETHER (DESIGN.md §10, "The groups of a
+ * walk, counted together").  counts[g] = the rows of groups[g] that the
+ * collected copy `copy` (lion_sources_collect()) holds, visible to snapshot,
+ * for each of ngroups located posting sets - what a count of each against the
+ * copy (lion_run_merge_copy()) answers, made in ONE walk of container keys
+ * for all of them.
+ *
+ * Counted one at a time, each group's containers looked the copy up at their
+ * keys and were ANDed with the copy's container there: every container of
+ * the copy was read, sought and merged again by every group that had a
+ * container at its key - a GROUP BY of many groups over every page of the
+ * heap read its collected WHERE once per group, each time an AND of a
+ * group's few members with a dense ARRAY by galloping search.  Here the groups' cursors
+ * stand on a heap ordered by container key, and at each key of the copy that
+ * a group has a container at, the copy's container is set in a bitset image
+ * ONCE and every group standing there is tested against it: a bit test per
+ * member of a group's ARRAY, which gives the intersection's count and block
+ * mask without building it (lion_container_and_image_count()).  The map is
+ * asked once per key too, about every block the copy's container has a
+ * member on - every group's intersection there lies on those.
+ *
+ * WHY IT IS EXACT, AND DESIGN.md §9.  Each group's set is located afresh by
+ * the caller and read by a cursor of its own, which pins the page each of its
+ * containers came from - the pinned source each of its counts had - and the
+ * copy is the same pinless copy those counts were ANDed with, on the same
+ * argument (lion_sources_collect()).  At a key, the map is asked after every
+ * group standing there has copied its container under its pin, and before
+ * any of them moves past it: lion_count_container()'s order, for all of them
+ * at once.  A group whose set carries no pin of its own - located past the
+ * pin budget, or a private copy - trusts no map (novm, per group), as its
+ * count alone would; so does every group while a row filter applies
+ * (DESIGN.md §17), whose rows all go to the heap.  A key the copy has nothing
+ * at, and a group whose intersection there is empty, ask the map nothing, and
+ * the groups sought past such keys let go of what they held there: no answer
+ * rests on it.  Each group keeps its own recheck queue, as its count did, and
+ * they share the visibility cache as the counts did.
+ *
+ * `images`, when not NULL, is ngroups page images of the caller's that the
+ * groups' cursors copy their leaves to, so that a caller walking batch after
+ * batch - a parallel GROUP BY's ranges above all - does not allocate and free
+ * a page for every group every time.
+ */
+void
+lion_count_groups_copy(Relation heap, Snapshot snapshot, int ngroups,
+					   LionPostingSet *groups, const LionPostingSet *copy,
+					   int64 *counts, LionCountStats *stats,
+					   LionVisCache *cache, bool rel_read_only,
+					   PGAlignedBlock *images)
+{
+	const LionMatSet *mat;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	LionCountCtx base;
+	LionCountCtx *gcx;
+	LionSetCursor *cur;
+	bool	   *trust;
+	LionGroupEnt *gheap;
+	int		   *hot;
+	int			nheap = 0;
+	LionContainer *img;
+	LionContainer *work;
+	LionContainer *buf = NULL;
+	int			batchmax;
+	int			idx = 0;
+	int			g;
+
+	for (g = 0; g < ngroups; g++)
+		counts[g] = 0;
+	if (ngroups == 0 || !copy->found || copy->mat == NULL ||
+		copy->mat->ncontainers == 0)
+		return;
+	mat = copy->mat;
+	Assert(mat->collected);
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"lion index grouped walk",
+								ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+
+	/* what lion_count_sources_run() sets up for one count, once for all */
+	memset(&base, 0, sizeof(base));
+	base.cxt = cxt;
+	base.heap = heap;
+	base.snapshot = snapshot;
+	base.vmbuf = InvalidBuffer;
+	if (cache != NULL && BufferIsValid(cache->vmbuf))
+	{
+		if (cache->vmrelid == RelationGetRelid(heap))
+		{
+			base.vmbuf = cache->vmbuf;
+			cache->vmbuf = InvalidBuffer;
+			cache->vmrelid = InvalidOid;
+		}
+		else
+			lion_vis_cache_release_vm(cache);
+	}
+	base.serializable = IsolationIsSerializable();
+	/* a copy is never made in recovery; were it, nothing would trust the map */
+	base.in_recovery = RecoveryInProgress();
+	base.rel_read_only = rel_read_only;
+	base.raw = true;
+	base.tids_sorted = true;
+
+	/*
+	 * The groups share the cache as their counts did, one after the other:
+	 * each is a count begun, which is what lets the cache resolve a dirty
+	 * block on its second visit rather than only record it.
+	 */
+	for (g = 0; g < ngroups; g++)
+		lion_vis_cache_begin(cache, heap, snapshot);
+	base.cache = cache;
+	base.filter = (cache != NULL) ? cache->filter : NULL;
+	if (base.filter != NULL && base.filter->heap != heap)
+		elog(ERROR, "lion index count: a row filter for another relation");
+
+	/* each group's recheck queue takes its share of one count's */
+	batchmax = Max(lion_recheck_budget() / ngroups, LION_RECHECK_MIN_BATCH);
+
+	gcx = (LionCountCtx *) palloc(sizeof(LionCountCtx) * ngroups);
+	cur = (LionSetCursor *) palloc(sizeof(LionSetCursor) * ngroups);
+	trust = (bool *) palloc(sizeof(bool) * ngroups);
+	gheap = (LionGroupEnt *) palloc(sizeof(LionGroupEnt) * ngroups);
+	hot = (int *) palloc(sizeof(int) * ngroups);
+	img = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	work = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	if (lion_mat_spills(mat))
+		buf = (LionContainer *) palloc(MAXALIGN(LION_CONTAINER_MAX_SIZE));
+
+	for (g = 0; g < ngroups; g++)
+	{
+		LionPostingSet *ps = &groups[g];
+
+		gcx[g] = base;
+		gcx[g].vmbuf = InvalidBuffer;
+		gcx[g].batchmax = batchmax;
+		gcx[g].keyset = ps;
+		trust[g] = ps->found && !ps->nopin && ps->mat == NULL;
+		gcx[g].novm = !trust[g];
+
+		/* nothing below the copy's first key can be counted: begin there */
+		lion_cursor_init_at(&cur[g], ps, &gcx[g], false, lion_mat_key(mat, 0),
+							images != NULL ? &images[g] : NULL);
+		if (cur[g].valid)
+			lion_group_heap_push(gheap, &nheap, cur[g].cur->ckey, g);
+	}
+
+	while (nheap > 0)
+	{
+		uint32		key = gheap[0].ckey;
+		const LionContainer *w;
+		const LionContainer *wc;
+		uint64		wanted;
+		uint64		allvis;
+		int			nhot = 0;
+		int			i;
+
+		/* the copy at or past the smallest key a group stands at */
+		base.stats.copy_seeks++;
+		idx = lion_mat_seek(mat, idx, key);
+		if (idx >= mat->ncontainers)
+			break;
+		if (lion_mat_key(mat, idx) != key)
+		{
+			uint32		target = lion_mat_key(mat, idx);
+
+			/*
+			 * The copy has nothing below target: every group below it is
+			 * sought there (DESIGN.md §22), and nothing of the keys it passes
+			 * is counted.
+			 */
+			while (nheap > 0 && gheap[0].ckey < target)
+			{
+				LionGroupEnt e = lion_group_heap_pop(gheap, &nheap);
+
+				lion_cursor_seek(&cur[e.g], target);
+				if (cur[e.g].valid)
+					lion_group_heap_push(gheap, &nheap, cur[e.g].cur->ckey,
+										 e.g);
+			}
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
+
+		/* every group standing at the key, its container read and pinned */
+		while (nheap > 0 && gheap[0].ckey == key)
+			hot[nhot++] = lion_group_heap_pop(gheap, &nheap).g;
+
+		/*
+		 * The copy's container there, once, as a bitset image - unless it is
+		 * a few members, which each group's AND looks up in the group's
+		 * container instead (lion_container_and_raw()): a sparse WHERE
+		 * against dense groups would otherwise test every member of every
+		 * group's container against an image of one or two.
+		 */
+		w = lion_mat_container(&base, mat, idx, buf);
+		if (w->type == LION_CT_BITSET)
+			wc = w;
+		else if (lion_container_cardinality(w) * (uint32) nhot <
+				 LION_GROUP_IMAGE_MIN)
+			wc = NULL;
+		else
+		{
+			lion_container_bitset_init(img, key);
+			lion_container_or_into_bitset(w, LION_BITSET_DATA(img));
+			(void) lion_container_bitset_recount(img);
+			wc = img;
+		}
+
+		/*
+		 * The map, once for every group here: every block any of their
+		 * intersections has a member on is one of the copy's container's.
+		 * The test hook of lion_count_container_vm(): the groups' containers
+		 * copied, their pages pinned, the map not asked yet.
+		 */
+		LION_INJECTION_POINT("lion-count-containers-pinned");
+		wanted = lion_container_block_mask(w);
+		if (base.in_recovery || base.filter != NULL)
+			allvis = 0;
+		else
+		{
+			allvis = lion_vm_allvisible_mask(heap, lion_ckey_first_block(key),
+											 wanted, &base.vmbuf,
+											 &base.stats.vm_pins);
+			base.stats.vm_checks++;
+#ifdef LION_VM_MASK_CHECK
+			lion_vm_mask_check(heap, lion_ckey_first_block(key), wanted,
+							   allvis, &base.vmbuf);
+#endif
+		}
+
+		for (i = 0; i < nhot; i++)
+		{
+			LionCountCtx *cx = &gcx[hot[i]];
+			const LionContainer *c = cur[hot[i]].cur;
+			uint64		av = trust[hot[i]] ? allvis : 0;
+			uint64		blocks;
+			uint32		n;
+			bool		built = false;
+
+			if (wc != NULL && c->type == LION_CT_ARRAY)
+				n = lion_container_and_image_count(c, LION_BITSET_DATA(wc),
+												   &blocks);
+			else
+			{
+				n = lion_container_and_raw(c, wc != NULL ? wc : w, work);
+				blocks = lion_container_block_mask(work);
+				built = true;
+			}
+			if (n == 0)
+				continue;
+
+			if ((blocks & ~av) == 0 && !cx->serializable)
+			{
+				/* every row of it on an all-visible block: counted */
+				cx->count += n;
+				cx->stats.blocks_skipped_via_vm += pg_popcount64(blocks);
+				continue;
+			}
+
+			/* the heap has to see some of it, or a predicate lock be taken */
+			if (!built)
+				(void) lion_container_and_raw(c, wc, work);
+			lion_count_container_masks(cx, work, blocks, av);
+		}
+
+		/*
+		 * Only now may the groups here let go of their pages (§9), and each
+		 * goes straight to the copy's next key, the next one a count can be
+		 * made at: a step where that is the next key, a seek past the keys
+		 * between otherwise (DESIGN.md §22).  Past the copy's last key there
+		 * is nothing left to count.
+		 */
+		if (idx + 1 >= mat->ncontainers)
+			break;
+		{
+			uint32		next = lion_mat_key(mat, idx + 1);
+
+			for (i = 0; i < nhot; i++)
+			{
+				int			hg = hot[i];
+
+				if (next == key + 1)
+					lion_cursor_next(&cur[hg]);
+				else
+					lion_cursor_seek(&cur[hg], next);
+				if (cur[hg].valid)
+					lion_group_heap_push(gheap, &nheap, cur[hg].cur->ckey, hg);
+			}
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	for (g = 0; g < ngroups; g++)
+		lion_cursor_close(&cur[g]);
+
+	/* no index page is pinned any more: the heap answers the rest */
+	for (g = 0; g < ngroups; g++)
+	{
+		lion_recheck_flush(&gcx[g]);
+		counts[g] = gcx[g].count + gcx[g].recheck_count;
+		if (BufferIsValid(gcx[g].vmbuf))
+			ReleaseBuffer(gcx[g].vmbuf);
+		if (stats != NULL)
+			lion_count_stats_add(stats, &gcx[g].stats);
+	}
+	if (stats != NULL)
+		lion_count_stats_add(stats, &base.stats);
+
+	if (BufferIsValid(base.vmbuf))
+	{
+		if (cache != NULL && !BufferIsValid(cache->vmbuf))
+		{
+			cache->vmbuf = base.vmbuf;
+			cache->vmrelid = RelationGetRelid(heap);
+		}
+		else
+			ReleaseBuffer(base.vmbuf);
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
+}
+
+
+/* ---------------------------------------------------------------------
  * A copy shared by the participants of a parallel plan (LionSharedCopy)
  * --------------------------------------------------------------------- */
 
@@ -7435,15 +8433,61 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
  */
 #define LION_COPY_MAX_CHUNKS		64
 #define LION_COPY_CHUNKS_EACH		4	/* chunks a participant: the work evens out */
-#define LION_COPY_MIN_CHUNK_KEYS	16	/* container keys a chunk covers at least */
 
 /* the phases of LionSharedCopy.barrier */
 #define LION_COPY_COLLECTING		0
 #define LION_COPY_INDEXING			1
 #define LION_COPY_DONE				2
 
-/* no end: the last chunk takes every key past its first */
-#define LION_COPY_END				((uint64) PG_UINT32_MAX + 1)
+/*
+ * The fewest container keys a range covers when the executor cuts them,
+ * pg_lion.parallel_range_keys: a range seeks every source to its first key,
+ * and a parallel GROUP BY walks every group's entry again for each.  A testing
+ * knob rather than a tuning one - the regression suite lowers it to cut a
+ * table of a few megabytes into several ranges - so the planner prices the
+ * ranges of the default width, LION_PARALLEL_RANGE_KEYS, whatever it is set
+ * to.
+ */
+int			lion_parallel_range_keys = LION_PARALLEL_RANGE_KEYS;
+
+/*
+ * Cut the heap's container keys into ranges for the participants of a
+ * parallel plan: a few for each, so that one that is slow to start or has
+ * denser keys is made up for by the others, and no fewer than minkeys keys
+ * each.  Returns how many there are, and in *ckeys the container keys they
+ * are cut from, which lion_key_range() divides among them as evenly as whole
+ * keys go - no range is empty.  The last one is open-ended.  The shared
+ * copy's chunks are these ranges, and so are the ranges a parallel GROUP BY
+ * counts its groups over (DESIGN.md §10, "A GROUP BY in parallel").
+ */
+int
+lion_key_ranges(BlockNumber heapblocks, int participants, int minkeys,
+				uint32 *ckeys)
+{
+	uint64		keys = (uint64) heapblocks / LION_BLOCKS_PER_CONTAINER + 1;
+	uint64		n;
+
+	n = Min((uint64) LION_COPY_MAX_CHUNKS,
+			(uint64) Max(participants, 1) * LION_COPY_CHUNKS_EACH);
+	n = Min(n, Max(keys / (uint64) Max(minkeys, 1), (uint64) 1));
+	*ckeys = (uint32) keys;
+	return (int) n;
+}
+
+/*
+ * The container keys of range r of lion_key_ranges()'s cut of ckeys keys
+ * into nranges: lo up to, not including, hi.  The last range has no end - the
+ * heap may have grown since the ranges were cut - and takes every key from
+ * its first on (LION_KEYS_END).
+ */
+void
+lion_key_range(int nranges, uint32 ckeys, int r, uint32 *lo, uint64 *hi)
+{
+	Assert(r >= 0 && r < nranges);
+	*lo = (uint32) ((uint64) r * ckeys / (uint64) nranges);
+	*hi = (r == nranges - 1) ? LION_KEYS_END :
+		(uint64) (r + 1) * ckeys / (uint64) nranges;
+}
 
 typedef struct LionCopyChunk
 {
@@ -7465,7 +8509,7 @@ struct LionSharedCopy
 	dsm_handle	seg;			/* the plan's DSM, which a worker attaches
 								 * the file set through */
 	int			nchunks;
-	uint32		width;			/* container keys a chunk covers */
+	uint32		ckeys;			/* the container keys they are cut from */
 
 	/* the index, made by the participant elected once every chunk is in */
 	int			ncontainers;
@@ -7511,23 +8555,12 @@ lion_copy_chunk_name(char *name, Size len, int c)
 	snprintf(name, len, "lioncopy.%d", c);
 }
 
-/*
- * Cut the heap's container keys into chunks: a few for each participant, so
- * that one that is slow to start or has dense chunks is made up for by the
- * others, and no fewer keys than LION_COPY_MIN_CHUNK_KEYS each, since a chunk
- * seeks every source to its first key.
- */
+/* Cut the heap's container keys into chunks (lion_key_ranges()). */
 static void
 lion_copy_cut(LionSharedCopy *sc, BlockNumber heapblocks)
 {
-	uint64		ckeys = (uint64) heapblocks / LION_BLOCKS_PER_CONTAINER + 1;
-	uint64		n;
-
-	n = Min((uint64) LION_COPY_MAX_CHUNKS,
-			(uint64) Max(sc->participants, 1) * LION_COPY_CHUNKS_EACH);
-	n = Min(n, Max(ckeys / LION_COPY_MIN_CHUNK_KEYS, (uint64) 1));
-	sc->nchunks = (int) n;
-	sc->width = (uint32) ((ckeys + n - 1) / n);
+	sc->nchunks = lion_key_ranges(heapblocks, sc->participants,
+								  lion_parallel_range_keys, &sc->ckeys);
 }
 
 /* The copy as it is before anyone collects it. */
@@ -7646,9 +8679,7 @@ lion_copy_chunk(LionSharedCopy *sc, dsa_area *area, Relation heap,
 	col.sp.fileset = &sc->fileset.fs;
 	col.sp.name = name;
 	col.ranged = true;
-	col.lo = (uint32) ((uint64) c * sc->width);
-	col.hi = (c == sc->nchunks - 1) ? LION_COPY_END :
-		(uint64) (c + 1) * sc->width;
+	lion_key_range(sc->nchunks, sc->ckeys, c, &col.lo, &col.hi);
 	col.cap = 8192;
 	col.buf = (char *) palloc(col.cap);
 	col.offcap = 256;
@@ -8019,9 +9050,6 @@ typedef struct LionRangeUnion
 	LionContainer *tmp;			/* LION_CONTAINER_MAX_SIZE bytes */
 	uint64	   *img;			/* LION_BITSET_BYTES: a fold's image */
 } LionRangeUnion;
-
-/* The fewest pending members an ARRAY union waits for before a fold. */
-#define LION_RANGE_UNION_PEND_MIN	32
 
 /* No upper bound on the container keys of a window. */
 #define LION_CKEY_END				((uint64) PG_UINT32_MAX + 1)
@@ -9306,6 +10334,7 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	 */
 	cx.novm = false;
 	cx.rel_read_only = rel_read_only;
+	cx.raw = true;
 	cx.tids_sorted = true;
 	cx.batchmax = lion_recheck_budget();
 	cx.exists = exists;
@@ -9456,6 +10485,8 @@ lion_count_stats_add(LionCountStats *dst, const LionCountStats *src)
 	dst->blocks_rechecked += src->blocks_rechecked;
 	dst->containers_visited += src->containers_visited;
 	dst->probes_avoided += src->probes_avoided;
+	dst->unions_built += src->unions_built;
+	dst->unions_probed += src->unions_probed;
 	dst->cache_hits += src->cache_hits;
 	dst->cache_full += src->cache_full;
 	dst->sets_summed += src->sets_summed;

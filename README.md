@@ -159,7 +159,25 @@ A `GROUP BY` with several filters (`SELECT country, count(*) FROM events WHERE e
 partition, and counts each group against that one set, so the filters' index pages are read once
 rather than once per group; `EXPLAIN ANALYZE` prints `WHERE Sets Collected` when it did (DESIGN.md
 §10). The set stays within a hash table's memory (`work_mem` times `hash_mem_multiplier`) and goes
-to a temporary file past it.
+to a temporary file past it. The groups are then counted against it up to a few hundred at a time,
+in one pass over its containers for all of them (`Group Batches` in `EXPLAIN ANALYZE`). With
+parallel query enabled (`max_parallel_workers_per_gather`) such a `GROUP BY` over one table can
+run in parallel: the workers divide the table's blocks into ranges, each collects the filters of
+its ranges and counts every group there, and a `Finalize HashAggregate` above the `Gather` adds
+the groups' partial counts up (`Parallel Custom Scan (LionCount)`, `Key Ranges` in `EXPLAIN
+ANALYZE`; DESIGN.md §10, "A GROUP BY in parallel").
+
+On a partitioned table the pushdown counts each partition the planner keeps, with that partition's
+own Lion indexes (DESIGN.md §16), and every `WHERE` clause needs one in every partition counted -
+except a clause the partition's bounds imply. `kind = 'a'` over a table partitioned by `kind`,
+once pruning has left only the `kind = 'a'` partitions (sub-partitions included), is true of every
+row they hold: it needs no index there and is left out of their counts, and `EXPLAIN` lists it
+under `Implied by Partition Bounds`. The proof is PostgreSQL's own, the one partial indexes use, so
+a partition that also takes NULLs, a default partition, or a generic plan's parameter implies
+only what that proof can show. An `OR` with an arm per kind - `(kind = 'a' AND tags && '{x}') OR
+(kind = 'b' AND tags && '{y}')` - is narrowed the same way: each partition leaves out the arms its
+bounds rule out and, in the arm it keeps, the `kind = ...` they imply, so the partition of `'a'`
+counts `tags && '{x}'` alone (`Refuted by Partition Bounds` in `EXPLAIN`).
 
 A count over a fact table joined to a filtered dimension (DESIGN.md §27) is pushed down too, when the
 fact's foreign-key column has a Lion index and its own filters are ones Lion answers: the dimension
@@ -222,13 +240,34 @@ that the copy spills to a temporary file, as a hash join's table would. Their va
 parameters and stable expressions as for a single table, an `IN` list whose array is a parameter
 (`o.status = ANY ($1)`) included: every process evaluates them once per scan.
 
+The fact table may be partitioned, when every partition the planner keeps has a Lion index on the
+foreign-key column (one on the partitioned table gives each partition its own) and on each fact
+filter its bounds do not imply. The node then takes each batch of dimension keys to every partition
+in turn and adds the partitions' counts up per dimension row - for `EXISTS` a match in any of them,
+for `NOT EXISTS` in none (DESIGN.md §27, "A partitioned fact table"). `EXPLAIN` lists the partitions
+and what their bounds imply, and its counters are summed over them: `Join Keys Looked Up` counts a
+key once per partition it was looked up in. The partitions are the ones plan-time pruning keeps: a
+partition that only run-time pruning would remove, as with `ts >= now() - interval '1 year'` over
+partitions by year, is counted too, and contributes nothing.
+
+The dimension may itself be a join: one table that carries the key, and other tables joined to it
+only by `EXISTS`, `IN` or `NOT EXISTS`, which never repeat its rows (DESIGN.md §27, "A dimension
+that is a join"). A dimension `d` with an `EXISTS` on each of two fact tables `f1` and `f2` is
+then `f2` counted against `d` semi-joined to `f1`, or `f1` against `d` semi-joined to `f2`,
+whichever the cost model prices lower; and `SELECT count(*) FROM f2 WHERE ... AND f2.fk IN (SELECT
+d.pk FROM dim d WHERE ... AND EXISTS (SELECT 1 FROM f1 WHERE f1.fk = d.pk AND ...))` counts `f2`
+against the dimension rows that pass. The node's child is PostgreSQL's own plan of that join. An
+inner or outer join inside the dimension, which could repeat a row, keeps the ordinary plan.
+
 `EXPLAIN ANALYZE` of such a join says where each dimension row's time went (DESIGN.md §27, "Where a
 key's time goes"): `Join Child Rows` from the dimension's plan, `Join Keys Looked Up` and `Without
 Entry`, the containers the counts read from each key's FK set (`Join Key Containers Read`), from the
 collected copy of the fact filters (`Fact Filter Copy Containers Read`, `Seeks`, and `File Reads`
 when the copy spilled), the posting-tree pages they read (`Join Posting Pages Read`) and the
 visibility map (`Visibility Map Checks`, `Pages Pinned`); with `TIMING` on, also `Join Child Time`,
-`Join Lookup Time`, `Join Count Time` and `Fact Filter Collect Time`, summed over parallel workers.
+`Join Lookup Time`, `Join Count Time`, `Fact Filter Locate Time` (the fact filters located, a range
+among them collected into memory, which can be most of a run) and `Fact Filter Collect Time`, summed
+over parallel workers and the partitions of a partitioned fact table.
 A join whose result is counts alone (no `GROUP BY`, no dimension column in the output) adds the
 dimension rows' counts up inside the node and hands up one row per process.
 
@@ -432,8 +471,14 @@ working around a bad choice:
   number.
 
 Testing knobs rather than tuning ones: `pg_lion.scan_window_floor` (4 MB), the least memory a plain
-scan's window of container keys takes (DESIGN.md §29.3), and `pg_lion.vacuum_barrier_ranges`
-(superuser), how many visited-block ranges VACUUM batches in rmgr mode (DESIGN.md §25).
+scan's window of container keys takes (DESIGN.md §29.3), `pg_lion.parallel_range_keys` (16), the
+fewest container keys - of 64 heap blocks each - a range of a parallel count covers when it runs
+(DESIGN.md §10, "A GROUP BY in parallel"; the planner prices the default),
+`pg_lion.enable_union_probe` (on), whether an AND of posting sets may look its few rows up in the
+containers of an `IN` list's or a multi-key query's union rather than build the union (DESIGN.md
+§29.11, "Unions probed"; the answers are the same either way), and
+`pg_lion.vacuum_barrier_ranges` (superuser), how many visited-block ranges VACUUM batches in rmgr
+mode (DESIGN.md §25).
 `pg_lion.rmgr_id` is described under `wal_mode` above.
 
 Cost settings, for calibrating Lion's cost model on your own workload the way `random_page_cost`
@@ -451,7 +496,9 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `member_cost` | 0.15 | `cpu_operator_cost` | a member of it, up to 1,024 a container |
 | `probe_cost` | 40 | `cpu_operator_cost` | a seek of a posting tree to a container key |
 | `memory_probe_cost` | 30 | `cpu_operator_cost` | the same into a set copied into memory |
-| `and_member_cost` | 0.8 | `cpu_operator_cost` | a member of an intersection ANDed with what a seek found |
+| `and_member_cost` | 0.8 | `cpu_operator_cost` | a member of an intersection ANDed with what a seek found, or looked up in a container of a union's |
+| `union_key_cost` | 30 | `cpu_operator_cost` | the union of an `IN` list's or a multi-key query's containers built at a container key |
+| `union_member_cost` | 0.25 | `cpu_operator_cost` | a member of such a union, or of the intersection ANDed with it |
 | `descent_cost` | 120 | `cpu_operator_cost` | a level of an entry directory descended |
 | `union_set_cost` | 100 | `cpu_tuple_cost` | a set of an `IN` list or `OR` rebuilt by each count of a GROUP BY or join |
 | `recheck_tid_cost` | 1.5 | `cpu_tuple_cost` | a candidate row of a count's heap recheck |
@@ -462,6 +509,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `range_entry_cost` | 40 | `cpu_tuple_cost` | an entry of a range walk counted on its own |
 | `range_union_entry_cost` | 12 | `cpu_tuple_cost` | a small entry of a summed range, counted with its leaf |
 | `probe_step_cost` | 2.0 | `cpu_operator_cost` | a container of a set a summed range probes |
+| `range_fold_cost` | 420 | `cpu_operator_cost` | a fold into a container of a range's union, collected as a source, that is not a bitset |
 | `fkjoin_count_cost` | 25 | `cpu_tuple_cost` | an FK-side join's count, a dimension row |
 | `fkjoin_row_cost` | 10 | `cpu_tuple_cost` | a row the FK-side join hands up |
 | `fkjoin_probe_cost` | 80 | `cpu_operator_cost` | a probe of such a count into a fact filter |
