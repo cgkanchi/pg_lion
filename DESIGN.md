@@ -7701,8 +7701,10 @@ on 2026-09-28, and after them what a key's time is made of, the per-key path and
 ("Where a key's time goes" and the two sections after it), counts beside the aggregates that
 need the dimension rows ("Every aggregate over the node's rows"), a GROUP BY of the join key,
 the fact's or the dimension's ("Grouped by the join key"), a partitioned fact table ("A
-partitioned fact table"), and last a dimension that is itself a join of a table and the tables
-semi- or anti-joined to it ("A dimension that is a join"). The shape is the star-schema aggregate
+partitioned fact table"), and a dimension that is itself a join of a table and the tables
+semi- or anti-joined to it ("A dimension that is a join"); on 2026-09-29, a run that probes the fact
+filters and collects them part way through once probing has cost what collecting would ("Probed,
+then collected"). The shape is the star-schema aggregate
 
     SELECT d.attr, count(*)
     FROM fact f JOIN dim d ON f.fk = d.pk
@@ -8130,7 +8132,10 @@ inner join - exclude fk = 0 and include the rows deleted after the snapshot.
 
 The choice between the copy and the probes is the cost model's, per path, and the plan carries it:
 the join member of `custom_private` became `{clause, kind of join, flags [, child column]}` with
-`LION_JOINFLAG_COLLECT` (shape 12). EXPLAIN prints `Fact Filters: collected once`.
+`LION_JOINFLAG_COLLECT` (shape 12). EXPLAIN prints `Fact Filters: collected once`. Since 2026-09-29 a
+plan that probes may still collect part way through a run, once probing has cost what collecting
+would ("Probed, then collected", below), which bounds what an estimate of the dimension rows far
+too low costs.
 
 ### Cost, revisited (2026-09-27)
 
@@ -8787,7 +8792,12 @@ levels or more and a batch holds more keys than there are leaves between them - 
 directory of height 1, whose descent is the root and a leaf. So no plan over an fk index of a few
 thousand keys changes, and the plans the suite pins are all of that kind. The leaves themselves are
 priced as before, each read once: that is what the walk reads, and what the descents read too while
-the directory stays in the cache.
+the directory stays in the cache. *(Refitted 2026-09-29, "The per-key terms, refitted": the walk's
+counters show no leaf read again a key - 0.02 to 0.3 directory pages a key where the keys are
+dense - so a walked row is now its lookup on the leaf the walk stands on,
+`LION_FKJOIN_LOOKUP_COST`, and its place in the batch, `LION_FKJOIN_BATCH_ROW_COST` at 75, which
+together are the 740 ns a walked key measured; and the walk is taken over any directory where the
+batch's keys are closer than a descent, the suite's small fk indexes included.)*
 
 **Prefetch.** While the keys are close together the walk asks for the right sibling of each leaf it
 lands on (`PrefetchBuffer()`), after letting go of its lock, where the tablespace's io concurrency
@@ -9124,6 +9134,9 @@ made, the filters' lookups and merge, and for the forward semi join over a non-u
 (`LION_FKJOIN_SORT_COMPARE_COST`, `LION_FKJOIN_SORT_KEY_COST`). Pages of the fk index are core's page
 costs: the leaves each once at `lion_heap_page_cost()`'s interpolation, the chain pages at
 `seq_page_cost`.
+
+*(The FK-side join's terms of this table were refitted on 2026-09-29, with posting pages, a walked
+key's lookup and a union's sets priced on their own: "The per-key terms, refitted" has the values.)*
 
 **The per-key constant.** A count's set-up, after the fixes, is some twenty allocations from
 memory the node already holds, two cursors built and the plan's decisions: about half a microsecond,
@@ -9765,7 +9778,11 @@ and every partition was priced for every key. Since 2026-09-29 it is timed (`Fac
 Time`) and priced as the union it builds, and each partition for the keys it looks up (§32, "What
 collecting a range costs"). Re-measured on data of the same kind, the two-table half then costs
 316,865 against 512,027 before, and still loses to the hash semi join at 276,208 (441 ms against
-667): its lookups over the partitions are priced at two to three times their time.
+667): its lookups over the partitions are priced at two to three times their time. *(Refitted
+2026-09-29, "The per-key terms, refitted": a walked key is now priced at its lookup on the leaf and
+its place in the batch, not a page visit as well, and the semi joins over a partitioned fact of that
+refit's measurements came down from a median of 792 units a millisecond collected and 1,279 probed
+to 613 and 786.)*
 
 **Probe or collect for a few thousand dimension rows.** The model collects f2's filter in every
 plan above, and probing it is dearer in the model and slower in fact. Over 14,947 dimension rows
@@ -9778,6 +9795,324 @@ at 14,947 dimension rows the loop is priced at 137,687 and runs in 1,349 ms, aga
 have, at the fact's average rows a key again; at 3,831 it is priced at 121,671 and runs in 601 to
 660 ms, about as fast as the node, and is chosen rightly. For (B) the node is chosen at both sizes,
 the probed plan never.
+
+### Probed, then collected (2026-09-29)
+
+Whether the node probes the fact filters at every count or collects them once is the planner's
+choice, made from its estimate of the dimension rows ("Cost, revisited"). A benchmark counted a fact
+of a tsvector under a lion index against tens of thousands of dimension keys, the fact filter a
+tsquery of two ORs of dense terms; core estimated an order of magnitude fewer dimension rows - the
+product of the dimension's filters, which core takes for independent - so the plan probed. The keys
+the dimension kept were the heavy ones, hundreds of containers each where the model prices a key at
+the fact's average, and the count phase ran for tens of seconds over three participants, building
+about two unions for every key container it read. The same fact counted against several times as
+many keys with the filters collected took under a second. Core underestimates semi joins over
+skewed keys by one to two orders of magnitude on that benchmark, and no price the planner makes from
+its own estimate can be right about a run it estimated that wrongly; the executor can see what it is
+paying.
+
+**The account** (`lion_join_count_key()`). A run whose plan probes keeps an account of what probing
+has cost it beyond what the same counts against a copy would have, in the planner's units, from the
+counters each count leaves: the containers read from the fact filters' sets (the count's
+`Containers Visited` less the key's own), each a seek of a posting tree and the container found
+there, at `LION_PROBE_COST` (`LION_MEMORY_PROBE_COST` for a set already in memory); the posting
+pages those seeks read, at `LION_DESCENT_COST` a page as a directory level is priced; the unions
+built at a key, at `LION_UNION_KEY_COST`; less the key's own containers at
+`LION_FKJOIN_COPY_PROBE_COST`, the copy's lookup each would have made instead. What both ways share -
+the key's set read and counted, a count set up - is in neither. Deterministic: the same data and
+plan make the same account, which the tests rely on. *(Since "The per-key terms, refitted" the
+account is kept at the planner's own prices for the same operations - the probing count's set-up and
+its union sets, `LION_FKJOIN_PROBE_COST` a filter container sought and
+`LION_FKJOIN_PROBE_PAGE_COST` a posting page, less the count against the copy's set-up as well as
+its lookups - and never goes below nothing; the measurements below were made before.)*
+
+**The price** (`lion_join_copy_price()`), taken once, at the first count that probes, from the sets
+as they were located, which carry their rows and containers (`ntids`, `ncontainers`): every
+container of every set of every positive filter read once (`LION_CONTAINER_COST`), the posting
+pages a set on pages of its own takes (`LION_DESCENT_COST` each, its containers' bytes over a page's
+room), each union's image at each of its keys and its members set in it (`LION_UNION_KEY_COST`,
+`LION_UNION_MEMBER_COST`), and the copy's containers made (`LION_FKJOIN_COPY_CONTAINER_COST`). The
+copy's size is the planner's formula over the rows the filters' product leaves, taken as
+independent, in no more containers than the sparsest filter has. No price - no switch - where no
+copy can be made: a hot standby, filters that only subtract, a range too large to collect (§32), a
+list located a batch at a time; nor where the copy is not expected to fit a hash join's memory
+(`get_hash_memory_limit()`), which is what a plan that collects is given. A copy that turns out
+larger than expected spills to a temporary file, as a planned one does.
+
+**The switch** (`lion_join_maybe_switch()`). After each count, between two keys, a run whose account
+has reached the price collects the filters (`lion_join_collect_into()`, as a planned collection does
+before the first key) and counts every key after that against the copy. That is the ski-rental
+rule: a run that switches has paid for probing at most the price of collecting, and then the
+collection, so it costs at most about twice what the better of the two ways, chosen in hindsight,
+would have - where the probing plan it replaces costs as many times that as the keys are heavier
+than the planner thought. A run that never reaches the price was right to probe, and does. The walk
+of the fk index lets go of its leaf while the copy is made, and reads it again by its block number
+for the next key; the WHERE sets let go of their pins, as after a planned collection. Should the
+copy come out empty - the filters select nothing - the keys after it are looked up no more: an inner
+or semi join has no row left, and an anti join's are every row, as when a filter has no entry.
+
+- **§9.** "Why a stale copy is safe" asks of a copy that it be made after the query's snapshot was
+  taken and only ever be counted beside a located fk set, which carries the interlock. A copy made
+  part way through is both: the filters it is made from were located in this run, under the
+  snapshot, and the collection reads them as a planned one does, pinning nothing and asking the map
+  nothing; every count after it locates its fk set under its own pin, as every count does.
+- **A partitioned fact** keeps an account and a price per leaf (`LionJoinPart`), since each leaf's
+  filters are its own sets. A probing plan locates a leaf's filters again at each of its turns (each
+  batch of keys), and that goes on the leaf's account too, its directory pages at
+  `LION_DESCENT_COST`. A leaf that switches makes its copy within what the copies of the leaves
+  before it left of the hash join's memory (`lion_join_part_maybe_switch()`), as a collecting plan's
+  leaves do, and its later turns read the copy - so the switch saves the locating of the filters at
+  every later turn as well.
+- **Parallel.** Each participant keeps its own account and makes its own copy, as the leader of a
+  plan run without its workers does. The shared copy of "One copy per query" is not joined: a
+  probing plan sized no dynamic shared memory for it, and the participants reach the price at keys
+  of their own, each over its own share of the dimension rows. A participant whose share holds few
+  heavy keys may never switch, and needs not.
+- **Rescans.** Each run starts its account again (`lion_join_switch_reset()`, from
+  `lion_reset_run()`); the copy of the run before is released with the run.
+- **EXPLAIN ANALYZE** prints `Fact Filters: probed, then collected` in place of nothing (a probing
+  plan prints no `Fact Filters` line), and `Fact Filter Switches` - the copies made so, one a run, a
+  leaf or a participant - and `Fact Filter Keys Probed`, the keys counted by probing before each,
+  summed; and the copy's own counters (`Fact Filter Rows Collected`, `Copy Containers Read`, `Seeks`,
+  `File Reads`, `Fact Filter Collect Time`), as a collecting plan does. `pg_lion.enable_filter_switch`
+  (on) is a testing knob: off, a probing run probes to its end, with the same answers.
+
+The reverse - a plan that collected and meets only a few light keys - is not switched: its
+collection is made before the first key, and what it cost is spent by then.
+
+**Measured** (2026-09-29, PostgreSQL 18 packaged build, a VM of four cores that other work kept at
+a load of two to six, warm cache, `shared_buffers` 6 GB, `work_mem` 64 MB; medians of three runs
+after one, a probing run without the switch once). A synthetic star of 30 million fact rows in
+230,000 heap pages (3,600 container keys), a tsvector of five dense terms (each on 6% of
+the rows) and two filler words under one lion index, the fk under another: 12 million of the rows on
+30,000 hot keys, 400 each in some 380 containers; 12 million on 200,000 warm ones, 60 each; 6
+million on 6 million cold ones - 4.8 rows a key on average, which is what the model prices a key
+at. A 1.43-million-row dimension whose two filter flags are true on the hot keys and nowhere else,
+which core multiplies into 549 rows for 30,000. The fact filter is a tsquery of two ORs, of three
+and of two of the dense terms: 592,134 rows. The node is forced (the join methods disabled; probing
+by pricing the collection's pass out, the switch off or on); with nothing disabled core's nested
+loop into the fk index is chosen for the first three sets, priced at the average rows a key.
+Times in ms:
+
+| dimension keys | collected | probed, before | probed, trees probed | probed, then collected (trees built / probed) | keys probed before the switch | nothing disabled |
+|---|---|---|---|---|---|---|
+| 1,047 hot | 118 | 3,511 | 2,065 | 143 / 140 | 8 | nested loop, 572 |
+| 10,147 hot | 312 | 32,225 | 18,607 | 360 / 331 | 8 | nested loop, 5,540 |
+| 30,000 hot | 801 | 96,345 | 64,786 | 781 / 728 | 8 | nested loop, 18,656 |
+| 200,000 hot and warm | 1,565 | 252,835 | 169,041 | 1,744 / 1,603 | 8 | the node, collected, 1,721 |
+| two workers: 1,047 | 114 | 1,456 | 1,157 | 166 / 156 | 24 | nested loop, 386 |
+| 10,147 | 253 | 11,439 | 11,352 | 350 / 317 | 24 | nested loop, 3,624 |
+| 30,000 | 549 | 33,540 | 30,890 | 532 / 561 | 24 | nested loop, 9,867 |
+| 200,000 | 1,000 | 93,551 | 84,139 | 920 / 1,021 | 24 | the node, collected, 1,009 |
+
+The probing run over the 30,000 keys did what the benchmark's did: 11.4 million key containers,
+73.6 million posting pages read by the seeks of the filters' five sets, and 34.3 million unions
+built (none with trees probed, where the tree was evaluated for the key's row or two at each of the
+11.4 million keys instead). Collected, the same keys took 32 ms to collect and 637 to count. A run
+that switches pays eight keys' probing - some 30 ms, what the collection's price says - and then
+runs as the collected plan does: 0.9 to 1.2 times its time, where probing to the end took 30 to 160
+times it. With two workers each of the three participants switched, after eight keys of its own
+(`Fact Filter Switches: 3`, `Keys Probed: 24`); they gained less from
+probing trees, whose seeks of the same few hundred posting pages by three processes at once cost
+more than the unions they save. Over keys of one row each - the dimension's cold keys, the
+shape the model prices - the account grows a container a key: 1,202 of them took 135 ms probed to
+the end and 130 collected (the collection 36 ms of it), and the run that may switch did so after
+526 keys, in 136; 40,542 took 730 ms probed and 238 collected, and switched after 522, in 178 (its
+copy made in 28 ms where the planned one took 56, on a machine other work was loading). The account
+and the price are both in the planner's units, and the rule's factor of two holds in those; in time
+it holds as far as the two are calibrated alike. Over the 1,202 keys the run switched after 14 ms of
+probing for a collection that took 32: the price is the cheaper of the two to underestimate, since
+the account keeps growing at the next key while a price too high is never reached.
+
+`test/sql/fkjoin_adaptive.sql` forces probing plans (the collection's pass priced out of the
+planner's choice, `pg_lion.fkjoin_collect_container_cost`, which the run's own price does not read)
+over a fact whose forty heavy keys core estimates at one dimension row, and checks against the
+pushdown off: counts, a grouped count, an IN list, semi and anti joins, row at a time and walked in
+key order, each switching after a stated number of keys; filters that never meet, whose copy made
+part way through is empty, over inner and anti joins, row at a time and walked; the knob off, and a
+copy that would not fit 64 kB, probing to their ends; two rescans below a correlated subquery,
+two switches; a partitioned fact, three leaves switching each on its own, grouped, semi and anti
+joins; parallel plans, plain and partitioned, whose participants switch; and a dirty heap - rows
+deleted, moved to other keys and to other terms - before and after VACUUM.
+
+### The per-key terms, refitted (2026-09-29)
+
+"Cost, revisited" fitted the FK-side join's terms over 23 shapes of two facts, and every term added
+since - the copy looked up by key, the walk in key order, the row handed up, the counts' unions
+probed rather than built (§29.11) - was derived or measured on its own. Refitted here together,
+against what the executor now does.
+
+**Measured** (2026-09-29, PostgreSQL 18 packaged build, the machine of "Probed, then collected",
+which other work kept loaded; `shared_buffers` 6 GB, `work_mem` 64 MB, warm; medians of three runs
+after one, timed and untimed). Four facts of two million rows, 10,800 heap pages (169 container
+keys), whose fk has exactly 1, 10, 100 or 1,000 rows a key scattered over the heap, a filter column
+of ten values under a lion index of its own and the fk under another; a dimension per fact, its keys
+ranked at random so that a range of the rank selects any number of them; and the fact of ten rows a
+key again, list-partitioned into four leaves. Dimension sets of 100 to 500,000 keys (at most the
+fact's), each under three shapes - a count whose fact filter is an IN list of three values (a union
+of three sets, 30% of the fact), a grouped count under one equality (10%), a semi join under the
+same equality - with the filters collected and with them probed (the join methods disabled, the
+other way priced out, the switch off), serially and in two workers, and with nothing disabled and
+with the pushdown off. 352 runs; and the skewed star of "Probed, then collected" again.
+
+**The fit.** Each phase's time from the node's timers (`Join Lookup Time`, `Join Count Time`, the
+node's own time less its phases) against the counters of the operations it made, by non-negative
+least squares weighted to relative error, with each fk container charged `LION_CONTAINER_COST`'s 40
+ns as the model charges it on both ways. Per operation:
+
+| operation | counter | serial | two workers |
+|---|---|---|---|
+| a count that probes the filters, set up | keys found | 271 ns | 737 |
+| a set of a union filter, per such count | keys found x the union's sets | 217 ns | 708 |
+| a container of the filters sought | `Containers Visited` less the key's own | 51 ns | 38 |
+| a posting page those seeks read | `Join Posting Pages Read` | 270 ns | 281 |
+| a count against the copy, set up | keys found | 659 ns | 832 |
+| an fk container ANDed with the copy, besides `LION_CONTAINER_COST` | `Join Key Containers Read` | 12 ns | - |
+| a member of it past its first | | 14 ns | 20 |
+| a directory page | `Directory Pages Read` | 430 to 571 ns | 403 to 572 |
+| a key looked up on its leaf | `Join Keys Looked Up` | 377 ns | 474 |
+| a walked key, besides the leaves it steps over: its lookup and its place in its batch | the same, walked | 740 ns | 784 |
+| a row handed up | `Actual Rows` | 340 to 630 ns | 200 to 570 |
+
+Median residuals 16% for the probing counts, 13 to 20% for the counts against the copy, 22 to 27%
+for the lookups; the ranges are two fits of the same term that differ in what they are fitted
+beside. In two workers a count costs two to three times what it does alone: the participants seek
+the same posting pages and sets at once. The model prices the serial operations and divides by the
+participants, as core does.
+
+**What was wrong.** The probing count of a union filter was priced as the union's merge again at
+every count - `lion_merge_ops()` of the whole union prorated to the probed keys, and
+`LION_UNION_SET_COST`'s 100 `cpu_tuple_cost` a set - from when the counts built it; they probe it
+now, a seek of each set at the key's containers and its cursor set up, 217 ns a set. The IN list's
+probing plans were priced at 2,149 to 16,139 units a millisecond (median 3,684), five to thirty
+times what they take. The probe of a filter set too large to be copied into memory for the counts
+(`LION_MATERIALIZE_MAX_*`) re-reads its posting tree at every count: from the second row on it is a
+NOPIN set whose cursor starts at the root, 2.9 to 3.7 posting pages a probe where a key's one to ten
+containers lie far apart, 0.34 to 0.68 where it has 100 or all 169 of the heap's container keys and
+the seeks step right. `LION_FKJOIN_PROBE_COST`'s 80 had those pages in it, measured at one fanout. A
+set that is copied is probed in memory, at `LION_MEMORY_PROBE_COST`, and the partitioned fact's
+leaves' filter sets all are. The walk in key order was charged a page visit a row, where its
+counters show 0.02 to 0.3 directory pages a key while the keys are dense, besides a batch row priced
+as a page on purpose: a partitioned fact's lookups, a batch sorted once and walked in every leaf,
+were priced at two to three times their time ("A dimension that is a join", §32 "What collecting a
+range costs"). And the two counts' set-ups, 25 `cpu_tuple_cost` each, are 271 and 659 ns: probing a
+key whose filters are in memory is cheaper than looking it up in a copy.
+
+**What moved.** The model's shape: a union filter probed is its sets' seeks - no more of them than
+the sets have containers - and `LION_FKJOIN_SET_COST` a set, a count; a probe is
+`lion_fkjoin_probe_one()`: `LION_FKJOIN_PROBE_COST` and the pages it reads,
+`LION_FKJOIN_PROBE_PAGE_COST` each, the posting tree's height and two where the key's containers are
+eight container keys apart or more and a share of that where they are closer, or
+`LION_MEMORY_PROBE_COST` where the set can be copied; a union collected is its sets' containers read
+and its image built at each of its keys (`LION_UNION_KEY_COST`, `LION_UNION_MEMBER_COST`), as the
+leapfrog builds a driving union, not a k-way merge; and a walked row is `LION_FKJOIN_LOOKUP_COST`
+and `LION_FKJOIN_BATCH_ROW_COST`, with no page but the leaves it steps over. The constants, at 5 ns
+a `cpu_operator_cost` and 20 a `cpu_tuple_cost`:
+
+| setting (`pg_lion.`) | before | now |
+|---|---|---|
+| `fkjoin_count_cost` | 25 `cpu_tuple_cost` | 14 |
+| `fkjoin_set_cost` (new; was `LION_UNION_SET_COST` and the prorated merge) | 100 `cpu_tuple_cost` | 11 |
+| `fkjoin_probe_cost` | 80 `cpu_operator_cost` | 10 |
+| `fkjoin_probe_page_cost` (new; was in `fkjoin_probe_cost`) | - | 54 `cpu_operator_cost` |
+| `fkjoin_copy_count_cost` | 25 `cpu_tuple_cost` | 33 |
+| `fkjoin_copy_probe_cost` | 5 `cpu_operator_cost` | 2 |
+| `fkjoin_copy_member_cost` | 3 `cpu_operator_cost` | 3 |
+| `fkjoin_lookup_cost` (new; was a page visit, `descent_cost`'s 120) | - | 75 `cpu_operator_cost` |
+| `fkjoin_batch_row_cost` | 120 `cpu_operator_cost` | 75 |
+| `fkjoin_row_cost` | 10 `cpu_tuple_cost` | 20 |
+| `fkjoin_collect_container_cost`, `fkjoin_copy_container_cost` | 2, 20 `cpu_operator_cost` | unchanged (below) |
+
+The run's account of "Probed, then collected" is kept at the same prices: a count that probes adds
+its set-up and its union's sets, its filter containers sought and its posting pages read, less the
+count against a copy it would have made - its set-up and its fk containers looked up - and the
+account does not go below nothing, so that keys cheap to probe early in a run do not put off the
+switch once dear ones come.
+
+**Units a millisecond, before and after** - each forced plan's total cost over its untimed run, the
+same 352 runs with the build before the refit and after it (the executor the same but for the
+account); median, and the least and the most:
+
+| forced plans | serial, before | serial, now | two workers, before | two workers, now |
+|---|---|---|---|---|
+| collected, plain (51 each) | 677 (156 to 2,308) | 605 (276 to 942) | 554 (303 to 2,070) | 648 (266 to 1,074) |
+| collected, partitioned (10) | 808 (465 to 1,906) | 634 (446 to 1,282) | 658 (552 to 1,651) | 450 (363 to 1,290) |
+| probed, plain (51) | 739 (193 to 16,139) | 419 (215 to 974) | 788 (119 to 15,377) | 410 (164 to 933) |
+| ... of them the IN list (17) | 3,684 (2,149 to 16,139) | 383 (215 to 765) | 2,310 (703 to 15,377) | 373 (164 to 708) |
+| probed, partitioned (10) | 3,966 (1,023 to 22,785) | 752 (631 to 1,412) | 1,635 (808 to 18,327) | 435 (362 to 1,401) |
+| core's plans, pushdown off (27) | 223 (81 to 14,469) | 257 (117 to 15,686) | 289 (101 to 4,477) | 303 (163 to 5,925) |
+
+The probing plans, priced at up to 45 times the 500 units a millisecond the rest of the model runs
+at, run at 164 to 1,412; what is left low is the IN list probed over keys of a hundred or a thousand
+rows (215 to 250 serially, below) and the two workers' probing counts, which take two to three times
+a serial one's time each (164 to 183 over the ten-row fact's largest sets). Core's own plans are its
+prices, unchanged: its hash joins run at 120 to 300 units a millisecond, its nested loops over a
+hundred keys at 1,700 to 15,000 (they are priced for pages read at random that the warm cache
+holds).
+
+**The choices.** With nothing disabled, the IN list over each fact and dimension set and the
+partitioned fact's semi join, against the fastest of the node collected, the node probed and core's
+plan: serially the chosen plan took 1.05 times the fastest at the median where it took 1.07, 1.81 at
+the 90th percentile where 2.17, and 2,251 ms in all where 2,794; in two workers 1.06, 1.83 and 1,386
+ms where 1.09, 1.62 and 1,776. The mispicks the refit ends are the node's collected plan refused for
+a hash join (serially, 10,000 keys of one row, 115 ms against 40, which two workers still refuse;
+the partitioned fact's 10,000 keys, 131 against 45) and the probed plan chosen over the collected
+one (1,000 keys of a hundred rows, 15.6 against 6.6; of a thousand rows, 32.5 against 20.9). The
+mispicks left are hash joins that core prices at 120 to 270 units a millisecond, which the node at
+600 loses to while it is up to two and a half times faster (20,000 keys of a hundred rows, 160 ms
+against the node's 103; 2,000 of a thousand, 128 against 43), and a hundred keys of one row, where
+core's nested loop, priced at 797 and run in 0.3 to 0.5 ms, now loses to the node's 585 and 0.8 to
+0.9 ms. Over the suite's own small tables `fkjoin_distinct.sql`'s `count(DISTINCT d.attr)` over a
+semi join of 300 dimension rows is now pushed down, in 0.6 to 0.7 ms against the nested loop's 1.0
+to 1.1 it was left to.
+
+**Walks over small fk indexes.** The refit takes the walk wherever the batch's keys lie closer than
+a descent reads, which it did not over the suite's small fk indexes. Over 400,000 rows of 4,000 and
+of 400 keys, whose descents read three directory pages a key, the walk and the descent were timed
+side by side (the walk forced by pricing its rows at nothing, the descent by pricing the walk's
+lookups out): the whole of 4,000 keys took 9.0 ms walked against 9.2 descended, their lookups 2.2 ms
+against 4.3; 400 keys 1.1 against 1.1; 400 keys of a thousand rows 1.7 against 1.6 and 20.2 against
+21.8 grouped. The walk is not slower where the refit now takes it, and saves half the lookups' time.
+
+**The skewed star of "Probed, then collected", again** (the same machine and runs as there, three of
+each). With nothing disabled the node, collected, is now chosen for 10,147 and 30,000 hot keys, in
+315 and 770 ms, where core's nested loop into the fk index was, in 5,540 and 18,656: the collected
+price came down with a union collected priced as its image rather than a k-way merge, below the
+nested loop's price at the average rows a key. For 1,047 keys the nested loop stays, in 605 ms
+against 120 collected. The probing plans switch after 19 keys where they switched after 8 (57 over
+three participants where 24), at the account's lower prices, and take 1.0 to 1.3 times the collected
+plan's time serially (160 ms against 120 for 1,047 keys, 819 against 769 for 30,000, 1,604 against
+1,554 for 200,000) and 1.04 to 1.8 in two workers, where each participant collects for itself: 125
+to 152 ms of collection over the three against 50 to 65 for the planned shared copy. Over the cold
+keys of one row the 1,202 keys no longer switch and probe to the end, in 104 ms against 99
+collected; the 40,542 switch after 1,144 keys, in 181 against 155.
+
+**Not refitted, and found.** The collection's own terms, once a run
+(`fkjoin_collect_container_cost`, `fkjoin_copy_container_cost`), are left as they were: one filter
+of 201,111 rows in 169 containers took 0.45 to 0.6 ms to collect, where it is priced at some 20 us
+(the three of the IN list, a union, took 1.1 to 1.5 ms, priced at 0.8 through the union's members),
+and the skewed star's union of 592,134 rows took 27 to 36 ms. The data holds two sizes of collection
+only, which cannot tell a fixed cost from one a row; the price is low for small dimension sets,
+where it makes the planner collect for a few hundred microseconds more than probing would take, and
+it makes the run's switch come early, which costs at most the collection. A count's containers that
+hold visible rows cost some 0.8 us each more, fitted on `Visibility Map Checks`, in both ways; the
+model has no such term. The AND of a key's container of a few members with a copy's container that
+is an array walks the copy's members: the grouped count over a thousand rows a key, whose copy of
+one filter holds 1,190 members a container, counts three to four times slower than the IN list's,
+whose copy is of bitsets. A union filter probed over keys of a hundred or a thousand rows is priced
+at half its time (215 to 250 units a millisecond): each of its containers at a key is probed as a
+union of three sets, some 1.4 us, where the model has three seeks. And in two workers a count takes
+two to three times what it does alone.
+
+The suite's plans change in three ways, each checked: over its small fk indexes the lookups now walk
+the keys in index order where they descended (`Join Key Lookups: in index order`); some small
+dimension sets over filters held in memory probe them rather than collect them; and
+`fkjoin_distinct.sql`'s `count(DISTINCT d.attr)` over a semi join of 300 dimension rows is pushed
+down, in 0.6 to 0.7 ms against the nested loop's 1.0 to 1.1 it was left to. `costgucs.sql` lists the
+three new settings. Where a test counts the copy's own counters (`fkjoin_perkey.sql`,
+`fkjoin_semi.sql`, `fkjoin_walk.sql`) it now forces the collection with `pg_lion.fkjoin_count_cost`,
+and `fkjoin_adaptive.sql`'s switches come a few keys later (13 where 10), its rescan case running
+two dimension sets of twenty heavy keys so that each run still reaches the price.
 
 ### Declined in v1, and why
 
@@ -10140,6 +10475,12 @@ the query leaves no choice or a setting makes it. And a dirty heap - deletes, up
 every table - before and after VACUUM. `fkjoin_semi.sql`'s "three relations", a dimension
 semi-joined to a second table, is pushed down now; beside it an inner join inside the dimension
 still declines.
+
+`test/sql/fkjoin_adaptive.sql` (2026-09-29), probing plans that collect part way through: what
+"Probed, then collected" lists - the switch's key in EXPLAIN ANALYZE, row at a time and walked, a
+copy that comes out empty, the knob off and a copy too large for its memory, rescans, a partitioned
+fact's leaves, parallel plans and a dirty heap before and after VACUUM - each answer against the
+pushdown off.
 
 ## 28. Range predicates over the sorted directory (v1, implemented)
 
@@ -12165,6 +12506,95 @@ outer row, plain and bitmap; on a heap made dirty by updates and deletes, and af
 the count's counters making each choice, and every union built with the knob off. `costgucs.out`
 lists the two new settings.
 
+**Trees probed** (2026-09-29, `lion_lazy_and()`, `lion_and_align()`, `lion_and_build()`,
+`lion_tree_probe_pays()`, `lion_tree_probe()`). Union probing applied to an OR met directly by an AND
+in the leapfrog. A source whose own tree is more than one union - a tsquery `(a | b | c) & (d | e)`,
+an AND of two ORs (and each OR of three a binary OR of an OR, as a tsquery's operators nest); an OR
+across columns of ANDed clauses, an OR of ANDs - was a cursor of its own and was evaluated whole at
+every key it was sought to: its AND node leapfrogged its children, and its driver OR's union was
+always built, a bitset image of every member of its sets' containers at the key, however few rows the
+outer intersection had left there. A benchmark's FK-side join that probed a tsquery of two ORs of
+dense terms per key built about two unions for every key container it read, of a row or two each,
+all of them to keep those rows.
+
+- **Lazy trees.** Under a leapfrog an AND node is lazy as an OR is (`LionExprCursor.lazy`): sought to
+  a key, it winds its children to the first key at or after it that every one of them has a container
+  at (`lion_and_align()`, the leapfrog's seeks without its ANDs) and stands there PENDING, its
+  intersection not made; the children of a lazy OR are lazy too, so an OR of ANDs, or of ORs, is
+  pending until it is asked. When it is asked - it drives the leapfrog, or building it is the cheaper
+  way - its children are intersected at the key as the leapfrog does it (`lion_and_build()`), each of
+  them again built or probed by the same rule, and the container may come out empty, which the
+  leapfrog above takes as a key without a row. An AND node that drives a leapfrog - the merge's, or
+  its parent AND node's - is not lazy (`lion_leapfrog_lazy()`): it is intersected at every key it
+  stands at anyway, and its own leapfrog stops at the first child that empties a key, where winding
+  would seek every child there first.
+- **The choice, per key** (`lion_lazy_and()`). A pending union whose children all have their
+  containers is decided as before (`lion_or_probe_pays()`); anything else pending is a tree, and
+  `lion_tree_probe_pays()` estimates both ways from the containers standing at the key, in the same
+  quarters of a nanosecond and the same integer arithmetic: probing costs every member of the running
+  intersection looked up in every leaf (the lookups `lion_or_probe_pays()` prices, now one function,
+  `lion_up_lookup()`) and its extraction; building costs each union's image and its members, each
+  AND node's ANDs by the sizes of what it ANDs, and the running intersection's AND with the result
+  (`lion_tree_estimate()`). A running intersection of more members than an ARRAY holds is never
+  probed.
+- **The probe** (`lion_tree_probe()`, `lion_tree_eval()`). The intersection's members are extracted
+  once, and the tree is evaluated over their positions: a leaf's (or a built node's) container probed
+  with the positions still in question, an AND node's children each given the positions the one before
+  it kept, in the leapfrog's order, an OR node's children that have a container probed one after the
+  other with what none before found, then its pending children evaluated for what is left. The found
+  positions come out as an ARRAY in the intersection's order. The three steps are the container
+  library's (`lion_container_extract_members()`, `lion_container_probe_members()`,
+  `lion_container_array_from_marks()`), which `lion_container_and_union_raw()` is now made of too.
+- **§9.** The argument on `lion_leapfrog()` holds unchanged. Winding a tree's children to a key is
+  seeking them there, and nothing of a key they pass over reaches the visibility map; a pending tree
+  stands at its key with every child standing there with the pin its container came with - a trimmed
+  AND with its kept child's - until it moves past the key; and what the probe keeps is a subset of the
+  running intersection, whose members lie in containers the cursors before it stand on with their
+  pins. A tree that is built is the eager node's container at that key, made the same way. What
+  changes is where a key the tree has no row at is found out: by the leapfrog that meets it, at the
+  cost of a probe, instead of by the tree running on to its next row - which the leapfrog would then
+  have sought every other source to.
+- **What shows it.** `LionCount`'s `EXPLAIN ANALYZE` prints `Trees Built` and `Trees Probed` where the
+  AND met a tree past its driver - the keys at which it was built there, and those at which it was
+  evaluated for the intersection's members; a tree that drives is built and counted in neither.
+  `pg_lion.enable_tree_probe` (on) is a testing knob: off, no AND node is lazy and every tree is
+  built where it is sought, as before, with the same answers. The same leapfrog is the plain and the
+  bitmap scan's AND (above), so both probe trees too.
+
+Measured on the FK-side join of §27's "Probed, then collected" (the probing runs there, trees
+probed against built: 30 to 45% off serially, where the unions were most of a key's work beside its
+seeks, and 1 to 20% with two workers, whose seeks of the same posting pages contend), and on 4
+million rows of 562 container keys under one lion index over a selective column (`e`, 0.1% of the
+rows, scattered), three dense ones of four values and a tsvector of five dense terms, each on three
+rows in ten; the same build and machine, medians of five, in ms, with tree probing on and off (the
+count forced as `LionCount`, the scans forced; the times are a few milliseconds on a loaded machine,
+so only the larger differences mean anything):
+
+| filter | count, probed / built | plain scan | bitmap scan | counters, probed (built) |
+|---|---|---|---|---|
+| `e = 7 AND doc @@ '(t1 \| t2 \| t3) & (t4 \| t5)'` | 8.2 / 16.6 | 3.4 / 6.1 | 4.2 / 15.3 | 562 trees probed (1,686 unions built) |
+| `e = 7 AND ((a = 1 AND b = 2) OR (a = 3 AND c = 1))` | 2.0 / 11.7 | - | - | 562 trees probed (562 unions probed over ANDs built) |
+| `e = 7 AND doc @@ '(t1 & t2) \| (t3 & t4)'` | 2.1 / 2.2 | 3.4 / 11.1 | 3.0 / 7.3 | 562 trees probed (562 unions probed) |
+| `e = 7 AND b = 2 AND doc @@ '(t1 \| t2) & (t4 \| t5)'` | 2.4 / 8.8 | 7.1 / 9.8 | 2.9 / 4.3 | 560 trees probed (1,120 unions built) |
+| `a = 1 AND doc @@ '(t1 \| t2 \| t3) & (t4 \| t5)'` (dense: built) | 7.2 / 9.6 | | | 1,124 trees built |
+| `doc @@ '(t1 \| t2 \| t3) & (t4 \| t5)'` (the tree drives) | 7.3 / 9.4 | | | 562 trees built inside it |
+
+The OR across columns is no index qual of a plain or bitmap scan (core's scans take it as a filter),
+so only the count meets it as a tree. The last two rows are where no probe pays, and the tree is
+built as before - an OR of an OR and a term, as a tsquery's `t1 | t2 | t3` nests, now built when it
+is asked for rather than wherever its inner OR stands - in no more time than before.
+
+`test/sql/treeprobe.sql` checks the answers against a sequential scan through the count, the plain and
+the bitmap scan, with tree probing on and off, over fourteen filters: ANDs of ORs and ORs of ANDs in a
+tsquery, an OR of ANDs across columns, a deeper tree, both kinds beside each other, a three-term AND,
+trees met with a dense intersection (built), a tree built at the keys where a column is dense and
+probed where it is sparse, a tree that drives, a term with no entry in an OR and in an AND, a tree
+met after another clause, a term twice in one tree; the counters of each (and, for two of them, the
+numbers, probing on and off: the unions a probed tree never builds); a nested loop's inner scans
+rescanned per outer row, plain and bitmap; a dirty heap before and after VACUUM. The container
+library's three steps are unit-tested against the reference alone and combined over random trees of
+ANDs and ORs of every representation, and on damaged inputs (`test/unit/container_test.c`).
+
 **A WALK is priced as a heap pass per entry** (2026-09-27). A range alone - one column's entries
 in key order, each entry's TIDs in heap order (§29.3) - got the column's correlation, as a scan not in
 heap order does: btree's price, Mackert and Lohman's pages each a random read, whatever its entries
@@ -13214,7 +13644,12 @@ stays `LION_UNION_SET_COST` and has no setting of its own: both are a union sour
 a count, in the same code (`lion_count_sources_cached()`), whether the counts are a GROUP BY's or an
 FK-side join's. `LION_FKJOIN_BATCH_ROW_COST` was `LION_DESCENT_COST` by choice, not by identity - a
 row's place in a batch priced as a page visit, on purpose on the high side (§27, "Lookups in key
-order") - and has its own setting, `pg_lion.fkjoin_batch_row_cost`, at the same 120. Two inline
+order") - and has its own setting, `pg_lion.fkjoin_batch_row_cost`, at the same 120. *(Since the
+refit of 2026-09-29 (§27, "The per-key terms, refitted") the FK-side join's counts no longer build a
+union source again - they probe it (§29.11) - and `LION_FKJOIN_SET_COST` is a set's cursor set up
+and sought, with a setting of its own, `pg_lion.fkjoin_set_cost`, at 11 `cpu_tuple_cost`;
+`fkjoin_batch_row_cost` is 75, beside a new `fkjoin_lookup_cost`; and `fkjoin_probe_page_cost`
+prices the posting pages a probe reads, which `fkjoin_probe_cost` had in it.)* Two inline
 numbers became constants as well: the collecting merge's driver containers
 (`LION_FKJOIN_COLLECT_CONTAINER_COST`, two `cpu_operator_cost`) and the sort's page mix (0.75
 `seq_page_cost` and 0.25 `random_page_cost`, `cost_tuplesort()`'s). A count of operations times a
@@ -13241,12 +13676,14 @@ what the defaults are fitted to:
   SET`, as a tuned `random_page_cost` would.
 - For the FK-side join, §27's "Where a key's time goes" gives the per-key terms directly:
   `Join Lookup Time` over `Join Keys Looked Up`, with `Directory Pages Read` over the same keys,
-  is a lookup's price in pages of `descent_cost` (and `fkjoin_batch_row_cost` a key in key
-  order); `Join Count Time` over the keys found is a count - `fkjoin_count_cost` or
-  `fkjoin_copy_count_cost`, and `Join Key Containers Read` over the keys found times
-  `container_cost` and `member_cost`, with `fkjoin_copy_probe_cost` for each of those containers
-  against a collected copy (`Fact Filter Copy Seeks`), or `fkjoin_probe_cost` probed; and `Fact
-  Filter Collect Time` is the once-a-run collection (`fkjoin_collect_container_cost`,
+  is a lookup's price in pages of `descent_cost` (and `fkjoin_lookup_cost` and
+  `fkjoin_batch_row_cost` a key in key order); `Join Count Time` over the keys found is a count -
+  `fkjoin_count_cost` or `fkjoin_copy_count_cost`, and `Join Key Containers Read` over the keys
+  found times `container_cost` and `member_cost`, with `fkjoin_copy_probe_cost` for each of those
+  containers against a collected copy (`Fact Filter Copy Seeks`), or probed `fkjoin_probe_cost`
+  for each container of the filters sought (`Containers Visited` less the key's own),
+  `fkjoin_probe_page_cost` for each of `Join Posting Pages Read` and `fkjoin_set_cost` for each set
+  of a union filter; and `Fact Filter Collect Time` is the once-a-run collection (`fkjoin_collect_container_cost`,
   `fkjoin_copy_container_cost`). A phase's time per key over the operations a key makes of it is
   the time of one, and at R units a millisecond a microsecond is R/1000 units: at 500, a lookup of
   0.6 us a directory page is 0.3 units a page, which at a `cpu_operator_cost` of 0.0025 is
@@ -13994,7 +14431,7 @@ one now goes through an image; and taking the first bucket of a range whose lowe
 column's first key as whole, where its 4,096 keys are walked one by one - a range over all of a leaf
 reads them. The counts of a GROUP BY against a collected range's bitsets take about twice those
 against an equality's set of as many rows, priced the same (§10's counts). And the node's lookups
-over a partitioned fact, as above.
+over a partitioned fact, as above - since refitted (§27, "The per-key terms, refitted").
 
 ### Verification (lion_funcs.c)
 

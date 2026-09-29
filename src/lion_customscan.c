@@ -6822,7 +6822,7 @@ lion_cost_fkjoin_walk(double rows, double leaves, double height,
  * they lie eight container keys apart or more, a share of that where they are
  * closer.  That is what the counters of the refit's probing counts come to:
  * 2.9 to 3.7 posting pages a probe over one to ten containers a key, 0.34 to
- * 0.68 over 76 to 168 of the heap's 168 container keys.
+ * 0.68 over 100 or all of the heap's 169 container keys.
  */
 static Cost
 lion_fkjoin_probe_one(double heap_pages, double members, double cfk)
@@ -17326,7 +17326,7 @@ lion_join_count_key(LionCountScanState *st)
  * a semi join over skewed keys can miss by two orders of magnitude, while
  * the keys the dimension keeps are the heavy ones, far above the fact's
  * average rows a key that the model prices each at.  A plan made to probe
- * for a thousand keys that meets thirty thousand heavy ones rebuilds the
+ * for a few keys that meets many times as many heavy ones rebuilds the
  * filters' unions at every container of every key, where one collection
  * would have served them all.
  *
