@@ -15,6 +15,11 @@ LOAD 'pg_lion';
 CREATE EXTENSION IF NOT EXISTS pg_lion;
 -- VACUUM can only set all-visible once the commit record is on disk
 SET synchronous_commit = on;
+-- The FK-side joins below pin the upper node's plans (DESIGN.md §27).  The semi
+-- and anti join path answers the same joins as a join rel's rows, below core's
+-- own Agg, and no enable_*join setting disables it: it is off here, and tested
+-- - the upper node over it included - in fkjoin_semipath.sql.
+SET pg_lion.enable_semijoin = off;
 SET default_statistics_target = 1000;
 -- parallel plans at any size; the suite's own setting is 0, and lion_xj()
 -- runs every query serially as well
