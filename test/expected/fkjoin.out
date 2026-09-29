@@ -430,9 +430,10 @@ SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_ff f JOIN lion_fd d O
  Finalize Aggregate
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_ff_fk (fk = d.pk), lion_ff_tk (tk = ANY ('{k1,k2,k3,k4,k5,k6,k7,k8,k9,k10,k11,k12,k13,k14,k15,k16,k17,k18,k19,k20,k21,k22,k23,k24,k25,k26,k27,k28,k29,k30,k31,k32,k33,k34,k35,k36,k37,k38,k39,k40,k41,k42,k43,k44,k45,k46,k47,k48,k49,k50,k51,k52,k53,k54,k55,k56,k57,k58,k59,k60}'::text[]))
+         Join Key Lookups: in index order
          Fact Filters: collected once
          ->  Seq Scan on lion_fd d
-(5 rows)
+(6 rows)
 
 SELECT lion_fj('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.tk IN (' ||
 	(SELECT string_agg(quote_literal('k' || i), ', ') FROM generate_series(1, 60) i) || ')');
@@ -452,9 +453,10 @@ SELECT * FROM lion_explain_norm('SELECT d.attr, count(*) FROM lion_ff f JOIN lio
    Group Key: d.attr
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_ff_fk (fk = d.pk), lion_ff_x (x = 3)
+         Join Key Lookups: in index order
          ->  Seq Scan on lion_fd d
                Filter: (region = 'eu'::text)
-(6 rows)
+(7 rows)
 
 SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE d.attr = 2') AS p("QUERY PLAN");
                   QUERY PLAN                  
@@ -476,9 +478,10 @@ SELECT * FROM lion_explain_norm('SELECT d.attr, count(*) FROM lion_ff f JOIN lio
    ->  Custom Scan (LionCount)
          Output: d.attr, (PARTIAL count(*))
          Lion Indexes: lion_ff_fk (fk = d.pk)
+         Join Key Lookups: in index order
          ->  Seq Scan on public.lion_fd d
                Output: d.attr, d.pk
-(9 rows)
+(10 rows)
 
 RESET enable_hashjoin;
 RESET enable_mergejoin;

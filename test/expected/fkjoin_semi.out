@@ -778,9 +778,10 @@ SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sd d WHERE EXISTS (SE
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_sf_fk (fk = d.pk), lion_sf_yt.t (t = ANY ('{t1,t2}'::text[])), lion_sf_x (x = 3)
          Join Type: Semi
+         Join Key Lookups: in index order
          Fact Filters: collected once
          ->  Seq Scan on lion_sd d
-(6 rows)
+(7 rows)
 
 SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sd d WHERE NOT EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.doc @@ ''a1 & b1''::tsquery)') AS p("QUERY PLAN");
                                           QUERY PLAN                                           
@@ -789,9 +790,10 @@ SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sd d WHERE NOT EXISTS
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_sf_fk (fk = d.pk), lion_sf_doc (doc @@ '''a1'' & ''b1'''::tsquery)
          Join Type: Anti
+         Join Key Lookups: in index order
          Fact Filters: collected once
          ->  Seq Scan on lion_sd d
-(6 rows)
+(7 rows)
 
 SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_sd d WHERE d.pk = f.fk AND d.region = ''eu'')') AS p("QUERY PLAN");
                            QUERY PLAN                            
@@ -799,10 +801,11 @@ SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sf f WHERE f.x = 3 AN
  Finalize Aggregate
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_sf_fk (fk = d.pk), lion_sf_x (x = 3)
+         Join Key Lookups: in index order
          Fact Filters: collected once
          ->  Seq Scan on lion_sd d
                Filter: (region = 'eu'::text)
-(6 rows)
+(7 rows)
 
 -- the dimension's own filters answered by its lion index, as a bitmap scan
 -- (two equalities: every supported release puts both in the Index Cond)
@@ -814,12 +817,11 @@ SELECT * FROM lion_explain_norm('SELECT count(*) FROM lion_sd d WHERE d.region =
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_sf_fk (fk = d.pk), lion_sf_yt.t (t = 't3'::text)
          Join Type: Semi
-         Fact Filters: collected once
          ->  Bitmap Heap Scan on lion_sd d
                Recheck Cond: ((region = 'us'::text) AND (grp = 'g1'::text))
                ->  Bitmap Index Scan on lion_sd_rg
                      Index Cond: ((region = 'us'::text) AND (grp = 'g1'::text))
-(9 rows)
+(8 rows)
 
 RESET enable_seqscan;
 -- two dimension rows: two counts, each probing the filter itself.  The child
@@ -852,13 +854,18 @@ SELECT * FROM lion_explain_norm('SELECT d.grp, count(*) FROM lion_sd d WHERE EXI
          Output: d.grp, (PARTIAL count(*))
          Lion Indexes: lion_sf_fk (fk = d.pk)
          Join Type: Semi
+         Join Key Lookups: in index order
          ->  Seq Scan on public.lion_sd d
                Output: d.grp, d.pk
-(9 rows)
+(10 rows)
 
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 RESET enable_nestloop;
+-- the copy holds the filter's rows: forced, since a count that probes one set
+-- in memory is priced below one against the copy (DESIGN.md §27, "The
+-- per-key terms, refitted")
+SET pg_lion.fkjoin_count_cost = 1e6;
 SELECT lion_sj_counter('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)', 'Fact Filter Rows Collected')
 	= (SELECT count(*) FROM lion_sf WHERE x = 3) AS collected_the_filter;
  collected_the_filter 
@@ -866,6 +873,7 @@ SELECT lion_sj_counter('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FR
  t
 (1 row)
 
+RESET pg_lion.fkjoin_count_cost;
 -- the 300 keys are looked up; 17 of them have no entry
 SELECT lion_sj_counter('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)', 'Join Keys Looked Up');
  lion_sj_counter 

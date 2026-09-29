@@ -179,9 +179,10 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM l
          ->  Parallel Custom Scan (LionCount)
                Lion Indexes: lion_pf_fk (fk = d.pk), lion_pf_x (x = 3)
                Join Type: Semi
+               Join Key Lookups: in index order
                Fact Filters: collected once
                ->  Parallel Seq Scan on lion_pd d
-(8 rows)
+(9 rows)
 
 EXPLAIN (COSTS OFF) SELECT d.grp, count(*) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.t = 't3' GROUP BY d.grp;
                                     QUERY PLAN                                     
@@ -192,9 +193,10 @@ EXPLAIN (COSTS OFF) SELECT d.grp, count(*) FROM lion_pf f JOIN lion_pd d ON d.pk
          Workers Planned: 2
          ->  Parallel Custom Scan (LionCount)
                Lion Indexes: lion_pf_fk (fk = d.pk), lion_pf_yt.t (t = 't3'::text)
+               Join Key Lookups: in index order
                Fact Filters: collected once
                ->  Parallel Seq Scan on lion_pd d
-(8 rows)
+(9 rows)
 
 -- the rows of a count(DISTINCT), gathered, sorted and aggregated by core
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT f.fk) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.x = 3 AND d.attr = 2;
@@ -207,11 +209,12 @@ EXPLAIN (COSTS OFF) SELECT count(DISTINCT f.fk) FROM lion_pf f JOIN lion_pd d ON
                Workers Planned: 2
                ->  Parallel Custom Scan (LionCount)
                      Lion Indexes: lion_pf_fk (fk = d.pk), lion_pf_x (x = 3)
+                     Join Key Lookups: in index order
                      Join Rows: the dimension rows with a match
                      Fact Filters: collected once
                      ->  Parallel Seq Scan on lion_pd d
                            Filter: (attr = 2)
-(11 rows)
+(12 rows)
 
 -- as many workers as max_parallel_workers_per_gather allows (one worker and
 -- a leader that does not take part would count every row one participant
@@ -224,9 +227,10 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FR
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_pf_fk (fk = d.pk), lion_pf_x (x = 3)
          Join Type: Anti
+         Join Key Lookups: in index order
          Fact Filters: collected once
          ->  Seq Scan on lion_pd d
-(6 rows)
+(7 rows)
 
 SET parallel_leader_participation = on;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3);
@@ -238,9 +242,10 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FR
          ->  Parallel Custom Scan (LionCount)
                Lion Indexes: lion_pf_fk (fk = d.pk), lion_pf_x (x = 3)
                Join Type: Anti
+               Join Key Lookups: in index order
                Fact Filters: collected once
                ->  Parallel Seq Scan on lion_pd d
-(8 rows)
+(9 rows)
 
 SET parallel_leader_participation = off;
 -- ... none at all
@@ -252,9 +257,10 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FR
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_pf_fk (fk = d.pk), lion_pf_x (x = 3)
          Join Type: Anti
+         Join Key Lookups: in index order
          Fact Filters: collected once
          ->  Seq Scan on lion_pd d
-(6 rows)
+(7 rows)
 
 SET max_parallel_workers_per_gather = 2;
 -- ... and as many as the dimension's parallel_workers allows
@@ -266,9 +272,10 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FR
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_pf_fk (fk = d.pk), lion_pf_x (x = 3)
          Join Type: Anti
+         Join Key Lookups: in index order
          Fact Filters: collected once
          ->  Seq Scan on lion_pd d
-(6 rows)
+(7 rows)
 
 -- the serial node is parallel-safe: with debug_parallel_query a worker runs it
 SET debug_parallel_query = on;
@@ -282,9 +289,10 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_pd d WHERE NOT EXISTS (SELECT 1 FR
          ->  Custom Scan (LionCount)
                Lion Indexes: lion_pf_fk (fk = d.pk), lion_pf_x (x = 3)
                Join Type: Anti
+               Join Key Lookups: in index order
                Fact Filters: collected once
                ->  Seq Scan on lion_pd d
-(9 rows)
+(10 rows)
 
 RESET debug_parallel_query;
 ALTER TABLE lion_pd SET (parallel_workers = 2);
@@ -494,9 +502,10 @@ EXPLAIN (COSTS OFF) SELECT g, s.c FROM generate_series(2690, 2700, 2) g LEFT JOI
                ->  Parallel Custom Scan (LionCount)
                      Lion Indexes: lion_pf_fk (fk = d.pk), lion_pf_x (x = 3)
                      Join Type: Semi
+                     Join Key Lookups: in index order
                      Fact Filters: collected once
                      ->  Parallel Seq Scan on lion_pd d
-(11 rows)
+(12 rows)
 
 RESET enable_hashjoin;
 RESET enable_mergejoin;
@@ -550,9 +559,10 @@ EXPLAIN (COSTS OFF) EXECUTE lion_pj_p(3, 't5');
                ->  Parallel Custom Scan (LionCount)
                      Lion Indexes: lion_pf_fk (fk = d.pk), lion_pf_x (x = $1), lion_pf_yt.t (t = $2)
                      Join Type: Semi
+                     Join Key Lookups: in index order
                      Fact Filters: collected once
                      ->  Parallel Seq Scan on lion_pd d
-(11 rows)
+(12 rows)
 
 EXECUTE lion_pj_p(3, 't5');
  grp | count 
@@ -618,9 +628,10 @@ EXPLAIN (COSTS OFF) EXECUTE lion_pj_big;
          ->  Parallel Custom Scan (LionCount)
                Lion Indexes: lion_pfw_fk (fk = d.pk), lion_pfw_x (x = ANY ('{0,2,4,6,8}'::integer[]))
                Join Type: Semi
+               Join Key Lookups: in index order
                Fact Filters: collected once
                ->  Parallel Seq Scan on lion_pd d
-(8 rows)
+(9 rows)
 
 EXECUTE lion_pj_big;
  count 
@@ -712,9 +723,10 @@ EXPLAIN (COSTS OFF) EXECUTE lion_pj_spill;
          ->  Parallel Custom Scan (LionCount)
                Lion Indexes: lion_pfs_fk (fk = d.pk), lion_pfs_x (x = ANY ('{0,2,4,6,8}'::integer[]))
                Join Type: Semi
+               Join Key Lookups: in index order
                Fact Filters: collected once
                ->  Parallel Seq Scan on lion_pd d
-(8 rows)
+(9 rows)
 
 EXECUTE lion_pj_spill;
  count 

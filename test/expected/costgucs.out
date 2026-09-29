@@ -33,15 +33,18 @@ SELECT name, setting, boot_val, context, vartype
  pg_lion.descent_cost                  | 120     | 120      | user    | real
  pg_lion.distinct_test_cost            | 50      | 50       | user    | real
  pg_lion.entry_count_cost              | 50      | 50       | user    | real
- pg_lion.fkjoin_batch_row_cost         | 120     | 120      | user    | real
+ pg_lion.fkjoin_batch_row_cost         | 75      | 75       | user    | real
  pg_lion.fkjoin_collect_container_cost | 2       | 2        | user    | real
  pg_lion.fkjoin_copy_container_cost    | 20      | 20       | user    | real
- pg_lion.fkjoin_copy_count_cost        | 25      | 25       | user    | real
+ pg_lion.fkjoin_copy_count_cost        | 33      | 33       | user    | real
  pg_lion.fkjoin_copy_member_cost       | 3       | 3        | user    | real
- pg_lion.fkjoin_copy_probe_cost        | 5       | 5        | user    | real
- pg_lion.fkjoin_count_cost             | 25      | 25       | user    | real
- pg_lion.fkjoin_probe_cost             | 80      | 80       | user    | real
- pg_lion.fkjoin_row_cost               | 10      | 10       | user    | real
+ pg_lion.fkjoin_copy_probe_cost        | 2       | 2        | user    | real
+ pg_lion.fkjoin_count_cost             | 14      | 14       | user    | real
+ pg_lion.fkjoin_lookup_cost            | 75      | 75       | user    | real
+ pg_lion.fkjoin_probe_cost             | 10      | 10       | user    | real
+ pg_lion.fkjoin_probe_page_cost        | 54      | 54       | user    | real
+ pg_lion.fkjoin_row_cost               | 20      | 20       | user    | real
+ pg_lion.fkjoin_set_cost               | 11      | 11       | user    | real
  pg_lion.fkjoin_sort_compare_cost      | 0.25    | 0.25     | user    | real
  pg_lion.fkjoin_sort_key_cost          | 6       | 6        | user    | real
  pg_lion.fkjoin_sort_random_page_cost  | 0.25    | 0.25     | user    | real
@@ -61,7 +64,7 @@ SELECT name, setting, boot_val, context, vartype
  pg_lion.union_member_cost             | 0.25    | 0.25     | user    | real
  pg_lion.union_set_cost                | 100     | 100      | user    | real
  pg_lion.walk_pass_cost                | 5       | 5        | user    | real
-(34 rows)
+(37 rows)
 
 -- from 0 up, among the customized options as every extension's settings are
 SELECT count(*) AS settings,
@@ -73,7 +76,7 @@ SELECT count(*) AS settings,
  WHERE name LIKE 'pg_lion.%\_cost';
  settings | from_zero | unbounded | custom_group | unit_named 
 ----------+-----------+-----------+--------------+------------
-       34 | t         | t         | t            | t
+       37 | t         | t         | t            | t
 (1 row)
 
 -- 50000 rows; a has 10 values and g 100, both placed at random, about 55

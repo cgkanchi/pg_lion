@@ -367,10 +367,14 @@ SELECT lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk 
 	>= 3 * lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2', 'Join Keys Looked Up') AS a_descent_a_key;
 -- a fact filter that is one range, collected into memory on its own (§32),
 -- is what the join copies as its fact filters: one source of one set, which
--- the collection used to refuse as a collected set counted on its own
+-- the collection used to refuse as a collected set counted on its own.  The
+-- copy is forced: a count that probes a set in memory is priced below one
+-- against the copy (DESIGN.md §27, "The per-key terms, refitted").
+SET pg_lion.fkjoin_count_cost = 1e6;
 SELECT lion_wj_counter('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x < 5)', 'Range Sources Collected') AS range_collected,
 	   lion_wj_counter('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x < 5)', 'Fact Filter Rows Collected') AS rows_copied,
 	   lion_wj_counter('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x < 5)', 'Join Keys Without Entry') AS without_entry;
+RESET pg_lion.fkjoin_count_cost;
 -- a batch is what work_mem holds: at 256 kB the keys come in more than one
 SET work_mem = '256kB';
 SELECT lion_wj('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE f.x < 8 GROUP BY d.attr');

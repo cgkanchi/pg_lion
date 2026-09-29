@@ -511,7 +511,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `union_key_cost` | 30 | `cpu_operator_cost` | the union of an `IN` list's or a multi-key query's containers built at a container key |
 | `union_member_cost` | 0.25 | `cpu_operator_cost` | a member of such a union, or of the intersection ANDed with it |
 | `descent_cost` | 120 | `cpu_operator_cost` | a level of an entry directory descended |
-| `union_set_cost` | 100 | `cpu_tuple_cost` | a set of an `IN` list or `OR` rebuilt by each count of a GROUP BY or join |
+| `union_set_cost` | 100 | `cpu_tuple_cost` | a set of an `IN` list or `OR` rebuilt by each count of a GROUP BY |
 | `recheck_tid_cost` | 1.5 | `cpu_tuple_cost` | a candidate row of a count's heap recheck |
 | `recheck_group_tid_cost` | 6.0 | `cpu_tuple_cost` | the same in a grouped count |
 | `entry_count_cost` | 50 | `cpu_tuple_cost` | a count of a GROUP BY: an entry, or a pair of two |
@@ -521,15 +521,18 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `range_union_entry_cost` | 12 | `cpu_tuple_cost` | a small entry of a summed range, counted with its leaf |
 | `probe_step_cost` | 2.0 | `cpu_operator_cost` | a container of a set a summed range probes |
 | `range_fold_cost` | 420 | `cpu_operator_cost` | a fold into a container of a range's union, collected as a source, that is not a bitset |
-| `fkjoin_count_cost` | 25 | `cpu_tuple_cost` | an FK-side join's count, a dimension row |
-| `fkjoin_row_cost` | 10 | `cpu_tuple_cost` | a row the FK-side join hands up |
-| `fkjoin_probe_cost` | 80 | `cpu_operator_cost` | a probe of such a count into a fact filter |
+| `fkjoin_count_cost` | 14 | `cpu_tuple_cost` | an FK-side join's count that probes the fact filters, a dimension row |
+| `fkjoin_row_cost` | 20 | `cpu_tuple_cost` | a row the FK-side join hands up |
+| `fkjoin_probe_cost` | 10 | `cpu_operator_cost` | a probe of such a count into a fact filter |
+| `fkjoin_probe_page_cost` | 54 | `cpu_operator_cost` | a posting page such a probe reads |
+| `fkjoin_set_cost` | 11 | `cpu_tuple_cost` | a set of a fact filter that is a union (an `IN` list, an `OR`), a count that probes it |
+| `fkjoin_lookup_cost` | 75 | `cpu_operator_cost` | a key looked up on the directory leaf a lookup in key order stands on |
 | `fkjoin_collect_container_cost` | 2.0 | `cpu_operator_cost` | a container of the driving filter, read to collect the fact filters |
-| `fkjoin_copy_count_cost` | 25 | `cpu_tuple_cost` | a count against the collected copy |
-| `fkjoin_copy_probe_cost` | 5 | `cpu_operator_cost` | a lookup of the copy and its AND, an fk container |
+| `fkjoin_copy_count_cost` | 33 | `cpu_tuple_cost` | a count against the collected copy |
+| `fkjoin_copy_probe_cost` | 2.0 | `cpu_operator_cost` | a lookup of the copy and its AND, an fk container |
 | `fkjoin_copy_member_cost` | 3.0 | `cpu_operator_cost` | a member of that container |
 | `fkjoin_copy_container_cost` | 20 | `cpu_operator_cost` | a container of the copy made |
-| `fkjoin_batch_row_cost` | 120 | `cpu_operator_cost` | a dimension row's place in a batch looked up in key order |
+| `fkjoin_batch_row_cost` | 75 | `cpu_operator_cost` | a dimension row's place in a batch looked up in key order |
 | `fkjoin_sort_compare_cost` | 0.25 | `cpu_operator_cost` | a comparison in the sort that makes the dimension's keys distinct |
 | `fkjoin_sort_key_cost` | 6.0 | `cpu_operator_cost` | a key into and out of that sort |
 | `fkjoin_sort_seq_page_cost` | 0.75 | `seq_page_cost` | a page that sort writes or reads past `work_mem`, the sequential share |

@@ -230,9 +230,8 @@ SELECT * FROM lion_xj_explain('SELECT count(*) FROM lion_xd d WHERE d.region = '
                Implied by Partition Bounds: (kind = 'a'::text)
                Join Type: Semi
                Join Key Lookups: in index order
-               Fact Filters: collected once
                ->  (the dimension's plan)
-(11 rows)
+(10 rows)
 
 -- an inner join grouped by a dimension column, over partitions one of which
 -- answers the list from its own index on kind
@@ -266,9 +265,8 @@ SELECT * FROM lion_xj_explain('SELECT count(*) FROM lion_xd d WHERE d.grp = ''g1
                Implied by Partition Bounds: (kind = ANY ('{a,b}'::text[])), (ts >= 'Thu Jan 01 00:00:00 2026 PST'::timestamp with time zone) in 1 of 2 partitions
                Join Type: Anti
                Join Key Lookups: in index order
-               Fact Filters: collected once
                ->  (the dimension's plan)
-(11 rows)
+(10 rows)
 
 -- the rows of a count(DISTINCT) and the counted rows of the mixed aggregates
 SELECT * FROM lion_xj_explain('SELECT count(DISTINCT d.attr) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''b'' AND f.x = 3)');
@@ -286,9 +284,8 @@ SELECT * FROM lion_xj_explain('SELECT count(DISTINCT d.attr) FROM lion_xd d WHER
                      Join Type: Semi
                      Join Key Lookups: in index order
                      Join Rows: the dimension rows with a match
-                     Fact Filters: collected once
                      ->  (the dimension's plan)
-(14 rows)
+(13 rows)
 
 SELECT * FROM lion_xj_explain('SELECT count(DISTINCT d.pk), count(*) FROM lion_xf f JOIN lion_xd d ON d.pk = f.fk WHERE d.region = ''us'' AND f.kind = ''a'' AND f.tags && ''{u2}''');
                                       lion_xj_explain                                      
@@ -305,9 +302,8 @@ SELECT * FROM lion_xj_explain('SELECT count(DISTINCT d.pk), count(*) FROM lion_x
                            Implied by Partition Bounds: (kind = 'a'::text)
                            Join Key Lookups: in index order
                            Join Rows: the dimension rows with a match, each with its count
-                           Fact Filters: collected once
                            ->  (the dimension's plan)
-(14 rows)
+(13 rows)
 
 -- the forward semi join over a non-unique key, counted over its distinct keys
 SELECT * FROM lion_xj_explain('SELECT count(*) FROM lion_xf f WHERE f.kind = ''b'' AND f.x IN (1, 2) AND f.fk IN (SELECT n.k FROM lion_xdn n WHERE n.region = ''eu'')');
@@ -322,9 +318,8 @@ SELECT * FROM lion_xj_explain('SELECT count(*) FROM lion_xf f WHERE f.kind = ''b
                Implied by Partition Bounds: (kind = 'b'::text)
                Join Type: Semi
                Join Keys: distinct, sorted
-               Fact Filters: collected once
                ->  (the dimension's plan)
-(11 rows)
+(10 rows)
 
 -- a filter per kind, ORed: each partition leaves out the arms its bounds
 -- refute and, in the arm it keeps, the kind its bounds imply; lion_xf_cd's
@@ -553,9 +548,8 @@ SELECT * FROM lion_xj_explain('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELE
                Implied by Partition Bounds: (kind = 'a'::text)
                Join Type: Semi
                Join Key Lookups: in index order
-               Fact Filters: collected once
                ->  (the dimension's plan)
-(11 rows)
+(10 rows)
 
 SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND f.kind = ''a'' AND f.ts >= current_setting(''lion.cut'')::timestamptz)');
      lion_xj      
@@ -678,9 +672,8 @@ SELECT * FROM lion_xj_explain('EXECUTE lion_xj_q(3, ''eu'')');
          Lion Indexes: (fk = d.pk), (x = $1)
          Implied by Partition Bounds: (kind = ANY ('{a,b}'::text[]))
          Join Key Lookups: in index order
-         Fact Filters: collected once
          ->  (the dimension's plan)
-(9 rows)
+(8 rows)
 
 CREATE TEMP TABLE lion_xj_g1 AS EXECUTE lion_xj_q(3, 'eu');
 CREATE TEMP TABLE lion_xj_g2 AS EXECUTE lion_xj_q(NULL, 'eu');
