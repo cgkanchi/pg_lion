@@ -705,7 +705,11 @@ SET work_mem = '64kB';
 SELECT lion_sp_start('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x = 3)',
 	lion_sp_counter('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x = 3)', 'Join Key Batches'));
 RESET work_mem;
+-- (a walk in key order priced out, so that the keys are looked up a row at a
+-- time: over an fk index this small the model walks it)
+SET pg_lion.fkjoin_batch_row_cost = 1e6;
 SELECT lion_sp_start('SELECT d.pk FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.y = 2)');
+RESET pg_lion.fkjoin_batch_row_cost;
 -- ... so a LIMIT prices the wait: over one batch the path's rows come no
 -- sooner in the outer side's order than through a Sort of them, which is
 -- cheaper; over several, the first batch's rows come first, with no Sort
