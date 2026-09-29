@@ -97,7 +97,15 @@ SELECT k, count(*) FROM hk_p WHERE k IN (0, 7, 19) GROUP BY k ORDER BY k;
 
 RESET pg_lion.enable_count_pushdown;
 -- the LionOrdered scan (DESIGN.md §30), which set_rel_pathlist_hook adds,
--- chained the same way: the lion filter k = 3 over a walk of the btree on v
+-- chained the same way: the lion filter k = 3 over a walk of the btree on v.
+-- The rel hook's counters start here: pg_lion offers ordered paths for the
+-- queries above too (an ORDER BY of a lion column walks that column).
+SELECT lion_hooktest_reset();
+ lion_hooktest_reset 
+---------------------
+ 
+(1 row)
+
 SET enable_seqscan = off; SET enable_bitmapscan = off;
 SET enable_indexscan = off; SET enable_indexonlyscan = off;
 EXPLAIN (COSTS OFF) SELECT v FROM hk WHERE k = 3 ORDER BY v LIMIT 5;
