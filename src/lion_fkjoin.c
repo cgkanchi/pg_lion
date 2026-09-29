@@ -637,3 +637,147 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 	*out = fj;
 	return n;
 }
+
+/*
+ * The FK-side semi or anti join as a JOIN path (DESIGN.md §27, "The semi and
+ * anti join as a join path"): the rows of `outer ⋉ fact` or `outer ▷ fact`
+ * themselves, for whatever needs them above - another join, a sort, an
+ * aggregate, the node itself as its joined dimension - where the upper node
+ * answers only an aggregate over the whole query's join.
+ *
+ * set_join_pathlist_hook is called once for each way core takes joinrel
+ * apart into two rels it may join, and for each kind of join it tries for
+ * them.  For a semi join (EXISTS, IN) that is JOIN_SEMI with the special
+ * join's left side outer; JOIN_RIGHT_SEMI the other way round (PostgreSQL 18
+ * and later); and the right side made unique and inner-joined, which up to 18
+ * is JOIN_UNIQUE_INNER and JOIN_UNIQUE_OUTER and from 19 a JOIN_INNER with a
+ * rel of unique-ified paths.  For an anti join (NOT EXISTS) it is JOIN_ANTI,
+ * and JOIN_RIGHT_ANTI the other way round (16 and later).  Only the plain
+ * JOIN_SEMI and JOIN_ANTI are taken, with the fact as innerrel: their rows are
+ * the outer side's, each at most once, which is what the node emits - each
+ * outer row whose key the fact's posting sets say has a match, or has none.
+ * So nothing is asked of the key's uniqueness: two outer rows with one key are
+ * two rows, each tested and each emitted once.  The other forms have the fact
+ * outer (whose rows the node never emits) or a unique-ified side (which only
+ * repeats what JOIN_SEMI answers).
+ *
+ * What the special join and the join rel must be:
+ *
+ *	- the special join is this call's own (extra->sjinfo), a semi or anti join
+ *	  with no range table entry of its own: an anti join made from `LEFT JOIN
+ *	  ... WHERE f.fk IS NULL` has one (ojrelid), and is left alone as the
+ *	  upper node leaves it;
+ *	- its minimal and syntactic inner sides are the fact alone, and innerrel is
+ *	  the fact: a plain or partitioned table the node may count
+ *	  (lion_fkjoin_rel_ok()), with no LATERAL reference and no TABLESAMPLE;
+ *	- the join's clauses (extra->restrictlist, everything the join has to
+ *	  evaluate) are exactly ONE, a strict operator between a plain column of
+ *	  the fact and a plain column of a table of the outer side - a second
+ *	  correlation, an outer-side qual left inside a NOT EXISTS, a
+ *	  pseudoconstant qual anywhere in the query all decline;
+ *	- the outer side needs nothing from outside it (no LATERAL reference left
+ *	  unsatisfied) and its rows carry the key: the node reads it from them.
+ *
+ * The outer side may be any rel: a base relation of any kind, or a join rel
+ * of any shape, since only core plans and runs it.  What the join rel's
+ * target may name, and the fact side's indexes, are the caller's to check.
+ */
+bool
+lion_fkjoin_recognize_join(PlannerInfo *root, RelOptInfo *joinrel,
+						   RelOptInfo *outerrel, RelOptInfo *innerrel,
+						   JoinType jointype, JoinPathExtraData *extra,
+						   LionFkJoin *fj)
+{
+	SpecialJoinInfo *sjinfo = extra->sjinfo;
+	RestrictInfo *rinfo;
+	OpExpr	   *op;
+	Node	   *argexpr[2];
+	Var		   *argvar[2];
+	RelOptInfo *dim;
+	int			fi;
+	int			di;
+	int			i;
+
+	if (jointype != JOIN_SEMI && jointype != JOIN_ANTI)
+		return false;
+	if (sjinfo == NULL || sjinfo->jointype != jointype || sjinfo->ojrelid != 0)
+		return false;
+	if (joinrel->reloptkind != RELOPT_JOINREL || IS_DUMMY_REL(joinrel) ||
+		IS_DUMMY_REL(outerrel))
+		return false;
+
+	/* ---- the fact alone on the inner side ---- */
+	if (!bms_equal(sjinfo->min_righthand, innerrel->relids) ||
+		!bms_equal(sjinfo->syn_righthand, innerrel->relids))
+		return false;
+	if (!lion_fkjoin_rel_ok(root, innerrel))
+		return false;
+
+	/*
+	 * A pseudoconstant qual is gated where core puts it, which may be this
+	 * join (PostgreSQL 16 does not even call the hook then); a LATERAL
+	 * reference out of the outer side would make its paths depend on rows the
+	 * node never gives them.
+	 */
+	if (root->hasPseudoConstantQuals)
+		return false;
+	if (!bms_is_empty(outerrel->lateral_relids) ||
+		!bms_is_empty(joinrel->lateral_relids))
+		return false;
+
+	/* ---- exactly one join clause: the key ---- */
+	if (list_length(extra->restrictlist) != 1)
+		return false;
+	rinfo = (RestrictInfo *) linitial(extra->restrictlist);
+	if (!IsA(rinfo, RestrictInfo) || rinfo->pseudoconstant)
+		return false;
+	if (!IsA(rinfo->clause, OpExpr))
+		return false;
+	op = (OpExpr *) rinfo->clause;
+	if (list_length(op->args) != 2 || !op_strict(op->opno))
+		return false;
+	for (i = 0; i < 2; i++)
+	{
+		Node	   *arg = (Node *) list_nth(op->args, i);
+		Node	   *stripped = lion_fkjoin_strip(arg);
+
+		if (stripped == NULL || !IsA(stripped, Var))
+			return false;
+		argexpr[i] = arg;
+		argvar[i] = (Var *) stripped;
+		if (argvar[i]->varattno <= 0 || argvar[i]->varlevelsup != 0)
+			return false;
+	}
+	fi = (argvar[0]->varno == (int) innerrel->relid) ? 0 : 1;
+	di = 1 - fi;
+	if (argvar[fi]->varno != (int) innerrel->relid ||
+		!bms_is_member(argvar[di]->varno, outerrel->relids))
+		return false;
+	dim = root->simple_rel_array[argvar[di]->varno];
+	if (dim == NULL || dim->reloptkind != RELOPT_BASEREL)
+		return false;
+
+	/* ---- the outer side's rows carry the key ---- */
+	if (!lion_fkjoin_target_has(outerrel->reltarget, argvar[di]))
+		return false;
+	if (outerrel->cheapest_total_path == NULL ||
+		outerrel->cheapest_total_path->param_info != NULL)
+		return false;
+
+	memset(fj, 0, sizeof(LionFkJoin));
+	fj->factrel = innerrel;
+	fj->dimrel = dim;
+	fj->dimchild = outerrel;
+	fj->fkvar = argvar[fi];
+	fj->pkvar = argvar[di];
+	fj->pkexpr = argexpr[di];
+	fj->opno = op->opno;
+	fj->collation = op->inputcollid;
+	fj->clause = (Node *) op;
+	fj->dimpath = outerrel->cheapest_total_path;
+	fj->jointype = jointype;
+	fj->joinrel = joinrel;
+	fj->uniqsortop = InvalidOid;
+	fj->joinpath = true;
+	return true;
+}
