@@ -495,6 +495,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `range_entry_cost` | 40 | `cpu_tuple_cost` | an entry of a range walk counted on its own |
 | `range_union_entry_cost` | 12 | `cpu_tuple_cost` | a small entry of a summed range, counted with its leaf |
 | `probe_step_cost` | 2.0 | `cpu_operator_cost` | a container of a set a summed range probes |
+| `range_fold_cost` | 420 | `cpu_operator_cost` | a fold into a container of a range's union, collected as a source, that is not a bitset |
 | `fkjoin_count_cost` | 25 | `cpu_tuple_cost` | an FK-side join's count, a dimension row |
 | `fkjoin_row_cost` | 10 | `cpu_tuple_cost` | a row the FK-side join hands up |
 | `fkjoin_probe_cost` | 80 | `cpu_operator_cost` | a probe of such a count into a fact filter |

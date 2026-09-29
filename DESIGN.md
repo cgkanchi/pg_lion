@@ -9493,7 +9493,12 @@ sections above ask of the fact side.
   choices, walk or descend and collect or probe, are made once over the sums: a batch's place is
   charged once a row, not once a leaf; collecting needs every leaf's copy to fit in one hash
   table's memory per participant together; and a probing plan's locating of the filters is
-  charged once a batch per leaf. Row estimates are the planner's, as for a count (§16).
+  charged once a batch per leaf. Row estimates are the planner's, as for a count (§16). Since
+  2026-09-29 each leaf is priced for the keys it looks up rather than for all of them: none in a
+  leaf whose bound refutes its fact filters at their plan-time values, or whose filters are expected
+  to select less than a row, and for an existence test only the share no earlier leaf has matched
+  (§32, "What collecting a range costs"); and a range among the filters is estimated over the
+  leaf's own columns.
 - **EXPLAIN** has the `Partitions` line, `Lion Indexes` without index names and `Implied by
   Partition Bounds`, as a count's (§16). The counters are summed over the leaves (and the
   participants): `Join Keys Looked Up` counts a lookup per leaf that had a turn - an inner join's
@@ -9529,11 +9534,14 @@ is `now()` less an interval, over a few hundred dimension rows, where a nested l
 few thousand heap rows from a warm cache. The node then collects the range in each leaf it keeps
 (§32's "range as a source"), some two million `ts` entries from their summaries - 49 of the 54 ms
 of the 420-row semi join, none of it in the node's timers, since it happens while the filters are
-located - and `lion_cost_range_source()` prices that as the walk of a summed range, a fraction of
-it. That is a plain table's cost too (the same query on the one leaf: 26 ms against 5), and it is
-left for a costing change of its own; so is the nested loop's warm cache, which its cost does not
-assume. With two workers the same holds of the 5,000-row joins with the range: the node, chosen
-at 60 to 70 ms, against a parallel nested loop's 36 (semi) and 41 (grouped).
+located - and `lion_cost_range_source()` priced that as the walk of a summed range, a fraction of
+it. That is a plain table's cost too (the same query on the one leaf: 26 ms against 5). With two
+workers the same holds of the 5,000-row joins with the range: the node, chosen at 60 to 70 ms,
+against a parallel nested loop's 36 (semi) and 41 (grouped). *(2026-09-29: the collection is
+priced now, at what its union does, and timed, in `Fact Filter Locate Time`; each leaf is priced for
+the keys it looks up. On a reproduction of this star the 420-row semi join is priced at 49,968
+where it was 9,403 and goes to the nested loop, 2.4 ms against the node's 97 - §32, "What collecting
+a range costs". The nested loop's warm cache, which its cost does not assume, is core's.)*
 
 ### Declined in v1, and why
 
@@ -12729,7 +12737,7 @@ was always written in: `cpu_operator_cost` or `cpu_tuple_cost`, and for the FK-s
 calibration made at one `cpu_operator_cost` holds at another. Each defaults to the value it was
 fitted or derived at - this section's tables and the comment above each macro are why - so a server
 that sets none plans exactly as it did; the regression suite runs at the defaults, and
-`costgucs.sql` checks that each setting is there and that three of them move the plans they price.
+`costgucs.sql` checks that each setting is there and that four of them move the plans they price.
 `lion_costs.c` holds the table of them and registers them from `_PG_init`, user settings from 0 up
 as core's cost settings are, and shown by `EXPLAIN (SETTINGS)` when changed; `pg_settings` lists
 them among the customized options, as it does any extension's, since no API puts a custom setting in
@@ -13147,7 +13155,8 @@ let the planner take one it expects to be large.
 
 EXPLAIN names each range with all of its bounds (`lion_src_ur.u (u > 100 AND u <= 900)`), and
 EXPLAIN ANALYZE counts `Range Sources Collected` and `Range Sources Walked` when there are any, and
-of the collected, `Range Sources Spilled`.
+of the collected, `Range Sources Spilled`. An FK-side join's collection is timed, with TIMING, in
+`Fact Filter Locate Time` (since 2026-09-29, "What collecting a range costs").
 
 ### Summed ranges: dense and probed (2026-09-28)
 
@@ -13312,13 +13321,214 @@ container keys, was about 400 units a summary (4096 probes into F at `LION_MEMOR
 is now about 30.
 
 A range taken as a source costs its collection once per relation - the same walk, with nothing to
-AND and nothing to recheck, plus a step per container of the union - and is then a source read from
+AND and nothing to recheck, and the union it builds of what the walk hands out
+(`lion_cost_range_union()`, "What collecting a range costs" below) - and is then a source read from
 memory: no page reads for the probes, its rows `tuples x selectivity of its bounds`. One whose
 estimated union exceeds a hash table's memory is priced as walked by every count (the walk times
-the counts), and one in an OR is priced out.
+the counts), and one in an OR is priced out. The union's size is a container per container key its
+rows lie in, about two bytes a row up to a bitset each when they lie all over the heap and a run
+per heap block when they lie in its order, the correlation interpolating, and its hash entries.
+(Before 2026-09-29 it was the scattered size whatever the order: all of a timestamp stored in the
+order of twenty million rows was sized at 9.4 MB, past the 8 MB hash table of a default `work_mem`,
+and priced as walked at every count, where it is collected in 1.3 MB.)
 
-The range's selectivity is the planner's (`clauselist_selectivity()` of its bounds), which the
-plan-time endpoint probe of another change may sharpen; nothing here depends on how it is obtained.
+The range's selectivity is the planner's (`clauselist_selectivity()` of its bounds) over the
+relation it is collected in: over a leaf partition, the bounds are mapped onto the leaf's columns
+and estimated with its own statistics, and with the ends of the column read from its lion index
+(§28, "The endpoint probe"); and a leaf whose bound refutes them at their values when the plan is
+made - `ts >= now() - interval '400 days'` beside a leaf of three years ago - selects none of its
+rows (`lion_rel_clauses_selectivity()`). Before 2026-09-29 it was the partitioned table's share of
+every leaf.
+
+### What collecting a range costs (2026-09-29)
+
+Two measurements on synthetic data found a range taken as a source priced wrong in both directions
+(§27, "A partitioned fact table", and a dimension semi-joined to a partitioned fact). Reproduced
+here on a fact of 10,000,000 rows LIST-partitioned by kind into five leaves, one kind
+sub-partitioned by year on `ts` into four, `ts` over four years at random within each leaf, fk
+skewed (80% of the rows on 75,000 of 500,000 dimension keys), with a partitioned lion index over the
+filter columns and fk (`summaries = auto`) and a btree on fk - PostgreSQL 18, packaged build, warm
+cache, `work_mem` 64 MB, four cores shared with other work, medians of three runs after one:
+
+- a semi join of 420 dimension rows to one kind under `ts >= now() - interval '730 days'`: the node,
+  priced at 9,403, was chosen and ran in 90 ms, 87 of them collecting the range in the four leaves
+  of that kind (two million rows, 487 summaries) - in none of the node's timers. A nested loop,
+  priced at 25,734, runs in 2.2 ms;
+- a semi join of 75,000 dimension rows under a range of 400 days beside an OR with an arm per kind:
+  the node, priced at 512,027, ran in 415 ms, and the hash join chosen at 276,223 in 660 to 700.
+
+**What was wrong.**
+
+1. *The union was not priced.* `lion_cost_range_source()` charged the walk of a summed range - its
+   entries, summaries and pages, with nothing to AND - and a `cpu_operator_cost` a container of the
+   union. The walk is the cheap part: the sum over 400 days of a million scattered rows takes
+   2.3 ms, and collecting the same range 36; stored in order, 0.8 and 5. A collection's time is its
+   union (`lion_range_union_cb()`), and counting what the union does shows how: each container of
+   each set the walk hands out is looked up by key and ORed in, or set aside to wait, and a
+   container of the union that is not a bitset yet FOLDS in what came for it - the members set
+   aside, through a bitset image, or a larger container merged in - and is put back at its new size,
+   optimized: some 2 us a fold, where a container ORed in place is a few tens of nanoseconds. A
+   range over 400 days of 20M scattered rows ORed 2,554,479 containers and folded 25,278 times, 11
+   at each of the heap's 2,298 container keys; all of 20M rows stored in order ORed 11,043 and
+   folded 8,713 - every one after a key's first into the RUN that key's union is, which is no
+   bitset; 400 days of a million scattered rows, whose summaries have 36 members at each of 115
+   keys, ORed 10,787 and folded or merged 6,077, each merge moving the union's members too. Over 30
+   collections - 3 to 1,500 days of a four-year timestamp, in heap order and at random, over 1M, 5M
+   and 20M rows, 0.9 ms to 1.1 s of collecting - the old price came to 28 to 355 units a
+   millisecond, median 184, where the model runs at 500 (§31): up to eighteen times too cheap, the
+   more so the more scattered the column and the smaller its heap.
+2. *Every leaf was priced for every key.* A partitioned fact's leaves were each priced for all the
+   dimension rows (`lion_cost_fkjoin_path()`), but the node looks a key up only in the leaves before
+   the first whose rows match it when the test is an existence test, and a leaf whose fact filters
+   select nothing has no turn at all (`lion_join_count_parts()`). The second semi join above was
+   priced for 605,200 lookups and counts, eight leaves of 75,650 keys, and made 187,780: two of its
+   eight leaves are years the range does not reach, and a key that matches in one leaf is looked up
+   in no later one.
+3. *The partitioned table's selectivity in every leaf.* The range's selectivity was estimated over
+   the query's relation, the same share of every leaf: 27% of each yearly leaf, where it is none of
+   the two oldest, a tenth of the third and all of the last.
+4. *A partial bucket at each end of a one-sided range.* `ts >= X` has one partial bucket, whose keys
+   the walk reads one by one; its summaries run to the column's end. Each of those keys is a fold
+   into a column in heap order.
+5. *The union's size* was the scattered one whatever the order (the paragraph above on sizes).
+
+The two cases err in opposite directions because the collection is nearly all of the first - 87
+of 90 ms, priced at a tenth of that - and a quarter of the second, 110 of 415 ms, where the lookups
+and counts of eight leaves priced for 605,200 keys (418,000 units, 836 ms at the model's rate)
+more than make up for it.
+
+**The model** (`lion_cost_range_union()`, on top of the walk). Each container the walk hands out is
+ORed in at `LION_CONTAINER_COST`, and the folds are counted as the union makes them, between two
+shapes the column's correlation squared interpolates, as `cost_index()` does:
+
+- rows in the heap's order: every container after a key's first is folded into its RUN - the
+  sets' containers, a set's rows spanning one container key more than they fill, less the union's
+  containers;
+- rows scattered: each set has a container at nearly every container key (`lion_containers_for()`),
+  and a key's union ends up with its share of the range's rows. Containers of at most
+  `LION_RANGE_UNION_PEND_MIN` (32) members wait and are folded in once the waiting members come to
+  half the union's, so the union grows by half at least between two folds: 1 + log1.5(members /
+  32) folds a key until it is a bitset, past 2,048 members, and takes the rest in place - 11.3,
+  against the 11 measured above. Larger containers are merged in one at a time until then, a fold
+  each, and each moves the union's members too, half a bitset's worth on average, at
+  `LION_AND_MEMBER_COST` a member. Which are larger is a Poisson count's tail
+  (`lion_poisson_above()`): a set's rows fall at a key at random, and of a summary of 16,384 rows
+  over 575 container keys, 28.5 a key on average, a fifth of the containers hold more than 32.
+
+A fold is `LION_RANGE_FOLD_COST`, the new setting `pg_lion.range_fold_cost`: 420
+`cpu_operator_cost`, 2.1 us at 500 units a millisecond, fitted to what the walk's price leaves of
+the time of 62 collections, their folds counted - the 30 above, six more over 20M rows in heap
+order, and 26 over 5M rows with buckets of 1,024 and 16,384 rows and with none, 0.9 ms to 4.1 s.
+57 of the 62 are within a factor of 1.5 of it; the five others are columns in heap order folded
+key by key into a RUN of up to a run a heap block, up to 7 us a fold. With the folds as the model
+counts them, its price of the 56 still measured is 112 to 1,830 units a millisecond, median 493,
+48 of them within a factor of two of 500 and 53 within three (the old price of the 30 with the
+default buckets: 28 to 355, median 184). All eight outside a factor of two are columns in heap
+order, whose partial bucket the walk reads and folds key by key: the model takes half a bucket, or
+every key of a range inside one, and the walk reads anywhere from none of it to all - all of it
+when the range's bound lies below the column's first key, since the walk cannot tell that the first
+bucket is whole (below) - and a bucket of 16,384 keys, or a column without summaries, folds them
+into the costlier RUNs. Scattered columns are priced within a factor of 1.6 at every bucket size,
+and without summaries.
+
+Each leaf of a partitioned fact is priced for the keys it looks up: the dimension rows times the
+chance that it has a turn - none when its bound refutes the fact filters at their plan-time values
+(`lion_leaf_refuted_now()`), and otherwise the rows they are expected to select there, taken as
+that chance while they are less than one (`lion_leaf_turn_share()`) - and, for an existence test,
+times the share of the keys no earlier leaf has matched: a key found in a leaf matches there unless
+none of its rows passes the leaf's filters, exp(-rows) for its rows there spread as the leaf's
+estimate says. A batch's place is still a row's once however many leaves look the row up. The
+range's bounds are estimated over each leaf's own columns and statistics
+(`lion_rel_clauses_selectivity()`, the paragraph above), a one-sided range has its partial bucket at
+one end (`lion_range_sides()`), and the union's size follows the column's order.
+
+**Where it is collected, and how often.** The same function collects a range in every context
+(`lion_locate_range()`, `lion_range_collect()`), and what differs is how many times:
+
+- a count's source, grouped or not: once a run in each relation - each leaf of a partitioned table -
+  before its first count, and read from memory by every group, pair or test after it; the model
+  charges it once a relation (`lion_cost_count_rel()`);
+- the FK-side join's fact filter: once a run over a plain table, when the filters are located, and
+  then read by every count, or by the collection of the copy of the filters (§27, "The fact
+  filters, collected once"), which reads it as any other set; over a partitioned fact once a leaf,
+  at the leaf's first turn where the plan collects the copy, and at every turn - every batch of keys
+  - where it probes, which the model charges once a batch;
+- in a parallel plan, once in EVERY participant: the filters are each participant's own, and only
+  their copy is shared (§27, "One copy per query"). The parallel semi join below spent 190 ms of
+  `Fact Filter Locate Time` over three participants on a range the serial plan collects in 50. The
+  model charges each participant the whole of it, as it charges each the locating of the filters.
+
+**EXPLAIN.** The locating of the FK-side join's fact filters is a phase of its own, `Fact Filter
+Locate Time` (`LION_JT_LOCATE`, `lion_join_locate_where()`), printed with TIMING beside `Join Child
+Time`, `Join Lookup Time`, `Join Count Time` and `Fact Filter Collect Time` and, as they are, summed
+over the participants of a parallel plan and the leaves of a partitioned fact. It was in no phase:
+of the first semi join above, 87 of the node's 90 ms were in no timer.
+
+**Measured before and after** - the library before this change with the timer alone, and this one;
+the same data, the same session settings, nothing disabled for "chosen". The partitioned star is
+the one above; `r5m` and `o5m` are 5,000,000 rows of `(fk, kind, g, x, ts)`, fk uniform over the
+500,000 keys of the dimension, `ts` over four years at random (`r`) or in heap order (`o`), with a
+lion index on `(fk, kind, g, x)`, one on `ts` with summaries, and btrees on fk and on `ts`; the
+fact filter is `ts >= now() - interval '400 days'` (27% of the rows) beside `kind = 1` for the inner
+joins; the dimension rows are the first of a random order. Times in ms, the node's median over the
+two libraries' runs (its plan is the same); a node chosen before and after is marked once:
+
+| query | chosen before, after | node cost before, after | node ms | core's alternatives: cost, ms |
+|---|---|---|---|---|
+| partitioned semi, 420 dimension rows | node 90, nested loop 2.4 | 9,403, 49,968 | 97 | nested loop 25,734, 2.5; hash join 72,241, 1,097 |
+| partitioned semi, 75,000 | hash join 662, 660 | 512,027, 316,865 | 441 | nested loop 337,378, 938; hash join 276,208, 667 |
+| r5m semi, 100 | nested loop 1.4, 0.9 | 7,100, 17,506 | 53 | nested loop 2,423, 1.0 |
+| r5m semi, 1,000 | node | 9,294, 19,699 | 55 | nested loop 21,580, 11 |
+| r5m semi, 10,000 | node | 28,777, 39,171 | 84 | nested loop 96,829, 78 |
+| r5m semi, 100,000 | hash join 1,080, 1,116 | 124,062, 134,360 | 263 | hash join 106,327, 1,116 to 1,293 |
+| r5m inner, grouped, 100 | nested loop 3.4, 3.5 | 7,457, 17,861 | 59 | nested loop 5,437, 3.8 |
+| r5m inner, grouped, 1,000 | node | 9,946, 20,350 | 60 | nested loop 49,254, 20 |
+| r5m inner, grouped, 10,000 | node | 32,492, 42,897 | 97 | hash join 172,762, 475 |
+| r5m inner, grouped, 100,000 | node | 155,908, 166,313 | 326 | hash join 926,759, 536 |
+| o5m semi, 1,000 | node | 3,690, 5,956 | 11 | nested loop 21,284, 14 |
+| o5m semi, 100,000 | hash join 705, 854 | 118,505, 120,346 | 201 | hash join 70,051, 787 to 854 |
+| r5m inner, grouped, 100,000, two workers | node | 87,933, 98,337 | 222 | hash join 421,483, 338 |
+| r5m semi, 10,000, two workers | node | 21,223, 31,624 | 96 | nested loop 60,741, 54 |
+| r5m `g, count(*)`, 30 days | node | 15,710, 18,926 | 29 | bitmap heap scan 41,064, 187 |
+| r5m `g, count(*)`, 400 days | node | 10,191, 20,597 | 67 | bitmap heap scan 93,093, 568 |
+| o5m `g, count(*)`, 30 days | node | 2,023, 4,030 | 12 | index scan 3,993, 26 |
+| o5m `g, count(*)`, 400 days | node | 2,144, 4,442 | 17 | index scan 56,849, 383 |
+| r5m `count(DISTINCT g)`, 400 days | node | 6,869, 17,275 | 47 | bitmap heap scan 232,347, 654 |
+| r5m `count(*)`, 400 days and `fk < 50000` | bitmap heap scan 227, 270 | 59,922, 74,697 | 155 | bitmap heap scan 53,097, 270 to 335 |
+| 20M rows at random, `g, count(*)`, 30 days | node | 19,542, 36,576 | 124 | bitmap heap scan 164,053, 588 |
+
+The node's price per millisecond of its time was 97 to 1,162 units (median 220) - 97 for the
+first semi join, 1,162 for the second - and is 267 to 719 (median 442). The low end is the grouped
+counts, whose counts of each group against the range's bitsets take about twice what §10 prices
+them at (below), and the joins over a hundred to a thousand keys, whose collection took 48 to 61 ms
+in these runs, on a machine other work loaded, against 33 in the calibration runs. One plan
+changes: the first semi join's, from the node at 90 ms to the nested loop at 2.4. The mispicks left
+are core's own prices of its plans against a warm cache (§27, §31): the nested loop of the
+1,000-row semi join is priced at 21,580 and runs in 11 ms, 1,900 units a millisecond, above the
+node's 19,699 for 55; the hash joins chosen over 100,000 keys run at 80 to 95 units a millisecond,
+and the bitmap heap scan of the two ranges at 160 to 200. The node over the partitioned star's
+75,000 rows is still priced at 720 units a millisecond - its lookups at two to three times the 75
+to 101 ms they took (§27's `LION_FKJOIN_BATCH_ROW_COST` is high on purpose) - and loses to a hash
+join core prices at 400 to 420.
+
+`test/sql/rangesource.sql` §9 pins both ends on 200,000 rows whose summaries of 1,024 scattered
+rows have 60 members at each of 17 container keys: ten dimension rows and a range over nearly all
+of them go to core's plan (the node was chosen before, and ran three times slower than the nested
+loop), a hundred and a range over a tenth to the node; and the timer's presence with TIMING and its
+absence without. `costgucs.sql` shows the new setting moving a price; `fkjoin_partition.sql`'s
+forward semi join over a leaf whose filter selects none of its rows now descends for each key
+rather than walking the fk index: no key is looked up there, and the model no longer prices a walk
+of them.
+
+**Found and not done.** The executor's union takes six to fifteen times the sum over the same
+range, and three things would make it cheaper, each a change of the executor's own: folding a
+container of more than 32 members through the same waiting buffer rather than merging it at once;
+letting a RUN union take the members of a column in heap order through that buffer too, where each
+one now goes through an image; and taking the first bucket of a range whose lower bound is below the
+column's first key as whole, where its 4,096 keys are walked one by one - a range over all of a leaf
+reads them. The counts of a GROUP BY against a collected range's bitsets take about twice those
+against an equality's set of as many rows, priced the same (§10's counts). And the node's lookups
+over a partitioned fact, as above.
 
 ### Verification (lion_funcs.c)
 
@@ -13410,7 +13620,10 @@ leave out.
   count(DISTINCT), another range, an equality on its own column, in OR arms, among an FK-side join's
   fact filters, on a partitioned table; collected and - at work_mem's floor, over 200,000 rows -
   walked, inside and as its complement, and in existence tests; generic plans with Param bounds, a
-  NULL one, and multi-key Params beside it; a dirty heap and VACUUM.
+  NULL one, and multi-key Params beside it; a dirty heap and VACUUM. Since 2026-09-29 (§9) the
+  planner's choice at both ends of a collected range's price - core's plan over ten dimension rows
+  and a range over nearly every row, the node over a hundred and a range over a tenth - and `Fact
+  Filter Locate Time` with TIMING and not without.
 - `test/sql/summary_append.sql` (2026-09-28): the directory order of "The open bucket and the
   directory order" - rows appended one statement at a time over several leaves with
   `summary_tids = 16`, verify and range counts at and around bucket bounds against a sequential

@@ -51,6 +51,7 @@ double		lion_distinct_test_cost;
 double		lion_range_entry_cost;
 double		lion_range_union_entry_cost;
 double		lion_probe_step_cost;
+double		lion_range_fold_cost;
 double		lion_fkjoin_count_cost;
 double		lion_fkjoin_row_cost;
 double		lion_fkjoin_probe_cost;
@@ -129,6 +130,8 @@ static const LionCostSetting lion_cost_settings[] = {
 	 "Sets the planner's estimate of the cost of each small entry of a lion summed range counted with the rest of its leaf"},
 	{"pg_lion.probe_step_cost", &lion_probe_step_cost, 2.0, LION_OP,
 	 "Sets the planner's estimate of the cost of each container of a set a lion summed range probes"},
+	{"pg_lion.range_fold_cost", &lion_range_fold_cost, 420.0, LION_OP,
+	 "Sets the planner's estimate of the cost of each fold or merge of a lion range collected as a source into a container of its union that is not a bitset"},
 
 	/* lion_customscan.c: the FK-side join (§27) */
 	{"pg_lion.fkjoin_count_cost", &lion_fkjoin_count_cost, 25.0, LION_TUPLE,
