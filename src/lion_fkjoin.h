@@ -9,7 +9,8 @@
  *		lion_fkjoin.c finds the join clause and proves the dimension key
  *		unique; everything about the FACT side - its WHERE clauses, the lion
  *		index that answers the join column, the path, the plan and the
- *		executor - is lion_customscan.c's, which treats the join key as one
+ *		executor - is lion_plan_fkjoin.c's and lion_exec_fkjoin.c's, which treat
+ *		the join key as one
  *		more equality clause whose value comes from the dimension's rows.
  *
  *		The dimension may be a join itself: one base table that carries the

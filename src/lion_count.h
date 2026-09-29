@@ -32,8 +32,8 @@
  * Two thresholds of the k-way union that the COST MODEL has to know as well as
  * the executor, so that a path is priced as the path it will take (DESIGN.md
  * §15).  The arguments for the numbers are where they are used, in
- * lion_count.c: lion_ecursor_build() for the first and lion_sum_is_cheaper()
- * for both.
+ * lion_expr.c's lion_ecursor_build() for the first and lion_count.c's
+ * lion_sum_is_cheaper() for both.
  *
  *	LION_OR_BITSET_MIN		containers at one container key above which an OR
  *							node accumulates them in a bitset image instead of
@@ -50,7 +50,7 @@
 
 /*
  * Two more the cost model shares with the executor: how small a posting set
- * is worth a private copy (lion_posting_set_materialize() in lion_count.c,
+ * is worth a private copy (lion_posting_set_materialize() in lion_set_copy.c,
  * where the argument is) - which decides whether a GROUP BY's lone WHERE set
  * is collected (DESIGN.md §10) - and the most groups one walk of
  * lion_count_groups_copy() counts together.
@@ -172,7 +172,7 @@ extern void lion_count_stats_add(LionCountStats *dst,
  * snapshot is held, so the answer for every root line pointer of a heap page
  * may be resolved once and reused by every later recheck of that page - which
  * is what turns the GROUP BY path's one-recheck-per-group-per-dirty-page into
- * one pass over the dirty pages.  The safety argument is in lion_count.c above
+ * one pass over the dirty pages.  The safety argument is in lion_vis.c above
  * lion_vis_cache_lookup().
  *
  * The handle is opaque and is created once per count node execution, in a
@@ -280,9 +280,9 @@ extern int64 lion_count_heap_filtered(Relation heap, Snapshot snapshot,
  * carries no visibility-map interlock of its own, so lion_count_posting_sets()
  * only ever materializes a set while at least one other set of the same
  * intersection is still read the pinned way.  The argument for why that is
- * enough is in lion_count.c above lion_posting_set_materialize().
+ * enough is in lion_set_copy.c above lion_posting_set_materialize().
  */
-struct LionMatSet;				/* private to lion_count.c */
+struct LionMatSet;				/* private to the count engine */
 
 typedef struct LionPostingSet
 {
@@ -531,7 +531,7 @@ extern void lion_list_pin_participants(int participants);
 /*
  * Everything needed to probe one key column with values of one search type:
  * DESIGN.md §21's cross-type resolution, made ONCE and shared by every path
- * that looks values up - the single and the batched lookup of lion_count.c
+ * that looks values up - the single and the batched lookup of lion_set.c
  * and the bitmap scan of lion_scan.c - because they walk the same tree, and a
  * path that descended where another scans would read the directory in an
  * order it is not in.
@@ -1347,7 +1347,8 @@ extern void lion_check_execute(Oid funcid);
 extern void lion_check_aggregate_execute(Oid aggfnoid);
 
 /* ---------------------------------------------------------------------
- * lion_customscan.c (DESIGN.md section 10)
+ * the LionCount custom scan, lion_plan_*.c and lion_exec_*.c (DESIGN.md
+ * section 10)
  * --------------------------------------------------------------------- */
 
 extern PGDLLIMPORT bool lion_enable_count_pushdown;
@@ -1384,7 +1385,7 @@ extern void lion_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
  * The cost model's shared terms (DESIGN.md section 10, "The units"): what a
  * merge of posting sets costs in CPU, used by the count pushdown and by
  * lioncostestimate() for the AND of sets an index scan makes; and a column's
- * correlation with the heap order less ANALYZE's tie-break (lion_am.c).
+ * correlation with the heap order less ANALYZE's tie-break (lion_amcost.c).
  */
 extern double lion_merge_cpu_cost(int nsrc, const double *members,
 								  const double *containers, const bool *inmem,

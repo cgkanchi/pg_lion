@@ -265,7 +265,7 @@ typedef int LionSysCacheId;
 /*
  * pg_always_inline is the newer spelling of pg_attribute_always_inline (which
  * every supported major has); released 16.x and 17.x minors do not define it,
- * so lion_count.c did not compile against them.
+ * so the count engine did not compile against them.
  */
 #ifndef pg_always_inline
 #define pg_always_inline pg_attribute_always_inline

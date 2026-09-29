@@ -91,10 +91,10 @@ typedef struct LionCostSetting
  * comment above that macro is where its default comes from; the two page
  * costs of the FK-side join's sort are the two terms of
  * LION_FKJOIN_SORT_PAGE_COST, and union_set_cost prices LION_FKJOIN_SET_COST
- * too, which is the same rebuild of a union (lion_customscan.c).
+ * too, which is the same rebuild of a union (lion_plan_cost.c).
  */
 static const LionCostSetting lion_cost_settings[] = {
-	/* lion_am.c: a plain index scan's heap side (DESIGN.md §29.11) */
+	/* lion_amcost.c: a plain index scan's heap side (DESIGN.md §29.11) */
 	{"pg_lion.plain_fetch_row_cost", &lion_plain_fetch_row_cost, 1.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of a lion plain index scan's fetch of a row past the first on its heap page, beyond a bitmap heap scan's"},
 	{"pg_lion.bitmap_row_cost", &lion_bitmap_row_cost, 0.1, LION_OP,
@@ -102,7 +102,7 @@ static const LionCostSetting lion_cost_settings[] = {
 	{"pg_lion.walk_pass_cost", &lion_walk_pass_cost, 5.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each entry past the first that a lion plain index scan walks the heap for, beyond a bitmap scan's"},
 
-	/* lion_customscan.c: the merge, the lookups and the heap recheck (§10) */
+	/* lion_plan_cost.c: the merge, the lookups and the heap recheck (§10) */
 	{"pg_lion.container_cost", &lion_container_cost, 8.0, LION_OP,
 	 "Sets the planner's estimate of the cost of reading and counting a container of a lion posting set"},
 	{"pg_lion.member_cost", &lion_member_cost, 0.15, LION_OP,
@@ -126,7 +126,7 @@ static const LionCostSetting lion_cost_settings[] = {
 	{"pg_lion.recheck_group_tid_cost", &lion_recheck_group_tid_cost, 6.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each candidate row of a grouped lion count's heap recheck"},
 
-	/* lion_customscan.c: the count's walks (§20, §26, §28, §32) */
+	/* lion_plan_cost.c: the count's walks (§20, §26, §28, §32) */
 	{"pg_lion.entry_count_cost", &lion_entry_count_cost, 50.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each count a lion GROUP BY makes, per entry or pair of entries"},
 	{"pg_lion.list_group_cost", &lion_list_group_cost, 18.0, LION_TUPLE,
@@ -142,7 +142,7 @@ static const LionCostSetting lion_cost_settings[] = {
 	{"pg_lion.range_fold_cost", &lion_range_fold_cost, 420.0, LION_OP,
 	 "Sets the planner's estimate of the cost of each fold or merge of a lion range collected as a source into a container of its union that is not a bitset"},
 
-	/* lion_customscan.c: the FK-side join (§27) */
+	/* lion_plan_fkjoin_cost.c: the FK-side join (§27) */
 	{"pg_lion.fkjoin_count_cost", &lion_fkjoin_count_cost, 14.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each count of a lion FK-side join, per dimension row"},
 	{"pg_lion.fkjoin_row_cost", &lion_fkjoin_row_cost, 20.0, LION_TUPLE,
