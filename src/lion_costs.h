@@ -33,6 +33,8 @@ extern PGDLLIMPORT double lion_member_cost;
 extern PGDLLIMPORT double lion_probe_cost;
 extern PGDLLIMPORT double lion_memory_probe_cost;
 extern PGDLLIMPORT double lion_and_member_cost;
+extern PGDLLIMPORT double lion_union_key_cost;
+extern PGDLLIMPORT double lion_union_member_cost;
 extern PGDLLIMPORT double lion_descent_cost;
 extern PGDLLIMPORT double lion_union_set_cost;
 extern PGDLLIMPORT double lion_recheck_tid_cost;

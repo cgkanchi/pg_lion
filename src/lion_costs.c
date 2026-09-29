@@ -41,6 +41,8 @@ double		lion_member_cost;
 double		lion_probe_cost;
 double		lion_memory_probe_cost;
 double		lion_and_member_cost;
+double		lion_union_key_cost;
+double		lion_union_member_cost;
 double		lion_descent_cost;
 double		lion_union_set_cost;
 double		lion_recheck_tid_cost;
@@ -106,7 +108,11 @@ static const LionCostSetting lion_cost_settings[] = {
 	{"pg_lion.memory_probe_cost", &lion_memory_probe_cost, 30.0, LION_OP,
 	 "Sets the planner's estimate of the cost of seeking a lion posting set copied into memory to a container key"},
 	{"pg_lion.and_member_cost", &lion_and_member_cost, 0.8, LION_OP,
-	 "Sets the planner's estimate of the cost of ANDing each member of a lion intersection with what a seek found"},
+	 "Sets the planner's estimate of the cost of ANDing each member of a lion intersection with what a seek found, or of looking it up in a container of a union"},
+	{"pg_lion.union_key_cost", &lion_union_key_cost, 30.0, LION_OP,
+	 "Sets the planner's estimate of the cost of building the union of a lion IN list's or multi-key query's containers at a container key"},
+	{"pg_lion.union_member_cost", &lion_union_member_cost, 0.25, LION_OP,
+	 "Sets the planner's estimate of the cost of each member of a union of lion containers built at a container key"},
 	{"pg_lion.descent_cost", &lion_descent_cost, 120.0, LION_OP,
 	 "Sets the planner's estimate of the cost of each level of a lion entry directory descended"},
 	{"pg_lion.union_set_cost", &lion_union_set_cost, 100.0, LION_TUPLE,
