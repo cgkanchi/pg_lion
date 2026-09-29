@@ -47,8 +47,6 @@
  */
 #include "postgres.h"
 
-#include <math.h>
-
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -4726,90 +4724,114 @@ lion_ecursor_container(LionExprCursor *c)
  * is dense, or the list's containers are small.
  *
  * Which is cheaper is estimated here from what the containers' headers say,
- * in nanoseconds as a harness beside the container library measured them
- * (-O2, containers of a heap of 70 rows a block, members at every offset a
- * row can have): a bit test 2 ns; a gallop through an ARRAY of s members 2 ns
- * a step, 1 + log2(1 + s/a) steps a member of acc; a search of r runs 1.5 ns
- * a step, a merge with them 0.8 ns a run and 3 a member; and for the union a
- * member of an ARRAY 1 ns, a BITSET 170, a run 2, the image's clear and count
- * 150 (52 ns of which is the count on PostgreSQL 18's AVX-512 popcount; 16's
- * takes 670), a fold 1.25 ns a member a fold, and acc's AND with it 1.5 ns a
- * member.  The estimate takes every member of acc to be looked up in every
- * child, where one found is not looked up again: it errs towards the union.
- * An acc of more than an ARRAY's worth of members is never probed.
+ * in quarters of a nanosecond as a harness beside the container library
+ * measured them (-O2, containers of a heap of 70 rows a block, members at
+ * every offset a row can have): a bit test 2 ns; a gallop through an ARRAY
+ * of s members 2 ns a step there and 3 in a count, whose containers are not
+ * all in the first-level cache, 1 + log2(1 + s/a) steps a member of acc; a
+ * search of r runs 1.5 ns a step, a merge with them 0.75 ns a run and 3 a
+ * member; and for the union a member of an ARRAY 1 ns, a BITSET 170, a run 2,
+ * the image's clear and count 150 (52 ns of which is the count on PostgreSQL
+ * 18's AVX-512 popcount; 16's takes 670), a fold 1.25 ns a member a fold,
+ * and acc's AND with it 1.5 ns a member.  The estimate is integer
+ * arithmetic and its logarithms fixed point (lion_log2_16()): it is made at
+ * every key a union is met at, and made in floating point it took 2 to 3%
+ * of a count that builds its unions anyway.  Rounded to whole steps instead,
+ * it took 120 members against two ARRAYs of 90 for one step each where they
+ * take 1.8, probed them, and the count that built its union in 2.8 ms took
+ * 4.2.  It takes every member of acc to be looked up in every child, where
+ * one found is not looked up again: it errs towards the union.  An acc of
+ * more than an ARRAY's worth of members is never probed.
  */
-#define LION_UP_BIT_NS			2.0
-#define LION_UP_GALLOP_NS		2.0
-#define LION_UP_RUNSEARCH_NS	1.5
-#define LION_UP_RUNMERGE_NS		0.8
-#define LION_UP_EXTRACT_NS		100.0	/* a BITSET's 512 words scanned */
-#define LION_UP_MEMBER_OR_NS	1.0
-#define LION_UP_BITSET_OR_NS	170.0
-#define LION_UP_RUN_OR_NS		2.0
-#define LION_UP_IMAGE_NS		150.0
-#define LION_UP_FOLD_NS			1.25
-#define LION_UP_AND_NS			1.5
+#define LION_UP_BIT			8	/* quarters of a nanosecond */
+#define LION_UP_GALLOP		12
+#define LION_UP_RUNSEARCH	6
+#define LION_UP_RUNMERGE	3
+#define LION_UP_RUNMERGE_A	12
+#define LION_UP_EXTRACT		400 /* a BITSET's 512 words scanned */
+#define LION_UP_MEMBER_OR	4
+#define LION_UP_BITSET_OR	680
+#define LION_UP_RUN_OR		8
+#define LION_UP_IMAGE		600
+#define LION_UP_FOLD		5
+#define LION_UP_AND			6
 
 /* GUC pg_lion.enable_union_probe (DESIGN.md §29.11, "Unions probed") */
 bool		lion_enable_union_probe = true;
 
+/*
+ * 16 log2(x) for x >= 1, within a sixteenth or so: the leading bit's position
+ * and the four bits after it, as a straight line between two powers of two.
+ */
+static inline uint32
+lion_log2_16(uint32 x)
+{
+	int			k = pg_leftmost_one_pos32(x);
+	uint32		rest = x - ((uint32) 1 << k);
+
+	return (uint32) k * 16 + ((k >= 4) ? rest >> (k - 4) : rest << (4 - k));
+}
+
 static bool
 lion_or_probe_pays(const LionExprCursor *c, const LionContainer *acc)
 {
-	double		a = (double) lion_container_cardinality(acc);
-	double		probe = 0;
-	double		unite = 0;
-	double		members = 0;
+	uint64		a = lion_container_cardinality(acc);
+	uint64		probe = 0;
+	uint64		unite = 0;
+	uint64		members = 0;
 	bool		arrays = true;
 	int			i;
 
 	Assert(c->pending && c->nhot > 1);
-	if (!lion_enable_union_probe || a > (double) LION_ARRAY_MAX_CARD)
+	if (!lion_enable_union_probe || a > LION_ARRAY_MAX_CARD)
 		return false;
-	a = Max(a, 1.0);
+	a = Max(a, 1);
 
 	if (acc->type == LION_CT_BITSET)
-		probe += LION_UP_EXTRACT_NS + a;
+		probe += LION_UP_EXTRACT + 4 * a;
 	else if (acc->type == LION_CT_RUN)
-		probe += a;
+		probe += 4 * a;
 
 	for (i = 0; i < c->nhot; i++)
 	{
 		const LionContainer *h = c->hot[i].cur;
-		double		m = (double) lion_container_cardinality(h);
+		uint64		m = lion_container_cardinality(h);
 
 		members += m;
 		if (h->type == LION_CT_BITSET)
 		{
-			probe += LION_UP_BIT_NS * a;
-			unite += LION_UP_BITSET_OR_NS;
+			probe += LION_UP_BIT * a;
+			unite += LION_UP_BITSET_OR;
 			arrays = false;
 		}
 		else if (h->type == LION_CT_RUN)
 		{
-			double		r = (double) Min((uint32) LION_RUN_NRUNS((LionContainer *) h),
-										 (uint32) LION_RUN_MAX_NRUNS);
+			uint32		r = Min((uint32) LION_RUN_NRUNS((LionContainer *) h),
+								(uint32) LION_RUN_MAX_NRUNS);
 
-			probe += (r >= 8.0 * a) ?
-				LION_UP_RUNSEARCH_NS * a * log2(r + 1.0) :
-				LION_UP_RUNMERGE_NS * r + 3.0 * a;
-			unite += LION_UP_RUN_OR_NS * r;
+			probe += ((uint64) r >= 8 * a) ?
+				LION_UP_RUNSEARCH * a * lion_log2_16(r + 1) / 16 :
+				LION_UP_RUNMERGE * r + LION_UP_RUNMERGE_A * a;
+			unite += LION_UP_RUN_OR * (uint64) r;
 			arrays = false;
 		}
 		else
 		{
-			probe += LION_UP_GALLOP_NS * a * (1.0 + log2(1.0 + m / a));
-			unite += LION_UP_MEMBER_OR_NS * m;
+			/* 1 + log2(1 + m/a) steps: 16 + 16 log2(16 + 16 m/a) - 64 sixteenths */
+			probe += LION_UP_GALLOP * a *
+				(lion_log2_16((uint32) (16 * m / a) + 16) - 48) / 16;
+			unite += LION_UP_MEMBER_OR * m;
 		}
 	}
 
 	/* lion_or_hot_raw()'s two ways, and acc's AND with what it builds */
-	if (arrays && members <= (double) LION_OR_FOLD_MEMBERS &&
+	if (arrays && members <= LION_OR_FOLD_MEMBERS &&
 		c->nhot < LION_OR_BITSET_MIN)
-		unite = LION_UP_FOLD_NS * members * c->nhot + LION_UP_AND_NS * (a + members);
+		unite = LION_UP_FOLD * members * (uint64) c->nhot +
+			LION_UP_AND * (a + members);
 	else
-		unite += LION_UP_IMAGE_NS +
-			((acc->type == LION_CT_ARRAY) ? LION_UP_AND_NS * a : LION_UP_IMAGE_NS);
+		unite += LION_UP_IMAGE +
+			((acc->type == LION_CT_ARRAY) ? LION_UP_AND * a : LION_UP_IMAGE);
 
 	return probe < unite;
 }
