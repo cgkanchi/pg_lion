@@ -50,6 +50,13 @@
  *		the others involves the fact, and that exactly one table of the
  *		dimension is outside every inner side.
  *
+ *		The semi and anti joins are also offered as JOIN paths, whose rows
+ *		are the outer side's - DESIGN.md §27, "The semi and anti join as a
+ *		join path".  lion_fkjoin_recognize_join() decides, for one call of
+ *		set_join_pathlist_hook, whether the join it is asked about is one: a
+ *		plain semi or anti join, the fact alone its inner side, one fk
+ *		equality its only clause, whatever the outer side is.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"

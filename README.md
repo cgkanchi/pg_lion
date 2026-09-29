@@ -259,6 +259,18 @@ d.pk FROM dim d WHERE ... AND EXISTS (SELECT 1 FROM f1 WHERE f1.fk = d.pk AND ..
 against the dimension rows that pass. The node's child is PostgreSQL's own plan of that join. An
 inner or outer join inside the dimension, which could repeat a row, keeps the ordinary plan.
 
+The rows of such a semi or anti join themselves - `d` semi-joined to `f1`, where a sort, another
+join, an aggregate the node does not answer, or the node above as its joined dimension needs them -
+can come from the same lookups: `Custom Scan (LionSemiJoin)` emits each row of its outer side whose
+key the fact's FK index has rows for under the fact filters, `Custom Scan (LionAntiJoin)` each row
+that has none, a NULL key included (DESIGN.md §27, "The semi and anti join as a join path"). The
+outer side can be any table or join, its key need not be unique - each of its rows is tested and
+emitted once - and the fact table may be partitioned. It keeps the outer side's order, so a sort
+above it may not be needed, and runs in parallel over a parallel scan of the outer side. It is
+offered for `EXISTS`, `IN` and `NOT EXISTS` whose subquery is the fact alone, correlated on one
+column; `NOT IN` is not an anti join and keeps the ordinary plan. The cost model chooses between it
+and PostgreSQL's own joins; `pg_lion.enable_semijoin` turns it off.
+
 `EXPLAIN ANALYZE` of such a join says where each dimension row's time went (DESIGN.md §27, "Where a
 key's time goes"): `Join Child Rows` from the dimension's plan, `Join Keys Looked Up` and `Without
 Entry`, the containers the counts read from each key's FK set (`Join Key Containers Read`), from the
@@ -336,9 +348,9 @@ expressions as the table's owner (DESIGN.md §7).
     src/lion_vacuum.c       ambulkdelete with cleanup locks on every page, two-pass cancellable protocol
     src/lion_funcs.c        lion_index_stats(), lion_index_verify() and the other diagnostics
     src/lion_count.[ch]     lion_count_keys(): VM-interlocked counting, per-block batched heap recheck
-    src/lion_customscan.c   create_upper_paths_hook -> CustomPath/CustomScan "LionCount"
+    src/lion_customscan.c   create_upper_paths_hook -> CustomPath/CustomScan "LionCount"; set_join_pathlist_hook -> "LionSemiJoin"/"LionAntiJoin"
     src/lion_costs.[ch]     the cost model's constants as planner settings (pg_lion.*_cost)
-    src/lion_fkjoin.[ch]    the FK-side joins a LionCount answers (fact JOIN dim, EXISTS / NOT EXISTS)
+    src/lion_fkjoin.[ch]    the FK-side joins a LionCount answers (fact JOIN dim, EXISTS / NOT EXISTS), and the semi/anti join paths
     src/lion_ordered.c      CustomScan "LionOrdered": lion-filtered, btree-ordered scans
     src/lion_multikey.c     array_ops/tsvector_ops: GIN-style extraction and tsquery key trees
     test/sql, test/isolation, test/unit, test/recovery, test/modules
@@ -447,7 +459,11 @@ Planner switches, each on by default and settable per session (`SET`), for compa
 working around a bad choice:
 
 - `pg_lion.enable_count_pushdown`: answer `count(*)` from Lion indexes with the `LionCount`
-  custom scan (DESIGN.md §10).
+  custom scan (DESIGN.md §10). Off, it turns off `pg_lion.enable_semijoin`'s joins too.
+- `pg_lion.enable_semijoin`: offer `LionSemiJoin` and `LionAntiJoin`, a semi or anti join over a
+  fact table answered from the Lion index on its foreign key (DESIGN.md §27, "The semi and anti
+  join as a join path"). PostgreSQL's `enable_hashjoin`, `enable_mergejoin` and `enable_nestloop`
+  do not disable them.
 - `pg_lion.enable_ordered_scan`: offer `LionOrdered`, a Lion-filtered walk of a B-tree, for an
   `ORDER BY` (DESIGN.md §30).
 - `pg_lion.enable_plain_scan`: let the planner use plain and index-only scans of Lion indexes

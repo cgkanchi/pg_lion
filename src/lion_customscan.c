@@ -71,6 +71,14 @@
  * each row's count when a count stands beside them, and a LionJoinAgg above
  * that Agg gives the query its own aggregates back.
  *
+ * The same semi and anti joins are also offered as JOIN paths, by
+ * set_join_pathlist_hook (DESIGN.md §27, "The semi and anti join as a join
+ * path"): a CustomPath of a join rel whose join is a semi or anti join with
+ * the fact alone on its inner side, over a path of its outer side - any rel
+ * - which emits the outer rows with (or without) a match, for whatever needs
+ * them above.  EXPLAIN calls it LionSemiJoin or LionAntiJoin; it is the same
+ * node, in the rows mode of a count(DISTINCT).
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -12244,6 +12252,11 @@ lion_child_resno(Plan *child, Var *var)
  * count(*) (LION_JOINFLAG_COUNTS) - and they, or the partial counts, may
  * carry the fact's join column, which is read from the key's column of the
  * child.
+ *
+ * A semi or anti join path (LION_JOINFLAG_OUTER) is a join rel's: its target
+ * list is the join rel's rows, the outer side's columns - and a semi join's
+ * fact key where an equivalence class needs it, which is read from the key's
+ * column too - and it is named LionSemiJoin or LionAntiJoin.
  */
 static Plan *
 lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
