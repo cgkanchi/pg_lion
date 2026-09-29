@@ -17,6 +17,11 @@ SET max_parallel_workers_per_gather = 0;
 -- out of the planner's choice.  The run's own price of collecting them is
 -- made from the sets it located, and does not read that setting.
 SET pg_lion.fkjoin_collect_container_cost = 1e9;
+-- The upper node's switch is what this file is about: with core's joins
+-- disabled, a count of an anti join could otherwise be core's Agg over the
+-- semi/anti join path (DESIGN.md §27, "The semi and anti join as a join
+-- path"), whose lookups switch the same way but are not what these show.
+SET pg_lion.enable_semijoin = off;
 
 /*
  * lion_aj() runs a query through the pushdown with every join method

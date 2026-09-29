@@ -430,20 +430,22 @@ SELECT * FROM lion_sp_explain('SELECT d.pk, d.attr FROM lion_sp_d d WHERE EXISTS
 -----------------------------------------------------------------------------------------------------
  Custom Scan (LionSemiJoin)
    Lion Indexes: lion_sp_f2_df.fk (fk = d.pk), lion_sp_f2_df.doc (doc @@ '''w3'' | ''w5'''::tsquery)
+   Join Key Lookups: in index order
    Join Rows: the outer rows with a match
    Fact Filters: collected once
    ->  Seq Scan on lion_sp_d d
-(5 rows)
+(6 rows)
 
 SELECT * FROM lion_sp_explain('SELECT d.pk, d.attr FROM lion_sp_d d WHERE NOT EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)');
                           lion_sp_explain                           
 --------------------------------------------------------------------
  Custom Scan (LionAntiJoin)
    Lion Indexes: lion_sp_f2_df.fk (fk = d.pk), lion_sp_f2_y (y = 5)
+   Join Key Lookups: in index order
    Join Rows: the outer rows without a match
    Fact Filters: collected once
    ->  Seq Scan on lion_sp_d d
-(5 rows)
+(6 rows)
 
 -- the IN spelling, and a fact filter that only subtracts
 SELECT * FROM lion_sp_explain('SELECT d.pk FROM lion_sp_d d WHERE d.pk IN (SELECT f2.fk FROM lion_sp_f2 f2 WHERE f2.fk4 IS NOT NULL)');
@@ -451,9 +453,10 @@ SELECT * FROM lion_sp_explain('SELECT d.pk FROM lion_sp_d d WHERE d.pk IN (SELEC
 --------------------------------------------------------------------------------
  Custom Scan (LionSemiJoin)
    Lion Indexes: lion_sp_f2_df.fk (fk = d.pk), lion_sp_f2_fk4 (fk4 IS NOT NULL)
+   Join Key Lookups: in index order
    Join Rows: the outer rows with a match
    ->  Seq Scan on lion_sp_d d
-(4 rows)
+(5 rows)
 
 -- over the partitioned fact, with a stable range and a filter per kind ORed
 SELECT * FROM lion_sp_explain('SELECT d.pk, d.grp FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND ((f1.kind = ''a'' AND f1.tags && ''{t1}'') OR (f1.kind = ''b'' AND f1.x = 3) OR f1.kind = ''c'') AND f1.ts >= now() - interval ''120 days'')');
@@ -476,10 +479,11 @@ SELECT * FROM lion_sp_explain('SELECT d.pk, g.label FROM lion_sp_d d JOIN lion_s
 --------------------------------------------------------------------
  Custom Scan (LionSemiJoin)
    Lion Indexes: lion_sp_f2_df.fk (fk = d.pk), lion_sp_f2_y (y = 5)
+   Join Key Lookups: in index order
    Join Rows: the outer rows with a match
    Fact Filters: collected once
    ->  (the outer side's plan: a join)
-(5 rows)
+(6 rows)
 
 -- ... and one that is itself a semi join path: a dimension semi-joined to two
 -- facts, the second over the rows of the first
@@ -488,17 +492,16 @@ SELECT * FROM lion_sp_explain('SELECT d.pk FROM lion_sp_d d WHERE EXISTS (SELECT
 --------------------------------------------------------------------
  Custom Scan (LionSemiJoin)
    Lion Indexes: lion_sp_f2_df.fk (fk = d.pk), lion_sp_f2_y (y < 4)
+   Join Key Lookups: in index order
    Join Rows: the outer rows with a match
-   Fact Filters: collected once
    ->  Custom Scan (LionAntiJoin)
          Partitions: lion_sp_f1_b
          Lion Indexes: (fk = d.pk), (x = 3)
          Implied by Partition Bounds: (kind = 'b'::text)
          Join Key Lookups: in index order
          Join Rows: the outer rows without a match
-         Fact Filters: collected once
          ->  Seq Scan on lion_sp_d d
-(12 rows)
+(11 rows)
 
 -- the outer side's order kept: in key order, a batch at a time, and put back
 -- (sorts off: over one batch a Sort of the path's rows is as early and
@@ -511,9 +514,8 @@ SELECT * FROM lion_sp_explain('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SEL
    Lion Indexes: lion_sp_w_fk (fk = wd.pk), lion_sp_w_x (x = 3)
    Join Key Lookups: in index order
    Join Rows: the outer rows with a match, in their order
-   Fact Filters: collected once
    ->  Index Only Scan Backward using lion_sp_wd_pkey on lion_sp_wd wd
-(6 rows)
+(5 rows)
 
 RESET enable_sort;
 -- the rows of the join feeding a sort, and - nothing disabled, a few outer rows
@@ -525,10 +527,11 @@ SELECT * FROM lion_sp_explain('SELECT d.pk, d.region FROM lion_sp_d d WHERE EXIS
    Sort Key: d.region, d.pk
    ->  Custom Scan (LionSemiJoin)
          Lion Indexes: lion_sp_f2_df.fk (fk = d.pk), lion_sp_f2_y (y = 5)
+         Join Key Lookups: in index order
          Join Rows: the outer rows with a match
          Fact Filters: collected once
          ->  Seq Scan on lion_sp_d d
-(7 rows)
+(8 rows)
 
 -- (from PostgreSQL 19 eager aggregation would group the path's rows below the
 -- join instead: off for this plan, where the setting exists)
@@ -545,7 +548,6 @@ EXPLAIN (COSTS OFF) SELECT g.label, count(*) FROM lion_sp_g g JOIN lion_sp_d d O
                Lion Indexes: (fk = d.pk), (x < 8)
                Join Key Lookups: in index order
                Join Rows: the outer rows with a match
-               Fact Filters: collected once
                ->  Bitmap Heap Scan on lion_sp_d d
                      Recheck Cond: (region = 'eu'::text)
                      Filter: (attr = 3)
@@ -553,7 +555,7 @@ EXPLAIN (COSTS OFF) SELECT g.label, count(*) FROM lion_sp_g g JOIN lion_sp_d d O
                            Index Cond: (region = 'eu'::text)
          ->  Hash
                ->  Seq Scan on lion_sp_g g
-(17 rows)
+(16 rows)
 
 DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN EXECUTE 'RESET enable_eager_aggregate'; END IF; END$$;
 -- the composition: the upper node over a dimension that is a join, whose
@@ -568,9 +570,9 @@ SELECT * FROM lion_sp_explain('SELECT count(*) FROM lion_sp_d d WHERE d.region =
          Implied by Partition Bounds: (kind = 'b'::text)
          Join Type: Semi
          Join Key Lookups: in index order
-         Fact Filters: collected once
          ->  Custom Scan (LionSemiJoin)
                Lion Indexes: lion_sp_f2_df.fk (fk = d.pk), lion_sp_f2_df.doc (doc @@ '''w3'' | ''w5'''::tsquery)
+               Join Key Lookups: in index order
                Join Rows: the outer rows with a match
                Fact Filters: collected once
                ->  Bitmap Heap Scan on lion_sp_d d
@@ -586,6 +588,7 @@ SELECT * FROM lion_sp_explain('SELECT count(*) FROM lion_sp_f2 f2 WHERE f2.doc @
  Finalize Aggregate
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_sp_f2_df.fk (fk = d.pk), lion_sp_f2_df.doc (doc @@ '''w3'' | ''w5'''::tsquery)
+         Join Key Lookups: in index order
          Fact Filters: collected once
          ->  Custom Scan (LionSemiJoin)
                Partitions: lion_sp_f1_a_old, lion_sp_f1_a_new, lion_sp_f1_b, lion_sp_f1_cd
@@ -599,7 +602,7 @@ SELECT * FROM lion_sp_explain('SELECT count(*) FROM lion_sp_f2 f2 WHERE f2.doc @
                      Recheck Cond: (region = 'eu'::text)
                      ->  Bitmap Index Scan on lion_sp_d_rg
                            Index Cond: (region = 'eu'::text)
-(16 rows)
+(17 rows)
 
 SET max_parallel_workers_per_gather = 2;
 -- parallel: each participant tests its share of the outer rows
@@ -610,10 +613,11 @@ SELECT * FROM lion_sp_explain('SELECT d.pk, d.attr FROM lion_sp_d d WHERE EXISTS
    Workers Planned: 2
    ->  Parallel Custom Scan (LionSemiJoin)
          Lion Indexes: lion_sp_f2_df.fk (fk = d.pk), lion_sp_f2_df.doc (doc @@ '''w3'' | ''w5'''::tsquery)
+         Join Key Lookups: in index order
          Join Rows: the outer rows with a match
          Fact Filters: collected once
          ->  Parallel Seq Scan on lion_sp_d d
-(7 rows)
+(8 rows)
 
 SELECT * FROM lion_sp_explain('SELECT d.pk FROM lion_sp_d d WHERE NOT EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'' AND f1.x = 3)');
                      lion_sp_explain                     
@@ -626,9 +630,8 @@ SELECT * FROM lion_sp_explain('SELECT d.pk FROM lion_sp_d d WHERE NOT EXISTS (SE
          Implied by Partition Bounds: (kind = 'b'::text)
          Join Key Lookups: in index order
          Join Rows: the outer rows without a match
-         Fact Filters: collected once
          ->  Parallel Seq Scan on lion_sp_d d
-(10 rows)
+(9 rows)
 
 -- ---- 2. the answers ------------------------------------------------------------
 -- semi and anti joins over the plain fact, fact filters of every kind
@@ -1271,12 +1274,16 @@ SELECT lion_sp_start('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FRO
 (1 row)
 
 RESET work_mem;
+-- (a walk in key order priced out, so that the keys are looked up a row at a
+-- time: over an fk index this small the model walks it)
+SET pg_lion.fkjoin_batch_row_cost = 1e6;
 SELECT lion_sp_start('SELECT d.pk FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.y = 2)');
              lion_sp_start             
 ---------------------------------------
  before the first row: next to nothing
 (1 row)
 
+RESET pg_lion.fkjoin_batch_row_cost;
 -- ... so a LIMIT prices the wait: over one batch the path's rows come no
 -- sooner in the outer side's order than through a Sort of them, which is
 -- cheaper; over several, the first batch's rows come first, with no Sort
@@ -1290,9 +1297,8 @@ SELECT * FROM lion_sp_explain('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SEL
                Lion Indexes: lion_sp_w_fk (fk = wd.pk), lion_sp_w_x (x = 3)
                Join Key Lookups: in index order
                Join Rows: the outer rows with a match
-               Fact Filters: collected once
                ->  Seq Scan on lion_sp_wd wd
-(9 rows)
+(8 rows)
 
 SET work_mem = '64kB';
 SELECT * FROM lion_sp_explain('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x = 3) ORDER BY wd.pk DESC LIMIT 5');
@@ -1303,9 +1309,8 @@ SELECT * FROM lion_sp_explain('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SEL
          Lion Indexes: lion_sp_w_fk (fk = wd.pk), lion_sp_w_x (x = 3)
          Join Key Lookups: in index order
          Join Rows: the outer rows with a match, in their order
-         Fact Filters: collected once
          ->  Index Only Scan Backward using lion_sp_wd_pkey on lion_sp_wd wd
-(7 rows)
+(6 rows)
 
 SELECT lion_sp_seq('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x = 3) ORDER BY wd.pk DESC LIMIT 5');
              lion_sp_seq             
