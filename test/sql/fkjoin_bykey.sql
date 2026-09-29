@@ -498,7 +498,9 @@ SELECT lion_bk('SELECT f.fk + 1, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.p
 -- and hashed - its groups are not proved to be one row each
 SELECT lion_bk('SELECT d.tk COLLATE "C", count(*) FROM lion_bkf f JOIN lion_bkd d ON d.tk = f.tk WHERE f.x = 3 GROUP BY d.tk COLLATE "C"');
 SELECT lion_bk('SELECT d.pk + 0, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.pk + 0');
--- another fact column
+-- another fact column, alone and beside the key: each key's count in each of
+-- its groups (DESIGN.md §27, "Grouped by a fact column"), a row a group each
+-- no longer
 SELECT lion_bk('SELECT f.x, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY f.x');
 SELECT lion_bk('SELECT f.fk, f.x, count(*) FROM lion_bkf f JOIN lion_bkd d ON d.pk = f.fk WHERE f.hot GROUP BY f.fk, f.x');
 

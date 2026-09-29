@@ -356,8 +356,9 @@ SELECT lion_nj_counter('SELECT count(*) FROM lion_nf f WHERE EXISTS (SELECT 1 FR
 	= (SELECT count(DISTINCT k) FROM lion_nd) AS one_lookup_a_key;
 
 -- ---- 4. declined ---------------------------------------------------------------
--- a fact column in the output, as for every FK-side join
-SELECT lion_nj('SELECT f.x, count(*) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk AND d.attr = 1) GROUP BY f.x');
+-- two fact columns in the output, as for every FK-side join (one is counted
+-- once per group of it: fkjoin_factgroup.sql)
+SELECT lion_nj('SELECT f.x, f.y, count(*) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk AND d.attr = 1) GROUP BY f.x, f.y');
 -- another aggregate
 SELECT lion_nj('SELECT sum(f.x) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk AND d.attr = 1)');
 -- a second correlation

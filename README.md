@@ -208,8 +208,11 @@ for the hash semi join, on an assert build). The JOIN and the second form may gr
 dimension's columns. To count each customer's orders, the JOIN may also group by the join key,
 `cu.id` or `o.customer_id`, and the first form by `o.customer_id`. Each customer the node counts is
 then a group of its own, which PostgreSQL's aggregate takes as it comes, with no sort and no hash
-table (DESIGN.md §27, "Grouped by the join key"). A query that aggregates those per-key counts in
-turn gets the node at its inner level:
+table (DESIGN.md §27, "Grouped by the join key"). The JOIN, and the form with `IN`, may also group
+by one column of the fact table, `o.status`, with a lion index on it: each customer is then counted
+once per status. Over a fact table partitioned by that column, a partition whose bounds give it one
+value needs no index on it (DESIGN.md §27, "Grouped by a fact column"). A query that aggregates
+those per-key counts in turn gets the node at its inner level:
 
 ```sql
 WITH n AS (SELECT o.customer_id, count(*) AS n
