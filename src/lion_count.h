@@ -84,6 +84,17 @@ typedef struct LionCountStats
 	int64		probes_avoided;
 
 	/*
+	 * How the AND met its unions (DESIGN.md §29.11, "Unions probed"): the
+	 * container keys at which the union of two or more containers of an IN
+	 * list, a multi-key `&&` or an OR across columns was built, and the ones
+	 * at which the running intersection was looked up in those containers
+	 * instead and the union never built.  A union that drives the AND, or is
+	 * the only source, is always built.
+	 */
+	int64		unions_built;
+	int64		unions_probed;
+
+	/*
 	 * The per-query visibility cache (LionVisCache below).  cache_hits counts
 	 * the heap block visits it answered without touching the buffer manager,
 	 * so cache_hits + blocks_rechecked is the number of block visits the
@@ -1304,6 +1315,13 @@ extern void lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 extern double lion_merge_cpu_cost(int nsrc, const double *members,
 								  const double *containers, const bool *inmem,
 								  double tuples, double isect, double *probes);
+extern double lion_merge_cpu_cost_sets(int nsrc, const double *members,
+									   const double *containers,
+									   const double *nsets,
+									   const double *setcontainers,
+									   const double *setpages,
+									   const bool *inmem, double tuples,
+									   double isect, double *probes);
 
 /*
  * The AND of the posting sets of n clauses of one relation (DESIGN.md §29.11,
@@ -1385,6 +1403,13 @@ extern double lion_probe_rel_factor(PlannerInfo *root, RelOptInfo *rel);
  * lion_probe_rel_rows() applies it to rel's own restriction clauses.
  */
 extern PGDLLIMPORT bool lion_enable_intersection_probe;
+
+/*
+ * Whether an AND of posting sets may look its running intersection up in the
+ * containers of a union at a key instead of building the union (DESIGN.md
+ * §29.11, "Unions probed"): an executor setting, for comparing the two.
+ */
+extern PGDLLIMPORT bool lion_enable_union_probe;
 extern double lion_isect_factor(PlannerInfo *root, RelOptInfo *rel,
 								IndexOptInfo *idx, int n,
 								const AttrNumber *cols, Node **clauses);

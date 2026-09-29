@@ -471,7 +471,10 @@ working around a bad choice:
 Testing knobs rather than tuning ones: `pg_lion.scan_window_floor` (4 MB), the least memory a plain
 scan's window of container keys takes (DESIGN.md §29.3), `pg_lion.parallel_range_keys` (16), the
 fewest container keys - of 64 heap blocks each - a range of a parallel count covers when it runs
-(DESIGN.md §10, "A GROUP BY in parallel"; the planner prices the default), and
+(DESIGN.md §10, "A GROUP BY in parallel"; the planner prices the default),
+`pg_lion.enable_union_probe` (on), whether an AND of posting sets may look its few rows up in the
+containers of an `IN` list's or a multi-key query's union rather than build the union (DESIGN.md
+§29.11, "Unions probed"; the answers are the same either way), and
 `pg_lion.vacuum_barrier_ranges` (superuser), how many visited-block ranges VACUUM batches in rmgr
 mode (DESIGN.md §25).
 `pg_lion.rmgr_id` is described under `wal_mode` above.
@@ -491,7 +494,9 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `member_cost` | 0.15 | `cpu_operator_cost` | a member of it, up to 1,024 a container |
 | `probe_cost` | 40 | `cpu_operator_cost` | a seek of a posting tree to a container key |
 | `memory_probe_cost` | 30 | `cpu_operator_cost` | the same into a set copied into memory |
-| `and_member_cost` | 0.8 | `cpu_operator_cost` | a member of an intersection ANDed with what a seek found |
+| `and_member_cost` | 0.8 | `cpu_operator_cost` | a member of an intersection ANDed with what a seek found, or looked up in a container of a union's |
+| `union_key_cost` | 30 | `cpu_operator_cost` | the union of an `IN` list's or a multi-key query's containers built at a container key |
+| `union_member_cost` | 0.25 | `cpu_operator_cost` | a member of such a union, or of the intersection ANDed with it |
 | `descent_cost` | 120 | `cpu_operator_cost` | a level of an entry directory descended |
 | `union_set_cost` | 100 | `cpu_tuple_cost` | a set of an `IN` list or `OR` rebuilt by each count of a GROUP BY or join |
 | `recheck_tid_cost` | 1.5 | `cpu_tuple_cost` | a candidate row of a count's heap recheck |

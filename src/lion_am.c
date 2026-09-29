@@ -263,6 +263,22 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §29.11, "Unions probed": whether the AND of posting sets may
+	 * look its running intersection up in the containers of an IN list's or
+	 * a multi-key query's union at a key, where that is cheaper than building
+	 * the union.  A testing knob: off, every union is built, as it was, and
+	 * the answers are the same either way.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_union_probe",
+							 "Lets a lion AND of posting sets look its few rows up in a union's containers instead of building the union.",
+							 "Off, every union a lion AND meets is built; the answers are the same either way.",
+							 &lion_enable_union_probe,
+							 true,
+							 PGC_USERSET,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
+
+	/*
 	 * The cost model's constants (DESIGN.md §31, "The settings"): one setting
 	 * for each, the multiplier of the core cost it is priced in, for
 	 * calibrating the model without a rebuild.
