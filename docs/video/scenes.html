@@ -7,65 +7,64 @@
   Every frame of the video is this page at one instant: renderAt(t) poses the whole stage for time t
   (seconds), from the cue times in timeline.js, which build_audio.py writes from the narration.
   Nothing here animates by itself; render.py steps t and screenshots each frame.
-  Open it in a browser with ?play to watch it in real time (without sound).
+  Open it in a browser with ?play to watch it in real time (without sound), or ?t=20 for one instant.
+
+  One cast of objects carries the story: 800 dots are the table's rows (6,250 rows each); the
+  matching ones are counted by a B-tree and by GIN, fly together into a pixel lion, and then pack
+  into the chunk bitmaps that Lion adds up.  The canvas draws that cast; the DOM draws the words.
 -->
 <style>
+@font-face { font-family: Brico; font-weight: 600; src: url(fonts/bricolage-grotesque-latin-600-normal.woff2) format("woff2"); }
+@font-face { font-family: Brico; font-weight: 700; src: url(fonts/bricolage-grotesque-latin-700-normal.woff2) format("woff2"); }
+@font-face { font-family: Brico; font-weight: 800; src: url(fonts/bricolage-grotesque-latin-800-normal.woff2) format("woff2"); }
 @font-face { font-family: Inter; font-weight: 400; src: url(fonts/inter-latin-400-normal.woff2) format("woff2"); }
 @font-face { font-family: Inter; font-weight: 500; src: url(fonts/inter-latin-500-normal.woff2) format("woff2"); }
 @font-face { font-family: Inter; font-weight: 600; src: url(fonts/inter-latin-600-normal.woff2) format("woff2"); }
 @font-face { font-family: Inter; font-weight: 700; src: url(fonts/inter-latin-700-normal.woff2) format("woff2"); }
-@font-face { font-family: Inter; font-weight: 800; src: url(fonts/inter-latin-800-normal.woff2) format("woff2"); }
-@font-face { font-family: JBM; font-weight: 400; src: url(fonts/jetbrains-mono-latin-400-normal.woff2) format("woff2"); }
 @font-face { font-family: JBM; font-weight: 500; src: url(fonts/jetbrains-mono-latin-500-normal.woff2) format("woff2"); }
 @font-face { font-family: JBM; font-weight: 700; src: url(fonts/jetbrains-mono-latin-700-normal.woff2) format("woff2"); }
 
 :root {
-  --bg: #0b0e13; --bg2: #10151d; --panel: #151b25; --panel2: #1b2330; --line: #2a3446; --line2: #36425a;
-  --text: #eef1f6; --muted: #929cae; --dim: #5d6779;
-  --blue: #5b9cff; --blue-bg: #13233d; --green: #3ecf8e; --green-bg: #0f2c22;
-  --amber: #f7b03c; --amber-bg: #33240c; --pink: #f0648c; --pink-bg: #36121f;
-  --orange: #ff8a4c; --red: #ff6464; --gray: #8f99ab;
+  --bg: #f2f4f9; --ink: #141a2a; --muted: #5d6880; --faint: #9aa4b8; --line: #dce2ec; --card: #ffffff;
+  --lion: #f59e0b; --lion-deep: #e27812; --lion-pale: #fff1d6;
+  --blue: #3867f4; --blue-pale: #e4ebff; --green: #12a06a; --green-pale: #dcf4e9;
+  --pink: #ec4f86; --red: #ef5a38; --red-pale: #ffe5dd;
 }
 html, body { margin: 0; padding: 0; background: #000; }
-body { font-family: Inter, sans-serif; color: var(--text); -webkit-font-smoothing: antialiased; }
-#stage { position: relative; width: 1920px; height: 1080px; overflow: hidden;
-  background: radial-gradient(1400px 900px at 50% 38%, #121824 0%, var(--bg) 70%); }
+body { font-family: Inter, sans-serif; color: var(--ink); -webkit-font-smoothing: antialiased; }
+#stage { position: relative; width: 1920px; height: 1080px; overflow: hidden; background-color: var(--bg); }
+#dots { position: absolute; inset: -40px; background-image: radial-gradient(#d3d9e6 1.6px, transparent 1.8px); background-size: 36px 36px; }
+#glow { position: absolute; inset: 0; background: radial-gradient(1100px 700px at 50% 45%, rgba(255,255,255,.75), rgba(255,255,255,0) 70%); }
 .a { position: absolute; }
-.scene { position: absolute; inset: 0; display: none; }
-.mono { font-family: JBM, monospace; }
-svg.layer { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; overflow: visible; }
+.beat { position: absolute; inset: 0; }
 canvas.layer { position: absolute; left: 0; top: 0; }
-
-#brand { position: absolute; right: 90px; top: 50px; font-size: 30px; font-weight: 800; letter-spacing: -.01em; color: #7d889c; }
-#brand b { color: var(--amber); font-weight: 800; }
-#caption { position: absolute; left: 0; right: 0; bottom: 34px; display: flex; justify-content: center; }
-#caption span { max-width: 1500px; font-size: 32px; line-height: 1.38; font-weight: 500; color: #f4f6fa;
-  background: rgba(6, 8, 12, .78); padding: 9px 24px 11px; border-radius: 12px; text-align: center; }
-
-.card { background: var(--panel); border: 1.5px solid var(--line); border-radius: 18px; }
-.chip { border-radius: 12px; padding: 8px 26px; font-weight: 700; border: 2px solid; display: inline-block; }
-.pill { border-radius: 999px; padding: 6px 18px; font-weight: 700; display: inline-block; }
+.brico { font-family: Brico, Inter, sans-serif; letter-spacing: -.02em; }
+.mono { font-family: JBM, monospace; }
+.card { background: var(--card); border-radius: 22px; box-shadow: 0 1px 2px rgba(20,30,60,.06), 0 14px 36px rgba(20,30,60,.09); }
+.pill { border-radius: 999px; padding: 6px 20px; font-weight: 700; display: inline-block; }
 .center { text-align: center; }
 .code { font-family: JBM, monospace; white-space: pre; }
-.kw { color: #c792ea; } .fn { color: #82aaff; } .str { color: #c3e88d; } .num { color: #f78c6c; } .cm { color: #5d6779; }
-.big { font-weight: 800; letter-spacing: -.02em; }
+.kw { color: #7c4dff; } .fn { color: var(--blue); } .str { color: #0f8a5f; }
+#caption { position: absolute; left: 0; right: 0; bottom: 34px; display: flex; justify-content: center; }
+#caption span { max-width: 1500px; font-size: 32px; line-height: 1.38; font-weight: 500; color: #fff;
+  background: rgba(20, 26, 42, .88); padding: 9px 24px 11px; border-radius: 14px; text-align: center; }
 </style>
 </head>
 <body>
 <div id="stage">
-  <div id="scenes"></div>
-  <div id="brand">pg_<b>lion</b></div>
+  <div id="dots"></div>
+  <div id="glow"></div>
+  <canvas id="world" class="layer" width="1920" height="1080"></canvas>
+  <div id="beats"></div>
   <div id="caption"><span></span></div>
 </div>
 <script src="timeline.js"></script>
 <script>
 "use strict";
-/* ------------------------------------------------------------------ helpers */
+/* ------------------------------------------------------------------ timing helpers */
 const TL = window.TIMELINE;
-const CUE = {};
-TL.scenes.forEach(s => s.cues.forEach(c => { CUE[c.id] = c; }));
-const SC = {};
-TL.scenes.forEach(s => { SC[s.id] = s; });
+const CUE = {}, SC = {};
+TL.scenes.forEach(s => { SC[s.id] = s; s.cues.forEach(c => { CUE[c.id] = c; }); });
 const A = (id, k = 0) => CUE[id].sentences[k].start;      // when sentence k of a cue starts
 const Z = (id) => CUE[id].end;                               // when a cue's speech ends
 // when a phrase of a cue's caption is spoken, by its share of the sentence's characters
@@ -82,12 +81,18 @@ const P = (t, a, d) => clamp((t - a) / d);
 const E = {
   out: x => 1 - Math.pow(1 - clamp(x), 3),
   io: x => { x = clamp(x); return x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; },
-  back: x => { x = clamp(x); const c1 = 1.5, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); },
+  back: x => { x = clamp(x); const c1 = 1.6, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); },
+  in: x => Math.pow(clamp(x), 2.4),
 };
 const fmt = n => Math.round(n).toLocaleString("en-US");
 function rng(seed) { return function () { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
   t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const hex = h => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+const mix = (a, b, x) => { x = clamp(x); return "rgb(" + a.map((v, i) => Math.round(v + (b[i] - v) * x)).join(",") + ")"; };
+const C = { grey: hex("#c7cfdc"), lion: hex("#f59e0b"), blue: hex("#3867f4"), green: hex("#12a06a"), red: hex("#ef5a38"),
+  white: hex("#ffffff"), ink: hex("#141a2a"), line: hex("#dce2ec"), pale: hex("#fff1d6") };
 
+/* ------------------------------------------------------------------ DOM helpers */
 function mk(parent, cls, css, html) {
   const e = document.createElement("div");
   e.className = "a" + (cls ? " " + cls : "");
@@ -97,320 +102,553 @@ function mk(parent, cls, css, html) {
   return e;
 }
 function box(x, y, w, h) { const s = { left: x + "px", top: y + "px" }; if (w != null) s.width = w + "px"; if (h != null) s.height = h + "px"; return s; }
-// pose an element: opacity, offset, scale
 function st(e, o = 1, x = 0, y = 0, s = 1) {
   e.style.opacity = o;
   e.style.visibility = o <= 0.001 ? "hidden" : "visible";
-  e.style.transform = (e._base || "") + " translate(" + x + "px," + y + "px) scale(" + s + ")";
+  e.style.transform = "translate(" + x + "px," + y + "px) scale(" + s + ")";
 }
-// fade and rise in at a, fade out at b (if given)
-function show(e, t, a, b, dy = 22, d = 0.5) {
-  const pin = E.out(P(t, a, d));
-  const pout = b == null ? 0 : E.io(P(t, b, 0.4));
-  st(e, pin * (1 - pout), 0, (1 - pin) * dy - pout * 10, 1);
+// in at a with a rise, out at b
+function show(e, t, a, b, dy = 24, d = 0.45) {
+  const pin = E.out(P(t, a, d)), pout = b == null ? 0 : E.io(P(t, b, 0.3));
+  st(e, pin * (1 - pout), 0, (1 - pin) * dy - pout * 14, 1);
   return pin * (1 - pout);
 }
-function pop(e, t, a, b, d = 0.45) {
-  const pin = P(t, a, d), pout = b == null ? 0 : E.io(P(t, b, 0.35));
-  st(e, clamp(pin * 2) * (1 - pout), 0, 0, lerp(0.6, 1, E.back(pin)) * (1 - pout * 0.1));
-  return pin * (1 - pout);
+// in at a with a springy scale, out at b
+function pop(e, t, a, b, d = 0.45, from = 0.6) {
+  const pin = P(t, a, d), pout = b == null ? 0 : E.io(P(t, b, 0.3));
+  st(e, clamp(pin * 2.2) * (1 - pout), 0, 0, lerp(from, 1, E.back(pin)) * (1 - pout * 0.08));
+  return clamp(pin * 2.2) * (1 - pout);
 }
-const SVGNS = "http://www.w3.org/2000/svg";
-function svgLayer(parent) { const s = document.createElementNS(SVGNS, "svg"); s.setAttribute("class", "layer"); s.setAttribute("viewBox", "0 0 1920 1080"); parent.appendChild(s); return s; }
-function sv(parent, tag, attrs) { const e = document.createElementNS(SVGNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); parent.appendChild(e); return e; }
-function canvasLayer(parent) {
-  const c = document.createElement("canvas"); c.className = "layer"; c.width = 1920; c.height = 1080;
-  c.style.width = "1920px"; c.style.height = "1080px"; parent.appendChild(c); return c.getContext("2d");
-}
-function rrect(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
-const COL = { blue: "#5b9cff", green: "#3ecf8e", amber: "#f7b03c", pink: "#f0648c", orange: "#ff8a4c",
-  cell: "#1e2635", cellLine: "#2a3446", text: "#eef1f6", muted: "#929cae", dim: "#5d6779", white: "#ffffff" };
 
-// slide in from the side, for the snappier cuts
-function slide(e, t, a, b, dx = 60, d = 0.35) {
-  const pin = E.out(P(t, a, d)), pout = b == null ? 0 : E.io(P(t, b, 0.25));
-  st(e, pin * (1 - pout), (1 - pin) * dx, -pout * 16, 1);
-  return pin * (1 - pout);
-}
-// a number that counts up from 0 to n between a and a + d
-const tick = (t, a, d, n, pow = 1) => n * Math.pow(P(t, a, d), pow);
-const chipHTML = (w, c, size = 30) => `<span class=chip style='color:var(--${c});border-color:var(--${c});font-size:${size}px;background:var(--${c}-bg)'>${w}</span>`;
-
-/* ------------------------------------------------------------------ scenes */
-const SCENES = [];
-function scene(id, build, opts) { SCENES.push({ id, build, brand: !(opts && opts.nobrand) }); }
-
-/* hook: every dashboard asks how many -------------------------------------- */
-scene("hook", root => {
-  const words = [["Every", "dashboard,"], ["every", "filter,"], ["every", "report"]];
-  const lines = words.map(([a, b], i) => mk(root, "big", Object.assign(box(150, 250 + i * 128), { fontSize: "110px", lineHeight: "1" }),
-    `<span style='color:#6f7a8e'>${a}</span> ${b}`));
-  const pills = [["country = 'Japan'", "2,500,000"], ["type = 'purchase'", "312,408"], ["last 24 hours", "48,112"],
-    ["status = 'error'", "1,284"], ["plan = 'pro'", "91,337"]].map(([k, v], i) => {
-    const e = mk(root, "card", Object.assign(box(1150 + (i % 2) * 70, 200 + i * 118, 600, 92), { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 30px", boxSizing: "border-box" }));
-    e.innerHTML = `<span class=mono style='font-size:25px;color:var(--muted)'>${k}</span><span class='mono big' style='font-size:36px;color:var(--amber)'>${v}</span>`;
-    return e;
-  });
-  const q = mk(root, "center big", Object.assign(box(0, 390, 1920), { fontSize: "150px", lineHeight: "1.05" }),
-    "<span style='color:var(--amber)'>How many</span> rows match?");
-  const at = [wt("h1", "dashboard") - 0.25, wt("h1", "every filter") - 0.1, wt("h1", "every report") - 0.1];
-  const q0 = A("h2") - 0.2;
-  return t => {
-    lines.forEach((e, i) => slide(e, t, at[i], q0 - 0.2, -50));
-    pills.forEach((e, i) => { const p = slide(e, t, A("h1") + 0.3 + i * 0.35, q0 - 0.2, 70); st(e, p, (1 - E.out(P(t, A("h1") + 0.3 + i * 0.35, 0.35))) * 70, Math.sin(t * 1.3 + i) * 5); });
-    const p = P(t, q0, 0.45);
-    st(q, clamp(p * 2.5), 0, 0, lerp(0.82, 1, E.back(p)));
-  };
-}, { nobrand: true });
-
-/* pain: B-tree walks rows, GIN reads the table ----------------------------- */
-scene("pain", root => {
-  const sql = mk(root, "center code", Object.assign(box(0, 130, 1920), { fontSize: "36px" }),
-    "<span class=kw>SELECT</span> <span class=fn>count</span>(*) <span class=kw>FROM</span> events <span class=kw>WHERE</span> country = <span class=str>'Japan'</span>;");
-  const note = mk(root, "center", Object.assign(box(0, 190, 1920), { fontSize: "26px", color: "var(--muted)" }), "5,000,000 rows · 2,500,000 match");
-  const panel = (x, name, color, sub) => {
-    const e = mk(root, "card", box(x, 270, 800, 600));
-    mk(e, "", Object.assign(box(44, 34), { fontSize: "58px", fontWeight: 800, color: `var(--${color})` }), name);
-    mk(e, "", Object.assign(box(44, 110), { fontSize: "27px", color: "var(--muted)" }), sub);
-    return e;
-  };
-  const L = panel(120, "B-tree", "blue", "counts one entry at a time");
-  const R = panel(1000, "GIN", "green", "returns a bitmap, then reads the table");
-  const cells = [];
-  for (let j = 0; j < 8; j++) for (let i = 0; i < 24; i++) cells.push(mk(L, "", Object.assign(box(44 + i * 30, 180 + j * 30, 24, 24), { borderRadius: "5px", background: "#222b3a" })));
-  const pages = [];
-  for (let j = 0; j < 4; j++) for (let i = 0; i < 10; i++) pages.push(mk(R, "", Object.assign(box(44 + i * 72, 180 + j * 58, 62, 48), { borderRadius: "7px", background: "var(--panel2)", border: "1.5px solid var(--line2)" })));
-  const lc = mk(L, "mono", Object.assign(box(44, 440), { fontSize: "30px", color: "var(--muted)" }), "");
-  const rc = mk(R, "mono", Object.assign(box(44, 440), { fontSize: "30px", color: "var(--muted)" }), "");
-  const lt = mk(L, "big", Object.assign(box(44, 488), { fontSize: "84px", color: "var(--blue)", lineHeight: "1" }), "157 ms");
-  const rt = mk(R, "big", Object.assign(box(44, 488), { fontSize: "84px", color: "var(--green)", lineHeight: "1" }), "665 ms");
-  const tl = A("p1"), tr = A("p2");
-  return t => {
-    show(sql, t, SC.pain.start + 0.05, null, 12, 0.3); show(note, t, SC.pain.start + 0.2, null, 8, 0.3);
-    slide(L, t, SC.pain.start + 0.1, null, -60); slide(R, t, SC.pain.start + 0.2, null, 60);
-    st(R, +R.style.opacity * lerp(0.35, 1, E.out(P(t, tr - 0.3, 0.3))));
-    const pl = P(t, tl + 0.2, Z("p1") - tl - 0.2);
-    const lit = Math.floor(pl * cells.length);
-    cells.forEach((c, i) => { c.style.background = i < lit ? (i === lit - 1 ? "#ffffff" : "var(--blue)") : "#222b3a"; });
-    lc.textContent = "count(*) = " + fmt(2500000 * Math.pow(pl, 2));
-    pop(lt, t, Z("p1") - 0.2, null, 0.35);
-    const pr = P(t, tr + 0.1, Z("p2") - tr - 0.1);
-    const seen = Math.floor(pr * pages.length);
-    pages.forEach((p, i) => { p.style.background = i < seen ? (i >= seen - 2 ? "var(--green)" : "#1d4a37") : "var(--panel2)"; p.style.borderColor = i < seen ? "var(--green)" : "var(--line2)"; });
-    rc.textContent = "count(*) = " + fmt(2500000 * pr);
-    pop(rt, t, Z("p2") - 0.1, null, 0.35);
-  };
-});
-
-/* reveal: meet Lion ------------------------------------------------------- */
-scene("reveal", root => {
-  const r = rng(7), cols = 22, rows = 5, cs = 34, gap = 9;
-  const gx = 960 - (cols * (cs + gap) - gap) / 2, gy = 210;
-  const cells = [];
-  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
-    const e = mk(root, "", Object.assign(box(gx + i * (cs + gap), gy + j * (cs + gap), cs, cs), { borderRadius: "7px", background: "#1a2130" }));
-    cells.push({ e, on: r() < 0.46, d: Math.hypot(i - cols / 2, (j - rows / 2) * 2) });
+/* ------------------------------------------------------------------ the cast */
+// the table: 40 x 20 dots, 6,250 rows each; about half of them match
+const G = { cols: 40, rows: 20, sp: 26, x0: 263, y0: 322, r: 8 };
+const DOTS = (() => { const r = rng(42), out = [];
+  for (let i = 0; i < G.cols * G.rows; i++) {
+    const c = i % G.cols, w = (i / G.cols) | 0;
+    out.push({ i, c, w, x: G.x0 + c * G.sp, y: G.y0 + w * G.sp, m: r() < 0.5, j: r() });
   }
-  const word = mk(root, "center big", Object.assign(box(0, 470, 1920), { fontSize: "200px", lineHeight: "1" }),
-    '<span style="color:#7d889c">pg_</span><span style="color:var(--amber)">lion</span>');
-  const tag = mk(root, "center", Object.assign(box(0, 720, 1920), { fontSize: "50px", fontWeight: 600 }),
-    "a <span style='color:var(--amber)'>roaring-bitmap</span> index for Postgres");
-  const t0 = A("r1");
-  return t => {
-    cells.forEach(c => {
-      const p = E.out(P(t, t0 - 0.25 + c.d * 0.03, 0.3));
-      c.e.style.background = c.on && p > 0 ? `rgba(247,176,60,${0.2 + 0.8 * p})` : "#1a2130";
-      st(c.e, clamp(p * 1.5 + 0.2), 0, 0, lerp(0.5, 1, E.back(p)));
-    });
-    const p = P(t, t0 - 0.05, 0.5);
-    st(word, clamp(p * 2), 0, 0, lerp(0.85, 1, E.back(p)));
-    show(tag, t, A("r1", 1) - 0.1, null, 16, 0.4);
-  };
-}, { nobrand: true });
+  return out; })();
+const MATCH = DOTS.filter(d => d.m);
+MATCH.forEach((d, k) => { d.k = k; });
 
-/* how: compressed bitmaps in chunks that know their counts ----------------- */
-const CH = { n: 8, w: 196, g: 14, y: 200, cy: 470 };
-CH.x0 = 960 - (CH.n * (CH.w + CH.g) - CH.g) / 2;
-CH.x = i => CH.x0 + i * (CH.w + CH.g);
-CH.types = ["bitmap", "list", "bitmap", "runs", "bitmap", "list", "bitmap", "runs"];
-CH.counts = [4812, 38, 4211, 2400, 5020, 12, 3877, 1950];
-CH.fill = (() => { const r = rng(9), dens = [0.7, 0.05, 0.6, 0.45, 0.8, 0.02, 0.6, 0.35];
-  return dens.map(d => Array.from({ length: 64 }, () => r() < d)); })();
-const ICON = { list: "[ 17, 402, … ]", bitmap: "▦ bitmap", runs: "▬▬ runs" };
-scene("how", root => {
-  const svg = svgLayer(root);
-  const chunks = [], pages = [], cons = [], badges = [], lines = [];
-  for (let c = 0; c < CH.n; c++) {
-    const e = mk(root, "", Object.assign(box(CH.x(c), CH.y, CH.w, CH.w), { borderRadius: "14px", border: "2px solid var(--line2)", background: "var(--panel)" }));
-    const ps = [];
-    for (let k = 0; k < 64; k++) ps.push(mk(e, "", Object.assign(box(12 + (k % 8) * 21.5, 12 + ((k / 8) | 0) * 21.5, 17, 17), { borderRadius: "3px", background: CH.fill[c][k] ? "rgba(247,176,60,.7)" : "#263043" })));
-    chunks.push(e); pages.push(ps);
-    lines.push(sv(svg, "line", { x1: CH.x(c) + CH.w / 2, y1: CH.y + CH.w, x2: CH.x(c) + CH.w / 2, y2: CH.cy, stroke: "#f7b03c", "stroke-width": 2, "stroke-dasharray": "4 5" }));
-    cons.push(mk(root, "center", Object.assign(box(CH.x(c), CH.cy, CH.w, 70), { borderRadius: "12px", border: "2px solid var(--amber)", background: "var(--amber-bg)", lineHeight: "66px", fontSize: "24px", fontWeight: 700, color: "var(--amber)" }), ICON[CH.types[c]]));
-    badges.push(mk(root, "center mono", Object.assign(box(CH.x(c) + CH.w / 2 - 72, CH.cy + 84, 144, 46), { lineHeight: "46px", fontSize: "27px", fontWeight: 700, borderRadius: "999px", background: "var(--amber)", color: "#1a1204" }), fmt(CH.counts[c])));
+// the lion, 16 x 16: M mane, F face, W muzzle, E eyes, N nose
+const LION_MAP = [
+  ".....MMMMMM.....",
+  "...MMMMMMMMMM...",
+  "..MMMMMMMMMMMM..",
+  ".MMMFFMMMMFFMMM.",
+  ".MMFFFFFFFFFFMM.",
+  "MMFFFFFFFFFFFFMM",
+  "MMFFFEFFFFEFFFMM",
+  "MMFFFEFFFFEFFFMM",
+  "MMFFFFFFFFFFFFMM",
+  "MMFFFFWNNWFFFFMM",
+  "MMMFFWWWWWWFFMMM",
+  ".MMFFFWWWWFFFMM.",
+  ".MMMFFFFFFFFMMM.",
+  "..MMMMFFFFMMMM..",
+  "...MMMMMMMMMM...",
+  ".....MMMMMM....."];
+const LCOL = { F: hex("#f8b84a"), W: hex("#ffe3a3"), E: hex("#1b2233"), N: hex("#5a2d14") };
+const LION = (() => { const px = [];
+  const at = (x, y) => y >= 0 && y < 16 && x >= 0 && x < 16 && LION_MAP[y][x] !== ".";
+  LION_MAP.forEach((row, y) => [...row].forEach((ch, x) => {
+    if (ch === ".") return;
+    let col = LCOL[ch];
+    if (ch === "M") col = (!at(x - 1, y) || !at(x + 1, y) || !at(x, y - 1) || !at(x, y + 1)) ? hex("#d9661a") : hex("#ee8a1e");
+    px.push({ gx: x, gy: y, col });
+  }));
+  return px; })();
+const LZ = { cx: 960, cy: 440, ps: 30 };          // the lion's place and pixel pitch in "Meet Lion"
+LION.forEach(p => { p.x = LZ.cx + (p.gx - 7.5) * LZ.ps; p.y = LZ.cy + (p.gy - 7.5) * LZ.ps; });
+// each lion pixel is one matching dot; the others fade on the way
+(() => {
+  const byX = MATCH.slice().sort((a, b) => a.x - b.x || a.y - b.y);
+  const lx = LION.map((p, n) => n).sort((a, b) => LION[a].x - LION[b].x || LION[a].y - LION[b].y);
+  lx.forEach((n, k) => { const d = byX[Math.floor(k * byX.length / lx.length)]; LION[n].dot = d; d.lion = LION[n]; });
+})();
+
+// the chunks: tiles of a 6 x 6 bitmap, 8 on screen and 16 more on the conveyor
+const T = { w: 180, gap: 26, y: 478, slots: 6, sq: 18, sg: 4, n: 24 };
+T.x0 = 960 - (8 * T.w + 7 * T.gap) / 2;
+T.pitch = T.w + T.gap;
+const TILES = (() => { const r = rng(5), out = [];
+  const counts = [4812, 3907, 5020, 4211, 2400, 4655, 3877, 4950];
+  for (let i = 0; i < T.n; i++) {
+    const fill = Array.from({ length: 36 }, () => r() < 0.72);
+    out.push({ i, fill, count: i < 8 ? counts[i] : 2300 + Math.floor(r() * 2900) });
   }
-  const top = mk(root, "", Object.assign(box(CH.x0, 140, 1500), { fontSize: "28px", color: "var(--muted)", fontWeight: 600 }), "the table, in chunks of 64 pages");
-  const key = mk(root, "mono", Object.assign(box(CH.x0 - 10, CH.cy - 52), { fontSize: "26px", color: "var(--amber)", background: "var(--bg)", padding: "4px 10px", borderRadius: "8px" }), "country = 'Japan'");
-  const cur = mk(root, "", Object.assign(box(0, CH.cy - 10, CH.w + 20, 154), { borderRadius: "16px", border: "3px solid #fff", boxSizing: "border-box" }));
-  const acc = mk(root, "card", box(260, 700, 760, 150));
-  mk(acc, "mono", Object.assign(box(40, 22), { fontSize: "26px", color: "var(--muted)" }), "count(*) = sum of the chunk counts");
-  const accN = mk(acc, "big mono", Object.assign(box(40, 62), { fontSize: "66px", color: "var(--amber)" }), "0");
-  const vs = mk(root, "", Object.assign(box(1080, 712), { fontSize: "40px", lineHeight: "1.55", fontWeight: 700 }),
-    "<span style='color:var(--amber)'>Lion:</span> 1 step per chunk<br><span style='color:var(--blue)'>B-tree:</span> 1 step per row");
-  const t1 = A("w1"), tc = wt("w1", "compressed bitmaps"), tk = wt("w1", "in chunks"), tn = wt("w1", "know their own counts"), t2 = A("w2");
-  const step = 0.24;
-  return t => {
-    show(top, t, t1 - 0.2, null, 10, 0.3);
-    chunks.forEach((e, i) => pop(e, t, t1 - 0.15 + i * 0.05, null, 0.35));
-    cons.forEach((e, i) => { pop(e, t, tc + i * 0.06, null, 0.35); lines[i].setAttribute("opacity", E.out(P(t, tc + i * 0.06, 0.3))); });
-    show(key, t, tc, null, 8, 0.3);
-    chunks.forEach((e, i) => { const hl = t > tk && t < tn + 0.3; e.style.borderColor = hl ? "var(--amber)" : "var(--line2)"; });
-    badges.forEach((e, i) => pop(e, t, tn + 0.1 + i * 0.07, null, 0.35));
-    show(acc, t, t2 - 0.2, null, 14, 0.3);
-    let n = 0, idx = -1;
-    for (let i = 0; i < CH.n; i++) if (t >= t2 + i * step + 0.12) n += CH.counts[i];
-    if (t >= t2 && t < t2 + CH.n * step + 0.3) idx = Math.min(CH.n - 1, Math.floor((t - t2) / step));
-    accN.textContent = fmt(n);
-    st(cur, idx >= 0 ? 1 : 0, idx >= 0 ? CH.x(idx) - 10 : 0, 0);
-    badges.forEach((b, i) => { b.style.background = idx >= i || (t > t2 + CH.n * step && t > t2) ? "#ffd27f" : "var(--amber)"; });
-    show(vs, t, wt("w2", "instead of walking rows") - 0.1, null, 14, 0.35);
-  };
-});
+  return out; })();
+// the lion's pixels fly into the first eight tiles, left pixels to left tiles
+(() => {
+  const order = LION.map((p, n) => n).sort((a, b) => LION[a].x - LION[b].x);
+  const per = order.length / 8, r = rng(8);
+  for (let k = 0; k < 8; k++) {
+    const mine = order.slice(Math.round(k * per), Math.round((k + 1) * per));
+    const slots = Array.from({ length: 36 }, (_, s) => s).sort(() => r() - 0.5).slice(0, mine.length).sort((a, b) => a - b);
+    TILES[k].fill = Array(36).fill(false);
+    mine.forEach((n, q) => { LION[n].tile = k; LION[n].slot = slots[q]; TILES[k].fill[slots[q]] = true; });
+  }
+})();
 
-/* numbers: 1.7 ms, 90x, and the other counts ------------------------------- */
-scene("numbers", root => {
-  const g1 = mk(root, "", box(0, 0, 1920, 1080));
-  const lab = mk(g1, "", Object.assign(box(150, 160), { fontSize: "30px", color: "var(--muted)", fontWeight: 600 }), "<span class=mono>count(*)</span>, 2,500,000 of 5,000,000 rows");
-  const big = mk(g1, "big", Object.assign(box(140, 210), { fontSize: "250px", lineHeight: "1", color: "var(--amber)" }), "1.7<span style='font-size:120px'> ms</span>");
-  const x90 = mk(g1, "", box(1130, 230, 700));
-  mk(x90, "big", { fontSize: "190px", lineHeight: "1", color: "var(--text)", position: "relative" }, "90×");
-  mk(x90, "", { fontSize: "42px", fontWeight: 600, color: "var(--muted)", position: "relative", marginTop: "10px" }, "faster than a B-tree");
-  const bars = [["B-tree", 157.0, "blue", "157 ms"], ["GIN", 665.0, "green", "665 ms"], ["Lion", 1.744, "amber", "1.7 ms"]].map(([n, v, c, s], i) => {
-    const y = 560 + i * 92;
-    mk(g1, "", Object.assign(box(150, y + 8, 160), { fontSize: "36px", fontWeight: 800, color: `var(--${c})` }), n);
-    const b = mk(g1, "", Object.assign(box(330, y, 0, 62), { borderRadius: "8px", background: `var(--${c})` }));
-    const l = mk(g1, "big", Object.assign(box(0, y + 8), { fontSize: "40px" }), s);
-    return { b, l, w: Math.max(8, 1180 * v / 665) };
-  });
-  const tiles = [["9×", "two equality filters", "vs B-tree", "Two filters"], ["24×", "GROUP BY, 200 groups", "vs B-tree", "GROUP BY"], ["168×", "array tag count", "vs GIN", "Array tags"]].map(([n, what, vs, ph], i) => {
-    const e = mk(root, "card", Object.assign(box(150 + i * 560, 250, 500, 440), { borderColor: "var(--amber)" }));
-    mk(e, "big", Object.assign(box(44, 40), { fontSize: "170px", lineHeight: "1", color: "var(--amber)" }), n);
-    mk(e, "", Object.assign(box(44, 250, 420), { fontSize: "36px", fontWeight: 700, lineHeight: "1.2" }), what);
-    mk(e, "", Object.assign(box(44, 350), { fontSize: "30px", color: vs === "vs GIN" ? "var(--green)" : "var(--blue)", fontWeight: 700 }), vs);
-    return { e, ph };
-  });
-  const foot = mk(root, "center", Object.assign(box(0, 760, 1920), { fontSize: "24px", color: "var(--dim)" }), "5M rows (200k documents for arrays) · vacuumed · PostgreSQL 18.6 · median of 3 runs");
-  const t1 = A("n1"), t2 = A("n2");
+/* ------------------------------------------------------------------ canvas */
+const cv = document.getElementById("world"), ctx = cv.getContext("2d");
+function rr(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+// a dot, or a square with rounded corners: s is the half size, k how square it is (0 circle, 1 square)
+function blob(x, y, s, k, fill) {
+  ctx.fillStyle = fill;
+  if (k <= 0.01) { ctx.beginPath(); ctx.arc(x, y, s, 0, 6.2832); ctx.fill(); return; }
+  rr(x - s, y - s, 2 * s, 2 * s, lerp(s, s * 0.28, k)); ctx.fill();
+}
+
+/* ------------------------------------------------------------------ beats */
+const BEATS = [];
+function beat(id, build) { const root = document.createElement("div"); root.className = "beat"; document.getElementById("beats").appendChild(root); BEATS.push({ id, root, draw: build(root) }); }
+
+// times the whole cast shares
+const TM = {};
+function times() {
+  TM.gridIn = SC.problem.start - 0.35;               // the rows fall into place
+  TM.match = TM.gridIn + 0.7;                        // half of them light up
+  TM.b0 = A("p1") + 0.9; TM.b1 = Z("p1");            // the B-tree counts them
+  TM.g0 = A("p2"); TM.gs0 = wt("p2", "still reads the table") - 0.2; TM.gs1 = Z("p2") - 0.1;
+  TM.fly0 = A("r1") - 0.5;                           // the matches fly into a lion
+  TM.roar = A("r1") + 0.95;
+  TM.pack0 = wt("w1", "compressed bitmaps") - 0.7;   // the lion packs into chunks
+  TM.band = TM.pack0 + 0.5;                         // the table's chunks, once the lion has begun to leave
+  TM.chunk = wt("w1", "chunk by chunk") - 0.1;
+  TM.knows = wt("w1", "already knows its count") - 0.1;
+  TM.c0 = A("w2") + 0.15; TM.c1 = TM.c0 + 2.7;        // the conveyor adds them up
+  TM.v0 = A("v1"); TM.check = wt("v1", "checked row by row") - 0.2; TM.exact = wt("v1", "always exact") - 0.1;
+  TM.clear = SC.payoff.start - 0.35;
+}
+times();
+const conv = t => 16 * T.pitch * E.io(P(t, TM.c0, TM.c1 - TM.c0));
+const tileX = (i, t) => T.x0 + i * T.pitch - conv(t);
+const slotXY = (i, s, t) => [tileX(i, t) + 26 + (s % 6) * (T.sq + T.sg) + T.sq / 2, T.y + 26 + ((s / 6) | 0) * (T.sq + T.sg) + T.sq / 2];
+// the tile under the check in "Pages that changed": the one nearest the middle once the conveyor stops
+const CHECK = (() => { let best = 0; for (let i = 0; i < T.n; i++) if (Math.abs(tileX(i, 1e9) + T.w / 2 - 960) < Math.abs(tileX(best, 1e9) + T.w / 2 - 960)) best = i; return best; })();
+
+function drawWorld(t) {
+  ctx.clearRect(0, 0, 1920, 1080);
+  const gone = E.io(P(t, TM.clear, 0.45));
+  if (t > SC.payoff.start + 0.3) return;
+
+  // the rows, until they fly
+  if (t < TM.fly0 + 1.6) {
+    const kB = MATCH.length * E.in(P(t, TM.b0, TM.b1 - TM.b0));
+    const sweepX = lerp(G.x0 - 60, G.x0 + G.cols * G.sp + 40, E.io(P(t, TM.gs0, TM.gs1 - TM.gs0)));
+    for (const d of DOTS) {
+      const fall = E.out(P(t, TM.gridIn + d.c * 0.012 + d.j * 0.25, 0.5));
+      if (fall <= 0) continue;
+      let x = d.x, y = d.y - (1 - fall) * 120, s = G.r, col, a = fall;
+      if (!d.m) {
+        col = mix(C.grey, C.grey, 0);
+        const f = E.io(P(t, TM.fly0 - 0.2 + d.j * 0.2, 0.4)); s *= 1 - f; a *= 1 - f;
+      } else {
+        const lit = E.out(P(t, TM.match + d.c * 0.015 + d.j * 0.2, 0.3));
+        col = mix(C.grey, C.lion, lit);
+        // the B-tree's count, one by one, blue; then back to amber for GIN
+        const blue = d.k < kB ? 1 - E.io(P(t, TM.g0 - 0.2, 0.35)) : 0;
+        if (blue > 0) col = mix(C.lion, C.blue, blue);
+        // GIN: the list of matches flashes, then the table is read page by page
+        const flash = Math.max(0, 1 - Math.abs(t - (TM.g0 + 0.45)) / 0.35);
+        if (flash > 0) s *= 1 + 0.25 * flash;
+        const green = d.x < sweepX && t > TM.gs0 ? 1 - E.io(P(t, TM.fly0 - 0.6, 0.35)) : 0;
+        if (green > 0) col = mix(C.lion, C.green, green);
+        if (Math.abs(d.x - sweepX) < 26 && t > TM.gs0 && t < TM.gs1) s *= 1.25;
+        if (d.lion) {
+          // fly into the lion: a dot becomes a pixel
+          const p = d.lion, f = E.io(P(t, TM.fly0 + (p.x - 720) / 480 * 0.35 + d.j * 0.1, 0.9));
+          if (f > 0) {
+            x = lerp(d.x, p.x, f); y = lerp(d.y, p.y, f) - Math.sin(f * Math.PI) * 60;
+            s = lerp(G.r, LZ.ps / 2 - 2, f);
+            col = mix(C.lion, p.col, f);
+            if (f >= 1) continue;               // the lion takes it from here
+            blob(x, y, s, f, col); continue;
+          }
+        } else {
+          const f = E.io(P(t, TM.fly0 + d.j * 0.3, 0.7));
+          if (f > 0) { x = lerp(d.x, LZ.cx, f); y = lerp(d.y, LZ.cy, f); s *= 1 - f; a *= 1 - f; }
+        }
+      }
+      if (s <= 0.2 || a <= 0.01) continue;
+      ctx.globalAlpha = a; blob(x, y, s, 0, col); ctx.globalAlpha = 1;
+      // the B-tree's cursor
+    }
+    if (t > TM.b0 && t < TM.b1 + 0.3) {
+      const k = Math.min(MATCH.length - 1, Math.floor(kB));
+      const d = MATCH[k];
+      ctx.strokeStyle = "#3867f4"; ctx.lineWidth = 4;
+      ctx.globalAlpha = 1 - P(t, TM.b1, 0.3);
+      ctx.beginPath(); ctx.arc(d.x, d.y, 15, 0, 6.2832); ctx.stroke(); ctx.globalAlpha = 1;
+    }
+    if (t > TM.gs0 && t < TM.gs1 + 0.2) {
+      ctx.fillStyle = "rgba(18,160,106,.14)";
+      ctx.globalAlpha = 1 - P(t, TM.gs1, 0.2);
+      rr(sweepX - 26, G.y0 - 22, 52, (G.rows - 1) * G.sp + 44, 12); ctx.fill(); ctx.globalAlpha = 1;
+    }
+  }
+
+  // the lion, then its pixels packing into chunks
+  if (t >= TM.fly0 + 0.4) {
+    const roar = Math.sin(clamp((t - TM.roar) / 0.5) * Math.PI) * 0.07;
+    // rings
+    for (let q = 0; q < 3; q++) {
+      const rp = P(t, TM.roar + q * 0.13, 0.9);
+      if (rp > 0 && rp < 1) {
+        ctx.strokeStyle = "rgba(245,158,11," + (0.45 * (1 - rp)) + ")"; ctx.lineWidth = 6 * (1 - rp) + 1;
+        ctx.beginPath(); ctx.arc(LZ.cx, LZ.cy, 250 + rp * 330, 0, 6.2832); ctx.stroke();
+      }
+    }
+    // the chunk band and the tiles appear under the flying pixels
+    drawChunks(t, gone);
+    for (const p of LION) {
+      const d = p.dot, arrive = TM.fly0 + (p.x - 720) / 480 * 0.35 + d.j * 0.1 + 0.9;
+      if (t < arrive) continue;
+      const k = p.tile, f = E.io(P(t, TM.pack0 + k * 0.09 + (p.gy / 16) * 0.25, 0.8));
+      const sc = 1 + roar;
+      let x = LZ.cx + (p.x - LZ.cx) * sc, y = LZ.cy + (p.y - LZ.cy) * sc, s = (LZ.ps / 2 - 2) * sc, col = mix(p.col, p.col, 0);
+      if (f > 0) {
+        const [tx, ty] = slotXY(k, p.slot, t);
+        x = lerp(x, tx, f); y = lerp(y, ty, f) - Math.sin(f * Math.PI) * 80;
+        s = lerp(s, T.sq / 2, f); col = mix(p.col, C.lion, f);
+      }
+      ctx.globalAlpha = 1 - gone;
+      blob(x, y, s, 1, col);
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+function drawChunks(t, gone) {
+  const tileIn = i => TM.pack0 - 0.1 + i * 0.06;
+  const band = E.out(P(t, TM.band, 0.6));
+  const vdim = E.io(P(t, TM.v0 - 0.2, 0.4));
+  for (let i = 0; i < T.n; i++) {
+    const x = tileX(i, t);
+    if (x > 1920 || x + T.w < 0) continue;
+    const onConveyor = i >= 8;
+    const tin = onConveyor ? 1 : E.back(P(t, tileIn(i), 0.45));
+    const a = (onConveyor ? (t > TM.c0 ? 1 : 0) : clamp(P(t, tileIn(i), 0.45) * 2.2)) * (1 - gone);
+    if (a <= 0) continue;
+    const dim = i === CHECK ? 1 : 1 - 0.55 * vdim;
+    ctx.globalAlpha = a * dim;
+    // the chunk of the table above the tile
+    if (band > 0) {
+      const bx = x, by = 300, bw = T.w * (onConveyor ? 1 : clamp(band * 1.6 - i * 0.08)), hl = t > TM.chunk + i * 0.12 && t < TM.knows + 0.4;
+      if (bw > 4) {
+        ctx.fillStyle = hl ? "#fff1d6" : "#ffffff"; rr(bx, by, bw, 76, 14); ctx.fill();
+        ctx.strokeStyle = hl ? "#f59e0b" : "#dce2ec"; ctx.lineWidth = 2; rr(bx, by, bw, 76, 14); ctx.stroke();
+        for (let q = 0; q < 8; q++) {
+          const px = bx + 16 + q * 20; if (px + 12 > bx + bw) break;
+          const changed = i === CHECK && q === 5 && t > TM.v0 + 0.2;
+          ctx.fillStyle = changed ? "#ef5a38" : hl ? "#f5b54a" : "#d6dce8"; rr(px, by + 18, 12, 40, 4); ctx.fill();
+        }
+        // a dashed link down to the tile
+        ctx.strokeStyle = hl ? "#f59e0b" : "#c7cfdc"; ctx.setLineDash([5, 6]); ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(bx + T.w / 2, by + 76); ctx.lineTo(bx + T.w / 2, T.y); ctx.stroke(); ctx.setLineDash([]);
+      }
+    }
+    // the tile: a white card holding a 6 x 6 bitmap
+    const s = tin, cx = x + T.w / 2, cy = T.y + T.w / 2;
+    ctx.save(); ctx.translate(cx, cy); ctx.scale(s, s); ctx.translate(-cx, -cy);
+    ctx.shadowColor = "rgba(20,30,60,.12)"; ctx.shadowBlur = 24; ctx.shadowOffsetY = 8;
+    ctx.fillStyle = "#ffffff"; rr(x, T.y, T.w, T.w, 20); ctx.fill();
+    ctx.shadowColor = "transparent";
+    if (i === CHECK && t > TM.v0 + 0.2) { ctx.strokeStyle = "#ef5a38"; ctx.lineWidth = 4; rr(x, T.y, T.w, T.w, 20); ctx.stroke(); }
+    for (let q = 0; q < 36; q++) {
+      const [sx, sy] = slotXY(i, q, t);
+      // the first eight tiles' bits are the lion's pixels, drawn as they land
+      if (TILES[i].fill[q] && onConveyor) blob(sx, sy, T.sq / 2, 1, "#f59e0b");
+      else if (!TILES[i].fill[q]) blob(sx, sy, T.sq / 2, 1, "#eef1f6");
+    }
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* hook: every dashboard asks how many ------------------------------------ */
+beat("hook", root => {
+  const w1 = mk(root, "card", Object.assign(box(250, 200, 420, 200), { padding: "30px 36px", boxSizing: "border-box" }),
+    "<div style='font-size:22px;color:var(--muted);font-weight:600'>Matching events</div><div class=brico style='font-size:72px;font-weight:800;margin-top:10px'>2,500,000</div>");
+  const w2 = mk(root, "card", Object.assign(box(1180, 180, 520, 110), { display: "flex", gap: "14px", alignItems: "center", padding: "0 28px", boxSizing: "border-box" }),
+    "<span style='font-size:30px;color:var(--faint)'>⌕</span><span class=pill style='background:var(--lion-pale);color:#9a5a00;font-size:22px'>country: Japan</span><span class=pill style='background:#fde4ee;color:#b02a5b;font-size:22px'>type: purchase</span>");
+  const bars = [0.95, 0.4, 0.25, 0.18, 0.1];
+  const w3 = mk(root, "card", Object.assign(box(330, 600, 470, 260), { padding: "28px 34px", boxSizing: "border-box" }),
+    "<div style='font-size:22px;color:var(--muted);font-weight:600'>Events by country</div>");
+  const barEls = bars.map((v, i) => mk(w3, "", Object.assign(box(34 + i * 82, 230, 56, 0), { borderRadius: "10px 10px 4px 4px", background: i ? "#fbd38d" : "var(--lion)" })));
+  const w4 = mk(root, "card", Object.assign(box(1230, 640, 400, 120), { display: "flex", alignItems: "center", gap: "18px", padding: "0 30px", boxSizing: "border-box" }),
+    "<span class=pill style='background:var(--blue);color:#fff;font-size:26px'>12,408</span><span style='font-size:26px;font-weight:600'>new since yesterday</span>");
+  const head = mk(root, "center brico", Object.assign(box(0, 400, 1920), { fontSize: "140px", fontWeight: 800, lineHeight: "1" }),
+    "<span style='color:var(--lion)'>How many</span> rows match?");
+  const ws = [w1, w2, w3, w4];
+  const th = wt("h1", "how many rows match") - 0.25;
   return t => {
-    const out1 = t2 - 0.25;
-    show(g1, t, SC.numbers.start, out1, 0, 0.2);
-    show(lab, t, t1 - 0.1, null, 8, 0.3);
-    const p = P(t, wt("n1", "1.7") - 0.1, 0.45);
-    st(big, clamp(p * 2.5), 0, 0, lerp(0.8, 1, E.back(p)));
-    bars.forEach((b, i) => {
-      const q = E.out(P(t, t1 + 0.2 + i * 0.25, 0.6));
-      b.b.style.width = (b.w * q) + "px"; b.l.style.left = (350 + b.w * q) + "px"; st(b.l, q);
+    ws.forEach((e, i) => {
+      const a = 0.2 + i * 0.35, p = P(t, a, 0.5), q = E.io(P(t, th - 0.1, 0.5));
+      const cx = parseFloat(e.style.left) + parseFloat(e.style.width) / 2, cy = parseFloat(e.style.top) + 60;
+      st(e, clamp(p * 2.2) * (1 - q), (960 - cx) * q * 0.6, (470 - cy) * q * 0.6 + Math.sin(t * 1.4 + i * 1.7) * 6, lerp(0.7, 1, E.back(p)) * (1 - 0.5 * q));
     });
-    const q = P(t, A("n1", 1) - 0.1, 0.45);
-    st(x90, clamp(q * 2.5), 0, 0, lerp(0.7, 1, E.back(q)));
-    tiles.forEach(o => { const r = P(t, wt("n2", o.ph) - 0.15, 0.4); st(o.e, clamp(r * 2.5), 0, (1 - E.out(r)) * 40, lerp(0.9, 1, E.back(r))); });
-    show(foot, t, t2 + 0.3, null, 6, 0.4);
+    barEls.forEach((b, i) => { b.style.height = (150 * bars[i] * E.out(P(t, 1.1 + i * 0.1, 0.6))) + "px"; b.style.top = (230 - 150 * bars[i] * E.out(P(t, 1.1 + i * 0.1, 0.6))) + "px"; });
+    const hp = P(t, th, 0.5), up = E.io(P(t, SC.problem.start - 0.6, 0.6));
+    st(head, clamp(hp * 2.2) * (1 - up), 0, -up * 230, lerp(0.8, 1, E.back(hp)) * lerp(1, 0.45, up));
   };
 });
 
-/* drop-in: it's just an index ---------------------------------------------- */
-scene("dropin", root => {
-  const head = mk(root, "center big", Object.assign(box(0, 140, 1920), { fontSize: "88px" }), "It's just an <span style='color:var(--amber)'>index</span>.");
-  const code = mk(root, "card", box(260, 300, 1400, 250));
-  const lines = [
-    "<span class=kw>CREATE EXTENSION</span> pg_lion;",
-    "<span class=kw>CREATE INDEX ON</span> events <span class=kw>USING</span> lion (country);",
-    "<span class=kw>VACUUM</span> (<span class=kw>ANALYZE</span>) events;"].map((l, i) => mk(code, "code", Object.assign(box(50, 40 + i * 60), { fontSize: "36px" }), l));
-  const q = mk(root, "card", box(260, 580, 1400, 250));
-  mk(q, "code", Object.assign(box(50, 40), { fontSize: "34px" }), "<span class=kw>SELECT</span> <span class=fn>count</span>(*) <span class=kw>FROM</span> events <span class=kw>WHERE</span> country = <span class=str>'Japan'</span>;");
-  mk(q, "", Object.assign(box(50, 112), { fontSize: "28px", color: "var(--muted)" }), "the query you already have, now planned as");
-  const plan = mk(q, "mono", Object.assign(box(50, 160), { fontSize: "34px", fontWeight: 700, color: "var(--amber)", border: "3px solid var(--amber)", borderRadius: "12px", padding: "6px 18px" }), "Custom Scan (LionCount)");
-  const t1 = A("d1"), t2 = A("d1", 1);
-  const at = [wt("d1", "Create it") - 0.1, wt("d1", "Create it") + 0.35, wt("d1", "VACUUM") - 0.1];
+/* problem: B-tree counts one at a time, GIN reads the table --------------- */
+beat("problem", root => {
+  const lab = mk(root, "", Object.assign(box(G.x0 - 8, 262), { fontSize: "24px", fontWeight: 700 }), "events <span style='color:var(--muted);font-weight:500'>· 5,000,000 rows</span>");
+  const leg = mk(root, "", Object.assign(box(G.x0 + (G.cols - 1) * G.sp - 400 + 8, 262, 400), { fontSize: "22px", color: "var(--muted)", textAlign: "right" }),
+    "<span style='color:var(--lion)'>●</span> matches &nbsp; ● = 6,250 rows");
+  const panel = mk(root, "card", box(1345, 300, 330, 540));
+  const row = (y, name, col, pale) => {
+    const g = mk(panel, "", box(0, y, 330, 250));
+    mk(g, "pill", Object.assign(box(32, 30), { fontSize: "26px", background: `var(--${pale})`, color: `var(--${col})` }), name);
+    const n = mk(g, "mono", Object.assign(box(34, 96), { fontSize: "22px", color: "var(--muted)" }), "");
+    const tm = mk(g, "brico", Object.assign(box(32, 134), { fontSize: "72px", fontWeight: 800, color: `var(--${col})`, lineHeight: "1" }), "");
+    return { g, n, tm };
+  };
+  const B = row(0, "B-tree", "blue", "blue-pale"), Gn = row(270, "GIN", "green", "green-pale");
+  mk(panel, "", Object.assign(box(32, 268, 266, 2), { background: "var(--line)" }));
+  const steps = mk(root, "", Object.assign(box(G.x0 - 8, 846), { fontSize: "24px", color: "var(--blue)", fontWeight: 700 }), "one step per matching row");
+  const sql = mk(root, "card code center", Object.assign(box(470, 170, 980, 76), { fontSize: "32px", lineHeight: "76px", borderRadius: "999px" }),
+    "<span class=kw>SELECT</span> <span class=fn>count</span>(*) <span class=kw>FROM</span> events <span class=kw>WHERE</span> country = <span class=str>'Japan'</span>");
   return t => {
-    const p = P(t, t1 - 0.1, 0.4);
-    st(head, clamp(p * 2.5), 0, 0, lerp(0.85, 1, E.back(p)));
-    show(code, t, t2 - 0.2, null, 20, 0.35);
-    lines.forEach((l, i) => { const r = P(t, at[i], 0.45); l.style.clipPath = `inset(0 ${100 - r * 100}% 0 0)`; st(l, r > 0 ? 1 : 0); });
-    show(q, t, wt("d1", "Postgres uses it") - 0.2, null, 20, 0.35);
-    pop(plan, t, wt("d1", "count queries") - 0.1, null, 0.4);
+    const sp = E.out(P(t, SC.problem.start - 0.3, 0.5)), so = E.io(P(t, TM.fly0 - 0.3, 0.4));
+    st(sql, sp * (1 - so), 0, (1 - sp) * 20, 1);
+    const out = E.io(P(t, TM.fly0 - 0.4, 0.4));
+    [lab, leg].forEach(e => { const p = E.out(P(t, TM.gridIn + 0.3, 0.4)); st(e, p * (1 - out), 0, (1 - p) * 10); });
+    const pp = E.out(P(t, TM.b0 - 0.5, 0.45));
+    st(panel, pp * (1 - out), (1 - pp) * 60 + out * 80, 0);
+    const kB = MATCH.length * E.in(P(t, TM.b0, TM.b1 - TM.b0));
+    B.n.textContent = "count(*) = " + fmt(2500000 * kB / MATCH.length);
+    B.tm.textContent = t > TM.b1 - 0.05 ? "157 ms" : "…";
+    st(B.tm, t > TM.b1 - 0.05 ? E.back(P(t, TM.b1 - 0.05, 0.4)) : 0.5, 0, 0, t > TM.b1 - 0.05 ? lerp(0.6, 1, E.back(P(t, TM.b1 - 0.05, 0.4))) : 1);
+    show(steps, t, TM.b0 + 0.4, TM.g0 - 0.3, 8);
+    const g = P(t, TM.gs0, TM.gs1 - TM.gs0);
+    st(Gn.g, lerp(0.35, 1, E.out(P(t, TM.g0 - 0.2, 0.3))));
+    Gn.n.textContent = t < TM.g0 ? "" : "count(*) = " + fmt(2500000 * E.io(g));
+    Gn.tm.textContent = t > TM.gs1 - 0.05 ? "665 ms" : t > TM.g0 ? "…" : "";
+    st(Gn.tm, t > TM.gs1 - 0.05 ? 1 : 0.5, 0, 0, t > TM.gs1 - 0.05 ? lerp(0.6, 1, E.back(P(t, TM.gs1 - 0.05, 0.4))) : 1);
   };
 });
 
-/* fit: keep B-tree and GIN, add Lion where you count ----------------------- */
-scene("fit", root => {
-  const cards = [["B-tree", "blue", ["lookups", "ORDER BY … LIMIT", "UNIQUE keys"], "B-trees"],
-    ["GIN", "green", ["full-text search", "JSONB documents", "phrase and prefix"], "GIN for text"],
-    ["Lion", "amber", ["count(*)", "filters combined", "GROUP BY"], "Add Lion"]].map(([n, c, items, ph], i) => {
-    const e = mk(root, "card", Object.assign(box(150 + i * 560, 250, 500, 400), { borderColor: `var(--${c})`, borderWidth: "2px" }));
-    mk(e, "", Object.assign(box(48, 40), { fontSize: "72px", fontWeight: 800, color: `var(--${c})` }), n);
-    mk(e, "", Object.assign(box(48, 160, 420), { fontSize: "38px", lineHeight: "1.7", fontWeight: 600 }), items.map(x => `<span style='color:var(--${c})'>•</span> ${x}`).join("<br>"));
-    return { e, ph, c };
-  });
-  const keep = mk(root, "center", Object.assign(box(0, 150, 1920), { fontSize: "40px", fontWeight: 700, color: "var(--muted)" }), "Keep the indexes you have. Add Lion where you count.");
+/* reveal: meet Lion -------------------------------------------------------- */
+beat("reveal", root => {
+  const word = mk(root, "center brico", Object.assign(box(0, 700, 1920), { fontSize: "124px", fontWeight: 800, lineHeight: "1" }),
+    "<span style='color:#8a94a8'>pg_</span><span style='color:var(--lion)'>lion</span>");
+  const tag = mk(root, "center", Object.assign(box(0, 850, 1920), { fontSize: "36px", fontWeight: 600, color: "var(--muted)" }),
+    "a <span style='color:var(--lion-deep)'>roaring-bitmap</span> index for Postgres");
   return t => {
-    show(keep, t, SC.fit.start + 0.1, null, 10, 0.3);
-    cards.forEach((o, i) => {
-      const a = wt("f1", o.ph) - 0.15, r = P(t, a, 0.4);
-      st(o.e, clamp(r * 2.5), 0, (1 - E.out(r)) * 40, lerp(0.92, 1, E.back(r)));
-      if (i === 2) o.e.style.boxShadow = t > a + 0.3 ? "0 0 0 6px rgba(247,176,60,.18), 0 0 60px rgba(247,176,60,.25)" : "none";
+    pop(word, t, TM.roar - 0.1, TM.pack0 - 0.3, 0.5, 0.7);
+    show(tag, t, TM.roar + 0.25, TM.pack0 - 0.3, 14);
+  };
+});
+
+/* how: chunks that know their count, added up; changed pages checked -------- */
+beat("how", root => {
+  const bandLab = mk(root, "", Object.assign(box(T.x0, 254), { fontSize: "26px", fontWeight: 700 }), "the table, <span style='color:var(--lion-deep)'>chunk by chunk</span>");
+  const badges = TILES.map((tl, i) => mk(root, "center mono", Object.assign(box(0, T.y + T.w + 16, 140, 44), { lineHeight: "44px", fontSize: "25px", fontWeight: 700, borderRadius: "999px", background: "var(--lion)", color: "#fff" }), fmt(tl.count)));
+  const total = mk(root, "card", Object.assign(box(700, 760, 520, 120), { padding: "18px 34px", boxSizing: "border-box" }));
+  mk(total, "mono", { fontSize: "22px", color: "var(--muted)", position: "relative" }, "count(*) = the sum of the chunks");
+  const totalN = mk(total, "brico", { fontSize: "54px", fontWeight: 800, color: "var(--lion-deep)", position: "relative", lineHeight: "1.1" }, "0");
+  const exact = mk(total, "pill", Object.assign(box(360, 60), { fontSize: "22px", background: "var(--green-pale)", color: "var(--green)" }), "✓ exact");
+  const arrow = mk(root, "center", Object.assign(box(940, T.y + T.w + 66, 40), { fontSize: "30px", color: "var(--lion-deep)" }), "▼");
+  // the recheck
+  const call = mk(root, "card", box(460, 120, 1000, 140));
+  mk(call, "", Object.assign(box(36, 26), { fontSize: "28px", fontWeight: 700, color: "var(--red)" }), "Changed since the last VACUUM");
+  mk(call, "", Object.assign(box(36, 76), { fontSize: "22px", color: "var(--muted)" }), "checked in the table, row by row");
+  const rowsV = [1, 1, 1, 0, 1, 1, 1, 1];
+  const rowEls = rowsV.map((v, i) => mk(call, "center", Object.assign(box(530 + i * 56, 45, 46, 46), { borderRadius: "50%", lineHeight: "46px", fontSize: "24px", fontWeight: 800, background: "#eef1f6" }), ""));
+  // real sums while the tiles pass, then the rest of the table
+  const passT = TILES.map((tl, i) => { // when tile i's middle passes the arrow
+    for (let k = 0; k <= 200; k++) { const tt = TM.c0 - 0.2 + k * 0.02; if (tileX(i, tt) + T.w / 2 < 960) return tt; }
+    return 1e9; });
+  const counted = (i, t) => t >= Math.max(passT[i], TM.c0 - 0.1 + i * 0.12);
+  const finalReal = TILES.reduce((s, tl, i) => s + (passT[i] < 1e8 ? tl.count : 0), 0);
+  return t => {
+    const gone = E.io(P(t, TM.clear, 0.45));
+    show(bandLab, t, TM.band, TM.v0 - 0.2, 10);
+    badges.forEach((b, i) => {
+      const x = tileX(i, t) + T.w / 2 - 70;
+      if (x < -200 || x > 2100) { st(b, 0); return; }
+      const a = i < 8 ? P(t, TM.knows + i * 0.07, 0.4) : (t > TM.c0 ? 1 : 0);
+      b.style.left = x + "px";
+      const c = counted(i, t) && t < TM.c1 + 0.2;
+      b.style.background = counted(i, t) ? "var(--lion-deep)" : "var(--lion)";
+      st(b, clamp(a * 2.2) * (1 - gone) * (i === CHECK ? 1 : 1 - 0.55 * E.io(P(t, TM.v0 - 0.2, 0.4))), 0, 0, lerp(0.6, 1, E.back(a)) * (c ? 1.06 : 1));
+    });
+    show(total, t, TM.c0 - 0.5, TM.clear, 16);
+    show(arrow, t, TM.c0 - 0.4, TM.clear, 6);
+    let real = 0; TILES.forEach((tl, i) => { if (counted(i, t)) real += tl.count; });
+    const rest = (2500000 - finalReal) * Math.pow(P(t, TM.c0, TM.c1 - TM.c0 + 0.1), 2.2);
+    totalN.textContent = fmt(t < TM.c0 - 0.1 ? 0 : real + rest);
+    pop(exact, t, TM.exact, null, 0.4);
+    show(call, t, TM.v0 + 0.1, TM.clear, 16);
+    rowEls.forEach((e, i) => {
+      const a = TM.check + i * ((TM.exact - TM.check - 0.2) / rowsV.length);
+      const done = t >= a;
+      e.textContent = done ? (rowsV[i] ? "✓" : "✗") : "";
+      e.style.background = done ? (rowsV[i] ? "var(--green-pale)" : "var(--red-pale)") : "#eef1f6";
+      e.style.color = rowsV[i] ? "var(--green)" : "var(--red)";
     });
   };
 });
 
-/* end: try it -------------------------------------------------------------- */
-scene("end", root => {
-  const r = rng(7), cols = 16, rows = 3, cs = 30, gap = 8;
-  const gx = 960 - (cols * (cs + gap) - gap) / 2;
-  const cells = [];
-  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++)
-    cells.push({ e: mk(root, "", Object.assign(box(gx + i * (cs + gap), 190 + j * (cs + gap), cs, cs), { borderRadius: "6px", background: r() < 0.46 ? "var(--amber)" : "#1a2130" })), i });
-  const word = mk(root, "center big", Object.assign(box(0, 340, 1920), { fontSize: "190px", lineHeight: "1" }),
-    '<span style="color:#7d889c">pg_</span><span style="color:var(--amber)">lion</span>');
-  const tag = mk(root, "center", Object.assign(box(0, 570, 1920), { fontSize: "56px", fontWeight: 700 }), "Try it on your data.");
-  const url = mk(root, "center mono", Object.assign(box(0, 668, 1920), { fontSize: "34px", color: "var(--muted)" }), "github.com/cgkanchi/pg_lion");
-  const fine = mk(root, "center", Object.assign(box(360, 770, 1200), { fontSize: "21px", lineHeight: "1.5", color: "var(--dim)" }),
+/* payoff: the race ---------------------------------------------------------- */
+beat("payoff", root => {
+  const lanes = [["B-tree", 157.0, "blue", "157 ms"], ["GIN", 665.0, "green", "665 ms"], ["Lion", 1.744, "lion", "1.7 ms"]];
+  const L0 = 400, L1 = 1560, rs = A("n1") + 0.25, dur = 2.3;
+  const els = lanes.map(([n, v, c, s], i) => {
+    const y = 220 + i * 118;
+    const lab = mk(root, "brico", Object.assign(box(170, y + 6), { fontSize: "46px", fontWeight: 800, color: `var(--${c === "lion" ? "lion-deep" : c})` }), n);
+    const track = mk(root, "", Object.assign(box(L0, y + 8, L1 - L0, 56), { borderRadius: "14px", background: "#e6eaf2" }));
+    const bar = mk(root, "", Object.assign(box(L0, y + 8, 0, 56), { borderRadius: "14px", background: `var(--${c})` }));
+    const chip = mk(root, "brico", Object.assign(box(0, y + 4), { fontSize: "46px", fontWeight: 800, color: "var(--ink)" }), s + (c === "lion" ? " <span style='color:var(--green)'>✓</span>" : ""));
+    const w = Math.max(10, (L1 - L0) * v / 665);
+    return { lab, track, bar, chip, w, done: rs + dur * v / 665 };
+  });
+  const axis = mk(root, "", Object.assign(box(L0, 572, L1 - L0), { fontSize: "22px", color: "var(--muted)", textAlign: "right" }), "time to count 2,500,000 of 5,000,000 rows →");
+  const big = mk(root, "center", Object.assign(box(0, 650, 1920), { lineHeight: "1" }),
+    "<span class=brico style='font-size:190px;font-weight:800;color:var(--lion)'>90×</span> <span class=brico style='font-size:64px;font-weight:700'>faster than a B-tree</span>");
+  const foot = mk(root, "center", Object.assign(box(0, 866, 1920), { fontSize: "22px", color: "var(--faint)" }), "vacuumed table · PostgreSQL 18.6 · median of 3 runs");
+  return t => {
+    const inn = SC.payoff.start - 0.1;
+    els.forEach((e, i) => {
+      show(e.lab, t, inn + i * 0.08, SC.payoff.end - 0.25, 14, 0.35);
+      show(e.track, t, inn + i * 0.08, SC.payoff.end - 0.25, 14, 0.35);
+      const g = P(t, rs, Math.max(0.05, e.done - rs));
+      e.bar.style.width = (e.w * g) + "px";
+      show(e.bar, t, inn + i * 0.08, SC.payoff.end - 0.25, 14, 0.35);
+      e.chip.style.left = (L0 + e.w + 24) + "px";
+      const cp = pop(e.chip, t, e.done, SC.payoff.end - 0.25, 0.4);
+      if (i === 2) { const pulse = Math.max(0, 1 - Math.abs(t - wt("n1", "1.7")) / 0.25); e.chip.style.transform += ` scale(${1 + 0.12 * pulse})`; }
+    });
+    show(axis, t, rs, SC.payoff.end - 0.25, 6);
+    pop(big, t, wt("n1", "90×") - 0.1, SC.payoff.end - 0.25, 0.5, 0.7);
+    show(foot, t, wt("n1", "90×") + 0.4, SC.payoff.end - 0.25, 6);
+  };
+});
+
+/* more: filters, GROUP BY, joins, partitions -------------------------------- */
+beat("more", root => {
+  const items = [["Combined filters", "9× vs B-tree", "Combined filters"], ["GROUP BY", "24× vs B-tree", "GROUP BY"],
+    ["Joins", "counted across the join", "joins"], ["Partitioned tables", "each partition's own index", "partitioned tables"]];
+  const cw = 380, gap = 30, x0 = 960 - (4 * cw + 3 * gap) / 2;
+  const cards = items.map(([title, sub, ph], i) => {
+    const e = mk(root, "card", box(x0 + i * (cw + gap), 250, cw, 440));
+    mk(e, "brico", Object.assign(box(34, 282, cw - 60), { fontSize: "40px", fontWeight: 800, lineHeight: "1.05" }), title);
+    mk(e, "", Object.assign(box(34, 380, cw - 60), { fontSize: "24px", fontWeight: 600, color: i < 2 ? "var(--lion-deep)" : "var(--muted)" }), sub);
+    const g = mk(e, "", box(30, 30, cw - 60, 220));
+    return { e, g, ph };
+  });
+  // 1: two sets overlap
+  const gA = [], gB = [], r = rng(3);
+  const fA = Array.from({ length: 25 }, () => r() < 0.55), fB = Array.from({ length: 25 }, () => r() < 0.5);
+  for (let k = 0; k < 25; k++) {
+    gA.push(mk(cards[0].g, "", Object.assign(box(20 + (k % 5) * 26, 40 + ((k / 5) | 0) * 26, 22, 22), { borderRadius: "5px", background: fA[k] ? "var(--lion)" : "#eef1f6" })));
+    gB.push(mk(cards[0].g, "", Object.assign(box(170 + (k % 5) * 26, 40 + ((k / 5) | 0) * 26, 22, 22), { borderRadius: "5px", background: fB[k] ? "var(--pink)" : "#eef1f6" })));
+  }
+  // 2: bars
+  const hs = [0.9, 0.62, 0.45, 0.3, 0.2];
+  const barsE = hs.map((h, k) => mk(cards[1].g, "", Object.assign(box(24 + k * 58, 0, 42, 0), { borderRadius: "10px 10px 4px 4px", background: k ? "#fbd38d" : "var(--lion)" })));
+  // 3: two tables and a link
+  const tA = mk(cards[2].g, "", Object.assign(box(10, 50, 120, 140), { borderRadius: "14px", border: "3px solid var(--ink)", boxSizing: "border-box" }), "<div style='height:30px;background:var(--ink)'></div>");
+  const tB = mk(cards[2].g, "", Object.assign(box(190, 70, 120, 110), { borderRadius: "14px", border: "3px solid var(--lion)", boxSizing: "border-box" }), "<div style='height:30px;background:var(--lion)'></div>");
+  const link = mk(cards[2].g, "", Object.assign(box(130, 124, 60, 4), { background: "var(--faint)" }));
+  const pkt = mk(cards[2].g, "", Object.assign(box(126, 116, 20, 20), { borderRadius: "50%", background: "var(--lion)" }));
+  // 4: partitions
+  const parts = [0, 1, 2, 3].map(k => mk(cards[3].g, "", Object.assign(box(20 + k * 14, 20 + k * 44, 220, 64), { borderRadius: "12px", background: "#fff", border: "2.5px solid var(--line)", boxSizing: "border-box" })));
+  const pbad = [0, 1, 2, 3].map(k => mk(cards[3].g, "center mono", Object.assign(box(250 + k * 14, 34 + k * 44, 64, 36), { borderRadius: "999px", background: "var(--lion)", color: "#fff", fontSize: "18px", fontWeight: 700, lineHeight: "36px" }), ["412k", "388k", "901k", "799k"][k]));
+  return t => {
+    const out = SC.more.end - 0.25;
+    cards.forEach(o => { const a = wt("b1", o.ph) - 0.2, p = P(t, a, 0.45); st(o.e, clamp(p * 2.2) * (1 - E.io(P(t, out, 0.3))), 0, (1 - E.out(p)) * 50, lerp(0.85, 1, E.back(p))); });
+    // animate the glyphs
+    const a0 = wt("b1", "Combined filters"), slideP = E.io(P(t, a0 + 0.4, 0.7));
+    gA.forEach((e, k) => { e.style.transform = `translateX(${slideP * 75}px)`; });
+    gB.forEach((e, k) => { e.style.transform = `translateX(${-slideP * 75}px)`; e.style.opacity = String(lerp(1, 0.85, slideP)); });
+    gA.forEach((e, k) => { e.style.background = slideP > 0.95 ? (fA[k] && fB[k] ? "var(--ink)" : "#eef1f6") : fA[k] ? "var(--lion)" : "#eef1f6"; });
+    gB.forEach((e, k) => { e.style.opacity = String(slideP > 0.95 ? 0 : 1); });
+    const a1 = wt("b1", "GROUP BY");
+    barsE.forEach((b, k) => { const h = 190 * hs[k] * E.out(P(t, a1 + 0.2 + k * 0.08, 0.5)); b.style.height = h + "px"; b.style.top = (200 - h) + "px"; });
+    const a2 = wt("b1", "joins"), lp = ((t - a2) * 0.9) % 1;
+    st(pkt, t > a2 + 0.2 ? 1 : 0, lp * 50, 0);
+    const a3 = wt("b1", "partitioned tables");
+    pbad.forEach((b, k) => pop(b, t, a3 + 0.3 + k * 0.12, null, 0.35));
+  };
+});
+
+/* use: keep your indexes, add Lion where you count ------------------------ */
+beat("use", root => {
+  const cw = 480, gap = 40, x0 = 960 - (3 * cw + 2 * gap) / 2;
+  const cards = [["B-tree", "blue", "blue-pale", "lookups and ORDER BY", "B-trees"], ["GIN", "green", "green-pale", "full-text and JSONB", "GIN for search"],
+    ["Lion", "lion-deep", "lion-pale", "counts and GROUP BY", "Add a Lion index"]].map(([n, c, pale, sub, ph], i) => {
+    const e = mk(root, "card", box(x0 + i * (cw + gap), 230, cw, 280));
+    mk(e, "pill", Object.assign(box(36, 36), { fontSize: "40px", background: `var(--${pale})`, color: `var(--${c})`, padding: "8px 28px" }), n);
+    mk(e, "", Object.assign(box(36, 150, cw - 72), { fontSize: "30px", fontWeight: 600, lineHeight: "1.35" }), sub);
+    return { e, ph, i };
+  });
+  const code = mk(root, "card code center", Object.assign(box(410, 580, 1100, 86), { fontSize: "34px", lineHeight: "86px", borderRadius: "999px" }),
+    "<span class=kw>CREATE INDEX ON</span> events <span class=kw>USING</span> lion (country);");
+  return t => {
+    const out = SC.use.end - 0.25;
+    cards.forEach(o => {
+      const a = wt("u1", o.ph) - 0.2, p = P(t, a, 0.45);
+      st(o.e, clamp(p * 2.2) * (1 - E.io(P(t, out, 0.3))), 0, (1 - E.out(p)) * 50, lerp(0.85, 1, E.back(p)));
+      if (o.i === 2) o.e.style.boxShadow = t > a + 0.3 ? "0 0 0 6px rgba(245,158,11,.25), 0 18px 44px rgba(226,120,18,.25)" : "";
+    });
+    const cp = P(t, wt("u1", "Add a Lion index") + 0.1, 0.9);
+    show(code, t, wt("u1", "Add a Lion index"), out, 16);
+    code.style.clipPath = `inset(0 ${(1 - E.out(cp)) * 100}% 0 0 round 999px)`;
+  };
+});
+
+/* end: the lion again -------------------------------------------------------- */
+beat("end", root => {
+  const cvs = document.createElement("canvas"); cvs.width = 1920; cvs.height = 1080; cvs.className = "layer"; root.appendChild(cvs);
+  const c2 = cvs.getContext("2d");
+  const r = rng(77), bits = LION.map(p => ({ p, sx: 960 + (r() - 0.5) * 1700, sy: 400 + (r() - 0.5) * 900, j: r() }));
+  const word = mk(root, "center brico", Object.assign(box(0, 520, 1920), { fontSize: "124px", fontWeight: 800, lineHeight: "1" }),
+    "<span style='color:#8a94a8'>pg_</span><span style='color:var(--lion)'>lion</span>");
+  const tag = mk(root, "center brico", Object.assign(box(0, 668, 1920), { fontSize: "54px", fontWeight: 700 }), "Try it on your data.");
+  const url = mk(root, "center mono", Object.assign(box(0, 752, 1920), { fontSize: "30px", color: "var(--muted)" }), "github.com/cgkanchi/pg_lion");
+  const fine = mk(root, "center", Object.assign(box(360, 826, 1200), { fontSize: "20px", lineHeight: "1.5", color: "var(--faint)" }),
     "pg_lion is a prototype. Counts are fastest on regularly vacuumed tables; inserts cost about 1.25× a B-tree's time.<br>Benchmarks: PostgreSQL 18.6 release build, 5M rows, median of 3 timed runs. Details in the README.");
-  const t0 = A("e1");
+  const t0 = SC.end.start;
   return t => {
-    cells.forEach(c => st(c.e, E.out(P(t, t0 - 0.3 + c.i * 0.02, 0.3))));
-    const p = P(t, t0 - 0.1, 0.5);
-    st(word, clamp(p * 2), 0, 0, lerp(0.85, 1, E.back(p)));
-    show(tag, t, A("e1", 1) - 0.1, null, 14, 0.35);
-    show(url, t, A("e1", 1) + 0.3, null, 10, 0.35);
+    c2.clearRect(0, 0, 1920, 1080);
+    const ps = 22, cx = 960, cy = 285;
+    for (const b of bits) {
+      const f = E.io(P(t, t0 - 0.2 + b.j * 0.5, 0.8));
+      if (f <= 0) continue;
+      const x = lerp(b.sx, cx + (b.p.gx - 7.5) * ps, f), y = lerp(b.sy, cy + (b.p.gy - 7.5) * ps, f);
+      c2.globalAlpha = clamp(f * 3);
+      c2.fillStyle = mix(C.lion, b.p.col, f);
+      c2.beginPath(); c2.roundRect(x - 10, y - 10, 20, 20, lerp(10, 4, f)); c2.fill();
+    }
+    c2.globalAlpha = 1;
+    pop(word, t, t0 + 0.2, null, 0.5, 0.7);
+    show(tag, t, A("e1", 1) - 0.1, null, 14);
+    show(url, t, A("e1", 1) + 0.3, null, 10);
     show(fine, t, Z("e1") + 0.4, null, 6, 0.5);
   };
-}, { nobrand: true });
+});
 
 /* ------------------------------------------------------------------ stage */
-const scenesEl = document.getElementById("scenes");
-const DRAW = SCENES.map(s => {
-  const root = document.createElement("div"); root.className = "scene"; scenesEl.appendChild(root);
-  return { id: s.id, root, brand: s.brand, meta: SC[s.id], draw: s.build(root) };
-});
-const brand = document.getElementById("brand");
 const cap = document.getElementById("caption"), capSpan = cap.querySelector("span");
 const SENT = []; TL.scenes.forEach(s => s.cues.forEach(c => c.sentences.forEach(x => SENT.push(x))));
-
+const bgDots = document.getElementById("dots");
 function renderAt(t) {
-  let brandOn = 0;
-  DRAW.forEach((d, k) => {
-    const m = d.meta, first = k === 0, last = k === DRAW.length - 1;
-    // quick cuts: a short fade on each side of every scene
-    const fin = first ? E.out(P(t, 0, 0.4)) : E.io(P(t, m.start - 0.02, 0.22));
-    const fout = last ? E.io(P(t, TL.total - 0.8, 0.8)) : E.io(P(t, m.end - 0.2, 0.2));
-    const o = t < m.start - 0.02 || t > m.end ? 0 : fin * (1 - fout);
-    if (o <= 0) { d.root.style.display = "none"; return; }
-    d.root.style.display = "block"; d.root.style.opacity = o;
-    if (d.brand) brandOn = Math.max(brandOn, o);
-    d.draw(t);
+  bgDots.style.transform = `translate(${(t * 6) % 36}px, ${(t * 3) % 36}px)`;
+  drawWorld(t);
+  BEATS.forEach(b => {
+    const s = SC[b.id];
+    // a beat is drawn from a little before its scene to a little after it
+    const on = t > s.start - 1.2 && t < s.end + 1.2;
+    b.root.style.display = on ? "block" : "none";
+    if (on) b.draw(t);
   });
-  brand.style.opacity = brandOn;
   const c = SENT.find(x => t >= x.start - 0.06 && t < x.end + 0.25);
   if (c) {
     if (capSpan.textContent !== c.cap) capSpan.textContent = c.cap;

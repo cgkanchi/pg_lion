@@ -1,64 +1,63 @@
 {
   "voice": "af_heart",
   "speed": 1.0,
-  "lead_in": 0.6,
-  "settle": 0.3,
-  "sentence_gap": 0.18,
-  "cue_gap": 0.22,
-  "scene_gap": 0.3,
+  "lead_in": 1.0,
+  "settle": 0.25,
+  "sentence_gap": 0.2,
+  "cue_gap": 0.3,
+  "scene_gap": 0.25,
   "tail": 4.5,
   "scenes": [
     {
       "id": "hook",
       "title": "How many rows match?",
       "cues": [
-        {"id": "h1", "say": "Every dashboard, every filter, every report asks the same question.", "hold": 0.1},
-        {"id": "h2", "say": "How many rows match?", "hold": 0.8}
+        {"id": "h1", "say": "Your dashboard asks one question, all day long: how many rows match?", "hold": 0.5}
       ]
     },
     {
-      "id": "pain",
-      "title": "Counting is slow",
+      "id": "problem",
+      "title": "Counting row by row",
       "cues": [
-        {"id": "p1", "say": "On five million rows, a B tree counts the matches one at a time.", "hold": 0.6},
-        {"id": "p2", "say": "Gin has to go back and read the table.", "cap": "GIN has to go back and read the table.", "hold": 0.9}
+        {"id": "p1", "say": "With a B tree, Postgress counts the matches one at a time. Half of five million rows? Two and a half million steps.", "cap": "With a B-tree, Postgres counts the matches one at a time. Half of 5 million rows? 2.5 million steps.", "hold": 0.4},
+        {"id": "p2", "say": "Gin hands back a list of matches, and then still reads the table.", "cap": "GIN hands back a list of matches, and then still reads the table.", "hold": 0.5}
       ]
     },
     {
       "id": "reveal",
       "title": "Meet Lion",
       "cues": [
-        {"id": "r1", "say": "Meet Lion. A roaring bitmap index for Postgress.", "hold": 0.8}
+        {"id": "r1", "say": "Meet Lion.", "hold": 1.4}
       ]
     },
     {
       "id": "how",
-      "title": "How it counts",
+      "title": "Chunks that know their count",
       "cues": [
-        {"id": "w1", "say": "Lion keeps each value's rows as compressed bitmaps, in chunks that know their own counts.", "hold": 0.4},
-        {"id": "w2", "say": "So it adds up chunks, instead of walking rows.", "hold": 0.8}
+        {"id": "w1", "say": "Lion packs each value's rows into compressed bitmaps, chunk by chunk, and every chunk already knows its count.", "hold": 0.3},
+        {"id": "w2", "say": "So counting is just adding up the chunks.", "hold": 0.9},
+        {"id": "v1", "say": "Pages that changed since the last vacuum get checked row by row, so the answer is always exact.", "cap": "Pages that changed since the last VACUUM get checked row by row, so the answer is always exact.", "hold": 0.4}
       ]
     },
     {
-      "id": "numbers",
-      "title": "The numbers",
+      "id": "payoff",
+      "title": "The result",
       "cues": [
-        {"id": "n1", "say": "The same count: one point seven milliseconds. Ninety times faster than a B tree.", "cap": "The same count: 1.7 milliseconds. 90× faster than a B-tree.", "hold": 0.6},
-        {"id": "n2", "say": "Two filters: nine times faster. GROUP BY: twenty-four times. Array tags: a hundred and sixty-eight times faster than gin.", "cap": "Two filters: 9× faster. GROUP BY: 24×. Array tags: 168× faster than GIN.", "hold": 0.8}
+        {"id": "n1", "say": "Same query: one point seven milliseconds. Ninety times faster than a B tree.", "cap": "Same query: 1.7 milliseconds. 90× faster than a B-tree.", "hold": 0.8}
       ]
     },
     {
-      "id": "dropin",
-      "title": "Just an index",
+      "id": "more",
+      "title": "More than one filter",
       "cues": [
-        {"id": "d1", "say": "And it's just an index. Create it, vacuum, and Postgress uses it for the count queries you already write.", "cap": "And it's just an index. Create it, VACUUM, and Postgres uses it for the count queries you already write.", "hold": 0.8}
+        {"id": "b1", "say": "Combined filters, GROUP BY, joins and partitioned tables all count this way.", "hold": 0.8}
       ]
     },
     {
-      "id": "fit",
+      "id": "use",
       "title": "Where it fits",
       "cues": [
-        {"id": "f1", "say": "Keep your B trees for lookups and ordering, and gin for text search. Add Lion where you count.", "hold": 0.8}
+        {"id": "u1", "say": "Keep your B trees for lookups and gin for search. Add a Lion index where you count.", "cap": "Keep your B-trees for lookups and GIN for search. Add a Lion index where you count.", "hold": 0.5}
       ]
     },
     {
