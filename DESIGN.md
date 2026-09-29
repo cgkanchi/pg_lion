@@ -9924,11 +9924,24 @@ of a partitioned fact for the keys it looks up - plus `cpu_tuple_cost` and the t
 emitted, as core charges a join's rows. The rows are the join rel's, core's estimate of the semi or
 anti join, and a partial path's a participant's share of them. Nothing is taken off: not for the
 outer rows core's estimate says have no match, and not for the fact rows the cost model has priced
-at their average number a key where the kept keys hold more. The path starts when its child does,
-though no row goes up before the child's first batch is tested whole: one batch of 200,000 rows at a
-`work_mem` of 64 MB, below, gave its first row at 978 ms of 992, which a LIMIT above is not told.
-What the fact side costs does not depend on which of the outer side's paths the child is, and is
-computed once for all of them.
+at their average number a key where the kept keys hold more. What the fact side costs does not
+depend on which of the outer side's paths the child is, and is computed once for all of them.
+
+**Startup** (2026-09-29, the same day). No row goes up before the first batch is tested whole: one
+batch of 200,000 rows at a `work_mem` of 64 MB, below, gave its first row at 978 ms of 992. The path
+first started when its child did, which told a LIMIT above that its first rows came at once. Its
+startup cost is now the child's startup, the child's run for the first batch's rows (their share of
+its rows), and what the fact side does for them - `lion_cost_fkjoin_path()` for that many rows
+under the choices the whole run made (`force`): the fact filters located, the copy collected, the
+batch's lookups and existence tests. The total is as it was. The batch is what
+`lion_join_fill_batch()` puts in one: rows until its memory context has `work_mem` allocated - its
+first block, the array of entries, 1,024 at first and doubled when full, and each row's copy
+(`lion_join_batch_rows()`) - never more than the child's rows; a plan that looks the keys up a row
+at a time has a batch of one row, and its startup is the fact filters' collection and one lookup.
+So over one batch the path's startup is nearly its total, and a Sort above it gives the rows of an
+`ORDER BY ... LIMIT` as early and for less than the child's order does (the ordered path is shown
+with sorts off in the test); at a `work_mem` of 64 kB, ten batches of a 4,000-row outer side, the
+startup is some 14% of the path's cost and the ordered path under a LIMIT is taken with no Sort.
 
 The upper node prices a row it hands up at `LION_FKJOIN_ROW_COST` (10 `cpu_tuple_cost`, "The cost
 of a key, after the per-key path"), and the join path at one `cpu_tuple_cost`, core's price of a
@@ -10441,8 +10454,13 @@ among them; generic plans with Params on both sides, NULL ones included, and a g
 join rel's rows, the fact joined outer; a LATERAL outer side taken above what it references;
 `pg_lion.enable_semijoin` and `pg_lion.enable_count_pushdown` off. The cost model with nothing
 disabled: the path for a few outer rows against a filter that leaves most fact rows, core's join for
-all of them against one that leaves few, and the upper node for a count of the first. And a dirty
-heap - deletes, updates, fks moved, NULL keys made, on every table - before and after VACUUM.
+all of them against one that leaves few, and the upper node for a count of the first. The startup
+(`lion_sp_start()`, from EXPLAIN's JSON costs): nearly the whole of the path's cost past its child's
+startup for one batch, in key order and over the partitioned fact; about one batch's share of it
+at a `work_mem` of 64 kB, against the batches the executor made; next to nothing a row at a time;
+and an `ORDER BY ... LIMIT 5` over the path, a Sort above it over one batch and the outer side's
+order with no Sort over several. And a dirty heap - deletes, updates, fks moved, NULL keys made, on
+every table - before and after VACUUM.
 
 ## 28. Range predicates over the sorted directory (v1, implemented)
 
