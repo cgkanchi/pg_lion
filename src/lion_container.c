@@ -2950,6 +2950,205 @@ lion_container_or_raw(const LionContainer *a, const LionContainer *b,
 }
 
 /*
+ * THE AND OF A FEW MEMBERS WITH A UNION, WITHOUT THE UNION (DESIGN.md
+ * §29.11, "Unions probed").  The count engine's leapfrog ANDs its running
+ * intersection with every source in turn, and a source that is an IN list or
+ * a multi-key `&&` is the union of the containers its sets have at the key.
+ * Building that union costs every member of every one of those containers -
+ * a bitset image cleared, filled and counted, or a fold of merges - whatever
+ * the intersection holds, and a running intersection of a few rows is ANDed
+ * with it only to keep those few.  Here each of a's members is looked up in
+ * the union's members one after the other instead, and a member once found
+ * is not looked up again: at most |a| lookups a member, and none past the
+ * member that finds the last of them.
+ *
+ * pending[] holds the positions in vals[] of the values not found yet, in
+ * ascending order, and found[] (a bit a position) the ones that were; each
+ * pass leaves in pending[] the values b does not hold and returns how many
+ * those are, a position written back and kept by adding a comparison rather
+ * than by a branch.  The lookup: a bit test in a BITSET; a galloping search
+ * through an ARRAY, from where the last value was found; a binary search of
+ * a RUN's runs for a few values against many runs, else a merge with them.
+ * Measured by a harness beside this file (-O2, containers of a heap of 70
+ * rows a block, a key's lookups timed 20,000 times): the gallop is never
+ * slower than a merge of the two sorted sides - 16 values against an ARRAY
+ * of 450 members 0.19 us against 1.6, 256 against 97 members 0.84 against
+ * 1.6, the merge's steps being a chain of dependent loads - and within a
+ * fifth of setting the ARRAY's members in an image and testing the values
+ * against it wherever that is faster, so it is the one way for an ARRAY.
+ * Against 723 runs the search takes 13 ns a value and the merge 0.6 ns a run
+ * or so, level at about one value for every eight runs, which is
+ * lion_container_and()'s own ratio (LION_AND_SEARCH_RATIO).  For a damaged b
+ * - members out of order, runs overlapping - which positions it keeps is
+ * unspecified, and every index stays inside vals[] and b.
+ */
+static uint32
+probe_pending(const LionContainer *b, const uint16 *vals, uint16 *pending,
+			  uint32 np, uint64 *found)
+{
+	uint32		k = 0;
+	uint32		i = 0;
+	uint32		j = 0;
+
+#define PROBE_KEEP(p_, h_) \
+	do { \
+		found[(p_) >> 6] |= (uint64) (h_) << ((p_) & 63); \
+		pending[k] = (uint16) (p_); \
+		k += 1 - (h_); \
+	} while (0)
+
+	switch (b->type)
+	{
+		case LION_CT_BITSET:
+			{
+				const uint64 *w = bitset_cdata(b);
+
+				for (i = 0; i < np; i++)
+				{
+					uint32		p = pending[i];
+					uint32		h = bits_test(w, vals[p]) ? 1 : 0;
+
+					PROBE_KEEP(p, h);
+				}
+				return k;
+			}
+		case LION_CT_ARRAY:
+			{
+				const uint16 *arr = array_cdata(b);
+				uint32		s = array_card(b);
+
+				for (i = 0; i < np; i++)
+				{
+					uint32		p = pending[i];
+					uint32		h;
+
+					j = array_gallop(arr, s, j, vals[p]);
+					h = (j < s && arr[j] == vals[p]) ? 1 : 0;
+					PROBE_KEEP(p, h);
+				}
+				return k;
+			}
+		case LION_CT_RUN:
+			{
+				const LionRun *runs = run_cdata(b);
+				uint32		nruns = run_nruns(b);
+
+				if (nruns == 0)
+					return np;
+				if (nruns >= LION_AND_SEARCH_RATIO * np)
+				{
+					for (i = 0; i < np; i++)
+					{
+						uint32		p = pending[i];
+						uint32		h = run_has_member(runs, nruns, vals[p]) ? 1 : 0;
+
+						PROBE_KEEP(p, h);
+					}
+					return k;
+				}
+				while (i < np && j < nruns)
+				{
+					uint32		p = pending[i];
+					int32		v = (int32) vals[p];
+
+					if (v > run_end(&runs[j]))
+						j++;
+					else
+					{
+						uint32		h = (v >= (int32) runs[j].start) ? 1 : 0;
+
+						PROBE_KEEP(p, h);
+						i++;
+					}
+				}
+				break;
+			}
+		default:
+			Assert(false);
+			return np;
+	}
+#undef PROBE_KEEP
+
+	/* the merge ran out of b: what is left of pending[] stays pending */
+	for (; i < np; i++)
+		pending[k++] = pending[i];
+	return k;
+}
+
+uint32
+lion_container_and_union_raw(const LionContainer *a,
+							 const LionContainer *const *b, uint32 nb,
+							 LionContainer *dest)
+{
+	uint16		extracted[LION_ARRAY_MAX_CARD];
+	uint16		pending[LION_ARRAY_MAX_CARD];
+	uint64		found[LION_ARRAY_MAX_CARD / 64];
+	const uint16 *vals;
+	uint16	   *out = array_mdata(dest);
+	uint32		n;
+	uint32		np;
+	uint32		card = 0;
+	uint32		i;
+
+	Assert(dest != a);
+#ifdef USE_ASSERT_CHECKING
+	for (i = 0; i < nb; i++)
+		Assert(b[i]->ckey == a->ckey && dest != b[i]);
+#endif
+
+	/*
+	 * a's members, as iterate() hands them out: an ARRAY's own, read in
+	 * place, or extracted.  A damaged a whose payload holds more than an
+	 * ARRAY may (a caller checks the header's cardinality) is taken as
+	 * empty.
+	 */
+	if (a->type == LION_CT_ARRAY)
+	{
+		vals = array_cdata(a);
+		n = array_card(a);
+	}
+	else
+	{
+		n = container_extract(a, extracted, LION_ARRAY_MAX_CARD);
+		if (n > LION_ARRAY_MAX_CARD)
+			n = 0;
+		vals = extracted;
+	}
+
+	memset(found, 0, sizeof(uint64) * ((n + 63) / 64));
+	for (i = 0; i < n; i++)
+		pending[i] = (uint16) i;
+	np = n;
+	for (i = 0; i < nb && np > 0; i++)
+		np = probe_pending(b[i], vals, pending, np, found);
+
+	/*
+	 * The found ones, in a's order.  A member written is masked and above
+	 * the one before (array_out()), so that a damaged a's repeats and
+	 * disorder come out a well-formed ARRAY, as container_and_probe()
+	 * leaves them.
+	 */
+	lion_container_init(dest, a->ckey);
+	for (i = 0; i < (n + 63) / 64; i++)
+	{
+		uint64		word = found[i];
+
+		while (word != 0)
+		{
+			uint32		p = (i << 6) + (uint32) pg_rightmost_one_pos64(word);
+			uint16		v = array_out(vals[p]);
+
+			word &= word - 1;
+			if (card > 0 && v <= out[card - 1])
+				continue;
+			out[card++] = v;
+		}
+	}
+	dest->cardinality = (uint16) card;
+	return card;
+}
+
+/*
  * How many members of an ARRAY c are set in the image w, and in *blocks which
  * heap blocks they lie on - the cardinality and lion_container_block_mask()
  * of the intersection, without writing it.  The count engine's grouped walk
