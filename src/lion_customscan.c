@@ -71,6 +71,14 @@
  * each row's count when a count stands beside them, and a LionJoinAgg above
  * that Agg gives the query its own aggregates back.
  *
+ * The same semi and anti joins are also offered as JOIN paths, by
+ * set_join_pathlist_hook (DESIGN.md §27, "The semi and anti join as a join
+ * path"): a CustomPath of a join rel whose join is a semi or anti join with
+ * the fact alone on its inner side, over a path of its outer side - any rel
+ * - which emits the outer rows with (or without) a match, for whatever needs
+ * them above.  EXPLAIN calls it LionSemiJoin or LionAntiJoin; it is the same
+ * node, in the rows mode of a count(DISTINCT).
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -148,10 +156,12 @@
 #include "lion_count.h"
 #include "lion_fkjoin.h"
 
-/* GUC and the previous hook, both owned here and installed by _PG_init. */
+/* GUCs and the previous hooks, all owned here and installed by _PG_init. */
 bool		lion_enable_count_pushdown = true;
 bool		lion_enable_filter_switch = true;
 create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
+bool		lion_enable_semijoin = true;
+set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook = NULL;
 
 /* Kinds of column in custom_scan_tlist. */
 #define LION_TL_GROUPKEY		0
@@ -212,6 +222,18 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 										 * pairs, which the Agg above adds up
 										 * in place of count() ("Every
 										 * aggregate over the node's rows") */
+#define LION_JOINFLAG_OUTER		0x40	/* with ROWS, a semi or anti join's:
+										 * the node is a JOIN path, and its
+										 * rows are the join rel's - the outer
+										 * side's rows with a match, or with
+										 * none ("The semi and anti join as a
+										 * join path") */
+#define LION_JOINFLAG_ORDERED	0x80	/* with OUTER: the rows go up in the
+										 * order the child gave them, a batch
+										 * counted whole in key order and its
+										 * rows then handed up in their own,
+										 * and the path claims the child's
+										 * pathkeys */
 
 /*
  * Where an FK-side join's time goes (DESIGN.md §27, "Where a key's time
@@ -437,6 +459,9 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  */
 #define LION_FKJOIN_BATCH_ROW_COST	(lion_fkjoin_batch_row_cost * cpu_operator_cost)
 #define LION_FKJOIN_BATCH_ENT_BYTES	(sizeof(LionJoinEnt) + 48)
+
+/* The most rows a batch takes whatever work_mem allows: its array's limit. */
+#define LION_JOIN_BATCH_MAX		((int) (MaxAllocSize / sizeof(LionJoinEnt) - 1))
 
 /*
  * ... and each key a walk looks up on the leaf it stands on: the leaf's
@@ -903,6 +928,12 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * added the IMPLIED member (13), the clauses every partition leaves out, in
  * front of the target-list kinds.
  *
+ * Shape 16 moved no member but gave the JOIN member (10) two flags a build
+ * before it would ignore, LION_JOINFLAG_OUTER and LION_JOINFLAG_ORDERED: the
+ * semi or anti join as a join path, whose rows are the outer side's (DESIGN.md
+ * §27, "The semi and anti join as a join path").  Read by an older build, such
+ * a plan would be taken for the rows of a count(DISTINCT).
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -915,7 +946,7 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x5242490f
+#define LION_PRIV_MAGIC		0x52424910
 #define LION_PRIV_NMEMBERS	15
 
 /*
@@ -1510,6 +1541,10 @@ typedef struct LionCountScanState
 	bool		joinsum;		/* LION_JOINFLAG_SUM: one row, the sum */
 	bool		joincounts;		/* LION_JOINFLAG_COUNTS: rows, each with
 								 * its count */
+	bool		joinouter;		/* LION_JOINFLAG_OUTER: a semi or anti join
+								 * path, whose rows are the outer side's */
+	bool		joinordered;	/* LION_JOINFLAG_ORDERED: ... handed up in
+								 * the child's order */
 	bool		joincollected;
 	bool		joinfiltered;
 	LionPostingSet joinfilter;
@@ -1794,6 +1829,34 @@ static const CustomExecMethods lion_count_exec_methods = {
 	.InitializeWorkerCustomScan = lion_initialize_worker,
 	.ShutdownCustomScan = lion_shutdown_custom_scan,
 	.ExplainCustomScan = lion_explain_custom_scan,
+};
+
+/*
+ * The FK-side semi and anti join as a JOIN path (DESIGN.md §27, "The semi and
+ * anti join as a join path") is the same node, run by the same executor
+ * methods, under the names EXPLAIN shows for what it does: a join rel's rows,
+ * the outer side's with a match (LionSemiJoin) or without one (LionAntiJoin).
+ */
+static const CustomPathMethods lion_semijoin_path_methods = {
+	.CustomName = "LionSemiJoin",
+	.PlanCustomPath = lion_plan_custom_path,
+	.ReparameterizeCustomPathByChild = NULL,
+};
+
+static const CustomPathMethods lion_antijoin_path_methods = {
+	.CustomName = "LionAntiJoin",
+	.PlanCustomPath = lion_plan_custom_path,
+	.ReparameterizeCustomPathByChild = NULL,
+};
+
+static const CustomScanMethods lion_semijoin_scan_methods = {
+	.CustomName = "LionSemiJoin",
+	.CreateCustomScanState = lion_create_custom_scan_state,
+};
+
+static const CustomScanMethods lion_antijoin_scan_methods = {
+	.CustomName = "LionAntiJoin",
+	.CreateCustomScanState = lion_create_custom_scan_state,
 };
 
 /*
@@ -6909,6 +6972,11 @@ lion_fkjoin_probe_one(double heap_pages, double members, double cfk)
  * back as well, and the rest beside them (LionFkJoinCost): a partitioned fact
  * table is priced one leaf partition at a time, and the choices are then the
  * plan's, made over the sum of its partitions (lion_cost_fkjoin_path()).
+ *
+ * With `force` the two choices are not made but taken from *collect and *walk
+ * (a copy is made only where there is one to make): the price of a part of
+ * the rows - the first batch of a semi or anti join path, which its startup
+ * cost holds - under the choices the whole run made.
  */
 typedef struct LionFkJoinCost
 {
@@ -6928,8 +6996,10 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 					 List *whereclauses, List *wherekinds, List *ors,
 					 double dimrows, double found, bool exists,
 					 double rowbytes, int workers, bool *collect, bool *walk,
-					 LionFkJoinCost *parts)
+					 bool force, LionFkJoinCost *parts)
 {
+	bool		wantcollect = force && *collect;
+	bool		wantwalk = force && *walk;
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
 	double		tuples = Max(rel->tuples, 1.0);
@@ -7012,7 +7082,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	 */
 	descents = dimrows * (height + 1.0) * LION_DESCENT_COST;
 	walked = lion_cost_fkjoin_walk(dimrows, dirpages, height, rowbytes);
-	if (walked < descents)
+	if (force ? wantwalk : walked < descents)
 	{
 		*walk = true;
 		run += walked;
@@ -7250,8 +7320,9 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		 * made there as if the copy would be made chose the node where each
 		 * dimension row then built the filters' unions again.
 		 */
-		if (copybytes <= (double) get_hash_memory_limit() * (workers + 1) &&
-			collected < probed && !RecoveryInProgress())
+		if (force ? wantcollect :
+			(copybytes <= (double) get_hash_memory_limit() * (workers + 1) &&
+			 collected < probed && !RecoveryInProgress()))
 			*collect = true;
 		if (parts != NULL)
 		{
@@ -8520,7 +8591,13 @@ lion_fkjoin_fk_is_key(const LionFkJoin *fj)
 {
 	TypeCacheEntry *typentry;
 
-	if (fj->jointype != JOIN_INNER && fj->jointype != JOIN_UNIQUE_INNER)
+	/*
+	 * ... and a semi join path's row, which is an outer row with a match: the
+	 * key stands for the matching fact rows' values there too (DESIGN.md §27,
+	 * "The semi and anti join as a join path").
+	 */
+	if (fj->jointype != JOIN_INNER && fj->jointype != JOIN_UNIQUE_INNER &&
+		!(fj->joinpath && fj->jointype == JOIN_SEMI))
 		return false;
 	if (fj->fkvar->vartype != fj->pkvar->vartype)
 		return false;
@@ -9174,7 +9251,8 @@ lion_leaf_turn_share(PlannerInfo *root, RelOptInfo *rel)
  * and counts (lion_cost_fkjoin_rel()), and the heap recheck of a multi-key
  * fact filter the node only has at run time (DESIGN.md §17, "A query known
  * only at run time") - the fact rows the keys reach, each count reading its
- * own.  *collect and *walk are the plan's two choices.
+ * own.  *collect and *walk are the plan's two choices - or, with `force`,
+ * the choices to price, made already (lion_cost_fkjoin_rel()).
  *
  * A partitioned fact table (DESIGN.md §27, "A partitioned fact table") is
  * every key looked up in every leaf partition, each with its own fk index,
@@ -9209,9 +9287,11 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 					  Var *fkvar, int joinclause, List *whereclauses,
 					  List *wherekinds, List *ors, double dimrows, double found,
 					  bool exists, double rowbytes, int workers, bool *collect,
-					  bool *walk)
+					  bool *walk, bool force)
 {
 	LionCountTarget *first = (LionCountTarget *) linitial(targets);
+	bool		wantcollect = force && *collect;
+	bool		wantwalk = force && *walk;
 	double		ndall;
 	Cost		other = 0;
 	Cost		descents = 0;
@@ -9237,7 +9317,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 								   first->wherecol, fkvar, joinclause,
 								   whereclauses, wherekinds, ors, dimrows,
 								   found, exists, rowbytes, workers,
-								   collect, walk, NULL);
+								   collect, walk, force, NULL);
 		run += lion_cost_recheck(root, rel, first->whereidx, first->wherecol,
 								 whereclauses, wherekinds, ors,
 								 reach * Min(Max(rel->rows, 1.0) / tuples, 1.0),
@@ -9287,7 +9367,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 		(void) lion_cost_fkjoin_rel(root, t->rel, tidx, tcol, leafvar, tjoin,
 									tclauses, tkinds, tors, tdim, tfound,
 									exists, rowbytes, workers, &tcollect,
-									&twalk, &parts);
+									&twalk, false, &parts);
 		other += parts.other;
 		descents += parts.descents;
 		walked += parts.walked;
@@ -9322,10 +9402,18 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 					   1.0));
 	probed += (batches - 1.0) * located;
 
-	*walk = (walked < descents);
-	*collect = (copybytes > 0 &&
-				copybytes <= (double) get_hash_memory_limit() * (workers + 1) &&
-				collected < probed && !RecoveryInProgress());
+	if (force)
+	{
+		*walk = wantwalk;
+		*collect = (wantcollect && copybytes > 0);
+	}
+	else
+	{
+		*walk = (walked < descents);
+		*collect = (copybytes > 0 &&
+					copybytes <= (double) get_hash_memory_limit() * (workers + 1) &&
+					collected < probed && !RecoveryInProgress());
+	}
 	return other + (*walk ? walked : descents) +
 		(*collect ? collected : probed);
 }
@@ -9495,7 +9583,7 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 								childfound,
 								jointype != LION_JOIN_INNER ||
 								(emitrows && !counts),
-								rowbytes, workers, &collect, &walk);
+								rowbytes, workers, &collect, &walk, false);
 
 	/*
 	 * Partial counts and nothing else - no dimension column to group by or
@@ -9691,6 +9779,154 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * What every FK-side join path carries of the fact side (DESIGN.md §27), the
+ * aggregate over the query's join and the semi or anti join path alike
+ * ("The semi and anti join as a join path"): the join key appended to the
+ * fact filters as one more LION_CLAUSE_EQ clause, whose value expression is
+ * the dimension's (the outer side's) column; the relations to count - the
+ * fact table, or each of its live leaf partitions - each with a lion index
+ * for the key and for every fact filter it keeps (lion_collect_targets());
+ * and custom_private but for its join member.  `tlexprs` and `having` are
+ * what the node's target and HAVING evaluate, for the EXECUTE checks
+ * (lion_replaced_functions()).  False when the fact side declines.
+ */
+typedef struct LionFkJoinSetup
+{
+	int			joinclause;		/* the key's clause */
+	List	   *targets;		/* LionCountTarget, one per relation counted */
+	bool		partitioned;
+	double		fkpages;		/* the fk index's pages, in every partition */
+	List	   *whereclauses;	/* the clauses, the key's appended */
+	List	   *wherekinds;		/* ... and their kinds */
+	List	   *consts;			/* ... and values */
+	List	   *base;			/* custom_private, its join member NIL */
+} LionFkJoinSetup;
+
+static bool
+lion_fkjoin_setup(PlannerInfo *root, RelOptInfo *rel, const LionFkJoin *fj,
+				  List *whereattnos, List *clauseinfos, List *whereclauses,
+				  List *whereconsts, List *wherekinds, List *whereopnos,
+				  List *whereinor, List *ors, const LionImply *imply,
+				  List *tlexprs, List *having, LionFkJoinSetup *out)
+{
+	RangeTblEntry *rte = root->simple_rte_array[rel->relid];
+	LionLeafInfo leaf;
+	LionDriveInfo nodrive[LION_MAX_GROUPCOLS];
+	int			joinclause;
+	List	   *targets = NIL;
+	bool		partitioned;
+	double		fkpages;
+	List	   *parts = NIL;
+	List	   *oids;
+	List	   *ints;
+	List	   *consts = NIL;
+	List	   *ckinds = NIL;
+	List	   *base;
+	ListCell   *lc;
+	ListCell   *l1;
+	ListCell   *l2;
+	ListCell   *l3;
+	int			i;
+
+	/* ---- the join key: one more equality clause on the fact rel ---- */
+	memset(&leaf, 0, sizeof(leaf));
+	leaf.var = fj->fkvar;
+	leaf.val = (Node *) copyObject(fj->pkexpr);
+	leaf.opno = fj->opno;
+	leaf.cmptype = exprType(fj->pkexpr);
+	leaf.strategy = LION_STRAT_EQUAL;
+	leaf.extractquery = InvalidOid;
+	leaf.collation = fj->collation;
+	leaf.kind = LION_CLAUSE_EQ;
+	joinclause = list_length(whereattnos);
+	lion_append_clause(&leaf, fj->clause, false,
+					  &whereattnos, &clauseinfos, &whereclauses,
+					  &whereconsts, &wherekinds, &whereopnos, &whereinor);
+
+	/*
+	 * ---- the fact rel and its indexes ----
+	 *
+	 * Nothing drives an entry scan: the child's rows drive the counts.  A
+	 * partitioned fact rel is one target per live leaf partition, each with
+	 * its own fk index and its own fact filters, less the ones its bounds
+	 * imply (DESIGN.md §27, "A partitioned fact table"); all of them pruned
+	 * away leaves the join to the planner, which knows it is empty.
+	 */
+	memset(nodrive, 0, sizeof(nodrive));
+	if (!lion_collect_targets(root, rel, nodrive, 0, whereattnos, clauseinfos,
+							 imply, &targets))
+		return false;
+	if (targets == NIL)
+		return false;
+	partitioned = rte->inh;
+	fkpages = 0;
+	foreach(lc, targets)
+		fkpages += (double)
+			((IndexOptInfo *) list_nth(((LionCountTarget *) lfirst(lc))->whereidx,
+									   joinclause))->pages;
+
+	/*
+	 * A partitioned fact table's own index Oids are InvalidOid, its
+	 * partitions' in LION_PRIV_PARTS - InvalidOid where a partition leaves a
+	 * fact filter out - as for a count (DESIGN.md §16).
+	 */
+	oids = list_make3_oid(rte->relid, InvalidOid, InvalidOid);
+	ints = list_make4_int((int) rel->relid, 0, 0, 0);
+	i = 0;
+	forthree(l1, whereattnos, l2, whereconsts, l3, wherekinds)
+	{
+		oids = lappend_oid(oids, partitioned ? InvalidOid :
+						   ((IndexOptInfo *) list_nth(((LionCountTarget *) linitial(targets))->whereidx,
+													  i))->indexoid);
+		ints = lappend_int(ints, lfirst_int(l1));
+		consts = lappend(consts, copyObject((Node *) lfirst(l2)));
+		ckinds = lappend_int(ckinds, lfirst_int(l3));
+		i++;
+	}
+	if (partitioned)
+	{
+		foreach(lc, targets)
+		{
+			LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+			List	   *one = list_make3_oid(t->heapoid, InvalidOid, InvalidOid);
+
+			foreach(l1, t->whereidx)
+				one = lappend_oid(one, lfirst(l1) != NULL ?
+								  ((IndexOptInfo *) lfirst(l1))->indexoid :
+								  InvalidOid);
+			parts = lappend(parts, one);
+		}
+	}
+
+	base = list_make1(list_make2_int(LION_PRIV_MAGIC, LION_PRIV_NMEMBERS));
+	base = lappend(base, oids);
+	base = lappend(base, ints);
+	base = lappend(base, consts);
+	base = lappend(base, ckinds);
+	base = lappend(base, parts);
+	base = lappend(base, whereopnos);
+	base = lappend(base, ors);
+	base = lappend(base, NIL);	/* having */
+	base = lappend(base, NIL);	/* distinct */
+	base = lappend(base, NIL);	/* join: lion_fkjoin_private() */
+	/* the dimension's GROUP BY is the Agg's, which checks it */
+	base = lappend(base, lion_replaced_functions(rel, tlexprs, having, NIL,
+												 fj));
+	base = lappend(base, NIL);	/* coalesce: the fact side groups nothing */
+	base = lappend(base, (imply != NULL) ? imply->skipped : NIL);
+
+	out->joinclause = joinclause;
+	out->targets = targets;
+	out->partitioned = partitioned;
+	out->fkpages = fkpages;
+	out->whereclauses = whereclauses;
+	out->wherekinds = wherekinds;
+	out->consts = consts;
+	out->base = base;
+	return true;
+}
+
+/*
  * The rest of lion_try_count_path() for the FK-side join (DESIGN.md §27).
  *
  * The caller has analysed the FACT rel's WHERE clauses exactly as it does for
@@ -9742,21 +9978,14 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 					 List *whereconsts, List *wherekinds, List *whereopnos,
 					 List *whereinor, List *ors, const LionImply *imply)
 {
-	RangeTblEntry *rte = root->simple_rte_array[rel->relid];
 	List	   *exprs;
 	List	   *items;
-	LionLeafInfo leaf;
-	LionDriveInfo nodrive[LION_MAX_GROUPCOLS];
+	LionFkJoinSetup setup;
 	int			joinclause;
-	List	   *targets = NIL;
-	bool		partitioned;
+	List	   *targets;
 	double		fkpages;		/* the fk index's pages, in every partition */
-	List	   *parts = NIL;
 	PathTarget *nodetarget;
-	List	   *oids;
-	List	   *ints;
-	List	   *consts = NIL;
-	List	   *ckinds = NIL;
+	List	   *consts;
 	List	   *base;
 	double		dimrows;
 	double		found;
@@ -9768,10 +9997,6 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	bool		fkkey;
 	bool		perrow;
 	ListCell   *lc;
-	ListCell   *l1;
-	ListCell   *l2;
-	ListCell   *l3;
-	int			i;
 
 	/*
 	 * The fact's join column may stand in the rows as the dimension's key
@@ -9972,42 +10197,22 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	 * expression's array is priced by its plan-time estimate.
 	 */
 
-	/* ---- the join key: one more equality clause on the fact rel ---- */
-	memset(&leaf, 0, sizeof(leaf));
-	leaf.var = fj->fkvar;
-	leaf.val = (Node *) copyObject(fj->pkexpr);
-	leaf.opno = fj->opno;
-	leaf.cmptype = exprType(fj->pkexpr);
-	leaf.strategy = LION_STRAT_EQUAL;
-	leaf.extractquery = InvalidOid;
-	leaf.collation = fj->collation;
-	leaf.kind = LION_CLAUSE_EQ;
-	joinclause = list_length(whereattnos);
-	lion_append_clause(&leaf, fj->clause, false,
-					  &whereattnos, &clauseinfos, &whereclauses,
-					  &whereconsts, &wherekinds, &whereopnos, &whereinor);
-
 	/*
-	 * ---- the fact rel and its indexes ----
-	 *
-	 * Nothing drives an entry scan: the child's rows drive the counts.  A
-	 * partitioned fact rel is one target per live leaf partition, each with
-	 * its own fk index and its own fact filters, less the ones its bounds
-	 * imply (DESIGN.md §27, "A partitioned fact table"); all of them pruned
-	 * away leaves the join to the planner, which knows it is empty.
+	 * ---- the join key, the fact rel's indexes, and what every path carries
+	 * of them (lion_fkjoin_setup()) ----
 	 */
-	memset(nodrive, 0, sizeof(nodrive));
-	if (!lion_collect_targets(root, rel, nodrive, 0, whereattnos, clauseinfos,
-							 imply, &targets))
+	if (!lion_fkjoin_setup(root, rel, fj, whereattnos, clauseinfos,
+						   whereclauses, whereconsts, wherekinds, whereopnos,
+						   whereinor, ors, imply, output_rel->reltarget->exprs,
+						   having, &setup))
 		return;
-	if (targets == NIL)
-		return;
-	partitioned = rte->inh;
-	fkpages = 0;
-	foreach(lc, targets)
-		fkpages += (double)
-			((IndexOptInfo *) list_nth(((LionCountTarget *) lfirst(lc))->whereidx,
-									   joinclause))->pages;
+	joinclause = setup.joinclause;
+	targets = setup.targets;
+	fkpages = setup.fkpages;
+	whereclauses = setup.whereclauses;
+	wherekinds = setup.wherekinds;
+	consts = setup.consts;
+	base = setup.base;
 
 	/*
 	 * ---- what every path of it carries ----
@@ -10043,57 +10248,6 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 								  Max(rel->rows, 1.0)));
 	jointype = (fj->jointype == JOIN_SEMI) ? LION_JOIN_SEMI :
 		(fj->jointype == JOIN_ANTI) ? LION_JOIN_ANTI : LION_JOIN_INNER;
-
-	/*
-	 * A partitioned fact table's own index Oids are InvalidOid, its
-	 * partitions' in LION_PRIV_PARTS - InvalidOid where a partition leaves a
-	 * fact filter out - as for a count (DESIGN.md §16).
-	 */
-	oids = list_make3_oid(rte->relid, InvalidOid, InvalidOid);
-	ints = list_make4_int((int) rel->relid, 0, 0, 0);
-	i = 0;
-	forthree(l1, whereattnos, l2, whereconsts, l3, wherekinds)
-	{
-		oids = lappend_oid(oids, partitioned ? InvalidOid :
-						   ((IndexOptInfo *) list_nth(((LionCountTarget *) linitial(targets))->whereidx,
-													  i))->indexoid);
-		ints = lappend_int(ints, lfirst_int(l1));
-		consts = lappend(consts, copyObject((Node *) lfirst(l2)));
-		ckinds = lappend_int(ckinds, lfirst_int(l3));
-		i++;
-	}
-	if (partitioned)
-	{
-		foreach(lc, targets)
-		{
-			LionCountTarget *t = (LionCountTarget *) lfirst(lc);
-			List	   *one = list_make3_oid(t->heapoid, InvalidOid, InvalidOid);
-
-			foreach(l1, t->whereidx)
-				one = lappend_oid(one, lfirst(l1) != NULL ?
-								  ((IndexOptInfo *) lfirst(l1))->indexoid :
-								  InvalidOid);
-			parts = lappend(parts, one);
-		}
-	}
-
-	base = list_make1(list_make2_int(LION_PRIV_MAGIC, LION_PRIV_NMEMBERS));
-	base = lappend(base, oids);
-	base = lappend(base, ints);
-	base = lappend(base, consts);
-	base = lappend(base, ckinds);
-	base = lappend(base, parts);
-	base = lappend(base, whereopnos);
-	base = lappend(base, ors);
-	base = lappend(base, NIL);	/* having */
-	base = lappend(base, NIL);	/* distinct */
-	base = lappend(base, NIL);	/* join: lion_fkjoin_private() */
-	/* the dimension's GROUP BY is the Agg's, which checks it */
-	base = lappend(base, lion_replaced_functions(rel,
-												 output_rel->reltarget->exprs,
-												 having, NIL, fj));
-	base = lappend(base, NIL);	/* coalesce: the fact side groups nothing */
-	base = lappend(base, (imply != NULL) ? imply->skipped : NIL);
 
 	/*
 	 * ---- may it run in a worker ----
@@ -10200,6 +10354,367 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 								  joinclause, jointype, rowagg, perrow,
 								  whereclauses, wherekinds, ors, dimrows,
 								  dimrows, true);
+	}
+}
+
+/* Does a path's target carry the column `var` is of, as a plain Var? */
+static bool
+lion_path_has_var(Path *path, Var *var)
+{
+	ListCell   *lc;
+
+	foreach(lc, path->pathtarget->exprs)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (IsA(v, Var) && v->varno == var->varno &&
+			v->varattno == var->varattno && v->varlevelsup == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * How many child rows a batch holds, as lion_join_fill_batch() fills it: rows
+ * until the batch's memory context has work_mem allocated.  That is its first
+ * block, the array of entries - 1,024 of them at first, doubled whenever it is
+ * full - and each row's copy, `rowbytes` less its entry.  At a small work_mem
+ * the first array is most of it: 64 kB holds some 300 rows of one column where
+ * rowbytes alone would say 700.
+ */
+static double
+lion_join_batch_rows(double rowbytes)
+{
+	double		limit = (double) work_mem * 1024.0;
+	double		ent = (double) sizeof(LionJoinEnt);
+	double		tup = Max(rowbytes - ent, 1.0);
+	double		base = (double) ALLOCSET_DEFAULT_INITSIZE;
+	double		prev = 0.0;
+	double		cap;
+	double		n = (double) LION_JOIN_BATCH_MAX;
+
+	for (cap = 1024.0; cap < (double) LION_JOIN_BATCH_MAX; cap *= 2.0)
+	{
+		/* the rows beside an array of `cap` entries, while it holds them */
+		n = ceil((limit - base - ent * cap) / tup);
+		if (n <= cap)
+		{
+			/* the row that made the array grow is in the batch */
+			n = Max(n, prev + 1.0);
+			break;
+		}
+		prev = cap;
+	}
+	return Min(Max(n, 1.0), (double) LION_JOIN_BATCH_MAX);
+}
+
+/*
+ * One semi or anti join path (DESIGN.md §27, "The semi and anti join as a
+ * join path") over `child`, a path of the outer side: a serial one, or with
+ * `workers` above zero a partial one over a partial child, each participant
+ * testing the outer rows its share of the child returns.  `run` is what the
+ * node does over the fact side for `childrows` outer rows (one participant's
+ * share, in a partial path), and `collect` and `walk` its two choices, all of
+ * them lion_cost_fkjoin_path()'s: they do not depend on which of the outer
+ * side's paths the child is.
+ *
+ * The path's rows are the join rel's, core's estimate of the semi or anti
+ * join - a participant's share of them, in a partial path - and it costs the
+ * child, the lookups and the existence tests, and cpu_tuple_cost and the
+ * target's cost per row it emits, as a join of core's does.
+ *
+ * STARTUP.  No row goes up before the first batch is tested whole: the
+ * child's first `firstrows` rows, read at their share of its run, and
+ * `startrun`, what the fact side does for them - the fact filters located
+ * and collected, and the batch's lookups and existence tests - so that a
+ * LIMIT above prices the wait.  A plan that looks the keys up a row at a time
+ * has a batch of one row.
+ *
+ * ORDER.  A plan that looks the keys up a row at a time emits the child's
+ * rows in the child's order.  One that walks the fk index in key order
+ * (LION_JOINFLAG_WALK), and every plan over a partitioned fact, reads the
+ * child a batch at a time and sorts the batch into the index's key order;
+ * the join path counts the batch whole and hands its surviving rows up in
+ * their own order again (LION_JOINFLAG_ORDERED, lion_join_batch_unsort()) -
+ * so it claims the child's pathkeys, as a nested loop claims its outer
+ * side's, where the join rel has a use for them (build_join_pathkeys()).
+ */
+static void
+lion_add_semijoin_path(PlannerInfo *root, const LionFkJoin *fj,
+					   const LionFkJoinSetup *setup, Path *child, int workers,
+					   int jointype, Cost run, Cost startrun, double firstrows,
+					   bool collect, bool walk, double childrows,
+					   bool parallel_safe)
+{
+	RelOptInfo *joinrel = fj->joinrel;
+	PathTarget *target = joinrel->reltarget;
+	bool		partial = (workers > 0);
+	CustomPath *cpath;
+	List	   *pathkeys;
+	double		rows;
+	double		childshare;
+	Cost		startup;
+	Cost		total;
+	int			flags;
+	ListCell   *lc;
+
+	/* the child's rows carry every outer column the join rel's do, and the key */
+	if (!lion_path_has_var(child, fj->pkvar))
+		return;
+	foreach(lc, target->exprs)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (bms_is_member(v->varno, fj->dimchild->relids) &&
+			!lion_path_has_var(child, v))
+			return;
+	}
+
+	pathkeys = build_join_pathkeys(root, joinrel, fj->jointype,
+								   child->pathkeys);
+	flags = LION_JOINFLAG_ROWS | LION_JOINFLAG_OUTER |
+		(collect ? LION_JOINFLAG_COLLECT : 0) |
+		(walk ? LION_JOINFLAG_WALK : 0) |
+		(pathkeys != NIL ? LION_JOINFLAG_ORDERED : 0);
+
+	rows = partial ?
+		clamp_row_est(Min(joinrel->rows / lion_parallel_divisor(workers),
+						  childrows)) :
+		joinrel->rows;
+
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = joinrel;
+	cpath->path.pathtarget = target;
+	cpath->path.param_info = NULL;
+	cpath->path.parallel_aware = partial;
+	cpath->path.parallel_safe = parallel_safe;
+	cpath->path.parallel_workers = workers;
+	cpath->path.pathkeys = pathkeys;
+	cpath->path.rows = rows;
+	total = child->total_cost + run + target->cost.startup +
+		rows * (cpu_tuple_cost + target->cost.per_tuple);
+	childshare = Min(firstrows / Max(child->rows, 1.0), 1.0);
+	startup = child->startup_cost +
+		(child->total_cost - child->startup_cost) * childshare +
+		startrun + target->cost.startup;
+	cpath->path.startup_cost = Min(startup, total);
+	cpath->path.total_cost = total;
+#if PG_VERSION_NUM >= 180000
+	cpath->path.disabled_nodes = child->disabled_nodes;
+#endif
+
+	/*
+	 * It projects, as core's joins do: a target list other than the join
+	 * rel's - the query's own, over the topmost join - is computed by the
+	 * node from its row (lion_plan_fkjoin_path()), with no Result above it.
+	 */
+	cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+	cpath->custom_paths = list_make1(child);
+#if PG_VERSION_NUM >= 170000
+	cpath->custom_restrictinfo = NIL;
+#endif
+	cpath->custom_private = lion_fkjoin_private(setup->base,
+												setup->joinclause, jointype,
+												flags, InvalidOid, InvalidOid);
+	cpath->methods = (jointype == LION_JOIN_ANTI) ?
+		&lion_antijoin_path_methods : &lion_semijoin_path_methods;
+
+	if (partial)
+		add_partial_path(joinrel, &cpath->path);
+	else
+		add_path(joinrel, &cpath->path);
+}
+
+/*
+ * THE SEMI OR ANTI JOIN AS A JOIN PATH (DESIGN.md §27, "The semi and anti
+ * join as a join path"): the rest of lion_try_count_path() for a join rel of
+ * an outer side semi- or anti-joined to the fact `rel` on one key
+ * (lion_fkjoin_recognize_join(), fj->joinpath).  The caller has analysed the
+ * fact's filters exactly as for the upper node; this adds the key, finds the
+ * fact's indexes (lion_fkjoin_setup()) and adds a path of the join rel over
+ * each path of the outer side, and a partial one over its partial paths.
+ *
+ * The node is the upper node's machinery with the upper node's rows: per
+ * child row, the key looked up in the fact's fk index and tested for a
+ * visible row under the fact filters (their collected copy or the probes;
+ * key-order batches; a partitioned fact's leaves each looked up, any or none
+ * of them matching; the §9 interlock per leaf), and the row emitted when the
+ * semi join has a match, or when the anti join has none - a NULL key, which
+ * joins nothing, included.  Its target is the join rel's, which holds only
+ * columns of the outer side, read from the child's row, and in a semi join
+ * the fact's key (below).  No uniqueness is asked: each outer row is tested
+ * and emitted on its own, however many share its key.
+ */
+static void
+lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
+					   const LionFkJoin *fj, List *whereattnos,
+					   List *clauseinfos, List *whereclauses,
+					   List *whereconsts, List *wherekinds, List *whereopnos,
+					   List *whereinor, List *ors, const LionImply *imply)
+{
+	RelOptInfo *joinrel = fj->joinrel;
+	RelOptInfo *outerrel = fj->dimchild;
+	PathTarget *target = joinrel->reltarget;
+	LionFkJoinSetup setup;
+	int			jointype;
+	double		dimrows;
+	double		rowbytes;
+	double		perbatch;
+	double		firstrows;
+	bool		parallel;
+	bool		partitioned;
+	bool		collect;
+	bool		walk;
+	Cost		run;
+	Cost		startrun;
+	ListCell   *lc;
+
+	/*
+	 * ---- what the join rel's rows carry ----
+	 *
+	 * Columns of the outer side, which the node reads from its child's row -
+	 * of any kind (a system column, a whole-row Var): it passes them through
+	 * as they come.  A semi join's rows may carry the fact's join column too:
+	 * core's semi join hands up its first matching fact row's, which an
+	 * equivalence class of the key needs above the join - `EXISTS` on two
+	 * facts correlated to one key makes one class of the three columns, and
+	 * the join with the second fact may compare the first fact's column with
+	 * the second's.  The node emits the outer row's key in its place, which is
+	 * every matching fact row's value when the join operator is the type's own
+	 * equality and implies one representation (lion_fkjoin_fk_is_key(), §10's
+	 * value rule).  Anything else - a PlaceHolderVar, another fact column, an
+	 * anti join's fact column, which has no row to come from - declines.
+	 */
+	foreach(lc, target->exprs)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!IsA(v, Var) || v->varlevelsup != 0)
+			return;
+		if (bms_is_member(v->varno, outerrel->relids))
+			continue;
+		if (v->varno == fj->fkvar->varno &&
+			v->varattno == fj->fkvar->varattno &&
+			lion_fkjoin_fk_is_key(fj))
+			continue;
+		return;
+	}
+
+	/* ---- the join key and the fact's indexes ---- */
+	if (!lion_fkjoin_setup(root, rel, fj, whereattnos, clauseinfos,
+						   whereclauses, whereconsts, wherekinds, whereopnos,
+						   whereinor, ors, imply, target->exprs, NIL, &setup))
+		return;
+	jointype = (fj->jointype == JOIN_SEMI) ? LION_JOIN_SEMI : LION_JOIN_ANTI;
+
+	/*
+	 * May it run in a worker: the rules of the upper node (lion_try_fkjoin_path()),
+	 * with the join rel in the grouped rel's place.
+	 */
+	parallel = (joinrel->consider_parallel && rel->consider_parallel &&
+				outerrel->consider_parallel &&
+				is_parallel_safe(root, (Node *) setup.consts));
+
+	/*
+	 * ---- serial: over each path of the outer side ----
+	 *
+	 * Every outer row is tested: an existence test per row, priced as the
+	 * upper node prices a reverse semi join's (found = every row, "Cost,
+	 * revisited"), with nothing taken off for the rows core's estimate says
+	 * have no match.  What the node does over the fact side is the same over
+	 * every path of the outer side, which differ in their own cost and order
+	 * only.
+	 */
+	dimrows = clamp_row_est(outerrel->rows);
+	rowbytes = (double) LION_FKJOIN_BATCH_ENT_BYTES +
+		MAXALIGN(outerrel->reltarget->width);
+	run = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar,
+								setup.joinclause, setup.whereclauses,
+								setup.wherekinds, ors, dimrows, dimrows, true,
+								rowbytes, 0, &collect, &walk, false);
+
+	/*
+	 * The first batch, which is all tested before a row goes up (the startup
+	 * cost, lion_add_semijoin_path()): the rows work_mem holds
+	 * (lion_join_batch_rows()) when the keys are looked up in key order or
+	 * over a partitioned fact's leaves, and otherwise one row - never more
+	 * than the child's - priced under the choices the whole run made.
+	 */
+	partitioned = (list_length(setup.targets) > 1 ||
+				   ((LionCountTarget *) linitial(setup.targets))->rel != rel);
+	perbatch = lion_join_batch_rows(rowbytes);
+	firstrows = (walk || partitioned) ? Min(perbatch, dimrows) : 1.0;
+	startrun = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar,
+									 setup.joinclause, setup.whereclauses,
+									 setup.wherekinds, ors, firstrows,
+									 firstrows, true, rowbytes, 0, &collect,
+									 &walk, true);
+	foreach(lc, outerrel->pathlist)
+	{
+		Path	   *child = (Path *) lfirst(lc);
+
+		if (child->param_info != NULL)
+			continue;
+		lion_add_semijoin_path(root, fj, &setup, child, 0, jointype, run,
+							   startrun, firstrows, collect, walk, dimrows,
+							   parallel && child->parallel_safe);
+	}
+
+	/*
+	 * ---- parallel: over each partial path of the outer side ----
+	 *
+	 * The upper node's rules ("Parallel"): each participant tests the rows its
+	 * share of the child returns, collecting the fact filters' copy with the
+	 * others where the plan collects them ("One copy per query"), and the
+	 * workers are what a parallel scan of the fk index pages the lookups read
+	 * would get, or the child's, whichever is more - unless the key's table
+	 * has a parallel_workers setting, which decides alone.  Core puts the
+	 * Gather above it, as over any partial path of a join rel.
+	 */
+	if (parallel && outerrel->partial_pathlist != NIL)
+	{
+		Path	   *cheapest = (Path *) linitial(outerrel->partial_pathlist);
+		int			workers;
+
+		workers = compute_parallel_worker(fj->dimrel, -1,
+										  setup.fkpages *
+										  Min(dimrows /
+											  lion_fkjoin_fk_ndistinct(root, rel,
+																	   fj->fkvar),
+											  1.0),
+										  max_parallel_workers_per_gather);
+		if (fj->dimrel->rel_parallel_workers == -1)
+			workers = Max(workers, cheapest->parallel_workers);
+		if (workers > 0)
+		{
+			double		childrows = clamp_row_est(dimrows /
+												  lion_parallel_divisor(workers));
+
+			run = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar,
+										setup.joinclause, setup.whereclauses,
+										setup.wherekinds, ors, childrows,
+										childrows, true, rowbytes, workers,
+										&collect, &walk, false);
+			/* a participant's first batch, of its share of the child */
+			firstrows = (walk || partitioned) ? Min(perbatch, childrows) : 1.0;
+			startrun = lion_cost_fkjoin_path(root, rel, setup.targets,
+											 fj->fkvar, setup.joinclause,
+											 setup.whereclauses,
+											 setup.wherekinds, ors, firstrows,
+											 firstrows, true, rowbytes,
+											 workers, &collect, &walk, true);
+			foreach(lc, outerrel->partial_pathlist)
+			{
+				Path	   *child = (Path *) lfirst(lc);
+
+				if (child->param_info != NULL)
+					continue;
+				lion_add_semijoin_path(root, fj, &setup, child, workers,
+									   jointype, run, startrun, firstrows,
+									   collect, walk, childrows, true);
+			}
+		}
 	}
 }
 
@@ -10427,18 +10942,29 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	Cost		serialrun;		/* the serial node's price, without HAVING */
 	ListCell   *lc;
 
-	/* ---- the query as a whole ---- */
+	/*
+	 * ---- the query as a whole ----
+	 *
+	 * A semi or anti join path (fj->joinpath, DESIGN.md §27, "The semi and
+	 * anti join as a join path") is a join rel's rows, whatever the query
+	 * does with them above - but in a SELECT only, and with no row marks:
+	 * a row the statement locks or modifies would have its EvalPlanQual
+	 * recheck made through a join the node replaces, which it does not do.
+	 */
 	if (parse->commandType != CMD_SELECT)
-		return;
-	if (!parse->hasAggs)
-		return;
-	if (parse->groupingSets != NIL)
-		return;
-	if (parse->hasWindowFuncs || parse->hasTargetSRFs ||
-		parse->hasDistinctOn || parse->distinctClause != NIL)
 		return;
 	if (parse->rowMarks != NIL || root->rowMarks != NIL)
 		return;
+	if (fj == NULL || !fj->joinpath)
+	{
+		if (!parse->hasAggs)
+			return;
+		if (parse->groupingSets != NIL)
+			return;
+		if (parse->hasWindowFuncs || parse->hasTargetSRFs ||
+			parse->hasDistinctOn || parse->distinctClause != NIL)
+			return;
+	}
 
 	/*
 	 * HAVING (DESIGN.md §10).  By now it is an implicit-AND list of the
@@ -10452,6 +10978,8 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 */
 	having = (extra != NULL) ? (List *) extra->havingQual :
 		(List *) parse->havingQual;
+	if (fj != NULL && fj->joinpath)
+		having = NIL;			/* a join path's rows are no groups */
 
 	/* The FK-side join counts the fact rel's posting sets (DESIGN.md §27). */
 	if (fj != NULL)
@@ -10981,10 +11509,17 @@ unanswerable:
 		imply.skipped = impliedtexts;
 		imply.leafclauses = whereclauses;
 		imply.ors = ors;
-		lion_try_fkjoin_path(root, input_rel, output_rel, extra, fj, having,
-							 whereattnos, clauseinfos, whereclauses,
-							 whereconsts, wherekinds, whereopnos, whereinor,
-							 ors, partitioned ? &imply : NULL);
+		if (fj->joinpath)
+			lion_try_semijoin_path(root, input_rel, fj, whereattnos,
+								   clauseinfos, whereclauses, whereconsts,
+								   wherekinds, whereopnos, whereinor, ors,
+								   partitioned ? &imply : NULL);
+		else
+			lion_try_fkjoin_path(root, input_rel, output_rel, extra, fj,
+								 having, whereattnos, clauseinfos,
+								 whereclauses, whereconsts, wherekinds,
+								 whereopnos, whereinor, ors,
+								 partitioned ? &imply : NULL);
 		return;
 	}
 
@@ -11894,6 +12429,42 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 }
 
 /*
+ * set_join_pathlist_hook: the FK-side semi or anti join as a JOIN path
+ * (DESIGN.md §27, "The semi and anti join as a join path").  A join rel of
+ * an outer side - any rel - semi- or anti-joined to one fact table on one
+ * key gets a path that emits the outer side's rows with (or without) a
+ * match, from a lookup of each row's key in the fact's posting sets, for
+ * whatever needs those rows above: another join, a sort, an aggregate, or
+ * the upper node itself as its joined dimension ("A dimension that is a
+ * join").  lion_fkjoin_recognize_join() says whether this call is one;
+ * lion_try_count_path() then checks the fact side exactly as for the upper
+ * node, and lion_try_semijoin_path() adds the paths.  Chained to any hook
+ * installed before ours, which runs first.
+ */
+void
+lion_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
+					   RelOptInfo *outerrel, RelOptInfo *innerrel,
+					   JoinType jointype, JoinPathExtraData *extra)
+{
+	LionFkJoin	fj;
+
+	if (lion_prev_set_join_pathlist_hook != NULL)
+		lion_prev_set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
+										 jointype, extra);
+
+	if (!lion_enable_count_pushdown || !lion_enable_semijoin)
+		return;
+	if (jointype != JOIN_SEMI && jointype != JOIN_ANTI)
+		return;
+	if (lion_old_snapshot_threshold_active())
+		return;
+	if (!lion_fkjoin_recognize_join(root, joinrel, outerrel, innerrel,
+									jointype, extra, &fj))
+		return;
+	lion_try_count_path(root, innerrel, joinrel, NULL, &fj);
+}
+
+/*
  * The position of a dimension column in the child plan's target list, which
  * the executor reads it from (DESIGN.md §27).  The child was planned with
  * CP_EXACT_TLIST from the dimension rel's own target, which holds every
@@ -11935,6 +12506,11 @@ lion_child_resno(Plan *child, Var *var)
  * count(*) (LION_JOINFLAG_COUNTS) - and they, or the partial counts, may
  * carry the fact's join column, which is read from the key's column of the
  * child.
+ *
+ * A semi or anti join path (LION_JOINFLAG_OUTER) is a join rel's: its target
+ * list is the join rel's rows, the outer side's columns - and a semi join's
+ * fact key where an equivalence class needs it, which is read from the key's
+ * column too - and it is named LionSemiJoin or LionAntiJoin.
  */
 static Plan *
 lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
@@ -11985,6 +12561,18 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 						   PVC_INCLUDE_AGGREGATES |
 						   PVC_RECURSE_WINDOWFUNCS |
 						   PVC_INCLUDE_PLACEHOLDERS);
+
+	/*
+	 * A semi or anti join path projects (CUSTOMPATH_SUPPORT_PROJECTION): the
+	 * target list core hands it may be another than its path's - or none, when
+	 * core means to put its own on the plan afterwards (a ProjectionPath above,
+	 * create_projection_plan()) - so its tuple is every column of the join
+	 * rel's rows, from which any such target list is computed.
+	 */
+	if ((lthird_int(join) & LION_JOINFLAG_OUTER) != 0)
+		want = list_concat(want,
+						   pull_var_clause((Node *) best_path->path.pathtarget->exprs,
+										   PVC_RECURSE_PLACEHOLDERS));
 	want = lappend(want, keyvar);
 
 	foreach(lc, want)
@@ -11996,7 +12584,7 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 
 		if (IsA(expr, Var) && ((Var *) expr)->varno == (int) factrelid &&
 			((Var *) expr)->varattno == fkattno &&
-			lsecond_int(join) == LION_JOIN_INNER)
+			lsecond_int(join) != LION_JOIN_ANTI)
 			kind = LION_TL_CHILDCOL(keyresno);
 		else if (IsA(expr, Var))
 			kind = LION_TL_CHILDCOL(lion_child_resno(child, (Var *) expr));
@@ -12043,7 +12631,16 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	cscan->custom_scan_tlist = ctlist;
 	cscan->custom_relids = rel->relids;
 	cscan->custom_private = lappend(priv, kinds);
-	cscan->methods = &lion_count_scan_methods;
+
+	/*
+	 * A semi or anti join path (LION_JOINFLAG_OUTER, DESIGN.md §27, "The semi
+	 * and anti join as a join path") is named for what it is in EXPLAIN.
+	 */
+	if ((lthird_int(join) & LION_JOINFLAG_OUTER) != 0)
+		cscan->methods = (lsecond_int(join) == LION_JOIN_ANTI) ?
+			&lion_antijoin_scan_methods : &lion_semijoin_scan_methods;
+	else
+		cscan->methods = &lion_count_scan_methods;
 
 	return &cscan->scan.plan;
 }
@@ -12060,6 +12657,10 @@ lion_count_scan_register(void)
 		RegisterCustomScanMethods(&lion_count_scan_methods);
 	if (GetCustomScanMethods("LionJoinAgg", true) == NULL)
 		RegisterCustomScanMethods(&lion_join_agg_scan_methods);
+	if (GetCustomScanMethods("LionSemiJoin", true) == NULL)
+		RegisterCustomScanMethods(&lion_semijoin_scan_methods);
+	if (GetCustomScanMethods("LionAntiJoin", true) == NULL)
+		RegisterCustomScanMethods(&lion_antijoin_scan_methods);
 }
 
 /*
@@ -13064,6 +13665,8 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->joinrows = false;
 	st->joinsum = false;
 	st->joincounts = false;
+	st->joinouter = false;
+	st->joinordered = false;
 	st->joinunique = false;
 	st->joinwalk = false;
 	st->joinsortop = InvalidOid;
@@ -13079,6 +13682,8 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		st->joinrows = (lthird_int(join) & LION_JOINFLAG_ROWS) != 0;
 		st->joinsum = (lthird_int(join) & LION_JOINFLAG_SUM) != 0;
 		st->joincounts = (lthird_int(join) & LION_JOINFLAG_COUNTS) != 0;
+		st->joinouter = (lthird_int(join) & LION_JOINFLAG_OUTER) != 0;
+		st->joinordered = (lthird_int(join) & LION_JOINFLAG_ORDERED) != 0;
 		st->joinunique = (lthird_int(join) & LION_JOINFLAG_UNIQUE) != 0;
 		st->joinwalk = (lthird_int(join) & LION_JOINFLAG_WALK) != 0;
 		st->joinsortop = (Oid) list_nth_int(join, 3);
@@ -13094,7 +13699,11 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 			  !OidIsValid(st->joinsortop))) ||
 			(st->joinsum && st->joinrows) ||
 			(st->joincounts &&
-			 (!st->joinrows || st->jointype != LION_JOIN_INNER)))
+			 (!st->joinrows || st->jointype != LION_JOIN_INNER)) ||
+			(st->joinouter &&
+			 (!st->joinrows || st->jointype == LION_JOIN_INNER ||
+			  st->joinunique || st->joincounts)) ||
+			(st->joinordered && !st->joinouter))
 			elog(ERROR, "LionCount: malformed join");
 	}
 
@@ -17963,9 +18572,6 @@ lion_join_next_key(LionCountScanState *st)
  * "Visibility and the §9 interlock").
  */
 
-/* The most rows a batch takes whatever work_mem allows: its array's limit. */
-#define LION_JOIN_BATCH_MAX		((int) (MaxAllocSize / sizeof(LionJoinEnt) - 1))
-
 static void lion_pause_run(LionCountScanState *st);
 
 /* The directory's order of two batched rows; NULL keys (an anti join's) first. */
@@ -18118,6 +18724,62 @@ lion_join_batch_row(LionCountScanState *st, const LionJoinEnt *ent)
 }
 
 /*
+ * One batched key looked up in the relation being counted - walked to in key
+ * order, or descended to - and its set counted, or tested, and let go of; or,
+ * when it is the key the batch looked up last, that key's answer again (a
+ * duplicated key comes out of the batch's sort next to the first).  Whether
+ * it has an entry at all in *foundp.  After a lookup, the fact filters a plan
+ * probes are collected from here on if probing has cost what that would
+ * (lion_join_maybe_switch(), or lion_join_part_maybe_switch() for leaf
+ * partition `part` of a partitioned fact; -1 for a plain one).
+ */
+static int64
+lion_join_lookup_ent(LionCountScanState *st, const LionJoinEnt *ent,
+					 bool walked, int part, bool *foundp)
+{
+	MemoryContext oldcxt;
+	instr_time	t;
+	bool		found;
+	int64		count;
+
+	if (st->joinlasthave &&
+		datumIsEqual(ent->key, st->joinlastkey, st->joinkeybyval,
+					 st->joinkeylen))
+	{
+		*foundp = st->joinlastfound;
+		return st->joinlastcount;
+	}
+
+	INSTR_TIME_SET_ZERO(t);
+	lion_join_clock(st, -1, &t);
+	MemoryContextReset(st->pergroup);
+	oldcxt = MemoryContextSwitchTo(st->pergroup);
+	found = walked ?
+		lion_lookup_walk_find(&st->joinwalker, ent->key, ent->hash,
+							  &st->groupset) :
+		lion_lookup_walk_descend(&st->joinwalker, ent->key, &st->groupset);
+	lion_join_clock(st, LION_JT_LOOKUP, &t);
+	count = found ? lion_join_count_key(st) : 0;
+	lion_posting_set_release(&st->groupset);
+	MemoryContextSwitchTo(oldcxt);
+	lion_join_clock(st, LION_JT_COUNT, &t);
+
+	st->joinlasthave = true;
+	st->joinlastkey = ent->key;
+	st->joinlastfound = found;
+	st->joinlastcount = count;
+
+	/* probed so far, and collected from here on if that pays */
+	if (part < 0)
+		lion_join_maybe_switch(st);
+	else
+		lion_join_part_maybe_switch(st, part);
+
+	*foundp = found;
+	return count;
+}
+
+/*
  * lion_join_next_row() for a plan that looks the keys up in key order: the
  * same rows, counted the same way, from the batches above.
  */
@@ -18125,7 +18787,6 @@ static bool
 lion_join_next_walked(LionCountScanState *st, int64 *countp)
 {
 	bool		anti = (st->jointype == LION_JOIN_ANTI);
-	MemoryContext oldcxt;
 
 	for (;;)
 	{
@@ -18159,38 +18820,7 @@ lion_join_next_walked(LionCountScanState *st, int64 *countp)
 			return true;
 		}
 		st->joinlookups++;
-
-		if (st->joinlasthave &&
-			datumIsEqual(ent->key, st->joinlastkey, st->joinkeybyval,
-						 st->joinkeylen))
-		{
-			found = st->joinlastfound;
-			count = st->joinlastcount;
-		}
-		else
-		{
-			instr_time	t;
-
-			INSTR_TIME_SET_ZERO(t);
-			lion_join_clock(st, -1, &t);
-			MemoryContextReset(st->pergroup);
-			oldcxt = MemoryContextSwitchTo(st->pergroup);
-			found = lion_lookup_walk_find(&st->joinwalker, ent->key, ent->hash,
-										  &st->groupset);
-			lion_join_clock(st, LION_JT_LOOKUP, &t);
-			count = found ? lion_join_count_key(st) : 0;
-			lion_posting_set_release(&st->groupset);
-			MemoryContextSwitchTo(oldcxt);
-			lion_join_clock(st, LION_JT_COUNT, &t);
-
-			st->joinlasthave = true;
-			st->joinlastkey = ent->key;
-			st->joinlastfound = found;
-			st->joinlastcount = count;
-
-			/* probed so far, and collected from here on if that pays */
-			lion_join_maybe_switch(st);
-		}
+		count = lion_join_lookup_ent(st, ent, true, -1, &found);
 
 		if (!found)
 			st->joinmissing++;
@@ -18510,7 +19140,6 @@ lion_join_count_parts(LionCountScanState *st)
 {
 	bool		exists = (st->jointype != LION_JOIN_INNER ||
 						  (st->joinrows && !st->joincounts));
-	MemoryContext oldcxt;
 	int			p;
 	int			k;
 
@@ -18539,41 +19168,7 @@ lion_join_count_parts(LionCountScanState *st)
 				continue;
 			CHECK_FOR_INTERRUPTS();
 			st->joinlookups++;
-
-			if (st->joinlasthave &&
-				datumIsEqual(ent->key, st->joinlastkey, st->joinkeybyval,
-							 st->joinkeylen))
-			{
-				found = st->joinlastfound;
-				count = st->joinlastcount;
-			}
-			else
-			{
-				instr_time	t;
-
-				INSTR_TIME_SET_ZERO(t);
-				lion_join_clock(st, -1, &t);
-				MemoryContextReset(st->pergroup);
-				oldcxt = MemoryContextSwitchTo(st->pergroup);
-				found = walked ?
-					lion_lookup_walk_find(&st->joinwalker, ent->key, ent->hash,
-										  &st->groupset) :
-					lion_lookup_walk_descend(&st->joinwalker, ent->key,
-											 &st->groupset);
-				lion_join_clock(st, LION_JT_LOOKUP, &t);
-				count = found ? lion_join_count_key(st) : 0;
-				lion_posting_set_release(&st->groupset);
-				MemoryContextSwitchTo(oldcxt);
-				lion_join_clock(st, LION_JT_COUNT, &t);
-
-				st->joinlasthave = true;
-				st->joinlastkey = ent->key;
-				st->joinlastfound = found;
-				st->joinlastcount = count;
-
-				/* probed so far, and collected from here on if that pays */
-				lion_join_part_maybe_switch(st, p);
-			}
+			count = lion_join_lookup_ent(st, ent, walked, p, &found);
 			if (!found)
 				st->joinmissing++;
 			ent->acc += count;
@@ -18587,9 +19182,68 @@ lion_join_count_parts(LionCountScanState *st)
 }
 
 /*
+ * A semi or anti join path's batch over a plain fact table (DESIGN.md §27,
+ * "The semi and anti join as a join path"), walked in key order: every key of
+ * it tested before any of its rows goes up - into the key's entry, as a
+ * partitioned fact's are (lion_join_count_parts()) - so that the rows can go
+ * up in the child's order, and the walk keeps its place from one key to the
+ * next without a row going up in between.
+ */
+static void
+lion_join_count_batch(LionCountScanState *st)
+{
+	int			k;
+
+	for (k = 0; k < st->joinbatchn; k++)
+	{
+		LionJoinEnt *ent = &st->joinbatch[k];
+		bool		found;
+
+		if (ent->isnull)
+			continue;
+		CHECK_FOR_INTERRUPTS();
+		st->joinlookups++;
+		ent->acc = lion_join_lookup_ent(st, ent, true, -1, &found);
+		if (!found)
+			st->joinmissing++;
+	}
+}
+
+/*
+ * The batch back into the child's order, from the key order its lookups took
+ * (LION_JOINFLAG_ORDERED): each row's place in the child's order is its
+ * `seq`, 0 to n - 1, so a row is swapped into its place until every place
+ * holds its own - n swaps at most, and no comparison.
+ */
+static void
+lion_join_batch_unsort(LionCountScanState *st)
+{
+	int			i;
+
+	for (i = 0; i < st->joinbatchn; i++)
+	{
+		while (st->joinbatch[i].seq != i)
+		{
+			int			j = st->joinbatch[i].seq;
+			LionJoinEnt tmp = st->joinbatch[j];
+
+			Assert(j >= 0 && j < st->joinbatchn && j != i);
+			st->joinbatch[j] = st->joinbatch[i];
+			st->joinbatch[i] = tmp;
+		}
+	}
+}
+
+/*
  * lion_join_next_row() for a partitioned fact table: the same rows, each with
  * its counts summed over the partitions (lion_join_count_parts()).  A NULL
  * key joins nothing, in any partition.
+ *
+ * And for a semi or anti join path over a plain fact table walked in key
+ * order, whose batch is tested whole first (lion_join_count_batch()).  Either
+ * way the rows of a join path whose order is claimed go up in the child's
+ * order (lion_join_batch_unsort()); the others in the order the last walk
+ * left them, or the child's where nothing sorted them.
  */
 static bool
 lion_join_next_parts(LionCountScanState *st, int64 *countp)
@@ -18611,8 +19265,15 @@ lion_join_next_parts(LionCountScanState *st, int64 *countp)
 				lion_join_batch_reset(st);
 				return false;
 			}
-			memset(&st->joinorder, 0, sizeof(st->joinorder));
-			lion_join_count_parts(st);
+			if (st->joinpart != NULL)
+			{
+				memset(&st->joinorder, 0, sizeof(st->joinorder));
+				lion_join_count_parts(st);
+			}
+			else
+				lion_join_count_batch(st);
+			if (st->joinordered)
+				lion_join_batch_unsort(st);
 		}
 		ent = &st->joinbatch[st->joinbatchpos++];
 
@@ -18745,7 +19406,14 @@ lion_next_join_row(LionCountScanState *st)
 		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, total);
 	}
 
-	if (!(walked ? lion_join_next_walked(st, &count) :
+	/*
+	 * A semi or anti join path tests a walked batch whole before its rows go
+	 * up, in the child's order where the path claims it (DESIGN.md §27, "The
+	 * semi and anti join as a join path"); a row at a time, its rows are in
+	 * the child's order anyway.
+	 */
+	if (!(walked ? (st->joinouter ? lion_join_next_parts(st, &count) :
+					lion_join_next_walked(st, &count)) :
 		  lion_join_next_row(st, &count)))
 	{
 		st->done = true;
@@ -20317,9 +20985,11 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		 * A forward semi join over a non-unique key counts the fact rows of
 		 * each DISTINCT key of the dimension, which it sorts to find them.
 		 */
-		if (st->jointype == LION_JOIN_SEMI || st->joinunique)
+		/* ... which a semi or anti join path's name says (LionSemiJoin) */
+		if (!st->joinouter &&
+			(st->jointype == LION_JOIN_SEMI || st->joinunique))
 			ExplainPropertyText("Join Type", "Semi", es);
-		else if (st->jointype == LION_JOIN_ANTI)
+		else if (!st->joinouter && st->jointype == LION_JOIN_ANTI)
 			ExplainPropertyText("Join Type", "Anti", es);
 		if (st->joinunique)
 			ExplainPropertyText("Join Keys", "distinct, sorted", es);
@@ -20330,7 +21000,21 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		 */
 		if (st->joinwalk)
 			ExplainPropertyText("Join Key Lookups", "in index order", es);
-		if (st->joinrows)
+		/*
+		 * A semi or anti join path's rows are the outer side's (DESIGN.md
+		 * §27, "The semi and anti join as a join path"), in the child's order
+		 * where the path claims it.
+		 */
+		if (st->joinouter)
+			ExplainPropertyText("Join Rows",
+								st->jointype == LION_JOIN_ANTI ?
+								(st->joinordered ?
+								 "the outer rows without a match, in their order" :
+								 "the outer rows without a match") :
+								(st->joinordered ?
+								 "the outer rows with a match, in their order" :
+								 "the outer rows with a match"), es);
+		else if (st->joinrows)
 			ExplainPropertyText("Join Rows",
 								st->jointype == LION_JOIN_ANTI ?
 								"the dimension rows without a match" :
