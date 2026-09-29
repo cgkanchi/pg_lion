@@ -88,7 +88,7 @@ $(OBJS): src/lion.h src/lion_compat.h src/lion_container.h src/lion_sparse.h src
 src/lion_count.o src/lion_customscan.o src/lion_am.o src/lion_ordered.o src/lion_scan.o \
           src/lion_funcs.o src/lion_selfuncs.o: src/lion_count.h
 src/lion_customscan.o src/lion_fkjoin.o: src/lion_fkjoin.h
-src/lion_costs.o src/lion_customscan.o src/lion_am.o: src/lion_costs.h
+src/lion_costs.o src/lion_customscan.o src/lion_am.o src/lion_ordered.o: src/lion_costs.h
 src/lion_build.o src/lion_spool.o: src/lion_spool.h
 
 # Crash-recovery and hot-standby tests (test/recovery/README.md).  These need a
