@@ -138,7 +138,7 @@ sparse_delete_range(LionContainer *s, uint32 from, uint32 count)
 		return;
 
 	/* ckeys: slide the tail down; this never reaches into los[] */
-	memmove(ckeys + from, ckeys + from + count,
+	memmove(&ckeys[from], &ckeys[from + count],
 			(Size) (n - from - count) * sizeof(uint32));
 
 	/*
@@ -147,7 +147,7 @@ sparse_delete_range(LionContainer *s, uint32 from, uint32 count)
 	 * tail second.
 	 */
 	memmove(newlos, los, (Size) from * sizeof(uint16));
-	memmove(newlos + from, los + from + count,
+	memmove(&newlos[from], &los[from + count],
 			(Size) (n - from - count) * sizeof(uint16));
 
 	s->cardinality = (uint16) newn;
@@ -249,9 +249,9 @@ lion_sparse_insert(LionContainer *s, uint32 ckey, uint16 lo, bool *dup)
 	 * los tail (up by 6 bytes), then the los head (up by 4), then the ckeys
 	 * tail (up by 4, into the 4 bytes the los array has just vacated).
 	 */
-	memmove(newlos + pos + 1, los + pos, (Size) (n - pos) * sizeof(uint16));
+	memmove(&newlos[pos + 1], &los[pos], (Size) (n - pos) * sizeof(uint16));
 	memmove(newlos, los, (Size) pos * sizeof(uint16));
-	memmove(ckeys + pos + 1, ckeys + pos, (Size) (n - pos) * sizeof(uint32));
+	memmove(&ckeys[pos + 1], &ckeys[pos], (Size) (n - pos) * sizeof(uint32));
 
 	ckeys[pos] = ckey;
 	newlos[pos] = lo;
