@@ -236,7 +236,13 @@ cost model leaves a large dimension set to the hash join. With parallel query en
 (`max_parallel_workers_per_gather`) it can run in parallel, each worker taking its share of the
 dimension rows, or of the distinct keys, which every worker sorts. The fact filters are collected
 once per process into memory bounded like a hash join's (`work_mem` × `hash_mem_multiplier`); past
-that the copy spills to a temporary file, as a hash join's table would. Their values may be
+that the copy spills to a temporary file, as a hash join's table would. Where the planner expects
+few dimension rows it may instead probe the fact filters at each dimension row's count; a run that
+meets far more rows, or far heavier keys, than it expected keeps an account of what probing has cost
+and collects the filters part way through once that reaches what collecting them costs, if the copy
+is expected to fit that memory (DESIGN.md §27, "Probed, then collected"; `EXPLAIN ANALYZE` prints
+`Fact Filters: probed, then collected`, `Fact Filter Switches` and `Fact Filter Keys Probed`, the
+keys counted by probing before each switch). Their values may be
 parameters and stable expressions as for a single table, an `IN` list whose array is a parameter
 (`o.status = ANY ($1)`) included: every process evaluates them once per scan.
 
@@ -479,7 +485,12 @@ fewest container keys - of 64 heap blocks each - a range of a parallel count cov
 (DESIGN.md §10, "A GROUP BY in parallel"; the planner prices the default),
 `pg_lion.enable_union_probe` (on), whether an AND of posting sets may look its few rows up in the
 containers of an `IN` list's or a multi-key query's union rather than build the union (DESIGN.md
-§29.11, "Unions probed"; the answers are the same either way), and
+§29.11, "Unions probed"; the answers are the same either way; `EXPLAIN ANALYZE` of a count prints
+`Unions Built` and `Unions Probed`), `pg_lion.enable_tree_probe` (on), the same for a nested tree -
+a tsquery `(a | b) & (c | d)`, an `OR` of `AND`s across columns - evaluated for the intersection's
+few rows rather than built (DESIGN.md §29.11, "Trees probed"; `Trees Built` and `Trees Probed`),
+`pg_lion.enable_filter_switch` (on), whether an FK-side join that probes its fact filters may
+collect them part way through (DESIGN.md §27, "Probed, then collected"), and
 `pg_lion.vacuum_barrier_ranges` (superuser), how many visited-block ranges VACUUM batches in rmgr
 mode (DESIGN.md §25).
 `pg_lion.rmgr_id` is described under `wal_mode` above.
@@ -503,7 +514,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `union_key_cost` | 30 | `cpu_operator_cost` | the union of an `IN` list's or a multi-key query's containers built at a container key |
 | `union_member_cost` | 0.25 | `cpu_operator_cost` | a member of such a union, or of the intersection ANDed with it |
 | `descent_cost` | 120 | `cpu_operator_cost` | a level of an entry directory descended |
-| `union_set_cost` | 100 | `cpu_tuple_cost` | a set of an `IN` list or `OR` rebuilt by each count of a GROUP BY or join |
+| `union_set_cost` | 100 | `cpu_tuple_cost` | a set of an `IN` list or `OR` rebuilt by each count of a GROUP BY |
 | `recheck_tid_cost` | 1.5 | `cpu_tuple_cost` | a candidate row of a count's heap recheck |
 | `recheck_group_tid_cost` | 6.0 | `cpu_tuple_cost` | the same in a grouped count |
 | `entry_count_cost` | 50 | `cpu_tuple_cost` | a count of a GROUP BY: an entry, or a pair of two |
@@ -513,15 +524,18 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `range_union_entry_cost` | 12 | `cpu_tuple_cost` | a small entry of a summed range, counted with its leaf |
 | `probe_step_cost` | 2.0 | `cpu_operator_cost` | a container of a set a summed range probes |
 | `range_fold_cost` | 420 | `cpu_operator_cost` | a fold into a container of a range's union, collected as a source, that is not a bitset |
-| `fkjoin_count_cost` | 25 | `cpu_tuple_cost` | an FK-side join's count, a dimension row |
-| `fkjoin_row_cost` | 10 | `cpu_tuple_cost` | a row the FK-side join hands up |
-| `fkjoin_probe_cost` | 80 | `cpu_operator_cost` | a probe of such a count into a fact filter |
+| `fkjoin_count_cost` | 14 | `cpu_tuple_cost` | an FK-side join's count that probes the fact filters, a dimension row |
+| `fkjoin_row_cost` | 20 | `cpu_tuple_cost` | a row the FK-side join hands up |
+| `fkjoin_probe_cost` | 10 | `cpu_operator_cost` | a probe of such a count into a fact filter |
+| `fkjoin_probe_page_cost` | 54 | `cpu_operator_cost` | a posting page such a probe reads |
+| `fkjoin_set_cost` | 11 | `cpu_tuple_cost` | a set of a fact filter that is a union (an `IN` list, an `OR`), a count that probes it |
+| `fkjoin_lookup_cost` | 75 | `cpu_operator_cost` | a key looked up on the directory leaf a lookup in key order stands on |
 | `fkjoin_collect_container_cost` | 2.0 | `cpu_operator_cost` | a container of the driving filter, read to collect the fact filters |
-| `fkjoin_copy_count_cost` | 25 | `cpu_tuple_cost` | a count against the collected copy |
-| `fkjoin_copy_probe_cost` | 5 | `cpu_operator_cost` | a lookup of the copy and its AND, an fk container |
+| `fkjoin_copy_count_cost` | 33 | `cpu_tuple_cost` | a count against the collected copy |
+| `fkjoin_copy_probe_cost` | 2.0 | `cpu_operator_cost` | a lookup of the copy and its AND, an fk container |
 | `fkjoin_copy_member_cost` | 3.0 | `cpu_operator_cost` | a member of that container |
 | `fkjoin_copy_container_cost` | 20 | `cpu_operator_cost` | a container of the copy made |
-| `fkjoin_batch_row_cost` | 120 | `cpu_operator_cost` | a dimension row's place in a batch looked up in key order |
+| `fkjoin_batch_row_cost` | 75 | `cpu_operator_cost` | a dimension row's place in a batch looked up in key order |
 | `fkjoin_sort_compare_cost` | 0.25 | `cpu_operator_cost` | a comparison in the sort that makes the dimension's keys distinct |
 | `fkjoin_sort_key_cost` | 6.0 | `cpu_operator_cost` | a key into and out of that sort |
 | `fkjoin_sort_seq_page_cost` | 0.75 | `seq_page_cost` | a page that sort writes or reads past `work_mem`, the sequential share |

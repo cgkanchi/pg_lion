@@ -3646,6 +3646,8 @@ static bool lion_or_probe_pays(const LionExprCursor *c,
 							   const LionContainer *acc);
 static void lion_or_probe(LionExprCursor *c, const LionContainer *acc,
 						  LionContainer *dest);
+static void lion_lazy_and(LionExprCursor *c, const LionContainer *acc,
+						  LionContainer *dest);
 static void lion_ecursor_build(LionExprCursor *c);
 static void lion_ecursor_next(LionExprCursor *c);
 static void lion_ecursor_seek(LionExprCursor *c, uint32 target);
@@ -3750,7 +3752,10 @@ lion_leapfrog_order(const double *est, int n, int *order)
  * members are looked up in the children's containers and the ones found
  * kept (lion_or_probe()), which is the same AND - acc ∩ (c1 ∪ ... ∪ ck) - at
  * the cost of the members the intersection has rather than of those the
- * union would have.
+ * union would have.  A cursor that is a nested tree - an AND node, an OR of
+ * ANDs or of ORs - is lazy the same way, wound to a key and not evaluated
+ * there, and is built or evaluated for acc's members alone the same way
+ * (lion_lazy_and(), lion_tree_probe(); DESIGN.md §29.11, "Trees probed").
  *
  * THE DESIGN.md §9 PIN DISCIPLINE IS UNCHANGED, and this is the argument.
  * The rule is that the visibility-map question about a container's heap
@@ -3841,11 +3846,8 @@ lion_leapfrog(LionExprCursor *cur, const int *order, int n,
 				acc = lion_ecursor_container(c);	/* a union is built here */
 			else
 			{
-				if (c->pending && lion_or_probe_pays(c, acc))
-					lion_or_probe(c, acc, work[*w]);
-				else
-					lion_container_and_raw(acc, lion_ecursor_container(c),
-										   work[*w]);
+				/* built and ANDed, or acc's members looked up in it */
+				lion_lazy_and(c, acc, work[*w]);
 				acc = work[*w];
 				*w ^= 1;
 			}
@@ -4548,6 +4550,21 @@ lion_or_hot_raw(LionExprCursor *c, uint32 ckey)
 }
 
 /*
+ * Is a node that drives a leapfrog still to be lazy there?  A union, yes: the
+ * leapfrog asks for its container at the keys it keeps, and building it at
+ * every key the union stands at would build it at keys the leapfrog gives up
+ * as well.  An AND node, no (DESIGN.md §29.11, "Trees probed"): wound to a
+ * key it seeks every child there before intersecting any, where its own
+ * leapfrog stops at the first child that empties the key - and as the driver
+ * it is intersected at every key it stands at anyway.
+ */
+static bool
+lion_leapfrog_lazy(const LionKeyNode *node)
+{
+	return node == NULL || node->kind != LION_KN_AND;
+}
+
+/*
  * Build the cursor of one planned node (lion_plan_node()).  droppins: carry
  * no interlock anywhere below - a child of a wide union, a child of a
  * trimmed AND other than the one that keeps its pins.  Its container is
@@ -4590,7 +4607,17 @@ lion_ecursor_init_ex(LionExprCursor *c, const LionNodePlan *plan,
 		return;					/* a source with no sets at all */
 
 	c->kind = node->kind;
-	c->lazy = lazy && node->kind == LION_KN_OR && !plan->wide;
+
+	/*
+	 * Lazy under a leapfrog: a union, not built until it is asked for, and -
+	 * where trees may be probed - an AND node, whose children are wound to a
+	 * key they all have a container at and not intersected until it is asked
+	 * for (DESIGN.md §29.11, "Unions probed" and "Trees probed").
+	 */
+	c->lazy = lazy && !plan->wide &&
+		(node->kind == LION_KN_OR ||
+		 (node->kind == LION_KN_AND && node->nargs > 1 &&
+		  lion_enable_tree_probe));
 
 	if (node->kind == LION_KN_KEY)
 	{
@@ -4604,23 +4631,19 @@ lion_ecursor_init_ex(LionExprCursor *c, const LionNodePlan *plan,
 	}
 	else
 	{
-		/* the children of a leapfrog: raw, and lazy where they are unions */
+		/*
+		 * The children of a leapfrog: raw, and lazy where they are unions or
+		 * trees - and so are the children of a lazy union, where trees may be
+		 * probed: an OR of ANDs is evaluated for the members it is probed
+		 * with, or built from its children's containers when it is asked for.
+		 */
 		bool		under = (node->kind == LION_KN_AND && node->nargs > 1);
+		bool		sublazy = under ||
+			(c->lazy && node->kind == LION_KN_OR && lion_enable_tree_probe);
 
 		Assert(node->nargs >= 1 && plan->nsub == node->nargs);
 		c->nsub = node->nargs;
 		c->sub = (LionExprCursor *) palloc0(sizeof(LionExprCursor) * c->nsub);
-		for (i = 0; i < c->nsub; i++)
-			lion_ecursor_init_ex(&c->sub[i], &plan->sub[i], sets, nsets, cx,
-								 droppins ||
-								 (plan->keep != LION_KEEP_ALL && plan->keep != i),
-								 under || raw, under);
-
-		if (c->nsub > 1)
-		{
-			c->acc[0] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
-			c->acc[1] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
-		}
 
 		if (node->kind == LION_KN_AND)
 		{
@@ -4632,6 +4655,27 @@ lion_ecursor_init_ex(LionExprCursor *c, const LionNodePlan *plan,
 			c->order = (int *) palloc(sizeof(int) * c->nsub);
 			lion_leapfrog_order(est, c->nsub, c->order);
 			pfree(est);
+		}
+
+		/*
+		 * ... but the child that drives an AND node's leapfrog is always
+		 * asked for its container, and an AND node there is built as it is
+		 * sought, with the early exit of its own leapfrog, rather than wound
+		 * to a key first (lion_leapfrog_lazy()).
+		 */
+		for (i = 0; i < c->nsub; i++)
+			lion_ecursor_init_ex(&c->sub[i], &plan->sub[i], sets, nsets, cx,
+								 droppins ||
+								 (plan->keep != LION_KEEP_ALL && plan->keep != i),
+								 under || raw,
+								 sublazy &&
+								 !(under && i == c->order[0] &&
+								   !lion_leapfrog_lazy(node->args[i])));
+
+		if (c->nsub > 1)
+		{
+			c->acc[0] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+			c->acc[1] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 		}
 
 		if (node->kind == LION_KN_OR)
@@ -4670,9 +4714,25 @@ lion_or_build(LionExprCursor *c)
 	int			w = 0;
 	int			i;
 
-	Assert(c->kind == LION_KN_OR && c->nhot > 1);
-	c->cx->stats.unions_built++;
+	Assert(c->kind == LION_KN_OR && c->nhot >= 1);
 	c->pending = false;
+
+	/*
+	 * A child still pending - an AND node of a lazy OR's, wound to the key
+	 * and not intersected (DESIGN.md §29.11, "Trees probed") - is built
+	 * first; the heap's entry carried no container for it.
+	 */
+	for (i = 0; i < c->nhot; i++)
+	{
+		if (c->hot[i].cur == NULL)
+			c->hot[i].cur = lion_ecursor_container(&c->sub[c->hot[i].child]);
+	}
+	if (c->nhot == 1)
+	{
+		c->cur = c->hot[0].cur;
+		return;
+	}
+	c->cx->stats.unions_built++;
 
 	if (c->raw)
 		c->cur = lion_or_hot_raw(c, c->ckey);
@@ -4703,12 +4763,19 @@ lion_or_build(LionExprCursor *c)
  * The container the cursor stands on, the union of a lazy OR's children
  * built if it has not been (lion_leapfrog()).
  */
+static void lion_and_build(LionExprCursor *c);
+
 static const LionContainer *
 lion_ecursor_container(LionExprCursor *c)
 {
 	Assert(c->valid);
 	if (c->pending)
-		lion_or_build(c);
+	{
+		if (c->kind == LION_KN_OR)
+			lion_or_build(c);
+		else
+			lion_and_build(c);
+	}
 	return c->cur;
 }
 
@@ -4766,6 +4833,9 @@ lion_ecursor_container(LionExprCursor *c)
 /* GUC pg_lion.enable_union_probe (DESIGN.md §29.11, "Unions probed") */
 bool		lion_enable_union_probe = true;
 
+/* GUC pg_lion.enable_tree_probe (DESIGN.md §29.11, "Trees probed") */
+bool		lion_enable_tree_probe = true;
+
 /*
  * 16 log2(x) for x >= 1, within a sixteenth or so: the leading bit's position
  * and the four bits after it, as a straight line between two powers of two.
@@ -4777,6 +4847,39 @@ lion_log2_16(uint32 x)
 	uint32		rest = x - ((uint32) 1 << k);
 
 	return (uint32) k * 16 + ((k >= 4) ? rest >> (k - 4) : rest << (4 - k));
+}
+
+/* A RUN's runs, as many as its payload may hold at most. */
+static inline uint32
+lion_up_runs(const LionContainer *h)
+{
+	return Min((uint32) LION_RUN_NRUNS((LionContainer *) h),
+			   (uint32) LION_RUN_MAX_NRUNS);
+}
+
+/*
+ * What looking a members up in container h costs, in quarters of a
+ * nanosecond: a bit test each in a BITSET; a search of a RUN's runs for a
+ * few, else a merge with them; a gallop through an ARRAY of m members,
+ * 1 + log2(1 + m/a) steps a member - 16 + 16 log2(16 + 16 m/a) - 64
+ * sixteenths.
+ */
+static inline uint64
+lion_up_lookup(const LionContainer *h, uint64 a)
+{
+	if (h->type == LION_CT_BITSET)
+		return LION_UP_BIT * a;
+	if (h->type == LION_CT_RUN)
+	{
+		uint32		r = lion_up_runs(h);
+
+		return ((uint64) r >= 8 * a) ?
+			LION_UP_RUNSEARCH * a * lion_log2_16(r + 1) / 16 :
+			LION_UP_RUNMERGE * r + LION_UP_RUNMERGE_A * a;
+	}
+	return LION_UP_GALLOP * a *
+		(lion_log2_16((uint32) (16 * lion_container_cardinality(h) / a) + 16) -
+		 48) / 16;
 }
 
 static bool
@@ -4805,30 +4908,19 @@ lion_or_probe_pays(const LionExprCursor *c, const LionContainer *acc)
 		uint64		m = lion_container_cardinality(h);
 
 		members += m;
+		probe += lion_up_lookup(h, a);
 		if (h->type == LION_CT_BITSET)
 		{
-			probe += LION_UP_BIT * a;
 			unite += LION_UP_BITSET_OR;
 			arrays = false;
 		}
 		else if (h->type == LION_CT_RUN)
 		{
-			uint32		r = Min((uint32) LION_RUN_NRUNS((LionContainer *) h),
-								(uint32) LION_RUN_MAX_NRUNS);
-
-			probe += ((uint64) r >= 8 * a) ?
-				LION_UP_RUNSEARCH * a * lion_log2_16(r + 1) / 16 :
-				LION_UP_RUNMERGE * r + LION_UP_RUNMERGE_A * a;
-			unite += LION_UP_RUN_OR * (uint64) r;
+			unite += LION_UP_RUN_OR * (uint64) lion_up_runs(h);
 			arrays = false;
 		}
 		else
-		{
-			/* 1 + log2(1 + m/a) steps: 16 + 16 log2(16 + 16 m/a) - 64 sixteenths */
-			probe += LION_UP_GALLOP * a *
-				(lion_log2_16((uint32) (16 * m / a) + 16) - 48) / 16;
 			unite += LION_UP_MEMBER_OR * m;
-		}
 	}
 
 	/* lion_or_hot_raw()'s two ways, and acc's AND with what it builds */
@@ -4858,6 +4950,421 @@ lion_or_probe(LionExprCursor *c, const LionContainer *acc, LionContainer *dest)
 		c->hotc[i] = c->hot[i].cur;
 	(void) lion_container_and_union_raw(acc, c->hotc, (uint32) c->nhot, dest);
 	c->cx->stats.unions_probed++;
+}
+
+/*
+ * TREES PROBED (DESIGN.md §29.11).  A source of the count's merge, or a child
+ * of an AND node, may be a tree of its own: a tsquery `(a | b | c) & (d |
+ * e)` is an AND of two ORs, and an OR across columns of ANDed clauses an OR
+ * of ANDs.  Such a tree was its own cursor, built whole at every key it was
+ * sought to: its AND node leapfrogged its children and its driver OR's
+ * union was always built - a bitset image of every member of every one of
+ * its sets' containers at the key - however few rows the running
+ * intersection that met it had left.  Where its sets are dense and the
+ * intersection is a key's own rows of an FK-side join's count, a row or two
+ * a container, all of that was spent to keep those few.
+ *
+ * So under a leapfrog an AND node is LAZY, as an OR is (lion_ecursor_init_ex()):
+ * sought to a key it winds its children to the first key at or after it that
+ * every one of them has a container at (lion_and_align()) and stops there,
+ * PENDING, its intersection not made; and the children of a lazy OR are lazy
+ * too.  The leapfrog that meets it then either builds it - the children's
+ * containers intersected at the key, each the cheaper of the two ways again
+ * (lion_and_build()) - and ANDs the running intersection with that, or
+ * evaluates the tree for the intersection's members alone (lion_tree_probe()):
+ * each leaf's container probed with the members still in question, an AND
+ * node's children each given the members the one before it kept, an OR
+ * node's the ones none before it found - the same members, acc ∩ tree, at the
+ * cost of acc's members a leaf rather than of the tree's.  Which is cheaper is
+ * estimated from the containers standing at the key (lion_tree_estimate(), in
+ * lion_or_probe_pays()'s units): the lookups of every member of acc in every
+ * leaf - which errs towards building - against the unions' images, their
+ * members and the ANDs building would make.
+ *
+ * THE DESIGN.md §9 ARGUMENT IS THE LEAPFROG'S (lion_leapfrog()), and a lazy
+ * AND adds nothing to it.  Winding the children to a key is what seeking them
+ * there is, and nothing of a key they pass over reaches the visibility map; a
+ * lazy node stands at its key with every child standing there too, each with
+ * the pin its container came with - a trimmed AND with its kept child's -
+ * until it moves past it; and what the probe keeps is a subset of the running
+ * intersection, whose members lie in containers the cursors before it stand
+ * on with their pins.  A node that is built is the eager node's container at
+ * that key, made the same way.  What changes is only that a key the tree has
+ * no row at is found out by the leapfrog that meets it - at the cost of its
+ * probe - rather than by the tree running ahead to its next row, which the
+ * leapfrog would then have sought every other source to.
+ */
+typedef struct LionTreeEst
+{
+	uint64		probe;			/* looking the members up in every leaf */
+	uint64		build;			/* building its container at the key */
+	uint64		members;		/* what that container would hold, at most */
+	bool		bits;			/* ... and whether as a BITSET */
+} LionTreeEst;
+
+/* What ANDing two containers of m1 and m2 members costs, likewise. */
+static inline uint64
+lion_up_and(uint64 m1, bool b1, uint64 m2, bool b2)
+{
+	if (b1 && b2)
+		return 2 * LION_UP_EXTRACT;
+	if (b1)
+		return LION_UP_BIT * m2;
+	if (b2)
+		return LION_UP_BIT * m1;
+	return LION_UP_AND * (m1 + m2);
+}
+
+static void
+lion_tree_estimate(const LionExprCursor *c, uint64 a, LionTreeEst *e)
+{
+	int			i;
+
+	check_stack_depth();
+	memset(e, 0, sizeof(LionTreeEst));
+	if (!c->pending)
+	{
+		/* a leaf, or a node whose container is there: a container to probe */
+		e->probe = lion_up_lookup(c->cur, a);
+		e->members = lion_container_cardinality(c->cur);
+		e->bits = (c->cur->type == LION_CT_BITSET);
+		return;
+	}
+
+	if (c->kind == LION_KN_OR)
+	{
+		uint64		unite = 0;
+		bool		arrays = true;
+		bool		bits = false;
+
+		for (i = 0; i < c->nhot; i++)
+		{
+			const LionContainer *h = c->hot[i].cur;
+			LionTreeEst s;
+
+			if (h != NULL)
+			{
+				s.probe = lion_up_lookup(h, a);
+				s.build = 0;
+				s.members = lion_container_cardinality(h);
+				s.bits = (h->type == LION_CT_BITSET);
+				if (h->type == LION_CT_RUN)
+				{
+					unite += LION_UP_RUN_OR * (uint64) lion_up_runs(h);
+					arrays = false;
+				}
+				else
+					unite += s.bits ? LION_UP_BITSET_OR :
+						LION_UP_MEMBER_OR * s.members;
+			}
+			else
+			{
+				lion_tree_estimate(&c->sub[c->hot[i].child], a, &s);
+				unite += s.bits ? LION_UP_BITSET_OR :
+					LION_UP_MEMBER_OR * s.members;
+			}
+			if (s.bits)
+				arrays = false;
+			bits = s.bits;
+			e->probe += s.probe;
+			e->build += s.build;
+			e->members += s.members;
+		}
+
+		/* lion_or_hot_raw()'s two ways; the union of one is its container */
+		if (c->nhot == 1)
+			e->bits = bits;
+		else if (arrays && e->members <= LION_OR_FOLD_MEMBERS &&
+				 c->nhot < LION_OR_BITSET_MIN)
+			e->build += LION_UP_FOLD * e->members * (uint64) c->nhot;
+		else
+		{
+			e->build += unite + LION_UP_IMAGE;
+			e->bits = true;
+		}
+		e->members = Min(e->members, (uint64) LION_CONTAINER_RANGE);
+		return;
+	}
+
+	/* an AND node: its children in the leapfrog's order, each ANDed in */
+	for (i = 0; i < c->nsub; i++)
+	{
+		LionTreeEst s;
+
+		lion_tree_estimate(&c->sub[c->order[i]], a, &s);
+		e->probe += s.probe;
+		e->build += s.build;
+		if (i == 0)
+		{
+			e->members = s.members;
+			e->bits = s.bits;
+			continue;
+		}
+		e->build += lion_up_and(e->members, e->bits, s.members, s.bits);
+		e->members = Min(e->members, s.members);
+		e->bits = e->bits && s.bits;
+	}
+}
+
+/*
+ * Is looking acc's members up in the tree c stands for cheaper than building
+ * its container and ANDing acc with it?  An acc of more members than an ARRAY
+ * holds is never probed, as for a union.
+ */
+static bool
+lion_tree_probe_pays(const LionExprCursor *c, const LionContainer *acc)
+{
+	uint64		a = lion_container_cardinality(acc);
+	uint64		probe;
+	uint64		build;
+	LionTreeEst e;
+
+	Assert(c->pending);
+	if (!lion_enable_tree_probe || a > LION_ARRAY_MAX_CARD)
+		return false;
+	a = Max(a, 1);
+
+	lion_tree_estimate(c, a, &e);
+	probe = e.probe + 4 * a;	/* the members written out */
+	if (acc->type == LION_CT_BITSET)
+		probe += LION_UP_EXTRACT + 4 * a;
+	else if (acc->type == LION_CT_RUN)
+		probe += 4 * a;
+	build = e.build + lion_up_and(a, acc->type == LION_CT_BITSET,
+								  e.members, e.bits);
+	return probe < build;
+}
+
+/*
+ * Mark in found[] the positions pend[0 .. np - 1] into vals[] whose value
+ * the tree c stands for holds at its key: a leaf's container, or a built
+ * node's, probed; a lazy OR's children that have a container probed one
+ * after the other with what none before found, then each pending child
+ * evaluated for what is left; a lazy AND's children in the leapfrog's order,
+ * each with what the ones before it kept.  vals[] is ascending, and so is
+ * every list of positions made of it.
+ */
+static void
+lion_tree_eval(LionExprCursor *c, const uint16 *vals, const uint16 *pend,
+			   uint32 np, uint64 *found)
+{
+	uint16		rest[LION_ARRAY_MAX_CARD];
+	uint64		f[LION_ARRAY_MAX_CARD / 64];
+	uint32		nr = np;
+	uint32		i;
+	uint32		j;
+	uint32		k;
+
+	check_stack_depth();
+	if (np == 0)
+		return;
+	Assert(np <= LION_ARRAY_MAX_CARD);
+	memcpy(rest, pend, sizeof(uint16) * np);
+
+	if (!c->pending)
+	{
+		(void) lion_container_probe_members(c->cur, vals, rest, nr, found);
+		return;
+	}
+
+	if (c->kind == LION_KN_OR)
+	{
+		for (i = 0; i < (uint32) c->nhot && nr > 0; i++)
+		{
+			if (c->hot[i].cur != NULL)
+				nr = lion_container_probe_members(c->hot[i].cur, vals, rest,
+												  nr, found);
+		}
+		for (i = 0; i < (uint32) c->nhot && nr > 0; i++)
+		{
+			if (c->hot[i].cur != NULL)
+				continue;
+			memset(f, 0, sizeof(f));
+			lion_tree_eval(&c->sub[c->hot[i].child], vals, rest, nr, f);
+			for (j = k = 0; j < nr; j++)
+			{
+				uint32		p = rest[j];
+				uint64		bit = UINT64CONST(1) << (p & 63);
+
+				if (f[p >> 6] & bit)
+					found[p >> 6] |= bit;
+				else
+					rest[k++] = (uint16) p;
+			}
+			nr = k;
+		}
+		return;
+	}
+
+	for (i = 0; i < (uint32) c->nsub && nr > 0; i++)
+	{
+		memset(f, 0, sizeof(f));
+		lion_tree_eval(&c->sub[c->order[i]], vals, rest, nr, f);
+		for (j = k = 0; j < nr; j++)
+		{
+			uint32		p = rest[j];
+
+			if (f[p >> 6] & (UINT64CONST(1) << (p & 63)))
+				rest[k++] = (uint16) p;
+		}
+		nr = k;
+	}
+	for (j = 0; j < nr; j++)
+		found[rest[j] >> 6] |= UINT64CONST(1) << (rest[j] & 63);
+}
+
+/*
+ * dest = acc AND the tree c stands for at its key, without building it
+ * (lion_tree_eval()).  acc holds at most an ARRAY's members, which
+ * lion_tree_probe_pays() checked by its cardinality; a damaged acc whose
+ * payload holds more is taken as empty, as lion_container_and_union_raw()
+ * takes it.
+ */
+static void
+lion_tree_probe(LionExprCursor *c, const LionContainer *acc,
+				LionContainer *dest)
+{
+	uint16		vals[LION_ARRAY_MAX_CARD];
+	uint16		pend[LION_ARRAY_MAX_CARD];
+	uint64		found[LION_ARRAY_MAX_CARD / 64];
+	uint32		n;
+	uint32		i;
+
+	n = lion_container_extract_members(acc, vals, LION_ARRAY_MAX_CARD);
+	if (n > LION_ARRAY_MAX_CARD)
+		n = 0;
+	for (i = 0; i < n; i++)
+		pend[i] = (uint16) i;
+	memset(found, 0, sizeof(found));
+	lion_tree_eval(c, vals, pend, n, found);
+	(void) lion_container_array_from_marks(dest, acc->ckey, vals, n, found);
+	c->cx->stats.trees_probed++;
+}
+
+/*
+ * dest = acc AND what cursor c stands on, as the leapfrog makes it past its
+ * driver (lion_leapfrog(), lion_and_build()): a pending union or tree probed
+ * with acc's members where that is the cheaper way - a union whose children
+ * all have a container by lion_or_probe_pays(), anything else nested by
+ * lion_tree_probe_pays() - else built and ANDed.
+ */
+static void
+lion_lazy_and(LionExprCursor *c, const LionContainer *acc, LionContainer *dest)
+{
+	if (c->pending)
+	{
+		bool		tree = (c->kind == LION_KN_AND);
+		int			i;
+
+		for (i = 0; !tree && i < c->nhot; i++)
+		{
+			if (c->hot[i].cur == NULL)
+				tree = true;
+		}
+		if (!tree)
+		{
+			if (lion_or_probe_pays(c, acc))
+			{
+				lion_or_probe(c, acc, dest);
+				return;
+			}
+		}
+		else if (lion_tree_probe_pays(c, acc))
+		{
+			lion_tree_probe(c, acc, dest);
+			return;
+		}
+		else
+			c->cx->stats.trees_built++;
+	}
+	lion_container_and_raw(acc, lion_ecursor_container(c), dest);
+}
+
+/*
+ * A lazy AND node's children, wound forward to the first key at or after
+ * where they stand that every one of them has a container at - the
+ * leapfrog's seeks without its ANDs - and the node left PENDING there: its
+ * intersection is made only when it is asked for (lion_and_build()), and a
+ * leapfrog that meets it may look its own few members up in the children
+ * instead (lion_tree_probe()).  Invalid once a child runs out.
+ */
+static void
+lion_and_align(LionExprCursor *c)
+{
+	for (;;)
+	{
+		uint32		target = 0;
+		int			k;
+
+		for (k = 0; k < c->nsub; k++)
+		{
+			LionExprCursor *s = &c->sub[c->order[k]];
+
+			if (!s->valid)
+				return;
+			if (s->ckey > target)
+				target = s->ckey;
+		}
+		for (k = 0; k < c->nsub; k++)
+		{
+			LionExprCursor *s = &c->sub[c->order[k]];
+
+			if (s->ckey < target)
+			{
+				lion_ecursor_seek(s, target);
+				if (!s->valid)
+					return;
+			}
+			if (s->ckey > target)
+				break;			/* none at the target: on to where it is */
+		}
+		if (k == c->nsub)
+		{
+			c->ckey = target;
+			c->valid = true;
+			c->pending = true;
+			return;
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
+ * The intersection of a pending AND node's children at the key they all
+ * stand at, made as the leapfrog makes it there: the first in its order
+ * built, each other one ANDed in the cheaper way (lion_lazy_and()), stopping
+ * at the first that empties it.  It may come out empty, which a leapfrog
+ * above takes as a key with no row; the node is optimized for a caller that
+ * keeps what it hands out, as an eager one is.
+ */
+static void
+lion_and_build(LionExprCursor *c)
+{
+	const LionContainer *acc = NULL;
+	int			w = 0;
+	int			k;
+
+	Assert(c->kind == LION_KN_AND && c->pending && c->nsub > 1);
+	c->pending = false;
+	for (k = 0; k < c->nsub; k++)
+	{
+		LionExprCursor *s = &c->sub[c->order[k]];
+
+		Assert(s->valid && s->ckey == c->ckey);
+		if (acc == NULL)
+			acc = lion_ecursor_container(s);
+		else
+		{
+			lion_lazy_and(s, acc, c->acc[w]);
+			acc = c->acc[w];
+			w ^= 1;
+		}
+		if (lion_container_cardinality(acc) == 0)
+			break;
+	}
+	if (!c->raw && (acc == c->acc[0] || acc == c->acc[1]))
+		lion_container_optimize((LionContainer *) acc);
+	c->cur = acc;
 }
 
 /*
@@ -4924,16 +5431,27 @@ lion_ecursor_build(LionExprCursor *c)
 		 * the driver and where building it is the cheaper way to AND it
 		 * (DESIGN.md §29.11, "Unions probed").
 		 */
-		if (c->nhot == 1)
+		if (c->nhot == 1 && c->hot[0].cur != NULL)
 			c->cur = c->hot[0].cur;
 		else if (c->lazy)
-			c->pending = true;
+			c->pending = true;	/* ... or its one child is pending itself */
 		else
 			lion_or_build(c);
 		return;
 	}
 
 	Assert(c->kind == LION_KN_AND);
+
+	/*
+	 * A lazy AND node under a leapfrog only winds its children to a key they
+	 * all have a container at, and leaves its intersection to whoever asks
+	 * for it (DESIGN.md §29.11, "Trees probed").
+	 */
+	if (c->lazy)
+	{
+		lion_and_align(c);
+		return;
+	}
 
 	/*
 	 * The children, wound forward to the next key their AND holds a member
@@ -7141,14 +7659,18 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 	}
 
 	/*
-	 * The positive sources are lazy: a union among them is built only when
-	 * the leapfrog finds that cheaper than probing its members (DESIGN.md
-	 * §29.11, "Unions probed").  A negated one is subtracted whole.
+	 * The positive sources are lazy: a union or a tree among them is built
+	 * only when the leapfrog finds that cheaper than probing its members
+	 * (DESIGN.md §29.11, "Unions probed", "Trees probed") - but for a tree
+	 * that drives, which is built as it is sought (lion_leapfrog_lazy()).  A
+	 * negated one is subtracted whole.
 	 */
 	for (i = 0; i < nsources; i++)
 		lion_ecursor_init_ex(&cursors[i], plans[i], sources[i].sets,
 							 sources[i].nsets, cx, false, cx->raw,
-							 !sources[i].negated);
+							 !sources[i].negated &&
+							 (i != driver ||
+							  lion_leapfrog_lazy(plans[i]->node)));
 
 	/*
 	 * A chunk of a shared copy (LionCollect.ranged) begins at its first key:
@@ -10487,6 +11009,8 @@ lion_count_stats_add(LionCountStats *dst, const LionCountStats *src)
 	dst->probes_avoided += src->probes_avoided;
 	dst->unions_built += src->unions_built;
 	dst->unions_probed += src->unions_probed;
+	dst->trees_built += src->trees_built;
+	dst->trees_probed += src->trees_probed;
 	dst->cache_hits += src->cache_hits;
 	dst->cache_full += src->cache_full;
 	dst->sets_summed += src->sets_summed;

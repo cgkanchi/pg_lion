@@ -444,8 +444,13 @@ SELECT * FROM lion_explain_norm('SELECT d.grp, count(*) FROM lion_sd d WHERE EXI
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 RESET enable_nestloop;
+-- the copy holds the filter's rows: forced, since a count that probes one set
+-- in memory is priced below one against the copy (DESIGN.md §27, "The
+-- per-key terms, refitted")
+SET pg_lion.fkjoin_count_cost = 1e6;
 SELECT lion_sj_counter('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)', 'Fact Filter Rows Collected')
 	= (SELECT count(*) FROM lion_sf WHERE x = 3) AS collected_the_filter;
+RESET pg_lion.fkjoin_count_cost;
 -- the 300 keys are looked up; 17 of them have no entry
 SELECT lion_sj_counter('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)', 'Join Keys Looked Up');
 SELECT lion_sj_counter('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)', 'Join Keys Without Entry');

@@ -57,6 +57,9 @@ double		lion_range_fold_cost;
 double		lion_fkjoin_count_cost;
 double		lion_fkjoin_row_cost;
 double		lion_fkjoin_probe_cost;
+double		lion_fkjoin_probe_page_cost;
+double		lion_fkjoin_set_cost;
+double		lion_fkjoin_lookup_cost;
 double		lion_fkjoin_collect_container_cost;
 double		lion_fkjoin_copy_count_cost;
 double		lion_fkjoin_copy_probe_cost;
@@ -140,23 +143,29 @@ static const LionCostSetting lion_cost_settings[] = {
 	 "Sets the planner's estimate of the cost of each fold or merge of a lion range collected as a source into a container of its union that is not a bitset"},
 
 	/* lion_customscan.c: the FK-side join (§27) */
-	{"pg_lion.fkjoin_count_cost", &lion_fkjoin_count_cost, 25.0, LION_TUPLE,
+	{"pg_lion.fkjoin_count_cost", &lion_fkjoin_count_cost, 14.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each count of a lion FK-side join, per dimension row"},
-	{"pg_lion.fkjoin_row_cost", &lion_fkjoin_row_cost, 10.0, LION_TUPLE,
+	{"pg_lion.fkjoin_row_cost", &lion_fkjoin_row_cost, 20.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each row a lion FK-side join hands up"},
-	{"pg_lion.fkjoin_probe_cost", &lion_fkjoin_probe_cost, 80.0, LION_OP,
+	{"pg_lion.fkjoin_probe_cost", &lion_fkjoin_probe_cost, 10.0, LION_OP,
 	 "Sets the planner's estimate of the cost of each probe of a lion FK-side join's count into a fact filter"},
+	{"pg_lion.fkjoin_probe_page_cost", &lion_fkjoin_probe_page_cost, 54.0, LION_OP,
+	 "Sets the planner's estimate of the cost of each posting page a probe of a lion FK-side join's count into a fact filter reads"},
+	{"pg_lion.fkjoin_set_cost", &lion_fkjoin_set_cost, 11.0, LION_TUPLE,
+	 "Sets the planner's estimate of the cost of each set of a fact filter that is a union, per count of a lion FK-side join that probes it"},
+	{"pg_lion.fkjoin_lookup_cost", &lion_fkjoin_lookup_cost, 75.0, LION_OP,
+	 "Sets the planner's estimate of the cost of each key a lion FK-side join looks up on the directory leaf it stands on"},
 	{"pg_lion.fkjoin_collect_container_cost", &lion_fkjoin_collect_container_cost, 2.0, LION_OP,
 	 "Sets the planner's estimate of the cost of each container of the driving fact filter that a lion FK-side join reads to collect the filters"},
-	{"pg_lion.fkjoin_copy_count_cost", &lion_fkjoin_copy_count_cost, 25.0, LION_TUPLE,
+	{"pg_lion.fkjoin_copy_count_cost", &lion_fkjoin_copy_count_cost, 33.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each count of a lion FK-side join against its copy of the fact filters"},
-	{"pg_lion.fkjoin_copy_probe_cost", &lion_fkjoin_copy_probe_cost, 5.0, LION_OP,
+	{"pg_lion.fkjoin_copy_probe_cost", &lion_fkjoin_copy_probe_cost, 2.0, LION_OP,
 	 "Sets the planner's estimate of the cost of looking a lion FK-side join's copy of the fact filters up and ANDing it, per fk container"},
 	{"pg_lion.fkjoin_copy_member_cost", &lion_fkjoin_copy_member_cost, 3.0, LION_OP,
 	 "Sets the planner's estimate of the cost of each member of an fk container ANDed with a lion FK-side join's copy of the fact filters"},
 	{"pg_lion.fkjoin_copy_container_cost", &lion_fkjoin_copy_container_cost, 20.0, LION_OP,
 	 "Sets the planner's estimate of the cost of each container of a lion FK-side join's copy of the fact filters made"},
-	{"pg_lion.fkjoin_batch_row_cost", &lion_fkjoin_batch_row_cost, 120.0, LION_OP,
+	{"pg_lion.fkjoin_batch_row_cost", &lion_fkjoin_batch_row_cost, 75.0, LION_OP,
 	 "Sets the planner's estimate of the cost of each dimension row's place in a batch a lion FK-side join looks up in key order"},
 	{"pg_lion.fkjoin_sort_compare_cost", &lion_fkjoin_sort_compare_cost, 0.25, LION_OP,
 	 "Sets the planner's estimate of the cost of each comparison of the sort that makes a lion FK-side join's keys distinct"},

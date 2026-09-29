@@ -287,7 +287,7 @@ SELECT * FROM lion_nj_explain('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND 
          Lion Indexes: lion_nf_fk (fk = d.k), lion_nf_x (x = 3)
          Join Type: Semi
          Join Keys: distinct, sorted
-         Fact Filters: collected once
+         Join Key Lookups: in index order
          ->  (the dimension's plan)
 (7 rows)
 
@@ -299,8 +299,9 @@ SELECT * FROM lion_nj_explain('SELECT count(*) FROM lion_nf f WHERE f.fk IN (SEL
          Lion Indexes: lion_nf_fk (fk = d.k)
          Join Type: Semi
          Join Keys: distinct, sorted
+         Join Key Lookups: in index order
          ->  (the dimension's plan)
-(6 rows)
+(7 rows)
 
 -- count(DISTINCT) of the fact's key: one row per distinct key with a match,
 -- sorted and aggregated by core
@@ -314,8 +315,8 @@ SELECT * FROM lion_nj_explain('SELECT count(DISTINCT f.fk) FROM lion_nf f WHERE 
                Lion Indexes: lion_nf_fk (fk = d.k), lion_nf_x (x = 3)
                Join Type: Semi
                Join Keys: distinct, sorted
+               Join Key Lookups: in index order
                Join Rows: the distinct keys with a match
-               Fact Filters: collected once
                ->  (the dimension's plan)
 (10 rows)
 
@@ -756,7 +757,7 @@ SELECT * FROM lion_nj_explain('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND 
                Lion Indexes: lion_nf_fk (fk = d.k), lion_nf_x (x = 3)
                Join Type: Semi
                Join Keys: distinct, sorted
-               Fact Filters: collected once
+               Join Key Lookups: in index order
                ->  (the dimension's plan)
 (9 rows)
 
@@ -772,9 +773,10 @@ SELECT * FROM lion_nj_explain('SELECT count(DISTINCT f.fk) FROM lion_nf f WHERE 
                      Lion Indexes: lion_nf_fk (fk = d.k)
                      Join Type: Semi
                      Join Keys: distinct, sorted
+                     Join Key Lookups: in index order
                      Join Rows: the distinct keys with a match
                      ->  (the dimension's plan)
-(11 rows)
+(12 rows)
 
 SELECT lion_nj_par('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk AND d.region = ''eu'')');
    lion_nj_par    
@@ -876,7 +878,7 @@ SELECT * FROM lion_nj_explain('SELECT g, s.c FROM generate_series(1, 4) g LEFT J
                      Lion Indexes: lion_nf_fk (fk = d.k), lion_nf_x (x = 3)
                      Join Type: Semi
                      Join Keys: distinct, sorted
-                     Fact Filters: collected once
+                     Join Key Lookups: in index order
                      ->  (the dimension's plan)
 (12 rows)
 
