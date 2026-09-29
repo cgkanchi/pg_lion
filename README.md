@@ -236,7 +236,13 @@ cost model leaves a large dimension set to the hash join. With parallel query en
 (`max_parallel_workers_per_gather`) it can run in parallel, each worker taking its share of the
 dimension rows, or of the distinct keys, which every worker sorts. The fact filters are collected
 once per process into memory bounded like a hash join's (`work_mem` × `hash_mem_multiplier`); past
-that the copy spills to a temporary file, as a hash join's table would. Their values may be
+that the copy spills to a temporary file, as a hash join's table would. Where the planner expects
+few dimension rows it may instead probe the fact filters at each dimension row's count; a run that
+meets far more rows, or far heavier keys, than it expected keeps an account of what probing has cost
+and collects the filters part way through once that reaches what collecting them costs, if the copy
+is expected to fit that memory (DESIGN.md §27, "Probed, then collected"; `EXPLAIN ANALYZE` prints
+`Fact Filters: probed, then collected`, `Fact Filter Switches` and `Fact Filter Keys Probed`, the
+keys counted by probing before each switch). Their values may be
 parameters and stable expressions as for a single table, an `IN` list whose array is a parameter
 (`o.status = ANY ($1)`) included: every process evaluates them once per scan.
 
@@ -476,7 +482,12 @@ fewest container keys - of 64 heap blocks each - a range of a parallel count cov
 (DESIGN.md §10, "A GROUP BY in parallel"; the planner prices the default),
 `pg_lion.enable_union_probe` (on), whether an AND of posting sets may look its few rows up in the
 containers of an `IN` list's or a multi-key query's union rather than build the union (DESIGN.md
-§29.11, "Unions probed"; the answers are the same either way), and
+§29.11, "Unions probed"; the answers are the same either way; `EXPLAIN ANALYZE` of a count prints
+`Unions Built` and `Unions Probed`), `pg_lion.enable_tree_probe` (on), the same for a nested tree -
+a tsquery `(a | b) & (c | d)`, an `OR` of `AND`s across columns - evaluated for the intersection's
+few rows rather than built (DESIGN.md §29.11, "Trees probed"; `Trees Built` and `Trees Probed`),
+`pg_lion.enable_filter_switch` (on), whether an FK-side join that probes its fact filters may
+collect them part way through (DESIGN.md §27, "Probed, then collected"), and
 `pg_lion.vacuum_barrier_ranges` (superuser), how many visited-block ranges VACUUM batches in rmgr
 mode (DESIGN.md §25).
 `pg_lion.rmgr_id` is described under `wal_mode` above.
