@@ -16,6 +16,7 @@
 #include "access/skey.h"
 #include "fmgr.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/paths.h"
 #include "optimizer/planner.h"
 #include "storage/buf.h"
 #include "utils/relcache.h"
@@ -1365,6 +1366,19 @@ extern void lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 								   RelOptInfo *input_rel,
 								   RelOptInfo *output_rel,
 								   void *extra);
+
+/*
+ * The FK-side semi and anti join as a join path (DESIGN.md §27, "The semi and
+ * anti join as a join path"): pg_lion.enable_semijoin, and the
+ * set_join_pathlist_hook that offers it, chained to the previous one.
+ */
+extern PGDLLIMPORT bool lion_enable_semijoin;
+extern PGDLLIMPORT set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook;
+
+extern void lion_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
+								   RelOptInfo *outerrel, RelOptInfo *innerrel,
+								   JoinType jointype,
+								   JoinPathExtraData *extra);
 
 /*
  * The cost model's shared terms (DESIGN.md section 10, "The units"): what a

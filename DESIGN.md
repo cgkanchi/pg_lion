@@ -7704,7 +7704,8 @@ the fact's or the dimension's ("Grouped by the join key"), a partitioned fact ta
 partitioned fact table"), and a dimension that is itself a join of a table and the tables
 semi- or anti-joined to it ("A dimension that is a join"); on 2026-09-29, a run that probes the fact
 filters and collects them part way through once probing has cost what collecting would ("Probed,
-then collected"). The shape is the star-schema aggregate
+then collected"), and the semi and anti join offered as a join path of its own, whose rows are the
+outer side's ("The semi and anti join as a join path"). The shape is the star-schema aggregate
 
     SELECT d.attr, count(*)
     FROM fact f JOIN dim d ON f.fk = d.pk
@@ -10114,6 +10115,279 @@ three new settings. Where a test counts the copy's own counters (`fkjoin_perkey.
 and `fkjoin_adaptive.sql`'s switches come a few keys later (13 where 10), its rescan case running
 two dimension sets of twenty heavy keys so that each run still reaches the price.
 
+### The semi and anti join as a join path (2026-09-29)
+
+The node answered the FK-side semi and anti joins only as an aggregate over the whole query's join,
+at the upper rel. Where the rows of `d ⋉ f` - the dimension rows that have a fact row under the fact
+filters - were the INPUT of something else, core computed that semi join itself: a nested loop that
+probes a btree on `f.fk` for each dimension row and tests the fact filters on the heap, or a hash
+join over all of the fact's filtered rows. A benchmark had such a semi join over a large share of a
+dimension's rows, a partitioned fact (list partitions, one sub-partitioned by range on a timestamp)
+and fact filters that are a stable range on the timestamp beside an OR with an arm per value of the
+partition key: 10 to 30 s through core's nested loop or hash semi join, where the same semi join
+counted by the node (the reverse semi join) took some 150 ms. Its rows fed the node itself, as its
+joined dimension ("A dimension that is a join", whose child is core's cheapest path of the join rel
+`{d, f1}`), and other joins and aggregates.
+
+So the semi and anti join is offered as a JOIN path of its own (`set_join_pathlist_hook`,
+`lion_set_join_pathlist()`, chained to any hook installed before it): a CustomPath of the join rel
+that emits the outer side's rows. Its child is a path of the outer side; for each of the child's
+rows the node looks the key up in the fact's fk index and tests it under the fact filters - the
+upper node's machinery unchanged: the filters collected once or probed, the lookups in key order a
+batch at a time, a partitioned fact's leaves each looked up with the batch and matched by any (or
+by none), the §9 interlock per leaf - and emits the row when the semi join has a match, or when the
+anti join has none. EXPLAIN names it `Custom Scan (LionSemiJoin)` or `Custom Scan (LionAntiJoin)`,
+prints `Join Rows: the outer rows with a match` (`without a match`; `, in their order` when it
+claims the child's order, below) and every line and counter the upper node prints, and runs with
+the upper node's executor: the same LionCount scan state under another plan name
+(`lion_semijoin_scan_methods`), the rows mode of `count(DISTINCT)` (`LION_JOINFLAG_ROWS`) with
+`LION_JOINFLAG_OUTER` (shape 16).
+
+**Which calls it takes** (`lion_fkjoin_recognize_join()`). Core calls the hook once for each pair of
+rels it joins into the join rel and each kind of join it tries for them. A semi join (`EXISTS`,
+`IN`) comes as JOIN_SEMI, the special join's left side outer; as JOIN_RIGHT_SEMI the other way round
+(PostgreSQL 18 and later); and as the right side made unique and inner-joined - JOIN_UNIQUE_INNER and
+JOIN_UNIQUE_OUTER up to 18, from 19 JOIN_INNER with a rel of unique-ified paths. An anti join (`NOT
+EXISTS`) comes as JOIN_ANTI, and as JOIN_RIGHT_ANTI the other way round (16 and later). Only the
+plain JOIN_SEMI and JOIN_ANTI are taken, with the fact as innerrel: their rows are the outer side's,
+each at most once, which is what the node emits; the right-hand forms have the fact outer, whose rows
+the node never emits, and the unique-ified ones only repeat what JOIN_SEMI answers. Then:
+
+- the special join is the call's own (`extra->sjinfo`), of the same kind, with no range table entry
+  of its own - the anti join core makes of `LEFT JOIN ... WHERE f.fk IS NULL` has one (`ojrelid`) and
+  is left alone, as the upper node leaves it;
+- its minimal and its syntactic inner side are the fact alone, and innerrel is the fact: a plain or
+  partitioned table with no LATERAL reference and no TABLESAMPLE (`lion_fkjoin_rel_ok()`), whose
+  own restrictions are the fact filters - every one answered by posting sets, with a lion index on
+  the fk and on each filter in every leaf that keeps it, exactly as the upper node asks
+  (`lion_try_count_path()`, `lion_fkjoin_setup()`), RLS on the fact declining as there;
+- the join's clauses (`extra->restrictlist`, everything the join evaluates) are exactly ONE: a strict
+  operator between a plain column of the fact and a plain column of a table of the outer side,
+  which the index must answer as a §10 equality (`lion_match_index()`). A second correlation (`f.y =
+  d.attr`), an outer-side qual inside `NOT EXISTS` (which stays a join clause; inside `EXISTS` it is
+  pushed to the outer side and is a filter of the child), or anything but a Var on either side
+  declines;
+- the outer side needs nothing from outside it (no `lateral_relids`, on it or on the join rel: a
+  LATERAL subquery on the outer side is taken at the join rel that also holds what it references),
+  its rows carry the key, and no pseudoconstant qual is anywhere in the query; the paths offered are
+  unparameterized, over every unparameterized path of the outer side;
+- the statement is a SELECT with no row marks: a row it locks or modifies would have its EvalPlanQual
+  recheck run through a join the node stands in for, which it does not do.
+
+The outer side may be anything else: a base relation of any kind, an inner or outer join, a join rel
+holding other semi and anti joins - another LionSemiJoin among them - whatever core plans for it.
+
+**What the rows carry.** The join rel's target, which for a semi or anti join names the outer side's
+columns - of any kind, system columns and whole-row Vars included; the node reads them from its
+child's row as it reads a dimension column - and nothing of the inner side but what an equivalence
+class needs above the join. Two `EXISTS` correlated to one key make one class of the three columns
+(`f1.fk = d.pk`, `f2.fk = d.pk`), core forces every member to be available up to the class's
+relids, and the join rel `{d, f1}` then carries `f1.fk` for a join with f2 that may compare `f2.fk
+= f1.fk`. Core's semi join hands up its first matching fact row's value; the node emits the outer
+row's key in its place, which is every matching fact row's value when the fk and the key are of one
+type, the join operator is that type's own equality, and it implies one representation under the
+join's collation (`lion_fkjoin_fk_is_key()`, §10's value rule - "Grouped by the join key"). A key of
+another type (`int4` fk against an `int8` key, joined by a cross-type class) or of a type whose equal
+values are spelled differently declines, and so does any other fact column, an anti join's fact
+column (it has no row to come from), and a PlaceHolderVar. No uniqueness is asked of the key: each
+outer row is tested and emitted on its own, two outer rows with one key being two rows.
+
+**Why the rows are the join's.** A semi join's rows are the outer rows for which some fact row
+satisfies the join clause and the fact filters, under the query's snapshot; per outer row that is
+§26's existence test of the key's fk set ANDed with the filters, which the upper node already makes
+for a reverse semi join, and the anti join's rows are those for which it finds nothing. A NULL key
+joins nothing under a strict operator: a semi join never emits its row and an anti join always does
+(NOT EXISTS). `NOT IN` is no anti join: `x NOT IN (SELECT f.fk ...)` is not true for a NULL `x` nor
+when the subquery yields a NULL, and core makes no anti join of it on 16 to 18. From 19 it does,
+when it proves neither the outer expression nor the subquery's output can be NULL - where the two
+are the same, and the node's anti join is right for it. Over a partitioned fact a row matches when
+any leaf has a visible match (the leaves' rows are disjoint), and the anti join's when none has;
+a leaf whose filters select nothing has no turn. Every count is the upper node's, so §9, "Why a stale
+copy is safe", "One copy per query" and "A partitioned fact table" hold as they are: the node is the
+upper node with the rows of a join instead of partial counts.
+
+**Order.** A plan that looks the keys up a row at a time emits the child's rows in the child's
+order. One that walks the fk index in key order, and every plan over a partitioned fact, reads the
+child a batch at a time and sorts the batch into the index's key order. The join path tests such a
+batch WHOLE before any of its rows goes up (`lion_join_count_batch()` for a plain fact,
+`lion_join_count_parts()` for a partitioned one, each key's answer in its entry) and then hands up the
+surviving rows in their own order: each row's place in the child's order is its `seq`, 0 to n - 1,
+so `lion_join_batch_unsort()` swaps each row into its place - n swaps at most and no comparison. So
+the path claims the child's pathkeys, as a nested loop claims its outer side's
+(`build_join_pathkeys()`), and a Sort or a merge join above can use them; `LION_JOINFLAG_ORDERED`
+says so, set when the join rel has a use for them. Testing a batch whole also keeps the walk's place
+from one key to the next with no row going up in between, where the rows mode of the upper node
+lets the walk's leaf go at each row it hands up. What putting the rows back costs was measured on
+the data below (d's 200,000 kept rows semi-joined to the partitioned f1, serially, a build that
+timed the put-back and one that skipped it): 0.9 ms of some 750, under 5 ns a row. The query ran in
+736 to 759 ms over an ordered child (`LionOrdered` on d, or a btree index scan) with no Sort, and in
+748 ms with a Sort above the path over an unordered child - the differences noise, as were those
+with the put-back skipped (782 to 862 ms). The model charges nothing for it.
+
+**Projection.** The path supports projection (`CUSTOMPATH_SUPPORT_PROJECTION`): over the topmost
+join the query's target list is computed by the node from its row, with no Result above it. Its
+tuple (`custom_scan_tlist`) is then every column of the join rel's rows, since core may hand it
+another target list, or none - when it puts one on the plan afterwards (`create_projection_plan()`).
+
+**Parallel.** A partial path over each partial path of the outer side, under the upper node's rules
+("Parallel", "One copy per query"): the join rel, the fact rel and the outer side consider
+parallelism and the clause values are parallel-safe; each participant tests the rows its share of
+the child returns; the fact filters' copy is collected once, by the participants together, in the
+Gather's shared memory; and the workers are what a parallel scan of the fk index pages the lookups
+read would get, or the child's, whichever is more - unless the key's table has a `parallel_workers`
+setting, which decides alone. Core puts the Gather (or a Gather Merge, over the claimed order) above
+it, as over any partial path of a join rel; its rows are the join rel's divided as core divides a
+partial path's. The serial path is parallel-safe when its child is, and a worker may run it whole
+- under a parallel join's inner side, say - with a copy of its own. A parallel upper node over a
+partial semi join path is two parallel-aware nodes, each with its shared state keyed by its own
+plan node; each collects its copy before it reads a row of its child, so no participant waits at one
+node's barrier while another waits at the other's.
+
+**Rescans and parameters.** A rescan is the upper node's: everything a run built let go of, the
+copy made again for new values of the fact filters, and the child rescanned, core's changed
+parameters handed on to it. So the path is right as the inner side of a nested loop that rescans it
+for every outer row, and inside a correlated subplan whose parameters are in the child's quals and in
+the fact filters, a NULL one among them; a generic plan's parameters are evaluated once a run, in
+every participant. A generic plan's `kind = $1` proves nothing of a partition's bounds (§16), and
+needs a lion index on kind in every partition.
+
+**Cost** (`lion_add_semijoin_path()`): the child's total cost, plus `lion_cost_fkjoin_path()` for
+the child's rows - a lookup and an existence test per outer row, every row taken to find an fk entry
+as the upper node prices a reverse semi join's (`found` = the rows, "Cost, revisited"), each leaf
+of a partitioned fact for the keys it looks up - plus `cpu_tuple_cost` and the target's cost per row
+emitted, as core charges a join's rows. The rows are the join rel's, core's estimate of the semi or
+anti join, and a partial path's a participant's share of them. Nothing is taken off: not for the
+outer rows core's estimate says have no match, and not for the fact rows the cost model has priced
+at their average number a key where the kept keys hold more. What the fact side costs does not
+depend on which of the outer side's paths the child is, and is computed once for all of them.
+
+**Startup** (2026-09-29, the same day). No row goes up before the first batch is tested whole: one
+batch of 200,000 rows at a `work_mem` of 64 MB, below, gave its first row at 978 ms of 992. The path
+first started when its child did, which told a LIMIT above that its first rows came at once. Its
+startup cost is now the child's startup, the child's run for the first batch's rows (their share of
+its rows), and what the fact side does for them - `lion_cost_fkjoin_path()` for that many rows
+under the choices the whole run made (`force`): the fact filters located, the copy collected, the
+batch's lookups and existence tests. The total is as it was. The batch is what
+`lion_join_fill_batch()` puts in one: rows until its memory context has `work_mem` allocated - its
+first block, the array of entries, 1,024 at first and doubled when full, and each row's copy
+(`lion_join_batch_rows()`) - never more than the child's rows; a plan that looks the keys up a row
+at a time has a batch of one row, and its startup is the fact filters' collection and one lookup.
+So over one batch the path's startup is nearly its total, and a Sort above it gives the rows of an
+`ORDER BY ... LIMIT` as early and for less than the child's order does (the ordered path is shown
+with sorts off in the test); at a `work_mem` of 64 kB, ten batches of a 4,000-row outer side, the
+startup is some 14% of the path's cost and the ordered path under a LIMIT is taken with no Sort.
+
+The upper node prices a row it hands up at `LION_FKJOIN_ROW_COST` (10 `cpu_tuple_cost`, "The cost
+of a key, after the per-key path"), and the join path at one `cpu_tuple_cost`, core's price of a
+join's row. For the rows of a reverse semi or anti join - the rows of a `count(DISTINCT)` of a
+dimension column, a `GROUP BY` of one - the two plans do the same lookups and hand up the same rows,
+and the model now prefers core's Agg over the join path to the upper node's rows by the difference.
+Measured, neither price is the time. Through an anti join whose fact filter selects nothing -
+2,000,000 outer rows, every one handed up and none looked up - the path took some 65 ns a row over
+its child's own, about 3 `cpu_tuple_cost` at §10's units, and a `count(DISTINCT)` of a column of
+those rows ran as fast through the upper node's rows as through core's Agg over the path (310 and
+320 ms). The two plans run alike, and the prices are left as they are. A count alone keeps the
+upper node, which hands up one row a participant.
+
+**Composition.** The upper node over a dimension that is a join takes the join rel's cheapest path
+as its child ("A dimension that is a join"); where that is the semi join path, the node counts one
+fact against the rows the path emits for another:
+
+    Finalize Aggregate
+      ->  Custom Scan (LionCount)
+            Lion Indexes: f2_df.fk (fk = d.pk), f2_df.doc (doc @@ '...'::tsquery)
+            Fact Filters: collected once
+            ->  Custom Scan (LionSemiJoin)
+                  Partitions: f1_a_old, f1_a_new, f1_b, f1_cd
+                  Lion Indexes: (fk = d.pk), (((kind = 'a') AND ...) OR ...), (ts >= (now() - ...))
+                  Implied by Partition Bounds: ...
+                  Refuted by Partition Bounds: ...
+                  Join Key Lookups: in index order
+                  Join Rows: the outer rows with a match
+                  Fact Filters: collected once
+                  ->  Bitmap Heap Scan on dim d
+                        ...
+
+**Setting.** `pg_lion.enable_semijoin` (on) offers the paths; `pg_lion.enable_count_pushdown` off
+turns them off with the rest of the pushdown. No `enable_*join` setting disables them: they are
+join methods of their own. The FK-side join tests that pin the upper node's plans with core's join
+methods disabled (`fkjoin*.sql` but this one, and `countmultikey.sql`) turn the path off: with it,
+their reverse semi and anti joins went to core's Agg over the join path, by the row prices above,
+with the same answers - the whole suite was run so once, and every answer agreed.
+
+**Measured** (2026-09-29; PostgreSQL 18, release build, `shared_buffers` 256 MB, `work_mem` 64 MB;
+medians of five warm runs; the machine shared with other work at a load of 4 to 9, so that a
+difference under some 20% is noise). Synthetic data: a dimension `d` of 500,000 rows, a unique key,
+a lion index over its filter columns and a filter that keeps 40% of it; `f1`, 20,000,000 rows
+LIST-partitioned by `kind` into four lists, one sub-partitioned by range on `ts`, with a
+partitioned lion index over its filter columns and the fk and a btree leading with the fk; `f2`,
+10,000,000 rows with a lion-indexed filter column, a lion index over the fk, and a btree on the fk; 95%
+of either fact's rows on the kept keys. f1's filters, a range on `ts` relative to `now()` beside an
+OR with an arm per kind, keep 821,814 rows on 195,969 of the 200,000 kept keys; f2's keep 400,000
+rows (two words ORed) or, marked narrow, 10,000 (two ANDed). The queries: (1) the count of d's
+kept rows with a row in f1 and a row in f2; (2) the count of f2's rows whose fk is a kept d row
+with a row in f1; (3) the rows of d ⋉ f1 feeding a Sort on another column, and, joined to a
+100-row table, a GROUP BY of that table's label - the semi join below the join to it or, kept
+apart in a subquery by `OFFSET 0`, above it (a hash join, where core's joins are enabled); (4) the
+anti join feeding a Sort; (5) the rows of d ⋉ f1, and their count. Each cell is the plan, its cost and its median time; "the path"
+has core's three join methods disabled, "without it" the same and `pg_lion.enable_semijoin` off,
+and "core's nested loop" the pushdown off and the hash and merge joins disabled.
+
+Serial:
+
+| query | nothing disabled | `enable_nestloop = off` | the path | without it | core's nested loop |
+|---|---|---|---|---|---|
+| (1) | hash semi joins, 292,095: 1,603 ms | the same: 1,324 | LionCount over LionSemiJoin, 732,064: 1,514 | LionCount over d nested-loop-joined to f1 made unique, 477,689: 2,673 | 428,816: 17,765 |
+| (1) narrow | nested loop semi join into f1's btree over a hash semi join of d and f2, 53,691: 367 | LionCount over the hash semi join, 102,375: 177 | LionCount over LionSemiJoin, 429,796: 732 | LionCount over d nested-loop-joined to f2 made unique, 116,121: 203 | 67,438: 358 |
+| (2) | hash semi joins, 288,590: 2,395 | the same: 1,488 | LionCount over LionSemiJoin, 732,068: 1,638 | 477,687: 2,376 | 530,789: 33,232 |
+| (2) narrow | nested loop semi joins, 72,510: 352 | hash semi joins, 237,608: 1,561 | 730,097: 1,958 | 475,677: 3,253 | 72,510: 566 |
+| (3) Sort | Sort over a hash right semi join, 218,126: 1,426 | the same: 1,508 | Sort over LionSemiJoin, 577,190: 846 | core's, 322,802: 1,879 | 322,802: 1,797 |
+| (3) grouped | hash right semi join over the hash join of d and the table, 207,461: 1,059 | the same: 1,157 | LionSemiJoin over their nested loop, 255,519: 428 | core's, 319,994: 1,764 | 319,994: 1,728 |
+| (3) grouped, kept apart | a hash join over a hash right semi join, 211,817: 1,015 | the same: 969 | a nested loop over LionSemiJoin, 575,322: 801 | core's, 320,876: 1,553 | 320,876: 1,547 |
+| (4) | Sort over a hash right anti join, 219,900: 1,268 | the same: 1,142 | Sort over LionAntiJoin, 579,158: 990 | a nested loop anti join into f1's btree, 1,018,932: 4,662 | 1,018,933: 5,519 |
+| (5) rows | hash right semi join, 210,450: 2,056 | the same: 1,796 | LionSemiJoin, 569,520: 1,009 | core's, 315,126: 2,283 | 315,126: 2,405 |
+| (5) count | the same under an Agg, 210,664: 1,571 | the same: 1,452 | the upper node alone, 568,633: 833 | the same: 765 | 315,339: 1,728 |
+
+Two workers:
+
+| query | nothing disabled | `enable_nestloop = off` | the path | without it | core's nested loop |
+|---|---|---|---|---|---|
+| (1) | a nested loop semi join into f2's btree over a parallel hash semi join of d and f1, 212,485: 9,203 ms | Parallel LionCount over the parallel hash semi join, 233,299: 1,238 | Parallel LionCount over Parallel LionSemiJoin, 350,092: 1,114 | Parallel LionCount over a nested loop semi join into f2's btree, 433,370: 9,538 | 428,810: 15,761 |
+| (1) narrow | a nested loop semi join into f1's btree over a parallel hash semi join of d and f2, 40,984: 300 | Parallel LionCount over the parallel hash semi join, 86,170: 328 | Parallel LionCount over Parallel LionSemiJoin, 207,959: 546 | 116,114: 243 | 67,431: 382 |
+| (2) | Parallel LionCount over the parallel hash semi join of d and f1, 233,298: 1,303 | the same: 1,185 | Parallel LionCount over Parallel LionSemiJoin, 350,094: 1,154 | 477,678: 2,624 | 530,780: 38,420 |
+| (2) narrow | nested loop semi joins, 46,270: 385 | parallel hash semi joins, 191,484: 969 | 349,206: 1,090 | 475,672: 2,729 | 46,270: 436 |
+| (3) Sort | Sort over a parallel hash semi join, 178,515: 949 | the same: 894 | Sort over Parallel LionSemiJoin, 295,314: 725 | core's, 322,793: 1,810 | 322,793: 1,802 |
+| (3) grouped | **Parallel LionSemiJoin over the hash join of d and the table, 149,157: 399** | the same: 373 | over their nested loop, 151,015: 388 | a nested loop semi join into f1's btree, 151,812: 908 | 151,812: 950 |
+| (3) grouped, kept apart | a hash join over a Gather of a parallel hash semi join, 175,537: 487 | the same: 491 | a nested loop over a Gather of Parallel LionSemiJoin, 296,737: 435 | core's, 320,876: 1,490 | 320,876: 1,537 |
+| (4) | Sort over a parallel hash right anti join, 179,426: 753 | the same: 845 | Sort over Parallel LionAntiJoin, 298,291: 578 | 440,503: 1,865 | 440,503: 1,852 |
+| (5) rows | parallel hash semi join, 174,159: 821 | the same: 720 | Parallel LionSemiJoin, 290,960: 574 | core's, 315,118: 1,775 | 315,118: 1,738 |
+| (5) count | the same under an Agg, 165,202: 761 | the same: 824 | the upper node alone, 281,538: 643 | the same: 651 | 315,338: 1,952 |
+
+What they say:
+
+- The path is the fastest way to the semi join's rows over f1's wide filters: 1.3 to 2.5 times
+  core's hash semi join serially ((3), (4), (5)), 1.1 to 2.2 times with two workers, and 2 to 33
+  times the plans core makes with its hash joins disabled - a nested loop into f1's btree, or over
+  f1's rows made unique. For the counts (1) and (2) it is about as fast as core's hash semi joins
+  serially, and as the upper node over core's parallel hash semi join - the node's child where the
+  path is not taken - with two workers; with a narrow filter on f2 a plan that starts from f2's
+  10,000 rows is faster (177 to 367 ms against 732 to 1,958), and the path is priced above it by
+  as much.
+- With nothing disabled it was chosen once, rightly: (3)'s GROUP BY with two workers, 399 ms
+  against the 868 ms of the plan core takes with the path off. `enable_nestloop = off` changes no
+  choice of it; it moves (1) with two workers off core's nested loop into f2's btree (9.2 s) to the
+  upper node over core's parallel hash semi join (1.2 s), whose partial path is cheaper than the
+  path's (233,299 against 350,092) and as fast.
+- The path's price is its time: 370 to 680 units a millisecond serially and 310 to 520 with two
+  workers, around §10's calibration. Core's hash semi joins over the partitioned fact run at 100 to
+  240 (some 90,000 heap pages of fact rows read past `shared_buffers`, two million rows filtered),
+  and its nested loop into f2's btree at 23. So the path loses on price where it wins on time:
+  serially it costs 1.2 to 2.7 times core's hash semi join and runs faster. Nothing was taken off
+  its price for that; a hash join priced at its time would lose to it.
+- Core's estimate of d ⋉ f1 was 90,469 rows for 195,969 (ANALYZE's `n_distinct` of `f1.fk`,
+  226,000 for 500,000): the join path's rows are the join rel's, and everything above them is
+  priced for half the rows it gets, whichever path the join rel takes.
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
@@ -10481,6 +10755,52 @@ still declines.
 copy that comes out empty, the knob off and a copy too large for its memory, rescans, a partitioned
 fact's leaves, parallel plans and a dirty heap before and after VACUUM - each answer against the
 pushdown off.
+
+`test/sql/fkjoin_semipath.sql` (2026-09-29), the semi and anti join as a join path, against the
+pushdown off (`lion_sp()`, as `lion_gj()` does: with core's join methods disabled - so that the path
+is taken wherever it is offered - as planned, in parallel where the plan is, then serially, and
+with the pushdown off and sequential scans only, saying which of the two paths the plan took and,
+where asked, whether it was parallel and below the upper node). The data is `fkjoin_dimjoin.sql`'s
+kind: a 3,000-row dimension; an outer side of 3,000 rows over 1,500 keys, duplicated, with NULL keys;
+f1, 40,000 rows LIST-partitioned by kind with one list sub-partitioned by range on `ts` and `ts`
+relative to `now()`; f2, a plain fact with a tsvector, its fk and an int4 copy of it; and a fact
+whose fk index is built at fillfactor 20, a directory of height 2, with a dimension over every third
+key read through an index on another column. EXPLAIN (COSTS OFF) of each shape: semi and anti joins
+over the plain fact and the partitioned one (a stable range beside a filter per kind ORed), the `IN`
+spelling with a filter that only subtracts, an outer side that is an inner join (its plan as one
+line) and one that is itself a semi join path, the outer side's order kept with no Sort, the rows
+feeding a Sort and - nothing disabled - a hash join, the upper node over the path for (A) and (B),
+and the parallel path below a Gather. The answers: semi and anti joins over both facts, fact filters
+of every kind, one that selects nothing (no row of the semi join, every row of the anti join), the
+int8 key against the int4 fk; outer sides that are an inner join, the path's own rows, an anti
+join over a semi join and an outer join whose NULL-extended rows have a NULL key; a system column,
+a whole row and expressions, computed by the path's projection; two facts on one key, whose class
+makes the join rel carry the first fact's column, an int8 fk and an int4 one; NULL keys (the semi
+join's count pinned without them, the anti join's with them) and duplicated keys, each outer row
+emitted once per its own occurrence (how many keys are emitted how many times, against the outer side's own counts); the
+rows feeding a sort, core's Agg (`avg`, `string_agg`) and a hash join; the composition, (A) and
+(B) pinned by value. Order (`lion_sp_seq()`, the rows in the order they come against the pushdown
+off, and whether a Sort was needed): descending through a backward index scan and by another column
+first through an index on it, the batch sorted by key and put back, over many batches at a
+`work_mem` of 64 kB, and over the partitioned fact - each checked, by a build that skipped the
+put-back, to fail without it. The counters: every outer row a child row and every non-NULL key
+looked up, none looked up when a fact filter selects nothing, and a parallel plan's sums. Rescans:
+the path as the inner side of a nested loop with no Materialize, serially and as a Gather; a
+correlated subplan with a new outer-side filter and a new fact filter per outer row, a NULL one
+among them; generic plans with Params on both sides, NULL ones included, and a generic plan's `kind
+= $1`, which declines. The declines: a second correlation, an outer-side qual inside `NOT EXISTS`
+(and inside `EXISTS`, where it is the outer side's and taken), a fact filter no posting set answers,
+`NOT IN` over a nullable fk, the anti join of `LEFT JOIN ... IS NULL`, a PlaceHolderVar among the
+join rel's rows, the fact joined outer; a LATERAL outer side taken above what it references;
+`pg_lion.enable_semijoin` and `pg_lion.enable_count_pushdown` off. The cost model with nothing
+disabled: the path for a few outer rows against a filter that leaves most fact rows, core's join for
+all of them against one that leaves few, and the upper node for a count of the first. The startup
+(`lion_sp_start()`, from EXPLAIN's JSON costs): nearly the whole of the path's cost past its child's
+startup for one batch, in key order and over the partitioned fact; about one batch's share of it
+at a `work_mem` of 64 kB, against the batches the executor made; next to nothing a row at a time;
+and an `ORDER BY ... LIMIT 5` over the path, a Sort above it over one batch and the outer side's
+order with no Sort over several. And a dirty heap - deletes, updates, fks moved, NULL keys made, on
+every table - before and after VACUUM.
 
 ## 28. Range predicates over the sorted directory (v1, implemented)
 
