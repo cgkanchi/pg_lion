@@ -3724,13 +3724,17 @@ static TpNode tp_nodes[64];
 static int	tp_nnodes;
 static int	tp_nleaves;
 
+/*
+ * A random tree of at most `budget` leaves: each child is given what its
+ * siblings before it left, less a leaf for each sibling after it.
+ */
 static TpNode *
-tp_gen(int depth)
+tp_gen(int depth, int budget)
 {
 	TpNode	   *n = &tp_nodes[tp_nnodes++];
 	int			i;
 
-	if (depth == 0 || tp_nleaves >= TP_LEAVES - 4 || rng_below(3) == 0)
+	if (depth == 0 || budget < 2 || rng_below(3) == 0)
 	{
 		n->kind = 0;
 		n->leaf = tp_nleaves;
@@ -3739,9 +3743,14 @@ tp_gen(int depth)
 		return n;
 	}
 	n->kind = 1 + rng_below(2);
-	n->nargs = 2 + rng_below(2);
+	n->nargs = Min(2 + (int) rng_below(2), budget);
 	for (i = 0; i < n->nargs; i++)
-		n->args[i] = tp_gen(depth - 1);
+	{
+		int			before = tp_nleaves;
+
+		n->args[i] = tp_gen(depth - 1, budget - (n->nargs - i - 1));
+		budget -= tp_nleaves - before;
+	}
 	return n;
 }
 
@@ -3933,7 +3942,7 @@ test_tree_probe(void)
 
 		tp_nnodes = 0;
 		tp_nleaves = 0;
-		root = tp_gen(1 + rng_below(3));
+		root = tp_gen(1 + rng_below(3), TP_LEAVES);
 		tp_ref_eval(root, &ref_b);
 
 		/* a: a few members, or up to an ARRAY's worth, any representation */
