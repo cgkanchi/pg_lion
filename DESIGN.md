@@ -202,7 +202,7 @@ Full API: `src/lion_container.h`. Unit tests: `test/unit/container_test.c` (`mak
 cover every type transition, boundary cardinalities (0, 1, 2047, 2048, 2049, 32767, 32768 members),
 run merging/splitting, and set algebra against a brute-force 32768-bit reference.
 
-## 4. Page layout (module `lion.h`, implemented in `lion_pages.c`)
+## 4. Page layout (module `lion.h`, implemented in `lion_pages.c`, `lion_meta.c`, `lion_state.c`, `lion_entry.c` and `lion_posting_put.c`)
 
 All pages are standard PG pages (PageInit) with a special area:
 
@@ -737,7 +737,7 @@ int2, int4, int8, oid, bool, "char", text, varchar (via text), bpchar, bytea, uu
 timestamp, timestamptz, interval, numeric, float4, float8, macaddr, inet, name, jsonb, enum types
 via anyenum (hashenum). Strategy 1 operator = the type's `=`.
 
-## 7. SQL functions (`lion_funcs.c`)
+## 7. SQL functions (`lion_funcs.c`, `lion_verify*.c`, `lion_count_sql.c`)
 
     lion_index_stats(regclass, OUT attno int2, OUT directory_height int, OUT leaf_pages bigint,
         OUT internal_pages bigint, OUT ordered bool, OUT entries bigint,
@@ -1023,23 +1023,34 @@ left links and root flags settled on the spot, and posting-set walks made, throw
 
     src/lion_tid.h            TID ↔ code helpers                          (fixed; written by the architect)
     src/lion_container.h/.c   container library + test/unit/container_test.c   (agent "container")
-    src/lion.h                on-disk structs, LionState, prototypes of lion_pages.c (skeleton by architect)
+    src/lion.h                on-disk structs, LionState, prototypes of the page layer (skeleton by architect)
     src/lion_pages.c          meta/bucket/entry/chain primitives, splits, page alloc   (agent "am-core")
+                              - since split into lion_pages.c, lion_meta.c, lion_state.c, lion_entry.c
+                              and lion_posting_put.c
     src/lion_am.c             handler, options, validate, costestimate, buildempty     (agent "am-core")
+                              - costestimate since moved to lion_amcost.c
     src/lion_build.c          ambuild                                                   (agent "am-core")
     src/lion_scan.c           ambeginscan/rescan/endscan/getbitmap                      (agent "am-core")
     src/lion_insert.c         aminsert                                                  (wave 2)
     src/lion_vacuum.c         ambulkdelete/amvacuumcleanup                              (wave 2)
     src/lion_funcs.c          stats/verify (+ count in phase 2)                         (wave 2)
+                              - verify since in lion_verify*.c, with lion_funcs.h between them
     src/lion_multikey.c       GIN-style extraction and query trees (§17)                (wave 3)
     src/lion_ordered.c        LionOrdered: lion-filtered, btree-ordered scans (§30)
+    src/lion_count.c          the count engine (§9) - since split into lion_set.c, lion_set_copy.c,
+                              lion_cursor.c, lion_expr.c, lion_vis.c, lion_count.c,
+                              lion_count_groups.c, lion_count_shared.c, lion_rangesrc.c,
+                              lion_range.c and lion_count_sql.c, which lion_count_int.h joins
+    src/lion_customscan.c     the LionCount custom scan (§10) - since split into its planner half,
+                              lion_plan_*.c, and its executor half, lion_exec_*.c, which
+                              lion_customscan.h joins
     pg_lion.control, pg_lion--0.1.sql, Makefile, test/                    (am-core, then wave 2)
 
 Coding conventions: PostgreSQL C style (tabs, K&R braces on their own line for functions, /* */
 comments, `elog(ERROR, ...)` for internal errors, `ereport` with errcode for user-facing errors),
 compile clean with `-Wall -Wextra -Wno-unused-parameter` and cassert enabled. No CRoaring dependency.
 
-## 9. Phase 2a: heap-skipping count with a visibility-map interlock (`lion_count.c`)
+## 9. Phase 2a: heap-skipping count with a visibility-map interlock (the count engine, `lion_count.h`)
 
 Goal: `count(*) WHERE k1 = v1 [AND k2 = v2 ...]` computed from containers, visiting the heap only for
 pages that are not all-visible, with exactly the MVCC semantics of the equivalent SELECT under the
@@ -1329,7 +1340,7 @@ its heap and indexes are empty, so the count used to answer 0 (2026-09-25 review
 already refused it).
 Nobody vetted the index they were handed, so they also make the decision the planner makes in
 get_relation_info() before looking anything up: `lion_index_usable(index, snapshot, &why)` (lion.h,
-implemented in lion_pages.c, shared with lion_index_verify's heapallindexed pass) requires
+implemented in lion_state.c, shared with lion_index_verify's heapallindexed pass) requires
 indisvalid and indisready and applies the indcheckxmin rule against TransactionXmin exactly as
 plancat.c does; an unusable index is an ERROR naming the reason, never a count. This is not an
 optimisation: an index built from a broken HOT chain holds only the latest version of that chain, so
@@ -1345,7 +1356,7 @@ not use at all (count_checkxmin.spec: a HOT update before CREATE INDEX makes the
 indcheckxmin, and the old REPEATABLE READ reader must get the eligibility error rather than a count
 that is missing the row it still sees).
 
-## 10. Phase 2b: CustomScan for `count(*) [GROUP BY k] FROM t WHERE k1 = c1 AND ...` (`lion_customscan.c`)
+## 10. Phase 2b: CustomScan for `count(*) [GROUP BY k] FROM t WHERE k1 = c1 AND ...` (`lion_plan_*.c`, `lion_exec_*.c`)
 
 Planner integration
 - Install `create_upper_paths_hook` (chaining to any previous hook) at `_PG_init`; act only for
@@ -1840,7 +1851,7 @@ GROUP BY, once per group.
 Now the WHERE items are COLLECTED once per relation into one private posting set - their
 intersection, less what the negated ones subtract, made by `lion_sources_collect()` exactly as the
 FK-side join's fact filters are (§27) - and every count after that is the group's set ANDed with
-that one set (`lion_group_count()`, lion_customscan.c). Three drivers take it: the entry walk
+that one set (`lion_group_count()`, lion_exec_count.c). Three drivers take it: the entry walk
 (`lion_next_group()`), an IN list that drives its own groups (`lion_next_group_inlist()`, §15, whose
 list is no item of the WHERE), and the pairs of two columns (`lion_next_group2()`, §20).
 
@@ -1963,7 +1974,7 @@ was: 266 ms, 61% of it still `array_gallop()`.
 batch at a time - up to `LION_GROUP_BATCH_MAX` (256) entries, fewer when the open budget of one
 count's cursors (work_mem, and the pins the lists leave; §15, "Bounded cursors") holds fewer, since
 each group holds a cursor, a page image for a CHAIN set, and a pin - and counts the batch in ONE
-walk of container keys (`lion_count_groups_copy()`, lion_count.c):
+walk of container keys (`lion_count_groups_copy()`, lion_count_groups.c):
 
 - the groups' cursors stand on a binary heap by container key. At each key the copy has and a group
   stands at, the copy's container is made a bitset image once, and every group standing there is
@@ -3828,7 +3839,7 @@ keys.  `amconsistentequality` stays true: a scalar roaring family holds nothing 
 operators and a multi-key one holds no equality operator at all, so `equality_ops_are_compatible()`
 is never asked about two members of the same roaring family that disagree.
 
-### Key type resolution (`lion_fill_state`, lion_pages.c)
+### Key type resolution (`lion_fill_state`, lion_state.c)
 
 The index's own tuple descriptor already carries the resolved key type: `ConstructTupleDescriptor()`
 substitutes `opckeytype` for the column type and replaces ANYELEMENT under an ANYARRAY opcintype with
@@ -3937,7 +3948,7 @@ entry but the NULL one - the EMPTY entry included - with recheck = true (`lion_e
 is the function `IS NOT NULL` already used); KEYS locates one posting set per key and hands the tree
 to the shared evaluator, emitting the result containers with recheck = false.
 
-**The scan reuses the count cursors.**  `lion_sets_iterate()` (lion_count.c) walks
+**The scan reuses the count cursors.**  `lion_sets_iterate()` (lion_expr.c) walks
 (tree over located posting sets) in ascending container-key order and calls back per container; the
 scan's callback is `lion_container_to_tbm()`.  The alternative - one TIDBitmap per key combined with
 tbm_intersect/tbm_union - was not needed: the cursors already present a set as one ascending run of
@@ -3949,7 +3960,7 @@ takes is taken before the first container page is pinned: the reader side of the
 `col op ANY (const array)` reaches a multi-key index too (amsearcharray is on for §15's sake); each
 element is a query of its own and the answers go into the same bitmap, which is their union.
 
-**Costing the ALL fallback** (`lioncostestimate`, lion_am.c; the 2026-09-21 follow-up review). An
+**Costing the ALL fallback** (`lioncostestimate`, lion_amcost.c; the 2026-09-21 follow-up review). An
 ALL-mode scan reads the WHOLE index and hands the heap every indexed row, and the generic estimate
 priced it with the PREDICATE's output selectivity instead - it was handed an empty `GenericCosts` and
 told nothing. A prefix query on 200,000 documents was estimated at **192.15** cost units against the
@@ -3984,7 +3995,7 @@ weight / `<@` against the bitmap plan's 101.3/98.0/88.7/89.1), and to GIN when a
 (18.8/7.1/27.3 ms), while exact `@>`, `&&` and AND/OR tsqueries keep the count pushdown and the
 bitmap plan unchanged. `test/sql/tsvector.sql` and `test/sql/array.sql` pin the plan shapes.
 
-### The expression evaluator (`lion_count.c`)
+### The expression evaluator (`lion_expr.c`)
 
 §15's union cursor is generalised into `LionExprCursor`, a cursor over an `LionKeyNode` tree whose
 leaves are located posting sets.  `LionCountSource` gains a `tree` member; NULL still means "the union
@@ -4026,7 +4037,7 @@ every key and has the others drop theirs, which leaves the AND rule - any child 
 `lion_source_pinned()` asks the plan, so what the count trusts and how the cursors are built are one
 decision.
 
-### Count pushdown (`lion_customscan.c`)
+### Count pushdown (`lion_plan_*.c`, `lion_exec_*.c`)
 
 A new clause kind, `LION_CLAUSE_MULTI`: an OpExpr whose operator is strategy 2, 3 or 5 of some roaring
 opfamily, with the column on the LEFT (these operators do not commute: `'{a}' @> tags` is strategy 4)
@@ -4100,7 +4111,7 @@ and one no key narrows ALL.  `<@` is still declined whatever its value: ginquery
 it with INCLUDE_EMPTY, so it would never be exact and always be the recheck the ordinary bitmap plan
 makes anyway.  (`=` on arrays is no operator of array_ops.)
 
-**Execution** (`lion_locate_multikey()`, lion_customscan.c).  The value is evaluated once per scan
+**Execution** (`lion_locate_multikey()`, lion_exec_locate.c).  The value is evaluated once per scan
 and after every ReScan with the other clause values (`lion_eval_clause_values()`, in every
 participant of a parallel plan), and extracted per relation counted:
 
@@ -5106,7 +5117,7 @@ shipped classes call C functions that read no relation.
 
 **Cross-type searches** (`int4col = 123::int8`) need an ordering of a STORED key against a value of
 another type, and it is resolved ONCE for the single-value lookup, the batched one AND the bitmap
-scan (`lion_probe_init()` / `lion_probe_find()` in lion_count.c, declared in lion_count.h and used by
+scan (`lion_probe_init()` / `lion_probe_find()` in lion_set.c, declared in lion_count.h and used by
 lion_scan.c), because all three walk the same tree and a path that descended where another scans
 would read the directory in an order it is not in. The outcomes, in this order:
 
@@ -6097,7 +6108,7 @@ that only runs after a crash left a split unfinished.
 
 Not covered: the leaf split's second page outside the repair - `lion_split_and_place()` still holds
 M, EXCLUSIVE, while it finishes P, and P while it finishes M, and neither is in the list, because
-`lion_pages.c` does not pass them. Neither is reached: M has no downlink and lies right of P, where
+`lion_posting_put.c` does not pass them. Neither is reached: M has no downlink and lies right of P, where
 every walk of that repair stops (P is held); and finishing M finds the downlink finishing P has just
 placed where M's first key routes - in a sound tree no later separator is at or below that key -
 without adopting. A link to the directory leaf stays the double
@@ -6445,7 +6456,7 @@ per column, and - with heapallindexed - every heap row under every key of every 
 
 **Scans (amgetbitmap)**: the scan keys arrive with `sk_attno`; each key resolves to its column, every
 set qual of every column is answered (§5 SCAN step 5: several on one column are ANDed like the
-columns) and the trees are ANDed through the expression evaluator of `lion_count.c` - the same
+columns) and the trees are ANDed through the expression evaluator of `lion_expr.c` - the same
 evaluator a multi-key query's AND/OR tree goes through, because "the sets of a and the sets of b" is
 an AND of set trees whatever produced them. A qual the sets cannot express is DROPPED and the TIDs
 are marked for recheck, which is always correct because the bitmap heap scan re-applies the original
@@ -6902,7 +6913,7 @@ neither pays for an image at all and the record is the page's live bytes.
 `wal_consistency_checking` did not find that one - reading the code did.**
 VACUUM's REGROW step (§18: a container that grew while it was being filtered
 and no longer fits its slot) re-places the item through the general machinery of
-lion_pages.c, the same code an INSERT goes down, so the record it writes is an
+the page layer, the same code an INSERT goes down, so the record it writes is an
 ordinary ITEM_REPLACE or ITEM_ADD or SPLIT - and it removes TIDs. The fact is a
 property of the CALLER, not of the operation: VACUUM holds a cleanup lock on
 that page throughout. So `lion_wal_removal_begin()`/`_end()` bracket that window
@@ -8082,7 +8093,7 @@ count seeks by a binary search in memory. The same forward count takes 135 ms (t
   its own table ("Parallel" below), and the participants now make one together, in a Parallel
   Hash's memory ("One copy per query" below). A copy that outgrows it SPILLS, as a hash join's
   table would
-  (2026-09-28 review): what it holds so far goes to a temporary file (`LionSpill`, lion_count.c),
+  (2026-09-28 review): what it holds so far goes to a temporary file (`LionSpill`, lion_set_copy.c),
   and so does every container after it, in key order; memory keeps sixteen bytes a container - its
   key, where it is and its size - and a count reads the file a container at a time, a seek being a
   binary search over those keys. EXPLAIN ANALYZE prints `Fact Filter Copies Spilled`. It used to be
@@ -8443,7 +8454,7 @@ several times the serial one and each participant's share of it was spent before
 count. A benchmark's collection was a large part of its parallel join's wall time for that
 reason. Now the participants collect ONE copy, together, into the query's dynamic shared memory,
 the way a Parallel Hash builds one table, and every one of them reads it
-(`lion_shared_copy_collect()`, lion_count.c; `LionSharedCopy`).
+(`lion_shared_copy_collect()`, lion_count_shared.c; `LionSharedCopy`).
 
 - **When.** A parallel-aware node whose plan collects the filters, in a Gather whose workers
   started. A plan run without them - none started, or no DSM could be made - runs in the leader,
@@ -8728,7 +8739,7 @@ the cost model, below):
   cross-type key whose family has no ordering for that type, `lion_probe_init()`) are looked up a
   row at a time, as before;
 - it looks the batch's keys up in that order with one WALK of the leaves (`LionLookupWalk`,
-  lion_count.c), and counts each key's set exactly as the row-at-a-time loop does;
+  lion_set.c), and counts each key's set exactly as the row-at-a-time loop does;
 - a key that appears again in the batch - two dimension rows with one key, which a semi or anti
   join counts once each - comes out of the sort next to the first, and takes its answer instead
   of a second lookup.
@@ -10932,7 +10943,7 @@ offered where `IndexCollMatchesExprColl()` holds, and the pushdown makes the sam
 `lion_match_index()`. NULL keys never satisfy a range: the walk visits VALUE entries only, so the
 reserved NULL (and EMPTY) entries are never in one.
 
-### The bounded walk (`LionRange`, lion_count.c)
+### The bounded walk (`LionRange`, lion_range.c)
 
 A column's range clauses become one `LionRange`, resolved once per scan (per partition, §16):
 
@@ -11866,7 +11877,7 @@ union is strictly better for a plain scan: it visits each heap page once, in phy
 an entry-by-entry list restarts at the beginning of the heap for every value; and it is already the
 shape the bitmap path evaluates. An ordered scan would need the other one (§29.8).
 
-**The stream** (`LionSetStream`, lion_count.c: `lion_stream_begin()`, `lion_stream_next()`,
+**The stream** (`LionSetStream`, lion_expr.c: `lion_stream_begin()`, `lion_stream_next()`,
 `lion_stream_end()`) is the `LionExprCursor` behind a pull interface - `lion_sets_iterate()`, the
 push form the bitmap path uses, is now a loop over it - with one new switch, `keeppins`, described
 in §29.5. A walked entry becomes a `LionPostingSet` without a lookup: an INLINE entry's payload
@@ -12316,7 +12327,7 @@ the two prices differed in:
   `lion_cost_qual_is_full()`, the count's since 2026-09-28 by `lion_multikey_cost_mode()`, the
   count's own extraction of the same query (§17, "A query known only at run time").
 
-One function prices it now. `lion_cost_set_and()` (lion_customscan.c) prices each clause as
+One function prices it now. `lion_cost_set_and()` (lion_plan_cost.c) prices each clause as
 `lion_cost_count_rel()` prices a WHERE source - `lion_cost_set_clause()`: its lookups, what a walk
 of its sets reads, its containers and, for a list, the union - intersects them with
 `lion_merge_cpu_cost()`, and charges the driver's walk and the sought sources' pages
@@ -14514,7 +14525,7 @@ block (`lion_vac_entry_matches()`), and found again after one by descending to `
 walking right through the column's summaries (`lion_vac_ref_relocate()`), as a key's entry is found
 by its key.
 
-### Readers: the phased walk (lion_count.c)
+### Readers: the phased walk (lion_range.c)
 
 A summed walk over a summarized column (`lion_entry_scan_begin_sum()`: the sum of §28, its
 complement's BELOW and ABOVE, the sum over all of §14, and the collection of a range source below)
@@ -14634,7 +14645,7 @@ leftmost of the upper bounds' for ABOVE - comparing the landed items by the dire
 where it should: `test/sql/rangesum.sql`'s `k > 2 AND k >= 4 AND k < 996 AND k <= 993` is now
 taken as its complement, 10 entries against 990 walked before.
 
-### A range as a source (lion_customscan.c)
+### A range as a source (lion_plan_count.c, lion_rangesrc.c)
 
 §28 bounded the DRIVING walk with a range and declined a range anywhere else. With summaries a
 range on any column is cheap to turn into the set of its rows, so the count pushdown now takes a
@@ -14827,7 +14838,7 @@ set per whole bucket, and each is as many containers as the bucket has rows; a s
 buckets - a summary per run of summaries - would let a wide range read a set per run instead. It
 changes what VACUUM and inserts maintain and the readers' disjointness argument, and is not done.
 
-### Costs (lion_customscan.c)
+### Costs (lion_plan_cost.c)
 
 `lion_cost_range_sum()` prices each side of a summed range with `lion_cost_range_side()`. On a
 summarized column a bucket holds `max(summary_tids, rows per key)` rows and so `bucket rows / rows
@@ -15086,7 +15097,7 @@ reads them. The counts of a GROUP BY against a collected range's bitsets take ab
 against an equality's set of as many rows, priced the same (§10's counts). And the node's lookups
 over a partitioned fact, as above - since refitted (§27, "The per-key terms, refitted").
 
-### Verification (lion_funcs.c)
+### Verification (lion_verify_summary.c)
 
 `lion_index_verify()` checks every summarized column after its other checks
 (`lion_verify_column_summaries()`): bucket by bucket in key order, it looks the bucket's summary up

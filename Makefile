@@ -1,9 +1,29 @@
 # pg_lion — build with: make PG_CONFIG=<path to pg_config>
 # (the default is .local/pg/bin/pg_config when that exists, else pg_config on PATH)
 MODULE_big = pg_lion
-OBJS = src/lion_container.o src/lion_sparse.o src/lion_wal.o src/lion_pages.o src/lion_dir.o src/lion_posting.o src/lion_am.o \
-       src/lion_build.o src/lion_spool.o src/lion_scan.o \
-       src/lion_insert.o src/lion_vacuum.o src/lion_funcs.o src/lion_count.o src/lion_customscan.o \
+# The page layer (lion.h): pages, the meta page, the relation state, entries,
+# and writing container chains.
+PAGES_OBJS = src/lion_pages.o src/lion_meta.o src/lion_state.o src/lion_entry.o \
+       src/lion_posting_put.o
+# The count engine: its interface is src/lion_count.h, and its files share the
+# private header src/lion_count_int.h.
+COUNT_OBJS = src/lion_set.o src/lion_set_copy.o src/lion_cursor.o src/lion_expr.o src/lion_vis.o \
+       src/lion_count.o src/lion_count_groups.o src/lion_count_shared.o src/lion_rangesrc.o \
+       src/lion_range.o src/lion_count_sql.o
+# The LionCount custom scan: its planner half (lion_plan_*) and its executor
+# half (lion_exec_*), which share the private header src/lion_customscan.h.
+CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_target.o \
+       src/lion_plan_cost.o src/lion_plan_fkjoin_cost.o src/lion_plan_fkjoin.o \
+       src/lion_plan_count.o src/lion_plan_hooks.o \
+       src/lion_exec_begin.o src/lion_exec_locate.o src/lion_exec_count.o \
+       src/lion_exec_fkjoin.o src/lion_exec_run.o src/lion_exec_explain.o
+# The SQL-callable helpers: lion_funcs.c and lion_index_verify()'s files, which
+# share the private header src/lion_funcs.h.
+FUNCS_OBJS = src/lion_funcs.o src/lion_verify.o src/lion_verify_dir.o src/lion_verify_heap.o \
+       src/lion_verify_summary.o
+OBJS = src/lion_container.o src/lion_sparse.o src/lion_wal.o $(PAGES_OBJS) src/lion_dir.o src/lion_posting.o \
+       src/lion_am.o src/lion_amcost.o src/lion_build.o src/lion_spool.o src/lion_scan.o \
+       src/lion_insert.o src/lion_vacuum.o $(FUNCS_OBJS) $(COUNT_OBJS) $(CUSTOMSCAN_OBJS) \
        src/lion_multikey.o src/lion_fkjoin.o src/lion_ordered.o src/lion_selfuncs.o \
        src/lion_costs.o
 PGFILEDESC = "pg_lion - roaring bitmap inverted index"
@@ -85,10 +105,13 @@ unit: test/unit/container_test test/unit/sparse_test
 # line leaves a stale object with an old struct layout after a header change)
 $(OBJS): src/lion.h src/lion_compat.h src/lion_container.h src/lion_sparse.h src/lion_tid.h \
          src/lion_wal.h
-src/lion_count.o src/lion_customscan.o src/lion_am.o src/lion_ordered.o src/lion_scan.o \
-          src/lion_funcs.o src/lion_selfuncs.o: src/lion_count.h
-src/lion_customscan.o src/lion_fkjoin.o: src/lion_fkjoin.h
-src/lion_costs.o src/lion_customscan.o src/lion_am.o src/lion_ordered.o: src/lion_costs.h
+$(COUNT_OBJS) $(CUSTOMSCAN_OBJS) $(FUNCS_OBJS) src/lion_am.o src/lion_amcost.o src/lion_ordered.o \
+          src/lion_scan.o src/lion_selfuncs.o: src/lion_count.h
+$(CUSTOMSCAN_OBJS) src/lion_fkjoin.o: src/lion_fkjoin.h
+src/lion_costs.o $(CUSTOMSCAN_OBJS) src/lion_am.o src/lion_amcost.o src/lion_ordered.o: src/lion_costs.h
+$(COUNT_OBJS): src/lion_count_int.h
+$(CUSTOMSCAN_OBJS): src/lion_customscan.h
+$(FUNCS_OBJS): src/lion_funcs.h
 src/lion_build.o src/lion_spool.o: src/lion_spool.h
 
 # Crash-recovery and hot-standby tests (test/recovery/README.md).  These need a

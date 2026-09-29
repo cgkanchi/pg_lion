@@ -17,7 +17,7 @@
  * this file does NOT reuse is GIN's consistent function: a roaring scan does
  * not test one row at a time against a bitmap of "which keys matched", it
  * combines whole posting sets.  So the query side turns the extracted keys
- * into a boolean TREE (LionKeyNode) that the set algebra in lion_count.c can
+ * into a boolean TREE (LionKeyNode) that the set algebra in lion_expr.c can
  * evaluate, and falls back to "scan everything and recheck" for any query
  * shape that a plain AND/OR of key sets cannot express.
  *

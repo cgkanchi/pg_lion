@@ -10,7 +10,7 @@
  *
  *		The LionCount node answers it by running the dimension side as a
  *		child plan and counting, per dimension row, the fk posting set of that
- *		row's key ANDed with the fact filters (lion_customscan.c).  This file
+ *		row's key ANDed with the fact filters (lion_exec_fkjoin.c).  This file
  *		decides only what is about the JOIN: that there is exactly one join
  *		clause, an equality between a plain column of each table, and which
  *		orientations of it have a dimension column that is provably unique.
@@ -75,7 +75,7 @@
 
 /*
  * Peel binary-coercion relabels off an expression, as lion_strip() in
- * lion_customscan.c does: a varchar column compared with a text one arrives
+ * lion_plan_match.c does: a varchar column compared with a text one arrives
  * as RelabelType(Var).
  */
 static Node *

@@ -1210,7 +1210,7 @@ lion_emit_multikey(LionScanOpaque so, LionState *col,
  *
  * Each qual becomes a boolean TREE over posting sets, all of them located
  * into one array, and the trees are ANDed together.  That is the very shape
- * a multi-key query already produces (§17), so the evaluator of lion_count.c
+ * a multi-key query already produces (§17), so the evaluator of lion_expr.c
  * answers both without knowing which is which.
  *
  * Every set is located BEFORE the merge starts, which is the reader side of
@@ -2140,7 +2140,7 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
  * ndropped counts the quals left to the recheck here; a set tree the scan
  * cannot build after all - a multi-key query in mode ALL (§17) - is dropped
  * where it is built, and sets the recheck there.  The same classification is
- * mirrored in lion_am.c (lion_cost_col_quals()) so that the path is priced as
+ * mirrored in lion_amcost.c (lion_cost_col_quals()) so that the path is priced as
  * the scan it takes.
  */
 typedef struct LionScanChoice
@@ -3687,7 +3687,7 @@ lion_source_next(LionSource *src)
 			 * and a relcache invalidation replaces it - the executor may
 			 * accept one between two calls, whenever it takes a lock for
 			 * something else while the scan is paused.  The old state stays
-			 * valid memory (LionAmCache, lion_pages.c) but is no longer the
+			 * valid memory (LionAmCache, lion_state.c) but is no longer the
 			 * current one, so it is looked up again here, and the walk and its
 			 * ranges re-pointed at the rebuilt one.  Nothing else the source holds points into it: the
 			 * ranges' comparison functions are copies, and the posting-set

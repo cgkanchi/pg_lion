@@ -1037,7 +1037,8 @@ extern void lion_extract_query_superset(LionState *state, Datum query,
 									   StrategyNumber strategy, LionQuery *q);
 
 
-/* ---------- lion_pages.c: primitives shared by build/insert/scan/vacuum ---------- */
+/* ---------- the page layer (lion_pages.c, lion_meta.c, lion_state.c, lion_entry.c,
+ * lion_posting_put.c): primitives shared by build/insert/scan/vacuum ---------- */
 
 /* The whole cached state of an index, built on first use (DESIGN.md §24). */
 extern LionIndexState *lion_get_index_state(Relation index);
@@ -1544,6 +1545,7 @@ extern bool lionvalidate(Oid opclassoid);
 extern void lioncostestimate(struct PlannerInfo *root, struct IndexPath *path, double loop_count,
 							Cost *indexStartupCost, Cost *indexTotalCost, Selectivity *indexSelectivity,
 							double *indexCorrelation, double *indexPages);
+extern bool lion_enable_plain_scan;	/* GUC pg_lion.enable_plain_scan */
 
 /*
  * Emit one item's members into a TIDBitmap (lion_scan.c), one tbm_add_tuples()
@@ -1587,7 +1589,7 @@ extern Size lion_inline_fetch(const char *payload, Size paylen, Size *off,
 extern void lion_fill_index_state(Relation index, LionIndexState *ix,
 								 const LionMetaPageData *meta,
 								 MemoryContext cxt);
-/* The meta page's wal_mode, remembered per relfilenode (§25; lion_pages.c). */
+/* The meta page's wal_mode, remembered per relfilenode (§25; lion_state.c). */
 extern uint32 lion_index_meta_wal_mode(Relation index);
 
 /* Record on a meta page image the order a build laid the directory out in (§21). */
@@ -1895,5 +1897,21 @@ extern PGDLLIMPORT int64 lion_dir_pages_read;
  * "Join Key Posting Pages Read" (DESIGN.md §27, "Where a key's time goes").
  */
 extern PGDLLIMPORT int64 lion_posting_pages_read;
+
+
+/*
+ * Functions of the page layer that one of its files (lion_pages.c,
+ * lion_meta.c, lion_state.c, lion_entry.c, lion_posting_put.c) uses in
+ * another.
+ */
+
+/* lion_pages.c */
+extern void lion_put_entry(Relation index, LionWalState *xstate,
+						   Buffer entrybuf, OffsetNumber entryoff,
+						   LionEntryTuple *entry);
+extern void lion_item_zero_slack(LionContainer *item, Size size, Size alloc);
+
+/* lion_state.c */
+extern uint32 lion_order_ident(LionIndexState *ix);
 
 #endif							/* LION_H */
