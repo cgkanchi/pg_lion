@@ -262,6 +262,44 @@ BEGIN
 	RETURN CASE WHEN how = '' THEN 'ordinary plan' ELSE btrim(how) END;
 END $$;
 
+/*
+ * What the startup cost of the first semi or anti join path holds, joins
+ * disabled: the share of what the path costs past its child's startup that
+ * comes before its first row - all of it for one batch, a batch's share of
+ * several, next to nothing for a row at a time - and, with `batches` (the
+ * batches the executor made, which an assert-enabled build's memory checks
+ * make more of), whether that share is about one batch's.
+ */
+CREATE FUNCTION lion_sp_start(q text, batches bigint DEFAULT NULL) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	j json;
+	n json;
+	share float8;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+	n := j->0->'Plan';
+	WHILE n IS NOT NULL AND
+		coalesce(n->>'Custom Plan Provider', '') NOT IN ('LionSemiJoin', 'LionAntiJoin') LOOP
+		n := n->'Plans'->0;
+	END LOOP;
+	IF n IS NULL THEN
+		RETURN 'no join path';
+	END IF;
+	share := ((n->>'Startup Cost')::float8 - (n->'Plans'->0->>'Startup Cost')::float8) /
+		((n->>'Total Cost')::float8 - (n->'Plans'->0->>'Startup Cost')::float8);
+	RETURN CASE WHEN share > 0.95 THEN 'before the first row: all of it'
+		WHEN share > 0.05 THEN 'before the first row: a batch of it'
+		ELSE 'before the first row: next to nothing' END ||
+		CASE WHEN batches IS NULL THEN ''
+			WHEN share BETWEEN 0.5 / batches AND 2.0 / batches
+			THEN ', about one of the batches the executor made'
+			ELSE ', not one of ' || batches || ' batches: ' || round(share::numeric, 3) END;
+END $$;
+
 CREATE FUNCTION lion_sp_h(i int8, seed int8) RETURNS int8
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 AS 'SELECT hashint8extended(i, seed) & 9223372036854775807';
@@ -417,7 +455,11 @@ SELECT * FROM lion_sp_explain('SELECT d.pk, g.label FROM lion_sp_d d JOIN lion_s
 -- facts, the second over the rows of the first
 SELECT * FROM lion_sp_explain('SELECT d.pk FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.y < 4) AND NOT EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'' AND f1.x = 3)');
 -- the outer side's order kept: in key order, a batch at a time, and put back
+-- (sorts off: over one batch a Sort of the path's rows is as early and
+-- cheaper - section 7)
+SET enable_sort = off;
 SELECT * FROM lion_sp_explain('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x = 3) ORDER BY wd.pk DESC');
+RESET enable_sort;
 -- the rows of the join feeding a sort, and - nothing disabled, a few outer rows
 -- against a fact filter that leaves most fact rows - a hash join
 SELECT * FROM lion_sp_explain('SELECT d.pk, d.region FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5) ORDER BY d.region, d.pk');
@@ -508,13 +550,14 @@ SELECT lion_sp_val('SELECT count(*) FROM lion_sp_f2 f2 WHERE f2.doc @@ ''w3 | w5
 -- the fk index of w has a directory of height 2, and the keys are looked up in
 -- key order a batch at a time; the path claims the child's order, and the rows
 -- come back in it - descending here, the batch sorted ascending, or by
--- another column first, the outer side read through an index on it (with sorts
--- off: a sort of what is left is cheaper) - with no Sort
+-- another column first, the outer side read through an index on it - with no
+-- Sort (sorts off where the outer side is one batch, whose rows a Sort of them
+-- gives as early and for less: section 7)
 -- (serially: a parallel plan's Gather Merge would need a Sort below it)
 SET max_parallel_workers_per_gather = 0;
 SELECT directory_height FROM lion_index_stats('lion_sp_w_fk');
-SELECT lion_sp_seq('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x = 3) ORDER BY wd.pk DESC');
 SET enable_sort = off;
+SELECT lion_sp_seq('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x = 3) ORDER BY wd.pk DESC');
 SELECT lion_sp_seq('SELECT wd.attr, wd.pk FROM lion_sp_wd wd WHERE NOT EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x < 5) ORDER BY wd.attr, wd.pk');
 RESET enable_sort;
 -- ... over many batches, a work_mem of 64 kB
@@ -642,7 +685,7 @@ SET pg_lion.enable_count_pushdown = off;
 SELECT lion_sp_pick('SELECT d.pk, d.attr FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w3 | w5'')');
 RESET pg_lion.enable_count_pushdown;
 
--- ---- 7. the cost model, nothing disabled -----------------------------------------
+-- ---- 7. the cost model, nothing disabled, and the startup ------------------------
 SET max_parallel_workers_per_gather = 0;
 -- a few outer rows against a fact filter that leaves most fact rows: the path
 SELECT lion_sp_pick('SELECT d.pk, d.attr FROM lion_sp_d d WHERE d.region = ''eu'' AND d.grp = ''g1'' AND EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND f1.x < 8)');
@@ -650,6 +693,27 @@ SELECT lion_sp_pick('SELECT d.pk, d.attr FROM lion_sp_d d WHERE d.region = ''eu'
 SELECT lion_sp_pick('SELECT d.pk, d.attr FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w3'' AND f2.y = 2)');
 -- a count of them: the upper node, which hands up no row
 SELECT lion_sp_pick('SELECT count(*) FROM lion_sp_d d WHERE d.region = ''eu'' AND d.grp = ''g1'' AND EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND f1.x < 8)');
+-- the startup: no row goes up before the first batch is tested whole, so the
+-- startup cost holds the child's rows of that batch and what the fact side
+-- does for them - all of it where the outer side is one batch (in key order,
+-- or over the partitioned fact), a batch's share at a work_mem of 64 kB, as
+-- many as the executor made, and next to nothing (the fact filters'
+-- collection and one row) where the keys are looked up a row at a time
+SELECT lion_sp_start('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x = 3)');
+SELECT lion_sp_start('SELECT d.pk FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'' AND f1.x = 3)');
+SET work_mem = '64kB';
+SELECT lion_sp_start('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x = 3)',
+	lion_sp_counter('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x = 3)', 'Join Key Batches'));
+RESET work_mem;
+SELECT lion_sp_start('SELECT d.pk FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.y = 2)');
+-- ... so a LIMIT prices the wait: over one batch the path's rows come no
+-- sooner in the outer side's order than through a Sort of them, which is
+-- cheaper; over several, the first batch's rows come first, with no Sort
+SELECT * FROM lion_sp_explain('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x = 3) ORDER BY wd.pk DESC LIMIT 5');
+SET work_mem = '64kB';
+SELECT * FROM lion_sp_explain('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x = 3) ORDER BY wd.pk DESC LIMIT 5');
+SELECT lion_sp_seq('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x = 3) ORDER BY wd.pk DESC LIMIT 5');
+RESET work_mem;
 SET max_parallel_workers_per_gather = 2;
 
 -- ---- 8. a dirty heap, before and after VACUUM ----------------------------------------
@@ -669,7 +733,9 @@ SELECT lion_sp('SELECT d.pk, d.grp FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM 
 SELECT lion_sp('SELECT n.id, n.k FROM lion_sp_n n WHERE NOT EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = n.k AND f1.x < 4)');
 SELECT lion_sp('SELECT count(*) FROM lion_sp_f2 f2 WHERE f2.doc @@ ''w3 | w5'' AND f2.fk IN (SELECT d.pk FROM lion_sp_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b''))', 'plan');
 SET max_parallel_workers_per_gather = 0;
+SET enable_sort = off;
 SELECT lion_sp_seq('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x = 3) ORDER BY wd.pk DESC');
+RESET enable_sort;
 SET max_parallel_workers_per_gather = 2;
 VACUUM lion_sp_f1;
 VACUUM lion_sp_f2;
@@ -682,10 +748,13 @@ SELECT lion_sp('SELECT d.pk, d.grp FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM 
 SELECT lion_sp('SELECT n.id, n.k FROM lion_sp_n n WHERE NOT EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = n.k AND f1.x < 4)');
 SELECT lion_sp('SELECT count(*) FROM lion_sp_f2 f2 WHERE f2.doc @@ ''w3 | w5'' AND f2.fk IN (SELECT d.pk FROM lion_sp_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b''))', 'plan');
 SET max_parallel_workers_per_gather = 0;
+SET enable_sort = off;
 SELECT lion_sp_seq('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SELECT 1 FROM lion_sp_w w WHERE w.fk = wd.pk AND w.x = 3) ORDER BY wd.pk DESC');
+RESET enable_sort;
 SET max_parallel_workers_per_gather = 2;
 
 DROP TABLE lion_sp_d, lion_sp_n, lion_sp_g, lion_sp_f1, lion_sp_f2, lion_sp_w, lion_sp_wd;
 DROP FUNCTION lion_sp(text, text), lion_sp_rows(text), lion_sp_seq(text),
 	lion_sp_val(text), lion_sp_explain(text, boolean), lion_sp_counter(text, text),
-	lion_sp_pick(text), lion_sp_prep(text, text), lion_sp_h(int8, int8);
+	lion_sp_pick(text), lion_sp_start(text, bigint), lion_sp_prep(text, text),
+	lion_sp_h(int8, int8);

@@ -432,6 +432,9 @@ set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook = NULL;
 #define LION_FKJOIN_BATCH_ROW_COST	(lion_fkjoin_batch_row_cost * cpu_operator_cost)
 #define LION_FKJOIN_BATCH_ENT_BYTES	(sizeof(LionJoinEnt) + 48)
 
+/* The most rows a batch takes whatever work_mem allows: its array's limit. */
+#define LION_JOIN_BATCH_MAX		((int) (MaxAllocSize / sizeof(LionJoinEnt) - 1))
+
 /*
  * How many GROUP BY columns the node understands (DESIGN.md §20).  One is
  * driven by that index's entry scan; two are the nested loop of
@@ -6844,6 +6847,11 @@ lion_cost_fkjoin_walk(double rows, double leaves, double height,
  * back as well, and the rest beside them (LionFkJoinCost): a partitioned fact
  * table is priced one leaf partition at a time, and the choices are then the
  * plan's, made over the sum of its partitions (lion_cost_fkjoin_path()).
+ *
+ * With `force` the two choices are not made but taken from *collect and *walk
+ * (a copy is made only where there is one to make): the price of a part of
+ * the rows - the first batch of a semi or anti join path, which its startup
+ * cost holds - under the choices the whole run made.
  */
 typedef struct LionFkJoinCost
 {
@@ -6863,8 +6871,10 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 					 List *whereclauses, List *wherekinds, List *ors,
 					 double dimrows, double found, bool exists,
 					 double rowbytes, int workers, bool *collect, bool *walk,
-					 LionFkJoinCost *parts)
+					 bool force, LionFkJoinCost *parts)
 {
+	bool		wantcollect = force && *collect;
+	bool		wantwalk = force && *walk;
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
 	double		tuples = Max(rel->tuples, 1.0);
@@ -6949,7 +6959,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	 */
 	descents = dimrows * (height + 1.0) * LION_DESCENT_COST;
 	walked = lion_cost_fkjoin_walk(dimrows, dirpages, height, rowbytes);
-	if (walked < descents)
+	if (force ? wantwalk : walked < descents)
 	{
 		*walk = true;
 		run += walked;
@@ -7156,8 +7166,9 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		 * made there as if the copy would be made chose the node where each
 		 * dimension row then built the filters' unions again.
 		 */
-		if (copybytes <= (double) get_hash_memory_limit() * (workers + 1) &&
-			collected < probed && !RecoveryInProgress())
+		if (force ? wantcollect :
+			(copybytes <= (double) get_hash_memory_limit() * (workers + 1) &&
+			 collected < probed && !RecoveryInProgress()))
 			*collect = true;
 		if (parts != NULL)
 		{
@@ -9086,7 +9097,8 @@ lion_leaf_turn_share(PlannerInfo *root, RelOptInfo *rel)
  * and counts (lion_cost_fkjoin_rel()), and the heap recheck of a multi-key
  * fact filter the node only has at run time (DESIGN.md §17, "A query known
  * only at run time") - the fact rows the keys reach, each count reading its
- * own.  *collect and *walk are the plan's two choices.
+ * own.  *collect and *walk are the plan's two choices - or, with `force`,
+ * the choices to price, made already (lion_cost_fkjoin_rel()).
  *
  * A partitioned fact table (DESIGN.md §27, "A partitioned fact table") is
  * every key looked up in every leaf partition, each with its own fk index,
@@ -9121,9 +9133,11 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 					  Var *fkvar, int joinclause, List *whereclauses,
 					  List *wherekinds, List *ors, double dimrows, double found,
 					  bool exists, double rowbytes, int workers, bool *collect,
-					  bool *walk)
+					  bool *walk, bool force)
 {
 	LionCountTarget *first = (LionCountTarget *) linitial(targets);
+	bool		wantcollect = force && *collect;
+	bool		wantwalk = force && *walk;
 	double		ndall;
 	Cost		other = 0;
 	Cost		descents = 0;
@@ -9149,7 +9163,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 								   first->wherecol, fkvar, joinclause,
 								   whereclauses, wherekinds, ors, dimrows,
 								   found, exists, rowbytes, workers,
-								   collect, walk, NULL);
+								   collect, walk, force, NULL);
 		run += lion_cost_recheck(root, rel, first->whereidx, first->wherecol,
 								 whereclauses, wherekinds, ors,
 								 reach * Min(Max(rel->rows, 1.0) / tuples, 1.0),
@@ -9199,7 +9213,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 		(void) lion_cost_fkjoin_rel(root, t->rel, tidx, tcol, leafvar, tjoin,
 									tclauses, tkinds, tors, tdim, tfound,
 									exists, rowbytes, workers, &tcollect,
-									&twalk, &parts);
+									&twalk, false, &parts);
 		other += parts.other;
 		descents += parts.descents;
 		walked += parts.walked;
@@ -9234,10 +9248,18 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 					   1.0));
 	probed += (batches - 1.0) * located;
 
-	*walk = (walked < descents);
-	*collect = (copybytes > 0 &&
-				copybytes <= (double) get_hash_memory_limit() * (workers + 1) &&
-				collected < probed && !RecoveryInProgress());
+	if (force)
+	{
+		*walk = wantwalk;
+		*collect = (wantcollect && copybytes > 0);
+	}
+	else
+	{
+		*walk = (walked < descents);
+		*collect = (copybytes > 0 &&
+					copybytes <= (double) get_hash_memory_limit() * (workers + 1) &&
+					collected < probed && !RecoveryInProgress());
+	}
 	return other + (*walk ? walked : descents) +
 		(*collect ? collected : probed);
 }
@@ -9407,7 +9429,7 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 								childfound,
 								jointype != LION_JOIN_INNER ||
 								(emitrows && !counts),
-								rowbytes, workers, &collect, &walk);
+								rowbytes, workers, &collect, &walk, false);
 
 	/*
 	 * Partial counts and nothing else - no dimension column to group by or
@@ -10199,6 +10221,40 @@ lion_path_has_var(Path *path, Var *var)
 }
 
 /*
+ * How many child rows a batch holds, as lion_join_fill_batch() fills it: rows
+ * until the batch's memory context has work_mem allocated.  That is its first
+ * block, the array of entries - 1,024 of them at first, doubled whenever it is
+ * full - and each row's copy, `rowbytes` less its entry.  At a small work_mem
+ * the first array is most of it: 64 kB holds some 300 rows of one column where
+ * rowbytes alone would say 700.
+ */
+static double
+lion_join_batch_rows(double rowbytes)
+{
+	double		limit = (double) work_mem * 1024.0;
+	double		ent = (double) sizeof(LionJoinEnt);
+	double		tup = Max(rowbytes - ent, 1.0);
+	double		base = (double) ALLOCSET_DEFAULT_INITSIZE;
+	double		prev = 0.0;
+	double		cap;
+	double		n = (double) LION_JOIN_BATCH_MAX;
+
+	for (cap = 1024.0; cap < (double) LION_JOIN_BATCH_MAX; cap *= 2.0)
+	{
+		/* the rows beside an array of `cap` entries, while it holds them */
+		n = ceil((limit - base - ent * cap) / tup);
+		if (n <= cap)
+		{
+			/* the row that made the array grow is in the batch */
+			n = Max(n, prev + 1.0);
+			break;
+		}
+		prev = cap;
+	}
+	return Min(Max(n, 1.0), (double) LION_JOIN_BATCH_MAX);
+}
+
+/*
  * One semi or anti join path (DESIGN.md §27, "The semi and anti join as a
  * join path") over `child`, a path of the outer side: a serial one, or with
  * `workers` above zero a partial one over a partial child, each participant
@@ -10211,8 +10267,14 @@ lion_path_has_var(Path *path, Var *var)
  * The path's rows are the join rel's, core's estimate of the semi or anti
  * join - a participant's share of them, in a partial path - and it costs the
  * child, the lookups and the existence tests, and cpu_tuple_cost and the
- * target's cost per row it emits, as a join of core's does.  It starts when
- * its child does.
+ * target's cost per row it emits, as a join of core's does.
+ *
+ * STARTUP.  No row goes up before the first batch is tested whole: the
+ * child's first `firstrows` rows, read at their share of its run, and
+ * `startrun`, what the fact side does for them - the fact filters located
+ * and collected, and the batch's lookups and existence tests - so that a
+ * LIMIT above prices the wait.  A plan that looks the keys up a row at a time
+ * has a batch of one row.
  *
  * ORDER.  A plan that looks the keys up a row at a time emits the child's
  * rows in the child's order.  One that walks the fk index in key order
@@ -10226,8 +10288,9 @@ lion_path_has_var(Path *path, Var *var)
 static void
 lion_add_semijoin_path(PlannerInfo *root, const LionFkJoin *fj,
 					   const LionFkJoinSetup *setup, Path *child, int workers,
-					   int jointype, Cost run, bool collect, bool walk,
-					   double childrows, bool parallel_safe)
+					   int jointype, Cost run, Cost startrun, double firstrows,
+					   bool collect, bool walk, double childrows,
+					   bool parallel_safe)
 {
 	RelOptInfo *joinrel = fj->joinrel;
 	PathTarget *target = joinrel->reltarget;
@@ -10235,6 +10298,9 @@ lion_add_semijoin_path(PlannerInfo *root, const LionFkJoin *fj,
 	CustomPath *cpath;
 	List	   *pathkeys;
 	double		rows;
+	double		childshare;
+	Cost		startup;
+	Cost		total;
 	int			flags;
 	ListCell   *lc;
 
@@ -10272,9 +10338,14 @@ lion_add_semijoin_path(PlannerInfo *root, const LionFkJoin *fj,
 	cpath->path.parallel_workers = workers;
 	cpath->path.pathkeys = pathkeys;
 	cpath->path.rows = rows;
-	cpath->path.startup_cost = child->startup_cost + target->cost.startup;
-	cpath->path.total_cost = child->total_cost + run + target->cost.startup +
+	total = child->total_cost + run + target->cost.startup +
 		rows * (cpu_tuple_cost + target->cost.per_tuple);
+	childshare = Min(firstrows / Max(child->rows, 1.0), 1.0);
+	startup = child->startup_cost +
+		(child->total_cost - child->startup_cost) * childshare +
+		startrun + target->cost.startup;
+	cpath->path.startup_cost = Min(startup, total);
+	cpath->path.total_cost = total;
 #if PG_VERSION_NUM >= 180000
 	cpath->path.disabled_nodes = child->disabled_nodes;
 #endif
@@ -10335,10 +10406,14 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 	int			jointype;
 	double		dimrows;
 	double		rowbytes;
+	double		perbatch;
+	double		firstrows;
 	bool		parallel;
+	bool		partitioned;
 	bool		collect;
 	bool		walk;
 	Cost		run;
+	Cost		startrun;
 	ListCell   *lc;
 
 	/*
@@ -10403,7 +10478,24 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 	run = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar,
 								setup.joinclause, setup.whereclauses,
 								setup.wherekinds, ors, dimrows, dimrows, true,
-								rowbytes, 0, &collect, &walk);
+								rowbytes, 0, &collect, &walk, false);
+
+	/*
+	 * The first batch, which is all tested before a row goes up (the startup
+	 * cost, lion_add_semijoin_path()): the rows work_mem holds
+	 * (lion_join_batch_rows()) when the keys are looked up in key order or
+	 * over a partitioned fact's leaves, and otherwise one row - never more
+	 * than the child's - priced under the choices the whole run made.
+	 */
+	partitioned = (list_length(setup.targets) > 1 ||
+				   ((LionCountTarget *) linitial(setup.targets))->rel != rel);
+	perbatch = lion_join_batch_rows(rowbytes);
+	firstrows = (walk || partitioned) ? Min(perbatch, dimrows) : 1.0;
+	startrun = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar,
+									 setup.joinclause, setup.whereclauses,
+									 setup.wherekinds, ors, firstrows,
+									 firstrows, true, rowbytes, 0, &collect,
+									 &walk, true);
 	foreach(lc, outerrel->pathlist)
 	{
 		Path	   *child = (Path *) lfirst(lc);
@@ -10411,7 +10503,7 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 		if (child->param_info != NULL)
 			continue;
 		lion_add_semijoin_path(root, fj, &setup, child, 0, jointype, run,
-							   collect, walk, dimrows,
+							   startrun, firstrows, collect, walk, dimrows,
 							   parallel && child->parallel_safe);
 	}
 
@@ -10449,7 +10541,15 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 										setup.joinclause, setup.whereclauses,
 										setup.wherekinds, ors, childrows,
 										childrows, true, rowbytes, workers,
-										&collect, &walk);
+										&collect, &walk, false);
+			/* a participant's first batch, of its share of the child */
+			firstrows = (walk || partitioned) ? Min(perbatch, childrows) : 1.0;
+			startrun = lion_cost_fkjoin_path(root, rel, setup.targets,
+											 fj->fkvar, setup.joinclause,
+											 setup.whereclauses,
+											 setup.wherekinds, ors, firstrows,
+											 firstrows, true, rowbytes,
+											 workers, &collect, &walk, true);
 			foreach(lc, outerrel->partial_pathlist)
 			{
 				Path	   *child = (Path *) lfirst(lc);
@@ -10457,8 +10557,8 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 				if (child->param_info != NULL)
 					continue;
 				lion_add_semijoin_path(root, fj, &setup, child, workers,
-									   jointype, run, collect, walk,
-									   childrows, true);
+									   jointype, run, startrun, firstrows,
+									   collect, walk, childrows, true);
 			}
 		}
 	}
@@ -17951,9 +18051,6 @@ lion_join_next_key(LionCountScanState *st)
  * set's own pin, as every count after the first row always was (§27,
  * "Visibility and the §9 interlock").
  */
-
-/* The most rows a batch takes whatever work_mem allows: its array's limit. */
-#define LION_JOIN_BATCH_MAX		((int) (MaxAllocSize / sizeof(LionJoinEnt) - 1))
 
 static void lion_pause_run(LionCountScanState *st);
 
