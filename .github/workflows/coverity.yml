@@ -1,0 +1,112 @@
+# Coverity Scan (scan.coverity.com) static analysis of pg_lion.
+#
+# The extension is built against the PGDG PostgreSQL 18 headers under
+# cov-build, which records every compilation; the capture is uploaded to the
+# project on scan.coverity.com, where the analysis runs and the defects are
+# listed.  Coverity limits how many builds a project may submit a week, so
+# this runs once a day on the default branch and by hand (workflow_dispatch),
+# not on every push.
+#
+# It needs two repository secrets (Settings -> Secrets and variables ->
+# Actions):
+#
+#   COVERITY_SCAN_TOKEN   the project's token, from the project's page on
+#                         scan.coverity.com (Project Settings)
+#   COVERITY_SCAN_EMAIL   the address Coverity mails the analysis result to
+#
+# and, if the project on scan.coverity.com is not named after this
+# repository, a repository variable COVERITY_SCAN_PROJECT with its name.
+# Without the token the job says so and does nothing.
+
+name: Coverity Scan
+
+on:
+  schedule:
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coverity:
+    name: Coverity Scan build and upload
+    runs-on: ubuntu-24.04
+    env:
+      PG: "18"
+      PG_CONFIG: .local/pg/bin/pg_config
+      COVERITY_PROJECT: ${{ vars.COVERITY_SCAN_PROJECT || github.repository }}
+      COVERITY_TOKEN: ${{ secrets.COVERITY_SCAN_TOKEN }}
+      COVERITY_EMAIL: ${{ secrets.COVERITY_SCAN_EMAIL }}
+    steps:
+      - name: Check for the Coverity token
+        id: token
+        run: |
+          if [ -z "$COVERITY_TOKEN" ] || [ -z "$COVERITY_EMAIL" ]; then
+            echo "::notice::COVERITY_SCAN_TOKEN or COVERITY_SCAN_EMAIL is not set; nothing to do"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.token.outputs.present == 'true'
+
+      - name: Install PostgreSQL 18 from apt.postgresql.org
+        if: steps.token.outputs.present == 'true'
+        run: |
+          sudo mkdir -p /etc/postgresql-common/createcluster.d
+          echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/no-main.conf
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends "postgresql-server-dev-$PG"
+          mkdir -p .local
+          ln -sfn "/usr/lib/postgresql/$PG" .local/pg
+          .local/pg/bin/pg_config --version
+
+      # The build tool is about a gigabyte; it is cached under its own md5,
+      # which Coverity publishes beside it, so a new release is fetched once.
+      - name: Look up the Coverity build tool
+        if: steps.token.outputs.present == 'true'
+        id: tool
+        run: |
+          project=$(printf '%s' "$COVERITY_PROJECT" | sed 's|/|%2F|g')
+          echo "project=$project" >> "$GITHUB_OUTPUT"
+          md5=$(curl -fsS --data "token=$COVERITY_TOKEN&project=$project&md5=1" \
+                "https://scan.coverity.com/download/cxx/linux64")
+          echo "md5=$md5" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the Coverity build tool
+        if: steps.token.outputs.present == 'true'
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: cov-analysis
+          key: cov-analysis-linux64-${{ steps.tool.outputs.md5 }}
+
+      - name: Download the Coverity build tool
+        if: steps.token.outputs.present == 'true' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsS --data "token=$COVERITY_TOKEN&project=${{ steps.tool.outputs.project }}" \
+               -o cov-analysis.tgz "https://scan.coverity.com/download/cxx/linux64"
+          echo "${{ steps.tool.outputs.md5 }}  cov-analysis.tgz" | md5sum -c -
+          mkdir cov-analysis
+          tar -xzf cov-analysis.tgz -C cov-analysis --strip-components=1
+          rm cov-analysis.tgz
+
+      - name: Build under cov-build
+        if: steps.token.outputs.present == 'true'
+        run: |
+          cov-analysis/bin/cov-build --dir cov-int make -j4
+          tail -n 5 cov-int/build-log.txt
+
+      - name: Upload the capture to scan.coverity.com
+        if: steps.token.outputs.present == 'true'
+        run: |
+          tar -czf pg_lion-cov.tgz cov-int
+          curl -fsS \
+               --form token="$COVERITY_TOKEN" \
+               --form email="$COVERITY_EMAIL" \
+               --form file=@pg_lion-cov.tgz \
+               --form version="$(git rev-parse --short HEAD)" \
+               --form description="$GITHUB_REF_NAME $(git log -1 --format=%cs)" \
+               "https://scan.coverity.com/builds?project=${{ steps.tool.outputs.project }}"
