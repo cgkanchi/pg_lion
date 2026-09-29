@@ -1,0 +1,76 @@
+# CodeQL code scanning of pg_lion (GitHub's "advanced setup").
+#
+#   c-cpp     the extension, built against the PGDG PostgreSQL 18 headers with
+#             make, which CodeQL traces (build-mode: manual - its autobuild
+#             knows nothing of PGXS or where the server headers are)
+#   actions   the workflow files themselves (build-mode: none)
+#
+# Both run the security-extended query suite.  Alerts appear under the
+# repository's Security -> Code scanning; a pull request gets the ones its
+# change introduces.  Runs on pushes to main, on pull requests, weekly, and by
+# hand.
+#
+# This is an advanced setup: CodeQL's "default setup" (Settings -> Code
+# security) must stay off, or GitHub refuses to process these results.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: c-cpp
+            build-mode: manual
+          - language: actions
+            build-mode: none
+    env:
+      PG: "18"
+      PG_CONFIG: .local/pg/bin/pg_config
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install PostgreSQL 18 from apt.postgresql.org
+        if: matrix.language == 'c-cpp'
+        run: |
+          sudo mkdir -p /etc/postgresql-common/createcluster.d
+          echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/no-main.conf
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends "postgresql-server-dev-$PG"
+          mkdir -p .local
+          ln -sfn "/usr/lib/postgresql/$PG" .local/pg
+          .local/pg/bin/pg_config --version
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-extended
+
+      - name: Build
+        if: matrix.language == 'c-cpp'
+        run: make -j4
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
