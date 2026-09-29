@@ -3084,10 +3084,8 @@ lion_container_and_union_raw(const LionContainer *a,
 	uint16		pending[LION_ARRAY_MAX_CARD];
 	uint64		found[LION_ARRAY_MAX_CARD / 64];
 	const uint16 *vals;
-	uint16	   *out = array_mdata(dest);
 	uint32		n;
 	uint32		np;
-	uint32		card = 0;
 	uint32		i;
 
 	Assert(dest != a);
@@ -3122,17 +3120,74 @@ lion_container_and_union_raw(const LionContainer *a,
 	for (i = 0; i < nb && np > 0; i++)
 		np = probe_pending(b[i], vals, pending, np, found);
 
-	/*
-	 * The found ones, in a's order.  A member written is masked and above
-	 * the one before (array_out()), so that a damaged a's repeats and
-	 * disorder come out a well-formed ARRAY, as container_and_probe()
-	 * leaves them.
-	 */
-	lion_container_init(dest, a->ckey);
+	/* the found ones, in a's order */
+	return lion_container_array_from_marks(dest, a->ckey, vals, n, found);
+}
+
+/*
+ * THE PIECES OF THAT PROBE, FOR A TREE (DESIGN.md §29.11, "Trees probed").
+ * lion_container_and_union_raw() is one OR of containers probed with a's
+ * members; the count engine's AND also meets nested trees - an AND of ORs,
+ * an OR of ANDs - which it evaluates for the running intersection's members
+ * alone, node by node: a leaf's container probed with the positions still
+ * wanted, an AND node's children each given the positions the one before it
+ * kept, an OR node's the positions none before it found.  These are the
+ * three steps it is made of, as that function takes them.
+ *
+ * lion_container_extract_members(): c's members as iterate() hands them out,
+ * in ascending order, into out, which has room for cap of them; the count,
+ * or cap + 1 when there are more than that, which only a damaged container
+ * (or one of more members than the caller wanted) can have.
+ */
+uint32
+lion_container_extract_members(const LionContainer *c, uint16 *out, uint32 cap)
+{
+	return container_extract(c, out, cap);
+}
+
+/*
+ * lion_container_probe_members(): of the positions pending[0 .. np - 1] into
+ * vals[], ascending, mark in found[] (a bit a position) the ones whose value
+ * b holds, leave in pending[], in order, the ones it does not, and return
+ * how many those are - probe_pending() above: a bit test in a BITSET, a
+ * gallop through an ARRAY, a search or a merge of a RUN's runs.  vals[] is
+ * ascending for the lookups to be right; for a damaged b or vals[] which
+ * positions are kept is unspecified, and no index leaves vals[], pending[],
+ * found[] or b.
+ */
+uint32
+lion_container_probe_members(const LionContainer *b, const uint16 *vals,
+							 uint16 *pending, uint32 np, uint64 *found)
+{
+	return probe_pending(b, vals, pending, np, found);
+}
+
+/*
+ * lion_container_array_from_marks(): dest (capacity LION_CONTAINER_MAX_SIZE)
+ * becomes the ARRAY of ckey holding vals[p] for every position p < n marked
+ * in marks[], in vals[]'s order, and its cardinality is returned.  A member
+ * written is masked and above the one before (array_out()), so that a
+ * damaged vals[]'s repeats and disorder come out a well-formed ARRAY, as
+ * container_and_probe() leaves them; past LION_ARRAY_MAX_CARD positions
+ * nothing is read.  dest does not overlap vals[].
+ */
+uint32
+lion_container_array_from_marks(LionContainer *dest, uint32 ckey,
+								const uint16 *vals, uint32 n,
+								const uint64 *marks)
+{
+	uint16	   *out = array_mdata(dest);
+	uint32		card = 0;
+	uint32		i;
+
+	n = Min(n, (uint32) LION_ARRAY_MAX_CARD);
+	lion_container_init(dest, ckey);
 	for (i = 0; i < (n + 63) / 64; i++)
 	{
-		uint64		word = found[i];
+		uint64		word = marks[i];
 
+		if ((i << 6) + 64 > n)
+			word &= (n & 63) ? ~(~UINT64CONST(0) << (n & 63)) : ~UINT64CONST(0);
 		while (word != 0)
 		{
 			uint32		p = (i << 6) + (uint32) pg_rightmost_one_pos64(word);

@@ -393,6 +393,10 @@ SELECT lion_pk('SELECT count(*) FROM lion_pkd d WHERE d.region = ''r2'' AND NOT 
  pushed down, 1 rows
 (1 row)
 
+-- collected: a count that probes a filter this small in memory is priced
+-- below one against the copy (DESIGN.md §27, "The per-key terms, refitted"),
+-- and it is the copy's lookups that are counted here
+SET pg_lion.fkjoin_count_cost = 1e6;
 SELECT (n->>'Fact Filter Rows Collected')::int AS collected,
 	   (n->>'Fact Filter Copy Seeks')::int <= (n->>'Join Key Containers Read')::int AS a_seek_a_container,
 	   (n->>'Fact Filter Copy Containers Read')::int < (n->>'Join Key Containers Read')::int AS most_find_nothing
@@ -402,6 +406,7 @@ FROM lion_pk_node('SELECT count(*) FROM lion_pks f JOIN lion_pkd d ON f.fk = d.p
       2000 | t                  | t
 (1 row)
 
+RESET pg_lion.fkjoin_count_cost;
 DROP TABLE lion_pks;
 DROP TABLE lion_pkf, lion_pkd;
 DROP FUNCTION lion_pk(text);

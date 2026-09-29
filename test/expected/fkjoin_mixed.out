@@ -682,12 +682,13 @@ EXPLAIN (VERBOSE, COSTS OFF) SELECT count(DISTINCT d.pk), count(*) FROM lion_mf 
                ->  Custom Scan (LionCount)
                      Output: d.pk, (PARTIAL count(*))
                      Lion Indexes: lion_mf_fk (fk = d.pk), lion_mf_hot (hot = true)
+                     Join Key Lookups: in index order
                      Join Rows: the dimension rows with a match, each with its count
                      Fact Filters: collected once
                      ->  Seq Scan on public.lion_md d
                            Output: d.pk
                            Filter: d.kept
-(15 rows)
+(16 rows)
 
 EXPLAIN (VERBOSE, COSTS OFF) SELECT d.attr, count(DISTINCT d.pk), count(*), count(d.name), sum(d.small), max(d.name) FROM lion_mf f JOIN lion_md d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.attr HAVING count(*) > 10 ORDER BY count(*) DESC;
                                                                                                           QUERY PLAN                                                                                                          
@@ -707,11 +708,12 @@ EXPLAIN (VERBOSE, COSTS OFF) SELECT d.attr, count(DISTINCT d.pk), count(*), coun
                      ->  Custom Scan (LionCount)
                            Output: d.attr, d.pk, d.name, d.small, (PARTIAL count(*))
                            Lion Indexes: lion_mf_fk (fk = d.pk), lion_mf_x (x = 3)
+                           Join Key Lookups: in index order
                            Join Rows: the dimension rows with a match, each with its count
                            Fact Filters: collected once
                            ->  Seq Scan on public.lion_md d
                                  Output: d.attr, d.pk, d.name, d.small
-(19 rows)
+(20 rows)
 
 -- no DISTINCT: hashed, with no Sort
 EXPLAIN (COSTS OFF) SELECT d.grp, count(*), min(d.attr), count(d.attr) FROM lion_mf f JOIN lion_md d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.grp;
@@ -722,10 +724,11 @@ EXPLAIN (COSTS OFF) SELECT d.grp, count(*), min(d.attr), count(d.attr) FROM lion
          Group Key: d.grp
          ->  Custom Scan (LionCount)
                Lion Indexes: lion_mf_fk (fk = d.pk), lion_mf_x (x = 3)
+               Join Key Lookups: in index order
                Join Rows: the dimension rows with a match, each with its count
                Fact Filters: collected once
                ->  Seq Scan on lion_md d
-(8 rows)
+(9 rows)
 
 -- the fact's key counted distinct: the rows carry the dimension's key in its place
 EXPLAIN (VERBOSE, COSTS OFF) SELECT count(DISTINCT f.fk), count(*) FROM lion_mf f JOIN lion_md d ON d.pk = f.fk WHERE f.x = 3;
@@ -741,11 +744,12 @@ EXPLAIN (VERBOSE, COSTS OFF) SELECT count(DISTINCT f.fk), count(*) FROM lion_mf 
                ->  Custom Scan (LionCount)
                      Output: fk, (PARTIAL count(*))
                      Lion Indexes: lion_mf_fk (fk = d.pk), lion_mf_x (x = 3)
+                     Join Key Lookups: in index order
                      Join Rows: the dimension rows with a match, each with its count
                      Fact Filters: collected once
                      ->  Seq Scan on public.lion_md d
                            Output: d.pk
-(14 rows)
+(15 rows)
 
 -- the forward semi join's distinct keys, each with its count
 EXPLAIN (COSTS OFF) SELECT count(*), count(DISTINCT f.fk) FROM lion_mf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_mdn d WHERE d.k = f.fk AND d.attr = 1);
@@ -759,11 +763,12 @@ EXPLAIN (COSTS OFF) SELECT count(*), count(DISTINCT f.fk) FROM lion_mf f WHERE f
                      Lion Indexes: lion_mf_fk (fk = d.k), lion_mf_x (x = 3)
                      Join Type: Semi
                      Join Keys: distinct, sorted
+                     Join Key Lookups: in index order
                      Join Rows: the distinct keys with a match, each with its count
                      Fact Filters: collected once
                      ->  Seq Scan on lion_mdn d
                            Filter: (attr = 1)
-(12 rows)
+(13 rows)
 
 -- a semi or anti join's rows are the join's own: the aggregates as they stand
 EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*), count(DISTINCT d.attr), count(d.name), sum(d.attr) FROM lion_md d WHERE EXISTS (SELECT 1 FROM lion_mf f WHERE f.fk = d.pk AND f.x = 3);
@@ -778,11 +783,12 @@ EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*), count(DISTINCT d.attr), count(d.na
                Output: d.attr, d.name
                Lion Indexes: lion_mf_fk (fk = d.pk), lion_mf_x (x = 3)
                Join Type: Semi
+               Join Key Lookups: in index order
                Join Rows: the dimension rows with a match
                Fact Filters: collected once
                ->  Seq Scan on public.lion_md d
                      Output: d.attr, d.name, d.pk
-(13 rows)
+(14 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*), count(d.k) FROM lion_mdn d WHERE NOT EXISTS (SELECT 1 FROM lion_mf f WHERE f.fk = d.k AND f.x = 2);
                            QUERY PLAN                           
@@ -791,10 +797,11 @@ EXPLAIN (COSTS OFF) SELECT count(*), count(d.k) FROM lion_mdn d WHERE NOT EXISTS
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_mf_fk (fk = d.k), lion_mf_x (x = 2)
          Join Type: Anti
+         Join Key Lookups: in index order
          Join Rows: the dimension rows without a match
          Fact Filters: collected once
          ->  Seq Scan on lion_mdn d
-(7 rows)
+(8 rows)
 
 -- counts alone are partial counts, as ever: summed in the node, or one a
 -- dimension row under a GROUP BY
@@ -804,10 +811,11 @@ EXPLAIN (COSTS OFF) SELECT count(*), count(d.pk) FROM lion_mf f JOIN lion_md d O
  Finalize Aggregate
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_mf_fk (fk = d.pk), lion_mf_hot (hot = true)
+         Join Key Lookups: in index order
          Fact Filters: collected once
          ->  Seq Scan on lion_md d
                Filter: kept
-(6 rows)
+(7 rows)
 
 EXPLAIN (COSTS OFF) SELECT d.attr, count(*) FROM lion_mf f JOIN lion_md d ON d.pk = f.fk WHERE f.hot AND d.kept GROUP BY d.attr;
                                QUERY PLAN                               
@@ -816,10 +824,11 @@ EXPLAIN (COSTS OFF) SELECT d.attr, count(*) FROM lion_mf f JOIN lion_md d ON d.p
    Group Key: d.attr
    ->  Custom Scan (LionCount)
          Lion Indexes: lion_mf_fk (fk = d.pk), lion_mf_hot (hot = true)
+         Join Key Lookups: in index order
          Fact Filters: collected once
          ->  Seq Scan on lion_md d
                Filter: kept
-(7 rows)
+(8 rows)
 
 RESET enable_hashjoin;
 RESET enable_mergejoin;
@@ -946,11 +955,12 @@ EXPLAIN (COSTS OFF) SELECT count(DISTINCT d.pk), count(*) FROM lion_mf f JOIN li
                      Workers Planned: 2
                      ->  Parallel Custom Scan (LionCount)
                            Lion Indexes: lion_mf_fk (fk = d.pk), lion_mf_hot (hot = true)
+                           Join Key Lookups: in index order
                            Join Rows: the dimension rows with a match, each with its count
                            Fact Filters: collected once
                            ->  Parallel Seq Scan on lion_md d
                                  Filter: kept
-(12 rows)
+(13 rows)
 
 EXPLAIN (COSTS OFF) SELECT d.grp, count(*), max(d.name) FROM lion_mf f JOIN lion_md d ON d.pk = f.fk WHERE f.x = 3 GROUP BY d.grp;
                                      QUERY PLAN                                      
@@ -962,10 +972,11 @@ EXPLAIN (COSTS OFF) SELECT d.grp, count(*), max(d.name) FROM lion_mf f JOIN lion
                Workers Planned: 2
                ->  Parallel Custom Scan (LionCount)
                      Lion Indexes: lion_mf_fk (fk = d.pk), lion_mf_x (x = 3)
+                     Join Key Lookups: in index order
                      Join Rows: the dimension rows with a match, each with its count
                      Fact Filters: collected once
                      ->  Parallel Seq Scan on lion_md d
-(10 rows)
+(11 rows)
 
 -- counts alone keep the partial counts: one summed row a participant
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_mf f JOIN lion_md d ON d.pk = f.fk WHERE f.hot AND d.kept;
@@ -976,10 +987,11 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_mf f JOIN lion_md d ON d.pk = f.fk
          Workers Planned: 2
          ->  Parallel Custom Scan (LionCount)
                Lion Indexes: lion_mf_fk (fk = d.pk), lion_mf_hot (hot = true)
+               Join Key Lookups: in index order
                Fact Filters: collected once
                ->  Parallel Seq Scan on lion_md d
                      Filter: kept
-(8 rows)
+(9 rows)
 
 RESET enable_hashjoin;
 RESET enable_mergejoin;

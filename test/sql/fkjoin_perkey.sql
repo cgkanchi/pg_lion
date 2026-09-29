@@ -288,10 +288,15 @@ SELECT lion_pk('SELECT count(*) FROM lion_pks f JOIN lion_pkd d ON f.fk = d.pk W
 SELECT lion_pk('SELECT d.attr, count(*) FROM lion_pks f JOIN lion_pkd d ON f.fk = d.pk WHERE f.z = 1 GROUP BY d.attr');
 SELECT lion_pk('SELECT count(*) FROM lion_pkd d WHERE EXISTS (SELECT 1 FROM lion_pks f WHERE f.fk = d.pk AND f.z = 1)');
 SELECT lion_pk('SELECT count(*) FROM lion_pkd d WHERE d.region = ''r2'' AND NOT EXISTS (SELECT 1 FROM lion_pks f WHERE f.fk = d.pk AND f.z = 1)');
+-- collected: a count that probes a filter this small in memory is priced
+-- below one against the copy (DESIGN.md §27, "The per-key terms, refitted"),
+-- and it is the copy's lookups that are counted here
+SET pg_lion.fkjoin_count_cost = 1e6;
 SELECT (n->>'Fact Filter Rows Collected')::int AS collected,
 	   (n->>'Fact Filter Copy Seeks')::int <= (n->>'Join Key Containers Read')::int AS a_seek_a_container,
 	   (n->>'Fact Filter Copy Containers Read')::int < (n->>'Join Key Containers Read')::int AS most_find_nothing
 FROM lion_pk_node('SELECT count(*) FROM lion_pks f JOIN lion_pkd d ON f.fk = d.pk WHERE f.z = 1') n;
+RESET pg_lion.fkjoin_count_cost;
 
 DROP TABLE lion_pks;
 DROP TABLE lion_pkf, lion_pkd;

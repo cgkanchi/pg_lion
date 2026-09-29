@@ -279,6 +279,35 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §29.11, "Trees probed": the same for a nested tree - an AND
+	 * of ORs, an OR of ANDs - evaluated for the running intersection's
+	 * members alone.  A testing knob, as the one above.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_tree_probe",
+							 "Lets a lion AND of posting sets look its few rows up in a nested AND/OR tree's leaves instead of building the tree's container.",
+							 "Off, every nested tree a lion AND meets is built at the keys it is sought to; the answers are the same either way.",
+							 &lion_enable_tree_probe,
+							 true,
+							 PGC_USERSET,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §27, "Probed, then collected": whether an FK-side join that
+	 * probes its fact filters may collect them once probing has cost what
+	 * collecting would.  A testing knob: off, a probing plan probes to its
+	 * end, as it did; the answers are the same either way.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_filter_switch",
+							 "Lets a lion FK-side join that probes its fact filters collect them part way through, once probing has cost what collecting them would.",
+							 "Off, a plan that probes the fact filters probes them to its end; the answers are the same either way.",
+							 &lion_enable_filter_switch,
+							 true,
+							 PGC_USERSET,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
+
+	/*
 	 * The cost model's constants (DESIGN.md §31, "The settings"): one setting
 	 * for each, the multiplier of the core cost it is priced in, for
 	 * calibrating the model without a rebuild.

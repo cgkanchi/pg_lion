@@ -150,6 +150,7 @@
 
 /* GUC and the previous hook, both owned here and installed by _PG_init. */
 bool		lion_enable_count_pushdown = true;
+bool		lion_enable_filter_switch = true;
 create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 
 /* Kinds of column in custom_scan_tlist. */
@@ -254,10 +255,14 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * does (DESIGN.md §27, "The cost of a key, after the per-key path"): once it
  * works in the node's scratch memory and keeps the node's map page pinned,
  * what is left is some twenty allocations from memory already there, two
- * cursors built and the plan's decisions, about half a microsecond - this.
- * §10 and §26 measured 1.0 us a count or test that also made and deleted a
- * memory context, pinned a map page and, when it merged two sources, malloc'd
- * and freed two blocks every time: what the per-key fixes took off.
+ * cursors built and the plan's decisions, about half a microsecond - this,
+ * 25, until the refit of 2026-09-29 (DESIGN.md §27, "The per-key terms,
+ * refitted") fitted the probing counts of 61 serial joins against their
+ * counters at 271 ns a count besides the containers it reads and the pages
+ * it descends: 14.  §10 and §26 measured 1.0 us a count or test that also
+ * made and deleted a memory context, pinned a map page and, when it merged
+ * two sources, malloc'd and freed two blocks every time: what the per-key
+ * fixes took off.
  */
 #define LION_FKJOIN_COUNT_COST	(lion_fkjoin_count_cost * cpu_tuple_cost)
 
@@ -266,10 +271,12 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * joins, or the row itself for count(DISTINCT) - the per-tuple context reset,
  * a virtual tuple, the projection, the return through the executor, and the
  * pause that lets go of its index pins (the leaf a walk in key order then
- * reads again for the next key is that key's leaf visit, which
+ * finds again for the next key is in that key's lookup, which
  * lion_cost_fkjoin_walk() charges).  About 0.2 us from the operations (the
- * same derivation), where one cpu_tuple_cost used to be charged.  A summed
- * join (LION_JOINFLAG_SUM) hands up one row per participant and run.  What
+ * same derivation), where one cpu_tuple_cost used to be charged: 10.  The
+ * refit of 2026-09-29 found 340 to 630 ns a row handed up, serial, and 200 to
+ * 570 in two workers, fitted beside the keys' lookups and batches: 20.  A
+ * summed join (LION_JOINFLAG_SUM) hands up one row per participant and run.  What
  * core does with the rows above the node - its Finalize Agg's transitions, a
  * Gather's tuple queue - core charges.
  */
@@ -281,27 +288,42 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * the AND of the two containers there.  Measured on the assert build at two
  * million fact rows and a thousand dimension rows (DESIGN.md §27): the
  * thousand counts ANDed with a 10% filter read 708,160 containers in 157 ms
- * against 354,076 in 54 ms without it, about 0.3 us per probe.  §10's two
- * cpu_operator_cost per container understate that tenfold, and with them the
- * node was chosen for that query at 157 ms against the ordinary plan's 63.
- * 20 still chose it (23,378 against 28,057); 30 refuses it (about 32,000) and
- * keeps the same query over a quarter of the dimension, 39 ms against 67,
- * chosen (about 8,000).
+ * against 354,076 in 54 ms without it, about 0.3 us per probe - 80, which
+ * had the posting pages the seeks read in it.  Refitted on the release build
+ * with the pages apart (LION_FKJOIN_PROBE_PAGE_COST, below): 51 ns a filter
+ * container sought, besides the fk container's own LION_CONTAINER_COST - 10.
  */
 #define LION_FKJOIN_PROBE_COST	(lion_fkjoin_probe_cost * cpu_operator_cost)
 
 /*
- * ... and, per count, each SET of a fact filter that is a union (an IN list,
- * an OR across columns): the count builds its k-way union again (§15), and
- * each sub-cursor is set up and positioned whether or not the fk set's keys
- * find anything in it.  Measured on the assert build, 1.5M fact rows and 300
- * dimension rows: `t IN (n values)` took 57 ms at n = 30, 199 at 100, 599 at
- * 300 and 1195 at 1000 - 4 to 6 us per set per count.  It is the rebuild a
- * GROUP BY's counts make of a union source too - the same count of the same
- * sources, lion_count_sources_cached() - measured on the release build at 2.7
- * to 6 us a set (LION_UNION_SET_COST), and priced as that, by the same setting.
+ * ... and each posting page such a probe reads.  A filter set too large to
+ * be copied into memory for the counts (LION_MATERIALIZE_MAX_*) is read from
+ * its posting tree at every count, and from the second row on it is a NOPIN
+ * set whose cursor starts at the tree's root: the first probe of a count
+ * descends it, and a probe after it steps right while the keys it is sought
+ * to are close (lion_fkjoin_probe_one()).
+ *
+ * Refitted on the release build (DESIGN.md §27, "The per-key terms,
+ * refitted", 2026-09-29) from the probing counts of 61 serial joins - fact
+ * filters of one and three sets, 100 to 500,000 keys of 1 to 1,000 rows -
+ * against their counters: 270 ns a posting page (54 cpu_operator_cost).  A
+ * set small enough to be copied is probed in memory at LION_MEMORY_PROBE_COST
+ * instead.
  */
-#define LION_FKJOIN_SET_COST	LION_UNION_SET_COST
+#define LION_FKJOIN_PROBE_PAGE_COST	(lion_fkjoin_probe_page_cost * cpu_operator_cost)
+
+/*
+ * ... and, per count, each SET of a fact filter that is a union (an IN list,
+ * an OR across columns, a multi-key query of several keys): its cursor set
+ * up and positioned whether or not the fk set's keys find anything in it.
+ * It was LION_UNION_SET_COST - measured on the assert build at 4 to 6 us a
+ * set a count, when every count built the union again at every key - until
+ * the refit of 2026-09-29, which found 217 ns (11 cpu_tuple_cost): since
+ * unions are probed (§29.11) a count builds none for a key's few rows, and
+ * what the union costs besides is its sets' probes, which are priced as
+ * probes.  A GROUP BY's counts keep LION_UNION_SET_COST.
+ */
+#define LION_FKJOIN_SET_COST	(lion_fkjoin_set_cost * cpu_tuple_cost)
 
 /*
  * ... and, when the fact filters are COLLECTED once into a private copy
@@ -333,6 +355,14 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  * 25 to 30 ns, five cpu_operator_cost.  COPY_MEMBER is unchanged: the AND of
  * a larger fk container still merges it with the copy's, and at six members a
  * container the node is still slower than the hash join it is priced above.
+ *
+ * Refitted on the release build (DESIGN.md §27, "The per-key terms,
+ * refitted", 2026-09-29) from the counts against the copy of 61 serial
+ * joins, 100 to 500,000 keys of 1 to 1,000 rows: 659 ns a count besides its
+ * containers - COPY_COUNT 33 where it was 25 - 52 ns an fk container, of which
+ * LION_CONTAINER_COST, charged to every count's fk containers, is 40 -
+ * COPY_PROBE 2 - and 14 ns a member past a container's first (COPY_MEMBER's
+ * 15, unchanged).
  */
 #define LION_FKJOIN_COPY_COUNT_COST	(lion_fkjoin_copy_count_cost * cpu_tuple_cost)
 #define LION_FKJOIN_COPY_PROBE_COST	(lion_fkjoin_copy_probe_cost * cpu_operator_cost)
@@ -391,17 +421,15 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  *	BATCH_ROW		per row, its place in the batch - the row copied in, its
  *					share of the sort (log2 of the batch comparisons through the
  *					opclass's comparison function) and the slot it is handed
- *					back to the target list in.  Priced as one directory page
- *					visit - LION_DESCENT_COST's default, though a setting of
- *					its own, since a page visit is not what it is - which is on
- *					the high side: putting a key into the datum sort of the
- *					distinct keys above, sorting it and taking it out again
- *					measured at a fraction of what a page visit is fitted at,
- *					and a row's copy and its slot are of the same order.  High
- *					on purpose: the walk replaces a descent's internal levels
- *					with this, so it is taken only where it saves a page a key
- *					or more - never over a directory of height 1, whose descent
- *					is the root and the leaf.
+ *					back to the target list in.  It was priced as a directory
+ *					page visit, 120 - on purpose high, beside a page visit a
+ *					row the walk was charged as well, so that a walk was never
+ *					taken over a directory of height 1.  Refitted with the
+ *					key's lookup on its leaf (LION_FKJOIN_LOOKUP_COST): a walked
+ *					key takes 740 ns besides the leaves it steps over, which
+ *					75 and the lookup's 75 are (DESIGN.md §27, "The per-key
+ *					terms, refitted"), and a descent of a directory of height
+ *					1 - its root and its leaf - takes 860 ns and the lookup's.
  *	BATCH_ENT_BYTES	per row, what a batch holds besides the row's own columns:
  *					the entry that sorts it, the MinimalTuple's header and the
  *					allocator's chunk headers of the row and of a key copied
@@ -409,6 +437,26 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
  */
 #define LION_FKJOIN_BATCH_ROW_COST	(lion_fkjoin_batch_row_cost * cpu_operator_cost)
 #define LION_FKJOIN_BATCH_ENT_BYTES	(sizeof(LionJoinEnt) + 48)
+
+/*
+ * ... and each key a walk looks up on the leaf it stands on: the leaf's
+ * binary search, the entry decoded and its set located - its INLINE payload
+ * copied - which a descent's leaf level has in its price already.
+ *
+ * Refitted on the release build (DESIGN.md §27, "The per-key terms,
+ * refitted", 2026-09-29) from the lookups of 122 serial joins, walked and
+ * descended, of plain and partitioned facts: 377 ns a key looked up (75
+ * cpu_operator_cost) and 430 ns a directory page visited, which is
+ * LION_DESCENT_COST's to price.  Fitted with the time the batches take, a
+ * walked key came to 740 ns besides the leaves it steps over - its lookup
+ * and its place in its batch, LION_FKJOIN_BATCH_ROW_COST, 75 where it was
+ * 120.  A walk used to be charged a page visit a row as well as the leaves
+ * it steps over, where a key on the leaf the walk stands on reads no page
+ * (the walks' counters show 0.02 to 0.3 directory pages a key where their
+ * keys are dense): a partitioned fact's lookups, a batch sorted once and
+ * walked in every leaf, were priced at two to three times their time.
+ */
+#define LION_FKJOIN_LOOKUP_COST	(lion_fkjoin_lookup_cost * cpu_operator_cost)
 
 /*
  * How many GROUP BY columns the node understands (DESIGN.md §20).  One is
@@ -1023,6 +1071,16 @@ typedef struct LionJoinPart
 	LionQueryMode *qmode;		/* one per clause */
 	MemoryContext cxt;
 	struct LionSharedCopy *shared;
+
+	/*
+	 * Probed, then collected (DESIGN.md §27): what probing its filters has
+	 * cost so far this run, and what collecting them would - estimated at
+	 * its first turn, -1 before, and 0 where no copy of them can be made or
+	 * would fit - and the keys counted by probing them.
+	 */
+	double		rent;
+	double		buy;
+	int64		probed;
 } LionJoinPart;
 
 typedef struct LionCountScanState
@@ -1460,6 +1518,32 @@ typedef struct LionCountScanState
 	int64		joinspilled;	/* copies that went to a temporary file */
 
 	/*
+	 * PROBED, THEN COLLECTED (DESIGN.md §27): a plan that probes the fact
+	 * filters, because the planner expected few dimension rows, keeps an
+	 * account of what probing them has cost this run - joinrent, in the
+	 * planner's units, from what the counts read (lion_join_count_key()) - and
+	 * collects them once it reaches what collecting would cost, joinbuy
+	 * (lion_join_copy_price(), from the located sets; -1 until they are
+	 * priced, 0 where no copy of them can be made or would fit).  joinswitch
+	 * says this run may still switch; joinprobed counts its keys counted by
+	 * probing.  A partitioned fact table keeps the same account per leaf
+	 * (LionJoinPart), joinrentp pointing at the one of the leaf whose turn it
+	 * is.  joinswitches and joinswitchkeys are what EXPLAIN ANALYZE reports:
+	 * the copies made by switching, and the keys probed before each, summed
+	 * over the runs, the leaves and - joinworker* - the workers.
+	 */
+	bool		joinswitch;
+	double		joinrent;
+	double		joinbuy;
+	int64		joinprobed;
+	double	   *joinrentp;
+	int64	   *joinprobedp;
+	int64		joinswitches;
+	int64		joinswitchkeys;
+	int64		joinworkerswitches;
+	int64		joinworkerswitchkeys;
+
+	/*
 	 * The forward semi join over a non-unique key (DESIGN.md §27, "Forward
 	 * semi joins over a non-unique key"): joinunique says each key is counted
 	 * once however many child rows carry it.  The keys of the child's rows go
@@ -1607,7 +1691,10 @@ typedef struct LionCountScanState
  * join over a non-unique key that nobody has claimed yet.  The other is the
  * fact filters' copy (copyready: a LionSharedCopy after this struct, in the
  * same DSM chunk), and copies and copychunks are what its participants
- * indexed and collected of it, summed.  participants is how many the
+ * indexed and collected of it, summed; switches and switchkeys the copies
+ * participants of a plan that probes the filters made of them part way
+ * through, each its own, and the keys they probed before (DESIGN.md §27,
+ * "Probed, then collected"), summed.  participants is how many the
  * leader started the plan for, itself included, which is how many ways each
  * of them divides the list pin budget (lion_list_pin_participants()).
  * batches is the batches of keys looked up in key order, summed, and
@@ -1637,6 +1724,8 @@ typedef struct LionJoinShared
 	instr_time	time[LION_JT_N];
 	int64		copies;
 	int64		copychunks;
+	int64		switches;
+	int64		switchkeys;
 	int64		ranges;
 	int64		wherecollected;
 	int64		wherespilled;
@@ -1663,6 +1752,7 @@ typedef struct LionJoinShared
 static Plan *lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 								  CustomPath *best_path, List *tlist,
 								  List *clauses, List *custom_plans);
+static void lion_join_switch_reset(LionCountScanState *st);
 static Node *lion_create_custom_scan_state(CustomScan *cscan);
 static void lion_begin_custom_scan(CustomScanState *node, EState *estate,
 								  int eflags);
@@ -6715,8 +6805,41 @@ lion_cost_fkjoin_walk(double rows, double leaves, double height,
 	double		apart = leaves / Max(keys, 1.0);
 
 	return batches * (height + 1.0) * LION_DESCENT_COST +
-		rows * ((1.0 + Min(apart, height)) * LION_DESCENT_COST +
-				LION_FKJOIN_BATCH_ROW_COST);
+		rows * (Min(apart, height) * LION_DESCENT_COST +
+				LION_FKJOIN_LOOKUP_COST + LION_FKJOIN_BATCH_ROW_COST);
+}
+
+/*
+ * What one probe of a fact filter's set of `members` rows costs a count of the
+ * FK-side join that probes it, the key's set lying in `cfk` containers
+ * (DESIGN.md §27, "The per-key terms, refitted").  A set small enough for the
+ * counts to copy into memory on its second use (lion_posting_set_materialize()
+ * and LION_MATERIALIZE_MAX_*) is looked up there, LION_MEMORY_PROBE_COST.  Any
+ * other is sought on its posting tree, LION_FKJOIN_PROBE_COST and the pages
+ * the seek reads: a count's first probe descends the tree from its root,
+ * where a NOPIN set's cursor starts, and a probe after it steps right while
+ * the key's containers are close together - height + 2 pages a probe where
+ * they lie eight container keys apart or more, a share of that where they are
+ * closer.  That is what the counters of the refit's probing counts come to:
+ * 2.9 to 3.7 posting pages a probe over one to ten containers a key, 0.34 to
+ * 0.68 over 100 or all of the heap's 169 container keys.
+ */
+static Cost
+lion_fkjoin_probe_one(double heap_pages, double members, double cfk)
+{
+	double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
+	double		containers = lion_containers_for(heap_pages, Max(members, 1.0));
+	double		bytes = containers *
+		(LION_CONTAINER_HDRSZ + Min(2.0 * Max(members, 1.0) / containers,
+									(double) LION_BITSET_BYTES));
+	double		leaves = Max(bytes / (double) LION_PAGE_CAPACITY, 1.0);
+
+	if (bytes <= (double) LION_MATERIALIZE_MAX_BYTES &&
+		bytes <= (double) work_mem * 1024.0)
+		return LION_MEMORY_PROBE_COST;
+	return LION_FKJOIN_PROBE_COST +
+		(lion_posting_height(leaves) + 2.0) *
+		Min(1.0, ckeys / (8.0 * Max(cfk, 1.0))) * LION_FKJOIN_PROBE_PAGE_COST;
 }
 
 /*
@@ -6745,15 +6868,17 @@ lion_cost_fkjoin_walk(double rows, double leaves, double height,
  * cheaper:
  *
  *	- PROBED per count: every count seeks each filter source at the fk set's
- *	  container keys (LION_FKJOIN_PROBE_COST a probe).  A source that is a
- *	  UNION - an IN list, an OR across columns, a multi-key clause whose query
- *	  is several keys - builds its merge again at every count: each of its
- *	  sets is set up (LION_FKJOIN_SET_COST) and the containers standing at the
- *	  probed keys are merged, lion_merge_ops() of the whole source prorated to
- *	  those keys.  That was the 2026-09-23 review's finding for a thousand-value
- *	  IN list, and the 2026-09-27 benchmark's for a tsquery of four lexemes,
- *	  priced as one set and chosen at half the hash join's cost for a plan
- *	  sixteen times slower;
+ *	  container keys (lion_fkjoin_probe_one(): LION_FKJOIN_PROBE_COST a probe
+ *	  and the posting pages it reads, or a probe in memory).  A source that
+ *	  is a UNION - an IN list, an OR across columns, a multi-key clause whose
+ *	  query is several keys - has each of its sets set up at every count
+ *	  (LION_FKJOIN_SET_COST) and sought at the probed keys.  That was the
+ *	  2026-09-23 review's finding for a thousand-value IN list, and the
+ *	  2026-09-27 benchmark's for a tsquery of four lexemes, priced as one set
+ *	  and chosen at half the hash join's cost for a plan sixteen times slower;
+ *	  it was priced as the union's merge again at every count until the refit
+ *	  of 2026-09-29 (DESIGN.md §27, "The per-key terms, refitted"), since the
+ *	  counts probe a union rather than build it (§29.11);
  *	- or COLLECTED once (lion_sources_collect()): one merge of the filters
  *	  over all of their containers, as a single count of them would make, and
  *	  a private copy of what survives, which every count then looks up at its
@@ -6818,7 +6943,6 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	double	   *srcprobesets = (double *) palloc0(sizeof(double) * (nclause + nsrc + 1));
 	double	   *srcmembers = (double *) palloc0(sizeof(double) * (nclause + nsrc + 1));
 	double		probesets;
-	double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
 	double		nd;
 	double		perkey;
 	double		share;
@@ -6830,7 +6954,6 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	Cost		walked;
 	double		cfk;
 	double		readshare = 1.0;
-	double		probes = 0;
 	double		drive = -1.0;
 	double		matched;
 	double		recheck_tids;
@@ -7029,11 +7152,11 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	/*
 	 * PROBED: every count seeks each source at the container keys the fk set
 	 * has, and a seek finds a container only where the source has one.  A
-	 * union source builds its k-way union again at every count.
+	 * union source's sets are each set up and sought at every count.
 	 *
 	 * COLLECTED: the same sources merged once over all of their containers -
-	 * driven by the sparsest, the others probed at its keys, a union's merge
-	 * built in full once - and the survivors copied.
+	 * driven by the sparsest, the others probed at its keys, a union's image
+	 * built at each of its keys once - and the survivors copied.
 	 */
 	for (sno = 0; sno < nclause + nsrc; sno++)
 	{
@@ -7045,16 +7168,49 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		npositive++;
 		call = lion_containers_for(heap_pages, srcmembers[sno]);
 		cs = Min(cfk, call);
-		probes += cs;
-		if (srcprobesets[sno] > 1.0)
-			probed += found *
-				(srcprobesets[sno] * LION_FKJOIN_SET_COST +
-				 lion_merge_ops(heap_pages, srcmembers[sno], srcprobesets[sno]) *
-				 Min(cs / ckeys, 1.0) * readshare * cpu_operator_cost);
+
+		/*
+		 * A union source - an IN list, an OR, a multi-key query of several
+		 * keys - is met at the probed keys with its sets sought there, each
+		 * a seek of its posting tree, no more of them than its sets have
+		 * containers (lion_merge_cpu_cost_sets()'s sought union); since
+		 * unions are probed (§29.11) a count builds none of them for the
+		 * few rows of a key's container, and what it pays besides the seeks
+		 * is each set's cursor set up (LION_FKJOIN_SET_COST).  It used to
+		 * be charged the union's merge, lion_merge_ops() prorated to the
+		 * probed keys, at 5 to 7 times what the counts took (DESIGN.md §27,
+		 * "The per-key terms, refitted").
+		 */
+		{
+			double		setm = srcmembers[sno] / Max(srcsets[sno], 1.0);
+			double		setc = lion_containers_for(heap_pages, setm);
+			double		seeks = cs;
+
+			if (srcprobesets[sno] > 1.0)
+			{
+				seeks = Min(cs * srcprobesets[sno],
+							Max(srcprobesets[sno] * setc, cs));
+				probed += found * srcprobesets[sno] * LION_FKJOIN_SET_COST;
+			}
+			probed += found * seeks * readshare *
+				lion_fkjoin_probe_one(heap_pages, setm, cfk);
+		}
+
+		/*
+		 * Collected, a union is read whole once and built at each of its
+		 * keys: its sets' containers read, and the union's image at each key
+		 * with its members set in it (LION_UNION_KEY_COST,
+		 * LION_UNION_MEMBER_COST, as the leapfrog builds a driving union);
+		 * not lion_merge_ops()'s k-way comparisons, which the image has
+		 * replaced.
+		 */
 		if (srcsets[sno] > 1.0)
 			collected += srcsets[sno] * LION_FKJOIN_SET_COST +
-				lion_merge_ops(heap_pages, srcmembers[sno], srcsets[sno]) *
-				cpu_operator_cost;
+				srcsets[sno] * lion_containers_for(heap_pages,
+												   srcmembers[sno] / srcsets[sno]) *
+				LION_FKJOIN_COLLECT_CONTAINER_COST +
+				call * LION_UNION_KEY_COST +
+				srcmembers[sno] * LION_UNION_MEMBER_COST;
 		if (drive < 0.0 || call < drive)
 			drive = call;
 	}
@@ -7063,8 +7219,6 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	pfree(srcsets);
 	pfree(srcprobesets);
 	pfree(srcmembers);
-
-	probed += found * probes * readshare * LION_FKJOIN_PROBE_COST;
 
 	/*
 	 * What the collected copy holds and how large it is: the filters' rows, in
@@ -13355,6 +13509,11 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->joinworkersorted = 0;
 	st->joinchildrows = 0;
 	st->joinposting = 0;
+	lion_join_switch_reset(st);
+	st->joinswitches = 0;
+	st->joinswitchkeys = 0;
+	st->joinworkerswitches = 0;
+	st->joinworkerswitchkeys = 0;
 
 	/*
 	 * Timed only when core times the nodes: under EXPLAIN ANALYZE with its
@@ -13464,6 +13623,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 			LionJoinPart *jp = &st->joinpart[i];
 
 			jp->filter.pinbuf = InvalidBuffer;
+			jp->buy = -1;
 			jp->qmode = (LionQueryMode *)
 				palloc0(sizeof(LionQueryMode) * Max(st->nclause, 1));
 			jp->cxt = AllocSetContextCreate(st->joinpartcxt,
@@ -17089,11 +17249,37 @@ lion_join_child_next(LionCountScanState *st)
  * located into groupset, ANDed with the fact filters or their collected copy;
  * the posting pages it reads are EXPLAIN ANALYZE's (DESIGN.md §27, "Where a
  * key's time goes").
+ *
+ * A count that probes the filters adds what it cost beyond what the same
+ * count against a copy of them would have to the run's account - or the
+ * leaf's, over a partitioned fact table - which lion_join_maybe_switch()
+ * holds against the price of collecting them (DESIGN.md §27, "Probed, then
+ * collected").  In the planner's units and at the planner's prices
+ * (lion_cost_fkjoin_rel(), "The per-key terms, refitted"), from what the
+ * count read: the count set up (LION_FKJOIN_COUNT_COST) and each set of a
+ * union source (LION_FKJOIN_SET_COST), the filters' containers, each a seek
+ * and the container found there (LION_FKJOIN_PROBE_COST; one of a set in
+ * memory, LION_MEMORY_PROBE_COST), the posting pages those seeks read
+ * (LION_FKJOIN_PROBE_PAGE_COST) and the unions built at a key
+ * (LION_UNION_KEY_COST) - less the count against a copy the key would have
+ * made instead, set up (LION_FKJOIN_COPY_COUNT_COST) and looked up at the
+ * key's own containers (LION_FKJOIN_COPY_PROBE_COST).  What both ways share
+ * - the key's own set read and counted - is in neither.
+ *
+ * A count can come out cheaper probed than against a copy - a key of one
+ * container over filters small enough to be in memory - and the account
+ * does not go below nothing: it is what probing has cost since it last was
+ * the cheaper way, so that keys probed cheaply early in a run do not put off
+ * the switch once keys that probing is dear for come.
  */
 static int64
 lion_join_count_key(LionCountScanState *st)
 {
 	int64		pages = lion_posting_pages_read;
+	int64		visited = st->stats.containers_visited;
+	int64		keyc = st->stats.key_containers;
+	int64		copyc = st->stats.copy_containers;
+	int64		unions = st->stats.unions_built;
 	int64		count;
 	bool		exists = (st->jointype != LION_JOIN_INNER ||
 						  (st->joinrows && !st->joincounts));
@@ -17101,8 +17287,260 @@ lion_join_count_key(LionCountScanState *st)
 	count = st->joinfiltered ?
 		lion_node_count(st, 2, st->joinsources, exists) :
 		lion_node_count(st, st->nsource, st->sources, exists);
-	st->joinposting += lion_posting_pages_read - pages;
+	pages = lion_posting_pages_read - pages;
+	st->joinposting += pages;
+
+	if (!st->joinfiltered && st->joinswitch)
+	{
+		double		key = (double) (st->stats.key_containers - keyc);
+		double		mem = (double) (st->stats.copy_containers - copyc);
+		double		filt = (double) (st->stats.containers_visited - visited) -
+			key - mem;
+		double		sets = 0;
+		double		rent;
+		int			k;
+
+		for (k = 1; k <= st->nitem; k++)
+		{
+			if (!st->sources[k].negated && st->sources[k].nsets > 1)
+				sets += (double) st->sources[k].nsets;
+		}
+		rent = LION_FKJOIN_COUNT_COST - LION_FKJOIN_COPY_COUNT_COST +
+			sets * LION_FKJOIN_SET_COST +
+			Max(filt, 0.0) * LION_FKJOIN_PROBE_COST +
+			mem * LION_MEMORY_PROBE_COST +
+			(double) pages * LION_FKJOIN_PROBE_PAGE_COST +
+			(double) (st->stats.unions_built - unions) * LION_UNION_KEY_COST -
+			key * LION_FKJOIN_COPY_PROBE_COST;
+		*st->joinrentp = Max(*st->joinrentp + rent, 0.0);
+		(*st->joinprobedp)++;
+	}
 	return count;
+}
+
+/*
+ * PROBED, THEN COLLECTED (DESIGN.md §27).  Whether an FK-side join probes its
+ * fact filters at every count or collects them once is the planner's choice,
+ * made from its estimate of the dimension rows - which core makes for a
+ * filtered dimension from the product of its quals' selectivities, and which
+ * a semi join over skewed keys can miss by two orders of magnitude, while
+ * the keys the dimension keeps are the heavy ones, far above the fact's
+ * average rows a key that the model prices each at.  A plan made to probe
+ * for a few keys that meets many times as many heavy ones rebuilds the
+ * filters' unions at every container of every key, where one collection
+ * would have served them all.
+ *
+ * So a plan that probes keeps an account, and switches: every count adds
+ * what probing cost it over what the same count against a copy would have
+ * (lion_join_count_key()), and once the account reaches what collecting the
+ * filters costs (lion_join_copy_price(), from the sets as they were located)
+ * they are collected - between two keys, as lion_join_collect() would have
+ * collected them before the first - and every count after that reads the
+ * copy.  That is the ski-rental rule: a run that switches pays what probing
+ * cost until it did, which is at most the collection's price, and the
+ * collection, so it never costs more than about twice what the better of
+ * the two ways chosen in hindsight would have; a run that never reaches the
+ * price was right to probe.
+ *
+ * Only where a copy can be made and is expected to fit: a hash join's
+ * memory (get_hash_memory_limit()), what a plan that collects is given - or
+ * over a partitioned fact what the leaves' copies before it left of it -
+ * and never on a hot standby, which makes no copy.  A copy that turns out
+ * larger than expected spills, as a planned one does.  The copy is taken
+ * after the query's snapshot, and is only ever counted beside a located fk
+ * set, which is all "Why a stale copy is safe" asks of it; the filters were
+ * located in this run, and the collection reads them as a planned one does,
+ * pinning nothing.  In a parallel plan each participant keeps its own
+ * account and makes its own copy, as the leader of a plan run without its
+ * workers does: a probing plan has sized no shared copy, and the
+ * participants reach the price at keys of their own.  Each run - each
+ * rescan - starts its account again.
+ */
+static void
+lion_join_switch_reset(LionCountScanState *st)
+{
+	int			p;
+
+	st->joinswitch = (st->joinclause >= 0 && !st->joincollect &&
+					  lion_enable_filter_switch && !RecoveryInProgress());
+	st->joinrent = 0;
+	st->joinbuy = -1;
+	st->joinprobed = 0;
+	st->joinrentp = &st->joinrent;
+	st->joinprobedp = &st->joinprobed;
+	if (st->joinpart != NULL)
+	{
+		for (p = 0; p < st->npart; p++)
+		{
+			st->joinpart[p].rent = 0;
+			st->joinpart[p].buy = -1;
+			st->joinpart[p].probed = 0;
+		}
+	}
+}
+
+/*
+ * The rows a node of a source's tree holds, and the container keys it has,
+ * from what the located sets carry (`ntids`, `ncontainers`): a set's own, a
+ * union's sets added up - at most the heap's keys - and the least of an
+ * intersection's children.  Upper bounds, as lion_node_members() takes them.
+ */
+static void
+lion_join_node_size(const LionKeyNode *node, const LionPostingSet *sets,
+					int nsets, double ckeys, double *members, double *keys)
+{
+	int			i;
+
+	check_stack_depth();
+	*members = 0;
+	*keys = 0;
+	if (node == NULL)
+	{
+		/* the implicit union of every set */
+		for (i = 0; i < nsets; i++)
+		{
+			if (!sets[i].found)
+				continue;
+			*members += (double) sets[i].ntids;
+			*keys += Min((double) sets[i].ncontainers, ckeys);
+		}
+		*keys = Min(*keys, ckeys);
+		return;
+	}
+	if (node->kind == LION_KN_KEY)
+	{
+		if (node->keyno >= 0 && node->keyno < nsets && sets[node->keyno].found)
+		{
+			*members = (double) sets[node->keyno].ntids;
+			*keys = Min((double) sets[node->keyno].ncontainers, ckeys);
+		}
+		return;
+	}
+	for (i = 0; i < node->nargs; i++)
+	{
+		double		m;
+		double		k;
+
+		lion_join_node_size(node->args[i], sets, nsets, ckeys, &m, &k);
+		if (node->kind == LION_KN_OR)
+		{
+			*members += m;
+			*keys = Min(*keys + k, ckeys);
+		}
+		else if (i == 0 || m < *members)
+		{
+			*members = m;
+			*keys = (i == 0) ? k : Min(*keys, k);
+		}
+		else
+			*keys = Min(*keys, k);
+	}
+}
+
+/*
+ * What collecting the located fact filters would cost now, in the planner's
+ * units - 0 when no copy of them can be made, or the copy is not expected to
+ * fit in `budget` bytes (DESIGN.md §27, "Probed, then collected").  From the
+ * sets as they were located, which carry their rows and containers: every
+ * container of every set read once (LION_CONTAINER_COST), the posting pages
+ * a set on pages of its own takes, a page visited each (LION_DESCENT_COST),
+ * each union's image at each of its keys and each of its members set in it
+ * (LION_UNION_KEY_COST, LION_UNION_MEMBER_COST), and each container of the
+ * copy made (LION_FKJOIN_COPY_CONTAINER_COST).  The copy's size is the
+ * planner's formula (lion_cost_fkjoin_rel()) over the rows the filters'
+ * product leaves, taken as independent - its containers at most the fewest
+ * any source has.  What cannot be collected is what lion_join_collect_into()
+ * refuses: a range too large to collect (§32), filters that only subtract,
+ * a list located a batch at a time.
+ */
+static double
+lion_join_copy_price(LionCountScanState *st, Size budget)
+{
+	BlockNumber blocks;
+	double		ckeys;
+	double		tuples;
+	double		frac = 1.0;
+	double		copykeys;
+	double		copyrows;
+	double		bytes;
+	double		cost = 0;
+	double	   *srcmembers;
+	bool		positive = false;
+	int			k;
+	int			j;
+
+	if (st->wheremissing || st->nitem == 0 || RecoveryInProgress())
+		return 0;
+
+	blocks = RelationGetNumberOfBlocks(st->heap);
+	ckeys = Max((double) blocks / LION_BLOCKS_PER_CONTAINER, 1.0);
+	tuples = Max((double) st->heap->rd_rel->reltuples, 1.0);
+	copykeys = ckeys;
+	srcmembers = (double *) palloc0(sizeof(double) * (st->nitem + 1));
+
+	for (k = 1; k <= st->nitem; k++)
+	{
+		LionCountSource *src = &st->sources[k];
+		double		members;
+		double		keys;
+		double		setmembers = 0;
+
+		if (src->negated)
+			continue;
+		if (src->rangewalk != NULL || src->nsets == 0)
+		{
+			pfree(srcmembers);
+			return 0;
+		}
+		positive = true;
+
+		for (j = 0; j < src->nsets; j++)
+		{
+			LionPostingSet *ps = &src->sets[j];
+			double		nc;
+			double		per;
+
+			if (!ps->found)
+				continue;
+			nc = Max((double) ps->ncontainers, 1.0);
+			setmembers += (double) ps->ntids;
+			cost += nc * LION_CONTAINER_COST;
+			if (!ps->is_inline && ps->mat == NULL)
+			{
+				per = LION_CONTAINER_HDRSZ +
+					Min(2.0 * (double) ps->ntids / nc, (double) LION_BITSET_BYTES);
+				cost += ceil(nc * per / (double) LION_PAGE_CAPACITY) *
+					LION_DESCENT_COST;
+			}
+		}
+
+		lion_join_node_size(src->tree, src->sets, src->nsets, ckeys,
+							&members, &keys);
+		srcmembers[k] = members;
+		tuples = Max(tuples, members);
+		if (src->nsets > 1)
+			cost += keys * LION_UNION_KEY_COST +
+				setmembers * LION_UNION_MEMBER_COST;
+		copykeys = Min(copykeys, keys);
+	}
+	for (k = 1; k <= st->nitem; k++)
+	{
+		if (!st->sources[k].negated)
+			frac *= srcmembers[k] / tuples;
+	}
+	pfree(srcmembers);
+	if (!positive)
+		return 0;
+
+	copyrows = tuples * Min(frac, 1.0);
+	copykeys = Max(Min(copykeys, copyrows), 1.0);
+	bytes = copykeys * (LION_CONTAINER_HDRSZ + sizeof(LionContainer *) +
+						Min(2.0 * copyrows / copykeys,
+							(double) LION_BITSET_BYTES));
+	if (bytes > (double) budget)
+		return 0;
+	cost += copykeys * LION_FKJOIN_COPY_CONTAINER_COST;
+	return Max(cost, 1e-6);
 }
 
 /*
@@ -17158,12 +17596,14 @@ lion_join_shares_copy(LionCountScanState *st, LionSharedCopy *shared)
  * counted, and shared as `shared` says: st->joinfilter in outercxt for a
  * plain table, and each leaf partition's own copy for a partitioned one
  * (lion_join_part_open()), held for the whole run, all of them within the
- * one hash table's memory `budget` leaves them.
+ * one hash table's memory `budget` leaves them.  `force` makes it for a plan
+ * that probes the filters, which switches to the copy part way through a run
+ * (lion_join_maybe_switch()); it is then never shared.
  */
 static void
 lion_join_collect_into(LionCountScanState *st, LionPostingSet *out,
 					   MemoryContext cxt, LionSharedCopy *shared,
-					   bool *viewshared, Size budget)
+					   bool *viewshared, Size budget, bool force)
 {
 	EState	   *estate = st->css.ss.ps.state;
 	MemoryContext oldcxt;
@@ -17174,7 +17614,7 @@ lion_join_collect_into(LionCountScanState *st, LionPostingSet *out,
 	int			k;
 
 	st->joincollected = true;
-	if (!st->joincollect || st->wheremissing || st->nitem == 0)
+	if ((!st->joincollect && !force) || st->wheremissing || st->nitem == 0)
 		return;
 	if (RecoveryInProgress())
 		return;
@@ -17293,7 +17733,87 @@ lion_join_collect(LionCountScanState *st)
 {
 	lion_join_collect_into(st, &st->joinfilter, st->outercxt,
 						   st->joinsharedcopy, &st->joinviewshared,
-						   get_hash_memory_limit());
+						   get_hash_memory_limit(), false);
+}
+
+/*
+ * Between two keys of a plan that probes the fact filters of a plain table:
+ * collect them now, if probing has cost what collecting them would (DESIGN.md
+ * §27, "Probed, then collected"; lion_join_switch_reset()).  The price is
+ * taken once, from the sets as they were located, at the first count that
+ * probes them; a run whose filters cannot be collected, or whose copy would
+ * not fit, stops asking.  The walk of the fk index lets go of its leaf while
+ * the copy is made, as it does before a row goes up, and reads it again by
+ * its block number for the next key.
+ */
+static void
+lion_join_maybe_switch(LionCountScanState *st)
+{
+	if (!st->joinswitch || st->joinfiltered)
+		return;
+	if (st->joinbuy < 0)
+		st->joinbuy = lion_join_copy_price(st, get_hash_memory_limit());
+	if (st->joinbuy <= 0)
+	{
+		st->joinswitch = false;
+		return;
+	}
+	if (st->joinrent < st->joinbuy)
+		return;
+
+	st->joinswitch = false;
+	if (st->joinwalkbegun)
+		lion_lookup_walk_pause(&st->joinwalker);
+	lion_join_collect_into(st, &st->joinfilter, st->outercxt, NULL,
+						   &st->joinviewshared, get_hash_memory_limit(), true);
+	if (st->joinfiltered)
+	{
+		st->joinswitches++;
+		st->joinswitchkeys += st->joinprobed;
+	}
+}
+
+/*
+ * ... and between two keys of leaf partition p's turn (DESIGN.md §27, "A
+ * partitioned fact table"): each leaf keeps an account of its own, and its
+ * copy, once made, is its copy for the rest of the run, as a planned one is -
+ * within what the copies of the leaves before it left of a hash table's
+ * memory.
+ */
+static void
+lion_join_part_maybe_switch(LionCountScanState *st, int p)
+{
+	LionJoinPart *jp = &st->joinpart[p];
+	Size		limit;
+	Size		held;
+	Size		budget;
+
+	if (!st->joinswitch || st->joinfiltered || jp->buy == 0)
+		return;
+	limit = get_hash_memory_limit();
+	held = MemoryContextMemAllocated(st->joinpartcxt, true);
+	budget = (held < limit) ? limit - held : 0;
+	if (jp->buy < 0)
+		jp->buy = lion_join_copy_price(st, budget);
+	if (jp->buy <= 0 || jp->rent < jp->buy)
+		return;
+
+	/* the leaves' copies so far may have taken what it had */
+	jp->buy = 0;
+	if (lion_join_copy_price(st, budget) <= 0)
+		return;
+	lion_lookup_walk_pause(&st->joinwalker);
+	lion_join_collect_into(st, &jp->filter, jp->cxt, NULL, &jp->viewshared,
+						   budget, true);
+	jp->filtered = st->joinfiltered;
+	if (jp->filtered)
+	{
+		if (jp->filter.index != NULL)
+			jp->filterindex = RelationGetRelid(jp->filter.index);
+		st->joinswitches++;
+		st->joinswitchkeys += jp->probed;
+	}
+	jp->missing = st->wheremissing;
 }
 
 /*
@@ -17623,10 +18143,16 @@ lion_join_next_walked(LionCountScanState *st, int64 *countp)
 		}
 		ent = &st->joinbatch[st->joinbatchpos++];
 
-		if (ent->isnull)
+		if (ent->isnull || st->wheremissing)
 		{
-			/* joins nothing: an anti join's row, which only it batched */
-			Assert(anti);
+			/*
+			 * Joins nothing: an anti join's row, which only it batched - or,
+			 * once a copy of the fact filters made part way through the run
+			 * has found them to select nothing (lion_join_maybe_switch()),
+			 * any row, looked up no more.
+			 */
+			if (!anti)
+				continue;
 			if (!st->joinsum)
 				lion_join_batch_row(st, ent);
 			*countp = 1;
@@ -17661,6 +18187,9 @@ lion_join_next_walked(LionCountScanState *st, int64 *countp)
 			st->joinlastkey = ent->key;
 			st->joinlastfound = found;
 			st->joinlastcount = count;
+
+			/* probed so far, and collected from here on if that pays */
+			lion_join_maybe_switch(st);
 		}
 
 		if (!found)
@@ -17786,6 +18315,9 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
 		MemoryContextSwitchTo(oldcxt);
 		lion_join_clock(st, LION_JT_COUNT, &t);
 
+		/* probed so far, and collected from here on if that pays */
+		lion_join_maybe_switch(st);
+
 		if (anti)
 			count = 1 - count;
 		if (count == 0)
@@ -17882,9 +18414,25 @@ lion_join_part_open(LionCountScanState *st, int p)
 		return;
 	}
 
-	lion_join_locate_where(st);
+	/*
+	 * A plan that probes the filters locates them again each turn, and that
+	 * is part of what probing them costs (DESIGN.md §27, "Probed, then
+	 * collected"): its directory pages go on the leaf's account, as the
+	 * counts' posting pages do.
+	 */
+	st->joinrentp = &jp->rent;
+	st->joinprobedp = &jp->probed;
 	if (jp->collected)
+	{
+		int64		dirpages = lion_dir_pages_read;
+
+		lion_join_locate_where(st);
+		if (st->joinswitch)
+			jp->rent += (double) (lion_dir_pages_read - dirpages) *
+				LION_DESCENT_COST;
 		return;					/* probed, and located again each turn */
+	}
+	lion_join_locate_where(st);
 
 	jp->collected = true;
 	for (i = 0; i < st->nclause; i++)
@@ -17896,7 +18444,7 @@ lion_join_part_open(LionCountScanState *st, int p)
 
 		lion_join_collect_into(st, &jp->filter, jp->cxt, jp->shared,
 							   &jp->viewshared,
-							   (held < limit) ? limit - held : 0);
+							   (held < limit) ? limit - held : 0, false);
 		jp->filtered = st->joinfiltered;
 		if (jp->filtered && jp->filter.index != NULL)
 			jp->filterindex = RelationGetRelid(jp->filter.index);
@@ -17917,6 +18465,8 @@ lion_join_part_close(LionCountScanState *st)
 	lion_release_where(st);
 	st->joinfiltered = false;
 	memset(st->joinsources, 0, sizeof(st->joinsources));
+	st->joinrentp = &st->joinrent;
+	st->joinprobedp = &st->joinprobed;
 	lion_close_relation(st);
 	MemoryContextReset(st->joinvisitcxt);
 }
@@ -18020,10 +18570,17 @@ lion_join_count_parts(LionCountScanState *st)
 				st->joinlastkey = ent->key;
 				st->joinlastfound = found;
 				st->joinlastcount = count;
+
+				/* probed so far, and collected from here on if that pays */
+				lion_join_part_maybe_switch(st, p);
 			}
 			if (!found)
 				st->joinmissing++;
 			ent->acc += count;
+
+			/* a copy made part way through that selects nothing */
+			if (st->wheremissing)
+				break;
 		}
 		lion_join_part_close(st);
 	}
@@ -18662,6 +19219,9 @@ lion_reset_run(LionCountScanState *st)
 		st->joinrunfilterrows = 0;
 	}
 
+	/* ... and the account of a plan that probes them, begun again */
+	lion_join_switch_reset(st);
+
 	/* ... and a forward semi join's sorted keys, sorted again next run. */
 	if (st->joinsort != NULL)
 	{
@@ -19047,6 +19607,8 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		shared->posting += st->joinposting;
 		shared->copies += st->joincopies;
 		shared->copychunks += st->joincopychunks;
+		shared->switches += st->joinswitches;
+		shared->switchkeys += st->joinswitchkeys;
 		for (i = 0; i < LION_JT_N; i++)
 			INSTR_TIME_ADD(shared->time[i], st->jointime[i]);
 		shared->ranges += st->granges;
@@ -19072,6 +19634,8 @@ lion_shutdown_custom_scan(CustomScanState *node)
 	st->joinworkerposting = shared->posting;
 	st->joinworkercopies = shared->copies;
 	st->joinworkercopychunks = shared->copychunks;
+	st->joinworkerswitches = shared->switches;
+	st->joinworkerswitchkeys = shared->switchkeys;
 	for (i = 0; i < LION_JT_N; i++)
 		st->joinworkertime[i] = shared->time[i];
 	st->workerranges = shared->ranges;
@@ -19779,6 +20343,9 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 								"the dimension rows with a match", es);
 		if (st->joincollect)
 			ExplainPropertyText("Fact Filters", "collected once", es);
+		else if (es->analyze &&
+				 st->joinswitches + st->joinworkerswitches > 0)
+			ExplainPropertyText("Fact Filters", "probed, then collected", es);
 	}
 
 	if (st->hasgroupidx && st->groupattno != 0 && st->hascoal)
@@ -19869,6 +20436,21 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 								   tot.unions_built, es);
 			ExplainPropertyInteger("Unions Probed", NULL,
 								   tot.unions_probed, es);
+		}
+
+		/*
+		 * ... and its nested trees (DESIGN.md §29.11, "Trees probed"): the
+		 * keys at which a tree it met past its driver - an AND of ORs, an OR
+		 * of ANDs - was built, and those at which it was evaluated for the
+		 * running intersection's members alone.  Printed only where it met
+		 * one there.
+		 */
+		if (tot.trees_built > 0 || tot.trees_probed > 0)
+		{
+			ExplainPropertyInteger("Trees Built", NULL,
+								   tot.trees_built, es);
+			ExplainPropertyInteger("Trees Probed", NULL,
+								   tot.trees_probed, es);
 		}
 		ExplainPropertyInteger("Heap Blocks From Cache", NULL,
 							   tot.cache_hits, es);
@@ -20023,6 +20605,9 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		 */
 		if (st->joinclause >= 0)
 		{
+			int64		switches = st->joinswitches + st->joinworkerswitches;
+			bool		switched = (switches > 0);
+
 			/*
 			 * A forward semi join's keys: the child rows with one, sorted - by
 			 * every participant of a parallel plan, so what one of them sorted
@@ -20095,7 +20680,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 			 * largest copy any participant made, which is the one they all
 			 * read when they share it.
 			 */
-			if (st->joincollect)
+			if (st->joincollect || switched)
 				ExplainPropertyInteger("Fact Filter Rows Collected", NULL,
 									   Max(st->joinfilterrows,
 										   st->joinworkerfilterrows), es);
@@ -20127,12 +20712,28 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 			}
 
 			/*
+			 * A plan that probed the filters and collected them part way
+			 * through (DESIGN.md §27, "Probed, then collected"): the copies
+			 * made so - one a run, a leaf of a partitioned fact or a
+			 * participant of a parallel plan - and the keys counted by
+			 * probing before each, summed.  Only when there were any.
+			 */
+			if (switched)
+			{
+				ExplainPropertyInteger("Fact Filter Switches", NULL,
+									   switches, es);
+				ExplainPropertyInteger("Fact Filter Keys Probed", NULL,
+									   st->joinswitchkeys +
+									   st->joinworkerswitchkeys, es);
+			}
+
+			/*
 			 * What the counts read of the copy: its containers, the binary
 			 * searches that found them, and of those the ones read back from
 			 * a spilled copy's temporary file - one read each, never the
 			 * copy again.
 			 */
-			if (st->joincollect)
+			if (st->joincollect || switched)
 			{
 				ExplainPropertyInteger("Fact Filter Copy Containers Read", NULL,
 									   tot.copy_containers, es);
@@ -20161,7 +20762,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 				{
 					instr_time	t = st->jointime[i];
 
-					if (i == LION_JT_COLLECT && !st->joincollect)
+					if (i == LION_JT_COLLECT && !st->joincollect && !switched)
 						continue;
 					INSTR_TIME_ADD(t, st->joinworkertime[i]);
 					ExplainPropertyFloat(phasename[i], "ms",

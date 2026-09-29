@@ -95,6 +95,20 @@ typedef struct LionCountStats
 	int64		unions_probed;
 
 	/*
+	 * How the AND met its nested trees (DESIGN.md §29.11, "Trees probed"): an
+	 * AND of ORs, an OR of ANDs - a source, or a child of an AND node, whose
+	 * own tree is more than one union - met at a key the running
+	 * intersection has reached from other sources.  trees_built counts the
+	 * keys at which the tree's container was built there and ANDed with the
+	 * intersection, trees_probed those at which the intersection's members
+	 * were looked up in the tree's leaves instead, combined by its AND and
+	 * OR nodes, and nothing of it was built.  A tree that drives the AND, or
+	 * is the only source, is built and counted in neither.
+	 */
+	int64		trees_built;
+	int64		trees_probed;
+
+	/*
 	 * The per-query visibility cache (LionVisCache below).  cache_hits counts
 	 * the heap block visits it answered without touching the buffer manager,
 	 * so cache_hits + blocks_rechecked is the number of block visits the
@@ -1336,6 +1350,14 @@ extern void lion_check_aggregate_execute(Oid aggfnoid);
  * --------------------------------------------------------------------- */
 
 extern PGDLLIMPORT bool lion_enable_count_pushdown;
+
+/*
+ * Whether an FK-side join that probes its fact filters may collect them part
+ * way through a run, once probing has cost what collecting them would
+ * (DESIGN.md §27, "Probed, then collected"): an executor setting, for
+ * comparing the two ways.
+ */
+extern PGDLLIMPORT bool lion_enable_filter_switch;
 extern PGDLLIMPORT create_upper_paths_hook_type lion_prev_create_upper_paths_hook;
 
 extern void lion_count_scan_register(void);
@@ -1448,6 +1470,15 @@ extern PGDLLIMPORT bool lion_enable_intersection_probe;
  * §29.11, "Unions probed"): an executor setting, for comparing the two.
  */
 extern PGDLLIMPORT bool lion_enable_union_probe;
+
+/*
+ * ... and whether it may do the same with a nested tree - an AND of ORs, an
+ * OR of ANDs - evaluating the tree for the intersection's members alone
+ * rather than building its container (DESIGN.md §29.11, "Trees probed").
+ * Off, a nested tree is evaluated whole at every key it is sought to, as it
+ * was; the answers are the same either way.
+ */
+extern PGDLLIMPORT bool lion_enable_tree_probe;
 extern double lion_isect_factor(PlannerInfo *root, RelOptInfo *rel,
 								IndexOptInfo *idx, int n,
 								const AttrNumber *cols, Node **clauses);
