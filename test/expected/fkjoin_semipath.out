@@ -713,6 +713,28 @@ SELECT lion_sp('SELECT d.pk FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp
  semi and anti join paths, parallel, 2119 rows
 (1 row)
 
+-- an outer side that is an outer join, the key on its nullable side: the row
+-- it NULL-extends has a NULL key, which the anti join emits and the semi join not
+SELECT lion_sp('SELECT g.grp, n.id FROM lion_sp_g g LEFT JOIN lion_sp_n n ON n.attr = length(g.label) + 1 WHERE NOT EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = n.k AND f2.y = 2)');
+         lion_sp          
+--------------------------
+ anti join path, 660 rows
+(1 row)
+
+SELECT lion_sp('SELECT g.grp, n.id FROM lion_sp_g g LEFT JOIN lion_sp_n n ON n.attr = length(g.label) + 1 WHERE EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = n.k AND f2.y = 2)');
+         lion_sp          
+--------------------------
+ semi join path, 542 rows
+(1 row)
+
+-- a system column, a whole row and expressions of the outer side's columns,
+-- which the path's projection computes
+SELECT lion_sp('SELECT d.ctid, d, d.pk + 1, upper(d.region) FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.y = 2)');
+          lion_sp          
+---------------------------
+ semi join path, 1373 rows
+(1 row)
+
 -- two facts on one key: one equivalence class of the three columns, whose
 -- join rel of the dimension and the first fact carries that fact's column
 SELECT lion_sp('SELECT d.pk, d.attr FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND f1.x = 2) AND EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w1'')');

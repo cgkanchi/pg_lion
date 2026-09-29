@@ -460,6 +460,13 @@ SELECT lion_sp('SELECT d.pk, g.label FROM lion_sp_d d JOIN lion_sp_g g ON g.grp 
 SELECT lion_sp('SELECT g.label, count(*) FROM lion_sp_g g JOIN lion_sp_d d ON d.grp = g.grp WHERE d.region = ''eu'' AND d.attr = 3 AND EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND f1.x < 8) GROUP BY g.label');
 SELECT lion_sp('SELECT d.pk FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.y < 4) AND EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'')');
 SELECT lion_sp('SELECT d.pk FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.y < 4) AND NOT EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'' AND f1.x = 3)', 'plan');
+-- an outer side that is an outer join, the key on its nullable side: the row
+-- it NULL-extends has a NULL key, which the anti join emits and the semi join not
+SELECT lion_sp('SELECT g.grp, n.id FROM lion_sp_g g LEFT JOIN lion_sp_n n ON n.attr = length(g.label) + 1 WHERE NOT EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = n.k AND f2.y = 2)');
+SELECT lion_sp('SELECT g.grp, n.id FROM lion_sp_g g LEFT JOIN lion_sp_n n ON n.attr = length(g.label) + 1 WHERE EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = n.k AND f2.y = 2)');
+-- a system column, a whole row and expressions of the outer side's columns,
+-- which the path's projection computes
+SELECT lion_sp('SELECT d.ctid, d, d.pk + 1, upper(d.region) FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.y = 2)');
 -- two facts on one key: one equivalence class of the three columns, whose
 -- join rel of the dimension and the first fact carries that fact's column
 SELECT lion_sp('SELECT d.pk, d.attr FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND f1.x = 2) AND EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w1'')');
