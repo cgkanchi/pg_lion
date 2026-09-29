@@ -789,6 +789,16 @@ extern void lion_shared_copy_collect(LionSharedCopy *sc, struct dsa_area *area,
 extern bool lion_posting_set_rewalked(const LionPostingSet *ps);
 
 /*
+ * How a collected range's union grows (lion_range_union_cb()), which the
+ * planner prices (lion_cost_range_union(), DESIGN.md §32, "What collecting a
+ * range costs"): an ARRAY container of at most this many members that comes
+ * to an ARRAY union waits with the others that came, and is folded in once
+ * the waiting members are LION_RANGE_UNION_PEND_MIN or half the union's,
+ * whichever is more; anything larger is merged in at once.
+ */
+#define LION_RANGE_UNION_PEND_MIN	32
+
+/*
  * The rows of one range over key column `attno` of index - every set a walk of
  * the range's INSIDE hands out, summaries included (DESIGN.md §32) - as ONE
  * private, pinless posting set: their union, collected in memory.  Like a

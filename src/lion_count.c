@@ -8763,9 +8763,6 @@ typedef struct LionRangeUnion
 	uint64	   *img;			/* LION_BITSET_BYTES: a fold's image */
 } LionRangeUnion;
 
-/* The fewest pending members an ARRAY union waits for before a fold. */
-#define LION_RANGE_UNION_PEND_MIN	32
-
 /* No upper bound on the container keys of a window. */
 #define LION_CKEY_END				((uint64) PG_UINT32_MAX + 1)
 
