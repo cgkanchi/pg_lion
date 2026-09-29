@@ -421,7 +421,11 @@ SELECT * FROM lion_sp_explain('SELECT wd.pk FROM lion_sp_wd wd WHERE EXISTS (SEL
 -- the rows of the join feeding a sort, and - nothing disabled, a few outer rows
 -- against a fact filter that leaves most fact rows - a hash join
 SELECT * FROM lion_sp_explain('SELECT d.pk, d.region FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5) ORDER BY d.region, d.pk');
+-- (from PostgreSQL 19 eager aggregation would group the path's rows below the
+-- join instead: off for this plan, where the setting exists)
+DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN PERFORM set_config('enable_eager_aggregate', 'off', false); END IF; END$$;
 EXPLAIN (COSTS OFF) SELECT g.label, count(*) FROM lion_sp_g g JOIN lion_sp_d d ON d.grp = g.grp WHERE d.region = 'eu' AND d.attr = 3 AND EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND f1.x < 8) GROUP BY g.label;
+DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN EXECUTE 'RESET enable_eager_aggregate'; END IF; END$$;
 -- the composition: the upper node over a dimension that is a join, whose
 -- child is the semi join path - (A) a dimension semi-joined to two facts
 SELECT * FROM lion_sp_explain('SELECT count(*) FROM lion_sp_d d WHERE d.region = ''eu'' AND EXISTS (SELECT 1 FROM lion_sp_f1 f1 WHERE f1.fk = d.pk AND f1.kind = ''b'' AND f1.ts >= now() - interval ''120 days'') AND EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w3 | w5'')');
