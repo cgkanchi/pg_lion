@@ -3989,3 +3989,476 @@ liongettuple(IndexScanDesc scan, ScanDirection dir)
 		LION_INJECTION_POINT("lion-gettuple-batch");
 	}
 }
+
+/* ---------------------------------------------------------------------
+ * The ordered walk of one column (DESIGN.md §30.11)
+ * --------------------------------------------------------------------- */
+
+/*
+ * What lion_order_walk_next() walks: the NULL entry when it comes first, the
+ * VALUE entries of the range in key order, the NULL entry when it comes last.
+ */
+#define LOW_PHASE_NULLS_FIRST	0
+#define LOW_PHASE_VALUES		1
+#define LOW_PHASE_NULLS_LAST	2
+#define LOW_PHASE_DONE			3
+
+struct LionOrderWalk
+{
+	Relation	index;
+	AttrNumber	attno;
+	bool		backward;
+	int			nulls;			/* LION_ORDER_NULLS_* */
+	LionRange	range;			/* every range key of the column, ANDed */
+	int			phase;			/* LOW_PHASE_* */
+
+	/* the directory leaf being walked, copied */
+	PGAlignedBlock *leaf;
+	bool		haspage;
+	bool		started;		/* the VALUE walk has read its first leaf */
+	BlockNumber blk;			/* where the copy came from */
+	BlockNumber nextblk;		/* ascending: the leaf to read next */
+	int			off;			/* the next item to look at */
+	int			firstoff;
+	int			maxoff;
+
+	/* the entry whose TIDs are being handed out, copied */
+	PGAlignedBlock *ebuf;
+	LionEntryTuple *entry;		/* NULL: none */
+	Size		entrysz;
+	Size		payoff;			/* INLINE: the next item of the payload */
+	bool		chainstarted;	/* CHAIN: its first posting leaf was read */
+	PGAlignedBlock *post;		/* CHAIN: the posting leaf being read, copied */
+	bool		haspost;
+	BlockNumber postblk;
+	BlockNumber postnext;
+	OffsetNumber postoff;
+	OffsetNumber postmax;
+
+	/* the TIDs of the item being handed out */
+	LionContainer *cbuf;
+	uint16	   *los;
+	uint64	   *codes;
+	uint32		ncodes;
+	uint32		pos;
+
+	int64		entries;
+	int64		leaves;
+};
+
+static bool
+lion_order_pair_cb(uint32 ckey, uint16 lo, void *arg)
+{
+	LionOrderWalk *w = (LionOrderWalk *) arg;
+
+	w->codes[w->ncodes++] = lion_make_code(ckey, lo);
+	return true;
+}
+
+/* The TIDs of one item of a posting set, container or segment, as codes. */
+static void
+lion_order_expand(LionOrderWalk *w, const LionContainer *c)
+{
+	w->ncodes = 0;
+	w->pos = 0;
+	if (c->type == LION_CT_SPARSE)
+		lion_sparse_iterate(c, lion_order_pair_cb, w);
+	else
+	{
+		uint32		n = lion_container_to_array(c, w->los);
+		uint32		i;
+
+		for (i = 0; i < n; i++)
+			w->codes[i] = lion_make_code(c->ckey, w->los[i]);
+		w->ncodes = n;
+	}
+}
+
+LionOrderWalk *
+lion_order_walk_begin(Relation index, AttrNumber attno, ScanKey keys, int nkeys,
+					  bool backward, int nulls, MemoryContext cxt)
+{
+	MemoryContext oldcxt = MemoryContextSwitchTo(cxt);
+	LionOrderWalk *w = (LionOrderWalk *) palloc0(sizeof(LionOrderWalk));
+	LionState  *col = lion_index_column_state(index, attno);
+	int			i;
+
+	if (col->multikey || !col->ordered)
+		elog(ERROR, "lion index \"%s\": key column %d has no order to walk",
+			 RelationGetRelationName(index), (int) attno);
+
+	w->index = index;
+	w->attno = attno;
+	w->backward = backward;
+	w->nulls = nulls;
+	w->leaf = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
+	w->ebuf = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
+	w->post = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
+	w->cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	w->los = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
+	/* a container holds at most LION_CONTAINER_RANGE members, a segment fewer */
+	w->codes = (uint64 *) palloc(sizeof(uint64) *
+								 Max(LION_CONTAINER_RANGE, LION_SPARSE_MAX_PAIRS));
+
+	/*
+	 * The range keys, as one range (DESIGN.md §28); `IS NOT NULL` leaves the
+	 * NULL entry out, as a strict comparison does.  The values stay the
+	 * caller's, as a source's do.
+	 */
+	lion_range_init(&w->range, index, attno);
+	for (i = 0; i < nkeys; i++)
+	{
+		ScanKey		k = &keys[i];
+
+		if (k->sk_attno != attno)
+			continue;
+		if (k->sk_flags & SK_SEARCHNOTNULL)
+		{
+			w->nulls = LION_ORDER_NULLS_NONE;
+			continue;
+		}
+		if (!lion_scankey_is_range(col, k))
+			elog(ERROR, "lion index \"%s\": an ordered walk takes only range keys",
+				 RelationGetRelationName(index));
+		lion_range_add(&w->range, index, k->sk_strategy, k->sk_func.fn_oid,
+					   k->sk_subtype, k->sk_argument,
+					   (k->sk_flags & SK_ISNULL) != 0, k->sk_collation);
+		w->nulls = LION_ORDER_NULLS_NONE;
+	}
+
+	w->phase = (w->nulls == LION_ORDER_NULLS_FIRST) ? LOW_PHASE_NULLS_FIRST :
+		LOW_PHASE_VALUES;
+	if (w->range.empty)
+		w->phase = LOW_PHASE_DONE;
+
+	MemoryContextSwitchTo(oldcxt);
+	return w;
+}
+
+/* Take the entry into ebuf, as the one whose TIDs come next. */
+static void
+lion_order_take_entry(LionOrderWalk *w, const LionEntryTuple *entry, Size sz)
+{
+	memcpy(w->ebuf->data, entry, sz);
+	w->entry = (LionEntryTuple *) w->ebuf->data;
+	w->entrysz = sz;
+	w->payoff = 0;
+	w->chainstarted = false;
+	w->haspost = false;
+	w->entries++;
+}
+
+/* Copy the directory leaf buf holds, share-locked, and start on it. */
+static void
+lion_order_read_leaf(LionOrderWalk *w, Buffer buf)
+{
+	Page		page = BufferGetPage(buf);
+	Page		cpage = (Page) w->leaf->data;
+
+	if (!LionPageIsLeaf(page))
+		elog(ERROR, "lion index \"%s\": block %u is not a directory leaf",
+			 RelationGetRelationName(w->index), BufferGetBlockNumber(buf));
+	memcpy(cpage, page, BLCKSZ);
+	lion_dir_pages_read++;
+	w->leaves++;
+	w->blk = BufferGetBlockNumber(buf);
+	w->nextblk = LionPageIsRightmost(cpage) ? InvalidBlockNumber :
+		LionPageGetOpaque(cpage)->rightlink;
+	w->firstoff = (int) lion_page_first_data(cpage);
+	w->maxoff = (int) PageGetMaxOffsetNumber(cpage);
+	w->off = w->backward ? w->maxoff : w->firstoff;
+	w->haspage = true;
+}
+
+/*
+ * The next VALUE entry of the range in the walk's direction, taken into ebuf;
+ * false at the end of the range.
+ *
+ * Ascending, this is lion_walk_next()'s walk: the leaf the range's lower bound
+ * lands on and then the right links, each leaf copied under a share lock and
+ * let go.  Descending, it starts on the leaf the upper bound lands on
+ * (lion_range_last_leaf()) and goes to each leaf's LEFT sibling
+ * (lion_dir_step_left(): the page whose right link is this one, found from
+ * the left link by walking right, since the page the link names may have
+ * split).  Neither misses an entry a snapshot taken before the walk began can
+ * see: such an entry was in the index then, a split only ever moves entries
+ * to a new page right of the one it splits, and no directory page is ever
+ * unlinked (§21).  When the left neighbour of a leaf already copied splits,
+ * its upper half goes to the new page, whose right link is that leaf: the
+ * page the descending walk reads next.  Entries inserted after the walk began
+ * are for rows no older snapshot sees.
+ */
+static bool
+lion_order_next_value(LionOrderWalk *w)
+{
+	for (;;)
+	{
+		if (!w->haspage)
+		{
+			Buffer		buf;
+
+			if (!w->started)
+			{
+				BlockNumber blk;
+
+				w->started = true;
+				blk = w->backward ? lion_range_last_leaf(w->index, &w->range) :
+					lion_range_first_leaf(w->index, &w->range);
+				buf = ReadBuffer(w->index, blk);
+				LockBuffer(buf, BUFFER_LOCK_SHARE);
+			}
+			else if (w->backward)
+			{
+				BlockNumber left = LionPageGetOpaque((Page) w->leaf->data)->leftlink;
+
+				/* the leftmost leaf of the directory: nothing is left of it */
+				if (!BlockNumberIsValid(left) || left == w->blk)
+					return false;
+				buf = ReadBuffer(w->index, w->blk);
+				LockBuffer(buf, BUFFER_LOCK_SHARE);
+				buf = lion_dir_step_left(w->index, buf, INT_MAX);
+
+				/*
+				 * A leaf with a left link has a left sibling whose right link
+				 * names it, found however far it split (§21): not finding one
+				 * is damage, not the end of the column.
+				 */
+				if (!BufferIsValid(buf))
+					ereport(ERROR,
+							(errcode(ERRCODE_INDEX_CORRUPTED),
+							 errmsg("lion index \"%s\": no left sibling of directory leaf %u",
+									RelationGetRelationName(w->index), w->blk),
+							 errhint("REINDEX the index.")));
+			}
+			else
+			{
+				if (!BlockNumberIsValid(w->nextblk))
+					return false;
+				buf = ReadBuffer(w->index, w->nextblk);
+				LockBuffer(buf, BUFFER_LOCK_SHARE);
+			}
+			lion_order_read_leaf(w, buf);
+			UnlockReleaseBuffer(buf);
+			CHECK_FOR_INTERRUPTS();
+		}
+
+		while (w->backward ? (w->off >= w->firstoff) : (w->off <= w->maxoff))
+		{
+			Page		cpage = (Page) w->leaf->data;
+			ItemId		iid = PageGetItemId(cpage, (OffsetNumber) w->off);
+			LionEntryTuple *entry;
+			int			kind;
+			int			t;
+
+			w->off += w->backward ? -1 : 1;
+			if (!ItemIdIsUsed(iid))
+				continue;
+			entry = (LionEntryTuple *) PageGetItem(cpage, iid);
+			kind = lion_entry_kind(entry);
+
+			/*
+			 * One key column's VALUE entries (DESIGN.md §24): an earlier
+			 * column's entries and this one's reserved entries sort before
+			 * them, this one's summaries (§32) and a later column's after.
+			 */
+			if (entry->attno < w->attno ||
+				(entry->attno == w->attno && kind < LION_KIND_VALUE))
+			{
+				if (w->backward)
+					return false;
+				continue;
+			}
+			if (entry->attno > w->attno || kind > LION_KIND_VALUE)
+			{
+				if (w->backward)
+					continue;
+				return false;
+			}
+
+			t = lion_range_test(&w->range, entry);
+			if (t == LION_RANGE_MATCH)
+			{
+				lion_order_take_entry(w, entry, ItemIdGetLength(iid));
+				return true;
+			}
+			if (!w->backward)
+			{
+				if (t == LION_RANGE_END)
+					return false;
+				continue;
+			}
+
+			/*
+			 * Descending, the entries above an upper bound come first and
+			 * are passed over; below a lower bound of an ordered range every
+			 * entry further left is below it too.
+			 */
+			if (!w->range.ordered || lion_range_fails_upper(&w->range, entry))
+				continue;
+			return false;
+		}
+		w->haspage = false;
+	}
+}
+
+/* The NULL entry of the column, taken into ebuf; false when it has none. */
+static bool
+lion_order_null_entry(LionOrderWalk *w)
+{
+	LionState  *col = lion_index_column_state(w->index, w->attno);
+	Buffer		buf = InvalidBuffer;
+	OffsetNumber off;
+	bool		found;
+
+	found = lion_find_null_entry(w->index, col, BUFFER_LOCK_SHARE, &buf, &off);
+	if (found)
+	{
+		Page		page = BufferGetPage(buf);
+		ItemId		iid = PageGetItemId(page, off);
+
+		lion_order_take_entry(w, (LionEntryTuple *) PageGetItem(page, iid),
+							  ItemIdGetLength(iid));
+	}
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
+	return found;
+}
+
+/*
+ * The next item of the current entry's posting set, expanded into codes;
+ * false when the set has no more.  An INLINE set is the entry's payload; a
+ * posting tree is read a leaf at a time from its leftmost one, each copied
+ * under a share lock and let go, as lion_emit_chain() reads one - a leaf that
+ * no longer belongs to the set means the set was freed after the entry was
+ * copied, which only happens once it held nothing any snapshot sees.
+ */
+static bool
+lion_order_next_item(LionOrderWalk *w)
+{
+	LionEntryTuple *entry = w->entry;
+
+	if (entry->flags & LION_ENTRY_INLINE)
+	{
+		Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, w->entrysz);
+
+		if (lion_inline_fetch(LionEntryGetPayload(entry), paylen, &w->payoff,
+							  w->cbuf) == 0)
+			return false;
+		lion_order_expand(w, w->cbuf);
+		return true;
+	}
+
+	for (;;)
+	{
+		if (!w->haspost)
+		{
+			Buffer		buf;
+			Page		page;
+
+			if (!w->chainstarted)
+			{
+				w->chainstarted = true;
+				if (!BlockNumberIsValid(entry->head))
+					return false;
+				buf = lion_posting_search(w->index, NULL, entry->hash,
+										  entry->head, 0, BUFFER_LOCK_SHARE,
+										  false);
+				if (!BufferIsValid(buf))
+					return false;
+			}
+			else
+			{
+				if (!BlockNumberIsValid(w->postnext))
+					return false;
+				buf = ReadBuffer(w->index, w->postnext);
+				LockBuffer(buf, BUFFER_LOCK_SHARE);
+				page = BufferGetPage(buf);
+				if (!lion_page_owns_entry(page, entry->hash, entry->head) ||
+					!LionPageIsPostingLeaf(page))
+				{
+					UnlockReleaseBuffer(buf);
+					return false;
+				}
+			}
+			page = BufferGetPage(buf);
+			memcpy(w->post->data, page, BLCKSZ);
+			w->postblk = BufferGetBlockNumber(buf);
+			UnlockReleaseBuffer(buf);
+			w->postnext = LionPageGetOpaque((Page) w->post->data)->rightlink;
+			w->postoff = FirstOffsetNumber;
+			w->postmax = PageGetMaxOffsetNumber((Page) w->post->data);
+			w->haspost = true;
+			CHECK_FOR_INTERRUPTS();
+		}
+		if (w->postoff <= w->postmax)
+		{
+			LionContainer *c = lion_page_item_fetch(w->index,
+													(Page) w->post->data,
+													w->postblk, w->postoff);
+
+			w->postoff = OffsetNumberNext(w->postoff);
+			lion_order_expand(w, c);
+			return true;
+		}
+		w->haspost = false;
+	}
+}
+
+bool
+lion_order_walk_next(LionOrderWalk *w, ItemPointer tid)
+{
+	for (;;)
+	{
+		if (w->pos < w->ncodes)
+		{
+			lion_code_to_tid(w->codes[w->pos++], tid);
+			return true;
+		}
+		if (w->entry != NULL)
+		{
+			if (lion_order_next_item(w))
+				continue;
+			w->entry = NULL;
+		}
+
+		switch (w->phase)
+		{
+			case LOW_PHASE_NULLS_FIRST:
+				w->phase = LOW_PHASE_VALUES;
+				(void) lion_order_null_entry(w);
+				break;
+			case LOW_PHASE_VALUES:
+				if (!lion_order_next_value(w))
+					w->phase = (w->nulls == LION_ORDER_NULLS_LAST) ?
+						LOW_PHASE_NULLS_LAST : LOW_PHASE_DONE;
+				break;
+			case LOW_PHASE_NULLS_LAST:
+				w->phase = LOW_PHASE_DONE;
+				(void) lion_order_null_entry(w);
+				break;
+			default:
+				return false;
+		}
+	}
+}
+
+void
+lion_order_walk_counts(LionOrderWalk *w, int64 *entries, int64 *leaves)
+{
+	*entries = w->entries;
+	*leaves = w->leaves;
+}
+
+void
+lion_order_walk_end(LionOrderWalk *w)
+{
+	pfree(w->leaf);
+	pfree(w->ebuf);
+	pfree(w->post);
+	pfree(w->cbuf);
+	pfree(w->los);
+	pfree(w->codes);
+	if (w->range.bounds != NULL)
+		pfree(w->range.bounds);
+	pfree(w);
+}
