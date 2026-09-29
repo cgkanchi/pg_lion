@@ -978,6 +978,33 @@ extern bool lion_source_exact(LionSource *src);
 extern void lion_source_close(LionSource *src);
 
 /*
+ * The TIDs of one ordered scalar key column in the column's order (DESIGN.md
+ * §30.11), in lion_scan.c: the entries its range keys select - every `<`,
+ * `<=`, `>=` and `>` key on the column, and `IS NOT NULL` - walked in key
+ * order, ascending or descending, and the TIDs of each entry in heap order;
+ * the NULL entry's before them or after them, or not at all.  Rows with equal
+ * keys come in no particular order.  The walk holds no pin and no lock between
+ * calls: it reads each directory leaf and each posting page into private
+ * memory, which is what an MVCC snapshot allows (§29.5), and every TID it
+ * hands out is for the caller to look up in the heap.  *entries and *leaves
+ * count what it has read.
+ */
+typedef struct LionOrderWalk LionOrderWalk;
+
+#define LION_ORDER_NULLS_NONE	0	/* the NULL entry is not walked */
+#define LION_ORDER_NULLS_FIRST	1
+#define LION_ORDER_NULLS_LAST	2
+
+extern LionOrderWalk *lion_order_walk_begin(Relation index, AttrNumber attno,
+											ScanKey keys, int nkeys,
+											bool backward, int nulls,
+											MemoryContext cxt);
+extern bool lion_order_walk_next(LionOrderWalk *w, ItemPointer tid);
+extern void lion_order_walk_counts(LionOrderWalk *w, int64 *entries,
+								   int64 *leaves);
+extern void lion_order_walk_end(LionOrderWalk *w);
+
+/*
  * Can (tree over sets) select anything at all?  False when a key the tree
  * requires has no entry in the index, which lets a caller skip the whole
  * merge - and, in the GROUP BY path, every group of it.
@@ -1053,6 +1080,7 @@ extern int	lion_range_test(LionRange *range, const LionEntryTuple *entry);
 extern bool lion_range_fails_upper(LionRange *range,
 								   const LionEntryTuple *entry);
 extern BlockNumber lion_range_first_leaf(Relation index, LionRange *range);
+extern BlockNumber lion_range_last_leaf(Relation index, LionRange *range);
 
 /*
  * The summaries of a column as the planner sees them (DESIGN.md §32,

@@ -11115,6 +11115,34 @@ lion_range_first_leaf(Relation index, LionRange *range)
 }
 
 /*
+ * The directory leaf a DESCENDING walk of the range starts on (DESIGN.md
+ * §30.11): where its tightest upper bound lands - the entry there is the
+ * first that is not below the bound, so every entry the range selects is on
+ * that leaf or on one to its left - or, without an upper bound or an order to
+ * descend by, the leaf where the column's VALUE entries end.  A walk leftwards
+ * from there passes over the entries of that leaf that lie above the range.
+ */
+BlockNumber
+lion_range_last_leaf(Relation index, LionRange *range)
+{
+	BlockNumber blk = InvalidBlockNumber;
+
+	if (range->ordered)
+		blk = lion_range_side_leaf(index, range, false, LION_KIND_VALUE, NULL);
+	if (!BlockNumberIsValid(blk))
+	{
+		Buffer		buf;
+		OffsetNumber off;
+
+		range->state = lion_index_column_state(index, range->state->attno);
+		buf = lion_dir_value_end(index, range->state, &off);
+		blk = BufferGetBlockNumber(buf);
+		UnlockReleaseBuffer(buf);
+	}
+	return blk;
+}
+
+/*
  * Where a column's summaries begin (DESIGN.md §32): the leaf a descent to
  * (attno, SUMMARY) with no key lands on.  A search key of kind SUMMARY and no
  * comparison compares only on its hash, 0, and without a stored form it is the

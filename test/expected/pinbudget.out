@@ -182,12 +182,13 @@ SELECT lion_pinsrc('SELECT count(*) FROM lion_pin WHERE k = ANY ((SELECT array_a
  * a hundred values under the same OR, and a plain AND of two INLINE sets.
  */
 SELECT lion_pinsrc('SELECT count(*) FROM lion_pin WHERE k = ANY ((SELECT array_agg(k) FROM (SELECT k FROM lion_pin ORDER BY k LIMIT 100) s)::text[]) OR x = 1');
-            lion_pinsrc            
------------------------------------
+                        lion_pinsrc                        
+-----------------------------------------------------------
  Custom Scan (LionCount)
    Heap Blocks Skipped via VM: 750
    Heap TIDs Rechecked: 0
-(3 rows)
+                 ->  Custom Scan (LionOrdered) on lion_pin
+(4 rows)
 
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
