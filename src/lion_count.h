@@ -1315,6 +1315,13 @@ extern void lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 extern double lion_merge_cpu_cost(int nsrc, const double *members,
 								  const double *containers, const bool *inmem,
 								  double tuples, double isect, double *probes);
+extern double lion_merge_cpu_cost_sets(int nsrc, const double *members,
+									   const double *containers,
+									   const double *nsets,
+									   const double *setcontainers,
+									   const double *setpages,
+									   const bool *inmem, double tuples,
+									   double isect, double *probes);
 
 /*
  * The AND of the posting sets of n clauses of one relation (DESIGN.md §29.11,

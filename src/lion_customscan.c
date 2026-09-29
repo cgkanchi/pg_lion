@@ -597,6 +597,18 @@ create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 #define LION_AND_MEMBER_COST	(lion_and_member_cost * cpu_operator_cost)
 
 /*
+ * THE UNION OF A LIST'S SETS AT ONE KEY (DESIGN.md §29.11, "Unions probed"),
+ * where the leapfrog builds it (lion_or_hot_raw(), lion_merge_cpu_cost_sets()):
+ * a bitset image cleared, its members set in it and counted, UNION_KEY a
+ * key and UNION_MEMBER a member.  Measured on the release build of
+ * PostgreSQL 18: the image's clear and count 85 ns with its AVX-512 popcount
+ * (670 on 16's), a member 1.0 to 1.5 ns; fitted over lists of 2 to 32
+ * values at 150 ns and 1.25 ns.
+ */
+#define LION_UNION_KEY_COST		(lion_union_key_cost * cpu_operator_cost)
+#define LION_UNION_MEMBER_COST	(lion_union_member_cost * cpu_operator_cost)
+
+/*
  * One level of an entry directory descended - a page pinned and locked, a
  * binary search, the entry decoded - for a count's lookup of a key, an IN
  * list's of each of its values, and the FK-side join's of each dimension row's
@@ -3790,6 +3802,54 @@ lion_merge_cpu_cost(int nsrc, const double *members, const double *containers,
 					const bool *inmem, double tuples, double isect,
 					double *probes)
 {
+	return lion_merge_cpu_cost_sets(nsrc, members, containers, NULL, NULL,
+									NULL, inmem, tuples, isect, probes);
+}
+
+/*
+ * ... with the UNIONS among the sources priced as the leapfrog meets them
+ * (DESIGN.md §29.11, "Unions probed"): nsets[i] the posting sets of source i -
+ * an IN list's values, a multi-key `&&`'s keys, an OR's leaves; 1 for a set
+ * of its own - lying in setcontainers[i] containers together, where
+ * containers[i] counts the container keys the source has (at most the
+ * heap's).  With nsets NULL every source is taken for one set, as it was
+ * before unions were probed; a grouped count and the FK-side join price
+ * their unions themselves (LION_UNION_SET_COST, lion_merge_ops()).
+ *
+ *	- A union that DRIVES reads every container of its sets, and builds their
+ *	  union at each of its keys: LION_UNION_KEY_COST a key and
+ *	  LION_UNION_MEMBER_COST a member, the bitset image cleared, filled and
+ *	  counted (lion_or_hot_raw()).
+ *	- A union that is SOUGHT seeks each of its sets that has a container at or
+ *	  before the key, and no more of them than its sets have containers: a
+ *	  probe each (LION_PROBE_COST) for a set on posting pages of its own, and
+ *	  what reading the container it lands on costs (LION_CONTAINER_COST) for
+ *	  one INLINE on its entry, whose seek steps over the items of a payload in
+ *	  memory - setpages[i], the posting pages of its sets, says which; the
+ *	  pages themselves are the caller's (lion_cost_set_pages()).  Then it ANDs
+ *	  the running intersection with the union the cheaper
+ *	  way at each key, as lion_or_probe_pays() chooses: the union built and
+ *	  ANDed (LION_UNION_KEY_COST, and LION_UNION_MEMBER_COST each of its
+ *	  members at the key and each of the intersection's, a bit set and a bit
+ *	  tested in its image), or the intersection's members looked up in each
+ *	  of its sets' containers there, LION_AND_MEMBER_COST a member a
+ *	  container.  An intersection of more members than an ARRAY holds is
+ *	  never probed.
+ *
+ * Fitted on the release build of PostgreSQL 18 (2026-09-28, a heap of 70
+ * rows a block, 8M rows, lists of 2 to 32 values and `&&` of 3 and 6 keys
+ * ANDed with a set of a few rows a key, of a few hundred, and with dense
+ * ones): a set of a list read or sought costs 110 to 400 ns a key, of which
+ * the seek is 130 and a member of the union 1.2 to 1.5 ns; an intersection's
+ * member looked up in a set's container 1.5 to 3.6 ns.
+ */
+double
+lion_merge_cpu_cost_sets(int nsrc, const double *members,
+						 const double *containers, const double *nsets,
+						 const double *setcontainers, const double *setpages,
+						 const bool *inmem, double tuples, double isect,
+						 double *probes)
+{
 	int		   *order;
 	int			i;
 	int			k;
@@ -3817,6 +3877,13 @@ lion_merge_cpu_cost(int nsrc, const double *members, const double *containers,
 	lambda = Max(members[order[0]], 0.0) / keys;
 	cost = keys * (LION_CONTAINER_COST +
 				   LION_MEMBER_COST * Min(lambda, LION_MEMBER_CAP));
+	if (nsets != NULL && nsets[order[0]] > 1.0)
+	{
+		/* a driving union: its sets' other containers, and its union built */
+		cost += Max(setcontainers[order[0]] - keys, 0.0) * LION_CONTAINER_COST;
+		cost += keys * LION_UNION_KEY_COST +
+			Max(members[order[0]], 0.0) * LION_UNION_MEMBER_COST;
+	}
 	if (probes != NULL)
 		probes[order[0]] = 0.0;
 	if (nsrc > 1 && isect > 0.0 && isect != 1.0)
@@ -3826,10 +3893,33 @@ lion_merge_cpu_cost(int nsrc, const double *members, const double *containers,
 	{
 		int			j = order[k];
 		double		sought = keys * alive;
+		Cost		seek = (inmem != NULL && inmem[j]) ?
+			LION_MEMORY_PROBE_COST : LION_PROBE_COST;
+		double		lam = Min(lambda, LION_MEMBER_CAP);
 
-		cost += sought * ((inmem != NULL && inmem[j]) ?
-						  LION_MEMORY_PROBE_COST : LION_PROBE_COST);
-		cost += sought * LION_AND_MEMBER_COST * Min(lambda, LION_MEMBER_CAP);
+		if (nsets != NULL && nsets[j] > 1.0)
+		{
+			/* a sought union: its sets sought, then built or probed */
+			double		ukeys = Max(containers[j], 1.0);
+			double		hot = Max(setcontainers[j] / ukeys, 1.0);
+			double		mu = Max(members[j], 0.0) / ukeys;
+			Cost		built = LION_UNION_KEY_COST +
+				LION_UNION_MEMBER_COST * (mu + lam);
+			Cost		probed = LION_AND_MEMBER_COST * lam * hot;
+
+			double		chain = Min(setpages[j] / nsets[j], 1.0);
+
+			cost += Min(sought * nsets[j], Max(setcontainers[j], sought)) *
+				(LION_CONTAINER_COST +
+				 (seek - LION_CONTAINER_COST) * Max(chain, 0.0));
+			cost += sought * ((lambda > (double) LION_ARRAY_MAX_CARD) ?
+							  built : Min(built, probed));
+		}
+		else
+		{
+			cost += sought * seek;
+			cost += sought * LION_AND_MEMBER_COST * lam;
+		}
 		if (probes != NULL)
 			probes[j] = sought;
 
@@ -3923,11 +4013,17 @@ lion_heap_page_cost(PlannerInfo *root, RelOptInfo *rel, double pages,
  *	descent		the lookups' comparisons, LION_DESCENT_COST a level
  *	readall		reading every container of its sets, for a union or a sum
  *	unionops	the k-way union of an IN list's sets, in cpu_operator_cost
+ *	nsets		the sets an AND meets it as the union of: an IN list's values,
+ *				a multi-key `&&`'s keys (lion_merge_cpu_cost_sets()); 1 for a
+ *				set of its own
+ *	setcontainers	... and the containers those lie in together
  */
 typedef struct LionSetClause
 {
 	double		sel;
 	double		nkeys;
+	double		nsets;
+	double		setcontainers;
 	double		members;
 	double		containers;
 	double		pages;
@@ -3941,6 +4037,10 @@ typedef struct LionSetClause
 	Cost		readall;
 	double		unionops;
 } LionSetClause;
+
+static LionQueryMode lion_multikey_cost_mode_ex(IndexOptInfo *idx,
+												AttrNumber col, Node *clause,
+												double *nkeys, bool *isunion);
 
 static void
 lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
@@ -4082,6 +4182,29 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		 LION_MEMBER_COST * Min(sc->members / sc->containers, LION_MEMBER_CAP));
 	if (nkeys > 1.0)
 		sc->unionops = lion_merge_ops(heap_pages, sc->members, nkeys);
+
+	/*
+	 * The union an AND meets it as (DESIGN.md §29.11, "Unions probed"): an
+	 * IN list's sets, or a multi-key query that ORs its keys, `&&`, whose
+	 * keys' sets the executor locates and unites as a list's (§17); its rows
+	 * are shared out among them, as a list's are.
+	 */
+	sc->nsets = nkeys;
+	sc->setcontainers = sc->containers;
+	if (nkeys <= 1.0 && IsA(bare, OpExpr))
+	{
+		double		mkeys;
+		bool		isunion;
+
+		(void) lion_multikey_cost_mode_ex(idx, col, bare, &mkeys, &isunion);
+		if (isunion && mkeys > 1.0)
+		{
+			sc->nsets = mkeys;
+			sc->setcontainers = mkeys *
+				lion_key_containers(root, rel, idx, col,
+									sc->members / mkeys);
+		}
+	}
 }
 
 /*
@@ -4179,6 +4302,9 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 	LionSetClause *sc;
 	double	   *members;
 	double	   *containers;
+	double	   *nsets;
+	double	   *setcontainers;
+	double	   *setpages;
 	double	   *probes;
 	double		ckeys = Max((double) rel->pages / LION_BLOCKS_PER_CONTAINER,
 							1.0);
@@ -4197,6 +4323,9 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 	sc = (LionSetClause *) palloc(sizeof(LionSetClause) * n);
 	members = (double *) palloc(sizeof(double) * n);
 	containers = (double *) palloc(sizeof(double) * n);
+	nsets = (double *) palloc(sizeof(double) * n);
+	setcontainers = (double *) palloc(sizeof(double) * n);
+	setpages = (double *) palloc(sizeof(double) * n);
 	probes = (double *) palloc0(sizeof(double) * n);
 
 	for (i = 0; i < n; i++)
@@ -4206,19 +4335,26 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 		lookup += sc[i].lookup;
 		out->leafpages += sc[i].lookuppages;
 		out->cpu += sc[i].descent;
-		if (sc[i].nkeys > 1.0)
-			out->cpu += sc[i].readall + sc[i].unionops * cpu_operator_cost;
 
 		members[i] = sc[i].members;
-		containers[i] = Min(sc[i].containers, ckeys);
+		containers[i] = Min(sc[i].setcontainers, ckeys);
+		nsets[i] = sc[i].nsets;
+		setcontainers[i] = sc[i].setcontainers;
+		setpages[i] = sc[i].pages;
 		if (driver < 0 || members[i] < members[driver])
 			driver = i;
 	}
 
+	/*
+	 * The unions among them - IN lists, multi-key `&&` - are read, built or
+	 * probed as the leapfrog meets them (lion_merge_cpu_cost_sets(), DESIGN.md
+	 * §29.11, "Unions probed").
+	 */
 	randompages = lion_cost_leaf_pages(n, idxs, sc);
 	out->leafpages += randompages;
-	out->cpu += lion_merge_cpu_cost(n, members, containers, NULL,
-									Max(rel->tuples, 1.0), isect, probes);
+	out->cpu += lion_merge_cpu_cost_sets(n, members, containers, nsets,
+										 setcontainers, setpages, NULL,
+										 Max(rel->tuples, 1.0), isect, probes);
 
 	for (i = 0; i < n; i++)
 		probed += lion_cost_set_pages(root, rel, &sc[i], i == driver,
@@ -4232,6 +4368,9 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 	pfree(sc);
 	pfree(members);
 	pfree(containers);
+	pfree(nsets);
+	pfree(setcontainers);
+	pfree(setpages);
 	pfree(probes);
 
 	return out->leafcost + out->setcost + out->cpu;
@@ -4925,6 +5064,11 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	double	   *srccontainers;	/* and the containers they lie in */
 	bool	   *srcunion;		/* is it a union of several sets? */
 	double	   *srcsets;		/* ... of how many */
+	double	   *srcnsets;		/* the sets an AND meets it as the union of */
+	double	   *srcsetcont;		/* ... and the containers they lie in */
+	double	   *srcsetpages;	/* ... and the posting pages they fill */
+	Cost		union_read = 0; /* read_cpu of the union sources' sets */
+	double		union_ops = 0;	/* merge_ops of their unions */
 	double	   *srcprobes;		/* how often each is sought */
 	int			nsrc;
 	int			driver = -1;	/* the source that drives the leapfrog */
@@ -4986,6 +5130,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	srccontainers = (double *) palloc0(sizeof(double) * Max(nclause, 1));
 	srcunion = (bool *) palloc0(sizeof(bool) * Max(nclause, 1));
 	srcsets = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+	srcnsets = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+	srcsetcont = (double *) palloc0(sizeof(double) * Max(nclause, 1));
+	srcsetpages = (double *) palloc0(sizeof(double) * Max(nclause, 1));
 	srcprobes = (double *) palloc0(sizeof(double) * (Max(nclause, 1) + 2));
 	orgrp = lion_or_group_map(ors, nclause);
 
@@ -5084,12 +5231,19 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			clc = lion_key_containers(root, rel, idx,
 									  (AttrNumber) lfirst_int(lc4), tuples * sel);
 			if (orgrp[ci - 1] >= 0)
-				read_cpu += clc * (LION_CONTAINER_COST + LION_MEMBER_COST *
-								   Min(tuples * sel / clc, LION_MEMBER_CAP));
+			{
+				Cost		readleaf = clc * (LION_CONTAINER_COST + LION_MEMBER_COST *
+											  Min(tuples * sel / clc, LION_MEMBER_CAP));
+
+				read_cpu += readleaf;
+				union_read += readleaf;
+			}
 			clausesrc[ci - 1] = (orgrp[ci - 1] >= 0) ? orgrp[ci - 1] : nsrc++;
 			srcmembers[clausesrc[ci - 1]] += tuples * sel;
 			srccontainers[clausesrc[ci - 1]] += clc;
 			srcsets[clausesrc[ci - 1]] += 1.0;
+			srcnsets[clausesrc[ci - 1]] += 1.0;
+			srcsetcont[clausesrc[ci - 1]] += clc;
 			if (orgrp[ci - 1] >= 0)
 				srcunion[clausesrc[ci - 1]] = true;
 			continue;
@@ -5121,7 +5275,10 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		 */
 		if (!(groupdrive && ci - 1 == inlistci) &&
 			(orgrp[ci - 1] >= 0 || nkeys > 1.0))
+		{
 			read_cpu += sc->readall;
+			union_read += sc->readall;
+		}
 
 		/*
 		 * Which source of the AND this clause belongs to: the union of its OR
@@ -5137,6 +5294,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			srcmembers[clausesrc[ci - 1]] += sc->members;
 			srccontainers[clausesrc[ci - 1]] += sc->containers;
 			srcsets[clausesrc[ci - 1]] += nkeys;
+			srcnsets[clausesrc[ci - 1]] += sc->nsets;
+			srcsetcont[clausesrc[ci - 1]] += sc->setcontainers;
+			srcsetpages[clausesrc[ci - 1]] += sc->pages;
 			if (orgrp[ci - 1] >= 0 || nkeys > 1.0)
 				srcunion[clausesrc[ci - 1]] = true;
 		}
@@ -5167,7 +5327,10 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 						  (double) LION_SUM_MAX_DENSITY);
 
 			if (merged)
+			{
 				merge_ops += sc->unionops;
+				union_ops += sc->unionops;
+			}
 		}
 
 		/*
@@ -5206,7 +5369,10 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			members += tuples * clausesel[i];
 
 		if (nleaves > 1)
+		{
 			merge_ops += members * log2((double) nleaves);
+			union_ops += members * log2((double) nleaves);
+		}
 	}
 	pfree(clausesel);
 	pfree(orgrp);
@@ -5281,10 +5447,23 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	if (groupidx == NULL && !rangesum && nsrc > 0 &&
 		(nsrc > 1 || !srcunion[0]))
-		merge_cpu = lion_merge_cpu_cost(nsrc, srcmembers, srccontainers,
-										NULL, tuples,
-										lion_probe_rel_factor(root, rel),
-										srcprobes);
+	{
+		/*
+		 * The unions among the sources - IN lists, `&&`, ORs across columns -
+		 * are met as the leapfrog meets them, read and built where they drive
+		 * and sought, then built or probed, where they do not (DESIGN.md
+		 * §29.11, "Unions probed"), which lion_merge_cpu_cost_sets() prices in
+		 * place of reading every container of their sets and a k-way merge of
+		 * them all.
+		 */
+		merge_cpu = lion_merge_cpu_cost_sets(nsrc, srcmembers, srccontainers,
+											 srcnsets, srcsetcont, srcsetpages,
+											 NULL, tuples,
+											 lion_probe_rel_factor(root, rel),
+											 srcprobes);
+		read_cpu -= union_read;
+		merge_ops -= union_ops;
+	}
 	else if (groupidx != NULL && !rangesum)
 	{
 		double	   *mem = (double *) palloc(sizeof(double) * (nsrc + 2));
@@ -5507,6 +5686,9 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	pfree(srccontainers);
 	pfree(srcunion);
 	pfree(srcsets);
+	pfree(srcnsets);
+	pfree(srcsetcont);
+	pfree(srcsetpages);
 	pfree(srcprobes);
 
 	/*
@@ -5944,6 +6126,18 @@ static LionQueryMode
 lion_multikey_cost_mode(IndexOptInfo *idx, AttrNumber col, Node *clause,
 						double *nkeys)
 {
+	return lion_multikey_cost_mode_ex(idx, col, clause, nkeys, NULL);
+}
+
+/*
+ * ... and in *isunion whether the keys are ORed and nothing else - the
+ * union of their posting sets, a `&&`'s, which an AND meets as it meets an
+ * IN list (lion_merge_cpu_cost_sets()) - where a `@>` or a tsquery ANDs them.
+ */
+static LionQueryMode
+lion_multikey_cost_mode_ex(IndexOptInfo *idx, AttrNumber col, Node *clause,
+						   double *nkeys, bool *isunion)
+{
 	OpExpr	   *op;
 	Node	   *arg;
 	Const	   *con;
@@ -5958,6 +6152,8 @@ lion_multikey_cost_mode(IndexOptInfo *idx, AttrNumber col, Node *clause,
 	MemoryContext oldcxt;
 
 	*nkeys = 1.0;
+	if (isunion != NULL)
+		*isunion = false;
 	if (clause == NULL || !IsA(clause, OpExpr) || col < 1 ||
 		col > idx->nkeycolumns || list_length(((OpExpr *) clause)->args) != 2)
 		return LION_QMODE_KEYS;
@@ -5995,6 +6191,16 @@ lion_multikey_cost_mode(IndexOptInfo *idx, AttrNumber col, Node *clause,
 								(StrategyNumber) strategy, &q);
 	if (q.mode == LION_QMODE_KEYS || q.mode == LION_QMODE_LOSSY)
 		*nkeys = Max((double) q.nkeys, 1.0);
+	if (isunion != NULL && q.mode == LION_QMODE_KEYS && q.tree != NULL &&
+		q.tree->kind == LION_KN_OR)
+	{
+		int			i;
+
+		*isunion = true;
+		for (i = 0; i < q.tree->nargs; i++)
+			if (q.tree->args[i]->kind != LION_KN_KEY)
+				*isunion = false;
+	}
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);

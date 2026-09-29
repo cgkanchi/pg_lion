@@ -485,7 +485,9 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `member_cost` | 0.15 | `cpu_operator_cost` | a member of it, up to 1,024 a container |
 | `probe_cost` | 40 | `cpu_operator_cost` | a seek of a posting tree to a container key |
 | `memory_probe_cost` | 30 | `cpu_operator_cost` | the same into a set copied into memory |
-| `and_member_cost` | 0.8 | `cpu_operator_cost` | a member of an intersection ANDed with what a seek found |
+| `and_member_cost` | 0.8 | `cpu_operator_cost` | a member of an intersection ANDed with what a seek found, or looked up in a container of a union's |
+| `union_key_cost` | 30 | `cpu_operator_cost` | the union of an `IN` list's or a multi-key query's containers built at a container key |
+| `union_member_cost` | 0.25 | `cpu_operator_cost` | a member of such a union, or of the intersection ANDed with it |
 | `descent_cost` | 120 | `cpu_operator_cost` | a level of an entry directory descended |
 | `union_set_cost` | 100 | `cpu_tuple_cost` | a set of an `IN` list or `OR` rebuilt by each count of a GROUP BY or join |
 | `recheck_tid_cost` | 1.5 | `cpu_tuple_cost` | a candidate row of a count's heap recheck |
