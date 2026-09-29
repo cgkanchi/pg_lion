@@ -196,6 +196,34 @@ extern uint32 lion_container_and_union_raw(const LionContainer *a,
 										   uint32 nb, LionContainer *dest);
 
 /*
+ * The three steps of that probe, for the count engine's evaluation of a
+ * nested tree - an AND of ORs, an OR of ANDs - for a few members (DESIGN.md
+ * §29.11, "Trees probed"):
+ *
+ * - lion_container_extract_members(): c's members, ascending, as iterate()
+ *   hands them out, into out (room for cap); the count, or cap + 1 when
+ *   there are more;
+ * - lion_container_probe_members(): of the positions pending[0 .. np - 1]
+ *   into the ascending vals[], mark in found[] (a bit a position) those whose
+ *   value b holds, keep in pending[], in order, those it does not, and
+ *   return how many are kept;
+ * - lion_container_array_from_marks(): dest (capacity
+ *   LION_CONTAINER_MAX_SIZE) becomes the ARRAY of ckey of vals[p] for each
+ *   position p < n (at most LION_ARRAY_MAX_CARD) marked, masked and
+ *   ascending whatever vals[] holds; its cardinality is returned.
+ *
+ * Containers may come off pages; no index leaves the arrays given.
+ */
+extern uint32 lion_container_extract_members(const LionContainer *c,
+											 uint16 *out, uint32 cap);
+extern uint32 lion_container_probe_members(const LionContainer *b,
+										   const uint16 *vals, uint16 *pending,
+										   uint32 np, uint64 *found);
+extern uint32 lion_container_array_from_marks(LionContainer *dest, uint32 ckey,
+											  const uint16 *vals, uint32 n,
+											  const uint64 *marks);
+
+/*
  * A BITSET a caller ORs containers into (the count engine's union of several
  * containers of one key): bitset_init() makes dest (capacity
  * LION_CONTAINER_MAX_SIZE) an empty BITSET of ckey, whose words
