@@ -99,6 +99,8 @@ setup
 	-- the race is the collected copy's: on a table this small the model may
 	-- probe the fact filters instead
 	SET pg_lion.fkjoin_count_cost = 1e6;
+	-- and the upper node's: a count over the semi join path is not it
+	SET pg_lion.enable_semijoin = off;
 	SELECT injection_points_set_local();
 	SELECT injection_points_attach('lion-count-containers-pinned', 'wait');
 }
