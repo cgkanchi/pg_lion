@@ -2051,38 +2051,72 @@ lion_cost_where_collected(int nsrc, const double *members,
  */
 #define LION_RANGE_DESCENT_PAGES	1.0
 
-static Cost
-lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
-				   IndexOptInfo *groupidx, AttrNumber groupcol,
-				   IndexOptInfo *groupidx2, AttrNumber groupcol2,
-				   List *whereidx, List *wherecol, List *whereclauses,
-				   List *wherekinds,
-				   List *ors, double numgroups,
-				   double outer_entries, double inner_entries, int distinct,
-				   double drivefrac, Var *rangevar, bool rangesum,
-				   LionRangeCost *rc)
+/*
+ * What the phases of lion_cost_count_rel() share: its arguments, the sizes of
+ * the relation, the arrays it keeps per WHERE clause and per source of the
+ * AND, and the running terms its cost is summed from.
+ */
+typedef struct LionCountRelCost
 {
-	double		heap_pages = Max((double) rel->pages, 1.0);
-	double		dirtyfrac = 1.0 - rel->allvisfrac;
-	double		dirty_pages;
-	double		matching = Max(lion_probe_rel_rows(root, rel), 1.0);
-	double		tuples = Max(rel->tuples, 1.0);
-	double		random_pages = 0;	/* directory leaves, one a lookup (§29.11) */
-	Cost		descent_cost = 0;	/* comparisons on the way down (§21) */
-	double		seq_pages = 0;	/* container chains, read in order */
-	Cost		lookup_cost = 0;	/* an IN list's bucket pages, in order */
-	Cost		probe_cost = 0; /* what the SOUGHT sources read (§22) */
-	Cost		read_cpu = 0;	/* containers read whole: unions, lists */
-	Cost		merge_cpu = 0;	/* the AND's driver and probes (§10) */
-	int		   *orgrp;			/* each clause's OR restriction, or -1 */
-	double		merge_ops = 0;	/* comparisons a union of k sets makes */
+	/* lion_cost_count_rel()'s arguments */
+	PlannerInfo *root;
+	RelOptInfo *rel;
+	IndexOptInfo *groupidx;
+	AttrNumber	groupcol;
+	IndexOptInfo *groupidx2;
+	AttrNumber	groupcol2;
+	List	   *whereidx;
+	List	   *wherecol;
+	List	   *whereclauses;
+	List	   *wherekinds;
+	List	   *ors;
+	double		numgroups;
+	double		outer_entries;
+	double		inner_entries;
+	int			distinct;
+	double		drivefrac;
+	Var		   *rangevar;
+	bool		rangesum;
+	LionRangeCost *rc;
+
+	/* the relation */
+	double		heap_pages;
+	double		dirtyfrac;
+	double		matching;
+	double		tuples;
+
+	/* the terms of the cost */
+	double		random_pages;	/* directory leaves, one a lookup (§29.11) */
+	Cost		descent_cost;	/* comparisons on the way down (§21) */
+	double		seq_pages;		/* container chains, read in order */
+	Cost		lookup_cost;	/* an IN list's bucket pages, in order */
+	Cost		probe_cost;		/* what the SOUGHT sources read (§22) */
+	Cost		read_cpu;		/* containers read whole: unions, lists */
+	Cost		merge_cpu;		/* the AND's driver and probes (§10) */
+	double		merge_ops;		/* comparisons a union of k sets makes */
 	double		recheck_tids;
 	double		recheck_pages;
-	double		probed_pages = 0;	/* the pages the sought sources read */
+	double		probed_pages;	/* the pages the sought sources read */
+	Cost		union_read;		/* read_cpu of the union sources' sets */
+	double		union_ops;		/* merge_ops of their unions */
+	Cost		pair_cost;		/* §20: the (outer, inner) group pairs */
+	Cost		rangecost;		/* §28: the walk of a summed range */
+	Cost		rangesrc_cost;	/* §32: collecting the ranges taken as
+								 * sources */
+
+	/* the WHERE clauses, by their position in the lists */
+	int			nclause;
+	int			ci;				/* the clause being priced */
+	int		   *orgrp;			/* each clause's OR restriction, or -1 */
 	double	   *clausesel;		/* each clause's own selectivity, for §19 */
 	LionSetClause *clauseset;	/* its sets as the AND prices them (§22) */
 	IndexOptInfo **clauseindex; /* ... in this index, for its lookup */
 	int		   *clausesrc;		/* the AND source it is part of, or -1 */
+	int		   *rangelead;		/* each clause's range source, or -1 */
+
+	/* the sources of the AND */
+	int			nsrc;
+	int			driver;			/* the source that drives the leapfrog */
 	double	   *srcmembers;		/* members of each AND source */
 	double	   *srccontainers;	/* and the containers they lie in */
 	bool	   *srcunion;		/* is it a union of several sets? */
@@ -2090,74 +2124,230 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	double	   *srcnsets;		/* the sets an AND meets it as the union of */
 	double	   *srcsetcont;		/* ... and the containers they lie in */
 	double	   *srcsetpages;	/* ... and the posting pages they fill */
-	Cost		union_read = 0; /* read_cpu of the union sources' sets */
-	double		union_ops = 0;	/* merge_ops of their unions */
 	double	   *srcprobes;		/* how often each is sought */
-	int			nsrc;
-	int			driver = -1;	/* the source that drives the leapfrog */
-	int			nclause = list_length(whereclauses);
-	int			ci = 0;
-	int			i;
-	Cost		pair_cost = 0;	/* §20: the (outer, inner) group pairs */
-	Cost		run;
-	bool		sumshort;		/* §15: the IN list is summed, not merged */
+
+	/* the groups */
 	bool		groupdrive;		/* §15: the IN list is the GROUP BY driver */
 	int			inlistci;
-	double		ingroups = numgroups;	/* groups the node really emits */
-	double		recheckshare = 1.0; /* §26: what the existence tests recheck */
-	Cost		rangecost = 0;	/* §28: the walk of a summed range */
-	Cost		rangesrc_cost = 0;	/* §32: collecting the ranges taken as
-									 * sources */
-	int		   *rangelead;		/* each clause's range source, or -1 */
-	double		listrows = 0;	/* rows of one entry of a group-driving list */
-	double		walked = 1.0;	/* counts the merge runs: groups, pairs */
-	bool		whereonce = false;	/* the WHERE is collected once and the
-									 * groups counted in batches (§10) */
+	double		ingroups;		/* groups the node really emits */
+	double		recheckshare;	/* §26: what the existence tests recheck */
+	double		listrows;		/* rows of one entry of a group-driving list */
+	double		walked;			/* counts the merge runs: groups, pairs */
+	bool		whereonce;		/* the WHERE is collected once and the
+								 * groups counted in batches (§10) */
+} LionCountRelCost;
+
+/*
+ * The arrays lion_cost_count_rel() keeps per WHERE clause and per source of
+ * the AND, zeroed, and the OR restriction of each clause.
+ */
+static void
+lion_count_rel_alloc(LionCountRelCost *c)
+{
+	c->clausesel = (double *) palloc0(sizeof(double) * Max(c->nclause, 1));
+	c->clauseset = (LionSetClause *) palloc0(sizeof(LionSetClause) *
+											 Max(c->nclause, 1));
+	c->clauseindex = (IndexOptInfo **) palloc0(sizeof(IndexOptInfo *) *
+											   Max(c->nclause, 1));
+	c->clausesrc = (int *) palloc0(sizeof(int) * Max(c->nclause, 1));
+	c->srcmembers = (double *) palloc0(sizeof(double) * Max(c->nclause, 1));
+	c->srccontainers = (double *) palloc0(sizeof(double) *
+										  Max(c->nclause, 1));
+	c->srcunion = (bool *) palloc0(sizeof(bool) * Max(c->nclause, 1));
+	c->srcsets = (double *) palloc0(sizeof(double) * Max(c->nclause, 1));
+	c->srcnsets = (double *) palloc0(sizeof(double) * Max(c->nclause, 1));
+	c->srcsetcont = (double *) palloc0(sizeof(double) * Max(c->nclause, 1));
+	c->srcsetpages = (double *) palloc0(sizeof(double) *
+										Max(c->nclause, 1));
+	c->srcprobes = (double *) palloc0(sizeof(double) *
+									  (Max(c->nclause, 1) + 2));
+	c->orgrp = lion_or_group_map(c->ors, c->nclause);
+}
+
+/*
+ * A range taken as a source (DESIGN.md §32), priced at the first of its
+ * bounds and added to the sources of the AND.  c->ci is the clause's
+ * position, and is left past it.
+ */
+static void
+lion_count_rel_range_source(LionCountRelCost *c, IndexOptInfo *idx,
+							AttrNumber col)
+{
+	LionSetClause *sc = &c->clauseset[c->ci];
+	Selectivity sel;
+	List	   *bounds = NIL;
+	double		clc;
+	int			j;
+
+	if (c->rangelead[c->ci] != c->ci)
+	{
+		c->ci++;
+		return;
+	}
+	for (j = c->ci; j < c->nclause; j++)
+		if (c->rangelead[j] == c->ci)
+			bounds = lappend(bounds, list_nth(c->whereclauses, j));
+	sel = lion_rel_clauses_selectivity(c->root, c->rel, bounds);
+	c->clausesel[c->ci++] = sel;
+
+	c->rangesrc_cost += lion_cost_range_source(c->root, c->rel, idx, col,
+											   bounds, sel,
+											   Max(c->ingroups, 1.0),
+											   c->orgrp[c->ci - 1] >= 0);
+	list_free(bounds);
+	sc->nkeys = 1.0;
+	sc->leaves = 1.0;
+	sc->idxpages = Max((double) idx->pages, 1.0);
+
+	/*
+	 * As one set of the AND, it drives the merge or is probed at the
+	 * driver's keys (lion_merge_cpu_cost()); as an OR's leaf, its
+	 * containers are all read into the union.
+	 */
+	clc = lion_key_containers(c->root, c->rel, idx, col, c->tuples * sel);
+	if (c->orgrp[c->ci - 1] >= 0)
+	{
+		Cost		readleaf = clc * (LION_CONTAINER_COST + LION_MEMBER_COST *
+									  Min(c->tuples * sel / clc,
+										  LION_MEMBER_CAP));
+
+		c->read_cpu += readleaf;
+		c->union_read += readleaf;
+	}
+	c->clausesrc[c->ci - 1] = (c->orgrp[c->ci - 1] >= 0) ?
+		c->orgrp[c->ci - 1] : c->nsrc++;
+	c->srcmembers[c->clausesrc[c->ci - 1]] += c->tuples * sel;
+	c->srccontainers[c->clausesrc[c->ci - 1]] += clc;
+	c->srcsets[c->clausesrc[c->ci - 1]] += 1.0;
+	c->srcnsets[c->clausesrc[c->ci - 1]] += 1.0;
+	c->srcsetcont[c->clausesrc[c->ci - 1]] += clc;
+	if (c->orgrp[c->ci - 1] >= 0)
+		c->srcunion[c->clausesrc[c->ci - 1]] = true;
+}
+
+/*
+ * A WHERE clause's sets (lion_cost_set_clause()): their lookups charged, and
+ * the clause added to the source of the AND it is part of.  c->ci is the
+ * clause's position, and is left past it.
+ */
+static void
+lion_count_rel_set_clause(LionCountRelCost *c, IndexOptInfo *idx,
+						  AttrNumber col, Node *clause)
+{
+	LionSetClause *sc = &c->clauseset[c->ci];
+	Selectivity sel;
+	double		nkeys;
+
+	/*
+	 * The clause's sets, priced as every AND of them is priced
+	 * (lion_cost_set_clause()): its lookups - a directory leaf and a
+	 * descent, or an IN list's leaves in key order and a search per value
+	 * - are charged here, and what a walk of them reads once the driver
+	 * is known, below.
+	 */
+	lion_cost_set_clause(c->root, c->rel, idx, col, clause, sc);
+	sel = sc->sel;
+	nkeys = sc->nkeys;
+	c->clauseindex[c->ci] = idx;
+	c->clausesel[c->ci++] = sel;
+	c->lookup_cost += sc->lookup;
+	c->descent_cost += sc->descent;
+
+	/*
+	 * A single set ANDed with the others is read only where it drives the
+	 * merge, and PROBED at the driver's container keys elsewhere
+	 * (DESIGN.md §22), which lion_merge_cpu_cost() prices below.  The
+	 * containers of an OR leaf and of an IN list's sets are all READ: a
+	 * union is built of them (§15, §19) or they are summed.  A list that
+	 * drives the groups is read one entry a group, below.
+	 */
+	if (!(c->groupdrive && c->ci - 1 == c->inlistci) &&
+		(c->orgrp[c->ci - 1] >= 0 || nkeys > 1.0))
+	{
+		c->read_cpu += sc->readall;
+		c->union_read += sc->readall;
+	}
+
+	/*
+	 * Which source of the AND this clause belongs to: the union of its OR
+	 * restriction, or one of its own.  A list that drives the groups is
+	 * not a source at all - each group IS one of its entries - so it
+	 * neither drives the leapfrog nor is sought by it.
+	 */
+	if (c->groupdrive && c->ci - 1 == c->inlistci)
+		c->clausesrc[c->ci - 1] = -1;
+	else
+	{
+		c->clausesrc[c->ci - 1] = (c->orgrp[c->ci - 1] >= 0) ?
+			c->orgrp[c->ci - 1] : c->nsrc++;
+		c->srcmembers[c->clausesrc[c->ci - 1]] += sc->members;
+		c->srccontainers[c->clausesrc[c->ci - 1]] += sc->containers;
+		c->srcsets[c->clausesrc[c->ci - 1]] += nkeys;
+		c->srcnsets[c->clausesrc[c->ci - 1]] += sc->nsets;
+		c->srcsetcont[c->clausesrc[c->ci - 1]] += sc->setcontainers;
+		c->srcsetpages[c->clausesrc[c->ci - 1]] += sc->pages;
+		if (c->orgrp[c->ci - 1] >= 0 || nkeys > 1.0)
+			c->srcunion[c->clausesrc[c->ci - 1]] = true;
+	}
+
+	/*
+	 * Does the merge build this clause's union?  ... unless there is no
+	 * union to build.  A list that drives the groups is not a source at
+	 * all, and a list that is the only positive source is SUMMED instead
+	 * - its entries counted one at a time and added up (the disjoint-sum
+	 * short-circuit, DESIGN.md §15), which leaves the per-element lookup
+	 * and container work priced above and nothing for a merge that does
+	 * not happen: what lets a thousand-value list on a high-cardinality
+	 * column be chosen, 1.5 ms against the B-tree's 4.5 at one million
+	 * rows.  But only while the sum is the cheaper of the two, which is
+	 * lion_sum_is_cheaper() in the executor and the same test from
+	 * estimates here: dense entries, enough of them for the merge's
+	 * bitset image, and the merge runs after all.
+	 */
+	if (nkeys > 1.0)
+	{
+		double		ckeys = Max(c->heap_pages / LION_BLOCKS_PER_CONTAINER,
+								1.0);
+		bool		merged = true;
+
+		if (c->ci - 1 == c->inlistci)
+			merged = (!c->groupdrive &&
+					  nkeys >= (double) LION_OR_BITSET_MIN &&
+					  (c->tuples * sel / nkeys) / ckeys >
+					  (double) LION_SUM_MAX_DENSITY);
+
+		if (merged)
+		{
+			c->merge_ops += sc->unionops;
+			c->union_ops += sc->unionops;
+		}
+	}
+
+	/*
+	 * A list that drives the groups is not a source: each group is one of
+	 * its entries, and the rest of the list has nothing to say about that
+	 * group's rows.  So it is not intersected with anything, and the
+	 * per-group work below is over the listed values rather than over
+	 * every entry of the index.
+	 */
+	if (c->groupdrive && c->ci - 1 == c->inlistci)
+	{
+		c->ingroups = Min(nkeys, c->ingroups);
+		c->listrows = c->tuples * sel / nkeys;
+	}
+}
+
+/*
+ * Number the sources of the AND, and price the WHERE clauses' lookups clause
+ * by clause.
+ */
+static void
+lion_count_rel_clauses(LionCountRelCost *c)
+{
 	ListCell   *lc1;
 	ListCell   *lc2;
 	ListCell   *lc3;
 	ListCell   *lc4;
-
-	/*
-	 * A sum over a range (DESIGN.md §28) prices its walk, its entries and its
-	 * heap recheck itself (lion_cost_range_sum()); what is left here is the
-	 * WHERE sources, located once and read once - materialized after their
-	 * first use - and the one row.
-	 */
-	if (rangesum)
-	{
-		rangecost = lion_cost_range_sum(root, rel, groupidx, groupcol,
-										rangevar, drivefrac, whereclauses,
-										wherekinds, ors, NULL);
-		ingroups = 1.0;
-	}
-
-	/*
-	 * A count(DISTINCT k) without a GROUP BY walks k's entries, and a WHERE
-	 * equality on k itself drives that walk as a list of one would (DESIGN.md
-	 * §26).
-	 */
-	inlistci = lion_inlist_shape(groupidx, groupcol, groupidx2,
-								whereidx, wherecol, whereclauses,
-								wherekinds, ors,
-								distinct != LION_DISTINCT_NONE && groupidx2 == NULL,
-								&sumshort, &groupdrive);
-
-	clausesel = (double *) palloc0(sizeof(double) * Max(nclause, 1));
-	clauseset = (LionSetClause *) palloc0(sizeof(LionSetClause) *
-										  Max(nclause, 1));
-	clauseindex = (IndexOptInfo **) palloc0(sizeof(IndexOptInfo *) *
-											Max(nclause, 1));
-	clausesrc = (int *) palloc0(sizeof(int) * Max(nclause, 1));
-	srcmembers = (double *) palloc0(sizeof(double) * Max(nclause, 1));
-	srccontainers = (double *) palloc0(sizeof(double) * Max(nclause, 1));
-	srcunion = (bool *) palloc0(sizeof(bool) * Max(nclause, 1));
-	srcsets = (double *) palloc0(sizeof(double) * Max(nclause, 1));
-	srcnsets = (double *) palloc0(sizeof(double) * Max(nclause, 1));
-	srcsetcont = (double *) palloc0(sizeof(double) * Max(nclause, 1));
-	srcsetpages = (double *) palloc0(sizeof(double) * Max(nclause, 1));
-	srcprobes = (double *) palloc0(sizeof(double) * (Max(nclause, 1) + 2));
-	orgrp = lion_or_group_map(ors, nclause);
 
 	/*
 	 * The sources of the AND: one per OR restriction (a union is one source,
@@ -2165,19 +2355,18 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * drives the leapfrog join decides what the others read, so they are
 	 * numbered here and the page terms are charged once the driver is known.
 	 */
-	nsrc = list_length(ors);
-	for (ci = 0; ci < nclause; ci++)
-		clausesrc[ci] = -1;
-	ci = 0;
-	rangelead = lion_rangesrc_leaders(whereidx, wherecol, wherekinds, ors,
-									  nclause);
+	c->nsrc = list_length(c->ors);
+	for (c->ci = 0; c->ci < c->nclause; c->ci++)
+		c->clausesrc[c->ci] = -1;
+	c->ci = 0;
+	c->rangelead = lion_rangesrc_leaders(c->whereidx, c->wherecol,
+										 c->wherekinds, c->ors, c->nclause);
 
-	forfour(lc1, whereidx, lc2, whereclauses, lc3, wherekinds, lc4, wherecol)
+	forfour(lc1, c->whereidx, lc2, c->whereclauses, lc3, c->wherekinds,
+			lc4, c->wherecol)
 	{
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
 		Node	   *clause = (Node *) lfirst(lc2);
-		LionSetClause *sc = &clauseset[ci];
-		Selectivity sel;
 		double		nkeys;
 
 		if (!LION_CLAUSE_IS_POSITIVE(lfirst_int(lc3)))
@@ -2186,7 +2375,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 			 * `IS NOT NULL` selects no rows of its own; it has been left out
 			 * of this estimate since before partitions existed.
 			 */
-			ci++;
+			c->ci++;
 			continue;
 		}
 
@@ -2206,11 +2395,11 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		 * other lexemes' or elements' sets.  An OR's leaf is a literal
 		 * (lion_analyze_leaf()) and is never one.
 		 */
-		if (lfirst_int(lc3) == LION_CLAUSE_MULTI && orgrp[ci] < 0 &&
+		if (lfirst_int(lc3) == LION_CLAUSE_MULTI && c->orgrp[c->ci] < 0 &&
 			lion_multikey_cost_mode(idx, (AttrNumber) lfirst_int(lc4), clause,
 									&nkeys) == LION_QMODE_ALL)
 		{
-			ci++;
+			c->ci++;
 			continue;
 		}
 
@@ -2222,154 +2411,24 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		 */
 		if (lfirst_int(lc3) == LION_CLAUSE_RANGESRC)
 		{
-			List	   *bounds = NIL;
-			double		clc;
-			int			j;
-
-			if (rangelead[ci] != ci)
-			{
-				ci++;
-				continue;
-			}
-			for (j = ci; j < nclause; j++)
-				if (rangelead[j] == ci)
-					bounds = lappend(bounds, list_nth(whereclauses, j));
-			sel = lion_rel_clauses_selectivity(root, rel, bounds);
-			clausesel[ci++] = sel;
-
-			rangesrc_cost += lion_cost_range_source(root, rel, idx,
-													(AttrNumber) lfirst_int(lc4),
-													bounds, sel,
-													Max(ingroups, 1.0),
-													orgrp[ci - 1] >= 0);
-			list_free(bounds);
-			sc->nkeys = 1.0;
-			sc->leaves = 1.0;
-			sc->idxpages = Max((double) idx->pages, 1.0);
-
-			/*
-			 * As one set of the AND, it drives the merge or is probed at the
-			 * driver's keys (lion_merge_cpu_cost()); as an OR's leaf, its
-			 * containers are all read into the union.
-			 */
-			clc = lion_key_containers(root, rel, idx,
-									  (AttrNumber) lfirst_int(lc4), tuples * sel);
-			if (orgrp[ci - 1] >= 0)
-			{
-				Cost		readleaf = clc * (LION_CONTAINER_COST + LION_MEMBER_COST *
-											  Min(tuples * sel / clc, LION_MEMBER_CAP));
-
-				read_cpu += readleaf;
-				union_read += readleaf;
-			}
-			clausesrc[ci - 1] = (orgrp[ci - 1] >= 0) ? orgrp[ci - 1] : nsrc++;
-			srcmembers[clausesrc[ci - 1]] += tuples * sel;
-			srccontainers[clausesrc[ci - 1]] += clc;
-			srcsets[clausesrc[ci - 1]] += 1.0;
-			srcnsets[clausesrc[ci - 1]] += 1.0;
-			srcsetcont[clausesrc[ci - 1]] += clc;
-			if (orgrp[ci - 1] >= 0)
-				srcunion[clausesrc[ci - 1]] = true;
+			lion_count_rel_range_source(c, idx, (AttrNumber) lfirst_int(lc4));
 			continue;
 		}
 
-		/*
-		 * The clause's sets, priced as every AND of them is priced
-		 * (lion_cost_set_clause()): its lookups - a directory leaf and a
-		 * descent, or an IN list's leaves in key order and a search per value
-		 * - are charged here, and what a walk of them reads once the driver
-		 * is known, below.
-		 */
-		lion_cost_set_clause(root, rel, idx, (AttrNumber) lfirst_int(lc4),
-							 clause, sc);
-		sel = sc->sel;
-		nkeys = sc->nkeys;
-		clauseindex[ci] = idx;
-		clausesel[ci++] = sel;
-		lookup_cost += sc->lookup;
-		descent_cost += sc->descent;
-
-		/*
-		 * A single set ANDed with the others is read only where it drives the
-		 * merge, and PROBED at the driver's container keys elsewhere
-		 * (DESIGN.md §22), which lion_merge_cpu_cost() prices below.  The
-		 * containers of an OR leaf and of an IN list's sets are all READ: a
-		 * union is built of them (§15, §19) or they are summed.  A list that
-		 * drives the groups is read one entry a group, below.
-		 */
-		if (!(groupdrive && ci - 1 == inlistci) &&
-			(orgrp[ci - 1] >= 0 || nkeys > 1.0))
-		{
-			read_cpu += sc->readall;
-			union_read += sc->readall;
-		}
-
-		/*
-		 * Which source of the AND this clause belongs to: the union of its OR
-		 * restriction, or one of its own.  A list that drives the groups is
-		 * not a source at all - each group IS one of its entries - so it
-		 * neither drives the leapfrog nor is sought by it.
-		 */
-		if (groupdrive && ci - 1 == inlistci)
-			clausesrc[ci - 1] = -1;
-		else
-		{
-			clausesrc[ci - 1] = (orgrp[ci - 1] >= 0) ? orgrp[ci - 1] : nsrc++;
-			srcmembers[clausesrc[ci - 1]] += sc->members;
-			srccontainers[clausesrc[ci - 1]] += sc->containers;
-			srcsets[clausesrc[ci - 1]] += nkeys;
-			srcnsets[clausesrc[ci - 1]] += sc->nsets;
-			srcsetcont[clausesrc[ci - 1]] += sc->setcontainers;
-			srcsetpages[clausesrc[ci - 1]] += sc->pages;
-			if (orgrp[ci - 1] >= 0 || nkeys > 1.0)
-				srcunion[clausesrc[ci - 1]] = true;
-		}
-
-		/*
-		 * Does the merge build this clause's union?  ... unless there is no
-		 * union to build.  A list that drives the groups is not a source at
-		 * all, and a list that is the only positive source is SUMMED instead
-		 * - its entries counted one at a time and added up (the disjoint-sum
-		 * short-circuit, DESIGN.md §15), which leaves the per-element lookup
-		 * and container work priced above and nothing for a merge that does
-		 * not happen: what lets a thousand-value list on a high-cardinality
-		 * column be chosen, 1.5 ms against the B-tree's 4.5 at one million
-		 * rows.  But only while the sum is the cheaper of the two, which is
-		 * lion_sum_is_cheaper() in the executor and the same test from
-		 * estimates here: dense entries, enough of them for the merge's
-		 * bitset image, and the merge runs after all.
-		 */
-		if (nkeys > 1.0)
-		{
-			double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
-			bool		merged = true;
-
-			if (ci - 1 == inlistci)
-				merged = (!groupdrive &&
-						  nkeys >= (double) LION_OR_BITSET_MIN &&
-						  (tuples * sel / nkeys) / ckeys >
-						  (double) LION_SUM_MAX_DENSITY);
-
-			if (merged)
-			{
-				merge_ops += sc->unionops;
-				union_ops += sc->unionops;
-			}
-		}
-
-		/*
-		 * A list that drives the groups is not a source: each group is one of
-		 * its entries, and the rest of the list has nothing to say about that
-		 * group's rows.  So it is not intersected with anything, and the
-		 * per-group work below is over the listed values rather than over
-		 * every entry of the index.
-		 */
-		if (groupdrive && ci - 1 == inlistci)
-		{
-			ingroups = Min(nkeys, ingroups);
-			listrows = tuples * sel / nkeys;
-		}
+		lion_count_rel_set_clause(c, idx, (AttrNumber) lfirst_int(lc4),
+								  clause);
 	}
+}
+
+/*
+ * The merge each OR across columns makes of its arms' sets (DESIGN.md §19);
+ * frees the per-clause arrays no later phase reads.
+ */
+static void
+lion_count_rel_or_unions(LionCountRelCost *c)
+{
+	ListCell   *lc1;
+	int			i;
 
 	/*
 	 * An OR across columns (DESIGN.md §19) is the union of its arms, and a
@@ -2379,7 +2438,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * one per leaf, exactly as if they had been separate clauses; the term
 	 * here is the merge they take part in and nothing else.
 	 */
-	foreach(lc1, ors)
+	foreach(lc1, c->ors)
 	{
 		List	   *one = (List *) lfirst(lc1);
 		int			first = linitial_int(one);
@@ -2389,20 +2448,27 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 
 		for (i = 0; i < narms; i++)
 			nleaves += list_nth_int(one, 2 + i);
-		for (i = first; i < first + nleaves && i < nclause; i++)
-			members += tuples * clausesel[i];
+		for (i = first; i < first + nleaves && i < c->nclause; i++)
+			members += c->tuples * c->clausesel[i];
 
 		if (nleaves > 1)
 		{
-			merge_ops += members * log2((double) nleaves);
-			union_ops += members * log2((double) nleaves);
+			c->merge_ops += members * log2((double) nleaves);
+			c->union_ops += members * log2((double) nleaves);
 		}
 	}
-	pfree(clausesel);
-	pfree(orgrp);
-	pfree(rangelead);
+	pfree(c->clausesel);
+	pfree(c->orgrp);
+	pfree(c->rangelead);
+}
 
-
+/*
+ * The source that drives the leapfrog - the one with the fewest members - and
+ * each source's containers bounded by the heap's container keys.
+ */
+static void
+lion_count_rel_driver(LionCountRelCost *c)
+{
 	/*
 	 * WHAT THE SOURCES READ (DESIGN.md §22).  The same leapfrog decides it: the
 	 * DRIVER - the source with the fewest members - is the only one walked end
@@ -2439,19 +2505,268 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * the others is its CONTAINER KEYS, of which there are no more than the
 	 * heap has.
 	 */
-	if (nsrc > 0)
+	if (c->nsrc > 0)
 	{
-		double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
+		double		ckeys = Max(c->heap_pages / LION_BLOCKS_PER_CONTAINER,
+								1.0);
 		int			s;
 
-		for (s = 0; s < nsrc; s++)
+		for (s = 0; s < c->nsrc; s++)
 		{
-			if (driver < 0 || srcmembers[s] < srcmembers[driver])
-				driver = s;
-			srccontainers[s] = Min(srccontainers[s], ckeys);
+			if (c->driver < 0 || c->srcmembers[s] < c->srcmembers[c->driver])
+				c->driver = s;
+			c->srccontainers[s] = Min(c->srccontainers[s], ckeys);
 		}
 	}
+}
 
+/*
+ * The groups of a walk counted together against the WHERE collected once
+ * (DESIGN.md §10), and what a range of a parallel walk pays again of it.
+ */
+static void
+lion_count_rel_where_once(LionCountRelCost *c, double *mem, double *keys,
+						  double gm)
+{
+	/*
+	 * THE GROUPS OF THE WALK, COUNTED TOGETHER (DESIGN.md §10).
+	 * The WHERE is collected once - a merge of its sources as an
+	 * ungrouped count makes it, and a container of the copy
+	 * written at each key it keeps - and the groups are counted
+	 * against the copy in batches of LION_GROUP_BATCH_MAX, one
+	 * walk of container keys a batch (lion_count_groups_copy()):
+	 * each group's container at a key the copy has is read and
+	 * its members tested against the copy's, made a bitset image
+	 * once a batch, and a batch's cursors stand on a heap, a sift
+	 * of log2(batch) a container.  A group is walked only as far
+	 * as the copy's keys reach, which is all of them where the
+	 * WHERE is dense.  The unions of the WHERE are built once, in
+	 * the collection.  Priced as each group's merge with the
+	 * WHERE's sets probed in memory, the synthetic repro's GROUP BY
+	 * of 150 groups under four filters cost 217,000 for 68 ms; it
+	 * now costs about the 500 units a millisecond of §10's
+	 * reference.
+	 */
+	double		wkeys = lion_containers_for(c->heap_pages, c->matching);
+	double		batch = Min(c->walked, (double) LION_GROUP_BATCH_MAX);
+	double		visits;
+	double		collect;
+	double		per;
+	int			s;
+
+	for (s = 0; s < c->nsrc; s++)
+		wkeys = Min(wkeys, keys[s]);
+	wkeys = Max(wkeys, 1.0);
+	visits = Min(keys[c->nsrc], wkeys);
+
+	collect = lion_merge_cpu_cost(c->nsrc, mem, keys, NULL, c->tuples,
+								  lion_probe_rel_factor(c->root, c->rel),
+								  c->srcprobes) +
+		wkeys * LION_FKJOIN_COPY_CONTAINER_COST;
+	per = visits * (LION_CONTAINER_COST +
+					LION_MEMBER_COST *
+					Min(gm / Max(keys[c->nsrc], 1.0), LION_MEMBER_CAP) +
+					log2(Max(batch, 2.0)) * cpu_operator_cost);
+	c->merge_cpu = collect + c->walked * per +
+		ceil(c->walked / batch) * wkeys *
+		(LION_CONTAINER_COST + LION_MEMBER_COST *
+		 Min(c->matching / wkeys, LION_MEMBER_CAP));
+	c->whereonce = true;
+
+	/* ... and what a range of a parallel one pays again of it */
+	if (c->rc != NULL)
+	{
+		c->rc->batched = true;
+		c->rc->perrange = c->walked * (LION_ENTRY_COUNT_COST +
+									   LION_PROBE_COST +
+									   LION_RANGE_DESCENT_PAGES *
+									   seq_page_cost) +
+			c->nsrc * (LION_PROBE_COST +
+					   LION_RANGE_DESCENT_PAGES * seq_page_cost);
+	}
+}
+
+/*
+ * The merges of a count over one GROUP BY column, one a group - or the WHERE
+ * collected once and the groups counted against it - and each count's own
+ * set-up.
+ */
+static void
+lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
+						  bool *inmem, double gm, double unionsets)
+{
+	double		per;
+	double		share = 1.0;
+	int			s;
+
+	/*
+	 * The count(DISTINCT k) walk over k's entries (DESIGN.md §26)
+	 * tests each entry for ONE visible row and stops there, so it
+	 * reads the share of each entry's intersection
+	 * lion_exists_fraction() expects - one container or two when the
+	 * entries are dense, all of it when the WHERE leaves most of them
+	 * empty - and rechecks that share of the candidates.
+	 */
+	if (c->distinct == LION_DISTINCT_EXISTS)
+	{
+		double		drvkeys = keys[c->nsrc];
+
+		/* the test walks the merge's driver: the smallest source */
+		for (s = 0; s < c->nsrc; s++)
+			if (mem[s] < mem[c->nsrc])
+				drvkeys = Min(drvkeys, keys[s]);
+		share = lion_exists_fraction(drvkeys, c->matching / c->walked);
+		c->recheckshare = share;
+	}
+	if (c->distinct == LION_DISTINCT_NONE && !c->groupdrive &&
+		c->walked >= 2.0 &&
+		lion_cost_where_collected(c->nsrc, c->srcmembers, c->srccontainers,
+								  c->srcunion))
+	{
+		lion_count_rel_where_once(c, mem, keys, gm);
+	}
+	else
+	{
+		per = lion_merge_cpu_cost(c->nsrc + 1, mem, keys, inmem, c->tuples,
+								  1.0, c->srcprobes) +
+			unionsets * LION_UNION_SET_COST;
+		c->merge_cpu = c->walked * per * share;
+	}
+
+	/*
+	 * ... and each count's own set-up and tear-down (a memory context,
+	 * the sources' cursors, the visibility-map state): a distinct
+	 * walk's test prices it (LION_DISTINCT_TEST_COST, below), a range's
+	 * walk its entry (LION_RANGE_ENTRY_COST).
+	 */
+	if (c->distinct == LION_DISTINCT_NONE && c->rangevar == NULL)
+		c->merge_cpu += c->walked * (c->groupdrive ? LION_LIST_GROUP_COST :
+									 LION_ENTRY_COUNT_COST);
+}
+
+/*
+ * The merges of a count over two GROUP BY columns (DESIGN.md §20): one for
+ * each (outer, inner) pair of their entries.
+ */
+static void
+lion_count_rel_two_columns(LionCountRelCost *c, double *mem, double *keys,
+						   bool *inmem, double unionsets)
+{
+	/*
+	 * A second GROUP BY column (DESIGN.md §20): every (outer, inner)
+	 * PAIR of the two indexes' entries is a count of its own, the
+	 * two groups' sets and the WHERE's merged, whether or not the
+	 * intersection comes out empty.  Two groups whose rows are
+	 * scattered over the whole heap have a container at nearly every
+	 * container key, which is what makes a pair expensive even when
+	 * their intersection is empty.
+	 */
+	double		oe = Max(c->outer_entries, 1.0);
+	double		ie = Max(c->inner_entries, 1.0);
+	double		per;
+
+	mem[c->nsrc] = c->tuples / oe;
+	keys[c->nsrc] = lion_key_containers(c->root, c->rel, c->groupidx,
+										c->groupcol, c->tuples / oe);
+	mem[c->nsrc + 1] = c->tuples / ie;
+	keys[c->nsrc + 1] = lion_key_containers(c->root, c->rel, c->groupidx2,
+											c->groupcol2, c->tuples / ie);
+	/*
+	 * The early exit of a count(DISTINCT k)'s pair test is NOT
+	 * discounted: a pair's time is its lookup and its merge's set-up
+	 * far more than its members.  Discounted, 200 x 50 pairs over 100k
+	 * rows were chosen at 10,566 for 45 ms against the sorting
+	 * aggregate's 10,694 for 27.
+	 */
+	per = lion_merge_cpu_cost(c->nsrc + 2, mem, keys, inmem, c->tuples,
+							  1.0, c->srcprobes) +
+		unionsets * LION_UNION_SET_COST;
+	c->walked = oe * ie;
+	c->merge_cpu = c->walked * per;
+}
+
+/*
+ * The merges of a grouped count: each group's own set located from the index,
+ * and the WHERE's sources probed in memory by the counts.
+ */
+static void
+lion_count_rel_group_merge(LionCountRelCost *c)
+{
+	double	   *mem = (double *) palloc(sizeof(double) * (c->nsrc + 2));
+	double	   *keys = (double *) palloc(sizeof(double) * (c->nsrc + 2));
+	bool	   *inmem = (bool *) palloc0(sizeof(bool) * (c->nsrc + 2));
+	double		unionsets = 0;
+	double		gnd = -1.0;
+	double		gm;
+	int			s;
+
+	/*
+	 * The WHERE's sets are copied into memory on their second use and
+	 * probed there by every group after that (DESIGN.md §9); a group's
+	 * own set is located from the index for its one count.
+	 */
+	for (s = 0; s < c->nsrc; s++)
+	{
+		mem[s] = c->srcmembers[s];
+		keys[s] = c->srccontainers[s];
+		inmem[s] = true;
+	}
+
+	/* the rows of one group's own set, and how many groups are counted */
+	if (c->groupdrive)
+	{
+		gm = Max(c->listrows, 1.0);
+		c->walked = Max(c->ingroups, 1.0);
+	}
+	else
+	{
+		if (c->groupcol >= 1 && c->groupcol <= c->groupidx->nkeycolumns &&
+			c->rel->relid > 0 &&
+			c->rel->relid < (Index) c->root->simple_rel_array_size &&
+			c->root->simple_rte_array[c->rel->relid] != NULL &&
+			c->root->simple_rte_array[c->rel->relid]->rtekind == RTE_RELATION)
+			gnd = lion_index_column_nd(c->root, c->rel, c->groupidx,
+									   c->groupcol - 1);
+		if (gnd > 0.0)
+		{
+			gm = c->tuples / gnd;
+			c->walked = Max(gnd * c->drivefrac, 1.0);
+		}
+		else
+		{
+			gm = c->tuples / Max(c->numgroups, 1.0);
+			c->walked = Max(c->ingroups, 1.0);
+		}
+	}
+	mem[c->nsrc] = gm;
+	keys[c->nsrc] = lion_key_containers(c->root, c->rel, c->groupidx,
+										c->groupcol, gm);
+
+	/*
+	 * A WHERE source that is a union - an IN list, an OR - is built again
+	 * by every count, each of its sets' cursors set up and positioned
+	 * over the copy in memory (LION_UNION_SET_COST a set).
+	 */
+	for (s = 0; s < c->nsrc; s++)
+		if (c->srcunion[s])
+			unionsets += c->srcsets[s];
+
+	if (c->groupidx2 == NULL)
+		lion_count_rel_one_column(c, mem, keys, inmem, gm, unionsets);
+	else
+		lion_count_rel_two_columns(c, mem, keys, inmem, unionsets);
+	pfree(mem);
+	pfree(keys);
+	pfree(inmem);
+}
+
+/*
+ * The CPU of the merges: an ungrouped count's one merge of the AND's sources,
+ * or a grouped count's (lion_count_rel_group_merge()).
+ */
+static void
+lion_count_rel_merge(LionCountRelCost *c)
+{
 	/*
 	 * THE MERGE (DESIGN.md §10, "The units"; §22).  An ungrouped count is one
 	 * merge of the AND's sources, driven by the smallest and the others sought
@@ -2469,8 +2784,8 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * 1,091 ms, where the sequential aggregate is 142,000 for 905.
 	 * A summed range prices its entries' merges itself (lion_cost_range_sum()).
 	 */
-	if (groupidx == NULL && !rangesum && nsrc > 0 &&
-		(nsrc > 1 || !srcunion[0]))
+	if (c->groupidx == NULL && !c->rangesum && c->nsrc > 0 &&
+		(c->nsrc > 1 || !c->srcunion[0]))
 	{
 		/*
 		 * The unions among the sources - IN lists, `&&`, ORs across columns -
@@ -2480,210 +2795,29 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		 * place of reading every container of their sets and a k-way merge of
 		 * them all.
 		 */
-		merge_cpu = lion_merge_cpu_cost_sets(nsrc, srcmembers, srccontainers,
-											 srcnsets, srcsetcont, srcsetpages,
-											 NULL, tuples,
-											 lion_probe_rel_factor(root, rel),
-											 srcprobes);
-		read_cpu -= union_read;
-		merge_ops -= union_ops;
+		c->merge_cpu = lion_merge_cpu_cost_sets(c->nsrc, c->srcmembers,
+												c->srccontainers, c->srcnsets,
+												c->srcsetcont, c->srcsetpages,
+												NULL, c->tuples,
+												lion_probe_rel_factor(c->root,
+																	  c->rel),
+												c->srcprobes);
+		c->read_cpu -= c->union_read;
+		c->merge_ops -= c->union_ops;
 	}
-	else if (groupidx != NULL && !rangesum)
-	{
-		double	   *mem = (double *) palloc(sizeof(double) * (nsrc + 2));
-		double	   *keys = (double *) palloc(sizeof(double) * (nsrc + 2));
-		bool	   *inmem = (bool *) palloc0(sizeof(bool) * (nsrc + 2));
-		double		unionsets = 0;
-		double		gnd = -1.0;
-		double		gm;
-		double		per;
-		double		share = 1.0;
-		int			s;
+	else if (c->groupidx != NULL && !c->rangesum)
+		lion_count_rel_group_merge(c);
+}
 
-		/*
-		 * The WHERE's sets are copied into memory on their second use and
-		 * probed there by every group after that (DESIGN.md §9); a group's
-		 * own set is located from the index for its one count.
-		 */
-		for (s = 0; s < nsrc; s++)
-		{
-			mem[s] = srcmembers[s];
-			keys[s] = srccontainers[s];
-			inmem[s] = true;
-		}
-
-		/* the rows of one group's own set, and how many groups are counted */
-		if (groupdrive)
-		{
-			gm = Max(listrows, 1.0);
-			walked = Max(ingroups, 1.0);
-		}
-		else
-		{
-			if (groupcol >= 1 && groupcol <= groupidx->nkeycolumns &&
-				rel->relid > 0 && rel->relid < (Index) root->simple_rel_array_size &&
-				root->simple_rte_array[rel->relid] != NULL &&
-				root->simple_rte_array[rel->relid]->rtekind == RTE_RELATION)
-				gnd = lion_index_column_nd(root, rel, groupidx, groupcol - 1);
-			if (gnd > 0.0)
-			{
-				gm = tuples / gnd;
-				walked = Max(gnd * drivefrac, 1.0);
-			}
-			else
-			{
-				gm = tuples / Max(numgroups, 1.0);
-				walked = Max(ingroups, 1.0);
-			}
-		}
-		mem[nsrc] = gm;
-		keys[nsrc] = lion_key_containers(root, rel, groupidx, groupcol, gm);
-
-		/*
-		 * A WHERE source that is a union - an IN list, an OR - is built again
-		 * by every count, each of its sets' cursors set up and positioned
-		 * over the copy in memory (LION_UNION_SET_COST a set).
-		 */
-		for (s = 0; s < nsrc; s++)
-			if (srcunion[s])
-				unionsets += srcsets[s];
-
-		if (groupidx2 == NULL)
-		{
-			/*
-			 * The count(DISTINCT k) walk over k's entries (DESIGN.md §26)
-			 * tests each entry for ONE visible row and stops there, so it
-			 * reads the share of each entry's intersection
-			 * lion_exists_fraction() expects - one container or two when the
-			 * entries are dense, all of it when the WHERE leaves most of them
-			 * empty - and rechecks that share of the candidates.
-			 */
-			if (distinct == LION_DISTINCT_EXISTS)
-			{
-				double		drvkeys = keys[nsrc];
-
-				/* the test walks the merge's driver: the smallest source */
-				for (s = 0; s < nsrc; s++)
-					if (mem[s] < mem[nsrc])
-						drvkeys = Min(drvkeys, keys[s]);
-				share = lion_exists_fraction(drvkeys, matching / walked);
-				recheckshare = share;
-			}
-			if (distinct == LION_DISTINCT_NONE && !groupdrive &&
-				walked >= 2.0 &&
-				lion_cost_where_collected(nsrc, srcmembers, srccontainers,
-										  srcunion))
-			{
-				/*
-				 * THE GROUPS OF THE WALK, COUNTED TOGETHER (DESIGN.md §10).
-				 * The WHERE is collected once - a merge of its sources as an
-				 * ungrouped count makes it, and a container of the copy
-				 * written at each key it keeps - and the groups are counted
-				 * against the copy in batches of LION_GROUP_BATCH_MAX, one
-				 * walk of container keys a batch (lion_count_groups_copy()):
-				 * each group's container at a key the copy has is read and
-				 * its members tested against the copy's, made a bitset image
-				 * once a batch, and a batch's cursors stand on a heap, a sift
-				 * of log2(batch) a container.  A group is walked only as far
-				 * as the copy's keys reach, which is all of them where the
-				 * WHERE is dense.  The unions of the WHERE are built once, in
-				 * the collection.  Priced as each group's merge with the
-				 * WHERE's sets probed in memory, the synthetic repro's GROUP BY
-				 * of 150 groups under four filters cost 217,000 for 68 ms; it
-				 * now costs about the 500 units a millisecond of §10's
-				 * reference.
-				 */
-				double		wkeys = lion_containers_for(heap_pages, matching);
-				double		batch = Min(walked, (double) LION_GROUP_BATCH_MAX);
-				double		visits;
-				double		collect;
-
-				for (s = 0; s < nsrc; s++)
-					wkeys = Min(wkeys, keys[s]);
-				wkeys = Max(wkeys, 1.0);
-				visits = Min(keys[nsrc], wkeys);
-
-				collect = lion_merge_cpu_cost(nsrc, mem, keys, NULL, tuples,
-											  lion_probe_rel_factor(root, rel),
-											  srcprobes) +
-					wkeys * LION_FKJOIN_COPY_CONTAINER_COST;
-				per = visits * (LION_CONTAINER_COST +
-								LION_MEMBER_COST *
-								Min(gm / Max(keys[nsrc], 1.0), LION_MEMBER_CAP) +
-								log2(Max(batch, 2.0)) * cpu_operator_cost);
-				merge_cpu = collect + walked * per +
-					ceil(walked / batch) * wkeys *
-					(LION_CONTAINER_COST + LION_MEMBER_COST *
-					 Min(matching / wkeys, LION_MEMBER_CAP));
-				whereonce = true;
-
-				/* ... and what a range of a parallel one pays again of it */
-				if (rc != NULL)
-				{
-					rc->batched = true;
-					rc->perrange = walked * (LION_ENTRY_COUNT_COST +
-											 LION_PROBE_COST +
-											 LION_RANGE_DESCENT_PAGES *
-											 seq_page_cost) +
-						nsrc * (LION_PROBE_COST +
-								LION_RANGE_DESCENT_PAGES * seq_page_cost);
-				}
-			}
-			else
-			{
-				per = lion_merge_cpu_cost(nsrc + 1, mem, keys, inmem, tuples,
-										  1.0, srcprobes) +
-					unionsets * LION_UNION_SET_COST;
-				merge_cpu = walked * per * share;
-			}
-
-			/*
-			 * ... and each count's own set-up and tear-down (a memory context,
-			 * the sources' cursors, the visibility-map state): a distinct
-			 * walk's test prices it (LION_DISTINCT_TEST_COST, below), a range's
-			 * walk its entry (LION_RANGE_ENTRY_COST).
-			 */
-			if (distinct == LION_DISTINCT_NONE && rangevar == NULL)
-				merge_cpu += walked * (groupdrive ? LION_LIST_GROUP_COST :
-									   LION_ENTRY_COUNT_COST);
-		}
-		else
-		{
-			/*
-			 * A second GROUP BY column (DESIGN.md §20): every (outer, inner)
-			 * PAIR of the two indexes' entries is a count of its own, the
-			 * two groups' sets and the WHERE's merged, whether or not the
-			 * intersection comes out empty.  Two groups whose rows are
-			 * scattered over the whole heap have a container at nearly every
-			 * container key, which is what makes a pair expensive even when
-			 * their intersection is empty.
-			 */
-			double		oe = Max(outer_entries, 1.0);
-			double		ie = Max(inner_entries, 1.0);
-
-			mem[nsrc] = tuples / oe;
-			keys[nsrc] = lion_key_containers(root, rel, groupidx, groupcol,
-											 tuples / oe);
-			mem[nsrc + 1] = tuples / ie;
-			keys[nsrc + 1] = lion_key_containers(root, rel, groupidx2,
-												 groupcol2, tuples / ie);
-			/*
-			 * The early exit of a count(DISTINCT k)'s pair test is NOT
-			 * discounted: a pair's time is its lookup and its merge's set-up
-			 * far more than its members.  Discounted, 200 x 50 pairs over 100k
-			 * rows were chosen at 10,566 for 45 ms against the sorting
-			 * aggregate's 10,694 for 27.
-			 */
-			per = lion_merge_cpu_cost(nsrc + 2, mem, keys, inmem, tuples,
-									  1.0, srcprobes) +
-				unionsets * LION_UNION_SET_COST;
-			walked = oe * ie;
-			merge_cpu = walked * per;
-		}
-		pfree(mem);
-		pfree(keys);
-		pfree(inmem);
-	}
+/*
+ * The pages each clause's sets read, walked or sought (lion_cost_set_pages()),
+ * and the directory leaves of their lookups; frees the per-clause and
+ * per-source arrays.
+ */
+static void
+lion_count_rel_set_pages(LionCountRelCost *c)
+{
+	int			i;
 
 	/*
 	 * Walked: the driver, a group's own list, and what a range's entries are
@@ -2691,30 +2825,40 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * clause has nothing to read.  The single-key lookups' directory leaves,
 	 * one a lookup and no more of an index than it has (lion_cost_leaf_pages()).
 	 */
-	for (i = 0; i < nclause; i++)
+	for (i = 0; i < c->nclause; i++)
 	{
-		bool		walk = (clausesrc[i] < 0 || clausesrc[i] == driver ||
-							rangesum);
+		bool		walk = (c->clausesrc[i] < 0 ||
+							c->clausesrc[i] == c->driver ||
+							c->rangesum);
 
-		probe_cost += lion_cost_set_pages(root, rel, &clauseset[i], walk,
-										  walk ? 0.0 :
-										  srcprobes[clausesrc[i]] *
-										  (whereonce ? 1.0 : walked),
-										  &seq_pages, &probed_pages);
+		c->probe_cost += lion_cost_set_pages(c->root, c->rel,
+											 &c->clauseset[i], walk,
+											 walk ? 0.0 :
+											 c->srcprobes[c->clausesrc[i]] *
+											 (c->whereonce ? 1.0 : c->walked),
+											 &c->seq_pages, &c->probed_pages);
 	}
-	random_pages = lion_cost_leaf_pages(nclause, clauseindex, clauseset);
-	pfree(clauseset);
-	pfree(clauseindex);
-	pfree(clausesrc);
-	pfree(srcmembers);
-	pfree(srccontainers);
-	pfree(srcunion);
-	pfree(srcsets);
-	pfree(srcnsets);
-	pfree(srcsetcont);
-	pfree(srcsetpages);
-	pfree(srcprobes);
+	c->random_pages = lion_cost_leaf_pages(c->nclause, c->clauseindex,
+										   c->clauseset);
+	pfree(c->clauseset);
+	pfree(c->clauseindex);
+	pfree(c->clausesrc);
+	pfree(c->srcmembers);
+	pfree(c->srccontainers);
+	pfree(c->srcunion);
+	pfree(c->srcsets);
+	pfree(c->srcnsets);
+	pfree(c->srcsetcont);
+	pfree(c->srcsetpages);
+	pfree(c->srcprobes);
+}
 
+/*
+ * The entry scan of the driving index.
+ */
+static void
+lion_count_rel_entry_scan(LionCountRelCost *c)
+{
 	/*
 	 * The entry scan of the driving index - unless an IN list on that very
 	 * column drives the groups instead (DESIGN.md §15), in which case its
@@ -2722,7 +2866,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * and the index's entries are never walked.  A summed range has priced its
 	 * walk already.
 	 */
-	if (groupidx != NULL && !groupdrive && !rangesum)
+	if (c->groupidx != NULL && !c->groupdrive && !c->rangesum)
 	{
 		/*
 		 * The entry scan walks ONE key column's entries and stops at the first
@@ -2731,27 +2875,36 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		 * a range bounds the walk to drivefrac of those (§28), the share of
 		 * the column's entries it selects.
 		 */
-		double		entrypages = Max(1.0, (double) groupidx->pages *
-									 lion_index_column_share(root, rel, groupidx,
-															 groupcol) *
-									 drivefrac);
+		double		entrypages = Max(1.0, (double) c->groupidx->pages *
+									 lion_index_column_share(c->root, c->rel,
+															 c->groupidx,
+															 c->groupcol) *
+									 c->drivefrac);
 
-		seq_pages += entrypages;
-		if (rc != NULL && rc->batched)
-			rc->perrange += entrypages * seq_page_cost;
+		c->seq_pages += entrypages;
+		if (c->rc != NULL && c->rc->batched)
+			c->rc->perrange += entrypages * seq_page_cost;
 
 		/*
 		 * Beside a second GROUP BY column a count(DISTINCT k) tests each
 		 * group of the first for a row as well, which the pairs' tests come
 		 * on top of (DESIGN.md §26).
 		 */
-		if (distinct != LION_DISTINCT_NONE && groupidx2 != NULL)
-			recheckshare = lion_exists_fraction(
-												lion_containers_for(heap_pages,
-																	matching / Max(numgroups, 1.0)),
-												matching / Max(numgroups, 1.0));
+		if (c->distinct != LION_DISTINCT_NONE && c->groupidx2 != NULL)
+			c->recheckshare = lion_exists_fraction(
+				lion_containers_for(c->heap_pages,
+									c->matching / Max(c->numgroups, 1.0)),
+				c->matching / Max(c->numgroups, 1.0));
 	}
+}
 
+/*
+ * A second GROUP BY column's entry scan and its (outer, inner) pairs, and the
+ * fixed cost of a count(DISTINCT k)'s tests.
+ */
+static void
+lion_count_rel_pair_cost(LionCountRelCost *c)
+{
 	/*
 	 * A second GROUP BY column (DESIGN.md §20) is a nested loop over the two
 	 * indexes' entries: the outer index's entries drive the scan and the
@@ -2782,19 +2935,21 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * says; 20000 x 200 is four million pairs and is refused by a wide
 	 * margin.
 	 */
-	if (groupidx2 != NULL)
+	if (c->groupidx2 != NULL)
 	{
-		double		oe = Max(outer_entries, 1.0);
-		double		ie = Max(inner_entries, 1.0);
+		double		oe = Max(c->outer_entries, 1.0);
+		double		ie = Max(c->inner_entries, 1.0);
 
-		double		co = lion_containers_for(heap_pages, tuples / oe);
-		double		cinner = lion_containers_for(heap_pages, tuples / ie);
+		double		co = lion_containers_for(c->heap_pages, c->tuples / oe);
+		double		cinner = lion_containers_for(c->heap_pages,
+												 c->tuples / ie);
 
-		seq_pages += Max(1.0, (double) groupidx2->pages *
-						 lion_index_column_share(root, rel, groupidx2,
-												 groupcol2));
-		pair_cost = Max(oe * ie, numgroups) *
-			((distinct == LION_DISTINCT_NONE) ? LION_ENTRY_COUNT_COST :
+		c->seq_pages += Max(1.0, (double) c->groupidx2->pages *
+							lion_index_column_share(c->root, c->rel,
+													c->groupidx2,
+													c->groupcol2));
+		c->pair_cost = Max(oe * ie, c->numgroups) *
+			((c->distinct == LION_DISTINCT_NONE) ? LION_ENTRY_COUNT_COST :
 			 cpu_tuple_cost);
 
 		/*
@@ -2809,11 +2964,12 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 		 * What it does save is heap rechecks, one container's worth per test
 		 * instead of all of them, and that is charged as such below.
 		 */
-		if (distinct != LION_DISTINCT_NONE)
+		if (c->distinct != LION_DISTINCT_NONE)
 		{
-			pair_cost += oe * ie * LION_DISTINCT_TEST_COST;
-			recheckshare += (distinct == LION_DISTINCT_EXISTS) ?
-				lion_exists_fraction(Min(co, cinner), matching / (oe * ie)) :
+			c->pair_cost += oe * ie * LION_DISTINCT_TEST_COST;
+			c->recheckshare += (c->distinct == LION_DISTINCT_EXISTS) ?
+				lion_exists_fraction(Min(co, cinner),
+									 c->matching / (oe * ie)) :
 				1.0;
 		}
 	}
@@ -2823,8 +2979,18 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * listed value, when a list on k drives it - and beside a GROUP BY one
 	 * per group, the group's own test.
 	 */
-	if (distinct != LION_DISTINCT_NONE)
-		pair_cost += ingroups * LION_DISTINCT_TEST_COST;
+	if (c->distinct != LION_DISTINCT_NONE)
+		c->pair_cost += c->ingroups * LION_DISTINCT_TEST_COST;
+}
+
+/*
+ * The heap recheck: the candidate TIDs the visibility map cannot vouch for,
+ * and the pages they lie on.
+ */
+static void
+lion_count_rel_recheck(LionCountRelCost *c)
+{
+	double		dirty_pages;
 
 	/*
 	 * Rechecking is what makes the pushdown expensive, and the estimate has
@@ -2852,13 +3018,13 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * 148 ms against 1174 ms over a resident 71 MiB working set with zero
 	 * physical reads (the 2026-09-21 follow-up review).
 	 */
-	dirty_pages = Min(heap_pages * dirtyfrac, heap_pages);
-	recheck_tids = matching * dirtyfrac * recheckshare;
-	recheck_pages = Min(recheck_tids, dirty_pages);
+	dirty_pages = Min(c->heap_pages * c->dirtyfrac, c->heap_pages);
+	c->recheck_tids = c->matching * c->dirtyfrac * c->recheckshare;
+	c->recheck_pages = Min(c->recheck_tids, dirty_pages);
 
 	/* A summed range has priced its own (lion_cost_range_sum()). */
-	if (rangesum)
-		recheck_tids = recheck_pages = 0.0;
+	if (c->rangesum)
+		c->recheck_tids = c->recheck_pages = 0.0;
 
 	/*
 	 * ... except that a RANGE-bounded walk (DESIGN.md §28) does not visit a
@@ -2880,18 +3046,19 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * block visits for 1,148 pages when 21 entries of a 200-value column share
 	 * every page of a small table.
 	 */
-	if (rangevar != NULL && recheck_tids > 0.0)
+	if (c->rangevar != NULL && c->recheck_tids > 0.0)
 	{
-		double		entries = lion_range_entries(root, rel, rangevar,
-												 drivefrac);
-		double		rowsper = matching / entries;
-		double		corr = lion_var_correlation(root, rel, rangevar);
-		double		scattered = Min(rowsper, heap_pages);
-		double		inorder = Max(1.0, rowsper * heap_pages / tuples);
+		double		entries = lion_range_entries(c->root, c->rel, c->rangevar,
+												 c->drivefrac);
+		double		rowsper = c->matching / entries;
+		double		corr = lion_var_correlation(c->root, c->rel, c->rangevar);
+		double		scattered = Min(rowsper, c->heap_pages);
+		double		inorder = Max(1.0, rowsper * c->heap_pages / c->tuples);
 		double		perentry = scattered + (inorder - scattered) * corr * corr;
 
-		recheck_pages = Min(Min(recheck_tids, entries * perentry * dirtyfrac),
-							2.0 * recheck_pages);
+		c->recheck_pages = Min(Min(c->recheck_tids,
+								   entries * perentry * c->dirtyfrac),
+							   2.0 * c->recheck_pages);
 	}
 
 	/*
@@ -2908,36 +3075,128 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	 * against 3252 units for 5000 rows on 32 pages at a million rows, and the
 	 * node ran 2.5x faster than the scan that was chosen.
 	 */
-	if (rangevar == NULL && ors == NIL && recheck_tids > 0.0)
+	if (c->rangevar == NULL && c->ors == NIL && c->recheck_tids > 0.0)
 	{
-		Var		   *eqvar = lion_single_eq_var(rel, whereclauses, wherekinds);
+		Var		   *eqvar = lion_single_eq_var(c->rel, c->whereclauses,
+											   c->wherekinds);
 
 		if (eqvar != NULL)
 		{
-			double		corr = lion_var_correlation(root, rel, eqvar);
-			double		scattered = Min(matching, heap_pages);
-			double		inorder = Max(1.0, matching * heap_pages / tuples);
+			double		corr = lion_var_correlation(c->root, c->rel, eqvar);
+			double		scattered = Min(c->matching, c->heap_pages);
+			double		inorder = Max(1.0, c->matching * c->heap_pages /
+									  c->tuples);
 			double		spanned = scattered + (inorder - scattered) * corr * corr;
 
-			recheck_pages = Min(recheck_pages, Max(1.0, spanned * dirtyfrac));
+			c->recheck_pages = Min(c->recheck_pages,
+								   Max(1.0, spanned * c->dirtyfrac));
 		}
 	}
+}
 
-	run = random_pages * random_page_cost;
-	run += descent_cost;
-	run += lookup_cost;
-	run += seq_pages * seq_page_cost;
-	run += probe_cost;
-	run += read_cpu + merge_cpu;	/* containers, members, probes (§10) */
-	run += merge_ops * cpu_operator_cost;
-	run += recheck_pages * lion_heap_page_cost(root, rel, recheck_pages,
-											  heap_pages);
-	run += recheck_tids * ((groupidx != NULL && !rangesum) ?
-						   LION_RECHECK_GROUP_TID_COST : LION_RECHECK_TID_COST);
-	run += ingroups * cpu_tuple_cost;
-	run += pair_cost;
-	run += rangecost;
-	run += rangesrc_cost;
+/*
+ * What a LionCount path costs over one relation, phase by phase: the WHERE
+ * clauses' lookups and the sources of their AND, the merges that count them,
+ * the pages they read, the entry scans and pairs of the GROUP BY, and the
+ * heap recheck.
+ */
+static Cost
+lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
+				   IndexOptInfo *groupidx, AttrNumber groupcol,
+				   IndexOptInfo *groupidx2, AttrNumber groupcol2,
+				   List *whereidx, List *wherecol, List *whereclauses,
+				   List *wherekinds,
+				   List *ors, double numgroups,
+				   double outer_entries, double inner_entries, int distinct,
+				   double drivefrac, Var *rangevar, bool rangesum,
+				   LionRangeCost *rc)
+{
+	LionCountRelCost c;
+	bool		sumshort;		/* §15: the IN list is summed, not merged */
+	Cost		run;
+
+	memset(&c, 0, sizeof(c));
+	c.root = root;
+	c.rel = rel;
+	c.groupidx = groupidx;
+	c.groupcol = groupcol;
+	c.groupidx2 = groupidx2;
+	c.groupcol2 = groupcol2;
+	c.whereidx = whereidx;
+	c.wherecol = wherecol;
+	c.whereclauses = whereclauses;
+	c.wherekinds = wherekinds;
+	c.ors = ors;
+	c.numgroups = numgroups;
+	c.outer_entries = outer_entries;
+	c.inner_entries = inner_entries;
+	c.distinct = distinct;
+	c.drivefrac = drivefrac;
+	c.rangevar = rangevar;
+	c.rangesum = rangesum;
+	c.rc = rc;
+	c.heap_pages = Max((double) rel->pages, 1.0);
+	c.dirtyfrac = 1.0 - rel->allvisfrac;
+	c.matching = Max(lion_probe_rel_rows(root, rel), 1.0);
+	c.tuples = Max(rel->tuples, 1.0);
+	c.driver = -1;
+	c.nclause = list_length(whereclauses);
+	c.ingroups = numgroups;
+	c.recheckshare = 1.0;
+	c.walked = 1.0;
+
+	/*
+	 * A sum over a range (DESIGN.md §28) prices its walk, its entries and its
+	 * heap recheck itself (lion_cost_range_sum()); what is left here is the
+	 * WHERE sources, located once and read once - materialized after their
+	 * first use - and the one row.
+	 */
+	if (rangesum)
+	{
+		c.rangecost = lion_cost_range_sum(root, rel, groupidx, groupcol,
+										  rangevar, drivefrac, whereclauses,
+										  wherekinds, ors, NULL);
+		c.ingroups = 1.0;
+	}
+
+	/*
+	 * A count(DISTINCT k) without a GROUP BY walks k's entries, and a WHERE
+	 * equality on k itself drives that walk as a list of one would (DESIGN.md
+	 * §26).
+	 */
+	c.inlistci = lion_inlist_shape(groupidx, groupcol, groupidx2,
+								   whereidx, wherecol, whereclauses,
+								   wherekinds, ors,
+								   distinct != LION_DISTINCT_NONE &&
+								   groupidx2 == NULL,
+								   &sumshort, &c.groupdrive);
+
+	lion_count_rel_alloc(&c);
+	lion_count_rel_clauses(&c);
+	lion_count_rel_or_unions(&c);
+	lion_count_rel_driver(&c);
+	lion_count_rel_merge(&c);
+	lion_count_rel_set_pages(&c);
+	lion_count_rel_entry_scan(&c);
+	lion_count_rel_pair_cost(&c);
+	lion_count_rel_recheck(&c);
+
+	run = c.random_pages * random_page_cost;
+	run += c.descent_cost;
+	run += c.lookup_cost;
+	run += c.seq_pages * seq_page_cost;
+	run += c.probe_cost;
+	run += c.read_cpu + c.merge_cpu;	/* containers, members, probes (§10) */
+	run += c.merge_ops * cpu_operator_cost;
+	run += c.recheck_pages * lion_heap_page_cost(root, rel, c.recheck_pages,
+												 c.heap_pages);
+	run += c.recheck_tids * ((groupidx != NULL && !rangesum) ?
+							 LION_RECHECK_GROUP_TID_COST :
+							 LION_RECHECK_TID_COST);
+	run += c.ingroups * cpu_tuple_cost;
+	run += c.pair_cost;
+	run += c.rangecost;
+	run += c.rangesrc_cost;
 
 	return run;
 }
