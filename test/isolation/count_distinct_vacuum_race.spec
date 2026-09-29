@@ -85,6 +85,9 @@ setup
 	SET pg_lion.enable_count_pushdown = on;
 	SET enable_seqscan = off;
 	SET enable_bitmapscan = off;
+	-- on a table this small a LionOrdered walk of g under a sort is priced
+	-- about as LionCount is; the race is LionCount's
+	SET pg_lion.enable_ordered_scan = off;
 	SELECT injection_points_set_local();
 	SELECT injection_points_attach('lion-count-containers-pinned', 'wait');
 }
