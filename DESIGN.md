@@ -13910,6 +13910,19 @@ ordered path's selectivity `s_o` (the fraction of the index its own quals leave)
 fetches, and the node - a plain index scan of `(g, k)` plus the lion lookups - cost 721 against
 13,909 for the bitmap scan and Sort that the planner had preferred to that same index scan.)*
 
+*(Fixed 2026-09-30: the same for a clause the ordered index's PREDICATE implies. A partial btree
+on `(k) WHERE s <> ''` walks only rows with `s <> ''`, so a lion access for `s <> ''` - a lion
+index clause, or a partial lion index's own predicate - selects nothing among them. `lo_cost()`
+now divides `s` by the selectivity of the lion qual's clauses the predicate implies
+(`lo_pred_implied()`, core's `check_index_predicates()` test asked of the lion side), and so does
+§30.11's walk of a partial lion index, whose walked rows are now also scaled by its predicate as
+`add_predicate_to_index_quals()` scales an index's selectivity. ClickBench's Q15 (5M rows, `WHERE
+SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase`, the benchmark's partial btree `search2`
+beside a partial lion index on the same predicate) took the node at 227k against the bitmap scan's
+485k and ran 3.6 s against 1.9 s: 659k rows walked in key order, priced as 86k fetches.
+`ordered.sql` §18 has the shape: the node, dearer than core's own Index Scan of the partial btree
+it walks, no longer beats it.)*
+
 Core's LIMIT planning scales a path's run cost by the fraction of its rows the LIMIT takes
 (`adjust_limit_rows_costs()`), which is exactly how the node behaves: the walk and the fetches stop
 when the LIMIT stops pulling, and the set is built in full before the first row. So `LIMIT 10` of a
