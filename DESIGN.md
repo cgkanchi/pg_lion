@@ -14891,15 +14891,42 @@ once within `work_mem`, and counts them once beside F under its pins.
 OR node's image does (§15, `LION_OR_BITSET_MIN`): once it is a BITSET, containers are ORed into it
 in place (`lion_container_or_inplace()`), and it is optimized once, when the walk is over
 (`lion_range_union_finish()`); while it is an ARRAY, the members of incoming ARRAYs of at most 32
-members wait in a buffer and are folded in through one image (`lion_container_add_many()`) once
-half as many as the union holds have come. Since the union grows by at least half between two
-folds, each member is moved a bounded number of times; the buffer - at most half the union, counted
-in the collection's memory as the union is - may put a collection over its memory a little sooner
-than before, which then walks or spills as any other. A RUN on either side (a column in heap
-order) is folded as before. The windowed union of §15 (`lion_wide_fill()`) was not reused: a window
-of container keys would walk the range once per window, where the union either fits the memory it
-is allowed or is walked instead. It is also what a bitmap scan collects of the first of several
-range columns with nothing else beside them (§28, "Bitmap scans"), and grows the same way there.
+members wait in a buffer and are folded in through one image (`lion_container_add_many()`) once half
+as many as the union holds have come. Since the union grows by at least half between two folds, each
+member is moved a bounded number of times; the buffer - at most half the union, counted in the
+collection's memory as the union is - may put a collection over its memory a little sooner than
+before, which then walks or spills as any other. A RUN on either side is widened (below). The
+windowed union of §15 (`lion_wide_fill()`) was not reused: a window of container keys would walk the
+range once per window, where the union either fits the memory it is allowed or is walked instead. It
+is also what a bitmap scan collects of the first of several range columns with nothing else beside
+them (§28, "Bitmap scans"), and grows the same way there.
+
+**Widened (2026-09-30).** Anything else went through an image, as before: a RUN union, or a RUN or a
+BITSET coming to an ARRAY one - and a RUN is what a DENSE union optimizes to, a heap block's rows
+being a run, and what every union of a column in heap order is. Each container that came to a RUN
+union was folded into it: an image filled, counted, optimized and copied back, a few microseconds
+however few members it brought, which over a range of scattered rows is per member. `count(DISTINCT
+lo) WHERE hi BETWEEN 10 AND X` over 2M rows, `hi` a permutation of 200,000 keys of ten rows, took 19
+ms at X = 10,000, 1.26 s at 50,000 and 12.7 to 17 s at 190,000, 22 times core's plan - and the
+model, which took a union to be ORed into in place once it had 2,048 members, priced it at a third
+of a second (2026-09-29 review). Now a union that would take a container through an image is WIDENED
+to a BITSET instead (`lion_range_union_widen()`) and ORed into in place from then on, and optimized
+with the others when the walk is over; ARRAY unions keep their buffer and their merges, which are
+bounded. A widened union takes a bitset's 4 kB where its optimized form may take a few bytes - a RUN
+of a key in heap order - so the unions widened since the last time are COMPACTED, optimized back
+(`lion_range_union_compact()`), whenever that memory runs short: before a union is refused a
+widening, which then folds as before, and before the collection gives up or a window gives back
+keys, which therefore happens only where it did before. Each widening is made where a fold would
+have been and compacted at most once, so a collection short of memory spends about what it did - a
+scattered range at `work_mem` 64 kB widened and compacted 6,916 times in 495 compactions and took as
+long as it did - and one that is not spends a fold or two a union key and a few nanoseconds a
+container. On an assert build the series went from 30 ms, 1.09 s and 9.1 s to 21, 101 and 455 ms,
+against core's 176, 269 and 492; over 2M rows in heap order, one row a key, 1.9 million keys went
+from 14.1 s to 1.24, the walk of the keys most of it, and ten rows a key from 951 ms to 109.
+Measured over 40 collections - two orders, one row and ten a key, with and without summaries, 1% to
+95% of the keys - none is slower beyond the noise, and all but six are 2 to 30 times faster. The
+model's in-order folds are one fold or two per union key rather than one per container
+(`LION_RANGE_WIDEN_FOLDS`, "What collecting a range costs" below).
 
 EXPLAIN ANALYZE prints `Range Walks Probed` when there were any: each probed walk, so a complement
 whose walks below and above both turned is two.
@@ -15041,17 +15068,21 @@ shapes the column's correlation squared interpolates, as `cost_index()` does:
 
 - rows in the heap's order: every container after a key's first is folded into its RUN - the
   sets' containers, a set's rows spanning one container key more than they fill, less the union's
-  containers;
+  containers. *(Since 2026-09-30 the RUN is widened into a bitset by the second container instead
+  and optimized back at the end ("Widened", above), `LION_RANGE_WIDEN_FOLDS` (2) folds for each
+  union key that takes more than one container; this is what that measurement found.)*
 - rows scattered: each set has a container at nearly every container key (`lion_containers_for()`),
   and a key's union ends up with its share of the range's rows. Containers of at most
   `LION_RANGE_UNION_PEND_MIN` (32) members wait and are folded in once the waiting members come to
-  half the union's, so the union grows by half at least between two folds: 1 + log1.5(members /
-  32) folds a key until it is a bitset, past 2,048 members, and takes the rest in place - 11.3,
-  against the 11 measured above. Larger containers are merged in one at a time until then, a fold
-  each, and each moves the union's members too, half a bitset's worth on average, at
-  `LION_AND_MEMBER_COST` a member. Which are larger is a Poisson count's tail
-  (`lion_poisson_above()`): a set's rows fall at a key at random, and of a summary of 16,384 rows
-  over 575 container keys, 28.5 a key on average, a fifth of the containers hold more than 32.
+  half the union's, so the union grows by half at least between two folds: 1 + log1.5(members / 32)
+  folds a key until it is a bitset, past 2,048 members, and takes the rest in place - 11.3, against
+  the 11 measured above. (A union that became a RUN instead - dense, which random rows seldom are at
+  2,048 members - was folded for every container after that, and is widened into a bitset now.)
+  Larger containers are merged in one at a time until then, a fold each, and each moves the union's
+  members too, half a bitset's worth on average, at `LION_AND_MEMBER_COST` a member. Which are
+  larger is a Poisson count's tail (`lion_poisson_above()`): a set's rows fall at a key at random,
+  and of a summary of 16,384 rows over 575 container keys, 28.5 a key on average, a fifth of the
+  containers hold more than 32.
 
 A fold is `LION_RANGE_FOLD_COST`, the new setting `pg_lion.range_fold_cost`: 420
 `cpu_operator_cost`, 2.1 us at 500 units a millisecond, fitted to what the walk's price leaves of
