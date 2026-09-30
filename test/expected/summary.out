@@ -370,9 +370,9 @@ SELECT lion_sm('SELECT count(DISTINCT r) FROM lion_sm WHERE r BETWEEN 100 AND 40
 (1 row)
 
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE k IS NOT NULL');
-             lion_sm              
-----------------------------------
- no range, summaries 267: (18182)
+            lion_sm             
+--------------------------------
+ no range, summaries 7: (18182)
 (1 row)
 
 SELECT lion_sm('SELECT g, count(*) FROM lion_sm GROUP BY g');
