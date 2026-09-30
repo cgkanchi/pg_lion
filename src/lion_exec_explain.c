@@ -393,7 +393,19 @@ lion_explain_group_index(LionCountScanState *st, List *ancestors,
 		appendStringInfo(buf, "(%s)",
 						 get_attname(st->heapoid, st->driveattno, false));
 	else
-		appendStringInfoString(buf, "(all keys)");
+	{
+		bool		keys = false;
+
+		/*
+		 * Every entry but the NULL one when the column's own `IS NOT NULL`
+		 * drives (DESIGN.md §14), every entry - every row - when nothing
+		 * names the column (§35).
+		 */
+		for (i = 0; i < st->nclause && !keys; i++)
+			keys = (st->clause[i].kind == LION_CLAUSE_NOTNULL &&
+					!st->inor[i] && st->clause[i].attno == st->driveattno);
+		appendStringInfoString(buf, keys ? "(all keys)" : "(all rows)");
+	}
 
 	/*
 	 * The inner index of a two-column GROUP BY (DESIGN.md §20), or of the

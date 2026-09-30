@@ -68,14 +68,14 @@ PG_FUNCTION_INFO_V1(lion_handler);
  * Strategies and support procedure numbers live in lion.h, because build,
  * insert, scan and count all need them.  The multi-key strategies of
  * DESIGN.md §17 are 2 .. 5; a scalar opclass has strategy 1, and an ordered
- * one the range strategies 6 .. 9 of §28 as well.
+ * one the range strategies 6 .. 9 of §28 and the `<>` of §35 (10) as well.
  */
 #define LION_MULTI_STRATEGY_MASK \
 	((1 << LION_STRAT_CONTAINS) | (1 << LION_STRAT_OVERLAP) | \
 	 (1 << LION_STRAT_CONTAINED) | (1 << LION_STRAT_MATCH))
 #define LION_RANGE_STRATEGY_MASK \
 	((1 << LION_STRAT_LT) | (1 << LION_STRAT_LE) | \
-	 (1 << LION_STRAT_GE) | (1 << LION_STRAT_GT))
+	 (1 << LION_STRAT_GE) | (1 << LION_STRAT_GT) | (1 << LION_STRAT_NE))
 
 /* Kind of relation options for lion indexes */
 static relopt_kind lion_relopt_kind;
@@ -770,18 +770,19 @@ lionvalidate(Oid opclassoid)
 
 		/*
 		 * A scalar family answers equality and, where it can order its keys,
-		 * the range comparisons of DESIGN.md §28 - whether it CAN is a
-		 * question about the type pair's support function 4, asked with the
-		 * groups below; a multi-key one answers the containment/match
-		 * strategies and never equality or a range (the keys of one row are
-		 * not the row's value, so neither could be answered from them).
+		 * the range comparisons of DESIGN.md §28 and `<>` (§35) - whether it
+		 * CAN is a question about the type pair's support function 4, asked
+		 * with the groups below; a multi-key one answers the
+		 * containment/match strategies and never equality, a range or `<>`
+		 * (the keys of one row are not the row's value, so none of them
+		 * could be answered from them).
 		 */
 		stratok = multikey ?
 			(oprform->amopstrategy >= 1 &&
 			 oprform->amopstrategy <= LION_NSTRATEGIES &&
 			 (LION_MULTI_STRATEGY_MASK & (1 << oprform->amopstrategy)) != 0) :
 			(oprform->amopstrategy == LION_STRAT_EQUAL ||
-			 LION_STRAT_IS_RANGE(oprform->amopstrategy));
+			 LION_STRAT_IS_WALK(oprform->amopstrategy));
 
 		if (!stratok)
 		{

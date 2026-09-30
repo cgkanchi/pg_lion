@@ -23,5 +23,6 @@ CREATE OPERATOR CLASS citext_ops
         OPERATOR 7 @extschema:citext@.<= (@extschema:citext@.citext, @extschema:citext@.citext),
         OPERATOR 8 @extschema:citext@.>= (@extschema:citext@.citext, @extschema:citext@.citext),
         OPERATOR 9 @extschema:citext@.> (@extschema:citext@.citext, @extschema:citext@.citext),
+        OPERATOR 10 @extschema:citext@.<> (@extschema:citext@.citext, @extschema:citext@.citext),
         FUNCTION 1 @extschema:citext@.citext_hash(@extschema:citext@.citext),
         FUNCTION 4 @extschema:citext@.citext_cmp(@extschema:citext@.citext, @extschema:citext@.citext);

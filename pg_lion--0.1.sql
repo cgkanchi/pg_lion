@@ -35,6 +35,11 @@ COMMENT ON ACCESS METHOD lion IS
  * support function 4 has them; xid and cid, and the multi-key classes further
  * down, do not.  The operators are core's and, like `=`, resolve to
  * pg_catalog's before anything in the target schema.
+ *
+ * Strategy 10 is `<>` (DESIGN.md §35): every entry of the column but the one
+ * the value names - a range with a hole, walked as a range is - and every
+ * class with the range comparisons has it, for the same type pairs, beside
+ * the same support function 4.
  */
 
 /* ---- integers: one family, so cross-type equality can use the index ---- */
@@ -48,6 +53,7 @@ CREATE OPERATOR CLASS int2_ops DEFAULT FOR TYPE int2 USING lion
 	OPERATOR	7	<= (int2, int2),
 	OPERATOR	8	>= (int2, int2),
 	OPERATOR	9	> (int2, int2),
+	OPERATOR	10	<> (int2, int2),
 	FUNCTION	1	hashint2(int2),
 	FUNCTION	4	btint2cmp(int2, int2);
 
@@ -58,6 +64,7 @@ CREATE OPERATOR CLASS int4_ops DEFAULT FOR TYPE int4 USING lion
 	OPERATOR	7	<= (int4, int4),
 	OPERATOR	8	>= (int4, int4),
 	OPERATOR	9	> (int4, int4),
+	OPERATOR	10	<> (int4, int4),
 	FUNCTION	1	hashint4(int4),
 	FUNCTION	4	btint4cmp(int4, int4);
 
@@ -68,6 +75,7 @@ CREATE OPERATOR CLASS int8_ops DEFAULT FOR TYPE int8 USING lion
 	OPERATOR	7	<= (int8, int8),
 	OPERATOR	8	>= (int8, int8),
 	OPERATOR	9	> (int8, int8),
+	OPERATOR	10	<> (int8, int8),
 	FUNCTION	1	hashint8(int8),
 	FUNCTION	4	btint8cmp(int8, int8);
 
@@ -90,26 +98,32 @@ ALTER OPERATOR FAMILY integer_ops USING lion ADD
 	OPERATOR	7	<= (int2, int4),
 	OPERATOR	8	>= (int2, int4),
 	OPERATOR	9	> (int2, int4),
+	OPERATOR	10	<> (int2, int4),
 	OPERATOR	6	< (int2, int8),
 	OPERATOR	7	<= (int2, int8),
 	OPERATOR	8	>= (int2, int8),
 	OPERATOR	9	> (int2, int8),
+	OPERATOR	10	<> (int2, int8),
 	OPERATOR	6	< (int4, int2),
 	OPERATOR	7	<= (int4, int2),
 	OPERATOR	8	>= (int4, int2),
 	OPERATOR	9	> (int4, int2),
+	OPERATOR	10	<> (int4, int2),
 	OPERATOR	6	< (int4, int8),
 	OPERATOR	7	<= (int4, int8),
 	OPERATOR	8	>= (int4, int8),
 	OPERATOR	9	> (int4, int8),
+	OPERATOR	10	<> (int4, int8),
 	OPERATOR	6	< (int8, int2),
 	OPERATOR	7	<= (int8, int2),
 	OPERATOR	8	>= (int8, int2),
 	OPERATOR	9	> (int8, int2),
+	OPERATOR	10	<> (int8, int2),
 	OPERATOR	6	< (int8, int4),
 	OPERATOR	7	<= (int8, int4),
 	OPERATOR	8	>= (int8, int4),
 	OPERATOR	9	> (int8, int4),
+	OPERATOR	10	<> (int8, int4),
 	FUNCTION	4	(int2, int4) btint24cmp(int2, int4),
 	FUNCTION	4	(int2, int8) btint28cmp(int2, int8),
 	FUNCTION	4	(int4, int2) btint42cmp(int4, int2),
@@ -128,6 +142,7 @@ CREATE OPERATOR CLASS float4_ops DEFAULT FOR TYPE float4 USING lion
 	OPERATOR	7	<= (float4, float4),
 	OPERATOR	8	>= (float4, float4),
 	OPERATOR	9	> (float4, float4),
+	OPERATOR	10	<> (float4, float4),
 	FUNCTION	1	hashfloat4(float4),
 	FUNCTION	4	btfloat4cmp(float4, float4);
 
@@ -138,6 +153,7 @@ CREATE OPERATOR CLASS float8_ops DEFAULT FOR TYPE float8 USING lion
 	OPERATOR	7	<= (float8, float8),
 	OPERATOR	8	>= (float8, float8),
 	OPERATOR	9	> (float8, float8),
+	OPERATOR	10	<> (float8, float8),
 	FUNCTION	1	hashfloat8(float8),
 	FUNCTION	4	btfloat8cmp(float8, float8);
 
@@ -148,10 +164,12 @@ ALTER OPERATOR FAMILY float_ops USING lion ADD
 	OPERATOR	7	<= (float4, float8),
 	OPERATOR	8	>= (float4, float8),
 	OPERATOR	9	> (float4, float8),
+	OPERATOR	10	<> (float4, float8),
 	OPERATOR	6	< (float8, float4),
 	OPERATOR	7	<= (float8, float4),
 	OPERATOR	8	>= (float8, float4),
 	OPERATOR	9	> (float8, float4),
+	OPERATOR	10	<> (float8, float4),
 	FUNCTION	4	(float4, float8) btfloat48cmp(float4, float8),
 	FUNCTION	4	(float8, float4) btfloat84cmp(float8, float4);
 
@@ -163,6 +181,7 @@ CREATE OPERATOR CLASS oid_ops DEFAULT FOR TYPE oid USING lion AS
 	OPERATOR	7	<= (oid, oid),
 	OPERATOR	8	>= (oid, oid),
 	OPERATOR	9	> (oid, oid),
+	OPERATOR	10	<> (oid, oid),
 	FUNCTION	1	hashoid(oid),
 	FUNCTION	4	btoidcmp(oid, oid);
 
@@ -199,6 +218,7 @@ SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS bool_ops DEFAULT FOR TYP
 	OPERATOR	7	<= (bool, bool),
 	OPERATOR	8	>= (bool, bool),
 	OPERATOR	9	> (bool, bool),
+	OPERATOR	10	<> (bool, bool),
 	FUNCTION	1	%s,
 	FUNCTION	4	btboolcmp(bool, bool)', 'hashbool(bool)', 'hashchar("char")');
 
@@ -208,6 +228,7 @@ CREATE OPERATOR CLASS char_ops DEFAULT FOR TYPE "char" USING lion AS
 	OPERATOR	7	<= ("char", "char"),
 	OPERATOR	8	>= ("char", "char"),
 	OPERATOR	9	> ("char", "char"),
+	OPERATOR	10	<> ("char", "char"),
 	FUNCTION	1	hashchar("char"),
 	FUNCTION	4	btcharcmp("char", "char");
 
@@ -217,6 +238,7 @@ CREATE OPERATOR CLASS name_ops DEFAULT FOR TYPE name USING lion AS
 	OPERATOR	7	<= (name, name),
 	OPERATOR	8	>= (name, name),
 	OPERATOR	9	> (name, name),
+	OPERATOR	10	<> (name, name),
 	FUNCTION	1	hashname(name),
 	FUNCTION	4	btnamecmp(name, name);
 
@@ -227,6 +249,7 @@ CREATE OPERATOR CLASS text_ops DEFAULT FOR TYPE text USING lion AS
 	OPERATOR	7	<= (text, text),
 	OPERATOR	8	>= (text, text),
 	OPERATOR	9	> (text, text),
+	OPERATOR	10	<> (text, text),
 	FUNCTION	1	hashtext(text),
 	FUNCTION	4	bttextcmp(text, text);
 
@@ -236,6 +259,7 @@ CREATE OPERATOR CLASS bpchar_ops DEFAULT FOR TYPE bpchar USING lion AS
 	OPERATOR	7	<= (bpchar, bpchar),
 	OPERATOR	8	>= (bpchar, bpchar),
 	OPERATOR	9	> (bpchar, bpchar),
+	OPERATOR	10	<> (bpchar, bpchar),
 	FUNCTION	1	hashbpchar(bpchar),
 	FUNCTION	4	bpcharcmp(bpchar, bpchar);
 
@@ -245,6 +269,7 @@ SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS bytea_ops DEFAULT FOR TY
 	OPERATOR	7	<= (bytea, bytea),
 	OPERATOR	8	>= (bytea, bytea),
 	OPERATOR	9	> (bytea, bytea),
+	OPERATOR	10	<> (bytea, bytea),
 	FUNCTION	1	%s,
 	FUNCTION	4	byteacmp(bytea, bytea)', 'hashbytea(bytea)', 'hashvarlena(internal)');
 
@@ -254,6 +279,7 @@ CREATE OPERATOR CLASS uuid_ops DEFAULT FOR TYPE uuid USING lion AS
 	OPERATOR	7	<= (uuid, uuid),
 	OPERATOR	8	>= (uuid, uuid),
 	OPERATOR	9	> (uuid, uuid),
+	OPERATOR	10	<> (uuid, uuid),
 	FUNCTION	1	uuid_hash(uuid),
 	FUNCTION	4	uuid_cmp(uuid, uuid);
 
@@ -263,6 +289,7 @@ SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS date_ops DEFAULT FOR TYP
 	OPERATOR	7	<= (date, date),
 	OPERATOR	8	>= (date, date),
 	OPERATOR	9	> (date, date),
+	OPERATOR	10	<> (date, date),
 	FUNCTION	1	%s,
 	FUNCTION	4	date_cmp(date, date)', 'hashdate(date)', 'hashint4(int4)');
 
@@ -272,6 +299,7 @@ CREATE OPERATOR CLASS time_ops DEFAULT FOR TYPE time USING lion AS
 	OPERATOR	7	<= (time, time),
 	OPERATOR	8	>= (time, time),
 	OPERATOR	9	> (time, time),
+	OPERATOR	10	<> (time, time),
 	FUNCTION	1	time_hash(time),
 	FUNCTION	4	time_cmp(time, time);
 
@@ -281,6 +309,7 @@ CREATE OPERATOR CLASS timetz_ops DEFAULT FOR TYPE timetz USING lion AS
 	OPERATOR	7	<= (timetz, timetz),
 	OPERATOR	8	>= (timetz, timetz),
 	OPERATOR	9	> (timetz, timetz),
+	OPERATOR	10	<> (timetz, timetz),
 	FUNCTION	1	timetz_hash(timetz),
 	FUNCTION	4	timetz_cmp(timetz, timetz);
 
@@ -290,6 +319,7 @@ CREATE OPERATOR CLASS timestamp_ops DEFAULT FOR TYPE timestamp USING lion AS
 	OPERATOR	7	<= (timestamp, timestamp),
 	OPERATOR	8	>= (timestamp, timestamp),
 	OPERATOR	9	> (timestamp, timestamp),
+	OPERATOR	10	<> (timestamp, timestamp),
 	FUNCTION	1	timestamp_hash(timestamp),
 	FUNCTION	4	timestamp_cmp(timestamp, timestamp);
 
@@ -299,6 +329,7 @@ SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS timestamptz_ops DEFAULT 
 	OPERATOR	7	<= (timestamptz, timestamptz),
 	OPERATOR	8	>= (timestamptz, timestamptz),
 	OPERATOR	9	> (timestamptz, timestamptz),
+	OPERATOR	10	<> (timestamptz, timestamptz),
 	FUNCTION	1	%s,
 	FUNCTION	4	timestamptz_cmp(timestamptz, timestamptz)', 'timestamptz_hash(timestamptz)', 'timestamp_hash(timestamp)');
 
@@ -308,6 +339,7 @@ CREATE OPERATOR CLASS interval_ops DEFAULT FOR TYPE interval USING lion AS
 	OPERATOR	7	<= (interval, interval),
 	OPERATOR	8	>= (interval, interval),
 	OPERATOR	9	> (interval, interval),
+	OPERATOR	10	<> (interval, interval),
 	FUNCTION	1	interval_hash(interval),
 	FUNCTION	4	interval_cmp(interval, interval);
 
@@ -317,6 +349,7 @@ CREATE OPERATOR CLASS numeric_ops DEFAULT FOR TYPE numeric USING lion AS
 	OPERATOR	7	<= (numeric, numeric),
 	OPERATOR	8	>= (numeric, numeric),
 	OPERATOR	9	> (numeric, numeric),
+	OPERATOR	10	<> (numeric, numeric),
 	FUNCTION	1	hash_numeric(numeric),
 	FUNCTION	4	numeric_cmp(numeric, numeric);
 
@@ -326,6 +359,7 @@ CREATE OPERATOR CLASS macaddr_ops DEFAULT FOR TYPE macaddr USING lion AS
 	OPERATOR	7	<= (macaddr, macaddr),
 	OPERATOR	8	>= (macaddr, macaddr),
 	OPERATOR	9	> (macaddr, macaddr),
+	OPERATOR	10	<> (macaddr, macaddr),
 	FUNCTION	1	hashmacaddr(macaddr),
 	FUNCTION	4	macaddr_cmp(macaddr, macaddr);
 
@@ -335,6 +369,7 @@ CREATE OPERATOR CLASS macaddr8_ops DEFAULT FOR TYPE macaddr8 USING lion AS
 	OPERATOR	7	<= (macaddr8, macaddr8),
 	OPERATOR	8	>= (macaddr8, macaddr8),
 	OPERATOR	9	> (macaddr8, macaddr8),
+	OPERATOR	10	<> (macaddr8, macaddr8),
 	FUNCTION	1	hashmacaddr8(macaddr8),
 	FUNCTION	4	macaddr8_cmp(macaddr8, macaddr8);
 
@@ -344,6 +379,7 @@ CREATE OPERATOR CLASS inet_ops DEFAULT FOR TYPE inet USING lion AS
 	OPERATOR	7	<= (inet, inet),
 	OPERATOR	8	>= (inet, inet),
 	OPERATOR	9	> (inet, inet),
+	OPERATOR	10	<> (inet, inet),
 	FUNCTION	1	hashinet(inet),
 	FUNCTION	4	network_cmp(inet, inet);
 
@@ -353,6 +389,7 @@ CREATE OPERATOR CLASS jsonb_ops DEFAULT FOR TYPE jsonb USING lion AS
 	OPERATOR	7	<= (jsonb, jsonb),
 	OPERATOR	8	>= (jsonb, jsonb),
 	OPERATOR	9	> (jsonb, jsonb),
+	OPERATOR	10	<> (jsonb, jsonb),
 	FUNCTION	1	jsonb_hash(jsonb),
 	FUNCTION	4	jsonb_cmp(jsonb, jsonb);
 
@@ -362,6 +399,7 @@ CREATE OPERATOR CLASS pg_lsn_ops DEFAULT FOR TYPE pg_lsn USING lion AS
 	OPERATOR	7	<= (pg_lsn, pg_lsn),
 	OPERATOR	8	>= (pg_lsn, pg_lsn),
 	OPERATOR	9	> (pg_lsn, pg_lsn),
+	OPERATOR	10	<> (pg_lsn, pg_lsn),
 	FUNCTION	1	pg_lsn_hash(pg_lsn),
 	FUNCTION	4	pg_lsn_cmp(pg_lsn, pg_lsn);
 
@@ -380,6 +418,7 @@ SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS xid8_ops DEFAULT FOR TYP
 	OPERATOR	7	<= (xid8, xid8),
 	OPERATOR	8	>= (xid8, xid8),
 	OPERATOR	9	> (xid8, xid8),
+	OPERATOR	10	<> (xid8, xid8),
 	FUNCTION	1	%s,
 	FUNCTION	4	xid8cmp(xid8, xid8)', 'hashxid8(xid8)', 'hashint8(int8)');
 
@@ -393,6 +432,7 @@ CREATE OPERATOR CLASS tid_ops DEFAULT FOR TYPE tid USING lion AS
 	OPERATOR	7	<= (tid, tid),
 	OPERATOR	8	>= (tid, tid),
 	OPERATOR	9	> (tid, tid),
+	OPERATOR	10	<> (tid, tid),
 	FUNCTION	1	hashtid(tid),
 	FUNCTION	4	bttidcmp(tid, tid);
 
@@ -402,6 +442,7 @@ CREATE OPERATOR CLASS enum_ops DEFAULT FOR TYPE anyenum USING lion AS
 	OPERATOR	7	<= (anyenum, anyenum),
 	OPERATOR	8	>= (anyenum, anyenum),
 	OPERATOR	9	> (anyenum, anyenum),
+	OPERATOR	10	<> (anyenum, anyenum),
 	FUNCTION	1	hashenum(anyenum),
 	FUNCTION	4	enum_cmp(anyenum, anyenum);
 

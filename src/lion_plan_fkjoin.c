@@ -1488,6 +1488,7 @@ lion_fkjoin_setup(PlannerInfo *root, RelOptInfo *rel, const LionFkJoin *fj,
 	else
 		base = lappend(base, NIL);
 	base = lappend(base, NIL);	/* decoded walk: the dimension's groups */
+	base = lappend(base, NIL);	/* every row: the join key drives */
 
 	out->joinclause = joinclause;
 	out->targets = targets;

@@ -203,7 +203,7 @@ SELECT lion_uq('SELECT g FROM lion_uq WHERE a = 5 GROUP BY g HAVING count(DISTIN
 -- a GROUP BY folded to one group, and a two-column GROUP BY
 SELECT lion_uq('SELECT a, count(DISTINCT id) FROM lion_uq WHERE a = 6 GROUP BY a');
 SELECT lion_uq('SELECT g, a, count(DISTINCT id) FROM lion_uq WHERE a IN (1, 2) GROUP BY g, a');
--- nothing drives a count of the whole table, as for count(*)
+-- a count of the whole table, driven as count(*)'s is (DESIGN.md §35)
 SELECT lion_uq('SELECT count(DISTINCT id) FROM lion_uq');
 -- the EXPLAIN: a count, with no Distinct Key
 SET enable_seqscan = off;

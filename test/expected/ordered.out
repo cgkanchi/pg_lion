@@ -1254,6 +1254,57 @@ SELECT lion_ord('SELECT id, k FROM ldbl WHERE g = 5 AND h = 3 ORDER BY k LIMIT 1
 (1 row)
 
 DROP TABLE ldbl;
+-- 18. So is a clause the btree's PREDICATE implies: a partial btree on (k)
+--     WHERE s <> '' walks only rows with s <> '', and a lion set for s <> ''
+--     selects nothing among them.  Priced at s <> ''s share of the walk's
+--     fetches, the node beat core's own Index Scan of that btree - the same
+--     walk and fetches without the set - and, beside a GROUP BY that wanted
+--     no order, a bitmap scan it ran twice as slow as (2026-09-30).  With a
+--     lion clause the predicate does not imply, it still wins.
+CREATE TABLE lpart (id int PRIMARY KEY, s text, e int, k int, pad text)
+  WITH (autovacuum_enabled = off);
+INSERT INTO lpart
+SELECT i, CASE WHEN i % 8 <> 0 THEN '' ELSE 'p' || (i % 997) END, i % 50,
+	   (i * 7919) % 100003, repeat('x', 60)
+  FROM generate_series(1, 100000) i;
+CREATE INDEX lpart_k ON lpart (k) WHERE s <> '';
+CREATE INDEX lpart_s ON lpart USING lion (s) WHERE s <> '';
+CREATE INDEX lpart_e ON lpart USING lion (e);
+VACUUM (FREEZE, ANALYZE) lpart;
+SET enable_bitmapscan = off;
+SET enable_seqscan = off;
+SELECT * FROM lion_ord_plan('SELECT id, pad FROM lpart WHERE s <> '''' ORDER BY k');
+           lion_ord_plan           
+-----------------------------------
+ Index Scan using lpart_k on lpart
+(1 row)
+
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+SELECT * FROM lion_ord_plan('SELECT id, pad FROM lpart WHERE s <> '''' AND e = 4 ORDER BY k LIMIT 10');
+              lion_ord_plan               
+------------------------------------------
+ Limit
+   ->  Custom Scan (LionOrdered) on lpart
+         Filter: (s <> ''::text)
+         Ordered By: lpart_k
+         Lion Cond: (e = 4)
+         Lion Indexes: lpart_e
+(6 rows)
+
+SELECT lion_ord('SELECT id, k FROM lpart WHERE s <> '''' ORDER BY k');
+        lion_ord         
+-------------------------
+ LionOrdered, 12500 rows
+(1 row)
+
+SELECT lion_ord('SELECT id, k FROM lpart WHERE s <> '''' AND e = 4 ORDER BY k LIMIT 10');
+       lion_ord       
+----------------------
+ LionOrdered, 10 rows
+(1 row)
+
+DROP TABLE lpart;
 DROP FUNCTION lion_ord_try(text, boolean);
 DROP TABLE lo_rls;
 REVOKE SELECT ON lo FROM lion_ord_user;

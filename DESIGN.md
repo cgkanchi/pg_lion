@@ -13910,6 +13910,19 @@ ordered path's selectivity `s_o` (the fraction of the index its own quals leave)
 fetches, and the node - a plain index scan of `(g, k)` plus the lion lookups - cost 721 against
 13,909 for the bitmap scan and Sort that the planner had preferred to that same index scan.)*
 
+*(Fixed 2026-09-30: the same for a clause the ordered index's PREDICATE implies. A partial btree
+on `(k) WHERE s <> ''` walks only rows with `s <> ''`, so a lion access for `s <> ''` - a lion
+index clause, or a partial lion index's own predicate - selects nothing among them. `lo_cost()`
+now divides `s` by the selectivity of the lion qual's clauses the predicate implies
+(`lo_pred_implied()`, core's `check_index_predicates()` test asked of the lion side), and so does
+§30.11's walk of a partial lion index, whose walked rows are now also scaled by its predicate as
+`add_predicate_to_index_quals()` scales an index's selectivity. ClickBench's Q15 (5M rows, `WHERE
+SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase`, the benchmark's partial btree `search2`
+beside a partial lion index on the same predicate) took the node at 227k against the bitmap scan's
+485k and ran 3.6 s against 1.9 s: 659k rows walked in key order, priced as 86k fetches.
+`ordered.sql` §18 has the shape: the node, dearer than core's own Index Scan of the partial btree
+it walks, no longer beats it.)*
+
 Core's LIMIT planning scales a path's run cost by the fraction of its rows the LIMIT takes
 (`adjust_limit_rows_costs()`), which is exactly how the node behaves: the walk and the fetches stop
 when the LIMIT stops pulling, and the set is built in full before the first row. So `LIMIT 10` of a
@@ -16223,3 +16236,113 @@ it declines.
 - **Parallel**: the walk is container-major, so it divides by ranges of container keys exactly as
   §10's parallel GROUP BY does, under the Finalize Agg it already has.
 - **A hot standby**, where no WHERE is collected (§10): the planner declines it there.
+
+## 35. `<>`, a count of every row, and a filter on a walked column (implemented 2026-09-30)
+
+ClickBench on a 5% sample (5M rows, PostgreSQL 18, the benchmark's own settings) found three gaps.
+Twenty of its 43 queries filter on `col <> c`, which no lion access answered: not the count, not a
+bitmap or plain scan, not LionOrdered's set. `count(*)` with no WHERE was left to core. And
+`WHERE SearchPhrase <> '' ORDER BY SearchPhrase LIMIT 10`, walked by the column's own lion index
+(§30.11), fetched and rejected the 87% of the table whose phrase is `''` before its first row: 3.1 s
+against the sequential scan's 1.1. A fourth, the price of a partial btree's walk, is §30.3's.
+
+### The operator: strategy 10, a range with a hole
+
+Strategy 10 is `<>`, added beside the range comparisons (§28) of every class and type pair that
+has them, citext's included: 36 operators in `pg_lion--0.1.sql`, one in `pg_lion_citext--0.1.sql`.
+`lionvalidate()` takes it where it takes a range, beside support function 4 for the same pair
+(`LION_STRAT_IS_WALK()`). `k <> c` is every VALUE entry of the column but c's, which is a walk of
+the column with a HOLE: a `LionRange` bound of strategy `LION_STRAT_NE` that fails the one entry
+whose key compares equal to c and bounds the walk on neither side. So:
+
+- **`lion_range_test()`** skips the hole's entry and never ends a walk on it; the descents to a
+  lower or an upper bound, and the walk ABOVE a range, pass holes by (`lion_range_side_leaf()`,
+  `lion_range_fails_upper()`); a DESCENDING walk ends at the first entry that fails a lower bound,
+  and passes over one skipped for anything else (`lion_range_fails_lower()`, §30.11 - it ended at
+  any entry that did not fail an upper bound, which a hole would have made it do early).
+- **Summaries (§32) are not read** by a walk with holes (`lion_entry_scan_plan_sum()`): a bucket's
+  summary may hold the hole's rows. Nor is the complement (§28) raced: the entries outside a range
+  with holes are not what it subtracts.
+- **Scans**: a `<>` scan key is a range key (`lion_scankey_is_range()`), so everything the bitmap
+  and the plain scan do with a range - a WALK or a WINDOW beside other columns' sets, one walk for
+  every range key of the column, dropped and rechecked beside the column's own sets - they do with
+  it. The NULL entry is never walked: `<>` is strict.
+- **`k <> ANY (array)`**: core hands the AM an `op ANY (array)` for every operator of the family.
+  It is true of a row whose k differs from SOME element - every row with a value once two
+  non-NULL elements differ, every row but one value's with one, no row with none - so the scan
+  rewrites the key as the one it means before anything classifies it (`lion_scan_keys_rewrite()`):
+  `IS NOT NULL`, the `<>` of the one element, or a `<>` of NULL. The elements are told apart with
+  the probe's comparison of their type among themselves, under the column's collation, where two
+  values it calls equal are one value to the index too (`'AB'` and `'ab'` under citext).
+- **The price** (`lioncostestimate()`): a walk with holes reads the keys of its RANGE - n_distinct
+  times the other bounds' selectivity - less the holes, and no summaries
+  (`lion_cost_ranges_entries()`). Priced by its selectivity, `SearchPhrase <> ''` was 13% of
+  477,418 keys where the walk reads all but one.
+
+### The count: a negated source
+
+In the pushdown `k <> c` is `LION_CLAUSE_NE`, the second NEGATED clause kind beside `IS NOT NULL`
+(§14): the rows it rejects are c's entry and the NULL one, and the source is the union of those
+two, subtracted at every container key the positive sources have, exactly as `IS NOT NULL`'s NULL
+entry is. Either set may be missing - no row has c, the column has no NULLs - and then there is
+less to subtract; a NULL c (a parameter) makes the count 0. It is taken wherever `IS NOT NULL` is:
+beside positive clauses, under a GROUP BY and a count(DISTINCT), a partitioned table's and an
+FK-side join's fact filters, and not under an OR, where a complement would be a leaf of a union
+(§19). The clause's operator has the column on its left (a commuted `c <> k` is rewritten), and it
+is what a candidate is tested with when a multi-key query narrowed nothing and the heap is read
+(`lion_count_scan_filtered()`). EXECUTE on the operator's function is checked as for any WHERE
+function (§9).
+
+### Every row
+
+With nothing in the WHERE that selects rows - `count(*)` alone, or beside `IS NOT NULL` and `<>`
+clauses only - there was nothing to drive the merge, except §14's sum over the entries of the
+first `IS NOT NULL` column. Now any lion column drives it: the entries of one SCALAR column are
+disjoint and, the NULL entry included, hold every row of the table, so the sum over them - each
+less what the negated sources subtract - is the count, visibility and all, as §14's sum is. The
+planner takes the column with the fewest entries (`lion_count_all_driver()`, by n_distinct), a
+column whose own `IS NOT NULL` is a clause when it is no dearer, since its NULL entry is then
+skipped and its clause dropped (§14). A scalar, whole, non-expression index's column only
+(`lion_find_roaring_index()`): a multi-key column's entries overlap and miss the rows with no keys,
+a partial index holds only its predicate's rows. A partitioned table's candidates are its first
+live leaf's, which `lion_collect_targets()` then asks of every partition.
+
+The plan names the column in a new member of custom_private, `LION_PRIV_ALLROWS` (shape 19): no
+clause names it. EXPLAIN prints the driver as `(all rows)`, or `(all keys)` when it is the column's
+own `IS NOT NULL` that drives. `count(*) WHERE k IS NOT NULL` over a column of many keys is now
+driven by one of few: `lion_null_t (all rows), lion_null_k (k IS NOT NULL)` in `null.sql`, where it
+was `lion_null_k (all keys)`.
+
+### A filter on the walked column
+
+A lion column's walk (§30.11) now answers `<>` on its own column as a hole, which takes the '' entry
+out of `SearchPhrase <> '' ORDER BY SearchPhrase LIMIT 10` without reading it: 13 entries walked
+and 16 buffers. Any other filter on the walked column alone - `s LIKE 'p1%'`, `length(s) > 3`,
+`k % 7 = 3`, `n IS NULL OR n > 4` - is decided once per ENTRY (`lo_walk_value_rinfos()`): when the
+index's stored keys are the rows' own values byte for byte (`lion_index_can_emit_value()`, the
+value-representation rule of §10), every row of an entry holds one value, so a clause that reads
+no other column and calls nothing volatile is true of all of them or of none. The first VISIBLE row
+the walk fetches of an entry decides for the entry; one that fails takes the rest of it with it,
+unread (`lion_order_walk_skip_entry()`). EXPLAIN shows the clauses as `Filter per Value` and ANALYZE
+counts `Lion Keys Filtered`; they stay in the node's filter too.
+
+Deciding on the stored key alone was the first design, and it is wrong twice over. The key may be a
+DEAD row's, so a function the query never calls on a visible row would be called on it: `100 / k >
+3` with `k = 0` only in deleted rows raised a division by zero the ordinary plan does not. Only
+leakproof functions promise not to, and those are the comparisons the walk's bounds answer already.
+And over a type whose equal values may differ - numeric's 1.0 and 1.00 are one entry - the
+representative is not every row's value, which the image rule excludes. The price
+(`lo_cost_walk()`): of the entries the filter rejects, the walk reads the TIDs up to the first
+member and fetches it; of the rest, everything.
+
+### Tests
+
+`test/sql/notequal.sql`: the opclass census and `amvalidate()`; `<>` through the bitmap and the
+plain scan against a sequential scan - commuted, cross-type, nullable, beside a range, a second
+hole, an equality on the same column and another column's sets, a column without the value, a
+summarized column, a multicolumn index, citext, and `<> ANY` with zero, one and two distinct
+elements; the pushdown of each shape, GROUP BY and count(DISTINCT), an OR it declines, the plans,
+a generic plan with a NULL parameter, EXECUTE revoked on `int4ne`; the driver of a count of every
+row and the indexes that cannot be one; a dirty heap and a partitioned table; the walk's hole in
+both directions, with NULLs first and last, beside a range and a list; and the per-entry filter,
+the deleted row it must not evaluate `100 / k` on, and the numeric column it must not be taken on.

@@ -189,7 +189,8 @@ BEGIN
 END
 $$;
 -- ---------- the opclasses ----------
--- strategies 6..9 on every ordered scalar class, nowhere else
+-- strategies 6..9, and `<>`'s 10 (DESIGN.md §35), on every ordered scalar
+-- class, nowhere else
 SELECT o.amopstrategy, count(DISTINCT c.opcname) AS classes
   FROM pg_amop o JOIN pg_opclass c ON c.opcfamily = o.amopfamily
  WHERE o.amopmethod = (SELECT oid FROM pg_am WHERE amname = 'lion')
@@ -206,7 +207,8 @@ SELECT o.amopstrategy, count(DISTINCT c.opcname) AS classes
             7 |      29
             8 |      29
             9 |      29
-(9 rows)
+           10 |      29
+(10 rows)
 
 SELECT c.opcname
   FROM pg_opclass c

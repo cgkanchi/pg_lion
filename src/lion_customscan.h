@@ -519,7 +519,9 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * Kinds of WHERE clause the pushdown understands.  EQ, ARRAY and NULL select
  * rows (they are positive sources of the count); NOTNULL removes them
  * (DESIGN.md §14: the NULL rows are exactly the members of the index's
- * reserved NULL entry, so `IS NOT NULL` is their complement).
+ * reserved NULL entry, so `IS NOT NULL` is their complement), and so does NE
+ * (§35): `col <> c` is every row but those of c's entry and the NULL one, the
+ * union of the two subtracted.
  */
 #define LION_CLAUSE_EQ		0	/* col = const */
 #define LION_CLAUSE_ARRAY	1	/* col = ANY (const array), DESIGN.md §15 */
@@ -529,6 +531,7 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_CLAUSE_RANGE	5	/* col < / <= / >= / > const, DESIGN.md §28 */
 #define LION_CLAUSE_RANGESRC	6	/* the same on a column that does not drive
 									 * the count: a source, DESIGN.md §32 */
+#define LION_CLAUSE_NE		7	/* col <> const, DESIGN.md §35 */
 
 /*
  * A RANGE clause is neither: it is not a source of the count at all, but a
@@ -538,7 +541,12 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * rows whose key lies in it (DESIGN.md §32, "A range as a source").
  */
 #define LION_CLAUSE_IS_POSITIVE(k) \
-	((k) != LION_CLAUSE_NOTNULL && (k) != LION_CLAUSE_RANGE)
+	((k) != LION_CLAUSE_NOTNULL && (k) != LION_CLAUSE_RANGE && \
+	 (k) != LION_CLAUSE_NE)
+
+/* ... and which are subtracted: a negated source (DESIGN.md §14, §35) */
+#define LION_CLAUSE_IS_NEGATED(k) \
+	((k) == LION_CLAUSE_NOTNULL || (k) == LION_CLAUSE_NE)
 
 /*
  * Which clause kinds pin their column to ONE value, so that a target list
@@ -945,7 +953,15 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  *		walk takes them (the first is the one member 2 names, and the second
  *		slot there is 0: nothing is the inner side of a nested loop), and
  *		an OidList of the lion index each is read from
- *	16	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	16	IntList: the column a sum over EVERY row drives by, or empty
+ *		(DESIGN.md §35, "Every row"): with LION_FLAG_SUMALL and nothing in
+ *		the WHERE that selects rows - `count(*)` alone, or beside `IS NOT
+ *		NULL` and `<>` clauses only - the planner picks the lion-indexed
+ *		column with the fewest entries, whose entries, the NULL one included,
+ *		are every row of the table; attnum the PARENT's.  Empty for a sum
+ *		driven by a range, or by the first `IS NOT NULL`, which name their
+ *		column themselves
+ *	17	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -964,7 +980,8 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_PRIV_IMPLIED	13
 #define LION_PRIV_FACTGROUP	14
 #define LION_PRIV_GROUPN		15
-#define LION_PRIV_TLKINDS	16
+#define LION_PRIV_ALLROWS	16
+#define LION_PRIV_TLKINDS	17
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -1020,6 +1037,12 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * LION_TL_WHEREKEY: the decoded walk of DESIGN.md §34, of up to
  * LION_MAX_GROUPCOLS columns.
  *
+ * Shape 19 added the ALLROWS member (16) in front of the target-list kinds,
+ * and the NE clause kind of DESIGN.md §35: a sum over every row driven by a
+ * column no clause names, which an older build would have looked for among
+ * the clauses and not found, and a `<>` it would have counted as an
+ * equality.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1032,8 +1055,8 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424912
-#define LION_PRIV_NMEMBERS	17
+#define LION_PRIV_MAGIC		0x52424913
+#define LION_PRIV_NMEMBERS	18
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -1356,6 +1379,9 @@ typedef struct LionCountScanState
 	bool		sumall;			/* no GROUP BY, but every entry of the group
 								 * index is counted and summed (DESIGN.md §14,
 								 * `col IS NOT NULL` with nothing else) */
+	AttrNumber	allattno;		/* ... of this column, the plan's choice, when
+								 * nothing names it (DESIGN.md §35, "Every
+								 * row"); 0 otherwise */
 	bool		hasgroupidx;	/* an index's entries drive the count */
 
 	/*
