@@ -163,7 +163,7 @@ lion_range_test(LionRange *range, const LionEntryTuple *entry)
 	if (lion_entry_kind(entry) != LION_KIND_VALUE)
 		return LION_RANGE_SKIP;
 
-	key = lion_fetch_key(state, LionEntryGetKey(entry));
+	key = lion_entry_key(state, entry);
 
 	for (i = 0; i < range->nbounds; i++)
 	{
@@ -191,7 +191,7 @@ lion_range_fails_upper(LionRange *range, const LionEntryTuple *entry)
 	int			i;
 
 	Assert(lion_entry_kind(entry) == LION_KIND_VALUE);
-	key = lion_fetch_key(range->state, LionEntryGetKey(entry));
+	key = lion_entry_key(range->state, entry);
 
 	for (i = 0; i < range->nbounds; i++)
 	{
@@ -675,6 +675,8 @@ lion_scan_keycopy(LionEntryScan *es, const LionEntryTuple *entry, char **bufp,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lion index \"%s\": a summary key of %u bytes",
 						RelationGetRelationName(es->index), entry->keylen)));
+	/* the copy goes to the opclass functions as it is (lion_check_key()) */
+	lion_check_key(es->state, LionEntryGetKey(entry), entry->keylen);
 	if (*bufp == NULL)
 		*bufp = (char *) MemoryContextAlloc(es->phasecxt, LION_MAX_KEY_SIZE);
 	memcpy(*bufp, LionEntryGetKey(entry), entry->keylen);
@@ -682,17 +684,17 @@ lion_scan_keycopy(LionEntryScan *es, const LionEntryTuple *entry, char **bufp,
 }
 
 /*
- * Compare a stored key of the walk's column with another stored one, under the
- * column's own comparison: how a key is put on one side or the other of a
- * bucket boundary (DESIGN.md §32).
+ * Compare the key of an entry of the walk's column with a stored one the walk
+ * kept (lion_scan_keycopy()), under the column's own comparison: how a key is
+ * put on one side or the other of a bucket boundary (DESIGN.md §32).
  */
 static int
-lion_scan_keycmp(LionEntryScan *es, const char *a, const char *b)
+lion_scan_keycmp(LionEntryScan *es, const LionEntryTuple *a, const char *b)
 {
 	LionState  *st = es->state;
 
 	return DatumGetInt32(FunctionCall2Coll(&st->cmpproc, st->collation,
-										   lion_fetch_key(st, a),
+										   lion_entry_key(st, a),
 										   lion_fetch_key(st, b)));
 }
 
@@ -723,7 +725,7 @@ lion_scan_bucket_inside(LionEntryScan *es, const LionEntryTuple *entry)
 	if (es->part == LION_WALK_ALL || es->part == LION_WALK_ABOVE)
 		return true;
 
-	key = lion_fetch_key(es->state, LionEntryGetKey(entry));
+	key = lion_entry_key(es->state, entry);
 	for (i = 0; i < range->nbounds; i++)
 	{
 		LionRangeBound *b = &range->bounds[i];
@@ -1022,8 +1024,13 @@ lion_entry_scan_remember(LionEntryScan *es, const LionEntryTuple *entry)
 	 */
 	es->lastkey = (char *) MemoryContextAlloc(es->cxt,
 											  Max((Size) entry->keylen, 1));
+
 	if (entry->keylen > 0)
+	{
+		/* the next read hands the copy to the opclass functions (§21) */
+		lion_check_key(es->state, LionEntryGetKey(entry), entry->keylen);
 		memcpy(es->lastkey, LionEntryGetKey(entry), entry->keylen);
+	}
 	es->haslast = true;
 }
 
@@ -1076,10 +1083,10 @@ lion_entry_scan_selects(LionEntryScan *es, const LionEntryTuple *entry,
 		if (kind != LION_KIND_VALUE)
 			return false;
 		if (es->hasclipmin &&
-			lion_scan_keycmp(es, LionEntryGetKey(entry), es->clipmin) <= 0)
+			lion_scan_keycmp(es, entry, es->clipmin) <= 0)
 			return false;
 		if (es->hasclipmax &&
-			lion_scan_keycmp(es, LionEntryGetKey(entry), es->clipmax) > 0)
+			lion_scan_keycmp(es, entry, es->clipmax) > 0)
 		{
 			*stop = true;
 			return false;

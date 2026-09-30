@@ -561,8 +561,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 
 			if (lion_probe_entry_alive(ph, index, items[k], sizes[k]))
 			{
-				*value = datumCopy(lion_fetch_key(state,
-												  LionEntryGetKey(items[k])),
+				*value = datumCopy(lion_entry_key(state, items[k]),
 								   state->typbyval, state->typlen);
 				found = true;
 			}

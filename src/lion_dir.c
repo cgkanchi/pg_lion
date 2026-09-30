@@ -297,7 +297,7 @@ lion_cmp_prefix(const LionEntryTuple *item, const LionSearchKey *sk)
 
 	if (sk->cmpproc != NULL)
 	{
-		Datum		stored = lion_fetch_key(sk->col, LionEntryGetKey(item));
+		Datum		stored = lion_entry_key(sk->col, item);
 		int32		c = DatumGetInt32(FunctionCall2Coll(sk->cmpproc,
 														sk->collation,
 														stored, sk->key));
@@ -414,7 +414,7 @@ lion_search_key_exact(LionIndexState *ix, LionSearchKey *sk,
 
 		lion_search_key_init(col, sk, kind,
 							 LION_KIND_HAS_KEY(kind) ?
-							 lion_fetch_key(col, LionEntryGetKey(entry)) :
+							 lion_entry_key(col, entry) :
 							 (Datum) 0,
 							 entry->hash);
 	}
@@ -881,8 +881,7 @@ lion_dir_find_by_scan(Relation index, LionIndexState *ix,
 				continue;
 			if (sk->kind == LION_KIND_VALUE &&
 				!DatumGetBool(FunctionCall2Coll(sk->eqproc, sk->collation,
-												lion_fetch_key(sk->col,
-															   LionEntryGetKey(e)),
+												lion_entry_key(sk->col, e),
 												sk->key)))
 				continue;
 
@@ -998,8 +997,7 @@ lion_dir_scan_run_ext(Relation index, const LionSearchKey *sk,
 			 */
 			if (sk->kind != LION_KIND_VALUE ||
 				DatumGetBool(FunctionCall2Coll(sk->eqproc, sk->collation,
-											   lion_fetch_key(sk->col,
-															  LionEntryGetKey(e)),
+											   lion_entry_key(sk->col, e),
 											   sk->key)))
 			{
 				*bufp = buf;

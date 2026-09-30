@@ -589,7 +589,7 @@ lion_verify_summary_after(LionVerifySumState *ss, const char *lo,
 			break;
 		if (lo != NULL && !LionEntryIsSumLast(e) &&
 			DatumGetInt32(FunctionCall2Coll(&col->cmpproc, col->collation,
-											lion_fetch_key(col, LionEntryGetKey(e)),
+											lion_entry_key(col, e),
 											lokey)) <= 0)
 		{
 			off = OffsetNumberNext(off);

@@ -1010,7 +1010,8 @@ lion_store_key(LionState *state, Datum key, char *dest)
 /*
  * Reconstruct a key Datum from stored bytes.  For by-reference types the
  * result points into src, so it is only valid while the caller keeps the
- * page pinned.
+ * page pinned.  Bytes that came off a page go through lion_entry_key() or
+ * lion_check_key() first.
  */
 Datum
 lion_fetch_key(LionState *state, const char *src)
@@ -1024,6 +1025,67 @@ lion_fetch_key(LionState *state, const char *src)
 	}
 
 	return PointerGetDatum(src);
+}
+
+/*
+ * A STORED KEY IS DATA.  Every other byte of a page is checked before it is
+ * followed or copied (DESIGN.md §21, "Readers"), and a key has to be too,
+ * because it goes where nothing checks anything: into the opclass functions,
+ * which take a Datum on trust.  Two damaged bytes of a text key, 01 01, are
+ * the header of an INDIRECT TOAST pointer, and the first descent that
+ * compared against it had texteq() detoast through whatever pointer the page
+ * held - a SIGSEGV (2026-09-29 review); a header that claims more bytes than
+ * the key has sends a function past the item.  So a key read off a page is
+ * checked for exactly the form lion_store_key() gives it, which is also what
+ * lion_index_verify() checks (lion_verify_keylen()):
+ *
+ *	by value		sizeof(Datum) bytes;
+ *	fixed length	typlen bytes;
+ *	varlena			a plain 4-byte header whose length is the key's -
+ *					PG_DETOAST_DATUM() gives every stored key one, never a
+ *					short, compressed or external one;
+ *	cstring			its terminating NUL as its last byte, and no other;
+ *
+ * and 1 .. LION_MAX_KEY_SIZE bytes in any case.  A few comparisons (a strnlen
+ * for a cstring), next to the function call they guard.
+ */
+bool
+lion_key_is_valid(LionState *state, const char *key, Size keylen)
+{
+	if (keylen == 0 || keylen > LION_MAX_KEY_SIZE)
+		return false;
+	if (state->typbyval)
+		return keylen == sizeof(Datum);
+	if (state->typlen > 0)
+		return keylen == (Size) state->typlen;
+	if (state->typlen == -1)
+		return keylen >= VARHDRSZ && VARATT_IS_4B_U(key) &&
+			VARSIZE(key) == keylen;
+	return strnlen(key, keylen) == keylen - 1;
+}
+
+/* The same as an ERROR (ERRCODE_INDEX_CORRUPTED). */
+void
+lion_check_key(LionState *state, const char *key, Size keylen)
+{
+	if (unlikely(!lion_key_is_valid(state, key, keylen)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index entry of key column %u has a malformed key of %zu bytes",
+						state->attno, keylen)));
+}
+
+/*
+ * The key of an entry that came off a page - a leaf's or a pivot's, or a
+ * private copy of one - for the opclass functions: lion_fetch_key() of it
+ * once lion_check_key() has passed it.  Only for an entry whose kind has a
+ * key (LION_KIND_HAS_KEY()), of the column state is for.
+ */
+Datum
+lion_entry_key(LionState *state, const LionEntryTuple *entry)
+{
+	lion_check_key(state, LionEntryGetKey(entry), entry->keylen);
+	return lion_fetch_key(state, LionEntryGetKey(entry));
 }
 
 bool

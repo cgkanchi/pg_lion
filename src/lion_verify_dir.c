@@ -129,8 +129,8 @@ lion_verify_run_add(LionVerifyState *vs, LionVerifyRun *run,
 			LionState  *col = lion_column(vs->ix, (AttrNumber) item->attno);
 
 			same = lion_keys_equal(col,
-								   lion_fetch_key(col, LionEntryGetKey(other)),
-								   lion_fetch_key(col, LionEntryGetKey(item)));
+								   lion_entry_key(col, other),
+								   lion_entry_key(col, item));
 		}
 		if (same)
 			lion_corrupt("lion index \"%s\": entry %u on block %u is a second entry for the key of an entry on block %u",
