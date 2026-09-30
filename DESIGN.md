@@ -1310,18 +1310,33 @@ compared its keys under its own collation; `col = key` compares under the key's 
 one of its own - an explicit COLLATE, or a column of another collation, read from the argument's own
 expression (`lion_count_arg_collation()`, so that the two-key form's keys are taken one by one, as
 the two clauses of its query are) - and otherwise under the column's: a literal or a parameter brings
-the default collation, which gives way to the column's in the parser's rule for an operator's inputs
-(an explicit COLLATE "default" therefore reads as none). The column's collation is the table
-column's, or the expression's for an expression column, and need not be the index's: `(c COLLATE
-"x")` keeps c and compares under x. Two deterministic collations agree on which values are equal -
-each calls two values equal when their bytes are - so a count under another deterministic collation
-than the index's is made, and is the query's. A nondeterministic one agrees with no other: a
-case-insensitive index counts 'ABC' under the key 'abc', and `c = 'abc'` under the column's own
-collation does not; so where either collation is nondeterministic and the two differ the count is
-an ERROR (`collation_mismatch`), never a different number. `lion_index_count_group_stats()` stands for
-`GROUP BY col`, which groups under the column's collation, and is refused the same way.
+the default collation, which gives way to the column's in the parser's rule for an operator's inputs.
+The column's collation is the table column's, or the expression's for an expression column, and need
+not be the index's: `(c COLLATE "x")` keeps c and compares under x. Two deterministic collations
+agree on which values are equal - each calls two values equal when their bytes are - so a count
+under another deterministic collation than the index's is made, and is the query's. A
+nondeterministic one agrees with no other: a case-insensitive index counts 'ABC' under the key
+'abc', and `c = 'abc'` under the column's own collation does not; so where either collation is
+nondeterministic and the two differ the count is an ERROR (`collation_mismatch`), never a different
+number. `lion_index_count_group_stats()` stands for `GROUP BY col`, which groups under the column's
+collation, and is refused the same way.
+*A key of the default collation* (2026-09-29 review) is the one the call cannot read. An explicit
+`COLLATE "default"` does not give way to the column's collation - `c = 'abc' COLLATE "default"` on a
+case-insensitive column counts 'abc' alone - but the planner folds a COLLATE into the literal or the
+parameter under it (`eval_const_expressions()` turns the CollateExpr into the Const's own
+`constcollid`), and the function's `inputcollid` is "default" either way, so the FuncExpr the
+function is handed is the same with it and without it. Taken for no COLLATE at all, as it was, it
+counted 'ABC' too: 600 rows where the query counts 200. Both readings are taken instead, and the
+count is made only where both would make it. They part on one case alone, a column of a
+nondeterministic collation counted through an index under that collation: the literal's reading
+counts, the explicit one is refused. That case is an ERROR (`indeterminate_collation`) whose hint
+says to name the column's collation on the key (`'abc'::text COLLATE case_insensitive`), which is
+then counted as the column's queries count; everywhere else - every column of a deterministic
+collation, the database's default among them, since a default collation is always deterministic -
+nothing changed. A key taken from a column brings that column's collation and is read as such.
 `test/sql/countcoll.sql` covers both halves; the nondeterministic one needs ICU and a UTF8 database
-and is skipped without them (`countcoll_1.out`), as it is on CI's source builds.
+and is skipped without them (`countcoll_1.out`), as it is on CI's source builds;
+`test/sql/countcoll_default.sql` the default collation's key, likewise.
 **A NULL argument answers NULL**, where `count(*) WHERE col = NULL` answers 0: the functions are
 STRICT, deliberately (2026-09-25 review, kept). PostgreSQL never calls a STRICT function with a NULL
 argument - a NULL constant folds the call away when the query is planned - so no count is made,

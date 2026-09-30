@@ -78,7 +78,10 @@ SELECT lion_index_count('lcc_ci_i', 'abc'::text COLLATE lcc_ci, 'lcc_m', 0) AS l
 	   (SELECT count(*) FROM lcc WHERE t COLLATE lcc_ci = 'abc' AND m = 0) AS query;
 
 -- a column of the case-insensitive collation: its own index counts as its
--- queries do, an index under "C" does not
+-- queries do, an index under "C" does not.  A key of the default collation -
+-- a literal's - is refused even by its own index: the call cannot tell it
+-- from an explicit COLLATE "default", under which the query does not count
+-- 'ABC' (countcoll_default.sql).  Named, the column's collation is counted.
 CREATE TABLE lcc2 (id int, t text COLLATE lcc_ci) WITH (autovacuum_enabled = off);
 INSERT INTO lcc2 SELECT g, (ARRAY['abc', 'ABC', 'Abc', 'xyz'])[1 + g % 4]
   FROM generate_series(1, 400) g;
@@ -87,6 +90,10 @@ CREATE INDEX lcc2_c ON lcc2 USING lion (t COLLATE "C");
 SELECT lion_index_count('lcc2_i', 'abc'::text) AS lion,
 	   (SELECT count(*) FROM lcc2 WHERE t = 'abc') AS query;
 SELECT lion_index_count_any('lcc2_i', ARRAY['abc', 'xyz']) AS lion,
+	   (SELECT count(*) FROM lcc2 WHERE t = ANY (ARRAY['abc', 'xyz'])) AS query;
+SELECT lion_index_count('lcc2_i', 'abc'::text COLLATE lcc_ci) AS lion,
+	   (SELECT count(*) FROM lcc2 WHERE t = 'abc') AS query;
+SELECT lion_index_count_any('lcc2_i', ARRAY['abc', 'xyz'] COLLATE lcc_ci) AS lion,
 	   (SELECT count(*) FROM lcc2 WHERE t = ANY (ARRAY['abc', 'xyz'])) AS query;
 SELECT groups, count FROM lion_index_count_group_stats('lcc2_i');
 SELECT lion_index_count('lcc2_i', 'abc'::text COLLATE "C");
