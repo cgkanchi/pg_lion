@@ -83,11 +83,11 @@ replay, so turning it on for a primary that never replays proves nothing.
 `.local/pg` can be any PostgreSQL 16 or later install.  What the suites need from it:
 
 - **contrib: `citext`, `pageinspect`, `pg_buffercache` and `pg_walinspect`.**  The regression
-  suite creates all four.  Without `pageinspect` the `build`, `corrupt` and `summary` files fail,
-  without `pg_buffercache` the `corrupt`, `pinbudget` and `range` files and the `count_batch_race`
-  and `gettuple_pause` specs fail, without `pg_walinspect` `walrecords` fails, and most files use
-  `citext`.  The PGDG packages (`postgresql-N`) include contrib; a source build needs
-  `make -C contrib install`.
+  suite creates all four.  Without `pageinspect` the `build`, `corrupt`, `corrupt_items` and
+  `summary` files fail, without `pg_buffercache` the `corrupt`, `corrupt_items`, `pinbudget` and
+  `range` files and the `count_batch_race` and `gettuple_pause` specs fail, without
+  `pg_walinspect` `walrecords` fails, and most files use `citext`.  The PGDG packages
+  (`postgresql-N`) include contrib; a source build needs `make -C contrib install`.
 - **`pg_isolation_regress`** for the isolation specs: a source build installs it with
   `make -C src/test/isolation install`, and the packages ship it in `postgresql-server-dev-N`.
 - **`injection_points`** for the specs that park a backend on an injection point: a server
