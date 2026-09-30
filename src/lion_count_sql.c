@@ -828,6 +828,96 @@ lion_index_count_stats(PG_FUNCTION_ARGS)
 }
 
 /*
+ * The count of a list longer than lion_array_batch_size(), located and counted
+ * a batch at a time as the pushdown's plain count locates one (DESIGN.md §15,
+ * "A list too long to locate at once"; lion_count_batched()).  The values are
+ * sorted into the order a lookup locates them in, with their hashes, and the
+ * byte-for-byte repeats dropped; each batch - run on to where the hash
+ * changes, so that no equality class, and no entry, is in two - is located,
+ * counted as the disjoint list it is and released, pins and all, before the
+ * next one is located.  The entries of one scalar index are disjoint (a
+ * multi-key class is refused by lion_count_open_indexes()), so the count of
+ * the list is the sum of the batches' counts.  What is held for the whole
+ * call is the values - the array, and a Datum and a hash each - one batch of
+ * sets, and the visibility cache the batches share, as the node's do.  elems
+ * and nulls, deconstruct_array()'s, are freed once the values are sorted.
+ */
+static int64
+lion_count_any_batched(LionCountCall *call, Snapshot snapshot, int nelems,
+					   Datum *elems, bool *nulls, bool elmbyval, int16 elmlen)
+{
+	Relation	index = call->index[0];
+	int			batch = lion_array_batch_size();
+	LionVisCache *cache;
+	MemoryContext batchcxt;
+	MemoryContext oldcxt;
+	Datum	   *vals;
+	uint32	   *hashes;
+	int			nvals;
+	int			start = 0;
+	int64		count = 0;
+
+	vals = (Datum *) palloc_extended(sizeof(Datum) * Max(nelems, 1),
+									 MCXT_ALLOC_HUGE);
+	hashes = (uint32 *) palloc_extended(sizeof(uint32) * Max(nelems, 1),
+										MCXT_ALLOC_HUGE);
+	nvals = lion_probe_sort(index, 1, call->keytype[0], nelems, elems, nulls,
+							vals, hashes);
+	nvals = lion_probe_sort_unique(vals, hashes, nvals, elmbyval, elmlen);
+	/* a by-reference value points into the array, which the caller keeps */
+	pfree(elems);
+	pfree(nulls);
+
+	cache = lion_vis_cache_create(CurrentMemoryContext);
+	batchcxt = AllocSetContextCreate(CurrentMemoryContext,
+									 "lion index count batch",
+									 ALLOCSET_DEFAULT_SIZES);
+	while (start < nvals)
+	{
+		int			end = start + Min(batch, nvals - start);
+		LionPostingSet *sets;
+		int			nsets;
+		int			nfound;
+		int			i;
+
+		while (end < nvals && hashes[end] == hashes[end - 1])
+			end++;
+
+		oldcxt = MemoryContextSwitchTo(batchcxt);
+		sets = (LionPostingSet *)
+			palloc_extended(sizeof(LionPostingSet) * (end - start),
+							MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
+		nsets = lion_posting_set_lookup_many_col(index, 1, call->keytype[0],
+												 end - start, &vals[start],
+												 NULL, sets, &nfound);
+		if (nfound > 0)
+		{
+			LionCountSource src;
+
+			memset(&src, 0, sizeof(src));
+			src.nsets = nsets;
+			src.sets = sets;
+			src.disjoint = true;
+			count += lion_count_sources_cached(call->heap, snapshot, 1, &src,
+											   NULL, cache, false);
+		}
+		for (i = 0; i < nsets; i++)
+			lion_posting_set_release(&sets[i]);
+		MemoryContextSwitchTo(oldcxt);
+		MemoryContextReset(batchcxt);
+
+		start = end;
+		CHECK_FOR_INTERRUPTS();
+	}
+	MemoryContextDelete(batchcxt);
+	lion_vis_cache_destroy(cache);
+	pfree(vals);
+	pfree(hashes);
+
+	return count;
+}
+
+/*
  * lion_index_count_any(idx, keys) - count(*) WHERE col = ANY (keys), the
  * SQL form of the IN list of DESIGN.md §15: the union of the listed values'
  * posting sets, counted against the visibility map like any other count.
@@ -837,7 +927,11 @@ lion_index_count_stats(PG_FUNCTION_ARGS)
  * k-way merge of lion_ecursor_build() or the disjoint sum.  Unlike the
  * pushdown's literal lists, this has no limit on the number of values: the
  * pins the lookup keeps are budgeted instead (DESIGN.md §15), and the sets
- * past the budget are counted one at a time.
+ * past the budget are counted one at a time.  And a list longer than a
+ * work_mem of located sets is located a batch at a time
+ * (lion_count_any_batched()): every value's set used to be held at once, and
+ * past some nine million values the array of them was larger than an
+ * allocation may be (2026-09-29 review).
  */
 Datum
 lion_index_count_any(PG_FUNCTION_ARGS)
@@ -879,6 +973,14 @@ lion_index_count_any(PG_FUNCTION_ARGS)
 	 * as the type lion_count_open_indexes() resolved that to: a varchar[] is
 	 * looked up as text on a text_ops column, the same bytes.
 	 */
+	if (nelems > lion_array_batch_size())
+	{
+		count = lion_count_any_batched(&call, snapshot, nelems, elems, nulls,
+									   elmbyval, elmlen);
+		lion_count_sql_close(&call);
+		PG_RETURN_INT64(count);
+	}
+
 	sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * Max(nelems, 1));
 	nsets = lion_posting_set_lookup_many_col(call.index[0], 1, call.keytype[0],
 											nelems, elems, nulls, sets,
