@@ -1065,6 +1065,7 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 		bool		dup = false;
 		bool		located;
 		int			steps;
+		LionRightWalk walk;
 
 		/*
 		 * Every so often, with no lock held.  The walk keeps the leaf it
@@ -1151,6 +1152,7 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 				buf = InvalidBuffer;
 			}
 
+			lion_rightwalk_init(&walk);
 			for (steps = 0; BufferIsValid(buf); steps++)
 			{
 				Page		page = BufferGetPage(buf);
@@ -1164,7 +1166,8 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 					buf = InvalidBuffer;
 					break;
 				}
-				buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
+				buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE,
+										  &walk);
 			}
 
 			if (!BufferIsValid(buf))
@@ -1437,6 +1440,7 @@ lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 	bool		moved = false;
 	bool		keeppin = false;
 	int			steps;
+	LionRightWalk rwalk;
 
 	memset(ps, 0, sizeof(LionPostingSet));
 	ps->index = index;
@@ -1468,6 +1472,7 @@ lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 
 	if (had)
 	{
+		lion_rightwalk_init(&rwalk);
 		if (walk->hikeylen == 0 || lion_cmp_entry(walk->hikey, &sk) > 0)
 		{
 			/* on the last leaf, or right of it if it has split since */
@@ -1486,6 +1491,7 @@ lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 			lion_lookup_walk_pause(walk);
 			if (walk->stepok && BlockNumberIsValid(walk->rightlink))
 			{
+				lion_rightwalk_step(index, &rwalk, walk->blk, walk->rightlink);
 				buf = lion_dir_read_leaf(index, walk->rightlink);
 				stepping = true;
 			}
@@ -1509,7 +1515,7 @@ lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 				walk->stepok = false;
 				break;
 			}
-			buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
+			buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE, &rwalk);
 		}
 	}
 	else

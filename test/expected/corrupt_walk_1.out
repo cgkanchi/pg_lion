@@ -1,0 +1,269 @@
+-- A cycle of damaged right links is an ERROR, not a walk (DESIGN.md §21,
+-- "Readers", and §22).
+--
+-- Every walk along the directory leaves or along the leaves of a posting set
+-- steps through LionRightWalk (lion.h): a right link to the page itself or to
+-- the meta page is refused at once, and a walk that has taken more steps than
+-- the index has blocks is going round a cycle.  Before that, one damaged right
+-- link sent the counts, the scans, the ordered walks and VACUUM round the
+-- cycle until they were cancelled - and autovacuum, which nothing cancels,
+-- for ever (2026-09-29 review).  Each case damages a freshly built index ON
+-- DISK the way test/sql/corrupt.sql does (pg_buffercache_evict(), PostgreSQL
+-- 17 and later - on 16 the test is skipped, test/expected/corrupt_walk_1.out),
+-- then runs every walker the damage is in the way of under statement_timeout
+-- and expects INDEX_CORRUPTED (XX002) from each, never the timeout.  The byte
+-- offsets assume a little-endian server, as the page checksum's does.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+CREATE EXTENSION IF NOT EXISTS pg_buffercache;
+RESET client_min_messages;
+SELECT current_setting('server_version_num')::int >= 170000 AS lion_rw_can_evict \gset
+\if :lion_rw_can_evict
+-- a damaged index must fail fast, never loop
+SET statement_timeout = '60s';
+SET max_parallel_workers_per_gather = 0;
+-- A little-endian uint32 at byte off of a bytea, and one as four bytes.
+CREATE FUNCTION lion_rw_u32(f bytea, off int) RETURNS bigint
+LANGUAGE sql IMMUTABLE AS $$
+	SELECT get_byte(f, off)::bigint | (get_byte(f, off + 1)::bigint << 8) |
+		   (get_byte(f, off + 2)::bigint << 16) | (get_byte(f, off + 3)::bigint << 24)
+$$;
+CREATE FUNCTION lion_rw_le32(v bigint) RETURNS bytea
+LANGUAGE sql IMMUTABLE AS $$
+	SELECT set_byte(set_byte(set_byte(set_byte('\x00000000'::bytea,
+		0, (v & 255)::int), 1, ((v >> 8) & 255)::int),
+		2, ((v >> 16) & 255)::int), 3, ((v >> 24) & 255)::int)
+$$;
+-- Block blk of an index's main fork, read from the file, not the buffer pool.
+CREATE FUNCTION lion_rw_block(idx regclass, blk bigint) RETURNS bytea
+LANGUAGE sql AS $$
+	SELECT pg_read_binary_file(pg_relation_filepath(idx),
+							   blk * current_setting('block_size')::int,
+							   current_setting('block_size')::int)
+$$;
+-- Byte offset in its page of item off: lp_off, the low 15 bits of the line
+-- pointer at 24 + 4 * (off - 1).
+CREATE FUNCTION lion_rw_item(page bytea, off int) RETURNS int
+LANGUAGE sql IMMUTABLE AS $$
+	SELECT (lion_rw_u32(page, 24 + 4 * (off - 1)) & 32767)::int
+$$;
+-- The directory's height and its n-th leaf, for a directory of height 1: the
+-- root (LionMetaPageData after the 24-byte page header: root at +20, height
+-- at +24) is the rightmost page of its level, so its items are all downlinks,
+-- in key order, each a LionEntryTuple whose `head` at +8 is the child.
+CREATE FUNCTION lion_rw_height(idx regclass) RETURNS bigint
+LANGUAGE sql AS $$
+	SELECT lion_rw_u32(lion_rw_block(idx, 0), 48)
+$$;
+CREATE FUNCTION lion_rw_leaf(idx regclass, n int) RETURNS bigint
+LANGUAGE sql AS $$
+	SELECT lion_rw_u32(r, lion_rw_item(r, n) + 8)
+	  FROM lion_rw_block(idx, lion_rw_u32(lion_rw_block(idx, 0), 44)) r
+$$;
+-- The n-th leaf of the posting set of key: the root lion_index_posting_root()
+-- names is an internal page of LionPostingPivot downlinks (ckey, then the
+-- child at +4), and the only page of its level, so every item is a downlink.
+CREATE FUNCTION lion_rw_posting_leaf(idx regclass, key int, n int) RETURNS bigint
+LANGUAGE sql AS $$
+	SELECT lion_rw_u32(r, lion_rw_item(r, n) + 4)
+	  FROM lion_rw_block(idx, lion_index_posting_root(idx, key)) r
+$$;
+-- Write an index out and drop its pages from the buffer pool, so that the
+-- file is what the next read sees.
+CREATE FUNCTION lion_rw_evict(idx regclass) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+	CHECKPOINT;
+	PERFORM pg_buffercache_evict(bufferid)
+	   FROM pg_buffercache
+	  WHERE relfilenode = pg_relation_filenode(idx)
+		AND reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database());
+END $$;
+-- Point block blk's right link at block target: the link is the first field
+-- of the special area, which starts at pd_special, the uint16 at byte 16.
+-- The page gets its new checksum (data checksums are on by default from
+-- PostgreSQL 18; pd_checksum is the uint16 at byte 8) and the file is written
+-- back.
+CREATE FUNCTION lion_rw_link(idx regclass, blk bigint, target bigint)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+	path text := pg_relation_filepath(idx);
+	bs int := current_setting('block_size')::int;
+	f bytea := pg_read_binary_file(path);
+	page bytea;
+	ck int;
+	lo oid;
+BEGIN
+	page := substring(f FROM (blk * bs)::int + 1 FOR bs);
+	page := overlay(page PLACING lion_rw_le32(target)
+					FROM (lion_rw_u32(page, 16) & 65535)::int + 1);
+	ck := page_checksum(page, blk::int)::int & 65535;
+	page := overlay(page PLACING set_byte(set_byte('\x0000'::bytea, 0, ck & 255), 1, ck >> 8)
+					FROM 9);
+	f := overlay(f PLACING page FROM (blk * bs)::int + 1);
+	lo := lo_from_bytea(0, f);
+	PERFORM lo_export(lo, path);
+	PERFORM lo_unlink(lo);
+END $$;
+-- Run a query and say which walker the plan chose - the first lion scan node
+-- of EXPLAIN, "no scan" for a plan without one (a function's), "planning"
+-- when the planner itself failed - and how the query ended: its SQLSTATE and
+-- message with the numbers out.  A statement_timeout is not caught here, and
+-- fails the test.
+CREATE FUNCTION lion_rw_run(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	node text := NULL;
+	planned boolean := false;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF node IS NULL THEN
+			node := substring(ln FROM 'LionCount|LionOrdered|Bitmap Index Scan|Index Scan');
+		END IF;
+	END LOOP;
+	planned := true;
+	EXECUTE q;
+	RETURN coalesce(node, 'no scan') || ': ok';
+EXCEPTION WHEN OTHERS THEN
+	RETURN CASE WHEN planned THEN coalesce(node, 'no scan') ELSE 'planning' END ||
+		': ' || SQLSTATE || ': ' || regexp_replace(SQLERRM, '[0-9]+', 'N', 'g');
+END $$;
+-- ---------- 1. directory leaves in a cycle ----------
+-- The third leaf's right link goes back to the second: 2 -> 3 -> 2 -> ...
+-- Every walk of the column's entries from the left went round it.
+CREATE TABLE lion_rw_d (k int NOT NULL);
+INSERT INTO lion_rw_d SELECT i FROM generate_series(1, 3000) i;
+CREATE INDEX lion_rw_di ON lion_rw_d USING lion (k);
+SELECT lion_rw_evict('lion_rw_di');
+SELECT lion_rw_height('lion_rw_di') = 1 AS one_level_of_leaves;
+SELECT lion_rw_link('lion_rw_di', lion_rw_leaf('lion_rw_di', 3),
+					lion_rw_leaf('lion_rw_di', 2));
+SET enable_seqscan = off;
+-- LionCount of a range: the walk of its entries (LionEntryScan)
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SELECT lion_rw_run('SELECT count(*) FROM lion_rw_d WHERE k > 10');
+SELECT lion_rw_run('SELECT k, count(*) FROM lion_rw_d WHERE k > 10 GROUP BY k');
+RESET enable_indexscan;
+-- the scans: the walk of the range's leaves (LionLeafWalk)
+SET pg_lion.enable_count_pushdown = off;
+SELECT lion_rw_run('SELECT count(*) FROM lion_rw_d WHERE k > 10');
+RESET enable_bitmapscan;
+SET enable_indexscan = off;
+SELECT lion_rw_run('SELECT count(*) FROM lion_rw_d WHERE k > 10');
+RESET enable_indexscan;
+RESET pg_lion.enable_count_pushdown;
+-- LionOrdered: the ordered walk rightwards, and leftwards, where finding a
+-- leaf's left sibling walks right from its left link (lion_dir_step_left())
+SET enable_sort = off;
+SELECT lion_rw_run('SELECT k FROM lion_rw_d WHERE k > 10 ORDER BY k');
+SELECT lion_rw_run('SELECT k FROM lion_rw_d WHERE k < 2990 ORDER BY k DESC');
+RESET enable_sort;
+-- VACUUM's walk of the leaves (pass 1), and lion_index_verify(), which
+-- always caught it
+DELETE FROM lion_rw_d WHERE k = 5;
+VACUUM (INDEX_CLEANUP ON) lion_rw_d;
+SELECT lion_rw_run($$SELECT lion_index_verify('lion_rw_di')$$);
+RESET enable_seqscan;
+DROP TABLE lion_rw_d;
+-- ---------- 2. a directory leaf whose right link is itself ----------
+-- The first leaf.  A count of every key walks from it, and so does the
+-- planner's endpoint probe (DESIGN.md §28) for a bound below the histogram,
+-- which steps right from a leaf whose keys have no live row: those are
+-- deleted here, and not vacuumed away.
+CREATE TABLE lion_rw_s (k int NOT NULL) WITH (autovacuum_enabled = off);
+INSERT INTO lion_rw_s SELECT i FROM generate_series(1, 3000) i;
+CREATE INDEX lion_rw_si ON lion_rw_s USING lion (k);
+ANALYZE lion_rw_s;
+DELETE FROM lion_rw_s WHERE k <= 300;
+SELECT lion_rw_evict('lion_rw_si');
+SELECT lion_rw_link('lion_rw_si', lion_rw_leaf('lion_rw_si', 1),
+					lion_rw_leaf('lion_rw_si', 1));
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SELECT lion_rw_run('SELECT k, count(*) FROM lion_rw_s GROUP BY k');
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+SELECT lion_rw_run('SELECT * FROM lion_rw_s WHERE k < 2');
+VACUUM (INDEX_CLEANUP ON) lion_rw_s;
+RESET enable_seqscan;
+DROP TABLE lion_rw_s;
+-- ---------- 3. the leaves of a posting set in a cycle ----------
+-- Two keys taking alternate rows, so that each key's containers are dense
+-- bitsets and its posting set a tree of several leaves (as in
+-- test/sql/posting_tree.sql).  Key 1's second leaf's right link goes back to
+-- its first.  Every read of the key went round it: the count, the bitmap and
+-- plain scans, LionOrdered and the SQL count, and VACUUM's pass 2.
+CREATE TABLE lion_rw_p (p int NOT NULL);
+INSERT INTO lion_rw_p SELECT i % 2 FROM generate_series(1, 60000) i;
+CREATE INDEX lion_rw_pi ON lion_rw_p USING lion (p);
+SELECT lion_rw_evict('lion_rw_pi');
+SELECT lion_rw_link('lion_rw_pi', lion_rw_posting_leaf('lion_rw_pi', 1, 2),
+					lion_rw_posting_leaf('lion_rw_pi', 1, 1));
+SET enable_seqscan = off;
+SELECT lion_rw_run('SELECT count(*) FROM lion_rw_p WHERE p = 1');
+SELECT lion_rw_run($$SELECT lion_index_count('lion_rw_pi', 1)$$);
+SET pg_lion.enable_count_pushdown = off;
+SET enable_indexscan = off;
+SELECT lion_rw_run('SELECT count(*) FROM lion_rw_p WHERE p = 1');
+RESET enable_indexscan;
+SET enable_bitmapscan = off;
+SELECT lion_rw_run('SELECT count(*) FROM lion_rw_p WHERE p = 1');
+RESET enable_bitmapscan;
+RESET pg_lion.enable_count_pushdown;
+SET enable_sort = off;
+SELECT lion_rw_run('SELECT p FROM lion_rw_p WHERE p >= 1 ORDER BY p');
+RESET enable_sort;
+-- the other key is sound, and still answers
+SELECT lion_rw_run('SELECT count(*) FROM lion_rw_p WHERE p = 0');
+DELETE FROM lion_rw_p WHERE ctid = '(0,1)';
+VACUUM (INDEX_CLEANUP ON) lion_rw_p;
+SELECT lion_rw_run($$SELECT lion_index_verify('lion_rw_pi')$$);
+RESET enable_seqscan;
+DROP INDEX lion_rw_pi;
+-- ---------- 4. a posting leaf whose right link is the meta page ----------
+-- A reader took block 0 for a page the set no longer owns - which is what a
+-- freed page looks like - and ended the set there: the count came out short,
+-- without a word.
+CREATE INDEX lion_rw_pi ON lion_rw_p USING lion (p);
+SELECT count(*) AS rows_of_key_1 FROM lion_rw_p WHERE p = 1;
+SELECT lion_rw_evict('lion_rw_pi');
+SELECT lion_rw_link('lion_rw_pi', lion_rw_posting_leaf('lion_rw_pi', 1, 1), 0);
+SET enable_seqscan = off;
+SELECT lion_rw_run('SELECT count(*) FROM lion_rw_p WHERE p = 1');
+SELECT lion_rw_run($$SELECT lion_index_count('lion_rw_pi', 1)$$);
+SET pg_lion.enable_count_pushdown = off;
+SET enable_indexscan = off;
+SELECT lion_rw_run('SELECT count(*) FROM lion_rw_p WHERE p = 1');
+RESET enable_indexscan;
+RESET pg_lion.enable_count_pushdown;
+RESET enable_seqscan;
+DROP INDEX lion_rw_pi;
+-- ---------- an undamaged index still works, and the rows are all there ----------
+CREATE INDEX lion_rw_pi ON lion_rw_p USING lion (p);
+SET enable_seqscan = off;
+SELECT lion_rw_run('SELECT count(*) FROM lion_rw_p WHERE p = 1');
+SELECT count(*) FROM lion_rw_p WHERE p = 1;
+RESET enable_seqscan;
+SELECT lion_index_verify('lion_rw_pi');
+RESET statement_timeout;
+RESET max_parallel_workers_per_gather;
+DROP TABLE lion_rw_p;
+DROP FUNCTION lion_rw_run(text);
+DROP FUNCTION lion_rw_link(regclass, bigint, bigint);
+DROP FUNCTION lion_rw_evict(regclass);
+DROP FUNCTION lion_rw_posting_leaf(regclass, int, int);
+DROP FUNCTION lion_rw_leaf(regclass, int);
+DROP FUNCTION lion_rw_height(regclass);
+DROP FUNCTION lion_rw_item(bytea, int);
+DROP FUNCTION lion_rw_block(regclass, bigint);
+DROP FUNCTION lion_rw_le32(bigint);
+DROP FUNCTION lion_rw_u32(bytea, int);
+\else
+\echo 'pg_buffercache_evict() needs PostgreSQL 17: skipped'
+pg_buffercache_evict() needs PostgreSQL 17: skipped
+\endif

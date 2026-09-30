@@ -303,6 +303,21 @@ lion_rightwalk_exceeded(Relation index, LionRightWalk *walk, BlockNumber blk)
 	walk->limit = nblocks;
 }
 
+/* blk's right link names blk itself or the meta page (see lion.h). */
+void
+lion_rightwalk_badlink(Relation index, BlockNumber blk, BlockNumber next)
+{
+	if (next == blk)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": the right link of block %u is the block itself",
+						RelationGetRelationName(index), blk)));
+	ereport(ERROR,
+			(errcode(ERRCODE_INDEX_CORRUPTED),
+			 errmsg("lion index \"%s\": the right link of block %u is the meta page",
+					RelationGetRelationName(index), blk)));
+}
+
 /*
  * Read blk, lock it in lockmode and check that it is still a page of the
  * posting set rooted at head (DESIGN.md §18).
@@ -396,8 +411,7 @@ lion_posting_step_right(Relation index, Buffer buf, BlockNumber head,
 {
 	BlockNumber next = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
 
-	Assert(BlockNumberIsValid(next));
-	lion_rightwalk_step(index, walk, BufferGetBlockNumber(buf));
+	lion_rightwalk_step(index, walk, BufferGetBlockNumber(buf), next);
 	UnlockReleaseBuffer(buf);
 
 	/* Between the pages, where no content lock holds interrupts off. */
@@ -1589,7 +1603,7 @@ lion_posting_scan_for_downlink(Relation index, Relation heaprel, uint32 hash,
 			UnlockReleaseBuffer(buf);
 			return InvalidBuffer;
 		}
-		lion_rightwalk_step(index, &walk, blk);
+		lion_rightwalk_step(index, &walk, blk, next);
 		UnlockReleaseBuffer(buf);
 		CHECK_FOR_INTERRUPTS();
 		blk = next;
@@ -1673,6 +1687,7 @@ lion_posting_adopt(Relation index, Relation heaprel, uint32 hash,
 		{
 			Buffer		buf;
 			Page		page;
+			BlockNumber next;
 
 			buf = lion_posting_getbuf(index, blk, head, BUFFER_LOCK_SHARE, true);
 			page = BufferGetPage(buf);
@@ -1686,8 +1701,10 @@ lion_posting_adopt(Relation index, Relation heaprel, uint32 hash,
 				!BlockNumberIsValid(firstflagged))
 				firstflagged = blk;
 
-			lion_rightwalk_step(index, &walk, blk);
-			blk = LionPageGetOpaque(page)->rightlink;
+			next = LionPageGetOpaque(page)->rightlink;
+			if (BlockNumberIsValid(next))
+				lion_rightwalk_step(index, &walk, blk, next);
+			blk = next;
 			UnlockReleaseBuffer(buf);
 			CHECK_FOR_INTERRUPTS();
 		}
@@ -1701,6 +1718,7 @@ lion_posting_adopt(Relation index, Relation heaprel, uint32 hash,
 			{
 				Buffer		buf;
 				Page		page;
+				BlockNumber next;
 
 				/* The walk above passed these pages and met no held one. */
 				if (BufferIsValid(lion_posting_held_buffer(held, blk)))
@@ -1724,8 +1742,10 @@ lion_posting_adopt(Relation index, Relation heaprel, uint32 hash,
 					}
 				}
 
-				lion_rightwalk_step(index, &walk, blk);
-				blk = LionPageGetOpaque(page)->rightlink;
+				next = LionPageGetOpaque(page)->rightlink;
+				if (BlockNumberIsValid(next))
+					lion_rightwalk_step(index, &walk, blk, next);
+				blk = next;
 				UnlockReleaseBuffer(buf);
 				CHECK_FOR_INTERRUPTS();
 			}
