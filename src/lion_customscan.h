@@ -179,8 +179,25 @@
 #define LION_TL_COUNT_DISTCOL	7	/* count(k) of that same k: its non-NULL
 									 * rows, which a nullable k allows nowhere
 									 * else */
+/*
+ * The third and later GROUP BY columns of the decoded walk (DESIGN.md §34):
+ * LION_TL_GROUPKEYN(g) is the key of plan column g, 2 <= g <
+ * LION_MAX_GROUPCOLS, and LION_TL_COUNT_GROUPCOLN(g) is count() of it - 0 in
+ * its NULL group - as LION_TL_GROUPKEY2 and LION_TL_COUNT_GROUPCOL2 are of
+ * column 1.
+ */
+#define LION_TL_GROUPKEYN(g)		(8 + (g) - 2)
+#define LION_TL_COUNT_GROUPCOLN(g)	(8 + (LION_MAX_GROUPCOLS - 2) + (g) - 2)
+#define LION_TL_IS_GROUPKEYN(kind)	((kind) >= 8 && \
+									 (kind) < 8 + (LION_MAX_GROUPCOLS - 2))
+#define LION_TL_IS_COUNT_GROUPCOLN(kind) \
+	((kind) >= 8 + (LION_MAX_GROUPCOLS - 2) && \
+	 (kind) < 8 + 2 * (LION_MAX_GROUPCOLS - 2))
+#define LION_TL_GROUPN_COL(kind)	((kind) < 8 + (LION_MAX_GROUPCOLS - 2) ? \
+									 (kind) - 8 + 2 : \
+									 (kind) - 8 - (LION_MAX_GROUPCOLS - 2) + 2)
 /* LION_TL_WHEREKEY + i: the key stored in the i'th clause's entry */
-#define LION_TL_WHEREKEY		8
+#define LION_TL_WHEREKEY		(8 + 2 * (LION_MAX_GROUPCOLS - 2))
 
 /*
  * A column of the FK-side join's child plan (DESIGN.md §27): the dimension
@@ -488,11 +505,15 @@
 #define LION_FKJOIN_LOOKUP_COST	(lion_fkjoin_lookup_cost * cpu_operator_cost)
 
 /*
- * How many GROUP BY columns the node understands (DESIGN.md §20).  One is
- * driven by that index's entry scan; two are the nested loop of
- * lion_next_group2(), whose cost is the product of the two entry counts.
+ * How many GROUP BY columns the node understands.  One is driven by that
+ * index's entry scan; two are the nested loop of lion_next_group2() (DESIGN.md
+ * §20), whose cost is the product of the two entry counts; three and more are
+ * the decoded walk of DESIGN.md §34, which reads every column's sets once, key
+ * by key, whatever the number of their combinations.
  */
-#define LION_MAX_GROUPCOLS	2
+#define LION_MAX_GROUPCOLS	8
+StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
+				 "the decoded walk takes every GROUP BY column the node does");
 
 /*
  * Kinds of WHERE clause the pushdown understands.  EQ, ARRAY and NULL select
@@ -649,6 +670,32 @@
 #define LION_RANGE_FOLD_COST	(lion_range_fold_cost * cpu_operator_cost)
 
 /*
+ * The decoded walk of DESIGN.md §34, per unit of its work, fitted to a
+ * release build (PostgreSQL 16 as packaged, 2026-09-30) over 5M rows of
+ * 120 a page, all-visible, three to five columns of 2 to 100 values, with
+ * and without a WHERE of 30% - 62 to 329 ms, at 500 units a millisecond:
+ *
+ *	- LION_DECODE_CONTAINER_COST: a container of a column's value at a key,
+ *	  its cursor stepped to it and its members listed (0.5 us);
+ *	- LION_DECODE_MEMBER_COST: a member stored into its key's array (1 ns);
+ *	- LION_DECODE_ROW_COST: a row the WHERE keeps counted under its
+ *	  combination - the arrays of the columns after the first read, a cell of
+ *	  the tally added to (3 ns, and LION_DECODE_ROW_COL_COST, 2 ns, a column
+ *	  after the first) - and LION_DECODE_ROW_MISS_COST more once the tally's
+ *	  array is past what a core's cache holds (LION_DECODE_CACHE_BYTES);
+ *	- LION_DECODE_HASH_ROW_COST: the same row into a hash table of the
+ *	  combinations, when an array of them all would not fit (50 ns: 5M rows
+ *	  into 100,000 combinations, 250 ms).
+ */
+#define LION_DECODE_CONTAINER_COST	(100.0 * cpu_operator_cost)
+#define LION_DECODE_MEMBER_COST		(0.2 * cpu_operator_cost)
+#define LION_DECODE_ROW_COST		(0.6 * cpu_operator_cost)
+#define LION_DECODE_ROW_COL_COST	(0.4 * cpu_operator_cost)
+#define LION_DECODE_ROW_MISS_COST	(1.6 * cpu_operator_cost)
+#define LION_DECODE_HASH_ROW_COST	(10.0 * cpu_operator_cost)
+#define LION_DECODE_CACHE_BYTES		(512.0 * 1024.0)
+
+/*
  * The folds a key's union that is WIDENED into a bitset costs (DESIGN.md §32,
  * "The collected union, dense"): the fold that made it the RUN it is - the
  * members of a key's first containers set aside and folded in, when they
@@ -794,6 +841,9 @@
 #define LION_FLAG_GROUPIDX		0x04	/* an index drives the entry scan */
 #define LION_FLAG_RANGE			0x08	/* its walk is bounded by the RANGE
 										 * clauses (DESIGN.md §28) */
+#define LION_FLAG_DECODE			0x10	/* the GROUP BY columns are counted by
+										 * the decoded walk (DESIGN.md §34),
+										 * named in LION_PRIV_GROUPN */
 
 /*
  * What the planner decided, in a form the executor can be handed through
@@ -890,7 +940,12 @@
  *		bounds give the column one value; and a List of Const, one per
  *		relation, that value (a NULL Const for the NULL group) where the
  *		index Oid is InvalidOid, and read by nothing where it is not
- *	15	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	15	List, or empty: the GROUP BY columns of the decoded walk (DESIGN.md
+ *		§34), LION_FLAG_DECODE: an IntList of their attnums, in the order the
+ *		walk takes them (the first is the one member 2 names, and the second
+ *		slot there is 0: nothing is the inner side of a nested loop), and
+ *		an OidList of the lion index each is read from
+ *	16	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -908,7 +963,8 @@
 #define LION_PRIV_COALESCE	12
 #define LION_PRIV_IMPLIED	13
 #define LION_PRIV_FACTGROUP	14
-#define LION_PRIV_TLKINDS	15
+#define LION_PRIV_GROUPN		15
+#define LION_PRIV_TLKINDS	16
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -959,6 +1015,11 @@
  * kinds: an FK-side join grouped by a fact column (DESIGN.md §27, "Grouped by
  * a fact column"), whose groups an older build would have summed into one.
  *
+ * Shape 18 added the GROUPN member (15) in front of the target-list kinds, and
+ * the target-list kinds of the third and later GROUP BY columns, which moved
+ * LION_TL_WHEREKEY: the decoded walk of DESIGN.md §34, of up to
+ * LION_MAX_GROUPCOLS columns.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -971,8 +1032,8 @@
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424911
-#define LION_PRIV_NMEMBERS	16
+#define LION_PRIV_MAGIC		0x52424912
+#define LION_PRIV_NMEMBERS	17
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -1171,6 +1232,54 @@ typedef struct LionJoinPart
 	int64		probed;
 } LionJoinPart;
 
+/*
+ * The decoded walk of DESIGN.md §34, one run of it over the relation the node
+ * counts.  Each GROUP BY column c is taken a CHUNK of its values at a time -
+ * cap[c] of them, the keys read off its entry walk (escan[c]) - and one PASS
+ * of the walk counts every combination of the chunks it stands at: the
+ * chunks advance like the digits of an odometer, the last column fastest, so
+ * that every combination of values is in exactly one pass.  The usual query,
+ * whose columns have a few dozen values each, has one chunk per column and one
+ * pass.  The tally of a pass goes up as partial counts, one row a combination
+ * (the Finalize Agg above adds up what a spilled tally splits), and between
+ * two rows nothing is pinned: the sets are located again for each pass.
+ */
+typedef struct LionDecodeRun
+{
+	int			ncol;
+	AttrNumber	attno[LION_MAX_GROUPCOLS];	/* heap columns, in walk order */
+	Oid			idxoid[LION_MAX_GROUPCOLS];
+	Relation	idx[LION_MAX_GROUPCOLS];
+	AttrNumber	idxcol[LION_MAX_GROUPCOLS]; /* key column of idx[c] (§24) */
+	int			cap[LION_MAX_GROUPCOLS];	/* values in a chunk, at most */
+
+	/* each column's entry walk, and the chunk it has read off it */
+	LionEntryScan escan[LION_MAX_GROUPCOLS];
+	bool		scanning[LION_MAX_GROUPCOLS];
+	bool		scandone[LION_MAX_GROUPCOLS];	/* the walk ran out in this
+												 * chunk: it is the last */
+	int			nvals[LION_MAX_GROUPCOLS];
+	Datum	   *keys[LION_MAX_GROUPCOLS];
+	bool	   *isnull[LION_MAX_GROUPCOLS];
+	LionPostingSet *sets[LION_MAX_GROUPCOLS];	/* as the walk found them,
+												 * unpinned */
+	MemoryContext chunkcxt[LION_MAX_GROUPCOLS];
+	PGAlignedBlock *images[LION_MAX_GROUPCOLS]; /* cap[c] page images */
+
+	MemoryContext passcxt;		/* the pass's located sets */
+	struct LionDecodeTally *tally;
+	bool		started;		/* the chunks of the first pass are read */
+	bool		finished;		/* every pass has gone up */
+	bool		emitting;		/* the tally of the pass is going up */
+	Datum		rowkeys[LION_MAX_GROUPCOLS];	/* the row that went up last */
+	bool		rownull[LION_MAX_GROUPCOLS];
+
+	/* EXPLAIN ANALYZE */
+	int64		passes;
+	int64		rowsup;			/* partial rows handed up */
+	LionDecodeStats stats;
+} LionDecodeRun;
+
 typedef struct LionCountScanState
 {
 	CustomScanState css;
@@ -1194,6 +1303,14 @@ typedef struct LionCountScanState
 	AttrNumber	driveattno;
 	AttrNumber	groupidxcol;	/* key column of groupidx (§24) */
 	AttrNumber	groupidxcol2;	/* ... and of groupidx2 */
+
+	/*
+	 * The decoded walk of DESIGN.md §34 (LION_FLAG_DECODE): the GROUP BY
+	 * columns it counts, three or more, and the run - its passes, its tally
+	 * and the row it has got to (lion_next_group_decode()).  NULL for every
+	 * other shape.
+	 */
+	struct LionDecodeRun *decode;
 
 	/*
 	 * count(DISTINCT k) (DESIGN.md §26).  distattno is k, or 0.  Without a
@@ -2168,6 +2285,11 @@ extern void lion_cost_count_path(PlannerInfo *root, CustomPath *cpath,
 								 double outer_entries, double inner_entries,
 								 double outrows, int distinct, int ranged,
 								 double drivefrac, LionRangeCost *rc);
+extern void lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath,
+								  List *targets, List *whereclauses,
+								  List *wherekinds, List *ors, int ncol,
+								  const double *groupest, double numgroups,
+								  double outrows);
 extern double lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col,
 								  Node *clause);
 extern Cost lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel,
@@ -2255,6 +2377,9 @@ extern void lion_release_where(LionCountScanState *st);
 extern TupleTableSlot *lion_emit_tuple(LionCountScanState *st, Datum key,
 									   bool keyisnull, Datum key2,
 									   bool key2isnull, int64 count);
+extern TupleTableSlot *lion_emit_keys(LionCountScanState *st, int nkeys,
+									  const Datum *keys, const bool *keyisnull,
+									  int64 count);
 
 /* lion_exec_count.c */
 extern int64 lion_node_count(LionCountScanState *st, int nsource,
@@ -2266,6 +2391,7 @@ extern TupleTableSlot *lion_next_group_ranged(LionCountScanState *st,
 extern TupleTableSlot *lion_distinct_relation(LionCountScanState *st);
 extern TupleTableSlot *lion_next_group_any(LionCountScanState *st,
 										   bool *exhausted);
+extern void lion_decode_reset(LionCountScanState *st);
 
 /* lion_exec_run.c */
 extern void lion_pause_run(LionCountScanState *st);

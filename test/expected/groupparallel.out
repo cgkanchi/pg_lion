@@ -452,9 +452,9 @@ SELECT lgp_check('SELECT g, count(*) FROM lgp WHERE a = 1 AND b GROUP BY g');
 -- two group columns, GROUP BY coalesce, count(DISTINCT), an IN list that
 -- drives the groups, no WHERE, a WHERE of one set the counts copy anyway
 SELECT lgp_check('SELECT g, k, count(*) FROM lgp WHERE a = 1 AND b GROUP BY g, k');
-         lgp_check          
-----------------------------
- not pushed down, 1228 rows
+     lgp_check     
+-------------------
+ serial, 1228 rows
 (1 row)
 
 SELECT lgp_check('SELECT coalesce(g, -1), count(*) FROM lgp WHERE a = 1 AND b GROUP BY coalesce(g, -1)');

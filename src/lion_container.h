@@ -235,6 +235,15 @@ extern void lion_container_bitset_init(LionContainer *dest, uint32 ckey);
 extern uint32 lion_container_bitset_recount(LionContainer *c);
 
 /*
+ * The number of bits set in an image of LION_BITSET_WORDS words, which a
+ * caller that builds a container key's members in an image of its own
+ * (lion_bits_to_container()) needs: the library's popcount of a whole
+ * bitset, AVX2 or POPCNT where the CPU has them (lion_container.c,
+ * "whole-bitset kernels").
+ */
+extern uint32 lion_container_image_cardinality(const uint64 *w);
+
+/*
  * The members of an ARRAY c that are set in the image w (LION_BITSET_WORDS
  * words): how many, returned, and in *blocks the heap blocks they lie on, in
  * lion_container_block_mask()'s numbering - the cardinality and block mask of
@@ -331,5 +340,51 @@ lion_lo_is_tuple(uint32 lo, uint32 maxoff)
  */
 extern bool lion_container_check_offsets(const LionContainer *c,
 										 uint32 maxoff, const char **errmsg);
+
+/*
+ * The passes of the library's whole-bitset kernels (lion_container.c,
+ * "whole-bitset kernels"): what a pass over all LION_BITSET_WORDS words of a
+ * (and b) writes to d, and what it counts.  Internal to the library, but for
+ * lion_container_bits_pass() below.
+ */
+typedef enum LionBitsOp
+{
+	LION_BITS_COUNT,			/* |a| */
+	LION_BITS_RUNS,				/* the runs of set bits in a */
+	LION_BITS_AND_COUNT,		/* |a & b|, nothing written */
+	LION_BITS_AND,				/* d = a & b, |d| */
+	LION_BITS_OR,				/* d = a | b, |d| */
+	LION_BITS_ANDNOT,			/* d = a & ~b, |d| */
+	LION_BITS_OR_NEW			/* d = a | b, |b & ~a| */
+} LionBitsOp;
+
+#ifdef FRONTEND
+/*
+ * For the unit tests: which implementation of the whole-bitset kernels
+ * (lion_container.c) the library runs.  The server always runs the best its
+ * CPU has, picked at the first call, which LION_SIMD_AUTO restores.  force()
+ * returns false, and changes nothing, for one this build or this CPU does
+ * not have: the x86-64 ones outside x86-64 GCC and clang, or under
+ * LION_NO_SIMD.  Every implementation gives the same results.
+ */
+typedef enum LionSimdImpl
+{
+	LION_SIMD_AUTO = 0,			/* the best this CPU runs */
+	LION_SIMD_PORTABLE,			/* plain C */
+	LION_SIMD_POPCNT,			/* x86-64: a POPCNT a word */
+	LION_SIMD_AVX2				/* x86-64: AVX2 */
+} LionSimdImpl;
+
+extern bool lion_container_simd_force(LionSimdImpl impl);
+extern LionSimdImpl lion_container_simd_current(void);
+
+/*
+ * One pass of the implementation in use, which the set algebra makes on
+ * BITSET payloads: its count returned, and d written for the ops that write
+ * (d may be a or b; NULL for the ones that do not).
+ */
+extern uint32 lion_container_bits_pass(LionBitsOp op, uint64 *d,
+									   const uint64 *a, const uint64 *b);
+#endif
 
 #endif							/* LION_CONTAINER_H */

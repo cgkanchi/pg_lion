@@ -32,6 +32,8 @@
  */
 
 static const char *cur_phase = "startup";
+static const char *phase_suffix = NULL;	/* the kernel forced, if any */
+static char phase_buf[128];
 static long nchecks = 0;
 static long nfail = 0;
 static long nmember_cmps = 0;
@@ -55,7 +57,13 @@ check_impl(bool ok, int line, const char *msg)
 static void
 phase(const char *name)
 {
-	cur_phase = name;
+	if (phase_suffix == NULL)
+		cur_phase = name;
+	else
+	{
+		snprintf(phase_buf, sizeof(phase_buf), "%s; %s", name, phase_suffix);
+		cur_phase = phase_buf;
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -4172,6 +4180,542 @@ test_tree_probe(void)
 }
 
 /* ----------------------------------------------------------------
+ *				whole-bitset kernels, every implementation
+ *
+ * The library makes every pass over a whole bitset that counts - a
+ * BITSET's cardinality and runs, the AND, OR and ANDNOT of two BITSETs
+ * counted or written out, the in-place OR - with one of up to three
+ * implementations (lion_container.c, "whole-bitset kernels"): AVX2 or
+ * POPCNT on x86-64, picked by the CPU, and a portable one everywhere.
+ * test_bitset_kernels() forces each one this build and CPU have in turn
+ * (lion_container_simd_force()) and checks every pass
+ * (lion_container_bits_pass()), and what the public functions make of
+ * BITSETs, over pairs of many densities and shapes against a reference that
+ * counts a bit at a time: the counts, the words written, and the
+ * representation the optimizing forms then choose.  Every container sits in
+ * an exact-size heap buffer at each 8-byte alignment modulo 32, the AVX2
+ * kernel's vector width, so that a sanitized build sees any access past it.
+ * ----------------------------------------------------------------
+ */
+
+static const char *const simd_names[] = {"auto", "portable", "popcnt", "avx2"};
+
+#define KERN_NPATTERNS	22
+
+/* A bit-by-bit count: no popcount instruction, builtin or table. */
+static uint32
+kern_ref_count(const uint64 *w)
+{
+	uint32		n = 0;
+	uint32		i;
+
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
+		n += (uint32) ((w[i >> 6] >> (i & 63)) & 1);
+	return n;
+}
+
+static bool
+kern_bit(const uint64 *w, uint32 i)
+{
+	return ((w[i >> 6] >> (i & 63)) & 1) != 0;
+}
+
+static uint32
+kern_ref_runs(const uint64 *w)
+{
+	uint32		n = 0;
+	uint32		i;
+
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
+		if (kern_bit(w, i) && (i == 0 || !kern_bit(w, i - 1)))
+			n++;
+	return n;
+}
+
+/* The representation lion_container_optimize() chooses (DESIGN.md §3). */
+static uint8
+kern_ref_type(uint32 card, uint32 nruns)
+{
+	Size		asz = (card <= LION_ARRAY_MAX_CARD) ?
+		LION_CONTAINER_HDRSZ + (Size) card * sizeof(uint16) : SIZE_MAX;
+	Size		rsz = (nruns <= LION_RUN_MAX_NRUNS) ?
+		LION_CONTAINER_HDRSZ + sizeof(uint16) + (Size) nruns * sizeof(LionRun) : SIZE_MAX;
+
+	if (asz <= rsz && asz <= LION_CONTAINER_MAX_SIZE)
+		return LION_CT_ARRAY;
+	if (rsz <= LION_CONTAINER_MAX_SIZE)
+		return LION_CT_RUN;
+	return LION_CT_BITSET;
+}
+
+/* Bits set with probability ppm / 1e6. */
+static void
+kern_random(uint64 *w, uint32 ppm)
+{
+	uint32		i;
+
+	memset(w, 0, LION_BITSET_BYTES);
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
+		if (rng_below(1000000) < ppm)
+			w[i >> 6] |= UINT64CONST(1) << (i & 63);
+}
+
+/* Pattern p of KERN_NPATTERNS: edges of words, runs and blocks, densities. */
+static void
+kern_pattern(uint64 *w, int p)
+{
+	static const uint32 ppm[] = {500, 10000, 100000, 300000, 500000,
+	700000, 900000, 990000, 999500};
+	uint32		i;
+
+	memset(w, 0, LION_BITSET_BYTES);
+	switch (p)
+	{
+		case 0:					/* empty */
+			break;
+		case 1:					/* full */
+			memset(w, 0xFF, LION_BITSET_BYTES);
+			break;
+		case 2:
+			memset(w, 0x55, LION_BITSET_BYTES);
+			break;
+		case 3:
+			memset(w, 0xAA, LION_BITSET_BYTES);
+			break;
+		case 4:					/* the first bit of every word */
+			for (i = 0; i < LION_BITSET_WORDS; i++)
+				w[i] = 1;
+			break;
+		case 5:					/* the last bit of every word */
+			for (i = 0; i < LION_BITSET_WORDS; i++)
+				w[i] = UINT64CONST(1) << 63;
+			break;
+		case 6:					/* runs of two across word boundaries */
+			for (i = 0; i < LION_BITSET_WORDS; i++)
+				w[i] = (i % 2 == 0) ? UINT64CONST(1) << 63 : 1;
+			break;
+		case 7:					/* the first member alone */
+			w[0] = 1;
+			break;
+		case 8:					/* the last member alone */
+			w[LION_BITSET_WORDS - 1] = UINT64CONST(1) << 63;
+			break;
+		case 9:					/* full but for the first and last */
+			memset(w, 0xFF, LION_BITSET_BYTES);
+			w[0] &= ~UINT64CONST(1);
+			w[LION_BITSET_WORDS - 1] &= ~(UINT64CONST(1) << 63);
+			break;
+		case 10:				/* whole AVX2 blocks full and empty */
+			for (i = 0; i < LION_BITSET_WORDS; i++)
+				w[i] = ((i / 64) % 2 == 0) ? ~UINT64CONST(0) : 0;
+			break;
+		case 11:				/* random words */
+			for (i = 0; i < LION_BITSET_WORDS; i++)
+				w[i] = ((uint64) rng_next() << 32) | rng_next();
+			break;
+		case 12:				/* random runs */
+			{
+				uint32		lo = rng_below(200);
+
+				while (lo < LION_CONTAINER_RANGE)
+				{
+					uint32		len = 1 + rng_below(300);
+
+					for (i = lo; i < lo + len && i < LION_CONTAINER_RANGE; i++)
+						w[i >> 6] |= UINT64CONST(1) << (i & 63);
+					lo += len + 1 + rng_below(300);
+				}
+				break;
+			}
+		default:				/* 13 .. 21: densities */
+			kern_random(w, ppm[p - 13]);
+			break;
+	}
+}
+
+/*
+ * An exact-size buffer for a container at shift bytes past a 32-byte
+ * boundary, which puts its payload at (shift + 8) % 32: exact_alloc()'s,
+ * aligned.  *base is what to free().
+ */
+static LionContainer *
+kern_alloc(Size shift, void **base)
+{
+	unsigned char *p;
+	Size		i;
+
+	if (posix_memalign((void **) &p, 32, shift + LION_CONTAINER_MAX_SIZE + guard_bytes) != 0)
+	{
+		printf("out of memory\n");
+		exit(2);
+	}
+	for (i = 0; i < guard_bytes; i++)
+		p[shift + LION_CONTAINER_MAX_SIZE + i] = GUARD_FILL;
+	*base = p;
+	return (LionContainer *) (p + shift);
+}
+
+/* c = the BITSET of w, its cardinality counted bit by bit */
+static void
+kern_bitset(LionContainer *c, const uint64 *w)
+{
+	c->ckey = TEST_CKEY;
+	c->type = LION_CT_BITSET;
+	c->flags = 0;
+	memcpy(LION_BITSET_DATA(c), w, LION_BITSET_BYTES);
+	c->cardinality = (uint16) kern_ref_count(w);
+}
+
+/* Is c's membership exactly w's, and is c well-formed? */
+static bool
+kern_holds(const LionContainer *c, const uint64 *w)
+{
+	uint64		img[LION_BITSET_WORDS];
+	const char *why;
+
+	memset(img, 0, sizeof(img));
+	lion_container_or_into_bitset(c, img);
+	return memcmp(img, w, LION_BITSET_BYTES) == 0 &&
+		lion_container_cardinality(c) == kern_ref_count(w) &&
+		lion_container_check(c, LION_CONTAINER_MAX_SIZE, &why);
+}
+
+/*
+ * A raw result of two BITSETs: the reference's words in a BITSET, written by
+ * the kernel pass - unless an operand was empty, which the set algebra
+ * answers without one (an empty ARRAY, or a copy of the other operand).
+ */
+static bool
+kern_raw_ok(const LionContainer *d, uint32 got, const uint64 *w, bool empty_operand)
+{
+	uint32		want = kern_ref_count(w);
+
+	if (got != want || !kern_holds(d, w))
+		return false;
+	return empty_operand ||
+		(d->type == LION_CT_BITSET &&
+		 memcmp(LION_BITSET_DATA(d), w, LION_BITSET_BYTES) == 0);
+}
+
+static uint64 kern_wa[LION_BITSET_WORDS];
+static uint64 kern_wb[LION_BITSET_WORDS];
+static uint64 kern_want[LION_BITSET_WORDS];
+
+/*
+ * What a kernel pass should make of wa and wb, a bit at a time: its count
+ * returned, and in want the words it writes (for the ops that write).
+ */
+static uint32
+kern_ref_pass(LionBitsOp op, const uint64 *wa, const uint64 *wb, uint64 *want)
+{
+	uint64		counted[LION_BITSET_WORDS];
+	uint32		i;
+
+	for (i = 0; i < LION_BITSET_WORDS; i++)
+	{
+		switch (op)
+		{
+			case LION_BITS_COUNT:
+			case LION_BITS_RUNS:
+				counted[i] = wa[i];
+				break;
+			case LION_BITS_AND_COUNT:
+			case LION_BITS_AND:
+				want[i] = counted[i] = wa[i] & wb[i];
+				break;
+			case LION_BITS_OR:
+				want[i] = counted[i] = wa[i] | wb[i];
+				break;
+			case LION_BITS_ANDNOT:
+				want[i] = counted[i] = wa[i] & ~wb[i];
+				break;
+			case LION_BITS_OR_NEW:
+				want[i] = wa[i] | wb[i];
+				counted[i] = wb[i] & ~wa[i];
+				break;
+		}
+	}
+	return (op == LION_BITS_RUNS) ? kern_ref_runs(counted) : kern_ref_count(counted);
+}
+
+/*
+ * Every op of the kernel pass in use against the reference, on the payloads
+ * of a and b; d and e are work buffers whose payloads are written, e's in
+ * place (the op's d being its a), as or_inplace() makes the pass.
+ */
+static uint32
+kern_check_passes(const LionContainer *a, const LionContainer *b,
+				  LionContainer *d, LionContainer *e)
+{
+	const uint64 *wa = LION_BITSET_DATA(a);
+	const uint64 *wb = LION_BITSET_DATA(b);
+	uint64	   *wd = LION_BITSET_DATA(d);
+	uint64	   *we = LION_BITSET_DATA(e);
+	uint32		bad = 0;
+	int			op;
+
+	for (op = LION_BITS_COUNT; op <= LION_BITS_OR_NEW; op++)
+	{
+		bool		writes = (op != LION_BITS_COUNT && op != LION_BITS_RUNS &&
+							  op != LION_BITS_AND_COUNT);
+		uint32		want = kern_ref_pass((LionBitsOp) op, wa, wb, kern_want);
+
+		memset(wd, 0x5A, LION_BITSET_BYTES);
+		if (lion_container_bits_pass((LionBitsOp) op, writes ? wd : NULL, wa, wb) != want ||
+			(writes && memcmp(wd, kern_want, LION_BITSET_BYTES) != 0))
+			bad++;
+		if (!writes)
+			continue;
+		memcpy(we, wa, LION_BITSET_BYTES);
+		if (lion_container_bits_pass((LionBitsOp) op, we, we, wb) != want ||
+			memcmp(we, kern_want, LION_BITSET_BYTES) != 0)
+			bad++;
+	}
+	return bad;
+}
+
+/*
+ * One implementation over every pair of patterns: each function that runs
+ * a kernel pass, against the reference.
+ */
+static void
+test_kernels_one(void)
+{
+	void	   *base[4];
+	LionContainer *a;
+	LionContainer *b;
+	LionContainer *d;
+	LionContainer *e;
+	int			pa;
+	int			pb;
+	uint32		i;
+	uint32		bad_pass = 0;
+	uint32		bad_count = 0;
+	uint32		bad_raw = 0;
+	uint32		bad_opt = 0;
+	uint32		bad_mixed = 0;
+	uint32		bad_inplace = 0;
+	uint32		bad_guard = 0;
+
+	for (pa = 0; pa < KERN_NPATTERNS; pa++)
+	{
+		for (pb = 0; pb < KERN_NPATTERNS; pb++)
+		{
+			const char *why;
+			uint32		ca;
+			uint32		want;
+			uint32		got;
+			bool		empty;
+
+			/* every buffer at an alignment of its own, varying by pair */
+			a = kern_alloc(8 * ((pa + pb) % 4), &base[0]);
+			b = kern_alloc(8 * ((pa + 2 * pb + 1) % 4), &base[1]);
+			d = kern_alloc(8 * ((pa + 3 * pb + 2) % 4), &base[2]);
+			e = kern_alloc(8 * ((2 * pa + pb + 3) % 4), &base[3]);
+
+			/* fixed seeds: the random patterns are the same for every run */
+			rng_seed(UINT64CONST(0x5EED6000) + (uint64) pa);
+			kern_pattern(kern_wa, pa);
+			rng_seed(UINT64CONST(0x5EED7000) + (uint64) pb);
+			kern_pattern(kern_wb, pb);
+			kern_bitset(a, kern_wa);
+			kern_bitset(b, kern_wb);
+			ca = a->cardinality;
+			empty = (ca == 0 || b->cardinality == 0);
+
+			/* the passes themselves */
+			bad_pass += kern_check_passes(a, b, d, e);
+
+			/* COUNT: recount(), image_cardinality(), check() */
+			if (pb == 0)
+			{
+				memcpy(e, a, LION_CONTAINER_MAX_SIZE);
+				e->cardinality = 0;
+				if (lion_container_bitset_recount(e) != ca || e->cardinality != ca ||
+					lion_container_image_cardinality(LION_BITSET_DATA(a)) != ca ||
+					!lion_container_check(a, LION_CONTAINER_MAX_SIZE, &why))
+					bad_count++;
+				e->cardinality = (uint16) (ca + 1);
+				if (lion_container_check(e, LION_CONTAINER_MAX_SIZE, &why))
+					bad_count++;	/* a cardinality one off must be found */
+			}
+
+			/* AND_COUNT, both ways round */
+			for (i = 0; i < LION_BITSET_WORDS; i++)
+				kern_want[i] = kern_wa[i] & kern_wb[i];
+			want = kern_ref_count(kern_want);
+			if (lion_container_and_cardinality(a, b) != want ||
+				lion_container_and_cardinality(b, a) != want)
+				bad_count++;
+
+			/* AND written out: raw, both ways round, and optimized */
+			got = lion_container_and_raw(a, b, d);
+			if (!kern_raw_ok(d, got, kern_want, empty))
+				bad_raw++;
+			got = lion_container_and_raw(b, a, d);
+			if (!kern_raw_ok(d, got, kern_want, empty))
+				bad_raw++;
+			got = lion_container_and(a, b, d);
+			if (got != want || !kern_holds(d, kern_want) ||
+				d->type != kern_ref_type(want, kern_ref_runs(kern_want)))
+				bad_opt++;
+
+			/* OR */
+			for (i = 0; i < LION_BITSET_WORDS; i++)
+				kern_want[i] = kern_wa[i] | kern_wb[i];
+			want = kern_ref_count(kern_want);
+			got = lion_container_or_raw(a, b, d);
+			if (!kern_raw_ok(d, got, kern_want, empty))
+				bad_raw++;
+			got = lion_container_or(a, b, d);
+			if (got != want || !kern_holds(d, kern_want) ||
+				d->type != kern_ref_type(want, kern_ref_runs(kern_want)))
+				bad_opt++;
+
+			/* OR in place: the new members counted, the words ORed */
+			memcpy(e, a, LION_CONTAINER_MAX_SIZE);
+			for (i = 0; i < LION_BITSET_WORDS; i++)
+				kern_want[i] = kern_wb[i] & ~kern_wa[i];
+			got = lion_container_or_inplace(e, b);
+			if (got != kern_ref_count(kern_want) || e->type != LION_CT_BITSET ||
+				e->cardinality != ca + got)
+				bad_inplace++;
+			for (i = 0; i < LION_BITSET_WORDS; i++)
+				kern_want[i] = kern_wa[i] | kern_wb[i];
+			if (memcmp(LION_BITSET_DATA(e), kern_want, LION_BITSET_BYTES) != 0 ||
+				lion_container_or_inplace(e, b) != 0)
+				bad_inplace++;
+
+			/* ANDNOT, both ways round */
+			for (i = 0; i < LION_BITSET_WORDS; i++)
+				kern_want[i] = kern_wa[i] & ~kern_wb[i];
+			want = kern_ref_count(kern_want);
+			got = lion_container_andnot_raw(a, b, d);
+			if (!kern_raw_ok(d, got, kern_want, empty))
+				bad_raw++;
+			got = lion_container_andnot(a, b, d);
+			if (got != want || !kern_holds(d, kern_want) ||
+				d->type != kern_ref_type(want, kern_ref_runs(kern_want)))
+				bad_opt++;
+			for (i = 0; i < LION_BITSET_WORDS; i++)
+				kern_want[i] = kern_wb[i] & ~kern_wa[i];
+			want = kern_ref_count(kern_want);
+			got = lion_container_andnot_raw(b, a, d);
+			if (!kern_raw_ok(d, got, kern_want, empty))
+				bad_raw++;
+
+			/*
+			 * RUNS: a optimized as optimize() would choose, by the reference's
+			 * count of its runs.  Then a in that form against the BITSET b,
+			 * which fills a into the result and folds b into it in the kernel
+			 * pass that counts it.
+			 */
+			memcpy(e, a, LION_CONTAINER_MAX_SIZE);
+			lion_container_optimize(e);
+			if (e->type != kern_ref_type(ca, kern_ref_runs(kern_wa)) ||
+				!kern_holds(e, kern_wa))
+				bad_opt++;
+			if (e->type != LION_CT_BITSET && e->cardinality > 0)
+			{
+				for (i = 0; i < LION_BITSET_WORDS; i++)
+					kern_want[i] = kern_wa[i] | kern_wb[i];
+				want = kern_ref_count(kern_want);
+				if (!kern_raw_ok(d, lion_container_or_raw(e, b, d), kern_want, empty))
+					bad_mixed++;
+				if (e->type == LION_CT_RUN)
+				{
+					for (i = 0; i < LION_BITSET_WORDS; i++)
+						kern_want[i] = kern_wa[i] & ~kern_wb[i];
+					want = kern_ref_count(kern_want);
+					if (lion_container_andnot_raw(e, b, d) != want ||
+						!kern_holds(d, kern_want))
+						bad_mixed++;
+					for (i = 0; i < LION_BITSET_WORDS; i++)
+						kern_want[i] = kern_wa[i] & kern_wb[i];
+					want = kern_ref_count(kern_want);
+					if (lion_container_and(e, b, d) != want || !kern_holds(d, kern_want))
+						bad_mixed++;
+				}
+			}
+
+			/* the operands untouched, and nothing written past a buffer */
+			if (memcmp(LION_BITSET_DATA(a), kern_wa, LION_BITSET_BYTES) != 0 ||
+				memcmp(LION_BITSET_DATA(b), kern_wb, LION_BITSET_BYTES) != 0)
+				bad_guard++;
+			for (i = 0; i < 4; i++)
+			{
+				LionContainer *c = (i == 0) ? a : (i == 1) ? b : (i == 2) ? d : e;
+
+				if (!guard_ok(c, LION_CONTAINER_MAX_SIZE))
+					bad_guard++;
+				free(base[i]);
+			}
+		}
+	}
+	CHECK(bad_pass == 0, "kernels: every pass counts, and writes, what the reference does");
+	CHECK(bad_count == 0, "kernels: recount(), check() and and_cardinality() count as the reference");
+	CHECK(bad_raw == 0, "kernels: and/or/andnot_raw() of two BITSETs write and count the reference's words");
+	CHECK(bad_opt == 0, "kernels: and/or/andnot() and optimize() hold the reference's members, in its representation");
+	CHECK(bad_mixed == 0, "kernels: a RUN or an ARRAY against a BITSET, folded in the counting pass");
+	CHECK(bad_inplace == 0, "kernels: or_inplace() ORs the words and counts exactly the new members");
+	CHECK(bad_guard == 0, "kernels: operands untouched, nothing written past a buffer");
+}
+
+static void
+test_bitset_kernels(void)
+{
+	static const LionSimdImpl impls[] = {LION_SIMD_PORTABLE, LION_SIMD_POPCNT, LION_SIMD_AVX2};
+	LionSimdImpl best;
+	uint32		k;
+
+	phase("whole-bitset kernels");
+	best = lion_container_simd_current();
+	printf("  whole-bitset kernels: %s picked for this CPU; checking", simd_names[best]);
+	for (k = 0; k < lengthof(impls); k++)
+	{
+		char		name[64];
+
+		if (!lion_container_simd_force(impls[k]))
+		{
+			printf(" [%s: not in this build or CPU]", simd_names[impls[k]]);
+#ifdef LION_NO_SIMD
+			CHECK(impls[k] != LION_SIMD_PORTABLE,
+				  "LION_NO_SIMD keeps the portable kernel");
+#else
+			CHECK(impls[k] != LION_SIMD_PORTABLE,
+				  "every build has the portable kernel");
+#endif
+			continue;
+		}
+#ifdef LION_NO_SIMD
+		CHECK(impls[k] == LION_SIMD_PORTABLE,
+			  "LION_NO_SIMD builds no x86 kernel");
+#endif
+		CHECK(lion_container_simd_current() == impls[k], "simd_force() takes effect");
+		printf(" %s", simd_names[impls[k]]);
+		fflush(stdout);
+
+		snprintf(name, sizeof(name), "%s kernel forced", simd_names[impls[k]]);
+		phase_suffix = name;
+		phase("whole-bitset kernels");
+		test_kernels_one();
+
+		/*
+		 * And the set algebra over every type pair and the in-place OR, as
+		 * the rest of this program runs them under the kernel the CPU picks.
+		 */
+		test_setops();
+		test_or_inplace();
+		phase_suffix = NULL;
+	}
+	printf("\n");
+	phase("whole-bitset kernels");
+	CHECK(lion_container_simd_force(LION_SIMD_AUTO) &&
+		  lion_container_simd_current() == best,
+		  "simd_force(LION_SIMD_AUTO) goes back to the CPU's pick");
+}
+
+/* ----------------------------------------------------------------
  *					representative sizes (informational)
  * ----------------------------------------------------------------
  */
@@ -4314,6 +4858,7 @@ main(void)
 	test_mark_members();
 	test_and_union();
 	test_tree_probe();
+	test_bitset_kernels();
 
 	test_random_ops(3, "random ops @ 0.01% density", 20000, UINT64CONST(0x5EED1001));
 	test_random_ops(328, "random ops @ 1% density", 20000, UINT64CONST(0x5EED1002));

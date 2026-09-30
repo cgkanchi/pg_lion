@@ -8,8 +8,8 @@ PAGES_OBJS = src/lion_pages.o src/lion_meta.o src/lion_state.o src/lion_entry.o 
 # The count engine: its interface is src/lion_count.h, and its files share the
 # private header src/lion_count_int.h.
 COUNT_OBJS = src/lion_set.o src/lion_set_copy.o src/lion_cursor.o src/lion_expr.o src/lion_vis.o \
-       src/lion_count.o src/lion_count_groups.o src/lion_count_shared.o src/lion_rangesrc.o \
-       src/lion_range.o src/lion_count_sql.o
+       src/lion_count.o src/lion_count_groups.o src/lion_count_decode.o src/lion_count_shared.o \
+       src/lion_rangesrc.o src/lion_range.o src/lion_count_sql.o
 # The LionCount custom scan: its planner half (lion_plan_*) and its executor
 # half (lion_exec_*), which share the private header src/lion_customscan.h.
 CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_target.o \
@@ -43,7 +43,15 @@ PG_CFLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers 
 ifeq ($(WERROR),1)
 PG_CFLAGS += -Werror
 endif
-EXTRA_CLEAN = test/unit/container_test test/unit/sparse_test test/results test/isolation/results
+# `make LION_NO_SIMD=1` leaves out the container library's AVX2 and POPCNT
+# kernels, which x86-64 GCC and clang builds pick between at run time
+# (DESIGN.md §3, "Whole-bitset kernels"), and runs the portable one
+# everywhere.  The unit tests always build a copy that way too.
+ifeq ($(LION_NO_SIMD),1)
+PG_CFLAGS += -DLION_NO_SIMD
+endif
+EXTRA_CLEAN = test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test \
+              test/results test/isolation/results
 
 PG_CONFIG ?= $(if $(wildcard .local/pg/bin/pg_config),.local/pg/bin/pg_config,pg_config)
 PGXS := $(shell $(PG_CONFIG) --pgxs)
@@ -66,6 +74,9 @@ UNIT_CFLAGS = -O1 -g -Wall -Wextra -Wno-unused-parameter -DFRONTEND -Isrc \
 ifeq ($(WERROR),1)
 UNIT_CFLAGS += -Werror
 endif
+ifeq ($(LION_NO_SIMD),1)
+UNIT_CFLAGS += -DLION_NO_SIMD
+endif
 # pkglibdir first: the Debian/Ubuntu packages put the server's own
 # libpgcommon.a and libpgport.a there, while libdir holds libpq-dev's copies,
 # which are of whatever major libpq-dev is at.  Source builds have them in
@@ -84,20 +95,31 @@ UNIT_LDFLAGS = -L$(shell $(PG_CONFIG) --pkglibdir) -L$(shell $(PG_CONFIG) --libd
 ifeq ($(SANITIZE),1)
 UNIT_CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
 UNIT_LDFLAGS += -fsanitize=address,undefined
-test/unit/container_test test/unit/sparse_test: .lion-force-unit
+test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test: .lion-force-unit
 .PHONY: .lion-force-unit
 endif
 
 test/unit/container_test: test/unit/container_test.c src/lion_container.c src/lion_container.h src/lion_tid.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/container_test.c src/lion_container.c $(UNIT_LDFLAGS)
 
+# The same tests with -DLION_NO_SIMD: the build without the x86-64 kernels,
+# which must refuse to force them and run the portable one.  On an x86-64
+# host also -mpopcnt, which makes that kernel the fused loop other
+# architectures run, where x86 built for its baseline counts through
+# pg_popcount() - which container_test covers when it forces the portable
+# kernel.
+UNIT_NOSIMD_CFLAGS = -DLION_NO_SIMD $(if $(filter x86_64 amd64,$(shell uname -m)),-mpopcnt)
+test/unit/container_test_nosimd: test/unit/container_test.c src/lion_container.c src/lion_container.h src/lion_tid.h
+	$(CC) $(UNIT_CFLAGS) $(UNIT_NOSIMD_CFLAGS) -o $@ test/unit/container_test.c src/lion_container.c $(UNIT_LDFLAGS)
+
 test/unit/sparse_test: test/unit/sparse_test.c src/lion_sparse.c src/lion_container.c \
                        src/lion_sparse.h src/lion_container.h src/lion_tid.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/sparse_test.c src/lion_sparse.c src/lion_container.c $(UNIT_LDFLAGS)
 
 .PHONY: unit
-unit: test/unit/container_test test/unit/sparse_test
+unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test
 	./test/unit/container_test
+	./test/unit/container_test_nosimd
 	./test/unit/sparse_test
 
 # header deps (the PostgreSQL build we compile against was not configured with --enable-depend)

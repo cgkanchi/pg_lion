@@ -785,7 +785,9 @@ lion_or_heap_pop(LionExprCursor *c)
  * The containers are ORed into the image by lion_container_or_into_bitset(),
  * the container library's own: this file used to carry a copy of it, which
  * lacked the library's masks and wrote up to 12 KiB past the image for a
- * damaged container (2026-09-27 review).
+ * damaged container (2026-09-27 review).  The image is counted by the
+ * library too (lion_container_image_cardinality()), where a pg_popcount64()
+ * a word made 512 indirect calls on x86-64 before PostgreSQL 19.
  *
  * Turn the accumulated image into a container in dest (capacity
  * LION_CONTAINER_MAX_SIZE), in the smallest representation, exactly as
@@ -794,11 +796,7 @@ lion_or_heap_pop(LionExprCursor *c)
 void
 lion_bits_to_container(const uint64 *w, uint32 ckey, LionContainer *dest)
 {
-	uint64		card = 0;
-	int			k;
-
-	for (k = 0; k < LION_BITSET_WORDS; k++)
-		card += pg_popcount64(w[k]);
+	uint32		card = lion_container_image_cardinality(w);
 
 	lion_container_init(dest, ckey);
 	if (card == 0)
