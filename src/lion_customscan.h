@@ -651,9 +651,25 @@
  * union at LION_CONTAINER_COST and each member an ARRAY merge moves at
  * LION_AND_MEMBER_COST: 2.1 us at 500 units a millisecond, 57 of the 62
  * within a factor of 1.5.  The others are columns in heap order folded key
- * by key into a RUN of up to a run a heap block, which takes up to 7 us.
+ * by key into a RUN of up to a run a heap block, which takes up to 7 us -
+ * which a union no longer is: it is widened into a bitset instead (below).
  */
 #define LION_RANGE_FOLD_COST	(lion_range_fold_cost * cpu_operator_cost)
+
+/*
+ * The folds a key's union that is WIDENED into a bitset costs (DESIGN.md §32,
+ * "The collected union, dense"): the fold that made it the RUN it is - the
+ * members of a key's first containers set aside and folded in, when they
+ * came one or two rows at a time - and its optimization back when the walk
+ * is over, which takes what a fold does, most of a fold being its
+ * optimization; the widening between them is an image filled and copied, a
+ * tenth of a fold or less.  Every container that comes to it in between is
+ * ORed in place, a few nanoseconds.  Counted over 2M rows in heap order, a
+ * key of one row and of ten, without summaries and with them, ranges of
+ * 1,000 to 1.9 million keys: one fold or two a union key.  Timed apart
+ * (-O2), a widening took 0.1 to 0.4 us and a fold 1.4 to 8.
+ */
+#define LION_RANGE_WIDEN_FOLDS	2.0
 
 /*
  * What a collected range's union takes in memory beyond its containers' own

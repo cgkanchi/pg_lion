@@ -1,5 +1,6 @@
--- What a count over two ranges is priced at (DESIGN.md §28, "The cost of a
--- summed range").
+-- What a count over two ranges is priced at, and the union a range taken as
+-- a source is collected into (DESIGN.md §28, "The cost of a summed range";
+-- §32, "The collected union, dense" and "What collecting a range costs").
 --
 -- `count(*) WHERE <range on a> AND <range on b>` sums one range and collects
 -- the other as a source.  A collected range holds no pin, so it cannot drive
@@ -8,8 +9,15 @@
 -- priced the complement all the same - any positive source would do - and
 -- took two ranges over nearly every row for a tenth of what their inside
 -- walk costs: the node, 2.5 s, over a sequential scan of 0.33 s (2M rows).
--- Every answer is checked against the pushdown turned off; the plan choices
--- are the planner's own, nothing disabled.
+--
+-- The union a collected range builds was folded one container at a time
+-- into a key's union once that was a RUN - which a dense union of scattered
+-- rows is, and every union of a column in heap order - a bitset image per
+-- container, 12.7 s for a range of 1.9 million scattered rows.  It is
+-- widened into a bitset and ORed into in place now, and the model prices a
+-- union in heap order at a fold or two a union key rather than one a
+-- container.  Every answer is checked against the pushdown turned off; the
+-- plan choices are the planner's own, nothing disabled.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -21,16 +29,24 @@ SET synchronous_commit = on;
 SET default_statistics_target = 1000;
 SET max_parallel_workers_per_gather = 0;
 
--- 100,000 rows, 47 to a heap page, 34 container keys.  lo has four values;
+-- 100,000 rows, 45 to a heap page, 35 container keys.  lo has four values;
 -- w1 is the row number modulo 1000 and w2 a permutation of 20,000 keys of
--- five rows each, both spread over the whole heap.
-CREATE TABLE rcost (id int, lo int, w1 int, w2 int, pad text);
+-- five rows each, both spread over the whole heap; o has four rows a key, in
+-- the heap's order; m has four rows a key too, its keys up to 12,500 in the
+-- heap's order in the second half of the heap and the others a permutation
+-- over the first half.
+CREATE TABLE rcost (id int, lo int, w1 int, w2 int, o int, m int, pad text);
 INSERT INTO rcost
-SELECT g, g % 4, g % 1000, ((g::bigint * 7919) % 20000)::int, repeat('x', 120)
+SELECT g, g % 4, g % 1000, ((g::bigint * 7919) % 20000)::int, g / 4,
+	   CASE WHEN g > 50000 THEN (g - 50001) / 4
+			ELSE 12500 + ((g::bigint * 7919) % 50000)::int / 4 END,
+	   repeat('x', 120)
   FROM generate_series(1, 100000) g;
 CREATE INDEX rcost_lo ON rcost USING lion (lo);
 CREATE INDEX rcost_w1 ON rcost USING lion (w1);
 CREATE INDEX rcost_w2 ON rcost USING lion (w2);
+CREATE INDEX rcost_o ON rcost USING lion (o);
+CREATE INDEX rcost_m ON rcost USING lion (m);
 VACUUM (FREEZE, ANALYZE) rcost;
 
 /*
@@ -101,6 +117,45 @@ SELECT rc_check('SELECT count(*) FROM rcost WHERE w1 BETWEEN 10 AND 900 AND w2 B
 EXPLAIN (COSTS OFF) SELECT count(*) FROM rcost WHERE lo = 1 AND w2 > 10;
 SELECT rc_check('SELECT count(*) FROM rcost WHERE lo = 1 AND w2 > 10');
 SELECT rc_check('SELECT count(*) FROM rcost WHERE lo = 1 AND w1 > 10 AND w2 > 10');
+
+-- ---------- 2. A range collected as a source, its union a RUN ----------
+
+-- In the heap's order every key's union is a RUN, and each container after
+-- its first used to be priced - and made - a fold into it: half the keys of
+-- o went to an index scan and a sort.  They are a fold or two a union key
+-- now, and the node is the plan.
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT lo) FROM rcost WHERE o BETWEEN 10 AND 12500;
+SELECT rc_check('SELECT count(DISTINCT lo) FROM rcost WHERE o BETWEEN 10 AND 12500');
+SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE o BETWEEN 10 AND 24000 GROUP BY lo');
+
+-- Nearly all of w1's rows: the union of every container key is dense, a
+-- RUN - the case that folded every container - and widened into a bitset.
+SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE w1 BETWEEN 10 AND 990 GROUP BY lo');
+SELECT rc_check('SELECT count(DISTINCT lo) FROM rcost WHERE w2 BETWEEN 10 AND 19000');
+SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE w2 BETWEEN 5000 AND 12000 GROUP BY lo');
+-- half in the heap's order, half scattered
+SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE m BETWEEN 0 AND 18750 GROUP BY lo');
+SELECT rc_check('SELECT count(*) FROM rcost WHERE lo = 2 AND o > 100 AND m BETWEEN 10 AND 24000');
+
+-- With 64 kB for the ranges the widened unions of 35 container keys do not
+-- all fit, and are optimized back - compacted - to make room: for the next
+-- widening, which is refused and folds as before when that finds none, and
+-- before the collection would give up.  The unions optimized fit, and the
+-- range is still collected; w2's, whose unions pass an ARRAY's 2,048 members
+-- as bitsets before they are optimized, does not, and is walked.
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1.0;
+SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE o BETWEEN 10 AND 24000 GROUP BY lo');
+SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE m BETWEEN 0 AND 18750 GROUP BY lo');
+SELECT rc_check('SELECT count(DISTINCT lo) FROM rcost WHERE w2 BETWEEN 10 AND 19000');
+-- an OR's leaves, which cannot be walked: the second has what the first
+-- leaves of the memory, and is collected a window of container keys at a
+-- time past it, each window widening and compacting its own unions
+SELECT rc_check('SELECT count(*) FROM rcost WHERE lo = 1 AND (w2 BETWEEN 10 AND 3000 OR m BETWEEN 6000 AND 16000)');
+SELECT rc_check('SELECT count(*) FROM rcost WHERE lo = 1 AND (w2 BETWEEN 10 AND 4000 OR m BETWEEN 0 AND 18750)');
+SELECT rc_check('SELECT count(*) FROM rcost WHERE lo = 3 AND (w2 BETWEEN 10 AND 19000 OR o < 5)');
+RESET work_mem;
+RESET hash_mem_multiplier;
 
 DROP FUNCTION rc_check(text);
 DROP TABLE rcost;
