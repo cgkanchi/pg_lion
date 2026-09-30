@@ -553,6 +553,7 @@ lion_verify_summary_after(LionVerifySumState *ss, const char *lo,
 	Buffer		buf;
 	OffsetNumber off;
 	Datum		lokey = (Datum) 0;
+	LionRightWalk walk;
 
 	if (lo != NULL)
 	{
@@ -567,6 +568,7 @@ lion_verify_summary_after(LionVerifySumState *ss, const char *lo,
 	}
 	buf = lion_dir_search_first(vs->index, NULL, vs->ix, &sk,
 								BUFFER_LOCK_SHARE, false, &off);
+	lion_rightwalk_init(&walk);
 	for (;;)
 	{
 		Page		page = BufferGetPage(buf);
@@ -576,7 +578,8 @@ lion_verify_summary_after(LionVerifySumState *ss, const char *lo,
 		{
 			if (LionPageIsRightmost(page))
 				break;
-			buf = lion_dir_step_right(vs->index, buf, BUFFER_LOCK_SHARE);
+			buf = lion_dir_step_right(vs->index, buf, BUFFER_LOCK_SHARE,
+									  &walk);
 			off = lion_page_first_data(BufferGetPage(buf));
 			continue;
 		}

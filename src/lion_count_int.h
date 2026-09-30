@@ -458,6 +458,11 @@ typedef struct LionSetCursor
 	PGAlignedBlock *imgbuf;		/* private copy of the current container page */
 	Page		img;
 	BlockNumber imgblk;			/* the block img is a copy of */
+	LionRightWalk walk;			/* its steps right over its whole life, seeks
+								 * and all: a cursor only moves forward and a
+								 * seek lands no further left than it stands,
+								 * so a cycle of damaged links still ends in
+								 * an ERROR (lion.h) */
 	bool		haspage;		/* img holds a leaf whose items are being
 								 * consumed; pinbuf pins it unless the cursor
 								 * was told to drop its pins (cx->droppins) */

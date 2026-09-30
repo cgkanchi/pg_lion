@@ -5483,25 +5483,35 @@ reads and at the cost of a comparison each, only what it would otherwise follow 
   had that write land on whatever page it named.
 
 A block number past the end and a damaged key datum are not caught here: the first fails in
-`ReadBuffer()`, and the second is the same risk every index AM takes with its own keys. A right-link
-cycle that an uncoupled walk follows walks until it is cancelled. "Until it is cancelled" is new as
-well: every step of a descent and of an uncoupled walk right now checks for interrupts BETWEEN the
-pages, with no content lock held. It used to check just after locking the next page, where the lock
-holds interrupts off, so a descent round a cycle of downlinks (the third case of the test below,
-before the level check refused it) ignored statement_timeout and pg_terminate_backend() alike and
-only SIGKILL stopped it. The walks that can NOT be cancelled, because they hold a page at every
-point - the coupled steps through a prefix run, and `lion_dir_find_parent()`'s walks right, under
-the child - are bounded instead (`LionRightWalk`, lion.h, 2026-09-27 review): a walk that only
-moves right never passes a page twice, since no page leaves a level and a split puts its new page
-to the right, so a walk that has taken more steps than the index has blocks is going round a cycle
-and is refused. The size is only asked for once a walk is 1024 pages long, and asked again whenever
-the walk outgrows it, since the index grows meanwhile. `test/sql/corrupt.sql` damages a freshly
-built index's root on disk in the first three ways of the list above and checks that queries and
-inserts fail with INDEX_CORRUPTED and leave the relation's size alone; against the code before that
-review the first grew the index by a block per statement, the second answered from a line pointer
-past pd_lower, and the third never returned. The cases the 2026-09-27 review added are not in that
-test yet, and neither is the root-split race above, which needs two backends and a split to land
-between one's meta-page read and its lock.
+`ReadBuffer()`, and the second is the same risk every index AM takes with its own keys. Every step of
+a descent and of an uncoupled walk right checks for interrupts BETWEEN the pages, with no content
+lock held. It used to check just after locking the next page, where the lock holds interrupts off, so
+a descent round a cycle of downlinks (the third case of the test below, before the level check
+refused it) ignored statement_timeout and pg_terminate_backend() alike and only SIGKILL stopped it.
+And EVERY walk right is bounded (`LionRightWalk`, lion.h): a walk that only moves right never passes
+a page twice, since no page leaves a level and a split puts its new page to the right, so a walk that
+has taken more steps than the index has blocks is going round a cycle and is refused with
+INDEX_CORRUPTED. The size is only asked for once a walk is 1024 pages long, and asked again whenever
+the walk outgrows it, since the index grows meanwhile; before that a step costs a counter and two
+comparisons, which refuse at once a right link to the page itself and one to the meta page. The
+2026-09-27 review bounded the walks that can NOT be cancelled, because they hold a page at every
+point - the coupled steps through a prefix run, and `lion_dir_find_parent()`'s walks right, under the
+child - and left the others to "walk until cancelled". The 2026-09-29 review found what that meant:
+one right link pointed back into its own level sent every count, bitmap and plain scan,
+`lion_index_count()`, LionOrdered and VACUUM round the cycle until statement_timeout, and
+autovacuum, which has none, round it for ever, relaunched every cycle. So now every walker steps
+through it - the descents' moves right and `lion_dir_step_right()`, which takes the walk as an
+argument, the leaf walks of the scans (`LionLeafWalk`, `LionOrderWalk` in both directions), of the
+count engine (`LionEntryScan`, the lookup walks) and of the planner's endpoint probe, the walks of a
+posting set's leaves (§22) and VACUUM's walks of both (§18), which therefore fail the VACUUM with the
+ERROR, as a damaged nbtree does. `test/sql/corrupt_walk.sql` damages a right link into a cycle, to
+the page itself and to the meta page, on disk, and runs every one of those walkers under a timeout.
+`test/sql/corrupt.sql` damages a freshly built index's root on disk in the first three ways of the
+list above and checks that queries and inserts fail with INDEX_CORRUPTED and leave the relation's
+size alone; against the code before that review the first grew the index by a block per statement,
+the second answered from a line pointer past pd_lower, and the third never returned. The cases the
+2026-09-27 review added are not in that test yet, and neither is the root-split race above, which
+needs two backends and a split to land between one's meta-page read and its lock.
 
 ### Planner
 
@@ -5744,7 +5754,14 @@ Operations.
     never passes a page twice, since no page leaves a level of a live set and a split puts its new
     page to the right, so one that has taken more steps than the index has blocks is going round a
     cycle of right links, and is refused. The index's size is asked for only once a walk is 1024
-    pages long.
+    pages long. A right link to the page itself or to the meta page is refused at the step; the
+    second used to END a reader's walk without a word, since block 0 does not claim the set and a
+    page that does not is what a freed one looks like (§18), so the count came out short. Since the
+    2026-09-29 review this holds for the READERS' walks of the leaves too (§21, "Readers"):
+    `lion_emit_chain()`, `LionOrderWalk`, the count cursor over the whole of its life, seeks and all
+    (a cursor only moves forward, and a seek lands no further left than it stands), the private
+    copy of `lion_posting_set_materialize()`, and VACUUM's pass 2, its regrow walk and its freeing of
+    a set's levels. They went round a cycle until cancelled, and VACUUM for ever under autovacuum.
 
   "For ever" meant UNCANCELLABLE on every writer's path, which is why the bounds, and not the checks
   for interrupts, are what matter there: a writer holds the key's directory leaf throughout, a held

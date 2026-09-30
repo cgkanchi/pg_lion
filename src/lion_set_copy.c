@@ -77,6 +77,7 @@ lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 	bool		ok = true;
 	bool		sorted = true;
 	int			i;
+	LionRightWalk walk;
 
 	Assert(ps->found && !ps->is_inline && ps->mat == NULL);
 
@@ -108,6 +109,7 @@ lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 		}
 	}
 
+	lion_rightwalk_init(&walk);
 	while (BlockNumberIsValid(blkno))
 	{
 		BlockNumber imgblk = blkno;
@@ -168,6 +170,7 @@ lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 		if (!ok || !BlockNumberIsValid(blkno))
 			break;
 
+		lion_rightwalk_step(ps->index, &walk, imgblk, blkno);
 		CHECK_FOR_INTERRUPTS();
 
 		{

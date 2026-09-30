@@ -471,8 +471,10 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 	Buffer		buf;
 	int			nleaves = 0;
 	bool		found = false;
+	LionRightWalk walk;
 
 	*settled = false;
+	lion_rightwalk_init(&walk);
 
 	/* every item at least an entry header and a line pointer, as a batch */
 	maxitems = BLCKSZ / (MAXALIGN(LION_ENTRY_HDRSZ) + sizeof(ItemIdData)) + 1;
@@ -588,7 +590,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 			buf = InvalidBuffer;
 		}
 		else
-			buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
+			buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE, &walk);
 		if (!BufferIsValid(buf))
 			break;
 	}

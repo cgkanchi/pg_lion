@@ -1145,6 +1145,11 @@ typedef struct LionEntryScan
 	uint16		attno;			/* ... and its number; the walk ends at the
 								 * first entry of the next column */
 	BlockNumber blkno;			/* directory leaf to read next */
+	BlockNumber stepfrom;		/* ... the leaf whose right link it is, or
+								 * InvalidBlockNumber when the walk did not
+								 * step there (a start, a phase, a pause) */
+	LionRightWalk walk;			/* the steps right since the walk (or its
+								 * phase) started (lion.h) */
 	bool		haslast;		/* the key below is valid */
 	int			lastkind;		/* LION_KIND_* of the last entry examined */
 	uint32		lasthash;

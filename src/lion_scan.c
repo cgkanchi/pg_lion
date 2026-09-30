@@ -316,6 +316,7 @@ lion_emit_chain(Relation index, uint32 hash, BlockNumber head, TIDBitmap *tbm,
 	BlockNumber blkno;
 	Buffer		buf;
 	int64		ntids = 0;
+	LionRightWalk walk;
 
 	if (!BlockNumberIsValid(head))
 		return 0;
@@ -336,6 +337,7 @@ lion_emit_chain(Relation index, uint32 hash, BlockNumber head, TIDBitmap *tbm,
 
 	copy = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 
+	lion_rightwalk_init(&walk);
 	for (;;)
 	{
 		Page		page;
@@ -362,6 +364,7 @@ lion_emit_chain(Relation index, uint32 hash, BlockNumber head, TIDBitmap *tbm,
 		if (!BlockNumberIsValid(blkno))
 			break;
 
+		lion_rightwalk_step(index, &walk, cblkno, blkno);
 		buf = ReadBuffer(index, blkno);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 
@@ -609,7 +612,9 @@ typedef struct LionLeafWalk
 	Buffer		pinbuf;
 	PGAlignedBlock *copy;
 	bool		haspage;
+	BlockNumber curblk;			/* the leaf the image came from, or Invalid */
 	BlockNumber nextblk;
+	LionRightWalk rwalk;		/* the steps from leaf to leaf (lion.h) */
 	OffsetNumber off;
 	OffsetNumber maxoff;
 	bool		done;
@@ -632,7 +637,9 @@ lion_walk_begin(LionLeafWalk *w, Relation index, LionState *col,
 	w->keeppin = keeppin;
 	w->pinbuf = InvalidBuffer;
 	w->copy = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
+	w->curblk = InvalidBlockNumber;
 	w->nextblk = InvalidBlockNumber;
+	lion_rightwalk_init(&w->rwalk);
 
 	if (w->nranges > 0)
 	{
@@ -712,6 +719,12 @@ lion_walk_next(LionLeafWalk *w, Size *itemlen)
 				w->pinbuf = InvalidBuffer;
 			}
 
+			/* Every leaf after the first is a step right (lion.h). */
+			if (BlockNumberIsValid(w->curblk))
+				lion_rightwalk_step(w->index, &w->rwalk, w->curblk,
+									w->nextblk);
+			CHECK_FOR_INTERRUPTS();
+
 			buf = ReadBuffer(w->index, w->nextblk);
 			lion_dir_pages_read++;
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -731,6 +744,7 @@ lion_walk_next(LionLeafWalk *w, Size *itemlen)
 			else
 				UnlockReleaseBuffer(buf);
 
+			w->curblk = w->nextblk;
 			w->nextblk = LionPageGetOpaque(cpage)->rightlink;
 			w->off = lion_page_first_data(cpage);
 			w->maxoff = PageGetMaxOffsetNumber(cpage);
@@ -4018,6 +4032,8 @@ struct LionOrderWalk
 	bool		started;		/* the VALUE walk has read its first leaf */
 	BlockNumber blk;			/* where the copy came from */
 	BlockNumber nextblk;		/* ascending: the leaf to read next */
+	LionRightWalk leafwalk;		/* the steps from leaf to leaf, in either
+								 * direction (lion.h) */
 	int			off;			/* the next item to look at */
 	int			firstoff;
 	int			maxoff;
@@ -4032,6 +4048,7 @@ struct LionOrderWalk
 	bool		haspost;
 	BlockNumber postblk;
 	BlockNumber postnext;
+	LionRightWalk postwalk;		/* ... and its steps from leaf to leaf */
 	OffsetNumber postoff;
 	OffsetNumber postmax;
 
@@ -4091,6 +4108,7 @@ lion_order_walk_begin(Relation index, AttrNumber attno, ScanKey keys, int nkeys,
 	w->attno = attno;
 	w->backward = backward;
 	w->nulls = nulls;
+	lion_rightwalk_init(&w->leafwalk);
 	w->leaf = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 	w->ebuf = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 	w->post = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
@@ -4145,6 +4163,7 @@ lion_order_take_entry(LionOrderWalk *w, const LionEntryTuple *entry, Size sz)
 	w->payoff = 0;
 	w->chainstarted = false;
 	w->haspost = false;
+	lion_rightwalk_init(&w->postwalk);
 	w->entries++;
 }
 
@@ -4229,11 +4248,21 @@ lion_order_next_value(LionOrderWalk *w)
 							 errmsg("lion index \"%s\": no left sibling of directory leaf %u",
 									RelationGetRelationName(w->index), w->blk),
 							 errhint("REINDEX the index.")));
+
+				/*
+				 * A step along the level like any other, counted as the
+				 * right link that joins the two: left and right links that
+				 * agree on a cycle would take this walk round it for ever.
+				 */
+				lion_rightwalk_step(w->index, &w->leafwalk,
+									BufferGetBlockNumber(buf), w->blk);
 			}
 			else
 			{
 				if (!BlockNumberIsValid(w->nextblk))
 					return false;
+				lion_rightwalk_step(w->index, &w->leafwalk, w->blk,
+									w->nextblk);
 				buf = ReadBuffer(w->index, w->nextblk);
 				LockBuffer(buf, BUFFER_LOCK_SHARE);
 			}
@@ -4370,6 +4399,8 @@ lion_order_next_item(LionOrderWalk *w)
 			{
 				if (!BlockNumberIsValid(w->postnext))
 					return false;
+				lion_rightwalk_step(w->index, &w->postwalk, w->postblk,
+									w->postnext);
 				buf = ReadBuffer(w->index, w->postnext);
 				LockBuffer(buf, BUFFER_LOCK_SHARE);
 				page = BufferGetPage(buf);
