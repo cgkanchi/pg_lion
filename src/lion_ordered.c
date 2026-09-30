@@ -824,6 +824,7 @@ typedef struct LoWalk
 	int			nulls;			/* LION_ORDER_NULLS_* */
 	List	   *rinfos;			/* the restriction clauses it answers */
 	List	   *quals;			/* ... as index quals, the key on the left */
+	double		nlist;			/* the values of a list among them, or 0 */
 } LoWalk;
 
 /* The walk's custom_private marker (the btree kind's first member is a Path) */
@@ -833,8 +834,18 @@ typedef struct LoWalk
  * Can the walk of `var` answer rinfo: a range comparison of the column with
  * a value that does not depend on the row - a Const, a Param, a stable
  * expression, evaluated when the walk starts as an Index Scan's run-time keys
- * are - under the index column's collation, or `IS NOT NULL`?  *qual is the
- * clause with the column on the left.
+ * are - under the index column's collation, `IS NOT NULL`, or a list, `col =
+ * ANY (array)` of such an array?  *qual is the clause with the column on the
+ * left, and *list says it is a list.
+ *
+ * A list is walked a value at a time, each value descended to (DESIGN.md
+ * §30.11, "Lists"), which the walk can do only in the directory's own order:
+ * so only under the column's own equality for its own type (the opclass's
+ * input type), whose probe is the column's comparison.  Left to the set, a
+ * list on the walked column was walked from the column's first entry
+ * whatever its values, and `here IN ('H10', 'H11') ... ORDER BY here LIMIT
+ * 50` read every entry below 'H10' before its first member - until the
+ * fetch-and-sort switch fetched all 1,292 of them instead (2026-09-30).
  *
  * The collation is core's rule for an index clause, IndexCollMatchesExprColl()
  * (as lion_match_index() applies it): the walk compares its bound with the
@@ -846,13 +857,47 @@ typedef struct LoWalk
  * filter, as any other the walk does not answer.
  */
 static bool
-lo_walk_clause(RestrictInfo *rinfo, Var *var, Oid opfamily, Oid idxcoll,
-			   Expr **qual)
+lo_walk_clause(RestrictInfo *rinfo, Var *var, Oid opfamily, Oid opcintype,
+			   Oid idxcoll, Expr **qual, bool *list)
 {
 	Expr	   *clause = rinfo->clause;
 
+	*list = false;
 	if (rinfo->pseudoconstant)
 		return false;
+	if (IsA(clause, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+		Node	   *l;
+		Node	   *arr;
+		int			strategy;
+		Oid			lefttype;
+		Oid			righttype;
+
+		if (!saop->useOr || list_length(saop->args) != 2)
+			return false;
+		l = (Node *) linitial(saop->args);
+		arr = (Node *) lsecond(saop->args);
+		while (IsA(l, RelabelType))
+			l = (Node *) ((RelabelType *) l)->arg;
+		if (!equal(l, var))
+			return false;
+		if (contain_var_clause(arr) || contain_volatile_functions(arr) ||
+			contain_subplans(arr))
+			return false;
+		if (OidIsValid(idxcoll) && saop->inputcollid != idxcoll)
+			return false;
+		if (!op_in_opfamily(saop->opno, opfamily))
+			return false;
+		get_op_opfamily_properties(saop->opno, opfamily, false, &strategy,
+								   &lefttype, &righttype);
+		if (strategy != LION_STRAT_EQUAL || lefttype != opcintype ||
+			righttype != opcintype)
+			return false;
+		*qual = clause;
+		*list = true;
+		return true;
+	}
 	if (IsA(clause, NullTest))
 	{
 		NullTest   *nt = (NullTest *) clause;
@@ -1021,13 +1066,28 @@ lo_lion_walks(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			{
 				RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
 				Expr	   *qual;
+				bool		list;
 
 				if (lo_walk_clause(rinfo, var, idx->opfamily[c],
-						   idx->indexcollations[c], &qual))
+								   idx->opcintype[c],
+								   idx->indexcollations[c], &qual, &list))
 				{
+					/* one list a walk: any other stays the set's, or a filter */
+					if (list && w->nlist > 0)
+						continue;
+					if (list)
+					{
+						Node	   *arr = (Node *) lsecond(((ScalarArrayOpExpr *) qual)->args);
+
+#if PG_VERSION_NUM >= 170000
+						w->nlist = Max(1.0, estimate_array_length(root, arr));
+#else
+						w->nlist = Max(1.0, (double) estimate_array_length(arr));
+#endif
+					}
 					w->rinfos = lappend(w->rinfos, rinfo);
 					w->quals = lappend(w->quals, qual);
-					strict = true;	/* no NULL satisfies either kind */
+					strict = true;	/* no NULL satisfies any kind */
 				}
 			}
 			w->nulls = strict ? LION_ORDER_NULLS_NONE :
@@ -1137,6 +1197,10 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 	startup += qcost.startup + rel->reltarget->cost.startup;
 	run += fetched * (cpu_tuple_cost + qcost.per_tuple) +
 		rows * rel->reltarget->cost.per_tuple;
+
+	/* a list: one more descent for each of its values after the first */
+	if (w->nlist > 1.0)
+		run += (w->nlist - 1.0) * 2.0 * random_page_cost;
 
 	*startup_p = startup;
 	*total_p = startup + run;

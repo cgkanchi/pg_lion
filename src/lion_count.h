@@ -1063,7 +1063,8 @@ extern void lion_source_close(LionSource *src);
 /*
  * The TIDs of one ordered scalar key column in the column's order (DESIGN.md
  * §30.11), in lion_scan.c: the entries its range keys select - every `<`,
- * `<=`, `>=` and `>` key on the column, and `IS NOT NULL` - walked in key
+ * `<=`, `>=` and `>` key on the column, `IS NOT NULL`, and one list, `= ANY
+ * (array)`, whose values are each descended to in turn - walked in key
  * order, ascending or descending, and the TIDs of each entry in heap order;
  * the NULL entry's before them or after them, or not at all.  Rows with equal
  * keys come in no particular order.  The walk holds no pin and no lock between

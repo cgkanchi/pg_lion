@@ -14353,6 +14353,24 @@ are the filter. One path per (walk, set) and one with no set, and add_path() kee
 The walk needs no restriction clause at all: `ORDER BY ts DESC LIMIT 10` over a table whose only
 index on `ts` is a lion index is a walk with nothing to filter, where it was a whole scan and a Sort.
 
+**Lists** (2026-09-30). One list on the walked column, `g = ANY (array)` or `g IN (...)`, is the
+walk's too: it descends to each of the list's values in turn, in the walk's direction, and walks
+only their entries (`lion_order_points()`, `lion_order_point_range()`). Before, the list was left to
+the set, and the walk started at the column's first entry: `here IN ('H10', 'H11') AND <two other
+lists> ORDER BY here LIMIT 50` over 5M rows of fifty values read every entry of `H00` .. `H09`
+without a member, until the fetch-and-sort switch gave up on it at 41,344 entries and fetched and
+sorted all 1,292 members - 12.2 ms warm and 128 ms from disk, where the same query over a list at
+the bottom of the column fetched 50 rows. Now it walks 7,816 entries of `H10` and fetches 50 (8.0 ms
+warm, most of it building the set of the other two lists). The values are sorted in the directory's
+order - the probe's `sortproc`, the column's comparison - without NULLs, which no key equals, and
+without duplicates, which would walk an entry twice; each is a range of its own, the range keys'
+bounds and `>= v AND <= v`, whose two bounds are the ones the walk descends to (every entry it
+selects equals `v`, whatever else bounds it). Only under the column's own equality for its own
+type, the opclass's input type: that is the order the walk can seek in. `n = ANY ('{3,5}'::int8[])`
+over an int4 column stays the set's, as does a second list on the column. The cost adds a descent,
+`2 random_page_cost`, for each value after the first (`estimate_array_length()`); `s_w` has the
+list's selectivity in it already. `test/sql/ordered_lists.sql`.
+
 **Cost** (`lo_cost_walk()`). With `T` the relation's tuples, `s_w` the selectivity of the walk's
 clauses, `nd` the column's distinct values, and a set of selectivity `s` and index cost `C_lion`
 (§30.3):
