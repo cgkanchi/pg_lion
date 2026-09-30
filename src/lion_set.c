@@ -377,7 +377,7 @@ lion_fill_posting_set_entry(Relation index, LionState *state,
 	}
 	else
 	{
-		ps->storedkey = datumCopy(lion_fetch_key(state, LionEntryGetKey(entry)),
+		ps->storedkey = datumCopy(lion_entry_key(state, entry),
 								  state->typbyval, state->typlen);
 		ps->hasstoredkey = true;
 	}
@@ -513,6 +513,58 @@ lion_probe_sort(Relation index, AttrNumber attno, Oid keytype, int nvalues,
 	}
 	pfree(probes);
 	return n;
+}
+
+/*
+ * Keep one of each run of byte-for-byte equal values in a list that
+ * lion_probe_sort() has sorted, hashes and all: they are the same key, and
+ * the sort puts them side by side.  The lookup would skip the rest anyway,
+ * but a list located a batch at a time runs a batch on past its size while
+ * the hash stays the same, so a list of one value repeated millions of times
+ * was one batch of that many sets.  typbyval and typlen are the values' own.
+ * Returns how many are left.
+ */
+int
+lion_probe_sort_unique(Datum *sorted, uint32 *hashes, int n, bool typbyval,
+					   int16 typlen)
+{
+	int			in;
+	int			out = 1;
+
+	if (n <= 1)
+		return n;
+	for (in = 1; in < n; in++)
+	{
+		if (hashes[in] == hashes[out - 1] &&
+			datumIsEqual(sorted[in], sorted[out - 1], typbyval, typlen))
+			continue;
+		sorted[out] = sorted[in];
+		hashes[out] = hashes[in];
+		out++;
+	}
+	return out;
+}
+
+/*
+ * What one value of an IN list costs once located: its LionPostingSet, the
+ * copies of its INLINE payload and stored key, its leaf of the source's tree
+ * and the pointer to it - some 200 bytes, rounded up.
+ */
+#define LION_ARRAY_SET_BYTES	256
+
+/*
+ * The most values of one IN list a count locates at once (DESIGN.md §15, "A
+ * list too long to locate at once"): what a work_mem of located sets holds,
+ * and never fewer than the longest list a literal may be, which is located
+ * whole as it always was.
+ */
+int
+lion_array_batch_size(void)
+{
+	Size		n = (Size) work_mem * 1024 / LION_ARRAY_SET_BYTES;
+
+	n = Min(n, (Size) (INT_MAX / 2));
+	return (int) Max(n, (Size) LION_MAX_ARRAY_ELEMS);
 }
 
 /*
@@ -660,14 +712,20 @@ lion_posting_set_lookup_budgeted_col(Relation index, AttrNumber attno,
  *	  few as 100), which nothing else shares and which run out just the same:
  *	  "no empty local buffer available" (lion_pin_pool());
  *	- for the SHARED pool, LION_LOOKUP_SHARES times the backend's fair share
- *	  of it, NBuffers / MaxBackends, but never less than LION_LOOKUP_MIN_PINS
- *	  (2026-09-28 review).  The eighth keeps one backend from taking the
- *	  pool, but eight backends running such lists at once still took all of
- *	  it; with the share, the backends that must do so are a sixteenth of all
- *	  the server is configured for, however many that is.  On a stock server
- *	  (128MB, 100 connections: some 130 buffers a backend) the share is 2000
- *	  and the thousand binds, so an ordinary configuration pins what it always
- *	  did; the share binds where max_connections is large for shared_buffers.
+ *	  of it: the pool over every process that may pin a buffer of it,
+ *	  GetPinLimit() (lion_pin_fair_share()), what core holds a read stream
+ *	  or a relation extension to.  The eighth keeps one backend from taking
+ *	  the pool, but eight backends running such lists at once still took all
+ *	  of it; with the share, the backends that must do so are a quarter of
+ *	  all the server is configured for, however many that is.  On a stock
+ *	  18 server (128MB, 100 connections: 94 buffers a backend) that is 376,
+ *	  and the thousand binds from about 340MB of shared_buffers up.
+ *	  It used to be sixteen shares of NBuffers / MaxBackends and never fewer
+ *	  than 64 (2026-09-28 review): a thousand pins a backend on a stock
+ *	  server, seventeen of which took the whole pool, and 64 on any pool of
+ *	  512 buffers or more however many connections shared it (2026-09-29
+ *	  review).  Nothing floors it now: a pool too small for its connections
+ *	  gives no share at all, and every set is located NOPIN;
  *
  * and a participant of a parallel plan gets its SHARE of that: the limit
  * divided by the participants the plan was started with
@@ -675,12 +733,13 @@ lion_posting_set_lookup_budgeted_col(Relation index, AttrNumber attno,
  * join locates the fact filters for itself (DESIGN.md §27), and a leader with
  * seven workers took eight budgets for one query.
  *
- * None of them is the backend's plain "fair share" (GetAdditionalPinLimit()
- * of 18): 86 buffers on a stock 128MB server, and a budget of it sent
- * ordinary thousand-value lists to the heap.  No bound kept per backend can
- * promise the pool to every backend at once - that needs a count in shared
- * memory, which an extension that need not be preloaded does not have - and a
- * set past the budget only costs time: it comes out NOPIN, never wrong.
+ * No bound kept per backend can promise the pool to every backend at once -
+ * that needs a count in shared memory, which an extension that need not be
+ * preloaded does not have - and a set past the budget only costs time: it
+ * comes out NOPIN, never wrong.  So the bound is a few shares and not one: a
+ * single share (the budget's first version, 2fb790e: 86 buffers on a stock
+ * 128MB server) sent ordinary thousand-value lists to the heap, and four
+ * leave a stock server's lists a pinned leaf for most of their values.
  *
  * The count is backend-wide because the budget is: two unbounded lists in one
  * query share it instead of taking one budget each.  Every set that took a
@@ -704,8 +763,7 @@ lion_posting_set_lookup_budgeted_col(Relation index, AttrNumber attno,
  * pin at all and then pinned a page per value when its cursors were built.
  */
 #define LION_LOOKUP_MAX_PINS	1000
-#define LION_LOOKUP_SHARES		16
-#define LION_LOOKUP_MIN_PINS	64
+#define LION_LOOKUP_SHARES		4
 
 static uint32 lion_list_pins = 0;
 static bool lion_list_pins_cb = false;
@@ -750,13 +808,12 @@ lion_pin_limit(Relation rel)
 	limit = (uint32) Min(LION_LOOKUP_MAX_PINS, Max(lion_pin_pool(rel) / 8, 1));
 	if (rel == NULL || !RelationUsesLocalBuffers(rel))
 	{
-		int64		share;
+		uint64		share;
 
-		share = (int64) LION_LOOKUP_SHARES * NBuffers / Max(MaxBackends, 1);
-		share = Max(share, (int64) LION_LOOKUP_MIN_PINS);
-		limit = (uint32) Min((int64) limit, share);
+		share = (uint64) LION_LOOKUP_SHARES * lion_pin_fair_share();
+		limit = (uint32) Min((uint64) limit, share);
 	}
-	if (lion_list_participants > 1)
+	if (lion_list_participants > 1 && limit > 0)
 		limit = Max(limit / (uint32) lion_list_participants, (uint32) 1);
 	return limit;
 }
@@ -864,8 +921,16 @@ lion_list_pin_budget(Relation index)
  *			of a hash join each get one.
  *	pins	what the lists this backend has located have left of the list pin
  *			budget above, so that the leaves a list keeps pinned and the
- *			pages its cursors pin come out of ONE limit per backend - an
- *			eighth of the pool, at most a thousand buffers.
+ *			pages its cursors pin come out of ONE limit per backend - at
+ *			most a few fair shares of the pool, an eighth of it and a
+ *			thousand buffers.  Never fewer than LION_OPEN_MIN_PINS while the
+ *			limit itself allows that many, so that lists which spent it
+ *			still leave their count a batch of a few dozen sets; and never
+ *			more than the limit, however small (2026-09-29 review): a floor
+ *			of sixteen pins was the whole of a 128kB pool.  A budget of no
+ *			pins at all still opens one CHAIN set at a time, each pinning
+ *			the page it reads, and everything wider is read without its
+ *			pins (lion_plan_node()).
  *
  * rel names the pool (lion_pin_pool()): the heap for a count, whose indexes
  * share its persistence, the index for a bitmap walk.
@@ -877,7 +942,7 @@ lion_open_budget_init(LionOpenBudget *budget, Relation rel)
 	uint32		left = (lion_list_pins < limit) ? limit - lion_list_pins : 0;
 
 	budget->mem = Max((Size) work_mem * 1024, (Size) LION_OPEN_MIN_BYTES);
-	budget->pins = (int) Max(left, (uint32) LION_OPEN_MIN_PINS);
+	budget->pins = (int) Max(left, Min(limit, (uint32) LION_OPEN_MIN_PINS));
 }
 
 /*
@@ -1065,6 +1130,7 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 		bool		dup = false;
 		bool		located;
 		int			steps;
+		LionRightWalk walk;
 
 		/*
 		 * Every so often, with no lock held.  The walk keeps the leaf it
@@ -1151,6 +1217,7 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 				buf = InvalidBuffer;
 			}
 
+			lion_rightwalk_init(&walk);
 			for (steps = 0; BufferIsValid(buf); steps++)
 			{
 				Page		page = BufferGetPage(buf);
@@ -1164,7 +1231,8 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 					buf = InvalidBuffer;
 					break;
 				}
-				buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
+				buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE,
+										  &walk);
 			}
 
 			if (!BufferIsValid(buf))
@@ -1437,6 +1505,7 @@ lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 	bool		moved = false;
 	bool		keeppin = false;
 	int			steps;
+	LionRightWalk rwalk;
 
 	memset(ps, 0, sizeof(LionPostingSet));
 	ps->index = index;
@@ -1468,6 +1537,7 @@ lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 
 	if (had)
 	{
+		lion_rightwalk_init(&rwalk);
 		if (walk->hikeylen == 0 || lion_cmp_entry(walk->hikey, &sk) > 0)
 		{
 			/* on the last leaf, or right of it if it has split since */
@@ -1486,6 +1556,7 @@ lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 			lion_lookup_walk_pause(walk);
 			if (walk->stepok && BlockNumberIsValid(walk->rightlink))
 			{
+				lion_rightwalk_step(index, &rwalk, walk->blk, walk->rightlink);
 				buf = lion_dir_read_leaf(index, walk->rightlink);
 				stepping = true;
 			}
@@ -1509,7 +1580,7 @@ lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 				walk->stepok = false;
 				break;
 			}
-			buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
+			buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE, &rwalk);
 		}
 	}
 	else

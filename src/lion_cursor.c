@@ -55,6 +55,7 @@ lion_cursor_init_at(LionSetCursor *cur, const LionPostingSet *set,
 	cur->cx = cx;
 	cur->pinbuf = InvalidBuffer;
 	cur->nextblk = InvalidBlockNumber;
+	lion_rightwalk_init(&cur->walk);
 	cur->droppins = droppins || cx->droppins;
 	cur->mintarget = target;
 
@@ -254,6 +255,8 @@ lion_cursor_next_item(LionSetCursor *cur)
 		if (!BlockNumberIsValid(cur->nextblk))
 			return NULL;
 
+		lion_rightwalk_step(cur->set->index, &cur->walk, cur->imgblk,
+							cur->nextblk);
 		lion_posting_pages_read++;
 		buf = ReadBuffer(cur->set->index, cur->nextblk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -524,6 +527,7 @@ lion_cursor_seek_leaf(LionSetCursor *cur, uint32 target)
 		}
 
 		blk = cur->nextblk;
+		lion_rightwalk_step(cur->set->index, &cur->walk, cur->imgblk, blk);
 		lion_cursor_unpin(cur);
 		cur->off = OffsetNumberNext(cur->maxoff);
 

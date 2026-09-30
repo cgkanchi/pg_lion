@@ -83,11 +83,11 @@ replay, so turning it on for a primary that never replays proves nothing.
 `.local/pg` can be any PostgreSQL 16 or later install.  What the suites need from it:
 
 - **contrib: `citext`, `pageinspect`, `pg_buffercache` and `pg_walinspect`.**  The regression
-  suite creates all four.  Without `pageinspect` the `build`, `corrupt` and `summary` files fail,
-  without `pg_buffercache` the `corrupt`, `pinbudget` and `range` files and the `count_batch_race`
-  and `gettuple_pause` specs fail, without `pg_walinspect` `walrecords` fails, and most files use
-  `citext`.  The PGDG packages (`postgresql-N`) include contrib; a source build needs
-  `make -C contrib install`.
+  suite creates all four.  Without `pageinspect` the `build`, `corrupt`, `corrupt_items` and
+  `summary` files fail, without `pg_buffercache` the `corrupt`, `corrupt_items`, `pinbudget` and
+  `range` files and the `count_batch_race` and `gettuple_pause` specs fail, without
+  `pg_walinspect` `walrecords` fails, and most files use `citext`.  The PGDG packages
+  (`postgresql-N`) include contrib; a source build needs `make -C contrib install`.
 - **`pg_isolation_regress`** for the isolation specs: a source build installs it with
   `make -C src/test/isolation install`, and the packages ship it in `postgresql-server-dev-N`.
 - **`injection_points`** for the specs that park a backend on an injection point: a server
@@ -321,7 +321,10 @@ and these functions are for testing, diagnostics and the occasional direct count
 
 The counts answer exactly what the equivalent `SELECT count(*)` answers under the same snapshot,
 and ask for what it would: SELECT on the table or its indexed columns, and no row-level security in
-force for the caller.  They take one INDEX, and an index belongs to one table, so they count that
+force for the caller.  A count under a collation the index does not compare in is an error, never
+a different number; on a column of a nondeterministic collation that includes a key of the default
+collation - a literal's, which the call cannot tell from an explicit `COLLATE "default"` - so there
+the key names the column's collation (`'abc'::text COLLATE case_insensitive`).  They take one INDEX, and an index belongs to one table, so they count that
 table's own rows and nothing else.  On an inheritance parent that is the parent's rows alone - the
 count of `SELECT count(*) FROM ONLY parent WHERE ...`, never the children's, even though a plain
 `FROM parent` includes them.  A partitioned table's index has no storage and is refused
@@ -336,9 +339,11 @@ CONCURRENTLY` builds one: it takes ShareUpdateExclusiveLock on the table and the
 UPDATE and DELETE go on while it runs, and VACUUM, ANALYZE, DDL and a second verify wait for it.
 What a concurrent insert could make look wrong it checks again once the statements that were writing
 the index have ended, so it may wait for them - for as long as statement_timeout and lock_timeout
-allow - but never reports their changes as damage.  On a hot standby it takes AccessShareLock and
-is exact only while replay leaves the index alone.  With `heapallindexed` it evaluates the index's
-expressions as the table's owner (DESIGN.md §7).
+allow - but never reports their changes as damage.  On a hot standby it takes AccessShareLock, holds
+no page while it waits for another that replay may hold, and is exact only while replay leaves the
+index alone; a posting set that replay keeps changing is checked page by page, with a WARNING that
+its totals were not compared.  With `heapallindexed` it evaluates the index's expressions as the
+table's owner (DESIGN.md §7).
 
 ## Source layout
 

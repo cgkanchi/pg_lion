@@ -1,0 +1,211 @@
+-- Damaged items: an ERROR, never a PANIC, a crash or a silent overwrite.
+--
+-- 1. A container item whose line pointer claims more than its slack: every
+--    reader and writer refuses it (lion_page_item_fetch()).  The push-down
+--    of the root used to copy it by that length inside its record, which in
+--    rmgr mode (installcheck-rmgr runs this file too) is a critical section:
+--    a PANIC, again after every recovery.
+-- 2. One whose line pointer reaches into the next item but stays within its
+--    slack: readers are right to take it, but the in-place insert grew the
+--    container into its neighbour and logged it (lion_page_check_alone()).
+-- 3. A stored text key whose header says TOAST pointer: the first descent
+--    that compared against it crashed in detoast (lion_check_key()).
+-- 4. A member at heap offset 0, which lion_index_verify() passed.
+--
+-- The pages are damaged on disk, as corrupt.sql does it (pg_buffercache_evict(),
+-- PostgreSQL 17 and later - on 16 the test is skipped,
+-- test/expected/corrupt_items_1.out).  The byte offsets assume a
+-- little-endian server.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+CREATE EXTENSION IF NOT EXISTS pg_buffercache;
+RESET client_min_messages;
+SELECT current_setting('server_version_num')::int >= 170000 AS lion_di_can_evict \gset
+\if :lion_di_can_evict
+SET statement_timeout = '60s';
+
+-- A little-endian uint32 at byte off of a bytea, and one as four bytes.
+CREATE FUNCTION lion_di_u32(f bytea, off int) RETURNS bigint
+LANGUAGE sql IMMUTABLE AS $$
+	SELECT get_byte(f, off)::bigint | (get_byte(f, off + 1)::bigint << 8) |
+		   (get_byte(f, off + 2)::bigint << 16) | (get_byte(f, off + 3)::bigint << 24)
+$$;
+CREATE FUNCTION lion_di_le32(v bigint) RETURNS bytea
+LANGUAGE sql IMMUTABLE AS $$
+	SELECT set_byte(set_byte(set_byte(set_byte('\x00000000'::bytea,
+		0, (v & 255)::int), 1, ((v >> 8) & 255)::int),
+		2, ((v >> 16) & 255)::int), 3, ((v >> 24) & 255)::int)
+$$;
+
+-- Block blk of an index's main fork, read from the file.
+CREATE FUNCTION lion_di_block(idx regclass, blk bigint) RETURNS bytea
+LANGUAGE sql AS $$
+	SELECT pg_read_binary_file(pg_relation_filepath(idx),
+							   blk * current_setting('block_size')::int,
+							   current_setting('block_size')::int)
+$$;
+
+-- Line pointer off of a page: lp_off is its low 15 bits, lp_len its top 15.
+CREATE FUNCTION lion_di_item(page bytea, off int) RETURNS int
+LANGUAGE sql IMMUTABLE AS $$
+	SELECT (lion_di_u32(page, 24 + 4 * (off - 1)) & 32767)::int
+$$;
+CREATE FUNCTION lion_di_lplen(page bytea, off int) RETURNS int
+LANGUAGE sql IMMUTABLE AS $$
+	SELECT (lion_di_u32(page, 24 + 4 * (off - 1)) >> 17)::int
+$$;
+
+-- Write an index out and drop its pages from the buffer pool.
+CREATE FUNCTION lion_di_evict(idx regclass) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+	CHECKPOINT;
+	PERFORM pg_buffercache_evict(bufferid)
+	   FROM pg_buffercache
+	  WHERE relfilenode = pg_relation_filenode(idx)
+		AND reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database());
+END $$;
+
+-- Overwrite bytes at byte pos of block blk, with the page's new checksum.
+CREATE FUNCTION lion_di_poke(idx regclass, blk bigint, pos int, bytes bytea)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+	path text := pg_relation_filepath(idx);
+	bs int := current_setting('block_size')::int;
+	f bytea := pg_read_binary_file(path);
+	page bytea;
+	ck int;
+	lo oid;
+BEGIN
+	page := substring(f FROM (blk * bs)::int + 1 FOR bs);
+	page := overlay(page PLACING bytes FROM pos + 1);
+	ck := page_checksum(page, blk::int)::int & 65535;
+	page := overlay(page PLACING set_byte(set_byte('\x0000'::bytea, 0, ck & 255), 1, ck >> 8)
+					FROM 9);
+	f := overlay(f PLACING page FROM (blk * bs)::int + 1);
+	lo := lo_from_bytea(0, f);
+	PERFORM lo_export(lo, path);
+	PERFORM lo_unlink(lo);
+END $$;
+
+-- Give line pointer off of block blk the length len, keeping its offset.
+CREATE FUNCTION lion_di_set_lplen(idx regclass, blk bigint, off int, len int)
+RETURNS void LANGUAGE sql AS $$
+	SELECT lion_di_poke(idx, blk, 24 + 4 * (off - 1),
+						lion_di_le32((lion_di_u32(lion_di_block(idx, blk),
+												  24 + 4 * (off - 1)) & 131071) |
+									 (len::bigint << 17)))
+$$;
+
+-- Run a statement; report its SQLSTATE and its message with the numbers out.
+CREATE FUNCTION lion_di_try(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'ok';
+EXCEPTION WHEN OTHERS THEN
+	RETURN SQLSTATE || ': ' || regexp_replace(SQLERRM, '[0-9]+', 'N', 'g');
+END $$;
+
+SET enable_seqscan = off;
+
+-- ---------- 1. a line pointer past its item's slack, and the push-down ----------
+-- Key 7 is every 16th row of 256 heap blocks: its posting set is one leaf, the
+-- root, holding four ARRAY containers of 1816 bytes.  The fourth one's line
+-- pointer claims 4000.  Growing the set by a fifth container then pushes the
+-- root down, which moved the items by their line pointers.
+CREATE TABLE lion_di (k int NOT NULL);
+INSERT INTO lion_di
+	SELECT CASE WHEN i % 16 = 0 THEN 7 ELSE 1 END FROM generate_series(0, 4 * 14464 - 1) i;
+CREATE INDEX lion_di_i ON lion_di USING lion (k);
+SELECT lion_di_evict('lion_di_i');
+SELECT lion_index_posting_root('lion_di_i', 7) AS lion_di_root \gset
+SELECT lion_di_lplen(lion_di_block('lion_di_i', :lion_di_root), 4) AS lp_len;
+SELECT lion_di_set_lplen('lion_di_i', :lion_di_root, 4, 4000);
+SELECT lion_di_try('SELECT count(*) FROM lion_di WHERE k = 7');
+SELECT lion_di_try($$INSERT INTO lion_di
+	SELECT CASE WHEN i % 2 = 0 THEN 7 ELSE 1 END FROM generate_series(1, 20000) i$$);
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_i')$$);
+-- key 1 is on other pages, and the INSERT left nothing behind
+SELECT count(*) FROM lion_di WHERE k = 1;
+DROP INDEX lion_di_i;
+TRUNCATE lion_di;
+
+-- ---------- 2. a line pointer within its slack that reaches into the next item ----------
+-- 224 heap blocks: the fourth ARRAY is the last 32 blocks' 452 members, 912
+-- bytes, right below the third, and the next row of key 7 goes into it.  Its
+-- line pointer now claims 976 bytes - 64 of slack, which readers accept and
+-- never look at - of which the last 64 are the third container's.
+INSERT INTO lion_di
+	SELECT CASE WHEN i % 16 = 0 THEN 7 ELSE 1 END FROM generate_series(0, 3 * 14464 + 7232 - 1) i;
+CREATE INDEX lion_di_i ON lion_di USING lion (k);
+SELECT lion_di_evict('lion_di_i');
+SELECT lion_index_posting_root('lion_di_i', 7) AS lion_di_root \gset
+SELECT lion_di_lplen(p, 4) AS lp_len, lion_di_item(p, 3) - lion_di_item(p, 4) AS next_item_at
+  FROM lion_di_block('lion_di_i', :lion_di_root) p;
+SELECT lion_di_set_lplen('lion_di_i', :lion_di_root, 4, 976);
+SELECT count(*) FROM lion_di WHERE k = 7;
+-- the in-place insert of the member into the fourth container
+SELECT lion_di_try('INSERT INTO lion_di VALUES (7)');
+-- the third container is as it was
+SELECT count(*) FROM lion_di WHERE k = 7;
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_i')$$);
+DROP INDEX lion_di_i;
+
+-- ---------- 3. a stored key whose header is an INDIRECT TOAST pointer's ----------
+-- The two bytes 01 01 at the key of the entry the first probe of leaf 1
+-- compares against.
+CREATE TABLE lion_di_t (t text NOT NULL);
+INSERT INTO lion_di_t SELECT md5((i % 50)::text) FROM generate_series(1, 5000) i;
+CREATE INDEX lion_di_t_i ON lion_di_t USING lion (t);
+SELECT lion_di_evict('lion_di_t_i');
+SELECT lion_di_poke('lion_di_t_i', 1, lion_di_item(p, (2 + (n - 1) / 2)::int) + 32, '\x0101'::bytea)
+  FROM lion_di_block('lion_di_t_i', 1) p,
+	   LATERAL (SELECT ((lion_di_u32(p, 12) & 65535) - 24) / 4 AS n) s;
+SELECT lion_di_try($$SELECT count(*) FROM lion_di_t WHERE t = md5('7')$$);
+SELECT lion_di_try($$SELECT count(*) FROM lion_di_t WHERE t > md5('7')$$);
+SELECT lion_di_try($$SELECT t, count(*) FROM lion_di_t GROUP BY t ORDER BY t$$);
+SELECT lion_di_try($$INSERT INTO lion_di_t VALUES (md5('7'))$$);
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_t_i')$$);
+DROP TABLE lion_di_t;
+
+-- ---------- 4. a member at offset 0 of its heap block ----------
+-- Key 7's ARRAY, on a container page, starts with (0,1), which is member 1;
+-- it becomes member 0, (0,0), which still sorts first.
+TRUNCATE lion_di;
+INSERT INTO lion_di
+	SELECT CASE WHEN i % 16 = 0 THEN 7 ELSE 1 END FROM generate_series(0, 14464 - 1) i;
+CREATE INDEX lion_di_i ON lion_di USING lion (k) WITH (inline_limit = 64);
+SELECT lion_index_verify('lion_di_i', true);
+SELECT lion_di_evict('lion_di_i');
+SELECT lion_index_posting_root('lion_di_i', 7) AS lion_di_root \gset
+SELECT get_byte(p, lion_di_item(p, 1) + 8) AS first_member
+  FROM lion_di_block('lion_di_i', :lion_di_root) p;
+SELECT lion_di_poke('lion_di_i', :lion_di_root,
+					lion_di_item(lion_di_block('lion_di_i', :lion_di_root), 1) + 8,
+					'\x0000'::bytea);
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_i')$$);
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_i', true)$$);
+DROP INDEX lion_di_i;
+
+-- ---------- an undamaged index still works ----------
+CREATE INDEX lion_di_i ON lion_di USING lion (k);
+SELECT count(*) FROM lion_di WHERE k = 7;
+SELECT lion_index_verify('lion_di_i');
+RESET enable_seqscan;
+RESET statement_timeout;
+
+DROP TABLE lion_di;
+DROP FUNCTION lion_di_try(text);
+DROP FUNCTION lion_di_set_lplen(regclass, bigint, int, int);
+DROP FUNCTION lion_di_poke(regclass, bigint, int, bytea);
+DROP FUNCTION lion_di_evict(regclass);
+DROP FUNCTION lion_di_lplen(bytea, int);
+DROP FUNCTION lion_di_item(bytea, int);
+DROP FUNCTION lion_di_block(regclass, bigint);
+DROP FUNCTION lion_di_le32(bigint);
+DROP FUNCTION lion_di_u32(bytea, int);
+\else
+\echo 'pg_buffercache_evict() needs PostgreSQL 17: skipped'
+\endif

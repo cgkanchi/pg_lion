@@ -1283,21 +1283,6 @@ lion_redo_resident_buffer(RelFileLocator rloc, BlockNumber blk)
 }
 
 /*
- * Replay one record.
- *
- * Blocks are taken in the order the writer registered them, which is the
- * order it locked them (DESIGN.md §5 and §21: directory root to leaf, then
- * container pages left to right, then the new page), so replay cannot
- * deadlock against a standby backend that takes them in the same order.
- *
- * A block whose bit is set in `cleanupmask` is taken with a CLEANUP lock: it
- * is a block this record removes TIDs or items from, and DESIGN.md §11
- * requires that removal to wait for every pin.  Those blocks are always
- * registered FIRST, so the wait happens with no other buffer lock held -
- * §11's waiting rule, which applies to the startup process exactly as it
- * applies to VACUUM.
- */
-/*
  * The standby barrier of DESIGN.md §11 and §25: take a CLEANUP lock on every
  * block of the ranges, one at a time and with nothing else held, and let it
  * go again.  A standby reader that copied containers out of one of those
@@ -1354,6 +1339,35 @@ lion_redo_barrier(RelFileLocator rloc, const char *data, int nvisit)
 	}
 }
 
+/*
+ * Replay one record.
+ *
+ * Blocks are taken in block-id order and every one is held to the end of the
+ * record, as generic_redo() holds a generic record's.  Block-id order is the
+ * order the writer REGISTERED them in (but for the cleanup blocks below), and
+ * that is not the order it locked them in: a writer of a posting set locks
+ * the entry's directory leaf first (DESIGN.md §5) and registers it LAST,
+ * after the posting pages it changes - an insert's, a split's, a root
+ * push-down's, VACUUM's rewrite of a page - so replay locks those container
+ * pages and then the leaf, the reverse of the primary's order.  (A directory
+ * split registers its pages left to right and the meta page last, which is
+ * the order it locks them in.)  Replay therefore deadlocks with any standby
+ * backend that holds a directory page while it waits for a posting page - on
+ * buffer content locks, which no deadlock detector watches and no cancel
+ * reaches - and no backend may do that during recovery (§11, the rules for
+ * readers).  Readers hold one page at a time; lion_index_verify() held the
+ * entry's leaf across a walk of its set, and replay stopped for good
+ * (2026-09-29 review, test/recovery/run.sh phase 4).  Registering the leaf
+ * first would not lift the rule: a removal record takes its cleanup block
+ * first whatever the registration order, and WAL already written keeps its.
+ *
+ * A block whose bit is set in `cleanupmask` is taken with a CLEANUP lock: it
+ * is a block this record removes TIDs or items from, and DESIGN.md §11
+ * requires that removal to wait for every pin.  Those blocks are always put
+ * FIRST (lion_wal_order_blocks()), so the wait happens with no other buffer
+ * lock held - §11's waiting rule, which applies to the startup process
+ * exactly as it applies to VACUUM.
+ */
 static void
 lion_redo(XLogReaderState *record)
 {

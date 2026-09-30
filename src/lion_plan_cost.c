@@ -1270,8 +1270,9 @@ lion_single_eq_var(RelOptInfo *rel, List *whereclauses, List *wherekinds)
  * runs it.
  *
  *	- ONE side of the range is walked: the entries it selects, or - when F
- *	  has a positive source and k's directory is ordered - the entries below
- *	  and above it, plus one count of F minus k's NULL entry (the complement).
+ *	  has a positive source that can drive a count, which a range taken as a
+ *	  source cannot, and k's directory is ordered - the entries below and
+ *	  above it, plus one count of F minus k's NULL entry (the complement).
  *	  The executor takes the side with fewer leaves, and so does this.
  *	- Each entry walked costs a fixed amount (LION_RANGE_ENTRY_COST for one
  *	  counted on its own, LION_RANGE_UNION_ENTRY_COST for a small one counted
@@ -1460,13 +1461,17 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	Cost		inside;
 	Cost		outside;
 
-	/* The sources of F: one per OR restriction, one per positive clause. */
+	/*
+	 * The sources of F: one per OR restriction, one per positive clause - and
+	 * of those, the ones that can drive a count of F (nplain): not a range
+	 * taken as a source, which is collected into a copy that carries no pin
+	 * (§32) and that the executor never lets drive (lion_source_drives()).
+	 */
 	foreach(lc, wherekinds)
 	{
 		if (LION_CLAUSE_IS_POSITIVE(lfirst_int(lc)) && orgrp[ci] < 0)
 		{
 			nsrc++;
-			/* a source that is a range carries no pin (§32) */
 			if (lfirst_int(lc) != LION_CLAUSE_RANGESRC)
 				nplain++;
 		}
@@ -1617,7 +1622,20 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	}
 	inside += lion_range_recheck(root, rel, matching * dirtyfrac, incounts,
 								 corr);
-	if (nsrc == 0 || !ordered)
+
+	/*
+	 * No complement without a source of F that can drive |F - NULL(k)|, which
+	 * the executor asks of F before it steps the two sides at all
+	 * (lion_range_choose_on()): beside nothing but ranges taken as sources -
+	 * `count(*) WHERE mid > 10 AND hi > 10`, one collected, the other summed -
+	 * the inside is walked whatever it holds.  This used to ask for any
+	 * source (nsrc), and priced the complement of two ranges over nearly
+	 * every row at a tenth of the inside walk that ran (2026-09-29 review).
+	 * A range too large to collect is walked at every count instead, and can
+	 * drive; it is taken as collected here all the same, which prices such a
+	 * count at its inside - what it costs at most.
+	 */
+	if (nplain == 0 || !ordered)
 		return inside;
 
 	/*
@@ -1769,31 +1787,40 @@ lion_rel_clauses_selectivity(PlannerInfo *root, RelOptInfo *rel,
  * hash lookup, and the OR in place or the members set aside - at
  * LION_CONTAINER_COST; what makes a collection dear is the FOLDS, at
  * LION_RANGE_FOLD_COST each: a container of the union that is not a bitset
- * taking what came for it through a bitset image, or merging a larger one in
+ * taking what came for it through a bitset image, or merging a larger one in,
+ * and a union made a bitset to OR into being optimized again
  * (lion_range_union_cb()).  How many there are depends on how the column lies
  * in the heap, which the correlation's square interpolates between, as
  * cost_index() does:
  *
  *	- IN ORDER, the rows of a set are a run of the heap and the union of a
- *	  container key a RUN, which is no ARRAY and no bitset: every container
- *	  that comes to a key after its first is folded in.  A set's rows span
- *	  one container key more than they fill.
+ *	  container key a RUN, which is no ARRAY and no bitset: the container
+ *	  that comes to a key after its first WIDENS it into a bitset, every one
+ *	  after that is ORed in place, and it is optimized back once the walk is
+ *	  over - LION_RANGE_WIDEN_FOLDS for each key that takes more than one.
+ *	  A set's rows span one container key more than they fill.
  *	- SCATTERED, every set has a container at nearly every container key of
  *	  the heap (lion_containers_for()), and the union of a key ends up with
  *	  its rows' share of the range.  Containers of at most
  *	  LION_RANGE_UNION_PEND_MIN members wait and are folded in when the
  *	  waiting members come to half the union's, so the union grows by half at
  *	  least between two folds: 1 + log1.5(members / 32) folds a key, until it
- *	  is a bitset past LION_ARRAY_MAX_CARD members and takes the rest in
- *	  place.  Larger ones are merged in one by one until then, each merge
- *	  moving the union's members too (LION_AND_MEMBER_COST each, half the
- *	  bitset's worth on average).  Which are larger is a Poisson count's
- *	  tail (lion_poisson_above()): a set's rows fall at a key at random.
+ *	  is a bitset past LION_ARRAY_MAX_CARD members - or a RUN, which is
+ *	  widened into one - and takes the rest in place.  Larger ones are merged
+ *	  in one by one until then, each merge moving the union's members too
+ *	  (LION_AND_MEMBER_COST each, half the bitset's worth on average).  Which
+ *	  are larger is a Poisson count's tail (lion_poisson_above()): a set's
+ *	  rows fall at a key at random.
  *
  * The model used to charge a union the walk and a cpu_operator_cost a
  * container of it, and so priced a range of two million scattered rows at a
  * tenth of the time the node spent collecting it (DESIGN.md §27, "A
- * partitioned fact table").
+ * partitioned fact table").  Until the unions were widened (2026-09-30) the
+ * union of a key in heap order was folded once for every container after
+ * its first, as it was then priced, and a dense union of scattered rows -
+ * a RUN, a heap block's rows being a run - was folded once for every
+ * container, which the model never priced: 1.9 million rows took 12.7 s,
+ * priced at a third of a second (2026-09-29 review).
  */
 /*
  * P(X > k) for X a Poisson count of mean m: what share of the container keys
@@ -1846,9 +1873,10 @@ lion_cost_range_union(double heap_pages, double tuples, double rows,
 	Cost		ordered;
 	Cost		scattered;
 
-	/* in order: every container after a key's first is folded into a RUN */
+	/* in order: each key that takes a second container is widened once */
 	ordered = inord * LION_CONTAINER_COST +
-		Max(0.0, inord - uord) * LION_RANGE_FOLD_COST;
+		Min(uord, Max(0.0, inord - uord)) * LION_RANGE_WIDEN_FOLDS *
+		LION_RANGE_FOLD_COST;
 
 	/*
 	 * scattered: the small containers wait, the larger ones are merged - a

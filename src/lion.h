@@ -251,13 +251,26 @@ lion_posting_highkey(Page page)
  * page is ever taken out of a level of a live tree, and a split puts its new
  * page to the right of the page it splits, where the walk has not been yet.
  * So a walk that has taken more steps than the index has blocks is going
- * round a cycle of damaged right links.  That needs catching because some
- * walks cannot be cancelled: a posting-tree writer holds its key's directory
- * leaf the whole time, the directory's find-or-create holds its guard, and a
- * content lock holds interrupts off, so CHECK_FOR_INTERRUPTS() does nothing
- * there and statement_timeout never fires.  The size is asked for only once a
- * walk is LION_RIGHTWALK_CHEAP pages long, which almost no walk ever is, and
- * again each time the walk outgrows it, because the index grows meanwhile.
+ * round a cycle of damaged right links.  EVERY walk along a level of the
+ * directory or of a posting set steps through this - the readers', the
+ * writers' and VACUUM's alike; only lion_index_verify() keeps counts and a
+ * map of the blocks it has seen of its own.  The scans, the counts and VACUUM
+ * used to go round such a cycle until they were cancelled, and autovacuum,
+ * which nothing cancels, for ever (2026-09-29 review).  Some walks could not
+ * even be cancelled: a posting-tree writer holds its key's directory leaf the
+ * whole time, the directory's find-or-create holds its guard, and a content
+ * lock holds interrupts off, so CHECK_FOR_INTERRUPTS() does nothing there and
+ * statement_timeout never fires.  The size is asked for only once a walk is
+ * LION_RIGHTWALK_CHEAP pages long, which almost no walk ever is, and again
+ * each time the walk outgrows it, because the index grows meanwhile.
+ *
+ * A step also refuses the two links no page ever has, at once and for the
+ * price of two comparisons: one to the page itself, the shortest cycle, and
+ * one to block 0, the meta page, which a posting-set reader would otherwise
+ * take for a freed page and end the set at without a word.  A link past the
+ * end of the relation fails in ReadBuffer(); InvalidBlockNumber, which
+ * ReadBuffer() would take for P_NEW, is the end of the level, and no walk
+ * steps there.
  */
 typedef struct LionRightWalk
 {
@@ -267,8 +280,13 @@ typedef struct LionRightWalk
 
 #define LION_RIGHTWALK_CHEAP	1024
 
+/* Block 0 of every lion index, which no link ever names. */
+#define LION_METAPAGE_BLKNO	0
+
 extern void lion_rightwalk_exceeded(Relation index, LionRightWalk *walk,
 									BlockNumber blk);
+extern void lion_rightwalk_badlink(Relation index, BlockNumber blk,
+								   BlockNumber next);
 
 static inline void
 lion_rightwalk_init(LionRightWalk *walk)
@@ -277,17 +295,24 @@ lion_rightwalk_init(LionRightWalk *walk)
 	walk->limit = LION_RIGHTWALK_CHEAP;
 }
 
-/* One step right from blk; an ERROR when the walk has gone round a cycle. */
+/*
+ * One step right from blk to next, blk's right link, which is a valid block
+ * number; an ERROR when the link is damaged or the walk has gone round a
+ * cycle.
+ */
 static inline void
-lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk)
+lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
+					BlockNumber next)
 {
+	Assert(BlockNumberIsValid(next));
+	if (unlikely(next == blk || next == LION_METAPAGE_BLKNO))
+		lion_rightwalk_badlink(index, blk, next);
 	if (unlikely(++walk->steps > walk->limit))
 		lion_rightwalk_exceeded(index, walk, blk);
 }
 
 /* ---------- meta page ---------- */
 
-#define LION_METAPAGE_BLKNO	0
 #define LION_MAGIC			0x52424931	/* 'RBI1' */
 /*
  * Version 2 indexes NULL keys (DESIGN.md §14).  The page format did not
@@ -1122,6 +1147,17 @@ extern uint32 lion_hash_key(LionState *state, Datum key);
 extern Size lion_key_datum_size(LionState *state, Datum key);	/* bytes needed to store the key */
 extern void lion_store_key(LionState *state, Datum key, char *dest);
 extern Datum lion_fetch_key(LionState *state, const char *src);
+
+/*
+ * A key read off a page, checked for the form lion_store_key() gives it
+ * before any opclass function sees it (lion_state.c): lion_key_is_valid()
+ * says whether it has it, lion_check_key() raises ERRCODE_INDEX_CORRUPTED
+ * when it has not, and lion_entry_key() is lion_fetch_key() of an entry's
+ * key once lion_check_key() has passed it.
+ */
+extern bool lion_key_is_valid(LionState *state, const char *key, Size keylen);
+extern void lion_check_key(LionState *state, const char *key, Size keylen);
+extern Datum lion_entry_key(LionState *state, const LionEntryTuple *entry);
 extern bool lion_keys_equal(LionState *state, Datum a, Datum b);
 
 /* ---------- lion_dir.c: the sorted entry directory (DESIGN.md §21) ---------- */
@@ -1280,7 +1316,8 @@ extern bool lion_dir_find(Relation index, Relation heaprel, LionIndexState *ix,
 
 /* The pieces of the above, for a caller that walks the leaves itself. */
 extern LionEntryTuple *lion_dir_highkey(Page page);
-extern Buffer lion_dir_step_right(Relation index, Buffer buf, int lockmode);
+extern Buffer lion_dir_step_right(Relation index, Buffer buf, int lockmode,
+								  LionRightWalk *walk);
 extern Buffer lion_dir_read_leaf(Relation index, BlockNumber blk);
 extern OffsetNumber lion_dir_binsrch(Page page, const LionSearchKey *sk);
 extern bool lion_dir_scan_run(Relation index, const LionSearchKey *sk,
@@ -1470,6 +1507,23 @@ extern void lion_posting_finish_split_sep(Relation index, Relation heaprel,
  */
 extern LionContainer *lion_page_item_fetch(Relation index, Page page,
 										   BlockNumber blkno, OffsetNumber off);
+
+/*
+ * What a WRITER checks of a page before the WAL record that changes it opens
+ * (an rmgr-mode record is a critical section, DESIGN.md §25), each an ERROR
+ * (ERRCODE_INDEX_CORRUPTED) on damage: every item of the page inside its item
+ * space and no two overlapping (lion_page_check_items(), before items are
+ * deleted, moved to another page or rewritten); the item at off alone in the
+ * bytes the page allots it (lion_page_check_alone(), before it is overwritten
+ * or deleted in place); and the directory entry at off a whole one, of the
+ * size a CHAIN entry has to have (lion_page_entry_fetch()).
+ */
+extern void lion_page_check_items(Relation index, Page page, BlockNumber blkno);
+extern void lion_page_check_alone(Relation index, Page page, BlockNumber blkno,
+								  OffsetNumber off);
+extern LionEntryTuple *lion_page_entry_fetch(Relation index, Page page,
+											 BlockNumber blkno,
+											 OffsetNumber off);
 
 /*
  * Locate a container by ckey on a container page.  Returns the offset of the

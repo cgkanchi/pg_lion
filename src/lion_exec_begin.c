@@ -301,9 +301,9 @@ lion_rel_read_only(LionCountScanState *st, Relation heap)
 }
 
 /*
- * The items - the sources after slot 0 - of the partition just opened: the
- * plan's, less the clauses its bounds imply (DESIGN.md §16, "Clauses the
- * partition bounds imply"), whose indexes lion_open_relation() left closed.
+ * The items - the sources after slot 0 - of the partition whose turn begins:
+ * the plan's, less the clauses its bounds imply (DESIGN.md §16, "Clauses the
+ * partition bounds imply"), which have no index open (lion_open_parts()).
  * An OR is left out when every leaf of it is, and otherwise located without
  * the arms and leaves the partition leaves out (lion_locate_or()); a range
  * taken as a source stands for all of its bounds, and is left out when every
@@ -368,40 +368,158 @@ lion_relation_items(LionCountScanState *st)
 	}
 }
 
-void
-lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
-				  Oid groupidxoid2, const Oid *clauseidxoid)
+/*
+ * A heap the node counts, opened without a lock of its own: the executor
+ * holds one on every range table entry of the plan, a partition's included
+ * (the planner locked it when it expanded the parent, and
+ * AcquireExecutorLocks() relocks the whole flat range table for a cached
+ * plan).  A parallel worker (DESIGN.md §27, "Parallel") holds no lock of the
+ * leader's and takes its own, as ExecGetRangeTableRelation() does for the
+ * scans of a worker.
+ */
+static Relation
+lion_open_heap(Oid heapoid)
 {
+	Relation	heap;
+
+	heap = table_open(heapoid, IsParallelWorker() ? AccessShareLock : NoLock);
+	Assert(CheckRelationLockedByMe(heap, AccessShareLock, true));
+	return heap;
+}
+
+/*
+ * An index the node reads.  Indexes are not range table entries, and nothing
+ * relocks them for a cached plan, so each gets an AccessShareLock of its own,
+ * as ExecInitIndexScan() takes one.
+ */
+static Relation
+lion_open_index(Oid indexoid)
+{
+	return OidIsValid(indexoid) ? index_open(indexoid, AccessShareLock) : NULL;
+}
+
+/*
+ * Every relation of every leaf partition (DESIGN.md §16), opened when the
+ * node is initialised and kept open until it ends (lion_close_parts()), as
+ * the scans under core's Append keep theirs from ExecInitNode() to
+ * ExecEndNode().  The relcache references are the point: CheckTableNotInUse()
+ * reads them to refuse a TRUNCATE, DROP, REINDEX or ALTER - of the heap or
+ * of an index - that this session issues while a query still uses the
+ * relation, for instance between two FETCHes of a cursor.  Opened only for
+ * its turn, a partition could be emptied or dropped under the cursor between
+ * two of them.
+ *
+ * What each costs is a reference count and a resource owner entry: the
+ * relcache entries are the ones the planner built, and nothing is read from
+ * storage, since the files are opened when a turn reads a page, and through
+ * the virtual file descriptors, which fd.c pools.  The index locks are the
+ * ones the planner took for each leaf (get_relation_info()), and the ones an
+ * Append of index scans would take for a cached plan.
+ */
+static void
+lion_open_parts(LionCountScanState *st)
+{
+	int			p;
+	int			i;
+
+	for (p = 0; p < st->npart; p++)
+	{
+		LionPartState *part = &st->part[p];
+
+		part->heap = lion_open_heap(part->heapoid);
+		part->groupidx = lion_open_index(part->groupidxoid);
+		part->groupidx2 = lion_open_index(part->groupidxoid2);
+		part->clauseidx = (Relation *)
+			palloc0(sizeof(Relation) * Max(st->nclause, 1));
+		for (i = 0; i < st->nclause; i++)
+			part->clauseidx[i] = lion_open_index(part->clauseidxoid[i]);
+		part->fgidx = lion_open_index(part->fgidxoid);
+	}
+}
+
+/* ... and closed when the node ends. */
+void
+lion_close_parts(LionCountScanState *st)
+{
+	int			p;
+	int			i;
+
+	for (p = 0; p < st->npart; p++)
+	{
+		LionPartState *part = &st->part[p];
+
+		if (part->fgidx != NULL)
+			index_close(part->fgidx, AccessShareLock);
+		part->fgidx = NULL;
+		if (part->clauseidx != NULL)
+		{
+			for (i = 0; i < st->nclause; i++)
+			{
+				if (part->clauseidx[i] != NULL)
+					index_close(part->clauseidx[i], AccessShareLock);
+				part->clauseidx[i] = NULL;
+			}
+		}
+		if (part->groupidx2 != NULL)
+			index_close(part->groupidx2, AccessShareLock);
+		part->groupidx2 = NULL;
+		if (part->groupidx != NULL)
+			index_close(part->groupidx, AccessShareLock);
+		part->groupidx = NULL;
+		if (part->heap != NULL)
+			table_close(part->heap, NoLock);
+		part->heap = NULL;
+	}
+}
+
+/*
+ * Make a relation the one counted: the plain table (p < 0), whose relations
+ * are opened here, once for the life of the node, or leaf partition p for its
+ * turn, whose relations have been open since the node was (lion_open_parts()).
+ */
+void
+lion_open_relation(LionCountScanState *st, int p)
+{
+	LionPartState *part = (p >= 0) ? &st->part[p] : NULL;
 	int			i;
 
 	Assert(st->heap == NULL);
 
-	/*
-	 * A parallel worker (DESIGN.md §27, "Parallel") holds no lock of the
-	 * leader's and takes its own, as ExecGetRangeTableRelation() does for the
-	 * scans of a worker.
-	 */
-	st->heap = table_open(heapoid, IsParallelWorker() ? AccessShareLock :
-						  NoLock);
-	Assert(CheckRelationLockedByMe(st->heap, AccessShareLock, true));
+	if (part == NULL)
+	{
+		st->heap = lion_open_heap(st->heapoid);
+		for (i = 0; i < st->nclause; i++)
+			st->clause[i].idx = index_open(st->clause[i].idxoid,
+										   AccessShareLock);
+		st->groupidx = lion_open_index(st->groupidxoid);
+		st->groupidx2 = lion_open_index(st->groupidxoid2);
+		st->fgidx = lion_open_index(st->fgidxoid);
+	}
+	else
+	{
+		Assert(part->heap != NULL);
+		st->heap = part->heap;
+
+		/* NULL for a clause the partition's bounds imply (DESIGN.md §16) */
+		for (i = 0; i < st->nclause; i++)
+			st->clause[i].idx = part->clauseidx[i];
+		st->groupidx = part->groupidx;
+		st->groupidx2 = part->groupidx2;
+	}
 	lion_check_table_am(st->heap);	/* the planner declined it; see there */
 	st->rel_read_only = lion_rel_read_only(st, st->heap);
 
 	for (i = 0; i < st->nclause; i++)
 	{
-		/* a clause the partition's bounds imply (DESIGN.md §16) */
-		if (clauseidxoid != NULL && !OidIsValid(clauseidxoid[i]))
+		if (st->clause[i].idx == NULL)
 			continue;
-		st->clause[i].idx = index_open(clauseidxoid != NULL ?
-									   clauseidxoid[i] : st->clause[i].idxoid,
-									   AccessShareLock);
 		st->clause[i].idxcol =
 			lion_index_col_for(st->clause[i].idx,
 							   lion_heap_attno_in(st->heap, st->heapoid,
 												  st->clause[i].attno),
 							   st->clause[i].kind == LION_CLAUSE_MULTI);
 	}
-	if (clauseidxoid != NULL)
+	if (part != NULL)
 		lion_relation_items(st);
 
 	/*
@@ -412,24 +530,18 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 	 * column is always a scalar one: its entries have to be the column's
 	 * values, one per row.
 	 */
-	if (OidIsValid(groupidxoid))
-	{
-		st->groupidx = index_open(groupidxoid, AccessShareLock);
+	if (st->groupidx != NULL)
 		st->groupidxcol =
 			lion_index_col_for(st->groupidx,
 							   lion_heap_attno_in(st->heap, st->heapoid,
 												  st->driveattno),
 							   false);
-	}
-	if (OidIsValid(groupidxoid2))
-	{
-		st->groupidx2 = index_open(groupidxoid2, AccessShareLock);
+	if (st->groupidx2 != NULL)
 		st->groupidxcol2 =
 			lion_index_col_for(st->groupidx2,
 							   lion_heap_attno_in(st->heap, st->heapoid,
 												  st->innerattno),
 							   false);
-	}
 
 	/*
 	 * index_beginscan() would take a relation-level predicate lock on each of
@@ -462,30 +574,32 @@ lion_open_relation(LionCountScanState *st, Oid heapoid, Oid groupidxoid,
 }
 
 /*
- * The reverse.  Every posting set of this relation must already have been
- * released: DESIGN.md §9 wants no pin to outlive the relation it belongs to,
- * and a partition's pins must not outlive that partition's turn.
+ * The reverse: the plain table's relations closed, at the end of the node, or
+ * a partition's turn over, its relations left open for lion_close_parts().
+ * Every posting set of this relation must already have been released:
+ * DESIGN.md §9 wants no pin to outlive the relation it belongs to, and a
+ * partition's pins must not outlive that partition's turn.
  */
 void
 lion_close_relation(LionCountScanState *st)
 {
+	bool		own = (st->npart == 0); /* the relations are closed here */
 	int			i;
 
 	/* the counts' map page is this relation's */
 	lion_vis_cache_release_vm(st->viscache);
 
-	if (st->groupidx != NULL)
-	{
+	if (st->groupidx != NULL && own)
 		index_close(st->groupidx, AccessShareLock);
-		st->groupidx = NULL;
-		st->groupidxcol = 0;
-	}
-	if (st->groupidx2 != NULL)
-	{
+	st->groupidx = NULL;
+	st->groupidxcol = 0;
+	if (st->groupidx2 != NULL && own)
 		index_close(st->groupidx2, AccessShareLock);
-		st->groupidx2 = NULL;
-		st->groupidxcol2 = 0;
-	}
+	st->groupidx2 = NULL;
+	st->groupidxcol2 = 0;
+	if (st->fgidx != NULL)		/* a plain table's only */
+		index_close(st->fgidx, AccessShareLock);
+	st->fgidx = NULL;
 	st->innerkey = NULL;
 	st->innerisnull = NULL;
 	st->ninnerkey = 0;
@@ -493,18 +607,14 @@ lion_close_relation(LionCountScanState *st)
 		MemoryContextReset(st->innercxt);
 	for (i = 0; i < st->nclause; i++)
 	{
-		if (st->clause[i].idx != NULL)
-		{
+		if (st->clause[i].idx != NULL && own)
 			index_close(st->clause[i].idx, AccessShareLock);
-			st->clause[i].idx = NULL;
-			st->clause[i].idxcol = 0;
-		}
+		st->clause[i].idx = NULL;
+		st->clause[i].idxcol = 0;
 	}
-	if (st->heap != NULL)
-	{
+	if (st->heap != NULL && own)
 		table_close(st->heap, NoLock);
-		st->heap = NULL;
-	}
+	st->heap = NULL;
 }
 
 /*
@@ -1324,16 +1434,18 @@ lion_begin_join_batches(LionCountScanState *st, EState *estate)
  * taking another one.  The indexes are not range table entries, so they
  * get their own AccessShareLock.
  *
- * A partitioned one opens nothing here: lion_open_relation() opens one
- * partition at a time (DESIGN.md §16).
+ * A partitioned one has every leaf partition opened here and kept open the
+ * same way, and lion_open_relation() makes one of them at a time the relation
+ * counted (DESIGN.md §16).
  */
 static void
 lion_begin_open_table(LionCountScanState *st, int eflags)
 {
-	if (st->npart == 0)
+	if (st->npart > 0)
+		lion_open_parts(st);
+	else
 	{
-		lion_open_relation(st, st->heapoid, st->groupidxoid, st->groupidxoid2,
-						  NULL);
+		lion_open_relation(st, -1);
 
 		/*
 		 * A materialized view created WITH NO DATA has an empty heap and

@@ -303,6 +303,21 @@ lion_rightwalk_exceeded(Relation index, LionRightWalk *walk, BlockNumber blk)
 	walk->limit = nblocks;
 }
 
+/* blk's right link names blk itself or the meta page (see lion.h). */
+void
+lion_rightwalk_badlink(Relation index, BlockNumber blk, BlockNumber next)
+{
+	if (next == blk)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": the right link of block %u is the block itself",
+						RelationGetRelationName(index), blk)));
+	ereport(ERROR,
+			(errcode(ERRCODE_INDEX_CORRUPTED),
+			 errmsg("lion index \"%s\": the right link of block %u is the meta page",
+					RelationGetRelationName(index), blk)));
+}
+
 /*
  * Read blk, lock it in lockmode and check that it is still a page of the
  * posting set rooted at head (DESIGN.md §18).
@@ -396,8 +411,7 @@ lion_posting_step_right(Relation index, Buffer buf, BlockNumber head,
 {
 	BlockNumber next = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
 
-	Assert(BlockNumberIsValid(next));
-	lion_rightwalk_step(index, walk, BufferGetBlockNumber(buf));
+	lion_rightwalk_step(index, walk, BufferGetBlockNumber(buf), next);
 	UnlockReleaseBuffer(buf);
 
 	/* Between the pages, where no content lock holds interrupts off. */
@@ -849,11 +863,30 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	Assert(LionPageIsRightmost(page));	/* a root has no sibling */
 	Assert(level < LION_POSTING_MAX_HEIGHT);
 
+	/*
+	 * The items move by their line pointers, inside the record (see
+	 * lion_page_check_items()), so they are checked before anything is
+	 * allocated: each as a reader checks it, and all of them for fitting the
+	 * child, which the items of an undamaged root always do.  One line pointer
+	 * that claimed 4000 bytes for an item of 1816 used to fail the push-down
+	 * half way through its record - a PANIC in rmgr mode, and the same PANIC
+	 * again at the first insert into the key after recovery (2026-09-29
+	 * review).
+	 */
+	maxoff = PageGetMaxOffsetNumber(page);
+	lion_page_check_items(index, page, head);
+	for (off = FirstOffsetNumber; off <= maxoff; off++)
+	{
+		if (level == 0)
+			(void) lion_page_item_fetch(index, page, head, off);
+		else
+			(void) lion_posting_pivot_at(index, page, head, off);
+	}
+
 	/* Both pages are rebuilt, so work from a private copy of the root. */
 	copy = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 	cpage = (Page) copy->data;
 	memcpy(cpage, page, BLCKSZ);
-	maxoff = PageGetMaxOffsetNumber(cpage);
 
 	/* The child is allocated before the record opens (DESIGN.md §25). */
 	cbuf = lion_alloc_page(index, heaprel, true);
@@ -868,14 +901,16 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	if (level == 0)
 	{
 		Page		epage;
-		ItemId		eiid;
+		LionEntryTuple *onpage;
 
 		Assert(entry != NULL && BufferIsValid(entrybuf));
 		epage = BufferGetPage(entrybuf);
-		eiid = PageGetItemId(epage, entryoff);
-		loggedsz = ItemIdGetLength(eiid);
+		onpage = lion_page_entry_fetch(index, epage,
+									   BufferGetBlockNumber(entrybuf),
+									   entryoff);
+		loggedsz = ItemIdGetLength(PageGetItemId(epage, entryoff));
 		logged = (LionEntryTuple *) palloc(loggedsz);
-		memcpy(logged, PageGetItem(epage, eiid), loggedsz);
+		memcpy(logged, onpage, loggedsz);
 		if ((logged->flags & LION_ENTRY_CHAIN) == 0 || logged->head != head)
 			elog(ERROR, "lion index \"%s\": entry %u on block %u does not own the posting set at %u",
 				 RelationGetRelationName(index), entryoff,
@@ -1050,6 +1085,14 @@ lion_posting_split_internal(Relation index, Relation heaprel, uint32 hash,
 	Assert(level > 0);
 	Assert(pblk != head);
 	Assert(!LionPageIncompleteSplit(page));
+
+	/*
+	 * The pivots are copied out below, each one checked; that they also add
+	 * up to no more than a page is what makes both halves fit (see the cut),
+	 * and a page whose line pointers overlapped would otherwise fail to fill
+	 * them inside the record.
+	 */
+	lion_page_check_items(index, page, pblk);
 
 	if (!rightmost)
 		oldhk = *lion_posting_highkey_at(index, page, pblk);
@@ -1589,7 +1632,7 @@ lion_posting_scan_for_downlink(Relation index, Relation heaprel, uint32 hash,
 			UnlockReleaseBuffer(buf);
 			return InvalidBuffer;
 		}
-		lion_rightwalk_step(index, &walk, blk);
+		lion_rightwalk_step(index, &walk, blk, next);
 		UnlockReleaseBuffer(buf);
 		CHECK_FOR_INTERRUPTS();
 		blk = next;
@@ -1673,6 +1716,7 @@ lion_posting_adopt(Relation index, Relation heaprel, uint32 hash,
 		{
 			Buffer		buf;
 			Page		page;
+			BlockNumber next;
 
 			buf = lion_posting_getbuf(index, blk, head, BUFFER_LOCK_SHARE, true);
 			page = BufferGetPage(buf);
@@ -1686,8 +1730,10 @@ lion_posting_adopt(Relation index, Relation heaprel, uint32 hash,
 				!BlockNumberIsValid(firstflagged))
 				firstflagged = blk;
 
-			lion_rightwalk_step(index, &walk, blk);
-			blk = LionPageGetOpaque(page)->rightlink;
+			next = LionPageGetOpaque(page)->rightlink;
+			if (BlockNumberIsValid(next))
+				lion_rightwalk_step(index, &walk, blk, next);
+			blk = next;
 			UnlockReleaseBuffer(buf);
 			CHECK_FOR_INTERRUPTS();
 		}
@@ -1701,6 +1747,7 @@ lion_posting_adopt(Relation index, Relation heaprel, uint32 hash,
 			{
 				Buffer		buf;
 				Page		page;
+				BlockNumber next;
 
 				/* The walk above passed these pages and met no held one. */
 				if (BufferIsValid(lion_posting_held_buffer(held, blk)))
@@ -1724,8 +1771,10 @@ lion_posting_adopt(Relation index, Relation heaprel, uint32 hash,
 					}
 				}
 
-				lion_rightwalk_step(index, &walk, blk);
-				blk = LionPageGetOpaque(page)->rightlink;
+				next = LionPageGetOpaque(page)->rightlink;
+				if (BlockNumberIsValid(next))
+					lion_rightwalk_step(index, &walk, blk, next);
+				blk = next;
 				UnlockReleaseBuffer(buf);
 				CHECK_FOR_INTERRUPTS();
 			}

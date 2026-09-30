@@ -529,14 +529,6 @@
 	((k) == LION_CLAUSE_EQ || (k) == LION_CLAUSE_NULL)
 
 /*
- * An `IN` list longer than this is not pushed down: every listed value needs
- * its own posting set, and each of those may hold a buffer pin for as long as
- * the node runs (DESIGN.md §9).  A long list is also exactly the case where
- * the ordinary bitmap plan does well.
- */
-#define LION_MAX_ARRAY_ELEMS		1000
-
-/*
  * What the tests of a count(DISTINCT k) walk are (DESIGN.md §26), as far as
  * the cost model is concerned: none at all, existence tests that stop at the
  * first visible row, or full counts because the target list wants rows too.
@@ -651,9 +643,25 @@
  * union at LION_CONTAINER_COST and each member an ARRAY merge moves at
  * LION_AND_MEMBER_COST: 2.1 us at 500 units a millisecond, 57 of the 62
  * within a factor of 1.5.  The others are columns in heap order folded key
- * by key into a RUN of up to a run a heap block, which takes up to 7 us.
+ * by key into a RUN of up to a run a heap block, which takes up to 7 us -
+ * which a union no longer is: it is widened into a bitset instead (below).
  */
 #define LION_RANGE_FOLD_COST	(lion_range_fold_cost * cpu_operator_cost)
+
+/*
+ * The folds a key's union that is WIDENED into a bitset costs (DESIGN.md §32,
+ * "The collected union, dense"): the fold that made it the RUN it is - the
+ * members of a key's first containers set aside and folded in, when they
+ * came one or two rows at a time - and its optimization back when the walk
+ * is over, which takes what a fold does, most of a fold being its
+ * optimization; the widening between them is an image filled and copied, a
+ * tenth of a fold or less.  Every container that comes to it in between is
+ * ORed in place, a few nanoseconds.  Counted over 2M rows in heap order, a
+ * key of one row and of ten, without summaries and with them, ranges of
+ * 1,000 to 1.9 million keys: one fold or two a union key.  Timed apart
+ * (-O2), a widening took 0.1 to 0.4 us and a fold 1.4 to 8.
+ */
+#define LION_RANGE_WIDEN_FOLDS	2.0
 
 /*
  * What a collected range's union takes in memory beyond its containers' own
@@ -1064,6 +1072,13 @@ typedef struct LionRangeSource
 /*
  * One relation the executor counts: a plain table, or one live leaf
  * partition (DESIGN.md §16).  The index Oids are that relation's own.
+ *
+ * A partition's relations are opened when the node is initialised and stay
+ * open until it ends (lion_open_parts(), lion_close_parts()), as the scans
+ * under core's Append keep theirs: the relcache references are what tells a
+ * TRUNCATE, DROP, REINDEX or ALTER of one of them in the same session that
+ * a query is still using it (CheckTableNotInUse()).  NULL for an index the
+ * partition does not have, and clauseidx[i] for a clause its bounds imply.
  */
 typedef struct LionPartState
 {
@@ -1076,6 +1091,11 @@ typedef struct LionPartState
 	Const	   *fgconst;		/* ... and then the one value the bounds give
 								 * it (DESIGN.md §27, "Grouped by a fact
 								 * column") */
+	Relation	heap;
+	Relation	groupidx;
+	Relation	groupidx2;
+	Relation   *clauseidx;		/* one per WHERE clause */
+	Relation	fgidx;
 } LionPartState;
 
 /*
@@ -1115,15 +1135,17 @@ typedef struct LionJoinEnt
 /*
  * One leaf partition of a partitioned fact table, as the FK-side join keeps
  * it from one batch of keys to the next (DESIGN.md §27, "A partitioned fact
- * table").  The partition is opened for each batch and closed after it, but
- * its fact filters are located and collected once a run: `filter` is its
- * copy of them, in `cxt`, which the later batches read - named after an index
- * the partition reopens each time (filterindex), whose Relation the copy is
- * pointed at again - or, in a parallel plan whose workers started, a view of
- * the copy the participants made together (`shared`, viewshared).  qmode is
- * what the run's values made of its multi-key clauses (lion_locate_multikey()),
- * which the row filter of a later batch is built from without locating them
- * again.  missing says the filters select no row of it at all.
+ * table").  The partition has a turn with each batch, at whose end everything
+ * located in it is let go of (its relations stay open for the node's life,
+ * LionPartState), but its fact filters are located and collected once a run:
+ * `filter` is its copy of them, in `cxt`, which the later batches read - named
+ * after one of the partition's indexes (filterindex), whose Relation the copy
+ * is pointed at again at each turn - or, in a parallel plan whose workers
+ * started, a view of the copy the participants made together (`shared`,
+ * viewshared).  qmode is what the run's values made of its multi-key clauses
+ * (lion_locate_multikey()), which the row filter of a later batch is built
+ * from without locating them again.  missing says the filters select no row
+ * of it at all.
  */
 typedef struct LionJoinPart
 {
@@ -1290,9 +1312,10 @@ typedef struct LionCountScanState
 	/*
 	 * The relations to count.  npart is 0 for a plain table, whose heap and
 	 * indexes are opened once for the life of the node; a partitioned one
-	 * (DESIGN.md §16) has one LionPartState per live leaf partition and opens
-	 * them one partition at a time, so that no partition's buffer pin ever
-	 * outlives that partition's processing.
+	 * (DESIGN.md §16) has one LionPartState per live leaf partition, opens
+	 * all of them for the life of the node too, and counts them one partition
+	 * at a time - its turn, during which it is the relation below - so that
+	 * no partition's buffer pin ever outlives that partition's processing.
 	 */
 	int			npart;
 	LionPartState *part;
@@ -1677,6 +1700,19 @@ typedef struct LionCountScanState
 	int64		joinlastcount;
 
 	/*
+	 * How a run over a plain fact table reads its child: in those batches,
+	 * walked in key order (joinwalked), or a row at a time.  It is decided
+	 * once, at the run's first row (joinbegun), and kept to the run's end:
+	 * a copy of the fact filters made part way through that finds them to
+	 * select nothing sets wheremissing, which each way answers for itself
+	 * (DESIGN.md §27, "Probed, then collected"), and must not change the way
+	 * - the batch in hand would be dropped and the child read on, or read
+	 * again, a row at a time.
+	 */
+	bool		joinbegun;
+	bool		joinwalked;
+
+	/*
 	 * A partitioned fact table (DESIGN.md §27, "A partitioned fact table"):
 	 * every batch of keys is taken to each leaf partition in turn, and each
 	 * key's counts added up in its entry (LionJoinEnt.acc).  joinpart is the
@@ -1763,6 +1799,7 @@ typedef struct LionCountScanState
 	 */
 	AttrNumber	fgattno;
 	Oid			fgidxoid;
+	Relation	fgidx;			/* a plain table's, open for the node's life */
 	int			fgturn;
 	MemoryContext fgcxt;
 	MemoryContext fgrowcxt;
@@ -2189,10 +2226,9 @@ extern AttrNumber lion_index_col_for(Relation index, AttrNumber heapattno,
 									 bool multikey);
 extern AttrNumber lion_heap_attno_in(Relation heap, Oid parentoid,
 									 AttrNumber parentattno);
-extern void lion_open_relation(LionCountScanState *st, Oid heapoid,
-							   Oid groupidxoid, Oid groupidxoid2,
-							   const Oid *clauseidxoid);
+extern void lion_open_relation(LionCountScanState *st, int p);
 extern void lion_close_relation(LionCountScanState *st);
+extern void lion_close_parts(LionCountScanState *st);
 extern void lion_begin_custom_scan(CustomScanState *node, EState *estate,
 								   int eflags);
 
@@ -2213,7 +2249,6 @@ extern void lion_eval_clause_values(LionCountScanState *st);
 extern LionKeyNode *lion_key_node(int keyno);
 extern LionKeyNode *lion_bool_node(LionKeyNodeKind kind, LionKeyNode **args,
 								   int nargs);
-extern int lion_array_batch_size(void);
 extern void lion_build_filter(LionCountScanState *st);
 extern void lion_locate_where(LionCountScanState *st);
 extern void lion_release_where(LionCountScanState *st);

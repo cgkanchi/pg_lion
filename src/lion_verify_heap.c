@@ -432,6 +432,18 @@ lion_verify_recheck(LionVerifyState *vs)
 /*
  * Is (ckey, lo) present in the posting set of key, or of the reserved entry
  * named by reservedflag when there is one (DESIGN.md §14 and §17)?
+ *
+ * A reader's lookup (DESIGN.md §5, SCAN): the entry is read under its leaf's
+ * SHARE lock, and a CHAIN entry's leaf is let go before the posting tree is
+ * descended.  The descent hands back, locked, the leaf that holds ckey if any
+ * leaf does - moving right past a split, which is the only way an item moves
+ * - so the answer is the one a held leaf would give.  Holding it is what
+ * this used to do, and on a hot standby that deadlocked with replay, which
+ * locks a record's posting pages BEFORE the entry's leaf (§25): the startup
+ * process held the container page and waited for the leaf this held while
+ * this waited for the container page, for good.  A set can go away only once
+ * it holds nothing any snapshot sees (§18), and VACUUM is locked out on a
+ * primary anyway, so a set found gone holds no row this snapshot sees.
  */
 static bool
 lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
@@ -441,6 +453,8 @@ lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
 	Relation	index = vs->index;
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
+	BlockNumber head = InvalidBlockNumber;
+	uint32		ehash = 0;
 	bool		present = false;
 
 	if ((reservedflag != 0) ?
@@ -472,17 +486,27 @@ lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
 		}
 		else
 		{
-			BlockNumber blk = lion_chain_find_page(index, entry->hash,
-												  entry->head, entry->tail,
-												  ckey);
-			Buffer		cbuf;
-			Page		cpage;
+			head = entry->head;
+			ehash = entry->hash;
+		}
+
+		UnlockReleaseBuffer(entrybuf);
+	}
+	else if (BufferIsValid(entrybuf))
+		UnlockReleaseBuffer(entrybuf);
+
+	if (BlockNumberIsValid(head))
+	{
+		Buffer		cbuf = lion_posting_search(index, NULL, ehash, head, ckey,
+											   BUFFER_LOCK_SHARE, false);
+
+		if (BufferIsValid(cbuf))
+		{
+			Page		cpage = BufferGetPage(cbuf);
+			BlockNumber blk = BufferGetBlockNumber(cbuf);
 			OffsetNumber off;
 			bool		found;
 
-			cbuf = ReadBuffer(index, blk);
-			LockBuffer(cbuf, BUFFER_LOCK_SHARE);
-			cpage = BufferGetPage(cbuf);
 			off = lion_page_find_item(index, cpage, blk, ckey, &found);
 			if (found)
 				present = lion_item_contains(lion_page_item_fetch(index, cpage,
@@ -490,11 +514,7 @@ lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
 											ckey, lo);
 			UnlockReleaseBuffer(cbuf);
 		}
-
-		UnlockReleaseBuffer(entrybuf);
 	}
-	else if (BufferIsValid(entrybuf))
-		UnlockReleaseBuffer(entrybuf);
 
 	return present;
 }

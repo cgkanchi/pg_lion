@@ -51,7 +51,16 @@
  * what it finds at once, as it always has, and is exact only while replay
  * leaves the index alone.  None of the settling above holds against replay,
  * which locks each record's pages for that record alone, so a standby is the
- * one place verify() can report damage that is not there.
+ * one place verify() can report damage that is not there.  What it must
+ * never do there is hold a directory page while it waits for a posting page:
+ * replay takes a record's posting pages BEFORE its directory leaf and holds
+ * both to the end of the record (DESIGN.md §25), and two buffer locks taken
+ * in opposite orders are a deadlock nothing detects and nothing cancels.  So
+ * a standby walks a posting set as a primary first does - with nothing held,
+ * the entry read again afterwards - and a set that replay keeps changing is
+ * kept from its last walk without comparing its totals, never walked with
+ * the leaf held; and heapallindexed lets the entry's leaf go before it
+ * descends the set, on a primary too.
  *
  * With heapallindexed, lion_index_verify() evaluates the index's expressions
  * and predicate, which are the table owner's code; it runs them as the table
@@ -162,7 +171,9 @@ typedef struct LionVerifyState
 	/*
 	 * Writers may run beside the check: true on a primary, where the check
 	 * holds ShareUpdateExclusiveLock.  On a standby it is false, and every
-	 * suspicion is reported the moment it arises, as it always was there.
+	 * suspicion is reported the moment it arises, as it always was there -
+	 * but a posting set is walked with nothing held there too, and walked
+	 * again when replay changed it (lion_verify_set()).
 	 */
 	bool		concurrent;
 	bool		rootsplit;		/* the meta page showed a taller directory */
@@ -187,6 +198,7 @@ typedef struct LionVerifyState
 	int64		nsetwalks;		/* posting-set walks */
 	int64		nsetretries;	/* ... thrown away because a writer got in */
 	int64		nsetholds;		/* ... made with the entry's leaf held */
+	int64		nsetuncompared;	/* sets a standby kept without their totals */
 	int			nwaits;			/* WaitForLockers() calls */
 } LionVerifyState;
 
@@ -197,6 +209,16 @@ typedef struct LionVerifyState
  * writers of that leaf's keys a wait for one read of it.
  */
 #define LION_VERIFY_SET_ATTEMPTS	3
+
+/*
+ * How many walks of a posting set a STANDBY makes before it gives up on
+ * getting to the end of one (lion_verify_set()).  It never walks a set with
+ * the entry's leaf held - replay takes the set's pages before the leaf
+ * (DESIGN.md §25) - so after LION_VERIFY_SET_ATTEMPTS walks it keeps the next
+ * one that reaches the end of the set, and only a root pushed down or an
+ * upper level split under each walk keeps it from doing that.
+ */
+#define LION_VERIFY_STANDBY_WALKS	10
 
 /* What one walk of a posting set found (lion_verify_chain()). */
 typedef struct LionVerifySetResult

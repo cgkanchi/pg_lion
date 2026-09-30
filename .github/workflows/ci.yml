@@ -19,7 +19,7 @@
 #
 # The crash-recovery and hot-standby harness (test/recovery/run.sh) runs on
 # every major, in both WAL modes and with wal_consistency_checking, so that
-# every major replays lion's records: its phases 1, 1f and 2 on the packages,
+# every major replays lion's records: its phases 1, 1f, 2 and 4 on the packages,
 # and all of them, the injection-point phases included, on the source builds.
 #
 # The pgdg and source jobs run the unit tests twice: as built, and with
@@ -109,8 +109,8 @@ jobs:
           make installcheck-rmgr
 
       # pg_lion beside another extension on the same planner hook and with
-      # its own resource manager, in both load orders, and the non-heap
-      # table AM refusals (test/hook-check.sh).
+      # its own resource manager, in both load orders, the non-heap table AM
+      # refusals, and counts on a sixteen-buffer pool (test/hook-check.sh).
       # The test module goes into the packaged installation with sudo, like
       # pg_lion itself.
       - name: hookcheck (hook coexistence, table AMs)
@@ -121,9 +121,10 @@ jobs:
 
       # WAL replay on the packaged majors too - without these steps nothing
       # on 16-18 ever replayed a lion record.  The recovery harness's phases
-      # 1, 1f and 2 (crash recovery under load, a VACUUM on a server without
-      # the resource manager, a hot standby that replays everything the
-      # primary writes, and its promotion) in both WAL modes, with
+      # 1, 1f, 2 and 4 (crash recovery under load, a VACUUM on a server
+      # without the resource manager, a hot standby that replays everything
+      # the primary writes, and its promotion, and lion_index_verify() on a
+      # standby beside replay) in both WAL modes, with
       # wal_consistency_checking, as the source jobs run them.  Phases 1b-1e
       # and 3 park a backend on an injection point, which the packaged
       # servers cannot.  The extension is already in the packaged prefix
@@ -132,12 +133,12 @@ jobs:
       - name: Crash recovery and standby replay (custom resource manager, consistency checked)
         run: |
           RECOVERY_SKIP_INSTALL=1 ./test/recovery/run.sh --prefix "/usr/lib/postgresql/$PG" \
-            --phases "1 1f 2" --mode rmgr --conf "wal_consistency_checking = 'pg_lion'"
+            --phases "1 1f 2 4" --mode rmgr --conf "wal_consistency_checking = 'pg_lion'"
 
       - name: Crash recovery and standby replay (generic WAL, consistency checked)
         run: |
           RECOVERY_SKIP_INSTALL=1 ./test/recovery/run.sh --prefix "/usr/lib/postgresql/$PG" \
-            --phases "1 1f 2" --conf "wal_consistency_checking = 'generic'"
+            --phases "1 1f 2 4" --conf "wal_consistency_checking = 'generic'"
 
       - name: Show regression diffs
         if: failure()

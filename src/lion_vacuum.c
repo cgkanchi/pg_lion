@@ -399,7 +399,8 @@ static BlockNumber lion_vacuum_descend(LionVacState *vs,
 static BlockNumber lion_vacuum_container_page(LionVacState *vs,
 											 LionVacEntryRef *ref,
 											 const LionVacEntry *ent,
-											 BlockNumber blk);
+											 BlockNumber blk,
+											 LionRightWalk *walk);
 static BlockNumber lion_vacuum_filter_page(LionVacState *vs, Buffer buf,
 										  LionVacWork *w,
 										  const LionVacEntry *ent);
@@ -409,8 +410,8 @@ static void lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref,
 static void lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 							  const LionVacEntry *ent, BlockNumber startblk,
 							  uint32 ckey);
-static LionEntryTuple *lion_vacuum_entry_copy(Buffer entrybuf,
-											OffsetNumber entryoff, Size *size);
+static LionEntryTuple *lion_vacuum_entry_copy(Relation index, Buffer entrybuf,
+											  OffsetNumber entryoff, Size *size);
 static void lion_vacuum_free_chain(LionVacState *vs, uint32 hash,
 								  BlockNumber head);
 static void lion_vacuum_sweep(LionVacState *vs);
@@ -485,6 +486,7 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	MemoryContext oldcxt;
 	instr_time	started;
 	BlockNumber blk;
+	LionRightWalk walk;
 
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
@@ -533,8 +535,12 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 * The leaves, left to right (DESIGN.md §21).  Chain order and visit order
 	 * still agree, which is what the §11 interlock needs: a split of a leaf
 	 * moves entries only onto a brand new page immediately to its right, and
-	 * the walk has not passed that one yet.
+	 * the walk has not passed that one yet.  A cycle of damaged right links
+	 * is an ERROR (lion.h), which fails this VACUUM - and each autovacuum of
+	 * the table, which used to go round the cycle for ever - as a damaged
+	 * nbtree does.
 	 */
+	lion_rightwalk_init(&walk);
 	blk = lion_dir_leftmost_leaf(index, vs.ix);
 	while (BlockNumberIsValid(blk))
 	{
@@ -545,6 +551,8 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		MemoryContextSwitchTo(oldcxt);
 		MemoryContextReset(vaccxt);
 
+		if (BlockNumberIsValid(next))
+			lion_rightwalk_step(index, &walk, blk, next);
 		blk = next;
 		lion_vacuum_delay_point();
 	}
@@ -866,7 +874,7 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 			LionPageGetOpaque(page)->rightlink;
 		UnlockReleaseBuffer(buf);
 		if (BlockNumberIsValid(next))
-			lion_rightwalk_step(index, &walk, next);
+			lion_rightwalk_step(index, &walk, blk, next);
 		blk = next;
 		lion_vacuum_delay_point();
 	}
@@ -1130,6 +1138,7 @@ lion_vac_ref_relocate(LionVacState *vs, LionVacEntryRef *ref,
 	Size		probesz = MAXALIGN(LION_ENTRY_HDRSZ + ent->keylen);
 	Buffer		buf;
 	OffsetNumber off;
+	LionRightWalk walk;
 
 	if (BufferIsValid(ref->buf))
 	{
@@ -1145,12 +1154,25 @@ lion_vac_ref_relocate(LionVacState *vs, LionVacEntryRef *ref,
 	if (ent->ischain && (ent->kind == LION_KIND_SUMMARY ||
 						 ent->kind == LION_KIND_SUMLAST))
 	{
-		LionState  *col = lion_column(vs->ix, (AttrNumber) ent->attno);
+		LionState  *col;
+
+		/*
+		 * Pass 1 copied the key and its column off the page, and the descent
+		 * hands the key to the opclass (lion_check_key()).
+		 */
+		if (unlikely(ent->attno < 1 || ent->attno > vs->ix->ncolumns))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index entry belongs to key column %u, but the index has %d",
+							ent->attno, vs->ix->ncolumns)));
+		col = lion_column(vs->ix, (AttrNumber) ent->attno);
+		lion_check_key(col, ent->keydata, ent->keylen);
 
 		lion_search_key_init(col, &sk, LION_KIND_SUMMARY,
 							 lion_fetch_key(col, ent->keydata), 0);
 		buf = lion_dir_search(vs->index, vs->heaprel, vs->ix, &sk,
 							  BUFFER_LOCK_SHARE, false, &off);
+		lion_rightwalk_init(&walk);
 		for (;;)
 		{
 			Page		page = BufferGetPage(buf);
@@ -1172,7 +1194,8 @@ lion_vac_ref_relocate(LionVacState *vs, LionVacEntryRef *ref,
 			}
 			if (LionPageIsRightmost(page))
 				break;
-			buf = lion_dir_step_right(vs->index, buf, BUFFER_LOCK_SHARE);
+			buf = lion_dir_step_right(vs->index, buf, BUFFER_LOCK_SHARE,
+									  &walk);
 			off = lion_page_first_data(BufferGetPage(buf));
 		}
 summary_gone:
@@ -1266,6 +1289,16 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		elog(ERROR, "lion index: block %u is not a directory leaf", blk);
 	}
 
+	/*
+	 * The entries of this leaf are rewritten below by their line pointers,
+	 * several in one record, and the final step deletes some: they have to be
+	 * apart and inside the page, and each a whole entry
+	 * (lion_page_check_items(), lion_page_entry_fetch() in the loop), or those
+	 * records fail - a PANIC in rmgr mode, every VACUUM of the index - or
+	 * overwrite one entry with another.
+	 */
+	lion_page_check_items(vs->index, page, blk);
+
 	*nextp = LionPageGetOpaque(page)->rightlink;
 	maxoff = PageGetMaxOffsetNumber(page);
 	ents = (LionVacEntry *) palloc(sizeof(LionVacEntry) * (maxoff + 1));
@@ -1281,7 +1314,7 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		if (!ItemIdIsUsed(iid))
 			continue;
 
-		entry = (LionEntryTuple *) PageGetItem(page, iid);
+		entry = lion_page_entry_fetch(vs->index, page, blk, off);
 		ent = &ents[nents++];
 		ent->off = off;
 		ent->hash = entry->hash;
@@ -1602,6 +1635,7 @@ lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 	BlockNumber blk;
 	LionVacEntryRef ref;
 	LionEntryTuple *entry;
+	LionRightWalk walk;
 
 	/*
 	 * DESIGN.md §22: the entry's head block is the ROOT of the posting tree,
@@ -1622,9 +1656,14 @@ lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 	ref.off = ent->off;
 	IncrBufferRefCount(ref.buf);	/* the walk owns a pin of its own */
 
+	/*
+	 * A cycle of damaged right links ends the walk in an ERROR (lion.h) and
+	 * fails the VACUUM, which used to go round it for ever.
+	 */
+	lion_rightwalk_init(&walk);
 	while (BlockNumberIsValid(blk))
 	{
-		blk = lion_vacuum_container_page(vs, &ref, ent, blk);
+		blk = lion_vacuum_container_page(vs, &ref, ent, blk, &walk);
 
 		lion_vacuum_delay_point();
 	}
@@ -1788,7 +1827,9 @@ lion_vacuum_free_level(LionVacState *vs, uint32 hash, BlockNumber head,
 					   BlockNumber first)
 {
 	BlockNumber blk = first;
+	LionRightWalk walk;
 
+	lion_rightwalk_init(&walk);
 	while (BlockNumberIsValid(blk))
 	{
 		Buffer		buf;
@@ -1844,6 +1885,8 @@ lion_vacuum_free_level(LionVacState *vs, uint32 hash, BlockNumber head,
 		vs->pages_deleted++;
 		vs->prof.records++;
 
+		if (BlockNumberIsValid(next))
+			lion_rightwalk_step(vs->index, &walk, blk, next);
 		blk = next;
 		CHECK_FOR_INTERRUPTS();
 	}
@@ -2135,10 +2178,13 @@ lion_vacuum_sweep(LionVacState *vs)
  * Private copy of the CHAIN entry at (entrybuf, entryoff), which the caller
  * holds locked.  Concurrent inserts change the entry, so it is re-read from
  * the page inside every window and its counters are only ever updated with
- * deltas.
+ * deltas.  The copy is written back in place, inside the record that changes
+ * the set, so the entry has to be one of the size a CHAIN entry has
+ * (lion_page_entry_fetch()).
  */
 static LionEntryTuple *
-lion_vacuum_entry_copy(Buffer entrybuf, OffsetNumber entryoff, Size *size)
+lion_vacuum_entry_copy(Relation index, Buffer entrybuf, OffsetNumber entryoff,
+					   Size *size)
 {
 	Page		page = BufferGetPage(entrybuf);
 	ItemId		iid = PageGetItemId(page, entryoff);
@@ -2148,7 +2194,8 @@ lion_vacuum_entry_copy(Buffer entrybuf, OffsetNumber entryoff, Size *size)
 		elog(ERROR, "lion index: entry %u on block %u is gone",
 			 entryoff, BufferGetBlockNumber(entrybuf));
 
-	entry = (LionEntryTuple *) PageGetItem(page, iid);
+	entry = lion_page_entry_fetch(index, page, BufferGetBlockNumber(entrybuf),
+								  entryoff);
 	if ((entry->flags & LION_ENTRY_CHAIN) == 0)
 		elog(ERROR, "lion index: entry %u on block %u is no longer a chain entry",
 			 entryoff, BufferGetBlockNumber(entrybuf));
@@ -2159,11 +2206,14 @@ lion_vacuum_entry_copy(Buffer entrybuf, OffsetNumber entryoff, Size *size)
 /*
  * Vacuum one container page of a chain and return the block to continue at.
  * Nothing is held on entry or on return; see the file header for the lock
- * protocol this implements.
+ * protocol this implements.  walk is the walk along the leaves: continuing
+ * at the right link is a step of it, and starting again at the leftmost leaf
+ * after a root push-down starts it again.
  */
 static BlockNumber
 lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
-						  const LionVacEntry *ent, BlockNumber blk)
+						  const LionVacEntry *ent, BlockNumber blk,
+						  LionRightWalk *walk)
 {
 	Buffer		buf;
 	BlockNumber next;
@@ -2211,6 +2261,7 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 			lion_wal_visit(vs->index, blk);
 			MemoryContextSwitchTo(oldcxt);
 			MemoryContextReset(vs->pagecxt);
+			lion_rightwalk_init(walk);
 			return lion_vacuum_descend(vs, ent);
 		}
 
@@ -2303,6 +2354,7 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 				lion_wal_visit(vs->index, blk);
 				MemoryContextSwitchTo(oldcxt);
 				MemoryContextReset(vs->pagecxt);
+				lion_rightwalk_init(walk);
 				return lion_vacuum_descend(vs, ent);
 			}
 
@@ -2343,6 +2395,8 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextReset(vs->pagecxt);
 
+	if (BlockNumberIsValid(next))
+		lion_rightwalk_step(vs->index, walk, blk, next);
 	return next;
 }
 
@@ -2375,6 +2429,15 @@ lion_vacuum_filter_page(LionVacState *vs, Buffer buf, LionVacWork *w,
 	if (!lion_page_owns_entry(page, ent->hash, ent->head))
 		elog(ERROR, "lion index: block %u is not a container page of the chain at %u",
 			 blk, ent->head);
+
+	/*
+	 * What changes is written back in one record, by the items' line
+	 * pointers: in place, or deleted with the page compacted around them.  So
+	 * besides each item (lion_page_item_fetch() below) the page as a whole
+	 * has to hold together (lion_page_check_items()): a filtered item written
+	 * back into bytes that reach into its neighbour overwrote the neighbour.
+	 */
+	lion_page_check_items(vs->index, page, blk);
 
 	maxoff = PageGetMaxOffsetNumber(page);
 
@@ -2474,7 +2537,7 @@ lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref, Buffer buf,
 	vs->prof.items_deleted += w->ndel;
 
 	/* The entry may have been changed by inserts since the last window. */
-	ecopy = lion_vacuum_entry_copy(entrybuf, entryoff, &esize);
+	ecopy = lion_vacuum_entry_copy(index, entrybuf, entryoff, &esize);
 	grown = (uint32 *) palloc(sizeof(uint32) * (w->nwork + 1));
 
 	/*
@@ -2592,7 +2655,9 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 	Buffer		entrybuf = InvalidBuffer;
 	OffsetNumber entryoff = InvalidOffsetNumber;
 	BlockNumber blk = startblk;
+	LionRightWalk walk;
 
+	lion_rightwalk_init(&walk);
 	for (;;)
 	{
 		LionEntryTuple *ecopy;
@@ -2628,6 +2693,7 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 			if (!BlockNumberIsValid(blk))
 				elog(ERROR, "lion index: container %u of a posting set at %u vanished from it",
 					 ckey, ent->head);
+			lion_rightwalk_init(&walk);
 			CHECK_FOR_INTERRUPTS();
 			continue;
 		}
@@ -2647,6 +2713,7 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 			if (!BlockNumberIsValid(next))
 				elog(ERROR, "lion index: container %u of a chain at %u vanished from it",
 					 ckey, ent->head);
+			lion_rightwalk_step(index, &walk, blk, next);
 			blk = next;
 			CHECK_FOR_INTERRUPTS();
 			continue;
@@ -2681,7 +2748,7 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 		entryoff = ref->off;
 
 		/* Everything read from here on is used inside this window only. */
-		ecopy = lion_vacuum_entry_copy(entrybuf, entryoff, &esize);
+		ecopy = lion_vacuum_entry_copy(index, entrybuf, entryoff, &esize);
 
 		iid = PageGetItemId(page, off);
 		if (ItemIdGetLength(iid) > LION_CONTAINER_MAX_SIZE)
@@ -2715,10 +2782,15 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 
 			if (vs->cbuf->cardinality == 0)
 			{
-				LionWalState *xstate = lion_wal_begin(index);
-				Page		p = lion_wal_register_buffer(xstate, buf,
-														 LION_WALBUF_CLEANUP);
+				LionWalState *xstate;
+				Page		p;
 				OffsetNumber delof = off;
+
+				/* deleted in place, by its line pointer */
+				lion_page_check_alone(index, page, blk, off);
+
+				xstate = lion_wal_begin(index);
+				p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_CLEANUP);
 
 				PageIndexMultiDelete(p, &delof, 1);
 				lion_wal_op(xstate, p, LION_OP_MULTIDEL, 0, 1, &delof,

@@ -833,10 +833,21 @@ typedef struct LoWalk
  * Can the walk of `var` answer rinfo: a range comparison of the column with
  * a value that does not depend on the row - a Const, a Param, a stable
  * expression, evaluated when the walk starts as an Index Scan's run-time keys
- * are - or `IS NOT NULL`?  *qual is the clause with the column on the left.
+ * are - under the index column's collation, or `IS NOT NULL`?  *qual is the
+ * clause with the column on the left.
+ *
+ * The collation is core's rule for an index clause, IndexCollMatchesExprColl()
+ * (as lion_match_index() applies it): the walk compares its bound with the
+ * directory's keys in the order they were stored in, the index column's
+ * collation's, so a comparison under another collation is no bound of it.
+ * Taken as one it left the filter too, and `t < 'a' COLLATE "C"` over an
+ * "en-x-icu" column returned no rows at all, where 'A0' is below 'a' in "C"
+ * but after it in English (2026-09-29 review).  Such a clause stays in the
+ * filter, as any other the walk does not answer.
  */
 static bool
-lo_walk_clause(RestrictInfo *rinfo, Var *var, Oid opfamily, Expr **qual)
+lo_walk_clause(RestrictInfo *rinfo, Var *var, Oid opfamily, Oid idxcoll,
+			   Expr **qual)
 {
 	Expr	   *clause = rinfo->clause;
 
@@ -881,6 +892,8 @@ lo_walk_clause(RestrictInfo *rinfo, Var *var, Oid opfamily, Expr **qual)
 		}
 		if (contain_var_clause(right) || contain_volatile_functions(right) ||
 			contain_subplans(right))
+			return false;
+		if (OidIsValid(idxcoll) && op->inputcollid != idxcoll)
 			return false;
 		strategy = get_op_opfamily_strategy(opno, opfamily);
 		if (!LION_STRAT_IS_RANGE(strategy))
@@ -1009,7 +1022,8 @@ lo_lion_walks(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 				RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
 				Expr	   *qual;
 
-				if (lo_walk_clause(rinfo, var, idx->opfamily[c], &qual))
+				if (lo_walk_clause(rinfo, var, idx->opfamily[c],
+						   idx->indexcollations[c], &qual))
 				{
 					w->rinfos = lappend(w->rinfos, rinfo);
 					w->quals = lappend(w->quals, qual);
