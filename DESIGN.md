@@ -3568,30 +3568,56 @@ Planning (`lion_try_count_path`, `lion_collect_targets`)
     therefore a costing decision, not a correctness one, and wants its own calibration and tests.
 
 Executor
-- `lion_open_relation()` / `lion_close_relation()` open and close ONE relation: a plain table once for
-  the life of the node, a partition for the length of its own turn. The heap is opened with NoLock -
-  the executor holds a lock on every range table entry of the plan, partitions included (the planner
-  locked them when it expanded the parent, and `AcquireExecutorLocks()` relocks the whole flat range
-  table for a cached plan), and cassert builds check it with `CheckRelationLockedByMe` - and the
-  indexes, which are not range table entries, with AccessShareLock.
+- Every relation the node reads is open for the life of the node, from Begin to End, as the scans
+  under core's Append keep theirs from `ExecInitNode()` to `ExecEndNode()`: a plain table's heap and
+  indexes, and every leaf partition's (`lion_open_parts()` / `lion_close_parts()`, into
+  `LionPartState`). A heap is opened with NoLock - the executor holds a lock on every range table
+  entry of the plan, partitions included (the planner locked them when it expanded the parent, and
+  `AcquireExecutorLocks()` relocks the whole flat range table for a cached plan), and cassert builds
+  check it with `CheckRelationLockedByMe` - and the indexes, which are not range table entries and
+  which nothing relocks for a cached plan, with AccessShareLock, as `ExecInitIndexScan()` locks its
+  index. A parallel worker takes AccessShareLock on the heaps too. The partition set is fixed at
+  plan time (no run-time pruning, below), so nothing is opened later than Begin; EXPLAIN without
+  ANALYZE opens nothing (`EXEC_FLAG_EXPLAIN_ONLY`), as `ExecInitIndexScan()` opens no index then:
+  nothing runs between its Begin and its End that could drop one.
+- `lion_open_relation()` / `lion_close_relation()` then make ONE of them the relation counted: a
+  plain table once for the life of the node, a partition for the length of its own turn, whose end
+  releases what the turn located but leaves the relations open.
+- **Why every leaf is open for the whole run** (2026-09-30). Core refuses a TRUNCATE, DROP, REINDEX,
+  CREATE INDEX, CLUSTER or ALTER of a table or index that a query of the same session still uses -
+  a cursor between two FETCHes, say - and it knows which ones are in use only from the relcache
+  references the query holds (`CheckTableNotInUse()`). The node used to open a partition only for
+  its turn and so held none between turns: under a cursor over a correlated count a TRUNCATE of a
+  leaf was accepted and the cursor's later counts dropped (30000 to 20000 inside one snapshot), and
+  a DROP TABLE of one was accepted and the next FETCH failed with "could not open relation with
+  OID", where core, with the pushdown off, refused both. Now each is refused with core's own error;
+  `test/sql/partition_cursor.sql` runs them under a cursor with the pushdown on and off and gets the
+  same output. `ALTER TABLE ... DETACH PARTITION` alters the parent, which neither the node nor
+  core's Append has open, so both accept it, and both go on counting the detached table they hold.
+  The cost, measured with 2000 leaves of one lion index each: a reference and a resource owner
+  entry per relation (about 0.2 MB of backend memory in all); no file opened at Begin (smgr opens a
+  relation's files when a page is first read, through fd.c's pooled descriptors, and keeps them
+  past a relation's close anyway: 993 descriptors either way); and the same locks for a fresh plan,
+  whose planner locked every leaf's indexes in `get_relation_info()` - a cached plan now holds its
+  2000 index locks for the run, as an Append of index scans does, instead of one turn at a time.
 - Per relation the node then runs one of `lion_count_relation()` (the intersection of the WHERE
   clauses), `lion_sumall_relation()` (§14's sum over every entry) or `lion_next_group()` (§10's
   streaming group loop); all three are the single-table code, unchanged.
 - Without GROUP BY the partition counts are summed and one row is emitted, as §10 says: nothing
   comes out until the last partition has been counted, because the one row is the total.
 - With GROUP BY the node streams. `lion_next_partial_group()` keeps two pieces of state, which
-  partition is open (`curpart`) and whether it is open (`partopen`), and on each call: open the
-  partition if it is not open and locate its WHERE clauses; ask `lion_next_group()` for the next
-  group of it and return that row; and when its entry scan runs out, release its posting sets,
-  close it, and move to the next one. Each group is emitted as a partial aggregate the moment it
-  is counted, so a group with rows in three partitions comes out three times and the Finalize Agg
-  adds them up. The NULL group is emitted per partition like any other and hash aggregation groups
-  NULLs together. Groups whose count is 0 are still not emitted - there is no such group in that
-  partition - and a partition where a positive clause has no entry at all (`wheremissing`) is
-  skipped without an entry scan. The per-partition work uses the same pergroup context as before,
-  reset per group, and the located WHERE payloads are released and their context reset at the end
-  of each partition. There is no cross-partition state: no hash table, no per-node group memory
-  beyond one partition's iteration state.
+  partition has its turn (`curpart`) and whether the turn has begun (`partopen`), and on each call:
+  begin the partition's turn if it has not begun and locate its WHERE clauses; ask
+  `lion_next_group()` for the next group of it and return that row; and when its entry scan runs
+  out, release its posting sets, end its turn, and move to the next one. Each group is emitted as
+  a partial aggregate the moment it is counted, so a group with rows in three partitions comes out
+  three times and the Finalize Agg adds them up. The NULL group is emitted per partition like any
+  other and hash aggregation groups NULLs together. Groups whose count is 0 are still not emitted -
+  there is no such group in that partition - and a partition where a positive clause has no entry
+  at all (`wheremissing`) is skipped without an entry scan. The per-partition work uses the same
+  pergroup context as before, reset per group, and the located WHERE payloads are released and
+  their context reset at the end of each partition. There is no cross-partition state beyond the
+  open relations: no hash table, no per-node group memory beyond one partition's iteration state.
 - The key a target list prints for a column a clause pins to one value is remembered on the clause
   (`LionClauseState.storedkey`, copied into a small context of its own) the first time a relation's
   entry has it, because the posting set is gone by the time the row comes out. With partitions that
@@ -3599,17 +3625,18 @@ Executor
   index's own equality - and, since the planner only builds a value-producing node when every
   partition's index has the type's own representation-preserving equality (§10), "compares equal"
   there means "is the same bytes".
-- ReScan throws all of it away - entry scan, posting sets, the open partition and the remembered
-  keys - and starts again from the first partition. A Finalize HashAggregate that has not spilled
-  re-reads its own table instead of rescanning the node (`ExecReScanAgg()`), so the case that
-  really exercises this is a nested loop over a spilling one, which `test/sql/partition.sql` has.
+- ReScan throws all of it away - entry scan, posting sets, the current partition's turn and the
+  remembered keys - and starts again from the first partition; the relations stay open. A
+  Finalize HashAggregate that has not spilled re-reads its own table instead of rescanning the node
+  (`ExecReScanAgg()`), so the case that really exercises this is a nested loop over a spilling one,
+  which `test/sql/partition.sql` has.
 - EXPLAIN prints `Partitions: p1, p2, ...` in the planner's order. The `Lion Indexes` line keeps
   its per-clause text but drops the index name for a partitioned scan (`(a), (b = 2)` rather than
   `idx_a (a), idx_b (b = 2)`), because there is one index per partition and no single name to give.
   `Group Key` and the ANALYZE counters are unchanged and are summed over the partitions.
 
 Locking and the §9 pin discipline are per partition and unchanged. A partition's posting sets are
-all released before its indexes are closed, so no partition's index pin outlives its turn, and a
+all released before its turn ends, so no partition's index pin outlives its turn, and a
 VACUUM of one partition cannot affect the count of another: the interlock argument of §9 is about
 one heap and its indexes, and each partition is its own.
 
@@ -9507,16 +9534,18 @@ sections above ask of the fact side.
 - **A batch at a time, a leaf at a time.** The keys are read a batch at a time whatever the plan
   chose ("Lookups in key order": the batches are `work_mem`'s), each key with an accumulator of its
   own (`LionJoinEnt.acc`), and each batch goes to every leaf in turn (`lion_join_count_parts()`):
-  the leaf is opened, its fk index's walk begun, its fact filters located or its copy of them taken
-  up again (`lion_join_part_open()`), every key of the batch looked up and counted and the count
-  added into the key's accumulator, and the leaf closed - every set released, and its pins with
-  them - before the next one is opened (`lion_join_part_close()`). An existence test does not look
-  a key up again once one leaf has matched it. Where the plan walks the fk index in key order, the
-  batch is sorted into the first leaf's walk order and left alone for every leaf whose fk index
-  orders keys the same way (`LionWalkOrder`, `lion_walk_order_equal()`) - one partitioned index's
-  leaves do - and sorted again for one that does not; where it descends for each key, the batch
-  stays in the child's order. Only when every leaf has had the batch are its rows handed up (`lion_join_next_parts()`),
-  so the node never hands up a row with a leaf open, and no leaf's pin outlives its turn (§16).
+  the leaf's turn begins, its fk index's walk begun, its fact filters located or its copy of them
+  taken up again (`lion_join_part_open()`), every key of the batch looked up and counted and the
+  count added into the key's accumulator, and the turn ends - every set released, and its pins with
+  them - before the next one's begins (`lion_join_part_close()`). The leaves' relations stay open
+  from the node's Begin to its End (§16, "Why every leaf is open for the whole run"). An existence
+  test does not look a key up again once one leaf has matched it. Where the plan walks the fk index
+  in key order, the batch is sorted into the first leaf's walk order and left alone for every leaf
+  whose fk index orders keys the same way (`LionWalkOrder`, `lion_walk_order_equal()`) - one
+  partitioned index's leaves do - and sorted again for one that does not; where it descends for each
+  key, the batch stays in the child's order. Only when every leaf has had the batch are its rows
+  handed up (`lion_join_next_parts()`), so the node never hands up a row in the middle of a leaf's
+  turn, and no leaf's pin outlives its turn (§16).
 - **Each leaf is its own table.** Its own heap, visibility map and pins; the §9 interlock between
   its own fk set and its own filters; the pin budget of §15 per turn. Where the plan collects the
   filters, a leaf's are located and copied at its first turn into a copy of its own
@@ -10459,14 +10488,15 @@ partition of several kinds, or a default one, needs one.
 "Lookups in key order", taken for a plain table too - and each batch is taken to each relation in
 turn, the plain table or every leaf partition. In a partition whose bounds give `g` its value, the
 turn is the partition's ordinary turn (`lion_join_lookup_ent()`, with its copy of the filters and
-its account of what probing them costs), each count put by with that value. Otherwise the entries
-of `g`'s index are walked a chunk of 64 at a time: the chunk's sets located - and pinned, as an IN
-list's are - each key of the batch looked up once and counted against each of them
-(`lion_join_count_groups()`: the key's set, the filters or their copy, and the group's set, ANDed
-by the one count function every count goes through), and the chunk let go of before the next. The
-cost model takes this for columns of few values; a column of more is correct, only slower, and a
-chunk after the first walks the fk index from its start again. The rows a turn counted go up once
-the turn is over: after the partition is closed, as a partitioned fact's rows always are (§16), or,
+its account of what probing them costs), each count put by with that value. Otherwise the entries of
+`g`'s index - open, with the relation's others, for the life of the node (§16, "Why every leaf is
+open for the whole run") - are walked a chunk of 64 at a time: the chunk's sets located - and
+pinned, as an IN list's are - each key of the batch looked up once and counted against each of them
+(`lion_join_count_groups()`: the key's set, the filters or their copy, and the group's set, ANDed by
+the one count function every count goes through), and the chunk let go of before the next. The cost
+model takes this for columns of few values; a column of more is correct, only slower, and a chunk
+after the first walks the fk index from its start again. The rows a turn counted go up once the turn
+is over: after the partition's turn has ended, as a partitioned fact's rows always go (§16), or,
 over the plain table, once its sets have let go of their pins (`lion_pause_run()`). They wait in
 memory until then - at most one per key and group with rows in the relation, no more than the
 batch's join rows there. A turn whose filters select nothing has none. `Fact Group Key` names the
