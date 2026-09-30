@@ -19,14 +19,14 @@
 #ifndef LION_COSTS_H
 #define LION_COSTS_H
 
-/* A plain lion index scan's heap side (lion_am.c, DESIGN.md §29.11) */
+/* A plain lion index scan's heap side (lion_amcost.c, DESIGN.md §29.11) */
 extern PGDLLIMPORT double lion_plain_fetch_row_cost;
 extern PGDLLIMPORT double lion_bitmap_row_cost;
 extern PGDLLIMPORT double lion_walk_pass_cost;
 
 /*
  * The merge, the lookups and the heap recheck, wherever posting sets are
- * counted or ANDed (lion_customscan.c, DESIGN.md §10 "The units")
+ * counted or ANDed (lion_plan_cost.c, DESIGN.md §10 "The units")
  */
 extern PGDLLIMPORT double lion_container_cost;
 extern PGDLLIMPORT double lion_member_cost;
