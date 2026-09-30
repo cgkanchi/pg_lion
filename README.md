@@ -182,6 +182,19 @@ every row has, and counts each row under its combination (`Group Strategy: Decod
 under a `Finalize HashAggregate`; DESIGN.md §34). On 5M rows it took 77 ms for 1,000 combinations
 and 179 ms for 100,000, where a HashAggregate over the table took 900 ms and 1.9 s.
 
+`GROUP BY g ORDER BY count(*) DESC LIMIT k` counts only the groups that can be among the first `k`
+(`Top K` in EXPLAIN; DESIGN.md §36): each key's entry records how many rows it holds, which bounds
+its group's count, so the largest entries are counted first and the rest never once they cannot
+catch up - ten groups of 3.4 million on ClickBench's `UserID`. Expressions of the grouping column
+(`GROUP BY ip, ip - 1`) split no group and are computed from it.
+
+With no `WHERE` and no `GROUP BY`, `sum`, `avg` (of integers), `min`, `max`, `bool_and` and
+`bool_or` of an expression of one Lion-indexed column are computed from the column's keys, each
+weighted by its rows (`Aggregates Over Keys` in EXPLAIN; DESIGN.md §37): `SELECT sum(width),
+avg(width + 1) FROM t` walks `width`'s distinct values, not the table. On a table the visibility
+map calls all-visible - as after a `VACUUM` - the rows of each key are the count its entry keeps,
+and nothing else is read.
+
 On a partitioned table the pushdown counts each partition the planner keeps, with that partition's
 own Lion indexes (DESIGN.md §16), and every `WHERE` clause needs one in every partition counted -
 except a clause the partition's bounds imply. `kind = 'a'` over a table partitioned by `kind`,
