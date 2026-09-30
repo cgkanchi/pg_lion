@@ -84,10 +84,12 @@ lion_group_heap_pop(LionGroupEnt *heap, int *nheap)
  * cursor - a page image for a CHAIN set - and a pin on the posting leaf it
  * stands on, so a batch takes what the cursors of one count may hold open
  * (LionOpenBudget, DESIGN.md §15 "Bounded cursors"): work_mem of cursors, and
- * the pins the lists have left.  Never fewer than LION_OPEN_MIN_PINS, nor
- * more than LION_GROUP_BATCH_MAX (lion_count.h): past a few hundred groups a
- * batch saves nothing more, each reading of the copy being shared by that
- * many already.
+ * the pins the lists have left.  Never fewer than LION_OPEN_MIN_PINS while
+ * the pins allow that many, and one group at the least - a pool too small
+ * for its connections allows none (2026-09-29 review) - nor more than
+ * LION_GROUP_BATCH_MAX (lion_count.h): past a few hundred groups a batch
+ * saves nothing more, each reading of the copy being shared by that many
+ * already.
  */
 
 /*
@@ -114,7 +116,8 @@ lion_count_groups_batch(Relation index)
 	lion_open_budget_init(&budget, index);
 	n = Min(budget.mem / per, (Size) budget.pins);
 	n = Min(n, (Size) LION_GROUP_BATCH_MAX);
-	return (int) Max(n, (Size) LION_OPEN_MIN_PINS);
+	n = Max(n, (Size) Min(budget.pins, LION_OPEN_MIN_PINS));
+	return (int) Max(n, (Size) 1);
 }
 
 /*

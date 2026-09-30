@@ -109,8 +109,8 @@ jobs:
           make installcheck-rmgr
 
       # pg_lion beside another extension on the same planner hook and with
-      # its own resource manager, in both load orders, and the non-heap
-      # table AM refusals (test/hook-check.sh).
+      # its own resource manager, in both load orders, the non-heap table AM
+      # refusals, and counts on a sixteen-buffer pool (test/hook-check.sh).
       # The test module goes into the packaged installation with sudo, like
       # pg_lion itself.
       - name: hookcheck (hook coexistence, table AMs)
