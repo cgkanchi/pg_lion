@@ -298,7 +298,8 @@ SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a > 3');
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND id = 5');
 -- two different constants on one column
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND a = 4');
--- no equality key and no GROUP BY at all
+-- no equality key and no GROUP BY at all: the sum over every entry of the
+-- lion column with the fewest, which is every row (DESIGN.md §35)
 SELECT lion_pd('SELECT count(*) FROM lion_pdt');
 -- GROUP BY an unindexed column
 SELECT lion_pd('SELECT id, count(*) FROM lion_pdt WHERE a = 3 GROUP BY id');

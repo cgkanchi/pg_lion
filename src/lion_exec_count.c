@@ -41,8 +41,8 @@ lion_where_has_positive(LionCountScanState *st)
  * A count with nothing to take its candidates from: every WHERE clause that
  * selects rows was a multi-key query no key narrows, so the candidates are
  * every row of the relation, and the heap is read once, sequentially, with
- * the row filter - those queries - and the `IS NOT NULL` clauses tested on
- * each row the snapshot sees.  It is the ordinary plan's work, which the
+ * the row filter - those queries - and the `IS NOT NULL` and `<>` clauses
+ * tested on each row the snapshot sees.  It is the ordinary plan's work, which the
  * cost model charged for a value it could not estimate (lion_cost_recheck()).
  */
 static int64
@@ -62,11 +62,18 @@ lion_count_scan_filtered(LionCountScanState *st)
 		LionClauseState *cl = &st->clause[st->item[k].clauseno];
 		LionRowFilterClause *c;
 
-		if (st->item[k].orno >= 0 || cl->kind != LION_CLAUSE_NOTNULL)
+		if (st->item[k].orno >= 0 || !LION_CLAUSE_IS_NEGATED(cl->kind))
 			continue;
 		c = &scan.clauses[scan.nclauses++];
 		c->attno = cl->idx->rd_index->indkey.values[cl->idxcol - 1];
-		c->notnull = true;
+		c->notnull = (cl->kind == LION_CLAUSE_NOTNULL);
+		if (!c->notnull)
+		{
+			/* `col <> c` (DESIGN.md §35): its own operator, column on the left */
+			c->collation = cl->idx->rd_indcollation[cl->idxcol - 1];
+			c->value = cl->val;
+			fmgr_info(get_opcode(cl->opno), &c->flinfo);
+		}
 	}
 
 	return lion_count_heap_filtered(st->heap, estate->es_snapshot, &scan,
@@ -577,8 +584,8 @@ lion_count_nonnull(LionCountScanState *st, LionCountSource *sources,
  *
  * The complement is not taken when
  *
- *	- the range is unordered, or empty: there is no run to take apart, or no
- *	  row to count;
+ *	- the range is unordered, or empty, or has a hole (`<>`, DESIGN.md §35):
+ *	  there is no run to take apart, or no row to count;
  *	- no WHERE source is positive: |F − NULL(k)| has nothing to drive it, and
  *	  a count of every row of the table is not something an index can give;
  *	- the driving index is PARTIAL: its entries hold only the rows its
@@ -597,7 +604,7 @@ lion_range_choose_on(Relation index, AttrNumber col, LionRange *range,
 	int			eval;
 	int			i;
 
-	if (!range->ordered || range->empty)
+	if (!range->ordered || range->empty || range->nholes > 0)
 		return LION_RANGE_EVAL_INSIDE;
 
 	/*

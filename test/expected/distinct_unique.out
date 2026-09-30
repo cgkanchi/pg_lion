@@ -294,11 +294,11 @@ SELECT lion_uq('SELECT g, a, count(DISTINCT id) FROM lion_uq WHERE a IN (1, 2) G
  counted, 14 rows
 (1 row)
 
--- nothing drives a count of the whole table, as for count(*)
+-- a count of the whole table, driven as count(*)'s is (DESIGN.md §35)
 SELECT lion_uq('SELECT count(DISTINCT id) FROM lion_uq');
-         lion_uq         
--------------------------
- not pushed down, 1 rows
+     lion_uq     
+-----------------
+ counted, 1 rows
 (1 row)
 
 -- the EXPLAIN: a count, with no Distinct Key

@@ -174,14 +174,32 @@ lion_array_query_is_full_scan(IndexOptInfo *index, int col,
 
 /*
  * Is this index qual one of the range comparisons of DESIGN.md §28 - `<`,
- * `<=`, `>=` or `>`, strategies 6 .. 9 of a SCALAR column's opfamily?
+ * `<=`, `>=` or `>`, strategies 6 .. 9 of a SCALAR column's opfamily - or a
+ * `<>` (10, §35), which the scan answers with the same walk, a hole in it?
  */
 static bool
 lion_cost_is_range_op(IndexOptInfo *index, int col, Oid opno)
 {
 	return !lion_index_is_multikey(index, col) &&
-		LION_STRAT_IS_RANGE(get_op_opfamily_strategy(opno,
-													 index->opfamily[col]));
+		LION_STRAT_IS_WALK(get_op_opfamily_strategy(opno,
+													index->opfamily[col]));
+}
+
+/* ... and is it the `<>` - the hole - among them? */
+static bool
+lion_cost_is_hole(IndexOptInfo *index, int col, RestrictInfo *rinfo)
+{
+	Node	   *clause = (Node *) rinfo->clause;
+	Oid			opno;
+
+	if (IsA(clause, OpExpr))
+		opno = ((OpExpr *) clause)->opno;
+	else if (IsA(clause, ScalarArrayOpExpr))
+		opno = ((ScalarArrayOpExpr *) clause)->opno;
+	else
+		return false;
+	return !lion_index_is_multikey(index, col) &&
+		get_op_opfamily_strategy(opno, index->opfamily[col]) == LION_STRAT_NE;
 }
 
 static bool
@@ -618,7 +636,7 @@ lion_cost_col_ndistinct(PlannerInfo *root, IndexOptInfo *index, int c)
  */
 static double
 lion_cost_walk_entries(PlannerInfo *root, IndexPath *path, int c,
-					   Selectivity sel)
+					   Selectivity sel, int nholes)
 {
 	IndexOptInfo *index = path->indexinfo;
 	double		nkeys = Max(1.0, lion_cost_col_ndistinct(root, index, c) * sel);
@@ -631,6 +649,15 @@ lion_cost_walk_entries(PlannerInfo *root, IndexPath *path, int c,
 	double		bucketrows;
 	double		keysper;
 	double		whole;
+
+	/*
+	 * A walk with holes (`<>`, DESIGN.md §35) - sel is then its RANGE's, the
+	 * holes left out - reads every key of the range but theirs, however many
+	 * rows the holes hold, and reads them one by one: a bucket's summary may
+	 * hold a hole's rows (lion_entry_scan_plan_sum()).
+	 */
+	if (nholes > 0)
+		return Max(1.0, nkeys - nholes);
 
 	if (index->hypothetical)
 		return nkeys;			/* nothing to read the options off */
@@ -657,6 +684,37 @@ lion_cost_walk_entries(PlannerInfo *root, IndexPath *path, int c,
 	if (whole < 1.0)
 		return nkeys;
 	return Max(0.0, nkeys - whole * keysper) + whole;
+}
+
+/*
+ * ... for the range quals of key column c (lion_cost_col_ranges()), whose
+ * selectivity together is sel: a walk with holes (`<>`, DESIGN.md §35) reads
+ * the keys of its RANGE, the quals that are not holes, but the holes'.
+ */
+static double
+lion_cost_ranges_entries(PlannerInfo *root, IndexPath *path, int c,
+						 List *ranges, Selectivity sel)
+{
+	IndexOptInfo *index = path->indexinfo;
+	List	   *bounds = NIL;
+	int			nholes = 0;
+	ListCell   *lc;
+	double		entries;
+
+	foreach(lc, ranges)
+	{
+		if (lion_cost_is_hole(index, c, lfirst_node(RestrictInfo, lc)))
+			nholes++;
+		else
+			bounds = lappend(bounds, lfirst(lc));
+	}
+	if (nholes > 0)
+		sel = (bounds == NIL) ? 1.0 :
+			clauselist_selectivity(root, bounds, index->rel->relid,
+								   JOIN_INNER, NULL);
+	entries = lion_cost_walk_entries(root, path, c, sel, nholes);
+	list_free(bounds);
+	return entries;
 }
 
 /*
@@ -709,7 +767,8 @@ lion_range_walk_cost(PlannerInfo *root, IndexPath *path, double *walkrows)
 			Selectivity sel = clauselist_selectivity(root, ranges,
 													 index->rel->relid,
 													 JOIN_INNER, NULL);
-			double		entries = lion_cost_walk_entries(root, path, c, sel);
+			double		entries = lion_cost_ranges_entries(root, path, c,
+														   ranges, sel);
 
 			if (lion_cost_sets_beside(path, c))
 			{
@@ -1036,10 +1095,10 @@ lion_plain_walk_entries(PlannerInfo *root, IndexPath *path, int c)
 
 	if (ranges == NIL)
 		return Max(1.0, lion_cost_col_ndistinct(root, index, c));
-	entries = lion_cost_walk_entries(root, path, c,
-									 clauselist_selectivity(root, ranges,
-															index->rel->relid,
-															JOIN_INNER, NULL));
+	entries = lion_cost_ranges_entries(root, path, c, ranges,
+									   clauselist_selectivity(root, ranges,
+															  index->rel->relid,
+															  JOIN_INNER, NULL));
 	list_free(ranges);
 	return Max(1.0, entries);
 }

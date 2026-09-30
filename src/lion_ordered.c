@@ -82,6 +82,7 @@
 #include "lion.h"
 #include "lion_count.h"
 #include "lion_costs.h"
+#include "lion_customscan.h"
 
 /* GUCs, and the hook this file chains (all installed by lion_ordered_init). */
 bool		lion_enable_ordered_scan = true;
@@ -111,7 +112,7 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *					(collations), IntList (nulls first); NIL when a pathkey
  *					is not a plain column, and then the walk never switches
  *
- * and custom_exprs holds four lists:
+ * and custom_exprs holds five lists:
  *
  *	LO_EXPR_LIONQUALS	every leaf's index quals, key on the left, in leaf
  *						order (heap Vars; the executor substitutes INDEX_VAR)
@@ -120,6 +121,10 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *						recheck of an inexact set
  *	LO_EXPR_ORDORIG		the ordered index's original clauses (implicit AND),
  *						the recheck when the index sets xs_recheck
+ *	LO_EXPR_VALUEQUAL	a lion column's walk: the restriction clauses on the
+ *						walked column alone that the first visible row of an
+ *						entry decides for the whole entry (implicit AND; §30.11,
+ *						"A filter on the walked column"); NIL otherwise
  */
 #define LO_PRIV_MAGIC		0x4c4f5244	/* "LORD" */
 #define LO_PRIV_SHAPE		0
@@ -176,6 +181,8 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 #define LO_EXPR_ORDQUALS	1
 #define LO_EXPR_LIONQUAL	2
 #define LO_EXPR_ORDORIG		3
+#define LO_EXPR_VALUEQUAL	4
+#define LO_EXPR_NLISTS		5
 
 #define LO_NODE_LEAF		0
 #define LO_NODE_AND			1
@@ -315,6 +322,15 @@ typedef struct LionOrderedState
 	struct IndexFetchTableData *fetch;
 #endif
 	uint64		walkkeys;		/* EXPLAIN ANALYZE: keys the walks read */
+
+	/*
+	 * ... and its filter on the walked column (§30.11, "A filter on the
+	 * walked column"): the entry whose first visible row has decided for it,
+	 * and how many entries were passed over for failing.
+	 */
+	ExprState  *valuequal;
+	int64		valueentry;
+	uint64		valueskips;
 
 	/* the lion side; noset: none, every row the walk meets is fetched */
 	bool		noset;
@@ -684,14 +700,41 @@ lo_residual(List *rinfos, List *ordrinfos, List *lionrinfos, List *lionqual)
 }
 
 /*
+ * The clauses of a lion access's qual that a partial index's predicate
+ * implies - core's own test for which restriction clauses a partial index
+ * answers by itself (check_index_predicates()), asked of the lion side: an
+ * index clause of a lion leaf, or a partial lion index's own predicate.  A
+ * walk of that index meets only rows that satisfy them, so among the rows it
+ * walks they select nothing.
+ */
+static List *
+lo_pred_implied(IndexOptInfo *idx, List *lionqual)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	if (idx->indpred == NIL)
+		return NIL;
+	foreach(lc, lionqual)
+	{
+		Expr	   *clause = (Expr *) lfirst(lc);
+
+		if (!contain_mutable_functions((Node *) clause) &&
+			predicate_implied_by(list_make1(clause), idx->indpred, false))
+			result = lappend(result, clause);
+	}
+	return result;
+}
+
+/*
  * The price of one (ordered path, lion access) pair (DESIGN.md §30.3), and the
  * size its set is expected to have.  rows is what the node returns, as lion's
  * estimates see it (lion_probe_rel_rows()).
  */
 static void
 lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
-		List *lionrinfos, List *residual, double rows, Cost *startup_p,
-		Cost *total_p, double *setbytes)
+		List *lionrinfos, List *lionqual, List *residual, double rows,
+		Cost *startup_p, Cost *total_p, double *setbytes)
 {
 	Cost		lioncost;
 	Selectivity sel;
@@ -736,7 +779,10 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	 * fetches were priced at 1% of them, and the node (a plain index scan
 	 * plus the lion lookups) beat a bitmap scan and Sort that the planner's
 	 * own price for that index scan had rejected, 721 against 13,909 on 1M
-	 * rows (2026-09-25 second review).
+	 * rows (2026-09-25 second review).  So is a clause the ordered index's
+	 * PREDICATE implies: a partial btree on (k) WHERE s <> '' walks only
+	 * rows with s <> '', and pricing the fetches at s <> ''s share of them
+	 * chose the node over a bitmap scan it ran twice as slow as.
 	 */
 	foreach(lc, ord->indexclauses)
 	{
@@ -744,6 +790,18 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 
 		if (list_member_ptr(lionrinfos, iclause->rinfo))
 			shared = lappend(shared, iclause->rinfo);
+	}
+	foreach(lc, lo_pred_implied(ord->indexinfo, lionqual))
+	{
+		Expr	   *clause = (Expr *) lfirst(lc);
+		ListCell   *lc2;
+		bool		dup = false;
+
+		foreach(lc2, shared)
+			if (equal(lfirst_node(RestrictInfo, lc2)->clause, clause))
+				dup = true;
+		if (!dup)
+			shared = lappend(shared, clause);
 	}
 	selwalk = sel;
 	if (shared != NIL)
@@ -917,13 +975,16 @@ typedef struct LoWalk
 	List	   *rinfos;			/* the restriction clauses it answers */
 	List	   *quals;			/* ... as index quals, the key on the left */
 	double		nlist;			/* the values of a list among them, or 0 */
+	List	   *vrinfos;		/* the clauses an entry's first visible row
+								 * decides for it (lo_walk_value_rinfos()) */
 } LoWalk;
 
 /* The walk's custom_private marker (the btree kind's first member is a Path) */
 #define LO_WALK_MAGIC		0x4c57414c	/* "LWAL" */
 
 /*
- * Can the walk of `var` answer rinfo: a range comparison of the column with
+ * Can the walk of `var` answer rinfo: a range comparison of the column - or a
+ * `<>`, the hole the walk steps over (DESIGN.md §35) - with
  * a value that does not depend on the row - a Const, a Param, a stable
  * expression, evaluated when the walk starts as an Index Scan's run-time keys
  * are - under the index column's collation, `IS NOT NULL`, or a list, `col =
@@ -1033,8 +1094,8 @@ lo_walk_clause(RestrictInfo *rinfo, Var *var, Oid opfamily, Oid opcintype,
 		if (OidIsValid(idxcoll) && op->inputcollid != idxcoll)
 			return false;
 		strategy = get_op_opfamily_strategy(opno, opfamily);
-		if (!LION_STRAT_IS_RANGE(strategy))
-			return false;
+		if (!LION_STRAT_IS_WALK(strategy))
+			return false;		/* a range, or `<>`'s hole (DESIGN.md §35) */
 		if (opno == op->opno)
 			*qual = clause;
 		else
@@ -1050,6 +1111,50 @@ lo_walk_clause(RestrictInfo *rinfo, Var *var, Oid opfamily, Oid opcintype,
 		return true;
 	}
 	return false;
+}
+
+/*
+ * The restriction clauses a lion column's walk can decide once per ENTRY
+ * rather than once per row (DESIGN.md §30.11, "A filter on the walked
+ * column"): those that read no column but the walked one and call nothing
+ * volatile, on an index whose stored keys are the rows' own values byte for
+ * byte (lion_index_can_emit_value()).  Every row of an entry then holds one
+ * value, so a clause is true of all of them or of none, and the first
+ * visible row the walk fetches of an entry decides for the entry: one that
+ * fails takes the rest of the entry with it, unread.  The clause is only
+ * ever evaluated on a visible row, as the ordinary plan evaluates it - never
+ * on a stored key alone, which may be a dead row's, and could make a function
+ * fail that the query never calls on it (`1 / k` with k = 0 only in a
+ * deleted row).  It stays in the node's filter as well.
+ */
+static List *
+lo_walk_value_rinfos(RelOptInfo *rel, IndexOptInfo *idx, int c, Var *var,
+					 List *walkrinfos)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	if (!lion_index_can_emit_value(idx, (AttrNumber) (c + 1)))
+		return NIL;
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		Bitmapset  *attrs = NULL;
+
+		if (rinfo->pseudoconstant || list_member_ptr(walkrinfos, rinfo) ||
+			!bms_equal(rinfo->clause_relids, rel->relids))
+			continue;
+		if (contain_volatile_functions((Node *) rinfo->clause) ||
+			contain_subplans((Node *) rinfo->clause))
+			continue;
+		pull_varattnos((Node *) rinfo->clause, rel->relid, &attrs);
+		if (bms_num_members(attrs) != 1 ||
+			!bms_is_member(var->varattno - FirstLowInvalidHeapAttributeNumber,
+						   attrs))
+			continue;
+		result = lappend(result, rinfo);
+	}
+	return result;
 }
 
 /*
@@ -1185,6 +1290,7 @@ lo_lion_walks(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			w->nulls = strict ? LION_ORDER_NULLS_NONE :
 				want->pk_nulls_first ? LION_ORDER_NULLS_FIRST :
 				LION_ORDER_NULLS_LAST;
+			w->vrinfos = lo_walk_value_rinfos(rel, idx, c, var, w->rinfos);
 			walks = lappend(walks, w);
 		}
 		if (indexrel != NULL)
@@ -1202,8 +1308,8 @@ lo_lion_walks(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
  */
 static void
 lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
-			 List *residual, double rows, Cost *startup_p, Cost *total_p,
-			 double *setbytes)
+			 List *lionqual, List *residual, double rows, Cost *startup_p,
+			 Cost *total_p, double *setbytes)
 {
 	double		tuples = Max(rel->tuples, 1.0);
 	double		pages = Max((double) rel->pages, 1.0);
@@ -1229,9 +1335,26 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 	bool		isdefault;
 	int16		keywidth;
 
-	if (w->rinfos != NIL)
-		swalk = clauselist_selectivity(root, w->rinfos, rel->relid,
-									   JOIN_INNER, NULL);
+	/*
+	 * The rows of the range - of a partial index, only the ones its predicate
+	 * admits, the predicate's clauses the range does not already imply added
+	 * as core's add_predicate_to_index_quals() adds them.
+	 */
+	{
+		List	   *walkclauses = list_copy(w->rinfos);
+		ListCell   *lc;
+
+		foreach(lc, w->index->indpred)
+		{
+			Expr	   *pred = (Expr *) lfirst(lc);
+
+			if (!predicate_implied_by(list_make1(pred), w->quals, false))
+				walkclauses = lappend(walkclauses, pred);
+		}
+		if (walkclauses != NIL)
+			swalk = clauselist_selectivity(root, walkclauses, rel->relid,
+										   JOIN_INNER, NULL);
+	}
 	walked = clamp_row_est(tuples * swalk);
 	examine_variable(root, (Node *) w->var, rel->relid, &vardata);
 	ndistinct = Max(1.0, get_variable_numdistinct(&vardata, &isdefault));
@@ -1248,12 +1371,28 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 		double		members;
 		double		ncont;
 
+		List	   *shared;
+
 		cost_bitmap_tree_node(lion, &lioncost, &sel);
 		members = clamp_row_est(sel * tuples);
 		ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
 		*setbytes = ncont * (LION_CONTAINER_HDRSZ + LO_ENTRY_BYTES) +
 			Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES);
 		startup += lioncost + ncont * cpu_operator_cost;
+
+		/*
+		 * What the set selects among the rows walked: not what the walked
+		 * index's predicate already guarantees (lo_cost()).
+		 */
+		shared = lo_pred_implied(w->index, lionqual);
+		if (shared != NIL)
+		{
+			Selectivity both = clauselist_selectivity(root, shared, rel->relid,
+													  JOIN_INNER, NULL);
+
+			if (both > 0)
+				sel = Min(sel / both, 1.0);
+		}
 	}
 
 	/*
@@ -1275,8 +1414,43 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 	 * The rows fetched: every row the walk meets, or only the set's members,
 	 * each priced as cost_index() prices a fetch, the column's correlation
 	 * with the heap interpolating between rows at random and rows in order.
+	 *
+	 * A filter on the walked column (lo_walk_value_rinfos()) lets an entry
+	 * go after one fetched member: of the entries it rejects, the walk reads
+	 * the TIDs up to that member and fetches it, and of the rest everything,
+	 * as before.  The share of its clauses the set already selects by is not
+	 * counted again.
 	 */
 	fetched = clamp_row_est(walked * sel);
+	if (w->vrinfos != NIL)
+	{
+		List	   *vclauses = NIL;
+		ListCell   *lc;
+
+		foreach(lc, w->vrinfos)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+			if (lionqual == NIL ||
+				!predicate_implied_by(list_make1(rinfo->clause), lionqual,
+									  false))
+				vclauses = lappend(vclauses, rinfo);
+		}
+		if (vclauses != NIL)
+		{
+			Selectivity vsel = clauselist_selectivity(root, vclauses,
+													  rel->relid, JOIN_INNER,
+													  NULL);
+			double		rejected = entries * (1.0 - vsel);
+			double		tidsto = Min(perentry, 1.0 / Max(sel, 1e-9));
+
+			run -= walked * cpu_operator_cost;
+			walked = clamp_row_est(walked * vsel + rejected * tidsto);
+			run += walked * cpu_operator_cost;
+			fetched = clamp_row_est(fetched * vsel +
+									rejected * Min(1.0, perentry * sel));
+		}
+	}
 	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
 	corr = lion_var_heap_correlation(root, rel->relid, w->var);
 	max_io = index_pages_fetched(fetched, rel->pages,
@@ -1444,7 +1618,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			Cost		total;
 			double		setbytes;
 
-			lo_cost(root, rel, ord, lion, lionrinfos, residual, rows,
+			lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual, rows,
 					&startup, &total, &setbytes);
 			if (setbytes > (double) limit)
 				continue;		/* the set would not fit (§30.3) */
@@ -1483,13 +1657,14 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			double		setbytes;
 			List	   *priv;
 
-			lo_cost_walk(root, rel, w, lion, residual, rows, &startup, &total,
-						 &setbytes);
+			lo_cost_walk(root, rel, w, lion, lionqual, residual, rows,
+						 &startup, &total, &setbytes);
 			if (setbytes > (double) limit)
 				continue;		/* the set would not fit (§30.3) */
 			priv = list_make5(walkinfo, w->index, w->rinfos, w->quals,
 							  list_make1(w->var));
 			priv = lappend(priv, lion);
+			priv = lappend(priv, w->vrinfos);
 			lo_add_path(rel, list_make1(w->pathkey), priv, rows, startup,
 						total);
 		}
@@ -1591,6 +1766,7 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *ordquals = NIL;
 	List	   *ordcols = NIL;
 	List	   *ordorig = NIL;
+	List	   *vrinfos = NIL;
 	int			dir;
 	int			flags = 0;
 	int			nulls = LION_ORDER_NULLS_NONE;
@@ -1637,6 +1813,7 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		ordrinfos = (List *) lthird(best_path->custom_private);
 		ordquals = (List *) lfourth(best_path->custom_private);
 		lion = (Path *) list_nth(best_path->custom_private, 5);
+		vrinfos = (List *) list_nth(best_path->custom_private, 6);
 		foreach(lc, ordrinfos)
 		{
 			ordorig = lappend(ordorig, lfirst_node(RestrictInfo, lc)->clause);
@@ -1665,7 +1842,8 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->flags = best_path->flags;
 	cscan->custom_plans = NIL;
 	cscan->custom_scan_tlist = NIL;
-	cscan->custom_exprs = list_make4(lionquals, ordquals, lionqual, ordorig);
+	cscan->custom_exprs = list_make5(lionquals, ordquals, lionqual, ordorig,
+									 extract_actual_clauses(vrinfos, false));
 	cscan->custom_private =
 		list_make5(list_make2_int(LO_PRIV_MAGIC, LO_PRIV_NMEMBERS),
 				   list_make1_oid(ordoid),
@@ -2680,7 +2858,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	if (shape == NIL || !IsA(shape, IntList) || list_length(shape) != 2 ||
 		linitial_int(shape) != LO_PRIV_MAGIC ||
 		lsecond_int(shape) != LO_PRIV_NMEMBERS ||
-		list_length(cscan->custom_exprs) != 4)
+		list_length(cscan->custom_exprs) != LO_EXPR_NLISTS)
 		elog(ERROR, "LionOrdered: unrecognized custom_private shape (%d members)",
 			 list_length(cscan->custom_private));
 
@@ -2709,6 +2887,10 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->ordrecheck = ExecInitQual((List *) list_nth(cscan->custom_exprs,
 													 LO_EXPR_ORDORIG),
 								  &node->ss.ps);
+	st->valuequal = ExecInitQual((List *) list_nth(cscan->custom_exprs,
+													LO_EXPR_VALUEQUAL),
+								 &node->ss.ps);
+	st->valueentry = -1;
 
 	st->nleaves = list_length(leafoids);
 	st->leaves = (LoLeaf *) palloc0(sizeof(LoLeaf) * Max(st->nleaves, 1));
@@ -2948,6 +3130,7 @@ lo_start_walk(LionOrderedState *st)
 										  st->okeys, st->nokeys,
 										  ScanDirectionIsBackward(st->dir),
 										  st->walknulls, st->walkcxt);
+		st->valueentry = -1;	/* a new walk numbers its entries afresh */
 		pgstat_count_index_scan(st->ordidx);
 		st->scans++;
 		st->started = true;
@@ -3315,6 +3498,27 @@ lo_next(ScanState *ss)
 			if (ordrecheck && !ExecQual(st->ordrecheck, econtext))
 				continue;
 		}
+
+		/*
+		 * A filter on the walked column (DESIGN.md §30.11): the rows of one
+		 * entry hold one value, byte for byte, so the first visible one
+		 * decides for the entry - evaluated here on a visible row, as the
+		 * filter above the node would, and one that fails takes the rest of
+		 * the entry with it, unread.
+		 */
+		if (st->valuequal != NULL && st->lionwalk && st->owalk != NULL &&
+			lion_order_walk_entryno(st->owalk) != st->valueentry)
+		{
+			st->valueentry = lion_order_walk_entryno(st->owalk);
+			ResetExprContext(econtext);
+			econtext->ecxt_scantuple = slot;
+			if (!ExecQual(st->valuequal, econtext))
+			{
+				lion_order_walk_skip_entry(st->owalk);
+				st->valueskips++;
+				continue;
+			}
+		}
 		return slot;
 	}
 	st->done = true;
@@ -3462,6 +3666,9 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 					"Index Cond", ancestors, es);
 	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs, LO_EXPR_LIONQUAL),
 					"Lion Cond", ancestors, es);
+	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs,
+											LO_EXPR_VALUEQUAL),
+					"Filter per Value", ancestors, es);
 
 	resetStringInfo(&buf);
 	for (i = 0; i < st->nleaves; i++)
@@ -3496,6 +3703,9 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 				lion_order_walk_counts(st->owalk, &entries, &leaves);
 			ExplainPropertyInteger("Lion Keys Walked", NULL,
 								   (int64) st->walkkeys + entries, es);
+			if (st->valuequal != NULL)
+				ExplainPropertyInteger("Lion Keys Filtered", NULL,
+									   (int64) st->valueskips, es);
 		}
 		if (!st->noset)
 			ExplainPropertyInteger("Lion Set Hits", NULL, (int64) st->hits,

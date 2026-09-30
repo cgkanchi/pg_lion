@@ -847,7 +847,7 @@ SELECT count(*) FROM lion_mcp WHERE n IS NOT NULL AND m IS NOT NULL;
                                              QUERY PLAN                                              
 -----------------------------------------------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_mcp_i.n (all keys), lion_mcp_i.n (n IS NOT NULL), lion_mcp_i.m (m IS NOT NULL)
+   Lion Indexes: lion_mcp_i.m (all keys), lion_mcp_i.n (n IS NOT NULL), lion_mcp_i.m (m IS NOT NULL)
 (2 rows)
 
 RESET enable_seqscan;

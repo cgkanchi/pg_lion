@@ -401,6 +401,39 @@ lion_locate_leaf(LionClauseState *cl, LionPostingSet **sets, int *nsets)
 				tree = NULL;
 			break;
 
+		case LION_CLAUSE_NE:
+
+			/*
+			 * `col <> c` (DESIGN.md §35) rejects the rows of c's entry and of
+			 * the NULL one: a negated source of whichever of the two exist.
+			 * The caller has seen to a NULL c, which rejects every row.
+			 */
+			Assert(!cl->valisnull);
+			*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * 2);
+			if (lion_posting_set_lookup_col(cl->idx, cl->idxcol, cl->val,
+											cl->valtype, &(*sets)[n]))
+				n++;
+			else
+				lion_posting_set_release(&(*sets)[n]);
+			if (lion_posting_set_lookup_null_col(cl->idx, cl->idxcol,
+												 &(*sets)[n]))
+				n++;
+			else
+				lion_posting_set_release(&(*sets)[n]);
+			if (n == 1)
+				tree = lion_key_node(0);
+			else if (n == 2)
+			{
+				/* the node keeps the array: not the stack's */
+				LionKeyNode **args = (LionKeyNode **)
+					palloc(sizeof(LionKeyNode *) * 2);
+
+				args[0] = lion_key_node(0);
+				args[1] = lion_key_node(1);
+				tree = lion_bool_node(LION_KN_OR, args, 2);
+			}
+			break;
+
 		case LION_CLAUSE_NULL:
 		case LION_CLAUSE_NOTNULL:
 			*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));
@@ -955,7 +988,15 @@ lion_locate_where(LionCountScanState *st)
 			continue;
 		}
 
-		src->negated = (cl->kind == LION_CLAUSE_NOTNULL);
+		/* `col <> NULL` is true of no row (DESIGN.md §35) */
+		if (cl->kind == LION_CLAUSE_NE && cl->valisnull)
+		{
+			st->wheremissing = true;
+			src->negated = true;
+			continue;
+		}
+
+		src->negated = LION_CLAUSE_IS_NEGATED(cl->kind);
 		src->tree = lion_locate_leaf(cl, &src->sets, &src->nsets);
 
 		/*

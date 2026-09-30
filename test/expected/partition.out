@@ -517,7 +517,7 @@ SELECT lion_pplan('SELECT count(*) FROM lion_part WHERE n IS NOT NULL');
 -------------------------------------------------------------------------
  Custom Scan (LionCount)
    Partitions: lion_part_p1, lion_part_p2x, lion_part_p2d, lion_part_def
-   Lion Indexes: (all keys), (n IS NOT NULL)
+   Lion Indexes: (all rows), (n IS NOT NULL)
 (3 rows)
 
 /* A by-reference group key: the merged table keeps a copy of every key. */

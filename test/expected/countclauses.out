@@ -356,7 +356,7 @@ SELECT n, lion_cc(q) FROM lion_cc_q ORDER BY n;
  116 | LionCount, 1 rows
  117 | LionCount, 1 rows
  118 | LionCount, 4 rows
- 119 | not pushed, 1 rows
+ 119 | LionCount, 1 rows
  120 | not pushed, 1 rows
  121 | LionCount, 3 rows
  122 | LionCount, 3 rows
@@ -758,7 +758,7 @@ SELECT n, lion_cc(q) FROM lion_cc_q ORDER BY n;
  116 | LionCount, 1 rows
  117 | LionCount, 1 rows
  118 | LionCount, 4 rows
- 119 | not pushed, 1 rows
+ 119 | LionCount, 1 rows
  120 | not pushed, 1 rows
  121 | LionCount, 3 rows
  122 | LionCount, 3 rows
