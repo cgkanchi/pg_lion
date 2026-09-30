@@ -478,7 +478,8 @@ lion_verify_segment(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
 	uint32		run = 1;
 	uint32		i;
 
-	if (!lion_sparse_check(c, avail, &detail))
+	if (!lion_sparse_check(c, avail, &detail) ||
+		!lion_sparse_check_offsets(c, MaxHeapTuplesPerPage, &detail))
 		lion_corrupt("lion index \"%s\": sparse segment %u on block %u is corrupt: %s",
 					RelationGetRelationName(vs->index), off, blk, detail);
 
@@ -534,7 +535,13 @@ lion_verify_container(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
 		return;
 	}
 
-	if (!lion_container_check(c, avail, &detail))
+	/*
+	 * Its structure, and then its members as heap TIDs (DESIGN.md §2): a
+	 * member at offset 0 or past MaxHeapTuplesPerPage used to pass, and every
+	 * query that turned the key into TIDs failed on it.
+	 */
+	if (!lion_container_check(c, avail, &detail) ||
+		!lion_container_check_offsets(c, MaxHeapTuplesPerPage, &detail))
 		lion_corrupt("lion index \"%s\": container %u on block %u is corrupt: %s",
 					RelationGetRelationName(vs->index), off, blk, detail);
 

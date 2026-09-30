@@ -302,4 +302,34 @@ extern uint64 lion_container_block_mask(const LionContainer *c);
  */
 extern bool lion_container_check(const LionContainer *c, Size avail_bytes, const char **errmsg);
 
+/*
+ * HEAP TUPLE OFFSETS (DESIGN.md §2).  A member is the low LION_CONTAINER_BITS
+ * of a heap TID's code - the block within the container's range, above
+ * LION_OFFSET_BITS of offset number - so it names a tuple only when that
+ * offset is one a heap page can have, 1 .. maxoff, where maxoff is the
+ * server's MaxHeapTuplesPerPage: this module is frontend code and takes it
+ * from the caller.  Structurally any lo is a member, which is why
+ * lion_container_check() does not ask, and nothing but lion_index_verify()
+ * does: a member at offset 0 passed it, and every query that turned the key
+ * into TIDs then failed with "tuple offset out of range: 0" (2026-09-29
+ * review).
+ */
+static inline bool
+lion_lo_is_tuple(uint32 lo, uint32 maxoff)
+{
+	uint32		off = lo & ((1U << LION_OFFSET_BITS) - 1);
+
+	return off >= 1 && off <= maxoff;
+}
+
+/*
+ * For lion_index_verify(), of a container lion_container_check() has passed:
+ * every member is a tuple (lion_lo_is_tuple()), which for a RUN means each
+ * run lies inside the offsets 1 .. maxoff of one heap block.  maxoff has to
+ * be below 1 << LION_OFFSET_BITS.  Returns false and sets *errmsg (a static
+ * string) on failure.
+ */
+extern bool lion_container_check_offsets(const LionContainer *c,
+										 uint32 maxoff, const char **errmsg);
+
 #endif							/* LION_CONTAINER_H */

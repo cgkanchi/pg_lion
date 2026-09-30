@@ -3474,3 +3474,83 @@ lion_container_check(const LionContainer *c, Size avail_bytes, const char **errm
 	Assert(lion_container_size(c) <= avail_bytes);
 	return true;
 }
+
+/*
+ * The bits of BITSET word `word` whose members are tuples.  A word lies
+ * inside one heap block's lo values (LION_BITSET_WORDS_PER_BLOCK), of which
+ * it covers the offsets base .. base + 63.
+ */
+static uint64
+bitset_tuple_mask(uint32 word, uint32 maxoff)
+{
+	uint32		base = (word % LION_BITSET_WORDS_PER_BLOCK) * 64;
+	uint32		first = Max(base, 1);
+	uint32		last = Min(base + 63, maxoff);
+	uint64		mask;
+
+	if (first > last)
+		return 0;
+	mask = (last - base == 63) ? ~UINT64CONST(0) :
+		(UINT64CONST(1) << (last - base + 1)) - 1;
+	return mask & ~((UINT64CONST(1) << (first - base)) - 1);
+}
+
+bool
+lion_container_check_offsets(const LionContainer *c, uint32 maxoff,
+							 const char **errmsg)
+{
+	*errmsg = NULL;
+
+	Assert(maxoff < (1U << LION_OFFSET_BITS));
+
+	switch (c->type)
+	{
+		case LION_CT_ARRAY:
+			{
+				const uint16 *arr = array_cdata(c);
+				uint32		n = array_card(c);
+				uint32		i;
+
+				for (i = 0; i < n; i++)
+				{
+					if (!lion_lo_is_tuple(arr[i], maxoff))
+						LION_CHECK_FAIL("array container member is not a heap tuple offset");
+				}
+				break;
+			}
+		case LION_CT_BITSET:
+			{
+				const uint64 *w = bitset_cdata(c);
+				uint32		k;
+
+				for (k = 0; k < LION_BITSET_WORDS; k++)
+				{
+					if ((w[k] & ~bitset_tuple_mask(k, maxoff)) != 0)
+						LION_CHECK_FAIL("bitset container member is not a heap tuple offset");
+				}
+				break;
+			}
+		case LION_CT_RUN:
+			{
+				const LionRun *runs = run_cdata(c);
+				uint32		nruns = run_nruns(c);
+				uint32		i;
+
+				for (i = 0; i < nruns; i++)
+				{
+					uint32		start = runs[i].start;
+					uint32		last = (uint32) run_end(&runs[i]);
+
+					if (!lion_lo_is_tuple(start, maxoff) ||
+						!lion_lo_is_tuple(last, maxoff) ||
+						(start >> LION_OFFSET_BITS) != (last >> LION_OFFSET_BITS))
+						LION_CHECK_FAIL("run container run is not inside the tuple offsets of one heap block");
+				}
+				break;
+			}
+		default:
+			LION_CHECK_FAIL("invalid container type");
+	}
+
+	return true;
+}

@@ -991,6 +991,94 @@ test_check_rejects(void)
 	}
 }
 
+/*
+ * lion_sparse_check_offsets(): every pair's lo is a heap tuple of its block,
+ * offsets 1 .. MaxHeapTuplesPerPage - which this frontend program computes
+ * for its BLCKSZ as the server does, 291 at 8K.
+ */
+#define TEST_MAXOFF		((uint32) ((BLCKSZ - 24) / (24 + 4)))
+
+static uint16
+tuple_lo(uint32 blk, uint32 off)
+{
+	return (uint16) ((blk << LION_OFFSET_BITS) | off);
+}
+
+static void
+test_check_offsets(void)
+{
+	SBuf		b;
+	const char *err;
+	uint32		maxlo = (1U << LION_OFFSET_BITS) - 1;
+	int			iter;
+
+	phase("check_offsets");
+	lion_sparse_init(&b.c, 0);
+	lion_sparse_insert(&b.c, 100, tuple_lo(0, 1), NULL);
+	lion_sparse_insert(&b.c, 100, tuple_lo(0, TEST_MAXOFF), NULL);
+	lion_sparse_insert(&b.c, 101, tuple_lo(3, 7), NULL);
+	lion_sparse_insert(&b.c, 250, tuple_lo(LION_BLOCKS_PER_CONTAINER - 1, 1), NULL);
+
+	err = NULL;
+	CHECK(lion_sparse_check(&b.c, lion_sparse_size(&b.c), &err), "the good image passes");
+	CHECK(lion_sparse_check_offsets(&b.c, TEST_MAXOFF, &err) && err == NULL,
+		  "pairs of tuples pass");
+
+	{
+		SBuf		x = b;
+
+		lion_sparse_insert(&x.c, 101, tuple_lo(1, 0), NULL);
+		err = NULL;
+		CHECK(lion_sparse_check(&x.c, lion_sparse_size(&x.c), &err),
+			  "offset 0 is a structurally valid lo");
+		CHECK(!lion_sparse_check_offsets(&x.c, TEST_MAXOFF, &err) && err != NULL,
+			  "a pair at offset 0 is rejected");
+	}
+	{
+		SBuf		x = b;
+
+		lion_sparse_insert(&x.c, 250, tuple_lo(2, TEST_MAXOFF + 1), NULL);
+		err = NULL;
+		CHECK(!lion_sparse_check_offsets(&x.c, TEST_MAXOFF, &err) && err != NULL,
+			  "a pair past MaxHeapTuplesPerPage is rejected");
+	}
+	{
+		SBuf		x = b;
+
+		lion_sparse_insert(&x.c, 99, tuple_lo(0, maxlo), NULL);
+		err = NULL;
+		CHECK(!lion_sparse_check_offsets(&x.c, TEST_MAXOFF, &err) && err != NULL,
+			  "a pair at the last lo of a block is rejected");
+	}
+
+	/* the answer is "every lo is a tuple", for any segment */
+	for (iter = 0; iter < 500; iter++)
+	{
+		uint32		n = 1 + rng_below(60);
+		bool		expect = true;
+		uint32		i;
+
+		lion_sparse_init(&b.c, 0);
+		for (i = 0; i < n; i++)
+		{
+			uint32		off = 1 + rng_below(TEST_MAXOFF);
+			uint16		lo;
+
+			/* now and then one that is not a tuple: offset 0, or any */
+			if (rng_below(40) == 0)
+				off = rng_below(2) ? 0 : rng_below(maxlo + 1);
+			lo = tuple_lo(rng_below(LION_BLOCKS_PER_CONTAINER), off);
+
+			if (lion_sparse_insert(&b.c, rng_below(1000), lo, NULL) &&
+				(off == 0 || off > TEST_MAXOFF))
+				expect = false;
+		}
+		err = NULL;
+		CHECK(lion_sparse_check_offsets(&b.c, TEST_MAXOFF, &err) == expect,
+			  "check_offsets() agrees with the pairs, one by one");
+	}
+}
+
 /* ----------------------------------------------------------------
  *		damaged segments, and growth in place (DESIGN.md §13)
  *
@@ -1550,6 +1638,7 @@ main(void)
 	test_merge();
 	test_iterate_early_stop();
 	test_check_rejects();
+	test_check_offsets();
 	test_damaged(3000, UINT64CONST(0x5EED2200));
 	test_inplace_growth();
 
