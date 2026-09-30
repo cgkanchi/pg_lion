@@ -362,6 +362,12 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
 			(void) lion_verify_dir_item(vs, blk, page, off);
 
+		/*
+		 * ... and no two of them overlap, which every writer of the page
+		 * requires before it rewrites one (lion_page_check_items()).
+		 */
+		lion_page_check_items(vs->index, page, blk);
+
 		if (!LionPageIsRightmost(page))
 		{
 			if (maxoff < FirstOffsetNumber)

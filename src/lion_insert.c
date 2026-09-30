@@ -536,7 +536,9 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 {
 	Page		page = BufferGetPage(entrybuf);
 	ItemId		iid = PageGetItemId(page, entryoff);
-	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
+	LionEntryTuple *entry = lion_page_entry_fetch(index, page,
+												  BufferGetBlockNumber(entrybuf),
+												  entryoff);
 	Size		itemsz = ItemIdGetLength(iid);
 	Size		payoff = LionEntryPayloadOffset(entry);
 	Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemsz);
@@ -739,6 +741,13 @@ lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 	if (lion_container_contains(onpage, lo))
 		return true;
 
+	/*
+	 * The member goes into the bytes the line pointer allots the item, which
+	 * lion_page_item_fetch() has bounded - and which must not reach into the
+	 * next item: this wrote into that one's header before, and logged it.
+	 */
+	lion_page_check_alone(index, page, BufferGetBlockNumber(buf), off);
+
 	xstate = lion_wal_begin(index);
 	p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 	c = (LionContainer *) PageGetItem(p, PageGetItemId(p, off));
@@ -813,6 +822,9 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 
 	if (lion_sparse_contains(onpage, ckey, lo))
 		return true;
+
+	/* As for a container (lion_insert_container_inplace()). */
+	lion_page_check_alone(index, page, BufferGetBlockNumber(buf), off);
 
 	xstate = lion_wal_begin(index);
 	p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
@@ -1087,16 +1099,22 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 				 uint32 ckey, uint16 lo)
 {
 	Page		page = BufferGetPage(entrybuf);
-	ItemId		iid = PageGetItemId(page, entryoff);
-	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
+	LionEntryTuple *entry;
 	LionEntryTuple *ecopy;
 	LionContainer *cbuf;
 	Size		esize;
 	Buffer		buf;
 	bool		ontail;
 
+	/*
+	 * Every record below rewrites the entry in place, at the size it has,
+	 * inside the record (lion_put_entry()): it has to have the size a CHAIN
+	 * entry has, or that write fails there - a PANIC in rmgr mode.
+	 */
+	entry = lion_page_entry_fetch(index, page, BufferGetBlockNumber(entrybuf),
+								  entryoff);
 	ecopy = lion_entry_rebuild(entry, NULL, 0, &esize);
-	Assert(esize == ItemIdGetLength(iid));
+	Assert(esize == ItemIdGetLength(PageGetItemId(page, entryoff)));
 	Assert((ecopy->flags & LION_ENTRY_CHAIN) != 0);
 
 	cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
@@ -1180,7 +1198,8 @@ lion_summary_rekey_insert(Relation index, Relation heaprel, LionState *state,
 {
 	Page		page = BufferGetPage(buf);
 	ItemId		iid = PageGetItemId(page, off);
-	LionEntryTuple *e = (LionEntryTuple *) PageGetItem(page, iid);
+	LionEntryTuple *e = lion_page_entry_fetch(index, page,
+											  BufferGetBlockNumber(buf), off);
 	LionEntryTuple *newentry;
 	Size		newsize;
 	Size		newpayoff = MAXALIGN(LION_ENTRY_HDRSZ +
@@ -1310,14 +1329,16 @@ lion_summary_close_last(Relation index, Relation heaprel, LionState *state,
 {
 	Page		page = BufferGetPage(buf);
 	ItemId		iid = PageGetItemId(page, off);
+	LionEntryTuple *onpage;
 	LionEntryTuple *closed;
 	LionEntryTuple *last;
 	Size		size;
 	Buffer		lbuf = buf;
 
+	onpage = lion_page_entry_fetch(index, page, BufferGetBlockNumber(buf), off);
 	size = ItemIdGetLength(iid);
 	closed = (LionEntryTuple *) palloc(size);
-	memcpy(closed, PageGetItem(page, iid), size);
+	memcpy(closed, onpage, size);
 	closed->flags &= ~LION_ENTRY_SUMLAST;
 	lion_dir_place(index, heaprel, state->ix, buf, off, true, closed, size);
 	pfree(closed);
