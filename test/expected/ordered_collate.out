@@ -111,8 +111,8 @@ END $$;
 --    Index Cond: 'A0' is below 'a' in "C".
 SELECT * FROM loc_plan($$
 	SELECT id, t FROM loc WHERE t < 'a' COLLATE "C" ORDER BY t, id LIMIT 5$$);
-                     loc_plan                      
----------------------------------------------------
+                          loc_plan                           
+-------------------------------------------------------------
  Limit
    ->  Incremental Sort
          Sort Key: t COLLATE loc_en, id
@@ -120,7 +120,8 @@ SELECT * FROM loc_plan($$
          ->  Custom Scan (LionOrdered) on loc
                Filter: (t < 'a'::text COLLATE "C")
                Ordered By: loc_l (t, nulls last)
-(7 rows)
+               Filter per Value: (t < 'a'::text COLLATE "C")
+(8 rows)
 
 SELECT loc_cmp($$
 	SELECT id, t FROM loc WHERE t < 'a' COLLATE "C" ORDER BY t, id LIMIT 5$$);
@@ -148,8 +149,8 @@ SELECT loc_cmp($$
 SELECT * FROM loc_plan($$
 	SELECT id, t FROM loc WHERE t >= 'a5' AND t < 'b' COLLATE "C"
 	 ORDER BY t, id LIMIT 5$$);
-                     loc_plan                      
----------------------------------------------------
+                          loc_plan                           
+-------------------------------------------------------------
  Limit
    ->  Incremental Sort
          Sort Key: t COLLATE loc_en, id
@@ -158,7 +159,8 @@ SELECT * FROM loc_plan($$
                Filter: (t < 'b'::text COLLATE "C")
                Ordered By: loc_l (t)
                Index Cond: (t >= 'a5'::text)
-(8 rows)
+               Filter per Value: (t < 'b'::text COLLATE "C")
+(9 rows)
 
 SELECT loc_cmp($$
 	SELECT id, t FROM loc WHERE t >= 'a5' AND t < 'b' COLLATE "C"
@@ -182,8 +184,8 @@ PREPARE loc_p(text) AS
 	SELECT id, t FROM loc WHERE t < $1 COLLATE "C" ORDER BY t, id LIMIT 5;
 SET plan_cache_mode = force_generic_plan;
 SELECT * FROM loc_plan('EXECUTE loc_p(''a'')');
-                    loc_plan                     
--------------------------------------------------
+                     loc_plan                     
+--------------------------------------------------
  Limit
    ->  Incremental Sort
          Sort Key: t COLLATE loc_en, id
@@ -191,7 +193,8 @@ SELECT * FROM loc_plan('EXECUTE loc_p(''a'')');
          ->  Custom Scan (LionOrdered) on loc
                Filter: (t < ($1)::text)
                Ordered By: loc_l (t, nulls last)
-(7 rows)
+               Filter per Value: (t < ($1)::text)
+(8 rows)
 
 SELECT loc_cmp('EXECUTE loc_p(''a'')', $$
 	SELECT id, t FROM loc WHERE t < 'a' COLLATE "C" ORDER BY t, id LIMIT 5$$);

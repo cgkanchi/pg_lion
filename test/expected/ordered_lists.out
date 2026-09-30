@@ -240,7 +240,8 @@ SELECT * FROM ol_plan($$SELECT id FROM lol
  Ordered By: lol_l (g)
  Index Cond: (g = ANY ('{g01,g02,g03}'::text[]))
  Lion Cond: ((a = 'a2'::text) AND (g = ANY ('{g02,g03,g04}'::text[])))
-(4 rows)
+ Filter per Value: (g = ANY ('{g02,g03,g04}'::text[]))
+(5 rows)
 
 SELECT ol_cmp($$SELECT id, g FROM lol
 	WHERE g IN ('g01', 'g02', 'g03') AND g IN ('g02', 'g03', 'g04') AND a = 'a2'
@@ -273,7 +274,8 @@ SELECT * FROM ol_plan($$SELECT id FROM lol
  ->  Custom Scan (LionOrdered) on lol
  Ordered By: lol_l (n, nulls last)
  Lion Cond: ((a = 'a9'::text) AND (n = ANY ('{3,5}'::bigint[])))
-(3 rows)
+ Filter per Value: (n = ANY ('{3,5}'::bigint[]))
+(4 rows)
 
 SELECT ol_cmp($$SELECT id, n FROM lol
 	WHERE a = 'a9' AND n = ANY ('{3, 5}'::int8[]) ORDER BY n, id$$);

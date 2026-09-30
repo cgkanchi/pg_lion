@@ -698,9 +698,9 @@ SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND a = 4');
 
 -- no equality key and no GROUP BY at all
 SELECT lion_pd('SELECT count(*) FROM lion_pdt');
-         lion_pd         
--------------------------
- not pushed down, 1 rows
+       lion_pd       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- GROUP BY an unindexed column

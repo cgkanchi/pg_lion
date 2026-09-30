@@ -55,7 +55,8 @@ SELECT o.amopstrategy, o.amopopr::regoperator::text LIKE 'lion_hard.%' AS plante
             7 | f
             8 | f
             9 | f
-(5 rows)
+           10 | f
+(6 rows)
 
 CREATE TABLE lion_hard_ci (n citext);
 INSERT INTO lion_hard_ci VALUES ('Alice');

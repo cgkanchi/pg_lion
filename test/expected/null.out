@@ -225,7 +225,7 @@ SELECT lion_nullplan('SELECT count(*) FROM lion_null WHERE k IS NOT NULL');
                             lion_nullplan                            
 ---------------------------------------------------------------------
  Custom Scan (LionCount)
-   Lion Indexes: lion_null_k (all keys), lion_null_k (k IS NOT NULL)
+   Lion Indexes: lion_null_t (all rows), lion_null_k (k IS NOT NULL)
 (2 rows)
 
 SELECT lion_nullplan('SELECT k, count(*) FROM lion_null GROUP BY k');

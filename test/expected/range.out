@@ -206,7 +206,8 @@ SELECT o.amopstrategy, count(DISTINCT c.opcname) AS classes
             7 |      29
             8 |      29
             9 |      29
-(9 rows)
+           10 |      29
+(10 rows)
 
 SELECT c.opcname
   FROM pg_opclass c
