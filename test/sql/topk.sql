@@ -1,0 +1,239 @@
+-- The top k of a GROUP BY ordered by its count (DESIGN.md §36).
+--
+-- `GROUP BY g ORDER BY count(*) DESC LIMIT k`: each entry's header says how
+-- many rows its posting set holds, which bounds the group's count whatever
+-- the WHERE says.  The node reads every entry's header, counts the largest
+-- first, and stops once the k-th count cannot be passed by any entry left;
+-- only the groups it counted go up to the Sort and Limit above it.  When the
+-- candidates it kept cannot show that, it counts every group.  An expression
+-- of the grouping column (`GROUP BY g, g + 1`) splits no group and is
+-- computed from the column.  Every answer is checked against a SEQUENTIAL
+-- SCAN, as a multiset in both directions.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS citext;
+CREATE EXTENSION IF NOT EXISTS pg_lion_citext;
+RESET client_min_messages;
+SET synchronous_commit = on;
+SET default_statistics_target = 1000;
+SET max_parallel_workers_per_gather = 0;
+
+/*
+ * lion_tq() runs q with the LionCount pushdown and every other plan
+ * disabled, then as a sequential scan with the pushdown off, and compares the
+ * two as multisets.  It says whether the node was used, and whether it was a
+ * top k.
+ */
+CREATE FUNCTION lion_tq(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	used boolean := false;
+	topk boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_hashagg', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionCount\)' THEN
+			used := true;
+		END IF;
+		IF ln ~ 'Top K:' THEN
+			topk := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_tq_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_hashagg', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_tq_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_tq_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_tq_on EXCEPT ALL SELECT * FROM lion_tq_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_tq_off EXCEPT ALL SELECT * FROM lion_tq_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_tq_on, lion_tq_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN topk THEN 'top k' WHEN used THEN 'every group'
+					   ELSE 'no pushdown' END, nrows);
+END $$;
+
+/* The node's own lines of EXPLAIN ANALYZE, with every other plan disabled. */
+CREATE FUNCTION lion_trun(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_hashagg', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF ln ~ '(Top K|Group Key|Lion Indexes|LionCount)' THEN
+			RETURN NEXT regexp_replace(ln, '\s+\(actual.*$', '');
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('enable_hashagg', 'on', true);
+END $$;
+
+/*
+ * 20 heavy groups of 100 to 2000 rows (group 2000 ties with 1019), 4000
+ * light ones of 5 rows, and 2500 NULLs - the largest group of all - in an
+ * order that scatters every group over the heap.  h cuts across all of them;
+ * light says which rows are the light groups'.
+ */
+CREATE TABLE tk (id int, g int, h int, light bool, s text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO tk
+SELECT row_number() OVER (ORDER BY md5(x.g::text || '/' || x.n::text)),
+	   x.g, (x.n % 7), x.light, 'v' || (x.g % 50)
+FROM (SELECT 1000 + k AS g, n, false AS light
+	  FROM generate_series(1, 20) k, generate_series(1, k * 100) n
+	  UNION ALL
+	  SELECT 2000, n, false FROM generate_series(1, 1900) n
+	  UNION ALL
+	  SELECT 10000 + (n % 4000), n, true FROM generate_series(1, 20000) n
+	  UNION ALL
+	  SELECT NULL, n, false FROM generate_series(1, 2500) n) x;
+CREATE INDEX tk_g ON tk USING lion (g);
+CREATE INDEX tk_h ON tk USING lion (h);
+CREATE INDEX tk_light ON tk USING lion (light);
+VACUUM ANALYZE tk;
+
+-- 1. The top 5, the NULL group first: five groups counted of 4022.
+SELECT lion_tq('SELECT g, count(*) FROM tk GROUP BY g ORDER BY count(*) DESC LIMIT 5');
+SELECT lion_trun('SELECT g, count(*) FROM tk GROUP BY g ORDER BY count(*) DESC LIMIT 5');
+SELECT g, count(*) FROM tk GROUP BY g ORDER BY count(*) DESC LIMIT 5;
+
+-- 2. A tie at the cut: every group tied with the k-th comes out when the
+--    ORDER BY breaks ties, or under WITH TIES.
+SELECT lion_tq('SELECT g, count(*) AS c FROM tk GROUP BY g ORDER BY c DESC, g LIMIT 3');
+SELECT lion_trun('SELECT g, count(*) AS c FROM tk GROUP BY g ORDER BY c DESC, g LIMIT 3');
+SELECT g, count(*) AS c FROM tk GROUP BY g ORDER BY c DESC, g LIMIT 3;
+SELECT g, count(*) AS c FROM tk GROUP BY g ORDER BY c DESC, g DESC LIMIT 3;
+SELECT lion_tq('SELECT count(*) AS c FROM tk GROUP BY g ORDER BY c DESC FETCH FIRST 3 ROWS WITH TIES');
+SELECT count(*) AS c FROM tk GROUP BY g ORDER BY c DESC FETCH FIRST 3 ROWS WITH TIES;
+
+-- 3. OFFSET adds to k; the count need not be printed; count(col) of a column
+--    no row of the group has NULL is the group's count.
+SELECT lion_tq('SELECT g, count(*) FROM tk GROUP BY g ORDER BY count(*) DESC, g LIMIT 4 OFFSET 3');
+SELECT lion_tq('SELECT g FROM tk GROUP BY g ORDER BY count(*) DESC, g LIMIT 4');
+SELECT lion_tq('SELECT g, count(h) FROM tk WHERE h IS NOT NULL GROUP BY g ORDER BY count(h) DESC, g LIMIT 4');
+SELECT lion_tq('SELECT g, count(g) FROM tk WHERE g IS NOT NULL GROUP BY g ORDER BY 2 DESC, g LIMIT 4');
+
+-- 4. A WHERE on another column: the bounds are the rows of the entries, the
+--    counts some seventh of them.
+SELECT lion_tq('SELECT g, count(*) FROM tk WHERE h = 3 GROUP BY g ORDER BY count(*) DESC, g LIMIT 5');
+SELECT lion_trun('SELECT g, count(*) FROM tk WHERE h = 3 GROUP BY g ORDER BY count(*) DESC, g LIMIT 5');
+-- ... and one that leaves the heavy groups nothing: every candidate's count
+-- ties with the bounds left, so every group is counted instead.
+SELECT lion_tq('SELECT g, count(*) FROM tk WHERE light GROUP BY g ORDER BY count(*) DESC, g LIMIT 5');
+SELECT lion_trun('SELECT g, count(*) FROM tk WHERE light GROUP BY g ORDER BY count(*) DESC, g LIMIT 5');
+-- ... which the ORDER BY without a tie-breaker does not need.
+SELECT lion_tq('SELECT count(*) FROM tk WHERE light GROUP BY g ORDER BY count(*) DESC LIMIT 5');
+
+-- 5. `g <> c` and `g IS NOT NULL` take entries out whole: the NULL group
+--    and 1020's are never counted.
+SELECT lion_tq('SELECT g, count(*) FROM tk WHERE g <> 1020 GROUP BY g ORDER BY count(*) DESC, g LIMIT 3');
+SELECT lion_trun('SELECT g, count(*) FROM tk WHERE g <> 1020 GROUP BY g ORDER BY count(*) DESC, g LIMIT 3');
+SELECT lion_tq('SELECT g, count(*) FROM tk WHERE g IS NOT NULL GROUP BY g ORDER BY count(*) DESC LIMIT 2');
+
+-- 6. Declined: an ORDER BY that is not the count descending, a HAVING, a
+--    DISTINCT, a window function, a LIMIT only known at run time, a count
+--    of the group column that is 0 in the NULL group, and a column with few
+--    groups for the k.
+SELECT lion_tq('SELECT g, count(*) FROM tk GROUP BY g ORDER BY count(*), g LIMIT 3');
+SELECT lion_tq('SELECT g, count(*) FROM tk GROUP BY g ORDER BY g LIMIT 3');
+SELECT lion_tq('SELECT g, count(*) FROM tk GROUP BY g HAVING count(*) > 1 ORDER BY count(*) DESC, g LIMIT 3');
+SELECT lion_tq('SELECT DISTINCT count(*) FROM tk GROUP BY g ORDER BY count(*) DESC LIMIT 3');
+SELECT lion_tq('SELECT g, count(*), rank() OVER (ORDER BY count(*) DESC) FROM tk GROUP BY g ORDER BY count(*) DESC, g LIMIT 3');
+SELECT lion_tq('SELECT g, count(g) FROM tk GROUP BY g ORDER BY count(g) DESC, g LIMIT 3');
+SELECT lion_tq('SELECT h, count(*) FROM tk GROUP BY h ORDER BY count(*) DESC LIMIT 3');
+PREPARE tkp(int) AS SELECT g, count(*) FROM tk GROUP BY g ORDER BY count(*) DESC, g LIMIT $1;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE tkp(2);
+EXECUTE tkp(2);
+RESET plan_cache_mode;
+DEALLOCATE tkp;
+SET pg_lion.enable_topk = off;
+SELECT lion_tq('SELECT g, count(*) FROM tk GROUP BY g ORDER BY count(*) DESC, g LIMIT 3');
+RESET pg_lion.enable_topk;
+
+-- 7. Rows the snapshot does not see are still in the entries' counts, which
+--    only bound the groups': half of 1020 deleted puts it behind 1010.
+BEGIN;
+DELETE FROM tk WHERE g = 1020 AND id % 2 = 0;
+SELECT lion_tq('SELECT g, count(*) FROM tk WHERE g IS NOT NULL GROUP BY g ORDER BY count(*) DESC, g LIMIT 12');
+SELECT g, count(*) FROM tk WHERE g = 1020 GROUP BY g ORDER BY count(*) DESC LIMIT 1;
+ROLLBACK;
+DELETE FROM tk WHERE g = 1019;
+SELECT lion_tq('SELECT g, count(*) FROM tk GROUP BY g ORDER BY count(*) DESC, g LIMIT 3');
+VACUUM tk;
+SELECT lion_tq('SELECT g, count(*) FROM tk GROUP BY g ORDER BY count(*) DESC, g LIMIT 3');
+
+-- 8. A rescan per outer row finds the groups again, under each row's WHERE.
+SET enable_seqscan = off;
+SET enable_hashagg = off;
+EXPLAIN (COSTS OFF)
+SELECT v.x, s.g, s.c
+FROM (VALUES (1), (5)) v(x),
+	 LATERAL (SELECT g, count(*) AS c FROM tk WHERE h = v.x
+			  GROUP BY g ORDER BY count(*) DESC, g LIMIT 2) s
+ORDER BY v.x, s.c DESC, s.g;
+SELECT v.x, s.g, s.c
+FROM (VALUES (1), (5)) v(x),
+	 LATERAL (SELECT g, count(*) AS c FROM tk WHERE h = v.x
+			  GROUP BY g ORDER BY count(*) DESC, g LIMIT 2) s
+ORDER BY v.x, s.c DESC, s.g;
+RESET enable_seqscan;
+RESET enable_hashagg;
+SELECT v.x, s.g, s.c
+FROM (VALUES (1), (5)) v(x),
+	 LATERAL (SELECT g, count(*) AS c FROM tk WHERE h = v.x
+			  GROUP BY g ORDER BY count(*) DESC, g LIMIT 2) s
+ORDER BY v.x, s.c DESC, s.g;
+
+-- 9. Expressions of the grouping column split no group: `GROUP BY g, g + 1`
+--    is g's groups, and the plan computes g + 1 from g.  With every group too.
+SELECT lion_tq('SELECT g, g + 1, (g * 2)::text, count(*) FROM tk GROUP BY g, g + 1, (g * 2)::text ORDER BY count(*) DESC LIMIT 4');
+SELECT lion_trun('SELECT g + 1, count(*) FROM tk GROUP BY g + 1, g ORDER BY count(*) DESC LIMIT 4');
+SELECT g - 1, g, count(*) FROM tk GROUP BY g - 1, g ORDER BY count(*) DESC LIMIT 4;
+SELECT lion_tq('SELECT g, g % 3, count(*) FROM tk GROUP BY g, g % 3');
+-- ... but not a volatile one, one of another column, or one alone.
+SELECT lion_tq('SELECT g, count(*) FROM tk GROUP BY g, g + (random() * 0)::int ORDER BY count(*) DESC LIMIT 2');
+SELECT lion_tq('SELECT g, h + 1, count(*) FROM tk WHERE g < 1005 GROUP BY g, h + 1');
+SELECT lion_tq('SELECT g + 1, count(*) FROM tk GROUP BY g + 1 ORDER BY count(*) DESC LIMIT 2');
+-- ... nor one of a column whose equal values need not be the same: 'A' and
+-- 'a' are one entry of citext, and two groups of (c, c::text).
+CREATE TABLE tkc (c citext) WITH (autovacuum_enabled = off);
+INSERT INTO tkc SELECT CASE WHEN i % 3 = 0 THEN 'A' WHEN i % 3 = 1 THEN 'a'
+							ELSE 'k' || i END
+FROM generate_series(1, 3000) i;
+CREATE INDEX tkc_c ON tkc USING lion (c);
+VACUUM ANALYZE tkc;
+SELECT lion_tq('SELECT count(*) FROM tkc GROUP BY c ORDER BY count(*) DESC LIMIT 3');
+SELECT lion_tq('SELECT c::text, count(*) FROM tkc GROUP BY c, c::text ORDER BY count(*) DESC, 1 LIMIT 3');
+SELECT c::text, count(*) FROM tkc GROUP BY c, c::text ORDER BY count(*) DESC, 1 LIMIT 3;
+
+DROP FUNCTION lion_trun(text);
+DROP FUNCTION lion_tq(text);
+DROP TABLE tk, tkc;

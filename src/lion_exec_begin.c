@@ -789,6 +789,28 @@ lion_begin_decode(LionCountScanState *st, CustomScan *cscan,
 		if (st->allattno != 0 && !st->sumall)
 			elog(ERROR, "LionCount: a column for every row without a sum");
 	}
+	{
+		List	   *topk = (List *) list_nth(cscan->custom_private,
+											 LION_PRIV_TOPK);
+
+		/*
+		 * The top k by count (DESIGN.md §36) is made of one grouping column
+		 * walked in one table, counted a group at a time.
+		 */
+		st->topkn = 0;
+		if (topk != NIL)
+		{
+			if (list_length(topk) != 3 || linitial_int(topk) <= 0 ||
+				lsecond_int(topk) < linitial_int(topk) ||
+				st->groupattno == 0 || st->groupattno2 != 0 ||
+				st->distattno != 0 || st->sumall || priv->partlist != NIL ||
+				priv->coal != NIL)
+				elog(ERROR, "LionCount: a top k of another shape");
+			st->topkn = linitial_int(topk);
+			st->topkcand = lsecond_int(topk);
+			st->topkstrict = (lthird_int(topk) != 0);
+		}
+	}
 }
 
 /* GROUP BY coalesce(g, c) (DESIGN.md §10): c and its equality */

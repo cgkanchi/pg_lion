@@ -532,6 +532,10 @@ working around a bad choice:
   at each range of 64 heap blocks, which value of each column every row has (DESIGN.md §34): three
   or more columns, and two where that is cheaper than the nested loop over their entries. Off, a
   `GROUP BY` of three or more columns goes to the ordinary plan and one of two to the nested loop.
+- `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
+  that can be among the first `k`: each key's entry records how many rows it holds, which bounds
+  its count, so the largest of those are counted first and the rest are never read once they cannot
+  catch up (DESIGN.md §36). Off, every group is counted.
 - `pg_lion.enable_plain_scan`: let the planner use plain and index-only scans of Lion indexes
   (`amgettuple`, DESIGN.md §29). Off, Lion indexes are planned for bitmap scans only, as GIN
   indexes are, and every other index's scans are unaffected - where `enable_indexscan = off` would
