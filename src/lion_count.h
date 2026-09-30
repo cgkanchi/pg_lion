@@ -1086,6 +1086,15 @@ extern LionOrderWalk *lion_order_walk_begin(Relation index, AttrNumber attno,
 extern bool lion_order_walk_next(LionOrderWalk *w, ItemPointer tid);
 extern void lion_order_walk_counts(LionOrderWalk *w, int64 *entries,
 								   int64 *leaves);
+
+/*
+ * The number of the entry the walk's last TID came from - they count from 1
+ * in each walk - and the way to pass over the rest of that entry: the caller
+ * has found, from one row of it, that none of its rows will do (DESIGN.md
+ * §30.11, "A filter on the walked column").
+ */
+extern int64 lion_order_walk_entryno(LionOrderWalk *w);
+extern void lion_order_walk_skip_entry(LionOrderWalk *w);
 extern void lion_order_walk_end(LionOrderWalk *w);
 
 /*
@@ -1102,7 +1111,8 @@ extern bool lion_sets_satisfiable(int nsets, LionPostingSet *sets,
 
 /*
  * One bound of a range: `key <strategy> value`, strategy one of
- * LION_STRAT_LT .. LION_STRAT_GT.
+ * LION_STRAT_LT .. LION_STRAT_GT, or LION_STRAT_NE - a HOLE, which fails the
+ * one entry the value names and bounds the walk on neither side (§35).
  *
  * It is compared the way §21's probe resolution says a value of its type is
  * compared with the stored keys (lion_probe_init()): the column's own proc 4,
@@ -1133,6 +1143,10 @@ typedef struct LionRangeBound
  *			then starts where the column does.
  *	upper	the upper bound a walk of what lies ABOVE the range descends to
  *			when it is the only one (nupper == 1), or -1.
+ *	nholes	how many of the bounds are holes (`<>`, DESIGN.md §35).  A range
+ *			with one is no RUN of entries: a bucket's summary (§32) may hold
+ *			the hole's rows, and the entries outside it are not what the
+ *			complement (§28) subtracts, so it is walked key by key, inside.
  *	empty	a bound is NULL, so nothing can satisfy the range.
  *
  * The bound values are the caller's and must outlive the range.
@@ -1147,6 +1161,7 @@ typedef struct LionRange
 	int			lower;
 	int			upper;
 	int			nupper;
+	int			nholes;
 	bool		empty;
 } LionRange;
 
@@ -1162,6 +1177,8 @@ extern void lion_range_add(LionRange *range, Relation index,
 						   Datum value, bool isnull, Oid collation);
 extern int	lion_range_test(LionRange *range, const LionEntryTuple *entry);
 extern bool lion_range_fails_upper(LionRange *range,
+								   const LionEntryTuple *entry);
+extern bool lion_range_fails_lower(LionRange *range,
 								   const LionEntryTuple *entry);
 extern BlockNumber lion_range_first_leaf(Relation index, LionRange *range);
 extern BlockNumber lion_range_last_leaf(Relation index, LionRange *range);

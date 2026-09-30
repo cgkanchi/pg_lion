@@ -98,6 +98,9 @@ typedef struct LionScanOpaqueData
 	Relation	index;
 	ScanKey		keys;
 	int			nkeys;
+	MemoryContext keycxt;		/* the scan's own keys as rewritten
+								 * (lion_scan_keys_rewrite()), reset by
+								 * amrescan */
 
 	/*
 	 * The plain scan (liongettuple(), DESIGN.md §29).  The source is opened
@@ -265,6 +268,8 @@ lion_scan_reset(LionScanOpaque so)
 	so->pos = 0;
 	if (so->gtcxt != NULL)
 		MemoryContextReset(so->gtcxt);
+	if (so->keycxt != NULL)
+		MemoryContextReset(so->keycxt);
 }
 
 void
@@ -290,6 +295,8 @@ lionendscan(IndexScanDesc scan)
 		lion_scan_reset(so);
 		if (so->gtcxt != NULL)
 			MemoryContextDelete(so->gtcxt);
+		if (so->keycxt != NULL)
+			MemoryContextDelete(so->keycxt);
 		if (so->lo != NULL)
 			pfree(so->lo);
 		if (so->cols != NULL)
@@ -869,9 +876,10 @@ lion_emit_all_keys(Relation index, LionState *col, TIDBitmap *tbm,
 }
 
 /*
- * Is this scan key one of the range comparisons of DESIGN.md §28?  Only a
- * SCALAR column has them: a multi-key class's strategies are §17's, and its
- * validator refuses 6 .. 9 anyway.
+ * Is this scan key one of the range comparisons of DESIGN.md §28, or the
+ * hole of a `<>` (§35), which a walk of the column answers as it answers a
+ * range?  Only a SCALAR column has them: a multi-key class's strategies are
+ * §17's, and its validator refuses 6 .. 10 anyway.
  */
 static bool
 lion_scankey_is_range(LionState *col, ScanKey skey)
@@ -879,7 +887,7 @@ lion_scankey_is_range(LionState *col, ScanKey skey)
 	return !col->multikey &&
 		(skey->sk_flags & (SK_SEARCHNULL | SK_SEARCHNOTNULL |
 						   SK_SEARCHARRAY)) == 0 &&
-		LION_STRAT_IS_RANGE(skey->sk_strategy);
+		LION_STRAT_IS_WALK(skey->sk_strategy);
 }
 
 /*
@@ -2386,6 +2394,133 @@ lion_getbitmap_choice(LionScanOpaque so, LionScanChoice *ch, TIDBitmap *tbm)
 }
 
 /*
+ * `k <> ANY (array)` (DESIGN.md §35): amsearcharray hands the planner's
+ * ScalarArrayOpExpr to us for every strategy of the family, `<>` included.  It
+ * is true of a row whose k differs from SOME element: with two distinct
+ * non-NULL elements that is every row with a value - no value equals both -
+ * with one it is every row but that value's, and with none (an empty or
+ * all-NULL array, or a NULL one) it is no row, a comparison with NULL being
+ * NULL.  So the key is rewritten as the one it means before anything
+ * classifies it: `IS NOT NULL`, the `<>` of the one element, or a `<>` of
+ * NULL, which selects nothing as every strict key with a NULL value does.
+ * The elements are told apart with the comparison the probe resolution gives
+ * values of their type among themselves (the family's proc 4, which the
+ * validator insists on beside `<>`), under the column's collation - two
+ * values it calls equal are one value to the column's equality too.
+ *
+ * Returns keys itself when there is nothing to rewrite, and a copy in cxt
+ * otherwise, whose values live there too.
+ */
+static void
+lion_scan_key_ne_any(Relation index, LionState *col, ScanKey k)
+{
+	int			ndistinct = 0;
+	Datum		one = (Datum) 0;
+
+	if ((k->sk_flags & SK_ISNULL) == 0)
+	{
+		ArrayType  *arr = DatumGetArrayTypeP(k->sk_argument);
+		Oid			elemtype = ARR_ELEMTYPE(arr);
+		int16		elmlen;
+		bool		elmbyval;
+		char		elmalign;
+		Datum	   *elems;
+		bool	   *nulls;
+		int			nelems;
+		LionProbe	probe;
+		int			i;
+
+		get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+		deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
+						  &elems, &nulls, &nelems);
+		lion_probe_init(index, col, k->sk_subtype, &probe);
+		for (i = 0; i < nelems && ndistinct < 2; i++)
+		{
+			if (nulls[i])
+				continue;
+			if (ndistinct == 0)
+			{
+				one = elems[i];
+				ndistinct = 1;
+				continue;
+			}
+			if (!probe.hassort)
+				elog(ERROR, "lion index \"%s\": no comparison for the elements of `<> ANY`",
+					 RelationGetRelationName(index));
+			if (DatumGetInt32(FunctionCall2Coll(&probe.sortproc,
+												col->collation,
+												elems[i], one)) != 0)
+				ndistinct = 2;
+		}
+	}
+
+	k->sk_flags &= ~SK_SEARCHARRAY;
+	if (ndistinct == 2)
+	{
+		/* every row with a value: IS NOT NULL, as core builds that key */
+		k->sk_flags |= SK_ISNULL | SK_SEARCHNOTNULL;
+		k->sk_strategy = InvalidStrategy;
+		k->sk_subtype = InvalidOid;
+		k->sk_argument = (Datum) 0;
+	}
+	else if (ndistinct == 1)
+		k->sk_argument = one;
+	else
+	{
+		k->sk_flags |= SK_ISNULL;
+		k->sk_argument = (Datum) 0;
+	}
+}
+
+static ScanKey
+lion_scan_keys_rewrite(Relation index, LionIndexState *ix, ScanKey keys,
+					   int nkeys, MemoryContext cxt)
+{
+	ScanKey		out = NULL;
+	MemoryContext oldcxt = NULL;
+	int			i;
+
+	for (i = 0; i < nkeys; i++)
+	{
+		ScanKey		k = &keys[i];
+
+		if ((k->sk_flags & (SK_SEARCHARRAY | SK_SEARCHNULL |
+							SK_SEARCHNOTNULL)) != SK_SEARCHARRAY ||
+			k->sk_strategy != LION_STRAT_NE ||
+			k->sk_attno < 1 || k->sk_attno > ix->ncolumns ||
+			lion_column(ix, k->sk_attno)->multikey)
+			continue;
+		if (out == NULL)
+		{
+			oldcxt = MemoryContextSwitchTo(cxt);
+			out = (ScanKey) palloc(sizeof(ScanKeyData) * nkeys);
+			memcpy(out, keys, sizeof(ScanKeyData) * nkeys);
+		}
+		lion_scan_key_ne_any(index, lion_column(ix, k->sk_attno), &out[i]);
+	}
+	if (out == NULL)
+		return keys;
+	MemoryContextSwitchTo(oldcxt);
+	return out;
+}
+
+/* ... the scan's own keys, into its keycxt */
+static void
+lion_scan_adopt_keys(LionScanOpaque so, IndexScanDesc scan)
+{
+	so->keys = scan->keyData;
+	so->nkeys = scan->numberOfKeys;
+	if (so->keycxt == NULL)
+		so->keycxt = AllocSetContextCreate(GetMemoryChunkContext(so),
+										   "lion index scan keys",
+										   ALLOCSET_SMALL_SIZES);
+	else
+		MemoryContextReset(so->keycxt);
+	so->keys = lion_scan_keys_rewrite(so->index, so->ix, so->keys, so->nkeys,
+									  so->keycxt);
+}
+
+/*
  * The bitmap scan proper, on the keys so->keys[0 .. so->nkeys - 1].
  */
 static int64
@@ -2430,8 +2565,7 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	 */
 	so->ix = lion_get_index_state(scan->indexRelation);
 	so->index = scan->indexRelation;
-	so->keys = scan->keyData;
-	so->nkeys = scan->numberOfKeys;
+	lion_scan_adopt_keys(so, scan);
 
 	pgstat_count_index_scan(scan->indexRelation);
 #if PG_VERSION_NUM >= 180000
@@ -3802,7 +3936,7 @@ lion_source_open(Relation index, ScanKey keys, int nkeys, bool keeppins,
 	so->ix = lion_get_index_state(index);
 	so->cols = (LionScanCol *) palloc0(sizeof(LionScanCol) * so->ix->ncolumns);
 	so->index = index;
-	so->keys = keys;
+	so->keys = lion_scan_keys_rewrite(index, so->ix, keys, nkeys, cxt);
 	so->nkeys = nkeys;
 	MemoryContextSwitchTo(oldcxt);
 
@@ -3860,8 +3994,7 @@ liongettuple(IndexScanDesc scan, ScanDirection dir)
 		/* A relcache invalidation may have replaced the cached state. */
 		so->ix = lion_get_index_state(scan->indexRelation);
 		so->index = scan->indexRelation;
-		so->keys = scan->keyData;
-		so->nkeys = scan->numberOfKeys;
+		lion_scan_adopt_keys(so, scan);
 
 		pgstat_count_index_scan(scan->indexRelation);
 #if PG_VERSION_NUM >= 180000
@@ -4485,10 +4618,11 @@ lion_order_next_value(LionOrderWalk *w)
 
 			/*
 			 * Descending, the entries above an upper bound come first and
-			 * are passed over; below a lower bound of an ordered range every
-			 * entry further left is below it too.
+			 * are passed over, as is a hole (DESIGN.md §35); below a lower
+			 * bound of an ordered range every entry further left is below it
+			 * too.
 			 */
-			if (!w->range.ordered || lion_range_fails_upper(&w->range, entry))
+			if (!w->range.ordered || !lion_range_fails_lower(&w->range, entry))
 				continue;
 			return false;
 		}
@@ -4645,6 +4779,19 @@ lion_order_walk_counts(LionOrderWalk *w, int64 *entries, int64 *leaves)
 {
 	*entries = w->entries;
 	*leaves = w->leaves;
+}
+
+int64
+lion_order_walk_entryno(LionOrderWalk *w)
+{
+	return w->entries;
+}
+
+void
+lion_order_walk_skip_entry(LionOrderWalk *w)
+{
+	w->entry = NULL;
+	w->pos = w->ncodes;
 }
 
 void

@@ -367,6 +367,17 @@ lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 										  cmptype, LION_CMP_PROC)))
 			return NULL;
 	}
+	else if (kind == LION_CLAUSE_NE)
+	{
+		/*
+		 * `<>` (DESIGN.md §35) has to be the index's strategy 10 for the pair:
+		 * the promise that c's entry is exactly the rows `<>` rejects.  The
+		 * entry is looked up as an equality's is, which the checks below make
+		 * possible.
+		 */
+		if (get_op_opfamily_strategy(opno, idx->opfamily[i]) != LION_STRAT_NE)
+			return NULL;
+	}
 	else if (OidIsValid(opno) &&
 			 get_op_opfamily_strategy(opno, idx->opfamily[i]) != LION_STRAT_EQUAL)
 		return NULL;
@@ -923,6 +934,48 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 			out->opno = op->opno;
 			out->cmptype = exprType(out->val);
 			out->kind = LION_CLAUSE_EQ;
+		}
+		else if (out->strategy == LION_STRAT_NE)
+		{
+			/*
+			 * `col <> c` (DESIGN.md §35): every row but those of c's entry
+			 * and the NULL one, which it subtracts - a negated source, as
+			 * `IS NOT NULL` is, so it is not taken where one is not (under an
+			 * OR).  `<>` commutes like `=`, so either side may hold the
+			 * column; a literal NULL makes it true of no row.
+			 */
+			Oid			neop = op->opno;
+
+			if (!allow_negated)
+				return false;
+			if (IsA(left, Var) && lion_is_value_expr(right, false))
+			{
+				out->var = (Var *) left;
+				out->val = right;
+			}
+			else if (lion_is_value_expr(left, false) && IsA(right, Var))
+			{
+				/*
+				 * The column on the left, as a range's is: the operator is
+				 * also what a row is tested with (lion_count_scan_filtered()),
+				 * column first.
+				 */
+				neop = get_commutator(op->opno);
+				if (!OidIsValid(neop) ||
+					lion_op_roaring_strategy(neop, &opfamily,
+											 &lefttype) != LION_STRAT_NE)
+					return false;
+				out->var = (Var *) right;
+				out->val = left;
+			}
+			else
+				return false;
+			if (IsA(out->val, Const) && ((Const *) out->val)->constisnull)
+				return false;
+
+			out->opno = neop;
+			out->cmptype = exprType(out->val);
+			out->kind = LION_CLAUSE_NE;
 		}
 		else if (LION_STRAT_IS_RANGE(out->strategy))
 		{
