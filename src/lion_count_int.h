@@ -217,6 +217,9 @@ typedef struct LionCountCtx
 	int			batchmax;		/* flush the list once it holds this many */
 	bool		tids_sorted;	/* they came out in order (they always do) */
 	int64		recheck_count;	/* rows counted by the batches flushed so far */
+	bool	   *visout;			/* lion_recheck_visible(): where each TID's
+								 * answer goes, by its place in tids; NULL for
+								 * a count */
 
 	/*
 	 * An EXISTENCE test rather than a count (DESIGN.md §26): stop at the first
@@ -960,6 +963,72 @@ extern void lion_count_container_masks(LionCountCtx *cx,
 									   const LionContainer *c, uint64 members,
 									   uint64 allvis);
 extern void lion_recheck_flush(LionCountCtx *cx);
+extern int64 lion_recheck_visible(LionCountCtx *cx, bool *vis);
+
+/*
+ * A cursor on a grouped walk's heap (lion_count_groups_copy(),
+ * lion_count_groups_decode()): the container key it stands at, and which
+ * cursor it is.
+ */
+typedef struct LionGroupEnt
+{
+	uint32		ckey;
+	int32		g;
+} LionGroupEnt;
+
+static inline void
+lion_group_heap_push(LionGroupEnt *heap, int *nheap, uint32 ckey, int g)
+{
+	int			i = (*nheap)++;
+
+	while (i > 0)
+	{
+		int			parent = (i - 1) / 2;
+
+		if (heap[parent].ckey <= ckey)
+			break;
+		heap[i] = heap[parent];
+		i = parent;
+	}
+	heap[i].ckey = ckey;
+	heap[i].g = g;
+}
+
+static inline LionGroupEnt
+lion_group_heap_pop(LionGroupEnt *heap, int *nheap)
+{
+	LionGroupEnt top = heap[0];
+	LionGroupEnt last;
+	int			i = 0;
+
+	Assert(*nheap > 0);
+	if (--(*nheap) == 0)
+		return top;
+
+	last = heap[*nheap];
+	for (;;)
+	{
+		int			l = 2 * i + 1;
+		int			r = l + 1;
+		int			small = i;
+		uint32		smallkey = last.ckey;
+
+		if (l < *nheap && heap[l].ckey < smallkey)
+		{
+			small = l;
+			smallkey = heap[l].ckey;
+		}
+		if (r < *nheap && heap[r].ckey < smallkey)
+			small = r;
+		if (small == i)
+			break;
+		heap[i] = heap[small];
+		i = small;
+	}
+	heap[i] = last;
+	return top;
+}
+
 extern int64 lion_count_sources_run(Relation heap, Snapshot snapshot,
 									int nsources, LionCountSource *sources,
 									LionCountStats *stats, LionVisCache *cache,

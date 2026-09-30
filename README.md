@@ -167,6 +167,13 @@ its ranges and counts every group there, and a `Finalize HashAggregate` above th
 the groups' partial counts up (`Parallel Custom Scan (LionCount)`, `Key Ranges` in `EXPLAIN
 ANALYZE`; DESIGN.md §10, "A GROUP BY in parallel").
 
+A `GROUP BY` of three or more indexed columns (`SELECT country, event_type, device, count(*)
+FROM events GROUP BY country, event_type, device`) is counted in one walk of the index whatever
+the number of combinations: at each range of 64 heap blocks it reads which value of each column
+every row has, and counts each row under its combination (`Group Strategy: Decoded` in EXPLAIN,
+under a `Finalize HashAggregate`; DESIGN.md §34). On 5M rows it took 77 ms for 1,000 combinations
+and 179 ms for 100,000, where a HashAggregate over the table took 900 ms and 1.9 s.
+
 On a partitioned table the pushdown counts each partition the planner keeps, with that partition's
 own Lion indexes (DESIGN.md §16), and every `WHERE` clause needs one in every partition counted -
 except a clause the partition's bounds imply. `kind = 'a'` over a table partitioned by `kind`,
@@ -605,10 +612,11 @@ per execution; a volatile one like `random()` goes to the ordinary plan) on any 
 columns included, a boolean column tested by itself (`flag`, `NOT flag`, `flag IS TRUE`, `flag IS
 NOT FALSE`), an `OR` of such clauses and of `AND`s of them, nested as deep as the query writes it
 (`(a = 1 AND flag IS NOT TRUE) OR b = 2` is distributed into the arms it stands for, up to 1000
-clauses in all), a `GROUP BY` of one or two indexed columns - or of `coalesce(col, constant)` of
+clauses in all), a `GROUP BY` of up to eight indexed columns - three or more over one table that
+is not partitioned, with a WHERE of no range (DESIGN.md §34) - or of `coalesce(col, constant)` of
 one, whose NULL rows are counted in the constant's group, merged with that key's rows when the
-column has it - and a `HAVING` over the counts it computes (a `HAVING` with a correlated subquery,
-or a `GROUP BY` of three or more columns, goes to the ordinary plan). `count(DISTINCT col)` is
+column has it - and a `HAVING` over the counts it computes (a `HAVING` with a correlated subquery
+goes to the ordinary plan). `count(DISTINCT col)` is
 answered for an indexed column (DESIGN.md §26), and for a column a unique index proves unique - a
 primary key - as the `count(col)` it equals: `count(*)` where the column is NOT NULL, whether or not
 it has a lion index (a single-column, immediate, non-partial btree index under the `DISTINCT`'s

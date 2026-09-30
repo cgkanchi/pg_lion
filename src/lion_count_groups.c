@@ -17,69 +17,6 @@
  * --------------------------------------------------------------------- */
 
 /*
- * A group's cursor on the grouped walk's heap: the container key it stands
- * at, and which group it is.
- */
-typedef struct LionGroupEnt
-{
-	uint32		ckey;
-	int32		g;
-} LionGroupEnt;
-
-static void
-lion_group_heap_push(LionGroupEnt *heap, int *nheap, uint32 ckey, int g)
-{
-	int			i = (*nheap)++;
-
-	while (i > 0)
-	{
-		int			parent = (i - 1) / 2;
-
-		if (heap[parent].ckey <= ckey)
-			break;
-		heap[i] = heap[parent];
-		i = parent;
-	}
-	heap[i].ckey = ckey;
-	heap[i].g = g;
-}
-
-static LionGroupEnt
-lion_group_heap_pop(LionGroupEnt *heap, int *nheap)
-{
-	LionGroupEnt top = heap[0];
-	LionGroupEnt last;
-	int			i = 0;
-
-	Assert(*nheap > 0);
-	if (--(*nheap) == 0)
-		return top;
-
-	last = heap[*nheap];
-	for (;;)
-	{
-		int			l = 2 * i + 1;
-		int			r = l + 1;
-		int			small = i;
-		uint32		smallkey = last.ckey;
-
-		if (l < *nheap && heap[l].ckey < smallkey)
-		{
-			small = l;
-			smallkey = heap[l].ckey;
-		}
-		if (r < *nheap && heap[r].ckey < smallkey)
-			small = r;
-		if (small == i)
-			break;
-		heap[i] = heap[small];
-		i = small;
-	}
-	heap[i] = last;
-	return top;
-}
-
-/*
  * How many groups one lion_count_groups_copy() takes at most.  Each holds a
  * cursor - a page image for a CHAIN set - and a pin on the posting leaf it
  * stands on, so a batch takes what the cursors of one count may hold open

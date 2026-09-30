@@ -494,6 +494,14 @@ lion_open_relation(LionCountScanState *st, int p)
 		st->groupidx = lion_open_index(st->groupidxoid);
 		st->groupidx2 = lion_open_index(st->groupidxoid2);
 		st->fgidx = lion_open_index(st->fgidxoid);
+		if (st->decode != NULL)
+		{
+			LionDecodeRun *dr = st->decode;
+			int			c;
+
+			for (c = 0; c < dr->ncol; c++)
+				dr->idx[c] = lion_open_index(dr->idxoid[c]);
+		}
 	}
 	else
 	{
@@ -542,6 +550,22 @@ lion_open_relation(LionCountScanState *st, int p)
 							   lion_heap_attno_in(st->heap, st->heapoid,
 												  st->innerattno),
 							   false);
+	if (st->decode != NULL)
+	{
+		LionDecodeRun *dr = st->decode;
+		int			c;
+
+		for (c = 0; c < dr->ncol; c++)
+		{
+			if (dr->idx[c] != NULL)
+				dr->idxcol[c] =
+					lion_index_col_for(dr->idx[c],
+									   lion_heap_attno_in(st->heap,
+														  st->heapoid,
+														  dr->attno[c]),
+									   false);
+		}
+	}
 
 	/*
 	 * index_beginscan() would take a relation-level predicate lock on each of
@@ -562,6 +586,16 @@ lion_open_relation(LionCountScanState *st, int p)
 			PredicateLockRelation(st->groupidx, snapshot);
 		if (st->groupidx2 != NULL)
 			PredicateLockRelation(st->groupidx2, snapshot);
+		if (st->decode != NULL)
+		{
+			int			c;
+
+			for (c = 0; c < st->decode->ncol; c++)
+			{
+				if (st->decode->idx[c] != NULL)
+					PredicateLockRelation(st->decode->idx[c], snapshot);
+			}
+		}
 	}
 
 	/*
@@ -600,6 +634,20 @@ lion_close_relation(LionCountScanState *st)
 	if (st->fgidx != NULL)		/* a plain table's only */
 		index_close(st->fgidx, AccessShareLock);
 	st->fgidx = NULL;
+	if (st->decode != NULL)		/* ... and so is the decoded walk */
+	{
+		LionDecodeRun *dr = st->decode;
+		int			c;
+
+		lion_decode_reset(st);
+		for (c = 0; c < dr->ncol; c++)
+		{
+			if (dr->idx[c] != NULL)
+				index_close(dr->idx[c], AccessShareLock);
+			dr->idx[c] = NULL;
+			dr->idxcol[c] = 0;
+		}
+	}
 	st->innerkey = NULL;
 	st->innerisnull = NULL;
 	st->ninnerkey = 0;
@@ -1511,6 +1559,65 @@ lion_begin_sources(LionCountScanState *st)
 		palloc0(sizeof(LionCountSource) * (st->nsource + 1));
 }
 
+/*
+ * The decoded walk of DESIGN.md §34, when the plan's GROUP BY columns are
+ * counted by it (LION_FLAG_DECODE): the columns from LION_PRIV_GROUPN, and
+ * the run's memory.  Its indexes are opened with the relation's
+ * (lion_open_relation()).
+ */
+static void
+lion_begin_decoded_walk(LionCountScanState *st, CustomScan *cscan,
+						EState *estate)
+{
+	List	   *gn = (List *) list_nth(cscan->custom_private, LION_PRIV_GROUPN);
+	int			flags = lfourth_int((List *) list_nth(cscan->custom_private,
+													  LION_PRIV_INTS));
+	LionDecodeRun *dr;
+	List	   *attnos;
+	List	   *oids;
+	int			c;
+
+	st->decode = NULL;
+	if ((flags & LION_FLAG_DECODE) == 0)
+	{
+		if (gn != NIL)
+			elog(ERROR, "LionCount: malformed decoded walk");
+		return;
+	}
+	if (list_length(gn) != 2 || !IsA(linitial(gn), IntList) ||
+		!IsA(lsecond(gn), OidList))
+		elog(ERROR, "LionCount: malformed decoded walk");
+	attnos = (List *) linitial(gn);
+	oids = (List *) lsecond(gn);
+	if (list_length(attnos) < 2 || list_length(attnos) > LION_MAX_GROUPCOLS ||
+		list_length(oids) != list_length(attnos) ||
+		st->groupattno != (AttrNumber) linitial_int(attnos) ||
+		st->groupattno2 != 0 || st->distattno != 0 || st->hascoal ||
+		st->sumall || !st->hasgroupidx || st->hasrange || st->npart > 0 ||
+		st->joinclause >= 0)
+		elog(ERROR, "LionCount: malformed decoded walk");
+
+	dr = (LionDecodeRun *) MemoryContextAllocZero(estate->es_query_cxt,
+												  sizeof(LionDecodeRun));
+	dr->ncol = list_length(attnos);
+	for (c = 0; c < dr->ncol; c++)
+	{
+		dr->attno[c] = (AttrNumber) list_nth_int(attnos, c);
+		dr->idxoid[c] = list_nth_oid(oids, c);
+		if (dr->attno[c] <= 0 || !OidIsValid(dr->idxoid[c]))
+			elog(ERROR, "LionCount: malformed decoded walk");
+		dr->chunkcxt[c] = AllocSetContextCreate(estate->es_query_cxt,
+												"LionCount decoded chunk",
+												ALLOCSET_DEFAULT_SIZES);
+	}
+	dr->passcxt = AllocSetContextCreate(estate->es_query_cxt,
+										"LionCount decoded pass",
+										ALLOCSET_DEFAULT_SIZES);
+	dr->tally = lion_decode_tally_create(estate->es_query_cxt,
+										 get_hash_memory_limit());
+	st->decode = dr;
+}
+
 void
 lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 {
@@ -1546,6 +1653,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_fact_group(st, cscan);
 	lion_begin_run_state(st, cscan);
 	lion_begin_contexts(st, estate);
+	lion_begin_decoded_walk(st, cscan, estate);
 	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
 	st->writtenrels = lion_statement_written_rels(estate);
 	lion_begin_join_child(st, node, cscan, estate, eflags);

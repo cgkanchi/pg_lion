@@ -236,6 +236,7 @@ lion_finish_run(LionCountScanState *st)
 	lion_posting_set_release(&st->groupset);
 	lion_posting_set_release(&st->groupset2);
 	st->outeropen = false;
+	lion_decode_reset(st);
 	lion_join_batch_reset(st);
 	lion_release_where(st);
 
@@ -403,7 +404,7 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 	 * begin.  (The partitioned path opens one per partition either way; a scan
 	 * that is only begun holds nothing, so it costs the flag it sets.)
 	 */
-	if (!st->scanning && st->ingroupitem < 0)
+	if (!st->scanning && st->ingroupitem < 0 && st->decode == NULL)
 	{
 		lion_entry_scan_begin_range(&st->escan, st->groupidx, st->groupidxcol,
 									st->hasrange ? &st->range : NULL);
@@ -450,6 +451,7 @@ lion_reset_run(LionCountScanState *st)
 	st->inneridx = 0;
 	st->coalcount = 0;
 	st->coalwalked = false;
+	lion_decode_reset(st);
 	lion_release_where(st);
 
 	/* The FK-side join's collected filters (in outercxt, reset below). */

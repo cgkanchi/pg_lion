@@ -300,8 +300,9 @@ SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND id = 5');
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND a = 4');
 -- no equality key and no GROUP BY at all
 SELECT lion_pd('SELECT count(*) FROM lion_pdt');
--- GROUP BY an unindexed column, and by more than two columns
+-- GROUP BY an unindexed column
 SELECT lion_pd('SELECT id, count(*) FROM lion_pdt WHERE a = 3 GROUP BY id');
+-- three indexed columns are the decoded walk of DESIGN.md section 34
 SELECT lion_pd('SELECT a, b, c, count(*) FROM lion_pdt GROUP BY a, b, c');
 -- two indexed columns are the nested loop of DESIGN.md section 20, below
 SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
