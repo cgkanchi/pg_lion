@@ -1,0 +1,156 @@
+-- The SQL counts and a key of the default collation (DESIGN.md §9, "SQL
+-- surface").
+--
+-- lion_index_count(idx, key) is `SELECT count(*) ... WHERE col = key`, which
+-- compares under the key's collation when the key brings one of its own and
+-- under the column's otherwise.  A literal brings the default collation,
+-- which gives way to the column's; an explicit COLLATE "default" does not -
+-- but the planner folds it into the literal, and the call cannot tell the two
+-- apart.  The functions took every key of the default collation for one that
+-- brings none, and on a case-insensitive column counted 'ABC' under
+-- `'abc'::text COLLATE "default"`, where the query does not (2026-09-29
+-- review).  Both readings are now taken, and the count is made only where
+-- both make it: a key of the default collation is refused on a column of a
+-- nondeterministic collation, and counted as before on any other.
+--
+-- Nondeterministic collations need ICU; that half is skipped without it
+-- (test/expected/countcoll_default_1.out).
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET max_parallel_workers_per_gather = 0;
+-- ---------- a column of a deterministic collation: counted, either way ----------
+CREATE TABLE lcd_d (id int, t text COLLATE "C") WITH (autovacuum_enabled = off);
+INSERT INTO lcd_d SELECT g, (ARRAY['abc', 'ABC', 'Abc', 'xyz', 'XYZ'])[g % 5 + 1]
+  FROM generate_series(1, 1000) g;
+CREATE INDEX lcd_d_t ON lcd_d USING lion (t);
+SELECT lion_index_count('lcd_d_t', 'abc'::text COLLATE "default") AS explicit,
+	   lion_index_count('lcd_d_t', 'abc'::text) AS implicit,
+	   (SELECT count(*) FROM lcd_d WHERE t = 'abc' COLLATE "default") AS query_default,
+	   (SELECT count(*) FROM lcd_d WHERE t = 'abc') AS query;
+ explicit | implicit | query_default | query 
+----------+----------+---------------+-------
+      200 |      200 |           200 |   200
+(1 row)
+
+SELECT lion_index_count_any('lcd_d_t', ARRAY['abc', 'xyz'] COLLATE "default") AS explicit,
+	   lion_index_count_any('lcd_d_t', ARRAY['abc', 'xyz']) AS implicit,
+	   (SELECT count(*) FROM lcd_d WHERE t = ANY (ARRAY['abc', 'xyz'])) AS query;
+ explicit | implicit | query 
+----------+----------+-------
+      400 |      400 |   400
+(1 row)
+
+DROP TABLE lcd_d;
+-- ---------- a column of a nondeterministic collation ----------
+SET client_min_messages = warning;
+DO $$
+BEGIN
+	IF getdatabaseencoding() = 'UTF8' THEN
+		CREATE COLLATION lcd_ci (provider = icu, locale = 'und-u-ks-level2',
+								 deterministic = false);
+	END IF;
+EXCEPTION WHEN feature_not_supported THEN
+	NULL;						-- a build without ICU
+END $$;
+RESET client_min_messages;
+SELECT NOT EXISTS (SELECT 1 FROM pg_collation WHERE collname = 'lcd_ci')
+	   AS lcd_skip \gset
+\if :lcd_skip
+\echo 'no ICU collations, or not a UTF8 database: skipped'
+\else
+-- 'abc', 'ABC' and 'Abc' are one key of the case-insensitive index
+CREATE TABLE lcd (id int, m int, s text COLLATE lcd_ci)
+  WITH (autovacuum_enabled = off);
+INSERT INTO lcd SELECT g, g % 2, (ARRAY['abc', 'ABC', 'Abc', 'xyz', 'XYZ'])[g % 5 + 1]
+  FROM generate_series(1, 1000) g;
+CREATE INDEX lcd_s ON lcd USING lion (s);
+CREATE INDEX lcd_m ON lcd USING lion (m);
+VACUUM (FREEZE, ANALYZE) lcd;
+-- the query under "default" counts 'abc' alone, under the column's all three
+SELECT (SELECT count(*) FROM lcd WHERE s = 'abc' COLLATE "default") AS query_default,
+	   (SELECT count(*) FROM lcd WHERE s = 'abc') AS query;
+ query_default | query 
+---------------+-------
+           200 |   600
+(1 row)
+
+SELECT (SELECT count(*) FROM lcd WHERE s = ANY (ARRAY['abc'] COLLATE "default")) AS query_default,
+	   (SELECT count(*) FROM lcd WHERE s = ANY (ARRAY['abc'])) AS query;
+ query_default | query 
+---------------+-------
+           200 |   600
+(1 row)
+
+-- an explicit COLLATE "default": every SQL count refuses it
+SELECT lion_index_count('lcd_s', 'abc'::text COLLATE "default");
+ERROR:  could not determine which collation to use for a count through index "lcd_s"
+SELECT count FROM lion_index_count_stats('lcd_s', 'abc'::text COLLATE "default");
+ERROR:  could not determine which collation to use for a count through index "lcd_s"
+SELECT lion_index_count_any('lcd_s', ARRAY['abc'] COLLATE "default");
+ERROR:  could not determine which collation to use for a count through index "lcd_s"
+SELECT lion_index_count('lcd_s', 'abc'::text COLLATE "default", 'lcd_m', 0);
+ERROR:  could not determine which collation to use for a count through index "lcd_s"
+SELECT lion_index_count('lcd_m', 0, 'lcd_s', 'abc'::text COLLATE "default");
+ERROR:  could not determine which collation to use for a count through index "lcd_s"
+PREPARE lcd_p(text) AS SELECT lion_index_count('lcd_s', $1 COLLATE "default");
+EXECUTE lcd_p('abc');
+ERROR:  could not determine which collation to use for a count through index "lcd_s"
+DEALLOCATE lcd_p;
+-- no COLLATE: the same call, as the plan has it, refused alike
+SELECT lion_index_count('lcd_s', 'abc'::text);
+ERROR:  could not determine which collation to use for a count through index "lcd_s"
+SELECT lion_index_count_any('lcd_s', ARRAY['abc']);
+ERROR:  could not determine which collation to use for a count through index "lcd_s"
+PREPARE lcd_p(text) AS SELECT lion_index_count('lcd_s', $1);
+EXECUTE lcd_p('abc');
+ERROR:  could not determine which collation to use for a count through index "lcd_s"
+DEALLOCATE lcd_p;
+-- the column's collation named, or brought by a key of the column: counted,
+-- and the count is the query's
+SELECT lion_index_count('lcd_s', 'abc'::text COLLATE lcd_ci) AS lion,
+	   (SELECT count(*) FROM lcd WHERE s = 'abc') AS query;
+ lion | query 
+------+-------
+  600 |   600
+(1 row)
+
+SELECT count FROM lion_index_count_stats('lcd_s', 'abc'::text COLLATE lcd_ci);
+ count 
+-------
+   600
+(1 row)
+
+SELECT lion_index_count_any('lcd_s', ARRAY['abc', 'xyz'] COLLATE lcd_ci) AS lion,
+	   (SELECT count(*) FROM lcd WHERE s = ANY (ARRAY['abc', 'xyz'])) AS query;
+ lion | query 
+------+-------
+ 1000 |  1000
+(1 row)
+
+SELECT lion_index_count('lcd_s', 'abc'::text COLLATE lcd_ci, 'lcd_m', 0) AS lion,
+	   (SELECT count(*) FROM lcd WHERE s = 'abc' AND m = 0) AS query;
+ lion | query 
+------+-------
+  300 |   300
+(1 row)
+
+SELECT lion_index_count('lcd_s', (SELECT s FROM lcd WHERE id = 5)) AS lion,
+	   (SELECT count(*) FROM lcd WHERE s = (SELECT s FROM lcd WHERE id = 5)) AS query;
+ lion | query 
+------+-------
+  600 |   600
+(1 row)
+
+-- and GROUP BY s, which groups under the column's collation, as before
+SELECT groups, count FROM lion_index_count_group_stats('lcd_s');
+ groups | count 
+--------+-------
+      2 |  1000
+(1 row)
+
+DROP TABLE lcd;
+DROP COLLATION lcd_ci;
+\endif

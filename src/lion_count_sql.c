@@ -320,13 +320,23 @@ lion_count_column_collation(Relation heap, Relation index, AttrNumber col)
  * brings one of its own (an explicit COLLATE, or a column of another
  * collation), and otherwise under the column's: a literal or a parameter
  * brings the default collation, which gives way to the column's in the
- * parser's rule for an operator's inputs.  (So an explicit COLLATE "default"
- * is taken for no COLLATE at all.)  Two deterministic collations agree on
- * which values are equal - each calls them equal when their bytes are - and
- * a nondeterministic one agrees with no other: `c COLLATE case_insensitive =
- * 'abc'` counts 'ABC' and `c = 'abc'` does not.  So a count under another
- * collation than the index's is refused when either is nondeterministic, and
- * made otherwise.
+ * parser's rule for an operator's inputs.  Two deterministic collations agree
+ * on which values are equal - each calls them equal when their bytes are -
+ * and a nondeterministic one agrees with no other: `c COLLATE
+ * case_insensitive = 'abc'` counts 'ABC' and `c = 'abc'` does not.  So a
+ * count under another collation than the index's is refused when either is
+ * nondeterministic, and made otherwise.
+ *
+ * A key of the default collation is the one the call cannot read: an explicit
+ * COLLATE "default" does not give way to the column's, and the planner folds
+ * it into the literal or the parameter, where nothing is left to tell it
+ * from a key that brings no collation of its own.  Both readings are taken:
+ * the count is made only when both would make it.  They part only on a
+ * column of a nondeterministic collation, which one reading compares under
+ * and the other does not, and there the call must name the collation.  Taken
+ * for no COLLATE at all, `lion_index_count('i', 'abc'::text COLLATE
+ * "default")` counted 'ABC' on a case-insensitive column, where the query
+ * under "default" does not (2026-09-29 review).
  */
 static void
 lion_count_check_collation(Relation heap, Relation index, AttrNumber col,
@@ -339,8 +349,23 @@ lion_count_check_collation(Relation heap, Relation index, AttrNumber col,
 		return;					/* the key type is not collatable */
 	if (!OidIsValid(collation) || collation == DEFAULT_COLLATION_OID)
 		collation = lion_count_column_collation(heap, index, col);
-	if (!OidIsValid(collation) || collation == idxcoll)
+	if (!OidIsValid(collation))
 		return;
+	if (collation == idxcoll)
+	{
+		if (keycoll == DEFAULT_COLLATION_OID &&
+			collation != DEFAULT_COLLATION_OID &&	/* always deterministic */
+			!get_collation_isdeterministic(collation))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDETERMINATE_COLLATION),
+					 errmsg("could not determine which collation to use for a count through index \"%s\"",
+							RelationGetRelationName(index)),
+					 errdetail("The key is of the default collation, which stands for the column's nondeterministic collation \"%s\" without a COLLATE clause and for \"default\" with COLLATE \"default\"; the two do not agree on which values are equal, and the call cannot tell them apart.",
+							   get_collation_name(collation)),
+					 errhint("Give the key the column's collation, as in COLLATE \"%s\", or count with the query itself.",
+							 get_collation_name(collation))));
+		return;
+	}
 	if (get_collation_isdeterministic(collation) &&
 		get_collation_isdeterministic(idxcoll))
 		return;

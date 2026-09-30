@@ -321,7 +321,10 @@ and these functions are for testing, diagnostics and the occasional direct count
 
 The counts answer exactly what the equivalent `SELECT count(*)` answers under the same snapshot,
 and ask for what it would: SELECT on the table or its indexed columns, and no row-level security in
-force for the caller.  They take one INDEX, and an index belongs to one table, so they count that
+force for the caller.  A count under a collation the index does not compare in is an error, never
+a different number; on a column of a nondeterministic collation that includes a key of the default
+collation - a literal's, which the call cannot tell from an explicit `COLLATE "default"` - so there
+the key names the column's collation (`'abc'::text COLLATE case_insensitive`).  They take one INDEX, and an index belongs to one table, so they count that
 table's own rows and nothing else.  On an inheritance parent that is the parent's rows alone - the
 count of `SELECT count(*) FROM ONLY parent WHERE ...`, never the children's, even though a plain
 `FROM parent` includes them.  A partitioned table's index has no storage and is refused
