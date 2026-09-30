@@ -345,19 +345,43 @@ expressions as the table's owner (DESIGN.md §7).
     src/lion_tid.h          TID <-> (container key, 15-bit lo) encoding; 9 offset bits at 8K pages
     src/lion_container.[ch] container library (array/bitset/run), set algebra, unit-tested standalone
     src/lion_sparse.[ch]    sparse (container key, offset) segments, unit-tested standalone
-    src/lion.h, lion_pages.c on-disk structs; meta/entry/leaf primitives, page splits
+    src/lion.h              on-disk structs, the relation state, and the page layer's and the AM's functions
+    src/lion_pages.c        index pages: initializing, deleting, recycling; the items of container pages
+    src/lion_meta.c         the meta page
+    src/lion_state.c        per-relation state: columns, opclass procedures and order; usability checks; keys
+    src/lion_entry.c        entry tuples, and the max_entries cardinality guard
+    src/lion_posting_put.c  writing container chains: putting items, spilling an INLINE entry, page splits
     src/lion_compat.h       the differences between PostgreSQL 16, 17, 18, 19 and master
     src/lion_wal.[ch]       the WAL shim every write path calls, and the custom resource manager
     src/lion_dir.c          the sorted entry directory: a Lehman & Yao B-tree keyed by the index key
     src/lion_posting.c      the per-key posting tree: a B-tree over container keys, GIN's shape
-    src/lion_am.c           handler, reloptions, amvalidate, cost estimate, buildempty, _PG_init hook/GUC
+    src/lion_am.c           handler, reloptions, amvalidate, table AMs, buildempty, _PG_init hook/GUC
+    src/lion_amcost.c       amcostestimate: the cost of plain and bitmap scans
     src/lion_build.c        ambuild via tuplesort (hash, key, tid code); INLINE entries or per-key posting trees
     src/lion_scan.c         amgetbitmap, and amgettuple for plain index scans
     src/lion_insert.c       aminsert (serialised on the directory leaf; bitset in-place fast path)
     src/lion_vacuum.c       ambulkdelete with cleanup locks on every page, two-pass cancellable protocol
-    src/lion_funcs.c        lion_index_stats(), lion_index_verify() and the other diagnostics
-    src/lion_count.[ch]     lion_count_keys(): VM-interlocked counting, per-block batched heap recheck
-    src/lion_customscan.c   create_upper_paths_hook -> CustomPath/CustomScan "LionCount"; set_join_pathlist_hook -> "LionSemiJoin"/"LionAntiJoin"
+    src/lion_funcs.[ch]     lion_index_stats() and the other diagnostics; lion_funcs.h is private to them
+    src/lion_verify*.c      lion_index_verify(): pages and posting sets, the directory, rechecks and
+                            heapallindexed, summary posting sets
+    src/lion_count.h        the count engine's interface - lion_count_keys(): VM-interlocked counting,
+                            per-block batched heap recheck - and lion_count_int.h what its files share:
+    src/lion_set.c          locating posting sets, the list pin budget, the lookup walk
+    src/lion_set_copy.c     private copies of posting sets, spilled to a file when too big
+    src/lion_cursor.c       container cursors over one posting set
+    src/lion_expr.c         expression cursors over boolean expressions of sets; the stream the scans read
+    src/lion_vis.c          the visibility map a container at a time, and the per-query visibility cache
+    src/lion_count.c        counting a container against the map and the heap; the merge
+    src/lion_count_groups.c the groups of a walk counted together
+    src/lion_count_shared.c the copy the participants of a parallel plan share
+    src/lion_rangesrc.c     a range as a source: collected, or probed at the other sources' rows
+    src/lion_range.c        range restrictions, and iterating every entry of an index
+    src/lion_count_sql.c    the SQL count functions (lion_index_count() and the others)
+    src/lion_customscan.h   the LionCount custom scan's private header, shared by its planner half:
+    src/lion_plan_*.c       create_upper_paths_hook -> CustomPath/CustomScan "LionCount"; set_join_pathlist_hook
+                            -> "LionSemiJoin"/"LionAntiJoin"; index matching, partitions, the cost model
+    src/lion_exec_*.c       and its executor half: begin, locating the WHERE sets, counting, the FK-side
+                            join, the run and parallel DSM, EXPLAIN
     src/lion_costs.[ch]     the cost model's constants as planner settings (pg_lion.*_cost)
     src/lion_fkjoin.[ch]    the FK-side joins a LionCount answers (fact JOIN dim, EXISTS / NOT EXISTS), and the semi/anti join paths
     src/lion_ordered.c      CustomScan "LionOrdered": lion-filtered scans in a btree's or a lion column's order

@@ -275,7 +275,7 @@ extern void lion_wal_abort(LionWalState *state);
  * VACUUM's REGROW window (DESIGN.md §11 and §25).
  *
  * A container that grew while it was being filtered is re-placed through the
- * general machinery of lion_pages.c - the same code an INSERT goes down - and
+ * general machinery of the page layer - the same code an INSERT goes down - and
  * that machinery has no idea that the item it is writing has had TIDs taken
  * out of it.  It matters, because a record that removes a TID has to replay
  * under a CLEANUP lock on the page it removes it from, and nothing else about

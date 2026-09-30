@@ -1483,7 +1483,7 @@ lion_container_to_array(const LionContainer *c, uint16 *out)
 /* ----------------------------------------------------------------
  *				images for the count engine
  *
- * Two readers the count engine (lion_count.c) used to carry copies of, and
+ * Two readers the count engine (lion_count.h) used to carry copies of, and
  * which met page bytes without the masks above: an ARRAY member or a RUN past
  * the range wrote up to 12 KiB past a 4 KiB image, or set block bits past
  * LION_BLOCKS_PER_CONTAINER through undefined shifts (2026-09-27 review).
