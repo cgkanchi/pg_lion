@@ -4026,6 +4026,21 @@ struct LionOrderWalk
 	LionRange	range;			/* every range key of the column, ANDed */
 	int			phase;			/* LOW_PHASE_* */
 
+	/*
+	 * `col = ANY (array)`: the list's values in the directory's order, each
+	 * walked as a range of its own - the range keys' bounds and `>= v AND
+	 * <= v` - so the walk descends to each value instead of reading every
+	 * entry below it.  npoints < 0: no list.
+	 */
+	MemoryContext cxt;			/* the walk's, for the ranges it makes */
+	Datum	   *points;
+	int			npoints;
+	int			point;			/* the value walked now, an index of points[] */
+	Oid			pointtype;
+	Oid			pointfunc;
+	Oid			pointcoll;
+	LionRange	base;			/* the range keys' bounds alone */
+
 	/* the directory leaf being walked, copied */
 	PGAlignedBlock *leaf;
 	bool		haspage;
@@ -4091,6 +4106,130 @@ lion_order_expand(LionOrderWalk *w, const LionContainer *c)
 	}
 }
 
+typedef struct LionOrderPointSort
+{
+	FmgrInfo   *sortproc;
+	Oid			collation;
+} LionOrderPointSort;
+
+static int
+lion_order_point_cmp(const void *a, const void *b, void *arg)
+{
+	LionOrderPointSort *ctx = (LionOrderPointSort *) arg;
+
+	return DatumGetInt32(FunctionCall2Coll(ctx->sortproc, ctx->collation,
+										   *(const Datum *) a,
+										   *(const Datum *) b));
+}
+
+/*
+ * The values of `col = ANY (array)` in the directory's order, without NULLs
+ * (no entry's key equals one) or duplicates (each would walk its entry
+ * again).  The planner takes such a key for a walk only when its operator is
+ * the column's own equality for the column's own type (lo_walk_clause()), so
+ * the probe resolution finds the column's comparison, which is the order the
+ * directory keeps its entries in.
+ */
+static void
+lion_order_points(LionOrderWalk *w, LionState *col, ScanKey k)
+{
+	ArrayType  *arr;
+	Oid			elemtype;
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+	LionProbe	probe;
+	LionOrderPointSort ctx;
+	int			n = 0;
+	int			i;
+
+	w->npoints = 0;
+	w->pointtype = k->sk_subtype;
+	w->pointfunc = k->sk_func.fn_oid;
+	w->pointcoll = k->sk_collation;
+	if (k->sk_flags & SK_ISNULL)
+		return;					/* `col = ANY (NULL)` selects nothing */
+
+	arr = DatumGetArrayTypeP(k->sk_argument);
+	elemtype = ARR_ELEMTYPE(arr);
+	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
+					  &elems, &nulls, &nelems);
+
+	lion_probe_init(w->index, col, w->pointtype, &probe);
+	if (!probe.hassort || !probe.hascmp || probe.needscan)
+		elog(ERROR, "lion index \"%s\": key column %d cannot walk the values of this list in its order",
+			 RelationGetRelationName(w->index), (int) w->attno);
+
+	w->points = (Datum *) palloc(sizeof(Datum) * Max(nelems, 1));
+	for (i = 0; i < nelems; i++)
+	{
+		if (!nulls[i])
+			w->points[n++] = elems[i];
+	}
+	ctx.sortproc = &probe.sortproc;
+	ctx.collation = col->collation;
+	if (n > 1)
+	{
+		int			m = 1;
+
+		qsort_arg(w->points, n, sizeof(Datum), lion_order_point_cmp, &ctx);
+		for (i = 1; i < n; i++)
+		{
+			if (lion_order_point_cmp(&w->points[m - 1], &w->points[i], &ctx) != 0)
+				w->points[m++] = w->points[i];
+		}
+		n = m;
+	}
+	w->npoints = n;
+	pfree(nulls);
+}
+
+/*
+ * Make the range of points[w->point]: the range keys' bounds and the value's
+ * own two, which are the ones the walk descends to - every entry the range
+ * selects equals the value, so it lies at or above the one and at or below
+ * the other, whatever else bounds it - and start the walk of it afresh.
+ */
+static void
+lion_order_point_range(LionOrderWalk *w)
+{
+	MemoryContext oldcxt = MemoryContextSwitchTo(w->cxt);
+	Datum		v = w->points[w->point];
+	int			ge;
+
+	w->range = w->base;
+	ge = w->range.nbounds;
+	lion_range_add(&w->range, w->index, LION_STRAT_GE, w->pointfunc,
+				   w->pointtype, v, false, w->pointcoll);
+	lion_range_add(&w->range, w->index, LION_STRAT_LE, w->pointfunc,
+				   w->pointtype, v, false, w->pointcoll);
+	w->range.lower = ge;
+	w->range.upper = ge + 1;
+
+	/* the bounds array may have moved; base's bounds are its prefix still */
+	w->base.bounds = w->range.bounds;
+	w->base.maxbounds = w->range.maxbounds;
+
+	w->started = false;
+	w->haspage = false;
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/* On to the list's next value in the walk's direction; false past the last. */
+static bool
+lion_order_next_point(LionOrderWalk *w)
+{
+	w->point += w->backward ? -1 : 1;
+	if (w->point < 0 || w->point >= w->npoints)
+		return false;
+	lion_order_point_range(w);
+	return true;
+}
+
 LionOrderWalk *
 lion_order_walk_begin(Relation index, AttrNumber attno, ScanKey keys, int nkeys,
 					  bool backward, int nulls, MemoryContext cxt)
@@ -4098,6 +4237,7 @@ lion_order_walk_begin(Relation index, AttrNumber attno, ScanKey keys, int nkeys,
 	MemoryContext oldcxt = MemoryContextSwitchTo(cxt);
 	LionOrderWalk *w = (LionOrderWalk *) palloc0(sizeof(LionOrderWalk));
 	LionState  *col = lion_index_column_state(index, attno);
+	ScanKey		listkey = NULL;
 	int			i;
 
 	if (col->multikey || !col->ordered)
@@ -4108,6 +4248,7 @@ lion_order_walk_begin(Relation index, AttrNumber attno, ScanKey keys, int nkeys,
 	w->attno = attno;
 	w->backward = backward;
 	w->nulls = nulls;
+	w->cxt = cxt;
 	lion_rightwalk_init(&w->leafwalk);
 	w->leaf = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 	w->ebuf = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
@@ -4135,8 +4276,19 @@ lion_order_walk_begin(Relation index, AttrNumber attno, ScanKey keys, int nkeys,
 			w->nulls = LION_ORDER_NULLS_NONE;
 			continue;
 		}
+		if (!col->multikey && (k->sk_flags & SK_SEARCHARRAY) &&
+			!(k->sk_flags & (SK_SEARCHNULL | SK_SEARCHNOTNULL)) &&
+			k->sk_strategy == LION_STRAT_EQUAL)
+		{
+			if (listkey != NULL)
+				elog(ERROR, "lion index \"%s\": an ordered walk takes one list",
+					 RelationGetRelationName(index));
+			listkey = k;
+			w->nulls = LION_ORDER_NULLS_NONE;
+			continue;
+		}
 		if (!lion_scankey_is_range(col, k))
-			elog(ERROR, "lion index \"%s\": an ordered walk takes only range keys",
+			elog(ERROR, "lion index \"%s\": an ordered walk takes only range keys and a list",
 				 RelationGetRelationName(index));
 		lion_range_add(&w->range, index, k->sk_strategy, k->sk_func.fn_oid,
 					   k->sk_subtype, k->sk_argument,
@@ -4146,6 +4298,20 @@ lion_order_walk_begin(Relation index, AttrNumber attno, ScanKey keys, int nkeys,
 
 	w->phase = (w->nulls == LION_ORDER_NULLS_FIRST) ? LOW_PHASE_NULLS_FIRST :
 		LOW_PHASE_VALUES;
+
+	/* a list: its values one at a time, from the first in the walk's order */
+	if (listkey != NULL && !w->range.empty)
+	{
+		lion_order_points(w, col, listkey);
+		w->base = w->range;
+		if (w->npoints == 0)
+			w->phase = LOW_PHASE_DONE;
+		else
+		{
+			w->point = backward ? w->npoints - 1 : 0;
+			lion_order_point_range(w);
+		}
+	}
 	if (w->range.empty)
 		w->phase = LOW_PHASE_DONE;
 
@@ -4459,7 +4625,8 @@ lion_order_walk_next(LionOrderWalk *w, ItemPointer tid)
 				(void) lion_order_null_entry(w);
 				break;
 			case LOW_PHASE_VALUES:
-				if (!lion_order_next_value(w))
+				if (!lion_order_next_value(w) &&
+					(w->points == NULL || !lion_order_next_point(w)))
 					w->phase = (w->nulls == LION_ORDER_NULLS_LAST) ?
 						LOW_PHASE_NULLS_LAST : LOW_PHASE_DONE;
 				break;
@@ -4491,5 +4658,7 @@ lion_order_walk_end(LionOrderWalk *w)
 	pfree(w->codes);
 	if (w->range.bounds != NULL)
 		pfree(w->range.bounds);
+	if (w->points != NULL)
+		pfree(w->points);
 	pfree(w);
 }
