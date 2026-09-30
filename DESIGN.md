@@ -16531,6 +16531,17 @@ adds `Keys Aggregated`, `Key Walks From Entry Counts` and, when it happened, `Ke
 
 Q4's 3.4M entries are the walk of every header, as for the top k of §36.
 
+### Not done in this version
+
+- **A heap with a few pages not all-visible counts every entry.** The proof is all or nothing, so
+  one insert since the last VACUUM sends each column's walk to the count of each of its entries -
+  cheap for a column of a few thousand keys, a GROUP BY walk's price for one of millions. The price
+  follows `allvisfrac`, which only VACUUM and ANALYZE refresh, so a table written to since is
+  still priced as the header walk. Correcting the headers' sums by the dirty pages alone would
+  need each dirty TID's key, which a dead item no longer has.
+- **A WHERE, a GROUP BY, a partitioned table**: each entry's rows would be its count against the
+  WHERE, per group - the walks of §10 with an argument per entry, not yet written.
+
 ### Tests
 
 `test/sql/keyaggs.sql`: every answer against a sequential scan. int2, int4 with NULLs, int8 whose
