@@ -14014,7 +14014,17 @@ than overruns (§30.4).
   and the switch, which need the set's size, can act; or once the memo holds half of `hash_mem`.
   The counts are hints, and decide only when the set is built: whether the switch comes is
   decided on the set built, and in the regression suite it comes at the same entry it came at
-  before. The build takes over what the
+  before. And a walk that does not go in heap order is built for at once: once
+  `LO_LAZY_ORDER_KEYS` (64) keys have been evaluated, if a quarter of them or more lay behind the
+  key evaluated before them. A btree walked in an order the heap does not follow - a score, a
+  random key: `ORDER BY score DESC LIMIT 100` - hands out TIDs at random container keys, half of
+  them behind the last, and each such probe seeks every set again by a descent, at about eight
+  build containers' cost; the budget above counted it at five, and over 5M rows a 0.67% filter
+  under `ORDER BY <random numeric> DESC LIMIT 100` probed 2,012 keys before it built, 29.2 ms
+  against 10.0 ms with the set built at the start. With the rule it builds after 64: 11.4 ms
+  against 10.7. A lion column's walk goes back only between entries (the `here IN (...)` walk of
+  §30.11 "Lists" probed 468 keys, none behind the one before, and stays lazy), and a btree
+  correlated with the heap seldom goes back. The build takes over what the
   walk met (`lo_lazy_convert()`): each memo key's bitmap goes to its container's slot, so the
   members already returned count as met and the switch does not fetch them again. A small set,
   whose build is cheap, is built at once, before the walk has cost more than a few dozen probes:

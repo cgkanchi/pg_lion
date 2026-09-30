@@ -156,6 +156,22 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 #define LO_LAZY_RESTART_WORK	4
 #define LO_LAZY_MAX_WALK		(4 * LO_SWITCH_MIN_WALK)
 
+/*
+ * ... and a walk that does not go in heap order is built for at once: once
+ * LO_LAZY_ORDER_KEYS keys have been evaluated, if one in LO_LAZY_BACK_SHARE
+ * of them or more lay behind the key evaluated before it.  A btree walked in
+ * an order the heap does not follow - a score, a random key - hands out TIDs
+ * at random container keys, half of them behind the last, and each of those
+ * seeks every set of the tree again by a descent: a probe of a key cost as
+ * much as eight containers of the build, and the probes of 2,012 keys of a
+ * 5M-row table (a 0.67% filter, ORDER BY a random score LIMIT 100) came to
+ * 29 ms where the build and the walk took 10 (2026-09-30).  A lion column's
+ * walk goes back only between entries, and a btree correlated with the heap
+ * seldom does.
+ */
+#define LO_LAZY_ORDER_KEYS		64
+#define LO_LAZY_BACK_SHARE		4
+
 #define LO_EXPR_LIONQUALS	0
 #define LO_EXPR_ORDQUALS	1
 #define LO_EXPR_LIONQUAL	2
@@ -337,6 +353,9 @@ typedef struct LionOrderedState
 	double		lazywork;
 	double		lazybudget;
 	double		lazymembers;	/* at most this many members: the sets' hints */
+	uint64		lazyevals;		/* keys evaluated since the set was started */
+	uint64		lazyback;		/* ... that lay behind the key before them */
+	uint32		lazylast;		/* the key evaluated last */
 	uint64		lazykeys;		/* EXPLAIN ANALYZE: keys evaluated */
 
 	/*
@@ -2283,6 +2302,9 @@ lo_lazy_begin(LionOrderedState *st)
 
 	st->memobytes = 0;
 	st->lazywork = 0.0;
+	st->lazyevals = 0;
+	st->lazyback = 0;
+	st->lazylast = 0;
 	st->lazybudget = Max((double) LO_LAZY_MIN_WORK, containers);
 	st->limit = get_hash_memory_limit();
 	st->exact = !st->lossyqual;
@@ -2413,6 +2435,12 @@ lo_lazy_find(LionOrderedState *st, ItemPointer tid)
 	{
 		LionContainer *c;
 		bool		found;
+
+		/* how far the walk goes in heap order (LO_LAZY_ORDER_KEYS) */
+		if (st->lazyevals > 0 && ckey < st->lazylast)
+			st->lazyback++;
+		st->lazyevals++;
+		st->lazylast = ckey;
 
 		MemoryContextReset(st->probecxt);
 		c = lo_probe_node(st, st->tree, ckey);
@@ -3198,16 +3226,18 @@ lo_next(ScanState *ss)
 		CHECK_FOR_INTERRUPTS();
 
 		/*
-		 * The lazy set's probes have cost what building it would, or the
-		 * walk has gone as far as the switch below would let it go were the
-		 * set as big as its entries' counts say - or far enough anyway that
-		 * the early stop and the switch should have the set's size to go by:
-		 * build it (§30.4, "The set, lazily").  Whether the switch comes is
-		 * decided on the set built, so a count that is off moves only when the
-		 * set is built.
+		 * The walk does not go in heap order, or the lazy set's probes have
+		 * cost what building it would, or the walk has gone as far as the
+		 * switch below would let it go were the set as big as its entries'
+		 * counts say - or far enough anyway that the early stop and the
+		 * switch should have the set's size to go by: build it (§30.4, "The
+		 * set, lazily").  Whether the switch comes is decided on the set
+		 * built, so a count that is off moves only when the set is built.
 		 */
 		if (st->lazy &&
-			(st->lazywork >= st->lazybudget ||
+			((st->lazyevals >= LO_LAZY_ORDER_KEYS &&
+			  st->lazyback * LO_LAZY_BACK_SHARE >= st->lazyevals) ||
+			 st->lazywork >= st->lazybudget ||
 			 (st->nsort > 0 && !st->noswitch &&
 			  st->scanwalked >= LO_SWITCH_MIN_WALK &&
 			  (double) st->scanwalked >=
