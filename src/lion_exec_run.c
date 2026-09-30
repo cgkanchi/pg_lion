@@ -502,6 +502,10 @@ lion_reset_run(LionCountScanState *st)
 	lion_join_batch_reset(st);
 	st->joinchilddone = false;
 
+	/* ... and the way the child is read, decided again at the next row */
+	st->joinbegun = false;
+	st->joinwalked = false;
+
 	/* ... and a fact column's groups: the rows put by, and the next turn */
 	st->fgturn = 0;
 	st->fgnrows = 0;

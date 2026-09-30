@@ -1,0 +1,411 @@
+-- FK-side join: a switch to a collected copy of the fact filters that comes
+-- out EMPTY part way through a run (DESIGN.md §27, "Probed, then
+-- collected").  The plans below probe the fact filters (the collection's pass
+-- is priced out of the planner's choice), and after a few keys the run
+-- collects them: the filters here never meet - x = 1 only on odd ids, kind =
+-- 'c' only on even ones - so the copy selects nothing, and no key after it
+-- is looked up.  How the run reads its child - a batch at a time in key
+-- order, or a row at a time - is decided once, at its first row, and the
+-- empty copy must not change it: it once did, and the batch in hand was
+-- dropped and the child read on, or read again, a row at a time.  Every
+-- answer is checked against the same query with the pushdown off: the
+-- upper node's anti, semi and inner joins handing up a row per dimension
+-- row, the semi and anti join paths, one batch and several, row at a time,
+-- in parallel, and rescanned.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+SET work_mem = '4MB';
+SET hash_mem_multiplier = 2;
+-- probe the filters; the run's own price of collecting them is made from
+-- the sets it located, and does not read this setting
+SET pg_lion.fkjoin_collect_container_cost = 1e9;
+
+/*
+ * lion_sw_node() is the Lion node of a query's EXPLAIN ANALYZE, joins
+ * disabled.  lion_sw() runs the query so, and again with the pushdown off and
+ * sequential scans only, and compares the two as multisets; it says which
+ * node ran, whether it walked the keys in key order - in one batch a run or
+ * in several - and whether a run switched to a copy that came out empty, how
+ * many times and after how many keys.  With `vague` it says only that a run
+ * did: a parallel plan's participants divide the keys among them, and a
+ * partitioned fact's leaves switch at keys that depend on how the batches
+ * fall.
+ */
+CREATE FUNCTION lion_sw_node(q text) RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE
+	e jsonb;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	EXECUTE 'EXPLAIN (ANALYZE, FORMAT JSON, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) ' || q
+		INTO e;
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	RETURN jsonb_path_query_first(e,
+		'$.** ? (@."Custom Plan Provider" like_regex "^Lion(Count|SemiJoin|AntiJoin)$")');
+END $$;
+
+CREATE FUNCTION lion_sw(q text, vague bool DEFAULT false) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	node jsonb;
+	how text;
+	sw bigint;
+	nrows bigint;
+	ndistinct bigint;
+	ndiff bigint;
+BEGIN
+	node := lion_sw_node(q);
+	IF node IS NULL THEN
+		how := 'not pushed down';
+	ELSE
+		sw := coalesce((node->>'Fact Filter Switches')::bigint, 0);
+		how := (node->>'Custom Plan Provider') ||
+			CASE WHEN (node->>'Parallel Aware')::bool THEN ', parallel' ELSE '' END ||
+			CASE WHEN node->>'Join Key Lookups' IS NULL THEN ', row at a time'
+				 WHEN vague THEN ', walked'
+				 WHEN (node->>'Join Key Batches')::bigint >
+					  (node->>'Actual Loops')::bigint
+				 THEN ', walked in batches' ELSE ', walked in one batch' END ||
+			CASE WHEN sw = 0 THEN ', probed'
+				 WHEN vague THEN ', switched'
+				 ELSE format(', switched %s after %s keys', sw,
+							 node->>'Fact Filter Keys Probed') END ||
+			CASE WHEN sw > 0 AND (node->>'Fact Filter Rows Collected')::bigint = 0
+				 THEN ' to an empty copy' ELSE '' END;
+	END IF;
+
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_sw_on AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_sw_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*), count(DISTINCT r) FROM lion_sw_on' INTO nrows, ndistinct;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_sw_on EXCEPT ALL SELECT * FROM lion_sw_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_sw_off EXCEPT ALL SELECT * FROM lion_sw_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_sw_on, lion_sw_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ (%s rows, %s distinct)',
+					  ndiff, nrows, ndistinct);
+	END IF;
+	RETURN format('%s: %s rows, %s distinct', how, nrows, ndistinct);
+END $$;
+
+/* EXPLAIN (COSTS OFF), joins disabled, without the "Disabled" lines of 18. */
+CREATE FUNCTION lion_sw_explain(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		CONTINUE WHEN ln ~ '^\s*Disabled: true$';
+		RETURN NEXT ln;
+	END LOOP;
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+END $$;
+
+/*
+ * The dimension: 3000 keys in three regions, 500 of them without fact rows.
+ * The fact: 60000 rows over keys 1 .. 2500; each filter keeps thousands of
+ * them, the two together none.  The outer side of the join paths: 4000 rows
+ * whose keys repeat, some NULL.
+ */
+CREATE TABLE lion_swd (pk int8 PRIMARY KEY, region text NOT NULL)
+	WITH (parallel_workers = 2);
+INSERT INTO lion_swd
+SELECT i, (ARRAY['eu', 'us', 'ap'])[1 + i % 3] FROM generate_series(1, 3000) i;
+CREATE TABLE lion_swf (id int NOT NULL, fk int8 NOT NULL, x int NOT NULL,
+					   kind text NOT NULL);
+INSERT INTO lion_swf
+SELECT i, 1 + (i * 7919) % 2500, i % 10,
+	   CASE WHEN i % 2 = 0 THEN 'c' ELSE 'z' END
+FROM generate_series(1, 60000) i;
+CREATE INDEX lion_swf_fk ON lion_swf USING lion (fk);
+CREATE INDEX lion_swf_x ON lion_swf USING lion (x);
+CREATE INDEX lion_swf_kind ON lion_swf USING lion (kind);
+CREATE TABLE lion_swo (k int8, tag int NOT NULL) WITH (parallel_workers = 2);
+INSERT INTO lion_swo
+SELECT CASE WHEN i % 97 = 0 THEN NULL ELSE 1 + (i * 31) % 2800 END, i % 3
+FROM generate_series(1, 4000) i;
+VACUUM (FREEZE, ANALYZE) lion_swd;
+VACUUM (FREEZE, ANALYZE) lion_swf;
+VACUUM (FREEZE, ANALYZE) lion_swo;
+
+-- 1. The upper node, a row handed up per dimension row (the semi and anti
+-- join paths off, so that it is the upper node): the anti join's rows are
+-- every dimension row, and the rows after the switch are looked up no more.
+SET pg_lion.enable_semijoin = off;
+SELECT * FROM lion_sw_explain($$
+	SELECT d.region, count(*) FROM lion_swd d
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+					  AND f.x = 1 AND f.kind = 'c')
+	GROUP BY d.region$$);
+SELECT lion_sw($$
+	SELECT d.region, count(*) FROM lion_swd d
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+					  AND f.x = 1 AND f.kind = 'c')
+	GROUP BY d.region$$);
+-- ... the rows themselves (core's Agg over them)
+SELECT lion_sw($$
+	SELECT d.region, count(*), min(d.pk), max(d.pk) FROM lion_swd d
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+					  AND f.x = 1 AND f.kind = 'c')
+	GROUP BY d.region$$);
+-- ... the semi join and the inner join: no row at all
+SELECT lion_sw($$
+	SELECT d.region, count(*) FROM lion_swd d
+	WHERE EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+				  AND f.x = 1 AND f.kind = 'c')
+	GROUP BY d.region$$);
+SELECT lion_sw($$
+	SELECT d.region, count(*) FROM lion_swf f JOIN lion_swd d ON d.pk = f.fk
+	WHERE f.x = 1 AND f.kind = 'c' GROUP BY d.region$$);
+-- ... the counted rows below a LionJoinAgg
+SELECT * FROM lion_sw_explain($$
+	SELECT d.region, count(*), count(DISTINCT d.pk) FROM lion_swf f
+	JOIN lion_swd d ON d.pk = f.fk
+	WHERE f.x = 1 AND f.kind = 'c' GROUP BY d.region$$);
+SELECT lion_sw($$
+	SELECT d.region, count(*), count(DISTINCT d.pk) FROM lion_swf f
+	JOIN lion_swd d ON d.pk = f.fk
+	WHERE f.x = 1 AND f.kind = 'c' GROUP BY d.region$$);
+-- ... and the count alone, summed in the node
+SELECT lion_sw($$
+	SELECT count(*) FROM lion_swd d
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+					  AND f.x = 1 AND f.kind = 'c')$$);
+-- ... over several batches: the anti join's after the switch looked up no
+-- more, and the semi join's run over at the switch, in its first batch
+SET work_mem = '64kB';
+SELECT lion_sw($$
+	SELECT d.region, count(*) FROM lion_swd d
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+					  AND f.x = 1 AND f.kind = 'c')
+	GROUP BY d.region$$);
+SELECT lion_sw($$
+	SELECT d.region, count(*) FROM lion_swd d
+	WHERE EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+				  AND f.x = 1 AND f.kind = 'c')
+	GROUP BY d.region$$);
+RESET work_mem;
+SET work_mem = '4MB';
+-- ... and a row at a time (the walk in key order priced out)
+SET pg_lion.fkjoin_batch_row_cost = 1e6;
+SELECT lion_sw($$
+	SELECT d.region, count(*) FROM lion_swd d
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+					  AND f.x = 1 AND f.kind = 'c')
+	GROUP BY d.region$$);
+SELECT lion_sw($$
+	SELECT d.region, count(*) FROM lion_swd d
+	WHERE EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+				  AND f.x = 1 AND f.kind = 'c')
+	GROUP BY d.region$$);
+RESET pg_lion.fkjoin_batch_row_cost;
+
+-- 2. The semi and anti join as a join path: a walked batch is tested whole
+-- before its rows go up, and the keys after the switch are tested no more.
+-- The outer side's keys repeat, and some are NULL.
+SET pg_lion.enable_semijoin = on;
+SELECT * FROM lion_sw_explain($$
+	SELECT o.k, o.tag FROM lion_swo o
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = o.k
+					  AND f.x = 1 AND f.kind = 'c')$$);
+SELECT lion_sw($$
+	SELECT o.k, o.tag FROM lion_swo o
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = o.k
+					  AND f.x = 1 AND f.kind = 'c')$$);
+SELECT lion_sw($$
+	SELECT o.k, o.tag FROM lion_swo o
+	WHERE EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = o.k
+				  AND f.x = 1 AND f.kind = 'c')$$);
+SELECT lion_sw($$
+	SELECT d.pk FROM lion_swd d
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+					  AND f.x = 1 AND f.kind = 'c')$$);
+-- ... over several batches (the semi join's, again, over at the switch)
+SET work_mem = '64kB';
+SELECT lion_sw($$
+	SELECT o.k, o.tag FROM lion_swo o
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = o.k
+					  AND f.x = 1 AND f.kind = 'c')$$);
+SELECT lion_sw($$
+	SELECT o.k, o.tag FROM lion_swo o
+	WHERE EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = o.k
+				  AND f.x = 1 AND f.kind = 'c')$$);
+SET work_mem = '4MB';
+-- ... and a row at a time
+SET pg_lion.fkjoin_batch_row_cost = 1e6;
+SELECT lion_sw($$
+	SELECT o.k, o.tag FROM lion_swo o
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = o.k
+					  AND f.x = 1 AND f.kind = 'c')$$);
+RESET pg_lion.fkjoin_batch_row_cost;
+
+-- 3. Rescans: each run decides its way again, and switches again.  The upper
+-- node below a correlated subquery, its dimension filtered by the outer row,
+-- walked in key order (the walk priced in: a run's thousand keys would be
+-- looked up a row at a time) ...
+SET pg_lion.enable_semijoin = off;
+SET pg_lion.fkjoin_batch_row_cost = 0;
+SELECT (n->>'Actual Loops')::int AS loops,
+	   (n->>'Fact Filter Switches')::int AS switches
+FROM lion_sw_node($$
+	SELECT g, (SELECT string_agg(s.region || '=' || s.n, ',' ORDER BY s.region)
+			   FROM (SELECT d.region, count(*) AS n FROM lion_swd d
+					 WHERE d.pk % 3 = g
+					 AND NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+									 AND f.x = 1 AND f.kind = 'c')
+					 GROUP BY d.region) s)
+	FROM generate_series(0, 2) g$$) n;
+SELECT lion_sw($$
+	SELECT g, (SELECT string_agg(s.region || '=' || s.n, ',' ORDER BY s.region)
+			   FROM (SELECT d.region, count(*) AS n FROM lion_swd d
+					 WHERE d.pk % 3 = g
+					 AND NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+									 AND f.x = 1 AND f.kind = 'c')
+					 GROUP BY d.region) s)
+	FROM generate_series(0, 2) g$$);
+RESET pg_lion.fkjoin_batch_row_cost;
+-- ... and the anti and semi join paths as the inner side of a nested loop,
+-- their outer side filtered by its outer row
+SET pg_lion.enable_semijoin = on;
+SELECT (n->>'Actual Loops')::int AS loops,
+	   (n->>'Fact Filter Switches')::int AS switches
+FROM lion_sw_node($$
+	SELECT v.i, s.k FROM (VALUES (0), (1), (2)) v(i),
+	LATERAL (SELECT o.k FROM lion_swo o WHERE o.tag = v.i
+			 AND NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = o.k
+							 AND f.x = 1 AND f.kind = 'c') OFFSET 0) s$$) n;
+SELECT lion_sw($$
+	SELECT v.i, s.k FROM (VALUES (0), (1), (2)) v(i),
+	LATERAL (SELECT o.k FROM lion_swo o WHERE o.tag = v.i
+			 AND NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = o.k
+							 AND f.x = 1 AND f.kind = 'c') OFFSET 0) s$$);
+SELECT lion_sw($$
+	SELECT v.i, s.k FROM (VALUES (0), (1), (2)) v(i),
+	LATERAL (SELECT o.k FROM lion_swo o WHERE o.tag = v.i
+			 AND EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = o.k
+						 AND f.x = 1 AND f.kind = 'c') OFFSET 0) s$$);
+
+-- 4. In parallel each participant switches on its own, at keys of its own
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET parallel_leader_participation = off;
+SET pg_lion.enable_semijoin = off;
+SELECT * FROM lion_sw_explain($$
+	SELECT d.region, count(*) FROM lion_swd d
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+					  AND f.x = 1 AND f.kind = 'c')
+	GROUP BY d.region$$);
+SELECT lion_sw($$
+	SELECT d.region, count(*) FROM lion_swd d
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+					  AND f.x = 1 AND f.kind = 'c')
+	GROUP BY d.region$$, true);
+SELECT lion_sw($$
+	SELECT d.region, count(*) FROM lion_swd d
+	WHERE EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+				  AND f.x = 1 AND f.kind = 'c')
+	GROUP BY d.region$$, true);
+SELECT lion_sw($$
+	SELECT d.region, count(*), count(DISTINCT d.pk) FROM lion_swf f
+	JOIN lion_swd d ON d.pk = f.fk
+	WHERE f.x = 1 AND f.kind = 'c' GROUP BY d.region$$, true);
+SET pg_lion.enable_semijoin = on;
+SELECT * FROM lion_sw_explain($$
+	SELECT o.k, o.tag FROM lion_swo o
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = o.k
+					  AND f.x = 1 AND f.kind = 'c')$$);
+SELECT lion_sw($$
+	SELECT o.k, o.tag FROM lion_swo o
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = o.k
+					  AND f.x = 1 AND f.kind = 'c')$$, true);
+SELECT lion_sw($$
+	SELECT o.k, o.tag FROM lion_swo o
+	WHERE EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = o.k
+				  AND f.x = 1 AND f.kind = 'c')$$, true);
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET parallel_leader_participation;
+SET max_parallel_workers_per_gather = 0;
+
+-- 5. A partitioned fact: each leaf switches on its own, and a leaf whose
+-- copy is empty is left out of the later batches.
+CREATE TABLE lion_swp (id int NOT NULL, fk int8 NOT NULL, x int NOT NULL,
+					   kind text NOT NULL) PARTITION BY LIST ((id % 3));
+CREATE TABLE lion_swp0 PARTITION OF lion_swp FOR VALUES IN (0);
+CREATE TABLE lion_swp1 PARTITION OF lion_swp FOR VALUES IN (1);
+CREATE TABLE lion_swp2 PARTITION OF lion_swp FOR VALUES IN (2);
+INSERT INTO lion_swp SELECT * FROM lion_swf;
+CREATE INDEX lion_swp_fk ON lion_swp USING lion (fk);
+CREATE INDEX lion_swp_x ON lion_swp USING lion (x);
+CREATE INDEX lion_swp_kind ON lion_swp USING lion (kind);
+VACUUM (FREEZE, ANALYZE) lion_swp;
+SET work_mem = '64kB';
+SET pg_lion.enable_semijoin = off;
+SELECT lion_sw($$
+	SELECT d.region, count(*) FROM lion_swd d
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swp f WHERE f.fk = d.pk
+					  AND f.x = 1 AND f.kind = 'c')
+	GROUP BY d.region$$, true);
+SET pg_lion.enable_semijoin = on;
+SELECT lion_sw($$
+	SELECT o.k, o.tag FROM lion_swo o
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swp f WHERE f.fk = o.k
+					  AND f.x = 1 AND f.kind = 'c')$$, true);
+SELECT lion_sw($$
+	SELECT o.k, o.tag FROM lion_swo o
+	WHERE EXISTS (SELECT 1 FROM lion_swp f WHERE f.fk = o.k
+				  AND f.x = 1 AND f.kind = 'c')$$, true);
+SET work_mem = '4MB';
+
+-- 6. The switch off: the run probes to its end, with the same answers.
+SET pg_lion.enable_filter_switch = off;
+SET pg_lion.enable_semijoin = off;
+SELECT lion_sw($$
+	SELECT d.region, count(*) FROM lion_swd d
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = d.pk
+					  AND f.x = 1 AND f.kind = 'c')
+	GROUP BY d.region$$);
+SET pg_lion.enable_semijoin = on;
+SELECT lion_sw($$
+	SELECT o.k, o.tag FROM lion_swo o
+	WHERE NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = o.k
+					  AND f.x = 1 AND f.kind = 'c')$$);
+RESET pg_lion.enable_filter_switch;
+
+DROP TABLE lion_swd, lion_swf, lion_swo, lion_swp;
+DROP FUNCTION lion_sw(text, bool), lion_sw_node(text), lion_sw_explain(text);

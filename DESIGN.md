@@ -9864,6 +9864,22 @@ for the next key; the WHERE sets let go of their pins, as after a planned collec
 copy come out empty - the filters select nothing - the keys after it are looked up no more: an inner
 or semi join has no row left, and an anti join's are every row, as when a filter has no entry.
 
+- **The empty copy does not change how the run reads its child** (2026-09-30 review). Over a plain
+  fact, whether the rows come a batch at a time, walked in key order, or a row at a time is decided
+  once, at the run's first row (`joinbegun`, `joinwalked`), and kept to its end. It used to be
+  worked out again at every row from `wheremissing`, which a clause with no entry sets before the
+  first row and the empty copy sets part way through - so the row after the switch was read a row at
+  a time: the rest of the batch in hand was dropped and the child read on, or read again where a
+  finished scan starts over, and an anti join lost rows or counted them twice (on PostgreSQL 16,
+  1001 a region for 1000 over one batch, 867 over several at 64 kB, one in parallel). Each way sees
+  to the empty copy itself: walked or a row at a time, an anti join's rows after it go up with no
+  lookup and a semi or inner join's run ends; a semi or anti join path's batch tested whole
+  (`lion_join_count_batch()`) tests no key after it - those join nothing - and hands up what it
+  tested, and its later batches are tested no more. The copy is set up as the counts' filters
+  (`joinsources`) even when empty, so that `joinfiltered` always means what the counts read. A
+  partitioned fact's leaves already stopped at their turn's empty copy (`lion_join_count_parts()`),
+  and that leaf has no turn after it.
+
 - **§9.** "Why a stale copy is safe" asks of a copy that it be made after the query's snapshot was
   taken and only ever be counted beside a located fk set, which carries the interlock. A copy made
   part way through is both: the filters it is made from were located in this run, under the
@@ -9946,7 +9962,11 @@ part way through is empty, over inner and anti joins, row at a time and walked; 
 copy that would not fit 64 kB, probing to their ends; two rescans below a correlated subquery,
 two switches; a partitioned fact, three leaves switching each on its own, grouped, semi and anti
 joins; parallel plans, plain and partitioned, whose participants switch; and a dirty heap - rows
-deleted, moved to other keys and to other terms - before and after VACUUM.
+deleted, moved to other keys and to other terms - before and after VACUUM. Its empty copies are all
+counts summed in the node - one call, which reads the whole child - with the join paths turned off,
+so the way of reading the child that an empty copy changed at the next call went unseen.
+`test/sql/fkjoin_switch.sql` (2026-09-30) is about the empty copy alone: filters that never meet,
+the rows handed up one at a time, against the pushdown off.
 
 ### The per-key terms, refitted (2026-09-29)
 
@@ -10848,6 +10868,18 @@ still declines.
 copy that comes out empty, the knob off and a copy too large for its memory, rescans, a partitioned
 fact's leaves, parallel plans and a dirty heap before and after VACUUM - each answer against the
 pushdown off.
+
+`test/sql/fkjoin_switch.sql` (2026-09-30), a switch whose copy comes out empty, made part way
+through a batch: the upper node handing up a row per dimension row - anti, semi and inner joins
+grouped by a dimension column, the rows of an anti join below core's Agg and the counted rows below
+a LionJoinAgg - and the count summed in the node; the semi and anti join paths over an outer side
+whose keys repeat and are sometimes NULL; each walked over one batch and over several at a
+`work_mem` of 64 kB and a row at a time; rescans (the upper node below a correlated subquery, the
+paths below a nested loop's LATERAL), each run switching again; parallel plans of both; a
+partitioned fact; and the switch off. EXPLAIN (COSTS OFF) of the plans, and each answer against the
+pushdown off as multisets. Before `joinbegun` every anti join walked in key order - the upper node's
+and the join path's, over one batch and several, rescanned and in parallel - lost or repeated rows,
+ten answers of the file; the others passed then too, and hold the ways the fix did not mean to change.
 
 `test/sql/fkjoin_semipath.sql` (2026-09-29), the semi and anti join as a join path, against the
 pushdown off (`lion_sp()`, as `lion_gj()` does: with core's join methods disabled - so that the path
