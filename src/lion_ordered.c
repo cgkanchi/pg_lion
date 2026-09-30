@@ -684,14 +684,41 @@ lo_residual(List *rinfos, List *ordrinfos, List *lionrinfos, List *lionqual)
 }
 
 /*
+ * The clauses of a lion access's qual that a partial index's predicate
+ * implies - core's own test for which restriction clauses a partial index
+ * answers by itself (check_index_predicates()), asked of the lion side: an
+ * index clause of a lion leaf, or a partial lion index's own predicate.  A
+ * walk of that index meets only rows that satisfy them, so among the rows it
+ * walks they select nothing.
+ */
+static List *
+lo_pred_implied(IndexOptInfo *idx, List *lionqual)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	if (idx->indpred == NIL)
+		return NIL;
+	foreach(lc, lionqual)
+	{
+		Expr	   *clause = (Expr *) lfirst(lc);
+
+		if (!contain_mutable_functions((Node *) clause) &&
+			predicate_implied_by(list_make1(clause), idx->indpred, false))
+			result = lappend(result, clause);
+	}
+	return result;
+}
+
+/*
  * The price of one (ordered path, lion access) pair (DESIGN.md §30.3), and the
  * size its set is expected to have.  rows is what the node returns, as lion's
  * estimates see it (lion_probe_rel_rows()).
  */
 static void
 lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
-		List *lionrinfos, List *residual, double rows, Cost *startup_p,
-		Cost *total_p, double *setbytes)
+		List *lionrinfos, List *lionqual, List *residual, double rows,
+		Cost *startup_p, Cost *total_p, double *setbytes)
 {
 	Cost		lioncost;
 	Selectivity sel;
@@ -736,7 +763,10 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	 * fetches were priced at 1% of them, and the node (a plain index scan
 	 * plus the lion lookups) beat a bitmap scan and Sort that the planner's
 	 * own price for that index scan had rejected, 721 against 13,909 on 1M
-	 * rows (2026-09-25 second review).
+	 * rows (2026-09-25 second review).  So is a clause the ordered index's
+	 * PREDICATE implies: a partial btree on (k) WHERE s <> '' walks only
+	 * rows with s <> '', and pricing the fetches at s <> ''s share of them
+	 * chose the node over a bitmap scan it ran twice as slow as.
 	 */
 	foreach(lc, ord->indexclauses)
 	{
@@ -744,6 +774,18 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 
 		if (list_member_ptr(lionrinfos, iclause->rinfo))
 			shared = lappend(shared, iclause->rinfo);
+	}
+	foreach(lc, lo_pred_implied(ord->indexinfo, lionqual))
+	{
+		Expr	   *clause = (Expr *) lfirst(lc);
+		ListCell   *lc2;
+		bool		dup = false;
+
+		foreach(lc2, shared)
+			if (equal(lfirst_node(RestrictInfo, lc2)->clause, clause))
+				dup = true;
+		if (!dup)
+			shared = lappend(shared, clause);
 	}
 	selwalk = sel;
 	if (shared != NIL)
@@ -1202,8 +1244,8 @@ lo_lion_walks(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
  */
 static void
 lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
-			 List *residual, double rows, Cost *startup_p, Cost *total_p,
-			 double *setbytes)
+			 List *lionqual, List *residual, double rows, Cost *startup_p,
+			 Cost *total_p, double *setbytes)
 {
 	double		tuples = Max(rel->tuples, 1.0);
 	double		pages = Max((double) rel->pages, 1.0);
@@ -1229,9 +1271,26 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 	bool		isdefault;
 	int16		keywidth;
 
-	if (w->rinfos != NIL)
-		swalk = clauselist_selectivity(root, w->rinfos, rel->relid,
-									   JOIN_INNER, NULL);
+	/*
+	 * The rows of the range - of a partial index, only the ones its predicate
+	 * admits, the predicate's clauses the range does not already imply added
+	 * as core's add_predicate_to_index_quals() adds them.
+	 */
+	{
+		List	   *walkclauses = list_copy(w->rinfos);
+		ListCell   *lc;
+
+		foreach(lc, w->index->indpred)
+		{
+			Expr	   *pred = (Expr *) lfirst(lc);
+
+			if (!predicate_implied_by(list_make1(pred), w->quals, false))
+				walkclauses = lappend(walkclauses, pred);
+		}
+		if (walkclauses != NIL)
+			swalk = clauselist_selectivity(root, walkclauses, rel->relid,
+										   JOIN_INNER, NULL);
+	}
 	walked = clamp_row_est(tuples * swalk);
 	examine_variable(root, (Node *) w->var, rel->relid, &vardata);
 	ndistinct = Max(1.0, get_variable_numdistinct(&vardata, &isdefault));
@@ -1248,12 +1307,28 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 		double		members;
 		double		ncont;
 
+		List	   *shared;
+
 		cost_bitmap_tree_node(lion, &lioncost, &sel);
 		members = clamp_row_est(sel * tuples);
 		ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
 		*setbytes = ncont * (LION_CONTAINER_HDRSZ + LO_ENTRY_BYTES) +
 			Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES);
 		startup += lioncost + ncont * cpu_operator_cost;
+
+		/*
+		 * What the set selects among the rows walked: not what the walked
+		 * index's predicate already guarantees (lo_cost()).
+		 */
+		shared = lo_pred_implied(w->index, lionqual);
+		if (shared != NIL)
+		{
+			Selectivity both = clauselist_selectivity(root, shared, rel->relid,
+													  JOIN_INNER, NULL);
+
+			if (both > 0)
+				sel = Min(sel / both, 1.0);
+		}
 	}
 
 	/*
@@ -1444,7 +1519,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			Cost		total;
 			double		setbytes;
 
-			lo_cost(root, rel, ord, lion, lionrinfos, residual, rows,
+			lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual, rows,
 					&startup, &total, &setbytes);
 			if (setbytes > (double) limit)
 				continue;		/* the set would not fit (§30.3) */
@@ -1483,8 +1558,8 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			double		setbytes;
 			List	   *priv;
 
-			lo_cost_walk(root, rel, w, lion, residual, rows, &startup, &total,
-						 &setbytes);
+			lo_cost_walk(root, rel, w, lion, lionqual, residual, rows,
+						 &startup, &total, &setbytes);
 			if (setbytes > (double) limit)
 				continue;		/* the set would not fit (§30.3) */
 			priv = list_make5(walkinfo, w->index, w->rinfos, w->quals,
