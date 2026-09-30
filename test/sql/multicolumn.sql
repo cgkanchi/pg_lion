@@ -530,6 +530,10 @@ EXPLAIN (COSTS OFF)
 SELECT a, count(*) FROM lion_mcp WHERE b = 2 GROUP BY a;
 EXPLAIN (COSTS OFF)
 SELECT a, b, count(*) FROM lion_mcp GROUP BY a, b;
+SET pg_lion.enable_decoded_walk = off;
+EXPLAIN (COSTS OFF)
+SELECT a, b, count(*) FROM lion_mcp GROUP BY a, b;
+RESET pg_lion.enable_decoded_walk;
 -- an OR is one source over several columns of the one index (§19)
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM lion_mcp WHERE a = 3 OR b = 2;
@@ -632,8 +636,10 @@ SELECT lion_mcsame($$SELECT count(*) FROM @
 -- The natural use of a multicolumn index: both grouping columns come from the
 -- same relation, the outer/inner nested loop opens it twice and each side
 -- walks its OWN key column's entries.  `b` has fewer distinct values, so it is
--- the outer one and EXPLAIN names it first.
+-- the outer one and EXPLAIN names it first.  The decoded walk (§34) is off
+-- for it, and shown after.
 
+SET pg_lion.enable_decoded_walk = off;
 SELECT lion_mcpd($$SELECT a, b, count(*) FROM lion_mcp GROUP BY a, b$$);
 SELECT lion_mcpd($$SELECT b, a, count(*) FROM lion_mcp GROUP BY b, a$$);
 SELECT lion_mcpd($$SELECT a, b, count(*) FROM lion_mcp
@@ -649,6 +655,14 @@ SELECT n, m, count(*) FROM lion_mcp GROUP BY n, m
 SELECT lion_mcsame($$SELECT a, b, count(*) FROM @ GROUP BY a, b$$);
 SELECT lion_mcsame($$SELECT a, n, count(*) FROM @ GROUP BY a, n$$);
 -- and one the model refuses over either portfolio, for the same reason
+SELECT lion_mcsame($$SELECT a, b, count(*) FROM @ WHERE c = 'c1' GROUP BY a, b$$);
+RESET pg_lion.enable_decoded_walk;
+-- the decoded walk reads both key columns of the one index at each container
+-- key, and takes the WHERE the nested loop is refused, over either portfolio
+SELECT lion_mcpd($$SELECT a, b, count(*) FROM lion_mcp GROUP BY a, b$$);
+SELECT lion_mcpd($$SELECT a, b, count(*) FROM lion_mcp
+				   WHERE c = 'c1' GROUP BY a, b$$);
+SELECT lion_mcpd($$SELECT n, m, count(*) FROM lion_mcp GROUP BY n, m$$);
 SELECT lion_mcsame($$SELECT a, b, count(*) FROM @ WHERE c = 'c1' GROUP BY a, b$$);
 
 -- ---- 11.5 IN lists (§15) --------------------------------------------------

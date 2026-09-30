@@ -15,6 +15,7 @@
 
 bool		lion_enable_count_pushdown = true;
 bool		lion_enable_filter_switch = true;
+bool		lion_enable_decoded_walk = true;
 create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 bool		lion_enable_semijoin = true;
 set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook = NULL;

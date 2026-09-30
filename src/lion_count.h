@@ -1433,6 +1433,13 @@ extern PGDLLIMPORT bool lion_enable_count_pushdown;
  * comparing the two ways.
  */
 extern PGDLLIMPORT bool lion_enable_filter_switch;
+
+/*
+ * Whether a GROUP BY of several lion-indexed columns may be counted by the
+ * decoded walk (DESIGN.md §34): three or more columns, and two where it is
+ * cheaper than the nested loop of §20.  A planner switch.
+ */
+extern PGDLLIMPORT bool lion_enable_decoded_walk;
 extern PGDLLIMPORT create_upper_paths_hook_type lion_prev_create_upper_paths_hook;
 
 extern void lion_count_scan_register(void);
