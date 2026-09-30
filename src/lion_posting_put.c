@@ -142,6 +142,18 @@ lion_chain_put_items_locked_ext(Relation index, Relation heaprel, Buffer buf,
 	}
 	Assert(need <= LION_MAX_ITEM_SIZE + sizeof(ItemIdData));
 
+	/*
+	 * The item that goes away is overwritten or deleted by its line pointer,
+	 * inside the record: it has to be one a reader would take, alone in the
+	 * bytes the page allots it (lion_page_check_alone()).
+	 */
+	if (replace)
+	{
+		(void) lion_page_item_fetch(index, page, BufferGetBlockNumber(buf),
+									off);
+		lion_page_check_alone(index, page, BufferGetBlockNumber(buf), off);
+	}
+
 	/* One item taking another one's place: overwrite it where it is. */
 	if (replace && nitems == 1)
 	{
@@ -490,6 +502,16 @@ lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 	Size		off = 0;
 	int			nleaves;
 	int			i;
+
+	/*
+	 * The entry is rewritten in the last record, by its line pointer, at a
+	 * smaller size, which moves the items below it on the leaf: it has to be
+	 * a whole entry alone in its bytes (lion_page_check_alone()).
+	 */
+	(void) lion_page_entry_fetch(index, BufferGetPage(entrybuf),
+								 BufferGetBlockNumber(entrybuf), entryoff);
+	lion_page_check_alone(index, BufferGetPage(entrybuf),
+						  BufferGetBlockNumber(entrybuf), entryoff);
 
 	cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	nleaves = lion_spill_count_leaves(payload, paylen, cbuf);
@@ -850,10 +872,19 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 		need += MAXALIGN(sizes[i]) + sizeof(ItemIdData);
 	}
 
+	/*
+	 * The record deletes items by their line pointers and moves them to N by
+	 * them, so no two of them may overlap (lion_page_check_items()): one that
+	 * reached into another would have that one overwritten when it goes, or
+	 * the items would not fit N inside the record - a PANIC in rmgr mode.
+	 */
+	lion_page_check_items(index, page, blk);
+
 	/* Copy out the items that are going to move, before touching the page. */
 	if (nmove > 0)
 	{
 		Size		used = 0;
+		Size		budget = 0;
 
 		movebuf = (char *) palloc(BLCKSZ);
 		movelen = (Size *) palloc(sizeof(Size) * nmove);
@@ -867,11 +898,14 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 
 			/*
 			 * Items are data (lion_page_item_fetch()), and so are the line
-			 * pointers' lengths: ones that overlap could add up to more than
-			 * the page, and movebuf is a page.
+			 * pointers' lengths.  What moves has to fit N, an empty page,
+			 * line pointers and all, or the record fails half way through
+			 * - which the check above already makes sure of; this one keeps
+			 * movebuf, a page, from being overrun whatever the page holds.
 			 */
 			item = lion_page_item_fetch(index, page, blk, firstright + i);
-			if (unlikely(used + MAXALIGN(sz) > BLCKSZ))
+			budget += MAXALIGN(sz) + sizeof(ItemIdData);
+			if (unlikely(budget > (Size) LION_PAGE_CAPACITY))
 				ereport(ERROR,
 						(errcode(ERRCODE_INDEX_CORRUPTED),
 						 errmsg("lion index \"%s\": the items of container page %u add up to more than a page",

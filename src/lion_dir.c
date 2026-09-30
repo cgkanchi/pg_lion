@@ -1336,6 +1336,17 @@ lion_dir_place(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 
 	if (replace)
 	{
+		/*
+		 * The item that goes is overwritten by its line pointer inside the
+		 * record, and the items below it move when its size changes: it has
+		 * to be a whole entry, alone in its bytes (lion_page_check_alone()),
+		 * or the record fails - a PANIC in rmgr mode - or overwrites its
+		 * neighbour.
+		 */
+		(void) lion_page_entry_fetch(index, page, BufferGetBlockNumber(buf),
+									 off);
+		lion_page_check_alone(index, page, BufferGetBlockNumber(buf), off);
+
 		xstate = lion_wal_begin(index);
 		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 		lion_wal_save_item(xstate, p, off);
@@ -1557,6 +1568,15 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 		elog(ERROR, "lion index \"%s\": root page %u has a right sibling",
 			 RelationGetRelationName(index), pblk);
 
+	/*
+	 * Both pages are rebuilt from the items as their line pointers give them,
+	 * inside the record, and the cut below is chosen by their lengths: they
+	 * have to be inside the page and apart (lion_page_check_items()), each at
+	 * least a header and its key long (see the loop), or the rebuild reads
+	 * past the copy or fails half way.
+	 */
+	lion_page_check_items(index, page, pblk);
+
 	/* Work from a private copy: both pages are rebuilt from scratch. */
 	copy = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 	cpage = (Page) copy->data;
@@ -1587,6 +1607,14 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 			continue;
 		items[nitems].item = lion_page_item(cpage, o);
 		items[nitems].size = lion_page_itemsz(cpage, o);
+		if (unlikely(items[nitems].size < LION_ENTRY_HDRSZ ||
+					 items[nitems].size <
+					 LionEntryPayloadOffset(items[nitems].item)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": item %u on block %u is %zu bytes, too small for its header and key",
+							RelationGetRelationName(index), o, pblk,
+							items[nitems].size)));
 		nitems++;
 	}
 

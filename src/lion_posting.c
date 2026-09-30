@@ -863,11 +863,30 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	Assert(LionPageIsRightmost(page));	/* a root has no sibling */
 	Assert(level < LION_POSTING_MAX_HEIGHT);
 
+	/*
+	 * The items move by their line pointers, inside the record (see
+	 * lion_page_check_items()), so they are checked before anything is
+	 * allocated: each as a reader checks it, and all of them for fitting the
+	 * child, which the items of an undamaged root always do.  One line pointer
+	 * that claimed 4000 bytes for an item of 1816 used to fail the push-down
+	 * half way through its record - a PANIC in rmgr mode, and the same PANIC
+	 * again at the first insert into the key after recovery (2026-09-29
+	 * review).
+	 */
+	maxoff = PageGetMaxOffsetNumber(page);
+	lion_page_check_items(index, page, head);
+	for (off = FirstOffsetNumber; off <= maxoff; off++)
+	{
+		if (level == 0)
+			(void) lion_page_item_fetch(index, page, head, off);
+		else
+			(void) lion_posting_pivot_at(index, page, head, off);
+	}
+
 	/* Both pages are rebuilt, so work from a private copy of the root. */
 	copy = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 	cpage = (Page) copy->data;
 	memcpy(cpage, page, BLCKSZ);
-	maxoff = PageGetMaxOffsetNumber(cpage);
 
 	/* The child is allocated before the record opens (DESIGN.md §25). */
 	cbuf = lion_alloc_page(index, heaprel, true);
@@ -882,14 +901,16 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	if (level == 0)
 	{
 		Page		epage;
-		ItemId		eiid;
+		LionEntryTuple *onpage;
 
 		Assert(entry != NULL && BufferIsValid(entrybuf));
 		epage = BufferGetPage(entrybuf);
-		eiid = PageGetItemId(epage, entryoff);
-		loggedsz = ItemIdGetLength(eiid);
+		onpage = lion_page_entry_fetch(index, epage,
+									   BufferGetBlockNumber(entrybuf),
+									   entryoff);
+		loggedsz = ItemIdGetLength(PageGetItemId(epage, entryoff));
 		logged = (LionEntryTuple *) palloc(loggedsz);
-		memcpy(logged, PageGetItem(epage, eiid), loggedsz);
+		memcpy(logged, onpage, loggedsz);
 		if ((logged->flags & LION_ENTRY_CHAIN) == 0 || logged->head != head)
 			elog(ERROR, "lion index \"%s\": entry %u on block %u does not own the posting set at %u",
 				 RelationGetRelationName(index), entryoff,
@@ -1064,6 +1085,14 @@ lion_posting_split_internal(Relation index, Relation heaprel, uint32 hash,
 	Assert(level > 0);
 	Assert(pblk != head);
 	Assert(!LionPageIncompleteSplit(page));
+
+	/*
+	 * The pivots are copied out below, each one checked; that they also add
+	 * up to no more than a page is what makes both halves fit (see the cut),
+	 * and a page whose line pointers overlapped would otherwise fail to fill
+	 * them inside the record.
+	 */
+	lion_page_check_items(index, page, pblk);
 
 	if (!rightmost)
 		oldhk = *lion_posting_highkey_at(index, page, pblk);

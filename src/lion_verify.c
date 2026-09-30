@@ -766,6 +766,14 @@ lion_verify_posting_leaves(LionVerifyState *vs, BlockNumber eblk,
 			lastused = off;
 		}
 
+		/*
+		 * No two items overlap: each is inside the page and within its slack,
+		 * and yet one may reach into the next, which is what a writer then
+		 * overwrites - so every writer refuses such a page
+		 * (lion_page_check_items()), and this says so first.
+		 */
+		lion_page_check_items(vs->index, page, blk);
+
 		/* min/max in the special area must describe the items */
 		if (firstused == InvalidOffsetNumber)
 		{
@@ -853,6 +861,7 @@ lion_verify_posting_level(LionVerifyState *vs, BlockNumber eblk,
 							(Size) ItemIdGetLength(iid),
 							LION_POSTING_PIVOT_SIZE);
 		}
+		lion_page_check_items(vs->index, page, blk);
 
 		if (!LionPageIsRightmost(page))
 		{

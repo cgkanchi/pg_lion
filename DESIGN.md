@@ -198,6 +198,21 @@ BLCKSZ 16K and 32K set flags past the engine's per-block array. A WAL redo of th
 (LION_OP_CONTAINER_ADD, LION_OP_SPARSE_INS, §25) checks its item the way the writer did before it
 logged the call.
 
+The 2026-09-29 review found the WRITERS trusting line pointers: they copy, move, overwrite and
+delete items by them inside a WAL record, which in rmgr mode is a critical section (§25). A line
+pointer that claimed 4000 bytes for an 1816-byte ARRAY passed every reader, and the next push-down
+of its set copied the item by that length, failed half way through its record and PANICked - and
+again at the first insert after recovery; one that reached into the next item within its slack had
+the in-place insert grow the container into that item's header, logged. So `lion_page_item_fetch()`
+also bounds what the line pointer claims past the item's size by `LION_ITEM_SLACK_BOUND`, verify()'s
+rule, and a writer checks what its record is going to do before the record opens: every item of the
+page inside the item space and no two overlapping (`lion_page_check_items()`, before a push-down,
+a split, VACUUM's filtering of a page and a directory split), the one item it overwrites or
+deletes in place alone in the bytes the page allots it (`lion_page_check_alone()`, before the
+in-place insert, a replacement and VACUUM's delete), and the directory entry a record rewrites a
+whole one, of exactly its size when it is a CHAIN entry (`lion_page_entry_fetch()`). Each is an
+ERROR (INDEX_CORRUPTED), and verify() reports an overlap too. `test/sql/corrupt_items.sql`.
+
 Full API: `src/lion_container.h`. Unit tests: `test/unit/container_test.c` (`make unit`), which must
 cover every type transition, boundary cardinalities (0, 1, 2047, 2048, 2049, 32767, 32768 members),
 run merging/splitting, and set algebra against a brute-force 32768-bit reference.
@@ -6823,7 +6838,10 @@ and is used for the record header alone.
 `lion_wal_begin()` opens a CRITICAL SECTION, because the page is modified in
 place and an ERROR between the first modification and XLogInsert() would leave a
 page in shared buffers that no record describes. Everything fallible therefore
-has to happen BEFORE the record opens. Three consequences, all of them
+has to happen BEFORE the record opens - which includes looking at the line
+pointers the record is going to move, overwrite or delete items by (§3,
+2026-09-29: `lion_page_check_items()`, `lion_page_check_alone()`,
+`lion_page_entry_fetch()`). Three consequences, all of them
 deviations from what this section assumed:
 
 - `lion_new_buffer_xl()` is gone. Allocating a page is split into

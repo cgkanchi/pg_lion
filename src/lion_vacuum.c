@@ -410,8 +410,8 @@ static void lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref,
 static void lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 							  const LionVacEntry *ent, BlockNumber startblk,
 							  uint32 ckey);
-static LionEntryTuple *lion_vacuum_entry_copy(Buffer entrybuf,
-											OffsetNumber entryoff, Size *size);
+static LionEntryTuple *lion_vacuum_entry_copy(Relation index, Buffer entrybuf,
+											  OffsetNumber entryoff, Size *size);
 static void lion_vacuum_free_chain(LionVacState *vs, uint32 hash,
 								  BlockNumber head);
 static void lion_vacuum_sweep(LionVacState *vs);
@@ -1277,6 +1277,16 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		elog(ERROR, "lion index: block %u is not a directory leaf", blk);
 	}
 
+	/*
+	 * The entries of this leaf are rewritten below by their line pointers,
+	 * several in one record, and the final step deletes some: they have to be
+	 * apart and inside the page, and each a whole entry
+	 * (lion_page_check_items(), lion_page_entry_fetch() in the loop), or those
+	 * records fail - a PANIC in rmgr mode, every VACUUM of the index - or
+	 * overwrite one entry with another.
+	 */
+	lion_page_check_items(vs->index, page, blk);
+
 	*nextp = LionPageGetOpaque(page)->rightlink;
 	maxoff = PageGetMaxOffsetNumber(page);
 	ents = (LionVacEntry *) palloc(sizeof(LionVacEntry) * (maxoff + 1));
@@ -1292,7 +1302,7 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		if (!ItemIdIsUsed(iid))
 			continue;
 
-		entry = (LionEntryTuple *) PageGetItem(page, iid);
+		entry = lion_page_entry_fetch(vs->index, page, blk, off);
 		ent = &ents[nents++];
 		ent->off = off;
 		ent->hash = entry->hash;
@@ -2156,10 +2166,13 @@ lion_vacuum_sweep(LionVacState *vs)
  * Private copy of the CHAIN entry at (entrybuf, entryoff), which the caller
  * holds locked.  Concurrent inserts change the entry, so it is re-read from
  * the page inside every window and its counters are only ever updated with
- * deltas.
+ * deltas.  The copy is written back in place, inside the record that changes
+ * the set, so the entry has to be one of the size a CHAIN entry has
+ * (lion_page_entry_fetch()).
  */
 static LionEntryTuple *
-lion_vacuum_entry_copy(Buffer entrybuf, OffsetNumber entryoff, Size *size)
+lion_vacuum_entry_copy(Relation index, Buffer entrybuf, OffsetNumber entryoff,
+					   Size *size)
 {
 	Page		page = BufferGetPage(entrybuf);
 	ItemId		iid = PageGetItemId(page, entryoff);
@@ -2169,7 +2182,8 @@ lion_vacuum_entry_copy(Buffer entrybuf, OffsetNumber entryoff, Size *size)
 		elog(ERROR, "lion index: entry %u on block %u is gone",
 			 entryoff, BufferGetBlockNumber(entrybuf));
 
-	entry = (LionEntryTuple *) PageGetItem(page, iid);
+	entry = lion_page_entry_fetch(index, page, BufferGetBlockNumber(entrybuf),
+								  entryoff);
 	if ((entry->flags & LION_ENTRY_CHAIN) == 0)
 		elog(ERROR, "lion index: entry %u on block %u is no longer a chain entry",
 			 entryoff, BufferGetBlockNumber(entrybuf));
@@ -2404,6 +2418,15 @@ lion_vacuum_filter_page(LionVacState *vs, Buffer buf, LionVacWork *w,
 		elog(ERROR, "lion index: block %u is not a container page of the chain at %u",
 			 blk, ent->head);
 
+	/*
+	 * What changes is written back in one record, by the items' line
+	 * pointers: in place, or deleted with the page compacted around them.  So
+	 * besides each item (lion_page_item_fetch() below) the page as a whole
+	 * has to hold together (lion_page_check_items()): a filtered item written
+	 * back into bytes that reach into its neighbour overwrote the neighbour.
+	 */
+	lion_page_check_items(vs->index, page, blk);
+
 	maxoff = PageGetMaxOffsetNumber(page);
 
 	w->nwork = 0;
@@ -2502,7 +2525,7 @@ lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref, Buffer buf,
 	vs->prof.items_deleted += w->ndel;
 
 	/* The entry may have been changed by inserts since the last window. */
-	ecopy = lion_vacuum_entry_copy(entrybuf, entryoff, &esize);
+	ecopy = lion_vacuum_entry_copy(index, entrybuf, entryoff, &esize);
 	grown = (uint32 *) palloc(sizeof(uint32) * (w->nwork + 1));
 
 	/*
@@ -2713,7 +2736,7 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 		entryoff = ref->off;
 
 		/* Everything read from here on is used inside this window only. */
-		ecopy = lion_vacuum_entry_copy(entrybuf, entryoff, &esize);
+		ecopy = lion_vacuum_entry_copy(index, entrybuf, entryoff, &esize);
 
 		iid = PageGetItemId(page, off);
 		if (ItemIdGetLength(iid) > LION_CONTAINER_MAX_SIZE)
@@ -2747,10 +2770,15 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 
 			if (vs->cbuf->cardinality == 0)
 			{
-				LionWalState *xstate = lion_wal_begin(index);
-				Page		p = lion_wal_register_buffer(xstate, buf,
-														 LION_WALBUF_CLEANUP);
+				LionWalState *xstate;
+				Page		p;
 				OffsetNumber delof = off;
+
+				/* deleted in place, by its line pointer */
+				lion_page_check_alone(index, page, blk, off);
+
+				xstate = lion_wal_begin(index);
+				p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_CLEANUP);
 
 				PageIndexMultiDelete(p, &delof, 1);
 				lion_wal_op(xstate, p, LION_OP_MULTIDEL, 0, 1, &delof,
