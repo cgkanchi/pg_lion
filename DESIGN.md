@@ -14077,15 +14077,20 @@ the walk under a sorted aggregate replaced the count pushdown.)
 The restriction clauses the walk answers exactly bound it: a range comparison of the column - `<`,
 `<=`, `>=`, `>` of the column's operator family, either way round - with a value that does not
 depend on the row (a Const, a Param, a stable expression such as `now() - interval '...'`: evaluated
-when the walk starts, as an Index Scan's run-time keys are; no subplan), and `IS NOT NULL`. They
-leave the filter and are the plan's `Index Cond`. The other clauses may be a lion SET: core's lion
-accesses are built as for a btree's walk (§30.2), on a scratch copy of the relation whose lion
-`IndexOptInfo`s are copied too, with the walk's clauses taken out of the clauses they may match
-(`lo_lion_accesses()`) - a set that collected the range would read all of it, which is what the walk
-exists not to do. Or no set at all: every row the walk meets is fetched, and the clauses are the
-filter. One path per (walk, set) and one with no set, and add_path() keeps what is cheaper. The
-walk needs no restriction clause at all: `ORDER BY ts DESC LIMIT 10` over a table whose only index
-on `ts` is a lion index is a walk with nothing to filter, where it was a whole scan and a Sort.
+when the walk starts, as an Index Scan's run-time keys are; no subplan), under the index column's
+collation, and `IS NOT NULL`. They leave the filter and are the plan's `Index Cond`. The collation is
+core's rule for an index clause (`IndexCollMatchesExprColl()`, as `lion_match_index()` applies it):
+the walk compares a bound with keys stored in the order of the index column's collation, so a
+comparison under another is no bound of it and stays in the filter. Until the 2026-09-29 review any
+was taken, and `t < 'a' COLLATE "C"` over an English column returned no rows ('A0' is below 'a' in
+"C", above it in English); `test/sql/ordered_collate.sql`. The other clauses may be a lion SET:
+core's lion accesses are built as for a btree's walk (§30.2), on a scratch copy of the relation
+whose lion `IndexOptInfo`s are copied too, with the walk's clauses taken out of the clauses they may
+match (`lo_lion_accesses()`) - a set that collected the range would read all of it, which is what
+the walk exists not to do. Or no set at all: every row the walk meets is fetched, and the clauses
+are the filter. One path per (walk, set) and one with no set, and add_path() keeps what is cheaper.
+The walk needs no restriction clause at all: `ORDER BY ts DESC LIMIT 10` over a table whose only
+index on `ts` is a lion index is a walk with nothing to filter, where it was a whole scan and a Sort.
 
 **Cost** (`lo_cost_walk()`). With `T` the relation's tuples, `s_w` the selectivity of the walk's
 clauses, `nd` the column's distinct values, and a set of selectivity `s` and index cost `C_lion`
