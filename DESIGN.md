@@ -16346,3 +16346,106 @@ a generic plan with a NULL parameter, EXECUTE revoked on `int4ne`; the driver of
 row and the indexes that cannot be one; a dirty heap and a partitioned table; the walk's hole in
 both directions, with NULLs first and last, beside a range and a list; and the per-entry filter,
 the deleted row it must not evaluate `100 / k` on, and the numeric column it must not be taken on.
+
+## 36. The top k of a GROUP BY ordered by its count (implemented 2026-09-30)
+
+ClickBench's `GROUP BY x ORDER BY count(*) DESC LIMIT 10` queries (UserID, SearchPhrase, ClientIP)
+counted every group to keep ten: 3.4M UserID entries in 1.7 s, where the answer is the ten largest.
+
+### The bound
+
+An entry's header records `ntids`, the TIDs its posting set holds, kept exact in the record that
+changes the set (§22, §18; `verify()` checks it). Every row a snapshot sees has its TID there - a
+row is in the index before its transaction commits, VACUUM takes out only what no snapshot sees, a
+TID is one row at most - so `ntids` BOUNDS the group's count under any WHERE, which can only take
+rows away. It is read after the snapshot was taken; an entry inserted later holds no row the
+snapshot sees, and one VACUUM deletes held none.
+
+### The walk (`lion_topk_run()`, lion_exec_count.c)
+
+One walk of the driving column's entries - the walk the groups would be counted in, under the same
+range - reads their headers alone (`lion_entry_scan_next_copy()`: no set located, no pin kept) and
+keeps the `topkcand` largest, with `maxout`, the largest count it left out: candidates gather in an
+array of twice that, which is cut back to the largest half whenever it fills, and an entry no
+larger than the smallest kept is not copied. The candidates are then counted exactly, largest bound
+first - each looked up again by its stored key, VACUUM having possibly deleted it (it holds no row
+then), and counted as any group of a walk is, against the WHERE collected once it pays
+(`lion_group_count()`). The walk stops once the k-th largest count so far is AT LEAST the next
+candidate's bound, or `maxout` after the last: no group not yet counted can then pass it. When the
+groups tied with the k-th must all come out - a second ORDER BY key, which may pick any of them, or
+WITH TIES - it stops only once the k-th count is LARGER. The groups counted, with a row or more,
+go up; core's Sort and Limit above the node order and cut them. Running out of candidates short of
+that means a count left out might still be large enough: the node then counts every group as it
+would without a k (`Top K Walked Whole` in EXPLAIN ANALYZE), which is the price of a WHERE whose
+counts fall far below their entries' - `WHERE light` in `topk.sql`, which leaves the largest
+entries nothing.
+
+Entries the WHERE takes out whole are not candidates: `g <> c` subtracts c's entry and the NULL
+one, `g IS NOT NULL` the NULL one (§35), so a group of either has no row, and `SearchPhrase <> ''`'s
+`''` is the largest entry there is - counting it would read 87% of the table for nothing. Its entry
+is the one whose stored key the clause's lookup found, one entry to an equality class, so the same
+bytes (`lion_topk_excluded()`).
+
+### The planner (`lion_count_path_topk()`)
+
+The grouped rel's paths are read by nothing but the Sort and Limit when the query has no DISTINCT,
+window function, set-returning function, set operation or grouping sets, so a path that leaves out
+groups the Limit would cut answers the query. The shape is one grouping column of one table walked
+a group at a time - not an IN list driving the groups, a coalesce group, a count(DISTINCT), the
+decoded walk, a partitioned table's or a parallel plan's partial counts - with no HAVING, which
+could reject the groups the k were counted from. The first ORDER BY key is the group's count,
+descending: an aggregate the node answers as the group's rows (count(*), or count(col) of a column
+no row of the group has NULL - not count(g) beside g's NULL group, which is 0 there), sorted by
+int8's `>` of the integer btree family. k is the LIMIT and the OFFSET, both constants, at most
+10,000; a LIMIT known only at run time is declined.
+
+`topkcand` is 2k/s for a WHERE that keeps a share s of the rows, leaving out what it says of g
+alone: where the rows it keeps are spread evenly over the groups, the k-th count is some s of its
+bound, and the bounds after it have to fall below that. Never fewer than k + 64, never more than
+16,384, and only when that is under half the column's entries - past that every group is counted
+anyway. The price (`lion_cost_topk_path()`): every entry's header at two operator costs, the
+leaves of the walk, a lookup per candidate, and the candidates counted as the groups of a walk of
+that many entries are - their rows the column's most common values' frequencies, largest first
+(`lion_topk_rows()`) - with their rows rechecked. Nothing comes out before the last is counted.
+
+The plan carries k, the candidates and the tie rule in a new member of custom_private,
+`LION_PRIV_TOPK` (shape 20). EXPLAIN prints `Top K: 10 by count, 74 candidates` (`with ties` when
+they must all come out); ANALYZE adds `Top K Entries Walked`, `Top K Groups Counted` and, when it
+happened, `Top K Walked Whole`. `pg_lion.enable_topk` turns it off.
+
+### Expressions of the grouping column
+
+`GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3` was declined: a grouping clause that
+is not a column. An expression of the grouping columns alone splits none of their groups, when it
+is immutable and made of nothing but those columns and constants - no aggregate, window function,
+set-returning function, subquery or parameter (`lion_group_dependent()`) - and the rows of a group
+hold the same column values, not merely equal ones: the value rule of §10, so each column it names
+is one the node prints (`groupvalueout`). The node emits the columns; `lion_plan_custom_path()`
+puts the expression's columns in `custom_scan_tlist`, and setrefs.c makes the expression part of
+the plan's projection. One table and its finished groups only - not a partitioned table's, the
+decoded walk's or a parallel plan's partial counts, which a Finalize Agg would group by the
+expressions again - and the order of the entries is not claimed as the query's. Under a top k an
+expression is computed for the groups that come out, so an error only another group's key would
+raise (`ClientIP + 1` at the type's maximum) is not raised; the ordinary plan computes it for
+every row.
+
+### Measured (ClickBench, 5% sample, PostgreSQL 18 release build, warm)
+
+| query | before | top k | groups counted |
+| --- | --- | --- | --- |
+| `SearchPhrase ... WHERE SearchPhrase <> ''` (Q13) | 280 ms | 53 ms | 10 of 477,418 |
+| `UserID` (Q16) | 1,664 ms | 160-190 ms | 10 of 3,407,288 |
+| `ClientIP, ClientIP - 1, ...` (Q36, a lion index on ClientIP) | 4,000 ms | 130-150 ms | 10 of 2,280,454 |
+
+What is left is the walk of every header: some 50 ns an entry, most of it copying the leaves.
+
+### Tests
+
+`test/sql/topk.sql`: every answer against a sequential scan. The NULL group largest; ties at the
+cut under a second ORDER BY key and WITH TIES; OFFSET; the count unprinted; count(col) beside
+`IS NOT NULL`; a WHERE on another column, and one that leaves the largest entries nothing (every
+group counted, and not without a tie-breaker); `g <> c` and `g IS NOT NULL` taking entries out;
+the declines - ascending, ordered by the group, HAVING, DISTINCT, a window function, count(g)
+beside the NULL group, few groups, a generic plan's LIMIT, the setting off; deleted rows still in
+the entries' counts, before and after VACUUM; a rescan under each outer row's WHERE; expressions of
+the grouping column, and the volatile one, the one of another column and the one alone it declines.
