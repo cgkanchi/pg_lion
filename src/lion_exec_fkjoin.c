@@ -624,18 +624,24 @@ lion_join_collect_into(LionCountScanState *st, LionPostingSet *out,
 	 */
 	lion_unpin_where(st);
 
-	/* The filters select no row at all: as a clause with no entry does. */
-	if (!out->found)
-	{
-		st->wheremissing = true;
-		return;
-	}
-
+	/*
+	 * Every count from here on reads its fk set and the copy - joinfiltered
+	 * says so, whatever the copy holds.
+	 */
 	memset(st->joinsources, 0, sizeof(st->joinsources));
 	st->joinsources[0].nsets = 1;
 	st->joinsources[0].sets = &st->groupset;
 	st->joinsources[1].nsets = 1;
 	st->joinsources[1].sets = out;
+
+	/*
+	 * The filters select no row at all: as a clause with no entry does, and
+	 * no key is looked up after this - which, for a copy made part way
+	 * through the run, every way of reading the child sees to itself
+	 * (lion_next_join_row()).
+	 */
+	if (!out->found)
+		st->wheremissing = true;
 }
 
 static void
@@ -1096,6 +1102,17 @@ lion_join_next_walked(LionCountScanState *st, int64 *countp)
 
 		CHECK_FOR_INTERRUPTS();
 
+		/*
+		 * Once a copy of the fact filters made part way through the run has
+		 * found them to select nothing (lion_join_maybe_switch()), no row
+		 * after joins a fact row: only an anti join has rows left.
+		 */
+		if (st->wheremissing && !anti)
+		{
+			lion_join_batch_reset(st);
+			return false;
+		}
+
 		if (st->joinbatchpos >= st->joinbatchn &&
 			!lion_join_fill_batch(st))
 		{
@@ -1108,9 +1125,8 @@ lion_join_next_walked(LionCountScanState *st, int64 *countp)
 		{
 			/*
 			 * Joins nothing: an anti join's row, which only it batched - or,
-			 * once a copy of the fact filters made part way through the run
-			 * has found them to select nothing (lion_join_maybe_switch()),
-			 * any row, looked up no more.
+			 * once that copy has been made, any row of it, the rest of the
+			 * batch and the batches after, looked up no more.
 			 */
 			if (!anti)
 				continue;
@@ -1196,6 +1212,16 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
 		instr_time	t;
 
 		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * A copy made part way through that selects nothing ends a semi or
+		 * inner join's run, as walked (lion_join_next_walked()).
+		 */
+		if (st->wheremissing && !anti)
+		{
+			st->childslot = NULL;
+			return false;
+		}
 
 		if (st->joinsum)
 			lion_pause_run(st);
@@ -1487,7 +1513,10 @@ lion_join_count_parts(LionCountScanState *st)
  * it tested before any of its rows goes up - into the key's entry, as a
  * partitioned fact's are (lion_join_count_parts()) - so that the rows can go
  * up in the child's order, and the walk keeps its place from one key to the
- * next without a row going up in between.
+ * next without a row going up in between.  Once a copy of the fact filters
+ * made part way through the run has found them to select nothing
+ * (lion_join_maybe_switch()), the keys left - of this batch and the ones
+ * after - are looked up no more, and join nothing.
  */
 static void
 lion_join_count_batch(LionCountScanState *st)
@@ -1499,6 +1528,8 @@ lion_join_count_batch(LionCountScanState *st)
 		LionJoinEnt *ent = &st->joinbatch[k];
 		bool		found;
 
+		if (st->wheremissing)
+			break;
 		if (ent->isnull)
 			continue;
 		CHECK_FOR_INTERRUPTS();
@@ -1560,7 +1591,13 @@ lion_join_next_parts(LionCountScanState *st, int64 *countp)
 		CHECK_FOR_INTERRUPTS();
 		if (st->joinbatchpos >= st->joinbatchn)
 		{
-			if (!lion_join_fill_batch(st))
+			/*
+			 * The batch tested whole has gone up; after a copy of a plain
+			 * fact's filters that selects nothing, only an anti join has
+			 * rows left.  (A leaf partition's empty copy leaves only that
+			 * leaf out, and not past its turn: lion_join_count_parts().)
+			 */
+			if ((st->wheremissing && !anti) || !lion_join_fill_batch(st))
 			{
 				lion_join_batch_reset(st);
 				return false;
@@ -1960,7 +1997,7 @@ lion_next_join_row(LionCountScanState *st)
 {
 	LionClauseState *jcl = &st->clause[st->joinclause];
 	bool		anti = (st->jointype == LION_JOIN_ANTI);
-	bool		walked = false;
+	bool		walked;
 	int64		count;
 	MemoryContext oldcxt;
 
@@ -1994,44 +2031,58 @@ lion_next_join_row(LionCountScanState *st)
 		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, count);
 	}
 
-	if (!st->joincollected)
-		lion_join_collect(st);
-
 	/*
-	 * A fact clause that selects nothing leaves no dimension row a count - and
-	 * makes every one of them a row of an anti join, which the loop below
-	 * emits without a lookup.
+	 * The run's first row: the fact filters collected where the plan says,
+	 * and the way the child is read decided, for the whole run (joinbegun,
+	 * joinwalked).  A copy of the filters made part way through that selects
+	 * nothing (lion_join_maybe_switch()) does not change it: each way sees to
+	 * that itself, the rows of a batch tested whole still going up.
 	 */
-	if (st->wheremissing && !anti)
+	if (!st->joinbegun)
 	{
-		st->done = true;
-		return NULL;
-	}
+		if (!st->joincollected)
+			lion_join_collect(st);
 
-	if (st->joinunique && !st->joinsortdone)
-		lion_join_sort_keys(st);
-
-	/*
-	 * The walk of the fk index's directory, begun once for the node in its
-	 * query memory, which resolves the key's probe once for all the lookups
-	 * (lion_lookup_walk_begin()) - in key order when the plan asks for it and
-	 * the keys can be sorted into it, and otherwise a descent per key.  Keys
-	 * the directory cannot be sorted by - a cross-type key whose family has
-	 * no ordering of its own for that type (lion_probe_init()) - are looked
-	 * up a row at a time, as they would be without the walk.
-	 */
-	if (!st->wheremissing)
-	{
-		if (!st->joinwalkbegun)
+		/*
+		 * A fact clause that selects nothing leaves no dimension row a count
+		 * - and makes every one of them a row of an anti join, which the
+		 * loop a row at a time emits without a lookup.
+		 */
+		if (st->wheremissing && !anti)
 		{
-			oldcxt = MemoryContextSwitchTo(st->css.ss.ps.state->es_query_cxt);
-			lion_lookup_walk_begin(&st->joinwalker, jcl->idx, jcl->idxcol,
-								   jcl->valtype);
-			MemoryContextSwitchTo(oldcxt);
-			st->joinwalkbegun = true;
+			st->done = true;
+			return NULL;
 		}
-		walked = (st->joinwalk && lion_lookup_walk_ordered(&st->joinwalker));
+
+		if (st->joinunique && !st->joinsortdone)
+			lion_join_sort_keys(st);
+
+		/*
+		 * The walk of the fk index's directory, begun once for the node in
+		 * its query memory, which resolves the key's probe once for all the
+		 * lookups (lion_lookup_walk_begin()) - in key order when the plan
+		 * asks for it and the keys can be sorted into it, and otherwise a
+		 * descent per key.  Keys the directory cannot be sorted by - a
+		 * cross-type key whose family has no ordering of its own for that
+		 * type (lion_probe_init()) - are looked up a row at a time, as they
+		 * would be without the walk.
+		 */
+		if (!st->wheremissing)
+		{
+			if (!st->joinwalkbegun)
+			{
+				oldcxt = MemoryContextSwitchTo(st->css.ss.ps.state->es_query_cxt);
+				lion_lookup_walk_begin(&st->joinwalker, jcl->idx, jcl->idxcol,
+									   jcl->valtype);
+				MemoryContextSwitchTo(oldcxt);
+				st->joinwalkbegun = true;
+			}
+			st->joinwalked = (st->joinwalk &&
+							  lion_lookup_walk_ordered(&st->joinwalker));
+		}
+		st->joinbegun = true;
 	}
+	walked = st->joinwalked;
 
 	if (st->joinsum)
 	{

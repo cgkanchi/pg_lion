@@ -1677,6 +1677,19 @@ typedef struct LionCountScanState
 	int64		joinlastcount;
 
 	/*
+	 * How a run over a plain fact table reads its child: in those batches,
+	 * walked in key order (joinwalked), or a row at a time.  It is decided
+	 * once, at the run's first row (joinbegun), and kept to the run's end:
+	 * a copy of the fact filters made part way through that finds them to
+	 * select nothing sets wheremissing, which each way answers for itself
+	 * (DESIGN.md §27, "Probed, then collected"), and must not change the way
+	 * - the batch in hand would be dropped and the child read on, or read
+	 * again, a row at a time.
+	 */
+	bool		joinbegun;
+	bool		joinwalked;
+
+	/*
 	 * A partitioned fact table (DESIGN.md §27, "A partitioned fact table"):
 	 * every batch of keys is taken to each leaf partition in turn, and each
 	 * key's counts added up in its entry (LionJoinEnt.acc).  joinpart is the
