@@ -1209,9 +1209,32 @@ lion_release_where(LionCountScanState *st)
 	st->sumallitem = -1;
 }
 
+/*
+ * A row of one or two GROUP BY columns - the entry walk's group, a pair of
+ * the nested loop (DESIGN.md §20) - or of none: lion_emit_keys() of them.
+ */
 TupleTableSlot *
 lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull,
 			   Datum key2, bool key2isnull, int64 count)
+{
+	Datum		keys[2];
+	bool		isnull[2];
+
+	keys[0] = key;
+	isnull[0] = keyisnull;
+	keys[1] = key2;
+	isnull[1] = key2isnull;
+	return lion_emit_keys(st, 2, keys, isnull, count);
+}
+
+/*
+ * The row of a group: the key of each of its nkeys GROUP BY columns, in the
+ * plan's order, and its count - the target list's columns made of them, the
+ * HAVING applied and the projection done.  NULL when the HAVING rejects it.
+ */
+TupleTableSlot *
+lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
+			   const bool *keyisnull, int64 count)
 {
 	TupleTableSlot *slot = st->css.ss.ss_ScanTupleSlot;
 	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
@@ -1254,13 +1277,15 @@ lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull,
 		switch (kind)
 		{
 			case LION_TL_GROUPKEY:
-				slot->tts_values[i] = key;
-				slot->tts_isnull[i] = keyisnull;
+				Assert(nkeys >= 1);
+				slot->tts_values[i] = keys[0];
+				slot->tts_isnull[i] = keyisnull[0];
 				break;
 
 			case LION_TL_GROUPKEY2:
-				slot->tts_values[i] = key2;
-				slot->tts_isnull[i] = key2isnull;
+				Assert(nkeys >= 2);
+				slot->tts_values[i] = keys[1];
+				slot->tts_isnull[i] = keyisnull[1];
 				break;
 
 			case LION_TL_COUNT:
@@ -1269,11 +1294,11 @@ lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull,
 
 			case LION_TL_COUNT_GROUPCOL:
 				/* count(group column): 0 in the NULL group (DESIGN.md §14) */
-				slot->tts_values[i] = Int64GetDatum(keyisnull ? 0 : count);
+				slot->tts_values[i] = Int64GetDatum(keyisnull[0] ? 0 : count);
 				break;
 
 			case LION_TL_COUNT_GROUPCOL2:
-				slot->tts_values[i] = Int64GetDatum(key2isnull ? 0 : count);
+				slot->tts_values[i] = Int64GetDatum(keyisnull[1] ? 0 : count);
 				break;
 
 			case LION_TL_COUNT_ZERO:
@@ -1292,6 +1317,24 @@ lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull,
 				break;
 
 			default:
+				if (LION_TL_IS_GROUPKEYN(kind))
+				{
+					/* the third or a later column of the decoded walk (§34) */
+					int			g = LION_TL_GROUPN_COL(kind);
+
+					Assert(g < nkeys);
+					slot->tts_values[i] = keys[g];
+					slot->tts_isnull[i] = keyisnull[g];
+					break;
+				}
+				if (LION_TL_IS_COUNT_GROUPCOLN(kind))
+				{
+					int			g = LION_TL_GROUPN_COL(kind);
+
+					Assert(g < nkeys);
+					slot->tts_values[i] = Int64GetDatum(keyisnull[g] ? 0 : count);
+					break;
+				}
 				{
 					/*
 					 * A column a clause pins to one value: report the key the

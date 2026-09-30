@@ -166,6 +166,8 @@ typedef struct LionCountPathBuild
 	bool		groupvalueout[LION_MAX_GROUPCOLS];
 	double		groupest[LION_MAX_GROUPCOLS];
 	int			ngroup;
+	bool		decode;			/* three or more columns: the decoded walk
+								 * of DESIGN.md §34 counts them */
 	AttrNumber	driveattno;		/* column whose index drives the entry scan */
 	bool		singlegroup;
 	bool		sumall;
@@ -538,8 +540,23 @@ lion_count_path_group_by(LionCountPathBuild *cx)
 				 (extra->flags & GROUPING_CAN_PARTIAL_AGG) == 0))
 				return false;
 
+			/*
+			 * Three or more columns are the decoded walk of DESIGN.md §34,
+			 * which emits partial counts too - a combination's rows may come
+			 * out in more than one row, when a pass's tally spills - for a
+			 * Finalize Agg to add up: the same two requirements.  It counts
+			 * one table, and is not made on a hot standby, where no WHERE is
+			 * collected.
+			 */
+			if (list_length(root->processed_groupClause) > 2 &&
+				(cx->partitioned || !sgc->hashable || extra == NULL ||
+				 (extra->flags & GROUPING_CAN_PARTIAL_AGG) == 0 ||
+				 RecoveryInProgress()))
+				return false;
+
 			cx->ngroup++;
 		}
+		cx->decode = (cx->ngroup > 2);
 	}
 	return true;
 }
@@ -1282,6 +1299,17 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 	Index		rti = cx->rti;
 	ListCell   *lc;
 
+	/*
+	 * The decoded walk (DESIGN.md §34) reads the WHERE as one collected copy,
+	 * and a range is walked rather than collected once it is too large to
+	 * collect: not beside it, as yet.  Nor a WHERE of negated clauses alone
+	 * (`c IS NOT NULL`), whose copy - the positive clauses' intersection,
+	 * less the others - has nothing to begin from.
+	 */
+	if (cx->decode && (cx->hasrangesrc || cx->rangevars != NIL ||
+					   (cx->wherekinds != NIL && !cx->havepositive)))
+		return false;
+
 	/* Something has to drive the count. */
 	cx->driveattno = cx->groupattno[0];
 	if (cx->distvar != NULL && cx->ngroup == 0)
@@ -1478,26 +1506,39 @@ lion_count_path_targets(LionCountPathBuild *cx)
 		cx->groupest[g] = estimate_num_groups(root,
 											  list_make1(cx->groupvar[g]),
 											  input_rel->rows, NULL, NULL);
-	if (cx->ngroup == 2 && cx->groupest[1] < cx->groupest[0])
-	{
-		Var		   *tv = cx->groupvar[0];
-		AttrNumber	ta = cx->groupattno[0];
-		Oid			te = cx->groupeqop[0];
-		bool		tvo = cx->groupvalueout[0];
-		double		tn = cx->groupest[0];
 
-		cx->groupvar[0] = cx->groupvar[1];
-		cx->groupattno[0] = cx->groupattno[1];
-		cx->groupeqop[0] = cx->groupeqop[1];
-		cx->groupvalueout[0] = cx->groupvalueout[1];
-		cx->groupest[0] = cx->groupest[1];
-		cx->groupvar[1] = tv;
-		cx->groupattno[1] = ta;
-		cx->groupeqop[1] = te;
-		cx->groupvalueout[1] = tvo;
-		cx->groupest[1] = tn;
-		cx->driveattno = cx->groupattno[0];
+	/*
+	 * ... and the decoded walk of DESIGN.md §34 takes them in that order too:
+	 * its first column's sets are the ones it keeps pinned, and a pass takes
+	 * only as many of its values as the pin budget allows, so the fewer the
+	 * better.  An insertion sort, stable, of at most LION_MAX_GROUPCOLS.
+	 */
+	for (g = 1; g < cx->ngroup; g++)
+	{
+		int			h;
+
+		for (h = g; h > 0 && cx->groupest[h] < cx->groupest[h - 1]; h--)
+		{
+			Var		   *tv = cx->groupvar[h - 1];
+			AttrNumber	ta = cx->groupattno[h - 1];
+			Oid			te = cx->groupeqop[h - 1];
+			bool		tvo = cx->groupvalueout[h - 1];
+			double		tn = cx->groupest[h - 1];
+
+			cx->groupvar[h - 1] = cx->groupvar[h];
+			cx->groupattno[h - 1] = cx->groupattno[h];
+			cx->groupeqop[h - 1] = cx->groupeqop[h];
+			cx->groupvalueout[h - 1] = cx->groupvalueout[h];
+			cx->groupest[h - 1] = cx->groupest[h];
+			cx->groupvar[h] = tv;
+			cx->groupattno[h] = ta;
+			cx->groupeqop[h] = te;
+			cx->groupvalueout[h] = tvo;
+			cx->groupest[h] = tn;
+		}
 	}
+	if (cx->ngroup > 0)
+		cx->driveattno = cx->groupattno[0];
 
 	memset(drive, 0, sizeof(drive));
 	if (cx->ngroup > 0)
@@ -1601,12 +1642,15 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 	/* ---- build the path ---- */
 	if (cx->ngroup == 1)
 		cx->numgroups = cx->groupest[0];
-	else if (cx->ngroup == 2)
+	else if (cx->ngroup >= 2)
 	{
-		cx->numgroups = estimate_num_groups(root,
-											list_make2(cx->groupvar[0],
-													   cx->groupvar[1]),
-											input_rel->rows, NULL, NULL);
+		List	   *vars = NIL;
+		int			g;
+
+		for (g = 0; g < cx->ngroup; g++)
+			vars = lappend(vars, cx->groupvar[g]);
+		cx->numgroups = estimate_num_groups(root, vars, input_rel->rows,
+											NULL, NULL);
 	}
 	else if (cx->sumall && cx->rangevar != NULL)
 	{
@@ -1638,6 +1682,18 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 	 */
 	if (cx->ngroup == 0)
 		cx->outrows = 1.0;
+	else if (cx->decode)
+	{
+		/*
+		 * The decoded walk's rows are partial counts, one a combination with
+		 * rows (DESIGN.md §34), below a Finalize Agg - as a partitioned
+		 * table's are.
+		 */
+		cx->outrows = cx->numgroups;
+		cx->partialtarget = lion_make_partial_target(root,
+													 output_rel->reltarget,
+													 cx->having);
+	}
 	else if (!cx->partitioned)
 		cx->outrows = cx->numgroups;
 	else
@@ -1696,15 +1752,16 @@ lion_count_path_encode(LionCountPathBuild *cx)
 							  (!cx->partitioned &&
 							   first->driveidx[0] != NULL) ?
 							  first->driveidx[0]->indexoid : InvalidOid,
-							  (!cx->partitioned &&
+							  (!cx->partitioned && !cx->decode &&
 							   first->driveidx[1] != NULL) ?
 							  first->driveidx[1]->indexoid : InvalidOid);
 	cx->ints = list_make4_int((int) cx->rti, (int) cx->groupattno[0],
-							  (int) cx->groupattno[1],
+							  cx->decode ? 0 : (int) cx->groupattno[1],
 							  (cx->singlegroup ? LION_FLAG_SINGLEGROUP : 0) |
 							  (cx->sumall ? LION_FLAG_SUMALL : 0) |
 							  (cx->driveattno != 0 ? LION_FLAG_GROUPIDX : 0) |
-							  (cx->rangevar != NULL ? LION_FLAG_RANGE : 0));
+							  (cx->rangevar != NULL ? LION_FLAG_RANGE : 0) |
+							  (cx->decode ? LION_FLAG_DECODE : 0));
 	{
 		ListCell   *l1;
 		ListCell   *l2;
@@ -1890,6 +1947,24 @@ lion_count_path_make(LionCountPathBuild *cx)
 				NIL);
 	cpath->custom_private = lappend(cpath->custom_private, cx->impliedtexts);
 	cpath->custom_private = lappend(cpath->custom_private, NIL);	/* fact group */
+
+	/* the decoded walk's columns (DESIGN.md §34), in the order it takes them */
+	if (cx->decode)
+	{
+		List	   *attnos = NIL;
+		List	   *idxoids = NIL;
+		int			g;
+
+		for (g = 0; g < cx->ngroup; g++)
+		{
+			attnos = lappend_int(attnos, (int) cx->groupattno[g]);
+			idxoids = lappend_oid(idxoids, first->driveidx[g]->indexoid);
+		}
+		cpath->custom_private = lappend(cpath->custom_private,
+										list_make2(attnos, idxoids));
+	}
+	else
+		cpath->custom_private = lappend(cpath->custom_private, NIL);
 	cpath->methods = &lion_count_path_methods;
 
 	return cpath;
@@ -1916,22 +1991,31 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	 * DESIGN.md §20, g outer and k inner, and is priced as those pairs
 	 * (DESIGN.md §26); without one, k's entries are the "groups" of the walk.
 	 */
-	lion_cost_count_path(root, cpath, cx->targets, cx->whereclauses,
-						cx->wherekinds, cx->ors,
-						cx->numgroups, cx->groupest[0],
-						(cx->ngroup == 2) ? cx->groupest[1] :
-						(cx->distvar != NULL && cx->ngroup == 1) ?
-						cx->distest : 0,
-						cx->outrows,
-						(cx->distvar == NULL) ? LION_DISTINCT_NONE :
-						cx->distcounts ? LION_DISTINCT_COUNT :
-						LION_DISTINCT_EXISTS,
-						(cx->rangevar == NULL) ?
-						((cx->sumall && cx->distvar == NULL) ?
-						 LION_RANGED_SUMALL :
-						 LION_RANGED_NONE) :
-						cx->sumall ? LION_RANGED_SUM : LION_RANGED_WALK,
-						cx->rangesel, &rangeprice);
+	if (cx->decode)
+	{
+		lion_cost_decode_path(root, cpath, cx->targets, cx->whereclauses,
+							  cx->wherekinds, cx->ors, cx->ngroup,
+							  cx->groupest, cx->numgroups, cx->outrows);
+		rangeprice.batched = false;
+		rangeprice.perrange = 0;
+	}
+	else
+		lion_cost_count_path(root, cpath, cx->targets, cx->whereclauses,
+							 cx->wherekinds, cx->ors,
+							 cx->numgroups, cx->groupest[0],
+							 (cx->ngroup == 2) ? cx->groupest[1] :
+							 (cx->distvar != NULL && cx->ngroup == 1) ?
+							 cx->distest : 0,
+							 cx->outrows,
+							 (cx->distvar == NULL) ? LION_DISTINCT_NONE :
+							 cx->distcounts ? LION_DISTINCT_COUNT :
+							 LION_DISTINCT_EXISTS,
+							 (cx->rangevar == NULL) ?
+							 ((cx->sumall && cx->distvar == NULL) ?
+							  LION_RANGED_SUMALL :
+							  LION_RANGED_NONE) :
+							 cx->sumall ? LION_RANGED_SUM : LION_RANGED_WALK,
+							 cx->rangesel, &rangeprice);
 	serialrun = cpath->path.total_cost;
 
 	/*

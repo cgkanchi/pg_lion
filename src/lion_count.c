@@ -604,7 +604,11 @@ lion_recheck_heap_am(LionCountCtx *cx)
 		}
 
 		if (lion_table_fetch_tid(cx->heap, &tid, cx->snapshot, NULL))
+		{
 			visible++;
+			if (cx->visout != NULL)
+				cx->visout[i] = true;
+		}
 
 		if ((i & 0x3ff) == 0)
 			CHECK_FOR_INTERRUPTS();
@@ -695,7 +699,11 @@ lion_recheck_heap_heap(LionCountCtx *cx)
 			do
 			{
 				if (lion_vis_entry_visible(e, ItemPointerGetOffsetNumber(&cx->tids[i])))
+				{
 					visible++;
+					if (cx->visout != NULL)
+						cx->visout[i] = true;
+				}
 				i++;
 			} while (i < cx->ntids &&
 					 ItemPointerGetBlockNumber(&cx->tids[i]) == blk);
@@ -719,7 +727,11 @@ lion_recheck_heap_heap(LionCountCtx *cx)
 			do
 			{
 				if (lion_vis_entry_visible(e, ItemPointerGetOffsetNumber(&cx->tids[i])))
+				{
 					visible++;
+					if (cx->visout != NULL)
+						cx->visout[i] = true;
+				}
 				i++;
 			} while (i < cx->ntids &&
 					 ItemPointerGetBlockNumber(&cx->tids[i]) == blk);
@@ -733,7 +745,11 @@ lion_recheck_heap_heap(LionCountCtx *cx)
 
 				if (heap_hot_search_buffer(&tid, cx->heap, buf, cx->snapshot,
 										   &heapTuple, NULL, true))
+				{
 					visible++;
+					if (cx->visout != NULL)
+						cx->visout[i] = true;
+				}
 				i++;
 			} while (i < cx->ntids &&
 					 ItemPointerGetBlockNumber(&cx->tids[i]) == blk);
@@ -810,6 +826,7 @@ lion_recheck_heap_filtered(LionCountCtx *cx)
 {
 	LionRowFilter *filter = cx->filter;
 	OffsetNumber vis[MaxHeapTuplesPerPage];
+	int			visidx[MaxHeapTuplesPerPage];	/* ... and its place in tids */
 	int64		passed = 0;
 	int			i = 0;
 
@@ -837,6 +854,7 @@ lion_recheck_heap_filtered(LionCountCtx *cx)
 				/* one visible member per chain, one chain per candidate */
 				if (nvis >= MaxHeapTuplesPerPage)
 					elog(ERROR, "lion index count: more visible tuples than a heap page holds");
+				visidx[nvis] = i;
 				vis[nvis++] = ItemPointerGetOffsetNumber(&tid);
 			}
 			i++;
@@ -857,7 +875,11 @@ lion_recheck_heap_filtered(LionCountCtx *cx)
 			ItemPointerSet(&tuple.t_self, blk, vis[j]);
 
 			if (lion_row_filter_test(filter, &tuple))
+			{
 				passed++;
+				if (cx->visout != NULL)
+					cx->visout[visidx[j]] = true;
+			}
 			else
 				cx->stats.rows_removed++;
 		}
@@ -944,6 +966,29 @@ lion_recheck_heap(LionCountCtx *cx)
 		visible = lion_recheck_heap_am(cx);
 
 	cx->stats.tids_rechecked += cx->ntids;
+	return visible;
+}
+
+/*
+ * The heap's answer for each TID of cx->tids rather than their number: vis[i]
+ * is set when the i'th is a row the snapshot sees (and, under a row filter,
+ * one that passes it), for a caller that has to know WHICH rows - the decoded
+ * walk (DESIGN.md §34), whose rows each belong to a combination of groups it
+ * keeps beside them.  The list must be in (block, offset) order already, as
+ * every list built key by key is, since sorting it here would part it from
+ * what the caller keeps beside it; it is left as it is, and so is vis for
+ * every TID the heap does not show.  Returns how many were visible.
+ */
+int64
+lion_recheck_visible(LionCountCtx *cx, bool *vis)
+{
+	int64		visible;
+
+	if (!cx->tids_sorted)
+		elog(ERROR, "lion index count: a recheck by row of TIDs out of order");
+	cx->visout = vis;
+	visible = lion_recheck_heap(cx);
+	cx->visout = NULL;
 	return visible;
 }
 

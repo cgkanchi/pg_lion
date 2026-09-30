@@ -409,6 +409,21 @@ lion_explain_group_index(LionCountScanState *st, List *ancestors,
 		appendStringInfo(buf, "(%s)",
 						 get_attname(st->heapoid, st->innerattno, false));
 	}
+
+	/*
+	 * The other columns of the decoded walk (DESIGN.md §34), each read from
+	 * its own index; the scan is never partitioned.
+	 */
+	if (st->decode != NULL)
+	{
+		for (i = 1; i < st->decode->ncol; i++)
+			appendStringInfo(buf, ", %s%s (%s)",
+							 get_rel_name(st->decode->idxoid[i]),
+							 lion_explain_col(st->decode->idxoid[i],
+											  st->decode->attno[i], false),
+							 get_attname(st->heapoid, st->decode->attno[i],
+										 false));
+	}
 }
 
 /*
@@ -739,6 +754,23 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 		pfree(buf.data);
 		pfree(val);
 	}
+	else if (st->decode != NULL)
+	{
+		/*
+		 * The decoded walk (DESIGN.md §34): every column, in the order it
+		 * takes them, the first the one whose sets it pins.
+		 */
+		int			c;
+
+		initStringInfo(&buf);
+		for (c = 0; c < st->decode->ncol; c++)
+			appendStringInfo(&buf, "%s%s", (c > 0) ? ", " : "",
+							 get_attname(st->heapoid, st->decode->attno[c],
+										 false));
+		ExplainPropertyText("Group Key", buf.data, es);
+		ExplainPropertyText("Group Strategy", "Decoded", es);
+		pfree(buf.data);
+	}
 	else if (st->hasgroupidx && st->groupattno != 0)
 	{
 		initStringInfo(&buf);
@@ -958,6 +990,26 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 		ExplainPropertyInteger("Groups Counted in Batches", NULL,
 							   st->groupsbatched + st->workergroupsbatched,
 							   es);
+	}
+
+	/*
+	 * The decoded walk's passes (DESIGN.md §34): the container keys it
+	 * decoded, the rows it counted under their combinations - from the map
+	 * or the heap - and those the heap was asked about, the partial rows it
+	 * handed up, and how often a pass's tally went to its temporary file.
+	 */
+	if (st->decode != NULL && st->decode->passes > 0)
+	{
+		LionDecodeRun *dr = st->decode;
+
+		ExplainPropertyInteger("Decoded Passes", NULL, dr->passes, es);
+		ExplainPropertyInteger("Decoded Keys", NULL, dr->stats.keys, es);
+		ExplainPropertyInteger("Decoded Rows", NULL, dr->stats.rows, es);
+		ExplainPropertyInteger("Decoded Rows Rechecked", NULL,
+							   dr->stats.rechecked, es);
+		ExplainPropertyInteger("Partial Rows", NULL, dr->rowsup, es);
+		if (dr->stats.spills > 0)
+			ExplainPropertyInteger("Tally Spills", NULL, dr->stats.spills, es);
 	}
 
 	/*

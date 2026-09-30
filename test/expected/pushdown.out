@@ -703,17 +703,18 @@ SELECT lion_pd('SELECT count(*) FROM lion_pdt');
  not pushed down, 1 rows
 (1 row)
 
--- GROUP BY an unindexed column, and by more than two columns
+-- GROUP BY an unindexed column
 SELECT lion_pd('SELECT id, count(*) FROM lion_pdt WHERE a = 3 GROUP BY id');
            lion_pd           
 -----------------------------
  not pushed down, 10000 rows
 (1 row)
 
+-- three indexed columns are the decoded walk of DESIGN.md section 34
 SELECT lion_pd('SELECT a, b, c, count(*) FROM lion_pdt GROUP BY a, b, c');
-          lion_pd          
----------------------------
- not pushed down, 140 rows
+        lion_pd        
+-----------------------
+ pushed down, 140 rows
 (1 row)
 
 -- two indexed columns are the nested loop of DESIGN.md section 20, below

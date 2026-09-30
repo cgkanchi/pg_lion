@@ -783,6 +783,55 @@ extern void lion_count_groups_copy(Relation heap, Snapshot snapshot,
 extern int	lion_count_groups_batch(Relation index);
 
 /*
+ * THE GROUPS OF SEVERAL COLUMNS, DECODED KEY BY KEY (DESIGN.md §34,
+ * lion_count_decode.c).  One pass of a GROUP BY of ncol columns: column c's
+ * values in the pass are the nsets located sets of cols[c], and the rows of a
+ * combination (v0, ..., vn) are those in every one of its sets and in the
+ * collected WHERE (`where`, or every row without one).  Column 0's sets carry
+ * the §9 interlock and must be located with their pins; the others' are read
+ * with none.  Each combination with a visible row is added to the tally under
+ * its code, v0 * radix[1] * ... + ... + vn, radix[c] being cols[c].nsets.
+ */
+#define LION_MAX_DECODE_COLS	8
+
+typedef struct LionDecodeCol
+{
+	int			nsets;
+	LionPostingSet *sets;
+	PGAlignedBlock *images;		/* nsets page images for the cursors of
+								 * CHAIN sets, or NULL for their own */
+} LionDecodeCol;
+
+/* What a decoded walk did, for EXPLAIN ANALYZE; summed over its passes. */
+typedef struct LionDecodeStats
+{
+	int64		keys;			/* container keys decoded */
+	int64		rows;			/* rows tallied, from the map or the heap */
+	int64		rechecked;		/* rows the heap was asked about */
+	int64		spills;			/* times the tally went to its temporary file */
+} LionDecodeStats;
+
+typedef struct LionDecodeTally LionDecodeTally;
+
+extern LionDecodeTally *lion_decode_tally_create(MemoryContext cxt,
+												 Size maxbytes);
+extern bool lion_decode_tally_begin(LionDecodeTally *t, int ncol,
+									const int *radix);
+extern bool lion_decode_tally_next(LionDecodeTally *t, uint64 *code,
+								   int64 *count);
+extern void lion_decode_tally_end(LionDecodeTally *t);
+extern Size lion_count_cursor_bytes(void);
+extern void lion_decode_code_split(uint64 code, int ncol, const int *radix,
+								   int *vals);
+extern void lion_count_groups_decode(Relation heap, Snapshot snapshot,
+									 int ncol, LionDecodeCol *cols,
+									 const LionPostingSet *where,
+									 LionDecodeTally *tally,
+									 LionCountStats *stats,
+									 LionDecodeStats *dstats,
+									 LionVisCache *cache, bool rel_read_only);
+
+/*
  * The same intersection collected ONCE for all the participants of a parallel
  * plan, into its dynamic shared memory (DESIGN.md §27, "One copy per query"):
  * the participants divide its container keys into chunks and collect them

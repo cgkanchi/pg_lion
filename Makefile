@@ -8,8 +8,8 @@ PAGES_OBJS = src/lion_pages.o src/lion_meta.o src/lion_state.o src/lion_entry.o 
 # The count engine: its interface is src/lion_count.h, and its files share the
 # private header src/lion_count_int.h.
 COUNT_OBJS = src/lion_set.o src/lion_set_copy.o src/lion_cursor.o src/lion_expr.o src/lion_vis.o \
-       src/lion_count.o src/lion_count_groups.o src/lion_count_shared.o src/lion_rangesrc.o \
-       src/lion_range.o src/lion_count_sql.o
+       src/lion_count.o src/lion_count_groups.o src/lion_count_decode.o src/lion_count_shared.o \
+       src/lion_rangesrc.o src/lion_range.o src/lion_count_sql.o
 # The LionCount custom scan: its planner half (lion_plan_*) and its executor
 # half (lion_exec_*), which share the private header src/lion_customscan.h.
 CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_target.o \
