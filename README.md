@@ -522,6 +522,9 @@ working around a bad choice:
   BY ts DESC LIMIT n` over a Lion index on `ts`), filtered by a Lion set of the other clauses or by
   the clauses themselves; on a table, or on each partition of one (DESIGN.md §30, §30.11). EXPLAIN
   names a column's walk `Ordered By: <index> (<column>[, backward])`.
+- `pg_lion.enable_lazy_set`: let `LionOrdered` evaluate its Lion set only at the ranges of 64 heap
+  blocks its walk reaches, and build it for the whole table only once that has cost what the build
+  would (DESIGN.md §30.4, "The set, lazily"). Off, the set is built before the walk starts.
 - `pg_lion.enable_decoded_walk`: count a `GROUP BY` of several Lion-indexed columns by decoding,
   at each range of 64 heap blocks, which value of each column every row has (DESIGN.md §34): three
   or more columns, and two where that is cheaper than the nested loop over their entries. Off, a

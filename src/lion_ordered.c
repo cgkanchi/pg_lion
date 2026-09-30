@@ -45,6 +45,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
 #include "commands/explain.h"
+#include "common/hashfn.h"
 #if PG_VERSION_NUM >= 180000
 #include "commands/explain_format.h"
 #endif
@@ -82,8 +83,9 @@
 #include "lion_count.h"
 #include "lion_costs.h"
 
-/* GUC, and the hook this file chains (both installed by lion_ordered_init). */
+/* GUCs, and the hook this file chains (all installed by lion_ordered_init). */
 bool		lion_enable_ordered_scan = true;
+bool		lion_enable_lazy_set = true;
 static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 
 /*
@@ -140,6 +142,20 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 #define LO_SWITCH_RATIO		32
 #define LO_SWITCH_MIN_WALK	10000
 
+/*
+ * The set evaluated lazily (DESIGN.md §30.4, "The set, lazily"), until its
+ * probes have cost what building it would: a probe of a stream is a unit of
+ * work for each of its posting sets, starting a stream again behind where it
+ * stands LO_LAZY_RESTART_WORK more for each, and the build reads each of the
+ * sets' containers once - the budget, never below LO_LAZY_MIN_WORK.  A walk
+ * that has met LO_LAZY_MAX_WALK entries is built for too, so that the early
+ * stop and the fetch-and-sort switch, which need the set's size, can act on
+ * it; as is one whose memo has taken half of hash_mem.
+ */
+#define LO_LAZY_MIN_WORK		64
+#define LO_LAZY_RESTART_WORK	4
+#define LO_LAZY_MAX_WALK		(4 * LO_SWITCH_MIN_WALK)
+
 #define LO_EXPR_LIONQUALS	0
 #define LO_EXPR_ORDQUALS	1
 #define LO_EXPR_LIONQUAL	2
@@ -184,6 +200,22 @@ typedef struct LionTidSet
  * Executor state
  * --------------------------------------------------------------------- */
 
+/*
+ * One scan key of a leaf, for the lazy set: its posting sets, located once
+ * and let go of (no pin is held between rows, §30.5), the tree over them
+ * (lion_scankey_sets()), and a stream of that tree's containers which is only
+ * ever sought forward - started again when a probe is behind it.
+ */
+typedef struct LoProbeKey
+{
+	int			nsets;
+	LionPostingSet *sets;
+	LionKeyNode *tree;			/* NULL: the key selects nothing */
+	MemoryContext cxt;			/* the stream's */
+	LionSetStream *stream;		/* NULL until the first probe */
+	uint32		last;			/* the container key last sought */
+} LoProbeKey;
+
 typedef struct LoLeaf
 {
 	Oid			indexoid;
@@ -193,6 +225,7 @@ typedef struct LoLeaf
 	int			nkeys;
 	IndexRuntimeKeyInfo *rtkeys;
 	int			nrtkeys;
+	LoProbeKey *pkeys;			/* [nkeys] while the set is lazy, else NULL */
 } LoLeaf;
 
 typedef struct LoNode
@@ -202,6 +235,29 @@ typedef struct LoNode
 	struct LoNode **child;
 	LoLeaf	   *leaf;
 } LoNode;
+
+/*
+ * What the lazy set is at one container key the walk met: its members there,
+ * and the ones this scan's walk has met.
+ */
+typedef struct LoMemoEnt
+{
+	uint32		ckey;
+	char		status;
+	LionContainer *c;			/* NULL: no member at this key */
+	uint64	   *visited;		/* in scancxt, NULL until a member is met */
+} LoMemoEnt;
+
+#define SH_PREFIX		lo_memo
+#define SH_ELEMENT_TYPE	LoMemoEnt
+#define SH_KEY_TYPE		uint32
+#define SH_KEY			ckey
+#define SH_HASH_KEY(tb, key)	murmurhash32(key)
+#define SH_EQUAL(tb, a, b)		((a) == (b))
+#define SH_SCOPE		static inline
+#define SH_DECLARE
+#define SH_DEFINE
+#include "lib/simplehash.h"
 
 /* A member fetched by the fetch-and-sort switch, with its sort keys. */
 typedef struct LoSortRow
@@ -265,6 +321,23 @@ typedef struct LionOrderedState
 	bool		degraded;
 	bool		exact;
 	uint64		members;		/* members of the set, when not degraded */
+
+	/*
+	 * ... or the set evaluated only at the container keys the walk meets
+	 * (DESIGN.md §30.4, "The set, lazily"), and what it is at each of them
+	 * remembered; built as above once the probes have cost what that would.
+	 */
+	bool		lazyok;			/* every leaf's keys are sets to seek in */
+	bool		lazy;			/* the set is lazy now */
+	bool		lazyempty;		/* ... and selects nothing at all */
+	MemoryContext lazycxt;		/* the leaves' sets and the memo */
+	MemoryContext probecxt;		/* one key's evaluation */
+	lo_memo_hash *memo;
+	Size		memobytes;
+	double		lazywork;
+	double		lazybudget;
+	double		lazymembers;	/* at most this many members: the sets' hints */
+	uint64		lazykeys;		/* EXPLAIN ANALYZE: keys evaluated */
 
 	/*
 	 * This scan's walk (DESIGN.md §30.4): which members it has met, one
@@ -1957,6 +2030,21 @@ lo_build_node(LionOrderedState *st, LoNode *node)
 	return acc;
 }
 
+/* The leaves' run-time keys, for this scan's Param values. */
+static void
+lo_leaf_keys(LionOrderedState *st)
+{
+	int			i;
+
+	ResetExprContext(st->lrtcxt);
+	for (i = 0; i < st->nleaves; i++)
+	{
+		if (st->leaves[i].nrtkeys > 0)
+			ExecIndexEvalRuntimeKeys(st->lrtcxt, st->leaves[i].rtkeys,
+									 st->leaves[i].nrtkeys);
+	}
+}
+
 static void
 lo_build_set(LionOrderedState *st)
 {
@@ -1969,15 +2057,7 @@ lo_build_set(LionOrderedState *st)
 	st->exact = !st->lossyqual;
 	st->limit = get_hash_memory_limit();
 
-	/* the leaves' run-time keys, for this scan's Param values */
-	ResetExprContext(st->lrtcxt);
-	for (i = 0; i < st->nleaves; i++)
-	{
-		if (st->leaves[i].nrtkeys > 0)
-			ExecIndexEvalRuntimeKeys(st->lrtcxt, st->leaves[i].rtkeys,
-									 st->leaves[i].nrtkeys);
-	}
-
+	lo_leaf_keys(st);
 	st->set = lo_build_node(st, st->tree);
 	MemoryContextReset(st->buildcxt);
 
@@ -1989,6 +2069,472 @@ lo_build_set(LionOrderedState *st)
 			st->members += st->set->conts[i]->cardinality;
 	}
 	st->builds++;
+}
+
+/* ---------------------------------------------------------------------
+ * The set, lazily (DESIGN.md §30.4, "The set, lazily")
+ * --------------------------------------------------------------------- */
+
+/*
+ * Can every key of every leaf be sought in: a set tree - an equality or a
+ * list - on a scalar column?  A range is a walk of entries, and a multi-key
+ * column's query may need every row; those leaves are only ever built.
+ */
+static bool
+lo_lazy_ok(LionOrderedState *st)
+{
+	int			i;
+	int			k;
+
+	if (st->noset)
+		return false;
+	for (i = 0; i < st->nleaves; i++)
+	{
+		LoLeaf	   *leaf = &st->leaves[i];
+
+		if (leaf->nkeys == 0)
+			return false;
+		for (k = 0; k < leaf->nkeys; k++)
+		{
+			ScanKey		sk = &leaf->keys[k];
+			LionState  *col = lion_index_column_state(leaf->index,
+													  sk->sk_attno);
+
+			if (col->multikey || sk->sk_strategy != LION_STRAT_EQUAL ||
+				(sk->sk_flags & (SK_SEARCHNULL | SK_SEARCHNOTNULL |
+								 SK_ROW_HEADER)) != 0)
+				return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * Let go of the lazy set: every stream, and every set - their pins before
+ * the memory they live in (lion_posting_set_release()) - and the memo.
+ */
+static void
+lo_lazy_end(LionOrderedState *st)
+{
+	int			i;
+	int			k;
+	int			s;
+
+	for (i = 0; i < st->nleaves; i++)
+	{
+		LoLeaf	   *leaf = &st->leaves[i];
+
+		if (leaf->pkeys == NULL)
+			continue;
+		for (k = 0; k < leaf->nkeys; k++)
+		{
+			LoProbeKey *pk = &leaf->pkeys[k];
+
+			if (pk->stream != NULL)
+				lion_stream_end(pk->stream);
+			pk->stream = NULL;
+			for (s = 0; s < pk->nsets; s++)
+				lion_posting_set_release(&pk->sets[s]);
+			pk->nsets = 0;
+		}
+		leaf->pkeys = NULL;
+	}
+	st->memo = NULL;
+	st->memobytes = 0;
+	st->lazy = false;
+	if (st->lazycxt != NULL)
+		MemoryContextReset(st->lazycxt);
+}
+
+/* Does node select nothing, whatever the key: a key of no entry at all? */
+static bool
+lo_lazy_empty(LoNode *node)
+{
+	int			i;
+
+	if (node->kind == LO_NODE_LEAF)
+	{
+		for (i = 0; i < node->leaf->nkeys; i++)
+		{
+			if (node->leaf->pkeys[i].tree == NULL)
+				return true;
+		}
+		return false;
+	}
+	for (i = 0; i < node->nchild; i++)
+	{
+		bool		empty = lo_lazy_empty(node->child[i]);
+
+		if (node->kind == LO_NODE_AND && empty)
+			return true;
+		if (node->kind == LO_NODE_OR && !empty)
+			return false;
+	}
+	return node->kind == LO_NODE_OR;
+}
+
+/*
+ * How many members node has at most, by the located entries' recorded member
+ * counts: an AND no more than its smallest child, an OR no more than its
+ * children together.  The counts are hints; this decides only when the set
+ * is built, never what it holds.
+ */
+static double
+lo_lazy_members(LoNode *node)
+{
+	double		n = 0.0;
+	int			i;
+	int			s;
+
+	if (node->kind == LO_NODE_LEAF)
+	{
+		for (i = 0; i < node->leaf->nkeys; i++)
+		{
+			LoProbeKey *pk = &node->leaf->pkeys[i];
+			double		m = 0.0;
+
+			if (pk->tree != NULL)
+				for (s = 0; s < pk->nsets; s++)
+					m += (double) pk->sets[s].ntids;
+			n = (i == 0) ? m : Min(n, m);
+		}
+		return n;
+	}
+	for (i = 0; i < node->nchild; i++)
+	{
+		double		m = lo_lazy_members(node->child[i]);
+
+		if (node->kind == LO_NODE_AND)
+			n = (i == 0) ? m : Min(n, m);
+		else
+			n += m;
+	}
+	return n;
+}
+
+/*
+ * Start the set lazily: locate every leaf key's posting sets, as a bitmap
+ * scan locates them, let go of their pins, and make the memo.  False when a
+ * key is no set tree after all, or a list longer than a plain scan opens at
+ * once (lion_scan_list_batch(), §29.4; a stream holds a cursor for each of
+ * its sets): the set is then built, a batch at a time.
+ */
+static bool
+lo_lazy_begin(LionOrderedState *st)
+{
+	MemoryContext oldcxt;
+	double		containers = 0.0;
+	int			i;
+	int			k;
+	int			s;
+
+	lo_leaf_keys(st);
+	lo_lazy_end(st);
+	oldcxt = MemoryContextSwitchTo(st->lazycxt);
+
+	for (i = 0; i < st->nleaves; i++)
+	{
+		LoLeaf	   *leaf = &st->leaves[i];
+
+		leaf->pkeys = (LoProbeKey *) palloc0(sizeof(LoProbeKey) * leaf->nkeys);
+		for (k = 0; k < leaf->nkeys; k++)
+		{
+			LoProbeKey *pk = &leaf->pkeys[k];
+			ScanKey		sk = &leaf->keys[k];
+			bool		nomatch = false;
+			bool		ok;
+
+			if ((sk->sk_flags & (SK_SEARCHARRAY | SK_ISNULL)) == SK_SEARCHARRAY)
+			{
+				ArrayType  *arr = DatumGetArrayTypeP(sk->sk_argument);
+
+				if (ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr)) >
+					lion_scan_list_batch())
+				{
+					MemoryContextSwitchTo(oldcxt);
+					lo_lazy_end(st);
+					return false;
+				}
+			}
+			ok = lion_scankey_sets(leaf->index, sk, &pk->nsets, &pk->sets,
+								   &pk->tree, &nomatch);
+			for (s = 0; s < pk->nsets; s++)
+			{
+				lion_posting_set_unpin(&pk->sets[s]);
+				containers += (double) pk->sets[s].ncontainers;
+			}
+			if (!ok)
+			{
+				MemoryContextSwitchTo(oldcxt);
+				lo_lazy_end(st);
+				return false;
+			}
+			if (nomatch)
+				pk->tree = NULL;
+			pk->cxt = AllocSetContextCreate(st->lazycxt, "LionOrdered stream",
+											ALLOCSET_SMALL_SIZES);
+			CHECK_FOR_INTERRUPTS();
+		}
+		pgstat_count_index_scan(leaf->index);
+	}
+
+	st->memo = lo_memo_create(st->lazycxt, 256, NULL);
+	MemoryContextSwitchTo(oldcxt);
+
+	st->memobytes = 0;
+	st->lazywork = 0.0;
+	st->lazybudget = Max((double) LO_LAZY_MIN_WORK, containers);
+	st->limit = get_hash_memory_limit();
+	st->exact = !st->lossyqual;
+	st->lazyempty = lo_lazy_empty(st->tree);
+	st->lazymembers = lo_lazy_members(st->tree);
+	st->lazy = true;
+	return true;
+}
+
+/*
+ * The container of pk's tree at ckey, or NULL: valid until pk is sought
+ * again.  The stream only goes forward, so a probe behind where it stands
+ * starts it again, over the same located sets.
+ */
+static const LionContainer *
+lo_probe_at(LionOrderedState *st, LoProbeKey *pk, uint32 ckey)
+{
+	const LionContainer *c;
+
+	if (pk->tree == NULL)
+		return NULL;
+	if (pk->stream != NULL && ckey < pk->last)
+	{
+		lion_stream_end(pk->stream);
+		pk->stream = NULL;
+		MemoryContextReset(pk->cxt);
+		st->lazywork += (double) (LO_LAZY_RESTART_WORK * pk->nsets);
+	}
+	if (pk->stream == NULL)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(pk->cxt);
+
+		pk->stream = lion_stream_begin(pk->nsets, pk->sets, pk->tree, false);
+		MemoryContextSwitchTo(oldcxt);
+	}
+	pk->last = ckey;
+	st->lazywork += (double) Max(pk->nsets, 1);
+	c = lion_stream_at(pk->stream, ckey);
+	return (c != NULL && c->ckey == ckey && c->cardinality > 0) ? c : NULL;
+}
+
+/* A copy of c in probecxt, with room for what an AND or an OR makes. */
+static LionContainer *
+lo_probe_copy(LionOrderedState *st, const LionContainer *c)
+{
+	LionContainer *r = (LionContainer *)
+		MemoryContextAlloc(st->probecxt, LION_CONTAINER_MAX_SIZE);
+
+	memcpy(r, c, lion_container_size(c));
+	return r;
+}
+
+/* What node selects at ckey, in probecxt, or NULL for nothing. */
+static LionContainer *
+lo_probe_node(LionOrderedState *st, LoNode *node, uint32 ckey)
+{
+	LionContainer *acc = NULL;
+	int			i;
+
+	if (node->kind == LO_NODE_LEAF)
+	{
+		LoLeaf	   *leaf = node->leaf;
+
+		for (i = 0; i < leaf->nkeys; i++)
+		{
+			const LionContainer *c = lo_probe_at(st, &leaf->pkeys[i], ckey);
+			LionContainer *r;
+
+			if (c == NULL)
+				return NULL;
+			if (acc == NULL)
+			{
+				acc = lo_probe_copy(st, c);
+				continue;
+			}
+			r = (LionContainer *) MemoryContextAlloc(st->probecxt,
+													 LION_CONTAINER_MAX_SIZE);
+			if (lion_container_and(acc, c, r) == 0)
+				return NULL;
+			acc = r;
+		}
+		return acc;
+	}
+
+	for (i = 0; i < node->nchild; i++)
+	{
+		LionContainer *c = lo_probe_node(st, node->child[i], ckey);
+		LionContainer *r;
+
+		if (c == NULL)
+		{
+			/* an empty AND stays empty: the other children need not be read */
+			if (node->kind == LO_NODE_AND)
+				return NULL;
+			continue;
+		}
+		if (acc == NULL)
+		{
+			acc = c;
+			continue;
+		}
+		r = (LionContainer *) MemoryContextAlloc(st->probecxt,
+												 LION_CONTAINER_MAX_SIZE);
+		if (node->kind == LO_NODE_AND)
+		{
+			if (lion_container_and(acc, c, r) == 0)
+				return NULL;
+		}
+		else
+			(void) lion_container_or(acc, c, r);
+		acc = r;
+	}
+	return acc;
+}
+
+/*
+ * The memo's entry for tid's container key if tid is a member, else NULL: a
+ * key met for the first time is evaluated and remembered, members or not.
+ */
+static LoMemoEnt *
+lo_lazy_find(LionOrderedState *st, ItemPointer tid)
+{
+	uint64		code = lion_tid_to_code(tid);
+	uint32		ckey = lion_code_ckey(code);
+	LoMemoEnt  *e = lo_memo_lookup(st->memo, ckey);
+
+	if (e == NULL)
+	{
+		LionContainer *c;
+		bool		found;
+
+		MemoryContextReset(st->probecxt);
+		c = lo_probe_node(st, st->tree, ckey);
+		e = lo_memo_insert(st->memo, ckey, &found);
+		e->c = NULL;
+		e->visited = NULL;
+		if (c != NULL && c->cardinality > 0)
+		{
+			Size		size = lion_container_size(c);
+
+			e->c = (LionContainer *) MemoryContextAlloc(st->lazycxt, size);
+			memcpy(e->c, c, size);
+			st->memobytes += size;
+		}
+		st->memobytes += sizeof(LoMemoEnt);
+		st->lazykeys++;
+		CHECK_FOR_INTERRUPTS();
+	}
+	if (e->c == NULL || !lion_container_contains(e->c, lion_code_lo(code)))
+		return NULL;
+	return e;
+}
+
+/* lo_mark() for the lazy set: the memo keeps what the walk met. */
+static bool
+lo_lazy_mark(LionOrderedState *st, LoMemoEnt *e, ItemPointer tid)
+{
+	uint16		lo = lion_code_lo(lion_tid_to_code(tid));
+	uint64		bit = UINT64CONST(1) << (lo & 63);
+
+	if (e->visited == NULL)
+	{
+		e->visited = (uint64 *) MemoryContextAllocZero(st->scancxt,
+													   LION_BITSET_BYTES);
+		st->memobytes += LION_BITSET_BYTES;
+	}
+	if (e->visited[lo >> 6] & bit)
+		return false;
+	e->visited[lo >> 6] |= bit;
+	return true;
+}
+
+/* The index of container key ckey in set, or -1. */
+static int
+lo_set_key_index(const LionTidSet *set, uint32 ckey)
+{
+	int			lo = 0;
+	int			hi = set->n - 1;
+
+	while (lo <= hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (set->keys[mid] == ckey)
+			return mid;
+		if (set->keys[mid] < ckey)
+			lo = mid + 1;
+		else
+			hi = mid - 1;
+	}
+	return -1;
+}
+
+/*
+ * The probes have cost what the build would, or the walk has gone far: build
+ * the set, and hand it what the walk met so far, so that the early stop and
+ * the switch count those members as met.  A member the build does not have
+ * cannot be - it is the same answer - but should one be missing, the scan
+ * stops counting (novisit) rather than let the switch fetch it again.
+ *
+ * The lazy set goes first: the build evaluates the leaves' run-time keys
+ * again, and the values the lazy sets were located from go with them.  What
+ * the walk met lives in scancxt, and outlives it.
+ */
+static void
+lo_lazy_convert(LionOrderedState *st)
+{
+	lo_memo_iterator it;
+	LoMemoEnt  *e;
+	uint32	   *mkeys;
+	uint64	  **mvisited;
+	int			nmet = 0;
+	uint64	  **visited = NULL;
+	bool		lost = false;
+	int			i;
+
+	mkeys = (uint32 *) MemoryContextAlloc(st->scancxt,
+										  sizeof(uint32) * Max(st->memo->members, 1));
+	mvisited = (uint64 **) MemoryContextAlloc(st->scancxt,
+											  sizeof(uint64 *) * Max(st->memo->members, 1));
+	lo_memo_start_iterate(st->memo, &it);
+	while ((e = lo_memo_iterate(st->memo, &it)) != NULL)
+	{
+		if (e->visited == NULL)
+			continue;
+		mkeys[nmet] = e->ckey;
+		mvisited[nmet++] = e->visited;
+	}
+	lo_lazy_end(st);
+
+	lo_build_set(st);
+	if (!st->degraded && st->set->n > 0)
+		visited = (uint64 **) MemoryContextAllocZero(st->scancxt,
+													 sizeof(uint64 *) * st->set->n);
+	for (i = 0; i < nmet; i++)
+	{
+		int			idx = (visited != NULL) ?
+			lo_set_key_index(st->set, mkeys[i]) : -1;
+
+		if (idx < 0)
+		{
+			lost = true;
+			continue;
+		}
+		visited[idx] = mvisited[i];
+		st->visitedbytes += LION_BITSET_BYTES;
+	}
+	st->visited = visited;
+	if (lost)
+		st->novisit = true;
+	pfree(mkeys);
+	pfree(mvisited);
 }
 
 /* ---------------------------------------------------------------------
@@ -2249,6 +2795,18 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 
 	/* which Params a rescan has to rebuild the set for */
 	st->lionparams = pull_paramids((Expr *) lionquals);
+
+	/* the set evaluated lazily, when every leaf's keys can be sought (§30.4) */
+	st->lazyok = lion_enable_lazy_set && lo_lazy_ok(st);
+	if (st->lazyok)
+	{
+		st->lazycxt = AllocSetContextCreate(estate->es_query_cxt,
+											"LionOrdered lazy set",
+											ALLOCSET_DEFAULT_SIZES);
+		st->probecxt = AllocSetContextCreate(estate->es_query_cxt,
+											 "LionOrdered probe",
+											 ALLOCSET_DEFAULT_SIZES);
+	}
 }
 
 /* The next TID of the ordered index, or NULL at its end. */
@@ -2396,6 +2954,20 @@ lo_start_walk(LionOrderedState *st)
 static void
 lo_scan_reset(LionOrderedState *st)
 {
+	/* what the lazy set's memo says this scan met goes with scancxt */
+	if (st->memo != NULL)
+	{
+		lo_memo_iterator it;
+		LoMemoEnt  *e;
+
+		lo_memo_start_iterate(st->memo, &it);
+		while ((e = lo_memo_iterate(st->memo, &it)) != NULL)
+		{
+			if (e->visited != NULL)
+				st->memobytes -= LION_BITSET_BYTES;
+			e->visited = NULL;
+		}
+	}
 	if (st->scancxt != NULL)
 		MemoryContextReset(st->scancxt);
 	st->visited = NULL;
@@ -2599,13 +3171,19 @@ lo_next(ScanState *ss)
 	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
 	ExprContext *econtext = ss->ps.ps_ExprContext;
 
-	if (st->set == NULL && !st->noset)
+	/*
+	 * The set: lazily, evaluated only where the walk goes, when its keys
+	 * can be sought (§30.4, "The set, lazily"); built otherwise.
+	 */
+	if (st->set == NULL && !st->noset && !st->lazy &&
+		!(st->lazyok && lo_lazy_begin(st)))
 		lo_build_set(st);
 	if (!st->started)
 		lo_start_walk(st);
 
 	/* an empty set selects nothing, and needs no walk */
-	if (st->done || (!st->noset && st->set->n == 0))
+	if (st->done ||
+		(!st->noset && (st->lazy ? st->lazyempty : st->set->n == 0)))
 		return ExecClearTuple(slot);
 	if (st->sorting)
 		return lo_sort_next(st, slot);
@@ -2614,10 +3192,30 @@ lo_next(ScanState *ss)
 	{
 		ItemPointer tid;
 		int			idx;
-		bool		counted = !st->noset && !st->degraded && !st->novisit;
+		bool		counted;
 		bool		ordrecheck;
 
 		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * The lazy set's probes have cost what building it would, or the
+		 * walk has gone as far as the switch below would let it go were the
+		 * set as big as its entries' counts say - or far enough anyway that
+		 * the early stop and the switch should have the set's size to go by:
+		 * build it (§30.4, "The set, lazily").  Whether the switch comes is
+		 * decided on the set built, so a count that is off moves only when the
+		 * set is built.
+		 */
+		if (st->lazy &&
+			(st->lazywork >= st->lazybudget ||
+			 (st->nsort > 0 && !st->noswitch &&
+			  st->scanwalked >= LO_SWITCH_MIN_WALK &&
+			  (double) st->scanwalked >=
+			  LO_SWITCH_RATIO * (st->lazymembers - (double) st->distinct)) ||
+			 st->scanwalked >= LO_LAZY_MAX_WALK ||
+			 st->memobytes > st->limit / 2))
+			lo_lazy_convert(st);
+		counted = !st->noset && !st->lazy && !st->degraded && !st->novisit;
 
 		/*
 		 * Every member met: nothing further along can be one (§30.4,
@@ -2643,7 +3241,18 @@ lo_next(ScanState *ss)
 			break;
 		st->walked++;
 		st->scanwalked++;
-		if (!st->noset)
+		if (st->lazy)
+		{
+			LoMemoEnt  *e = lo_lazy_find(st, tid);
+
+			if (e == NULL)
+				continue;
+			if (!lo_lazy_mark(st, e, tid))
+				continue;		/* met before: a recycled slot (§30.4) */
+			st->distinct++;
+			st->hits++;
+		}
+		else if (!st->noset)
 		{
 			idx = lo_set_find(st->set, tid);
 			if (idx < 0)
@@ -2716,9 +3325,13 @@ lo_rescan(CustomScanState *node)
 	 * The set is rebuilt only when a Param of the lion quals changed; the
 	 * snapshot is the same for the whole execution (DESIGN.md §30.4).
 	 */
-	if (st->set != NULL && node->ss.ps.chgParam != NULL &&
+	if (node->ss.ps.chgParam != NULL &&
 		bms_overlap(node->ss.ps.chgParam, st->lionparams))
+	{
 		st->set = NULL;
+		if (st->lazy)
+			lo_lazy_end(st);
+	}
 
 	ExecScanReScan(&node->ss);
 }
@@ -2744,11 +3357,18 @@ lo_end(CustomScanState *node)
 	st->walkcxt = NULL;
 	if (st->ordidx != NULL)
 		index_close(st->ordidx, AccessShareLock);
+	lo_lazy_end(st);
 	for (i = 0; i < st->nleaves; i++)
 	{
 		if (st->leaves[i].index != NULL)
 			index_close(st->leaves[i].index, AccessShareLock);
 	}
+	if (st->lazycxt != NULL)
+		MemoryContextDelete(st->lazycxt);
+	if (st->probecxt != NULL)
+		MemoryContextDelete(st->probecxt);
+	st->lazycxt = NULL;
+	st->probecxt = NULL;
 	if (st->setcxt != NULL)
 		MemoryContextDelete(st->setcxt);
 	if (st->buildcxt != NULL)
@@ -2851,8 +3471,9 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 			ExplainPropertyInteger("Lion Set Hits", NULL, (int64) st->hits,
 								   es);
 		ExplainPropertyInteger("Heap Fetches", NULL, (int64) st->fetched, es);
-		/* a node that never built its set has no exactness to report */
-		if (st->removed > 0 || (st->builds > 0 && !st->exact))
+		/* a node that never made its set has no exactness to report */
+		if (st->removed > 0 ||
+			((st->builds > 0 || st->lazykeys > 0) && !st->exact))
 			ExplainPropertyInteger("Rows Removed by Lion Recheck", NULL,
 								   (int64) st->removed, es);
 		if (st->builds > 0)
@@ -2864,6 +3485,18 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 			if (st->builds > 1)
 				appendStringInfo(&buf, ", %llu builds",
 								 (unsigned long long) st->builds);
+			if (st->lazykeys > 0)
+				appendStringInfo(&buf, ", after %llu keys probed",
+								 (unsigned long long) st->lazykeys);
+			ExplainPropertyText("Lion Set", buf.data, es);
+		}
+		else if (st->lazykeys > 0)
+		{
+			/* the set was never built: only the keys the walk met (§30.4) */
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "lazy, %llu keys probed, %s",
+							 (unsigned long long) st->lazykeys,
+							 st->exact ? "exact" : "rechecked");
 			ExplainPropertyText("Lion Set", buf.data, es);
 		}
 		if (st->switches > 0)
@@ -2890,6 +3523,20 @@ lion_ordered_init(void)
 							 "Answer ORDER BY over an ordered index with a lion-filtered walk of it.",
 							 NULL,
 							 &lion_enable_ordered_scan,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §30.4, "The set, lazily": off, LionOrdered builds its set
+	 * before the walk, as it did before - for comparing the two, and for the
+	 * tests of the build that pin it.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_lazy_set",
+							 "Lets LionOrdered evaluate its lion set only at the container keys its walk meets.",
+							 "Off, the set is built for the whole table before the walk starts.",
+							 &lion_enable_lazy_set,
 							 true,
 							 PGC_USERSET,
 							 0,
