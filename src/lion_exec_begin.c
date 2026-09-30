@@ -781,6 +781,14 @@ lion_begin_decode(LionCountScanState *st, CustomScan *cscan,
 	st->nclause = list_length(priv->ckinds);
 	st->distattno = (priv->dist != NIL) ?
 		(AttrNumber) linitial_int(priv->dist) : 0;
+	{
+		List	   *all = (List *) list_nth(cscan->custom_private,
+											LION_PRIV_ALLROWS);
+
+		st->allattno = (all != NIL) ? (AttrNumber) linitial_int(all) : 0;
+		if (st->allattno != 0 && !st->sumall)
+			elog(ERROR, "LionCount: a column for every row without a sum");
+	}
 }
 
 /* GROUP BY coalesce(g, c) (DESIGN.md §10): c and its equality */
@@ -1016,7 +1024,9 @@ lion_begin_driving_column(LionCountScanState *st)
 			LION_CLAUSE_NOTNULL;
 
 		st->driveattno = 0;
-		for (i = 0; i < st->nclause; i++)
+		if (st->allattno != 0 && !st->hasrange)
+			st->driveattno = st->allattno;	/* the plan's (DESIGN.md §35) */
+		for (i = 0; i < st->nclause && st->driveattno == 0; i++)
 		{
 			if (st->clause[i].kind == drivekind)
 			{

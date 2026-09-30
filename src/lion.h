@@ -959,7 +959,8 @@ lion_index_row_column(const LionIndexState *ix)
  * Strategy numbers of the roaring AM.  1 is equality, which every scalar
  * opclass has; 2 .. 5 belong to the multi-key classes; 6 .. 9 are the range
  * comparisons of DESIGN.md §28, in btree's order, which an ORDERED scalar
- * class has beside its proc 4.
+ * class has beside its proc 4, and 10 is `<>` (§35), which it has beside
+ * them: every entry but one, a range with a hole in it.
  */
 #define LION_STRAT_EQUAL			1
 #define LION_STRAT_CONTAINS		2	/* anyarray @> anyarray */
@@ -970,10 +971,14 @@ lion_index_row_column(const LionIndexState *ix)
 #define LION_STRAT_LE			7	/* key <= value */
 #define LION_STRAT_GE			8	/* key >= value */
 #define LION_STRAT_GT			9	/* key > value */
-#define LION_NSTRATEGIES			9
+#define LION_STRAT_NE			10	/* key <> value (§35) */
+#define LION_NSTRATEGIES			10
 
 #define LION_STRAT_IS_RANGE(s) \
 	((s) >= LION_STRAT_LT && (s) <= LION_STRAT_GT)
+/* a bound of a walk (LionRange): a range comparison, or the hole `<>` makes */
+#define LION_STRAT_IS_WALK(s) \
+	(LION_STRAT_IS_RANGE(s) || (s) == LION_STRAT_NE)
 /* a LOWER bound (>=, >) as opposed to an upper one (<, <=) */
 #define LION_STRAT_IS_LOWER(s) \
 	((s) == LION_STRAT_GE || (s) == LION_STRAT_GT)

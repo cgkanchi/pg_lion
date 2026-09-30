@@ -27,6 +27,7 @@ lion_range_init(LionRange *range, Relation index, AttrNumber attno)
 	range->lower = -1;
 	range->upper = -1;
 	range->nupper = 0;
+	range->nholes = 0;
 	range->empty = false;
 }
 
@@ -53,7 +54,7 @@ lion_range_add(LionRange *range, Relation index, StrategyNumber strategy,
 	LionRangeBound *b;
 	LionProbe	probe;
 
-	if (!LION_STRAT_IS_RANGE(strategy))
+	if (!LION_STRAT_IS_WALK(strategy))
 		elog(ERROR, "lion index: strategy %d is not a range comparison",
 			 (int) strategy);
 
@@ -98,7 +99,9 @@ lion_range_add(LionRange *range, Relation index, StrategyNumber strategy,
 		range->ordered = false;
 	}
 
-	if (LION_STRAT_IS_LOWER(strategy))
+	if (strategy == LION_STRAT_NE)
+		range->nholes++;		/* neither end: the walk passes it by */
+	else if (LION_STRAT_IS_LOWER(strategy))
 	{
 		if (range->lower < 0)
 			range->lower = range->nbounds;
@@ -131,6 +134,8 @@ lion_range_bound_ok(LionRange *range, LionRangeBound *b, Datum key)
 			return c <= 0;
 		case LION_STRAT_GE:
 			return c >= 0;
+		case LION_STRAT_NE:
+			return c != 0;
 		default:
 			return c > 0;
 	}
@@ -146,7 +151,8 @@ lion_range_bound_ok(LionRange *range, LionRangeBound *b, Datum key)
  * that bound too - while one that fails only a LOWER bound is skipped, and the
  * entries that do are a prefix of what the walk visits: those of the landing
  * leaf below the bound it descended to, and those below any other lower bound.
- * Without an order nothing ends the walk early.
+ * Without an order nothing ends the walk early, and neither does a hole
+ * (`<>`, DESIGN.md §35): it fails its own entry and no other.
  *
  * The caller has checked the entry's column and holds the page it is on.
  */
@@ -171,12 +177,39 @@ lion_range_test(LionRange *range, const LionEntryTuple *entry)
 
 		if (lion_range_bound_ok(range, b, key))
 			continue;
-		if (range->ordered && !LION_STRAT_IS_LOWER(b->strategy))
+		if (range->ordered && !LION_STRAT_IS_LOWER(b->strategy) &&
+			b->strategy != LION_STRAT_NE)
 			return LION_RANGE_END;
 		skip = true;
 	}
 
 	return skip ? LION_RANGE_SKIP : LION_RANGE_MATCH;
+}
+
+/*
+ * ... and a LOWER bound?  In an ordered range those entries are the column's
+ * first ones, and every entry BEFORE the last of them fails one too: which is
+ * where a descending walk ends (DESIGN.md §30.11).  An entry the range skips
+ * for anything else - an upper bound, a hole (§35) - is passed over.
+ */
+bool
+lion_range_fails_lower(LionRange *range, const LionEntryTuple *entry)
+{
+	Datum		key;
+	int			i;
+
+	Assert(lion_entry_kind(entry) == LION_KIND_VALUE);
+	key = lion_entry_key(range->state, entry);
+
+	for (i = 0; i < range->nbounds; i++)
+	{
+		LionRangeBound *b = &range->bounds[i];
+
+		if (LION_STRAT_IS_LOWER(b->strategy) &&
+			!lion_range_bound_ok(range, b, key))
+			return true;
+	}
+	return false;
 }
 
 /*
@@ -198,6 +231,7 @@ lion_range_fails_upper(LionRange *range, const LionEntryTuple *entry)
 		LionRangeBound *b = &range->bounds[i];
 
 		if (!LION_STRAT_IS_LOWER(b->strategy) &&
+			b->strategy != LION_STRAT_NE &&
 			!lion_range_bound_ok(range, b, key))
 			return true;
 	}
@@ -319,8 +353,9 @@ lion_range_side_leaf(Relation index, LionRange *range, bool lower, int kind,
 		BlockNumber blk;
 		bool		better;
 
-		if (LION_STRAT_IS_LOWER(range->bounds[i].strategy) != lower)
-			continue;
+		if (range->bounds[i].strategy == LION_STRAT_NE ||
+			LION_STRAT_IS_LOWER(range->bounds[i].strategy) != lower)
+			continue;			/* a hole is no end of either side */
 
 		blk = lion_range_landing(index, range, i, kind, &pos);
 		if (!BlockNumberIsValid(best))
@@ -737,7 +772,7 @@ lion_scan_bucket_inside(LionEntryScan *es, const LionEntryTuple *entry)
 				failslower = true;
 		}
 		else if (!ok)
-			return false;
+			return false;		/* an upper bound, or a hole (never here) */
 	}
 	return (es->part == LION_WALK_INSIDE) ? true : failslower;
 }
@@ -778,6 +813,9 @@ lion_entry_scan_plan_sum(LionEntryScan *es, Relation index, LionRange *range,
 	if (!col->summarized)
 		return false;
 	if (range != NULL && (!range->ordered || range->empty))
+		return false;
+	/* a bucket may hold a hole's rows (DESIGN.md §35): key by key */
+	if (range != NULL && range->nholes > 0)
 		return false;
 	if (part == LION_WALK_ABOVE && range->nupper == 0)
 		return false;

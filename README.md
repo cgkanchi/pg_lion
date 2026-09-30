@@ -7,9 +7,10 @@ format is unchanged: the meta-page magic still spells `RBI1`, so indexes built b
 (array / bitset / run, ≤ 4104 bytes each, one per 64 heap pages) or sparse (container key, offset)
 segments per distinct key, plus one reserved entry for the rows whose key is NULL. The index serves
 Bitmap Index Scans through `amgetbitmap` for equality, `IN`/`ANY`, scalar ranges
-(`<`, `<=`, `>=`, `>`), `col IS NULL` and `col IS NOT NULL`, and a CustomScan (`LionCount`) answers
-`SELECT count(*) [, k] FROM t WHERE k1 = c1 [AND ...] [GROUP BY k]` from the containers plus the
-visibility map, visiting the heap only for pages that are not all-visible. `DESIGN.md` is the spec:
+(`<`, `<=`, `>=`, `>`), `<>` (`!=`), `col IS NULL` and `col IS NOT NULL`, and a CustomScan
+(`LionCount`) answers `SELECT count(*) [, k] FROM t [WHERE k1 = c1 [AND ...]] [GROUP BY k]` from the
+containers plus the visibility map, visiting the heap only for pages that are not all-visible - a
+bare `count(*)` included, which sums the entries of the Lion column with the fewest (DESIGN.md §35). `DESIGN.md` is the spec:
 on-disk format, locking protocol, the VACUUM/visibility-map interlock argument (§9, §11), and the
 planner integration (§10).
 
@@ -30,7 +31,7 @@ and by those specs on the newer majors, not by a test on that major.  See the
 ## When to use Lion
 
 Use the roaring index (`USING lion`) for read-heavy dashboards, facet counts, and aggregations over
-large tables: equality, range or NULL counts, intersections of indexed predicates, and grouping by a column
+large tables: equality, range, `<>` or NULL counts, intersections of indexed predicates, and grouping by a column
 with relatively few distinct values. It can count compressed posting sets without fetching every
 matching row when the visibility map allows it. Array membership and simple full-text AND/OR counts
 benefit from the same mechanism. Keep tables vacuumed and statistics current so the planner can
@@ -521,7 +522,9 @@ working around a bad choice:
   by a Lion set, or a walk of a Lion index's own ordered scalar column in either direction (`ORDER
   BY ts DESC LIMIT n` over a Lion index on `ts`), filtered by a Lion set of the other clauses or by
   the clauses themselves; on a table, or on each partition of one (DESIGN.md §30, §30.11). EXPLAIN
-  names a column's walk `Ordered By: <index> (<column>[, backward])`.
+  names a column's walk `Ordered By: <index> (<column>[, backward])`. A filter on the walked column
+  alone (`WHERE s LIKE 'p1%' ORDER BY s`) is decided for a whole key by its first visible row, and
+  a key that fails is skipped unread (`Filter per Value`, DESIGN.md §35).
 - `pg_lion.enable_lazy_set`: let `LionOrdered` evaluate its Lion set only at the ranges of 64 heap
   blocks its walk reaches, and build it for the whole table only once that has cost what the build
   would (DESIGN.md §30.4, "The set, lazily"). Off, the set is built before the walk starts.

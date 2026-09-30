@@ -194,6 +194,7 @@ typedef struct LionCountPathBuild
 	List	   *targets;		/* LionCountTarget, one per counted relation */
 	LionCountTarget *first;
 	Var		   *notnullvar;		/* the first `IS NOT NULL` column */
+	Var		   *allvar;			/* a sum over every row drives by it (§35) */
 	Var		   *rangevar;		/* the column the RANGE clauses bound (§28) */
 	List	   *rangeclauses;	/* ... and those clauses' RestrictInfos */
 	List	   *rangevars;		/* every column a range bounds (§28, §32) */
@@ -278,6 +279,7 @@ lion_count_path_init(LionCountPathBuild *cx, PlannerInfo *root,
 	cx->nullattnos = NIL;
 	cx->targets = NIL;
 	cx->notnullvar = NULL;
+	cx->allvar = NULL;
 	cx->rangevar = NULL;
 	cx->rangeclauses = NIL;
 	cx->rangevars = NIL;
@@ -834,6 +836,11 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 			cx->nonnullattnos = lappend_int(cx->nonnullattnos,
 											(int) leaf.var->varattno);
 			break;
+		case LION_CLAUSE_NE:
+			/* a strict operator: never true of NULL (DESIGN.md §35) */
+			cx->nonnullattnos = lappend_int(cx->nonnullattnos,
+											(int) leaf.var->varattno);
+			break;
 		case LION_CLAUSE_ARRAY:
 		case LION_CLAUSE_MULTI:
 			/* a strict operator with a non-NULL constant */
@@ -1287,6 +1294,116 @@ lion_count_path_outputs(LionCountPathBuild *cx)
 }
 
 /*
+ * The first live leaf under a partitioned rel, and the attnums of the
+ * parent's columns there, level by level (lion_child_var()): 0 where a
+ * level has no such column.  A plain rel is its own leaf.
+ */
+static RelOptInfo *
+lion_count_first_leaf(PlannerInfo *root, RelOptInfo *rel, AttrNumber *attnos,
+					  int natts)
+{
+	while (IS_PARTITIONED_REL(rel))
+	{
+		RelOptInfo *child = NULL;
+		int			i;
+
+		for (i = 0; i < rel->nparts; i++)
+		{
+			if (rel->part_rels[i] != NULL &&
+				bms_is_member(i, rel->live_parts) &&
+				!IS_DUMMY_REL(rel->part_rels[i]))
+			{
+				child = rel->part_rels[i];
+				break;
+			}
+		}
+		if (child == NULL)
+			return NULL;
+		for (i = 0; i < natts; i++)
+		{
+			if (attnos[i] != 0)
+			{
+				Var		   *cvar = lion_child_var(root, child->relid,
+												  attnos[i]);
+
+				attnos[i] = (cvar != NULL) ? cvar->varattno : 0;
+			}
+		}
+		rel = child;
+	}
+	return rel;
+}
+
+/*
+ * The column a sum over EVERY row drives by (DESIGN.md §35, "Every row"),
+ * when nothing in the WHERE selects rows: `count(*)` alone, or `IS NOT NULL`
+ * and `<>` clauses only.  The entries of one SCALAR lion column are disjoint
+ * and between them - the NULL entry included - hold every row of the table,
+ * so the sum over them, less what the negated clauses subtract from each, is
+ * the count; the column with the fewest entries is the cheapest walk.  Only a
+ * column of a scalar, non-partial, non-expression index will do
+ * (lion_find_roaring_index()): a multi-key column's entries overlap and miss
+ * the rows with no keys, and a partial index holds only its predicate's rows.
+ * A column with an `IS NOT NULL` of its own is preferred when it is no
+ * dearer, since its NULL entry is then skipped and its clause dropped
+ * (lion_locate_where()).  A partitioned table's candidates are those of its
+ * first live leaf, which lion_collect_targets() then asks of every partition.
+ */
+static Var *
+lion_count_all_driver(LionCountPathBuild *cx)
+{
+	PlannerInfo *root = cx->root;
+	RelOptInfo *rel = cx->input_rel;
+	int			natts = Max((int) rel->max_attr, 0);
+	AttrNumber *attnos = (AttrNumber *) palloc0(sizeof(AttrNumber) * Max(natts, 1));
+	RelOptInfo *leaf;
+	Var		   *best = NULL;
+	double		bestentries = 0.0;
+	int			a;
+
+	for (a = 0; a < natts; a++)
+		attnos[a] = (AttrNumber) (a + 1);
+	leaf = lion_count_first_leaf(root, rel, attnos, natts);
+	if (leaf == NULL)
+		return NULL;
+
+	for (a = 0; a < natts; a++)
+	{
+		Oid			type;
+		int32		typmod;
+		Oid			coll;
+		Var		   *var;
+		VariableStatData vardata;
+		bool		isdefault;
+		double		entries;
+
+		/* an indexed column is no dropped one, nor maps to none (§16) */
+		if (attnos[a] == 0 ||
+			lion_find_roaring_index(leaf, attnos[a], false, NULL) == NULL)
+			continue;
+		get_atttypetypmodcoll(cx->rte->relid, (AttrNumber) (a + 1), &type,
+							  &typmod, &coll);
+		var = makeVar(cx->rti, (AttrNumber) (a + 1), type, typmod, coll, 0);
+		examine_variable(root, (Node *) var, cx->rti, &vardata);
+		entries = get_variable_numdistinct(&vardata, &isdefault);
+		ReleaseVariableStats(vardata);
+
+		/* the first `IS NOT NULL` column skips its NULL entry: no dearer */
+		if (cx->notnullvar != NULL &&
+			var->varattno == cx->notnullvar->varattno)
+			entries = Max(entries - 1.0, 1.0);
+
+		if (best == NULL || entries < bestentries)
+		{
+			best = var;
+			bestentries = entries;
+		}
+	}
+	pfree(attnos);
+	return best;
+}
+
+/*
  * What drives the count: the grouping column, the distinct column, or the
  * sum over all of one column's entries (sumall) - bounded by the range that
  * bounds that walk (rangevar), every other range being made a source.  Sets
@@ -1416,16 +1533,24 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 	else if (cx->ngroup == 0 && !cx->havepositive)
 	{
 		/*
-		 * Only `IS NOT NULL` clauses: that column's index knows every row of
-		 * the table, so the count is the sum over all of its entries with the
-		 * NULL one subtracted (DESIGN.md §14).  The entries of one index are
-		 * disjoint - a row has one value per column - so summing them is the
-		 * count of their union.
+		 * Nothing that selects rows: `count(*)` alone, or beside `IS NOT
+		 * NULL` and `<>` clauses only, which subtract (DESIGN.md §14, §35).
+		 * Any lion-indexed column's index knows every row of the table, so
+		 * the count is the sum over all of its entries - disjoint, a row
+		 * having one value per column or none - with the negated clauses
+		 * subtracted from each (lion_count_all_driver()).  Driven by the
+		 * first `IS NOT NULL` column, its own NULL entry is skipped and its
+		 * clause dropped; by any other, the plan names the column.
 		 */
-		if (cx->notnullvar == NULL)
+		Var		   *drive = lion_count_all_driver(cx);
+
+		if (drive == NULL)
 			return false;
 		cx->sumall = true;
-		cx->driveattno = cx->notnullvar->varattno;
+		cx->driveattno = drive->varattno;
+		if (cx->notnullvar == NULL ||
+			drive->varattno != cx->notnullvar->varattno)
+			cx->allvar = drive;
 	}
 	/* A group folded to a constant can only have come from a WHERE key. */
 	if (cx->singlegroup && !cx->havepositive)
@@ -1558,7 +1683,8 @@ lion_count_path_targets(LionCountPathBuild *cx)
 	{
 		/* §14's sum-over-all: one index, and it groups nothing. */
 		drive[0].attno = cx->driveattno;
-		drive[0].var = (cx->rangevar != NULL) ? cx->rangevar : cx->notnullvar;
+		drive[0].var = (cx->rangevar != NULL) ? cx->rangevar :
+			(cx->allvar != NULL) ? cx->allvar : cx->notnullvar;
 		drive[0].collation = InvalidOid;
 		drive[0].eqop = InvalidOid;
 		drive[0].valueout = false;
@@ -1662,8 +1788,10 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 	else if (cx->sumall)
 	{
 		/* Every entry of the driving index is visited, one group or not. */
-		Assert(cx->notnullvar != NULL);
-		cx->numgroups = estimate_num_groups(root, list_make1(cx->notnullvar),
+		Var		   *dv = (cx->allvar != NULL) ? cx->allvar : cx->notnullvar;
+
+		Assert(dv != NULL);
+		cx->numgroups = estimate_num_groups(root, list_make1(dv),
 											input_rel->rows, NULL, NULL);
 	}
 	else if (cx->distvar != NULL)
@@ -1966,6 +2094,12 @@ lion_count_path_make(LionCountPathBuild *cx)
 	}
 	else
 		cpath->custom_private = lappend(cpath->custom_private, NIL);
+
+	/* the column a sum over every row drives by (DESIGN.md §35) */
+	cpath->custom_private =
+		lappend(cpath->custom_private,
+				(cx->allvar != NULL) ?
+				list_make1_int((int) cx->allvar->varattno) : NIL);
 	cpath->methods = &lion_count_path_methods;
 
 	return cpath;
