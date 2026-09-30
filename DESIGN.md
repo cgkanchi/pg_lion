@@ -5497,8 +5497,20 @@ reads and at the cost of a comparison each, only what it would otherwise follow 
   before the split record writes its leftlink. It was not checked at all, so a damaged right link
   had that write land on whatever page it named.
 
-A block number past the end and a damaged key datum are not caught here: the first fails in
-`ReadBuffer()`, and the second is the same risk every index AM takes with its own keys. Every step of
+A block number past the end is not caught here: it fails in `ReadBuffer()`. A damaged key datum
+used to be let through as well, as "the same risk every index AM takes with its own keys", until
+two damaged bytes of a text key, `01 01` - the header of an INDIRECT TOAST pointer - had the first
+descent that compared against it detoast through whatever the page held, a SIGSEGV (2026-09-29
+review). A stored key has exactly one form, the one `lion_store_key()` writes: `sizeof(Datum)` bytes
+for a by-value type, `typlen` for a fixed-length one, a plain 4-byte varlena header whose length is
+the key's (`PG_DETOAST_DATUM()` gives every stored key one), a cstring whose only NUL is its last
+byte, and at most `LION_MAX_KEY_SIZE` bytes in any case. So every key that comes off a page is
+checked for that form before any opclass function sees it (`lion_entry_key()`, `lion_check_key()`,
+lion_state.c) - in the descent's comparisons, the prefix-run scans, the entry and summary walks, the
+posting sets' stored keys that LionOrdered and the GROUP BY counts emit, the planner's probes and
+the insert and VACUUM paths - which is a few comparisons next to the function call it guards, and
+verify() requires the same form (`lion_verify_keylen()`, which used to accept a short header too;
+`test/sql/corrupt_items.sql`). Every step of
 a descent and of an uncoupled walk right checks for interrupts BETWEEN the pages, with no content
 lock held. It used to check just after locking the next page, where the lock holds interrupts off, so
 a descent round a cycle of downlinks (the third case of the test below, before the level check

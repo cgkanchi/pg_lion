@@ -1154,7 +1154,19 @@ lion_vac_ref_relocate(LionVacState *vs, LionVacEntryRef *ref,
 	if (ent->ischain && (ent->kind == LION_KIND_SUMMARY ||
 						 ent->kind == LION_KIND_SUMLAST))
 	{
-		LionState  *col = lion_column(vs->ix, (AttrNumber) ent->attno);
+		LionState  *col;
+
+		/*
+		 * Pass 1 copied the key and its column off the page, and the descent
+		 * hands the key to the opclass (lion_check_key()).
+		 */
+		if (unlikely(ent->attno < 1 || ent->attno > vs->ix->ncolumns))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index entry belongs to key column %u, but the index has %d",
+							ent->attno, vs->ix->ncolumns)));
+		col = lion_column(vs->ix, (AttrNumber) ent->attno);
+		lion_check_key(col, ent->keydata, ent->keylen);
 
 		lion_search_key_init(col, &sk, LION_KIND_SUMMARY,
 							 lion_fetch_key(col, ent->keydata), 0);

@@ -293,7 +293,9 @@ lion_verify_itemid(LionVerifyState *vs, BlockNumber blk, Page page,
 
 /*
  * Check that the stored key of an entry has the length its type calls for,
- * so that hashing it cannot run off the end of the item.
+ * so that hashing it cannot run off the end of the item - which is the form
+ * the readers require of a key before an opclass function sees it
+ * (lion_key_is_valid()), so that an index this passes they can read.
  */
 static void
 lion_verify_keylen(LionVerifyState *vs, LionState *state, BlockNumber blk,
@@ -323,8 +325,12 @@ lion_verify_keylen(LionVerifyState *vs, LionState *state, BlockNumber blk,
 	}
 	else if (state->typlen == -1)
 	{
-		if (VARATT_IS_EXTERNAL(key) || VARATT_IS_COMPRESSED(key) ||
-			VARSIZE_ANY(key) != keylen)
+		/*
+		 * A plain 4-byte header, as lion_store_key() writes it: a short one
+		 * is no longer accepted either, because no reader does.
+		 */
+		if (keylen < VARHDRSZ || !VARATT_IS_4B_U(key) ||
+			VARSIZE(key) != keylen)
 			lion_corrupt("lion index \"%s\": entry %u on block %u has a malformed varlena key of %zu bytes",
 						RelationGetRelationName(vs->index), off, blk, keylen);
 	}
@@ -334,6 +340,8 @@ lion_verify_keylen(LionVerifyState *vs, LionState *state, BlockNumber blk,
 			lion_corrupt("lion index \"%s\": entry %u on block %u has a malformed cstring key of %zu bytes",
 						RelationGetRelationName(vs->index), off, blk, keylen);
 	}
+
+	Assert(lion_key_is_valid(state, key, keylen));
 }
 
 /*
@@ -1569,7 +1577,7 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 		/* A summary's hash is a constant, not its key's (DESIGN.md §32). */
 		hash = LionEntryIsSummary(entry) ? LION_SUMMARY_HASH :
 			lion_hash_key(state,
-						  lion_fetch_key(state, LionEntryGetKey(entry)));
+						  lion_entry_key(state, entry));
 		if (hash != entry->hash)
 			lion_corrupt("lion index \"%s\": entry %u on block %u stores hash %u, but its key hashes to %u",
 						RelationGetRelationName(vs->index), off, blk,

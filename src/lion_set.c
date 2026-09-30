@@ -377,7 +377,7 @@ lion_fill_posting_set_entry(Relation index, LionState *state,
 	}
 	else
 	{
-		ps->storedkey = datumCopy(lion_fetch_key(state, LionEntryGetKey(entry)),
+		ps->storedkey = datumCopy(lion_entry_key(state, entry),
 								  state->typbyval, state->typlen);
 		ps->hasstoredkey = true;
 	}

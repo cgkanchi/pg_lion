@@ -1147,6 +1147,17 @@ extern uint32 lion_hash_key(LionState *state, Datum key);
 extern Size lion_key_datum_size(LionState *state, Datum key);	/* bytes needed to store the key */
 extern void lion_store_key(LionState *state, Datum key, char *dest);
 extern Datum lion_fetch_key(LionState *state, const char *src);
+
+/*
+ * A key read off a page, checked for the form lion_store_key() gives it
+ * before any opclass function sees it (lion_state.c): lion_key_is_valid()
+ * says whether it has it, lion_check_key() raises ERRCODE_INDEX_CORRUPTED
+ * when it has not, and lion_entry_key() is lion_fetch_key() of an entry's
+ * key once lion_check_key() has passed it.
+ */
+extern bool lion_key_is_valid(LionState *state, const char *key, Size keylen);
+extern void lion_check_key(LionState *state, const char *key, Size keylen);
+extern Datum lion_entry_key(LionState *state, const LionEntryTuple *entry);
 extern bool lion_keys_equal(LionState *state, Datum a, Datum b);
 
 /* ---------- lion_dir.c: the sorted entry directory (DESIGN.md §21) ---------- */

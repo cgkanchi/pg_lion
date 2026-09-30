@@ -1455,7 +1455,7 @@ lion_summary_insert(Relation index, Relation heaprel, LionState *state,
 
 		if (kind == LION_KIND_SUMLAST)
 		{
-			Datum		lastkey = lion_fetch_key(state, LionEntryGetKey(e));
+			Datum		lastkey = lion_entry_key(state, e);
 			int32		c = DatumGetInt32(FunctionCall2Coll(&state->cmpproc,
 															state->collation,
 															key, lastkey));
@@ -1527,8 +1527,7 @@ lion_summary_insert(Relation index, Relation heaprel, LionState *state,
 					lion_entry_kind(prev) == LION_KIND_SUMMARY &&
 					DatumGetInt32(FunctionCall2Coll(&state->cmpproc,
 													state->collation,
-													lion_fetch_key(state,
-																   LionEntryGetKey(prev)),
+													lion_entry_key(state, prev),
 													key)) >= 0)
 				{
 					UnlockReleaseBuffer(buf);
