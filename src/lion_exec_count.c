@@ -15,6 +15,9 @@
 
 #include "lion_customscan.h"
 
+#include "access/visibilitymap.h"
+#include "utils/numeric.h"
+
 static int64 lion_walk_count(LionCountScanState *st, LionCountSource *sources,
 							 int nsource, int w, bool exists);
 
@@ -2756,6 +2759,344 @@ lion_decode_reset(LionCountScanState *st)
 	dr->started = false;
 	dr->finished = false;
 	dr->emitting = false;
+}
+
+/*
+ * THE AGGREGATES OVER LION COLUMNS' ENTRIES (DESIGN.md §37).
+ *
+ * Every row of a table with no WHERE is in exactly one entry of a scalar lion
+ * column - the NULL one for a NULL - and holds its key's value when the keys
+ * are the rows' own values (the value rule of §10, which the planner asked).
+ * So sum(f(x)) is the sum over x's entries of f(key) times the entry's rows,
+ * avg the same over their total, and min or max the first f(key) in the
+ * aggregate's order among the entries with a row: one walk of each column,
+ * however many aggregates are taken over it.
+ *
+ * An entry's rows are its visible TIDs.  lion_heap_all_visible() says when
+ * its ntids is that number (lion_wagg_run()); otherwise each entry is counted
+ * as a group of a walk is.
+ */
+
+/*
+ * Is every page of heap all-visible, and how many are there?  An index TID on
+ * an all-visible page is a row every snapshot sees - core's own promise, the
+ * one an index-only scan rests on (a page with a dead item is never marked,
+ * and a mark is taken away by the first change to the page, before the change
+ * reaches any index).
+ */
+static bool
+lion_heap_all_visible(Relation heap, BlockNumber *nblocks)
+{
+	BlockNumber allvisible;
+
+	*nblocks = RelationGetNumberOfBlocks(heap);
+	visibilitymap_count(heap, &allvisible, NULL);
+	return allvisible == *nblocks;
+}
+
+#ifdef HAVE_INT128
+/* v as a numeric, exactly: in three parts of 10^18 past int8's range */
+static Datum
+lion_int128_numeric(int128 v)
+{
+	const int64 base = INT64CONST(1000000000000000000);
+	Datum		hi;
+
+	if (v >= (int128) PG_INT64_MIN && v <= (int128) PG_INT64_MAX)
+		return NumericGetDatum(int64_to_numeric((int64) v));
+	hi = lion_int128_numeric(v / base);
+	return DirectFunctionCall2(numeric_add,
+							   DirectFunctionCall2(numeric_mul, hi,
+												   NumericGetDatum(int64_to_numeric(base))),
+							   NumericGetDatum(int64_to_numeric((int64) (v % base))));
+}
+#endif
+
+/* The aggregates of column c take an entry of key key (isnull) and rows. */
+static void
+lion_wagg_add(LionCountScanState *st, int c, Datum key, bool isnull,
+			  int64 rows)
+{
+	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
+	TupleTableSlot *slot = st->css.ss.ss_ScanTupleSlot;
+	bool		slotset = false;
+	int			i;
+
+	if (rows <= 0)
+		return;
+	ResetExprContext(econtext);
+	for (i = 0; i < st->nwagg; i++)
+	{
+		LionWAgg   *a = &st->wagg[i];
+		Datum		v;
+		bool		vnull;
+
+		if (a->col != c)
+			continue;
+		if (a->argiskey)
+		{
+			v = key;
+			vnull = isnull;
+		}
+		else
+		{
+			/* the key in its column of the scan tuple, the rest NULL */
+			if (!slotset)
+			{
+				int			j;
+
+				ExecClearTuple(slot);
+				for (j = 0; j < slot->tts_tupleDescriptor->natts; j++)
+				{
+					slot->tts_values[j] = (Datum) 0;
+					slot->tts_isnull[j] = true;
+				}
+				slot->tts_values[st->wcol[c].slotcol] = key;
+				slot->tts_isnull[st->wcol[c].slotcol] = isnull;
+				ExecStoreVirtualTuple(slot);
+				econtext->ecxt_scantuple = slot;
+				slotset = true;
+			}
+			v = ExecEvalExprSwitchContext(a->arg, econtext, &vnull);
+		}
+		if (vnull)
+			continue;
+
+		switch (a->kind)
+		{
+#ifdef HAVE_INT128
+			case LION_WAGG_SUM:
+			case LION_WAGG_SUM8:
+			case LION_WAGG_AVG:
+			case LION_WAGG_AVG8:
+				{
+					int64		iv = (a->argwidth == 2) ? DatumGetInt16(v) :
+						(a->argwidth == 4) ? DatumGetInt32(v) : DatumGetInt64(v);
+
+					a->sum += (int128) iv * (int128) rows;
+					a->n += rows;
+				}
+				break;
+#endif
+			case LION_WAGG_EXTREME:
+				if (!a->hasext ||
+					DatumGetBool(FunctionCall2Coll(&a->cmp, a->collation, v,
+												   a->ext)))
+				{
+					MemoryContext oldcxt = MemoryContextSwitchTo(st->wcxt);
+
+					if (a->hasext && !a->typbyval)
+						pfree(DatumGetPointer(a->ext));
+					a->ext = datumCopy(v, a->typbyval, a->typlen);
+					a->hasext = true;
+					MemoryContextSwitchTo(oldcxt);
+				}
+				break;
+			default:
+				elog(ERROR, "LionCount: aggregate kind %d over keys", a->kind);
+		}
+	}
+}
+
+/*
+ * One walk of column c's entries, every one of them the NULL one included:
+ * with fast, each entry's rows its ntids; without, each entry counted.
+ */
+static void
+lion_wagg_walk(LionCountScanState *st, int c, bool fast)
+{
+	LionWCol   *wc = &st->wcol[c];
+	LionEntryScan es;
+	MemoryContext oldcxt;
+
+	lion_entry_scan_begin_col(&es, wc->idx, wc->idxcol);
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+		MemoryContextReset(st->pergroup);
+		oldcxt = MemoryContextSwitchTo(st->pergroup);
+		if (fast)
+		{
+			LionEntryTuple *entry;
+			Size		itemlen;
+			bool		isnull;
+
+			entry = lion_entry_scan_next_copy(&es, &itemlen);
+			if (entry == NULL)
+			{
+				MemoryContextSwitchTo(oldcxt);
+				break;
+			}
+			isnull = LionEntryIsNullKey(entry);
+			lion_wagg_add(st, c,
+						  isnull ? (Datum) 0 : lion_entry_key(es.state, entry),
+						  isnull, (int64) entry->ntids);
+		}
+		else
+		{
+			LionPostingSet ps;
+			LionCountSource src;
+			Datum		key;
+			bool		isnull;
+			int64		rows;
+
+			if (!lion_entry_scan_next(&es, &key, &ps))
+			{
+				MemoryContextSwitchTo(oldcxt);
+				break;
+			}
+			memset(&src, 0, sizeof(src));
+			src.nsets = 1;
+			src.sets = &ps;
+			isnull = ps.keyisnull;
+			rows = lion_node_count(st, 1, &src, false);
+			lion_posting_set_release(&ps);
+			lion_wagg_add(st, c, key, isnull, rows);
+		}
+		st->wentries++;
+		MemoryContextSwitchTo(oldcxt);
+	}
+	lion_entry_scan_end(&es);
+}
+
+/* Every aggregate over keys, begun again. */
+static void
+lion_wagg_reset(LionCountScanState *st)
+{
+	int			i;
+
+	if (st->wcxt != NULL)
+		MemoryContextReset(st->wcxt);
+	for (i = 0; i < st->nwagg; i++)
+	{
+		LionWAgg   *a = &st->wagg[i];
+
+#ifdef HAVE_INT128
+		a->sum = 0;
+#endif
+		a->n = 0;
+		a->hasext = false;
+		a->ext = (Datum) 0;
+		a->result = (Datum) 0;
+		a->resnull = true;
+	}
+}
+
+/*
+ * Compute every aggregate over keys (DESIGN.md §37) into its result.
+ *
+ * The entries' own counts are the rows when every heap page is all-visible
+ * before the first header is read and after the last, and the heap has as
+ * many pages both times.  At the first look every TID in the index is a row
+ * every snapshot sees.  A change made after it - an insert, an update, a
+ * delete, by a transaction this snapshot cannot see, since one it sees had
+ * made its change before the snapshot and so before the first look - takes
+ * the mark off its page before its TID reaches an index, and that page cannot
+ * be marked again while this snapshot's xmin holds VACUUM back; a new page is
+ * not marked at all.  So the second look finds every page marked only if
+ * nothing changed in between, and every ntids read then counted exactly the
+ * rows of the first look: this snapshot's.  During recovery the standby's
+ * snapshot holds nothing back on the primary, and every entry is counted.
+ */
+void
+lion_wagg_run(LionCountScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	BlockNumber before;
+	BlockNumber after;
+	bool		fast;
+	int			c;
+	int			i;
+
+	if (st->wcxt == NULL)
+		st->wcxt = AllocSetContextCreate(estate->es_query_cxt,
+										 "LionCount aggregates over keys",
+										 ALLOCSET_DEFAULT_SIZES);
+	for (c = 0; c < st->nwcol; c++)
+	{
+		if (st->wcol[c].idx == NULL)
+			st->wcol[c].idx = index_open(st->wcol[c].idxoid, AccessShareLock);
+	}
+
+	lion_wagg_reset(st);
+	fast = !RecoveryInProgress() && lion_heap_all_visible(st->heap, &before);
+	if (fast)
+	{
+		for (c = 0; c < st->nwcol; c++)
+			lion_wagg_walk(st, c, true);
+		fast = lion_heap_all_visible(st->heap, &after) && after == before;
+		st->wfast += st->nwcol;
+		if (!fast)
+			lion_wagg_reset(st);
+	}
+	if (!fast)
+	{
+		for (c = 0; c < st->nwcol; c++)
+			lion_wagg_walk(st, c, false);
+		st->wslow += st->nwcol;
+	}
+
+	for (i = 0; i < st->nwagg; i++)
+	{
+		LionWAgg   *a = &st->wagg[i];
+		MemoryContext oldcxt = MemoryContextSwitchTo(st->wcxt);
+
+		a->resnull = true;
+		switch (a->kind)
+		{
+#ifdef HAVE_INT128
+			case LION_WAGG_SUM:
+
+				/*
+				 * sum(int2) and sum(int4) add up in an int8 that wraps; the
+				 * sum modulo 2^64 is what the wrapping adds make, in any order.
+				 */
+				if (a->n > 0)
+				{
+					a->result = Int64GetDatum((int64) (uint64) a->sum);
+					a->resnull = false;
+				}
+				break;
+			case LION_WAGG_SUM8:
+				if (a->n > 0)
+				{
+					a->result = lion_int128_numeric(a->sum);
+					a->resnull = false;
+				}
+				break;
+			case LION_WAGG_AVG:
+			case LION_WAGG_AVG8:
+
+				/*
+				 * int8_avg() and numeric_poly_avg(): the sum over the count,
+				 * both numerics - the sum an int8 that wraps for int2 and int4,
+				 * exact for int8.
+				 */
+				if (a->n > 0)
+				{
+					Datum		sum = (a->kind == LION_WAGG_AVG) ?
+						NumericGetDatum(int64_to_numeric((int64) (uint64) a->sum)) :
+						lion_int128_numeric(a->sum);
+
+					a->result = DirectFunctionCall2(numeric_div, sum,
+													NumericGetDatum(int64_to_numeric(a->n)));
+					a->resnull = false;
+				}
+				break;
+#endif
+			case LION_WAGG_EXTREME:
+				a->result = a->ext;
+				a->resnull = !a->hasext;
+				break;
+		}
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	for (c = 0; c < st->nwcol; c++)
+	{
+		index_close(st->wcol[c].idx, AccessShareLock);
+		st->wcol[c].idx = NULL;
+	}
 }
 
 /*

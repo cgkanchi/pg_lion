@@ -229,6 +229,12 @@ typedef struct LionCountPathBuild
 								 * collect by ranges (§10) */
 	List	   *groupdeps;		/* GROUP BY expressions of the columns
 								 * (§36), which split no group */
+	List	   *wattnos;		/* §37: the columns aggregates are taken
+								 * over, weighted by their entries' rows */
+	List	   *widx;			/* ... their indexes (IndexOptInfo) */
+	List	   *wcols;			/* ... and key columns there */
+	List	   *wnaggs;			/* ... and how many aggregates each */
+	bool		wcounts;		/* the counts of the target list besides */
 	int64		topkn;			/* the top k by count (§36), or 0 */
 	int			topkcand;		/* ... the candidates its walk keeps */
 	double		topkrows;		/* ... and the rows of their entries */
@@ -443,22 +449,6 @@ lion_count_path_rel(LionCountPathBuild *cx)
  * it names is one the node prints (groupvalueout).  The node emits the
  * columns, and the plan's projection computes the expression from them.
  */
-static bool
-lion_contains_param_walker(Node *node, void *context)
-{
-	if (node == NULL)
-		return false;
-	if (IsA(node, Param))
-		return true;
-	return expression_tree_walker(node, lion_contains_param_walker, context);
-}
-
-static bool
-lion_contains_param(Node *expr)
-{
-	return lion_contains_param_walker(expr, NULL);
-}
-
 static bool
 lion_group_dependent(LionCountPathBuild *cx, Node *expr)
 {
@@ -1256,6 +1246,54 @@ lion_count_path_distinct(LionCountPathBuild *cx)
 }
 
 /*
+ * An aggregate over the entries of lion column attno (DESIGN.md §37): taken
+ * over one table with no WHERE and no GROUP BY, where every entry of a
+ * scalar column is its rows' value, and from a whole index on the column
+ * whose stored keys are the rows' own values (the value rule of §10) - the
+ * argument is evaluated on the key.  Notes the column, its index and its
+ * aggregates.
+ */
+static bool
+lion_count_path_wagg(LionCountPathBuild *cx, AttrNumber attno)
+{
+	IndexOptInfo *idx;
+	AttrNumber	col;
+	Oid			atttype;
+	ListCell   *lc;
+	int			i = 0;
+
+	if (cx->fj != NULL || cx->ngroup != 0 || cx->singlegroup ||
+		cx->partitioned || cx->distvar != NULL || cx->groupcoal != NULL ||
+		cx->input_rel->baserestrictinfo != NIL)
+		return false;
+	foreach(lc, cx->wattnos)
+	{
+		if ((AttrNumber) lfirst_int(lc) == attno)
+		{
+			lfirst_int(list_nth_cell(cx->wnaggs, i))++;
+			return true;
+		}
+		i++;
+	}
+	idx = lion_find_roaring_index(cx->input_rel, attno, false, &col);
+	if (idx == NULL || idx->indpred != NIL ||
+		!lion_index_can_emit_value(idx, col))
+		return false;
+
+	/* the key is the column's value in the column's own representation */
+	atttype = get_atttype(cx->rte->relid, attno);
+	if (!IsBinaryCoercible(atttype, idx->opcintype[col - 1]) ||
+		get_typlen(atttype) != get_typlen(idx->opcintype[col - 1]) ||
+		get_typbyval(atttype) != get_typbyval(idx->opcintype[col - 1]))
+		return false;
+	cx->wattnos = lappend_int(cx->wattnos, (int) attno);
+	cx->widx = lappend(cx->widx, idx);
+	cx->wcols = lappend_int(cx->wcols, (int) col);
+	cx->wnaggs = lappend_int(cx->wnaggs, 1);
+	return true;
+}
+
+/*
  * Every expression of checkexprs has to be one the node produces: a grouping
  * column, a column a clause pins, or a count the posting sets answer - and
  * there has to be a count.  Notes the columns printed (groupvalueout,
@@ -1342,12 +1380,26 @@ lion_count_path_outputs(LionCountPathBuild *cx)
 				NULL;
 			AttrNumber	argattno = (arg != NULL && IsA(arg, Var)) ?
 				((Var *) arg)->varattno : 0;
+			AttrNumber	wattno;
+
+			/*
+			 * A sum, an average, a minimum or a maximum over the entries of
+			 * one lion column, weighted by their rows (DESIGN.md §37).
+			 */
+			if (lion_wagg_classify(agg, rti, &wattno, NULL) != LION_WAGG_NONE)
+			{
+				if (!lion_count_path_wagg(cx, wattno))
+					return false;
+				haveagg = true;
+				continue;
+			}
 
 			if (agg->aggdistinct != NIL && cx->distvar != NULL &&
 				argattno == cx->distvar->varattno)
 			{
 				/* checked above; a distinct count needs no other test */
 				haveagg = true;
+				cx->wcounts = true;
 				continue;
 			}
 
@@ -1380,6 +1432,7 @@ lion_count_path_outputs(LionCountPathBuild *cx)
 								  cx->nullattnos))
 				return false;
 			haveagg = true;
+			cx->wcounts = true;
 
 			/*
 			 * Does the walk have to COUNT rather than test for existence?
@@ -2413,6 +2466,21 @@ lion_count_path_make(LionCountPathBuild *cx)
 				(cx->topkn > 0) ?
 				list_make3_int((int) cx->topkn, cx->topkcand,
 							   cx->topkstrict ? 1 : 0) : NIL);
+
+	/* the columns aggregates are taken over (DESIGN.md §37) */
+	if (cx->wattnos != NIL)
+	{
+		List	   *oids = NIL;
+		ListCell   *lc;
+
+		foreach(lc, cx->widx)
+			oids = lappend_oid(oids, ((IndexOptInfo *) lfirst(lc))->indexoid);
+		cpath->custom_private = lappend(cpath->custom_private,
+										list_make3(cx->wattnos, oids,
+												   cx->wcols));
+	}
+	else
+		cpath->custom_private = lappend(cpath->custom_private, NIL);
 	cpath->methods = &lion_count_path_methods;
 
 	return cpath;
@@ -2479,6 +2547,14 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 							  LION_RANGED_NONE) :
 							 cx->sumall ? LION_RANGED_SUM : LION_RANGED_WALK,
 							 cx->rangesel, &rangeprice);
+	/*
+	 * The aggregates over lion columns' entries (DESIGN.md §37): their walks,
+	 * after - or, with no count in the target list, instead of - the sum over
+	 * every row.
+	 */
+	if (cx->wattnos != NIL)
+		lion_cost_wagg_path(root, cpath, input_rel, cx->widx, cx->wcols,
+							cx->wnaggs, cx->wcounts);
 	serialrun = cpath->path.total_cost;
 
 	/*
@@ -2622,6 +2698,9 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	if (!lion_count_path_outputs(&cx))
 		return;
 	if (!lion_count_path_strategy(&cx))
+		return;
+	/* §37's aggregates beside a sum over every row, and nothing else */
+	if (cx.wattnos != NIL && !cx.sumall)
 		return;
 	if (!lion_count_path_targets(&cx))
 		return;

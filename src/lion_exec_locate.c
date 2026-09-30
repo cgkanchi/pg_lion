@@ -1368,6 +1368,22 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 					slot->tts_isnull[i] = keyisnull[g];
 					break;
 				}
+				if (LION_TL_IS_WAGG(kind))
+				{
+					/* an aggregate over a column's entries (DESIGN.md §37) */
+					LionWAgg   *a = &st->wagg[LION_TL_WAGG_NO(kind)];
+
+					slot->tts_values[i] = a->result;
+					slot->tts_isnull[i] = a->resnull;
+					break;
+				}
+				if (LION_TL_IS_WKEY(kind))
+				{
+					/* ... and the key its argument read, which nothing prints */
+					slot->tts_values[i] = (Datum) 0;
+					slot->tts_isnull[i] = true;
+					break;
+				}
 				if (LION_TL_IS_COUNT_GROUPCOLN(kind))
 				{
 					int			g = LION_TL_GROUPN_COL(kind);

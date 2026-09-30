@@ -1490,6 +1490,7 @@ lion_fkjoin_setup(PlannerInfo *root, RelOptInfo *rel, const LionFkJoin *fj,
 	base = lappend(base, NIL);	/* decoded walk: the dimension's groups */
 	base = lappend(base, NIL);	/* every row: the join key drives */
 	base = lappend(base, NIL);	/* top k: the Agg above groups */
+	base = lappend(base, NIL);	/* aggregates over a column's entries */
 
 	out->joinclause = joinclause;
 	out->targets = targets;
