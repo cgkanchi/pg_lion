@@ -438,6 +438,11 @@ Lock ordering:
   entry's posting pages, and buffer locks have no deadlock detector). VACUUM's pass 2 is the one
   path that holds a posting page and wants the leaf, and it only ever tries
   (`ConditionalLockBuffer`), letting go of the posting page before it waits (§11).
+  **Replay takes them the other way round** (§25): a record lists the posting pages it changes
+  before the entry's leaf, and redo locks its blocks in that order and holds them to the end of the
+  record. So on a hot standby no backend may hold a directory page while it WAITS for a posting
+  page either - which no reader does, holding one page at a time; `lion_index_verify()` did until
+  the 2026-09-29 review, and replay deadlocked against it for good (§7).
 - **Within one tree, nbtree's rules** (§21 "Locking summary", §22): a descent takes SHARE locks and
   releases the parent BEFORE locking the child, and takes the target leaf directly in the mode the
   caller needs, so no lock is ever upgraded; a searcher whose key a concurrent split has moved off
@@ -842,6 +847,12 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- report is confirmed with replay paused (pg_wal_replay_pause(), then
         -- pg_wal_replay_resume()); run on a quiet standby, as test/recovery/run.sh does, the check
         -- is exact. A standby is the one place verify() can report damage that is not there.
+        -- A POSTING SET is the one thing a standby settles like a primary: walked with nothing
+        -- held, its entry read again, the walk thrown away when replay changed the set - and never
+        -- walked with the entry's leaf held, the primary's last resort, because replay locks a
+        -- set's pages BEFORE the leaf (§25) and that walk deadlocked replay for good (2026-09-29
+        -- review). A set replay keeps changing is kept from a later walk that gets to its end,
+        -- every page checked, with a WARNING that its totals were not compared with the entry.
         -- AN UNFINISHED SPLIT IS NOT DAMAGE (§21, §22). A split writes the new right sibling in one
         -- record and its downlink in the next, with the left page flagged
         -- LION_PAGE_INCOMPLETE_SPLIT in between, and a crash or an error there leaves the sibling
@@ -946,7 +957,8 @@ saw, which throws the walk away too; so does a root at another level than the de
 A set that keeps changing - a hot key - is walked at most three times like that, and then once more
 with the leaf held SHARE throughout. That is the lock order every writer uses (directory page before
 posting page) and keeps waiting only the writers of the keys on that one leaf, for one walk of one
-set; the 50-call stress run below needed it for 6 of its 70 set walks.
+set; the 50-call stress run below needed it for 6 of its 70 set walks. It is a PRIMARY's last
+resort: replay does not use that lock order (§25), and a standby never makes that walk (below).
 
 **Candidates.** What is left - a downlink to a page the lower walk did not reach, a live page nothing
 reached (directory pages, posting leaves with a live root, internal posting pages) - is recorded, not
@@ -985,12 +997,39 @@ neither is a set created behind it beyond the pages it took. **heapallindexed** 
 its snapshot is taken after the structural check, is registered, and every row it sees was inserted
 by a transaction that committed before it - whose index inserts had therefore finished - while VACUUM,
 the one thing that could have taken a visible row's TID out of the index, is locked out. The lookups
-are readers' descents; a posting-tree lookup holds the entry's leaf for that one descent, as it always
-did. The owner switch, `lion_index_usable()` and the indcheckxmin refusal are unchanged.
+are readers' descents: a CHAIN entry's leaf is let go before its posting tree is descended, and the
+descent hands back, locked, the leaf that holds the container key, moving right past a split - the
+only way an item moves - so the answer is the one a held leaf would give. *(Until the 2026-09-29
+review the lookup held the entry's leaf for its descent, which replay on a standby deadlocked
+against, §25.)* The owner switch, `lion_index_usable()` and the indcheckxmin refusal are unchanged.
 
 **What it can still falsely report: only on a standby**, where it takes AccessShareLock, settles
 nothing and reports what it finds at once, as before - the arguments above rest on how writers hold
 pages across their records, and replay holds each record's pages for that record alone.
+
+**Posting sets on a standby** (2026-09-29 review) are the exception, and the reason is a deadlock,
+not exactness. Replay takes a record's blocks in the order they were registered and holds them all
+to the end of the record, and every record that changes a set registers the set's pages before the
+entry's leaf (§25): a walk with the leaf held - which is how a standby walked every set, and the
+primary's last resort above - waits for a posting page the startup process holds while the startup
+process waits for the leaf. Two buffer content locks: no deadlock detector, and cancel, terminate and
+`pg_ctl stop -m fast` do nothing to either side; replay stopped for good within seconds of a write
+load, in both WAL modes, and only an immediate shutdown got the standby back. So a standby walks a
+set with nothing held and reads the entry again, as above, and the entry reading the same means what
+it means on a primary, for replay's own reason: every record that changes a set's items, counters,
+last leaf or the level of a leaf root carries the entry, and the records that do not - a downlink, a
+flag cleared, an internal split or an internal root pushed down - change nothing the entry counts and
+are what the walk already accepts from a writer between two levels, or throws away. A set that replay
+keeps changing has no last resort: after three walks the next one that gets to the end of the set is
+kept, every page it read checked, and its totals are not compared with the entry - a WARNING says so,
+and a check with replay paused compares them. Only a root pushed down or an upper level split under
+it stops a walk short of the end, and a set that does that to ten walks in a row is an ERROR asking
+for replay to be paused. In a 30 s run of 8 clients inserting 15,000 rows a second into three keys
+of 700,000 rows each (the assert-enabled 18.6, rmgr mode), two clients verifying on the standby made
+27,000 calls without an error, 0.5% of the sets they walked were kept uncompared, and replay kept up
+throughout. `test/recovery/run.sh` phase 4 is that run, shortened, with a watchdog on replay's
+progress: the code before the fix failed it in both modes, replay frozen with the startup process and
+both verifying backends waiting on `BufferContent`.
 
 **Measured** (the assert-enabled PostgreSQL 18.6 of the development slot, 4 CPUs; ratios, not
 absolute numbers). The stress is a loop inserting 200 new ~140-byte text keys at a time (directory
@@ -2467,6 +2506,12 @@ holding a container pin and then asking for the leaf closes the cycle, and buffe
 deadlock detection. Finish with the leaf (copy the entry out, drop its lock) before pinning
 container pages, and never go back. `lion_chain_find_page()` takes SHARE locks
 internally, so do not call it while holding a lock on any page of that chain.
+
+On a standby the rule has a second half (§25): replay locks a record's posting pages BEFORE the
+entry's directory leaf and holds both to the end of the record, so a backend in recovery must also
+never wait for a posting page's lock while it holds a directory page. Every reader already finishes
+with the leaf first; `lion_index_verify()` did not - its walk of a set and its heapallindexed
+lookups held the leaf - and replay deadlocked against it for good (2026-09-29 review, §7).
 
 ### On-access pruning sets the visibility map too (PostgreSQL 19+)
 
@@ -7132,11 +7177,44 @@ block in `cleanupmask`, and applies that block's operation stream when the
 action is BLK_NEEDS_REDO. Blocks that need a cleanup lock are always FIRST (the
 shim reorders them, above), so the wait happens with no other buffer lock held
 - §11's waiting rule, applied to the startup process.
-The reverse order (container page, then directory leaf) is safe against standby
-READERS because no reader ever holds two of these locks at once: a scan walks
-the leaves one shared lock at a time, a descent releases the parent before
+**Replay takes a posting set's pages BEFORE the entry's leaf** - the reverse of
+the primary's order (§5), because the writer locks the leaf first and registers
+it last, when the counters go into the record - and `generic_redo()` takes a
+generic record's blocks in the same order and holds them to the end of the
+record as `lion_redo()` does. That is safe against standby backends only as long
+as none of them holds a directory page while it waits for a posting page: a scan
+walks the leaves one shared lock at a time, a descent releases the parent before
 locking the child, and §11's rule for readers already forbids taking a directory
-lock while holding a container page.
+lock while holding a container page. *(Deviation, found by the 2026-09-29 review:
+this paragraph said that much and called the order safe, and
+`lion_index_verify()` was the exception - on a standby it walked every posting
+set with the entry's leaf held SHARE, and its heapallindexed lookups descended a
+set with the leaf held. The startup process, holding a container page and
+waiting for the leaf, and the backend, holding the leaf and waiting for the
+container page, waited on buffer content locks for good. verify() now holds
+nothing across a set on a standby (§7), and test/recovery/run.sh phase 4 runs
+it there beside a write load with a watchdog on replay.)* Registering the leaf
+first was not done and would not remove the rule: a removal record's cleanup
+block goes first whatever the registration order (above), and WAL already
+written keeps its order. The records that name more than one block, in the
+order redo takes them:
+
+    ITEM_SET, ITEM_REPLACE, ITEM_ADD         container page, entry leaf
+    ITEM_DELETE, VACUUM_PAGE (VACUUM)        container page (cleanup), entry leaf
+    SPLIT of a posting leaf                  P, N (new), M (new, between them), entry leaf
+    SPLIT pushing a leaf root down           root, new child, entry leaf
+    SPLIT pushing an internal root down      root, new child
+    SPLIT of an internal posting page        P, new right sibling
+    SPLIT of a directory page                P, new right sibling, old right sibling, meta page
+    SPLIT of the directory root              old root, new right sibling, new root, meta page
+    ITEM_ADD ending an INLINE spill          new root, entry leaf - but entry leaf, then new
+                                             root, both cleanup, for VACUUM's spill in rmgr
+                                             mode (the reorder above)
+
+VACUUM's regrow and the spill its filtering causes write theirs inside a
+removal window, which cleanup-locks their first block (and the spill's entry
+leaf); that changes the order only where it says so. Every other record names
+one block.
 
 `rm_mask()` masks the page LSN and checksum, the hint bits, the free space
 between pd_lower and pd_upper, and **the MAXALIGN padding after every item**.

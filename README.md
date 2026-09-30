@@ -339,9 +339,11 @@ CONCURRENTLY` builds one: it takes ShareUpdateExclusiveLock on the table and the
 UPDATE and DELETE go on while it runs, and VACUUM, ANALYZE, DDL and a second verify wait for it.
 What a concurrent insert could make look wrong it checks again once the statements that were writing
 the index have ended, so it may wait for them - for as long as statement_timeout and lock_timeout
-allow - but never reports their changes as damage.  On a hot standby it takes AccessShareLock and
-is exact only while replay leaves the index alone.  With `heapallindexed` it evaluates the index's
-expressions as the table's owner (DESIGN.md §7).
+allow - but never reports their changes as damage.  On a hot standby it takes AccessShareLock, holds
+no page while it waits for another that replay may hold, and is exact only while replay leaves the
+index alone; a posting set that replay keeps changing is checked page by page, with a WARNING that
+its totals were not compared.  With `heapallindexed` it evaluates the index's expressions as the
+table's owner (DESIGN.md §7).
 
 ## Source layout
 

@@ -48,9 +48,9 @@ the control files and the library are there, and says so if the tree's
 `pg_lion.so` is not the installed one.
 
 Phases 1b-1e and 3 need the `injection_points` extension. On a server without
-it they are skipped - the log and the summary say which - and phases 1, 1f
-and 2 still run; `--phases "1 1f 2"` asks for exactly those (CI does, on the
-packaged 16-19 servers). `INJECTION_POINTS=1` in the environment turns every
+it they are skipped - the log and the summary say which - and phases 1, 1f,
+2 and 4 still run; `--phases "1 1f 2 4"` asks for exactly those (CI does, on
+the packaged 16-19 servers). `INJECTION_POINTS=1` in the environment turns every
 such skip into a failure, so a server that should have injection points and
 does not cannot end in "ALL RECOVERY AND HOT-STANDBY CHECKS PASSED" having run
 none of those phases; CI's source-build jobs set it.
@@ -76,7 +76,7 @@ failing in the *baseline* check, before any crash has happened — a failure
 there is a reason to check who else is installing into the prefix, not a
 recovery bug. Every failure after the baseline is about recovery.
 
-Takes about 65-80 s with the default 8 iterations. Full output goes to
+Takes about 85-110 s with the default 8 iterations. Full output goes to
 `test/recovery/log/run.log`; on failure the two server logs are copied next to
 it. `make clean` removes the directory.
 
@@ -252,6 +252,31 @@ still be right (the standby rechecks every TID). A failing case is reported and
 the other cases still run. `PHASE3_CASES="split spill"` in the environment runs
 a subset, and `--phases 3` skips phases 1 and 2.
 
+**Phase 4, `lion_index_verify()` on a standby beside replay** (DESIGN.md §7,
+§11, §25). Replay takes a record's blocks in the order the writer registered
+them and holds every one to the end of the record, and every record that
+changes a posting set registers the set's pages before the entry's directory
+leaf - container page, then leaf, the reverse of the primary's order. verify()
+used to walk each set on a standby with that leaf held SHARE, and its
+heapallindexed lookups descended a set with it held: leaf, then container
+page. The startup process and the backend then waited for each other on buffer
+content locks, which have no deadlock detector and ignore cancel and
+terminate: replay stopped for good, and only an immediate shutdown got the
+standby back. The phase makes a standby of its own, with a table of three keys
+whose posting sets are trees of about ten leaves, and for `PHASE4_SECS`
+seconds (12) has pgbench insert into those keys on the primary while two loops
+on the standby call `lion_index_verify(sv_k)` and
+`lion_index_verify(sv_k, true)`. A watchdog asks the standby twice a second
+where replay stands, and fails the phase as soon as replay has not moved for
+`PHASE4_STALL` seconds (10) while WAL it received waits to be replayed - a
+deadlock never ends, so the phase cannot hang, and `statement_timeout` would
+not have ended it. Every verify() call must return without an error (a set
+replay kept changing is kept with a WARNING, which the phase counts); then,
+caught up, verify() with heapallindexed and every key's count must agree with
+the primary. Before the fix the phase failed in both modes within seconds of
+the load starting, with the startup process and both verify() backends
+waiting on `LWLock/BufferContent`.
+
 ## What is not covered
 
 * **No torn-page test.** Nothing here interrupts a page write in the middle.
@@ -270,9 +295,9 @@ a subset, and `--phases 3` skips phases 1 and 2.
   phase 1 workload happens to be, which reaches the frequent paths and not
   the rare ones.
 * **No replica that is behind.** The standby is always caught up before it is
-  read, except in the conflict test where being behind is the point. Nothing
-  tests a cascading standby, a restart from an archive, `pg_rewind`, or a
-  timeline switch other than the one `pg_ctl promote` makes.
+  read, except in the conflict test and in phase 4, where being behind is the
+  point. Nothing tests a cascading standby, a restart from an archive,
+  `pg_rewind`, or a timeline switch other than the one `pg_ctl promote` makes.
 * **No unlogged or temporary indexes.** `test/sql/unlogged.sql` covers what an
   unlogged lion index does; recovery truncates it, so there is nothing to
   check here.
