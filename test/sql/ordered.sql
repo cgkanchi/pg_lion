@@ -298,6 +298,14 @@ RESET enable_seqscan; RESET enable_bitmapscan;
 RESET enable_indexscan; RESET enable_indexonlyscan;
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
+-- the set built, as it always was before the lazy one (§30.4): it degrades
+SET pg_lion.enable_lazy_set = off;
+SELECT * FROM lion_ord_run('EXECUTE lo_big(1)');
+SELECT lion_ord('EXECUTE lo_big(1)',
+				'SELECT id, k FROM lo WHERE c2 = 1 ORDER BY k, id LIMIT 20');
+RESET pg_lion.enable_lazy_set;
+-- lazily: the twenty rows lie in the first few container keys, which is all
+-- of the set that is made, and it stays exact
 SELECT * FROM lion_ord_run('EXECUTE lo_big(1)');
 SELECT lion_ord('EXECUTE lo_big(1)',
 				'SELECT id, k FROM lo WHERE c2 = 1 ORDER BY k, id LIMIT 20');

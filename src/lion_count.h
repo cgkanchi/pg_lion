@@ -1520,6 +1520,7 @@ extern double lion_var_heap_correlation(PlannerInfo *root, Index relid,
  * --------------------------------------------------------------------- */
 
 extern PGDLLIMPORT bool lion_enable_ordered_scan;
+extern PGDLLIMPORT bool lion_enable_lazy_set;
 
 /* GUC, scan methods and set_rel_pathlist_hook; called from _PG_init. */
 extern void lion_ordered_init(void);

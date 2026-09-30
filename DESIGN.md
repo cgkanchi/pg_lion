@@ -13953,8 +13953,9 @@ than overruns (§30.4).
   argument needs one. Under SERIALIZABLE it takes `PredicateLockRelation()` on every lion index
   before any lookup (§9, "SERIALIZABLE": the AM has no `ampredlocks`, and the node reads it
   without `index_beginscan()`).
-- **The set is built at the first fetch after a start or a rescan**, not in BeginCustomScan: an
-  exec Param is set by a nested loop after the node is initialised. Each lion leaf evaluates its
+- **The set is built at the first fetch after a start or a rescan** - or started lazily, below -
+  not in BeginCustomScan: an exec Param is set by a nested loop after the node is initialised.
+  Each lion leaf evaluates its
   run-time keys, opens `lion_source_open(index, keys, nkeys, keeppins = false, cxt)` (§29.3,
   §29.8; an MVCC reader holds no pin, §29.5), and copies every container it produces into a
   `LionTidSet`: a sorted array of (container key, container copy), searched by binary search and
@@ -13987,6 +13988,51 @@ than overruns (§30.4).
   key, at most one per 64 heap blocks (and, while a WALK or LIST leaf is being read, its unmerged
   pieces: fewer than three per key, or 1,024, above); the answer stays exact because every
   fetched member is now rechecked; the node walks on as a slower filter.
+- **The set, lazily** (2026-09-30). Building the set reads every container of every leaf's
+  sets, over the whole table, before the walk hands out its first TID - and a `LIMIT` walk that
+  finds its rows in the first few hundred container keys needs the set at those keys only. When
+  every leaf's keys are set trees (an equality or a list on a scalar column: `lo_lazy_ok()`; a
+  range is a walk of entries, a multi-key query may need every row, and a list longer than a
+  plain scan opens at once, `lion_scan_list_batch()`, is read a batch at a time - a stream holds
+  a cursor for each of its sets), the set is LAZY instead: each leaf key's
+  posting sets are located once (`lion_scankey_sets()`, as a bitmap scan locates them) and their
+  pins let go (§30.5: the node holds none between rows), and each TID the walk hands out is looked
+  up in a memo of container keys (a simplehash, `lo_memo`); a key met for the first time is
+  evaluated there - each key's stream sought to it (`lion_stream_at()`, the leapfrog seek of §22),
+  the leaf's keys ANDed and the tree's ANDs and ORs applied to those containers - and remembered,
+  members or none, with the members this scan met (the 4 kB bitmap of "Stopping early", in the
+  per-scan context). A stream only goes forward; a probe behind where it stands starts it again
+  over the same located sets, which a walk in heap order (the TIDs of one entry, a btree
+  correlated with the heap) rarely does and one in random order does at nearly every key.
+  So the set is BUILT, as above, once the probes have cost what the build would - one unit of
+  work for each set a probe seeks, `LO_LAZY_RESTART_WORK` (4) more for each set a stream starts
+  again over, against a budget of the located sets' recorded container counts, the containers the
+  build reads (`ncontainers`, never below `LO_LAZY_MIN_WORK`, 64) - or once the walk has gone as
+  far as the fetch-and-sort switch below would let it go were the set as big as its entries'
+  recorded member counts say (`ntids`: an AND no bigger than its smallest child, an OR than its
+  children together), or `LO_LAZY_MAX_WALK` (40,000) entries in any case, so that the early stop
+  and the switch, which need the set's size, can act; or once the memo holds half of `hash_mem`.
+  The counts are hints, and decide only when the set is built: whether the switch comes is
+  decided on the set built, and in the regression suite it comes at the same entry it came at
+  before. The build takes over what the
+  walk met (`lo_lazy_convert()`): each memo key's bitmap goes to its container's slot, so the
+  members already returned count as met and the switch does not fetch them again. A small set,
+  whose build is cheap, is built at once, before the walk has cost more than a few dozen probes:
+  the worst case costs about twice the build. A leaf key that selects nothing makes an AND of it
+  empty, as before (`lo_lazy_empty()`). Exactness is the lion quals' own (every lazy key is an
+  exact set). A rescan keeps the memo unless a Param of the lion quals changed, as it keeps a
+  built set; the members met are the scan's and go with it. EXPLAIN ANALYZE says `Lion Set:
+  lazy, K keys probed, exact`, or `N containers, exact, after K keys probed` when it was built.
+  The planner still prices the set as built (§30.3): the lazy set makes the node cheaper than
+  its estimate, never dearer by more than the build. `pg_lion.enable_lazy_set` (on) turns it
+  off, for comparing the two and for the tests of the build (a set that degrades).
+  `test/sql/ordered_lists.sql`. Measured on a release PostgreSQL 18, 5M rows of a 3 GB heap,
+  `long IN (2 of 20) AND here IN (2 of 50) AND we IN (2 of 30) ORDER BY here LIMIT 50` (§30.11,
+  "Lists"): the set of `long` and `we` built is 5,989 containers read before the first row, 8.0 ms
+  warm; lazily the walk probes 468 of the table's 5,860 container keys, 1.3 ms warm, and 6.0 ms
+  from disk (direct I/O, 55 pages) where it was 128 ms (1,509 pages) before the list was the
+  walk's. A btree on `(here, long, we) INCLUDE (...)` answers the same in 0.02 ms warm and 0.8 ms
+  from disk (10 pages), for that query shape alone, at 936 MB against the lion index's 39 MB.
 - **The walk.** `index_beginscan()` on the ordered index under the executor snapshot and
   `index_rescan()` with its keys, in the path's direction. On 16 .. 19 each TID comes from
   `index_getnext_tid()`, which reads only the index, and a member is fetched with
@@ -14361,7 +14407,7 @@ lists> ORDER BY here LIMIT 50` over 5M rows of fifty values read every entry of 
 without a member, until the fetch-and-sort switch gave up on it at 41,344 entries and fetched and
 sorted all 1,292 members - 12.2 ms warm and 128 ms from disk, where the same query over a list at
 the bottom of the column fetched 50 rows. Now it walks 7,816 entries of `H10` and fetches 50 (8.0 ms
-warm, most of it building the set of the other two lists). The values are sorted in the directory's
+warm with the set of the other two lists built, 1.3 ms with it lazy, §30.4). The values are sorted in the directory's
 order - the probe's `sortproc`, the column's comparison - without NULLs, which no key equals, and
 without duplicates, which would walk an entry twice; each is a range of its own, the range keys'
 bounds and `>= v AND <= v`, whose two bounds are the ones the walk descends to (every entry it

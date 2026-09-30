@@ -14,10 +14,12 @@ RESET client_min_messages;
 SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
 -- g: 50 values, a: 20, b: 30, none of them in heap order; n: NULL on every
--- 11th row; ts: nearly unique.  One lion index over the filter columns, one
--- over ts; no btree but the primary key.
+-- 11th row; ts: nearly unique; k: a permutation of the ids, with a btree,
+-- in no heap order either; tags: a multi-key column.  One lion index over
+-- the filter columns, one over ts, one over tags.
 CREATE TABLE lol (id int PRIMARY KEY, g text, a text, b text, n int,
-				  ts timestamptz, pad text) WITH (autovacuum_enabled = off);
+				  ts timestamptz, k int, tags text[], pad text)
+	WITH (autovacuum_enabled = off);
 INSERT INTO lol
 SELECT i,
 	   'g' || lpad(((hashint8extended(i::bigint, 1) & 9223372036854775807) % 50)::text, 2, '0'),
@@ -25,10 +27,14 @@ SELECT i,
 	   'b' || ((hashint8extended(i::bigint, 3) & 9223372036854775807) % 30),
 	   CASE WHEN i % 11 = 0 THEN NULL ELSE i % 13 END,
 	   timestamptz '2026-01-01 00:00+00' + ((i::bigint * 7919) % 60013) * interval '1 minute',
+	   (i::bigint * 7919 % 60013)::int,
+	   ARRAY['t' || (i % 7)],
 	   repeat('x', 200)
   FROM generate_series(1, 60000) i;
 CREATE INDEX lol_l ON lol USING lion (a, g, b, n);
 CREATE INDEX lol_ts ON lol USING lion (ts);
+CREATE INDEX lol_tags ON lol USING lion (tags);
+CREATE INDEX lol_k ON lol (k, id);
 VACUUM (FREEZE, ANALYZE) lol;
 /*
  * ol_cmp() runs q without core's Sort, so that an ordered path is what is
@@ -125,24 +131,24 @@ SELECT * FROM ol_plan($$SELECT id FROM lol
 SELECT * FROM ol_run($$SELECT id FROM lol
 	WHERE a IN ('a3', 'a7') AND g IN ('g10', 'g11') AND b IN ('b4', 'b9')
 	ORDER BY g LIMIT 5$$);
-             ol_run             
---------------------------------
+                ol_run                 
+---------------------------------------
  Index Entries Walked: 567
  Lion Keys Walked: 1
  Lion Set Hits: 5
  Heap Fetches: 5
- Lion Set: 32 containers, exact
+ Lion Set: lazy, 18 keys probed, exact
 (5 rows)
 
 SELECT * FROM ol_run($$SELECT id FROM lol
 	WHERE a IN ('a3', 'a7') AND g IN ('g10', 'g11') ORDER BY g DESC LIMIT 5$$);
-             ol_run             
---------------------------------
+                ol_run                
+--------------------------------------
  Index Entries Walked: 48
  Lion Keys Walked: 1
  Lion Set Hits: 5
  Heap Fetches: 5
- Lion Set: 32 containers, exact
+ Lion Set: lazy, 2 keys probed, exact
 (5 rows)
 
 -- 3. The answers.
@@ -325,6 +331,332 @@ SELECT ol_cmp($$
         ol_cmp        
 ----------------------
  LionOrdered, 12 rows
+(1 row)
+
+-- 5. The set, lazily (DESIGN.md §30.4, "The set, lazily"): evaluated only at
+--    the container keys the walk meets, when every key of it is a set tree
+--    (the counters of 2. above say so too).
+-- an OR of two leaves, and a leaf of two keys: ANDed and ORed at each key
+SELECT * FROM ol_run($$SELECT id FROM lol
+	WHERE (a = 'a3' OR b = 'b2') AND g IN ('g10', 'g11', 'g40') ORDER BY g LIMIT 5$$);
+                ol_run                
+--------------------------------------
+ Index Entries Walked: 47
+ Lion Keys Walked: 1
+ Lion Set Hits: 5
+ Heap Fetches: 5
+ Lion Set: lazy, 2 keys probed, exact
+(5 rows)
+
+SELECT ol_cmp($$SELECT id, g FROM lol
+	WHERE (a = 'a3' OR b = 'b2') AND g IN ('g10', 'g11', 'g40') ORDER BY g, id LIMIT 40$$);
+        ol_cmp        
+----------------------
+ LionOrdered, 40 rows
+(1 row)
+
+SELECT ol_cmp($$SELECT id, g FROM lol
+	WHERE a IN ('a3', 'a4') AND b IN ('b2', 'b7', 'b9') ORDER BY g DESC, id LIMIT 40$$);
+        ol_cmp        
+----------------------
+ LionOrdered, 40 rows
+(1 row)
+
+-- a key of no entry makes its AND empty: no walk at all
+SELECT * FROM ol_run($$SELECT id FROM lol WHERE a = 'zz' AND b = 'b1' ORDER BY g LIMIT 5$$);
+         ol_run          
+-------------------------
+ Index Entries Walked: 0
+ Lion Keys Walked: 0
+ Lion Set Hits: 0
+ Heap Fetches: 0
+(4 rows)
+
+SELECT ol_cmp($$SELECT id, g FROM lol WHERE a = 'zz' AND b = 'b1' ORDER BY g, id LIMIT 5$$);
+       ol_cmp        
+---------------------
+ LionOrdered, 0 rows
+(1 row)
+
+SELECT ol_cmp($$SELECT id, g FROM lol WHERE (a = 'zz' OR b = 'b1') AND g < 'g03'
+	ORDER BY g, id LIMIT 5$$);
+       ol_cmp        
+---------------------
+ LionOrdered, 5 rows
+(1 row)
+
+-- a range, or a multi-key key, in the set: built, as before
+SELECT * FROM ol_run($$SELECT id FROM lol
+	WHERE a = 'a3' AND b > 'b25' AND g IN ('g10', 'g11') ORDER BY g LIMIT 5$$);
+             ol_run             
+--------------------------------
+ Index Entries Walked: 83
+ Lion Keys Walked: 1
+ Lion Set Hits: 5
+ Heap Fetches: 5
+ Lion Set: 35 containers, exact
+(5 rows)
+
+SELECT * FROM ol_run($$SELECT id FROM lol
+	WHERE tags @> ARRAY['t2'] AND g IN ('g10', 'g11') ORDER BY g LIMIT 5$$);
+               ol_run               
+------------------------------------
+ Index Entries Walked: 38
+ Lion Keys Walked: 1
+ Lion Set Hits: 5
+ Heap Fetches: 5
+ Rows Removed by Lion Recheck: 0
+ Lion Set: 35 containers, rechecked
+(6 rows)
+
+SELECT ol_cmp($$SELECT id, g FROM lol
+	WHERE a = 'a3' AND b > 'b25' AND g IN ('g10', 'g11') ORDER BY g, id LIMIT 20$$);
+        ol_cmp        
+----------------------
+ LionOrdered, 20 rows
+(1 row)
+
+-- a list longer than a plain scan opens at once: built
+SET work_mem = '64kB';
+SELECT * FROM ol_run($$SELECT id FROM lol
+	WHERE ts = ANY (ARRAY(SELECT timestamptz '2026-01-01 00:00+00' + i * interval '1 minute'
+						   FROM generate_series(1, 40) i))
+	  AND g IN ('g10', 'g11') ORDER BY g LIMIT 3$$);
+             ol_run             
+--------------------------------
+ Index Entries Walked: 2396
+ Lion Keys Walked: 2
+ Lion Set Hits: 2
+ Heap Fetches: 2
+ Lion Set: 31 containers, exact
+(5 rows)
+
+RESET work_mem;
+-- 6. Built after all: a btree walk in random heap order starts the streams
+--    again at nearly every key, until the probes have cost what the build
+--    reads - here at once, the sets being small.
+SELECT * FROM ol_run($$SELECT id FROM lol
+	WHERE a = 'a3' AND b = 'b4' ORDER BY k LIMIT 5$$);
+                        ol_run                        
+------------------------------------------------------
+ Index Entries Walked: 6179
+ Lion Set Hits: 5
+ Heap Fetches: 5
+ Lion Set: 31 containers, exact, after 11 keys probed
+(4 rows)
+
+SELECT ol_cmp($$SELECT id, k FROM lol WHERE a = 'a3' AND b = 'b4' ORDER BY k, id LIMIT 10$$);
+        ol_cmp        
+----------------------
+ LionOrdered, 10 rows
+(1 row)
+
+-- and a long walk: built once it has met 40,000 entries, the members it met
+-- lazily counted as met, so the early stop ends the walk and the switch,
+-- should it come, fetches none of them again
+SELECT * FROM ol_run($$SELECT id FROM lol
+	WHERE a IN ('a1', 'a2') AND b IN ('b1', 'b2', 'b3') ORDER BY g$$);
+                            ol_run                             
+---------------------------------------------------------------
+ Index Entries Walked: 14496
+ Lion Keys Walked: 13
+ Lion Set Hits: 166
+ Heap Fetches: 619
+ Lion Set: 35 containers, exact, after 35 keys probed
+ Switched to Fetch and Sort: 1 of 1 scans, 453 members fetched
+(6 rows)
+
+SELECT ol_cmp($$SELECT id, g FROM lol
+	WHERE a IN ('a1', 'a2') AND b IN ('b1', 'b2', 'b3') ORDER BY g, id$$);
+        ol_cmp         
+-----------------------
+ LionOrdered, 619 rows
+(1 row)
+
+SELECT ol_cmp($$SELECT id, g FROM lol
+	WHERE a = 'a1' AND b = 'b1' AND n = 3 ORDER BY g, id$$);
+       ol_cmp        
+---------------------
+ LionOrdered, 4 rows
+(1 row)
+
+SELECT ol_cmp($$SELECT id, ts FROM lol
+	WHERE a = 'a1' AND b IN ('b1', 'b2') ORDER BY ts DESC, id$$);
+        ol_cmp         
+-----------------------
+ LionOrdered, 230 rows
+(1 row)
+
+-- 7. Rescans: a LATERAL filter per outer row starts the set again; one whose
+--    Param is only the walk's keeps it; a cursor fetched in pieces.
+SELECT ol_cmp($$
+	SELECT o.v, x.id, x.g FROM (VALUES ('a1'), ('a7'), ('zz'), ('a19')) o(v),
+	  LATERAL (SELECT l.id, l.g FROM lol l WHERE l.a = o.v AND l.b IN ('b1', 'b5')
+				ORDER BY l.g, l.id LIMIT 3) x$$);
+       ol_cmp        
+---------------------
+ LionOrdered, 9 rows
+(1 row)
+
+SELECT ol_cmp($$
+	SELECT o.v, x.id, x.g FROM (VALUES (ARRAY['g01', 'g03']), (ARRAY['g49']),
+										(ARRAY['g20', 'g21', 'g22'])) o(v),
+	  LATERAL (SELECT l.id, l.g FROM lol l WHERE l.g = ANY (o.v) AND l.a = 'a4' AND l.b <> 'b0'
+				ORDER BY l.g, l.id LIMIT 4) x$$);
+        ol_cmp        
+----------------------
+ LionOrdered, 12 rows
+(1 row)
+
+SET enable_sort = off;
+BEGIN;
+DECLARE ol_c CURSOR FOR
+	SELECT id, g FROM lol WHERE a IN ('a3', 'a7') AND b = 'b4' ORDER BY g, id LIMIT 30;
+FETCH 7 FROM ol_c;
+  id   |  g  
+-------+-----
+ 18079 | g01
+ 24495 | g01
+ 25561 | g01
+ 29774 | g01
+ 40603 | g01
+ 47709 | g01
+ 51787 | g01
+(7 rows)
+
+FETCH 11 FROM ol_c;
+  id   |  g  
+-------+-----
+ 25203 | g02
+  7734 | g03
+ 37459 | g03
+ 48699 | g03
+ 52413 | g03
+ 57584 | g03
+ 59759 | g03
+  2837 | g04
+ 15486 | g04
+ 25003 | g04
+ 49770 | g04
+(11 rows)
+
+FETCH ALL FROM ol_c;
+  id   |  g  
+-------+-----
+ 59557 | g04
+ 18530 | g05
+ 47873 | g05
+ 50039 | g05
+ 58376 | g05
+  6864 | g06
+  9890 | g06
+ 14531 | g06
+ 43277 | g06
+  3684 | g07
+  7062 | g07
+ 18957 | g07
+(12 rows)
+
+ROLLBACK;
+RESET enable_sort;
+SET pg_lion.enable_ordered_scan = off;
+SELECT id, g FROM lol WHERE a IN ('a3', 'a7') AND b = 'b4' ORDER BY g, id LIMIT 30;
+  id   |  g  
+-------+-----
+ 18079 | g01
+ 24495 | g01
+ 25561 | g01
+ 29774 | g01
+ 40603 | g01
+ 47709 | g01
+ 51787 | g01
+ 25203 | g02
+  7734 | g03
+ 37459 | g03
+ 48699 | g03
+ 52413 | g03
+ 57584 | g03
+ 59759 | g03
+  2837 | g04
+ 15486 | g04
+ 25003 | g04
+ 49770 | g04
+ 59557 | g04
+ 18530 | g05
+ 47873 | g05
+ 50039 | g05
+ 58376 | g05
+  6864 | g06
+  9890 | g06
+ 14531 | g06
+ 43277 | g06
+  3684 | g07
+  7062 | g07
+ 18957 | g07
+(30 rows)
+
+RESET pg_lion.enable_ordered_scan;
+-- a list Param of the set in a generic plan: NULL selects nothing, and no
+-- walk is made; a NULL element is no key
+SET plan_cache_mode = force_generic_plan;
+PREPARE ol_s(text[]) AS
+	SELECT id, g FROM lol WHERE a = ANY ($1) AND b = 'b1' AND g IN ('g01', 'g11', 'g21')
+	ORDER BY g, id LIMIT 5;
+SELECT * FROM ol_run('EXECUTE ol_s(NULL)');
+         ol_run          
+-------------------------
+ Index Entries Walked: 0
+ Lion Keys Walked: 0
+ Lion Set Hits: 0
+ Heap Fetches: 0
+(4 rows)
+
+SELECT ol_cmp('EXECUTE ol_s(NULL)',
+			  $$SELECT id, g FROM lol WHERE a = ANY (NULL::text[]) AND b = 'b1'
+				  AND g IN ('g01', 'g11', 'g21') ORDER BY g, id LIMIT 5$$);
+       ol_cmp        
+---------------------
+ LionOrdered, 0 rows
+(1 row)
+
+SELECT * FROM ol_run($$EXECUTE ol_s(ARRAY['a1', NULL, 'a11'])$$);
+                        ol_run                        
+------------------------------------------------------
+ Index Entries Walked: 2422
+ Lion Keys Walked: 3
+ Lion Set Hits: 8
+ Heap Fetches: 8
+ Lion Set: 35 containers, exact, after 35 keys probed
+(5 rows)
+
+SELECT ol_cmp($$EXECUTE ol_s(ARRAY['a1', NULL, 'a11'])$$,
+			  $$SELECT id, g FROM lol WHERE a = ANY (ARRAY['a1', NULL, 'a11']) AND b = 'b1'
+				  AND g IN ('g01', 'g11', 'g21') ORDER BY g, id LIMIT 5$$);
+       ol_cmp        
+---------------------
+ LionOrdered, 5 rows
+(1 row)
+
+DEALLOCATE ol_s;
+RESET plan_cache_mode;
+-- 8. A heap that is not all-visible: rows deleted and updated after the
+--    index was built, and a row inserted - the walk meets TIDs whose rows
+--    the snapshot does not see, and the set knows no better.
+DELETE FROM lol WHERE id % 17 = 0;
+UPDATE lol SET a = 'a3' WHERE id % 23 = 0;
+INSERT INTO lol VALUES (60001, 'g10', 'a3', 'b4', 1, now(), 60001, '{t1}', 'y');
+SELECT ol_cmp($$SELECT id, g FROM lol
+	WHERE a IN ('a3', 'a7') AND g IN ('g10', 'g11') AND b IN ('b4', 'b9')
+	ORDER BY g, id LIMIT 20$$);
+        ol_cmp        
+----------------------
+ LionOrdered, 20 rows
+(1 row)
+
+SELECT ol_cmp($$SELECT id, g FROM lol WHERE a = 'a3' AND b IN ('b4', 'b5') ORDER BY g DESC, id$$);
+        ol_cmp         
+-----------------------
+ LionOrdered, 329 rows
 (1 row)
 
 DROP FUNCTION ol_cmp(text, text);
