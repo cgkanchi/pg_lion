@@ -11421,7 +11421,8 @@ another column, as every walk does.
 Not taken, and the inside walked as before:
 
 - **an unordered range**, where there is no run to take apart;
-- **no positive WHERE source.** `|F − NULL(k)|` needs one to drive the merge (§14), and the count of
+- **no positive WHERE source**, or none but ranges collected as sources (§32), which hold no pin
+  (`lion_source_drives()`). `|F − NULL(k)|` needs one to drive the merge (§14), and the count of
   every row of the table is not something an index can give. `count(*) WHERE k >= 0` alone is the
   sum over every entry, as it always was. Summing another column's entries, NULL included, and
   subtracting k's NULL entry from each would give it, but that is a walk of another column, and only
@@ -11447,9 +11448,17 @@ a thousand rows each beside a selective equality at 1,344 for 920,000 containers
 could not see that the keys outside a range might be a handful. Now:
 
 - **One side is walked.** INSIDE has `nin = n_distinct(k) × sel` entries. When F has a positive source
-  and k's directory is ordered, the complement has `n_distinct(k) − nin` entries plus one count of
-  F minus the NULL entry: F's containers again, and a descent. The cheaper side is charged, plus the
-  race: two leaf reads for every leaf of that side.
+  that can drive a count and k's directory is ordered, the complement has `n_distinct(k) − nin`
+  entries plus one count of F minus the NULL entry: F's containers again, and a descent. The cheaper
+  side is charged, plus the race: two leaf reads for every leaf of that side. A range taken as a
+  source (§32) is no such source: it is collected into a copy that holds no pin, and the executor
+  never lets one drive (`lion_source_drives()`), so beside nothing but such ranges the inside is
+  charged, as it is walked. *(Until 2026-09-30 any positive source would do here, and
+  `count(*) WHERE mid > 10 AND hi > 10` over 2M rows - `hi > 10` summed, `mid > 10` collected - was
+  priced at a tenth of the inside walk it made: 38,488 for 2.5 s, where the sequential scan it
+  rejected, at 63,522, takes 0.33. It is 316,199 now, and the sequential scan is chosen. A range too
+  large to collect is walked at every count instead, and can drive; the model takes it as collected
+  all the same, which prices such a count at its inside, what it costs at most.)*
 - **Each entry walked** costs a fixed amount, `LION_RANGE_UNION_ENTRY_COST` (12 `cpu_tuple_cost`)
   for a small entry counted with its leaf and `LION_RANGE_ENTRY_COST` (40) for one counted on its
   own. On top of that come its OWN containers: the rows of one key of k (`tuples × sel / nin`), not

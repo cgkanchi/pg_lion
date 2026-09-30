@@ -1270,8 +1270,9 @@ lion_single_eq_var(RelOptInfo *rel, List *whereclauses, List *wherekinds)
  * runs it.
  *
  *	- ONE side of the range is walked: the entries it selects, or - when F
- *	  has a positive source and k's directory is ordered - the entries below
- *	  and above it, plus one count of F minus k's NULL entry (the complement).
+ *	  has a positive source that can drive a count, which a range taken as a
+ *	  source cannot, and k's directory is ordered - the entries below and
+ *	  above it, plus one count of F minus k's NULL entry (the complement).
  *	  The executor takes the side with fewer leaves, and so does this.
  *	- Each entry walked costs a fixed amount (LION_RANGE_ENTRY_COST for one
  *	  counted on its own, LION_RANGE_UNION_ENTRY_COST for a small one counted
@@ -1460,13 +1461,17 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	Cost		inside;
 	Cost		outside;
 
-	/* The sources of F: one per OR restriction, one per positive clause. */
+	/*
+	 * The sources of F: one per OR restriction, one per positive clause - and
+	 * of those, the ones that can drive a count of F (nplain): not a range
+	 * taken as a source, which is collected into a copy that carries no pin
+	 * (§32) and that the executor never lets drive (lion_source_drives()).
+	 */
 	foreach(lc, wherekinds)
 	{
 		if (LION_CLAUSE_IS_POSITIVE(lfirst_int(lc)) && orgrp[ci] < 0)
 		{
 			nsrc++;
-			/* a source that is a range carries no pin (§32) */
 			if (lfirst_int(lc) != LION_CLAUSE_RANGESRC)
 				nplain++;
 		}
@@ -1617,7 +1622,20 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	}
 	inside += lion_range_recheck(root, rel, matching * dirtyfrac, incounts,
 								 corr);
-	if (nsrc == 0 || !ordered)
+
+	/*
+	 * No complement without a source of F that can drive |F - NULL(k)|, which
+	 * the executor asks of F before it steps the two sides at all
+	 * (lion_range_choose_on()): beside nothing but ranges taken as sources -
+	 * `count(*) WHERE mid > 10 AND hi > 10`, one collected, the other summed -
+	 * the inside is walked whatever it holds.  This used to ask for any
+	 * source (nsrc), and priced the complement of two ranges over nearly
+	 * every row at a tenth of the inside walk that ran (2026-09-29 review).
+	 * A range too large to collect is walked at every count instead, and can
+	 * drive; it is taken as collected here all the same, which prices such a
+	 * count at its inside - what it costs at most.
+	 */
+	if (nplain == 0 || !ordered)
 		return inside;
 
 	/*
