@@ -213,15 +213,18 @@ lion_dir_downlink_block(Relation index, Page page, BlockNumber blk,
  * Move to the right sibling, releasing the page we came from first.  Moving
  * right needs no coupling: items only ever move rightwards, so a page that
  * splits under us puts what we are looking for on a page we have not passed.
+ * walk is the walk along the level this step belongs to, which a cycle of
+ * damaged right links ends in an ERROR (lion.h).
  */
 Buffer
-lion_dir_step_right(Relation index, Buffer buf, int lockmode)
+lion_dir_step_right(Relation index, Buffer buf, int lockmode,
+					LionRightWalk *walk)
 {
 	BlockNumber next = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
 	int			level = LionPageGetOpaque(BufferGetPage(buf))->level;
 	Buffer		nbuf;
 
-	Assert(BlockNumberIsValid(next));
+	lion_rightwalk_step(index, walk, BufferGetBlockNumber(buf), next);
 	UnlockReleaseBuffer(buf);
 
 	/*
@@ -294,7 +297,7 @@ lion_cmp_prefix(const LionEntryTuple *item, const LionSearchKey *sk)
 
 	if (sk->cmpproc != NULL)
 	{
-		Datum		stored = lion_fetch_key(sk->col, LionEntryGetKey(item));
+		Datum		stored = lion_entry_key(sk->col, item);
 		int32		c = DatumGetInt32(FunctionCall2Coll(sk->cmpproc,
 														sk->collation,
 														stored, sk->key));
@@ -411,7 +414,7 @@ lion_search_key_exact(LionIndexState *ix, LionSearchKey *sk,
 
 		lion_search_key_init(col, sk, kind,
 							 LION_KIND_HAS_KEY(kind) ?
-							 lion_fetch_key(col, LionEntryGetKey(entry)) :
+							 lion_entry_key(col, entry) :
 							 (Datum) 0,
 							 entry->hash);
 	}
@@ -649,6 +652,7 @@ restart:
 		BlockNumber child;
 		int			level;
 		int			childlock;
+		LionRightWalk walk;
 
 		/*
 		 * A concurrent split may have moved our key to the right - and a
@@ -659,6 +663,7 @@ restart:
 		 * have no parent item to insert next to.  nbtree's _bt_moveright does
 		 * exactly this, lock upgrade and all (DESIGN.md §21).
 		 */
+		lion_rightwalk_init(&walk);
 		for (;;)
 		{
 			page = BufferGetPage(buf);
@@ -686,7 +691,7 @@ restart:
 			if (lion_cmp_entry(lion_page_highkey(page), sk) > 0)
 				break;
 
-			buf = lion_dir_step_right(index, buf, pagelock);
+			buf = lion_dir_step_right(index, buf, pagelock, &walk);
 		}
 		page = BufferGetPage(buf);
 
@@ -745,7 +750,9 @@ lion_dir_search_first(Relation index, Relation heaprel, LionIndexState *ix,
 	OffsetNumber off;
 	Buffer		buf = lion_dir_search(index, heaprel, ix, sk, lockmode,
 									  forwrite, &off);
+	LionRightWalk walk;
 
+	lion_rightwalk_init(&walk);
 	for (;;)
 	{
 		Page		page = BufferGetPage(buf);
@@ -764,7 +771,7 @@ lion_dir_search_first(Relation index, Relation heaprel, LionIndexState *ix,
 			lion_dir_finish_split(index, heaprel, ix, buf);
 			continue;
 		}
-		buf = lion_dir_step_right(index, buf, lockmode);
+		buf = lion_dir_step_right(index, buf, lockmode, &walk);
 		off = lion_page_first_data(BufferGetPage(buf));
 	}
 
@@ -803,11 +810,13 @@ lion_dir_search_level(Relation index, LionIndexState *ix,
 		OffsetNumber off;
 		BlockNumber child;
 		int			plevel;
+		LionRightWalk walk;
 
+		lion_rightwalk_init(&walk);
 		while (!LionPageIsRightmost(page) &&
 			   lion_cmp_entry(lion_page_highkey(page), sk) <= 0)
 		{
-			buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
+			buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE, &walk);
 			page = BufferGetPage(buf);
 		}
 
@@ -841,13 +850,16 @@ lion_dir_find_by_scan(Relation index, LionIndexState *ix,
 					 OffsetNumber *offnum)
 {
 	BlockNumber blk = lion_dir_leftmost_leaf(index, ix);
+	LionRightWalk walk;
 
+	lion_rightwalk_init(&walk);
 	while (BlockNumberIsValid(blk))
 	{
 		Buffer		buf = lion_dir_readbuf(index, blk);
 		Page		page;
 		OffsetNumber off;
 		OffsetNumber maxoff;
+		BlockNumber next;
 
 		LockBuffer(buf, lockmode);
 		page = BufferGetPage(buf);
@@ -869,8 +881,7 @@ lion_dir_find_by_scan(Relation index, LionIndexState *ix,
 				continue;
 			if (sk->kind == LION_KIND_VALUE &&
 				!DatumGetBool(FunctionCall2Coll(sk->eqproc, sk->collation,
-												lion_fetch_key(sk->col,
-															   LionEntryGetKey(e)),
+												lion_entry_key(sk->col, e),
 												sk->key)))
 				continue;
 
@@ -879,7 +890,10 @@ lion_dir_find_by_scan(Relation index, LionIndexState *ix,
 			return true;
 		}
 
-		blk = LionPageGetOpaque(page)->rightlink;
+		next = LionPageGetOpaque(page)->rightlink;
+		if (BlockNumberIsValid(next))
+			lion_rightwalk_step(index, &walk, blk, next);
+		blk = next;
 		UnlockReleaseBuffer(buf);
 		CHECK_FOR_INTERRUPTS();
 	}
@@ -914,7 +928,7 @@ lion_dir_step_right_coupled(Relation index, Buffer buf, Buffer guard,
 	if (unlikely(next == blk ||
 				 (BufferIsValid(guard) && next == BufferGetBlockNumber(guard))))
 		lion_dir_held_link(index, blk, next);
-	lion_rightwalk_step(index, walk, blk);
+	lion_rightwalk_step(index, walk, blk, next);
 
 	nbuf = lion_dir_readbuf(index, next);
 	LockBuffer(nbuf, lockmode);
@@ -983,8 +997,7 @@ lion_dir_scan_run_ext(Relation index, const LionSearchKey *sk,
 			 */
 			if (sk->kind != LION_KIND_VALUE ||
 				DatumGetBool(FunctionCall2Coll(sk->eqproc, sk->collation,
-											   lion_fetch_key(sk->col,
-															  LionEntryGetKey(e)),
+											   lion_entry_key(sk->col, e),
 											   sk->key)))
 			{
 				*bufp = buf;
@@ -1023,7 +1036,7 @@ lion_dir_scan_run_ext(Relation index, const LionSearchKey *sk,
 											  keep, &walk);
 		}
 		else
-			buf = lion_dir_step_right(index, buf, lockmode);
+			buf = lion_dir_step_right(index, buf, lockmode, &walk);
 		off = lion_page_first_data(BufferGetPage(buf));
 		moved = true;
 	}
@@ -1193,8 +1206,10 @@ lion_dir_value_end(Relation index, LionState *col, OffsetNumber *offp)
  * directory page is ever unlinked (DESIGN.md §21), so the page now left of
  * this one is reached by walking right from the one the link names until a
  * page's right link is this page - nbtree's _bt_walk_left() without page
- * deletion.  The walk is bounded because its caller only estimates and can
- * give up; nothing is held between the two pages, as in lion_dir_step_right().
+ * deletion.  The walk is bounded by maxsteps for a caller that only estimates
+ * and can give up, and for every caller by the size of the index, like any
+ * walk right (lion.h); nothing is held between the two pages, as in
+ * lion_dir_step_right().
  */
 Buffer
 lion_dir_step_left(Relation index, Buffer buf, int maxsteps)
@@ -1205,6 +1220,7 @@ lion_dir_step_left(Relation index, Buffer buf, int maxsteps)
 	int			level = LionPageGetOpaque(page)->level;
 	Buffer		lbuf;
 	int			steps;
+	LionRightWalk walk;
 
 	UnlockReleaseBuffer(buf);
 	if (!BlockNumberIsValid(left) || left == cur)
@@ -1216,6 +1232,7 @@ lion_dir_step_left(Relation index, Buffer buf, int maxsteps)
 	lion_dir_check_page(index, BufferGetPage(lbuf), left);
 	lion_dir_check_level(index, BufferGetPage(lbuf), left, level);
 
+	lion_rightwalk_init(&walk);
 	for (steps = 0;; steps++)
 	{
 		Page		lpage = BufferGetPage(lbuf);
@@ -1224,7 +1241,7 @@ lion_dir_step_left(Relation index, Buffer buf, int maxsteps)
 			return lbuf;
 		if (LionPageIsRightmost(lpage) || steps >= maxsteps)
 			break;
-		lbuf = lion_dir_step_right(index, lbuf, BUFFER_LOCK_SHARE);
+		lbuf = lion_dir_step_right(index, lbuf, BUFFER_LOCK_SHARE, &walk);
 	}
 
 	UnlockReleaseBuffer(lbuf);
@@ -1317,6 +1334,17 @@ lion_dir_place(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 
 	if (replace)
 	{
+		/*
+		 * The item that goes is overwritten by its line pointer inside the
+		 * record, and the items below it move when its size changes: it has
+		 * to be a whole entry, alone in its bytes (lion_page_check_alone()),
+		 * or the record fails - a PANIC in rmgr mode - or overwrites its
+		 * neighbour.
+		 */
+		(void) lion_page_entry_fetch(index, page, BufferGetBlockNumber(buf),
+									 off);
+		lion_page_check_alone(index, page, BufferGetBlockNumber(buf), off);
+
 		xstate = lion_wal_begin(index);
 		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 		lion_wal_save_item(xstate, p, off);
@@ -1538,6 +1566,15 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 		elog(ERROR, "lion index \"%s\": root page %u has a right sibling",
 			 RelationGetRelationName(index), pblk);
 
+	/*
+	 * Both pages are rebuilt from the items as their line pointers give them,
+	 * inside the record, and the cut below is chosen by their lengths: they
+	 * have to be inside the page and apart (lion_page_check_items()), each at
+	 * least a header and its key long (see the loop), or the rebuild reads
+	 * past the copy or fails half way.
+	 */
+	lion_page_check_items(index, page, pblk);
+
 	/* Work from a private copy: both pages are rebuilt from scratch. */
 	copy = (PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 	cpage = (Page) copy->data;
@@ -1568,6 +1605,14 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 			continue;
 		items[nitems].item = lion_page_item(cpage, o);
 		items[nitems].size = lion_page_itemsz(cpage, o);
+		if (unlikely(items[nitems].size < LION_ENTRY_HDRSZ ||
+					 items[nitems].size <
+					 LionEntryPayloadOffset(items[nitems].item)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": item %u on block %u is %zu bytes, too small for its header and key",
+							RelationGetRelationName(index), o, pblk,
+							items[nitems].size)));
 		nitems++;
 	}
 
@@ -1996,8 +2041,8 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 				if (LionPageGetOpaque(page)->rightlink == childblk)
 					lion_dir_held_link(index, BufferGetBlockNumber(buf),
 									   childblk);
-				lion_rightwalk_step(index, &walk, BufferGetBlockNumber(buf));
-				buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
+				buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE,
+										  &walk);
 				page = BufferGetPage(buf);
 			}
 			off = lion_page_downlink(page, sk);
@@ -2032,6 +2077,7 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 		Page		page;
 		OffsetNumber off;
 		OffsetNumber maxoff;
+		BlockNumber next;
 
 		if (blk == childblk)
 			lion_dir_held_link(index, blk, childblk);
@@ -2064,12 +2110,13 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 			}
 		}
 
-		lion_rightwalk_step(index, &walk, blk);
-		blk = LionPageGetOpaque(page)->rightlink;
+		next = LionPageGetOpaque(page)->rightlink;
 		UnlockReleaseBuffer(buf);
-		if (!BlockNumberIsValid(blk))
+		if (!BlockNumberIsValid(next))
 			elog(ERROR, "lion index \"%s\": no downlink for block %u at level %u",
 				 RelationGetRelationName(index), childblk, childlevel + 1);
+		lion_rightwalk_step(index, &walk, blk, next);
+		blk = next;
 		CHECK_FOR_INTERRUPTS();
 	}
 }

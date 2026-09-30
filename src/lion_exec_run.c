@@ -16,16 +16,16 @@
 static TupleTableSlot *lion_exec_custom_scan_internal(CustomScanState *node);
 
 /*
- * Walk one partition without a group key: open it, locate its clauses, count
- * it, then let go of everything it owns (DESIGN.md §16).
+ * Walk one partition without a group key: its turn, in which it is the
+ * relation counted - its clauses located, it counted, and everything it
+ * located let go of again (DESIGN.md §16).
  */
 static int64
 lion_run_partition(LionCountScanState *st, int p)
 {
 	int64		count;
 
-	lion_open_relation(st, st->part[p].heapoid, st->part[p].groupidxoid,
-					  st->part[p].groupidxoid2, st->part[p].clauseidxoid);
+	lion_open_relation(st, p);
 	lion_locate_where(st);
 
 	if (st->hasgroupidx)
@@ -47,15 +47,15 @@ lion_run_partition(LionCountScanState *st, int p)
  * GROUP BY over a partitioned table: one PARTIAL aggregate per group per
  * partition (DESIGN.md §16).
  *
- * The partitions are walked in the planner's order and each one is opened,
- * iterated and closed in turn, its groups emitted as they are counted.  The
- * node therefore holds no cross-partition state at all - no hash table, no
- * per-node group memory beyond one partition's iteration state - and the
- * Finalize HashAggregate core puts above it combines the partial counts,
- * spilling to disk under hash_mem like any HashAggregate.  A group with rows
- * in several partitions is emitted once per partition, and the §9 pin
- * discipline is unchanged: a partition's posting sets are all released
- * before its indexes are closed.
+ * The partitions are walked in the planner's order and each one has its
+ * turn - made the relation counted, iterated, and let go of - its groups
+ * emitted as they are counted.  The node therefore holds no cross-partition
+ * state beyond the open relations - no hash table, no per-node group memory
+ * beyond one partition's iteration state - and the Finalize HashAggregate
+ * core puts above it combines the partial counts, spilling to disk under
+ * hash_mem like any HashAggregate.  A group with rows in several partitions
+ * is emitted once per partition, and the §9 pin discipline is unchanged: a
+ * partition's posting sets are all released before its turn ends.
  */
 static TupleTableSlot *
 lion_next_partial_group(LionCountScanState *st)
@@ -70,10 +70,7 @@ lion_next_partial_group(LionCountScanState *st)
 				return NULL;
 			}
 
-			lion_open_relation(st, st->part[st->curpart].heapoid,
-							  st->part[st->curpart].groupidxoid,
-							  st->part[st->curpart].groupidxoid2,
-							  st->part[st->curpart].clauseidxoid);
+			lion_open_relation(st, st->curpart);
 			lion_locate_where(st);
 			st->partopen = true;
 
@@ -106,7 +103,7 @@ lion_next_partial_group(LionCountScanState *st)
 			st->scanning = false;
 		}
 
-		/* This partition is done: release its sets, then close it. */
+		/* This partition is done: release its sets, then end its turn. */
 		lion_release_where(st);
 		lion_close_relation(st);
 		st->partopen = false;
@@ -501,6 +498,10 @@ lion_reset_run(LionCountScanState *st)
 	/* ... and the batch of keys being looked up in key order, and the walk */
 	lion_join_batch_reset(st);
 	st->joinchilddone = false;
+
+	/* ... and the way the child is read, decided again at the next row */
+	st->joinbegun = false;
+	st->joinwalked = false;
 
 	/* ... and a fact column's groups: the rows put by, and the next turn */
 	st->fgturn = 0;
@@ -942,9 +943,14 @@ lion_end_custom_scan(CustomScanState *node)
 	}
 	st->childslot = NULL;
 
-	/* A plain table's relations were opened once and are closed once. */
+	/*
+	 * A plain table's relations were opened once and are closed once, and so
+	 * were every partition's (lion_reset_run() has ended the current turn).
+	 */
 	if (st->npart == 0)
 		lion_close_relation(st);
+	else
+		lion_close_parts(st);
 
 	if (st->pergroup != NULL)
 	{

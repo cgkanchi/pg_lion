@@ -79,7 +79,9 @@ lion_count_scan_filtered(LionCountScanState *st)
  * (the complement of DESIGN.md §28)?  A COLLECTED set - a range taken as a
  * source (§32) - cannot: it holds no pin, and a count it drove alone would
  * have nothing to carry the §9 interlock and would recheck every row in the
- * heap.  A range still to be walked can: its pieces are located sets.
+ * heap.  A range still to be walked can: its pieces are located sets.  The
+ * planner prices the complement only beside a source this says yes to
+ * (lion_cost_range_sum()), taking every range as a collected one.
  */
 static bool
 lion_source_drives(const LionCountSource *src)

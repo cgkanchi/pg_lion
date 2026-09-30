@@ -276,12 +276,22 @@ lion_new_buffer(Relation index, Relation heaprel, uint16 flags)
  * compacts - that lies inside the page's item space at a MAXALIGNed offset,
  * the test lion_verify_itemid() makes, which is amcheck's; the type has to be
  * one of the four item kinds; the size the header gives has to fit both the
- * line pointer's length and the largest legal item; and a sparse segment has
- * to hold a pair, because an empty one is never stored and has no last
- * container key.  Anything else is an ERROR naming the index and the block.
- * Before this, a damaged item was read wherever its line pointer and its
- * header said, up to 256 KiB past the page image (2026-09-27 review).  What
- * the payload itself holds is lion_index_verify()'s business.
+ * line pointer's length and the largest legal item, and the line pointer may
+ * claim no more beyond it than the growth slack an item can carry
+ * (LION_ITEM_SLACK_BOUND, the rule lion_index_verify() applies); and a sparse
+ * segment has to hold a pair, because an empty one is never stored and has no
+ * last container key.  Anything else is an ERROR naming the index and the
+ * block.  Before this, a damaged item was read wherever its line pointer and
+ * its header said, up to 256 KiB past the page image (2026-09-27 review).
+ * What the payload itself holds is lion_index_verify()'s business.
+ *
+ * The slack bound is not for the readers, which never look past the size the
+ * header gives, but for the WRITERS, which copy, move and rewrite an item by
+ * its line pointer, inside a WAL record: a length that reached from an item
+ * into the next one made every root push-down of its set PANIC in rmgr mode,
+ * again after every recovery (2026-09-29 review).  What a writer needs beyond
+ * this - the item alone in its bytes, the items of the page apart - it checks
+ * itself (lion_page_check_alone(), lion_page_check_items()).
  *
  * It is a dozen comparisons per item, against the hundreds to thousands of
  * instructions the container code then spends on it.  page may be a private
@@ -354,6 +364,13 @@ lion_page_item_fetch(Relation index, Page page, BlockNumber blkno,
 				 errmsg("lion index \"%s\": item %u on container page %u needs %zu bytes, but has %u",
 						RelationGetRelationName(index), off, blkno, size,
 						lplen)));
+	if (unlikely(lplen > LION_CONTAINER_MAX_SIZE ||
+				 lplen - size > LION_ITEM_SLACK_BOUND))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": item %u on container page %u occupies %u bytes, %zu more than its %zu bytes need (at most %d bytes of slack)",
+						RelationGetRelationName(index), off, blkno, lplen,
+						lplen - size, size, LION_ITEM_SLACK_BOUND)));
 
 	if (unlikely(item->type == LION_CT_SPARSE && item->cardinality == 0))
 		ereport(ERROR,
@@ -362,6 +379,212 @@ lion_page_item_fetch(Relation index, Page page, BlockNumber blkno,
 						RelationGetRelationName(index), off, blkno)));
 
 	return item;
+}
+
+/*
+ * THE LINE POINTERS OF A PAGE A RECORD IS ABOUT TO CHANGE.
+ *
+ * bufpage.c overwrites, deletes and moves items by their line pointers, and
+ * the push-down and the splits copy items out by them, all of it inside a WAL
+ * record - which in rmgr mode is a critical section (DESIGN.md §25).  A line
+ * pointer the writer has not looked at first is then either a PANIC -
+ * bufpage.c's "corrupted line pointer" is an ERROR, and so is an item that
+ * does not fit where the record puts it - or SILENT: an item written back at
+ * the length its line pointer gives, when that length reaches into the next
+ * item, overwrites the next item, and the record takes the damage to every
+ * standby.  So a writer checks what its record is going to do before the
+ * record opens, and refuses a damaged page with ERRCODE_INDEX_CORRUPTED:
+ *
+ *	- lion_page_check_items(), every item, before a record that deletes
+ *	  items, moves them to a new page or rewrites several of them;
+ *	- lion_page_check_alone(), the one item a record overwrites or deletes in
+ *	  place;
+ *	- lion_page_entry_fetch(), the directory entry a record rewrites.
+ *
+ * A container item has been through lion_page_item_fetch() as well, which
+ * bounds what its line pointer may claim beyond its size.
+ */
+
+/* The header bounds, as bufpage.c tests them before it moves anything. */
+static void
+lion_page_check_header(Relation index, Page page, BlockNumber blkno)
+{
+	PageHeader	phdr = (PageHeader) page;
+
+	if (unlikely(phdr->pd_lower < SizeOfPageHeaderData ||
+				 phdr->pd_lower > phdr->pd_upper ||
+				 phdr->pd_upper > phdr->pd_special ||
+				 phdr->pd_special > BLCKSZ ||
+				 phdr->pd_special != MAXALIGN(phdr->pd_special)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": block %u has a corrupt page header (lower %u, upper %u, special %u)",
+						RelationGetRelationName(index), blkno,
+						phdr->pd_lower, phdr->pd_upper, phdr->pd_special)));
+}
+
+/*
+ * Item off is on the page, and its line pointer is a normal one that lies
+ * inside the item space at a MAXALIGNed offset: lion_verify_itemid()'s test,
+ * and what bufpage.c requires of an item it overwrites or deletes.
+ */
+static void
+lion_page_check_itemid(Relation index, Page page, BlockNumber blkno,
+					   OffsetNumber off)
+{
+	PageHeader	phdr = (PageHeader) page;
+	ItemId		iid;
+
+	if (unlikely(off < FirstOffsetNumber || off > PageGetMaxOffsetNumber(page)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": block %u has no item %u",
+						RelationGetRelationName(index), blkno, off)));
+
+	iid = PageGetItemId(page, off);
+	if (unlikely(!ItemIdIsNormal(iid) || ItemIdGetLength(iid) == 0 ||
+				 ItemIdGetOffset(iid) < phdr->pd_upper ||
+				 ItemIdGetOffset(iid) + ItemIdGetLength(iid) > phdr->pd_special ||
+				 ItemIdGetOffset(iid) != MAXALIGN(ItemIdGetOffset(iid))))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": line pointer %u on block %u points at %u bytes at offset %u, outside the item space %u .. %u",
+						RelationGetRelationName(index), off, blkno,
+						ItemIdGetLength(iid), ItemIdGetOffset(iid),
+						phdr->pd_upper, phdr->pd_special)));
+}
+
+/*
+ * Every used line pointer of block blkno lies inside the item space, and no
+ * two items overlap.  Then neither PageIndexMultiDelete() nor
+ * PageIndexTupleDelete() can fail on the page or move one item over another,
+ * and the items - all of them, or any of them - fit an empty page of the same
+ * kind, which is where a push-down or a split moves them: disjoint items at
+ * MAXALIGNed offsets take no more of the item space than it has, and their n
+ * line pointers take the pd_lower - SizeOfPageHeaderData bytes they take
+ * here.  An unused line pointer is one VACUUM leaves on a directory leaf
+ * (DESIGN.md §18); a container page has none (lion_page_item_fetch()).
+ *
+ * The items of a page this index wrote tile its item space, because every
+ * delete compacts, so an overlap is damage - and the one damage nothing else
+ * a writer checks would see: two line pointers can each be inside the page,
+ * and an item's length within its slack, while one reaches into the other.
+ * The test marks the MAXALIGN units each item covers, which is a pass over
+ * the page's bytes an eighth at a time whatever the number of items.
+ */
+void
+lion_page_check_items(Relation index, Page page, BlockNumber blkno)
+{
+	uint64		covered[BLCKSZ / MAXIMUM_ALIGNOF / 64];
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+	OffsetNumber off;
+
+	lion_page_check_header(index, page, blkno);
+	memset(covered, 0, sizeof(covered));
+
+	for (off = FirstOffsetNumber; off <= maxoff; off++)
+	{
+		ItemId		iid = PageGetItemId(page, off);
+		unsigned	u;
+		unsigned	end;
+
+		if (!ItemIdIsUsed(iid))
+			continue;
+		lion_page_check_itemid(index, page, blkno, off);
+
+		end = (ItemIdGetOffset(iid) + ItemIdGetLength(iid) +
+			   MAXIMUM_ALIGNOF - 1) / MAXIMUM_ALIGNOF;
+		for (u = ItemIdGetOffset(iid) / MAXIMUM_ALIGNOF; u < end; u++)
+		{
+			uint64		bit = UINT64CONST(1) << (u % 64);
+
+			if (unlikely((covered[u / 64] & bit) != 0))
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("lion index \"%s\": item %u on block %u overlaps another item",
+								RelationGetRelationName(index), off, blkno)));
+			covered[u / 64] |= bit;
+		}
+	}
+}
+
+/*
+ * Item off of block blkno is the only one in the bytes the page allots it -
+ * from its offset to the MAXALIGNed end of its length, which is where
+ * bufpage.c writes an item back and what it moves the items below it by.
+ * It is lion_page_check_items() for the one item a record overwrites or
+ * deletes in place, as one pass over the line pointers rather than over the
+ * page, because the in-place insert of a member is the hot path of a hot
+ * key; and it is what keeps a line
+ * pointer whose length reaches into the next item from having that item
+ * overwritten - which that insert did, growing a container into its
+ * neighbour, and logged (2026-09-29 review).
+ */
+void
+lion_page_check_alone(Relation index, Page page, BlockNumber blkno,
+					  OffsetNumber off)
+{
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+	OffsetNumber i;
+	unsigned	start;
+	unsigned	end;
+
+	lion_page_check_header(index, page, blkno);
+	lion_page_check_itemid(index, page, blkno, off);
+	start = ItemIdGetOffset(PageGetItemId(page, off));
+	end = start + MAXALIGN(ItemIdGetLength(PageGetItemId(page, off)));
+
+	for (i = FirstOffsetNumber; i <= maxoff; i++)
+	{
+		ItemId		iid = PageGetItemId(page, i);
+
+		if (i == off || !ItemIdHasStorage(iid))
+			continue;
+		if (unlikely(ItemIdGetOffset(iid) < end &&
+					 start < (unsigned) (ItemIdGetOffset(iid) +
+										 ItemIdGetLength(iid))))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": items %u and %u on block %u overlap",
+							RelationGetRelationName(index), off, i, blkno)));
+	}
+}
+
+/*
+ * The entry at off of directory leaf blkno, for a writer that reads its
+ * payload by its line pointer's length or rewrites it in a record: a line
+ * pointer lion_page_check_itemid() accepts, long enough for the header and
+ * for the key the header gives - and, for a CHAIN entry, exactly that long,
+ * which is what lion_index_verify() requires of one and what every record
+ * that rewrites one relies on (lion_put_entry(): the entry keeps its size, so
+ * "this cannot fail", inside a critical section).
+ */
+LionEntryTuple *
+lion_page_entry_fetch(Relation index, Page page, BlockNumber blkno,
+					  OffsetNumber off)
+{
+	LionEntryTuple *entry;
+	Size		len;
+
+	lion_page_check_header(index, page, blkno);
+	lion_page_check_itemid(index, page, blkno, off);
+	entry = (LionEntryTuple *) PageGetItem(page, PageGetItemId(page, off));
+	len = ItemIdGetLength(PageGetItemId(page, off));
+
+	if (unlikely(len < LION_ENTRY_HDRSZ || len < LionEntryPayloadOffset(entry)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": entry %u on block %u is %zu bytes, too small for its header and key",
+						RelationGetRelationName(index), off, blkno, len)));
+	if (unlikely((entry->flags & LION_ENTRY_CHAIN) != 0 &&
+				 len != LionEntryPayloadOffset(entry)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": chain entry %u on block %u is %zu bytes, expected %zu",
+						RelationGetRelationName(index), off, blkno, len,
+						LionEntryPayloadOffset(entry))));
+
+	return entry;
 }
 
 /*

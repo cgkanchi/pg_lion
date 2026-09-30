@@ -129,8 +129,8 @@ lion_verify_run_add(LionVerifyState *vs, LionVerifyRun *run,
 			LionState  *col = lion_column(vs->ix, (AttrNumber) item->attno);
 
 			same = lion_keys_equal(col,
-								   lion_fetch_key(col, LionEntryGetKey(other)),
-								   lion_fetch_key(col, LionEntryGetKey(item)));
+								   lion_entry_key(col, other),
+								   lion_entry_key(col, item));
 		}
 		if (same)
 			lion_corrupt("lion index \"%s\": entry %u on block %u is a second entry for the key of an entry on block %u",
@@ -361,6 +361,12 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 		/* Nothing below reads an item this has not vouched for. */
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
 			(void) lion_verify_dir_item(vs, blk, page, off);
+
+		/*
+		 * ... and no two of them overlap, which every writer of the page
+		 * requires before it rewrites one (lion_page_check_items()).
+		 */
+		lion_page_check_items(vs->index, page, blk);
 
 		if (!LionPageIsRightmost(page))
 		{

@@ -528,3 +528,23 @@ lion_sparse_check(const LionContainer *s, Size avail_bytes, const char **errmsg)
 
 	return true;
 }
+
+bool
+lion_sparse_check_offsets(const LionContainer *s, uint32 maxoff,
+						  const char **errmsg)
+{
+	uint32		n = lion_sparse_npairs(s);
+	const uint16 *los = sparse_los_const(s, n);
+	uint32		i;
+
+	*errmsg = NULL;
+	Assert(maxoff < (1U << LION_OFFSET_BITS));
+
+	for (i = 0; i < n; i++)
+	{
+		if (!lion_lo_is_tuple(los[i], maxoff))
+			LION_SPARSE_CHECK_FAIL("sparse segment member is not a heap tuple offset");
+	}
+
+	return true;
+}

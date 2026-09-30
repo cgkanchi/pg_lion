@@ -317,6 +317,25 @@ get_opfamily_name(Oid opfid, bool missing_ok)
 #endif
 
 /*
+ * A backend's fair share of shared_buffers: the pool over every process that
+ * may pin a buffer of it, which is what core holds its own batch operations
+ * to - a read stream, a relation extension (LimitAdditionalPins()).  18
+ * exports it as GetPinLimit(); 16 and 17 compute the same number inside
+ * bufmgr.c (MaxProportionalPins) and export no way to read it, so it is
+ * computed here the way they compute it.  It is 0 on a pool that is small for
+ * the connections it serves (DESIGN.md §15, "The pin budget").
+ */
+#include "storage/bufmgr.h"
+#if PG_VERSION_NUM >= 180000
+#define lion_pin_fair_share()	GetPinLimit()
+#else
+#include "miscadmin.h"
+#include "storage/proc.h"
+#define lion_pin_fair_share() \
+	((uint32) (NBuffers / (MaxBackends + NUM_AUXILIARY_PROCS)))
+#endif
+
+/*
  * The bulk-write API (storage/bulk_write.h) is 17's.  On 16 the same five
  * calls are provided by lion_build.c on top of smgrextend()/smgrwrite() and
  * log_newpage(), the way 16's own nbtree build writes its pages: each page is

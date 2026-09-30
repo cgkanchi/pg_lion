@@ -36,8 +36,26 @@
  * members of incoming ARRAYs are only appended to `pend`, and folded in -
  * one pass through an image, lion_container_add_many() - once half as many
  * as the union holds have come: each member is then moved a bounded number
- * of times, and `pend` is at most half the union's own size.  Anything else
- * (a RUN on either side, a column in heap order) is folded as before.
+ * of times, and `pend` is at most half the union's own size.  An ARRAY that
+ * a larger ARRAY comes to is merged with it, while the two fit an ARRAY.
+ *
+ * Anything else would go through an image - a RUN union, which is what a
+ * dense union optimizes to (a heap block's rows are a run) and what every
+ * union of a column in heap order is, or a RUN or a BITSET coming to an
+ * ARRAY - and the union is WIDENED to a BITSET instead
+ * (lion_range_union_widen()), ORed into in place from then on.  Folded, a
+ * RUN union cost a 4 KB image per container that came to it however few
+ * members it brought, which over a range of scattered rows is per member:
+ * the collection went from 19 ms at 10,000 keys to 12.7 s at 190,000, 22
+ * times core's plan (2026-09-29 review).  A widened union takes a BITSET's
+ * memory where its optimized form may take a few bytes, so the unions
+ * widened since the last time are optimized again - COMPACTED,
+ * lion_range_union_compact() - whenever that memory runs short: before a
+ * union is refused a widening, which then folds as before, and before the
+ * collection gives up or a window gives back keys, which therefore happens
+ * only where it did before.  A widening is made where a fold would have been
+ * and compacted at most once, so a collection short of memory spends about
+ * what it did, and one that is not a fold or two a union key.
  */
 typedef struct LionRangeUnionEnt
 {
@@ -61,6 +79,9 @@ typedef struct LionRangeUnion
 	uint64		hi;
 	LionContainer *tmp;			/* LION_CONTAINER_MAX_SIZE bytes */
 	uint64	   *img;			/* LION_BITSET_BYTES: a fold's image */
+	uint32	   *widened;		/* the keys widened since the last compaction */
+	int			nwidened;
+	int			widenedcap;
 } LionRangeUnion;
 
 /* No upper bound on the container keys of a window. */
@@ -175,9 +196,81 @@ lion_range_union_fold(LionRangeUnion *u, LionRangeUnionEnt *e)
 }
 
 /*
+ * Optimize every union widened since the last compaction that is still there
+ * - a windowed collection may have given it back since - and that is still a
+ * BITSET, so that what the unions hold is what their optimized forms take
+ * again (DENSE ACCUMULATION, above).  A union that comes out of it a BITSET
+ * all the same is one past what an ARRAY or a RUN holds, and stays one.
+ */
+static void
+lion_range_union_compact(LionRangeUnion *u)
+{
+	int			i;
+
+	for (i = 0; i < u->nwidened; i++)
+	{
+		LionRangeUnionEnt *e = (LionRangeUnionEnt *)
+			hash_search(u->byckey, &u->widened[i], HASH_FIND, NULL);
+
+		if (e == NULL || e->c->type != LION_CT_BITSET)
+			continue;
+		memcpy(u->tmp, e->c, e->size);
+		lion_container_optimize(u->tmp);
+		lion_range_union_store(u, e, u->tmp);
+	}
+	u->nwidened = 0;
+}
+
+/*
+ * Make e's union, which is no BITSET and has nothing pending, a BITSET to OR
+ * into in place (DENSE ACCUMULATION, above) - if the memory has room for one,
+ * after compacting the unions widened before it if it has not.  False, with
+ * nothing changed, when it has no room even then: the caller folds.
+ */
+static bool
+lion_range_union_widen(LionRangeUnion *u, LionRangeUnionEnt *e)
+{
+	Assert(e->c->type != LION_CT_BITSET && e->npend == 0);
+
+	if (u->held + LION_CONTAINER_MAX_SIZE > u->maxbytes)
+	{
+		lion_range_union_compact(u);
+		if (u->held + LION_CONTAINER_MAX_SIZE > u->maxbytes)
+			return false;
+	}
+	if (u->nwidened == u->widenedcap)
+	{
+		Size		had = (u->widened != NULL) ?
+			GetMemoryChunkSpace(u->widened) : 0;
+
+		u->widenedcap = Max(64, u->widenedcap * 2);
+		u->widened = (u->widened != NULL) ?
+			(uint32 *) repalloc(u->widened, sizeof(uint32) * u->widenedcap) :
+			(uint32 *) MemoryContextAlloc(u->cxt,
+										  sizeof(uint32) * u->widenedcap);
+		u->held += GetMemoryChunkSpace(u->widened);
+		u->held -= Min(u->held, had);
+	}
+	u->widened[u->nwidened++] = e->ckey;
+
+	/* a BITSET union takes no pending members */
+	if (e->pend != NULL)
+	{
+		u->held -= Min(u->held, GetMemoryChunkSpace(e->pend));
+		pfree(e->pend);
+		e->pend = NULL;
+		e->pendcap = 0;
+	}
+	memcpy(u->tmp, e->c, e->size);
+	lion_container_to_bitset(u->tmp);
+	lion_range_union_store(u, e, u->tmp);
+	return true;
+}
+
+/*
  * The walk is over: every union folded and optimized, which is the form it
- * is handed out in.  A BITSET that was ORed into in place may now be smaller
- * as an ARRAY or a RUN.
+ * is handed out in.  A BITSET that was ORed into in place - widened, or past
+ * what an ARRAY holds - may now be smaller as an ARRAY or a RUN.
  */
 static void
 lion_range_union_finish(LionRangeUnion *u)
@@ -275,15 +368,24 @@ lion_range_union_cb(const LionContainer *c, void *arg)
 	else
 	{
 		lion_range_union_fold(u, e);
+		if (e->c->type != LION_CT_BITSET &&
+			!(e->c->type == LION_CT_ARRAY && c->type == LION_CT_ARRAY &&
+			  (uint32) e->c->cardinality + c->cardinality <=
+			  LION_ARRAY_MAX_CARD))
+			(void) lion_range_union_widen(u, e);
 		if (e->c->type == LION_CT_BITSET)
 			(void) lion_container_or_inplace(e->c, c);
 		else
 		{
+			/* two ARRAYs merged, or a union refused a widening folded */
 			(void) lion_container_or(e->c, c, u->tmp);
 			lion_range_union_store(u, e, u->tmp);
 		}
 	}
 
+	/* the widened unions give back what they took first */
+	if (u->held > u->maxbytes && u->nwidened > 0)
+		lion_range_union_compact(u);
 	if (u->held > u->maxbytes)
 	{
 		if (!u->window)
@@ -498,6 +600,8 @@ lion_range_collect(Relation index, AttrNumber attno, LionRange *range,
 			pfree(ents);
 			pfree(u.tmp);
 			pfree(u.img);
+			if (u.widened != NULL)
+				pfree(u.widened);
 			hash_destroy(u.byckey);
 			mat->held = sizeof(LionMatSet) + sizeof(LionContainer *) * n +
 				MemoryContextMemAllocated(cxt, true);

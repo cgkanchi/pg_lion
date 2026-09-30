@@ -198,6 +198,21 @@ BLCKSZ 16K and 32K set flags past the engine's per-block array. A WAL redo of th
 (LION_OP_CONTAINER_ADD, LION_OP_SPARSE_INS, §25) checks its item the way the writer did before it
 logged the call.
 
+The 2026-09-29 review found the WRITERS trusting line pointers: they copy, move, overwrite and
+delete items by them inside a WAL record, which in rmgr mode is a critical section (§25). A line
+pointer that claimed 4000 bytes for an 1816-byte ARRAY passed every reader, and the next push-down
+of its set copied the item by that length, failed half way through its record and PANICked - and
+again at the first insert after recovery; one that reached into the next item within its slack had
+the in-place insert grow the container into that item's header, logged. So `lion_page_item_fetch()`
+also bounds what the line pointer claims past the item's size by `LION_ITEM_SLACK_BOUND`, verify()'s
+rule, and a writer checks what its record is going to do before the record opens: every item of the
+page inside the item space and no two overlapping (`lion_page_check_items()`, before a push-down,
+a split, VACUUM's filtering of a page and a directory split), the one item it overwrites or
+deletes in place alone in the bytes the page allots it (`lion_page_check_alone()`, before the
+in-place insert, a replacement and VACUUM's delete), and the directory entry a record rewrites a
+whole one, of exactly its size when it is a CHAIN entry (`lion_page_entry_fetch()`). Each is an
+ERROR (INDEX_CORRUPTED), and verify() reports an overlap too. `test/sql/corrupt_items.sql`.
+
 Full API: `src/lion_container.h`. Unit tests: `test/unit/container_test.c` (`make unit`), which must
 cover every type transition, boundary cardinalities (0, 1, 2047, 2048, 2049, 32767, 32768 members),
 run merging/splitting, and set algebra against a brute-force 32768-bit reference.
@@ -423,6 +438,11 @@ Lock ordering:
   entry's posting pages, and buffer locks have no deadlock detector). VACUUM's pass 2 is the one
   path that holds a posting page and wants the leaf, and it only ever tries
   (`ConditionalLockBuffer`), letting go of the posting page before it waits (§11).
+  **Replay takes them the other way round** (§25): a record lists the posting pages it changes
+  before the entry's leaf, and redo locks its blocks in that order and holds them to the end of the
+  record. So on a hot standby no backend may hold a directory page while it WAITS for a posting
+  page either - which no reader does, holding one page at a time; `lion_index_verify()` did until
+  the 2026-09-29 review, and replay deadlocked against it for good (§7).
 - **Within one tree, nbtree's rules** (§21 "Locking summary", §22): a descent takes SHARE locks and
   releases the parent BEFORE locking the child, and takes the target leaf directly in the mode the
   caller needs, so no lock is ever upgraded; a searcher whose key a concurrent split has moved off
@@ -784,9 +804,12 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- never below the column of the entry before it, §24), at most one reserved NULL and one
         -- reserved EMPTY entry PER COLUMN, page ids/flags, meta values, entry flags,
         -- ascending ckeys within pages and across rightlinks, min/max correctness, container_check
-        -- on every container, ntids/ncontainers sums; with heapallindexed, scans the heap with a
-        -- fresh snapshot and checks that every visible tuple's TID is present under its key in
-        -- EVERY key column (§24) - refusing (lion_index_usable(), §9) when this transaction's
+        -- on every container and that every member is a heap tuple - an offset 1 ..
+        -- MaxHeapTuplesPerPage, a RUN inside one block (§2; a member at offset 0 used to pass,
+        -- and every query of its key then failed) - no two items of a page overlapping, the
+        -- form of every stored key (§21, "Readers"), ntids/ncontainers sums; with
+        -- heapallindexed, scans the heap with a fresh snapshot and checks that every visible
+        -- tuple's TID is present under its key in EVERY key column (§24) - refusing (lion_index_usable(), §9) when this transaction's
         -- snapshot may not use the index.
         -- The heap scan evaluates the index's expressions and predicate, which are the table
         -- owner's functions and can be replaced after CREATE INDEX with anything at all. They run
@@ -824,6 +847,12 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- report is confirmed with replay paused (pg_wal_replay_pause(), then
         -- pg_wal_replay_resume()); run on a quiet standby, as test/recovery/run.sh does, the check
         -- is exact. A standby is the one place verify() can report damage that is not there.
+        -- A POSTING SET is the one thing a standby settles like a primary: walked with nothing
+        -- held, its entry read again, the walk thrown away when replay changed the set - and never
+        -- walked with the entry's leaf held, the primary's last resort, because replay locks a
+        -- set's pages BEFORE the leaf (§25) and that walk deadlocked replay for good (2026-09-29
+        -- review). A set replay keeps changing is kept from a later walk that gets to its end,
+        -- every page checked, with a WARNING that its totals were not compared with the entry.
         -- AN UNFINISHED SPLIT IS NOT DAMAGE (§21, §22). A split writes the new right sibling in one
         -- record and its downlink in the next, with the left page flagged
         -- LION_PAGE_INCOMPLETE_SPLIT in between, and a crash or an error there leaves the sibling
@@ -928,7 +957,8 @@ saw, which throws the walk away too; so does a root at another level than the de
 A set that keeps changing - a hot key - is walked at most three times like that, and then once more
 with the leaf held SHARE throughout. That is the lock order every writer uses (directory page before
 posting page) and keeps waiting only the writers of the keys on that one leaf, for one walk of one
-set; the 50-call stress run below needed it for 6 of its 70 set walks.
+set; the 50-call stress run below needed it for 6 of its 70 set walks. It is a PRIMARY's last
+resort: replay does not use that lock order (§25), and a standby never makes that walk (below).
 
 **Candidates.** What is left - a downlink to a page the lower walk did not reach, a live page nothing
 reached (directory pages, posting leaves with a live root, internal posting pages) - is recorded, not
@@ -967,12 +997,39 @@ neither is a set created behind it beyond the pages it took. **heapallindexed** 
 its snapshot is taken after the structural check, is registered, and every row it sees was inserted
 by a transaction that committed before it - whose index inserts had therefore finished - while VACUUM,
 the one thing that could have taken a visible row's TID out of the index, is locked out. The lookups
-are readers' descents; a posting-tree lookup holds the entry's leaf for that one descent, as it always
-did. The owner switch, `lion_index_usable()` and the indcheckxmin refusal are unchanged.
+are readers' descents: a CHAIN entry's leaf is let go before its posting tree is descended, and the
+descent hands back, locked, the leaf that holds the container key, moving right past a split - the
+only way an item moves - so the answer is the one a held leaf would give. *(Until the 2026-09-29
+review the lookup held the entry's leaf for its descent, which replay on a standby deadlocked
+against, §25.)* The owner switch, `lion_index_usable()` and the indcheckxmin refusal are unchanged.
 
 **What it can still falsely report: only on a standby**, where it takes AccessShareLock, settles
 nothing and reports what it finds at once, as before - the arguments above rest on how writers hold
 pages across their records, and replay holds each record's pages for that record alone.
+
+**Posting sets on a standby** (2026-09-29 review) are the exception, and the reason is a deadlock,
+not exactness. Replay takes a record's blocks in the order they were registered and holds them all
+to the end of the record, and every record that changes a set registers the set's pages before the
+entry's leaf (§25): a walk with the leaf held - which is how a standby walked every set, and the
+primary's last resort above - waits for a posting page the startup process holds while the startup
+process waits for the leaf. Two buffer content locks: no deadlock detector, and cancel, terminate and
+`pg_ctl stop -m fast` do nothing to either side; replay stopped for good within seconds of a write
+load, in both WAL modes, and only an immediate shutdown got the standby back. So a standby walks a
+set with nothing held and reads the entry again, as above, and the entry reading the same means what
+it means on a primary, for replay's own reason: every record that changes a set's items, counters,
+last leaf or the level of a leaf root carries the entry, and the records that do not - a downlink, a
+flag cleared, an internal split or an internal root pushed down - change nothing the entry counts and
+are what the walk already accepts from a writer between two levels, or throws away. A set that replay
+keeps changing has no last resort: after three walks the next one that gets to the end of the set is
+kept, every page it read checked, and its totals are not compared with the entry - a WARNING says so,
+and a check with replay paused compares them. Only a root pushed down or an upper level split under
+it stops a walk short of the end, and a set that does that to ten walks in a row is an ERROR asking
+for replay to be paused. In a 30 s run of 8 clients inserting 15,000 rows a second into three keys
+of 700,000 rows each (the assert-enabled 18.6, rmgr mode), two clients verifying on the standby made
+27,000 calls without an error, 0.5% of the sets they walked were kept uncompared, and replay kept up
+throughout. `test/recovery/run.sh` phase 4 is that run, shortened, with a watchdog on replay's
+progress: the code before the fix failed it in both modes, replay frozen with the startup process and
+both verifying backends waiting on `BufferContent`.
 
 **Measured** (the assert-enabled PostgreSQL 18.6 of the development slot, 4 CPUs; ratios, not
 absolute numbers). The stress is a loop inserting 200 new ~140-byte text keys at a time (directory
@@ -1310,18 +1367,33 @@ compared its keys under its own collation; `col = key` compares under the key's 
 one of its own - an explicit COLLATE, or a column of another collation, read from the argument's own
 expression (`lion_count_arg_collation()`, so that the two-key form's keys are taken one by one, as
 the two clauses of its query are) - and otherwise under the column's: a literal or a parameter brings
-the default collation, which gives way to the column's in the parser's rule for an operator's inputs
-(an explicit COLLATE "default" therefore reads as none). The column's collation is the table
-column's, or the expression's for an expression column, and need not be the index's: `(c COLLATE
-"x")` keeps c and compares under x. Two deterministic collations agree on which values are equal -
-each calls two values equal when their bytes are - so a count under another deterministic collation
-than the index's is made, and is the query's. A nondeterministic one agrees with no other: a
-case-insensitive index counts 'ABC' under the key 'abc', and `c = 'abc'` under the column's own
-collation does not; so where either collation is nondeterministic and the two differ the count is
-an ERROR (`collation_mismatch`), never a different number. `lion_index_count_group_stats()` stands for
-`GROUP BY col`, which groups under the column's collation, and is refused the same way.
+the default collation, which gives way to the column's in the parser's rule for an operator's inputs.
+The column's collation is the table column's, or the expression's for an expression column, and need
+not be the index's: `(c COLLATE "x")` keeps c and compares under x. Two deterministic collations
+agree on which values are equal - each calls two values equal when their bytes are - so a count
+under another deterministic collation than the index's is made, and is the query's. A
+nondeterministic one agrees with no other: a case-insensitive index counts 'ABC' under the key
+'abc', and `c = 'abc'` under the column's own collation does not; so where either collation is
+nondeterministic and the two differ the count is an ERROR (`collation_mismatch`), never a different
+number. `lion_index_count_group_stats()` stands for `GROUP BY col`, which groups under the column's
+collation, and is refused the same way.
+*A key of the default collation* (2026-09-29 review) is the one the call cannot read. An explicit
+`COLLATE "default"` does not give way to the column's collation - `c = 'abc' COLLATE "default"` on a
+case-insensitive column counts 'abc' alone - but the planner folds a COLLATE into the literal or the
+parameter under it (`eval_const_expressions()` turns the CollateExpr into the Const's own
+`constcollid`), and the function's `inputcollid` is "default" either way, so the FuncExpr the
+function is handed is the same with it and without it. Taken for no COLLATE at all, as it was, it
+counted 'ABC' too: 600 rows where the query counts 200. Both readings are taken instead, and the
+count is made only where both would make it. They part on one case alone, a column of a
+nondeterministic collation counted through an index under that collation: the literal's reading
+counts, the explicit one is refused. That case is an ERROR (`indeterminate_collation`) whose hint
+says to name the column's collation on the key (`'abc'::text COLLATE case_insensitive`), which is
+then counted as the column's queries count; everywhere else - every column of a deterministic
+collation, the database's default among them, since a default collation is always deterministic -
+nothing changed. A key taken from a column brings that column's collation and is read as such.
 `test/sql/countcoll.sql` covers both halves; the nondeterministic one needs ICU and a UTF8 database
-and is skipped without them (`countcoll_1.out`), as it is on CI's source builds.
+and is skipped without them (`countcoll_1.out`), as it is on CI's source builds;
+`test/sql/countcoll_default.sql` the default collation's key, likewise.
 **A NULL argument answers NULL**, where `count(*) WHERE col = NULL` answers 0: the functions are
 STRICT, deliberately (2026-09-25 review, kept). PostgreSQL never calls a STRICT function with a NULL
 argument - a NULL constant folds the call away when the query is planned - so no count is made,
@@ -2435,6 +2507,12 @@ deadlock detection. Finish with the leaf (copy the entry out, drop its lock) bef
 container pages, and never go back. `lion_chain_find_page()` takes SHARE locks
 internally, so do not call it while holding a lock on any page of that chain.
 
+On a standby the rule has a second half (§25): replay locks a record's posting pages BEFORE the
+entry's directory leaf and holds both to the end of the record, so a backend in recovery must also
+never wait for a posting page's lock while it holds a directory page. Every reader already finishes
+with the leaf first; `lion_index_verify()` did not - its walk of a set and its heapallindexed
+lookups held the leaf - and replay deadlocked against it for good (2026-09-29 review, §7).
+
 ### On-access pruning sets the visibility map too (PostgreSQL 19+)
 
 §9 was written when VACUUM was the only thing that set a VM bit. PostgreSQL 19's
@@ -2911,8 +2989,9 @@ over a temporary table pinned up to a thousand local buffers of 1024 and failed 
 local buffer available" (2026-09-25 review). The eighth is what keeps one backend from exhausting
 the pool - the failure above
 was 9000 leaves against 2048 buffers, where an eighth is 256 and leaves seven eighths to the query's
-own heap, visibility-map and chain pages and to every other backend - and it only binds below 64MB,
-so on any ordinary configuration a literal list pins exactly the leaves it always did. The CURSORS
+own heap, visibility-map and chain pages and to every other backend - and it only binds below 64MB
+(on a shared pool the fair-share bound below binds before it, since 2026-09-29 below about 340MB of
+shared_buffers). The CURSORS
 that read the located sets draw on what the lists leave of the same limit ("Bounded cursors",
 below). Pins on the
 leaf the previous set already pins cost no buffer and are not counted. Every set that took a new
@@ -2933,13 +3012,34 @@ the budget comes out **NOPIN**: its payload copied, its leaf let go, exactly lik
 The limit is per backend, and two things it did not account for were other backends and a
 query's own parallel workers (2026-09-28 review). An eighth of the pool keeps one backend from
 exhausting it, but eight at once still could. So for the shared pool the limit is also at most
-`LION_LOOKUP_SHARES` = 16 times the backend's fair share, `NBuffers / MaxBackends`, and never less
-than `LION_LOOKUP_MIN_PINS` = 64: exhausting the pool that way takes a sixteenth of all the
-backends the server is configured for, running lists over the budget at the same moment. On a stock
-server (128MB, 100 connections, some 130 buffers a backend) the share is about 2000 and the thousand
-still binds, so an ordinary configuration pins exactly what it did; the share binds where
-max_connections is large for shared_buffers (128MB and 500 connections: about 500). A plain fair
-share, the budget's first version below, sent ordinary lists to the heap; sixteen of them do not.
+`LION_LOOKUP_SHARES` = 4 times the backend's fair share of it: the pool over every process that may
+pin a buffer of it, core's `GetPinLimit()` - NBuffers / (MaxBackends + NUM_AUXILIARY_PROCS), which
+is what core holds a read stream or a relation extension to, and which 16 and 17 compute the same
+way without exporting it (`lion_pin_fair_share()`, lion_compat.h). Exhausting the pool that way
+takes a quarter of all the processes the server is configured for, running lists over the budget at
+the same moment. On a stock 18 server (128MB, 100 connections: 94 buffers a backend) that is 376,
+and the thousand binds from about 340MB of shared_buffers up - the regression suite's servers pin
+exactly what they did. A plain fair share, the budget's first version below, sent ordinary lists to
+the heap; four of them keep a pinned leaf for most of a stock server's thousand-value lists.
+
+The first cut of this bound (2026-09-28 review) was sixteen times `NBuffers / MaxBackends` and never
+less than 64 pins, and the second review of it (2026-09-29) found both out of proportion to the
+pool: a thousand leaves pinned by one list count on a stock server, where seventeen such counts at
+once pin all 16384 buffers; and floors of their own, 64 list pins on any pool of 512 buffers or more
+however many connections share it, and 16 cursor pins (`LION_OPEN_MIN_PINS`) and 16 groups of a
+GROUP BY batch on any pool at all - the whole of a 128kB one. At shared_buffers = 128kB -
+sixteen buffers, one session - or 512kB with twelve pgbench clients, `k IN (30 CHAIN values) AND
+x = 1`, a GROUP BY over such a list and `lion_index_count_any()` of fifty CHAIN values failed with
+"no unpinned buffers available" where the plan without the pushdown answers. Nothing floors the
+share now: a pool too small for its connections gives a limit of NO pins, every list is located
+NOPIN, and the pins of the count's cursors follow the same limit ("Bounded cursors", below: their
+floor of 16 gives way to it, and past it an OR is read without its pins). What is left is what a
+count cannot do without: a heap page, a visibility-map page, and the page each source's CHAIN set is
+read from - past the budget a list is taken one set at a time, an OR keeps no pin, an AND one
+child's, and a GROUP BY counts one group at a time. `test/hook-check.sh` restarts the dev cluster with shared_buffers = 128kB
+and runs those counts (test/modules/lion_hooktest/sql/pinpool.sql), because installcheck's pool of
+gigabytes never reaches any of this.
+
 And each participant of a parallel FK-side join locates the fact filters for itself (§27), so a
 leader and seven workers took eight budgets: the node now tells each participant how many the plan
 was started with (`lion_list_pin_participants()`, the workers planned plus the leader, whether it
@@ -3141,7 +3241,8 @@ What changed, each where the cost was:
 - **An open budget, and a plan against it.** Before a merge builds its cursors, each source's tree
   is PLANNED (`lion_plan_node()`) against an open budget: work_mem of cursor memory (at least
   256 kB) and, in pins, what this backend's lists have left of the list pin limit above (at least
-  16), so that a list's leaf pins and its cursors' page pins come out of ONE limit per backend. The
+  16, or the limit itself where that is smaller - 2026-09-29 review), so that a list's leaf pins and
+  its cursors' page pins come out of ONE limit per backend. The
   plan estimates bottom-up what each node's cursors would hold - the `LionExprCursor`, the staging
   buffer or page image, an OR's heap entries and accumulators - and decides the three shapes below.
   An ordinary query is under the budget everywhere and is built exactly as before; the plan also
@@ -3149,7 +3250,9 @@ What changed, each where the cost was:
   shape and the interlock are one decision.
 - **A disjoint list is counted in BATCHES** (`lion_run_batches()`). A source that is a disjoint
   list (the §15 short-circuit's test, minus "the only source") and would not fit the budget opened
-  whole is cut into batches of consecutive entries that do fit, and the merge runs once per batch
+  whole is cut into batches of consecutive entries that do fit (at least `LION_BATCH_MIN_SETS` = 16
+  found sets, or on a pin budget smaller than that as many as it allows and one at the least: one
+  set is never read as a windowed union), and the merge runs once per batch
   with the list replaced by that batch's union. With the list's sets pairwise disjoint and U_1 ..
   U_m the batches' unions, R the intersection of the other positive sources and N the union of the
   negated ones, `|((U_1 ∪ ... ∪ U_m) ∩ R) \ N| = Σ_j |(U_j ∩ R) \ N|`, the terms being disjoint -
@@ -3220,6 +3323,19 @@ size" where the ordinary plan answers. Two things now:
   hash alike and sort together - are never in two batches, and neither is any entry: the argument
   of the plain scan's pieces (§29.4). A batch none of whose values has an entry adds nothing.
   EXPLAIN ANALYZE prints `List Batches` when there were any.
+- **So does `lion_index_count_any()`** (`lion_count_any_batched()`, 2026-09-29 review), which is
+  that count's SQL form and had been left out of it: it still located every value's set at once,
+  so its array of sets failed the same way at nine million values ("invalid memory alloc request
+  size 1080000000", where `k = ANY (...)` answered) and before that held a gigabyte at five million
+  (1.09 GB of VmHWM against the node's 260 MB). A list longer than `lion_array_batch_size()` is
+  now sorted, byte-for-byte repeats dropped (`lion_probe_sort_unique()`, the node's own), and
+  located, counted and released a batch at a time, the batches sharing one visibility cache as the
+  node's do: 243 MB of VmHWM at five million values, against the node's 263 MB on the same server. A list within the batch size is
+  located whole, exactly as before; the element types, collations and NULLs a call accepts are the
+  same either way, because everything the batches do is what one lookup of the whole list did, in
+  pieces. `test/sql/countany_long.sql` checks it against the query's own answer across the batch
+  boundaries, with repeats, NULLs, other element types and citext's equal-but-not-identical keys,
+  and at nine million elements.
 - **Every other shape holds the list whole, in a huge allocation**, so that it answers at any length
   the array itself can have instead of failing at nine million values. A GROUP BY, a count(DISTINCT)
   and an FK-side join count the list many times over - batching it would locate it again for every
@@ -3568,30 +3684,56 @@ Planning (`lion_try_count_path`, `lion_collect_targets`)
     therefore a costing decision, not a correctness one, and wants its own calibration and tests.
 
 Executor
-- `lion_open_relation()` / `lion_close_relation()` open and close ONE relation: a plain table once for
-  the life of the node, a partition for the length of its own turn. The heap is opened with NoLock -
-  the executor holds a lock on every range table entry of the plan, partitions included (the planner
-  locked them when it expanded the parent, and `AcquireExecutorLocks()` relocks the whole flat range
-  table for a cached plan), and cassert builds check it with `CheckRelationLockedByMe` - and the
-  indexes, which are not range table entries, with AccessShareLock.
+- Every relation the node reads is open for the life of the node, from Begin to End, as the scans
+  under core's Append keep theirs from `ExecInitNode()` to `ExecEndNode()`: a plain table's heap and
+  indexes, and every leaf partition's (`lion_open_parts()` / `lion_close_parts()`, into
+  `LionPartState`). A heap is opened with NoLock - the executor holds a lock on every range table
+  entry of the plan, partitions included (the planner locked them when it expanded the parent, and
+  `AcquireExecutorLocks()` relocks the whole flat range table for a cached plan), and cassert builds
+  check it with `CheckRelationLockedByMe` - and the indexes, which are not range table entries and
+  which nothing relocks for a cached plan, with AccessShareLock, as `ExecInitIndexScan()` locks its
+  index. A parallel worker takes AccessShareLock on the heaps too. The partition set is fixed at
+  plan time (no run-time pruning, below), so nothing is opened later than Begin; EXPLAIN without
+  ANALYZE opens nothing (`EXEC_FLAG_EXPLAIN_ONLY`), as `ExecInitIndexScan()` opens no index then:
+  nothing runs between its Begin and its End that could drop one.
+- `lion_open_relation()` / `lion_close_relation()` then make ONE of them the relation counted: a
+  plain table once for the life of the node, a partition for the length of its own turn, whose end
+  releases what the turn located but leaves the relations open.
+- **Why every leaf is open for the whole run** (2026-09-30). Core refuses a TRUNCATE, DROP, REINDEX,
+  CREATE INDEX, CLUSTER or ALTER of a table or index that a query of the same session still uses -
+  a cursor between two FETCHes, say - and it knows which ones are in use only from the relcache
+  references the query holds (`CheckTableNotInUse()`). The node used to open a partition only for
+  its turn and so held none between turns: under a cursor over a correlated count a TRUNCATE of a
+  leaf was accepted and the cursor's later counts dropped (30000 to 20000 inside one snapshot), and
+  a DROP TABLE of one was accepted and the next FETCH failed with "could not open relation with
+  OID", where core, with the pushdown off, refused both. Now each is refused with core's own error;
+  `test/sql/partition_cursor.sql` runs them under a cursor with the pushdown on and off and gets the
+  same output. `ALTER TABLE ... DETACH PARTITION` alters the parent, which neither the node nor
+  core's Append has open, so both accept it, and both go on counting the detached table they hold.
+  The cost, measured with 2000 leaves of one lion index each: a reference and a resource owner
+  entry per relation (about 0.2 MB of backend memory in all); no file opened at Begin (smgr opens a
+  relation's files when a page is first read, through fd.c's pooled descriptors, and keeps them
+  past a relation's close anyway: 993 descriptors either way); and the same locks for a fresh plan,
+  whose planner locked every leaf's indexes in `get_relation_info()` - a cached plan now holds its
+  2000 index locks for the run, as an Append of index scans does, instead of one turn at a time.
 - Per relation the node then runs one of `lion_count_relation()` (the intersection of the WHERE
   clauses), `lion_sumall_relation()` (§14's sum over every entry) or `lion_next_group()` (§10's
   streaming group loop); all three are the single-table code, unchanged.
 - Without GROUP BY the partition counts are summed and one row is emitted, as §10 says: nothing
   comes out until the last partition has been counted, because the one row is the total.
 - With GROUP BY the node streams. `lion_next_partial_group()` keeps two pieces of state, which
-  partition is open (`curpart`) and whether it is open (`partopen`), and on each call: open the
-  partition if it is not open and locate its WHERE clauses; ask `lion_next_group()` for the next
-  group of it and return that row; and when its entry scan runs out, release its posting sets,
-  close it, and move to the next one. Each group is emitted as a partial aggregate the moment it
-  is counted, so a group with rows in three partitions comes out three times and the Finalize Agg
-  adds them up. The NULL group is emitted per partition like any other and hash aggregation groups
-  NULLs together. Groups whose count is 0 are still not emitted - there is no such group in that
-  partition - and a partition where a positive clause has no entry at all (`wheremissing`) is
-  skipped without an entry scan. The per-partition work uses the same pergroup context as before,
-  reset per group, and the located WHERE payloads are released and their context reset at the end
-  of each partition. There is no cross-partition state: no hash table, no per-node group memory
-  beyond one partition's iteration state.
+  partition has its turn (`curpart`) and whether the turn has begun (`partopen`), and on each call:
+  begin the partition's turn if it has not begun and locate its WHERE clauses; ask
+  `lion_next_group()` for the next group of it and return that row; and when its entry scan runs
+  out, release its posting sets, end its turn, and move to the next one. Each group is emitted as
+  a partial aggregate the moment it is counted, so a group with rows in three partitions comes out
+  three times and the Finalize Agg adds them up. The NULL group is emitted per partition like any
+  other and hash aggregation groups NULLs together. Groups whose count is 0 are still not emitted -
+  there is no such group in that partition - and a partition where a positive clause has no entry
+  at all (`wheremissing`) is skipped without an entry scan. The per-partition work uses the same
+  pergroup context as before, reset per group, and the located WHERE payloads are released and
+  their context reset at the end of each partition. There is no cross-partition state beyond the
+  open relations: no hash table, no per-node group memory beyond one partition's iteration state.
 - The key a target list prints for a column a clause pins to one value is remembered on the clause
   (`LionClauseState.storedkey`, copied into a small context of its own) the first time a relation's
   entry has it, because the posting set is gone by the time the row comes out. With partitions that
@@ -3599,17 +3741,18 @@ Executor
   index's own equality - and, since the planner only builds a value-producing node when every
   partition's index has the type's own representation-preserving equality (§10), "compares equal"
   there means "is the same bytes".
-- ReScan throws all of it away - entry scan, posting sets, the open partition and the remembered
-  keys - and starts again from the first partition. A Finalize HashAggregate that has not spilled
-  re-reads its own table instead of rescanning the node (`ExecReScanAgg()`), so the case that
-  really exercises this is a nested loop over a spilling one, which `test/sql/partition.sql` has.
+- ReScan throws all of it away - entry scan, posting sets, the current partition's turn and the
+  remembered keys - and starts again from the first partition; the relations stay open. A
+  Finalize HashAggregate that has not spilled re-reads its own table instead of rescanning the node
+  (`ExecReScanAgg()`), so the case that really exercises this is a nested loop over a spilling one,
+  which `test/sql/partition.sql` has.
 - EXPLAIN prints `Partitions: p1, p2, ...` in the planner's order. The `Lion Indexes` line keeps
   its per-clause text but drops the index name for a partitioned scan (`(a), (b = 2)` rather than
   `idx_a (a), idx_b (b = 2)`), because there is one index per partition and no single name to give.
   `Group Key` and the ANALYZE counters are unchanged and are summed over the partitions.
 
 Locking and the §9 pin discipline are per partition and unchanged. A partition's posting sets are
-all released before its indexes are closed, so no partition's index pin outlives its turn, and a
+all released before its turn ends, so no partition's index pin outlives its turn, and a
 VACUUM of one partition cannot affect the count of another: the interlock argument of §9 is about
 one heap and its indexes, and each partition is its own.
 
@@ -5440,26 +5583,48 @@ reads and at the cost of a comparison each, only what it would otherwise follow 
   before the split record writes its leftlink. It was not checked at all, so a damaged right link
   had that write land on whatever page it named.
 
-A block number past the end and a damaged key datum are not caught here: the first fails in
-`ReadBuffer()`, and the second is the same risk every index AM takes with its own keys. A right-link
-cycle that an uncoupled walk follows walks until it is cancelled. "Until it is cancelled" is new as
-well: every step of a descent and of an uncoupled walk right now checks for interrupts BETWEEN the
-pages, with no content lock held. It used to check just after locking the next page, where the lock
-holds interrupts off, so a descent round a cycle of downlinks (the third case of the test below,
-before the level check refused it) ignored statement_timeout and pg_terminate_backend() alike and
-only SIGKILL stopped it. The walks that can NOT be cancelled, because they hold a page at every
-point - the coupled steps through a prefix run, and `lion_dir_find_parent()`'s walks right, under
-the child - are bounded instead (`LionRightWalk`, lion.h, 2026-09-27 review): a walk that only
-moves right never passes a page twice, since no page leaves a level and a split puts its new page
-to the right, so a walk that has taken more steps than the index has blocks is going round a cycle
-and is refused. The size is only asked for once a walk is 1024 pages long, and asked again whenever
-the walk outgrows it, since the index grows meanwhile. `test/sql/corrupt.sql` damages a freshly
-built index's root on disk in the first three ways of the list above and checks that queries and
-inserts fail with INDEX_CORRUPTED and leave the relation's size alone; against the code before that
-review the first grew the index by a block per statement, the second answered from a line pointer
-past pd_lower, and the third never returned. The cases the 2026-09-27 review added are not in that
-test yet, and neither is the root-split race above, which needs two backends and a split to land
-between one's meta-page read and its lock.
+A block number past the end is not caught here: it fails in `ReadBuffer()`. A damaged key datum
+used to be let through as well, as "the same risk every index AM takes with its own keys", until
+two damaged bytes of a text key, `01 01` - the header of an INDIRECT TOAST pointer - had the first
+descent that compared against it detoast through whatever the page held, a SIGSEGV (2026-09-29
+review). A stored key has exactly one form, the one `lion_store_key()` writes: `sizeof(Datum)` bytes
+for a by-value type, `typlen` for a fixed-length one, a plain 4-byte varlena header whose length is
+the key's (`PG_DETOAST_DATUM()` gives every stored key one), a cstring whose only NUL is its last
+byte, and at most `LION_MAX_KEY_SIZE` bytes in any case. So every key that comes off a page is
+checked for that form before any opclass function sees it (`lion_entry_key()`, `lion_check_key()`,
+lion_state.c) - in the descent's comparisons, the prefix-run scans, the entry and summary walks, the
+posting sets' stored keys that LionOrdered and the GROUP BY counts emit, the planner's probes and
+the insert and VACUUM paths - which is a few comparisons next to the function call it guards, and
+verify() requires the same form (`lion_verify_keylen()`, which used to accept a short header too;
+`test/sql/corrupt_items.sql`). Every step of
+a descent and of an uncoupled walk right checks for interrupts BETWEEN the pages, with no content
+lock held. It used to check just after locking the next page, where the lock holds interrupts off, so
+a descent round a cycle of downlinks (the third case of the test below, before the level check
+refused it) ignored statement_timeout and pg_terminate_backend() alike and only SIGKILL stopped it.
+And EVERY walk right is bounded (`LionRightWalk`, lion.h): a walk that only moves right never passes
+a page twice, since no page leaves a level and a split puts its new page to the right, so a walk that
+has taken more steps than the index has blocks is going round a cycle and is refused with
+INDEX_CORRUPTED. The size is only asked for once a walk is 1024 pages long, and asked again whenever
+the walk outgrows it, since the index grows meanwhile; before that a step costs a counter and two
+comparisons, which refuse at once a right link to the page itself and one to the meta page. The
+2026-09-27 review bounded the walks that can NOT be cancelled, because they hold a page at every
+point - the coupled steps through a prefix run, and `lion_dir_find_parent()`'s walks right, under the
+child - and left the others to "walk until cancelled". The 2026-09-29 review found what that meant:
+one right link pointed back into its own level sent every count, bitmap and plain scan,
+`lion_index_count()`, LionOrdered and VACUUM round the cycle until statement_timeout, and
+autovacuum, which has none, round it for ever, relaunched every cycle. So now every walker steps
+through it - the descents' moves right and `lion_dir_step_right()`, which takes the walk as an
+argument, the leaf walks of the scans (`LionLeafWalk`, `LionOrderWalk` in both directions), of the
+count engine (`LionEntryScan`, the lookup walks) and of the planner's endpoint probe, the walks of a
+posting set's leaves (§22) and VACUUM's walks of both (§18), which therefore fail the VACUUM with the
+ERROR, as a damaged nbtree does. `test/sql/corrupt_walk.sql` damages a right link into a cycle, to
+the page itself and to the meta page, on disk, and runs every one of those walkers under a timeout.
+`test/sql/corrupt.sql` damages a freshly built index's root on disk in the first three ways of the
+list above and checks that queries and inserts fail with INDEX_CORRUPTED and leave the relation's
+size alone; against the code before that review the first grew the index by a block per statement,
+the second answered from a line pointer past pd_lower, and the third never returned. The cases the
+2026-09-27 review added are not in that test yet, and neither is the root-split race above, which
+needs two backends and a split to land between one's meta-page read and its lock.
 
 ### Planner
 
@@ -5702,7 +5867,14 @@ Operations.
     never passes a page twice, since no page leaves a level of a live set and a split puts its new
     page to the right, so one that has taken more steps than the index has blocks is going round a
     cycle of right links, and is refused. The index's size is asked for only once a walk is 1024
-    pages long.
+    pages long. A right link to the page itself or to the meta page is refused at the step; the
+    second used to END a reader's walk without a word, since block 0 does not claim the set and a
+    page that does not is what a freed one looks like (§18), so the count came out short. Since the
+    2026-09-29 review this holds for the READERS' walks of the leaves too (§21, "Readers"):
+    `lion_emit_chain()`, `LionOrderWalk`, the count cursor over the whole of its life, seeks and all
+    (a cursor only moves forward, and a seek lands no further left than it stands), the private
+    copy of `lion_posting_set_materialize()`, and VACUUM's pass 2, its regrow walk and its freeing of
+    a set's levels. They went round a cycle until cancelled, and VACUUM for ever under autovacuum.
 
   "For ever" meant UNCANCELLABLE on every writer's path, which is why the bounds, and not the checks
   for interrupts, are what matter there: a writer holds the key's directory leaf throughout, a held
@@ -6764,7 +6936,10 @@ and is used for the record header alone.
 `lion_wal_begin()` opens a CRITICAL SECTION, because the page is modified in
 place and an ERROR between the first modification and XLogInsert() would leave a
 page in shared buffers that no record describes. Everything fallible therefore
-has to happen BEFORE the record opens. Three consequences, all of them
+has to happen BEFORE the record opens - which includes looking at the line
+pointers the record is going to move, overwrite or delete items by (§3,
+2026-09-29: `lion_page_check_items()`, `lion_page_check_alone()`,
+`lion_page_entry_fetch()`). Three consequences, all of them
 deviations from what this section assumed:
 
 - `lion_new_buffer_xl()` is gone. Allocating a page is split into
@@ -7002,11 +7177,44 @@ block in `cleanupmask`, and applies that block's operation stream when the
 action is BLK_NEEDS_REDO. Blocks that need a cleanup lock are always FIRST (the
 shim reorders them, above), so the wait happens with no other buffer lock held
 - §11's waiting rule, applied to the startup process.
-The reverse order (container page, then directory leaf) is safe against standby
-READERS because no reader ever holds two of these locks at once: a scan walks
-the leaves one shared lock at a time, a descent releases the parent before
+**Replay takes a posting set's pages BEFORE the entry's leaf** - the reverse of
+the primary's order (§5), because the writer locks the leaf first and registers
+it last, when the counters go into the record - and `generic_redo()` takes a
+generic record's blocks in the same order and holds them to the end of the
+record as `lion_redo()` does. That is safe against standby backends only as long
+as none of them holds a directory page while it waits for a posting page: a scan
+walks the leaves one shared lock at a time, a descent releases the parent before
 locking the child, and §11's rule for readers already forbids taking a directory
-lock while holding a container page.
+lock while holding a container page. *(Deviation, found by the 2026-09-29 review:
+this paragraph said that much and called the order safe, and
+`lion_index_verify()` was the exception - on a standby it walked every posting
+set with the entry's leaf held SHARE, and its heapallindexed lookups descended a
+set with the leaf held. The startup process, holding a container page and
+waiting for the leaf, and the backend, holding the leaf and waiting for the
+container page, waited on buffer content locks for good. verify() now holds
+nothing across a set on a standby (§7), and test/recovery/run.sh phase 4 runs
+it there beside a write load with a watchdog on replay.)* Registering the leaf
+first was not done and would not remove the rule: a removal record's cleanup
+block goes first whatever the registration order (above), and WAL already
+written keeps its order. The records that name more than one block, in the
+order redo takes them:
+
+    ITEM_SET, ITEM_REPLACE, ITEM_ADD         container page, entry leaf
+    ITEM_DELETE, VACUUM_PAGE (VACUUM)        container page (cleanup), entry leaf
+    SPLIT of a posting leaf                  P, N (new), M (new, between them), entry leaf
+    SPLIT pushing a leaf root down           root, new child, entry leaf
+    SPLIT pushing an internal root down      root, new child
+    SPLIT of an internal posting page        P, new right sibling
+    SPLIT of a directory page                P, new right sibling, old right sibling, meta page
+    SPLIT of the directory root              old root, new right sibling, new root, meta page
+    ITEM_ADD ending an INLINE spill          new root, entry leaf - but entry leaf, then new
+                                             root, both cleanup, for VACUUM's spill in rmgr
+                                             mode (the reorder above)
+
+VACUUM's regrow and the spill its filtering causes write theirs inside a
+removal window, which cleanup-locks their first block (and the spill's entry
+leaf); that changes the order only where it says so. Every other record names
+one block.
 
 `rm_mask()` masks the page LSN and checksum, the hint bits, the free space
 between pd_lower and pd_upper, and **the MAXALIGN padding after every item**.
@@ -9507,16 +9715,18 @@ sections above ask of the fact side.
 - **A batch at a time, a leaf at a time.** The keys are read a batch at a time whatever the plan
   chose ("Lookups in key order": the batches are `work_mem`'s), each key with an accumulator of its
   own (`LionJoinEnt.acc`), and each batch goes to every leaf in turn (`lion_join_count_parts()`):
-  the leaf is opened, its fk index's walk begun, its fact filters located or its copy of them taken
-  up again (`lion_join_part_open()`), every key of the batch looked up and counted and the count
-  added into the key's accumulator, and the leaf closed - every set released, and its pins with
-  them - before the next one is opened (`lion_join_part_close()`). An existence test does not look
-  a key up again once one leaf has matched it. Where the plan walks the fk index in key order, the
-  batch is sorted into the first leaf's walk order and left alone for every leaf whose fk index
-  orders keys the same way (`LionWalkOrder`, `lion_walk_order_equal()`) - one partitioned index's
-  leaves do - and sorted again for one that does not; where it descends for each key, the batch
-  stays in the child's order. Only when every leaf has had the batch are its rows handed up (`lion_join_next_parts()`),
-  so the node never hands up a row with a leaf open, and no leaf's pin outlives its turn (§16).
+  the leaf's turn begins, its fk index's walk begun, its fact filters located or its copy of them
+  taken up again (`lion_join_part_open()`), every key of the batch looked up and counted and the
+  count added into the key's accumulator, and the turn ends - every set released, and its pins with
+  them - before the next one's begins (`lion_join_part_close()`). The leaves' relations stay open
+  from the node's Begin to its End (§16, "Why every leaf is open for the whole run"). An existence
+  test does not look a key up again once one leaf has matched it. Where the plan walks the fk index
+  in key order, the batch is sorted into the first leaf's walk order and left alone for every leaf
+  whose fk index orders keys the same way (`LionWalkOrder`, `lion_walk_order_equal()`) - one
+  partitioned index's leaves do - and sorted again for one that does not; where it descends for each
+  key, the batch stays in the child's order. Only when every leaf has had the batch are its rows
+  handed up (`lion_join_next_parts()`), so the node never hands up a row in the middle of a leaf's
+  turn, and no leaf's pin outlives its turn (§16).
 - **Each leaf is its own table.** Its own heap, visibility map and pins; the §9 interlock between
   its own fk set and its own filters; the pin budget of §15 per turn. Where the plan collects the
   filters, a leaf's are located and copied at its first turn into a copy of its own
@@ -9864,6 +10074,22 @@ for the next key; the WHERE sets let go of their pins, as after a planned collec
 copy come out empty - the filters select nothing - the keys after it are looked up no more: an inner
 or semi join has no row left, and an anti join's are every row, as when a filter has no entry.
 
+- **The empty copy does not change how the run reads its child** (2026-09-30 review). Over a plain
+  fact, whether the rows come a batch at a time, walked in key order, or a row at a time is decided
+  once, at the run's first row (`joinbegun`, `joinwalked`), and kept to its end. It used to be
+  worked out again at every row from `wheremissing`, which a clause with no entry sets before the
+  first row and the empty copy sets part way through - so the row after the switch was read a row at
+  a time: the rest of the batch in hand was dropped and the child read on, or read again where a
+  finished scan starts over, and an anti join lost rows or counted them twice (on PostgreSQL 16,
+  1001 a region for 1000 over one batch, 867 over several at 64 kB, one in parallel). Each way sees
+  to the empty copy itself: walked or a row at a time, an anti join's rows after it go up with no
+  lookup and a semi or inner join's run ends; a semi or anti join path's batch tested whole
+  (`lion_join_count_batch()`) tests no key after it - those join nothing - and hands up what it
+  tested, and its later batches are tested no more. The copy is set up as the counts' filters
+  (`joinsources`) even when empty, so that `joinfiltered` always means what the counts read. A
+  partitioned fact's leaves already stopped at their turn's empty copy (`lion_join_count_parts()`),
+  and that leaf has no turn after it.
+
 - **§9.** "Why a stale copy is safe" asks of a copy that it be made after the query's snapshot was
   taken and only ever be counted beside a located fk set, which carries the interlock. A copy made
   part way through is both: the filters it is made from were located in this run, under the
@@ -9946,7 +10172,11 @@ part way through is empty, over inner and anti joins, row at a time and walked; 
 copy that would not fit 64 kB, probing to their ends; two rescans below a correlated subquery,
 two switches; a partitioned fact, three leaves switching each on its own, grouped, semi and anti
 joins; parallel plans, plain and partitioned, whose participants switch; and a dirty heap - rows
-deleted, moved to other keys and to other terms - before and after VACUUM.
+deleted, moved to other keys and to other terms - before and after VACUUM. Its empty copies are all
+counts summed in the node - one call, which reads the whole child - with the join paths turned off,
+so the way of reading the child that an empty copy changed at the next call went unseen.
+`test/sql/fkjoin_switch.sql` (2026-09-30) is about the empty copy alone: filters that never meet,
+the rows handed up one at a time, against the pushdown off.
 
 ### The per-key terms, refitted (2026-09-29)
 
@@ -10439,14 +10669,15 @@ partition of several kinds, or a default one, needs one.
 "Lookups in key order", taken for a plain table too - and each batch is taken to each relation in
 turn, the plain table or every leaf partition. In a partition whose bounds give `g` its value, the
 turn is the partition's ordinary turn (`lion_join_lookup_ent()`, with its copy of the filters and
-its account of what probing them costs), each count put by with that value. Otherwise the entries
-of `g`'s index are walked a chunk of 64 at a time: the chunk's sets located - and pinned, as an IN
-list's are - each key of the batch looked up once and counted against each of them
-(`lion_join_count_groups()`: the key's set, the filters or their copy, and the group's set, ANDed
-by the one count function every count goes through), and the chunk let go of before the next. The
-cost model takes this for columns of few values; a column of more is correct, only slower, and a
-chunk after the first walks the fk index from its start again. The rows a turn counted go up once
-the turn is over: after the partition is closed, as a partitioned fact's rows always are (§16), or,
+its account of what probing them costs), each count put by with that value. Otherwise the entries of
+`g`'s index - open, with the relation's others, for the life of the node (§16, "Why every leaf is
+open for the whole run") - are walked a chunk of 64 at a time: the chunk's sets located - and
+pinned, as an IN list's are - each key of the batch looked up once and counted against each of them
+(`lion_join_count_groups()`: the key's set, the filters or their copy, and the group's set, ANDed by
+the one count function every count goes through), and the chunk let go of before the next. The cost
+model takes this for columns of few values; a column of more is correct, only slower, and a chunk
+after the first walks the fk index from its start again. The rows a turn counted go up once the turn
+is over: after the partition's turn has ended, as a partitioned fact's rows always go (§16), or,
 over the plain table, once its sets have let go of their pins (`lion_pause_run()`). They wait in
 memory until then - at most one per key and group with rows in the relation, no more than the
 batch's join rows there. A turn whose filters select nothing has none. `Fact Group Key` names the
@@ -10848,6 +11079,18 @@ still declines.
 copy that comes out empty, the knob off and a copy too large for its memory, rescans, a partitioned
 fact's leaves, parallel plans and a dirty heap before and after VACUUM - each answer against the
 pushdown off.
+
+`test/sql/fkjoin_switch.sql` (2026-09-30), a switch whose copy comes out empty, made part way
+through a batch: the upper node handing up a row per dimension row - anti, semi and inner joins
+grouped by a dimension column, the rows of an anti join below core's Agg and the counted rows below
+a LionJoinAgg - and the count summed in the node; the semi and anti join paths over an outer side
+whose keys repeat and are sometimes NULL; each walked over one batch and over several at a
+`work_mem` of 64 kB and a row at a time; rescans (the upper node below a correlated subquery, the
+paths below a nested loop's LATERAL), each run switching again; parallel plans of both; a
+partitioned fact; and the switch off. EXPLAIN (COSTS OFF) of the plans, and each answer against the
+pushdown off as multisets. Before `joinbegun` every anti join walked in key order - the upper node's
+and the join path's, over one batch and several, rescanned and in parallel - lost or repeated rows,
+ten answers of the file; the others passed then too, and hold the ways the fix did not mean to change.
 
 `test/sql/fkjoin_semipath.sql` (2026-09-29), the semi and anti join as a join path, against the
 pushdown off (`lion_sp()`, as `lion_gj()` does: with core's join methods disabled - so that the path
@@ -11359,7 +11602,8 @@ another column, as every walk does.
 Not taken, and the inside walked as before:
 
 - **an unordered range**, where there is no run to take apart;
-- **no positive WHERE source.** `|F − NULL(k)|` needs one to drive the merge (§14), and the count of
+- **no positive WHERE source**, or none but ranges collected as sources (§32), which hold no pin
+  (`lion_source_drives()`). `|F − NULL(k)|` needs one to drive the merge (§14), and the count of
   every row of the table is not something an index can give. `count(*) WHERE k >= 0` alone is the
   sum over every entry, as it always was. Summing another column's entries, NULL included, and
   subtracting k's NULL entry from each would give it, but that is a walk of another column, and only
@@ -11385,9 +11629,17 @@ a thousand rows each beside a selective equality at 1,344 for 920,000 containers
 could not see that the keys outside a range might be a handful. Now:
 
 - **One side is walked.** INSIDE has `nin = n_distinct(k) × sel` entries. When F has a positive source
-  and k's directory is ordered, the complement has `n_distinct(k) − nin` entries plus one count of
-  F minus the NULL entry: F's containers again, and a descent. The cheaper side is charged, plus the
-  race: two leaf reads for every leaf of that side.
+  that can drive a count and k's directory is ordered, the complement has `n_distinct(k) − nin`
+  entries plus one count of F minus the NULL entry: F's containers again, and a descent. The cheaper
+  side is charged, plus the race: two leaf reads for every leaf of that side. A range taken as a
+  source (§32) is no such source: it is collected into a copy that holds no pin, and the executor
+  never lets one drive (`lion_source_drives()`), so beside nothing but such ranges the inside is
+  charged, as it is walked. *(Until 2026-09-30 any positive source would do here, and
+  `count(*) WHERE mid > 10 AND hi > 10` over 2M rows - `hi > 10` summed, `mid > 10` collected - was
+  priced at a tenth of the inside walk it made: 38,488 for 2.5 s, where the sequential scan it
+  rejected, at 63,522, takes 0.33. It is 316,199 now, and the sequential scan is chosen. A range too
+  large to collect is walked at every count instead, and can drive; the model takes it as collected
+  all the same, which prices such a count at its inside, what it costs at most.)*
 - **Each entry walked** costs a fixed amount, `LION_RANGE_UNION_ENTRY_COST` (12 `cpu_tuple_cost`)
   for a small entry counted with its leaf and `LION_RANGE_ENTRY_COST` (40) for one counted on its
   own. On top of that come its OWN containers: the rows of one key of k (`tuples × sel / nin`), not
@@ -14006,15 +14258,20 @@ the walk under a sorted aggregate replaced the count pushdown.)
 The restriction clauses the walk answers exactly bound it: a range comparison of the column - `<`,
 `<=`, `>=`, `>` of the column's operator family, either way round - with a value that does not
 depend on the row (a Const, a Param, a stable expression such as `now() - interval '...'`: evaluated
-when the walk starts, as an Index Scan's run-time keys are; no subplan), and `IS NOT NULL`. They
-leave the filter and are the plan's `Index Cond`. The other clauses may be a lion SET: core's lion
-accesses are built as for a btree's walk (§30.2), on a scratch copy of the relation whose lion
-`IndexOptInfo`s are copied too, with the walk's clauses taken out of the clauses they may match
-(`lo_lion_accesses()`) - a set that collected the range would read all of it, which is what the walk
-exists not to do. Or no set at all: every row the walk meets is fetched, and the clauses are the
-filter. One path per (walk, set) and one with no set, and add_path() keeps what is cheaper. The
-walk needs no restriction clause at all: `ORDER BY ts DESC LIMIT 10` over a table whose only index
-on `ts` is a lion index is a walk with nothing to filter, where it was a whole scan and a Sort.
+when the walk starts, as an Index Scan's run-time keys are; no subplan), under the index column's
+collation, and `IS NOT NULL`. They leave the filter and are the plan's `Index Cond`. The collation is
+core's rule for an index clause (`IndexCollMatchesExprColl()`, as `lion_match_index()` applies it):
+the walk compares a bound with keys stored in the order of the index column's collation, so a
+comparison under another is no bound of it and stays in the filter. Until the 2026-09-29 review any
+was taken, and `t < 'a' COLLATE "C"` over an English column returned no rows ('A0' is below 'a' in
+"C", above it in English); `test/sql/ordered_collate.sql`. The other clauses may be a lion SET:
+core's lion accesses are built as for a btree's walk (§30.2), on a scratch copy of the relation
+whose lion `IndexOptInfo`s are copied too, with the walk's clauses taken out of the clauses they may
+match (`lo_lion_accesses()`) - a set that collected the range would read all of it, which is what
+the walk exists not to do. Or no set at all: every row the walk meets is fetched, and the clauses
+are the filter. One path per (walk, set) and one with no set, and add_path() keeps what is cheaper.
+The walk needs no restriction clause at all: `ORDER BY ts DESC LIMIT 10` over a table whose only
+index on `ts` is a lion index is a walk with nothing to filter, where it was a whole scan and a Sort.
 
 **Cost** (`lo_cost_walk()`). With `T` the relation's tuples, `s_w` the selectivity of the walk's
 clauses, `nd` the column's distinct values, and a set of selectivity `s` and index cost `C_lion`
@@ -14820,15 +15077,42 @@ once within `work_mem`, and counts them once beside F under its pins.
 OR node's image does (§15, `LION_OR_BITSET_MIN`): once it is a BITSET, containers are ORed into it
 in place (`lion_container_or_inplace()`), and it is optimized once, when the walk is over
 (`lion_range_union_finish()`); while it is an ARRAY, the members of incoming ARRAYs of at most 32
-members wait in a buffer and are folded in through one image (`lion_container_add_many()`) once
-half as many as the union holds have come. Since the union grows by at least half between two
-folds, each member is moved a bounded number of times; the buffer - at most half the union, counted
-in the collection's memory as the union is - may put a collection over its memory a little sooner
-than before, which then walks or spills as any other. A RUN on either side (a column in heap
-order) is folded as before. The windowed union of §15 (`lion_wide_fill()`) was not reused: a window
-of container keys would walk the range once per window, where the union either fits the memory it
-is allowed or is walked instead. It is also what a bitmap scan collects of the first of several
-range columns with nothing else beside them (§28, "Bitmap scans"), and grows the same way there.
+members wait in a buffer and are folded in through one image (`lion_container_add_many()`) once half
+as many as the union holds have come. Since the union grows by at least half between two folds, each
+member is moved a bounded number of times; the buffer - at most half the union, counted in the
+collection's memory as the union is - may put a collection over its memory a little sooner than
+before, which then walks or spills as any other. A RUN on either side is widened (below). The
+windowed union of §15 (`lion_wide_fill()`) was not reused: a window of container keys would walk the
+range once per window, where the union either fits the memory it is allowed or is walked instead. It
+is also what a bitmap scan collects of the first of several range columns with nothing else beside
+them (§28, "Bitmap scans"), and grows the same way there.
+
+**Widened (2026-09-30).** Anything else went through an image, as before: a RUN union, or a RUN or a
+BITSET coming to an ARRAY one - and a RUN is what a DENSE union optimizes to, a heap block's rows
+being a run, and what every union of a column in heap order is. Each container that came to a RUN
+union was folded into it: an image filled, counted, optimized and copied back, a few microseconds
+however few members it brought, which over a range of scattered rows is per member. `count(DISTINCT
+lo) WHERE hi BETWEEN 10 AND X` over 2M rows, `hi` a permutation of 200,000 keys of ten rows, took 19
+ms at X = 10,000, 1.26 s at 50,000 and 12.7 to 17 s at 190,000, 22 times core's plan - and the
+model, which took a union to be ORed into in place once it had 2,048 members, priced it at a third
+of a second (2026-09-29 review). Now a union that would take a container through an image is WIDENED
+to a BITSET instead (`lion_range_union_widen()`) and ORed into in place from then on, and optimized
+with the others when the walk is over; ARRAY unions keep their buffer and their merges, which are
+bounded. A widened union takes a bitset's 4 kB where its optimized form may take a few bytes - a RUN
+of a key in heap order - so the unions widened since the last time are COMPACTED, optimized back
+(`lion_range_union_compact()`), whenever that memory runs short: before a union is refused a
+widening, which then folds as before, and before the collection gives up or a window gives back
+keys, which therefore happens only where it did before. Each widening is made where a fold would
+have been and compacted at most once, so a collection short of memory spends about what it did - a
+scattered range at `work_mem` 64 kB widened and compacted 6,916 times in 495 compactions and took as
+long as it did - and one that is not spends a fold or two a union key and a few nanoseconds a
+container. On an assert build the series went from 30 ms, 1.09 s and 9.1 s to 21, 101 and 455 ms,
+against core's 176, 269 and 492; over 2M rows in heap order, one row a key, 1.9 million keys went
+from 14.1 s to 1.24, the walk of the keys most of it, and ten rows a key from 951 ms to 109.
+Measured over 40 collections - two orders, one row and ten a key, with and without summaries, 1% to
+95% of the keys - none is slower beyond the noise, and all but six are 2 to 30 times faster. The
+model's in-order folds are one fold or two per union key rather than one per container
+(`LION_RANGE_WIDEN_FOLDS`, "What collecting a range costs" below).
 
 EXPLAIN ANALYZE prints `Range Walks Probed` when there were any: each probed walk, so a complement
 whose walks below and above both turned is two.
@@ -14970,17 +15254,21 @@ shapes the column's correlation squared interpolates, as `cost_index()` does:
 
 - rows in the heap's order: every container after a key's first is folded into its RUN - the
   sets' containers, a set's rows spanning one container key more than they fill, less the union's
-  containers;
+  containers. *(Since 2026-09-30 the RUN is widened into a bitset by the second container instead
+  and optimized back at the end ("Widened", above), `LION_RANGE_WIDEN_FOLDS` (2) folds for each
+  union key that takes more than one container; this is what that measurement found.)*
 - rows scattered: each set has a container at nearly every container key (`lion_containers_for()`),
   and a key's union ends up with its share of the range's rows. Containers of at most
   `LION_RANGE_UNION_PEND_MIN` (32) members wait and are folded in once the waiting members come to
-  half the union's, so the union grows by half at least between two folds: 1 + log1.5(members /
-  32) folds a key until it is a bitset, past 2,048 members, and takes the rest in place - 11.3,
-  against the 11 measured above. Larger containers are merged in one at a time until then, a fold
-  each, and each moves the union's members too, half a bitset's worth on average, at
-  `LION_AND_MEMBER_COST` a member. Which are larger is a Poisson count's tail
-  (`lion_poisson_above()`): a set's rows fall at a key at random, and of a summary of 16,384 rows
-  over 575 container keys, 28.5 a key on average, a fifth of the containers hold more than 32.
+  half the union's, so the union grows by half at least between two folds: 1 + log1.5(members / 32)
+  folds a key until it is a bitset, past 2,048 members, and takes the rest in place - 11.3, against
+  the 11 measured above. (A union that became a RUN instead - dense, which random rows seldom are at
+  2,048 members - was folded for every container after that, and is widened into a bitset now.)
+  Larger containers are merged in one at a time until then, a fold each, and each moves the union's
+  members too, half a bitset's worth on average, at `LION_AND_MEMBER_COST` a member. Which are
+  larger is a Poisson count's tail (`lion_poisson_above()`): a set's rows fall at a key at random,
+  and of a summary of 16,384 rows over 575 container keys, 28.5 a key on average, a fifth of the
+  containers hold more than 32.
 
 A fold is `LION_RANGE_FOLD_COST`, the new setting `pg_lion.range_fold_cost`: 420
 `cpu_operator_cost`, 2.1 us at 500 units a millisecond, fitted to what the walk's price leaves of

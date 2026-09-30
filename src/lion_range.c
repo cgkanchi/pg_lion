@@ -163,7 +163,7 @@ lion_range_test(LionRange *range, const LionEntryTuple *entry)
 	if (lion_entry_kind(entry) != LION_KIND_VALUE)
 		return LION_RANGE_SKIP;
 
-	key = lion_fetch_key(state, LionEntryGetKey(entry));
+	key = lion_entry_key(state, entry);
 
 	for (i = 0; i < range->nbounds; i++)
 	{
@@ -191,7 +191,7 @@ lion_range_fails_upper(LionRange *range, const LionEntryTuple *entry)
 	int			i;
 
 	Assert(lion_entry_kind(entry) == LION_KIND_VALUE);
-	key = lion_fetch_key(range->state, LionEntryGetKey(entry));
+	key = lion_entry_key(range->state, entry);
 
 	for (i = 0; i < range->nbounds; i++)
 	{
@@ -239,6 +239,7 @@ lion_range_landing(Relation index, LionRange *range, int bound, int kind,
 	Buffer		buf;
 	OffsetNumber off;
 	BlockNumber blk;
+	LionRightWalk walk;
 
 	Assert(b->hascmp);
 	lion_search_key_init(range->state, &sk, kind, b->value, 0);
@@ -246,6 +247,7 @@ lion_range_landing(Relation index, LionRange *range, int bound, int kind,
 
 	buf = lion_dir_search(index, NULL, range->state->ix, &sk,
 						  BUFFER_LOCK_SHARE, false, &off);
+	lion_rightwalk_init(&walk);
 	for (;;)
 	{
 		Page		page = BufferGetPage(buf);
@@ -268,7 +270,7 @@ lion_range_landing(Relation index, LionRange *range, int bound, int kind,
 			*posp = NULL;
 			break;
 		}
-		buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
+		buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE, &walk);
 		off = lion_page_first_data(BufferGetPage(buf));
 	}
 	blk = BufferGetBlockNumber(buf);
@@ -443,8 +445,10 @@ lion_summary_shape(Relation index, LionState *col, LionSumShape *shape)
 	Buffer		buf;
 	OffsetNumber off;
 	int			nleaves = 1;
+	LionRightWalk walk;
 
 	memset(shape, 0, sizeof(LionSumShape));
+	lion_rightwalk_init(&walk);
 
 	/* where the column's summaries begin, as lion_summary_first_leaf() */
 	lion_search_key_init(col, &sk, LION_KIND_SUMMARY, (Datum) 0, 0);
@@ -475,7 +479,7 @@ lion_summary_shape(Relation index, LionState *col, LionSumShape *shape)
 		}
 		if (nleaves >= LION_SUMMARY_SHAPE_LEAVES)
 			break;
-		buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE);
+		buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE, &walk);
 		off = lion_page_first_data(BufferGetPage(buf));
 		nleaves++;
 	}
@@ -538,6 +542,8 @@ lion_entry_scan_init(LionEntryScan *es, Relation index, AttrNumber attno)
 	es->lastkey = (char *) MemoryContextAllocZero(es->cxt, 1);
 	es->haslast = true;
 	es->blkno = InvalidBlockNumber;
+	es->stepfrom = InvalidBlockNumber;
+	lion_rightwalk_init(&es->walk);
 	es->range = NULL;
 	es->part = LION_WALK_ALL;
 	es->done = false;
@@ -669,6 +675,8 @@ lion_scan_keycopy(LionEntryScan *es, const LionEntryTuple *entry, char **bufp,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lion index \"%s\": a summary key of %u bytes",
 						RelationGetRelationName(es->index), entry->keylen)));
+	/* the copy goes to the opclass functions as it is (lion_check_key()) */
+	lion_check_key(es->state, LionEntryGetKey(entry), entry->keylen);
 	if (*bufp == NULL)
 		*bufp = (char *) MemoryContextAlloc(es->phasecxt, LION_MAX_KEY_SIZE);
 	memcpy(*bufp, LionEntryGetKey(entry), entry->keylen);
@@ -676,17 +684,17 @@ lion_scan_keycopy(LionEntryScan *es, const LionEntryTuple *entry, char **bufp,
 }
 
 /*
- * Compare a stored key of the walk's column with another stored one, under the
- * column's own comparison: how a key is put on one side or the other of a
- * bucket boundary (DESIGN.md §32).
+ * Compare the key of an entry of the walk's column with a stored one the walk
+ * kept (lion_scan_keycopy()), under the column's own comparison: how a key is
+ * put on one side or the other of a bucket boundary (DESIGN.md §32).
  */
 static int
-lion_scan_keycmp(LionEntryScan *es, const char *a, const char *b)
+lion_scan_keycmp(LionEntryScan *es, const LionEntryTuple *a, const char *b)
 {
 	LionState  *st = es->state;
 
 	return DatumGetInt32(FunctionCall2Coll(&st->cmpproc, st->collation,
-										   lion_fetch_key(st, a),
+										   lion_entry_key(st, a),
 										   lion_fetch_key(st, b)));
 }
 
@@ -717,7 +725,7 @@ lion_scan_bucket_inside(LionEntryScan *es, const LionEntryTuple *entry)
 	if (es->part == LION_WALK_ALL || es->part == LION_WALK_ABOVE)
 		return true;
 
-	key = lion_fetch_key(es->state, LionEntryGetKey(entry));
+	key = lion_entry_key(es->state, entry);
 	for (i = 0; i < range->nbounds; i++)
 	{
 		LionRangeBound *b = &range->bounds[i];
@@ -899,6 +907,7 @@ lion_entry_scan_end_phase(LionEntryScan *es, bool partended)
 	if (es->nextphase == LION_PHASE_DONE)
 		es->done = true;
 	es->blkno = InvalidBlockNumber;
+	es->stepfrom = InvalidBlockNumber;
 }
 
 static void
@@ -912,6 +921,10 @@ lion_entry_scan_setup_phase(LionEntryScan *es)
 	 * Compiles to nothing without --enable-injection-points.
 	 */
 	LION_INJECTION_POINT("lion-entry-scan-phase");
+
+	/* The phase starts where a descent lands: a walk right of its own. */
+	es->stepfrom = InvalidBlockNumber;
+	lion_rightwalk_init(&es->walk);
 
 	switch (es->nextphase)
 	{
@@ -1011,8 +1024,13 @@ lion_entry_scan_remember(LionEntryScan *es, const LionEntryTuple *entry)
 	 */
 	es->lastkey = (char *) MemoryContextAlloc(es->cxt,
 											  Max((Size) entry->keylen, 1));
+
 	if (entry->keylen > 0)
+	{
+		/* the next read hands the copy to the opclass functions (§21) */
+		lion_check_key(es->state, LionEntryGetKey(entry), entry->keylen);
 		memcpy(es->lastkey, LionEntryGetKey(entry), entry->keylen);
+	}
 	es->haslast = true;
 }
 
@@ -1065,10 +1083,10 @@ lion_entry_scan_selects(LionEntryScan *es, const LionEntryTuple *entry,
 		if (kind != LION_KIND_VALUE)
 			return false;
 		if (es->hasclipmin &&
-			lion_scan_keycmp(es, LionEntryGetKey(entry), es->clipmin) <= 0)
+			lion_scan_keycmp(es, entry, es->clipmin) <= 0)
 			return false;
 		if (es->hasclipmax &&
-			lion_scan_keycmp(es, LionEntryGetKey(entry), es->clipmax) > 0)
+			lion_scan_keycmp(es, entry, es->clipmax) > 0)
 		{
 			*stop = true;
 			return false;
@@ -1152,6 +1170,18 @@ lion_entry_scan_fill(LionEntryScan *es, bool copy)
 	if (es->nleaves > 0)
 		LION_INJECTION_POINT("lion-entry-scan-leaf");
 
+	/*
+	 * A leaf reached through a right link is a step of the walk, which ends a
+	 * cycle of damaged links in an ERROR (lion.h); nothing is held here, so a
+	 * cancel is answered too.
+	 */
+	if (BlockNumberIsValid(es->stepfrom))
+	{
+		lion_rightwalk_step(es->index, &es->walk, es->stepfrom, es->blkno);
+		es->stepfrom = InvalidBlockNumber;
+	}
+	CHECK_FOR_INTERRUPTS();
+
 	buf = ReadBuffer(es->index, es->blkno);
 	lion_dir_pages_read++;
 	es->nleaves++;
@@ -1196,6 +1226,7 @@ lion_entry_scan_fill(LionEntryScan *es, bool copy)
 		if (!LionPageIsRightmost(page) &&
 			lion_cmp_entry(lion_dir_highkey(page), &sk) <= 0)
 		{
+			es->stepfrom = es->blkno;
 			es->blkno = LionPageGetOpaque(page)->rightlink;
 			UnlockReleaseBuffer(buf);
 			return 0;
@@ -1309,6 +1340,7 @@ lion_entry_scan_fill(LionEntryScan *es, bool copy)
 		 * has already, or entries inserted since, which hold no row this
 		 * walk's snapshot can see (DESIGN.md §28, "One read per leaf").
 		 */
+		es->stepfrom = es->blkno;
 		es->blkno = LionPageGetOpaque(page)->rightlink;
 		if (!BlockNumberIsValid(es->blkno))
 		{
@@ -1492,6 +1524,7 @@ lion_entry_scan_pause(LionEntryScan *es)
 	es->nbatch = es->nextbatch;
 	es->lastinline = -1;
 	es->blkno = es->batchblk;
+	es->stepfrom = InvalidBlockNumber;	/* read again, not a step */
 	es->done = false;
 }
 

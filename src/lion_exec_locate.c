@@ -178,28 +178,6 @@ lion_locate_array(LionClauseState *cl, LionPostingSet **sets)
 }
 
 /*
- * What one value of an IN list costs once located: its LionPostingSet, the
- * copies of its INLINE payload and stored key, its leaf of the source's tree
- * and the pointer to it - some 200 bytes, rounded up.
- */
-#define LION_ARRAY_SET_BYTES	256
-
-/*
- * The most values of one IN list a count locates at once (DESIGN.md §15, "A
- * list too long to locate at once"): what a work_mem of located sets holds,
- * and never fewer than the longest list a literal may be, which is located
- * whole as it always was.
- */
-int
-lion_array_batch_size(void)
-{
-	Size		n = (Size) work_mem * 1024 / LION_ARRAY_SET_BYTES;
-
-	n = Min(n, (Size) (INT_MAX / 2));
-	return (int) Max(n, (Size) LION_MAX_ARRAY_ELEMS);
-}
-
-/*
  * Is WHERE item k, the IN list cl, to be located and counted a batch at a
  * time?  A parameter's array has no length cap (DESIGN.md §15), and the
  * located sets of a long one were all held at once, work_mem or not - about
@@ -262,30 +240,8 @@ lion_array_batch_prepare(LionCountScanState *st, int k, LionClauseState *cl)
 	st->nbatchval = lion_probe_sort(cl->idx, cl->idxcol, elemtype, nelems,
 									elems, nulls, st->batchval,
 									st->batchhash);
-
-	/*
-	 * Byte-for-byte equal values are the same key, and the sort puts them
-	 * side by side: keep one.  The lookup would skip the rest anyway, but a
-	 * batch runs on past its size while the hash stays the same, so a list of
-	 * one value repeated millions of times was one batch of that many sets.
-	 */
-	if (st->nbatchval > 1)
-	{
-		int			in;
-		int			out = 1;
-
-		for (in = 1; in < st->nbatchval; in++)
-		{
-			if (st->batchhash[in] == st->batchhash[out - 1] &&
-				datumIsEqual(st->batchval[in], st->batchval[out - 1],
-							 elmbyval, elmlen))
-				continue;
-			st->batchval[out] = st->batchval[in];
-			st->batchhash[out] = st->batchhash[in];
-			out++;
-		}
-		st->nbatchval = out;
-	}
+	st->nbatchval = lion_probe_sort_unique(st->batchval, st->batchhash,
+										   st->nbatchval, elmbyval, elmlen);
 	st->batchtype = elemtype;
 	st->batchitem = k;
 
