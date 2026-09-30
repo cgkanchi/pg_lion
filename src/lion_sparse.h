@@ -284,4 +284,13 @@ extern void lion_sparse_iterate(const LionContainer *s, lion_pair_callback cb,
 extern bool lion_sparse_check(const LionContainer *s, Size avail_bytes,
 							 const char **errmsg);
 
+/*
+ * For lion_index_verify(), of a segment lion_sparse_check() has passed: every
+ * pair's lo is a heap tuple (lion_lo_is_tuple(), lion_container.h), maxoff
+ * being MaxHeapTuplesPerPage.  Returns false and sets *errmsg (a static
+ * string) on failure.
+ */
+extern bool lion_sparse_check_offsets(const LionContainer *s, uint32 maxoff,
+									 const char **errmsg);
+
 #endif							/* LION_SPARSE_H */

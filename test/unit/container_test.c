@@ -2405,6 +2405,164 @@ test_check_rejects(void)
 }
 
 /* ----------------------------------------------------------------
+ *				lion_container_check_offsets()
+ *
+ * MaxHeapTuplesPerPage of a server with this BLCKSZ, which the frontend
+ * cannot include: (BLCKSZ - SizeOfPageHeaderData) /
+ * (MAXALIGN(SizeofHeapTupleHeader) + sizeof(ItemIdData)), 291 at 8K.
+ * ----------------------------------------------------------------
+ */
+
+#define TEST_MAXOFF		((uint32) ((BLCKSZ - 24) / (24 + 4)))
+
+/* The lo of offset off of block blk (within the container's range). */
+static uint16
+tuple_lo(uint32 blk, uint32 off)
+{
+	return (uint16) ((blk << LION_OFFSET_BITS) | off);
+}
+
+static void
+expect_offsets(LionContainer *c, bool good, const char *what)
+{
+	const char *msg = NULL;
+	bool		ok;
+
+	CHECK(lion_container_check(c, LION_CONTAINER_MAX_SIZE, &msg),
+		  "the container is structurally sound");
+	ok = lion_container_check_offsets(c, TEST_MAXOFF, &msg);
+	CHECK(ok == good, what);
+	CHECK(ok == (msg == NULL), "check_offsets() sets *errmsg exactly when it fails");
+}
+
+/* Build buf_a from lo values, add one more, and optimize to type. */
+static void
+offsets_case(int type, const uint16 *los, int n, int extra, const char *what,
+			 bool good)
+{
+	int			i;
+
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	for (i = 0; i < n; i++)
+		lion_container_add(&buf_a.c, los[i]);
+	if (extra >= 0)
+		lion_container_add(&buf_a.c, (uint16) extra);
+	lion_container_optimize(&buf_a.c);
+	if (type == LION_CT_BITSET && buf_a.c.type != LION_CT_BITSET)
+		lion_container_to_bitset(&buf_a.c);
+	CHECK(buf_a.c.type == type, "the case has the representation it tests");
+	expect_offsets(&buf_a.c, good, what);
+}
+
+static void
+test_check_offsets(void)
+{
+	static uint16 los[LION_CONTAINER_RANGE];
+	uint32		nblocks = LION_BLOCKS_PER_CONTAINER;
+	uint32		maxlo = (1U << LION_OFFSET_BITS) - 1;
+	int			n;
+	uint32		b;
+	uint32		o;
+	int			iter;
+
+	phase("lion_container_check_offsets()");
+
+	CHECK(TEST_MAXOFF < (1U << LION_OFFSET_BITS),
+		  "MaxHeapTuplesPerPage fits the offset bits");
+
+	/* ARRAY: a few members of a few blocks, first and last offsets included */
+	n = 0;
+	los[n++] = tuple_lo(0, 1);
+	los[n++] = tuple_lo(0, TEST_MAXOFF);
+	los[n++] = tuple_lo(5, 17);
+	los[n++] = tuple_lo(nblocks - 1, 1);
+	offsets_case(LION_CT_ARRAY, los, n, -1, "an ARRAY of tuples passes", true);
+	offsets_case(LION_CT_ARRAY, los, n, tuple_lo(0, 0),
+				 "an ARRAY member at offset 0 is rejected", false);
+	offsets_case(LION_CT_ARRAY, los, n, tuple_lo(1, 0),
+				 "an ARRAY member at offset 0 of block 1 (lo 512 at 8K) is rejected",
+				 false);
+	offsets_case(LION_CT_ARRAY, los, n, tuple_lo(3, TEST_MAXOFF + 1),
+				 "an ARRAY member past MaxHeapTuplesPerPage is rejected", false);
+	offsets_case(LION_CT_ARRAY, los, n, tuple_lo(nblocks - 1, maxlo),
+				 "an ARRAY member at the last lo of a block is rejected", false);
+
+	/* BITSET: every tuple of every block, the most a container can hold */
+	n = 0;
+	for (b = 0; b < nblocks; b++)
+		for (o = 1; o <= TEST_MAXOFF; o++)
+			los[n++] = tuple_lo(b, o);
+	offsets_case(LION_CT_BITSET, los, n, -1, "a BITSET of every tuple passes", true);
+	offsets_case(LION_CT_BITSET, los, n, tuple_lo(0, 0),
+				 "a BITSET member at offset 0 is rejected", false);
+	offsets_case(LION_CT_BITSET, los, n, tuple_lo(1, 0),
+				 "a BITSET member at offset 0 of block 1 is rejected", false);
+	offsets_case(LION_CT_BITSET, los, n, tuple_lo(nblocks - 1, TEST_MAXOFF + 1),
+				 "a BITSET member past MaxHeapTuplesPerPage is rejected", false);
+	offsets_case(LION_CT_BITSET, los, n, tuple_lo(7, maxlo),
+				 "a BITSET member at the last lo of a block is rejected", false);
+
+	/* RUN: whole blocks' worth of tuples, one run each */
+	n = 0;
+	for (b = 2; b < 6; b++)
+		for (o = 1; o <= TEST_MAXOFF; o++)
+			los[n++] = tuple_lo(b, o);
+	offsets_case(LION_CT_RUN, los, n, -1, "a RUN of whole blocks passes", true);
+	offsets_case(LION_CT_RUN, los, n, tuple_lo(3, 0),
+				 "a run that starts at offset 0 is rejected", false);
+	offsets_case(LION_CT_RUN, los, n, tuple_lo(4, TEST_MAXOFF + 1),
+				 "a run that ends past MaxHeapTuplesPerPage is rejected", false);
+	offsets_case(LION_CT_RUN, los, n, tuple_lo(9, 0),
+				 "a run of offset 0 alone is rejected", false);
+
+	/* a run from one block into the next, written by hand */
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	for (o = 1; o <= 8; o++)
+		lion_container_add(&buf_a.c, tuple_lo(2, o));
+	lion_container_optimize(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_RUN && LION_RUN_NRUNS(&buf_a.c) == 1,
+		  "eight members in a row are one RUN");
+	LION_RUN_DATA(&buf_a.c)[0].start = tuple_lo(2, TEST_MAXOFF);
+	LION_RUN_DATA(&buf_a.c)[0].len_minus_1 =
+		(uint16) (tuple_lo(3, 1) - tuple_lo(2, TEST_MAXOFF));
+	buf_a.c.cardinality = (uint16) (LION_RUN_DATA(&buf_a.c)[0].len_minus_1 + 1);
+	expect_offsets(&buf_a.c, false, "a run across two blocks is rejected");
+
+	/* the answer is "every member is a tuple", for any container */
+	for (iter = 0; iter < 300; iter++)
+	{
+		uint32		nmem = 1 + rng_below(iter % 3 == 0 ? 3000 : 200);
+		bool		expect = true;
+		const char *msg = NULL;
+		uint32		v;
+		uint32		i;
+
+		lion_container_init(&buf_a.c, TEST_CKEY);
+		for (i = 0; i < nmem; i++)
+		{
+			uint32		blk = rng_below(nblocks);
+			uint32		off = 1 + rng_below(TEST_MAXOFF);
+
+			/* now and then one that is not a tuple: offset 0, or any */
+			if (rng_below(50) == 0)
+				off = rng_below(2) ? 0 : rng_below(maxlo + 1);
+
+			lion_container_add(&buf_a.c, tuple_lo(blk, off));
+		}
+		if (iter % 2 == 0)
+			lion_container_optimize(&buf_a.c);
+		for (v = 0; v < LION_CONTAINER_RANGE; v++)
+		{
+			if (lion_container_contains(&buf_a.c, (uint16) v) &&
+				((v & maxlo) == 0 || (v & maxlo) > TEST_MAXOFF))
+				expect = false;
+		}
+		CHECK(lion_container_check_offsets(&buf_a.c, TEST_MAXOFF, &msg) == expect,
+			  "check_offsets() agrees with the members, one by one");
+	}
+}
+
+/* ----------------------------------------------------------------
  *			exact-size buffers (damaged containers, growth in place)
  *
  * A heap buffer of exactly the size under test, so that a build with
@@ -4137,6 +4295,7 @@ main(void)
 	test_run_intersection_overflow();
 	test_remove_if_rebuild();
 	test_check_rejects();
+	test_check_offsets();
 
 	dmg_a = exact_alloc(LION_CONTAINER_MAX_SIZE);
 	dmg_b = exact_alloc(LION_CONTAINER_MAX_SIZE);

@@ -799,9 +799,12 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- never below the column of the entry before it, §24), at most one reserved NULL and one
         -- reserved EMPTY entry PER COLUMN, page ids/flags, meta values, entry flags,
         -- ascending ckeys within pages and across rightlinks, min/max correctness, container_check
-        -- on every container, ntids/ncontainers sums; with heapallindexed, scans the heap with a
-        -- fresh snapshot and checks that every visible tuple's TID is present under its key in
-        -- EVERY key column (§24) - refusing (lion_index_usable(), §9) when this transaction's
+        -- on every container and that every member is a heap tuple - an offset 1 ..
+        -- MaxHeapTuplesPerPage, a RUN inside one block (§2; a member at offset 0 used to pass,
+        -- and every query of its key then failed) - no two items of a page overlapping, the
+        -- form of every stored key (§21, "Readers"), ntids/ncontainers sums; with
+        -- heapallindexed, scans the heap with a fresh snapshot and checks that every visible
+        -- tuple's TID is present under its key in EVERY key column (§24) - refusing (lion_index_usable(), §9) when this transaction's
         -- snapshot may not use the index.
         -- The heap scan evaluates the index's expressions and predicate, which are the table
         -- owner's functions and can be replaced after CREATE INDEX with anything at all. They run
