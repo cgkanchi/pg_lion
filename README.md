@@ -61,6 +61,13 @@ the tested workloads, not a general replacement recommendation.
     make PG_CONFIG=.local/pg/bin/pg_config installcheck   # regress files + isolation specs
     make unit PG_CONFIG=.local/pg/bin/pg_config           # container and sparse libraries, no server needed
 
+No `-march` is needed for speed: on x86-64, GCC and clang builds carry AVX2 and POPCNT versions of
+the container library's passes over whole bitsets, compiled with target attributes, and pick one at
+run time by what the CPU has; other targets and compilers get a portable one, and `make
+LION_NO_SIMD=1` leaves the x86-64 ones out (DESIGN.md §3, "Whole-bitset kernels").  `make unit` runs
+the container tests against each version the CPU has, and once more built without the x86-64 ones
+(`test/unit/container_test_nosimd`).
+
 Lion logs through one of two WAL resource managers (DESIGN.md §25), chosen per index at
 CREATE INDEX, so the suite has to pass in both:
 
@@ -355,7 +362,8 @@ table's owner (DESIGN.md §7).
 ## Source layout
 
     src/lion_tid.h          TID <-> (container key, 15-bit lo) encoding; 9 offset bits at 8K pages
-    src/lion_container.[ch] container library (array/bitset/run), set algebra, unit-tested standalone
+    src/lion_container.[ch] container library (array/bitset/run), set algebra, AVX2/POPCNT bitset kernels
+                            picked at run time, unit-tested standalone
     src/lion_sparse.[ch]    sparse (container key, offset) segments, unit-tested standalone
     src/lion.h              on-disk structs, the relation state, and the page layer's and the AM's functions
     src/lion_pages.c        index pages: initializing, deleting, recycling; the items of container pages

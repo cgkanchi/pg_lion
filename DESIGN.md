@@ -143,7 +143,8 @@ Representation policy
 **Damaged containers** (2026-09-25 review). A container read from disk is data, and a reader checks
 its header and its size (`lion_inline_fetch()`) - not its payload: `lion_container_check()` costs as
 much as using the container (0.8 us for a BITSET, a popcount of all 512 words, which is what an
-and-cardinality of two bitsets costs), and the count engine reads millions per query. The library
+and-cardinality of two bitsets costs; 0.12 and 0.14 us with the AVX2 kernels below), and the count
+engine reads millions per query. The library
 used to trust the payload as far as its own buffers went, and a review found, with AddressSanitizer,
 three ways a container that passes the size check wrote outside one: an ARRAY member of 32768 or
 more indexed a bitset word past the 512th (65535 wrote 4 KB past a 4104-byte stack buffer), a run
@@ -212,6 +213,85 @@ deletes in place alone in the bytes the page allots it (`lion_page_check_alone()
 in-place insert, a replacement and VACUUM's delete), and the directory entry a record rewrites a
 whole one, of exactly its size when it is a CHAIN entry (`lion_page_entry_fetch()`). Each is an
 ERROR (INDEX_CORRUPTED), and verify() reports an overlap too. `test/sql/corrupt_items.sql`.
+
+**Whole-bitset kernels** (2026-09-30). Every pass over all 512 words of a BITSET that counts what it
+sees is one call of a fused kernel (lion_container.c, "whole-bitset kernels"), which reads the
+operands, writes the result if the operation has one and counts, in the same pass:
+
+| pass | what | callers |
+|---|---|---|
+| COUNT | a BITSET's cardinality | `lion_container_bitset_recount()`, `lion_container_check()`, the count engine's OR images (`lion_bits_to_container()`, through `lion_container_image_cardinality()`), `lion_container_add_many()` |
+| RUNS | the number of its runs | `lion_container_optimize()` of a BITSET, and a RUN rebuilt by `remove_if()` |
+| AND_COUNT | the cardinality of a BITSET x BITSET AND, nothing stored | `lion_container_and_cardinality()` |
+| AND, OR, ANDNOT | the result written and counted | `lion_container_and()`, `_or()`, `_andnot()` and their `_raw` twins, when the right operand is a BITSET: two BITSETs read straight from their payloads, a RUN or an ARRAY on the left filled into the result first |
+| OR_NEW | a BITSET ORed into one in place, the new members counted | `lion_container_or_inplace()` (§32's dense unions) |
+
+Before, the AND of two BITSETs was a 4 KB copy of one, a pass ANDing in the other and a
+`pg_popcount()` of the result, `and_cardinality()` an AND into a 4 KB stack image and a
+`pg_popcount()` of it, and the run count and the in-place OR a `pg_popcount64()` a word - which on
+x86-64 before PostgreSQL 19 is an indirect call, as is every word of `pg_popcount()` itself before
+17. There are three implementations, picked once per process at the first call: a static function
+pointer starts at a resolver, which asks `__builtin_cpu_supports()` and overwrites the pointer with
+its choice, as PostgreSQL's own `pg_popcount64` does:
+
+- **AVX2** (x86-64): Muła's popcount - each byte's count looked up a nibble at a time in a 16-entry
+  table with VPSHUFB - summed in bytes over 16 vectors, at most 128 a byte, before one VPSADBW;
+- **POPCNT** (x86-64 without AVX2): a word at a time, four sums;
+- **portable**, on every other target and compiler and under `make LION_NO_SIMD=1`: the same
+  word-at-a-time loop where `__builtin_popcountll()` is an instruction (CNT on aarch64, which clang
+  vectorizes with NEON), and what each caller did before - a `pg_popcount()` of what it counts - where
+  it is not (x86 built for its baseline ISA, where the builtin is libgcc's table).
+
+The x86-64 kernels are GCC's and clang's `__attribute__((target("avx2")))` and `("popcnt")`, so the
+extension builds with the default `-march` and runs on any x86-64; `__builtin_cpu_supports("avx2")`
+also checks that the OS saves the AVX registers. **No AVX-512**, on purpose: Intel's client CPUs lack
+it, AMD's Zen 4 runs it as two 256-bit halves, and outside L1 a pass waits on the cache rather than
+the popcount - with the operands cycling through 2 MB the AVX2 kernel is within a tenth of the POPCNT
+one - so a fourth implementation to test would buy little beyond a hot L1. (`pg_popcount()` itself
+uses VPOPCNTDQ where it finds it, from PostgreSQL 17 on, and the portable kernel on x86 counts
+through it.) Every implementation gives the same counts and writes the same words, so the same
+representations are chosen and plans do not change (the golden plans of the regression suite are
+identical).
+
+Measured through the library (a harness beside it; Xeon at 2.8 GHz with AVX2 and no VPOPCNTDQ, gcc
+-O2, PostgreSQL 16's libpgcommon; one pair of bitsets of 30% and 50% density in L1 / 256 pairs, 2
+MB), in ns:
+
+| call | before | AVX2 | POPCNT |
+|---|---|---|---|
+| `and_cardinality()` | 775 / 878 | 144 / 255 | 202 / 277 |
+| `and_raw()` (`or_raw()`, `andnot_raw()` alike) | 914 / 1182 | 133 / 390 | 211 / 407 |
+| `and()`, optimizing | 1603 / 1814 | 357 / 623 | 601 / 809 |
+| `or_inplace()` | 876 / 887 | 138 / 252 | 318 / 333 |
+| `bitset_recount()` | 636 / 641 | 121 / 139 | 163 / 166 |
+| `optimize()` of a BITSET that stays one | 644 / 651 | 184 / 190 | 347 / 351 |
+
+PostgreSQL 17 and 18 run POPCNT inside `pg_popcount()`, which about halves the "before" of what
+counts through it (`and_cardinality()` 404 / 500 ns, `bitset_recount()` 290 against an -O1 build of
+18's libpgcommon). End to end, on the assert-enabled PostgreSQL 18 build (-O1), 10M rows of three
+random 0/1 columns with a lion index each, all-visible, 845 container keys, a count's backend CPU
+time (600 runs in one session, medians of three rounds alternating the builds, on a shared and
+busy machine): `WHERE a = 1 AND b = 1` 3.85 -> 2.68 ms, `AND c = 1` too 6.12 -> 4.12 ms, `a = 1 OR
+b = 1` 4.22 -> 3.27 ms - a fifth to a third less.
+
+Left as they were, with a reason each: a partial range's count (`bits_range_cardinality()`: a RUN
+against a BITSET a run at a time, `range_cardinality()`, `remove_range()`, a RUN ORed in place),
+which is a few words per call; the count near the cap in `bits_extract_array()`; and the bitmap
+scan's window, which ANDs an image into another and then hands it to `lion_bits_to_container()`,
+whose count is the kernel's now but a second pass (`lion_scan.c`, `lion_source_window_next()`). The
+cost model is unchanged: its fitted constants (§10, "The merge": a bitset costs what an array of a
+thousand members does, 800 ns) were measured with the old passes and now overcharge a dense count
+somewhat, which a refit may take up with the rest of the model.
+
+`lion_container_simd_force()` (a `-DFRONTEND` build only) makes the library use a given
+implementation: the unit tests force each one the build and CPU have, check every pass against a
+reference that counts a bit at a time - 22 x 22 pairs of patterns: empty, full, densities from 0.05%
+to 99.95%, the first or last bit of every word, runs across words and across the AVX2 kernel's
+16-vector blocks - in exact-size heap buffers at every 8-byte alignment modulo 32, check what the
+public functions make of them (counts, words, and the representation the optimizing forms choose,
+against the policy above), and rerun the set algebra of every type pair under it.
+`test/unit/container_test_nosimd` is the same program built with `-DLION_NO_SIMD` (and `-mpopcnt`
+on an x86-64 host, which makes its portable kernel the fused loop other architectures run).
 
 Full API: `src/lion_container.h`. Unit tests: `test/unit/container_test.c` (`make unit`), which must
 cover every type transition, boundary cardinalities (0, 1, 2047, 2048, 2049, 32767, 32768 members),
