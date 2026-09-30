@@ -2944,8 +2944,9 @@ over a temporary table pinned up to a thousand local buffers of 1024 and failed 
 local buffer available" (2026-09-25 review). The eighth is what keeps one backend from exhausting
 the pool - the failure above
 was 9000 leaves against 2048 buffers, where an eighth is 256 and leaves seven eighths to the query's
-own heap, visibility-map and chain pages and to every other backend - and it only binds below 64MB,
-so on any ordinary configuration a literal list pins exactly the leaves it always did. The CURSORS
+own heap, visibility-map and chain pages and to every other backend - and it only binds below 64MB
+(on a shared pool the fair-share bound below binds before it, since 2026-09-29 below about 340MB of
+shared_buffers). The CURSORS
 that read the located sets draw on what the lists leave of the same limit ("Bounded cursors",
 below). Pins on the
 leaf the previous set already pins cost no buffer and are not counted. Every set that took a new
@@ -2966,13 +2967,34 @@ the budget comes out **NOPIN**: its payload copied, its leaf let go, exactly lik
 The limit is per backend, and two things it did not account for were other backends and a
 query's own parallel workers (2026-09-28 review). An eighth of the pool keeps one backend from
 exhausting it, but eight at once still could. So for the shared pool the limit is also at most
-`LION_LOOKUP_SHARES` = 16 times the backend's fair share, `NBuffers / MaxBackends`, and never less
-than `LION_LOOKUP_MIN_PINS` = 64: exhausting the pool that way takes a sixteenth of all the
-backends the server is configured for, running lists over the budget at the same moment. On a stock
-server (128MB, 100 connections, some 130 buffers a backend) the share is about 2000 and the thousand
-still binds, so an ordinary configuration pins exactly what it did; the share binds where
-max_connections is large for shared_buffers (128MB and 500 connections: about 500). A plain fair
-share, the budget's first version below, sent ordinary lists to the heap; sixteen of them do not.
+`LION_LOOKUP_SHARES` = 4 times the backend's fair share of it: the pool over every process that may
+pin a buffer of it, core's `GetPinLimit()` - NBuffers / (MaxBackends + NUM_AUXILIARY_PROCS), which
+is what core holds a read stream or a relation extension to, and which 16 and 17 compute the same
+way without exporting it (`lion_pin_fair_share()`, lion_compat.h). Exhausting the pool that way
+takes a quarter of all the processes the server is configured for, running lists over the budget at
+the same moment. On a stock 18 server (128MB, 100 connections: 94 buffers a backend) that is 376,
+and the thousand binds from about 340MB of shared_buffers up - the regression suite's servers pin
+exactly what they did. A plain fair share, the budget's first version below, sent ordinary lists to
+the heap; four of them keep a pinned leaf for most of a stock server's thousand-value lists.
+
+The first cut of this bound (2026-09-28 review) was sixteen times `NBuffers / MaxBackends` and never
+less than 64 pins, and the second review of it (2026-09-29) found both out of proportion to the
+pool: a thousand leaves pinned by one list count on a stock server, where seventeen such counts at
+once pin all 16384 buffers; and floors of their own, 64 list pins on any pool of 512 buffers or more
+however many connections share it, and 16 cursor pins (`LION_OPEN_MIN_PINS`) and 16 groups of a
+GROUP BY batch on any pool at all - the whole of a 128kB one. At shared_buffers = 128kB -
+sixteen buffers, one session - or 512kB with twelve pgbench clients, `k IN (30 CHAIN values) AND
+x = 1`, a GROUP BY over such a list and `lion_index_count_any()` of fifty CHAIN values failed with
+"no unpinned buffers available" where the plan without the pushdown answers. Nothing floors the
+share now: a pool too small for its connections gives a limit of NO pins, every list is located
+NOPIN, and the pins of the count's cursors follow the same limit ("Bounded cursors", below: their
+floor of 16 gives way to it, and past it an OR is read without its pins). What is left is what a
+count cannot do without: a heap page, a visibility-map page, and the page each source's CHAIN set is
+read from - past the budget a list is taken one set at a time, an OR keeps no pin, an AND one
+child's, and a GROUP BY counts one group at a time. `test/hook-check.sh` restarts the dev cluster with shared_buffers = 128kB
+and runs those counts (test/modules/lion_hooktest/sql/pinpool.sql), because installcheck's pool of
+gigabytes never reaches any of this.
+
 And each participant of a parallel FK-side join locates the fact filters for itself (§27), so a
 leader and seven workers took eight budgets: the node now tells each participant how many the plan
 was started with (`lion_list_pin_participants()`, the workers planned plus the leader, whether it
@@ -3174,7 +3196,8 @@ What changed, each where the cost was:
 - **An open budget, and a plan against it.** Before a merge builds its cursors, each source's tree
   is PLANNED (`lion_plan_node()`) against an open budget: work_mem of cursor memory (at least
   256 kB) and, in pins, what this backend's lists have left of the list pin limit above (at least
-  16), so that a list's leaf pins and its cursors' page pins come out of ONE limit per backend. The
+  16, or the limit itself where that is smaller - 2026-09-29 review), so that a list's leaf pins and
+  its cursors' page pins come out of ONE limit per backend. The
   plan estimates bottom-up what each node's cursors would hold - the `LionExprCursor`, the staging
   buffer or page image, an OR's heap entries and accumulators - and decides the three shapes below.
   An ordinary query is under the budget everywhere and is built exactly as before; the plan also
@@ -3182,7 +3205,9 @@ What changed, each where the cost was:
   shape and the interlock are one decision.
 - **A disjoint list is counted in BATCHES** (`lion_run_batches()`). A source that is a disjoint
   list (the §15 short-circuit's test, minus "the only source") and would not fit the budget opened
-  whole is cut into batches of consecutive entries that do fit, and the merge runs once per batch
+  whole is cut into batches of consecutive entries that do fit (at least `LION_BATCH_MIN_SETS` = 16
+  found sets, or on a pin budget smaller than that as many as it allows and one at the least: one
+  set is never read as a windowed union), and the merge runs once per batch
   with the list replaced by that batch's union. With the list's sets pairwise disjoint and U_1 ..
   U_m the batches' unions, R the intersection of the other positive sources and N the union of the
   negated ones, `|((U_1 ∪ ... ∪ U_m) ∩ R) \ N| = Σ_j |(U_j ∩ R) \ N|`, the terms being disjoint -

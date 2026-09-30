@@ -327,8 +327,11 @@ typedef struct LionOpenBudget
  * budget may be spent entirely by the lists' own INLINE leaves; a batch of
  * a few dozen sets still has to fit, or a list would be counted a set or two
  * at a time.  LION_BATCH_MIN_SETS is the fewest found sets one batch of a
- * disjoint list takes, and it fits both floors - which is what keeps a batch
- * from ever being planned as a windowed union.
+ * disjoint list takes while the pins allow it, and it fits both floors -
+ * which is what keeps a batch from ever being planned as a windowed union.
+ * The pin floor gives way to the list pin limit itself where that is smaller
+ * (a pool of a few dozen buffers, lion_open_budget_init()), and a batch then
+ * stops at the pins it has, one set at the least: one set is never wide.
  */
 #define LION_OPEN_MIN_BYTES		(256 * 1024)
 #define LION_OPEN_MIN_PINS		16

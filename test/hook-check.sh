@@ -23,7 +23,13 @@
 #      outermost) and 'lion_hooktest,pg_lion' (pg_lion's outermost), with
 #      pg_lion.rmgr_id moved to 129 so the two resource managers coexist;
 #   3. both resource managers on the default id 128: the server must refuse
-#      to start, and say why.
+#      to start, and say why;
+#   4. shared_buffers = 128kB, sixteen buffers, fewer than one per
+#      connection: the counts of test/modules/lion_hooktest/sql/pinpool.sql,
+#      whose pin budgets used to have floors of their own and ran such a pool
+#      out of buffers (DESIGN.md §15, "The pin budget").  Here and not in
+#      installcheck because it needs a pool that small, which only a restart
+#      sets; it has nothing to do with the hooks.
 #
 # Each order-sensitive test checks from inside the other hook which one ran
 # first, that LionCount is still in the plan, and that the answers equal the
@@ -136,6 +142,13 @@ elif tail -c +"$((before + 1))" "$LOG" |
 	echo "   refused, as it must be: $(tail -c +"$((before + 1))" "$LOG" | grep -m1 -A1 'failed to register' | tr '\n' ' ')"
 else
 	FAILED="$FAILED [rmgr id collision: no registration error in $LOG]"
+fi
+
+# ---- 4. a pool of sixteen buffers ------------------------------------------
+if start_with "-c shared_buffers=128kB"; then
+	run "shared_buffers 128kB" pinpool
+else
+	FAILED="$FAILED [shared_buffers 128kB: server did not start]"
 fi
 
 if [ -z "$FAILED" ]; then

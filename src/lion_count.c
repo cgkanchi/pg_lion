@@ -1637,8 +1637,10 @@ lion_batch_source(int nsources, const LionCountSource *sources,
 
 /*
  * Where the batch that starts at sets[start] ends: as many sets as the open
- * budget allows, and at least LION_BATCH_MIN_SETS that have an entry.  The
- * sets without one are left out of the batch's union and cost nothing.  The
+ * budget allows, and at least LION_BATCH_MIN_SETS that have an entry - or,
+ * with fewer pins than that (lion_open_budget_init()), as many as the pins
+ * allow and at least one, which is never planned wide either.  The sets
+ * without an entry are left out of the batch's union and cost nothing.  The
  * price is what lion_plan_node() charges for an OR over the found ones, plus
  * the accumulators it charges only from two or three children on, so that a
  * batch that fits is never planned wide.
@@ -1662,8 +1664,9 @@ lion_batch_end(const LionCountSource *src, int start,
 			continue;
 		lion_leaf_cost(&src->sets[end], false, &m, &p);
 		m += LION_OR_CHILD_OVERHEAD;
-		if (n >= LION_BATCH_MIN_SETS &&
-			(mem + m > budget->mem || pins + p > budget->pins))
+		if (n >= 1 && pins + p > budget->pins)
+			break;
+		if (n >= LION_BATCH_MIN_SETS && mem + m > budget->mem)
 			break;
 		mem += m;
 		pins += p;
