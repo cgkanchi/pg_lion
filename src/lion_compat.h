@@ -116,6 +116,23 @@ lion_ordering_op_is_lt(Oid ltopr, Oid *opfamily, Oid *opcintype)
 #endif
 }
 
+/* ... and is gtopr the `>` of one (DESIGN.md §36: ORDER BY count(*) DESC)? */
+static inline bool
+lion_ordering_op_is_gt(Oid gtopr, Oid *opfamily, Oid *opcintype)
+{
+#if PG_VERSION_NUM >= 180000
+	CompareType cmptype;
+
+	return get_ordering_op_properties(gtopr, opfamily, opcintype, &cmptype) &&
+		cmptype == COMPARE_GT;
+#else
+	int16		strategy;
+
+	return get_ordering_op_properties(gtopr, opfamily, opcintype, &strategy) &&
+		strategy == BTGreaterStrategyNumber;
+#endif
+}
+
 /*
  * Does any version of the HOT chain rooted at tid satisfy snapshot?  20 renamed
  * table_index_fetch_tuple_check() to table_fetch_tid() when the index-fetch

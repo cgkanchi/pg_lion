@@ -1458,6 +1458,13 @@ extern PGDLLIMPORT bool lion_enable_filter_switch;
  * cheaper than the nested loop of §20.  A planner switch.
  */
 extern PGDLLIMPORT bool lion_enable_decoded_walk;
+
+/*
+ * Whether a GROUP BY ordered by its count under a LIMIT may count only the
+ * groups the entries' own counts leave in the running (DESIGN.md §36).  A
+ * planner switch.
+ */
+extern PGDLLIMPORT bool lion_enable_topk;
 extern PGDLLIMPORT create_upper_paths_hook_type lion_prev_create_upper_paths_hook;
 
 extern void lion_count_scan_register(void);

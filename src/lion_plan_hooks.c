@@ -16,6 +16,7 @@
 bool		lion_enable_count_pushdown = true;
 bool		lion_enable_filter_switch = true;
 bool		lion_enable_decoded_walk = true;
+bool		lion_enable_topk = true;
 create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 bool		lion_enable_semijoin = true;
 set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook = NULL;
@@ -649,6 +650,51 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			 * NULL entry and c's own.
 			 */
 			kind = LION_TL_GROUPKEY;
+		}
+		else if (!contain_agg_clause(expr) && pull_var_clause(expr, 0) != NIL)
+		{
+			/*
+			 * An expression of the grouping columns (DESIGN.md §36): the node
+			 * emits the columns, and setrefs.c makes the expression over them
+			 * part of the plan's projection.  The planner let through no
+			 * other.
+			 */
+			List	   *vars = pull_var_clause(expr, 0);
+			ListCell   *l3;
+
+			foreach(l3, vars)
+			{
+				AttrNumber	attno = ((Var *) lfirst(l3))->varattno;
+				int			i;
+
+				if (groupattno != 0 && attno == groupattno)
+					kind = LION_TL_GROUPKEY;
+				else if (groupattno2 != 0 && attno == groupattno2)
+					kind = LION_TL_GROUPKEY2;
+				else if ((i = lion_groupn_col(groupnattnos, attno)) > 0)
+					kind = (i == 1) ? LION_TL_GROUPKEY2 : LION_TL_GROUPKEYN(i);
+				else
+					elog(ERROR, "LionCount: an expression of column %d, which is not grouped",
+						 attno);
+
+				dup = false;
+				foreach(l2, ctlist)
+				{
+					if (equal(((TargetEntry *) lfirst(l2))->expr, lfirst(l3)))
+					{
+						dup = true;
+						break;
+					}
+				}
+				if (dup)
+					continue;
+				ctlist = lappend(ctlist,
+								 makeTargetEntry((Expr *) copyObject(lfirst(l3)),
+												 list_length(ctlist) + 1,
+												 NULL, false));
+				kinds = lappend_int(kinds, kind);
+			}
+			continue;
 		}
 		else
 			elog(ERROR, "unexpected expression in LionCount target list");

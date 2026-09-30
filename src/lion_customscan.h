@@ -961,7 +961,14 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  *		are every row of the table; attnum the PARENT's.  Empty for a sum
  *		driven by a range, or by the first `IS NOT NULL`, which name their
  *		column themselves
- *	17	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	17	IntList: the top k of a GROUP BY ordered by its count (DESIGN.md
+ *		§36), or empty: k - the query's LIMIT and OFFSET added up - then how
+ *		many entries the walk of the entries' own counts keeps as candidates,
+ *		then 1 when the groups tied with the k-th must all come out (a second
+ *		ORDER BY key, or WITH TIES) and 0 when any of them will do.  The node
+ *		then emits only groups that can be among the first k, which the Sort
+ *		and Limit above it put in order and cut
+ *	18	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -981,7 +988,8 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_PRIV_FACTGROUP	14
 #define LION_PRIV_GROUPN		15
 #define LION_PRIV_ALLROWS	16
-#define LION_PRIV_TLKINDS	17
+#define LION_PRIV_TOPK		17
+#define LION_PRIV_TLKINDS	18
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -1043,6 +1051,11 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * the clauses and not found, and a `<>` it would have counted as an
  * equality.
  *
+ * Shape 20 added the TOPK member (17) in front of the target-list kinds: a
+ * GROUP BY that emits only the groups that can be among the first k by
+ * count (DESIGN.md §36), which an older build would have emitted whole -
+ * right, but not what the plan was priced as.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1055,8 +1068,8 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424913
-#define LION_PRIV_NMEMBERS	18
+#define LION_PRIV_MAGIC		0x52424914
+#define LION_PRIV_NMEMBERS	19
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -1612,6 +1625,31 @@ typedef struct LionCountScanState
 	int			gbpos;
 	int64		groupbatches;
 	int64		groupsbatched;
+
+	/*
+	 * The top k of a GROUP BY ordered by its count (DESIGN.md §36): topkn is
+	 * k (0: every group), topkcand how many entries the walk of the entries'
+	 * counts keeps, topkstrict that every group tied with the k-th must come
+	 * out.  lion_topk_run() fills topkkey, topknull and topkcount with the
+	 * groups it counted, in topkcxt, and the rows go up one a call; topkran
+	 * says it has run, and topkwhole that it could not prove its candidates
+	 * enough, so the walk counts every group as without a k.  topkwalked and
+	 * topkcounted are what EXPLAIN ANALYZE reports.
+	 */
+	int64		topkn;
+	int			topkcand;
+	bool		topkstrict;
+	bool		topkran;
+	bool		topkwhole;
+	MemoryContext topkcxt;
+	Datum	   *topkkey;
+	bool	   *topknull;
+	int64	   *topkcount;
+	int			topkout;
+	int			topkpos;
+	int64		topkwalked;
+	int64		topkcounted;
+	int64		topkwholes;
 
 	/*
 	 * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel"; granged,
@@ -2305,6 +2343,11 @@ extern void lion_target_lists(const LionCountTarget *t, List *whereclauses,
 							  List *wherekinds, List *ors, List **idx,
 							  List **col, List **clauses, List **kinds,
 							  List **tors, int *joinclause);
+extern void lion_cost_topk_path(PlannerInfo *root, CustomPath *cpath,
+								List *targets, List *whereclauses,
+								List *wherekinds, List *ors, double entries,
+								double drivefrac, double cand,
+								double candrows, double outrows);
 extern void lion_cost_count_path(PlannerInfo *root, CustomPath *cpath,
 								 List *targets, List *whereclauses,
 								 List *wherekinds, List *ors, double numgroups,

@@ -342,6 +342,20 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §36: whether a GROUP BY ordered by its count under a LIMIT
+	 * may count only the groups that can be among the first rows, found by
+	 * the entries' own counts.  Off, every group is counted.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_topk",
+							 "Lets the count pushdown count only the groups that can be among the first rows of a GROUP BY ordered by its count under a LIMIT.",
+							 "Off, every group is counted and the Sort and Limit above choose among them.",
+							 &lion_enable_topk,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
 	 * The cost model's constants (DESIGN.md §31, "The settings"): one setting
 	 * for each, the multiplier of the core cost it is priced in, for
 	 * calibrating the model without a rebuild.

@@ -520,6 +520,17 @@ lion_reset_run(LionCountScanState *st)
 	if (st->fgrowcxt != NULL)
 		MemoryContextReset(st->fgrowcxt);
 
+	/* ... and the top k's groups, found again (DESIGN.md §36) */
+	st->topkran = false;
+	st->topkwhole = false;
+	st->topkkey = NULL;
+	st->topknull = NULL;
+	st->topkcount = NULL;
+	st->topkout = 0;
+	st->topkpos = 0;
+	if (st->topkcxt != NULL)
+		MemoryContextReset(st->topkcxt);
+
 	if (st->npart > 0)
 		lion_close_relation(st);
 	if (st->joinvisitcxt != NULL)
