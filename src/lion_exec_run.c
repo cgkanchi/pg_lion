@@ -366,8 +366,15 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 	/* ---- every entry of the index, summed into one row ---- */
 	if (st->sumall)
 	{
-		int64		total = lion_sumall_relation(st);
+		/*
+		 * ... and the aggregates over lion columns' entries (DESIGN.md §37),
+		 * beside the counts or without any.
+		 */
+		int64		total = (st->nwagg == 0 || st->wneedcount) ?
+			lion_sumall_relation(st) : 0;
 
+		if (st->nwagg > 0)
+			lion_wagg_run(st);
 		st->done = true;
 
 		/*

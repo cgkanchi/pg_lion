@@ -3480,6 +3480,57 @@ lion_cost_topk_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 }
 
 /*
+ * THE AGGREGATES OVER LION COLUMNS' ENTRIES (DESIGN.md §37): one walk of each
+ * column's entries, idxs[c] and key column cols[c], with naggs[c] arguments
+ * evaluated at each entry.  On a heap the visibility map calls all-visible
+ * the walk reads the entries' headers alone; elsewhere it counts each entry
+ * as a GROUP BY of the column would.  Added to the sum over every row the
+ * path already prices when the target list has counts too (counts), and in
+ * place of it when it has not.
+ */
+#define LION_WAGG_ALLVISIBLE	0.999
+
+void
+lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
+					List *idxs, List *cols, List *naggs, bool counts)
+{
+	Cost		run = counts ? cpath->path.total_cost : 0.0;
+	bool		fast = (rel->allvisfrac >= LION_WAGG_ALLVISIBLE);
+	ListCell   *l1;
+	ListCell   *l2;
+	ListCell   *l3;
+
+	forthree(l1, idxs, l2, cols, l3, naggs)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(l1);
+		AttrNumber	col = (AttrNumber) lfirst_int(l2);
+		double		nagg = (double) lfirst_int(l3);
+		double		nd = lion_index_column_nd(root, rel, idx, col - 1);
+		double		pages;
+
+		if (nd <= 0.0)
+			nd = Max(rel->tuples, 1.0);
+		pages = Max(1.0, (double) idx->pages *
+					lion_index_column_share(root, rel, idx, col));
+		run += nd * nagg * 2.0 * cpu_operator_cost;
+		if (fast)
+			run += pages * seq_page_cost + nd * LION_TOPK_ENTRY_COST;
+		else
+			run += lion_cost_count_rel(root, rel, idx, col, NULL, 0,
+									   NIL, NIL, NIL, NIL, NIL, nd, nd, 0,
+									   LION_DISTINCT_NONE, 1.0, NULL, false,
+									   NULL, 0.0, 0.0);
+	}
+
+	cpath->path.rows = 1.0;
+#if PG_VERSION_NUM >= 180000
+	cpath->path.disabled_nodes = 0;
+#endif
+	cpath->path.startup_cost = run;
+	cpath->path.total_cost = run;
+}
+
+/*
  * THE DECODED WALK (DESIGN.md §34): a GROUP BY of ncol columns, groupest[c]
  * values each by the planner's estimate, over one table.  It does what the
  * grouped count of its first column alone does - that column's sets walked
