@@ -802,6 +802,19 @@ SELECT a, count(*) FROM lion_mcp WHERE b = 2 GROUP BY a;
 
 EXPLAIN (COSTS OFF)
 SELECT a, b, count(*) FROM lion_mcp GROUP BY a, b;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: a, b
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_mcp_i.b (b), lion_mcp_i.a (a)
+         Group Key: b, a
+         Group Strategy: Decoded
+(6 rows)
+
+SET pg_lion.enable_decoded_walk = off;
+EXPLAIN (COSTS OFF)
+SELECT a, b, count(*) FROM lion_mcp GROUP BY a, b;
                      QUERY PLAN                     
 ----------------------------------------------------
  Custom Scan (LionCount)
@@ -809,6 +822,7 @@ SELECT a, b, count(*) FROM lion_mcp GROUP BY a, b;
    Group Key: b, a
 (3 rows)
 
+RESET pg_lion.enable_decoded_walk;
 -- an OR is one source over several columns of the one index (§19)
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM lion_mcp WHERE a = 3 OR b = 2;
@@ -1113,7 +1127,9 @@ SELECT lion_mcsame($$SELECT count(*) FROM @
 -- The natural use of a multicolumn index: both grouping columns come from the
 -- same relation, the outer/inner nested loop opens it twice and each side
 -- walks its OWN key column's entries.  `b` has fewer distinct values, so it is
--- the outer one and EXPLAIN names it first.
+-- the outer one and EXPLAIN names it first.  The decoded walk (§34) is off
+-- for it, and shown after.
+SET pg_lion.enable_decoded_walk = off;
 SELECT lion_mcpd($$SELECT a, b, count(*) FROM lion_mcp GROUP BY a, b$$);
       lion_mcpd       
 ----------------------
@@ -1196,6 +1212,34 @@ SELECT lion_mcsame($$SELECT a, b, count(*) FROM @ WHERE c = 'c1' GROUP BY a, b$$
                    lion_mcsame                    
 --------------------------------------------------
  multicolumn not pushed, single-column not pushed
+(1 row)
+
+RESET pg_lion.enable_decoded_walk;
+-- the decoded walk reads both key columns of the one index at each container
+-- key, and takes the WHERE the nested loop is refused, over either portfolio
+SELECT lion_mcpd($$SELECT a, b, count(*) FROM lion_mcp GROUP BY a, b$$);
+      lion_mcpd       
+----------------------
+ pushed down, 70 rows
+(1 row)
+
+SELECT lion_mcpd($$SELECT a, b, count(*) FROM lion_mcp
+				   WHERE c = 'c1' GROUP BY a, b$$);
+      lion_mcpd       
+----------------------
+ pushed down, 35 rows
+(1 row)
+
+SELECT lion_mcpd($$SELECT n, m, count(*) FROM lion_mcp GROUP BY n, m$$);
+      lion_mcpd       
+----------------------
+ pushed down, 24 rows
+(1 row)
+
+SELECT lion_mcsame($$SELECT a, b, count(*) FROM @ WHERE c = 'c1' GROUP BY a, b$$);
+               lion_mcsame                
+------------------------------------------
+ multicolumn pushed, single-column pushed
 (1 row)
 
 -- ---- 11.5 IN lists (§15) --------------------------------------------------

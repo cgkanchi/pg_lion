@@ -3418,6 +3418,121 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 }
 
 /*
+ * THE DECODED WALK (DESIGN.md §34): a GROUP BY of ncol columns, groupest[c]
+ * values each by the planner's estimate, over one table.  It does what the
+ * grouped count of its first column alone does - that column's sets walked
+ * key by key against the collected WHERE, the map asked once a key and the
+ * dirty rows rechecked (lion_cost_count_rel()) - and at every key the WHERE
+ * leaves rows at, besides:
+ *
+ *	- every column's containers there decoded: a step to the key for each
+ *	  value of it that has a container there - a seek, past the keys between,
+ *	  where the WHERE leaves few - and a store per member, all the key's rows
+ *	  once a column;
+ *	- each of the WHERE's rows counted under its combination
+ *	  (LION_DECODE_ROW_COST, or LION_DECODE_HASH_ROW_COST once an array of
+ *	  every combination would take more than a quarter of hash_mem);
+ *	- the posting pages of the other columns' sets, the share of them the
+ *	  keys are.
+ *
+ * Nothing of it grows with the number of combinations, which is the point
+ * (the pairs of §20 are priced by the product of the two entry counts).  A
+ * column with more values than a pass takes makes more than one pass, each
+ * reading the other columns again: priced as that many times their work.
+ * The rows are partial counts, one per combination with rows, which the
+ * Finalize Agg above adds up; all of them come out once the pass has run.
+ */
+void
+lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
+					  List *whereclauses, List *wherekinds, List *ors,
+					  int ncol, const double *groupest, double numgroups,
+					  double outrows)
+{
+	LionCountTarget *t = (LionCountTarget *) linitial(targets);
+	RelOptInfo *rel = t->rel;
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		tuples = Max(rel->tuples, 1.0);
+	double		nkeys = Max(ceil(heap_pages / LION_BLOCKS_PER_CONTAINER), 1.0);
+	double		rowsperkey = tuples / nkeys;
+	double		whererows = Max(rel->rows, 1.0);
+	double		keys;
+	double		keyfrac;
+	double		combos = 1.0;
+	double		passes = 1.0;
+	double		percap;
+	Cost		perkey = 0;
+	Cost		run;
+	List	   *tidx;
+	List	   *tcol;
+	List	   *tclauses;
+	List	   *tkinds;
+	List	   *tors;
+	int			c;
+
+	Assert(list_length(targets) == 1 && ncol >= 2);
+	lion_target_lists(t, whereclauses, wherekinds, ors, &tidx, &tcol,
+					  &tclauses, &tkinds, &tors, NULL);
+
+	/* column 0 against the WHERE, as its own grouped count walks it */
+	run = lion_cost_count_rel(root, rel, t->driveidx[0], t->drivecol[0],
+							  NULL, 0, tidx, tcol, tclauses, tkinds, tors,
+							  groupest[0], groupest[0], 0,
+							  LION_DISTINCT_NONE, 1.0, NULL, false, NULL);
+	run += lion_cost_recheck(root, rel, tidx, tcol, tclauses, tkinds, tors,
+							 lion_probe_rel_rows(root, rel), groupest[0],
+							 rel->tuples);
+
+	/* the keys the WHERE's rows lie at, scattered over the heap */
+	keys = Max(nkeys * (1.0 - exp(-whererows / nkeys)), 1.0);
+	keyfrac = Min(keys / nkeys, 1.0);
+
+	/*
+	 * Every column decoded at each of them.  Values a pass takes: column 0's
+	 * a batch of groups (LION_GROUP_BATCH_MAX at most, fewer under a tight
+	 * pin budget), the others' a work_mem of cursors shared among them.
+	 */
+	percap = Max((double) work_mem * 1024.0 /
+				 ((double) sizeof(PGAlignedBlock) + 512.0) / (ncol - 1), 16.0);
+	for (c = 0; c < ncol; c++)
+	{
+		double		vals = Min(Max(groupest[c], 1.0), rowsperkey);
+		double		cap = (c == 0) ? (double) LION_GROUP_BATCH_MAX : percap;
+
+		perkey += rowsperkey * LION_DECODE_MEMBER_COST;
+		perkey += vals * LION_DECODE_CONTAINER_COST;
+		if (c > 0)
+		{
+			IndexOptInfo *idx = t->driveidx[c];
+
+			perkey += vals * LION_PROBE_COST * (1.0 - keyfrac);
+			if (idx != NULL)
+				run += (double) idx->pages / Max(idx->nkeycolumns, 1) *
+					keyfrac * seq_page_cost;
+		}
+		combos *= Max(groupest[c], 1.0);
+		passes *= Max(ceil(Max(groupest[c], 1.0) / cap), 1.0);
+	}
+	run += keys * perkey * passes;
+	if (combos * sizeof(int64) * 4 <= (double) get_hash_memory_limit())
+		run += whererows * (LION_DECODE_ROW_COST +
+							(ncol - 1) * LION_DECODE_ROW_COL_COST +
+							((combos * sizeof(int64) > LION_DECODE_CACHE_BYTES) ?
+							 LION_DECODE_ROW_MISS_COST : 0.0));
+	else
+		run += whererows * (LION_DECODE_HASH_ROW_COST +
+							(ncol - 1) * LION_DECODE_ROW_COL_COST);
+
+	cpath->path.rows = outrows;
+#if PG_VERSION_NUM >= 180000
+	cpath->path.disabled_nodes = 0;
+#endif
+	/* a pass's rows go up once it has counted them all */
+	cpath->path.startup_cost = run;
+	cpath->path.total_cost = run + outrows * cpu_tuple_cost;
+	(void) numgroups;
+}
+
+/*
  * How a multi-key clause will be answered (DESIGN.md §17), and how many
  * posting sets its query is made of: the keys its extraction yields, which is
  * what a count merges at every container key it asks the clause about.

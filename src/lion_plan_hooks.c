@@ -15,6 +15,7 @@
 
 bool		lion_enable_count_pushdown = true;
 bool		lion_enable_filter_switch = true;
+bool		lion_enable_decoded_walk = true;
 create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 bool		lion_enable_semijoin = true;
 set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook = NULL;
@@ -430,6 +431,27 @@ lion_plan_join_agg_path(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * Which of the decoded walk's GROUP BY columns (DESIGN.md §34) attno is, in
+ * the order the walk takes them: 0 for the first, which member 2 of
+ * custom_private names as the group column, 1 and on for the others, and -1
+ * for a column that is not one of them.
+ */
+static int
+lion_groupn_col(List *attnos, AttrNumber attno)
+{
+	int			i = 0;
+	ListCell   *lc;
+
+	foreach(lc, attnos)
+	{
+		if ((AttrNumber) lfirst_int(lc) == attno)
+			return i;
+		i++;
+	}
+	return -1;
+}
+
+/*
  * Turn the path into a CustomScan.
  *
  * scan.scanrelid is 0 because this is an upper node, so custom_scan_tlist has
@@ -451,6 +473,8 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	bool	   *inor;
 	AttrNumber	groupattno;
 	AttrNumber	groupattno2;
+	List	   *groupn;
+	List	   *groupnattnos;
 	AttrNumber	distattno;
 	List	   *dist;
 	ListCell   *lc;
@@ -470,6 +494,8 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	ckinds = (List *) list_nth(best_path->custom_private, LION_PRIV_CLAUSEKINDS);
 	groupattno = (AttrNumber) lsecond_int(ints);
 	groupattno2 = (AttrNumber) lthird_int(ints);
+	groupn = (List *) list_nth(best_path->custom_private, LION_PRIV_GROUPN);
+	groupnattnos = (groupn != NIL) ? (List *) linitial(groupn) : NIL;
 	dist = (List *) list_nth(best_path->custom_private, LION_PRIV_DISTINCT);
 	distattno = (dist != NIL) ? (AttrNumber) linitial_int(dist) : 0;
 
@@ -553,6 +579,9 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 					kind = LION_TL_COUNT_GROUPCOL;
 				else if (groupattno2 != 0 && attno == groupattno2)
 					kind = LION_TL_COUNT_GROUPCOL2;
+				else if ((i = lion_groupn_col(groupnattnos, attno)) > 0)
+					kind = (i == 1) ? LION_TL_COUNT_GROUPCOL2 :
+						LION_TL_COUNT_GROUPCOLN(i);
 				else
 				{
 					for (i = 0; i < list_length(ckinds); i++)
@@ -577,6 +606,8 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				kind = LION_TL_GROUPKEY;
 			else if (groupattno2 != 0 && attno == groupattno2)
 				kind = LION_TL_GROUPKEY2;
+			else if ((i = lion_groupn_col(groupnattnos, attno)) > 0)
+				kind = (i == 1) ? LION_TL_GROUPKEY2 : LION_TL_GROUPKEYN(i);
 			else
 			{
 				/*

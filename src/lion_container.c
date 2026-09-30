@@ -45,6 +45,30 @@
 
 #include "lion_container.h"
 
+/*
+ * pg_always_inline is the newer spelling of pg_attribute_always_inline, and
+ * master's only one; released 16.x and 17.x minors have only the older
+ * (lion_compat.h, which this file does not include, says the same).
+ */
+#ifndef pg_always_inline
+#define pg_always_inline pg_attribute_always_inline
+#endif
+
+/*
+ * The x86-64 kernels of "whole-bitset kernels" below: GCC or clang, whose
+ * __attribute__((target)) compiles them for AVX2 and POPCNT whatever -march
+ * the rest of the extension is built for, and whose __builtin_cpu_supports()
+ * says at run time whether they may run.  LION_NO_SIMD (make
+ * LION_NO_SIMD=1) leaves them out, and every build then runs the portable
+ * kernel.
+ */
+#if !defined(LION_NO_SIMD) && defined(__x86_64__) && \
+	((defined(__clang__) && __clang_major__ >= 6) || \
+	 (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 5))
+#define LION_HAVE_X86_SIMD 1
+#include <immintrin.h>
+#endif
+
 /* All-ones 64-bit word. */
 #define LION_ALL_ONES		UINT64CONST(0xFFFFFFFFFFFFFFFF)
 /* Largest legal lo value. */
@@ -73,8 +97,9 @@ typedef union LionContainerBuf
  * readers do not, on purpose: the count engine reads millions of containers
  * per query, and checking each one again would cost about as much as using it
  * (a BITSET's check is a popcount of all 512 words, 0.8 us, which is what an
- * and_cardinality() of two bitsets costs too).  What a reader does check is
- * the header and the size: lion_inline_fetch() refuses an item whose type is
+ * and_cardinality() of two bitsets costs too - 0.12 and 0.14 us with the
+ * AVX2 kernels of "whole-bitset kernels").  What a reader does check is the
+ * header and the size: lion_inline_fetch() refuses an item whose type is
  * not one of the four or whose lion_item_size() is past the payload or past
  * LION_CONTAINER_MAX_SIZE, and lion_page_item_fetch() does the same for an
  * item on a page, its line pointer included.  So everything in this file is
@@ -244,6 +269,496 @@ container_clamp(LionContainer *c)
 
 
 /* ----------------------------------------------------------------
+ *						whole-bitset kernels
+ *
+ * Every pass over all LION_BITSET_WORDS words of a bitset that counts what
+ * it sees is one call of bits_kernel(d, a, b, op), which reads a (and b),
+ * writes d where the op writes, and returns the popcount of what the op
+ * counts - in one pass:
+ *
+ *	LION_BITS_COUNT			|a|						bits_cardinality()
+ *	LION_BITS_RUNS			a's runs				bits_count_runs()
+ *	LION_BITS_AND_COUNT		|a & b|					and_cardinality()
+ *	LION_BITS_AND			d = a & b, |d|			the set algebra's
+ *	LION_BITS_OR			d = a | b, |d|			bitset results
+ *	LION_BITS_ANDNOT		d = a & ~b, |d|			(container_op_bitset())
+ *	LION_BITS_OR_NEW		d = a | b, |b & ~a|		or_inplace()
+ *
+ * d may be a or b - a word is read before it is written - and otherwise
+ * overlaps neither; the ops that write nothing take NULL.
+ *
+ * Why.  The cardinality of a BITSET x BITSET AND was an AND into a 4 KB
+ * image on the stack and a pg_popcount() of it, and the set algebra's
+ * bitset results a copy of one operand, a pass folding in the other and a
+ * third counting the result; before PostgreSQL 17, pg_popcount() itself
+ * calls pg_popcount64() a word at a time, which on x86-64 is a function
+ * pointer, 512 indirect calls.  Measured through the library (2026-09-30,
+ * Xeon at 2.8 GHz with AVX2 and no VPOPCNTDQ, gcc -O2, PostgreSQL 16's
+ * libpgcommon; one pair of bitsets in L1 / 256 pairs, 2 MB), before ->
+ * AVX2 kernel, POPCNT kernel, in ns:
+ *
+ *	and_cardinality()		775 / 878	->	144 / 255,	202 / 277
+ *	and_raw()				914 / 1182	->	133 / 390,	211 / 407
+ *	or_raw(), andnot_raw()	like and_raw()
+ *	and() (optimizing)		1603 / 1814	->	357 / 623,	601 / 809
+ *	or_inplace()			876 / 887	->	138 / 252,	318 / 333
+ *	bitset_recount()		636 / 641	->	121 / 139,	163 / 166
+ *	optimize(), a BITSET	644 / 651	->	184 / 190,	347 / 351
+ *
+ * PostgreSQL 17 and 18 run POPCNT inside pg_popcount(), which about halves
+ * the "before" of the ones that count through it (and_cardinality() 404 /
+ * 500 ns, bitset_recount() 290 / 289 against an -O1 build of 18's).
+ *
+ * Three implementations, one picked at the first call: bits_kernel starts
+ * as bits_kernel_choose(), which asks the CPU and overwrites the pointer
+ * with its choice, as PostgreSQL's own pg_popcount64 does.
+ *
+ *	- AVX2 (x86-64): 32 bytes at a time, each byte's popcount looked up a
+ *	  nibble at a time in a 16-entry table with VPSHUFB (Mula), the byte
+ *	  counts summed over 16 vectors - at most 128, which a byte holds - and
+ *	  only then added up across the bytes with VPSADBW;
+ *	- POPCNT (x86-64 without AVX2): a word at a time, the builtin compiled
+ *	  for the POPCNT instruction;
+ *	- portable, on every other target and compiler and under LION_NO_SIMD:
+ *	  the same word-at-a-time loop where a word's popcount is an instruction
+ *	  (lion_popcount64()), and what each caller did before this kernel -
+ *	  pg_popcount() of what it counts - where it is not.
+ *
+ * No AVX-512, on purpose: Intel's client CPUs do not have it, AMD's Zen 4
+ * runs it as two 256-bit halves, and outside L1 a pass waits on the cache,
+ * not on the popcount - with the pairs cycling through 2 MB the AVX2 kernel
+ * is within a tenth of the POPCNT one above - so a fourth implementation
+ * to test would buy little beyond a hot L1.  (pg_popcount() uses VPOPCNTDQ
+ * where it finds it, from PostgreSQL 17 on, and the portable kernel on x86
+ * counts through it.)
+ *
+ * The x86-64 kernels are compiled with __attribute__((target)), so the
+ * extension builds with the default -march and runs on any x86-64;
+ * __builtin_cpu_supports("avx2") also checks that the OS saves the AVX
+ * registers.  Every implementation returns the same count and writes the
+ * same words: which one runs changes the time a pass takes, nothing else.
+ * lion_container_simd_force() makes a -DFRONTEND build use a given one, for
+ * test/unit/container_test.c, which compares each against a reference; the
+ * unit tests are also built with -DLION_NO_SIMD, which leaves only the
+ * portable one (container_test_nosimd).
+ * ----------------------------------------------------------------
+ */
+
+typedef uint32 (*LionBitsKernel) (uint64 *d, const uint64 *a, const uint64 *b,
+								  LionBitsOp op);
+
+/*
+ * The portable kernel's popcount of a word.  __builtin_popcountll() is an
+ * instruction where the build's target has one - CNT on aarch64, POPCNT on
+ * an x86 build for a CPU that has it (-mpopcnt, -march=native) - and there
+ * the portable kernel is a fused loop like the POPCNT kernel's
+ * (LION_POPCOUNT64_INLINE).  On x86 built for the baseline ISA the builtin is
+ * a call into libgcc's table lookup, and pg_popcount64() either the POPCNT
+ * instruction behind a function pointer (before PostgreSQL 19) or a dozen
+ * instructions inline (19 on): a fused loop of those took 640 - 900 ns
+ * where the stored result and one pg_popcount() of it take what they did
+ * before this kernel (bits_kernel_portable()).  So does a compiler without
+ * the builtin.
+ */
+#if (defined(__GNUC__) || defined(__clang__)) && \
+	(defined(__POPCNT__) || !(defined(__x86_64__) || defined(__i386__)))
+#define LION_POPCOUNT64_INLINE 1
+#define lion_popcount64(w)	((uint32) __builtin_popcountll(w))
+#else
+#define lion_popcount64(w)	((uint32) pg_popcount64(w))
+#endif
+
+/*
+ * The word-at-a-time kernels' popcount: POPCNT's own when hw (the POPCNT
+ * kernel, compiled for the instruction), else lion_popcount64().
+ */
+#ifdef LION_HAVE_X86_SIMD
+#define bits_popcount(hw, w) \
+	((hw) ? (uint32) __builtin_popcountll(w) : lion_popcount64(w))
+#else
+#define bits_popcount(hw, w)	lion_popcount64(w)
+#endif
+
+/*
+ * Word i of a pass: writes d[i] for the ops that write, and returns the word
+ * whose bits the op counts.
+ */
+static pg_always_inline uint64
+bits_word(uint64 *d, const uint64 *a, const uint64 *b, uint32 i,
+		  LionBitsOp op)
+{
+	uint64		x = a[i];
+	uint64		r;
+
+	switch (op)
+	{
+		case LION_BITS_COUNT:
+			return x;
+		case LION_BITS_RUNS:
+			/* a run starts at a set bit whose predecessor is clear */
+			return x & ~((x << 1) | (i > 0 ? a[i - 1] >> 63 : 0));
+		case LION_BITS_AND_COUNT:
+			return x & b[i];
+		case LION_BITS_AND:
+			r = x & b[i];
+			break;
+		case LION_BITS_OR:
+			r = x | b[i];
+			break;
+		case LION_BITS_ANDNOT:
+			r = x & ~b[i];
+			break;
+		case LION_BITS_OR_NEW:
+			{
+				uint64		y = b[i];
+
+				d[i] = x | y;
+				return y & ~x;
+			}
+		default:
+			pg_unreachable();
+	}
+	d[i] = r;
+	return r;
+}
+
+/*
+ * A pass a word at a time, op being a constant wherever this is inlined.
+ * Four sums, so that neither their adds nor POPCNT's false dependency on its
+ * destination (Intel, before Cannon Lake) chain the words: with one sum the
+ * POPCNT AND_COUNT took 350 ns, with four 207.
+ */
+static pg_always_inline uint32
+bits_pass_words(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
+				bool hw)
+{
+	uint64		n0 = 0;
+	uint64		n1 = 0;
+	uint64		n2 = 0;
+	uint64		n3 = 0;
+	uint32		i;
+
+	for (i = 0; i < LION_BITSET_WORDS; i += 4)
+	{
+		n0 += bits_popcount(hw, bits_word(d, a, b, i, op));
+		n1 += bits_popcount(hw, bits_word(d, a, b, i + 1, op));
+		n2 += bits_popcount(hw, bits_word(d, a, b, i + 2, op));
+		n3 += bits_popcount(hw, bits_word(d, a, b, i + 3, op));
+	}
+	return (uint32) (n0 + n1 + n2 + n3);
+}
+
+#ifndef LION_POPCOUNT64_INLINE
+/*
+ * A pass that stores its result in d and counts it with one pg_popcount():
+ * the portable kernel's where a word's popcount is not an instruction.
+ */
+static pg_always_inline uint32
+bits_pass_stored(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op)
+{
+	uint32		i;
+
+	for (i = 0; i < LION_BITSET_WORDS; i++)
+		(void) bits_word(d, a, b, i, op);
+	return (uint32) pg_popcount((const char *) d, LION_BITSET_BYTES);
+}
+#endif
+
+/*
+ * The portable kernel.  Where a word's popcount is an instruction
+ * (LION_POPCOUNT64_INLINE) every pass is a fused loop, which clang turns
+ * into NEON's CNT and pairwise adds on aarch64.  Elsewhere each pass is what
+ * its caller did before this kernel: a lone count one pg_popcount(), an op
+ * that makes a result stores it (AND_COUNT in an image of its own) and
+ * counts it with pg_popcount(), and RUNS and OR_NEW take a pg_popcount64()
+ * a word.
+ */
+static uint32
+bits_kernel_portable(uint64 *d, const uint64 *a, const uint64 *b,
+					 LionBitsOp op)
+{
+#ifndef LION_POPCOUNT64_INLINE
+	uint64		img[LION_BITSET_WORDS];
+#endif
+
+	switch (op)
+	{
+		case LION_BITS_RUNS:
+			return bits_pass_words(d, a, b, LION_BITS_RUNS, false);
+		case LION_BITS_OR_NEW:
+			return bits_pass_words(d, a, b, LION_BITS_OR_NEW, false);
+#ifdef LION_POPCOUNT64_INLINE
+		case LION_BITS_COUNT:
+			return bits_pass_words(d, a, b, LION_BITS_COUNT, false);
+		case LION_BITS_AND_COUNT:
+			return bits_pass_words(d, a, b, LION_BITS_AND_COUNT, false);
+		case LION_BITS_AND:
+			return bits_pass_words(d, a, b, LION_BITS_AND, false);
+		case LION_BITS_OR:
+			return bits_pass_words(d, a, b, LION_BITS_OR, false);
+		case LION_BITS_ANDNOT:
+			return bits_pass_words(d, a, b, LION_BITS_ANDNOT, false);
+#else
+		case LION_BITS_COUNT:
+			return (uint32) pg_popcount((const char *) a, LION_BITSET_BYTES);
+		case LION_BITS_AND_COUNT:
+			return bits_pass_stored(img, a, b, LION_BITS_AND);
+		case LION_BITS_AND:
+			return bits_pass_stored(d, a, b, LION_BITS_AND);
+		case LION_BITS_OR:
+			return bits_pass_stored(d, a, b, LION_BITS_OR);
+		case LION_BITS_ANDNOT:
+			return bits_pass_stored(d, a, b, LION_BITS_ANDNOT);
+#endif
+	}
+	Assert(false);
+	return 0;
+}
+
+#ifdef LION_HAVE_X86_SIMD
+
+#define LION_TARGET(isa)	__attribute__((target(isa)))
+
+static LION_TARGET("popcnt") uint32
+bits_kernel_popcnt(uint64 *d, const uint64 *a, const uint64 *b,
+				   LionBitsOp op)
+{
+	switch (op)
+	{
+		case LION_BITS_COUNT:
+			return bits_pass_words(d, a, b, LION_BITS_COUNT, true);
+		case LION_BITS_RUNS:
+			return bits_pass_words(d, a, b, LION_BITS_RUNS, true);
+		case LION_BITS_AND_COUNT:
+			return bits_pass_words(d, a, b, LION_BITS_AND_COUNT, true);
+		case LION_BITS_AND:
+			return bits_pass_words(d, a, b, LION_BITS_AND, true);
+		case LION_BITS_OR:
+			return bits_pass_words(d, a, b, LION_BITS_OR, true);
+		case LION_BITS_ANDNOT:
+			return bits_pass_words(d, a, b, LION_BITS_ANDNOT, true);
+		case LION_BITS_OR_NEW:
+			return bits_pass_words(d, a, b, LION_BITS_OR_NEW, true);
+	}
+	Assert(false);
+	return 0;
+}
+
+/* Words i .. i + 3 of w; a bitset payload is only 8-byte aligned. */
+static pg_always_inline LION_TARGET("avx2") __m256i
+bits_avx2_load(const uint64 *w, uint32 i)
+{
+	return _mm256_loadu_si256((const __m256i *) (w + i));
+}
+
+static pg_always_inline LION_TARGET("avx2") void
+bits_avx2_store(uint64 *w, uint32 i, __m256i v)
+{
+	_mm256_storeu_si256((__m256i *) (w + i), v);
+}
+
+/* The popcount of each byte of v, 0 .. 8: two nibbles looked up (Mula). */
+static pg_always_inline LION_TARGET("avx2") __m256i
+bits_avx2_byte_counts(__m256i v)
+{
+	const __m256i lut = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3,
+										 1, 2, 2, 3, 2, 3, 3, 4,
+										 0, 1, 1, 2, 1, 2, 2, 3,
+										 1, 2, 2, 3, 2, 3, 3, 4);
+	const __m256i nibble = _mm256_set1_epi8(0x0f);
+	__m256i		lo = _mm256_and_si256(v, nibble);
+	__m256i		hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), nibble);
+
+	return _mm256_add_epi8(_mm256_shuffle_epi8(lut, lo),
+						   _mm256_shuffle_epi8(lut, hi));
+}
+
+/* Words i .. i + 3 of a pass: bits_word() four words at a time. */
+static pg_always_inline LION_TARGET("avx2") __m256i
+bits_avx2_vector(uint64 *d, const uint64 *a, const uint64 *b, uint32 i,
+				 LionBitsOp op)
+{
+	__m256i		x = bits_avx2_load(a, i);
+	__m256i		r;
+
+	switch (op)
+	{
+		case LION_BITS_COUNT:
+			return x;
+		case LION_BITS_RUNS:
+			{
+				/* the words before a[i .. i + 3]; none before a[0] */
+				__m256i		prev = (i > 0) ? bits_avx2_load(a, i - 1) :
+					_mm256_setr_epi64x(0, (long long) a[0], (long long) a[1],
+									   (long long) a[2]);
+
+				return _mm256_andnot_si256(_mm256_or_si256(_mm256_slli_epi64(x, 1),
+														   _mm256_srli_epi64(prev, 63)),
+										   x);
+			}
+		case LION_BITS_AND_COUNT:
+			return _mm256_and_si256(x, bits_avx2_load(b, i));
+		case LION_BITS_AND:
+			r = _mm256_and_si256(x, bits_avx2_load(b, i));
+			break;
+		case LION_BITS_OR:
+			r = _mm256_or_si256(x, bits_avx2_load(b, i));
+			break;
+		case LION_BITS_ANDNOT:
+			r = _mm256_andnot_si256(bits_avx2_load(b, i), x);
+			break;
+		case LION_BITS_OR_NEW:
+			{
+				__m256i		y = bits_avx2_load(b, i);
+
+				bits_avx2_store(d, i, _mm256_or_si256(x, y));
+				return _mm256_andnot_si256(x, y);
+			}
+		default:
+			pg_unreachable();
+	}
+	bits_avx2_store(d, i, r);
+	return r;
+}
+
+/* The words a pass sums in bytes before it adds them up: 16 vectors. */
+#define LION_AVX2_BLOCK_WORDS	64
+StaticAssertDecl(LION_BITSET_WORDS % LION_AVX2_BLOCK_WORDS == 0,
+				 "the AVX2 kernel takes whole blocks");
+
+static pg_always_inline LION_TARGET("avx2") uint32
+bits_pass_avx2(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op)
+{
+	__m256i		total = _mm256_setzero_si256();
+	__m128i		sum;
+	uint32		i;
+	uint32		j;
+
+	for (i = 0; i < LION_BITSET_WORDS; i += LION_AVX2_BLOCK_WORDS)
+	{
+		__m256i		bytes = _mm256_setzero_si256();
+
+		for (j = 0; j < LION_AVX2_BLOCK_WORDS; j += 4)
+			bytes = _mm256_add_epi8(bytes,
+									bits_avx2_byte_counts(bits_avx2_vector(d, a, b, i + j, op)));
+		total = _mm256_add_epi64(total,
+								 _mm256_sad_epu8(bytes, _mm256_setzero_si256()));
+	}
+	sum = _mm_add_epi64(_mm256_castsi256_si128(total),
+						_mm256_extracti128_si256(total, 1));
+	return (uint32) (_mm_cvtsi128_si64(sum) + _mm_extract_epi64(sum, 1));
+}
+
+static LION_TARGET("avx2") uint32
+bits_kernel_avx2(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op)
+{
+	switch (op)
+	{
+		case LION_BITS_COUNT:
+			return bits_pass_avx2(d, a, b, LION_BITS_COUNT);
+		case LION_BITS_RUNS:
+			return bits_pass_avx2(d, a, b, LION_BITS_RUNS);
+		case LION_BITS_AND_COUNT:
+			return bits_pass_avx2(d, a, b, LION_BITS_AND_COUNT);
+		case LION_BITS_AND:
+			return bits_pass_avx2(d, a, b, LION_BITS_AND);
+		case LION_BITS_OR:
+			return bits_pass_avx2(d, a, b, LION_BITS_OR);
+		case LION_BITS_ANDNOT:
+			return bits_pass_avx2(d, a, b, LION_BITS_ANDNOT);
+		case LION_BITS_OR_NEW:
+			return bits_pass_avx2(d, a, b, LION_BITS_OR_NEW);
+	}
+	Assert(false);
+	return 0;
+}
+
+/* The best kernel this CPU runs. */
+static LionBitsKernel
+bits_kernel_best(void)
+{
+	/* a no-op after libgcc's constructor, which has run by any first call */
+	__builtin_cpu_init();
+	if (__builtin_cpu_supports("avx2"))
+		return bits_kernel_avx2;
+	if (__builtin_cpu_supports("popcnt"))
+		return bits_kernel_popcnt;
+	return bits_kernel_portable;
+}
+
+static uint32 bits_kernel_choose(uint64 *d, const uint64 *a, const uint64 *b,
+								 LionBitsOp op);
+
+static LionBitsKernel bits_kernel = bits_kernel_choose;
+
+static uint32
+bits_kernel_choose(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op)
+{
+	bits_kernel = bits_kernel_best();
+	return bits_kernel(d, a, b, op);
+}
+
+#else							/* !LION_HAVE_X86_SIMD */
+
+#define bits_kernel(d, a, b, op)	bits_kernel_portable((d), (a), (b), (op))
+
+#endif							/* LION_HAVE_X86_SIMD */
+
+#ifdef FRONTEND
+bool
+lion_container_simd_force(LionSimdImpl impl)
+{
+#ifdef LION_HAVE_X86_SIMD
+	__builtin_cpu_init();
+	switch (impl)
+	{
+		case LION_SIMD_AUTO:
+			bits_kernel = bits_kernel_best();
+			return true;
+		case LION_SIMD_PORTABLE:
+			bits_kernel = bits_kernel_portable;
+			return true;
+		case LION_SIMD_POPCNT:
+			if (!__builtin_cpu_supports("popcnt"))
+				return false;
+			bits_kernel = bits_kernel_popcnt;
+			return true;
+		case LION_SIMD_AVX2:
+			if (!__builtin_cpu_supports("avx2"))
+				return false;
+			bits_kernel = bits_kernel_avx2;
+			return true;
+	}
+	return false;
+#else
+	return impl == LION_SIMD_AUTO || impl == LION_SIMD_PORTABLE;
+#endif
+}
+
+uint32
+lion_container_bits_pass(LionBitsOp op, uint64 *d, const uint64 *a,
+						 const uint64 *b)
+{
+	return bits_kernel(d, a, b, op);
+}
+
+LionSimdImpl
+lion_container_simd_current(void)
+{
+#ifdef LION_HAVE_X86_SIMD
+	if (bits_kernel == bits_kernel_choose)
+		bits_kernel = bits_kernel_best();
+	if (bits_kernel == bits_kernel_avx2)
+		return LION_SIMD_AVX2;
+	if (bits_kernel == bits_kernel_popcnt)
+		return LION_SIMD_POPCNT;
+#endif
+	return LION_SIMD_PORTABLE;
+}
+#endif							/* FRONTEND */
+
+
+/* ----------------------------------------------------------------
  *						bitset primitives
  *
  * These all operate on a bare array of LION_BITSET_WORDS uint64s.
@@ -322,16 +837,18 @@ bits_clear_range(uint64 *w, uint32 lo, uint32 hi)
 }
 
 /*
- * One pg_popcount() over the whole bitset rather than a pg_popcount64() per
- * word: on x86-64 before PostgreSQL 19 pg_popcount64 is a function pointer,
- * so the per-word loop made 512 indirect calls, where pg_popcount() makes
- * one and runs the hardware instruction (or AVX-512) inside it.  Measured on
- * PostgreSQL 18, x86-64 with POPCNT (2026-09-25): 768 ns -> 612 ns.
+ * The number of set bits: a kernel pass (LION_BITS_COUNT).  It was one
+ * pg_popcount() of the whole bitset rather than a pg_popcount64() a word,
+ * which on x86-64 before PostgreSQL 19 is a function pointer, so the loop
+ * made 512 indirect calls where pg_popcount() makes one: 768 ns -> 612 ns
+ * on PostgreSQL 18 (2026-09-25).  The kernel pass takes 121 ns with AVX2
+ * and 163 with POPCNT, against 636 for PostgreSQL 16's pg_popcount() and 290
+ * for 18's (2026-09-30, "whole-bitset kernels").
  */
 static inline uint32
 bits_cardinality(const uint64 *w)
 {
-	return (uint32) pg_popcount((const char *) w, LION_BITSET_BYTES);
+	return bits_kernel(NULL, w, NULL, LION_BITS_COUNT);
 }
 
 static uint32
@@ -355,28 +872,18 @@ bits_range_cardinality(const uint64 *w, uint32 lo, uint32 hi)
 
 /*
  * Number of maximal runs of consecutive set bits.  A bit starts a run if it
- * is set and its predecessor is not, so count those in a word-parallel way.
+ * is set and its predecessor is not, so count those in a word-parallel way:
+ * a kernel pass (LION_BITS_RUNS).  It was a pg_popcount64() a word - an
+ * image of the run starts counted by one pg_popcount(), as bits_cardinality()
+ * did, cost more than the calls it saved (1.22 us against 0.92,
+ * 2026-09-25).  The kernel pass takes 184 ns with AVX2 and 347 with POPCNT,
+ * against 644 (2026-09-30: the optimize() of a BITSET that stays one, which
+ * is mostly this).
  */
-static uint32
+static inline uint32
 bits_count_runs(const uint64 *w)
 {
-	uint32		nruns = 0;
-	uint64		prev = 0;
-	uint32		i;
-
-	/*
-	 * Word by word, not an image of the run starts counted by one
-	 * pg_popcount() as bits_cardinality() does: writing the 4 KB image cost
-	 * more than the calls it saved (1.22 us against 0.92, 2026-09-25).
-	 */
-	for (i = 0; i < LION_BITSET_WORDS; i++)
-	{
-		uint64		cur = w[i];
-
-		nruns += (uint32) pg_popcount64(cur & ~((cur << 1) | prev));
-		prev = cur >> 63;
-	}
-	return nruns;
+	return bits_kernel(NULL, w, NULL, LION_BITS_RUNS);
 }
 
 /*
@@ -748,6 +1255,49 @@ container_fill_bitset(const LionContainer *c, uint64 *w)
 		memset(w, 0, LION_BITSET_BYTES);
 		container_or_bitset(c, w);
 	}
+}
+
+/*
+ * w = a AND, OR or ANDNOT b (op LION_BITS_AND, _OR or _ANDNOT), and its
+ * cardinality: the set algebra's bitset results.  When b is a BITSET, the
+ * op and the count are one kernel pass, which reads a's payload itself when
+ * a is a BITSET too - the AND of two BITSETs used to be a 4 KB copy of one,
+ * a pass ANDing in the other and a third counting the result - and a filled
+ * into w otherwise.  Other b's are folded into a filled w, which is then
+ * counted.  w overlaps neither operand.
+ */
+static uint32
+container_op_bitset(const LionContainer *a, const LionContainer *b,
+					LionBitsOp op, uint64 *w)
+{
+	if (b->type == LION_CT_BITSET)
+	{
+		const uint64 *src = w;
+
+		if (a->type == LION_CT_BITSET)
+			src = bitset_cdata(a);
+		else
+			container_fill_bitset(a, w);
+		return bits_kernel(w, src, bitset_cdata(b), op);
+	}
+
+	container_fill_bitset(a, w);
+	switch (op)
+	{
+		case LION_BITS_AND:
+			container_and_bitset(b, w);
+			break;
+		case LION_BITS_OR:
+			container_or_bitset(b, w);
+			break;
+		case LION_BITS_ANDNOT:
+			container_andnot_bitset(b, w);
+			break;
+		default:
+			Assert(false);
+			break;
+	}
+	return bits_cardinality(w);
 }
 
 /* Number of maximal runs of consecutive members, whatever the type. */
@@ -1548,16 +2098,9 @@ lion_container_or_inplace(LionContainer *acc, const LionContainer *c)
 				break;
 			}
 		case LION_CT_BITSET:
-			{
-				const uint64 *src = bitset_cdata(c);
-
-				for (i = 0; i < LION_BITSET_WORDS; i++)
-				{
-					added += (uint32) pg_popcount64(src[i] & ~w[i]);
-					w[i] |= src[i];
-				}
-				break;
-			}
+			/* the OR and the count of what was new, one kernel pass */
+			added = bits_kernel(w, w, bitset_cdata(c), LION_BITS_OR_NEW);
+			break;
 		case LION_CT_RUN:
 			{
 				const LionRun *runs = run_cdata(c);
@@ -2688,12 +3231,9 @@ lion_container_and(const LionContainer *a, const LionContainer *b,
 	}
 	else
 	{
-		uint64	   *w = bitset_mdata(o);
-
-		container_fill_bitset(a, w);
-		container_and_bitset(b, w);
 		o->type = LION_CT_BITSET;
-		o->cardinality = (uint16) bits_cardinality(w);
+		o->cardinality = (uint16) container_op_bitset(a, b, LION_BITS_AND,
+													  bitset_mdata(o));
 	}
 	return container_emit_result(o, dest);
 }
@@ -2727,12 +3267,9 @@ lion_container_or(const LionContainer *a, const LionContainer *b,
 	}
 	else
 	{
-		uint64	   *w = bitset_mdata(o);
-
-		container_fill_bitset(a, w);
-		container_or_bitset(b, w);
 		o->type = LION_CT_BITSET;
-		o->cardinality = (uint16) bits_cardinality(w);
+		o->cardinality = (uint16) container_op_bitset(a, b, LION_BITS_OR,
+													  bitset_mdata(o));
 	}
 	return container_emit_result(o, dest);
 }
@@ -2773,12 +3310,9 @@ lion_container_andnot(const LionContainer *a, const LionContainer *b,
 	}
 	else
 	{
-		uint64	   *w = bitset_mdata(o);
-
-		container_fill_bitset(a, w);
-		container_andnot_bitset(b, w);
 		o->type = LION_CT_BITSET;
-		o->cardinality = (uint16) bits_cardinality(w);
+		o->cardinality = (uint16) container_op_bitset(a, b, LION_BITS_ANDNOT,
+													  bitset_mdata(o));
 	}
 	return container_emit_result(o, dest);
 }
@@ -2841,25 +3375,17 @@ lion_container_and_raw(const LionContainer *a, const LionContainer *b,
 		run_and_run(a, b, dest))
 		return dest->cardinality;
 
-	{
-		uint64	   *w = bitset_mdata(dest);
-
-		/* a BITSET operand is copied and the other ANDed in */
-		if (b->type == LION_CT_BITSET)
-		{
-			container_fill_bitset(b, w);
-			container_and_bitset(a, w);
-		}
-		else
-		{
-			container_fill_bitset(a, w);
-			container_and_bitset(b, w);
-		}
-		dest->type = LION_CT_BITSET;
-		n = bits_cardinality(w);
-		dest->cardinality = (uint16) n;
-		return n;
-	}
+	/*
+	 * A BITSET operand is copied and the other ANDed in; two BITSETs are
+	 * ANDed and counted in one pass (container_op_bitset()).
+	 */
+	if (b->type == LION_CT_BITSET)
+		n = container_op_bitset(b, a, LION_BITS_AND, bitset_mdata(dest));
+	else
+		n = container_op_bitset(a, b, LION_BITS_AND, bitset_mdata(dest));
+	dest->type = LION_CT_BITSET;
+	dest->cardinality = (uint16) n;
+	return n;
 }
 
 uint32
@@ -2898,16 +3424,10 @@ lion_container_andnot_raw(const LionContainer *a, const LionContainer *b,
 		return n;
 	}
 
-	{
-		uint64	   *w = bitset_mdata(dest);
-
-		container_fill_bitset(a, w);
-		container_andnot_bitset(b, w);
-		dest->type = LION_CT_BITSET;
-		n = bits_cardinality(w);
-		dest->cardinality = (uint16) n;
-		return n;
-	}
+	n = container_op_bitset(a, b, LION_BITS_ANDNOT, bitset_mdata(dest));
+	dest->type = LION_CT_BITSET;
+	dest->cardinality = (uint16) n;
+	return n;
 }
 
 uint32
@@ -2937,16 +3457,10 @@ lion_container_or_raw(const LionContainer *a, const LionContainer *b,
 		return dest->cardinality;
 	}
 
-	{
-		uint64	   *w = bitset_mdata(dest);
-
-		container_fill_bitset(a, w);
-		container_or_bitset(b, w);
-		dest->type = LION_CT_BITSET;
-		n = bits_cardinality(w);
-		dest->cardinality = (uint16) n;
-		return n;
-	}
+	n = container_op_bitset(a, b, LION_BITS_OR, bitset_mdata(dest));
+	dest->type = LION_CT_BITSET;
+	dest->cardinality = (uint16) n;
+	return n;
 }
 
 /*
@@ -3259,6 +3773,12 @@ lion_container_bitset_recount(LionContainer *c)
 }
 
 uint32
+lion_container_image_cardinality(const uint64 *w)
+{
+	return bits_cardinality(w);
+}
+
+uint32
 lion_container_and_cardinality(const LionContainer *a, const LionContainer *b)
 {
 	Assert(a->ckey == b->ckey);
@@ -3267,24 +3787,17 @@ lion_container_and_cardinality(const LionContainer *a, const LionContainer *b)
 		return 0;
 
 	/*
-	 * BITSET x BITSET: AND into a local image, then one popcount of it
-	 * (bits_cardinality()).  Popcounting the ANDed words one at a time
-	 * materialised nothing but made 512 indirect calls on x86-64 before
-	 * PostgreSQL 19; the AND loop vectorizes and the image is 4 KB of stack.
-	 * 920 ns -> 837 ns on the machine bits_cardinality() was measured on; a
-	 * review measured 2.3 - 3.8 us -> 1.2 us on another.
+	 * BITSET x BITSET: the AND counted as it is made, nothing stored (a
+	 * kernel pass, LION_BITS_AND_COUNT).  Popcounting the ANDed words one
+	 * pg_popcount64() at a time made 512 indirect calls on x86-64 before
+	 * PostgreSQL 19 (2.3 - 3.8 us in a review); an AND into a 4 KB image on
+	 * the stack and one pg_popcount() of it took 837 ns, and 775 on the
+	 * machine the kernels were measured on (404 with PostgreSQL 18's
+	 * pg_popcount()), where they take 144 ns with AVX2 and 202 with POPCNT.
 	 */
 	if (a->type == LION_CT_BITSET && b->type == LION_CT_BITSET)
-	{
-		const uint64 *wa = bitset_cdata(a);
-		const uint64 *wb = bitset_cdata(b);
-		uint64		w[LION_BITSET_WORDS];
-		uint32		i;
-
-		for (i = 0; i < LION_BITSET_WORDS; i++)
-			w[i] = wa[i] & wb[i];
-		return bits_cardinality(w);
-	}
+		return bits_kernel(NULL, bitset_cdata(a), bitset_cdata(b),
+						   LION_BITS_AND_COUNT);
 
 	if (a->type == LION_CT_ARRAY || b->type == LION_CT_ARRAY)
 	{

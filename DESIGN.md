@@ -143,7 +143,8 @@ Representation policy
 **Damaged containers** (2026-09-25 review). A container read from disk is data, and a reader checks
 its header and its size (`lion_inline_fetch()`) - not its payload: `lion_container_check()` costs as
 much as using the container (0.8 us for a BITSET, a popcount of all 512 words, which is what an
-and-cardinality of two bitsets costs), and the count engine reads millions per query. The library
+and-cardinality of two bitsets costs; 0.12 and 0.14 us with the AVX2 kernels below), and the count
+engine reads millions per query. The library
 used to trust the payload as far as its own buffers went, and a review found, with AddressSanitizer,
 three ways a container that passes the size check wrote outside one: an ARRAY member of 32768 or
 more indexed a bitset word past the 512th (65535 wrote 4 KB past a 4104-byte stack buffer), a run
@@ -212,6 +213,85 @@ deletes in place alone in the bytes the page allots it (`lion_page_check_alone()
 in-place insert, a replacement and VACUUM's delete), and the directory entry a record rewrites a
 whole one, of exactly its size when it is a CHAIN entry (`lion_page_entry_fetch()`). Each is an
 ERROR (INDEX_CORRUPTED), and verify() reports an overlap too. `test/sql/corrupt_items.sql`.
+
+**Whole-bitset kernels** (2026-09-30). Every pass over all 512 words of a BITSET that counts what it
+sees is one call of a fused kernel (lion_container.c, "whole-bitset kernels"), which reads the
+operands, writes the result if the operation has one and counts, in the same pass:
+
+| pass | what | callers |
+|---|---|---|
+| COUNT | a BITSET's cardinality | `lion_container_bitset_recount()`, `lion_container_check()`, the count engine's OR images (`lion_bits_to_container()`, through `lion_container_image_cardinality()`), `lion_container_add_many()` |
+| RUNS | the number of its runs | `lion_container_optimize()` of a BITSET, and a RUN rebuilt by `remove_if()` |
+| AND_COUNT | the cardinality of a BITSET x BITSET AND, nothing stored | `lion_container_and_cardinality()` |
+| AND, OR, ANDNOT | the result written and counted | `lion_container_and()`, `_or()`, `_andnot()` and their `_raw` twins, when the right operand is a BITSET: two BITSETs read straight from their payloads, a RUN or an ARRAY on the left filled into the result first |
+| OR_NEW | a BITSET ORed into one in place, the new members counted | `lion_container_or_inplace()` (§32's dense unions) |
+
+Before, the AND of two BITSETs was a 4 KB copy of one, a pass ANDing in the other and a
+`pg_popcount()` of the result, `and_cardinality()` an AND into a 4 KB stack image and a
+`pg_popcount()` of it, and the run count and the in-place OR a `pg_popcount64()` a word - which on
+x86-64 before PostgreSQL 19 is an indirect call, as is every word of `pg_popcount()` itself before
+17. There are three implementations, picked once per process at the first call: a static function
+pointer starts at a resolver, which asks `__builtin_cpu_supports()` and overwrites the pointer with
+its choice, as PostgreSQL's own `pg_popcount64` does:
+
+- **AVX2** (x86-64): Muła's popcount - each byte's count looked up a nibble at a time in a 16-entry
+  table with VPSHUFB - summed in bytes over 16 vectors, at most 128 a byte, before one VPSADBW;
+- **POPCNT** (x86-64 without AVX2): a word at a time, four sums;
+- **portable**, on every other target and compiler and under `make LION_NO_SIMD=1`: the same
+  word-at-a-time loop where `__builtin_popcountll()` is an instruction (CNT on aarch64, which clang
+  vectorizes with NEON), and what each caller did before - a `pg_popcount()` of what it counts - where
+  it is not (x86 built for its baseline ISA, where the builtin is libgcc's table).
+
+The x86-64 kernels are GCC's and clang's `__attribute__((target("avx2")))` and `("popcnt")`, so the
+extension builds with the default `-march` and runs on any x86-64; `__builtin_cpu_supports("avx2")`
+also checks that the OS saves the AVX registers. **No AVX-512**, on purpose: Intel's client CPUs lack
+it, AMD's Zen 4 runs it as two 256-bit halves, and outside L1 a pass waits on the cache rather than
+the popcount - with the operands cycling through 2 MB the AVX2 kernel is within a tenth of the POPCNT
+one - so a fourth implementation to test would buy little beyond a hot L1. (`pg_popcount()` itself
+uses VPOPCNTDQ where it finds it, from PostgreSQL 17 on, and the portable kernel on x86 counts
+through it.) Every implementation gives the same counts and writes the same words, so the same
+representations are chosen and plans do not change (the golden plans of the regression suite are
+identical).
+
+Measured through the library (a harness beside it; Xeon at 2.8 GHz with AVX2 and no VPOPCNTDQ, gcc
+-O2, PostgreSQL 16's libpgcommon; one pair of bitsets of 30% and 50% density in L1 / 256 pairs, 2
+MB), in ns:
+
+| call | before | AVX2 | POPCNT |
+|---|---|---|---|
+| `and_cardinality()` | 775 / 878 | 144 / 255 | 202 / 277 |
+| `and_raw()` (`or_raw()`, `andnot_raw()` alike) | 914 / 1182 | 133 / 390 | 211 / 407 |
+| `and()`, optimizing | 1603 / 1814 | 357 / 623 | 601 / 809 |
+| `or_inplace()` | 876 / 887 | 138 / 252 | 318 / 333 |
+| `bitset_recount()` | 636 / 641 | 121 / 139 | 163 / 166 |
+| `optimize()` of a BITSET that stays one | 644 / 651 | 184 / 190 | 347 / 351 |
+
+PostgreSQL 17 and 18 run POPCNT inside `pg_popcount()`, which about halves the "before" of what
+counts through it (`and_cardinality()` 404 / 500 ns, `bitset_recount()` 290 against an -O1 build of
+18's libpgcommon). End to end, on the assert-enabled PostgreSQL 18 build (-O1), 10M rows of three
+random 0/1 columns with a lion index each, all-visible, 845 container keys, a count's backend CPU
+time (600 runs in one session, medians of three rounds alternating the builds, on a shared and
+busy machine): `WHERE a = 1 AND b = 1` 3.85 -> 2.68 ms, `AND c = 1` too 6.12 -> 4.12 ms, `a = 1 OR
+b = 1` 4.22 -> 3.27 ms - a fifth to a third less.
+
+Left as they were, with a reason each: a partial range's count (`bits_range_cardinality()`: a RUN
+against a BITSET a run at a time, `range_cardinality()`, `remove_range()`, a RUN ORed in place),
+which is a few words per call; the count near the cap in `bits_extract_array()`; and the bitmap
+scan's window, which ANDs an image into another and then hands it to `lion_bits_to_container()`,
+whose count is the kernel's now but a second pass (`lion_scan.c`, `lion_source_window_next()`). The
+cost model is unchanged: its fitted constants (§10, "The merge": a bitset costs what an array of a
+thousand members does, 800 ns) were measured with the old passes and now overcharge a dense count
+somewhat, which a refit may take up with the rest of the model.
+
+`lion_container_simd_force()` (a `-DFRONTEND` build only) makes the library use a given
+implementation: the unit tests force each one the build and CPU have, check every pass against a
+reference that counts a bit at a time - 22 x 22 pairs of patterns: empty, full, densities from 0.05%
+to 99.95%, the first or last bit of every word, runs across words and across the AVX2 kernel's
+16-vector blocks - in exact-size heap buffers at every 8-byte alignment modulo 32, check what the
+public functions make of them (counts, words, and the representation the optimizing forms choose,
+against the policy above), and rerun the set algebra of every type pair under it.
+`test/unit/container_test_nosimd` is the same program built with `-DLION_NO_SIMD` (and `-mpopcnt`
+on an x86-64 host, which makes its portable kernel the fused loop other architectures run).
 
 Full API: `src/lion_container.h`. Unit tests: `test/unit/container_test.c` (`make unit`), which must
 cover every type transition, boundary cardinalities (0, 1, 2047, 2048, 2049, 32767, 32768 members),
@@ -4920,7 +5000,7 @@ entries. Everything §10 says about ONE grouping column is said again per column
 index, its own collation, its own grouping equality (`SortGroupClause.eqop` = strategy 1 of that
 index's opfamily), its own value-representation gate (`lion_index_can_emit_value()` when the key is
 printed), and - for a partitioned parent - all of that per partition. Three or more columns are
-declined; so is the same column twice.
+the decoded walk of §34; the same column twice is declined.
 
 **Which one drives.** The column with FEWER estimated distinct values is the OUTER one: its entry
 scan drives the node exactly as a single group column's does, and the other index is the INNER one.
@@ -15924,3 +16004,148 @@ does not know, so the rest of it runs with the setting off.
 - Dead row versions count until VACUUM (above).
 - An index whose meta page predates this section supplies nothing until a build, a VACUUM that
   deletes, or an ANALYZE within the bound has counted it.
+
+## 34. GROUP BY three or more indexed columns: the decoded walk (implemented 2026-09-30)
+
+`SELECT a, b, c, count(*) FROM t [WHERE ...] GROUP BY a, b, c`, up to `LION_MAX_GROUPCOLS` (8)
+columns - and two, where it is cheaper than §20's nested loop - each a column of a scalar lion index - the same one (§24) or several - under the same
+per-column rules as §20's two: its own index, collation, grouping equality and value gate.
+
+**Why not pairs.** §20 counts a pair of groups as the AND of their posting sets: one AND per
+combination, each over every container key the two sets share. A third column multiplies the ANDs
+by its values, and each AND is not a word but a walk of two sets across the table - about a
+microsecond a container key, so a millisecond a combination at 5M rows. That is the work that grows
+with the product of the columns' values.
+
+**What a key knows.** At a container key (64 heap blocks) every row of the table is in exactly ONE
+entry of each scalar column - its value's, or the column's NULL entry (§14). So instead of trying
+every combination, the key's rows are told apart: each column's containers there are DECODED - a
+store per member of `value index` into an array of the key's 32,768 row positions - and then the
+rows the WHERE keeps are visited once, each row's values read off the arrays and its combination
+counted. Two passes over the key's rows, whatever the number of combinations. A throwaway
+benchmark of one key (three columns, 2,176 rows a key; AVX2 for the ANDs):
+
+| values a column | combinations | ANDs of the combinations | decode and count |
+|---|---|---|---|
+| 2 | 8 | 15 us | 8 us |
+| 8 | 512 | 80 us | 7 us |
+| 16 | 4,096 | 556 us | 8 us |
+| 32 | 32,768 | 3.8 ms | 19 us |
+
+Decoding won at every size: the ANDs of array containers first build bitset images, which costs
+what decoding does, and then do the ANDs on top.
+
+**The walk** (`lion_count_groups_decode()`, lion_count_decode.c). One PASS takes, for each column,
+a set of its values (a CHUNK, below), and counts every combination of them:
+
+- column 0 DRIVES: its cursors - one per value - stand on a heap by container key, and the walk
+  goes to the smallest key column 0 stands at that the collected WHERE (§10, "The WHERE sets,
+  collected once") holds, or every key of column 0 without a WHERE. The rows of the pass are
+  column 0's rows: its values in the pass are the only ones counted;
+- column 0's containers there are decoded into `val0[lo]` and a bitset of its rows, which is ANDed
+  with the WHERE's container (its bitset image);
+- the other columns' cursors, on a second heap, are sought to the key (§22: a step, or a descent
+  past the keys between) and decoded into `valc[lo]`, each store stamped with the key's
+  GENERATION (`genc[lo]`, 16 bits), so that no array is ever cleared: a stamp of another key is no
+  value here, and a row some column holds no value of in the pass is no row of any combination in
+  it;
+- the visibility map is asked once for the key's blocks with rows (a 64-bit mask), and each row is
+  counted under its combination's CODE - `v0 * radix1 * ... + vn`, radix c being column c's values
+  in the pass - in the TALLY, or queued for the heap with its code when its block is not
+  all-visible (`lion_recheck_visible()`, which gives the heap's answer per TID: the rows come key by
+  key and in row order, so the list is in TID order already).
+
+**The tally** is an array of every combination while that takes at most a quarter of hash_mem
+(256k combinations at the default 8 MB), and a simplehash of those with rows past it. A hash table
+that outgrows hash_mem writes its entries to a temporary file and starts again, so the node's
+memory is bounded whatever the planner estimated. The same combination may then come out more than
+once, which is why the node's rows are PARTIAL counts under a Finalize HashAggregate, as a
+partitioned table's are (§16): core adds them up, and spills to disk itself if the groups do not fit.
+
+**Chunks and passes** (`LionDecodeRun`, lion_exec_count.c). Each column's values are read off its
+entry walk (§21) a chunk at a time: column 0's as many as a batch of groups may pin
+(`lion_count_groups_batch()`: the pin budget of §15, work_mem of cursors, at most 256), every other
+column's a share of a work_mem of cursors (a page image each for a CHAIN set), and all of them so
+that a pass's combinations fit a 60-bit code. The chunks advance like the digits of an odometer,
+the last column fastest, so that every combination of values is in exactly one pass. The columns are
+ordered by their estimated distinct values, fewest first, so column 0's chunk is the one most likely
+to be whole: the usual GROUP BY - a few dozen values a column - is one pass. Between two rows
+nothing is pinned: a chunk's sets are kept unpinned (an INLINE one gives its leaf's pin up as it is
+read), each entry walk lets go of its leaf once the chunk is read (`lion_entry_scan_pause()`), and
+column 0's sets are located again for each pass with their pins and released when it ends.
+
+**Why it is exact (§9).** Every row the walk counts is in exactly one of column 0's sets, each
+located for the pass under a pin of its own - an INLINE one keeps its leaf's pin, a CHAIN one is
+read by a cursor that pins each page it copies - which is the pinned source a count needs, one per
+row. The map is asked at a key after every column-0 cursor standing there has copied its container
+and before any moves past it, `lion_count_container()`'s order. The other columns and the WHERE
+copy are read with no pin, and are safe on the terms of `lion_sources_collect()`'s copies: they
+only narrow or label a row of a pinned set. A dead TID a pinless column still lists is either gone
+from column 0's container, and no row of the pass, or in it - so column 0's page was read before
+VACUUM's ambulkdelete got past it, VACUUM has not set its block all-visible, and the row goes to the
+heap, which does not show it. A row a pinless column has lost already is dead to every snapshot. A
+live row cannot be missing from any column: the pass is read after the snapshot was taken, and a
+visible row was in every index before its transaction committed. A column-0 set located past the
+pin budget (NOPIN) or read from a copy carries nothing, and its rows go to the heap; so does every
+row under a row filter (§17). Under SERIALIZABLE the all-visible blocks counted are predicate-locked
+page by page, as an index-only scan locks them, and each index read is locked as a relation.
+
+**The plan.** `LION_FLAG_DECODE` and the GROUPN member of custom_private (member 15, shape 18): the
+columns in the walk's order, and their indexes. The target list takes
+`LION_TL_GROUPKEYN(g)` and `LION_TL_COUNT_GROUPCOLN(g)` for the third and later columns. EXPLAIN
+names every column's index under `Lion Indexes`, prints every column as the `Group Key`, `Group
+Strategy: Decoded`, and under ANALYZE `Decoded
+Passes`, `Decoded Keys`, `Decoded Rows`, `Decoded Rows Rechecked`, `Partial Rows` and `Tally
+Spills`.
+
+**Two columns** are §20's nested loop or the walk: the planner builds both paths, the walk's on
+the same terms as three columns' (`lion_count_path_decodable()`), and add_path() keeps the cheaper.
+The loop wins where the pairs are few - `c4, w`, 8 pairs, 25 ms on the data below - and the walk
+from a few dozen on: `c4, c10`, 40 pairs, 143 ms as the loop and 51 as the walk; `c10, c25`, 250
+pairs, which the loop was priced out of (a HashAggregate over the table, 792 ms), 51; `c25, c100`,
+2,500 pairs, 871 ms under a HashAggregate and 57 as the walk. `pg_lion.enable_decoded_walk` off
+(on by default) leaves two columns to the loop and three or more to the ordinary plan, as before.
+
+**Cost** (`lion_cost_decode_path()`): the grouped count of column 0 alone against the WHERE, as
+`lion_cost_count_rel()` prices it (its walk, the map, the rechecks), and at each key the WHERE's
+rows lie at - `nkeys * (1 - exp(-rows / nkeys))` - each column's containers there
+(`LION_DECODE_CONTAINER_COST`, a seek where the keys are few), a store per row a column
+(`LION_DECODE_MEMBER_COST`), and each of the WHERE's rows counted (`LION_DECODE_ROW_COST`, plus
+`LION_DECODE_ROW_COL_COST` a column after the first, plus `LION_DECODE_ROW_MISS_COST` once the
+tally's array is past a core's cache, or `LION_DECODE_HASH_ROW_COST` for the hash table), times the
+passes the estimates make. Fitted to the release build below at 313 to 453 units a millisecond.
+
+**Measured** (2026-09-30, PostgreSQL 16 as packaged, 5M rows of 120 a page, all-visible, one lion
+index over `c4, c10, c25, c100, w` - 4, 10, 25 and 100 values and a boolean - work_mem 64 MB;
+medians; `core` is the plan with the pushdown off, a HashAggregate over a sequential or bitmap
+scan):
+
+| GROUP BY | decoded | core |
+|---|---|---|
+| `c4, c10, c25` (1,000 combinations) | 77 ms | 900 ms |
+| `c4, c10, c25 ... WHERE w` (30% of the rows) | 61 ms | 438 ms |
+| `c4, c10, c25, c100` (100,000) | 179 ms | 1,947 ms |
+| `c4, c10, c25, c100, w` | 343 ms | 2,851 ms |
+| `c4, c10, c25 ... WHERE c100 = 7` (1%) | 49 ms | 60 ms |
+
+and on a table of 200,000 of those rows, 4.7 ms against 41 for three columns. A WHERE of a few
+thousand rows (`c100 = 7 AND c25 = 3`) is left to core, 11 ms against the walk's 46: every key the
+rows lie at still decodes every column there. The four-column form first took 440 ms, with a hash
+table for its 100,000 combinations; as an array, 179.
+
+`test/sql/group_decode.sql` checks three to five columns - the NULL group and `count(col)` in it,
+another index's column, a text column - against a sequential scan with the pushdown off: WHEREs of
+an equality, an IN list, a NOT, an OR across columns, an IS NULL and one that selects nothing; a
+HAVING and an ORDER BY above the Finalize Agg; a work_mem of 64 kB (fourteen passes); a generic plan;
+a rescan per outer row; a cursor; SERIALIZABLE; a heap the map no longer vouches for; and the shapes
+it declines.
+
+### Not done in this version
+
+- **A partitioned table**: each partition would be a relation of its own, as §16's partial rows
+  already are; the planner declines it.
+- **A range in the WHERE**, which is walked rather than collected once it is too large to collect
+  (§32): declined. A range the walk could take as another pinless stream is the natural next step.
+- **Parallel**: the walk is container-major, so it divides by ranges of container keys exactly as
+  §10's parallel GROUP BY does, under the Finalize Agg it already has.
+- **A hot standby**, where no WHERE is collected (§10): the planner declines it there.

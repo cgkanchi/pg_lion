@@ -61,6 +61,13 @@ the tested workloads, not a general replacement recommendation.
     make PG_CONFIG=.local/pg/bin/pg_config installcheck   # regress files + isolation specs
     make unit PG_CONFIG=.local/pg/bin/pg_config           # container and sparse libraries, no server needed
 
+No `-march` is needed for speed: on x86-64, GCC and clang builds carry AVX2 and POPCNT versions of
+the container library's passes over whole bitsets, compiled with target attributes, and pick one at
+run time by what the CPU has; other targets and compilers get a portable one, and `make
+LION_NO_SIMD=1` leaves the x86-64 ones out (DESIGN.md §3, "Whole-bitset kernels").  `make unit` runs
+the container tests against each version the CPU has, and once more built without the x86-64 ones
+(`test/unit/container_test_nosimd`).
+
 Lion logs through one of two WAL resource managers (DESIGN.md §25), chosen per index at
 CREATE INDEX, so the suite has to pass in both:
 
@@ -166,6 +173,13 @@ run in parallel: the workers divide the table's blocks into ranges, each collect
 its ranges and counts every group there, and a `Finalize HashAggregate` above the `Gather` adds
 the groups' partial counts up (`Parallel Custom Scan (LionCount)`, `Key Ranges` in `EXPLAIN
 ANALYZE`; DESIGN.md §10, "A GROUP BY in parallel").
+
+A `GROUP BY` of three or more indexed columns (`SELECT country, event_type, device, count(*)
+FROM events GROUP BY country, event_type, device`), or of two with more than a few combinations,
+is counted in one walk of the index whatever the number of combinations: at each range of 64 heap blocks it reads which value of each column
+every row has, and counts each row under its combination (`Group Strategy: Decoded` in EXPLAIN,
+under a `Finalize HashAggregate`; DESIGN.md §34). On 5M rows it took 77 ms for 1,000 combinations
+and 179 ms for 100,000, where a HashAggregate over the table took 900 ms and 1.9 s.
 
 On a partitioned table the pushdown counts each partition the planner keeps, with that partition's
 own Lion indexes (DESIGN.md §16), and every `WHERE` clause needs one in every partition counted -
@@ -348,7 +362,8 @@ table's owner (DESIGN.md §7).
 ## Source layout
 
     src/lion_tid.h          TID <-> (container key, 15-bit lo) encoding; 9 offset bits at 8K pages
-    src/lion_container.[ch] container library (array/bitset/run), set algebra, unit-tested standalone
+    src/lion_container.[ch] container library (array/bitset/run), set algebra, AVX2/POPCNT bitset kernels
+                            picked at run time, unit-tested standalone
     src/lion_sparse.[ch]    sparse (container key, offset) segments, unit-tested standalone
     src/lion.h              on-disk structs, the relation state, and the page layer's and the AM's functions
     src/lion_pages.c        index pages: initializing, deleting, recycling; the items of container pages
@@ -507,6 +522,10 @@ working around a bad choice:
   BY ts DESC LIMIT n` over a Lion index on `ts`), filtered by a Lion set of the other clauses or by
   the clauses themselves; on a table, or on each partition of one (DESIGN.md §30, §30.11). EXPLAIN
   names a column's walk `Ordered By: <index> (<column>[, backward])`.
+- `pg_lion.enable_decoded_walk`: count a `GROUP BY` of several Lion-indexed columns by decoding,
+  at each range of 64 heap blocks, which value of each column every row has (DESIGN.md §34): three
+  or more columns, and two where that is cheaper than the nested loop over their entries. Off, a
+  `GROUP BY` of three or more columns goes to the ordinary plan and one of two to the nested loop.
 - `pg_lion.enable_plain_scan`: let the planner use plain and index-only scans of Lion indexes
   (`amgettuple`, DESIGN.md §29). Off, Lion indexes are planned for bitmap scans only, as GIN
   indexes are, and every other index's scans are unaffected - where `enable_indexscan = off` would
@@ -605,10 +624,11 @@ per execution; a volatile one like `random()` goes to the ordinary plan) on any 
 columns included, a boolean column tested by itself (`flag`, `NOT flag`, `flag IS TRUE`, `flag IS
 NOT FALSE`), an `OR` of such clauses and of `AND`s of them, nested as deep as the query writes it
 (`(a = 1 AND flag IS NOT TRUE) OR b = 2` is distributed into the arms it stands for, up to 1000
-clauses in all), a `GROUP BY` of one or two indexed columns - or of `coalesce(col, constant)` of
+clauses in all), a `GROUP BY` of up to eight indexed columns - three or more, and two where the
+walk is cheaper, over one table that is not partitioned, with a WHERE of no range (DESIGN.md §34) - or of `coalesce(col, constant)` of
 one, whose NULL rows are counted in the constant's group, merged with that key's rows when the
-column has it - and a `HAVING` over the counts it computes (a `HAVING` with a correlated subquery,
-or a `GROUP BY` of three or more columns, goes to the ordinary plan). `count(DISTINCT col)` is
+column has it - and a `HAVING` over the counts it computes (a `HAVING` with a correlated subquery
+goes to the ordinary plan). `count(DISTINCT col)` is
 answered for an indexed column (DESIGN.md §26), and for a column a unique index proves unique - a
 primary key - as the `count(col)` it equals: `count(*)` where the column is NOT NULL, whether or not
 it has a lion index (a single-column, immediate, non-partial btree index under the `DISTINCT`'s

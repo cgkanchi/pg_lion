@@ -11,6 +11,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "lion_customscan.h"
 
 static int64 lion_walk_count(LionCountScanState *st, LionCountSource *sources,
@@ -2072,11 +2074,352 @@ lion_next_group_distinct(LionCountScanState *st, bool *exhausted)
 }
 
 /*
+ * THE DECODED WALK (DESIGN.md §34): a GROUP BY of three or more columns, each
+ * a column of a scalar lion index, counted by lion_count_groups_decode() a
+ * pass at a time.  The columns are read a chunk of values at a time off their
+ * entry walks, and the chunks advance like an odometer (LionDecodeRun); each
+ * pass's tally goes up as partial rows, one a combination with rows, which
+ * the Finalize Agg above adds up.
+ *
+ * Pins (DESIGN.md §9).  Nothing is pinned between two rows: the chunks'
+ * sets are kept unpinned (an INLINE one gives its leaf's pin up as it is
+ * read, a CHAIN one never held one), the entry walks let go of their leaves
+ * once a chunk is read, and column 0's sets are located again for each pass
+ * with their pins - the interlock of its counts - and released when it ends.
+ */
+
+/*
+ * The next chunk of column c's values off its entry walk - its first, begun
+ * again, with restart.  False when the walk has none left: the column is past
+ * its last chunk.
+ */
+static bool
+lion_decode_fill(LionCountScanState *st, int c, bool restart)
+{
+	LionDecodeRun *dr = st->decode;
+	MemoryContext oldcxt;
+	int			cap = dr->cap[c];
+	int			n = 0;
+
+	if (restart || !dr->scanning[c])
+	{
+		if (dr->scanning[c])
+			lion_entry_scan_end(&dr->escan[c]);
+		/* the walk's own contexts outlive the chunks (lion_next_group2()) */
+		oldcxt = MemoryContextSwitchTo(st->css.ss.ps.state->es_query_cxt);
+		lion_entry_scan_begin_col(&dr->escan[c], dr->idx[c], dr->idxcol[c]);
+		MemoryContextSwitchTo(oldcxt);
+		dr->scanning[c] = true;
+		dr->scandone[c] = false;
+	}
+	else if (dr->scandone[c])
+		return false;
+
+	MemoryContextReset(dr->chunkcxt[c]);
+	oldcxt = MemoryContextSwitchTo(dr->chunkcxt[c]);
+	dr->keys[c] = (Datum *) palloc(sizeof(Datum) * cap);
+	dr->isnull[c] = (bool *) palloc(sizeof(bool) * cap);
+	dr->sets[c] = (LionPostingSet *) palloc(sizeof(LionPostingSet) * cap);
+	while (n < cap &&
+		   lion_entry_scan_next(&dr->escan[c], &dr->keys[c][n], &dr->sets[c][n]))
+	{
+		dr->isnull[c][n] = dr->sets[c][n].keyisnull;
+		lion_posting_set_unpin(&dr->sets[c][n]);
+		n++;
+	}
+	MemoryContextSwitchTo(oldcxt);
+	if (n < cap)
+		dr->scandone[c] = true;
+	lion_entry_scan_pause(&dr->escan[c]);
+	dr->nvals[c] = n;
+	return n > 0;
+}
+
+/*
+ * The next combination of chunks, the last column's changing fastest: false
+ * once column 0 is past its last chunk.
+ */
+static bool
+lion_decode_advance(LionCountScanState *st)
+{
+	LionDecodeRun *dr = st->decode;
+	int			c;
+
+	for (c = dr->ncol - 1; c >= 0; c--)
+	{
+		if (lion_decode_fill(st, c, false))
+		{
+			int			d;
+
+			for (d = c + 1; d < dr->ncol; d++)
+			{
+				if (!lion_decode_fill(st, d, true))
+					return false;
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * The chunk sizes: column 0's by the pins and the memory of one count's
+ * cursors, as a batch of groups is (lion_count_groups_batch()), since its
+ * sets hold pins; every other column's by the memory of a cursor each - a
+ * page image for a CHAIN set - shared among them; and all of them so that
+ * the combinations of a pass fit a code.
+ */
+static void
+lion_decode_caps(LionCountScanState *st)
+{
+	LionDecodeRun *dr = st->decode;
+	Size		per = lion_count_cursor_bytes() + sizeof(PGAlignedBlock) +
+		sizeof(LionPostingSet) + 2 * sizeof(Datum);
+	Size		budget = Max((Size) work_mem * 1024 / per, (Size) 64);
+	double		bits;
+	int			c;
+
+	dr->cap[0] = lion_count_groups_batch(dr->idx[0]);
+	for (c = 1; c < dr->ncol; c++)
+		dr->cap[c] = (int) Max(budget / (Size) (dr->ncol - 1), (Size) 16);
+	for (;;)
+	{
+		int			widest = 0;
+
+		bits = 0;
+		for (c = 0; c < dr->ncol; c++)
+		{
+			bits += log2((double) dr->cap[c]);
+			if (dr->cap[c] > dr->cap[widest])
+				widest = c;
+		}
+		if (bits <= 60.0 || dr->cap[widest] <= 1)
+			break;
+		dr->cap[widest] = Max(dr->cap[widest] / 2, 1);
+	}
+	for (c = 0; c < dr->ncol; c++)
+		dr->images[c] = (PGAlignedBlock *)
+			MemoryContextAlloc(st->css.ss.ps.state->es_query_cxt,
+							   sizeof(PGAlignedBlock) * dr->cap[c]);
+}
+
+/* One pass: every combination of the chunks the columns stand at, tallied. */
+static void
+lion_decode_pass(LionCountScanState *st)
+{
+	LionDecodeRun *dr = st->decode;
+	EState	   *estate = st->css.ss.ps.state;
+	LionDecodeCol cols[LION_MAX_GROUPCOLS];
+	bool	   *relocated;
+	MemoryContext oldcxt;
+	int			c;
+	int			v;
+
+	MemoryContextReset(dr->passcxt);
+	oldcxt = MemoryContextSwitchTo(dr->passcxt);
+
+	/* column 0's sets carry the interlock: located again, with their pins */
+	relocated = (bool *) palloc0(sizeof(bool) * Max(dr->nvals[0], 1));
+	cols[0].nsets = dr->nvals[0];
+	cols[0].images = dr->images[0];
+	cols[0].sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) *
+											  Max(dr->nvals[0], 1));
+	for (v = 0; v < dr->nvals[0]; v++)
+	{
+		LionPostingSet *ps = &dr->sets[0][v];
+
+		if (ps->found && ps->nopin)
+		{
+			/*
+			 * The entry as it is now, under a pin of its own (the listed
+			 * value of lion_next_group_inlist()): one gone meanwhile held no
+			 * row anyone sees, since VACUUM deletes only an empty entry (§18).
+			 */
+			if (ps->keyisnull)
+				(void) lion_posting_set_lookup_null_col(dr->idx[0],
+														dr->idxcol[0],
+														&cols[0].sets[v]);
+			else
+				(void) lion_posting_set_lookup_col(dr->idx[0], dr->idxcol[0],
+												  ps->storedkey, InvalidOid,
+												  &cols[0].sets[v]);
+			relocated[v] = true;
+		}
+		else
+			cols[0].sets[v] = *ps;
+	}
+	for (c = 1; c < dr->ncol; c++)
+	{
+		cols[c].nsets = dr->nvals[c];
+		cols[c].sets = dr->sets[c];
+		cols[c].images = dr->images[c];
+	}
+
+	if (!lion_decode_tally_begin(dr->tally, dr->ncol, dr->nvals))
+		elog(ERROR, "LionCount: the combinations of a decoded pass do not fit a code");
+	lion_count_groups_decode(st->heap, estate->es_snapshot, dr->ncol, cols,
+							 st->wcollected ? &st->wherecoll : NULL,
+							 dr->tally, &st->stats, &dr->stats,
+							 st->viscache, st->rel_read_only);
+
+	for (v = 0; v < dr->nvals[0]; v++)
+	{
+		if (relocated[v])
+			lion_posting_set_release(&cols[0].sets[v]);
+	}
+	MemoryContextSwitchTo(oldcxt);
+	dr->passes++;
+}
+
+/*
+ * The run begins: the WHERE collected, every column's first chunk read.
+ * False when there is nothing to count at all.
+ */
+static bool
+lion_decode_start(LionCountScanState *st)
+{
+	LionDecodeRun *dr = st->decode;
+	int			c;
+	int			k;
+
+	if (RecoveryInProgress())
+		elog(ERROR, "LionCount: a decoded GROUP BY during recovery");
+	for (k = 1; k <= st->nitem; k++)
+	{
+		if (st->sources[k].rangewalk != NULL)
+			elog(ERROR, "LionCount: a decoded GROUP BY beside a range it walks");
+	}
+
+	/*
+	 * The WHERE, as one copy, read before any column is (DESIGN.md §10, "The
+	 * WHERE sets, collected once"), and pinless.  A WHERE whose sources hold
+	 * no entry is no copy at all: nothing is counted.
+	 */
+	if (st->nitem > 0)
+	{
+		if (!st->wtried)
+			lion_where_collect(st, st->sources, st->nitem);
+		if (!st->wcollected)
+			return false;
+	}
+
+	if (dr->cap[0] == 0)
+		lion_decode_caps(st);
+	for (c = 0; c < dr->ncol; c++)
+	{
+		if (!lion_decode_fill(st, c, true))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * The next partial row of the decoded walk: a combination's key and count,
+ * for the relation the node has open.  Returns NULL and sets *exhausted once
+ * every pass has gone up.
+ */
+static TupleTableSlot *
+lion_next_group_decode(LionCountScanState *st, bool *exhausted)
+{
+	LionDecodeRun *dr = st->decode;
+
+	*exhausted = false;
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
+
+		if (dr->finished)
+		{
+			*exhausted = true;
+			return NULL;
+		}
+
+		if (dr->emitting)
+		{
+			uint64		code;
+			int64		count;
+			int			vals[LION_MAX_GROUPCOLS];
+			int			c;
+			TupleTableSlot *slot;
+
+			if (lion_decode_tally_next(dr->tally, &code, &count))
+			{
+				lion_decode_code_split(code, dr->ncol, dr->nvals, vals);
+				for (c = 0; c < dr->ncol; c++)
+				{
+					dr->rowkeys[c] = dr->keys[c][vals[c]];
+					dr->rownull[c] = dr->isnull[c][vals[c]];
+				}
+				dr->rowsup++;
+				slot = lion_emit_keys(st, dr->ncol, dr->rowkeys, dr->rownull,
+									  count);
+				if (slot == NULL)
+					continue;
+				return slot;
+			}
+			dr->emitting = false;
+			lion_decode_tally_end(dr->tally);
+			if (!lion_decode_advance(st))
+			{
+				dr->finished = true;
+				continue;
+			}
+		}
+		else if (!dr->started)
+		{
+			dr->started = true;
+			if (!lion_decode_start(st))
+			{
+				dr->finished = true;
+				continue;
+			}
+		}
+
+		lion_decode_pass(st);
+		dr->emitting = true;
+	}
+}
+
+/*
+ * The decoded walk ends, or begins again for a rescan: its entry walks and its
+ * tally go, and the next call starts from the first chunks.
+ */
+void
+lion_decode_reset(LionCountScanState *st)
+{
+	LionDecodeRun *dr = st->decode;
+	int			c;
+
+	if (dr == NULL)
+		return;
+	for (c = 0; c < dr->ncol; c++)
+	{
+		if (dr->scanning[c])
+			lion_entry_scan_end(&dr->escan[c]);
+		dr->scanning[c] = false;
+		dr->scandone[c] = false;
+		dr->nvals[c] = 0;
+		if (dr->chunkcxt[c] != NULL)
+			MemoryContextReset(dr->chunkcxt[c]);
+	}
+	if (dr->tally != NULL)
+		lion_decode_tally_end(dr->tally);
+	if (dr->passcxt != NULL)
+		MemoryContextReset(dr->passcxt);
+	dr->started = false;
+	dr->finished = false;
+	dr->emitting = false;
+}
+
+/*
  * Whichever of them the plan asks for.
  */
 TupleTableSlot *
 lion_next_group_any(LionCountScanState *st, bool *exhausted)
 {
+	if (st->decode != NULL)
+		return lion_next_group_decode(st, exhausted);
 	if (st->distattno != 0)
 		return lion_next_group_distinct(st, exhausted);
 	if (st->groupattno2 != 0)

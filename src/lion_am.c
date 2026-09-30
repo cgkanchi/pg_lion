@@ -327,6 +327,21 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §34: whether a GROUP BY of several lion-indexed columns may be
+	 * counted by the decoded walk - three or more columns, and two when it is
+	 * cheaper than §20's nested loop.  Off, three or more go to the ordinary
+	 * plan and two to the nested loop, as before §34.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_decoded_walk",
+							 "Lets the count pushdown count a GROUP BY of several lion-indexed columns by decoding each column's values key by key.",
+							 "Off, a GROUP BY of three or more columns goes to the ordinary plan and one of two to the nested loop of their entries.",
+							 &lion_enable_decoded_walk,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
 	 * The cost model's constants (DESIGN.md §31, "The settings"): one setting
 	 * for each, the multiplier of the core cost it is priced in, for
 	 * calibrating the model without a rebuild.

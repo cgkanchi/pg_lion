@@ -6,6 +6,7 @@ test/results/
 test/isolation/results/
 test/isolation/output_iso/
 test/unit/container_test
+test/unit/container_test_nosimd
 regression.*
 log/
 test/unit/sparse_test

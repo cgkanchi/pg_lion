@@ -300,10 +300,12 @@ SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND id = 5');
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND a = 4');
 -- no equality key and no GROUP BY at all
 SELECT lion_pd('SELECT count(*) FROM lion_pdt');
--- GROUP BY an unindexed column, and by more than two columns
+-- GROUP BY an unindexed column
 SELECT lion_pd('SELECT id, count(*) FROM lion_pdt WHERE a = 3 GROUP BY id');
+-- three indexed columns are the decoded walk of DESIGN.md section 34
 SELECT lion_pd('SELECT a, b, c, count(*) FROM lion_pdt GROUP BY a, b, c');
--- two indexed columns are the nested loop of DESIGN.md section 20, below
+-- two indexed columns are the nested loop of DESIGN.md section 20 or the
+-- decoded walk, whichever the model finds cheaper, below
 SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
 -- GROUP BY an expression
 SELECT lion_pd('SELECT a + 1, count(*) FROM lion_pdt GROUP BY a + 1');
@@ -975,7 +977,12 @@ SELECT count(*) FROM lion_pdpo WHERE a = 17 OR b = 3;
  * against 39.3, while 200 x 20 is 60.7 against 36.8 and 20000 x 2 is 169.8
  * against 51.6 - so the middle of that range is where the node stops winning,
  * and the model must stop choosing it there.
+ *
+ * The decoded walk of section 34 is the other plan for two columns, and is
+ * switched off down to the end of the cardinalities below, which are the
+ * nested loop's; what it takes of them is shown after.
  */
+SET pg_lion.enable_decoded_walk = off;
 SELECT lion_pd('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
 SELECT lion_plans('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
 SELECT lion_pd($$SELECT a, b, count(*) FROM lion_pdt WHERE c = 'c1' GROUP BY a, b$$);
@@ -1044,6 +1051,27 @@ SELECT lion_pd('SELECT c200, c2, count(*) FROM lion_pd2 GROUP BY c200, c2');
 -- 200 x 20 and 20000 x 200 are not, and are refused
 SELECT lion_pd('SELECT c200, c20, count(*) FROM lion_pd2 GROUP BY c200, c20');
 SELECT lion_plans('SELECT c200, c20, count(*) FROM lion_pd2 GROUP BY c200, c20');
+SELECT lion_pd('SELECT c20k, c200, count(*) FROM lion_pd2 GROUP BY c20k, c200');
+SELECT lion_pd('SELECT c20k, c2, count(*) FROM lion_pd2 GROUP BY c20k, c2');
+RESET pg_lion.enable_decoded_walk;
+
+-- ---- two columns by the decoded walk (DESIGN.md section 34) ------------
+/*
+ * Two passes over each container key's rows whatever the number of pairs, so
+ * the wide pairs the nested loop is refused are the walk's, and so is a WHERE
+ * the nested loop is priced too dear under.  Over these small tables it is
+ * the cheaper for the narrow pairs too (20 x 2 in 1.6 ms against 4.4, assert
+ * build); a partitioned table stays the nested loop's.
+ */
+SELECT lion_plans('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
+SELECT lion_pd($$SELECT a, b, count(*) FROM lion_pdt WHERE c = 'c1' GROUP BY a, b$$);
+SELECT lion_pd($$SELECT a, b, count(*) FROM lion_pdt WHERE c = 'c1' OR n = 2 GROUP BY a, b$$);
+SELECT lion_pd('SELECT a, n, count(n) FROM lion_pdt GROUP BY a, n');
+SELECT lion_plans('SELECT c20, c2, count(*) FROM lion_pd2 GROUP BY c20, c2');
+SELECT lion_pd('SELECT c20, c2, count(*) FROM lion_pd2 GROUP BY c20, c2');
+SELECT lion_pd('SELECT c200, c2, count(*) FROM lion_pd2 GROUP BY c200, c2');
+SELECT lion_plans('SELECT c200, c20, count(*) FROM lion_pd2 GROUP BY c200, c20');
+SELECT lion_pd('SELECT c200, c20, count(*) FROM lion_pd2 GROUP BY c200, c20');
 SELECT lion_pd('SELECT c20k, c200, count(*) FROM lion_pd2 GROUP BY c20k, c200');
 SELECT lion_pd('SELECT c20k, c2, count(*) FROM lion_pd2 GROUP BY c20k, c2');
 
