@@ -1296,13 +1296,15 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
  *
  * The keys are read a batch at a time - the batches of "Lookups in key order",
  * whatever the plan says of the walk - and each batch is taken to the leaf
- * partitions in turn: a partition is opened, its fk index walked (or descended
- * into) for every key of the batch, each key's count added into the key's own
- * entry, and the partition closed before the next one is opened, so that no
- * partition's pin outlives its turn (DESIGN.md §16).  A key that has matched
- * in one partition is not looked up again by an existence test.  Only when
- * every partition has had the batch are its rows handed up, each with its
- * sum; the node hands up no row with a partition open.
+ * partitions in turn: a partition's turn begins, its fk index is walked (or
+ * descended into) for every key of the batch, each key's count added into the
+ * key's own entry, and the turn ends - everything located in the partition
+ * let go of - before the next one's begins, so that no partition's pin
+ * outlives its turn (DESIGN.md §16).  The partitions' relations themselves
+ * stay open for the life of the node (lion_open_parts()).  A key that has
+ * matched in one partition is not looked up again by an existence test.  Only
+ * when every partition has had the batch are its rows handed up, each with
+ * its sum; the node hands up no row in the middle of a partition's turn.
  *
  * Each partition is its own table in everything §9 asks: its own heap and
  * visibility map, its own pins, and a count only ever beside its own fk set,
@@ -1316,10 +1318,11 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
  */
 
 /*
- * Leaf partition p's turn begins: the partition opened, its fk index's walk
- * begun, and its fact filters located - or, once they were collected, its copy
- * of them made the filters of every count again, with the row filter its
- * multi-key clauses need rebuilt from what they made of this run's values.
+ * Leaf partition p's turn begins: the partition made the relation counted,
+ * its fk index's walk begun, and its fact filters located - or, once they
+ * were collected, its copy of them made the filters of every count again,
+ * with the row filter its multi-key clauses need rebuilt from what they made
+ * of this run's values.
  */
 static void
 lion_join_part_open(LionCountScanState *st, int p)
@@ -1329,8 +1332,7 @@ lion_join_part_open(LionCountScanState *st, int p)
 	MemoryContext oldcxt;
 	int			i;
 
-	lion_open_relation(st, st->part[p].heapoid, InvalidOid, InvalidOid,
-					   st->part[p].clauseidxoid);
+	lion_open_relation(st, p);
 
 	oldcxt = MemoryContextSwitchTo(st->joinvisitcxt);
 	lion_lookup_walk_begin(&st->joinwalker, jcl->idx, jcl->idxcol,
@@ -1342,7 +1344,7 @@ lion_join_part_open(LionCountScanState *st, int p)
 
 	if (jp->collected && jp->filtered)
 	{
-		/* the copy is named after an index the partition has reopened */
+		/* the copy is named after one of the partition's indexes */
 		jp->filter.index = NULL;
 		for (i = 0; i < st->nclause; i++)
 		{
@@ -1408,7 +1410,7 @@ lion_join_part_open(LionCountScanState *st, int p)
 	jp->missing = st->wheremissing;
 }
 
-/* ... and ends: everything it located let go of, and the partition closed. */
+/* ... and ends: everything it located let go of, and its turn over. */
 static void
 lion_join_part_close(LionCountScanState *st)
 {
@@ -1750,9 +1752,8 @@ lion_join_count_groups(LionCountScanState *st, int k, bool walked)
 static void
 lion_join_group_turn(LionCountScanState *st, int p)
 {
-	Oid			fgidxoid = (p < 0) ? st->fgidxoid : st->part[p].fgidxoid;
+	Relation	fgidx = (p < 0) ? st->fgidx : st->part[p].fgidx;
 	Const	   *fgconst = (p < 0) ? NULL : st->part[p].fgconst;
-	Relation	fgidx;
 	AttrNumber	fgidxcol;
 	LionState  *istate;
 	LionEntryScan es;
@@ -1811,8 +1812,11 @@ lion_join_group_turn(LionCountScanState *st, int p)
 	 * The groups are the entries of the column's index here, its key column
 	 * derived from the index as it was opened (DESIGN.md §24), and the index
 	 * predicate-locked as every index the node reads is (lion_open_relation()).
+	 * It is open with the relation's others for the life of the node
+	 * (lion_open_relation() for a plain table, lion_open_parts() for a
+	 * partition), and stays open after the turn.
 	 */
-	fgidx = index_open(fgidxoid, AccessShareLock);
+	Assert(fgidx != NULL);
 	PredicateLockRelation(fgidx, st->css.ss.ps.state->es_snapshot);
 	fgidxcol = lion_index_col_for(fgidx,
 								  lion_heap_attno_in(st->heap, st->heapoid,
@@ -1881,7 +1885,6 @@ lion_join_group_turn(LionCountScanState *st, int p)
 		st->fgn = 0;
 	}
 	lion_entry_scan_end(&es);
-	index_close(fgidx, AccessShareLock);
 	MemoryContextReset(st->fgcxt);
 	st->fgsets = NULL;
 	st->fgkey = NULL;
