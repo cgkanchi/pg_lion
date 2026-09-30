@@ -549,7 +549,8 @@ lion_count_path_group_by(LionCountPathBuild *cx)
 			 * collected.
 			 */
 			if (list_length(root->processed_groupClause) > 2 &&
-				(cx->partitioned || !sgc->hashable || extra == NULL ||
+				(!lion_enable_decoded_walk ||
+				 cx->partitioned || !sgc->hashable || extra == NULL ||
 				 (extra->flags & GROUPING_CAN_PARTIAL_AGG) == 0 ||
 				 RecoveryInProgress()))
 				return false;
@@ -2094,6 +2095,30 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 }
 
 /*
+ * May a GROUP BY of two columns, made the nested loop of DESIGN.md §20, be
+ * the decoded walk of §34 as well?  On the terms of three columns
+ * (lion_count_path_group_by(), lion_count_path_strategy()): one table, not a
+ * partitioned one, partial counts core can add up, no range in the WHERE, no
+ * count(DISTINCT) or coalesce group, and not on a hot standby.
+ */
+static bool
+lion_count_path_decodable(LionCountPathBuild *cx)
+{
+	return lion_enable_decoded_walk &&
+		cx->ngroup == 2 && !cx->decode && cx->fj == NULL &&
+		!cx->partitioned && cx->distvar == NULL && cx->groupcoal == NULL &&
+		!cx->sumall && !cx->singlegroup &&
+		!cx->hasrangesrc && cx->rangevars == NIL &&
+		(cx->wherekinds == NIL || cx->havepositive) &&
+		cx->first != NULL && cx->first->driveidx[0] != NULL &&
+		cx->first->driveidx[1] != NULL &&
+		cx->extra != NULL &&
+		(cx->extra->flags & GROUPING_CAN_PARTIAL_AGG) != 0 &&
+		grouping_is_hashable(cx->root->processed_groupClause) &&
+		!RecoveryInProgress();
+}
+
+/*
  * Decide whether count(*) over input_rel can be answered from roaring
  * posting sets and, if so, add a CustomPath to output_rel.  Every failed
  * check simply returns: the normal plan is always available.
@@ -2142,4 +2167,23 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	lion_count_path_encode(&cx);
 	cpath = lion_count_path_make(&cx);
 	lion_count_path_add(&cx, cpath);
+
+	/*
+	 * Two columns are the nested loop of DESIGN.md §20, which ANDs the sets of
+	 * every pair, or the decoded walk of §34, which reads each column's sets
+	 * once whatever the number of pairs: both are priced, and add_path()
+	 * keeps the cheaper.  The lists encode appends to are begun again, the
+	 * first path keeping its own.
+	 */
+	if (lion_count_path_decodable(&cx))
+	{
+		cx.decode = true;
+		cx.consts = NIL;
+		cx.ckinds = NIL;
+		cx.parts = NIL;
+		lion_count_path_estimate(&cx);
+		lion_count_path_encode(&cx);
+		cpath = lion_count_path_make(&cx);
+		lion_count_path_add(&cx, cpath);
+	}
 }

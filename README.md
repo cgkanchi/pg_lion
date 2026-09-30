@@ -168,8 +168,8 @@ the groups' partial counts up (`Parallel Custom Scan (LionCount)`, `Key Ranges` 
 ANALYZE`; DESIGN.md §10, "A GROUP BY in parallel").
 
 A `GROUP BY` of three or more indexed columns (`SELECT country, event_type, device, count(*)
-FROM events GROUP BY country, event_type, device`) is counted in one walk of the index whatever
-the number of combinations: at each range of 64 heap blocks it reads which value of each column
+FROM events GROUP BY country, event_type, device`), or of two with more than a few combinations,
+is counted in one walk of the index whatever the number of combinations: at each range of 64 heap blocks it reads which value of each column
 every row has, and counts each row under its combination (`Group Strategy: Decoded` in EXPLAIN,
 under a `Finalize HashAggregate`; DESIGN.md §34). On 5M rows it took 77 ms for 1,000 combinations
 and 179 ms for 100,000, where a HashAggregate over the table took 900 ms and 1.9 s.
@@ -514,6 +514,10 @@ working around a bad choice:
   BY ts DESC LIMIT n` over a Lion index on `ts`), filtered by a Lion set of the other clauses or by
   the clauses themselves; on a table, or on each partition of one (DESIGN.md §30, §30.11). EXPLAIN
   names a column's walk `Ordered By: <index> (<column>[, backward])`.
+- `pg_lion.enable_decoded_walk`: count a `GROUP BY` of several Lion-indexed columns by decoding,
+  at each range of 64 heap blocks, which value of each column every row has (DESIGN.md §34): three
+  or more columns, and two where that is cheaper than the nested loop over their entries. Off, a
+  `GROUP BY` of three or more columns goes to the ordinary plan and one of two to the nested loop.
 - `pg_lion.enable_plain_scan`: let the planner use plain and index-only scans of Lion indexes
   (`amgettuple`, DESIGN.md §29). Off, Lion indexes are planned for bitmap scans only, as GIN
   indexes are, and every other index's scans are unaffected - where `enable_indexscan = off` would
@@ -612,8 +616,8 @@ per execution; a volatile one like `random()` goes to the ordinary plan) on any 
 columns included, a boolean column tested by itself (`flag`, `NOT flag`, `flag IS TRUE`, `flag IS
 NOT FALSE`), an `OR` of such clauses and of `AND`s of them, nested as deep as the query writes it
 (`(a = 1 AND flag IS NOT TRUE) OR b = 2` is distributed into the arms it stands for, up to 1000
-clauses in all), a `GROUP BY` of up to eight indexed columns - three or more over one table that
-is not partitioned, with a WHERE of no range (DESIGN.md §34) - or of `coalesce(col, constant)` of
+clauses in all), a `GROUP BY` of up to eight indexed columns - three or more, and two where the
+walk is cheaper, over one table that is not partitioned, with a WHERE of no range (DESIGN.md §34) - or of `coalesce(col, constant)` of
 one, whose NULL rows are counted in the constant's group, merged with that key's rows when the
 column has it - and a `HAVING` over the counts it computes (a `HAVING` with a correlated subquery
 goes to the ordinary plan). `count(DISTINCT col)` is

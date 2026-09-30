@@ -143,6 +143,41 @@ SELECT lgd_check('SELECT a, b, c, d, e, count(*) AS n FROM lgd GROUP BY a, b, c,
  decoded, 1 pass, 800 rows, same as the sequential scan
 (1 row)
 
+-- Two columns: the nested loop of DESIGN.md §20 or the walk, whichever is
+-- cheaper - the loop for a few pairs, the walk for many.  With
+-- pg_lion.enable_decoded_walk off, neither two columns nor three take it.
+SELECT lgd_check('SELECT a, e, count(*) AS n FROM lgd GROUP BY a, e');
+                         lgd_check                          
+------------------------------------------------------------
+ not decoded, 0 passes, 8 rows, same as the sequential scan
+(1 row)
+
+SELECT lgd_check('SELECT c, d, count(*) AS n FROM lgd GROUP BY c, d');
+                       lgd_check                        
+--------------------------------------------------------
+ decoded, 1 pass, 200 rows, same as the sequential scan
+(1 row)
+
+SELECT lgd_check('SELECT c, d, count(*) AS n FROM lgd WHERE e GROUP BY c, d');
+                       lgd_check                        
+--------------------------------------------------------
+ decoded, 1 pass, 200 rows, same as the sequential scan
+(1 row)
+
+SET pg_lion.enable_decoded_walk = off;
+SELECT lgd_check('SELECT c, d, count(*) AS n FROM lgd GROUP BY c, d');
+                          lgd_check                           
+--------------------------------------------------------------
+ not decoded, 0 passes, 200 rows, same as the sequential scan
+(1 row)
+
+SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgd GROUP BY a, b, c');
+                          lgd_check                           
+--------------------------------------------------------------
+ not decoded, 0 passes, 240 rows, same as the sequential scan
+(1 row)
+
+RESET pg_lion.enable_decoded_walk;
 -- A column of another lion index among them, and a text column.
 SELECT lgd_check('SELECT a, g, e, count(*) AS n FROM lgd GROUP BY a, g, e');
                        lgd_check                       

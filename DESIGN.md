@@ -15928,7 +15928,7 @@ does not know, so the rest of it runs with the setting off.
 ## 34. GROUP BY three or more indexed columns: the decoded walk (implemented 2026-09-30)
 
 `SELECT a, b, c, count(*) FROM t [WHERE ...] GROUP BY a, b, c`, up to `LION_MAX_GROUPCOLS` (8)
-columns, each a column of a scalar lion index - the same one (§24) or several - under the same
+columns - and two, where it is cheaper than §20's nested loop - each a column of a scalar lion index - the same one (§24) or several - under the same
 per-column rules as §20's two: its own index, collation, grouping equality and value gate.
 
 **Why not pairs.** §20 counts a pair of groups as the AND of their posting sets: one AND per
@@ -16018,6 +16018,14 @@ Strategy: Decoded`, and under ANALYZE `Decoded
 Passes`, `Decoded Keys`, `Decoded Rows`, `Decoded Rows Rechecked`, `Partial Rows` and `Tally
 Spills`.
 
+**Two columns** are §20's nested loop or the walk: the planner builds both paths, the walk's on
+the same terms as three columns' (`lion_count_path_decodable()`), and add_path() keeps the cheaper.
+The loop wins where the pairs are few - `c4, w`, 8 pairs, 25 ms on the data below - and the walk
+from a few dozen on: `c4, c10`, 40 pairs, 143 ms as the loop and 51 as the walk; `c10, c25`, 250
+pairs, which the loop was priced out of (a HashAggregate over the table, 792 ms), 51; `c25, c100`,
+2,500 pairs, 871 ms under a HashAggregate and 57 as the walk. `pg_lion.enable_decoded_walk` off
+(on by default) leaves two columns to the loop and three or more to the ordinary plan, as before.
+
 **Cost** (`lion_cost_decode_path()`): the grouped count of column 0 alone against the WHERE, as
 `lion_cost_count_rel()` prices it (its walk, the map, the rechecks), and at each key the WHERE's
 rows lie at - `nkeys * (1 - exp(-rows / nkeys))` - each column's containers there
@@ -16060,6 +16068,4 @@ it declines.
   (§32): declined. A range the walk could take as another pinless stream is the natural next step.
 - **Parallel**: the walk is container-major, so it divides by ranges of container keys exactly as
   §10's parallel GROUP BY does, under the Finalize Agg it already has.
-- **Two columns**: §20's nested loop stays theirs. The walk beats it wherever there are more than a
-  few combinations; the planner could price both and take the cheaper.
 - **A hot standby**, where no WHERE is collected (§10): the planner declines it there.

@@ -108,6 +108,17 @@ SELECT lgd_check('SELECT c, a, count(c) AS nc, count(*) AS n, b FROM lgd GROUP B
 SELECT lgd_check('SELECT a, b, c, d, count(*) AS n FROM lgd GROUP BY a, b, c, d');
 SELECT lgd_check('SELECT a, b, c, d, e, count(*) AS n FROM lgd GROUP BY a, b, c, d, e');
 
+-- Two columns: the nested loop of DESIGN.md §20 or the walk, whichever is
+-- cheaper - the loop for a few pairs, the walk for many.  With
+-- pg_lion.enable_decoded_walk off, neither two columns nor three take it.
+SELECT lgd_check('SELECT a, e, count(*) AS n FROM lgd GROUP BY a, e');
+SELECT lgd_check('SELECT c, d, count(*) AS n FROM lgd GROUP BY c, d');
+SELECT lgd_check('SELECT c, d, count(*) AS n FROM lgd WHERE e GROUP BY c, d');
+SET pg_lion.enable_decoded_walk = off;
+SELECT lgd_check('SELECT c, d, count(*) AS n FROM lgd GROUP BY c, d');
+SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgd GROUP BY a, b, c');
+RESET pg_lion.enable_decoded_walk;
+
 -- A column of another lion index among them, and a text column.
 SELECT lgd_check('SELECT a, g, e, count(*) AS n FROM lgd GROUP BY a, g, e');
 SELECT lgd_check('SELECT f, a, e, count(*) AS n FROM lgd GROUP BY f, a, e');
