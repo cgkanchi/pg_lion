@@ -16449,3 +16449,95 @@ the declines - ascending, ordered by the group, HAVING, DISTINCT, a window funct
 beside the NULL group, few groups, a generic plan's LIMIT, the setting off; deleted rows still in
 the entries' counts, before and after VACUUM; a rescan under each outer row's WHERE; expressions of
 the grouping column, and the volatile one, the one of another column and the one alone it declines.
+
+## 37. Aggregates over the entries of lion columns, weighted by their rows (implemented 2026-09-30)
+
+ClickBench's table-wide aggregates - `SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth)`, ninety
+`SUM(ResolutionWidth + k)`, `AVG(UserID)` - read every row where the answer is in the entries: with
+no WHERE and no GROUP BY, every row of the table is in exactly one entry of a scalar lion column (the
+NULL one for a NULL), and holds that entry's key when the keys are the rows' own values. So
+`sum(f(x))` is the sum over x's entries of `f(key)` times the entry's rows, `avg` that over their
+total, and `min` or `max` the first `f(key)` in the aggregate's order among the entries with a row.
+
+### What is taken (`lion_wagg_classify()`, `lion_count_path_wagg()`)
+
+- **The aggregates**: `sum` and `avg` of an int2, int4 or int8 argument, and every aggregate with a
+  sort operator - min and max of any type, `bool_and`, `bool_or`, `every` - which planagg.c already
+  answers as the first value in that operator's order. No DISTINCT, ORDER BY or FILTER. The counts
+  of the target list stay what they were: the sum over every row (§35) answers them beside.
+- **The argument**: an expression of ONE column of the table - immutable, with no parameter,
+  subquery, aggregate, window or set-returning function - since it is evaluated once per entry, on
+  the key. `sum(ResolutionWidth + 89)` is; `sum(s + i)` is not.
+- **The column**: a whole (not partial) scalar lion index on it whose keys are the rows' values -
+  the value rule of §10 (`lion_index_can_emit_value()`), which numeric's 1.0 and 1.00 fail - in
+  the column's own representation (a binary-coercible type of the same width).
+- **The query**: one table, not partitioned, with no WHERE and no GROUP BY, beside nothing but
+  counts; each column is walked once however many aggregates are taken over it.
+
+### The rows of an entry (`lion_wagg_run()`)
+
+An entry's rows are its visible TIDs. On a heap the visibility map calls all-visible they are its
+header's `ntids`, which the walk reads without locating a set (`lion_entry_scan_next_copy()`) - and
+that is decided as a whole, not page by page: every page is all-visible before the first header is
+read and after the last, and the heap has as many pages both times (`lion_heap_all_visible()`).
+
+- At the first look every TID in the index is a row every snapshot sees: core never marks a page
+  that has a dead item, which is the promise an index-only scan rests on.
+- A change after it - an insert, an update, a delete - is by a transaction this snapshot cannot
+  see: one it sees made its change before the snapshot was taken, so before the first look. The
+  change takes the mark off its page before its TID reaches any index, and the page cannot be
+  marked again while this snapshot's xmin holds VACUUM back; a new page is not marked at all.
+- So the second look finds every page marked only if nothing changed in between, and every `ntids`
+  read in between counted exactly the rows of the first look, which are this snapshot's.
+
+Otherwise - a page not marked, at either look - the aggregates start again and each entry is counted
+as a group of a walk is (`lion_node_count()`), the NULL entry included. So is every walk during
+recovery, where a standby's snapshot holds nothing back on the primary.
+
+### The results, as core computes them
+
+- `sum(int2)`, `sum(int4)`: an int8 that core adds up without an overflow check, wrapping; the
+  weighted sum is kept in 128 bits and cut to 64, which is the same sum modulo 2^64 in any order.
+- `sum(int8)`: a numeric; the 128-bit sum made a numeric exactly (`lion_int128_numeric()`: in parts
+  of 10^18 past int8's range). No table has rows enough for it to overflow 128 bits.
+- `avg`: `int8_avg()` and `numeric_poly_avg()` alike divide the sum by the count as numerics
+  (`numeric_div`) - the wrapped int8 sum for int2 and int4, the exact one for int8.
+- min, max and the rest: the aggregate's sort operator, under its input collation, over each
+  entry's `f(key)` - the NULL ones skipped.
+- No rows: every one NULL; the counts 0.
+
+Without 128-bit integers only the extremes are taken.
+
+### The plan
+
+The path is LionCount's sum over every row (§35) with the columns the aggregates are taken over in a
+new member of custom_private, `LION_PRIV_WAGG` (shape 21): their attnums, indexes and key columns.
+`lion_plan_custom_path()` adds what each aggregate computes and appends its argument to
+`custom_exprs`, after the clause values, where setrefs.c points the column at a place in
+`custom_scan_tlist` the executor fills with the key (`LION_TL_WKEY`); the aggregate itself is a
+`LION_TL_WAGG` column. With no count in the target list the sum over every row is not made. The
+price (`lion_cost_wagg_path()`): each column's leaves and two operator costs an entry where the
+table's `allvisfrac` is at least 0.999, the grouped count of the column (§10) elsewhere, and the
+arguments' evaluation. EXPLAIN prints `Aggregates Over Keys: <index> (<column>), ...`; ANALYZE
+adds `Keys Aggregated`, `Key Walks From Entry Counts` and, when it happened, `Key Walks Counted`.
+
+### Measured (ClickBench, 5% sample, PostgreSQL 18 release build, warm)
+
+| query | before | over keys | ClickHouse |
+| --- | --- | --- | --- |
+| `SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth)` (Q3) | 1,043 ms | 8-15 ms | 14 ms |
+| `AVG(UserID)` (Q4) | 540 ms | ~200 ms | 19 ms |
+| ninety `SUM(ResolutionWidth + k)` (Q30) | 2,085 ms | 9-14 ms | 30 ms |
+
+Q4's 3.4M entries are the walk of every header, as for the top k of §36.
+
+### Tests
+
+`test/sql/keyaggs.sql`: every answer against a sequential scan. int2, int4 with NULLs, int8 whose
+sum passes int8's range, text, date and bool columns and a two-column index's second column; sums,
+averages, extremes and `bool_and`/`bool_or`/`every` of the column and of expressions of it, NULL for
+some keys; a HAVING on the one row; the entries' own counts on an all-visible heap, and each entry
+counted after a DELETE, beside this transaction's own insert and delete, and again after VACUUM;
+an empty table and one of NULLs only; and the declines - a WHERE, a GROUP BY, two columns in one
+argument, a volatile argument, DISTINCT, FILTER, ORDER BY, a numeric column, the aggregates no
+sum of keys answers, and a partial index.
