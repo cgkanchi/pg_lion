@@ -516,6 +516,58 @@ lion_probe_sort(Relation index, AttrNumber attno, Oid keytype, int nvalues,
 }
 
 /*
+ * Keep one of each run of byte-for-byte equal values in a list that
+ * lion_probe_sort() has sorted, hashes and all: they are the same key, and
+ * the sort puts them side by side.  The lookup would skip the rest anyway,
+ * but a list located a batch at a time runs a batch on past its size while
+ * the hash stays the same, so a list of one value repeated millions of times
+ * was one batch of that many sets.  typbyval and typlen are the values' own.
+ * Returns how many are left.
+ */
+int
+lion_probe_sort_unique(Datum *sorted, uint32 *hashes, int n, bool typbyval,
+					   int16 typlen)
+{
+	int			in;
+	int			out = 1;
+
+	if (n <= 1)
+		return n;
+	for (in = 1; in < n; in++)
+	{
+		if (hashes[in] == hashes[out - 1] &&
+			datumIsEqual(sorted[in], sorted[out - 1], typbyval, typlen))
+			continue;
+		sorted[out] = sorted[in];
+		hashes[out] = hashes[in];
+		out++;
+	}
+	return out;
+}
+
+/*
+ * What one value of an IN list costs once located: its LionPostingSet, the
+ * copies of its INLINE payload and stored key, its leaf of the source's tree
+ * and the pointer to it - some 200 bytes, rounded up.
+ */
+#define LION_ARRAY_SET_BYTES	256
+
+/*
+ * The most values of one IN list a count locates at once (DESIGN.md §15, "A
+ * list too long to locate at once"): what a work_mem of located sets holds,
+ * and never fewer than the longest list a literal may be, which is located
+ * whole as it always was.
+ */
+int
+lion_array_batch_size(void)
+{
+	Size		n = (Size) work_mem * 1024 / LION_ARRAY_SET_BYTES;
+
+	n = Min(n, (Size) (INT_MAX / 2));
+	return (int) Max(n, (Size) LION_MAX_ARRAY_ELEMS);
+}
+
+/*
  * Fill *ps from the entry the caller has located at (buf, offnum), which is a
  * directory leaf held SHARE, and release the buffer - keeping its pin when the
  * entry is INLINE, because that pin is the DESIGN.md §9 interlock.

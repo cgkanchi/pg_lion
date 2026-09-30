@@ -529,14 +529,6 @@
 	((k) == LION_CLAUSE_EQ || (k) == LION_CLAUSE_NULL)
 
 /*
- * An `IN` list longer than this is not pushed down: every listed value needs
- * its own posting set, and each of those may hold a buffer pin for as long as
- * the node runs (DESIGN.md §9).  A long list is also exactly the case where
- * the ordinary bitmap plan does well.
- */
-#define LION_MAX_ARRAY_ELEMS		1000
-
-/*
  * What the tests of a count(DISTINCT k) walk are (DESIGN.md §26), as far as
  * the cost model is concerned: none at all, existence tests that stop at the
  * first visible row, or full counts because the target list wants rows too.
@@ -2257,7 +2249,6 @@ extern void lion_eval_clause_values(LionCountScanState *st);
 extern LionKeyNode *lion_key_node(int keyno);
 extern LionKeyNode *lion_bool_node(LionKeyNodeKind kind, LionKeyNode **args,
 								   int nargs);
-extern int lion_array_batch_size(void);
 extern void lion_build_filter(LionCountScanState *st);
 extern void lion_locate_where(LionCountScanState *st);
 extern void lion_release_where(LionCountScanState *st);

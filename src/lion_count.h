@@ -60,6 +60,16 @@
 #define LION_GROUP_BATCH_MAX	256
 
 /*
+ * An `IN` list longer than this is not pushed down: every listed value needs
+ * its own posting set, and each of those may hold a buffer pin for as long as
+ * the node runs (DESIGN.md §9).  A long list is also exactly the case where
+ * the ordinary bitmap plan does well.  A list whose length the planner cannot
+ * see is answered at any length, and one longer than this may be located a
+ * batch at a time (lion_array_batch_size()).
+ */
+#define LION_MAX_ARRAY_ELEMS		1000
+
+/*
  * Instrumentation, reported by lion_index_count_stats() and by
  * EXPLAIN ANALYZE of the LionCount node.
  */
@@ -955,6 +965,15 @@ extern void lion_bits_to_container(const uint64 *w, uint32 ckey,
 extern int	lion_probe_sort(Relation index, AttrNumber attno, Oid keytype,
 							int nvalues, const Datum *values,
 							const bool *isnull, Datum *sorted, uint32 *hashes);
+extern int	lion_probe_sort_unique(Datum *sorted, uint32 *hashes, int n,
+								   bool typbyval, int16 typlen);
+
+/*
+ * The most values of one IN list a count locates at once (DESIGN.md §15, "A
+ * list too long to locate at once"), the pushdown's plain count and
+ * lion_index_count_any() alike.
+ */
+extern int	lion_array_batch_size(void);
 extern void lion_stream_end(LionSetStream *st);
 
 /*

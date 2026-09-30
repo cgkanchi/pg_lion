@@ -3278,6 +3278,19 @@ size" where the ordinary plan answers. Two things now:
   hash alike and sort together - are never in two batches, and neither is any entry: the argument
   of the plain scan's pieces (§29.4). A batch none of whose values has an entry adds nothing.
   EXPLAIN ANALYZE prints `List Batches` when there were any.
+- **So does `lion_index_count_any()`** (`lion_count_any_batched()`, 2026-09-29 review), which is
+  that count's SQL form and had been left out of it: it still located every value's set at once,
+  so its array of sets failed the same way at nine million values ("invalid memory alloc request
+  size 1080000000", where `k = ANY (...)` answered) and before that held a gigabyte at five million
+  (1.09 GB of VmHWM against the node's 260 MB). A list longer than `lion_array_batch_size()` is
+  now sorted, byte-for-byte repeats dropped (`lion_probe_sort_unique()`, the node's own), and
+  located, counted and released a batch at a time, the batches sharing one visibility cache as the
+  node's do: 243 MB of VmHWM at five million values, against the node's 263 MB on the same server. A list within the batch size is
+  located whole, exactly as before; the element types, collations and NULLs a call accepts are the
+  same either way, because everything the batches do is what one lookup of the whole list did, in
+  pieces. `test/sql/countany_long.sql` checks it against the query's own answer across the batch
+  boundaries, with repeats, NULLs, other element types and citext's equal-but-not-identical keys,
+  and at nine million elements.
 - **Every other shape holds the list whole, in a huge allocation**, so that it answers at any length
   the array itself can have instead of failing at nine million values. A GROUP BY, a count(DISTINCT)
   and an FK-side join count the list many times over - batching it would locate it again for every
