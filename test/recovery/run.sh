@@ -23,8 +23,8 @@
 #              Phase 2 then expects the standby to TRUST the visibility map,
 #              which is the property §25 buys.
 #   --phases   which phases to run, e.g. "3" or "2 3" (default: all of
-#              "1 1b 1c 1d 1e 1f 2 3").  For development, and for a server
-#              without injection points, which can run only "1 1f 2" (CI's
+#              "1 1b 1c 1d 1e 1f 2 3 4").  For development, and for a server
+#              without injection points, which can run only "1 1f 2 4" (CI's
 #              packaged-server jobs do); `make recovery-check` always runs
 #              everything.
 #   --conf     an extra postgresql.conf line for the primary (repeatable),
@@ -90,6 +90,12 @@
 #            cancelled with a recovery conflict - never silently answered with
 #            a different number.  Then promote it and verify every index again.
 #
+#   Phase 4  lion_index_verify() in a loop on a hot standby while the primary
+#            inserts into the posting sets it walks, with a watchdog that fails
+#            the phase once replay stops moving: verify() used to hold a
+#            directory leaf while it locked posting pages, which replay locks
+#            the other way round, and the two deadlocked for good.
+#
 # See test/recovery/README.md for what is deliberately not covered.
 #
 # The cluster discipline is bench/lib.sh's: a private socket directory and port
@@ -118,7 +124,7 @@ REQUIRE_INJECTION=${INJECTION_POINTS:-0}
 ITERS=8
 KEEP=0
 MODE=generic
-PHASES="1 1b 1c 1d 1e 1f 2 3"
+PHASES="1 1b 1c 1d 1e 1f 2 3 4"
 EXTRA_CONF=()
 
 # Set by make_private_dirs(), which the main section calls once the arguments
@@ -146,6 +152,7 @@ BUILDDIR=""
 VACLOOP=""
 VACPID=""
 RRPID=""
+P4PIDS=""
 GENERIC_TOTAL=0
 SUMMARY=()
 PHASE3_FAILS=()
@@ -287,10 +294,13 @@ remove_private_dir() {
 
 # ---------------------------------------------------------------- shutdown
 
+# A cluster that is not running is left as it is: pg_ctl stop fails on one,
+# and without the `|| true` set -e would end the whole run there, silently -
+# which is what phase 4 met, calling this on the standby phase 3 had stopped.
 stop_hard() {
 	local d=$1
 	[ -n "$d" ] && [ -d "$d" ] || return 0
-	as_server "$PGBIN/pg_ctl" -D "$d" stop -m immediate -w -t 30 >/dev/null 2>&1
+	as_server "$PGBIN/pg_ctl" -D "$d" stop -m immediate -w -t 30 >/dev/null 2>&1 || true
 	return 0
 }
 
@@ -309,6 +319,7 @@ cleanup() {
 	trap - EXIT
 	set +e
 	kill_tree "$RRPID"
+	for p in $P4PIDS; do kill_tree "$p"; done
 	kill_tree "$VACPID"
 	kill_tree "$VACLOOP"
 	stop_hard "$STANDBY_DATA"
@@ -2100,6 +2111,169 @@ phase3() {
 		die "phase 3: a standby reader was overtaken by replay in: ${PHASE3_FAILS[*]}"
 }
 
+# ---------------------------------------------------------------- phase 4
+
+# lion_index_verify() on a hot standby while replay writes the posting sets it
+# walks (DESIGN.md §7, §11, §25).  Redo takes the blocks of a record in the
+# order the writer registered them and holds every one to the end of the
+# record, and every record that changes a posting set registers the set's
+# pages BEFORE the entry's directory leaf - an insert's, a split's, a
+# push-down's, VACUUM's - so replay locks container page, then leaf: the
+# reverse of the primary's order.  verify() used to walk a set on a standby
+# with that leaf held SHARE, and its heapallindexed lookups descended a set
+# with it held, on a primary too: leaf, then container page.  The startup process and the
+# backend then waited for each other on buffer content locks, which have no
+# deadlock detector and ignore cancel and terminate; replay stopped for good,
+# `pg_ctl stop -m fast` hung, and only an immediate shutdown got the standby
+# back.
+#
+# So: inserts into three hot keys on the primary, and verify() in two loops on
+# the standby - structural, and with heapallindexed - for PHASE4_SECS
+# seconds (default 12).  A watchdog fails the phase once replay has not moved
+# for PHASE4_STALL seconds (default 10) while the standby holds WAL it has
+# received and not replayed: that deadlock never ends, so it cannot hang the
+# run, and statement_timeout could not have ended it - a backend waiting for
+# a buffer lock never looks at it.  Every verify() call must return, and
+# return without an error.  Then, caught up, verify() and the counts once more
+# on the quiet standby.
+
+# p4_verify_loop <label> <heapallindexed> <deadline ms>: verify() on the standby
+# until the deadline; "<calls ok> <calls failed>" goes to $BASE/p4_<label>.n.
+p4_verify_loop() {
+	local label=$1 hai=$2 deadline=$3 ok=0 bad=0
+	while [ "$(now_ms)" -lt "$deadline" ]; do
+		if psql_s -c "select lion_index_verify('sv_k'::regclass, $hai)" \
+			>>"$BASE/p4_$label.out" 2>>"$BASE/p4_$label.err"; then
+			ok=$((ok + 1))
+		else
+			bad=$((bad + 1))
+		fi
+	done
+	echo "$ok $bad" >"$BASE/p4_$label.n"
+}
+
+# p4_bounded <program> [args]: through timeout(1) where there is one, so that
+# not even a standby that stopped answering can hang the watchdog.
+p4_bounded() {
+	if command -v timeout >/dev/null 2>&1; then
+		timeout 10 "$@"
+	else
+		"$@"
+	fi
+}
+
+# The standby's replay position, and whether it has received WAL beyond it.
+p4_replay_state() {
+	p4_bounded "$PGBIN/psql" -X -q -tA -F' ' -h "$SOCKDIR" -p "$STANDBY_PORT" \
+		-U postgres -d "$DBNAME" -c \
+		"select pg_last_wal_replay_lsn(), pg_last_wal_receive_lsn() > pg_last_wal_replay_lsn()" \
+		2>/dev/null || echo "? ?"
+}
+
+phase4() {
+	local secs=${PHASE4_SECS:-12} stall=${PHASE4_STALL:-10} deadline cap
+	local wpid spid hpid t lsn behind lastlsn="" lastmove longest=0 alive
+	local lsn0 lsn1 n_s n_h bad_s bad_h nwarn p
+	log ""
+	log "=== phase 4: lion_index_verify() on a hot standby beside replay (${secs}s) ==="
+
+	# A standby of its own: phase 2 promotes the one it made, phase 3 stops
+	# its own.
+	stop_hard "$STANDBY_DATA"
+	rm -rf "$STANDBY_DATA"
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 4: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS sv;
+		CREATE TABLE sv (k int NOT NULL, r int);
+		-- three keys, each a posting tree of about ten leaves and a root
+		INSERT INTO sv SELECT g % 3, g FROM generate_series(1, 300000) g;
+		CREATE INDEX sv_k ON sv USING lion (k);
+	SQL
+	psql_p -c "VACUUM (FREEZE, ANALYZE) sv" >>"$RUNLOG" 2>&1 ||
+		die "phase 4: VACUUM of the fixture failed"
+	[ "$(psql_p -tAc "select max_posting_height > 0 and inline_entries = 0 from lion_index_stats('sv_k')")" = t ] ||
+		die "phase 4: the fixture's sets are not posting trees"
+
+	basebackup_standby
+	wait_catchup
+
+	cat >"$BASE/p4_writer.sql" <<-'EOF2'
+		\set k random(0, 2)
+		INSERT INTO sv SELECT :k, g FROM generate_series(1, 5) g;
+	EOF2
+	: >"$BASE/p4_s.out"; : >"$BASE/p4_s.err"; : >"$BASE/p4_h.out"; : >"$BASE/p4_h.err"
+	rm -f "$BASE/p4_s.n" "$BASE/p4_h.n"
+	lsn0=$(psql_p -tAc "select pg_current_wal_insert_lsn()")
+	t=$(now_ms)
+	deadline=$((t + secs * 1000))
+	cap=$((deadline + 60000))
+
+	PGOPTIONS='-c synchronous_commit=off' \
+		"$PGBIN/pgbench" -n -T "$secs" -c 4 -j 2 -f "$BASE/p4_writer.sql" \
+		-h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres "$DBNAME" \
+		>"$BASE/p4_writer.log" 2>&1 &
+	wpid=$!
+	p4_verify_loop s false "$deadline" &
+	spid=$!
+	p4_verify_loop h true "$deadline" &
+	hpid=$!
+	P4PIDS="$wpid $spid $hpid"
+
+	# The watchdog, until the writer and both loops are done.
+	lastmove=$(now_ms)
+	while :; do
+		alive=0
+		for p in $wpid $spid $hpid; do
+			kill -0 "$p" 2>/dev/null && alive=1
+		done
+		[ "$alive" = 0 ] && break
+		t=$(now_ms)
+		read -r lsn behind <<<"$(p4_replay_state)"
+		if [ "$lsn" != "$lastlsn" ] || [ "$behind" != t ]; then
+			[ $((t - lastmove)) -gt "$longest" ] && longest=$((t - lastmove))
+			lastlsn=$lsn
+			lastmove=$t
+		elif [ $((t - lastmove)) -ge $((stall * 1000)) ]; then
+			{ echo "---- phase 4: the standby's backends when replay stopped";
+			  p4_bounded "$PGBIN/psql" -X -h "$SOCKDIR" -p "$STANDBY_PORT" -U postgres -d "$DBNAME" -c \
+				"select pid, backend_type, state, wait_event_type, wait_event, left(query, 60) as query from pg_stat_activity where backend_type in ('startup', 'client backend') and pid <> pg_backend_pid()" || true; } |
+				tee -a "$RUNLOG" >&2
+			die "phase 4: replay on the standby has not moved from $lsn for ${stall}s while WAL it received waits to be replayed: it is deadlocked against lion_index_verify() (DESIGN.md §25)"
+		fi
+		[ "$t" -lt "$cap" ] ||
+			die "phase 4: the writer or a standby verify() loop is still running $(( (t - deadline) / 1000 ))s after its deadline"
+		nap 0.5
+	done
+	P4PIDS=""
+	wait "$wpid" || die "phase 4: the pgbench writer failed: $(tail -3 "$BASE/p4_writer.log")"
+	wait "$spid" "$hpid" || true
+	lsn1=$(psql_p -tAc "select pg_current_wal_insert_lsn()")
+	cat "$BASE/p4_writer.log" "$BASE/p4_s.err" "$BASE/p4_h.err" >>"$RUNLOG"
+
+	read -r n_s bad_s <"$BASE/p4_s.n" || die "phase 4: the structural verify() loop left no count"
+	read -r n_h bad_h <"$BASE/p4_h.n" || die "phase 4: the heapallindexed verify() loop left no count"
+	[ "$bad_s" = 0 ] && [ "$bad_h" = 0 ] ||
+		die "phase 4: $bad_s structural and $bad_h heapallindexed verify() calls on the standby failed beside replay: $(grep -h ERROR "$BASE/p4_s.err" "$BASE/p4_h.err" | head -3)"
+	[ "$n_s" -gt 0 ] && [ "$n_h" -gt 0 ] ||
+		die "phase 4: a verify() loop made no call at all ($n_s structural, $n_h heapallindexed)"
+	nwarn=$(cat "$BASE/p4_s.err" "$BASE/p4_h.err" | grep -c '^WARNING' || true)
+
+	wait_catchup
+	run_check "phase 4 standby" psql_s "
+		select lion_index_verify('sv_k'::regclass, true) is not null, 'verify sv_k'
+		union all
+		select lion_index_count('sv_k'::regclass, k) = n, 'count k = ' || k
+		  from (select k, count(*) as n from sv group by k) s
+		union all
+		select (select count(*) from sv) = $(psql_p -tAc "select count(*) from sv"), 'rows'"
+
+	log "phase 4: $n_s structural and $n_h heapallindexed verify() calls on the standby beside replay of $(psql_p -tAc "select pg_size_pretty(pg_wal_lsn_diff('$lsn1', '$lsn0'))") of WAL; replay never stalled (longest pause $((longest / 1000)).$(( (longest % 1000) / 100 ))s); $nwarn warnings"
+	SUMMARY+=("phase4 standby      $n_s + $n_h verify() calls beside replay, none failed, replay never stalled")
+
+	stop_hard "$STANDBY_DATA"
+	psql_p -c "DROP TABLE sv" >>"$RUNLOG" 2>&1
+}
+
 # ---------------------------------------------------------------- main
 
 mkdir -p "$LOGDIR"
@@ -2146,6 +2320,7 @@ want_phase 1e && phase1e
 want_phase 1f && phase1f
 want_phase 2 && phase2
 want_phase 3 && phase3
+want_phase 4 && phase4
 
 END=$(now_ms)
 NWARN=$(wc -l <"$BASE/warnings.txt")

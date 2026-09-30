@@ -958,10 +958,10 @@ lion_verify_posting_level(LionVerifyState *vs, BlockNumber eblk,
  * statement as "the leaf right-link chain equals the in-order leaf sequence".
  *
  * `entry` is the caller's copy.  With `exact` the set cannot change while it
- * is walked - its entry's directory leaf is held, or this is a standby, where
- * nothing can be held against replay and the answer is what it always was -
- * and everything is checked and reported here but the totals, which
- * lion_verify_chain_totals() compares with the entry.
+ * is walked - its entry's directory leaf is held, which only a primary does
+ * (a standby must not: lion_verify_set_walks()) - and everything is checked
+ * and reported here but the totals, which lion_verify_chain_totals()
+ * compares with the entry.
  *
  * Without it, writers of the key may be changing the set, and this is one
  * attempt of lion_verify_set(), which reads the entry again afterwards and
@@ -1198,26 +1198,31 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
  * What a walk of a posting set is compared with its entry by: the last leaf
  * against `tail`, the TIDs and items against `ntids` and `ncontainers`.  Only
  * for a walk that is kept: an exact one, or one lion_verify_set() found the
- * entry unchanged around.  Also where a kept walk's unfinished-split warnings
- * are given, so that a walk that is thrown away and repeated gives them once.
+ * entry unchanged around - or, with compare false, the one a standby keeps of
+ * a set that replay would not leave alone, which is compared with nothing.
+ * Also where a kept walk's unfinished-split warnings are given, so that a walk
+ * that is thrown away and repeated gives them once.
  */
 static void
 lion_verify_chain_totals(LionVerifyState *vs, BlockNumber eblk,
 						 OffsetNumber eoff, const LionEntryTuple *entry,
-						 const LionVerifySetResult *res)
+						 const LionVerifySetResult *res, bool compare)
 {
 	int			i;
 
 	for (i = 0; i < res->nincomplete; i++)
 		lion_verify_warn_posting_incomplete(vs, res->incomplete[i]);
 
+	if (res->height > vs->max_posting_height)
+		vs->max_posting_height = res->height;
+
+	if (!compare)
+		return;
+
 	if (res->last != entry->tail)
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u ends at block %u, but its tail is block %u",
 					RelationGetRelationName(vs->index), eoff, eblk, res->last,
 					entry->tail);
-
-	if (res->height > vs->max_posting_height)
-		vs->max_posting_height = res->height;
 
 	if (res->card != entry->ntids)
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u claims " UINT64_FORMAT " TIDs, but its containers hold " UINT64_FORMAT,
@@ -1357,10 +1362,29 @@ lion_verify_refind(LionVerifyState *vs, LionEntryTuple *cur, BlockNumber *blkp,
  * LION_VERIFY_SET_ATTEMPTS times that way, and then once more with the leaf
  * held SHARE throughout.  That is the lock order every writer uses (directory
  * page before posting page, §5), and it keeps waiting only the writers of the
- * keys on that one leaf, for one walk of one set.  On a standby that walk is
- * the only one: replay does not lock the entry's leaf across its records, so
- * the entry reading the same proves nothing there, and verify() reports what
- * it finds, as it always did.
+ * keys on that one leaf, for one walk of one set.
+ *
+ * On a standby the set is walked the same way, and NEVER with its leaf held
+ * (DESIGN.md §25).  Replay takes the blocks of a record in the order the
+ * writer registered them and holds every one to the end of the record, and
+ * every record that changes a set registers the set's pages before the
+ * entry's leaf - so a walk holding the leaf waits for a posting page the
+ * startup process holds while the startup process waits for the leaf, on two
+ * buffer content locks, which no deadlock detector watches and no cancel
+ * reaches: replay stopped for good, and so did this backend (2026-09-29
+ * review; test/recovery/run.sh phase 4).  The entry reading the same both
+ * times settles a walk there too, for replay's own reason: every record that
+ * changes a set's items, its counters, its last leaf or the level of a leaf
+ * root carries the entry, and the records that do not - a downlink, a flag
+ * cleared, an internal page split, an internal root pushed down - change
+ * nothing the entry counts and are what the walk accepts from a writer
+ * between two levels, or throws away.  A set that replay keeps changing has
+ * no last resort there, so after LION_VERIFY_SET_ATTEMPTS walks the next one
+ * that gets to the end of the set is kept - every page it read is checked -
+ * and its totals are not compared with the entry, which a WARNING says.
+ * Only a root pushed down or an upper level split under the walk stops one
+ * short of the end, and a set that does that to LION_VERIFY_STANDBY_WALKS
+ * walks is an ERROR asking for replay to be paused.
  */
 static void
 lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
@@ -1376,8 +1400,7 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 
 	memcpy(cur, entry, sz);
 
-	for (attempt = 0; vs->concurrent && attempt < LION_VERIFY_SET_ATTEMPTS;
-		 attempt++)
+	for (attempt = 0;; attempt++)
 	{
 		LionEntryTuple before = *cur;
 		bool		ok;
@@ -1402,7 +1425,24 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		if (ok && lion_verify_same_entry(&before, cur))
 		{
 			lion_verify_track_end(vs, true);
-			lion_verify_chain_totals(vs, blk, off, cur, &res);
+			lion_verify_chain_totals(vs, blk, off, cur, &res, true);
+			pfree(cur);
+			return;
+		}
+
+		/* A standby's last resort: the walk, without the totals (above). */
+		if (!vs->concurrent && ok && attempt + 1 >= LION_VERIFY_SET_ATTEMPTS &&
+			(cur->flags & LION_ENTRY_CHAIN) != 0)
+		{
+			lion_verify_track_end(vs, true);
+			lion_verify_chain_totals(vs, blk, off, cur, &res, false);
+			vs->nsetuncompared++;
+			ereport(WARNING,
+					(errmsg("lion index \"%s\": the totals of chain entry %u on block %u were not compared with its posting set",
+							RelationGetRelationName(vs->index), off, blk),
+					 errdetail("Recovery changed the set during each of the %d walks made of it; every page of the last one was checked.",
+							   attempt + 1),
+					 errhint("Run the check with replay paused (pg_wal_replay_pause(), then pg_wal_replay_resume()) to compare them.")));
 			pfree(cur);
 			return;
 		}
@@ -1411,12 +1451,28 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		lion_verify_track_end(vs, false);
 		vs->nsetretries++;
 		if ((cur->flags & LION_ENTRY_CHAIN) == 0)
-			break;				/* the exact walk below reports it */
+			break;				/* reported below */
+		if (attempt + 1 >= (vs->concurrent ? LION_VERIFY_SET_ATTEMPTS :
+							LION_VERIFY_STANDBY_WALKS))
+			break;
+	}
+
+	if (!vs->concurrent)
+	{
+		if ((cur->flags & LION_ENTRY_CHAIN) == 0)
+			lion_corrupt("lion index \"%s\": chain entry %u on block %u is an inline entry now",
+						RelationGetRelationName(vs->index), off, blk);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("lion index \"%s\": could not walk the posting set of chain entry %u on block %u to its end",
+						RelationGetRelationName(vs->index), off, blk),
+				 errdetail("Recovery changed the upper levels of the set during each of the %d walks made of it.",
+						   attempt + 1),
+				 errhint("Run the check with replay paused (pg_wal_replay_pause(), then pg_wal_replay_resume()).")));
 	}
 
 	vs->nsetwalks++;
-	if (vs->concurrent)
-		vs->nsetholds++;
+	vs->nsetholds++;
 	leaf = lion_verify_refind(vs, cur, &blk, &off, true);
 
 	/*
@@ -1431,7 +1487,7 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 					RelationGetRelationName(vs->index), off, blk);
 	memset(&res, 0, sizeof(res));
 	(void) lion_verify_chain(vs, blk, off, cur, true, &res);
-	lion_verify_chain_totals(vs, blk, off, cur, &res);
+	lion_verify_chain_totals(vs, blk, off, cur, &res, true);
 	UnlockReleaseBuffer(leaf);
 	pfree(cur);
 }
@@ -1785,11 +1841,12 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	 * What writers running beside the check cost it (DESIGN.md §7), in the
 	 * spirit of ambulkdelete's DEBUG1 breakdown.
 	 */
-	elog(DEBUG1, "lion index \"%s\": %u blocks at the start and %u at the end; %d candidates settled after %d waits; %lld left links and %lld root flags settled on the spot; %lld posting-set walks, %lld thrown away, %lld with the leaf held",
+	elog(DEBUG1, "lion index \"%s\": %u blocks at the start and %u at the end; %d candidates settled after %d waits; %lld left links and %lld root flags settled on the spot; %lld posting-set walks, %lld thrown away, %lld with the leaf held, %lld kept uncompared",
 		 RelationGetRelationName(vs.index), vs.startblocks, vs.nblocks,
 		 vs.ncands, vs.nwaits, (long long) vs.nleftlinks,
 		 (long long) vs.nrootsplits, (long long) vs.nsetwalks,
-		 (long long) vs.nsetretries, (long long) vs.nsetholds);
+		 (long long) vs.nsetretries, (long long) vs.nsetholds,
+		 (long long) vs.nsetuncompared);
 
 	if (heapallindexed)
 		lion_verify_heapallindexed(&vs);
