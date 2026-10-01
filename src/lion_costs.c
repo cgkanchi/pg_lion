@@ -283,15 +283,17 @@ lion_costs_init(void)
 
 	/*
 	 * THE MARGIN (DESIGN.md §39): a lion custom path's own price, converted
-	 * into its competitor's units, is divided by it - so a lion path is
-	 * chosen only where its price is at most this share of the best core
-	 * path's, and a near tie goes to core.  Its default is §39's.
+	 * into its competitor's units, is divided by it - so that below 1 a lion
+	 * path is chosen only where its price is at most this share of the best
+	 * core path's, and a near tie goes to core.  1, no margin, by default:
+	 * §39's matrix found lion the faster plan in most of its near ties, and
+	 * every plan a margin moved moved to a slower one.
 	 */
 	DefineCustomRealVariable("pg_lion.pushdown_margin",
 							 "Sets the share of the cheapest competing plan's cost a lion custom path's own price must come to for it to be chosen.",
 							 "The price of a LionCount, LionSemiJoin, LionAntiJoin or LionOrdered path is divided by it (DESIGN.md §39); 1 is no margin.",
 							 &lion_pushdown_margin,
-							 0.8,
+							 1.0,
 							 0.01, 1.0,
 							 PGC_USERSET,
 							 GUC_EXPLAIN,
