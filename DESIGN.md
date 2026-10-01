@@ -16767,3 +16767,73 @@ and the 200 x 20 (60.7 against 36.8) stay refused as long as lion's price for th
 times the hash aggregate's (0.42 over 0.8), which an honest price - 3.6 and 4.1 times, at 500 and
 200 units a millisecond - is; `test/sql/pushdown.sql` pins both, and a regenerated expected output
 that loses either is a regression of this rung.
+
+### The matrix (`bench/calib/`)
+
+§31's decision matrix, in the tree this time and on synthetic tables only: `bench/calib/setup.sql`
+builds §31's `s` shape (`calib_s`: ints of 2, 20, 200, 20,000 and 1M values at random, 200 values
+in heap order, a skewed column, a 10% NULL one, lion indexes on each, btrees beside three and on
+`(k, id)` for `ORDER BY`) and §27's FK shape (`calib_f` over `calib_d`, 20 rows a key, and over
+`calib_dk`, 1,000 keys) at 2M rows by default, optionally with a percentage of `calib_s`'s rows
+updated after the VACUUM (`--dirty`). `bench/calib/matrix.py` (Python's standard library and
+`psql`) plans each of 39 queries - counts under equality, IN, AND, NULL and skew (`eq`), ranges
+(`range`), GROUP BY, two-column GROUP BY, `count(DISTINCT)` and the top k (`group`), FK-side joins
+and semi and anti joins (`fk`), `ORDER BY ... LIMIT` under a lion filter (`ordered`) - under eleven
+arms: the planner's choice, lion forced (every core scan and join method off), lion off, and each
+core alternative forced (sequential, bitmap, index, hashed and sorted aggregates, the three join
+methods). Each distinct plan is timed once per round with `EXPLAIN (ANALYZE, TIMING OFF)`, the
+median of five rounds after a warm-up, interleaved, serial and without JIT. It prints the chosen
+and fastest plan of each query, the mispicks by §31's rule (15% and 0.05 ms), each kind of plan's
+cost units a millisecond, and for `--sweep NAME=V1,..` - by default the margin from 1 to 0.5 - the
+planner's choices and mispicks at each value; `matrix.py compare A.json B.json` sets two runs side
+by side.
+
+**Not run yet.** The session that wrote this section could not start a server (the sandbox refused
+to run commands as the unprivileged user PostgreSQL needs), so the tables this section is to hold -
+the matrix before (dc7cd29, the merge base) and after, on PostgreSQL 18, warm - are not here, and
+neither are the regenerated expected outputs; nothing in this section above "The matrix" has been
+measured on this code. The run, on a server started as the unprivileged user with the library of
+each build installed in turn:
+
+```sh
+python3 bench/calib/matrix.py --setup-only --rows 2000000
+# the library of dc7cd29, installed; a new connection loads it
+python3 bench/calib/matrix.py --label before --out before.json
+# the library of this branch, installed
+python3 bench/calib/matrix.py --label after --out after.json
+python3 bench/calib/matrix.py --label own --out own.json --set pg_lion.pushdown_margin=1 \
+    --set pg_lion.hashagg_rate=1 --set pg_lion.hashjoin_rate=1 --set pg_lion.nestloop_rate=1
+python3 bench/calib/matrix.py compare before.json after.json
+```
+
+`own.json`'s units a millisecond by kind are the rates' measurement: a kind's rate is its median
+over the lion paths' median there. The margin's sweep in `after.json` is what keeps 0.8 or moves it.
+
+### Tests
+
+`test/sql/costrates.sql`: the settings and their ranges; the margin as a threshold - a count the
+node wins by far is chosen at a margin just above the ratio of its price to core's best and is not
+just below it - that divides a forced LionCount's and a forced LionOrdered's cost by exactly the
+margin, that core's `enable_*` settings still force at the dearest margin (0.01) and lion's
+switches still leave out with none; each kind of competitor made the cheapest by core's settings
+(a plain aggregate over a sequential scan, a hash aggregate, the join methods) moving the cost of
+the count, the GROUP BY, the FK-side join and the semi and anti join paths linearly with its own
+rate and not at all with any other, and deciding the GROUP BY at the lowest and the highest rate;
+the AM's scans unmoved by any rate or margin and LionOrdered by any rate; and every plan's rows
+against the pushdown off and sequential scans only. Its expected output is written from the
+design and has not been run. `costgucs.sql` lists 38 cost settings with `resident_page_cost`.
+
+### Not done
+
+- **The measurements** above, and with them the expected outputs of every test whose plans or
+  costs move: every lion custom path's EXPLAIN cost changes by its rate, its margin and its index
+  pages, so every expected output that prints a lion path's cost, or pins a choice near a tie,
+  has to be regenerated and each change read (no answer may change: the tests check answers
+  against sequential scans).
+- **Bitmap heap scans** have one rate for plans that run at 70 and at 4,400 units a millisecond;
+  splitting the kind by what the scan's price is made of (pages or TIDs) would let §22's BitmapAnd
+  have its own rate.
+- **LionOrdered** is not converted: its competitors are the reference or have no one rate. A
+  sorted aggregate's or a top-N sort's rate could be measured and given it.
+- **The parallel GROUP BY's participants** are priced with the serial node's competitor; core's
+  partial paths are not searched for one of their own.
