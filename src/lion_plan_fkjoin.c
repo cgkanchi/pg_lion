@@ -1092,10 +1092,12 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	bool		walk;
 	bool		sum;
 	Cost		run;
+	Cost		sortcost = 0;
 	Cost		startup;
 	int			flags;
 	AggStrategy aggstrategy;
 	AggClauseCosts agg_costs;
+	LionUnits	units;
 
 	/*
 	 * What a child row takes of a batch looked up in key order: its columns
@@ -1107,12 +1109,25 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 				 get_typavgwidth(fj->pkvar->vartype, fj->pkvar->vartypmod) :
 				 child->pathtarget->width);
 
+	/*
+	 * What the node does over the fact side, and the sort of a forward semi
+	 * join's keys, are its own price, in the units of the cheapest core path
+	 * of the grouped rel (DESIGN.md §39); the child is core's, priced by core.
+	 */
+	lion_units_for(output_rel, &units);
+	lion_units_begin(&units);
 	run = lion_cost_fkjoin_path(root, rel, targets, fj->fkvar, joinclause,
 								whereclauses, wherekinds, ors, childrows,
 								childfound,
 								jointype != LION_JOIN_INNER ||
 								(emitrows && !counts),
 								rowbytes, workers, &collect, &walk, false);
+	if (unique)
+		sortcost = lion_fkjoin_sort_cost(child->rows,
+										 child->pathtarget->width);
+	lion_units_end();
+	run = lion_units_price(&units, run);
+	sortcost = lion_units_price(&units, sortcost);
 
 	/*
 	 * Partial counts and nothing else - no dimension column to group by or
@@ -1134,9 +1149,8 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	startup = child->startup_cost;
 	if (unique)
 	{
-		startup = child->total_cost +
-			lion_fkjoin_sort_cost(child->rows, child->pathtarget->width);
-		run += startup - child->total_cost;
+		startup = child->total_cost + sortcost;
+		run += sortcost;
 	}
 
 	cpath = makeNode(CustomPath);
@@ -1181,7 +1195,7 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	/* ... or one, their sum, when that is all the target wants */
 	if (sum)
 		rows = 1.0;
-	run += rows * LION_FKJOIN_ROW_COST;
+	run += lion_units_price(&units, rows * LION_FKJOIN_ROW_COST);
 	cpath->path.rows = rows;
 	cpath->path.startup_cost = startup;
 	cpath->path.total_cost = child->total_cost + run;
@@ -2165,6 +2179,7 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 	bool		walk;
 	Cost		run;
 	Cost		startrun;
+	LionUnits	units;
 	ListCell   *lc;
 
 	/*
@@ -2227,6 +2242,14 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 	dimrows = clamp_row_est(outerrel->rows);
 	rowbytes = (double) LION_FKJOIN_BATCH_ENT_BYTES +
 		MAXALIGN(outerrel->reltarget->width);
+
+	/*
+	 * Priced in the units of the cheapest of core's joins the join rel has
+	 * (DESIGN.md §39): the node's own work over the fact side, `run` and
+	 * `startrun`; the child and the rows it emits are core's prices.
+	 */
+	lion_units_for(joinrel, &units);
+	lion_units_begin(&units);
 	run = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar,
 								setup.joinclause, setup.whereclauses,
 								setup.wherekinds, ors, dimrows, dimrows, true,
@@ -2248,6 +2271,9 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 									 setup.wherekinds, ors, firstrows,
 									 firstrows, true, rowbytes, 0, &collect,
 									 &walk, true);
+	lion_units_end();
+	run = lion_units_price(&units, run);
+	startrun = lion_units_price(&units, startrun);
 	foreach(lc, outerrel->pathlist)
 	{
 		Path	   *child = (Path *) lfirst(lc);
@@ -2289,6 +2315,7 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 			double		childrows = clamp_row_est(dimrows /
 												  lion_parallel_divisor(workers));
 
+			lion_units_begin(&units);
 			run = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar,
 										setup.joinclause, setup.whereclauses,
 										setup.wherekinds, ors, childrows,
@@ -2302,6 +2329,9 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 											 setup.wherekinds, ors, firstrows,
 											 firstrows, true, rowbytes,
 											 workers, &collect, &walk, true);
+			lion_units_end();
+			run = lion_units_price(&units, run);
+			startrun = lion_units_price(&units, startrun);
 			foreach(lc, outerrel->partial_pathlist)
 			{
 				Path	   *child = (Path *) lfirst(lc);

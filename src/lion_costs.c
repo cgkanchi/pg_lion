@@ -15,8 +15,13 @@
  *		value the price was fitted or derived at: the comment above each
  *		macro is why it is that value.
  *
- *		This file holds nothing but the table of them and its registration,
- *		called from _PG_init.
+ *		The rates of DESIGN.md §39 are here too: the cost units a millisecond
+ *		of each kind of core plan, as a multiple of the reference the
+ *		multipliers are fitted at, which a lion path is priced in against
+ *		that kind of plan (lion_plan_units.c).
+ *
+ *		This file holds nothing but the tables of them and their
+ *		registration, called from _PG_init.
  *
  *-------------------------------------------------------------------------
  */
@@ -70,6 +75,12 @@ double		lion_fkjoin_sort_compare_cost;
 double		lion_fkjoin_sort_key_cost;
 double		lion_fkjoin_sort_seq_page_cost;
 double		lion_fkjoin_sort_random_page_cost;
+double		lion_hashagg_rate;
+double		lion_agg_rate;
+double		lion_hashjoin_rate;
+double		lion_mergejoin_rate;
+double		lion_nestloop_rate;
+double		lion_bitmap_rate;
 
 typedef struct LionCostSetting
 {
@@ -178,11 +189,54 @@ static const LionCostSetting lion_cost_settings[] = {
 };
 
 /*
+ * THE COMPETITORS' UNITS (DESIGN.md §39).  Lion's CPU constants are fitted at
+ * 500 cost units a millisecond, the middle of core's sequential and
+ * index-only scans (§10, "The reference"); core's other plans run at rates
+ * of their own, and a lion path is priced in the units of the plan it
+ * competes with: its CPU terms times that plan's rate over 500, its pages as
+ * core prices pages (lion_plan_units.c).  pg_lion.<kind>_rate is that ratio
+ * for one kind of core plan, its default what §10's table measured; a kind
+ * the table has too little of to say, or whose rate is the reference, is
+ * priced at 1, as before.  Sequential, index-only and plain index scans are
+ * the reference itself and have no setting.
+ */
+typedef struct LionRateSetting
+{
+	const char *name;			/* the setting */
+	double	   *variable;		/* the rate it holds */
+	double		boot;			/* its default */
+	const char *desc;			/* the plans it is the rate of */
+} LionRateSetting;
+
+static const LionRateSetting lion_rate_settings[] = {
+	/* §10: 208 and 157 units a millisecond at 200 and 20,000 groups */
+	{"pg_lion.hashagg_rate", &lion_hashagg_rate, 0.42,
+	 "a hashed aggregate"},
+	/* §10: 401 to 695 over sequential scans, 415 to 536 over index-only ones */
+	{"pg_lion.agg_rate", &lion_agg_rate, 1.0,
+	 "a plain or sorted aggregate over a scan"},
+	/* §10: 280 and 283 with 1,000 to 4,400 rows hashed, 185 at 140,000 */
+	{"pg_lion.hashjoin_rate", &lion_hashjoin_rate, 0.5,
+	 "a hash join"},
+	/* no measurement */
+	{"pg_lion.mergejoin_rate", &lion_mergejoin_rate, 1.0,
+	 "a merge join"},
+	/* §10: 1,057 into a btree; §31: about 2,000 over warm indexes */
+	{"pg_lion.nestloop_rate", &lion_nestloop_rate, 2.0,
+	 "a nested loop into a parameterized index or bitmap scan"},
+	/* §10: 544 to 4,419 page-bound; §22: about 70 TID-bound - no one rate */
+	{"pg_lion.bitmap_rate", &lion_bitmap_rate, 1.0,
+	 "a bitmap heap scan"},
+};
+
+/*
  * Register the settings, from _PG_init.  They are user settings, real-valued
  * from 0 to DBL_MAX as core's cost settings are, and shown by EXPLAIN
  * (SETTINGS) when changed.  pg_settings lists them among the customized
  * options, as it does every extension's: no API puts a custom setting in one
  * of core's groups, and core's own records are not an extension's to edit.
+ * The rates are ratios, from a thousandth to a thousand: a rate of 0 would
+ * make lion's CPU free.
  */
 void
 lion_costs_init(void)
@@ -202,6 +256,22 @@ lion_costs_init(void)
 								 s->variable,
 								 s->boot,
 								 0.0, DBL_MAX,
+								 PGC_USERSET,
+								 GUC_EXPLAIN,
+								 NULL, NULL, NULL);
+	}
+
+	for (i = 0; i < (int) lengthof(lion_rate_settings); i++)
+	{
+		const LionRateSetting *s = &lion_rate_settings[i];
+
+		DefineCustomRealVariable(s->name,
+								 psprintf("Sets the planner's estimate of the cost units a millisecond of %s, as a multiple of the rate lion's CPU costs are fitted at.",
+										  s->desc),
+								 "Lion's CPU terms are priced at this multiple of their fitted cost against the cheapest core plan of this kind (DESIGN.md §39); 1 prices them as fitted.",
+								 s->variable,
+								 s->boot,
+								 0.001, 1000.0,
 								 PGC_USERSET,
 								 GUC_EXPLAIN,
 								 NULL, NULL, NULL);

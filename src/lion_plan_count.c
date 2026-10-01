@@ -2490,6 +2490,12 @@ lion_count_path_make(LionCountPathBuild *cx)
  * Price the path and add it to output_rel: below core's Finalize Agg for a
  * partitioned GROUP BY, and otherwise as it is - after the parallel GROUP BY
  * made from it, where there is one.
+ *
+ * The price is the node's own, in the units of the cheapest core path
+ * output_rel has (DESIGN.md §39): its CPU terms at that plan's rate, its
+ * pages as core prices them.  What core puts above it - the Finalize Agg of
+ * a partitioned or a parallel GROUP BY, the Gather - core prices itself, in
+ * its own units, as it prices the same nodes over its own plans.
  */
 static void
 lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
@@ -2501,6 +2507,10 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	LionCountTarget *first = cx->first;
 	LionRangeCost rangeprice;	/* ... and what its ranges pay */
 	Cost		serialrun;		/* the serial node's price, without HAVING */
+	LionUnits	units;			/* the competitor's (§39) */
+
+	lion_units_for(output_rel, &units);
+	lion_units_begin(&units);
 
 	/*
 	 * Beside a GROUP BY, count(DISTINCT k) is the (g, k) nested loop of
@@ -2555,6 +2565,12 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	if (cx->wattnos != NIL)
 		lion_cost_wagg_path(root, cpath, input_rel, cx->widx, cx->wcols,
 							cx->wnaggs, cx->wcounts);
+	lion_units_end();
+
+	cpath->path.startup_cost = lion_units_price(&units,
+												cpath->path.startup_cost);
+	cpath->path.total_cost = lion_units_price(&units, cpath->path.total_cost);
+	rangeprice.perrange = lion_units_price(&units, rangeprice.perrange);
 	serialrun = cpath->path.total_cost;
 
 	/*

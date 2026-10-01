@@ -631,6 +631,24 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `fkjoin_sort_seq_page_cost` | 0.75 | `seq_page_cost` | a page that sort writes or reads past `work_mem`, the sequential share |
 | `fkjoin_sort_random_page_cost` | 0.25 | `random_page_cost` | ... and the random share |
 
+Rate settings (DESIGN.md §39, "The competitor's units"). The cost settings above are fitted at 500
+cost units a millisecond, the rate of PostgreSQL's own sequential and index-only scans; its other
+plans run at rates of their own - a hash aggregate at about 200, a nested loop into a warm index at
+1,000 or more. A `LionCount`, `LionSemiJoin` or `LionAntiJoin` path is priced in the units of the
+cheapest PostgreSQL plan it competes with: its CPU terms times that kind of plan's rate below, its
+pages as PostgreSQL prices pages, so its cost in `EXPLAIN` is that plan's units. Set a rate to 1 to
+price Lion's CPU as fitted against that kind of plan; `SET client_min_messages = debug2` logs which
+kind each path was priced against.
+
+| `pg_lion.` | default | the PostgreSQL plans it is the rate of, as a multiple of 500 units a millisecond |
+|---|---|---|
+| `hashagg_rate` | 0.42 | an aggregate that hashes |
+| `agg_rate` | 1.0 | a plain or sorted aggregate over a scan |
+| `hashjoin_rate` | 0.5 | a hash join |
+| `mergejoin_rate` | 1.0 | a merge join |
+| `nestloop_rate` | 2.0 | a nested loop into a parameterized index or bitmap scan |
+| `bitmap_rate` | 1.0 | a bitmap heap scan |
+
 ## Known limitations
 
 Equality, `IN` lists, scalar ranges and the multi-key operators above are supported, through bitmap

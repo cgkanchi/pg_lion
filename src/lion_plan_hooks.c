@@ -74,6 +74,9 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		lion_prev_create_upper_paths_hook(root, stage, input_rel, output_rel,
 										 extra);
 
+	/* in the reference units until a path's price says otherwise (§39) */
+	lion_units_end();
+
 	if (stage != UPPERREL_GROUP_AGG)
 		return;
 	if (!lion_enable_count_pushdown)
@@ -151,6 +154,7 @@ lion_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 	if (lion_prev_set_join_pathlist_hook != NULL)
 		lion_prev_set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
 										 jointype, extra);
+	lion_units_end();
 
 	if (!lion_enable_count_pushdown || !lion_enable_semijoin)
 		return;

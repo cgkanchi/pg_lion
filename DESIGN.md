@@ -2380,7 +2380,9 @@ lion and core overcharge a warm page alike and `random_page_cost` moves both the
 core's hash aggregates and hash joins that rate makes lion honest and them cheap: where a grouped
 count competes with a hash aggregate on close to equal terms, the aggregate wins in the model and
 loses on the machine (§31 lists the cases). Pricing lion at the hash aggregate's rate instead would
-make it beat sequential and index-only scans it is up to twice as slow as.
+make it beat sequential and index-only scans it is up to twice as slow as. *(Since 2026-10-01 a
+lion custom path is priced at the rate of the plan it competes with - its CPU terms times that
+kind of plan's rate over this reference, its pages as here (§39).)*
 
 **The merge** (`lion_merge_cpu_cost()`; every count, every group and pair of a GROUP BY, the AND of
 a lion index scan's sets in `lioncostestimate()` - since 2026-09-28 with the lookups, unions and
@@ -16552,3 +16554,122 @@ counted after a DELETE, beside this transaction's own insert and delete, and aga
 an empty table and one of NULLs only; and the declines - a WHERE, a GROUP BY, two columns in one
 argument, a volatile argument, DISTINCT, FILTER, ORDER BY, a numeric column, the aggregates no
 sum of keys answers, and a partial index.
+
+## 39. The competitor's units, and a margin for the pushdown (2026-10-01)
+
+§10's "The reference" fits every CPU constant of lion's model at 500 cost units a millisecond, the
+middle of core's sequential scans (400 to 700) and index-only scans (415 to 535), so that lion is
+honest against them - and says what that costs: core's other plans run at rates of their own, and
+against them the same 500 is dishonest. A hash aggregate runs at 157 to 208 units a millisecond, a
+hash join at 57 to 283, a bitmap heap scan anywhere from 70 (TID-bound, §22) to 4,400 (page-bound),
+a nested loop into a warm btree at 1,057 (§10) to 2,000 (§31). Reproduced on a release PostgreSQL
+16, 2M rows of §31's `s` shape, 51% of the heap pages all-visible:
+
+| plan | cost | ms | units/ms |
+|---|---|---|---|
+| LionCount, `GROUP BY c200` | 86,261 | 169 | 510 |
+| sequential scan and HashAggregate | 68,232 | 325 | 210 |
+| LionCount, `count(*) WHERE c2 = 1` | 25,988 | 59 | 440 |
+| sequential scan and Aggregate | 65,494 | 249 | 263 |
+
+The node ran the GROUP BY 1.9 times faster and lost it by 26% on cost: priced in the units of a
+scan, it competed with a plan priced in units 2.4 times cheaper. And nothing stood between a near
+tie and the choice: `lion_count_path_add()` priced the path and called `add_path()`, which takes
+the cheaper by its fuzz factor of 1%. The outcomes are not symmetric - where lion wins it wins by 10
+to 100 times, where it loses it loses by 1.5 to 13 - and the losses of the last two passes were not
+constants: ClickBench Q15 (0451360, a clause a partial index's predicate implies priced twice) and
+a `count(DISTINCT)` priced as a walk it did not make were formulas, which no setting of the 37
+multipliers of §31 corrects. This section changes nothing in a formula and refits nothing; it
+corrects the units a lion path is compared in, and asks a lion path to win by a margin.
+
+### The competitor's units (`lion_plan_units.c`)
+
+A lion custom path is priced in the units of the cheapest core path of the relation it is added
+to - at the time it is added:
+
+- **Which path.** The upper rel's, for LionCount and the FK-side join (`create_upper_paths_hook`
+  runs after core has added every grouped path); the join rel's, for LionSemiJoin and LionAntiJoin
+  (`set_join_pathlist_hook` runs after core's paths for the join order and join type it is called
+  for, and the ones before it). Of those, the cheapest (fewest disabled nodes, then total cost) that
+  is not parameterized and has no lion custom path anywhere inside it (`lion_path_has_lion()`): an
+  Agg over a LionOrdered scan, or a hash join over a LionSemiJoin, is lion's plan as much as
+  core's. None - nothing of core's yet - prices at the reference.
+- **What kind of plan it is** (`lion_competitor_kind()`): down from its top, through the nodes that
+  pass a scan's or a join's rows up (projections, sorts, gathers, materializations, a LIMIT), to
+  the first that says what its units are. An aggregate that HASHES anywhere on the way - the
+  Partial HashAggregate under a Finalize Agg included - is a hashed aggregate. A join is its method:
+  a hash join, a merge join, or a nested loop whose inner side is an index or bitmap scan
+  parameterized by the outer rows (§10's and §31's nested loops; one over a materialized inner side
+  is CPU, and prices at the reference). A bitmap heap scan is one, aggregated or not. A plain or
+  sorted aggregate over a sequential, index-only or index scan is an aggregate over a scan; the
+  scan alone is its own kind. An Append is its dearest child's kind.
+- **Its rate**: the cost units a millisecond such plans run at, over 500 - a setting for each kind
+  that is not the reference (below).
+- **The price.** Lion's CPU terms in the competitor's units are its fitted price times the rate;
+  its pages stay as core prices pages, since lion keeps core's convention for them (§10: "lion and
+  core overcharge a warm page alike"), and a page read by either costs the same. The terms are not
+  classified one by one: the path's own price is summed with every page cost it reads divided by
+  the rate - `lion_page_scale`, which `LION_SEQ_PAGE_COST`, `LION_RANDOM_PAGE_COST` and
+  `lion_heap_page_cost()` apply - and multiplied by the rate after (`lion_units_begin()`,
+  `lion_units_price()`). What was CPU comes out times the rate, what was a page as it was, and the
+  choices the model makes inside a price - walk or probe, collect or seek, the inside of a range or
+  its complement - are made in the units the price is compared in.
+
+**On the path's own cost.** The converted price is the path's cost, as EXPLAIN shows it, rather than
+a correction made only where `add_path()` compares. It is the simplest, it is what every later
+comparison sees - a Sort above the node avoided, a LIMIT's fraction of it, a join above a
+LionSemiJoin - and it is what makes the comparisons with the other paths of the relation, added
+before or after, consistent with the one the rate was chosen for. It is also what a lion path's
+cost means from here on: its price in the units of the plan it was measured against. A bench
+measuring lion's own units a millisecond sets each rate to 1 (`bench/calib/`, below).
+
+**Only the node's own price.** What core puts above or below a lion node is core's plan, priced by
+core in its own units, and is not converted: the Finalize Agg over a partitioned count and the
+Gather and Finalize Agg over a parallel one; the dimension scan an FK-side join reads its rows from
+and the rows a semi or anti join emits (a `cpu_tuple_cost` each, as core's joins charge them); the
+HAVING the node evaluates (`cost_qual_eval()`, as `cost_agg()` charges it). The parallel GROUP BY's
+participant price is made of the serial node's converted price and its converted per-range terms.
+
+**Not converted at all**: LionOrdered, whose competitors are the base rel's scans - sequential,
+index-only, index, bitmap - which are the reference or have no one rate (below); and the AM's own
+plain, index-only and bitmap scans, which compete inside core's path machinery and are priced as
+core prices its own. `lioncostestimate()` sets `lion_page_scale` to 1 for its duration, whatever a
+custom path's pricing left it at - nothing calls it from inside one - and each planner hook resets it
+on entry, so an error inside a pricing cannot leave it scaled.
+
+### The rates
+
+| setting | default | the plans | §10's data, units a millisecond |
+|---|---|---|---|
+| `pg_lion.hashagg_rate` | 0.42 | an aggregate that hashes | 208 (200 groups), 157 (20,000), 309 (parallel); 210 on the PostgreSQL 16 repro above, against lion's 510 there |
+| `pg_lion.agg_rate` | 1.0 | a plain or sorted aggregate over a scan | 401 to 695 over sequential scans, 415 to 536 over index-only ones, 699 sorted: around the reference by construction (§10 fitted lion to these); 263 on the repro |
+| `pg_lion.hashjoin_rate` | 0.5 | a hash join | 280 and 283 with 1,000 and 4,400 rows hashed, 185 at 140,000, 57 at 1.4M (in batches); 219 parallel |
+| `pg_lion.mergejoin_rate` | 1.0 | a merge join | none measured |
+| `pg_lion.nestloop_rate` | 2.0 | a nested loop into a parameterized index or bitmap scan | 1,057 into a btree; about 2,000 over warm indexes (§31, `fk fwd tsq dim2 1.2k`) |
+| `pg_lion.bitmap_rate` | 1.0 | a bitmap heap scan | 4,419, 1,702, 544 for 500, 25,000 and 250,000 scattered rows; about 70 for §22's BitmapAnd |
+
+Sequential, index-only and plain index scans are the reference and have no setting, and so is
+everything else (`OTHER`: a function scan, a MinMaxAgg, a nested loop over a materialized side).
+
+- **Hashed aggregates, 0.42.** Both measurements and both machines agree: hashing is charged one or
+  two `cpu_operator_cost` a row for about 94 ns (§10), and every plan with a hash aggregate runs at
+  0.31 to 0.62 of the reference. 0.42 is the 200-group plan, and the PostgreSQL 16 repro's ratio
+  (210 against lion's 510 there).
+- **Hash joins, 0.5.** The FK-side join's competitor is a hash join of the fact with a filtered
+  dimension, the small-hash end of §10's measurements (0.56, 0.57); joins that hash more run lower
+  (0.37 at 140,000 rows, 0.11 in batches). 0.5 is the conservative end: a lower rate favours lion.
+- **Nested loops, 2.0.** A nested loop into an index is charged a random page a probe of a warm
+  index; it is the one kind whose plans run ABOVE the reference, and §31's one remaining FK-join
+  mispick (the node 36.9 ms at 13,700 against a nested loop's 11.8 at 23,800) is it. 2.0 is §10's
+  measurement, the low end; §31's 2,000 would be 4.
+- **Aggregates over a scan, 1.0.** Around the reference by construction - lion was fitted to the
+  middle of these very plans. The repro measured 0.53 on another machine and version, where lion's
+  own reference would have to be measured again too; the setting is there for that.
+- **Bitmap heap scans, 1.0: too little to say.** §10's 544 to 4,419 are scans whose price is pages -
+  a warm random page charged `random_page_cost` - which lion's pages share by convention; §22's
+  BitmapAnd ran at about 70, its price CPU per TID charged far below its time. One rate cannot be
+  both, and the kind cannot tell them apart; it prices at the reference, as before.
+- **Merge joins, 1.0**: none measured.
+
+`SET client_min_messages = debug2` logs, for each lion path priced, the kind it was priced against,
+that path's cost and the rate.

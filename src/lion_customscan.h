@@ -476,8 +476,8 @@
 #define LION_FKJOIN_SORT_COMPARE_COST	(lion_fkjoin_sort_compare_cost * cpu_operator_cost)
 #define LION_FKJOIN_SORT_KEY_COST	(lion_fkjoin_sort_key_cost * cpu_operator_cost)
 #define LION_FKJOIN_SORT_PAGE_COST \
-	(lion_fkjoin_sort_seq_page_cost * seq_page_cost + \
-	 lion_fkjoin_sort_random_page_cost * random_page_cost)
+	(lion_fkjoin_sort_seq_page_cost * LION_SEQ_PAGE_COST + \
+	 lion_fkjoin_sort_random_page_cost * LION_RANDOM_PAGE_COST)
 
 /*
  * Looking the child's rows up in the fk index's key order (DESIGN.md §27,
@@ -2402,6 +2402,43 @@ extern PathTarget *lion_make_partial_target(PlannerInfo *root,
 extern List *lion_replaced_functions(RelOptInfo *rel, List *tlexprs,
 									 List *having, List *groupclause,
 									 const LionFkJoin *fj);
+
+/*
+ * The kinds of core plan a lion path is priced against (DESIGN.md §39,
+ * lion_plan_units.c), each with its rate: the cost units a millisecond its
+ * plans run at, as a multiple of the 500 lion's CPU constants are fitted at.
+ */
+typedef enum LionCompetitor
+{
+	LION_COMPETITOR_NONE,		/* no path of core's in the relation yet */
+	LION_COMPETITOR_HASHAGG,	/* an aggregate that hashes */
+	LION_COMPETITOR_AGG,		/* a plain or sorted one over a scan */
+	LION_COMPETITOR_HASHJOIN,
+	LION_COMPETITOR_MERGEJOIN,
+	LION_COMPETITOR_NESTLOOP,	/* into a parameterized index scan */
+	LION_COMPETITOR_SEQSCAN,
+	LION_COMPETITOR_INDEXONLY,
+	LION_COMPETITOR_INDEX,
+	LION_COMPETITOR_BITMAP,
+	LION_COMPETITOR_OTHER
+} LionCompetitor;
+
+/* The units a lion path's own price is converted into (lion_units_for()) */
+typedef struct LionUnits
+{
+	LionCompetitor kind;		/* the cheapest core path's kind */
+	double		rate;			/* ... and its rate */
+} LionUnits;
+
+/* lion_plan_units.c */
+extern bool lion_path_has_lion(Path *path);
+extern LionCompetitor lion_competitor_kind(Path *path);
+extern double lion_competitor_rate(LionCompetitor kind);
+extern Path *lion_competitor_path(RelOptInfo *rel);
+extern void lion_units_for(RelOptInfo *rel, LionUnits *u);
+extern void lion_units_begin(const LionUnits *u);
+extern void lion_units_end(void);
+extern Cost lion_units_price(const LionUnits *u, Cost own);
 
 /* lion_plan_cost.c */
 extern double lion_index_dir_pages(IndexOptInfo *idx, double *height);

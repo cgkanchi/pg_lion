@@ -1472,12 +1472,42 @@ lion_generic_page_cost(PlannerInfo *root, IndexPath *path, double loop_count,
  * btree's is (lion_index_correlation(), DESIGN.md §29.11); a bitmap path,
  * which shares this estimate, does not read that last number.  With
  * pg_lion.enable_plain_scan off there is no plain path to price.
+ *
+ * The AM's own scans compete inside core's path machinery and are priced as
+ * core prices its own: in the reference units the constants are fitted in,
+ * whatever a custom path's pricing in a competitor's units (DESIGN.md §39)
+ * has left lion_page_scale at - which is 1 except while one is summed, and
+ * this is not called from inside one.
  */
+static void lion_cost_estimate_scan(PlannerInfo *root, IndexPath *path,
+									double loop_count,
+									Cost *indexStartupCost,
+									Cost *indexTotalCost,
+									Selectivity *indexSelectivity,
+									double *indexCorrelation,
+									double *indexPages);
+
 void
 lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 				Cost *indexStartupCost, Cost *indexTotalCost,
 				Selectivity *indexSelectivity, double *indexCorrelation,
 				double *indexPages)
+{
+	double		scale = lion_page_scale;
+
+	lion_page_scale = 1.0;
+	lion_cost_estimate_scan(root, path, loop_count, indexStartupCost,
+							indexTotalCost, indexSelectivity,
+							indexCorrelation, indexPages);
+	lion_page_scale = scale;
+}
+
+static void
+lion_cost_estimate_scan(PlannerInfo *root, IndexPath *path,
+						double loop_count, Cost *indexStartupCost,
+						Cost *indexTotalCost,
+						Selectivity *indexSelectivity,
+						double *indexCorrelation, double *indexPages)
 {
 	GenericCosts costs = {0};
 	bool		emits_all_rows;
