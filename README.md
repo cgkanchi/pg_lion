@@ -596,6 +596,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `plain_fetch_row_cost` | 1.0 | `cpu_tuple_cost` | a plain scan's heap fetch of a row past the first on its page, beyond a bitmap heap scan's |
 | `bitmap_row_cost` | 0.1 | `cpu_operator_cost` | a row's bitmap entry, which a plain scan is charged as a bitmap heap scan is |
 | `walk_pass_cost` | 5.0 | `cpu_tuple_cost` | a plain scan's walk of an entry past the first, a heap pass each |
+| `walk_entry_cost` | 40 | `cpu_operator_cost` | an entry a bitmap or plain scan's range or `<>` walk reads, its rows aside |
 | `container_cost` | 8.0 | `cpu_operator_cost` | a container of a posting set read and counted |
 | `member_cost` | 0.15 | `cpu_operator_cost` | a member of it, up to 1,024 a container |
 | `probe_cost` | 40 | `cpu_operator_cost` | a seek of a posting tree to a container key |

@@ -63,8 +63,9 @@ SELECT name, setting, boot_val, context, vartype
  pg_lion.union_key_cost                | 30      | 30       | user    | real
  pg_lion.union_member_cost             | 0.25    | 0.25     | user    | real
  pg_lion.union_set_cost                | 100     | 100      | user    | real
+ pg_lion.walk_entry_cost               | 40      | 40       | user    | real
  pg_lion.walk_pass_cost                | 5       | 5        | user    | real
-(37 rows)
+(38 rows)
 
 -- from 0 up, among the customized options as every extension's settings are
 SELECT count(*) AS settings,
@@ -76,7 +77,7 @@ SELECT count(*) AS settings,
  WHERE name LIKE 'pg_lion.%\_cost';
  settings | from_zero | unbounded | custom_group | unit_named 
 ----------+-----------+-----------+--------------+------------
-       37 | t         | t         | t            | t
+       38 | t         | t         | t            | t
 (1 row)
 
 -- 50000 rows; a has 10 values and g 100, both placed at random, about 55

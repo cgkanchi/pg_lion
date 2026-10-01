@@ -23,6 +23,7 @@
 extern PGDLLIMPORT double lion_plain_fetch_row_cost;
 extern PGDLLIMPORT double lion_bitmap_row_cost;
 extern PGDLLIMPORT double lion_walk_pass_cost;
+extern PGDLLIMPORT double lion_walk_entry_cost;
 
 /*
  * The merge, the lookups and the heap recheck, wherever posting sets are

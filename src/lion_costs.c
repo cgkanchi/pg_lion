@@ -36,6 +36,7 @@
 double		lion_plain_fetch_row_cost;
 double		lion_bitmap_row_cost;
 double		lion_walk_pass_cost;
+double		lion_walk_entry_cost;
 double		lion_container_cost;
 double		lion_member_cost;
 double		lion_probe_cost;
@@ -101,6 +102,8 @@ static const LionCostSetting lion_cost_settings[] = {
 	 "Sets the planner's estimate of the cost of a row's bitmap entry, which a lion plain index scan is charged as a bitmap heap scan is"},
 	{"pg_lion.walk_pass_cost", &lion_walk_pass_cost, 5.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each entry past the first that a lion plain index scan walks the heap for, beyond a bitmap scan's"},
+	{"pg_lion.walk_entry_cost", &lion_walk_entry_cost, 40.0, LION_OP,
+	 "Sets the planner's estimate of the cost of each entry a lion index scan's range or <> walk reads, its members aside"},
 
 	/* lion_plan_cost.c: the merge, the lookups and the heap recheck (§10) */
 	{"pg_lion.container_cost", &lion_container_cost, 8.0, LION_OP,
