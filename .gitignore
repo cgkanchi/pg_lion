@@ -20,3 +20,4 @@ test/modules/*/results/
 
 # bench/write_micro.sh temporary pgbench log directories
 .pgbench-*/
+test/soak/out/
