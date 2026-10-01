@@ -1,18 +1,19 @@
 -- The units a lion custom path is priced in, and the margin it has to win
 -- by (DESIGN.md §39).
 --
--- A lion custom path's CPU terms are priced in the units of the cheapest core
--- path of its relation - times pg_lion.<kind>_rate for that kind of plan -
--- and its pages as core prices pages, and the price is divided by
--- pg_lion.pushdown_margin.  This test lists the settings; shows that the
--- margin is a threshold on the ratio of the two prices, that it divides a
--- lion path's cost exactly, and that core's enable_* settings still force a
--- lion plan however dear the margin makes it; that each kind of competitor's
--- rate moves the cost of the lion paths that compete with that kind,
--- linearly, decides a choice, and that no other rate moves it; and that the
--- AM's own scans and LionOrdered are not converted.  The rows of every plan
--- are checked against the same query run with lion's paths off and
--- sequential scans only.
+-- A lion custom path's own price is converted into the units of the cheapest
+-- core path of its relation - times pg_lion.<kind>_rate for that kind of
+-- plan - and divided by pg_lion.pushdown_margin, 1 (none) by default.  This
+-- test lists the settings; shows that the margin is a threshold on the ratio
+-- of the two prices, that it divides a lion path's cost exactly, that core's
+-- enable_* settings still force a lion plan however dear the margin makes
+-- it, and that it is not applied where it hedges nothing - against a plan
+-- forced with nothing of core's left enabled, or the AM's own scan of a lion
+-- index; that each kind of competitor's rate moves the cost of the lion paths
+-- that compete with that kind, linearly, decides a choice, and that no other
+-- rate moves it; and that the AM's own scans and LionOrdered are not
+-- converted.  The rows of every plan are checked against the same query run
+-- with lion's paths off and sequential scans only.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -38,7 +39,7 @@ SELECT name, setting, boot_val, min_val, max_val, context
  pg_lion.hashjoin_rate   | 0.5     | 0.5      | 0.001   | 1000    | user
  pg_lion.mergejoin_rate  | 1       | 1        | 0.001   | 1000    | user
  pg_lion.nestloop_rate   | 2       | 2        | 0.001   | 1000    | user
- pg_lion.pushdown_margin | 0.8     | 0.8      | 0.01    | 1       | user
+ pg_lion.pushdown_margin | 1       | 1        | 0.01    | 1       | user
 (7 rows)
 
 -- 60000 rows: g20, g200 and c2 at random, k a permutation of the ids under a
@@ -153,9 +154,10 @@ END $$;
  * A lion path's cost with the rates in `mine` at 0.05, 0.1 and 0.2, and with
  * them at 0.1 and the rates in `others` at 5, under the settings in sw: the
  * plan, the same at each; whether its cost rises with the rate, and linearly
- * (the CPU terms times the rate, the pages as they are: the step from 0.1 to
- * 0.2 twice the step from 0.05 to 0.1, to the cent EXPLAIN rounds to); and
- * whether the other rates leave it exactly where it is.
+ * (the node's own price times the rate, core's nodes around it as they are:
+ * the step from 0.1 to 0.2 twice the step from 0.05 to 0.1, to the cent
+ * EXPLAIN rounds to); and whether the other rates leave it exactly where it
+ * is.
  */
 CREATE FUNCTION lcr_rates(q text, sw text[], mine text[], others text[])
 RETURNS TABLE (plan text, moves boolean, linear boolean, others_do_not boolean)
@@ -192,35 +194,36 @@ BEGIN
 	RETURN NEXT;
 END $$;
 -- ---------- 2. the margin ----------
--- a count the node wins by far with no margin: the margin is a threshold on
--- the ratio of its price to core's best - just above the ratio the node is
--- chosen, just below it core's plan is
+-- a GROUP BY the node wins by far against a hash aggregate (its rate at 1,
+-- so that the ratio is well above the dearest margin): the margin is a
+-- threshold on the ratio of its price to core's best - just above the ratio
+-- the node is chosen, just below it core's plan is
 SELECT lion < core * 0.9 AS wins_by_far,
-	   lcr_lion(q, ARRAY['pg_lion.pushdown_margin',
+	   lcr_lion(q, ARRAY['pg_lion.hashagg_rate', '1', 'pg_lion.pushdown_margin',
 						 least(lion / core * 1.05, 1)::text]) AS just_above,
-	   lcr_lion(q, ARRAY['pg_lion.pushdown_margin',
+	   lcr_lion(q, ARRAY['pg_lion.hashagg_rate', '1', 'pg_lion.pushdown_margin',
 						 greatest(lion / core * 0.95, 0.01)::text]) AS just_below
-  FROM (SELECT q, lcr_cost(q, '{pg_lion.pushdown_margin, 1}') AS lion,
+  FROM (SELECT q, lcr_cost(q, '{pg_lion.hashagg_rate, 1, pg_lion.pushdown_margin, 1}') AS lion,
 			   lcr_cost(q, '{pg_lion.enable_count_pushdown, off}') AS core
-		  FROM (VALUES ('SELECT count(*) FROM lcr WHERE g200 = 17 AND c2 = 1')) v(q)) c;
+		  FROM (VALUES ('SELECT g20, count(*) FROM lcr GROUP BY g20')) v(q)) c;
  wins_by_far | just_above | just_below 
 -------------+------------+------------
  t           | LionCount  | core
 (1 row)
 
 -- it divides the node's own cost exactly, and nothing above it is marked up:
--- a count's, and a LionOrdered's under its LIMIT, each forced (every core
--- scan off)
+-- the GROUP BY's, and a LionOrdered's under its LIMIT with core's ordered
+-- index scan off (its competitor, a bitmap scan and a Sort, left on)
 SELECT n, lcr_lion(q, sw) AS plan,
 	   round((lcr_cost(q, sw || '{pg_lion.pushdown_margin, 0.5}') /
 			  lcr_cost(q, sw || '{pg_lion.pushdown_margin, 1}'))::numeric, 2) AS half_margin
-  FROM (VALUES ('count', 'SELECT count(*) FROM lcr WHERE g200 = 17 AND c2 = 1',
-				'{enable_seqscan, off, enable_bitmapscan, off, enable_indexscan, off, enable_indexonlyscan, off, enable_tidscan, off}'::text[]),
+  FROM (VALUES ('group', 'SELECT g20, count(*) FROM lcr GROUP BY g20',
+				'{pg_lion.hashagg_rate, 1}'::text[]),
 			   ('ordered', 'SELECT id FROM lcr WHERE g200 = 17 ORDER BY k, id LIMIT 10',
-				'{enable_seqscan, off, enable_bitmapscan, off, enable_indexscan, off, enable_indexonlyscan, off, enable_tidscan, off}'::text[])) v(n, q, sw);
+				'{enable_indexscan, off}'::text[])) v(n, q, sw);
     n    |    plan     | half_margin 
 ---------+-------------+-------------
- count   | LionCount   |        2.00
+ group   | LionCount   |        2.00
  ordered | LionOrdered |        2.00
 (2 rows)
 
@@ -228,54 +231,98 @@ SELECT n, lcr_lion(q, sw) AS plan,
 -- node is not chosen there unforced, and lion's switches still leave it out
 -- with no margin
 SELECT n, lcr_lion(q, sw || '{pg_lion.pushdown_margin, 0.01}') AS forced,
-	   lcr_lion(q, '{pg_lion.pushdown_margin, 0.01}') AS unforced,
+	   lcr_lion(q, unforced || '{pg_lion.pushdown_margin, 0.01}') AS unforced,
 	   lcr_lion(q, ARRAY['pg_lion.pushdown_margin', '1', switch, 'off']) AS switched_off
-  FROM (VALUES ('count', 'SELECT count(*) FROM lcr WHERE g200 = 17 AND c2 = 1',
-				'{enable_seqscan, off, enable_bitmapscan, off, enable_indexscan, off, enable_indexonlyscan, off, enable_tidscan, off}'::text[], 'pg_lion.enable_count_pushdown'),
+  FROM (VALUES ('group', 'SELECT g20, count(*) FROM lcr GROUP BY g20',
+				'{enable_hashagg, off, enable_sort, off}'::text[],
+				'{pg_lion.hashagg_rate, 1}'::text[], 'pg_lion.enable_count_pushdown'),
 			   ('ordered', 'SELECT id FROM lcr WHERE g200 = 17 ORDER BY k, id LIMIT 10',
-				'{enable_seqscan, off, enable_bitmapscan, off, enable_indexscan, off, enable_indexonlyscan, off, enable_tidscan, off}'::text[], 'pg_lion.enable_ordered_scan')) v(n, q, sw, switch);
+				'{enable_seqscan, off, enable_bitmapscan, off, enable_indexscan, off, enable_indexonlyscan, off, enable_tidscan, off}'::text[],
+				'{enable_indexscan, off}'::text[], 'pg_lion.enable_ordered_scan')) v(n, q, sw, unforced, switch);
     n    |   forced    | unforced | switched_off 
 ---------+-------------+----------+--------------
- count   | LionCount   | core     | core
+ group   | LionCount   | core     | core
  ordered | LionOrdered | core     | core
 (2 rows)
+
+-- and none where it hedges nothing: a plan core's enable_* settings force,
+-- with nothing of core's left to compete, costs the same at every margin and
+-- every rate (lion's own units, which its choices among its own forms are
+-- made in)
+SELECT n, lcr_lion(q, sw) AS plan,
+	   lcr_cost(q, sw || '{pg_lion.pushdown_margin, 0.01}') =
+	   lcr_cost(q, sw || '{pg_lion.pushdown_margin, 1}') AS same_at_every_margin,
+	   lcr_cost(q, sw || '{pg_lion.hashagg_rate, 0.05, pg_lion.agg_rate, 0.05, pg_lion.hashjoin_rate, 0.05, pg_lion.mergejoin_rate, 0.05, pg_lion.nestloop_rate, 0.05, pg_lion.bitmap_rate, 0.05}'::text[]) =
+	   lcr_cost(q, sw || '{pg_lion.hashagg_rate, 5, pg_lion.agg_rate, 5, pg_lion.hashjoin_rate, 5, pg_lion.mergejoin_rate, 5, pg_lion.nestloop_rate, 5, pg_lion.bitmap_rate, 5}'::text[]) AS same_at_every_rate
+  FROM (VALUES ('count, forced', 'SELECT count(*) FROM lcr WHERE g200 = 17 AND c2 = 1',
+				'{enable_seqscan, off, enable_bitmapscan, off, enable_indexscan, off, enable_indexonlyscan, off, enable_tidscan, off}'::text[]),
+			   ('group, forced', 'SELECT g20, count(*) FROM lcr GROUP BY g20',
+				'{enable_hashagg, off, enable_sort, off}'::text[]),
+			   ('semi, forced', 'SELECT d.pk FROM lcrd d WHERE EXISTS (SELECT 1 FROM lcrf f WHERE f.fk = d.pk AND f.x = 3)',
+				'{enable_hashjoin, off, enable_mergejoin, off, enable_nestloop, off}'::text[]),
+			   ('ordered, forced', 'SELECT id FROM lcr WHERE g200 = 17 ORDER BY k, id LIMIT 10',
+				'{enable_seqscan, off, enable_bitmapscan, off, enable_indexscan, off, enable_indexonlyscan, off, enable_tidscan, off}'::text[])) v(n, q, sw);
+        n        |     plan     | same_at_every_margin | same_at_every_rate 
+-----------------+--------------+----------------------+--------------------
+ count, forced   | LionCount    | t                    | t
+ group, forced   | LionCount    | t                    | t
+ semi, forced    | LionSemiJoin | t                    | t
+ ordered, forced | LionOrdered  | t                    | t
+(4 rows)
+
+-- a count whose cheapest competitor is the AM's own scan of a lion index (an
+-- aggregate over its plain index scan here), priced by lion's model as the
+-- node is, costs the same at every margin - at a hundredth it would be core's
+-- plan - and is converted at that plan's kind's rate
+SELECT lcr_lion(q) AS plan,
+	   lcr_cost(q, '{pg_lion.pushdown_margin, 0.01}') =
+	   lcr_cost(q, '{pg_lion.pushdown_margin, 1}') AS same_at_every_margin,
+	   lcr_cost(q, '{pg_lion.agg_rate, 0.5}') <
+	   lcr_cost(q, '{pg_lion.agg_rate, 1}') AS moves_with_agg_rate
+  FROM (VALUES ('SELECT count(*) FROM lcr WHERE g200 = 17 AND c2 = 1')) v(q);
+   plan    | same_at_every_margin | moves_with_agg_rate 
+-----------+----------------------+---------------------
+ LionCount | t                    | t
+(1 row)
 
 -- ---------- 3. the rates ----------
 -- Each kind of competitor, made the cheapest by core's settings: a plain
 -- aggregate over a sequential scan (index scans off), a hash aggregate
--- (sorts off), joins (every method off, so their rates move together).  The
--- count, the GROUP BY, the FK-side join and the semi and anti join paths
--- each move with their competitor's rate, linearly, and with no other.
+-- (sorts off), and each join method with the other two off.  The count, the
+-- GROUP BY, the FK-side join and the semi and anti join paths each move with
+-- their competitor's rate, linearly, and with no other.
 SELECT n, r.*
   FROM (VALUES ('count', 'SELECT count(*) FROM lcr WHERE g200 = 17',
 				'{enable_bitmapscan, off, enable_indexscan, off, enable_indexonlyscan, off}'::text[],
-				'{pg_lion.agg_rate}'::text[],
-				'{pg_lion.hashagg_rate, pg_lion.hashjoin_rate, pg_lion.mergejoin_rate, pg_lion.nestloop_rate, pg_lion.bitmap_rate}'::text[]),
+				'{pg_lion.agg_rate}'::text[]),
 			   ('group', 'SELECT g20, count(*) FROM lcr GROUP BY g20',
-				'{enable_sort, off}',
-				'{pg_lion.hashagg_rate}',
-				'{pg_lion.agg_rate, pg_lion.hashjoin_rate, pg_lion.mergejoin_rate, pg_lion.nestloop_rate, pg_lion.bitmap_rate}'),
-			   ('fkjoin', 'SELECT count(*) FROM lcrf f JOIN lcrd d ON f.fk = d.pk WHERE d.attr = 2',
-				'{enable_hashjoin, off, enable_mergejoin, off, enable_nestloop, off}'::text[],
-				'{pg_lion.hashjoin_rate, pg_lion.mergejoin_rate, pg_lion.nestloop_rate}',
-				'{pg_lion.agg_rate, pg_lion.hashagg_rate, pg_lion.bitmap_rate}'),
-			   ('semi', 'SELECT d.pk FROM lcrd d WHERE EXISTS (SELECT 1 FROM lcrf f WHERE f.fk = d.pk AND f.x = 3)',
-				'{enable_hashjoin, off, enable_mergejoin, off, enable_nestloop, off}'::text[],
-				'{pg_lion.hashjoin_rate, pg_lion.mergejoin_rate, pg_lion.nestloop_rate}',
-				'{pg_lion.agg_rate, pg_lion.hashagg_rate, pg_lion.bitmap_rate}'),
-			   ('anti', 'SELECT d.pk FROM lcrd d WHERE NOT EXISTS (SELECT 1 FROM lcrf f WHERE f.fk = d.pk AND f.x = 3)',
-				'{enable_hashjoin, off, enable_mergejoin, off, enable_nestloop, off}'::text[],
-				'{pg_lion.hashjoin_rate, pg_lion.mergejoin_rate, pg_lion.nestloop_rate}',
-				'{pg_lion.agg_rate, pg_lion.hashagg_rate, pg_lion.bitmap_rate}')) v(n, q, sw, mine, others),
-	   lcr_rates(q, sw, mine, others) r;
-   n    |     plan     | moves | linear | others_do_not 
---------+--------------+-------+--------+---------------
- count  | LionCount    | t     | t      | t
- group  | LionCount    | t     | t      | t
- fkjoin | LionCount    | t     | t      | t
- semi   | LionSemiJoin | t     | t      | t
- anti   | LionAntiJoin | t     | t      | t
-(5 rows)
+				'{enable_sort, off}', '{pg_lion.hashagg_rate}'),
+			   ('fkjoin, hash', 'SELECT count(*) FROM lcrf f JOIN lcrd d ON f.fk = d.pk WHERE d.attr = 2',
+				'{enable_mergejoin, off, enable_nestloop, off}', '{pg_lion.hashjoin_rate}'),
+			   ('fkjoin, merge', 'SELECT count(*) FROM lcrf f JOIN lcrd d ON f.fk = d.pk WHERE d.attr = 2',
+				'{enable_hashjoin, off, enable_nestloop, off}', '{pg_lion.mergejoin_rate}'),
+			   ('fkjoin, nested loop', 'SELECT count(*) FROM lcrf f JOIN lcrd d ON f.fk = d.pk WHERE d.attr = 2',
+				'{enable_hashjoin, off, enable_mergejoin, off}', '{pg_lion.nestloop_rate}'),
+			   ('semi, hash', 'SELECT d.pk FROM lcrd d WHERE EXISTS (SELECT 1 FROM lcrf f WHERE f.fk = d.pk AND f.x = 3)',
+				'{enable_mergejoin, off, enable_nestloop, off}', '{pg_lion.hashjoin_rate}'),
+			   ('semi, merge', 'SELECT d.pk FROM lcrd d WHERE EXISTS (SELECT 1 FROM lcrf f WHERE f.fk = d.pk AND f.x = 3)',
+				'{enable_hashjoin, off, enable_nestloop, off}', '{pg_lion.mergejoin_rate}'),
+			   ('anti, hash', 'SELECT d.pk FROM lcrd d WHERE NOT EXISTS (SELECT 1 FROM lcrf f WHERE f.fk = d.pk AND f.x = 3)',
+				'{enable_mergejoin, off, enable_nestloop, off}', '{pg_lion.hashjoin_rate}')) v(n, q, sw, mine),
+	   lcr_rates(q, sw, mine,
+				 array(SELECT r FROM unnest('{pg_lion.agg_rate, pg_lion.hashagg_rate, pg_lion.hashjoin_rate, pg_lion.mergejoin_rate, pg_lion.nestloop_rate, pg_lion.bitmap_rate}'::text[]) r
+						WHERE r <> ALL (mine))) r;
+          n          |     plan     | moves | linear | others_do_not 
+---------------------+--------------+-------+--------+---------------
+ count               | LionCount    | t     | t      | t
+ group               | LionCount    | t     | t      | t
+ fkjoin, hash        | LionCount    | t     | t      | t
+ fkjoin, merge       | LionCount    | t     | t      | t
+ fkjoin, nested loop | LionCount    | t     | t      | t
+ semi, hash          | LionSemiJoin | t     | t      | t
+ semi, merge         | LionSemiJoin | t     | t      | t
+ anti, hash          | LionAntiJoin | t     | t      | t
+(8 rows)
 
 -- and the rate decides a choice: the GROUP BY against the hash aggregate at
 -- the lowest rate and at the highest
@@ -289,17 +336,17 @@ SELECT lcr_lion(q, '{enable_sort, off, pg_lion.hashagg_rate, 0.001}') AS lowest,
 
 -- ---------- 4. what is not converted ----------
 -- the AM's own scans (the count's pushdown off, sequential scans off) cost
--- the same at every rate and every margin; LionOrdered, forced, at every
--- rate, and the margin marks it up
+-- the same at every rate and every margin; LionOrdered (core's ordered index
+-- scan off) at every rate, while the margin marks it up
 SELECT n, lcr_lion(q, sw) AS plan,
 	   lcr_cost(q, sw || '{pg_lion.hashagg_rate, 0.05, pg_lion.agg_rate, 0.05, pg_lion.hashjoin_rate, 0.05, pg_lion.mergejoin_rate, 0.05, pg_lion.nestloop_rate, 0.05, pg_lion.bitmap_rate, 0.05}'::text[]) =
 	   lcr_cost(q, sw || '{pg_lion.hashagg_rate, 5, pg_lion.agg_rate, 5, pg_lion.hashjoin_rate, 5, pg_lion.mergejoin_rate, 5, pg_lion.nestloop_rate, 5, pg_lion.bitmap_rate, 5}'::text[]) AS same_at_every_rate,
-	   lcr_cost(q, sw || '{pg_lion.pushdown_margin, 0.01}') =
+	   lcr_cost(q, sw || '{pg_lion.pushdown_margin, 0.5}') =
 	   lcr_cost(q, sw || '{pg_lion.pushdown_margin, 1}') AS same_at_every_margin
   FROM (VALUES ('am scans', 'SELECT count(*) FROM lcr WHERE g200 = 17 AND c2 = 1',
 				'{pg_lion.enable_count_pushdown, off, enable_seqscan, off}'::text[]),
 			   ('ordered', 'SELECT id FROM lcr WHERE g200 = 17 ORDER BY k, id LIMIT 10',
-				'{enable_seqscan, off, enable_bitmapscan, off, enable_indexscan, off, enable_indexonlyscan, off, enable_tidscan, off}'::text[])) v(n, q, sw);
+				'{enable_indexscan, off}'::text[])) v(n, q, sw);
     n     |    plan     | same_at_every_rate | same_at_every_margin 
 ----------+-------------+--------------------+----------------------
  am scans | core        | t                  | t
