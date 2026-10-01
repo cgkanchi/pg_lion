@@ -607,6 +607,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `union_set_cost` | 100 | `cpu_tuple_cost` | a set of an `IN` list or `OR` rebuilt by each count of a GROUP BY |
 | `recheck_tid_cost` | 1.5 | `cpu_tuple_cost` | a candidate row of a count's heap recheck |
 | `recheck_group_tid_cost` | 6.0 | `cpu_tuple_cost` | the same in a grouped count |
+| `resident_page_cost` | 120 | `cpu_operator_cost` | a page of a Lion index a count reads while the index fits in `effective_cache_size` with the query's tables (DESIGN.md §39); a page that does not is priced as I/O, as before |
 | `entry_count_cost` | 50 | `cpu_tuple_cost` | a count of a GROUP BY: an entry, or a pair of two |
 | `list_group_cost` | 18 | `cpu_tuple_cost` | a count of a group an `IN` list drives |
 | `distinct_test_cost` | 50 | `cpu_tuple_cost` | a test of a `count(DISTINCT)` walk |

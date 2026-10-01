@@ -814,6 +814,18 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_DESCENT_COST		(lion_descent_cost * cpu_operator_cost)
 
 /*
+ * A page of a lion index that a custom path reads while the index is
+ * resident (lion_index_page_cost(), DESIGN.md §22, §39): a buffer hit,
+ * pinned, locked and stepped through.  Measured on the release build (§10,
+ * "The reference"): a warm page read in order 0.6 us, against the 2 us that
+ * seq_page_cost stands for at 500 units a millisecond; the posting leaves a
+ * probe's seeks cross fit at 0.7 us (LION_PROBE_COST's fit); a directory
+ * page descended 0.6 us with its search (LION_DESCENT_COST).  120
+ * cpu_operator_cost is the 0.6 us.
+ */
+#define LION_RESIDENT_PAGE_COST	(lion_resident_page_cost * cpu_operator_cost)
+
+/*
  * One candidate TID of a heap recheck (DESIGN.md §9): the visibility check of
  * its tuple, on a page the recheck has pinned (the page itself is charged as
  * I/O).  Fitted on the release build to counts of 99 to 1M candidates on a
@@ -2456,6 +2468,8 @@ extern double lion_exists_fraction(double containers, double survivors);
 extern double lion_posting_height(double leaves);
 extern Cost lion_heap_page_cost(PlannerInfo *root, RelOptInfo *rel,
 								double pages, double heap_pages);
+extern Cost lion_index_page_cost(PlannerInfo *root, double idxpages,
+								 Cost device);
 extern int lion_inlist_shape(IndexOptInfo *groupidx, AttrNumber groupcol,
 							 IndexOptInfo *groupidx2, List *whereidx,
 							 List *wherecol, List *whereclauses,
