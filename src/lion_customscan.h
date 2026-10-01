@@ -2423,11 +2423,15 @@ typedef enum LionCompetitor
 	LION_COMPETITOR_OTHER
 } LionCompetitor;
 
-/* The units a lion path's own price is converted into (lion_units_for()) */
+/*
+ * The units a lion path's own price is converted into (lion_units_for()), and
+ * the margin it is offered at
+ */
 typedef struct LionUnits
 {
 	LionCompetitor kind;		/* the cheapest core path's kind */
 	double		rate;			/* ... and its rate */
+	double		margin;			/* pg_lion.pushdown_margin */
 } LionUnits;
 
 /* lion_plan_units.c */
@@ -2439,6 +2443,7 @@ extern void lion_units_for(RelOptInfo *rel, LionUnits *u);
 extern void lion_units_begin(const LionUnits *u);
 extern void lion_units_end(void);
 extern Cost lion_units_price(const LionUnits *u, Cost own);
+extern double lion_units_margin(void);
 
 /* lion_plan_cost.c */
 extern double lion_index_dir_pages(IndexOptInfo *idx, double *height);

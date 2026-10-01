@@ -81,6 +81,13 @@ extern PGDLLIMPORT double lion_nestloop_rate;
 extern PGDLLIMPORT double lion_bitmap_rate;
 
 /*
+ * The share of a lion path's own price it is offered at (DESIGN.md §39, "The
+ * margin"): its price is divided by it, so that it must come to this share
+ * of the best core plan's to be chosen.  1 is no margin.
+ */
+extern PGDLLIMPORT double lion_pushdown_margin;
+
+/*
  * The scale on the page costs while a lion path's own price is summed in a
  * competitor's units (DESIGN.md §39, lion_plan_units.c): one over the
  * competitor's rate, so that the price times the rate is the CPU terms in
