@@ -12,19 +12,21 @@
  * priced dearly against a hash aggregate and cheaply against a nested loop,
  * and loses to the one where it is faster and wins against the other where it
  * is slower.  Each of lion's custom paths is therefore priced in the units of
- * the cheapest core path already in its relation: the kind of plan that is
+ * the cheapest core path of its relation: the kind of plan that is
  * (lion_competitor_kind()) has a rate, pg_lion.<kind>_rate, the multiple of
- * the reference its plans run at, and lion's CPU terms are multiplied by it.
- * Its pages stay in core's convention, which lion shares (§10): a page is
- * charged as core charges the same page, whoever reads it.
+ * the reference its plans run at, and the path's own price is multiplied by
+ * it (lion_units_price()).
  *
- * The terms are not classified one by one.  The price is summed with every
- * page cost it reads divided by the rate (lion_page_scale, which
- * LION_SEQ_PAGE_COST, LION_RANDOM_PAGE_COST and lion_heap_page_cost() apply)
- * and the sum multiplied by the rate: what was CPU comes out times the rate,
- * what was a page as it was, and every choice the model makes between two
- * ways of doing a thing - walk or probe, collect or seek - is made in the
- * competitor's units.
+ * The price is converted whole, its pages with its CPU terms.  A rate is the
+ * ratio of two whole plans' cost units a millisecond, pages and all, and a
+ * time in one unit is a time in another by that one factor.  Converting the
+ * CPU terms alone, as this file first did, priced a page differently against
+ * each kind of competitor: two of lion's own forms that read pages and CPU in
+ * different shares - the decoded walk and the nested loop of a GROUP BY, a
+ * walk and a probe, a collected filter and a sought one - then changed order
+ * with the competitor, and the executor follows the form the price picks.
+ * Converted whole, every choice inside a price is made in lion's own units,
+ * which its constants were fitted in.
  *
  * Part of the LionCount custom scan: lion_customscan.h describes the node
  * and declares what its files share.
@@ -34,9 +36,6 @@
 #include "postgres.h"
 
 #include "lion_customscan.h"
-
-/* 1 but while lion_units_begin() .. lion_units_end() sums a price */
-double		lion_page_scale = 1.0;
 
 static const char *const lion_competitor_names[] = {
 	[LION_COMPETITOR_NONE] = "none",
@@ -571,26 +570,8 @@ lion_units_margin_for(RelOptInfo *rel)
 }
 
 /*
- * Sum a price in u's units: until lion_units_end(), every page cost a custom
- * path's price reads is divided by the rate, so that lion_units_price()'s
- * multiplication by it leaves the pages as they were.
- */
-void
-lion_units_begin(const LionUnits *u)
-{
-	lion_page_scale = 1.0 / u->rate;
-}
-
-void
-lion_units_end(void)
-{
-	lion_page_scale = 1.0;
-}
-
-/*
- * A lion path's own price, summed between lion_units_begin() and
- * lion_units_end(), in the competitor's units - the CPU terms times the rate,
- * the pages as core prices them - and offered at the margin.
+ * A lion path's own price, in lion's units, converted into the competitor's
+ * and offered at the margin.
  */
 Cost
 lion_units_price(const LionUnits *u, Cost own)

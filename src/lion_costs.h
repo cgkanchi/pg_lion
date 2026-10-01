@@ -88,20 +88,6 @@ extern PGDLLIMPORT double lion_bitmap_rate;
  */
 extern PGDLLIMPORT double lion_pushdown_margin;
 
-/*
- * The scale on the page costs while a lion path's own price is summed in a
- * competitor's units (DESIGN.md §39, lion_plan_units.c): one over the
- * competitor's rate, so that the price times the rate is the CPU terms in
- * the competitor's units and the pages in core's.  1 at every other time -
- * lioncostestimate() among them, which prices the AM's own scans as core
- * prices its own.  Every page cost the custom paths' prices are made of reads
- * it: these two, and lion_heap_page_cost().
- */
-extern double lion_page_scale;
-
-#define LION_SEQ_PAGE_COST		(seq_page_cost * lion_page_scale)
-#define LION_RANDOM_PAGE_COST	(random_page_cost * lion_page_scale)
-
 extern void lion_costs_init(void);
 
 #endif							/* LION_COSTS_H */

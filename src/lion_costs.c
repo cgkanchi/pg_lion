@@ -197,8 +197,8 @@ static const LionCostSetting lion_cost_settings[] = {
  * 500 cost units a millisecond, the middle of core's sequential and
  * index-only scans (§10, "The reference"); core's other plans run at rates
  * of their own, and a lion path is priced in the units of the plan it
- * competes with: its CPU terms times that plan's rate over 500, its pages as
- * core prices pages (lion_plan_units.c).  pg_lion.<kind>_rate is that ratio
+ * competes with: its own price times that plan's rate over 500
+ * (lion_plan_units.c).  pg_lion.<kind>_rate is that ratio
  * for one kind of core plan, its default what §10's table measured; a kind
  * the table has too little of to say, or whose rate is the reference, is
  * priced at 1, as before.  Sequential, index-only and plain index scans are
@@ -272,7 +272,7 @@ lion_costs_init(void)
 		DefineCustomRealVariable(s->name,
 								 psprintf("Sets the planner's estimate of the cost units a millisecond of %s, as a multiple of the rate lion's CPU costs are fitted at.",
 										  s->desc),
-								 "Lion's CPU terms are priced at this multiple of their fitted cost against the cheapest core plan of this kind (DESIGN.md §39); 1 prices them as fitted.",
+								 "A lion custom path's own price is this multiple of its fitted price against the cheapest core plan of this kind (DESIGN.md §39); 1 prices it as fitted.",
 								 s->variable,
 								 s->boot,
 								 0.001, 1000.0,
