@@ -454,15 +454,18 @@ DROP TABLE lgw;
 /*
  * x and y in no order, four values each: x IN (0, 1, 2) AND y IN (0, 1, 2)
  * is 9/16 of the rows, a bitset at each of some twenty container keys - over
- * 80 kB, which 64 kB of work_mem does not hold.  The collection spills to a
- * temporary file, and the groups are counted against the file.
+ * 80 kB, which 64 kB of work_mem does not hold.  The rows are narrow, 185 to
+ * a page (pad is empty until the update below), so that the blocks hold
+ * offsets past 127 and no container key can be a NARROW (DESIGN.md §38),
+ * which would put the whole collection in some 21 kB.  The collection spills
+ * to a temporary file, and the groups are counted against the file.
  */
 CREATE TABLE lgw_s (g int NOT NULL, x int NOT NULL, y int NOT NULL,
 					pad text NOT NULL)
 	WITH (autovacuum_enabled = off);
 INSERT INTO lgw_s
-SELECT i % 20, hashint4(i) & 3, hashint4(i + 1000000) & 3, repeat('p', 40)
-  FROM generate_series(1, 120000) i;
+SELECT i % 20, hashint4(i) & 3, hashint4(i + 1000000) & 3, ''
+  FROM generate_series(1, 240000) i;
 CREATE INDEX lgw_s_g ON lgw_s USING lion (g);
 CREATE INDEX lgw_s_x ON lgw_s USING lion (x);
 CREATE INDEX lgw_s_y ON lgw_s USING lion (y);

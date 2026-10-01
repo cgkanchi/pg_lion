@@ -288,9 +288,21 @@ ANALYZE lo;
 
 -- 10. A set that outgrows hash_mem at run time degrades to container keys
 --     and rechecks every member: planned at 64MB (a generic plan keeps it),
---     run at 64kB.
+--     run at 64kB.  Half of lo's rows is 33 NARROWs, 34 kB, which 64kB holds
+--     (DESIGN.md §38); lon's rows are narrow, 185 to a page, so that its
+--     blocks hold offsets past 127, and half of them is 26 bitsets of 4 kB.
+--     Its first 600 rows have the smallest k, the rest a permutation.
+CREATE TABLE lon (id int PRIMARY KEY, k int, c2 int)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lon
+SELECT i, CASE WHEN i <= 600 THEN i - 601 ELSE (i::bigint * 7919 % 300007)::int END,
+	   ((hashint8extended(i::bigint, 11) & 9223372036854775807) % 2)::int
+  FROM generate_series(1, 300000) i;
+CREATE INDEX lon_k_id ON lon (k, id);
+CREATE INDEX lon_c2 ON lon USING lion (c2);
+VACUUM (FREEZE, ANALYZE) lon;
 SET plan_cache_mode = force_generic_plan;
-PREPARE lo_big(int) AS SELECT id, k FROM lo WHERE c2 = $1 ORDER BY k, id LIMIT 20;
+PREPARE lo_big(int) AS SELECT id, k FROM lon WHERE c2 = $1 ORDER BY k, id LIMIT 20;
 SET enable_seqscan = off; SET enable_bitmapscan = off;
 SET enable_indexscan = off; SET enable_indexonlyscan = off;
 EXPLAIN (COSTS OFF) EXECUTE lo_big(1);
@@ -302,17 +314,18 @@ SET hash_mem_multiplier = 1;
 SET pg_lion.enable_lazy_set = off;
 SELECT * FROM lion_ord_run('EXECUTE lo_big(1)');
 SELECT lion_ord('EXECUTE lo_big(1)',
-				'SELECT id, k FROM lo WHERE c2 = 1 ORDER BY k, id LIMIT 20');
+				'SELECT id, k FROM lon WHERE c2 = 1 ORDER BY k, id LIMIT 20');
 RESET pg_lion.enable_lazy_set;
--- lazily: the twenty rows lie in the first few container keys, which is all
--- of the set that is made, and it stays exact
+-- lazily: the twenty rows lie in the first container key, which is all of
+-- the set that is made, and it stays exact
 SELECT * FROM lion_ord_run('EXECUTE lo_big(1)');
 SELECT lion_ord('EXECUTE lo_big(1)',
-				'SELECT id, k FROM lo WHERE c2 = 1 ORDER BY k, id LIMIT 20');
+				'SELECT id, k FROM lon WHERE c2 = 1 ORDER BY k, id LIMIT 20');
 RESET hash_mem_multiplier;
 RESET work_mem;
 DEALLOCATE lo_big;
 RESET plan_cache_mode;
+DROP TABLE lon;
 
 -- 11. The plan choice, with nothing disabled: the node for a selective lion
 --     filter under ORDER BY a btree column LIMIT 10; core's ordered btree
