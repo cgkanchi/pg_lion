@@ -7,8 +7,9 @@
 -- avg that over their total, min and max the first f(key) in the aggregate's
 -- order: one walk of each column's entries.  When every heap page is
 -- all-visible before and after the walk, an entry's rows are the count its
--- header keeps; otherwise each entry is counted.  Every answer is checked
--- against a SEQUENTIAL SCAN.
+-- header keeps; otherwise an entry with a member under a container key that
+-- holds a page not all-visible is counted, and the rest keep their headers'
+-- counts.  Every answer is checked against a SEQUENTIAL SCAN.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -78,7 +79,7 @@ BEGIN
 	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
-		IF ln ~ '(Aggregates Over Keys|Keys Aggregated|Key Walks|Lion Indexes|LionCount)' THEN
+		IF ln ~ '(Aggregates Over Keys|Keys Aggregated|Keys Counted|Key Walks|Lion Indexes|LionCount)' THEN
 			RETURN NEXT regexp_replace(ln, '\s+\(actual.*$', '');
 		END IF;
 	END LOOP;
@@ -134,7 +135,8 @@ SELECT lion_kq('SELECT sum(i), count(*), sum(i) FROM ka WHERE true');
 -- ... an expression that is NULL for some keys, and a CASE.
 SELECT lion_kq('SELECT sum(nullif(i, 7)), max(CASE WHEN s > 0 THEN s END) FROM ka');
 
--- 2. A heap the visibility map does not vouch for: each entry counted.
+-- 2. A heap the visibility map does not vouch for: a page not all-visible in
+--    every container key, and each entry counted.
 DELETE FROM ka WHERE s = 3;
 SELECT lion_kq('SELECT sum(s), count(*), avg(i), min(t), max(b) FROM ka');
 SELECT lion_krun('SELECT sum(s), count(*), avg(i), min(t), max(b) FROM ka');
@@ -147,6 +149,13 @@ ROLLBACK;
 VACUUM ka;
 SELECT lion_kq('SELECT sum(s), count(*), avg(i), min(t), max(b) FROM ka');
 SELECT lion_krun('SELECT sum(s), avg(i) FROM ka');
+-- ... one page not all-visible: the entries with a member under its
+-- container key are counted - every one of s's, a few of b's, whose keys
+-- each have one row - and the rest are their headers' counts.
+DELETE FROM ka WHERE b = 100000300;
+SELECT lion_kq('SELECT sum(s), count(*), avg(i), min(t), max(b), sum(b) FROM ka');
+SELECT lion_krun('SELECT sum(b), avg(s) FROM ka');
+SELECT sum(b), avg(s) FROM ka;
 
 -- 3. No rows: sums, averages and extremes are NULL, counts 0.
 CREATE TABLE ka0 (x int4) WITH (autovacuum_enabled = off);

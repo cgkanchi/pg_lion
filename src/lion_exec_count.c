@@ -2898,12 +2898,22 @@ lion_wagg_add(LionCountScanState *st, int c, Datum key, bool isnull,
 	}
 }
 
+/* How a walk of a column's entries has each entry's rows (lion_wagg_run()). */
+#define LION_WALK_HEADERS	0	/* its ntids: every page all-visible */
+#define LION_WALK_DIRTY		1	/* its ntids unless it has a member under a
+								 * dirty container key: counted then */
+#define LION_WALK_LIVE		2	/* its ntids if the map calls every block of
+								 * its members all-visible now, under its
+								 * leaf's pin: counted otherwise */
+
 /*
- * One walk of column c's entries, every one of them the NULL one included:
- * with fast, each entry's rows its ntids; without, each entry counted.
+ * One walk of column c's entries, every one of them the NULL one included,
+ * each entry's rows had as `how` says; dirty and nkeys are the dirty
+ * container keys of LION_WALK_DIRTY.
  */
 static void
-lion_wagg_walk(LionCountScanState *st, int c, bool fast)
+lion_wagg_walk(LionCountScanState *st, int c, int how, const uint8 *dirty,
+			   uint32 nkeys)
 {
 	LionWCol   *wc = &st->wcol[c];
 	LionEntryScan es;
@@ -2912,47 +2922,61 @@ lion_wagg_walk(LionCountScanState *st, int c, bool fast)
 	lion_entry_scan_begin_col(&es, wc->idx, wc->idxcol);
 	for (;;)
 	{
+		LionEntryTuple *entry;
+		Size		itemlen;
+		Buffer		pin = InvalidBuffer;
+		bool		isnull;
+		bool		inl;
+		int64		rows;
+
 		CHECK_FOR_INTERRUPTS();
 		MemoryContextReset(st->pergroup);
 		oldcxt = MemoryContextSwitchTo(st->pergroup);
-		if (fast)
+		entry = (how == LION_WALK_HEADERS) ?
+			lion_entry_scan_next_copy(&es, &itemlen) :
+			lion_entry_scan_next_pinned(&es, &itemlen, &pin);
+		if (entry == NULL)
 		{
-			LionEntryTuple *entry;
-			Size		itemlen;
-			bool		isnull;
-
-			entry = lion_entry_scan_next_copy(&es, &itemlen);
-			if (entry == NULL)
-			{
-				MemoryContextSwitchTo(oldcxt);
-				break;
-			}
-			isnull = LionEntryIsNullKey(entry);
-			lion_wagg_add(st, c,
-						  isnull ? (Datum) 0 : lion_entry_key(es.state, entry),
-						  isnull, (int64) entry->ntids);
+			MemoryContextSwitchTo(oldcxt);
+			break;
 		}
+		isnull = LionEntryIsNullKey(entry);
+		inl = (entry->flags & LION_ENTRY_INLINE) != 0;
+
+		/*
+		 * An INLINE entry whose members lie only under clean container keys,
+		 * or - asked while the walk holds the pin of the leaf it was copied
+		 * from (§9) - only on blocks the map calls all-visible now, is all
+		 * rows; the rest are counted, each as a set located from its copy.  A
+		 * few dirty pages leave nearly every entry of a column of many keys
+		 * to the first kind.
+		 */
+		if (how == LION_WALK_HEADERS ||
+			(how == LION_WALK_DIRTY && inl && BufferIsValid(pin) &&
+			 !lion_payload_touches(LionEntryGetPayload(entry),
+								   LION_ENTRY_PAYLOAD_LEN(entry, itemlen),
+								   dirty, nkeys, st->wstage)) ||
+			(how == LION_WALK_LIVE && inl && BufferIsValid(pin) &&
+			 lion_payload_all_visible(st->heap, LionEntryGetPayload(entry),
+									  LION_ENTRY_PAYLOAD_LEN(entry, itemlen),
+									  &st->wvmbuf, st->wstage)))
+			rows = (int64) entry->ntids;
 		else
 		{
 			LionPostingSet ps;
 			LionCountSource src;
-			Datum		key;
-			bool		isnull;
-			int64		rows;
 
-			if (!lion_entry_scan_next(&es, &key, &ps))
-			{
-				MemoryContextSwitchTo(oldcxt);
-				break;
-			}
+			lion_entry_scan_locate(&es, entry, itemlen, pin, &ps);
 			memset(&src, 0, sizeof(src));
 			src.nsets = 1;
 			src.sets = &ps;
-			isnull = ps.keyisnull;
 			rows = lion_node_count(st, 1, &src, false);
 			lion_posting_set_release(&ps);
-			lion_wagg_add(st, c, key, isnull, rows);
+			st->wcounted++;
 		}
+		lion_wagg_add(st, c,
+					  isnull ? (Datum) 0 : lion_entry_key(es.state, entry),
+					  isnull, rows);
 		st->wentries++;
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -3012,6 +3036,9 @@ lion_wagg_run(LionCountScanState *st)
 		st->wcxt = AllocSetContextCreate(estate->es_query_cxt,
 										 "LionCount aggregates over keys",
 										 ALLOCSET_DEFAULT_SIZES);
+	if (st->wstage == NULL)
+		st->wstage = (LionContainer *)
+			MemoryContextAlloc(estate->es_query_cxt, LION_CONTAINER_MAX_SIZE);
 	for (c = 0; c < st->nwcol; c++)
 	{
 		if (st->wcol[c].idx == NULL)
@@ -3023,16 +3050,55 @@ lion_wagg_run(LionCountScanState *st)
 	if (fast)
 	{
 		for (c = 0; c < st->nwcol; c++)
-			lion_wagg_walk(st, c, true);
+			lion_wagg_walk(st, c, LION_WALK_HEADERS, NULL, 0);
 		fast = lion_heap_all_visible(st->heap, &after) && after == before;
 		st->wfast += st->nwcol;
+		if (!fast)
+			lion_wagg_reset(st);
+	}
+
+	/*
+	 * Some pages are not all-visible: the entries with a member under a
+	 * container key that holds one are counted, and the rest are all rows -
+	 * on the argument above, made per container key: a key all of whose
+	 * blocks are all-visible at the first look and at the second had no
+	 * change in between, and its TIDs were this snapshot's rows at the first.
+	 * A key that turns dirty in between sends the walks to the map, entry by
+	 * entry.
+	 */
+	if (!fast && !RecoveryInProgress())
+	{
+		uint8	   *dirty;
+		uint8	   *dirty2;
+		uint32		nkeys;
+		uint32		nkeys2;
+		uint32		k;
+
+		dirty = lion_heap_dirty_keys(st->heap, &before, &nkeys);
+		for (c = 0; c < st->nwcol; c++)
+			lion_wagg_walk(st, c, LION_WALK_DIRTY, dirty, nkeys);
+
+		/*
+		 * Test hook: the walks are done and the map not yet looked at again,
+		 * so a write here is one they may have counted (the isolation spec
+		 * wagg_dirty_race).  Compiles to nothing without
+		 * --enable-injection-points.
+		 */
+		LION_INJECTION_POINT("lion-wagg-dirty-walked");
+		dirty2 = lion_heap_dirty_keys(st->heap, &after, &nkeys2);
+		fast = (after == before && nkeys2 == nkeys);
+		for (k = 0; fast && k < nkeys; k++)
+			fast = (!dirty2[k] || dirty[k]);
+		pfree(dirty);
+		pfree(dirty2);
+		st->wdirty += st->nwcol;
 		if (!fast)
 			lion_wagg_reset(st);
 	}
 	if (!fast)
 	{
 		for (c = 0; c < st->nwcol; c++)
-			lion_wagg_walk(st, c, false);
+			lion_wagg_walk(st, c, LION_WALK_LIVE, NULL, 0);
 		st->wslow += st->nwcol;
 	}
 
@@ -3096,6 +3162,11 @@ lion_wagg_run(LionCountScanState *st)
 	{
 		index_close(st->wcol[c].idx, AccessShareLock);
 		st->wcol[c].idx = NULL;
+	}
+	if (BufferIsValid(st->wvmbuf))
+	{
+		ReleaseBuffer(st->wvmbuf);
+		st->wvmbuf = InvalidBuffer;
 	}
 }
 

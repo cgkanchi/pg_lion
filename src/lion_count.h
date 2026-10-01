@@ -678,6 +678,26 @@ extern bool lion_lookup_walk_descend(LionLookupWalk *walk, Datum key,
  * sets, applying snapshot to every heap block that is not all-visible.
  * *stats is accumulated into (not reset) when it is not NULL.
  */
+/*
+ * Is every member of an INLINE payload, whose leaf the caller holds pinned,
+ * on a heap block the visibility map calls all-visible?  Its entry's rows are
+ * then its ntids (DESIGN.md §37).  stage: a LION_CONTAINER_MAX_SIZE buffer.
+ */
+extern bool lion_payload_all_visible(Relation heap, const char *payload,
+									 Size paylen, Buffer *vmbuf,
+									 struct LionContainer *stage);
+
+/*
+ * The container keys of heap that hold a block the visibility map does not
+ * call all-visible, a byte each, and whether a payload has a member under one
+ * of them (DESIGN.md §37).
+ */
+extern uint8 *lion_heap_dirty_keys(Relation heap, BlockNumber *nblocks,
+								   uint32 *nkeys);
+extern bool lion_payload_touches(const char *payload, Size paylen,
+								 const uint8 *dirty, uint32 nkeys,
+								 struct LionContainer *stage);
+
 extern int64 lion_count_posting_sets(Relation heap, Snapshot snapshot,
 									int nsets, LionPostingSet *sets,
 									LionCountStats *stats);
@@ -1388,6 +1408,21 @@ extern bool lion_entry_scan_next(LionEntryScan *es, Datum *key,
  */
 extern LionEntryTuple *lion_entry_scan_next_copy(LionEntryScan *es,
 												 Size *itemlen);
+
+/*
+ * The next entry as the copy the leaf read made, as lion_entry_scan_next_copy()
+ * hands it out, but with the leaf it came from kept pinned until the walk
+ * reads another: *pin is that pin while the batch has an INLINE copy, and
+ * InvalidBuffer otherwise.  What the pin interlocks (DESIGN.md §9) may be
+ * asked of the copy for as long as it is held - and
+ * lion_entry_scan_locate() makes a located set of it, its own pin taken.
+ */
+extern LionEntryTuple *lion_entry_scan_next_pinned(LionEntryScan *es,
+												   Size *itemlen,
+												   Buffer *pin);
+extern void lion_entry_scan_locate(LionEntryScan *es,
+								   const LionEntryTuple *entry, Size itemlen,
+								   Buffer pin, LionPostingSet *ps);
 
 /*
  * Read ONE more leaf of the walk and say how many entries on it the walk

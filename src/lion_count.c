@@ -2577,3 +2577,118 @@ lion_sets_satisfiable(int nsets, LionPostingSet *sets, LionKeyNode *tree)
 
 	return lion_source_satisfiable(lion_source_tree(&src), sets);
 }
+
+/*
+ * Is every member of an INLINE payload on a heap block the visibility map
+ * calls all-visible (DESIGN.md §37, "The rows of an entry")?  Then each is a
+ * row every snapshot sees, and the entry's rows are its ntids.  The caller
+ * holds a pin of the leaf the payload was copied from, which is the
+ * interlock every count rests on (§9): VACUUM cannot take a TID out of the
+ * entry and mark its page while the leaf is pinned, and a TID put in after
+ * the snapshot was taken came with its page's mark taken off, which this
+ * snapshot's xmin keeps off.  stage is a LION_CONTAINER_MAX_SIZE buffer the
+ * items are read into.
+ */
+bool
+lion_payload_all_visible(Relation heap, const char *payload, Size paylen,
+						 Buffer *vmbuf, LionContainer *stage)
+{
+	Size		off = 0;
+
+	while (lion_inline_fetch(payload, paylen, &off, stage) > 0)
+	{
+		if (stage->type == LION_CT_SPARSE)
+		{
+			uint32		n = lion_sparse_npairs(stage);
+			const uint32 *ckeys = LION_SPARSE_CKEYS_CONST(stage);
+			const uint16 *los = LION_SPARSE_LOS_CONST_AT(stage, n);
+			uint32		i;
+
+			for (i = 0; i < n; i++)
+			{
+				uint64		wanted = UINT64CONST(1) <<
+					(los[i] >> LION_OFFSET_BITS);
+
+				if ((lion_vm_allvisible_mask(heap,
+											 lion_ckey_first_block(ckeys[i]),
+											 wanted, vmbuf, NULL) &
+					 wanted) != wanted)
+					return false;
+			}
+		}
+		else
+		{
+			uint64		wanted = lion_container_block_mask(stage);
+
+			if ((lion_vm_allvisible_mask(heap,
+										 lion_ckey_first_block(stage->ckey),
+										 wanted, vmbuf, NULL) &
+				 wanted) != wanted)
+				return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * The container keys of heap - one for every LION_BLOCKS_PER_CONTAINER of its
+ * blocks - that hold a block the visibility map does not call all-visible, as
+ * a byte each in a palloc'd array of *nkeys, with *nblocks the heap's size
+ * (DESIGN.md §37).  The last key's blocks past the end count as all-visible.
+ */
+uint8 *
+lion_heap_dirty_keys(Relation heap, BlockNumber *nblocks, uint32 *nkeys)
+{
+	Buffer		vmbuf = InvalidBuffer;
+	uint8	   *dirty;
+	uint32		k;
+
+	*nblocks = RelationGetNumberOfBlocks(heap);
+	*nkeys = (uint32) ((*nblocks + LION_BLOCKS_PER_CONTAINER - 1) /
+					   LION_BLOCKS_PER_CONTAINER);
+	dirty = (uint8 *) palloc0(Max(*nkeys, 1));
+	for (k = 0; k < *nkeys; k++)
+	{
+		BlockNumber first = (BlockNumber) k * LION_BLOCKS_PER_CONTAINER;
+		uint32		n = Min(*nblocks - first, LION_BLOCKS_PER_CONTAINER);
+		uint64		wanted = (n == 64) ? ~UINT64CONST(0) :
+			(UINT64CONST(1) << n) - 1;
+
+		if ((lion_vm_allvisible_mask(heap, first, wanted, &vmbuf, NULL) &
+			 wanted) != wanted)
+			dirty[k] = 1;
+	}
+	if (BufferIsValid(vmbuf))
+		ReleaseBuffer(vmbuf);
+	return dirty;
+}
+
+/*
+ * Does an INLINE payload have a member under one of the nkeys container keys
+ * dirty marks, or past them?
+ */
+bool
+lion_payload_touches(const char *payload, Size paylen, const uint8 *dirty,
+					 uint32 nkeys, LionContainer *stage)
+{
+	Size		off = 0;
+
+	while (lion_inline_fetch(payload, paylen, &off, stage) > 0)
+	{
+		if (stage->type == LION_CT_SPARSE)
+		{
+			uint32		n = lion_sparse_npairs(stage);
+			const uint32 *ckeys = LION_SPARSE_CKEYS_CONST(stage);
+			uint32		i;
+
+			for (i = 0; i < n; i++)
+			{
+				if (ckeys[i] >= nkeys || dirty[ckeys[i]])
+					return true;
+			}
+		}
+		else if (stage->ckey >= nkeys || dirty[stage->ckey])
+			return true;
+	}
+	return false;
+}

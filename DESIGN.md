@@ -16514,9 +16514,36 @@ read and after the last, and the heap has as many pages both times (`lion_heap_a
 - So the second look finds every page marked only if nothing changed in between, and every `ntids`
   read in between counted exactly the rows of the first look, which are this snapshot's.
 
-Otherwise - a page not marked, at either look - the aggregates start again and each entry is counted
-as a group of a walk is (`lion_node_count()`), the NULL entry included. So is every walk during
-recovery, where a standby's snapshot holds nothing back on the primary.
+Otherwise - a page not marked, at either look - the aggregates start again, and the same argument
+is made per container key (2026-10-01). `lion_heap_dirty_keys()` notes each key of 64 blocks that
+holds a page not all-visible; the walk counts each entry with a member under one of them as a group
+of a walk is (`lion_node_count()`), and takes the rest's `ntids` (`lion_payload_touches()`). Then
+the map is read again: when the heap has as many pages and no key is dirty that was clean, every
+clean key had no change in between, so its TIDs were this snapshot's rows at the first look, and the
+answer stands.
+
+- **Only an INLINE entry keeps its header's count.** A CHAIN entry's `ntids` covers the members
+  under dirty keys too, which the walk would have to take back out by reading them; it is counted.
+- **The entries are read under their leaf's pin** (`lion_entry_scan_next_pinned()`), and one to
+  be counted is located from the copy and that pin (`lion_entry_scan_locate()`), as the
+  directory-walk count of §9 does.
+- **A key that turned dirty between the looks** - a write the walks may have counted - sends them
+  again, each INLINE entry's blocks asked of the map while its leaf is pinned
+  (`lion_payload_all_visible()`, the §9 interlock): all-visible now, its `ntids`; otherwise
+  counted. That walk is right whatever happens during it, and it is the one recovery takes, where
+  a standby's snapshot holds nothing back on the primary.
+
+A column of 2.4 million keys with two pages not all-visible (5M rows, PostgreSQL 18 release build):
+
+| | before | after |
+| --- | --- | --- |
+| `avg(u)`, 2.4M keys | 840 ms | 270-330 ms |
+| `avg(w)`, 1,500 keys, each a CHAIN | ~140 ms | ~140 ms |
+| both | 1.8 s | 390-460 ms |
+
+Every key past the dirty ones is a header read; the time left is the walk's own, the entries copied
+under a pin rather than read in place, and the 1,500 CHAIN entries counted. A sequential scan of the
+same table took 233 ms.
 
 ### The results, as core computes them
 
@@ -16541,9 +16568,12 @@ new member of custom_private, `LION_PRIV_WAGG` (shape 21): their attnums, indexe
 `custom_scan_tlist` the executor fills with the key (`LION_TL_WKEY`); the aggregate itself is a
 `LION_TL_WAGG` column. With no count in the target list the sum over every row is not made. The
 price (`lion_cost_wagg_path()`): each column's leaves and two operator costs an entry where the
-table's `allvisfrac` is at least 0.999, the grouped count of the column (§10) elsewhere, and the
-arguments' evaluation. EXPLAIN prints `Aggregates Over Keys: <index> (<column>), ...`; ANALYZE
-adds `Keys Aggregated`, `Key Walks From Entry Counts` and, when it happened, `Key Walks Counted`.
+table's `allvisfrac` is at least 0.999, and the arguments' evaluation. Elsewhere the share of the
+entries the walk counts is priced as the grouped count of the column (§10), the rest as headers:
+the pages not all-visible taken one to a container key, and an entry of the column's average rows
+under as many keys drawn at random. EXPLAIN prints `Aggregates Over Keys: <index> (<column>),
+...`; ANALYZE adds `Keys Aggregated`, `Key Walks From Entry Counts` and, when they happened, `Key
+Walks Past Dirty Pages`, `Key Walks Counted` (the map asked entry by entry) and `Keys Counted`.
 
 ### Measured (ClickBench, 5% sample, PostgreSQL 18 release build, warm)
 
@@ -16557,12 +16587,13 @@ Q4's 3.4M entries are the walk of every header, as for the top k of §36.
 
 ### Not done in this version
 
-- **A heap with a few pages not all-visible counts every entry.** The proof is all or nothing, so
-  one insert since the last VACUUM sends each column's walk to the count of each of its entries -
-  cheap for a column of a few thousand keys, a GROUP BY walk's price for one of millions. The price
-  follows `allvisfrac`, which only VACUUM and ANALYZE refresh, so a table written to since is
-  still priced as the header walk. Correcting the headers' sums by the dirty pages alone would
-  need each dirty TID's key, which a dead item no longer has.
+- **A CHAIN entry under a dirty key is counted whole.** Its header's count less the members under
+  the dirty keys, counted, would be its rows, but the posting tree keeps no count per key, so
+  finding those members reads the tree as the count does. A column of few keys, every one of them
+  a CHAIN, gains nothing from a few dirty pages.
+- **The price follows `allvisfrac`**, which only VACUUM and ANALYZE refresh, so a table written to
+  since is still priced as the header walk. Correcting the headers' sums by the dirty pages alone
+  would need each dirty TID's key, which a dead item no longer has.
 - **A WHERE, a GROUP BY, a partitioned table**: each entry's rows would be its count against the
   WHERE, per group - the walks of §10 with an argument per entry, not yet written.
 
@@ -16573,6 +16604,11 @@ sum passes int8's range, text, date and bool columns and a two-column index's se
 averages, extremes and `bool_and`/`bool_or`/`every` of the column and of expressions of it, NULL for
 some keys; a HAVING on the one row; the entries' own counts on an all-visible heap, and each entry
 counted after a DELETE, beside this transaction's own insert and delete, and again after VACUUM;
+one page not all-visible, every entry of a column of few keys counted and a quarter of one of a
+row each;
 an empty table and one of NULLs only; and the declines - a WHERE, a GROUP BY, two columns in one
 argument, a volatile argument, DISTINCT, FILTER, ORDER BY, a numeric column, the aggregates no
-sum of keys answers, and a partial index.
+sum of keys answers, and a partial index. `test/isolation/wagg_dirty_race.spec`: the walks past one
+dirty page, parked at the injection point `lion-wagg-dirty-walked` before the second look, with and
+without an insert after the snapshot onto clean keys' pages meanwhile; the answer with the insert is
+the snapshot's, from the walk that asks the map entry by entry.
