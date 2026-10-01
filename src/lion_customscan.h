@@ -2423,6 +2423,7 @@ extern List *lion_replaced_functions(RelOptInfo *rel, List *tlexprs,
 typedef enum LionCompetitor
 {
 	LION_COMPETITOR_NONE,		/* no path of core's in the relation yet */
+	LION_COMPETITOR_DISABLED,	/* ... or none that enable_* leaves on */
 	LION_COMPETITOR_HASHAGG,	/* an aggregate that hashes */
 	LION_COMPETITOR_AGG,		/* a plain or sorted one over a scan */
 	LION_COMPETITOR_HASHJOIN,
@@ -2443,7 +2444,7 @@ typedef struct LionUnits
 {
 	LionCompetitor kind;		/* the cheapest core path's kind */
 	double		rate;			/* ... and its rate */
-	double		margin;			/* pg_lion.pushdown_margin */
+	double		margin;			/* pg_lion.pushdown_margin, or 1 */
 } LionUnits;
 
 /* lion_plan_units.c */
@@ -2452,10 +2453,13 @@ extern LionCompetitor lion_competitor_kind(Path *path);
 extern double lion_competitor_rate(LionCompetitor kind);
 extern Path *lion_competitor_path(RelOptInfo *rel);
 extern void lion_units_for(RelOptInfo *rel, LionUnits *u);
+extern void lion_units_pin(RelOptInfo *rel);
+extern void lion_units_unpin(void);
 extern void lion_units_begin(const LionUnits *u);
 extern void lion_units_end(void);
 extern Cost lion_units_price(const LionUnits *u, Cost own);
 extern double lion_units_margin(void);
+extern double lion_units_margin_for(RelOptInfo *rel);
 
 /* lion_plan_cost.c */
 extern double lion_index_dir_pages(IndexOptInfo *idx, double *height);
@@ -2470,6 +2474,8 @@ extern Cost lion_heap_page_cost(PlannerInfo *root, RelOptInfo *rel,
 								double pages, double heap_pages);
 extern Cost lion_index_page_cost(PlannerInfo *root, double idxpages,
 								 Cost device);
+extern bool lion_where_query_unknown(List *whereclauses, List *wherekinds,
+									 List *whereinor);
 extern int lion_inlist_shape(IndexOptInfo *groupidx, AttrNumber groupcol,
 							 IndexOptInfo *groupidx2, List *whereidx,
 							 List *wherecol, List *whereclauses,

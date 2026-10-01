@@ -40,6 +40,7 @@ double		lion_page_scale = 1.0;
 
 static const char *const lion_competitor_names[] = {
 	[LION_COMPETITOR_NONE] = "none",
+	[LION_COMPETITOR_DISABLED] = "disabled plan",
 	[LION_COMPETITOR_HASHAGG] = "hashed aggregate",
 	[LION_COMPETITOR_AGG] = "aggregate over a scan",
 	[LION_COMPETITOR_HASHJOIN] = "hash join",
@@ -304,6 +305,7 @@ lion_competitor_rate(LionCompetitor kind)
 		case LION_COMPETITOR_BITMAP:
 			return lion_bitmap_rate;
 		case LION_COMPETITOR_NONE:
+		case LION_COMPETITOR_DISABLED:
 		case LION_COMPETITOR_SEQSCAN:
 		case LION_COMPETITOR_INDEXONLY:
 		case LION_COMPETITOR_INDEX:
@@ -356,23 +358,180 @@ lion_competitor_path(RelOptInfo *rel)
 }
 
 /*
- * The units a lion path of rel is to be priced in: the cheapest core path's
- * kind and its rate, or the reference when rel has no path of core's yet.
+ * Is a path one core's enable_* settings have disabled: a node of it is
+ * (PostgreSQL 18's disabled_nodes), or its cost holds disable_cost?
+ */
+static bool
+lion_path_disabled(const Path *p)
+{
+#if PG_VERSION_NUM >= 180000
+	return p->disabled_nodes > 0;
+#else
+	return p->total_cost >= disable_cost;
+#endif
+}
+
+/* Does a bitmap path's tree of quals read a lion index? */
+static bool
+lion_bitmap_reads_lion(Path *bitmapqual, Oid lionam)
+{
+	ListCell   *lc;
+
+	if (IsA(bitmapqual, IndexPath))
+		return ((IndexPath *) bitmapqual)->indexinfo->relam == lionam;
+	if (IsA(bitmapqual, BitmapAndPath))
+	{
+		foreach(lc, ((BitmapAndPath *) bitmapqual)->bitmapquals)
+			if (lion_bitmap_reads_lion((Path *) lfirst(lc), lionam))
+				return true;
+	}
+	else if (IsA(bitmapqual, BitmapOrPath))
+	{
+		foreach(lc, ((BitmapOrPath *) bitmapqual)->bitmapquals)
+			if (lion_bitmap_reads_lion((Path *) lfirst(lc), lionam))
+				return true;
+	}
+	return false;
+}
+
+/*
+ * Is a core path a scan of a lion index through the AM - a plain, index-only
+ * or bitmap scan of one, under the nodes that pass its rows up and no join?
+ * Its price is lion's own model's (lioncostestimate()), with lion's errors.
+ */
+static bool
+lion_path_is_lion_scan(Path *path)
+{
+	Oid			lionam = lion_get_am_oid();
+
+	while (path != NULL && OidIsValid(lionam))
+	{
+		switch (nodeTag(path))
+		{
+			case T_IndexPath:
+				return ((IndexPath *) path)->indexinfo->relam == lionam;
+			case T_BitmapHeapPath:
+				return lion_bitmap_reads_lion(((BitmapHeapPath *) path)->bitmapqual,
+											  lionam);
+			case T_NestPath:
+			case T_MergePath:
+			case T_HashPath:
+			case T_AppendPath:
+			case T_MergeAppendPath:
+				return false;
+			default:
+				break;
+		}
+		path = lion_path_input(path);
+	}
+	return false;
+}
+
+/*
+ * What a lion path of rel competes with: the kind of the cheapest core path
+ * (lion_competitor_path()) and its cost; NONE when core has no path there yet,
+ * and DISABLED when every one it has is disabled - a plan forced by core's
+ * enable_* settings, which leave a lion path nothing to compete with.
+ * *ownscan says whether that path is one of the AM's own scans of a lion
+ * index (lion_path_is_lion_scan()).
+ */
+static LionCompetitor
+lion_competitor_of(RelOptInfo *rel, Cost *cost, bool *ownscan)
+{
+	Path	   *best = lion_competitor_path(rel);
+
+	*cost = (best != NULL) ? best->total_cost : 0.0;
+	*ownscan = false;
+	if (best == NULL)
+		return LION_COMPETITOR_NONE;
+	if (lion_path_disabled(best))
+		return LION_COMPETITOR_DISABLED;
+	*ownscan = lion_path_is_lion_scan(best);
+	return lion_competitor_kind(best);
+}
+
+/*
+ * The margin a lion path is offered at against a competitor of this kind:
+ * pg_lion.pushdown_margin, or none - 1 - where there is nothing to hedge.
+ * With no competitor (no path of core's yet, or none left enabled) the choice
+ * is not between lion and core, and a plan forced by core's enable_*
+ * settings is priced in lion's own units, which its choices among its own
+ * forms - a walk in order or a Sort over one, serial or parallel - were made
+ * in.  Against the AM's own scan of a lion index both prices are lion's
+ * model's and share its errors: the margin, a hedge against those errors in
+ * lion's price alone, would only tilt a choice between two of lion's plans.
+ */
+static double
+lion_competitor_margin(LionCompetitor kind, bool ownscan)
+{
+	if (kind == LION_COMPETITOR_NONE || kind == LION_COMPETITOR_DISABLED ||
+		ownscan)
+		return 1.0;
+	return lion_units_margin();
+}
+
+/*
+ * The competitor of the relation a planner hook is adding lion's paths to,
+ * found before the first of them is added (lion_units_pin()).  add_path()
+ * frees the paths a new one dominates, so the core path the first lion path
+ * was priced against may be gone by the time the next one is priced - the
+ * decoded walk after the nested loop of the same GROUP BY (§34), the parallel
+ * FK-side join after the serial one, the second way round of a join - and
+ * the next one would be priced against the cheapest path core has LEFT, of
+ * another kind or none: two of lion's own paths in two units, compared with
+ * each other.
+ */
+static RelOptInfo *lion_units_pinned_rel = NULL;
+static LionCompetitor lion_units_pinned_kind;
+static Cost lion_units_pinned_cost;
+static bool lion_units_pinned_ownscan;
+
+/*
+ * The units a lion path of rel is to be priced in - the cheapest core path's
+ * kind and its rate, the reference when there is none - and the margin it is
+ * offered at (lion_competitor_margin()).
  */
 void
 lion_units_for(RelOptInfo *rel, LionUnits *u)
 {
-	Path	   *best = lion_competitor_path(rel);
+	Cost		cost;
+	bool		ownscan;
 
-	u->kind = (best != NULL) ? lion_competitor_kind(best) :
-		LION_COMPETITOR_NONE;
+	if (rel != NULL && rel == lion_units_pinned_rel)
+	{
+		u->kind = lion_units_pinned_kind;
+		cost = lion_units_pinned_cost;
+		ownscan = lion_units_pinned_ownscan;
+	}
+	else
+		u->kind = lion_competitor_of(rel, &cost, &ownscan);
 	u->rate = lion_competitor_rate(u->kind);
 	if (u->rate <= 0.0)
 		u->rate = 1.0;
-	u->margin = lion_units_margin();
-	elog(DEBUG2, "lion: priced against a %s, cost %.2f, at rate %g and margin %g",
-		 lion_competitor_names[u->kind],
-		 (best != NULL) ? best->total_cost : 0.0, u->rate, u->margin);
+	u->margin = lion_competitor_margin(u->kind, ownscan);
+	elog(DEBUG2, "lion: priced against a %s%s, cost %.2f, at rate %g and margin %g",
+		 ownscan ? "lion " : "", lion_competitor_names[u->kind], cost,
+		 u->rate, u->margin);
+}
+
+/*
+ * Pin rel's competitor for the planner hook adding lion's paths to it, before
+ * it adds the first (see above); lion_units_unpin() at the hook's end, and at
+ * every hook's start, so that a pin an error left behind is never read.
+ */
+void
+lion_units_pin(RelOptInfo *rel)
+{
+	lion_units_pinned_rel = NULL;
+	lion_units_pinned_kind = lion_competitor_of(rel, &lion_units_pinned_cost,
+												&lion_units_pinned_ownscan);
+	lion_units_pinned_rel = rel;
+}
+
+void
+lion_units_unpin(void)
+{
+	lion_units_pinned_rel = NULL;
 }
 
 /*
@@ -391,6 +550,24 @@ double
 lion_units_margin(void)
 {
 	return (lion_pushdown_margin > 0.0) ? lion_pushdown_margin : 1.0;
+}
+
+/*
+ * ... for a LionOrdered path of the base rel rel, which has no rate (its
+ * competitors are the reference): the margin, or none when rel's scans are
+ * all disabled.  Not the AM's scans' exemption: the cheapest scan of the
+ * relation is rarely what a LionOrdered path is chosen over - that is an
+ * ordered btree scan of core's, or a Sort, under a LIMIT - and a lion bitmap
+ * scan of its filter often is.
+ */
+double
+lion_units_margin_for(RelOptInfo *rel)
+{
+	Cost		cost;
+	bool		ownscan;
+	LionCompetitor kind = lion_competitor_of(rel, &cost, &ownscan);
+
+	return lion_competitor_margin(kind, false);
 }
 
 /*
