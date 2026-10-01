@@ -1115,7 +1115,6 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	 * of the grouped rel (DESIGN.md §39); the child is core's, priced by core.
 	 */
 	lion_units_for(output_rel, &units);
-	lion_units_begin(&units);
 	run = lion_cost_fkjoin_path(root, rel, targets, fj->fkvar, joinclause,
 								whereclauses, wherekinds, ors, childrows,
 								childfound,
@@ -1125,7 +1124,6 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	if (unique)
 		sortcost = lion_fkjoin_sort_cost(child->rows,
 										 child->pathtarget->width);
-	lion_units_end();
 	run = lion_units_price(&units, run);
 	sortcost = lion_units_price(&units, sortcost);
 
@@ -2249,7 +2247,6 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 	 * `startrun`; the child and the rows it emits are core's prices.
 	 */
 	lion_units_for(joinrel, &units);
-	lion_units_begin(&units);
 	run = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar,
 								setup.joinclause, setup.whereclauses,
 								setup.wherekinds, ors, dimrows, dimrows, true,
@@ -2271,7 +2268,6 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 									 setup.wherekinds, ors, firstrows,
 									 firstrows, true, rowbytes, 0, &collect,
 									 &walk, true);
-	lion_units_end();
 	run = lion_units_price(&units, run);
 	startrun = lion_units_price(&units, startrun);
 	foreach(lc, outerrel->pathlist)
@@ -2315,7 +2311,6 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 			double		childrows = clamp_row_est(dimrows /
 												  lion_parallel_divisor(workers));
 
-			lion_units_begin(&units);
 			run = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar,
 										setup.joinclause, setup.whereclauses,
 										setup.wherekinds, ors, childrows,
@@ -2329,7 +2324,6 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 											 setup.wherekinds, ors, firstrows,
 											 firstrows, true, rowbytes,
 											 workers, &collect, &walk, true);
-			lion_units_end();
 			run = lion_units_price(&units, run);
 			startrun = lion_units_price(&units, startrun);
 			foreach(lc, outerrel->partial_pathlist)

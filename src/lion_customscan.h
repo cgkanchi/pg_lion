@@ -476,8 +476,8 @@
 #define LION_FKJOIN_SORT_COMPARE_COST	(lion_fkjoin_sort_compare_cost * cpu_operator_cost)
 #define LION_FKJOIN_SORT_KEY_COST	(lion_fkjoin_sort_key_cost * cpu_operator_cost)
 #define LION_FKJOIN_SORT_PAGE_COST \
-	(lion_fkjoin_sort_seq_page_cost * LION_SEQ_PAGE_COST + \
-	 lion_fkjoin_sort_random_page_cost * LION_RANDOM_PAGE_COST)
+	(lion_fkjoin_sort_seq_page_cost * seq_page_cost + \
+	 lion_fkjoin_sort_random_page_cost * random_page_cost)
 
 /*
  * Looking the child's rows up in the fk index's key order (DESIGN.md §27,
@@ -2455,8 +2455,6 @@ extern Path *lion_competitor_path(RelOptInfo *rel);
 extern void lion_units_for(RelOptInfo *rel, LionUnits *u);
 extern void lion_units_pin(RelOptInfo *rel);
 extern void lion_units_unpin(void);
-extern void lion_units_begin(const LionUnits *u);
-extern void lion_units_end(void);
 extern Cost lion_units_price(const LionUnits *u, Cost own);
 extern double lion_units_margin(void);
 extern double lion_units_margin_for(RelOptInfo *rel);
