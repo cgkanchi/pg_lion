@@ -1725,9 +1725,10 @@ typedef struct LionCountScanState
 	 * columns, each walked once, and nwagg aggregates over them, each an
 	 * argument evaluated on an entry's key and weighted by the entry's rows.
 	 * wneedcount says the target list has counts too, which the sum over
-	 * every row answers as before.  wfast and wslow are what EXPLAIN ANALYZE
-	 * reports: the walks that read the entries' own counts, and those that
-	 * counted each entry.
+	 * every row answers as before.  wfast, wdirty and wslow are what EXPLAIN
+	 * ANALYZE reports: the walks that read the entries' own counts, those
+	 * that counted the entries under dirty container keys, and those that
+	 * asked the map entry by entry.
 	 */
 	int			nwcol;
 	struct LionWCol *wcol;
@@ -1738,6 +1739,11 @@ typedef struct LionCountScanState
 	int64		wentries;
 	int64		wfast;
 	int64		wslow;
+	int64		wdirty;
+	int64		wcounted;		/* entries those last two counted: the rest
+								 * were all rows */
+	Buffer		wvmbuf;			/* the map page those walks last read */
+	struct LionContainer *wstage;	/* ... and their items' buffer */
 
 	/*
 	 * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel"; granged,

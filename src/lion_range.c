@@ -1528,6 +1528,54 @@ lion_entry_scan_next_copy(LionEntryScan *es, Size *itemlen)
 	return es->bentry[i];
 }
 
+LionEntryTuple *
+lion_entry_scan_next_pinned(LionEntryScan *es, Size *itemlen, Buffer *pin)
+{
+	int			i;
+
+	while (es->nextbatch >= es->nbatch)
+	{
+		/* the last leaf's copies are done with: its pin goes */
+		if (BufferIsValid(es->batchbuf))
+		{
+			ReleaseBuffer(es->batchbuf);
+			es->batchbuf = InvalidBuffer;
+		}
+		if (es->done ||
+			(!BlockNumberIsValid(es->blkno) && es->nextphase == es->phase))
+		{
+			es->done = true;
+			return NULL;
+		}
+		CHECK_FOR_INTERRUPTS();
+		(void) lion_entry_scan_fill(es, true);
+	}
+
+	i = es->nextbatch++;
+	*itemlen = es->bsize[i];
+	*pin = es->batchbuf;
+	return es->bentry[i];
+}
+
+void
+lion_entry_scan_locate(LionEntryScan *es, const LionEntryTuple *entry,
+					   Size itemlen, Buffer pin, LionPostingSet *ps)
+{
+	bool		keeppin;
+
+	Assert(es->nextbatch > 0 && es->bentry[es->nextbatch - 1] == entry);
+	lion_fill_posting_set_entry(es->index, es->state, entry, itemlen,
+								es->batchblk, es->boff[es->nextbatch - 1], ps,
+								&keeppin);
+	if (keeppin)
+	{
+		if (!BufferIsValid(pin))
+			elog(ERROR, "lion: an INLINE copy without its leaf's pin");
+		IncrBufferRefCount(pin);
+		ps->pinbuf = pin;
+	}
+}
+
 int64
 lion_entry_scan_skip_leaf(LionEntryScan *es)
 {

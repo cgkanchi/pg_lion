@@ -7,8 +7,9 @@
 -- avg that over their total, min and max the first f(key) in the aggregate's
 -- order: one walk of each column's entries.  When every heap page is
 -- all-visible before and after the walk, an entry's rows are the count its
--- header keeps; otherwise each entry is counted.  Every answer is checked
--- against a SEQUENTIAL SCAN.
+-- header keeps; otherwise an entry with a member under a container key that
+-- holds a page not all-visible is counted, and the rest keep their headers'
+-- counts.  Every answer is checked against a SEQUENTIAL SCAN.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -76,7 +77,7 @@ BEGIN
 	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
-		IF ln ~ '(Aggregates Over Keys|Keys Aggregated|Key Walks|Lion Indexes|LionCount)' THEN
+		IF ln ~ '(Aggregates Over Keys|Keys Aggregated|Keys Counted|Key Walks|Lion Indexes|LionCount)' THEN
 			RETURN NEXT regexp_replace(ln, '\s+\(actual.*$', '');
 		END IF;
 	END LOOP;
@@ -212,7 +213,8 @@ SELECT lion_kq('SELECT sum(nullif(i, 7)), max(CASE WHEN s > 0 THEN s END) FROM k
  over keys, 1 rows
 (1 row)
 
--- 2. A heap the visibility map does not vouch for: each entry counted.
+-- 2. A heap the visibility map does not vouch for: a page not all-visible in
+--    every container key, and each entry counted.
 DELETE FROM ka WHERE s = 3;
 SELECT lion_kq('SELECT sum(s), count(*), avg(i), min(t), max(b) FROM ka');
       lion_kq      
@@ -228,8 +230,9 @@ SELECT lion_krun('SELECT sum(s), count(*), avg(i), min(t), max(b) FROM ka');
    Aggregates Over Keys: ka_s (s), ka_i (i), ka_t (t), ka_b (b)
    Keys Aggregated: 31056
    Key Walks From Entry Counts: 0
-   Key Walks Counted: 4
-(6 rows)
+   Key Walks Past Dirty Pages: 4
+   Keys Counted: 31056
+(7 rows)
 
 -- ... rows this transaction added, and one it took away.
 BEGIN;
@@ -258,6 +261,34 @@ SELECT lion_krun('SELECT sum(s), avg(i) FROM ka');
    Keys Aggregated: 1017
    Key Walks From Entry Counts: 2
 (5 rows)
+
+-- ... one page not all-visible: the entries with a member under its
+-- container key are counted - every one of s's, a few of b's, whose keys
+-- each have one row - and the rest are their headers' counts.
+DELETE FROM ka WHERE b = 100000300;
+SELECT lion_kq('SELECT sum(s), count(*), avg(i), min(t), max(b), sum(b) FROM ka');
+      lion_kq      
+-------------------
+ over keys, 1 rows
+(1 row)
+
+SELECT lion_krun('SELECT sum(b), avg(s) FROM ka');
+                 lion_krun                  
+--------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: ka_f (all rows)
+   Aggregates Over Keys: ka_b (b), ka_s (s)
+   Keys Aggregated: 28251
+   Key Walks From Entry Counts: 0
+   Key Walks Past Dirty Pages: 2
+   Keys Counted: 7244
+(7 rows)
+
+SELECT sum(b), avg(s) FROM ka;
+           sum           |           avg           
+-------------------------+-------------------------
+ 84708000282344718844977 | -0.18842530282637954240
+(1 row)
 
 -- 3. No rows: sums, averages and extremes are NULL, counts 0.
 CREATE TABLE ka0 (x int4) WITH (autovacuum_enabled = off);

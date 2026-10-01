@@ -1,0 +1,115 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s2_vacuum s2_dirty s1_begin s1_snap s1_walks s2_wakeup s1_aggs s1_seq s1_commit
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s2_vacuum: VACUUM wd;
+step s2_dirty: UPDATE wd SET pad = 'q' WHERE id = 1;
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_snap: SELECT count(*) FROM wd WHERE id < 0;
+count
+-----
+    0
+(1 row)
+
+step s1_walks: SELECT * FROM wd_walks(); <waiting ...>
+step s2_wakeup: 
+	SELECT injection_points_detach('lion-wagg-dirty-walked');
+	SELECT injection_points_wakeup('lion-wagg-dirty-walked');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_walks: <... completed>
+wd_walks                                
+----------------------------------------
+Aggregates Over Keys: wd_u (u), wd_w (w)
+Key Walks From Entry Counts: 0          
+Key Walks Past Dirty Pages: 2           
+(3 rows)
+
+step s1_aggs: SELECT sum(u), avg(w), max(u) FROM wd;
+     sum|               avg| max
+--------+------------------+----
+49990000|2.9999000000000000|4999
+(1 row)
+
+step s1_seq: 
+	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SET LOCAL enable_seqscan = on;
+	SELECT sum(u), avg(w), max(u) FROM wd;
+
+     sum|               avg| max
+--------+------------------+----
+49990000|2.9999000000000000|4999
+(1 row)
+
+step s1_commit: COMMIT;
+
+starting permutation: s2_vacuum s2_dirty s1_begin s1_snap s1_walks s2_insert s2_wakeup s1_aggs s1_seq s1_commit
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s2_vacuum: VACUUM wd;
+step s2_dirty: UPDATE wd SET pad = 'q' WHERE id = 1;
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_snap: SELECT count(*) FROM wd WHERE id < 0;
+count
+-----
+    0
+(1 row)
+
+step s1_walks: SELECT * FROM wd_walks(); <waiting ...>
+step s2_insert: INSERT INTO wd SELECT g, 1000000 + g, 100, 'n' FROM generate_series(1, 300) g;
+step s2_wakeup: 
+	SELECT injection_points_detach('lion-wagg-dirty-walked');
+	SELECT injection_points_wakeup('lion-wagg-dirty-walked');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_walks: <... completed>
+wd_walks                                
+----------------------------------------
+Aggregates Over Keys: wd_u (u), wd_w (w)
+Key Walks From Entry Counts: 0          
+Key Walks Past Dirty Pages: 2           
+Key Walks Counted: 2                    
+(4 rows)
+
+step s1_aggs: SELECT sum(u), avg(w), max(u) FROM wd;
+     sum|               avg| max
+--------+------------------+----
+49990000|2.9999000000000000|4999
+(1 row)
+
+step s1_seq: 
+	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SET LOCAL enable_seqscan = on;
+	SELECT sum(u), avg(w), max(u) FROM wd;
+
+     sum|               avg| max
+--------+------------------+----
+49990000|2.9999000000000000|4999
+(1 row)
+
+step s1_commit: COMMIT;

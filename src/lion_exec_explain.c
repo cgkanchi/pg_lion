@@ -1082,16 +1082,23 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 							   es);
 
 	/*
-	 * The aggregates over keys (DESIGN.md §37): the entries they took, and
-	 * how many walks read the entries' own counts and how many counted them.
+	 * The aggregates over keys (DESIGN.md §37): the entries they took, how
+	 * many walks read the entries' own counts, how many went past dirty
+	 * pages and how many asked the map entry by entry, and the entries those
+	 * two kinds counted.
 	 */
 	if (st->nwcol > 0)
 	{
 		ExplainPropertyInteger("Keys Aggregated", NULL, st->wentries, es);
 		ExplainPropertyInteger("Key Walks From Entry Counts", NULL, st->wfast,
 							   es);
+		if (st->wdirty > 0)
+			ExplainPropertyInteger("Key Walks Past Dirty Pages", NULL,
+								   st->wdirty, es);
 		if (st->wslow > 0)
 			ExplainPropertyInteger("Key Walks Counted", NULL, st->wslow, es);
+		if (st->wdirty + st->wslow > 0)
+			ExplainPropertyInteger("Keys Counted", NULL, st->wcounted, es);
 	}
 
 	/*

@@ -3483,10 +3483,14 @@ lion_cost_topk_path(PlannerInfo *root, CustomPath *cpath, List *targets,
  * THE AGGREGATES OVER LION COLUMNS' ENTRIES (DESIGN.md §37): one walk of each
  * column's entries, idxs[c] and key column cols[c], with naggs[c] arguments
  * evaluated at each entry.  On a heap the visibility map calls all-visible
- * the walk reads the entries' headers alone; elsewhere it counts each entry
- * as a GROUP BY of the column would.  Added to the sum over every row the
- * path already prices when the target list has counts too (counts), and in
- * place of it when it has not.
+ * the walk reads the entries' headers alone.  Elsewhere it counts the entries
+ * with a member under a container key that holds a page not all-visible, as
+ * a GROUP BY of the column would, and reads the rest's headers: the pages
+ * not all-visible taken as one to a key, the most keys they can be, and an
+ * entry of the column's average rows, each under a key of its own, as likely
+ * to meet one as that many keys drawn at random.  Added to the sum over every
+ * row the path already prices when the target list has counts too (counts),
+ * and in place of it when it has not.
  */
 #define LION_WAGG_ALLVISIBLE	0.999
 
@@ -3496,6 +3500,9 @@ lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 {
 	Cost		run = counts ? cpath->path.total_cost : 0.0;
 	bool		fast = (rel->allvisfrac >= LION_WAGG_ALLVISIBLE);
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		nkeys = Max(ceil(heap_pages / LION_BLOCKS_PER_CONTAINER), 1.0);
+	double		dirtyfrac = Min(1.0, (1.0 - rel->allvisfrac) * heap_pages / nkeys);
 	ListCell   *l1;
 	ListCell   *l2;
 	ListCell   *l3;
@@ -3507,19 +3514,27 @@ lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 		double		nagg = (double) lfirst_int(l3);
 		double		nd = lion_index_column_nd(root, rel, idx, col - 1);
 		double		pages;
+		double		counted;
+		Cost		headers;
 
 		if (nd <= 0.0)
 			nd = Max(rel->tuples, 1.0);
 		pages = Max(1.0, (double) idx->pages *
 					lion_index_column_share(root, rel, idx, col));
 		run += nd * nagg * 2.0 * cpu_operator_cost;
+		headers = pages * seq_page_cost + nd * LION_TOPK_ENTRY_COST;
 		if (fast)
-			run += pages * seq_page_cost + nd * LION_TOPK_ENTRY_COST;
+			run += headers;
 		else
-			run += lion_cost_count_rel(root, rel, idx, col, NULL, 0,
-									   NIL, NIL, NIL, NIL, NIL, nd, nd, 0,
-									   LION_DISTINCT_NONE, 1.0, NULL, false,
-									   NULL, 0.0, 0.0);
+		{
+			counted = 1.0 - pow(1.0 - dirtyfrac,
+								Min(Max(rel->tuples / nd, 1.0), nkeys));
+			run += (1.0 - counted) * headers +
+				counted * lion_cost_count_rel(root, rel, idx, col, NULL, 0,
+											  NIL, NIL, NIL, NIL, NIL, nd, nd,
+											  0, LION_DISTINCT_NONE, 1.0, NULL,
+											  false, NULL, 0.0, 0.0);
+		}
 	}
 
 	cpath->path.rows = 1.0;
