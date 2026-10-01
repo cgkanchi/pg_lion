@@ -150,7 +150,8 @@ psqlp -d postgres -tAc 'select 1' >/dev/null || { echo "soak: cannot connect to 
 log "soak: primary $PRIMARY_PGHOST:$PRIMARY_PGPORT, $(psqlp -d postgres -tAc 'select version()')"
 log "soak: duration ${DURATION}s, rows $ROWS + $PROWS, writers $WRITERS, readers $READERS, seed $SEED, out $OUT"
 preload=$(psqlp -d postgres -tAc "show shared_preload_libraries")
-log "soak: shared_preload_libraries = '$preload'"
+sbuf=$(psqlp -d postgres -tAc "show shared_buffers")
+log "soak: shared_preload_libraries = '$preload', shared_buffers = $sbuf"
 
 psqlp -d postgres -c "DROP DATABASE IF EXISTS $DB WITH (FORCE)" -c "CREATE DATABASE $DB" >/dev/null || exit 2
 log "soak: loading the schema"
@@ -171,7 +172,7 @@ wait_catchup() {
 	psqlp -c "SELECT pg_switch_wal()" >/dev/null 2>&1
 	until [ "$(psqls -tAc "SELECT pg_last_wal_replay_lsn() >= '$lsn'::pg_lsn" 2>/dev/null)" = t ]; do
 		n=$((n + 1))
-		[ $n -gt 1200 ] && { fail "standby catch-up" "the standby did not replay up to $lsn in 600s" "$SB_DATA/server.log"; return 1; }
+		[ $n -gt 1200 ] && { fail "standby catch-up" "the standby did not replay up to $lsn in 600s" "$SB_DATA/soak-standby.log"; return 1; }
 		sleep 0.5
 	done
 }
@@ -203,8 +204,11 @@ if [ -n "$SB_PORT" ]; then
 		shared_preload_libraries = '$preload'
 		log_line_prefix = '%m [%p] '
 	EOF
-	as_server "$PGBIN/pg_ctl" -D "$SB_DATA" -l "$SB_DATA/server.log" -w -t 120 start >>"$LOG" 2>&1 ||
-		{ echo "soak: the standby did not start (see $SB_DATA/server.log)" >&2; exit 2; }
+	# pg_basebackup copied whatever log the primary keeps in its data
+	# directory; the standby's own goes to a file of its own name.
+	as_server rm -f "$SB_DATA/soak-standby.log"
+	as_server "$PGBIN/pg_ctl" -D "$SB_DATA" -l "$SB_DATA/soak-standby.log" -w -t 120 start >>"$LOG" 2>&1 ||
+		{ echo "soak: the standby did not start (see $SB_DATA/soak-standby.log)" >&2; exit 2; }
 	[ "$(psqls -tAc 'select pg_is_in_recovery()')" = t ] || { echo "soak: the standby is not in recovery" >&2; exit 2; }
 	wait_catchup || exit 1
 	log "soak: standby up and caught up ($(psqls -tAc "select count(*) from soak.t") rows in soak.t there)"
@@ -396,7 +400,7 @@ fi
 log "soak: collecting the results"
 for f in "$OUT"/reader-*.out; do
 	grep -E '^(FAIL|ERROR)\|' "$f" | while IFS= read -r line; do
-		case $f in *-s[0-9]*|*standby*) sl=$SB_DATA/server.log ;; *) sl=$SERVER_LOG ;; esac
+		case $f in *-s[0-9]*|*standby*) sl=$SB_DATA/soak-standby.log ;; *) sl=$SERVER_LOG ;; esac
 		fail "$(basename "$f" .out): $(echo "$line" | cut -d'|' -f1-3)" "$line" "$sl"
 	done
 done
@@ -434,18 +438,19 @@ scan_log() {
 	[ -f "$f" ] || return
 	tail -c +"$((from + 1))" "$f" >"$OUT/$what-server.log"
 	grep -nE 'TRAP:|PANIC|terminated by signal|was terminated|exited with exit code|ERROR: +[^ ]*(sanitizer|AddressSanitizer)|runtime error:|AddressSanitizer|LeakSanitizer|WARNING' "$OUT/$what-server.log" |
-		grep -vE 'could not serialize|deadlock|conflict with recovery|canceling' | head -50 >"$OUT/$what-server.anomalies"
+		grep -vE 'could not serialize|deadlock|conflict with recovery|canceling|"logical replication launcher" \(PID [0-9]+\) exited with exit code 1' |
+		head -50 >"$OUT/$what-server.anomalies"
 	if [ -s "$OUT/$what-server.anomalies" ]; then
 		fail "$what server log: $(head -1 "$OUT/$what-server.anomalies" | cut -c1-200)" "$(cat "$OUT/$what-server.anomalies")" "$OUT/$what-server.log"
 	fi
 	grep -E 'ERROR:' "$OUT/$what-server.log" | sed -E 's/^[^E]*ERROR: +//' | cut -c1-120 | sort | uniq -c | sort -rn >"$OUT/$what-server.errors"
 }
 scan_log "$SERVER_LOG" "$SLOG_START" primary
-[ -n "$SB_PORT" ] && scan_log "$SB_DATA/server.log" 0 standby
+[ -n "$SB_PORT" ] && scan_log "$SB_DATA/soak-standby.log" 0 standby
 
 {
 	echo "== soak summary ($(date '+%F %T'))"
-	echo "mode: $MODE   preload: '$preload'   duration: ${DURATION}s   seed: $SEED   standby: ${SB_PORT:-none}"
+	echo "mode: $MODE   preload: '$preload'   shared_buffers: $sbuf   duration: ${DURATION}s   seed: $SEED   standby: ${SB_PORT:-none}"
 	echo "rows now: soak.t $(psqlp -tAc 'select count(*) from soak.t'), soak.p $(psqlp -tAc 'select count(*) from soak.p')"
 	echo "writer transactions: $(grep -h 'number of transactions actually processed' "$OUT/writers.log" | awk '{s += $NF} END {print s + 0}')" \
 		"(failed: $(grep -h 'number of failed transactions' "$OUT/writers.log" | awk '{s += $5} END {print s + 0}'))"

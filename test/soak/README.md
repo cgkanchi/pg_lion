@@ -32,6 +32,7 @@ running in generic mode if it was running.  Its settings, all optional:
 | `SOAK_DURATION` | `600` | seconds of load per mode |
 | `SOAK_ARGS` | | more `soak.sh` options, e.g. `--rows 100000 --readers 1` |
 | `SOAK_RUN_AS` | | the user the cluster runs as, when this runs as root |
+| `SOAK_SERVER_OPTS` | | more options for the restart, e.g. `-c shared_buffers=16MB`: a pool small enough that long lists run past the pin budget (DESIGN.md §15) and come out unpinned |
 | `SOAK_STANDBY_PORT`, `_SOCK`, `_DATA` | port + 1, `<socket dir>-standby`, `.local/soak-standby` | the standby's endpoint and data directory |
 | `LION_SOCK`, `LION_PORT` | | as for `dev.sh` |
 
@@ -197,7 +198,14 @@ do; they run in a database of their own (`lion_findings`).
   bug that changes what the heap holds (a lost row) is caught only by
   `heapallindexed` verify, not by a comparison.
 - A race the soak hits once in ten minutes it may miss the next time: a clean
-  run is evidence, not proof.  The rounds are seeded (`--seed`, `setseed()`
+  run is evidence, not proof.  Some it practically never hits: the aggregates
+  over keys count an aborted row only if a whole VACUUM cycle - the pruning,
+  every index's bulk delete, the second heap pass - fits between the walk
+  reading the entry and its second look at the map, and VACUUM's pass over
+  the very index the walk is reading follows the walk at much the same pace.
+  The soaks of 2026-10-01 took that path about a thousand times without a
+  wrong answer; `findings/wagg_aborted_insert.spec` parks the walk and gets
+  one every time.  That is what the injection-point specs are for.  The rounds are seeded (`--seed`, `setseed()`
   per reader iteration), but thread scheduling is not reproducible; what is,
   is the finding's spec.
 - The dev cluster runs `synchronous_commit = off`: a page whose newest commit
