@@ -2510,6 +2510,9 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	LionUnits	units;			/* the competitor's (§39) */
 
 	lion_units_for(output_rel, &units);
+	if (lion_where_query_unknown(cx->whereclauses, cx->wherekinds,
+								 cx->whereinor))
+		units.margin = 1.0;
 	lion_units_begin(&units);
 
 	/*

@@ -3830,6 +3830,40 @@ lion_multikey_cost_mode_ex(IndexOptInfo *idx, AttrNumber col, Node *clause,
 	return q.mode;
 }
 
+/*
+ * Is a count's WHERE priced at its dearest because a multi-key query in it is
+ * not known until run time - a generic plan's parameter, with no estimate to
+ * go by, which lion_multikey_cost_mode() takes as every row?  Such a price is
+ * the most the count can cost, the node's own sequential scan, and not an
+ * estimate that may fall short of it: the count is offered without
+ * pg_lion.pushdown_margin (DESIGN.md §39), which is there for the estimates.
+ * An OR's leaf is a literal (lion_analyze_leaf()) and is never one.
+ */
+bool
+lion_where_query_unknown(List *whereclauses, List *wherekinds,
+						 List *whereinor)
+{
+	ListCell   *lc1;
+	ListCell   *lc2;
+	ListCell   *lc3;
+
+	forthree(lc1, whereclauses, lc2, wherekinds, lc3, whereinor)
+	{
+		Node	   *clause = (Node *) lfirst(lc1);
+		Node	   *arg;
+
+		if (lfirst_int(lc2) != LION_CLAUSE_MULTI || lfirst_int(lc3) != 0)
+			continue;
+		if (clause == NULL || !IsA(clause, OpExpr) ||
+			list_length(((OpExpr *) clause)->args) != 2)
+			continue;
+		arg = lion_strip((Node *) lsecond(((OpExpr *) clause)->args));
+		if (arg != NULL && !IsA(arg, Const))
+			return true;
+	}
+	return false;
+}
+
 double
 lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
 {

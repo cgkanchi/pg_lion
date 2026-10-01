@@ -1473,6 +1473,13 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 }
 
 /*
+ * The margin the paths of the relation lion_ordered_set_rel_pathlist() is
+ * adding them to are offered at (lion_units_margin_for()), found before the
+ * first is added and can free a scan of core's.
+ */
+static double lo_margin = 1.0;
+
+/*
  * One LionOrdered path, offered to add_path() (DESIGN.md §30.2, step 3) at
  * pg_lion.pushdown_margin (§39): its price divided by the margin, startup
  * and total alike, so that whatever it is compared with - the btree scan it
@@ -1485,7 +1492,6 @@ lo_add_path(RelOptInfo *rel, List *pathkeys, List *priv, double rows,
 			Cost startup, Cost total)
 {
 	CustomPath *cp = makeNode(CustomPath);
-	double		margin = lion_units_margin();
 
 	cp->path.pathtype = T_CustomScan;
 	cp->path.parent = rel;
@@ -1495,8 +1501,8 @@ lo_add_path(RelOptInfo *rel, List *pathkeys, List *priv, double rows,
 	cp->path.parallel_safe = false;
 	cp->path.parallel_workers = 0;
 	cp->path.rows = rows;
-	cp->path.startup_cost = startup / margin;
-	cp->path.total_cost = total / margin;
+	cp->path.startup_cost = startup / lo_margin;
+	cp->path.total_cost = total / lo_margin;
 	cp->path.pathkeys = pathkeys;
 	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cp->custom_paths = NIL;
@@ -1543,6 +1549,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	}
 	if (lionidx == NIL)
 		return;
+	lo_margin = lion_units_margin_for(rel);
 
 	/* the ordered side: core's ordered btree paths ... */
 	if (rel->baserestrictinfo != NIL)
