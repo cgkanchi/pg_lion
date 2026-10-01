@@ -788,6 +788,7 @@ lion_verify_meta(LionVerifyState *vs)
 
 	vs->root = meta->root;
 	vs->height = meta->height;
+	vs->version = meta->version;
 
 	UnlockReleaseBuffer(buf);
 }
