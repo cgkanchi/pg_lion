@@ -1,0 +1,603 @@
+-- NARROW containers (DESIGN.md §38).
+--
+-- A NARROW is a bitset of 64 heap blocks x 128 offsets, 1032 bytes against a
+-- BITSET's 4104, for a container whose members all lie at offsets below 128.
+-- Only the build and VACUUM's re-optimize choose one, and VACUUM only in an
+-- index of format version 8, which a build writes only when it has written a
+-- NARROW; an insert never makes one, and a member at offset 128 or more turns
+-- one into a BITSET.  This file checks the format end to end: what the build
+-- writes and the version it records, the in-place insert below offset 128
+-- and the conversion at it, what VACUUM makes of each kind of index, and that
+-- bitmap scans, lion_index_count() and the count pushdown agree with a
+-- sequential scan at every step.  The damaged-NARROW cases are in
+-- corrupt_items.sql.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+-- VACUUM sets a page all-visible only once the commit record is on disk.
+SET synchronous_commit = on;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+RESET client_min_messages;
+-- Bitmap scan versus sequential scan, as in sparse.sql.
+CREATE FUNCTION lion_nr_cmp(tbl text, pred text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	q text := format('SELECT count(*) AS c, coalesce(sum(i), 0) AS s FROM %s WHERE %s', tbl, pred);
+	a record;
+	b record;
+	ln text;
+	used boolean := false;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Bitmap Index Scan%' THEN
+			used := true;
+		END IF;
+	END LOOP;
+	EXECUTE q INTO a;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	EXECUTE q INTO b;
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	IF a IS DISTINCT FROM b THEN
+		RETURN format('MISMATCH index=%s seqscan=%s', a::text, b::text);
+	END IF;
+	IF NOT used THEN
+		RETURN format('NO BITMAP INDEX SCAN (%s rows)', a.c);
+	END IF;
+	RETURN format('ok %s rows', a.c);
+END $$;
+-- The count pushdown versus the plan without it, as in sparse.sql.
+CREATE FUNCTION lion_nr_pd(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_nr_on AS %s', q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_nr_off AS %s', q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'SELECT count(*) FROM lion_nr_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_nr_on EXCEPT ALL SELECT * FROM lion_nr_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_nr_off EXCEPT ALL SELECT * FROM lion_nr_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_nr_on, lion_nr_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  nrows);
+END $$;
+-- An index's containers by kind, per key column.
+CREATE FUNCTION lion_nr_mix(idx regclass)
+RETURNS TABLE (attno int2, containers int8, arrays int8, bitsets int8,
+			   runs int8, narrows int8, container_bytes int8)
+LANGUAGE sql AS $$
+	SELECT attno, containers, array_containers, bitset_containers,
+		   run_containers, narrow_containers, container_bytes
+	  FROM lion_index_stats(idx)
+$$;
+-- The format version, off the meta page: LionMetaPageData follows the
+-- 24-byte page header, with its version at +4.
+CREATE FUNCTION lion_nr_version(idx regclass) RETURNS int
+LANGUAGE sql AS $$
+	SELECT get_byte(p, 28) | (get_byte(p, 29) << 8) FROM get_raw_page(idx::text, 0) p
+$$;
+-- The highest heap offset a table's rows are at.
+CREATE FUNCTION lion_nr_maxoff(tbl regclass) RETURNS int
+LANGUAGE plpgsql AS $$
+DECLARE
+	r int;
+BEGIN
+	EXECUTE format('SELECT max((ctid::text::point)[1])::int FROM %s', tbl) INTO r;
+	RETURN r;
+END $$;
+-- ---------- 1. the build ----------
+-- 55 rows to a heap page.  k has two values, so each of its containers holds
+-- some 1760 members: too many for an ARRAY under 1032 bytes, at offsets below
+-- 128, so a NARROW.  g has twenty, 176 a container, an ARRAY of 360 bytes; c
+-- is clustered, a RUN.  An index with a NARROW is version 8, and one without
+-- stays version 6, which the builds before §38 read.
+CREATE TABLE lion_nw (i int NOT NULL, k int NOT NULL, g int NOT NULL,
+					  c int NOT NULL, pad text);
+INSERT INTO lion_nw
+	SELECT i, i % 2, i % 20, i / 1000, repeat('x', 100) FROM generate_series(0, 39999) i;
+SELECT lion_nr_maxoff('lion_nw') AS maxoff;
+ maxoff 
+--------
+     55
+(1 row)
+
+CREATE INDEX lion_nw_k ON lion_nw USING lion (k);
+CREATE INDEX lion_nw_g ON lion_nw USING lion (g);
+CREATE INDEX lion_nw_c ON lion_nw USING lion (c);
+CREATE INDEX lion_nw_kgc ON lion_nw USING lion (k, g, c);
+SELECT * FROM lion_nr_mix('lion_nw_k');
+ attno | containers | arrays | bitsets | runs | narrows | container_bytes 
+-------+------------+--------+---------+------+---------+-----------------
+     1 |         24 |      0 |       0 |    0 |      24 |           24768
+(1 row)
+
+SELECT * FROM lion_nr_mix('lion_nw_g');
+ attno | containers | arrays | bitsets | runs | narrows | container_bytes 
+-------+------------+--------+---------+------+---------+-----------------
+     1 |        240 |    240 |       0 |    0 |       0 |           81920
+(1 row)
+
+SELECT * FROM lion_nr_mix('lion_nw_c');
+ attno | containers | arrays | bitsets | runs | narrows | container_bytes 
+-------+------------+--------+---------+------+---------+-----------------
+     1 |         51 |      0 |       0 |   51 |       0 |            3566
+(1 row)
+
+SELECT * FROM lion_nr_mix('lion_nw_kgc');
+ attno | containers | arrays | bitsets | runs | narrows | container_bytes 
+-------+------------+--------+---------+------+---------+-----------------
+     1 |         24 |      0 |       0 |    0 |      24 |           24768
+     2 |        240 |    240 |       0 |    0 |       0 |           81920
+     3 |         51 |      0 |       0 |   51 |       0 |            3566
+(3 rows)
+
+SELECT lion_nr_version('lion_nw_k') AS k, lion_nr_version('lion_nw_g') AS g,
+	   lion_nr_version('lion_nw_c') AS c, lion_nr_version('lion_nw_kgc') AS kgc;
+ k | g | c | kgc 
+---+---+---+-----
+ 8 | 6 | 6 |   8
+(1 row)
+
+SELECT lion_index_verify('lion_nw_k', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT lion_index_verify('lion_nw_kgc', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+VACUUM ANALYZE lion_nw;
+-- The same two-valued column on rows that fill a page 226 deep: its
+-- containers have members at offsets 128 and above, so BITSETs, version 6.
+CREATE TABLE lion_nn (i int NOT NULL, k int NOT NULL);
+INSERT INTO lion_nn SELECT i, i % 2 FROM generate_series(0, 39999) i;
+SELECT lion_nr_maxoff('lion_nn') AS maxoff;
+ maxoff 
+--------
+    226
+(1 row)
+
+CREATE INDEX lion_nn_k ON lion_nn USING lion (k);
+SELECT * FROM lion_nr_mix('lion_nn_k');
+ attno | containers | arrays | bitsets | runs | narrows | container_bytes 
+-------+------------+--------+---------+------+---------+-----------------
+     1 |          6 |      0 |       6 |    0 |       0 |           24624
+(1 row)
+
+SELECT lion_nr_version('lion_nn_k') AS version;
+ version 
+---------
+       6
+(1 row)
+
+VACUUM ANALYZE lion_nn;
+-- ---------- 2. reads ----------
+-- NARROW against itself, an ARRAY and a RUN, in one index and across two.
+DROP INDEX lion_nw_kgc;
+SELECT lion_nr_cmp('lion_nw', 'k = 1');
+  lion_nr_cmp  
+---------------
+ ok 20000 rows
+(1 row)
+
+SELECT lion_nr_cmp('lion_nw', 'k = 0');
+  lion_nr_cmp  
+---------------
+ ok 20000 rows
+(1 row)
+
+SELECT lion_nr_cmp('lion_nw', 'k = 1 AND g = 3');
+ lion_nr_cmp  
+--------------
+ ok 2000 rows
+(1 row)
+
+SELECT lion_nr_cmp('lion_nw', 'k = 1 AND g = 4');
+ lion_nr_cmp 
+-------------
+ ok 0 rows
+(1 row)
+
+SELECT lion_nr_cmp('lion_nw', 'k = 0 OR g = 3');
+  lion_nr_cmp  
+---------------
+ ok 22000 rows
+(1 row)
+
+SELECT lion_nr_cmp('lion_nw', 'k = 1 AND c BETWEEN 7 AND 9');
+ lion_nr_cmp  
+--------------
+ ok 1500 rows
+(1 row)
+
+SELECT lion_nr_cmp('lion_nw', 'k = 1 OR c = 7');
+  lion_nr_cmp  
+---------------
+ ok 20500 rows
+(1 row)
+
+SELECT lion_nr_cmp('lion_nw', 'k IN (0, 1)');
+  lion_nr_cmp  
+---------------
+ ok 40000 rows
+(1 row)
+
+SELECT lion_nr_cmp('lion_nw', 'k = 1 AND (g = 3 OR c = 7)');
+ lion_nr_cmp  
+--------------
+ ok 2450 rows
+(1 row)
+
+SELECT lion_nr_pd('SELECT count(*) FROM lion_nw WHERE k = 1');
+     lion_nr_pd      
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_nr_pd('SELECT count(*) FROM lion_nw WHERE k = 1 AND g = 3');
+     lion_nr_pd      
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_nr_pd('SELECT count(*) FROM lion_nw WHERE k = 0 OR c = 7');
+     lion_nr_pd      
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_nr_pd('SELECT count(*) FROM lion_nw WHERE k = 1 AND c BETWEEN 3 AND 30');
+     lion_nr_pd      
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_nr_pd('SELECT k, count(*) FROM lion_nw GROUP BY k');
+     lion_nr_pd      
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+SELECT lion_nr_pd('SELECT g, count(*) FROM lion_nw WHERE k = 1 GROUP BY g');
+      lion_nr_pd      
+----------------------
+ pushed down, 10 rows
+(1 row)
+
+SELECT lion_nr_pd('SELECT k, count(*) FROM lion_nw WHERE g = 3 GROUP BY k');
+     lion_nr_pd      
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_nr_pd('SELECT k, count(*) FROM lion_nw WHERE c < 10 GROUP BY k');
+     lion_nr_pd      
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+SELECT lion_index_count('lion_nw_k', 1) = (SELECT count(*) FROM lion_nw WHERE k = 1) AS count_ok;
+ count_ok 
+----------
+ t
+(1 row)
+
+SELECT lion_index_count('lion_nw_k', 1, 'lion_nw_g', 3) =
+	   (SELECT count(*) FROM lion_nw WHERE k = 1 AND g = 3) AS count_ok;
+ count_ok 
+----------
+ t
+(1 row)
+
+-- ---------- 3. inserts never make a NARROW ----------
+-- 5000 more rows, on 91 new heap pages: the first 40 are in the last
+-- container of the build, whose NARROWs take them in place, and the rest in
+-- a new container, for each key an ARRAY of some 1400 members, which a
+-- NARROW would be smaller than.
+INSERT INTO lion_nw
+	SELECT i, i % 2, i % 20, i / 1000, repeat('x', 100) FROM generate_series(40000, 44999) i;
+SELECT * FROM lion_nr_mix('lion_nw_k');
+ attno | containers | arrays | bitsets | runs | narrows | container_bytes 
+-------+------------+--------+---------+------+---------+-----------------
+     1 |         26 |      2 |       0 |    0 |      24 |           30304
+(1 row)
+
+SELECT lion_index_verify('lion_nw_k', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT lion_nr_cmp('lion_nw', 'k = 1');
+  lion_nr_cmp  
+---------------
+ ok 22500 rows
+(1 row)
+
+SELECT lion_nr_cmp('lion_nw', 'k = 0 AND g = 6');
+ lion_nr_cmp  
+--------------
+ ok 2250 rows
+(1 row)
+
+SELECT lion_nr_pd('SELECT k, count(*) FROM lion_nw GROUP BY k');
+     lion_nr_pd      
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+-- ... and a version 6 index does not get one from an insert either
+INSERT INTO lion_nn SELECT i, i % 2 FROM generate_series(40000, 40999) i;
+SELECT * FROM lion_nr_mix('lion_nn_k');
+ attno | containers | arrays | bitsets | runs | narrows | container_bytes 
+-------+------------+--------+---------+------+---------+-----------------
+     1 |          6 |      0 |       6 |    0 |       0 |           24624
+(1 row)
+
+SELECT lion_nr_version('lion_nn_k') AS version;
+ version 
+---------
+       6
+(1 row)
+
+-- ---------- 4. offset 128 ----------
+-- At fillfactor 40 a page takes 73 rows; an UPDATE that changes the key
+-- puts the new version on the same page, past them.  The first one moves
+-- the rows at offsets 1 .. 20 to 74 .. 93, below 128: every insert is a
+-- NARROW's, in place.  The second moves the rows at 21 .. 73 of the first
+-- 69 pages to 94 .. 146: those at 128 and above turn the two containers of
+-- each key there into BITSETs.
+CREATE TABLE lion_nb (i int NOT NULL, k int NOT NULL, v int NOT NULL)
+	WITH (fillfactor = 40);
+INSERT INTO lion_nb SELECT i, i % 2, 0 FROM generate_series(0, 19999) i;
+SELECT lion_nr_maxoff('lion_nb') AS maxoff;
+ maxoff 
+--------
+     73
+(1 row)
+
+CREATE INDEX lion_nb_k ON lion_nb USING lion (k);
+SELECT * FROM lion_nr_mix('lion_nb_k');
+ attno | containers | arrays | bitsets | runs | narrows | container_bytes 
+-------+------------+--------+---------+------+---------+-----------------
+     1 |         10 |      0 |       0 |    0 |      10 |           10320
+(1 row)
+
+SELECT lion_nr_version('lion_nb_k') AS version;
+ version 
+---------
+       8
+(1 row)
+
+UPDATE lion_nb SET k = 1 - k WHERE (ctid::text::point)[1] <= 20;
+SELECT lion_nr_maxoff('lion_nb') AS maxoff;
+ maxoff 
+--------
+     93
+(1 row)
+
+SELECT * FROM lion_nr_mix('lion_nb_k');
+ attno | containers | arrays | bitsets | runs | narrows | container_bytes 
+-------+------------+--------+---------+------+---------+-----------------
+     1 |         10 |      0 |       0 |    0 |      10 |           10320
+(1 row)
+
+SELECT lion_index_verify('lion_nb_k', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT lion_nr_cmp('lion_nb', 'k = 1');
+  lion_nr_cmp  
+---------------
+ ok 10000 rows
+(1 row)
+
+SELECT lion_nr_cmp('lion_nb', 'k = 0');
+  lion_nr_cmp  
+---------------
+ ok 10000 rows
+(1 row)
+
+UPDATE lion_nb SET k = 1 - k WHERE (ctid::text::point)[1] BETWEEN 21 AND 73 AND i < 5000;
+SELECT lion_nr_maxoff('lion_nb') AS maxoff;
+ maxoff 
+--------
+    146
+(1 row)
+
+SELECT * FROM lion_nr_mix('lion_nb_k');
+ attno | containers | arrays | bitsets | runs | narrows | container_bytes 
+-------+------------+--------+---------+------+---------+-----------------
+     1 |         10 |      0 |       4 |    0 |       6 |           22608
+(1 row)
+
+SELECT lion_index_verify('lion_nb_k', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT lion_nr_cmp('lion_nb', 'k = 1');
+  lion_nr_cmp  
+---------------
+ ok 10000 rows
+(1 row)
+
+SELECT lion_nr_cmp('lion_nb', 'k = 0');
+  lion_nr_cmp  
+---------------
+ ok 10000 rows
+(1 row)
+
+SELECT lion_nr_pd('SELECT k, count(*) FROM lion_nb GROUP BY k');
+       lion_nr_pd        
+-------------------------
+ not pushed down, 2 rows
+(1 row)
+
+-- ---------- 5. VACUUM ----------
+-- In a version 8 index VACUUM's re-optimize of an item it changed picks a
+-- NARROW where that is smallest: the BITSETs of section 4 are NARROWs again
+-- once their rows at 128 and above are gone.
+DELETE FROM lion_nb WHERE (ctid::text::point)[1] >= 128;
+VACUUM lion_nb;
+SELECT lion_nr_maxoff('lion_nb') AS maxoff;
+ maxoff 
+--------
+    127
+(1 row)
+
+SELECT * FROM lion_nr_mix('lion_nb_k');
+ attno | containers | arrays | bitsets | runs | narrows | container_bytes 
+-------+------------+--------+---------+------+---------+-----------------
+     1 |         10 |      0 |       0 |    0 |      10 |           10320
+(1 row)
+
+SELECT lion_index_verify('lion_nb_k', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT lion_nr_cmp('lion_nb', 'k = 1');
+ lion_nr_cmp  
+--------------
+ ok 9354 rows
+(1 row)
+
+SELECT lion_nr_pd('SELECT k, count(*) FROM lion_nb GROUP BY k');
+     lion_nr_pd      
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+-- ... and a NARROW left with 512 members or fewer is an ARRAY: key 0 loses
+-- seven rows in eight.  Key 1 loses two rows of the ARRAY section 3's
+-- inserts made, which VACUUM's re-optimize makes a NARROW; its other
+-- containers it does not change.
+DELETE FROM lion_nw WHERE (k = 0 AND i % 8 <> 0) OR i IN (44001, 44003);
+VACUUM lion_nw;
+SELECT * FROM lion_nr_mix('lion_nw_k');
+ attno | containers | arrays | bitsets | runs | narrows | container_bytes 
+-------+------------+--------+---------+------+---------+-----------------
+     1 |         26 |     13 |       0 |    0 |      13 |           24770
+(1 row)
+
+SELECT lion_index_verify('lion_nw_k', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT lion_nr_cmp('lion_nw', 'k = 0');
+ lion_nr_cmp  
+--------------
+ ok 5625 rows
+(1 row)
+
+SELECT lion_nr_cmp('lion_nw', 'k = 0 OR g = 5');
+ lion_nr_cmp  
+--------------
+ ok 7875 rows
+(1 row)
+
+SELECT lion_nr_pd('SELECT k, count(*) FROM lion_nw GROUP BY k');
+     lion_nr_pd      
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+-- A version 6 index never gets a NARROW from VACUUM, though its BITSETs
+-- hold nothing at 128 or above any more: it stays readable by the builds
+-- before §38.  REINDEX is what makes them NARROWs.
+DELETE FROM lion_nn WHERE (ctid::text::point)[1] >= 128 OR i % 3 = 0;
+VACUUM lion_nn;
+SELECT * FROM lion_nr_mix('lion_nn_k');
+ attno | containers | arrays | bitsets | runs | narrows | container_bytes 
+-------+------------+--------+---------+------+---------+-----------------
+     1 |          6 |      0 |       6 |    0 |       0 |           24624
+(1 row)
+
+SELECT lion_nr_version('lion_nn_k') AS version;
+ version 
+---------
+       6
+(1 row)
+
+SELECT lion_index_verify('lion_nn_k', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT lion_nr_cmp('lion_nn', 'k = 1');
+ lion_nr_cmp  
+--------------
+ ok 7634 rows
+(1 row)
+
+REINDEX INDEX lion_nn_k;
+SELECT * FROM lion_nr_mix('lion_nn_k');
+ attno | containers | arrays | bitsets | runs | narrows | container_bytes 
+-------+------------+--------+---------+------+---------+-----------------
+     1 |          6 |      0 |       0 |    0 |       6 |            6192
+(1 row)
+
+SELECT lion_nr_version('lion_nn_k') AS version;
+ version 
+---------
+       8
+(1 row)
+
+SELECT lion_index_verify('lion_nn_k', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT lion_nr_cmp('lion_nn', 'k = 1');
+ lion_nr_cmp  
+--------------
+ ok 7634 rows
+(1 row)
+
+SELECT lion_nr_pd('SELECT k, count(*) FROM lion_nn GROUP BY k');
+     lion_nr_pd      
+---------------------
+ pushed down, 2 rows
+(1 row)
+
+DROP TABLE lion_nw, lion_nn, lion_nb;
+DROP FUNCTION lion_nr_cmp(text, text);
+DROP FUNCTION lion_nr_pd(text);
+DROP FUNCTION lion_nr_mix(regclass);
+DROP FUNCTION lion_nr_version(regclass);
+DROP FUNCTION lion_nr_maxoff(regclass);

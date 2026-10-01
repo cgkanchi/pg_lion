@@ -11,6 +11,8 @@
 -- 3. A stored text key whose header says TOAST pointer: the first descent
 --    that compared against it crashed in detoast (lion_check_key()).
 -- 4. A member at heap offset 0, which lion_index_verify() passed.
+-- 5. A NARROW (DESIGN.md §38) whose cardinality is not its payload's.
+-- 6. A NARROW in an index whose meta page says version 6.
 --
 -- The pages are damaged on disk, as corrupt.sql does it (pg_buffercache_evict(),
 -- PostgreSQL 17 and later - on 16 the test is skipped,
@@ -188,6 +190,47 @@ SELECT lion_di_poke('lion_di_i', :lion_di_root,
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_i')$$);
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_i', true)$$);
 DROP INDEX lion_di_i;
+
+-- ---------- 5. a NARROW whose cardinality is wrong ----------
+-- 55 rows to a heap page and two keys: each key's container of the first 64
+-- blocks is a NARROW of 1760 members, alone on its container page.  Every
+-- bit of a NARROW's payload is a member it may hold, so the cardinality in
+-- its header (bytes 4 and 5; the type is byte 6) is all there is to damage.
+-- The readers bound what they do by the payload, not by the claim, and
+-- lion_index_verify() reports it.
+CREATE TABLE lion_di_n (k int NOT NULL, pad text);
+INSERT INTO lion_di_n
+	SELECT i % 2, repeat('x', 100) FROM generate_series(0, 64 * 55 - 1) i;
+CREATE INDEX lion_di_n_i ON lion_di_n USING lion (k) WITH (inline_limit = 64);
+SELECT narrow_containers FROM lion_index_stats('lion_di_n_i');
+SELECT lion_di_evict('lion_di_n_i');
+SELECT lion_index_posting_root('lion_di_n_i', 1) AS lion_di_root \gset
+SELECT get_byte(p, lion_di_item(p, 1) + 6) AS type,
+	   get_byte(p, lion_di_item(p, 1) + 4) |
+	   (get_byte(p, lion_di_item(p, 1) + 5) << 8) AS cardinality
+  FROM lion_di_block('lion_di_n_i', :lion_di_root) p;
+SELECT lion_di_poke('lion_di_n_i', :lion_di_root,
+					lion_di_item(lion_di_block('lion_di_n_i', :lion_di_root), 1) + 4,
+					'\x0100'::bytea);
+SELECT lion_di_try('SELECT count(*) FROM lion_di_n WHERE k = 1');
+SELECT lion_di_try('SELECT k, count(*) FROM lion_di_n GROUP BY k');
+SELECT lion_di_try($$SELECT lion_index_count('lion_di_n_i', 1)$$);
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM lion_di_n WHERE k = 1;
+RESET pg_lion.enable_count_pushdown;
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_n_i')$$);
+DROP INDEX lion_di_n_i;
+
+-- ---------- 6. a NARROW in an index of version 6 ----------
+-- The same index with its meta page's version (at byte 28) made 6: a build
+-- before §38 would read it and not know the items, which is what version 8
+-- is there to prevent, so lion_index_verify() reports it.
+CREATE INDEX lion_di_n_i ON lion_di_n USING lion (k) WITH (inline_limit = 64);
+SELECT lion_di_evict('lion_di_n_i');
+SELECT lion_di_u32(lion_di_block('lion_di_n_i', 0), 28) AS version;
+SELECT lion_di_poke('lion_di_n_i', 0, 28, lion_di_le32(6));
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_n_i')$$);
+DROP TABLE lion_di_n;
 
 -- ---------- an undamaged index still works ----------
 CREATE INDEX lion_di_i ON lion_di USING lion (k);
