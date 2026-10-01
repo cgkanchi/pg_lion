@@ -641,6 +641,8 @@ pages as PostgreSQL prices pages, so its cost in `EXPLAIN` is that plan's units.
 price Lion's CPU as fitted against that kind of plan; `SET client_min_messages = debug2` logs which
 kind each path was priced against, at which rate and margin. To read Lion's own cost units a
 millisecond when calibrating the cost settings above, set every rate and the margin below to 1.
+`bench/calib/matrix.py` measures each kind of plan's units a millisecond, and the planner's
+mispicks, on synthetic tables (DESIGN.md §39, "The matrix").
 
 | `pg_lion.` | default | the PostgreSQL plans it is the rate of, as a multiple of 500 units a millisecond |
 |---|---|---|
