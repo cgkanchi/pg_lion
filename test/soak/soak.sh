@@ -455,6 +455,11 @@ scan_log "$SERVER_LOG" "$SLOG_START" primary
 	echo "writer transactions: $(grep -h 'number of transactions actually processed' "$OUT/writers.log" | awk '{s += $NF} END {print s + 0}')" \
 		"(failed: $(grep -h 'number of failed transactions' "$OUT/writers.log" | awk '{s += $5} END {print s + 0}'))"
 	echo "vacuums: $(grep -c VACUUM "$OUT/vacuum.log")   verify passes: $(cat "$OUT"/verify-*.log 2>/dev/null | grep -c '== ')"
+	# narrow_containers is a column only builds with NARROW containers have
+	echo "containers at the end (table: array bitset run narrow):"
+	psqlp -tA -F' ' -c "SELECT i.tbl, sum(s.array_containers), sum(s.bitset_containers), sum(s.run_containers),
+			coalesce(sum((to_jsonb(s) ->> 'narrow_containers')::int8)::text, '-')
+		  FROM soak.lion_indexes i, lion_index_stats(i.idx) s GROUP BY i.tbl ORDER BY 1" 2>&1 | sed 's/^/  /'
 	echo "checks by status:"
 	cat "$OUT"/reader-*.out 2>/dev/null | grep -E '^(ok|FAIL|ERROR|expected)\|' | cut -d'|' -f1 | sort | uniq -c
 	echo "checks by family and path (what answered the lion side):"
