@@ -313,7 +313,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		parts->descents = descents;
 		parts->walked = walked;
 	}
-	run += Min(found * container_pages / nd, container_pages) * seq_page_cost;
+	run += Min(found * container_pages / nd, container_pages) *
+		LION_SEQ_PAGE_COST;
 
 	/* ---- the fact filters: located once, each a source of every count ---- */
 	rangelead = lion_rangesrc_leaders(whereidx, wherecol, wherekinds,
@@ -431,9 +432,10 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 													 (AttrNumber) lfirst_int(lc4)),
 					 0.0);
 
-		located += Min(nkeys, Max(cdir * cshare, 1.0)) * random_page_cost +
+		located += Min(nkeys, Max(cdir * cshare, 1.0)) *
+			LION_RANDOM_PAGE_COST +
 			nkeys * (cheight + 1.0) * LION_DESCENT_COST;
-		located += Max(Min(nkeys, cpages), cpages * sel) * seq_page_cost;
+		located += Max(Min(nkeys, cpages), cpages * sel) * LION_SEQ_PAGE_COST;
 	}
 	run += located;
 

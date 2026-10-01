@@ -689,6 +689,9 @@ lion_merge_cpu_cost_sets(int nsrc, const double *members,
  * and the answer moves between seq_page_cost and random_page_cost - so a
  * dirty working set far larger than the cache is still charged as random
  * I/O, which is the case a blanket preference for this node would get wrong.
+ *
+ * A page cost like LION_SEQ_PAGE_COST: scaled by lion_page_scale while a
+ * custom path's price is summed in a competitor's units (DESIGN.md §39).
  */
 Cost
 lion_heap_page_cost(PlannerInfo *root, RelOptInfo *rel, double pages,
@@ -718,8 +721,9 @@ lion_heap_page_cost(PlannerInfo *root, RelOptInfo *rel, double pages,
 	density = sqrt(Min(pages / heap_pages, 1.0));
 	seqness = Max(resident, density);
 
-	return spc_random_page_cost -
-		(spc_random_page_cost - spc_seq_page_cost) * seqness;
+	return (spc_random_page_cost -
+			(spc_random_page_cost - spc_seq_page_cost) * seqness) *
+		lion_page_scale;
 }
 
 /*
@@ -1094,9 +1098,9 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 									  probes[i], &seqpages, &probedpages);
 
 	out->nsrc = n;
-	out->leafcost = randompages * random_page_cost + lookup;
+	out->leafcost = randompages * LION_RANDOM_PAGE_COST + lookup;
 	out->setpages = seqpages + probedpages;
-	out->setcost = seqpages * seq_page_cost + probed;
+	out->setcost = seqpages * LION_SEQ_PAGE_COST + probed;
 
 	pfree(sc);
 	pfree(members);
@@ -1358,17 +1362,17 @@ lion_cost_range_side(double nkeys, double nedges, const LionSumModel *sum,
 	{
 		*counts = nkeys;
 		*pages = nkeys * pageper;
-		return nkeys * (perentry + pageper * seq_page_cost);
+		return nkeys * (perentry + pageper * LION_SEQ_PAGE_COST);
 	}
 
 	edgekeys = Max(0.0, nkeys - whole * sum->keysper);
 	*counts = edgekeys + whole;
 	*pages = edgekeys * pageper + whole * sum->sumpages;
-	cost = edgekeys * (perentry + pageper * seq_page_cost) +
-		whole * (sum->persum + sum->sumpages * seq_page_cost);
+	cost = edgekeys * (perentry + pageper * LION_SEQ_PAGE_COST) +
+		whole * (sum->persum + sum->sumpages * LION_SEQ_PAGE_COST);
 
 	/* the phases after the first each start with a descent of their own */
-	return cost + LION_SUMMARY_PHASE_DESCENTS * random_page_cost;
+	return cost + LION_SUMMARY_PHASE_DESCENTS * LION_RANDOM_PAGE_COST;
 }
 
 /*
@@ -1648,13 +1652,13 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 										  probeentry, pageper, nout * rowsper,
 										  frows, fcount, &outcounts,
 										  &outpages) +
-		fcount + random_page_cost +
+		fcount + LION_RANDOM_PAGE_COST +
 		lion_range_recheck(root, rel, frows * (2.0 - sel) * dirtyfrac,
 						   Max(outcounts, 1.0), corr);
 
 	/* ... and the leaf-by-leaf race that picks the side, counting only. */
 	return Min(inside, outside) +
-		2.0 * Min(inpages, outpages) * seq_page_cost;
+		2.0 * Min(inpages, outpages) * LION_SEQ_PAGE_COST;
 }
 
 /*
@@ -2610,9 +2614,9 @@ lion_count_rel_where_once(LionCountRelCost *c, double *mem, double *keys,
 		c->rc->perrange = c->walked * (LION_ENTRY_COUNT_COST +
 									   LION_PROBE_COST +
 									   LION_RANGE_DESCENT_PAGES *
-									   seq_page_cost) +
+									   LION_SEQ_PAGE_COST) +
 			c->nsrc * (LION_PROBE_COST +
-					   LION_RANGE_DESCENT_PAGES * seq_page_cost);
+					   LION_RANGE_DESCENT_PAGES * LION_SEQ_PAGE_COST);
 	}
 }
 
@@ -2919,7 +2923,7 @@ lion_count_rel_entry_scan(LionCountRelCost *c)
 
 		c->seq_pages += entrypages;
 		if (c->rc != NULL && c->rc->batched)
-			c->rc->perrange += entrypages * seq_page_cost;
+			c->rc->perrange += entrypages * LION_SEQ_PAGE_COST;
 
 		/*
 		 * Beside a second GROUP BY column a count(DISTINCT k) tests each
@@ -3226,10 +3230,10 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	lion_count_rel_pair_cost(&c);
 	lion_count_rel_recheck(&c);
 
-	run = c.random_pages * random_page_cost;
+	run = c.random_pages * LION_RANDOM_PAGE_COST;
 	run += c.descent_cost;
 	run += c.lookup_cost;
-	run += c.seq_pages * seq_page_cost;
+	run += c.seq_pages * LION_SEQ_PAGE_COST;
 	run += c.probe_cost;
 	run += c.read_cpu + c.merge_cpu;	/* containers, members, probes (§10) */
 	run += c.merge_ops * cpu_operator_cost;
@@ -3469,7 +3473,8 @@ lion_cost_topk_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 							 lion_probe_rel_rows(root, t->rel), cand,
 							 t->rel->tuples);
 	run += entries * drivefrac * LION_TOPK_ENTRY_COST;
-	run += cand * (LION_PROBE_COST + LION_RANGE_DESCENT_PAGES * seq_page_cost);
+	run += cand * (LION_PROBE_COST +
+				   LION_RANGE_DESCENT_PAGES * LION_SEQ_PAGE_COST);
 
 	cpath->path.rows = outrows;
 #if PG_VERSION_NUM >= 180000
@@ -3514,7 +3519,7 @@ lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 					lion_index_column_share(root, rel, idx, col));
 		run += nd * nagg * 2.0 * cpu_operator_cost;
 		if (fast)
-			run += pages * seq_page_cost + nd * LION_TOPK_ENTRY_COST;
+			run += pages * LION_SEQ_PAGE_COST + nd * LION_TOPK_ENTRY_COST;
 		else
 			run += lion_cost_count_rel(root, rel, idx, col, NULL, 0,
 									   NIL, NIL, NIL, NIL, NIL, nd, nd, 0,
@@ -3621,7 +3626,7 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 			perkey += vals * LION_PROBE_COST * (1.0 - keyfrac);
 			if (idx != NULL)
 				run += (double) idx->pages / Max(idx->nkeycolumns, 1) *
-					keyfrac * seq_page_cost;
+					keyfrac * LION_SEQ_PAGE_COST;
 		}
 		combos *= Max(groupest[c], 1.0);
 		passes *= Max(ceil(Max(groupest[c], 1.0) / cap), 1.0);
