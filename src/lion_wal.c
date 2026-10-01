@@ -953,22 +953,8 @@ lion_redo_inplace_item(Page page, const xl_lion_op *op, BlockNumber blkno)
 	}
 	else
 	{
-		switch (item->type)
-		{
-			case LION_CT_BITSET:
-				need = LION_CONTAINER_MAX_SIZE;
-				break;
-			case LION_CT_ARRAY:
-				if (item->cardinality < LION_ARRAY_MAX_CARD)
-					need = lion_container_size(item) + sizeof(uint16);
-				break;
-			case LION_CT_RUN:
-				if (LION_RUN_NRUNS(item) < LION_RUN_MAX_NRUNS)
-					need = lion_container_size(item) + sizeof(LionRun);
-				break;
-			default:
-				break;
-		}
+		/* the table the in-place insert asked (lion_container.h) */
+		need = lion_container_inplace_need(item, (uint16) op->aux);
 	}
 	if (need == 0 || alloc < need)
 		elog(PANIC, "pg_lion: item %u on block %u (type %u, %zu bytes) cannot take in-place operation %u",

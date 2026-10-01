@@ -721,14 +721,19 @@ lion_verify_meta(LionVerifyState *vs)
 
 	if (meta->magic != LION_MAGIC ||
 		(meta->version != LION_VERSION &&
-		 meta->version != LION_VERSION_SUMMARIES))
-		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u or %u",
+		 meta->version != LION_VERSION_SUMMARIES &&
+		 meta->version != LION_VERSION_NARROW))
+		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u, %u or %u",
 					RelationGetRelationName(vs->index), meta->magic,
 					meta->version, LION_MAGIC, LION_VERSION,
-					LION_VERSION_SUMMARIES);
+					LION_VERSION_SUMMARIES, LION_VERSION_NARROW);
 
-	/* DESIGN.md §32: version 7 is version 6 with summaries, and only that. */
-	if ((meta->version == LION_VERSION) != (meta->summary_cols == 0))
+	/*
+	 * DESIGN.md §32: version 7 is version 6 with summaries, and only that;
+	 * version 8 is either with NARROW items (§38).
+	 */
+	if ((meta->version == LION_VERSION && meta->summary_cols != 0) ||
+		(meta->version == LION_VERSION_SUMMARIES && meta->summary_cols == 0))
 		lion_corrupt("lion index \"%s\": meta page version %u names summarized key columns %08X",
 					RelationGetRelationName(vs->index), meta->version,
 					meta->summary_cols);

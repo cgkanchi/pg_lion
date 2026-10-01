@@ -73,7 +73,7 @@ typedef struct LionColStats
 	int64		entries;
 	int64		inline_entries;
 	int64		containers;
-	int64		by_type[4];		/* indexed by LionContainerType */
+	int64		by_type[LION_CT_NARROW + 1];	/* indexed by LionContainerType */
 	int64		sparse_segments;	/* items of type LION_CT_SPARSE */
 	int64		sparse_members; /* (ckey, lo) pairs inside them */
 	int64		ntids;
@@ -223,7 +223,7 @@ lion_stats_item(LionColStats *cs, const LionContainer *c, Size itemlen)
 	else
 	{
 		cs->containers++;
-		if (c->type >= LION_CT_ARRAY && c->type <= LION_CT_RUN)
+		if (lion_container_type_valid(c->type))
 			cs->by_type[c->type]++;
 	}
 
@@ -459,7 +459,8 @@ lion_index_stats(PG_FUNCTION_ARGS)
 												  LION_CONTAINER_HDRSZ + sizeof(uint16)))
 						continue;
 					c = (LionContainer *) PageGetItem(page, iid);
-					if (c->type < LION_CT_ARRAY || c->type > LION_CT_SPARSE)
+					if (!lion_container_type_valid(c->type) &&
+						c->type != LION_CT_SPARSE)
 						continue;
 
 					lion_stats_item(cs, c, ItemIdGetLength(iid));
@@ -502,7 +503,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 				}
 
 				cs->containers += ent->st.containers;
-				for (k = 0; k < 4; k++)
+				for (k = 0; k < (int) lengthof(cs->by_type); k++)
 					cs->by_type[k] += ent->st.by_type[k];
 				cs->sparse_segments += ent->st.sparse_segments;
 				cs->sparse_members += ent->st.sparse_members;
@@ -578,6 +579,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 			values[28] = Int64GetDatum((int64) st->nd.ndistinct[call]);
 		else
 			nulls[28] = true;
+		values[29] = Int64GetDatum(cs->by_type[LION_CT_NARROW]);
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));

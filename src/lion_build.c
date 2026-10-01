@@ -489,6 +489,9 @@ typedef struct LionBuildState
 	LionSumBuild *sum;			/* the column being written's, or NULL */
 	uint32		summary_cols;	/* the columns that got them */
 	int64		nsummaries;		/* summary entries written */
+
+	/* A NARROW item written, which makes the index version 8 (§38). */
+	bool		wrote_narrow;
 } LionBuildState;
 
 static void lion_build_callback(Relation index, ItemPointer tid, Datum *values,
@@ -1134,6 +1137,10 @@ static void
 lion_builder_emit(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 {
 	Size		csize = lion_item_size(c);
+
+	/* every item the index gets comes this way, a summary's included */
+	if (c->type == LION_CT_NARROW)
+		bs->wrote_narrow = true;
 
 	/* A collecting summary builder puts its items aside (DESIGN.md §32). */
 	if (b->tofile != NULL)
@@ -2383,6 +2390,9 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	/* ... and which columns got summaries, which makes it version 7 (§32). */
 	lion_meta_record_summaries(LionPageGetMeta((Page) metabuf->data),
 							   bs.summary_cols, bs.sumtids);
+	/* ... and whether it has a NARROW item, which makes it version 8 (§38). */
+	lion_meta_record_narrow(LionPageGetMeta((Page) metabuf->data),
+							bs.wrote_narrow);
 	/* ... and each column's distinct keys, for the planner (§33). */
 	{
 		LionMetaNdistinct nd;
