@@ -345,8 +345,8 @@ lion_page_item_fetch(Relation index, Page page, BlockNumber blkno,
 						lpoff, phdr->pd_upper, phdr->pd_special)));
 
 	item = (LionContainer *) PageGetItem(page, iid);
-	if (unlikely(item->type != LION_CT_ARRAY && item->type != LION_CT_BITSET &&
-				 item->type != LION_CT_RUN && item->type != LION_CT_SPARSE))
+	if (unlikely(!lion_container_type_valid(item->type) &&
+				 item->type != LION_CT_SPARSE))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lion index \"%s\": item %u on container page %u has type %u, which is no item kind",
@@ -741,8 +741,13 @@ lion_item_alloc_size(const LionContainer *item, Size size)
 
 	Assert(size == lion_item_size(item));
 
-	/* A bitset is already the largest an item can be. */
-	if (item->type == LION_CT_BITSET)
+	/*
+	 * A bitset is already the largest an item can be, and a NARROW (DESIGN.md
+	 * §38) is the size it is whatever add() does to it in place: a member it
+	 * holds sets a bit, and one it does not makes it a BITSET, which no slack
+	 * short of 3 KB would hold.
+	 */
+	if (item->type == LION_CT_BITSET || item->type == LION_CT_NARROW)
 		return size;
 
 	extra = size / LION_ITEM_SLACK_FRACTION;

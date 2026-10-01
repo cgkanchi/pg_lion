@@ -1184,6 +1184,19 @@ lion_log2_16(uint32 x)
 	return (uint32) k * 16 + ((k >= 4) ? rest >> (k - 4) : rest << (4 - k));
 }
 
+/*
+ * Is h a bitmap - a BITSET, or a NARROW (DESIGN.md §38), whose lookups are a
+ * bit test each too?  A NARROW is priced as the BITSET: its words are a
+ * quarter as many to scan or OR, so a NARROW's extract and OR are
+ * overestimated, which leaves a probe neither more nor less likely than for
+ * the BITSET it would otherwise be.
+ */
+static inline bool
+lion_up_bits(const LionContainer *h)
+{
+	return h->type == LION_CT_BITSET || h->type == LION_CT_NARROW;
+}
+
 /* A RUN's runs, as many as its payload may hold at most. */
 static inline uint32
 lion_up_runs(const LionContainer *h)
@@ -1202,7 +1215,7 @@ lion_up_runs(const LionContainer *h)
 static inline uint64
 lion_up_lookup(const LionContainer *h, uint64 a)
 {
-	if (h->type == LION_CT_BITSET)
+	if (lion_up_bits(h))
 		return LION_UP_BIT * a;
 	if (h->type == LION_CT_RUN)
 	{
@@ -1232,7 +1245,7 @@ lion_or_probe_pays(const LionExprCursor *c, const LionContainer *acc)
 		return false;
 	a = Max(a, 1);
 
-	if (acc->type == LION_CT_BITSET)
+	if (lion_up_bits(acc))
 		probe += LION_UP_EXTRACT + 4 * a;
 	else if (acc->type == LION_CT_RUN)
 		probe += 4 * a;
@@ -1244,7 +1257,7 @@ lion_or_probe_pays(const LionExprCursor *c, const LionContainer *acc)
 
 		members += m;
 		probe += lion_up_lookup(h, a);
-		if (h->type == LION_CT_BITSET)
+		if (lion_up_bits(h))
 		{
 			unite += LION_UP_BITSET_OR;
 			arrays = false;
@@ -1362,7 +1375,7 @@ lion_tree_estimate(const LionExprCursor *c, uint64 a, LionTreeEst *e)
 		/* a leaf, or a node whose container is there: a container to probe */
 		e->probe = lion_up_lookup(c->cur, a);
 		e->members = lion_container_cardinality(c->cur);
-		e->bits = (c->cur->type == LION_CT_BITSET);
+		e->bits = lion_up_bits(c->cur);
 		return;
 	}
 
@@ -1382,7 +1395,7 @@ lion_tree_estimate(const LionExprCursor *c, uint64 a, LionTreeEst *e)
 				s.probe = lion_up_lookup(h, a);
 				s.build = 0;
 				s.members = lion_container_cardinality(h);
-				s.bits = (h->type == LION_CT_BITSET);
+				s.bits = lion_up_bits(h);
 				if (h->type == LION_CT_RUN)
 				{
 					unite += LION_UP_RUN_OR * (uint64) lion_up_runs(h);
@@ -1461,12 +1474,11 @@ lion_tree_probe_pays(const LionExprCursor *c, const LionContainer *acc)
 
 	lion_tree_estimate(c, a, &e);
 	probe = e.probe + 4 * a;	/* the members written out */
-	if (acc->type == LION_CT_BITSET)
+	if (lion_up_bits(acc))
 		probe += LION_UP_EXTRACT + 4 * a;
 	else if (acc->type == LION_CT_RUN)
 		probe += 4 * a;
-	build = e.build + lion_up_and(a, acc->type == LION_CT_BITSET,
-								  e.members, e.bits);
+	build = e.build + lion_up_and(a, lion_up_bits(acc), e.members, e.bits);
 	return probe < build;
 }
 

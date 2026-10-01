@@ -87,8 +87,7 @@ lion_inline_fetch(const char *payload, Size paylen, Size *off, LionContainer *bu
 	memcpy(buf, payload + *off, peek);
 	if (buf->type == 0)
 		return 0;				/* the slack VACUUM left behind */
-	if (buf->type != LION_CT_ARRAY && buf->type != LION_CT_BITSET &&
-		buf->type != LION_CT_RUN && buf->type != LION_CT_SPARSE)
+	if (!lion_container_type_valid(buf->type) && buf->type != LION_CT_SPARSE)
 		elog(ERROR, "lion index: malformed inline item of type %u",
 			 buf->type);
 	csize = lion_item_size(buf);

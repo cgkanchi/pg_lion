@@ -249,11 +249,12 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 	UnlockReleaseBuffer(buf);
 
 	/*
-	 * Version 6 is the base format and version 7 the same with summary posting
-	 * sets (DESIGN.md §32): both are read, and a version 6 index is one whose
-	 * columns have no summaries.  Anything older predates a format change that
-	 * moved or reinterpreted items, and anything newer is a format this build
-	 * does not know - and the hint says which of the two it is, since REINDEX
+	 * Version 6 is the base format, version 7 the same with summary posting
+	 * sets (DESIGN.md §32) and version 8 either with NARROW items (§38): all
+	 * three are read, and a version 6 index is one whose columns have no
+	 * summaries.  Anything older predates a format change that moved or
+	 * reinterpreted items, and anything newer is a format this build does
+	 * not know - and the hint says which of the two it is, since REINDEX
 	 * with this build is the way out of either, but the reason differs.
 	 */
 	if (meta->magic != LION_MAGIC)
@@ -264,14 +265,15 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 				 errdetail("Meta page magic %08X, expected %08X.",
 						   meta->magic, LION_MAGIC)));
 	if (meta->version != LION_VERSION &&
-		meta->version != LION_VERSION_SUMMARIES)
+		meta->version != LION_VERSION_SUMMARIES &&
+		meta->version != LION_VERSION_NARROW)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a valid lion index",
 						RelationGetRelationName(index)),
-				 errdetail("Meta page magic %08X version %u, expected %08X version %u or %u.",
+				 errdetail("Meta page magic %08X version %u, expected %08X version %u, %u or %u.",
 						   meta->magic, meta->version, LION_MAGIC, LION_VERSION,
-						   LION_VERSION_SUMMARIES),
+						   LION_VERSION_SUMMARIES, LION_VERSION_NARROW),
 				 meta->version < LION_VERSION ?
 				 errhint("REINDEX the index: its on-disk format predates this build of pg_lion.") :
 				 errhint("The index was written by a newer build of pg_lion than this one: use that build, or REINDEX the index with this one.")));
@@ -287,10 +289,12 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 
 	/*
 	 * The summary words (§32) must agree with the version: a version 6 meta
-	 * page has zeros there, and a version 7 one names at least one column and
-	 * a bucket size a build could have chosen.
+	 * page has zeros there, a version 7 one names at least one column, and
+	 * either way a version 8 one (§38); one that names a column, a bucket
+	 * size a build could have chosen.
 	 */
-	if ((meta->version == LION_VERSION) != (meta->summary_cols == 0) ||
+	if ((meta->version == LION_VERSION && meta->summary_cols != 0) ||
+		(meta->version == LION_VERSION_SUMMARIES && meta->summary_cols == 0) ||
 		(meta->summary_cols != 0 &&
 		 (meta->summary_tids < LION_MIN_SUMMARY_TIDS ||
 		  meta->summary_tids > LION_MAX_SUMMARY_TIDS)))
@@ -360,4 +364,11 @@ lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
 		meta->summary_cols = cols;
 		meta->summary_tids = bucket_tids;
 	}
+}
+
+void
+lion_meta_record_narrow(LionMetaPageData *meta, bool narrow)
+{
+	if (narrow)
+		meta->version = LION_VERSION_NARROW;
 }

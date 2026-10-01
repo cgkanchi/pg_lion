@@ -536,6 +536,17 @@ lion_verify_container(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
 	}
 
 	/*
+	 * DESIGN.md §38: a NARROW only in an index of version 8.  A build writes
+	 * one only into such an index, VACUUM likewise, and inserts never; and a
+	 * build of pg_lion before §38 reads version 6 and 7 indexes, which have
+	 * to stay what it can read.
+	 */
+	if (c->type == LION_CT_NARROW && !LION_META_ALLOWS_NARROW(&vs->ix->meta))
+		lion_corrupt("lion index \"%s\": container %u on block %u is a NARROW, which an index of version %u cannot hold",
+					RelationGetRelationName(vs->index), off, blk,
+					vs->ix->meta.version);
+
+	/*
 	 * Its structure, and then its members as heap TIDs (DESIGN.md §2): a
 	 * member at offset 0 or past MaxHeapTuplesPerPage used to pass, and every
 	 * query that turned the key into TIDs failed on it.
