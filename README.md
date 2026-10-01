@@ -182,6 +182,19 @@ every row has, and counts each row under its combination (`Group Strategy: Decod
 under a `Finalize HashAggregate`; DESIGN.md §34). On 5M rows it took 77 ms for 1,000 combinations
 and 179 ms for 100,000, where a HashAggregate over the table took 900 ms and 1.9 s.
 
+`GROUP BY g ORDER BY count(*) DESC LIMIT k` counts only the groups that can be among the first `k`
+(`Top K` in EXPLAIN; DESIGN.md §36): each key's entry records how many rows it holds, which bounds
+its group's count, so the largest entries are counted first and the rest never once they cannot
+catch up - ten groups of 3.4 million on ClickBench's `UserID`. Expressions of the grouping column
+(`GROUP BY ip, ip - 1`) split no group and are computed from it.
+
+With no `WHERE` and no `GROUP BY`, `sum`, `avg` (of integers), `min`, `max`, `bool_and` and
+`bool_or` of an expression of one Lion-indexed column are computed from the column's keys, each
+weighted by its rows (`Aggregates Over Keys` in EXPLAIN; DESIGN.md §37): `SELECT sum(width),
+avg(width + 1) FROM t` walks `width`'s distinct values, not the table. On a table the visibility
+map calls all-visible - as after a `VACUUM` - the rows of each key are the count its entry keeps,
+and nothing else is read.
+
 On a partitioned table the pushdown counts each partition the planner keeps, with that partition's
 own Lion indexes (DESIGN.md §16), and every `WHERE` clause needs one in every partition counted -
 except a clause the partition's bounds imply. `kind = 'a'` over a table partitioned by `kind`,
@@ -532,6 +545,10 @@ working around a bad choice:
   at each range of 64 heap blocks, which value of each column every row has (DESIGN.md §34): three
   or more columns, and two where that is cheaper than the nested loop over their entries. Off, a
   `GROUP BY` of three or more columns goes to the ordinary plan and one of two to the nested loop.
+- `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
+  that can be among the first `k`: each key's entry records how many rows it holds, which bounds
+  its count, so the largest of those are counted first and the rest are never read once they cannot
+  catch up (DESIGN.md §36). Off, every group is counted.
 - `pg_lion.enable_plain_scan`: let the planner use plain and index-only scans of Lion indexes
   (`amgettuple`, DESIGN.md §29). Off, Lion indexes are planned for bitmap scans only, as GIN
   indexes are, and every other index's scans are unaffected - where `enable_indexscan = off` would

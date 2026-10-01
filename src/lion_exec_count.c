@@ -15,6 +15,9 @@
 
 #include "lion_customscan.h"
 
+#include "access/visibilitymap.h"
+#include "utils/numeric.h"
+
 static int64 lion_walk_count(LionCountScanState *st, LionCountSource *sources,
 							 int nsource, int w, bool exists);
 
@@ -1413,6 +1416,321 @@ lion_next_group_ranged(LionCountScanState *st, bool *exhausted)
 }
 
 /*
+ * A candidate of the top k (DESIGN.md §36): an entry's own count, which is
+ * at least the group's, and its key.
+ */
+typedef struct LionTopkCand
+{
+	uint64		ntids;
+	Datum		key;
+	bool		isnull;
+} LionTopkCand;
+
+/* larger counts first */
+static int
+lion_topk_cand_cmp(const void *a, const void *b)
+{
+	uint64		x = ((const LionTopkCand *) a)->ntids;
+	uint64		y = ((const LionTopkCand *) b)->ntids;
+
+	return (x > y) ? -1 : (x < y) ? 1 : 0;
+}
+
+/*
+ * Keep the `keep` largest of the n candidates, the rest let go of: the
+ * largest count among those is *maxout's, if it is larger.
+ */
+static int
+lion_topk_trim(LionTopkCand *cand, int n, int keep, bool byval,
+			   uint64 *maxout)
+{
+	int			i;
+
+	qsort(cand, n, sizeof(LionTopkCand), lion_topk_cand_cmp);
+	if (n <= keep)
+		return n;
+	*maxout = Max(*maxout, cand[keep].ntids);
+	for (i = keep; i < n; i++)
+	{
+		if (!byval && !cand[i].isnull)
+			pfree(DatumGetPointer(cand[i].key));
+	}
+	return keep;
+}
+
+/* Is the entry's key one of the n stored keys excl? */
+static bool
+lion_topk_excluded(LionState *state, const LionEntryTuple *entry,
+				   const Datum *excl, int n)
+{
+	Datum		key;
+	int			i;
+
+	if (n == 0)
+		return false;
+	key = lion_entry_key(state, entry);
+	for (i = 0; i < n; i++)
+	{
+		if (datumIsEqual(key, excl[i], state->typbyval, state->typlen))
+			return true;
+	}
+	return false;
+}
+
+/* The smallest of a min-heap of counts, n of them, sifted after a change. */
+static void
+lion_topk_sift(int64 *heap, int n, int i)
+{
+	for (;;)
+	{
+		int			l = 2 * i + 1;
+		int			m = i;
+		int64		t;
+
+		if (l < n && heap[l] < heap[m])
+			m = l;
+		if (l + 1 < n && heap[l + 1] < heap[m])
+			m = l + 1;
+		if (m == i)
+			return;
+		t = heap[i];
+		heap[i] = heap[m];
+		heap[m] = t;
+		i = m;
+	}
+}
+
+static void
+lion_topk_push(int64 *heap, int *n, int64 cap, int64 v)
+{
+	int			i;
+
+	if (*n >= cap)
+	{
+		if (v <= heap[0])
+			return;
+		heap[0] = v;
+		lion_topk_sift(heap, *n, 0);
+		return;
+	}
+	i = (*n)++;
+	heap[i] = v;
+	while (i > 0 && heap[(i - 1) / 2] > heap[i])
+	{
+		int64		t = heap[i];
+
+		heap[i] = heap[(i - 1) / 2];
+		heap[(i - 1) / 2] = t;
+		i = (i - 1) / 2;
+	}
+}
+
+/*
+ * THE TOP k OF A GROUP BY ORDERED BY ITS COUNT (DESIGN.md §36): the groups
+ * that can be among the first k, counted, into topkkey, topknull and
+ * topkcount - or topkwhole set when the candidates could not be shown to be
+ * enough, and the walk then counts every group as it would without a k.
+ *
+ * An entry's ntids is the number of TIDs its posting set holds, and a group
+ * this snapshot sees has each of its visible rows there: a row is in the
+ * index before its transaction commits, VACUUM takes out only what no
+ * snapshot sees, and a TID is one row at most.  So ntids BOUNDS the group's
+ * count, whatever the WHERE says - it can only take rows away.
+ *
+ * One walk of the driving column's entries (the same walk, under the same
+ * range, as the groups would be counted in) reads nothing but their headers
+ * and keeps the topkcand largest; maxout is the largest count it left out.
+ * The candidates are then counted exactly, largest bound first, until the
+ * k-th largest count so far is at least the next bound - more than it, when
+ * every group tied with the k-th has to come out: no group not yet counted
+ * can then have a larger count, or, strictly, an equal one.  The groups
+ * counted go up, and the Sort and Limit above put them in order and cut them;
+ * a group not counted cannot be among the first k.  Running out of
+ * candidates short of that, with a count left out that might still be large
+ * enough, is the case the walk of every group is for.
+ */
+static void
+lion_topk_run(LionCountScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	LionEntryScan es;
+	LionTopkCand *cand;
+	MemoryContext oldcxt;
+	int64	   *heap;
+	int			nheap = 0;
+	int			cap = st->topkcand;
+	int			n = 0;
+	int			i;
+	uint64		maxout = 0;
+	uint64		floor = 0;
+	bool		trimmed = false;
+	bool		byval;
+	int16		typlen;
+	bool		enough = false;
+	Datum	   *excl;
+	int			nexcl = 0;
+	bool		exclnull = false;
+	int			k;
+
+	st->topkran = true;
+	if (st->topkcxt == NULL)
+		st->topkcxt = AllocSetContextCreate(estate->es_query_cxt,
+											"LionCount top k",
+											ALLOCSET_DEFAULT_SIZES);
+	MemoryContextReset(st->topkcxt);
+	oldcxt = MemoryContextSwitchTo(st->topkcxt);
+
+	/*
+	 * The entries the WHERE takes out whole: `g <> c` subtracts c's entry and
+	 * the NULL one, `g IS NOT NULL` the NULL one (DESIGN.md §35), so a group
+	 * of either has no row - and c is often the largest entry there is, whose
+	 * set counting would read for nothing.  Its entry is the one whose stored
+	 * key the lookup found: one entry to an equality class, so the same bytes.
+	 */
+	excl = (Datum *) palloc(sizeof(Datum) * Max(2 * st->nitem, 1));
+	for (k = 0; k < st->nitem; k++)
+	{
+		LionSourceItem *it = &st->item[k];
+		LionCountSource *src = &st->sources[k + 1];
+		LionClauseState *cl;
+		int			j;
+
+		if (it->orno >= 0 || it->rangesrc || !src->negated)
+			continue;
+		cl = &st->clause[it->clauseno];
+		if ((cl->kind != LION_CLAUSE_NE && cl->kind != LION_CLAUSE_NOTNULL) ||
+			cl->idx == NULL ||
+			RelationGetRelid(cl->idx) != RelationGetRelid(st->groupidx) ||
+			cl->idxcol != st->groupidxcol)
+			continue;
+		for (j = 0; j < src->nsets; j++)
+		{
+			if (!src->sets[j].found)
+				continue;
+			if (src->sets[j].keyisnull)
+				exclnull = true;
+			else if (src->sets[j].hasstoredkey)
+				excl[nexcl++] = src->sets[j].storedkey;
+		}
+	}
+
+	/* ---- the entries' own counts: the topkcand largest, and maxout ---- */
+	cand = (LionTopkCand *) palloc(sizeof(LionTopkCand) * 2 * cap);
+	lion_entry_scan_begin_range(&es, st->groupidx, st->groupidxcol,
+								st->hasrange ? &st->range : NULL);
+	byval = es.state->typbyval;
+	typlen = es.state->typlen;
+	for (;;)
+	{
+		LionEntryTuple *entry;
+		Size		itemlen;
+
+		entry = lion_entry_scan_next_copy(&es, &itemlen);
+		if (entry == NULL)
+			break;
+		st->topkwalked++;
+
+		if (LionEntryIsNullKey(entry) ? exclnull :
+			lion_topk_excluded(es.state, entry, excl, nexcl))
+			continue;
+
+		/* smaller than every one kept, once there are enough */
+		if (trimmed && entry->ntids <= floor)
+		{
+			maxout = Max(maxout, entry->ntids);
+			continue;
+		}
+		cand[n].ntids = entry->ntids;
+		cand[n].isnull = LionEntryIsNullKey(entry);
+		cand[n].key = cand[n].isnull ? (Datum) 0 :
+			datumCopy(lion_entry_key(es.state, entry), byval, typlen);
+		if (++n == 2 * cap)
+		{
+			n = lion_topk_trim(cand, n, cap, byval, &maxout);
+			floor = cand[n - 1].ntids;
+			trimmed = true;
+		}
+	}
+	lion_entry_scan_end(&es);
+	n = lion_topk_trim(cand, n, cap, byval, &maxout);
+
+	/* ---- counted, largest bound first, until the rest cannot matter ---- */
+	st->topkkey = (Datum *) palloc(sizeof(Datum) * Max(n, 1));
+	st->topknull = (bool *) palloc(sizeof(bool) * Max(n, 1));
+	st->topkcount = (int64 *) palloc(sizeof(int64) * Max(n, 1));
+	heap = (int64 *) palloc(sizeof(int64) * Min((int64) Max(n, 1),
+												 st->topkn));
+	st->topkout = 0;
+	st->topkpos = 0;
+	MemoryContextSwitchTo(oldcxt);
+
+	for (i = 0; i < n && !enough; i++)
+	{
+		uint64		next = (i + 1 < n) ? cand[i + 1].ntids : maxout;
+		int64		count;
+		bool		found;
+
+		CHECK_FOR_INTERRUPTS();
+		MemoryContextReset(st->pergroup);
+		oldcxt = MemoryContextSwitchTo(st->pergroup);
+
+		/*
+		 * The entry is looked up again by its key: VACUUM may have deleted it
+		 * since the walk read it, which it does only to an entry holding no
+		 * row this snapshot sees.
+		 */
+		if (cand[i].isnull)
+			found = lion_posting_set_lookup_null_col(st->groupidx,
+													 st->groupidxcol,
+													 &st->groupset);
+		else
+			found = lion_posting_set_lookup_col(st->groupidx,
+												st->groupidxcol,
+												cand[i].key, InvalidOid,
+												&st->groupset);
+		count = found ?
+			lion_group_count(st, st->nsource, st->sources, st->nitem,
+							 st->groupset.ntids, i + 1 < n) : 0;
+		lion_posting_set_release(&st->groupset);
+		MemoryContextSwitchTo(oldcxt);
+		st->topkcounted++;
+
+		if (count > 0)
+		{
+			st->topkkey[st->topkout] = cand[i].key;
+			st->topknull[st->topkout] = cand[i].isnull;
+			st->topkcount[st->topkout] = count;
+			st->topkout++;
+			lion_topk_push(heap, &nheap, st->topkn, count);
+		}
+
+		/*
+		 * Enough: no entry is left with a row, or k groups are counted and
+		 * none still to come can pass the k-th.
+		 */
+		if (next == 0)
+			enough = true;
+		else if (nheap >= st->topkn &&
+				 (st->topkstrict ? (uint64) heap[0] > next :
+				  (uint64) heap[0] >= next))
+			enough = true;
+	}
+	if (n == 0)
+		enough = true;
+
+	if (!enough)
+	{
+		st->topkwhole = true;
+		st->topkwholes++;
+		MemoryContextReset(st->topkcxt);
+		st->topkkey = NULL;
+		st->topknull = NULL;
+		st->topkcount = NULL;
+		st->topkout = 0;
+	}
+}
+
+/*
  * The next group of the relation the node has open, as one row.
  *
  * Returns NULL and sets *exhausted once the relation's entry scan has run
@@ -1453,6 +1771,30 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 		 */
 		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
 		MemoryContextReset(st->pergroup);
+
+		/*
+		 * The top k by count (DESIGN.md §36): the groups that can be among
+		 * them, counted before the first row goes up - unless that could not
+		 * be shown, when the walk below counts every group.
+		 */
+		if (st->topkn > 0 && !st->topkwhole)
+		{
+			if (!st->topkran)
+				lion_topk_run(st);
+			if (!st->topkwhole)
+			{
+				int			i;
+
+				if (st->topkpos >= st->topkout)
+				{
+					*exhausted = true;
+					return NULL;
+				}
+				i = st->topkpos++;
+				return lion_emit_tuple(st, st->topkkey[i], st->topknull[i],
+									   (Datum) 0, true, st->topkcount[i]);
+			}
+		}
 
 		/*
 		 * Once the WHERE is collected, the rest of the walk is counted a
@@ -2417,6 +2759,344 @@ lion_decode_reset(LionCountScanState *st)
 	dr->started = false;
 	dr->finished = false;
 	dr->emitting = false;
+}
+
+/*
+ * THE AGGREGATES OVER LION COLUMNS' ENTRIES (DESIGN.md §37).
+ *
+ * Every row of a table with no WHERE is in exactly one entry of a scalar lion
+ * column - the NULL one for a NULL - and holds its key's value when the keys
+ * are the rows' own values (the value rule of §10, which the planner asked).
+ * So sum(f(x)) is the sum over x's entries of f(key) times the entry's rows,
+ * avg the same over their total, and min or max the first f(key) in the
+ * aggregate's order among the entries with a row: one walk of each column,
+ * however many aggregates are taken over it.
+ *
+ * An entry's rows are its visible TIDs.  lion_heap_all_visible() says when
+ * its ntids is that number (lion_wagg_run()); otherwise each entry is counted
+ * as a group of a walk is.
+ */
+
+/*
+ * Is every page of heap all-visible, and how many are there?  An index TID on
+ * an all-visible page is a row every snapshot sees - core's own promise, the
+ * one an index-only scan rests on (a page with a dead item is never marked,
+ * and a mark is taken away by the first change to the page, before the change
+ * reaches any index).
+ */
+static bool
+lion_heap_all_visible(Relation heap, BlockNumber *nblocks)
+{
+	BlockNumber allvisible;
+
+	*nblocks = RelationGetNumberOfBlocks(heap);
+	visibilitymap_count(heap, &allvisible, NULL);
+	return allvisible == *nblocks;
+}
+
+#ifdef HAVE_INT128
+/* v as a numeric, exactly: in three parts of 10^18 past int8's range */
+static Datum
+lion_int128_numeric(int128 v)
+{
+	const int64 base = INT64CONST(1000000000000000000);
+	Datum		hi;
+
+	if (v >= (int128) PG_INT64_MIN && v <= (int128) PG_INT64_MAX)
+		return NumericGetDatum(int64_to_numeric((int64) v));
+	hi = lion_int128_numeric(v / base);
+	return DirectFunctionCall2(numeric_add,
+							   DirectFunctionCall2(numeric_mul, hi,
+												   NumericGetDatum(int64_to_numeric(base))),
+							   NumericGetDatum(int64_to_numeric((int64) (v % base))));
+}
+#endif
+
+/* The aggregates of column c take an entry of key key (isnull) and rows. */
+static void
+lion_wagg_add(LionCountScanState *st, int c, Datum key, bool isnull,
+			  int64 rows)
+{
+	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
+	TupleTableSlot *slot = st->css.ss.ss_ScanTupleSlot;
+	bool		slotset = false;
+	int			i;
+
+	if (rows <= 0)
+		return;
+	ResetExprContext(econtext);
+	for (i = 0; i < st->nwagg; i++)
+	{
+		LionWAgg   *a = &st->wagg[i];
+		Datum		v;
+		bool		vnull;
+
+		if (a->col != c)
+			continue;
+		if (a->argiskey)
+		{
+			v = key;
+			vnull = isnull;
+		}
+		else
+		{
+			/* the key in its column of the scan tuple, the rest NULL */
+			if (!slotset)
+			{
+				int			j;
+
+				ExecClearTuple(slot);
+				for (j = 0; j < slot->tts_tupleDescriptor->natts; j++)
+				{
+					slot->tts_values[j] = (Datum) 0;
+					slot->tts_isnull[j] = true;
+				}
+				slot->tts_values[st->wcol[c].slotcol] = key;
+				slot->tts_isnull[st->wcol[c].slotcol] = isnull;
+				ExecStoreVirtualTuple(slot);
+				econtext->ecxt_scantuple = slot;
+				slotset = true;
+			}
+			v = ExecEvalExprSwitchContext(a->arg, econtext, &vnull);
+		}
+		if (vnull)
+			continue;
+
+		switch (a->kind)
+		{
+#ifdef HAVE_INT128
+			case LION_WAGG_SUM:
+			case LION_WAGG_SUM8:
+			case LION_WAGG_AVG:
+			case LION_WAGG_AVG8:
+				{
+					int64		iv = (a->argwidth == 2) ? DatumGetInt16(v) :
+						(a->argwidth == 4) ? DatumGetInt32(v) : DatumGetInt64(v);
+
+					a->sum += (int128) iv * (int128) rows;
+					a->n += rows;
+				}
+				break;
+#endif
+			case LION_WAGG_EXTREME:
+				if (!a->hasext ||
+					DatumGetBool(FunctionCall2Coll(&a->cmp, a->collation, v,
+												   a->ext)))
+				{
+					MemoryContext oldcxt = MemoryContextSwitchTo(st->wcxt);
+
+					if (a->hasext && !a->typbyval)
+						pfree(DatumGetPointer(a->ext));
+					a->ext = datumCopy(v, a->typbyval, a->typlen);
+					a->hasext = true;
+					MemoryContextSwitchTo(oldcxt);
+				}
+				break;
+			default:
+				elog(ERROR, "LionCount: aggregate kind %d over keys", a->kind);
+		}
+	}
+}
+
+/*
+ * One walk of column c's entries, every one of them the NULL one included:
+ * with fast, each entry's rows its ntids; without, each entry counted.
+ */
+static void
+lion_wagg_walk(LionCountScanState *st, int c, bool fast)
+{
+	LionWCol   *wc = &st->wcol[c];
+	LionEntryScan es;
+	MemoryContext oldcxt;
+
+	lion_entry_scan_begin_col(&es, wc->idx, wc->idxcol);
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+		MemoryContextReset(st->pergroup);
+		oldcxt = MemoryContextSwitchTo(st->pergroup);
+		if (fast)
+		{
+			LionEntryTuple *entry;
+			Size		itemlen;
+			bool		isnull;
+
+			entry = lion_entry_scan_next_copy(&es, &itemlen);
+			if (entry == NULL)
+			{
+				MemoryContextSwitchTo(oldcxt);
+				break;
+			}
+			isnull = LionEntryIsNullKey(entry);
+			lion_wagg_add(st, c,
+						  isnull ? (Datum) 0 : lion_entry_key(es.state, entry),
+						  isnull, (int64) entry->ntids);
+		}
+		else
+		{
+			LionPostingSet ps;
+			LionCountSource src;
+			Datum		key;
+			bool		isnull;
+			int64		rows;
+
+			if (!lion_entry_scan_next(&es, &key, &ps))
+			{
+				MemoryContextSwitchTo(oldcxt);
+				break;
+			}
+			memset(&src, 0, sizeof(src));
+			src.nsets = 1;
+			src.sets = &ps;
+			isnull = ps.keyisnull;
+			rows = lion_node_count(st, 1, &src, false);
+			lion_posting_set_release(&ps);
+			lion_wagg_add(st, c, key, isnull, rows);
+		}
+		st->wentries++;
+		MemoryContextSwitchTo(oldcxt);
+	}
+	lion_entry_scan_end(&es);
+}
+
+/* Every aggregate over keys, begun again. */
+static void
+lion_wagg_reset(LionCountScanState *st)
+{
+	int			i;
+
+	if (st->wcxt != NULL)
+		MemoryContextReset(st->wcxt);
+	for (i = 0; i < st->nwagg; i++)
+	{
+		LionWAgg   *a = &st->wagg[i];
+
+#ifdef HAVE_INT128
+		a->sum = 0;
+#endif
+		a->n = 0;
+		a->hasext = false;
+		a->ext = (Datum) 0;
+		a->result = (Datum) 0;
+		a->resnull = true;
+	}
+}
+
+/*
+ * Compute every aggregate over keys (DESIGN.md §37) into its result.
+ *
+ * The entries' own counts are the rows when every heap page is all-visible
+ * before the first header is read and after the last, and the heap has as
+ * many pages both times.  At the first look every TID in the index is a row
+ * every snapshot sees.  A change made after it - an insert, an update, a
+ * delete, by a transaction this snapshot cannot see, since one it sees had
+ * made its change before the snapshot and so before the first look - takes
+ * the mark off its page before its TID reaches an index, and that page cannot
+ * be marked again while this snapshot's xmin holds VACUUM back; a new page is
+ * not marked at all.  So the second look finds every page marked only if
+ * nothing changed in between, and every ntids read then counted exactly the
+ * rows of the first look: this snapshot's.  During recovery the standby's
+ * snapshot holds nothing back on the primary, and every entry is counted.
+ */
+void
+lion_wagg_run(LionCountScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	BlockNumber before;
+	BlockNumber after;
+	bool		fast;
+	int			c;
+	int			i;
+
+	if (st->wcxt == NULL)
+		st->wcxt = AllocSetContextCreate(estate->es_query_cxt,
+										 "LionCount aggregates over keys",
+										 ALLOCSET_DEFAULT_SIZES);
+	for (c = 0; c < st->nwcol; c++)
+	{
+		if (st->wcol[c].idx == NULL)
+			st->wcol[c].idx = index_open(st->wcol[c].idxoid, AccessShareLock);
+	}
+
+	lion_wagg_reset(st);
+	fast = !RecoveryInProgress() && lion_heap_all_visible(st->heap, &before);
+	if (fast)
+	{
+		for (c = 0; c < st->nwcol; c++)
+			lion_wagg_walk(st, c, true);
+		fast = lion_heap_all_visible(st->heap, &after) && after == before;
+		st->wfast += st->nwcol;
+		if (!fast)
+			lion_wagg_reset(st);
+	}
+	if (!fast)
+	{
+		for (c = 0; c < st->nwcol; c++)
+			lion_wagg_walk(st, c, false);
+		st->wslow += st->nwcol;
+	}
+
+	for (i = 0; i < st->nwagg; i++)
+	{
+		LionWAgg   *a = &st->wagg[i];
+		MemoryContext oldcxt = MemoryContextSwitchTo(st->wcxt);
+
+		a->resnull = true;
+		switch (a->kind)
+		{
+#ifdef HAVE_INT128
+			case LION_WAGG_SUM:
+
+				/*
+				 * sum(int2) and sum(int4) add up in an int8 that wraps; the
+				 * sum modulo 2^64 is what the wrapping adds make, in any order.
+				 */
+				if (a->n > 0)
+				{
+					a->result = Int64GetDatum((int64) (uint64) a->sum);
+					a->resnull = false;
+				}
+				break;
+			case LION_WAGG_SUM8:
+				if (a->n > 0)
+				{
+					a->result = lion_int128_numeric(a->sum);
+					a->resnull = false;
+				}
+				break;
+			case LION_WAGG_AVG:
+			case LION_WAGG_AVG8:
+
+				/*
+				 * int8_avg() and numeric_poly_avg(): the sum over the count,
+				 * both numerics - the sum an int8 that wraps for int2 and int4,
+				 * exact for int8.
+				 */
+				if (a->n > 0)
+				{
+					Datum		sum = (a->kind == LION_WAGG_AVG) ?
+						NumericGetDatum(int64_to_numeric((int64) (uint64) a->sum)) :
+						lion_int128_numeric(a->sum);
+
+					a->result = DirectFunctionCall2(numeric_div, sum,
+													NumericGetDatum(int64_to_numeric(a->n)));
+					a->resnull = false;
+				}
+				break;
+#endif
+			case LION_WAGG_EXTREME:
+				a->result = a->ext;
+				a->resnull = !a->hasext;
+				break;
+		}
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	for (c = 0; c < st->nwcol; c++)
+	{
+		index_close(st->wcol[c].idx, AccessShareLock);
+		st->wcol[c].idx = NULL;
+	}
 }
 
 /*

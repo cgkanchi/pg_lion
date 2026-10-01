@@ -200,6 +200,28 @@
 #define LION_TL_WHEREKEY		(8 + 2 * (LION_MAX_GROUPCOLS - 2))
 
 /*
+ * The aggregates over the entries of lion columns (DESIGN.md §37):
+ * LION_TL_WAGG(j) is the j'th of them (LionWAgg), LION_TL_WKEY(c) the key
+ * of column c that their arguments are evaluated on, which no row prints.
+ * Far above any clause's LION_TL_WHEREKEY.
+ */
+#define LION_TL_WAGG(j)				(0x10000000 + (j))
+#define LION_TL_IS_WAGG(kind)		((kind) >= 0x10000000 && (kind) < 0x20000000)
+#define LION_TL_WAGG_NO(kind)		((kind) - 0x10000000)
+#define LION_TL_WKEY(c)				(0x20000000 + (c))
+#define LION_TL_IS_WKEY(kind)		((kind) >= 0x20000000 && (kind) < 0x30000000)
+#define LION_TL_WKEY_COL(kind)		((kind) - 0x20000000)
+
+/* ... and what each one computes */
+#define LION_WAGG_NONE		0
+#define LION_WAGG_SUM		1	/* sum(int2), sum(int4): an int8 */
+#define LION_WAGG_SUM8		2	/* sum(int8): a numeric */
+#define LION_WAGG_AVG		3	/* avg(int2), avg(int4): a numeric */
+#define LION_WAGG_AVG8		4	/* avg(int8): a numeric */
+#define LION_WAGG_EXTREME	5	/* min, max, bool_and, bool_or: the first
+								 * value in the aggregate's sort order */
+
+/*
  * A column of the FK-side join's child plan (DESIGN.md §27): the dimension
  * column at position `resno` of the child's target list, read from the child's
  * current row.  Negative, so that it can never collide with the kinds above.
@@ -961,7 +983,21 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  *		are every row of the table; attnum the PARENT's.  Empty for a sum
  *		driven by a range, or by the first `IS NOT NULL`, which name their
  *		column themselves
- *	17	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	17	IntList: the top k of a GROUP BY ordered by its count (DESIGN.md
+ *		§36), or empty: k - the query's LIMIT and OFFSET added up - then how
+ *		many entries the walk of the entries' own counts keeps as candidates,
+ *		then 1 when the groups tied with the k-th must all come out (a second
+ *		ORDER BY key, or WITH TIES) and 0 when any of them will do.  The node
+ *		then emits only groups that can be among the first k, which the Sort
+ *		and Limit above it put in order and cut
+ *	18	List, or empty: the aggregates over the entries of lion columns,
+ *		weighted by their counts (DESIGN.md §37): an IntList of the columns'
+ *		attnums, an OidList of the lion index each is read from and an IntList
+ *		of its key column there; lion_plan_custom_path() adds a List of one
+ *		IntList per aggregate - its LION_WAGG_* kind, the column's position in
+ *		those lists and the width of its integer argument - whose argument
+ *		expressions it appends to custom_exprs after the clause values
+ *	19	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -981,7 +1017,9 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_PRIV_FACTGROUP	14
 #define LION_PRIV_GROUPN		15
 #define LION_PRIV_ALLROWS	16
-#define LION_PRIV_TLKINDS	17
+#define LION_PRIV_TOPK		17
+#define LION_PRIV_WAGG		18
+#define LION_PRIV_TLKINDS	19
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -1043,6 +1081,16 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * the clauses and not found, and a `<>` it would have counted as an
  * equality.
  *
+ * Shape 20 added the TOPK member (17) in front of the target-list kinds: a
+ * GROUP BY that emits only the groups that can be among the first k by
+ * count (DESIGN.md §36), which an older build would have emitted whole -
+ * right, but not what the plan was priced as.
+ *
+ * Shape 21 added the WAGG member (18) in front of the target-list kinds, and
+ * the target-list kinds of its aggregates and keys: sums, averages, minima
+ * and maxima over the entries of lion columns (DESIGN.md §37), which an older
+ * build would have taken for counts.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1055,8 +1103,8 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424913
-#define LION_PRIV_NMEMBERS	18
+#define LION_PRIV_MAGIC		0x52424915
+#define LION_PRIV_NMEMBERS	20
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -1302,6 +1350,40 @@ typedef struct LionDecodeRun
 	int64		rowsup;			/* partial rows handed up */
 	LionDecodeStats stats;
 } LionDecodeRun;
+
+/*
+ * A lion column whose entries the aggregates of DESIGN.md §37 are taken
+ * over, and one of those aggregates.
+ */
+typedef struct LionWCol
+{
+	AttrNumber	attno;			/* the heap column */
+	Oid			idxoid;
+	AttrNumber	idxcol;			/* its key column in idxoid */
+	Relation	idx;			/* open while the scan runs, or NULL */
+	int			slotcol;		/* its key's column of the scan tuple, or -1 */
+} LionWCol;
+
+typedef struct LionWAgg
+{
+	int			kind;			/* LION_WAGG_* */
+	int			col;			/* its column, in the scan's wcol */
+	int			argwidth;		/* 2, 4 or 8: a sum's or average's argument */
+	ExprState  *arg;			/* the argument, over the key's column */
+	bool		argiskey;		/* ... which is the key itself */
+	FmgrInfo	cmp;			/* EXTREME: its sort operator */
+	Oid			collation;
+	int16		typlen;			/* EXTREME: the argument's type */
+	bool		typbyval;
+#ifdef HAVE_INT128
+	int128		sum;			/* SUM, AVG: the weighted sum */
+#endif
+	int64		n;				/* ... and the rows with a value */
+	Datum		ext;			/* EXTREME: the value so far, in wcxt */
+	bool		hasext;
+	Datum		result;
+	bool		resnull;
+} LionWAgg;
 
 typedef struct LionCountScanState
 {
@@ -1612,6 +1694,50 @@ typedef struct LionCountScanState
 	int			gbpos;
 	int64		groupbatches;
 	int64		groupsbatched;
+
+	/*
+	 * The top k of a GROUP BY ordered by its count (DESIGN.md §36): topkn is
+	 * k (0: every group), topkcand how many entries the walk of the entries'
+	 * counts keeps, topkstrict that every group tied with the k-th must come
+	 * out.  lion_topk_run() fills topkkey, topknull and topkcount with the
+	 * groups it counted, in topkcxt, and the rows go up one a call; topkran
+	 * says it has run, and topkwhole that it could not prove its candidates
+	 * enough, so the walk counts every group as without a k.  topkwalked and
+	 * topkcounted are what EXPLAIN ANALYZE reports.
+	 */
+	int64		topkn;
+	int			topkcand;
+	bool		topkstrict;
+	bool		topkran;
+	bool		topkwhole;
+	MemoryContext topkcxt;
+	Datum	   *topkkey;
+	bool	   *topknull;
+	int64	   *topkcount;
+	int			topkout;
+	int			topkpos;
+	int64		topkwalked;
+	int64		topkcounted;
+	int64		topkwholes;
+
+	/*
+	 * The aggregates over the entries of lion columns (DESIGN.md §37): nwcol
+	 * columns, each walked once, and nwagg aggregates over them, each an
+	 * argument evaluated on an entry's key and weighted by the entry's rows.
+	 * wneedcount says the target list has counts too, which the sum over
+	 * every row answers as before.  wfast and wslow are what EXPLAIN ANALYZE
+	 * reports: the walks that read the entries' own counts, and those that
+	 * counted each entry.
+	 */
+	int			nwcol;
+	struct LionWCol *wcol;
+	int			nwagg;
+	struct LionWAgg *wagg;
+	bool		wneedcount;
+	MemoryContext wcxt;
+	int64		wentries;
+	int64		wfast;
+	int64		wslow;
 
 	/*
 	 * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel"; granged,
@@ -2220,6 +2346,9 @@ extern IndexOptInfo *lion_find_roaring_index(RelOptInfo *rel, AttrNumber attno,
 extern Oid lion_index_equality_op(IndexOptInfo *idx, AttrNumber col);
 extern bool lion_type_equalimage(Oid typid, Oid collation);
 extern bool lion_index_can_emit_value(IndexOptInfo *idx, AttrNumber col);
+extern bool lion_contains_param(Node *expr);
+extern int	lion_wagg_classify(Aggref *agg, Index rti, AttrNumber *attno,
+							   int *argwidth);
 extern IndexOptInfo *lion_match_index(RelOptInfo *rel, AttrNumber attno,
 									  int kind, Oid opno, Oid cmptype,
 									  StrategyNumber strategy,
@@ -2305,6 +2434,14 @@ extern void lion_target_lists(const LionCountTarget *t, List *whereclauses,
 							  List *wherekinds, List *ors, List **idx,
 							  List **col, List **clauses, List **kinds,
 							  List **tors, int *joinclause);
+extern void lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath,
+								RelOptInfo *rel, List *idxs, List *cols,
+								List *naggs, bool counts);
+extern void lion_cost_topk_path(PlannerInfo *root, CustomPath *cpath,
+								List *targets, List *whereclauses,
+								List *wherekinds, List *ors, double entries,
+								double drivefrac, double cand,
+								double candrows, double outrows);
 extern void lion_cost_count_path(PlannerInfo *root, CustomPath *cpath,
 								 List *targets, List *whereclauses,
 								 List *wherekinds, List *ors, double numgroups,
@@ -2415,6 +2552,7 @@ extern int64 lion_sumall_relation(LionCountScanState *st);
 extern TupleTableSlot *lion_next_group_ranged(LionCountScanState *st,
 											  bool *exhausted);
 extern TupleTableSlot *lion_distinct_relation(LionCountScanState *st);
+extern void lion_wagg_run(LionCountScanState *st);
 extern TupleTableSlot *lion_next_group_any(LionCountScanState *st,
 										   bool *exhausted);
 extern void lion_decode_reset(LionCountScanState *st);

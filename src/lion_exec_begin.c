@@ -789,6 +789,28 @@ lion_begin_decode(LionCountScanState *st, CustomScan *cscan,
 		if (st->allattno != 0 && !st->sumall)
 			elog(ERROR, "LionCount: a column for every row without a sum");
 	}
+	{
+		List	   *topk = (List *) list_nth(cscan->custom_private,
+											 LION_PRIV_TOPK);
+
+		/*
+		 * The top k by count (DESIGN.md §36) is made of one grouping column
+		 * walked in one table, counted a group at a time.
+		 */
+		st->topkn = 0;
+		if (topk != NIL)
+		{
+			if (list_length(topk) != 3 || linitial_int(topk) <= 0 ||
+				lsecond_int(topk) < linitial_int(topk) ||
+				st->groupattno == 0 || st->groupattno2 != 0 ||
+				st->distattno != 0 || st->sumall || priv->partlist != NIL ||
+				priv->coal != NIL)
+				elog(ERROR, "LionCount: a top k of another shape");
+			st->topkn = linitial_int(topk);
+			st->topkcand = lsecond_int(topk);
+			st->topkstrict = (lthird_int(topk) != 0);
+		}
+	}
 }
 
 /* GROUP BY coalesce(g, c) (DESIGN.md §10): c and its equality */
@@ -933,6 +955,116 @@ lion_begin_target_list(LionCountScanState *st, CustomScan *cscan, List *kinds)
 			default:
 				break;
 		}
+	}
+}
+
+/*
+ * The aggregates over lion columns' entries (DESIGN.md §37), from the plan's
+ * WAGG member and the argument expressions after the clause values: the
+ * columns, each aggregate's kind, argument and - for a minimum or a maximum -
+ * its sort operator, and where each column's key goes in the scan tuple.
+ * Whether the target list has counts besides, which the sum over every row
+ * answers.
+ */
+static void
+lion_begin_wagg(LionCountScanState *st, CustomScanState *node,
+				CustomScan *cscan, List *exprs)
+{
+	List	   *w = (List *) list_nth(cscan->custom_private, LION_PRIV_WAGG);
+	List	   *attnos;
+	List	   *oids;
+	List	   *cols;
+	List	   *specs;
+	int			i;
+
+	st->nwcol = 0;
+	st->nwagg = 0;
+	if (w == NIL)
+		return;
+	if (list_length(w) != 4 || !st->sumall || st->groupattno != 0)
+		elog(ERROR, "LionCount: malformed aggregates over keys");
+	attnos = (List *) linitial(w);
+	oids = (List *) lsecond(w);
+	cols = (List *) lthird(w);
+	specs = (List *) lfourth(w);
+
+	st->nwcol = list_length(attnos);
+	st->wcol = (LionWCol *) palloc0(sizeof(LionWCol) * st->nwcol);
+	for (i = 0; i < st->nwcol; i++)
+	{
+		st->wcol[i].attno = (AttrNumber) list_nth_int(attnos, i);
+		st->wcol[i].idxoid = list_nth_oid(oids, i);
+		st->wcol[i].idxcol = (AttrNumber) list_nth_int(cols, i);
+		st->wcol[i].slotcol = -1;
+	}
+
+	st->nwagg = list_length(specs);
+	st->wagg = (LionWAgg *) palloc0(sizeof(LionWAgg) * Max(st->nwagg, 1));
+	for (i = 0; i < st->nwagg; i++)
+	{
+		List	   *spec = (List *) list_nth(specs, i);
+		LionWAgg   *a = &st->wagg[i];
+		Expr	   *arg = (Expr *) list_nth(exprs, st->nclause + i);
+		Node	   *bare = lion_strip((Node *) arg);
+
+		if (list_length(spec) != 5)
+			elog(ERROR, "LionCount: malformed aggregates over keys");
+		a->kind = list_nth_int(spec, 0);
+		a->col = list_nth_int(spec, 1);
+		a->argwidth = list_nth_int(spec, 2);
+		if (a->col < 0 || a->col >= st->nwcol ||
+			a->kind <= LION_WAGG_NONE || a->kind > LION_WAGG_EXTREME)
+			elog(ERROR, "LionCount: malformed aggregates over keys");
+#ifndef HAVE_INT128
+		if (a->kind != LION_WAGG_EXTREME)
+			elog(ERROR, "LionCount: a sum over keys without 128-bit integers");
+#endif
+		a->arg = ExecInitExpr(arg, &node->ss.ps);
+		a->argiskey = (bare != NULL && IsA(bare, Var));
+		get_typlenbyval(exprType((Node *) arg), &a->typlen, &a->typbyval);
+		if (a->kind == LION_WAGG_EXTREME)
+		{
+			Oid			aggfnoid = (Oid) list_nth_int(spec, 3);
+			HeapTuple	tup;
+			Oid			sortop;
+
+			tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggfnoid));
+			if (!HeapTupleIsValid(tup))
+				elog(ERROR, "cache lookup failed for aggregate %u", aggfnoid);
+			sortop = ((Form_pg_aggregate) GETSTRUCT(tup))->aggsortop;
+			ReleaseSysCache(tup);
+			if (!OidIsValid(sortop))
+				elog(ERROR, "LionCount: aggregate %u has no sort operator",
+					 aggfnoid);
+			fmgr_info(get_opcode(sortop), &a->cmp);
+			a->collation = (Oid) list_nth_int(spec, 4);
+		}
+	}
+
+	/* each column's key in the scan tuple, and whether counts are wanted */
+	st->wneedcount = false;
+	for (i = 0; i < st->ntlist; i++)
+	{
+		int			kind = st->tlkind[i];
+
+		if (LION_TL_IS_WKEY(kind))
+		{
+			if (LION_TL_WKEY_COL(kind) >= st->nwcol)
+				elog(ERROR, "LionCount: malformed aggregates over keys");
+			st->wcol[LION_TL_WKEY_COL(kind)].slotcol = i;
+		}
+		else if (LION_TL_IS_WAGG(kind))
+		{
+			if (LION_TL_WAGG_NO(kind) >= st->nwagg)
+				elog(ERROR, "LionCount: malformed aggregates over keys");
+		}
+		else
+			st->wneedcount = true;
+	}
+	for (i = 0; i < st->nwagg; i++)
+	{
+		if (!st->wagg[i].argiskey && st->wcol[st->wagg[i].col].slotcol < 0)
+			elog(ERROR, "LionCount: an aggregate's argument without its key");
 	}
 }
 
@@ -1650,12 +1782,20 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	 * above).  A mismatch is planner/executor drift, exactly like a wrong
 	 * shape marker, and is said rather than decoded.
 	 */
-	if (list_length(priv.exprs) != st->nclause)
-		elog(ERROR, "LionCount: %d clauses but %d value expressions",
-			 st->nclause, list_length(priv.exprs));
+	{
+		List	   *wagg = (List *) list_nth(cscan->custom_private,
+											 LION_PRIV_WAGG);
+		int			nwagg = (wagg != NIL && list_length(wagg) == 4) ?
+			list_length((List *) lfourth(wagg)) : 0;
+
+		if (list_length(priv.exprs) != st->nclause + nwagg)
+			elog(ERROR, "LionCount: %d clauses but %d value expressions",
+				 st->nclause, list_length(priv.exprs) - nwagg);
+	}
 
 	lion_begin_join(st, cscan, priv.join);
 	lion_begin_target_list(st, cscan, priv.kinds);
+	lion_begin_wagg(st, node, cscan, priv.exprs);
 	lion_begin_clauses(st, node, &priv);
 	lion_begin_driving_column(st);
 	lion_begin_ors_and_items(st, priv.orlist);

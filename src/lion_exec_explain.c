@@ -799,6 +799,35 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 	if (st->distattno != 0)
 		ExplainPropertyText("Distinct Key",
 							get_attname(st->heapoid, st->distattno, false), es);
+
+	/* the columns aggregates are taken over (DESIGN.md §37) */
+	if (st->nwcol > 0)
+	{
+		int			c;
+
+		initStringInfo(&buf);
+		for (c = 0; c < st->nwcol; c++)
+			appendStringInfo(&buf, "%s%s (%s)", (c > 0) ? ", " : "",
+							 get_rel_name(st->wcol[c].idxoid),
+							 get_attname(st->heapoid, st->wcol[c].attno,
+										 false));
+		ExplainPropertyText("Aggregates Over Keys", buf.data, es);
+		pfree(buf.data);
+	}
+
+	/*
+	 * The top k by count (DESIGN.md §36): k, and how many entries the walk of
+	 * their counts keeps as candidates.
+	 */
+	if (st->topkn > 0)
+	{
+		initStringInfo(&buf);
+		appendStringInfo(&buf, INT64_FORMAT " by count%s, %d candidates",
+						 st->topkn, st->topkstrict ? " with ties" : "",
+						 st->topkcand);
+		ExplainPropertyText("Top K", buf.data, es);
+		pfree(buf.data);
+	}
 }
 
 /*
@@ -1051,6 +1080,35 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 	if (st->distattno != 0)
 		ExplainPropertyInteger("Distinct Keys Tested", NULL, st->disttests,
 							   es);
+
+	/*
+	 * The aggregates over keys (DESIGN.md §37): the entries they took, and
+	 * how many walks read the entries' own counts and how many counted them.
+	 */
+	if (st->nwcol > 0)
+	{
+		ExplainPropertyInteger("Keys Aggregated", NULL, st->wentries, es);
+		ExplainPropertyInteger("Key Walks From Entry Counts", NULL, st->wfast,
+							   es);
+		if (st->wslow > 0)
+			ExplainPropertyInteger("Key Walks Counted", NULL, st->wslow, es);
+	}
+
+	/*
+	 * The top k (DESIGN.md §36): the entries whose counts were read, the
+	 * groups counted, and how often the candidates were not enough and every
+	 * group was counted instead.
+	 */
+	if (st->topkn > 0)
+	{
+		ExplainPropertyInteger("Top K Entries Walked", NULL, st->topkwalked,
+							   es);
+		ExplainPropertyInteger("Top K Groups Counted", NULL,
+							   st->topkcounted, es);
+		if (st->topkwholes > 0)
+			ExplainPropertyInteger("Top K Walked Whole", NULL,
+								   st->topkwholes, es);
+	}
 }
 
 /*

@@ -16346,3 +16346,209 @@ a generic plan with a NULL parameter, EXECUTE revoked on `int4ne`; the driver of
 row and the indexes that cannot be one; a dirty heap and a partitioned table; the walk's hole in
 both directions, with NULLs first and last, beside a range and a list; and the per-entry filter,
 the deleted row it must not evaluate `100 / k` on, and the numeric column it must not be taken on.
+
+## 36. The top k of a GROUP BY ordered by its count (implemented 2026-09-30)
+
+ClickBench's `GROUP BY x ORDER BY count(*) DESC LIMIT 10` queries (UserID, SearchPhrase, ClientIP)
+counted every group to keep ten: 3.4M UserID entries in 1.7 s, where the answer is the ten largest.
+
+### The bound
+
+An entry's header records `ntids`, the TIDs its posting set holds, kept exact in the record that
+changes the set (§22, §18; `verify()` checks it). Every row a snapshot sees has its TID there - a
+row is in the index before its transaction commits, VACUUM takes out only what no snapshot sees, a
+TID is one row at most - so `ntids` BOUNDS the group's count under any WHERE, which can only take
+rows away. It is read after the snapshot was taken; an entry inserted later holds no row the
+snapshot sees, and one VACUUM deletes held none.
+
+### The walk (`lion_topk_run()`, lion_exec_count.c)
+
+One walk of the driving column's entries - the walk the groups would be counted in, under the same
+range - reads their headers alone (`lion_entry_scan_next_copy()`: no set located, no pin kept) and
+keeps the `topkcand` largest, with `maxout`, the largest count it left out: candidates gather in an
+array of twice that, which is cut back to the largest half whenever it fills, and an entry no
+larger than the smallest kept is not copied. The candidates are then counted exactly, largest bound
+first - each looked up again by its stored key, VACUUM having possibly deleted it (it holds no row
+then), and counted as any group of a walk is, against the WHERE collected once it pays
+(`lion_group_count()`). The walk stops once the k-th largest count so far is AT LEAST the next
+candidate's bound, or `maxout` after the last: no group not yet counted can then pass it. When the
+groups tied with the k-th must all come out - a second ORDER BY key, which may pick any of them, or
+WITH TIES - it stops only once the k-th count is LARGER. The groups counted, with a row or more,
+go up; core's Sort and Limit above the node order and cut them. Running out of candidates short of
+that means a count left out might still be large enough: the node then counts every group as it
+would without a k (`Top K Walked Whole` in EXPLAIN ANALYZE), which is the price of a WHERE whose
+counts fall far below their entries' - `WHERE light` in `topk.sql`, which leaves the largest
+entries nothing.
+
+Entries the WHERE takes out whole are not candidates: `g <> c` subtracts c's entry and the NULL
+one, `g IS NOT NULL` the NULL one (§35), so a group of either has no row, and `SearchPhrase <> ''`'s
+`''` is the largest entry there is - counting it would read 87% of the table for nothing. Its entry
+is the one whose stored key the clause's lookup found, one entry to an equality class, so the same
+bytes (`lion_topk_excluded()`).
+
+### The planner (`lion_count_path_topk()`)
+
+The grouped rel's paths are read by nothing but the Sort and Limit when the query has no DISTINCT,
+window function, set-returning function, set operation or grouping sets, so a path that leaves out
+groups the Limit would cut answers the query. The shape is one grouping column of one table walked
+a group at a time - not an IN list driving the groups, a coalesce group, a count(DISTINCT), the
+decoded walk, a partitioned table's or a parallel plan's partial counts - with no HAVING, which
+could reject the groups the k were counted from. The first ORDER BY key is the group's count,
+descending: an aggregate the node answers as the group's rows (count(*), or count(col) of a column
+no row of the group has NULL - not count(g) beside g's NULL group, which is 0 there), sorted by
+int8's `>` of the integer btree family. k is the LIMIT and the OFFSET, both constants, at most
+10,000; a LIMIT known only at run time is declined.
+
+`topkcand` is 2k/s for a WHERE that keeps a share s of the rows, leaving out what it says of g
+alone: where the rows it keeps are spread evenly over the groups, the k-th count is some s of its
+bound, and the bounds after it have to fall below that. Never fewer than k + 64, never more than
+16,384, and only when that is under half the column's entries - past that every group is counted
+anyway. The price (`lion_cost_topk_path()`): every entry's header at two operator costs, the
+leaves of the walk, a lookup per candidate, and the candidates counted as the groups of a walk of
+that many entries are - their rows the column's most common values' frequencies, largest first
+(`lion_topk_rows()`) - with their rows rechecked. Nothing comes out before the last is counted.
+
+The plan carries k, the candidates and the tie rule in a new member of custom_private,
+`LION_PRIV_TOPK` (shape 20). EXPLAIN prints `Top K: 10 by count, 74 candidates` (`with ties` when
+they must all come out); ANALYZE adds `Top K Entries Walked`, `Top K Groups Counted` and, when it
+happened, `Top K Walked Whole`. `pg_lion.enable_topk` turns it off.
+
+### Expressions of the grouping column
+
+`GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3` was declined: a grouping clause that
+is not a column. An expression of the grouping columns alone splits none of their groups, when it
+is immutable and made of nothing but those columns and constants - no aggregate, window function,
+set-returning function, subquery or parameter (`lion_group_dependent()`) - and the rows of a group
+hold the same column values, not merely equal ones: the value rule of §10, so each column it names
+is one the node prints (`groupvalueout`). The node emits the columns; `lion_plan_custom_path()`
+puts the expression's columns in `custom_scan_tlist`, and setrefs.c makes the expression part of
+the plan's projection. One table and its finished groups only - not a partitioned table's, the
+decoded walk's or a parallel plan's partial counts, which a Finalize Agg would group by the
+expressions again - and the order of the entries is not claimed as the query's. Under a top k an
+expression is computed for the groups that come out, so an error only another group's key would
+raise (`ClientIP + 1` at the type's maximum) is not raised; the ordinary plan computes it for
+every row.
+
+### Measured (ClickBench, 5% sample, PostgreSQL 18 release build, warm)
+
+| query | before | top k | groups counted |
+| --- | --- | --- | --- |
+| `SearchPhrase ... WHERE SearchPhrase <> ''` (Q13) | 280 ms | 53 ms | 10 of 477,418 |
+| `UserID` (Q16) | 1,664 ms | 160-190 ms | 10 of 3,407,288 |
+| `ClientIP, ClientIP - 1, ...` (Q36, a lion index on ClientIP) | 4,000 ms | 130-150 ms | 10 of 2,280,454 |
+
+What is left is the walk of every header: some 50 ns an entry, most of it copying the leaves.
+
+### Tests
+
+`test/sql/topk.sql`: every answer against a sequential scan. The NULL group largest; ties at the
+cut under a second ORDER BY key and WITH TIES; OFFSET; the count unprinted; count(col) beside
+`IS NOT NULL`; a WHERE on another column, and one that leaves the largest entries nothing (every
+group counted, and not without a tie-breaker); `g <> c` and `g IS NOT NULL` taking entries out;
+the declines - ascending, ordered by the group, HAVING, DISTINCT, a window function, count(g)
+beside the NULL group, few groups, a generic plan's LIMIT, the setting off; deleted rows still in
+the entries' counts, before and after VACUUM; a rescan under each outer row's WHERE; expressions of
+the grouping column, and the volatile one, the one of another column and the one alone it declines.
+
+## 37. Aggregates over the entries of lion columns, weighted by their rows (implemented 2026-09-30)
+
+ClickBench's table-wide aggregates - `SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth)`, ninety
+`SUM(ResolutionWidth + k)`, `AVG(UserID)` - read every row where the answer is in the entries: with
+no WHERE and no GROUP BY, every row of the table is in exactly one entry of a scalar lion column (the
+NULL one for a NULL), and holds that entry's key when the keys are the rows' own values. So
+`sum(f(x))` is the sum over x's entries of `f(key)` times the entry's rows, `avg` that over their
+total, and `min` or `max` the first `f(key)` in the aggregate's order among the entries with a row.
+
+### What is taken (`lion_wagg_classify()`, `lion_count_path_wagg()`)
+
+- **The aggregates**: `sum` and `avg` of an int2, int4 or int8 argument, and every aggregate with a
+  sort operator - min and max of any type, `bool_and`, `bool_or`, `every` - which planagg.c already
+  answers as the first value in that operator's order. No DISTINCT, ORDER BY or FILTER. The counts
+  of the target list stay what they were: the sum over every row (§35) answers them beside.
+- **The argument**: an expression of ONE column of the table - immutable, with no parameter,
+  subquery, aggregate, window or set-returning function - since it is evaluated once per entry, on
+  the key. `sum(ResolutionWidth + 89)` is; `sum(s + i)` is not.
+- **The column**: a whole (not partial) scalar lion index on it whose keys are the rows' values -
+  the value rule of §10 (`lion_index_can_emit_value()`), which numeric's 1.0 and 1.00 fail - in
+  the column's own representation (a binary-coercible type of the same width).
+- **The query**: one table, not partitioned, with no WHERE and no GROUP BY, beside nothing but
+  counts; each column is walked once however many aggregates are taken over it.
+
+### The rows of an entry (`lion_wagg_run()`)
+
+An entry's rows are its visible TIDs. On a heap the visibility map calls all-visible they are its
+header's `ntids`, which the walk reads without locating a set (`lion_entry_scan_next_copy()`) - and
+that is decided as a whole, not page by page: every page is all-visible before the first header is
+read and after the last, and the heap has as many pages both times (`lion_heap_all_visible()`).
+
+- At the first look every TID in the index is a row every snapshot sees: core never marks a page
+  that has a dead item, which is the promise an index-only scan rests on.
+- A change after it - an insert, an update, a delete - is by a transaction this snapshot cannot
+  see: one it sees made its change before the snapshot was taken, so before the first look. The
+  change takes the mark off its page before its TID reaches any index, and the page cannot be
+  marked again while this snapshot's xmin holds VACUUM back; a new page is not marked at all.
+- So the second look finds every page marked only if nothing changed in between, and every `ntids`
+  read in between counted exactly the rows of the first look, which are this snapshot's.
+
+Otherwise - a page not marked, at either look - the aggregates start again and each entry is counted
+as a group of a walk is (`lion_node_count()`), the NULL entry included. So is every walk during
+recovery, where a standby's snapshot holds nothing back on the primary.
+
+### The results, as core computes them
+
+- `sum(int2)`, `sum(int4)`: an int8 that core adds up without an overflow check, wrapping; the
+  weighted sum is kept in 128 bits and cut to 64, which is the same sum modulo 2^64 in any order.
+- `sum(int8)`: a numeric; the 128-bit sum made a numeric exactly (`lion_int128_numeric()`: in parts
+  of 10^18 past int8's range). No table has rows enough for it to overflow 128 bits.
+- `avg`: `int8_avg()` and `numeric_poly_avg()` alike divide the sum by the count as numerics
+  (`numeric_div`) - the wrapped int8 sum for int2 and int4, the exact one for int8.
+- min, max and the rest: the aggregate's sort operator, under its input collation, over each
+  entry's `f(key)` - the NULL ones skipped.
+- No rows: every one NULL; the counts 0.
+
+Without 128-bit integers only the extremes are taken.
+
+### The plan
+
+The path is LionCount's sum over every row (§35) with the columns the aggregates are taken over in a
+new member of custom_private, `LION_PRIV_WAGG` (shape 21): their attnums, indexes and key columns.
+`lion_plan_custom_path()` adds what each aggregate computes and appends its argument to
+`custom_exprs`, after the clause values, where setrefs.c points the column at a place in
+`custom_scan_tlist` the executor fills with the key (`LION_TL_WKEY`); the aggregate itself is a
+`LION_TL_WAGG` column. With no count in the target list the sum over every row is not made. The
+price (`lion_cost_wagg_path()`): each column's leaves and two operator costs an entry where the
+table's `allvisfrac` is at least 0.999, the grouped count of the column (§10) elsewhere, and the
+arguments' evaluation. EXPLAIN prints `Aggregates Over Keys: <index> (<column>), ...`; ANALYZE
+adds `Keys Aggregated`, `Key Walks From Entry Counts` and, when it happened, `Key Walks Counted`.
+
+### Measured (ClickBench, 5% sample, PostgreSQL 18 release build, warm)
+
+| query | before | over keys | ClickHouse |
+| --- | --- | --- | --- |
+| `SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth)` (Q3) | 1,043 ms | 8-15 ms | 14 ms |
+| `AVG(UserID)` (Q4) | 540 ms | ~200 ms | 19 ms |
+| ninety `SUM(ResolutionWidth + k)` (Q30) | 2,085 ms | 9-14 ms | 30 ms |
+
+Q4's 3.4M entries are the walk of every header, as for the top k of §36.
+
+### Not done in this version
+
+- **A heap with a few pages not all-visible counts every entry.** The proof is all or nothing, so
+  one insert since the last VACUUM sends each column's walk to the count of each of its entries -
+  cheap for a column of a few thousand keys, a GROUP BY walk's price for one of millions. The price
+  follows `allvisfrac`, which only VACUUM and ANALYZE refresh, so a table written to since is
+  still priced as the header walk. Correcting the headers' sums by the dirty pages alone would
+  need each dirty TID's key, which a dead item no longer has.
+- **A WHERE, a GROUP BY, a partitioned table**: each entry's rows would be its count against the
+  WHERE, per group - the walks of §10 with an argument per entry, not yet written.
+
+### Tests
+
+`test/sql/keyaggs.sql`: every answer against a sequential scan. int2, int4 with NULLs, int8 whose
+sum passes int8's range, text, date and bool columns and a two-column index's second column; sums,
+averages, extremes and `bool_and`/`bool_or`/`every` of the column and of expressions of it, NULL for
+some keys; a HAVING on the one row; the entries' own counts on an all-visible heap, and each entry
+counted after a DELETE, beside this transaction's own insert and delete, and again after VACUUM;
+an empty table and one of NULLs only; and the declines - a WHERE, a GROUP BY, two columns in one
+argument, a volatile argument, DISTINCT, FILTER, ORDER BY, a numeric column, the aggregates no
+sum of keys answers, and a partial index.

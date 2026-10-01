@@ -1414,3 +1414,116 @@ lion_rangesrc_leaders(List *whereidx, List *wherecol, List *wherekinds,
 	pfree(armof);
 	return lead;
 }
+
+static bool
+lion_contains_param_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param))
+		return true;
+	return expression_tree_walker(node, lion_contains_param_walker, context);
+}
+
+/* Does expr hold a Param of any kind? */
+bool
+lion_contains_param(Node *expr)
+{
+	return lion_contains_param_walker(expr, NULL);
+}
+
+/*
+ * Is agg an aggregate the entries of one lion column answer, each entry's
+ * key weighted by its rows (DESIGN.md §37) - and which?  sum or avg of an
+ * int2, int4 or int8 argument, or an aggregate with a sort operator (min,
+ * max, bool_and, bool_or: planagg.c's first value in that order), of an
+ * argument that is an expression of one column of relation rti alone:
+ * immutable, and with no parameter, subquery, aggregate, window or set-
+ * returning function.  No DISTINCT, ORDER BY or FILTER.  *attno is the
+ * column and *argwidth the byte width of a sum's or an average's argument.
+ * Whether the column has an index whose keys are its values is the caller's
+ * to ask.
+ */
+int
+lion_wagg_classify(Aggref *agg, Index rti, AttrNumber *attno, int *argwidth)
+{
+	Node	   *arg;
+	List	   *vars;
+	ListCell   *lc;
+	int			kind = LION_WAGG_NONE;
+	int			width = 0;
+
+	if (agg->aggdistinct != NIL || agg->aggorder != NIL ||
+		agg->aggfilter != NULL || agg->agglevelsup != 0 || agg->aggstar ||
+		agg->aggkind != AGGKIND_NORMAL || agg->aggsplit != AGGSPLIT_SIMPLE ||
+		list_length(agg->args) != 1)
+		return LION_WAGG_NONE;
+	arg = (Node *) ((TargetEntry *) linitial(agg->args))->expr;
+
+	switch (agg->aggfnoid)
+	{
+#ifdef HAVE_INT128
+		case F_SUM_INT2:
+			kind = LION_WAGG_SUM;
+			width = 2;
+			break;
+		case F_SUM_INT4:
+			kind = LION_WAGG_SUM;
+			width = 4;
+			break;
+		case F_SUM_INT8:
+			kind = LION_WAGG_SUM8;
+			width = 8;
+			break;
+		case F_AVG_INT2:
+			kind = LION_WAGG_AVG;
+			width = 2;
+			break;
+		case F_AVG_INT4:
+			kind = LION_WAGG_AVG;
+			width = 4;
+			break;
+		case F_AVG_INT8:
+			kind = LION_WAGG_AVG8;
+			width = 8;
+			break;
+#endif
+		default:
+			{
+				HeapTuple	tup;
+
+				tup = SearchSysCache1(AGGFNOID,
+									  ObjectIdGetDatum(agg->aggfnoid));
+				if (!HeapTupleIsValid(tup))
+					return LION_WAGG_NONE;
+				if (OidIsValid(((Form_pg_aggregate) GETSTRUCT(tup))->aggsortop) &&
+					agg->aggtype == exprType(arg))
+					kind = LION_WAGG_EXTREME;
+				ReleaseSysCache(tup);
+			}
+			break;
+	}
+	if (kind == LION_WAGG_NONE)
+		return LION_WAGG_NONE;
+
+	if (contain_mutable_functions(arg) || contain_agg_clause(arg) ||
+		contain_window_function(arg) || expression_returns_set(arg) ||
+		contain_subplans(arg) || lion_contains_param(arg))
+		return LION_WAGG_NONE;
+	vars = pull_var_clause(arg, PVC_RECURSE_PLACEHOLDERS);
+	*attno = 0;
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!IsA(v, Var) || v->varno != (int) rti || v->varattno <= 0 ||
+			v->varlevelsup != 0 || (*attno != 0 && v->varattno != *attno))
+			return LION_WAGG_NONE;
+		*attno = v->varattno;
+	}
+	if (*attno == 0)
+		return LION_WAGG_NONE;
+	if (argwidth != NULL)
+		*argwidth = width;
+	return kind;
+}
