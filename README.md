@@ -4,7 +4,8 @@ Formerly `roaring_index`; renamed to pg_lion on 2026-09-21 (a roaring bitmap ind
 format is unchanged: the meta-page magic still spells `RBI1`, so indexes built before the rename remain readable.
 
 `CREATE INDEX ... USING lion (col)` builds one posting set of roaring-style containers
-(array / bitset / run, ≤ 4104 bytes each, one per 64 heap pages) or sparse (container key, offset)
+(array / bitset / run, ≤ 4104 bytes each, one per 64 heap pages, and a 1032-byte NARROW bitset
+where every member lies at a heap offset below 128, DESIGN.md §38) or sparse (container key, offset)
 segments per distinct key, plus one reserved entry for the rows whose key is NULL. The index serves
 Bitmap Index Scans through `amgetbitmap` for equality, `IN`/`ANY`, scalar ranges
 (`<`, `<=`, `>=`, `>`), `<>` (`!=`), `col IS NULL` and `col IS NOT NULL`, and a CustomScan
@@ -376,7 +377,7 @@ table's owner (DESIGN.md §7).
 ## Source layout
 
     src/lion_tid.h          TID <-> (container key, 15-bit lo) encoding; 9 offset bits at 8K pages
-    src/lion_container.[ch] container library (array/bitset/run), set algebra, AVX2/POPCNT bitset kernels
+    src/lion_container.[ch] container library (array/bitset/run/narrow), set algebra, AVX2/POPCNT bitset kernels
                             picked at run time, unit-tested standalone
     src/lion_sparse.[ch]    sparse (container key, offset) segments, unit-tested standalone
     src/lion.h              on-disk structs, the relation state, and the page layer's and the AM's functions
@@ -486,6 +487,10 @@ are read at build time: `ALTER INDEX ... SET (summaries = ...)` takes effect at 
 An index with summaries is format 7, which an older build refuses; one without is format 6, as
 before.  A range on a column that does not drive a count (`g, count(*) ... WHERE ts >= $1 GROUP BY
 g`, a range in an OR, a join's fact filter) is answered too, collected once from the same walk.
+A build that writes a NARROW container (DESIGN.md §38) makes the index format 8, which older builds
+refuse in turn: REINDEX such an index under the older build before going back to it.  Inserts never
+make a NARROW, and VACUUM makes one only in a format 8 index, so an existing index stays format 6
+or 7 until it is rebuilt.
 `wal_mode` (`auto` | `generic` | `rmgr`, default `auto`): which WAL resource manager this index is
 logged through (DESIGN.md §25).  Measured on a release build: the 8-client hot-key insert burst goes
 from 765 to 1275 tps (p95 14.8 to 9.9 ms, against btree's 1632 / 7.8), 10,000 inserts into the
@@ -512,8 +517,9 @@ directory's height, its leaf and internal pages and whether that column is `orde
 key type with no btree opclass, whose entries are then in a complete but arbitrary order), the
 column's entries, its containers by kind, its sparse segments, its posting trees' internal pages and
 tallest height, `null_tids`, the number of rows whose key in that column is NULL, and `empty_tids`,
-the number of rows a multi-key opclass extracted no key from, and `ndistinct`, the distinct keys
-the planner is given for the column (DESIGN.md §33; NULL where none is recorded).  `slack_bytes` and
+the number of rows a multi-key opclass extracted no key from, `ndistinct`, the distinct keys
+the planner is given for the column (DESIGN.md §33; NULL where none is recorded), and, last,
+`narrow_containers`, the column's NARROW containers (DESIGN.md §38).  `slack_bytes` and
 `inline_slack_bytes` are the growth slack inserts leave inside items and inside INLINE entry
 payloads (DESIGN.md §4), which is space a later insert into the same key grows into for free; a
 bulk-built index has none of either.  The counters that describe the
@@ -829,6 +835,13 @@ and Lion is not smaller for every distribution.
 At 5M rows, Lion uses about **25% less space than B-tree** and **23% more than GIN**;
 at 1M, it uses about **15% more than either**. Its scalar build takes roughly **2.8–2.9×**
 the B-tree time. The additional high-cardinality and skew indexes matter to these totals.
+
+These runs predate NARROW containers (DESIGN.md §38). On a table whose heap pages hold fewer than
+128 rows each - rows of 64 bytes or more - a dense container is a 1032-byte NARROW where it was a
+4104-byte bitset, seven to a page instead of one: a two-valued column of 2M synthetic rows, 65 to a
+page, went from 30.93 to 4.65 bits a row (GIN: 8.91), and its counts and GROUP BYs from 2.8 to 4
+times faster. Tables of narrower rows, and columns whose containers are arrays or runs, are
+unchanged.
 
 | Dataset | Family | Build seconds | Index MiB |
 | --- | --- | --- | --- |
