@@ -52,6 +52,7 @@ double		lion_descent_cost;
 double		lion_union_set_cost;
 double		lion_recheck_tid_cost;
 double		lion_recheck_group_tid_cost;
+double		lion_resident_page_cost;
 double		lion_entry_count_cost;
 double		lion_list_group_cost;
 double		lion_distinct_test_cost;
@@ -137,6 +138,8 @@ static const LionCostSetting lion_cost_settings[] = {
 	 "Sets the planner's estimate of the cost of each candidate row of a lion count's heap recheck"},
 	{"pg_lion.recheck_group_tid_cost", &lion_recheck_group_tid_cost, 6.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each candidate row of a grouped lion count's heap recheck"},
+	{"pg_lion.resident_page_cost", &lion_resident_page_cost, 120.0, LION_OP,
+	 "Sets the planner's estimate of the cost of each page of a resident lion index that a lion count reads"},
 
 	/* lion_plan_cost.c: the count's walks (§20, §26, §28, §32) */
 	{"pg_lion.entry_count_cost", &lion_entry_count_cost, 50.0, LION_TUPLE,

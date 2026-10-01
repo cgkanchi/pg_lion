@@ -6096,7 +6096,8 @@ Two ways out, neither taken here:
   would have to apply to walked pages as much as to probed ones, which moves every estimate in this
   model, so it needs its own pass over every pin in `test/sql/pushdown.sql` - the 20000-group
   refusal of §10 and the 200x20 refusal of §20 are the ones to watch, since both are refusals the
-  node deserves.
+  node deserves. *TAKEN in §39 ("Resident index pages", 2026-10-01): `lion_index_page_cost()`,
+  `pg_lion.resident_page_cost`, walked and probed pages alike, for the custom paths' counts.*
 
 Format: LION_VERSION 5. *(Deviation: this section planned to share §21's version 4, because the two
 were meant to land in one wave; §21 shipped first, so the bump is separate. The page HEADER did not
@@ -16719,3 +16720,50 @@ cost the most - 1.5 to 13 times - are formula errors priced far from the tie (§
 0.58 of the nested loop and 3.1 times slower, which the nested loop's rate now prices), and a margin
 low enough to catch them refuses real wins: the repro's `GROUP BY c200`, converted, is priced at 0.53
 of the hash aggregate and runs 1.9 times faster. The matrix below is what confirms or moves it.
+
+### Resident index pages: §22's third rung
+
+§22's open item, taken: a page of a lion index that a custom path reads is priced as the buffer hit
+it is when the index is resident, `lion_index_page_cost()`, a third rung below `seq_page_cost`.
+
+- **Why only lion's index.** `lion_heap_page_cost()` argues a page from `random_page_cost` down to
+  `seq_page_cost` by residency and stops there, because for a HEAP page the competing plan reads the
+  same page and pays the same convention. Lion's index is not read by its competitor. A BitmapAnd
+  of btrees is charged CPU per TID for the same rows, a hash aggregate its rows; the node was
+  charged a device read for each page of a small hot index, and per microsecond of real time ran at
+  about thirty times its competitor's rate on §22's `c20k = 77 AND c200 = 17 AND c2 = 1` (117.6
+  against the BitmapAnd's 62.1, for 0.25 ms against 0.88).
+- **Residency** is core's measure of what stays cached, as `index_pages_fetched()` prorates it:
+  `effective_cache_size` over the query's table pages (`root->total_table_pages`) plus the index's
+  own, at most 1. A page costs `device - resident x (device - hit)`, where `device` is what it was
+  priced at before - `seq_page_cost` for a page walked in order, `lion_heap_page_cost()`'s price for a
+  page a probe touches - and `hit` is `pg_lion.resident_page_cost`, 120 `cpu_operator_cost` (0.3
+  units): §10's warm page read in order, 0.6 us against the 2 us that `seq_page_cost` stands for at
+  500 units a millisecond (the posting leaves a probe's seeks cross fit at 0.7, a directory page
+  descended at 0.6 with its search). Never above `device`: a page core prices lower keeps core's
+  price. The hit is CPU and `device` is a page, so under §39's units the hit is converted with the
+  rate and the page is not, as every other term is.
+- **Walked and probed alike**, as §22 asked: the driver's walk of its sets and the other sources'
+  probes of theirs (`lion_cost_set_pages()`), a GROUP BY's entry scan and a second column's
+  (`lion_count_rel_entry_scan()`, `lion_count_rel_pair_cost()`), a range's leaves read again by a
+  parallel walk, the top k's descents (§36), the aggregates' walk of entry headers (§37), and the
+  decoded walk's pages (§34).
+- **Not here.** The one directory leaf of a single key's lookup keeps `random_page_cost`, as
+  `btcostestimate()` charges btree's leaf and lion's own scans charge theirs; so do a collected
+  range's sums and the heap pages of a recheck. The FK-side join's probed posting pages already
+  are priced as the warm pages they were measured as (`fkjoin_probe_page_cost`, 270 ns a page, §27). The AM's own scans
+  (`lioncostestimate()`) compete with core's index scans, which charge their own pages as device
+  reads; they keep the convention.
+
+**What it moves.** Every count's estimate, by the pages it reads: the selective counts most, whose
+price is mostly pages - §22's case comes to about 48 before the margin and 60 after, against the
+BitmapAnd's 62.1, an estimate the regression suite and the matrix have to confirm - and the large
+GROUP BYs least, whose price is per-group work. Both refusals §22 named stay refusals on the
+arithmetic: §10's 20000 groups at 5M rows cost 502,000 against the hash aggregate's 142,000, and
+their entry pages are a few hundred units of it, so in the hash aggregate's units and over the margin
+it is still 264,000; §20's 200 x 20 is refused by its pairs' member term, and its two entry scans
+are a few pages. In units a millisecond the 20000-group never-vacuumed table (40.8 ms against 28.0)
+and the 200 x 20 (60.7 against 36.8) stay refused as long as lion's price for them is more than 1.9
+times the hash aggregate's (0.42 over 0.8), which an honest price - 3.6 and 4.1 times, at 500 and
+200 units a millisecond - is; `test/sql/pushdown.sql` pins both, and a regenerated expected output
+that loses either is a regression of this rung.
