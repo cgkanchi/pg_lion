@@ -2382,7 +2382,8 @@ count competes with a hash aggregate on close to equal terms, the aggregate wins
 loses on the machine (§31 lists the cases). Pricing lion at the hash aggregate's rate instead would
 make it beat sequential and index-only scans it is up to twice as slow as. *(Since 2026-10-01 a
 lion custom path is priced at the rate of the plan it competes with - its CPU terms times that
-kind of plan's rate over this reference, its pages as here (§39).)*
+kind of plan's rate over this reference, its pages as here - and has to beat it by a margin
+(§39).)*
 
 **The merge** (`lion_merge_cpu_cost()`; every count, every group and pair of a GROUP BY, the AND of
 a lion index scan's sets in `lioncostestimate()` - since 2026-09-28 with the lookups, unions and
@@ -14757,6 +14758,9 @@ what the defaults are fitted to:
   ratios, units a millisecond, are what the model says each plan does per unit of time; a lion
   path well above the competitor's ratio is overpriced, and well below it underpriced, which is
   the mispick waiting to happen. Core's own CPU-bound scans ran at 400 to 700 (§10, "The units").
+  *(Since §39 a lion path's cost is in its competitor's units and over a margin: set
+  `pg_lion.pushdown_margin` and every `pg_lion.*_rate` to 1 to read lion's own, and calibrate the
+  rates themselves against core's plans the same way.)*
 - Which setting to move is the one whose term dominates the path's price, read against the
   node's counters: `Containers Visited`, `Directory Pages Read` and `Heap TIDs Rechecked` of a
   count are the containers, the descents and the recheck candidates `container_cost`,
@@ -16673,3 +16677,45 @@ everything else (`OTHER`: a function scan, a MinMaxAgg, a nested loop over a mat
 
 `SET client_min_messages = debug2` logs, for each lion path priced, the kind it was priced against,
 that path's cost and the rate.
+
+### The margin
+
+`pg_lion.pushdown_margin`, default **0.8**: a lion custom path's own price, in its competitor's
+units, is divided by the margin before the path is offered to `add_path()`, so that a lion path is
+chosen only where its price comes to at most 0.8 of the best core plan's - a near tie, within 25%,
+goes to core. It applies to every lion custom path - LionCount (serial, parallel, partitioned, the
+FK-side join), LionSemiJoin, LionAntiJoin and LionOrdered (startup and total alike) - and to the
+node's own price only, as the rates do: core's nodes around it are not marked up. 1 is no margin,
+the behaviour before this section. The AM's own scans compete inside core's path machinery on their
+plain cost, unmarked.
+
+**Divided, not declined.** Not adding the path would be cheaper and would leave EXPLAIN's costs
+alone, but it decides once, against the paths the relation has at that moment, and two of lion's
+paths meet their competitors later:
+
+- a join rel gets paths of core's after `set_join_pathlist_hook` has run - the right semi join, the
+  unique-ified inner join, the same rel reached by another split, the Gather over its partial
+  paths - which a decline made earlier never saw;
+- a path whose worth is its order or its first rows - LionOrdered under `ORDER BY ... LIMIT`, a
+  GROUP BY's groups in key order, a semi join under a LIMIT - is not dominated by the cheapest path
+  of its relation at all; it meets its competitor above the relation, in a Sort it saves or a
+  LIMIT's fraction of a path, long after it is added. Declined against the cheapest total cost it
+  would lose every LIMIT; declined only by dominance, the margin would never apply to it.
+
+A divided price carries the margin into every comparison it is in, whenever and wherever that is
+made, and forcing a plan works as it did: core's `enable_*` settings disable core's paths
+(`disabled_nodes` on PostgreSQL 18, `disable_cost` before it), which lose to an enabled lion path
+whatever its price, and `pg_lion.enable_*` leave lion's out. What it costs is that a lion path's cost
+in EXPLAIN is its price over the margin; a bench reading lion's own units a millisecond sets the
+margin to 1, and each rate to 1, first.
+
+**0.8, from what is known.** Taking the cheaper of two plans minimizes the expected time when the
+estimates are exact. When one of them carries a log-normal error of spread sigma - lion's, whose
+fit §10 left at a median residual of 27% and whose 35 re-costed counts span 283 to 3,724 units a
+millisecond - the rule that minimizes it takes that one only below `exp(-sigma^2 / 2)` of the
+other's price: 0.78 to 0.88 for sigma 0.5 to 0.7. Below it the margin buys little: the losses that
+cost the most - 1.5 to 13 times - are formula errors priced far from the tie (§31's `eq s.c1m in
+1000`, the node at 0.47 of the index-only scan and 3.1 times slower; `fk fwd tsq dim2 1.2k`, at
+0.58 of the nested loop and 3.1 times slower, which the nested loop's rate now prices), and a margin
+low enough to catch them refuses real wins: the repro's `GROUP BY c200`, converted, is priced at 0.53
+of the hash aggregate and runs 1.9 times faster. The matrix below is what confirms or moves it.

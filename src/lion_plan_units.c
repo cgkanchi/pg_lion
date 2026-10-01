@@ -369,9 +369,28 @@ lion_units_for(RelOptInfo *rel, LionUnits *u)
 	u->rate = lion_competitor_rate(u->kind);
 	if (u->rate <= 0.0)
 		u->rate = 1.0;
-	elog(DEBUG2, "lion: priced against a %s, cost %.2f, at rate %g",
+	u->margin = lion_units_margin();
+	elog(DEBUG2, "lion: priced against a %s, cost %.2f, at rate %g and margin %g",
 		 lion_competitor_names[u->kind],
-		 (best != NULL) ? best->total_cost : 0.0, u->rate);
+		 (best != NULL) ? best->total_cost : 0.0, u->rate, u->margin);
+}
+
+/*
+ * THE MARGIN (DESIGN.md §39): the share of the best core plan's cost a lion
+ * path's own price must come to, pg_lion.pushdown_margin.  The price is
+ * divided by it rather than the path declined: a join rel gets paths of
+ * core's after set_join_pathlist_hook has run, and a path whose worth is its
+ * order or its first rows - LionOrdered under a LIMIT, the count's sorted
+ * groups - meets its competitor above the relation, in a Sort or a LIMIT's
+ * fraction of a path, which a decision made when it is added cannot see.
+ * Divided, the price carries the margin into every comparison it is in, and
+ * core's enable_* settings and lion's own switches force a plan as they did:
+ * a disabled path loses to it whatever its cost.
+ */
+double
+lion_units_margin(void)
+{
+	return (lion_pushdown_margin > 0.0) ? lion_pushdown_margin : 1.0;
 }
 
 /*
@@ -393,11 +412,11 @@ lion_units_end(void)
 
 /*
  * A lion path's own price, summed between lion_units_begin() and
- * lion_units_end(), in the competitor's units: the CPU terms times the rate,
- * the pages as core prices them.
+ * lion_units_end(), in the competitor's units - the CPU terms times the rate,
+ * the pages as core prices them - and offered at the margin.
  */
 Cost
 lion_units_price(const LionUnits *u, Cost own)
 {
-	return own * u->rate;
+	return own * u->rate / u->margin;
 }

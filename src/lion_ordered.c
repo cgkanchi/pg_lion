@@ -1472,12 +1472,20 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 	*total_p = startup + run;
 }
 
-/* One LionOrdered path, offered to add_path() (DESIGN.md §30.2, step 3). */
+/*
+ * One LionOrdered path, offered to add_path() (DESIGN.md §30.2, step 3) at
+ * pg_lion.pushdown_margin (§39): its price divided by the margin, startup
+ * and total alike, so that whatever it is compared with - the btree scan it
+ * walks, a Sort over another path, a LIMIT's fraction of either - it is
+ * taken only by that margin.  Its competitors are the relation's scans, which
+ * are lion's reference units already: it has no rate.
+ */
 static void
 lo_add_path(RelOptInfo *rel, List *pathkeys, List *priv, double rows,
 			Cost startup, Cost total)
 {
 	CustomPath *cp = makeNode(CustomPath);
+	double		margin = lion_units_margin();
 
 	cp->path.pathtype = T_CustomScan;
 	cp->path.parent = rel;
@@ -1487,8 +1495,8 @@ lo_add_path(RelOptInfo *rel, List *pathkeys, List *priv, double rows,
 	cp->path.parallel_safe = false;
 	cp->path.parallel_workers = 0;
 	cp->path.rows = rows;
-	cp->path.startup_cost = startup;
-	cp->path.total_cost = total;
+	cp->path.startup_cost = startup / margin;
+	cp->path.total_cost = total / margin;
 	cp->path.pathkeys = pathkeys;
 	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cp->custom_paths = NIL;

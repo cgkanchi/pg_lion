@@ -638,7 +638,8 @@ plans run at rates of their own - a hash aggregate at about 200, a nested loop i
 cheapest PostgreSQL plan it competes with: its CPU terms times that kind of plan's rate below, its
 pages as PostgreSQL prices pages, so its cost in `EXPLAIN` is that plan's units. Set a rate to 1 to
 price Lion's CPU as fitted against that kind of plan; `SET client_min_messages = debug2` logs which
-kind each path was priced against.
+kind each path was priced against, at which rate and margin. To read Lion's own cost units a
+millisecond when calibrating the cost settings above, set every rate and the margin below to 1.
 
 | `pg_lion.` | default | the PostgreSQL plans it is the rate of, as a multiple of 500 units a millisecond |
 |---|---|---|
@@ -648,6 +649,12 @@ kind each path was priced against.
 | `mergejoin_rate` | 1.0 | a merge join |
 | `nestloop_rate` | 2.0 | a nested loop into a parameterized index or bitmap scan |
 | `bitmap_rate` | 1.0 | a bitmap heap scan |
+
+`pg_lion.pushdown_margin` (0.8): the share of the cheapest competing plan's cost a Lion custom path
+(`LionCount`, `LionSemiJoin`, `LionAntiJoin`, `LionOrdered`) must be priced at to be chosen: its
+own price is divided by it, so a near tie goes to PostgreSQL's plan, and its cost in `EXPLAIN` is
+marked up by it. 1 is no margin. PostgreSQL's `enable_*` settings and Lion's switches above still
+force a plan either way.
 
 ## Known limitations
 

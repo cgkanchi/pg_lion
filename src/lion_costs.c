@@ -81,6 +81,7 @@ double		lion_hashjoin_rate;
 double		lion_mergejoin_rate;
 double		lion_nestloop_rate;
 double		lion_bitmap_rate;
+double		lion_pushdown_margin;
 
 typedef struct LionCostSetting
 {
@@ -276,6 +277,22 @@ lion_costs_init(void)
 								 GUC_EXPLAIN,
 								 NULL, NULL, NULL);
 	}
+
+	/*
+	 * THE MARGIN (DESIGN.md §39): a lion custom path's own price, converted
+	 * into its competitor's units, is divided by it - so a lion path is
+	 * chosen only where its price is at most this share of the best core
+	 * path's, and a near tie goes to core.  Its default is §39's.
+	 */
+	DefineCustomRealVariable("pg_lion.pushdown_margin",
+							 "Sets the share of the cheapest competing plan's cost a lion custom path's own price must come to for it to be chosen.",
+							 "The price of a LionCount, LionSemiJoin, LionAntiJoin or LionOrdered path is divided by it (DESIGN.md §39); 1 is no margin.",
+							 &lion_pushdown_margin,
+							 0.8,
+							 0.01, 1.0,
+							 PGC_USERSET,
+							 GUC_EXPLAIN,
+							 NULL, NULL, NULL);
 
 	MemoryContextSwitchTo(oldcxt);
 }
