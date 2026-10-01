@@ -15,6 +15,9 @@
 #   SOAK_DURATION       seconds of load per mode [600]
 #   SOAK_ARGS           more soak.sh options ("--rows 100000 --readers 1")
 #   SOAK_RUN_AS         the user the cluster runs as, when this runs as root
+#   SOAK_SERVER_OPTS    more server options for the restart, e.g.
+#                       "-c shared_buffers=16MB" (a pool small enough that
+#                       long lists run past the pin budget: DESIGN.md §15)
 #   SOAK_STANDBY_PORT   [port + 1]   SOAK_STANDBY_SOCK  [<socket dir>-standby]
 #   SOAK_STANDBY_DATA   [.local/soak-standby]
 #   LION_SOCK, LION_PORT  as for dev.sh
@@ -59,9 +62,9 @@ trap restore EXIT
 rc=0
 stamp=$(date +%Y%m%d-%H%M%S)
 for mode in $MODES; do
-	opts=""
+	opts="${SOAK_SERVER_OPTS:-}"
 	standby=()
-	[ "$mode" = rmgr ] && opts="-c shared_preload_libraries=pg_lion"
+	[ "$mode" = rmgr ] && opts="$opts -c shared_preload_libraries=pg_lion"
 	if [[ " $SB_MODES " == *" $mode "* ]]; then
 		opts="$opts -c max_wal_senders=4"
 		standby=(--standby-port "$SB_PORT" --standby-sock "$SB_SOCK" --standby-data "$SB_DATA")
