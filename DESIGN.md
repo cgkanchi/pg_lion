@@ -16713,3 +16713,18 @@ bitmap scans, `lion_index_count()` and the count pushdown against a sequential s
 and at offset 128 (same-page UPDATEs past a fillfactor), VACUUM making NARROWs, ARRAYs and nothing
 in a version 6 index, and REINDEX. `test/sql/corrupt_items.sql`: a NARROW whose cardinality is
 wrong, and one in an index whose meta page says version 6.
+
+Eight existing tests changed with NARROW, because sets on wide rows are a quarter the size and the
+probe heuristics read NARROWs as bitmaps. `spill.sql`, `groupwhere.sql` §7, `fkjoin_perkey.sql` §3
+and `ordered.sql` §10 size a set to outgrow a 64 kB work_mem; on rows of 64 bytes and more it no
+longer does, so each now runs on narrow rows (157 or 185 to a page), and more of them, with
+fkjoin_perkey and ordered getting tables of their own (`lion_pkb`, `lon`) so that their other
+sections stay as they were. `scanand.sql` §6 counts posting pages and wants d0's and d1's containers
+to be bitsets, a page each: narrow rows again. `count_split_race.spec` grows a leaf's ARRAYs until
+it splits, and its ARRAYs of 768 members had become NARROWs, which an insert below offset 128 does
+not grow: its pad is wider, 15 rows a page and 480 members a key. `treeprobe.sql`: filter 6's AND of
+three NARROWs is built at 34 of its 35 keys, where its ARRAYs were probed at all of them, and filter
+3's union with tree probing off is probed at all 35 keys, where it was built at 34.
+`fkjoin_adaptive.sql`: a probed key reads fewer posting pages, so the run's account grows more
+slowly against an unchanged price of collecting, and each run switches a key or a few later. Every
+answer is the same as before.
