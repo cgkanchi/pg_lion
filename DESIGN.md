@@ -11493,6 +11493,30 @@ the other columns' containers at their own size, so it makes at most as many wal
 *(Added 2026-09-25: before it, `a BETWEEN 1 AND 900000 AND b = 5` over a million unique `a` was
 priced at two thirds of the sequential scan and ran 1.4 to 1.6 times as long.)*
 
+**An entry's price, and how many keys a range holds (2026-10-01).** An entry walked was charged a
+`cpu_index_tuple_cost` (10 ns at §10's 500 units a millisecond) and an operator per bound. Timed on
+the release build over 16 bitmap index scans of ClickBench's 5M-row table - `<>` and ranges on
+columns of 16 to 3.4M keys, 25,000 to 5M rows - the walk costs some 200 ns an entry beside 73 ns a
+row (300 for a text key, 100 to 150 for an int8), so a walk of many keys ran at 44 to 263 units a
+millisecond: `SearchPhrase <> ''`, 477,418 keys, was priced at 11,604 for 208 ms, where btree's
+walk of the same rows over its partial index was priced at 25,024 for 158. An entry is now
+`pg_lion.walk_entry_cost`, 40 `cpu_operator_cost` (200 ns), with the operator per bound beside it;
+those walks price at 210 to 775 units a millisecond. What the rows add to the bitmap stays priced
+per row as core prices btree's, which underprices both alike (btree's scans of scattered rows ran
+at 47 to 274 units a millisecond, at 100 to 320 ns a row): it is core's convention, not lion's.
+
+And the keys a range selects were `n_distinct x sel`, sel being the share of the ROWS. On a skewed
+column the two part: `SearchPhrase > 'm'` selects 12.7% of the rows and 95% of the keys, the 87% of
+rows whose phrase is `''` being one key outside it - priced as 60,000 entries, 454,471 walked. The
+column's most common values are now tested against the bounds and count a key each, and only the
+rest of sel is spread over the other keys, as their rows are (`lion_cost_range_keyfrac()`); a
+bound that is not the column against a constant, or a column without an MCV list, keeps `sel`.
+`rangeprobe.sql`'s range beside a one-row equality, whose plain scan walks 28,441 keys to AND them
+with it, now prices above the sequential scan of 30,000 rows; the two run within each other's noise
+(3.0 to 4.7 ms against 3.6 to 5.3). Not done: the count pushdown's range walks
+(`lion_range_entries()`) still take `n_distinct x sel` - their row share serves the pages and the
+recheck as well, and splitting the two runs through every function that prices a count.
+
 ### Count pushdown: a range BOUNDS the driver, it is never a source
 
 The design question was whether a range should be a count SOURCE - the union of its entries, merged

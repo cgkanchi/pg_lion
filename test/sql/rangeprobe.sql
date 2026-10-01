@@ -109,7 +109,10 @@ SELECT lpr_rows($$SELECT * FROM lpr WHERE ts >= '2026-01-01 12:00'$$, NULL) =
 SELECT lpr_plan($$SELECT count(*) FROM lpr WHERE ts >= '2026-01-02 02:00'$$);
 SELECT lpr_plan($$SELECT sum(id) FROM lpr WHERE ts >= '2026-01-02 02:00'$$);
 SELECT lpr_plan($$SELECT count(*) FROM lpr WHERE v < 0$$);
--- a selective equality beside the range keeps lion's scan
+-- a selective equality beside the range: lion's scan walks every key of the
+-- range to AND them with the equality's one row (DESIGN.md §29.11), priced at
+-- what the walk costs since 2026-10-01 - as dear as the sequential scan, which
+-- is taken
 SELECT lpr_plan($$SELECT sum(id) FROM lpr WHERE ts >= '2026-01-02 02:00' AND c = 0 AND v = -700$$);
 -- and the answers are the sequential scan's
 SELECT count(*), sum(id) FROM lpr WHERE ts >= '2026-01-02 02:00';

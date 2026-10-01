@@ -620,8 +620,131 @@ lion_cost_col_ndistinct(PlannerInfo *root, IndexOptInfo *index, int c)
 }
 
 /*
+ * The share of key column c's KEYS a range's bounds select, where sel is the
+ * share of its ROWS.  The two are one only where every key holds as many rows
+ * as every other: `SearchPhrase > 'm'` selects 12.7% of ClickBench's rows and
+ * 95% of its 477,418 keys, the 87% of rows whose phrase is '' being one key
+ * outside the range.  So the column's most common values are tested against
+ * the bounds one by one and count a key each, and only the rest of sel - what
+ * the bounds select among the other values - is spread over the other keys,
+ * as the rows of those are.  sel itself where there is no MCV list to read,
+ * or a bound is anything but the column against a constant.
+ */
+static double
+lion_cost_range_keyfrac(PlannerInfo *root, IndexOptInfo *index, int c,
+						List *bounds, Selectivity sel)
+{
+	RangeTblEntry *rte;
+	VariableStatData vardata;
+	AttStatsSlot sslot;
+	FmgrInfo   *fn;
+	Datum	   *val;
+	bool	   *onleft;
+	Oid		   *coll;
+	double		nd;
+	double		frac = sel;
+	int			nb = list_length(bounds);
+	int			b;
+	ListCell   *lc;
+	Var		   *var;
+
+	if (bounds == NIL || index->indexkeys[c] <= 0)
+		return sel;
+	nd = lion_cost_col_ndistinct(root, index, c);
+	if (nd < 1.0)
+		return sel;
+
+	/* each bound a comparison of the column with a constant */
+	fn = (FmgrInfo *) palloc(sizeof(FmgrInfo) * nb);
+	val = (Datum *) palloc(sizeof(Datum) * nb);
+	onleft = (bool *) palloc(sizeof(bool) * nb);
+	coll = (Oid *) palloc(sizeof(Oid) * nb);
+	b = 0;
+	foreach(lc, bounds)
+	{
+		Node	   *clause = (Node *) lfirst_node(RestrictInfo, lc)->clause;
+		OpExpr	   *op;
+		Node	   *l;
+		Node	   *r;
+
+		if (!IsA(clause, OpExpr) || list_length(((OpExpr *) clause)->args) != 2)
+			return sel;
+		op = (OpExpr *) clause;
+		l = (Node *) linitial(op->args);
+		r = (Node *) lsecond(op->args);
+		while (l != NULL && IsA(l, RelabelType))
+			l = (Node *) ((RelabelType *) l)->arg;
+		while (r != NULL && IsA(r, RelabelType))
+			r = (Node *) ((RelabelType *) r)->arg;
+		if (l != NULL && IsA(l, Var) && r != NULL && IsA(r, Const) &&
+			!((Const *) r)->constisnull)
+		{
+			onleft[b] = true;
+			val[b] = ((Const *) r)->constvalue;
+		}
+		else if (r != NULL && IsA(r, Var) && l != NULL && IsA(l, Const) &&
+				 !((Const *) l)->constisnull)
+		{
+			onleft[b] = false;
+			val[b] = ((Const *) l)->constvalue;
+		}
+		else
+			return sel;
+		fmgr_info(get_opcode(op->opno), &fn[b]);
+		coll[b] = op->inputcollid;
+		b++;
+	}
+
+	rte = planner_rt_fetch(index->rel->relid, root);
+	var = makeVar(index->rel->relid, index->indexkeys[c],
+				  get_atttype(rte->relid, index->indexkeys[c]),
+				  -1, index->indexcollations[c], 0);
+	examine_variable(root, (Node *) var, index->rel->relid, &vardata);
+	if (HeapTupleIsValid(vardata.statsTuple) &&
+		get_attstatsslot(&sslot, vardata.statsTuple, STATISTIC_KIND_MCV,
+						 InvalidOid, ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS))
+	{
+		double		nullfrac = ((Form_pg_statistic)
+								GETSTRUCT(vardata.statsTuple))->stanullfrac;
+		double		allmcv = 0.0;
+		double		inmcv = 0.0;
+		double		nin = 0.0;
+		double		rest;
+		int			i;
+
+		for (i = 0; i < sslot.nvalues; i++)
+		{
+			bool		in = true;
+
+			allmcv += sslot.numbers[i];
+			for (b = 0; b < nb && in; b++)
+				in = DatumGetBool(onleft[b] ?
+								  FunctionCall2Coll(&fn[b], coll[b],
+													sslot.values[i], val[b]) :
+								  FunctionCall2Coll(&fn[b], coll[b],
+													val[b], sslot.values[i]));
+			if (in)
+			{
+				nin += 1.0;
+				inmcv += sslot.numbers[i];
+			}
+		}
+		rest = 1.0 - allmcv - nullfrac;
+		frac = nin;
+		if (rest > 0.0)
+			frac += Min(Max((sel - inmcv) / rest, 0.0), 1.0) *
+				Max(nd - sslot.nvalues, 0.0);
+		frac = Min(Max(frac / nd, 0.0), 1.0);
+		free_attstatsslot(&sslot);
+	}
+	ReleaseVariableStats(vardata);
+	return frac;
+}
+
+/*
  * How many entries ONE walk of key column c's range reads (DESIGN.md §28):
- * the keys between its bounds, about n_distinct(col) x sel of them - or, on
+ * the keys between its bounds, n_distinct(col) x keyfrac of them
+ * (lion_cost_range_keyfrac(); sel is the rows' share) - or, on
  * a column with SUMMARY posting sets (§32), the keys of the buckets at the
  * range's two ends one by one and ONE summary for every bucket it covers
  * whole, which is what lion_walk_begin() hands the bitmap and the plain scan
@@ -636,10 +759,11 @@ lion_cost_col_ndistinct(PlannerInfo *root, IndexOptInfo *index, int c)
  */
 static double
 lion_cost_walk_entries(PlannerInfo *root, IndexPath *path, int c,
-					   Selectivity sel, int nholes)
+					   Selectivity sel, double keyfrac, int nholes)
 {
 	IndexOptInfo *index = path->indexinfo;
-	double		nkeys = Max(1.0, lion_cost_col_ndistinct(root, index, c) * sel);
+	double		nkeys = Max(1.0, lion_cost_col_ndistinct(root, index, c) *
+							keyfrac);
 	Relation	indexrel;
 	LionState  *col;
 	LionSumShape shape;
@@ -712,10 +836,27 @@ lion_cost_ranges_entries(PlannerInfo *root, IndexPath *path, int c,
 		sel = (bounds == NIL) ? 1.0 :
 			clauselist_selectivity(root, bounds, index->rel->relid,
 								   JOIN_INNER, NULL);
-	entries = lion_cost_walk_entries(root, path, c, sel, nholes);
+	entries = lion_cost_walk_entries(root, path, c, sel,
+									 lion_cost_range_keyfrac(root, index, c,
+															 bounds, sel),
+									 nholes);
 	list_free(bounds);
 	return entries;
 }
+
+/*
+ * An entry a range or `<>` walk reads (DESIGN.md §28, §35): copied off its
+ * leaf, its key tested against every bound and its posting set located and
+ * opened - what the members it adds to the bitmap cost besides is the
+ * bitmap's, priced per row as core prices btree's.  Fitted on the release
+ * build (§10's units) to 16 bitmap index scans of ClickBench's 5M-row table,
+ * 16 to 3.4M entries and 25,000 to 5M rows: 200 ns an entry beside 73 ns a
+ * row, the entries of a text column some 300 and of an int8 one 100 to 150.
+ * It was a cpu_index_tuple_cost (10 ns), which made a walk of 477,418 keys
+ * cost 11,604 for 208 ms - 56 units a millisecond - where a btree's walk of
+ * the same rows was priced at 25,024 for 158.
+ */
+#define LION_WALK_ENTRY_COST	(lion_walk_entry_cost * cpu_operator_cost)
 
 /*
  * What the ENTRIES of the range walks of this path cost (DESIGN.md §28), on
@@ -777,7 +918,7 @@ lion_range_walk_cost(PlannerInfo *root, IndexPath *path, double *walkrows)
 
 				entries *= Max(1.0, ceil(containers / lion_walk_window()));
 			}
-			cost += entries * (cpu_index_tuple_cost +
+			cost += entries * (LION_WALK_ENTRY_COST +
 							   list_length(ranges) * cpu_operator_cost);
 			if (lion_cost_other_column(path, c))
 				*walkrows += sel * Max(index->rel->tuples, 0.0);
