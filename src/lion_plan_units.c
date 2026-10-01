@@ -196,21 +196,26 @@ lion_nestloop_probes_index(JoinPath *jp)
  * its top through the nodes that pass a scan's or a join's rows up, to the
  * first that says what its units are.
  *
- *	- an aggregate that hashes, anywhere on the way down - a Finalize Agg
- *	  over the Partial HashAggregates of a parallel plan included - is a
- *	  HASHED AGGREGATE: hashing is what core charges far below its time;
  *	- a join is its join method: a HASH JOIN, a MERGE JOIN, or a NESTED LOOP
- *	  into a parameterized index scan (an aggregate over it included; a
- *	  nested loop over anything else is OTHER);
- *	- a bitmap heap scan is a BITMAP heap scan, aggregated or not;
+ *	  into a parameterized index scan - aggregated or not, hashed or not: an
+ *	  aggregate over a join is the join's kind, whose rate was measured with
+ *	  the aggregate over it and whose rows are what the aggregate is fed;
+ *	- an aggregate that hashes, anywhere above a scan - a Finalize Agg over
+ *	  the Partial HashAggregates of a parallel plan included - is a HASHED
+ *	  AGGREGATE: hashing is what core charges far below its time;
+ *	- a bitmap heap scan is a BITMAP heap scan, aggregated by a plain or
+ *	  sorted aggregate or not;
  *	- a plain or sorted aggregate over a sequential, index-only or index scan
  *	  is an AGGREGATE over a scan, and the scan alone its own kind;
+ *	- a nested loop over anything else is OTHER, and so is anything else
+ *	  but under a hashed aggregate;
  *	- an Append is the kind of its dearest child, which most of its time is.
  */
 LionCompetitor
 lion_competitor_kind(Path *path)
 {
 	bool		aggregated = false;
+	bool		hashed = false;
 
 	while (path != NULL)
 	{
@@ -219,13 +224,13 @@ lion_competitor_kind(Path *path)
 			case T_AggPath:
 				if (((AggPath *) path)->aggstrategy == AGG_HASHED ||
 					((AggPath *) path)->aggstrategy == AGG_MIXED)
-					return LION_COMPETITOR_HASHAGG;
+					hashed = true;
 				aggregated = true;
 				break;
 			case T_GroupingSetsPath:
 				if (((GroupingSetsPath *) path)->aggstrategy == AGG_HASHED ||
 					((GroupingSetsPath *) path)->aggstrategy == AGG_MIXED)
-					return LION_COMPETITOR_HASHAGG;
+					hashed = true;
 				aggregated = true;
 				break;
 			case T_GroupPath:
@@ -237,16 +242,23 @@ lion_competitor_kind(Path *path)
 			case T_MergePath:
 				return LION_COMPETITOR_MERGEJOIN;
 			case T_NestPath:
-				return lion_nestloop_probes_index((JoinPath *) path) ?
-					LION_COMPETITOR_NESTLOOP : LION_COMPETITOR_OTHER;
+				if (lion_nestloop_probes_index((JoinPath *) path))
+					return LION_COMPETITOR_NESTLOOP;
+				return hashed ? LION_COMPETITOR_HASHAGG :
+					LION_COMPETITOR_OTHER;
 			case T_BitmapHeapPath:
-				return LION_COMPETITOR_BITMAP;
+				return hashed ? LION_COMPETITOR_HASHAGG :
+					LION_COMPETITOR_BITMAP;
 			case T_IndexPath:
+				if (hashed)
+					return LION_COMPETITOR_HASHAGG;
 				if (aggregated)
 					return LION_COMPETITOR_AGG;
 				return (path->pathtype == T_IndexOnlyScan) ?
 					LION_COMPETITOR_INDEXONLY : LION_COMPETITOR_INDEX;
 			case T_Path:
+				if (hashed)
+					return LION_COMPETITOR_HASHAGG;
 				if (path->pathtype != T_SeqScan)
 					return LION_COMPETITOR_OTHER;
 				return aggregated ? LION_COMPETITOR_AGG :
@@ -269,7 +281,8 @@ lion_competitor_kind(Path *path)
 							dearest = p;
 					}
 					if (dearest == NULL)
-						return LION_COMPETITOR_OTHER;
+						return hashed ? LION_COMPETITOR_HASHAGG :
+							LION_COMPETITOR_OTHER;
 					path = dearest;
 					continue;
 				}
@@ -278,7 +291,7 @@ lion_competitor_kind(Path *path)
 		}
 		path = lion_path_input(path);
 	}
-	return LION_COMPETITOR_OTHER;
+	return hashed ? LION_COMPETITOR_HASHAGG : LION_COMPETITOR_OTHER;
 }
 
 /*
