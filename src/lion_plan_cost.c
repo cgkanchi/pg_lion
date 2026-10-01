@@ -2163,6 +2163,8 @@ typedef struct LionCountRelCost
 	double		walked;			/* counts the merge runs: groups, pairs */
 	bool		whereonce;		/* the WHERE is collected once and the
 								 * groups counted in batches (§10) */
+	double		topk;			/* §36: the candidates counted, or 0 */
+	double		topkrows;		/* ... and the rows of their entries */
 } LionCountRelCost;
 
 /*
@@ -2755,7 +2757,13 @@ lion_count_rel_group_merge(LionCountRelCost *c)
 			c->root->simple_rte_array[c->rel->relid]->rtekind == RTE_RELATION)
 			gnd = lion_index_column_nd(c->root, c->rel, c->groupidx,
 									   c->groupcol - 1);
-		if (gnd > 0.0)
+		if (c->topk > 0.0)
+		{
+			/* §36: the candidates alone, the largest entries */
+			gm = c->topkrows / c->topk;
+			c->walked = c->topk;
+		}
+		else if (gnd > 0.0)
 		{
 			gm = c->tuples / gnd;
 			c->walked = Max(gnd * c->drivefrac, 1.0);
@@ -3137,7 +3145,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 				   List *ors, double numgroups,
 				   double outer_entries, double inner_entries, int distinct,
 				   double drivefrac, Var *rangevar, bool rangesum,
-				   LionRangeCost *rc)
+				   LionRangeCost *rc, double topk, double topkrows)
 {
 	LionCountRelCost c;
 	bool		sumshort;		/* §15: the IN list is summed, not merged */
@@ -3172,6 +3180,15 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	c.ingroups = numgroups;
 	c.recheckshare = 1.0;
 	c.walked = 1.0;
+
+	/*
+	 * The top k (DESIGN.md §36) counts its candidates' sets alone, and
+	 * rechecks their rows alone.
+	 */
+	c.topk = topk;
+	c.topkrows = Min(Max(topkrows, topk), c.tuples);
+	if (topk > 0.0)
+		c.recheckshare = c.topkrows / c.tuples;
 
 	/*
 	 * A sum over a range (DESIGN.md §28) prices its walk, its entries and its
@@ -3377,7 +3394,8 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 								  tfrac, rangevar,
 								  tranged == LION_RANGED_SUM && rangevar != NULL &&
 								  t->driveidx[0] != NULL,
-								  list_length(targets) == 1 ? rc : NULL);
+								  list_length(targets) == 1 ? rc : NULL,
+								  0.0, 0.0);
 
 		/*
 		 * A multi-key query the node only has at run time may need its
@@ -3414,6 +3432,101 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	 * row comes out.
 	 */
 	cpath->path.startup_cost = (outrows <= 1.0) ? run : 0.0;
+	cpath->path.total_cost = run;
+}
+
+/*
+ * THE TOP k BY COUNT (DESIGN.md §36): one table's GROUP BY of one column,
+ * `entries` entries of which the walk reads the headers of - the share
+ * drivefrac of them a range on the column leaves - and `cand` candidates,
+ * whose entries hold candrows rows, counted against the WHERE as the groups
+ * of any walk are, each found again by a descent of the directory.  Nothing
+ * comes out before the last candidate is counted.
+ */
+#define LION_TOPK_ENTRY_COST	(2.0 * cpu_operator_cost)
+
+void
+lion_cost_topk_path(PlannerInfo *root, CustomPath *cpath, List *targets,
+					List *whereclauses, List *wherekinds, List *ors,
+					double entries, double drivefrac, double cand,
+					double candrows, double outrows)
+{
+	LionCountTarget *t = (LionCountTarget *) linitial(targets);
+	List	   *tidx;
+	List	   *tcol;
+	List	   *tclauses;
+	List	   *tkinds;
+	List	   *tors;
+	Cost		run;
+
+	lion_target_lists(t, whereclauses, wherekinds, ors, &tidx, &tcol,
+					  &tclauses, &tkinds, &tors, NULL);
+	run = lion_cost_count_rel(root, t->rel, t->driveidx[0], t->drivecol[0],
+							  NULL, 0, tidx, tcol, tclauses, tkinds, tors,
+							  cand, cand, 0, LION_DISTINCT_NONE, drivefrac,
+							  NULL, false, NULL, cand, candrows);
+	run += lion_cost_recheck(root, t->rel, tidx, tcol, tclauses, tkinds, tors,
+							 lion_probe_rel_rows(root, t->rel), cand,
+							 t->rel->tuples);
+	run += entries * drivefrac * LION_TOPK_ENTRY_COST;
+	run += cand * (LION_PROBE_COST + LION_RANGE_DESCENT_PAGES * seq_page_cost);
+
+	cpath->path.rows = outrows;
+#if PG_VERSION_NUM >= 180000
+	cpath->path.disabled_nodes = 0;
+#endif
+	cpath->path.startup_cost = run;
+	cpath->path.total_cost = run;
+}
+
+/*
+ * THE AGGREGATES OVER LION COLUMNS' ENTRIES (DESIGN.md §37): one walk of each
+ * column's entries, idxs[c] and key column cols[c], with naggs[c] arguments
+ * evaluated at each entry.  On a heap the visibility map calls all-visible
+ * the walk reads the entries' headers alone; elsewhere it counts each entry
+ * as a GROUP BY of the column would.  Added to the sum over every row the
+ * path already prices when the target list has counts too (counts), and in
+ * place of it when it has not.
+ */
+#define LION_WAGG_ALLVISIBLE	0.999
+
+void
+lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
+					List *idxs, List *cols, List *naggs, bool counts)
+{
+	Cost		run = counts ? cpath->path.total_cost : 0.0;
+	bool		fast = (rel->allvisfrac >= LION_WAGG_ALLVISIBLE);
+	ListCell   *l1;
+	ListCell   *l2;
+	ListCell   *l3;
+
+	forthree(l1, idxs, l2, cols, l3, naggs)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(l1);
+		AttrNumber	col = (AttrNumber) lfirst_int(l2);
+		double		nagg = (double) lfirst_int(l3);
+		double		nd = lion_index_column_nd(root, rel, idx, col - 1);
+		double		pages;
+
+		if (nd <= 0.0)
+			nd = Max(rel->tuples, 1.0);
+		pages = Max(1.0, (double) idx->pages *
+					lion_index_column_share(root, rel, idx, col));
+		run += nd * nagg * 2.0 * cpu_operator_cost;
+		if (fast)
+			run += pages * seq_page_cost + nd * LION_TOPK_ENTRY_COST;
+		else
+			run += lion_cost_count_rel(root, rel, idx, col, NULL, 0,
+									   NIL, NIL, NIL, NIL, NIL, nd, nd, 0,
+									   LION_DISTINCT_NONE, 1.0, NULL, false,
+									   NULL, 0.0, 0.0);
+	}
+
+	cpath->path.rows = 1.0;
+#if PG_VERSION_NUM >= 180000
+	cpath->path.disabled_nodes = 0;
+#endif
+	cpath->path.startup_cost = run;
 	cpath->path.total_cost = run;
 }
 
@@ -3477,7 +3590,8 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	run = lion_cost_count_rel(root, rel, t->driveidx[0], t->drivecol[0],
 							  NULL, 0, tidx, tcol, tclauses, tkinds, tors,
 							  groupest[0], groupest[0], 0,
-							  LION_DISTINCT_NONE, 1.0, NULL, false, NULL);
+							  LION_DISTINCT_NONE, 1.0, NULL, false, NULL,
+							  0.0, 0.0);
 	run += lion_cost_recheck(root, rel, tidx, tcol, tclauses, tkinds, tors,
 							 lion_probe_rel_rows(root, rel), groupest[0],
 							 rel->tuples);

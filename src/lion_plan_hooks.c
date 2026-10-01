@@ -16,6 +16,7 @@
 bool		lion_enable_count_pushdown = true;
 bool		lion_enable_filter_switch = true;
 bool		lion_enable_decoded_walk = true;
+bool		lion_enable_topk = true;
 create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 bool		lion_enable_semijoin = true;
 set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook = NULL;
@@ -452,6 +453,69 @@ lion_groupn_col(List *attnos, AttrNumber attno)
 }
 
 /*
+ * An aggregate of DESIGN.md §37 in the tuple the node produces: agg over the
+ * entries of one of the columns in wattnos, weighted by their rows.  Appends
+ * it to *ctlist with its LION_TL_WAGG kind, what it computes to *wspecs - its
+ * LION_WAGG_* kind, its column's position in wattnos, the width of an integer
+ * argument, the aggregate and its input collation - and its argument to
+ * *wargs; and the column itself, once, as LION_TL_WKEY: the key the argument
+ * is evaluated on.  False for any other aggregate.  An aggregate already in
+ * *ctlist is done.
+ */
+static bool
+lion_wagg_add_target(Aggref *agg, Index rti, List *wattnos,
+					 List **ctlist, List **kinds, List **wspecs, List **wargs)
+{
+	AttrNumber	attno;
+	int			width = 0;
+	int			wkind = lion_wagg_classify(agg, rti, &attno, &width);
+	Node	   *arg;
+	List	   *vars;
+	int			c;
+	ListCell   *lc;
+
+	if (wkind == LION_WAGG_NONE)
+		return false;
+	c = 0;
+	foreach(lc, wattnos)
+	{
+		if ((AttrNumber) lfirst_int(lc) == attno)
+			break;
+		c++;
+	}
+	if (lc == NULL)
+		elog(ERROR, "LionCount: an aggregate over column %d, which is not walked",
+			 attno);
+
+	foreach(lc, *ctlist)
+	{
+		if (equal(((TargetEntry *) lfirst(lc))->expr, agg))
+			return true;
+	}
+	arg = (Node *) ((TargetEntry *) linitial(agg->args))->expr;
+	*wspecs = lappend(*wspecs, list_make5_int(wkind, c, width,
+											  (int) agg->aggfnoid,
+											  (int) agg->inputcollid));
+	*wargs = lappend(*wargs, copyObject(arg));
+	*ctlist = lappend(*ctlist,
+					  makeTargetEntry((Expr *) copyObject(agg),
+									  list_length(*ctlist) + 1, NULL, false));
+	*kinds = lappend_int(*kinds, LION_TL_WAGG(list_length(*wspecs) - 1));
+
+	vars = pull_var_clause(arg, PVC_RECURSE_PLACEHOLDERS);
+	foreach(lc, *ctlist)
+	{
+		if (equal(((TargetEntry *) lfirst(lc))->expr, linitial(vars)))
+			return true;
+	}
+	*ctlist = lappend(*ctlist,
+					  makeTargetEntry((Expr *) copyObject(linitial(vars)),
+									  list_length(*ctlist) + 1, NULL, true));
+	*kinds = lappend_int(*kinds, LION_TL_WKEY(c));
+	return true;
+}
+
+/*
  * Turn the path into a CustomScan.
  *
  * scan.scanrelid is 0 because this is an upper node, so custom_scan_tlist has
@@ -477,6 +541,9 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *groupnattnos;
 	AttrNumber	distattno;
 	List	   *dist;
+	List	   *wagg;
+	List	   *wspecs = NIL;
+	List	   *wargs = NIL;
 	ListCell   *lc;
 
 	/*
@@ -498,6 +565,7 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	groupnattnos = (groupn != NIL) ? (List *) linitial(groupn) : NIL;
 	dist = (List *) list_nth(best_path->custom_private, LION_PRIV_DISTINCT);
 	distattno = (dist != NIL) ? (AttrNumber) linitial_int(dist) : 0;
+	wagg = (List *) list_nth(best_path->custom_private, LION_PRIV_WAGG);
 
 	/*
 	 * A leaf of an OR constrains no column of the result (DESIGN.md §19), so
@@ -539,6 +607,12 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		ListCell   *l2;
 		bool		dup = false;
 
+		if (IsA(expr, Aggref) && wagg != NIL &&
+			lion_wagg_add_target((Aggref *) expr,
+								 (Index) linitial_int(ints),
+								 (List *) linitial(wagg), &ctlist, &kinds,
+								 &wspecs, &wargs))
+			continue;
 		if (IsA(expr, Aggref))
 		{
 			Aggref	   *agg = (Aggref *) expr;
@@ -650,6 +724,51 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			 */
 			kind = LION_TL_GROUPKEY;
 		}
+		else if (!contain_agg_clause(expr) && pull_var_clause(expr, 0) != NIL)
+		{
+			/*
+			 * An expression of the grouping columns (DESIGN.md §36): the node
+			 * emits the columns, and setrefs.c makes the expression over them
+			 * part of the plan's projection.  The planner let through no
+			 * other.
+			 */
+			List	   *vars = pull_var_clause(expr, 0);
+			ListCell   *l3;
+
+			foreach(l3, vars)
+			{
+				AttrNumber	attno = ((Var *) lfirst(l3))->varattno;
+				int			i;
+
+				if (groupattno != 0 && attno == groupattno)
+					kind = LION_TL_GROUPKEY;
+				else if (groupattno2 != 0 && attno == groupattno2)
+					kind = LION_TL_GROUPKEY2;
+				else if ((i = lion_groupn_col(groupnattnos, attno)) > 0)
+					kind = (i == 1) ? LION_TL_GROUPKEY2 : LION_TL_GROUPKEYN(i);
+				else
+					elog(ERROR, "LionCount: an expression of column %d, which is not grouped",
+						 attno);
+
+				dup = false;
+				foreach(l2, ctlist)
+				{
+					if (equal(((TargetEntry *) lfirst(l2))->expr, lfirst(l3)))
+					{
+						dup = true;
+						break;
+					}
+				}
+				if (dup)
+					continue;
+				ctlist = lappend(ctlist,
+								 makeTargetEntry((Expr *) copyObject(lfirst(l3)),
+												 list_length(ctlist) + 1,
+												 NULL, false));
+				kinds = lappend_int(kinds, kind);
+			}
+			continue;
+		}
 		else
 			elog(ERROR, "unexpected expression in LionCount target list");
 
@@ -693,6 +812,19 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	priv = list_copy(best_path->custom_private);
 	lfirst(list_nth_cell(priv, LION_PRIV_CONSTS)) = NIL;
 	lfirst(list_nth_cell(priv, LION_PRIV_HAVING)) = NIL;
+
+	/*
+	 * The aggregates over lion columns' entries (DESIGN.md §37): what each
+	 * computes, and its argument after the clause values, where setrefs.c
+	 * points its column at the key's place in custom_scan_tlist.
+	 */
+	if (wagg != NIL)
+	{
+		lfirst(list_nth_cell(priv, LION_PRIV_WAGG)) =
+			lappend(list_copy(wagg), wspecs);
+		cscan->custom_exprs = list_concat(list_copy(cscan->custom_exprs),
+										  wargs);
+	}
 
 	cscan->custom_scan_tlist = ctlist;
 	cscan->custom_relids = rel->relids;
