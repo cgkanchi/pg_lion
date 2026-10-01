@@ -339,7 +339,9 @@ RESET enable_nestloop;
 SELECT lion_dj_counter('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk', 'Containers Visited')
 	< lion_dj_counter('SELECT count(*) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk', 'Containers Visited') AS rows_test_existence;
 SELECT lion_dj_counter('SELECT count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3', 'Join Keys Looked Up');
--- the cost model's choice
+-- the cost model's choice.  The second is a near tie the hash join's rate
+-- (DESIGN.md §39) gives to the node, which is the slower here - 0.64 ms
+-- against the hash join's 0.47, assert build - a loss §39 accepts
 SELECT lion_dj_pick('SELECT count(DISTINCT d.attr) FROM lion_dd d WHERE EXISTS (SELECT 1 FROM lion_df f WHERE f.fk = d.pk AND f.x = 3)');
 SELECT lion_dj_pick('SELECT d.region, count(DISTINCT f.fk) FROM lion_df f JOIN lion_dd d ON d.pk = f.fk WHERE f.x = 3 AND f.t = ''t4'' GROUP BY d.region');
 
