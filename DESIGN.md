@@ -7915,7 +7915,12 @@ distinct count - the decline the backlog item asked for, with the cost model as 
   table costs 1.0 us, which is 50 `cpu_tuple_cost` at the 500 units a millisecond of §10's "The
   units"; the assert build measured 2 us with nothing to intersect and 3.4 us with a WHERE set to
   seek. Without it, a walk of 1000 entries of `k` under a WHERE that leaves 500 rows was chosen,
-  and took 3.4 ms against the bitmap scan and sort's 0.56.
+  and took 3.4 ms against the bitmap scan and sort's 0.56. In shape 1 it is charged per entry
+  WALKED, not per value the node emits: until 2026-10-01 it was the emitted values, the distinct
+  `k` the WHERE leaves, which ClickBench's `count(DISTINCT UserID) WHERE MobilePhoneModel <> ''`
+  (5M rows, release PostgreSQL 18) put at 281,060 tests where the walk made 3,413,988 - 275k cost
+  units against the bitmap scan's 437k, 9.1 s against 0.7. Charged per entry it costs 1.85M and is
+  left to core.
 - **The merges are §10's** (`lion_merge_cpu_cost()`, 2026-09-27): each entry's own set is a source
   of its test, which drives whenever it is the smaller, so a test over a selective WHERE costs its
   entry's containers and not the WHERE's share. With the old per-container charge `count(DISTINCT
