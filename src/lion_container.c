@@ -2,23 +2,28 @@
  * lion_container.c
  *	  Roaring-style containers for pg_lion.  See DESIGN.md §3.
  *
- *	  Three representations of a set of 15-bit "lo" values:
+ *	  Four representations of a set of 15-bit "lo" values:
  *
  *		ARRAY	uint16 lo[cardinality], strictly ascending, cardinality <= 2048
  *		BITSET	uint64 words[512], fixed 4096 bytes
  *		RUN		uint16 nruns, then nruns ascending, non-overlapping and
  *				non-adjacent (start, len_minus_1) pairs, nruns <= 1023
+ *		NARROW	uint64 words[128], fixed 1024 bytes: the offsets 0 .. 127 of
+ *				each of the 64 heap blocks (DESIGN.md §38, lion_container.h)
  *
- *	  Representation policy (DESIGN.md §3), enforced by the mutators:
+ *	  Representation policy (DESIGN.md §3, §38), enforced by the mutators:
  *		- adding to a full ARRAY (2048 members)			=> BITSET
  *		- adding to a RUN that would need a 1024th run	=> ARRAY when the
  *				members, the new one included, fit one (<= 2048), else BITSET
+ *		- adding to a NARROW a member at offset >= 128	=> BITSET
  *		- removing from a RUN so that a split would need a 1024th run
  *														=> the same
  *		- removing from a BITSET leaving <= 2048 members	=> ARRAY
+ *		- removing from a NARROW leaving <= 512 members	=> ARRAY
  *
- *	  lion_container_optimize() is the only function that searches for the
- *	  globally smallest representation.
+ *	  No mutator makes a NARROW: lion_container_optimize() is the only
+ *	  function that searches for the globally smallest representation, and
+ *	  the only one that chooses NARROW.
  *
  *	  This file depends only on c.h, port/pg_bitutils.h and the project
  *	  headers, so that it also builds standalone with -DFRONTEND for
@@ -71,6 +76,19 @@
 
 /* All-ones 64-bit word. */
 #define LION_ALL_ONES		UINT64CONST(0xFFFFFFFFFFFFFFFF)
+/* The words of one heap block in a BITSET: 8 at 8K. */
+#define LION_BITSET_WORDS_PER_BLOCK	(LION_BITSET_WORDS / LION_BLOCKS_PER_CONTAINER)
+/* The offsets of a block, as a mask of lo: 511 at 8K. */
+#define LION_OFFSET_MASK	((uint32) ((1 << LION_OFFSET_BITS) - 1))
+
+StaticAssertDecl(LION_BITSET_WORDS_PER_BLOCK * LION_BLOCKS_PER_CONTAINER ==
+				 LION_BITSET_WORDS,
+				 "pg_lion: bitset words do not divide evenly among heap blocks");
+StaticAssertDecl(LION_NARROW_OFFSETS % 64 == 0 &&
+				 LION_NARROW_WORDS_PER_BLOCK < LION_BITSET_WORDS_PER_BLOCK,
+				 "pg_lion: a NARROW block is whole words, fewer than a BITSET's");
+StaticAssertDecl(LION_NARROW_SIZE < LION_CONTAINER_MAX_SIZE,
+				 "pg_lion: a NARROW is smaller than a BITSET");
 /* Largest legal lo value. */
 #define LION_LO_MAX			((uint32) (LION_CONTAINER_RANGE - 1))
 /* A size that always loses the "smallest representation" comparison. */
@@ -117,7 +135,11 @@ typedef union LionContainerBuf
  *	  larger than LION_CONTAINER_MAX_SIZE either.
  *	- A member never indexes a bitset unmasked: bits_test() and friends take
  *	  lo & LION_LO_MASK.  A run's bounds are clamped to LION_LO_MAX by
- *	  run_last(), and a run that starts past it comes out empty.
+ *	  run_last(), and a run that starts past it comes out empty.  Every bit
+ *	  of a NARROW's payload is a legal member (an offset below 128), and a
+ *	  member at an offset it has no bit for is one it does not hold, which
+ *	  narrow_test() answers without an index: a NARROW's header has only its
+ *	  cardinality to claim, and that claim is treated as every BITSET's is.
  *	- The header's CARDINALITY is a claim, not a bound.  Every extraction
  *	  into a fixed-size array is bounded by the array, and a representation
  *	  change the claim allows but the payload contradicts (a BITSET that says
@@ -186,6 +208,19 @@ bitset_mdata(LionContainer *c)
 
 static inline const uint64 *
 bitset_cdata(const LionContainer *c)
+{
+	return (const uint64 *) ((const char *) c + LION_CONTAINER_HDRSZ);
+}
+
+/* A NARROW's LION_NARROW_WORDS words (DESIGN.md §38). */
+static inline uint64 *
+narrow_mdata(LionContainer *c)
+{
+	return (uint64 *) ((char *) c + LION_CONTAINER_HDRSZ);
+}
+
+static inline const uint64 *
+narrow_cdata(const LionContainer *c)
 {
 	return (const uint64 *) ((const char *) c + LION_CONTAINER_HDRSZ);
 }
@@ -285,7 +320,11 @@ container_clamp(LionContainer *c)
  *	LION_BITS_OR_NEW		d = a | b, |b & ~a|		or_inplace()
  *
  * d may be a or b - a word is read before it is written - and otherwise
- * overlaps neither; the ops that write nothing take NULL.
+ * overlaps neither; the ops that write nothing take NULL.  The same passes
+ * over a NARROW's LION_NARROW_WORDS words are narrow_kernel(d, a, b, op)
+ * (DESIGN.md §38): one kernel of each implementation takes the word count,
+ * and runs one of two passes compiled for it, so that a BITSET's is the
+ * code it was.
  *
  * Why.  The cardinality of a BITSET x BITSET AND was an AND into a 4 KB
  * image on the stack and a pg_popcount() of it, and the set algebra's
@@ -345,7 +384,7 @@ container_clamp(LionContainer *c)
  */
 
 typedef uint32 (*LionBitsKernel) (uint64 *d, const uint64 *a, const uint64 *b,
-								  LionBitsOp op);
+								  LionBitsOp op, uint32 nwords);
 
 /*
  * The portable kernel's popcount of a word.  __builtin_popcountll() is an
@@ -423,14 +462,14 @@ bits_word(uint64 *d, const uint64 *a, const uint64 *b, uint32 i,
 }
 
 /*
- * A pass a word at a time, op being a constant wherever this is inlined.
- * Four sums, so that neither their adds nor POPCNT's false dependency on its
- * destination (Intel, before Cannon Lake) chain the words: with one sum the
- * POPCNT AND_COUNT took 350 ns, with four 207.
+ * A pass a word at a time, op and nwords being constants wherever this is
+ * inlined.  Four sums, so that neither their adds nor POPCNT's false
+ * dependency on its destination (Intel, before Cannon Lake) chain the words:
+ * with one sum the POPCNT AND_COUNT took 350 ns, with four 207.
  */
 static pg_always_inline uint32
 bits_pass_words(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
-				bool hw)
+				bool hw, uint32 nwords)
 {
 	uint64		n0 = 0;
 	uint64		n1 = 0;
@@ -438,7 +477,7 @@ bits_pass_words(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
 	uint64		n3 = 0;
 	uint32		i;
 
-	for (i = 0; i < LION_BITSET_WORDS; i += 4)
+	for (i = 0; i < nwords; i += 4)
 	{
 		n0 += bits_popcount(hw, bits_word(d, a, b, i, op));
 		n1 += bits_popcount(hw, bits_word(d, a, b, i + 1, op));
@@ -454,13 +493,14 @@ bits_pass_words(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
  * the portable kernel's where a word's popcount is not an instruction.
  */
 static pg_always_inline uint32
-bits_pass_stored(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op)
+bits_pass_stored(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
+				 uint32 nwords)
 {
 	uint32		i;
 
-	for (i = 0; i < LION_BITSET_WORDS; i++)
+	for (i = 0; i < nwords; i++)
 		(void) bits_word(d, a, b, i, op);
-	return (uint32) pg_popcount((const char *) d, LION_BITSET_BYTES);
+	return (uint32) pg_popcount((const char *) d, nwords * sizeof(uint64));
 }
 #endif
 
@@ -473,9 +513,9 @@ bits_pass_stored(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op)
  * counts it with pg_popcount(), and RUNS and OR_NEW take a pg_popcount64()
  * a word.
  */
-static uint32
-bits_kernel_portable(uint64 *d, const uint64 *a, const uint64 *b,
-					 LionBitsOp op)
+static pg_always_inline uint32
+bits_portable_pass(uint64 *d, const uint64 *a, const uint64 *b,
+				   LionBitsOp op, uint32 nwords)
 {
 #ifndef LION_POPCOUNT64_INLINE
 	uint64		img[LION_BITSET_WORDS];
@@ -484,64 +524,92 @@ bits_kernel_portable(uint64 *d, const uint64 *a, const uint64 *b,
 	switch (op)
 	{
 		case LION_BITS_RUNS:
-			return bits_pass_words(d, a, b, LION_BITS_RUNS, false);
+			return bits_pass_words(d, a, b, LION_BITS_RUNS, false, nwords);
 		case LION_BITS_OR_NEW:
-			return bits_pass_words(d, a, b, LION_BITS_OR_NEW, false);
+			return bits_pass_words(d, a, b, LION_BITS_OR_NEW, false, nwords);
 #ifdef LION_POPCOUNT64_INLINE
 		case LION_BITS_COUNT:
-			return bits_pass_words(d, a, b, LION_BITS_COUNT, false);
+			return bits_pass_words(d, a, b, LION_BITS_COUNT, false, nwords);
 		case LION_BITS_AND_COUNT:
-			return bits_pass_words(d, a, b, LION_BITS_AND_COUNT, false);
+			return bits_pass_words(d, a, b, LION_BITS_AND_COUNT, false, nwords);
 		case LION_BITS_AND:
-			return bits_pass_words(d, a, b, LION_BITS_AND, false);
+			return bits_pass_words(d, a, b, LION_BITS_AND, false, nwords);
 		case LION_BITS_OR:
-			return bits_pass_words(d, a, b, LION_BITS_OR, false);
+			return bits_pass_words(d, a, b, LION_BITS_OR, false, nwords);
 		case LION_BITS_ANDNOT:
-			return bits_pass_words(d, a, b, LION_BITS_ANDNOT, false);
+			return bits_pass_words(d, a, b, LION_BITS_ANDNOT, false, nwords);
 #else
 		case LION_BITS_COUNT:
-			return (uint32) pg_popcount((const char *) a, LION_BITSET_BYTES);
+			return (uint32) pg_popcount((const char *) a,
+										nwords * sizeof(uint64));
 		case LION_BITS_AND_COUNT:
-			return bits_pass_stored(img, a, b, LION_BITS_AND);
+			return bits_pass_stored(img, a, b, LION_BITS_AND, nwords);
 		case LION_BITS_AND:
-			return bits_pass_stored(d, a, b, LION_BITS_AND);
+			return bits_pass_stored(d, a, b, LION_BITS_AND, nwords);
 		case LION_BITS_OR:
-			return bits_pass_stored(d, a, b, LION_BITS_OR);
+			return bits_pass_stored(d, a, b, LION_BITS_OR, nwords);
 		case LION_BITS_ANDNOT:
-			return bits_pass_stored(d, a, b, LION_BITS_ANDNOT);
+			return bits_pass_stored(d, a, b, LION_BITS_ANDNOT, nwords);
 #endif
 	}
 	Assert(false);
 	return 0;
 }
 
+/*
+ * Every kernel takes the words a pass covers, which is one of two: a BITSET's
+ * LION_BITSET_WORDS or a NARROW's LION_NARROW_WORDS (DESIGN.md §38).  Each
+ * runs its pass with the count as a constant, so that the BITSET pass is the
+ * code it was before NARROW.
+ */
+static uint32
+bits_kernel_portable(uint64 *d, const uint64 *a, const uint64 *b,
+					 LionBitsOp op, uint32 nwords)
+{
+	if (nwords == LION_NARROW_WORDS)
+		return bits_portable_pass(d, a, b, op, LION_NARROW_WORDS);
+	Assert(nwords == LION_BITSET_WORDS);
+	return bits_portable_pass(d, a, b, op, LION_BITSET_WORDS);
+}
+
 #ifdef LION_HAVE_X86_SIMD
 
 #define LION_TARGET(isa)	__attribute__((target(isa)))
 
-static LION_TARGET("popcnt") uint32
-bits_kernel_popcnt(uint64 *d, const uint64 *a, const uint64 *b,
-				   LionBitsOp op)
+/* The POPCNT kernel's pass, inlined into the function compiled for it. */
+static pg_always_inline uint32
+bits_popcnt_pass(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
+				 uint32 nwords)
 {
 	switch (op)
 	{
 		case LION_BITS_COUNT:
-			return bits_pass_words(d, a, b, LION_BITS_COUNT, true);
+			return bits_pass_words(d, a, b, LION_BITS_COUNT, true, nwords);
 		case LION_BITS_RUNS:
-			return bits_pass_words(d, a, b, LION_BITS_RUNS, true);
+			return bits_pass_words(d, a, b, LION_BITS_RUNS, true, nwords);
 		case LION_BITS_AND_COUNT:
-			return bits_pass_words(d, a, b, LION_BITS_AND_COUNT, true);
+			return bits_pass_words(d, a, b, LION_BITS_AND_COUNT, true, nwords);
 		case LION_BITS_AND:
-			return bits_pass_words(d, a, b, LION_BITS_AND, true);
+			return bits_pass_words(d, a, b, LION_BITS_AND, true, nwords);
 		case LION_BITS_OR:
-			return bits_pass_words(d, a, b, LION_BITS_OR, true);
+			return bits_pass_words(d, a, b, LION_BITS_OR, true, nwords);
 		case LION_BITS_ANDNOT:
-			return bits_pass_words(d, a, b, LION_BITS_ANDNOT, true);
+			return bits_pass_words(d, a, b, LION_BITS_ANDNOT, true, nwords);
 		case LION_BITS_OR_NEW:
-			return bits_pass_words(d, a, b, LION_BITS_OR_NEW, true);
+			return bits_pass_words(d, a, b, LION_BITS_OR_NEW, true, nwords);
 	}
 	Assert(false);
 	return 0;
+}
+
+static LION_TARGET("popcnt") uint32
+bits_kernel_popcnt(uint64 *d, const uint64 *a, const uint64 *b,
+				   LionBitsOp op, uint32 nwords)
+{
+	if (nwords == LION_NARROW_WORDS)
+		return bits_popcnt_pass(d, a, b, op, LION_NARROW_WORDS);
+	Assert(nwords == LION_BITSET_WORDS);
+	return bits_popcnt_pass(d, a, b, op, LION_BITSET_WORDS);
 }
 
 /* Words i .. i + 3 of w; a bitset payload is only 8-byte aligned. */
@@ -621,24 +689,30 @@ bits_avx2_vector(uint64 *d, const uint64 *a, const uint64 *b, uint32 i,
 	return r;
 }
 
-/* The words a pass sums in bytes before it adds them up: 16 vectors. */
-#define LION_AVX2_BLOCK_WORDS	64
-StaticAssertDecl(LION_BITSET_WORDS % LION_AVX2_BLOCK_WORDS == 0,
-				 "the AVX2 kernel takes whole blocks");
+/*
+ * The words a pass sums in bytes before it adds them up: 16 vectors, or all
+ * of a pass of fewer words than that (a NARROW at BLCKSZ 32K, 32 words).
+ */
+#define LION_AVX2_BLOCK_WORDS(n)	((n) < 64 ? (n) : 64)
+StaticAssertDecl(LION_BITSET_WORDS % LION_AVX2_BLOCK_WORDS(LION_BITSET_WORDS) == 0 &&
+				 LION_NARROW_WORDS % LION_AVX2_BLOCK_WORDS(LION_NARROW_WORDS) == 0 &&
+				 LION_NARROW_WORDS % 4 == 0,
+				 "the AVX2 kernel takes whole blocks of whole vectors");
 
 static pg_always_inline LION_TARGET("avx2") uint32
-bits_pass_avx2(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op)
+bits_pass_avx2(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
+			   uint32 nwords)
 {
 	__m256i		total = _mm256_setzero_si256();
 	__m128i		sum;
 	uint32		i;
 	uint32		j;
 
-	for (i = 0; i < LION_BITSET_WORDS; i += LION_AVX2_BLOCK_WORDS)
+	for (i = 0; i < nwords; i += LION_AVX2_BLOCK_WORDS(nwords))
 	{
 		__m256i		bytes = _mm256_setzero_si256();
 
-		for (j = 0; j < LION_AVX2_BLOCK_WORDS; j += 4)
+		for (j = 0; j < LION_AVX2_BLOCK_WORDS(nwords); j += 4)
 			bytes = _mm256_add_epi8(bytes,
 									bits_avx2_byte_counts(bits_avx2_vector(d, a, b, i + j, op)));
 		total = _mm256_add_epi64(total,
@@ -649,28 +723,39 @@ bits_pass_avx2(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op)
 	return (uint32) (_mm_cvtsi128_si64(sum) + _mm_extract_epi64(sum, 1));
 }
 
-static LION_TARGET("avx2") uint32
-bits_kernel_avx2(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op)
+static pg_always_inline LION_TARGET("avx2") uint32
+bits_avx2_pass(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
+			   uint32 nwords)
 {
 	switch (op)
 	{
 		case LION_BITS_COUNT:
-			return bits_pass_avx2(d, a, b, LION_BITS_COUNT);
+			return bits_pass_avx2(d, a, b, LION_BITS_COUNT, nwords);
 		case LION_BITS_RUNS:
-			return bits_pass_avx2(d, a, b, LION_BITS_RUNS);
+			return bits_pass_avx2(d, a, b, LION_BITS_RUNS, nwords);
 		case LION_BITS_AND_COUNT:
-			return bits_pass_avx2(d, a, b, LION_BITS_AND_COUNT);
+			return bits_pass_avx2(d, a, b, LION_BITS_AND_COUNT, nwords);
 		case LION_BITS_AND:
-			return bits_pass_avx2(d, a, b, LION_BITS_AND);
+			return bits_pass_avx2(d, a, b, LION_BITS_AND, nwords);
 		case LION_BITS_OR:
-			return bits_pass_avx2(d, a, b, LION_BITS_OR);
+			return bits_pass_avx2(d, a, b, LION_BITS_OR, nwords);
 		case LION_BITS_ANDNOT:
-			return bits_pass_avx2(d, a, b, LION_BITS_ANDNOT);
+			return bits_pass_avx2(d, a, b, LION_BITS_ANDNOT, nwords);
 		case LION_BITS_OR_NEW:
-			return bits_pass_avx2(d, a, b, LION_BITS_OR_NEW);
+			return bits_pass_avx2(d, a, b, LION_BITS_OR_NEW, nwords);
 	}
 	Assert(false);
 	return 0;
+}
+
+static LION_TARGET("avx2") uint32
+bits_kernel_avx2(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
+				 uint32 nwords)
+{
+	if (nwords == LION_NARROW_WORDS)
+		return bits_avx2_pass(d, a, b, op, LION_NARROW_WORDS);
+	Assert(nwords == LION_BITSET_WORDS);
+	return bits_avx2_pass(d, a, b, op, LION_BITSET_WORDS);
 }
 
 /* The best kernel this CPU runs. */
@@ -687,22 +772,29 @@ bits_kernel_best(void)
 }
 
 static uint32 bits_kernel_choose(uint64 *d, const uint64 *a, const uint64 *b,
-								 LionBitsOp op);
+								 LionBitsOp op, uint32 nwords);
 
-static LionBitsKernel bits_kernel = bits_kernel_choose;
+static LionBitsKernel bits_kernel_fn = bits_kernel_choose;
 
 static uint32
-bits_kernel_choose(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op)
+bits_kernel_choose(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
+				   uint32 nwords)
 {
-	bits_kernel = bits_kernel_best();
-	return bits_kernel(d, a, b, op);
+	bits_kernel_fn = bits_kernel_best();
+	return bits_kernel_fn(d, a, b, op, nwords);
 }
 
 #else							/* !LION_HAVE_X86_SIMD */
 
-#define bits_kernel(d, a, b, op)	bits_kernel_portable((d), (a), (b), (op))
+#define bits_kernel_fn(d, a, b, op, n)	bits_kernel_portable((d), (a), (b), (op), (n))
 
 #endif							/* LION_HAVE_X86_SIMD */
+
+/* A pass over a BITSET's words, and over a NARROW's. */
+#define bits_kernel(d, a, b, op) \
+	bits_kernel_fn((d), (a), (b), (op), LION_BITSET_WORDS)
+#define narrow_kernel(d, a, b, op) \
+	bits_kernel_fn((d), (a), (b), (op), LION_NARROW_WORDS)
 
 #ifdef FRONTEND
 bool
@@ -713,20 +805,20 @@ lion_container_simd_force(LionSimdImpl impl)
 	switch (impl)
 	{
 		case LION_SIMD_AUTO:
-			bits_kernel = bits_kernel_best();
+			bits_kernel_fn = bits_kernel_best();
 			return true;
 		case LION_SIMD_PORTABLE:
-			bits_kernel = bits_kernel_portable;
+			bits_kernel_fn = bits_kernel_portable;
 			return true;
 		case LION_SIMD_POPCNT:
 			if (!__builtin_cpu_supports("popcnt"))
 				return false;
-			bits_kernel = bits_kernel_popcnt;
+			bits_kernel_fn = bits_kernel_popcnt;
 			return true;
 		case LION_SIMD_AVX2:
 			if (!__builtin_cpu_supports("avx2"))
 				return false;
-			bits_kernel = bits_kernel_avx2;
+			bits_kernel_fn = bits_kernel_avx2;
 			return true;
 	}
 	return false;
@@ -742,15 +834,22 @@ lion_container_bits_pass(LionBitsOp op, uint64 *d, const uint64 *a,
 	return bits_kernel(d, a, b, op);
 }
 
+uint32
+lion_container_narrow_pass(LionBitsOp op, uint64 *d, const uint64 *a,
+						   const uint64 *b)
+{
+	return narrow_kernel(d, a, b, op);
+}
+
 LionSimdImpl
 lion_container_simd_current(void)
 {
 #ifdef LION_HAVE_X86_SIMD
-	if (bits_kernel == bits_kernel_choose)
-		bits_kernel = bits_kernel_best();
-	if (bits_kernel == bits_kernel_avx2)
+	if (bits_kernel_fn == bits_kernel_choose)
+		bits_kernel_fn = bits_kernel_best();
+	if (bits_kernel_fn == bits_kernel_avx2)
 		return LION_SIMD_AVX2;
-	if (bits_kernel == bits_kernel_popcnt)
+	if (bits_kernel_fn == bits_kernel_popcnt)
 		return LION_SIMD_POPCNT;
 #endif
 	return LION_SIMD_PORTABLE;
@@ -887,21 +986,37 @@ bits_count_runs(const uint64 *w)
 }
 
 /*
+ * The member that bit 0 of word i of a payload stands for: i * 64 in a
+ * BITSET's, and the same offset of word i's block in a NARROW's
+ * (narrow_lo() below).
+ */
+static pg_always_inline uint32
+words_base(uint32 i, bool narrow)
+{
+	if (narrow)
+		return ((i / LION_NARROW_WORDS_PER_BLOCK) << LION_OFFSET_BITS) |
+			((i % LION_NARROW_WORDS_PER_BLOCK) << 6);
+	return i << 6;
+}
+
+/*
  * Materialise the set bits in ascending order into out, which has room for
  * cap values.  Returns the count, or cap + 1 as soon as there are more set
  * bits than that: the callers size out by a cardinality that a damaged header
- * may understate (DESIGN.md §3, "untrusted containers" above).
+ * may understate (DESIGN.md §3, "untrusted containers" above).  The members
+ * of a BITSET's payload, or of a NARROW's (narrow_extract_array()).
  */
-static uint32
-bits_extract_array(const uint64 *w, uint16 *out, uint32 cap)
+static pg_always_inline uint32
+words_extract_array(const uint64 *w, uint32 nwords, bool narrow,
+					uint16 *out, uint32 cap)
 {
 	uint32		n = 0;
 	uint32		i;
 
-	for (i = 0; i < LION_BITSET_WORDS; i++)
+	for (i = 0; i < nwords; i++)
 	{
 		uint64		cur = w[i];
-		uint32		base = i << 6;
+		uint32		base = words_base(i, narrow);
 
 		/* a word adds at most 64: test per word, and count only near cap */
 		if (unlikely(n + 64 > cap) && cur != 0 &&
@@ -916,23 +1031,32 @@ bits_extract_array(const uint64 *w, uint16 *out, uint32 cap)
 	return n;
 }
 
-/*
- * Materialise the runs of set bits.  At most maxruns are written to out, but
- * the total number of runs is always returned, so the caller can detect that
- * the buffer was too small.
- */
 static uint32
-bits_extract_runs(const uint64 *w, LionRun *out, uint32 maxruns)
+bits_extract_array(const uint64 *w, uint16 *out, uint32 cap)
+{
+	return words_extract_array(w, LION_BITSET_WORDS, false, out, cap);
+}
+
+/*
+ * Materialise the runs of members.  At most maxruns are written to out, but
+ * the total number of runs is always returned, so the caller can detect that
+ * the buffer was too small.  A run is one of members, not of bits: in a
+ * NARROW's payload a block's offset 0 follows the block before's offset 127,
+ * which as members are two runs.
+ */
+static pg_always_inline uint32
+words_extract_runs(const uint64 *w, uint32 nwords, bool narrow,
+				   LionRun *out, uint32 maxruns)
 {
 	uint32		n = 0;
 	int32		rstart = -1;
 	int32		rprev = -2;
 	uint32		i;
 
-	for (i = 0; i < LION_BITSET_WORDS; i++)
+	for (i = 0; i < nwords; i++)
 	{
 		uint64		cur = w[i];
-		int32		base = (int32) (i << 6);
+		int32		base = (int32) words_base(i, narrow);
 
 		while (cur != 0)
 		{
@@ -967,6 +1091,210 @@ bits_extract_runs(const uint64 *w, LionRun *out, uint32 maxruns)
 		n++;
 	}
 	return n;
+}
+
+static uint32
+bits_extract_runs(const uint64 *w, LionRun *out, uint32 maxruns)
+{
+	return words_extract_runs(w, LION_BITSET_WORDS, false, out, maxruns);
+}
+
+
+/* ----------------------------------------------------------------
+ *						NARROW primitives
+ *
+ * A NARROW's payload (DESIGN.md §38, lion_container.h) is LION_NARROW_WORDS
+ * words, LION_NARROW_WORDS_PER_BLOCK to a heap block: member lo is bit
+ * narrow_bit(lo), and bit i is member narrow_lo(i).  A block's words are the
+ * first LION_NARROW_WORDS_PER_BLOCK of its LION_BITSET_WORDS_PER_BLOCK in a
+ * BITSET (narrow_bits_word()), so that a NARROW meets a BITSET image a block
+ * at a time.  A member at an offset of LION_NARROW_OFFSETS or more has no
+ * bit, and a NARROW does not hold it; every bit of a payload is a legal
+ * member, so that a damaged NARROW's payload is a set like any other and only
+ * its header's cardinality can be wrong ("untrusted containers").
+ * ----------------------------------------------------------------
+ */
+
+/* lo's bit in a NARROW's payload: lo is in range, and one a NARROW holds. */
+static inline uint32
+narrow_bit(uint32 lo)
+{
+	Assert(lo <= LION_LO_MAX && lion_lo_is_narrow(lo));
+	return ((lo >> LION_OFFSET_BITS) << LION_NARROW_OFFSET_BITS) |
+		(lo & (LION_NARROW_OFFSETS - 1));
+}
+
+/* The member bit i of a NARROW's payload stands for. */
+static inline uint32
+narrow_lo(uint32 bit)
+{
+	return ((bit >> LION_NARROW_OFFSET_BITS) << LION_OFFSET_BITS) |
+		(bit & (LION_NARROW_OFFSETS - 1));
+}
+
+/* The word of a BITSET that holds the members of a NARROW's word i. */
+static inline uint32
+narrow_bits_word(uint32 i)
+{
+	return (i / LION_NARROW_WORDS_PER_BLOCK) * LION_BITSET_WORDS_PER_BLOCK +
+		i % LION_NARROW_WORDS_PER_BLOCK;
+}
+
+/* Masked like bits_test(); false, not an index, for an offset of 128 on. */
+static inline bool
+narrow_test(const uint64 *w, uint32 lo)
+{
+	uint32		bit;
+
+	lo &= LION_LO_MASK;
+	if (!lion_lo_is_narrow(lo))
+		return false;
+	bit = narrow_bit(lo);
+	return (w[bit >> 6] & (UINT64CONST(1) << (bit & 63))) != 0;
+}
+
+/* lo is one a NARROW holds: every caller has asked lion_lo_is_narrow(). */
+static inline void
+narrow_set(uint64 *w, uint32 lo)
+{
+	uint32		bit = narrow_bit(lo & LION_LO_MASK);
+
+	w[bit >> 6] |= UINT64CONST(1) << (bit & 63);
+}
+
+/* A no-op for a member a NARROW cannot hold. */
+static inline void
+narrow_clear(uint64 *w, uint32 lo)
+{
+	uint32		bit;
+
+	lo &= LION_LO_MASK;
+	if (!lion_lo_is_narrow(lo))
+		return;
+	bit = narrow_bit(lo);
+	w[bit >> 6] &= ~(UINT64CONST(1) << (bit & 63));
+}
+
+/*
+ * The bits of block b's members among lo .. hi in a NARROW's payload, as
+ * *first .. *last; false when the NARROW has none of them there.
+ */
+static inline bool
+narrow_span(uint32 lo, uint32 hi, uint32 b, uint32 *first, uint32 *last)
+{
+	uint32		f = (b == lo >> LION_OFFSET_BITS) ? (lo & LION_OFFSET_MASK) : 0;
+	uint32		l = (b == hi >> LION_OFFSET_BITS) ?
+		(hi & LION_OFFSET_MASK) : LION_OFFSET_MASK;
+
+	l = Min(l, (uint32) LION_NARROW_OFFSETS - 1);
+	if (f > l)
+		return false;
+	*first = (b << LION_NARROW_OFFSET_BITS) | f;
+	*last = (b << LION_NARROW_OFFSET_BITS) | l;
+	return true;
+}
+
+/* The members lo .. hi that a NARROW holds, set, cleared or counted. */
+static void
+narrow_set_range(uint64 *w, uint32 lo, uint32 hi)
+{
+	uint32		b;
+	uint32		first;
+	uint32		last;
+
+	Assert(lo <= hi && hi <= LION_LO_MAX);
+	for (b = lo >> LION_OFFSET_BITS; b <= hi >> LION_OFFSET_BITS; b++)
+		if (narrow_span(lo, hi, b, &first, &last))
+			bits_set_range(w, first, last);
+}
+
+static void
+narrow_clear_range(uint64 *w, uint32 lo, uint32 hi)
+{
+	uint32		b;
+	uint32		first;
+	uint32		last;
+
+	Assert(lo <= hi && hi <= LION_LO_MAX);
+	for (b = lo >> LION_OFFSET_BITS; b <= hi >> LION_OFFSET_BITS; b++)
+		if (narrow_span(lo, hi, b, &first, &last))
+			bits_clear_range(w, first, last);
+}
+
+static uint32
+narrow_range_cardinality(const uint64 *w, uint32 lo, uint32 hi)
+{
+	uint32		n = 0;
+	uint32		b;
+	uint32		first;
+	uint32		last;
+
+	Assert(lo <= hi && hi <= LION_LO_MAX);
+	for (b = lo >> LION_OFFSET_BITS; b <= hi >> LION_OFFSET_BITS; b++)
+		if (narrow_span(lo, hi, b, &first, &last))
+			n += bits_range_cardinality(w, first, last);
+	return n;
+}
+
+/* The number of members: a kernel pass over the payload's words. */
+static inline uint32
+narrow_cardinality(const uint64 *w)
+{
+	return narrow_kernel(NULL, w, NULL, LION_BITS_COUNT);
+}
+
+/*
+ * The number of runs of members.  The kernel's RUNS pass counts the runs of
+ * the words as they lie, where a block's offset 0 follows the block before's
+ * offset 127; as members those are 385 apart, so a block that starts with a
+ * member where the block before ends with one is one run more.
+ */
+static uint32
+narrow_count_runs(const uint64 *w)
+{
+	uint32		n = narrow_kernel(NULL, w, NULL, LION_BITS_RUNS);
+	uint32		b;
+
+	for (b = 1; b < LION_BLOCKS_PER_CONTAINER; b++)
+		n += (uint32) (w[b * LION_NARROW_WORDS_PER_BLOCK] &
+					   (w[b * LION_NARROW_WORDS_PER_BLOCK - 1] >> 63) & 1);
+	return n;
+}
+
+static uint32
+narrow_extract_array(const uint64 *w, uint16 *out, uint32 cap)
+{
+	return words_extract_array(w, LION_NARROW_WORDS, true, out, cap);
+}
+
+static uint32
+narrow_extract_runs(const uint64 *w, LionRun *out, uint32 maxruns)
+{
+	return words_extract_runs(w, LION_NARROW_WORDS, true, out, maxruns);
+}
+
+/* nw = the members of the BITSET image w that a NARROW holds. */
+static void
+narrow_from_bits(const uint64 *w, uint64 *nw)
+{
+	uint32		i;
+
+	for (i = 0; i < LION_NARROW_WORDS; i++)
+		nw[i] = w[narrow_bits_word(i)];
+}
+
+/* Does the BITSET image w hold no member that a NARROW cannot? */
+static bool
+bits_narrow_feasible(const uint64 *w)
+{
+	uint64		any = 0;
+	uint32		b;
+	uint32		k;
+
+	for (b = 0; b < LION_BLOCKS_PER_CONTAINER; b++)
+		for (k = LION_NARROW_WORDS_PER_BLOCK; k < LION_BITSET_WORDS_PER_BLOCK; k++)
+			any |= w[b * LION_BITSET_WORDS_PER_BLOCK + k];
+	return any == 0;
 }
 
 
@@ -1143,6 +1471,14 @@ container_or_bitset(const LionContainer *c, uint64 *w)
 				}
 				break;
 			}
+		case LION_CT_NARROW:
+			{
+				const uint64 *src = narrow_cdata(c);
+
+				for (i = 0; i < LION_NARROW_WORDS; i++)
+					w[narrow_bits_word(i)] |= src[i];
+				break;
+			}
 		default:
 			Assert(false);
 			break;
@@ -1188,6 +1524,14 @@ container_andnot_bitset(const LionContainer *c, uint64 *w)
 				}
 				break;
 			}
+		case LION_CT_NARROW:
+			{
+				const uint64 *src = narrow_cdata(c);
+
+				for (i = 0; i < LION_NARROW_WORDS; i++)
+					w[narrow_bits_word(i)] &= ~src[i];
+				break;
+			}
 		default:
 			Assert(false);
 			break;
@@ -1195,8 +1539,10 @@ container_andnot_bitset(const LionContainer *c, uint64 *w)
 }
 
 /*
- * w &= c.  Only BITSET and RUN operands get here: the public entry points
- * intersect ARRAY operands by probing, without materialising a bitset.
+ * w &= c.  Only BITSET, RUN and NARROW operands get here: the public entry
+ * points intersect ARRAY operands by probing, without materialising a bitset
+ * (and an AND with a NARROW makes a NARROW, container_op_narrow(), but this
+ * is total).
  */
 static void
 container_and_bitset(const LionContainer *c, uint64 *w)
@@ -1236,6 +1582,23 @@ container_and_bitset(const LionContainer *c, uint64 *w)
 				}
 				if (prev <= LION_LO_MAX)
 					bits_clear_range(w, prev, LION_LO_MAX);
+				break;
+			}
+		case LION_CT_NARROW:
+			{
+				const uint64 *src = narrow_cdata(c);
+				uint32		b;
+				uint32		k;
+
+				for (b = 0; b < LION_BLOCKS_PER_CONTAINER; b++)
+				{
+					uint64	   *bw = &w[b * LION_BITSET_WORDS_PER_BLOCK];
+
+					for (k = 0; k < LION_NARROW_WORDS_PER_BLOCK; k++)
+						bw[k] &= src[b * LION_NARROW_WORDS_PER_BLOCK + k];
+					for (; k < LION_BITSET_WORDS_PER_BLOCK; k++)
+						bw[k] = 0;
+				}
 				break;
 			}
 		default:
@@ -1322,10 +1685,84 @@ container_count_runs(const LionContainer *c)
 			return bits_count_runs(bitset_cdata(c));
 		case LION_CT_RUN:
 			return run_nruns(c);
+		case LION_CT_NARROW:
+			return narrow_count_runs(narrow_cdata(c));
 		default:
 			Assert(false);
 			return 0;
 	}
+}
+
+/*
+ * nw = c's members that a NARROW holds - all of them, for a c that
+ * lion_container_narrow_feasible() passes - as a NARROW's payload.  nw does
+ * not overlap c.
+ */
+static void
+container_fill_narrow(const LionContainer *c, uint64 *nw)
+{
+	uint32		i;
+
+	switch (c->type)
+	{
+		case LION_CT_NARROW:
+			memcpy(nw, narrow_cdata(c), LION_NARROW_BYTES);
+			return;
+		case LION_CT_BITSET:
+			narrow_from_bits(bitset_cdata(c), nw);
+			return;
+		default:
+			break;
+	}
+
+	memset(nw, 0, LION_NARROW_BYTES);
+	if (c->type == LION_CT_ARRAY)
+	{
+		const uint16 *arr = array_cdata(c);
+		uint32		n = array_card(c);
+
+		for (i = 0; i < n; i++)
+			if (lion_lo_is_narrow(arr[i] & LION_LO_MASK))
+				narrow_set(nw, arr[i] & LION_LO_MASK);
+	}
+	else if (c->type == LION_CT_RUN)
+	{
+		const LionRun *runs = run_cdata(c);
+		uint32		nruns = run_nruns(c);
+
+		for (i = 0; i < nruns; i++)
+		{
+			int32		last = run_last(&runs[i]);
+
+			if ((int32) runs[i].start <= last)
+				narrow_set_range(nw, runs[i].start, (uint32) last);
+		}
+	}
+	else
+		Assert(false);
+}
+
+/*
+ * nw = a AND, OR or ANDNOT b (op LION_BITS_AND, _OR or _ANDNOT), a NARROW's
+ * payload, and its cardinality: the set algebra's NARROW results
+ * (lion_container.h).  a is a NARROW, and so is b for OR; for AND and ANDNOT
+ * b is any container, whose members a NARROW cannot hold change nothing.  One
+ * kernel pass over a's payload and b's, or over an image of b's members in
+ * nw, which overlaps neither operand.
+ */
+static uint32
+container_op_narrow(const LionContainer *a, const LionContainer *b,
+					LionBitsOp op, uint64 *nw)
+{
+	const uint64 *src = nw;
+
+	Assert(a->type == LION_CT_NARROW);
+	Assert(op != LION_BITS_OR || b->type == LION_CT_NARROW);
+	if (b->type == LION_CT_NARROW)
+		src = narrow_cdata(b);
+	else
+		container_fill_narrow(b, nw);
+	return narrow_kernel(nw, narrow_cdata(a), src, op);
 }
 
 
@@ -1396,6 +1833,9 @@ container_extract(const LionContainer *c, uint16 *out, uint32 cap)
 		case LION_CT_BITSET:
 			n = bits_extract_array(bitset_cdata(c), out, cap);
 			break;
+		case LION_CT_NARROW:
+			n = narrow_extract_array(narrow_cdata(c), out, cap);
+			break;
 		case LION_CT_RUN:
 			{
 				const LionRun *runs = run_cdata(c);
@@ -1460,6 +1900,8 @@ container_make_run(LionContainer *c)
 		return;
 	if (c->type == LION_CT_BITSET)
 		n = bits_extract_runs(bitset_cdata(c), tmp, LION_RUN_MAX_NRUNS);
+	else if (c->type == LION_CT_NARROW)
+		n = narrow_extract_runs(narrow_cdata(c), tmp, LION_RUN_MAX_NRUNS);
 	else
 	{
 		const uint16 *arr = array_cdata(c);
@@ -1540,6 +1982,36 @@ container_shrink_bitset(LionContainer *c)
 		container_make_array(c);
 }
 
+/*
+ * The NARROW form of c, every member of which has an offset below
+ * LION_NARROW_OFFSETS (lion_container_narrow_feasible(), which a caller has
+ * asked).  The cardinality is what the payload holds, which for a
+ * well-formed container is what it already was.
+ */
+static void
+container_make_narrow(LionContainer *c)
+{
+	uint64		nw[LION_NARROW_WORDS];
+
+	if (c->type == LION_CT_NARROW)
+		return;
+	container_fill_narrow(c, nw);
+	c->type = LION_CT_NARROW;
+	memcpy(narrow_mdata(c), nw, LION_NARROW_BYTES);
+	c->cardinality = (uint16) narrow_cardinality(nw);
+}
+
+/*
+ * DESIGN.md §38: a NARROW that has shrunk to LION_NARROW_ARRAY_CARD (512)
+ * members or fewer becomes an ARRAY, which is then no larger.
+ */
+static inline void
+container_shrink_narrow(LionContainer *c)
+{
+	if (c->type == LION_CT_NARROW && c->cardinality <= LION_NARROW_ARRAY_CARD)
+		container_make_array(c);
+}
+
 
 /* ----------------------------------------------------------------
  *						size, construction, lookup
@@ -1558,6 +2030,8 @@ lion_container_size_for(LionContainerType type, uint32 cardinality, uint32 nruns
 		case LION_CT_RUN:
 			return LION_CONTAINER_HDRSZ + sizeof(uint16) +
 				(Size) nruns * sizeof(LionRun);
+		case LION_CT_NARROW:
+			return LION_CONTAINER_HDRSZ + LION_NARROW_BYTES;
 		case LION_CT_SPARSE:
 			/* a segment is not a container: lion_sparse_size() sizes those */
 			break;
@@ -1582,6 +2056,36 @@ lion_container_init(LionContainer *c, uint32 ckey)
 	c->cardinality = 0;
 	c->type = LION_CT_ARRAY;
 	c->flags = 0;
+}
+
+/*
+ * GROWTH IN PLACE (lion_container.h): what add() writes when it keeps the
+ * representation, as the table there says.  The clamps add() applies first
+ * leave an ARRAY or a RUN whose header claims past its limit at the limit,
+ * where it converts, so a claim of that or more is 0 here too.
+ */
+Size
+lion_container_inplace_need(const LionContainer *c, uint16 lo)
+{
+	switch (c->type)
+	{
+		case LION_CT_BITSET:
+			return LION_CONTAINER_MAX_SIZE;
+		case LION_CT_ARRAY:
+			if (c->cardinality >= LION_ARRAY_MAX_CARD)
+				return 0;		/* would become a BITSET */
+			return lion_container_size(c) + sizeof(uint16);
+		case LION_CT_RUN:
+			if (run_nruns_raw(c) >= LION_RUN_MAX_NRUNS)
+				return 0;		/* would become an ARRAY or a BITSET */
+			return lion_container_size(c) + sizeof(LionRun);
+		case LION_CT_NARROW:
+			if (!lion_lo_is_narrow((uint32) lo & LION_LO_MASK))
+				return 0;		/* would become a BITSET */
+			return LION_NARROW_SIZE;
+		default:
+			return 0;
+	}
 }
 
 uint32
@@ -1614,6 +2118,8 @@ lion_container_contains(const LionContainer *c, uint16 lo)
 
 				return idx >= 0 && (int32) lo <= run_end(&runs[idx]);
 			}
+		case LION_CT_NARROW:
+			return narrow_test(narrow_cdata(c), lo);
 		default:
 			Assert(false);
 			return false;
@@ -1630,10 +2136,24 @@ lion_container_to_bitset(LionContainer *c)
 void
 lion_container_optimize(LionContainer *c)
 {
+	lion_container_optimize_ext(c, true);
+}
+
+/*
+ * NARROW is a candidate when allow_narrow and every member's offset is below
+ * LION_NARROW_OFFSETS, and is then never larger than a BITSET: the choice is
+ * among the sizes, ties going to ARRAY, then RUN, then NARROW, then BITSET
+ * (DESIGN.md §38, "Rules").  An ARRAY of LION_NARROW_ARRAY_CARD (512)
+ * members is a NARROW's size, so a NARROW has more members than that.
+ */
+void
+lion_container_optimize_ext(LionContainer *c, bool allow_narrow)
+{
 	uint32		card;
 	uint32		nruns;
 	Size		asz;
 	Size		rsz;
+	Size		nsz;
 	Size		bsz;
 
 	container_clamp(c);
@@ -1647,16 +2167,70 @@ lion_container_optimize(LionContainer *c)
 	rsz = (nruns <= LION_RUN_MAX_NRUNS)
 		? lion_container_size_for(LION_CT_RUN, card, nruns)
 		: LION_SIZE_INFEASIBLE;
+	nsz = (allow_narrow && lion_container_narrow_feasible(c))
+		? lion_container_size_for(LION_CT_NARROW, card, 0)
+		: LION_SIZE_INFEASIBLE;
 
-	/* ties prefer ARRAY, then RUN, then BITSET */
-	if (asz <= rsz && asz <= bsz)
+	/* ties prefer ARRAY, then RUN, then NARROW, then BITSET */
+	if (asz <= rsz && asz <= nsz && asz <= bsz)
 		container_make_array(c);
-	else if (rsz <= bsz)
+	else if (rsz <= nsz && rsz <= bsz)
 		container_make_run(c);
+	else if (nsz <= bsz)
+		container_make_narrow(c);
 	else
 		container_make_bitset(c);
 
 	Assert(lion_container_size(c) <= LION_CONTAINER_MAX_SIZE);
+}
+
+/*
+ * Members as iterate() takes them: an ARRAY's masked, a run's clamped and
+ * one that starts past LION_LO_MAX left out (it is empty).
+ */
+bool
+lion_container_narrow_feasible(const LionContainer *c)
+{
+	uint32		i;
+
+	switch (c->type)
+	{
+		case LION_CT_NARROW:
+			return true;
+		case LION_CT_BITSET:
+			return bits_narrow_feasible(bitset_cdata(c));
+		case LION_CT_ARRAY:
+			{
+				const uint16 *arr = array_cdata(c);
+				uint32		n = array_card(c);
+				uint32		far = 0;
+
+				/* an offset of 128 or more has a bit at or past 128 */
+				for (i = 0; i < n; i++)
+					far |= (uint32) arr[i] & LION_OFFSET_MASK;
+				return far < LION_NARROW_OFFSETS;
+			}
+		case LION_CT_RUN:
+			{
+				const LionRun *runs = run_cdata(c);
+				uint32		nruns = run_nruns(c);
+
+				for (i = 0; i < nruns; i++)
+				{
+					int32		last = run_last(&runs[i]);
+
+					if ((int32) runs[i].start > last)
+						continue;
+					if (((uint32) runs[i].start >> LION_OFFSET_BITS) !=
+						((uint32) last >> LION_OFFSET_BITS) ||
+						!lion_lo_is_narrow((uint32) last))
+						return false;
+				}
+				return true;
+			}
+		default:
+			return false;
+	}
 }
 
 
@@ -1843,6 +2417,24 @@ lion_container_add(LionContainer *c, uint16 lo)
 			}
 		case LION_CT_RUN:
 			return run_add(c, lo);
+		case LION_CT_NARROW:
+			{
+				uint64	   *w = narrow_mdata(c);
+
+				if (!lion_lo_is_narrow(lo))
+				{
+					/* a member it has no bit for: not one it holds */
+					container_make_bitset(c);
+					bits_set(bitset_mdata(c), lo);
+					c->cardinality++;
+					return true;
+				}
+				if (narrow_test(w, lo))
+					return false;
+				narrow_set(w, lo);
+				c->cardinality++;
+				return true;
+			}
 		default:
 			Assert(false);
 			return false;
@@ -1883,6 +2475,17 @@ lion_container_remove(LionContainer *c, uint16 lo)
 			}
 		case LION_CT_RUN:
 			return run_remove(c, lo);
+		case LION_CT_NARROW:
+			{
+				uint64	   *w = narrow_mdata(c);
+
+				if (!narrow_test(w, lo))
+					return false;
+				narrow_clear(w, lo);
+				c->cardinality--;
+				container_shrink_narrow(c);
+				return true;
+			}
 		default:
 			Assert(false);
 			return false;
@@ -1935,8 +2538,8 @@ lion_container_append_sorted(LionContainer *c, uint16 lo)
 		return;
 	}
 
-	/* A builder never produces a RUN, but stay total if one shows up. */
-	Assert(c->type == LION_CT_RUN);
+	/* A builder never produces a RUN or a NARROW, but stay total. */
+	Assert(c->type == LION_CT_RUN || c->type == LION_CT_NARROW);
 	(void) lion_container_add(c, lo);
 }
 
@@ -1972,6 +2575,26 @@ lion_container_iterate(const LionContainer *c, lion_lo_callback cb, void *arg)
 				{
 					uint64		cur = w[i];
 					uint32		base = i << 6;
+
+					while (cur != 0)
+					{
+						uint32		lo = base + (uint32) pg_rightmost_one_pos64(cur);
+
+						cur &= cur - 1;
+						if (!cb((uint16) lo, arg))
+							return;
+					}
+				}
+				break;
+			}
+		case LION_CT_NARROW:
+			{
+				const uint64 *w = narrow_cdata(c);
+
+				for (i = 0; i < LION_NARROW_WORDS; i++)
+				{
+					uint64		cur = w[i];
+					uint32		base = words_base(i, true);
 
 					while (cur != 0)
 					{
@@ -2124,6 +2747,19 @@ lion_container_or_inplace(LionContainer *acc, const LionContainer *c)
 				}
 				break;
 			}
+		case LION_CT_NARROW:
+			{
+				const uint64 *src = narrow_cdata(c);
+
+				for (i = 0; i < LION_NARROW_WORDS; i++)
+				{
+					uint64	   *dw = &w[narrow_bits_word(i)];
+
+					added += lion_popcount64(src[i] & ~*dw);
+					*dw |= src[i];
+				}
+				break;
+			}
 		default:
 			Assert(false);
 			break;
@@ -2242,6 +2878,15 @@ lion_container_mark_members(const LionContainer *c, const uint16 *sorted,
 						MARK(j);
 				break;
 			}
+		case LION_CT_NARROW:
+			{
+				const uint64 *w = narrow_cdata(c);
+
+				for (j = 0; j < n; j++)
+					if (narrow_test(w, sorted[j]))
+						MARK(j);
+				break;
+			}
 		case LION_CT_RUN:
 			{
 				const LionRun *runs = run_cdata(c);
@@ -2283,12 +2928,6 @@ lion_container_mark_members(const LionContainer *c, const uint16 *sorted,
  * visibility map - and no bit at or above LION_BLOCKS_PER_CONTAINER ever is:
  * the engine indexes an array of that many flags with them.
  */
-#define LION_BITSET_WORDS_PER_BLOCK	(LION_BITSET_WORDS / LION_BLOCKS_PER_CONTAINER)
-
-StaticAssertDecl(LION_BITSET_WORDS_PER_BLOCK * LION_BLOCKS_PER_CONTAINER ==
-				 LION_BITSET_WORDS,
-				 "pg_lion: bitset words do not divide evenly among heap blocks");
-
 /* the bits of the LION_BLOCKS_PER_CONTAINER blocks, all 64 at BLCKSZ 8K */
 #define LION_BLOCK_BITS		(LION_ALL_ONES >> (64 - LION_BLOCKS_PER_CONTAINER))
 
@@ -2322,6 +2961,23 @@ lion_container_block_mask(const LionContainer *c)
 
 					for (k = 0; k < LION_BITSET_WORDS_PER_BLOCK; k++)
 						any |= w[b * LION_BITSET_WORDS_PER_BLOCK + k];
+					if (any != 0)
+						mask |= UINT64CONST(1) << b;
+				}
+				break;
+			}
+		case LION_CT_NARROW:
+			{
+				const uint64 *w = narrow_cdata(c);
+				uint32		b;
+
+				for (b = 0; b < LION_BLOCKS_PER_CONTAINER; b++)
+				{
+					uint64		any = 0;
+					uint32		k;
+
+					for (k = 0; k < LION_NARROW_WORDS_PER_BLOCK; k++)
+						any |= w[b * LION_NARROW_WORDS_PER_BLOCK + k];
 					if (any != 0)
 						mask |= UINT64CONST(1) << b;
 				}
@@ -2415,6 +3071,34 @@ lion_container_remove_if(LionContainer *c, lion_lo_predicate pred, void *arg)
 				container_shrink_bitset(c);
 				break;
 			}
+		case LION_CT_NARROW:
+			{
+				uint64	   *w = narrow_mdata(c);
+
+				for (i = 0; i < LION_NARROW_WORDS; i++)
+				{
+					uint64		cur = w[i];
+					uint64		keep = cur;
+					uint32		base = words_base(i, true);
+
+					while (cur != 0)
+					{
+						int			b = pg_rightmost_one_pos64(cur);
+
+						cur &= cur - 1;
+						if (pred((uint16) (base + (uint32) b), arg))
+						{
+							keep &= ~(UINT64CONST(1) << b);
+							removed++;
+						}
+					}
+					w[i] = keep;
+				}
+				/* as a BITSET's: a damaged header wraps, verify says so */
+				c->cardinality -= (uint16) removed;
+				container_shrink_narrow(c);
+				break;
+			}
 		case LION_CT_RUN:
 			{
 				uint64		w[LION_BITSET_WORDS];
@@ -2484,6 +3168,8 @@ lion_container_range_cardinality(const LionContainer *c, uint16 lo_start, uint16
 			}
 		case LION_CT_BITSET:
 			return bits_range_cardinality(bitset_cdata(c), lo_start, lo_end);
+		case LION_CT_NARROW:
+			return narrow_range_cardinality(narrow_cdata(c), lo_start, lo_end);
 		case LION_CT_RUN:
 			{
 				const LionRun *runs = run_cdata(c);
@@ -2572,6 +3258,19 @@ lion_container_remove_range(LionContainer *c, uint16 lo_start, uint16 lo_end)
 					bits_clear_range(w, lo_start, lo_end);
 					c->cardinality -= (uint16) removed;
 					container_shrink_bitset(c);
+				}
+				break;
+			}
+		case LION_CT_NARROW:
+			{
+				uint64	   *w = narrow_mdata(c);
+
+				removed = narrow_range_cardinality(w, lo_start, lo_end);
+				if (removed > 0)
+				{
+					narrow_clear_range(w, lo_start, lo_end);
+					c->cardinality -= (uint16) removed;
+					container_shrink_narrow(c);
 				}
 				break;
 			}
@@ -2946,6 +3645,33 @@ array_andnot_bitset(const uint16 *arr, uint32 na, const uint64 *w, uint16 *out)
 	return n;
 }
 
+/* The same two against a NARROW's payload: a member it has no bit for is out. */
+static uint32
+array_and_narrow(const uint16 *arr, uint32 na, const uint64 *w, uint16 *out)
+{
+	uint32		n = 0;
+	uint32		i;
+
+	for (i = 0; i < na; i++)
+	{
+		out[n] = array_out(arr[i]);
+		n += narrow_test(w, arr[i]) ? 1 : 0;
+	}
+	return n;
+}
+
+static uint32
+array_andnot_narrow(const uint16 *arr, uint32 na, const uint64 *w, uint16 *out)
+{
+	uint32		n = 0;
+	uint32		i;
+
+	for (i = 0; i < na; i++)
+		if (!narrow_test(w, arr[i]))
+			out[n++] = array_out(arr[i]);
+	return n;
+}
+
 /*
  * Intersect two RUN containers straight into o's run payload.  Returns false
  * (leaving o's payload undefined) if the result needs more than
@@ -3143,6 +3869,8 @@ container_has_member(const LionContainer *c, uint16 v)
 			}
 		case LION_CT_BITSET:
 			return bits_test(bitset_cdata(c), v);
+		case LION_CT_NARROW:
+			return narrow_test(narrow_cdata(c), v);
 		default:
 			{
 				const LionRun *runs = run_cdata(c);
@@ -3220,6 +3948,9 @@ lion_container_and(const LionContainer *a, const LionContainer *b,
 		else if (oth->type == LION_CT_BITSET)
 			n = array_and_bitset(array_cdata(arr), array_card(arr),
 								 bitset_cdata(oth), out);
+		else if (oth->type == LION_CT_NARROW)
+			n = array_and_narrow(array_cdata(arr), array_card(arr),
+								 narrow_cdata(oth), out);
 		else
 			n = array_and_run(array_cdata(arr), array_card(arr), oth, out);
 		o->cardinality = (uint16) n;
@@ -3228,6 +3959,15 @@ lion_container_and(const LionContainer *a, const LionContainer *b,
 			 run_and_run(a, b, o))
 	{
 		/* done: o already holds the intersected runs */
+	}
+	else if (a->type == LION_CT_NARROW || b->type == LION_CT_NARROW)
+	{
+		const LionContainer *nar = (a->type == LION_CT_NARROW) ? a : b;
+		const LionContainer *oth = (a->type == LION_CT_NARROW) ? b : a;
+
+		o->type = LION_CT_NARROW;
+		o->cardinality = (uint16) container_op_narrow(nar, oth, LION_BITS_AND,
+													  narrow_mdata(o));
 	}
 	else
 	{
@@ -3264,6 +4004,12 @@ lion_container_or(const LionContainer *a, const LionContainer *b,
 		container_copy(src, o);
 		o->ckey = a->ckey;
 		o->flags = 0;
+	}
+	else if (a->type == LION_CT_NARROW && b->type == LION_CT_NARROW)
+	{
+		o->type = LION_CT_NARROW;
+		o->cardinality = (uint16) container_op_narrow(a, b, LION_BITS_OR,
+													  narrow_mdata(o));
 	}
 	else
 	{
@@ -3304,9 +4050,18 @@ lion_container_andnot(const LionContainer *a, const LionContainer *b,
 		else if (b->type == LION_CT_BITSET)
 			n = array_andnot_bitset(array_cdata(a), array_card(a),
 									bitset_cdata(b), out);
+		else if (b->type == LION_CT_NARROW)
+			n = array_andnot_narrow(array_cdata(a), array_card(a),
+									narrow_cdata(b), out);
 		else
 			n = array_andnot_run(array_cdata(a), array_card(a), b, out);
 		o->cardinality = (uint16) n;
+	}
+	else if (a->type == LION_CT_NARROW)
+	{
+		o->type = LION_CT_NARROW;
+		o->cardinality = (uint16) container_op_narrow(a, b, LION_BITS_ANDNOT,
+													  narrow_mdata(o));
 	}
 	else
 	{
@@ -3365,6 +4120,9 @@ lion_container_and_raw(const LionContainer *a, const LionContainer *b,
 		else if (oth->type == LION_CT_BITSET)
 			n = array_and_bitset(array_cdata(arr), array_card(arr),
 								 bitset_cdata(oth), out);
+		else if (oth->type == LION_CT_NARROW)
+			n = array_and_narrow(array_cdata(arr), array_card(arr),
+								 narrow_cdata(oth), out);
 		else
 			n = array_and_run(array_cdata(arr), array_card(arr), oth, out);
 		dest->cardinality = (uint16) n;
@@ -3374,6 +4132,18 @@ lion_container_and_raw(const LionContainer *a, const LionContainer *b,
 	if (a->type == LION_CT_RUN && b->type == LION_CT_RUN &&
 		run_and_run(a, b, dest))
 		return dest->cardinality;
+
+	/* A NARROW and anything: one kernel pass over a NARROW's words. */
+	if (a->type == LION_CT_NARROW || b->type == LION_CT_NARROW)
+	{
+		if (a->type == LION_CT_NARROW)
+			n = container_op_narrow(a, b, LION_BITS_AND, narrow_mdata(dest));
+		else
+			n = container_op_narrow(b, a, LION_BITS_AND, narrow_mdata(dest));
+		dest->type = LION_CT_NARROW;
+		dest->cardinality = (uint16) n;
+		return n;
+	}
 
 	/*
 	 * A BITSET operand is copied and the other ANDed in; two BITSETs are
@@ -3418,8 +4188,18 @@ lion_container_andnot_raw(const LionContainer *a, const LionContainer *b,
 		else if (b->type == LION_CT_BITSET)
 			n = array_andnot_bitset(array_cdata(a), array_card(a),
 									bitset_cdata(b), out);
+		else if (b->type == LION_CT_NARROW)
+			n = array_andnot_narrow(array_cdata(a), array_card(a),
+									narrow_cdata(b), out);
 		else
 			n = array_andnot_run(array_cdata(a), array_card(a), b, out);
+		dest->cardinality = (uint16) n;
+		return n;
+	}
+	if (a->type == LION_CT_NARROW)
+	{
+		n = container_op_narrow(a, b, LION_BITS_ANDNOT, narrow_mdata(dest));
+		dest->type = LION_CT_NARROW;
 		dest->cardinality = (uint16) n;
 		return n;
 	}
@@ -3455,6 +4235,13 @@ lion_container_or_raw(const LionContainer *a, const LionContainer *b,
 		dest->ckey = a->ckey;
 		dest->flags = 0;
 		return dest->cardinality;
+	}
+	if (a->type == LION_CT_NARROW && b->type == LION_CT_NARROW)
+	{
+		n = container_op_narrow(a, b, LION_BITS_OR, narrow_mdata(dest));
+		dest->type = LION_CT_NARROW;
+		dest->cardinality = (uint16) n;
+		return n;
 	}
 
 	n = container_op_bitset(a, b, LION_BITS_OR, bitset_mdata(dest));
@@ -3521,6 +4308,19 @@ probe_pending(const LionContainer *b, const uint16 *vals, uint16 *pending,
 				{
 					uint32		p = pending[i];
 					uint32		h = bits_test(w, vals[p]) ? 1 : 0;
+
+					PROBE_KEEP(p, h);
+				}
+				return k;
+			}
+		case LION_CT_NARROW:
+			{
+				const uint64 *w = narrow_cdata(b);
+
+				for (i = 0; i < np; i++)
+				{
+					uint32		p = pending[i];
+					uint32		h = narrow_test(w, vals[p]) ? 1 : 0;
 
 					PROBE_KEEP(p, h);
 				}
@@ -3837,6 +4637,14 @@ lion_container_and_cardinality(const LionContainer *a, const LionContainer *b)
 				card += bits_test(w, data[i]) ? 1 : 0;
 			return card;
 		}
+		if (oth->type == LION_CT_NARROW)
+		{
+			const uint64 *w = narrow_cdata(oth);
+
+			for (i = 0; i < n; i++)
+				card += narrow_test(w, data[i]) ? 1 : 0;
+			return card;
+		}
 		/* ARRAY x RUN, branch-free as array_and_run() */
 		{
 			const LionRun *runs = run_cdata(oth);
@@ -3859,6 +4667,47 @@ lion_container_and_cardinality(const LionContainer *a, const LionContainer *b)
 
 	if (a->type == LION_CT_RUN && b->type == LION_CT_RUN)
 		return run_and_run_cardinality(a, b);
+
+	/*
+	 * A NARROW and a NARROW, a BITSET or a RUN: a kernel pass over two
+	 * NARROWs' words; a BITSET's words that a NARROW has, a word at a time;
+	 * a NARROW's members in each run's span.
+	 */
+	if (a->type == LION_CT_NARROW || b->type == LION_CT_NARROW)
+	{
+		const LionContainer *nar = (a->type == LION_CT_NARROW) ? a : b;
+		const LionContainer *oth = (a->type == LION_CT_NARROW) ? b : a;
+		const uint64 *nw = narrow_cdata(nar);
+		uint32		card = 0;
+		uint32		i;
+
+		if (oth->type == LION_CT_NARROW)
+			return narrow_kernel(NULL, nw, narrow_cdata(oth),
+								 LION_BITS_AND_COUNT);
+		if (oth->type == LION_CT_BITSET)
+		{
+			const uint64 *w = bitset_cdata(oth);
+
+			for (i = 0; i < LION_NARROW_WORDS; i++)
+				card += lion_popcount64(nw[i] & w[narrow_bits_word(i)]);
+			return card;
+		}
+		{
+			const LionRun *runs = run_cdata(oth);
+			uint32		nruns = run_nruns(oth);
+
+			Assert(oth->type == LION_CT_RUN);
+			for (i = 0; i < nruns; i++)
+			{
+				int32		last = run_last(&runs[i]);
+
+				if ((int32) runs[i].start <= last)
+					card += narrow_range_cardinality(nw, runs[i].start,
+													 (uint32) last);
+			}
+			return card;
+		}
+	}
 
 	/* BITSET x RUN */
 	{
@@ -3908,8 +4757,7 @@ lion_container_check(const LionContainer *c, Size avail_bytes, const char **errm
 	if (c->type == LION_CT_SPARSE)
 		LION_CHECK_FAIL("item is a sparse segment, not a container");
 
-	if (c->type != LION_CT_ARRAY && c->type != LION_CT_BITSET &&
-		c->type != LION_CT_RUN)
+	if (!lion_container_type_valid(c->type))
 		LION_CHECK_FAIL("invalid container type");
 
 	if (c->flags != 0)
@@ -3946,6 +4794,15 @@ lion_container_check(const LionContainer *c, Size avail_bytes, const char **errm
 					LION_CHECK_FAIL("bitset container does not fit in the available space");
 				if (bits_cardinality(bitset_cdata(c)) != card)
 					LION_CHECK_FAIL("bitset container cardinality does not match its payload");
+				break;
+			}
+		case LION_CT_NARROW:
+			{
+				/* every bit is a legal member: the count is all there is */
+				if (lion_container_size_for(LION_CT_NARROW, card, 0) > avail_bytes)
+					LION_CHECK_FAIL("narrow container does not fit in the available space");
+				if (narrow_cardinality(narrow_cdata(c)) != card)
+					LION_CHECK_FAIL("narrow container cardinality does not match its payload");
 				break;
 			}
 		case LION_CT_RUN:
@@ -4040,6 +4897,19 @@ lion_container_check_offsets(const LionContainer *c, uint32 maxoff,
 				{
 					if ((w[k] & ~bitset_tuple_mask(k, maxoff)) != 0)
 						LION_CHECK_FAIL("bitset container member is not a heap tuple offset");
+				}
+				break;
+			}
+		case LION_CT_NARROW:
+			{
+				const uint64 *w = narrow_cdata(c);
+				uint32		k;
+
+				/* a NARROW's word covers the offsets its BITSET word does */
+				for (k = 0; k < LION_NARROW_WORDS; k++)
+				{
+					if ((w[k] & ~bitset_tuple_mask(narrow_bits_word(k), maxoff)) != 0)
+						LION_CHECK_FAIL("narrow container member is not a heap tuple offset");
 				}
 				break;
 			}
