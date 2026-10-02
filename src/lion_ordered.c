@@ -17,6 +17,13 @@
  *		column no btree orders (DESIGN.md §30.11); the lion side is then the
  *		other clauses' set, or nothing at all.
  *
+ *		Or there is no ordered side at all: when the ORDER BY's columns are
+ *		stored in a lion index's window store and the query has a LIMIT, the
+ *		node gathers their values for the rows the set keeps, window by
+ *		window under the pin of DESIGN.md §9, keeps the best limit + offset
+ *		of them in a bounded heap, and fetches only those, in order - the
+ *		store order of DESIGN.md §40 ("The custom shapes", 2).
+ *
  * Nothing here re-implements what core already decides.  The ORDERED side is
  * one of core's own ordered IndexPaths from the relation's path list, so its
  * pathkeys, direction and index quals are core's.  The LION side is one of
@@ -42,6 +49,8 @@
 #include "access/tableam_indexscan.h"
 #endif
 #include "access/stratnum.h"
+#include "access/visibilitymap.h"
+#include "access/xact.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
 #include "commands/explain.h"
@@ -68,6 +77,7 @@
 #include "pgstat.h"
 #include "storage/predicate.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -83,10 +93,19 @@
 #include "lion_count.h"
 #include "lion_costs.h"
 #include "lion_customscan.h"
+#include "lion_store.h"
+#include "lion_wal.h"
 
 /* GUCs, and the hook this file chains (all installed by lion_ordered_init). */
 bool		lion_enable_ordered_scan = true;
 bool		lion_enable_lazy_set = true;
+
+/*
+ * The store order (DESIGN.md §40): ORDER BY stored columns LIMIT n from the
+ * window store.  Off, LionOrdered offers only its walks - for comparing the
+ * two, and for the tests that show both plans of one query.
+ */
+static bool lion_enable_ordered_store = true;
 static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 
 /*
@@ -94,7 +113,9 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *
  *	LO_PRIV_SHAPE	IntList (LO_PRIV_MAGIC, LO_PRIV_NMEMBERS)
  *	LO_PRIV_ORD		OidList (the ordered index: a btree, or the lion index
- *					whose column is walked, LO_FLAG_LIONWALK)
+ *					whose column is walked, LO_FLAG_LIONWALK, or the lion
+ *					index whose store holds the ORDER BY's columns,
+ *					LO_FLAG_STORE)
  *	LO_PRIV_INTS	IntList (scan direction, flags, where a lion column's walk
  *					puts its NULL entry - LION_ORDER_NULLS_* - and the
  *					column it walks, 1-based; 0 and 0 for a btree)
@@ -111,6 +132,11 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *					IntList (attnos), OidList (sort operators), OidList
  *					(collations), IntList (nulls first); NIL when a pathkey
  *					is not a plain column, and then the walk never switches
+ *	LO_PRIV_STORE	the store order (LO_FLAG_STORE, DESIGN.md §40): IntList
+ *					(the rows it keeps - limit + offset - and, for each sort
+ *					key in LO_PRIV_SORT's order, the column of LO_PRIV_ORD's
+ *					index whose store holds it, 1-based, then whether the key
+ *					is descending); NIL for a walk
  *
  * and custom_exprs holds five lists:
  *
@@ -134,7 +160,8 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 #define LO_PRIV_TREE		4
 #define LO_PRIV_LEAVES		5
 #define LO_PRIV_SORT		6
-#define LO_PRIV_NMEMBERS	7
+#define LO_PRIV_STORE		7
+#define LO_PRIV_NMEMBERS	8
 
 /*
  * The fetch-and-sort switch (DESIGN.md §30.4, "When the walk is not paying"):
@@ -190,6 +217,7 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 
 #define LO_FLAG_LOSSY		0x0001	/* a lion index clause was lossy */
 #define LO_FLAG_LIONWALK	0x0002	/* the order is a lion column's walk */
+#define LO_FLAG_STORE		0x0004	/* the order is the store's (§40) */
 
 /* ---------------------------------------------------------------------
  * The TID set
@@ -289,6 +317,28 @@ typedef struct LoSortRow
 	Datum	   *vals;
 	bool	   *nulls;
 } LoSortRow;
+
+/*
+ * The TIDs the store order keeps (DESIGN.md §40), by their code: a row that
+ * two pieces of the set both hold - two arms of an OR, two entries of a walk
+ * - is ranked once.
+ */
+typedef struct LoTidEnt
+{
+	uint64		code;
+	char		status;
+} LoTidEnt;
+
+#define SH_PREFIX		lo_tids
+#define SH_ELEMENT_TYPE	LoTidEnt
+#define SH_KEY_TYPE		uint64
+#define SH_KEY			code
+#define SH_HASH_KEY(tb, key)	murmurhash64(key)
+#define SH_EQUAL(tb, a, b)		((a) == (b))
+#define SH_SCOPE		static inline
+#define SH_DECLARE
+#define SH_DEFINE
+#include "lib/simplehash.h"
 
 typedef struct LionOrderedState
 {
@@ -395,9 +445,44 @@ typedef struct LionOrderedState
 	int			nsrt;
 	int			srtpos;
 
+	/*
+	 * ... or the store order (DESIGN.md §40): no walk at all.  The ORDER BY's
+	 * columns are gathered from LO_PRIV_ORD's window store for the rows the
+	 * set keeps, under the §9 pin of the piece of the set they came from, and
+	 * the best storek of them kept: a max-heap of candidate slots, the worst
+	 * on top, while the set is folded, and the slots in order afterwards.
+	 */
+	bool		store;
+	int			storek;			/* rows to keep: limit + offset */
+	AttrNumber *storeattnos;	/* [nsort] the store index's columns */
+	int16	   *sortlen;		/* [nsort] the sort keys' typlen */
+	bool	   *sortbyval;		/* [nsort] ... and typbyval */
+	LionStoreReader **readers;	/* [nsort] while the set is folded */
+	bool		storenovm;		/* no interlock: every row from the heap */
+	bool		storebuilt;		/* the candidates are this execution's */
+	MemoryContext topcxt;		/* the candidates and their values */
+	int			topcap;
+	int			ntop;
+	ItemPointerData *toptid;	/* [topcap] */
+	Datum	   *topvals;		/* [topcap * nsort] */
+	bool	   *topnulls;		/* [topcap * nsort] */
+	int		   *topheap;		/* [topcap] slots: a max-heap, then sorted */
+	lo_tids_hash *toptids;		/* the TIDs of the slots */
+	int			toppos;			/* the next slot to return */
+	uint16	   *los;			/* [LION_CONTAINER_RANGE] a piece's members */
+	uint16	   *avlos;			/* ... the ones on all-visible heap pages */
+	Datum	  **gvals;			/* [nsort][LION_CONTAINER_RANGE] gathered */
+	bool	  **gnulls;
+	Datum	   *rowvals;		/* [nsort] one row's */
+	bool	   *rownulls;
+	MemoryContext rowcxt;		/* one heap row's values */
+	Buffer		vmbuf;
+
 	/* EXPLAIN ANALYZE */
 	uint64		walked;
 	uint64		hits;
+	uint64		storevals;		/* rows whose values the store gave */
+	uint64		ranked;			/* rows the store order ranked */
 	uint64		fetched;
 	uint64		removed;
 	uint64		builds;
@@ -418,6 +503,7 @@ static void lo_rescan(CustomScanState *node);
 static void lo_scan_reset(LionOrderedState *st);
 static void lo_explain(CustomScanState *node, List *ancestors,
 					   ExplainState *es);
+static List *lo_sort_keys(RelOptInfo *rel, List *pathkeys);
 
 static const CustomPathMethods lo_path_methods = {
 	.CustomName = "LionOrdered",
@@ -981,6 +1067,8 @@ typedef struct LoWalk
 
 /* The walk's custom_private marker (the btree kind's first member is a Path) */
 #define LO_WALK_MAGIC		0x4c57414c	/* "LWAL" */
+/* ... and the store order's (DESIGN.md §40) */
+#define LO_STORE_MAGIC		0x4c53544f	/* "LSTO" */
 
 /*
  * Can the walk of `var` answer rinfo: a range comparison of the column - or a
@@ -1473,6 +1561,296 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 }
 
 /*
+ * The store order (DESIGN.md §40, "The custom shapes", 2): the rows a LIMIT
+ * takes of an ORDER BY of stored columns, ranked from the window store.
+ *
+ * The node then returns only the rows it keeps, limit + offset of them, and
+ * so may be offered only where nothing between it and the LIMIT can want a
+ * row more: the relation is the whole query - or a partition, or a member of
+ * a UNION ALL, of the relation that is, whose Append or MergeAppend the
+ * ORDER BY and the LIMIT are above - and core's limit_tuples, which it
+ * computes only for a query with no grouping, aggregate, window, DISTINCT or
+ * set-returning target, says how many rows that is.  FOR UPDATE is
+ * declined: LockRows sits between the scan and the LIMIT and can drop a row
+ * a concurrent update moved, after which the LIMIT pulls one more; so is
+ * WITH TIES, whose LIMIT takes the rows that tie with the last; and so is a
+ * LIMIT or OFFSET that is not a constant (limit_tuples is then -1).  The
+ * ORDER BY must be the path's whole order: an Incremental Sort above it
+ * would need every row that ties with the last.  Returns limit + offset, or
+ * 0 where the shape does not hold.
+ */
+static double
+lo_store_limit(PlannerInfo *root, RelOptInfo *rel)
+{
+	Relids		top;
+
+	if (root->sort_pathkeys == NIL || root->parse->rowMarks != NIL ||
+		root->parse->limitOption == LIMIT_OPTION_WITH_TIES)
+		return 0.0;
+	if (root->limit_tuples < 1.0 || root->limit_tuples > (double) (INT_MAX / 2))
+		return 0.0;
+	top = (rel->reloptkind == RELOPT_OTHER_MEMBER_REL) ?
+		rel->top_parent_relids : rel->relids;
+	if (top == NULL || !bms_equal(top, root->all_baserels))
+		return 0.0;
+	return floor(root->limit_tuples);
+}
+
+/*
+ * A lion index of rel whose window store holds every column the ORDER BY
+ * sorts by (DESIGN.md §40): each a plain column of the table (sortkeys, from
+ * lo_sort_keys()), stored as the column's own datum in the table's type -
+ * LionStoreCol.returnable, never a multi-key column, which is never stored -
+ * in an index that has a slot for every row the query can return: one that
+ * is not partial, or whose predicate the query implies; of several, the one
+ * whose store reads the fewest pages a window and column, and of those one
+ * the lion side `lion` reads, if it reads one - any index's store will do
+ * (lion_count_int.h: one pin is enough), but EXPLAIN reads more easily so.
+ * Fills the store's columns, their directions, and the store pages a
+ * window of them reads.
+ */
+typedef struct LoStore
+{
+	IndexOptInfo *index;
+	List	   *attnos;			/* the index's column of each sort key */
+	List	   *descs;			/* each sort key descending */
+	int			nkeys;
+	double		pagesper;		/* store pages a window reads, all the keys */
+	double		width;			/* bytes a candidate keeps */
+} LoStore;
+
+/* What a candidate costs in memory besides its values (lo_store_fold()). */
+#define LO_TOP_ENTRY_BYTES	((double) (sizeof(ItemPointerData) + 2 * sizeof(int) + 16))
+
+/* Does the lion side read index? */
+static bool
+lo_path_reads(Path *path, Oid indexoid)
+{
+	List	   *arms;
+	ListCell   *lc;
+
+	if (path == NULL)
+		return false;
+	if (IsA(path, IndexPath))
+		return ((IndexPath *) path)->indexinfo->indexoid == indexoid;
+	if (IsA(path, BitmapAndPath))
+		arms = ((BitmapAndPath *) path)->bitmapquals;
+	else if (IsA(path, BitmapOrPath))
+		arms = ((BitmapOrPath *) path)->bitmapquals;
+	else
+		return false;
+	foreach(lc, arms)
+		if (lo_path_reads((Path *) lfirst(lc), indexoid))
+			return true;
+	return false;
+}
+
+static bool
+lo_store_find(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
+			  List *lionidx, List *sortkeys, Path *lion, LoStore *st)
+{
+	List	   *hattnos = (List *) linitial(sortkeys);
+	bool		found_any = false;
+	bool		bestreads = false;
+	ListCell   *lc;
+
+	foreach(lc, lionidx)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		Relation	indexrel;
+		LionIndexState *ix;
+		List	   *attnos = NIL;
+		List	   *ords = NIL;
+		double		width = LO_TOP_ENTRY_BYTES;
+		bool		ok = true;
+		ListCell   *lc2;
+
+		if (idx->indpred != NIL && !idx->predOK)
+			continue;
+		indexrel = index_open(idx->indexoid, AccessShareLock);
+		ix = lion_get_index_state(indexrel);
+		if (ix->nstored == 0)
+		{
+			index_close(indexrel, AccessShareLock);
+			continue;
+		}
+		foreach(lc2, hattnos)
+		{
+			AttrNumber	hattno = (AttrNumber) lfirst_int(lc2);
+			Oid			type = get_atttype(rte->relid, hattno);
+			int			found = 0;
+			int			c;
+
+			for (c = 0; c < idx->ncolumns && found == 0; c++)
+			{
+				int			ord;
+
+				if (idx->indexkeys[c] != hattno)
+					continue;
+				ord = lion_store_ordinal(ix, (AttrNumber) (c + 1));
+				if (ord >= 0 && ix->stored[ord].returnable &&
+					ix->stored[ord].typid == type)
+				{
+					const LionStoreCol *col = &ix->stored[ord];
+					int32		w = 0;
+
+					found = c + 1;
+					if (col->typlen > 0)
+						w = col->typlen;
+					else if (hattno >= rel->min_attr && hattno <= rel->max_attr)
+						w = rel->attr_widths[hattno - rel->min_attr];
+					if (w <= 0)
+						w = get_typavgwidth(type, -1);
+					width += (double) w + sizeof(Datum) + sizeof(bool) +
+						(col->typbyval ? 0.0 : 16.0);
+				}
+			}
+			if (found == 0)
+			{
+				ok = false;
+				break;
+			}
+			attnos = lappend_int(attnos, found);
+			ords = lappend_int(ords, lion_store_ordinal(ix, (AttrNumber) found));
+		}
+		if (ok)
+		{
+			LionMetaStore ms;
+			double		windows = Max(1.0, ceil((double) rel->pages /
+												LION_BLOCKS_PER_CONTAINER));
+			double		pagesper = 0.0;
+			double		allw = 0.0;
+			bool		reads = lo_path_reads(lion, idx->indexoid);
+			int			i;
+
+			/*
+			 * The store's pages a window, shared among its columns by the
+			 * width of their slots - a gather reads only its column's pages
+			 * - and at least one a column read.
+			 */
+			lion_read_meta_store(indexrel, &ix->meta, &ms);
+			for (i = 0; i < ix->nstored; i++)
+				allw += (double) Max(ix->stored[i].rawwidth, 1);
+			foreach(lc2, ords)
+			{
+				double		w = (double) Max(ix->stored[lfirst_int(lc2)].rawwidth, 1);
+
+				pagesper += Max(1.0, (double) ms.store_pages * w / allw /
+								windows);
+			}
+			if (found_any &&
+				(pagesper > st->pagesper ||
+				 (pagesper == st->pagesper && (bestreads || !reads))))
+			{
+				index_close(indexrel, AccessShareLock);
+				continue;		/* another store is as good */
+			}
+			found_any = true;
+			bestreads = reads;
+			st->index = idx;
+			st->attnos = attnos;
+			st->nkeys = list_length(attnos);
+			st->width = width;
+			st->pagesper = pagesper;
+			st->descs = NIL;
+			foreach(lc2, root->sort_pathkeys)
+			{
+				PathKey    *pk = (PathKey *) lfirst(lc2);
+
+#if PG_VERSION_NUM >= 180000
+				st->descs = lappend_int(st->descs, pk->pk_cmptype == COMPARE_GT);
+#else
+				st->descs = lappend_int(st->descs,
+										pk->pk_strategy == BTGreaterStrategyNumber);
+#endif
+			}
+		}
+		index_close(indexrel, AccessShareLock);
+	}
+	return found_any;
+}
+
+/*
+ * The price of the store order with one lion access (DESIGN.md §40, "Costs"),
+ * the rows its set keeps, and the size the set would have.  It is §30.3's
+ * set without the walk:
+ *
+ *	- start-up: the lion lookups and a container's work per container key,
+ *	  as §30.3; the gather - LION_STORE_VALUE_COST a value of each sort key
+ *	  for the rows kept on all-visible heap pages, LION_STORE_PAGE_COST a
+ *	  store page each window reads, the store's pages over the heap's
+ *	  windows, shared among the stored columns by their slots' widths, at
+ *	  least one a sort key (lo_store_find()); the rows on the other pages
+ *	  fetched from the heap, as §9 prices a recheck
+ *	  (a heap page's read, lion_heap_page_cost(), and LION_RECHECK_TID_COST a
+ *	  row); and the ranking, as core prices a bounded sort, two operator
+ *	  costs a comparison and log2(2 n) comparisons a row;
+ *	- run: the n rows fetched, at random, as cost_index() prices them, and
+ *	  the target per row.
+ *
+ * Nothing is converted (§39, "Not converted at all"): LionOrdered competes
+ * with the relation's own scans, and lo_add_path() offers it at the margin
+ * as it offers the walks.
+ */
+static void
+lo_cost_store(PlannerInfo *root, RelOptInfo *rel, Path *lion, LoStore *s,
+			  double k, Cost *startup_p, Cost *total_p, double *kept_p,
+			  double *setbytes)
+{
+	double		tuples = Max(rel->tuples, 1.0);
+	double		pages = Max((double) rel->pages, 1.0);
+	double		allvis = Min(Max(rel->allvisfrac, 0.0), 1.0);
+	Cost		lioncost;
+	Selectivity sel;
+	double		members;
+	double		ncont;
+	double		stored;
+	double		dirty;
+	double		fetched;
+	double		spc_random;
+	double		spc_seq;
+	Cost		startup;
+	Cost		run;
+
+	cost_bitmap_tree_node(lion, &lioncost, &sel);
+	members = clamp_row_est(sel * tuples);
+	ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
+	*setbytes = ncont * (LION_CONTAINER_HDRSZ + LO_ENTRY_BYTES) +
+		Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES);
+	*kept_p = members;
+
+	/* the lookups, and a container's work for each key of the answer */
+	startup = lioncost + ncont * cpu_operator_cost;
+
+	/* the gather, on the all-visible pages, and the heap on the others */
+	stored = members * allvis;
+	dirty = members - stored;
+	startup += stored * s->nkeys * LION_STORE_VALUE_COST +
+		ncont * s->pagesper * LION_STORE_PAGE_COST;
+	if (dirty > 0.0)
+	{
+		double		dirtypages = Min(dirty, ceil(pages * (1.0 - allvis)));
+
+		startup += dirtypages * lion_heap_page_cost(root, rel, dirtypages,
+													pages) +
+			dirty * LION_RECHECK_TID_COST;
+	}
+
+	/* the bounded heap of the n best, as cost_sort() prices one */
+	startup += 2.0 * cpu_operator_cost * members * (log(2.0 * k) / log(2.0));
+	startup += rel->reltarget->cost.startup;
+
+	/* the n rows, fetched in their order, which is no order of the heap's */
+	fetched = Min(k, members);
+	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
+	run = index_pages_fetched(fetched, rel->pages, 0.0, root) * spc_random +
+		fetched * (cpu_tuple_cost + rel->reltarget->cost.per_tuple);
+
+	*startup_p = startup;
+	*total_p = startup + run;
+}
+
+/*
  * The margin the paths of the relation lion_ordered_set_rel_pathlist() is
  * adding them to are offered at (lion_units_margin_for()), found before the
  * first is added and can free a scan of core's.
@@ -1524,6 +1902,9 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	ListCell   *lc2;
 	Size		limit;
 	double		rows;
+	double		storek = 0.0;
+	List	   *storesort = NIL;
+	LoStore		store;
 
 	if (lion_prev_set_rel_pathlist_hook != NULL)
 		lion_prev_set_rel_pathlist_hook(root, rel, rti, rte);
@@ -1581,7 +1962,21 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 
 	/* ... and the walks of lion's own ordered columns (§30.11) */
 	walks = lo_lion_walks(root, rel, rte, lionidx);
-	if (ordpaths == NIL && walks == NIL)
+
+	/*
+	 * ... or no walk at all: the ORDER BY's columns from a window store, for
+	 * the rows a LIMIT takes (DESIGN.md §40), when the set answers the WHERE.
+	 */
+	memset(&store, 0, sizeof(store));
+	if (lion_enable_ordered_store && rel->baserestrictinfo != NIL &&
+		(storek = lo_store_limit(root, rel)) > 0.0)
+	{
+		storesort = lo_sort_keys(rel, root->sort_pathkeys);
+		if (storesort == NIL ||
+			!lo_store_find(root, rel, rte, lionidx, storesort, NULL, &store))
+			storek = 0.0;
+	}
+	if (ordpaths == NIL && walks == NIL && storek == 0.0)
 		return;
 
 	/* the heap table AM only (§2); ambuild refused every other */
@@ -1610,10 +2005,10 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	rows = lion_probe_rel_rows(root, rel);
 
 	/*
-	 * The lion side of a btree walk, as core would build it for every
-	 * restriction clause.
+	 * The lion side of a btree walk, and of the store order, as core would
+	 * build it for every restriction clause.
 	 */
-	if (ordpaths != NIL)
+	if (ordpaths != NIL || storek > 0.0)
 		cands = lo_lion_accesses(root, rel, lionidx, NIL, lionam);
 
 	foreach(lc, ordpaths)
@@ -1682,6 +2077,54 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			priv = lappend(priv, w->vrinfos);
 			lo_add_path(rel, list_make1(w->pathkey), priv, rows, startup,
 						total);
+		}
+	}
+
+	/*
+	 * The store order (DESIGN.md §40): one path per lion access whose set is
+	 * the whole WHERE - exact, with nothing left for a filter, since a row
+	 * the node ranks is a row it returns - and only while the rows it keeps
+	 * are a small share of the set's, at most a quarter, and fit in
+	 * work_mem; past that the walks and core's Sort are what the query
+	 * gets.  Its order is the ORDER BY's, so that core puts no Sort above
+	 * it, and its rows are the ones it keeps.
+	 */
+	if (storek > 0.0)
+	{
+		foreach(lc, cands)
+		{
+			Path	   *lion = (Path *) lfirst(lc);
+			List	   *lionrinfos = NIL;
+			bool		lossy = false;
+			List	   *lionqual = lo_lion_qual(lion, &lionrinfos, &lossy);
+			List	   *storeinfo;
+			Cost		startup;
+			Cost		total;
+			double		setbytes;
+			double		kept;
+
+			if (lossy ||
+				lo_residual(rel->baserestrictinfo, NIL, lionrinfos,
+							lionqual) != NIL)
+				continue;
+			if (!lo_store_find(root, rel, rte, lionidx, storesort, lion,
+							   &store))
+				continue;		/* cannot happen: it was found above */
+			storeinfo = list_make3_int(LO_STORE_MAGIC, (int) storek,
+									   store.nkeys);
+			storeinfo = list_concat(storeinfo, store.attnos);
+			storeinfo = list_concat(storeinfo, store.descs);
+			lo_cost_store(root, rel, lion, &store, storek, &startup, &total,
+						  &kept, &setbytes);
+			/* only an AND's other sides are ever held as sets */
+			if (!IsA(lion, IndexPath) && setbytes > (double) limit)
+				continue;		/* the set would not fit (§30.3) */
+			if (storek > kept / 4.0 ||
+				storek * store.width > (double) work_mem * 1024.0)
+				continue;		/* too many rows to rank */
+			lo_add_path(rel, root->sort_pathkeys,
+						list_make3(storeinfo, store.index, lion),
+						clamp_row_est(Min(storek, rows)), startup, total);
 		}
 	}
 }
@@ -1787,6 +2230,7 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	int			nulls = LION_ORDER_NULLS_NONE;
 	int			walkattno = 0;
 	Oid			ordoid;
+	List	   *store = NIL;
 	ListCell   *lc;
 
 	if (IsA(linitial(best_path->custom_private), IndexPath))
@@ -1812,6 +2256,23 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		}
 		ordoid = ord->indexinfo->indexoid;
 		dir = (int) ord->indexscandir;
+	}
+	else if (linitial_int((List *) linitial(best_path->custom_private)) ==
+			 LO_STORE_MAGIC)
+	{
+		/*
+		 * The store order (DESIGN.md §40): the index whose store holds the
+		 * ORDER BY's columns, the rows to keep and those columns; no walk,
+		 * and so no quals of its own.
+		 */
+		List	   *storeinfo = (List *) linitial(best_path->custom_private);
+		IndexOptInfo *idx = (IndexOptInfo *) lsecond(best_path->custom_private);
+
+		lion = (Path *) lthird(best_path->custom_private);
+		store = list_copy_tail(storeinfo, 1);
+		ordoid = idx->indexoid;
+		dir = (int) ForwardScanDirection;
+		flags |= LO_FLAG_STORE;
 	}
 	else
 	{
@@ -1851,6 +2312,10 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	}
 	residual = lo_residual(clauses, ordrinfos, lionrinfos, lionqual);
 
+	/* a row the store order ranks is a row it returns: nothing filters it */
+	if (store != NIL && (residual != NIL || lion == NULL || lossy))
+		elog(ERROR, "LionOrdered: a store order with a filter");
+
 	cscan->scan.plan.targetlist = tlist;
 	cscan->scan.plan.qual = extract_actual_clauses(residual, false);
 	cscan->scan.scanrelid = rel->relid;
@@ -1868,6 +2333,7 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->custom_private = lappend(cscan->custom_private, leaves);
 	cscan->custom_private = lappend(cscan->custom_private,
 									lo_sort_keys(rel, best_path->path.pathkeys));
+	cscan->custom_private = lappend(cscan->custom_private, store);
 	cscan->methods = &lo_scan_methods;
 
 	return &cscan->scan.plan;
@@ -2882,6 +3348,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->dir = (ScanDirection) linitial_int(ints);
 	st->lossyqual = (lsecond_int(ints) & LO_FLAG_LOSSY) != 0;
 	st->lionwalk = (lsecond_int(ints) & LO_FLAG_LIONWALK) != 0;
+	st->store = (lsecond_int(ints) & LO_FLAG_STORE) != 0;
 	st->walknulls = lthird_int(ints);
 	st->walkattno = (AttrNumber) lfourth_int(ints);
 	ordcols = (List *) list_nth(cscan->custom_private, LO_PRIV_ORDCOLS);
@@ -2922,6 +3389,29 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	}
 	if (leafno != st->nleaves || qualno != list_length(lionquals))
 		elog(ERROR, "LionOrdered: malformed lion tree");
+
+	/*
+	 * The store order (DESIGN.md §40): the rows it keeps, and the store
+	 * index's column of each sort key, which are LO_PRIV_SORT's.
+	 */
+	if (st->store)
+	{
+		List	   *sl = (List *) list_nth(cscan->custom_private, LO_PRIV_STORE);
+		List	   *sk = (List *) list_nth(cscan->custom_private, LO_PRIV_SORT);
+		int			n;
+
+		if (sl == NIL || !IsA(sl, IntList) || list_length(sl) < 2 ||
+			sk == NIL || st->noset || st->lionwalk)
+			elog(ERROR, "LionOrdered: malformed store order");
+		st->storek = linitial_int(sl);
+		n = lsecond_int(sl);
+		if (st->storek < 1 || n < 1 || list_length(sl) != 2 + 2 * n ||
+			list_length((List *) linitial(sk)) != n)
+			elog(ERROR, "LionOrdered: malformed store order");
+		st->storeattnos = (AttrNumber *) palloc(sizeof(AttrNumber) * n);
+		for (i = 0; i < n; i++)
+			st->storeattnos[i] = (AttrNumber) list_nth_int(sl, 2 + i);
+	}
 
 	/* EXPLAIN without ANALYZE opens nothing (it names indexes by Oid). */
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
@@ -2985,12 +3475,13 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	ExecIndexBuildScanKeys(&node->ss.ps, st->ordidx, fixed, false,
 						   &st->okeys, &st->nokeys,
 						   &st->ortkeys, &st->nortkeys, NULL, NULL);
-	if (st->lionwalk)
+	if (st->lionwalk || st->store)
 	{
 		/*
 		 * The walk reads the lion index without index_beginscan(), as the
 		 * set does: a relation predicate lock first (§30.5), and the heap
-		 * fetch state of an index scan for what it meets.
+		 * fetch state of an index scan for what it meets.  So does the store
+		 * order, whose rows are fetched by their TIDs as the walk's are.
 		 */
 		PredicateLockRelation(st->ordidx, estate->es_snapshot);
 #if PG_VERSION_NUM >= 200000
@@ -3021,8 +3512,46 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	/* which Params a rescan has to rebuild the set for */
 	st->lionparams = pull_paramids((Expr *) lionquals);
 
+	/*
+	 * The store order's candidates, and what a fold needs (DESIGN.md §40).
+	 * Its sort keys are LO_PRIV_SORT's, the relation's own columns; their
+	 * values are copied as the table's tuple descriptor says.
+	 */
+	if (st->store)
+	{
+		TupleDesc	desc = RelationGetDescr(node->ss.ss_currentRelation);
+
+		if (st->nsort < 1)
+			elog(ERROR, "LionOrdered: a store order without sort keys");
+		st->sortlen = (int16 *) palloc(sizeof(int16) * st->nsort);
+		st->sortbyval = (bool *) palloc(sizeof(bool) * st->nsort);
+		st->readers = (LionStoreReader **) palloc0(sizeof(LionStoreReader *) * st->nsort);
+		st->gvals = (Datum **) palloc(sizeof(Datum *) * st->nsort);
+		st->gnulls = (bool **) palloc(sizeof(bool *) * st->nsort);
+		st->rowvals = (Datum *) palloc(sizeof(Datum) * st->nsort);
+		st->rownulls = (bool *) palloc(sizeof(bool) * st->nsort);
+		for (i = 0; i < st->nsort; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(desc, st->sortattnos[i] - 1);
+
+			st->sortlen[i] = att->attlen;
+			st->sortbyval[i] = att->attbyval;
+			st->gvals[i] = (Datum *) palloc(sizeof(Datum) * LION_CONTAINER_RANGE);
+			st->gnulls[i] = (bool *) palloc(sizeof(bool) * LION_CONTAINER_RANGE);
+		}
+		st->los = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
+		st->avlos = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
+		st->topcxt = AllocSetContextCreate(estate->es_query_cxt,
+										   "LionOrdered store order",
+										   ALLOCSET_DEFAULT_SIZES);
+		st->rowcxt = AllocSetContextCreate(estate->es_query_cxt,
+										   "LionOrdered store row",
+										   ALLOCSET_SMALL_SIZES);
+		st->vmbuf = InvalidBuffer;
+	}
+
 	/* the set evaluated lazily, when every leaf's keys can be sought (§30.4) */
-	st->lazyok = lion_enable_lazy_set && lo_lazy_ok(st);
+	st->lazyok = lion_enable_lazy_set && !st->store && lo_lazy_ok(st);
 	if (st->lazyok)
 	{
 		st->lazycxt = AllocSetContextCreate(estate->es_query_cxt,
@@ -3087,10 +3616,10 @@ lo_fetch_btree(LionOrderedState *st, TupleTableSlot *slot)
  * dead entries: lion has no such hint.
  */
 static bool
-lo_fetch_walk(LionOrderedState *st, TupleTableSlot *slot)
+lo_fetch_tid(LionOrderedState *st, ItemPointer root, TupleTableSlot *slot)
 {
 	Snapshot	snapshot = st->css.ss.ps.state->es_snapshot;
-	ItemPointerData tid = st->walktid;
+	ItemPointerData tid = *root;
 	bool		all_dead = false;
 #if PG_VERSION_NUM >= 200000
 	Relation	heap = st->css.ss.ss_currentRelation;
@@ -3104,6 +3633,12 @@ lo_fetch_walk(LionOrderedState *st, TupleTableSlot *slot)
 	return table_index_fetch_tuple(st->fetch, &tid, snapshot, slot,
 								   &call_again, &all_dead);
 #endif
+}
+
+static bool
+lo_fetch_walk(LionOrderedState *st, TupleTableSlot *slot)
+{
+	return lo_fetch_tid(st, &st->walktid, slot);
 }
 
 static bool
@@ -3389,6 +3924,610 @@ lo_sort_next(LionOrderedState *st, TupleTableSlot *slot)
 	return slot;
 }
 
+/* ---------------------------------------------------------------------
+ * The store order (DESIGN.md §40, "The custom shapes", 2)
+ * --------------------------------------------------------------------- */
+
+#define LO_TOPV(st, s)	(&(st)->topvals[(Size) (s) * (st)->nsort])
+#define LO_TOPN(st, s)	(&(st)->topnulls[(Size) (s) * (st)->nsort])
+
+/*
+ * Order two rows' keys as the ORDER BY does: the pathkeys' own sort
+ * operators, collations and NULLS placement, through SortSupport, as core's
+ * Sort compares them (lo_cmp_rows()).
+ */
+static inline int
+lo_top_cmp(LionOrderedState *st, const Datum *va, const bool *na,
+		   const Datum *vb, const bool *nb)
+{
+	int			i;
+
+	for (i = 0; i < st->nsort; i++)
+	{
+		int			c = ApplySortComparator(va[i], na[i], vb[i], nb[i],
+											&st->sortkeys[i]);
+
+		if (c != 0)
+			return c;
+	}
+	return 0;
+}
+
+static inline int
+lo_top_cmp_slots(LionOrderedState *st, int a, int b)
+{
+	return lo_top_cmp(st, LO_TOPV(st, a), LO_TOPN(st, a),
+					  LO_TOPV(st, b), LO_TOPN(st, b));
+}
+
+static int
+lo_top_qcmp(const void *a, const void *b, void *arg)
+{
+	return lo_top_cmp_slots((LionOrderedState *) arg, *(const int *) a,
+							*(const int *) b);
+}
+
+/* The heap of candidates keeps its worst - the last in order - on top. */
+static void
+lo_top_sift_down(LionOrderedState *st, int i)
+{
+	int		   *h = st->topheap;
+
+	for (;;)
+	{
+		int			l = 2 * i + 1;
+		int			m = i;
+		int			t;
+
+		if (l < st->ntop && lo_top_cmp_slots(st, h[l], h[m]) > 0)
+			m = l;
+		if (l + 1 < st->ntop && lo_top_cmp_slots(st, h[l + 1], h[m]) > 0)
+			m = l + 1;
+		if (m == i)
+			return;
+		t = h[i];
+		h[i] = h[m];
+		h[m] = t;
+		i = m;
+	}
+}
+
+static void
+lo_top_sift_up(LionOrderedState *st, int i)
+{
+	int		   *h = st->topheap;
+
+	while (i > 0)
+	{
+		int			p = (i - 1) / 2;
+		int			t;
+
+		if (lo_top_cmp_slots(st, h[i], h[p]) <= 0)
+			return;
+		t = h[i];
+		h[i] = h[p];
+		h[p] = t;
+		i = p;
+	}
+}
+
+/* Room for more candidates, up to the rows the node keeps. */
+static void
+lo_top_grow(LionOrderedState *st)
+{
+	int			cap = (int) Min((int64) st->topcap * 2, (int64) st->storek);
+	Size		n = (Size) cap * st->nsort;
+
+	st->toptid = (ItemPointerData *)
+		repalloc_huge(st->toptid, sizeof(ItemPointerData) * cap);
+	st->topvals = (Datum *) repalloc_huge(st->topvals, sizeof(Datum) * n);
+	st->topnulls = (bool *) repalloc_huge(st->topnulls, sizeof(bool) * n);
+	st->topheap = (int *) repalloc_huge(st->topheap, sizeof(int) * cap);
+	st->topcap = cap;
+}
+
+/*
+ * Rank one row the set keeps: tid, a TID the set holds - the root of its HOT
+ * chain, which is what is fetched again at the end - and its sort keys, a
+ * row the snapshot sees (lo_store_piece()).  It is kept when fewer than
+ * storek are, or when it comes strictly before the worst of them, which it
+ * then replaces; a row that ties with the worst is not taken, so a row that
+ * has left the heap, or never entered it, can never come back, and a TID met
+ * again only has to be looked for among the rows kept.
+ */
+static void
+lo_store_fold(LionOrderedState *st, ItemPointer tid, const Datum *vals,
+			  const bool *nulls)
+{
+	uint64		code = lion_tid_to_code(tid);
+	MemoryContext oldcxt;
+	bool		found;
+	bool		added;
+	int			slot;
+	int			k;
+
+	st->ranked++;
+	if (st->ntop >= st->storek)
+	{
+		slot = st->topheap[0];
+		if (lo_top_cmp(st, vals, nulls, LO_TOPV(st, slot), LO_TOPN(st, slot)) >= 0)
+			return;
+	}
+	if (lo_tids_lookup(st->toptids, code) != NULL)
+		return;					/* kept already, through another piece */
+
+	oldcxt = MemoryContextSwitchTo(st->topcxt);
+	added = (st->ntop < st->storek);
+	if (added)
+	{
+		if (st->ntop == st->topcap)
+			lo_top_grow(st);
+		slot = st->ntop;
+		st->topheap[st->ntop++] = slot;
+	}
+	else
+	{
+		/* the worst goes, with its values */
+		slot = st->topheap[0];
+		for (k = 0; k < st->nsort; k++)
+			if (!st->sortbyval[k] && !LO_TOPN(st, slot)[k])
+				pfree(DatumGetPointer(LO_TOPV(st, slot)[k]));
+		lo_tids_delete(st->toptids, lion_tid_to_code(&st->toptid[slot]));
+	}
+	st->toptid[slot] = *tid;
+	for (k = 0; k < st->nsort; k++)
+	{
+		LO_TOPN(st, slot)[k] = nulls[k];
+		LO_TOPV(st, slot)[k] = nulls[k] ? (Datum) 0 :
+			datumCopy(vals[k], st->sortbyval[k], st->sortlen[k]);
+	}
+	(void) lo_tids_insert(st->toptids, code, &found);
+	MemoryContextSwitchTo(oldcxt);
+
+	if (added)
+		lo_top_sift_up(st, st->ntop - 1);
+	else
+		lo_top_sift_down(st, 0);
+}
+
+/*
+ * A row of the set from the heap (DESIGN.md §40, "Reads"): one on a page the
+ * visibility map does not call all-visible, one of a heap page the store left
+ * to the heap (ABSENT, or no store yet), or one of a piece without the §9
+ * interlock.  The fetch settles its visibility and its values together; a
+ * row of an inexact piece is also tested against the lion qual, as §30.4's
+ * recheck tests a member.
+ */
+static void
+lo_store_heap(LionOrderedState *st, ItemPointer tid, bool exact)
+{
+	TupleTableSlot *slot = st->css.ss.ss_ScanTupleSlot;
+	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
+	MemoryContext oldcxt;
+	int			k;
+
+	if (!lo_fetch_tid(st, tid, slot))
+		return;
+	st->fetched++;
+	if (!exact)
+	{
+		ResetExprContext(econtext);
+		econtext->ecxt_scantuple = slot;
+		if (!ExecQual(st->lionrecheck, econtext))
+		{
+			st->removed++;
+			ExecClearTuple(slot);
+			return;
+		}
+	}
+
+	/* the values, detoasted, as the store would give them */
+	MemoryContextReset(st->rowcxt);
+	oldcxt = MemoryContextSwitchTo(st->rowcxt);
+	for (k = 0; k < st->nsort; k++)
+	{
+		Datum		v = slot_getattr(slot, st->sortattnos[k], &st->rownulls[k]);
+
+		if (!st->rownulls[k] && st->sortlen[k] == -1)
+			v = PointerGetDatum(PG_DETOAST_DATUM_PACKED(v));
+		st->rowvals[k] = v;
+	}
+	MemoryContextSwitchTo(oldcxt);
+	lo_store_fold(st, tid, st->rowvals, st->rownulls);
+	ExecClearTuple(slot);
+}
+
+/*
+ * One piece of the set: container c, whose members all belong to the set, at
+ * a moment when the page every member of it came from is still PINNED, if
+ * `exact` - the caller lets go of that pin only after this returns.  That is
+ * the §9 interlock, and it is what lets the store's value stand for a row:
+ * the visibility map is asked about c's heap pages under the pin, and on a
+ * page it calls all-visible a member is a row every snapshot sees, whose
+ * slot its own insert wrote and VACUUM cannot have cleared or given to
+ * another row (DESIGN.md §40, "Why it is safe", lion_store.h).  Those rows'
+ * values are gathered from the store, and the others' come from the heap
+ * (lo_store_heap()): every row of a page that is not all-visible, of a heap
+ * page the store leaves to the heap, and every row of a piece that is not
+ * exact - it has no pin, or comes from a superset that must be rechecked -
+ * or of a hot standby where the pin interlocks nothing (§9, "Hot standby").
+ * Under SERIALIZABLE the heap pages served from the store are predicate-
+ * locked, as an index-only scan locks the pages it does not visit.
+ */
+static void
+lo_store_piece(LionOrderedState *st, const LionContainer *c, bool exact)
+{
+	Relation	heap = st->css.ss.ss_currentRelation;
+	BlockNumber firstblk = lion_ckey_first_block(c->ckey);
+	uint64		allvis = 0;
+	uint64		served = 0;
+	uint32		n;
+	uint32		i;
+	int			k;
+
+	st->ncont++;
+	if (!exact)
+		st->exact = false;
+	n = lion_container_to_array(c, st->los);
+
+	if (exact && !st->storenovm)
+	{
+		uint64		m = lion_container_block_mask(c);
+
+		while (m != 0)
+		{
+			int			b = pg_rightmost_one_pos64(m);
+
+			m &= m - 1;
+			if (VM_ALL_VISIBLE(heap, firstblk + (BlockNumber) b, &st->vmbuf))
+				allvis |= UINT64CONST(1) << b;
+		}
+	}
+
+	if (allvis != 0)
+	{
+		uint64		absent = 0;
+		int			nav = 0;
+
+		for (i = 0; i < n; i++)
+			if (allvis & (UINT64CONST(1) << (st->los[i] >> LION_OFFSET_BITS)))
+				st->avlos[nav++] = st->los[i];
+		for (k = 0; k < st->nsort; k++)
+		{
+			uint64		a;
+
+			lion_store_gather(st->readers[k], c->ckey, st->avlos, nav,
+							  st->gvals[k], st->gnulls[k], &a);
+			absent |= a;
+		}
+		served = allvis & ~absent;
+		for (i = 0; i < (uint32) nav; i++)
+		{
+			ItemPointerData tid;
+
+			if ((served & (UINT64CONST(1) << (st->avlos[i] >> LION_OFFSET_BITS))) == 0)
+				continue;
+			for (k = 0; k < st->nsort; k++)
+			{
+				st->rowvals[k] = st->gvals[k][i];
+				st->rownulls[k] = st->gnulls[k][i];
+			}
+			lion_code_to_tid(lion_make_code(c->ckey, st->avlos[i]), &tid);
+			st->storevals++;
+			lo_store_fold(st, &tid, st->rowvals, st->rownulls);
+		}
+		for (k = 0; k < st->nsort; k++)
+			lion_store_gather_reset(st->readers[k]);
+
+		if (served != 0 && IsolationIsSerializable())
+		{
+			Snapshot	snapshot = st->css.ss.ps.state->es_snapshot;
+			uint64		m = served;
+
+			while (m != 0)
+			{
+				int			b = pg_rightmost_one_pos64(m);
+
+				m &= m - 1;
+				PredicateLockPage(heap, firstblk + (BlockNumber) b, snapshot);
+			}
+		}
+	}
+
+	for (i = 0; i < n; i++)
+	{
+		ItemPointerData tid;
+
+		if (served & (UINT64CONST(1) << (st->los[i] >> LION_OFFSET_BITS)))
+			continue;
+		CHECK_FOR_INTERRUPTS();
+		lion_code_to_tid(lion_make_code(c->ckey, st->los[i]), &tid);
+		lo_store_heap(st, &tid, exact);
+	}
+}
+
+/*
+ * Fold node's answer into the candidates, a piece at a time while the page
+ * each piece came from is pinned (DESIGN.md §40: §30's finished set holds no
+ * pin, so the fold has to happen while the set is being made).
+ *
+ * The set's own build cannot give that: each leaf is read whole, pinless
+ * (§30.4), and a container key's answer is final only once every leaf has
+ * been read and combined.  So the store order reads the tree differently:
+ *
+ *	- a LEAF is opened with keeppins, and each container it hands out is
+ *	  folded before the source moves past it - its pin is still held -,
+ *	  ANDed first with the masks the ANDs above it made (below).  A source
+ *	  that is not exact (a UNION, which pins nothing, a set located past the
+ *	  pin budget, a multi-key recheck) has its pieces folded from the heap
+ *	  with the recheck;
+ *	- an OR folds each of its children: its answer is their union, and a row
+ *	  two of them hold is ranked once (lo_store_fold());
+ *	- an AND reads one child the pinned way, the first leaf among them - the
+ *	  DRIVER - and builds the others into a set as §30.4 builds one, pinless,
+ *	  which masks the driver's pieces.  Every row of the AND is a row of the
+ *	  driver's piece, so the driver's pin is the interlock for all of them
+ *	  (lion_count_int.h: one pin is enough).  A mask that degraded (§30.4)
+ *	  keeps the driver's piece whole at its keys, and the piece is rechecked.
+ */
+static void
+lo_store_node(LionOrderedState *st, LoNode *node, List *masks, bool maskexact)
+{
+	int			i;
+
+	if (node->kind == LO_NODE_LEAF)
+	{
+		LoLeaf	   *leaf = node->leaf;
+		LionSource *src;
+		LionContainer *buf[2] = {NULL, NULL};
+		const LionContainer *c;
+
+		src = lion_source_open(leaf->index, leaf->keys, leaf->nkeys, true,
+							   st->buildcxt);
+		pgstat_count_index_scan(leaf->index);
+		if (masks != NIL)
+		{
+			buf[0] = (LionContainer *) MemoryContextAlloc(st->buildcxt,
+														  LION_CONTAINER_MAX_SIZE);
+			buf[1] = (LionContainer *) MemoryContextAlloc(st->buildcxt,
+														  LION_CONTAINER_MAX_SIZE);
+		}
+		while ((c = lion_source_next(src)) != NULL)
+		{
+			const LionContainer *piece = c;
+			bool		exact = maskexact && !st->lossyqual &&
+				lion_source_exact(src);
+			bool		skip = false;
+			int			b = 0;
+			ListCell   *lc;
+
+			CHECK_FOR_INTERRUPTS();
+			if (c->cardinality == 0)
+				continue;
+			foreach(lc, masks)
+			{
+				LionTidSet *m = (LionTidSet *) lfirst(lc);
+				int			idx = lo_set_key_index(m, c->ckey);
+
+				if (idx < 0)
+				{
+					skip = true;
+					break;
+				}
+				if (m->conts[idx] == NULL)
+				{
+					exact = false;	/* degraded: any TID may be a member */
+					continue;
+				}
+				if (lion_container_and(piece, m->conts[idx], buf[b]) == 0)
+				{
+					skip = true;
+					break;
+				}
+				piece = buf[b];
+				b = 1 - b;
+			}
+			if (!skip)
+				lo_store_piece(st, piece, exact);
+		}
+		lion_source_close(src);
+		if (buf[0] != NULL)
+		{
+			pfree(buf[0]);
+			pfree(buf[1]);
+		}
+		return;
+	}
+
+	if (node->kind == LO_NODE_OR)
+	{
+		for (i = 0; i < node->nchild; i++)
+			lo_store_node(st, node->child[i], masks, maskexact);
+		return;
+	}
+
+	/* an AND: one child driven under its pins, the others its mask */
+	{
+		int			driver = 0;
+		LionTidSet *rest = NULL;
+		bool		saved = st->exact;
+		bool		restexact;
+		List	   *all;
+		MemoryContext oldcxt;
+
+		for (i = 0; i < node->nchild; i++)
+		{
+			if (node->child[i]->kind == LO_NODE_LEAF)
+			{
+				driver = i;
+				break;
+			}
+		}
+		st->exact = true;
+		for (i = 0; i < node->nchild; i++)
+		{
+			LionTidSet *s;
+
+			if (i == driver)
+				continue;
+			s = lo_build_node(st, node->child[i]);
+			rest = (rest == NULL) ? s : lo_set_combine(st, rest, s, true);
+			if (rest->n == 0)
+				break;			/* an empty AND stays empty */
+		}
+		restexact = st->exact;
+		st->exact = saved;
+		Assert(rest != NULL);
+		if (rest->n > 0)
+		{
+			oldcxt = MemoryContextSwitchTo(st->buildcxt);
+			all = lappend(list_copy(masks), rest);
+			MemoryContextSwitchTo(oldcxt);
+			lo_store_node(st, node->child[driver], all,
+						  maskexact && restexact);
+		}
+		lo_set_free(st, rest);
+	}
+}
+
+/* Is every index the store order reads in rmgr mode (§9, "Hot standby")? */
+static bool
+lo_store_all_rmgr(LionOrderedState *st)
+{
+	int			i;
+
+	if (lion_wal_mode(st->ordidx) != LION_WAL_MODE_RMGR)
+		return false;
+	for (i = 0; i < st->nleaves; i++)
+		if (lion_wal_mode(st->leaves[i].index) != LION_WAL_MODE_RMGR)
+			return false;
+	return true;
+}
+
+/*
+ * Fold the whole set into the candidates and put them in order (DESIGN.md
+ * §40): at the first fetch after a start, or after a rescan whose Params
+ * changed the lion quals - a rescan that did not change them returns the
+ * same rows again, under the same snapshot (§30.4, "Rescans").
+ */
+static void
+lo_store_build(LionOrderedState *st)
+{
+	LionIndexState *ix;
+	MemoryContext oldcxt;
+	int			cap = Min(st->storek, 1024);
+	int			k;
+
+	MemoryContextReset(st->topcxt);
+	MemoryContextReset(st->setcxt);
+	st->live = NIL;
+	st->bytes = 0;
+	st->degraded = false;
+	st->exact = !st->lossyqual;
+	st->limit = get_hash_memory_limit();
+	st->ncont = 0;
+
+	oldcxt = MemoryContextSwitchTo(st->topcxt);
+	st->topcap = cap;
+	st->toptid = (ItemPointerData *) palloc(sizeof(ItemPointerData) * cap);
+	st->topvals = (Datum *) palloc(sizeof(Datum) * cap * st->nsort);
+	st->topnulls = (bool *) palloc(sizeof(bool) * cap * st->nsort);
+	st->topheap = (int *) palloc(sizeof(int) * cap);
+	st->toptids = lo_tids_create(st->topcxt, cap, NULL);
+	st->ntop = 0;
+	st->toppos = 0;
+	MemoryContextSwitchTo(oldcxt);
+
+	lo_leaf_keys(st);
+
+	/*
+	 * A reader of each sort key's column, over the index's state as it is
+	 * now; the plan was made for an index that stored them, and one rebuilt
+	 * since without them is an error rather than a wrong answer.
+	 */
+	ix = lion_get_index_state(st->ordidx);
+	for (k = 0; k < st->nsort; k++)
+	{
+		int			ord = lion_store_ordinal(ix, st->storeattnos[k]);
+
+		if (ord < 0 || !ix->stored[ord].returnable)
+			elog(ERROR, "LionOrdered: index \"%s\" does not store column %d",
+				 RelationGetRelationName(st->ordidx), st->storeattnos[k]);
+		st->readers[k] = lion_store_open(st->ordidx, ix, ord, st->buildcxt);
+	}
+
+	/*
+	 * On a hot standby a generic-mode index's pins interlock nothing (§9,
+	 * "Hot standby"): every row then comes from the heap, as the count
+	 * rechecks every TID there.
+	 */
+	st->storenovm = RecoveryInProgress() && !lo_store_all_rmgr(st);
+
+	lo_store_node(st, st->tree, NIL, true);
+
+	if (BufferIsValid(st->vmbuf))
+		ReleaseBuffer(st->vmbuf);
+	st->vmbuf = InvalidBuffer;
+	for (k = 0; k < st->nsort; k++)
+	{
+		lion_store_close(st->readers[k]);
+		st->readers[k] = NULL;
+	}
+	MemoryContextReset(st->buildcxt);
+	MemoryContextReset(st->setcxt);
+	st->live = NIL;
+	st->bytes = 0;
+
+	/* the candidates in order; rows that tie come in any order */
+	qsort_arg(st->topheap, st->ntop, sizeof(int), lo_top_qcmp, st);
+	st->storebuilt = true;
+	st->builds++;
+}
+
+/*
+ * The next row of the store order: the candidates in order, each fetched
+ * again by its TID.  Each is a row the snapshot sees - on a page the
+ * visibility map called all-visible under the pin, or found visible in the
+ * heap - so it is still there, and still the row ranked; anything else is
+ * an error, never a row left out.
+ */
+static TupleTableSlot *
+lo_store_next(LionOrderedState *st, TupleTableSlot *slot)
+{
+	if (!st->storebuilt)
+		lo_store_build(st);
+
+	while (st->toppos < st->ntop)
+	{
+		int			s = st->topheap[st->toppos++];
+
+		CHECK_FOR_INTERRUPTS();
+		if (!lo_fetch_tid(st, &st->toptid[s], slot))
+			elog(ERROR, "LionOrdered: the row at (%u,%u) the store order kept is not visible",
+				 ItemPointerGetBlockNumber(&st->toptid[s]),
+				 ItemPointerGetOffsetNumber(&st->toptid[s]));
+		st->fetched++;
+#ifdef USE_ASSERT_CHECKING
+		{
+			int			k;
+
+			for (k = 0; k < st->nsort; k++)
+			{
+				bool		isnull;
+				Datum		v = slot_getattr(slot, st->sortattnos[k], &isnull);
+
+				Assert(ApplySortComparator(v, isnull, LO_TOPV(st, s)[k],
+										   LO_TOPN(st, s)[k],
+										   &st->sortkeys[k]) == 0);
+			}
+		}
+#endif
+		return slot;
+	}
+	st->done = true;
+	return ExecClearTuple(slot);
+}
+
 /* ExecScan's access method: the next member with a visible version. */
 static TupleTableSlot *
 lo_next(ScanState *ss)
@@ -3396,6 +4535,10 @@ lo_next(ScanState *ss)
 	LionOrderedState *st = (LionOrderedState *) ss;
 	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
 	ExprContext *econtext = ss->ps.ps_ExprContext;
+
+	/* the store order has no walk (DESIGN.md §40) */
+	if (st->store)
+		return lo_store_next(st, slot);
 
 	/*
 	 * The set: lazily, evaluated only where the walk goes, when its keys
@@ -3570,6 +4713,9 @@ lo_rescan(CustomScanState *node)
 	st->done = false;
 	lo_scan_reset(st);
 
+	/* the store order returns the rows it ranked again (DESIGN.md §40) */
+	st->toppos = 0;
+
 	/*
 	 * The set is rebuilt only when a Param of the lion quals changed; the
 	 * snapshot is the same for the whole execution (DESIGN.md §30.4).
@@ -3580,6 +4726,7 @@ lo_rescan(CustomScanState *node)
 		st->set = NULL;
 		if (st->lazy)
 			lo_lazy_end(st);
+		st->storebuilt = false;
 	}
 
 	ExecScanReScan(&node->ss);
@@ -3628,6 +4775,15 @@ lo_end(CustomScanState *node)
 	st->setcxt = NULL;
 	st->buildcxt = NULL;
 	st->set = NULL;
+	if (BufferIsValid(st->vmbuf))
+		ReleaseBuffer(st->vmbuf);
+	st->vmbuf = InvalidBuffer;
+	if (st->topcxt != NULL)
+		MemoryContextDelete(st->topcxt);
+	if (st->rowcxt != NULL)
+		MemoryContextDelete(st->rowcxt);
+	st->topcxt = NULL;
+	st->rowcxt = NULL;
 }
 
 /* ---------------------------------------------------------------------
@@ -3651,6 +4807,58 @@ lo_explain_qual(CustomScanState *node, List *qual, const char *label,
 	ExplainPropertyText(label, str, es);
 }
 
+/*
+ * The store order's lines (DESIGN.md §40, EXPLAIN): the columns gathered from
+ * the store, and the order they are ranked in, every key with its direction
+ * and NULLS placement spelled out, and its collation where it is not the
+ * column's own.
+ */
+static void
+lo_explain_store(CustomScanState *node, ExplainState *es)
+{
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	List	   *sk = (List *) list_nth(cscan->custom_private, LO_PRIV_SORT);
+	List	   *sl = (List *) list_nth(cscan->custom_private, LO_PRIV_STORE);
+	List	   *attnos = (List *) linitial(sk);
+	List	   *colls = (List *) lthird(sk);
+	List	   *nulls = (List *) lfourth(sk);
+	Oid			relid = RelationGetRelid(node->ss.ss_currentRelation);
+	int			n = list_length(attnos);
+	StringInfoData cols;
+	StringInfoData order;
+	int			i;
+
+	initStringInfo(&cols);
+	initStringInfo(&order);
+	for (i = 0; i < n; i++)
+	{
+		AttrNumber	attno = (AttrNumber) list_nth_int(attnos, i);
+		const char *name = quote_identifier(get_attname(relid, attno, false));
+		Oid			coll = list_nth_oid(colls, i);
+		Oid			type;
+		int32		typmod;
+		Oid			attcoll;
+
+		if (i > 0)
+		{
+			appendStringInfoString(&cols, ", ");
+			appendStringInfoString(&order, ", ");
+		}
+		appendStringInfoString(&cols, name);
+		appendStringInfo(&order, "%s %s NULLS %s", name,
+						 list_nth_int(sl, 2 + n + i) ? "DESC" : "ASC",
+						 list_nth_int(nulls, i) ? "FIRST" : "LAST");
+		get_atttypetypmodcoll(relid, attno, &type, &typmod, &attcoll);
+		if (OidIsValid(coll) && coll != attcoll)
+			appendStringInfo(&order, " COLLATE %s",
+							 generate_collation_name(coll));
+	}
+	ExplainPropertyText("Store", cols.data, es);
+	ExplainPropertyText("Order", order.data, es);
+	pfree(cols.data);
+	pfree(order.data);
+}
+
 static void
 lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
@@ -3660,6 +4868,11 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	int			i;
 
 	initStringInfo(&buf);
+	if (st->store)
+	{
+		lo_explain_store(node, es);
+		goto quals;
+	}
 	appendStringInfoString(&buf, get_rel_name(st->ordoid));
 	if (st->lionwalk)
 	{
@@ -3677,6 +4890,7 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 		appendStringInfoString(&buf, " (backward)");
 	ExplainPropertyText("Ordered By", buf.data, es);
 
+quals:
 	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs, LO_EXPR_ORDORIG),
 					"Index Cond", ancestors, es);
 	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs, LO_EXPR_LIONQUAL),
@@ -3701,11 +4915,51 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 			appendStringInfoString(&buf, ", ");
 		appendStringInfoString(&buf, name);
 	}
+
+	/* the store order reads its store's index too, when the set does not */
+	if (st->store)
+	{
+		for (i = 0; i < st->nleaves; i++)
+			if (st->leaves[i].indexoid == st->ordoid)
+				break;
+		if (i == st->nleaves)
+		{
+			if (buf.len > 0)
+				appendStringInfoString(&buf, ", ");
+			appendStringInfoString(&buf, get_rel_name(st->ordoid));
+		}
+	}
 	/* a lion column's walk without a set reads no other lion index */
 	if (buf.len > 0)
 		ExplainPropertyText("Lion Indexes", buf.data, es);
 
-	if (es->analyze)
+	if (es->analyze && st->store)
+	{
+		/*
+		 * The store order (DESIGN.md §40): the rows it ranked, those whose
+		 * values the store gave, and every heap fetch - the rows of pages the
+		 * store did not answer for, and the rows returned.
+		 */
+		ExplainPropertyInteger("Rows Ranked", NULL, (int64) st->ranked, es);
+		ExplainPropertyInteger("Store Values", NULL, (int64) st->storevals,
+							   es);
+		ExplainPropertyInteger("Heap Fetches", NULL, (int64) st->fetched, es);
+		if (st->removed > 0 || (st->builds > 0 && !st->exact))
+			ExplainPropertyInteger("Rows Removed by Lion Recheck", NULL,
+								   (int64) st->removed, es);
+		if (st->builds > 0)
+		{
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "%d containers, %s", st->ncont,
+							 st->degraded ? "degraded" :
+							 st->exact ? "exact" : "rechecked");
+			if (st->builds > 1)
+				appendStringInfo(&buf, ", %llu builds",
+								 (unsigned long long) st->builds);
+			ExplainPropertyText("Lion Set", buf.data, es);
+		}
+	}
+	else if (es->analyze)
 	{
 		ExplainPropertyInteger("Index Entries Walked", NULL,
 							   (int64) st->walked, es);
@@ -3792,6 +5046,19 @@ lion_ordered_init(void)
 							 "Lets LionOrdered evaluate its lion set only at the container keys its walk meets.",
 							 "Off, the set is built for the whole table before the walk starts.",
 							 &lion_enable_lazy_set,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §40: ORDER BY a window store's columns LIMIT n.  Off,
+	 * LionOrdered offers its walks only.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_ordered_store",
+							 "Lets LionOrdered rank an ORDER BY ... LIMIT from the columns a lion index stores.",
+							 "Off, only its walks of a btree or of a lion column are offered.",
+							 &lion_enable_ordered_store,
 							 true,
 							 PGC_USERSET,
 							 0,
