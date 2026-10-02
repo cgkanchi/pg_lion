@@ -79,8 +79,10 @@ lion_count_scan_filtered(LionCountScanState *st)
 		}
 	}
 
-	return lion_count_heap_filtered(st->heap, estate->es_snapshot, &scan,
-									&st->stats);
+	/* every row it counts is a heap row, which a gather takes too (§40) */
+	return lion_count_heap_gather(st->heap, estate->es_snapshot, &scan,
+								  lion_vis_cache_get_gather(st->viscache),
+								  &st->stats);
 }
 
 /*
@@ -474,8 +476,16 @@ lion_sum_walk(LionCountScanState *st, LionCountSource *sources, int nsource,
 			st->stats.sets_summed += nsets;
 		}
 
-		/* Small entries are one count, large ones one count each. */
-		per = (items <= (double) nsets * LION_SUM_UNION_MAX_ITEMS) ?
+		/*
+		 * Small entries are one count, large ones one count each - except
+		 * under a gather (DESIGN.md §40), which reads a window's store pages
+		 * at every count of a container there: the leaf's entries are one
+		 * union, so that each window's pages are read once a leaf and not
+		 * once an entry.  A union too wide for the pins it may hold is still
+		 * taken in batches (lion_run_batches()).
+		 */
+		per = (st->store != NULL ||
+			   items <= (double) nsets * LION_SUM_UNION_MAX_ITEMS) ?
 			Max(nsets, 1) : 1;
 
 		for (i = 0; rp == NULL && i < nsets; i += per)
@@ -802,6 +812,13 @@ lion_walk_count(LionCountScanState *st, LionCountSource *sources, int nsource,
 		eval = lion_range_choose_on(rs->index, rs->col, &rs->range, srcs,
 									nsource, w);
 
+	/*
+	 * A gather (DESIGN.md §40) is handed every row the count counts, and the
+	 * complement counts rows it then takes away again: the inside, then.
+	 */
+	if (eval == LION_RANGE_EVAL_COMPLEMENT && st->store != NULL)
+		eval = LION_RANGE_EVAL_INSIDE;
+
 	if (eval == LION_RANGE_EVAL_INSIDE)
 		total = lion_walk_range_part(st, rs, LION_WALK_INSIDE, srcs, nsource,
 									 w, exists);
@@ -897,6 +914,15 @@ lion_sumall_relation(LionCountScanState *st)
 
 	if (st->hasrange)
 		eval = lion_range_choose(st, sources, nsource);
+
+	/*
+	 * The complement subtracts the rows of the entries below and above the
+	 * range from those of every entry, which a gather (DESIGN.md §40) cannot
+	 * take back once it has been handed them: it walks the inside.  The
+	 * range that covers every entry is one count of every row, as before.
+	 */
+	if (eval == LION_RANGE_EVAL_COMPLEMENT && st->store != NULL)
+		eval = LION_RANGE_EVAL_INSIDE;
 
 	switch (eval)
 	{
@@ -3133,6 +3159,65 @@ lion_wagg_reset(LionCountScanState *st)
 }
 
 /*
+ * The result of one aggregate of §37 - and of an aggregate over a gathered
+ * column (DESIGN.md §40, lion_exec_store.c), which keeps the same state -
+ * from its sum, its count of values and its extreme value: into a->result
+ * and a->resnull, allocated in the current memory context.
+ */
+void
+lion_wagg_finish(LionWAgg *a)
+{
+	a->resnull = true;
+	switch (a->kind)
+	{
+#ifdef HAVE_INT128
+		case LION_WAGG_SUM:
+
+			/*
+			 * sum(int2) and sum(int4) add up in an int8 that wraps; the
+			 * sum modulo 2^64 is what the wrapping adds make, in any order.
+			 */
+			if (a->n > 0)
+			{
+				a->result = Int64GetDatum((int64) (uint64) a->sum);
+				a->resnull = false;
+			}
+			break;
+		case LION_WAGG_SUM8:
+			if (a->n > 0)
+			{
+				a->result = lion_int128_numeric(a->sum);
+				a->resnull = false;
+			}
+			break;
+		case LION_WAGG_AVG:
+		case LION_WAGG_AVG8:
+
+			/*
+			 * int8_avg() and numeric_poly_avg(): the sum over the count,
+			 * both numerics - the sum an int8 that wraps for int2 and int4,
+			 * exact for int8.
+			 */
+			if (a->n > 0)
+			{
+				Datum		sum = (a->kind == LION_WAGG_AVG) ?
+					NumericGetDatum(int64_to_numeric((int64) (uint64) a->sum)) :
+					lion_int128_numeric(a->sum);
+
+				a->result = DirectFunctionCall2(numeric_div, sum,
+												NumericGetDatum(int64_to_numeric(a->n)));
+				a->resnull = false;
+			}
+			break;
+#endif
+		case LION_WAGG_EXTREME:
+			a->result = a->ext;
+			a->resnull = !a->hasext;
+			break;
+	}
+}
+
+/*
  * Compute every aggregate over keys (DESIGN.md §37) into its result.
  *
  * The walk reads every row of the table, so it takes the predicate lock a
@@ -3246,57 +3331,9 @@ lion_wagg_run(LionCountScanState *st)
 
 	for (i = 0; i < st->nwagg; i++)
 	{
-		LionWAgg   *a = &st->wagg[i];
 		MemoryContext oldcxt = MemoryContextSwitchTo(st->wcxt);
 
-		a->resnull = true;
-		switch (a->kind)
-		{
-#ifdef HAVE_INT128
-			case LION_WAGG_SUM:
-
-				/*
-				 * sum(int2) and sum(int4) add up in an int8 that wraps; the
-				 * sum modulo 2^64 is what the wrapping adds make, in any order.
-				 */
-				if (a->n > 0)
-				{
-					a->result = Int64GetDatum((int64) (uint64) a->sum);
-					a->resnull = false;
-				}
-				break;
-			case LION_WAGG_SUM8:
-				if (a->n > 0)
-				{
-					a->result = lion_int128_numeric(a->sum);
-					a->resnull = false;
-				}
-				break;
-			case LION_WAGG_AVG:
-			case LION_WAGG_AVG8:
-
-				/*
-				 * int8_avg() and numeric_poly_avg(): the sum over the count,
-				 * both numerics - the sum an int8 that wraps for int2 and int4,
-				 * exact for int8.
-				 */
-				if (a->n > 0)
-				{
-					Datum		sum = (a->kind == LION_WAGG_AVG) ?
-						NumericGetDatum(int64_to_numeric((int64) (uint64) a->sum)) :
-						lion_int128_numeric(a->sum);
-
-					a->result = DirectFunctionCall2(numeric_div, sum,
-													NumericGetDatum(int64_to_numeric(a->n)));
-					a->resnull = false;
-				}
-				break;
-#endif
-			case LION_WAGG_EXTREME:
-				a->result = a->ext;
-				a->resnull = !a->hasext;
-				break;
-		}
+		lion_wagg_finish(&st->wagg[i]);
 		MemoryContextSwitchTo(oldcxt);
 	}
 

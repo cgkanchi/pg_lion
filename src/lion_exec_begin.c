@@ -1804,6 +1804,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_run_state(st, cscan);
 	lion_begin_contexts(st, estate);
 	lion_begin_decoded_walk(st, cscan, estate);
+	lion_store_begin(st, cscan, estate);
 	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
 	st->writtenrels = lion_statement_written_rels(estate);
 	lion_begin_join_child(st, node, cscan, estate, eflags);
