@@ -340,11 +340,14 @@ DROP TABLE lgw_s;
  * Once the WHERE is collected, the rest of the walk is counted a batch of
  * groups at a time, in one walk of container keys a batch (DESIGN.md §10,
  * "The groups of a walk, counted together"): at most 256 groups, fewer when
- * work_mem holds fewer cursors.  g has 600 groups, and NULL, of about eight
- * rows a container key each - ARRAYs and sparse segments; k 300 and no NULL;
- * h two, a RUN and an ARRAY; a is every other row, so that a WHERE of
- * `a = 1` alone is a BITSET at each key; b three values, r scattered over
- * 997, all three on one multicolumn index.  About 13 container keys.
+ * work_mem holds fewer cursors.  g has 600 groups, and NULL, of about 14
+ * rows a container key each - ARRAYs; k 300 and no NULL; h two, RUNs; a is
+ * every other row, so that a WHERE of `a = 1` alone is a BITSET at each key;
+ * b three values, r scattered over 997, all three on one multicolumn index.
+ * The rows are narrow, 136 to a page (pad is empty until the update below),
+ * so that the blocks hold offsets past 127 and a's sets cannot be NARROWs
+ * (DESIGN.md §38), which the groups would be tested against through an
+ * image instead.  Seven container keys.
  */
 CREATE TABLE lgw_b (g int, k int NOT NULL, h int NOT NULL, a int NOT NULL,
 					b int NOT NULL, r int NOT NULL, pad text NOT NULL)
@@ -352,7 +355,7 @@ CREATE TABLE lgw_b (g int, k int NOT NULL, h int NOT NULL, a int NOT NULL,
 INSERT INTO lgw_b
 SELECT CASE WHEN i % 101 = 0 THEN NULL ELSE (i * 7) % 600 END, (i * 13) % 300,
 	   CASE WHEN i % 1000 < 900 THEN 1 ELSE 2 END, i % 2, i % 3,
-	   (i * 7919) % 997, repeat('z', 30)
+	   (i * 7919) % 997, ''
   FROM generate_series(1, 60000) i;
 CREATE INDEX lgw_b_g ON lgw_b USING lion (g);
 CREATE INDEX lgw_b_k ON lgw_b USING lion (k);
@@ -363,7 +366,7 @@ VACUUM (FREEZE, ANALYZE) lgw_b;
 SELECT lgw_check('SELECT g, count(*) FROM lgw_b WHERE a = 1 AND b = 2 GROUP BY g');
 -- the WHERE a BITSET at every key, which the groups are tested against as it is
 SELECT lgw_check('SELECT g, count(*) FROM lgw_b WHERE a = 1 AND b IN (0, 1, 2) GROUP BY g');
--- two groups whose containers are a RUN and an ARRAY
+-- two groups whose containers are RUNs
 SELECT lgw_check('SELECT h, count(*) FROM lgw_b WHERE a = 0 AND b IN (0, 2) GROUP BY h');
 -- a WHERE of a row or two a key, which each group ANDs directly
 SELECT lgw_check('SELECT h, count(*) FROM lgw_b WHERE a = 0 AND r = 5 GROUP BY h');
