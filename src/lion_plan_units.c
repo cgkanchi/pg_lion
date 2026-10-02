@@ -86,8 +86,15 @@ lion_path_input(Path *path)
 			return ((GroupPath *) path)->subpath;
 		case T_GroupingSetsPath:
 			return ((GroupingSetsPath *) path)->subpath;
+#if PG_VERSION_NUM >= 190000
+		case T_UniquePath:		/* 19: the upper unique, PG18's UpperUniquePath */
+			return ((UniquePath *) path)->subpath;
+#else
 		case T_UpperUniquePath:
 			return ((UpperUniquePath *) path)->subpath;
+		case T_UniquePath:		/* the semi-join unique, gone in 19 */
+			return ((UniquePath *) path)->subpath;
+#endif
 		case T_ProjectionPath:
 			return ((ProjectionPath *) path)->subpath;
 		case T_ProjectSetPath:
@@ -112,10 +119,6 @@ lion_path_input(Path *path)
 			return ((GatherMergePath *) path)->subpath;
 		case T_SubqueryScanPath:
 			return ((SubqueryScanPath *) path)->subpath;
-#if PG_VERSION_NUM < 190000
-		case T_UniquePath:
-			return ((UniquePath *) path)->subpath;
-#endif
 		default:
 			return NULL;
 	}
@@ -234,7 +237,11 @@ lion_competitor_kind(Path *path)
 				aggregated = true;
 				break;
 			case T_GroupPath:
+#if PG_VERSION_NUM >= 190000
+			case T_UniquePath:
+#else
 			case T_UpperUniquePath:
+#endif
 				aggregated = true;
 				break;
 			case T_HashPath:
