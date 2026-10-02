@@ -1238,8 +1238,8 @@ bitmap_cardinality(const uint64 *w, uint32 k)
  * the words as they lie, where a block's offset 0 follows the block before's
  * offset 64 * k - 1; below the full width those are not adjacent members,
  * so a block that starts with a member where the block before ends with one
- * is one run more.  At the full width they are adjacent
- * members, and the pass's count is the count.
+ * is one run more.  At the full width they are adjacent members, and the
+ * pass's count is the count.
  */
 static uint32
 bitmap_count_runs(const uint64 *w, uint32 k)
