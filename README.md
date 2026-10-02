@@ -4,8 +4,8 @@ Formerly `roaring_index`; renamed to pg_lion on 2026-09-21 (a roaring bitmap ind
 format is unchanged: the meta-page magic still spells `RBI1`, so indexes built before the rename remain readable.
 
 `CREATE INDEX ... USING lion (col)` builds one posting set of roaring-style containers
-(array / bitset / run, ≤ 4104 bytes each, one per 64 heap pages, and a 1032-byte NARROW bitset
-where every member lies at a heap offset below 128, DESIGN.md §38) or sparse (container key, offset)
+(array / bitset / run, ≤ 4104 bytes each, one per 64 heap pages, and NARROW bitmaps of 520 to 2568
+bytes, only as wide as the offsets their heap pages have, DESIGN.md §38) or sparse (container key, offset)
 segments per distinct key, plus one reserved entry for the rows whose key is NULL. The index serves
 Bitmap Index Scans through `amgetbitmap` for equality, `IN`/`ANY`, scalar ranges
 (`<`, `<=`, `>=`, `>`), `<>` (`!=`), `col IS NULL` and `col IS NOT NULL`, and a CustomScan
@@ -489,8 +489,8 @@ before.  A range on a column that does not drive a count (`g, count(*) ... WHERE
 g`, a range in an OR, a join's fact filter) is answered too, collected once from the same walk.
 A build that writes a NARROW container (DESIGN.md §38) makes the index format 8, which older builds
 refuse in turn: REINDEX such an index under the older build before going back to it.  Inserts never
-make a NARROW, and VACUUM makes one only in a format 8 index, so an existing index stays format 6
-or 7 until it is rebuilt.
+make a NARROW of anything else (they widen one when a row's offset is past it), and VACUUM makes one
+only in a format 8 index, so an existing index stays format 6 or 7 until it is rebuilt.
 `wal_mode` (`auto` | `generic` | `rmgr`, default `auto`): which WAL resource manager this index is
 logged through (DESIGN.md §25).  Measured on a release build: the 8-client hot-key insert burst goes
 from 765 to 1275 tps (p95 14.8 to 9.9 ms, against btree's 1632 / 7.8), 10,000 inserts into the
@@ -836,12 +836,13 @@ At 5M rows, Lion uses about **25% less space than B-tree** and **23% more than G
 at 1M, it uses about **15% more than either**. Its scalar build takes roughly **2.8–2.9×**
 the B-tree time. The additional high-cardinality and skew indexes matter to these totals.
 
-These runs predate NARROW containers (DESIGN.md §38). On a table whose heap pages hold fewer than
-128 rows each - rows of 64 bytes or more - a dense container is a 1032-byte NARROW where it was a
-4104-byte bitset, seven to a page instead of one: a two-valued column of 2M synthetic rows, 65 to a
-page, went from 30.93 to 4.65 bits a row (GIN: 8.91), and its counts and GROUP BYs from 2.8 to 4
-times faster. Tables of narrower rows, and columns whose containers are arrays or runs, are
-unchanged.
+These runs predate NARROW containers (DESIGN.md §38). A dense container is now a NARROW bitmap
+only as wide as its heap pages' offsets - 520 bytes for pages of at most 63 rows, 1032 for 127, and
+so on to 2568 for the 291 an 8 kB page can hold - where it was a 4104-byte bitset. On synthetic
+tables of 1M rows, a two-valued column went from 15.34, 11.40 and 9.31 bits a row to 3.28, 2.49
+and 3.41 at 136, 185 and 226 rows a page, and its counts and GROUP BYs became about twice as fast;
+at 65 rows a page, 2M rows went from 30.93 to 4.65 bits a row (GIN: 8.91), with counts and GROUP
+BYs 2.8 to 4 times faster. Columns whose containers are arrays or runs are unchanged.
 
 | Dataset | Family | Build seconds | Index MiB |
 | --- | --- | --- | --- |
