@@ -352,6 +352,13 @@ lion_page_item_fetch(Relation index, Page page, BlockNumber blkno,
 				 errmsg("lion index \"%s\": item %u on container page %u has type %u, which is no item kind",
 						RelationGetRelationName(index), off, blkno,
 						item->type)));
+	/* a NARROW's width, in its flags byte, sizes it (DESIGN.md §38) */
+	if (unlikely(!lion_container_width_valid(item)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": item %u on container page %u is a NARROW of width %u, not one of 1 .. %u",
+						RelationGetRelationName(index), off, blkno,
+						item->flags, (uint32) LION_NARROW_MAX_WIDTH)));
 
 	/* a RUN is sized by its run count, which follows the header */
 	if (item->type == LION_CT_RUN && lplen < LION_CONTAINER_HDRSZ + sizeof(uint16))
@@ -744,8 +751,8 @@ lion_item_alloc_size(const LionContainer *item, Size size)
 	/*
 	 * A bitset is already the largest an item can be, and a NARROW (DESIGN.md
 	 * §38) is the size it is whatever add() does to it in place: a member it
-	 * holds sets a bit, and one it does not makes it a BITSET, which no slack
-	 * short of 3 KB would hold.
+	 * holds sets a bit, and one it does not widens it by at least 512 bytes
+	 * at 8K, a word of each block, which no slack an item carries would hold.
 	 */
 	if (item->type == LION_CT_BITSET || item->type == LION_CT_NARROW)
 		return size;

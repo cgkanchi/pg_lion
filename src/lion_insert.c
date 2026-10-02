@@ -194,7 +194,7 @@ lion_segment_add(LionSegWork *w, uint32 ckey, uint16 lo)
 		if (!lion_container_add(w->cont, lo))
 			elog(ERROR, "lion index: duplicate member in sparse segment for container key %u",
 				 ckey);
-		/* an insert never makes a NARROW (DESIGN.md §38) */
+		/* an insert makes no NARROW of anything else (DESIGN.md §38) */
 		lion_container_optimize_ext(w->cont, false);
 
 		lion_sparse_split_at(w->seg, ckey, w->left, w->right);
@@ -666,8 +666,9 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
  *			lion_container_add() would turn it into a bitset.
  *	RUN		when the item has room for one more run and the run count is
  *			below LION_RUN_MAX_NRUNS, for the same reason.
- *	NARROW	when the member's offset is below 128, the ones it has bits for
- *			(DESIGN.md §38); one at 128 or more makes it a BITSET.
+ *	NARROW	when the member's offset is below 64 times its width, the ones
+ *			it has bits for (DESIGN.md §38); one past them widens it, to
+ *			the narrowest NARROW that holds the member.
  *
  * which is lion_container_inplace_need(), the table the redo of the record
  * written here checks too.

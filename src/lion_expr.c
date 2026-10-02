@@ -1186,10 +1186,10 @@ lion_log2_16(uint32 x)
 
 /*
  * Is h a bitmap - a BITSET, or a NARROW (DESIGN.md §38), whose lookups are a
- * bit test each too?  A NARROW is priced as the BITSET: its words are a
- * quarter as many to scan or OR, so a NARROW's extract and OR are
- * overestimated, which leaves a probe neither more nor less likely than for
- * the BITSET it would otherwise be.
+ * bit test each too?  A NARROW is priced as the BITSET: at 8K a NARROW of
+ * width k has k eighths of a BITSET's words to scan or OR, k being 1 .. 5,
+ * so a NARROW's extract and OR are overestimated, which leaves a probe
+ * neither more nor less likely than for the BITSET it would otherwise be.
  */
 static inline bool
 lion_up_bits(const LionContainer *h)

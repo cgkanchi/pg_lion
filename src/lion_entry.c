@@ -90,6 +90,10 @@ lion_inline_fetch(const char *payload, Size paylen, Size *off, LionContainer *bu
 	if (!lion_container_type_valid(buf->type) && buf->type != LION_CT_SPARSE)
 		elog(ERROR, "lion index: malformed inline item of type %u",
 			 buf->type);
+	/* a NARROW's width sizes it (DESIGN.md §38) */
+	if (!lion_container_width_valid(buf))
+		elog(ERROR, "lion index: malformed inline NARROW of width %u",
+			 buf->flags);
 	csize = lion_item_size(buf);
 	if (csize < LION_CONTAINER_HDRSZ || csize > LION_CONTAINER_MAX_SIZE ||
 		csize > avail)
