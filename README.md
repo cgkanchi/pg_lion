@@ -543,6 +543,49 @@ and then the INCLUDE columns - with NULL for a NULL, for a slot no row has writt
 cleared, and for a heap page left to the heap; it reads the store, not the heap, so it answers for
 dead and never-committed rows too.
 
+### Index-only scans
+
+A stored column is one an index-only scan returns (`amcanreturn`): an INCLUDE column, and a scalar
+key column under `store_values`. The posting sets answer the WHERE clause, the store supplies the
+columns, and the heap is read only for the pages the visibility map does not call all-visible -
+core's `Heap Fetches`, as over a btree. That includes the GIN-class predicates: a multi-key column
+is never returned itself, but lion's planner hook builds the index-only scan core would not when
+the query only filters on it, with a predicate the posting sets answer exactly.
+
+```sql
+CREATE INDEX docs_tags_lion ON docs USING lion (tags) INCLUDE (author_id, created);
+SELECT author_id, created FROM docs WHERE tags && '{postgres,index}';
+--  Index Only Scan using docs_tags_lion on docs
+--    Index Cond: (tags && '{postgres,index}'::text[])
+CREATE INDEX docs_body_lion ON docs USING lion (body_tsv) INCLUDE (author_id);
+SELECT author_id FROM docs WHERE body_tsv @@ 'roaring & bitmap';   -- the same
+```
+
+Three bounds (DESIGN.md §40, "Index-only scans"):
+
+- **The predicate must be one the posting sets answer without a recheck**: `&&` and `@>` of
+  elements, `IS NULL`, a tsquery of lexemes under `&` and `|`, and the scalar operators. `<@`,
+  `@> '{}'`, a tsquery with `!`, a prefix, a phrase or a weight, and a generic plan's parameter
+  recheck the column, which the scan cannot return: those stay bitmap or plain scans.
+- **The multi-key column itself is never returned** - a row has many keys and the store one slot -
+  so `SELECT *`, or any query that reads the array or the tsvector, over such an index is a plain
+  or bitmap scan as before.
+- **Every other column the query reads must be stored in the index**, as for any index-only scan.
+  A key column without `store_values` may be filtered on, not returned.
+
+The values are the rows' own (citext's spelling, not the key's): from the store for a batch of
+TIDs whose index page the scan holds pinned (the §9 interlock), from the heap for a heap page the
+store left to the heap, for a multi-key query's sets past the pin budget, and for every TID on a
+hot standby over a generic-mode index. The planner prices the scan as the plain scan's fetches of
+the pages that are not all-visible, plus the gather: `pg_lion.store_value_cost` per value and
+`pg_lion.store_page_cost` per store page of each window the scan's batches touch. The scan gathers
+every stored column the index can return, whichever the query reads. Measured warm on a synthetic
+table of 2M rows (52 to a heap page, the heap in shared buffers, release build), returning two
+INCLUDE columns: `tags && '{t7,t8}'`, 20,000 rows, 8.2 ms against 10.1 ms for the plain index scan
+(6,030 buffers against 10,014); `k = 42` on a scalar key under `store_values`, 2,000 rows of about
+3 a window, 2.8 ms against 0.9 ms (7,443 buffers against 2,005) - a scattered result reads every
+store page of each window it touches, which the store's page price does not yet charge as I/O.
+
 ## Reloptions
 
 `fillfactor` (10 .. 100, default 90): how full the build packs a directory leaf.
@@ -764,8 +807,8 @@ Equality, `IN` lists, scalar ranges and the multi-key operators above are suppor
 scans and plain index scans (`amgettuple`, DESIGN.md §29). There are no ordered scans of the
 access method itself (an `ORDER BY` is `LionOrdered`'s: a B-tree walked with a lion filter, or a
 lion index's own ordered column walked, §30), no index-only scans
-that return a column (only those that need none, like `count(*)`; INCLUDE columns are stored but
-not returned, below), no
+that return a column the index does not store (a multi-key column, a key column without
+`store_values`; above), no
 parallel build or scan, no reclaim of an emptied directory leaf or of an emptied posting-tree leaf
 (both wait for the whole set or the whole index to go). Inserts serialise on the directory
 leaf that holds the key; see the measured
@@ -792,8 +835,8 @@ with an error and have to be rebuilt with REINDEX.
 On a hot standby a GENERIC-mode index's count paths recheck every candidate TID in the heap instead
 of trusting the visibility map, because generic WAL replay does not take the cleanup locks the pin
 interlock relies on; they stay correct there but are no longer O(1) per container.  Index-only
-scans of such an index (of a query that needs no column, such as `SELECT count(*)`) look every TID
-up in the heap there for the same reason.  An rmgr-mode
+scans of such an index look every TID up in the heap there for the same reason, and take the
+columns they return from it.  An rmgr-mode
 index does not pay that: its removal records replay under a cleanup lock, so the standby uses the
 visibility map again (DESIGN.md §25) - at the price that a standby reader holding a pin makes replay
 wait, which `max_standby_streaming_delay` resolves as a recovery conflict.  A count that reads even
