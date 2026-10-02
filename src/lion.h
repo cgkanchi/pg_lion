@@ -1721,6 +1721,8 @@ extern bool lionvalidate(Oid opclassoid);
 extern void lioncostestimate(struct PlannerInfo *root, struct IndexPath *path, double loop_count,
 							Cost *indexStartupCost, Cost *indexTotalCost, Selectivity *indexSelectivity,
 							double *indexCorrelation, double *indexPages);
+/* an index-only path answered with no recheck (lion_amcost.c, §40) */
+extern bool lion_index_only_exact(struct PlannerInfo *root, struct IndexPath *path);
 extern bool lion_enable_plain_scan;	/* GUC pg_lion.enable_plain_scan */
 
 /*

@@ -1,0 +1,800 @@
+-- Index-only scans that return the window store's columns (DESIGN.md §40,
+-- "Index-only scans").
+--
+-- amcanreturn says true for a stored column whose stored type is the index
+-- column's own (LionStoreCol.returnable): a key column under store_values,
+-- an INCLUDE column always.  liongettuple() hands the executor each TID's
+-- values - from the store for a batch the §9 interlock covers, from the heap
+-- for a heap page the store leaves ABSENT and for a batch with no interlock
+-- behind it - and core's IndexOnlyScan fetches the heap only for a page the
+-- visibility map does not call all-visible.  lion's planner hook builds the
+-- index-only paths core does not: a qual on a column the index cannot return
+-- - a multi-key column, a key column without store_values - that the posting
+-- sets answer exactly, with no recheck (`tags && '{a,b}'`, `doc @@ 'x & y'`).
+--
+-- Every answer is compared, as a multiset both ways round and spelling by
+-- spelling, with the same query's under sequential scans only: over clean
+-- pages, over pages with updates and deletes not yet vacuumed, and after the
+-- VACUUM, with NULLs, a text column under a collation, a capped column and
+-- an ABSENT heap page.  The sections:
+--
+--	1. a scalar key under store_values with INCLUDE columns
+--	2. an array column: `&&`, `@>`, IS NULL, returning INCLUDE columns
+--	3. a tsvector column: `@@`
+--	4. store_max_len: a capped text column
+--	5. an ABSENT heap page: its rows' values come from the heap
+--	6. multi-key sets past the pin budget: their batches go to the heap
+--	7. what is not answered from the index: SELECT * over the array column,
+--	   a predicate the sets answer only with a recheck
+--	8. citext: a key column's own spelling, and an INCLUDE citext column
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+-- a temporary table's buffer pool is temp_buffers, settable only before the
+-- session touches one: 100 buffers is a pin budget of 12 leaves (section 6)
+SET temp_buffers = 100;
+/*
+ * lion_ios_check() names the scan the query's plan runs - the first of
+ * Index Only Scan, Index Scan, Bitmap Heap Scan and Seq Scan in it - and
+ * compares the query's rows with its rows under sequential scans only, each
+ * row as its text spelling (citext's equality would take 'Alice' for
+ * 'alice').  The settings are put back as they were.
+ */
+CREATE FUNCTION lion_ios_check(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	node text := 'other';
+	n bigint;
+	ndiff bigint;
+	s_idx text := current_setting('enable_indexscan');
+	s_ios text := current_setting('enable_indexonlyscan');
+	s_bmp text := current_setting('enable_bitmapscan');
+	s_seq text := current_setting('enable_seqscan');
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF node = 'other' AND
+		   ln ~ '(Index Only Scan|Index Scan|Bitmap Heap Scan|Seq Scan)' THEN
+			node := substring(ln from '(Index Only Scan|Index Scan|Bitmap Heap Scan|Seq Scan)');
+		END IF;
+	END LOOP;
+	EXECUTE 'CREATE TEMP TABLE lion_ios_got AS SELECT x::text AS r FROM (' || q || ') x';
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	EXECUTE 'CREATE TEMP TABLE lion_ios_want AS SELECT x::text AS r FROM (' || q || ') x';
+	PERFORM set_config('enable_indexscan', s_idx, true);
+	PERFORM set_config('enable_indexonlyscan', s_ios, true);
+	PERFORM set_config('enable_bitmapscan', s_bmp, true);
+	PERFORM set_config('enable_seqscan', s_seq, true);
+	SELECT count(*) INTO n FROM lion_ios_got;
+	SELECT (SELECT count(*) FROM (SELECT r FROM lion_ios_got EXCEPT ALL
+								  SELECT r FROM lion_ios_want) a) +
+		   (SELECT count(*) FROM (SELECT r FROM lion_ios_want EXCEPT ALL
+								  SELECT r FROM lion_ios_got) b)
+	  INTO ndiff;
+	DROP TABLE lion_ios_got, lion_ios_want;
+	RETURN format('%s: %s, %s rows', node,
+				  CASE WHEN ndiff = 0 THEN 'same' ELSE ndiff || ' differ' END, n);
+END $$;
+/*
+ * EXPLAIN ANALYZE of q, the lines that say what the scan did: its node and
+ * conditions, and core's own Heap Fetches - the rows it looked up in the heap
+ * because the visibility map does not call their pages all-visible - as 0 or
+ * "> 0".  The row counts are lion_ios_check()'s.
+ */
+CREATE FUNCTION lion_ios_explain(q text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		CONTINUE WHEN ln ~ '^\s*(Index Searches|Disabled|Storage|Planning|Execution|Buffers|Memory)';
+		ln := regexp_replace(ln, '\s*\(actual[^)]*\)', '');
+		ln := regexp_replace(ln, 'Heap Fetches: [1-9][0-9]*', 'Heap Fetches: > 0');
+		RETURN NEXT ln;
+	END LOOP;
+END $$;
+/* Which columns of idx an index-only scan can return (amcanreturn). */
+CREATE FUNCTION lion_ios_returnable(idx regclass)
+RETURNS TABLE (col name, returnable boolean) LANGUAGE sql AS $$
+	SELECT a.attname, pg_index_column_has_property(idx, a.attnum, 'returnable')
+	  FROM pg_attribute a
+	 WHERE a.attrelid = idx AND a.attnum > 0
+	 ORDER BY a.attnum $$;
+-- ---------------------------------------------------------------------
+-- 1. A scalar key under store_values, INCLUDE columns: an int with NULLs,
+--    a text column under the "C" collation, and a text column with one
+--    value of 1,800 bytes in every thousand rows.  A NULL key now and then.
+-- ---------------------------------------------------------------------
+CREATE TABLE lion_ios_s (id int, k int, a int, t text COLLATE "C", w text);
+INSERT INTO lion_ios_s
+SELECT g, CASE WHEN g % 333 = 0 THEN NULL ELSE g % 200 END,
+	   CASE WHEN g % 11 = 0 THEN NULL ELSE g * 3 END,
+	   CASE WHEN g % 7 = 0 THEN NULL
+			ELSE (ARRAY['apple', 'Banana', 'cherry', 'Date', 'eel'])[1 + g % 5] || (g % 3) END,
+	   CASE WHEN g % 1000 = 1 THEN repeat('long', 450) ELSE 'w' || g END
+  FROM generate_series(1, 40000) g;
+CREATE INDEX lion_ios_s_k ON lion_ios_s USING lion (k) INCLUDE (a, t, w)
+	WITH (store_values = true);
+VACUUM ANALYZE lion_ios_s;
+SELECT * FROM lion_ios_returnable('lion_ios_s_k');
+ col | returnable 
+-----+------------
+ k   | t
+ a   | t
+ t   | t
+ w   | t
+(4 rows)
+
+EXPLAIN (COSTS OFF) SELECT k, a, t, w FROM lion_ios_s WHERE k = 17;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Index Only Scan using lion_ios_s_k on lion_ios_s
+   Index Cond: (k = 17)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT a, t FROM lion_ios_s WHERE k IN (3, 5, 150);
+                    QUERY PLAN                    
+--------------------------------------------------
+ Index Only Scan using lion_ios_s_k on lion_ios_s
+   Index Cond: (k = ANY ('{3,5,150}'::integer[]))
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT a, w FROM lion_ios_s WHERE k IS NULL;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Index Only Scan using lion_ios_s_k on lion_ios_s
+   Index Cond: (k IS NULL)
+(2 rows)
+
+-- a qual on a returned column is the scan's filter, evaluated on its values
+EXPLAIN (COSTS OFF) SELECT k, length(w) FROM lion_ios_s WHERE k = 1 AND w LIKE 'long%';
+                    QUERY PLAN                    
+--------------------------------------------------
+ Index Only Scan using lion_ios_s_k on lion_ios_s
+   Index Cond: (k = 1)
+   Filter: (w ~~ 'long%'::text)
+(3 rows)
+
+SELECT k, count(*), min(length(w)) FROM lion_ios_s WHERE k = 1 AND w LIKE 'long%' GROUP BY k;
+ k | count | min  
+---+-------+------
+ 1 |    40 | 1800
+(1 row)
+
+-- the collation is the column's: upper case before lower case under "C"
+EXPLAIN (COSTS OFF) SELECT DISTINCT t FROM lion_ios_s WHERE k < 5 ORDER BY t;
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Sort
+   Sort Key: t COLLATE "C"
+   ->  HashAggregate
+         Group Key: t
+         ->  Index Only Scan using lion_ios_s_k on lion_ios_s
+               Index Cond: (k < 5)
+(6 rows)
+
+SELECT DISTINCT t FROM lion_ios_s WHERE k < 5 ORDER BY t;
+    t    
+---------
+ Banana0
+ Banana1
+ Banana2
+ Date0
+ Date1
+ Date2
+ apple0
+ apple1
+ apple2
+ cherry0
+ cherry1
+ cherry2
+ eel0
+ eel1
+ eel2
+ 
+(16 rows)
+
+SELECT q, lion_ios_check(q) FROM (VALUES
+	('SELECT k, a, t, w FROM lion_ios_s WHERE k = 17'),
+	('SELECT a, t FROM lion_ios_s WHERE k IN (3, 5, 150)'),
+	('SELECT a, w FROM lion_ios_s WHERE k IS NULL'),
+	('SELECT k, t FROM lion_ios_s WHERE k < 5'),
+	('SELECT k, length(w) FROM lion_ios_s WHERE k = 1 AND w LIKE ''long%''')) v(q);
+                                 q                                  |          lion_ios_check          
+--------------------------------------------------------------------+----------------------------------
+ SELECT k, a, t, w FROM lion_ios_s WHERE k = 17                     | Index Only Scan: same, 200 rows
+ SELECT a, t FROM lion_ios_s WHERE k IN (3, 5, 150)                 | Index Only Scan: same, 600 rows
+ SELECT a, w FROM lion_ios_s WHERE k IS NULL                        | Index Only Scan: same, 120 rows
+ SELECT k, t FROM lion_ios_s WHERE k < 5                            | Index Only Scan: same, 1000 rows
+ SELECT k, length(w) FROM lion_ios_s WHERE k = 1 AND w LIKE 'long%' | Index Only Scan: same, 40 rows
+(5 rows)
+
+SELECT * FROM lion_ios_explain('SELECT k, a, t, w FROM lion_ios_s WHERE k = 17');
+                 lion_ios_explain                 
+--------------------------------------------------
+ Index Only Scan using lion_ios_s_k on lion_ios_s
+   Index Cond: (k = 17)
+   Heap Fetches: 0
+(3 rows)
+
+-- updated and deleted rows, not vacuumed: the pages they are on are not
+-- all-visible, and the executor takes those rows' visibility from the heap,
+-- their values from the scan
+UPDATE lion_ios_s SET a = a + 1, t = upper(t) WHERE id % 50 = 0;
+DELETE FROM lion_ios_s WHERE id % 61 = 0;
+INSERT INTO lion_ios_s VALUES (40001, 17, NULL, 'fig', NULL), (40002, 17, 5, NULL, 'new'),
+	(40003, NULL, 7, 'Fig', repeat('long', 400));
+SELECT q, lion_ios_check(q) FROM (VALUES
+	('SELECT k, a, t, w FROM lion_ios_s WHERE k = 17'),
+	('SELECT a, t FROM lion_ios_s WHERE k IN (3, 5, 150)'),
+	('SELECT a, w FROM lion_ios_s WHERE k IS NULL'),
+	('SELECT k, t FROM lion_ios_s WHERE k < 5'),
+	('SELECT k, length(w) FROM lion_ios_s WHERE k = 1 AND w LIKE ''long%''')) v(q);
+                                 q                                  |         lion_ios_check          
+--------------------------------------------------------------------+---------------------------------
+ SELECT k, a, t, w FROM lion_ios_s WHERE k = 17                     | Index Only Scan: same, 199 rows
+ SELECT a, t FROM lion_ios_s WHERE k IN (3, 5, 150)                 | Index Only Scan: same, 590 rows
+ SELECT a, w FROM lion_ios_s WHERE k IS NULL                        | Index Only Scan: same, 120 rows
+ SELECT k, t FROM lion_ios_s WHERE k < 5                            | Index Only Scan: same, 984 rows
+ SELECT k, length(w) FROM lion_ios_s WHERE k = 1 AND w LIKE 'long%' | Index Only Scan: same, 39 rows
+(5 rows)
+
+SELECT * FROM lion_ios_explain('SELECT k, a, t, w FROM lion_ios_s WHERE k = 17');
+                 lion_ios_explain                 
+--------------------------------------------------
+ Index Only Scan using lion_ios_s_k on lion_ios_s
+   Index Cond: (k = 17)
+   Heap Fetches: > 0
+(3 rows)
+
+-- ... and vacuumed: every page all-visible again, no heap fetch at all
+VACUUM lion_ios_s;
+SELECT q, lion_ios_check(q) FROM (VALUES
+	('SELECT k, a, t, w FROM lion_ios_s WHERE k = 17'),
+	('SELECT a, w FROM lion_ios_s WHERE k IS NULL'),
+	('SELECT k, t FROM lion_ios_s WHERE k < 5')) v(q);
+                       q                        |         lion_ios_check          
+------------------------------------------------+---------------------------------
+ SELECT k, a, t, w FROM lion_ios_s WHERE k = 17 | Index Only Scan: same, 199 rows
+ SELECT a, w FROM lion_ios_s WHERE k IS NULL    | Index Only Scan: same, 120 rows
+ SELECT k, t FROM lion_ios_s WHERE k < 5        | Index Only Scan: same, 984 rows
+(3 rows)
+
+SELECT * FROM lion_ios_explain('SELECT k, a, t, w FROM lion_ios_s WHERE k = 17');
+                 lion_ios_explain                 
+--------------------------------------------------
+ Index Only Scan using lion_ios_s_k on lion_ios_s
+   Index Cond: (k = 17)
+   Heap Fetches: 0
+(3 rows)
+
+-- an index without store_values returns its INCLUDE columns, not its key
+CREATE INDEX lion_ios_s_nokey ON lion_ios_s USING lion (k) INCLUDE (a);
+SELECT * FROM lion_ios_returnable('lion_ios_s_nokey');
+ col | returnable 
+-----+------------
+ k   | f
+ a   | t
+(2 rows)
+
+DROP INDEX lion_ios_s_nokey;
+-- ---------------------------------------------------------------------
+-- 2. An array column, its INCLUDE columns returned under `&&` and `@>`:
+--    the posting sets answer both exactly (DESIGN.md §15, §17), so the
+--    plan never reads tags, which no index-only scan could return.  NULL
+--    and empty arrays, a NULL INCLUDE value now and then.
+-- ---------------------------------------------------------------------
+CREATE TABLE lion_ios_a (id int, tags text[], inc int, note text COLLATE "C");
+INSERT INTO lion_ios_a
+SELECT g, CASE WHEN g % 97 = 0 THEN NULL WHEN g % 89 = 0 THEN '{}'
+			   ELSE ARRAY['t' || (g % 40), 'u' || (g % 9)] END,
+	   CASE WHEN g % 13 = 0 THEN NULL ELSE g END,
+	   (ARRAY['Note', 'note', 'NOTE'])[1 + g % 3] || (g % 500)
+  FROM generate_series(1, 40000) g;
+CREATE INDEX lion_ios_a_tags ON lion_ios_a USING lion (tags) INCLUDE (inc, note);
+VACUUM ANALYZE lion_ios_a;
+SELECT * FROM lion_ios_returnable('lion_ios_a_tags');
+ col  | returnable 
+------+------------
+ tags | f
+ inc  | t
+ note | t
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT inc, note FROM lion_ios_a WHERE tags && '{t3,t4}';
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Index Only Scan using lion_ios_a_tags on lion_ios_a
+   Index Cond: (tags && '{t3,t4}'::text[])
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT inc FROM lion_ios_a WHERE tags @> '{t3}';
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Index Only Scan using lion_ios_a_tags on lion_ios_a
+   Index Cond: (tags @> '{t3}'::text[])
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT inc, note FROM lion_ios_a WHERE tags @> '{t3,u2}';
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Index Only Scan using lion_ios_a_tags on lion_ios_a
+   Index Cond: (tags @> '{t3,u2}'::text[])
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT inc FROM lion_ios_a WHERE tags @> '{t5}' AND inc > 20000;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Index Only Scan using lion_ios_a_tags on lion_ios_a
+   Index Cond: (tags @> '{t5}'::text[])
+   Filter: (inc > 20000)
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT inc, note FROM lion_ios_a WHERE tags IS NULL;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Index Only Scan using lion_ios_a_tags on lion_ios_a
+   Index Cond: (tags IS NULL)
+(2 rows)
+
+SELECT q, lion_ios_check(q) FROM (VALUES
+	('SELECT inc, note FROM lion_ios_a WHERE tags && ''{t3,t4}'''),
+	('SELECT inc FROM lion_ios_a WHERE tags @> ''{t3}'''),
+	('SELECT inc, note FROM lion_ios_a WHERE tags @> ''{t3,u2}'''),
+	('SELECT inc FROM lion_ios_a WHERE tags @> ''{t5}'' AND inc > 20000'),
+	('SELECT inc, note FROM lion_ios_a WHERE tags IS NULL')) v(q);
+                                q                                |          lion_ios_check          
+-----------------------------------------------------------------+----------------------------------
+ SELECT inc, note FROM lion_ios_a WHERE tags && '{t3,t4}'        | Index Only Scan: same, 1957 rows
+ SELECT inc FROM lion_ios_a WHERE tags @> '{t3}'                 | Index Only Scan: same, 979 rows
+ SELECT inc, note FROM lion_ios_a WHERE tags @> '{t3,u2}'        | Index Only Scan: same, 109 rows
+ SELECT inc FROM lion_ios_a WHERE tags @> '{t5}' AND inc > 20000 | Index Only Scan: same, 452 rows
+ SELECT inc, note FROM lion_ios_a WHERE tags IS NULL             | Index Only Scan: same, 412 rows
+(5 rows)
+
+SELECT * FROM lion_ios_explain('SELECT inc, note FROM lion_ios_a WHERE tags && ''{t3,t4}''');
+                  lion_ios_explain                   
+-----------------------------------------------------
+ Index Only Scan using lion_ios_a_tags on lion_ios_a
+   Index Cond: (tags && '{t3,t4}'::text[])
+   Heap Fetches: 0
+(3 rows)
+
+UPDATE lion_ios_a SET inc = -inc, note = lower(note) WHERE id % 40 = 3;
+UPDATE lion_ios_a SET tags = tags || '{t4}'::text[] WHERE id % 40 = 5;
+DELETE FROM lion_ios_a WHERE id % 71 = 0;
+INSERT INTO lion_ios_a VALUES (40001, '{t3,zz}', NULL, 'new'), (40002, '{t4}', 7, NULL);
+SELECT q, lion_ios_check(q) FROM (VALUES
+	('SELECT inc, note FROM lion_ios_a WHERE tags && ''{t3,t4}'''),
+	('SELECT inc FROM lion_ios_a WHERE tags @> ''{t3}'''),
+	('SELECT inc, note FROM lion_ios_a WHERE tags @> ''{t3,u2}'''),
+	('SELECT inc FROM lion_ios_a WHERE tags @> ''{t5}'' AND inc > 20000'),
+	('SELECT inc, note FROM lion_ios_a WHERE tags IS NULL')) v(q);
+                                q                                |          lion_ios_check          
+-----------------------------------------------------------------+----------------------------------
+ SELECT inc, note FROM lion_ios_a WHERE tags && '{t3,t4}'        | Index Only Scan: same, 2917 rows
+ SELECT inc FROM lion_ios_a WHERE tags @> '{t3}'                 | Index Only Scan: same, 966 rows
+ SELECT inc, note FROM lion_ios_a WHERE tags @> '{t3,u2}'        | Index Only Scan: same, 107 rows
+ SELECT inc FROM lion_ios_a WHERE tags @> '{t5}' AND inc > 20000 | Index Only Scan: same, 445 rows
+ SELECT inc, note FROM lion_ios_a WHERE tags IS NULL             | Index Only Scan: same, 396 rows
+(5 rows)
+
+SELECT * FROM lion_ios_explain('SELECT inc, note FROM lion_ios_a WHERE tags && ''{t3,t4}''');
+                  lion_ios_explain                   
+-----------------------------------------------------
+ Index Only Scan using lion_ios_a_tags on lion_ios_a
+   Index Cond: (tags && '{t3,t4}'::text[])
+   Heap Fetches: > 0
+(3 rows)
+
+VACUUM lion_ios_a;
+SELECT q, lion_ios_check(q) FROM (VALUES
+	('SELECT inc, note FROM lion_ios_a WHERE tags && ''{t3,t4}'''),
+	('SELECT inc, note FROM lion_ios_a WHERE tags @> ''{t3,u2}''')) v(q);
+                            q                             |          lion_ios_check          
+----------------------------------------------------------+----------------------------------
+ SELECT inc, note FROM lion_ios_a WHERE tags && '{t3,t4}' | Index Only Scan: same, 2917 rows
+ SELECT inc, note FROM lion_ios_a WHERE tags @> '{t3,u2}' | Index Only Scan: same, 107 rows
+(2 rows)
+
+SELECT * FROM lion_ios_explain('SELECT inc, note FROM lion_ios_a WHERE tags && ''{t3,t4}''');
+                  lion_ios_explain                   
+-----------------------------------------------------
+ Index Only Scan using lion_ios_a_tags on lion_ios_a
+   Index Cond: (tags && '{t3,t4}'::text[])
+   Heap Fetches: 0
+(3 rows)
+
+-- ---------------------------------------------------------------------
+-- 3. A tsvector column: `@@` of an AND or an OR of lexemes is exact.
+-- ---------------------------------------------------------------------
+CREATE TABLE lion_ios_d (id int, doc tsvector, inc int, title text);
+INSERT INTO lion_ios_d
+SELECT g, CASE WHEN g % 101 = 0 THEN NULL
+			   ELSE to_tsvector('simple', 'w' || (g % 30) || ' x' || (g % 11) || ' y' || (g % 7)) END,
+	   CASE WHEN g % 17 = 0 THEN NULL ELSE g END, 'title ' || (g % 300)
+  FROM generate_series(1, 40000) g;
+CREATE INDEX lion_ios_d_doc ON lion_ios_d USING lion (doc) INCLUDE (inc, title);
+VACUUM ANALYZE lion_ios_d;
+SELECT * FROM lion_ios_returnable('lion_ios_d_doc');
+  col  | returnable 
+-------+------------
+ doc   | f
+ inc   | t
+ title | t
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT inc, title FROM lion_ios_d WHERE doc @@ 'w3 & x2'::tsquery;
+                     QUERY PLAN                     
+----------------------------------------------------
+ Index Only Scan using lion_ios_d_doc on lion_ios_d
+   Index Cond: (doc @@ '''w3'' & ''x2'''::tsquery)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT inc FROM lion_ios_d WHERE doc @@ 'w3 | w4'::tsquery;
+                     QUERY PLAN                     
+----------------------------------------------------
+ Index Only Scan using lion_ios_d_doc on lion_ios_d
+   Index Cond: (doc @@ '''w3'' | ''w4'''::tsquery)
+(2 rows)
+
+SELECT q, lion_ios_check(q) FROM (VALUES
+	('SELECT inc, title FROM lion_ios_d WHERE doc @@ ''w3 & x2''::tsquery'),
+	('SELECT inc FROM lion_ios_d WHERE doc @@ ''w3 | w4''::tsquery')) v(q);
+                                 q                                 |          lion_ios_check          
+-------------------------------------------------------------------+----------------------------------
+ SELECT inc, title FROM lion_ios_d WHERE doc @@ 'w3 & x2'::tsquery | Index Only Scan: same, 120 rows
+ SELECT inc FROM lion_ios_d WHERE doc @@ 'w3 | w4'::tsquery        | Index Only Scan: same, 2641 rows
+(2 rows)
+
+UPDATE lion_ios_d SET title = upper(title) WHERE id % 30 = 3;
+DELETE FROM lion_ios_d WHERE id % 37 = 0;
+SELECT q, lion_ios_check(q) FROM (VALUES
+	('SELECT inc, title FROM lion_ios_d WHERE doc @@ ''w3 & x2''::tsquery'),
+	('SELECT inc FROM lion_ios_d WHERE doc @@ ''w3 | w4''::tsquery')) v(q);
+                                 q                                 |          lion_ios_check          
+-------------------------------------------------------------------+----------------------------------
+ SELECT inc, title FROM lion_ios_d WHERE doc @@ 'w3 & x2'::tsquery | Index Only Scan: same, 116 rows
+ SELECT inc FROM lion_ios_d WHERE doc @@ 'w3 | w4'::tsquery        | Index Only Scan: same, 2571 rows
+(2 rows)
+
+SELECT * FROM lion_ios_explain('SELECT inc, title FROM lion_ios_d WHERE doc @@ ''w3 & x2''::tsquery');
+                  lion_ios_explain                  
+----------------------------------------------------
+ Index Only Scan using lion_ios_d_doc on lion_ios_d
+   Index Cond: (doc @@ '''w3'' & ''x2'''::tsquery)
+   Heap Fetches: > 0
+(3 rows)
+
+VACUUM lion_ios_d;
+SELECT * FROM lion_ios_explain('SELECT inc, title FROM lion_ios_d WHERE doc @@ ''w3 & x2''::tsquery');
+                  lion_ios_explain                  
+----------------------------------------------------
+ Index Only Scan using lion_ios_d_doc on lion_ios_d
+   Index Cond: (doc @@ '''w3'' & ''x2'''::tsquery)
+   Heap Fetches: 0
+(3 rows)
+
+-- ---------------------------------------------------------------------
+-- 4. store_max_len: a text INCLUDE column in capped slots
+-- ---------------------------------------------------------------------
+CREATE TABLE lion_ios_c (id int, k int, code text);
+INSERT INTO lion_ios_c
+SELECT g, g % 100, CASE WHEN g % 9 = 0 THEN NULL ELSE 'c-' || g END
+  FROM generate_series(1, 30000) g;
+CREATE INDEX lion_ios_c_k ON lion_ios_c USING lion (k) INCLUDE (code)
+	WITH (store_values = true, store_max_len = 12);
+VACUUM ANALYZE lion_ios_c;
+EXPLAIN (COSTS OFF) SELECT k, code FROM lion_ios_c WHERE k = 42;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Index Only Scan using lion_ios_c_k on lion_ios_c
+   Index Cond: (k = 42)
+(2 rows)
+
+SELECT lion_ios_check('SELECT k, code FROM lion_ios_c WHERE k = 42');
+         lion_ios_check          
+---------------------------------
+ Index Only Scan: same, 300 rows
+(1 row)
+
+UPDATE lion_ios_c SET code = 'u-' || id WHERE id % 25 = 0;
+SELECT lion_ios_check('SELECT k, code FROM lion_ios_c WHERE k = 42');
+         lion_ios_check          
+---------------------------------
+ Index Only Scan: same, 300 rows
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- 5. ABSENT: heap pages whose values no store page can hold (store.sql's
+--    recipe: distinct strings of 1,984 bytes the heap compresses inline).
+--    The key is not stored - the qual is answered by the posting sets, and
+--    the plan is the one lion's planner hook builds - and the ABSENT pages'
+--    values come from the heap, the others' from the store.
+-- ---------------------------------------------------------------------
+CREATE TABLE lion_ios_abs (id int, s text, f text) WITH (toast_tuple_target = 128);
+INSERT INTO lion_ios_abs SELECT g, repeat(md5(g::text), 62), repeat('f', 100) FROM generate_series(1, 400) g;
+INSERT INTO lion_ios_abs SELECT g, 'short ' || g FROM generate_series(401, 900) g;
+CREATE INDEX lion_ios_abs_i ON lion_ios_abs USING lion (id) INCLUDE (s);
+VACUUM ANALYZE lion_ios_abs;
+SELECT attno, store_absent > 0 AS has_absent FROM lion_index_stats('lion_ios_abs_i') WHERE attno = 2;
+ attno | has_absent 
+-------+------------
+     2 | t
+(1 row)
+
+SELECT * FROM lion_ios_returnable('lion_ios_abs_i');
+ col | returnable 
+-----+------------
+ id  | f
+ s   | t
+(2 rows)
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- rows on ABSENT pages and on stored ones, in one batch
+EXPLAIN (COSTS OFF) SELECT s FROM lion_ios_abs WHERE id IN (7, 150, 399, 401, 450, 800);
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Index Only Scan using lion_ios_abs_i on lion_ios_abs
+   Index Cond: (id = ANY ('{7,150,399,401,450,800}'::integer[]))
+(2 rows)
+
+SELECT lion_ios_check('SELECT s FROM lion_ios_abs WHERE id IN (7, 150, 399, 401, 450, 800)');
+        lion_ios_check         
+-------------------------------
+ Index Only Scan: same, 6 rows
+(1 row)
+
+SELECT lion_ios_check('SELECT length(s) FROM lion_ios_abs WHERE id = 7');
+        lion_ios_check         
+-------------------------------
+ Index Only Scan: same, 1 rows
+(1 row)
+
+SELECT * FROM lion_ios_explain('SELECT s FROM lion_ios_abs WHERE id IN (7, 150, 399, 401, 450, 800)');
+                        lion_ios_explain                         
+-----------------------------------------------------------------
+ Index Only Scan using lion_ios_abs_i on lion_ios_abs
+   Index Cond: (id = ANY ('{7,150,399,401,450,800}'::integer[]))
+   Heap Fetches: 0
+(3 rows)
+
+-- a walk of 201 one-row entries gathers the window once per entry, which
+-- costs more than the heap of this small table: a plain scan, unless the
+-- store's pages are made free
+EXPLAIN (COSTS OFF) SELECT s FROM lion_ios_abs WHERE id BETWEEN 300 AND 500;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Index Scan using lion_ios_abs_i on lion_ios_abs
+   Index Cond: ((id >= 300) AND (id <= 500))
+(2 rows)
+
+SET pg_lion.store_page_cost = 0;
+EXPLAIN (COSTS OFF) SELECT s FROM lion_ios_abs WHERE id BETWEEN 300 AND 500;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Index Only Scan using lion_ios_abs_i on lion_ios_abs
+   Index Cond: ((id >= 300) AND (id <= 500))
+(2 rows)
+
+SELECT lion_ios_check('SELECT s FROM lion_ios_abs WHERE id BETWEEN 300 AND 500');
+         lion_ios_check          
+---------------------------------
+ Index Only Scan: same, 201 rows
+(1 row)
+
+RESET pg_lion.store_page_cost;
+-- the key itself is not returned: a plain scan
+EXPLAIN (COSTS OFF) SELECT id, s FROM lion_ios_abs WHERE id IN (7, 150, 399, 401, 450, 800);
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Index Scan using lion_ios_abs_i on lion_ios_abs
+   Index Cond: (id = ANY ('{7,150,399,401,450,800}'::integer[]))
+(2 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+-- ---------------------------------------------------------------------
+-- 6. Past the pin budget.  A multi-key query's sets keep their leaves
+--    pinned for an index-only scan as far as the list pin budget goes, and
+--    a set past it holds none: the batches it contributes to have no §9
+--    interlock, and their TIDs go to the heap, values and all.  A temporary
+--    table's budget is an eighth of temp_buffers, 12 leaves here, and keys
+--    of 1.9 kB put one or two on a leaf.
+-- ---------------------------------------------------------------------
+CREATE TEMP TABLE lion_ios_pin (id int, tags text[], inc int);
+INSERT INTO lion_ios_pin SELECT g, ARRAY[repeat(md5(g::text), 59) || g], g * 7 FROM generate_series(1, 300) g;
+CREATE INDEX lion_ios_pin_tags ON lion_ios_pin USING lion (tags) INCLUDE (inc);
+VACUUM ANALYZE lion_ios_pin;
+SELECT array_agg(repeat(md5(g::text), 59) || g) AS pin_keys FROM generate_series(1, 300, 4) g \gset
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT lion_ios_check(format('SELECT inc FROM lion_ios_pin WHERE tags && %L::text[]', :'pin_keys'));
+         lion_ios_check         
+--------------------------------
+ Index Only Scan: same, 75 rows
+(1 row)
+
+UPDATE lion_ios_pin SET inc = -inc WHERE id % 8 = 1;
+SELECT lion_ios_check(format('SELECT inc FROM lion_ios_pin WHERE tags && %L::text[]', :'pin_keys'));
+         lion_ios_check         
+--------------------------------
+ Index Only Scan: same, 75 rows
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP TABLE lion_ios_pin;
+-- ---------------------------------------------------------------------
+-- 7. What an index-only scan does not answer: the array column itself,
+--    which no index can return (a row has many keys and the store one
+--    slot), and the predicates the sets answer only with a recheck - `<@`,
+--    `@> '{}'`, a tsquery with `!` or a prefix - whose recheck would read
+--    the column.  The plans core takes instead.
+-- ---------------------------------------------------------------------
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT * FROM lion_ios_a WHERE tags @> '{t3}';
+                  QUERY PLAN                  
+----------------------------------------------
+ Bitmap Heap Scan on lion_ios_a
+   Recheck Cond: (tags @> '{t3}'::text[])
+   ->  Bitmap Index Scan on lion_ios_a_tags
+         Index Cond: (tags @> '{t3}'::text[])
+(4 rows)
+
+EXPLAIN (COSTS OFF) SELECT tags, inc FROM lion_ios_a WHERE tags && '{t3,t4}';
+                   QUERY PLAN                    
+-------------------------------------------------
+ Bitmap Heap Scan on lion_ios_a
+   Recheck Cond: (tags && '{t3,t4}'::text[])
+   ->  Bitmap Index Scan on lion_ios_a_tags
+         Index Cond: (tags && '{t3,t4}'::text[])
+(4 rows)
+
+EXPLAIN (COSTS OFF) SELECT inc FROM lion_ios_a WHERE tags <@ '{t3,u2}';
+                   QUERY PLAN                    
+-------------------------------------------------
+ Bitmap Heap Scan on lion_ios_a
+   Recheck Cond: (tags <@ '{t3,u2}'::text[])
+   ->  Bitmap Index Scan on lion_ios_a_tags
+         Index Cond: (tags <@ '{t3,u2}'::text[])
+(4 rows)
+
+EXPLAIN (COSTS OFF) SELECT inc FROM lion_ios_a WHERE tags @> '{}';
+                 QUERY PLAN                 
+--------------------------------------------
+ Bitmap Heap Scan on lion_ios_a
+   Recheck Cond: (tags @> '{}'::text[])
+   ->  Bitmap Index Scan on lion_ios_a_tags
+         Index Cond: (tags @> '{}'::text[])
+(4 rows)
+
+EXPLAIN (COSTS OFF) SELECT inc FROM lion_ios_d WHERE doc @@ '!w3'::tsquery;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Bitmap Heap Scan on lion_ios_d
+   Recheck Cond: (doc @@ '!''w3'''::tsquery)
+   ->  Bitmap Index Scan on lion_ios_d_doc
+         Index Cond: (doc @@ '!''w3'''::tsquery)
+(4 rows)
+
+EXPLAIN (COSTS OFF) SELECT inc FROM lion_ios_d WHERE doc @@ 'w3:*'::tsquery;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Bitmap Heap Scan on lion_ios_d
+   Recheck Cond: (doc @@ '''w3'':*'::tsquery)
+   ->  Bitmap Index Scan on lion_ios_d_doc
+         Index Cond: (doc @@ '''w3'':*'::tsquery)
+(4 rows)
+
+-- an INCLUDE column that is not returned: the plan needs id
+EXPLAIN (COSTS OFF) SELECT id, inc FROM lion_ios_a WHERE tags && '{t3,t4}';
+                   QUERY PLAN                    
+-------------------------------------------------
+ Bitmap Heap Scan on lion_ios_a
+   Recheck Cond: (tags && '{t3,t4}'::text[])
+   ->  Bitmap Index Scan on lion_ios_a_tags
+         Index Cond: (tags && '{t3,t4}'::text[])
+(4 rows)
+
+RESET enable_seqscan;
+SELECT q, lion_ios_check(q) FROM (VALUES
+	('SELECT * FROM lion_ios_a WHERE tags @> ''{t3}'''),
+	('SELECT inc FROM lion_ios_a WHERE tags <@ ''{t3,u2}'''),
+	('SELECT inc FROM lion_ios_d WHERE doc @@ ''!w3''::tsquery')) v(q);
+                           q                            |          lion_ios_check          
+--------------------------------------------------------+----------------------------------
+ SELECT * FROM lion_ios_a WHERE tags @> '{t3}'          | Bitmap Heap Scan: same, 966 rows
+ SELECT inc FROM lion_ios_a WHERE tags <@ '{t3,u2}'     | Seq Scan: same, 534 rows
+ SELECT inc FROM lion_ios_d WHERE doc @@ '!w3'::tsquery | Seq Scan: same, 37248 rows
+(3 rows)
+
+-- ---------------------------------------------------------------------
+-- 8. citext (the pg_lion_citext extension).  The key column's entry is one
+--    spelling standing for all its case variants (citext.sql), but the store
+--    holds each row's own datum (DESIGN.md §40, "Writes"): citext_ops has no
+--    storage type, so the stored type is the index column's and the key is
+--    returnable (LionStoreCol.returnable) - and what it returns is every
+--    row's own spelling.  The INCLUDE citext column likewise.
+-- ---------------------------------------------------------------------
+CREATE EXTENSION IF NOT EXISTS citext;
+CREATE EXTENSION IF NOT EXISTS pg_lion_citext;
+CREATE TABLE lion_ios_ci (id int, name citext, alias citext);
+INSERT INTO lion_ios_ci
+SELECT g, (ARRAY['Alice', 'ALICE', 'alice', 'Bob', 'BOB', 'carol'])[1 + g % 6],
+	   CASE WHEN g % 10 = 0 THEN NULL ELSE (ARRAY['Al', 'AL', 'al'])[1 + g % 3] || (g % 4) END
+  FROM generate_series(1, 30000) g;
+CREATE INDEX lion_ios_ci_name ON lion_ios_ci USING lion (name) INCLUDE (alias)
+	WITH (store_values = true);
+VACUUM ANALYZE lion_ios_ci;
+SELECT * FROM lion_ios_returnable('lion_ios_ci_name');
+  col  | returnable 
+-------+------------
+ name  | t
+ alias | t
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT name, alias FROM lion_ios_ci WHERE name = 'alice';
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Index Only Scan using lion_ios_ci_name on lion_ios_ci
+   Index Cond: (name = 'alice'::citext)
+(2 rows)
+
+SELECT name::text, count(*) FROM lion_ios_ci WHERE name = 'alice' GROUP BY name::text ORDER BY 1;
+ name  | count 
+-------+-------
+ ALICE |  5000
+ Alice |  5000
+ alice |  5000
+(3 rows)
+
+SELECT lion_ios_check('SELECT name, alias FROM lion_ios_ci WHERE name = ''alice''');
+          lion_ios_check           
+-----------------------------------
+ Index Only Scan: same, 15000 rows
+(1 row)
+
+UPDATE lion_ios_ci SET name = upper(name::text), alias = lower(alias::text) WHERE id % 50 = 2;
+SELECT name::text, count(*) FROM lion_ios_ci WHERE name = 'alice' GROUP BY name::text ORDER BY 1;
+ name  | count 
+-------+-------
+ ALICE |  5400
+ Alice |  4800
+ alice |  4800
+(3 rows)
+
+SELECT lion_ios_check('SELECT name, alias FROM lion_ios_ci WHERE name = ''alice''');
+          lion_ios_check           
+-----------------------------------
+ Index Only Scan: same, 15000 rows
+(1 row)
+
+SELECT * FROM lion_ios_explain('SELECT name, alias FROM lion_ios_ci WHERE name = ''alice''');
+                   lion_ios_explain                    
+-------------------------------------------------------
+ Index Only Scan using lion_ios_ci_name on lion_ios_ci
+   Index Cond: (name = 'alice'::citext)
+   Heap Fetches: > 0
+(3 rows)
+
+DROP TABLE lion_ios_ci;
+DROP EXTENSION pg_lion_citext;
+DROP EXTENSION citext;
+SELECT lion_index_verify('lion_ios_s_k', true), lion_index_verify('lion_ios_a_tags', true),
+	   lion_index_verify('lion_ios_d_doc', true), lion_index_verify('lion_ios_c_k', true);
+ lion_index_verify | lion_index_verify | lion_index_verify | lion_index_verify 
+-------------------+-------------------+-------------------+-------------------
+                   |                   |                   | 
+(1 row)
+
+DROP TABLE lion_ios_s, lion_ios_a, lion_ios_d, lion_ios_c, lion_ios_abs;
+DROP FUNCTION lion_ios_check(text);
+DROP FUNCTION lion_ios_explain(text);
+DROP FUNCTION lion_ios_returnable(regclass);
