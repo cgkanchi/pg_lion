@@ -1015,6 +1015,46 @@ SELECT lion_dc('SELECT g8, count(DISTINCT k50) FROM lion_dtc GROUP BY g8', false
 (1 row)
 
 DROP TABLE lion_dtc;
+/*
+ * The walk tests every entry of k, not only the values the WHERE leaves: here
+ * 150,000 entries for the 7,500 values of a `c <> 0` that keeps 5% of 200k wide
+ * rows.  Priced by the values it was chosen, 594 ms against the bitmap scan's
+ * 17 (assert build); ClickBench's `count(DISTINCT UserID) WHERE
+ * MobilePhoneModel <> ''` was 9.1 s against 0.7.  An equality on c, 1% of the
+ * rows, is left to core as it was.  Forced, the walk still answers right.
+ */
+CREATE TABLE lion_dtm (
+	id		int		NOT NULL,
+	k		int		NOT NULL,
+	c		int		NOT NULL,
+	pad		text
+);
+INSERT INTO lion_dtm
+SELECT i, (i::bigint * 7919) % 150000,
+	   CASE WHEN i % 20 = 0 THEN 1 + i % 7 ELSE 0 END, repeat(md5(i::text), 12)
+  FROM generate_series(1, 200000) i;
+CREATE INDEX lion_dtm_k ON lion_dtm USING lion (k);
+CREATE INDEX lion_dtm_c ON lion_dtm USING lion (c);
+VACUUM (FREEZE, ANALYZE) lion_dtm;
+SELECT lion_dc_pick('SELECT count(DISTINCT k) FROM lion_dtm WHERE c <> 0');
+  lion_dc_pick   
+-----------------
+ not pushed down
+(1 row)
+
+SELECT lion_dc_pick('SELECT count(DISTINCT k) FROM lion_dtm WHERE c = 3');
+  lion_dc_pick   
+-----------------
+ not pushed down
+(1 row)
+
+SELECT lion_dc('SELECT count(DISTINCT k) FROM lion_dtm WHERE c <> 0');
+       lion_dc       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+DROP TABLE lion_dtm;
 -- ---- 9. citext: the opclass equality IS citext's own ----------------------
 CREATE EXTENSION IF NOT EXISTS citext;
 CREATE EXTENSION IF NOT EXISTS pg_lion_citext;

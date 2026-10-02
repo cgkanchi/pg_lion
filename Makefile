@@ -14,7 +14,7 @@ COUNT_OBJS = src/lion_set.o src/lion_set_copy.o src/lion_cursor.o src/lion_expr.
 # half (lion_exec_*), which share the private header src/lion_customscan.h.
 CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_target.o \
        src/lion_plan_cost.o src/lion_plan_fkjoin_cost.o src/lion_plan_fkjoin.o \
-       src/lion_plan_count.o src/lion_plan_hooks.o \
+       src/lion_plan_count.o src/lion_plan_hooks.o src/lion_plan_units.o \
        src/lion_exec_begin.o src/lion_exec_locate.o src/lion_exec_count.o \
        src/lion_exec_fkjoin.o src/lion_exec_run.o src/lion_exec_explain.o
 # The SQL-callable helpers: lion_funcs.c and lion_index_verify()'s files, which
@@ -203,6 +203,17 @@ recovery-check:
 recovery-check-rmgr:
 	./test/recovery/run.sh $(if $(RECOVERY_PREFIX),--prefix "$(RECOVERY_PREFIX)") \
 		--mode rmgr --conf "wal_consistency_checking = 'pg_lion'"
+
+# The concurrent write + VACUUM + count soak (test/soak/README.md): the dev
+# cluster restarted into each WAL mode in turn, as installcheck-rmgr does,
+# with a hot standby in rmgr mode, and put back afterwards.
+#
+#   make soak                                  10 minutes a mode
+#   make soak SOAK_DURATION=120 SOAK_MODES=rmgr
+#   make soak SOAK_RUN_AS=<user>               as root: the cluster's user
+.PHONY: soak
+soak:
+	PG_CONFIG="$(PG_CONFIG)" ./test/soak/modes.sh
 
 # The PGXN release archive: pg_lion-<version>.zip, made by git archive from
 # the committed HEAD, so it holds exactly the tracked files named here - what

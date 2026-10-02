@@ -6,9 +6,10 @@
 -- sum(f(x)) is the sum over x's entries of f(key) times the entry's rows,
 -- avg that over their total, min and max the first f(key) in the aggregate's
 -- order: one walk of each column's entries.  When every heap page is
--- all-visible before and after the walk, an entry's rows are the count its
--- header keeps; otherwise each entry is counted.  Every answer is checked
--- against a SEQUENTIAL SCAN.
+-- all-visible before and after the walk, and no bulk delete of the index has
+-- finished in between, an entry's rows are the count its header keeps;
+-- otherwise each entry is counted.  Every answer is checked against a
+-- SEQUENTIAL SCAN.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -179,6 +180,43 @@ CREATE INDEX kap_x ON kap USING lion (x) WHERE x > 10;
 VACUUM ANALYZE kap;
 SELECT lion_kq('SELECT sum(x) FROM kap');
 
+-- 5. What tells the walk that VACUUM took TIDs out under it: the meta page's
+--    count of finished bulk deletes (DESIGN.md §37), at byte 84 of block 0 -
+--    the second word of the key counts of §33, which follow the 24-byte page
+--    header and the 56 bytes of meta data.  A build writes 0.  A VACUUM that
+--    finds nothing dead calls no bulk delete, and ANALYZE counts the keys
+--    without touching it.  Every bulk delete adds one - the one that took out
+--    an aborted insert's rows too - and the walk, which compares it before
+--    and after (test/isolation/wagg_aborted_insert.spec races it), takes the
+--    entries' own counts again once VACUUM has finished.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+RESET client_min_messages;
+CREATE FUNCTION lion_kbd(idx regclass) RETURNS bigint
+LANGUAGE sql AS $$
+	SELECT get_byte(p, 84)::bigint | (get_byte(p, 85)::bigint << 8) |
+		   (get_byte(p, 86)::bigint << 16) | (get_byte(p, 87)::bigint << 24)
+	  FROM get_raw_page(idx::text, 0) p
+$$;
+CREATE TABLE kbd (x int4) WITH (autovacuum_enabled = off);
+INSERT INTO kbd SELECT g % 40 FROM generate_series(1, 4000) g;
+CREATE INDEX kbd_x ON kbd USING lion (x);
+SELECT lion_kbd('kbd_x') AS after_build;
+VACUUM ANALYZE kbd;
+SELECT lion_kbd('kbd_x') AS after_vacuum_of_nothing_dead;
+BEGIN;
+INSERT INTO kbd SELECT g FROM generate_series(1, 100) g;
+ROLLBACK;
+VACUUM (INDEX_CLEANUP ON) kbd;
+SELECT lion_kbd('kbd_x') AS after_aborted_insert_vacuumed;
+DELETE FROM kbd WHERE x = 7;
+VACUUM (INDEX_CLEANUP ON) kbd;
+ANALYZE kbd;
+SELECT lion_kbd('kbd_x') AS after_delete_vacuumed_and_analyze;
+SELECT lion_kq('SELECT sum(x), max(x), avg(x), count(*) FROM kbd');
+SELECT lion_krun('SELECT sum(x), max(x) FROM kbd');
+DROP FUNCTION lion_kbd(regclass);
+
 DROP FUNCTION lion_krun(text);
 DROP FUNCTION lion_kq(text);
-DROP TABLE ka, ka0, kap;
+DROP TABLE ka, ka0, kap, kbd;

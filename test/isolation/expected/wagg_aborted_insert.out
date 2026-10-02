@@ -1,0 +1,313 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s3_prep s3_how s1_aggs s3_parked s2_abort s3_walk s3_vacuum s3_allvis s3_release s3_reference s3_after s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM (FREEZE, ANALYZE) wa;
+s3: NOTICE:  aggregates over keys planned: t
+step s3_how: 
+	INSERT INTO wa_pages SELECT pg_relation_size('wa');
+	DO $$
+	DECLARE ln text; found bool := false;
+	BEGIN
+		FOR ln IN EXPLAIN (COSTS OFF) SELECT sum(k), max(k % 50) FROM wa LOOP
+			IF ln ~ 'Aggregates Over Keys' THEN found := true; END IF;
+		END LOOP;
+		RAISE NOTICE 'aggregates over keys planned: %', found;
+	END $$;
+	SELECT leaf_pages >= 2 AS two_leaves_or_more FROM lion_index_stats('wa_k');
+
+two_leaves_or_more
+------------------
+t                 
+(1 row)
+
+step s1_aggs: SELECT sum(k), max(k % 50) FROM wa; <waiting ...>
+step s3_parked: 
+	SELECT wait_event FROM pg_stat_activity
+	 WHERE datname = current_database() AND wait_event_type = 'InjectionPoint';
+
+wait_event          
+--------------------
+lion-entry-scan-leaf
+(1 row)
+
+step s2_abort: 
+	BEGIN;
+	INSERT INTO wa SELECT -1, k, 'y' FROM (SELECT DISTINCT k FROM wa) d;
+	INSERT INTO wa SELECT -2, k, 'y' FROM generate_series(49, 9999, 50) k;
+	ROLLBACK;
+
+step s3_walk: 
+	/*
+	 * Detach first, so that the walk parks at no leaf again, then let it go
+	 * on to the end of its walk, where it parks at the other point.
+	 */
+	SELECT injection_points_detach('lion-entry-scan-leaf');
+	SELECT injection_points_wakeup('lion-entry-scan-leaf');
+	DO $$
+	BEGIN
+		FOR i IN 1 .. 6000 LOOP
+			/* pg_stat_activity is otherwise read once per transaction */
+			PERFORM pg_stat_clear_snapshot();
+			EXIT WHEN EXISTS (SELECT FROM pg_stat_activity
+							   WHERE datname = current_database()
+								 AND wait_event_type = 'InjectionPoint'
+								 AND wait_event = 'lion-wagg-walked');
+			PERFORM pg_sleep(0.01);
+		END LOOP;
+	END $$;
+	SELECT wait_event FROM pg_stat_activity
+	 WHERE datname = current_database() AND wait_event_type = 'InjectionPoint';
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+wait_event      
+----------------
+lion-wagg-walked
+(1 row)
+
+step s3_vacuum: VACUUM (INDEX_CLEANUP ON) wa;
+step s3_allvis: 
+	SELECT pg_relation_size('wa') = (SELECT before FROM wa_pages) AS same_pages,
+		   (SELECT relallvisible FROM pg_class WHERE relname = 'wa') =
+		   pg_relation_size('wa') / current_setting('block_size')::int AS all_visible_again;
+
+same_pages|all_visible_again
+----------+-----------------
+t         |t                
+(1 row)
+
+step s3_release: 
+	SELECT injection_points_detach('lion-wagg-walked');
+	SELECT injection_points_wakeup('lion-wagg-walked');
+	/*
+	 * Wait until s1 has left the point.  The tester deems a session that
+	 * waits at one blocked, and checks the walk again as soon as this step
+	 * is done: seen there still, the walk's answer would be reported after
+	 * the next step's instead of before it.
+	 */
+	DO $$
+	BEGIN
+		FOR i IN 1 .. 6000 LOOP
+			PERFORM pg_stat_clear_snapshot();
+			EXIT WHEN NOT EXISTS (SELECT FROM pg_stat_activity
+								   WHERE datname = current_database()
+									 AND wait_event_type = 'InjectionPoint'
+									 AND wait_event = 'lion-wagg-walked');
+			PERFORM pg_sleep(0.01);
+		END LOOP;
+	END $$;
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_aggs: <... completed>
+     sum|max
+--------+---
+97980400| 48
+(1 row)
+
+step s3_reference: 
+	SET pg_lion.enable_count_pushdown = off;
+	SET enable_seqscan = on;
+	SET enable_bitmapscan = off;
+	SET enable_indexscan = off;
+	SELECT sum(k), max(k % 50) FROM wa;
+	RESET pg_lion.enable_count_pushdown;
+	SET enable_seqscan = off;
+	RESET enable_bitmapscan;
+	RESET enable_indexscan;
+
+     sum|max
+--------+---
+97980400| 48
+(1 row)
+
+step s3_after: SELECT sum(k), max(k % 50) FROM wa;
+     sum|max
+--------+---
+97980400| 48
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('wa_k', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s3_prep s3_how s1_aggs s3_parked s2_savepoint s3_walk s3_vacuum s3_allvis s3_release s3_reference s3_after s3_verify
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM (FREEZE, ANALYZE) wa;
+s3: NOTICE:  aggregates over keys planned: t
+step s3_how: 
+	INSERT INTO wa_pages SELECT pg_relation_size('wa');
+	DO $$
+	DECLARE ln text; found bool := false;
+	BEGIN
+		FOR ln IN EXPLAIN (COSTS OFF) SELECT sum(k), max(k % 50) FROM wa LOOP
+			IF ln ~ 'Aggregates Over Keys' THEN found := true; END IF;
+		END LOOP;
+		RAISE NOTICE 'aggregates over keys planned: %', found;
+	END $$;
+	SELECT leaf_pages >= 2 AS two_leaves_or_more FROM lion_index_stats('wa_k');
+
+two_leaves_or_more
+------------------
+t                 
+(1 row)
+
+step s1_aggs: SELECT sum(k), max(k % 50) FROM wa; <waiting ...>
+step s3_parked: 
+	SELECT wait_event FROM pg_stat_activity
+	 WHERE datname = current_database() AND wait_event_type = 'InjectionPoint';
+
+wait_event          
+--------------------
+lion-entry-scan-leaf
+(1 row)
+
+step s2_savepoint: 
+	BEGIN;
+	SAVEPOINT a;
+	INSERT INTO wa SELECT -1, k, 'y' FROM (SELECT DISTINCT k FROM wa) d;
+	INSERT INTO wa SELECT -2, k, 'y' FROM generate_series(49, 9999, 50) k;
+	ROLLBACK TO SAVEPOINT a;
+	COMMIT;
+
+step s3_walk: 
+	/*
+	 * Detach first, so that the walk parks at no leaf again, then let it go
+	 * on to the end of its walk, where it parks at the other point.
+	 */
+	SELECT injection_points_detach('lion-entry-scan-leaf');
+	SELECT injection_points_wakeup('lion-entry-scan-leaf');
+	DO $$
+	BEGIN
+		FOR i IN 1 .. 6000 LOOP
+			/* pg_stat_activity is otherwise read once per transaction */
+			PERFORM pg_stat_clear_snapshot();
+			EXIT WHEN EXISTS (SELECT FROM pg_stat_activity
+							   WHERE datname = current_database()
+								 AND wait_event_type = 'InjectionPoint'
+								 AND wait_event = 'lion-wagg-walked');
+			PERFORM pg_sleep(0.01);
+		END LOOP;
+	END $$;
+	SELECT wait_event FROM pg_stat_activity
+	 WHERE datname = current_database() AND wait_event_type = 'InjectionPoint';
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+wait_event      
+----------------
+lion-wagg-walked
+(1 row)
+
+step s3_vacuum: VACUUM (INDEX_CLEANUP ON) wa;
+step s3_allvis: 
+	SELECT pg_relation_size('wa') = (SELECT before FROM wa_pages) AS same_pages,
+		   (SELECT relallvisible FROM pg_class WHERE relname = 'wa') =
+		   pg_relation_size('wa') / current_setting('block_size')::int AS all_visible_again;
+
+same_pages|all_visible_again
+----------+-----------------
+t         |t                
+(1 row)
+
+step s3_release: 
+	SELECT injection_points_detach('lion-wagg-walked');
+	SELECT injection_points_wakeup('lion-wagg-walked');
+	/*
+	 * Wait until s1 has left the point.  The tester deems a session that
+	 * waits at one blocked, and checks the walk again as soon as this step
+	 * is done: seen there still, the walk's answer would be reported after
+	 * the next step's instead of before it.
+	 */
+	DO $$
+	BEGIN
+		FOR i IN 1 .. 6000 LOOP
+			PERFORM pg_stat_clear_snapshot();
+			EXIT WHEN NOT EXISTS (SELECT FROM pg_stat_activity
+								   WHERE datname = current_database()
+									 AND wait_event_type = 'InjectionPoint'
+									 AND wait_event = 'lion-wagg-walked');
+			PERFORM pg_sleep(0.01);
+		END LOOP;
+	END $$;
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_aggs: <... completed>
+     sum|max
+--------+---
+97980400| 48
+(1 row)
+
+step s3_reference: 
+	SET pg_lion.enable_count_pushdown = off;
+	SET enable_seqscan = on;
+	SET enable_bitmapscan = off;
+	SET enable_indexscan = off;
+	SELECT sum(k), max(k % 50) FROM wa;
+	RESET pg_lion.enable_count_pushdown;
+	SET enable_seqscan = off;
+	RESET enable_bitmapscan;
+	RESET enable_indexscan;
+
+     sum|max
+--------+---
+97980400| 48
+(1 row)
+
+step s3_after: SELECT sum(k), max(k % 50) FROM wa;
+     sum|max
+--------+---
+97980400| 48
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('wa_k', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+

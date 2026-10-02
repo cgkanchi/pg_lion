@@ -723,6 +723,42 @@ lion_heap_page_cost(PlannerInfo *root, RelOptInfo *rel, double pages,
 }
 
 /*
+ * THE THIRD RUNG (DESIGN.md §22, "The open item"; §39, "Resident index
+ * pages"): what a page of a lion index costs a custom path that reads it - a
+ * container page walked or sought, a directory leaf an entry walk reads in
+ * order - priced at `device` as I/O until now.
+ *
+ * lion_heap_page_cost() argues a page down from random_page_cost to
+ * seq_page_cost from residency and never below, because for HEAP pages the
+ * competing plan reads the same pages and pays the same convention.  Lion's
+ * index is not read by its competitor: a BitmapAnd of btrees is charged CPU
+ * per TID for the same rows, a hash aggregate its rows, and a page of a
+ * small, hot index charged as a read from a device made the node several
+ * times dearer per microsecond than the BitmapAnd §22 measured it against.
+ * So an index the query's tables and it fit in effective_cache_size with -
+ * core's own measure of what stays cached, index_pages_fetched()'s proration
+ * - has its pages priced as the buffer hits they are, LION_RESIDENT_PAGE_COST
+ * a page, and one that does not fit has the share that does: resident =
+ * effective_cache_size / (the query's table pages + the index's), at most 1.
+ * Never above `device`: a page core prices lower keeps core's price.
+ *
+ * The one directory leaf of a single-key lookup keeps random_page_cost, as
+ * btcostestimate() charges btree's leaf and lion's own index scans charge
+ * theirs; so do the heap pages of the recheck.
+ */
+Cost
+lion_index_page_cost(PlannerInfo *root, double idxpages, Cost device)
+{
+	double		total = Max(root->total_table_pages + Max(idxpages, 1.0), 1.0);
+	double		resident = Min((double) effective_cache_size / total, 1.0);
+	Cost		hit = LION_RESIDENT_PAGE_COST;
+
+	if (hit >= device)
+		return device;
+	return device - resident * (device - hit);
+}
+
+/*
  * ONE CLAUSE'S POSTING SETS, as the cost model prices them wherever they are
  * ANDed (DESIGN.md §22; §29.11, "One price for the AND of sets"): a WHERE
  * source of the count pushdown, and a qual a lion index scan answers.  The
@@ -986,25 +1022,37 @@ lion_cost_leaf_pages(int n, IndexOptInfo **idxs, const LionSetClause *sc)
  * probes touch (lion_probed_pages()), never for more than a walk of it would
  * have cost, priced as lion_heap_page_cost() prices a read of them (added to
  * *probedpages; the price is returned).
+ *
+ * A custom path's count passes *seqcost: then the walked pages are priced
+ * into it, and both kinds at the index's third rung (lion_index_page_cost(),
+ * §39).  An index scan's AND passes NULL and prices its walked pages itself,
+ * as core prices its own scans' pages.
  */
 static Cost
 lion_cost_set_pages(PlannerInfo *root, RelOptInfo *rel,
 					const LionSetClause *sc, bool walked, double probes,
-					double *seqpages, double *probedpages)
+					double *seqpages, double *probedpages, Cost *seqcost)
 {
 	double		pages = sc->pages;
+	Cost		price;
 
 	if (pages <= 0.0)
 		return 0.0;
 	if (walked)
 	{
 		*seqpages += pages;
+		if (seqcost != NULL)
+			*seqcost += pages * lion_index_page_cost(root, sc->idxpages,
+													 seq_page_cost);
 		return 0.0;
 	}
 	pages = Min(pages, sc->nkeys * lion_probed_pages(sc->leaves, probes,
 													 sc->height));
 	*probedpages += pages;
-	return pages * lion_heap_page_cost(root, rel, pages, sc->idxpages);
+	price = lion_heap_page_cost(root, rel, pages, sc->idxpages);
+	if (seqcost != NULL)
+		price = lion_index_page_cost(root, sc->idxpages, price);
+	return pages * price;
 }
 
 /*
@@ -1091,7 +1139,8 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 
 	for (i = 0; i < n; i++)
 		probed += lion_cost_set_pages(root, rel, &sc[i], i == driver,
-									  probes[i], &seqpages, &probedpages);
+									  probes[i], &seqpages, &probedpages,
+									  NULL);
 
 	out->nsrc = n;
 	out->leafcost = randompages * random_page_cost + lookup;
@@ -2117,6 +2166,8 @@ typedef struct LionCountRelCost
 	double		random_pages;	/* directory leaves, one a lookup (§29.11) */
 	Cost		descent_cost;	/* comparisons on the way down (§21) */
 	double		seq_pages;		/* container chains, read in order */
+	Cost		seq_cost;		/* ... and their price, each at its index's
+								 * third rung (lion_index_page_cost()) */
 	Cost		lookup_cost;	/* an IN list's bucket pages, in order */
 	Cost		probe_cost;		/* what the SOUGHT sources read (§22) */
 	Cost		read_cpu;		/* containers read whole: unions, lists */
@@ -2603,16 +2654,22 @@ lion_count_rel_where_once(LionCountRelCost *c, double *mem, double *keys,
 		 Min(c->matching / wkeys, LION_MEMBER_CAP));
 	c->whereonce = true;
 
-	/* ... and what a range of a parallel one pays again of it */
+	/*
+	 * ... and what a range of a parallel one pays again of it: the leaves
+	 * each set reads again, pages of the walked index (its third rung, §39)
+	 */
 	if (c->rc != NULL)
 	{
+		Cost		leaf = LION_RANGE_DESCENT_PAGES *
+			lion_index_page_cost(c->root,
+								 (c->groupidx != NULL) ?
+								 (double) c->groupidx->pages : 0.0,
+								 seq_page_cost);
+
 		c->rc->batched = true;
 		c->rc->perrange = c->walked * (LION_ENTRY_COUNT_COST +
-									   LION_PROBE_COST +
-									   LION_RANGE_DESCENT_PAGES *
-									   seq_page_cost) +
-			c->nsrc * (LION_PROBE_COST +
-					   LION_RANGE_DESCENT_PAGES * seq_page_cost);
+									   LION_PROBE_COST + leaf) +
+			c->nsrc * (LION_PROBE_COST + leaf);
 	}
 }
 
@@ -2872,7 +2929,8 @@ lion_count_rel_set_pages(LionCountRelCost *c)
 											 walk ? 0.0 :
 											 c->srcprobes[c->clausesrc[i]] *
 											 (c->whereonce ? 1.0 : c->walked),
-											 &c->seq_pages, &c->probed_pages);
+											 &c->seq_pages, &c->probed_pages,
+											 &c->seq_cost);
 	}
 	c->random_pages = lion_cost_leaf_pages(c->nclause, c->clauseindex,
 										   c->clauseset);
@@ -2917,9 +2975,14 @@ lion_count_rel_entry_scan(LionCountRelCost *c)
 															 c->groupcol) *
 									 c->drivefrac);
 
+		Cost		entryprice = entrypages *
+			lion_index_page_cost(c->root, (double) c->groupidx->pages,
+								 seq_page_cost);
+
 		c->seq_pages += entrypages;
+		c->seq_cost += entryprice;
 		if (c->rc != NULL && c->rc->batched)
-			c->rc->perrange += entrypages * seq_page_cost;
+			c->rc->perrange += entryprice;
 
 		/*
 		 * Beside a second GROUP BY column a count(DISTINCT k) tests each
@@ -2980,10 +3043,15 @@ lion_count_rel_pair_cost(LionCountRelCost *c)
 		double		cinner = lion_containers_for(c->heap_pages,
 												 c->tuples / ie);
 
-		c->seq_pages += Max(1.0, (double) c->groupidx2->pages *
-							lion_index_column_share(c->root, c->rel,
-													c->groupidx2,
-													c->groupcol2));
+		double		innerpages = Max(1.0, (double) c->groupidx2->pages *
+									 lion_index_column_share(c->root, c->rel,
+															 c->groupidx2,
+															 c->groupcol2));
+
+		c->seq_pages += innerpages;
+		c->seq_cost += innerpages *
+			lion_index_page_cost(c->root, (double) c->groupidx2->pages,
+								 seq_page_cost);
 		c->pair_cost = Max(oe * ie, c->numgroups) *
 			((c->distinct == LION_DISTINCT_NONE) ? LION_ENTRY_COUNT_COST :
 			 cpu_tuple_cost);
@@ -3014,9 +3082,20 @@ lion_count_rel_pair_cost(LionCountRelCost *c)
 	 * pairs (DESIGN.md §26): one per entry of k the walk visits - or per
 	 * listed value, when a list on k drives it - and beside a GROUP BY one
 	 * per group, the group's own test.
+	 *
+	 * Without a GROUP BY the walk tests EVERY entry of k it visits
+	 * (c->walked), and not only the ones the WHERE leaves a row in, which
+	 * are the values it emits (c->ingroups): an entry the WHERE empties is a
+	 * test read to its end to say so (lion_exists_fraction()).  Charging the
+	 * emitted values priced `count(DISTINCT UserID) WHERE MobilePhoneModel
+	 * <> ''` (ClickBench, 5M rows) at 281,060 tests where it made 3,413,988,
+	 * and chose it at 275k cost units against a bitmap scan's 437k: 9.1 s
+	 * against 0.7.
 	 */
 	if (c->distinct != LION_DISTINCT_NONE)
-		c->pair_cost += c->ingroups * LION_DISTINCT_TEST_COST;
+		c->pair_cost += ((c->groupidx2 == NULL) ? Max(c->walked, c->ingroups) :
+						 c->ingroups) *
+			LION_DISTINCT_TEST_COST;
 }
 
 /*
@@ -3229,7 +3308,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	run = c.random_pages * random_page_cost;
 	run += c.descent_cost;
 	run += c.lookup_cost;
-	run += c.seq_pages * seq_page_cost;
+	run += c.seq_cost;			/* c.seq_pages, each at its index's rung */
 	run += c.probe_cost;
 	run += c.read_cpu + c.merge_cpu;	/* containers, members, probes (§10) */
 	run += c.merge_ops * cpu_operator_cost;
@@ -3469,7 +3548,11 @@ lion_cost_topk_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 							 lion_probe_rel_rows(root, t->rel), cand,
 							 t->rel->tuples);
 	run += entries * drivefrac * LION_TOPK_ENTRY_COST;
-	run += cand * (LION_PROBE_COST + LION_RANGE_DESCENT_PAGES * seq_page_cost);
+	run += cand * (LION_PROBE_COST + LION_RANGE_DESCENT_PAGES *
+				   lion_index_page_cost(root,
+										(t->driveidx[0] != NULL) ?
+										(double) t->driveidx[0]->pages : 0.0,
+										seq_page_cost));
 
 	cpath->path.rows = outrows;
 #if PG_VERSION_NUM >= 180000
@@ -3514,7 +3597,9 @@ lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 					lion_index_column_share(root, rel, idx, col));
 		run += nd * nagg * 2.0 * cpu_operator_cost;
 		if (fast)
-			run += pages * seq_page_cost + nd * LION_TOPK_ENTRY_COST;
+			run += pages * lion_index_page_cost(root, (double) idx->pages,
+												seq_page_cost) +
+				nd * LION_TOPK_ENTRY_COST;
 		else
 			run += lion_cost_count_rel(root, rel, idx, col, NULL, 0,
 									   NIL, NIL, NIL, NIL, NIL, nd, nd, 0,
@@ -3621,7 +3706,8 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 			perkey += vals * LION_PROBE_COST * (1.0 - keyfrac);
 			if (idx != NULL)
 				run += (double) idx->pages / Max(idx->nkeycolumns, 1) *
-					keyfrac * seq_page_cost;
+					keyfrac * lion_index_page_cost(root, (double) idx->pages,
+												   seq_page_cost);
 		}
 		combos *= Max(groupest[c], 1.0);
 		passes *= Max(ceil(Max(groupest[c], 1.0) / cap), 1.0);
@@ -3746,6 +3832,40 @@ lion_multikey_cost_mode_ex(IndexOptInfo *idx, AttrNumber col, Node *clause,
 	MemoryContextDelete(cxt);
 
 	return q.mode;
+}
+
+/*
+ * Is a count's WHERE priced at its dearest because a multi-key query in it is
+ * not known until run time - a generic plan's parameter, with no estimate to
+ * go by, which lion_multikey_cost_mode() takes as every row?  Such a price is
+ * the most the count can cost, the node's own sequential scan, and not an
+ * estimate that may fall short of it: the count is offered without
+ * pg_lion.pushdown_margin (DESIGN.md §39), which is there for the estimates.
+ * An OR's leaf is a literal (lion_analyze_leaf()) and is never one.
+ */
+bool
+lion_where_query_unknown(List *whereclauses, List *wherekinds,
+						 List *whereinor)
+{
+	ListCell   *lc1;
+	ListCell   *lc2;
+	ListCell   *lc3;
+
+	forthree(lc1, whereclauses, lc2, wherekinds, lc3, whereinor)
+	{
+		Node	   *clause = (Node *) lfirst(lc1);
+		Node	   *arg;
+
+		if (lfirst_int(lc2) != LION_CLAUSE_MULTI || lfirst_int(lc3) != 0)
+			continue;
+		if (clause == NULL || !IsA(clause, OpExpr) ||
+			list_length(((OpExpr *) clause)->args) != 2)
+			continue;
+		arg = lion_strip((Node *) lsecond(((OpExpr *) clause)->args));
+		if (arg != NULL && !IsA(arg, Const))
+			return true;
+	}
+	return false;
 }
 
 double
