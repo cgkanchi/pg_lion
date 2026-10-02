@@ -11,6 +11,7 @@
 #include "postgres.h"
 
 #include "lion_customscan.h"
+#include "lion_store.h"
 
 static LionQueryMode lion_multikey_cost_mode_ex(IndexOptInfo *idx,
 												AttrNumber col, Node *clause,
@@ -73,6 +74,29 @@ lion_index_dir_pages(IndexOptInfo *idx, double *height)
 
 	index_close(indexrel, AccessShareLock);
 	return Max(dirpages, 1.0);
+}
+
+/*
+ * The pages of idx's window store (DESIGN.md §40): the map and store pages
+ * the meta page's record counts, which the build sets and every page added
+ * or freed keeps exact - 0 for an index that stores nothing - and in
+ * *nstored how many columns it stores.  They are no posting pages: every
+ * formula below that takes the posting pages as what is left of the index
+ * after its meta page and its directory takes these out too.
+ */
+double
+lion_index_store_pages(IndexOptInfo *idx, int *nstored)
+{
+	Relation	indexrel = index_open(idx->indexoid, AccessShareLock);
+	LionMetaPageData meta;
+	LionMetaStore store;
+
+	lion_read_meta(indexrel, &meta);
+	lion_read_meta_store(indexrel, &meta, &store);
+	index_close(indexrel, AccessShareLock);
+	if (nstored != NULL)
+		*nstored = pg_popcount32(store.store_cols);
+	return (double) store.store_pages;
 }
 
 /* A key column's n_distinct, or -1 for an expression column. */
@@ -842,7 +866,8 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	share = lion_index_column_share(root, rel, idx, col);
 	dirpages = lion_index_dir_pages(idx, &height);
 
-	container_pages = ((double) idx->pages - 1.0 - dirpages) *
+	container_pages = ((double) idx->pages - 1.0 - dirpages -
+					   lion_index_store_pages(idx, NULL)) *
 		lion_index_column_posting_share(root, rel, idx, col);
 	container_pages = Max(container_pages, 0.0);
 	dirpages = Max(dirpages * share, 1.0);
@@ -3730,6 +3755,71 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	cpath->path.startup_cost = run;
 	cpath->path.total_cost = run + outrows * cpu_tuple_cost;
 	(void) numgroups;
+}
+
+/*
+ * THE GATHER OF THE WINDOW STORE (DESIGN.md §40, "Costs"): what the count
+ * cpath already carries - of the WHERE, or the sum over every row, whose
+ * rows are rel->rows - becomes the count of a node that gathers ncols
+ * columns of storeidx's store for each of those rows and forms its groups
+ * and aggregates of them:
+ *
+ *	- a value per row per column decoded (LION_STORE_VALUE_COST);
+ *	- each column's store pages in every window the rows lie in, the windows
+ *	  being the heap's 64-page container keys, of which rows scattered over
+ *	  the heap touch nkeys * (1 - e^(-rows / nkeys)), and a column's pages in
+ *	  one its share of the store - the meta record's store_pages over the
+ *	  windows and the columns stored - and never less than one
+ *	  (LION_STORE_PAGE_COST).  The entries of a range, an IN list or the sum
+ *	  over every row are merged into one union under a gather, a directory
+ *	  leaf's at a time, so a window's pages are read about once (the count
+ *	  engine, lion_count_sources_run() and lion_sum_walk());
+ *	- each row hashed into its group, as the decoded walk prices a row into
+ *	  its hash table of combinations (LION_DECODE_HASH_ROW_COST, and
+ *	  LION_DECODE_ROW_COL_COST a column after the first), an operator per
+ *	  aggregate it steps, and the hash of a count(DISTINCT)'s pairs;
+ *	- the groups, all of which come out once the count is over.
+ *
+ * A row on a page that is not all-visible, or one the store leaves to the
+ * heap, has its values read from the tuple its recheck fetches, which the
+ * count has priced already (§9).  The units and the margin of §39 are the
+ * caller's, as for every count path.
+ */
+void
+lion_cost_store_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
+					 IndexOptInfo *storeidx, int ncols, int ngroup,
+					 double groups, double outrows, int naggs, int ndistinct,
+					 double distinctpairs)
+{
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		windows = Max(ceil(heap_pages / LION_BLOCKS_PER_CONTAINER), 1.0);
+	double		rows = Max(rel->rows, 1.0);
+	double		touched;
+	double		perwindow;
+	double		storepages;
+	int			nstored = 0;
+	Cost		run = cpath->path.total_cost;
+
+	Assert(ncols > 0);
+	storepages = lion_index_store_pages(storeidx, &nstored);
+	touched = Max(windows * (1.0 - exp(-rows / windows)), 1.0);
+	perwindow = Max(storepages / windows / (double) Max(nstored, 1), 1.0);
+
+	run += rows * ncols * LION_STORE_VALUE_COST;
+	run += touched * ncols * perwindow * LION_STORE_PAGE_COST;
+	if (ngroup > 0)
+		run += rows * (LION_DECODE_HASH_ROW_COST +
+					   (ngroup - 1) * LION_DECODE_ROW_COL_COST);
+	run += rows * naggs * cpu_operator_cost;
+	run += rows * ndistinct * LION_DECODE_HASH_ROW_COST;
+	run += (groups + distinctpairs) * cpu_operator_cost;
+
+	cpath->path.rows = outrows;
+#if PG_VERSION_NUM >= 180000
+	cpath->path.disabled_nodes = 0;
+#endif
+	cpath->path.startup_cost = run;
+	cpath->path.total_cost = run + outrows * cpu_tuple_cost;
 }
 
 /*

@@ -18171,3 +18171,149 @@ Append. No existing expected output changed.
 - The hot-standby rule is tested by reading, not by the recovery harness (the store order is not
   in its fixture).
 - Built and tested on PostgreSQL 18 only; the version guards are the file's own.
+
+### As built: Phase B, the count's shapes (2026-10-02)
+
+Shapes 1 and 3 of "The custom shapes" are one path of LionCount: the gather. It answers
+`count(DISTINCT c)`, `GROUP BY c` with `count(*)` and `count(x)` per group, and `sum`, `avg`,
+`min`, `max` and `count` of c with or without a `GROUP BY`, for stored columns c, under a lion
+WHERE or with none. Where it differs from the design above, and why:
+
+**One accumulator, not the decoded walk.** The design put the gathered values in place of the
+decoded walk's reconstruction (§34). As built the gather is a path of its own beside the walks: the
+node counts what `count(*)` under the same WHERE counts - the WHERE's intersection
+(`lion_count_relation()`), or with no WHERE the sum over every entry of a driver column
+(`lion_sumall_relation()`) - and the count engine hands it each counted row with the gathered
+columns' values (`LionGather`, `lion_count.h`); the node hashes them by its `GROUP BY` columns and
+keeps per group the rows and each aggregate's state (`lion_exec_store.c`). The walks are untouched
+and still offered: the planner builds the walk path and the gather path for the same query and
+`add_path()` keeps the cheaper. So §37's walk stays for no WHERE and no `GROUP BY` over key
+columns, and the decoded walk for a `GROUP BY` of key columns with no WHERE, by cost rather than
+by exclusion; a stored INCLUDE column has only the gather.
+
+**The engine** (`lion_count.c`). A `LionGather` is created over the heap, the store index and the
+gathered columns' store ordinals, with a row callback, and attached to the node's visibility cache
+(`lion_vis_cache_set_gather()`); `lion_count_sources_run()` hands it to every count of that heap
+except an existence test and a collection of the WHERE, which count no rows. In
+`lion_count_container_masks()` a gather takes the container's members on the heap pages the map
+calls all-visible (the `allvis` mask, which is 0 in recovery, without a map and under a row
+filter, as before), gathers each column for them (`lion_store_gather()`) and hands every row not on
+an ABSENT page to the callback; the members of the other pages, and of the ABSENT ones, are queued
+for the heap recheck. The recheck (`lion_recheck_heap_rows()`, the former filtered recheck, now
+also run with no filter) fetches each TID, tests it against the snapshot and hands a visible
+tuple's values to the callback, detoasted; the sequential fallback of a filtered count does the
+same (`lion_count_heap_gather()`). Predicate locks: `PredicateLockPage` on each all-visible page
+whose rows came from the store; an ABSENT page's rows are heap fetches and are locked by them. The
+container is a copy of a page the count still pins (§9), with no buffer lock held, so the gather's
+one share lock at a time is never held beside a posting or directory page. The node checks that it
+was handed exactly the rows the count counted, and errors otherwise: a count path that counted
+rows without handing them over would be a wrong answer, not a slow one.
+
+**What the count does differently with a gather.** The subtractive paths count rows they never
+see (a range's complement, `LION_RANGE_EVAL_COMPLEMENT`), so a node with a gather forces `INSIDE`
+(`lion_walk_count()`, `lion_sumall_relation()`); the full-column sum (`lion_count_nonnull()`)
+sees every member and stays. And the disjoint entries a count sums one at a time - an IN list's
+under §15's short-circuit, a range's or a whole column's large entries in `lion_sum_walk()` - are
+merged into one union per container key instead (a directory leaf's entries at a time, in
+batches when the union is wider than the pins it may hold): the gather reads a window's store
+pages at every count of a container there, so summed entry by entry a range of 90 values read
+each window's pages 90 times. Measured on the table below, `max(g) ... WHERE k < 90` read 139,595
+buffers in 305 ms summed and 2,179 in 52 ms merged; the sum is kept where only it holds the
+interlock (a list past the pin budget, NOPIN sets). The gather is not used beside the node's own walks (a group column, a
+distinct column, aggregates over keys, a join, partitions, the top k, the decoded walk): the plan
+never builds that, and `lion_store_begin()` refuses it.
+
+**The planner** (`lion_plan_count.c`, `lion_try_store_path()`). The path is built as the count's
+is - query, relation, WHERE, HAVING, strategy, targets, estimate - with a `GROUP BY` and outputs
+of its own: every `GROUP BY` item a plain column with a hashable equality (its collation the
+column's), every output a `GROUP BY` column, `count(*)`, or an aggregate over a plain column that
+`lion_store_agg_classify()` accepts: `count(c)`, `count(DISTINCT c)` with a hash function, or
+§37's `lion_wagg_classify()` set (sum and avg of int2, int4 and int8 in 128 bits, min and max
+under the aggregate's sort operator; float8 and numeric sums were not trivial and are left out).
+`lion_find_store_index()` then picks the lion index that stores every gathered column, the one
+storing fewest columns when several do. Partitioned tables, the FK-side join and a hash table the
+planner expects to exceed `hash_mem` are declined (the node does not spill). The plan carries the
+gather as private member 19 (`LION_PRIV_STORE`: the index, the heap columns, their index columns,
+the `GROUP BY`'s position, equality and collation per column, and per aggregate its kind, column,
+width, aggregate, input collation and DISTINCT equality and collation); the target-list kinds move
+to member 20, and `LION_PRIV_MAGIC` and `LION_PRIV_NMEMBERS` changed with it. Two new target-list
+kinds name a gathered `GROUP BY` column and a gathered aggregate (`LION_TL_SKEY`, `LION_TL_SAGG`).
+EXPLAIN prints `Group Key:` and `Store: col1, col2`, and with ANALYZE `Store Rows`, `Store Rows
+From Heap`, `Store Pages Absent` and `Store Groups`.
+
+**The cost rule as implemented** (`lion_cost_store_path()`, added to the count's own price before
+the competitor's units and the §39 margin are applied, as every term of the count is):
+
+	windows   = ceil(heap pages / 64)
+	touched   = windows * (1 - exp(-rows / windows))        windows holding a kept row
+	perwindow = max(store_pages / windows / nstored, 1)      one column's store pages a window
+	gather    = rows * ncols * LION_STORE_VALUE_COST
+	          + touched * ncols * perwindow * LION_STORE_PAGE_COST
+	hash      = rows * (LION_DECODE_HASH_ROW_COST + (ngroup - 1) * LION_DECODE_ROW_COL_COST)
+	                                                          when there is a GROUP BY
+	          + rows * naggs * cpu_operator_cost
+	          + rows * ndistinct * LION_DECODE_HASH_ROW_COST
+	          + (groups + distinct pairs) * cpu_operator_cost
+
+with rows the rows the WHERE keeps (`rel->rows`), ncols the gathered columns, nstored the columns
+the index stores (`store_pages` counts them all, map pages included), and the path's rows the
+estimated groups. Departures from the design's rule: the value cost is one constant per value, not
+a code width times a decode rate; the page cost is apportioned by column and paid only in the
+windows a kept row is in; the map's reads are not priced apart (its pages are in `store_pages`);
+and an ABSENT page's or a dirty page's heap fetch is priced as the count already prices its
+recheck, nothing more. A window's pages are priced once, because the entries the count would
+sum are merged under a gather (above). The per-row terms are the decoded walk's release-build
+constants (§34); they were not refitted for the gather's fmgr hash and equality calls. `store_pages` is subtracted from the posting pages at the three sites Phase
+A named (`lion_plan_cost.c`, `lion_plan_fkjoin_cost.c` twice), read from the meta record by
+`lion_index_store_pages()`.
+
+**Tests.** `test/sql/store_count.sql`, every answer compared with a sequential scan with the
+pushdown off: the plans with their `Store:` line; `GROUP BY` with `count(*)` and `count(x)`, the
+NULL group, `count(DISTINCT)` not counting NULL, min and max ignoring it; int2, int4, int8, date,
+timestamptz, uuid and numeric as `GROUP BY` columns and under `count(DISTINCT)`; sums past int8's
+range; `GROUP BY` two columns; a WHERE on a multi-key column (`@>` and `&&`) with a stored INCLUDE
+column grouped; no WHERE; key columns both walked and stored, with §37's walk, the decoded walk and
+the gather shown by toggling `pg_lion.enable_decoded_walk`; a range beside another clause
+(walked inside where a count alone takes the complement, and probed); dirty pages (updates, deletes, inserts,
+and an open transaction's changes) and the same after VACUUM; nothing matching; a correlated
+subquery's rescans; the shapes declined; an ABSENT window (all from the heap, mixed, all from the
+store); a text column under an ICU collation (min and max in its order) and under a
+case-insensitive one (`GROUP BY` and `count(DISTINCT)` folding case), clean and dirty.
+`store_count_1.out` is that file without the ICU part, for a build without ICU, as
+`ordered_collate` and `countcoll` have.
+
+**Measured.** An assert-enabled build (`-O1`), warm shared buffers, no parallel workers; a
+synthetic table of 2,000,000 rows, `(id int, k int4, g int4, v int8, pad text)` with `k` = id mod
+100, `g` 20,000 values and a 40-byte pad, 24,692 heap pages, all-visible; `lion (k) INCLUDE (g,
+v)`, whose store is 3,473 pages. Medians of seven runs, the gather against the same build with
+`pg_lion.enable_count_pushdown = off` (the plan the base branch makes, which has no path for an
+INCLUDE column):
+
+| query | rows kept | gather | before |
+| --- | --- | --- | --- |
+| `g, count(*), sum(v) WHERE k < 10 GROUP BY g` | 200,000 | 27.7 ms | 124.1 ms (bitmap heap scan, HashAggregate) |
+| `count(DISTINCT g) WHERE k IN (3, 7, 11)` | 60,000 | 11.2 ms | 53.3 ms (index scan, Sort, Aggregate) |
+| `sum(v), min(g), max(g) WHERE k = 42` | 20,000 | 13.4 ms | 35.5 ms (index scan, Aggregate) |
+| `g, count(*), sum(v) WHERE k < 90 GROUP BY g` | 1,800,000 | 169 ms | 556 ms (seq scan, HashAggregate) |
+| `g, count(*) GROUP BY g` (no WHERE) | 2,000,000 | 137 ms | 501 ms (seq scan, HashAggregate) |
+
+In an earlier run, before the entries were merged under a gather, the first took 77 ms and the
+fourth 660 ms (best of four), which lost to the `HashAggregate`'s 492 ms then.
+
+**What is left.**
+- A `GROUP BY` that mixes a walked column with a stored one, and columns stored by two indexes:
+  every gathered column is in one index's store, and every `GROUP BY` column is gathered.
+- A parallel gather: the node's partitioned mode would need partial aggregate states for sum,
+  avg, min, max and `count(DISTINCT)`; and a partitioned table, for the same reason.
+- Spilling: the node keeps every group in memory and the planner declines past `hash_mem`.
+- Expressions: an aggregate argument or a `GROUP BY` item that is not a plain column, and a target
+  that is an expression of a `GROUP BY` column.
+- float8 and numeric sums and averages; `FILTER` and ordered aggregates.
+- Shape 2 (LionOrdered) and the index-only scans are the other Phase B branches; shape 4 (the
+  join's keys) is not built.
+- A gather in place of the decoded walk's reconstruction, as the design has it, for a `GROUP BY`
+  of key columns both walked and stored under a WHERE.
+- The per-row prices measured on a release build; the numbers above are an assert build's.
+- An isolation test racing VACUUM against a parked gather: the interlock is the count's (§9),
+  which `test/isolation` already races, and the store reader's own race is Phase A's
+  `store_vacuum_reader.spec`; none drives the two together.
