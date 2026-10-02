@@ -413,6 +413,35 @@ _PG_init(void)
 }
 
 /*
+ * amcanreturn (DESIGN.md §40, "Index-only scans"): can an index-only scan
+ * return index column attno - a key column or an INCLUDE one?  Exactly when
+ * the window store holds it and its stored datum is of the index tuple
+ * descriptor's own type (LionStoreCol.returnable): liongettuple() then hands
+ * the executor the row's own value, from the store at a heap page the §9
+ * interlock covers and from the heap everywhere else.  A multi-key column is
+ * never stored, so never returned - a row has many keys and the store one
+ * slot - and neither is a key column of an index without `store_values`.
+ *
+ * The planner asks this of every column of every index of every relation it
+ * plans (get_relation_info()), so it answers from the cached relation state,
+ * which reads the meta page once per relcache entry - and of a partitioned
+ * table's partitioned index too, which has no pages and is never scanned:
+ * false there.
+ */
+static bool
+lioncanreturn(Relation index, int attno)
+{
+	LionIndexState *ix;
+	int			ord;
+
+	if (!RELKIND_HAS_STORAGE(index->rd_rel->relkind))
+		return false;
+	ix = lion_get_index_state(index);
+	ord = lion_store_ordinal(ix, (AttrNumber) attno);
+	return ord >= 0 && ix->stored[ord].returnable;
+}
+
+/*
  * Handler function: return the IndexAmRoutine of the roaring AM.
  */
 Datum
@@ -469,8 +498,8 @@ lion_handler(PG_FUNCTION_ARGS)
 #endif
 		/*
 		 * DESIGN.md §40: an INCLUDE column is stored in the window store,
-		 * which is the only meaning INCLUDE has in lion.  amcanreturn stays
-		 * NULL until the readers of the store exist.
+		 * which is the only meaning INCLUDE has in lion, and an index-only
+		 * scan returns it (lioncanreturn()).
 		 */
 		.amcaninclude = true,
 		.amusemaintenanceworkmem = true,
@@ -494,7 +523,7 @@ lion_handler(PG_FUNCTION_ARGS)
 #endif
 		.ambulkdelete = lionbulkdelete,
 		.amvacuumcleanup = lionvacuumcleanup,
-		.amcanreturn = NULL,
+		.amcanreturn = lioncanreturn,	/* the stored columns, §40 */
 		/* lioncostestimate() with the endpoint probe, DESIGN.md §28 */
 		.amcostestimate = lion_amcostestimate,
 #if PG_VERSION_NUM >= 180000
