@@ -18032,3 +18032,142 @@ refused, so `multicolumn` and `options` changed.
   are per page; the heap's extension lock is held across the WAL records of a cleanup that frees
   windows (only after a truncation); inserts into the middle of an old window split by halves and
   can leave half-full pages behind; `lion_index_stats()` reads every store page.
+
+### As built: Phase B, LionOrdered (2026-10-02)
+
+The store order, shape 2 of "The custom shapes": `SELECT ... WHERE <lion> ORDER BY c LIMIT n`
+with c stored, in `src/lion_ordered.c` alone. LionOrdered gets a third kind of path beside the
+btree walk (§30) and the lion column's walk (§30.11); it has no ordered side. Where it differs
+from the design above, and why:
+
+**The fold runs on a pinned walk of the tree, not in the set's build.** §30.4 reads each leaf whole
+and pinless and combines the leaves afterwards, so a container key's answer is final only once
+every leaf is read, long after any pin is gone; holding every leaf's pins until then is the budget
+§29.5 refuses. The store order (`lo_store_build()` → `lo_store_node()`) reads the tree itself:
+- a LEAF is opened with `keeppins` (`lion_source_open(..., true, ...)`), and each container it
+  hands out is folded (`lo_store_piece()`) before `lion_source_next()` moves past it, so the page
+  its members came from is still pinned;
+- an OR folds each of its children; a row two of them hold is ranked once (a simplehash of the
+  kept TIDs, consulted only for a row that would be kept);
+- an AND drives its first LEAF child under its pins and builds every other child as §30.4 builds
+  a set, pinless; those sets mask each driven container (`lion_container_and()`) before the fold.
+  Every row of the AND is a member of the driver's container, whose page is pinned, and one pin
+  suffices (`lion_count_int.h`). A mask that degraded (§30.4) keeps the driver's container whole,
+  rechecked.
+The piece is exact when its source is (`lion_source_exact()`: a UNION, a NOPIN set past the pin
+budget and a multi-key leaf, which §29.6 rechecks, are not), every mask was, and no lion clause is
+lossy. For an exact piece, `lo_store_piece()` asks the visibility map about each heap page of the
+container under the pin; the members on all-visible pages get their sort keys from
+`lion_store_gather()` (one call per sort key), except those of the pages it reports in
+`absent_pages`; every other member - a dirty page, an ABSENT one, any member of an inexact piece,
+and every member on a hot standby unless every index the node reads is in rmgr mode (§9, "Hot
+standby") - is fetched (`lo_fetch_tid()`, the HOT chain from its root), which settles visibility
+and value together, and an inexact piece's row is tested against the lion qual as §30.4's recheck
+tests one. Under SERIALIZABLE the heap pages served from the store are `PredicateLockPage()`d, as
+the count locks them; the rows fetched are locked by the fetch.
+
+**The candidates.** A max-heap of `limit + offset` slots, the worst on top, compared with the
+ORDER BY's own SortSupport (its operators, collations, directions and NULLS placement, from
+LO_PRIV_SORT); a row is taken only when it comes strictly before the worst, so a row that ties with
+the worst is not, the first met of a tie wins, and a TID met again needs looking up only among the
+slots kept. By-reference values are copied into the node's context (`datumCopy()`), a heap row's
+detoasted first; the arrays grow by doubling from 1,024 slots. After the fold the slots are sorted
+(`qsort_arg()`) and fetched in order; a slot whose row is not visible is an ERROR - it was visible
+to the same snapshot when it was ranked - and an assert-enabled build checks that the row fetched
+has the values ranked. A rescan returns the same rows; one whose Params changed the lion quals
+builds again.
+
+**The plan shape** (`lo_store_limit()`, `lo_store_find()`): offered when
+- core's `limit_tuples` is known (a constant LIMIT and OFFSET; no grouping, aggregate, window,
+  DISTINCT or set-returning target), with no FOR UPDATE (LockRows between the node and the LIMIT
+  can drop a row) and no WITH TIES (which takes the rows that tie with the last);
+- the relation is the whole query, or a partition or UNION ALL member of the relation that is
+  (`top_parent_relids`), so that nothing between the node and the LIMIT can want another row;
+  each partition then has its own store order under core's Merge Append;
+- every ORDER BY key is a plain column (`lo_sort_keys()`) that one lion index stores with
+  `LionStoreCol.returnable` and the table's type, the index being non-partial or implied by the
+  query - not necessarily one the WHERE reads (the pin of any index of the table interlocks the
+  slot of every index, `lion_count_int.h`). Several keys are supported when all are stored in that
+  one index; a key that is not stored, first or later, means no store order (core's Incremental
+  Sort above it would need every row that ties with the last). Of several such indexes, the one
+  whose store reads the fewest pages for the keys, then one the lion side reads;
+- the lion access answers the whole WHERE: no residual filter and no lossy index clause (a row the
+  node ranks is a row it returns).
+Its pathkeys are `root->sort_pathkeys`, so core puts no Sort above it, and its rows are
+`min(limit + offset, rows)`. `custom_private` gains LO_PRIV_STORE: limit + offset, the number of
+keys, the store index's column of each key, and each key's direction. `pg_lion.enable_ordered_store`
+(on) turns the shape off alone; it is a planner switch, not a cost setting.
+
+**The cost rule as implemented** (`lo_cost_store()`), with N the rows the lion side keeps
+(`cost_bitmap_tree_node()`'s selectivity times the tuples), C = min(⌈pages / 64⌉, N) the
+containers, f the relation's `allvisfrac`, k the sort keys, K = limit + offset:
+- start-up = the lion side's cost + C × `cpu_operator_cost` (as §30.3)
+  + N × f × k × LION_STORE_VALUE_COST
+  + C × P × LION_STORE_PAGE_COST, P being the store pages a window reads for the k keys: the
+    meta record's `store_pages` over the heap's windows, shared among the stored columns by the
+    width of their slots (`rawwidth`, a gather reads only its column's chain), at least one a key
+  + for the N × (1 - f) rows on other pages, min(those rows, pages × (1 - f)) heap pages at
+    `lion_heap_page_cost()` and LION_RECHECK_TID_COST a row (§9's price of a recheck)
+  + 2 × `cpu_operator_cost` × N × log2(2K), core's price of a bounded sort (`cost_sort()`), not
+    N log N
+  + the target's start-up;
+- run = `index_pages_fetched(min(K, N))` × `random_page_cost` + min(K, N) × (`cpu_tuple_cost` +
+  the target per row);
+- both divided by `pg_lion.pushdown_margin` (`lo_add_path()`, as the walks are, §39); nothing is
+  converted, the competitors being the relation's own scans.
+It is refused when K > N / 4, when K candidates - a TID and a slot, about 30 bytes, and for each
+key its value's width, a Datum and a null flag, 16 bytes more by reference - pass `work_mem`, and,
+for a BitmapAnd or BitmapOr lion side, when the set would pass `hash_mem` (only an AND's masks are
+ever held as sets). When the sort column is also a lion key column, the walk of its entries is
+priced beside it (§30.11) and `add_path()` keeps the cheaper. "Costs" above prices a value as its
+code width times a decode rate and adds the map's three reads a window; as built, the two settings
+every reader of the store shares stand for those, LION_STORE_VALUE_COST a value and
+LION_STORE_PAGE_COST a page, and the map's reads are not priced apart.
+
+**EXPLAIN**: `Store: c4[, c8]` and `Order: c4 DESC NULLS FIRST[, ...]`, with ` COLLATE x` for a
+key whose collation is not the column's, in place of `Ordered By`; `Lion Indexes` names the store's
+index too when the set does not read it. ANALYZE: `Rows Ranked` (rows folded; a row both sides of
+an OR hold counts twice), `Store Values` (rows whose keys the store gave), `Heap Fetches` (the
+others, and the rows returned), `Rows Removed by Lion Recheck` (for an inexact set), and `Lion Set:
+<containers folded>, exact|rechecked|degraded[, <builds>]`.
+
+**Measured** (2026-10-02, assert-enabled PostgreSQL 18.6 at -O1, warm cache, no parallel workers,
+the median of nine runs after two). A synthetic table of 2,000,000 rows (`a` of 100 values, `g` of
+7, `c4` of about a million random ints, an md5 text; 20,619 heap pages) with `lion (a) INCLUDE
+(c4)` and `lion (g)`, all-visible: `WHERE a = 7 ORDER BY c4 DESC LIMIT 10` (20,000 rows kept) took
+4.8 ms through the store order (`Store Values: 20000`, `Heap Fetches: 10`, 1,633 buffers) against
+25.4 ms for the plan with `pg_lion.enable_ordered_store` off (an index scan of `lsb_a` and a top-N
+Sort, 20,008 buffers); `WHERE a = 7 AND g = 3 ... LIMIT 10` (2,857 rows) 3.4 ms against 21.8 ms (a
+bitmap heap scan and a Sort). With one row updated on every heap page and no VACUUM, every row
+comes from the heap and the two are level: 23.5 ms against 24.6 ms.
+
+**Tests.** `test/sql/store_ordered.sql`: every query runs through the node (core's scans off) and
+through the ordinary plan (`pg_lion.enable_ordered_scan` off), and the sequences of their sort keys
+are compared - ties may come in any order - and every row the node returned is checked to be a
+distinct row its WHERE selects. ASC and DESC, NULLS FIRST and LAST, OFFSET, ties (500 values over
+4,286 rows), two and three keys; int4, int8, date, timestamptz, and text under an ICU collation (a
+copy of "C" where there is no ICU, with the same output) and under `COLLATE "C"`; AND, OR, an OR
+under an AND, IN and `= ANY`, ranges, a two-column index's quals, a multi-key WHERE (`@>`, `&&`,
+`<@`, OR'd with a scalar one) ranking an INCLUDE column; a generic plan whose LIMIT outruns the set
+and one with an empty set; a SubPlan rescanned with new Params (`5 builds`); a SCROLL cursor; a key
+column both walkable and stored, its two plans shown by `pg_lion.enable_ordered_store`; every
+refusal (a column not stored, first or second; an expression; a filter; FOR UPDATE; WITH TIES; a
+LIMIT parameter; a join; a LIMIT past a quarter of the set; one past `work_mem`); dirty pages
+(updates to new values, HOT updates, deletes and inserts over two thirds of the heap: the counters
+show the store and the heap sharing the rows), then VACUUM (every row from the store); SERIALIZABLE;
+an ABSENT window (`Store Values` 71 and 109 rows from the heap); a partitioned table under Merge
+Append. No existing expected output changed.
+
+**What is left.**
+- A piece that must be rechecked takes every row from the heap, though its pin and the visibility
+  map would let the store rank it: ranking by the stored value and rechecking only the candidates
+  needs a way to refill the heap when a candidate fails. This is every multi-key WHERE (§29.6
+  rechecks it), and every AND with a multi-key side.
+- A UNION ALL whose arms core plans as subqueries (`Subquery Scan`) gets no store order: each arm's
+  plan knows neither the ORDER BY nor the LIMIT.
+- `ORDER BY stored, not_stored`: no partial use (the rows that tie on the stored prefix at the
+  cut would all be needed).
+- Not parallel-aware.
+- The hot-standby rule is tested by reading, not by the recovery harness (the store order is not
+  in its fixture).
+- Built and tested on PostgreSQL 18 only; the version guards are the file's own.
