@@ -636,13 +636,15 @@ Rate settings (DESIGN.md §39, "The competitor's units"). The cost settings abov
 cost units a millisecond, the rate of PostgreSQL's own sequential and index-only scans; its other
 plans run at rates of their own - a hash aggregate at about 200, a nested loop into a warm index at
 1,000 or more. A `LionCount`, `LionSemiJoin` or `LionAntiJoin` path is priced in the units of the
-cheapest PostgreSQL plan it competes with: its CPU terms times that kind of plan's rate below, its
-pages as PostgreSQL prices pages, so its cost in `EXPLAIN` is that plan's units. Set a rate to 1 to
-price Lion's CPU as fitted against that kind of plan; `SET client_min_messages = debug2` logs which
-kind each path was priced against, at which rate and margin. To read Lion's own cost units a
-millisecond when calibrating the cost settings above, set every rate and the margin below to 1.
-`bench/calib/matrix.py` measures each kind of plan's units a millisecond, and the planner's
-mispicks, on synthetic tables (DESIGN.md §39, "The matrix").
+cheapest PostgreSQL plan it competes with: its own price, pages and CPU alike, times that kind of
+plan's rate below, so its cost in `EXPLAIN` is that plan's units; which of its own forms Lion runs
+is decided before, in its own units. Set a rate to 1 to price Lion as fitted against that kind of
+plan; `SET client_min_messages = debug2` logs which kind each path was priced against, at which
+rate and margin. A plan forced with PostgreSQL's `enable_*` settings, with nothing of PostgreSQL's
+left enabled to compete with, is priced in Lion's own units. To read Lion's own cost units a
+millisecond when calibrating the cost settings above, force its plans that way, or set every rate
+below to 1. `bench/calib/matrix.py` measures each kind of plan's units a millisecond, and the
+planner's mispicks, on synthetic tables (DESIGN.md §39, "The matrix").
 
 | `pg_lion.` | default | the PostgreSQL plans it is the rate of, as a multiple of 500 units a millisecond |
 |---|---|---|
@@ -653,11 +655,16 @@ mispicks, on synthetic tables (DESIGN.md §39, "The matrix").
 | `nestloop_rate` | 2.0 | a nested loop into a parameterized index or bitmap scan |
 | `bitmap_rate` | 1.0 | a bitmap heap scan |
 
-`pg_lion.pushdown_margin` (0.8): the share of the cheapest competing plan's cost a Lion custom path
-(`LionCount`, `LionSemiJoin`, `LionAntiJoin`, `LionOrdered`) must be priced at to be chosen: its
-own price is divided by it, so a near tie goes to PostgreSQL's plan, and its cost in `EXPLAIN` is
-marked up by it. 1 is no margin. PostgreSQL's `enable_*` settings and Lion's switches above still
-force a plan either way.
+`pg_lion.pushdown_margin` (1, no margin): the share of the cheapest competing plan's cost a Lion
+custom path (`LionCount`, `LionSemiJoin`, `LionAntiJoin`, `LionOrdered`) must be priced at to be
+chosen. Set below 1, its own price is divided by it, so a near tie goes to PostgreSQL's plan, and
+its cost in `EXPLAIN` is marked up by it. It is not applied where it hedges nothing: to a plan
+forced with nothing of PostgreSQL's left enabled, to a count whose cheapest competitor is the
+access method's own scan of a Lion index (both prices Lion's), and to a count whose multi-key query
+is a generic plan's parameter (priced at its dearest already). The default was 0.8 until the
+decision matrix found Lion the faster plan in most of its near ties, and every plan 0.8 moved
+moved to a slower one (DESIGN.md §39, "The margin"). PostgreSQL's `enable_*` settings and Lion's
+switches above still force a plan either way.
 
 ## Known limitations
 

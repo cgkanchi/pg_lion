@@ -2381,9 +2381,9 @@ core's hash aggregates and hash joins that rate makes lion honest and them cheap
 count competes with a hash aggregate on close to equal terms, the aggregate wins in the model and
 loses on the machine (§31 lists the cases). Pricing lion at the hash aggregate's rate instead would
 make it beat sequential and index-only scans it is up to twice as slow as. *(Since 2026-10-01 a
-lion custom path is priced at the rate of the plan it competes with - its CPU terms times that
-kind of plan's rate over this reference, its pages as here - and has to beat it by a margin
-(§39).)*
+lion custom path is priced at the rate of the plan it competes with - its price, as fitted here,
+times that kind of plan's rate over this reference - and a site can ask it to beat that plan by a
+margin (§39).)*
 
 **The merge** (`lion_merge_cpu_cost()`; every count, every group and pair of a GROUP BY, the AND of
 a lion index scan's sets in `lioncostestimate()` - since 2026-09-28 with the lookups, unions and
@@ -14759,9 +14759,10 @@ what the defaults are fitted to:
   ratios, units a millisecond, are what the model says each plan does per unit of time; a lion
   path well above the competitor's ratio is overpriced, and well below it underpriced, which is
   the mispick waiting to happen. Core's own CPU-bound scans ran at 400 to 700 (§10, "The units").
-  *(Since §39 a lion path's cost is in its competitor's units and over a margin: set
-  `pg_lion.pushdown_margin` and every `pg_lion.*_rate` to 1 to read lion's own, and calibrate the
-  rates themselves against core's plans the same way.)*
+  *(Since §39 a lion path's cost is in its competitor's units, and over a margin if one is set:
+  force its plans with core's `enable_*` settings, or set every `pg_lion.*_rate` and
+  `pg_lion.pushdown_margin` to 1, to read lion's own, and calibrate the rates themselves against
+  core's plans the same way.)*
 - Which setting to move is the one whose term dominates the path's price, read against the
   node's counters: `Containers Visited`, `Directory Pages Read` and `Heap TIDs Rechecked` of a
   count are the containers, the descents and the recheck candidates `container_cost`,
@@ -16585,12 +16586,13 @@ to 100 times, where it loses it loses by 1.5 to 13 - and the losses of the last 
 constants: ClickBench Q15 (0451360, a clause a partial index's predicate implies priced twice) and
 a `count(DISTINCT)` priced as a walk it did not make were formulas, which no setting of the 37
 multipliers of §31 corrects. This section changes nothing in a formula and refits nothing; it
-corrects the units a lion path is compared in, and asks a lion path to win by a margin.
+corrects the units a lion path is compared in, and gives a site a margin a lion path has to win by -
+which it first set to 0.8, and which the matrix set back to 1 ("The margin", "The matrix").
 
 ### The competitor's units (`lion_plan_units.c`)
 
 A lion custom path is priced in the units of the cheapest core path of the relation it is added
-to - at the time it is added:
+to, found when the planner hook that adds it starts:
 
 - **Which path.** The upper rel's, for LionCount and the FK-side join (`create_upper_paths_hook`
   runs after core has added every grouped path); the join rel's, for LionSemiJoin and LionAntiJoin
@@ -16598,27 +16600,37 @@ to - at the time it is added:
   for, and the ones before it). Of those, the cheapest (fewest disabled nodes, then total cost) that
   is not parameterized and has no lion custom path anywhere inside it (`lion_path_has_lion()`): an
   Agg over a LionOrdered scan, or a hash join over a LionSemiJoin, is lion's plan as much as
-  core's. None - nothing of core's yet - prices at the reference.
+  core's. None - nothing of core's yet - prices at the reference, and so does a relation whose
+  every path of core's is disabled (`DISABLED`, below).
+- **Once for each hook** (`lion_units_pin()`). `add_path()` frees the paths a new path dominates,
+  so the core path the first lion path of a relation was priced against can be gone when the next
+  is priced - the decoded walk after the nested loop of the same GROUP BY (§34), the parallel
+  FK-side join after the serial one, the second way round of a join - and the next would be
+  priced against whatever core had left, of another kind or none: two of lion's own paths
+  compared in two units. Each hook finds the competitor before it adds its first path and prices
+  every path it adds against that one, and forgets it when it returns (and when it starts, so
+  that an error inside a pricing leaves nothing behind).
 - **What kind of plan it is** (`lion_competitor_kind()`): down from its top, through the nodes that
   pass a scan's or a join's rows up (projections, sorts, gathers, materializations, a LIMIT), to
-  the first that says what its units are. An aggregate that HASHES anywhere on the way - the
-  Partial HashAggregate under a Finalize Agg included - is a hashed aggregate. A join is its method:
-  a hash join, a merge join, or a nested loop whose inner side is an index or bitmap scan
-  parameterized by the outer rows (§10's and §31's nested loops; one over a materialized inner side
-  is CPU, and prices at the reference). A bitmap heap scan is one, aggregated or not. A plain or
-  sorted aggregate over a sequential, index-only or index scan is an aggregate over a scan; the
-  scan alone is its own kind. An Append is its dearest child's kind.
+  the first that says what its units are. A join is its method, under any aggregate: a hash join,
+  a merge join, or a nested loop whose inner side is an index or bitmap scan parameterized by the
+  outer rows (§10's and §31's nested loops; one over a materialized inner side is CPU, and prices
+  at the reference). An aggregate that HASHES anywhere above a scan - the Partial HashAggregate
+  under a Finalize Agg included - is a hashed aggregate. A bitmap heap scan is one under a plain or
+  sorted aggregate or none. A plain or sorted aggregate over a sequential, index-only or index scan
+  is an aggregate over a scan; the scan alone is its own kind. An Append is its dearest child's
+  kind. (A hash aggregate over a join was first a hashed aggregate: "What running it changed".)
 - **Its rate**: the cost units a millisecond such plans run at, over 500 - a setting for each kind
   that is not the reference (below).
-- **The price.** Lion's CPU terms in the competitor's units are its fitted price times the rate;
-  its pages stay as core prices pages, since lion keeps core's convention for them (§10: "lion and
-  core overcharge a warm page alike"), and a page read by either costs the same. The terms are not
-  classified one by one: the path's own price is summed with every page cost it reads divided by
-  the rate - `lion_page_scale`, which `LION_SEQ_PAGE_COST`, `LION_RANDOM_PAGE_COST` and
-  `lion_heap_page_cost()` apply - and multiplied by the rate after (`lion_units_begin()`,
-  `lion_units_price()`). What was CPU comes out times the rate, what was a page as it was, and the
-  choices the model makes inside a price - walk or probe, collect or seek, the inside of a range or
-  its complement - are made in the units the price is compared in.
+- **The price**: the path's own price, as lion's model makes it in the reference units, times the
+  rate (`lion_units_price()`) - its pages with its CPU terms. A rate is the ratio of two whole
+  plans' cost units a millisecond, pages and all, and a time in one unit is a time in another by
+  that one factor. Every choice the model makes inside a price - walk or probe, collect or seek,
+  the inside of a range or its complement, the decoded walk or the nested loop - is made before
+  the conversion, in the units lion's constants were fitted in, so that the competitor changes how
+  dear a lion path is and never which of its forms the executor runs. (The first version of this
+  section converted the CPU terms alone, the pages left in core's convention: "What running it
+  changed", below.)
 
 **On the path's own cost.** The converted price is the path's cost, as EXPLAIN shows it, rather than
 a correction made only where `add_path()` compares. It is the simplest, it is what every later
@@ -16626,7 +16638,8 @@ comparison sees - a Sort above the node avoided, a LIMIT's fraction of it, a joi
 LionSemiJoin - and it is what makes the comparisons with the other paths of the relation, added
 before or after, consistent with the one the rate was chosen for. It is also what a lion path's
 cost means from here on: its price in the units of the plan it was measured against. A bench
-measuring lion's own units a millisecond sets each rate to 1 (`bench/calib/`, below).
+measuring lion's own units a millisecond forces lion's plans with core's `enable_*` settings, or
+sets each rate to 1 (`bench/calib/`, below).
 
 **Only the node's own price.** What core puts above or below a lion node is core's plan, priced by
 core in its own units, and is not converted: the Finalize Agg over a partitioned count and the
@@ -16636,11 +16649,16 @@ HAVING the node evaluates (`cost_qual_eval()`, as `cost_agg()` charges it). The 
 participant price is made of the serial node's converted price and its converted per-range terms.
 
 **Not converted at all**: LionOrdered, whose competitors are the base rel's scans - sequential,
-index-only, index, bitmap - which are the reference or have no one rate (below); and the AM's own
+index-only, index, bitmap - which are the reference or have no one rate (below); the AM's own
 plain, index-only and bitmap scans, which compete inside core's path machinery and are priced as
-core prices its own. `lioncostestimate()` sets `lion_page_scale` to 1 for its duration, whatever a
-custom path's pricing left it at - nothing calls it from inside one - and each planner hook resets it
-on entry, so an error inside a pricing cannot leave it scaled.
+core prices its own; and a path with nothing to compete with. When every path core has for the
+relation is disabled (`DISABLED`: `disabled_nodes` on PostgreSQL 18, `disable_cost` before it) -
+a plan forced with core's `enable_*` settings, as most of the regression suite and the matrix's
+`lion` arm force one - there are no units to convert into, and the path is priced in lion's own,
+which its choices among its own forms - a walk in order or a Sort over one, serial or parallel -
+are made in. Priced at the disabled plan's rate, a forced semi join under `fkjoin_semipath.sql`'s
+LIMIT took the walk in the outer side's order (the disabled nested loop's 2) over the Sort its
+model prefers.
 
 ### The rates
 
@@ -16676,19 +16694,20 @@ everything else (`OTHER`: a function scan, a MinMaxAgg, a nested loop over a mat
   both, and the kind cannot tell them apart; it prices at the reference, as before.
 - **Merge joins, 1.0**: none measured.
 
-`SET client_min_messages = debug2` logs, for each lion path priced, the kind it was priced against,
-that path's cost and the rate.
+`SET client_min_messages = debug2` logs, for each lion path priced, the kind of plan it was priced
+against (`lion` before it when that plan is the AM's own scan), that plan's cost, the rate and the
+margin.
 
 ### The margin
 
-`pg_lion.pushdown_margin`, default **0.8**: a lion custom path's own price, in its competitor's
-units, is divided by the margin before the path is offered to `add_path()`, so that a lion path is
-chosen only where its price comes to at most 0.8 of the best core plan's - a near tie, within 25%,
-goes to core. It applies to every lion custom path - LionCount (serial, parallel, partitioned, the
-FK-side join), LionSemiJoin, LionAntiJoin and LionOrdered (startup and total alike) - and to the
-node's own price only, as the rates do: core's nodes around it are not marked up. 1 is no margin,
-the behaviour before this section. The AM's own scans compete inside core's path machinery on their
-plain cost, unmarked.
+`pg_lion.pushdown_margin`, default **1**, no margin. Set below 1, a lion custom path's own price, in
+its competitor's units, is divided by the margin before the path is offered to `add_path()`, so that
+a lion path is chosen only where its price comes to at most that share of the best core plan's - at
+0.8, a near tie within 25% goes to core. It applies to every lion custom path - LionCount (serial,
+parallel, partitioned, the FK-side join), LionSemiJoin, LionAntiJoin and LionOrdered (startup and
+total alike) - and to the node's own price only, as the rates do: core's nodes around it are not
+marked up. The AM's own scans compete inside core's path machinery on their plain cost, unmarked.
+This section first made 0.8 the default; the matrix made it 1 ("1, from the matrix", below).
 
 **Divided, not declined.** Not adding the path would be cheaper and would leave EXPLAIN's costs
 alone, but it decides once, against the paths the relation has at that moment, and two of lion's
@@ -16706,20 +16725,60 @@ paths meet their competitors later:
 A divided price carries the margin into every comparison it is in, whenever and wherever that is
 made, and forcing a plan works as it did: core's `enable_*` settings disable core's paths
 (`disabled_nodes` on PostgreSQL 18, `disable_cost` before it), which lose to an enabled lion path
-whatever its price, and `pg_lion.enable_*` leave lion's out. What it costs is that a lion path's cost
-in EXPLAIN is its price over the margin; a bench reading lion's own units a millisecond sets the
-margin to 1, and each rate to 1, first.
+whatever its price, and `pg_lion.enable_*` leave lion's out. What it costs is that a lion path's
+cost in EXPLAIN is its price over the margin, where one is set.
 
-**0.8, from what is known.** Taking the cheaper of two plans minimizes the expected time when the
-estimates are exact. When one of them carries a log-normal error of spread sigma - lion's, whose
-fit §10 left at a median residual of 27% and whose 35 re-costed counts span 283 to 3,724 units a
-millisecond - the rule that minimizes it takes that one only below `exp(-sigma^2 / 2)` of the
-other's price: 0.78 to 0.88 for sigma 0.5 to 0.7. Below it the margin buys little: the losses that
-cost the most - 1.5 to 13 times - are formula errors priced far from the tie (§31's `eq s.c1m in
-1000`, the node at 0.47 of the index-only scan and 3.1 times slower; `fk fwd tsq dim2 1.2k`, at
-0.58 of the nested loop and 3.1 times slower, which the nested loop's rate now prices), and a margin
-low enough to catch them refuses real wins: the repro's `GROUP BY c200`, converted, is priced at 0.53
-of the hash aggregate and runs 1.9 times faster. The matrix below is what confirms or moves it.
+**Not where it hedges nothing.** The margin is a hedge against the error of lion's price alone;
+three prices carry no such error, and are offered at no margin whatever it is set to:
+
+- *Nothing to compete with* - `NONE` or `DISABLED` above: the choice is not between lion and core.
+- *The AM's own scan of a lion index* (`lion_path_is_lion_scan()`: a plain, index-only or bitmap
+  scan of one, under the nodes that pass its rows up), for a count: that price is
+  `lioncostestimate()`'s, lion's model with lion's errors, and a margin would only tilt a choice
+  between two of lion's plans. At 0.8 three counts of the regression suite went from the node to
+  such a scan: `corrupt_walk.sql`'s, 3.9 ms against the node's 1.75; `indexscan.sql`'s clustered
+  value, 0.19 against 0.06; `unlogged.sql`'s, a tie. LionOrdered keeps its margin against one
+  (`lion_units_margin_for()`): what it is chosen over is an ordered btree scan or a Sort under a
+  LIMIT, not the cheapest scan of its relation, which under a lion filter often is the AM's bitmap
+  scan.
+- *A query unknown until run time* (`lion_where_query_unknown()`): a generic plan's `tags @> $1`
+  is priced as every row (§17), the node's own sequential scan - the most the count can cost, not
+  an estimate that may fall short of it. At 0.8 the generic plans of `array.sql` and
+  `countmultikey.sql` went to the sequential scan they tie at worst: 3.2 ms against the node's 0.03
+  for the value they run with, 3.3 against 2.8 for the worst value, `'{}'`.
+
+**1, from the matrix.** The case for 0.8 was this: taking the cheaper of two plans minimizes the
+expected time when the estimates are exact; when one carries a log-normal error of spread sigma -
+lion's, whose fit §10 left at a median residual of 27% - the rule that minimizes it takes that one
+only below `exp(-sigma^2 / 2)` of the other's price, 0.78 to 0.88 for sigma 0.5 to 0.7. That
+assumes the other price exact, and the matrix (below) says core's is not: its plans of one kind
+run at 142 to 795 units a millisecond (an aggregate over a sequential scan), 121 to 799 (a hash
+aggregate), 167 to 2,258 (a nested loop), as widely spread as lion's counts' 118 to 1,219; and the
+ordered btree scan under a LIMIT that LionOrdered competes with ran at 40 to 115, four to twelve
+times below the reference. Where both prices err alike the correction cancels, and what is left is
+which way the near ties fall. In the matrix they fall to lion. Seven of its 39 queries have lion's
+price, in its competitor's units, within a third of core's best; lion was the faster plan in six,
+in both runs:
+
+| query | lion's price over core's | lion's time over core's, run 1, run 2 | core's plan |
+|---|---|---|---|
+| `eq.c20k` | 1.13 | 0.82, 0.74 | aggregate over an index-only scan |
+| `eq.c1m` | 1.17 | 0.93, 0.66 | aggregate over an index-only scan |
+| `group.c20k` | 1.09 | 0.70, 0.68 | sorted aggregate over an index-only scan |
+| `range.c20k` | 0.96 | 0.77, 0.75 | aggregate over an index-only scan |
+| `fk.status.kind` | 0.91 | 0.85, 0.86 | hash join |
+| `ord.c200` | 0.86 | 0.12, 0.15 | ordered index scan under the LIMIT |
+| `eq.c20k.in100` | 0.78 | 1.31, 1.40 | aggregate over an index-only scan |
+
+At 0.8 the margin refused the three of these lion was priced below core in and won - `range.c20k`,
+`fk.status.kind` and `ord.c200`, the last 7 to 8 times faster - and kept the one it loses, priced
+below 0.8. Those four are all the margin moves, at any value from 0.9 to 0.5, in either run: the
+three wins go to core at 0.9 or 0.8, and the loss only at 0.6, the three wins long gone by then. 1
+had the fewest mispicks and the least time lost of the sweep in both runs ("The matrix", below). So
+the default is 1; the setting stays, with the exemptions above, for a site whose own matrix says
+otherwise. A margin above 1 - lion favoured - would have taken three more of the seven (the first
+three rows), and the setting stops at 1: on 39 queries that would be a fit, not the correction of a
+known bias.
 
 ### Resident index pages: §22's third rung
 
@@ -16736,13 +16795,12 @@ it is when the index is resident, `lion_index_page_cost()`, a third rung below `
 - **Residency** is core's measure of what stays cached, as `index_pages_fetched()` prorates it:
   `effective_cache_size` over the query's table pages (`root->total_table_pages`) plus the index's
   own, at most 1. A page costs `device - resident x (device - hit)`, where `device` is what it was
-  priced at before - `seq_page_cost` for a page walked in order, `lion_heap_page_cost()`'s price for a
-  page a probe touches - and `hit` is `pg_lion.resident_page_cost`, 120 `cpu_operator_cost` (0.3
+  priced at before - `seq_page_cost` for a page walked in order, `lion_heap_page_cost()`'s price for
+  a page a probe touches - and `hit` is `pg_lion.resident_page_cost`, 120 `cpu_operator_cost` (0.3
   units): §10's warm page read in order, 0.6 us against the 2 us that `seq_page_cost` stands for at
   500 units a millisecond (the posting leaves a probe's seeks cross fit at 0.7, a directory page
   descended at 0.6 with its search). Never above `device`: a page core prices lower keeps core's
-  price. The hit is CPU and `device` is a page, so under §39's units the hit is converted with the
-  rate and the page is not, as every other term is.
+  price. In a competitor's units both are converted with the rest of the price.
 - **Walked and probed alike**, as §22 asked: the driver's walk of its sets and the other sources'
   probes of theirs (`lion_cost_set_pages()`), a GROUP BY's entry scan and a second column's
   (`lion_count_rel_entry_scan()`, `lion_count_rel_pair_cost()`), a range's leaves read again by a
@@ -16750,23 +16808,58 @@ it is when the index is resident, `lion_index_page_cost()`, a third rung below `
   decoded walk's pages (§34).
 - **Not here.** The one directory leaf of a single key's lookup keeps `random_page_cost`, as
   `btcostestimate()` charges btree's leaf and lion's own scans charge theirs; so do a collected
-  range's sums and the heap pages of a recheck. The FK-side join's probed posting pages already
-  are priced as the warm pages they were measured as (`fkjoin_probe_page_cost`, 270 ns a page, §27). The AM's own scans
-  (`lioncostestimate()`) compete with core's index scans, which charge their own pages as device
-  reads; they keep the convention.
+  range's sums and the heap pages of a recheck. The FK-side join's probed posting pages already are
+  priced as the warm pages they were measured as (`fkjoin_probe_page_cost`, 270 ns a page, §27). The
+  AM's own scans (`lioncostestimate()`) compete with core's index scans, which charge their own
+  pages as device reads; they keep the convention.
 
 **What it moves.** Every count's estimate, by the pages it reads: the selective counts most, whose
-price is mostly pages - §22's case comes to about 48 before the margin and 60 after, against the
-BitmapAnd's 62.1, an estimate the regression suite and the matrix have to confirm - and the large
-GROUP BYs least, whose price is per-group work. Both refusals §22 named stay refusals on the
-arithmetic: §10's 20000 groups at 5M rows cost 502,000 against the hash aggregate's 142,000, and
-their entry pages are a few hundred units of it, so in the hash aggregate's units and over the margin
-it is still 264,000; §20's 200 x 20 is refused by its pairs' member term, and its two entry scans
-are a few pages. In units a millisecond the 20000-group never-vacuumed table (40.8 ms against 28.0)
-and the 200 x 20 (60.7 against 36.8) stay refused as long as lion's price for them is more than 1.9
-times the hash aggregate's (0.42 over 0.8), which an honest price - 3.6 and 4.1 times, at 500 and
-200 units a millisecond - is; `test/sql/pushdown.sql` pins both, and a regenerated expected output
-that loses either is a regression of this rung.
+price is mostly pages (§22's case comes to about 48 by the arithmetic, against the BitmapAnd's
+62.1) and the large GROUP BYs least, whose price is per-group work. Both refusals §22 named stay
+refusals: §10's 20000 groups at 5M rows cost 502,000 against the hash aggregate's 142,000, their
+entry pages a few hundred units of it, so 211,000 in the hash aggregate's units; §20's 200 x 20 is
+refused by its pairs' member term, and its two entry scans are a few pages. `test/sql/pushdown.sql`
+pins both at 100,000 rows, and they hold, by EXPLAIN on this build at the defaults: the 20000 groups
+of the table never vacuumed (40.8 ms through the node against 28.0, §10) are 21,187 in lion's units,
+8,898 in the hash aggregate's, against its 4,642; the 200 x 20 with the decoded walk off (60.7 ms
+against 36.8, §20) 30,259 and 12,709 against 4,915, and the 20000 x 2 beside it 43,989 and 18,476
+against 5,075. Each stays refused while lion's price is more than 2.4 times the hash aggregate's (1
+over 0.42), and they are 4.6, 6.2 and 8.7 times; the margin at 0.8 made that 1.9.
+
+### What running it changed (2026-10-01, the same day)
+
+Everything above was first written without a server, and is given as it stands after the run.
+Run - the regression suite first, 17 of its 104 tests failing, then the matrix below, then the
+suite again - it changed in seven places, each with the measurement that moved it. Timings here are
+the assert build's (`-O1`) on a shared 4-core VM, medians of five to six runs: ratios between two
+plans of one query, not rates.
+
+- **One competitor for each hook** ("Which path", above). Priced against whatever `add_path()` had
+  left, `pushdown.sql`'s `GROUP BY c20, c2` over 100,000 rows took its nested loop, priced against
+  the hash aggregate at 0.42, over its decoded walk, priced against the sorted aggregate left after
+  the nested loop had freed the hash aggregate, at 1: 7.1 ms against 1.3. Seventeen of the FK
+  tests' parallel joins went serial the same way, in six files.
+- **Lion's own units against a disabled plan** ("Not converted at all").
+- **No margin against the AM's own scan of a lion index, nor for a query unknown until run time**
+  ("Not where it hedges nothing").
+- **The price converted whole.** The first version converted lion's CPU terms and left its pages
+  in core's convention, summing the price with every page divided by the rate (`lion_page_scale`)
+  and multiplying by the rate after. A rate is a ratio of whole plans' units a millisecond, so that
+  applied it to a part it was not measured on; and it reached inside the price, where lion's forms
+  read pages and CPU in different shares - priced CPU-only, the decoded walk and the nested loop,
+  a walk and a probe, a collected filter and a sought one changed order with the competitor's
+  rate, and the executor follows the form the price picks. The matrix's 39 queries chose the same
+  plans either way (one run of each); the regression suite differed in one forced plan.
+  `lion_page_scale`, its two macros, `lion_units_begin()` and `lion_units_end()` and
+  `lioncostestimate()`'s wrapper that reset the scale are gone with it.
+- **An aggregate over a join is the join's kind** ("What kind of plan it is"). It was a hashed
+  aggregate wherever the aggregate hashed, and `rangesource.sql`'s GROUP BY over a nested loop into
+  the fk btree - ten dimension rows, the hash aggregate over them a few cost units of the plan - had
+  the node priced at the hash aggregate's 0.42 against a plan whose time is the nested loop's, and
+  with the margin at 1 the node was chosen: 4.7 ms against 0.6. A join's rate was measured with the
+  aggregate over it (§10's and §31's are counts over joins), and its rows are what the aggregate is
+  fed.
+- **The margin's default, 0.8 to 1** ("1, from the matrix").
 
 ### The matrix (`bench/calib/`)
 
@@ -16788,52 +16881,197 @@ cost units a millisecond, and for `--sweep NAME=V1,..` - by default the margin f
 planner's choices and mispicks at each value; `matrix.py compare A.json B.json` sets two runs side
 by side.
 
-**Not run yet.** The session that wrote this section could not start a server (the sandbox refused
-to run commands as the unprivileged user PostgreSQL needs), so the tables this section is to hold -
-the matrix before (dc7cd29, the merge base) and after, on PostgreSQL 18, warm - are not here, and
-neither are the regenerated expected outputs; nothing in this section above "The matrix" has been
-measured on this code. The run, on a server started as the unprivileged user with the library of
-each build installed in turn:
+**The run.** PostgreSQL 18.6, an assert-enabled build at `-O1`; 2M rows, warm, serial, five rounds;
+a 4-core VM shared with other work, whose load average ran from 2 to 15 during the runs. The load
+moves a plan's time between runs by up to twice - the before run's GROUP BYs, widest range and FK
+joins took twice what the same plans took after - but not the ratio of two plans timed in the same
+rounds, which is what a mispick is. The build after dc7cd29 was the branch's as it stood at each
+run; what changed after run 2 changes no plan of the 39 (EXPLAIN of each). The commands:
 
 ```sh
 python3 bench/calib/matrix.py --setup-only --rows 2000000
-# the library of dc7cd29, installed; a new connection loads it
+# dc7cd29's library installed, the server restarted
 python3 bench/calib/matrix.py --label before --out before.json
-# the library of this branch, installed
+# this branch's library: run 1 had the margin's default at 0.8, run 2 at 1
 python3 bench/calib/matrix.py --label after --out after.json
 python3 bench/calib/matrix.py --label own --out own.json --set pg_lion.pushdown_margin=1 \
-    --set pg_lion.hashagg_rate=1 --set pg_lion.hashjoin_rate=1 --set pg_lion.nestloop_rate=1
+    --set pg_lion.hashagg_rate=1 --set pg_lion.agg_rate=1 --set pg_lion.hashjoin_rate=1 \
+    --set pg_lion.mergejoin_rate=1 --set pg_lion.nestloop_rate=1 --set pg_lion.bitmap_rate=1
 python3 bench/calib/matrix.py compare before.json after.json
 ```
 
-`own.json`'s units a millisecond by kind are the rates' measurement: a kind's rate is its median
-over the lion paths' median there. The margin's sweep in `after.json` is what keeps 0.8 or moves it.
+Six runs: before; after with the margin's default at 0.8 (run 1), and the same build with the
+first version's CPU-only conversion; after with it at 1 (run 2); and own twice, the first under a
+load of 10 to 15 and used here only for the choices its sweeps of the rates make, which are costs,
+not times. Each query's chosen plan and its median time in milliseconds, a mispick in bold, and the
+fastest plan of run 2 ("own" is the second own run: every rate and the margin at 1):
+
+| query | before (dc7cd29) | after, margin 0.8 | after, margin 1 | own | fastest |
+|---|---|---|---|---|---|
+| `eq.c2` | LionCount 0.96 | LionCount 0.85 | LionCount 0.93 | LionCount 0.93 | LionCount |
+| `eq.c20` | LionCount 0.39 | LionCount 0.38 | LionCount 0.36 | LionCount 0.39 | LionCount |
+| `eq.c200` | LionCount 0.14 | LionCount 0.15 | LionCount 0.14 | LionCount 0.16 | LionCount |
+| `eq.c20k` | agg, IOS 0.06 | agg, IOS 0.04 | agg, IOS 0.05 | agg, IOS 0.06 | LionCount |
+| `eq.c1m` | agg, IOS 0.04 | agg, IOS 0.04 | agg, IOS 0.05 | agg, IOS 0.05 | LionCount |
+| `eq.c200.c20` | LionCount 0.33 | LionCount 0.34 | LionCount 0.34 | LionCount 0.33 | LionCount |
+| `eq.c20k.c200.c2` | LionCount 0.07 | LionCount 0.07 | LionCount 0.08 | LionCount 0.08 | LionCount |
+| `eq.c20k.in100` | **LionCount 1.28** | **LionCount 1.30** | **LionCount 1.32** | **LionCount 1.37** | agg, IOS |
+| `eq.c1m.in1000` | **LionCount 6.54** | **LionCount 6.76** | **LionCount 6.97** | **LionCount 7.74** | agg, IOS |
+| `eq.skew.hot` | LionCount 0.71 | LionCount 0.84 | LionCount 0.90 | LionCount 0.82 | LionCount |
+| `eq.skew.cold` | LionCount 0.10 | LionCount 0.10 | LionCount 0.10 | LionCount 0.10 | LionCount |
+| `eq.n10.null` | LionCount 0.49 | LionCount 0.50 | LionCount 0.46 | LionCount 0.49 | LionCount |
+| `eq.cl200` | LionCount 0.04 | LionCount 0.04 | LionCount 0.05 | LionCount 0.05 | LionCount |
+| `eq.c200.in2.c2` | LionCount 0.91 | LionCount 0.97 | LionCount 0.93 | LionCount 0.87 | LionCount |
+| `range.cl200` | LionCount 0.07 | LionCount 0.08 | LionCount 0.08 | LionCount 0.08 | LionCount |
+| `range.c20k` | LionCount 0.50 | **agg, IOS 0.63** | LionCount 0.46 | LionCount 0.46 | LionCount |
+| `range.c20k.c2` | LionCount 88.66 | LionCount 41.57 | LionCount 41.93 | LionCount 42.01 | LionCount |
+| `group.c20` | LionCount 14.78 | LionCount 6.73 | LionCount 6.67 | LionCount 6.81 | LionCount |
+| `group.c200` | LionCount 44.94 | LionCount 19.36 | LionCount 20.51 | LionCount 21.32 | LionCount |
+| `group.c20k` | **agg, IOS 302** | **agg, IOS 133** | **agg, IOS 143** | **agg, IOS 145** | LionCount |
+| `group.c200.w.c2` | LionCount 23.56 | LionCount 11.26 | LionCount 11.46 | LionCount 9.17 | LionCount |
+| `group.c20k.w.c20` | HashAgg 90.15 | HashAgg 87.68 | HashAgg 73.44 | **HashAgg 90.10** | HashAgg |
+| `group.c20.c2` | LionCount 17.11 | LionCount 17.29 | LionCount 21.19 | LionCount 21.48 | LionCount |
+| `group.c200.c20` | LionCount 42.40 | LionCount 26.79 | LionCount 24.31 | LionCount 27.15 | LionCount |
+| `distinct.c20k.w.c200` | agg, lion idx scan 26.66 | agg, lion idx scan 8.23 | agg, lion idx scan 9.30 | agg, lion idx scan 8.99 | agg, lion idx scan |
+| `distinct.c200` | LionCount 0.82 | LionCount 0.92 | LionCount 0.95 | LionCount 0.82 | LionCount |
+| `topk.c20k` | LionCount 8.74 | LionCount 3.87 | LionCount 3.99 | LionCount 4.07 | LionCount |
+| `fk.status` | LionCount 58.80 | LionCount 39.43 | LionCount 37.59 | LionCount 40.02 | LionCount |
+| `fk.status.country` | LionCount 2.29 | LionCount 2.29 | LionCount 2.23 | LionCount 2.22 | LionCount |
+| `fk.status.kind` | hash join 69.86 | **hash join 62.29** | LionCount 47.59 | **hash join 56.67** | LionCount |
+| `fk.group.country` | HashAgg 81.41 | HashAgg 95.84 | HashAgg 95.72 | HashAgg 97.10 | HashAgg |
+| `fk.small.grp` | LionCount 1.69 | LionCount 1.90 | LionCount 1.83 | LionCount 1.81 | LionCount |
+| `fk.semi.country` | LionSemiJoin 10.86 | LionSemiJoin 6.71 | LionSemiJoin 7.59 | LionSemiJoin 7.80 | LionSemiJoin |
+| `fk.semi.count` | **hash join 89.00** | hash join 31.30 | **hash join 33.38** | hash join 32.25 | merge join |
+| `fk.anti.country` | LionAntiJoin 14.44 | LionAntiJoin 7.13 | LionAntiJoin 7.32 | LionAntiJoin 7.36 | LionAntiJoin |
+| `ord.c200` | LionOrdered 0.51 | **index scan 4.19** | LionOrdered 0.59 | LionOrdered 0.54 | LionOrdered |
+| `ord.c20k` | lion idx scan 0.25 | lion idx scan 0.20 | lion idx scan 0.21 | lion idx scan 0.20 | lion idx scan |
+| `ord.c200.c2` | LionOrdered 1.75 | LionOrdered 1.68 | LionOrdered 1.63 | LionOrdered 1.50 | LionOrdered |
+| `ord.c2` | index scan 0.42 | index scan 0.41 | index scan 0.37 | index scan 0.42 | index scan |
+
+At the defaults the matrix chooses as dc7cd29 did in 38 of its 39 queries. The one it changes is
+`fk.status.kind`, whose LionCount the hash join's rate, 0.5, prices at 0.91 of the hash join where
+lion's own units priced it at 1.86: 47.6 ms against 59.6, and 47.7 against 62.3 in run 1. Its other
+mispicks are dc7cd29's, and none is the rates' or the margin's:
+
+| run | mispicks | time lost, ms | lion's in them |
+|---|---|---|---|
+| before, dc7cd29 | 4 | 116.7 | `eq.c20k.in100`, `eq.c1m.in1000`, `group.c20k` |
+| after, margin 0.8 (run 1) | 6 | 62.4 | the same three, `range.c20k`, `fk.status.kind`, `ord.c200` |
+| ... the CPU-only conversion | 6 | 71.2 | the same six |
+| after, margin 1 (run 2) | 4 | 54.4 | `eq.c20k.in100`, `eq.c1m.in1000`, `group.c20k` |
+| own: every rate and the margin 1 | 5 | 83.3 | the same three, `fk.status.kind` |
+
+The fourth of dc7cd29's and of run 2's, `fk.semi.count`, is a hash join chosen over a merge join it
+ran 25% and 15% slower than (8% in run 1), and own's fifth, `group.c20k.w.c20`, a hash aggregate
+over one scan chosen over the same over another priced 1.5% dearer: core's choices between core's
+plans, which lion's paths do not enter. The three that are lion's are formulas, the kind §31 named
+and this section does not refit: the two IN lists price the union of 100 and 1,000 sets at 0.78 and
+0.60 of the index-only scan's aggregate and run 1.3 to 1.4 and 2.1 to 2.2 times slower (§31's `eq
+s.c1m in 1000`), and `group.c20k`'s 20,000 entries are priced 1.09 times the sorted aggregate over
+an index-only scan and run 1.4 times faster.
+
+**The margin's sweep**, mispicks and time lost, in the two runs that swept it:
+
+| margin | run 1 | run 2 |
+|---|---|---|
+| 1 | 3, 44.0 ms | 4, 54.4 ms |
+| 0.9 | 5, 58.7 ms | 6, 66.6 ms |
+| 0.8 | 6, 62.4 ms | 7, 69.9 ms |
+| 0.7 | 6, 62.4 ms | 7, 69.9 ms |
+| 0.6 | 5, 62.1 ms | 6, 69.6 ms |
+| 0.5 | 5, 62.1 ms | 6, 69.6 ms |
+
+**Cost units a millisecond**, by the top of each plan, from the own run (lion in its own units):
+
+| kind of plan | plans | median | min | max | median over LionCount's | over 500 | its rate |
+|---|---|---|---|---|---|---|---|
+| LionCount | 33 | 344 | 118 | 1,219 | | | |
+| aggregate over a sequential scan | 23 | 244 | 142 | 795 | 0.71 | 0.49 | `agg_rate` 1 |
+| aggregate over an index-only scan | 9 | 396 | 95 | 1,089 | 1.15 | 0.79 | `agg_rate` 1 |
+| hash aggregate | 18 | 212 | 121 | 799 | 0.62 | 0.42 | `hashagg_rate` 0.42 |
+| hash join | 19 | 298 | 175 | 558 | 0.87 | 0.60 | `hashjoin_rate` 0.5 |
+| merge join | 7 | 547 | 213 | 675 | 1.59 | 1.09 | `mergejoin_rate` 1 |
+| nested loop | 12 | 516 | 167 | 2,258 | 1.50 | 1.03 | `nestloop_rate` 2 |
+| aggregate over the AM's bitmap scan | 20 | 870 | 52 | 20,242 | | | (lion's model) |
+| index scan in order, under a LIMIT | 4 | 54 | 40 | 115 | | 0.11 | (LionOrdered's competitor) |
+| LionOrdered | 6 | 908 | 276 | 4,294 | | | |
+| LionSemiJoin, LionAntiJoin | 4 | 869 | 819 | 897 | | | |
+
+**The rates stay.** The definition above makes a kind's rate its median over the lion paths' median
+in such a run, and this run says hash aggregates 0.62, hash joins 0.87, nested loops 1.5, merge
+joins 1.6 - not the defaults. Two things say not to take them. This build's lion runs at 344 units a
+millisecond where §10's release build ran it at the 500 its constants are fitted at, against core's
+scans at 244 to 396 here and 400 to 700 there: assertions and `-O1` slow lion's code and core's by
+different factors, so a ratio measured on this build is not a release build's, and measured over 500
+instead the same medians say 0.42, 0.60, 1.03, 1.09. And the matrix's choices barely depend on them:
+in the first own run's sweeps, no choice of the 39 moves with `hashagg_rate` from 1 to 0.3 or
+`nestloop_rate` from 1 to 4, and one moves with `hashjoin_rate` - `fk.status.kind`, which 0.5
+decides for lion, 1.2 to 1.3 times faster, and 0.87 would give back to the hash join. Refit on a
+release build, over the near ties rather than the medians, they may move; not on this evidence.
 
 ### Tests
 
-`test/sql/costrates.sql`: the settings and their ranges; the margin as a threshold - a count the
+`test/sql/costrates.sql`: the settings and their ranges; the margin as a threshold - a GROUP BY the
 node wins by far is chosen at a margin just above the ratio of its price to core's best and is not
-just below it - that divides a forced LionCount's and a forced LionOrdered's cost by exactly the
-margin, that core's `enable_*` settings still force at the dearest margin (0.01) and lion's
-switches still leave out with none; each kind of competitor made the cheapest by core's settings
-(a plain aggregate over a sequential scan, a hash aggregate, the join methods) moving the cost of
-the count, the GROUP BY, the FK-side join and the semi and anti join paths linearly with its own
-rate and not at all with any other, and deciding the GROUP BY at the lowest and the highest rate;
-the AM's scans unmoved by any rate or margin and LionOrdered by any rate; and every plan's rows
-against the pushdown off and sequential scans only. Its expected output is written from the
-design and has not been run. `costgucs.sql` lists 38 cost settings with `resident_page_cost`.
+just below it - that divides the node's and a LionOrdered's cost by exactly the margin, that core's
+`enable_*` settings still force at the dearest margin (0.01) and lion's switches still leave out
+with none; no margin and no rate where they hedge nothing - a count, a GROUP BY, a semi join and a
+LionOrdered forced with core's settings cost the same at every margin and every rate, and a count
+whose cheapest competitor is an aggregate over the AM's own index scan the same at every margin
+while its rate still converts it; each kind of competitor made the cheapest by core's settings (a
+plain aggregate over a sequential scan, a hash aggregate, the join methods) moving the cost of the
+count, the GROUP BY, the FK-side join and the semi and anti join paths linearly with its own rate
+and not at all with any other, and deciding the GROUP BY at the lowest and the highest rate; the
+AM's scans unmoved by any rate or margin and LionOrdered by any rate; and every plan's rows against
+the pushdown off and sequential scans only. `costgucs.sql` lists 38 cost settings with
+`resident_page_cost`.
+
+**The expected outputs regenerated.** No answer changed. Eight plans did, each timed against the
+plan it replaced (assert build, the median of five, two or three times over):
+
+| test | query | was | is | ms, is against was |
+|---|---|---|---|---|
+| `pushdown` | `g, count(*)`, 1,000 groups, never vacuumed | hash aggregate | LionCount | 13.8 to 14.3 against 15.0 to 15.8 |
+| `pushdown` | `a, b, count(*) WHERE c = 'c1'`, decoded walk off | hash aggregate | LionCount | 2.4 to 2.9 against 3.2 to 3.5 |
+| `pushdown` | ... `WHERE c = 'c1' OR n = 2` | hash aggregate | LionCount | 2.2 to 2.5 against 3.9 to 5.1 |
+| `multicolumn` | `a, b, count(*) WHERE c = 'c1'`, one two-column index | hash aggregate | LionCount | 2.2 against 4.2 to 5.5 |
+| `multicolumn` | ... over single-column indexes | hash aggregate | LionCount | 1.7 to 1.8 against 4.2 to 5.2 |
+| `fkjoin_mixed` | `d.grp, count(*)`, `f.x = 3 AND d.attr = 2` | hash aggregate, hash join | partial counts | 1.0 to 1.25 against 1.35 to 1.66 |
+| `fkjoin_mixed` | ... `, max(d.name)` | hash aggregate, hash join | counted rows | 1.28 against 1.62 to 1.74 |
+| `fkjoin_distinct` | `d.region, count(DISTINCT f.fk)`, `f.x = 3 AND f.t = 't4'` | sorted aggregate, hash join | LionCount | 0.63 to 0.65 against 0.42 to 0.51 |
+
+The first seven are the hash aggregate's and the hash join's rates finding the node where it is the
+faster plan and dc7cd29 refused it; the tests' comments say so. The eighth is a loss, accepted: the
+hash join's rate prices this small join's node at 0.82 of the hash join, and it runs 1.35 times
+slower, where the matrix's `fk.status.kind` is priced at 0.91 and runs 1.25 times faster. To give
+each to its faster plan the rate would have to be at least 0.57 and below 0.555 at once (EXPLAIN at
+each); 0.5 keeps the larger, 12 ms against 0.17. At 0.8 the margin had moved four more -
+`fkjoin_semipath.sql`'s GROUP BY to a sorted aggregate (a tie) and its two picks to a nested loop
+(1.56 ms against 1.36) and from a LionCount (1.20 against 1.36), `orderedsemi.sql`'s LionOrdered
+under a LIMIT to an index scan three times slower (0.13 to 0.15 ms against 0.04 to 0.05) - which at
+1 are dc7cd29's plans again.
+
+`make installcheck` passes in both WAL modes, 104 tests and 35 isolation tests in each, and so does
+`make unit`.
 
 ### Not done
 
-- **The measurements** above, and with them the expected outputs of every test whose plans or
-  costs move: every lion custom path's EXPLAIN cost changes by its rate, its margin and its index
-  pages, so every expected output that prints a lion path's cost, or pins a choice near a tie,
-  has to be regenerated and each change read (no answer may change: the tests check answers
-  against sequential scans).
+- **Three of lion's mispicks** in the matrix are formulas, not units: the IN lists' unions
+  (`eq.c20k.in100`, `eq.c1m.in1000`, priced at 0.78 and 0.60 of an index-only scan's aggregate
+  and 1.3 to 2.2 times slower) and the 20,000-entry GROUP BY (`group.c20k`, priced 1.09 times a
+  sorted aggregate over an index-only scan and 1.4 times faster). Neither the rates nor the margin
+  is the tool for them, and this section refits none of the 37 constants they are made of.
+- **The rates on a release build.** This run's build was assert-enabled, and its own run's medians
+  disagree with the defaults in both directions depending on what they are taken over (above). A
+  release build's matrix, the rates fitted to its near ties, is the measurement that could move
+  them.
+- **LionOrdered** is not converted: its competitors are the reference or have no one rate. The
+  matrix measured the one it meets most - a btree's index scan in order under a LIMIT - at 40 to
+  115 units a millisecond, a fourth to a twelfth of the reference; a rate of its own would favour
+  LionOrdered, but four queries are too few to set one.
 - **Bitmap heap scans** have one rate for plans that run at 70 and at 4,400 units a millisecond;
   splitting the kind by what the scan's price is made of (pages or TIDs) would let §22's BitmapAnd
-  have its own rate.
-- **LionOrdered** is not converted: its competitors are the reference or have no one rate. A
-  sorted aggregate's or a top-N sort's rate could be measured and given it.
+  have its own rate. Every bitmap scan the matrix timed was the AM's own, priced by lion's model,
+  and measures nothing of the rate.
 - **The parallel GROUP BY's participants** are priced with the serial node's competitor; core's
   partial paths are not searched for one of their own.
