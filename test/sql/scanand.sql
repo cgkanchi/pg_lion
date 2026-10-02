@@ -346,17 +346,16 @@ DROP FUNCTION sca_rows(text);
 DROP FUNCTION sca_margin(text, text, boolean);
 
 -- ---------- 6. what the scans read: the count's pages ----------
--- d0 and d1 are half the rows each, at random: a bitset at every container
--- key, a posting page each.  b and c are 2% of the rows each, at every key,
--- and together only in the first two keys' rows and the last two's.  The
--- index lists the dense columns first, which is the order the scan's AND
--- node used to step and seek its children in: every page of d0 and d1 was
--- read, where the count, driven by c and giving up every key b rules out,
--- reads theirs at four keys.  Now the scans read what the count reads - its
--- index pages, the count's one visibility map page aside.  The rows are
--- narrow, 157 to a page and 10048 to a container key, so that the blocks
--- hold offsets past 127: d0's and d1's containers are bitsets, not NARROWs
--- (DESIGN.md §38), which would share their posting pages seven at a time.
+-- d0 and d1 are half the rows each, at random: a NARROW of width 3
+-- (DESIGN.md §38) at every container key, five to a posting page.  b and c
+-- are 2% of the rows each, at every key, and together only in the first two
+-- keys' rows and the last two's.  The index lists the dense columns first,
+-- which is the order the scan's AND node used to step and seek its children
+-- in: every page of d0 and d1 was read, where the count, driven by c and
+-- giving up every key b rules out, reads theirs at four keys.  Now the scans
+-- read what the count reads - its index pages, the count's one visibility
+-- map page aside.  The rows are narrow, 157 to a page and 10048 to a
+-- container key.
 CREATE TABLE scb (id int NOT NULL, d0 int NOT NULL, d1 int NOT NULL,
 				  b int NOT NULL, c int NOT NULL);
 INSERT INTO scb

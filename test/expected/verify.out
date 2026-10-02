@@ -575,7 +575,7 @@ SELECT lion_vfy_poke('lion_vfy_bad_child', :root,
 
 SET client_min_messages = error;
 SELECT lion_index_verify('lion_vfy_bad_child');
-ERROR:  lion index "lion_vfy_bad_child": a link points at block 4294967295, but the index has only 12 blocks
+ERROR:  lion index "lion_vfy_bad_child": a link points at block 4294967295, but the index has only 8 blocks
 SET client_min_messages = warning;
 SELECT pg_relation_size('lion_vfy_bad_child') = :size_before AS not_extended;
  not_extended 

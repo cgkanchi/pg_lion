@@ -467,11 +467,14 @@ SELECT lion_sj_counter('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FR
 -- hash_mem_multiplier): the plan was made to collect, and the run goes on in
 -- a temporary file, as a hash join's batches would, and every count reads it
 -- back - with the same answer.  (It used to give up, and every count read the
--- filters instead.)  Half of 250000 narrow rows is a bitset in each of 22
--- containers: some 90 kB.
-CREATE TABLE lion_sfw (fk int8, x int NOT NULL);
-INSERT INTO lion_sfw SELECT abs(hashint4(i)) % 360 + 1, abs(hashint4(i + 1000000)) % 10
-FROM generate_series(1, 250000) i;
+-- filters instead.)  Half of 360000 rows, 65 to a page, is a NARROW of
+-- width 2 (DESIGN.md §38) in each of 87 containers: some 90 kB.  (The pad
+-- puts the rows just past the 63 offsets of a NARROW of width 1, which
+-- makes a NARROW the largest for the rows it holds.)
+CREATE TABLE lion_sfw (fk int8, x int NOT NULL, pad text);
+INSERT INTO lion_sfw SELECT abs(hashint4(i)) % 360 + 1, abs(hashint4(i + 1000000)) % 10,
+	   repeat('x', 80)
+FROM generate_series(1, 360000) i;
 CREATE INDEX lion_sfw_fk ON lion_sfw USING lion (fk);
 CREATE INDEX lion_sfw_x ON lion_sfw USING lion (x);
 VACUUM (FREEZE, ANALYZE) lion_sfw;
