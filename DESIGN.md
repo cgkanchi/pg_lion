@@ -2722,6 +2722,20 @@ work only; the argument above does not depend on it.
 - *The trade*: a count may dirty heap pages and write WAL (a prune record), as core's scans on 19
   already do; it never does so in recovery.
 
+### Every bulk delete counts itself (§37)
+
+The aggregates over keys (§37) read entry headers with no pin held, and learn that a TID they
+counted may have left the index - an aborted row's, which no snapshot holds VACUUM back from - from
+the meta page's `bulkdeletes`. So, binding on `lionbulkdelete()`: **every call ends by adding one to
+it** (`lion_meta_count_bulkdelete()`, in the NDISTINCT record that carries §33's counts), after the
+last TID it takes out and before it returns - which is before VACUUM's second heap pass can mark
+any page whose dead items it was handed. A call that found nothing to take out counts too: the TIDs
+it was handed may have been taken out by an earlier call that failed before its end. The one call
+that cannot write the record, on an rmgr-mode index whose server has not registered the resource
+manager, cannot take a TID out either (§25: its first removal stops the VACUUM). Nothing else
+removes a TID from an entry; a path that ever does - an opportunistic cleanup on insert, say - has
+to count itself the same way, or the aggregates over keys will count the rows it removed.
+
 ## 12. Measured on 20M rows (2026-09-20) and v1 priorities
 
 Measured (optimized build, see README; final run with sparse segments, inline_limit 4096 and byte-sized
@@ -7093,7 +7107,9 @@ image.
     DOWNLINK        0x60  1        ADD of one LionPostingPivot into a parent.
     SPLIT_CLEAR     0x70  1        FLAGS: clears LION_PAGE_INCOMPLETE_SPLIT.
     META            0x80  1        NDISTINCT: the key counts of §33, which
-                                   VACUUM and ANALYZE write on the meta page.
+                                   VACUUM and ANALYZE write on the meta page,
+                                   and the bulk deletes of §37, which the end
+                                   of every ambulkdelete call counts in it.
                                    The meta page's other fields change only
                                    inside a directory split, whose record
                                    carries the META operation.
@@ -7366,6 +7382,14 @@ right, because it rechecked every TID. The split case runs with
 VACUUM_VISIT records; the push-down and spill cases carry it on removal
 records. All three answered wrong before the barrier and the removal window of
 the spill (50000/48548, 1000/500, 200/100).
+
+The aggregates over keys (§37) are the one reader that trusts entry HEADERS with
+no pin held, and on a standby they never do: in recovery every entry is counted,
+in either mode, so neither the pin nor the barrier is asked of them there. The
+meta page's `bulkdeletes`, which tells them on a primary that a bulk delete
+finished under the walk, is replayed all the same - it rides in the META
+record's NDISTINCT operation, which redo copies whole - so a promoted standby
+and a recovered primary carry the number the primary had.
 
 ### Registration and migration (implemented)
 
@@ -15905,7 +15929,7 @@ has ANALYZE's estimate again, exactly as without lion.
 `LION_META_NDISTINCT_OFFSET`:
 
     valid_cols   uint32   bit i - 1: key column i has a count
-    unused       uint32
+    bulkdeletes  uint32   the ambulkdelete calls finished, mod 2^32 (§37; `unused` until then)
     rows         uint64   the rows the index held when counted (above)
     ndistinct    uint64[32]  the VALUE entries of each key column
 
@@ -15948,7 +15972,11 @@ change, `pd_lower` included; generic redo zeroes what lies between `pd_lower` an
 the area is below `pd_lower` by then. In rmgr mode redo copies the payload into the area and raises
 `pd_lower` the same way. The WAL mode is known without reading the meta page under the lock
 (`lion_index_meta_wal_mode()`), because the caller - `lionbulkdelete()` or
-`lion_vacuum_count_keys()` - built the index state first.
+`lion_vacuum_count_keys()` - built the index state first. *(Since §37's 2026-10-02 review the area
+also carries `bulkdeletes`, which every `lionbulkdelete()` call adds one to at its end in this same
+record - `lion_meta_count_bulkdelete()`, written even when the counts are the page's own - and which
+`lion_meta_write_ndistinct()` takes from the page rather than from its caller, so that an ANALYZE
+never takes it back.)*
 
 Two redo rules changed with it. The META operation of a directory split used to SET `pd_lower` to
 the end of `LionMetaPageData`; on a meta page with the area that would cut it off on the standby
@@ -16479,20 +16507,89 @@ total, and `min` or `max` the first `f(key)` in the aggregate's order among the 
 An entry's rows are its visible TIDs. On a heap the visibility map calls all-visible they are its
 header's `ntids`, which the walk reads without locating a set (`lion_entry_scan_next_copy()`) - and
 that is decided as a whole, not page by page: every page is all-visible before the first header is
-read and after the last, and the heap has as many pages both times (`lion_heap_all_visible()`).
+read and after the last, the heap has as many pages both times (`lion_heap_all_visible()`), and no
+index walked has finished a bulk delete in between - its meta page's `bulkdeletes`, read before the
+first look and after the second, has not moved (`lion_wagg_bulkdeletes()`).
 
 - At the first look every TID in the index is a row every snapshot sees: core never marks a page
   that has a dead item, which is the promise an index-only scan rests on.
 - A change after it - an insert, an update, a delete - is by a transaction this snapshot cannot
   see: one it sees made its change before the snapshot was taken, so before the first look. The
-  change takes the mark off its page before its TID reaches any index, and the page cannot be
-  marked again while this snapshot's xmin holds VACUUM back; a new page is not marked at all.
-- So the second look finds every page marked only if nothing changed in between, and every `ntids`
-  read in between counted exactly the rows of the first look, which are this snapshot's.
+  change takes the mark off its page before its TID reaches any index.
+- If that transaction COMMITS, the page cannot be marked again while this snapshot's xmin holds
+  VACUUM back, and a new page is not marked at all: the second look finds it unmarked.
+- If it does not - an aborted insert or non-HOT update, a subtransaction rolled back inside one
+  that commits, a speculative insert that `INSERT ... ON CONFLICT` killed - the tuple is dead to
+  every snapshot whatever the horizon, and nothing holds VACUUM back from it. VACUUM prunes it to
+  LP_DEAD, takes its TID out of the index and marks the page again, and all of that may happen
+  after the walk, which holds nothing between two leaves, has read a header that counted the TID:
+  the second look cannot tell. What it cannot do is mark the page before the line pointer is
+  LP_UNUSED, which only VACUUM's second heap pass makes, after a bulk delete of this index with the
+  TID among its dead ones has RETURNED (§11, "On-access pruning"). That call ended after the header
+  was read: the TID was still in the entry then, so the call either took it out and ended later,
+  or found it gone and began after an earlier call that took it out - later still. Every call
+  counts itself on the meta page as it ends (§11, "Every bulk delete counts itself"), so the count
+  moved between the two reads. Its read takes the meta page's share lock after the second look,
+  and its write the exclusive lock before VACUUM locks the map page to mark: a reader that sees the
+  mark sees the count.
+- So when the second look finds every page marked and no count has moved, nothing changed in
+  between, and every `ntids` read counted exactly the rows of the first look, which are this
+  snapshot's.
 
-Otherwise - a page not marked, at either look - the aggregates start again and each entry is counted
-as a group of a walk is (`lion_node_count()`), the NULL entry included. So is every walk during
-recovery, where a standby's snapshot holds nothing back on the primary.
+Otherwise - a page not marked, at either look, or a count that moved - the aggregates start again
+and each entry is counted as a group of a walk is (`lion_node_count()`), the NULL entry included.
+So is every walk during recovery, where a standby's snapshot holds nothing back on the primary.
+
+**The rows of an aborted insert** (2026-10-02 review; the 2026-10-01 soak found it, and
+`test/soak/findings/wagg_aborted_insert.spec` on its branch was the reproducer). The section
+first said of every change what the COMMITS bullet says: "the page cannot be marked again while
+this snapshot's xmin holds VACUUM back". That holds of committed changes only. With the walk parked
+between two directory leaves at `lion-entry-scan-leaf`, an insert of one row for every key rolled
+back, the rest of the leaves read, and `VACUUM (INDEX_CLEANUP ON)` run before the second look, the
+heap kept its size, every page was marked again, and `SELECT sum(k), max(k % 50)` answered
+147969514 | 49 for 97980400 | 48 - the keys of every leaf after the first once more, and a
+`k % 50` that no row has (97987880 | 49 in the soak's reproducer, which let the walk read one leaf
+before the VACUUM). `ROLLBACK TO SAVEPOINT` in a transaction that commits did the same; a killed
+speculative insert leaves the same kind of TID. Two fixes were weighed:
+
+- *The entry's own visibility under its leaf's pin* - each INLINE entry's member blocks asked of the
+  map while the leaf is pinned, the interlock of §9. It is the count's argument and holds without
+  any new state, but it is a visibility-map read per heap block of every entry, which is the cost
+  the header walk exists to avoid, and it cannot answer a CHAIN entry without locating its set:
+  every column of few keys and many rows would be counted outright. Counting each entry, the
+  walk's fallback, already rests on that interlock.
+- *A count of finished bulk deletes on the meta page*, taken. It lives in the one word of §33's
+  area that was spare (`LionMetaNdistinct.bulkdeletes`, the old `unused`), so the meta page keeps
+  its size and the format version stays where it is; it rides in the NDISTINCT record that
+  `lionbulkdelete()` already wrote at its end, so both WAL modes log it, redo copies it, a crash
+  keeps it and a standby has the primary's number (checked under
+  `wal_consistency_checking = 'pg_lion,Generic'`); and the fast path pays two reads of the meta page
+  per walked index per execution. A meta page with no area reads as zero, and the first bulk delete
+  writes the area.
+
+The walk counts every entry when the count moved, which is also what happens when an unrelated
+VACUUM finished a bulk delete during the walk: a slower answer, never a wrong one. On a hot standby
+nothing changes: the walk counts every entry there already, its snapshot holding nothing back on
+the primary.
+`test/isolation/wagg_aborted_insert.spec` is the reproducer made deterministic - it parks the walk a
+second time at `lion-wagg-walked`, between the last header and the second look, so that the VACUUM
+falls exactly there - with the rollback and the savepoint as its two permutations; without the
+count's comparison it fails with the numbers above. `keyaggs.sql` reads the count off the meta
+page (pageinspect): 0 after a build, kept by a VACUUM with nothing dead and by ANALYZE, one more
+for each bulk delete. A killed speculative insert is not among the permutations:
+the kill needs a conflicting tuple inserted concurrently, which either commits, and keeps its page
+unmarked while the walk's snapshot holds VACUUM back, or aborts, and the killer's retry then
+inserts its own row and has to abort too.
+
+*What the dirty-key walk needs* (`claude/lion-walkcost-wagg`, not merged): its `LION_WALK_DIRTY`
+walk takes an entry's `ntids` when none of its members lies under a container key that held a page
+not all-visible at the first look, and keeps the walk when no clean key turned dirty by the second.
+That is this argument made per container key, and it has the same hole: an aborted insert onto a
+clean key's page, pruned and marked again between the two looks, passes both tests
+(`wagg_aborted_insert_dirty.spec` on the soak branch). The same comparison closes it - each walked
+index's `bulkdeletes` read before the first look and compared after the second, falling to its
+`LION_WALK_LIVE` walk when it moved; that walk asks the map under the leaf's pin, so it needs
+nothing.
 
 ### The results, as core computes them
 

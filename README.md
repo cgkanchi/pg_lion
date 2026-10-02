@@ -193,7 +193,8 @@ With no `WHERE` and no `GROUP BY`, `sum`, `avg` (of integers), `min`, `max`, `bo
 weighted by its rows (`Aggregates Over Keys` in EXPLAIN; DESIGN.md §37): `SELECT sum(width),
 avg(width + 1) FROM t` walks `width`'s distinct values, not the table. On a table the visibility
 map calls all-visible - as after a `VACUUM` - the rows of each key are the count its entry keeps,
-and nothing else is read.
+and nothing else is read; a `VACUUM` that removes rows from the index while the walk runs, or a
+table that is not all-visible, has each key's rows counted instead.
 
 On a partitioned table the pushdown counts each partition the planner keeps, with that partition's
 own Lion indexes (DESIGN.md §16), and every `WHERE` clause needs one in every partition counted -
