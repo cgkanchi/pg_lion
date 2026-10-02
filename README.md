@@ -543,6 +543,59 @@ and then the INCLUDE columns - with NULL for a NULL, for a slot no row has writt
 cleared, and for a heap page left to the heap; it reads the store, not the heap, so it answers for
 dead and never-committed rows too.
 
+### Counts, `GROUP BY` and aggregates over stored columns
+
+`LionCount` reads the store. Under a lion `WHERE`, or with no `WHERE`, it answers a
+`count(DISTINCT c)`, a `GROUP BY c` with `count(*)` and `count(x)` per group, and `sum`, `avg`,
+`min`, `max` and `count` of a stored column, with or without a `GROUP BY`:
+
+```sql
+SELECT user_id, count(*), sum(amount), max(amount)
+  FROM events WHERE country IN ('NZ', 'AU') GROUP BY user_id;
+SELECT count(DISTINCT user_id) FROM events WHERE country = 'NZ';
+```
+
+```
+ Custom Scan (LionCount)
+   Lion Indexes: events_country_lion (country = ANY ('{NZ,AU}'::text[]))
+   Group Key: user_id
+   Store: user_id, amount
+```
+
+The node counts the rows the `WHERE` keeps exactly as for `count(*)` - or, with no `WHERE`, every
+row, over the entries of a lion column - and takes each counted row's values of the `Store:`
+columns from the store when the visibility map calls its heap page all-visible, under the same
+container pin that lets the count skip the heap there (DESIGN.md §9). A row on any other page, or
+on a page the store left to the heap (ABSENT), is fetched from the heap, which says both whether it
+is visible and what its values are; on a hot standby a generic-WAL-mode index sends every row to
+the heap. The values are hashed by the `GROUP BY` columns under their collation, so a
+case-insensitive collation groups as the query's own `HashAggregate` would. `EXPLAIN ANALYZE` adds
+`Store Rows` (rows whose values came from the store), `Store Rows From Heap`, `Store Pages Absent`
+and `Store Groups`.
+
+What it takes: every `GROUP BY` item and every aggregate argument a plain column, and all of them
+stored by one lion index (an INCLUDE column, or a scalar key column under `store_values`);
+`count(DISTINCT c)` of any hashable type; `sum` and `avg` of `int2`, `int4` and `int8` (summed in
+128 bits); `min` and `max` of any type with a sort operator, under the column's collation. The
+`WHERE` is whatever the count pushdown answers, from any lion indexes of the table, multi-key
+columns included; a `HAVING` is applied by the node. Not taken: an expression (`sum(x + 1)`,
+`GROUP BY lower(t)`), a `GROUP BY` that mixes a stored column with one that is not stored or is
+stored by another index, `sum`/`avg` of `numeric` or `float`, an aggregate with `FILTER` or
+`ORDER BY`, a partitioned table, a parallel plan, and a hash table the planner expects to exceed
+`hash_mem` (the node does not spill).
+
+The planner prices the gather at `pg_lion.store_value_cost` per value and `pg_lion.store_page_cost`
+per store page read, beside the count and the hashing, in the competitor's units (DESIGN.md §39),
+and offers it beside the walks that answer the same query; the cheaper is kept. With no `WHERE`
+and no `GROUP BY`, aggregates over key columns stay the walk of their entries (DESIGN.md §37); a
+`GROUP BY` of several key columns with no `WHERE` stays the decoded walk (§34), which
+`pg_lion.enable_decoded_walk = off` turns into a gather when the columns are stored; under a
+`WHERE` the gather is usually the cheaper. On a synthetic table of 2,000,000 all-visible rows
+(24,692 heap pages; a lion index on `k`, 100 values, `INCLUDE (g, v)`, `g` of 20,000 values),
+`SELECT g, count(*), sum(v) ... WHERE k < 10 GROUP BY g` took 28 ms against 124 ms for the bitmap
+heap scan and `HashAggregate` it replaces, and `count(DISTINCT g) ... WHERE k IN (3, 7, 11)` 11 ms
+against 53 ms (an assert-enabled build, warm cache, no parallel workers).
+
 ## Reloptions
 
 `fillfactor` (10 .. 100, default 90): how full the build packs a directory leaf.
