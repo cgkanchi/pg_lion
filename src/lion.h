@@ -474,6 +474,15 @@ StaticAssertDecl(sizeof(LionMetaPageData) == 56,
  *				its EMPTY entry, nor a summary (§32).  A key whose rows are
  *				all dead is counted until VACUUM deletes its entry: an
  *				estimate, as ANALYZE's own is.
+ *	bulkdeletes	how many ambulkdelete calls have finished on the index,
+ *				modulo 2^32 - not a count for the planner but the one word
+ *				of the area that was spare (§37, "The rows of an entry"):
+ *				the end of every call adds one, in the record that writes
+ *				the counts it took, and the aggregates over keys read it
+ *				before their first look at the visibility map and after
+ *				their second.  ANALYZE, and a VACUUM that calls no
+ *				ambulkdelete, keep it.  Zero where a build wrote the area,
+ *				and on a meta page that has none.
  *
  * Nothing in it says when it was counted: a build writes exactly the bytes
  * every other build of the same rows writes, whatever the memory, the workers
@@ -488,7 +497,7 @@ StaticAssertDecl(sizeof(LionMetaPageData) == 56,
 typedef struct LionMetaNdistinct
 {
 	uint32		valid_cols;
-	uint32		unused;			/* zero */
+	uint32		bulkdeletes;
 	uint64		rows;
 	uint64		ndistinct[LION_META_MAX_COLS];
 } LionMetaNdistinct;
@@ -1677,6 +1686,15 @@ extern void lion_meta_record_ndistinct(Page metapage,
 extern void lion_meta_write_ndistinct(Relation index,
 									  const LionMetaNdistinct *nd);
 extern bool lion_read_meta_ndistinct(Relation index, LionMetaNdistinct *nd);
+
+/*
+ * The end of an ambulkdelete call (DESIGN.md §37): add one to the meta page's
+ * bulkdeletes, in the record that writes nd beside it - or the counts the page
+ * has, when nd is NULL.  lion_meta_write_ndistinct() keeps the number as it
+ * is, and lion_read_meta_ndistinct() reads it back.
+ */
+extern void lion_meta_count_bulkdelete(Relation index,
+									   const LionMetaNdistinct *nd);
 
 /*
  * Like lion_find_entry(), but with the comparison functions the caller wants:

@@ -1374,6 +1374,7 @@ typedef struct LionWCol
 	AttrNumber	idxcol;			/* its key column in idxoid */
 	Relation	idx;			/* open while the scan runs, or NULL */
 	int			slotcol;		/* its key's column of the scan tuple, or -1 */
+	uint32		bulkdeletes;	/* idx's, at the first look (DESIGN.md §37) */
 } LionWCol;
 
 typedef struct LionWAgg
