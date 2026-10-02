@@ -413,10 +413,45 @@ lion_bitmap_reads_lion(Path *bitmapqual, Oid lionam)
 	return false;
 }
 
+static bool lion_path_is_lion_scan(Path *path);
+
+/*
+ * Is a partitioned table's scan - the Append or MergeAppend over its
+ * partitions, subpaths - a scan of lion indexes through the AM
+ * (lion_path_is_lion_scan())?  When the partitions scanned that way cost at
+ * least ten times the others: an empty partition, or one of a page or two,
+ * takes a sequential scan whose price is next to nothing, and the whole is
+ * priced by lion's model but for that; a partition scanned another way at a
+ * price that counts makes the price core's in part, where the margin's hedge
+ * still belongs.  No partition at all is not a scan of anything.
+ */
+#define LION_APPEND_OTHER_SHARE	0.1
+
+static bool
+lion_paths_are_lion_scans(List *subpaths)
+{
+	ListCell   *lc;
+	Cost		lion = 0.0;
+	Cost		other = 0.0;
+
+	foreach(lc, subpaths)
+	{
+		Path	   *sub = (Path *) lfirst(lc);
+
+		if (lion_path_is_lion_scan(sub))
+			lion += sub->total_cost;
+		else
+			other += sub->total_cost;
+	}
+	return lion > 0.0 && other <= lion * LION_APPEND_OTHER_SHARE;
+}
+
 /*
  * Is a core path a scan of a lion index through the AM - a plain, index-only
- * or bitmap scan of one, under the nodes that pass its rows up and no join?
- * Its price is lion's own model's (lioncostestimate()), with lion's errors.
+ * or bitmap scan of one, or an Append or MergeAppend of such scans of a
+ * partitioned table's partitions, under the nodes that pass its rows up and
+ * no join?  Its price is lion's own model's (lioncostestimate()), with lion's
+ * errors.
  */
 static bool
 lion_path_is_lion_scan(Path *path)
@@ -432,11 +467,13 @@ lion_path_is_lion_scan(Path *path)
 			case T_BitmapHeapPath:
 				return lion_bitmap_reads_lion(((BitmapHeapPath *) path)->bitmapqual,
 											  lionam);
+			case T_AppendPath:
+				return lion_paths_are_lion_scans(((AppendPath *) path)->subpaths);
+			case T_MergeAppendPath:
+				return lion_paths_are_lion_scans(((MergeAppendPath *) path)->subpaths);
 			case T_NestPath:
 			case T_MergePath:
 			case T_HashPath:
-			case T_AppendPath:
-			case T_MergeAppendPath:
 				return false;
 			default:
 				break;
