@@ -38,6 +38,12 @@
 #
 # Run with test/soak/findings/run-spec.sh wagg_aborted_insert; the expected
 # file holds the CORRECT answers, so the run fails while the bug is there.
+#
+# FIXED by PR #15 (claude/lion-wagg-aborted): a count of finished ambulkdelete
+# calls, kept in the meta page's spare key-count word, is read by the walk
+# before its first look at the map and after its second, and any movement
+# sends the walk to exact counting.  The branch carries this spec as a
+# test/isolation spec.
 
 setup
 {
