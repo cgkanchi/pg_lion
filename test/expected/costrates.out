@@ -271,14 +271,16 @@ SELECT n, lcr_lion(q, sw) AS plan,
 (4 rows)
 
 -- a count whose cheapest competitor is the AM's own scan of a lion index (an
--- aggregate over its plain index scan here), priced by lion's model as the
--- node is, costs the same at every margin - at a hundredth it would be core's
--- plan - and is converted at that plan's kind's rate
-SELECT lcr_lion(q) AS plan,
-	   lcr_cost(q, '{pg_lion.pushdown_margin, 0.01}') =
-	   lcr_cost(q, '{pg_lion.pushdown_margin, 1}') AS same_at_every_margin,
-	   lcr_cost(q, '{pg_lion.agg_rate, 0.5}') <
-	   lcr_cost(q, '{pg_lion.agg_rate, 1}') AS moves_with_agg_rate
+-- aggregate over its plain index scan here; bitmap scans are off so that the
+-- AM's BitmapAnd, whose price moves with the indexes' sizes, is never the
+-- cheapest), priced by lion's model as the node is, costs the same at every
+-- margin - at a hundredth it would be core's plan - and is converted at that
+-- plan's kind's rate
+SELECT lcr_lion(q, '{enable_bitmapscan, off}') AS plan,
+	   lcr_cost(q, '{enable_bitmapscan, off, pg_lion.pushdown_margin, 0.01}') =
+	   lcr_cost(q, '{enable_bitmapscan, off, pg_lion.pushdown_margin, 1}') AS same_at_every_margin,
+	   lcr_cost(q, '{enable_bitmapscan, off, pg_lion.agg_rate, 0.5}') <
+	   lcr_cost(q, '{enable_bitmapscan, off, pg_lion.agg_rate, 1}') AS moves_with_agg_rate
   FROM (VALUES ('SELECT count(*) FROM lcr WHERE g200 = 17 AND c2 = 1')) v(q);
    plan    | same_at_every_margin | moves_with_agg_rate 
 -----------+----------------------+---------------------
