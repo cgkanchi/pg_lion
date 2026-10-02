@@ -543,6 +543,53 @@ and then the INCLUDE columns - with NULL for a NULL, for a slot no row has writt
 cleared, and for a heap page left to the heap; it reads the store, not the heap, so it answers for
 dead and never-committed rows too.
 
+### `ORDER BY` a stored column `LIMIT n`
+
+Under a Lion `WHERE`, `ORDER BY` columns a Lion index stores, with a `LIMIT`, is answered from the
+store by `LionOrdered` (DESIGN.md §40, "The custom shapes", 2) - no Sort, no B-tree, and no heap
+page but the `n` rows it returns and the rows on pages that are not all-visible. Over
+`events_country_lion` above:
+
+```sql
+SELECT * FROM events WHERE country = 'NZ' ORDER BY amount DESC LIMIT 20;
+```
+```
+ Limit
+   ->  Custom Scan (LionOrdered) on events
+         Store: amount
+         Order: amount DESC NULLS FIRST
+         Lion Cond: (country = 'NZ'::text)
+         Lion Indexes: events_country_lion
+```
+
+It builds the `WHERE`'s set a 64-page window at a time and ranks every row of it as it goes: on a
+heap page the visibility map calls all-visible, by the store's value, taken while the index page
+the row came from is still pinned (the interlock of the count, §9); on any other page, on a page
+the store left to the heap, and for a clause Lion answers only as a superset (a multi-key column's,
+§29.6), by the heap row, which also settles its visibility. It keeps the best `limit + offset` in a
+bounded heap and then fetches those, in order. Rows that tie may come in any order, as from a Sort.
+`EXPLAIN ANALYZE` adds `Rows Ranked`, `Store Values` (the rows the store answered for), `Heap
+Fetches` and the set's containers.
+
+What it takes:
+
+- every `ORDER BY` key a plain column stored in one Lion index of the table - an INCLUDE column, or
+  a scalar key column under `store_values` - which is not partial, or whose predicate the query
+  implies; any direction, `NULLS FIRST` or `LAST`, any collation (`ORDER BY t COLLATE "C"`
+  included). The index need not be one the `WHERE` reads. `ORDER BY a, b` needs both stored;
+- a `WHERE` Lion answers whole - nothing left over as a filter - on the one table of the query, or
+  on each partition of a partitioned one (a Merge Append combines them);
+- a constant `LIMIT` (and `OFFSET`) at most a quarter of the rows the `WHERE` keeps, whose
+  candidates fit in `work_mem`; no `FOR UPDATE`, no `WITH TIES`, no join, `GROUP BY`, `DISTINCT` or
+  aggregate.
+
+The planner prices it against the other plans at `pg_lion.pushdown_margin`: the set, a value from
+the store for each row on an all-visible page (`pg_lion.store_value_cost`) and the store's pages a
+window (`pg_lion.store_page_cost`), a heap visit for the others, the bounded sort, and `n` random
+fetches. Where the sort column is also a Lion key column, the walk of its entries (`Ordered By`) is
+offered too and the cheaper wins: the walk when the `WHERE` keeps many rows, the store when it keeps
+few. `pg_lion.enable_ordered_store = off` turns the store order off.
+
 ## Reloptions
 
 `fillfactor` (10 .. 100, default 90): how full the build packs a directory leaf.
@@ -633,6 +680,9 @@ working around a bad choice:
 - `pg_lion.enable_lazy_set`: let `LionOrdered` evaluate its Lion set only at the ranges of 64 heap
   blocks its walk reaches, and build it for the whole table only once that has cost what the build
   would (DESIGN.md §30.4, "The set, lazily"). Off, the set is built before the walk starts.
+- `pg_lion.enable_ordered_store`: let `LionOrdered` answer `ORDER BY` stored columns `LIMIT n` from
+  a Lion index's window store (DESIGN.md §40; "`ORDER BY` a stored column `LIMIT n`" above). Off,
+  only its walks are offered.
 - `pg_lion.enable_decoded_walk`: count a `GROUP BY` of several Lion-indexed columns by decoding,
   at each range of 64 heap blocks, which value of each column every row has (DESIGN.md §34): three
   or more columns, and two where that is cheaper than the nested loop over their entries. Off, a
