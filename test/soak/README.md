@@ -87,7 +87,8 @@ quarters of the traffic on `soak.t`), alternating two phases:
   to back the heap keeps coming back to all-visible, which is the state the
   aggregates over keys (§37) trust the entries' own counts in - and an aborted
   write is the one change VACUUM may undo under a snapshot that holds it back
-  (`findings/wagg_aborted_insert.spec`).
+  (`findings/wagg_aborted_insert.spec`; fixed by PR #15,
+  `claude/lion-wagg-aborted`).
 
 pgbench retries deadlocks (`--max-tries`); any other error a client stops on is
 a FAIL.
@@ -224,9 +225,13 @@ do; they run in a database of their own (`lion_findings`).
   the very index the walk is reading follows the walk at much the same pace.
   The soaks of 2026-10-01 took that path about a thousand times without a
   wrong answer; `findings/wagg_aborted_insert.spec` parks the walk and gets
-  one every time.  That is what the injection-point specs are for.  The rounds are seeded (`--seed`, `setseed()`
-  per reader iteration), but thread scheduling is not reproducible; what is,
-  is the finding's spec.
+  one every time.  That is what the injection-point specs are for.  (PR #15,
+  `claude/lion-wagg-aborted`, fixes it: the walk reads a count of finished
+  `ambulkdelete` calls, kept in the meta page, before its first look at the
+  map and after its second, and counts exactly if it moved; the spec becomes
+  a `test/isolation` spec there.)  The rounds are seeded (`--seed`,
+  `setseed()` per reader iteration), but thread scheduling is not
+  reproducible; what is, is the finding's spec.
 - The dev cluster runs `synchronous_commit = off`: a page whose newest commit
   is not yet flushed cannot be marked all-visible (core sets no hint bit for
   it), which delays the all-visible state the abort phase aims at by up to

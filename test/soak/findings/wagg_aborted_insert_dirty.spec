@@ -16,6 +16,11 @@
 #  * the rest as in wagg_aborted_insert.spec.
 #
 # Expected (correct) result: s1's answer equals s3_reference's.
+#
+# PR #15 (claude/lion-wagg-aborted) fixes main's walk: a VACUUM's bulk delete
+# between the two looks at the map, counted in the meta page, sends the walk
+# to exact counting.  A branch with the dirty-key walk needs the same check
+# on that walk; this spec is the test of it.
 
 setup
 {
