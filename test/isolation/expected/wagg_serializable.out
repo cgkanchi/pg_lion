@@ -1,0 +1,65 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s2_begin s1_sum s2_sum s1_delete s2_delete s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_sum: SELECT ws_sum();
+ws_sum            
+------------------
+4500, entry counts
+(1 row)
+
+step s2_sum: SELECT ws_sum();
+ws_sum            
+------------------
+4500, entry counts
+(1 row)
+
+step s1_delete: DELETE FROM ws WHERE ctid = '(0,1)';
+step s2_delete: DELETE FROM ws WHERE ctid = '(0,2)';
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_dirty s1_begin s2_begin s1_sum s2_sum s1_delete s2_delete s1_commit s2_commit
+step s1_dirty: DELETE FROM ws WHERE ctid = '(4,1)';
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_sum: SELECT ws_sum();
+ws_sum                  
+------------------------
+4496, each entry counted
+(1 row)
+
+step s2_sum: SELECT ws_sum();
+ws_sum                  
+------------------------
+4496, each entry counted
+(1 row)
+
+step s1_delete: DELETE FROM ws WHERE ctid = '(0,1)';
+step s2_delete: DELETE FROM ws WHERE ctid = '(0,2)';
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_sum s2_sum s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_sum: SELECT ws_sum();
+ws_sum            
+------------------
+4500, entry counts
+(1 row)
+
+step s2_sum: SELECT ws_sum();
+ws_sum            
+------------------
+4500, entry counts
+(1 row)
+
+step s1_insert: INSERT INTO ws VALUES (100);
+step s2_insert: INSERT INTO ws VALUES (200);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
