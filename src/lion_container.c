@@ -4801,7 +4801,7 @@ lion_container_check(const LionContainer *c, Size avail_bytes, const char **errm
 	if (c->type == LION_CT_NARROW)
 	{
 		if (!lion_container_width_valid(c))
-			LION_CHECK_FAIL("narrow container width is not 1 .. LION_NARROW_MAX_WIDTH");
+			LION_CHECK_FAIL("narrow container width is out of range for the block size");
 	}
 	else if (c->flags != 0)
 		LION_CHECK_FAIL("container flags are not zero");
