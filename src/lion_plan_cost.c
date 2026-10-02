@@ -11,6 +11,7 @@
 #include "postgres.h"
 
 #include "lion_customscan.h"
+#include "lion_store.h"
 
 static LionQueryMode lion_multikey_cost_mode_ex(IndexOptInfo *idx,
 												AttrNumber col, Node *clause,
@@ -73,6 +74,29 @@ lion_index_dir_pages(IndexOptInfo *idx, double *height)
 
 	index_close(indexrel, AccessShareLock);
 	return Max(dirpages, 1.0);
+}
+
+/*
+ * The pages of idx's window store (DESIGN.md §40): the map and store pages
+ * the meta page's record counts, which the build sets and every page added
+ * or freed keeps exact - 0 for an index that stores nothing - and in
+ * *nstored how many columns it stores.  They are no posting pages: every
+ * formula below that takes the posting pages as what is left of the index
+ * after its meta page and its directory takes these out too.
+ */
+double
+lion_index_store_pages(IndexOptInfo *idx, int *nstored)
+{
+	Relation	indexrel = index_open(idx->indexoid, AccessShareLock);
+	LionMetaPageData meta;
+	LionMetaStore store;
+
+	lion_read_meta(indexrel, &meta);
+	lion_read_meta_store(indexrel, &meta, &store);
+	index_close(indexrel, AccessShareLock);
+	if (nstored != NULL)
+		*nstored = pg_popcount32(store.store_cols);
+	return (double) store.store_pages;
 }
 
 /* A key column's n_distinct, or -1 for an expression column. */
@@ -842,7 +866,8 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	share = lion_index_column_share(root, rel, idx, col);
 	dirpages = lion_index_dir_pages(idx, &height);
 
-	container_pages = ((double) idx->pages - 1.0 - dirpages) *
+	container_pages = ((double) idx->pages - 1.0 - dirpages -
+					   lion_index_store_pages(idx, NULL)) *
 		lion_index_column_posting_share(root, rel, idx, col);
 	container_pages = Max(container_pages, 0.0);
 	dirpages = Max(dirpages * share, 1.0);

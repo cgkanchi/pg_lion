@@ -283,7 +283,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	/* ---- one lookup and one count per dimension row ---- */
 	share = lion_index_column_share(root, rel, fkidx, fkcol);
 	dirpages = lion_index_dir_pages(fkidx, &height);
-	container_pages = Max(((double) fkidx->pages - 1.0 - dirpages) *
+	container_pages = Max(((double) fkidx->pages - 1.0 - dirpages -
+						   lion_index_store_pages(fkidx, NULL)) *
 						  lion_index_column_posting_share(root, rel, fkidx,
 														  fkcol), 0.0);
 	dirpages = Max(dirpages * share, 1.0);
@@ -426,7 +427,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		cshare = lion_index_column_share(root, rel, idx,
 										 (AttrNumber) lfirst_int(lc4));
 		cdir = lion_index_dir_pages(idx, &cheight);
-		cpages = Max(((double) idx->pages - 1.0 - cdir) *
+		cpages = Max(((double) idx->pages - 1.0 - cdir -
+					  lion_index_store_pages(idx, NULL)) *
 					 lion_index_column_posting_share(root, rel, idx,
 													 (AttrNumber) lfirst_int(lc4)),
 					 0.0);
