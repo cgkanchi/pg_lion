@@ -163,6 +163,58 @@ extern void lion_store_insert(Relation index, Relation heaprel,
 							  LionIndexState *ix, ItemPointer tid,
 							  const Datum *values, const bool *isnull);
 
+/* ---------- VACUUM (lion_vacuum.c) ---------- */
+
+/* Mark a block accounted for in VACUUM's walk (the sweep leaves it alone). */
+typedef void (*LionStoreVisit) (void *arg, BlockNumber blk);
+
+typedef struct LionStoreVacStats
+{
+	int64		pages;			/* store pages visited */
+	int64		mappages;		/* map pages visited */
+	int64		cleared;		/* slots cleared */
+	int64		rewritten;		/* pages rewritten */
+	int64		records;		/* WAL records written */
+} LionStoreVacStats;
+
+/*
+ * ambulkdelete's pass over the store (DESIGN.md §40, "VACUUM"): every map and
+ * store page reachable from the root is visited once and marked, and, when
+ * `write`, every written slot whose TID the callback calls dead is cleared,
+ * under an EXCLUSIVE lock on its page.  A VACUUM that may not write the
+ * index (an rmgr-mode index without the preload) only visits.
+ */
+extern void lion_store_bulkdelete(Relation index, LionIndexState *ix,
+								  IndexBulkDeleteCallback callback,
+								  void *callback_state, bool write,
+								  LionStoreVisit visit, void *visitarg,
+								  LionStoreVacStats *st);
+
+/*
+ * amvacuumcleanup's: clear the map slots of the windows that begin at or past
+ * the heap's end, and free their chains through the DELETED protocol of
+ * §18.  Takes the heap's extension lock for the part that must not race an
+ * insert (see the function).  Returns the pages freed.
+ */
+extern int64 lion_store_vacuum_cleanup(Relation index, Relation heaprel,
+									   LionIndexState *ix);
+
+/*
+ * The leak sweep's question about a live STORE page VACUUM's walk did not
+ * reach (lion_vacuum_sweep()): is it on the chain its special area names?
+ * Asked with nothing held.  A page that is not is an orphan of an interrupted
+ * cleanup, which the sweep frees with lion_store_free_page().
+ */
+extern bool lion_store_page_linked(Relation index, LionIndexState *ix,
+								   BlockNumber blk, uint32 ckey, uint16 ord);
+
+/*
+ * Mark the store page in buf, which the caller holds EXCLUSIVE, DELETED, take
+ * it off the meta page's count and hand it to the free space map.  buf is
+ * released.
+ */
+extern void lion_store_free_page(Relation index, Buffer buf);
+
 /* ---------- page access for lion_index_stats() and verify() ---------- */
 
 /*

@@ -2,8 +2,8 @@
  *
  * lion_store.c
  *		The window store (DESIGN.md §40): which columns are stored, the
- *		format of the map and of a store page, the build's emitter and the
- *		insert path.
+ *		format of the map and of a store page, the build's emitter, the
+ *		insert path and VACUUM's pass over it.
  *
  * lion_store.h describes the structures and their locking; lion_store_fmt.h
  * the bytes of a store page.  The code is in this order:
@@ -17,6 +17,7 @@
  *	4. the window map
  *	5. the build
  *	6. the insert path
+ *	7. VACUUM
  *
  * Every page change goes through the WAL shim of DESIGN.md §25: in rmgr mode
  * a LION_XLOG_STORE record made of the existing operations (INIT, ADD,
@@ -2518,4 +2519,613 @@ lion_store_insert(Relation index, Relation heaprel, LionIndexState *ix,
 	for (ord = 0; ord < ix->nstored; ord++)
 		lion_store_write(index, heaprel, ix, &ix->stored[ord], ckey, k, off,
 						 &vals[ord]);
+}
+
+/* ---------------------------------------------------------------------
+ * 7. VACUUM (DESIGN.md §40, "VACUUM")
+ * --------------------------------------------------------------------- */
+
+/*
+ * Mark the store page in buf (EXCLUSIVE) DELETED and take it off the meta
+ * page's count, in one record; buf is released.  The free space map is the
+ * caller's, so that a caller holding the heap's extension lock can defer it.
+ */
+static void
+lion_store_delete_page(Relation index, Buffer buf)
+{
+	FullTransactionId safexid = ReadNextFullTransactionId();
+	Buffer		metabuf = lion_store_lock_meta(index);
+	LionWalState *xs;
+	Page		p;
+
+	Assert(LionPageIsStore(BufferGetPage(buf)) &&
+		   !LionPageIsDeleted(BufferGetPage(buf)));
+	xs = lion_wal_begin(index);
+	p = lion_wal_register_buffer(xs, buf, LION_WALBUF_STD);
+	lion_page_set_deleted(p, safexid);
+	lion_wal_op(xs, p, LION_OP_DELETED, 0, 0, &safexid, sizeof(FullTransactionId));
+	lion_store_meta_count(xs, metabuf, -1);
+	lion_wal_finish(xs, LION_XLOG_STORE);
+
+	UnlockReleaseBuffer(buf);
+	UnlockReleaseBuffer(metabuf);
+}
+
+void
+lion_store_free_page(Relation index, Buffer buf)
+{
+	BlockNumber blk = BufferGetBlockNumber(buf);
+
+	lion_store_delete_page(index, buf);
+	RecordFreeIndexPage(index, blk);
+}
+
+/*
+ * Clear the dead slots of the store page in buf (EXCLUSIVE, checked), in
+ * place or by a rewrite.
+ */
+static void
+lion_store_vacuum_page(Relation index, const LionStoreCol *col, Buffer buf,
+					   IndexBulkDeleteCallback callback, void *callback_state,
+					   LionStoreVacStats *st)
+{
+	Page		page = BufferGetPage(buf);
+	LionStoreHeader h;
+	BlockNumber first;
+	bool	   *dead[LION_BLOCKS_PER_CONTAINER];
+	int64		written = 0;
+	int64		ndead = 0;
+	int			k;
+
+	memcpy(&h, lion_store_page_header(page), sizeof(LionStoreHeader));
+	first = lion_ckey_first_block(h.ckey);
+
+	/* which written slots are dead: one callback per written slot */
+	for (k = h.lo; k <= h.hi; k++)
+	{
+		Size		len;
+		LionStoreSub *s = lion_store_page_sub(page, k, &len);
+		const uint8 *body = (const uint8 *) s + sizeof(LionStoreSub);
+		uint32		i;
+
+		dead[k] = NULL;
+		if ((s->flags & LION_STORE_ABSENT) != 0)
+			continue;
+		for (i = 0; i < s->nslots; i++)
+		{
+			ItemPointerData tid;
+			bool		isnull;
+
+			if (h.mode == LION_STORE_DICT)
+				isnull = (lion_store_code_get(body, h.width, i) == 0);
+			else
+				isnull = lion_store_null_get(body + (Size) s->nslots * h.width, i);
+			if (isnull)
+				continue;		/* NULL, never written, or cleared */
+			written++;
+			ItemPointerSet(&tid, first + k, (OffsetNumber) (i + 1));
+			if (callback(&tid, callback_state))
+			{
+				if (dead[k] == NULL)
+					dead[k] = (bool *) palloc0(sizeof(bool) * s->nslots);
+				dead[k][i] = true;
+				ndead++;
+			}
+		}
+	}
+	if (ndead == 0)
+		return;
+	st->cleared += ndead;
+
+	if (ndead * 4 >= written)
+	{
+		/*
+		 * A quarter of the page is dead: write it again from its live
+		 * values, which drops the dictionary entries nothing names any more,
+		 * in whichever mode is smaller now (§40).
+		 */
+		char	   *copy = (char *) palloc(BLCKSZ);
+		LionStoreModel m;
+		LionStoreDictSet ds;
+		LionStoreImage img;
+		LionStoreImage other;
+		bool		have;
+		bool		haveother = false;
+
+		memcpy(copy, page, BLCKSZ);
+		lion_store_decode(index, col, (Page) copy, BufferGetBlockNumber(buf), &m);
+		for (k = h.lo; k <= h.hi; k++)
+		{
+			uint32		i;
+
+			if (dead[k] == NULL)
+				continue;
+			for (i = 0; i < m.nslots[k]; i++)
+				if (dead[k][i])
+				{
+					m.slots[k][i].data = NULL;
+					m.slots[k][i].len = 0;
+				}
+		}
+		lion_store_dset_init(&ds, CurrentMemoryContext);
+		have = lion_store_encode(col, &m, h.lo, h.hi, h.mode, &ds, &img);
+		if (h.mode == LION_STORE_RAW || col->rawwidth > 0)
+			haveother = lion_store_encode(col, &m, h.lo, h.hi,
+										  h.mode == LION_STORE_RAW ?
+										  LION_STORE_DICT : LION_STORE_RAW,
+										  &ds, &other);
+		if (haveother && (!have || other.need < img.need))
+		{
+			img = other;
+			have = true;
+		}
+		if (!have)
+			elog(ERROR, "lion store: a page with its dead slots cleared does not fit a page");
+		lion_store_rewrite(index, buf, &img);
+		st->rewritten++;
+		st->records++;
+		return;
+	}
+
+	/* Fewer: clear each in place, a SETBYTES per sub-array. */
+	{
+		LionWalState *xs = lion_wal_begin(index);
+		Page		p = lion_wal_register_buffer(xs, buf, LION_WALBUF_STD);
+
+		for (k = h.lo; k <= h.hi; k++)
+		{
+			Size		len;
+			LionStoreSub *s;
+			uint8	   *body;
+			Size		lowbyte = PG_UINT16_MAX;
+			Size		highbyte = 0;
+			uint32		i;
+
+			if (dead[k] == NULL)
+				continue;
+			s = lion_store_page_sub(p, k, &len);
+			body = (uint8 *) s + sizeof(LionStoreSub);
+			for (i = 0; i < s->nslots; i++)
+			{
+				Size		b;
+
+				if (!dead[k][i])
+					continue;
+				if (h.mode == LION_STORE_DICT)
+				{
+					lion_store_code_set(body, h.width, i, 0);
+					b = lion_store_code_byte(h.width, i);
+					lowbyte = Min(lowbyte, b);
+					highbyte = Max(highbyte, b + (h.width == 16 ? 1 : 0));
+				}
+				else
+				{
+					uint8	   *slot = body + (Size) i * h.width;
+
+					/* the bytes too, so that nothing of a dead row stays */
+					memset(slot, 0, h.width);
+					lowbyte = Min(lowbyte, (Size) i * h.width);
+					lion_store_null_set(body + (Size) s->nslots * h.width, i, true);
+					b = (Size) s->nslots * h.width + i / 8;
+					highbyte = Max(highbyte, b);
+				}
+			}
+			lion_wal_op(xs, p, LION_OP_SETBYTES,
+						(OffsetNumber) (LION_STORE_SUB_FIRST + k - h.lo),
+						(uint16) (sizeof(LionStoreSub) + lowbyte),
+						body + lowbyte, highbyte - lowbyte + 1);
+		}
+		lion_wal_finish(xs, LION_XLOG_STORE);
+		st->records++;
+	}
+}
+
+/* Copy the one item of map page blk, checked, into entries. */
+static void
+lion_storemap_copy(Relation index, BlockNumber blk, uint16 level,
+				   uint64 number, BlockNumber *entries)
+{
+	Buffer		buf = ReadBuffer(index, blk);
+	Page		page;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	lion_storemap_check(index, page, blk, level, number);
+	memcpy(entries, lion_storemap_entries(page), LION_STOREMAP_ITEM_SIZE);
+	UnlockReleaseBuffer(buf);
+}
+
+/*
+ * Walk the whole map, calling fn for every map page and every nonzero leaf
+ * slot from slot `from` on.  The pages' items are copied under a SHARE lock
+ * and the slots acted on with nothing held.
+ */
+typedef void (*LionStoreSlotFn) (void *arg, uint64 slot, BlockNumber head);
+
+static void
+lion_storemap_walk(Relation index, LionIndexState *ix, uint64 from,
+				   LionStoreVisit visit, void *visitarg,
+				   LionStoreSlotFn fn, void *fnarg, int64 *mappages)
+{
+	BlockNumber root = ix->store.store_root;
+	BlockNumber *rootents = (BlockNumber *) palloc(LION_STOREMAP_ITEM_SIZE);
+	BlockNumber *innerents = (BlockNumber *) palloc(LION_STOREMAP_ITEM_SIZE);
+	BlockNumber *leafents = (BlockNumber *) palloc(LION_STOREMAP_ITEM_SIZE);
+	uint64		fromleaf = from / LION_STOREMAP_FANOUT;
+	uint32		a;
+
+	lion_storemap_copy(index, root, LION_STOREMAP_ROOT, 0, rootents);
+	if (visit != NULL)
+		visit(visitarg, root);
+	if (mappages != NULL)
+		(*mappages)++;
+
+	for (a = (uint32) (fromleaf / LION_STOREMAP_FANOUT); a < LION_STOREMAP_FANOUT; a++)
+	{
+		uint32		b;
+
+		if (rootents[a] == 0)
+			continue;
+		lion_storemap_copy(index, rootents[a], LION_STOREMAP_INNER, a, innerents);
+		if (visit != NULL)
+			visit(visitarg, rootents[a]);
+		if (mappages != NULL)
+			(*mappages)++;
+
+		for (b = 0; b < LION_STOREMAP_FANOUT; b++)
+		{
+			uint64		leafno = (uint64) a * LION_STOREMAP_FANOUT + b;
+			uint32		c;
+
+			if (innerents[b] == 0 || leafno < fromleaf)
+				continue;
+			lion_storemap_copy(index, innerents[b], LION_STOREMAP_LEAF, leafno,
+							   leafents);
+			if (visit != NULL)
+				visit(visitarg, innerents[b]);
+			if (mappages != NULL)
+				(*mappages)++;
+
+			for (c = 0; c < LION_STOREMAP_FANOUT; c++)
+			{
+				uint64		slot = leafno * LION_STOREMAP_FANOUT + c;
+
+				if (leafents[c] == 0 || leafents[c] == LION_METAPAGE_BLKNO ||
+					slot < from)
+					continue;
+				if (fn != NULL)
+					fn(fnarg, slot, leafents[c]);
+			}
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
+
+	pfree(leafents);
+	pfree(innerents);
+	pfree(rootents);
+}
+
+typedef struct LionStoreVacArg
+{
+	Relation	index;
+	LionIndexState *ix;
+	IndexBulkDeleteCallback callback;
+	void	   *callback_state;
+	bool		write;
+	LionStoreVisit visit;
+	void	   *visitarg;
+	LionStoreVacStats *st;
+	MemoryContext pagecxt;
+} LionStoreVacArg;
+
+/* One window's chain for one column: visit each page, clear its dead slots. */
+static void
+lion_store_vacuum_chain(void *arg, uint64 slot, BlockNumber head)
+{
+	LionStoreVacArg *va = (LionStoreVacArg *) arg;
+	uint32		ckey = (uint32) (slot / (uint64) va->ix->nstored);
+	int			ord = (int) (slot % (uint64) va->ix->nstored);
+	const LionStoreCol *col = &va->ix->stored[ord];
+	BlockNumber blk = head;
+	int			steps = 0;
+
+	while (BlockNumberIsValid(blk))
+	{
+		Buffer		buf = ReadBuffer(va->index, blk);
+		Page		page;
+		BlockNumber next;
+		MemoryContext old;
+
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+
+		/*
+		 * A chain is freed only by amvacuumcleanup, which never runs beside
+		 * this, so every page of it is this window's.
+		 */
+		if (!lion_store_page_owned(page, ckey, (uint16) ord) ||
+			(blk == head && lion_store_check_header(page, col) == NULL &&
+			 lion_store_page_header(page)->lo != 0))
+		{
+			UnlockReleaseBuffer(buf);
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": block %u on the store chain of window %u column %d is not one of its pages",
+							RelationGetRelationName(va->index), blk, ckey,
+							col->attno),
+					 errhint("REINDEX the index.")));
+		}
+		lion_store_check_or_error(va->index, page, blk, col, true);
+		va->visit(va->visitarg, blk);
+		va->st->pages++;
+
+		old = MemoryContextSwitchTo(va->pagecxt);
+		if (va->write)
+			lion_store_vacuum_page(va->index, col, buf, va->callback,
+								   va->callback_state, va->st);
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(va->pagecxt);
+
+		next = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
+		UnlockReleaseBuffer(buf);
+		if (BlockNumberIsValid(next))
+			lion_store_chain_step(va->index, blk, next, &steps);
+		blk = next;
+		lion_vacuum_delay_point();
+	}
+}
+
+void
+lion_store_bulkdelete(Relation index, LionIndexState *ix,
+					  IndexBulkDeleteCallback callback, void *callback_state,
+					  bool write, LionStoreVisit visit, void *visitarg,
+					  LionStoreVacStats *st)
+{
+	LionStoreVacArg va;
+
+	Assert(ix->nstored > 0);
+	va.index = index;
+	va.ix = ix;
+	va.callback = callback;
+	va.callback_state = callback_state;
+	va.write = write;
+	va.visit = visit;
+	va.visitarg = visitarg;
+	va.st = st;
+	va.pagecxt = AllocSetContextCreate(CurrentMemoryContext,
+									   "lion store vacuum page",
+									   ALLOCSET_DEFAULT_SIZES);
+	lion_storemap_walk(index, ix, 0, visit, visitarg,
+					   lion_store_vacuum_chain, &va, &st->mappages);
+	MemoryContextDelete(va.pagecxt);
+}
+
+/* The slots and heads amvacuumcleanup found past the heap's end. */
+typedef struct LionStoreDoomed
+{
+	int			n;
+	int			cap;
+	uint64	   *slots;
+	BlockNumber *heads;
+} LionStoreDoomed;
+
+static void
+lion_store_doom(void *arg, uint64 slot, BlockNumber head)
+{
+	LionStoreDoomed *d = (LionStoreDoomed *) arg;
+
+	if (d->n >= d->cap)
+	{
+		d->cap = Max(16, d->cap * 2);
+		d->slots = (uint64 *) repalloc_array(d->slots, uint64, d->cap);
+		d->heads = (BlockNumber *) repalloc_array(d->heads, BlockNumber, d->cap);
+	}
+	d->slots[d->n] = slot;
+	d->heads[d->n] = head;
+	d->n++;
+}
+
+/*
+ * Free a chain from its head on, which nothing can reach any more: the map
+ * slot is cleared and the head, when deleted is set, is DELETED already.
+ */
+static int64
+lion_store_free_chain(Relation index, uint32 ckey, uint16 ord,
+					  BlockNumber blk, int steps)
+{
+	int64		freed = 0;
+
+	while (BlockNumberIsValid(blk))
+	{
+		Buffer		buf = ReadBuffer(index, blk);
+		Page		page;
+		BlockNumber next;
+
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		if (!lion_store_page_owned(page, ckey, ord))
+		{
+			/* gone already: a cleanup before this one got this far */
+			UnlockReleaseBuffer(buf);
+			break;
+		}
+		next = LionPageGetOpaque(page)->rightlink;
+		lion_store_free_page(index, buf);
+		freed++;
+		if (BlockNumberIsValid(next))
+			lion_store_chain_step(index, blk, next, &steps);
+		blk = next;
+	}
+	return freed;
+}
+
+int64
+lion_store_vacuum_cleanup(Relation index, Relation heaprel, LionIndexState *ix)
+{
+	LionStoreDoomed d;
+	BlockNumber nblocks;
+	uint32		firstwin;
+	BlockNumber *nexts;
+	int64		freed = 0;
+	int			i;
+
+	Assert(ix->nstored > 0);
+
+	/*
+	 * The windows past the heap's end now.  The heap does not shrink while
+	 * VACUUM runs (it truncates after this), so these are a superset of the
+	 * ones past it under the lock below, and an index with none - every index
+	 * whose heap was not truncated - takes no lock at all.
+	 */
+	nblocks = RelationGetNumberOfBlocks(heaprel);
+	firstwin = (uint32) ((nblocks + LION_BLOCKS_PER_CONTAINER - 1) /
+						 LION_BLOCKS_PER_CONTAINER);
+	memset(&d, 0, sizeof(d));
+	d.cap = 16;
+	d.slots = palloc_array(uint64, d.cap);
+	d.heads = palloc_array(BlockNumber, d.cap);
+	lion_storemap_walk(index, ix,
+					   lion_storemap_slot(firstwin, ix->nstored, 0),
+					   NULL, NULL, lion_store_doom, &d, NULL);
+	if (d.n == 0)
+		return 0;
+
+	/*
+	 * Under the heap's extension lock no heap page can be added, so no row
+	 * can be inserted into a window that has no heap page, and no insert
+	 * into one can be under way: its heap tuple would be on a page that does
+	 * not exist.  While it is held, clear the slots and delete the heads; an
+	 * insert into such a window afterwards finds the slot clear, or a cached
+	 * head DELETED, and starts a new chain (§40, "VACUUM").  Without the lock
+	 * an insert could write into a chain this is about to free, and a later
+	 * insert would start a new chain whose other slots read as NULL, which
+	 * for that first row would be wrong.  Nothing in here takes a heavyweight
+	 * lock, which the extension lock forbids: the free space map is told
+	 * about the heads after it is released.
+	 */
+	nexts = palloc_array(BlockNumber, d.n);
+	LockRelationForExtension(heaprel, ExclusiveLock);
+	nblocks = RelationGetNumberOfBlocks(heaprel);
+	firstwin = (uint32) ((nblocks + LION_BLOCKS_PER_CONTAINER - 1) /
+						 LION_BLOCKS_PER_CONTAINER);
+	for (i = 0; i < d.n; i++)
+	{
+		uint64		slot = d.slots[i];
+		uint32		ckey = (uint32) (slot / (uint64) ix->nstored);
+		uint16		ord = (uint16) (slot % (uint64) ix->nstored);
+		uint64		leafno = slot / LION_STOREMAP_FANOUT;
+		uint32		e = (uint32) (slot % LION_STOREMAP_FANOUT);
+		BlockNumber leafblk;
+		Buffer		buf;
+		Page		page;
+		LionWalState *xs;
+		Page		p;
+		BlockNumber zero = 0;
+
+		nexts[i] = InvalidBlockNumber;
+		if (ckey < firstwin)
+		{
+			d.heads[i] = InvalidBlockNumber;
+			continue;
+		}
+
+		/* the slot: one record on the map leaf */
+		leafblk = lion_storemap_leaf(index, ix->store.store_root, leafno, NULL);
+		Assert(BlockNumberIsValid(leafblk));
+		buf = ReadBuffer(index, leafblk);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		lion_storemap_check(index, page, leafblk, LION_STOREMAP_LEAF, leafno);
+		if (lion_storemap_entries(page)[e] != d.heads[i])
+		{
+			UnlockReleaseBuffer(buf);
+			d.heads[i] = InvalidBlockNumber;
+			continue;
+		}
+		xs = lion_wal_begin(index);
+		p = lion_wal_register_buffer(xs, buf, LION_WALBUF_STD);
+		lion_storemap_entries(p)[e] = 0;
+		lion_wal_op(xs, p, LION_OP_SETBYTES, FirstOffsetNumber,
+					(uint16) (e * sizeof(BlockNumber)), &zero, sizeof(BlockNumber));
+		lion_wal_finish(xs, LION_XLOG_STORE);
+		UnlockReleaseBuffer(buf);
+
+		/* the head, DELETED, so that a cached copy of the slot finds nothing */
+		buf = ReadBuffer(index, d.heads[i]);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		if (!lion_store_page_owned(page, ckey, ord))
+		{
+			UnlockReleaseBuffer(buf);
+			d.heads[i] = InvalidBlockNumber;
+			continue;
+		}
+		nexts[i] = LionPageGetOpaque(page)->rightlink;
+		lion_store_delete_page(index, buf);
+		freed++;
+	}
+	UnlockRelationForExtension(heaprel, ExclusiveLock);
+
+	/* The rest of each chain is out of everybody's reach now. */
+	for (i = 0; i < d.n; i++)
+	{
+		uint32		ckey = (uint32) (d.slots[i] / (uint64) ix->nstored);
+		uint16		ord = (uint16) (d.slots[i] % (uint64) ix->nstored);
+
+		if (!BlockNumberIsValid(d.heads[i]))
+			continue;
+		RecordFreeIndexPage(index, d.heads[i]);
+		if (BlockNumberIsValid(nexts[i]))
+			freed += lion_store_free_chain(index, ckey, ord, nexts[i], 1);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	return freed;
+}
+
+bool
+lion_store_page_linked(Relation index, LionIndexState *ix, BlockNumber blk,
+					   uint32 ckey, uint16 ord)
+{
+	uint64		slot;
+	BlockNumber head;
+	BlockNumber cur;
+	int			steps = 0;
+
+	if ((int) ord >= ix->nstored)
+		return false;			/* not a column this index stores */
+	slot = lion_storemap_slot(ckey, ix->nstored, ord);
+	head = lion_storemap_head(index, ix->store.store_root, slot, NULL);
+
+	cur = head;
+	while (BlockNumberIsValid(cur))
+	{
+		Buffer		buf;
+		Page		page;
+		BlockNumber next;
+
+		if (cur == blk)
+			return true;
+		buf = ReadBuffer(index, cur);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!lion_store_page_owned(page, ckey, ord))
+		{
+			/*
+			 * The chain is not what it should be.  This question decides
+			 * whether a page is freed, so a doubt answers "linked".
+			 */
+			UnlockReleaseBuffer(buf);
+			return true;
+		}
+		next = LionPageGetOpaque(page)->rightlink;
+		UnlockReleaseBuffer(buf);
+		if (BlockNumberIsValid(next))
+		{
+			if (next == cur || ++steps >= LION_BLOCKS_PER_CONTAINER)
+				return true;
+		}
+		cur = next;
+	}
+	return false;
 }
