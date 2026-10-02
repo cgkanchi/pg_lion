@@ -40,14 +40,15 @@ setup
 	CREATE EXTENSION IF NOT EXISTS pg_lion;
 	CREATE EXTENSION IF NOT EXISTS injection_points;
 	/* The padding is what makes a container key hold few enough rows for a
-	 * leaf to carry SEVERAL containers: eight arrays of ~970 bytes, so that
+	 * leaf to carry SEVERAL containers: arrays of ~970 bytes, so that
 	 * growing them is what splits the page rather than one bitset per leaf.
-	 * 15 rows a page, 480 of k = 1's a key: an ARRAY, where 24 rows a page
-	 * made 768, a NARROW of fixed size that an insert below offset 128 does
-	 * not grow (DESIGN.md §38). */
+	 * 15 rows a page, 480 of k = 1's a key.  The index is made before the
+	 * rows, so that the inserts make it, as ARRAYs: a build would make each
+	 * a NARROW of width 1 (DESIGN.md §38), 520 bytes, which an insert below
+	 * offset 64 does not grow. */
 	CREATE TABLE psr (id int, k int NOT NULL, pad char(480));
-	INSERT INTO psr SELECT i, i % 2, '' FROM generate_series(1, 100000) i;
 	CREATE INDEX psr_k ON psr USING lion (k);
+	INSERT INTO psr SELECT i, i % 2, '' FROM generate_series(1, 100000) i;
 }
 
 teardown
