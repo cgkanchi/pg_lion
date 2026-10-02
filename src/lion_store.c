@@ -2,7 +2,8 @@
  *
  * lion_store.c
  *		The window store (DESIGN.md §40): which columns are stored, the
- *		format of the map and of a store page, and the build's emitter.
+ *		format of the map and of a store page, the build's emitter and the
+ *		insert path.
  *
  * lion_store.h describes the structures and their locking; lion_store_fmt.h
  * the bytes of a store page.  The code is in this order:
@@ -15,8 +16,14 @@
  *	   through it, so that there is one encoder and one decoder
  *	4. the window map
  *	5. the build
+ *	6. the insert path
  *
- * The build writes its pages through the bulk writer, which logs them whole.
+ * Every page change goes through the WAL shim of DESIGN.md §25: in rmgr mode
+ * a LION_XLOG_STORE record made of the existing operations (INIT, ADD,
+ * ADDMANY, REPLACE/DELTA, SETBYTES, SPECIAL, DELETED) and LION_OP_STORE_META
+ * for the meta page's count; in generic mode a GenericXLog record.  Pages are
+ * allocated (lion_alloc_page()) and the meta page locked before a record
+ * opens, because in rmgr mode the record is a critical section.
  *
  *-------------------------------------------------------------------------
  */
@@ -582,6 +589,75 @@ lion_store_page_check_codes(Page page)
 	return NULL;
 }
 
+/* ERROR for a page that claims to be the store of (ckey, ord) and is not sound. */
+static void
+lion_store_check_or_error(Relation index, Page page, BlockNumber blk,
+						  const LionStoreCol *col, bool full)
+{
+	char	   *msg = full ? lion_store_page_check(page, col) :
+		lion_store_check_header(page, col);
+
+	if (msg != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": store page %u %s",
+						RelationGetRelationName(index), blk, msg),
+				 errhint("REINDEX the index.")));
+}
+
+/*
+ * Dictionary entry c (1-based) of a checked DICT page, its bounds checked:
+ * a varlena dictionary's offsets are not all checked on every lock.
+ */
+static const char *
+lion_store_dict_entry(Relation index, const LionStoreCol *col,
+					  const char *ditem, Size dlen, uint32 ndict, uint32 c,
+					  uint32 *len)
+{
+	Assert(c >= 1 && c <= ndict);
+	if (col->typlen > 0)
+	{
+		*len = (uint32) col->typlen;
+		return ditem + sizeof(LionStoreDict) + (Size) (c - 1) * col->typlen;
+	}
+	else
+	{
+		LionStoreDict d;
+		uint32		start = lion_store_vdict_off(ditem, dlen, ndict, c - 1);
+		uint32		end = lion_store_vdict_off(ditem, dlen, ndict, c);
+
+		memcpy(&d, ditem, sizeof(LionStoreDict));
+		if (start > end || end > d.nbytes)
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": a store dictionary has entry %u at bytes %u to %u of %u",
+							RelationGetRelationName(index), c, start, end,
+							(unsigned) d.nbytes),
+					 errhint("REINDEX the index.")));
+		*len = end - start;
+		return ditem + sizeof(LionStoreDict) + start;
+	}
+}
+
+/* The code of value v in a DICT page's dictionary, 0 when it has none. */
+static uint32
+lion_store_dict_find(Relation index, const LionStoreCol *col, const char *ditem,
+					 Size dlen, uint32 ndict, const LionStoreVal *v)
+{
+	uint32		c;
+
+	for (c = 1; c <= ndict; c++)
+	{
+		uint32		len;
+		const char *e = lion_store_dict_entry(index, col, ditem, dlen, ndict,
+											  c, &len);
+
+		if (lion_store_val_equal(v, e, len))
+			return c;
+	}
+	return 0;
+}
+
 /* ---------------------------------------------------------------------
  * 3. The page model
  *
@@ -929,6 +1005,111 @@ lion_store_encode(const LionStoreCol *col, const LionStoreModel *m, int from,
 	return true;
 }
 
+/*
+ * Decode a store page lion_store_page_check() accepted into m.  The values
+ * point into `page`, which must stay as it is while m is used.
+ */
+static void
+lion_store_decode(Relation index, const LionStoreCol *col, Page page,
+				  BlockNumber blk, LionStoreModel *m)
+{
+	LionStoreHeader *h = lion_store_page_header(page);
+	ItemId		diid = PageGetItemId(page, LION_STORE_DICT_OFF);
+	const char *ditem = (const char *) PageGetItem(page, diid);
+	Size		dlen = ItemIdGetLength(diid);
+	int			k;
+
+	memset(m, 0, sizeof(LionStoreModel));
+	m->ckey = h->ckey;
+	m->ord = h->ord;
+	m->lo = h->lo;
+	m->hi = h->hi;
+
+	for (k = h->lo; k <= h->hi; k++)
+	{
+		Size		len;
+		LionStoreSub *s = lion_store_page_sub(page, k, &len);
+		const uint8 *body = (const uint8 *) s + sizeof(LionStoreSub);
+		uint32		i;
+
+		if ((s->flags & LION_STORE_ABSENT) != 0)
+		{
+			m->absent[k] = true;
+			continue;
+		}
+		m->nslots[k] = s->nslots;
+		if (s->nslots == 0)
+			continue;
+		m->slots[k] = (LionStoreVal *) palloc0(sizeof(LionStoreVal) * s->nslots);
+		for (i = 0; i < s->nslots; i++)
+		{
+			LionStoreVal *v = &m->slots[k][i];
+
+			if (h->mode == LION_STORE_DICT)
+			{
+				uint32		c = lion_store_code_get(body, h->width, i);
+
+				if (c == 0)
+					continue;
+				if (c > h->ndict)
+					ereport(ERROR,
+							(errcode(ERRCODE_INDEX_CORRUPTED),
+							 errmsg("lion index \"%s\": store page %u has code %u of a dictionary of %u entries",
+									RelationGetRelationName(index), blk, c,
+									(unsigned) h->ndict),
+							 errhint("REINDEX the index.")));
+				v->data = lion_store_dict_entry(index, col, ditem, dlen,
+												h->ndict, c, &v->len);
+			}
+			else
+			{
+				const uint8 *slot = body + (Size) i * h->width;
+
+				if (lion_store_null_get(body + (Size) s->nslots * h->width, i))
+					continue;
+				if (col->typlen > 0)
+				{
+					v->data = (const char *) slot;
+					v->len = (uint32) col->typlen;
+				}
+				else
+				{
+					uint16		vlen;
+
+					memcpy(&vlen, slot, sizeof(uint16));
+					if ((int) vlen > (int) h->width - (int) sizeof(uint16))
+						ereport(ERROR,
+								(errcode(ERRCODE_INDEX_CORRUPTED),
+								 errmsg("lion index \"%s\": store page %u has a value of %u bytes in a slot of %u",
+										RelationGetRelationName(index), blk,
+										(unsigned) vlen, (unsigned) h->width),
+								 errhint("REINDEX the index.")));
+					v->data = (const char *) slot + sizeof(uint16);
+					v->len = vlen;
+				}
+			}
+		}
+	}
+}
+
+/* Set slot `off` of heap page k of m to v, growing the page's slots. */
+static void
+lion_store_model_set(LionStoreModel *m, int k, OffsetNumber off,
+					 const LionStoreVal *v)
+{
+	Assert(k >= m->lo && k <= m->hi && !m->absent[k]);
+	if (off > m->nslots[k])
+	{
+		LionStoreVal *n = (LionStoreVal *) palloc0(sizeof(LionStoreVal) * off);
+
+		if (m->nslots[k] > 0)
+			memcpy(n, m->slots[k], sizeof(LionStoreVal) * m->nslots[k]);
+		m->slots[k] = n;
+		m->nslots[k] = off;
+	}
+	m->slots[k][off - 1] = *v;
+}
+
 /* Put an image on a page nothing else can see (the build's). */
 static void
 lion_store_place(Page page, const LionStoreImage *img, BlockNumber rightlink)
@@ -945,6 +1126,38 @@ lion_store_place(Page page, const LionStoreImage *img, BlockNumber rightlink)
 								InvalidOffsetNumber, 0) !=
 			(OffsetNumber) (i + 1))
 			elog(ERROR, "lion store: could not place item %d of a page image", i + 1);
+}
+
+/*
+ * The same inside an open record, on a page it registered as one it
+ * initialises: INIT, then every item in one ADDMANY, then the special area
+ * (DESIGN.md §40, "WAL").  The image's size was checked, so nothing here can
+ * fail.
+ */
+static void
+lion_store_log_image(LionWalState *xs, Page page, const LionStoreImage *img,
+					 BlockNumber rightlink)
+{
+	int			i;
+
+	lion_init_page(page, LION_PAGE_STORE);
+	lion_wal_op(xs, page, LION_OP_INIT, 0, LION_PAGE_STORE, NULL, 0);
+	LionPageGetOpaque(page)->rightlink = rightlink;
+	lion_page_set_owner(page, (uint32) img->hdr.ord, (BlockNumber) img->hdr.ckey);
+	lion_wal_op(xs, page, LION_OP_ADDMANY, FirstOffsetNumber,
+				(uint16) img->nitems, NULL, 0);
+	for (i = 0; i < img->nitems; i++)
+	{
+		uint16		isz = (uint16) img->lens[i];
+
+		if (PageAddItemExtended(page, img->items[i], img->lens[i],
+								InvalidOffsetNumber, 0) !=
+			(OffsetNumber) (i + 1))
+			elog(ERROR, "lion store: could not place item %d of a page image", i + 1);
+		lion_wal_op_append(xs, page, &isz, sizeof(uint16));
+		lion_wal_op_append(xs, page, img->items[i], img->lens[i]);
+	}
+	lion_wal_log_special(xs, page);
 }
 
 /* ---------------------------------------------------------------------
@@ -996,10 +1209,106 @@ lion_storemap_page_check(Page page, uint16 level, uint64 number)
 	return NULL;
 }
 
+/*
+ * Is this page number `number` of `level` of the window map?  Map pages never
+ * move and are never freed, so anything else is damage.
+ */
+static void
+lion_storemap_check(Relation index, Page page, BlockNumber blk, uint16 level,
+					uint64 number)
+{
+	char	   *msg = lion_storemap_page_check(page, level, number);
+
+	if (msg != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": block %u, page " UINT64_FORMAT " of level %u of the window map, %s",
+						RelationGetRelationName(index), blk, number,
+						(unsigned) level, msg),
+				 errhint("REINDEX the index.")));
+}
+
 static inline BlockNumber *
 lion_storemap_entries(Page page)
 {
 	return lion_storemap_page_entries(page);
+}
+
+/* Entry i of the map page blk, read under a SHARE lock; 0 reads as none. */
+static BlockNumber
+lion_storemap_read(Relation index, BlockNumber blk, uint16 level,
+				   uint64 number, uint32 i)
+{
+	Buffer		buf = ReadBuffer(index, blk);
+	Page		page;
+	BlockNumber v;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	lion_storemap_check(index, page, blk, level, number);
+	v = lion_storemap_entries(page)[i];
+	UnlockReleaseBuffer(buf);
+
+	return (v == LION_METAPAGE_BLKNO) ? InvalidBlockNumber : v;
+}
+
+/*
+ * The leaf page of the map that holds leaf number leafno, or InvalidBlockNumber
+ * when the map has none yet.  cache, when given, remembers the inner and leaf
+ * pages found: they never move.
+ */
+static BlockNumber
+lion_storemap_leaf(Relation index, BlockNumber root, uint64 leafno,
+				   LionStoreCache *cache)
+{
+	uint64		innerno = leafno / LION_STOREMAP_FANOUT;
+	BlockNumber inner;
+	BlockNumber leaf;
+
+	if (innerno >= LION_STOREMAP_FANOUT)
+		return InvalidBlockNumber;	/* past every window there can be */
+	if (cache != NULL && BlockNumberIsValid(cache->leafblk) &&
+		cache->leafno == leafno)
+		return cache->leafblk;
+
+	if (cache != NULL && BlockNumberIsValid(cache->innerblk) &&
+		cache->innerno == innerno)
+		inner = cache->innerblk;
+	else
+	{
+		inner = lion_storemap_read(index, root, LION_STOREMAP_ROOT, 0,
+								   (uint32) innerno);
+		if (!BlockNumberIsValid(inner))
+			return InvalidBlockNumber;
+		if (cache != NULL)
+		{
+			cache->innerno = innerno;
+			cache->innerblk = inner;
+		}
+	}
+
+	leaf = lion_storemap_read(index, inner, LION_STOREMAP_INNER, innerno,
+							  (uint32) (leafno % LION_STOREMAP_FANOUT));
+	if (BlockNumberIsValid(leaf) && cache != NULL)
+	{
+		cache->leafno = leafno;
+		cache->leafblk = leaf;
+	}
+	return leaf;
+}
+
+/* The head of the store chain of map slot `slot`, or InvalidBlockNumber. */
+static BlockNumber
+lion_storemap_head(Relation index, BlockNumber root, uint64 slot,
+				   LionStoreCache *cache)
+{
+	uint64		leafno = slot / LION_STOREMAP_FANOUT;
+	BlockNumber leaf = lion_storemap_leaf(index, root, leafno, cache);
+
+	if (!BlockNumberIsValid(leaf))
+		return InvalidBlockNumber;
+	return lion_storemap_read(index, leaf, LION_STOREMAP_LEAF, leafno,
+							  (uint32) (slot % LION_STOREMAP_FANOUT));
 }
 
 /* ---------------------------------------------------------------------
@@ -1415,4 +1724,798 @@ lion_store_build_finish(LionStoreBuild *sb, LionMetaStore *store)
 	sb->ix->store.store_root = root;
 
 	MemoryContextDelete(sb->cxt);
+}
+
+/* ---------------------------------------------------------------------
+ * 6. The insert path (DESIGN.md §40, "Writes")
+ *
+ * For each stored column: find the window's chain through the map (creating
+ * its head when there is none), walk it to the page whose range holds the
+ * heap page, and write the slot.  The write is in place when the page has
+ * room - SETBYTES for a slot inside a sub-array, DELTA for a sub-array or a
+ * dictionary that grew, ADD for the sub-arrays of heap pages past the range
+ * of the chain's last page - and otherwise structural: the page is decoded,
+ * the write applied to the model and the model encoded again, which compacts
+ * the dictionary and widens the codes; a DICT page that then does not fit
+ * goes RAW when that fits; a page that still does not fit is split (or, past
+ * the chain's end, a page is appended) and the write starts again; and a page
+ * of one heap page that fits in no mode marks that heap page ABSENT.
+ * --------------------------------------------------------------------- */
+
+/* The meta page, EXCLUSIVE, for a record that changes the store's count. */
+static Buffer
+lion_store_lock_meta(Relation index)
+{
+	Buffer		buf = ReadBuffer(index, LION_METAPAGE_BLKNO);
+	Page		page;
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
+		!LionPageIsMeta(page) || !LionMetaHasStoreArea(page) ||
+		((PageHeader) page)->pd_lower > ((PageHeader) page)->pd_upper)
+	{
+		UnlockReleaseBuffer(buf);
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": the meta page has no store record",
+						RelationGetRelationName(index)),
+				 errhint("REINDEX the index.")));
+	}
+	return buf;
+}
+
+/*
+ * Count delta store or map pages on the meta page, in the open record
+ * (LION_OP_STORE_META): store_pages is kept exact by the records that add
+ * and free the pages, so that nothing has to count them.
+ */
+static void
+lion_store_meta_count(LionWalState *xs, Buffer metabuf, int delta)
+{
+	Page		p = lion_wal_register_buffer(xs, metabuf, LION_WALBUF_STD);
+	LionMetaStore *ms = LionPageGetMetaStore(p);
+	LionMetaStore copy;
+
+	if (delta < 0 && ms->store_pages < (uint32) -delta)
+		ms->store_pages = 0;
+	else
+		ms->store_pages = (uint32) ((int64) ms->store_pages + delta);
+	memcpy(&copy, ms, sizeof(LionMetaStore));
+	lion_wal_op(xs, p, LION_OP_STORE_META, 0, 0, &copy, sizeof(LionMetaStore));
+}
+
+/*
+ * Add map page (level, number) under entry i of its parent, unless another
+ * backend has meanwhile: one record of three blocks - the new page, the
+ * parent's SETBYTES, the meta page's count.
+ */
+static void
+lion_storemap_add(Relation index, Relation heaprel, BlockNumber parent,
+				  uint16 plevel, uint64 pnumber, uint32 i, uint16 level,
+				  uint64 number)
+{
+	Buffer		nbuf = lion_alloc_page(index, heaprel, true);
+	BlockNumber nblk = BufferGetBlockNumber(nbuf);
+	Buffer		pbuf = ReadBuffer(index, parent);
+	Buffer		metabuf;
+	Page		page;
+	LionWalState *xs;
+	Page		pN;
+	Page		pP;
+
+	LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(pbuf);
+	lion_storemap_check(index, page, parent, plevel, pnumber);
+	if (lion_storemap_entries(page)[i] != 0)
+	{
+		UnlockReleaseBuffer(pbuf);
+		lion_release_unused_page(index, nbuf);
+		return;
+	}
+	metabuf = lion_store_lock_meta(index);
+
+	xs = lion_wal_begin(index);
+	pN = lion_wal_register_buffer(xs, nbuf, LION_WALBUF_INIT);
+	lion_storemap_init_page(pN, level, (uint32) number);
+	lion_wal_op(xs, pN, LION_OP_INIT, 0, LION_PAGE_STOREMAP, NULL, 0);
+	lion_wal_op(xs, pN, LION_OP_ADD, FirstOffsetNumber, 0, lion_store_zero.data,
+				LION_STOREMAP_ITEM_SIZE);
+	lion_wal_log_special(xs, pN);
+
+	pP = lion_wal_register_buffer(xs, pbuf, LION_WALBUF_STD);
+	lion_storemap_entries(pP)[i] = nblk;
+	lion_wal_op(xs, pP, LION_OP_SETBYTES, FirstOffsetNumber,
+				(uint16) (i * sizeof(BlockNumber)), &nblk, sizeof(BlockNumber));
+
+	lion_store_meta_count(xs, metabuf, 1);
+	lion_wal_finish(xs, LION_XLOG_STORE);
+
+	UnlockReleaseBuffer(nbuf);
+	UnlockReleaseBuffer(pbuf);
+	UnlockReleaseBuffer(metabuf);
+}
+
+/* The leaf of leafno, adding it and its inner page as needed. */
+static BlockNumber
+lion_storemap_extend(Relation index, Relation heaprel, LionIndexState *ix,
+					 uint64 leafno)
+{
+	BlockNumber root = ix->store.store_root;
+	uint64		innerno = leafno / LION_STOREMAP_FANOUT;
+	int			attempts = 0;
+
+	if (innerno >= LION_STOREMAP_FANOUT)
+		elog(ERROR, "lion store: window map leaf " UINT64_FORMAT " is out of range",
+			 leafno);
+	for (;;)
+	{
+		BlockNumber leaf = lion_storemap_leaf(index, root, leafno, ix->storecache);
+		BlockNumber inner;
+
+		if (BlockNumberIsValid(leaf))
+			return leaf;
+		if (++attempts > 3)
+			elog(ERROR, "lion store: could not extend the window map");
+
+		inner = lion_storemap_read(index, root, LION_STOREMAP_ROOT, 0,
+								   (uint32) innerno);
+		if (!BlockNumberIsValid(inner))
+			lion_storemap_add(index, heaprel, root, LION_STOREMAP_ROOT, 0,
+							  (uint32) innerno, LION_STOREMAP_INNER, innerno);
+		else
+			lion_storemap_add(index, heaprel, inner, LION_STOREMAP_INNER,
+							  innerno, (uint32) (leafno % LION_STOREMAP_FANOUT),
+							  LION_STOREMAP_LEAF, leafno);
+	}
+}
+
+/*
+ * Create the head of window ckey's chain for col, holding the one value being
+ * written, and point the map slot at it, in one record (the page, the leaf,
+ * the meta page).  false when another backend created it first.
+ */
+static bool
+lion_store_create_head(Relation index, Relation heaprel, LionIndexState *ix,
+					   const LionStoreCol *col, uint32 ckey, int k,
+					   OffsetNumber off, const LionStoreVal *v, uint64 slot)
+{
+	uint64		leafno = slot / LION_STOREMAP_FANOUT;
+	uint32		i = (uint32) (slot % LION_STOREMAP_FANOUT);
+	BlockNumber leafblk = lion_storemap_extend(index, heaprel, ix, leafno);
+	LionStoreModel m;
+	LionStoreDictSet ds;
+	LionStoreImage img;
+	Buffer		sbuf;
+	BlockNumber sblk;
+	Buffer		lbuf;
+	Buffer		metabuf;
+	Page		page;
+	LionWalState *xs;
+	Page		pS;
+	Page		pL;
+
+	memset(&m, 0, sizeof(m));
+	m.ckey = ckey;
+	m.ord = (uint16) col->ord;
+	m.lo = 0;
+	m.hi = k;
+	lion_store_model_set(&m, k, off, v);
+	lion_store_dset_init(&ds, CurrentMemoryContext);
+	if (!lion_store_encode(col, &m, 0, k, LION_STORE_DICT, &ds, &img))
+		elog(ERROR, "lion store: a new window's first value does not fit a page");
+
+	sbuf = lion_alloc_page(index, heaprel, true);
+	sblk = BufferGetBlockNumber(sbuf);
+	lbuf = ReadBuffer(index, leafblk);
+	LockBuffer(lbuf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(lbuf);
+	lion_storemap_check(index, page, leafblk, LION_STOREMAP_LEAF, leafno);
+	if (lion_storemap_entries(page)[i] != 0)
+	{
+		UnlockReleaseBuffer(lbuf);
+		lion_release_unused_page(index, sbuf);
+		return false;
+	}
+	metabuf = lion_store_lock_meta(index);
+
+	xs = lion_wal_begin(index);
+	pS = lion_wal_register_buffer(xs, sbuf, LION_WALBUF_INIT);
+	lion_store_log_image(xs, pS, &img, InvalidBlockNumber);
+	pL = lion_wal_register_buffer(xs, lbuf, LION_WALBUF_STD);
+	lion_storemap_entries(pL)[i] = sblk;
+	lion_wal_op(xs, pL, LION_OP_SETBYTES, FirstOffsetNumber,
+				(uint16) (i * sizeof(BlockNumber)), &sblk, sizeof(BlockNumber));
+	lion_store_meta_count(xs, metabuf, 1);
+	lion_wal_finish(xs, LION_XLOG_STORE);
+
+	UnlockReleaseBuffer(sbuf);
+	UnlockReleaseBuffer(lbuf);
+	UnlockReleaseBuffer(metabuf);
+
+	ix->storecache->slot = slot;
+	ix->storecache->head = sblk;
+	return true;
+}
+
+/*
+ * Step from blk to its right link next, at most a window's worth of pages:
+ * every page of a chain covers at least one of the window's heap pages.
+ */
+static void
+lion_store_chain_step(Relation index, BlockNumber blk, BlockNumber next,
+					  int *steps)
+{
+	if (next == blk || next == LION_METAPAGE_BLKNO ||
+		++(*steps) >= LION_BLOCKS_PER_CONTAINER)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": store page %u links to %u after %d pages of one window",
+						RelationGetRelationName(index), blk, next, *steps),
+				 errhint("REINDEX the index.")));
+}
+
+/*
+ * The page of the chain at head whose range holds heap page k, or the chain's
+ * last page when k is past every range, EXCLUSIVE; InvalidBuffer when the
+ * chain is not (any longer) window ckey's, which sends the caller back to the
+ * map.
+ */
+static Buffer
+lion_store_find_page(Relation index, const LionStoreCol *col, uint32 ckey,
+					 BlockNumber head, int k)
+{
+	BlockNumber blk = head;
+	int			steps = 0;
+
+	for (;;)
+	{
+		Buffer		buf = ReadBuffer(index, blk);
+		Page		page;
+		LionStoreHeader *h;
+		BlockNumber next;
+
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		if (!lion_store_page_owned(page, ckey, (uint16) col->ord))
+		{
+			UnlockReleaseBuffer(buf);
+			return InvalidBuffer;
+		}
+		lion_store_check_or_error(index, page, blk, col, false);
+		h = lion_store_page_header(page);
+
+		/*
+		 * A head's range starts at the window's first heap page; a page that
+		 * does not is one of the window's later pages, reused as such after
+		 * the chain the map named was freed (§18).  Walking right never
+		 * overshoots, because ranges only ever move right.
+		 */
+		if ((blk == head && h->lo != 0) || k < h->lo)
+		{
+			UnlockReleaseBuffer(buf);
+			return InvalidBuffer;
+		}
+		next = LionPageGetOpaque(page)->rightlink;
+		if (k <= h->hi || !BlockNumberIsValid(next))
+		{
+			lion_store_check_or_error(index, page, blk, col, true);
+			return buf;
+		}
+		UnlockReleaseBuffer(buf);
+		lion_store_chain_step(index, blk, next, &steps);
+		blk = next;
+	}
+}
+
+/* Rewrite the page in buf (EXCLUSIVE) as img, keeping its right link. */
+static void
+lion_store_rewrite(Relation index, Buffer buf, const LionStoreImage *img)
+{
+	BlockNumber rightlink = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
+	LionWalState *xs = lion_wal_begin(index);
+	Page		p = lion_wal_register_buffer(xs, buf, LION_WALBUF_INIT);
+
+	lion_store_log_image(xs, p, img, rightlink);
+	lion_wal_finish(xs, LION_XLOG_STORE);
+}
+
+/*
+ * Split the page in buf (EXCLUSIVE), whose content is m: heap pages from `at`
+ * on move to a new page that takes its right link, both halves encoded in
+ * `mode` (two blocks and the meta page, one record).  Each half is part of a
+ * page that fits, so each fits.
+ */
+static void
+lion_store_split(Relation index, Relation heaprel, Buffer buf,
+				 const LionStoreCol *col, const LionStoreModel *m, int at,
+				 int mode)
+{
+	BlockNumber rightlink = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
+	LionStoreDictSet ds;
+	LionStoreImage left;
+	LionStoreImage right;
+	Buffer		nbuf;
+	BlockNumber nblk;
+	Buffer		metabuf;
+	LionWalState *xs;
+	Page		p;
+
+	Assert(at > m->lo && at <= m->hi);
+	lion_store_dset_init(&ds, CurrentMemoryContext);
+	if (!lion_store_encode(col, m, m->lo, at - 1, mode, &ds, &left) ||
+		!lion_store_encode(col, m, at, m->hi, mode, &ds, &right))
+		elog(ERROR, "lion store: half of a store page does not fit a page");
+
+	nbuf = lion_alloc_page(index, heaprel, true);
+	nblk = BufferGetBlockNumber(nbuf);
+	metabuf = lion_store_lock_meta(index);
+
+	xs = lion_wal_begin(index);
+	p = lion_wal_register_buffer(xs, buf, LION_WALBUF_INIT);
+	lion_store_log_image(xs, p, &left, nblk);
+	p = lion_wal_register_buffer(xs, nbuf, LION_WALBUF_INIT);
+	lion_store_log_image(xs, p, &right, rightlink);
+	lion_store_meta_count(xs, metabuf, 1);
+	lion_wal_finish(xs, LION_XLOG_STORE);
+
+	UnlockReleaseBuffer(nbuf);
+	UnlockReleaseBuffer(metabuf);
+}
+
+/*
+ * The chain's last page, in buf (EXCLUSIVE), has no room for heap pages
+ * [from .. to] past its range: they go to a new last page of their own,
+ * empty, in `mode`.
+ */
+static void
+lion_store_append(Relation index, Relation heaprel, Buffer buf,
+				  const LionStoreCol *col, uint32 ckey, int from, int to,
+				  int mode)
+{
+	LionStoreModel e;
+	LionStoreDictSet ds;
+	LionStoreImage img;
+	Buffer		nbuf;
+	BlockNumber nblk;
+	Buffer		metabuf;
+	LionWalState *xs;
+	Page		p;
+
+	Assert(!BlockNumberIsValid(LionPageGetOpaque(BufferGetPage(buf))->rightlink));
+	memset(&e, 0, sizeof(e));
+	e.ckey = ckey;
+	e.ord = (uint16) col->ord;
+	e.lo = from;
+	e.hi = to;
+	lion_store_dset_init(&ds, CurrentMemoryContext);
+	if (!lion_store_encode(col, &e, from, to, mode, &ds, &img))
+		elog(ERROR, "lion store: an empty store page does not fit a page");
+
+	nbuf = lion_alloc_page(index, heaprel, true);
+	nblk = BufferGetBlockNumber(nbuf);
+	metabuf = lion_store_lock_meta(index);
+
+	xs = lion_wal_begin(index);
+	p = lion_wal_register_buffer(xs, buf, LION_WALBUF_STD);
+	LionPageGetOpaque(p)->rightlink = nblk;
+	lion_wal_log_special(xs, p);
+	p = lion_wal_register_buffer(xs, nbuf, LION_WALBUF_INIT);
+	lion_store_log_image(xs, p, &img, InvalidBlockNumber);
+	lion_store_meta_count(xs, metabuf, 1);
+	lion_wal_finish(xs, LION_XLOG_STORE);
+
+	UnlockReleaseBuffer(nbuf);
+	UnlockReleaseBuffer(metabuf);
+}
+
+/*
+ * Write v at (k, off) in place on the page in buf (EXCLUSIVE, checked), if it
+ * has the room and needs no structural change; false, with nothing changed,
+ * when it does.
+ */
+static bool
+lion_store_write_inplace(Relation index, Buffer buf, const LionStoreCol *col,
+						 int k, OffsetNumber off, const LionStoreVal *v)
+{
+	Page		page = BufferGetPage(buf);
+	LionStoreHeader h;
+	ItemId		diid = PageGetItemId(page, LION_STORE_DICT_OFF);
+	const char *ditem = (const char *) PageGetItem(page, diid);
+	Size		dlen = ItemIdGetLength(diid);
+	bool		extend;
+	OffsetNumber subno = InvalidOffsetNumber;
+	const char *oldsub = NULL;
+	Size		oldsublen = 0;
+	uint16		oldnslots = 0;
+	uint16		newnslots;
+	Size		newsublen;
+	char	   *newsub;
+	uint8	   *body;
+	char	   *newdict = NULL;
+	Size		newdictlen = 0;
+	uint32		code = 0;
+	Size		need = 0;
+	LionWalState *xs;
+	Page		p;
+	int			j;
+
+	memcpy(&h, lion_store_page_header(page), sizeof(LionStoreHeader));
+	extend = (k > h.hi);
+	if (!extend)
+	{
+		LionStoreSub s;
+
+		subno = (OffsetNumber) (LION_STORE_SUB_FIRST + k - h.lo);
+		oldsub = (const char *) PageGetItem(page, PageGetItemId(page, subno));
+		oldsublen = ItemIdGetLength(PageGetItemId(page, subno));
+		memcpy(&s, oldsub, sizeof(LionStoreSub));
+		if ((s.flags & LION_STORE_ABSENT) != 0)
+			return true;		/* readers take this heap page from the heap */
+		oldnslots = s.nslots;
+	}
+	newnslots = Max(oldnslots, off);
+
+	if (h.mode == LION_STORE_DICT && v->data != NULL)
+	{
+		code = lion_store_dict_find(index, col, ditem, dlen, h.ndict, v);
+		if (code == 0)
+		{
+			uint32		nd = (uint32) h.ndict + 1;
+			LionStoreDict d;
+
+			/* a wider code is a rewrite of every sub-array */
+			if (lion_store_dict_width(nd) != h.width)
+				return false;
+			memcpy(&d, ditem, sizeof(LionStoreDict));
+			if ((Size) d.nbytes + v->len > PG_UINT16_MAX)
+				return false;
+			newdictlen = lion_store_dict_len(col->typlen, nd, d.nbytes + v->len);
+			need += MAXALIGN(newdictlen) - MAXALIGN(dlen);
+			code = nd;
+
+			/* the dictionary with v appended: values first, offsets last */
+			newdict = (char *) palloc0(newdictlen);
+			d.ndict = (uint16) nd;
+			if (col->typlen > 0)
+			{
+				memcpy(newdict, ditem, dlen);
+				memcpy(newdict + dlen, v->data, v->len);
+				d.nbytes = (uint16) (d.nbytes + v->len);
+			}
+			else
+			{
+				uint32		e;
+				uint16		o;
+
+				memcpy(newdict + sizeof(LionStoreDict),
+					   ditem + sizeof(LionStoreDict), d.nbytes);
+				memcpy(newdict + sizeof(LionStoreDict) + d.nbytes, v->data,
+					   v->len);
+				for (e = 0; e < nd; e++)
+				{
+					o = (uint16) lion_store_vdict_off(ditem, dlen, h.ndict, e);
+					memcpy(newdict + newdictlen - sizeof(uint16) * (nd + 1) +
+						   sizeof(uint16) * e, &o, sizeof(uint16));
+				}
+				o = (uint16) (d.nbytes + v->len);
+				memcpy(newdict + newdictlen - sizeof(uint16), &o, sizeof(uint16));
+				d.nbytes = o;
+			}
+			memcpy(newdict, &d, sizeof(LionStoreDict));
+		}
+	}
+
+	newsublen = lion_store_sub_len(h.mode, h.width, newnslots, false);
+	if (extend)
+		need += (Size) (k - h.hi - 1) * LION_STORE_ITEM_COST(sizeof(LionStoreSub)) +
+			LION_STORE_ITEM_COST(newsublen);
+	else
+		need += MAXALIGN(newsublen) - MAXALIGN(oldsublen);
+	if (need > PageGetExactFreeSpace(page))
+		return false;
+
+	/* the sub-array as it will be */
+	newsub = (char *) palloc0(newsublen);
+	body = (uint8 *) newsub + sizeof(LionStoreSub);
+	{
+		LionStoreSub s;
+
+		s.nslots = newnslots;
+		s.flags = 0;
+		memcpy(newsub, &s, sizeof(LionStoreSub));
+	}
+	if (h.mode == LION_STORE_DICT)
+	{
+		if (oldnslots > 0)
+			memcpy(body, oldsub + sizeof(LionStoreSub),
+				   lion_store_codes_bytes(h.width, oldnslots));
+		lion_store_code_set(body, h.width, off - 1, code);
+	}
+	else
+	{
+		uint8	   *bitmap = body + (Size) newnslots * h.width;
+		uint8	   *slot = body + (Size) (off - 1) * h.width;
+		uint32		i;
+
+		if (oldnslots > 0)
+		{
+			memcpy(body, oldsub + sizeof(LionStoreSub), (Size) oldnslots * h.width);
+			memcpy(bitmap, oldsub + sizeof(LionStoreSub) + (Size) oldnslots * h.width,
+				   lion_store_bitmap_bytes(oldnslots));
+		}
+		for (i = oldnslots; i < newnslots; i++)
+			lion_store_null_set(bitmap, i, true);
+		memset(slot, 0, h.width);
+		if (v->data == NULL)
+			lion_store_null_set(bitmap, off - 1, true);
+		else
+		{
+			lion_store_null_set(bitmap, off - 1, false);
+			if (col->typlen > 0)
+				memcpy(slot, v->data, v->len);
+			else
+			{
+				uint16		vlen = (uint16) v->len;
+
+				Assert((int) v->len <= (int) h.width - (int) sizeof(uint16));
+				memcpy(slot, &vlen, sizeof(uint16));
+				memcpy(slot + sizeof(uint16), v->data, v->len);
+			}
+		}
+	}
+
+	/* the same value written again changes nothing */
+	if (!extend && newdict == NULL && newsublen == oldsublen &&
+		memcmp(newsub, oldsub, oldsublen) == 0)
+		return true;
+
+	xs = lion_wal_begin(index);
+	p = lion_wal_register_buffer(xs, buf, LION_WALBUF_STD);
+	if (newdict != NULL || extend)
+	{
+		LionStoreHeader *ph = lion_store_page_header(p);
+
+		if (newdict != NULL)
+			ph->ndict = (uint16) code;
+		if (extend)
+			ph->hi = (uint8) k;
+		lion_wal_op(xs, p, LION_OP_SETBYTES, LION_STORE_HDR_OFF, 0, ph,
+					sizeof(LionStoreHeader));
+	}
+	if (newdict != NULL)
+	{
+		lion_wal_save_item(xs, p, LION_STORE_DICT_OFF);
+		if (!PageIndexTupleOverwrite(p, LION_STORE_DICT_OFF, newdict, newdictlen))
+			elog(ERROR, "lion store: could not grow a dictionary");
+		lion_wal_op_replace(xs, p, LION_STORE_DICT_OFF, newdict, newdictlen);
+	}
+	if (extend)
+	{
+		LionStoreSub empty;
+
+		empty.nslots = 0;
+		empty.flags = 0;
+		for (j = h.hi + 1; j <= k; j++)
+		{
+			OffsetNumber o = OffsetNumberNext(PageGetMaxOffsetNumber(p));
+			const char *item = (j == k) ? newsub : (const char *) &empty;
+			Size		len = (j == k) ? newsublen : sizeof(LionStoreSub);
+
+			if (PageAddItemExtended(p, item, len, o, 0) != o)
+				elog(ERROR, "lion store: could not add a sub-array");
+			lion_wal_op(xs, p, LION_OP_ADD, o, 0, item, len);
+		}
+	}
+	else if (newsublen == oldsublen)
+	{
+		char	   *target = (char *) PageGetItem(p, PageGetItemId(p, subno));
+		Size		first = 0;
+		Size		last = newsublen;
+
+		while (first < newsublen && target[first] == newsub[first])
+			first++;
+		while (last > first && target[last - 1] == newsub[last - 1])
+			last--;
+		if (last > first)
+		{
+			memcpy(target + first, newsub + first, last - first);
+			lion_wal_op(xs, p, LION_OP_SETBYTES, subno, (uint16) first,
+						newsub + first, last - first);
+		}
+	}
+	else
+	{
+		lion_wal_save_item(xs, p, subno);
+		if (!PageIndexTupleOverwrite(p, subno, newsub, newsublen))
+			elog(ERROR, "lion store: could not grow a sub-array");
+		lion_wal_op_replace(xs, p, subno, newsub, newsublen);
+	}
+	lion_wal_finish(xs, LION_XLOG_STORE);
+
+	return true;
+}
+
+/*
+ * The structural write: decode, write, encode.  Returns true when the value
+ * is written (or its heap page is ABSENT), false when the page was split or a
+ * page appended and the write has to find its page again.  buf is released.
+ */
+static bool
+lion_store_write_rebuild(Relation index, Relation heaprel,
+						 const LionStoreCol *col, Buffer buf, int k,
+						 OffsetNumber off, const LionStoreVal *v)
+{
+	Page		page = BufferGetPage(buf);
+	char	   *copy = (char *) palloc(BLCKSZ);
+	LionStoreHeader h;
+	LionStoreModel m;
+	LionStoreModel w;
+	LionStoreDictSet ds;
+	LionStoreImage img;
+	int			j;
+
+	memcpy(copy, page, BLCKSZ);
+	lion_store_decode(index, col, (Page) copy, BufferGetBlockNumber(buf), &m);
+	memcpy(&h, lion_store_page_header((Page) copy), sizeof(LionStoreHeader));
+	lion_store_dset_init(&ds, CurrentMemoryContext);
+
+	/* w is m with the write, past the range when k is */
+	w = m;
+	if (k > h.hi)
+	{
+		for (j = h.hi + 1; j <= k; j++)
+		{
+			w.nslots[j] = 0;
+			w.slots[j] = NULL;
+			w.absent[j] = false;
+		}
+		w.hi = k;
+	}
+	if (w.absent[k])
+	{
+		UnlockReleaseBuffer(buf);
+		return true;
+	}
+	w.slots[k] = (LionStoreVal *)
+		palloc0(sizeof(LionStoreVal) * Max(w.nslots[k], off));
+	if (w.nslots[k] > 0)
+		memcpy(w.slots[k], m.slots[k], sizeof(LionStoreVal) * w.nslots[k]);
+	w.nslots[k] = Max(w.nslots[k], off);
+	w.slots[k][off - 1] = *v;
+
+	/* compacted, and wider if need be, in the page's mode ... */
+	if (lion_store_encode(col, &w, w.lo, w.hi, h.mode, &ds, &img) ||
+	/* ... or RAW, once the dictionary has stopped paying (§40) */
+		(h.mode == LION_STORE_DICT && col->rawwidth > 0 &&
+		 lion_store_encode(col, &w, w.lo, w.hi, LION_STORE_RAW, &ds, &img)))
+	{
+		lion_store_rewrite(index, buf, &img);
+		UnlockReleaseBuffer(buf);
+		return true;
+	}
+
+	if (w.lo < w.hi)
+	{
+		if (k > h.hi)
+			lion_store_append(index, heaprel, buf, col, h.ckey, h.hi + 1, k,
+							  h.mode);
+		else
+		{
+			/*
+			 * The upper half moves right - or, for a write to the page's last
+			 * heap page, that page alone, which is where a heap filling page
+			 * by page keeps writing: the left page is then full and stays so,
+			 * where a cut in the middle would leave two half-full pages behind
+			 * every heap page of the window.
+			 */
+			int			at = (k == h.hi) ? h.hi : (h.lo + h.hi + 1) / 2;
+
+			lion_store_split(index, heaprel, buf, col, &m, at, h.mode);
+		}
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+
+	/*
+	 * One heap page whose values fit no page in the page's mode, nor RAW: it
+	 * is ABSENT, and its rows are read from the heap (§40, "Growth").
+	 */
+	Assert(w.lo == k && w.hi == k);
+	w.absent[k] = true;
+	w.nslots[k] = 0;
+	w.slots[k] = NULL;
+	if (!lion_store_encode(col, &w, k, k, h.mode, &ds, &img))
+		elog(ERROR, "lion store: an ABSENT heap page does not fit a page");
+	lion_store_rewrite(index, buf, &img);
+	UnlockReleaseBuffer(buf);
+	return true;
+}
+
+/* Write v as column col's value of (ckey, k, off). */
+static void
+lion_store_write(Relation index, Relation heaprel, LionIndexState *ix,
+				 const LionStoreCol *col, uint32 ckey, int k, OffsetNumber off,
+				 const LionStoreVal *v)
+{
+	uint64		slot = lion_storemap_slot(ckey, ix->nstored, col->ord);
+	LionStoreCache *cache = ix->storecache;
+	int			attempts = 0;
+
+	for (;;)
+	{
+		BlockNumber head;
+		Buffer		buf;
+
+		if (++attempts > LION_STORE_MAX_ATTEMPTS)
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": could not find the store page of window %u column %d",
+							RelationGetRelationName(index), ckey, col->attno),
+					 errhint("REINDEX the index.")));
+		CHECK_FOR_INTERRUPTS();
+
+		if (BlockNumberIsValid(cache->head) && cache->slot == slot)
+			head = cache->head;
+		else
+		{
+			head = lion_storemap_head(index, ix->store.store_root, slot, cache);
+			cache->slot = slot;
+			cache->head = head;
+		}
+		if (!BlockNumberIsValid(head))
+		{
+			if (lion_store_create_head(index, heaprel, ix, col, ckey, k, off,
+									   v, slot))
+				return;
+			cache->head = InvalidBlockNumber;
+			continue;
+		}
+
+		buf = lion_store_find_page(index, col, ckey, head, k);
+		if (!BufferIsValid(buf))
+		{
+			/* the chain was freed under the cached head: ask the map */
+			cache->head = InvalidBlockNumber;
+			continue;
+		}
+
+		if (lion_store_write_inplace(index, buf, col, k, off, v))
+		{
+			UnlockReleaseBuffer(buf);
+			return;
+		}
+		if (lion_store_write_rebuild(index, heaprel, col, buf, k, off, v))
+			return;
+	}
+}
+
+void
+lion_store_insert(Relation index, Relation heaprel, LionIndexState *ix,
+				  ItemPointer tid, const Datum *values, const bool *isnull)
+{
+	uint64		code = lion_tid_to_code(tid);
+	uint32		ckey = lion_code_ckey(code);
+	uint16		k;
+	OffsetNumber off;
+	LionStoreVal *vals;
+	Datum	   *fix;
+	int			ord;
+
+	Assert(ix->nstored > 0);
+	lion_lo_split(lion_code_lo(code), &k, &off);
+
+	/* every value first, so that a value too long is refused before a write */
+	vals = (LionStoreVal *) palloc(sizeof(LionStoreVal) * ix->nstored);
+	fix = (Datum *) palloc(sizeof(Datum) * ix->nstored);
+	for (ord = 0; ord < ix->nstored; ord++)
+	{
+		const LionStoreCol *col = &ix->stored[ord];
+
+		lion_store_value(index, col, values[col->attno - 1],
+						 isnull[col->attno - 1], &vals[ord], &fix[ord]);
+	}
+	for (ord = 0; ord < ix->nstored; ord++)
+		lion_store_write(index, heaprel, ix, &ix->stored[ord], ckey, k, off,
+						 &vals[ord]);
 }

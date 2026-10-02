@@ -152,6 +152,17 @@ extern void lion_store_build_add(LionStoreBuild *sb, ItemPointer tid,
 								 const Datum *values, const bool *isnull);
 extern void lion_store_build_finish(LionStoreBuild *sb, LionMetaStore *store);
 
+/* ---------- insert (lioninsert) ---------- */
+
+/*
+ * Write tid's value of every stored column.  lioninsert() calls it BEFORE it
+ * touches a posting set (DESIGN.md §40, "Writes"), with nothing held, and
+ * nothing is held when it returns.
+ */
+extern void lion_store_insert(Relation index, Relation heaprel,
+							  LionIndexState *ix, ItemPointer tid,
+							  const Datum *values, const bool *isnull);
+
 /* ---------- page access for lion_index_stats() and verify() ---------- */
 
 /*
