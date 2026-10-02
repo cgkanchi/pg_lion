@@ -81,6 +81,10 @@ BEGIN
 	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
 	PERFORM set_config('work_mem', '64MB', true);
 	PERFORM set_config('enable_hashagg', 'on', true);
+	PERFORM set_config('enable_sort', 'on', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
 END $$;
 
 -- What answered a query, from its plan.
@@ -101,7 +105,9 @@ $$;
 -- then a parallel plan.
 CREATE OR REPLACE FUNCTION soak.rand_gucs() RETURNS text[]
 LANGUAGE plpgsql VOLATILE AS $$
-DECLARE g text[] := '{}';
+DECLARE
+	g text[] := '{}';
+	r text;
 BEGIN
 	IF random() < 0.15 THEN g := g || 'work_mem=64kB'::text;
 	ELSIF random() < 0.3 THEN g := g || 'work_mem=1MB'::text; END IF;
@@ -119,6 +125,36 @@ BEGIN
 		g := g || 'enable_bitmapscan=off'::text;
 	END IF;
 	IF random() < 0.1 THEN g := g || 'enable_hashagg=off'::text; END IF;
+	IF random() < 0.1 THEN g := g || 'enable_sort=off'::text; END IF;
+	-- core's join methods, one or all of them: what the FK-side and semi
+	-- joins compete with, or a plan they are forced into
+	IF random() < 0.08 THEN
+		g := g || ARRAY['enable_hashjoin=off', 'enable_mergejoin=off', 'enable_nestloop=off'];
+	ELSE
+		IF random() < 0.1 THEN g := g || 'enable_hashjoin=off'::text; END IF;
+		IF random() < 0.1 THEN g := g || 'enable_mergejoin=off'::text; END IF;
+		IF random() < 0.1 THEN g := g || 'enable_nestloop=off'::text; END IF;
+	END IF;
+	-- The units and the margin a lion path is priced in (DESIGN.md §39), on a
+	-- build that has them: each now and then at a bound or between, so that
+	-- lion's paths are chosen where they never are by default, and not where
+	-- they always are.  No answer may depend on it.
+	IF current_setting('pg_lion.pushdown_margin', true) IS NOT NULL THEN
+		IF random() < 0.4 THEN
+			g := g || ('pg_lion.pushdown_margin=' || soak.pick('{0.01,0.1,0.5,0.99,1}'));
+		END IF;
+		FOREACH r IN ARRAY '{hashagg,agg,hashjoin,mergejoin,nestloop,bitmap}'::text[] LOOP
+			IF random() < 0.25 THEN
+				g := g || format('pg_lion.%s_rate=%s', r, soak.pick('{0.001,0.05,1,20,1000}'));
+			END IF;
+		END LOOP;
+		IF random() < 0.2 THEN
+			g := g || ('pg_lion.resident_page_cost=' || soak.pick('{0,1,120,100000}'));
+		END IF;
+		IF random() < 0.2 THEN
+			g := g || ('effective_cache_size=' || soak.pick('{8kB,1MB,4GB,1TB}'));
+		END IF;
+	END IF;
 	IF random() < 0.1 THEN
 		g := g || ARRAY['max_parallel_workers_per_gather=2', 'parallel_setup_cost=0',
 						'parallel_tuple_cost=0', 'min_parallel_table_scan_size=0',

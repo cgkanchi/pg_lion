@@ -343,6 +343,8 @@ reader_loop() {
 			sql="SELECT * FROM soak.cursor_check('soak.t', 3 + random() * 6); SELECT * FROM soak.cursor_check('soak.p', 2);"
 		fi
 		{
+			# the library first, so that soak.rand_gucs() sees its settings
+			echo "LOAD 'pg_lion';"
 			echo "SELECT setseed(($SEED + $n * 7919 + $RANDOM) % 1000000 / 1000000.0) \\g /dev/null"
 			echo "BEGIN ISOLATION LEVEL $iso;"
 			echo "$sql"
