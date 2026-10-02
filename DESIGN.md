@@ -16989,8 +16989,8 @@ DELETE and a VACUUM that shrink them. `test/sql/corrupt_items.sql` §7 writes wi
 into a NARROW of width 1: readers refuse 0 and 6, verify() reports them, and width 2, which the
 item has no bytes for, is refused by both as an item too short.
 
-Every test that sized a set to outgrow a 64 kB work_mem lost it, because a dense container of
-narrow rows went from 4104 bytes to 1544: `groupwhere.sql` §7, `range_cost.sql` §2, `spill.sql`,
+Every test that sized a set to outgrow a 64 kB work_mem lost it, because a dense container of narrow
+rows went from 4104 bytes to 1544: `groupwhere.sql` §7, `range_cost.sql` §2, `spill.sql`,
 `rangesource.sql` §4, `summary_scatter.sql` §4, `ordered.sql` §10, `fkjoin_perkey.sql` §3,
 `fkjoin_semi.sql` and both of `fkjoin_parallel.sql` §6's copies. Each now has more container keys:
 most pad their rows to 65 a page, just past the 63 offsets of width 1, which makes a NARROW the
@@ -17000,20 +17000,20 @@ them instead of 240,000; `summary_scatter.sql` keeps narrow rows and takes a lar
 permutation; `fkjoin_parallel.sql` sets `pg_lion.parallel_range_keys` so that its copies are still
 one chunk and three; `range_cost.sql` runs its 64 kB cases on `rcostw`, rcost's rows at some 25 a
 page over 63 container keys, and fills `rcostn`'s memory with 39 container keys of v = 0 NARROWs of
-width 3 where 15 of BITSETs did. The isolation specs that grow a posting set until a leaf splits
-lost their splits, since a dense set is NARROWs of a few to a leaf that an insert within their
-width does not grow: `count_split_race.spec` and `verify_concurrent.spec`'s `vp` create their index
-before the rows, so that the inserts make it, of ARRAYs and BITSETs as before, and
-`posting_split_repair.spec` spreads the rows that were one dense key over 97 keys of small ARRAYs,
-so that its index stays version 6 and VACUUM's filtering still grows a RUN into an ARRAY larger
-than the leaf's spare bytes, where it would make a NARROW of width 4 that fits them. The other
-expected changes follow from smaller containers and change no answer: a switch to the empty copy
-one key later (`fkjoin_switch.sql`), a range summed from its complement (`rangesum.sql`) or with
-another mix of summaries (`summary.sql`), a union probed at keys where it was built
-(`unionprobe.sql`), posting trees on fewer blocks (`verify.sql`, `corrupt_walk.sql`,
+width 3 where 15 of BITSETs did. The tests that grow a posting set until a leaf splits lost their
+splits, since a dense set is NARROWs of a few to a leaf that an insert within their width does not
+grow: `count_split_race.spec`, `verify_concurrent.spec`'s `vp` and the split case of
+`test/recovery/run.sh`'s phase 3 create their index before the rows, so that the inserts make it, of
+ARRAYs and BITSETs as before, and `posting_split_repair.spec` spreads the rows that were one dense
+key over 97 keys of small ARRAYs, so that its index stays version 6 and VACUUM's filtering still
+grows a RUN into an ARRAY larger than the leaf's spare bytes, where it would make a NARROW of width
+4 that fits them. The other expected changes follow from smaller containers and change no answer: a
+switch to the empty copy one key later (`fkjoin_switch.sql`), a range summed from its complement
+(`rangesum.sql`) or with another mix of summaries (`summary.sql`), a union probed at keys where it
+was built (`unionprobe.sql`), posting trees on fewer blocks (`verify.sql`, `corrupt_walk.sql`,
 `gettuple_pause.spec`), and the stats of NARROWs where there were BITSETs (`scanand.sql`,
-`basic.sql`). The first version's changes to `treeprobe.sql` and `fkjoin_adaptive.sql` stand, and
-so does `count_split_race.spec`'s wider pad.
+`basic.sql`). The first version's changes to `treeprobe.sql` and `fkjoin_adaptive.sql` stand, and so
+does `count_split_race.spec`'s wider pad.
 
 ## 39. The competitor's units, and a margin for the pushdown (2026-10-01)
 
