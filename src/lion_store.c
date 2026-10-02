@@ -3,7 +3,7 @@
  * lion_store.c
  *		The window store (DESIGN.md §40): which columns are stored, the
  *		format of the map and of a store page, the build's emitter, the
- *		insert path and VACUUM's pass over it.
+ *		insert path, VACUUM's pass over it, and the gather that reads it.
  *
  * lion_store.h describes the structures and their locking; lion_store_fmt.h
  * the bytes of a store page.  The code is in this order:
@@ -18,6 +18,7 @@
  *	5. the build
  *	6. the insert path
  *	7. VACUUM
+ *	8. the gather, and what verify() asks of the store
  *
  * Every page change goes through the WAL shim of DESIGN.md §25: in rmgr mode
  * a LION_XLOG_STORE record made of the existing operations (INIT, ADD,
@@ -394,6 +395,43 @@ lion_store_value(Relation index, const LionStoreCol *col, Datum d, bool isnull,
 					 errhint("REINDEX the index with a larger store_max_len, or with none.")));
 		v->data = VARDATA_ANY(flat);
 		v->len = (uint32) len;
+	}
+}
+
+/* The datum of stored bytes, a by-reference one copied into cxt. */
+static Datum
+lion_store_datum(const LionStoreCol *col, const char *data, uint32 len,
+				 MemoryContext cxt)
+{
+	if (col->typlen > 0)
+	{
+		if (col->typbyval)
+		{
+			union
+			{
+				Datum		d;
+				char		c[sizeof(Datum)];
+			}			u;
+
+			u.d = 0;
+			memcpy(u.c, data, col->typlen);
+			return fetch_att(u.c, true, col->typlen);
+		}
+		else
+		{
+			char	   *p = MemoryContextAlloc(cxt, col->typlen);
+
+			memcpy(p, data, col->typlen);
+			return PointerGetDatum(p);
+		}
+	}
+	else
+	{
+		struct varlena *v = (struct varlena *) MemoryContextAlloc(cxt, len + VARHDRSZ);
+
+		SET_VARSIZE(v, len + VARHDRSZ);
+		memcpy(VARDATA(v), data, len);
+		return PointerGetDatum(v);
 	}
 }
 
@@ -3128,4 +3166,417 @@ lion_store_page_linked(Relation index, LionIndexState *ix, BlockNumber blk,
 		cur = next;
 	}
 	return false;
+}
+
+/* ---------------------------------------------------------------------
+ * 8. The gather (DESIGN.md §40, "Reads")
+ *
+ * See lion_store.h for why what it returns may be used, and when.  The page
+ * is locked SHARE only while one heap page's sub-array is decoded, and
+ * checked every time it is locked: it may have been split, rewritten, freed
+ * and reused since the last look, and the check is what tells.
+ * --------------------------------------------------------------------- */
+
+struct LionStoreReader
+{
+	Relation	index;
+	LionIndexState *ix;
+	const LionStoreCol *col;
+	MemoryContext cxt;			/* the reader's own */
+	MemoryContext valcxt;		/* the values returned since the last reset */
+	LionStoreCache cache;		/* the map blocks, and the last head */
+
+	/*
+	 * A DICT code's value, for the members of one heap page: decoded once
+	 * per code per lock hold, since the dictionary is only stable while the
+	 * page stays locked.  stamp[c] == gen says val[c] is this hold's.
+	 */
+	Datum	   *dval;
+	uint32	   *dstamp;
+	uint32		dcap;
+	uint32		gen;
+
+	/*
+	 * Of the last gather's absent pages, those that are not ABSENT but have
+	 * no store at all, or not for that offset: for verify(), to which a
+	 * visible row without a value is damage (lion_store_compare()).
+	 */
+	uint64		missing;
+};
+
+LionStoreReader *
+lion_store_open(Relation index, LionIndexState *ix, int ord, MemoryContext cxt)
+{
+	MemoryContext rcxt;
+	LionStoreReader *r;
+
+	if (ord < 0 || ord >= ix->nstored)
+		elog(ERROR, "lion index \"%s\" has no stored column %d",
+			 RelationGetRelationName(index), ord);
+
+	rcxt = AllocSetContextCreate(cxt, "lion store reader", ALLOCSET_SMALL_SIZES);
+	r = (LionStoreReader *) MemoryContextAllocZero(rcxt, sizeof(LionStoreReader));
+	r->index = index;
+	r->ix = ix;
+	r->col = &ix->stored[ord];
+	r->cxt = rcxt;
+	r->valcxt = AllocSetContextCreate(rcxt, "lion store values",
+									  ALLOCSET_DEFAULT_SIZES);
+	r->cache.innerblk = InvalidBlockNumber;
+	r->cache.leafblk = InvalidBlockNumber;
+	r->cache.head = InvalidBlockNumber;
+	return r;
+}
+
+void
+lion_store_close(LionStoreReader *r)
+{
+	MemoryContextDelete(r->cxt);
+}
+
+void
+lion_store_gather_reset(LionStoreReader *r)
+{
+	MemoryContextReset(r->valcxt);
+}
+
+/* The head of the reader's window, from the cache or the map. */
+static BlockNumber
+lion_store_reader_head(LionStoreReader *r, uint64 slot, bool fresh)
+{
+	if (!fresh && r->cache.slot == slot && BlockNumberIsValid(r->cache.head))
+		return r->cache.head;
+	r->cache.slot = slot;
+	r->cache.head = lion_storemap_head(r->index, r->ix->store.store_root, slot,
+									   &r->cache);
+	return r->cache.head;
+}
+
+/* Member values of heap page k, from its checked sub-array s on page. */
+static void
+lion_store_gather_page(LionStoreReader *r, Page page, BlockNumber blk,
+					   const LionStoreHeader *h, const LionStoreSub *s,
+					   const uint16 *lo, int from, int to, Datum *values,
+					   bool *isnull, uint64 *absent_pages)
+{
+	const LionStoreCol *col = r->col;
+	const uint8 *body = (const uint8 *) s + sizeof(LionStoreSub);
+	const char *ditem = NULL;
+	Size		dlen = 0;
+	int			j;
+
+	if (h->mode == LION_STORE_DICT)
+	{
+		ItemId		diid = PageGetItemId(page, LION_STORE_DICT_OFF);
+
+		ditem = (const char *) PageGetItem(page, diid);
+		dlen = ItemIdGetLength(diid);
+		if (!col->typbyval)
+		{
+			if (r->dcap < (uint32) h->ndict + 1)
+			{
+				uint32		cap = Max(64, (uint32) h->ndict + 1);
+
+				if (r->dval != NULL)
+				{
+					pfree(r->dval);
+					pfree(r->dstamp);
+				}
+				r->dval = (Datum *) MemoryContextAlloc(r->cxt, sizeof(Datum) * cap);
+				r->dstamp = (uint32 *) MemoryContextAllocZero(r->cxt, sizeof(uint32) * cap);
+				r->dcap = cap;
+				r->gen = 0;
+			}
+			if (++r->gen == 0)
+			{
+				memset(r->dstamp, 0, sizeof(uint32) * r->dcap);
+				r->gen = 1;
+			}
+		}
+	}
+
+	for (j = from; j < to; j++)
+	{
+		uint16		k;
+		OffsetNumber off;
+		uint32		i;
+
+		lion_lo_split(lo[j], &k, &off);
+		Assert(off >= FirstOffsetNumber);
+		if (off > s->nslots)
+		{
+			/*
+			 * A slot no insert has reached.  The order of §40 ("Writes")
+			 * says a member's slot is written before the member exists, so
+			 * this is not a member a caller can be asking about in earnest;
+			 * the heap answers it.
+			 */
+			*absent_pages |= ((uint64) 1) << k;
+			r->missing |= ((uint64) 1) << k;
+			continue;
+		}
+		i = off - 1;
+
+		if (h->mode == LION_STORE_DICT)
+		{
+			uint32		c = lion_store_code_get(body, h->width, i);
+			uint32		len;
+			const char *data;
+
+			if (c == 0)
+				continue;		/* NULL */
+			if (c > h->ndict)
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("lion index \"%s\": store page %u has code %u of a dictionary of %u entries",
+								RelationGetRelationName(r->index), blk, c,
+								(unsigned) h->ndict),
+						 errhint("REINDEX the index.")));
+			if (!col->typbyval && r->dstamp[c] == r->gen)
+			{
+				values[j] = r->dval[c];
+				isnull[j] = false;
+				continue;
+			}
+			data = lion_store_dict_entry(r->index, col, ditem, dlen, h->ndict,
+										 c, &len);
+			values[j] = lion_store_datum(col, data, len, r->valcxt);
+			isnull[j] = false;
+			if (!col->typbyval)
+			{
+				r->dval[c] = values[j];
+				r->dstamp[c] = r->gen;
+			}
+		}
+		else
+		{
+			const uint8 *slot = body + (Size) i * h->width;
+
+			if (lion_store_null_get(body + (Size) s->nslots * h->width, i))
+				continue;		/* NULL */
+			if (col->typlen > 0)
+				values[j] = lion_store_datum(col, (const char *) slot,
+											 (uint32) col->typlen, r->valcxt);
+			else
+			{
+				uint16		vlen;
+
+				memcpy(&vlen, slot, sizeof(uint16));
+				if ((int) vlen > (int) h->width - (int) sizeof(uint16))
+					ereport(ERROR,
+							(errcode(ERRCODE_INDEX_CORRUPTED),
+							 errmsg("lion index \"%s\": store page %u has a value of %u bytes in a slot of %u",
+									RelationGetRelationName(r->index), blk,
+									(unsigned) vlen, (unsigned) h->width),
+							 errhint("REINDEX the index.")));
+				values[j] = lion_store_datum(col, (const char *) slot + sizeof(uint16),
+											 vlen, r->valcxt);
+			}
+			isnull[j] = false;
+		}
+	}
+}
+
+void
+lion_store_gather(LionStoreReader *r, uint32 ckey, const uint16 *lo, int nlo,
+				  Datum *values, bool *isnull, uint64 *absent_pages)
+{
+	const LionStoreCol *col = r->col;
+	uint64		slot = lion_storemap_slot(ckey, r->ix->nstored, col->ord);
+	BlockNumber head;
+	BlockNumber blk = InvalidBlockNumber;
+	Buffer		buf = InvalidBuffer;
+	int			restarts = 0;
+	int			steps = 0;
+	int			i;
+
+	*absent_pages = 0;
+	r->missing = 0;
+	for (i = 0; i < nlo; i++)
+	{
+		values[i] = (Datum) 0;
+		isnull[i] = true;
+#ifdef USE_ASSERT_CHECKING
+		if (i > 0)
+			Assert(lo[i - 1] < lo[i]);
+#endif
+	}
+	if (nlo == 0)
+		return;
+
+	head = lion_store_reader_head(r, slot, false);
+
+	/*
+	 * Nothing is locked or pinned here: a VACUUM may free the chain under
+	 * this head, and an insert take its pages, before the read below locks
+	 * it (test/isolation/store_vacuum_reader.spec parks a reader here).
+	 */
+	LION_INJECTION_POINT("lion-store-gather-head");
+	i = 0;
+	while (i < nlo)
+	{
+		uint16		k;
+		uint16		k2;
+		OffsetNumber off;
+		int			end;
+		Page		page;
+		LionStoreHeader h;
+		LionStoreSub *s;
+		Size		slen;
+		char	   *msg;
+		bool		ok;
+		BlockNumber next;
+
+		lion_lo_split(lo[i], &k, &off);
+		for (end = i + 1; end < nlo; end++)
+		{
+			lion_lo_split(lo[end], &k2, &off);
+			if (k2 != k)
+				break;
+		}
+
+		if (!BlockNumberIsValid(head))
+		{
+			/* the window has no store for this column (yet) */
+			*absent_pages |= ((uint64) 1) << k;
+			r->missing |= ((uint64) 1) << k;
+			i = end;
+			continue;
+		}
+		if (!BlockNumberIsValid(blk))
+			blk = head;
+
+		if (!BufferIsValid(buf) || BufferGetBlockNumber(buf) != blk)
+		{
+			if (BufferIsValid(buf))
+				ReleaseBuffer(buf);
+			buf = ReadBuffer(r->index, blk);
+		}
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+
+		/*
+		 * The page this read was led to must still be this window's store
+		 * for this column, and a head must still be one (§18; the same test
+		 * the insert path makes, lion_store_find_page()).  If it is not, the
+		 * chain was freed under a cached head, or the map was read before a
+		 * cleanup: read the map again.
+		 */
+		ok = false;
+		if (lion_store_page_owned(page, ckey, (uint16) col->ord))
+		{
+			if ((msg = lion_store_check_header(page, col)) != NULL)
+			{
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("lion index \"%s\": store page %u %s",
+								RelationGetRelationName(r->index), blk, msg),
+						 errhint("REINDEX the index.")));
+			}
+			memcpy(&h, lion_store_page_header(page), sizeof(LionStoreHeader));
+			ok = !(blk == head && h.lo != 0) && k >= h.lo;
+		}
+		if (!ok)
+		{
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			if (++restarts > LION_STORE_MAX_ATTEMPTS)
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("lion index \"%s\": could not find the store page of window %u column %d",
+								RelationGetRelationName(r->index), ckey,
+								col->attno),
+						 errhint("REINDEX the index.")));
+			head = lion_store_reader_head(r, slot, true);
+			blk = InvalidBlockNumber;
+			steps = 0;
+			continue;
+		}
+
+		if (k > h.hi)
+		{
+			next = LionPageGetOpaque(page)->rightlink;
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			if (!BlockNumberIsValid(next))
+			{
+				/* past every range: no row of heap page k is stored yet */
+				*absent_pages |= ((uint64) 1) << k;
+				r->missing |= ((uint64) 1) << k;
+				i = end;
+				continue;
+			}
+			lion_store_chain_step(r->index, blk, next, &steps);
+			blk = next;
+			continue;
+		}
+
+		if ((msg = lion_store_check_sub(page, &h, k)) != NULL)
+		{
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": store page %u %s",
+							RelationGetRelationName(r->index), blk, msg),
+					 errhint("REINDEX the index.")));
+		}
+		s = lion_store_page_sub(page, k, &slen);
+		if ((s->flags & LION_STORE_ABSENT) != 0)
+			*absent_pages |= ((uint64) 1) << k;
+		else
+			lion_store_gather_page(r, page, blk, &h, s, lo, i, end, values,
+								   isnull, absent_pages);
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		i = end;
+	}
+
+	if (BufferIsValid(buf))
+		ReleaseBuffer(buf);
+}
+
+bool
+lion_storemap_linked(Relation index, LionIndexState *ix, BlockNumber blk,
+					 uint16 level, uint64 number)
+{
+	BlockNumber root = ix->store.store_root;
+
+	if (level == LION_STOREMAP_ROOT)
+		return number == 0 && blk == root;
+	if (level == LION_STOREMAP_INNER)
+		return number < LION_STOREMAP_FANOUT &&
+			lion_storemap_read(index, root, LION_STOREMAP_ROOT, 0,
+							   (uint32) number) == blk;
+	if (level == LION_STOREMAP_LEAF)
+		return number / LION_STOREMAP_FANOUT < LION_STOREMAP_FANOUT &&
+			lion_storemap_leaf(index, root, number, NULL) == blk;
+	return false;
+}
+
+int
+lion_store_compare(LionStoreReader *r, ItemPointer tid, Datum d, bool isnull)
+{
+	uint64		code = lion_tid_to_code(tid);
+	uint16		lo = lion_code_lo(code);
+	Datum		got;
+	bool		gotnull;
+	uint64		absent;
+	LionStoreVal want;
+	LionStoreVal have;
+	Datum		fix1;
+	Datum		fix2;
+	int			result;
+
+	lion_store_gather(r, lion_code_ckey(code), &lo, 1, &got, &gotnull, &absent);
+	if (absent != 0)
+		return (r->missing != 0) ? LION_STORE_CMP_MISSING : LION_STORE_CMP_ABSENT;
+	if (gotnull || isnull)
+		result = (gotnull == isnull) ? LION_STORE_CMP_EQUAL : LION_STORE_CMP_DIFFERENT;
+	else
+	{
+		lion_store_value(r->index, r->col, d, false, &want, &fix1);
+		lion_store_value(r->index, r->col, got, false, &have, &fix2);
+		result = lion_store_val_equal(&want, have.data, have.len) ?
+			LION_STORE_CMP_EQUAL : LION_STORE_CMP_DIFFERENT;
+	}
+	lion_store_gather_reset(r);
+	return result;
 }

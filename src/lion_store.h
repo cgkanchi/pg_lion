@@ -215,6 +215,55 @@ extern bool lion_store_page_linked(Relation index, LionIndexState *ix,
  */
 extern void lion_store_free_page(Relation index, Buffer buf);
 
+/* ---------- reading: the gather (DESIGN.md §40, "Reads") ---------- */
+
+typedef struct LionStoreReader LionStoreReader;
+
+/*
+ * A reader of one stored column, by ordinal (lion_store_ordinal()).  It keeps
+ * its own memory in a child of cxt and caches the map blocks and the last
+ * window's chain head it looked up; nothing it caches is trusted without the
+ * check of the page it leads to.
+ */
+extern LionStoreReader *lion_store_open(Relation index, LionIndexState *ix,
+										int ord, MemoryContext cxt);
+extern void lion_store_close(LionStoreReader *r);
+
+/*
+ * The values of window ckey's members lo[0 .. nlo - 1], which must be in
+ * ascending order (heap page, then offset: the order a container iterates
+ * in), into values[] and isnull[].  A by-reference value is copied into the
+ * reader's memory, which lion_store_gather_reset() frees; nothing returned
+ * points into a page.  Bit k of *absent_pages is set for every heap page
+ * lion_ckey_first_block(ckey) + k of the members that the store cannot
+ * supply - an ABSENT sub-array, or a window or heap page with no store yet -
+ * and its members come back NULL: the caller takes those from the heap, as it
+ * does the members of a page that is not all-visible.
+ *
+ * WHY IT IS SAFE TO USE (DESIGN.md §40, "Why it is safe").  The gather takes
+ * no position on visibility and holds nothing when it returns: it takes a
+ * SHARE lock on one store page at a time, only while it decodes one heap
+ * page's sub-array, and pins nothing across calls.  A caller may use a value
+ * it returns for a TID only when that TID came from a container page the
+ * caller still holds pinned (§9) AND the visibility map calls the TID's heap
+ * page all-visible.  Then the row is visible to every snapshot, its slot was
+ * written by the row's own insert before the TID reached any container (the
+ * insert order of §40, "Writes"), and VACUUM - which clears a slot only for a
+ * TID dead to every snapshot, and sets a page all-visible only after
+ * ambulkdelete has returned, which it cannot do while the caller's container
+ * pin stands - cannot have cleared or reused it.  For any other TID the caller
+ * goes to the heap, which settles visibility and value together, and the
+ * store is not consulted.  On a hot standby a generic-mode index has no such
+ * interlock (§9) and every TID goes to the heap.
+ */
+extern void lion_store_gather(LionStoreReader *r, uint32 ckey,
+							  const uint16 *lo, int nlo,
+							  Datum *values, bool *isnull,
+							  uint64 *absent_pages);
+
+/* Free the values every gather since the last reset returned. */
+extern void lion_store_gather_reset(LionStoreReader *r);
+
 /* ---------- page access for lion_index_stats() and verify() ---------- */
 
 /*
@@ -245,6 +294,27 @@ lion_storemap_page_entries(Page page)
 {
 	return (BlockNumber *) PageGetItem(page, PageGetItemId(page, FirstOffsetNumber));
 }
+
+/*
+ * Is blk, a sound map page of (level, number) that a walk did not reach,
+ * linked into the map now (a page an insert added behind the walk)?
+ */
+extern bool lion_storemap_linked(Relation index, LionIndexState *ix,
+								 BlockNumber blk, uint16 level, uint64 number);
+
+/*
+ * verify()'s heapallindexed question: does the store hold (d, isnull) as the
+ * value of tid, a row the check's snapshot sees?  ABSENT says the store
+ * leaves that heap page to the heap; MISSING that it has no slot for the
+ * row, which for a visible row is damage.
+ */
+#define LION_STORE_CMP_EQUAL		0
+#define LION_STORE_CMP_DIFFERENT	1
+#define LION_STORE_CMP_ABSENT		2
+#define LION_STORE_CMP_MISSING		3
+
+extern int	lion_store_compare(LionStoreReader *r, ItemPointer tid, Datum d,
+							   bool isnull);
 
 /* The header of a page lion_store_page_check() accepted. */
 static inline LionStoreHeader *
