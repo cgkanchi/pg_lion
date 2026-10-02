@@ -49,6 +49,18 @@ CREATE INDEX lcr_g200 ON lcr USING lion (g200);
 CREATE INDEX lcr_c2 ON lcr USING lion (c2);
 CREATE INDEX lcr_k ON lcr (k, id);
 VACUUM (FREEZE, ANALYZE) lcr;
+-- the same rows in three range partitions, g200 and c2 indexed in each, and
+-- a default partition that stays empty and is vacuumed with the rest: core
+-- scans it sequentially, at no price
+CREATE TABLE lcrp (id int, g200 int, c2 int) PARTITION BY RANGE (id);
+CREATE TABLE lcrp0 PARTITION OF lcrp FOR VALUES FROM (1) TO (20001);
+CREATE TABLE lcrp1 PARTITION OF lcrp FOR VALUES FROM (20001) TO (40001);
+CREATE TABLE lcrp2 PARTITION OF lcrp FOR VALUES FROM (40001) TO (60001);
+CREATE TABLE lcrpd PARTITION OF lcrp DEFAULT;
+INSERT INTO lcrp SELECT id, g200, c2 FROM lcr;
+CREATE INDEX lcrp_g200 ON lcrp USING lion (g200);
+CREATE INDEX lcrp_c2 ON lcrp USING lion (c2);
+VACUUM (FREEZE, ANALYZE) lcrp;
 
 -- the FK-side join's shape: a fact of 40000 rows over 2000 keys, 20 rows a
 -- key, x of 10 values; its dimension, attr of 7
@@ -248,13 +260,16 @@ SELECT n, lcr_lion(q, sw) AS plan,
 -- AM's BitmapAnd, whose price moves with the indexes' sizes, is never the
 -- cheapest), priced by lion's model as the node is, costs the same at every
 -- margin - at a hundredth it would be core's plan - and is converted at that
--- plan's kind's rate
-SELECT lcr_lion(q, '{enable_bitmapscan, off}') AS plan,
+-- plan's kind's rate; over a partitioned table, where the competitor is an
+-- aggregate over an Append of the partitions' plain index scans and the
+-- sequential scan of the empty one, the same
+SELECT n, lcr_lion(q, '{enable_bitmapscan, off}') AS plan,
 	   lcr_cost(q, '{enable_bitmapscan, off, pg_lion.pushdown_margin, 0.01}') =
 	   lcr_cost(q, '{enable_bitmapscan, off, pg_lion.pushdown_margin, 1}') AS same_at_every_margin,
 	   lcr_cost(q, '{enable_bitmapscan, off, pg_lion.agg_rate, 0.5}') <
 	   lcr_cost(q, '{enable_bitmapscan, off, pg_lion.agg_rate, 1}') AS moves_with_agg_rate
-  FROM (VALUES ('SELECT count(*) FROM lcr WHERE g200 = 17 AND c2 = 1')) v(q);
+  FROM (VALUES ('plain', 'SELECT count(*) FROM lcr WHERE g200 = 17 AND c2 = 1'),
+			   ('partitioned', 'SELECT count(*) FROM lcrp WHERE g200 = 17 AND c2 = 1')) v(n, q);
 
 -- ---------- 3. the rates ----------
 -- Each kind of competitor, made the cheapest by core's settings: a plain
@@ -319,7 +334,7 @@ SELECT n, lcr_same(q, sw) AS answer
 			   ('semi', 'SELECT d.pk FROM lcrd d WHERE EXISTS (SELECT 1 FROM lcrf f WHERE f.fk = d.pk AND f.x = 3)', '{enable_hashjoin, off, enable_mergejoin, off, enable_nestloop, off}'::text[]),
 			   ('anti', 'SELECT d.pk FROM lcrd d WHERE NOT EXISTS (SELECT 1 FROM lcrf f WHERE f.fk = d.pk AND f.x = 3)', '{enable_hashjoin, off, enable_mergejoin, off, enable_nestloop, off}'::text[])) v(n, q, sw);
 
-DROP TABLE lcr, lcrf, lcrd;
+DROP TABLE lcr, lcrp, lcrf, lcrd;
 DROP FUNCTION lcr_rates(text, text[], text[], text[]);
 DROP FUNCTION lcr_same(text, text[]);
 DROP FUNCTION lcr_lion(text, text[]);

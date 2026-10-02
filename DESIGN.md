@@ -16733,7 +16733,10 @@ three prices carry no such error, and are offered at no margin whatever it is se
 
 - *Nothing to compete with* - `NONE` or `DISABLED` above: the choice is not between lion and core.
 - *The AM's own scan of a lion index* (`lion_path_is_lion_scan()`: a plain, index-only or bitmap
-  scan of one, under the nodes that pass its rows up), for a count: that price is
+  scan of one, or an Append of a partitioned table's partitions in which such scans cost at least
+  ten times the rest - an empty partition, or one of a page or two, is scanned sequentially at
+  next to no price, and a partition scanned another way at a price that counts keeps the margin -
+  under the nodes that pass its rows up), for a count: that price is
   `lioncostestimate()`'s, lion's model with lion's errors, and a margin would only tilt a choice
   between two of lion's plans. At 0.8 three counts of the regression suite went from the node to
   such a scan: `corrupt_walk.sql`'s, 3.9 ms against the node's 1.75; `indexscan.sql`'s clustered
