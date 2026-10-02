@@ -16578,6 +16578,30 @@ Otherwise - a page not marked, at either look, or a count that moved - the aggre
 and each entry is counted as a group of a walk is (`lion_node_count()`), the NULL entry included.
 So is every walk during recovery, where a standby's snapshot holds nothing back on the primary.
 
+**What the walk locks.** It reads every row of the table, so it takes the predicate lock a
+sequential scan takes, `PredicateLockRelation()` on the heap, on every run and before the first
+look. The relation locks the node takes on the indexes it reads (§9, "SERIALIZABLE") do not
+stand in for it: they see every insert, since the sum over every row reads a whole index of the
+table, which every insert reaches, but a DELETE reaches no index. The counted walk's page locks
+(§9) saw it; the walk from the entries' counts visits no heap page and took none.
+
+**An expression of the key waits for a look.** Giving an entry to its aggregates evaluates their
+arguments on its key. Until a look has vouched for its header, though, its `ntids` may count the
+TID of a row this snapshot does not see, inserted after the first look by a transaction that rolls
+back or commits after the snapshot, and its key may be one no row the snapshot sees has, and an
+expression evaluated on it can fail where the sequential scan, which never meets the row, does not:
+`sum(100 / k)` on an inserted `k = 0`. So the walk of a column with an aggregate of an expression
+of its key keeps each entry with a row - its key and `ntids` - in a batch (`LionWBatch`), and gives
+the batch to its aggregates only after a look that passes. Nothing in the argument above is
+particular to the last header: a look that finds every page marked, as many pages and no count
+moved says of every header read before it what the second look says of all of them. So when the
+batch fills `work_mem` the walk looks there and then, gives the batch its aggregates if the look
+passes and stops, to count every entry, if it does not; the look after the walk gives the rest. A
+column whose aggregates all take the bare key adds each entry as it reads it: a sum of keys is
+128-bit arithmetic and an extreme of them the column's own sort operator, neither of which fails on
+a value of the column's type. The counted walk needs neither: an entry with no row is given to no
+aggregate (`lion_wagg_add()`).
+
 **The rows of an aborted insert** (2026-10-02 review; the 2026-10-01 soak found it, and
 `test/soak/findings/wagg_aborted_insert.spec` on its branch was the reproducer). The section
 first said of every change what the COMMITS bullet says: "the page cannot be marked again while
@@ -16619,6 +16643,26 @@ the kill needs a conflicting tuple inserted concurrently, which either commits, 
 unmarked while the walk's snapshot holds VACUUM back, or aborts, and the killer's retry then
 inserts its own row and has to abort too.
 
+**SERIALIZABLE** (2026-10-02 review). The walk from the entries' counts took no predicate lock on
+the heap: two SERIALIZABLE transactions that each read `sum(k)` through it and each deleted, by
+ctid, a row the other's sum counted both committed, where the sequential scan's relation lock
+fails the second with a serialization failure. Inserts were caught, by the index's own lock, and
+so were deletes under the counted walk, by its page locks. "What the walk locks" above is the fix;
+it also makes the counted walk's page locks redundant, a coarser lock covering them. A standby
+needs nothing: it refuses SERIALIZABLE. `test/isolation/wagg_serializable.spec` is the schedule:
+both commit without the lock.
+
+**The key of a row the snapshot does not see** (2026-10-02 review). The walk evaluated an
+aggregate's argument on each entry's key as it read the entry. Parked after the first look
+(`lion-wagg-looked`), an insert of `k = 0` that rolled back, or that committed after the snapshot,
+made `SELECT sum(100 / k), min(1000 / k), max(k)` fail with "division by zero" where the
+sequential scan answers 964 | 0 | 5000: the second look would have sent the walk to counting each
+entry, where `k = 0` has no row, but the error came first (`test/isolation/wagg_unseen_key.spec`).
+"An expression of the key waits for a look" above is the fix. A tuplestore of the keys and their
+rows, read back after the second look, was weighed: it keeps the one look, but spills to a
+temporary file past `work_mem`, where the batch takes another look instead - a read of the map's
+pages and of each walked index's meta page.
+
 *What the dirty-key walk needs* (`claude/lion-walkcost-wagg`, not merged): its `LION_WALK_DIRTY`
 walk takes an entry's `ntids` when none of its members lies under a container key that held a page
 not all-visible at the first look, and keeps the walk when no clean key turned dirty by the second.
@@ -16627,7 +16671,8 @@ clean key's page, pruned and marked again between the two looks, passes both tes
 (`wagg_aborted_insert_dirty.spec` on the soak branch). The same comparison closes it - each walked
 index's `bulkdeletes` read before the first look and compared after the second, falling to its
 `LION_WALK_LIVE` walk when it moved; that walk asks the map under the leaf's pin, so it needs
-nothing.
+nothing. Its entries taken from `ntids` need the batch of "An expression of the key waits for a
+look" as this walk's do.
 
 ### The results, as core computes them
 
@@ -16687,6 +16732,14 @@ counted after a DELETE, beside this transaction's own insert and delete, and aga
 an empty table and one of NULLs only; and the declines - a WHERE, a GROUP BY, two columns in one
 argument, a volatile argument, DISTINCT, FILTER, ORDER BY, a numeric column, the aggregates no
 sum of keys answers, and a partial index.
+
+`test/isolation/wagg_serializable.spec`: the write skew of "SERIALIZABLE" above, through deletes
+under the walk from the entries' counts and under the counted walk, and through inserts.
+
+`test/isolation/wagg_unseen_key.spec`: the insert of "The key of a row the snapshot does not see",
+rolled back and committed, and rolled back again with `work_mem` at 64kB, where the look the walk
+takes once about a thousand keys wait finds the page unmarked and stops it. `keyaggs.sql` takes
+the walk at 64kB too, through some thirty looks that pass.
 
 ## 38. NARROW containers: a bitmap as wide as the heap's offsets (format version 8, implemented 2026-10-01, any width 2026-10-02)
 
