@@ -2914,15 +2914,140 @@ lion_wagg_add(LionCountScanState *st, int c, Datum key, bool isnull,
 }
 
 /*
- * One walk of column c's entries, every one of them the NULL one included:
- * with fast, each entry's rows its ntids; without, each entry counted.
+ * The entries the walk from the entries' own counts has read and not yet
+ * given to their aggregates, because an aggregate over their column takes an
+ * EXPRESSION of the key: it is evaluated on a key only once a look at the map
+ * has vouched for the entry's count (lion_wagg_run()), or it could meet the
+ * key of a row the snapshot does not see and fail where the sequential scan
+ * does not - `sum(100 / k)` on an inserted k = 0 that rolled back.  At most
+ * work_mem of them wait.
  */
+typedef struct LionWPending
+{
+	int			col;
+	bool		isnull;
+	Datum		key;			/* in LionWBatch.cxt */
+	int64		rows;
+} LionWPending;
+
+typedef struct LionWBatch
+{
+	MemoryContext cxt;			/* the keys and ent; NULL until the first */
+	LionWPending *ent;
+	int			n;
+	int			max;
+	BlockNumber nblocks;		/* the heap's, at the first look */
+} LionWBatch;
+
+#define LION_WAGG_MAXPENDING	((int) (MaxAllocSize / sizeof(LionWPending)))
+
+/*
+ * Are the counts of every header read so far the snapshot's rows
+ * (lion_wagg_run())?  Every heap page all-visible, as many pages as at the
+ * first look, and no walked index's count of bulk deletes moved.
+ */
+static bool
+lion_wagg_unchanged(LionCountScanState *st, BlockNumber before)
+{
+	BlockNumber after;
+	int			c;
+
+	if (!lion_heap_all_visible(st->heap, &after) || after != before)
+		return false;
+	for (c = 0; c < st->nwcol; c++)
+	{
+		if (lion_wagg_bulkdeletes(st->wcol[c].idx) != st->wcol[c].bulkdeletes)
+			return false;
+	}
+	return true;
+}
+
+/* The waiting entries given to their aggregates, once a look has said so. */
 static void
-lion_wagg_walk(LionCountScanState *st, int c, bool fast)
+lion_wagg_flush(LionCountScanState *st, LionWBatch *b)
+{
+	int			i;
+
+	for (i = 0; i < b->n; i++)
+	{
+		LionWPending *p = &b->ent[i];
+
+		CHECK_FOR_INTERRUPTS();
+		lion_wagg_add(st, p->col, p->key, p->isnull, p->rows);
+	}
+	if (b->cxt != NULL)
+		MemoryContextReset(b->cxt);
+	b->ent = NULL;
+	b->n = 0;
+	b->max = 0;
+}
+
+/*
+ * An entry of column c, read by the walk from the entries' counts, to wait
+ * for a look; when the waiting ones fill work_mem, the look is taken now and
+ * they are given their aggregates.  False when it found the counts no longer
+ * the snapshot's.
+ */
+static bool
+lion_wagg_defer(LionCountScanState *st, LionWBatch *b, int c,
+				LionState *state, Datum key, bool isnull, int64 rows)
+{
+	MemoryContext oldcxt;
+	LionWPending *p;
+
+	if (b->cxt == NULL)
+		b->cxt = AllocSetContextCreate(st->wcxt,
+									   "LionCount keys awaiting a look",
+									   ALLOCSET_DEFAULT_SIZES);
+	if (b->n > 0 &&
+		(b->n == LION_WAGG_MAXPENDING ||
+		 MemoryContextMemAllocated(b->cxt, false) >= (Size) work_mem * 1024))
+	{
+		if (!lion_wagg_unchanged(st, b->nblocks))
+			return false;
+		lion_wagg_flush(st, b);
+	}
+
+	oldcxt = MemoryContextSwitchTo(b->cxt);
+	if (b->n == b->max)
+	{
+		b->max = Min(Max(b->max * 2, 64), LION_WAGG_MAXPENDING);
+		b->ent = (b->ent == NULL) ?
+			(LionWPending *) palloc(sizeof(LionWPending) * b->max) :
+			(LionWPending *) repalloc(b->ent, sizeof(LionWPending) * b->max);
+	}
+	p = &b->ent[b->n++];
+	p->col = c;
+	p->isnull = isnull;
+	p->key = isnull ? (Datum) 0 :
+		datumCopy(key, state->typbyval, state->typlen);
+	p->rows = rows;
+	MemoryContextSwitchTo(oldcxt);
+	return true;
+}
+
+/*
+ * One walk of column c's entries, every one of them the NULL one included:
+ * with batch, each entry's rows its ntids - waiting in batch for a look, when
+ * an aggregate over the column takes an expression of the key; without, each
+ * entry counted.  False when a look the walk took found the counts no longer
+ * the snapshot's, and it stopped there.
+ */
+static bool
+lion_wagg_walk(LionCountScanState *st, int c, LionWBatch *batch)
 {
 	LionWCol   *wc = &st->wcol[c];
 	LionEntryScan es;
 	MemoryContext oldcxt;
+	bool		defer = false;
+	bool		ok = true;
+	int			i;
+
+	for (i = 0; batch != NULL && i < st->nwagg; i++)
+	{
+		if (st->wagg[i].col == c && !st->wagg[i].argiskey)
+			defer = true;
+	}
 
 	lion_entry_scan_begin_col(&es, wc->idx, wc->idxcol);
 	for (;;)
@@ -2930,10 +3055,11 @@ lion_wagg_walk(LionCountScanState *st, int c, bool fast)
 		CHECK_FOR_INTERRUPTS();
 		MemoryContextReset(st->pergroup);
 		oldcxt = MemoryContextSwitchTo(st->pergroup);
-		if (fast)
+		if (batch != NULL)
 		{
 			LionEntryTuple *entry;
 			Size		itemlen;
+			Datum		key;
 			bool		isnull;
 
 			entry = lion_entry_scan_next_copy(&es, &itemlen);
@@ -2943,9 +3069,17 @@ lion_wagg_walk(LionCountScanState *st, int c, bool fast)
 				break;
 			}
 			isnull = LionEntryIsNullKey(entry);
-			lion_wagg_add(st, c,
-						  isnull ? (Datum) 0 : lion_entry_key(es.state, entry),
-						  isnull, (int64) entry->ntids);
+			key = isnull ? (Datum) 0 : lion_entry_key(es.state, entry);
+			if (!defer)
+				lion_wagg_add(st, c, key, isnull, (int64) entry->ntids);
+			else if (entry->ntids > 0 &&
+					 !lion_wagg_defer(st, batch, c, es.state, key, isnull,
+									  (int64) entry->ntids))
+			{
+				MemoryContextSwitchTo(oldcxt);
+				ok = false;
+				break;
+			}
 		}
 		else
 		{
@@ -2972,6 +3106,7 @@ lion_wagg_walk(LionCountScanState *st, int c, bool fast)
 		MemoryContextSwitchTo(oldcxt);
 	}
 	lion_entry_scan_end(&es);
+	return ok;
 }
 
 /* Every aggregate over keys, begun again. */
@@ -3028,16 +3163,22 @@ lion_wagg_reset(LionCountScanState *st)
  * counted itself on the meta page as it ended (lion_meta_count_bulkdelete()).
  * So the meta page's count, read before the first look and after the second,
  * moved.  When it did not, nothing changed in between, and every ntids read
- * counted exactly the rows of the first look: this snapshot's.  During
- * recovery the standby's snapshot holds nothing back on the primary, and
- * every entry is counted.
+ * counted exactly the rows of the first look: this snapshot's.
+ *
+ * Nothing there is particular to the last header: a look that finds the same
+ * says it of every header read before it.  Until one has, a header may count
+ * the TID of a row the snapshot does not see, and the expression of an
+ * aggregate's argument must not meet that row's key, which the sequential scan
+ * never evaluates it on: it is evaluated only on entries a look has vouched
+ * for (LionWBatch), and when work_mem of them wait, that look is taken there
+ * and then.  During recovery the standby's snapshot holds nothing back on the
+ * primary, and every entry is counted.
  */
 void
 lion_wagg_run(LionCountScanState *st)
 {
 	EState	   *estate = st->css.ss.ps.state;
 	BlockNumber before;
-	BlockNumber after;
 	bool		fast;
 	int			c;
 	int			i;
@@ -3063,21 +3204,35 @@ lion_wagg_run(LionCountScanState *st)
 	}
 	if (fast)
 	{
-		for (c = 0; c < st->nwcol; c++)
-			lion_wagg_walk(st, c, true);
+		LionWBatch	batch;
+
+		memset(&batch, 0, sizeof(batch));
+		batch.nblocks = before;
+
+		/*
+		 * Test hook: the map has been looked at and no header read yet, so a
+		 * row inserted here, by a transaction that rolls back or commits, is
+		 * in the headers the walks read (the isolation spec
+		 * wagg_unseen_key).  Compiles to nothing without
+		 * --enable-injection-points.
+		 */
+		LION_INJECTION_POINT("lion-wagg-looked");
+		for (c = 0; fast && c < st->nwcol; c++)
+			fast = lion_wagg_walk(st, c, &batch);
 
 		/*
 		 * Test hook: every header has been read and the map not looked at
-		 * again, so a VACUUM here may take out TIDs the walks counted and
-		 * mark their pages all-visible again (the isolation spec
+		 * since the last, so a VACUUM here may take out TIDs the walks
+		 * counted and mark their pages all-visible again (the isolation spec
 		 * wagg_aborted_insert).  Compiles to nothing without
 		 * --enable-injection-points.
 		 */
 		LION_INJECTION_POINT("lion-wagg-walked");
-		fast = lion_heap_all_visible(st->heap, &after) && after == before;
-		for (c = 0; fast && c < st->nwcol; c++)
-			fast = (lion_wagg_bulkdeletes(st->wcol[c].idx) ==
-					st->wcol[c].bulkdeletes);
+		fast = fast && lion_wagg_unchanged(st, before);
+		if (fast)
+			lion_wagg_flush(st, &batch);
+		if (batch.cxt != NULL)
+			MemoryContextDelete(batch.cxt);
 		st->wfast += st->nwcol;
 		if (!fast)
 			lion_wagg_reset(st);
@@ -3085,7 +3240,7 @@ lion_wagg_run(LionCountScanState *st)
 	if (!fast)
 	{
 		for (c = 0; c < st->nwcol; c++)
-			lion_wagg_walk(st, c, false);
+			(void) lion_wagg_walk(st, c, NULL);
 		st->wslow += st->nwcol;
 	}
 
