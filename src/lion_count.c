@@ -11,7 +11,10 @@
  */
 #include "postgres.h"
 
+#include "access/detoast.h"
+
 #include "lion_count_int.h"
+#include "lion_store.h"
 
 static bool lion_exists_settled(LionCountCtx *cx);
 static bool lion_sources_collect_keys(Relation heap, Snapshot snapshot,
@@ -230,6 +233,351 @@ lion_collect_container(LionCollect *col, const LionContainer *c)
 	col->members += lion_container_cardinality(c);
 }
 
+/* ---------------------------------------------------------------------
+ * Gathering stored columns (DESIGN.md §40, "The custom shapes")
+ * --------------------------------------------------------------------- */
+
+/*
+ * The gather of lion_count.h.  The columns are read through one reader each,
+ * and a container's members on its all-visible pages go to every reader
+ * together, as one ascending list of lo codes (lion_store_gather() wants
+ * them in the order a container iterates in).  The arrays are a container's
+ * worth at most - LION_CONTAINER_RANGE members - and grow to the largest
+ * container seen.
+ */
+struct LionGather
+{
+	MemoryContext cxt;			/* the gather's own */
+	MemoryContext rowcxt;		/* one heap row's detoasted values */
+	Relation	heap;
+	Relation	index;
+	int			ncols;
+	LionStoreReader **readers;	/* one per column */
+	AttrNumber *heapattno;		/* the column in the heap */
+	int16	   *typlen;
+	LionGatherRowFn row;
+	void	   *arg;
+
+	/* a container's members on its all-visible pages, and their values */
+	int			cap;
+	uint16	   *lo;
+	Datum	   *values;			/* column-major: column j at j * cap */
+	bool	   *isnull;
+
+	/* one row's, handed to row */
+	Datum	   *rowvals;
+	bool	   *rownulls;
+
+	LionGatherStats stats;
+};
+
+LionGather *
+lion_gather_create(Relation heap, Relation index, int ncols, const int *ords,
+				   LionGatherRowFn row, void *arg, MemoryContext cxt)
+{
+	LionIndexState *ix = lion_get_index_state(index);
+	MemoryContext gcxt;
+	MemoryContext oldcxt;
+	LionGather *g;
+	int			j;
+
+	Assert(ncols > 0);
+	gcxt = AllocSetContextCreate(cxt, "lion gather", ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(gcxt);
+	g = (LionGather *) palloc0(sizeof(LionGather));
+	g->cxt = gcxt;
+	g->rowcxt = AllocSetContextCreate(gcxt, "lion gather row",
+									  ALLOCSET_SMALL_SIZES);
+	g->heap = heap;
+	g->index = index;
+	g->ncols = ncols;
+	g->readers = (LionStoreReader **) palloc0(sizeof(LionStoreReader *) * ncols);
+	g->heapattno = (AttrNumber *) palloc0(sizeof(AttrNumber) * ncols);
+	g->typlen = (int16 *) palloc0(sizeof(int16) * ncols);
+	g->rowvals = (Datum *) palloc0(sizeof(Datum) * ncols);
+	g->rownulls = (bool *) palloc0(sizeof(bool) * ncols);
+	g->row = row;
+	g->arg = arg;
+	for (j = 0; j < ncols; j++)
+	{
+		const LionStoreCol *col;
+		AttrNumber	heapattno;
+
+		if (ords[j] < 0 || ords[j] >= ix->nstored)
+			elog(ERROR, "lion index \"%s\" has no stored column %d",
+				 RelationGetRelationName(index), ords[j]);
+		col = &ix->stored[ords[j]];
+
+		/*
+		 * The heap path reads the column by its attribute number, so it has
+		 * to be a plain column: an INCLUDE column always is, a key column
+		 * unless it is an expression - which the planner never gathers.
+		 */
+		heapattno = index->rd_index->indkey.values[col->attno - 1];
+		if (heapattno <= 0 ||
+			heapattno > RelationGetDescr(heap)->natts ||
+			TupleDescAttr(RelationGetDescr(heap), heapattno - 1)->atttypid !=
+			col->typid)
+			elog(ERROR, "lion index \"%s\": stored column %d is not a column of \"%s\"",
+				 RelationGetRelationName(index), col->attno,
+				 RelationGetRelationName(heap));
+		g->heapattno[j] = heapattno;
+		g->typlen[j] = col->typlen;
+		g->readers[j] = lion_store_open(index, ix, ords[j], gcxt);
+	}
+	MemoryContextSwitchTo(oldcxt);
+	return g;
+}
+
+void
+lion_gather_destroy(LionGather *g)
+{
+	if (g == NULL)
+		return;
+	MemoryContextDelete(g->cxt);
+}
+
+void
+lion_gather_get_stats(const LionGather *g, LionGatherStats *out)
+{
+	*out = g->stats;
+}
+
+void
+lion_vis_cache_set_gather(LionVisCache *cache, LionGather *g)
+{
+	if (cache == NULL)
+	{
+		if (g != NULL)
+			elog(ERROR, "lion index count: a gather needs a visibility cache");
+		return;
+	}
+	cache->gather = g;
+}
+
+LionGather *
+lion_vis_cache_get_gather(LionVisCache *cache)
+{
+	return (cache != NULL) ? cache->gather : NULL;
+}
+
+/* Room for n members of a container. */
+static void
+lion_gather_reserve(LionGather *g, int n)
+{
+	int			cap = Max(g->cap, 256);
+
+	if (n <= g->cap)
+		return;
+	while (cap < n)
+		cap *= 2;
+	cap = Min(cap, LION_CONTAINER_RANGE);
+	if (n > cap)
+		elog(ERROR, "lion index count: a container of more than %d members",
+			 LION_CONTAINER_RANGE);
+	if (g->lo != NULL)
+	{
+		/* the members collected so far stay; the values come after */
+		g->lo = (uint16 *) repalloc(g->lo, sizeof(uint16) * cap);
+		pfree(g->values);
+		pfree(g->isnull);
+	}
+	else
+		g->lo = (uint16 *) MemoryContextAlloc(g->cxt, sizeof(uint16) * cap);
+	g->values = (Datum *) MemoryContextAlloc(g->cxt,
+											 sizeof(Datum) * cap * g->ncols);
+	g->isnull = (bool *) MemoryContextAlloc(g->cxt,
+											sizeof(bool) * cap * g->ncols);
+	g->cap = cap;
+}
+
+typedef struct LionGatherCollector
+{
+	LionGather *g;
+	uint64		blocks;			/* the heap pages whose members to take */
+	int			n;
+} LionGatherCollector;
+
+static bool
+lion_gather_cb(uint16 lo, void *arg)
+{
+	LionGatherCollector *gc = (LionGatherCollector *) arg;
+	uint16		blkinc;
+	OffsetNumber off;
+
+	lion_lo_split(lo, &blkinc, &off);
+	Assert(blkinc < LION_BLOCKS_PER_CONTAINER);
+	if ((gc->blocks & (((uint64) 1) << blkinc)) == 0)
+		return true;
+
+	/* a damaged container could hold more than its header says */
+	if (gc->n >= gc->g->cap)
+		lion_gather_reserve(gc->g, gc->n + 1);
+	gc->g->lo[gc->n++] = lo;
+	return true;
+}
+
+/*
+ * The heap row `tuple`, which the count counts, handed to the gather with
+ * its values read from the tuple itself (DESIGN.md §40: a row whose page is
+ * not all-visible, or one the store leaves to the heap).  The caller holds
+ * the pin of the tuple's page.
+ */
+static void
+lion_gather_tuple(LionGather *g, HeapTuple tuple)
+{
+	TupleDesc	desc = RelationGetDescr(g->heap);
+	MemoryContext oldcxt = MemoryContextSwitchTo(g->rowcxt);
+	int			j;
+
+	for (j = 0; j < g->ncols; j++)
+	{
+		Datum		d = heap_getattr(tuple, g->heapattno[j], desc,
+									 &g->rownulls[j]);
+
+		/*
+		 * The store holds a varlena detoasted and uncompressed; the heap may
+		 * hold it compressed inline or out of line, which a hash or a
+		 * comparison would detoast on every use - and a TOAST pointer must
+		 * not be kept past the row.  A short header is a plain value.
+		 */
+		if (!g->rownulls[j] && g->typlen[j] == -1 &&
+			(VARATT_IS_EXTERNAL(DatumGetPointer(d)) ||
+			 VARATT_IS_COMPRESSED(DatumGetPointer(d))))
+			d = PointerGetDatum(detoast_attr((struct varlena *) DatumGetPointer(d)));
+		g->rowvals[j] = d;
+	}
+	MemoryContextSwitchTo(oldcxt);
+
+	g->row(g->arg, g->rowvals, g->rownulls);
+	g->stats.heap_rows++;
+	MemoryContextReset(g->rowcxt);
+}
+
+/*
+ * lion_count_container_masks() for a count that gathers (DESIGN.md §40): the
+ * members of the all-visible pages - `members & allvis` - take their values
+ * from the store and are handed over here, under the pins the caller holds;
+ * the members of every other page, and of an all-visible page the store
+ * cannot supply (*absent_pages of lion_store_gather()), go to the heap
+ * recheck, which hands them over with their values from the heap tuple if
+ * the snapshot sees them (lion_recheck_heap_rows()).  So a row's value is
+ * taken from the store exactly when its count is taken from the visibility
+ * map, which is the safe-use contract of lion_store_gather().
+ *
+ * The store pages are share-locked one at a time inside the gather and
+ * released before it returns; the caller holds pins, not locks, on the pages
+ * the container came from, so no store page is ever locked together with a
+ * directory or posting page (lion_store.h).
+ */
+static void
+lion_gather_container(LionCountCtx *cx, const LionContainer *c,
+					  uint64 members, uint64 allvis)
+{
+	LionGather *g = cx->gather;
+	BlockNumber firstblk = lion_ckey_first_block(c->ckey);
+	uint64		clean = members & allvis;
+	uint64		absent = 0;
+	uint64		heapblocks;
+	int64		fed = 0;
+	int			j;
+
+	Assert(g != NULL && cx->collect == NULL && !cx->exists);
+
+	if (clean != 0)
+	{
+		LionGatherCollector gc;
+		int			i;
+
+		gc.g = g;
+		gc.blocks = clean;
+		gc.n = 0;
+		lion_gather_reserve(g, (int) Min(lion_container_cardinality(c),
+										 (uint32) LION_CONTAINER_RANGE));
+		lion_container_iterate(c, lion_gather_cb, &gc);
+
+		for (j = 0; j < g->ncols; j++)
+		{
+			uint64		a = 0;
+
+			lion_store_gather(g->readers[j], c->ckey, g->lo, gc.n,
+							  g->values + (Size) j * g->cap,
+							  g->isnull + (Size) j * g->cap, &a);
+			absent |= a;
+		}
+		Assert((absent & ~clean) == 0);
+		absent &= clean;
+
+		for (i = 0; i < gc.n; i++)
+		{
+			uint16		blkinc;
+			OffsetNumber off;
+
+			lion_lo_split(g->lo[i], &blkinc, &off);
+			if ((absent & (((uint64) 1) << blkinc)) != 0)
+				continue;		/* the heap's, below */
+			for (j = 0; j < g->ncols; j++)
+			{
+				g->rowvals[j] = g->values[(Size) j * g->cap + i];
+				g->rownulls[j] = g->isnull[(Size) j * g->cap + i];
+			}
+			g->row(g->arg, g->rowvals, g->rownulls);
+			fed++;
+		}
+		for (j = 0; j < g->ncols; j++)
+			lion_store_gather_reset(g->readers[j]);
+
+		cx->count += fed;
+		g->stats.store_rows += fed;
+		g->stats.store_pages += pg_popcount64(clean & ~absent);
+		g->stats.absent_pages += pg_popcount64(absent);
+		cx->stats.blocks_skipped_via_vm += pg_popcount64(clean & ~absent);
+	}
+
+	/*
+	 * Every other member is the heap's: those of the pages that are not
+	 * all-visible, as for any count, and those of the all-visible pages the
+	 * store left to it.  The recheck settles visibility and values together.
+	 */
+	heapblocks = (members & ~allvis) | absent;
+	if (heapblocks != 0)
+	{
+		bool		needrecheck[LION_BLOCKS_PER_CONTAINER];
+		uint64		m = heapblocks;
+		LionRecheckCollector rc;
+
+		memset(needrecheck, 0, sizeof(needrecheck));
+		while (m != 0)
+		{
+			int			b = pg_rightmost_one_pos64(m);
+
+			m &= m - 1;
+			needrecheck[b] = true;
+		}
+		rc.cx = cx;
+		rc.ckey = c->ckey;
+		rc.needrecheck = needrecheck;
+		lion_container_iterate(c, lion_recheck_cb, &rc);
+	}
+
+	/*
+	 * The pages whose rows were taken from the store are not visited in the
+	 * heap: lock them as an index-only scan would, as the count does.
+	 */
+	if (cx->serializable)
+	{
+		uint64		m = clean & ~absent;
+
+		while (m != 0)
+		{
+			int			b = pg_rightmost_one_pos64(m);
+
+			m &= m - 1;
+			PredicateLockPage(cx->heap, firstblk + (BlockNumber) b, cx->snapshot);
+		}
+	}
+}
+
 /*
  * Step 1 of counting a container: ask the visibility map about every heap
  * block that has members, and either count the members outright (plus a
@@ -314,6 +662,13 @@ lion_count_container_masks(LionCountCtx *cx, const LionContainer *c,
 {
 	BlockNumber firstblk = lion_ckey_first_block(c->ckey);
 	uint64		dirty;			/* blocks with members that need a heap recheck */
+
+	/* A count that gathers takes its values where it takes its rows (§40). */
+	if (cx->gather != NULL)
+	{
+		lion_gather_container(cx, c, members, allvis);
+		return;
+	}
 
 	dirty = members & ~allvis;
 
@@ -805,8 +1160,9 @@ lion_row_filter_test(LionRowFilter *filter, HeapTuple tuple)
 
 /*
  * lion_recheck_heap_heap() for a count with a row filter (DESIGN.md §17, "A
- * query known only at run time"): the row the snapshot sees is not only
- * found, it is tested, and counted when it passes.
+ * query known only at run time") or a gather (§40, "The custom shapes"): the
+ * row the snapshot sees is not only found, it is tested, and counted when it
+ * passes - and a gather is handed its values, read from the tuple.
  *
  * The chain of each candidate is resolved under the share lock exactly as
  * there - heap_hot_search_buffer(), its serializable conflict checks and
@@ -822,9 +1178,10 @@ lion_row_filter_test(LionRowFilter *filter, HeapTuple tuple)
  * are visible, but the filter needs their tuples.
  */
 static int64
-lion_recheck_heap_filtered(LionCountCtx *cx)
+lion_recheck_heap_rows(LionCountCtx *cx)
 {
 	LionRowFilter *filter = cx->filter;
+	LionGather *gather = cx->gather;
 	OffsetNumber vis[MaxHeapTuplesPerPage];
 	int			visidx[MaxHeapTuplesPerPage];	/* ... and its place in tids */
 	int64		passed = 0;
@@ -874,11 +1231,13 @@ lion_recheck_heap_filtered(LionCountCtx *cx)
 			tuple.t_tableOid = RelationGetRelid(cx->heap);
 			ItemPointerSet(&tuple.t_self, blk, vis[j]);
 
-			if (lion_row_filter_test(filter, &tuple))
+			if (filter == NULL || lion_row_filter_test(filter, &tuple))
 			{
 				passed++;
 				if (cx->visout != NULL)
 					cx->visout[visidx[j]] = true;
+				if (gather != NULL)
+					lion_gather_tuple(gather, &tuple);
 			}
 			else
 				cx->stats.rows_removed++;
@@ -895,6 +1254,14 @@ int64
 lion_count_heap_filtered(Relation heap, Snapshot snapshot,
 						 LionRowFilter *filter, LionCountStats *stats)
 {
+	return lion_count_heap_gather(heap, snapshot, filter, NULL, stats);
+}
+
+int64
+lion_count_heap_gather(Relation heap, Snapshot snapshot,
+					   LionRowFilter *filter, LionGather *g,
+					   LionCountStats *stats)
+{
 	TableScanDesc scan;
 	HeapTuple	tuple;
 	BlockNumber lastblk = InvalidBlockNumber;
@@ -902,6 +1269,8 @@ lion_count_heap_filtered(Relation heap, Snapshot snapshot,
 
 	if (filter == NULL || filter->heap != heap)
 		elog(ERROR, "lion index count: a heap scan without its row filter");
+	if (g != NULL && g->heap != heap)
+		elog(ERROR, "lion index count: a gather for another relation");
 
 	/*
 	 * An ordinary sequential scan under the count's snapshot: it takes the
@@ -921,7 +1290,11 @@ lion_count_heap_filtered(Relation heap, Snapshot snapshot,
 		}
 		stats->tids_rechecked++;
 		if (lion_row_filter_test(filter, tuple))
+		{
 			count++;
+			if (g != NULL)
+				lion_gather_tuple(g, tuple);
+		}
 		else
 			stats->rows_removed++;
 		CHECK_FOR_INTERRUPTS();
@@ -950,15 +1323,15 @@ lion_recheck_heap(LionCountCtx *cx)
 		qsort(cx->tids, cx->ntids, sizeof(ItemPointerData), lion_tid_cmp);
 
 	/*
-	 * A filtered count reads the tuples themselves, which only the heap AM
-	 * gives it that way; the count pushdown refuses every other table AM
-	 * before it gets here (DESIGN.md §10).
+	 * A filtered count, and one that gathers, read the tuples themselves,
+	 * which only the heap AM gives them that way; the count pushdown refuses
+	 * every other table AM before it gets here (DESIGN.md §10).
 	 */
-	if (cx->filter != NULL)
+	if (cx->filter != NULL || cx->gather != NULL)
 	{
 		if (cx->heap->rd_tableam != GetHeapamTableAmRoutine())
 			elog(ERROR, "lion index count: a row filter over a table that is not a heap");
-		visible = lion_recheck_heap_filtered(cx);
+		visible = lion_recheck_heap_rows(cx);
 	}
 	else if (cx->heap->rd_tableam == GetHeapamTableAmRoutine())
 		visible = lion_recheck_heap_heap(cx);
@@ -2113,6 +2486,17 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 			   lion_sum_is_cheaper(heap, &sources[0])));
 
 	/*
+	 * A gather (DESIGN.md §40) reads a window's store pages at every count of
+	 * a container there: summed set by set, an IN list's n entries would read
+	 * each window's pages n times where their union reads them once.  So a
+	 * count that gathers merges the list, unless only the sum keeps the
+	 * interlock.
+	 */
+	if (summed && cache != NULL && cache->gather != NULL && !exists &&
+		collect == NULL && !lion_source_has_nopin(&sources[0]))
+		summed = false;
+
+	/*
 	 * A collection (DESIGN.md §27) wants the union itself, not the sum of its
 	 * counts, and needs no interlock to build it: a NOPIN set is read from
 	 * its own copy like any other.
@@ -2437,6 +2821,15 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	cx.filter = (cache != NULL) ? cache->filter : NULL;
 	if (cx.filter != NULL && cx.filter->heap != heap)
 		elog(ERROR, "lion index count: a row filter for another relation");
+
+	/*
+	 * ... and the gather it feeds (DESIGN.md §40), which only a count has: an
+	 * existence test hands over no rows, and a collection counts none.
+	 */
+	cx.gather = (cache != NULL && !exists && collect == NULL) ?
+		cache->gather : NULL;
+	if (cx.gather != NULL && cx.gather->heap != heap)
+		elog(ERROR, "lion index count: a gather for another relation");
 
 	if (summed)
 	{
