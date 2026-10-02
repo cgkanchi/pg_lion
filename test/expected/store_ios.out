@@ -723,8 +723,10 @@ SELECT q, lion_ios_check(q) FROM (VALUES
 --    returnable (LionStoreCol.returnable) - and what it returns is every
 --    row's own spelling.  The INCLUDE citext column likewise.
 -- ---------------------------------------------------------------------
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS citext;
 CREATE EXTENSION IF NOT EXISTS pg_lion_citext;
+RESET client_min_messages;
 CREATE TABLE lion_ios_ci (id int, name citext, alias citext);
 INSERT INTO lion_ios_ci
 SELECT g, (ARRAY['Alice', 'ALICE', 'alice', 'Bob', 'BOB', 'carol'])[1 + g % 6],
