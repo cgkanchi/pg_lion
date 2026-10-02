@@ -118,6 +118,17 @@ without pruning it: its dead TIDs stay in every index and its visibility-map bit
 aggressive VACUUM waits for the lock instead.  The isolation specs keep plain VACUUMs, whose waits
 are part of what they test.
 
+`make soak` (`test/soak/README.md`) is the long-running check the suites are not: four pgbench
+writers (inserts, updates, deletes, rollbacks, savepoints, upserts, and a phase of writes that all
+roll back), a VACUUM loop, and readers that compare every lion-answered query - counts, GROUP BYs,
+`count(DISTINCT)`, the aggregates over keys, the direct SQL counts, LionOrdered, bitmap and plain
+scans - with a sequential scan inside the same REPEATABLE READ or SERIALIZABLE snapshot, some of
+them holding it across VACUUMs, plus periodic `lion_index_verify(idx, true)`; ten minutes in each
+WAL mode, with a hot standby whose readers compare the same way in rmgr mode.  It restarts the dev
+cluster as `installcheck-rmgr` does and puts it back; `test/soak/soak.sh` runs it against any
+running cluster.  Races it found are kept as reproducers in `test/soak/findings/`, whose expected
+outputs hold the correct answers (`test/soak/findings/run-spec.sh`).
+
 `dev.sh` puts its cluster's socket in `$XDG_RUNTIME_DIR/pg_lion-<user>` (or `/tmp/pg_lion-<user>`)
 on port 54329, and `LION_SOCK` / `LION_PORT` move it.  The cluster trusts local connections, so
 `dev.sh` makes a missing socket directory mode 0700, and refuses the default one if it is a symlink,
