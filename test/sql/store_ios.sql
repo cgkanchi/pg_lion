@@ -359,8 +359,8 @@ SELECT q, lion_ios_check(q) FROM (VALUES
 --    row's own spelling.  The INCLUDE citext column likewise.
 -- ---------------------------------------------------------------------
 
-CREATE EXTENSION citext;
-CREATE EXTENSION pg_lion_citext;
+CREATE EXTENSION IF NOT EXISTS citext;
+CREATE EXTENSION IF NOT EXISTS pg_lion_citext;
 CREATE TABLE lion_ios_ci (id int, name citext, alias citext);
 INSERT INTO lion_ios_ci
 SELECT g, (ARRAY['Alice', 'ALICE', 'alice', 'Bob', 'BOB', 'carol'])[1 + g % 6],
