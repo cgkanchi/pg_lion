@@ -232,6 +232,14 @@ do; they run in a database of their own (`lion_findings`).
   a `test/isolation` spec there.)  The rounds are seeded (`--seed`,
   `setseed()` per reader iteration), but thread scheduling is not
   reproducible; what is, is the finding's spec.
+- No posting set here is a BITSET.  The rows are about 40 to a heap page, so
+  a container key's 64 pages hold about 2,500 rows, and even `c2`'s half of
+  them stays under the 4,096 members a BITSET needs: the dense sets are
+  ARRAYs (and, with the NARROW container of the narrow-bitset branch,
+  NARROWs).  The BITSET arms of the set algebra, the readers, the inserts and
+  VACUUM are the regression suite's to test, on fixtures of narrow rows, not
+  this soak's; the summary's container counts at the end of each run show
+  it.
 - The dev cluster runs `synchronous_commit = off`: a page whose newest commit
   is not yet flushed cannot be marked all-visible (core sets no hint bit for
   it), which delays the all-visible state the abort phase aims at by up to
