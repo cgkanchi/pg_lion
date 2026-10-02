@@ -17,13 +17,17 @@ CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_
        src/lion_plan_count.o src/lion_plan_hooks.o src/lion_plan_units.o \
        src/lion_exec_begin.o src/lion_exec_locate.o src/lion_exec_count.o \
        src/lion_exec_fkjoin.o src/lion_exec_run.o src/lion_exec_explain.o
+# The window store of DESIGN.md §40 (stored key columns and INCLUDE): its
+# interface is src/lion_store.h, and the bytes of a store page are
+# src/lion_store_fmt.h.
+STORE_OBJS = src/lion_store.o
 # The SQL-callable helpers: lion_funcs.c and lion_index_verify()'s files, which
 # share the private header src/lion_funcs.h.
 FUNCS_OBJS = src/lion_funcs.o src/lion_verify.o src/lion_verify_dir.o src/lion_verify_heap.o \
        src/lion_verify_summary.o
 OBJS = src/lion_container.o src/lion_sparse.o src/lion_wal.o $(PAGES_OBJS) src/lion_dir.o src/lion_posting.o \
        src/lion_am.o src/lion_amcost.o src/lion_build.o src/lion_spool.o src/lion_scan.o \
-       src/lion_insert.o src/lion_vacuum.o $(FUNCS_OBJS) $(COUNT_OBJS) $(CUSTOMSCAN_OBJS) \
+       src/lion_insert.o src/lion_vacuum.o $(STORE_OBJS) $(FUNCS_OBJS) $(COUNT_OBJS) $(CUSTOMSCAN_OBJS) \
        src/lion_multikey.o src/lion_fkjoin.o src/lion_ordered.o src/lion_selfuncs.o \
        src/lion_costs.o
 PGFILEDESC = "pg_lion - roaring bitmap inverted index"
@@ -135,6 +139,8 @@ $(COUNT_OBJS): src/lion_count_int.h
 $(CUSTOMSCAN_OBJS): src/lion_customscan.h
 $(FUNCS_OBJS): src/lion_funcs.h
 src/lion_build.o src/lion_spool.o: src/lion_spool.h
+$(STORE_OBJS) $(FUNCS_OBJS) src/lion_am.o src/lion_build.o src/lion_insert.o src/lion_state.o \
+          src/lion_vacuum.o: src/lion_store.h src/lion_store_fmt.h
 
 # Crash-recovery and hot-standby tests (test/recovery/README.md).  These need a
 # whole PostgreSQL *installation* to initdb their own private clusters into,
