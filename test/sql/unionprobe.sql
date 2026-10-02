@@ -191,11 +191,13 @@ END $$;
 -- The rows each filter holds, the path each is forced through, and what the
 -- count's merge did with its unions.  Where the intersection is small by the
 -- time a list is met, the list is probed (10); where it is dense, built (6,
--- 7); the lists of 1 to 5, 9 and 14 meet an intersection of a hundred-odd
+-- 7); the lists of 1 to 4, 9 and 14 meet an intersection of a hundred-odd
 -- members at the first list and of a few at the next, and are built there and
--- probed here, as 8's are where z is dense and where it is sparse.  A list
--- that is empty or names no entry has nothing to meet (11, 12), and one of a
--- single entry is no union (13).
+-- probed here, as 8's are where z is dense and where it is sparse.  5's first
+-- list, k1's, is NARROWs of width 1 (DESIGN.md §38) at most keys, where a
+-- member is looked up in one bit, and it is probed there too.  A list that is
+-- empty or names no entry has nothing to meet (11, 12), and one of a single
+-- entry is no union (13).
 SELECT n, upt_rows(q) AS rows,
 	   upt_plan_has('count(*)', q, 'count', 'LionCount') AS count_plan,
 	   upt_plan_has('id', q, 'plain', 'Index Scan using upt_l') AS plain_plan,

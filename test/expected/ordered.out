@@ -664,16 +664,20 @@ SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 ORDER BY k, id LIM
 ANALYZE lo;
 -- 10. A set that outgrows hash_mem at run time degrades to container keys
 --     and rechecks every member: planned at 64MB (a generic plan keeps it),
---     run at 64kB.  Half of lo's rows is 33 NARROWs, 34 kB, which 64kB holds
---     (DESIGN.md §38); lon's rows are narrow, 185 to a page, so that its
---     blocks hold offsets past 127, and half of them is 26 bitsets of 4 kB.
---     Its first 600 rows have the smallest k, the rest a permutation.
-CREATE TABLE lon (id int PRIMARY KEY, k int, c2 int)
+--     run at 64kB.  Half of lo's rows, 49 to a page, is 32 NARROWs of
+--     width 1 (DESIGN.md §38), 17 kB, which 64kB holds; half of lon's 400000
+--     rows, 65 to a page, is 97 NARROWs of width 2, 1 kB each, which it
+--     does not.  (The pad puts the rows just past the 63 offsets of a
+--     NARROW of width 1, which makes a NARROW the largest for the rows it
+--     holds.)  Its first 600 rows have the smallest k, the rest a
+--     permutation.
+CREATE TABLE lon (id int PRIMARY KEY, k int, c2 int, pad text)
 	WITH (autovacuum_enabled = off);
 INSERT INTO lon
-SELECT i, CASE WHEN i <= 600 THEN i - 601 ELSE (i::bigint * 7919 % 300007)::int END,
-	   ((hashint8extended(i::bigint, 11) & 9223372036854775807) % 2)::int
-  FROM generate_series(1, 300000) i;
+SELECT i, CASE WHEN i <= 600 THEN i - 601 ELSE (i::bigint * 7919 % 400009)::int END,
+	   ((hashint8extended(i::bigint, 11) & 9223372036854775807) % 2)::int,
+	   repeat('x', 80)
+  FROM generate_series(1, 400000) i;
 CREATE INDEX lon_k_id ON lon (k, id);
 CREATE INDEX lon_c2 ON lon USING lion (c2);
 VACUUM (FREEZE, ANALYZE) lon;
@@ -705,7 +709,7 @@ SELECT * FROM lion_ord_run('EXECUTE lo_big(1)');
  Lion Set Hits: 27
  Heap Fetches: 27
  Rows Removed by Lion Recheck: 7
- Lion Set: 26 containers, degraded
+ Lion Set: 97 containers, degraded
 (6 rows)
 
 SELECT lion_ord('EXECUTE lo_big(1)',

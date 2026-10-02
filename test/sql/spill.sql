@@ -36,20 +36,21 @@ END $$;
 
 -- ---------- a range in an OR, larger than the memory it gets ----------
 /*
- * Half of 240000 rows of a column in no order is a bitset at each of some
- * twenty container keys, over 80 kB: more than a hash table's memory of
- * 64 kB.  The rows are narrow, 185 to a page, so that the blocks hold
- * offsets past 127 and no container key can be a NARROW (DESIGN.md §38),
- * which would put the whole set in some 21 kB.  The plan is made with the
- * default work_mem, where the range is collected into memory, and run again
- * with 64 kB, where it is collected a window of container keys at a time
- * into a temporary file.
+ * Half of 360000 rows of a column in no order is a NARROW of width 2
+ * (DESIGN.md §38), 1 kB, at each of some ninety container keys, some 90 kB:
+ * more than a hash table's memory of 64 kB.  The pad makes the rows 65 to a
+ * page, just past the 63 offsets a NARROW of width 1 holds, which makes a
+ * NARROW the largest for the rows it holds: narrow rows, 185 to a page,
+ * would need nearly twice as many for the same set.  The plan is made with the default
+ * work_mem, where the range is collected into memory, and run again with
+ * 64 kB, where it is collected a window of container keys at a time into a
+ * temporary file.
  */
-CREATE TABLE lion_sp_r (r int NOT NULL, g int NOT NULL, a int NOT NULL)
-	WITH (autovacuum_enabled = off);
+CREATE TABLE lion_sp_r (r int NOT NULL, g int NOT NULL, a int NOT NULL,
+						pad text) WITH (autovacuum_enabled = off);
 INSERT INTO lion_sp_r
-SELECT hashint4(i) & 1048575, i % 7, i % 30
-  FROM generate_series(1, 240000) i;
+SELECT hashint4(i) & 1048575, i % 7, i % 30, repeat('x', 80)
+  FROM generate_series(1, 360000) i;
 CREATE INDEX lion_sp_r_r ON lion_sp_r USING lion (r)
 	WITH (summaries = on, summary_tids = 1024);
 CREATE INDEX lion_sp_r_g ON lion_sp_r USING lion (g);
@@ -120,17 +121,18 @@ DROP TABLE lion_sp_r;
 /*
  * `x = ANY ($1)` has no length at plan time: the copy of the fact filters is
  * priced at estimate_array_length()'s guess, and planned; the run holds half
- * of the fact table's x values - a bitset at each of some twenty container
- * keys, which 64 kB does not hold either (narrow rows again, so that the
- * keys cannot be NARROWs).  The copy goes on in a temporary file, where it
- * used to be abandoned for a union of 5000 sets per dimension row.
+ * of the fact table's x values - a NARROW of width 2 at each of some ninety
+ * container keys, which 64 kB does not hold either (rows 65 to a page
+ * again).  The copy goes on in a temporary file, where it used to be
+ * abandoned for a union of 5000 sets per dimension row.
  */
 CREATE TABLE lion_sp_d (pk int PRIMARY KEY, attr int NOT NULL);
 INSERT INTO lion_sp_d SELECT i, i % 5 FROM generate_series(1, 360) i;
-CREATE TABLE lion_sp_f (fk int8, x int NOT NULL);
+CREATE TABLE lion_sp_f (fk int8, x int NOT NULL, pad text);
 INSERT INTO lion_sp_f
-SELECT abs(hashint4(i)) % 360 + 1, abs(hashint4(i + 1000000)) % 10000
-  FROM generate_series(1, 240000) i;
+SELECT abs(hashint4(i)) % 360 + 1, abs(hashint4(i + 1000000)) % 10000,
+	   repeat('x', 80)
+  FROM generate_series(1, 360000) i;
 CREATE INDEX lion_sp_f_fk ON lion_sp_f USING lion (fk);
 CREATE INDEX lion_sp_f_x ON lion_sp_f USING lion (x);
 VACUUM ANALYZE lion_sp_d;

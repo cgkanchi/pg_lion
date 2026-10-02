@@ -863,9 +863,9 @@ SELECT lion_sm('SELECT count(*) FROM lion_sm_p WHERE u BETWEEN 3000 AND 17000 AN
 (1 row)
 
 SELECT lion_sm('SELECT count(*) FROM lion_sm_p WHERE u < 12000 AND g = 2');
-                    lion_sm                    
------------------------------------------------
- inside 1, full domain 2, summaries 20: (4000)
+                    lion_sm                     
+------------------------------------------------
+ inside 2, full domain 1, summaries 177: (4000)
 (1 row)
 
 -- ---------- 10. a unique timestamp, the shape summaries are for ----------
