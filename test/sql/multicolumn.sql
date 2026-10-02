@@ -654,11 +654,13 @@ SELECT n, m, count(*) FROM lion_mcp GROUP BY n, m
 
 SELECT lion_mcsame($$SELECT a, b, count(*) FROM @ GROUP BY a, b$$);
 SELECT lion_mcsame($$SELECT a, n, count(*) FROM @ GROUP BY a, n$$);
--- and one the model refuses over either portfolio, for the same reason
+-- and one with a WHERE, which the model refused over either portfolio until
+-- §39 priced the node in the hash aggregate's units, and takes over both now
+-- (2.2 and 1.8 ms against 4.2 to 5.5, assert build)
 SELECT lion_mcsame($$SELECT a, b, count(*) FROM @ WHERE c = 'c1' GROUP BY a, b$$);
 RESET pg_lion.enable_decoded_walk;
 -- the decoded walk reads both key columns of the one index at each container
--- key, and takes the WHERE the nested loop is refused, over either portfolio
+-- key, and takes the WHERE from the nested loop too, over either portfolio
 SELECT lion_mcpd($$SELECT a, b, count(*) FROM lion_mcp GROUP BY a, b$$);
 SELECT lion_mcpd($$SELECT a, b, count(*) FROM lion_mcp
 				   WHERE c = 'c1' GROUP BY a, b$$);

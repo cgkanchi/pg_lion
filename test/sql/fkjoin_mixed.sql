@@ -420,8 +420,9 @@ SELECT lion_mj_counter('SELECT count(DISTINCT d.pk) FROM lion_mf f JOIN lion_md 
 	< lion_mj_counter('SELECT count(DISTINCT d.pk), count(*) FROM lion_mf f JOIN lion_md d ON d.pk = f.fk WHERE f.x = 3', 'Containers Visited') AS rows_alone_test;
 -- the cost model's choice, nothing disabled: counts alone take the partial
 -- counts, as they did, and the same query with an aggregate that needs the
--- rows is pushed down where they are, and left to the hash join where they
--- are not
+-- rows is pushed down where they are; where they are not it was left to the
+-- hash join until §39 priced the node in the hash join's units, and is the
+-- node's now (1.0 to 1.3 ms against 1.35 to 1.7, assert build)
 SELECT lion_mj('SELECT count(*) FROM lion_mf f JOIN lion_md d ON d.pk = f.fk WHERE f.hot AND d.kept AND d.attr = 2', false);
 SELECT lion_mj('SELECT count(DISTINCT d.pk), count(*) FROM lion_mf f JOIN lion_md d ON d.pk = f.fk WHERE f.hot AND d.kept AND d.attr = 2', false);
 SELECT lion_mj('SELECT d.grp, count(*) FROM lion_mf f JOIN lion_md d ON d.pk = f.fk WHERE f.x = 3 AND d.attr = 2 AND d.small = 1 GROUP BY d.grp', false);
