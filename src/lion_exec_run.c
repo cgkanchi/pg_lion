@@ -324,6 +324,13 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 	if (!st->located)
 		lion_locate_where(st);
 
+	/*
+	 * ---- the window store's gather (DESIGN.md §40): the count of the
+	 * WHERE, or of every row, and the groups the node forms of the rows ----
+	 */
+	if (st->store != NULL)
+		return lion_store_next(st);
+
 	/* ---- no index to iterate: exactly one row ---- */
 	if (!st->hasgroupidx)
 	{
@@ -537,6 +544,9 @@ lion_reset_run(LionCountScanState *st)
 	st->topkpos = 0;
 	if (st->topkcxt != NULL)
 		MemoryContextReset(st->topkcxt);
+
+	/* ... and the groups of the store's gather, counted again (§40) */
+	lion_store_reset(st);
 
 	if (st->npart > 0)
 		lion_close_relation(st);

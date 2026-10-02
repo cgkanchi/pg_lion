@@ -16,7 +16,8 @@ CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_
        src/lion_plan_cost.o src/lion_plan_fkjoin_cost.o src/lion_plan_fkjoin.o \
        src/lion_plan_count.o src/lion_plan_hooks.o src/lion_plan_units.o \
        src/lion_exec_begin.o src/lion_exec_locate.o src/lion_exec_count.o \
-       src/lion_exec_fkjoin.o src/lion_exec_run.o src/lion_exec_explain.o
+       src/lion_exec_fkjoin.o src/lion_exec_run.o src/lion_exec_explain.o \
+       src/lion_exec_store.o
 # The window store of DESIGN.md §40 (stored key columns and INCLUDE): its
 # interface is src/lion_store.h, and the bytes of a store page are
 # src/lion_store_fmt.h, which test/unit/store_test.c tests on its own.
@@ -148,7 +149,8 @@ $(CUSTOMSCAN_OBJS): src/lion_customscan.h
 $(FUNCS_OBJS): src/lion_funcs.h
 src/lion_build.o src/lion_spool.o: src/lion_spool.h
 $(STORE_OBJS) $(FUNCS_OBJS) src/lion_am.o src/lion_build.o src/lion_insert.o src/lion_state.o \
-          src/lion_vacuum.o: src/lion_store.h src/lion_store_fmt.h
+          src/lion_vacuum.o src/lion_count.o src/lion_exec_store.o src/lion_plan_cost.o \
+          src/lion_plan_match.o: src/lion_store.h src/lion_store_fmt.h
 
 # Crash-recovery and hot-standby tests (test/recovery/README.md).  These need a
 # whole PostgreSQL *installation* to initdb their own private clusters into,
