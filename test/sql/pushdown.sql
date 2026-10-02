@@ -390,9 +390,11 @@ SELECT lion_pd_counters('SELECT count(*) FROM lion_pdt WHERE a = 3');
  * group.  Before the cache, and before the estimate stopped charging
  * numgroups random reads per dirty page, this was the case that had to lose
  * by far.  On the release build it is a tie - the node 14.8 ms of CPU, the
- * sequential scan and hash aggregate 15.6 - which the model gives to the hash
+ * sequential scan and hash aggregate 15.6 - which the model gave to the hash
  * aggregate, priced below what hashing a row costs (DESIGN.md §10, "The
- * units"); once the pages are all-visible again the node wins, and is chosen.
+ * units"), until §39 priced the node in the hash aggregate's units: it is the
+ * node's now (14.0 ms against 15.2 on the assert build), and once the pages
+ * are all-visible again the node wins by more.
  */
 CREATE TABLE lion_pdd (g int NOT NULL, pad text NOT NULL);
 INSERT INTO lion_pdd

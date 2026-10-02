@@ -114,28 +114,37 @@ lion_meta_record_ndistinct(Page metapage, const LionMetaNdistinct *nd)
 }
 
 /*
- * Write the counts VACUUM or ANALYZE took on the index's meta page, in a
- * record of their own (LION_XLOG_META, operation NDISTINCT, DESIGN.md §25 and
- * §33).  A meta page written before §33 gets the area here: pd_lower moves to
- * cover it, in generic mode as in rmgr mode, so that neither GenericXLog's
- * diff - which leaves out, and at redo zeroes, what lies between pd_lower and
- * pd_upper - nor a full-page image drops it.
+ * Write nd - or, when it is NULL, the counts the page holds already - on the
+ * index's meta page, in a record of their own (LION_XLOG_META, operation
+ * NDISTINCT, DESIGN.md §25 and §33), with the page's count of finished bulk
+ * deletes plus bump (§37).  That number is the page's, never the caller's -
+ * the counts lion_meta_fill_ndistinct() fills in carry a zero there - so that
+ * no ANALYZE ever takes it back.  A meta page written before §33 gets the area
+ * here: pd_lower moves to cover it, in generic mode as in rmgr mode, so that
+ * neither GenericXLog's diff - which leaves out, and at redo zeroes, what lies
+ * between pd_lower and pd_upper - nor a full-page image drops it.  The record
+ * carries the whole area, the count with it, and redo copies it, so a standby
+ * and a crash recovery end with the primary's number in both modes.
  *
  * Counts the page holds already are not written again: an ANALYZE of a table
  * nothing has changed in, or whose changes left every count and the rows as
  * they were, writes no WAL for them - nor, the first time after a checkpoint,
- * an image of the meta page.
+ * an image of the meta page.  A bump is always written.
  *
  * The caller has read the meta page through lion_get_index_state(), so the
  * index's WAL mode is known without reading it again under the lock taken here
  * (lion_index_meta_wal_mode()).
  */
-void
-lion_meta_write_ndistinct(Relation index, const LionMetaNdistinct *nd)
+static void
+lion_meta_put_ndistinct(Relation index, const LionMetaNdistinct *nd,
+						uint32 bump)
 {
 	Buffer		buf;
 	Page		page;
 	LionWalState *xstate;
+	LionMetaNdistinct cur;
+	LionMetaNdistinct put;
+	bool		has;
 
 	buf = ReadBuffer(index, LION_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
@@ -149,9 +158,14 @@ lion_meta_write_ndistinct(Relation index, const LionMetaNdistinct *nd)
 		elog(ERROR, "lion index \"%s\": block 0 is not the meta page",
 			 RelationGetRelationName(index));
 	}
-	if (LionMetaHasNdistinct(page) &&
-		memcmp(LionPageGetMetaNdistinct(page), nd,
-			   sizeof(LionMetaNdistinct)) == 0)
+	has = LionMetaHasNdistinct(page);
+	if (has)
+		memcpy(&cur, LionPageGetMetaNdistinct(page), sizeof(LionMetaNdistinct));
+	else
+		memset(&cur, 0, sizeof(LionMetaNdistinct));
+	put = (nd != NULL) ? *nd : cur;
+	put.bulkdeletes = cur.bulkdeletes + bump;
+	if (has && memcmp(&cur, &put, sizeof(LionMetaNdistinct)) == 0)
 	{
 		UnlockReleaseBuffer(buf);
 		return;
@@ -159,14 +173,35 @@ lion_meta_write_ndistinct(Relation index, const LionMetaNdistinct *nd)
 
 	xstate = lion_wal_begin(index);
 	page = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
-	memcpy(LionPageGetMetaNdistinct(page), nd, sizeof(LionMetaNdistinct));
+	memcpy(LionPageGetMetaNdistinct(page), &put, sizeof(LionMetaNdistinct));
 	if (((PageHeader) page)->pd_lower < LION_META_NDISTINCT_END)
 		((PageHeader) page)->pd_lower = LION_META_NDISTINCT_END;
-	lion_wal_op(xstate, page, LION_OP_NDISTINCT, 0, 0, nd,
+	lion_wal_op(xstate, page, LION_OP_NDISTINCT, 0, 0, &put,
 				sizeof(LionMetaNdistinct));
 	lion_wal_finish(xstate, LION_XLOG_META);
 
 	UnlockReleaseBuffer(buf);
+}
+
+/* The counts VACUUM or ANALYZE took, with the bulk deletes kept as they are. */
+void
+lion_meta_write_ndistinct(Relation index, const LionMetaNdistinct *nd)
+{
+	lion_meta_put_ndistinct(index, nd, 0);
+}
+
+/*
+ * The end of an ambulkdelete call: one more bulk delete finished (DESIGN.md
+ * §37), written after the last TID the call took out, in the same record as
+ * the counts it took (or, with nd NULL, the ones the page has).  A call that
+ * found nothing to take out counts as well: the TIDs a VACUUM finds gone may
+ * have been taken out by an earlier call that failed before its end, and
+ * their heap pages are marked all-visible only after this one.
+ */
+void
+lion_meta_count_bulkdelete(Relation index, const LionMetaNdistinct *nd)
+{
+	lion_meta_put_ndistinct(index, nd, 1);
 }
 
 /*

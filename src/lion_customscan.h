@@ -814,6 +814,18 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_DESCENT_COST		(lion_descent_cost * cpu_operator_cost)
 
 /*
+ * A page of a lion index that a custom path reads while the index is
+ * resident (lion_index_page_cost(), DESIGN.md §22, §39): a buffer hit,
+ * pinned, locked and stepped through.  Measured on the release build (§10,
+ * "The reference"): a warm page read in order 0.6 us, against the 2 us that
+ * seq_page_cost stands for at 500 units a millisecond; the posting leaves a
+ * probe's seeks cross fit at 0.7 us (LION_PROBE_COST's fit); a directory
+ * page descended 0.6 us with its search (LION_DESCENT_COST).  120
+ * cpu_operator_cost is the 0.6 us.
+ */
+#define LION_RESIDENT_PAGE_COST	(lion_resident_page_cost * cpu_operator_cost)
+
+/*
  * One candidate TID of a heap recheck (DESIGN.md §9): the visibility check of
  * its tuple, on a page the recheck has pinned (the page itself is charged as
  * I/O).  Fitted on the release build to counts of 99 to 1M candidates on a
@@ -1362,6 +1374,7 @@ typedef struct LionWCol
 	AttrNumber	idxcol;			/* its key column in idxoid */
 	Relation	idx;			/* open while the scan runs, or NULL */
 	int			slotcol;		/* its key's column of the scan tuple, or -1 */
+	uint32		bulkdeletes;	/* idx's, at the first look (DESIGN.md §37) */
 } LionWCol;
 
 typedef struct LionWAgg
@@ -2403,6 +2416,50 @@ extern List *lion_replaced_functions(RelOptInfo *rel, List *tlexprs,
 									 List *having, List *groupclause,
 									 const LionFkJoin *fj);
 
+/*
+ * The kinds of core plan a lion path is priced against (DESIGN.md §39,
+ * lion_plan_units.c), each with its rate: the cost units a millisecond its
+ * plans run at, as a multiple of the 500 lion's CPU constants are fitted at.
+ */
+typedef enum LionCompetitor
+{
+	LION_COMPETITOR_NONE,		/* no path of core's in the relation yet */
+	LION_COMPETITOR_DISABLED,	/* ... or none that enable_* leaves on */
+	LION_COMPETITOR_HASHAGG,	/* an aggregate that hashes */
+	LION_COMPETITOR_AGG,		/* a plain or sorted one over a scan */
+	LION_COMPETITOR_HASHJOIN,
+	LION_COMPETITOR_MERGEJOIN,
+	LION_COMPETITOR_NESTLOOP,	/* into a parameterized index scan */
+	LION_COMPETITOR_SEQSCAN,
+	LION_COMPETITOR_INDEXONLY,
+	LION_COMPETITOR_INDEX,
+	LION_COMPETITOR_BITMAP,
+	LION_COMPETITOR_OTHER
+} LionCompetitor;
+
+/*
+ * The units a lion path's own price is converted into (lion_units_for()), and
+ * the margin it is offered at
+ */
+typedef struct LionUnits
+{
+	LionCompetitor kind;		/* the cheapest core path's kind */
+	double		rate;			/* ... and its rate */
+	double		margin;			/* pg_lion.pushdown_margin, or 1 */
+} LionUnits;
+
+/* lion_plan_units.c */
+extern bool lion_path_has_lion(Path *path);
+extern LionCompetitor lion_competitor_kind(Path *path);
+extern double lion_competitor_rate(LionCompetitor kind);
+extern Path *lion_competitor_path(RelOptInfo *rel);
+extern void lion_units_for(RelOptInfo *rel, LionUnits *u);
+extern void lion_units_pin(RelOptInfo *rel);
+extern void lion_units_unpin(void);
+extern Cost lion_units_price(const LionUnits *u, Cost own);
+extern double lion_units_margin(void);
+extern double lion_units_margin_for(RelOptInfo *rel);
+
 /* lion_plan_cost.c */
 extern double lion_index_dir_pages(IndexOptInfo *idx, double *height);
 extern double lion_index_column_share(PlannerInfo *root, RelOptInfo *rel,
@@ -2414,6 +2471,10 @@ extern double lion_exists_fraction(double containers, double survivors);
 extern double lion_posting_height(double leaves);
 extern Cost lion_heap_page_cost(PlannerInfo *root, RelOptInfo *rel,
 								double pages, double heap_pages);
+extern Cost lion_index_page_cost(PlannerInfo *root, double idxpages,
+								 Cost device);
+extern bool lion_where_query_unknown(List *whereclauses, List *wherekinds,
+									 List *whereinor);
 extern int lion_inlist_shape(IndexOptInfo *groupidx, AttrNumber groupcol,
 							 IndexOptInfo *groupidx2, List *whereidx,
 							 List *wherecol, List *whereclauses,

@@ -415,6 +415,7 @@ static LionEntryTuple *lion_vacuum_entry_copy(Relation index, Buffer entrybuf,
 static void lion_vacuum_free_chain(LionVacState *vs, uint32 hash,
 								  BlockNumber head);
 static void lion_vacuum_sweep(LionVacState *vs);
+static bool lion_vac_may_write(Relation index);
 static bool lion_vac_may_count(Relation index, LionIndexState *ix);
 static void lion_vacuum_count_keys(IndexVacuumInfo *info);
 
@@ -576,13 +577,25 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 * (DESIGN.md §33), so that the cleanup call after this one need not walk
 	 * the leaves again.  A VACUUM whose dead TIDs take more than one call
 	 * records each call's count, and the last one stands.
+	 *
+	 * The same record counts this call among the bulk deletes the index has
+	 * finished (§37), and that is not optional: it is written after the last
+	 * TID this call took out and before VACUUM marks any of their heap pages
+	 * all-visible, which is what tells the aggregates over keys that an entry
+	 * count they read may have held a TID that is gone.  Every call counts,
+	 * whatever it took out.  The one that cannot write - an rmgr-mode index
+	 * on a server without the preload - cannot take anything out either: its
+	 * first removal stops the VACUUM (lion_wal_begin()).
 	 */
-	if (lion_vac_may_count(index, vs.ix))
+	if (lion_vac_may_write(index))
 	{
 		LionMetaNdistinct nd;
+		bool		counted = lion_vac_may_count(index, vs.ix);
 
-		lion_meta_fill_ndistinct(&nd, vs.ix, vs.nvalues, (uint64) vs.numtids);
-		lion_meta_write_ndistinct(index, &nd);
+		if (counted)
+			lion_meta_fill_ndistinct(&nd, vs.ix, vs.nvalues,
+									 (uint64) vs.numtids);
+		lion_meta_count_bulkdelete(index, counted ? &nd : NULL);
 	}
 	pfree(vs.nvalues);
 
@@ -707,21 +720,31 @@ lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 }
 
 /*
- * May this VACUUM or ANALYZE record the index's key counts (DESIGN.md §33)?
- * Not in an index whose key columns are all multi-key: their keys are
- * elements, not values.  Nor in an rmgr-mode index on a server that has not
- * registered the resource manager, where the record could not be written
- * (lion_wal_begin() refuses it) and VACUUM must still go through (§25,
- * "VACUUM is the one path that could write without lion_wal_begin()"): such
- * an index keeps the counts it has until the preload is back.
+ * May this VACUUM or ANALYZE write the index's meta page at all?  Not in an
+ * rmgr-mode index on a server that has not registered the resource manager,
+ * where the record could not be written (lion_wal_begin() refuses it) and
+ * VACUUM must still go through (§25, "VACUUM is the one path that could write
+ * without lion_wal_begin()"): such an index keeps the counts it has until the
+ * preload is back.
+ */
+static bool
+lion_vac_may_write(Relation index)
+{
+	return !(lion_wal_mode(index) == LION_WAL_MODE_RMGR &&
+			 RelationNeedsWAL(index) && !lion_rmgr_registered());
+}
+
+/*
+ * May it record the index's key counts (DESIGN.md §33)?  Where it may write,
+ * and not in an index whose key columns are all multi-key: their keys are
+ * elements, not values.
  */
 static bool
 lion_vac_may_count(Relation index, LionIndexState *ix)
 {
 	if (lion_index_row_column(ix) == InvalidAttrNumber)
 		return false;
-	return !(lion_wal_mode(index) == LION_WAL_MODE_RMGR &&
-			 RelationNeedsWAL(index) && !lion_rmgr_registered());
+	return lion_vac_may_write(index);
 }
 
 /*
