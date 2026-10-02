@@ -77,9 +77,9 @@ lion_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey,
 
 		/*
 		 * ANY key column, not just the first (DESIGN.md §24).  INCLUDE columns
-		 * (ncolumns > nkeycolumns) cannot happen - amcaninclude is false - but
-		 * the loop is bounded by nkeycolumns anyway, because an INCLUDE column
-		 * has no opclass to ask about.
+		 * (ncolumns > nkeycolumns) are stored values (§40) with no posting
+		 * sets and no opclass to ask about, so the loop is bounded by
+		 * nkeycolumns: an INCLUDE column is never a key the count can use.
 		 *
 		 * `indexprs`: an expression column has indexkeys[i] == 0 and can never
 		 * match a heap attno, so the skip above could in principle be relaxed

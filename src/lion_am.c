@@ -50,6 +50,7 @@
 #include "utils/typcache.h"
 
 #include "lion.h"
+#include "lion_store.h"
 #include "lion_costs.h"
 #include "lion_count.h"
 
@@ -90,7 +91,9 @@ static const relopt_parse_elt lion_relopt_tab[] = {
 	{"fillfactor", RELOPT_TYPE_INT, offsetof(LionOptions, fillfactor)},
 	{"wal_mode", RELOPT_TYPE_ENUM, offsetof(LionOptions, wal_mode)},
 	{"summaries", RELOPT_TYPE_ENUM, offsetof(LionOptions, summaries)},
-	{"summary_tids", RELOPT_TYPE_INT, offsetof(LionOptions, summary_tids)}
+	{"summary_tids", RELOPT_TYPE_INT, offsetof(LionOptions, summary_tids)},
+	{"store_values", RELOPT_TYPE_BOOL, offsetof(LionOptions, store_values)},
+	{"store_max_len", RELOPT_TYPE_INT, offsetof(LionOptions, store_max_len)}
 };
 
 /* DESIGN.md §32: which key columns a build gives summary posting sets. */
@@ -181,6 +184,23 @@ _PG_init(void)
 					  "Rows a summary posting set holds before the next one starts",
 					  LION_DEFAULT_SUMMARY_TIDS, LION_MIN_SUMMARY_TIDS,
 					  LION_MAX_SUMMARY_TIDS,
+					  AccessExclusiveLock);
+
+	/*
+	 * DESIGN.md §40: the window store.  `store_values` stores the index's
+	 * scalar key columns beside its INCLUDE columns, which are always stored;
+	 * `store_max_len` lets a varlena column's pages go RAW in slots of that
+	 * many bytes and makes a longer value an ERROR.  Off and 0 by default, so
+	 * that an index that asks for neither is written exactly as before.  Both
+	 * are read at build time only and recorded on the meta page.
+	 */
+	add_bool_reloption(lion_relopt_kind, "store_values",
+					   "Store the values of the scalar key columns in the window store",
+					   false,
+					   AccessExclusiveLock);
+	add_int_reloption(lion_relopt_kind, "store_max_len",
+					  "Slot size in bytes of a stored varlena column (0 = dictionary-coded only)",
+					  0, 0, LION_MAX_STORE_MAX_LEN,
 					  AccessExclusiveLock);
 
 	/*
@@ -447,7 +467,12 @@ lion_handler(PG_FUNCTION_ARGS)
 		/* DESIGN.md §24, "Build"; 16 builds only btree indexes in parallel */
 		.amcanbuildparallel = true,
 #endif
-		.amcaninclude = false,
+		/*
+		 * DESIGN.md §40: an INCLUDE column is stored in the window store,
+		 * which is the only meaning INCLUDE has in lion.  amcanreturn stays
+		 * NULL until the readers of the store exist.
+		 */
+		.amcaninclude = true,
 		.amusemaintenanceworkmem = true,
 		.amsummarizing = false,
 		/*
@@ -1020,6 +1045,7 @@ lionbuildempty(Relation index)
 	uint32		wal_mode;
 	Buffer		buf;
 	LionMetaPageData meta;
+	LionMetaStore store;
 	LionIndexState ix;
 
 	inline_limit = opts ? (uint32) opts->inline_limit : LION_DEFAULT_INLINE_LIMIT;
@@ -1053,6 +1079,21 @@ lionbuildempty(Relation index)
 								   LION_DEFAULT_SUMMARY_TIDS);
 	}
 
+	/*
+	 * The window store (DESIGN.md §40): the columns are decided as a build
+	 * decides them - ambuild has already said what it leaves out - and an
+	 * index that stores any gets the root of an empty map, block 2, which
+	 * never moves.
+	 */
+	memset(&store, 0, sizeof(store));
+	store.store_cols = lion_store_columns(index, &ix, false);
+	if (store.store_cols != 0)
+	{
+		store.store_root = LION_FIRST_BLKNO + 1;
+		store.store_max_len = opts ? (uint32) opts->store_max_len : 0;
+		store.store_pages = 1;
+	}
+
 	/* Meta page, pointing at the one leaf that is also the root (§21). */
 	buf = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
 							EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
@@ -1066,6 +1107,7 @@ lionbuildempty(Relation index)
 	LionPageGetMeta(BufferGetPage(buf))->version = meta.version;
 	LionPageGetMeta(BufferGetPage(buf))->summary_cols = meta.summary_cols;
 	LionPageGetMeta(BufferGetPage(buf))->summary_tids = meta.summary_tids;
+	lion_meta_record_store(BufferGetPage(buf), &store);
 	MarkBufferDirty(buf);
 	log_newpage_buffer(buf, true);
 	END_CRIT_SECTION();
@@ -1080,4 +1122,17 @@ lionbuildempty(Relation index)
 	log_newpage_buffer(buf, true);
 	END_CRIT_SECTION();
 	UnlockReleaseBuffer(buf);
+
+	if (store.store_cols != 0)
+	{
+		buf = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
+								EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
+		Assert(BufferGetBlockNumber(buf) == store.store_root);
+		START_CRIT_SECTION();
+		lion_storemap_init_page(BufferGetPage(buf), LION_STOREMAP_ROOT, 0);
+		MarkBufferDirty(buf);
+		log_newpage_buffer(buf, true);
+		END_CRIT_SECTION();
+		UnlockReleaseBuffer(buf);
+	}
 }
