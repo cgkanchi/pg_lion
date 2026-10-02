@@ -212,10 +212,11 @@ SELECT rc_check('SELECT count(*) FROM rcost WHERE lo = 2 AND o > 100 AND m BETWE
 
 -- With 64 kB for the ranges the widened unions of 35 container keys do not
 -- all fit, and are optimized back - compacted - to make room: for the next
--- widening, which is refused and folds as before when that finds none, and
--- before the collection would give up.  The unions optimized fit, and the
--- range is still collected; w2's, whose unions pass an ARRAY's 2,048 members
--- as bitsets before they are optimized, does not, and is walked.
+-- widening, and before the collection would give up.  The unions optimized
+-- fit, and the range is still collected; w2's, whose unions pass an ARRAY's
+-- 2,048 members as bitsets before they are optimized, does not, and is
+-- walked.  A widening that finds no room even then is refused, and folds as
+-- before: rcostn below.
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1.0;
 SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE o BETWEEN 10 AND 24000 GROUP BY lo');
@@ -259,5 +260,54 @@ SELECT rc_check('SELECT count(*) FROM rcost WHERE lo = 3 AND (w2 BETWEEN 10 AND 
 
 RESET work_mem;
 RESET hash_mem_multiplier;
+-- On rcost's rows, 45 to a page, the unions compacted are NARROWs of a
+-- kilobyte (DESIGN.md §38), and compacting them always makes room.  rcostn's
+-- rows are narrow, 226 to a page, and there they stay BITSETs.  v is 0 in
+-- every other row of its first fifteen container keys, and 100,000, outside
+-- the range, in the others: v = 0 is a BITSET of 4 kB at each of them that
+-- nothing optimizes smaller, some 61 kB of the 64.  v's other values lie in
+-- the heap's order on the three keys after them, 20 rows each, and each of
+-- those keys' unions is a RUN that the sets after its first would widen:
+-- every widening is refused, the union folds, and the range is still
+-- collected.  With the memory, they are widened and ORed into in place.
+CREATE TABLE rcostn (g int NOT NULL, v int NOT NULL);
+INSERT INTO rcostn
+SELECT i % 5, CASE WHEN i > 15 * 64 * 226 THEN 1 + (i - 15 * 64 * 226 - 1) / 20
+				   WHEN i % 2 = 1 THEN 0 ELSE 100000 END
+  FROM generate_series(1, 18 * 64 * 226) i;
+CREATE INDEX rcostn_g ON rcostn USING lion (g);
+CREATE INDEX rcostn_v ON rcostn USING lion (v);
+VACUUM (FREEZE, ANALYZE) rcostn;
+SELECT count(*) AS rows_on_page_0, count(*) FILTER (WHERE v = 0) AS v0
+  FROM rcostn WHERE (ctid::text::point)[0] = 0;
+ rows_on_page_0 | v0  
+----------------+-----
+            226 | 113
+(1 row)
+
+SELECT bitset_containers, run_containers, narrow_containers
+  FROM lion_index_stats('rcostn_v');
+ bitset_containers | run_containers | narrow_containers 
+-------------------+----------------+-------------------
+                30 |           2172 |                 0
+(1 row)
+
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1.0;
+SELECT rc_check('SELECT g, count(*) FROM rcostn WHERE v BETWEEN 0 AND 99999 GROUP BY g');
+                                      rc_check                                       
+-------------------------------------------------------------------------------------
+ collected 1, walked 0, spilled 0: (0,30374) (1,30375) (2,30375) (3,30374) (4,30374)
+(1 row)
+
+RESET work_mem;
+RESET hash_mem_multiplier;
+SELECT rc_check('SELECT g, count(*) FROM rcostn WHERE v BETWEEN 0 AND 99999 GROUP BY g');
+                                      rc_check                                       
+-------------------------------------------------------------------------------------
+ collected 1, walked 0, spilled 0: (0,30374) (1,30375) (2,30375) (3,30374) (4,30374)
+(1 row)
+
+DROP TABLE rcostn;
 DROP FUNCTION rc_check(text);
 DROP TABLE rcost;
