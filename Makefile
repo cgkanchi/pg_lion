@@ -204,6 +204,17 @@ recovery-check-rmgr:
 	./test/recovery/run.sh $(if $(RECOVERY_PREFIX),--prefix "$(RECOVERY_PREFIX)") \
 		--mode rmgr --conf "wal_consistency_checking = 'pg_lion'"
 
+# The concurrent write + VACUUM + count soak (test/soak/README.md): the dev
+# cluster restarted into each WAL mode in turn, as installcheck-rmgr does,
+# with a hot standby in rmgr mode, and put back afterwards.
+#
+#   make soak                                  10 minutes a mode
+#   make soak SOAK_DURATION=120 SOAK_MODES=rmgr
+#   make soak SOAK_RUN_AS=<user>               as root: the cluster's user
+.PHONY: soak
+soak:
+	PG_CONFIG="$(PG_CONFIG)" ./test/soak/modes.sh
+
 # The PGXN release archive: pg_lion-<version>.zip, made by git archive from
 # the committed HEAD, so it holds exactly the tracked files named here - what
 # PGXS needs, the documentation and the test suites - and nothing from the
