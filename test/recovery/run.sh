@@ -2010,16 +2010,17 @@ phase3() {
 		SET synchronous_commit = on;
 		CREATE EXTENSION IF NOT EXISTS injection_points;
 
-		-- split: five ~1.5 KB ARRAY containers per leaf (count_split_race.spec)
+		-- split: several ~1 KB ARRAY containers per leaf (count_split_race.spec)
 		DROP TABLE IF EXISTS pin_split;
 		-- 15 rows to a heap page: 480 members of a key in a container, an
-		-- ARRAY, which the split case's inserts grow.  Narrower rows would
-		-- give the key more than 512 members with every offset below 128,
-		-- a NARROW (DESIGN.md section 38), which inserts set bits in and
-		-- never grow, so no leaf would split.
+		-- ARRAY, which the split case's inserts grow.  The index is made
+		-- before the rows, so that the inserts make it, as ARRAYs: a build
+		-- would make each a NARROW of width 1 (DESIGN.md section 38), 520
+		-- bytes, which an insert below offset 64 sets bits in and never
+		-- grows, so no leaf would split.
 		CREATE TABLE pin_split (id int, k int NOT NULL, pad char(480));
-		INSERT INTO pin_split SELECT i, i % 2, '' FROM generate_series(1, 100000) i;
 		CREATE INDEX pin_split_k ON pin_split USING lion (k);
+		INSERT INTO pin_split SELECT i, i % 2, '' FROM generate_series(1, 100000) i;
 
 		-- pushdown: one container on one page (count_root_pushdown_race.spec)
 		DROP TABLE IF EXISTS pin_push;
