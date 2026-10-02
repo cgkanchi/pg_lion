@@ -217,7 +217,17 @@ LANGUAGE sql IMMUTABLE AS $$
 		   ('select count(*) from lion_rec where id >= 20000'),
 		   ('select count(*) from lion_rec where id between 1000 and 30000 and k4 = 5'),
 		   ('select k4, count(*) from lion_rec where id < 25000 group by k4'),
-		   ('select count(*) from lion_rec where id > 100 and k4 < 50')
+		   ('select count(*) from lion_rec where id > 100 and k4 < 50'),
+		   /*
+		    * DESIGN.md §40: stored columns returned by an index-only scan of
+		    * lion_rec_st (a key under store_values, INCLUDE columns) and of
+		    * lion_rec_stb (INCLUDE columns under a key it does not store,
+		    * which lion's planner hook plans), when the visibility map
+		    * makes it the cheaper path - after a VACUUM, as on the standby.
+		    */
+		   ('select k4, t, nn, b from lion_rec where k4 = 5'),
+		   ('select t, nn from lion_rec where k4 in (1, 2, 3)'),
+		   ('select id, ct from lion_rec where nn = 7')
 $$;
 
 /* Every lion index on the table, with what its ntids must add up to. */
@@ -280,7 +290,7 @@ $$;
  * every check below, and compared between primary and standby: a standby that
  * quietly stopped using the pushdown would still produce the right numbers,
  * and the multiset comparisons would then be checking a sequential scan
- * against itself.
+ * against itself.  An index-only scan (DESIGN.md §40) is named as one.
  */
 CREATE FUNCTION lion_rec_node(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -297,6 +307,8 @@ BEGIN
 			node := 'pushdown';
 		ELSIF node <> 'pushdown' AND ln LIKE '%Bitmap Index Scan%' THEN
 			node := 'bitmap';
+		ELSIF node = 'other' AND ln LIKE '%Index Only Scan%' THEN
+			node := 'indexonly';
 		END IF;
 	END LOOP;
 	RETURN node;
