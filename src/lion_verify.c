@@ -537,9 +537,10 @@ lion_verify_container(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
 
 	/*
 	 * DESIGN.md §38: a NARROW only in an index of version 8.  A build writes
-	 * one only into such an index, VACUUM likewise, and inserts never; and a
-	 * build of pg_lion before §38 reads version 6 and 7 indexes, which have
-	 * to stay what it can read.  The version is the one the meta page says
+	 * one only into such an index, VACUUM likewise, and inserts only widen
+	 * one that is there; and a build of pg_lion before §38 reads version 6
+	 * and 7 indexes, which have to stay what it can read.  Its width is
+	 * lion_container_check()'s.  The version is the one the meta page says
 	 * now, as lion_verify_meta() read it.
 	 */
 	if (c->type == LION_CT_NARROW && vs->version < LION_VERSION_NARROW)

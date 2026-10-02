@@ -364,15 +364,17 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * stays readable by the builds before this one.
  *
  * Version 8 (DESIGN.md §38) is version 7 plus NARROW CONTAINERS: items of a
- * fifth type, a bitset of the offsets below 128 of a container's heap blocks.
- * It is an addition too - summary_cols says as before whether there are
- * summaries, and every page and item of a version 6 or 7 index reads as it
- * did - and the number moves so that a build that predates NARROW refuses an
- * index that has one rather than reporting it corrupt, or worse.  A build
- * writes version 8 only when it has written a NARROW item; VACUUM makes a
- * NARROW only in a version 8 index, and inserts never make one, so that an
- * index of version 6 or 7 stays one, readable by the builds before this one,
- * until it is rebuilt.
+ * fifth type, a bitset of the offsets below 64 * k of a container's heap
+ * blocks, k being the item's width, 1 .. LION_NARROW_MAX_WIDTH, in its
+ * header's flags byte.  It is an addition too - summary_cols says as before
+ * whether there are summaries, and every page and item of a version 6 or 7
+ * index reads as it did - and the number moves so that a build that
+ * predates NARROW refuses an index that has one rather than reporting it
+ * corrupt, or worse.  A build writes version 8 only when it has written a
+ * NARROW item; VACUUM makes a NARROW only in a version 8 index, and an insert
+ * makes one only of a NARROW, which it widens, so that an index of version 6
+ * or 7 stays one, readable by the builds before this one, until it is
+ * rebuilt.
  */
 #define LION_VERSION			6	/* the base format every index has */
 #define LION_VERSION_SUMMARIES	7	/* ... plus the summaries of §32 */
