@@ -125,8 +125,8 @@ jobs:
       # without the resource manager, a hot standby that replays everything
       # the primary writes, and its promotion, and lion_index_verify() on a
       # standby beside replay) in both WAL modes, with
-      # wal_consistency_checking, as the source jobs run them.  Phases 1b-1e
-      # and 3 park a backend on an injection point, which the packaged
+      # wal_consistency_checking, as the source jobs run them.  Phases 1b-1e,
+      # 1g and 3 park a backend on an injection point, which the packaged
       # servers cannot.  The extension is already in the packaged prefix
       # (the Install step put it there with sudo), which this user cannot
       # write to, so the harness uses it instead of installing its own.
@@ -159,7 +159,7 @@ jobs:
       PG_CONFIG: .local/pg/bin/pg_config
       # Fail rather than skip if the injection_points module is missing: the
       # Makefile then refuses to leave the injection-point specs out, and
-      # test/recovery/run.sh fails instead of skipping its phases 1b-1e and 3.
+      # test/recovery/run.sh fails instead of skipping its phases 1b-1e, 1g and 3.
       INJECTION_POINTS: "1"
     steps:
       - uses: actions/checkout@v7

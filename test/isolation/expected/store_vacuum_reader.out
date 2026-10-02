@@ -1,0 +1,162 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s2_delete_most s1_read s2_vacuum s2_pages s2_wakeup s2_detach s1_check
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s2_delete_most: DELETE FROM stvr WHERE k % 4 <> 1;
+step s1_read: SELECT lion_index_stored('stvr_i', '(0,1)') AS stored; <waiting ...>
+step s2_vacuum: VACUUM stvr;
+step s2_pages: 
+	SELECT pg_relation_size('stvr') / current_setting('block_size')::int AS heap_pages,
+		   store_pages
+	  FROM lion_index_stats('stvr_i') WHERE attno = 1;
+
+heap_pages|store_pages
+----------+-----------
+        17|          4
+(1 row)
+
+step s2_wakeup: SELECT injection_points_wakeup('lion-store-gather-head');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_read: <... completed>
+stored
+------
+{v1}  
+(1 row)
+
+step s2_detach: SELECT injection_points_detach('lion-store-gather-head');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s1_check: 
+	SELECT k, t, lion_index_stored('stvr_i', ctid) AS stored
+	  FROM stvr WHERE ctid = '(0,1)';
+	SELECT lion_index_verify('stvr_i', true);
+
+k|t |stored
+-+--+------
+1|v1|{v1}  
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s2_delete_all s1_read s2_vacuum s2_vacuum_again s2_pages s2_wakeup s2_detach s1_check
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s2_delete_all: DELETE FROM stvr;
+step s1_read: SELECT lion_index_stored('stvr_i', '(0,1)') AS stored; <waiting ...>
+step s2_vacuum: VACUUM stvr;
+step s2_vacuum_again: VACUUM stvr;
+step s2_pages: 
+	SELECT pg_relation_size('stvr') / current_setting('block_size')::int AS heap_pages,
+		   store_pages
+	  FROM lion_index_stats('stvr_i') WHERE attno = 1;
+
+heap_pages|store_pages
+----------+-----------
+         0|          0
+(1 row)
+
+step s2_wakeup: SELECT injection_points_wakeup('lion-store-gather-head');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_read: <... completed>
+stored
+------
+{NULL}
+(1 row)
+
+step s2_detach: SELECT injection_points_detach('lion-store-gather-head');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s1_check: 
+	SELECT k, t, lion_index_stored('stvr_i', ctid) AS stored
+	  FROM stvr WHERE ctid = '(0,1)';
+	SELECT lion_index_verify('stvr_i', true);
+
+k|t|stored
+-+-+------
+(0 rows)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+
+starting permutation: s2_delete_all s1_read s2_vacuum s2_vacuum_again s2_reinsert s2_pages s2_wakeup s2_detach s1_check
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s2_delete_all: DELETE FROM stvr;
+step s1_read: SELECT lion_index_stored('stvr_i', '(0,1)') AS stored; <waiting ...>
+step s2_vacuum: VACUUM stvr;
+step s2_vacuum_again: VACUUM stvr;
+step s2_reinsert: INSERT INTO stvr VALUES (-1, 'new');
+step s2_pages: 
+	SELECT pg_relation_size('stvr') / current_setting('block_size')::int AS heap_pages,
+		   store_pages
+	  FROM lion_index_stats('stvr_i') WHERE attno = 1;
+
+heap_pages|store_pages
+----------+-----------
+         1|          1
+(1 row)
+
+step s2_wakeup: SELECT injection_points_wakeup('lion-store-gather-head');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_read: <... completed>
+stored
+------
+{new} 
+(1 row)
+
+step s2_detach: SELECT injection_points_detach('lion-store-gather-head');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s1_check: 
+	SELECT k, t, lion_index_stored('stvr_i', ctid) AS stored
+	  FROM stvr WHERE ctid = '(0,1)';
+	SELECT lion_index_verify('stvr_i', true);
+
+ k|t  |stored
+--+---+------
+-1|new|{new} 
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+

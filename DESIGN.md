@@ -17605,7 +17605,8 @@ stores too, without the TIDs beside them.
 
 An index with neither `store_values` nor INCLUDE has no store and is written as format 8 or below,
 exactly as before, readable by every build before this one. `amcaninclude` turns on with this
-section (`lion_am.c`), and `amcanreturn` answers true for exactly the stored columns.
+section (`lion_am.c`), and `amcanreturn` answers true for exactly the stored columns - once the
+readers exist: Phase A leaves it NULL (see "As built" below).
 
 ### Format
 
@@ -17618,7 +17619,8 @@ says so, written by an op of its own (`LION_OP_STORE_META`, as `LION_OP_NDISTINC
 	BlockNumber store_root;    /* root of the window map */
 	uint32      store_cols;    /* bit i-1: index column i (key or INCLUDE) is stored */
 	uint32      store_max_len; /* the reloption at build time; 0 = none */
-	uint32      store_pages;   /* map and store pages, for the cost model (below) */
+	uint32      store_pages;   /* map and store pages, for the cost model (below); every
+	                            * record that adds or frees one carries the new count */
 
 `LION_VERSION_STORE` is 9; a build writes it only when `store_cols` is nonzero, and the version
 gate in `lion_meta.c` refuses a 9 to any build before this one, as 8 was refused before §38.
@@ -17633,10 +17635,10 @@ cost of a column does not depend on how many columns the index has.
 **The window map** (page kind `LION_PAGE_STOREMAP`, 0x0080) answers "where is the store of window
 ckey for stored column ord": slot = ckey × nstored + ord, slot value = the head block of that
 window's store chain, 0 = none yet. It is a radix of fixed depth two with fan-out
-LION_STOREMAP_FANOUT = 2035 (the BlockNumbers one item holds): the root page's one item is an
-array of inner-page blocks, each inner page's one item an array of leaf-page blocks, each leaf's
-one item an array of slot values; slot s lives at leaf s / 2035, which is entry (s / 2035) mod 2035
-of inner (s / 2035²). That addresses 8.4 billion slots, so the map never has to change shape, and a
+LION_STOREMAP_FANOUT = 2032 (the BlockNumbers one item of LION_MAX_ITEM_SIZE, 8,128 bytes, holds):
+the root page's one item is an array of inner-page blocks, each inner page's one item an array of
+leaf-page blocks, each leaf's one item an array of slot values; slot s lives at leaf s / 2032,
+which is entry (s / 2032) mod 2032 of inner (s / 2032²). That addresses 8.4 billion slots, so the map never has to change shape, and a
 lookup is three buffer reads, all hot. Pages are added at the end as slots are first used; a slot is
 written once, when a window's store is created, and cleared only by VACUUM when the heap has been
 truncated below the window. Every write is `LION_OP_SETBYTES` into the one item.
@@ -17654,16 +17656,19 @@ Its items, in order:
 1. **The header** `LionStoreHeader`: `ckey`, `ord`, `lo` and `hi` (heap pages covered, 0..63
    within the window), `mode` (DICT or RAW), `width` (bits per code in DICT, bytes per slot in RAW),
    `ndict`, `typlen`, `flags`.
-2. **The dictionary** (DICT mode only): the distinct values the page's rows hold, in the order they
-   were first seen, so that an insert appends and never renumbers. Fixed-width values are packed at
-   `typlen`; varlena values as a `uint16` offset array of ndict + 1 entries followed by the bytes.
+2. **The dictionary**: the distinct values the page's rows hold, in the order they were first
+   seen, so that an insert appends and never renumbers. Fixed-width values are packed at `typlen`;
+   varlena values as their bytes back to back followed by a `uint16` offset array of ndict + 1
+   entries at the item's end (off[0] = 0, off[i + 1] the end of entry i). The item is on every
+   page, empty in RAW mode, so that item 3 + k is always heap page lo + k.
    Code c ≥ 1 names entry c − 1; **code 0 is NULL**, and it is also what a slot holds that no row
    has written, which the insert order below makes the same thing.
 3. **One sub-array item per heap page** of the range, in heap page order, so item 3 + k is heap
-   page lo + k. A sub-array is `uint16 nslots` (the highest heap offset written) and then the slots,
-   indexed by heap offset − 1: in DICT mode `width` bits each, packed, `width` = the bits that hold
-   ndict (1 to 16); in RAW mode a null bitmap of nslots bits and then `width` bytes per slot, the
-   value itself (`typlen` bytes, or for a capped varlena `store_max_len` + 2 bytes, a `uint16`
+   page lo + k. A sub-array is a `LionStoreSub` (`uint16 nslots`, the highest heap offset written,
+   and `uint16 flags`) and then the slots, indexed by heap offset − 1: in DICT mode `width` bits
+   each, packed least significant bit first, `width` = the bits that hold ndict (1, 2, 4, 8 or 16,
+   so that no code straddles a byte); in RAW mode `width` bytes per slot and then a null bitmap of
+   nslots bits, the value itself (`typlen` bytes, or for a capped varlena `store_max_len` + 2 bytes, a `uint16`
    length and the bytes). A sub-array with the `LION_STORE_ABSENT` flag has no slots: the page could
    not hold its heap page's values (below), and a reader treats every TID on that heap page as it
    treats one on a page that is not all-visible, by fetching the heap, which carries both the row's
@@ -17728,9 +17733,12 @@ sorted by TID, the way the codes are spooled, is the follow-up that removes it.
 **WAL.** In rmgr mode (§25) every change is `LION_XLOG_STORE` (0xD0), an op-stream record over the
 existing ops: INIT and ADDMANY for a page written whole (create, rewrite, split, convert), REPLACE or
 DELTA for a sub-array or dictionary that grew, SETBYTES for a slot inside a sub-array and for a map
-slot, SPECIAL for a rightlink. No new op, no new replay code beyond dispatch. In generic mode every
+slot, SPECIAL for a rightlink, ADD for a sub-array that extends a page's range, DELETED for a
+freed page. One new op, `LION_OP_STORE_META` (18), copies the meta page's store record, as
+`LION_OP_NDISTINCT` copies §33's; nothing else needs new replay code. In generic mode every
 touched page is registered with GenericXLog and the diff does the rest. `wal_consistency_checking`
-covers both, and a store page's masking is a container page's (nothing but the LSN).
+covers both, and a store or map page's masking is a container page's (the LSN, and the padding
+after each item).
 
 **VACUUM.** `ambulkdelete` visits every store page once, after the posting sets, holding it
 exclusively (not a cleanup lock: readers hold a store page only while decoding one sub-array, and
@@ -17857,3 +17865,170 @@ pages), after VACUUM (clean), and with NULLs; `verify()` on each; `lion_index_st
 recovery harness: a crash between the store record and the posting record (an injection point in
 the cassert builds), and replay of every store record kind on a standby under
 `wal_consistency_checking = pg_lion`, in both WAL modes.
+
+### As built: Phase A (2026-10-02)
+
+Phase A is the store's format, its writers and its checks: the reloptions, the meta record and the
+version gate, the map and store pages, the serial and parallel build, the insert path and its WAL,
+VACUUM, `lion_index_stats()`, `lion_index_verify()`, `lion_index_stored()` and the gather API. No
+planner or executor path reads the store yet. Where it differs from the design above, and why:
+
+**Not yet: Phase B.** `amcanreturn` stays NULL; index-only scans, the four custom shapes, the
+gather's prices and EXPLAIN's `Store:` line come with the readers. `LionStoreCol.returnable` is
+already computed: a key column is returnable only when its stored type is the index tuple
+descriptor's, which `amstorage` can make differ (an opclass with a storage type). The cost model
+does not subtract `store_pages` yet: the three formulas that take the posting pages as `pages - 1 -
+dirpages` (`lion_plan_cost.c:845`, `lion_plan_fkjoin_cost.c:286` and `:429`) count an index's
+store pages as posting pages, which overprices posting reads of an index with a store - harmless
+while nothing chooses a plan for the store, and the first thing Phase B fixes.
+
+**The map.** Fan-out 2032, not 2035: one item of `LION_MAX_ITEM_SIZE` (8,128 bytes). Every map
+page records its level (`LionPageOpaque.level`: 0 leaf, 1 inner, 2 root) and its number within the
+level (`owner_head`), and every reader checks both against the path that reached it. The root is
+written by every build that stores a column, even of an empty heap, and by `ambuildempty` at block
+2 (an unlogged index's init fork); an inner or leaf page is added by an insert in a record of its
+own (the new page, its parent's entry, the meta count) before the record that creates a head.
+Map pages are never freed.
+
+**The page.** The dictionary item is on every page, empty in RAW mode; a varlena dictionary keeps
+its offsets at the item's end, after the bytes, so that an appended value moves nothing before it.
+A sub-array's header is `LionStoreSub` (`nslots`, `flags`), ABSENT is its flag, and a RAW
+sub-array's null bitmap follows its slots. `LionStoreHeader` repeats `ckey` and `ord`, carries
+`typlen`, and is 16 bytes; `lion_store_fmt.h` is the whole byte format, unit-tested on its own
+(`test/unit/store_test.c`).
+
+**`store_pages` is exact.** Every record that allocates or frees a map or store page carries
+`LION_OP_STORE_META` with the new count, so the cost model can read it at any time rather than
+after a build or a VACUUM.
+
+**A head starts at heap page 0, always.** A window's head is created covering heap pages 0 .. k,
+with empty sub-arrays before k; a page's `lo` never changes and ranges only move right (a split or
+an append), which is what a reader checks after reaching a page: the page names this window and
+column, a head has `lo` = 0, and the heap page is not before `lo`.
+
+**DICT or RAW.** Applied to every insert, the rule above would turn each new page RAW at its first
+rows, which are all distinct. As built:
+- the build applies it once per window, to the window's rows (`lion_store_prefer_raw()`), and
+  writes every page of the window in that mode;
+- an insert turns a DICT page RAW only when a write no longer fits the page as DICT, at any code
+  width, and does fit it as RAW; a page a split or an append creates inherits its page's mode;
+- VACUUM's rewrite encodes the page both ways when the column can be RAW and keeps the smaller, so
+  a RAW page whose rows mostly died can go back to DICT: "never converts back" holds for inserts.
+
+**Growth.** An insert first tries the page in place: the same value again (nothing), a slot set in
+its sub-array (SETBYTES of the bytes that changed), a longer sub-array (DELTA), a dictionary entry
+appended at the same code width, the range extended by ADDed sub-arrays. Anything else rebuilds
+the page from its decoded content: in its mode at whatever width it needs, then RAW as above, then
+- when the page covers more than one heap page - a split, or, for a heap page past the range of the
+chain's last page, a new last page of its own (an append), after which the write starts again from
+the map (at most 64 times). A split cuts the range in the middle, except that a write to the
+range's last heap page moves that heap page alone to the new page: a heap that fills page by page
+keeps writing there, and a cut in the middle would leave two half-full pages behind each heap page
+of the window. A page of one heap page that fits in neither mode marks it ABSENT; at build, a heap
+page too big for a page in the window's mode tries the other mode before ABSENT. The regression
+test reaches ABSENT with dozens of distinct 1,984-byte strings a heap page, compressed inline.
+
+**Unwritten slots.** A heap offset past its sub-array's `nslots`, a heap page past the chain's last
+range and a window with no head are reported by the gather as absent, which sends the caller to the
+heap, and as "missing" to `verify()`; a slot inside `nslots` that no row wrote reads NULL, which the
+insert order makes unreachable for a TID in a container. A parallel build's second scan can find
+dead a row the first one indexed and leave its slot unwritten, which is the same case.
+
+**Insert order and records.** `lion_store_insert()` computes every stored column's value first, so
+that a value too long is refused before anything is written, then writes the columns in order, a
+record per page touched; the injection point `lion-insert-after-store` follows it, before the key
+loop. A head is created in one record of three blocks: the store page, the map leaf's slot and the
+meta page.
+
+**Parallel build.** The leader's second heap scan (17 and later, as the parallel build is) writes
+the store after the posting sets, where a serial build writes each window's store pages as the scan
+leaves the window, before the posting sets: the two builds' block layouts differ, their stores do
+not (the regression test compares their statistics).
+
+**VACUUM.**
+- `ambulkdelete`'s store pass runs after the posting sets and before the leak sweep. It walks the
+  map from the root and every chain, marks each map and store page visited for the sweep, and asks
+  the callback about every written slot. Dead slots under a quarter of a page's written ones are
+  cleared in place, a SETBYTES per sub-array (code 0, or the null bit set and the RAW bytes
+  zeroed); a quarter or more rewrites the page in the smaller mode. An rmgr-mode index on a server
+  without the resource manager is visited and not written.
+- The sweep frees a live store page that the walk did not reach once a walk of the map from the
+  root (`lion_store_page_linked()`, where any doubt counts as linked) finds nothing that links it:
+  an orphan of a cleanup that freed a chain's head and failed before its other pages. A DELETED
+  store page goes the way a DELETED container page goes.
+- `amvacuumcleanup` frees the windows whose first heap block is at or past the heap's end. It
+  clears their map slots and deletes their heads while holding the HEAP's extension lock: no heap
+  page can be added meanwhile, so no insert can be writing into such a window, and one that comes
+  later finds the slot clear, or its cached head DELETED, and starts a new chain. The free space map
+  hears of the heads after the lock is released (the extension lock forbids other heavyweight
+  locks), and the rest of each chain is freed after that. Lazy VACUUM truncates the heap after
+  `amvacuumcleanup`, so the windows one VACUUM truncates away are freed by the next.
+
+**Reads.** The gather API (`lion_store.h`):
+
+	LionStoreReader *lion_store_open(Relation index, LionIndexState *ix, int ord,
+	                                 MemoryContext cxt);
+	void lion_store_gather(LionStoreReader *r, uint32 ckey, const uint16 *lo, int nlo,
+	                       Datum *values, bool *isnull, uint64 *absent_pages);
+	void lion_store_gather_reset(LionStoreReader *r);
+	void lion_store_close(LionStoreReader *r);
+
+`ord` is the stored ordinal (`lion_store_ordinal()`); `lo` is a window's members in ascending
+order; bit k of `*absent_pages` is set for heap page k when its rows must come from the heap. A
+reader holds one store page at a time, share-locked while it decodes one heap page's members, and
+a pin only within one call; it reads the map again when a page fails the check above (at most 64
+times). By-reference values are copied into the reader's context, a DICT page's values once per
+visit, and live until `lion_store_gather_reset()`. Between the map lookup and the first lock it
+holds nothing (the injection point `lion-store-gather-head`, which
+`test/isolation/store_vacuum_reader.spec` uses to free and reuse a chain under a parked reader).
+
+**`lion_index_stats()`** returns a row for each INCLUDE column as well, after the key columns,
+with no entries; its last seven columns are the store's: `store_pages` and `store_map_pages`
+(index-wide, on every row), and `store_dict_pages`, `store_raw_pages`, `store_absent`,
+`store_dict_bytes` and `store_slot_bytes`, NULL on the row of a column that is not stored.
+**`lion_index_stored(index, ctid) RETURNS text[]`**, revoked from PUBLIC, returns a TID's stored
+values through the gather, NULL where it reports the heap page absent.
+
+**`verify()`** checks the meta record against the index's columns, every map page's level and
+number, every head an owned STORE page, each chain's ranges contiguous from 0 (`lo` = the previous
+`hi` + 1) over at most 64 pages, and every page's header, dictionary, sub-arrays and codes; an
+unreachable store page is a leak (a WARNING), as an unreachable container page is. It does not
+check that no window past the heap's end has a slot - true only after the VACUUM that follows a
+truncation. With `heapallindexed` it compares every visible row's stored values with the heap's
+(`lion_store_compare()`), skipping ABSENT heap pages; a difference, or a slot the store does not
+have, is an ERROR naming the TID and not the values.
+
+**Unreachable refusals.** An INCLUDE column of a `typlen` -2 type, and a fixed-width type longer
+than 2,000 bytes, are refused with their own messages, but no table column has the one and no
+built-in type is the other; the checks stay as guards.
+
+**Tests as built.** `test/sql/store.sql` (options and refusals; every storable type and NULLs,
+serial, capped and parallel builds; each insert path - a window's head, codes widened at each
+width, DICT to RAW, appends, splits at the end and in the middle, ABSENT at build and at insert,
+the map growing past its first leaf; VACUUM clearing and rewriting; the store of a truncated heap
+freed and refilled; every step checked row by row against the heap and by `verify()`);
+`test/isolation/store_vacuum_reader.spec` (a parked reader whose page VACUUM rewrites, frees, and
+frees and reuses); the recovery harness (two store indexes in the crash-under-load fixture, their
+values compared with the heap after every crash and on the standby, and phase 1g, a crash between
+an insert's store record and its posting record); `test/unit/store_test.c`. INCLUDE used to be
+refused, so `multicolumn` and `options` changed.
+
+**What Phase B starts from.**
+- The count engine: the gather belongs where a window's result container, its visibility-map mask
+  and the posting pins are all held - `lion_count_container_masks()` / `lion_count_container()`
+  (`lion_count.c`) before the cursors advance; rows on dirty pages take their values from the heap
+  recheck that already reads them. In the decoded walk (`lion_count_groups_decode()`), a stored
+  column's values replace the reconstruction from its containers.
+- `amgettuple`: `liongettuple()` loads a container's members into `so->lo[]` (`lion_scan.c`, the
+  batch load); that is where a window's values are gathered, and the per-TID emission, which sets
+  `xs_itup = so->nullitup` today, is where the index tuple is formed from them. `amcanreturn`
+  answers from `LionStoreCol.returnable`, and `xs_want_itup` must keep the §9 pin.
+- LionOrdered: `lo_switch()` takes the sort keys with `heap_getattr()` and `lo_next()` fetches
+  before it tests; both run on the pinless set, so §40's fold has to move into the set's build,
+  under the pin.
+- The cost model: subtract `store_pages` at the three sites above.
+- Open: a parallel build's second heap scan; an uncapped, mostly distinct varlena column costs its
+  bytes plus a 2-byte code (15 bytes a row on the measured 11-byte strings) because dictionaries
+  are per page; the heap's extension lock is held across the WAL records of a cleanup that frees
+  windows (only after a truncation); inserts into the middle of an old window split by halves and
+  can leave half-full pages behind; `lion_index_stats()` reads every store page.

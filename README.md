@@ -61,7 +61,7 @@ the tested workloads, not a general replacement recommendation.
     make PG_CONFIG=.local/pg/bin/pg_config && make PG_CONFIG=.local/pg/bin/pg_config install
     eval "$(./dev.sh env)"
     make PG_CONFIG=.local/pg/bin/pg_config installcheck   # regress files + isolation specs
-    make unit PG_CONFIG=.local/pg/bin/pg_config           # container and sparse libraries, no server needed
+    make unit PG_CONFIG=.local/pg/bin/pg_config           # container, sparse and store formats, no server needed
 
 No `-march` is needed for speed: on x86-64, GCC and clang builds carry AVX2 and POPCNT versions of
 the container library's passes over whole bitsets, compiled with target attributes, and pick one at
@@ -107,8 +107,8 @@ replay, so turning it on for a primary that never replays proves nothing.
 - **The recovery harness** (`make recovery-check`) needs a whole installation to initdb clusters
   in, named by `RECOVERY_PREFIX`, which it builds and installs the extension into
   (`RECOVERY_SKIP_INSTALL=1` uses the one already installed there instead); as root it also
-  needs `RECOVERY_RUN_AS=<unprivileged user>` (`test/recovery/README.md`).  Its phases 1b-1e and 3
-  need `injection_points`, and are skipped without it unless `INJECTION_POINTS=1` makes that an
+  needs `RECOVERY_RUN_AS=<unprivileged user>` (`test/recovery/README.md`).  Its phases 1b-1e, 1g
+  and 3 need `injection_points`, and are skipped without it unless `INJECTION_POINTS=1` makes that an
   error.
 
 The regression files VACUUM with `FREEZE` wherever what they print depends on the VACUUM having
@@ -359,6 +359,7 @@ and these functions are for testing, diagnostics and the occasional direct count
     lion_index_verify(idx [, heapallindexed])       structural check, optionally against the heap
     lion_index_wal_mode(idx)                        'generic' or 'rmgr' (DESIGN.md §25)
     lion_index_posting_root(idx, key)               a key's posting-tree root block, for tests
+    lion_index_stored(idx, ctid)                    the values the window store holds for a TID (§40)
 
 The counts answer exactly what the equivalent `SELECT count(*)` answers under the same snapshot,
 and ask for what it would: SELECT on the table or its indexed columns, and no row-level security in
@@ -372,7 +373,7 @@ count of `SELECT count(*) FROM ONLY parent WHERE ...`, never the children's, eve
 (`"..." is not an index`); pass a partition's own index, or write the `SELECT count(*)` against the
 partitioned table and let the pushdown count every partition (DESIGN.md §16).  The pushdown is not
 attempted for an old-style inheritance parent without `ONLY`, whose children need not even share
-its columns: that query takes the ordinary plan.  The four diagnostic functions below the counts
+its columns: that query takes the ordinary plan.  The five diagnostic functions below the counts
 are not executable by PUBLIC, as with pageinspect and amcheck; `lion_index_stats()` is granted to
 `pg_stat_scan_tables`.
 `lion_index_verify()` checks the index while it is being written to, the way `CREATE INDEX
@@ -408,9 +409,12 @@ table's owner (DESIGN.md §7).
     src/lion_scan.c         amgetbitmap, and amgettuple for plain index scans
     src/lion_insert.c       aminsert (serialised on the directory leaf; bitset in-place fast path)
     src/lion_vacuum.c       ambulkdelete with cleanup locks on every page, two-pass cancellable protocol
+    src/lion_store.[ch]     the window store of stored and INCLUDE columns (§40): the map, store pages, the
+                            build's emitter, inserts, VACUUM's pass, the gather; lion_store_fmt.h is a
+                            store page's bytes, unit-tested standalone
     src/lion_funcs.[ch]     lion_index_stats() and the other diagnostics; lion_funcs.h is private to them
     src/lion_verify*.c      lion_index_verify(): pages and posting sets, the directory, rechecks and
-                            heapallindexed, summary posting sets
+                            heapallindexed, summary posting sets, the window store
     src/lion_count.h        the count engine's interface - lion_count_keys(): VM-interlocked counting,
                             per-block batched heap recheck - and lion_count_int.h what its files share:
     src/lion_set.c          locating posting sets, the list pin budget, the lookup walk
@@ -478,6 +482,67 @@ turned away as `Rows Removed by Recheck`. A value the planner cannot estimate is
 that rechecks the most, so a lone `tags @> $1` in a generic plan usually goes to the ordinary plan
 and a custom plan of the literal to the pushdown. Such a query is not taken under an `OR`.
 
+## Stored columns: INCLUDE and `store_values` (DESIGN.md §40)
+
+A lion index can keep the VALUES of some of its columns beside its posting sets: a window store,
+which holds, for each stored column and each 64-page window of the heap, the column's value of
+every row in the window, addressed by the row's TID.
+
+```sql
+-- INCLUDE columns are always stored
+CREATE INDEX events_country_lion ON events USING lion (country) INCLUDE (user_id, amount);
+-- store_values stores the scalar key columns as well
+CREATE INDEX events_type_lion ON events USING lion (event_type) WITH (store_values = true);
+```
+
+**Nothing reads the store yet.** This is its first part: the format, the build (serial and
+parallel), inserts, VACUUM, `lion_index_verify()` and the diagnostics. The planner and executor do
+not consult it - no index-only scan returns a stored column, and no count, `GROUP BY`, `ORDER BY`
+or aggregate takes a value from it - so for now a store costs its writes and its pages and buys
+only `lion_index_stored()`. The readers DESIGN.md §40 describes come next.
+
+| option | values | default | what it does |
+| --- | --- | --- | --- |
+| `store_values` | bool | off | store the scalar key columns too (INCLUDE columns are always stored) |
+| `store_max_len` | 0 .. 2000 | 0 | a stored varlena column may go RAW, in slots of this many bytes plus two; a longer value is an ERROR; 0 = dictionary-coded only |
+
+Both are read at build time and recorded in the index; `ALTER INDEX ... SET` takes effect at the
+next REINDEX.
+
+What is stored:
+
+- **INCLUDE columns**, always: any fixed-width type (integers, floats, dates, timestamps, bool,
+  enums, uuid, ...) or varlena type (text, varchar, bytea, numeric, arrays and the like, as plain
+  values). An INCLUDE column has no posting sets: it is never a lion filter.
+- **Key columns** with `store_values = true`, the scalar ones only. A multi-key column (an array or
+  tsvector under `array_ops` / `tsvector_ops`) gives a row many keys and is skipped with a NOTICE;
+  `store_values` on an index with nothing it can store is an ERROR.
+- The value stored is the column's datum, detoasted and uncompressed. One longer than 2000 bytes is
+  an ERROR at insert or build, as a key that long is; with `store_max_len` set, a varlena longer
+  than it is an ERROR too.
+- An index that stores a column is format 9, which the builds before this one refuse; one that
+  stores none is written exactly as before.
+
+How: a store page holds one column of a run of heap pages of one window. While the values repeat
+it lists each distinct one once and gives every row a code of 1 to 16 bits (DICT); once they stop
+repeating it keeps the values themselves in fixed slots (RAW), which a fixed-width column and a
+varlena column with `store_max_len` can do. A heap page whose values no store page can hold - only
+long distinct strings the heap compressed inline get there - is left to the heap, and
+`lion_index_stored()` says NULL for its rows. On a synthetic table of a million rows (136 rows a
+heap page, 115 windows), per window: an int4 of 10 values took 1 page (half a byte a row), an int4
+of distinct values 5 RAW pages (4.1 bytes a row), a short text of 100 values 2 pages, and a short
+text of distinct values (`'user-' || n`) 21 pages (15 bytes a row); the four together came to 3,378
+pages, beside 7,353 heap pages and 242 pages for the same index storing nothing.
+
+Writes: every insert writes each stored column's slot first, in a WAL record of its own, so a row
+costs one more page and record per stored column; VACUUM clears the slots of dead rows and rewrites
+a page a quarter of whose slots are dead; after VACUUM truncates the heap, the next VACUUM frees the
+store of every window past the heap's end. `lion_index_stored(idx, ctid)` returns the values the
+store holds for a TID, as `text[]` in the order of the stored columns - the stored key columns
+and then the INCLUDE columns - with NULL for a NULL, for a slot no row has written or VACUUM has
+cleared, and for a heap page left to the heap; it reads the store, not the heap, so it answers for
+dead and never-committed rows too.
+
 ## Reloptions
 
 `fillfactor` (10 .. 100, default 90): how full the build packs a directory leaf.
@@ -524,6 +589,11 @@ development: two extensions that both take it cannot be loaded together, so a pr
 should check `pg_get_wal_resource_managers()` and move one of them.  Once an index has been written
 in rmgr mode the library must stay in `shared_preload_libraries` for as long as WAL that mentions it
 may still be replayed - the rule core states for every custom resource manager.
+`store_values` (bool, default off) and `store_max_len` (0 .. 2000 bytes, default 0): the window
+store above (DESIGN.md §40).  `store_values` stores the index's scalar key columns as well as its
+INCLUDE columns; `store_max_len` lets a stored varlena column's pages turn RAW, in slots of that
+many bytes plus two, and makes a longer value an ERROR - with 0 a varlena column is only ever
+dictionary-coded.  Both are read at build time.
 `lion_index_stats()` reports ONE ROW PER KEY COLUMN (DESIGN.md §24), with a leading `attno`: the
 directory's height, its leaf and internal pages and whether that column is `ordered` (false for a
 key type with no btree opclass, whose entries are then in a complete but arbitrary order), the
@@ -536,7 +606,11 @@ the planner is given for the column (DESIGN.md §33; NULL where none is recorded
 payloads (DESIGN.md §4), which is space a later insert into the same key grows into for free; a
 bulk-built index has none of either.  The counters that describe the
 relation rather than a column - the directory's shape, free and deleted pages - are repeated on
-every row.
+every row.  An index with INCLUDE columns has a row for each of them too, after the key columns,
+with no entries.  The window store's counters come last: `store_pages` and `store_map_pages` (the
+index's, on every row, 0 without a store), and per stored column `store_dict_pages`,
+`store_raw_pages`, `store_absent` (heap pages left to the heap), `store_dict_bytes` and
+`store_slot_bytes`, which are NULL on the row of a column that is not stored.
 
 ## Settings
 
@@ -690,7 +764,8 @@ Equality, `IN` lists, scalar ranges and the multi-key operators above are suppor
 scans and plain index scans (`amgettuple`, DESIGN.md §29). There are no ordered scans of the
 access method itself (an `ORDER BY` is `LionOrdered`'s: a B-tree walked with a lion filter, or a
 lion index's own ordered column walked, §30), no index-only scans
-that return a column (only those that need none, like `count(*)`), no INCLUDE columns, no
+that return a column (only those that need none, like `count(*)`; INCLUDE columns are stored but
+not returned, below), no
 parallel build or scan, no reclaim of an emptied directory leaf or of an emptied posting-tree leaf
 (both wait for the whole set or the whole index to go). Inserts serialise on the directory
 leaf that holds the key; see the measured
@@ -731,6 +806,13 @@ the setting) does not read lion indexes at all: lion does not detect "snapshot t
 planner prices them out and declines the count pushdown and `LionOrdered`, and a scan or SQL count
 that reaches one anyway fails with an error rather than return a different answer than the
 snapshot's (DESIGN.md §9).  Inserts and VACUUM work as usual.
+The window store of INCLUDE and stored key columns (DESIGN.md §40) is written and maintained but
+not yet read by anything but `lion_index_stored()`: index-only scans do not return stored columns,
+and no count, `GROUP BY`, `ORDER BY` or aggregate takes its values from the store.  A stored value
+is at most 2000 bytes, a varlena one at most `store_max_len` when that is set; a multi-key column
+is never stored; which columns are stored is fixed at build.  A parallel build reads the heap a
+second time for the store.  A window's store is freed only by the VACUUM after the one that
+truncated the heap below it.
 
 ## Latest benchmarks
 
