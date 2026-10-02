@@ -1,7 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * lion_funcs.c
- *		lion_index_stats(), lion_index_wal_mode() and lion_index_posting_root().
+ *		lion_index_stats(), lion_index_wal_mode(), lion_index_posting_root()
+ *		and lion_index_stored().
  *
  * Part of the SQL-callable helpers of the lion index; lion_funcs.h
  * describes them and declares what their files share.
@@ -11,10 +12,13 @@
 #include "postgres.h"
 
 #include "lion_funcs.h"
+#include "lion_store.h"
+#include "utils/array.h"
 
 PG_FUNCTION_INFO_V1(lion_index_stats);
 PG_FUNCTION_INFO_V1(lion_index_posting_root);
 PG_FUNCTION_INFO_V1(lion_index_wal_mode);
+PG_FUNCTION_INFO_V1(lion_index_stored);
 
 /*
  * Open relid as a lion index.
@@ -53,7 +57,9 @@ lion_open_index(Oid relid, LOCKMODE lockmode)
 /* ---------------------------------------------------------------------
  * lion_index_stats()
  *
- * One row per KEY COLUMN (DESIGN.md §24).  Counters that describe an entry or
+ * One row per KEY COLUMN (DESIGN.md §24), and one per INCLUDE column after
+ * them, which has no entries and only the window store's counters of its own
+ * (§40).  Counters that describe an entry or
  * a posting set are that column's own; counters that describe the RELATION -
  * the directory's shape, the free and deleted pages - are the index's and are
  * repeated on every row, because a directory leaf holds the entries of
@@ -96,6 +102,19 @@ typedef struct LionColStats
 	int64		summary_tids;
 	int64		summary_bytes;
 	int64		summary_pages;
+
+	/*
+	 * The column's window store (DESIGN.md §40), when it is stored: its
+	 * pages by mode, the heap pages whose values a page could not hold
+	 * (ABSENT), and the bytes of the dictionaries and of the slots (codes,
+	 * RAW values and null bitmaps), item headers left out.
+	 */
+	bool		stored;
+	int64		store_dict_pages;
+	int64		store_raw_pages;
+	int64		store_absent;
+	int64		store_dict_bytes;
+	int64		store_slot_bytes;
 } LionColStats;
 
 /* What one posting set contributed, before its column is known. */
@@ -116,9 +135,12 @@ typedef struct LionStats
 	int64		free_bytes;
 	int64		deleted_pages;	/* freed pages awaiting reuse (DESIGN.md §18) */
 
-	int			ncolumns;
-	LionColStats *cols;			/* [ncolumns] */
-	bool	   *ordered;		/* [ncolumns]: the column's own opclass (§21) */
+	int			ncolumns;		/* key columns */
+	int			nrows;			/* ... and INCLUDE columns (§40) */
+	LionColStats *cols;			/* [nrows] */
+	bool	   *ordered;		/* [nrows]: the column's own opclass (§21) */
+	int64		store_pages;	/* window store pages (§40), live */
+	int64		store_map_pages;	/* ... and its map's pages */
 	HTAB	   *sets;			/* head block -> LionSetStats, or NULL */
 	LionMetaNdistinct nd;		/* the key counts on the meta page (§33) */
 } LionStats;
@@ -271,11 +293,14 @@ lion_index_stats(PG_FUNCTION_ARGS)
 
 		st = (LionStats *) palloc0(sizeof(LionStats));
 		st->ncolumns = ix->ncolumns;
+		st->nrows = IndexRelationGetNumberOfAttributes(index);
 		st->cols = (LionColStats *) palloc0(sizeof(LionColStats) *
-											st->ncolumns);
-		st->ordered = (bool *) palloc0(sizeof(bool) * st->ncolumns);
+											st->nrows);
+		st->ordered = (bool *) palloc0(sizeof(bool) * st->nrows);
 		for (i = 0; i < st->ncolumns; i++)
 			st->ordered[i] = ix->cols[i].ordered;
+		for (i = 0; i < ix->nstored; i++)
+			st->cols[ix->stored[i].attno - 1].stored = true;
 		st->sets = NULL;
 
 		/*
@@ -466,6 +491,51 @@ lion_index_stats(PG_FUNCTION_ARGS)
 					lion_stats_item(cs, c, ItemIdGetLength(iid));
 				}
 			}
+			else if (LionPageIsStoreMap(page))
+				st->store_map_pages++;
+			else if (LionPageIsStore(page))
+			{
+				uint32		ord = LionPageGetOpaque(page)->owner_hash;
+
+				/* a freed store page is a freed page like any other (§18) */
+				if (LionPageIsDeleted(page))
+				{
+					st->deleted_pages++;
+					UnlockReleaseBuffer(buf);
+					continue;
+				}
+				st->store_pages++;
+
+				/*
+				 * A page lion_store_page_check() refuses is left out of its
+				 * column's counters, as a damaged entry is; verify() says
+				 * what is wrong with it.
+				 */
+				if (ord < (uint32) ix->nstored &&
+					lion_store_page_check(page, &ix->stored[ord]) == NULL)
+				{
+					LionColStats *cs = &st->cols[ix->stored[ord].attno - 1];
+					LionStoreHeader *h = lion_store_page_header(page);
+					int			k;
+
+					if (h->mode == LION_STORE_DICT)
+						cs->store_dict_pages++;
+					else
+						cs->store_raw_pages++;
+					cs->store_dict_bytes += (int64)
+						(ItemIdGetLength(PageGetItemId(page, LION_STORE_DICT_OFF)) -
+						 sizeof(LionStoreDict));
+					for (k = h->lo; k <= h->hi; k++)
+					{
+						Size		len;
+						LionStoreSub *sub = lion_store_page_sub(page, k, &len);
+
+						if ((sub->flags & LION_STORE_ABSENT) != 0)
+							cs->store_absent++;
+						cs->store_slot_bytes += (int64) (len - sizeof(LionStoreSub));
+					}
+				}
+			}
 
 			UnlockReleaseBuffer(buf);
 			CHECK_FOR_INTERRUPTS();
@@ -529,7 +599,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 		index_close(index, AccessShareLock);
 
 		funcctx->user_fctx = (void *) st;
-		funcctx->max_calls = st->ncolumns;
+		funcctx->max_calls = st->nrows;
 
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -574,12 +644,31 @@ lion_index_stats(PG_FUNCTION_ARGS)
 		values[25] = Int64GetDatum(cs->summary_tids);
 		values[26] = Int64GetDatum(cs->summary_bytes);
 		values[27] = Int64GetDatum(cs->summary_pages);
-		if (call < LION_META_MAX_COLS &&
+		if (call < st->ncolumns && call < LION_META_MAX_COLS &&
 			(st->nd.valid_cols & (((uint32) 1) << call)) != 0)
 			values[28] = Int64GetDatum((int64) st->nd.ndistinct[call]);
 		else
 			nulls[28] = true;
 		values[29] = Int64GetDatum(cs->by_type[LION_CT_NARROW]);
+
+		/* the window store (DESIGN.md §40): the index's, then the column's */
+		values[30] = Int64GetDatum(st->store_pages);
+		values[31] = Int64GetDatum(st->store_map_pages);
+		if (cs->stored)
+		{
+			values[32] = Int64GetDatum(cs->store_dict_pages);
+			values[33] = Int64GetDatum(cs->store_raw_pages);
+			values[34] = Int64GetDatum(cs->store_absent);
+			values[35] = Int64GetDatum(cs->store_dict_bytes);
+			values[36] = Int64GetDatum(cs->store_slot_bytes);
+		}
+		else
+		{
+			int			k;
+
+			for (k = 32; k <= 36; k++)
+				nulls[k] = true;
+		}
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
@@ -689,4 +778,89 @@ lion_index_posting_root(PG_FUNCTION_ARGS)
 	if (root < 0)
 		PG_RETURN_NULL();
 	PG_RETURN_INT64(root);
+}
+
+/* ---------------------------------------------------------------------
+ * lion_index_stored()
+ * --------------------------------------------------------------------- */
+
+/*
+ * The window store's values of the row at ctid (DESIGN.md §40), one per
+ * stored column in ordinal order - the stored key columns and INCLUDE
+ * columns, in index column order - each through its type's output function.
+ * NULL for a NULL value and for one the store does not have: a heap page it
+ * marked ABSENT, or a slot no insert wrote.
+ *
+ * A DIAGNOSTIC, for the tests: it reads the slot as it stands, whatever the
+ * row's visibility - a slot a dead row's insert wrote keeps its value until
+ * VACUUM clears it or another row takes the TID - and it is the store's own
+ * gather, so what it returns for a row that is visible is what a reader of
+ * the store would be given.
+ */
+Datum
+lion_index_stored(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	ItemPointer tid = PG_GETARG_ITEMPOINTER(1);
+	Relation	index;
+	LionIndexState *ix;
+	Datum	   *elems;
+	bool	   *elnulls;
+	int			dims[1];
+	int			lbs[1];
+	int			ord;
+	ArrayType  *result;
+
+	index = lion_open_index(relid, AccessShareLock);
+	ix = lion_get_index_state(index);
+	if (ix->nstored == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("lion index \"%s\" stores no column",
+						RelationGetRelationName(index)),
+				 errhint("Columns are stored by an index built with store_values or with INCLUDE columns.")));
+	if (!OffsetNumberIsValid(ItemPointerGetOffsetNumberNoCheck(tid)) ||
+		ItemPointerGetOffsetNumberNoCheck(tid) > LION_MAX_OFFSET ||
+		!BlockNumberIsValid(ItemPointerGetBlockNumberNoCheck(tid)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid tuple identifier (%u,%u)",
+						ItemPointerGetBlockNumberNoCheck(tid),
+						ItemPointerGetOffsetNumberNoCheck(tid))));
+
+	elems = (Datum *) palloc0(sizeof(Datum) * ix->nstored);
+	elnulls = (bool *) palloc0(sizeof(bool) * ix->nstored);
+	for (ord = 0; ord < ix->nstored; ord++)
+	{
+		const LionStoreCol *col = &ix->stored[ord];
+		LionStoreReader *r = lion_store_open(index, ix, ord, CurrentMemoryContext);
+		uint64		code = lion_tid_to_code(tid);
+		uint16		lo = lion_code_lo(code);
+		Datum		value;
+		bool		isnull;
+		uint64		absent;
+
+		lion_store_gather(r, lion_code_ckey(code), &lo, 1, &value, &isnull,
+						  &absent);
+		if (absent != 0 || isnull)
+			elnulls[ord] = true;
+		else
+		{
+			Oid			typoutput;
+			bool		typisvarlena;
+
+			getTypeOutputInfo(col->typid, &typoutput, &typisvarlena);
+			elems[ord] = CStringGetTextDatum(OidOutputFunctionCall(typoutput,
+																   value));
+		}
+		lion_store_close(r);
+	}
+
+	dims[0] = ix->nstored;
+	lbs[0] = 1;
+	result = construct_md_array(elems, elnulls, 1, dims, lbs, TEXTOID, -1,
+								false, TYPALIGN_INT);
+	index_close(index, AccessShareLock);
+
+	PG_RETURN_ARRAYTYPE_P(result);
 }

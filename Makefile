@@ -24,7 +24,7 @@ STORE_OBJS = src/lion_store.o
 # The SQL-callable helpers: lion_funcs.c and lion_index_verify()'s files, which
 # share the private header src/lion_funcs.h.
 FUNCS_OBJS = src/lion_funcs.o src/lion_verify.o src/lion_verify_dir.o src/lion_verify_heap.o \
-       src/lion_verify_summary.o
+       src/lion_verify_summary.o src/lion_verify_store.o
 OBJS = src/lion_container.o src/lion_sparse.o src/lion_wal.o $(PAGES_OBJS) src/lion_dir.o src/lion_posting.o \
        src/lion_am.o src/lion_amcost.o src/lion_build.o src/lion_spool.o src/lion_scan.o \
        src/lion_insert.o src/lion_vacuum.o $(STORE_OBJS) $(FUNCS_OBJS) $(COUNT_OBJS) $(CUSTOMSCAN_OBJS) \

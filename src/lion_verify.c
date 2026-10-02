@@ -227,28 +227,50 @@ lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
 
 	flags = opaque->flags & LION_PAGE_KINDS;
 	if (flags != LION_PAGE_META && flags != LION_PAGE_BUCKET &&
-		flags != LION_PAGE_CONTAINER && flags != LION_PAGE_DIR)
+		flags != LION_PAGE_CONTAINER && flags != LION_PAGE_DIR &&
+		flags != LION_PAGE_STOREMAP && flags != LION_PAGE_STORE)
 		lion_corrupt("lion index \"%s\": block %u has flags 0x%04X, expected exactly one page kind",
 					RelationGetRelationName(vs->index), blk, opaque->flags);
 
-	/* Only a container page may ever carry the DELETED bit (DESIGN.md §18). */
-	if ((opaque->flags & LION_PAGE_DELETED) != 0 && flags != LION_PAGE_CONTAINER)
+	/*
+	 * Only a posting page or a window store page (§40) may ever carry the
+	 * DELETED bit (DESIGN.md §18).
+	 */
+	if ((opaque->flags & LION_PAGE_DELETED) != 0 &&
+		flags != LION_PAGE_CONTAINER && flags != LION_PAGE_STORE)
 		lion_corrupt("lion index \"%s\": block %u is marked deleted but is a %s page",
 					RelationGetRelationName(vs->index), blk,
-					flags == LION_PAGE_META ? "meta" :
-					flags == LION_PAGE_DIR ? "directory" : "leaf");
+					lion_verify_kind_name(flags));
 
 	if (flags != kind)
 		lion_corrupt("lion index \"%s\": block %u is a %s page, expected a %s page",
 					RelationGetRelationName(vs->index), blk,
-					flags == LION_PAGE_META ? "meta" :
-					flags == LION_PAGE_BUCKET ? "leaf" :
-					flags == LION_PAGE_DIR ? "directory" : "container",
-					kind == LION_PAGE_META ? "meta" :
-					kind == LION_PAGE_BUCKET ? "leaf" :
-					kind == LION_PAGE_DIR ? "directory" : "container");
+					lion_verify_kind_name(flags), lion_verify_kind_name(kind));
 
 	return page;
+}
+
+/* The name of a page kind, for messages. */
+const char *
+lion_verify_kind_name(uint16 kind)
+{
+	switch (kind)
+	{
+		case LION_PAGE_META:
+			return "meta";
+		case LION_PAGE_BUCKET:
+			return "leaf";
+		case LION_PAGE_DIR:
+			return "directory";
+		case LION_PAGE_CONTAINER:
+			return "container";
+		case LION_PAGE_STOREMAP:
+			return "window map";
+		case LION_PAGE_STORE:
+			return "store";
+		default:
+			return "unknown";
+	}
 }
 
 /*
@@ -1841,6 +1863,10 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	LION_INJECTION_POINT("lion-verify-meta-read");
 
 	lion_verify_directory(&vs);
+
+	/* The window store (DESIGN.md §40): its map, then every chain. */
+	lion_verify_store(&vs);
+
 	lion_verify_reachable(&vs);
 	lion_verify_recheck(&vs);
 
@@ -1863,6 +1889,8 @@ lion_index_verify(PG_FUNCTION_ARGS)
 
 	if (heapallindexed)
 		lion_verify_heapallindexed(&vs);
+
+	lion_verify_store_end(&vs);
 
 	MemoryContextDelete(vs.setcxt);
 	pfree(vs.setvisits);
