@@ -1778,54 +1778,82 @@ standby_chain_reuse() {
 	SUMMARY+=("phase2 standby      chain free + reuse replayed under a reader ($freed pages)")
 }
 
-# Index-only scans on the standby (DESIGN.md §9 "Hot standby", §29.9).  An
-# index-only scan trusts the visibility map for every TID it returns, which a
-# standby may only do where replay waits for the pin the scan keeps: rmgr
+# Index-only scans on the standby (DESIGN.md §9 "Hot standby", §29.9, §40).
+# An index-only scan trusts the visibility map for every TID it returns, which
+# a standby may only do where replay waits for the pin the scan keeps: rmgr
 # mode.  In generic mode liongettuple() looks every TID up in the heap first
-# (it used to return the dead rows instead, 2026-09-27 review).  Either way
-# the standby's index-only scan must answer what its sequential scan answers,
-# before and after the primary deletes rows and vacuums them away.  lion plans
-# an index-only scan only for a query that needs no column, which a partial
-# index whose predicate is the WHERE clause gives.
+# (it used to return the dead rows instead, 2026-09-27 review), and takes the
+# values it returns from there too; in rmgr mode it takes them from the
+# window store for a batch its pin covers.  Either way the standby's
+# index-only scan must answer what its sequential scan answers, and what the
+# primary answers: before, with updated rows not yet vacuumed (pages that are
+# not all-visible, which the executor looks up in the heap), and after the
+# primary deletes rows and vacuums them away.  Three scans: one that returns
+# no column - `count(*)` over a partial index whose predicate is the WHERE
+# clause - and two that return stored columns (DESIGN.md §40, "Index-only
+# scans"): a scalar key under store_values with INCLUDE columns, and INCLUDE
+# columns under an array column's `&&`, which lion's planner hook builds.
 standby_index_only() {
-	local plan ios seq want round
+	local plan ios seq want round q n
 	local ioset="set enable_seqscan = off; set enable_bitmapscan = off; set pg_lion.enable_count_pushdown = off;"
 	local seqset="set enable_indexscan = off; set enable_indexonlyscan = off; set enable_bitmapscan = off; set pg_lion.enable_count_pushdown = off;"
+	local -a queries=(
+		"select count(*) from lion_ios where flag"
+		"select k, v, w from lion_ios where k = 7"
+		"select v, w from lion_ios where tags && '{3,5}'"
+	)
+	local -a indexes=(lion_ios_k lion_ios_kv lion_ios_tags)
 	log ""
 	log "-- standby: index-only scans"
 
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "standby_index_only: fixture failed"
 		SET synchronous_commit = on;
 		DROP TABLE IF EXISTS lion_ios;
-		CREATE TABLE lion_ios (id int NOT NULL, k int NOT NULL, flag bool NOT NULL);
-		INSERT INTO lion_ios SELECT i, i % 50, i % 2 = 0 FROM generate_series(1, 40000) i;
+		CREATE TABLE lion_ios (id int NOT NULL, k int NOT NULL, flag bool NOT NULL,
+							   tags int4[], v text, w int);
+		INSERT INTO lion_ios
+		SELECT i, i % 50, i % 2 = 0, ARRAY[i % 13, i % 17], 'v' || (i % 1000),
+			   CASE WHEN i % 7 = 0 THEN NULL ELSE i END
+		  FROM generate_series(1, 40000) i;
 		CREATE INDEX lion_ios_k ON lion_ios USING lion (k) WHERE flag;
+		CREATE INDEX lion_ios_kv ON lion_ios USING lion (k) INCLUDE (v, w)
+			WITH (store_values = true);
+		CREATE INDEX lion_ios_tags ON lion_ios USING lion (tags) INCLUDE (v, w);
 	SQL
 	psql_p -c "VACUUM (ANALYZE) lion_ios" >>"$RUNLOG" 2>&1
 	wait_catchup
 
-	plan=$(psql_s -tAc "$ioset explain (costs off) select count(*) from lion_ios where flag")
-	grep -q "Index Only Scan using lion_ios_k" <<<"$plan" ||
-		die "standby_index_only: the standby plans no index-only scan of lion_ios_k: $plan"
+	for n in "${!queries[@]}"; do
+		plan=$(psql_s -tAc "$ioset explain (costs off) ${queries[$n]}")
+		grep -q "Index Only Scan using ${indexes[$n]} on" <<<"$plan" ||
+			die "standby_index_only: the standby plans no index-only scan of ${indexes[$n]} for ${queries[$n]}: $plan"
+	done
 
-	for round in before after; do
-		if [ "$round" = after ]; then
+	for round in before dirty after; do
+		if [ "$round" = dirty ]; then
+			psql_p -c "SET synchronous_commit = on; UPDATE lion_ios SET v = v || 'x', w = -w WHERE id % 9 = 0" \
+				>>"$RUNLOG" 2>&1 || die "standby_index_only: update failed"
+			wait_catchup
+		elif [ "$round" = after ]; then
 			psql_p -c "SET synchronous_commit = on; DELETE FROM lion_ios WHERE id % 4 = 0" \
 				>>"$RUNLOG" 2>&1 || die "standby_index_only: delete failed"
 			psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_ios" >>"$RUNLOG" 2>&1
 			wait_catchup
 		fi
-		want=$(psql_p -tAc "select count(*) from lion_ios where flag")
-		ios=$(psql_s -tAc "$ioset select count(*) from lion_ios where flag")
-		seq=$(psql_s -tAc "$seqset select count(*) from lion_ios where flag")
-		{ [ "$ios" = "$seq" ] && [ "$seq" = "$want" ]; } ||
-			die "BUG: standby_index_only ($round the delete): the standby's index-only scan counts $ios, its sequential scan $seq, the primary $want"
+		for q in "${queries[@]}"; do
+			q="select count(*) || ' ' || md5(coalesce(string_agg(x::text, ',' order by x::text), '')) from ($q) x"
+			want=$(psql_p -tAc "$seqset $q")
+			ios=$(psql_s -tAc "$ioset $q")
+			seq=$(psql_s -tAc "$seqset $q")
+			{ [ -n "$want" ] && [ "$ios" = "$seq" ] && [ "$seq" = "$want" ]; } ||
+				die "BUG: standby_index_only ($round): the standby's index-only scan answers '$ios', its sequential scan '$seq', the primary '$want': $q"
+		done
 	done
 
 	psql_p -c "DROP TABLE lion_ios" >>"$RUNLOG" 2>&1
 	wait_catchup
 
-	log "standby: index-only scans answer $ios rows, as the sequential scan does, before and after a VACUUM"
+	log "standby: index-only scans, stored columns among them, answer as the sequential scan does, before and after a VACUUM"
 	SUMMARY+=("phase2 standby      index-only scans agree with the heap ($MODE mode)")
 }
 
