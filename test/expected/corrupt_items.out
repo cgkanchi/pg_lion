@@ -11,6 +11,9 @@
 -- 3. A stored text key whose header says TOAST pointer: the first descent
 --    that compared against it crashed in detoast (lion_check_key()).
 -- 4. A member at heap offset 0, which lion_index_verify() passed.
+-- 5. A NARROW (DESIGN.md §38) whose cardinality is not its payload's.
+-- 6. A NARROW in an index whose meta page says version 6.
+-- 7. A NARROW of a width the build does not have, which sizes it.
 --
 -- The pages are damaged on disk, as corrupt.sql does it (pg_buffercache_evict(),
 -- PostgreSQL 17 and later - on 16 the test is skipped,
@@ -311,6 +314,231 @@ SELECT lion_di_try($$SELECT lion_index_verify('lion_di_i', true)$$);
 (1 row)
 
 DROP INDEX lion_di_i;
+-- ---------- 5. a NARROW whose cardinality is wrong ----------
+-- 55 rows to a heap page and two keys: each key's container of the first 64
+-- blocks is a NARROW of width 1 and 1760 members, alone on its container
+-- page.  Every bit of a NARROW's payload is a member it may hold, so the
+-- cardinality in its header (bytes 4 and 5; the type is byte 6) is all there
+-- is to damage but its width (section 7).  The readers bound what they do by
+-- the payload, not by the claim, and lion_index_verify() reports it.
+CREATE TABLE lion_di_n (k int NOT NULL, pad text);
+INSERT INTO lion_di_n
+	SELECT i % 2, repeat('x', 100) FROM generate_series(0, 64 * 55 - 1) i;
+CREATE INDEX lion_di_n_i ON lion_di_n USING lion (k) WITH (inline_limit = 64);
+SELECT narrow_containers FROM lion_index_stats('lion_di_n_i');
+ narrow_containers 
+-------------------
+                 2
+(1 row)
+
+SELECT lion_di_evict('lion_di_n_i');
+ lion_di_evict 
+---------------
+ 
+(1 row)
+
+SELECT lion_index_posting_root('lion_di_n_i', 1) AS lion_di_root \gset
+SELECT get_byte(p, lion_di_item(p, 1) + 6) AS type,
+	   get_byte(p, lion_di_item(p, 1) + 4) |
+	   (get_byte(p, lion_di_item(p, 1) + 5) << 8) AS cardinality
+  FROM lion_di_block('lion_di_n_i', :lion_di_root) p;
+ type | cardinality 
+------+-------------
+    5 |        1760
+(1 row)
+
+SELECT lion_di_poke('lion_di_n_i', :lion_di_root,
+					lion_di_item(lion_di_block('lion_di_n_i', :lion_di_root), 1) + 4,
+					'\x0100'::bytea);
+ lion_di_poke 
+--------------
+ 
+(1 row)
+
+SELECT lion_di_try('SELECT count(*) FROM lion_di_n WHERE k = 1');
+ lion_di_try 
+-------------
+ ok
+(1 row)
+
+SELECT lion_di_try('SELECT k, count(*) FROM lion_di_n GROUP BY k');
+ lion_di_try 
+-------------
+ ok
+(1 row)
+
+SELECT lion_di_try($$SELECT lion_index_count('lion_di_n_i', 1)$$);
+ lion_di_try 
+-------------
+ ok
+(1 row)
+
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM lion_di_n WHERE k = 1;
+ count 
+-------
+  1760
+(1 row)
+
+RESET pg_lion.enable_count_pushdown;
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_n_i')$$);
+                                                         lion_di_try                                                         
+-----------------------------------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_di_n_i": container N on block N is corrupt: narrow container cardinality does not match its payload
+(1 row)
+
+DROP INDEX lion_di_n_i;
+-- ---------- 6. a NARROW in an index of version 6 ----------
+-- The same index with its meta page's version (at byte 28) made 6: a build
+-- before §38 would read it and not know the items, which is what version 8
+-- is there to prevent, so lion_index_verify() reports it.
+CREATE INDEX lion_di_n_i ON lion_di_n USING lion (k) WITH (inline_limit = 64);
+SELECT lion_di_evict('lion_di_n_i');
+ lion_di_evict 
+---------------
+ 
+(1 row)
+
+SELECT lion_di_u32(lion_di_block('lion_di_n_i', 0), 28) AS version;
+ version 
+---------
+       8
+(1 row)
+
+SELECT lion_di_poke('lion_di_n_i', 0, 28, lion_di_le32(6));
+ lion_di_poke 
+--------------
+ 
+(1 row)
+
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_n_i')$$);
+                                                 lion_di_try                                                  
+--------------------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_di_n_i": container N on block N is a NARROW, which an index of version N cannot hold
+(1 row)
+
+DROP INDEX lion_di_n_i;
+-- ---------- 7. a NARROW of a width the build does not have ----------
+-- The container of section 5 with its width, its header's flags byte (byte
+-- 7), made 0 and then 6: the width sizes a NARROW, so the readers refuse
+-- one of a width outside 1 .. 5 before they read its payload, and
+-- lion_index_verify() reports it.  Made 2, the width sizes the item past its
+-- line pointer, which the readers refuse as they refuse any item longer
+-- than its line pointer.
+CREATE INDEX lion_di_n_i ON lion_di_n USING lion (k) WITH (inline_limit = 64);
+SELECT lion_di_evict('lion_di_n_i');
+ lion_di_evict 
+---------------
+ 
+(1 row)
+
+SELECT lion_index_posting_root('lion_di_n_i', 1) AS lion_di_root \gset
+SELECT get_byte(p, lion_di_item(p, 1) + 6) AS type,
+	   get_byte(p, lion_di_item(p, 1) + 7) AS width,
+	   lion_di_lplen(p, 1) AS lp_len
+  FROM lion_di_block('lion_di_n_i', :lion_di_root) p;
+ type | width | lp_len 
+------+-------+--------
+    5 |     1 |    520
+(1 row)
+
+SELECT lion_di_poke('lion_di_n_i', :lion_di_root,
+					lion_di_item(lion_di_block('lion_di_n_i', :lion_di_root), 1) + 7,
+					'\x00'::bytea);
+ lion_di_poke 
+--------------
+ 
+(1 row)
+
+SELECT lion_di_try('SELECT count(*) FROM lion_di_n WHERE k = 1');
+                                              lion_di_try                                              
+-------------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_di_n_i": item N on container page N is a NARROW of width N, not one of N .. N
+(1 row)
+
+SELECT lion_di_try('SELECT k, count(*) FROM lion_di_n GROUP BY k');
+                                              lion_di_try                                              
+-------------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_di_n_i": item N on container page N is a NARROW of width N, not one of N .. N
+(1 row)
+
+SELECT lion_di_try($$SELECT lion_index_count('lion_di_n_i', 1)$$);
+                                              lion_di_try                                              
+-------------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_di_n_i": item N on container page N is a NARROW of width N, not one of N .. N
+(1 row)
+
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_n_i')$$);
+                                                          lion_di_try                                                          
+-------------------------------------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_di_n_i": container N on block N is corrupt: narrow container width is out of range for the block size
+(1 row)
+
+SELECT lion_di_evict('lion_di_n_i');
+ lion_di_evict 
+---------------
+ 
+(1 row)
+
+SELECT lion_di_poke('lion_di_n_i', :lion_di_root,
+					lion_di_item(lion_di_block('lion_di_n_i', :lion_di_root), 1) + 7,
+					'\x06'::bytea);
+ lion_di_poke 
+--------------
+ 
+(1 row)
+
+SELECT lion_di_try('SELECT count(*) FROM lion_di_n WHERE k = 1');
+                                              lion_di_try                                              
+-------------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_di_n_i": item N on container page N is a NARROW of width N, not one of N .. N
+(1 row)
+
+SELECT lion_di_try($$SELECT lion_index_count('lion_di_n_i', 1)$$);
+                                              lion_di_try                                              
+-------------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_di_n_i": item N on container page N is a NARROW of width N, not one of N .. N
+(1 row)
+
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_n_i')$$);
+                                                          lion_di_try                                                          
+-------------------------------------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_di_n_i": container N on block N is corrupt: narrow container width is out of range for the block size
+(1 row)
+
+SELECT lion_di_evict('lion_di_n_i');
+ lion_di_evict 
+---------------
+ 
+(1 row)
+
+SELECT lion_di_poke('lion_di_n_i', :lion_di_root,
+					lion_di_item(lion_di_block('lion_di_n_i', :lion_di_root), 1) + 7,
+					'\x02'::bytea);
+ lion_di_poke 
+--------------
+ 
+(1 row)
+
+SELECT lion_di_try('SELECT count(*) FROM lion_di_n WHERE k = 1');
+                                     lion_di_try                                      
+--------------------------------------------------------------------------------------
+ XX002: lion index "lion_di_n_i": item N on container page N needs N bytes, but has N
+(1 row)
+
+SELECT lion_di_try($$SELECT lion_index_count('lion_di_n_i', 1)$$);
+                                     lion_di_try                                      
+--------------------------------------------------------------------------------------
+ XX002: lion index "lion_di_n_i": item N on container page N needs N bytes, but has N
+(1 row)
+
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_n_i')$$);
+                                                       lion_di_try                                                        
+--------------------------------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_di_n_i": container N on block N is corrupt: narrow container does not fit in the available space
+(1 row)
+
+DROP TABLE lion_di_n;
 -- ---------- an undamaged index still works ----------
 CREATE INDEX lion_di_i ON lion_di USING lion (k);
 SELECT count(*) FROM lion_di WHERE k = 7;

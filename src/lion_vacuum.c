@@ -466,12 +466,16 @@ lion_vac_filter_item(LionContainer *item, LionVacPred *pred)
 	return lion_container_remove_if(item, lion_vac_is_dead, pred);
 }
 
-/* Pick the smallest representation of a filtered item. */
+/*
+ * Pick the smallest representation of a filtered item: NARROW among them only
+ * in an index whose version allows it (DESIGN.md §38).
+ */
 static void
-lion_vac_optimize_item(LionContainer *item)
+lion_vac_optimize_item(LionVacState *vs, LionContainer *item)
 {
 	if (item->type != LION_CT_SPARSE)
-		lion_container_optimize(item);
+		lion_container_optimize_ext(item,
+									LION_META_ALLOWS_NARROW(&vs->ix->meta));
 }
 
 /*
@@ -913,13 +917,13 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
  * dropped.
  */
 static void
-lion_vac_inline_append(StringInfo newpay, LionContainer *item,
+lion_vac_inline_append(LionVacState *vs, StringInfo newpay, LionContainer *item,
 					   uint32 *ncontainers, uint64 *ntids)
 {
 	if (item->cardinality == 0)
 		return;					/* drop empty containers and segments */
 
-	lion_vac_optimize_item(item);
+	lion_vac_optimize_item(vs, item);
 	appendBinaryStringInfo(newpay, (char *) item, lion_item_size(item));
 	(*ncontainers)++;
 	*ntids += item->cardinality;
@@ -950,7 +954,7 @@ lion_vac_inline_append(StringInfo newpay, LionContainer *item,
  * again; everything from there on is filtered once and appended as it goes.
  * Every appended item goes through lion_vac_optimize_item() exactly as
  * before: a container's optimal form is a function of its members alone
- * (lion_container_optimize()), so the new payload is byte for byte the one
+ * (lion_container_optimize_ext()), so the new payload is byte for byte the one
  * the two-pass version built.
  *
  * Returns false when nothing changes.  Otherwise *res describes the write,
@@ -1003,12 +1007,12 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
 			initStringInfo(&newpay);
 			while (pcur < prefix &&
 				   lion_inline_fetch(onpage, prefix, &pcur, vs->cbuf2) > 0)
-				lion_vac_inline_append(&newpay, vs->cbuf2, &ncontainers,
+				lion_vac_inline_append(vs, &newpay, vs->cbuf2, &ncontainers,
 									   &ntids);
 		}
 
 		removed += r;
-		lion_vac_inline_append(&newpay, vs->cbuf, &ncontainers, &ntids);
+		lion_vac_inline_append(vs, &newpay, vs->cbuf, &ncontainers, &ntids);
 	}
 
 	if (removed == 0)
@@ -2501,7 +2505,7 @@ lion_vacuum_filter_page(LionVacState *vs, Buffer buf, LionVacWork *w,
 			continue;
 		}
 
-		lion_vac_optimize_item(vs->cbuf);
+		lion_vac_optimize_item(vs, vs->cbuf);
 		item = &w->work[w->nwork++];
 		item->off = off;
 		item->size = lion_item_size(vs->cbuf);
@@ -2835,7 +2839,7 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 			{
 				int			delta;
 
-				lion_container_optimize(vs->cbuf);
+				lion_vac_optimize_item(vs, vs->cbuf);
 
 				/*
 				 * This writes the container and the entry in one record, and

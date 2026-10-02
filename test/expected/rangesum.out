@@ -576,9 +576,9 @@ SELECT lion_rs('SELECT count(*) FROM lion_rsm WHERE a >= 1 AND b = 5');
 (1 row)
 
 SELECT lion_rs('SELECT count(*) FROM lion_rsm WHERE a <= 3 AND c = ''c011''');
-         lion_rs         
--------------------------
- inside, summed 4: (300)
+           lion_rs           
+-----------------------------
+ complement, summed 1: (300)
 (1 row)
 
 SELECT lion_rs('SELECT count(*) FROM lion_rsm WHERE c >= ''c000'' AND b = 7');

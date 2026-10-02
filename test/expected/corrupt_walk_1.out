@@ -194,10 +194,11 @@ RESET enable_seqscan;
 DROP TABLE lion_rw_s;
 -- ---------- 3. the leaves of a posting set in a cycle ----------
 -- Two keys taking alternate rows, so that each key's containers are dense
--- bitsets and its posting set a tree of several leaves (as in
--- test/sql/posting_tree.sql).  Key 1's second leaf's right link goes back to
--- its first.  Every read of the key went round it: the count, the bitmap and
--- plain scans, LionOrdered and the SQL count, and VACUUM's pass 2.
+-- bitmaps, NARROWs of width 4 (DESIGN.md §38), and its posting set a tree of
+-- several leaves (as in test/sql/posting_tree.sql).  Key 1's second leaf's
+-- right link goes back to its first.  Every read of the key went round it:
+-- the count, the bitmap and plain scans, LionOrdered and the SQL count, and
+-- VACUUM's pass 2.
 CREATE TABLE lion_rw_p (p int NOT NULL);
 INSERT INTO lion_rw_p SELECT i % 2 FROM generate_series(1, 60000) i;
 CREATE INDEX lion_rw_pi ON lion_rw_p USING lion (p);

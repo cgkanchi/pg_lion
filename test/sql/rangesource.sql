@@ -183,14 +183,19 @@ SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE u < 100 OR a = 3');
 SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE (k >= 5 AND k < 9 AND a = 1) OR a = 2');
 
 -- ---------- 4. too large for a hash table's memory: walked at every count ----------
--- A range over half of the rows of a column in no order is a container of
--- some four kilobytes at each container key of the heap, and 200,000 narrow
--- rows are some twenty of them: more than the 64 kB of work_mem's floor.
+-- A range over half of the rows of a column in no order is a NARROW of
+-- width 2 (DESIGN.md §38), a kilobyte, at each container key of the heap,
+-- and 360,000 rows 65 to a page are some ninety of them: more than the 64 kB
+-- of work_mem's floor.  (The pad puts the rows just past the 63 offsets of
+-- a NARROW of width 1, which makes a NARROW the largest for the rows it
+-- holds.)  a takes each value for two rows in turn, so that a range of it
+-- is RUNs of a few hundred bytes a key, which are collected beside a walked
+-- range of r.
 CREATE TABLE lion_src_w (u int NOT NULL, r int NOT NULL, g int NOT NULL,
-						 a int NOT NULL);
+						 a int NOT NULL, pad text);
 INSERT INTO lion_src_w
-SELECT i, hashint4(i) & 1048575, i % 7, i % 30
-  FROM generate_series(1, 200000) i;
+SELECT i, hashint4(i) & 1048575, i % 7, i / 2 % 30, repeat('x', 79)
+  FROM generate_series(1, 360000) i;
 CREATE INDEX lion_src_w_ur ON lion_src_w USING lion (u, r)
 	WITH (summaries = on, summary_tids = 1024);
 CREATE INDEX lion_src_w_g ON lion_src_w USING lion (g);
@@ -202,7 +207,7 @@ SELECT lion_src('SELECT g, count(*) FROM lion_src_w WHERE r < 524288 GROUP BY g'
 SELECT lion_src('SELECT g, count(*) FROM lion_src_w WHERE r >= 300000 AND r < 800000 AND a < 20 GROUP BY g');
 -- the complement of a walked range, and its inside
 SELECT lion_src('SELECT count(*) FROM lion_src_w WHERE u >= 100 AND r BETWEEN 1000 AND 1040000');
-SELECT lion_src('SELECT count(*) FROM lion_src_w WHERE u BETWEEN 100 AND 180000 AND r > 524288 AND g = 3');
+SELECT lion_src('SELECT count(*) FROM lion_src_w WHERE u BETWEEN 100 AND 340000 AND r > 524288 AND g = 3');
 -- existence tests over a walked range
 SELECT lion_src('SELECT count(DISTINCT a) FROM lion_src_w WHERE r < 524288');
 SELECT lion_src('SELECT g, count(DISTINCT a) FROM lion_src_w WHERE r > 500000 GROUP BY g');

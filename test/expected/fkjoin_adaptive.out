@@ -166,9 +166,9 @@ SELECT * FROM lion_aj_explain($$
          Join Keys Looked Up: 40
          Fact Filter Rows Collected: 38604
          Fact Filter Switches: 1
-         Fact Filter Keys Probed: 13
-         Fact Filter Copy Containers Read: 2175
-         Fact Filter Copy Seeks: 2115
+         Fact Filter Keys Probed: 14
+         Fact Filter Copy Containers Read: 2275
+         Fact Filter Copy Seeks: 2210
          Fact Filter Copy File Reads: 0
 (9 rows)
 
@@ -177,7 +177,7 @@ SELECT lion_aj($$
 	WHERE d.h1 AND d.h2 AND f.doc @@ '(da | db | dc) & (dd | de)'$$);
                     lion_aj                    
 -----------------------------------------------
- pushed down, switched 1 after 13 keys, 1 rows
+ pushed down, switched 1 after 14 keys, 1 rows
 (1 row)
 
 -- ... grouped, each dimension row handed up
@@ -187,7 +187,7 @@ SELECT lion_aj($$
 	GROUP BY d.attr$$);
                     lion_aj                    
 -----------------------------------------------
- pushed down, switched 1 after 13 keys, 4 rows
+ pushed down, switched 1 after 14 keys, 4 rows
 (1 row)
 
 -- ... an IN list, a semi join and an anti join
@@ -205,7 +205,7 @@ SELECT lion_aj($$
 				AND f.doc @@ '(da | db | dc) & (dd | de)' AND f.x IN (1, 3))$$);
                     lion_aj                    
 -----------------------------------------------
- pushed down, switched 1 after 22 keys, 1 rows
+ pushed down, switched 1 after 23 keys, 1 rows
 (1 row)
 
 SELECT lion_aj($$
@@ -214,7 +214,7 @@ SELECT lion_aj($$
 					AND f.doc @@ 'da & dd' AND f.x = 4)$$);
                     lion_aj                    
 -----------------------------------------------
- pushed down, switched 1 after 20 keys, 1 rows
+ pushed down, switched 1 after 21 keys, 1 rows
 (1 row)
 
 -- 2. Every dimension row, walked in key order: the heavy keys come first.
@@ -229,9 +229,9 @@ SELECT * FROM lion_aj_explain($$
          Join Keys Looked Up: 14040
          Fact Filter Rows Collected: 38604
          Fact Filter Switches: 1
-         Fact Filter Keys Probed: 13
-         Fact Filter Copy Containers Read: 62175
-         Fact Filter Copy Seeks: 62115
+         Fact Filter Keys Probed: 14
+         Fact Filter Copy Containers Read: 62275
+         Fact Filter Copy Seeks: 62210
          Fact Filter Copy File Reads: 0
 (10 rows)
 
@@ -240,7 +240,7 @@ SELECT lion_aj($$
 	WHERE f.doc @@ '(da | db | dc) & (dd | de)'$$);
                         lion_aj                        
 -------------------------------------------------------
- pushed down, walked, switched 1 after 13 keys, 1 rows
+ pushed down, walked, switched 1 after 14 keys, 1 rows
 (1 row)
 
 SELECT lion_aj($$
@@ -248,7 +248,7 @@ SELECT lion_aj($$
 	WHERE f.doc @@ '(da | db | dc) & (dd | de)' GROUP BY d.attr$$);
                         lion_aj                        
 -------------------------------------------------------
- pushed down, walked, switched 1 after 13 keys, 4 rows
+ pushed down, walked, switched 1 after 14 keys, 4 rows
 (1 row)
 
 -- 3. Two terms that never meet: the copy made part way through selects
@@ -354,7 +354,7 @@ SELECT lion_aj($$
 	FROM generate_series(0, 1) g$$);
                     lion_aj                    
 -----------------------------------------------
- pushed down, switched 2 after 26 keys, 2 rows
+ pushed down, switched 2 after 28 keys, 2 rows
 (1 row)
 
 -- 7. A partitioned fact: each leaf keeps its own account and switches on
@@ -380,9 +380,9 @@ SELECT * FROM lion_aj_explain($$
          Join Keys Looked Up: 120
          Fact Filter Rows Collected: 38604
          Fact Filter Switches: 3
-         Fact Filter Keys Probed: 45
-         Fact Filter Copy Containers Read: 1710
-         Fact Filter Copy Seeks: 1500
+         Fact Filter Keys Probed: 51
+         Fact Filter Copy Containers Read: 1854
+         Fact Filter Copy Seeks: 1614
          Fact Filter Copy File Reads: 0
 (9 rows)
 
@@ -391,7 +391,7 @@ SELECT lion_aj($$
 	WHERE d.h1 AND d.h2 AND f.doc @@ '(da | db | dc) & (dd | de)'$$);
                     lion_aj                    
 -----------------------------------------------
- pushed down, switched 3 after 45 keys, 1 rows
+ pushed down, switched 3 after 51 keys, 1 rows
 (1 row)
 
 SELECT lion_aj($$
@@ -399,7 +399,7 @@ SELECT lion_aj($$
 	WHERE f.doc @@ '(da | db | dc) & (dd | de)' GROUP BY d.attr$$);
                         lion_aj                        
 -------------------------------------------------------
- pushed down, walked, switched 3 after 45 keys, 4 rows
+ pushed down, walked, switched 3 after 51 keys, 4 rows
 (1 row)
 
 SELECT lion_aj($$
@@ -408,7 +408,7 @@ SELECT lion_aj($$
 				AND f.doc @@ '(da | db | dc) & (dd | de)' AND f.x IN (1, 3))$$);
                     lion_aj                    
 -----------------------------------------------
- pushed down, switched 3 after 60 keys, 1 rows
+ pushed down, switched 3 after 78 keys, 1 rows
 (1 row)
 
 SELECT lion_aj($$
@@ -479,7 +479,7 @@ SELECT lion_aj($$
 	WHERE d.h1 AND d.h2 AND f.doc @@ '(da | db | dc) & (dd | de)'$$);
                     lion_aj                    
 -----------------------------------------------
- pushed down, switched 1 after 13 keys, 1 rows
+ pushed down, switched 1 after 14 keys, 1 rows
 (1 row)
 
 SELECT lion_aj($$
@@ -487,7 +487,7 @@ SELECT lion_aj($$
 	WHERE f.doc @@ '(da | db | dc) & (dd | de)' GROUP BY d.attr$$);
                         lion_aj                        
 -------------------------------------------------------
- pushed down, walked, switched 1 after 13 keys, 4 rows
+ pushed down, walked, switched 1 after 14 keys, 4 rows
 (1 row)
 
 SELECT lion_aj($$
@@ -495,7 +495,7 @@ SELECT lion_aj($$
 	WHERE d.h1 AND d.h2 AND f.doc @@ '(da | db | dc) & (dd | de)'$$);
                     lion_aj                    
 -----------------------------------------------
- pushed down, switched 3 after 45 keys, 1 rows
+ pushed down, switched 3 after 51 keys, 1 rows
 (1 row)
 
 VACUUM lion_adf;
@@ -505,7 +505,7 @@ SELECT lion_aj($$
 	WHERE d.h1 AND d.h2 AND f.doc @@ '(da | db | dc) & (dd | de)'$$);
                     lion_aj                    
 -----------------------------------------------
- pushed down, switched 1 after 13 keys, 1 rows
+ pushed down, switched 1 after 14 keys, 1 rows
 (1 row)
 
 SELECT lion_aj($$
@@ -513,7 +513,7 @@ SELECT lion_aj($$
 	WHERE f.doc @@ '(da | db | dc) & (dd | de)' GROUP BY d.attr$$);
                         lion_aj                        
 -------------------------------------------------------
- pushed down, walked, switched 1 after 13 keys, 4 rows
+ pushed down, walked, switched 1 after 14 keys, 4 rows
 (1 row)
 
 SELECT lion_aj($$
@@ -521,7 +521,7 @@ SELECT lion_aj($$
 	WHERE d.h1 AND d.h2 AND f.doc @@ '(da | db | dc) & (dd | de)'$$);
                     lion_aj                    
 -----------------------------------------------
- pushed down, switched 3 after 42 keys, 1 rows
+ pushed down, switched 3 after 51 keys, 1 rows
 (1 row)
 
 DROP TABLE lion_adp, lion_adf, lion_add;

@@ -30,8 +30,11 @@ SET max_parallel_workers_per_gather = 0;
 -- the heap; a, b and c are dense, four values each; z is 7 on the first
 -- fifth of the heap and one row in fifty elsewhere, dense at some container
 -- keys and sparse at the others.  doc holds five dense terms, each on
--- three rows in ten or so, and a sparse one.  The mixing is arithmetic, so
--- the table is the same on every run.
+-- three rows in ten or so, and a sparse one.  The pad keeps the rows under
+-- 128 a page, so a, b, c and the dense terms are NARROWs (DESIGN.md §38),
+-- some 1,100 or 1,300 members a key in 1 kB, where they were ARRAYs of 2 kB
+-- and more.  The mixing is arithmetic, so the table is the same on every
+-- run.
 CREATE TABLE tpt (id int NOT NULL, e int NOT NULL, a int NOT NULL,
 				  b int NOT NULL, c int NOT NULL, z int NOT NULL,
 				  doc tsvector NOT NULL, pad text);
@@ -56,9 +59,11 @@ SELECT i,
 CREATE INDEX tpt_l ON tpt USING lion (e, a, b, c, z, doc);
 VACUUM (FREEZE, ANALYZE) tpt;
 
--- The filters.  1 to 6 meet their tree with e's few rows a key and probe
--- it; 7 and 8 meet it with a dense intersection and build it; 9 does both,
--- by where z is dense; 10 to 14 are the edges.
+-- The filters.  1 to 5 meet their tree with e's few rows a key and probe
+-- it; 6 meets an AND of three NARROWs, which costs less built than probed
+-- wherever e has 80 rows or more, and does both; 7 and 8 meet it with a
+-- dense intersection and build it; 9 does both, by where z is dense; 10 to
+-- 14 are the edges.
 CREATE TABLE tpt_q (n int, q text);
 INSERT INTO tpt_q VALUES
 	(1, $$e = 7 AND doc @@ '(t1 | t2 | t3) & (t4 | t5)'$$),
@@ -191,8 +196,9 @@ END $$;
 -- ---------- 1. every answer, each way ----------
 -- The rows each filter holds, the path each is forced through, and what the
 -- count's merge did with its trees: probed where e's few rows a key meet
--- them (1 to 6, 11, 13, 14), built where the intersection is dense (7, 8),
--- both by where z is dense (9).  A tree that drives is built, and counted in
+-- them (1 to 5, 11, 13, 14), built where the intersection is dense (7, 8),
+-- both by where z is dense (9) and by how many rows e has at a key (6, built
+-- at all but one).  A tree that drives is built, and counted in
 -- neither (10) - but its own AND met the other OR there, an OR of an OR and
 -- a term, as a tsquery's ORs of three nest, over the driver's dense union,
 -- and built it.  One that names no entry has nothing to meet (12).
@@ -211,14 +217,18 @@ SELECT n, tpt_diff('count(*)', q, 'count', true) AS count_diff,
   FROM tpt_q ORDER BY n;
 
 -- Probing off, every tree is built where it is sought, as before: no
--- counter says a tree was met, and the unions inside them are built.
+-- counter says a tree was met, and the unions inside them are built - but
+-- 3's, whose children are ANDs of NARROWs, a bitmap each, which e's rows
+-- are looked up in for less than their union costs: it is probed
+-- (pg_lion.enable_union_probe, DESIGN.md §29.11, "Unions probed").
 SET pg_lion.enable_tree_probe = off;
 SELECT n, (tpt_trees(q)).* FROM tpt_q WHERE n IN (1, 3, 9) ORDER BY n;
 RESET pg_lion.enable_tree_probe;
 
 -- The counters as numbers, for filter 1 and filter 3, probing on and off:
 -- probed, a tree's unions are not built past the driver at all, and the
--- keys the tree is met at are the same either way.
+-- keys the tree is met at are the same either way - 3's union, unprobed,
+-- probed by itself at every one of them.
 CREATE FUNCTION tpt_counters(q text, probe boolean) RETURNS json
 LANGUAGE plpgsql AS $$
 DECLARE

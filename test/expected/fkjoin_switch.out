@@ -179,7 +179,7 @@ SELECT lion_sw($$
 	GROUP BY d.region$$);
                                            lion_sw                                            
 ----------------------------------------------------------------------------------------------
- LionCount, walked in one batch, switched 1 after 3 keys to an empty copy: 3 rows, 3 distinct
+ LionCount, walked in one batch, switched 1 after 4 keys to an empty copy: 3 rows, 3 distinct
 (1 row)
 
 -- ... the rows themselves (core's Agg over them)
@@ -190,7 +190,7 @@ SELECT lion_sw($$
 	GROUP BY d.region$$);
                                            lion_sw                                            
 ----------------------------------------------------------------------------------------------
- LionCount, walked in one batch, switched 1 after 3 keys to an empty copy: 3 rows, 3 distinct
+ LionCount, walked in one batch, switched 1 after 4 keys to an empty copy: 3 rows, 3 distinct
 (1 row)
 
 -- ... the semi join and the inner join: no row at all
@@ -201,7 +201,7 @@ SELECT lion_sw($$
 	GROUP BY d.region$$);
                                            lion_sw                                            
 ----------------------------------------------------------------------------------------------
- LionCount, walked in one batch, switched 1 after 3 keys to an empty copy: 0 rows, 0 distinct
+ LionCount, walked in one batch, switched 1 after 4 keys to an empty copy: 0 rows, 0 distinct
 (1 row)
 
 SELECT lion_sw($$
@@ -209,7 +209,7 @@ SELECT lion_sw($$
 	WHERE f.x = 1 AND f.kind = 'c' GROUP BY d.region$$);
                                            lion_sw                                            
 ----------------------------------------------------------------------------------------------
- LionCount, walked in one batch, switched 1 after 3 keys to an empty copy: 0 rows, 0 distinct
+ LionCount, walked in one batch, switched 1 after 4 keys to an empty copy: 0 rows, 0 distinct
 (1 row)
 
 -- ... the counted rows below a LionJoinAgg
@@ -237,7 +237,7 @@ SELECT lion_sw($$
 	WHERE f.x = 1 AND f.kind = 'c' GROUP BY d.region$$);
                                            lion_sw                                            
 ----------------------------------------------------------------------------------------------
- LionCount, walked in one batch, switched 1 after 3 keys to an empty copy: 0 rows, 0 distinct
+ LionCount, walked in one batch, switched 1 after 4 keys to an empty copy: 0 rows, 0 distinct
 (1 row)
 
 -- ... and the count alone, summed in the node
@@ -247,7 +247,7 @@ SELECT lion_sw($$
 					  AND f.x = 1 AND f.kind = 'c')$$);
                                            lion_sw                                            
 ----------------------------------------------------------------------------------------------
- LionCount, walked in one batch, switched 1 after 3 keys to an empty copy: 1 rows, 1 distinct
+ LionCount, walked in one batch, switched 1 after 4 keys to an empty copy: 1 rows, 1 distinct
 (1 row)
 
 -- ... over several batches: the anti join's after the switch looked up no
@@ -260,7 +260,7 @@ SELECT lion_sw($$
 	GROUP BY d.region$$);
                                           lion_sw                                           
 --------------------------------------------------------------------------------------------
- LionCount, walked in batches, switched 1 after 3 keys to an empty copy: 3 rows, 3 distinct
+ LionCount, walked in batches, switched 1 after 4 keys to an empty copy: 3 rows, 3 distinct
 (1 row)
 
 SELECT lion_sw($$
@@ -270,7 +270,7 @@ SELECT lion_sw($$
 	GROUP BY d.region$$);
                                            lion_sw                                            
 ----------------------------------------------------------------------------------------------
- LionCount, walked in one batch, switched 1 after 3 keys to an empty copy: 0 rows, 0 distinct
+ LionCount, walked in one batch, switched 1 after 4 keys to an empty copy: 0 rows, 0 distinct
 (1 row)
 
 RESET work_mem;
@@ -284,7 +284,7 @@ SELECT lion_sw($$
 	GROUP BY d.region$$);
                                         lion_sw                                         
 ----------------------------------------------------------------------------------------
- LionCount, row at a time, switched 1 after 3 keys to an empty copy: 3 rows, 3 distinct
+ LionCount, row at a time, switched 1 after 4 keys to an empty copy: 3 rows, 3 distinct
 (1 row)
 
 SELECT lion_sw($$
@@ -294,7 +294,7 @@ SELECT lion_sw($$
 	GROUP BY d.region$$);
                                         lion_sw                                         
 ----------------------------------------------------------------------------------------
- LionCount, row at a time, switched 1 after 3 keys to an empty copy: 0 rows, 0 distinct
+ LionCount, row at a time, switched 1 after 4 keys to an empty copy: 0 rows, 0 distinct
 (1 row)
 
 RESET pg_lion.fkjoin_batch_row_cost;
@@ -321,7 +321,7 @@ SELECT lion_sw($$
 					  AND f.x = 1 AND f.kind = 'c')$$);
                                                 lion_sw                                                
 -------------------------------------------------------------------------------------------------------
- LionAntiJoin, walked in one batch, switched 1 after 3 keys to an empty copy: 4000 rows, 3962 distinct
+ LionAntiJoin, walked in one batch, switched 1 after 4 keys to an empty copy: 4000 rows, 3962 distinct
 (1 row)
 
 SELECT lion_sw($$
@@ -330,7 +330,7 @@ SELECT lion_sw($$
 				  AND f.x = 1 AND f.kind = 'c')$$);
                                              lion_sw                                             
 -------------------------------------------------------------------------------------------------
- LionSemiJoin, walked in one batch, switched 1 after 3 keys to an empty copy: 0 rows, 0 distinct
+ LionSemiJoin, walked in one batch, switched 1 after 4 keys to an empty copy: 0 rows, 0 distinct
 (1 row)
 
 SELECT lion_sw($$
@@ -339,7 +339,7 @@ SELECT lion_sw($$
 					  AND f.x = 1 AND f.kind = 'c')$$);
                                                 lion_sw                                                
 -------------------------------------------------------------------------------------------------------
- LionAntiJoin, walked in one batch, switched 1 after 3 keys to an empty copy: 3000 rows, 3000 distinct
+ LionAntiJoin, walked in one batch, switched 1 after 4 keys to an empty copy: 3000 rows, 3000 distinct
 (1 row)
 
 -- ... over several batches (the semi join's, again, over at the switch)
@@ -350,7 +350,7 @@ SELECT lion_sw($$
 					  AND f.x = 1 AND f.kind = 'c')$$);
                                                lion_sw                                               
 -----------------------------------------------------------------------------------------------------
- LionAntiJoin, walked in batches, switched 1 after 3 keys to an empty copy: 4000 rows, 3962 distinct
+ LionAntiJoin, walked in batches, switched 1 after 4 keys to an empty copy: 4000 rows, 3962 distinct
 (1 row)
 
 SELECT lion_sw($$
@@ -359,7 +359,7 @@ SELECT lion_sw($$
 				  AND f.x = 1 AND f.kind = 'c')$$);
                                              lion_sw                                             
 -------------------------------------------------------------------------------------------------
- LionSemiJoin, walked in one batch, switched 1 after 3 keys to an empty copy: 0 rows, 0 distinct
+ LionSemiJoin, walked in one batch, switched 1 after 4 keys to an empty copy: 0 rows, 0 distinct
 (1 row)
 
 SET work_mem = '4MB';
@@ -371,7 +371,7 @@ SELECT lion_sw($$
 					  AND f.x = 1 AND f.kind = 'c')$$);
                                              lion_sw                                             
 -------------------------------------------------------------------------------------------------
- LionAntiJoin, row at a time, switched 1 after 3 keys to an empty copy: 4000 rows, 3962 distinct
+ LionAntiJoin, row at a time, switched 1 after 4 keys to an empty copy: 4000 rows, 3962 distinct
 (1 row)
 
 RESET pg_lion.fkjoin_batch_row_cost;
@@ -404,9 +404,9 @@ SELECT lion_sw($$
 									 AND f.x = 1 AND f.kind = 'c')
 					 GROUP BY d.region) s)
 	FROM generate_series(0, 2) g$$);
-                                           lion_sw                                            
-----------------------------------------------------------------------------------------------
- LionCount, walked in one batch, switched 3 after 9 keys to an empty copy: 3 rows, 3 distinct
+                                            lion_sw                                            
+-----------------------------------------------------------------------------------------------
+ LionCount, walked in one batch, switched 3 after 12 keys to an empty copy: 3 rows, 3 distinct
 (1 row)
 
 RESET pg_lion.fkjoin_batch_row_cost;
@@ -430,9 +430,9 @@ SELECT lion_sw($$
 	LATERAL (SELECT o.k FROM lion_swo o WHERE o.tag = v.i
 			 AND NOT EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = o.k
 							 AND f.x = 1 AND f.kind = 'c') OFFSET 0) s$$);
-                                                lion_sw                                                
--------------------------------------------------------------------------------------------------------
- LionAntiJoin, walked in one batch, switched 3 after 9 keys to an empty copy: 4000 rows, 3962 distinct
+                                                lion_sw                                                 
+--------------------------------------------------------------------------------------------------------
+ LionAntiJoin, walked in one batch, switched 3 after 12 keys to an empty copy: 4000 rows, 3962 distinct
 (1 row)
 
 SELECT lion_sw($$
@@ -440,9 +440,9 @@ SELECT lion_sw($$
 	LATERAL (SELECT o.k FROM lion_swo o WHERE o.tag = v.i
 			 AND EXISTS (SELECT 1 FROM lion_swf f WHERE f.fk = o.k
 						 AND f.x = 1 AND f.kind = 'c') OFFSET 0) s$$);
-                                             lion_sw                                             
--------------------------------------------------------------------------------------------------
- LionSemiJoin, walked in one batch, switched 3 after 9 keys to an empty copy: 0 rows, 0 distinct
+                                             lion_sw                                              
+--------------------------------------------------------------------------------------------------
+ LionSemiJoin, walked in one batch, switched 3 after 12 keys to an empty copy: 0 rows, 0 distinct
 (1 row)
 
 -- 4. In parallel each participant switches on its own, at keys of its own

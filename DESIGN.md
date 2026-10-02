@@ -102,8 +102,9 @@ property that refusal stands for, a static assertion in lion.h that
     {
         uint32  ckey;          /* container key (code >> 15) */
         uint16  cardinality;   /* number of members, 0..32768 */
-        uint8   type;          /* LION_CT_ARRAY=1, LION_CT_BITSET=2, LION_CT_RUN=3 */
-        uint8   flags;         /* reserved, 0 */
+        uint8   type;          /* LION_CT_ARRAY=1, LION_CT_BITSET=2, LION_CT_RUN=3,
+                                  LION_CT_NARROW=5 (§38); 4 is a sparse segment (§13) */
+        uint8   flags;         /* a NARROW's width (§38); reserved, 0, otherwise */
         /* payload follows immediately (no padding; header is 8 bytes) */
     } LionContainer;
 
@@ -112,6 +113,10 @@ Payloads (all little values are host-endian uint16/uint64, like every other PG o
 - BITSET: `uint64 words[512]` (4096 bytes, fixed), bit i set ⇔ lo i is a member.
 - RUN:    `uint16 nruns; struct { uint16 start; uint16 len_minus_1; } runs[nruns]`, runs ascending and
           non-adjacent (merged). Max LION_RUN_MAX_NRUNS = 1023 (payload ≤ 4094 bytes).
+- NARROW (§38, format version 8): `uint64 words[64 * k]` (512 * k bytes), k words a heap block,
+          k the width in `flags`, 1 .. 5 at 8K, for a container whose members are all at
+          offsets below 64 * k: member lo is bit `(lo >> 9) * 64 * k + (lo & 511)`. A BITSET is the
+          same layout at the full width, 8 words a block.
 - LION_CONTAINER_MAX_SIZE = 8 + 4096 = 4104 bytes. Invariant: every container ≤ this size.
 
 Representation policy
@@ -126,17 +131,23 @@ Representation policy
   bitset - and the insert path does not optimize afterwards, so the bitset stayed, and a 4104-byte
   item cannot share an 8K page with another. The split already ended as an ARRAY, through a bitset;
   it now converts the same way the insert does.)*
-- `lion_container_optimize()` picks the smallest of the three representations. It is called at bulk
+- `lion_container_optimize()` picks the smallest of the three representations - four with NARROW,
+  of the narrowest width that holds the members, which only it makes, and VACUUM only in a version
+  8 index (§38). It is called at bulk
   build time for every container and by VACUUM after modifying a container. It is *not* called on
   every insert (inserts only enforce the size invariant), matching CRoaring's runOptimize semantics.
+  A NARROW given a member past its width widens to the narrowest width that holds it, and one
+  shrunk to 256 members a word of its width (`LION_WIDTH_ARRAY_CARD(k)`) or fewer is an ARRAY.
 - Mutators operate on a caller-supplied buffer of LION_CONTAINER_MAX_SIZE bytes. Page code copies a
   container out of the page into such a buffer, mutates, and writes it back (in place when it fits).
   The one exception is **growth in place**: the hot-key insert (`lion_insert_container_inplace()`)
   and its redo (`LION_OP_CONTAINER_ADD`, §25) call `lion_container_add()` on the page item itself,
   whose allotted length is only its size plus slack. What they rely on, and all they rely on, is
   that add() writes at most 2 bytes past the size of an ARRAY below 2048 members, 4 past a RUN below
-  1023 runs, and nothing past a BITSET, and never changes the representation of any of them; the
-  conversions above happen only at those limits, which the in-place path checks and refuses. The
+  1023 runs, and nothing past a BITSET or past a NARROW given a member within its width, and never
+  changes the representation of any of them; the conversions above happen only at those limits,
+  which the in-place path checks and refuses - both it and its redo through one table,
+  `lion_container_inplace_need()` (§38). The
   sparse insert has the same shape: 6 bytes past a segment below 682 pairs (§13). Stated in
   lion_container.h and lion_sparse.h, and tested on exact-size heap allocations (test/unit).
 
@@ -294,8 +305,14 @@ against the policy above), and rerun the set algebra of every type pair under it
 on an x86-64 host, which makes its portable kernel the fused loop other architectures run).
 
 Full API: `src/lion_container.h`. Unit tests: `test/unit/container_test.c` (`make unit`), which must
-cover every type transition, boundary cardinalities (0, 1, 2047, 2048, 2049, 32767, 32768 members),
-run merging/splitting, and set algebra against a brute-force 32768-bit reference.
+cover every type transition, boundary cardinalities (0, 1, 2047, 2048, 2049, 32767, 32768 members;
+256k - 1, 256k and 256k + 1 members and offsets 64k - 1 and 64k for a NARROW of every width k), run
+merging/splitting, and set algebra against a brute-force 32768-bit reference.
+
+The kernels above take a word count and run a pass compiled for a BITSET's 512 words or one for a
+NARROW's 64k (§38); every NARROW payload bit is a legal member, so its cardinality and its width are
+the claims a damaged NARROW can make wrongly: the cardinality is handled as a BITSET's is, and a
+width the build does not have is refused.
 
 ## 4. Page layout (module `lion.h`, implemented in `lion_pages.c`, `lion_meta.c`, `lion_state.c`, `lion_entry.c` and `lion_posting_put.c`)
 
@@ -321,7 +338,8 @@ minus-infinity downlink alone.
 Block 0: meta page. Payload struct `LionMetaPageData` { magic 0x52424931, version 6, offset_bits,
 container_bits, nbuckets, inline_limit, unused padding to 64 bytes }. *(Version 7, §32: an index
 with summary posting sets, which records them in `summary_cols` and `summary_tids`, two words that
-were reserved; an index without them is still version 6, byte for byte.)* Version 2 was the first that
+were reserved; an index without them is still version 6, byte for byte. Version 8, §38: an index
+with NARROW items, with or without summaries, which builds before it refuse.)* Version 2 was the first that
 indexes NULL keys (§14); version 3 (§18) added owner_hash/owner_head, which grows the special area
 from 16 to 24 bytes and therefore moves every item on every page. An index of an older version is
 structurally readable by nothing in this code, so opening one is an ERROR that asks for a REINDEX
@@ -416,7 +434,9 @@ and is what every reader uses to find where it ends; `ItemIdGetLength()` is its 
 which is what it may grow to in place. `lion_item_alloc_size()` chooses the second whenever an
 insert writes an item: MAXALIGN(size) plus size/8 clamped into [`LION_ITEM_SLACK_MIN` = 8,
 `LION_ITEM_SLACK_MAX` = 64] bytes, capped at LION_CONTAINER_MAX_SIZE, dropped entirely when the page
-has no room for it, and never for a BITSET (4104 bytes is already the maximum an item can be). The
+has no room for it, and never for a BITSET (4104 bytes is already the maximum an item can be) or a
+NARROW (§38: a member it holds changes no size, and one it does not widens it, which no slack would
+hold). The
 slack is a fraction of the item rather than a fixed 64 bytes on purpose: a key whose TIDs are
 spread thinly owns dozens of ~50-byte items per page, and 64 bytes of slack each would nearly halve
 what a page holds; MAXALIGN padding, which the page spends either way, is part of the slack and
@@ -431,8 +451,9 @@ An insert whose item has room inside it adds the member there and nowhere else
 (`lion_insert_container_inplace()`, `lion_insert_segment_inplace()` in lion_insert.c): the item keeps
 its offset and its allotted length, no other item on the page moves, minckey/maxckey change only
 when a segment's range really grew, and the WAL delta is the handful of bytes that changed. A
-BITSET always qualifies, an ARRAY needs 2 spare bytes and a cardinality below LION_ARRAY_MAX_CARD, a
-RUN needs 4 and a run count below LION_RUN_MAX_NRUNS (both would otherwise turn into a bitset), and
+BITSET always qualifies, a NARROW does for a member within its width (§38), an ARRAY needs 2 spare
+bytes and a cardinality below LION_ARRAY_MAX_CARD, a RUN needs 4 and a run count below
+LION_RUN_MAX_NRUNS (both would otherwise turn into a bitset), and
 a sparse segment needs 6 and a container key that stays below LION_SPARSE_THRESHOLD members (else
 the key is promoted, which is not an in-place change). Otherwise the general path runs - copy out,
 mutate, write back, split if needed - and leaves fresh slack behind, which is where the slack of a
@@ -849,7 +870,8 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         OUT deleted_pages bigint,
         OUT posting_internal_pages bigint, OUT max_posting_height int,
         OUT inline_slack_bytes bigint, OUT summary_entries bigint, OUT summary_tids bigint,
-        OUT summary_bytes bigint, OUT summary_pages bigint, OUT ndistinct bigint)
+        OUT summary_bytes bigint, OUT summary_pages bigint, OUT ndistinct bigint,
+        OUT narrow_containers bigint)
         RETURNS SETOF record
         -- ONE ROW PER KEY COLUMN (§24), in attno order.  Counters that describe an entry or a
         -- posting set - entries, inline_entries, ntids, null_tids, empty_tids, the container and
@@ -871,7 +893,8 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- and in none of the counters above;
         -- ndistinct is the column's distinct keys as the meta page records them for the planner
         -- (§33) - the last build's, VACUUM's or ANALYZE's count, not this walk's - and NULL for a
-        -- column with none (a multi-key one, or an index nothing has counted since before §33)
+        -- column with none (a multi-key one, or an index nothing has counted since before §33);
+        -- narrow_containers is the NARROW containers of §38, last so the others keep their places
     lion_index_posting_root(regclass, key anyelement) RETURNS bigint
         -- the ROOT block of one key's posting tree, NULL when the key has no entry or its set is
         -- still INLINE.  For tests only: §22 requires the root block never to move, because it is
@@ -2755,7 +2778,9 @@ v1 priorities, in order of measured impact:
 3. Bitset page packing: a 4104-byte 15-bit bitset fits once per 8152-byte page (c2: 56 MB vs GIN
    21 MB). 14-bit containers pack three per page and shrink c2 to 38 MB but cost mid-cardinality keys
    ~18%; a dedicated two-bitset page format, or splitting only bitset containers, would get both.
-   Sharing a container page between keys is the other half of this.
+   Sharing a container page between keys is the other half of this. PARTLY DONE (§38): a dense
+   container is a NARROW of the width its heap pages' offsets need, 520 bytes for 63 rows a page or
+   fewer and 2568 at most, fifteen to three to a page.
 4. Insert cost: a container is copied out and back per insert (bitset fast path exists). Consider an
    in-place add for ARRAY containers with slack and a GIN-style pending list for bulk loads.
 5. IN predicates in the AM and the count pushdown are DONE (§15, amsearcharray), and so are NULL
@@ -2789,8 +2814,8 @@ ckey and their ranges do not overlap or interleave; page minckey/maxckey and cha
 item's first and last ckey; `lion_item_size()` dispatches on type for containers and segments.
 The entry tuple's `ncontainers` counts ITEMS, containers and segments alike (it is the number the
 chain machinery maintains and verify() checks against the items it finds); the `containers`,
-`array_containers`, `bitset_containers` and `run_containers` columns of lion_index_stats() count
-only real containers, and `container_bytes` is the bytes of every item, segments included.
+`array_containers`, `bitset_containers`, `run_containers` and `narrow_containers` (§38) columns of
+lion_index_stats() count only real containers, and `container_bytes` is the bytes of every item, segments included.
 
 Policy. LION_SPARSE_THRESHOLD = 4: a ckey with ≥ 4 members is a regular container (array cost
 12 + 2n beats 6n from n = 4); with ≤ 3 members its pairs live in a segment.
@@ -16715,6 +16740,280 @@ under the walk from the entries' counts and under the counted walk, and through 
 rolled back and committed, and rolled back again with `work_mem` at 64kB, where the look the walk
 takes once about a thousand keys wait finds the page unmarked and stops it. `keyaggs.sql` takes
 the walk at 64kB too, through some thirty looks that pass.
+
+## 38. NARROW containers: a bitmap as wide as the heap's offsets (format version 8, implemented 2026-10-01, any width 2026-10-02)
+
+A container covers 64 heap blocks of 512 offsets each (§2), so its BITSET is 4104 bytes, one to a
+container page. But a heap page holds 291 tuples at most, and most tables far fewer: 226 for rows of
+a few small columns, 185 for three ints, 61 for rows of 132 bytes, the tuple header and the line
+pointer included. Every word of a BITSET past the highest offset its blocks have is a zero it can
+never use - five eighths of it at 185 rows a page, seven eighths at 61. A NARROW keeps only the words
+the offsets need: k words a block, the width k chosen per container, from 1 to 5 at 8K.
+
+The first version (2026-10-01) had one width, two words a block for offsets below 128, which left
+every table of more than 127 rows a page with BITSETs: those are the narrow rows, whose indexes are
+the densest. This one makes the width a property of the container, in the header byte that was
+reserved, and redefines version 8's NARROW in place: the version number did not change, and a
+NARROW of the first version - flags 0 - is refused as a width this build does not have ("Format
+version" below).
+
+### Format
+
+A NARROW is container type 5 (`LION_CT_NARROW`) with the usual 8-byte header, its width k in the
+`flags` byte, and a payload of `LION_WIDTH_WORDS(k)` words, 64 k at 8K: word j of block b of the
+container is word b * k + j and holds the block's offsets 64 j .. 64 j + 63, so that member lo is
+bit `(lo >> 9) * 64 k + (lo & 511)`, for an offset below 64 k. A BITSET is the same layout at the
+full width, `LION_BITSET_WIDTH` = 8 words a block, with flags 0, and its bit for lo is lo itself;
+so the code has one representation, a BITMAP of width k, with BITSET as the full width
+(lion_container.h, "widths"), and a BITSET of any index ever written keeps working as one.
+
+The widest NARROW is the narrowest bitmap that holds every offset a heap page can have, from a
+formula rather than a constant, so that every block size has its own:
+
+    LION_HEAP_MAX_OFFSET  = (BLCKSZ - 24) / (MAXALIGN(23) + 4)   (MaxHeapTuplesPerPage; asserted)
+    LION_NARROW_MAX_WIDTH = LION_HEAP_MAX_OFFSET / 64 + 1
+
+| BLCKSZ | offset bits | blocks a container | BITSET width | most offsets a page | NARROW widths | NARROW of width k |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8K | 9 | 64 | 8 | 291 | 1 .. 5 | 8 + 512 k bytes |
+| 16K | 10 | 32 | 16 | 584 | 1 .. 10 | 8 + 256 k bytes |
+| 32K | 11 | 16 | 32 | 1169 | 1 .. 19 | 8 + 128 k bytes |
+
+At 8K a NARROW is 520, 1032, 1544, 2056 or 2568 bytes - fifteen, seven, five, three or three to a
+container page where one BITSET fills it - and as large as an ARRAY of `LION_WIDTH_ARRAY_CARD(k)`
+= 256 k members. Every payload bit is a member the container may hold, so a damaged NARROW can
+claim two things wrongly: its cardinality, which is treated as every BITSET's is (§3, "Damaged
+containers"), and its width, which sizes it: a width outside 1 .. `LION_NARROW_MAX_WIDTH` is
+refused by every reader of a page before it reads the item ("item N on container page N is a NARROW
+of width N, not one of 1 .. 5") and reported by verify() ("narrow container width is out of range
+for the block size"); every function of the library clamps it into range, and the readers check
+that the item has the bytes the width sizes before any of them reads it.
+
+### Rules
+
+- **Who makes one.** `lion_container_optimize()` considers the NARROW of the narrowest width that
+  holds every member (`lion_container_min_width()`: an ARRAY's or a RUN's highest offset, a
+  bitmap's highest non-zero word of any block) and takes the smallest of the four, ties going to
+  ARRAY, then RUN, then NARROW, then BITSET. A NARROW is always smaller than a BITSET at 8K, so the
+  build never writes a dense container as a BITSET any more; an ARRAY of up to 256 k members and a
+  RUN of up to 128 k - 1 runs (a NARROW's bytes or fewer) stay what they are.
+  `lion_container_optimize_ext(c, false)` leaves NARROW out, which is what an index of an older
+  version gets. The build optimizes every container, so it writes NARROWs; VACUUM's re-optimize of
+  an item it changed allows one only in an index of version 8; inserts make none of anything else:
+  the promotion of a sparse segment's container key optimizes without NARROW, and an ARRAY that
+  reaches 2048 members becomes a BITSET as before.
+- **Widening.** `add()` of a member at an offset of 64 k or more makes the NARROW the narrowest
+  width that holds it (`lion_lo_width(lo)`), copying each block's k words to the start of its new
+  ones; past `LION_NARROW_MAX_WIDTH` - an offset no heap tuple has, which only a made-up or damaged
+  member can be - a BITSET. That changes the item's size, so it never happens in place
+  ("Growth in place").
+- **Shrinking.** `remove()`, `remove_if()` and `remove_range()` turn a bitmap of width k that has
+  `LION_WIDTH_ARRAY_CARD(k)` members or fewer into an ARRAY, 256 k for a NARROW and 2048 for a
+  BITSET, as a BITSET always did. They never narrow it: a NARROW whose widest members went is
+  wider than it needs until something optimizes it, which VACUUM does to the items it changed.
+- **The set algebra.** The raw forms (§15) keep the width of what they build: an AND is an ARRAY
+  if either side is one, a RUN if both are and it fits, else a bitmap of the NARROWER bitmap
+  operand's width - no member of the result is past it; an ANDNOT is an ARRAY when its left side
+  is one, else a bitmap of the left side's width; an OR is a bitmap of the WIDER bitmap operand's
+  width when both are bitmaps, else a BITSET (an ARRAY with an ARRAY whose members fit one aside).
+  So no member of a result is one its width cannot hold, and an operand's members past it change
+  nothing. An operand of another width is first copied into the result at the result's width -
+  each block's first words, and zeros past them (`bitmap_rewiden()`) - and one kernel pass then
+  makes and counts the result with the operand that has the width. The optimizing forms choose
+  among all four, at the result's narrowest width. `and_cardinality()` counts two bitmaps of one
+  width with the AND_COUNT kernel, and of two widths the wider one's words gathered to the narrower
+  width, the same pass.
+- **The kernels** (§3, "Whole-bitset kernels") take a word count, a multiple of 64; each
+  implementation runs the BITSET's 512 words as the constant-count pass it always was, and every
+  narrower width through one pass that takes the count as it comes, so a NARROW gets the same fused
+  AVX2, POPCNT and portable loops. The loops that go member by member or block by block -
+  extraction, iteration, block masks, re-widening - are compiled for each constant width from 1 to
+  4 and for the BITSET's (`LION_WIDTH_DISPATCH`), and run with the width as it comes for the others,
+  5 at 8K and more at larger blocks. The RUNS pass counts runs of the words as they lie, where offset
+  64 k - 1 of one block and offset 0 of the next are adjacent bits but not adjacent members, so
+  below the full width a block that starts with a member where the block before ends with one is
+  one run more (`bitmap_count_runs()`).
+
+### Growth in place
+
+`lion_container_inplace_need(c, lo)` is the one table that both the in-place insert
+(`lion_insert_container_inplace()`) and its redo (`LION_OP_CONTAINER_ADD`, §25) read: the bytes the
+item must have for `add(c, lo)` to stay inside it, or 0 when it would change the representation. A
+bitmap of width k - a BITSET, or a NARROW - needs its own size when lo's offset is below 64 k
+(every lo, for a BITSET), and 0 otherwise, which sends the insert down the general path: the
+container is copied out, widened, and written back as the item of its new size, exactly as a full
+ARRAY becomes a BITSET there. The redo asks the same table of the item it replays onto, and a
+record no item could take in place is a PANIC, so a replay never widens an item past its bytes. The
+ARRAY and RUN rows are what they were. `lion_item_alloc_size()` gives a NARROW no slack: a member
+it holds changes no byte count, and one past its width needs another 512 bytes for every word a
+block it gains, which no slack an item carries would hold.
+
+### Images stay at the full width
+
+The count engine's images - a container key's union of many containers (`or_into_bitset()`), the
+range union that grows in place (`lion_container_or_inplace()`, §32), the image a GROUP BY's groups
+are tested against (§10) - stay BITSETs of 512 words. A NARROW is ORed into one at its words'
+places; the image's width would otherwise have to follow the widest container that ever joins it,
+which is not known until the last one has, and every consumer of an image (extraction, the block
+masks, `and_image_count()`, the recount) would take a width it now takes as a constant. The cost
+is the words a narrower image would not have: one pass over 512 words rather than 64 k, per image
+and container key. The unit benchmark, in ns, the minimum of five runs, on the machine of the
+measurements below:
+
+| operation | BITSET | NARROW(1) | (2) | (3) | (4) | (5) |
+| --- | --- | --- | --- | --- | --- | --- |
+| OR into a full image | 160 | 55 | 77 | 100 | 117 | 139 |
+| AND, two of one width, counted | 110 | 20 | 35 | 42 | 65 | 81 |
+| AND, two of one width, raw | 138 | 25 | 41 | 50 | 76 | 92 |
+| optimize (copy and choose) | 263 | 71 | 94 | 117 | 132 | 171 |
+
+So a full image costs at most some 100 ns more a container key and operation than one of a
+NARROW's width would, against the 3,900 to 18,600 rows a container key holds at 61 to 291 rows a
+page: a few hundredths of a nanosecond a row. A container read from a page is a NARROW whatever the
+image is, which is where the bytes are saved.
+
+### Format version (lion.h, lion_meta.c)
+
+Version 8 is version 7 plus NARROW items, with or without summaries (`summary_cols` says, as in
+version 7), and its NARROW is the one above. A build writes it only when it emitted a NARROW
+(`lion_meta_record_narrow()`); VACUUM makes NARROWs only in an index that is already version 8;
+inserts make none. So an index of version 6 or 7 stays one until it is rebuilt, and stays readable
+by the builds before §38, which refuse 8 with the "not a valid lion index" ERROR and its REINDEX
+hint rather than reading a type 5 item as the damaged item it would be to them. Going back to such
+a build means a REINDEX of the version 8 indexes, under it, first. This build reads 6, 7 and 8, with
+6 never naming summarized columns and 7 always naming one.
+
+The first version's NARROWs had flags 0 and two words a block; this build reads flags 0 as no width
+it has, and refuses the item as above. No build of the first version was released, so nothing
+reads it in place: a REINDEX under this build rewrites such an index at the widths its heap needs.
+
+### verify(), statistics, EXPLAIN, costs
+
+- `lion_index_verify()` checks a NARROW's width (1 .. `LION_NARROW_MAX_WIDTH`), that the item has
+  the bytes its width sizes, its cardinality against its payload, its members' offsets against the
+  heap block's line pointers like any container's ("narrow container member is not a heap tuple
+  offset" for a bit past the block's last), that every other container's flags are 0, and that the
+  version the meta page says now - read off the page, not the cached state - is 8 or more.
+- `lion_index_stats()` counts NARROWs of every width in `narrow_containers`, its last column, and
+  in `containers`; its signature did not change, and there is no column per width.
+- EXPLAIN has no counter per container kind; `Containers Visited` counts NARROWs with the rest.
+- The probe heuristics of the expression evaluator (`lion_or_probe_pays()`, `lion_tree_probe_pays()`,
+  lion_expr.c) price a NARROW of any width as the BITSET it replaces - a bit test a lookup, and the
+  BITSET's extract and OR, which a NARROW's k eighths of the words overstate. No cost constant
+  changed; the planner's byte estimates (`lion_plan_cost.c`) still bound a dense container by a
+  BITSET's 4 kB.
+
+### Measured (2026-10-02, assert-enabled PostgreSQL 18.6 at -O1, four shared cores)
+
+The numbers are for their ratios, not their absolute values. Five synthetic tables of 1M rows,
+`(i int, k int2, g int2, pad text)` with pads that make 61, 97, 136, 185 and 226 rows a page; k
+has two values and g twenty, both a hash of the row number, each under a lion index. Before is the
+first version's build (NARROWs of width 2 only), after this one, the same rows in two clusters on
+the same machine.
+
+| rows a page | heap pages | `k` before | `k` after | `g`, both |
+| --- | --- | --- | --- | --- |
+| 61 | 16,394 | 5.11 bits/row: 512 NARROW(2), 1 ARRAY, 1 RUN | 2.62: 514 NARROW(1) | 19.60: 5,140 ARRAY |
+| 97 | 10,310 | 3.28: 322 NARROW(2), 1 ARRAY, 1 RUN | 3.28: the same | 19.79: 3,240 ARRAY |
+| 136 | 7,353 | 15.34: 230 BITSET | 3.28: 230 NARROW(3) | 18.61: 2,300 ARRAY |
+| 185 | 5,406 | 11.40: 170 BITSET | 2.49: 170 NARROW(3) | 19.79: 1,700 ARRAY |
+| 226 | 4,425 | 9.31: 138 BITSET, 2 ARRAY | 3.41: 138 NARROW(4), 2 ARRAY | 19.79: 1,400 ARRAY |
+
+`g`'s containers hold a twentieth of a container key's rows, at most 723 members, which an ARRAY
+holds in fewer bytes than any bitmap: those indexes did not change. `k` at 97 rows a page was
+already the first version's NARROW(2). Timings, the two builds alternating query by query in eight
+rounds, each the median of 15 runs after 3 warm-ups, with every scan but the count pushdown
+disabled (the plan is LionCount in both, every heap page all-visible), in ms, before / after, the
+median of the eight rounds:
+
+| rows a page | `count(*) WHERE k = 1` | `WHERE g = 3` | `k, count(*) GROUP BY k` | `GROUP BY g` | `g, count(*) WHERE k = 1 GROUP BY g` | `WHERE k = 1 AND g = 3` |
+| --- | --- | --- | --- | --- | --- | --- |
+| 61 | 0.19 / 0.19 | 0.21 / 0.20 | 0.37 / 0.35 | 3.58 / 3.64 | 2.46 / 2.39 | 0.30 / 0.27 |
+| 97 | 0.12 / 0.13 | 0.17 / 0.15 | 0.23 / 0.23 | 2.67 / 2.67 | 2.14 / 2.15 | 0.25 / 0.25 |
+| 136 | 0.20 / 0.11 | 0.13 / 0.14 | 0.41 / 0.20 | 2.22 / 2.24 | 2.16 / 2.04 | 0.28 / 0.24 |
+| 185 | 0.13 / 0.09 | 0.11 / 0.11 | 0.29 / 0.15 | 1.93 / 1.88 | 1.83 / 1.94 | 0.23 / 0.21 |
+| 226 | 0.10 / 0.08 | 0.11 / 0.10 | 0.24 / 0.13 | 1.74 / 1.78 | 1.94 / 1.88 | 0.19 / 0.19 |
+
+Where `k`'s BITSETs became NARROWs of width 3 or 4 (136, 185 and 226 rows a page), its count and
+its GROUP BY take half the time or less, the words they read being three eighths or half as many;
+where a NARROW(2) became a NARROW(1) (61), half the bytes of an index that was already small save
+nothing these timings resolve. Everything that `g`'s ARRAYs dominate is the same, within the
+spread of the rounds.
+
+The first version's own measurement (2026-10-01: 2M rows of 65 to a page, whose BITSETs at 30.93
+bits a row became NARROW(2)s at 4.65, against GIN's 8.91) stands: those are NARROW(2)s still.
+
+### Not done
+
+- **Inserts make no NARROW of anything else** (they only widen one). A full ARRAY still becomes a
+  BITSET, and an index that grows by inserts keeps its BITSETs until VACUUM changes the item - in a
+  version 8 index - or a REINDEX: an insert never pays for a re-optimize. An index built on an
+  empty table is version 6 and stays so.
+- **A version 6 or 7 index gets no NARROW without a REINDEX**, even where VACUUM could make one.
+- **VACUUM narrows only the items it changed.** A NARROW whose widest members are deleted narrows
+  when VACUUM takes them out, since it re-optimizes the item it rewrites; nothing narrows an item
+  VACUUM has no dead rows in.
+- **The cost model** prices a NARROW of any width as a BITSET (above).
+- **Images stay at the full width** (above), and with them the GROUP BY's test of its groups
+  against a collected WHERE: the WHERE is optimized when it is collected, so it is a NARROW
+  wherever its rows are dense, and is tested through a full image of it; the path that tests a
+  BITSET WHERE as it is now runs only for a WHERE that is a BITSET, which an optimized one never
+  is at 8K.
+- **No switch**: a build always makes NARROWs where they are smallest; there is no reloption or
+  setting to build a version 6 index for an older build to read.
+
+### Tests
+
+`test/unit/container_test.c`: for every width k, every transition - add below 64 k and at it,
+widening to each wider width and past the widest, removes to 256 k + 1 and 256 k members,
+optimize() from every kind at 256 k - 1, 256 k and 256 k + 1 members and around the RUN that is a
+NARROW's size - the set algebra of every type and width pair against the bit-at-a-time reference
+with the result kinds and widths above, `inplace_need()` against what add() writes, the kernels
+forced to each implementation at every width, and random damaged NARROWs of every width and of
+widths out of range, in exact-size heap buffers under `make unit SANITIZE=1`. The unit tests also
+pass built against a PostgreSQL configured for 16K and 32K blocks (widths 1 .. 10 and 1 .. 19).
+
+`test/sql/narrow.sql`: tables of 35, 61, 97, 136, 185 and 226 rows a page, and one of 272, whose
+two-value columns are NARROWs of widths 1, 1, 2, 3, 3, 4 and 5; `lion_index_stats()` per kind,
+counts, GROUP BY, IN lists and `<>` over columns of several widths in one query, bitmap and plain
+scans, `lion_index_count()` and the count pushdown, every answer against a sequential scan; a
+table whose keys hold one band of offsets each, so that one index has NARROWs of four widths;
+inserts within a width, past it (UPDATEs that widen a NARROW from 1 to 4 a width at a time) and
+into new keys; DELETE and VACUUM that narrow back, make an ARRAY, and leave a version 6 index's
+BITSETs alone until a REINDEX; summaries, whose items widen and narrow back the same way; and
+`lion_index_verify()` throughout. `test/sql/bitset.sql` runs one set of queries over a table of
+136 rows a page (NARROW(3)), one of 226 (NARROW(4)) and a version 6 index of the same rows that
+inserts filled, whose dense containers are BITSETs: AND, OR, `<>`, GROUP BY, bitmap and plain
+scans, inserts that the bitmaps take in place and that grow ARRAYs into BITSETs, and an UPDATE, a
+DELETE and a VACUUM that shrink them. `test/sql/corrupt_items.sql` §7 writes widths 0, 6 and 2
+into a NARROW of width 1: readers refuse 0 and 6, verify() reports them, and width 2, which the
+item has no bytes for, is refused by both as an item too short.
+
+Every test that sized a set to outgrow a 64 kB work_mem lost it, because a dense container of narrow
+rows went from 4104 bytes to 1544: `groupwhere.sql` §7, `range_cost.sql` §2, `spill.sql`,
+`rangesource.sql` §4, `summary_scatter.sql` §4, `ordered.sql` §10, `fkjoin_perkey.sql` §3,
+`fkjoin_semi.sql` and both of `fkjoin_parallel.sql` §6's copies. Each now has more container keys:
+most pad their rows to 65 a page, just past the 63 offsets of width 1, which makes a NARROW the
+largest for the rows it holds (0.25 bytes a row at width 2 against 0.13 at 185 rows a page), and
+grow their row counts to keep the old margin; `groupwhere.sql` §7 keeps its rows and has 600,000 of
+them instead of 240,000; `summary_scatter.sql` keeps narrow rows and takes a larger prime for its
+permutation; `fkjoin_parallel.sql` sets `pg_lion.parallel_range_keys` so that its copies are still
+one chunk and three; `range_cost.sql` runs its 64 kB cases on `rcostw`, rcost's rows at some 25 a
+page over 63 container keys, and fills `rcostn`'s memory with 39 container keys of v = 0 NARROWs of
+width 3 where 15 of BITSETs did. The tests that grow a posting set until a leaf splits lost their
+splits, since a dense set is NARROWs of a few to a leaf that an insert within their width does not
+grow: `count_split_race.spec`, `verify_concurrent.spec`'s `vp` and the split case of
+`test/recovery/run.sh`'s phase 3 create their index before the rows, so that the inserts make it, of
+ARRAYs and BITSETs as before, and `posting_split_repair.spec` spreads the rows that were one dense
+key over 97 keys of small ARRAYs, so that its index stays version 6 and VACUUM's filtering still
+grows a RUN into an ARRAY larger than the leaf's spare bytes, where it would make a NARROW of width
+4 that fits them. The other expected changes follow from smaller containers and change no answer: a
+switch to the empty copy one key later (`fkjoin_switch.sql`), a range summed from its complement
+(`rangesum.sql`) or with another mix of summaries (`summary.sql`), a union probed at keys where it
+was built (`unionprobe.sql`), posting trees on fewer blocks (`verify.sql`, `corrupt_walk.sql`,
+`gettuple_pause.spec`), and the stats of NARROWs where there were BITSETs (`scanand.sql`,
+`basic.sql`). The first version's changes to `treeprobe.sql` and `fkjoin_adaptive.sql` stand, and so
+does `count_split_race.spec`'s wider pad.
 
 ## 39. The competitor's units, and a margin for the pushdown (2026-10-01)
 

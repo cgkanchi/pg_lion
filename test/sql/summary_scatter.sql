@@ -137,28 +137,29 @@ SELECT s.same, s.probed, s.collected
 SELECT s.same, s.probed, s.collected
   FROM lion_sc('SELECT c, count(*) FROM lion_sc WHERE ts >= ''2025-01-04 00:00:00+00'' GROUP BY c') s;
 
--- ---------- 4. a narrow table: bitset containers on both sides ----------
--- Some two hundred rows a page and a heap of 17 container keys: g = 3 is a
--- fifth of every page, a bitset at each key, so a sum beside it is probed
--- into images; s = 7 is a dozen rows at each, an ARRAY whose members are
--- marked.  r is 2^i modulo the prime 200003 (2 generates every nonzero
--- residue, and 73755 is 2^1000): a permutation of the row number in no order
--- at all, so that a range over a fifth of the rows or more is a bitset at
--- each key too.  A multiple of i, as k is, would put a wide range's rows in
--- runs, whose union is RUN containers of half a bitset's size or less.
+-- ---------- 4. a narrow table: bitmap containers on both sides ----------
+-- Some two hundred rows a page and a heap of 51 container keys: g = 3 is a
+-- fifth of every page, a NARROW of width 3 (DESIGN.md §38) at each key, so a
+-- sum beside it is probed into images; s = 7 is a dozen rows at each, an
+-- ARRAY whose members are marked.  r is 2^i modulo the prime 600011 (2
+-- generates every nonzero residue, and 314410 is 2^1000): a permutation of
+-- the row number in no order at all, so that a range over a fifth of the
+-- rows or more is a NARROW at each key too.  A multiple of i, as k is, would
+-- put a wide range's rows in runs, whose union is RUN containers of a
+-- fraction of a NARROW's size.
 CREATE TABLE lion_sc_w (r int NOT NULL, g int NOT NULL, s int NOT NULL)
 	WITH (autovacuum_enabled = off);
 INSERT INTO lion_sc_w
 WITH RECURSIVE lo(i, r) AS (
 	SELECT 1, 2::int8
 	UNION ALL
-	SELECT i + 1, r * 2 % 200003 FROM lo WHERE i < 1000
+	SELECT i + 1, r * 2 % 600011 FROM lo WHERE i < 1000
 ), hi(j, m) AS (
 	SELECT 0, 1::int8
 	UNION ALL
-	SELECT j + 1, m * 73755 % 200003 FROM hi WHERE j < 199
+	SELECT j + 1, m * 314410 % 600011 FROM hi WHERE j < 599
 )
-SELECT (lo.r * hi.m % 200003)::int, (1000 * hi.j + lo.i) % 5,
+SELECT (lo.r * hi.m % 600011)::int, (1000 * hi.j + lo.i) % 5,
 	   (1000 * hi.j + lo.i) % 1009
   FROM hi, lo
  ORDER BY hi.j, lo.i;
@@ -168,24 +169,24 @@ CREATE INDEX lion_sc_w_g ON lion_sc_w USING lion (g);
 CREATE INDEX lion_sc_w_s ON lion_sc_w USING lion (s);
 VACUUM (FREEZE, ANALYZE) lion_sc_w;
 SELECT s.same, s.probed, s.collected
-  FROM lion_sc('SELECT count(*) FROM lion_sc_w WHERE r BETWEEN 5000 AND 50000 AND s = 7') s;
+  FROM lion_sc('SELECT count(*) FROM lion_sc_w WHERE r BETWEEN 15000 AND 150000 AND s = 7') s;
 SELECT s.same, s.probed, s.collected
-  FROM lion_sc('SELECT count(*) FROM lion_sc_w WHERE r BETWEEN 20000 AND 110000 AND g = 3') s;
+  FROM lion_sc('SELECT count(*) FROM lion_sc_w WHERE r BETWEEN 60000 AND 330000 AND g = 3') s;
 SELECT s.same, s.probed, s.collected
-  FROM lion_sc('SELECT g, count(*) FROM lion_sc_w WHERE r BETWEEN 5000 AND 50000 GROUP BY g') s;
+  FROM lion_sc('SELECT g, count(*) FROM lion_sc_w WHERE r BETWEEN 15000 AND 150000 GROUP BY g') s;
 SELECT s.same, s.probed, s.collected
-  FROM lion_sc('SELECT g, count(*) FROM lion_sc_w WHERE r < 196000 GROUP BY g') s;
--- At work_mem's floor a range over three quarters of the rows is a bitset at
--- every one of the 17 keys, some 70 kB, more than the 64 kB a relation's
--- ranges may collect into: it is not collected but walked at each group's
--- count, and each such walk is probed at the rows of the group and s = 7
--- (DESIGN.md §32, "A range as a source").
+  FROM lion_sc('SELECT g, count(*) FROM lion_sc_w WHERE r < 588000 GROUP BY g') s;
+-- At work_mem's floor a range over three quarters of the rows is a NARROW
+-- of width 3 at every one of the 51 keys, some 78 kB, more than the 64 kB a
+-- relation's ranges may collect into: it is not collected but walked at each
+-- group's count, and each such walk is probed at the rows of the group and
+-- s = 7 (DESIGN.md §32, "A range as a source").
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
 SELECT s.same, s.probed, s.collected
-  FROM lion_sc('SELECT g, count(*) FROM lion_sc_w WHERE r BETWEEN 5000 AND 150000 AND s = 7 GROUP BY g') s;
+  FROM lion_sc('SELECT g, count(*) FROM lion_sc_w WHERE r BETWEEN 15000 AND 450000 AND s = 7 GROUP BY g') s;
 SELECT s.same, s.probed, s.collected
-  FROM lion_sc('SELECT count(*) FROM lion_sc_w WHERE r BETWEEN 5000 AND 150000 AND s = 7') s;
+  FROM lion_sc('SELECT count(*) FROM lion_sc_w WHERE r BETWEEN 15000 AND 450000 AND s = 7') s;
 RESET work_mem;
 RESET hash_mem_multiplier;
 
