@@ -275,7 +275,7 @@ lion_new_buffer(Relation index, Relation heaprel, uint16 flags)
  * container page never has any other kind, because every delete there
  * compacts - that lies inside the page's item space at a MAXALIGNed offset,
  * the test lion_verify_itemid() makes, which is amcheck's; the type has to be
- * one of the four item kinds; the size the header gives has to fit both the
+ * one of the five item kinds; the size the header gives has to fit both the
  * line pointer's length and the largest legal item, and the line pointer may
  * claim no more beyond it than the growth slack an item can carry
  * (LION_ITEM_SLACK_BOUND, the rule lion_index_verify() applies); and a sparse
