@@ -90,6 +90,25 @@ BEGIN
 					   ELSE format('DIFFERENT in %s rows', ndiff) END);
 END $$;
 
+/*
+ * lsc_plan() prints the plan of q, and under `actual` what it did, without
+ * what differs between majors: the actual row counts (18 prints them with
+ * decimals) and a subplan's name (19 names it expr_1 where 18 numbered it).
+ */
+CREATE FUNCTION lsc_plan(q text, actual boolean DEFAULT false) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE CASE WHEN actual THEN
+			'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) '
+			ELSE 'EXPLAIN (COSTS OFF) ' END || q LOOP
+		ln := regexp_replace(ln, '\s*\(actual rows=[^)]*\)', '');
+		ln := regexp_replace(ln, 'SubPlan \S+', 'SubPlan N');
+		RETURN NEXT ln;
+	END LOOP;
+END $$;
+
 -- A key column k, a multi-key column tags, and an INCLUDE column of each
 -- type, every one with NULLs; three more key columns a, b, c in an index of
 -- their own that stores their values.
@@ -127,8 +146,7 @@ EXPLAIN (COSTS OFF) SELECT d, count(DISTINCT u), min(ts), max(n) FROM lsc WHERE 
 EXPLAIN (COSTS OFF) SELECT i2, d, count(*) FROM lsc WHERE tags @> ARRAY[3] GROUP BY i2, d;
 EXPLAIN (COSTS OFF) SELECT i2, count(*) FROM lsc GROUP BY i2;
 EXPLAIN (COSTS OFF) SELECT i2, count(*) FROM lsc WHERE k < 5 GROUP BY i2 HAVING count(*) > 10;
-EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
-	SELECT i2, count(*) FROM lsc WHERE k = 3 GROUP BY i2;
+SELECT * FROM lsc_plan('SELECT i2, count(*) FROM lsc WHERE k = 3 GROUP BY i2', true);
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
@@ -254,10 +272,9 @@ SELECT count(DISTINCT u), sum(i4), min(d), count(n), count(*) FROM lsc WHERE k =
 SELECT lsc_check('SELECT i2, count(*) FROM lsc WHERE k = 1000 GROUP BY i2');
 
 -- 10. Run again: each probe of a correlated subquery is counted afresh.
-EXPLAIN (COSTS OFF)
-SELECT x, (SELECT count(DISTINCT i2) FROM lsc WHERE k = x) AS di,
+SELECT * FROM lsc_plan($$SELECT x, (SELECT count(DISTINCT i2) FROM lsc WHERE k = x) AS di,
 	   (SELECT max(d) FROM lsc WHERE k = x) AS md
-  FROM generate_series(1, 4) x ORDER BY x;
+  FROM generate_series(1, 4) x ORDER BY x$$);
 SELECT x, (SELECT count(DISTINCT i2) FROM lsc WHERE k = x) AS di,
 	   (SELECT max(d) FROM lsc WHERE k = x) AS md
   FROM generate_series(1, 4) x ORDER BY x;
@@ -343,7 +360,7 @@ DROP TABLE lsc_t;
 \endif
 
 DROP TABLE lsc, lsc_abs;
-DROP FUNCTION lsc_check(text);
+DROP FUNCTION lsc_check(text), lsc_plan(text, boolean);
 SET client_min_messages = warning;
 DROP COLLATION IF EXISTS lsc_en;
 DROP COLLATION IF EXISTS lsc_ci;

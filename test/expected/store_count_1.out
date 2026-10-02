@@ -88,6 +88,24 @@ BEGIN
 				  CASE WHEN ndiff = 0 THEN 'same as the sequential scan'
 					   ELSE format('DIFFERENT in %s rows', ndiff) END);
 END $$;
+/*
+ * lsc_plan() prints the plan of q, and under `actual` what it did, without
+ * what differs between majors: the actual row counts (18 prints them with
+ * decimals) and a subplan's name (19 names it expr_1 where 18 numbered it).
+ */
+CREATE FUNCTION lsc_plan(q text, actual boolean DEFAULT false) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE CASE WHEN actual THEN
+			'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) '
+			ELSE 'EXPLAIN (COSTS OFF) ' END || q LOOP
+		ln := regexp_replace(ln, '\s*\(actual rows=[^)]*\)', '');
+		ln := regexp_replace(ln, 'SubPlan \S+', 'SubPlan N');
+		RETURN NEXT ln;
+	END LOOP;
+END $$;
 -- A key column k, a multi-key column tags, and an INCLUDE column of each
 -- type, every one with NULLs; three more key columns a, b, c in an index of
 -- their own that stores their values.
@@ -179,11 +197,10 @@ EXPLAIN (COSTS OFF) SELECT i2, count(*) FROM lsc WHERE k < 5 GROUP BY i2 HAVING 
    Store: i2
 (5 rows)
 
-EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
-	SELECT i2, count(*) FROM lsc WHERE k = 3 GROUP BY i2;
-                     QUERY PLAN                     
-----------------------------------------------------
- Custom Scan (LionCount) (actual rows=7.00 loops=1)
+SELECT * FROM lsc_plan('SELECT i2, count(*) FROM lsc WHERE k = 3 GROUP BY i2', true);
+              lsc_plan              
+------------------------------------
+ Custom Scan (LionCount)
    Lion Indexes: lsc_k.k (k = 3)
    Group Key: i2
    Store: i2
@@ -625,20 +642,19 @@ SELECT lsc_check('SELECT i2, count(*) FROM lsc WHERE k = 1000 GROUP BY i2');
 (1 row)
 
 -- 10. Run again: each probe of a correlated subquery is counted afresh.
-EXPLAIN (COSTS OFF)
-SELECT x, (SELECT count(DISTINCT i2) FROM lsc WHERE k = x) AS di,
+SELECT * FROM lsc_plan($$SELECT x, (SELECT count(DISTINCT i2) FROM lsc WHERE k = x) AS di,
 	   (SELECT max(d) FROM lsc WHERE k = x) AS md
-  FROM generate_series(1, 4) x ORDER BY x;
-                   QUERY PLAN                    
+  FROM generate_series(1, 4) x ORDER BY x$$);
+                    lsc_plan                     
 -------------------------------------------------
  Sort
    Sort Key: x.x
    ->  Function Scan on generate_series x
-         SubPlan 1
+         SubPlan N
            ->  Custom Scan (LionCount)
                  Lion Indexes: lsc_k.k (k = x.x)
                  Store: i2
-         SubPlan 2
+         SubPlan N
            ->  Custom Scan (LionCount)
                  Lion Indexes: lsc_k.k (k = x.x)
                  Store: d
@@ -797,7 +813,7 @@ SELECT lsc_check('SELECT count(DISTINCT ci), min(t), max(t) FROM lsc_t WHERE k <
 DROP TABLE lsc_t;
 \endif
 DROP TABLE lsc, lsc_abs;
-DROP FUNCTION lsc_check(text);
+DROP FUNCTION lsc_check(text), lsc_plan(text, boolean);
 SET client_min_messages = warning;
 DROP COLLATION IF EXISTS lsc_en;
 DROP COLLATION IF EXISTS lsc_ci;

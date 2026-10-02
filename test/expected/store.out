@@ -535,44 +535,77 @@ DROP TABLE lion_st_mid;
 CREATE TABLE lion_st_abs (id int, s text, f text) WITH (toast_tuple_target = 128);
 INSERT INTO lion_st_abs SELECT g, repeat(md5(g::text), 62), repeat('f', 100) FROM generate_series(1, 400) g;
 INSERT INTO lion_st_abs SELECT g, 'short ' || g FROM generate_series(401, 900) g;
-SELECT count(DISTINCT (ctid::text::point)[0]) AS heap_pages FROM lion_st_abs WHERE id <= 400;
- heap_pages 
-------------
-          7
+-- The long rows take several heap pages - how many depends on the heap's
+-- page layout, which differs between majors - and those pages are the ABSENT
+-- ones: the stats count them, and their rows, long and short alike, are the
+-- rows the store has no value for.
+CREATE FUNCTION lion_st_long_pages(tbl regclass) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE n bigint;
+BEGIN
+	EXECUTE format('SELECT count(DISTINCT (ctid::text::point)[0]) FROM %s WHERE id <= 400', tbl) INTO n;
+	RETURN n;
+END $$;
+SELECT lion_st_long_pages('lion_st_abs') > 3 AS several_long_pages;
+ several_long_pages 
+--------------------
+ t
 (1 row)
 
 CREATE INDEX lion_st_abs_b ON lion_st_abs USING lion (id) INCLUDE (s);
 CREATE TABLE lion_st_abs2 (LIKE lion_st_abs) WITH (toast_tuple_target = 128);
 CREATE INDEX lion_st_abs_i ON lion_st_abs2 USING lion (id) INCLUDE (s);
 INSERT INTO lion_st_abs2 SELECT * FROM lion_st_abs ORDER BY id;
-SELECT * FROM lion_st_stats('lion_st_abs_b');
- attno | pages | map_pages | dict_pages | raw_pages | absent | dict_bytes | slot_bytes 
--------+-------+-----------+------------+-----------+--------+------------+------------
-     1 |     8 |         3 |            |           |        |            |           
-     2 |     8 |         3 |          8 |         0 |      7 |       3657 |        662
-(2 rows)
-
-SELECT * FROM lion_st_stats('lion_st_abs_i');
- attno | pages | map_pages | dict_pages | raw_pages | absent | dict_bytes | slot_bytes 
--------+-------+-----------+------------+-----------+--------+------------+------------
-     1 |     7 |         3 |            |           |        |            |           
-     2 |     7 |         3 |          7 |         0 |      7 |       3655 |        662
-(2 rows)
-
-SELECT count(*) AS rows, count(*) FILTER (WHERE st IS NULL) AS absent,
-	   count(*) FILTER (WHERE st IS NOT NULL AND st IS DISTINCT FROM s) AS wrong
-  FROM (SELECT s, (lion_index_stored('lion_st_abs_b', ctid))[1] AS st FROM lion_st_abs) x;
- rows | absent | wrong 
-------+--------+-------
-  900 |    569 |     0
+SELECT lion_st_long_pages('lion_st_abs') = lion_st_long_pages('lion_st_abs2') AS same_layout;
+ same_layout 
+-------------
+ t
 (1 row)
 
-SELECT count(*) AS rows, count(*) FILTER (WHERE st IS NULL) AS absent,
+SELECT attno, pages > 0 AS some_pages, map_pages, dict_pages = pages AS all_dict,
+	   raw_pages, absent = lion_st_long_pages('lion_st_abs') AS absent_long_pages,
+	   dict_bytes > 0 AS some_dict, slot_bytes > 0 AS some_slots
+  FROM lion_st_stats('lion_st_abs_b');
+ attno | some_pages | map_pages | all_dict | raw_pages | absent_long_pages | some_dict | some_slots 
+-------+------------+-----------+----------+-----------+-------------------+-----------+------------
+     1 | t          |         3 |          |           |                   |           | 
+     2 | t          |         3 | t        |         0 | t                 | t         | t
+(2 rows)
+
+SELECT attno, pages > 0 AS some_pages, map_pages, dict_pages = pages AS all_dict,
+	   raw_pages, absent = lion_st_long_pages('lion_st_abs2') AS absent_long_pages,
+	   dict_bytes > 0 AS some_dict, slot_bytes > 0 AS some_slots
+  FROM lion_st_stats('lion_st_abs_i');
+ attno | some_pages | map_pages | all_dict | raw_pages | absent_long_pages | some_dict | some_slots 
+-------+------------+-----------+----------+-----------+-------------------+-----------+------------
+     1 | t          |         3 |          |           |                   |           | 
+     2 | t          |         3 | t        |         0 | t                 | t         | t
+(2 rows)
+
+SELECT count(*) AS rows,
+	   count(*) FILTER (WHERE st IS NULL) = count(*) FILTER (WHERE longpage) AS absent_long_pages_rows,
+	   count(*) FILTER (WHERE st IS NULL AND NOT longpage) AS absent_elsewhere,
+	   count(*) FILTER (WHERE st IS NOT NULL) > 0 AS some_stored,
 	   count(*) FILTER (WHERE st IS NOT NULL AND st IS DISTINCT FROM s) AS wrong
-  FROM (SELECT s, (lion_index_stored('lion_st_abs_i', ctid))[1] AS st FROM lion_st_abs2) x;
- rows | absent | wrong 
-------+--------+-------
-  900 |    569 |     0
+  FROM (SELECT s, (lion_index_stored('lion_st_abs_b', ctid))[1] AS st,
+			   (ctid::text::point)[0] IN (SELECT (ctid::text::point)[0] FROM lion_st_abs WHERE id <= 400) AS longpage
+		  FROM lion_st_abs) x;
+ rows | absent_long_pages_rows | absent_elsewhere | some_stored | wrong 
+------+------------------------+------------------+-------------+-------
+  900 | t                      |                0 | t           |     0
+(1 row)
+
+SELECT count(*) AS rows,
+	   count(*) FILTER (WHERE st IS NULL) = count(*) FILTER (WHERE longpage) AS absent_long_pages_rows,
+	   count(*) FILTER (WHERE st IS NULL AND NOT longpage) AS absent_elsewhere,
+	   count(*) FILTER (WHERE st IS NOT NULL) > 0 AS some_stored,
+	   count(*) FILTER (WHERE st IS NOT NULL AND st IS DISTINCT FROM s) AS wrong
+  FROM (SELECT s, (lion_index_stored('lion_st_abs_i', ctid))[1] AS st,
+			   (ctid::text::point)[0] IN (SELECT (ctid::text::point)[0] FROM lion_st_abs2 WHERE id <= 400) AS longpage
+		  FROM lion_st_abs2) x;
+ rows | absent_long_pages_rows | absent_elsewhere | some_stored | wrong 
+------+------------------------+------------------+-------------+-------
+  900 | t                      |                0 | t           |     0
 (1 row)
 
 SELECT lion_index_verify('lion_st_abs_b', true), lion_index_verify('lion_st_abs_i', true);
@@ -582,6 +615,7 @@ SELECT lion_index_verify('lion_st_abs_b', true), lion_index_verify('lion_st_abs_
 (1 row)
 
 DROP TABLE lion_st_abs, lion_st_abs2;
+DROP FUNCTION lion_st_long_pages(regclass);
 -- ---------------------------------------------------------------------
 -- 6. The map past its first leaf: with 32 stored columns a leaf holds the
 --    slots of 63.5 windows, and a row on heap page 4096 is in window 64.

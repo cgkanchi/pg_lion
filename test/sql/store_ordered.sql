@@ -207,7 +207,8 @@ END $$;
 
 /*
  * lso_plan() prints the plan with the settings as they are, without the
- * lines whose contents vary between majors.
+ * lines whose contents vary between majors, and a subplan's name as N (19
+ * names it expr_1 where 18 numbered it).
  */
 CREATE FUNCTION lso_plan(q text) RETURNS SETOF text
 LANGUAGE plpgsql AS $$
@@ -216,7 +217,7 @@ DECLARE
 BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln !~ '^\s*(Index Searches|Disabled|Storage|Planning|Execution|Buffers)' THEN
-			RETURN NEXT ln;
+			RETURN NEXT regexp_replace(ln, 'SubPlan \S+', 'SubPlan N');
 		END IF;
 	END LOOP;
 END $$;
@@ -225,11 +226,16 @@ END $$;
  * lso_run() runs q under EXPLAIN ANALYZE, every core scan off, and prints
  * the node's counters: the rows ranked, those the store gave the values of,
  * the heap fetches - the other rows, and the rows returned - and the set.
+ * When the values came from both, how many from each depends on the heap's
+ * page layout, which differs between majors: both counters then say "some".
  */
 CREATE FUNCTION lso_run(q text) RETURNS SETOF text
 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
+	lines text[] := '{}';
+	ranked bigint := NULL;
+	stored bigint := NULL;
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
@@ -237,8 +243,20 @@ BEGIN
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
 		IF ln ~ '(LionOrdered|Store|Order:|Rows Ranked|Heap Fetches|Rows Removed by|Lion Set)' THEN
-			RETURN NEXT btrim(regexp_replace(ln, '\s*\(actual.*\)', ''));
+			ln := btrim(regexp_replace(ln, '\s*\(actual.*\)', ''));
+			IF ln ~ '^Rows Ranked: ' THEN
+				ranked := substring(ln FROM '(\d+)$')::bigint;
+			ELSIF ln ~ '^Store Values: ' THEN
+				stored := substring(ln FROM '(\d+)$')::bigint;
+			END IF;
+			lines := lines || ln;
 		END IF;
+	END LOOP;
+	FOREACH ln IN ARRAY lines LOOP
+		IF stored > 0 AND stored < ranked AND ln ~ '^(Store Values|Heap Fetches): ' THEN
+			ln := regexp_replace(ln, '\d+$', 'some');
+		END IF;
+		RETURN NEXT ln;
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
@@ -271,7 +289,9 @@ PREPARE lso_lim(int) AS SELECT id FROM lso WHERE a = 3 ORDER BY c4 LIMIT $1;
 SELECT * FROM lso_plan('EXECUTE lso_lim(10)');
 DEALLOCATE lso_lim;
 RESET plan_cache_mode;
-SELECT * FROM lso_plan('SELECT lso.id FROM lso JOIN lso_g_vals v ON v.g = lso.g WHERE a = 3 ORDER BY c4 LIMIT 10');
+-- (the Sort above the join is the point; the join below it is core's, and
+-- its shape differs between majors)
+SELECT * FROM lso_plan('SELECT lso.id FROM lso JOIN lso_g_vals v ON v.g = lso.g WHERE a = 3 ORDER BY c4 LIMIT 10') LIMIT 3;
 RESET enable_seqscan; RESET enable_bitmapscan;
 RESET enable_indexscan; RESET enable_indexonlyscan;
 
@@ -437,7 +457,10 @@ INSERT INTO lsa SELECT i, i % 5, repeat(md5(i::text), 62), repeat('f', 100)
 INSERT INTO lsa SELECT i, i % 5, 'short ' || i FROM generate_series(401, 900) i;
 CREATE INDEX lsa_g ON lsa USING lion (g) INCLUDE (s);
 VACUUM (FREEZE, ANALYZE) lsa;
-SELECT count(*) AS rows, count(*) FILTER (WHERE st IS NULL) AS absent
+-- (how many rows the ABSENT pages hold depends on the heap's page layout,
+-- which differs between majors)
+SELECT count(*) AS rows, count(*) FILTER (WHERE st IS NULL) > 0 AS some_absent,
+	   count(*) FILTER (WHERE st IS NOT NULL) > 0 AS some_stored
   FROM (SELECT (lion_index_stored('lsa_g', ctid))[1] AS st FROM lsa WHERE g = 2) x;
 SELECT lso_cmp('lsa', 'g = 2', 's LIMIT 5', 'md5(s)');
 SELECT lso_cmp('lsa', 'g = 2', 's DESC LIMIT 5', 's');
