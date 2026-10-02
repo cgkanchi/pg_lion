@@ -87,8 +87,9 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_basic WHERE t1000 = 'key 7';
 RESET enable_indexscan;
 RESET enable_seqscan;
 
--- 2 distinct values: one container per 64 heap blocks each - a NARROW
--- (DESIGN.md §38), the rows being 81 to a page; bitset.sql has BITSETs.
+-- 2 distinct values: one container per 64 heap blocks each - a NARROW of
+-- width 2 (DESIGN.md §38), the rows being 81 to a page; bitset.sql has wider
+-- ones, and BITSETs.
 SELECT lion_cmp('lion_basic', 'b2');
 SELECT lion_cmp('lion_basic', 'NOT b2');
 -- 10 distinct values

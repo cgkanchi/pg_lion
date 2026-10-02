@@ -453,19 +453,18 @@ DROP TABLE lgw;
 -- ---------- 7. a collection past a hash table's memory ----------
 /*
  * x and y in no order, four values each: x IN (0, 1, 2) AND y IN (0, 1, 2)
- * is 9/16 of the rows, a bitset at each of some twenty container keys - over
- * 80 kB, which 64 kB of work_mem does not hold.  The rows are narrow, 185 to
- * a page (pad is empty until the update below), so that the blocks hold
- * offsets past 127 and no container key can be a NARROW (DESIGN.md §38),
- * which would put the whole collection in some 21 kB.  The collection spills
- * to a temporary file, and the groups are counted against the file.
+ * is 9/16 of the rows, a bitmap at each of some fifty container keys.  The
+ * rows are 185 to a page (pad is empty until the update below), and each is
+ * a NARROW of width 3 (DESIGN.md §38), 1.5 kB - over 78 kB in all, which
+ * 64 kB of work_mem does not hold.  The collection spills to a temporary
+ * file, and the groups are counted against the file.
  */
 CREATE TABLE lgw_s (g int NOT NULL, x int NOT NULL, y int NOT NULL,
 					pad text NOT NULL)
 	WITH (autovacuum_enabled = off);
 INSERT INTO lgw_s
 SELECT i % 20, hashint4(i) & 3, hashint4(i + 1000000) & 3, ''
-  FROM generate_series(1, 240000) i;
+  FROM generate_series(1, 600000) i;
 CREATE INDEX lgw_s_g ON lgw_s USING lion (g);
 CREATE INDEX lgw_s_x ON lgw_s USING lion (x);
 CREATE INDEX lgw_s_y ON lgw_s USING lion (y);
@@ -502,12 +501,10 @@ DROP TABLE lgw_s;
  * "The groups of a walk, counted together"): at most 256 groups, fewer when
  * work_mem holds fewer cursors.  g has 600 groups, and NULL, of about 14
  * rows a container key each - ARRAYs; k 300 and no NULL; h two, RUNs; a is
- * every other row, so that a WHERE of `a = 1` alone is a BITSET at each key;
+ * every other row, so that a WHERE of `a = 1` alone is a bitmap at each key;
  * b three values, r scattered over 997, all three on one multicolumn index.
- * The rows are narrow, 136 to a page (pad is empty until the update below),
- * so that the blocks hold offsets past 127 and a's sets cannot be NARROWs
- * (DESIGN.md §38), which the groups would be tested against through an
- * image instead.  Seven container keys.
+ * The rows are 136 to a page (pad is empty until the update below), and a's
+ * bitmaps are NARROWs of width 3 (DESIGN.md §38).  Seven container keys.
  */
 CREATE TABLE lgw_b (g int, k int NOT NULL, h int NOT NULL, a int NOT NULL,
 					b int NOT NULL, r int NOT NULL, pad text NOT NULL)
@@ -529,7 +526,8 @@ SELECT lgw_check('SELECT g, count(*) FROM lgw_b WHERE a = 1 AND b = 2 GROUP BY g
  pushed down, collected 1, spilled 0, batches 3, several rows
 (1 row)
 
--- the WHERE a BITSET at every key, which the groups are tested against as it is
+-- the WHERE a NARROW at every key, which the groups are tested against through
+-- an image of it
 SELECT lgw_check('SELECT g, count(*) FROM lgw_b WHERE a = 1 AND b IN (0, 1, 2) GROUP BY g');
                           lgw_check                           
 --------------------------------------------------------------
