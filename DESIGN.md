@@ -18032,3 +18032,116 @@ refused, so `multicolumn` and `options` changed.
   are per page; the heap's extension lock is held across the WAL records of a cleanup that frees
   windows (only after a truncation); inserts into the middle of an old window split by halves and
   can leave half-full pages behind; `lion_index_stats()` reads every store page.
+
+### As built: Phase B, index-only scans (2026-10-02)
+
+What Phase B built for `amcanreturn` and `amgettuple`, and where it departs from "Index-only
+scans" above.
+
+**`amcanreturn`** (`lioncanreturn()`, `lion_am.c`) is `LionStoreCol.returnable` from the cached
+relation state: true for every INCLUDE column and every key column under `store_values` whose
+stored type is the index column's. A multi-key column is never stored and so never returned. A
+citext key column IS returnable: `citext_ops` has no storage type, and the store holds each row's
+own spelling (`store_ios.sql` shows `'Alice'`, `'ALICE'` and `'alice'` returned for
+`name = 'alice'`). A partitioned index has no pages: false there (get_relation_info() asks it too).
+
+**The tuple** is a heap tuple, `xs_hitup`, over a descriptor of each index column's own type -
+the heap column's, or the expression's - which is what the executor's scan slot is built from, and
+not `index_form_tuple()` over `xs_itupdesc`: that would compress every value past 512 bytes, row
+after row, refuse one past 8 kB, and has the opclass storage type where a heap-supplied value of
+the column's type goes. Columns the index does not return are NULL.
+
+**Where the values come from** (`LionIosState`, `lion_scan.c`), decided per batch - one container
+of the source, one window's members - right after it is loaded:
+
+- the store, for a batch the §9 interlock covers: the gather runs for every returnable column
+  under the pin the batch keeps (`xs_want_itup` turns dropPin off), one reader a column, opened by
+  the scan's first batch and reset per batch. `lion_source_interlocked()` says whether a batch has
+  the pin: SETS and LIST through `lion_source_pinned()` of the (batch's) tree, a WALK always, a
+  UNION and a WINDOW never;
+- the heap, fetched by the scan under its snapshot (`heap_hot_search_buffer()`, which takes the
+  serializable checks and the tuple's predicate lock), for a heap page the gather reports absent,
+  for every TID of a batch without the interlock, and for every TID of every batch where the scan
+  looked TIDs up in the heap before: a UNION, and a hot standby over a generic-mode index. The
+  values are `FormIndexDatum()` of the visible version; an invisible TID is skipped;
+- the heap too, for every TID, when the scan would recheck (`xs_recheck`) a key column it does
+  not return - the executor evaluates the recheck on the tuple handed to it. The planner does not
+  build such a path (below); this is the fallback that keeps one correct.
+
+A multi-key query's sets are no longer released before the scan when it is an index-only scan:
+they keep their leaf pins as far as the list pin budget goes
+(`lion_posting_set_lookup_budgeted_col()`), and a set past it, NOPIN, takes the batches it
+contributes to through the heap instead of setting the recheck. What the sets answer exactly
+(`LION_QMODE_KEYS`) is not rechecked by an index-only scan - the bitmap scan already trusts it -
+while mode ALL still is.
+
+**The planner** (`lion_ios_paths()`, `lion_selfuncs.c`): core builds an index-only path only when
+every column the query reads, its WHERE clause included, is returnable (`check_index_only()`), so
+`SELECT inc FROM t WHERE tags && '{a,b}'` never got one. lion's `set_rel_pathlist_hook` builds it:
+the key columns a restriction clause names, the output does not and the index cannot return are
+relaxed in a copy of the IndexOptInfo, `create_index_paths()` runs on a scratch copy of the
+relation that sees only the copies (no join clauses, no parallelism, as LionOrdered builds its
+lion side), and an index-only path is kept when every clause naming a relaxed column is one of its
+index clauses, not lossy, and the scan answers its quals with no recheck and not by a UNION
+(`lion_index_only_exact()`, from `lion_plain_scan_shape()`). The copy stays the path's index:
+createplan marks what it cannot return resjunk, and setrefs resolves the plan's recheck quals
+against the rest, relaxed columns among them. Unparameterized paths only; none for a relation an
+UPDATE, a DELETE or a row mark reads, nor for a query that needs no column.
+
+**The cost rule as implemented** (`lion_plain_heap_correlation()`, `lion_amcost.c`). An index-only
+scan that returns no column - `count(*)` - is priced as before. One that returns stored columns is
+the plain scan of its shape - the bitmap-like heap side of §29.11, its rechecks, its row and pass
+charges - with the heap's pages and per-row fetches scaled by `1 - allvisfrac`, as `cost_index()`
+scales its own ends for an index-only scan (a UNION is not scaled: the scan fetches every TID
+itself), plus the gather:
+
+    G = rows × nret × store_value_cost
+      + windows × nret × max(1, store_pages / (W × nstored)) × store_page_cost
+
+with nret the returnable stored columns (all of them: the AM is not told which the query reads),
+W the heap's windows (pages / 64), store_pages from the meta page, and windows the windows the
+batches touch - Cardenas's count of `rows` over W, interpolated to the share the rows cover by the
+column's correlation squared, once per pass of a WALK. The gather is not the index's own cost: the
+bitmap scan of the same IndexPath is charged that and gathers nothing. It rides on the correlation
+handed to `cost_index()`, and what that cannot carry - nearly all of it on a mostly all-visible
+table, where both of `cost_index()`'s ends are near zero - is the remainder
+(`lion_plain_note_remainder()`), now noted for parameterized index-only paths too and charged by
+the hook to every index-only path in the relation's list, and to the hook's own before
+`add_path()`. A LIST's heap side stays `cost_index()`'s; its gather is the remainder. No margin
+is applied: the plain scan this extends applies none.
+
+**Tests.** `test/sql/store_ios.sql`: a scalar key under `store_values` with INCLUDE columns (NULL
+keys and values, a "C"-collated text column, values of 1,800 bytes); an array column's `&&`,
+`@>` and `IS NULL`, with a filter on a returned column; a tsvector's `@@` of `&` and `|`;
+`store_max_len`; ABSENT heap pages (and a walk that the planner keeps on the plain scan); a
+multi-key query past the pin budget of a temporary table (12 leaves), whose batches go to the
+heap; the plans taken for `SELECT *`, the array column in the output, `<@`, `@> '{}'`, `!` and a
+prefix; citext. Each answer is compared row by row, as its text spelling, with a sequential
+scan's: clean, with updates and deletes not vacuumed (`Heap Fetches` > 0), and after VACUUM
+(`Heap Fetches: 0`). The recovery harness: three index-only queries over the two store indexes in
+`lion_rec_queries()` (checked after every crash and on the standby, and their node named
+`indexonly`), and `standby_index_only()` now returns stored columns - a scalar key with INCLUDE
+columns and INCLUDE columns under `&&` - on the standby against its sequential scan and the
+primary, clean, dirty and after VACUUM, in both WAL modes.
+
+**Plans that change.** No regression test's. In the recovery harness, `count(*)` and `GROUP BY`
+queries over `lion_rec` whose columns `lion_rec_st` stores now plan an index-only scan of it
+where the count pushdown answered before (its price is above the index-only scan's): `k4 = 3 AND b`, `k4 = 5 AND t = 'v13'`, `nn` grouped under `k4 = 7` and others. A test
+that wants LionCount over an index with stored columns now competes with that path.
+
+**What is left.**
+- The scan gathers every returnable stored column, whichever the query reads; an `INCLUDE` list
+  wider than the query pays for all of it.
+- The gather walks a window's chain from its head on every call, so a scattered result - a few
+  rows a window - reads most of each window's store pages: measured warm (release build, 2M rows,
+  52 a page), `k = 42` returning two INCLUDE columns beside a stored key read 7,443 buffers in
+  2.8 ms against the plain index scan's 2,005 in 0.9 ms, while `tags && '{t7,t8}'` (20,000 rows)
+  read 6,030 in 8.2 ms against 10,014 in 10.1 ms. At `store_page_cost` (8 operator costs) a store
+  page is priced as CPU, a heap page as I/O, so the planner prefers the index-only scan in both;
+  the constants' fit is Phase C's.
+- Parameterized index-only paths come only from core (every column they filter on returnable);
+  the hook builds unparameterized ones.
+- EXPLAIN says nothing of the batches that went to the heap (absent pages, NOPIN sets); core's
+  `Heap Fetches` counts only its own.
+- `README.md`'s "Nothing reads the store yet" paragraph and the store limitation in "Known
+  limitations" are left for the merge of the three readers.
