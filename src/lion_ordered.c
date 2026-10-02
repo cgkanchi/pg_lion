@@ -966,6 +966,50 @@ lo_rel_ok(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	return true;
 }
 
+#if PG_VERSION_NUM < 180000
+/*
+ * create_index_paths() on the scratch relation, on 16 and 17.  18 counts
+ * disabled nodes: a disabled kind of scan loses to an enabled one, and among
+ * paths all disabled the prices decide.  16 and 17 add disable_cost (1e10)
+ * to a disabled scan's price instead: the first holds, the second does not -
+ * every price is then within add_path()'s 1% fuzz of 1e10, and one path
+ * survives - so with both kinds off, as a query that forces lion's own paths
+ * sets them, an AND of two indexes lost to a scan of one with the other as
+ * its filter, and the store order, whose set must answer the whole WHERE,
+ * found no access that did (2026-10-02).  The candidates are then priced
+ * with both kinds on, which is what 18 compares, and the settings put back
+ * whatever happens.  Also adds the paths 18's matching builds for an OR of
+ * equalities, as the IN list it spells (lion_or_list_paths(), DESIGN.md
+ * §29.11): the lion side of `k = 1 OR k = 7` is then the lion side of
+ * `k IN (1, 7)`.
+ */
+static void
+lo_scratch_index_paths(PlannerInfo *root, RelOptInfo *scratch)
+{
+	bool		save_indexscan = enable_indexscan;
+	bool		save_bitmapscan = enable_bitmapscan;
+
+	if (!enable_indexscan && !enable_bitmapscan)
+	{
+		enable_indexscan = true;
+		enable_bitmapscan = true;
+	}
+	PG_TRY();
+	{
+		create_index_paths(root, scratch);
+		scratch->pathlist = list_concat(scratch->pathlist,
+										lion_or_list_paths(root, scratch,
+														   scratch->indexlist));
+	}
+	PG_FINALLY();
+	{
+		enable_indexscan = save_indexscan;
+		enable_bitmapscan = save_bitmapscan;
+	}
+	PG_END_TRY();
+}
+#endif
+
 /*
  * The lion accesses core builds for rel's restriction clauses less `exclude`:
  * create_index_paths() run on a scratch copy of rel that sees only its lion
@@ -1015,18 +1059,10 @@ lo_lion_accesses(PlannerInfo *root, RelOptInfo *rel, List *lionidx,
 	scratch->consider_parallel = false;
 	if (scratch->baserestrictinfo == NIL)
 		return NIL;
+#if PG_VERSION_NUM >= 180000
 	create_index_paths(root, scratch);
-
-#if PG_VERSION_NUM < 180000
-
-	/*
-	 * ... and the paths 18's matching builds for an OR of equalities, as the
-	 * IN list it spells (lion_or_list_paths(), DESIGN.md §29.11): the lion
-	 * side of `k = 1 OR k = 7` is then the lion side of `k IN (1, 7)`.
-	 */
-	scratch->pathlist = list_concat(scratch->pathlist,
-									lion_or_list_paths(root, scratch,
-													   scratch->indexlist));
+#else
+	lo_scratch_index_paths(root, scratch);
 #endif
 
 	foreach(lc, scratch->pathlist)
