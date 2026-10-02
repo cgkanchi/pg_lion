@@ -275,7 +275,7 @@ lion_new_buffer(Relation index, Relation heaprel, uint16 flags)
  * container page never has any other kind, because every delete there
  * compacts - that lies inside the page's item space at a MAXALIGNed offset,
  * the test lion_verify_itemid() makes, which is amcheck's; the type has to be
- * one of the four item kinds; the size the header gives has to fit both the
+ * one of the five item kinds; the size the header gives has to fit both the
  * line pointer's length and the largest legal item, and the line pointer may
  * claim no more beyond it than the growth slack an item can carry
  * (LION_ITEM_SLACK_BOUND, the rule lion_index_verify() applies); and a sparse
@@ -345,13 +345,20 @@ lion_page_item_fetch(Relation index, Page page, BlockNumber blkno,
 						lpoff, phdr->pd_upper, phdr->pd_special)));
 
 	item = (LionContainer *) PageGetItem(page, iid);
-	if (unlikely(item->type != LION_CT_ARRAY && item->type != LION_CT_BITSET &&
-				 item->type != LION_CT_RUN && item->type != LION_CT_SPARSE))
+	if (unlikely(!lion_container_type_valid(item->type) &&
+				 item->type != LION_CT_SPARSE))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lion index \"%s\": item %u on container page %u has type %u, which is no item kind",
 						RelationGetRelationName(index), off, blkno,
 						item->type)));
+	/* a NARROW's width, in its flags byte, sizes it (DESIGN.md §38) */
+	if (unlikely(!lion_container_width_valid(item)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": item %u on container page %u is a NARROW of width %u, not one of 1 .. %u",
+						RelationGetRelationName(index), off, blkno,
+						item->flags, (uint32) LION_NARROW_MAX_WIDTH)));
 
 	/* a RUN is sized by its run count, which follows the header */
 	if (item->type == LION_CT_RUN && lplen < LION_CONTAINER_HDRSZ + sizeof(uint16))
@@ -741,8 +748,13 @@ lion_item_alloc_size(const LionContainer *item, Size size)
 
 	Assert(size == lion_item_size(item));
 
-	/* A bitset is already the largest an item can be. */
-	if (item->type == LION_CT_BITSET)
+	/*
+	 * A bitset is already the largest an item can be, and a NARROW (DESIGN.md
+	 * §38) is the size it is whatever add() does to it in place: a member it
+	 * holds sets a bit, and one it does not widens it by at least 512 bytes
+	 * at 8K, a word of each block, which no slack an item carries would hold.
+	 */
+	if (item->type == LION_CT_BITSET || item->type == LION_CT_NARROW)
 		return size;
 
 	extra = size / LION_ITEM_SLACK_FRACTION;

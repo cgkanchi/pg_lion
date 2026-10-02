@@ -55,6 +55,11 @@
 # RUN it owns - one new run of one member each - until its leaf splits.
 # Deleting the 2nd and 4th row of every run later turns a RUN into an ARRAY
 # half again as large (~2970 bytes), which is what sends VACUUM to regrow.
+# The other rows take 97 keys from 100 on, ARRAYs of some 120 members a
+# container key, so that the build writes no NARROW and the index is version
+# 6, whose VACUUM makes that ARRAY: in a version 8 index it would make a
+# NARROW of width 4 (DESIGN.md §38), 2056 bytes, which the leaf's spare bytes
+# hold.
 
 setup
 {
@@ -69,12 +74,12 @@ setup
 	-- B and C: eight container keys, two leaves of four RUNs for key 1.
 	CREATE TABLE psr_right (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
 	INSERT INTO psr_right SELECT i,
-		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 2 END
+		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 100 + i % 97 END
 	  FROM generate_series(1, 14464 * 8) i;
 	CREATE INDEX psr_right_k ON psr_right USING lion (k);
 	CREATE TABLE psr_left (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
 	INSERT INTO psr_left SELECT i,
-		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 2 END
+		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 100 + i % 97 END
 	  FROM generate_series(1, 14464 * 8) i;
 	CREATE INDEX psr_left_k ON psr_left USING lion (k);
 
@@ -205,7 +210,7 @@ step b_check	{
 	SELECT container_pages FROM lion_index_stats('psr_right_k');
 	SELECT lion_index_verify('psr_right_k', true);
 	SELECT * FROM psr_counts('psr_right', 1);
-	SELECT * FROM psr_counts('psr_right', 2);
+	SELECT * FROM psr_counts('psr_right', 100);
 }
 
 # C. VACUUM's regrow on the flagged LEFT half.  The rows go to container key
@@ -226,7 +231,7 @@ step c_check	{
 	SELECT container_pages FROM lion_index_stats('psr_left_k');
 	SELECT lion_index_verify('psr_left_k', true);
 	SELECT * FROM psr_counts('psr_left', 1);
-	SELECT * FROM psr_counts('psr_left', 2);
+	SELECT * FROM psr_counts('psr_left', 100);
 }
 
 # D. An insert's root push-down cut short.  Right after it the root is an

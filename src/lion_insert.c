@@ -194,7 +194,8 @@ lion_segment_add(LionSegWork *w, uint32 ckey, uint16 lo)
 		if (!lion_container_add(w->cont, lo))
 			elog(ERROR, "lion index: duplicate member in sparse segment for container key %u",
 				 ckey);
-		lion_container_optimize(w->cont);
+		/* an insert makes no NARROW of anything else (DESIGN.md §38) */
+		lion_container_optimize_ext(w->cont, false);
 
 		lion_sparse_split_at(w->seg, ckey, w->left, w->right);
 
@@ -233,7 +234,7 @@ lion_segment_add(LionSegWork *w, uint32 ckey, uint16 lo)
 
 		(void) lion_segwork_buf(&w->cont);
 		(void) lion_sparse_extract(w->seg, only, w->cont);
-		lion_container_optimize(w->cont);
+		lion_container_optimize_ext(w->cont, false);
 		Assert(w->seg->cardinality == 0);
 
 		lion_sparse_init(w->left, ckey);
@@ -665,6 +666,12 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
  *			lion_container_add() would turn it into a bitset.
  *	RUN		when the item has room for one more run and the run count is
  *			below LION_RUN_MAX_NRUNS, for the same reason.
+ *	NARROW	when the member's offset is below 64 times its width, the ones
+ *			it has bits for (DESIGN.md §38); one past them widens it, to
+ *			the narrowest NARROW that holds the member.
+ *
+ * which is lion_container_inplace_need(), the table the redo of the record
+ * written here checks too.
  *
  * Returns false when the container cannot take the member without changing
  * its size on the page; then nothing has been done and the caller takes the
@@ -689,48 +696,30 @@ lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 	Page		p;
 	LionContainer *c;
 
-	switch (onpage->type)
-	{
-		case LION_CT_BITSET:
-			need = LION_CONTAINER_MAX_SIZE;
-			break;
+	need = lion_container_inplace_need(onpage, lo);
+	if (need == 0)
+		return false;			/* would change its representation */
 
-		case LION_CT_ARRAY:
-			if (onpage->cardinality >= LION_ARRAY_MAX_CARD)
-				return false;	/* would become a bitset */
-			need = lion_container_size(onpage) + sizeof(uint16);
-			break;
-
-		case LION_CT_RUN:
-			if (LION_RUN_NRUNS(onpage) >= LION_RUN_MAX_NRUNS)
-				return false;	/* would become a bitset */
-			need = lion_container_size(onpage) + sizeof(LionRun);
-
-			/*
-			 * A member that closes the one-value gap between two runs MERGES
-			 * them, and the container comes out a run SHORTER while the item
-			 * keeps its allotment.  In place, a stream of such inserts would
-			 * grow the unused tail of the item without bound; the slack an
-			 * item may carry is LION_ITEM_SLACK_BOUND, the rule VACUUM's
-			 * shrink-in-place already follows (DESIGN.md §4, §18).  So a
-			 * merge that would take the item past it is left to the general
-			 * path, which rewrites the item at its logical size plus normal
-			 * growth slack.  Nothing else shrinks a container in place: an
-			 * ARRAY and a new run only grow, an extended run and a BITSET
-			 * keep their size.
-			 */
-			if (lo > 0 && lo < LION_LO_MASK &&
-				lion_container_contains(onpage, (uint16) (lo - 1)) &&
-				lion_container_contains(onpage, (uint16) (lo + 1)) &&
-				!lion_container_contains(onpage, lo) &&
-				alloc > lion_container_size(onpage) - sizeof(LionRun) +
-				LION_ITEM_SLACK_BOUND)
-				return false;
-			break;
-
-		default:
-			return false;
-	}
+	/*
+	 * A member that closes the one-value gap between two runs MERGES them,
+	 * and the container comes out a run SHORTER while the item keeps its
+	 * allotment.  In place, a stream of such inserts would grow the unused
+	 * tail of the item without bound; the slack an item may carry is
+	 * LION_ITEM_SLACK_BOUND, the rule VACUUM's shrink-in-place already
+	 * follows (DESIGN.md §4, §18).  So a merge that would take the item past
+	 * it is left to the general path, which rewrites the item at its logical
+	 * size plus normal growth slack.  Nothing else shrinks a container in
+	 * place: an ARRAY and a new run only grow, an extended run, a BITSET and
+	 * a NARROW keep their size.
+	 */
+	if (onpage->type == LION_CT_RUN &&
+		lo > 0 && lo < LION_LO_MASK &&
+		lion_container_contains(onpage, (uint16) (lo - 1)) &&
+		lion_container_contains(onpage, (uint16) (lo + 1)) &&
+		!lion_container_contains(onpage, lo) &&
+		alloc > lion_container_size(onpage) - sizeof(LionRun) +
+		LION_ITEM_SLACK_BOUND)
+		return false;
 
 	if (alloc < need)
 		return false;

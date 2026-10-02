@@ -102,9 +102,9 @@ END $$;
  * - rows i and i + 60000, half the heap apart, so in two containers - in an
  * order unrelated to the key's; x has 10 values, the same for both rows of a
  * key, and t 7.  The pad spreads the rows over some 1700 heap pages, 27
- * container keys, so that a filter whose rows alternate is a copy of 27
- * bitsets of 4 kB each - where one keeping eight rows in every ten, as
- * x IN (0, ..., 7) does, is 27 run containers, a few times smaller.
+ * container keys, 70 rows to a page, so that a filter's copy is 27 NARROWs
+ * of 1 kB each (DESIGN.md §38), whether its rows alternate or keep eight in
+ * every ten, as x IN (0, ..., 7) does.
  */
 CREATE TABLE lion_pkf (id int NOT NULL, fk int8 NOT NULL, x int NOT NULL,
 					   t text NOT NULL, pad text);
@@ -257,19 +257,30 @@ FROM lion_pk_node('SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.p
 
 -- ---- 3. a copy spilled to a temporary file ------------------------------------
 -- The plan is made at the default work_mem, where the copy of the filters
--- fits and is chosen, and run at 64 kB, where it spills.  The filter here,
--- x IN (0, 1, 3, 5, 7), keeps rows that alternate, 60000 of them in 27
--- bitsets; the earlier sections' eight values keep runs of rows, whose run
--- containers would fit even in 64 kB.  Each count reads back from the file
+-- fits and is chosen, and run at 64 kB, where it spills.  lion_pkf's copies
+-- are NARROWs, 28 kB, which fit even in 64 kB; the fact here is lion_pkb,
+-- lion_pkf's rows without t, 65 to a page, and 240000 rows more whose keys
+-- no dimension row has.  The filter, x IN (0, 1, 3, 5, 7), keeps rows that
+-- alternate, 180000 of them in 87 NARROWs of width 2 (DESIGN.md §38), 1 kB
+-- each, some 90 kB.  Each count reads back from the file
 -- only the containers its key's set is sought to, one read each, never the
 -- copy: the file reads are no more than the keys' own containers, and the
 -- temporary blocks the node read no more than those reads and the one that
 -- keeps the copy's first container in memory.
+CREATE TABLE lion_pkb (id int NOT NULL, fk int8 NOT NULL, x int NOT NULL,
+					   pad text);
+INSERT INTO lion_pkb
+SELECT i, CASE WHEN i <= 120000 THEN (i * 7919) % 60000 + 1 ELSE 200000 + i END,
+	   i % 10, repeat('p', 75)
+FROM generate_series(1, 360000) i;
+CREATE INDEX lion_pkb_fk ON lion_pkb USING lion (fk);
+CREATE INDEX lion_pkb_x ON lion_pkb USING lion (x);
+VACUUM (FREEZE, ANALYZE) lion_pkb;
 SET plan_cache_mode = force_generic_plan;
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
 SET enable_nestloop = off;
-PREPARE lion_pk_big AS SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 3, 5, 7) AND d.region = 'r1';
+PREPARE lion_pk_big AS SELECT count(*) FROM lion_pkb f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 3, 5, 7) AND d.region = 'r1';
 EXECUTE lion_pk_big;
  count 
 -------
@@ -302,7 +313,7 @@ RESET enable_hashjoin;
 RESET enable_mergejoin;
 RESET enable_nestloop;
 SET pg_lion.enable_count_pushdown = off;
-SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 3, 5, 7) AND d.region = 'r1';
+SELECT count(*) FROM lion_pkb f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 1, 3, 5, 7) AND d.region = 'r1';
  count 
 -------
   6000
@@ -311,6 +322,7 @@ SELECT count(*) FROM lion_pkf f JOIN lion_pkd d ON f.fk = d.pk WHERE f.x IN (0, 
 RESET pg_lion.enable_count_pushdown;
 DEALLOCATE lion_pk_big;
 RESET plan_cache_mode;
+DROP TABLE lion_pkb;
 -- ---- 4. parallel plans --------------------------------------------------------
 -- each participant counts the keys its share of the child gives it, and the
 -- counters are the sums of all of them

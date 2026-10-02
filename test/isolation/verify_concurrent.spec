@@ -96,9 +96,12 @@ setup
 	INSERT INTO vr SELECT 'key' || g FROM generate_series(1, 10) g;
 	CREATE INDEX vr_k ON vr USING lion (k) WITH (inline_limit = 64);
 
+	/* Made before the rows, so that the inserts make its sets, as BITSETs,
+	 * a leaf each: a build would make NARROWs of width 4 (DESIGN.md §38),
+	 * three to a leaf, whose last leaf the writers below do not split. */
 	CREATE TABLE vp (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
-	INSERT INTO vp SELECT i, i % 2 FROM generate_series(1, 60000) i;
 	CREATE INDEX vp_k ON vp USING lion (k) WITH (inline_limit = 64);
+	INSERT INTO vp SELECT i, i % 2 FROM generate_series(1, 60000) i;
 
 	CREATE TABLE vq (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
 	INSERT INTO vq SELECT i, i % 4 FROM generate_series(1, 4000) i;

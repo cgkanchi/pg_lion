@@ -60,7 +60,7 @@
  * payload back into the bytes the entry already has rather than shrinking the
  * entry tuple, so that no other entry on the bucket page moves and the WAL
  * delta is the handful of bytes that changed (DESIGN.md §18).  No real item
- * has type 0 - the four item kinds are 1 .. 4 - so a zero item header is an
+ * has type 0 - the five item kinds are 1 .. 5 - so a zero item header is an
  * unambiguous end marker and the payload needs no length of its own.  The
  * same goes for a tail shorter than one header.
  */
@@ -87,10 +87,13 @@ lion_inline_fetch(const char *payload, Size paylen, Size *off, LionContainer *bu
 	memcpy(buf, payload + *off, peek);
 	if (buf->type == 0)
 		return 0;				/* the slack VACUUM left behind */
-	if (buf->type != LION_CT_ARRAY && buf->type != LION_CT_BITSET &&
-		buf->type != LION_CT_RUN && buf->type != LION_CT_SPARSE)
+	if (!lion_container_type_valid(buf->type) && buf->type != LION_CT_SPARSE)
 		elog(ERROR, "lion index: malformed inline item of type %u",
 			 buf->type);
+	/* a NARROW's width sizes it (DESIGN.md §38) */
+	if (!lion_container_width_valid(buf))
+		elog(ERROR, "lion index: malformed inline NARROW of width %u",
+			 buf->flags);
 	csize = lion_item_size(buf);
 	if (csize < LION_CONTAINER_HDRSZ || csize > LION_CONTAINER_MAX_SIZE ||
 		csize > avail)

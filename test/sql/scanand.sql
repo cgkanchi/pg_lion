@@ -346,24 +346,25 @@ DROP FUNCTION sca_rows(text);
 DROP FUNCTION sca_margin(text, text, boolean);
 
 -- ---------- 6. what the scans read: the count's pages ----------
--- d0 and d1 are half the rows each, at random: a bitset at every container
--- key, a posting page each.  b and c are 2% of the rows each, at every key,
--- and together only in the first two keys' rows and the last two's.  The
--- index lists the dense columns first, which is the order the scan's AND
--- node used to step and seek its children in: every page of d0 and d1 was
--- read, where the count, driven by c and giving up every key b rules out,
--- reads theirs at four keys.  Now the scans read what the count reads - its
--- index pages, the count's one visibility map page aside.
+-- d0 and d1 are half the rows each, at random: a NARROW of width 3
+-- (DESIGN.md §38) at every container key, five to a posting page.  b and c
+-- are 2% of the rows each, at every key, and together only in the first two
+-- keys' rows and the last two's.  The index lists the dense columns first,
+-- which is the order the scan's AND node used to step and seek its children
+-- in: every page of d0 and d1 was read, where the count, driven by c and
+-- giving up every key b rules out, reads theirs at four keys.  Now the scans
+-- read what the count reads - its index pages, the count's one visibility
+-- map page aside.  The rows are narrow, 157 to a page and 10048 to a
+-- container key.
 CREATE TABLE scb (id int NOT NULL, d0 int NOT NULL, d1 int NOT NULL,
-				  b int NOT NULL, c int NOT NULL, pad text);
+				  b int NOT NULL, c int NOT NULL);
 INSERT INTO scb
 SELECT i, (i * 2654435761 % 4294967296 / 65536) % 2,
 	   i * 2654435761 % 4294967296 / 2147483648,
-	   CASE WHEN i % 50 = 0 OR (i % 50 = 25 AND (i / 4480 < 2 OR i / 4480 >= 18))
+	   CASE WHEN i % 50 = 0 OR (i % 50 = 25 AND (i / 10048 < 2 OR i / 10048 >= 18))
 			THEN 1 ELSE 0 END,
-	   CASE WHEN i % 50 = 25 THEN 1 ELSE 0 END,
-	   repeat('x', 60)
-  FROM generate_series(1::bigint, 4480 * 20) i;
+	   CASE WHEN i % 50 = 25 THEN 1 ELSE 0 END
+  FROM generate_series(1::bigint, 10048 * 20) i;
 CREATE INDEX scb_l ON scb USING lion (d0, d1, b, c);
 VACUUM (FREEZE, ANALYZE) scb;
 SELECT attno, containers, bitset_containers, container_pages

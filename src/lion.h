@@ -362,9 +362,26 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * rows twice.  A build writes version 7 only when at least one key column has
  * summaries (summary_cols below), so an index built with `summaries = off`
  * stays readable by the builds before this one.
+ *
+ * Version 8 (DESIGN.md §38) is version 7 plus NARROW CONTAINERS: items of a
+ * fifth type, a bitset of the offsets below 64 * k of a container's heap
+ * blocks, k being the item's width, 1 .. LION_NARROW_MAX_WIDTH, in its
+ * header's flags byte.  It is an addition too - summary_cols says as before
+ * whether there are summaries, and every page and item of a version 6 or 7
+ * index reads as it did - and the number moves so that a build that
+ * predates NARROW refuses an index that has one rather than reporting it
+ * corrupt, or worse.  A build writes version 8 only when it has written a
+ * NARROW item; VACUUM makes a NARROW only in a version 8 index, and an insert
+ * makes one only of a NARROW, which it widens, so that an index of version 6
+ * or 7 stays one, readable by the builds before this one, until it is
+ * rebuilt.
  */
 #define LION_VERSION			6	/* the base format every index has */
 #define LION_VERSION_SUMMARIES	7	/* ... plus the summaries of §32 */
+#define LION_VERSION_NARROW		8	/* ... plus the NARROW items of §38 */
+
+/* May an index of this meta page's version hold NARROW items (§38)? */
+#define LION_META_ALLOWS_NARROW(meta)	((meta)->version >= LION_VERSION_NARROW)
 
 typedef struct LionMetaPageData
 {
@@ -1669,6 +1686,12 @@ extern void lion_meta_record_order(LionMetaPageData *meta, LionIndexState *ix);
  */
 extern void lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
 									   uint32 bucket_tids);
+
+/*
+ * ... and whether the build wrote a NARROW item (DESIGN.md §38), which makes
+ * the meta page version 8; after lion_meta_record_summaries().
+ */
+extern void lion_meta_record_narrow(LionMetaPageData *meta, bool narrow);
 
 /*
  * The distinct keys of each key column (DESIGN.md §33).  Fill in a count of

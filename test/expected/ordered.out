@@ -664,19 +664,35 @@ SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 ORDER BY k, id LIM
 ANALYZE lo;
 -- 10. A set that outgrows hash_mem at run time degrades to container keys
 --     and rechecks every member: planned at 64MB (a generic plan keeps it),
---     run at 64kB.
+--     run at 64kB.  Half of lo's rows, 49 to a page, is 32 NARROWs of
+--     width 1 (DESIGN.md §38), 17 kB, which 64kB holds; half of lon's 400000
+--     rows, 65 to a page, is 97 NARROWs of width 2, 1 kB each, which it
+--     does not.  (The pad puts the rows just past the 63 offsets of a
+--     NARROW of width 1, which makes a NARROW the largest for the rows it
+--     holds.)  Its first 600 rows have the smallest k, the rest a
+--     permutation.
+CREATE TABLE lon (id int PRIMARY KEY, k int, c2 int, pad text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lon
+SELECT i, CASE WHEN i <= 600 THEN i - 601 ELSE (i::bigint * 7919 % 400009)::int END,
+	   ((hashint8extended(i::bigint, 11) & 9223372036854775807) % 2)::int,
+	   repeat('x', 80)
+  FROM generate_series(1, 400000) i;
+CREATE INDEX lon_k_id ON lon (k, id);
+CREATE INDEX lon_c2 ON lon USING lion (c2);
+VACUUM (FREEZE, ANALYZE) lon;
 SET plan_cache_mode = force_generic_plan;
-PREPARE lo_big(int) AS SELECT id, k FROM lo WHERE c2 = $1 ORDER BY k, id LIMIT 20;
+PREPARE lo_big(int) AS SELECT id, k FROM lon WHERE c2 = $1 ORDER BY k, id LIMIT 20;
 SET enable_seqscan = off; SET enable_bitmapscan = off;
 SET enable_indexscan = off; SET enable_indexonlyscan = off;
 EXPLAIN (COSTS OFF) EXECUTE lo_big(1);
-              QUERY PLAN               
----------------------------------------
+               QUERY PLAN               
+----------------------------------------
  Limit
-   ->  Custom Scan (LionOrdered) on lo
-         Ordered By: lo_k_id
+   ->  Custom Scan (LionOrdered) on lon
+         Ordered By: lon_k_id
          Lion Cond: (c2 = $1)
-         Lion Indexes: lo_c2
+         Lion Indexes: lon_c2
 (5 rows)
 
 RESET enable_seqscan; RESET enable_bitmapscan;
@@ -686,38 +702,38 @@ SET hash_mem_multiplier = 1;
 -- the set built, as it always was before the lazy one (§30.4): it degrades
 SET pg_lion.enable_lazy_set = off;
 SELECT * FROM lion_ord_run('EXECUTE lo_big(1)');
-            lion_ord_run             
--------------------------------------
- ->  Custom Scan (LionOrdered) on lo
- Index Entries Walked: 33
- Lion Set Hits: 33
- Heap Fetches: 33
- Rows Removed by Lion Recheck: 13
- Lion Set: 33 containers, degraded
+             lion_ord_run             
+--------------------------------------
+ ->  Custom Scan (LionOrdered) on lon
+ Index Entries Walked: 27
+ Lion Set Hits: 27
+ Heap Fetches: 27
+ Rows Removed by Lion Recheck: 7
+ Lion Set: 97 containers, degraded
 (6 rows)
 
 SELECT lion_ord('EXECUTE lo_big(1)',
-				'SELECT id, k FROM lo WHERE c2 = 1 ORDER BY k, id LIMIT 20');
+				'SELECT id, k FROM lon WHERE c2 = 1 ORDER BY k, id LIMIT 20');
        lion_ord       
 ----------------------
  LionOrdered, 20 rows
 (1 row)
 
 RESET pg_lion.enable_lazy_set;
--- lazily: the twenty rows lie in the first few container keys, which is all
--- of the set that is made, and it stays exact
+-- lazily: the twenty rows lie in the first container key, which is all of
+-- the set that is made, and it stays exact
 SELECT * FROM lion_ord_run('EXECUTE lo_big(1)');
              lion_ord_run             
 --------------------------------------
- ->  Custom Scan (LionOrdered) on lo
- Index Entries Walked: 33
+ ->  Custom Scan (LionOrdered) on lon
+ Index Entries Walked: 27
  Lion Set Hits: 20
  Heap Fetches: 20
- Lion Set: lazy, 4 keys probed, exact
+ Lion Set: lazy, 1 keys probed, exact
 (5 rows)
 
 SELECT lion_ord('EXECUTE lo_big(1)',
-				'SELECT id, k FROM lo WHERE c2 = 1 ORDER BY k, id LIMIT 20');
+				'SELECT id, k FROM lon WHERE c2 = 1 ORDER BY k, id LIMIT 20');
        lion_ord       
 ----------------------
  LionOrdered, 20 rows
@@ -727,6 +743,7 @@ RESET hash_mem_multiplier;
 RESET work_mem;
 DEALLOCATE lo_big;
 RESET plan_cache_mode;
+DROP TABLE lon;
 -- 11. The plan choice, with nothing disabled: the node for a selective lion
 --     filter under ORDER BY a btree column LIMIT 10; core's ordered btree
 --     walk when the filter is unselective; no node for a large answer and

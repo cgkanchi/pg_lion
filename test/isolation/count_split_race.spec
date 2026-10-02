@@ -26,12 +26,12 @@
 # leaf of that key's posting tree.  The DELETE takes the OTHER key's rows out
 # of the front of the heap, which leaves free line pointers on those pages
 # without touching k = 1's containers at all; the INSERT then puts k = 1 rows
-# into them, so exactly the container keys that leaf owns grow - here from 770
-# members to about 1540 - until its five arrays no longer fit and it splits.
+# into them, so exactly the container keys that leaf owns grow - here from 480
+# members to about 960 - until its eight arrays no longer fit and it splits.
 #
 # k = 1 has 50,000 rows and loses none of them, so s1 must answer 50,000
 # however the pages move under it; `container_pages` before and after shows
-# that they really did move (26 leaves become 32), and the unpushed count
+# that they really did move (26 leaves become 34), and the unpushed count
 # afterwards is 60,000, which is those 50,000 plus the inserter's 10,000.
 
 setup
@@ -40,11 +40,15 @@ setup
 	CREATE EXTENSION IF NOT EXISTS pg_lion;
 	CREATE EXTENSION IF NOT EXISTS injection_points;
 	/* The padding is what makes a container key hold few enough rows for a
-	 * leaf to carry SEVERAL containers: five arrays of ~1550 bytes, so that
-	 * growing them is what splits the page rather than one bitset per leaf. */
-	CREATE TABLE psr (id int, k int NOT NULL, pad char(300));
-	INSERT INTO psr SELECT i, i % 2, '' FROM generate_series(1, 100000) i;
+	 * leaf to carry SEVERAL containers: arrays of ~970 bytes, so that
+	 * growing them is what splits the page rather than one bitset per leaf.
+	 * 15 rows a page, 480 of k = 1's a key.  The index is made before the
+	 * rows, so that the inserts make it, as ARRAYs: a build would make each
+	 * a NARROW of width 1 (DESIGN.md §38), 520 bytes, which an insert below
+	 * offset 64 does not grow. */
+	CREATE TABLE psr (id int, k int NOT NULL, pad char(480));
 	CREATE INDEX psr_k ON psr USING lion (k);
+	INSERT INTO psr SELECT i, i % 2, '' FROM generate_series(1, 100000) i;
 }
 
 teardown

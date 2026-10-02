@@ -658,13 +658,14 @@ CREATE FUNCTION lion_index_stats(idx regclass,
 									OUT summary_tids int8,
 									OUT summary_bytes int8,
 									OUT summary_pages int8,
-									OUT ndistinct int8)
+									OUT ndistinct int8,
+									OUT narrow_containers int8)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'lion_index_stats'
 LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 COMMENT ON FUNCTION lion_index_stats(regclass) IS
-	'shape of a lion index, one row per key column: directory shape, entries, containers by kind, sparse segments, posting trees, NULL keys and key-less rows, summary posting sets, and the distinct keys the planner is given';
+	'shape of a lion index, one row per key column: directory shape, entries, containers by kind (narrow_containers last, DESIGN.md §38), sparse segments, posting trees, NULL keys and key-less rows, summary posting sets, and the distinct keys the planner is given';
 
 /*
  * The ROOT block of one key's posting tree (DESIGN.md §22), NULL when the key
