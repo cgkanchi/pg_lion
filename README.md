@@ -607,6 +607,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `union_set_cost` | 100 | `cpu_tuple_cost` | a set of an `IN` list or `OR` rebuilt by each count of a GROUP BY |
 | `recheck_tid_cost` | 1.5 | `cpu_tuple_cost` | a candidate row of a count's heap recheck |
 | `recheck_group_tid_cost` | 6.0 | `cpu_tuple_cost` | the same in a grouped count |
+| `resident_page_cost` | 120 | `cpu_operator_cost` | a page of a Lion index a count reads while the index fits in `effective_cache_size` with the query's tables (DESIGN.md §39); a page that does not is priced as I/O, as before |
 | `entry_count_cost` | 50 | `cpu_tuple_cost` | a count of a GROUP BY: an entry, or a pair of two |
 | `list_group_cost` | 18 | `cpu_tuple_cost` | a count of a group an `IN` list drives |
 | `distinct_test_cost` | 50 | `cpu_tuple_cost` | a test of a `count(DISTINCT)` walk |
@@ -630,6 +631,40 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `fkjoin_sort_key_cost` | 6.0 | `cpu_operator_cost` | a key into and out of that sort |
 | `fkjoin_sort_seq_page_cost` | 0.75 | `seq_page_cost` | a page that sort writes or reads past `work_mem`, the sequential share |
 | `fkjoin_sort_random_page_cost` | 0.25 | `random_page_cost` | ... and the random share |
+
+Rate settings (DESIGN.md §39, "The competitor's units"). The cost settings above are fitted at 500
+cost units a millisecond, the rate of PostgreSQL's own sequential and index-only scans; its other
+plans run at rates of their own - a hash aggregate at about 200, a nested loop into a warm index at
+1,000 or more. A `LionCount`, `LionSemiJoin` or `LionAntiJoin` path is priced in the units of the
+cheapest PostgreSQL plan it competes with: its own price, pages and CPU alike, times that kind of
+plan's rate below, so its cost in `EXPLAIN` is that plan's units; which of its own forms Lion runs
+is decided before, in its own units. Set a rate to 1 to price Lion as fitted against that kind of
+plan; `SET client_min_messages = debug2` logs which kind each path was priced against, at which
+rate and margin. A plan forced with PostgreSQL's `enable_*` settings, with nothing of PostgreSQL's
+left enabled to compete with, is priced in Lion's own units. To read Lion's own cost units a
+millisecond when calibrating the cost settings above, force its plans that way, or set every rate
+below to 1. `bench/calib/matrix.py` measures each kind of plan's units a millisecond, and the
+planner's mispicks, on synthetic tables (DESIGN.md §39, "The matrix").
+
+| `pg_lion.` | default | the PostgreSQL plans it is the rate of, as a multiple of 500 units a millisecond |
+|---|---|---|
+| `hashagg_rate` | 0.42 | an aggregate that hashes |
+| `agg_rate` | 1.0 | a plain or sorted aggregate over a scan |
+| `hashjoin_rate` | 0.5 | a hash join |
+| `mergejoin_rate` | 1.0 | a merge join |
+| `nestloop_rate` | 2.0 | a nested loop into a parameterized index or bitmap scan |
+| `bitmap_rate` | 1.0 | a bitmap heap scan |
+
+`pg_lion.pushdown_margin` (1, no margin): the share of the cheapest competing plan's cost a Lion
+custom path (`LionCount`, `LionSemiJoin`, `LionAntiJoin`, `LionOrdered`) must be priced at to be
+chosen. Set below 1, its own price is divided by it, so a near tie goes to PostgreSQL's plan, and
+its cost in `EXPLAIN` is marked up by it. It is not applied where it hedges nothing: to a plan
+forced with nothing of PostgreSQL's left enabled, to a count whose cheapest competitor is the
+access method's own scan of a Lion index (both prices Lion's), and to a count whose multi-key query
+is a generic plan's parameter (priced at its dearest already). The default was 0.8 until the
+decision matrix found Lion the faster plan in most of its near ties, and every plan 0.8 moved
+moved to a slower one (DESIGN.md §39, "The margin"). PostgreSQL's `enable_*` settings and Lion's
+switches above still force a plan either way.
 
 ## Known limitations
 

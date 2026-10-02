@@ -39,6 +39,7 @@ extern PGDLLIMPORT double lion_descent_cost;
 extern PGDLLIMPORT double lion_union_set_cost;
 extern PGDLLIMPORT double lion_recheck_tid_cost;
 extern PGDLLIMPORT double lion_recheck_group_tid_cost;
+extern PGDLLIMPORT double lion_resident_page_cost;
 
 /* The count's walks: GROUP BY, count(DISTINCT), ranges (§20, §26, §28, §32) */
 extern PGDLLIMPORT double lion_entry_count_cost;
@@ -66,6 +67,26 @@ extern PGDLLIMPORT double lion_fkjoin_sort_compare_cost;
 extern PGDLLIMPORT double lion_fkjoin_sort_key_cost;
 extern PGDLLIMPORT double lion_fkjoin_sort_seq_page_cost;
 extern PGDLLIMPORT double lion_fkjoin_sort_random_page_cost;
+
+/*
+ * The units a lion path is priced in against the plan it competes with
+ * (DESIGN.md §39): the cost units a millisecond each kind of core plan runs
+ * at, as a multiple of the 500 that lion's CPU constants are fitted at (§10,
+ * "The reference").
+ */
+extern PGDLLIMPORT double lion_hashagg_rate;
+extern PGDLLIMPORT double lion_agg_rate;
+extern PGDLLIMPORT double lion_hashjoin_rate;
+extern PGDLLIMPORT double lion_mergejoin_rate;
+extern PGDLLIMPORT double lion_nestloop_rate;
+extern PGDLLIMPORT double lion_bitmap_rate;
+
+/*
+ * The share of a lion path's own price it is offered at (DESIGN.md §39, "The
+ * margin"): its price is divided by it, so that it must come to this share
+ * of the best core plan's to be chosen.  1 is no margin.
+ */
+extern PGDLLIMPORT double lion_pushdown_margin;
 
 extern void lion_costs_init(void);
 

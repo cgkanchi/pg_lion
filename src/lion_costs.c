@@ -15,8 +15,13 @@
  *		value the price was fitted or derived at: the comment above each
  *		macro is why it is that value.
  *
- *		This file holds nothing but the table of them and its registration,
- *		called from _PG_init.
+ *		The rates of DESIGN.md §39 are here too: the cost units a millisecond
+ *		of each kind of core plan, as a multiple of the reference the
+ *		multipliers are fitted at, which a lion path is priced in against
+ *		that kind of plan (lion_plan_units.c).
+ *
+ *		This file holds nothing but the tables of them and their
+ *		registration, called from _PG_init.
  *
  *-------------------------------------------------------------------------
  */
@@ -47,6 +52,7 @@ double		lion_descent_cost;
 double		lion_union_set_cost;
 double		lion_recheck_tid_cost;
 double		lion_recheck_group_tid_cost;
+double		lion_resident_page_cost;
 double		lion_entry_count_cost;
 double		lion_list_group_cost;
 double		lion_distinct_test_cost;
@@ -70,6 +76,13 @@ double		lion_fkjoin_sort_compare_cost;
 double		lion_fkjoin_sort_key_cost;
 double		lion_fkjoin_sort_seq_page_cost;
 double		lion_fkjoin_sort_random_page_cost;
+double		lion_hashagg_rate;
+double		lion_agg_rate;
+double		lion_hashjoin_rate;
+double		lion_mergejoin_rate;
+double		lion_nestloop_rate;
+double		lion_bitmap_rate;
+double		lion_pushdown_margin;
 
 typedef struct LionCostSetting
 {
@@ -125,6 +138,8 @@ static const LionCostSetting lion_cost_settings[] = {
 	 "Sets the planner's estimate of the cost of each candidate row of a lion count's heap recheck"},
 	{"pg_lion.recheck_group_tid_cost", &lion_recheck_group_tid_cost, 6.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each candidate row of a grouped lion count's heap recheck"},
+	{"pg_lion.resident_page_cost", &lion_resident_page_cost, 120.0, LION_OP,
+	 "Sets the planner's estimate of the cost of each page of a resident lion index that a lion count reads"},
 
 	/* lion_plan_cost.c: the count's walks (§20, §26, §28, §32) */
 	{"pg_lion.entry_count_cost", &lion_entry_count_cost, 50.0, LION_TUPLE,
@@ -178,11 +193,54 @@ static const LionCostSetting lion_cost_settings[] = {
 };
 
 /*
+ * THE COMPETITORS' UNITS (DESIGN.md §39).  Lion's CPU constants are fitted at
+ * 500 cost units a millisecond, the middle of core's sequential and
+ * index-only scans (§10, "The reference"); core's other plans run at rates
+ * of their own, and a lion path is priced in the units of the plan it
+ * competes with: its own price times that plan's rate over 500
+ * (lion_plan_units.c).  pg_lion.<kind>_rate is that ratio
+ * for one kind of core plan, its default what §10's table measured; a kind
+ * the table has too little of to say, or whose rate is the reference, is
+ * priced at 1, as before.  Sequential, index-only and plain index scans are
+ * the reference itself and have no setting.
+ */
+typedef struct LionRateSetting
+{
+	const char *name;			/* the setting */
+	double	   *variable;		/* the rate it holds */
+	double		boot;			/* its default */
+	const char *desc;			/* the plans it is the rate of */
+} LionRateSetting;
+
+static const LionRateSetting lion_rate_settings[] = {
+	/* §10: 208 and 157 units a millisecond at 200 and 20,000 groups */
+	{"pg_lion.hashagg_rate", &lion_hashagg_rate, 0.42,
+	 "a hashed aggregate"},
+	/* §10: 401 to 695 over sequential scans, 415 to 536 over index-only ones */
+	{"pg_lion.agg_rate", &lion_agg_rate, 1.0,
+	 "a plain or sorted aggregate over a scan"},
+	/* §10: 280 and 283 with 1,000 to 4,400 rows hashed, 185 at 140,000 */
+	{"pg_lion.hashjoin_rate", &lion_hashjoin_rate, 0.5,
+	 "a hash join"},
+	/* no measurement */
+	{"pg_lion.mergejoin_rate", &lion_mergejoin_rate, 1.0,
+	 "a merge join"},
+	/* §10: 1,057 into a btree; §31: about 2,000 over warm indexes */
+	{"pg_lion.nestloop_rate", &lion_nestloop_rate, 2.0,
+	 "a nested loop into a parameterized index or bitmap scan"},
+	/* §10: 544 to 4,419 page-bound; §22: about 70 TID-bound - no one rate */
+	{"pg_lion.bitmap_rate", &lion_bitmap_rate, 1.0,
+	 "a bitmap heap scan"},
+};
+
+/*
  * Register the settings, from _PG_init.  They are user settings, real-valued
  * from 0 to DBL_MAX as core's cost settings are, and shown by EXPLAIN
  * (SETTINGS) when changed.  pg_settings lists them among the customized
  * options, as it does every extension's: no API puts a custom setting in one
  * of core's groups, and core's own records are not an extension's to edit.
+ * The rates are ratios, from a thousandth to a thousand: a rate of 0 would
+ * make lion's CPU free.
  */
 void
 lion_costs_init(void)
@@ -206,6 +264,40 @@ lion_costs_init(void)
 								 GUC_EXPLAIN,
 								 NULL, NULL, NULL);
 	}
+
+	for (i = 0; i < (int) lengthof(lion_rate_settings); i++)
+	{
+		const LionRateSetting *s = &lion_rate_settings[i];
+
+		DefineCustomRealVariable(s->name,
+								 psprintf("Sets the planner's estimate of the cost units a millisecond of %s, as a multiple of the rate lion's CPU costs are fitted at.",
+										  s->desc),
+								 "A lion custom path's own price is this multiple of its fitted price against the cheapest core plan of this kind (DESIGN.md §39); 1 prices it as fitted.",
+								 s->variable,
+								 s->boot,
+								 0.001, 1000.0,
+								 PGC_USERSET,
+								 GUC_EXPLAIN,
+								 NULL, NULL, NULL);
+	}
+
+	/*
+	 * THE MARGIN (DESIGN.md §39): a lion custom path's own price, converted
+	 * into its competitor's units, is divided by it - so that below 1 a lion
+	 * path is chosen only where its price is at most this share of the best
+	 * core path's, and a near tie goes to core.  1, no margin, by default:
+	 * §39's matrix found lion the faster plan in most of its near ties, and
+	 * every plan a margin moved moved to a slower one.
+	 */
+	DefineCustomRealVariable("pg_lion.pushdown_margin",
+							 "Sets the share of the cheapest competing plan's cost a lion custom path's own price must come to for it to be chosen.",
+							 "The price of a LionCount, LionSemiJoin, LionAntiJoin or LionOrdered path is divided by it (DESIGN.md §39); 1 is no margin.",
+							 &lion_pushdown_margin,
+							 1.0,
+							 0.01, 1.0,
+							 PGC_USERSET,
+							 GUC_EXPLAIN,
+							 NULL, NULL, NULL);
 
 	MemoryContextSwitchTo(oldcxt);
 }

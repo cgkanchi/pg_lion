@@ -74,6 +74,9 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		lion_prev_create_upper_paths_hook(root, stage, input_rel, output_rel,
 										 extra);
 
+	/* a competitor pinned by a hook an error left (§39) is never read */
+	lion_units_unpin();
+
 	if (stage != UPPERREL_GROUP_AGG)
 		return;
 	if (!lion_enable_count_pushdown)
@@ -86,6 +89,13 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	 */
 	if (lion_old_snapshot_threshold_active())
 		return;
+
+	/*
+	 * Every lion path added below is priced against the core path that is
+	 * cheapest now, before the first of them can free it (§39,
+	 * lion_units_pin()).
+	 */
+	lion_units_pin(output_rel);
 
 	/*
 	 * A join may be the FK-side join of DESIGN.md §27: of two tables, either
@@ -103,6 +113,7 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		for (i = 0; i < nfj; i++)
 			lion_try_count_path(root, input_rel, output_rel,
 							   (GroupPathExtraData *) extra, &fj[i]);
+		lion_units_unpin();
 		return;
 	}
 
@@ -114,6 +125,7 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	{
 		lion_try_count_path(root, input_rel, output_rel,
 						   (GroupPathExtraData *) extra, NULL);
+		lion_units_unpin();
 		return;
 	}
 	PG_TRY();
@@ -126,6 +138,7 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		lion_probe_end();
 	}
 	PG_END_TRY();
+	lion_units_unpin();
 }
 
 /*
@@ -151,6 +164,7 @@ lion_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 	if (lion_prev_set_join_pathlist_hook != NULL)
 		lion_prev_set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
 										 jointype, extra);
+	lion_units_unpin();
 
 	if (!lion_enable_count_pushdown || !lion_enable_semijoin)
 		return;
@@ -161,7 +175,9 @@ lion_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 	if (!lion_fkjoin_recognize_join(root, joinrel, outerrel, innerrel,
 									jointype, extra, &fj))
 		return;
+	lion_units_pin(joinrel);
 	lion_try_count_path(root, innerrel, joinrel, NULL, &fj);
+	lion_units_unpin();
 }
 
 /*
