@@ -239,6 +239,24 @@ typedef struct LionCountPathBuild
 	int			topkcand;		/* ... the candidates its walk keeps */
 	double		topkrows;		/* ... and the rows of their entries */
 	bool		topkstrict;		/* ... every group tied with the k-th */
+
+	/*
+	 * The gather of the window store (DESIGN.md §40, "The custom shapes"): a
+	 * path that counts what count(*) under the same WHERE counts and forms
+	 * its own groups and aggregates of the values of stored columns
+	 * (lion_try_store_path()).  ngroup stays 0: nothing is walked by group.
+	 */
+	bool		store;
+	List	   *storeattnos;	/* the columns gathered, in the heap */
+	List	   *storegroups;	/* {position, equality, collation} each */
+	List	   *storegroupvars; /* ... and the GROUP BY columns themselves */
+	List	   *storedistvars;	/* the columns a count(DISTINCT) counts */
+	int			storenaggs;		/* aggregates over gathered columns */
+	IndexOptInfo *storeidx;		/* the index whose store holds them */
+	List	   *storeidxcols;	/* ... and their columns there */
+	double		storegroupest;	/* the groups the rows fall into */
+	double		storepairs;		/* ... and the (group, value) pairs of
+								 * every count(DISTINCT) */
 } LionCountPathBuild;
 
 /*
@@ -1294,6 +1312,155 @@ lion_count_path_wagg(LionCountPathBuild *cx, AttrNumber attno)
 }
 
 /*
+ * The position of heap column attno among the columns the path gathers
+ * (DESIGN.md §40), which it is added to if it is not there yet.
+ */
+static int
+lion_store_column(LionCountPathBuild *cx, AttrNumber attno)
+{
+	int			pos = 0;
+	ListCell   *lc;
+
+	foreach(lc, cx->storeattnos)
+	{
+		if ((AttrNumber) lfirst_int(lc) == attno)
+			return pos;
+		pos++;
+	}
+	cx->storeattnos = lappend_int(cx->storeattnos, (int) attno);
+	return pos;
+}
+
+/*
+ * GROUP BY for the gather (DESIGN.md §40, "The custom shapes"): any number
+ * of plain columns of the table, each gathered and hashed by the node -
+ * under the grouping clause's own equality, which therefore needs a hash
+ * function, and the column's collation, as core's HashAggregate would hash
+ * it.  Nothing about indexes yet: whether the columns are stored is asked
+ * once every column the node gathers is known (lion_try_store_path()).  A
+ * GROUP BY the planner folded to constants is singlegroup, as for every
+ * other path.
+ */
+static bool
+lion_count_path_store_group_by(LionCountPathBuild *cx)
+{
+	PlannerInfo *root = cx->root;
+	ListCell   *lc;
+
+	if (root->processed_groupClause == NIL)
+	{
+		cx->singlegroup = (cx->parse->groupClause != NIL);
+		return true;
+	}
+	foreach(lc, root->processed_groupClause)
+	{
+		SortGroupClause *sgc = (SortGroupClause *) lfirst(lc);
+		TargetEntry *tle = get_sortgroupclause_tle(sgc, root->processed_tlist);
+		RegProcedure hashfn;
+		Var		   *v;
+
+		if (tle == NULL || !IsA(tle->expr, Var))
+			return false;
+		v = (Var *) tle->expr;
+		if (v->varno != (int) cx->rti || v->varattno <= 0 ||
+			v->varlevelsup != 0)
+			return false;
+		if (list_member_int(cx->storeattnos, (int) v->varattno))
+			return false;
+		if (!OidIsValid(sgc->eqop) ||
+			!get_op_hash_functions(sgc->eqop, &hashfn, NULL))
+			return false;
+		cx->storegroups =
+			lappend(cx->storegroups,
+					list_make3_int(lion_store_column(cx, v->varattno),
+								   (int) sgc->eqop,
+								   (int) exprCollation((Node *) v)));
+		cx->storegroupvars = lappend(cx->storegroupvars, v);
+	}
+	return true;
+}
+
+/*
+ * lion_count_path_outputs() for the gather: every expression of checkexprs
+ * is a GROUP BY column, a column a clause pins (printed from its entry, as
+ * every count path prints it), a count the group's rows answer - count(*),
+ * or a count(col) lion_agg_is_count() says is one - or an aggregate over a
+ * column the node gathers (lion_store_agg_classify()).  Something has to be
+ * gathered: a target list of counts alone is the ordinary count's.
+ */
+static bool
+lion_count_path_store_outputs(LionCountPathBuild *cx)
+{
+	PlannerInfo *root = cx->root;
+	RelOptInfo *input_rel = cx->input_rel;
+	Index		rti = cx->rti;
+	bool		haveagg = false;
+	ListCell   *lc;
+
+	foreach(lc, cx->checkexprs)
+	{
+		Node	   *node = (Node *) lfirst(lc);
+
+		if (IsA(node, Var))
+		{
+			Var		   *v = (Var *) node;
+			ListCell   *lg;
+			bool		grouped = false;
+
+			if (v->varno != (int) rti || v->varattno <= 0 ||
+				v->varlevelsup != 0)
+				return false;
+			foreach(lg, cx->storegroupvars)
+			{
+				if (((Var *) lfirst(lg))->varattno == v->varattno)
+					grouped = true;
+			}
+			if (grouped)
+				continue;
+			if (list_member_int(cx->eqattnos, (int) v->varattno))
+			{
+				if (!list_member_int(cx->valueattnos, (int) v->varattno))
+					cx->valueattnos = lappend_int(cx->valueattnos,
+												  (int) v->varattno);
+			}
+			else if (!list_member_int(cx->nullattnos, (int) v->varattno))
+				return false;
+		}
+		else if (IsA(node, Aggref))
+		{
+			Aggref	   *agg = (Aggref *) node;
+			AttrNumber	attno;
+			int			width;
+			Oid			eqop;
+			Oid			coll;
+			int			kind;
+
+			/* the group's own rows, which the count answers */
+			if (lion_agg_is_count(root, agg, rti, input_rel, NULL, 0,
+								  cx->nonnullattnos, cx->nullattnos))
+			{
+				haveagg = true;
+				continue;
+			}
+			kind = lion_store_agg_classify(agg, rti, &attno, &width, &eqop,
+										   &coll);
+			if (kind == LION_SAGG_NONE)
+				return false;
+			(void) lion_store_column(cx, attno);
+			cx->storenaggs++;
+			if (kind == LION_SAGG_DISTINCT)
+				cx->storedistvars =
+					lappend(cx->storedistvars,
+							lion_strip((Node *) ((TargetEntry *) linitial(agg->args))->expr));
+			haveagg = true;
+		}
+		else
+			return false;
+	}
+	return haveagg && cx->storeattnos != NIL;
+}
+
+/*
  * Every expression of checkexprs has to be one the node produces: a grouping
  * column, a column a clause pins, or a count the posting sets answer - and
  * there has to be a count.  Notes the columns printed (groupvalueout,
@@ -1308,6 +1475,10 @@ lion_count_path_outputs(LionCountPathBuild *cx)
 	bool		haveagg = false;
 	int			g;
 	ListCell   *lc;
+
+	/* ... or one the node forms of the values it gathers (DESIGN.md §40) */
+	if (cx->store)
+		return lion_count_path_store_outputs(cx);
 
 	foreach(lc, cx->checkexprs)
 	{
@@ -2481,6 +2652,22 @@ lion_count_path_make(LionCountPathBuild *cx)
 	}
 	else
 		cpath->custom_private = lappend(cpath->custom_private, NIL);
+
+	/*
+	 * The columns gathered from the window store (DESIGN.md §40), and the
+	 * GROUP BY formed of them; lion_plan_custom_path() adds the aggregates.
+	 */
+	if (cx->store)
+	{
+		Assert(cx->storeidx != NULL && cx->storeattnos != NIL);
+		cpath->custom_private =
+			lappend(cpath->custom_private,
+					list_make4(list_make1_oid(cx->storeidx->indexoid),
+							   cx->storeattnos, cx->storeidxcols,
+							   cx->storegroups));
+	}
+	else
+		cpath->custom_private = lappend(cpath->custom_private, NIL);
 	cpath->methods = &lion_count_path_methods;
 
 	return cpath;
@@ -2559,6 +2746,17 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 							  LION_RANGED_NONE) :
 							 cx->sumall ? LION_RANGED_SUM : LION_RANGED_WALK,
 							 cx->rangesel, &rangeprice);
+	/*
+	 * The gather of the window store (DESIGN.md §40): the count above, and the
+	 * values of its rows read and grouped.
+	 */
+	if (cx->store)
+		lion_cost_store_path(root, cpath, input_rel, cx->storeidx,
+							 list_length(cx->storeattnos),
+							 list_length(cx->storegroups),
+							 cx->storegroupest, cx->outrows, cx->storenaggs,
+							 list_length(cx->storedistvars), cx->storepairs);
+
 	/*
 	 * The aggregates over lion columns' entries (DESIGN.md §37): their walks,
 	 * after - or, with no count in the target list, instead of - the sum over
@@ -2675,9 +2873,10 @@ lion_count_path_decodable(LionCountPathBuild *cx)
 }
 
 /*
- * Decide whether count(*) over input_rel can be answered from roaring
- * posting sets and, if so, add a CustomPath to output_rel.  Every failed
- * check simply returns: the normal plan is always available.
+ * The walks' half of lion_try_count_path(): decide whether count(*) over
+ * input_rel can be answered from roaring posting sets and, if so, add a
+ * CustomPath to output_rel.  Every failed check simply returns: the normal
+ * plan is always available.
  *
  * fj is the FK-side join of DESIGN.md §27, or NULL.  With it, input_rel is
  * the JOIN rel and everything below about "the relation" - its WHERE clauses
@@ -2688,8 +2887,8 @@ lion_count_path_decodable(LionCountPathBuild *cx)
  * or returns false to end it there: a check that failed, or the FK-side join
  * taking over.
  */
-void
-lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
+static void
+lion_try_walk_path(PlannerInfo *root, RelOptInfo *input_rel,
 				   RelOptInfo *output_rel, GroupPathExtraData *extra,
 				   const LionFkJoin *fj)
 {
@@ -2746,4 +2945,151 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		cpath = lion_count_path_make(&cx);
 		lion_count_path_add(&cx, cpath);
 	}
+}
+
+/*
+ * The memory the gather's groups take (DESIGN.md §40): a group's keys and
+ * aggregate states and its place in the hash table, and a count(DISTINCT)'s
+ * values, at the columns' average widths.  The node keeps them all until it
+ * has counted every row - it has no spill - so a path whose groups would
+ * not fit in hash_mem is not made.
+ */
+static double
+lion_store_hash_bytes(LionCountPathBuild *cx)
+{
+	double		pergroup = 64.0 + 48.0 * cx->storenaggs;
+	double		perpair = 48.0;
+	ListCell   *lc;
+
+	foreach(lc, cx->storegroupvars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+		int32		w = get_attavgwidth(cx->rte->relid, v->varattno);
+
+		if (w <= 0)
+			w = get_typavgwidth(v->vartype, v->vartypmod);
+		pergroup += 16.0 + w;
+	}
+	foreach(lc, cx->storedistvars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+		int32		w = get_attavgwidth(cx->rte->relid, v->varattno);
+
+		if (w <= 0)
+			w = get_typavgwidth(v->vartype, v->vartypmod);
+		perpair = Max(perpair, 48.0 + w);
+	}
+	return cx->storegroupest * pergroup + cx->storepairs * perpair;
+}
+
+/*
+ * THE GATHER OF THE WINDOW STORE (DESIGN.md §40, "The custom shapes"):
+ * `count(DISTINCT x)`, `GROUP BY x` and sum, avg, min and max of x, x a
+ * column some lion index stores - a key column under store_values, or an
+ * INCLUDE column - under a WHERE the posting sets answer, or none.
+ *
+ * The path counts what count(*) under the same WHERE counts, by every means
+ * that count has - the intersection of the WHERE's sets, or a sum over every
+ * entry of a column when nothing selects rows (§14, §28, §35) - and is handed
+ * each counted row with the values of the gathered columns, from the store
+ * for the rows of all-visible pages and from the heap for the others
+ * (lion_count.h, LionGather).  It forms the groups and aggregates of those
+ * values itself.  So it is built as that count's path is - the query, the
+ * relation, the WHERE, the HAVING, the strategy and the targets, with no
+ * GROUP BY and no count(DISTINCT) of its own - with the GROUP BY and the
+ * outputs its own, and priced as that count plus the gather
+ * (lion_cost_store_path()).  It is offered beside whatever the walks make
+ * of the same query - the entry walk of a GROUP BY, the decoded walk of §34,
+ * the distinct walk of §26, the walk of §37 - and add_path() keeps the
+ * cheaper.
+ *
+ * One table: a partitioned one would need partial aggregates per partition,
+ * and the FK-side join gathers nothing.  One index's store holds every
+ * gathered column.  No GROUP BY item that is not a plain column, no
+ * aggregate with FILTER, ORDER BY or an argument that is not a plain column.
+ */
+static void
+lion_try_store_path(PlannerInfo *root, RelOptInfo *input_rel,
+					RelOptInfo *output_rel, GroupPathExtraData *extra)
+{
+	LionCountPathBuild cx;
+	CustomPath *cpath;
+
+	lion_count_path_init(&cx, root, input_rel, output_rel, extra, NULL);
+	cx.store = true;
+
+	if (!lion_count_path_query(&cx))
+		return;
+	if (!lion_count_path_rel(&cx))
+		return;
+	if (cx.partitioned)
+		return;
+	if (!lion_count_path_store_group_by(&cx))
+		return;
+	if (!lion_count_path_where(&cx))
+		return;
+	if (!lion_count_path_having(&cx))
+		return;
+	if (!lion_count_path_outputs(&cx))
+		return;
+
+	/* one index's store has every column */
+	cx.storeidx = lion_find_store_index(input_rel, cx.storeattnos,
+										&cx.storeidxcols);
+	if (cx.storeidx == NULL)
+		return;
+
+	if (!lion_count_path_strategy(&cx))
+		return;
+	if (!lion_count_path_targets(&cx))
+		return;
+	lion_count_path_estimate(&cx);
+
+	/*
+	 * The rows the node emits are its own groups', which the estimate above
+	 * (of a count without a GROUP BY) does not know: one row without a GROUP
+	 * BY - or with one the planner folded to a single group - else one per
+	 * group of the rows the WHERE keeps.
+	 */
+	cx.storegroupest = (cx.storegroupvars != NIL) ?
+		estimate_num_groups(root, cx.storegroupvars, Max(input_rel->rows, 1.0),
+							NULL, NULL) : 1.0;
+	cx.outrows = cx.storegroupest;
+	{
+		ListCell   *lc;
+
+		cx.storepairs = 0.0;
+		foreach(lc, cx.storedistvars)
+		{
+			List	   *vars = lappend(list_copy(cx.storegroupvars),
+									   lfirst(lc));
+
+			cx.storepairs += estimate_num_groups(root, vars,
+												 Max(input_rel->rows, 1.0),
+												 NULL, NULL);
+		}
+	}
+	if (lion_store_hash_bytes(&cx) > (double) get_hash_memory_limit())
+		return;
+
+	lion_count_path_encode(&cx);
+	cpath = lion_count_path_make(&cx);
+	lion_count_path_add(&cx, cpath);
+}
+
+/*
+ * Decide whether count(*) over input_rel - or the GROUP BY, count(DISTINCT)
+ * and aggregates of DESIGN.md §10 to §40 - can be answered from roaring
+ * posting sets and, if so, add CustomPaths to output_rel: the walks', and
+ * the window store's gather.  Every failed check simply returns: the normal
+ * plan is always available.
+ */
+void
+lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
+				   RelOptInfo *output_rel, GroupPathExtraData *extra,
+				   const LionFkJoin *fj)
+{
+	lion_try_walk_path(root, input_rel, output_rel, extra, fj);
+	if (fj == NULL)
+		lion_try_store_path(root, input_rel, output_rel, extra);
 }

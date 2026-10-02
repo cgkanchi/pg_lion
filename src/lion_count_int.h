@@ -207,6 +207,13 @@ typedef struct LionCountCtx
 	 * snapshot sees is tested (lion_recheck_heap_filtered()).
 	 */
 	LionRowFilter *filter;
+
+	/*
+	 * The values of stored columns every counted row hands over as well
+	 * (DESIGN.md §40, "The custom shapes"), or NULL: lion_gather_container()
+	 * and the heap rows of lion_recheck_heap_rows().
+	 */
+	struct LionGather *gather;
 	int64		count;			/* members counted straight from the VM */
 	LionCountStats stats;
 
@@ -835,6 +842,13 @@ struct LionVisCache
 	 * relation it names; a reset leaves it alone.
 	 */
 	LionRowFilter *filter;
+
+	/*
+	 * ... and the gather every count of it feeds, or NULL
+	 * (lion_vis_cache_set_gather(), DESIGN.md §40): the caller's, like the
+	 * filter, and left alone by a reset.
+	 */
+	struct LionGather *gather;
 
 	/*
 	 * What one count of this node execution leaves the next (DESIGN.md §27,
