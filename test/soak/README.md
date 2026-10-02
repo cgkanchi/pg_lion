@@ -182,6 +182,20 @@ the server logs are scanned.
 A FAIL found this way is reduced, where it can be, to a deterministic
 reproducer in `findings/`.
 
+## cost_bounds.sql
+
+Not a soak: on a build with DESIGN.md §39's units and margin, 26 queries -
+counts, GROUP BYs, count(DISTINCT), the top k, a multi-key column, a
+partitioned table, the FK-side, semi and anti joins, LATERAL joins,
+LionOrdered, six of them as generic plans - each planned under 13 settings
+from the defaults to every rate and the margin at their bounds, with core's
+joins, aggregates or scans all off, and in parallel, and each answer compared
+with the same query's with lion's paths off.  It prints every plan's lion
+node and cost and a verdict line; a differing answer or a cost that is not
+finite fails.  A build without the settings skips it.
+
+    eval "$(./dev.sh env)"; psql -X -f test/soak/cost_bounds.sql
+
 ## findings/
 
 One file per finding: an isolation spec (parked at an injection point, so the
