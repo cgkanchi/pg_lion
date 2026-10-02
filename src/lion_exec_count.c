@@ -2794,6 +2794,21 @@ lion_heap_all_visible(Relation heap, BlockNumber *nblocks)
 	return allvisible == *nblocks;
 }
 
+/*
+ * How many bulk deletes index has finished (DESIGN.md §37): the meta page's
+ * count, which the end of every ambulkdelete call moves, read under the meta
+ * page's share lock - whose acquisition orders this read after the looks at
+ * the map that came before it.
+ */
+static uint32
+lion_wagg_bulkdeletes(Relation index)
+{
+	LionMetaNdistinct nd;
+
+	(void) lion_read_meta_ndistinct(index, &nd);
+	return nd.bulkdeletes;
+}
+
 #ifdef HAVE_INT128
 /* v as a numeric, exactly: in three parts of 10^18 past int8's range */
 static Datum
@@ -2986,17 +3001,28 @@ lion_wagg_reset(LionCountScanState *st)
  * Compute every aggregate over keys (DESIGN.md §37) into its result.
  *
  * The entries' own counts are the rows when every heap page is all-visible
- * before the first header is read and after the last, and the heap has as
- * many pages both times.  At the first look every TID in the index is a row
- * every snapshot sees.  A change made after it - an insert, an update, a
- * delete, by a transaction this snapshot cannot see, since one it sees had
- * made its change before the snapshot and so before the first look - takes
- * the mark off its page before its TID reaches an index, and that page cannot
- * be marked again while this snapshot's xmin holds VACUUM back; a new page is
- * not marked at all.  So the second look finds every page marked only if
- * nothing changed in between, and every ntids read then counted exactly the
- * rows of the first look: this snapshot's.  During recovery the standby's
- * snapshot holds nothing back on the primary, and every entry is counted.
+ * before the first header is read and after the last, the heap has as many
+ * pages both times, and no index walked has finished a bulk delete in
+ * between.  At the first look every TID in the index is a row every snapshot
+ * sees.  A change made after it - an insert, an update, a delete, by a
+ * transaction this snapshot cannot see, since one it sees had made its change
+ * before the snapshot and so before the first look - takes the mark off its
+ * page before its TID reaches an index.  If it committed, the page cannot be
+ * marked again while this snapshot's xmin holds VACUUM back, and a new page is
+ * not marked at all.  If it did not - an aborted insert or update, a
+ * subtransaction rolled back, a speculative insert killed - its tuple is dead
+ * to every snapshot whatever the horizon, and VACUUM may prune it, take its
+ * TID out of the index and mark the page again, all after a header that
+ * counted the TID was read: the second look alone cannot see that.  But the
+ * page is marked only once the TID's line pointer is unused, after a bulk
+ * delete of this index that had the TID among its dead ones has returned, and
+ * that call ended after the header was read (the TID was still in it) and
+ * counted itself on the meta page as it ended (lion_meta_count_bulkdelete()).
+ * So the meta page's count, read before the first look and after the second,
+ * moved.  When it did not, nothing changed in between, and every ntids read
+ * counted exactly the rows of the first look: this snapshot's.  During
+ * recovery the standby's snapshot holds nothing back on the primary, and
+ * every entry is counted.
  */
 void
 lion_wagg_run(LionCountScanState *st)
@@ -3019,12 +3045,30 @@ lion_wagg_run(LionCountScanState *st)
 	}
 
 	lion_wagg_reset(st);
-	fast = !RecoveryInProgress() && lion_heap_all_visible(st->heap, &before);
+	fast = !RecoveryInProgress();
+	if (fast)
+	{
+		for (c = 0; c < st->nwcol; c++)
+			st->wcol[c].bulkdeletes = lion_wagg_bulkdeletes(st->wcol[c].idx);
+		fast = lion_heap_all_visible(st->heap, &before);
+	}
 	if (fast)
 	{
 		for (c = 0; c < st->nwcol; c++)
 			lion_wagg_walk(st, c, true);
+
+		/*
+		 * Test hook: every header has been read and the map not looked at
+		 * again, so a VACUUM here may take out TIDs the walks counted and
+		 * mark their pages all-visible again (the isolation spec
+		 * wagg_aborted_insert).  Compiles to nothing without
+		 * --enable-injection-points.
+		 */
+		LION_INJECTION_POINT("lion-wagg-walked");
 		fast = lion_heap_all_visible(st->heap, &after) && after == before;
+		for (c = 0; fast && c < st->nwcol; c++)
+			fast = (lion_wagg_bulkdeletes(st->wcol[c].idx) ==
+					st->wcol[c].bulkdeletes);
 		st->wfast += st->nwcol;
 		if (!fast)
 			lion_wagg_reset(st);
