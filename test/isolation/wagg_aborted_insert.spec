@@ -153,6 +153,23 @@ step s3_allvis	{
 step s3_release	{
 	SELECT injection_points_detach('lion-wagg-walked');
 	SELECT injection_points_wakeup('lion-wagg-walked');
+	/*
+	 * Wait until s1 has left the point.  The tester deems a session that
+	 * waits at one blocked, and checks the walk again as soon as this step
+	 * is done: seen there still, the walk's answer would be reported after
+	 * the next step's instead of before it.
+	 */
+	DO $$
+	BEGIN
+		FOR i IN 1 .. 6000 LOOP
+			PERFORM pg_stat_clear_snapshot();
+			EXIT WHEN NOT EXISTS (SELECT FROM pg_stat_activity
+								   WHERE datname = current_database()
+									 AND wait_event_type = 'InjectionPoint'
+									 AND wait_event = 'lion-wagg-walked');
+			PERFORM pg_sleep(0.01);
+		END LOOP;
+	END $$;
 }
 step s3_reference	{
 	SET pg_lion.enable_count_pushdown = off;
