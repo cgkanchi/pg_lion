@@ -16728,3 +16728,16 @@ three NARROWs is built at 34 of its 35 keys, where its ARRAYs were probed at all
 `fkjoin_adaptive.sql`: a probed key reads fewer posting pages, so the run's account grows more
 slowly against an unchanged price of collecting, and each run switches a key or a few later. Every
 answer is the same as before.
+
+Narrow rows keep the BITSETs tested. On rows of 64 bytes and more, fewer than 128 to a page, no
+dense set is a BITSET any more, so the BITSET arms of the set algebra, the readers, the inserts and
+VACUUM ran only in tests whose rows happened to be narrow, and gcov found two that no test reached:
+the RUN case of an ANDNOT into an image (a count of `<>`) and the widening refused after compaction
+(§32). `test/sql/bitset.sql` pins them: seven int columns, 136 rows to a page, BITSET, ARRAY, RUN
+and sparse columns, through counts (ANDs, ORs, `<>`), GROUP BY, bitmap and plain scans, inserts
+that grow ARRAYs into BITSETs, and an UPDATE, a DELETE and a VACUUM that shrink them, every answer
+against a sequential scan. `range_cost.sql` §2's `rcostn`, 226 rows a page, fills the range's memory
+with BITSETs that nothing optimizes smaller, so that its widenings are refused; `groupwhere.sql`
+§8's `lgw_b` is narrow again, 136 a page, so that its WHERE is the BITSET its groups are tested
+against as it is; `basic.sql` now says its two-value column is NARROWs. A test that means a BITSET
+needs more than 127 rows to a page: rows of under about 60 bytes.
