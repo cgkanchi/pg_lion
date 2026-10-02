@@ -36,16 +36,19 @@
  *
  *		ARRAY with fewer than LION_ARRAY_MAX_CARD members	size + 2 bytes
  *		RUN with fewer than LION_RUN_MAX_NRUNS runs			size + 4 bytes
- *		BITSET												its 4104 bytes
- *		NARROW, a member at an offset below 128				its 1032 bytes
+ *		a bitmap of width k, a member at an offset below 64 * k
+ *															its 8 + 512 * k bytes
  *
- *	  and in those cases never changes the representation.  An ARRAY at
- *	  LION_ARRAY_MAX_CARD members, a RUN at LION_RUN_MAX_NRUNS runs that
- *	  needs a new one, or a NARROW given a member at an offset it has no bit
- *	  for converts (to a BITSET, to an ARRAY or a BITSET, and to a BITSET),
- *	  which needs the full buffer.  lion_container_inplace_need() is that
- *	  table, and both callers ask it before they call add() on an item.
- *	  Nothing else may be called on an item in place.
+ *	  (at 8K: a NARROW of width k, or a BITSET, whose width is 8 and whose
+ *	  4104 bytes hold every offset; "widths" below) and in those cases
+ *	  never changes the representation.  An ARRAY at LION_ARRAY_MAX_CARD
+ *	  members, a RUN at LION_RUN_MAX_NRUNS runs that needs a new one, or a
+ *	  NARROW given a member at an offset it has no bit for converts (to a
+ *	  BITSET, to an ARRAY or a BITSET, and to the narrowest NARROW that holds
+ *	  the member, or a BITSET past LION_NARROW_MAX_WIDTH), which needs the
+ *	  full buffer.  lion_container_inplace_need() is that table, and both
+ *	  callers ask it before they call add() on an item.  Nothing else may be
+ *	  called on an item in place.
  *-------------------------------------------------------------------------
  */
 #ifndef LION_CONTAINER_H
@@ -60,7 +63,8 @@
  * shares the header below but has its own payload and its own module
  * (lion_sparse.[ch]).  Every function here rejects it: use lion_item_size()
  * when an item may be of either kind.  NARROW (DESIGN.md §38) came after the
- * segment, which is why it is 5: the numbers are on disk.
+ * segment, which is why it is 5: the numbers are on disk.  A BITSET and a
+ * NARROW are one representation of two widths ("widths" below).
  */
 typedef enum LionContainerType
 {
@@ -84,7 +88,7 @@ typedef struct LionContainer
 	uint32		ckey;			/* container key: tid code >> LION_CONTAINER_BITS */
 	uint16		cardinality;	/* number of members, 0 .. LION_CONTAINER_RANGE */
 	uint8		type;			/* LionContainerType */
-	uint8		flags;			/* reserved, must be 0 */
+	uint8		flags;			/* a NARROW's width; reserved, 0, otherwise */
 	/* payload follows; see LION_CONTAINER_PAYLOAD() */
 } LionContainer;
 
@@ -108,38 +112,76 @@ typedef struct LionRun
 #define LION_RUN_DATA(c)				((LionRun *) (LION_CONTAINER_PAYLOAD(c) + sizeof(uint16)))
 
 /*
- * NARROW (DESIGN.md §38): a bitset of the offsets below LION_NARROW_OFFSETS
- * of each of the container's LION_BLOCKS_PER_CONTAINER heap blocks, for a
- * set whose members all have such offsets - every set of a table with fewer
- * than 128 rows a page.  Member lo is bit
+ * WIDTHS (DESIGN.md §38).  A BITSET and a NARROW are one representation, a
+ * BITMAP of the container's LION_BLOCKS_PER_CONTAINER heap blocks, k words
+ * of each, k being the bitmap's WIDTH: word j of block b is word b * k + j
+ * of the payload and holds the block's offsets 64j .. 64j + 63, so that
+ * member lo is bit
  *
- *		(lo >> LION_OFFSET_BITS) << LION_NARROW_OFFSET_BITS | (lo & 127)
+ *		(lo >> LION_OFFSET_BITS) * 64 * k + (lo & offset mask)
  *
- * so that each block is LION_NARROW_WORDS_PER_BLOCK whole words, the first
- * of the block's words in a BITSET: 1024 payload bytes at 8K against a
- * BITSET's 4096.  Its words are NOT a BITSET's, and nothing outside this
- * module may read them as one; lion_container_or_into_bitset() is the way
- * to an image of a container of any kind.
+ * when its offset is below 64 * k, and a member the bitmap cannot hold
+ * otherwise.  A BITSET (type 2) has the full width, LION_BITSET_WIDTH words
+ * a block, every offset a block has, and its bit for lo is lo itself; a
+ * NARROW (type 5) has a width of 1 .. LION_NARROW_MAX_WIDTH, in its header's
+ * flags byte: the narrowest that covers every offset a heap page can have is
+ * the last, 5 words (320 offsets) at 8K, where a page holds 291 tuples at
+ * most.  A NARROW of width k takes 8 + 512 * k bytes at 8K against a
+ * BITSET's 4104, and is as large as an ARRAY of 256 * k members.
+ *
+ * LION_HEAP_MAX_OFFSET is MaxHeapTuplesPerPage, the largest offset number of
+ * a heap tuple, which this frontend-safe header cannot take from
+ * access/htup_details.h: the same formula, for a page header of 24 bytes and
+ * tuples of a 23-byte header, MAXALIGNed, and a 4-byte line pointer.
+ * lion_container.c asserts that it is the server's.
  */
-#define LION_NARROW_OFFSET_BITS	7
-#define LION_NARROW_OFFSETS		(1 << LION_NARROW_OFFSET_BITS)	/* 128 */
-#define LION_NARROW_WORDS_PER_BLOCK	(LION_NARROW_OFFSETS / 64)	/* 2 */
-#define LION_NARROW_WORDS		(LION_BLOCKS_PER_CONTAINER * LION_NARROW_WORDS_PER_BLOCK)	/* 128 at 8K */
-#define LION_NARROW_BYTES		(LION_NARROW_WORDS * sizeof(uint64))	/* 1024 at 8K */
-#define LION_NARROW_SIZE		(LION_CONTAINER_HDRSZ + LION_NARROW_BYTES)	/* 1032 at 8K */
-/* An ARRAY of this many members is as large as a NARROW: 512 at 8K. */
-#define LION_NARROW_ARRAY_CARD	(LION_NARROW_BYTES / sizeof(uint16))
+#define LION_BITSET_WIDTH		(LION_BITSET_WORDS / LION_BLOCKS_PER_CONTAINER)	/* 8 at 8K */
+#define LION_HEAP_MAX_OFFSET	((uint32) ((BLCKSZ - 24) / (MAXALIGN(23) + 4)))	/* 291 at 8K */
+#define LION_NARROW_MAX_WIDTH	(LION_HEAP_MAX_OFFSET / 64 + 1)	/* 5 at 8K */
+#define LION_WIDTH_WORDS(k)		(LION_BLOCKS_PER_CONTAINER * (k))	/* 64 * k at 8K */
+#define LION_WIDTH_BYTES(k)		(LION_WIDTH_WORDS(k) * sizeof(uint64))	/* 512 * k at 8K */
+#define LION_NARROW_SIZE(k)		(LION_CONTAINER_HDRSZ + LION_WIDTH_BYTES(k))
+/* An ARRAY of this many members is as large as a bitmap of width k: 256 * k at 8K. */
+#define LION_WIDTH_ARRAY_CARD(k)	(LION_WIDTH_BYTES(k) / sizeof(uint16))
 
-/* Can a NARROW hold lo: is its offset below LION_NARROW_OFFSETS? */
-static inline bool
-lion_lo_is_narrow(uint32 lo)
+/*
+ * The width of a bitmap: LION_BITSET_WIDTH for a BITSET, and for a NARROW its
+ * flags byte - clamped into 1 .. LION_NARROW_MAX_WIDTH, which is how every
+ * function here reads a damaged one (lion_container_check() reports it, and
+ * the readers of pages refuse it, lion_container_width_valid()); 0 for an
+ * ARRAY or a RUN.
+ */
+static inline uint32
+lion_container_width(const LionContainer *c)
 {
-	return (lo & ((1U << LION_OFFSET_BITS) - 1)) < LION_NARROW_OFFSETS;
+	if (c->type == LION_CT_BITSET)
+		return LION_BITSET_WIDTH;
+	if (c->type == LION_CT_NARROW)
+		return (c->flags == 0) ? 1 : Min((uint32) c->flags, (uint32) LION_NARROW_MAX_WIDTH);
+	return 0;
+}
+
+/* Does c's header give its width as it is: a NARROW of a width this build has? */
+static inline bool
+lion_container_width_valid(const LionContainer *c)
+{
+	return c->type != LION_CT_NARROW ||
+		(c->flags >= 1 && c->flags <= LION_NARROW_MAX_WIDTH);
+}
+
+/* The narrowest width that holds lo: the word of its block its offset is in, plus one. */
+static inline uint32
+lion_lo_width(uint32 lo)
+{
+	return ((lo & ((1U << LION_OFFSET_BITS) - 1)) >> 6) + 1;
 }
 
 /* Size in bytes of the whole container (header + payload) for its current type. */
 extern Size lion_container_size(const LionContainer *c);
-/* Size a container of the given type/cardinality/nruns would occupy. */
+/*
+ * Size a container of the given type and cardinality would occupy, with nruns
+ * runs for a RUN and of width nruns for a NARROW.
+ */
 extern Size lion_container_size_for(LionContainerType type, uint32 cardinality, uint32 nruns);
 
 /* Initialise an empty ARRAY container for ckey in buf. */
@@ -150,9 +192,10 @@ extern void lion_container_init(LionContainer *c, uint32 ckey);
  * lion_container_add(c, lo) may write when it keeps c's representation, or 0
  * when it would change it - an ARRAY at LION_ARRAY_MAX_CARD members, a RUN at
  * LION_RUN_MAX_NRUNS runs, a NARROW and a member at an offset it has no bit
- * for - or c is no container.  The in-place insert and its redo call add()
- * on a page item only when this is not 0 and the item's allotted length is
- * at least this.  It reads c's header (and a RUN's run count) only.
+ * for, which widens it - or c is no container.  The in-place insert and its
+ * redo call add() on a page item only when this is not 0 and the item's
+ * allotted length is at least this.  It reads c's header (and a RUN's run
+ * count) only.
  */
 extern Size lion_container_inplace_need(const LionContainer *c, uint16 lo);
 
@@ -179,20 +222,25 @@ extern void lion_container_append_sorted(LionContainer *c, uint16 lo);
 
 /*
  * Convert to the smallest representation: ARRAY, RUN, NARROW or BITSET, a
- * tie going to the first of them (DESIGN.md §3, §38).  NARROW is a candidate
- * only when every member's offset is below LION_NARROW_OFFSETS.
- * lion_container_optimize_ext() with allow_narrow false leaves NARROW out,
- * which is the choice for an index whose format predates it (DESIGN.md §38,
- * "Format"): what it makes is what optimize() made before §38, and a NARROW
- * handed to it comes out something else.  The result is a function of the
- * members and of allow_narrow alone.
+ * tie going to the first of them (DESIGN.md §3, §38).  The NARROW considered
+ * is the narrowest that holds every member (lion_container_min_width()),
+ * when that is at most LION_NARROW_MAX_WIDTH, which is every set of heap
+ * tuples: a BITSET is then never the smallest.  lion_container_optimize_ext()
+ * with allow_narrow false leaves NARROW out, which is the choice for an index
+ * whose format predates it (DESIGN.md §38, "Format"): what it makes is what
+ * optimize() made before §38, and a NARROW handed to it comes out something
+ * else.  The result is a function of the members and of allow_narrow alone.
  */
 extern void lion_container_optimize(LionContainer *c);
 extern void lion_container_optimize_ext(LionContainer *c, bool allow_narrow);
 /* Force BITSET representation (used when a RUN/ARRAY would exceed its limits). */
 extern void lion_container_to_bitset(LionContainer *c);
-/* Could c be a NARROW: is every member's offset below LION_NARROW_OFFSETS? */
-extern bool lion_container_narrow_feasible(const LionContainer *c);
+/*
+ * The narrowest width whose bitmap holds every member of c, as iterate()
+ * takes them: 1 .. LION_BITSET_WIDTH, and 1 for an empty c.  It may be less
+ * than a NARROW's own width, after removals, but never more.
+ */
+extern uint32 lion_container_min_width(const LionContainer *c);
 
 /* Iteration in ascending lo order; callback returns false to stop early. */
 typedef bool (*lion_lo_callback) (uint16 lo, void *arg);
@@ -229,10 +277,12 @@ extern uint32 lion_container_and_cardinality(const LionContainer *a, const LionC
  * in the representation the operation builds it in -
  *
  *	and		an ARRAY when either operand is one, a RUN when both are RUNs and
- *			the runs fit, a NARROW when either operand is one, else a BITSET;
- *	andnot	an ARRAY when a is one, a NARROW when a is one, else a BITSET;
- *	or		an ARRAY when both are ARRAYs whose members fit one, a NARROW
- *			when both are NARROWs, else a BITSET
+ *			the runs fit, else a bitmap of the narrower bitmap operand's width
+ *			(a NARROW when either operand is one) or a BITSET;
+ *	andnot	an ARRAY when a is one, a bitmap of a's width when a is a
+ *			NARROW, else a BITSET;
+ *	or		an ARRAY when both are ARRAYs whose members fit one, a bitmap of
+ *			the wider one's width when both are bitmaps, else a BITSET
  *
  * (an empty operand aside: and is then an empty ARRAY, and or and andnot a
  * copy of the operand that is not empty, or of a)
@@ -299,7 +349,7 @@ extern uint32 lion_container_array_from_marks(LionContainer *dest, uint32 ckey,
  * lion_container_or_into_bitset(c, LION_BITSET_DATA(dest)) sets, and
  * bitset_recount() sets its cardinality from them, which it returns.  The
  * result is not optimized either.  Both are for a BITSET only: a NARROW's
- * words are not a BITSET's (LION_NARROW_OFFSET_BITS above).
+ * words are not a BITSET's ("widths" above).
  */
 extern void lion_container_bitset_init(LionContainer *dest, uint32 ckey);
 extern uint32 lion_container_bitset_recount(LionContainer *c);
@@ -334,7 +384,8 @@ extern uint32 lion_container_remove_range(LionContainer *c, uint16 lo_start, uin
  * w |= c, for a caller that accumulates the union of several containers of
  * one container key in a bitset image of LION_BITSET_WORDS words (the count
  * engine's OR of k containers, DESIGN.md §15).  w must not overlap c.  A
- * container of any kind: a NARROW's words go where a BITSET has them.
+ * container of any kind: a NARROW's words go where a BITSET has them, the
+ * image being a bitmap of the full width.
  */
 extern void lion_container_or_into_bitset(const LionContainer *c, uint64 *w);
 
@@ -450,17 +501,16 @@ extern bool lion_container_simd_force(LionSimdImpl impl);
 extern LionSimdImpl lion_container_simd_current(void);
 
 /*
- * One pass of the implementation in use, which the set algebra makes on
- * BITSET payloads: its count returned, and d written for the ops that write
- * (d may be a or b; NULL for the ones that do not).  narrow_pass() is the
- * same pass over LION_NARROW_WORDS words, which the set algebra makes on
- * NARROW payloads; its LION_BITS_RUNS counts the runs of the words as they
- * lie, across the blocks' boundaries, which the library corrects for.
+ * One pass of the implementation in use over the LION_WIDTH_WORDS(width)
+ * words of bitmaps of that width, which the set algebra makes on their
+ * payloads, width LION_BITSET_WIDTH being a BITSET's: its count returned, and
+ * d written for the ops that write (d may be a or b; NULL for the ones that
+ * do not).  Its LION_BITS_RUNS counts the runs of the words as they lie,
+ * across the blocks' boundaries, which the library corrects for below the
+ * full width.
  */
-extern uint32 lion_container_bits_pass(LionBitsOp op, uint64 *d,
+extern uint32 lion_container_bits_pass(LionBitsOp op, uint32 width, uint64 *d,
 									   const uint64 *a, const uint64 *b);
-extern uint32 lion_container_narrow_pass(LionBitsOp op, uint64 *d,
-										 const uint64 *a, const uint64 *b);
 #endif
 
 #endif							/* LION_CONTAINER_H */

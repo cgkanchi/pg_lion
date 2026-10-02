@@ -193,63 +193,108 @@ ref_nruns(const Ref *r)
 
 /*
  * NARROW (DESIGN.md §38), written here from lion_container.h's layout rather
- * than through the library: member lo, whose offset is below
- * LION_NARROW_OFFSETS, is bit (block * LION_NARROW_OFFSETS + offset) of the
- * payload's LION_NARROW_WORDS words.
+ * than through the library.  A NARROW of width k, 1 .. LION_NARROW_MAX_WIDTH,
+ * holds the members whose offset is below 64 * k: member lo is bit
+ * (block * 64 * k + offset) of the payload's LION_WIDTH_WORDS(k) words, the
+ * width in the header's flags byte.  A BITSET is the same layout at the full
+ * width, LION_BITSET_WIDTH.
  */
+#define TEST_KMAX			((uint32) LION_NARROW_MAX_WIDTH)
+#define TEST_KMAX_LABELS	(3 * LION_NARROW_MAX_WIDTH)
+#define TEST_FULL			((uint32) LION_BITSET_WIDTH)
 #define TEST_NARROW_DATA(c)	((uint64 *) LION_CONTAINER_PAYLOAD(c))
 #define TEST_OFFSET_MASK	((1U << LION_OFFSET_BITS) - 1)
 
-static bool
-test_lo_narrow(uint32 lo)
+/* The narrowest width whose bits hold lo's offset. */
+static uint32
+test_lo_width(uint32 lo)
 {
-	return (lo & TEST_OFFSET_MASK) < LION_NARROW_OFFSETS;
+	return ((lo & TEST_OFFSET_MASK) >> 6) + 1;
+}
+
+/* Does a bitmap of width k hold lo's offset? */
+static bool
+test_lo_fits(uint32 lo, uint32 k)
+{
+	return (lo & TEST_OFFSET_MASK) < 64 * k;
 }
 
 static uint32
-test_narrow_bit(uint32 lo)
+test_narrow_bit(uint32 lo, uint32 k)
 {
-	return (lo >> LION_OFFSET_BITS) * LION_NARROW_OFFSETS + (lo & TEST_OFFSET_MASK);
+	return (lo >> LION_OFFSET_BITS) * 64 * k + (lo & TEST_OFFSET_MASK);
 }
 
-/* The member bit i of a NARROW's payload stands for. */
+/* The member bit i of a payload of width k stands for. */
 static uint32
-test_narrow_lo(uint32 i)
+test_narrow_lo(uint32 i, uint32 k)
 {
-	return ((i / LION_NARROW_OFFSETS) << LION_OFFSET_BITS) | (i % LION_NARROW_OFFSETS);
+	return ((i / (64 * k)) << LION_OFFSET_BITS) | (i % (64 * k));
 }
 
-/* Does every member of r have an offset a NARROW holds? */
-static bool
-ref_narrow_ok(const Ref *r)
+/* The narrowest width that holds every member of r (1 when it has none). */
+static uint32
+ref_width(const Ref *r)
 {
+	uint32		k = 1;
 	uint32		i;
 
 	for (i = 0; i < LION_CONTAINER_RANGE; i++)
-		if (r->m[i] && !test_lo_narrow(i))
-			return false;
-	return true;
+		if (r->m[i])
+			k = Max(k, test_lo_width(i));
+	return k;
+}
+
+/* Does some NARROW hold every member of r? */
+static bool
+ref_narrow_ok(const Ref *r)
+{
+	return ref_width(r) <= TEST_KMAX;
+}
+
+/* A container's bitmap width: a NARROW's flags, a BITSET's full one, or 0. */
+static uint32
+test_width(const LionContainer *c)
+{
+	if (c->type == LION_CT_BITSET)
+		return TEST_FULL;
+	if (c->type == LION_CT_NARROW)
+		return c->flags;
+	return 0;
+}
+
+/* A width for a test: 1 .. LION_NARROW_MAX_WIDTH. */
+static uint32
+rand_width(void)
+{
+	return 1 + rng_below(TEST_KMAX);
 }
 
 /*
- * Write the NARROW encoding of r directly, whatever optimize() would pick:
- * for sets a NARROW is not the smallest form of, which a NARROW can still
- * be after the mutators have been at it.
+ * Write the NARROW encoding of r at width k (0: the narrowest that holds it)
+ * directly, whatever optimize() would pick: for sets a NARROW is not the
+ * smallest form of, which a NARROW can still be after the mutators have been
+ * at it, and at widths wider than its members need, which VACUUM and the set
+ * algebra may meet.
  */
 static void
-build_narrow_direct(CBuf *b, const Ref *r)
+build_narrow_direct(CBuf *b, const Ref *r, uint32 k)
 {
 	uint64	   *w = TEST_NARROW_DATA(&b->c);
 	uint32		i;
 
-	CHECK(ref_narrow_ok(r), "build_narrow_direct() given members a NARROW holds");
+	if (k == 0)
+		k = ref_width(r);
+	CHECK(k >= 1 && k <= TEST_KMAX && ref_width(r) <= k,
+		  "build_narrow_direct() given members a NARROW of its width holds");
 	lion_container_init(&b->c, TEST_CKEY);
 	b->c.type = LION_CT_NARROW;
-	memset(w, 0, LION_NARROW_BYTES);
+	b->c.flags = (uint8) k;
+	memset(w, 0, LION_WIDTH_BYTES(k));
 	for (i = 0; i < LION_CONTAINER_RANGE; i++)
-		if (r->m[i] && test_lo_narrow(i))
+		if (r->m[i] && test_lo_fits(i, k))
 		{
-			uint32		bit = test_narrow_bit(i);
+			uint32		bit = test_narrow_bit(i, k);
 
 			w[bit >> 6] |= UINT64CONST(1) << (bit & 63);
 		}
@@ -322,7 +367,11 @@ verify_light(const LionContainer *c, const Ref *r)
 		CHECK(true, "check");
 	CHECK(lion_container_cardinality(c) == r->card, "cardinality vs reference");
 	CHECK(c->ckey == TEST_CKEY, "ckey preserved");
-	CHECK(c->flags == 0, "flags zero");
+	if (c->type == LION_CT_NARROW)
+		CHECK(c->flags >= 1 && c->flags <= TEST_KMAX,
+			  "a NARROW's flags are its width, 1 .. LION_NARROW_MAX_WIDTH");
+	else
+		CHECK(c->flags == 0, "flags zero");
 }
 
 /* Full comparison against the reference. */
@@ -414,9 +463,13 @@ verify_full(const LionContainer *c, const Ref *r)
 			expected = LION_CONTAINER_HDRSZ + LION_BITSET_BYTES;
 			break;
 		case LION_CT_NARROW:
-			expected = LION_CONTAINER_HDRSZ + LION_NARROW_BYTES;
-			CHECK(expected == 1032, "a NARROW is 1032 bytes");
-			CHECK(ref_narrow_ok(r), "a NARROW holds only members at offsets below 128");
+			/* k words a block */
+			expected = LION_CONTAINER_HDRSZ + (Size) c->flags *
+				LION_BLOCKS_PER_CONTAINER * sizeof(uint64);
+			CHECK(expected == LION_NARROW_SIZE(c->flags),
+				  "a NARROW of width k is 8 + 512 * k bytes (at 8K)");
+			CHECK(ref_width(r) <= c->flags,
+				  "a NARROW of width k holds only members at offsets below 64 * k");
 			break;
 		default:
 			expected = LION_CONTAINER_HDRSZ + sizeof(uint16) +
@@ -425,8 +478,8 @@ verify_full(const LionContainer *c, const Ref *r)
 			break;
 	}
 	CHECK(lion_container_size(c) == expected, "lion_container_size()");
-	CHECK(lion_container_narrow_feasible(c) == ref_narrow_ok(r),
-		  "narrow_feasible() says whether every member's offset is below 128");
+	CHECK(lion_container_min_width(c) == ref_width(r),
+		  "min_width() is the narrowest width that holds every member");
 }
 
 /* Build a container from a reference with repeated add(). */
@@ -1104,25 +1157,39 @@ gen_random(Ref *r, uint32 n)
 		(void) ref_add(r, rng_below(LION_CONTAINER_RANGE));
 }
 
-/* n random members at offsets a NARROW holds (n at most 64 * 128). */
+/*
+ * n random members at offsets a NARROW of width k holds (n at most its
+ * 64 * 64 * k bits), one of them at an offset only width k holds, so that k
+ * is the narrowest width that holds them.
+ */
 static void
-gen_narrow(Ref *r, uint32 n)
+gen_narrow(Ref *r, uint32 n, uint32 k)
 {
 	ref_init(r);
+	n = Min(n, (uint32) LION_BLOCKS_PER_CONTAINER * 64 * k);
+	if (n > 0)
+		(void) ref_add(r, (rng_below(LION_BLOCKS_PER_CONTAINER) << LION_OFFSET_BITS) |
+					   (64 * (k - 1) + rng_below(64)));
 	while (r->card < n)
 		(void) ref_add(r, (rng_below(LION_BLOCKS_PER_CONTAINER) << LION_OFFSET_BITS) |
-					   rng_below(LION_NARROW_OFFSETS));
+					   rng_below(64 * k));
 }
 
-/* n of them, no two adjacent (n well below 64 * 64): an ARRAY, or a NARROW. */
+/*
+ * n of them, no two adjacent (n well below 64 * 32 * k), one at offset
+ * 64 * k - 1: an ARRAY, or a NARROW of width k.
+ */
 static void
-gen_narrow_sparse(Ref *r, uint32 n)
+gen_narrow_sparse(Ref *r, uint32 n, uint32 k)
 {
 	ref_init(r);
+	if (n > 0)
+		(void) ref_add(r, (rng_below(LION_BLOCKS_PER_CONTAINER) << LION_OFFSET_BITS) |
+					   (64 * k - 1));
 	while (r->card < n)
 	{
 		uint32		lo = (rng_below(LION_BLOCKS_PER_CONTAINER) << LION_OFFSET_BITS) |
-			rng_below(LION_NARROW_OFFSETS);
+			rng_below(64 * k);
 
 		if (r->m[lo])
 			continue;
@@ -1135,25 +1202,29 @@ gen_narrow_sparse(Ref *r, uint32 n)
 }
 
 /*
- * nruns runs at offsets a NARROW holds, each inside one block; with edges
- * set, a block's runs end at offset 127 and the next block's start at 0,
- * which are adjacent bits of a NARROW's payload and not adjacent members.
+ * nruns runs at offsets a NARROW of width k holds, each inside one block;
+ * with edges set, a block's runs end at offset 64 * k - 1 and the next
+ * block's start at 0, which are adjacent bits of the payload and not
+ * adjacent members.
  */
 static void
-gen_narrow_runs(Ref *r, uint32 nruns, uint32 minlen, uint32 maxlen, bool edges)
+gen_narrow_runs(Ref *r, uint32 nruns, uint32 minlen, uint32 maxlen, bool edges,
+				uint32 k)
 {
 	uint32		i;
 	uint32		j;
 
+	maxlen = Min(maxlen, 64 * k);
+	minlen = Min(minlen, maxlen);
 	ref_init(r);
 	for (i = 0; i < nruns; i++)
 	{
 		uint32		len = minlen + rng_below(maxlen - minlen + 1);
 		uint32		blk = rng_below(LION_BLOCKS_PER_CONTAINER);
-		uint32		start = rng_below(LION_NARROW_OFFSETS - len + 1);
+		uint32		start = rng_below(64 * k - len + 1);
 
 		if (edges)
-			start = (i % 2 == 0) ? LION_NARROW_OFFSETS - len : 0;
+			start = (i % 2 == 0) ? 64 * k - len : 0;
 		for (j = 0; j < len; j++)
 			(void) ref_add(r, (blk << LION_OFFSET_BITS) | (start + j));
 	}
@@ -1181,11 +1252,21 @@ gen_typed(Ref *r, CBuf *b, LionContainerType t)
 			lion_container_to_bitset(&b->c);
 			break;
 		case LION_CT_NARROW:
-			/* 600 or more members are no ARRAY or RUN as small */
-			gen_narrow(r, 600 + rng_below(4000));
-			build_by_append(b, r);
-			lion_container_optimize(&b->c);
-			break;
+			{
+				/*
+				 * Of a random width k: more than 256 * k members (at 8K) are
+				 * no ARRAY as small, and at a density below a half no RUN.
+				 */
+				uint32		k = rand_width();
+
+				gen_narrow(r, LION_WIDTH_ARRAY_CARD(k) + 50 +
+						   rng_below(6 * LION_WIDTH_ARRAY_CARD(k)), k);
+				build_by_append(b, r);
+				lion_container_optimize(&b->c);
+				CHECK(b->c.type != LION_CT_NARROW || b->c.flags == k,
+					  "generator produced a NARROW of the width it asked for");
+				break;
+			}
 		case LION_CT_SPARSE:
 			/* not a container: see test/unit/sparse_test.c */
 			CHECK(false, "gen_typed() asked for a sparse segment");
@@ -1501,18 +1582,21 @@ ref_binop(const Ref *a, const Ref *b, Ref *out, int op)
 /*
  * The representation optimize_ext() chooses for r's members: the smallest of
  * DESIGN.md §3's and §38's sizes, ties going to ARRAY, then RUN, then
- * NARROW, then BITSET.
+ * NARROW, then BITSET.  A NARROW is of the narrowest width that holds them,
+ * 8 + 512 * k bytes at 8K.
  */
 static uint8
 ref_opt_type(const Ref *r, bool allow_narrow)
 {
 	uint32		nruns = ref_nruns(r);
+	uint32		k = ref_width(r);
 	Size		asz = (r->card <= LION_ARRAY_MAX_CARD) ?
 		LION_CONTAINER_HDRSZ + (Size) r->card * sizeof(uint16) : SIZE_MAX;
 	Size		rsz = (nruns <= LION_RUN_MAX_NRUNS) ?
 		LION_CONTAINER_HDRSZ + sizeof(uint16) + (Size) nruns * sizeof(LionRun) : SIZE_MAX;
-	Size		nsz = (allow_narrow && ref_narrow_ok(r)) ?
-		LION_CONTAINER_HDRSZ + LION_NARROW_BYTES : SIZE_MAX;
+	Size		nsz = (allow_narrow && k <= TEST_KMAX) ?
+		LION_CONTAINER_HDRSZ + (Size) k * LION_BLOCKS_PER_CONTAINER * sizeof(uint64) :
+		SIZE_MAX;
 	Size		bsz = LION_CONTAINER_MAX_SIZE;
 
 	if (asz <= rsz && asz <= nsz && asz <= bsz)
@@ -1522,6 +1606,15 @@ ref_opt_type(const Ref *r, bool allow_narrow)
 	if (nsz <= bsz)
 		return LION_CT_NARROW;
 	return LION_CT_BITSET;
+}
+
+/* Is c in the representation, and a NARROW of the width, r optimizes to? */
+static bool
+ref_opt_ok(const LionContainer *c, const Ref *r, bool allow_narrow)
+{
+	if (c->type != ref_opt_type(r, allow_narrow))
+		return false;
+	return c->type != LION_CT_NARROW || c->flags == ref_width(r);
 }
 
 /* Run all four set operations on buf_a/buf_b and check them. */
@@ -1538,7 +1631,7 @@ run_binops(void)
 	card = lion_container_and(&buf_a.c, &buf_b.c, &buf_d.c);
 	CHECK(card == ref_r.card, "and() returned the wrong cardinality");
 	CHECK(buf_d.c.ckey == buf_a.c.ckey, "and() dest ckey");
-	CHECK(buf_d.c.type == ref_opt_type(&ref_r, true),
+	CHECK(ref_opt_ok(&buf_d.c, &ref_r, true),
 		  "and() leaves the representation its members optimize to");
 	verify_full(&buf_d.c, &ref_r);
 	CHECK(lion_container_and_cardinality(&buf_a.c, &buf_b.c) == ref_r.card,
@@ -1551,7 +1644,7 @@ run_binops(void)
 	card = lion_container_or(&buf_a.c, &buf_b.c, &buf_d.c);
 	CHECK(card == ref_r.card, "or() returned the wrong cardinality");
 	CHECK(buf_d.c.ckey == buf_a.c.ckey, "or() dest ckey");
-	CHECK(buf_d.c.type == ref_opt_type(&ref_r, true),
+	CHECK(ref_opt_ok(&buf_d.c, &ref_r, true),
 		  "or() leaves the representation its members optimize to");
 	verify_full(&buf_d.c, &ref_r);
 
@@ -1560,7 +1653,7 @@ run_binops(void)
 	card = lion_container_andnot(&buf_a.c, &buf_b.c, &buf_d.c);
 	CHECK(card == ref_r.card, "andnot() returned the wrong cardinality");
 	CHECK(buf_d.c.ckey == buf_a.c.ckey, "andnot() dest ckey");
-	CHECK(buf_d.c.type == ref_opt_type(&ref_r, true),
+	CHECK(ref_opt_ok(&buf_d.c, &ref_r, true),
 		  "andnot() leaves the representation its members optimize to");
 	verify_full(&buf_d.c, &ref_r);
 
@@ -1819,28 +1912,33 @@ test_setops_special(void)
  */
 
 /*
- * A member to add or remove: anywhere, or with narrow mostly one a NARROW
- * holds (DESIGN.md §38) and now and then one it does not.
+ * A member to add or remove: anywhere, or with a width k mostly one a NARROW
+ * of that width holds (DESIGN.md §38), now and then one at the offsets just
+ * past it, which widen it by a word a block, and now and then one anywhere.
  */
 static uint32
-random_op_lo(bool narrow)
+random_op_lo(uint32 k)
 {
-	if (narrow && rng_below(40) != 0)
-		return (rng_below(LION_BLOCKS_PER_CONTAINER) << LION_OFFSET_BITS) |
-			rng_below(LION_NARROW_OFFSETS);
-	return rng_below(LION_CONTAINER_RANGE);
+	uint32		blk = rng_below(LION_BLOCKS_PER_CONTAINER) << LION_OFFSET_BITS;
+	uint32		r = rng_below(80);
+
+	if (k == 0 || r == 0)
+		return rng_below(LION_CONTAINER_RANGE);
+	if (r == 1)
+		return blk | (64 * k + rng_below(64));
+	return blk | rng_below(64 * k);
 }
 
 static void
 test_random_ops(uint32 target, const char *label, uint32 nops, uint64 seed,
-				bool narrow)
+				uint32 k)
 {
 	uint32		i;
 
 	phase(label);
 	rng_seed(seed);
-	if (narrow)
-		gen_narrow(&ref_a, target);
+	if (k > 0)
+		gen_narrow(&ref_a, target, k);
 	else
 		gen_random(&ref_a, target);
 	build_by_add(&buf_a, &ref_a);
@@ -1853,7 +1951,7 @@ test_random_ops(uint32 target, const char *label, uint32 nops, uint64 seed,
 
 		if (op < 30)
 		{
-			uint32		lo = random_op_lo(narrow);
+			uint32		lo = random_op_lo(k);
 			bool		expected = ref_add(&ref_a, lo);
 			bool		got = lion_container_add(&buf_a.c, (uint16) lo);
 
@@ -1863,7 +1961,7 @@ test_random_ops(uint32 target, const char *label, uint32 nops, uint64 seed,
 		}
 		else if (op < 52)
 		{
-			uint32		lo = random_op_lo(narrow);
+			uint32		lo = random_op_lo(k);
 			bool		expected = ref_remove(&ref_a, lo);
 			bool		got = lion_container_remove(&buf_a.c, (uint16) lo);
 
@@ -1885,7 +1983,7 @@ test_random_ops(uint32 target, const char *label, uint32 nops, uint64 seed,
 		else if (op < 80)
 		{
 			lion_container_optimize(&buf_a.c);
-			CHECK(buf_a.c.type == ref_opt_type(&ref_a, true),
+			CHECK(ref_opt_ok(&buf_a.c, &ref_a, true),
 				  "optimize() picks the reference's representation");
 		}
 		else if (op < 85)
@@ -2302,7 +2400,7 @@ test_and_probe(void)
 				if (types[t] == LION_CT_RUN)
 					build_run_direct(&buf_b, &ref_b);
 				else if (types[t] == LION_CT_NARROW)
-					build_narrow_direct(&buf_b, &ref_b);
+					build_narrow_direct(&buf_b, &ref_b, 0);
 				else
 				{
 					build_by_append(&buf_b, &ref_b);
@@ -2593,27 +2691,92 @@ test_check_rejects(void)
 	CHECK(lion_container_check(&buf_b.c, LION_CONTAINER_HDRSZ, &msg),
 		  "an empty container fits in 8 bytes");
 
-	/* ---- a NARROW: its 1032 bytes, and a count that is its payload's ---- */
-	gen_narrow(&ref_a, 1000);
-	build_narrow_direct(&buf_a, &ref_a);
-	CHECK(lion_container_check(&buf_a.c, LION_NARROW_SIZE, &msg),
-		  "a NARROW is valid in exactly 1032 bytes");
-	expect_bad(&buf_a.c, LION_NARROW_SIZE - 1, "a NARROW does not fit in 1031 bytes");
-	memcpy(&buf_b, &buf_a, LION_NARROW_SIZE);
-	buf_b.c.cardinality++;
-	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "narrow cardinality does not match");
-	buf_b.c.cardinality = 0;
-	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "a NARROW claiming no members");
-	memcpy(&buf_b, &buf_a, LION_NARROW_SIZE);
-	buf_b.c.flags = 1;
-	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "a NARROW with flags");
-	memcpy(&buf_b, &buf_a, LION_NARROW_SIZE);
+	/*
+	 * ---- a NARROW of each width k: its 8 + 512 * k bytes, a count that is
+	 * its payload's, and a width that is one of 1 .. LION_NARROW_MAX_WIDTH ----
+	 */
+	{
+		uint32		k;
+
+		for (k = 1; k <= TEST_KMAX; k++)
+		{
+			Size		sz = LION_NARROW_SIZE(k);
+			uint32		f;
+
+			gen_narrow(&ref_a, 300 * k, k);
+			build_narrow_direct(&buf_a, &ref_a, k);
+			CHECK(sz == LION_CONTAINER_HDRSZ + 512 * k * (LION_BLOCKS_PER_CONTAINER / 64) ||
+				  LION_BLOCKS_PER_CONTAINER < 64,
+				  "a NARROW of width k is 8 + 512 * k bytes at 8K");
+			CHECK(lion_container_size(&buf_a.c) == sz &&
+				  lion_container_size_for(LION_CT_NARROW, 9999, k) == sz,
+				  "size() and size_for(NARROW, width) agree");
+			CHECK(lion_container_check(&buf_a.c, sz, &msg),
+				  "a NARROW is valid in exactly its size");
+			expect_bad(&buf_a.c, sz - 1, "a NARROW does not fit in a byte less");
+			memcpy(&buf_b, &buf_a, sz);
+			buf_b.c.cardinality++;
+			expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "narrow cardinality does not match");
+			buf_b.c.cardinality = 0;
+			expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "a NARROW claiming no members");
+
+			/* a width this build does not have, whatever the bytes past it */
+			for (f = 0; f < 4; f++)
+			{
+				uint32		bad = (f == 0) ? 0 : (f == 1) ? TEST_KMAX + 1 :
+					(f == 2) ? TEST_FULL : 255;
+
+				memcpy(&buf_b, &buf_a, sz);
+				memset(buf_b.data + sz, 0, LION_CONTAINER_MAX_SIZE - sz);
+				buf_b.c.flags = (uint8) bad;
+				msg = NULL;
+				CHECK(!lion_container_check(&buf_b.c, LION_CONTAINER_MAX_SIZE, &msg) &&
+					  msg != NULL && strstr(msg, "width") != NULL,
+					  "a NARROW of width 0, LION_NARROW_MAX_WIDTH + 1, the full width or 255 is rejected, as a width");
+				CHECK(lion_container_size(&buf_b.c) <= LION_NARROW_SIZE(TEST_KMAX) &&
+					  lion_container_size(&buf_b.c) >= LION_NARROW_SIZE(1),
+					  "... and sized as a NARROW of a width it can have, never past the largest");
+			}
+
+			/*
+			 * The same payload read at a neighbouring width: every bit is a
+			 * legal member at any width, so it is the count, and the size,
+			 * that tell.
+			 */
+			if (k > 1)
+			{
+				memcpy(&buf_b, &buf_a, sz);
+				buf_b.c.flags = (uint8) (k - 1);
+				CHECK(lion_container_check(&buf_b.c, LION_CONTAINER_MAX_SIZE, &msg) ==
+					  (lion_container_cardinality(&buf_b.c) ==
+					   lion_container_range_cardinality(&buf_b.c, 0, LION_CONTAINER_RANGE - 1)),
+					  "a NARROW read a word a block narrower passes only with its count");
+			}
+			if (k < TEST_KMAX)
+			{
+				memcpy(&buf_b, &buf_a, sz);
+				buf_b.c.flags = (uint8) (k + 1);
+				expect_bad(&buf_b.c, sz, "a NARROW a word a block wider does not fit its item");
+			}
+		}
+
+		/* every other kind's flags are zero */
+		gen_typed(&ref_a, &buf_a, LION_CT_BITSET);
+		buf_a.c.flags = 1;
+		expect_bad(&buf_a.c, LION_CONTAINER_MAX_SIZE, "a BITSET with flags");
+		buf_a.c.flags = (uint8) TEST_FULL;
+		expect_bad(&buf_a.c, LION_CONTAINER_MAX_SIZE, "a BITSET with its width in its flags");
+		gen_typed(&ref_a, &buf_a, LION_CT_RUN);
+		buf_a.c.flags = 2;
+		expect_bad(&buf_a.c, LION_CONTAINER_MAX_SIZE, "a RUN with flags");
+	}
+	gen_narrow(&ref_a, 1000, 2);
+	build_narrow_direct(&buf_a, &ref_a, 2);
+	memcpy(&buf_b, &buf_a, LION_CONTAINER_MAX_SIZE);
 	buf_b.c.type = LION_CT_NARROW + 1;
 	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "type 6 is no container");
 	buf_b.c.type = 0;
 	expect_bad(&buf_b.c, LION_CONTAINER_MAX_SIZE, "type 0 is no container");
-	CHECK(lion_container_size_for(LION_CT_NARROW, 9999, 0) == 1032,
-		  "size_for(NARROW)");
 
 	/* lion_container_size_for() agrees with lion_container_size() */
 	CHECK(lion_container_size_for(LION_CT_ARRAY, 100, 0) == 8 + 200,
@@ -2735,24 +2898,40 @@ test_check_offsets(void)
 	offsets_case(LION_CT_RUN, los, n, tuple_lo(9, 0),
 				 "a run of offset 0 alone is rejected", false);
 
-	/* NARROW: the odd offsets below 128 of every block */
-	n = 0;
-	for (b = 0; b < nblocks; b++)
-		for (o = 1; o < LION_NARROW_OFFSETS; o += 2)
-			los[n++] = tuple_lo(b, o);
-	offsets_case(LION_CT_NARROW, los, n, -1, "a NARROW of tuples passes", true);
+	/*
+	 * NARROW of each width k: the odd offsets of every block below 64 * k
+	 * and no greater than MaxHeapTuplesPerPage, the last of them the largest
+	 * maxoff that rejects nothing
+	 */
 	{
-		const char *msg = NULL;
+		uint32		k;
 
-		CHECK(lion_container_check_offsets(&buf_a.c, LION_NARROW_OFFSETS - 1, &msg),
-			  "a NARROW passes a maxoff of 127");
-		CHECK(!lion_container_check_offsets(&buf_a.c, 100, &msg) && msg != NULL,
-			  "a NARROW member past maxoff is rejected");
+		for (k = 1; k <= TEST_KMAX; k++)
+		{
+			const char *msg = NULL;
+			uint32		last = 0;
+
+			n = 0;
+			for (b = 0; b < nblocks; b++)
+				for (o = 1; o < 64 * k && o <= TEST_MAXOFF; o += 2)
+				{
+					los[n++] = tuple_lo(b, o);
+					last = o;
+				}
+			offsets_case(LION_CT_NARROW, los, n, -1, "a NARROW of tuples passes", true);
+			CHECK(buf_a.c.flags == k, "the case is a NARROW of the width it tests");
+			CHECK(lion_container_check_offsets(&buf_a.c, last, &msg),
+				  "a NARROW passes a maxoff of its last offset");
+			CHECK(!lion_container_check_offsets(&buf_a.c, last - 1, &msg) && msg != NULL,
+				  "a NARROW member past maxoff is rejected");
+			CHECK(!lion_container_check_offsets(&buf_a.c, 64 * (k - 1), &msg) && msg != NULL,
+				  "a NARROW member in its last word a block past maxoff is rejected");
+			offsets_case(LION_CT_NARROW, los, n, tuple_lo(0, 0),
+						 "a NARROW member at offset 0 is rejected", false);
+			offsets_case(LION_CT_NARROW, los, n, tuple_lo(nblocks - 1, 0),
+						 "a NARROW member at offset 0 of the last block is rejected", false);
+		}
 	}
-	offsets_case(LION_CT_NARROW, los, n, tuple_lo(0, 0),
-				 "a NARROW member at offset 0 is rejected", false);
-	offsets_case(LION_CT_NARROW, los, n, tuple_lo(nblocks - 1, 0),
-				 "a NARROW member at offset 0 of the last block is rejected", false);
 
 	/* a run from one block into the next, written by hand */
 	lion_container_init(&buf_a.c, TEST_CKEY);
@@ -2891,15 +3070,18 @@ damage_iter_cb(uint16 lo, void *arg)
 
 /*
  * Every member a container stores, read raw rather than through the library
- * (which masks what it reads): is it below LION_CONTAINER_RANGE?  What a
- * result of the set algebra has to be, whatever its operands were, because a
- * result is handed on - onto a page, into another operation.
+ * (which masks what it reads): is it below LION_CONTAINER_RANGE?  And a
+ * NARROW's width one it can have.  What a result of the set algebra has to
+ * be, whatever its operands were, because a result is handed on - onto a
+ * page, into another operation.
  */
 static bool
 raw_in_range(const LionContainer *c)
 {
 	uint32		i;
 
+	if (c->type == LION_CT_NARROW)
+		return c->flags >= 1 && c->flags <= TEST_KMAX;
 	if (c->type == LION_CT_ARRAY)
 	{
 		const uint16 *arr = (const uint16 *) LION_CONTAINER_PAYLOAD(c);
@@ -3465,6 +3647,9 @@ damage_randomize(LionContainer *c)
 	c->ckey = TEST_CKEY;
 	c->type = (uint8) (rng_below(4) == 3 ? LION_CT_NARROW : LION_CT_ARRAY + rng_below(3));
 	c->flags = (uint8) rng_below(2);
+	/* a NARROW of any width, now and then one it cannot have (DESIGN.md §38) */
+	if (c->type == LION_CT_NARROW)
+		c->flags = (uint8) (rng_below(8) == 0 ? rng_next() : rng_below(TEST_KMAX + 2));
 	c->cardinality = (uint16) (k == 0 ? rng_below(LION_ARRAY_MAX_CARD + 1) : rng_next());
 	if (c->type == LION_CT_RUN)
 	{
@@ -3618,28 +3803,32 @@ test_inplace_growth(void)
 	}
 
 	/*
-	 * NARROWs (DESIGN.md §38) take a member at an offset below 128 in their
-	 * 1032 bytes, and none at 128 or more, which makes them a BITSET.
+	 * A NARROW of width k (DESIGN.md §38) takes a member at an offset below
+	 * 64 * k in its 8 + 512 * k bytes, and none at 64 * k or more, which
+	 * widens it - the general path, which rewrites the item.
 	 */
-	for (k = 0; k < 20; k++)
+	for (k = 0; k < 40; k++)
 	{
+		uint32		w;
+
 		gen_typed(&ref_a, &buf_a, LION_CT_NARROW);
+		w = buf_a.c.flags;
 		for (i = 0; i < 16; i++)
 		{
-			uint32		off = (i == 0) ? 0 : (i == 1) ? LION_NARROW_OFFSETS - 1 :
-				rng_below(LION_NARROW_OFFSETS);
+			uint32		off = (i == 0) ? 0 : (i == 1) ? 64 * w - 1 :
+				rng_below(64 * w);
 
-			inplace_add_one(&buf_a.c, LION_NARROW_SIZE,
+			inplace_add_one(&buf_a.c, LION_NARROW_SIZE(w),
 							(uint16) ((rng_below(LION_BLOCKS_PER_CONTAINER) << LION_OFFSET_BITS) | off));
 		}
 		for (i = 0; i < 8; i++)
 		{
-			uint32		off = (i == 0) ? LION_NARROW_OFFSETS :
-				LION_NARROW_OFFSETS + rng_below((1U << LION_OFFSET_BITS) - LION_NARROW_OFFSETS);
+			uint32		off = (i == 0) ? 64 * w :
+				64 * w + rng_below((1U << LION_OFFSET_BITS) - 64 * w);
 
 			CHECK(lion_container_inplace_need(&buf_a.c,
 											  (uint16) ((rng_below(LION_BLOCKS_PER_CONTAINER) << LION_OFFSET_BITS) | off)) == 0,
-				  "a NARROW cannot take a member at offset 128 or more in place");
+				  "a NARROW cannot take a member at offset 64 * k or more in place");
 		}
 	}
 
@@ -4511,30 +4700,43 @@ kern_ref_runs(const uint64 *w)
 	return n;
 }
 
+/* The narrowest width that holds every member of the image w. */
+static uint32
+kern_ref_width(const uint64 *w)
+{
+	uint32		k = 1;
+	uint32		i;
+
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
+		if (((w[i >> 6] >> (i & 63)) & 1) != 0)
+			k = Max(k, test_lo_width(i));
+	return k;
+}
+
 /*
  * The representation lion_container_optimize() chooses (DESIGN.md §3, §38)
- * for the members of the image w.
+ * for the members of the image w: is it c's, and a NARROW's width c's?
  */
-static uint8
-kern_ref_type(const uint64 *w, uint32 card, uint32 nruns)
+static bool
+kern_opt_ok(const LionContainer *c, const uint64 *w, uint32 card, uint32 nruns)
 {
+	uint32		k = kern_ref_width(w);
 	Size		asz = (card <= LION_ARRAY_MAX_CARD) ?
 		LION_CONTAINER_HDRSZ + (Size) card * sizeof(uint16) : SIZE_MAX;
 	Size		rsz = (nruns <= LION_RUN_MAX_NRUNS) ?
 		LION_CONTAINER_HDRSZ + sizeof(uint16) + (Size) nruns * sizeof(LionRun) : SIZE_MAX;
-	Size		nsz = LION_CONTAINER_HDRSZ + LION_NARROW_BYTES;
-	uint32		i;
+	Size		nsz = (k <= TEST_KMAX) ? LION_NARROW_SIZE(k) : SIZE_MAX;
+	uint8		t;
 
-	for (i = 0; i < LION_CONTAINER_RANGE; i++)
-		if (((w[i >> 6] >> (i & 63)) & 1) != 0 && !test_lo_narrow(i))
-			nsz = SIZE_MAX;
 	if (asz <= rsz && asz <= nsz && asz <= LION_CONTAINER_MAX_SIZE)
-		return LION_CT_ARRAY;
-	if (rsz <= nsz && rsz <= LION_CONTAINER_MAX_SIZE)
-		return LION_CT_RUN;
-	if (nsz <= LION_CONTAINER_MAX_SIZE)
-		return LION_CT_NARROW;
-	return LION_CT_BITSET;
+		t = LION_CT_ARRAY;
+	else if (rsz <= nsz && rsz <= LION_CONTAINER_MAX_SIZE)
+		t = LION_CT_RUN;
+	else if (nsz <= LION_CONTAINER_MAX_SIZE)
+		t = LION_CT_NARROW;
+	else
+		t = LION_CT_BITSET;
+	return c->type == t && (t != LION_CT_NARROW || c->flags == k);
 }
 
 /* Bits set with probability ppm / 1e6. */
@@ -4750,13 +4952,13 @@ kern_check_passes(const LionContainer *a, const LionContainer *b,
 		uint32		want = kern_ref_pass((LionBitsOp) op, wa, wb, kern_want);
 
 		memset(wd, 0x5A, LION_BITSET_BYTES);
-		if (lion_container_bits_pass((LionBitsOp) op, writes ? wd : NULL, wa, wb) != want ||
+		if (lion_container_bits_pass((LionBitsOp) op, TEST_FULL, writes ? wd : NULL, wa, wb) != want ||
 			(writes && memcmp(wd, kern_want, LION_BITSET_BYTES) != 0))
 			bad++;
 		if (!writes)
 			continue;
 		memcpy(we, wa, LION_BITSET_BYTES);
-		if (lion_container_bits_pass((LionBitsOp) op, we, we, wb) != want ||
+		if (lion_container_bits_pass((LionBitsOp) op, TEST_FULL, we, we, wb) != want ||
 			memcmp(we, kern_want, LION_BITSET_BYTES) != 0)
 			bad++;
 	}
@@ -4846,7 +5048,7 @@ test_kernels_one(void)
 				bad_raw++;
 			got = lion_container_and(a, b, d);
 			if (got != want || !kern_holds(d, kern_want) ||
-				d->type != kern_ref_type(kern_want, want, kern_ref_runs(kern_want)))
+				!kern_opt_ok(d, kern_want, want, kern_ref_runs(kern_want)))
 				bad_opt++;
 
 			/* OR */
@@ -4858,7 +5060,7 @@ test_kernels_one(void)
 				bad_raw++;
 			got = lion_container_or(a, b, d);
 			if (got != want || !kern_holds(d, kern_want) ||
-				d->type != kern_ref_type(kern_want, want, kern_ref_runs(kern_want)))
+				!kern_opt_ok(d, kern_want, want, kern_ref_runs(kern_want)))
 				bad_opt++;
 
 			/* OR in place: the new members counted, the words ORed */
@@ -4884,7 +5086,7 @@ test_kernels_one(void)
 				bad_raw++;
 			got = lion_container_andnot(a, b, d);
 			if (got != want || !kern_holds(d, kern_want) ||
-				d->type != kern_ref_type(kern_want, want, kern_ref_runs(kern_want)))
+				!kern_opt_ok(d, kern_want, want, kern_ref_runs(kern_want)))
 				bad_opt++;
 			for (i = 0; i < LION_BITSET_WORDS; i++)
 				kern_want[i] = kern_wb[i] & ~kern_wa[i];
@@ -4901,7 +5103,7 @@ test_kernels_one(void)
 			 */
 			memcpy(e, a, LION_CONTAINER_MAX_SIZE);
 			lion_container_optimize(e);
-			if (e->type != kern_ref_type(kern_wa, ca, kern_ref_runs(kern_wa)) ||
+			if (!kern_opt_ok(e, kern_wa, ca, kern_ref_runs(kern_wa)) ||
 				!kern_holds(e, kern_wa))
 				bad_opt++;
 			if (e->type != LION_CT_BITSET && e->cardinality > 0)
@@ -4953,35 +5155,72 @@ test_kernels_one(void)
 /* ----------------------------------------------------------------
  *						NARROW (DESIGN.md §38)
  *
- * The transitions into and out of a NARROW, optimize()'s choice of it
- * against the reference's sizes from every representation a set can arrive
- * in, the set algebra of operands whose members a NARROW holds, and damaged
- * NARROW payloads in buffers of exactly 1032 bytes.
+ * For each width k, 1 .. LION_NARROW_MAX_WIDTH: the transitions into and out
+ * of a NARROW of that width - optimize() past 256 * k members, remove() down
+ * to 256 * k, add() at offsets 64 * k - 1 and 64 * k and every offset that
+ * widens it - then optimize()'s choice against the reference's sizes from
+ * every representation and width a set can arrive in, the set algebra of
+ * operands of mixed widths, damaged payloads of every width and of a BITSET
+ * in buffers of exactly their size, and the kernel passes at every width.
+ * (256 * k and 512 * k are 8K's numbers; the tests use the macros.)
  * ----------------------------------------------------------------
  */
 
-static void
-test_narrow_transitions(void)
+/* Is c a bitmap of width k: a NARROW of it, or at the full width a BITSET? */
+static bool
+is_width(const LionContainer *c, uint32 k)
 {
+	if (k == TEST_FULL)
+		return c->type == LION_CT_BITSET && c->flags == 0;
+	return c->type == LION_CT_NARROW && c->flags == k;
+}
+
+/*
+ * The width add() of lo leaves a bitmap of width k at: k if it holds lo's
+ * offset, else the narrowest that does, and past LION_NARROW_MAX_WIDTH the
+ * full width, a BITSET.
+ */
+static uint32
+widened(uint32 k, uint32 lo)
+{
+	uint32		need = test_lo_width(lo);
+
+	if (need <= k)
+		return k;
+	return (need <= TEST_KMAX) ? need : TEST_FULL;
+}
+
+static void
+test_narrow_transitions(uint32 k)
+{
+	static CBuf saved;
+	static char width_phase[128];
+	uint32		cap = LION_WIDTH_ARRAY_CARD(k);
 	uint32		n;
-	uint32		k;
 	uint32		lo;
 	uint32		i;
+	uint32		j;
+	uint32		b;
+	uint32		t;
 
-	phase("NARROW: optimize() at 511, 512 and 513 members");
-	rng_seed(UINT64CONST(0x5EED3801));
-	for (n = 511; n <= 513; n++)
+	snprintf(width_phase, sizeof(width_phase), "NARROW of width %u: optimize() at 256 * k members", k);
+	phase(width_phase);
+	rng_seed(UINT64CONST(0x5EED3801) + k);
+	CHECK(cap == (LION_NARROW_SIZE(k) - LION_CONTAINER_HDRSZ) / sizeof(uint16),
+		  "a NARROW of width k is the size of an ARRAY of 256 * k members");
+	for (n = cap - 1; n <= cap + 1; n++)
 	{
-		gen_narrow_sparse(&ref_a, n);
+		gen_narrow_sparse(&ref_a, n, k);
+		CHECK(ref_width(&ref_a) == k, "the case needs width k");
 		build_by_append(&buf_a, &ref_a);
 		lion_container_optimize(&buf_a.c);
-		if (n <= LION_NARROW_ARRAY_CARD)
+		if (n <= cap)
 			CHECK(buf_a.c.type == LION_CT_ARRAY,
-				  "512 members or fewer are an ARRAY (512 ties a NARROW, and a tie goes to the ARRAY)");
+				  "256 * k members or fewer are an ARRAY (256 * k ties a NARROW of width k, and a tie goes to the ARRAY)");
 		else
-			CHECK(buf_a.c.type == LION_CT_NARROW &&
-				  lion_container_size(&buf_a.c) == 1032,
-				  "513 members at offsets below 128 are a NARROW of 1032 bytes");
+			CHECK(is_width(&buf_a.c, k) &&
+				  lion_container_size(&buf_a.c) == LION_NARROW_SIZE(k),
+				  "past 256 * k members at offsets below 64 * k are a NARROW of width k");
 		verify_full(&buf_a.c, &ref_a);
 
 		/* allow_narrow false: what optimize() made before §38 */
@@ -4989,140 +5228,181 @@ test_narrow_transitions(void)
 		CHECK(buf_a.c.type == LION_CT_ARRAY, "without NARROW the same set is an ARRAY");
 		verify_full(&buf_a.c, &ref_a);
 		lion_container_optimize(&buf_a.c);
-		CHECK((n > LION_NARROW_ARRAY_CARD) == (buf_a.c.type == LION_CT_NARROW),
-			  "and optimize() makes it a NARROW again past 512");
+		CHECK((n > cap) == is_width(&buf_a.c, k),
+			  "and optimize() makes it a NARROW of width k again past 256 * k");
 		verify_full(&buf_a.c, &ref_a);
 	}
 
-	phase("NARROW: remove() to 512 members makes an ARRAY");
-	gen_narrow_sparse(&ref_a, 516);
-	build_narrow_direct(&buf_a, &ref_a);
+	snprintf(width_phase, sizeof(width_phase), "NARROW of width %u: remove() to 256 * k members", k);
+	phase(width_phase);
+	gen_narrow_sparse(&ref_a, cap + 4, k);
+	build_narrow_direct(&buf_a, &ref_a, k);
 	verify_full(&buf_a.c, &ref_a);
-	while (ref_a.card > 509)
+	while (ref_a.card > cap - 3)
 	{
 		lo = ref_pick_member(&ref_a);
 		CHECK(lion_container_remove(&buf_a.c, (uint16) lo), "remove() of a member");
 		(void) ref_remove(&ref_a, lo);
-		CHECK((ref_a.card > LION_NARROW_ARRAY_CARD) == (buf_a.c.type == LION_CT_NARROW),
-			  "a NARROW down to 513 members, an ARRAY from 512");
+		CHECK((ref_a.card > cap) ? is_width(&buf_a.c, k) : buf_a.c.type == LION_CT_ARRAY,
+			  "a NARROW of width k down to 256 * k + 1 members, an ARRAY from 256 * k");
 		verify_full(&buf_a.c, &ref_a);
 	}
 
-	phase("NARROW: add() at offsets 127 and 128");
-	gen_narrow(&ref_a, 1000);
-	build_narrow_direct(&buf_a, &ref_a);
-	for (k = 0; k < LION_BLOCKS_PER_CONTAINER; k += 7)
+	snprintf(width_phase, sizeof(width_phase), "NARROW of width %u: add() at 64 * k - 1, and past it", k);
+	phase(width_phase);
+	gen_narrow(&ref_a, cap + 200, k);
+	build_narrow_direct(&buf_a, &ref_a, k);
+	for (b = 0; b < LION_BLOCKS_PER_CONTAINER; b += 7)
 	{
 		bool		isnew;
 
-		lo = (k << LION_OFFSET_BITS) | (LION_NARROW_OFFSETS - 1);
-		CHECK(lion_container_inplace_need(&buf_a.c, (uint16) lo) == LION_NARROW_SIZE,
-			  "offset 127: add() keeps a NARROW in its 1032 bytes");
+		lo = (b << LION_OFFSET_BITS) | (64 * k - 1);
+		CHECK(lion_container_inplace_need(&buf_a.c, (uint16) lo) == LION_NARROW_SIZE(k),
+			  "offset 64 * k - 1: add() keeps a NARROW of width k in its size");
 		isnew = ref_add(&ref_a, lo);
-		CHECK(lion_container_add(&buf_a.c, (uint16) lo) == isnew, "add() at offset 127");
-		CHECK(buf_a.c.type == LION_CT_NARROW, "... and the NARROW stays one");
+		CHECK(lion_container_add(&buf_a.c, (uint16) lo) == isnew, "add() at offset 64 * k - 1");
+		CHECK(is_width(&buf_a.c, k), "... and the NARROW keeps its width");
 		CHECK(!lion_container_add(&buf_a.c, (uint16) lo), "... and a second time adds nothing");
 	}
 	verify_full(&buf_a.c, &ref_a);
-	memcpy(&buf_b, &buf_a, LION_NARROW_SIZE);
+	memcpy(&saved, &buf_a, LION_NARROW_SIZE(k));
 	memcpy(&ref_b, &ref_a, sizeof(Ref));
 
-	lo = (5 << LION_OFFSET_BITS) | LION_NARROW_OFFSETS;
-	CHECK(!lion_container_contains(&buf_a.c, (uint16) lo),
-		  "a NARROW holds no member at offset 128");
-	CHECK(!lion_container_remove(&buf_a.c, (uint16) lo),
-		  "... removes none");
-	CHECK(lion_container_inplace_need(&buf_a.c, (uint16) lo) == 0,
-		  "... and cannot take one in place");
-	CHECK(lion_container_add(&buf_a.c, (uint16) lo), "add() at offset 128");
-	(void) ref_add(&ref_a, lo);
-	CHECK(buf_a.c.type == LION_CT_BITSET, "... makes the NARROW a BITSET");
-	verify_full(&buf_a.c, &ref_a);
-	lion_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == ref_opt_type(&ref_a, true) && buf_a.c.type != LION_CT_NARROW,
-		  "... which optimize() cannot make a NARROW again");
-	verify_full(&buf_a.c, &ref_a);
-	CHECK(lion_container_remove(&buf_a.c, (uint16) lo), "remove() of the member at offset 128");
-	(void) ref_remove(&ref_a, lo);
-	lion_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == LION_CT_NARROW &&
-		  memcmp(&buf_a, &buf_b, LION_NARROW_SIZE) == 0,
-		  "... and optimize() gives back the NARROW, byte for byte");
-	verify_full(&buf_a.c, &ref_a);
+	/* the first and the last offset of each word past the NARROW's */
+	for (j = k; j < TEST_FULL; j++)
+		for (t = 0; t < 2; t++)
+		{
+			uint32		off = 64 * j + ((t == 0) ? 0 : 63);
+			uint32		want;
 
-	/* the last lo of the container, at offset 511 */
-	CHECK(lion_container_add(&buf_b.c, LION_CONTAINER_RANGE - 1), "add() of lo 32767");
-	(void) ref_add(&ref_b, LION_CONTAINER_RANGE - 1);
-	CHECK(buf_b.c.type == LION_CT_BITSET, "... makes a BITSET");
-	verify_full(&buf_b.c, &ref_b);
+			memcpy(&buf_a, &saved, LION_NARROW_SIZE(k));
+			memcpy(&ref_a, &ref_b, sizeof(Ref));
+			lo = (rng_below(LION_BLOCKS_PER_CONTAINER) << LION_OFFSET_BITS) | off;
+			want = widened(k, lo);
+			CHECK(want == ((j + 1 <= TEST_KMAX) ? j + 1 : TEST_FULL),
+				  "the case widens to the next word a block's width");
+			CHECK(!lion_container_contains(&buf_a.c, (uint16) lo),
+				  "a NARROW of width k holds no member at offset 64 * k or more");
+			CHECK(!lion_container_remove(&buf_a.c, (uint16) lo), "... removes none");
+			CHECK(lion_container_inplace_need(&buf_a.c, (uint16) lo) == 0,
+				  "... and cannot take one in place");
+			CHECK(lion_container_add(&buf_a.c, (uint16) lo), "add() past its offsets");
+			(void) ref_add(&ref_a, lo);
+			CHECK(is_width(&buf_a.c, want),
+				  "... widens it to the narrowest width that holds the member, past LION_NARROW_MAX_WIDTH a BITSET");
+			verify_full(&buf_a.c, &ref_a);
+			lion_container_optimize(&buf_a.c);
+			CHECK(ref_opt_ok(&buf_a.c, &ref_a, true),
+				  "... which optimize() makes the reference's representation");
+			verify_full(&buf_a.c, &ref_a);
+			CHECK(lion_container_remove(&buf_a.c, (uint16) lo), "remove() of the member");
+			(void) ref_remove(&ref_a, lo);
+			lion_container_optimize(&buf_a.c);
+			CHECK(is_width(&buf_a.c, k) &&
+				  memcmp(&buf_a, &saved, LION_NARROW_SIZE(k)) == 0,
+				  "... and optimize() without it gives back the NARROW of width k, byte for byte");
+		}
+
+	/* the last lo of the container, at offset 511 at 8K */
+	memcpy(&buf_a, &saved, LION_NARROW_SIZE(k));
+	memcpy(&ref_a, &ref_b, sizeof(Ref));
+	CHECK(lion_container_add(&buf_a.c, LION_CONTAINER_RANGE - 1), "add() of the last lo");
+	(void) ref_add(&ref_a, LION_CONTAINER_RANGE - 1);
+	CHECK(is_width(&buf_a.c, TEST_FULL), "... makes a BITSET");
+	verify_full(&buf_a.c, &ref_a);
 
 	/* append_sorted() on a NARROW, which no builder makes: as add() */
-	build_narrow_direct(&buf_a, &ref_a);
+	memcpy(&buf_a, &saved, LION_NARROW_SIZE(k));
+	memcpy(&ref_a, &ref_b, sizeof(Ref));
 	lion_container_append_sorted(&buf_a.c, 3);
 	(void) ref_add(&ref_a, 3);
-	CHECK(buf_a.c.type == LION_CT_NARROW, "append_sorted() of offset 3 keeps a NARROW");
+	lo = ((LION_BLOCKS_PER_CONTAINER - 1) << LION_OFFSET_BITS) | (64 * k - 1);
+	lion_container_append_sorted(&buf_a.c, (uint16) lo);
+	(void) ref_add(&ref_a, lo);
+	CHECK(is_width(&buf_a.c, k), "append_sorted() of offsets below 64 * k keeps the NARROW");
+	verify_full(&buf_a.c, &ref_a);
+	lion_container_append_sorted(&buf_a.c, (uint16) (lo + 1));
+	(void) ref_add(&ref_a, lo + 1);
+	CHECK(is_width(&buf_a.c, widened(k, lo + 1)),
+		  "append_sorted() of offset 64 * k widens it, as add() does");
 	verify_full(&buf_a.c, &ref_a);
 
-	phase("NARROW: runs of members are not runs of the payload's bits");
+	snprintf(width_phase, sizeof(width_phase), "NARROW of width %u: runs of members are not runs of bits", k);
+	phase(width_phase);
 	ref_init(&ref_a);
 	for (i = 0; i < LION_CONTAINER_RANGE; i++)
-		if (test_lo_narrow(i))
+		if (test_lo_fits(i, k))
 			(void) ref_add(&ref_a, i);
-	build_narrow_direct(&buf_a, &ref_a);
+	build_narrow_direct(&buf_a, &ref_a, k);
 	verify_full(&buf_a.c, &ref_a);
 	lion_container_optimize(&buf_a.c);
 	CHECK(buf_a.c.type == LION_CT_RUN &&
 		  LION_RUN_NRUNS(&buf_a.c) == LION_BLOCKS_PER_CONTAINER,
-		  "every offset below 128 of every block: one run a block, 64 in all");
+		  "every offset below 64 * k of every block: one run a block");
 	verify_full(&buf_a.c, &ref_a);
 	lion_container_optimize_ext(&buf_a.c, false);
 	CHECK(buf_a.c.type == LION_CT_RUN, "... with or without NARROW");
 
 	/*
-	 * Four runs a block, the last ending at offset 127 and the first
-	 * starting at 0: 256 runs of members, a RUN of 1034 bytes, so a NARROW;
-	 * as runs of the payload's bits they would be 193, a RUN of 782.
+	 * 2 * k runs a block, the last ending at offset 64 * k - 1 and the first
+	 * starting at 0: a RUN of 10 + 512 * k bytes, two more than the NARROW of
+	 * width k, which it therefore is; as runs of the payload's bits they
+	 * would be a block fewer less one, a RUN smaller than the NARROW.
 	 */
 	ref_init(&ref_a);
-	for (k = 0; k < LION_BLOCKS_PER_CONTAINER; k++)
-		for (i = 0; i < LION_NARROW_OFFSETS; i++)
-			if (i < 10 || (i >= 30 && i < 40) || (i >= 60 && i < 70) || i >= 118)
-				(void) ref_add(&ref_a, (k << LION_OFFSET_BITS) | i);
-	CHECK(ref_nruns(&ref_a) == 256 && ref_opt_type(&ref_a, true) == LION_CT_NARROW,
-		  "the case has 256 runs, and is a NARROW");
+	for (b = 0; b < LION_BLOCKS_PER_CONTAINER; b++)
+		for (j = 0; j < 2 * k; j++)
+		{
+			uint32		start = (j == 2 * k - 1) ? 64 * k - 10 : 32 * j;
+
+			for (i = start; i < start + 10; i++)
+				(void) ref_add(&ref_a, (b << LION_OFFSET_BITS) | i);
+		}
+	CHECK(ref_nruns(&ref_a) == LION_BLOCKS_PER_CONTAINER * 2 * k &&
+		  ref_opt_type(&ref_a, true) == LION_CT_NARROW && ref_width(&ref_a) == k,
+		  "the case has 2 * k runs a block, and is a NARROW of width k");
 	build_by_append(&buf_a, &ref_a);
 	lion_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == LION_CT_NARROW, "a BITSET of them optimizes to a NARROW");
-	build_narrow_direct(&buf_a, &ref_a);
+	CHECK(is_width(&buf_a.c, k), "a BITSET of them optimizes to a NARROW of width k");
+	build_narrow_direct(&buf_a, &ref_a, k);
 	lion_container_optimize(&buf_a.c);
-	CHECK(buf_a.c.type == LION_CT_NARROW,
+	CHECK(is_width(&buf_a.c, k),
 		  "a NARROW's runs that meet across a block boundary are counted as two");
 	verify_full(&buf_a.c, &ref_a);
+	if (k < TEST_KMAX)
+	{
+		build_narrow_direct(&buf_a, &ref_a, k + 1);
+		verify_full(&buf_a.c, &ref_a);
+		lion_container_optimize(&buf_a.c);
+		CHECK(is_width(&buf_a.c, k), "... and one a word a block wider optimizes to width k");
+	}
 	lion_container_optimize_ext(&buf_a.c, false);
-	CHECK(buf_a.c.type == LION_CT_RUN && LION_RUN_NRUNS(&buf_a.c) == 256,
-		  "... and without NARROW it is a RUN of 256 runs");
+	CHECK(buf_a.c.type == LION_CT_RUN &&
+		  LION_RUN_NRUNS(&buf_a.c) == LION_BLOCKS_PER_CONTAINER * 2 * k,
+		  "... and without NARROW it is a RUN of them");
 	verify_full(&buf_a.c, &ref_a);
 
-	phase("NARROW: remove_if() and remove_range()");
-	for (k = 0; k < 40; k++)
+	snprintf(width_phase, sizeof(width_phase), "NARROW of width %u: remove_if() and remove_range()", k);
+	phase(width_phase);
+	for (t = 0; t < 12; t++)
 	{
 		uint32		s;
 		uint32		e;
 		uint32		want;
 
-		gen_narrow(&ref_a, 520 + rng_below(k < 20 ? 200 : 6000));
-		build_narrow_direct(&buf_a, &ref_a);
-		want = ref_remove_if(&ref_a, (k % 2) ? pred_mod3 : pred_even);
-		CHECK(lion_container_remove_if(&buf_a.c, (k % 2) ? pred_mod3 : pred_even, NULL) == want,
+		gen_narrow(&ref_a, cap + 8 + rng_below(t < 6 ? 200 : 3000 * k), k);
+		build_narrow_direct(&buf_a, &ref_a, k);
+		want = ref_remove_if(&ref_a, (t % 2) ? pred_mod3 : pred_even);
+		CHECK(lion_container_remove_if(&buf_a.c, (t % 2) ? pred_mod3 : pred_even, NULL) == want,
 			  "remove_if() of a NARROW removes what the reference does");
-		CHECK((ref_a.card > LION_NARROW_ARRAY_CARD) == (buf_a.c.type == LION_CT_NARROW),
-			  "remove_if() leaves a NARROW past 512 members, an ARRAY at 512 or fewer");
+		CHECK((ref_a.card > cap) ? is_width(&buf_a.c, k) : buf_a.c.type == LION_CT_ARRAY,
+			  "remove_if() leaves a NARROW of width k past 256 * k members, an ARRAY at 256 * k or fewer");
 		verify_full(&buf_a.c, &ref_a);
 
-		build_narrow_direct(&buf_a, &ref_a);
+		build_narrow_direct(&buf_a, &ref_a, k);
 		for (i = 0; i < 20; i++)
 		{
-			/* inside a block, across offset 128, across blocks */
+			/* inside a block, across offset 64 * k, across blocks */
 			s = rng_below(LION_CONTAINER_RANGE);
 			e = s + ((i % 3 == 0) ? rng_below(64) : (i % 3 == 1) ? rng_below(600) :
 					 rng_below(8000));
@@ -5138,17 +5418,18 @@ test_narrow_transitions(void)
 		CHECK(lion_container_remove_range(&buf_a.c, (uint16) s, (uint16) e) == want,
 			  "remove_range() of a NARROW removes what the reference does");
 		(void) ref_remove_range(&ref_a, s, e);
-		CHECK((ref_a.card > LION_NARROW_ARRAY_CARD) == (buf_a.c.type == LION_CT_NARROW),
-			  "remove_range() leaves a NARROW past 512 members, an ARRAY at 512 or fewer");
+		CHECK((ref_a.card > cap || want == 0) ? is_width(&buf_a.c, k) :
+			  buf_a.c.type == LION_CT_ARRAY,
+			  "remove_range() leaves a NARROW of width k past 256 * k members, an ARRAY at 256 * k or fewer, and one it removes nothing from as it was");
 		verify_full(&buf_a.c, &ref_a);
 	}
 }
 
 /*
- * optimize() from every representation a set can be in: the reference's
- * choice, and the same bytes whichever it started from - its result is a
- * function of the members (and allow_narrow) alone, which VACUUM's rewrite
- * and the set algebra's results rely on.
+ * optimize() from every representation and width a set can be in: the
+ * reference's choice, and the same bytes whichever it started from - its
+ * result is a function of the members (and allow_narrow) alone, which
+ * VACUUM's rewrite and the set algebra's results rely on.
  */
 static void
 test_narrow_optimize(void)
@@ -5156,39 +5437,49 @@ test_narrow_optimize(void)
 	static CBuf first;
 	uint32		trial;
 
-	phase("NARROW: optimize() from every representation, against the sizes");
+	phase("NARROW: optimize() from every representation and width, against the sizes");
 	rng_seed(UINT64CONST(0x5EED3802));
-	for (trial = 0; trial < 400; trial++)
+	for (trial = 0; trial < 600; trial++)
 	{
+		uint32		k = rand_width();
+		uint32		cap = LION_WIDTH_ARRAY_CARD(k);
 		int			allow;
 
-		switch (trial % 8)
+		switch (trial % 9)
 		{
 			case 0:
-				gen_narrow(&ref_a, 400 + rng_below(700));
+				/* around the ARRAY / NARROW boundary */
+				gen_narrow(&ref_a, cap - cap / 4 + rng_below(cap / 2), k);
 				break;
 			case 1:
-				gen_narrow(&ref_a, 1 + rng_below(8000));
+				gen_narrow(&ref_a, 1 + rng_below(LION_BLOCKS_PER_CONTAINER * 58 * k), k);
 				break;
 			case 2:
-				gen_narrow_sparse(&ref_a, 480 + rng_below(64));
+				gen_narrow_sparse(&ref_a, cap - 32 + rng_below(64), k);
 				break;
 			case 3:
-				/* around the RUN / NARROW boundary of 255 runs */
-				gen_narrow_runs(&ref_a, 200 + rng_below(120), 2, 12, false);
+				/* around the RUN / NARROW boundary, at 128 * k - 1 runs at 8K */
+				gen_narrow_runs(&ref_a, cap / 2 - 40 * k + rng_below(80 * k), 2, 12, false, k);
 				break;
 			case 4:
-				/* runs ending at offset 127 and starting at offset 0 */
-				gen_narrow_runs(&ref_a, 200 + rng_below(120), 2, 30, true);
+				/* runs ending at offset 64 * k - 1 and starting at offset 0 */
+				gen_narrow_runs(&ref_a, cap / 2 - 40 * k + rng_below(80 * k), 2, 30, true, k);
 				break;
 			case 5:
-				gen_narrow_runs(&ref_a, 1 + rng_below(80), 40, 128, trial % 16 == 5);
+				gen_narrow_runs(&ref_a, 1 + rng_below(80), 40, 64 * k, trial % 18 == 5, k);
 				break;
 			case 6:
-				/* one member a NARROW cannot hold */
-				gen_narrow(&ref_a, 600 + rng_below(3000));
+				/* one member no NARROW holds */
+				gen_narrow(&ref_a, 600 + rng_below(3000), k);
 				(void) ref_add(&ref_a, (rng_below(LION_BLOCKS_PER_CONTAINER) << LION_OFFSET_BITS) |
-							   (LION_NARROW_OFFSETS + rng_below(LION_NARROW_OFFSETS * 3)));
+							   (64 * TEST_KMAX + rng_below(64 * (TEST_FULL - TEST_KMAX))));
+				break;
+			case 7:
+				/* one member a wider NARROW holds */
+				gen_narrow(&ref_a, cap + rng_below(2000), k);
+				if (k < TEST_KMAX)
+					(void) ref_add(&ref_a, (rng_below(LION_BLOCKS_PER_CONTAINER) << LION_OFFSET_BITS) |
+								   (64 * k + rng_below(64 * (TEST_KMAX - k))));
 				break;
 			default:
 				gen_random(&ref_a, 1 + rng_below(3000));
@@ -5197,11 +5488,11 @@ test_narrow_optimize(void)
 
 		for (allow = 0; allow < 2; allow++)
 		{
-			uint8		want = ref_opt_type(&ref_a, allow != 0);
+			uint32		rw = ref_width(&ref_a);
 			int			from;
 			bool		have = false;
 
-			for (from = 0; from < 4; from++)
+			for (from = 0; from < 5; from++)
 			{
 				switch (from)
 				{
@@ -5217,14 +5508,21 @@ test_narrow_optimize(void)
 							continue;
 						build_run_direct(&buf_a, &ref_a);
 						break;
-					default:
-						if (!ref_narrow_ok(&ref_a))
+					case 3:
+						if (rw > TEST_KMAX)
 							continue;
-						build_narrow_direct(&buf_a, &ref_a);
+						build_narrow_direct(&buf_a, &ref_a, rw);
+						break;
+					default:
+						/* a NARROW wider than its members need */
+						if (rw >= TEST_KMAX)
+							continue;
+						build_narrow_direct(&buf_a, &ref_a, rw + 1 + rng_below(TEST_KMAX - rw));
 						break;
 				}
 				lion_container_optimize_ext(&buf_a.c, allow != 0);
-				CHECK(buf_a.c.type == want, "optimize_ext() picks the reference's representation");
+				CHECK(ref_opt_ok(&buf_a.c, &ref_a, allow != 0),
+					  "optimize_ext() picks the reference's representation, and a NARROW's width");
 				if (!have)
 				{
 					verify_full(&buf_a.c, &ref_a);
@@ -5234,76 +5532,80 @@ test_narrow_optimize(void)
 				else
 					CHECK(lion_container_size(&buf_a.c) == lion_container_size(&first.c) &&
 						  memcmp(&buf_a, &first, lion_container_size(&first.c)) == 0,
-						  "optimize_ext() makes the same bytes from every representation");
+						  "optimize_ext() makes the same bytes from every representation and width");
 			}
 		}
 	}
 }
 
-/* buf_a and buf_b of narrow-shaped members, each in representation t. */
+/* r of members a NARROW of width k holds, in representation t. */
 static void
-gen_typed_narrow(Ref *r, CBuf *b, LionContainerType t)
+gen_typed_narrow(Ref *r, CBuf *b, LionContainerType t, uint32 k)
 {
+	uint32		cap = LION_WIDTH_ARRAY_CARD(k);
+
 	switch (t)
 	{
 		case LION_CT_ARRAY:
-			gen_narrow_sparse(r, 1 + rng_below(500));
+			gen_narrow_sparse(r, 1 + rng_below(cap), k);
 			build_by_append(b, r);
 			lion_container_optimize(&b->c);
 			break;
 		case LION_CT_RUN:
-			gen_narrow_runs(r, 1 + rng_below(60), 20, 128, rng_below(2) == 0);
+			gen_narrow_runs(r, 1 + rng_below(60), 20, 64 * k, rng_below(2) == 0, k);
 			build_by_append(b, r);
 			lion_container_optimize(&b->c);
 			break;
 		case LION_CT_BITSET:
-			gen_narrow(r, 1 + rng_below(6000));
+			gen_narrow(r, 1 + rng_below(LION_BLOCKS_PER_CONTAINER * 45 * k), k);
 			build_by_append(b, r);
 			lion_container_to_bitset(&b->c);
 			break;
 		default:
-			gen_narrow(r, 600 + rng_below(5000));
+			gen_narrow(r, cap + 50 + rng_below(6 * cap), k);
 			build_by_append(b, r);
 			lion_container_optimize(&b->c);
+			CHECK(is_width(&b->c, k), "generator produced a NARROW of the width it asked for");
 			break;
 	}
 	CHECK(b->c.type == t, "generator produced the requested representation");
 }
 
 /*
- * The representation the unoptimized forms build a NARROW's result in
- * (lion_container.h): an AND with a NARROW and no ARRAY a NARROW (two RUNs
- * aside), an OR of two NARROWs a NARROW and of a NARROW and a BITSET or a
- * RUN a BITSET, an ANDNOT of a NARROW a NARROW.  Operands not empty.
+ * The representation the unoptimized forms build a bitmap result in
+ * (lion_container.h): an AND with no ARRAY at the narrower bitmap operand's
+ * width (two RUNs aside), an OR of two bitmaps at the wider's and of a
+ * bitmap and anything else at the full width, an ANDNOT of a bitmap at its
+ * width and of a RUN at the full width.  Operands not empty.
  */
 static void
-check_narrow_raw_types(void)
+check_raw_widths(void)
 {
 	const LionContainer *a = &buf_a.c;
 	const LionContainer *b = &buf_b.c;
-	bool		an = (a->type == LION_CT_NARROW);
-	bool		bn = (b->type == LION_CT_NARROW);
+	uint32		wa = test_width(a);
+	uint32		wb = test_width(b);
 	bool		aa = (a->type == LION_CT_ARRAY);
 	bool		ba = (b->type == LION_CT_ARRAY);
 
 	if (a->cardinality == 0 || b->cardinality == 0)
 		return;
 	(void) lion_container_and_raw(a, b, &buf_d.c);
-	if ((an || bn) && !aa && !ba)
-		CHECK(buf_d.c.type == LION_CT_NARROW,
-			  "and_raw() of a NARROW and no ARRAY builds a NARROW");
+	if ((wa || wb) && !aa && !ba)
+		CHECK(is_width(&buf_d.c, (wa && wb) ? Min(wa, wb) : Max(wa, wb)),
+			  "and_raw() of a bitmap and no ARRAY builds a bitmap of the narrower bitmap's width");
 	(void) lion_container_or_raw(a, b, &buf_d.c);
-	if (an && bn)
-		CHECK(buf_d.c.type == LION_CT_NARROW, "or_raw() of two NARROWs builds a NARROW");
-	else if ((an || bn) && !(aa && ba))
-		CHECK(buf_d.c.type == LION_CT_BITSET,
-			  "or_raw() of a NARROW and another kind builds a BITSET");
+	if (wa && wb)
+		CHECK(is_width(&buf_d.c, Max(wa, wb)),
+			  "or_raw() of two bitmaps builds a bitmap of the wider one's width");
+	else if ((wa || wb) && !(aa && ba))
+		CHECK(is_width(&buf_d.c, TEST_FULL),
+			  "or_raw() of a bitmap and another kind builds a BITSET");
 	(void) lion_container_andnot_raw(a, b, &buf_d.c);
-	if (an)
-		CHECK(buf_d.c.type == LION_CT_NARROW, "andnot_raw() of a NARROW builds a NARROW");
+	if (wa)
+		CHECK(is_width(&buf_d.c, wa), "andnot_raw() of a bitmap builds one of its width");
 	else if (!aa)
-		CHECK(buf_d.c.type == LION_CT_BITSET,
-			  "andnot_raw() of a BITSET or a RUN builds a BITSET");
+		CHECK(is_width(&buf_d.c, TEST_FULL), "andnot_raw() of a RUN builds a BITSET");
 }
 
 static void
@@ -5314,67 +5616,108 @@ test_setops_narrow(void)
 	uint32		tb;
 	uint32		trial;
 
-	phase("set algebra of members a NARROW holds, all 16 type combinations");
+	phase("set algebra of members NARROWs of mixed widths hold, all 16 type combinations");
 	rng_seed(UINT64CONST(0x5EED3803));
 	for (ta = 0; ta < lengthof(types); ta++)
 		for (tb = 0; tb < lengthof(types); tb++)
-			for (trial = 0; trial < 12; trial++)
+			for (trial = 0; trial < 16; trial++)
 			{
-				gen_typed_narrow(&ref_a, &buf_a, types[ta]);
+				uint32		ka = rand_width();
+				uint32		kb = (trial % 4 == 1) ? ka : rand_width();
+
+				gen_typed_narrow(&ref_a, &buf_a, types[ta], ka);
 				if (trial % 4 == 3)
 					gen_typed(&ref_b, &buf_b, types[tb]);	/* and anywhere */
 				else
-					gen_typed_narrow(&ref_b, &buf_b, types[tb]);
+					gen_typed_narrow(&ref_b, &buf_b, types[tb], kb);
 				run_binops();
-				check_narrow_raw_types();
+				check_raw_widths();
 			}
 }
 
 /*
- * Damaged NARROWs, each in a heap buffer of exactly LION_NARROW_SIZE bytes:
- * every reader on it where it lies, every mutator on a copy of its 1032
- * bytes in a LION_CONTAINER_MAX_SIZE buffer, and add() of a member it holds
- * in place, in an exact 1032 bytes again.  Every bit of the payload is a
- * legal member, so what a damaged NARROW can get wrong is its cardinality,
- * which check() has to find.
+ * Damaged bitmaps of every width, a BITSET's among them, each in a heap
+ * buffer of exactly its size: every reader on it where it lies, every
+ * mutator on a copy in a LION_CONTAINER_MAX_SIZE buffer, and add() of a
+ * member it holds in place, in an exact buffer again.  Every bit of the
+ * payload is a legal member, so what a damaged bitmap can get wrong is its
+ * cardinality, which check() has to find - and a NARROW its width, which
+ * check() has to find too, and which the library reads as the nearest
+ * width it can have, 1 for 0 and LION_NARROW_MAX_WIDTH for anything past
+ * it, so that it never reads past the size lion_container_size() gives.
  */
 static void
-test_damaged_narrow(uint32 iters, uint64 seed)
+test_damaged_widths(uint32 iters, uint64 seed)
 {
-	LionContainer *nc = exact_alloc(LION_NARROW_SIZE);
-	LionContainer *ip = exact_alloc(LION_NARROW_SIZE);
-	uint64	   *w = TEST_NARROW_DATA(nc);
+	LionContainer *nc[LION_BITSET_WIDTH + 1];
+	LionContainer *ip[LION_BITSET_WIDTH + 1];
 	uint32		it;
+	uint32		k;
 
-	phase("damaged: NARROW payloads in exact 1032-byte buffers");
+	for (k = 1; k <= TEST_FULL; k++)
+	{
+		Size		sz = (k == TEST_FULL) ? LION_CONTAINER_MAX_SIZE : LION_NARROW_SIZE(k);
+
+		nc[k] = (k <= TEST_KMAX || k == TEST_FULL) ? exact_alloc(sz) : NULL;
+		ip[k] = (k <= TEST_KMAX || k == TEST_FULL) ? exact_alloc(sz) : NULL;
+	}
+
+	phase("damaged: bitmaps of every width in exact buffers");
 	rng_seed(seed);
 	for (it = 0; it < iters; it++)
 	{
 		DamageIter	st;
 		const char *why;
+		LionContainer *c;
+		uint64	   *w;
+		Size		sz;
+		uint32		nwords;
 		uint32		truth = 0;
 		uint32		i;
 		uint32		n;
 		uint32		lo = rng_below(LION_CONTAINER_RANGE);
 		uint32		s = rng_below(LION_CONTAINER_RANGE);
 		uint32		e = s + rng_below(LION_CONTAINER_RANGE - s);
-		uint32		k = rng_below(4);
+		uint32		how = rng_below(4);
+		bool		badwidth = false;
 		uint64		mask;
 
-		for (i = 0; i < LION_NARROW_SIZE; i++)
-			((char *) nc)[i] = (char) rng_next();
-		if (k == 1)
-			for (i = 0; i < LION_NARROW_WORDS; i++)
+		k = 1 + rng_below(TEST_KMAX + 1);
+		if (k > TEST_KMAX)
+			k = TEST_FULL;
+		c = nc[k];
+		w = TEST_NARROW_DATA(c);
+		sz = (k == TEST_FULL) ? LION_CONTAINER_MAX_SIZE : LION_NARROW_SIZE(k);
+		nwords = LION_WIDTH_WORDS(k);
+
+		for (i = 0; i < sz; i++)
+			((char *) c)[i] = (char) rng_next();
+		if (how == 1)
+			for (i = 0; i < nwords; i++)
 				w[i] &= ((uint64) rng_next() << 32 | rng_next()) &
 					((uint64) rng_next() << 32 | rng_next());
-		for (i = 0; i < LION_NARROW_WORDS; i++)
+		for (i = 0; i < nwords; i++)
 			truth += (uint32) __builtin_popcountll(w[i]);
-		nc->ckey = TEST_CKEY;
-		nc->type = LION_CT_NARROW;
-		nc->flags = 0;
-		nc->cardinality = (uint16) ((k <= 1) ? truth :
-									(k == 2) ? rng_below(LION_CONTAINER_RANGE + 1) :
-									rng_next());
+		c->ckey = TEST_CKEY;
+		c->type = (k == TEST_FULL) ? LION_CT_BITSET : LION_CT_NARROW;
+		c->flags = (k == TEST_FULL) ? 0 : (uint8) k;
+		c->cardinality = (uint16) ((how <= 1) ? truth :
+								   (how == 2) ? rng_below(LION_CONTAINER_RANGE + 1) :
+								   rng_next());
+
+		/* a width this build does not have, read as the nearest it has */
+		if (k == 1 && rng_below(4) == 0)
+		{
+			c->flags = 0;
+			badwidth = true;
+		}
+		else if (k == TEST_KMAX && rng_below(4) == 0)
+		{
+			c->flags = (uint8) (TEST_KMAX + 1 + rng_below(255 - TEST_KMAX));
+			badwidth = true;
+		}
+		CHECK(lion_container_size(c) == sz,
+			  "damaged: a bitmap's size is its width's, a bad width read as the nearest");
 
 		if (rng_below(2) == 0)
 		{
@@ -5384,73 +5727,93 @@ test_damaged_narrow(uint32 iters, uint64 seed)
 		else
 			damage_randomize(dmg_b);
 
-		/* readers, on the NARROW where it lies */
-		CHECK(lion_container_check(nc, LION_NARROW_SIZE, &why) == (nc->cardinality == truth),
-			  "damaged: check() of a NARROW passes exactly when its cardinality is its payload's");
-		(void) lion_container_check_offsets(nc, TEST_MAXOFF, &why);
-		CHECK(lion_container_narrow_feasible(nc), "damaged: a NARROW is always narrow_feasible()");
-		(void) lion_container_inplace_need(nc, (uint16) lo);
-		(void) lion_container_contains(nc, (uint16) lo);
-		CHECK(lion_container_range_cardinality(nc, 0, LION_CONTAINER_RANGE - 1) == truth ||
-			  nc->cardinality == 0,
+		/* readers, on the bitmap where it lies */
+		CHECK(lion_container_check(c, sz, &why) == (c->cardinality == truth && !badwidth),
+			  "damaged: check() of a bitmap passes exactly when its width is one it can have and its cardinality is its payload's");
+		(void) lion_container_check_offsets(c, TEST_MAXOFF, &why);
+		CHECK(lion_container_min_width(c) <= k,
+			  "damaged: min_width() of a bitmap is at most its width");
+		(void) lion_container_inplace_need(c, (uint16) lo);
+		(void) lion_container_contains(c, (uint16) lo);
+		CHECK(lion_container_range_cardinality(c, 0, LION_CONTAINER_RANGE - 1) == truth ||
+			  c->cardinality == 0,
 			  "damaged: range_cardinality() counts the payload, not the header");
-		(void) lion_container_range_cardinality(nc, (uint16) s, (uint16) e);
+		(void) lion_container_range_cardinality(c, (uint16) s, (uint16) e);
 
 		st.n = 0;
 		st.bad = 0;
 		st.blocks = 0;
-		lion_container_iterate(nc, damage_iter_cb, &st);
+		lion_container_iterate(c, damage_iter_cb, &st);
 		CHECK(st.n == truth && st.bad == 0,
-			  "damaged: iterate() of a NARROW hands out its payload's members, in range");
+			  "damaged: iterate() of a bitmap hands out its payload's members, in range");
 		memset(dmg_img, 0, LION_BITSET_BYTES);
-		lion_container_or_into_bitset(nc, dmg_img);
+		lion_container_or_into_bitset(c, dmg_img);
 		CHECK(guard_ok(dmg_img, LION_BITSET_BYTES) && img_card(dmg_img) == truth,
-			  "damaged: or_into_bitset() of a NARROW sets its payload's members");
-		mask = lion_container_block_mask(nc);
+			  "damaged: or_into_bitset() of a bitmap sets its payload's members");
+		mask = lion_container_block_mask(c);
 		CHECK(mask == st.blocks && mask == image_blocks(dmg_img),
-			  "damaged: block_mask() of a NARROW names the blocks its members are on");
-		n = lion_container_to_array(nc, dmg_out);
-		CHECK(n == truth, "damaged: to_array() of a NARROW writes its payload's members");
-		(void) lion_container_and_cardinality(nc, dmg_b);
-		(void) lion_container_and_cardinality(dmg_b, nc);
-		(void) lion_container_mark_members(nc, dmg_out, Min(n, 100), (uint64 *) scratch_img);
+			  "damaged: block_mask() of a bitmap names the blocks its members are on");
+		n = lion_container_to_array(c, dmg_out);
+		CHECK(n == truth, "damaged: to_array() of a bitmap writes its payload's members");
+		(void) lion_container_and_cardinality(c, dmg_b);
+		(void) lion_container_and_cardinality(dmg_b, c);
+		(void) lion_container_mark_members(c, dmg_out, Min(n, 100), (uint64 *) scratch_img);
 
 #define DAMAGE_SETOP(what, stmt) \
 	do { \
 		stmt; \
 		CHECK(lion_container_size(dmg_dst) <= LION_CONTAINER_MAX_SIZE && \
 			  raw_in_range(dmg_dst), \
-			  "damaged: " what " of a NARROW leaves a result in range"); \
+			  "damaged: " what " of a bitmap leaves a result in range"); \
 	} while (0)
 
-		DAMAGE_SETOP("and()", (void) lion_container_and(nc, dmg_b, dmg_dst));
-		DAMAGE_SETOP("and()", (void) lion_container_and(dmg_b, nc, dmg_dst));
-		DAMAGE_SETOP("or()", (void) lion_container_or(nc, dmg_b, dmg_dst));
-		DAMAGE_SETOP("or()", (void) lion_container_or(dmg_b, nc, dmg_dst));
-		DAMAGE_SETOP("andnot()", (void) lion_container_andnot(nc, dmg_b, dmg_dst));
-		DAMAGE_SETOP("andnot()", (void) lion_container_andnot(dmg_b, nc, dmg_dst));
-		DAMAGE_SETOP("and_raw()", (void) lion_container_and_raw(nc, dmg_b, dmg_dst));
-		DAMAGE_SETOP("and_raw()", (void) lion_container_and_raw(dmg_b, nc, dmg_dst));
-		DAMAGE_SETOP("or_raw()", (void) lion_container_or_raw(nc, dmg_b, dmg_dst));
-		DAMAGE_SETOP("or_raw()", (void) lion_container_or_raw(dmg_b, nc, dmg_dst));
-		DAMAGE_SETOP("andnot_raw()", (void) lion_container_andnot_raw(nc, dmg_b, dmg_dst));
-		DAMAGE_SETOP("andnot_raw()", (void) lion_container_andnot_raw(dmg_b, nc, dmg_dst));
-		DAMAGE_SETOP("and_raw() with itself", (void) lion_container_and_raw(nc, nc, dmg_dst));
-		DAMAGE_SETOP("or_raw() with itself", (void) lion_container_or_raw(nc, nc, dmg_dst));
+		DAMAGE_SETOP("and()", (void) lion_container_and(c, dmg_b, dmg_dst));
+		DAMAGE_SETOP("and()", (void) lion_container_and(dmg_b, c, dmg_dst));
+		DAMAGE_SETOP("or()", (void) lion_container_or(c, dmg_b, dmg_dst));
+		DAMAGE_SETOP("or()", (void) lion_container_or(dmg_b, c, dmg_dst));
+		DAMAGE_SETOP("andnot()", (void) lion_container_andnot(c, dmg_b, dmg_dst));
+		DAMAGE_SETOP("andnot()", (void) lion_container_andnot(dmg_b, c, dmg_dst));
+		DAMAGE_SETOP("and_raw()", (void) lion_container_and_raw(c, dmg_b, dmg_dst));
+		DAMAGE_SETOP("and_raw()", (void) lion_container_and_raw(dmg_b, c, dmg_dst));
+		DAMAGE_SETOP("or_raw()", (void) lion_container_or_raw(c, dmg_b, dmg_dst));
+		DAMAGE_SETOP("or_raw()", (void) lion_container_or_raw(dmg_b, c, dmg_dst));
+		DAMAGE_SETOP("andnot_raw()", (void) lion_container_andnot_raw(c, dmg_b, dmg_dst));
+		DAMAGE_SETOP("andnot_raw()", (void) lion_container_andnot_raw(dmg_b, c, dmg_dst));
+		DAMAGE_SETOP("and_raw() with itself", (void) lion_container_and_raw(c, c, dmg_dst));
+		DAMAGE_SETOP("or_raw() with itself", (void) lion_container_or_raw(c, c, dmg_dst));
+		{
+			uint32		k2 = rand_width();
+			LionContainer *o = nc[k2];
+
+			/* against another bitmap of a width of its own, undamaged */
+			if (o != c)
+			{
+				gen_narrow(&ref_a, 1 + rng_below(LION_BLOCKS_PER_CONTAINER * 30 * k2), k2);
+				build_narrow_direct(&buf_a, &ref_a, k2);
+				memcpy(o, &buf_a, LION_NARROW_SIZE(k2));
+				DAMAGE_SETOP("and_raw() with another width", (void) lion_container_and_raw(c, o, dmg_dst));
+				DAMAGE_SETOP("or_raw() with another width", (void) lion_container_or_raw(o, c, dmg_dst));
+				DAMAGE_SETOP("andnot_raw() with another width", (void) lion_container_andnot_raw(c, o, dmg_dst));
+				DAMAGE_SETOP("andnot_raw() with another width", (void) lion_container_andnot_raw(o, c, dmg_dst));
+				(void) lion_container_and_cardinality(c, o);
+				CHECK(guard_ok(o, LION_NARROW_SIZE(k2)),
+					  "damaged: nothing written past the other bitmap");
+			}
+		}
 #undef DAMAGE_SETOP
 		{
-			const LionContainer *one = nc;
+			const LionContainer *one = c;
 
 			(void) lion_container_and_union_raw(dmg_b, &one, 1, dmg_dst);
-			CHECK(raw_in_range(dmg_dst), "damaged: and_union_raw() probing a NARROW");
+			CHECK(raw_in_range(dmg_dst), "damaged: and_union_raw() probing a bitmap");
 		}
-		CHECK(guard_ok(nc, LION_NARROW_SIZE) && guard_ok(dmg_dst, LION_CONTAINER_MAX_SIZE),
-			  "damaged: nothing written past a NARROW or a result");
+		CHECK(guard_ok(c, sz) && guard_ok(dmg_dst, LION_CONTAINER_MAX_SIZE),
+			  "damaged: nothing written past a bitmap or a result");
 
-		/* mutators, on a copy of its 1032 bytes in a full buffer */
+		/* mutators, on a copy of its bytes in a full buffer */
 #define DAMAGE_MUTATE(what, stmt) \
 	do { \
-		memcpy(dmg_work, nc, LION_NARROW_SIZE); \
+		memcpy(dmg_work, c, sz); \
 		stmt; \
 		st.n = 0; \
 		st.bad = 0; \
@@ -5458,7 +5821,7 @@ test_damaged_narrow(uint32 iters, uint64 seed)
 		CHECK(lion_container_size(dmg_work) <= LION_CONTAINER_MAX_SIZE && \
 			  guard_ok(dmg_work, LION_CONTAINER_MAX_SIZE) && \
 			  st.n <= LION_CONTAINER_RANGE && st.bad == 0, \
-			  "damaged: " what " of a NARROW leaves a container in range"); \
+			  "damaged: " what " of a bitmap leaves a container in range"); \
 	} while (0)
 
 		DAMAGE_MUTATE("add()", (void) lion_container_add(dmg_work, (uint16) lo));
@@ -5476,41 +5839,49 @@ test_damaged_narrow(uint32 iters, uint64 seed)
 		memcpy(dmg_work, dmg_b, LION_CONTAINER_MAX_SIZE);
 		if (dmg_work->type == LION_CT_BITSET)
 		{
-			(void) lion_container_or_inplace(dmg_work, nc);
+			(void) lion_container_or_inplace(dmg_work, c);
 			CHECK(guard_ok(dmg_work, LION_CONTAINER_MAX_SIZE),
-				  "damaged: or_inplace() of a NARROW stays inside the accumulator");
+				  "damaged: or_inplace() of a bitmap stays inside the accumulator");
 		}
 #undef DAMAGE_MUTATE
 
-		/* add() of a member it holds, in place in exactly 1032 bytes */
-		lo = (lo & ~TEST_OFFSET_MASK) | (lo & (LION_NARROW_OFFSETS - 1));
-		memcpy(ip, nc, LION_NARROW_SIZE);
-		CHECK(lion_container_inplace_need(ip, (uint16) lo) == LION_NARROW_SIZE,
-			  "damaged: a NARROW takes a member at offset below 128 in its 1032 bytes");
-		(void) lion_container_add(ip, (uint16) lo);
-		CHECK(ip->type == LION_CT_NARROW && guard_ok(ip, LION_NARROW_SIZE),
-			  "damaged: add() of such a member stays a NARROW, inside its 1032 bytes");
+		/* add() of a member it holds, in place in exactly its size */
+		lo = (lo & ~TEST_OFFSET_MASK) | ((lo & TEST_OFFSET_MASK) % (64 * k));
+		memcpy(ip[k], c, sz);
+		CHECK(lion_container_inplace_need(ip[k], (uint16) lo) == sz,
+			  "damaged: a bitmap takes a member at an offset it holds in its size");
+		(void) lion_container_add(ip[k], (uint16) lo);
+		CHECK(ip[k]->type == c->type && lion_container_size(ip[k]) == sz &&
+			  guard_ok(ip[k], sz),
+			  "damaged: add() of such a member stays the bitmap it was, inside its size");
 	}
-	free(nc);
-	free(ip);
+	for (k = 1; k <= TEST_FULL; k++)
+	{
+		if (nc[k])
+			free(nc[k]);
+		if (ip[k])
+			free(ip[k]);
+	}
 }
 
 /*
- * The kernels over a NARROW's LION_NARROW_WORDS words, each implementation:
- * every pass (lion_container_narrow_pass()) against a reference a bit at a
- * time - RUNS counting the runs of the words as they lie - and the public
- * functions on NARROWs built of those words, in exact-size buffers at each
- * 8-byte alignment modulo 32.  The payloads are 128-word windows of the
- * BITSET patterns.
+ * The kernels at every NARROW width, each implementation: every pass
+ * (lion_container_bits_pass()) over a payload of width k against a
+ * reference a bit at a time - RUNS counting the runs of the words as they
+ * lie - and the public functions on NARROWs of those words, against NARROWs
+ * of the same width and of another, and the BITSET of a whole pattern, in
+ * exact-size buffers at each 8-byte alignment modulo 32.  The payloads are
+ * windows of the BITSET patterns.
  */
 static uint32
-narrow_ref_pass(LionBitsOp op, const uint64 *a, const uint64 *b, uint64 *want)
+narrow_ref_pass(LionBitsOp op, uint32 k, const uint64 *a, const uint64 *b, uint64 *want)
 {
-	uint64		counted[LION_NARROW_WORDS];
+	static uint64 counted[LION_BITSET_WORDS];
+	uint32		nwords = LION_WIDTH_WORDS(k);
 	uint32		n = 0;
 	uint32		i;
 
-	for (i = 0; i < LION_NARROW_WORDS; i++)
+	for (i = 0; i < nwords; i++)
 	{
 		switch (op)
 		{
@@ -5534,7 +5905,7 @@ narrow_ref_pass(LionBitsOp op, const uint64 *a, const uint64 *b, uint64 *want)
 				break;
 		}
 	}
-	for (i = 0; i < LION_NARROW_WORDS * 64; i++)
+	for (i = 0; i < nwords * 64; i++)
 	{
 		bool		bit = kern_bit(counted, i);
 
@@ -5546,210 +5917,285 @@ narrow_ref_pass(LionBitsOp op, const uint64 *a, const uint64 *b, uint64 *want)
 	return n;
 }
 
-/* w (LION_BITSET_WORDS) = the members of the NARROW payload nw */
+/* w (LION_BITSET_WORDS) = the members of the payload nw of width k */
 static void
-narrow_widen(const uint64 *nw, uint64 *w)
+narrow_widen(const uint64 *nw, uint32 k, uint64 *w)
 {
 	uint32		i;
 
 	memset(w, 0, LION_BITSET_BYTES);
-	for (i = 0; i < LION_NARROW_WORDS * 64; i++)
+	for (i = 0; i < LION_WIDTH_WORDS(k) * 64; i++)
 		if (kern_bit(nw, i))
 		{
-			uint32		lo = test_narrow_lo(i);
+			uint32		lo = test_narrow_lo(i, k);
 
 			w[lo >> 6] |= UINT64CONST(1) << (lo & 63);
 		}
 }
 
 static LionContainer *
-narrow_alloc(Size shift, void **base)
+narrow_alloc(Size size, Size shift, void **base)
 {
 	unsigned char *p;
 	Size		i;
 
-	if (posix_memalign((void **) &p, 32, shift + LION_NARROW_SIZE + guard_bytes) != 0)
+	if (posix_memalign((void **) &p, 32, shift + size + guard_bytes) != 0)
 	{
 		printf("out of memory\n");
 		exit(2);
 	}
 	for (i = 0; i < guard_bytes; i++)
-		p[shift + LION_NARROW_SIZE + i] = GUARD_FILL;
+		p[shift + size + i] = GUARD_FILL;
 	*base = p;
 	return (LionContainer *) (p + shift);
 }
 
+/* c = the NARROW of width k of payload nw, its count counted bit by bit */
 static void
-test_narrow_kernels_one(void)
+narrow_fill(LionContainer *c, uint32 k, const uint64 *nw)
 {
-	static uint64 na[LION_NARROW_WORDS];
-	static uint64 nb[LION_NARROW_WORDS];
-	static uint64 want[LION_NARROW_WORDS];
-	static uint64 dw[LION_NARROW_WORDS];
+	c->ckey = TEST_CKEY;
+	c->type = LION_CT_NARROW;
+	c->flags = (uint8) k;
+	c->cardinality = (uint16) narrow_ref_pass(LION_BITS_COUNT, k, nw, NULL, NULL);
+	memcpy(TEST_NARROW_DATA(c), nw, LION_WIDTH_BYTES(k));
+}
+
+/* r = the members of the image w */
+static void
+ref_of_image(Ref *r, const uint64 *w)
+{
+	uint32		i;
+
+	ref_init(r);
+	for (i = 0; i < LION_CONTAINER_RANGE; i++)
+		if (kern_bit(w, i))
+			(void) ref_add(r, i);
+}
+
+static void
+test_width_kernels_one(void)
+{
+	static uint64 na[LION_BITSET_WORDS];
+	static uint64 nb[LION_BITSET_WORDS];
+	static uint64 want[LION_BITSET_WORDS];
+	static uint64 dw[LION_BITSET_WORDS];
 	static uint64 img[LION_BITSET_WORDS];
-	int			pa;
-	int			pb;
+	static uint64 img2[LION_BITSET_WORDS];
 	uint32		bad_pass = 0;
 	uint32		bad_fn = 0;
+	uint32		bad_mixed = 0;
 	uint32		bad_guard = 0;
+	uint32		k;
 
-	for (pa = 0; pa < KERN_NPATTERNS; pa++)
+	for (k = 1; k <= TEST_KMAX; k++)
 	{
-		for (pb = 0; pb < KERN_NPATTERNS; pb++)
+		uint32		nwords = LION_WIDTH_WORDS(k);
+		Size		nbytes = LION_WIDTH_BYTES(k);
+		Size		sz = LION_NARROW_SIZE(k);
+		uint32		k2 = (k % TEST_KMAX) + 1;	/* another width, when there is one */
+		int			pa;
+		int			pb;
+
+		for (pa = 0; pa < KERN_NPATTERNS; pa++)
 		{
-			void	   *base[2];
-			LionContainer *a;
-			LionContainer *b;
-			uint32		i;
-			int			op;
-			uint32		ca;
-			uint32		cb;
-			uint32		got;
-
-			rng_seed(UINT64CONST(0x5EED6800) + (uint64) pa);
-			kern_pattern(kern_wa, pa);
-			memcpy(na, kern_wa + (pa % 4) * LION_NARROW_WORDS, LION_NARROW_BYTES);
-			rng_seed(UINT64CONST(0x5EED6900) + (uint64) pb);
-			kern_pattern(kern_wb, pb);
-			memcpy(nb, kern_wb + (pb % 4) * LION_NARROW_WORDS, LION_NARROW_BYTES);
-
-			/* the passes, out of place and in place */
-			for (op = LION_BITS_COUNT; op <= LION_BITS_OR_NEW; op++)
+			for (pb = 0; pb < KERN_NPATTERNS; pb++)
 			{
-				bool		writes = (op != LION_BITS_COUNT && op != LION_BITS_RUNS &&
-									  op != LION_BITS_AND_COUNT);
-				uint32		w = narrow_ref_pass((LionBitsOp) op, na, nb, want);
+				void	   *base[3];
+				LionContainer *a;
+				LionContainer *b;
+				LionContainer *b2;
+				uint32		offa = Min((uint32) (pa % 4) * 16, LION_BITSET_WORDS - nwords);
+				uint32		offb = Min((uint32) (pb % 4) * 16, LION_BITSET_WORDS - nwords);
+				uint32		i;
+				int			op;
+				uint32		ca;
+				uint32		cb;
+				uint32		got;
 
-				memset(dw, 0x5A, LION_NARROW_BYTES);
-				if (lion_container_narrow_pass((LionBitsOp) op, writes ? dw : NULL, na, nb) != w ||
-					(writes && memcmp(dw, want, LION_NARROW_BYTES) != 0))
-					bad_pass++;
-				if (!writes)
-					continue;
-				memcpy(dw, na, LION_NARROW_BYTES);
-				if (lion_container_narrow_pass((LionBitsOp) op, dw, dw, nb) != w ||
-					memcmp(dw, want, LION_NARROW_BYTES) != 0)
-					bad_pass++;
-			}
+				rng_seed(UINT64CONST(0x5EED6800) + (uint64) pa);
+				kern_pattern(kern_wa, pa);
+				memcpy(na, kern_wa + offa, nbytes);
+				rng_seed(UINT64CONST(0x5EED6900) + (uint64) pb);
+				kern_pattern(kern_wb, pb);
+				memcpy(nb, kern_wb + offb, nbytes);
 
-			/* NARROWs of those words, in exact buffers */
-			a = narrow_alloc(8 * ((pa + pb) % 4), &base[0]);
-			b = narrow_alloc(8 * ((pa + 2 * pb + 1) % 4), &base[1]);
-			ca = narrow_ref_pass(LION_BITS_COUNT, na, NULL, NULL);
-			cb = narrow_ref_pass(LION_BITS_COUNT, nb, NULL, NULL);
-			a->ckey = b->ckey = TEST_CKEY;
-			a->type = b->type = LION_CT_NARROW;
-			a->flags = b->flags = 0;
-			a->cardinality = (uint16) ca;
-			b->cardinality = (uint16) cb;
-			memcpy(TEST_NARROW_DATA(a), na, LION_NARROW_BYTES);
-			memcpy(TEST_NARROW_DATA(b), nb, LION_NARROW_BYTES);
+				/* the passes, out of place and in place */
+				for (op = LION_BITS_COUNT; op <= LION_BITS_OR_NEW; op++)
+				{
+					bool		writes = (op != LION_BITS_COUNT && op != LION_BITS_RUNS &&
+										  op != LION_BITS_AND_COUNT);
+					uint32		wn = narrow_ref_pass((LionBitsOp) op, k, na, nb, want);
 
-			{
-				const char *why;
+					memset(dw, 0x5A, nbytes);
+					if (lion_container_bits_pass((LionBitsOp) op, k, writes ? dw : NULL, na, nb) != wn ||
+						(writes && memcmp(dw, want, nbytes) != 0))
+						bad_pass++;
+					if (!writes)
+						continue;
+					memcpy(dw, na, nbytes);
+					if (lion_container_bits_pass((LionBitsOp) op, k, dw, dw, nb) != wn ||
+						memcmp(dw, want, nbytes) != 0)
+						bad_pass++;
+				}
 
-				if (!lion_container_check(a, LION_NARROW_SIZE, &why))
+				/* NARROWs of those words, in exact buffers */
+				a = narrow_alloc(sz, 8 * ((pa + pb) % 4), &base[0]);
+				b = narrow_alloc(sz, 8 * ((pa + 2 * pb + 1) % 4), &base[1]);
+				narrow_fill(a, k, na);
+				narrow_fill(b, k, nb);
+				ca = a->cardinality;
+				cb = b->cardinality;
+
+				{
+					const char *why;
+
+					if (!lion_container_check(a, sz, &why))
+						bad_fn++;
+					a->cardinality = (uint16) (ca + 1);
+					if (lion_container_check(a, sz, &why))
+						bad_fn++;	/* a count one off must be found */
+					a->cardinality = (uint16) ca;
+				}
+
+				/* AND counted, both ways round; AND, OR, ANDNOT written */
+				got = narrow_ref_pass(LION_BITS_AND_COUNT, k, na, nb, want);
+				if (lion_container_and_cardinality(a, b) != got ||
+					lion_container_and_cardinality(b, a) != got)
 					bad_fn++;
-				a->cardinality = (uint16) (ca + 1);
-				if (lion_container_check(a, LION_NARROW_SIZE, &why))
-					bad_fn++;	/* a count one off must be found */
-				a->cardinality = (uint16) ca;
-			}
+				for (op = 0; op < 3; op++)
+				{
+					LionBitsOp	bop = (op == 0) ? LION_BITS_AND : (op == 1) ? LION_BITS_OR :
+						LION_BITS_ANDNOT;
+					uint32		wn = narrow_ref_pass(bop, k, na, nb, want);
+					uint32		card;
+					bool		empty = (ca == 0 || cb == 0);
 
-			/* AND counted, both ways round; AND, OR, ANDNOT written */
-			got = narrow_ref_pass(LION_BITS_AND_COUNT, na, nb, want);
-			if (lion_container_and_cardinality(a, b) != got ||
-				lion_container_and_cardinality(b, a) != got)
-				bad_fn++;
-			for (op = 0; op < 3; op++)
-			{
-				LionBitsOp	bop = (op == 0) ? LION_BITS_AND : (op == 1) ? LION_BITS_OR :
-					LION_BITS_ANDNOT;
-				uint32		w = narrow_ref_pass(bop, na, nb, want);
-				uint32		card;
-				bool		empty = (ca == 0 || cb == 0);
-				Ref		   *r = &ref_r;
+					card = (op == 0) ? lion_container_and_raw(a, b, &buf_d.c) :
+						(op == 1) ? lion_container_or_raw(a, b, &buf_d.c) :
+						lion_container_andnot_raw(a, b, &buf_d.c);
+					narrow_widen(want, k, img);
+					memset(scratch_img, 0, LION_BITSET_BYTES);
+					lion_container_or_into_bitset(&buf_d.c, scratch_img);
+					if (card != wn || buf_d.c.cardinality != wn ||
+						memcmp(scratch_img, img, LION_BITSET_BYTES) != 0)
+						bad_fn++;
+					if (!empty && (!is_width(&buf_d.c, k) ||
+								   memcmp(TEST_NARROW_DATA(&buf_d.c), want, nbytes) != 0))
+						bad_fn++;
 
-				card = (op == 0) ? lion_container_and_raw(a, b, &buf_d.c) :
-					(op == 1) ? lion_container_or_raw(a, b, &buf_d.c) :
-					lion_container_andnot_raw(a, b, &buf_d.c);
-				narrow_widen(want, img);
-				memset(scratch_img, 0, LION_BITSET_BYTES);
-				lion_container_or_into_bitset(&buf_d.c, scratch_img);
-				if (card != w || buf_d.c.cardinality != w ||
-					memcmp(scratch_img, img, LION_BITSET_BYTES) != 0)
-					bad_fn++;
-				if (!empty && (buf_d.c.type != LION_CT_NARROW ||
-							   memcmp(TEST_NARROW_DATA(&buf_d.c), want, LION_NARROW_BYTES) != 0))
-					bad_fn++;
+					/* the optimizing form: the members, in the reference's representation */
+					card = (op == 0) ? lion_container_and(a, b, &buf_d.c) :
+						(op == 1) ? lion_container_or(a, b, &buf_d.c) :
+						lion_container_andnot(a, b, &buf_d.c);
+					ref_of_image(&ref_r, img);
+					memset(scratch_img, 0, LION_BITSET_BYTES);
+					lion_container_or_into_bitset(&buf_d.c, scratch_img);
+					if (card != wn || memcmp(scratch_img, img, LION_BITSET_BYTES) != 0 ||
+						!ref_opt_ok(&buf_d.c, &ref_r, true))
+						bad_fn++;
+				}
 
-				/* the optimizing form: the members, in the reference's representation */
-				card = (op == 0) ? lion_container_and(a, b, &buf_d.c) :
-					(op == 1) ? lion_container_or(a, b, &buf_d.c) :
-					lion_container_andnot(a, b, &buf_d.c);
-				ref_init(r);
-				for (i = 0; i < LION_CONTAINER_RANGE; i++)
-					if (kern_bit(img, i))
-						(void) ref_add(r, i);
-				memset(scratch_img, 0, LION_BITSET_BYTES);
-				lion_container_or_into_bitset(&buf_d.c, scratch_img);
-				if (card != w || memcmp(scratch_img, img, LION_BITSET_BYTES) != 0 ||
-					buf_d.c.type != ref_opt_type(r, true))
-					bad_fn++;
-			}
+				/*
+				 * Against a NARROW of another width, the same window of b's
+				 * pattern read at it: the per-block passes of mixed widths.
+				 */
+				b2 = narrow_alloc(LION_NARROW_SIZE(k2), 8 * ((pa + 3 * pb + 2) % 4), &base[2]);
+				memcpy(dw, kern_wb + Min(offb, LION_BITSET_WORDS - LION_WIDTH_WORDS(k2)),
+					   LION_WIDTH_BYTES(k2));
+				narrow_fill(b2, k2, dw);
+				narrow_widen(na, k, img);
+				narrow_widen(dw, k2, img2);
+				for (op = 0; op < 4; op++)
+				{
+					uint32		card;
+					uint32		wn;
+					uint32		wk;
 
-			/* a NARROW against the BITSET of the whole pattern b */
-			kern_bitset(&buf_b.c, kern_wb);
-			narrow_widen(na, img);
-			for (i = 0; i < LION_BITSET_WORDS; i++)
-				img[i] &= kern_wb[i];
-			got = kern_ref_count(img);
-			if (lion_container_and_cardinality(a, &buf_b.c) != got ||
-				lion_container_and_cardinality(&buf_b.c, a) != got ||
-				lion_container_and_raw(a, &buf_b.c, &buf_d.c) != got ||
-				lion_container_and_raw(&buf_b.c, a, &buf_d.c) != got)
-				bad_fn++;
+					for (i = 0; i < LION_BITSET_WORDS; i++)
+						want[i] = (op == 0) ? (img[i] & img2[i]) :
+							(op == 1) ? (img[i] | img2[i]) :
+							(op == 2) ? (img[i] & ~img2[i]) : (img2[i] & ~img[i]);
+					wn = kern_ref_count(want);
+					card = (op == 0) ? lion_container_and_raw(a, b2, &buf_d.c) :
+						(op == 1) ? lion_container_or_raw(a, b2, &buf_d.c) :
+						(op == 2) ? lion_container_andnot_raw(a, b2, &buf_d.c) :
+						lion_container_andnot_raw(b2, a, &buf_d.c);
+					wk = (op == 0) ? Min(k, k2) : (op == 1) ? Max(k, k2) :
+						(op == 2) ? k : k2;
+					memset(scratch_img, 0, LION_BITSET_BYTES);
+					lion_container_or_into_bitset(&buf_d.c, scratch_img);
+					if (card != wn || buf_d.c.cardinality != wn ||
+						memcmp(scratch_img, want, LION_BITSET_BYTES) != 0)
+						bad_mixed++;
+					if (ca > 0 && b2->cardinality > 0 && !is_width(&buf_d.c, wk))
+						bad_mixed++;
+					if (op == 0 && (lion_container_and_cardinality(a, b2) != wn ||
+									lion_container_and_cardinality(b2, a) != wn))
+						bad_mixed++;
+					card = (op == 0) ? lion_container_and(b2, a, &buf_d.c) :
+						(op == 1) ? lion_container_or(b2, a, &buf_d.c) :
+						(op == 2) ? lion_container_andnot(a, b2, &buf_d.c) :
+						lion_container_andnot(b2, a, &buf_d.c);
+					ref_of_image(&ref_r, want);
+					if (card != wn || !ref_opt_ok(&buf_d.c, &ref_r, true))
+						bad_mixed++;
+				}
 
-			/* or_inplace() of the NARROW into the BITSET */
-			memcpy(&buf_e, &buf_b, LION_CONTAINER_MAX_SIZE);
-			narrow_widen(na, img);
-			{
-				uint64		newbits[LION_BITSET_WORDS];
-
+				/* a NARROW against the BITSET of the whole pattern b */
+				kern_bitset(&buf_b.c, kern_wb);
+				narrow_widen(na, k, img);
 				for (i = 0; i < LION_BITSET_WORDS; i++)
-					newbits[i] = img[i] & ~kern_wb[i];
-				got = lion_container_or_inplace(&buf_e.c, a);
-				for (i = 0; i < LION_BITSET_WORDS; i++)
-					img[i] |= kern_wb[i];
-				if (got != kern_ref_count(newbits) ||
-					memcmp(LION_BITSET_DATA(&buf_e.c), img, LION_BITSET_BYTES) != 0 ||
-					buf_e.c.cardinality != kern_ref_count(img))
+					img[i] &= kern_wb[i];
+				got = kern_ref_count(img);
+				if (lion_container_and_cardinality(a, &buf_b.c) != got ||
+					lion_container_and_cardinality(&buf_b.c, a) != got ||
+					lion_container_and_raw(a, &buf_b.c, &buf_d.c) != got ||
+					(ca > 0 && buf_b.c.cardinality > 0 && !is_width(&buf_d.c, k)) ||
+					lion_container_and_raw(&buf_b.c, a, &buf_d.c) != got)
 					bad_fn++;
+
+				/* or_inplace() of the NARROW into the BITSET */
+				memcpy(&buf_e, &buf_b, LION_CONTAINER_MAX_SIZE);
+				narrow_widen(na, k, img);
+				{
+					static uint64 newbits[LION_BITSET_WORDS];
+
+					for (i = 0; i < LION_BITSET_WORDS; i++)
+						newbits[i] = img[i] & ~kern_wb[i];
+					got = lion_container_or_inplace(&buf_e.c, a);
+					for (i = 0; i < LION_BITSET_WORDS; i++)
+						img[i] |= kern_wb[i];
+					if (got != kern_ref_count(newbits) ||
+						memcmp(LION_BITSET_DATA(&buf_e.c), img, LION_BITSET_BYTES) != 0 ||
+						buf_e.c.cardinality != kern_ref_count(img))
+						bad_fn++;
+				}
+
+				/* optimize() of the NARROW: the reference's representation */
+				narrow_widen(na, k, img);
+				ref_of_image(&ref_a, img);
+				memcpy(&buf_e, a, sz);
+				lion_container_optimize(&buf_e.c);
+				if (!ref_opt_ok(&buf_e.c, &ref_a, true) ||
+					lion_container_cardinality(&buf_e.c) != ca)
+					bad_fn++;
+
+				if (memcmp(TEST_NARROW_DATA(a), na, nbytes) != 0 ||
+					memcmp(TEST_NARROW_DATA(b), nb, nbytes) != 0 ||
+					!guard_ok(a, sz) || !guard_ok(b, sz) ||
+					!guard_ok(b2, LION_NARROW_SIZE(k2)))
+					bad_guard++;
+				free(base[0]);
+				free(base[1]);
+				free(base[2]);
 			}
-
-			/* optimize() of the NARROW: the reference's representation */
-			narrow_widen(na, img);
-			ref_init(&ref_a);
-			for (i = 0; i < LION_CONTAINER_RANGE; i++)
-				if (kern_bit(img, i))
-					(void) ref_add(&ref_a, i);
-			memcpy(&buf_e, a, LION_NARROW_SIZE);
-			lion_container_optimize(&buf_e.c);
-			if (buf_e.c.type != ref_opt_type(&ref_a, true) ||
-				lion_container_cardinality(&buf_e.c) != ca)
-				bad_fn++;
-
-			if (memcmp(TEST_NARROW_DATA(a), na, LION_NARROW_BYTES) != 0 ||
-				memcmp(TEST_NARROW_DATA(b), nb, LION_NARROW_BYTES) != 0 ||
-				!guard_ok(a, LION_NARROW_SIZE) || !guard_ok(b, LION_NARROW_SIZE))
-				bad_guard++;
-			free(base[0]);
-			free(base[1]);
 		}
 	}
-	CHECK(bad_pass == 0, "narrow kernels: every pass counts, and writes, what the reference does");
+	CHECK(bad_pass == 0, "narrow kernels: every pass at every width counts, and writes, what the reference does");
 	CHECK(bad_fn == 0, "narrow kernels: and/or/andnot, and_cardinality(), or_inplace(), optimize() and check() of NARROWs");
-	CHECK(bad_guard == 0, "narrow kernels: operands untouched, nothing read or written past a 1032-byte buffer");
+	CHECK(bad_mixed == 0, "narrow kernels: the set algebra of NARROWs of two widths, at the width it builds in");
+	CHECK(bad_guard == 0, "narrow kernels: operands untouched, nothing read or written past a NARROW's buffer");
 }
 
 static void
@@ -5791,7 +6237,7 @@ test_bitset_kernels(void)
 		phase("whole-bitset kernels");
 		test_kernels_one();
 		phase("narrow kernels");
-		test_narrow_kernels_one();
+		test_width_kernels_one();
 
 		/*
 		 * And the set algebra over every type pair and the in-place OR, as
@@ -5826,7 +6272,12 @@ type_name(const LionContainer *c)
 		case LION_CT_RUN:
 			return "RUN";
 		case LION_CT_NARROW:
-			return "NARROW";
+			{
+				static char name[16];
+
+				snprintf(name, sizeof(name), "NARROW%u", (unsigned) c->flags);
+				return name;
+			}
 	}
 	return "?";
 }
@@ -5892,16 +6343,29 @@ report_sizes(void)
 	lion_container_optimize(&buf_a.c);
 	show_size("32768 members (full)", &buf_a.c);
 
-	/* a table of up to 127 rows a page (DESIGN.md §38) */
-	lion_container_init(&buf_a.c, TEST_CKEY);
-	for (i = 0; i < LION_BLOCKS_PER_CONTAINER; i++)
-		for (j = 1; j < 65; j += 2)
-			lion_container_append_sorted(&buf_a.c,
-										 (uint16) ((i << LION_OFFSET_BITS) | j));
-	lion_container_optimize(&buf_a.c);
-	show_size("half of 65 rows a page", &buf_a.c);
-	lion_container_optimize_ext(&buf_a.c, false);
-	show_size("the same, without NARROW", &buf_a.c);
+	/* every other row of tables of so many rows a page (DESIGN.md §38) */
+	{
+		static const uint32 rows[] = {35, 61, 97, 136, 185, 226, 291};
+		uint32		r;
+
+		for (r = 0; r < lengthof(rows); r++)
+		{
+			char		what[64];
+
+			if (rows[r] > TEST_MAXOFF)
+				continue;
+			lion_container_init(&buf_a.c, TEST_CKEY);
+			for (i = 0; i < LION_BLOCKS_PER_CONTAINER; i++)
+				for (j = 1; j <= rows[r]; j += 2)
+					lion_container_append_sorted(&buf_a.c,
+												 (uint16) ((i << LION_OFFSET_BITS) | j));
+			lion_container_optimize(&buf_a.c);
+			snprintf(what, sizeof(what), "half of %u rows a page", rows[r]);
+			show_size(what, &buf_a.c);
+			lion_container_optimize_ext(&buf_a.c, false);
+			show_size("the same, without NARROW", &buf_a.c);
+		}
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -5921,8 +6385,26 @@ main(void)
 	CHECK(sizeof(LionContainer) == 8, "LionContainer header is 8 bytes");
 	CHECK(sizeof(LionRun) == 4, "LionRun is 4 bytes");
 	CHECK(LION_CONTAINER_MAX_SIZE == 4104, "LION_CONTAINER_MAX_SIZE is 4104");
-	CHECK(LION_NARROW_SIZE == 1032 && LION_NARROW_ARRAY_CARD == 512,
-		  "a NARROW is 1032 bytes, an ARRAY of 512 members");
+	printf("  LION_NARROW_MAX_WIDTH=%u LION_BITSET_WIDTH=%u LION_HEAP_MAX_OFFSET=%u\n",
+		   (unsigned) LION_NARROW_MAX_WIDTH, (unsigned) LION_BITSET_WIDTH,
+		   (unsigned) LION_HEAP_MAX_OFFSET);
+	CHECK(LION_HEAP_MAX_OFFSET == TEST_MAXOFF,
+		  "LION_HEAP_MAX_OFFSET is MaxHeapTuplesPerPage's formula");
+	CHECK(64 * TEST_KMAX > TEST_MAXOFF && 64 * (TEST_KMAX - 1) <= TEST_MAXOFF,
+		  "LION_NARROW_MAX_WIDTH is the narrowest width whose bits hold every heap offset");
+	CHECK(TEST_KMAX < TEST_FULL && TEST_FULL * 64 == (1U << LION_OFFSET_BITS) &&
+		  LION_WIDTH_WORDS(TEST_FULL) == LION_BITSET_WORDS,
+		  "a BITSET is the full width, every offset's bits");
+	if (BLCKSZ == 8192)
+	{
+		uint32		k;
+		bool		ok = (TEST_KMAX == 5);
+
+		for (k = 1; k <= TEST_KMAX; k++)
+			ok = ok && LION_NARROW_SIZE(k) == 8 + 512 * k &&
+				LION_WIDTH_ARRAY_CARD(k) == 256 * k;
+		CHECK(ok, "at 8K: widths 1 .. 5, a NARROW of width k 8 + 512 * k bytes, an ARRAY of 256 * k members");
+	}
 
 	test_empty();
 	test_boundaries();
@@ -5962,10 +6444,15 @@ main(void)
 	test_damaged_results();
 	test_damaged_random(3000, UINT64CONST(0x5EED3002));
 	test_inplace_growth();
-	test_narrow_transitions();
+	{
+		uint32		k;
+
+		for (k = 1; k <= TEST_KMAX; k++)
+			test_narrow_transitions(k);
+	}
 	test_narrow_optimize();
 	test_setops_narrow();
-	test_damaged_narrow(3000, UINT64CONST(0x5EED3804));
+	test_damaged_widths(4000, UINT64CONST(0x5EED3804));
 	test_or_inplace();
 	test_add_many();
 	test_mark_members();
@@ -5973,17 +6460,33 @@ main(void)
 	test_tree_probe();
 	test_bitset_kernels();
 
-	test_random_ops(3, "random ops @ 0.01% density", 20000, UINT64CONST(0x5EED1001), false);
-	test_random_ops(328, "random ops @ 1% density", 20000, UINT64CONST(0x5EED1002), false);
-	test_random_ops(3277, "random ops @ 10% density", 20000, UINT64CONST(0x5EED1003), false);
-	test_random_ops(16384, "random ops @ 50% density", 20000, UINT64CONST(0x5EED1004), false);
-	test_random_ops(32440, "random ops @ 99% density", 20000, UINT64CONST(0x5EED1005), false);
-	test_random_ops(520, "random ops at offsets below 128 @ 6%", 20000,
-					UINT64CONST(0x5EED1006), true);
-	test_random_ops(2000, "random ops at offsets below 128 @ 25%", 20000,
-					UINT64CONST(0x5EED1007), true);
-	test_random_ops(7000, "random ops at offsets below 128 @ 85%", 20000,
-					UINT64CONST(0x5EED1008), true);
+	test_random_ops(3, "random ops @ 0.01% density", 20000, UINT64CONST(0x5EED1001), 0);
+	test_random_ops(328, "random ops @ 1% density", 20000, UINT64CONST(0x5EED1002), 0);
+	test_random_ops(3277, "random ops @ 10% density", 20000, UINT64CONST(0x5EED1003), 0);
+	test_random_ops(16384, "random ops @ 50% density", 20000, UINT64CONST(0x5EED1004), 0);
+	test_random_ops(32440, "random ops @ 99% density", 20000, UINT64CONST(0x5EED1005), 0);
+	{
+		static const uint32 pct[] = {6, 25, 85};
+		static char labels[TEST_KMAX_LABELS][64];
+		uint32		k;
+		uint32		d;
+		uint32		nl = 0;
+
+		/* at offsets below 64 * k, now and then past them, for every width */
+		for (k = 1; k <= TEST_KMAX; k++)
+			for (d = 0; d < lengthof(pct); d++)
+			{
+				uint32		bits = LION_BLOCKS_PER_CONTAINER * 64 * k;
+
+				if (d != 1 && k != 1 && k != TEST_KMAX)
+					continue;	/* every width at 25%, the ends at all three */
+				snprintf(labels[nl], sizeof(labels[nl]),
+						 "random ops at offsets below 64 * %u @ %u%%", k, pct[d]);
+				test_random_ops(bits * pct[d] / 100, labels[nl], 20000,
+								UINT64CONST(0x5EED1006) + 16 * k + d, k);
+				nl++;
+			}
+	}
 
 	report_sizes();
 
