@@ -134,6 +134,15 @@ SELECT lion_kq('SELECT sum(s) FROM ka HAVING sum(s) < 0');
 SELECT lion_kq('SELECT sum(i), count(*), sum(i) FROM ka WHERE true');
 -- ... an expression that is NULL for some keys, and a CASE.
 SELECT lion_kq('SELECT sum(nullif(i, 7)), max(CASE WHEN s > 0 THEN s END) FROM ka');
+-- ... and with work_mem at its least, which b's keys fill many times over.
+-- An expression of the key is evaluated on an entry only once a look at the
+-- map has said that the counts read so far are the snapshot's rows, and the
+-- walk takes that look whenever the keys waiting for it fill work_mem
+-- (test/isolation/wagg_unseen_key.spec has one that fails).
+SET work_mem = 64;
+SELECT lion_kq('SELECT sum(b / 2), max(b - 1), avg(i * 2), min(b) FROM ka');
+SELECT lion_krun('SELECT sum(b / 2), max(b - 1), avg(i * 2), min(b) FROM ka');
+RESET work_mem;
 
 -- 2. A heap the visibility map does not vouch for: each entry counted.
 DELETE FROM ka WHERE s = 3;
