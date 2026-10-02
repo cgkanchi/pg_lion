@@ -116,9 +116,14 @@ the semi join on, `enable_seqscan = off`, and random settings that steer the
 plan (`work_mem` of 64 kB or 1 MB, which makes counts batch their rechecks and
 GROUP BYs spill; the decoded walk, the top k, the lazy set, the probes and the
 plain scan switched off now and then; bitmap and index scans off, which leaves
-the pushdown nothing to lose to; a parallel plan) - and the **reference**: no
-lion path at all, `enable_bitmapscan`, `enable_indexscan` and
-`enable_indexonlyscan` off, a sequential scan, serial.  The two answers are
+the pushdown nothing to lose to; sorts, hash aggregates and core's join
+methods off, one or all of them; on a build with DESIGN.md §39's units,
+`pg_lion.pushdown_margin`, each `pg_lion.<kind>_rate`,
+`pg_lion.resident_page_cost` and `effective_cache_size` now and then at a
+bound or between, which chooses lion's paths where they are never chosen by
+default and declines them where they always are; a parallel plan) - and the
+**reference**: no lion path at all, `enable_bitmapscan`, `enable_indexscan`
+and `enable_indexonlyscan` off, a sequential scan, serial.  The two answers are
 compared as multisets of rows; the direct SQL counts are compared with the
 query they stand for.  The families:
 
