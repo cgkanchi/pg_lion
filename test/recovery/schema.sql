@@ -82,6 +82,19 @@ CREATE INDEX lion_rec_ct  ON lion_rec USING lion (ct)  WITH (buckets = 8);
 CREATE INDEX lion_rec_b   ON lion_rec USING lion (b)   WITH (inline_limit = 64);
 CREATE INDEX lion_rec_arr ON lion_rec USING lion (arr) WITH (inline_limit = 64, buckets = 16);
 
+/*
+ * The window store (DESIGN.md §40).  lion_rec_st is created on the empty
+ * table, so every store page it has was written by aminsert under WAL: a
+ * window's first page and its map slot, sub-arrays extended and widened,
+ * dictionaries grown, pages split and appended, DICT turned RAW - and the
+ * writer's deletes and the VACUUM loop clear slots and rewrite pages.  Its
+ * key and its three INCLUDE columns are a dense int, the thin text column
+ * (about one value a row), a nullable int and a bool.  lion_rec_stb, built
+ * after the load, stores a distinct int8 a row and citext in capped slots.
+ */
+CREATE INDEX lion_rec_st  ON lion_rec USING lion (k4) INCLUDE (t, nn, b)
+	WITH (store_values = true);
+
 INSERT INTO lion_rec
 SELECT g.* FROM generate_series(1, 40000) i, lion_rec_gen(i) g;
 
@@ -89,6 +102,8 @@ CREATE INDEX lion_rec_k4  ON lion_rec USING lion (k4) WITH (inline_limit = 64);
 CREATE INDEX lion_rec_t   ON lion_rec USING lion (t);
 CREATE INDEX lion_rec_nn  ON lion_rec USING lion (nn) WITH (buckets = 8);
 CREATE INDEX lion_rec_tsv ON lion_rec USING lion (tsv);
+CREATE INDEX lion_rec_stb ON lion_rec USING lion (nn) INCLUDE (id, ct)
+	WITH (store_max_len = 16);
 
 /*
  * A MULTICOLUMN index (DESIGN.md §24), so that every crash round exercises
@@ -216,6 +231,8 @@ LANGUAGE sql IMMUTABLE AS $$
 	  ('lion_rec_ct', 'select count(*) from lion_rec'),
 	  ('lion_rec_b',  'select count(*) from lion_rec'),
 	  ('lion_rec_nn', 'select count(*) from lion_rec'),
+	  ('lion_rec_st', 'select count(*) from lion_rec'),
+	  ('lion_rec_stb', 'select count(*) from lion_rec'),
 	  /* ... two columns of it; the summaries' rows are counted apart. */
 	  ('lion_rec_sum', 'select 2 * (select count(*) from lion_rec)'),
 	  /* The multicolumn index (DESIGN.md §24): ntids over ALL its columns.
@@ -521,6 +538,34 @@ BEGIN
 	detail := format('lion_rec_mc column 4 (arr) empty_tids = %s, heap wants %s%s',
 					 got, want, CASE WHEN ok THEN '' ELSE ' MISMATCH' END);
 	RETURN NEXT;
+
+	/*
+	 * 3c. the window store (DESIGN.md §40): every row's stored values, as
+	 * lion_index_stored() reads them, against the heap's, as the type's
+	 * output function spells them.  verify() above compares the rows it
+	 * sees as visible already; this names the index and the count when a
+	 * store comes back wrong, and holds on a standby, where every committed
+	 * row has its slots replayed.
+	 */
+	FOR r IN SELECT * FROM (VALUES
+			('lion_rec_st'::text,
+			 'ARRAY[k4::text, t, nn::text, CASE WHEN b THEN ''t'' ELSE ''f'' END]'::text),
+			('lion_rec_stb', 'ARRAY[id::text, ct::text]')
+		) v(idx, vals)
+	LOOP
+		EXECUTE format('SELECT count(*) FROM lion_rec '
+					   'WHERE lion_index_stored(%L, ctid) IS DISTINCT FROM %s',
+					   r.idx, r.vals)
+			INTO got;
+		EXECUTE format('SELECT store_pages FROM lion_index_stats(%L) WHERE attno = 1',
+					   r.idx)
+			INTO want;
+		ok := (got = 0 AND want > 0);
+		detail := format('store(%s): %s of %s rows differ from the heap, %s store pages%s',
+						 r.idx, got, nrows, want,
+						 CASE WHEN ok THEN '' ELSE ' MISMATCH' END);
+		RETURN NEXT;
+	END LOOP;
 
 	/* 4. single-key counts: index vs seqscan vs count() vs pushdown. */
 	FOR r IN SELECT * FROM lion_rec_keys() LOOP

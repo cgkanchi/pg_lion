@@ -19,7 +19,7 @@ CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_
        src/lion_exec_fkjoin.o src/lion_exec_run.o src/lion_exec_explain.o
 # The window store of DESIGN.md §40 (stored key columns and INCLUDE): its
 # interface is src/lion_store.h, and the bytes of a store page are
-# src/lion_store_fmt.h.
+# src/lion_store_fmt.h, which test/unit/store_test.c tests on its own.
 STORE_OBJS = src/lion_store.o
 # The SQL-callable helpers: lion_funcs.c and lion_index_verify()'s files, which
 # share the private header src/lion_funcs.h.
@@ -55,6 +55,7 @@ ifeq ($(LION_NO_SIMD),1)
 PG_CFLAGS += -DLION_NO_SIMD
 endif
 EXTRA_CLEAN = test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test \
+              test/unit/store_test \
               test/results test/isolation/results
 
 PG_CONFIG ?= $(if $(wildcard .local/pg/bin/pg_config),.local/pg/bin/pg_config,pg_config)
@@ -99,7 +100,8 @@ UNIT_LDFLAGS = -L$(shell $(PG_CONFIG) --pkglibdir) -L$(shell $(PG_CONFIG) --libd
 ifeq ($(SANITIZE),1)
 UNIT_CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
 UNIT_LDFLAGS += -fsanitize=address,undefined
-test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test: .lion-force-unit
+test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test \
+	test/unit/store_test: .lion-force-unit
 .PHONY: .lion-force-unit
 endif
 
@@ -120,11 +122,17 @@ test/unit/sparse_test: test/unit/sparse_test.c src/lion_sparse.c src/lion_contai
                        src/lion_sparse.h src/lion_container.h src/lion_tid.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/sparse_test.c src/lion_sparse.c src/lion_container.c $(UNIT_LDFLAGS)
 
+# The window store's page format (DESIGN.md §40): header-only, plain C.
+test/unit/store_test: test/unit/store_test.c src/lion_store_fmt.h src/lion_tid.h
+	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/store_test.c $(UNIT_LDFLAGS)
+
 .PHONY: unit
-unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test
+unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test \
+      test/unit/store_test
 	./test/unit/container_test
 	./test/unit/container_test_nosimd
 	./test/unit/sparse_test
+	./test/unit/store_test
 
 # header deps (the PostgreSQL build we compile against was not configured with --enable-depend)
 # (every header lion.h includes, and each of the others' includers; a missing
