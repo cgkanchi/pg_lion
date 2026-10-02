@@ -2012,7 +2012,12 @@ phase3() {
 
 		-- split: five ~1.5 KB ARRAY containers per leaf (count_split_race.spec)
 		DROP TABLE IF EXISTS pin_split;
-		CREATE TABLE pin_split (id int, k int NOT NULL, pad char(300));
+		-- 15 rows to a heap page: 480 members of a key in a container, an
+		-- ARRAY, which the split case's inserts grow.  Narrower rows would
+		-- give the key more than 512 members with every offset below 128,
+		-- a NARROW (DESIGN.md section 38), which inserts set bits in and
+		-- never grow, so no leaf would split.
+		CREATE TABLE pin_split (id int, k int NOT NULL, pad char(480));
 		INSERT INTO pin_split SELECT i, i % 2, '' FROM generate_series(1, 100000) i;
 		CREATE INDEX pin_split_k ON pin_split USING lion (k);
 
