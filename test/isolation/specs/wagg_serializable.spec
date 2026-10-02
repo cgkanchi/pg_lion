@@ -1,0 +1,1 @@
+../wagg_serializable.spec

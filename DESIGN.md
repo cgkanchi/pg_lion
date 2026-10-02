@@ -16553,6 +16553,13 @@ Otherwise - a page not marked, at either look, or a count that moved - the aggre
 and each entry is counted as a group of a walk is (`lion_node_count()`), the NULL entry included.
 So is every walk during recovery, where a standby's snapshot holds nothing back on the primary.
 
+**What the walk locks.** It reads every row of the table, so it takes the predicate lock a
+sequential scan takes, `PredicateLockRelation()` on the heap, on every run and before the first
+look. The relation locks the node takes on the indexes it reads (§9, "SERIALIZABLE") do not
+stand in for it: they see every insert, since the sum over every row reads a whole index of the
+table, which every insert reaches, but a DELETE reaches no index. The counted walk's page locks
+(§9) saw it; the walk from the entries' counts visits no heap page and took none.
+
 **The rows of an aborted insert** (2026-10-02 review; the 2026-10-01 soak found it, and
 `test/soak/findings/wagg_aborted_insert.spec` on its branch was the reproducer). The section
 first said of every change what the COMMITS bullet says: "the page cannot be marked again while
@@ -16593,6 +16600,15 @@ for each bulk delete. A killed speculative insert is not among the permutations:
 the kill needs a conflicting tuple inserted concurrently, which either commits, and keeps its page
 unmarked while the walk's snapshot holds VACUUM back, or aborts, and the killer's retry then
 inserts its own row and has to abort too.
+
+**SERIALIZABLE** (2026-10-02 review). The walk from the entries' counts took no predicate lock on
+the heap: two SERIALIZABLE transactions that each read `sum(k)` through it and each deleted, by
+ctid, a row the other's sum counted both committed, where the sequential scan's relation lock
+fails the second with a serialization failure. Inserts were caught, by the index's own lock, and
+so were deletes under the counted walk, by its page locks. "What the walk locks" above is the fix;
+it also makes the counted walk's page locks redundant, a coarser lock covering them. A standby
+needs nothing: it refuses SERIALIZABLE. `test/isolation/wagg_serializable.spec` is the schedule:
+both commit without the lock.
 
 *What the dirty-key walk needs* (`claude/lion-walkcost-wagg`, not merged): its `LION_WALK_DIRTY`
 walk takes an entry's `ntids` when none of its members lies under a container key that held a page
@@ -16662,6 +16678,9 @@ counted after a DELETE, beside this transaction's own insert and delete, and aga
 an empty table and one of NULLs only; and the declines - a WHERE, a GROUP BY, two columns in one
 argument, a volatile argument, DISTINCT, FILTER, ORDER BY, a numeric column, the aggregates no
 sum of keys answers, and a partial index.
+
+`test/isolation/wagg_serializable.spec`: the write skew of "SERIALIZABLE" above, through deletes
+under the walk from the entries' counts and under the counted walk, and through inserts.
 
 ## 39. The competitor's units, and a margin for the pushdown (2026-10-01)
 

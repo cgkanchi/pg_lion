@@ -3000,6 +3000,14 @@ lion_wagg_reset(LionCountScanState *st)
 /*
  * Compute every aggregate over keys (DESIGN.md §37) into its result.
  *
+ * The walk reads every row of the table, so it takes the predicate lock a
+ * sequential scan takes, on the whole heap, before it reads anything.  The
+ * walk from the entries' counts visits no heap page, so it takes no page lock
+ * either, and the relation lock lion_open_relation() takes on the node's own
+ * index sees an insert but not a DELETE, which reaches no index: without it,
+ * two SERIALIZABLE transactions could each read a sum, each delete a row the
+ * other's sum counted, and both commit.
+ *
  * The entries' own counts are the rows when every heap page is all-visible
  * before the first header is read and after the last, the heap has as many
  * pages both times, and no index walked has finished a bulk delete in
@@ -3043,6 +3051,7 @@ lion_wagg_run(LionCountScanState *st)
 		if (st->wcol[c].idx == NULL)
 			st->wcol[c].idx = index_open(st->wcol[c].idxoid, AccessShareLock);
 	}
+	PredicateLockRelation(st->heap, estate->es_snapshot);
 
 	lion_wagg_reset(st);
 	fast = !RecoveryInProgress();
