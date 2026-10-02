@@ -3014,9 +3014,20 @@ lion_count_rel_pair_cost(LionCountRelCost *c)
 	 * pairs (DESIGN.md §26): one per entry of k the walk visits - or per
 	 * listed value, when a list on k drives it - and beside a GROUP BY one
 	 * per group, the group's own test.
+	 *
+	 * Without a GROUP BY the walk tests EVERY entry of k it visits
+	 * (c->walked), and not only the ones the WHERE leaves a row in, which
+	 * are the values it emits (c->ingroups): an entry the WHERE empties is a
+	 * test read to its end to say so (lion_exists_fraction()).  Charging the
+	 * emitted values priced `count(DISTINCT UserID) WHERE MobilePhoneModel
+	 * <> ''` (ClickBench, 5M rows) at 281,060 tests where it made 3,413,988,
+	 * and chose it at 275k cost units against a bitmap scan's 437k: 9.1 s
+	 * against 0.7.
 	 */
 	if (c->distinct != LION_DISTINCT_NONE)
-		c->pair_cost += c->ingroups * LION_DISTINCT_TEST_COST;
+		c->pair_cost += ((c->groupidx2 == NULL) ? Max(c->walked, c->ingroups) :
+						 c->ingroups) *
+			LION_DISTINCT_TEST_COST;
 }
 
 /*
