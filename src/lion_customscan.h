@@ -2462,6 +2462,7 @@ extern double lion_units_margin_for(RelOptInfo *rel);
 
 /* lion_plan_cost.c */
 extern double lion_index_dir_pages(IndexOptInfo *idx, double *height);
+extern double lion_index_store_pages(IndexOptInfo *idx, int *nstored);
 extern double lion_index_column_share(PlannerInfo *root, RelOptInfo *rel,
 									  IndexOptInfo *idx, AttrNumber col);
 extern bool lion_index_orders_naturally(IndexOptInfo *idx, AttrNumber col);
