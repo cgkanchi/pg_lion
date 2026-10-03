@@ -1046,12 +1046,15 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  *		5's order, each that partition's own, and the column numbers are 0:
  *		each partition's index may place the columns differently, and the
  *		executor finds every relation's from the index it opens
- *		(lion_store_count()), a plain table's too.  lion_plan_custom_path()
- *		adds a List of one IntList per aggregate over a gathered column: its
- *		LION_SAGG_* kind, its column's position, the width of an integer
- *		argument, the aggregate, its input collation, and - for a
- *		count(DISTINCT) - the equality the DISTINCT compares with and its
- *		collation.  The count itself is the count(*) every other member
+ *		(lion_store_count()), a plain table's too.  Then an IntList of the
+ *		planner's estimates of the groups and of the count(DISTINCT) pairs,
+ *		each capped at INT_MAX, from which the executor chooses the
+ *		partitions of a spill (DESIGN.md §40, "As built: spilling").
+ *		lion_plan_custom_path() adds a List of one IntList per aggregate over
+ *		a gathered column: its LION_SAGG_* kind, its column's position, the
+ *		width of an integer argument, the aggregate, its input collation,
+ *		and - for a count(DISTINCT) - the equality the DISTINCT compares with
+ *		and its collation.  The count itself is the count(*) every other member
  *		describes: of the WHERE, or the sum over every row.  The FK-side
  *		join's path carries members 0 - 18 (lion_plan_fkjoin.c) and its plan
  *		an empty one here (lion_plan_fkjoin_path())
@@ -1159,6 +1162,11 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * partition: a partitioned table's gather (DESIGN.md §40, "As built:
  * partitioned tables"), whose groups the node forms over every partition.
  *
+ * Shape 24 added the estimates of the groups and pairs to the STORE member
+ * (19), in front of its aggregates: the gather's spill (DESIGN.md §40, "As
+ * built: spilling"), whose partitions they choose, and which an older build
+ * would have read as the aggregates.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1171,7 +1179,7 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424917
+#define LION_PRIV_MAGIC		0x52424918
 #define LION_PRIV_NMEMBERS	21
 
 /*
@@ -2541,7 +2549,9 @@ extern double lion_index_store_pages(IndexOptInfo *idx, int *nstored);
 extern void lion_cost_store_path(PlannerInfo *root, CustomPath *cpath,
 								 List *targets, int ncols, int ngroup,
 								 double groups, double outrows, int naggs,
-								 int ndistinct, double distinctpairs);
+								 int ndistinct, double distinctpairs,
+								 double hashbytes, double pairbytes,
+								 int32 rowwidth, int32 pairwidth);
 extern double lion_index_column_share(PlannerInfo *root, RelOptInfo *rel,
 									  IndexOptInfo *idx, AttrNumber col);
 extern bool lion_index_orders_naturally(IndexOptInfo *idx, AttrNumber col);
@@ -2707,6 +2717,9 @@ extern Datum lion_store_emit_value(LionCountScanState *st, int kind,
 								   bool *isnull);
 extern void lion_store_reset(LionCountScanState *st);
 extern void lion_store_explain(LionCountScanState *st, ExplainState *es);
+extern double lion_store_chunk_bytes(double size);
+extern double lion_store_group_bytes(int ngroup, int naggs, bool hasdistinct);
+extern double lion_store_pair_bytes(double copybytes);
 
 /* lion_exec_run.c */
 extern void lion_pause_run(LionCountScanState *st);

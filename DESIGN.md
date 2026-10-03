@@ -18232,9 +18232,9 @@ column's), every output a `GROUP BY` column, `count(*)`, or an aggregate over a 
 §37's `lion_wagg_classify()` set (sum and avg of int2, int4 and int8 in 128 bits, min and max
 under the aggregate's sort operator; float8 and numeric sums were not trivial and are left out).
 `lion_find_store_index()` then picks the lion index that stores every gathered column, the one
-storing fewest columns when several do. The FK-side join and a hash table the planner expects to
-exceed `hash_mem` are declined (the node does not spill); a partitioned table was too, until
-"As built: partitioned tables" below. The plan carries the
+storing fewest columns when several do. The FK-side join is declined. A hash table the planner
+expects to exceed `hash_mem` was too, until "As built: spilling" below, and a partitioned table,
+until "As built: partitioned tables" below. The plan carries the
 gather as private member 19 (`LION_PRIV_STORE`: the index, the heap columns, their index columns,
 the `GROUP BY`'s position, equality and collation per column, and per aggregate its kind, column,
 width, aggregate, input collation and DISTINCT equality and collation); the target-list kinds move
@@ -18308,7 +18308,7 @@ fourth 660 ms (best of four), which lost to the `HashAggregate`'s 492 ms then.
 - A parallel gather: the node's partitioned mode would need partial aggregate states for sum,
   avg, min, max and `count(DISTINCT)`. A partitioned table does without them, counted a partition
   at a time into one set of groups ("As built: partitioned tables", below).
-- Spilling: the node keeps every group in memory and the planner declines past `hash_mem`.
+- Spilling past `hash_mem`, which the planner declined: built in "As built: spilling", below.
 - Expressions: an aggregate argument or a `GROUP BY` item that is not a plain column, and a target
   that is an expression of a `GROUP BY` column.
 - float8 and numeric sums and averages; `FILTER` and ordered aggregates.
@@ -18336,10 +18336,11 @@ reasons. `count(DISTINCT c)` has no partial state: two partitions' distinct coun
 added, and a Finalize Agg could only merge them if the partials carried the values themselves.
 The sums' partial states are core's internal ones - for int8 a 128-bit accumulator, serialized by
 `int8_avg_serialize()` - which the node would have to build to core's layout. And the store path
-over one table already holds every group in memory behind the plan-time guard of `hash_mem`
-(`lion_store_hash_bytes()`): holding every partition's groups is bounded the same way, while
-partials would hold one partition's groups at a time but emit a group once for every partition it
-has rows in, for a Finalize Agg to hash them all again.
+over one table bounds its groups by `hash_mem` - by a plan-time guard when this was built
+(`lion_store_hash_bytes()`), by a spill since "As built: spilling" below: holding every
+partition's groups is bounded the same way, while partials would hold one partition's groups at a
+time but emit a group once for every partition it has rows in, for a Finalize Agg to hash them all
+again.
 
 **The planner** (`lion_plan_count.c`). `lion_try_store_path()` no longer returns for a partitioned
 table. The leaves are §16's targets (`lion_collect_targets()`): the live leaves after plan-time
@@ -18355,16 +18356,17 @@ FK-side join gathers nothing, the gather has no parallel form, and run-time prun
 The cost (`lion_cost_store_path()`) is the rule above summed over the leaves, each with its own
 heap pages, windows, rows kept and store pages; the (groups + distinct pairs) term is paid once.
 
-**The estimate and the guard** (`lion_store_estimate()`). The groups the node forms are estimated
+**The estimate** (`lion_store_estimate()`). The groups the node forms are estimated
 as the SUM over the live leaves of each leaf's own estimate - `estimate_num_groups()` of the
 leaf's own columns over the rows its WHERE keeps, capped by those rows - and a `count(DISTINCT)`'s
 (group, value) pairs the same way. A group with rows in several partitions is counted once for
-each, so the sum is at least the groups formed, and the `hash_mem` guard compared with it errs
-toward declining. The parent's estimate is not used for the guard: a partitioned parent is never
-auto-analyzed, so its statistics are missing or as old as the last manual ANALYZE, while the
-leaves' are kept current. The path's rows are the fewer of the parent's estimate and the sum. A
-column's width is the widest leaf's (`lion_store_width()`): `get_attavgwidth()` reads a relation's
-own statistics, and a partitioned parent has only its inheritance tree's.
+each, so the sum is at least the groups formed, and the memory compared with `hash_mem` errs
+toward pricing a spill the node may not need (toward declining, while the planner declined past
+`hash_mem`; "As built: spilling", below). The parent's estimate is not used for it: a partitioned
+parent is never auto-analyzed, so its statistics are missing or as old as the last manual ANALYZE,
+while the leaves' are kept current. The path's rows are the fewer of the parent's estimate and the
+sum. A column's width is the widest leaf's (`lion_store_width()`): `get_attavgwidth()` reads a
+relation's own statistics, and a partitioned parent has only its inheritance tree's.
 
 **The plan.** Member 19 (`LION_PRIV_STORE`) names one index per live leaf, in member 5's order, and
 its column numbers are 0 for a partitioned table: a leaf's index may place the columns differently,
@@ -18401,15 +18403,167 @@ partition and to none; the narrower index read for the group column alone and th
 sum (`pg_statio_user_indexes`); the declines - a leaf whose index does not store a column and a
 leaf with no lion index, and the path taken again where pruning excludes it; dirty pages in one
 leaf, an open transaction's changes, and all from the store after VACUUM; correlated subqueries'
-rescans; and the guard declining under a small `work_mem` where the parent's stale statistics
-would have let the path through. The output names no actual rows, no SubPlan and no counter that
-depends on the heap's page layout, so it is one file for every major.
+rescans; and, under a small `work_mem`, groups past `hash_mem` that the parent's stale statistics
+would have let through the guard, which declined them until "As built: spilling" below and which
+now spill. The output names no actual rows, no SubPlan and no counter that depends on the heap's
+page layout, so it is one file for every major.
 
 **What is left.**
-- Partial aggregates, for a parallel gather (above), and so a partitioned table larger than
-  `hash_mem` in groups: the node still keeps every group in memory and does not spill.
+- Partial aggregates, for a parallel gather (above). A partitioned table larger than `hash_mem` in
+  groups was here too; the node spills its groups since "As built: spilling", below.
 - Run-time pruning, as for every partitioned count (§16).
 - A leaf's store index is the one storing fewest columns, not priced against the others.
+
+### As built: spilling (2026-10-03)
+
+The gather's hash table past `hash_mem`, spilled to batch files as core's HashAggregate spills its
+own (`nodeAgg.c`), so that the planner no longer declines a store path whose groups or
+`count(DISTINCT)` pairs would not fit, and the node's tables stay within `hash_mem` whatever the
+estimate said. The answer is the one the node gave in memory. Where it follows nodeAgg and where it
+departs, and why:
+
+**The memory check** (`lion_store_check_group()`, `lion_store_check_pair()`). After every new group
+and every new (group, value) pair of a `count(DISTINCT)`, the node compares what the groups' context
+has allocated - `MemoryContextMemAllocated()`, the pairs' child context included: the groups, their
+keys and extremes, the distinct values and both hash tables - with `get_hash_memory_limit()`. Past
+it the rest of the pass is in spill mode. The check comes after the entry has gone in, as
+`hash_agg_check_limits()`'s does, so a pass always keeps one entry and gets somewhere however little
+room it has. One departure: with a `count(DISTINCT)` the groups alone, the context without its
+pairs' child, are also held to half of `hash_mem`. The pairs that come for a pass's groups after it
+began to spill are counted from their batches beside those groups, in what they leave of `hash_mem`;
+groups that had filled it left a batch of pairs no room, and in a first build one test's query took
+64,450 batches, each keeping a pair or two. The tables' contexts also grow from small blocks to
+blocks of a sixteenth of `hash_mem` at most, as `hash_create_memory()` sizes a HashAggregate's under
+a small `work_mem`, and a pass's tables start at no more than 256 entries, so that the check is not
+made a block of several times the limit too late and an empty pass costs little.
+
+**Spill mode** (`lion_store_add()`, `lion_store_add_pair()`). No new group and no new pair enters a
+table. A row whose group the table does not hold is written to a batch file of groups, the partition
+chosen by the next bits of the group's hash (`lion_store_group_hash()`, the columns' hash functions
+combined as `execGrouping.c` combines them, then `murmurhash32()`); a row of a group the table holds
+updates it as before, and a `count(DISTINCT)` value the group has not had - a pair the table does
+not hold - is written to a batch file of pairs, by the next bits of the pair's hash. A row is its
+hash and a `MinimalTuple` of every gathered column over a `TupleDesc` of their parent's types
+(`lion_form_minimal_tuple()`, `lion_compat.h`, over 18's extra argument); a pair is its hash, the
+group's id, the aggregate's number and a tuple of the value alone. The partitions are chosen as
+`hash_choose_num_partitions()` chooses them (`lion_spill_num_partitions()`): 1.5 times what the
+input's estimate over `hash_mem` asks for, between 4 and 1024, a power of two of the bits the hash
+has left - one partition when none are left, a pass still keeping one entry - and no more than keep
+a block's buffer for every open file within a quarter of `hash_mem`, the batches still waiting and
+the one being read counted in: a BufFile holds its buffer for as long as it is open. The first
+pass's estimate is the plan's; a batch's is the HyperLogLog of the hashes written to it
+(`LION_SPILL_HLL_BIT_WIDTH`), and its `used_bits` advance by the bits its spill took. A partition's
+file is `BufFileCreateTemp(false)`, made at its first record.
+
+**The passes** (`lion_store_pass_begin()`, `lion_store_pass_end()`, `lion_store_next()`). The count
+is the first pass. At a pass's end its spill of groups goes onto a stack of batches, and its spill
+of pairs is counted at once: each batch of pairs, deepest first, into a fresh table in the pairs'
+context, a pair new to that table adding 1 to its group's count - the group found by its id
+(`run->byid`), which the pass still holds - and a batch that overflows split again by the next bits
+of the pair's hash. Then the pass's groups go out, and `lion_store_next()` is a loop: the next group
+of the pass, or, when there is none, the next batch of groups off the stack, deepest first, read in
+a pass of its own under the hashes it was written with, which may spill rows and pairs a level
+deeper and counts its pairs the same way before its groups go out; until the stack is empty. Without
+a `GROUP BY` only pairs spill, and the one row waits for them. The rows are counted once, at the
+gather (`run->rows`, and the check that the count handed over the rows it counted, per partition),
+not again as a batch replays them; `Store Groups` counts every pass's.
+
+**Why no pair is counted twice.** In spill mode no new pair enters the table, so a pair is written
+to a batch only when the table does not hold it - and then it never held it, since nothing leaves a
+table before its pass ends: the pair was not counted in memory. Every later row of the pair has the
+same hash and goes to the same partition, so one batch holds every occurrence memory did not count,
+and that batch's table counts it once; a batch that spills again keeps the same rule a level deeper.
+Nor is a group split: once a pass is spilling no group enters its table, and a group in it keeps its
+rows to the pass's end, so a group's rows - and with them its distinct values - are all in memory or
+all in one batch, as a HashAggregate's are. The pass's pair table may therefore go before its
+batches of pairs are read.
+
+**Files and memory.** A batch's file is closed once the batch has been read (`lion_batch_close()`),
+and every file still open at a rescan and at the node's end (`lion_store_close_files()`, from
+`lion_store_reset()`); an error leaves them to the resource owner, as for every temporary BufFile.
+The spills, the batches and the files' own structs and buffers are in a context of their own
+(`LionCount store spill`), reset with them.
+
+**EXPLAIN ANALYZE** adds `Store Batches` - 1 when nothing spilled and one more for every batch of
+groups or pairs written, as a HashAggregate's `Batches` - and `Store Disk Usage` in kB, the most the
+open batch files held at once. Departure: nodeAgg measures `hash_disk_used` from its tape set's
+blocks, which the `BufFileSize()` of each file would give here, but `BufFileSize()` asserts a
+FileSet on 16 and 17 and a file of `BufFileCreateTemp()` has none (the assertion went in 18, not
+backpatched), so the node sums the bytes written to the files still open. Both accumulate over
+rescans, as `Store Groups` does.
+
+**The planner** (`lion_try_store_path()`). The guard is gone: groups and pairs past `hash_mem` are
+priced, not declined, from the memory `lion_store_hash_bytes()` estimates, the pairs' part of it
+apart. That estimate was a constant per group and per aggregate (64 and 48 bytes), which a guard
+could live with; priced, it put the 20,000 groups of `g, count(*)` in the spill test at 1.7 MB,
+where the node used 4.4. It is now what the node allocates, from functions of the executor beside
+the structs they measure (`lion_store_chunk_bytes()`, `lion_store_group_bytes()`,
+`lion_store_pair_bytes()`): a group's struct rounded up to its AllocSet chunk with the chunk's
+header, its keys' and nulls' arrays the same way, its entry in the table of groups and, beside a
+`count(DISTINCT)`, its place by id, each at the average fill of a table that doubles at 0.9 full,
+and a copy of every by-reference key and min or max (`storeextvars`) at its column's average width;
+a pair, its entry and its value's copy the same way. Measured through a cursor
+(`pg_backend_memory_contexts` after the first row) on that table it is 5 to 14% under what the
+groups use - 192 bytes a group against 218 for `g, count(*)`, 612 against 647 with six aggregates
+and a `count(DISTINCT)` - and the pairs 48 against 55 to 72, by the table's fill. Member 19
+(`LION_PRIV_STORE`) carries the estimates of the groups and the pairs, capped at `INT_MAX`, for the
+first pass's partitions as an Agg's `numGroups`; `LION_PRIV_MAGIC` changed with it (shape 24). The
+partitioned estimate - the sum over the leaves - is as it was.
+
+**The cost rule as implemented** (`lion_cost_store_spill()`, from `lion_cost_store_path()`) is
+`cost_agg()`'s for an `AGG_HASHED` spill, added only when the estimated memory - or, beside a
+`count(DISTINCT)`, twice the groups' own - exceeds `hash_mem`, so a path that does not spill is
+priced as before:
+
+	mem_limit, ngroups_limit, partitions = hash_agg_set_limits(entrybytes, entries)
+	nbatches = max(ceil(max(entries * entrybytes / mem_limit, entries / ngroups_limit)), 1)
+	depth    = ceil(log(nbatches) / log(max(partitions, 2)))
+	pages    = tuples * (MAXALIGN(width) + MAXALIGN(SizeofHeapTupleHeader)) / BLCKSZ
+	startup += pages * depth * 2 * random_page_cost + depth * tuples * 2 * cpu_tuple_cost
+	total   += the same + pages * depth * 2 * seq_page_cost
+
+nothing when nbatches is 1. It is applied once with a `GROUP BY`, the groups the entries, the memory
+over the groups each (beside a `count(DISTINCT)`, twice the groups' own where that is more, since
+they are held to half of `hash_mem`), every row the WHERE keeps the tuples, and the gathered
+columns' summed widths (`lion_store_width()`) the width; and once with a `count(DISTINCT)`, the
+pairs the entries, the pairs' memory over the pairs each, every row once per distinct aggregate the
+tuples, and the widest distinct column with a group id and an aggregate number the width
+(`lion_store_spill_widths()`). As in `cost_agg()` the writes are at `random_page_cost` and the reads
+at `seq_page_cost`, both twice over, and the spill's CPU is paid once a level.
+
+**Tests.** `test/sql/store_spill.sql`, every answer compared with the plan with the pushdown off,
+under `work_mem = 64` and `hash_mem_multiplier = 1`: a synthetic table of 60,000 rows whose 20,000
+groups take a `GROUP BY` with `count(*)`, `sum`, `min`, `max` and `count(DISTINCT)`, with a `HAVING`
+and over two columns, with a WHERE and with none; `count(DISTINCT)` of 30,000 values with no
+`GROUP BY`, and two at once; few groups with many distinct values; a range-partitioned copy whose
+groups span the partitions; a correlated subquery's rescans, one stopping after a few groups with
+batches unread; and a `work_mem` everything fits in, where `Store Batches` is 1 - 64MB,
+`./dev.sh`'s, set in the test, since at PostgreSQL's default of 4MB the first query's groups, 13 MB
+of them, spill. The whole suite ran on 18, and the three store tests on 16, 17, 19 and master too.
+ANALYZE's `Store Batches > 1` and `Store Disk Usage > 0` are printed as booleans, and nothing that
+depends on the page layout or the batches' exact number, so it is one file for every major.
+`store_count.sql`'s decline under a small `work_mem` is now a spill, and so is
+`store_partition.sql`'s over partitions; both files' ANALYZE output gains the two lines.
+
+**Measured.** An assert-enabled build (`-O1`) on 18, a synthetic table of 1,000,000 rows, a
+`GROUP BY` of 200,000 groups with `count(*)`, `sum`, `min` of a text column and `count(DISTINCT)` of
+300,000 values, the node's contexts sampled with `pg_log_backend_memory_contexts()` while it ran. At
+`work_mem = 64`: 10,921 batches, 10,920 temporary files (`log_temp_files = 0`) of 290 MB together,
+the largest 13 MB, a `Store Disk Usage` of 63,487 kB, 2.3 s; the groups' and pairs' contexts at most
+42 kB together, the spill's 50 to 158 kB, the node's at most 201 kB. At `work_mem = 1024`: 1,221
+batches, 62,923 kB at most on disk, 1.0 s; the tables at most 656 kB, the spill's at most 383 kB,
+the node's at most 1,039,392 bytes, under the 1,048,576 of `hash_mem`.
+
+**What is left.**
+- The files' buffers are outside the check, as nodeAgg's tapes' are, and a BufFile keeps its block
+  while its batch waits, where a tape frees its write buffer once rewound; nor are the expected
+  buffers taken off the tables' limit, as `hash_agg_set_limits()` takes them. At the minimum of 4
+  partitions, with a spill of rows and one of pairs open at once and the waiting batches' files, a
+  tiny `hash_mem` is exceeded several times over (201 kB at 64 kB above).
+- A held group's min or max of a variable-width type may still grow in spill mode, a new extreme
+  replacing the old, as a HashAggregate's transition state may.
+- A batch of pairs that cannot fit beside its pass's groups - groups whose extremes outgrew
+  `hash_mem` - keeps one pair a level; the half of `hash_mem` makes that unlikely, not impossible.
 
 ### As built: Phase B, index-only scans (2026-10-02)
 

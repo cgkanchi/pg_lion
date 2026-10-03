@@ -29,7 +29,8 @@ SET max_parallel_workers_per_gather = 0;
  * answers equal as multisets.  It says whether the node gathered from the
  * store (and which columns), walked without it, or was not used; whether the
  * gathered rows came from the store, the heap or both; whether a page of
- * them was ABSENT; and how many rows the query returned.
+ * them was ABSENT; whether the node spilled past hash_mem into more batches
+ * than one; and how many rows the query returned.
  */
 CREATE FUNCTION lsc_check(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -40,6 +41,7 @@ DECLARE
 	fromstore bigint := 0;
 	fromheap bigint := 0;
 	absent bigint := 0;
+	batches bigint := 0;
 	nrows bigint;
 	ndiff bigint;
 BEGIN
@@ -59,6 +61,8 @@ BEGIN
 			fromstore := substring(ln FROM 'Store Rows: (\d+)')::bigint;
 		ELSIF ln ~ 'Store Pages Absent: ' THEN
 			absent := substring(ln FROM 'Store Pages Absent: (\d+)')::bigint;
+		ELSIF ln ~ 'Store Batches: ' THEN
+			batches := substring(ln FROM 'Store Batches: (\d+)')::bigint;
 		END IF;
 	END LOOP;
 	EXECUTE format('CREATE TEMP TABLE lsc_on AS SELECT s::text AS r FROM (%s) s', q);
@@ -77,12 +81,13 @@ BEGIN
 	DROP TABLE lsc_off;
 	RETURN format('%s, %s rows, %s',
 				  CASE WHEN cols IS NOT NULL THEN
-					   format('store (%s): %s%s', cols,
+					   format('store (%s): %s%s%s', cols,
 							  CASE WHEN fromstore > 0 AND fromheap > 0 THEN 'store and heap'
 								   WHEN fromstore > 0 THEN 'all from the store'
 								   WHEN fromheap > 0 THEN 'all from the heap'
 								   ELSE 'nothing gathered' END,
-							  CASE WHEN absent > 0 THEN ', absent pages' ELSE '' END)
+							  CASE WHEN absent > 0 THEN ', absent pages' ELSE '' END,
+							  CASE WHEN batches > 1 THEN ', Store Batches > 1' ELSE '' END)
 					   WHEN used THEN 'walk'
 					   ELSE 'no pushdown' END,
 				  nrows,
@@ -286,14 +291,15 @@ RESET pg_lion.enable_count_pushdown;
 
 -- 11. Not gathered: an argument that is not a plain column, an expression of
 --    a grouping column, a sum of numeric, a key column the index does not
---    store beside a stored one, a FILTER, a column no index stores, and a
---    hash table larger than hash_mem allows.
+--    store beside a stored one, a FILTER, and a column no index stores.
 SELECT lsc_check('SELECT sum(i4 + 1) FROM lsc WHERE k < 5');
 SELECT lsc_check('SELECT i2 + 1, count(*) FROM lsc WHERE k < 5 GROUP BY i2 + 1');
 SELECT lsc_check('SELECT sum(n) FROM lsc WHERE k < 5');
 SELECT lsc_check('SELECT k, i2, count(*) FROM lsc WHERE k < 3 GROUP BY k, i2');
 SELECT lsc_check('SELECT count(DISTINCT i2) FILTER (WHERE i4 > 5) FROM lsc WHERE k < 3');
 SELECT lsc_check('SELECT id, count(*) FROM lsc WHERE k = 3 GROUP BY id');
+-- ... but a hash table larger than hash_mem is: the node spills what does not
+--    fit to batch files, as a HashAggregate does (store_spill.sql).
 SET work_mem = 64;
 SET hash_mem_multiplier = 1;
 SELECT lsc_check('SELECT i8, count(*) FROM lsc WHERE k < 40 GROUP BY i8');
