@@ -349,7 +349,7 @@ psql_p() {
 }
 # Planner settings for a reference count that must come from the heap, not
 # from a lion index: no index plan of any kind and no count pushdown.
-HEAPONLY="-c pg_lion.enable_count_pushdown=off -c enable_indexscan=off -c enable_indexonlyscan=off -c enable_bitmapscan=off"
+HEAPONLY="-c pg_lion.enable_count_pushdown=off -c pg_lion.enable_store_scan=off -c enable_indexscan=off -c enable_indexonlyscan=off -c enable_bitmapscan=off"
 psql_s() {
 	"$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 -h "$SOCKDIR" -p "$STANDBY_PORT" \
 		-U postgres -d "$DBNAME" "$@"
@@ -1795,8 +1795,12 @@ standby_chain_reuse() {
 # columns under an array column's `&&`, which lion's planner hook builds.
 standby_index_only() {
 	local plan ios seq want round q n
-	local ioset="set enable_seqscan = off; set enable_bitmapscan = off; set pg_lion.enable_count_pushdown = off;"
-	local seqset="set enable_indexscan = off; set enable_indexonlyscan = off; set enable_bitmapscan = off; set pg_lion.enable_count_pushdown = off;"
+	# The row gather (LionStoreScan) answers the row queries from the same
+	# stores and undercuts the index-only scan on a table this size, and it
+	# is not an index scan for enable_indexscan; this fixture is the
+	# index-only scan's, so both settings turn it off.
+	local ioset="set enable_seqscan = off; set enable_bitmapscan = off; set pg_lion.enable_count_pushdown = off; set pg_lion.enable_store_scan = off;"
+	local seqset="set enable_indexscan = off; set enable_indexonlyscan = off; set enable_bitmapscan = off; set pg_lion.enable_count_pushdown = off; set pg_lion.enable_store_scan = off;"
 	local -a queries=(
 		"select count(*) from lion_ios where flag"
 		"select k, v, w from lion_ios where k = 7"
