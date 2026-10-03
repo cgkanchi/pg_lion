@@ -23,7 +23,7 @@
 #              Phase 2 then expects the standby to TRUST the visibility map,
 #              which is the property §25 buys.
 #   --phases   which phases to run, e.g. "3" or "2 3" (default: all of
-#              "1 1b 1c 1d 1e 1f 2 3 4").  For development, and for a server
+#              "1 1b 1c 1d 1e 1f 1g 2 3 4").  For development, and for a server
 #              without injection points, which can run only "1 1f 2 4" (CI's
 #              packaged-server jobs do); `make recovery-check` always runs
 #              everything.
@@ -57,7 +57,7 @@
 #                     the installed one is reported, since the installed one
 #                     is what gets tested.
 #   INJECTION_POINTS=1
-#                     phases 1b-1e and 3 park a backend on an injection point
+#                     phases 1b-1e, 1g and 3 park a backend on an injection point
 #                     and are skipped, with a line in the summary, on a server
 #                     without the injection_points extension.  With this set
 #                     (as CI's source jobs set it) that is a failure instead:
@@ -124,7 +124,7 @@ REQUIRE_INJECTION=${INJECTION_POINTS:-0}
 ITERS=8
 KEEP=0
 MODE=generic
-PHASES="1 1b 1c 1d 1e 1f 2 3 4"
+PHASES="1 1b 1c 1d 1e 1f 1g 2 3 4"
 EXTRA_CONF=()
 
 # Set by make_private_dirs(), which the main section calls once the arguments
@@ -1419,6 +1419,125 @@ phase1f() {
 	SUMMARY+=("phase1f            an unlogged rmgr-mode index was written without the manager")
 }
 
+# ------------------------------------------------------------- phase 1g
+
+# A crash between an insert's store record and its posting record (DESIGN.md
+# §40, "Insert").  lion_insert() writes the row's stored values first - the
+# slot is set before the TID enters any container - and the injection point
+# lion-insert-after-store parks it right after, before the key loop.  The
+# server dies there, with the store record flushed by another session's
+# commit.  What must come back: the slot as written (the record replayed),
+# no entry for the row anywhere (its posting record never happened, and its
+# transaction is aborted), an index verify() calls consistent, and a VACUUM
+# that clears the slot because the heap says the row is dead - after which
+# the TID's next row stores its own values.
+#
+# The table is fresh and its rows fit one heap page, so the parked row's TID
+# is (0,101): read at that TID, the store shows what the parked insert wrote.
+phase1g() {
+	local off stored inspid
+	log ""
+	log "=== phase 1g: a crash between an insert's store record and its posting ==="
+
+	psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1 ||
+		{ no_injection_points "phase 1g" "phase1g            skipped (no injection points)"; return 0; }
+
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1g: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS lion_stc, lion_stc_flush;
+		CREATE TABLE lion_stc (id int, k int, t text);
+		CREATE INDEX lion_stc_k ON lion_stc USING lion (k) INCLUDE (t)
+			WITH (store_values = true);
+		INSERT INTO lion_stc SELECT i, i % 7, 'row ' || i FROM generate_series(1, 100) i;
+		CHECKPOINT;
+	SQL
+	[ "$(psql_p -tAc "select max(ctid) = '(0,100)' from lion_stc")" = "t" ] ||
+		die "phase 1g: the fixture's rows are not the first 100 of heap page 0"
+
+	psql_p -c "SELECT injection_points_attach('lion-insert-after-store', 'wait')" \
+		>>"$RUNLOG" 2>&1 || die "phase 1g: could not attach the injection point"
+
+	off=$(stat -c %s "$PRIMARY_LOG")
+	"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres -d "$DBNAME" \
+		-c "INSERT INTO lion_stc VALUES (101, 42, 'parked')" >>"$RUNLOG" 2>&1 &
+	inspid=$!
+
+	wait_true psql_p \
+		"select count(*) > 0 from pg_stat_activity where wait_event = 'lion-insert-after-store'" \
+		60 "the INSERT to park between its store record and its posting"
+
+	# The store record is written; the posting is not.  The insert belongs
+	# to a transaction that will never commit, so nothing flushes its WAL:
+	# another transaction's commit does, as far as its own commit record,
+	# which is past the store record.
+	stored=$(psql_p -tAc "select lion_index_stored('lion_stc_k', '(0,101)')")
+	[ "$stored" = "{42,parked}" ] ||
+		die "phase 1g: the parked insert's slots read $stored before the crash, expected {42,parked}"
+	psql_p -c "SET synchronous_commit = on; CREATE TABLE lion_stc_flush AS SELECT 1 AS x" \
+		>>"$RUNLOG" 2>&1 || die "phase 1g: the flushing commit failed"
+
+	crash_immediate
+	wait "$inspid" 2>/dev/null || true
+
+	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+	verify_node psql_p "$PRIMARY_DATA"
+	tail -c "+$((off + 1))" "$PRIMARY_LOG" >>"$RUNLOG"
+	grep -q "database system was not properly shut down" \
+		<<<"$(tail -c "+$((off + 1))" "$PRIMARY_LOG")" ||
+		die "phase 1g: the restart did not report an unclean shutdown"
+	grep -q "redo starts at" <<<"$(tail -c "+$((off + 1))" "$PRIMARY_LOG")" ||
+		die "phase 1g: the restart replayed nothing"
+
+	run_check "phase 1g post-crash" psql_p \
+		"select lion_index_stored('lion_stc_k', '(0,101)') = '{42,parked}',
+				'the slots of the aborted row came back as written: ' ||
+				lion_index_stored('lion_stc_k', '(0,101)')::text
+		 union all
+		 select (select count(*) from lion_stc) = 100, 'the heap has the 100 committed rows'
+		 union all
+		 select lion_index_count('lion_stc_k', 42) = 0, 'no entry for the aborted row'
+		 union all
+		 select (select sum(ntids) from lion_index_stats('lion_stc_k')) = 100,
+				'the index holds the 100 committed TIDs'
+		 union all
+		 select lion_index_verify('lion_stc_k', true) is not null,
+				'verify: the slot of a row no posting holds is not an error'
+		 union all
+		 select (select count(*) from lion_stc
+				  where lion_index_stored('lion_stc_k', ctid) IS DISTINCT FROM ARRAY[k::text, t]) = 0,
+				'every committed row reads its own values'"
+
+	# VACUUM asks the heap about every written slot: the aborted row is dead
+	# to all, so its slot is cleared although no posting ever held its TID.
+	psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_stc" >>"$RUNLOG" 2>&1 ||
+		die "phase 1g: the VACUUM failed"
+	run_check "phase 1g vacuumed" psql_p \
+		"select lion_index_stored('lion_stc_k', '(0,101)') = '{NULL,NULL}',
+				'the slots of the dead row are cleared: ' ||
+				lion_index_stored('lion_stc_k', '(0,101)')::text
+		 union all
+		 select lion_index_verify('lion_stc_k', true) is not null, 'verify'"
+	psql_p -c "SET synchronous_commit = on; INSERT INTO lion_stc VALUES (102, 43, 'after')" \
+		>>"$RUNLOG" 2>&1 || die "phase 1g: the insert after the VACUUM failed"
+	run_check "phase 1g reused" psql_p \
+		"select (select ctid from lion_stc where id = 102) = '(0,101)',
+				'the next row took the TID: ' || (select ctid from lion_stc where id = 102)::text
+		 union all
+		 select lion_index_stored('lion_stc_k', '(0,101)') = '{43,after}',
+				'and its slots hold its own values: ' ||
+				lion_index_stored('lion_stc_k', '(0,101)')::text
+		 union all
+		 select lion_index_count('lion_stc_k', 43) = (select count(*) from lion_stc where k = 43),
+				'the index counts it'
+		 union all
+		 select lion_index_verify('lion_stc_k', true) is not null, 'verify'"
+
+	psql_p -c "DROP TABLE lion_stc, lion_stc_flush" >>"$RUNLOG" 2>&1
+
+	log "phase 1g: the store record survived the crash without its posting; VACUUM cleared the slot and the TID was reused"
+	SUMMARY+=("phase1g            crash between store and posting; slot replayed, then cleared and reused")
+}
+
 # ---------------------------------------------------------------- phase 2
 
 basebackup_standby() {
@@ -1659,54 +1778,82 @@ standby_chain_reuse() {
 	SUMMARY+=("phase2 standby      chain free + reuse replayed under a reader ($freed pages)")
 }
 
-# Index-only scans on the standby (DESIGN.md §9 "Hot standby", §29.9).  An
-# index-only scan trusts the visibility map for every TID it returns, which a
-# standby may only do where replay waits for the pin the scan keeps: rmgr
+# Index-only scans on the standby (DESIGN.md §9 "Hot standby", §29.9, §40).
+# An index-only scan trusts the visibility map for every TID it returns, which
+# a standby may only do where replay waits for the pin the scan keeps: rmgr
 # mode.  In generic mode liongettuple() looks every TID up in the heap first
-# (it used to return the dead rows instead, 2026-09-27 review).  Either way
-# the standby's index-only scan must answer what its sequential scan answers,
-# before and after the primary deletes rows and vacuums them away.  lion plans
-# an index-only scan only for a query that needs no column, which a partial
-# index whose predicate is the WHERE clause gives.
+# (it used to return the dead rows instead, 2026-09-27 review), and takes the
+# values it returns from there too; in rmgr mode it takes them from the
+# window store for a batch its pin covers.  Either way the standby's
+# index-only scan must answer what its sequential scan answers, and what the
+# primary answers: before, with updated rows not yet vacuumed (pages that are
+# not all-visible, which the executor looks up in the heap), and after the
+# primary deletes rows and vacuums them away.  Three scans: one that returns
+# no column - `count(*)` over a partial index whose predicate is the WHERE
+# clause - and two that return stored columns (DESIGN.md §40, "Index-only
+# scans"): a scalar key under store_values with INCLUDE columns, and INCLUDE
+# columns under an array column's `&&`, which lion's planner hook builds.
 standby_index_only() {
-	local plan ios seq want round
+	local plan ios seq want round q n
 	local ioset="set enable_seqscan = off; set enable_bitmapscan = off; set pg_lion.enable_count_pushdown = off;"
 	local seqset="set enable_indexscan = off; set enable_indexonlyscan = off; set enable_bitmapscan = off; set pg_lion.enable_count_pushdown = off;"
+	local -a queries=(
+		"select count(*) from lion_ios where flag"
+		"select k, v, w from lion_ios where k = 7"
+		"select v, w from lion_ios where tags && '{3,5}'"
+	)
+	local -a indexes=(lion_ios_k lion_ios_kv lion_ios_tags)
 	log ""
 	log "-- standby: index-only scans"
 
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "standby_index_only: fixture failed"
 		SET synchronous_commit = on;
 		DROP TABLE IF EXISTS lion_ios;
-		CREATE TABLE lion_ios (id int NOT NULL, k int NOT NULL, flag bool NOT NULL);
-		INSERT INTO lion_ios SELECT i, i % 50, i % 2 = 0 FROM generate_series(1, 40000) i;
+		CREATE TABLE lion_ios (id int NOT NULL, k int NOT NULL, flag bool NOT NULL,
+							   tags int4[], v text, w int);
+		INSERT INTO lion_ios
+		SELECT i, i % 50, i % 2 = 0, ARRAY[i % 13, i % 17], 'v' || (i % 1000),
+			   CASE WHEN i % 7 = 0 THEN NULL ELSE i END
+		  FROM generate_series(1, 40000) i;
 		CREATE INDEX lion_ios_k ON lion_ios USING lion (k) WHERE flag;
+		CREATE INDEX lion_ios_kv ON lion_ios USING lion (k) INCLUDE (v, w)
+			WITH (store_values = true);
+		CREATE INDEX lion_ios_tags ON lion_ios USING lion (tags) INCLUDE (v, w);
 	SQL
 	psql_p -c "VACUUM (ANALYZE) lion_ios" >>"$RUNLOG" 2>&1
 	wait_catchup
 
-	plan=$(psql_s -tAc "$ioset explain (costs off) select count(*) from lion_ios where flag")
-	grep -q "Index Only Scan using lion_ios_k" <<<"$plan" ||
-		die "standby_index_only: the standby plans no index-only scan of lion_ios_k: $plan"
+	for n in "${!queries[@]}"; do
+		plan=$(psql_s -tAc "$ioset explain (costs off) ${queries[$n]}")
+		grep -q "Index Only Scan using ${indexes[$n]} on" <<<"$plan" ||
+			die "standby_index_only: the standby plans no index-only scan of ${indexes[$n]} for ${queries[$n]}: $plan"
+	done
 
-	for round in before after; do
-		if [ "$round" = after ]; then
+	for round in before dirty after; do
+		if [ "$round" = dirty ]; then
+			psql_p -c "SET synchronous_commit = on; UPDATE lion_ios SET v = v || 'x', w = -w WHERE id % 9 = 0" \
+				>>"$RUNLOG" 2>&1 || die "standby_index_only: update failed"
+			wait_catchup
+		elif [ "$round" = after ]; then
 			psql_p -c "SET synchronous_commit = on; DELETE FROM lion_ios WHERE id % 4 = 0" \
 				>>"$RUNLOG" 2>&1 || die "standby_index_only: delete failed"
 			psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_ios" >>"$RUNLOG" 2>&1
 			wait_catchup
 		fi
-		want=$(psql_p -tAc "select count(*) from lion_ios where flag")
-		ios=$(psql_s -tAc "$ioset select count(*) from lion_ios where flag")
-		seq=$(psql_s -tAc "$seqset select count(*) from lion_ios where flag")
-		{ [ "$ios" = "$seq" ] && [ "$seq" = "$want" ]; } ||
-			die "BUG: standby_index_only ($round the delete): the standby's index-only scan counts $ios, its sequential scan $seq, the primary $want"
+		for q in "${queries[@]}"; do
+			q="select count(*) || ' ' || md5(coalesce(string_agg(x::text, ',' order by x::text), '')) from ($q) x"
+			want=$(psql_p -tAc "$seqset $q")
+			ios=$(psql_s -tAc "$ioset $q")
+			seq=$(psql_s -tAc "$seqset $q")
+			{ [ -n "$want" ] && [ "$ios" = "$seq" ] && [ "$seq" = "$want" ]; } ||
+				die "BUG: standby_index_only ($round): the standby's index-only scan answers '$ios', its sequential scan '$seq', the primary '$want': $q"
+		done
 	done
 
 	psql_p -c "DROP TABLE lion_ios" >>"$RUNLOG" 2>&1
 	wait_catchup
 
-	log "standby: index-only scans answer $ios rows, as the sequential scan does, before and after a VACUUM"
+	log "standby: index-only scans, stored columns among them, answer as the sequential scan does, before and after a VACUUM"
 	SUMMARY+=("phase2 standby      index-only scans agree with the heap ($MODE mode)")
 }
 
@@ -2324,6 +2471,7 @@ want_phase 1c && phase1c
 want_phase 1d && phase1d
 want_phase 1e && phase1e
 want_phase 1f && phase1f
+want_phase 1g && phase1g
 want_phase 2 && phase2
 want_phase 3 && phase3
 want_phase 4 && phase4

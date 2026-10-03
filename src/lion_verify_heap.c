@@ -409,6 +409,7 @@ lion_verify_recheck(LionVerifyState *vs)
 		switch (lion_verify_classify(vs, blk))
 		{
 			case LION_UNREF_FREE:
+			case LION_UNREF_LINKED:
 				break;
 			case LION_UNREF_LEAK:
 			case LION_UNREF_INTERNAL:
@@ -632,6 +633,10 @@ lion_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 
 		CHECK_FOR_INTERRUPTS();
 	}
+
+	/* ... and its stored values, in the window store (DESIGN.md §40) */
+	if (vs->ix->nstored > 0)
+		lion_verify_store_heap(vs, tid, values, isnull);
 
 	vs->nheaptuples++;
 

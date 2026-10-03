@@ -722,11 +722,12 @@ lion_verify_meta(LionVerifyState *vs)
 	if (meta->magic != LION_MAGIC ||
 		(meta->version != LION_VERSION &&
 		 meta->version != LION_VERSION_SUMMARIES &&
-		 meta->version != LION_VERSION_NARROW))
-		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u, %u or %u",
+		 meta->version != LION_VERSION_NARROW &&
+		 meta->version != LION_VERSION_STORE))
+		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u to %u",
 					RelationGetRelationName(vs->index), meta->magic,
 					meta->version, LION_MAGIC, LION_VERSION,
-					LION_VERSION_SUMMARIES, LION_VERSION_NARROW);
+					LION_VERSION_STORE);
 
 	/*
 	 * DESIGN.md §32: version 7 is version 6 with summaries, and only that;
@@ -790,6 +791,9 @@ lion_verify_meta(LionVerifyState *vs)
 	vs->height = meta->height;
 	vs->version = meta->version;
 
+	/* The window store's record (DESIGN.md §40), version 9 only. */
+	lion_verify_store_meta(vs, page);
+
 	UnlockReleaseBuffer(buf);
 }
 
@@ -851,6 +855,10 @@ lion_verify_classify(LionVerifyState *vs, BlockNumber blk)
 		UnlockReleaseBuffer(buf);
 		return LION_UNREF_FREE;
 	}
+
+	/* A window store page (DESIGN.md §40) is settled by its own chain. */
+	if (LionPageIsStore(page) || LionPageIsStoreMap(page))
+		return lion_verify_store_classify(vs, blk, page, buf);
 
 	if (!LionPageIsContainer(page))
 	{
@@ -924,6 +932,7 @@ lion_verify_reachable(LionVerifyState *vs)
 		switch (lion_verify_classify(vs, blk))
 		{
 			case LION_UNREF_FREE:
+			case LION_UNREF_LINKED:
 				continue;
 			case LION_UNREF_LEAK:
 				lion_verify_warn_leak(vs, blk);

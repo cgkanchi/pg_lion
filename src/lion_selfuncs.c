@@ -81,6 +81,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parse_coerce.h"
 #include "parser/parsetree.h"
@@ -2908,12 +2909,235 @@ lion_plain_note_remainder(PlannerInfo *root, IndexPath *path, Cost remainder)
 }
 
 /*
- * set_rel_pathlist_hook: each plain lion path of rel with a remainder noted
- * pays it, and is offered again with the bitmap heap scan of the same index
- * path beside it, which add_path() may have discarded for the plain one - the
- * paths added here are compared as any others (set_rel_pathlist() allows a
- * hook to modify the core paths).  The plain path keeps its startup cost, which
- * is what a LIMIT asks of it.
+ * The remainder noted for path, taken: what the caller charges it.
+ */
+static Cost
+lion_plain_take_remainder(PlannerInfo *root, Path *path)
+{
+	ListCell   *lc;
+
+	if (root->glob == NULL || lion_probe_cache.glob != root->glob)
+		return 0;
+	foreach(lc, lion_probe_cache.remainders)
+	{
+		LionPlainRemainder *r = (LionPlainRemainder *) lfirst(lc);
+
+		if (r->path == (IndexPath *) path && r->remainder > 0)
+		{
+			Cost		remainder = r->remainder;
+
+			r->remainder = 0;
+			return remainder;
+		}
+	}
+	return 0;
+}
+
+/* ---------------------------------------------------------------------
+ * Index-only paths core does not build (DESIGN.md §40, "Index-only scans")
+ * --------------------------------------------------------------------- */
+
+/*
+ * `SELECT inc FROM t WHERE tags && '{a,b}'` over a lion index on (tags)
+ * INCLUDE (inc): the posting sets of tags answer the qual exactly, the store
+ * supplies inc, and the heap is needed only for the pages that are not
+ * all-visible.  Core does not build that index-only path.  It builds one only
+ * when every column the query needs - its output AND its restriction clauses
+ * - is one the index can return (check_index_only()), and a multi-key column
+ * never is: a row has many keys and one slot.  Nor is a key column the index
+ * does not store.  Yet a qual the scan answers exactly needs no column: an
+ * index-only plan reads a column for its output, its filter and its recheck
+ * of the index quals, which IndexOnlyNext() evaluates only when the AM sets
+ * xs_recheck.  check_index_only() says as much ("attributes used only in
+ * index quals would not be needed at runtime either, if we are certain that
+ * the index is not lossy") and leaves it.
+ *
+ * Whether a lion scan rechecks is lion_plain_scan_shape()'s answer, so the
+ * paths are built here.  Per lion index of rel that can return a column the
+ * output needs, and every column it needs:
+ *	- each key column that a restriction clause names, the output does not,
+ *	  and the index cannot return is RELAXED: a copy of the IndexOptInfo says
+ *	  it can return it, and create_index_paths(), run on a scratch copy of
+ *	  rel that sees only the copies, with no join clause and no parallelism
+ *	  (as LionOrdered builds its lion side), builds the index-only paths.
+ *	  The copy stays the path's index: createplan.c marks the index target
+ *	  entries it cannot return as resjunk, and setrefs.c resolves the plan's
+ *	  recheck quals - the index quals, relaxed columns and all - against the
+ *	  others;
+ *	- a path is kept when every restriction clause that names a relaxed
+ *	  column is one of its index clauses, and not lossy (so the plan's
+ *	  filter never reads the column), and the scan answers its quals from its
+ *	  sets with no recheck (lion_index_only_exact()); it pays its remainder
+ *	  (lion_plain_heap_correlation(): the gather, and the fetches the
+ *	  correlation cannot carry) before add_path() compares it with anything.
+ * Should the scan recheck after all, liongettuple() takes every row from the
+ * heap, the relaxed columns with it (LionIosState), so the plan is right
+ * either way and only its price was wrong.  Unparameterized paths only; not
+ * for a relation an UPDATE, a DELETE or a row mark reads, nor one that needs
+ * no column at all - `count(*)`, which is LionCount's.
+ */
+static void
+lion_ios_paths(PlannerInfo *root, RelOptInfo *rel, Index rti)
+{
+	Oid			amoid = lion_get_am_oid();
+	Bitmapset  *outattrs = NULL;
+	List	   *copies = NIL;
+	List	   *relaxed = NIL;	/* per copy: its relaxed attnos */
+	RelOptInfo *scratch;
+	ListCell   *lc;
+
+	if (!enable_indexonlyscan || !lion_enable_plain_scan ||
+		lion_old_snapshot_threshold_active() ||
+		root->parse->resultRelation == (int) rti ||
+		get_plan_rowmark(root->rowMarks, rti) != NULL)
+		return;
+
+	pull_varattnos((Node *) rel->reltarget->exprs, rel->relid, &outattrs);
+	if (bms_is_empty(outattrs))
+		return;
+
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		Bitmapset  *retattrs = NULL;
+		Bitmapset  *clauseattrs = NULL;
+		Bitmapset  *relax = NULL;
+		IndexOptInfo *copy;
+		ListCell   *lc2;
+		int			i;
+
+		if (idx->relam != amoid || idx->hypothetical || !idx->amhasgettuple ||
+			(idx->indpred != NIL && !idx->predOK))
+			continue;
+
+		/* what it returns: lioncanreturn()'s stored columns */
+		for (i = 0; i < idx->ncolumns; i++)
+			if (idx->indexkeys[i] > 0 && idx->canreturn[i])
+				retattrs = bms_add_member(retattrs, idx->indexkeys[i] -
+										  FirstLowInvalidHeapAttributeNumber);
+		if (!bms_is_subset(outattrs, retattrs))
+		{
+			bms_free(retattrs);
+			continue;
+		}
+
+		foreach(lc2, idx->indrestrictinfo)
+			pull_varattnos((Node *) lfirst_node(RestrictInfo, lc2)->clause,
+						   rel->relid, &clauseattrs);
+		for (i = 0; i < idx->nkeycolumns; i++)
+		{
+			int			a = idx->indexkeys[i] -
+				FirstLowInvalidHeapAttributeNumber;
+
+			if (idx->indexkeys[i] > 0 && !idx->canreturn[i] &&
+				bms_is_member(a, clauseattrs) && !bms_is_member(a, retattrs))
+				relax = bms_add_member(relax, a);
+		}
+		if (relax == NULL ||
+			!bms_is_subset(clauseattrs, bms_union(retattrs, relax)))
+		{
+			bms_free(retattrs);
+			bms_free(clauseattrs);
+			bms_free(relax);
+			continue;
+		}
+
+		copy = makeNode(IndexOptInfo);
+		memcpy(copy, idx, sizeof(IndexOptInfo));
+		copy->canreturn = (bool *) palloc(sizeof(bool) * idx->ncolumns);
+		for (i = 0; i < idx->ncolumns; i++)
+			copy->canreturn[i] = idx->canreturn[i] ||
+				(i < idx->nkeycolumns && idx->indexkeys[i] > 0 &&
+				 bms_is_member(idx->indexkeys[i] -
+							   FirstLowInvalidHeapAttributeNumber, relax));
+		copies = lappend(copies, copy);
+		relaxed = lappend(relaxed, relax);
+		bms_free(retattrs);
+		bms_free(clauseattrs);
+	}
+	bms_free(outattrs);
+	if (copies == NIL)
+		return;
+
+	scratch = makeNode(RelOptInfo);
+	memcpy(scratch, rel, sizeof(RelOptInfo));
+	scratch->indexlist = copies;
+	scratch->pathlist = NIL;
+	scratch->ppilist = NIL;
+	scratch->partial_pathlist = NIL;
+	scratch->cheapest_startup_path = NULL;
+	scratch->cheapest_total_path = NULL;
+	scratch->cheapest_parameterized_paths = NIL;
+	scratch->joininfo = NIL;
+	scratch->has_eclass_joins = false;
+	scratch->consider_parallel = false;
+	create_index_paths(root, scratch);
+
+	foreach(lc, scratch->pathlist)
+	{
+		IndexPath  *ipath = (IndexPath *) lfirst(lc);
+		Bitmapset  *relax = NULL;
+		ListCell   *lc2;
+		ListCell   *lc3;
+		bool		ok = true;
+
+		if (!IsA(ipath, IndexPath) ||
+			ipath->path.pathtype != T_IndexOnlyScan ||
+			ipath->path.param_info != NULL)
+			continue;
+		forboth(lc2, copies, lc3, relaxed)
+		{
+			if (lfirst(lc2) == ipath->indexinfo)
+				relax = (Bitmapset *) lfirst(lc3);
+		}
+		if (relax == NULL)
+			continue;
+
+		foreach(lc2, ipath->indexinfo->indrestrictinfo)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+			Bitmapset  *attrs = NULL;
+			bool		answered = false;
+
+			pull_varattnos((Node *) rinfo->clause, rel->relid, &attrs);
+			if (!bms_overlap(attrs, relax))
+			{
+				bms_free(attrs);
+				continue;
+			}
+			bms_free(attrs);
+			foreach(lc3, ipath->indexclauses)
+			{
+				IndexClause *iclause = (IndexClause *) lfirst(lc3);
+
+				if (iclause->rinfo == rinfo && !iclause->lossy)
+					answered = true;
+			}
+			if (!answered)
+			{
+				ok = false;
+				break;
+			}
+		}
+		if (!ok || !lion_index_only_exact(root, ipath))
+			continue;
+
+		ipath->path.parent = rel;
+		ipath->path.total_cost += lion_plain_take_remainder(root,
+															(Path *) ipath);
+		add_path(rel, (Path *) ipath);
+	}
+}
+
+/*
+ * set_rel_pathlist_hook: first the index-only paths core does not build
+ * (lion_ios_paths()).  Then each plain lion path of rel with a remainder
+ * noted pays it - an index-only one too, parameterized or not (DESIGN.md
+ * §40) - and is offered again, an unparameterized one with the bitmap heap
+ * scan of the same index path beside it, which add_path() may have
+ * discarded for the plain one - the paths added here are compared as any
+ * others (set_rel_pathlist() allows a hook to modify the core paths).  The
+ * plain path keeps its startup cost, which is what a LIMIT asks of it.
  *
  * The bitmap heap scan is not all the plain path may have displaced before it
  * paid: set_plain_rel_pathlist() offers the sequential scan before the index
@@ -2958,35 +3182,41 @@ lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	}
 #endif
 
+	/* the index-only paths core does not build (DESIGN.md §40) */
+	if ((rel->reloptkind == RELOPT_BASEREL ||
+		 rel->reloptkind == RELOPT_OTHER_MEMBER_REL) &&
+		rel->rtekind == RTE_RELATION && rte->rtekind == RTE_RELATION &&
+		rte->tablesample == NULL && rel->indexlist != NIL &&
+		!IS_DUMMY_REL(rel))
+		lion_ios_paths(root, rel, rti);
+
 	if (root->glob != NULL && lion_probe_cache.glob == root->glob &&
 		lion_probe_cache.remainders != NIL)
 	{
 		List	   *repriced = NIL;
+		bool		anyplain = false;
 		ListCell   *lc;
 
+		/*
+		 * An index-only path pays its remainder too, the gather its
+		 * correlation cannot carry (lion_plain_heap_correlation()), and a
+		 * parameterized one as well: its price is a loop's, and so is the
+		 * remainder noted for it.
+		 */
 		foreach(lc, rel->pathlist)
 		{
 			Path	   *p = (Path *) lfirst(lc);
-			ListCell   *lc2;
-			bool		found = false;
+			Cost		remainder;
 
-			if (!IsA(p, IndexPath) || p->pathtype != T_IndexScan ||
-				p->param_info != NULL)
+			if (!IsA(p, IndexPath) ||
+				(p->pathtype != T_IndexScan &&
+				 p->pathtype != T_IndexOnlyScan) ||
+				(p->pathtype == T_IndexScan && p->param_info != NULL))
 				continue;
-			foreach(lc2, lion_probe_cache.remainders)
+			remainder = lion_plain_take_remainder(root, p);
+			if (remainder > 0)
 			{
-				LionPlainRemainder *r = (LionPlainRemainder *) lfirst(lc2);
-
-				if (r->path == (IndexPath *) p && r->remainder > 0)
-				{
-					p->total_cost += r->remainder;
-					r->remainder = 0;
-					found = true;
-					break;
-				}
-			}
-			if (found)
-			{
+				p->total_cost += remainder;
 				repriced = lappend(repriced, p);
 				rel->pathlist = foreach_delete_current(rel->pathlist, lc);
 			}
@@ -2997,10 +3227,14 @@ lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			Path	   *p = (Path *) lfirst(lc);
 
 			add_path(rel, p);
-			add_path(rel, (Path *) create_bitmap_heap_path(root, rel, p, NULL,
-														   1.0, 0));
+			if (p->param_info == NULL)
+			{
+				anyplain = true;
+				add_path(rel, (Path *) create_bitmap_heap_path(root, rel, p,
+															   NULL, 1.0, 0));
+			}
 		}
-		if (repriced != NIL && rte->rtekind == RTE_RELATION &&
+		if (anyplain && rte->rtekind == RTE_RELATION &&
 			rte->tablesample == NULL)
 		{
 			/* as set_plain_rel_pathlist() offers them */

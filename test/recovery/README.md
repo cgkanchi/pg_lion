@@ -47,7 +47,7 @@ install` and then run the harness as an ordinary user. The run checks that
 the control files and the library are there, and says so if the tree's
 `pg_lion.so` is not the installed one.
 
-Phases 1b-1e and 3 need the `injection_points` extension. On a server without
+Phases 1b-1e, 1g and 3 need the `injection_points` extension. On a server without
 it they are skipped - the log and the summary say which - and phases 1, 1f,
 2 and 4 still run; `--phases "1 1f 2 4"` asks for exactly those (CI does, on
 the packaged 16-19 servers). `INJECTION_POINTS=1` in the environment turns every
@@ -111,6 +111,16 @@ than rare, `buckets = 8`/`16` forces bucket-page chains, and the 3000 distinct
 values of `t` over ~800 heap pages give about one member per container key,
 which is what puts sparse segments in an index at all.
 
+Two of the indexes keep a window store (DESIGN.md §40). `lion_rec_st` is
+created on the empty table with `store_values` and three INCLUDE columns, so
+every store page it has - a window's first page and its map slot, sub-arrays
+grown and widened, dictionaries extended, pages split and appended, DICT
+pages turned RAW - was written by `aminsert` under WAL, and the writer's
+deletes and the VACUUM loop clear and rewrite them. `lion_rec_stb` is built
+after the load with a distinct `int8` a row and `citext` in capped slots.
+Every check battery reads every row's stored values back through
+`lion_index_stored()` and compares them with the heap.
+
 **Phase 1, crash recovery under load.** Eight rounds of: ~2 s of mixed writes
 (pgbench, 4 clients, `synchronous_commit = on`, ~430 transactions/s), then kill
 the server with no chance to flush — `pg_ctl stop -m immediate` and `kill -9`
@@ -155,11 +165,12 @@ finish a half-applied two-pass bulkdelete. After every restart:
   `null_tids` and `empty_tids` are checked separately, because a reserved
   entry that lost its flag would hide inside the `ntids` total.
 
-**Phases 1b-1f, a crash or a restart at a chosen point.** Each builds a
+**Phases 1b-1g, a crash or a restart at a chosen point.** Each builds a
 table of its own. 1b parks a VACUUM between the two steps of a whole-chain
 free (injection point `lion-vacuum-entries-deleted`), 1c and 1d an insert
 between a directory or posting-tree split and its downlink, and each crashes
-the server there and checks what comes back. Two more (DESIGN.md §18, §25):
+the server there and checks what comes back. Three more (DESIGN.md §18, §25,
+§40):
 
 * **1e**, a crash inside a MULTI-LEAF spill. VACUUM's filtering turns one
   key's INLINE payload into ten BITSETs, a leaf each; the spill parks at
@@ -176,6 +187,14 @@ the server there and checks what comes back. Two more (DESIGN.md §18, §25):
   find no record of a custom manager - it used to find `custom128` ones, which
   no such server can replay - and a crash right after it must recover. The
   primary is restarted in its `--mode` afterwards.
+* **1g**, a crash between an insert's store record and its posting record
+  (DESIGN.md §40). The insert parks at `lion-insert-after-store`, with the
+  row's stored values written and its TID in no container yet; another
+  session's commit flushes the WAL, and the server dies. The slot must come
+  back as written, the index must hold no entry for the aborted row and
+  `lion_index_verify()` must pass; the next VACUUM must clear the slot - the
+  heap says the row is dead, though no posting ever held it - and the row
+  that takes the TID next must read its own values.
 
 1b and 1e also read the page counts `VACUUM (VERBOSE)` reports for the index
 (DESIGN.md §18, "Page counts"), which no SQL function can see: the pages
@@ -289,7 +308,7 @@ waiting on `LWLock/BufferContent`.
 * **No long soak.** Eight rounds of two seconds is about 20000 transactions;
   it is a smoke test for the WAL records the write paths emit, not a
   statement about hours of churn. `--iters N` raises it.
-* **Crash injection at a few chosen points only.** Phases 1b-1e stop a
+* **Crash injection at a few chosen points only.** Phases 1b-1e and 1g stop a
   backend at an injection point and crash the server there; every other
   multi-record operation (a segment promotion, say) is crashed wherever the
   phase 1 workload happens to be, which reaches the frequent paths and not
