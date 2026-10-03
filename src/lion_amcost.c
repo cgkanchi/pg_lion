@@ -1140,6 +1140,78 @@ lion_plain_walk_entries(PlannerInfo *root, IndexPath *path, int c)
 }
 
 /*
+ * What LionStoreScan (lion_ordered.c; DESIGN.md §40, "As built: the row
+ * gather") asks of each lion leaf it streams under its pins: does the source
+ * of path answer its quals exactly - no recheck and no UNION
+ * (lion_plain_scan_shape()) - and does it hand out its containers in ONE
+ * ascending run of container keys, which is what an OR merges its arms by?
+ * Returned is how many runs over the heap's windows it makes: 1 for a SETS
+ * source, a WALK's entries (lion_plain_walk_entries()), a long list's
+ * batches.  A range beside other columns' sets is a WALK there, not the
+ * WINDOW lion_plain_scan_shape() calls sorted: a source that keeps its pins
+ * walks entry by entry (lion_source_build()).
+ */
+double
+lion_plain_scan_passes(PlannerInfo *root, IndexPath *path, bool *sorted,
+					   bool *exact)
+{
+	int			walkcol;
+	bool		rechecks;
+	bool		unions;
+	int			shape;
+	int			c;
+
+	shape = lion_plain_scan_shape(root, path, &walkcol, &rechecks, &unions);
+	*exact = !rechecks && !unions;
+	*sorted = false;
+	if (shape == LION_PLAIN_WALK)
+		return lion_plain_walk_entries(root, path, walkcol);
+	if (shape == LION_PLAIN_LIST)
+	{
+		double		batches = 1.0;
+		ListCell   *lc;
+
+		foreach(lc, path->indexclauses)
+		{
+			IndexClause *iclause = (IndexClause *) lfirst(lc);
+			ListCell   *lc2;
+
+			foreach(lc2, iclause->indexquals)
+			{
+				Node	   *cl = (Node *) lfirst_node(RestrictInfo, lc2)->clause;
+				double		n;
+
+				if (!IsA(cl, ScalarArrayOpExpr))
+					continue;
+#if PG_VERSION_NUM >= 170000
+				n = estimate_array_length(root,
+										  (Node *) lsecond(((ScalarArrayOpExpr *) cl)->args));
+#else
+				n = estimate_array_length((Node *) lsecond(((ScalarArrayOpExpr *) cl)->args));
+#endif
+				batches = Max(batches, ceil(n / (double) lion_scan_list_batch()));
+			}
+		}
+		return batches;
+	}
+	for (c = 0; c < path->indexinfo->nkeycolumns; c++)
+	{
+		LionCostCol cc;
+		bool		range;
+
+		lion_cost_col_quals(path, c, &cc);
+		range = cc.nquals > 0 && !cc.nomatch && cc.walk != NULL &&
+			!IsA(cc.walk->clause, NullTest) &&
+			!lion_index_is_multikey(path->indexinfo, c);
+		lion_cost_col_free(&cc);
+		if (range)
+			return lion_plain_walk_entries(root, path, c);
+	}
+	*sorted = true;
+	return 1.0;
+}
+
+/*
  * The plain scan's own prices below are planner settings (lion_costs.c):
  * each macro is the multiplier a setting holds - LION_PLAIN_FETCH_ROW_COST is
  * pg_lion.plain_fetch_row_cost - of the unit its comment names, and each

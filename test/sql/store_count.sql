@@ -50,6 +50,8 @@ BEGIN
 	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	/* the row gather would feed an ordinary Agg; store_gather.sql tests it */
+	PERFORM set_config('pg_lion.enable_store_scan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
 		IF ln ~ 'Custom Scan \(LionCount\)' THEN
 			used := true;

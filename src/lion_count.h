@@ -1129,6 +1129,13 @@ extern bool lion_source_exact(LionSource *src);
 extern void lion_source_close(LionSource *src);
 
 /*
+ * Does the container lion_source_next() handed out last still have the §9
+ * pin of the page it came from behind it (DESIGN.md §9, §29.5)?  Only a
+ * source opened with keeppins can say yes; a LIST answers per batch.
+ */
+extern bool lion_source_interlocked(LionSource *src);
+
+/*
  * The TIDs of one ordered scalar key column in the column's order (DESIGN.md
  * §30.11), in lion_scan.c: the entries its range keys select - every `<`,
  * `<=`, `>=` and `>` key on the column, `IS NOT NULL`, and one list, `= ANY

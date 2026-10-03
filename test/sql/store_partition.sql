@@ -48,6 +48,8 @@ BEGIN
 	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	/* the row gather would feed an ordinary Agg; store_gather.sql tests it */
+	PERFORM set_config('pg_lion.enable_store_scan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
 		IF ln ~ 'Custom Scan \(LionCount\)' THEN
 			used := true;
@@ -119,6 +121,8 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	/* the row gather would feed an ordinary Agg; store_gather.sql tests it */
+	PERFORM set_config('pg_lion.enable_store_scan', 'off', true);
 	FOR ln IN EXECUTE CASE WHEN actual THEN
 			'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) '
 			ELSE 'EXPLAIN (COSTS OFF) ' END || q LOOP
@@ -250,6 +254,9 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 SET enable_indexonlyscan = off;
+-- (the row gather's planning reads the meta page of every store it could
+-- take g from, lsp_c_id's among them: the reads counted are the pushdown's)
+SET pg_lion.enable_store_scan = off;
 SELECT pg_stat_force_next_flush();
 SELECT idx_blks_hit + idx_blks_read AS c_id_reads
   FROM pg_statio_user_indexes WHERE indexrelname = 'lsp_c_id' \gset
@@ -263,6 +270,7 @@ SELECT g, count(*), sum(v) FROM lsp WHERE k < 10 GROUP BY g ORDER BY g LIMIT 2;
 SELECT pg_stat_force_next_flush();
 SELECT idx_blks_hit + idx_blks_read > :c_id_reads AS lsp_c_id_read
   FROM pg_statio_user_indexes WHERE indexrelname = 'lsp_c_id';
+RESET pg_lion.enable_store_scan;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;

@@ -18675,3 +18675,220 @@ that wants LionCount over an index with stored columns now competes with that pa
   the hook builds unparameterized ones.
 - EXPLAIN says nothing of the batches that went to the heap (absent pages, NOPIN sets); core's
   `Heap Fetches` counts only its own.
+
+### As built: the row gather (2026-10-03)
+
+`LionStoreScan` (`lion_ordered.c`, beside `LionOrdered`, whose set it shares): a plain scan of the
+rows an AND/OR of lion indexes keeps, returning every column the query reads from the window
+stores of the relation's lion indexes, and reading the heap only for the rows the stores cannot
+answer for. Each column may come from a different index: a key column of an index built with
+`store_values`, or an INCLUDE column, of any lion index of the table. Over the quick benchmark's
+table with `(c2) INCLUDE (id)`, `(c20) INCLUDE (id)`, `(c200) INCLUDE (id)` and `(c20k) INCLUDE
+(id)`, each under `store_values`:
+
+```
+SELECT id, c2, c20, c200, c20k FROM fact WHERE c200 IN (17,18,19) AND c20 IN (3,4,5);
+
+ Custom Scan (LionStoreScan) on fact
+   Lion Cond: ((c200 = ANY ('{17,18,19}'::integer[])) AND (c20 = ANY ('{3,4,5}'::integer[])))
+   Lion Indexes: fact_c200, fact_c20, fact_c2, fact_c20k
+   Store: id, c200 (fact_c200)
+   Store: c2 (fact_c2)
+   Store: c20 (fact_c20)
+   Store: c20k (fact_c20k)
+```
+
+The name: the count engine has its `LionGather` already (the gather of a count's stored columns,
+`lion_count_int.h`), and core's `Gather` is parallel query's; a node that returns a relation's
+rows is a scan, as `LionCount` and `LionOrdered` are named for what they answer.
+
+**The planner** (`ls_add_paths()`, from `lion_ordered_set_rel_pathlist()`;
+`pg_lion.enable_store_scan`, on by default). For a relation `lo_rel_ok()` accepts and a query with a
+WHERE clause, the columns to return are the Vars of the relation's target, through placeholders
+(`ls_target_attnos()`): plain columns only - a whole-row Var or a system column declines, which
+takes in every row mark's ctid, so the rows of an UPDATE, a DELETE, a FOR UPDATE and an
+EvalPlanQual recheck are never this node's - and at least one, since a query that reads no column
+has nothing to gather (a count is `LionCount`'s). Before any index is opened the catalog says
+whether each of them is a column of some lion index at all, and only the stores with a column the
+scan could take have their meta page read: most queries pay nothing for the node. Then, for each
+lion access `lo_lion_accesses()` builds - the AND/OR trees `LionOrdered` streams, the same
+`lo_lion_tree()` / `lo_lion_qual()` / `lo_residual()` analysis:
+
+- a lossy lion clause declines: the store's value cannot stand for a row that must be rechecked;
+- the restriction clauses the lion side does not answer (`lo_residual()`) are the node's filter,
+  and the columns they read must be gathered too;
+- the access must stream (`ls_tree_ok()`): every leaf exact (`lion_plain_scan_passes()`,
+  `lion_amcost.c`, from `lion_plain_scan_shape()`: no recheck, no UNION); an AND's first LEAF
+  child is its DRIVER, whose pieces may come in several passes - a WALK, an IN list longer than
+  `lion_scan_list_batch()` - and its other children one set, priced (`ls_set_bytes()`) within
+  `hash_mem`; an OR's children each one ascending run of container keys, so an OR with a range
+  arm declines;
+- every column to gather must be stored as its own datum (`LionStoreCol.returnable`), in the
+  table's type, by a lion index that is not partial or whose predicate the query implies
+  (`ls_store_cols()`). Each comes from the index with the fewest store pages a window of it, and
+  among those within a tenth of each other from one already chosen - one chain fewer to find a
+  window - then one the set reads (`ls_choose_sources()`).
+
+The path is unparameterized, not parallel, and has no pathkeys.
+
+**The price** (`ls_cost()`), as `lo_cost_store()` prices the store order's set and gather, offered
+at the margin (§39) as `LionOrdered` is:
+
+- start-up: the lion side's cost (`cost_bitmap_tree_node()`), the AND's set built in it;
+- a container's work a piece: Cardenas's count of the members over the windows, once a pass of
+  the driver;
+- for the members on all-visible pages (`allvisfrac`), `store_value_cost` a value of each column;
+  and for each column the store pages a window it touches reads: a gather walks the window's
+  chain from its head to the page of its last member, `1 + (P - 1) m / (m + 1)` of a chain of `P`
+  pages for `m` members, each `store_page_cost` and its read. `P` comes from a model of a window's
+  bytes (`ls_window_bytes()`: DICT codes for a column of few values, the values themselves for
+  one of many), scaled so that an index's stored columns add up to the store pages its meta record
+  counts;
+- the read is priced as `cost_bitmap_heap_scan()` prices a heap page (`ls_store_page_price()`):
+  `random_page_cost` among few of the column's store pages, moving to `seq_page_cost` by the
+  root of the share read. It is not argued down for residency as the count's index pages are
+  (§39, "Resident index pages"): those compete with plans charged nothing for the same work,
+  where a store page here stands in for a heap page that core charges as I/O however cached it
+  is, and a store page takes about a heap page's time to reach. Priced as a buffer hit, the
+  first build put the node within an eighth of the index scan for `c20k IN (100, ..., 109) AND
+  c2 = 1` - 2,532 candidates, 15,257 buffers against the index scan's 2,509, four times its time
+  in an assert-enabled build - where it is 2.4 times the index scan's price now: a few rows'
+  gather reads a chain in each of their windows for each column, an index scan a heap page a row;
+- and for each column and window, the page of the store's map that names the chain's head
+  (`lion_storemap_head()`), which every gather reads again: in the windows' order, so
+  `seq_page_cost` each. It is as many buffers as a chain of one page, and two of every five a
+  sparse result reads (five columns, a row or three a window). Counted, it moved the node off
+  `c20k IN (...)` of 20 values (5,062 rows: 18,876 buffers against the index scan's 4,965);
+- the members on the other pages fetched from the heap, as §9 prices a recheck;
+- `cpu_tuple_cost` and the filter a member, the target a row returned.
+
+**The executor** (`ls_start()`, `ls_next()`). Each scan opens one reader a gathered column
+(`lion_store_open()`) and a cursor over the lion tree (`LsCursor`), which hands the set out one
+piece - the members at one container key - at a time, with the members it is sure of and the ones
+it holds the §9 pin for:
+
+- LEAF: a lion source opened with `keeppins`, its containers handed out as they come, pinned when
+  the source is exact and still holds the page's pin (`lion_source_interlocked()`, exported from
+  `lion_scan.c` for this);
+- AND: the driver streamed, the other children built first into one set without pins
+  (`lo_build_node()`), which masks each of the driver's pieces. Every member of the AND is a
+  member of the driver's piece, so the driver's pin is the interlock for all of them, as one pin
+  is for the count (`lion_count_int.h`). A mask that outgrew `hash_mem` and degraded (§30.4)
+  leaves the driver's piece whole at its keys, every member rechecked from the heap;
+- OR: the children merged by container key, a member pinned when a child holding it held its
+  pin; a row two of them hold is returned once;
+- SET: a child of an OR that does not come as one ascending run at run time - the shape is the
+  source's to decide, and a generic plan's parameter can make an IN list long - is built into a
+  set without pins and handed out key by key, every member from the heap; a key the set dropped
+  when it degraded is every TID of its window's heap pages, each rechecked.
+
+For each piece (`ls_piece()`) the visibility map is read for the heap pages its pinned members lie
+on, the pinned members on all-visible pages are gathered - a source's columns each by one
+`lion_store_gather()` for the same members, aligned by position - and a heap page the store reports
+ABSENT is dropped from them (`Store Pages Absent`). Then one tuple a member, in TID order: a member
+the store served is a virtual tuple of the gathered values, NULL in every column the plan does not
+read (`ls_begin()` checks that its target and filter read only gathered ones); any other is
+fetched from the heap with the scan's snapshot (`lo_fetch_tid()`, which takes the serializable
+checks and the tuple's predicate lock), copied into the scan slot, and rechecked against the lion
+side's qual when its piece was not sure. Under SERIALIZABLE a heap page the store served takes a
+page predicate lock, as the count takes one. On a hot standby over a generic-mode index every row
+comes from the heap (§9, "Hot standby").
+
+One window of rows at a time and no spill: a piece is one container, its gathers one window's
+values a column. The AND's mask is the only set; the planner declines one priced past `hash_mem`,
+and one that grows past it at run time degrades as above.
+
+**Pins.** Between two rows the node keeps the pins its streamed sources hold - opened with
+`keeppins`, as lion's index-only scan opens its source (§29.5): each located set's page and the
+posting leaf each stream stands on, a walk's leaf - since the piece it is returning came from them
+and an OR's children's pieces wait on them. A cursor paused between two FETCHes keeps them, and
+VACUUM's cleanup lock on those index pages waits for it, as it waits for an index-only scan's;
+the AND's mask holds none. They are let go at the end of the stream, at a rescan and at the end of
+the node. (`LionCount`, which pauses between groups only, holds none: countpause.sql.)
+
+**EXPLAIN**: `Lion Cond`, `Lion Indexes` (the set's, then the stores'), a `Store: <columns>
+(<index>)` line a source (a `Store` list in the structured formats); under ANALYZE `Store Rows`
+(rows the stores answered for), `Store Rows From Heap`, `Store Pages Absent`, `Heap Fetches`,
+`Rows Removed by Lion Recheck` when anything was rechecked, and `Lion Set: N containers,
+exact | rechecked | degraded`, with `, N scans` after a rescan. The counters add up over rescans.
+
+**The private layout** (`LS_PRIV_*`, `lion_ordered.c`): a shape marker of its own -
+`LS_PRIV_MAGIC`, "LSSC", and 7 members - since it is another node, not a shape of `LionOrdered`'s:
+the shape, the flags, the lion tree (as `LO_PRIV_TREE`), the leaves' indexes, the source indexes,
+and per source the table's columns it gives and the index columns that store them; custom_exprs
+holds the leaves' index quals and the lion side's original qual, the recheck.
+
+**Decisions and what it does not do.**
+
+- "A page with no store yet" cannot hold a row of any set: every insert writes its stored
+  columns' slots before its posting sets (`lion_store_insert()`), and a build stores every row it
+  indexes. The reader reports a window with no chain as ABSENT anyway, which sends its rows to the
+  heap; the test exercises ABSENT with values too long for any store page.
+- The AND's other children are built whole before the first piece; the lazy probe of §30.4 is
+  `LionOrdered`'s and is not used here.
+- No EvalPlanQual (`ls_recheck()` is an error: no row mark reaches the node), no parameterized
+  path, no parallel plan, no OR with an arm that is not one ascending run.
+- The band of "Measured" below, where the node is chosen over lion's plain index scan and is
+  slower than it, is left to a rate for index scans.
+
+**Tests.** `test/sql/store_gather.sql`: every query run through the node with core's scans off and
+compared as a multiset with a sequential scan with lion's custom scans off - ANDs of two and three
+indexes with the columns from two and three, key columns under `store_values` and INCLUDE columns
+with NULLs, an index whose key is not stored, ORs (of lists, of ANDs, under an AND), a range and a
+long IN list as the AND's driver, filters on gathered columns; dirty pages (updates, deletes,
+inserts, and a transaction's own changes: store and heap together) and the same after VACUUM; ABSENT
+pages; rescans under a nested loop (`, 3 scans`) and a semi join that stops each after its first
+row; a cursor holding pins while paused and none when done; a partitioned table; the cases
+declined (a column nobody stores, a key column its index does not store, a whole row, ctid, a
+filter on an unstored column, a WHERE lion cannot answer, an OR with a range arm, FOR UPDATE, no
+column, the setting off); the price's choice both ways; and a set that degrades at run time, an
+AND's mask and an OR's arm read as a set. `test/isolation/store_scan_cursor.spec`: a cursor paused
+after five rows while rows are inserted, deleted and updated into and out of the WHERE - before
+its first FETCH and while it is paused - returns exactly what its snapshot saw, from the store and
+the heap. It runs no VACUUM while paused: one with entries to remove would wait for the pins.
+
+**Measured** (release build, warm; the quick benchmark's table at 5,000,000 rows - 96,154 heap
+pages, fillfactor 90 - with the four indexes above; `shared_buffers` 512MB, no parallel workers;
+the median of five runs of `EXPLAIN (ANALYZE, TIMING OFF)` after one more; the columns returned
+are `id, c2, c20, c200, c20k` throughout):
+
+| WHERE | rows | plan | ms | buffers | node off: plan | ms | buffers |
+|---|---|---|---|---|---|---|---|
+| `c200 IN (17,18,19) AND c20 IN (3,4,5)` | 11,214 | LionStoreScan | 39.3 | 20,701 | Bitmap Heap Scan | 64.8 | 10,841 |
+| the same `AND c2 = 1` | 5,636 | LionStoreScan | 40.0 | 20,701 | Bitmap Heap Scan | 67.8 | 10,841 |
+| `c200 IN (17,18,19)` | 75,106 | LionStoreScan | 66.4 | 21,089 | Index Scan | 65.9 | 52,573 |
+| `c20k IN (100, ..., 109) AND c2 = 1` | 1,264 | Index Scan | 6.4 | 2,509 | Index Scan | 6.1 | 2,509 |
+| `c20k = 123` | 231 | Index Scan | 0.96 | 234 | Index Scan | 0.80 | 234 |
+
+Forced, the node took 12.9 ms (15,257 buffers) and 2.5 ms (2,554) for the last two. A result
+that meets every window reads about 21,000 buffers whatever its size - five chains and five map
+pages a window - so the node wins where its competitor reads more pages or pays more for each: a
+bitmap heap scan's page cost about 6 µs here. Against lion's plain index scan, whose cached heap
+page cost about 1.3 µs, `c20k IN (...)` of the first n values from 100, the same five columns:
+
+| n | rows | chosen | ms | node off: Index Scan, ms | buffers, node / index scan |
+|---|---|---|---|---|---|
+| 10 | 2,532 | Index Scan | 2.4 | 1.8 | 15,257 / 2,509 |
+| 20 | 5,062 | Index Scan | 5.3 | 5.0 | 18,876 / 4,965 |
+| 30 | 7,547 | LionStoreScan | 21.8 | 7.9 | 19,861 / 7,302 |
+| 60 | 14,930 | LionStoreScan | 33.9 | 17.7 | 20,782 / 13,908 |
+| 100 | 24,826 | LionStoreScan | 47.5 | 27.7 | 21,050 / 22,061 |
+| 200 | 50,024 | LionStoreScan | 66.5 | 49.0 | 21,260 / 39,316 |
+| 400 | 99,725 | LionStoreScan | 82.6 | 94.4 | 21,478 / 62,693 |
+
+From 30 to 200 values the node is chosen and 1.35 to 2.8 times slower: the index scan's heap
+pages are priced at `random_page_cost` however cached - it ran at 1,700 to 2,900 units a
+millisecond here, where §39 takes index scans for the reference, 500 - while the node's price ran
+at 300 to 1,000. The node's buffers stay at most 2.7 times the index scan's where it is chosen, as the
+pricing intends; it is the index scan's page that is cheaper than its price says. A rate for index
+scans (§39, "The rates") would move the band; until then it is a known misplan, at its worst
+where a result of a few thousand rows meets every window. Against the bitmap heap scan the same
+pages are priced and paid alike: the AND above is chosen at 0.76 of the bitmap scan's price and
+runs in 0.61 of its time.
+
+**Plans that change.** `store_count.sql`, `store_partition.sql` and `store_spill.sql` force
+`LionCount` by turning core's scans off; an ordinary `Agg` over `LionStoreScan` now competes with
+it there (at their 64 kB `work_mem` it undercuts the count's spilling price), so their helpers turn
+the row gather off. The partition test's check that one index is not read counts what planning
+reads too, and the row gather's planning reads the meta page of a store that could give the
+column; it turns the setting off around itself.

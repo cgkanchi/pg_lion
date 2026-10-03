@@ -1183,6 +1183,12 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_PRIV_NMEMBERS	21
 
 /*
+ * (LionOrdered's and LionStoreScan's custom_private are not this layout:
+ * each has its own, behind a marker of its own - LO_PRIV_* and LS_PRIV_*, in
+ * lion_ordered.c, where both nodes live.)
+ */
+
+/*
  * One WHERE clause of the pushdown, as the executor sees it.
  *
  * storedkey is the key the clause's entry holds, which is what a target list

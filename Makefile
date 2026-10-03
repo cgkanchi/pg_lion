@@ -145,12 +145,13 @@ $(COUNT_OBJS) $(CUSTOMSCAN_OBJS) $(FUNCS_OBJS) src/lion_am.o src/lion_amcost.o s
 $(CUSTOMSCAN_OBJS) src/lion_fkjoin.o: src/lion_fkjoin.h
 src/lion_costs.o $(CUSTOMSCAN_OBJS) src/lion_am.o src/lion_amcost.o src/lion_ordered.o: src/lion_costs.h
 $(COUNT_OBJS): src/lion_count_int.h
-$(CUSTOMSCAN_OBJS): src/lion_customscan.h
+$(CUSTOMSCAN_OBJS) src/lion_ordered.o: src/lion_customscan.h
 $(FUNCS_OBJS): src/lion_funcs.h
 src/lion_build.o src/lion_spool.o: src/lion_spool.h
 $(STORE_OBJS) $(FUNCS_OBJS) src/lion_am.o src/lion_build.o src/lion_insert.o src/lion_state.o \
           src/lion_vacuum.o src/lion_count.o src/lion_exec_store.o src/lion_plan_cost.o \
-          src/lion_plan_match.o: src/lion_store.h src/lion_store_fmt.h
+          src/lion_plan_match.o src/lion_amcost.o src/lion_ordered.o \
+          src/lion_scan.o: src/lion_store.h src/lion_store_fmt.h
 
 # Crash-recovery and hot-standby tests (test/recovery/README.md).  These need a
 # whole PostgreSQL *installation* to initdb their own private clusters into,
