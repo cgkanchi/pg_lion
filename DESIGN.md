@@ -18732,7 +18732,8 @@ reshaped until the index-only scan is the planner's own choice: the short rows s
 page by a column the heap neither compresses nor toasts, a key of fifty rows scattered over as
 many pages, four of them on the ABSENT pages. A section of its own shows the choice on a table of
 200,000 rows: the heap for a few hundred rows scattered over every window, the store for a tenth
-of the table.
+of the table. The file turns the row gather (below) off: it answers the same queries from the same
+stores and undercuts the index-only scan on tables this small.
 
 ### As built: the row gather (2026-10-03)
 

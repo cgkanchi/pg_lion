@@ -36,6 +36,10 @@ RESET client_min_messages;
 -- VACUUM can only set all-visible once the commit record is on disk
 SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
+-- the row gather (LionStoreScan, store_gather.sql) answers these queries from
+-- the same stores and undercuts the index-only scan on tables this small;
+-- the index-only scan is this test's
+SET pg_lion.enable_store_scan = off;
 -- a temporary table's buffer pool is temp_buffers, settable only before the
 -- session touches one: 100 buffers is a pin budget of 12 leaves (section 6)
 SET temp_buffers = 100;
