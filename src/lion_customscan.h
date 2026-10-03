@@ -967,8 +967,9 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  *		lion_plan_custom_path() moves it into the CustomScan's plan.qual -
  *		where setrefs.c rewrites its aggregates into references to the
  *		node's own count columns - and leaves this member empty.  Empty for
- *		a partitioned table, whose HAVING is applied by the Finalize Agg
- *		above the node (§16)
+ *		a partitioned GROUP BY of partial aggregates, whose HAVING is applied
+ *		by the Finalize Agg above the node (§16); a partitioned table's
+ *		gather (member 19) forms its groups itself and applies it
  *	9	IntList: the attnum of the column a count(DISTINCT k) counts, or
  *		empty (DESIGN.md §26).  Its index is in member 1: in the outer group
  *		slot when there is no GROUP BY (k's entries drive the scan), in the
@@ -1040,7 +1041,12 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  *		aggregates itself: an OidList of the index; an IntList of the
  *		columns' attnums and one of their column numbers in the index; and a
  *		List of one IntList per GROUP BY column, {its position in those
- *		lists, its equality operator, its collation}.  lion_plan_custom_path()
+ *		lists, its equality operator, its collation}.  For a partitioned
+ *		table the OidList has one index per live leaf partition, in member
+ *		5's order, each that partition's own, and the column numbers are 0:
+ *		each partition's index may place the columns differently, and the
+ *		executor finds every relation's from the index it opens
+ *		(lion_store_count()), a plain table's too.  lion_plan_custom_path()
  *		adds a List of one IntList per aggregate over a gathered column: its
  *		LION_SAGG_* kind, its column's position, the width of an integer
  *		argument, the aggregate, its input collation, and - for a
@@ -1149,6 +1155,10 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * (DESIGN.md §40, "The custom shapes"): a count whose groups an older build
  * would not have formed at all.
  *
+ * Shape 23 moved no member but let the STORE member (19) name one index per
+ * partition: a partitioned table's gather (DESIGN.md §40, "As built:
+ * partitioned tables"), whose groups the node forms over every partition.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1161,7 +1171,7 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424916
+#define LION_PRIV_MAGIC		0x52424917
 #define LION_PRIV_NMEMBERS	21
 
 /*
@@ -1281,11 +1291,15 @@ typedef struct LionPartState
 	Const	   *fgconst;		/* ... and then the one value the bounds give
 								 * it (DESIGN.md §27, "Grouped by a fact
 								 * column") */
+	Oid			storeidxoid;	/* the index whose window store the gather
+								 * reads here (DESIGN.md §40), or InvalidOid
+								 * when the node gathers nothing */
 	Relation	heap;
 	Relation	groupidx;
 	Relation	groupidx2;
 	Relation   *clauseidx;		/* one per WHERE clause */
 	Relation	fgidx;
+	Relation	storeidx;
 } LionPartState;
 
 /*
@@ -2291,6 +2305,10 @@ typedef struct LionCountTarget
 												 * (LionDriveInfo.bound), with
 												 * no index in driveidx; NULL
 												 * otherwise */
+	IndexOptInfo *storeidx;		/* the lion index whose window store holds
+								 * every column the store's gather reads
+								 * (DESIGN.md §40), this relation's own;
+								 * NULL for a path that gathers nothing */
 } LionCountTarget;
 
 /*
@@ -2521,10 +2539,9 @@ extern double lion_units_margin_for(RelOptInfo *rel);
 extern double lion_index_dir_pages(IndexOptInfo *idx, double *height);
 extern double lion_index_store_pages(IndexOptInfo *idx, int *nstored);
 extern void lion_cost_store_path(PlannerInfo *root, CustomPath *cpath,
-								 RelOptInfo *rel, IndexOptInfo *storeidx,
-								 int ncols, int ngroup, double groups,
-								 double outrows, int naggs, int ndistinct,
-								 double distinctpairs);
+								 List *targets, int ncols, int ngroup,
+								 double groups, double outrows, int naggs,
+								 int ndistinct, double distinctpairs);
 extern double lion_index_column_share(PlannerInfo *root, RelOptInfo *rel,
 									  IndexOptInfo *idx, AttrNumber col);
 extern bool lion_index_orders_naturally(IndexOptInfo *idx, AttrNumber col);

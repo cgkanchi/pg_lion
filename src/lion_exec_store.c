@@ -136,7 +136,8 @@ static bool lion_sdist_equal(struct LionStoreRun *run, LionSDistKey a,
 typedef struct LionStoreRun
 {
 	/* the plan's (LION_PRIV_STORE) */
-	Oid			indexoid;
+	Oid			indexoid;		/* a plain table's; a partition's is in its
+								 * LionPartState */
 	int			ncols;
 	AttrNumber *attnos;			/* the gathered columns, in the heap */
 	int			ngroup;
@@ -211,7 +212,9 @@ lion_sdist_equal(LionStoreRun *run, LionSDistKey a, LionSDistKey b)
 }
 
 /*
- * The plan's LION_PRIV_STORE member, read into st->store: the index, the
+ * The plan's LION_PRIV_STORE member, read into st->store: the index - or,
+ * over a partitioned table, each partition's, into its LionPartState, for
+ * lion_open_parts() to open with the partition's other relations - the
  * columns, the GROUP BY's equalities and hash functions, the aggregates.
  * Nothing is opened: an EXPLAIN without ANALYZE reads only this.
  */
@@ -220,6 +223,7 @@ lion_store_begin(LionCountScanState *st, CustomScan *cscan, EState *estate)
 {
 	List	   *m = (List *) list_nth(cscan->custom_private, LION_PRIV_STORE);
 	LionStoreRun *run;
+	List	   *oids;
 	List	   *attnos;
 	List	   *groups;
 	List	   *specs;
@@ -228,21 +232,34 @@ lion_store_begin(LionCountScanState *st, CustomScan *cscan, EState *estate)
 	st->store = NULL;
 	if (m == NIL)
 		return;
-	if (list_length(m) != 5 || list_length((List *) linitial(m)) != 1)
+	if (list_length(m) != 5 || !IsA(linitial(m), OidList))
+		elog(ERROR, "LionCount: malformed store gather");
+	oids = (List *) linitial(m);
+	if (list_length(oids) != Max(st->npart, 1))
 		elog(ERROR, "LionCount: malformed store gather");
 
 	/*
 	 * The gather is fed by the count of the WHERE, or by the sum over every
-	 * row: nothing of the node's own groups, walks or joins is beside it.
+	 * row, of the table or of each partition in turn: nothing of the node's
+	 * own groups, walks or joins is beside it.
 	 */
 	if (st->groupattno != 0 || st->groupattno2 != 0 || st->distattno != 0 ||
-		st->nwagg != 0 || st->joinclause >= 0 || st->npart > 0 ||
+		st->nwagg != 0 || st->joinclause >= 0 ||
 		st->topkn != 0 || st->decode != NULL ||
 		(st->hasgroupidx && !st->sumall))
 		elog(ERROR, "LionCount: a store gather beside another walk");
 
 	run = (LionStoreRun *) palloc0(sizeof(LionStoreRun));
-	run->indexoid = linitial_oid((List *) linitial(m));
+	run->indexoid = InvalidOid;
+	if (st->npart == 0)
+		run->indexoid = linitial_oid(oids);
+	for (i = 0; i < st->npart; i++)
+		st->part[i].storeidxoid = list_nth_oid(oids, i);
+	for (i = 0; i < Max(st->npart, 1); i++)
+	{
+		if (!OidIsValid(list_nth_oid(oids, i)))
+			elog(ERROR, "LionCount: malformed store gather");
+	}
 	attnos = (List *) lsecond(m);
 	groups = (List *) lfourth(m);
 	specs = (List *) list_nth(m, 4);
@@ -508,70 +525,49 @@ lion_store_row(void *arg, const Datum *values, const bool *isnull)
 }
 
 /*
- * The count, with the gather attached to every count of it, and the groups
- * it fills.  The count is what `count(*)` under the same WHERE counts - the
- * WHERE's intersection, or the sum over every row - and it is checked
- * against the rows handed over: a path of the count engine that counted rows
- * without handing them over would be an answer missing rows, not a slower
- * one.
+ * The count of the relation being counted - the table, or a partition in its
+ * turn - with a gather over index's store attached to every count of it,
+ * each row handed to lion_store_row().  Each gathered column is found by its
+ * place in the store, from the heap column it is in THIS relation: the plan's
+ * attnos are the parent's (DESIGN.md §16), and a partition may number its
+ * columns differently (lion_heap_attno_in()); its type is the parent's in
+ * every partition, so what the groups hash and compare is the same.  The
+ * count is checked against the rows handed over: a path of the count engine
+ * that counted rows without handing them over would be an answer missing
+ * rows, not a slower one.
  */
-static void
-lion_store_count(LionCountScanState *st)
+static int64
+lion_store_count_relation(LionCountScanState *st, Relation index)
 {
 	LionStoreRun *run = st->store;
-	Relation	index;
 	LionIndexState *ix;
 	LionGather *gather;
 	LionGatherStats gs;
 	int		   *ords;
+	int64		before = run->rows;
 	volatile int64 count = 0;
 	int			i;
 
-	MemoryContextReset(run->cxt);
-	run->groups = NULL;
-	run->dist = NULL;
-	run->ngroups = 0;
-	run->rows = 0;
-	if (run->ngroup > 0)
-	{
-		run->groups = lion_sgroup_create(run->cxt, 256, run);
-		run->probe = (LionSGroup *) MemoryContextAllocZero(run->cxt,
-														   lion_sgroup_size(run));
-		run->probe->keys = (Datum *) MemoryContextAllocZero(run->cxt,
-															sizeof(Datum) * run->ngroup);
-		run->probe->nulls = (bool *) MemoryContextAllocZero(run->cxt,
-															sizeof(bool) * run->ngroup);
-		run->single = NULL;
-	}
-	else
-		run->single = lion_sgroup_new(run, NULL);
-	if (run->hasdistinct)
-		run->dist = lion_sdist_create(run->cxt, 256, run);
-
-	/*
-	 * The index whose store the values are read from, opened for the count:
-	 * each column by its place in the store, found again from the heap
-	 * column, as every other index of the node is (lion_index_col_for()).
-	 */
-	index = index_open(run->indexoid, AccessShareLock);
 	ix = lion_get_index_state(index);
 	ords = (int *) palloc(sizeof(int) * run->ncols);
 	for (i = 0; i < run->ncols; i++)
 	{
+		AttrNumber	attno = lion_heap_attno_in(st->heap, st->heapoid,
+											   run->attnos[i]);
 		int			ord;
 
 		for (ord = 0; ord < ix->nstored; ord++)
 		{
 			AttrNumber	col = ix->stored[ord].attno;
 
-			if (index->rd_index->indkey.values[col - 1] == run->attnos[i])
+			if (index->rd_index->indkey.values[col - 1] == attno)
 				break;
 		}
 		if (ord >= ix->nstored)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("lion index \"%s\" does not store column %d of \"%s\"",
-							RelationGetRelationName(index), run->attnos[i],
+							RelationGetRelationName(index), attno,
 							RelationGetRelationName(st->heap))));
 		ords[i] = ord;
 	}
@@ -597,14 +593,81 @@ lion_store_count(LionCountScanState *st)
 	run->gstats.heap_rows += gs.heap_rows;
 	run->gstats.store_pages += gs.store_pages;
 	run->gstats.absent_pages += gs.absent_pages;
-	run->totalgroups += run->ngroups;
 	lion_gather_destroy(gather);
 	pfree(ords);
-	index_close(index, AccessShareLock);
 
-	if (count != run->rows)
+	if (count != run->rows - before)
 		elog(ERROR, "LionCount: counted " INT64_FORMAT " rows but gathered " INT64_FORMAT,
-			 count, run->rows);
+			 count, run->rows - before);
+	return count;
+}
+
+/*
+ * The count, with the gather attached to every count of it, and the groups
+ * it fills.  The count is what `count(*)` under the same WHERE counts - the
+ * WHERE's intersection, or the sum over every row - of the table, or of
+ * every live leaf partition in turn (DESIGN.md §40, "As built: partitioned
+ * tables"): each partition's turn begun as lion_run_partition() begins it,
+ * its WHERE located, its rows counted and gathered from its own index's store
+ * into the one hash table, everything it located let go of and its turn
+ * ended, so that no pin outlives the turn (§16).  The groups are complete
+ * only when the last partition has been counted; nothing comes out before.
+ */
+static void
+lion_store_count(LionCountScanState *st)
+{
+	LionStoreRun *run = st->store;
+	int64		count = 0;
+	int			p;
+
+	MemoryContextReset(run->cxt);
+	run->groups = NULL;
+	run->dist = NULL;
+	run->ngroups = 0;
+	run->rows = 0;
+	if (run->ngroup > 0)
+	{
+		run->groups = lion_sgroup_create(run->cxt, 256, run);
+		run->probe = (LionSGroup *) MemoryContextAllocZero(run->cxt,
+														   lion_sgroup_size(run));
+		run->probe->keys = (Datum *) MemoryContextAllocZero(run->cxt,
+															sizeof(Datum) * run->ngroup);
+		run->probe->nulls = (bool *) MemoryContextAllocZero(run->cxt,
+															sizeof(bool) * run->ngroup);
+		run->single = NULL;
+	}
+	else
+		run->single = lion_sgroup_new(run, NULL);
+	if (run->hasdistinct)
+		run->dist = lion_sdist_create(run->cxt, 256, run);
+
+	if (st->npart == 0)
+	{
+		/*
+		 * The index whose store the values are read from, opened for the
+		 * count; the table's own relations are open, and its WHERE located,
+		 * already.
+		 */
+		Relation	index = index_open(run->indexoid, AccessShareLock);
+
+		count = lion_store_count_relation(st, index);
+		index_close(index, AccessShareLock);
+	}
+	else
+	{
+		for (p = 0; p < st->npart; p++)
+		{
+			Assert(st->part[p].storeidx != NULL);
+			lion_open_relation(st, p);
+			lion_locate_where(st);
+			count += lion_store_count_relation(st, st->part[p].storeidx);
+			lion_release_where(st);
+			lion_close_relation(st);
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
+
+	run->totalgroups += run->ngroups;
 	if (run->single != NULL)
 		run->single->count = count;
 	run->counted = true;

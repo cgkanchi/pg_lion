@@ -308,10 +308,17 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 	/*
 	 * A partitioned table counts one partition at a time - and the FK-side
 	 * join over one takes each batch of keys to every partition in turn.
+	 * The window store's gather counts them all into its one set of groups
+	 * before its first row (lion_store_count(), DESIGN.md §40), and gives
+	 * each partition its turn itself.
 	 */
 	if (st->npart > 0)
+	{
+		if (st->store != NULL)
+			return lion_store_next(st);
 		return (st->joinclause >= 0) ? lion_next_join_row(st) :
 			lion_exec_partitioned(st);
+	}
 
 	/* ---- the FK-side join: one partial row per dimension row ---- */
 	if (st->joinclause >= 0)

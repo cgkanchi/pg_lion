@@ -434,6 +434,7 @@ lion_open_parts(LionCountScanState *st)
 		for (i = 0; i < st->nclause; i++)
 			part->clauseidx[i] = lion_open_index(part->clauseidxoid[i]);
 		part->fgidx = lion_open_index(part->fgidxoid);
+		part->storeidx = lion_open_index(part->storeidxoid);
 	}
 }
 
@@ -448,6 +449,9 @@ lion_close_parts(LionCountScanState *st)
 	{
 		LionPartState *part = &st->part[p];
 
+		if (part->storeidx != NULL)
+			index_close(part->storeidx, AccessShareLock);
+		part->storeidx = NULL;
 		if (part->fgidx != NULL)
 			index_close(part->fgidx, AccessShareLock);
 		part->fgidx = NULL;
