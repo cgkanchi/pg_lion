@@ -251,6 +251,7 @@ typedef struct LionCountPathBuild
 	List	   *storegroups;	/* {position, equality, collation} each */
 	List	   *storegroupvars; /* ... and the GROUP BY columns themselves */
 	List	   *storedistvars;	/* the columns a count(DISTINCT) counts */
+	List	   *storeextvars;	/* ... and those a min or max keeps */
 	int			storenaggs;		/* aggregates over gathered columns */
 	IndexOptInfo *storeidx;		/* one table's index whose store holds
 								 * them; a partition's is its target's
@@ -259,6 +260,11 @@ typedef struct LionCountPathBuild
 	double		storegroupest;	/* the groups the rows fall into */
 	double		storepairs;		/* ... and the (group, value) pairs of
 								 * every count(DISTINCT) */
+	double		storebytes;		/* ... the memory they take, the pairs'
+								 * included (lion_store_hash_bytes()) */
+	double		storepairbytes; /* ... and the pairs' part of it */
+	int32		storewidth;		/* a spilled row's columns */
+	int32		storepairwidth; /* ... and a spilled pair's */
 } LionCountPathBuild;
 
 /*
@@ -1453,6 +1459,10 @@ lion_count_path_store_outputs(LionCountPathBuild *cx)
 			if (kind == LION_SAGG_DISTINCT)
 				cx->storedistvars =
 					lappend(cx->storedistvars,
+							lion_strip((Node *) ((TargetEntry *) linitial(agg->args))->expr));
+			else if (kind == LION_SAGG_WAGG(LION_WAGG_EXTREME))
+				cx->storeextvars =
+					lappend(cx->storeextvars,
 							lion_strip((Node *) ((TargetEntry *) linitial(agg->args))->expr));
 			haveagg = true;
 		}
@@ -2683,10 +2693,20 @@ lion_count_path_make(LionCountPathBuild *cx)
 			foreach(lc, cx->storeattnos)
 				idxcols = lappend_int(idxcols, 0);
 		}
+		/*
+		 * ... and the estimates of the groups and the pairs, from which the
+		 * node chooses how many batches a spill takes (DESIGN.md §40, "As
+		 * built: spilling"), as an Agg's numGroups; past INT_MAX they would
+		 * choose the most partitions anyway.
+		 */
 		cpath->custom_private =
 			lappend(cpath->custom_private,
-					list_make4(idxoids, cx->storeattnos, idxcols,
-							   cx->storegroups));
+					list_make5(idxoids, cx->storeattnos, idxcols,
+							   cx->storegroups,
+							   list_make2_int((int) Min(rint(cx->storegroupest),
+														(double) PG_INT32_MAX),
+											  (int) Min(rint(cx->storepairs),
+														(double) PG_INT32_MAX))));
 	}
 	else
 		cpath->custom_private = lappend(cpath->custom_private, NIL);
@@ -2777,7 +2797,9 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 							 list_length(cx->storeattnos),
 							 list_length(cx->storegroups),
 							 cx->storegroupest, cx->outrows, cx->storenaggs,
-							 list_length(cx->storedistvars), cx->storepairs);
+							 list_length(cx->storedistvars), cx->storepairs,
+							 cx->storebytes, cx->storepairbytes,
+							 cx->storewidth, cx->storepairwidth);
 
 	/*
 	 * The aggregates over lion columns' entries (DESIGN.md §37): their walks,
@@ -3058,8 +3080,9 @@ lion_store_relations(LionCountPathBuild *cx)
  * capped by its rows, as DESIGN.md §16 counts a partitioned GROUP BY's partial
  * rows: the parent's estimate is unreliable, a partitioned parent being never
  * auto-analyzed, and the sum - a group once for every partition it has rows
- * in - errs toward the memory guard declining (lion_store_hash_bytes()).  The
- * rows emitted are the fewer of the parent's estimate and that sum.
+ * in - errs toward pricing a spill the node may not need
+ * (lion_store_hash_bytes()).  The rows emitted are the fewer of the parent's
+ * estimate and that sum.
  */
 static void
 lion_store_estimate(LionCountPathBuild *cx)
@@ -3148,25 +3171,79 @@ lion_store_width(LionCountPathBuild *cx, Var *v)
 }
 
 /*
- * The memory the gather's groups take (DESIGN.md §40): a group's keys and
- * aggregate states and its place in the hash table, and a count(DISTINCT)'s
- * values, at the columns' average widths.  The node keeps them all until it
- * has counted every row - of every partition, over a partitioned table - and
- * has no spill, so a path whose groups would not fit in hash_mem is not made.
+ * The memory the node's copy of a value of column v takes: nothing for a
+ * by-value type, which the node keeps in its Datum.
  */
 static double
-lion_store_hash_bytes(LionCountPathBuild *cx)
+lion_store_copy_bytes(LionCountPathBuild *cx, Var *v)
 {
-	double		pergroup = 64.0 + 48.0 * cx->storenaggs;
-	double		perpair = 48.0;
+	if (get_typbyval(v->vartype))
+		return 0;
+	return lion_store_chunk_bytes(lion_store_width(cx, v));
+}
+
+/*
+ * The memory the gather's groups take (DESIGN.md §40): a group's keys and
+ * aggregate states and its place in the hash table, and a count(DISTINCT)'s
+ * values, as the node allocates them (lion_store_group_bytes(),
+ * lion_store_pair_bytes()), a by-reference key's, extreme's or distinct
+ * value's copy at its column's average width; *pairbytes is the pairs' part
+ * of it.  The node holds them in memory up to hash_mem - every partition's,
+ * over a partitioned table - and spills what does not fit to batch files as
+ * a HashAggregate does (lion_exec_store.c), which the path is priced for
+ * from this (lion_cost_store_path()).
+ */
+static double
+lion_store_hash_bytes(LionCountPathBuild *cx, double *pairbytes)
+{
+	double		pergroup;
+	double		perpair = 0;
 	ListCell   *lc;
 
+	pergroup = lion_store_group_bytes(list_length(cx->storegroupvars),
+									  cx->storenaggs,
+									  cx->storedistvars != NIL);
 	foreach(lc, cx->storegroupvars)
-		pergroup += 16.0 + lion_store_width(cx, (Var *) lfirst(lc));
+		pergroup += lion_store_copy_bytes(cx, (Var *) lfirst(lc));
+	foreach(lc, cx->storeextvars)
+		pergroup += lion_store_copy_bytes(cx, (Var *) lfirst(lc));
 	foreach(lc, cx->storedistvars)
-		perpair = Max(perpair,
-					  48.0 + lion_store_width(cx, (Var *) lfirst(lc)));
-	return cx->storegroupest * pergroup + cx->storepairs * perpair;
+	{
+		double		copy = lion_store_copy_bytes(cx, (Var *) lfirst(lc));
+
+		perpair = Max(perpair, lion_store_pair_bytes(copy));
+	}
+	*pairbytes = cx->storepairs * perpair;
+	return cx->storegroupest * pergroup + *pairbytes;
+}
+
+/*
+ * The widths of what the node spills (DESIGN.md §40, "As built: spilling"):
+ * a row, the values of every gathered column; and a pair, a group id and an
+ * aggregate's number beside the widest count(DISTINCT) column's value.
+ */
+static void
+lion_store_spill_widths(LionCountPathBuild *cx, int32 *rowwidth,
+						int32 *pairwidth)
+{
+	ListCell   *lc;
+
+	*rowwidth = 0;
+	foreach(lc, cx->storeattnos)
+	{
+		AttrNumber	attno = (AttrNumber) lfirst_int(lc);
+		Oid			type;
+		int32		typmod;
+		Oid			coll;
+
+		get_atttypetypmodcoll(cx->rte->relid, attno, &type, &typmod, &coll);
+		*rowwidth += lion_store_width(cx, makeVar(cx->rti, attno, type, typmod,
+												  coll, 0));
+	}
+	*pairwidth = 0;
+	foreach(lc, cx->storedistvars)
+		*pairwidth = Max(*pairwidth, lion_store_width(cx, (Var *) lfirst(lc)));
+	*pairwidth += sizeof(int64) + sizeof(int32);
 }
 
 /*
@@ -3196,8 +3273,13 @@ lion_store_hash_bytes(LionCountPathBuild *cx)
  * has been counted (DESIGN.md §40, "As built: partitioned tables").  Not
  * partial aggregates per partition under a Finalize Agg, as §16's entry walk
  * makes them: a count(DISTINCT) has no partial state, and the sums' would be
- * core's serialized 128-bit accumulators; and the groups are bounded by
+ * core's serialized 128-bit accumulators; and the groups are held to
  * hash_mem as one table's are, the estimate summed over the partitions.
+ *
+ * Groups and pairs past hash_mem are not a reason to decline: the node
+ * spills them to batch files as a HashAggregate spills (DESIGN.md §40, "As
+ * built: spilling"), and the path is priced for that from the memory its
+ * estimate says they take (lion_store_hash_bytes(), lion_cost_store_path()).
  *
  * The FK-side join gathers nothing.  Per relation, one index's store holds
  * every gathered column.  No GROUP BY item that is not a plain column, no
@@ -3246,8 +3328,8 @@ lion_try_store_path(PlannerInfo *root, RelOptInfo *input_rel,
 		return;
 	lion_count_path_estimate(&cx);
 	lion_store_estimate(&cx);
-	if (lion_store_hash_bytes(&cx) > (double) get_hash_memory_limit())
-		return;
+	cx.storebytes = lion_store_hash_bytes(&cx, &cx.storepairbytes);
+	lion_store_spill_widths(&cx, &cx.storewidth, &cx.storepairwidth);
 
 	lion_count_path_encode(&cx);
 	cpath = lion_count_path_make(&cx);

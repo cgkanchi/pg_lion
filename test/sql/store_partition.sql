@@ -26,8 +26,8 @@ SET max_parallel_workers_per_gather = 0;
  * answers equal as multisets.  It says whether the node gathered from the
  * store (and which columns, over how many partitions), walked without it, or
  * was not used; whether an aggregate node sat above it; whether the gathered
- * rows came from the store, the heap or both; and how many rows the query
- * returned.
+ * rows came from the store, the heap or both; whether the node spilled past
+ * hash_mem into more batches than one; and how many rows the query returned.
  */
 CREATE FUNCTION lsp_check(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -39,6 +39,7 @@ DECLARE
 	nparts int := 0;
 	fromstore bigint := 0;
 	fromheap bigint := 0;
+	batches bigint := 0;
 	nrows bigint;
 	ndiff bigint;
 BEGIN
@@ -60,6 +61,8 @@ BEGIN
 			fromheap := fromheap + substring(ln FROM 'Store Rows From Heap: (\d+)')::bigint;
 		ELSIF ln ~ 'Store Rows: ' THEN
 			fromstore := fromstore + substring(ln FROM 'Store Rows: (\d+)')::bigint;
+		ELSIF ln ~ 'Store Batches: ' THEN
+			batches := batches + substring(ln FROM 'Store Batches: (\d+)')::bigint;
 		END IF;
 	END LOOP;
 	EXECUTE format('CREATE TEMP TABLE lsp_on AS SELECT s::text AS r FROM (%s) s', q);
@@ -78,13 +81,14 @@ BEGIN
 	DROP TABLE lsp_off;
 	RETURN format('%s, %s rows, %s',
 				  CASE WHEN cols IS NOT NULL THEN
-					   format('store (%s) over %s partition%s%s: %s', cols, nparts,
+					   format('store (%s) over %s partition%s%s: %s%s', cols, nparts,
 							  CASE WHEN nparts = 1 THEN '' ELSE 's' END,
 							  CASE WHEN agg THEN ' under an Agg' ELSE '' END,
 							  CASE WHEN fromstore > 0 AND fromheap > 0 THEN 'store and heap'
 								   WHEN fromstore > 0 THEN 'all from the store'
 								   WHEN fromheap > 0 THEN 'all from the heap'
-								   ELSE 'nothing gathered' END)
+								   ELSE 'nothing gathered' END,
+							  CASE WHEN batches > 1 THEN ', Store Batches > 1' ELSE '' END)
 					   WHEN used THEN 'walk'
 					   ELSE 'no pushdown' END,
 				  nrows,
@@ -100,7 +104,8 @@ END $$;
  * numbered it), and the node's counters but its groups.  How many of the
  * rows gathered came from the store and how many from the heap depends on
  * the layout too, so their total is printed, which is the rows counted, and
- * only whether each part is empty.
+ * only whether each part is empty; and of the spill only whether it took
+ * more batches than one, and disk.
  */
 CREATE FUNCTION lsp_plan(q text, actual boolean DEFAULT false) RETURNS SETOF text
 LANGUAGE plpgsql AS $$
@@ -131,6 +136,12 @@ BEGIN
 		ELSIF ln ~ '^\s*Store Pages Absent: ' THEN
 			RETURN NEXT format('%sStore Pages Absent > 0: %s', indent,
 							   substring(ln FROM ': (\d+)$')::bigint > 0);
+		ELSIF ln ~ '^\s*Store Batches: ' THEN
+			RETURN NEXT format('%sStore Batches > 1: %s', indent,
+							   substring(ln FROM ': (\d+)$')::bigint > 1);
+		ELSIF ln ~ '^\s*Store Disk Usage: ' THEN
+			RETURN NEXT format('%sStore Disk Usage > 0: %s', indent,
+							   substring(ln FROM ': (\d+) kB$')::bigint > 0);
 		ELSIF actual AND ln !~ '^\s*(Store Groups|Rows Removed by Filter): ' AND
 			  (ln ~ '^\s*[A-Z][A-Za-z ]*: \d+$' OR ln ~ '^\s*Range Evaluation: ') THEN
 			NULL;				-- a counter of the node's, which the layout decides
@@ -356,11 +367,13 @@ SELECT x, (SELECT count(DISTINCT g) FROM lsp WHERE k = x) AS dg,
   FROM generate_series(1, 4) x ORDER BY x;
 RESET pg_lion.enable_count_pushdown;
 
--- 9. The memory guard: the node keeps every group until the last partition
---    has been counted, and does not spill, so a path whose groups would not
---    fit in hash_mem is not made.  The groups are estimated per partition and
---    summed, since a partitioned parent is never auto-analyzed: here its own
---    statistics say w has 10 values, its partitions' that it has 20000.
+-- 9. More groups than hash_mem holds: the node keeps every group until the
+--    last partition has been counted, and those that do not fit go to batch
+--    files, as a HashAggregate's do, read back once the others have gone out.
+--    The groups are estimated per partition and summed, since a partitioned
+--    parent is never auto-analyzed - here its own statistics say w has 10
+--    values, its partitions' that it has 20000 - and the spill is priced
+--    from that sum.
 CREATE TABLE lspm (id int, k int, w int) PARTITION BY RANGE (id);
 CREATE TABLE lspm1 PARTITION OF lspm FOR VALUES FROM (0) TO (10000)
 	WITH (autovacuum_enabled = off);
@@ -378,6 +391,7 @@ SET work_mem = 64;
 SET hash_mem_multiplier = 1;
 SELECT lsp_check('SELECT w, count(*) AS n FROM lspm GROUP BY w');
 SELECT lsp_check('SELECT w, count(*) AS n FROM lspm WHERE k = 3 GROUP BY w');
+SELECT * FROM lsp_plan('SELECT w, count(*) FROM lspm GROUP BY w', true);
 RESET work_mem;
 RESET hash_mem_multiplier;
 SELECT lsp_check('SELECT w, count(*) AS n FROM lspm GROUP BY w');

@@ -617,9 +617,13 @@ container pin that lets the count skip the heap there (DESIGN.md §9). A row on 
 on a page the store left to the heap (ABSENT), is fetched from the heap, which says both whether it
 is visible and what its values are; on a hot standby a generic-WAL-mode index sends every row to
 the heap. The values are hashed by the `GROUP BY` columns under their collation, so a
-case-insensitive collation groups as the query's own `HashAggregate` would. `EXPLAIN ANALYZE` adds
-`Store Rows` (rows whose values came from the store), `Store Rows From Heap`, `Store Pages Absent`
-and `Store Groups`.
+case-insensitive collation groups as the query's own `HashAggregate` would. The groups and the
+`count(DISTINCT)` values are held to `hash_mem` (`work_mem` × `hash_mem_multiplier`), and past it
+the node spills to temporary batch files as a `HashAggregate` does, reading each batch back once
+the groups in memory have gone out; the planner prices the spill as it prices a `HashAggregate`'s.
+`EXPLAIN ANALYZE` adds `Store Rows` (rows whose values came from the store), `Store Rows From
+Heap`, `Store Pages Absent`, `Store Groups`, `Store Batches` (1 when nothing spilled) and `Store
+Disk Usage` (the most the batch files held at once, in kB).
 
 What it takes: every `GROUP BY` item and every aggregate argument a plain column, and all of them
 stored by one lion index (an INCLUDE column, or a scalar key column under `store_values`);
@@ -630,8 +634,7 @@ columns included; a `HAVING` is applied by the node. A partitioned table is coun
 a time, into one set of groups, when every live partition has a lion index that stores the columns.
 Not taken: an expression (`sum(x + 1)`, `GROUP BY lower(t)`), a `GROUP BY` that mixes a stored
 column with one that is not stored or is stored by another index, `sum`/`avg` of `numeric` or
-`float`, an aggregate with `FILTER` or `ORDER BY`, a parallel plan, and a hash table the planner
-expects to exceed `hash_mem` (the node does not spill).
+`float`, an aggregate with `FILTER` or `ORDER BY`, and a parallel plan.
 
 The planner prices the gather at `pg_lion.store_value_cost` per value and `pg_lion.store_page_cost`
 per store page read, beside the count and the hashing, in the competitor's units (DESIGN.md §39),
