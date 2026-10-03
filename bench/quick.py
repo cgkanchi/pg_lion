@@ -367,6 +367,7 @@ def main():
     parser.add_argument('--warmups', type=int, default=1)
     parser.add_argument('--seed', type=int, default=20260921)
     parser.add_argument('--max-seconds', type=int, default=300, help='Measurement deadline; aborts incomplete runs (plus query cancellation/cleanup)')
+    parser.add_argument('--preload', action='store_true', help="Start the cluster with shared_preload_libraries='pg_lion' so lion indexes use the custom WAL resource manager (wal_mode=auto -> rmgr)")
     args = parser.parse_args()
     if args.report_only:
         report(Path(args.report_only).resolve(), args.baseline)

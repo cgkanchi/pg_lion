@@ -1318,17 +1318,41 @@ lion_ios_store_info(IndexOptInfo *index, int *nstored, double *storepages)
 }
 
 /*
- * The gather of an index-only scan (DESIGN.md §40, "Costs"): every row it
- * returns is a value of each of the nret columns (LION_STORE_VALUE_COST), and
- * every window its batches touch reads that window's store pages of each
- * column (LION_STORE_PAGE_COST).  A window's pages of a column are the store's
+ * The gather of an index-only scan (DESIGN.md §40, "Costs"), in core's units.
+ * The index-only path is core's own, priced beside core's index and bitmap
+ * scans of the heap, so the pages its gather reads are priced as core prices
+ * the heap's, and not in lion's units alone (lion_plan_units.c), which the
+ * custom nodes are priced in and converted at the margin: liongettuple()
+ * gathers every column lioncanreturn() answers for - it is not told which
+ * the query reads - and for every window a batch touches it reads that
+ * window's whole chain of store pages of each of the nret columns, the first
+ * page of a chain found through the map (spc_random_page_cost) and the rest
+ * in its order (spc_seq_page_cost each), decodes each page it reads
+ * (LION_STORE_PAGE_COST, the CPU the custom nodes are charged for a store
+ * page), and hands up a value of each column for every row returned
+ * (LION_STORE_VALUE_COST).  A window's pages of a column are the store's
  * pages spread over the windows of the heap and its stored columns, one at
- * least - the map lookup that finds the chain.  The windows `tuples` rows
- * touch are counted as the heap pages are, in units of a window: Cardenas's
- * count for rows scattered over them, the share of them the rows cover for
- * rows packed in heap order, interpolated by the column's correlation
- * squared, as cost_index() interpolates its ends.  A WALK touches a pass's
- * windows once per pass.
+ * least.  The windows `tuples` rows touch are counted as the heap pages are,
+ * in units of a window: Cardenas's count for rows scattered over them, the
+ * share of them the rows cover for rows packed in heap order, interpolated
+ * by the column's correlation squared, as cost_index() interpolates its
+ * ends.  A WALK touches a pass's windows once per pass.
+ *
+ * Priced at LION_STORE_PAGE_COST a page and nothing for the read (0.02 at
+ * the defaults, CPU against the heap page's I/O) the scan was taken for a
+ * filter keeping 0.5% of 5M rows scattered over every window, where it read
+ * the whole store - 62,000 pages for 25,000 rows, 4 columns of 58,600, one
+ * of them wide - at 2,800 against the heap scan's 58,000, and ran three
+ * times slower than that heap scan (2026-10-03, DESIGN.md §40, "As built:
+ * the price of the index-only scan").  At core's page costs the same scan is
+ * 81,000, and the heap is taken (even with it cold, three times faster
+ * warm); for the filter keeping 5% the same columns are 94,000 against the
+ * heap scan's 104,000, and the store is taken, faster cold and warm.  The
+ * index-only scan of four narrow stored columns for the 0.5% filter, 21,000
+ * pages against the heap's 22,000, is 37,000 and taken, and is four times
+ * faster than the heap scan cold and twice slower warm, which is what core's
+ * page costs say of a scan that reads as many pages in chains as the heap
+ * scan reads at random.
  */
 static Cost
 lion_ios_gather_cost(RelOptInfo *baserel, double tuples, double passes,
@@ -1339,9 +1363,13 @@ lion_ios_gather_cost(RelOptInfo *baserel, double tuples, double passes,
 	double		scattered;
 	double		packed;
 	double		windows;
-	double		pagesper;
+	double		colpages;
+	double		spc_random_page_cost;
+	double		spc_seq_page_cost;
 
 	Assert(nret > 0 && nstored >= nret);
+	get_tablespace_page_costs(baserel->reltablespace, &spc_random_page_cost,
+							  &spc_seq_page_cost);
 	W = ceil(Max((double) baserel->pages, 1.0) /
 			 (double) LION_BLOCKS_PER_CONTAINER);
 	passes = Max(passes, 1.0);
@@ -1350,10 +1378,12 @@ lion_ios_gather_cost(RelOptInfo *baserel, double tuples, double passes,
 	packed = Min(W, ceil(W * perpass / Max(baserel->tuples, 1.0)));
 	windows = scattered + corr * corr * (packed - scattered);
 	windows = Min(passes * Max(windows, 1.0), Max(tuples, 1.0));
-	pagesper = (double) nret * Max(1.0, storepages / (W * (double) nstored));
+	colpages = Max(1.0, storepages / (W * (double) nstored));
 
 	return tuples * (double) nret * LION_STORE_VALUE_COST +
-		windows * pagesper * LION_STORE_PAGE_COST;
+		windows * (double) nret *
+		(colpages * LION_STORE_PAGE_COST +
+		 spc_random_page_cost + (colpages - 1.0) * spc_seq_page_cost);
 }
 
 /*

@@ -740,9 +740,16 @@ The values are the rows' own (citext's spelling, not the key's): from the store 
 TIDs whose index page the scan holds pinned (the §9 interlock), from the heap for a heap page the
 store left to the heap, for a multi-key query's sets past the pin budget, and for every TID on a
 hot standby over a generic-mode index. The planner prices the scan as the plain scan's fetches of
-the pages that are not all-visible, plus the gather: `pg_lion.store_value_cost` per value and
-`pg_lion.store_page_cost` per store page of each window the scan's batches touch. The scan gathers
-every stored column the index can return, whichever the query reads. Measured warm on a synthetic
+the pages that are not all-visible, plus the gather, in core's own page costs (the scan is core's
+IndexOnlyScan, priced beside core's heap scans): for each window the scan's batches touch, every
+returnable column's store pages at `random_page_cost` for the first and `seq_page_cost` for the
+rest, `pg_lion.store_page_cost` for the decoding of each, and `pg_lion.store_value_cost` per
+value. The scan gathers every stored column the index can return, whichever the query reads, so a
+filter whose rows are scattered over every window reads the whole store: on a 5M-row table with a
+wide stored column that is the right plan at 5% of the rows and three times slower than the heap
+at 0.5%, and the planner takes the heap there; with four narrow stored columns the scan reads as
+many pages as the heap scan at 0.5%, in chains rather than at random, and is taken - four times
+faster cold, twice slower warm. Measured warm on a synthetic
 table of 2M rows (52 to a heap page, the heap in shared buffers, release build), returning two
 INCLUDE columns: `tags && '{t7,t8}'`, 20,000 rows, 8.2 ms against 10.1 ms for the plain index scan
 (6,030 buffers against 10,014); `k = 42` on a scalar key under `store_values`, 2,000 rows of about
