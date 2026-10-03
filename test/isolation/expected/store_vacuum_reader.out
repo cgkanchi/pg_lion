@@ -19,16 +19,17 @@ heap_pages|store_pages
         17|          4
 (1 row)
 
-step s2_wakeup: SELECT injection_points_wakeup('lion-store-gather-head');
-injection_points_wakeup
------------------------
-                       
-(1 row)
-
+step s2_wakeup: SELECT injection_points_wakeup('lion-store-gather-head'); <waiting ...>
 step s1_read: <... completed>
 stored
 ------
 {v1}  
+(1 row)
+
+step s2_wakeup: <... completed>
+injection_points_wakeup
+-----------------------
+                       
 (1 row)
 
 step s2_detach: SELECT injection_points_detach('lion-store-gather-head');
@@ -73,16 +74,17 @@ heap_pages|store_pages
          0|          0
 (1 row)
 
-step s2_wakeup: SELECT injection_points_wakeup('lion-store-gather-head');
-injection_points_wakeup
------------------------
-                       
-(1 row)
-
+step s2_wakeup: SELECT injection_points_wakeup('lion-store-gather-head'); <waiting ...>
 step s1_read: <... completed>
 stored
 ------
 {NULL}
+(1 row)
+
+step s2_wakeup: <... completed>
+injection_points_wakeup
+-----------------------
+                       
 (1 row)
 
 step s2_detach: SELECT injection_points_detach('lion-store-gather-head');
@@ -127,16 +129,17 @@ heap_pages|store_pages
          1|          1
 (1 row)
 
-step s2_wakeup: SELECT injection_points_wakeup('lion-store-gather-head');
-injection_points_wakeup
------------------------
-                       
-(1 row)
-
+step s2_wakeup: SELECT injection_points_wakeup('lion-store-gather-head'); <waiting ...>
 step s1_read: <... completed>
 stored
 ------
 {new} 
+(1 row)
+
+step s2_wakeup: <... completed>
+injection_points_wakeup
+-----------------------
+                       
 (1 row)
 
 step s2_detach: SELECT injection_points_detach('lion-store-gather-head');

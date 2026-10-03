@@ -67,6 +67,9 @@ step s2_pages		{
 		   store_pages
 	  FROM lion_index_stats('stvr_i') WHERE attno = 1;
 }
+# (*, s1_read): the wakeup is reported as waiting, and complete once the reader
+# it woke is, so the reader's completion is reported in one place whatever the
+# tester sees first (on master it saw the detach first)
 step s2_wakeup		{ SELECT injection_points_wakeup('lion-store-gather-head'); }
 step s2_detach		{ SELECT injection_points_detach('lion-store-gather-head'); }
 
@@ -76,7 +79,7 @@ permutation
 	s1_read				# parks with the head in hand
 	s2_vacuum
 	s2_pages
-	s2_wakeup
+	s2_wakeup(*, s1_read)
 	s2_detach
 	s1_check
 
@@ -87,7 +90,7 @@ permutation
 	s2_vacuum
 	s2_vacuum_again
 	s2_pages
-	s2_wakeup
+	s2_wakeup(*, s1_read)
 	s2_detach
 	s1_check
 
@@ -99,6 +102,6 @@ permutation
 	s2_vacuum_again
 	s2_reinsert
 	s2_pages
-	s2_wakeup
+	s2_wakeup(*, s1_read)
 	s2_detach
 	s1_check
