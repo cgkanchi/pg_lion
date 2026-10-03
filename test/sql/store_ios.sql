@@ -27,6 +27,8 @@
 --	7. what is not answered from the index: SELECT * over the array column,
 --	   a predicate the sets answer only with a recheck
 --	8. citext: a key column's own spelling, and an INCLUDE citext column
+--	9. the planner's choice: the heap for a few rows on every window, the
+--	   store for a tenth of the table
 \set VERBOSITY terse
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
@@ -127,6 +129,11 @@ CREATE INDEX lion_ios_s_k ON lion_ios_s USING lion (k) INCLUDE (a, t, w)
 	WITH (store_values = true);
 VACUUM ANALYZE lion_ios_s;
 SELECT * FROM lion_ios_returnable('lion_ios_s_k');
+-- the heap scans are kept out: on 287 heap pages the planner prices the
+-- heap below the gathers of a WALK (k < 5 is five passes, each over the
+-- five windows), and the choice between them is section 9's
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
 
 EXPLAIN (COSTS OFF) SELECT k, a, t, w FROM lion_ios_s WHERE k = 17;
 EXPLAIN (COSTS OFF) SELECT a, t FROM lion_ios_s WHERE k IN (3, 5, 150);
@@ -173,6 +180,8 @@ SELECT * FROM lion_ios_explain('SELECT k, a, t, w FROM lion_ios_s WHERE k = 17')
 CREATE INDEX lion_ios_s_nokey ON lion_ios_s USING lion (k) INCLUDE (a);
 SELECT * FROM lion_ios_returnable('lion_ios_s_nokey');
 DROP INDEX lion_ios_s_nokey;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
 
 -- ---------------------------------------------------------------------
 -- 2. An array column, its INCLUDE columns returned under `&&` and `@>`:
@@ -271,38 +280,36 @@ SELECT lion_ios_check('SELECT k, code FROM lion_ios_c WHERE k = 42');
 
 -- ---------------------------------------------------------------------
 -- 5. ABSENT: heap pages whose values no store page can hold (store.sql's
---    recipe: distinct strings of 1,984 bytes the heap compresses inline).
---    The key is not stored - the qual is answered by the posting sets, and
---    the plan is the one lion's planner hook builds - and the ABSENT pages'
---    values come from the heap, the others' from the store.
+--    recipe: distinct strings of 1,984 bytes the heap compresses inline,
+--    a hundred to a page).  The key is not stored - the qual is answered by
+--    the posting sets, and the plan is the one lion's planner hook builds -
+--    and the ABSENT pages' values come from the heap, the others' from the
+--    store.  The other rows are short, and spread ten to a page by a column
+--    the heap neither compresses nor toasts, so that the rows of a key, four
+--    of them on the ABSENT pages, lie on as many heap pages as there are
+--    rows: the store's few pages are the cheaper read, and the index-only
+--    scan is the planner's own choice.
 -- ---------------------------------------------------------------------
 
-CREATE TABLE lion_ios_abs (id int, s text, f text) WITH (toast_tuple_target = 128);
-INSERT INTO lion_ios_abs SELECT g, repeat(md5(g::text), 62), repeat('f', 100) FROM generate_series(1, 400) g;
-INSERT INTO lion_ios_abs SELECT g, 'short ' || g FROM generate_series(401, 900) g;
-CREATE INDEX lion_ios_abs_i ON lion_ios_abs USING lion (id) INCLUDE (s);
+CREATE TABLE lion_ios_abs (id int, k int, s text, f text, w text) WITH (toast_tuple_target = 128);
+ALTER TABLE lion_ios_abs ALTER COLUMN w SET STORAGE PLAIN;
+INSERT INTO lion_ios_abs SELECT g, g % 100, repeat(md5(g::text), 62), repeat('f', 100), NULL FROM generate_series(1, 400) g;
+INSERT INTO lion_ios_abs SELECT g, g % 100, 'short ' || g, NULL, repeat('w', 700) FROM generate_series(401, 5400) g;
+CREATE INDEX lion_ios_abs_i ON lion_ios_abs USING lion (k) INCLUDE (s);
 VACUUM ANALYZE lion_ios_abs;
 SELECT attno, store_absent > 0 AS has_absent FROM lion_index_stats('lion_ios_abs_i') WHERE attno = 2;
 SELECT * FROM lion_ios_returnable('lion_ios_abs_i');
-SET enable_seqscan = off;
-SET enable_bitmapscan = off;
 -- rows on ABSENT pages and on stored ones, in one batch
-EXPLAIN (COSTS OFF) SELECT s FROM lion_ios_abs WHERE id IN (7, 150, 399, 401, 450, 800);
-SELECT lion_ios_check('SELECT s FROM lion_ios_abs WHERE id IN (7, 150, 399, 401, 450, 800)');
-SELECT lion_ios_check('SELECT length(s) FROM lion_ios_abs WHERE id = 7');
-SELECT * FROM lion_ios_explain('SELECT s FROM lion_ios_abs WHERE id IN (7, 150, 399, 401, 450, 800)');
--- a walk of 201 one-row entries gathers the window once per entry, which
--- costs more than the heap of this small table: a plain scan, unless the
--- store's pages are made free
-EXPLAIN (COSTS OFF) SELECT s FROM lion_ios_abs WHERE id BETWEEN 300 AND 500;
-SET pg_lion.store_page_cost = 0;
-EXPLAIN (COSTS OFF) SELECT s FROM lion_ios_abs WHERE id BETWEEN 300 AND 500;
-SELECT lion_ios_check('SELECT s FROM lion_ios_abs WHERE id BETWEEN 300 AND 500');
-RESET pg_lion.store_page_cost;
+EXPLAIN (COSTS OFF) SELECT s FROM lion_ios_abs WHERE k IN (7, 50);
+SELECT count(*), count(*) FILTER (WHERE id <= 400) AS on_absent_pages FROM lion_ios_abs WHERE k IN (7, 50);
+SELECT lion_ios_check('SELECT s FROM lion_ios_abs WHERE k IN (7, 50)');
+SELECT lion_ios_check('SELECT length(s) FROM lion_ios_abs WHERE k = 7');
+SELECT * FROM lion_ios_explain('SELECT s FROM lion_ios_abs WHERE k IN (7, 50)');
+-- a walk of three entries gathers the windows once per entry
+EXPLAIN (COSTS OFF) SELECT s FROM lion_ios_abs WHERE k BETWEEN 30 AND 32;
+SELECT lion_ios_check('SELECT s FROM lion_ios_abs WHERE k BETWEEN 30 AND 32');
 -- the key itself is not returned: a plain scan
-EXPLAIN (COSTS OFF) SELECT id, s FROM lion_ios_abs WHERE id IN (7, 150, 399, 401, 450, 800);
-RESET enable_seqscan;
-RESET enable_bitmapscan;
+EXPLAIN (COSTS OFF) SELECT k, s FROM lion_ios_abs WHERE k IN (7, 50);
 
 -- ---------------------------------------------------------------------
 -- 6. Past the pin budget.  A multi-key query's sets keep their leaves
@@ -382,6 +389,31 @@ SELECT * FROM lion_ios_explain('SELECT name, alias FROM lion_ios_ci WHERE name =
 DROP TABLE lion_ios_ci;
 DROP EXTENSION pg_lion_citext;
 DROP EXTENSION citext;
+
+-- ---------------------------------------------------------------------
+-- 9. The price of the gather (DESIGN.md §40, "As built: the price of the
+--    index-only scan").  The scan gathers every returnable column of every
+--    window its rows touch, a window's whole chain of each, priced in
+--    core's page costs: a few hundred rows scattered over every window read
+--    the whole store, and the heap's few hundred pages are cheaper; a tenth
+--    of the rows read the same store once, and the heap is not.  200,000
+--    rows of about 530 bytes (16 a page, 12,500 pages, 200 windows), a
+--    stored text of 224 bytes beside an unstored filler of 300: the store
+--    is about 5,500 pages.
+-- ---------------------------------------------------------------------
+
+CREATE TABLE lion_ios_p (id int, k int, g int, s text, filler text);
+INSERT INTO lion_ios_p
+SELECT g, g % 1000, g % 10, repeat(md5(g::text), 7), repeat('f', 300)
+  FROM generate_series(1, 200000) g;
+CREATE INDEX lion_ios_p_k ON lion_ios_p USING lion (k) INCLUDE (s);
+CREATE INDEX lion_ios_p_g ON lion_ios_p USING lion (g) INCLUDE (s);
+VACUUM ANALYZE lion_ios_p;
+SELECT q, regexp_replace(lion_ios_check(q), '^(Index Scan|Bitmap Heap Scan|Seq Scan)', 'heap scan')
+  FROM (VALUES
+	('SELECT length(s) FROM lion_ios_p WHERE k = 123'),
+	('SELECT length(s) FROM lion_ios_p WHERE g = 3')) v(q);
+DROP TABLE lion_ios_p;
 
 SELECT lion_index_verify('lion_ios_s_k', true), lion_index_verify('lion_ios_a_tags', true),
 	   lion_index_verify('lion_ios_d_doc', true), lion_index_verify('lion_ios_c_k', true);
