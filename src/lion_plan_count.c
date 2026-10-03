@@ -252,7 +252,9 @@ typedef struct LionCountPathBuild
 	List	   *storegroupvars; /* ... and the GROUP BY columns themselves */
 	List	   *storedistvars;	/* the columns a count(DISTINCT) counts */
 	int			storenaggs;		/* aggregates over gathered columns */
-	IndexOptInfo *storeidx;		/* the index whose store holds them */
+	IndexOptInfo *storeidx;		/* one table's index whose store holds
+								 * them; a partition's is its target's
+								 * (lion_store_relations()) */
 	List	   *storeidxcols;	/* ... and their columns there */
 	double		storegroupest;	/* the groups the rows fall into */
 	double		storepairs;		/* ... and the (group, value) pairs of
@@ -2656,14 +2658,34 @@ lion_count_path_make(LionCountPathBuild *cx)
 	/*
 	 * The columns gathered from the window store (DESIGN.md §40), and the
 	 * GROUP BY formed of them; lion_plan_custom_path() adds the aggregates.
+	 * The store index is each relation's counted: the table's, or one per
+	 * partition in LION_PRIV_PARTS's order, where the columns' numbers in
+	 * it are left 0 - a partition's index may place them differently, and
+	 * the executor finds every relation's from the index it opens.
 	 */
 	if (cx->store)
 	{
-		Assert(cx->storeidx != NULL && cx->storeattnos != NIL);
+		List	   *idxoids = NIL;
+		List	   *idxcols = cx->storeidxcols;
+		ListCell   *lc;
+
+		Assert(cx->storeattnos != NIL);
+		foreach(lc, cx->targets)
+		{
+			LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+
+			Assert(t->storeidx != NULL);
+			idxoids = lappend_oid(idxoids, t->storeidx->indexoid);
+		}
+		if (cx->partitioned)
+		{
+			idxcols = NIL;
+			foreach(lc, cx->storeattnos)
+				idxcols = lappend_int(idxcols, 0);
+		}
 		cpath->custom_private =
 			lappend(cpath->custom_private,
-					list_make4(list_make1_oid(cx->storeidx->indexoid),
-							   cx->storeattnos, cx->storeidxcols,
+					list_make4(idxoids, cx->storeattnos, idxcols,
 							   cx->storegroups));
 	}
 	else
@@ -2748,10 +2770,10 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 							 cx->rangesel, &rangeprice);
 	/*
 	 * The gather of the window store (DESIGN.md §40): the count above, and the
-	 * values of its rows read and grouped.
+	 * values of its rows read and grouped - in each relation it counts.
 	 */
 	if (cx->store)
-		lion_cost_store_path(root, cpath, input_rel, cx->storeidx,
+		lion_cost_store_path(root, cpath, cx->targets,
 							 list_length(cx->storeattnos),
 							 list_length(cx->storegroups),
 							 cx->storegroupest, cx->outrows, cx->storenaggs,
@@ -2948,11 +2970,189 @@ lion_try_walk_path(PlannerInfo *root, RelOptInfo *input_rel,
 }
 
 /*
+ * The Var parent column v of the query's relation is in relation t counted
+ * (DESIGN.md §16): itself for one table, and for a leaf partition the leaf's
+ * own column, through every level of partitioning between them, as the
+ * planner maps the restrictions it hands the leaf.  A partition's estimates
+ * and statistics are asked of that Var.  NULL where the leaf has no such
+ * column.
+ */
+static Var *
+lion_store_leaf_var(LionCountPathBuild *cx, LionCountTarget *t, Var *v)
+{
+	Node	   *n;
+
+	if (t->rel == cx->input_rel)
+		return v;
+	n = adjust_appendrel_attrs_multilevel(cx->root, (Node *) v, t->rel,
+										  cx->input_rel);
+	if (n == NULL || !IsA(n, Var) || ((Var *) n)->varattno <= 0)
+		return NULL;
+	return (Var *) n;
+}
+
+/*
+ * The store every relation counted reads the gathered columns from
+ * (t->storeidx, DESIGN.md §40): one table's, which lion_try_store_path() has
+ * found, or each live leaf partition's own - the lion index of THAT partition
+ * that stores every gathered column under the partition's own column numbers,
+ * the one storing fewest when several do (lion_find_store_index()).  A
+ * partition without one declines the whole query, as a partition without an
+ * index for a WHERE clause does: the node produces one set of groups, and
+ * there is no per-partition fallback.
+ */
+static bool
+lion_store_relations(LionCountPathBuild *cx)
+{
+	List	   *vars = NIL;
+	ListCell   *lc;
+
+	if (!cx->partitioned)
+	{
+		Assert(list_length(cx->targets) == 1 && cx->storeidx != NULL);
+		cx->first->storeidx = cx->storeidx;
+		return true;
+	}
+
+	foreach(lc, cx->storeattnos)
+	{
+		AttrNumber	attno = (AttrNumber) lfirst_int(lc);
+		Oid			type;
+		int32		typmod;
+		Oid			coll;
+
+		get_atttypetypmodcoll(cx->rte->relid, attno, &type, &typmod, &coll);
+		vars = lappend(vars, makeVar(cx->rti, attno, type, typmod, coll, 0));
+	}
+	foreach(lc, cx->targets)
+	{
+		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+		List	   *attnos = NIL;
+		List	   *cols;
+		ListCell   *lv;
+
+		foreach(lv, vars)
+		{
+			Var		   *cv = lion_store_leaf_var(cx, t, (Var *) lfirst(lv));
+
+			if (cv == NULL)
+				return false;
+			attnos = lappend_int(attnos, (int) cv->varattno);
+		}
+		t->storeidx = lion_find_store_index(t->rel, attnos, &cols);
+		if (t->storeidx == NULL)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * The groups the node forms (storegroupest), the (group, value) pairs its
+ * count(DISTINCT)s keep (storepairs), and the rows it emits (outrows), which
+ * the estimate of the count - made without a GROUP BY - does not know: one
+ * row without a GROUP BY, or with one the planner folded to a single group,
+ * else one per group of the rows the WHERE keeps.
+ *
+ * Over a partitioned table the groups and the pairs are the SUM over the live
+ * leaves of each leaf's own estimate, made against the leaf's own columns and
+ * capped by its rows, as DESIGN.md §16 counts a partitioned GROUP BY's partial
+ * rows: the parent's estimate is unreliable, a partitioned parent being never
+ * auto-analyzed, and the sum - a group once for every partition it has rows
+ * in - errs toward the memory guard declining (lion_store_hash_bytes()).  The
+ * rows emitted are the fewer of the parent's estimate and that sum.
+ */
+static void
+lion_store_estimate(LionCountPathBuild *cx)
+{
+	PlannerInfo *root = cx->root;
+	double		rows = Max(cx->input_rel->rows, 1.0);
+	double		parentgroups;
+	double		groups = 0.0;
+	ListCell   *lc;
+
+	parentgroups = (cx->storegroupvars != NIL) ?
+		estimate_num_groups(root, cx->storegroupvars, rows, NULL, NULL) : 1.0;
+	cx->storegroupest = parentgroups;
+	cx->outrows = parentgroups;
+	cx->storepairs = 0.0;
+	if (!cx->partitioned)
+	{
+		foreach(lc, cx->storedistvars)
+		{
+			List	   *vars = lappend(list_copy(cx->storegroupvars),
+									   lfirst(lc));
+
+			cx->storepairs += estimate_num_groups(root, vars, rows, NULL,
+												  NULL);
+		}
+		return;
+	}
+
+	foreach(lc, cx->targets)
+	{
+		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+		double		relrows = Max(t->rel->rows, 1.0);
+		List	   *cvars = NIL;
+		ListCell   *lv;
+
+		foreach(lv, cx->storegroupvars)
+			cvars = lappend(cvars, lion_store_leaf_var(cx, t,
+													   (Var *) lfirst(lv)));
+		if (cvars != NIL)
+			groups += Min(estimate_num_groups(root, cvars, relrows, NULL,
+											  NULL), relrows);
+		foreach(lv, cx->storedistvars)
+		{
+			List	   *vars = lappend(list_copy(cvars),
+									   lion_store_leaf_var(cx, t,
+														   (Var *) lfirst(lv)));
+
+			cx->storepairs += Min(estimate_num_groups(root, vars, relrows,
+													  NULL, NULL), relrows);
+		}
+	}
+	if (cx->storegroupvars != NIL)
+	{
+		cx->storegroupest = Max(groups, 1.0);
+		cx->outrows = Min(parentgroups, cx->storegroupest);
+	}
+}
+
+/*
+ * The average width of gathered column v: its statistics', or its type's.
+ * A partitioned parent keeps only statistics of its whole inheritance tree,
+ * which get_attavgwidth() does not read, so there it is the widest leaf's.
+ */
+static int32
+lion_store_width(LionCountPathBuild *cx, Var *v)
+{
+	int32		w = 0;
+	ListCell   *lc;
+
+	if (!cx->partitioned)
+		w = get_attavgwidth(cx->rte->relid, v->varattno);
+	else
+	{
+		foreach(lc, cx->targets)
+		{
+			LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+			Var		   *cv = lion_store_leaf_var(cx, t, v);
+
+			if (cv != NULL)
+				w = Max(w, get_attavgwidth(t->heapoid, cv->varattno));
+		}
+	}
+	if (w <= 0)
+		w = get_typavgwidth(v->vartype, v->vartypmod);
+	return w;
+}
+
+/*
  * The memory the gather's groups take (DESIGN.md §40): a group's keys and
  * aggregate states and its place in the hash table, and a count(DISTINCT)'s
  * values, at the columns' average widths.  The node keeps them all until it
- * has counted every row - it has no spill - so a path whose groups would
- * not fit in hash_mem is not made.
+ * has counted every row - of every partition, over a partitioned table - and
+ * has no spill, so a path whose groups would not fit in hash_mem is not made.
  */
 static double
 lion_store_hash_bytes(LionCountPathBuild *cx)
@@ -2962,23 +3162,10 @@ lion_store_hash_bytes(LionCountPathBuild *cx)
 	ListCell   *lc;
 
 	foreach(lc, cx->storegroupvars)
-	{
-		Var		   *v = (Var *) lfirst(lc);
-		int32		w = get_attavgwidth(cx->rte->relid, v->varattno);
-
-		if (w <= 0)
-			w = get_typavgwidth(v->vartype, v->vartypmod);
-		pergroup += 16.0 + w;
-	}
+		pergroup += 16.0 + lion_store_width(cx, (Var *) lfirst(lc));
 	foreach(lc, cx->storedistvars)
-	{
-		Var		   *v = (Var *) lfirst(lc);
-		int32		w = get_attavgwidth(cx->rte->relid, v->varattno);
-
-		if (w <= 0)
-			w = get_typavgwidth(v->vartype, v->vartypmod);
-		perpair = Max(perpair, 48.0 + w);
-	}
+		perpair = Max(perpair,
+					  48.0 + lion_store_width(cx, (Var *) lfirst(lc)));
 	return cx->storegroupest * pergroup + cx->storepairs * perpair;
 }
 
@@ -3003,9 +3190,17 @@ lion_store_hash_bytes(LionCountPathBuild *cx)
  * the distinct walk of §26, the walk of §37 - and add_path() keeps the
  * cheaper.
  *
- * One table: a partitioned one would need partial aggregates per partition,
- * and the FK-side join gathers nothing.  One index's store holds every
- * gathered column.  No GROUP BY item that is not a plain column, no
+ * A partitioned table is counted a live leaf partition at a time, as §16
+ * counts one, each partition's rows gathered from its own index's store into
+ * the node's one hash table, whose groups come out when the last partition
+ * has been counted (DESIGN.md §40, "As built: partitioned tables").  Not
+ * partial aggregates per partition under a Finalize Agg, as §16's entry walk
+ * makes them: a count(DISTINCT) has no partial state, and the sums' would be
+ * core's serialized 128-bit accumulators; and the groups are bounded by
+ * hash_mem as one table's are, the estimate summed over the partitions.
+ *
+ * The FK-side join gathers nothing.  Per relation, one index's store holds
+ * every gathered column.  No GROUP BY item that is not a plain column, no
  * aggregate with FILTER, ORDER BY or an argument that is not a plain column.
  */
 static void
@@ -3022,8 +3217,6 @@ lion_try_store_path(PlannerInfo *root, RelOptInfo *input_rel,
 		return;
 	if (!lion_count_path_rel(&cx))
 		return;
-	if (cx.partitioned)
-		return;
 	if (!lion_count_path_store_group_by(&cx))
 		return;
 	if (!lion_count_path_where(&cx))
@@ -3033,42 +3226,26 @@ lion_try_store_path(PlannerInfo *root, RelOptInfo *input_rel,
 	if (!lion_count_path_outputs(&cx))
 		return;
 
-	/* one index's store has every column */
-	cx.storeidx = lion_find_store_index(input_rel, cx.storeattnos,
-										&cx.storeidxcols);
-	if (cx.storeidx == NULL)
-		return;
+	/*
+	 * One index's store has every column: one table's, asked here, or each
+	 * partition's, asked once the partitions counted are known.
+	 */
+	if (!cx.partitioned)
+	{
+		cx.storeidx = lion_find_store_index(input_rel, cx.storeattnos,
+											&cx.storeidxcols);
+		if (cx.storeidx == NULL)
+			return;
+	}
 
 	if (!lion_count_path_strategy(&cx))
 		return;
 	if (!lion_count_path_targets(&cx))
 		return;
+	if (!lion_store_relations(&cx))
+		return;
 	lion_count_path_estimate(&cx);
-
-	/*
-	 * The rows the node emits are its own groups', which the estimate above
-	 * (of a count without a GROUP BY) does not know: one row without a GROUP
-	 * BY - or with one the planner folded to a single group - else one per
-	 * group of the rows the WHERE keeps.
-	 */
-	cx.storegroupest = (cx.storegroupvars != NIL) ?
-		estimate_num_groups(root, cx.storegroupvars, Max(input_rel->rows, 1.0),
-							NULL, NULL) : 1.0;
-	cx.outrows = cx.storegroupest;
-	{
-		ListCell   *lc;
-
-		cx.storepairs = 0.0;
-		foreach(lc, cx.storedistvars)
-		{
-			List	   *vars = lappend(list_copy(cx.storegroupvars),
-									   lfirst(lc));
-
-			cx.storepairs += estimate_num_groups(root, vars,
-												 Max(input_rel->rows, 1.0),
-												 NULL, NULL);
-		}
-	}
+	lion_store_estimate(&cx);
 	if (lion_store_hash_bytes(&cx) > (double) get_hash_memory_limit())
 		return;
 

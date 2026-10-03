@@ -3760,9 +3760,11 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 /*
  * THE GATHER OF THE WINDOW STORE (DESIGN.md §40, "Costs"): what the count
  * cpath already carries - of the WHERE, or the sum over every row, whose
- * rows are rel->rows - becomes the count of a node that gathers ncols
- * columns of storeidx's store for each of those rows and forms its groups
- * and aggregates of them:
+ * rows are each relation's rel->rows - becomes the count of a node that
+ * gathers ncols columns of the relation's store index (t->storeidx) for each
+ * of those rows and forms its groups and aggregates of them.  Per relation
+ * counted - the table, or each live leaf partition with its own pages, rows
+ * and store, summed as lion_cost_count_path() sums the count:
  *
  *	- a value per row per column decoded (LION_STORE_VALUE_COST);
  *	- each column's store pages in every window the rows lie in, the windows
@@ -3778,6 +3780,9 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
  *	  its hash table of combinations (LION_DECODE_HASH_ROW_COST, and
  *	  LION_DECODE_ROW_COL_COST a column after the first), an operator per
  *	  aggregate it steps, and the hash of a count(DISTINCT)'s pairs;
+ *
+ * and once, for the one hash table every relation's rows go into:
+ *
  *	- the groups, all of which come out once the count is over.
  *
  * A row on a page that is not all-visible, or one the store leaves to the
@@ -3786,32 +3791,40 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
  * caller's, as for every count path.
  */
 void
-lion_cost_store_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
-					 IndexOptInfo *storeidx, int ncols, int ngroup,
-					 double groups, double outrows, int naggs, int ndistinct,
-					 double distinctpairs)
+lion_cost_store_path(PlannerInfo *root, CustomPath *cpath, List *targets,
+					 int ncols, int ngroup, double groups, double outrows,
+					 int naggs, int ndistinct, double distinctpairs)
 {
-	double		heap_pages = Max((double) rel->pages, 1.0);
-	double		windows = Max(ceil(heap_pages / LION_BLOCKS_PER_CONTAINER), 1.0);
-	double		rows = Max(rel->rows, 1.0);
-	double		touched;
-	double		perwindow;
-	double		storepages;
-	int			nstored = 0;
 	Cost		run = cpath->path.total_cost;
+	ListCell   *lc;
 
 	Assert(ncols > 0);
-	storepages = lion_index_store_pages(storeidx, &nstored);
-	touched = Max(windows * (1.0 - exp(-rows / windows)), 1.0);
-	perwindow = Max(storepages / windows / (double) Max(nstored, 1), 1.0);
+	foreach(lc, targets)
+	{
+		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+		RelOptInfo *rel = t->rel;
+		double		heap_pages = Max((double) rel->pages, 1.0);
+		double		windows = Max(ceil(heap_pages / LION_BLOCKS_PER_CONTAINER),
+								  1.0);
+		double		rows = Max(rel->rows, 1.0);
+		double		touched;
+		double		perwindow;
+		double		storepages;
+		int			nstored = 0;
 
-	run += rows * ncols * LION_STORE_VALUE_COST;
-	run += touched * ncols * perwindow * LION_STORE_PAGE_COST;
-	if (ngroup > 0)
-		run += rows * (LION_DECODE_HASH_ROW_COST +
-					   (ngroup - 1) * LION_DECODE_ROW_COL_COST);
-	run += rows * naggs * cpu_operator_cost;
-	run += rows * ndistinct * LION_DECODE_HASH_ROW_COST;
+		Assert(t->storeidx != NULL);
+		storepages = lion_index_store_pages(t->storeidx, &nstored);
+		touched = Max(windows * (1.0 - exp(-rows / windows)), 1.0);
+		perwindow = Max(storepages / windows / (double) Max(nstored, 1), 1.0);
+
+		run += rows * ncols * LION_STORE_VALUE_COST;
+		run += touched * ncols * perwindow * LION_STORE_PAGE_COST;
+		if (ngroup > 0)
+			run += rows * (LION_DECODE_HASH_ROW_COST +
+						   (ngroup - 1) * LION_DECODE_ROW_COL_COST);
+		run += rows * naggs * cpu_operator_cost;
+		run += rows * ndistinct * LION_DECODE_HASH_ROW_COST;
+	}
 	run += (groups + distinctpairs) * cpu_operator_cost;
 
 	cpath->path.rows = outrows;

@@ -18221,7 +18221,8 @@ each window's pages 90 times. Measured on the table below, `max(g) ... WHERE k <
 buffers in 305 ms summed and 2,179 in 52 ms merged; the sum is kept where only it holds the
 interlock (a list past the pin budget, NOPIN sets). The gather is not used beside the node's own walks (a group column, a
 distinct column, aggregates over keys, a join, partitions, the top k, the decoded walk): the plan
-never builds that, and `lion_store_begin()` refuses it.
+never builds that, and `lion_store_begin()` refuses it. (Partitions were in that list until "As
+built: partitioned tables" below.)
 
 **The planner** (`lion_plan_count.c`, `lion_try_store_path()`). The path is built as the count's
 is - query, relation, WHERE, HAVING, strategy, targets, estimate - with a `GROUP BY` and outputs
@@ -18231,8 +18232,9 @@ column's), every output a `GROUP BY` column, `count(*)`, or an aggregate over a 
 §37's `lion_wagg_classify()` set (sum and avg of int2, int4 and int8 in 128 bits, min and max
 under the aggregate's sort operator; float8 and numeric sums were not trivial and are left out).
 `lion_find_store_index()` then picks the lion index that stores every gathered column, the one
-storing fewest columns when several do. Partitioned tables, the FK-side join and a hash table the
-planner expects to exceed `hash_mem` are declined (the node does not spill). The plan carries the
+storing fewest columns when several do. The FK-side join and a hash table the planner expects to
+exceed `hash_mem` are declined (the node does not spill); a partitioned table was too, until
+"As built: partitioned tables" below. The plan carries the
 gather as private member 19 (`LION_PRIV_STORE`: the index, the heap columns, their index columns,
 the `GROUP BY`'s position, equality and collation per column, and per aggregate its kind, column,
 width, aggregate, input collation and DISTINCT equality and collation); the target-list kinds move
@@ -18304,7 +18306,8 @@ fourth 660 ms (best of four), which lost to the `HashAggregate`'s 492 ms then.
 - A `GROUP BY` that mixes a walked column with a stored one, and columns stored by two indexes:
   every gathered column is in one index's store, and every `GROUP BY` column is gathered.
 - A parallel gather: the node's partitioned mode would need partial aggregate states for sum,
-  avg, min, max and `count(DISTINCT)`; and a partitioned table, for the same reason.
+  avg, min, max and `count(DISTINCT)`. A partitioned table does without them, counted a partition
+  at a time into one set of groups ("As built: partitioned tables", below).
 - Spilling: the node keeps every group in memory and the planner declines past `hash_mem`.
 - Expressions: an aggregate argument or a `GROUP BY` item that is not a plain column, and a target
   that is an expression of a `GROUP BY` column.
@@ -18317,6 +18320,96 @@ fourth 660 ms (best of four), which lost to the `HashAggregate`'s 492 ms then.
 - An isolation test racing VACUUM against a parked gather: the interlock is the count's (§9),
   which `test/isolation` already races, and the store reader's own race is Phase A's
   `store_vacuum_reader.spec`; none drives the two together.
+
+### As built: partitioned tables (2026-10-03)
+
+The gather of "the count's shapes" over a partitioned table. A partitioned parent takes the store
+path when every live leaf partition has a lion index that stores every gathered column; the node
+counts each leaf in turn, as §16 counts one, and gathers its rows from that leaf's own store.
+Where it departs from §16 and from the one table's gather, and why:
+
+**One set of groups, not partial aggregates.** §16's `GROUP BY` over partitions emits partial
+rows per partition under core's Finalize HashAggregate. The gather does not: the node hashes every
+partition's rows into its one hash table, emits the final groups when the last partition has been
+counted, applies the `HAVING` itself as it does over one table, and has no Agg above it. Three
+reasons. `count(DISTINCT c)` has no partial state: two partitions' distinct counts cannot be
+added, and a Finalize Agg could only merge them if the partials carried the values themselves.
+The sums' partial states are core's internal ones - for int8 a 128-bit accumulator, serialized by
+`int8_avg_serialize()` - which the node would have to build to core's layout. And the store path
+over one table already holds every group in memory behind the plan-time guard of `hash_mem`
+(`lion_store_hash_bytes()`): holding every partition's groups is bounded the same way, while
+partials would hold one partition's groups at a time but emit a group once for every partition it
+has rows in, for a Finalize Agg to hash them all again.
+
+**The planner** (`lion_plan_count.c`). `lion_try_store_path()` no longer returns for a partitioned
+table. The leaves are §16's targets (`lion_collect_targets()`): the live leaves after plan-time
+pruning, a clause a leaf's bounds imply having no index there (`LION_PRIV_IMPLIED`).
+`lion_store_relations()` translates each gathered column of the parent into each leaf's own,
+through every level of partitioning (`lion_store_leaf_var()`,
+`adjust_appendrel_attrs_multilevel()`), and asks `lion_find_store_index()` of the leaf's
+RelOptInfo, which takes the index storing fewest columns when several qualify; the leaf's target
+keeps it (`LionCountTarget.storeidx`). A leaf without one declines the whole query, as a leaf
+without an index for a WHERE clause does (§16): the node forms one set of groups and has no
+per-partition fallback. §16's other bounds stay: partitionwise aggregation declines the node, the
+FK-side join gathers nothing, the gather has no parallel form, and run-time pruning is not done.
+The cost (`lion_cost_store_path()`) is the rule above summed over the leaves, each with its own
+heap pages, windows, rows kept and store pages; the (groups + distinct pairs) term is paid once.
+
+**The estimate and the guard** (`lion_store_estimate()`). The groups the node forms are estimated
+as the SUM over the live leaves of each leaf's own estimate - `estimate_num_groups()` of the
+leaf's own columns over the rows its WHERE keeps, capped by those rows - and a `count(DISTINCT)`'s
+(group, value) pairs the same way. A group with rows in several partitions is counted once for
+each, so the sum is at least the groups formed, and the `hash_mem` guard compared with it errs
+toward declining. The parent's estimate is not used for the guard: a partitioned parent is never
+auto-analyzed, so its statistics are missing or as old as the last manual ANALYZE, while the
+leaves' are kept current. The path's rows are the fewer of the parent's estimate and the sum. A
+column's width is the widest leaf's (`lion_store_width()`): `get_attavgwidth()` reads a relation's
+own statistics, and a partitioned parent has only its inheritance tree's.
+
+**The plan.** Member 19 (`LION_PRIV_STORE`) names one index per live leaf, in member 5's order, and
+its column numbers are 0 for a partitioned table: a leaf's index may place the columns differently,
+and the executor finds each relation's from the index it opens. The `LION_PRIV_MAGIC` changed with
+it (shape 23).
+
+**The executor** (`lion_exec_store.c`). `lion_store_begin()` accepts partitions and puts each
+leaf's store index in its `LionPartState`, which `lion_open_parts()` opens and `lion_close_parts()`
+closes with the leaf's other relations. `lion_store_count()` gives each partition its turn as
+`lion_run_partition()` does - its relations opened, its WHERE located, its rows counted, what it
+located released, its relations closed, so no pin outlives the turn (§16) - and
+`lion_store_count_relation()` counts it with a gather over its own store into the one hash table.
+Each gathered column is found by its place in that store from the leaf's own column number
+(`lion_heap_attno_in()`, by name, as the node finds every partition's columns); its type is the
+parent's in every leaf, so the groups hash and compare alike. The check that the rows handed over
+are the rows counted holds per partition, and the gather's counters are summed over the
+partitions. `lion_exec_custom_scan_internal()` sends a partitioned node with a gather to
+`lion_store_next()`, which counts every partition before its first row; a rescan resets the groups
+(`lion_store_reset()`) and counts them all again.
+
+**EXPLAIN** is the one table's - `Custom Scan (LionCount)` with `Group Key:` and `Store:`, and no
+Finalize Agg above it - with §16's `Partitions:` line. ANALYZE's `Store Rows`, `Store Rows From
+Heap` and `Store Pages Absent` are totals over the partitions, and `Store Groups` the groups formed
+over all of them.
+
+**Tests.** `test/sql/store_partition.sql`, every answer compared with the plan with the pushdown
+off: a list-partitioned table of four leaves - one with a dropped column, one partitioned again by
+range, one with its columns and its INCLUDE list in another order and a second, narrower lion index
+storing only the group column - whose groups span partitions, with the NULL group and sums past
+int8's range. The plans (`Store:`, the `HAVING` as the node's filter, no Agg) and ANALYZE's totals;
+`GROUP BY` with every aggregate, two columns and `count(DISTINCT)`, `HAVING`, `ORDER BY`; no `GROUP
+BY`, no WHERE, nothing matching; clauses a leaf's bounds imply, at both levels; pruning to one
+partition and to none; the narrower index read for the group column alone and the wider one for a
+sum (`pg_statio_user_indexes`); the declines - a leaf whose index does not store a column and a
+leaf with no lion index, and the path taken again where pruning excludes it; dirty pages in one
+leaf, an open transaction's changes, and all from the store after VACUUM; correlated subqueries'
+rescans; and the guard declining under a small `work_mem` where the parent's stale statistics
+would have let the path through. The output names no actual rows, no SubPlan and no counter that
+depends on the heap's page layout, so it is one file for every major.
+
+**What is left.**
+- Partial aggregates, for a parallel gather (above), and so a partitioned table larger than
+  `hash_mem` in groups: the node still keeps every group in memory and does not spill.
+- Run-time pruning, as for every partitioned count (§16).
+- A leaf's store index is the one storing fewest columns, not priced against the others.
 
 ### As built: Phase B, index-only scans (2026-10-02)
 

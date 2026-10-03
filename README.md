@@ -626,11 +626,12 @@ stored by one lion index (an INCLUDE column, or a scalar key column under `store
 `count(DISTINCT c)` of any hashable type; `sum` and `avg` of `int2`, `int4` and `int8` (summed in
 128 bits); `min` and `max` of any type with a sort operator, under the column's collation. The
 `WHERE` is whatever the count pushdown answers, from any lion indexes of the table, multi-key
-columns included; a `HAVING` is applied by the node. Not taken: an expression (`sum(x + 1)`,
-`GROUP BY lower(t)`), a `GROUP BY` that mixes a stored column with one that is not stored or is
-stored by another index, `sum`/`avg` of `numeric` or `float`, an aggregate with `FILTER` or
-`ORDER BY`, a partitioned table, a parallel plan, and a hash table the planner expects to exceed
-`hash_mem` (the node does not spill).
+columns included; a `HAVING` is applied by the node. A partitioned table is counted a partition at
+a time, into one set of groups, when every live partition has a lion index that stores the columns.
+Not taken: an expression (`sum(x + 1)`, `GROUP BY lower(t)`), a `GROUP BY` that mixes a stored
+column with one that is not stored or is stored by another index, `sum`/`avg` of `numeric` or
+`float`, an aggregate with `FILTER` or `ORDER BY`, a parallel plan, and a hash table the planner
+expects to exceed `hash_mem` (the node does not spill).
 
 The planner prices the gather at `pg_lion.store_value_cost` per value and `pg_lion.store_page_cost`
 per store page read, beside the count and the hashing, in the competitor's units (DESIGN.md §39),
