@@ -18627,13 +18627,22 @@ charges - with the heap's pages and per-row fetches scaled by `1 - allvisfrac`, 
 scales its own ends for an index-only scan (a UNION is not scaled: the scan fetches every TID
 itself), plus the gather:
 
+    pages = max(1, store_pages / (W × nstored))
     G = rows × nret × store_value_cost
-      + windows × nret × max(1, store_pages / (W × nstored)) × store_page_cost
+      + windows × nret × (pages × store_page_cost + random_page_cost + (pages - 1) × seq_page_cost)
 
 with nret the returnable stored columns (all of them: the AM is not told which the query reads),
 W the heap's windows (pages / 64), store_pages from the meta page, and windows the windows the
 batches touch - Cardenas's count of `rows` over W, interpolated to the share the rows cover by the
-column's correlation squared, once per pass of a WALK. The gather is not the index's own cost: the
+column's correlation squared, once per pass of a WALK. The page costs are the tablespace's;
+`store_page_cost` (8 operator costs, 0.02) is the decoding of a store page and `store_value_cost`
+the value handed up, the CPU the custom nodes are charged for the same. Until 2026-10-03 those two
+were the whole price: lion's own constants, which the custom nodes are priced in and converted to
+their competitor's units at the margin (§39), but the index-only path is core's, priced beside
+core's index and bitmap scans with no conversion, and a store page was CPU while a heap page was
+I/O. Core's units for core's path: a window's chain of a column is one page found through the map
+and the rest read in order, each decoded ("As built: the price of the index-only scan", below).
+The gather is not the index's own cost: the
 bitmap scan of the same IndexPath is charged that and gathers nothing. It rides on the correlation
 handed to `cost_index()`, and what that cannot carry - nearly all of it on a mostly all-visible
 table, where both of `cost_index()`'s ends are near zero - is the remainder
@@ -18668,10 +18677,59 @@ that wants LionCount over an index with stored columns now competes with that pa
   rows a window - reads most of each window's store pages: measured warm (release build, 2M rows,
   52 a page), `k = 42` returning two INCLUDE columns beside a stored key read 7,443 buffers in
   2.8 ms against the plain index scan's 2,005 in 0.9 ms, while `tags && '{t7,t8}'` (20,000 rows)
-  read 6,030 in 8.2 ms against 10,014 in 10.1 ms. At `store_page_cost` (8 operator costs) a store
-  page is priced as CPU, a heap page as I/O, so the planner prefers the index-only scan in both;
-  the constants' fit is Phase C's.
+  read 6,030 in 8.2 ms against 10,014 in 10.1 ms. The price of those pages is core's since
+  2026-10-03 (below); the chain walk itself remains.
 - Parameterized index-only paths come only from core (every column they filter on returnable);
   the hook builds unparameterized ones.
 - EXPLAIN says nothing of the batches that went to the heap (absent pages, NOPIN sets); core's
   `Heap Fetches` counts only its own.
+
+### As built: the price of the index-only scan (2026-10-03)
+
+Measured on the quick benchmark's `fact` table at 5M rows (752 MB, 52 rows a page, 1,500 windows;
+release build, warm) with `lion (c200) INCLUDE (c20, c20k, id, payload)` (474 MB, 58,595 store
+pages: `id` 6,010, `c20k` 3,005, `c20` 1,503, `payload` 48,077): `sum(id), sum(length(payload))
+WHERE c200 = 17` (24,959 rows, 0.5%, scattered over every window) read 62,388 buffers through the
+index-only scan - the whole store and the map, and the same 62,388 whether the query read `id`,
+`payload` or both - in 64 ms warm and 412 ms cold, against the heap index scan's 21,974 buffers in
+21 ms warm and 157 ms cold; the planner priced the index-only scan at 2,826 and the heap scan at
+57,998 and took the index-only scan. At 5% (`c20 = 3`, 250,362 rows) the index-only scan reads the
+same store pages (57,159) in 125 ms and the heap scan 89,653 in 473 ms, and the index-only scan is
+the right choice.
+
+The gather of the index-only scan is now priced in core's units (`lion_ios_gather_cost()`): for
+every window the batches touch, every returnable column's chain at `random_page_cost` for its
+first page and `seq_page_cost` for each page after it, plus `store_page_cost` for the decoding of
+each, and a value of each column for every row at `store_value_cost`. The 0.5% scan prices at
+about 81,000 against the heap scan's 57,000, and the heap is taken: measured again with the OS
+cache dropped, the two are even cold (645 ms against 637 ms) and the heap scan is 2.9 times faster
+warm (27 ms against 78 ms). The same four columns for the 5% filter (`lion (c20) INCLUDE (c200,
+c20k, id, payload)`) price at 94,000 against the heap scan's 104,000: the store is taken, 1.5
+times faster cold (547 ms against 826 ms) and 3.5 times warm (152 ms against 529 ms). With four
+narrow stored columns instead (`lion (c200) INCLUDE (id, c2, c20, c20k) WITH (store_values = on)`, 121 MB,
+`sum(id), sum(c20k)` for the same filter) the index-only scan reads 21,000 pages against the heap
+scan's 22,000 and prices at 37,000: it is taken, and it is 4.5 times faster than the heap scan
+cold (136 ms against 608 ms, the OS cache dropped) and 1.8 times slower warm (41 ms against 23 ms),
+which is what core's page costs say of chains read in order against pages read at random. At 5%
+(`c20 = 3`, 250,362 rows, `lion (c20) INCLUDE (id, c2, c200, c20k)`) the index-only scan reads
+18,000 pages against the heap scan's 90,000 and is 37,000 against 104,000: taken, and 6.7 times
+faster cold (209 ms against 1,399 ms), 5 times warm (103 ms against 523 ms, the heap not fitting
+shared_buffers). `pg_lion.store_page_cost` and `pg_lion.store_value_cost` keep pricing the custom
+nodes' gathers as before, in lion's units under §39's conversion, where the measured times have
+shown no mispick: LionCount's gather reads only the columns it needs (6,010 pages for `sum(id)`,
+13.9 ms against the heap's 20.8 ms at 0.5%; 47,446 for `count(DISTINCT payload)`, 53 ms against
+the heap's 120 ms), and its competitors pay their sorts and hashing. What the index-only scan
+still does - gather every returnable column, walk a window's chain from its head, once per pass
+of a WALK - is unchanged, and priced for. On the small tables of
+`test/sql/store_ios.sql` the heap now wins some of the scans the file exercises, and no setting
+puts the index-only scan of a lion index ahead of the plain scan of the same index
+(`enable_indexscan = off` takes both away; `store_page_cost = 0`, which the file used, no longer
+touches it). The section on a stored key keeps the heap scans out (`enable_seqscan`,
+`enable_bitmapscan`), which is enough: with the key stored, core builds the index-only path and no
+plain one beside it, so a WALK of five entries over the five windows of 287 pages is still the
+index-only scan. The ABSENT section's six rows on nine pages were a plain scan, so its table was
+reshaped until the index-only scan is the planner's own choice: the short rows spread ten to a
+page by a column the heap neither compresses nor toasts, a key of fifty rows scattered over as
+many pages, four of them on the ABSENT pages. A section of its own shows the choice on a table of
+200,000 rows: the heap for a few hundred rows scattered over every window, the store for a tenth
+of the table.
