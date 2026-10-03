@@ -1820,7 +1820,20 @@ standby_index_only() {
 			WITH (store_values = true);
 		CREATE INDEX lion_ios_tags ON lion_ios USING lion (tags) INCLUDE (v, w);
 	SQL
-	psql_p -c "VACUUM (ANALYZE) lion_ios" >>"$RUNLOG" 2>&1
+	# The index-only scans are planned - and read from the store rather than
+	# the heap - only over heap pages the visibility map calls all-visible,
+	# and the primary's VACUUM can set that only once the standby's feedback
+	# xmin (hot_standby_feedback is on here) has moved past the fixture's
+	# INSERT, which it does a status interval after replaying it.  So: let the
+	# standby catch up, then VACUUM until pg_class says every page is.
+	wait_catchup
+	n=0
+	until [ "$(psql_p -tAc "select relallvisible = relpages and relpages > 0 from pg_class where relname = 'lion_ios'")" = t ]; do
+		psql_p -c "VACUUM (ANALYZE) lion_ios" >>"$RUNLOG" 2>&1
+		n=$((n + 1))
+		[ "$n" -le 30 ] || die "standby_index_only: 30 VACUUMs could not mark every page of lion_ios all-visible"
+		nap 0.5
+	done
 	wait_catchup
 
 	for n in "${!queries[@]}"; do
