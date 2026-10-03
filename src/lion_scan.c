@@ -2667,7 +2667,8 @@ struct LionSource
 	 * Does every container the stream yields come with the §9 pin on the
 	 * page it was read from (lion_source_pinned())?  SETS: decided when the
 	 * source is built; LIST: per batch; a WALK always, a WINDOW and a UNION
-	 * never.  Only an index-only scan asks (lion_source_interlocked()).
+	 * never.  An index-only scan asks, and LionStoreScan of each piece it
+	 * gathers (lion_source_interlocked()).
 	 */
 	bool		pinned;
 
@@ -4054,12 +4055,14 @@ lion_source_close(LionSource *src)
 /*
  * Does every container the source yields still have the §9 pin behind it
  * (DESIGN.md §9, §29.5)?  The question an index-only scan asks of each batch
- * before it lets the executor take a TID past the heap: SETS and LIST say
+ * before it lets the executor take a TID past the heap, and LionStoreScan of
+ * each piece before it takes a row's values from the window store
+ * (lion_ordered.c): SETS and LIST say
  * through lion_source_pinned(), of the tree and of each batch's tree; a WALK
  * always has it, its walked entry's pin; a UNION and a WINDOW copy containers
  * out of many pages and pin none of them.  NONE yields nothing.
  */
-static bool
+bool
 lion_source_interlocked(LionSource *src)
 {
 	switch (src->shape)

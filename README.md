@@ -495,12 +495,14 @@ CREATE INDEX events_country_lion ON events USING lion (country) INCLUDE (user_id
 CREATE INDEX events_type_lion ON events USING lion (event_type) WITH (store_values = true);
 ```
 
-**Four readers use it**, each described below: index-only scans return stored columns
+**Five readers use it**, each described below: index-only scans return stored columns
 (`amcanreturn`), including under an array or tsvector predicate, which no other PostgreSQL index
-can do; `LionCount` answers `count(DISTINCT c)`, `GROUP BY c` and `sum`/`avg`/`min`/`max`/`count`
-of a stored column under a lion `WHERE`; `LionOrdered` answers `ORDER BY c LIMIT n` under a lion
-`WHERE` without a Sort; and `lion_index_stored()` reads it for diagnostics. A stored column is
-never a filter: a `WHERE` on an INCLUDE column goes to the heap or another index.
+can do; `LionStoreScan` returns the rows an AND/OR of lion indexes selects with columns stored by
+any of the table's lion indexes, each from whichever stores it; `LionCount` answers
+`count(DISTINCT c)`, `GROUP BY c` and `sum`/`avg`/`min`/`max`/`count` of a stored column under a
+lion `WHERE`; `LionOrdered` answers `ORDER BY c LIMIT n` under a lion `WHERE` without a Sort; and
+`lion_index_stored()` reads it for diagnostics. A stored column is never a lion filter: a `WHERE`
+on an INCLUDE column goes to the heap, another index, or the filter of a scan that gathers it.
 
 | option | values | default | what it does |
 | --- | --- | --- | --- |
@@ -543,6 +545,62 @@ store holds for a TID, as `text[]` in the order of the stored columns - the stor
 and then the INCLUDE columns - with NULL for a NULL, for a slot no row has written or VACUUM has
 cleared, and for a heap page left to the heap; it reads the store, not the heap, so it answers for
 dead and never-committed rows too.
+
+### Rows from the store: `LionStoreScan`
+
+Under a Lion `WHERE`, a query whose every column - the ones it returns and the ones a leftover
+filter reads - is stored by some Lion index of the table is answered by `LionStoreScan` (DESIGN.md
+§40, "As built: the row gather"): the rows the `WHERE`'s indexes select, with their values taken
+from the stores, and the heap read only where the store cannot answer. The columns may come from
+different indexes: an INCLUDE column of any of them, or a key column of one built with
+`store_values = true`. With one index a column, each storing its key and `id`:
+
+```sql
+CREATE INDEX fact_c20  ON fact USING lion (c20)  INCLUDE (id) WITH (store_values = true);
+CREATE INDEX fact_c200 ON fact USING lion (c200) INCLUDE (id) WITH (store_values = true);
+SELECT id, c20, c200 FROM fact WHERE c200 IN (17, 18, 19) AND c20 IN (3, 4, 5);
+```
+```
+ Custom Scan (LionStoreScan) on fact
+   Lion Cond: ((c200 = ANY ('{17,18,19}'::integer[])) AND (c20 = ANY ('{3,4,5}'::integer[])))
+   Lion Indexes: fact_c200, fact_c20
+   Store: id, c200 (fact_c200)
+   Store: c20 (fact_c20)
+```
+
+It builds the `WHERE`'s set a 64-page window at a time, as `LionOrdered` does, and returns each
+window's rows in TID order: a row on a heap page the visibility map calls all-visible with the
+stores' values, read while the index page it came from is still pinned (the interlock of the count,
+DESIGN.md §9); a row on any other page, on a page a store left to the heap, or that the set holds
+only as a candidate, from the heap, which also settles its visibility. `EXPLAIN` names the indexes
+of the set and of the stores and has a `Store:` line for each index the columns come from; `EXPLAIN
+ANALYZE` adds `Store Rows` (rows the stores answered for), `Store Rows From Heap`, `Store Pages
+Absent`, `Heap Fetches` and the set's containers.
+
+What it takes:
+
+- a `WHERE` the table's Lion indexes answer exactly - ANDs and ORs of their clauses, none lossy;
+  an OR's arms each an equality, `IS NULL` or an IN list of at most `max(32, work_mem / 32 kB)`
+  values, which the index reads in one pass (a range, or a longer list, under an OR stays a bitmap
+  scan) - plus, optionally, a filter on stored columns;
+- every column the scan returns and the filter reads a plain column stored by a Lion index that
+  is not partial, or whose predicate the query implies; no whole row, no system column, no `FOR
+  UPDATE`, and no `UPDATE` or `DELETE` of the table;
+- not parallel, not parameterized; a partitioned table is scanned partition by partition.
+
+The planner prices it at `pg_lion.pushdown_margin` against the table's own scans: the set, a
+value a column for each row on an all-visible page (`pg_lion.store_value_cost`), the store pages
+each column reads in each window the rows lie in - priced as I/O as a heap page is, so that a few
+rows scattered over many windows, whose gather would read many more store pages than the heap
+pages an index scan reads, keep the index scan - and a heap visit for the rest.
+`pg_lion.enable_store_scan = off` turns it off. On the quick benchmark's table of 5,000,000 rows
+with the four indexes `(c2)`, `(c20)`, `(c200)` and `(c20k)`, each `INCLUDE (id)` under
+`store_values` (release build, warm), `SELECT id, c2, c20, c200, c20k ... WHERE c200 IN (17, 18,
+19) AND c20 IN (3, 4, 5)` (11,214 rows) took 39 ms against 65 ms for the bitmap heap scan it
+replaces, `WHERE c200 IN (17, 18, 19)` (75,106 rows) 66 ms as the index scan did, and results of a
+few thousand rows stayed index scans. Between about 7,500 and 50,000 rows of that table, all five
+columns returned, the node is chosen over Lion's plain index scan and runs up to 2.8 times slower
+(DESIGN.md §40, "As built: the row gather", "Measured").
 
 ### `ORDER BY` a stored column `LIMIT n`
 
@@ -784,6 +842,10 @@ working around a bad choice:
 - `pg_lion.enable_ordered_store`: let `LionOrdered` answer `ORDER BY` stored columns `LIMIT n` from
   a Lion index's window store (DESIGN.md §40; "`ORDER BY` a stored column `LIMIT n`" above). Off,
   only its walks are offered.
+- `pg_lion.enable_store_scan`: offer `LionStoreScan`, which returns the rows a Lion `WHERE`
+  selects with every column taken from the window stores of the table's Lion indexes (DESIGN.md
+  §40, "As built: the row gather"; "Rows from the store" above). Off, those queries are core's
+  index, bitmap or sequential scans.
 - `pg_lion.enable_decoded_walk`: count a `GROUP BY` of several Lion-indexed columns by decoding,
   at each range of 64 heap blocks, which value of each column every row has (DESIGN.md §34): three
   or more columns, and two where that is cheaper than the nested loop over their entries. Off, a

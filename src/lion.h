@@ -1723,6 +1723,10 @@ extern void lioncostestimate(struct PlannerInfo *root, struct IndexPath *path, d
 							double *indexCorrelation, double *indexPages);
 /* an index-only path answered with no recheck (lion_amcost.c, §40) */
 extern bool lion_index_only_exact(struct PlannerInfo *root, struct IndexPath *path);
+/* a plain source's exactness, order and passes, for LionStoreScan (§40) */
+extern double lion_plain_scan_passes(struct PlannerInfo *root,
+									 struct IndexPath *path, bool *sorted,
+									 bool *exact);
 extern bool lion_enable_plain_scan;	/* GUC pg_lion.enable_plain_scan */
 
 /*

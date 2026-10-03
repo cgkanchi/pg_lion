@@ -24,6 +24,13 @@
  *		of them in a bounded heap, and fetches only those, in order - the
  *		store order of DESIGN.md §40 ("The custom shapes", 2).
  *
+ *		LionStoreScan, beside it, has no order at all: it returns every row
+ *		the same set keeps, with every column the query reads gathered from
+ *		the window stores of the relation's lion indexes - window by window,
+ *		under the same pin - and reads the heap only for the rows the store
+ *		cannot answer for (DESIGN.md §40, "As built: the row gather").  It
+ *		shares the set's machinery, and this file, with LionOrdered.
+ *
  * Nothing here re-implements what core already decides.  The ORDERED side is
  * one of core's own ordered IndexPaths from the relation's path list, so its
  * pathkeys, direction and index quals are core's.  The LION side is one of
@@ -42,6 +49,7 @@
 #include <math.h>
 
 #include "access/genam.h"
+#include "access/htup_details.h"
 #include "access/relscan.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -49,6 +57,7 @@
 #include "access/tableam_indexscan.h"
 #endif
 #include "access/stratnum.h"
+#include "access/sysattr.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
 #include "catalog/pg_am.h"
@@ -72,6 +81,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
 #include "pgstat.h"
@@ -106,6 +116,12 @@ bool		lion_enable_lazy_set = true;
  * two, and for the tests that show both plans of one query.
  */
 static bool lion_enable_ordered_store = true;
+
+/*
+ * LionStoreScan (DESIGN.md §40, "As built: the row gather").  Off, no path of
+ * it is offered: the query gets core's scans and lion's own, as before.
+ */
+static bool lion_enable_store_scan = true;
 static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 
 /*
@@ -218,6 +234,50 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 #define LO_FLAG_LOSSY		0x0001	/* a lion index clause was lossy */
 #define LO_FLAG_LIONWALK	0x0002	/* the order is a lion column's walk */
 #define LO_FLAG_STORE		0x0004	/* the order is the store's (§40) */
+
+/*
+ * LionStoreScan's custom_private (DESIGN.md §40, "As built: the row gather")
+ * is positional too, behind a marker of its own - it is another node, with
+ * another layout, not a shape of LionOrdered's:
+ *
+ *	LS_PRIV_SHAPE	IntList (LS_PRIV_MAGIC, LS_PRIV_NMEMBERS)
+ *	LS_PRIV_INTS	IntList (flags): LO_FLAG_LOSSY, which no plan sets today -
+ *					a lossy lion clause is declined - but which the executor
+ *					honours as LionOrdered's does, every piece rechecked
+ *	LS_PRIV_TREE	the lion tree, as LO_PRIV_TREE; an AND streams its first
+ *					LEAF child, its DRIVER, and holds the others as a set
+ *	LS_PRIV_LEAVES	OidList: each leaf's lion index, in preorder
+ *	LS_PRIV_SOURCES	OidList: the lion indexes whose window stores the columns
+ *					are gathered from, each once, in the order of the first
+ *					column each gives
+ *	LS_PRIV_ATTNOS	List of IntList, one per source: the table's columns it
+ *					gives, ascending
+ *	LS_PRIV_COLS	List of IntList, one per source: the index column, 1-based,
+ *					that stores each of them, aligned with LS_PRIV_ATTNOS
+ *
+ * and custom_exprs holds two lists:
+ *
+ *	LS_EXPR_LIONQUALS	every leaf's index quals, as LO_EXPR_LIONQUALS
+ *	LS_EXPR_LIONQUAL	the lion side's ORIGINAL qual (implicit AND), the
+ *						recheck of a heap row of an inexact piece
+ *
+ * The plan's own targetlist and qual read only columns it gathers: the scan
+ * tuple of a row the store gives holds those and NULL for every other column,
+ * which ls_begin() checks the plan for.
+ */
+#define LS_PRIV_MAGIC		0x4c535343	/* "LSSC" */
+#define LS_PRIV_SHAPE		0
+#define LS_PRIV_INTS		1
+#define LS_PRIV_TREE		2
+#define LS_PRIV_LEAVES		3
+#define LS_PRIV_SOURCES		4
+#define LS_PRIV_ATTNOS		5
+#define LS_PRIV_COLS		6
+#define LS_PRIV_NMEMBERS	7
+
+#define LS_EXPR_LIONQUALS	0
+#define LS_EXPR_LIONQUAL	1
+#define LS_EXPR_NLISTS		2
 
 /* ---------------------------------------------------------------------
  * The TID set
@@ -478,6 +538,47 @@ typedef struct LionOrderedState
 	MemoryContext rowcxt;		/* one heap row's values */
 	Buffer		vmbuf;
 
+	/*
+	 * ... or LionStoreScan (DESIGN.md §40, "As built: the row gather"): no
+	 * order, every row of the set returned, with the ngcols columns the plan
+	 * reads gathered from the stores of nsrc lion indexes - gcols
+	 * srcfirst[i] .. srcfirst[i + 1] - 1 from source i, into readers[],
+	 * gvals[] and gnulls[] above - a piece of the set at a time while the
+	 * page it came from is pinned (struct LsCursor), and every other row
+	 * fetched into heapslot and copied into the virtual scan slot.
+	 */
+	bool		gscan;
+	int			nsrc;
+	Oid		   *srcoids;		/* [nsrc] */
+	Relation   *srcidx;			/* [nsrc] */
+	int		   *srcfirst;		/* [nsrc + 1] */
+	int			ngcols;
+	AttrNumber *gattnos;		/* [ngcols] the table's column */
+	AttrNumber *gindexcols;		/* [ngcols] its source's index column */
+	int			natts;			/* the table's columns */
+	int			maxatt;			/* the most of a heap row the plan reads */
+	TupleTableSlot *heapslot;
+	struct LsCursor *cur;		/* the set, while this scan streams it */
+	bool		gstarted;		/* this scan's cursor is open */
+	bool		gdone;			/* ... and has handed out its last row */
+	BlockNumber nblocks;		/* the heap's, when the scan started */
+	uint16	   *pinlos;			/* [LION_CONTAINER_RANGE] scratch */
+
+	/* the piece being returned: los[ppos .. pn - 1] are left */
+	uint32		pckey;
+	uint32		pn;
+	uint32		ppos;
+	uint32		pnav;			/* avlos[] gathered ... */
+	uint32		pavpos;			/* ... the next of them */
+	uint64		pserved;		/* heap pages whose rows the store gave */
+	const LionContainer *pall;	/* every member of the piece */
+	const LionContainer *psure; /* its certain ones: == pall, NULL, or some */
+
+	/* EXPLAIN ANALYZE */
+	uint64		gstorerows;		/* rows the store gave */
+	uint64		gheaprows;		/* rows the heap gave */
+	uint64		gabsent;		/* all-visible heap pages the store left */
+
 	/* EXPLAIN ANALYZE */
 	uint64		walked;
 	uint64		hits;
@@ -522,6 +623,37 @@ static const CustomExecMethods lo_exec_methods = {
 	.EndCustomScan = lo_end,
 	.ReScanCustomScan = lo_rescan,
 	.ExplainCustomScan = lo_explain,
+};
+
+/* LionStoreScan (DESIGN.md §40, "As built: the row gather") */
+static Plan *ls_plan_path(PlannerInfo *root, RelOptInfo *rel,
+						  CustomPath *best_path, List *tlist,
+						  List *clauses, List *custom_plans);
+static Node *ls_create_state(CustomScan *cscan);
+static void ls_begin(CustomScanState *node, EState *estate, int eflags);
+static TupleTableSlot *ls_exec(CustomScanState *node);
+static void ls_end(CustomScanState *node);
+static void ls_rescan(CustomScanState *node);
+static void ls_explain(CustomScanState *node, List *ancestors,
+					   ExplainState *es);
+
+static const CustomPathMethods ls_path_methods = {
+	.CustomName = "LionStoreScan",
+	.PlanCustomPath = ls_plan_path,
+};
+
+static const CustomScanMethods ls_scan_methods = {
+	.CustomName = "LionStoreScan",
+	.CreateCustomScanState = ls_create_state,
+};
+
+static const CustomExecMethods ls_exec_methods = {
+	.CustomName = "LionStoreScan",
+	.BeginCustomScan = ls_begin,
+	.ExecCustomScan = ls_exec,
+	.EndCustomScan = ls_end,
+	.ReScanCustomScan = ls_rescan,
+	.ExplainCustomScan = ls_explain,
 };
 
 /* ---------------------------------------------------------------------
@@ -1894,8 +2026,9 @@ lo_cost_store(PlannerInfo *root, RelOptInfo *rel, Path *lion, LoStore *s,
 static double lo_margin = 1.0;
 
 /*
- * One LionOrdered path, offered to add_path() (DESIGN.md §30.2, step 3) at
- * pg_lion.pushdown_margin (§39): its price divided by the margin, startup
+ * One LionOrdered path - or a LionStoreScan one, by its methods - offered
+ * to add_path() (DESIGN.md §30.2, step 3) at pg_lion.pushdown_margin
+ * (§39): its price divided by the margin, startup
  * and total alike, so that whatever it is compared with - the btree scan it
  * walks, a Sort over another path, a LIMIT's fraction of either - it is
  * taken only by that margin.  Its competitors are the relation's scans, which
@@ -1903,7 +2036,7 @@ static double lo_margin = 1.0;
  */
 static void
 lo_add_path(RelOptInfo *rel, List *pathkeys, List *priv, double rows,
-			Cost startup, Cost total)
+			Cost startup, Cost total, const CustomPathMethods *methods)
 {
 	CustomPath *cp = makeNode(CustomPath);
 
@@ -1921,8 +2054,692 @@ lo_add_path(RelOptInfo *rel, List *pathkeys, List *priv, double rows,
 	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cp->custom_paths = NIL;
 	cp->custom_private = priv;
-	cp->methods = &lo_path_methods;
+	cp->methods = methods;
 	add_path(rel, &cp->path);
+}
+
+/* ---------------------------------------------------------------------
+ * LionStoreScan's paths (DESIGN.md §40, "As built: the row gather")
+ * --------------------------------------------------------------------- */
+
+/*
+ * The columns of rel the scan must return: every Var of its target, a
+ * placeholder's contents included, each a plain column of the table - or
+ * NULL when the node cannot be the scan: a whole-row or system column (a row
+ * mark's ctid among them: the rows of an UPDATE, a DELETE, a FOR UPDATE and
+ * an EvalPlanQual recheck are never the node's), or no column at all, which
+ * leaves nothing to gather - a count is LionCount's.
+ */
+static Bitmapset *
+ls_target_attnos(PlannerInfo *root, RelOptInfo *rel)
+{
+	Bitmapset  *attnos = NULL;
+	List	   *vars;
+	ListCell   *lc;
+
+	if (get_plan_rowmark(root->rowMarks, rel->relid) != NULL)
+		return NULL;
+	vars = pull_var_clause((Node *) rel->reltarget->exprs,
+						   PVC_RECURSE_PLACEHOLDERS);
+	foreach(lc, vars)
+	{
+		Var		   *var = (Var *) lfirst(lc);
+
+		if (!IsA(var, Var) || var->varno != (int) rel->relid ||
+			var->varlevelsup != 0 || var->varattno <= 0)
+			return NULL;
+		attnos = bms_add_member(attnos, var->varattno);
+	}
+	list_free(vars);
+	return attnos;
+}
+
+/* Add the columns clauses read to *attnos; false for a whole-row or system one. */
+static bool
+ls_clause_attnos(List *rinfos, Index relid, Bitmapset **attnos)
+{
+	Bitmapset  *cols = NULL;
+	int			x = -1;
+
+	pull_varattnos((Node *) extract_actual_clauses(rinfos, false), relid,
+				   &cols);
+	while ((x = bms_next_member(cols, x)) >= 0)
+	{
+		AttrNumber	attno = (AttrNumber) (x + FirstLowInvalidHeapAttributeNumber);
+
+		if (attno <= 0)
+			return false;
+		*attnos = bms_add_member(*attnos, attno);
+	}
+	return true;
+}
+
+/*
+ * A column of rel that a lion index's window store holds as the column's own
+ * datum - LionStoreCol.returnable, in the table's type - and the store pages
+ * one window of it is (ls_store_cols()).
+ */
+typedef struct LsStoreCol
+{
+	IndexOptInfo *index;
+	AttrNumber	attno;			/* the table's column */
+	int			indexcol;		/* the index column storing it, 1-based */
+	double		pagesper;		/* store pages a window of it */
+} LsStoreCol;
+
+/* The bytes of a store page its sub-arrays can fill, about (lion_store_fmt.h). */
+#define LS_STORE_PAGE_BYTES		((double) (BLCKSZ - 1024))
+
+/*
+ * The bytes one window of stored column col takes as the store writes it
+ * (lion_store_choose_mode(), DESIGN.md §40, "DICT or RAW"): a dictionary of
+ * the window's distinct values and a code a row, or a RAW slot a row where
+ * the column has one and the dictionary would not pay.  rows is the window's
+ * rows, ndistinct the column's values, of which that many rows drawn at
+ * random meet ndistinct (1 - e^(-rows / ndistinct)); width a value's bytes.
+ */
+static double
+ls_window_bytes(const LionStoreCol *col, double rows, double ndistinct,
+				double width)
+{
+	double		d;
+	double		dict = -1.0;
+	double		raw = -1.0;
+	int			codebits;
+
+	ndistinct = Max(ndistinct, 1.0);
+	d = Max(1.0, Min(rows, ndistinct * (1.0 - exp(-rows / ndistinct))));
+	codebits = lion_store_dict_width((uint32) Min(d, (double) PG_UINT32_MAX));
+	if (codebits > 0)
+		dict = d * (width + (col->typlen > 0 ? 0.0 : 2.0)) +
+			rows * (double) codebits / 8.0;
+	if (col->rawwidth > 0)
+		raw = rows * (double) col->rawwidth + rows / 8.0;
+	if (dict < 0.0)
+		return (raw < 0.0) ? rows * width : raw;
+	if (raw < 0.0)
+		return dict;
+	return Min(dict, raw);
+}
+
+/* Column attno's distinct values, as the planner's statistics have them. */
+static double
+ls_ndistinct(PlannerInfo *root, RelOptInfo *rel, Oid relid, AttrNumber attno)
+{
+	VariableStatData vardata;
+	Oid			type;
+	int32		typmod;
+	Oid			coll;
+	bool		isdefault;
+	double		nd;
+
+	get_atttypetypmodcoll(relid, attno, &type, &typmod, &coll);
+	examine_variable(root,
+					 (Node *) makeVar(rel->relid, attno, type, typmod, coll, 0),
+					 0, &vardata);
+	nd = get_variable_numdistinct(&vardata, &isdefault);
+	ReleaseVariableStats(vardata);
+	return Max(nd, 1.0);
+}
+
+/*
+ * Whether idx can serve the scan's rows at all - it is not partial, or the
+ * query implies its predicate - and has a column, key or INCLUDE, among
+ * attnos.  The catalog's word only, before any page of the index is read:
+ * what the index stores, and how, takes its state and its meta page
+ * (ls_store_cols()).
+ */
+static bool
+ls_index_covers_any(IndexOptInfo *idx, Bitmapset *attnos)
+{
+	int			c;
+
+	if (idx->indpred != NIL && !idx->predOK)
+		return false;
+	for (c = 0; c < idx->ncolumns; c++)
+		if (idx->indexkeys[c] > 0 &&
+			bms_is_member(idx->indexkeys[c], attnos))
+			return true;
+	return false;
+}
+
+/*
+ * Every column of rel some lion index stores so that the scan can return it
+ * (LsStoreCol): a plain column of the table, stored as its own datum in its
+ * own type, by an index that has a slot for every row the query can return -
+ * one that is not partial, or whose predicate the query implies.  Each with
+ * the store pages a window of it is: the meta record counts the index's store
+ * pages, not each column's, so they are shared among its stored columns by
+ * what a window of each takes (ls_window_bytes()), and one at least - a
+ * column's chain starts on a page of its own in every window.
+ */
+static List *
+ls_store_cols(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
+			  List *lionidx, Bitmapset *want)
+{
+	List	   *result = NIL;
+	double		pages = Max((double) rel->pages, 1.0);
+	double		windows = Max(1.0, ceil(pages / LION_BLOCKS_PER_CONTAINER));
+	double		perwindow = Max(1.0, Max(rel->tuples, 1.0) / windows);
+	ListCell   *lc;
+
+	foreach(lc, lionidx)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		Relation	indexrel;
+		LionIndexState *ix;
+		LionMetaPageData meta;
+		LionMetaStore ms;
+		double	   *modeled;
+		double		sum = 0.0;
+		double		scale = 1.0;
+		int			o;
+		int			c;
+
+		if (!ls_index_covers_any(idx, want))
+			continue;			/* nothing the scan could take from it */
+		indexrel = index_open(idx->indexoid, AccessShareLock);
+		ix = lion_get_index_state(indexrel);
+		if (ix->nstored == 0)
+		{
+			index_close(indexrel, AccessShareLock);
+			continue;
+		}
+
+		/* the count is kept exact on the meta page, not in the cached state */
+		lion_read_meta(indexrel, &meta);
+		lion_read_meta_store(indexrel, &meta, &ms);
+		modeled = (double *) palloc(sizeof(double) * ix->nstored);
+		for (o = 0; o < ix->nstored; o++)
+		{
+			const LionStoreCol *col = &ix->stored[o];
+			AttrNumber	hattno = (col->attno >= 1 && col->attno <= idx->ncolumns) ?
+				idx->indexkeys[col->attno - 1] : 0;
+			double		nd = DEFAULT_NUM_DISTINCT;
+			double		width = (col->typlen > 0) ? (double) col->typlen : 32.0;
+
+			if (hattno > 0)
+			{
+				nd = ls_ndistinct(root, rel, rte->relid, hattno);
+				if (col->typlen <= 0 && hattno >= rel->min_attr &&
+					hattno <= rel->max_attr &&
+					rel->attr_widths[hattno - rel->min_attr] > 0)
+					width = (double) rel->attr_widths[hattno - rel->min_attr];
+			}
+			modeled[o] = Max(1.0, ls_window_bytes(col, perwindow, nd, width) /
+							 LS_STORE_PAGE_BYTES);
+			sum += modeled[o];
+		}
+		if (ms.store_pages > 0 && sum > 0.0)
+			scale = (double) ms.store_pages / windows / sum;
+
+		for (c = 0; c < idx->ncolumns; c++)
+		{
+			AttrNumber	hattno = idx->indexkeys[c];
+			LsStoreCol *sc;
+			int			ord;
+
+			if (hattno <= 0)
+				continue;		/* an expression's value is not the column */
+			ord = lion_store_ordinal(ix, (AttrNumber) (c + 1));
+			if (ord < 0 || !ix->stored[ord].returnable ||
+				ix->stored[ord].typid != get_atttype(rte->relid, hattno))
+				continue;
+			sc = (LsStoreCol *) palloc(sizeof(LsStoreCol));
+			sc->index = idx;
+			sc->attno = hattno;
+			sc->indexcol = c + 1;
+			sc->pagesper = Max(1.0, modeled[ord] * scale);
+			result = lappend(result, sc);
+		}
+		pfree(modeled);
+		index_close(indexrel, AccessShareLock);
+	}
+	return result;
+}
+
+/*
+ * The store each column of attnos is gathered from: of the lion indexes that
+ * store it (storecols), the one with the fewest pages a window of it, and on
+ * a tie - pages within LS_PAGES_TIE of each other, which is all the estimate
+ * can tell apart - one an earlier column is gathered from already, fewer
+ * indexes being fewer chains to find, then one the lion side reads
+ * (lion_count_int.h: one pin is enough, any index's store will do, but
+ * EXPLAIN reads more easily so).  Returns the chosen LsStoreCols, in column
+ * order, or NIL when a column is stored nowhere.
+ */
+#define LS_PAGES_TIE	0.10
+
+static List *
+ls_choose_sources(List *storecols, Bitmapset *attnos, Path *lion)
+{
+	List	   *chosen = NIL;
+	List	   *used = NIL;
+	int			x = -1;
+
+	while ((x = bms_next_member(attnos, x)) >= 0)
+	{
+		LsStoreCol *best = NULL;
+		bool		bestused = false;
+		bool		bestreads = false;
+		ListCell   *lc;
+
+		foreach(lc, storecols)
+		{
+			LsStoreCol *sc = (LsStoreCol *) lfirst(lc);
+			bool		isused;
+			bool		reads;
+
+			if (sc->attno != (AttrNumber) x)
+				continue;
+			isused = list_member_ptr(used, sc->index);
+			reads = lo_path_reads(lion, sc->index->indexoid);
+			if (best != NULL)
+			{
+				if (fabs(sc->pagesper - best->pagesper) >
+					LS_PAGES_TIE * Max(sc->pagesper, best->pagesper))
+				{
+					if (sc->pagesper > best->pagesper)
+						continue;
+				}
+				else if (isused != bestused)
+				{
+					if (!isused)
+						continue;
+				}
+				else if (!reads || bestreads)
+					continue;	/* no better: the first one stays */
+			}
+			best = sc;
+			bestused = isused;
+			bestreads = reads;
+		}
+		if (best == NULL)
+			return NIL;
+		chosen = lappend(chosen, best);
+		used = list_append_unique_ptr(used, best->index);
+	}
+	return chosen;
+}
+
+/* The bytes a lion access's set takes, as §30.3 estimates them (lo_cost()). */
+static double
+ls_set_bytes(Path *path, double tuples, double pages)
+{
+	Cost		cost;
+	Selectivity sel;
+	double		members;
+	double		ncont;
+
+	cost_bitmap_tree_node(path, &cost, &sel);
+	members = clamp_row_est(sel * tuples);
+	ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
+	return ncont * (LION_CONTAINER_HDRSZ + LO_ENTRY_BYTES) +
+		Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES);
+}
+
+/* Does every leaf of path answer its quals exactly (lion_plain_scan_passes())? */
+static bool
+ls_tree_exact(PlannerInfo *root, Path *path)
+{
+	List	   *arms;
+	ListCell   *lc;
+
+	if (IsA(path, IndexPath))
+	{
+		bool		sorted;
+		bool		exact;
+
+		(void) lion_plain_scan_passes(root, (IndexPath *) path, &sorted,
+									  &exact);
+		return exact;
+	}
+	arms = IsA(path, BitmapAndPath) ? ((BitmapAndPath *) path)->bitmapquals :
+		castNode(BitmapOrPath, path)->bitmapquals;
+	foreach(lc, arms)
+		if (!ls_tree_exact(root, (Path *) lfirst(lc)))
+			return false;
+	return true;
+}
+
+/*
+ * Can LionStoreScan stream lion access path, and how (DESIGN.md §40, "As
+ * built: the row gather")?
+ *
+ *	- every leaf answers its quals exactly (lion_plain_scan_passes()): a row
+ *	  the store gives is a row the set holds, and nothing rechecks it;
+ *	- an AND streams its first LEAF child, its DRIVER, as lo_store_node()
+ *	  does, and builds the others into one set as §30.4 builds one, which
+ *	  masks the driver's pieces and has to fit in hash_mem with the others
+ *	  (*maskbytes sums them): a set that degraded would leave every row of
+ *	  its keys to the heap and the recheck;
+ *	- an OR merges its arms' pieces by container key, a row two of them hold
+ *	  returned once, so each arm must hand out ONE ascending run of keys - a
+ *	  leaf of a SETS source, or an AND whose driver is one.  An arm that would
+ *	  not, a range or a long list, could only be built into a set without its
+ *	  pins, and every row of it read from the heap: such an OR is declined.
+ *
+ * *passes is how many runs over the heap's windows the stream makes - a
+ * WALK's entries, a long list's batches - and *sorted whether it is one.
+ */
+static bool
+ls_tree_ok(PlannerInfo *root, Path *path, double tuples, double pages,
+		   double *passes, bool *sorted, double *maskbytes)
+{
+	ListCell   *lc;
+
+	if (IsA(path, IndexPath))
+	{
+		bool		exact;
+
+		*passes = lion_plain_scan_passes(root, (IndexPath *) path, sorted,
+										 &exact);
+		return exact;
+	}
+	if (IsA(path, BitmapAndPath))
+	{
+		List	   *arms = ((BitmapAndPath *) path)->bitmapquals;
+		Path	   *driver = NULL;
+
+		foreach(lc, arms)
+		{
+			if (IsA(lfirst(lc), IndexPath))
+			{
+				driver = (Path *) lfirst(lc);
+				break;
+			}
+		}
+		if (driver == NULL)
+			driver = (Path *) linitial(arms);
+		foreach(lc, arms)
+		{
+			Path	   *arm = (Path *) lfirst(lc);
+
+			if (arm == driver)
+				continue;
+			if (!ls_tree_exact(root, arm))
+				return false;
+			*maskbytes += ls_set_bytes(arm, tuples, pages);
+		}
+		return ls_tree_ok(root, driver, tuples, pages, passes, sorted,
+						  maskbytes);
+	}
+	if (IsA(path, BitmapOrPath))
+	{
+		foreach(lc, ((BitmapOrPath *) path)->bitmapquals)
+		{
+			double		p;
+			bool		s;
+
+			if (!ls_tree_ok(root, (Path *) lfirst(lc), tuples, pages, &p, &s,
+							maskbytes) || !s)
+				return false;
+		}
+		*passes = 1.0;
+		*sorted = true;
+		return true;
+	}
+	return false;
+}
+
+/*
+ * What a page of a window store costs LionStoreScan to read - before
+ * LION_STORE_PAGE_COST's decoding - when `pages` of the `total` pages of one
+ * column's store are read: as cost_bitmap_heap_scan() prices a heap page,
+ * random_page_cost for a page among few, moving to seq_page_cost by the root
+ * of the share read, the index's tablespace's costs.
+ *
+ * Not argued down for residency as the count's index pages are (§39,
+ * "Resident index pages"; lion_index_page_cost()), nor as lion's recheck
+ * prices the heap pages it reads (lion_heap_page_cost()).  Those compete with
+ * plans that are charged no page for the same work - a BitmapAnd's CPU per
+ * TID - or that read the same heap pages; this node's store pages stand in
+ * for the heap pages of the scans it competes with, which core charges as
+ * I/O whatever the cache holds, and a store page takes about the time a heap
+ * page does to reach (a buffer either way: the release build measured a
+ * page of a gather at a few microseconds, as a bitmap heap scan's page).  A
+ * store page priced as a buffer hit against a heap page priced as a read
+ * put the node within an eighth of an index scan's price where it read six
+ * times the pages in four times the time: a few rows' gather reads a chain
+ * in each of their windows for each column, where an index scan reads a
+ * heap page a row.
+ */
+static Cost
+ls_store_page_price(IndexOptInfo *index, double pages, double total)
+{
+	double		spc_random;
+	double		spc_seq;
+	double		share;
+
+	if (pages <= 0.0)
+		return 0.0;
+	get_tablespace_page_costs(index->reltablespace, &spc_random, &spc_seq);
+	share = Min(pages / Max(total, 1.0), 1.0);
+	return spc_random - (spc_random - spc_seq) * sqrt(share);
+}
+
+/*
+ * The price of LionStoreScan over lion access `lion` (DESIGN.md §40, "As
+ * built: the row gather"), gathering the columns `chosen` (LsStoreCol) and
+ * filtering by residual; rows is what it returns (lion_probe_rel_rows()) and
+ * passes the runs its stream makes over the heap's windows (ls_tree_ok()).
+ * As lo_cost_store() prices the store order's set and gather, without the
+ * ranking:
+ *
+ *	- start-up: the lion lookups, the AND's sets built among them;
+ *	- a container's work for each piece the stream hands out, the windows
+ *	  each run meets a member in (Cardenas's count, as the count's gather);
+ *	- for the members on all-visible pages - the share rel->allvisfrac says -
+ *	  LION_STORE_VALUE_COST a value of each column, and for each column the
+ *	  store pages a piece reads: a gather walks the column's chain of the
+ *	  window from its head to the page of its last member, which for m
+ *	  members spread over a chain of P pages is 1 + (P - 1) m / (m + 1) of
+ *	  them, each LION_STORE_PAGE_COST and its read (ls_store_page_price());
+ *	  and before them the page of the store's map that names the chain's
+ *	  head (lion_storemap_head()), read again by every gather - a buffer
+ *	  each, in the windows' order, so seq_page_cost: as many buffers as a
+ *	  chain of one page, and on a sparse result most of what the gather
+ *	  reads (five columns, a row or three a window: two of every five);
+ *	- the members on the other pages fetched from the heap, as §9 prices a
+ *	  recheck (a heap page's read, lion_heap_page_cost(), and
+ *	  LION_RECHECK_TID_COST a row);
+ *	- a tuple's work for every member, the filter's for each, and the
+ *	  target's for every row returned.
+ *
+ * Nothing is converted (§39, "Not converted at all"): like LionOrdered it
+ * competes with the relation's own scans, and is offered at the margin.
+ */
+static void
+ls_cost(PlannerInfo *root, RelOptInfo *rel, Path *lion, List *chosen,
+		List *residual, double rows, double passes, Cost *startup_p,
+		Cost *total_p)
+{
+	double		tuples = Max(rel->tuples, 1.0);
+	double		pages = Max((double) rel->pages, 1.0);
+	double		allvis = Min(Max(rel->allvisfrac, 0.0), 1.0);
+	double		windows = Max(1.0, ceil(pages / LION_BLOCKS_PER_CONTAINER));
+	double		runs;
+	Cost		lioncost;
+	Selectivity sel;
+	double		members;
+	double		pieces;
+	double		stored;
+	double		dirty;
+	QualCost	qcost;
+	Cost		startup;
+	Cost		run = 0.0;
+	ListCell   *lc;
+
+	cost_bitmap_tree_node(lion, &lioncost, &sel);
+	members = clamp_row_est(sel * tuples);
+	runs = Max(passes, 1.0) * windows;
+
+	startup = lioncost;
+	pieces = Max(1.0, Min(members, runs * (1.0 - exp(-members / runs))));
+	run += pieces * cpu_operator_cost;
+
+	stored = members * allvis;
+	dirty = members - stored;
+	if (stored >= 1.0)
+	{
+		double		touched = Max(1.0, Min(stored,
+										   runs * (1.0 - exp(-stored / runs))));
+		double		m = stored / touched;
+
+		foreach(lc, chosen)
+		{
+			LsStoreCol *sc = (LsStoreCol *) lfirst(lc);
+			double		reads = touched * (1.0 + (sc->pagesper - 1.0) * m / (m + 1.0));
+			double		spc_random;
+			double		spc_seq;
+
+			get_tablespace_page_costs(sc->index->reltablespace, &spc_random,
+									  &spc_seq);
+			run += stored * LION_STORE_VALUE_COST;
+			run += reads * (ls_store_page_price(sc->index, reads,
+												windows * sc->pagesper) +
+							LION_STORE_PAGE_COST);
+			run += touched * (spc_seq + LION_STORE_PAGE_COST);	/* the map */
+		}
+	}
+	if (dirty > 0.0)
+	{
+		double		dirtypages = Min(dirty, ceil(pages * (1.0 - allvis)));
+
+		run += dirtypages * lion_heap_page_cost(root, rel, dirtypages, pages) +
+			dirty * LION_RECHECK_TID_COST;
+	}
+
+	cost_qual_eval(&qcost, residual, root);
+	startup += qcost.startup + rel->reltarget->cost.startup;
+	run += members * (cpu_tuple_cost + qcost.per_tuple) +
+		rows * rel->reltarget->cost.per_tuple;
+
+	*startup_p = startup;
+	*total_p = startup + run;
+}
+
+/*
+ * LionStoreScan's paths (DESIGN.md §40, "As built: the row gather"): one per
+ * lion access whose set answers the WHERE exactly but for a residual filter
+ * on columns it gathers, when every column the scan returns - attnos, from
+ * ls_target_attnos() - and every one that filter reads is stored by some
+ * lion index of the relation (ls_choose_sources()), and the access can be
+ * streamed (ls_tree_ok()).  The price decides against core's scans
+ * (ls_cost()).
+ */
+static void
+ls_add_paths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
+			 List *lionidx, List *cands, Bitmapset *attnos, double rows,
+			 Size limit)
+{
+	double		tuples = Max(rel->tuples, 1.0);
+	double		pages = Max((double) rel->pages, 1.0);
+	List	   *storecols = NIL;
+	Bitmapset  *want = bms_copy(attnos);
+	bool		looked = false;
+	ListCell   *lc;
+	int			x = -1;
+
+	/*
+	 * Every column the scan returns must be a column of some lion index that
+	 * serves its rows, or no source can be found for it whatever the access:
+	 * decided from the catalog alone, so that a query returning a column no
+	 * lion index has - most queries - reads no meta page for this node.  The
+	 * stores looked at are those that have a column the scan could take, one
+	 * it returns or one a restriction clause reads (a residual filter's).  A
+	 * clause on a system column or the whole row is no lion clause, so it is
+	 * every access's residual, which the scan cannot evaluate.
+	 */
+	while ((x = bms_next_member(attnos, x)) >= 0)
+	{
+		Bitmapset  *one = bms_make_singleton(x);
+		bool		found = false;
+
+		foreach(lc, lionidx)
+		{
+			if (ls_index_covers_any((IndexOptInfo *) lfirst(lc), one))
+			{
+				found = true;
+				break;
+			}
+		}
+		bms_free(one);
+		if (!found)
+			return;
+	}
+	if (!ls_clause_attnos(rel->baserestrictinfo, rel->relid, &want))
+		return;
+
+	foreach(lc, cands)
+	{
+		Path	   *lion = (Path *) lfirst(lc);
+		List	   *lionrinfos = NIL;
+		bool		lossy = false;
+		List	   *lionqual = lo_lion_qual(lion, &lionrinfos, &lossy);
+		List	   *residual;
+		Bitmapset  *need;
+		List	   *chosen;
+		List	   *srcs = NIL;
+		List	   *srcattnos = NIL;
+		List	   *srccols = NIL;
+		double		passes = 1.0;
+		double		maskbytes = 0.0;
+		bool		sorted;
+		Cost		startup;
+		Cost		total;
+		ListCell   *lc2;
+
+		if (lossy)
+			continue;
+		residual = lo_residual(rel->baserestrictinfo, NIL, lionrinfos,
+							   lionqual);
+		need = bms_copy(attnos);
+		if (!ls_clause_attnos(residual, rel->relid, &need))
+			continue;
+		if (!ls_tree_ok(root, lion, tuples, pages, &passes, &sorted,
+						&maskbytes) ||
+			maskbytes > (double) limit)
+			continue;
+		if (!looked)
+		{
+			storecols = ls_store_cols(root, rel, rte, lionidx, want);
+			looked = true;
+		}
+		chosen = ls_choose_sources(storecols, need, lion);
+		if (chosen == NIL)
+			continue;
+
+		/* the sources in the order of their first column, columns ascending */
+		foreach(lc2, chosen)
+		{
+			LsStoreCol *sc = (LsStoreCol *) lfirst(lc2);
+			int			i = 0;
+			ListCell   *lc3;
+
+			foreach(lc3, srcs)
+			{
+				if (lfirst_oid(lc3) == sc->index->indexoid)
+					break;
+				i++;
+			}
+			if (i == list_length(srcs))
+			{
+				srcs = lappend_oid(srcs, sc->index->indexoid);
+				srcattnos = lappend(srcattnos, NIL);
+				srccols = lappend(srccols, NIL);
+			}
+			lfirst(list_nth_cell(srcattnos, i)) =
+				lappend_int((List *) list_nth(srcattnos, i), sc->attno);
+			lfirst(list_nth_cell(srccols, i)) =
+				lappend_int((List *) list_nth(srccols, i), sc->indexcol);
+		}
+
+		ls_cost(root, rel, lion, chosen, residual, rows, passes, &startup,
+				&total);
+		lo_add_path(rel, NIL, list_make4(lion, srcs, srcattnos, srccols),
+					rows, startup, total, &ls_path_methods);
+	}
 }
 
 static void
@@ -1941,11 +2758,12 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	double		storek = 0.0;
 	List	   *storesort = NIL;
 	LoStore		store;
+	Bitmapset  *gattnos = NULL;
 
 	if (lion_prev_set_rel_pathlist_hook != NULL)
 		lion_prev_set_rel_pathlist_hook(root, rel, rti, rte);
 
-	if (!lion_enable_ordered_scan)
+	if (!lion_enable_ordered_scan && !lion_enable_store_scan)
 		return;
 	/* no lion index is read under 16's old_snapshot_threshold (§9) */
 	if (lion_old_snapshot_threshold_active())
@@ -1968,8 +2786,15 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		return;
 	lo_margin = lion_units_margin_for(rel);
 
+	/*
+	 * LionStoreScan (DESIGN.md §40, "As built: the row gather"): the columns
+	 * it would return, when it can be the scan at all.
+	 */
+	if (lion_enable_store_scan && rel->baserestrictinfo != NIL)
+		gattnos = ls_target_attnos(root, rel);
+
 	/* the ordered side: core's ordered btree paths ... */
-	if (rel->baserestrictinfo != NIL)
+	if (lion_enable_ordered_scan && rel->baserestrictinfo != NIL)
 	{
 		foreach(lc, rel->pathlist)
 		{
@@ -1997,14 +2822,16 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	}
 
 	/* ... and the walks of lion's own ordered columns (§30.11) */
-	walks = lo_lion_walks(root, rel, rte, lionidx);
+	walks = lion_enable_ordered_scan ?
+		lo_lion_walks(root, rel, rte, lionidx) : NIL;
 
 	/*
 	 * ... or no walk at all: the ORDER BY's columns from a window store, for
 	 * the rows a LIMIT takes (DESIGN.md §40), when the set answers the WHERE.
 	 */
 	memset(&store, 0, sizeof(store));
-	if (lion_enable_ordered_store && rel->baserestrictinfo != NIL &&
+	if (lion_enable_ordered_scan && lion_enable_ordered_store &&
+		rel->baserestrictinfo != NIL &&
 		(storek = lo_store_limit(root, rel)) > 0.0)
 	{
 		storesort = lo_sort_keys(rel, root->sort_pathkeys);
@@ -2012,7 +2839,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			!lo_store_find(root, rel, rte, lionidx, storesort, NULL, &store))
 			storek = 0.0;
 	}
-	if (ordpaths == NIL && walks == NIL && storek == 0.0)
+	if (ordpaths == NIL && walks == NIL && storek == 0.0 && gattnos == NULL)
 		return;
 
 	/* the heap table AM only (§2); ambuild refused every other */
@@ -2041,11 +2868,14 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	rows = lion_probe_rel_rows(root, rel);
 
 	/*
-	 * The lion side of a btree walk, and of the store order, as core would
-	 * build it for every restriction clause.
+	 * The lion side of a btree walk, of the store order and of LionStoreScan,
+	 * as core would build it for every restriction clause.
 	 */
-	if (ordpaths != NIL || storek > 0.0)
+	if (ordpaths != NIL || storek > 0.0 || gattnos != NULL)
 		cands = lo_lion_accesses(root, rel, lionidx, NIL, lionam);
+
+	if (gattnos != NULL)
+		ls_add_paths(root, rel, rte, lionidx, cands, gattnos, rows, limit);
 
 	foreach(lc, ordpaths)
 	{
@@ -2069,7 +2899,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			if (setbytes > (double) limit)
 				continue;		/* the set would not fit (§30.3) */
 			lo_add_path(rel, ord->path.pathkeys, list_make2(ord, lion), rows,
-						startup, total);
+						startup, total, &lo_path_methods);
 		}
 	}
 
@@ -2112,7 +2942,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			priv = lappend(priv, lion);
 			priv = lappend(priv, w->vrinfos);
 			lo_add_path(rel, list_make1(w->pathkey), priv, rows, startup,
-						total);
+						total, &lo_path_methods);
 		}
 	}
 
@@ -2160,7 +2990,8 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 				continue;		/* too many rows to rank */
 			lo_add_path(rel, root->sort_pathkeys,
 						list_make3(storeinfo, store.index, lion),
-						clamp_row_est(Min(storek, rows)), startup, total);
+						clamp_row_est(Min(storek, rows)), startup, total,
+						&lo_path_methods);
 		}
 	}
 }
@@ -2371,6 +3202,54 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 									lo_sort_keys(rel, best_path->path.pathkeys));
 	cscan->custom_private = lappend(cscan->custom_private, store);
 	cscan->methods = &lo_scan_methods;
+
+	return &cscan->scan.plan;
+}
+
+/*
+ * LionStoreScan's plan (DESIGN.md §40, "As built: the row gather"): the lion
+ * tree as LionOrdered's, the stores and their columns, and the restriction
+ * clauses the set does not answer as its filter - ls_add_paths() made sure
+ * the columns they read are gathered.
+ */
+static Plan *
+ls_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
+			 List *tlist, List *clauses, List *custom_plans)
+{
+	CustomScan *cscan = makeNode(CustomScan);
+	Path	   *lion = (Path *) linitial(best_path->custom_private);
+	List	   *lionrinfos = NIL;
+	bool		lossy = false;
+	List	   *lionqual;
+	List	   *residual;
+	List	   *tree = NIL;
+	List	   *leaves = NIL;
+	List	   *lionquals = NIL;
+
+	lionqual = lo_lion_qual(lion, &lionrinfos, &lossy);
+	lo_lion_tree(lion, &tree, &leaves, &lionquals);
+	if (lossy || tree == NIL)
+		elog(ERROR, "LionStoreScan: a lion access it cannot stream");
+	residual = lo_residual(clauses, NIL, lionrinfos, lionqual);
+
+	cscan->scan.plan.targetlist = tlist;
+	cscan->scan.plan.qual = extract_actual_clauses(residual, false);
+	cscan->scan.scanrelid = rel->relid;
+	cscan->flags = best_path->flags;
+	cscan->custom_plans = NIL;
+	cscan->custom_scan_tlist = NIL;
+	cscan->custom_exprs = list_make2(lionquals, lionqual);
+	cscan->custom_private =
+		list_make5(list_make2_int(LS_PRIV_MAGIC, LS_PRIV_NMEMBERS),
+				   list_make1_int(0),
+				   tree,
+				   leaves,
+				   lsecond(best_path->custom_private));
+	cscan->custom_private = lappend(cscan->custom_private,
+									lthird(best_path->custom_private));
+	cscan->custom_private = lappend(cscan->custom_private,
+									lfourth(best_path->custom_private));
+	cscan->methods = &ls_scan_methods;
 
 	return &cscan->scan.plan;
 }
@@ -5058,6 +5937,1182 @@ quals:
 }
 
 /* ---------------------------------------------------------------------
+ * LionStoreScan: the row gather (DESIGN.md §40, "As built: the row gather")
+ * --------------------------------------------------------------------- */
+
+/*
+ * The set, streamed a piece at a time: the members at one container key, and
+ * which of them the scan may take from the window store.
+ *
+ *	all		every member
+ *	sure	the members certainly in the set: == all when every one is, NULL
+ *			when none is (a superset to recheck - a source that is not exact,
+ *			a set that degraded), or a container of its own
+ *	pin		the members in sure whose container page is still pinned, the
+ *			§9 interlock that lets the store's value stand for a row on a
+ *			page the visibility map calls all-visible: NULL, == sure, or a
+ *			container of its own
+ *
+ * The containers stay valid until the cursor that handed the piece out is
+ * asked for the next one, and the pins with them.
+ */
+typedef struct LsPiece
+{
+	uint32		ckey;
+	const LionContainer *all;
+	const LionContainer *sure;
+	const LionContainer *pin;
+} LsPiece;
+
+#define LS_CUR_SET		3		/* beside LO_NODE_LEAF, _AND and _OR */
+
+/*
+ * A cursor over one node of the lion tree, handing out its answer piece by
+ * piece (ls_cursor_next()), and the pins of each piece with it:
+ *
+ *	LEAF	a lion source opened with keeppins, whose containers are handed out
+ *			as they come; pinned when the source is exact and still has the
+ *			§9 pin of the page each came from (lion_source_interlocked());
+ *	AND		its DRIVER - its first LEAF child, as lo_store_node() takes it -
+ *			streamed, and the other children built into one set, pinless, as
+ *			§30.4 builds one (lo_build_node()), which masks each of the
+ *			driver's pieces.  Every member of the AND is a member of the
+ *			driver's piece, so the driver's pin is the interlock for all of
+ *			them (lion_count_int.h: one pin is enough).  A mask that degraded
+ *			keeps the driver's piece whole at its keys, to be rechecked;
+ *	OR		its children merged by container key, each of which must hand out
+ *			one ascending run of keys: a piece's members are the union of the
+ *			children's at its key, so that a row two of them hold is returned
+ *			once, and a member is pinned when a child that holds it held its
+ *			pin (for an OR every contributing child's pin counts, each for
+ *			its own members);
+ *	SET		a child of an OR that would not come in one run (a WALK, a long
+ *			list - which ls_tree_ok() declines, but whose shape is the
+ *			source's to decide at run time): built pinless into a set and
+ *			handed out key by key, every member from the heap.  A key whose
+ *			container the set dropped when it degraded is every TID of the
+ *			window's heap pages, rechecked.
+ */
+typedef struct LsCursor
+{
+	int			kind;			/* LO_NODE_LEAF, _AND, _OR, or LS_CUR_SET */
+	bool		sorted;			/* one ascending run of container keys */
+	LsPiece		piece;			/* the piece handed out last */
+	LionContainer *buf[3];		/* a piece's all, sure and pin, when built */
+
+	/* LEAF */
+	LionSource *src;
+
+	/* AND */
+	struct LsCursor *driver;
+	LionTidSet *mask;			/* NULL: the AND is empty */
+	bool		maskexact;
+
+	/* OR */
+	int			nchild;
+	struct LsCursor **child;
+	bool	   *live;			/* [nchild] the child has a piece in hand */
+	bool	   *taken;			/* [nchild] ... which the last piece used */
+
+	/* SET */
+	LionTidSet *set;
+	int			pos;
+	bool		setexact;
+} LsCursor;
+
+static LsCursor *ls_cursor_open(LionOrderedState *st, LoNode *node);
+static bool ls_cursor_next(LionOrderedState *st, LsCursor *cur);
+static void ls_cursor_close(LsCursor *cur);
+
+static LionContainer *
+ls_buf(LionOrderedState *st)
+{
+	return (LionContainer *) MemoryContextAlloc(st->buildcxt,
+												LION_CONTAINER_MAX_SIZE);
+}
+
+/* A child of an OR read as a set, pinless (LsCursor, SET). */
+static LsCursor *
+ls_set_cursor(LionOrderedState *st, LoNode *node)
+{
+	LsCursor   *cur = (LsCursor *) MemoryContextAllocZero(st->buildcxt,
+														  sizeof(LsCursor));
+	bool		saved = st->exact;
+
+	cur->kind = LS_CUR_SET;
+	cur->sorted = true;
+	st->exact = true;
+	cur->set = lo_build_node(st, node);
+	cur->setexact = st->exact;
+	st->exact = saved;
+	cur->buf[0] = ls_buf(st);
+	return cur;
+}
+
+static LsCursor *
+ls_cursor_open(LionOrderedState *st, LoNode *node)
+{
+	LsCursor   *cur = (LsCursor *) MemoryContextAllocZero(st->buildcxt,
+														  sizeof(LsCursor));
+	int			i;
+
+	cur->kind = node->kind;
+	if (node->kind == LO_NODE_LEAF)
+	{
+		LoLeaf	   *leaf = node->leaf;
+
+		cur->src = lion_source_open(leaf->index, leaf->keys, leaf->nkeys, true,
+									st->buildcxt);
+		pgstat_count_index_scan(leaf->index);
+		cur->sorted = lion_source_sorted(cur->src);
+		return cur;
+	}
+
+	if (node->kind == LO_NODE_AND)
+	{
+		int			driver = 0;
+		LionTidSet *rest = NULL;
+		bool		saved = st->exact;
+
+		for (i = 0; i < node->nchild; i++)
+		{
+			if (node->child[i]->kind == LO_NODE_LEAF)
+			{
+				driver = i;
+				break;
+			}
+		}
+
+		/* the mask first, pinless, as lo_store_node() builds it */
+		st->exact = true;
+		for (i = 0; i < node->nchild; i++)
+		{
+			LionTidSet *s;
+
+			if (i == driver)
+				continue;
+			s = lo_build_node(st, node->child[i]);
+			rest = (rest == NULL) ? s : lo_set_combine(st, rest, s, true);
+			if (rest->n == 0)
+				break;			/* an empty AND stays empty */
+		}
+		cur->maskexact = st->exact;
+		st->exact = saved;
+		Assert(rest != NULL);
+		cur->sorted = true;
+		if (rest->n == 0)
+			return cur;			/* cur->mask NULL: nothing to hand out */
+		cur->mask = rest;
+		cur->driver = ls_cursor_open(st, node->child[driver]);
+		cur->sorted = cur->driver->sorted;
+		for (i = 0; i < 3; i++)
+			cur->buf[i] = ls_buf(st);
+		return cur;
+	}
+
+	Assert(node->kind == LO_NODE_OR);
+	cur->nchild = node->nchild;
+	cur->child = (LsCursor **) MemoryContextAlloc(st->buildcxt,
+												  sizeof(LsCursor *) * node->nchild);
+	cur->live = (bool *) MemoryContextAllocZero(st->buildcxt,
+												sizeof(bool) * node->nchild);
+	cur->taken = (bool *) MemoryContextAllocZero(st->buildcxt,
+												 sizeof(bool) * node->nchild);
+	for (i = 0; i < node->nchild; i++)
+	{
+		LsCursor   *c = ls_cursor_open(st, node->child[i]);
+
+		if (!c->sorted)
+		{
+			/* not one run of keys: the child is read whole, pinless */
+			ls_cursor_close(c);
+			c = ls_set_cursor(st, node->child[i]);
+		}
+		cur->child[i] = c;
+		cur->taken[i] = true;	/* to be read for its first piece */
+	}
+	cur->sorted = true;
+	for (i = 0; i < 3; i++)
+		cur->buf[i] = ls_buf(st);
+	return cur;
+}
+
+/* Let go of every source of the cursor, and so of every pin it holds. */
+static void
+ls_cursor_close(LsCursor *cur)
+{
+	int			i;
+
+	if (cur == NULL)
+		return;
+	if (cur->src != NULL)
+		lion_source_close(cur->src);
+	cur->src = NULL;
+	ls_cursor_close(cur->driver);
+	cur->driver = NULL;
+	for (i = 0; i < cur->nchild; i++)
+		ls_cursor_close(cur->child[i]);
+	cur->nchild = 0;
+}
+
+/*
+ * Every TID of window ckey's heap pages: what a key of a set that degraded
+ * stands for (§30.4), as a BITSET, whose bit for lo is lo - each page's line
+ * pointers as the page has them now, as a bitmap heap scan reads a lossy
+ * page.  A row the snapshot sees was on its page, under its line pointer,
+ * before the scan began, and a line pointer is never taken back while a row
+ * still lies under it; the pages are the ones the heap had when the scan
+ * started, which a VACUUM cannot truncate while the scan's lock is held.
+ */
+static const LionContainer *
+ls_full_container(LionOrderedState *st, uint32 ckey, LionContainer *out)
+{
+	Relation	heap = st->css.ss.ss_currentRelation;
+	BlockNumber first = lion_ckey_first_block(ckey);
+	uint64	   *w;
+	uint32		b;
+
+	lion_container_bitset_init(out, ckey);
+	w = LION_BITSET_DATA(out);
+	for (b = 0; b < LION_BLOCKS_PER_CONTAINER && first + b < st->nblocks; b++)
+	{
+		Buffer		buf = ReadBuffer(heap, first + b);
+		OffsetNumber maxoff;
+		uint32		off;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		maxoff = PageGetMaxOffsetNumber(BufferGetPage(buf));
+		UnlockReleaseBuffer(buf);
+		maxoff = Min(maxoff, LION_MAX_OFFSET);
+		for (off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			uint32		lo = (b << LION_OFFSET_BITS) | off;
+
+			w[lo >> 6] |= UINT64CONST(1) << (lo & 63);
+		}
+	}
+	(void) lion_container_bitset_recount(out);
+	return out;
+}
+
+/* AND's next piece: the driver's, masked by the other children's set. */
+static bool
+ls_and_next(LionOrderedState *st, LsCursor *cur)
+{
+	if (cur->mask == NULL)
+		return false;
+	for (;;)
+	{
+		const LsPiece *p;
+		const LionContainer *m;
+		int			idx;
+
+		if (!ls_cursor_next(st, cur->driver))
+			return false;
+		p = &cur->driver->piece;
+		idx = lo_set_key_index(cur->mask, p->ckey);
+		if (idx < 0)
+			continue;
+		m = cur->mask->conts[idx];
+		cur->piece.ckey = p->ckey;
+		if (m == NULL)
+		{
+			/* the mask degraded: any TID of the key may be a member */
+			cur->piece.all = p->all;
+			cur->piece.sure = NULL;
+			cur->piece.pin = NULL;
+			return true;
+		}
+		if (lion_container_and(p->all, m, cur->buf[0]) == 0)
+			continue;
+		cur->piece.all = cur->buf[0];
+		if (!cur->maskexact || p->sure == NULL)
+			cur->piece.sure = NULL;
+		else if (p->sure == p->all)
+			cur->piece.sure = cur->buf[0];
+		else
+		{
+			(void) lion_container_and(p->sure, m, cur->buf[1]);
+			cur->piece.sure = cur->buf[1];
+		}
+		if (cur->piece.sure == NULL || p->pin == NULL)
+			cur->piece.pin = NULL;
+		else if (p->pin == p->all)
+			cur->piece.pin = cur->buf[0];
+		else if (p->pin == p->sure)
+			cur->piece.pin = cur->piece.sure;
+		else
+		{
+			(void) lion_container_and(p->pin, m, cur->buf[2]);
+			cur->piece.pin = cur->buf[2];
+		}
+		return true;
+	}
+}
+
+/*
+ * OR's next piece: the union of its children's pieces at the lowest key any
+ * of them is at.  A key only one child is at is that child's piece as it is.
+ */
+static bool
+ls_or_next(LionOrderedState *st, LsCursor *cur)
+{
+	uint32		ckey = 0;
+	bool		any = false;
+	int			nat = 0;
+	int			first = -1;
+	bool		allsure = true;
+	bool		allpin = true;
+	bool		anysure = false;
+	bool		anypin = false;
+	int			i;
+
+	for (i = 0; i < cur->nchild; i++)
+	{
+		if (cur->taken[i])
+		{
+			cur->live[i] = ls_cursor_next(st, cur->child[i]);
+			cur->taken[i] = false;
+		}
+		if (cur->live[i] && (!any || cur->child[i]->piece.ckey < ckey))
+		{
+			ckey = cur->child[i]->piece.ckey;
+			any = true;
+		}
+	}
+	if (!any)
+		return false;
+
+	for (i = 0; i < cur->nchild; i++)
+	{
+		if (cur->live[i] && cur->child[i]->piece.ckey == ckey)
+		{
+			const LsPiece *p = &cur->child[i]->piece;
+
+			cur->taken[i] = true;
+			if (first < 0)
+				first = i;
+			nat++;
+			if (p->sure != p->all)
+				allsure = false;
+			if (p->pin != p->all)
+				allpin = false;
+			if (p->sure != NULL)
+				anysure = true;
+			if (p->pin != NULL)
+				anypin = true;
+		}
+	}
+	if (nat == 1)
+	{
+		cur->piece = cur->child[first]->piece;
+		return true;
+	}
+
+	lion_container_bitset_init(cur->buf[0], ckey);
+	if (!allsure && anysure)
+		lion_container_bitset_init(cur->buf[1], ckey);
+	if (!allpin && anypin)
+		lion_container_bitset_init(cur->buf[2], ckey);
+	for (i = 0; i < cur->nchild; i++)
+	{
+		const LsPiece *p;
+
+		if (!cur->taken[i])
+			continue;
+		p = &cur->child[i]->piece;
+		lion_container_or_into_bitset(p->all, LION_BITSET_DATA(cur->buf[0]));
+		if (!allsure && p->sure != NULL)
+			lion_container_or_into_bitset(p->sure,
+										  LION_BITSET_DATA(cur->buf[1]));
+		if (!allpin && p->pin != NULL)
+			lion_container_or_into_bitset(p->pin,
+										  LION_BITSET_DATA(cur->buf[2]));
+	}
+	(void) lion_container_bitset_recount(cur->buf[0]);
+	cur->piece.ckey = ckey;
+	cur->piece.all = cur->buf[0];
+	if (allsure)
+		cur->piece.sure = cur->buf[0];
+	else if (anysure)
+	{
+		(void) lion_container_bitset_recount(cur->buf[1]);
+		cur->piece.sure = cur->buf[1];
+	}
+	else
+		cur->piece.sure = NULL;
+	if (allpin)
+		cur->piece.pin = cur->buf[0];
+	else if (anypin)
+	{
+		(void) lion_container_bitset_recount(cur->buf[2]);
+		cur->piece.pin = cur->buf[2];
+	}
+	else
+		cur->piece.pin = NULL;
+	return true;
+}
+
+/* The cursor's next piece into cur->piece; false when it has none left. */
+static bool
+ls_cursor_next(LionOrderedState *st, LsCursor *cur)
+{
+	CHECK_FOR_INTERRUPTS();
+
+	switch (cur->kind)
+	{
+		case LO_NODE_LEAF:
+			for (;;)
+			{
+				const LionContainer *c = lion_source_next(cur->src);
+				bool		exact;
+
+				if (c == NULL)
+					return false;
+				if (c->cardinality == 0)
+					continue;
+				exact = !st->lossyqual && lion_source_exact(cur->src);
+				cur->piece.ckey = c->ckey;
+				cur->piece.all = c;
+				cur->piece.sure = exact ? c : NULL;
+				cur->piece.pin = (exact && lion_source_interlocked(cur->src)) ?
+					c : NULL;
+				return true;
+			}
+		case LO_NODE_AND:
+			return ls_and_next(st, cur);
+		case LO_NODE_OR:
+			return ls_or_next(st, cur);
+		case LS_CUR_SET:
+			while (cur->pos < cur->set->n)
+			{
+				int			i = cur->pos++;
+				const LionContainer *c = cur->set->conts[i];
+
+				cur->piece.ckey = cur->set->keys[i];
+				if (c == NULL)
+				{
+					c = ls_full_container(st, cur->piece.ckey, cur->buf[0]);
+					if (c->cardinality == 0)
+						continue;
+					cur->piece.all = c;
+					cur->piece.sure = NULL;
+					cur->piece.pin = NULL;
+					return true;
+				}
+				if (c->cardinality == 0)
+					continue;
+				cur->piece.all = c;
+				cur->piece.sure = (cur->setexact && !st->lossyqual) ? c : NULL;
+				cur->piece.pin = NULL;
+				return true;
+			}
+			return false;
+	}
+	elog(ERROR, "LionStoreScan: unexpected cursor kind %d", cur->kind);
+	return false;				/* keep compiler quiet */
+}
+
+static Node *
+ls_create_state(CustomScan *cscan)
+{
+	LionOrderedState *st = (LionOrderedState *)
+		newNode(sizeof(LionOrderedState), T_CustomScanState);
+
+	st->css.methods = &ls_exec_methods;
+
+	/*
+	 * A virtual scan slot: a row the store gives is its gathered values, and
+	 * a heap row is copied in from heapslot, so that the plan's expressions,
+	 * which are compiled for the scan slot's one kind, read both alike.
+	 */
+	st->css.slotOps = &TTSOpsVirtual;
+	return (Node *) st;
+}
+
+static void
+ls_begin(CustomScanState *node, EState *estate, int eflags)
+{
+	LionOrderedState *st = (LionOrderedState *) node;
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	Relation	heap = node->ss.ss_currentRelation;
+	Index		scanrelid = cscan->scan.scanrelid;
+	List	   *shape;
+	List	   *tree;
+	List	   *leafoids;
+	List	   *lionquals;
+	List	   *lionqual;
+	List	   *srcs;
+	List	   *srcattnos;
+	List	   *srccols;
+	Bitmapset  *gathered = NULL;
+	Bitmapset  *read = NULL;
+	ListCell   *pos;
+	int			leafno = 0;
+	int			qualno = 0;
+	int			x;
+	int			i;
+	int			k;
+
+	shape = (list_length(cscan->custom_private) == LS_PRIV_NMEMBERS) ?
+		(List *) list_nth(cscan->custom_private, LS_PRIV_SHAPE) : NIL;
+	if (shape == NIL || !IsA(shape, IntList) || list_length(shape) != 2 ||
+		linitial_int(shape) != LS_PRIV_MAGIC ||
+		lsecond_int(shape) != LS_PRIV_NMEMBERS ||
+		list_length(cscan->custom_exprs) != LS_EXPR_NLISTS)
+		elog(ERROR, "LionStoreScan: unrecognized custom_private shape (%d members)",
+			 list_length(cscan->custom_private));
+
+	st->gscan = true;
+	st->lossyqual = (linitial_int((List *) list_nth(cscan->custom_private,
+													LS_PRIV_INTS)) &
+					 LO_FLAG_LOSSY) != 0;
+	tree = (List *) list_nth(cscan->custom_private, LS_PRIV_TREE);
+	leafoids = (List *) list_nth(cscan->custom_private, LS_PRIV_LEAVES);
+	srcs = (List *) list_nth(cscan->custom_private, LS_PRIV_SOURCES);
+	srcattnos = (List *) list_nth(cscan->custom_private, LS_PRIV_ATTNOS);
+	srccols = (List *) list_nth(cscan->custom_private, LS_PRIV_COLS);
+	lionquals = (List *) list_nth(cscan->custom_exprs, LS_EXPR_LIONQUALS);
+	lionqual = (List *) list_nth(cscan->custom_exprs, LS_EXPR_LIONQUAL);
+
+	/* the recheck, initialised - and so checked for EXECUTE - every time */
+	st->lionrecheck = ExecInitQual(lionqual, &node->ss.ps);
+
+	st->nleaves = list_length(leafoids);
+	if (tree == NIL || st->nleaves < 1)
+		elog(ERROR, "LionStoreScan: malformed lion tree");
+	st->leaves = (LoLeaf *) palloc0(sizeof(LoLeaf) * st->nleaves);
+	pos = list_head(tree);
+	st->tree = lo_decode_tree(st, tree, &pos, leafoids, lionquals, &leafno,
+							  &qualno);
+	if (pos != NULL || leafno != st->nleaves ||
+		qualno != list_length(lionquals))
+		elog(ERROR, "LionStoreScan: malformed lion tree");
+
+	/* the stores, and the columns each gives */
+	st->nsrc = list_length(srcs);
+	if (st->nsrc < 1 || list_length(srcattnos) != st->nsrc ||
+		list_length(srccols) != st->nsrc)
+		elog(ERROR, "LionStoreScan: malformed store list");
+	st->natts = RelationGetDescr(heap)->natts;
+	st->srcoids = (Oid *) palloc(sizeof(Oid) * st->nsrc);
+	st->srcidx = (Relation *) palloc0(sizeof(Relation) * st->nsrc);
+	st->srcfirst = (int *) palloc(sizeof(int) * (st->nsrc + 1));
+	st->ngcols = 0;
+	for (i = 0; i < st->nsrc; i++)
+	{
+		List	   *a = (List *) list_nth(srcattnos, i);
+		List	   *c = (List *) list_nth(srccols, i);
+
+		if (a == NIL || !IsA(a, IntList) || c == NIL || !IsA(c, IntList) ||
+			list_length(a) != list_length(c))
+			elog(ERROR, "LionStoreScan: malformed store list");
+		st->ngcols += list_length(a);
+	}
+	st->gattnos = (AttrNumber *) palloc(sizeof(AttrNumber) * st->ngcols);
+	st->gindexcols = (AttrNumber *) palloc(sizeof(AttrNumber) * st->ngcols);
+	k = 0;
+	for (i = 0; i < st->nsrc; i++)
+	{
+		ListCell   *la;
+		ListCell   *lc;
+
+		st->srcoids[i] = list_nth_oid(srcs, i);
+		st->srcfirst[i] = k;
+		forboth(la, (List *) list_nth(srcattnos, i),
+				lc, (List *) list_nth(srccols, i))
+		{
+			AttrNumber	attno = (AttrNumber) lfirst_int(la);
+
+			if (attno < 1 || attno > st->natts ||
+				bms_is_member(attno, gathered))
+				elog(ERROR, "LionStoreScan: malformed store list");
+			gathered = bms_add_member(gathered, attno);
+			st->gattnos[k] = attno;
+			st->gindexcols[k] = (AttrNumber) lfirst_int(lc);
+			k++;
+		}
+	}
+	st->srcfirst[st->nsrc] = k;
+
+	/*
+	 * A row the store gives has the gathered columns and NULL for the rest:
+	 * the plan must read no other (ls_add_paths() offered it so).  A heap row
+	 * is copied up to the last column the plan or the recheck reads.
+	 */
+	pull_varattnos((Node *) cscan->scan.plan.targetlist, scanrelid, &read);
+	pull_varattnos((Node *) cscan->scan.plan.qual, scanrelid, &read);
+	x = -1;
+	while ((x = bms_next_member(read, x)) >= 0)
+	{
+		AttrNumber	attno = (AttrNumber) (x + FirstLowInvalidHeapAttributeNumber);
+
+		if (!bms_is_member(attno, gathered))
+			elog(ERROR, "LionStoreScan: the plan reads column %d, which it does not gather",
+				 (int) attno);
+	}
+	pull_varattnos((Node *) lionqual, scanrelid, &read);
+	st->maxatt = 0;
+	for (k = 0; k < st->ngcols; k++)
+		st->maxatt = Max(st->maxatt, (int) st->gattnos[k]);
+	x = -1;
+	while ((x = bms_next_member(read, x)) >= 0)
+	{
+		AttrNumber	attno = (AttrNumber) (x + FirstLowInvalidHeapAttributeNumber);
+
+		st->maxatt = (attno <= 0) ? st->natts : Max(st->maxatt, (int) attno);
+	}
+	st->maxatt = Min(st->maxatt, st->natts);
+
+	/* EXPLAIN without ANALYZE opens nothing (it names indexes by Oid). */
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	lion_check_table_am(heap);
+	if (!IsMVCCSnapshot(estate->es_snapshot))
+		elog(ERROR, "LionStoreScan: requires an MVCC snapshot");
+
+	st->setcxt = AllocSetContextCreate(estate->es_query_cxt,
+									   "LionStoreScan set",
+									   ALLOCSET_DEFAULT_SIZES);
+	st->buildcxt = AllocSetContextCreate(estate->es_query_cxt,
+										 "LionStoreScan stream",
+										 ALLOCSET_DEFAULT_SIZES);
+	st->lrtcxt = CreateExprContext(estate);
+#if PG_VERSION_NUM >= 200000
+#elif PG_VERSION_NUM >= 190000
+	st->fetch = table_index_fetch_begin(heap, SO_NONE);
+#else
+	st->fetch = table_index_fetch_begin(heap);
+#endif
+	st->heapslot = ExecInitExtraTupleSlot(estate, RelationGetDescr(heap),
+										  &TTSOpsBufferHeapTuple);
+
+	/*
+	 * Every lion index it reads, the set's and the stores', with a relation
+	 * predicate lock on each before any lookup (DESIGN.md §30.5).
+	 */
+	for (i = 0; i < st->nleaves; i++)
+	{
+		LoLeaf	   *leaf = &st->leaves[i];
+
+		leaf->index = index_open(leaf->indexoid, AccessShareLock);
+		ExecIndexBuildScanKeys(&node->ss.ps, leaf->index, leaf->quals, false,
+							   &leaf->keys, &leaf->nkeys,
+							   &leaf->rtkeys, &leaf->nrtkeys, NULL, NULL);
+		PredicateLockRelation(leaf->index, estate->es_snapshot);
+	}
+	for (i = 0; i < st->nsrc; i++)
+	{
+		st->srcidx[i] = index_open(st->srcoids[i], AccessShareLock);
+		PredicateLockRelation(st->srcidx[i], estate->es_snapshot);
+	}
+	st->lionparams = pull_paramids((Expr *) lionquals);
+
+	st->readers = (LionStoreReader **)
+		palloc0(sizeof(LionStoreReader *) * st->ngcols);
+	st->gvals = (Datum **) palloc(sizeof(Datum *) * st->ngcols);
+	st->gnulls = (bool **) palloc(sizeof(bool *) * st->ngcols);
+	for (k = 0; k < st->ngcols; k++)
+	{
+		st->gvals[k] = (Datum *) palloc(sizeof(Datum) * LION_CONTAINER_RANGE);
+		st->gnulls[k] = (bool *) palloc(sizeof(bool) * LION_CONTAINER_RANGE);
+	}
+	st->los = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
+	st->avlos = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
+	st->pinlos = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
+	st->vmbuf = InvalidBuffer;
+}
+
+/* Is every index the scan reads in rmgr mode (§9, "Hot standby")? */
+static bool
+ls_all_rmgr(LionOrderedState *st)
+{
+	int			i;
+
+	for (i = 0; i < st->nleaves; i++)
+		if (lion_wal_mode(st->leaves[i].index) != LION_WAL_MODE_RMGR)
+			return false;
+	for (i = 0; i < st->nsrc; i++)
+		if (lion_wal_mode(st->srcidx[i]) != LION_WAL_MODE_RMGR)
+			return false;
+	return true;
+}
+
+/*
+ * Start this scan's stream: the leaves' keys for its Param values, a reader
+ * of each gathered column over its index's state as it is now - the plan was
+ * made for indexes that stored them, and one rebuilt since without them is an
+ * error rather than a wrong answer - and the cursors, whose ANDs build their
+ * masks here.
+ */
+static void
+ls_start(LionOrderedState *st)
+{
+	Relation	heap = st->css.ss.ss_currentRelation;
+	TupleDesc	desc = RelationGetDescr(heap);
+	int			i;
+	int			k;
+
+	MemoryContextReset(st->setcxt);
+	MemoryContextReset(st->buildcxt);
+	st->live = NIL;
+	st->bytes = 0;
+	st->degraded = false;
+	st->exact = !st->lossyqual;
+	st->limit = get_hash_memory_limit();
+	st->ncont = 0;
+
+	lo_leaf_keys(st);
+	for (i = 0; i < st->nsrc; i++)
+	{
+		LionIndexState *ix = lion_get_index_state(st->srcidx[i]);
+
+		for (k = st->srcfirst[i]; k < st->srcfirst[i + 1]; k++)
+		{
+			int			ord = lion_store_ordinal(ix, st->gindexcols[k]);
+
+			if (ord < 0 || !ix->stored[ord].returnable ||
+				ix->stored[ord].typid !=
+				TupleDescAttr(desc, st->gattnos[k] - 1)->atttypid)
+				elog(ERROR, "LionStoreScan: index \"%s\" does not store column %d",
+					 RelationGetRelationName(st->srcidx[i]),
+					 (int) st->gattnos[k]);
+			st->readers[k] = lion_store_open(st->srcidx[i], ix, ord,
+											 st->buildcxt);
+		}
+	}
+
+	/*
+	 * On a hot standby a generic-mode index's pins interlock nothing (§9,
+	 * "Hot standby"): every row then comes from the heap.
+	 */
+	st->storenovm = RecoveryInProgress() && !ls_all_rmgr(st);
+	st->nblocks = RelationGetNumberOfBlocks(heap);
+	st->pn = st->ppos = 0;
+	st->pnav = st->pavpos = 0;
+	st->cur = ls_cursor_open(st, st->tree);
+	st->gstarted = true;
+	st->gdone = false;
+	st->builds++;
+}
+
+/*
+ * End this scan's stream, and let go of everything it holds: every source's
+ * pins, the readers, the visibility map's page and the heap's.
+ */
+static void
+ls_stop(LionOrderedState *st)
+{
+	int			k;
+
+	ls_cursor_close(st->cur);
+	st->cur = NULL;
+	for (k = 0; k < st->ngcols; k++)
+	{
+		if (st->readers[k] != NULL)
+			lion_store_close(st->readers[k]);
+		st->readers[k] = NULL;
+	}
+	if (BufferIsValid(st->vmbuf))
+		ReleaseBuffer(st->vmbuf);
+	st->vmbuf = InvalidBuffer;
+	ExecClearTuple(st->heapslot);
+#if PG_VERSION_NUM < 200000
+	table_index_fetch_reset(st->fetch);
+#endif
+	MemoryContextReset(st->buildcxt);
+	MemoryContextReset(st->setcxt);
+	st->live = NIL;
+	st->bytes = 0;
+	st->pn = st->ppos = 0;
+	st->pnav = st->pavpos = 0;
+	st->gstarted = false;
+}
+
+/*
+ * Take up the next piece (LsPiece): its members in order into los[], and,
+ * under the pin its cursor still holds, the visibility map's word on the
+ * heap pages of its pinned members - on an all-visible one such a member is
+ * a row every snapshot sees, whose slot its own insert wrote and VACUUM
+ * cannot have cleared or given to another row (DESIGN.md §40, "Why it is
+ * safe", lion_store.h) - and the gathered columns of those members, from
+ * every store, into gvals[]: lo_store_piece()'s reading, for every row of
+ * the piece rather than the best few.  The heap pages a store leaves to the
+ * heap (ABSENT, or no store yet) are taken out of the ones it serves: their
+ * rows, and every other member, are fetched as ls_next() reaches them.
+ * Under SERIALIZABLE the heap pages served are predicate-locked, as an
+ * index-only scan locks the pages it does not visit.
+ */
+static void
+ls_piece(LionOrderedState *st, const LsPiece *p)
+{
+	Relation	heap = st->css.ss.ss_currentRelation;
+	BlockNumber firstblk = lion_ckey_first_block(p->ckey);
+	uint64		allvis = 0;
+	uint32		nav = 0;
+	int			k;
+
+	st->ncont++;
+	if (p->sure != p->all)
+		st->exact = false;
+	st->pckey = p->ckey;
+	st->pall = p->all;
+	st->psure = p->sure;
+	st->pn = lion_container_to_array(p->all, st->los);
+	st->ppos = 0;
+	st->pavpos = 0;
+	st->pserved = 0;
+
+	/* the last piece's values are no longer anybody's */
+	for (k = 0; k < st->ngcols; k++)
+		lion_store_gather_reset(st->readers[k]);
+
+	if (p->pin != NULL && p->pin->cardinality > 0 && !st->storenovm)
+	{
+		uint64		m = lion_container_block_mask(p->pin);
+
+		while (m != 0)
+		{
+			int			b = pg_rightmost_one_pos64(m);
+
+			m &= m - 1;
+			if (VM_ALL_VISIBLE(heap, firstblk + (BlockNumber) b, &st->vmbuf))
+				allvis |= UINT64CONST(1) << b;
+		}
+	}
+
+	if (allvis != 0)
+	{
+		const uint16 *pl = st->los;
+		uint32		npl = st->pn;
+		uint64		absent = 0;
+		uint32		i;
+
+		if (p->pin != p->all)
+		{
+			npl = lion_container_to_array(p->pin, st->pinlos);
+			pl = st->pinlos;
+		}
+		for (i = 0; i < npl; i++)
+			if (allvis & (UINT64CONST(1) << (pl[i] >> LION_OFFSET_BITS)))
+				st->avlos[nav++] = pl[i];
+		for (k = 0; k < st->ngcols; k++)
+		{
+			uint64		a = 0;
+
+			lion_store_gather(st->readers[k], p->ckey, st->avlos, (int) nav,
+							  st->gvals[k], st->gnulls[k], &a);
+			absent |= a;
+		}
+		absent &= allvis;
+		st->pserved = allvis & ~absent;
+		st->gabsent += pg_popcount64(absent);
+
+		if (st->pserved != 0 && IsolationIsSerializable())
+		{
+			Snapshot	snapshot = st->css.ss.ps.state->es_snapshot;
+			uint64		m = st->pserved;
+
+			while (m != 0)
+			{
+				int			b = pg_rightmost_one_pos64(m);
+
+				m &= m - 1;
+				PredicateLockPage(heap, firstblk + (BlockNumber) b, snapshot);
+			}
+		}
+	}
+	st->pnav = nav;
+}
+
+/* A row the store gives: its gathered values, NULL for every other column. */
+static void
+ls_store_row(LionOrderedState *st, TupleTableSlot *slot, uint32 j,
+			 ItemPointer tid)
+{
+	int			k;
+
+	ExecClearTuple(slot);
+	memset(slot->tts_isnull, true, sizeof(bool) * st->natts);
+	for (k = 0; k < st->ngcols; k++)
+	{
+		int			a = st->gattnos[k] - 1;
+
+		slot->tts_values[a] = st->gvals[k][j];
+		slot->tts_isnull[a] = st->gnulls[k][j];
+	}
+	ExecStoreVirtualTuple(slot);
+	slot->tts_tid = *tid;
+}
+
+/*
+ * A row the heap gives: the version of member tid (the root of its HOT
+ * chain, as an index's TID is) that the snapshot sees, if any, and tested
+ * against the lion qual when the piece is not sure of it, as §30.4's recheck
+ * tests a member.  Its columns are copied into the scan slot, which holds the
+ * heap tuple's values - by reference into heapslot's, which keeps them until
+ * the next fetch.
+ */
+static bool
+ls_heap_row(LionOrderedState *st, TupleTableSlot *slot, ItemPointer tid,
+			uint16 lo)
+{
+	TupleTableSlot *hs = st->heapslot;
+	bool		sure = (st->psure == st->pall) ||
+		(st->psure != NULL && lion_container_contains(st->psure, lo));
+
+	if (!lo_fetch_tid(st, tid, hs))
+		return false;
+	st->fetched++;
+	ExecClearTuple(slot);
+	if (st->maxatt > 0)
+	{
+		slot_getsomeattrs(hs, st->maxatt);
+		memcpy(slot->tts_values, hs->tts_values, sizeof(Datum) * st->maxatt);
+		memcpy(slot->tts_isnull, hs->tts_isnull, sizeof(bool) * st->maxatt);
+	}
+	memset(slot->tts_isnull + st->maxatt, true,
+		   sizeof(bool) * (st->natts - st->maxatt));
+	ExecStoreVirtualTuple(slot);
+	slot->tts_tid = hs->tts_tid;
+	if (!sure)
+	{
+		ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
+
+		ResetExprContext(econtext);
+		econtext->ecxt_scantuple = slot;
+		if (!ExecQual(st->lionrecheck, econtext))
+		{
+			st->removed++;
+			ExecClearTuple(slot);
+			return false;
+		}
+	}
+	st->gheaprows++;
+	return true;
+}
+
+/*
+ * ExecScan's access method: the next row of the set, a piece at a time, in
+ * the piece's TID order.  The cursor holds the pins of the piece being
+ * returned until the next piece is asked for, as an index-only scan holds its
+ * leaf's while it returns the leaf's rows; once the last row is out the scan
+ * lets go of everything (ls_stop()).
+ */
+static TupleTableSlot *
+ls_next(ScanState *ss)
+{
+	LionOrderedState *st = (LionOrderedState *) ss;
+	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
+
+	if (st->gdone)
+		return ExecClearTuple(slot);
+	if (!st->gstarted)
+		ls_start(st);
+
+	for (;;)
+	{
+		while (st->ppos < st->pn)
+		{
+			uint16		lo = st->los[st->ppos++];
+			ItemPointerData tid;
+
+			CHECK_FOR_INTERRUPTS();
+			lion_code_to_tid(lion_make_code(st->pckey, lo), &tid);
+			if (st->pavpos < st->pnav && st->avlos[st->pavpos] == lo)
+			{
+				uint32		j = st->pavpos++;
+
+				if (st->pserved & (UINT64CONST(1) << (lo >> LION_OFFSET_BITS)))
+				{
+					ls_store_row(st, slot, j, &tid);
+					st->gstorerows++;
+					return slot;
+				}
+			}
+			Assert(st->pavpos >= st->pnav || st->avlos[st->pavpos] > lo);
+			if (ls_heap_row(st, slot, &tid, lo))
+				return slot;
+		}
+
+		ExecClearTuple(slot);
+		if (st->cur == NULL || !ls_cursor_next(st, st->cur))
+		{
+			ls_stop(st);
+			st->gdone = true;
+			return slot;
+		}
+		ls_piece(st, &st->cur->piece);
+	}
+}
+
+/*
+ * ExecScan's recheck method.  EvalPlanQual never reaches the node: a row of
+ * an UPDATE, a DELETE, a MERGE or a FOR UPDATE, and every row of a query that
+ * locks one, has a row mark whose ctid or whole row the node does not gather,
+ * and ls_target_attnos() declined it.
+ */
+static bool
+ls_recheck(ScanState *ss, TupleTableSlot *slot)
+{
+	elog(ERROR, "LionStoreScan: EvalPlanQual recheck is not supported");
+	return false;				/* keep compiler quiet */
+}
+
+static TupleTableSlot *
+ls_exec(CustomScanState *node)
+{
+	return ExecScan(&node->ss, (ExecScanAccessMtd) ls_next,
+					(ExecScanRecheckMtd) ls_recheck);
+}
+
+/*
+ * A rescan streams the set again from its start, with the leaves' keys
+ * evaluated again: nothing of the last scan is kept, which is what bounds the
+ * node's memory to a piece's rows.
+ */
+static void
+ls_rescan(CustomScanState *node)
+{
+	LionOrderedState *st = (LionOrderedState *) node;
+
+	if (st->gstarted)
+		ls_stop(st);
+	st->gdone = false;
+	ExecScanReScan(&node->ss);
+}
+
+static void
+ls_end(CustomScanState *node)
+{
+	LionOrderedState *st = (LionOrderedState *) node;
+	int			i;
+
+	if (st->gstarted)
+		ls_stop(st);
+	if (st->heapslot != NULL)
+		ExecClearTuple(st->heapslot);
+#if PG_VERSION_NUM < 200000
+	if (st->fetch != NULL)
+		table_index_fetch_end(st->fetch);
+	st->fetch = NULL;
+#endif
+	for (i = 0; i < st->nleaves; i++)
+	{
+		if (st->leaves[i].index != NULL)
+			index_close(st->leaves[i].index, AccessShareLock);
+		st->leaves[i].index = NULL;
+	}
+	for (i = 0; i < st->nsrc; i++)
+	{
+		if (st->srcidx[i] != NULL)
+			index_close(st->srcidx[i], AccessShareLock);
+		st->srcidx[i] = NULL;
+	}
+	if (st->setcxt != NULL)
+		MemoryContextDelete(st->setcxt);
+	if (st->buildcxt != NULL)
+		MemoryContextDelete(st->buildcxt);
+	st->setcxt = NULL;
+	st->buildcxt = NULL;
+}
+
+/*
+ * EXPLAIN (DESIGN.md §40, "As built: the row gather"): the lion qual and the
+ * lion indexes read, as LionOrdered shows them; a `Store` line per store,
+ * its columns and its index; and with ANALYZE where the rows came from, in
+ * the count's words (lion_store_explain()): the rows the store gave, the rows
+ * the heap gave, the all-visible heap pages the store left to the heap - and
+ * the heap fetches, the rows the recheck removed, and the set's pieces.
+ */
+static void
+ls_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	LionOrderedState *st = (LionOrderedState *) node;
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	List	   *srcs = (List *) list_nth(cscan->custom_private, LS_PRIV_SOURCES);
+	List	   *srcattnos = (List *) list_nth(cscan->custom_private,
+											  LS_PRIV_ATTNOS);
+	Oid			relid = RelationGetRelid(node->ss.ss_currentRelation);
+	List	   *stores = NIL;
+	StringInfoData buf;
+	int			i;
+
+	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs,
+											LS_EXPR_LIONQUAL),
+					"Lion Cond", ancestors, es);
+
+	/* each index once: the set's in the order the tree names them, then the stores' */
+	initStringInfo(&buf);
+	for (i = 0; i < st->nleaves + list_length(srcs); i++)
+	{
+		Oid			oid = (i < st->nleaves) ? st->leaves[i].indexoid :
+			list_nth_oid(srcs, i - st->nleaves);
+		int			j;
+
+		for (j = 0; j < i; j++)
+			if (((j < st->nleaves) ? st->leaves[j].indexoid :
+				 list_nth_oid(srcs, j - st->nleaves)) == oid)
+				break;
+		if (j < i)
+			continue;
+		if (buf.len > 0)
+			appendStringInfoString(&buf, ", ");
+		appendStringInfoString(&buf, get_rel_name(oid));
+	}
+	ExplainPropertyText("Lion Indexes", buf.data, es);
+
+	for (i = 0; i < list_length(srcs); i++)
+	{
+		ListCell   *lc;
+
+		resetStringInfo(&buf);
+		foreach(lc, (List *) list_nth(srcattnos, i))
+		{
+			if (buf.len > 0)
+				appendStringInfoString(&buf, ", ");
+			appendStringInfoString(&buf,
+								   quote_identifier(get_attname(relid,
+																(AttrNumber) lfirst_int(lc),
+																false)));
+		}
+		appendStringInfo(&buf, " (%s)", get_rel_name(list_nth_oid(srcs, i)));
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+			ExplainPropertyText("Store", buf.data, es);
+		else
+			stores = lappend(stores, pstrdup(buf.data));
+	}
+	if (stores != NIL)
+		ExplainPropertyList("Store", stores, es);
+
+	if (es->analyze)
+	{
+		ExplainPropertyInteger("Store Rows", NULL, (int64) st->gstorerows, es);
+		ExplainPropertyInteger("Store Rows From Heap", NULL,
+							   (int64) st->gheaprows, es);
+		ExplainPropertyInteger("Store Pages Absent", NULL,
+							   (int64) st->gabsent, es);
+		ExplainPropertyInteger("Heap Fetches", NULL, (int64) st->fetched, es);
+		if (st->removed > 0 || (st->builds > 0 && !st->exact))
+			ExplainPropertyInteger("Rows Removed by Lion Recheck", NULL,
+								   (int64) st->removed, es);
+		if (st->builds > 0)
+		{
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "%d containers, %s", st->ncont,
+							 st->degraded ? "degraded" :
+							 st->exact ? "exact" : "rechecked");
+			if (st->builds > 1)
+				appendStringInfo(&buf, ", %llu scans",
+								 (unsigned long long) st->builds);
+			ExplainPropertyText("Lion Set", buf.data, es);
+		}
+	}
+	pfree(buf.data);
+}
+
+/* ---------------------------------------------------------------------
  * Initialisation, from _PG_init (lion_am.c)
  * --------------------------------------------------------------------- */
 
@@ -5100,7 +7155,22 @@ lion_ordered_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	/*
+	 * DESIGN.md §40, "As built: the row gather": a plain scan of the rows a
+	 * lion set keeps with the columns the window stores hold.  Off, it is
+	 * never offered.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_store_scan",
+							 "Lets LionStoreScan return the rows lion indexes select with the columns their window stores hold.",
+							 "Off, such a query reads its columns from the heap, as core's scans do.",
+							 &lion_enable_store_scan,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	RegisterCustomScanMethods(&lo_scan_methods);
+	RegisterCustomScanMethods(&ls_scan_methods);
 
 	lion_prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = lion_ordered_set_rel_pathlist;
