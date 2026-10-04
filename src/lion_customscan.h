@@ -2523,6 +2523,7 @@ typedef enum LionCompetitor
 	LION_COMPETITOR_INDEXONLY,
 	LION_COMPETITOR_INDEX,
 	LION_COMPETITOR_BITMAP,
+	LION_COMPETITOR_BITMAP_HEAP,	/* of one index, unaggregated */
 	LION_COMPETITOR_OTHER
 } LionCompetitor;
 
