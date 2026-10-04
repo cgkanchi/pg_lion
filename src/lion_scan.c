@@ -4014,10 +4014,27 @@ LionSource *
 lion_source_open(Relation index, ScanKey keys, int nkeys, bool keeppins,
 				 MemoryContext cxt)
 {
+	return lion_source_open_ext(index, keys, nkeys, keeppins, false, cxt);
+}
+
+/*
+ * ... and, with keysexact, a source that trusts a multi-key column's sets
+ * where they answer exactly - mode KEYS, as the bitmap path and the
+ * index-only scan trust them (§29.6) - rather than rechecking them, and keeps
+ * their pins under the list pin budget when keeppins: the source an
+ * index-only scan builds (so->wantitup, which nothing else of the scan's
+ * reads here).  For LionStoreScan (lion_ordered.c, DESIGN.md §40), whose rows
+ * from the store are checked against nothing.
+ */
+LionSource *
+lion_source_open_ext(Relation index, ScanKey keys, int nkeys, bool keeppins,
+					 bool keysexact, MemoryContext cxt)
+{
 	LionScanOpaque so;
 	MemoryContext oldcxt = MemoryContextSwitchTo(cxt);
 
 	so = (LionScanOpaque) palloc0(sizeof(LionScanOpaqueData));
+	so->wantitup = keysexact;
 	so->ix = lion_get_index_state(index);
 	so->cols = (LionScanCol *) palloc0(sizeof(LionScanCol) * so->ix->ncolumns);
 	so->index = index;

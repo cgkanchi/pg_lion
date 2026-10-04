@@ -968,9 +968,10 @@ lion_index_correlation(PlannerInfo *root, IndexPath *path)
  * its index quals on every row it fetches: when it leaves a qual unanswered
  * (a range beside its column's sets, a second walk or long list, a walk
  * beside a list, an `IS NOT NULL` beside anything that answers), when it
- * answers a multi-key column, and for a UNION.  An index-only scan does not
- * recheck what a multi-key column's sets answer exactly, LION_QMODE_KEYS
- * (liongettuple(), DESIGN.md §40): only a query that needs every row
+ * answers a multi-key column, and for a UNION.  Under keysexact - an
+ * index-only scan (liongettuple(), DESIGN.md §40), or LionStoreScan's source
+ * (lion_source_open_ext()) - what a multi-key column's sets answer exactly,
+ * LION_QMODE_KEYS, is not rechecked: only a query that needs every row
  * (lion_cost_qual_is_full()), and the column's `IS NOT NULL`.
  *
  * *unions says whether the scan is a UNION (lion_source_build()): a
@@ -982,11 +983,10 @@ lion_index_correlation(PlannerInfo *root, IndexPath *path)
 #define LION_PLAIN_LIST		2
 
 static int
-lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
-					  bool *rechecks, bool *unions)
+lion_plain_scan_shape_ext(PlannerInfo *root, IndexPath *path, bool keysexact,
+						  int *walkcol, bool *rechecks, bool *unions)
 {
 	IndexOptInfo *index = path->indexinfo;
-	bool		indexonly = (path->path.pathtype == T_IndexOnlyScan);
 	int			ncols = index->nkeycolumns;
 	int			nsets = 0;
 	int			nlists = 0;
@@ -1043,7 +1043,7 @@ lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
 					else
 						keys = true;
 				}
-				if (!indexonly || whole)
+				if (!keysexact || whole)
 					*rechecks = true;
 				if (keys)
 					nmkkeys++;
@@ -1115,6 +1115,19 @@ lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
 }
 
 /*
+ * ... for the scan path is: an index-only scan trusts a multi-key column's
+ * exact answers (liongettuple()), a plain scan rechecks them.
+ */
+static int
+lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
+					  bool *rechecks, bool *unions)
+{
+	return lion_plain_scan_shape_ext(root, path,
+									 path->path.pathtype == T_IndexOnlyScan,
+									 walkcol, rechecks, unions);
+}
+
+/*
  * How many entries a WALK of key column c reads (LION_PLAIN_WALK): the
  * column's n_distinct, or the entries of its range's walk when a range bounds
  * it (lion_cost_walk_entries(), summaries and all) - the same count
@@ -1143,7 +1156,8 @@ lion_plain_walk_entries(PlannerInfo *root, IndexPath *path, int c)
  * What LionStoreScan (lion_ordered.c; DESIGN.md §40, "As built: the row
  * gather") asks of each lion leaf it streams under its pins: does the source
  * of path answer its quals exactly - no recheck and no UNION
- * (lion_plain_scan_shape()) - and does it hand out its containers in ONE
+ * (lion_plain_scan_shape_ext(), trusting a multi-key column's exact answers
+ * as the node's source does) - and does it hand out its containers in ONE
  * ascending run of container keys, which is what an OR merges its arms by?
  * Returned is how many runs over the heap's windows it makes: 1 for a SETS
  * source, a WALK's entries (lion_plain_walk_entries()), a long list's
@@ -1161,7 +1175,8 @@ lion_plain_scan_passes(PlannerInfo *root, IndexPath *path, bool *sorted,
 	int			shape;
 	int			c;
 
-	shape = lion_plain_scan_shape(root, path, &walkcol, &rechecks, &unions);
+	shape = lion_plain_scan_shape_ext(root, path, true, &walkcol, &rechecks,
+									  &unions);
 	*exact = !rechecks && !unions;
 	*sorted = false;
 	if (shape == LION_PLAIN_WALK)
