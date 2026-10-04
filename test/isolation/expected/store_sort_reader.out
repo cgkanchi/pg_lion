@@ -1,6 +1,6 @@
 Parsed test spec with 2 sessions
 
-starting permutation: s2_delete_most s2_window s1_read s2_vacuum s2_window s2_detach s2_wakeup s1_check
+starting permutation: s2_delete_most s2_window s1_read s2_vacuum s2_window s2_detach s2_wakeup s2_window_after s1_check
 injection_points_attach
 -----------------------
                        
@@ -40,6 +40,21 @@ stored
 {1,v1}
 (1 row)
 
+step s2_wakeup: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s2_window_after: 
+	SELECT generation, nsorted, entries, appended
+	  FROM lion_index_store_window('stsr_i', 0);
+
+generation|nsorted|entries|appended
+----------+-------+-------+--------
+         2|    750|    750|       0
+(1 row)
+
 step s1_check: 
 	SELECT k, t, lion_index_stored('stsr_i', ctid) AS stored
 	  FROM stsr WHERE ctid = '(0,1)';
@@ -55,14 +70,8 @@ lion_index_verify
                  
 (1 row)
 
-step s2_wakeup: <... completed>
-injection_points_wakeup
------------------------
-                       
-(1 row)
 
-
-starting permutation: s2_delete_most s1_read s2_wakeup_once s2_parked s2_vacuum s2_window s2_detach s2_wakeup s1_check
+starting permutation: s2_delete_most s1_read s2_wakeup_once s2_parked s2_vacuum s2_window s2_detach s2_wakeup s2_window_after s1_check
 injection_points_attach
 -----------------------
                        
@@ -110,6 +119,21 @@ stored
 {1,v1}
 (1 row)
 
+step s2_wakeup: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s2_window_after: 
+	SELECT generation, nsorted, entries, appended
+	  FROM lion_index_store_window('stsr_i', 0);
+
+generation|nsorted|entries|appended
+----------+-------+-------+--------
+         2|    750|    750|       0
+(1 row)
+
 step s1_check: 
 	SELECT k, t, lion_index_stored('stsr_i', ctid) AS stored
 	  FROM stsr WHERE ctid = '(0,1)';
@@ -123,11 +147,5 @@ k|t |stored
 lion_index_verify
 -----------------
                  
-(1 row)
-
-step s2_wakeup: <... completed>
-injection_points_wakeup
------------------------
-                       
 (1 row)
 
