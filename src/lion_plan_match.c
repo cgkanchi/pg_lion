@@ -1603,8 +1603,13 @@ lion_store_agg_classify(Aggref *agg, Index rti, AttrNumber *attno, int *width,
  * alike: what the store holds of either is the row's own value.  Not a
  * partial index, whose store holds its predicate's rows alone, nor a key
  * column that is an expression, whose value is not the heap column's (its
- * indexkeys entry is 0 and matches nothing).  Of several, the one with the
- * fewest stored columns, whose store pages are fewer for the same windows.
+ * indexkeys entry is 0 and matches nothing).  Of several, first one in
+ * key-ordered windows (DESIGN.md §41) whose order column the relation's
+ * restriction pins to an equality or IN list, whose members are adjacent
+ * slots; then one in heap order; then one ordered by another column, which
+ * reads the permutation besides and has lost the heap's locality; and among
+ * equals the one with the fewest stored columns, whose store pages are fewer
+ * for the same windows.
  */
 IndexOptInfo *
 lion_find_store_index(RelOptInfo *rel, List *attnos, List **idxcols)
@@ -1612,6 +1617,7 @@ lion_find_store_index(RelOptInfo *rel, List *attnos, List **idxcols)
 	Oid			amoid = lion_get_am_oid();
 	IndexOptInfo *best = NULL;
 	int			bestn = 0;
+	int			bestrank = 0;
 	ListCell   *lc;
 
 	*idxcols = NIL;
@@ -1651,11 +1657,26 @@ lion_find_store_index(RelOptInfo *rel, List *attnos, List **idxcols)
 			}
 			cols = lappend_int(cols, (int) ix->stored[ord].attno);
 		}
-		if (all && (best == NULL || ix->nstored < bestn))
+		if (all)
 		{
-			best = idx;
-			bestn = ix->nstored;
-			*idxcols = cols;
+			int			rank = 1;
+
+			if (ix->store_order >= 0)
+			{
+				LionStoreShape sh;
+
+				lion_store_shape(ix, idx, 0.0, &sh);
+				lion_store_shape_pin(idx, &sh, rel->baserestrictinfo, NIL);
+				rank = sh.nvals >= 1.0 ? 0 : 2;
+			}
+			if (best == NULL || rank < bestrank ||
+				(rank == bestrank && ix->nstored < bestn))
+			{
+				best = idx;
+				bestn = ix->nstored;
+				bestrank = rank;
+				*idxcols = cols;
+			}
 		}
 		index_close(indexrel, AccessShareLock);
 	}

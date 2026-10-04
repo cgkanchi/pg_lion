@@ -2553,6 +2553,9 @@ extern double lion_units_margin_for(RelOptInfo *rel);
 /* lion_plan_cost.c */
 extern double lion_index_dir_pages(IndexOptInfo *idx, double *height);
 extern double lion_index_store_pages(IndexOptInfo *idx, int *nstored);
+struct LionStoreShape;
+extern double lion_index_store_shape(IndexOptInfo *idx, int *nstored,
+									 struct LionStoreShape *sh);
 extern void lion_cost_store_path(PlannerInfo *root, CustomPath *cpath,
 								 List *targets, int ncols, int ngroup,
 								 double groups, double outrows, int naggs,

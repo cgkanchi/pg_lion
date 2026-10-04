@@ -31,6 +31,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/htup_details.h"
 #include "access/tupmacs.h"
 #include "access/xact.h"
@@ -40,10 +42,12 @@
 #include "common/hashfn.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/pathnodes.h"
 #include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
 #include "storage/lmgr.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -5740,4 +5744,132 @@ lion_store_compare(LionStoreReader *r, ItemPointer tid, Datum d, bool isnull)
 	}
 	lion_store_gather_reset(r);
 	return result;
+}
+
+/* ---------------------------------------------------------------------
+ * 9. The readers' page model (DESIGN.md §41, "Costs")
+ *
+ * Every reader's cost function prices a window's chain of a column as it
+ * would for heap order, and asks here what an ordered index changes: the
+ * permutation's pages are not a column's, every gather reads the
+ * permutation too, and the members of one value of the order column are
+ * adjacent slots.
+ * --------------------------------------------------------------------- */
+
+void
+lion_store_shape(LionIndexState *ix, IndexOptInfo *idx, double storepages,
+				 LionStoreShape *sh)
+{
+	RelOptInfo *rel = idx->rel;
+	double		windows = Max(1.0, ceil(Max((double) rel->pages, 1.0) /
+										LION_BLOCKS_PER_CONTAINER));
+
+	memset(sh, 0, sizeof(LionStoreShape));
+	sh->datapages = storepages;
+	sh->rowsper = Max(rel->tuples, 1.0) / windows;
+	if (ix->store_order < 0 || ix->nstored == 0)
+		return;
+	sh->ordered = true;
+
+	/*
+	 * Two bytes a row and the sub-arrays' headers: a window of up to about
+	 * 3,500 rows has one permutation page.  The meta page counts the store's
+	 * pages all together, so the columns' share is what is left.
+	 */
+	sh->permpages = Max(1.0, ceil(sh->rowsper * (sizeof(uint16) + 0.25) /
+								  (double) LION_PAGE_CAPACITY));
+	sh->datapages = Max(storepages - sh->permpages * windows, 0.0);
+	sh->ordercol = ix->stored[ix->store_order].attno;
+}
+
+void
+lion_store_shape_pin(IndexOptInfo *idx, LionStoreShape *sh, List *clauses,
+					 List *except)
+{
+	RelOptInfo *rel = idx->rel;
+	AttrNumber	hattno;
+	double		best = 0.0;
+	ListCell   *lc;
+
+	sh->nvals = 0.0;
+	if (!sh->ordered || sh->ordercol < 1 || sh->ordercol > idx->ncolumns)
+		return;
+	hattno = idx->indexkeys[sh->ordercol - 1];
+	if (hattno <= 0)
+		return;
+
+	foreach(lc, clauses)
+	{
+		Node	   *clause = (Node *) lfirst(lc);
+		double		n = 0.0;
+		Node	   *var = NULL;
+
+		if (IsA(clause, RestrictInfo))
+			clause = (Node *) ((RestrictInfo *) clause)->clause;
+		if (list_member(except, clause))
+			continue;			/* a filter on what the access returns */
+
+		if (IsA(clause, OpExpr) && list_length(((OpExpr *) clause)->args) == 2)
+		{
+			OpExpr	   *op = (OpExpr *) clause;
+			Node	   *l = strip_implicit_coercions(linitial(op->args));
+			Node	   *r = strip_implicit_coercions(lsecond(op->args));
+
+			if (!op_mergejoinable(op->opno, exprType(l)))
+				continue;
+			if (IsA(r, Const) || IsA(r, Param))
+				var = l;
+			else if (IsA(l, Const) || IsA(l, Param))
+				var = r;
+			n = 1.0;
+		}
+		else if (IsA(clause, ScalarArrayOpExpr) &&
+				 ((ScalarArrayOpExpr *) clause)->useOr)
+		{
+			ScalarArrayOpExpr *sa = (ScalarArrayOpExpr *) clause;
+			Node	   *l = strip_implicit_coercions(linitial(sa->args));
+			Node	   *r = lsecond(sa->args);
+
+			if (!op_mergejoinable(sa->opno, exprType(l)))
+				continue;
+			if (IsA(r, Const) && !((Const *) r)->constisnull)
+			{
+				ArrayType  *arr = DatumGetArrayTypeP(((Const *) r)->constvalue);
+
+				n = (double) ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
+			}
+			else if (IsA(r, ArrayExpr))
+				n = (double) list_length(((ArrayExpr *) r)->elements);
+			var = l;
+		}
+		if (var == NULL || n < 1.0 || !IsA(var, Var) ||
+			((Var *) var)->varno != (int) rel->relid ||
+			((Var *) var)->varattno != hattno)
+			continue;
+		if (best == 0.0 || n < best)
+			best = n;
+	}
+	sh->nvals = best;
+}
+
+double
+lion_store_window_pages(const LionStoreShape *sh, double heapreads,
+						double colpages, double members)
+{
+	double		nvals = sh->nvals;
+	double		reads = heapreads;
+
+	if (!sh->ordered)
+		return heapreads;
+	if (nvals >= 1.0 && members >= 1.0)
+	{
+		double		perslot = Max(colpages, 1.0) / Max(sh->rowsper, 1.0);
+		double		pervalue = Max(members / nvals, 1.0);
+
+		/* the pages m / nvals adjacent slots span, for each value */
+		reads = Min(heapreads,
+					nvals * (1.0 + (pervalue - 1.0) * perslot));
+		reads = Max(reads, 1.0);
+	}
+	return reads + sh->permpages;
 }
