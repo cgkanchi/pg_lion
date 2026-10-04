@@ -17,6 +17,13 @@
  * the reference its plans run at, and the path's own price is multiplied by
  * it (lion_units_price()).
  *
+ * The scans of a base relation have rates too - a plain index scan, an
+ * index-only scan, a bitmap heap scan of one index - which only the row
+ * gather (LionStoreScan) meets: lion's other paths of a base relation are
+ * LionOrdered, not converted, and the count's and the joins' competitors are
+ * aggregates and joins over those scans (DESIGN.md §40, "As built: the row
+ * gather, priced").
+ *
  * The price is converted whole, its pages with its CPU terms.  A rate is the
  * ratio of two whole plans' cost units a millisecond, pages and all, and a
  * time in one unit is a time in another by that one factor.  Converting the
@@ -49,6 +56,7 @@ static const char *const lion_competitor_names[] = {
 	[LION_COMPETITOR_INDEXONLY] = "index-only scan",
 	[LION_COMPETITOR_INDEX] = "index scan",
 	[LION_COMPETITOR_BITMAP] = "bitmap heap scan",
+	[LION_COMPETITOR_BITMAP_HEAP] = "bitmap heap scan of one index",
 	[LION_COMPETITOR_OTHER] = "other",
 };
 
@@ -69,6 +77,14 @@ lion_custom_is_lion(const CustomPath *cp)
 		 strcmp(name, "LionJoinAgg") == 0 ||
 		 strcmp(name, "LionOrdered") == 0 ||
 		 strcmp(name, "LionStoreScan") == 0);
+}
+
+/* Is cp LionStoreScan, the row gather - a scan of lion's, not a plan? */
+static bool
+lion_custom_is_store_scan(const CustomPath *cp)
+{
+	return cp->methods != NULL && cp->methods->CustomName != NULL &&
+		strcmp(cp->methods->CustomName, "LionStoreScan") == 0;
 }
 
 /*
@@ -132,8 +148,20 @@ lion_path_input(Path *path)
  * as core's, and not what a lion path is measured against.  A node this does
  * not know is taken to hold none.
  */
+static bool lion_path_holds_lion(Path *path, bool storescan);
+
 bool
 lion_path_has_lion(Path *path)
+{
+	return lion_path_holds_lion(path, true);
+}
+
+/*
+ * lion_path_has_lion(), with LionStoreScan counted as lion's or not as
+ * storescan says.
+ */
+static bool
+lion_path_holds_lion(Path *path, bool storescan)
 {
 	ListCell   *lc;
 
@@ -147,32 +175,33 @@ lion_path_has_lion(Path *path)
 			{
 				CustomPath *cp = (CustomPath *) path;
 
-				if (lion_custom_is_lion(cp))
+				if (lion_custom_is_lion(cp) &&
+					(storescan || !lion_custom_is_store_scan(cp)))
 					return true;
 				foreach(lc, cp->custom_paths)
-					if (lion_path_has_lion((Path *) lfirst(lc)))
+					if (lion_path_holds_lion((Path *) lfirst(lc), storescan))
 						return true;
 				return false;
 			}
 		case T_AppendPath:
 			foreach(lc, ((AppendPath *) path)->subpaths)
-				if (lion_path_has_lion((Path *) lfirst(lc)))
+				if (lion_path_holds_lion((Path *) lfirst(lc), storescan))
 					return true;
 			return false;
 		case T_MergeAppendPath:
 			foreach(lc, ((MergeAppendPath *) path)->subpaths)
-				if (lion_path_has_lion((Path *) lfirst(lc)))
+				if (lion_path_holds_lion((Path *) lfirst(lc), storescan))
 					return true;
 			return false;
 		case T_NestPath:
 		case T_MergePath:
 		case T_HashPath:
-			return lion_path_has_lion(((JoinPath *) path)->outerjoinpath) ||
-				lion_path_has_lion(((JoinPath *) path)->innerjoinpath);
+			return lion_path_holds_lion(((JoinPath *) path)->outerjoinpath, storescan) ||
+				lion_path_holds_lion(((JoinPath *) path)->innerjoinpath, storescan);
 		case T_ForeignPath:
-			return lion_path_has_lion(((ForeignPath *) path)->fdw_outerpath);
+			return lion_path_holds_lion(((ForeignPath *) path)->fdw_outerpath, storescan);
 		default:
-			return lion_path_has_lion(lion_path_input(path));
+			return lion_path_holds_lion(lion_path_input(path), storescan);
 	}
 }
 
@@ -207,13 +236,16 @@ lion_nestloop_probes_index(JoinPath *jp)
  *	- an aggregate that hashes, anywhere above a scan - a Finalize Agg over
  *	  the Partial HashAggregates of a parallel plan included - is a HASHED
  *	  AGGREGATE: hashing is what core charges far below its time;
- *	- a bitmap heap scan is a BITMAP heap scan, aggregated by a plain or
- *	  sorted aggregate or not;
+ *	- a bitmap heap scan of one index, unaggregated, is a BITMAP HEAP scan
+ *	  of one index; any other, aggregated by a plain or sorted aggregate or
+ *	  not, a BITMAP heap scan;
  *	- a plain or sorted aggregate over a sequential, index-only or index scan
  *	  is an AGGREGATE over a scan, and the scan alone its own kind;
  *	- a nested loop over anything else is OTHER, and so is anything else
  *	  but under a hashed aggregate;
- *	- an Append is the kind of its dearest child, which most of its time is.
+ *	- an Append is the kind of its dearest child, which most of its time is;
+ *	- LionStoreScan, a scan priced in core's units, is a scan under core's
+ *	  aggregate (lion_competitor_path()): HASHAGG or AGG over it.
  */
 LionCompetitor
 lion_competitor_kind(Path *path)
@@ -255,8 +287,12 @@ lion_competitor_kind(Path *path)
 				return hashed ? LION_COMPETITOR_HASHAGG :
 					LION_COMPETITOR_OTHER;
 			case T_BitmapHeapPath:
-				return hashed ? LION_COMPETITOR_HASHAGG :
-					LION_COMPETITOR_BITMAP;
+				if (hashed)
+					return LION_COMPETITOR_HASHAGG;
+				if (!aggregated &&
+					IsA(((BitmapHeapPath *) path)->bitmapqual, IndexPath))
+					return LION_COMPETITOR_BITMAP_HEAP;
+				return LION_COMPETITOR_BITMAP;
 			case T_IndexPath:
 				if (hashed)
 					return LION_COMPETITOR_HASHAGG;
@@ -264,6 +300,14 @@ lion_competitor_kind(Path *path)
 					return LION_COMPETITOR_AGG;
 				return (path->pathtype == T_IndexOnlyScan) ?
 					LION_COMPETITOR_INDEXONLY : LION_COMPETITOR_INDEX;
+			case T_CustomPath:
+				/* the gather, under core's aggregate (see above) */
+				if (!lion_custom_is_store_scan((CustomPath *) path))
+					break;
+				if (hashed)
+					return LION_COMPETITOR_HASHAGG;
+				return aggregated ? LION_COMPETITOR_AGG :
+					LION_COMPETITOR_OTHER;
 			case T_Path:
 				if (hashed)
 					return LION_COMPETITOR_HASHAGG;
@@ -324,11 +368,15 @@ lion_competitor_rate(LionCompetitor kind)
 			return lion_nestloop_rate;
 		case LION_COMPETITOR_BITMAP:
 			return lion_bitmap_rate;
+		case LION_COMPETITOR_BITMAP_HEAP:
+			return lion_bitmap_heap_rate;
+		case LION_COMPETITOR_INDEX:
+			return lion_indexscan_rate;
+		case LION_COMPETITOR_INDEXONLY:
+			return lion_indexonly_rate;
 		case LION_COMPETITOR_NONE:
 		case LION_COMPETITOR_DISABLED:
 		case LION_COMPETITOR_SEQSCAN:
-		case LION_COMPETITOR_INDEXONLY:
-		case LION_COMPETITOR_INDEX:
 		case LION_COMPETITOR_OTHER:
 			break;
 	}
@@ -350,8 +398,48 @@ lion_path_cheaper(const Path *a, const Path *b)
 }
 
 /*
+ * Is path rel's LionStoreScan, under nodes that pass its rows up but neither
+ * aggregate nor join them?
+ */
+static bool
+lion_path_is_store_scan(Path *path)
+{
+	while (path != NULL)
+	{
+		switch (nodeTag(path))
+		{
+			case T_CustomPath:
+				return lion_custom_is_store_scan((CustomPath *) path);
+			case T_AggPath:
+			case T_GroupPath:
+			case T_GroupingSetsPath:
+#if PG_VERSION_NUM >= 190000
+			case T_UniquePath:
+#else
+			case T_UpperUniquePath:
+			case T_UniquePath:
+#endif
+			case T_WindowAggPath:
+				return false;
+			default:
+				break;
+		}
+		path = lion_path_input(path);
+	}
+	return false;
+}
+
+/*
  * The cheapest of core's paths in rel so far: unparameterized, and with no
- * lion path inside (lion_path_has_lion()).  NULL when there is none.  The
+ * lion path inside (lion_path_has_lion()) - but for LionStoreScan under an
+ * aggregate or a join, and not rel's scan itself (lion_path_is_store_scan()).
+ * The gather is a scan priced in the units of the scan of core's it
+ * displaced, the plan of core's over it is core's, and core builds its
+ * GROUP BY and joins over the cheapest scan only: with the gather cheapest,
+ * the upper rel has no other plan to price LionCount against, and the
+ * reference rate core's hashed aggregate was a third of priced it at three
+ * times its own (DESIGN.md §40, "As built: the row gather, priced").
+ * NULL when there is none.  The
  * upper rel has every path of core's when create_upper_paths_hook runs, a
  * base rel when set_rel_pathlist_hook runs; a join rel has the paths of the
  * join order and join type set_join_pathlist_hook is called for, and those of
@@ -369,7 +457,7 @@ lion_competitor_path(RelOptInfo *rel)
 
 		if (p->param_info != NULL)
 			continue;
-		if (lion_path_has_lion(p))
+		if (lion_path_is_store_scan(p) || lion_path_holds_lion(p, false))
 			continue;
 		if (best == NULL || lion_path_cheaper(p, best))
 			best = p;
@@ -449,10 +537,10 @@ lion_paths_are_lion_scans(List *subpaths)
 
 /*
  * Is a core path a scan of a lion index through the AM - a plain, index-only
- * or bitmap scan of one, or an Append or MergeAppend of such scans of a
- * partitioned table's partitions, under the nodes that pass its rows up and
- * no join?  Its price is lion's own model's (lioncostestimate()), with lion's
- * errors.
+ * or bitmap scan of one, LionStoreScan, or an Append or MergeAppend of such
+ * scans of a partitioned table's partitions, under the nodes that pass its
+ * rows up and no join?  Its price is lion's own model's (lioncostestimate(),
+ * the gather's own), with lion's errors.
  */
 static bool
 lion_path_is_lion_scan(Path *path)
@@ -465,6 +553,8 @@ lion_path_is_lion_scan(Path *path)
 		{
 			case T_IndexPath:
 				return ((IndexPath *) path)->indexinfo->relam == lionam;
+			case T_CustomPath:
+				return lion_custom_is_store_scan((CustomPath *) path);
 			case T_BitmapHeapPath:
 				return lion_bitmap_reads_lion(((BitmapHeapPath *) path)->bitmapqual,
 											  lionam);

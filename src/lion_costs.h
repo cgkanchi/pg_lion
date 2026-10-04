@@ -96,6 +96,14 @@ extern PGDLLIMPORT double lion_nestloop_rate;
 extern PGDLLIMPORT double lion_bitmap_rate;
 
 /*
+ * ... and the scans a row reader competes with, unaggregated (DESIGN.md §40,
+ * "As built: the row gather, priced"): only LionStoreScan meets them.
+ */
+extern PGDLLIMPORT double lion_indexscan_rate;
+extern PGDLLIMPORT double lion_indexonly_rate;
+extern PGDLLIMPORT double lion_bitmap_heap_rate;
+
+/*
  * The share of a lion path's own price it is offered at (DESIGN.md §39, "The
  * margin"): its price is divided by it, so that it must come to this share
  * of the best core plan's to be chosen.  1 is no margin.

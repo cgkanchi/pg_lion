@@ -30,7 +30,7 @@ SET max_parallel_workers_per_gather = 0;
 -- hundredth to 1
 SELECT name, setting, boot_val, min_val, max_val, context
   FROM pg_settings
- WHERE name ~ '^pg_lion\.([a-z]+_rate|pushdown_margin)$'
+ WHERE name ~ '^pg_lion\.([a-z_]+_rate|pushdown_margin)$'
  ORDER BY name;
 
 -- 60000 rows: g20, g200 and c2 at random, k a permutation of the ids under a
@@ -88,7 +88,9 @@ BEGIN
 	FOREACH n IN ARRAY ARRAY['pg_lion.pushdown_margin', 'pg_lion.hashagg_rate',
 							 'pg_lion.agg_rate', 'pg_lion.hashjoin_rate',
 							 'pg_lion.mergejoin_rate', 'pg_lion.nestloop_rate',
-							 'pg_lion.bitmap_rate', 'pg_lion.enable_count_pushdown',
+							 'pg_lion.bitmap_rate', 'pg_lion.bitmap_heap_rate',
+							 'pg_lion.indexscan_rate', 'pg_lion.indexonly_rate',
+							 'pg_lion.enable_store_scan', 'pg_lion.enable_count_pushdown',
 							 'pg_lion.enable_semijoin', 'pg_lion.enable_ordered_scan',
 							 'enable_seqscan', 'enable_indexscan',
 							 'enable_indexonlyscan', 'enable_bitmapscan',
@@ -244,8 +246,8 @@ SELECT n, lcr_lion(q, sw || '{pg_lion.pushdown_margin, 0.01}') AS forced,
 SELECT n, lcr_lion(q, sw) AS plan,
 	   lcr_cost(q, sw || '{pg_lion.pushdown_margin, 0.01}') =
 	   lcr_cost(q, sw || '{pg_lion.pushdown_margin, 1}') AS same_at_every_margin,
-	   lcr_cost(q, sw || '{pg_lion.hashagg_rate, 0.05, pg_lion.agg_rate, 0.05, pg_lion.hashjoin_rate, 0.05, pg_lion.mergejoin_rate, 0.05, pg_lion.nestloop_rate, 0.05, pg_lion.bitmap_rate, 0.05}'::text[]) =
-	   lcr_cost(q, sw || '{pg_lion.hashagg_rate, 5, pg_lion.agg_rate, 5, pg_lion.hashjoin_rate, 5, pg_lion.mergejoin_rate, 5, pg_lion.nestloop_rate, 5, pg_lion.bitmap_rate, 5}'::text[]) AS same_at_every_rate
+	   lcr_cost(q, sw || '{pg_lion.hashagg_rate, 0.05, pg_lion.agg_rate, 0.05, pg_lion.hashjoin_rate, 0.05, pg_lion.mergejoin_rate, 0.05, pg_lion.nestloop_rate, 0.05, pg_lion.bitmap_rate, 0.05, pg_lion.bitmap_heap_rate, 0.05, pg_lion.indexscan_rate, 0.05, pg_lion.indexonly_rate, 0.05}'::text[]) =
+	   lcr_cost(q, sw || '{pg_lion.hashagg_rate, 5, pg_lion.agg_rate, 5, pg_lion.hashjoin_rate, 5, pg_lion.mergejoin_rate, 5, pg_lion.nestloop_rate, 5, pg_lion.bitmap_rate, 5, pg_lion.bitmap_heap_rate, 5, pg_lion.indexscan_rate, 5, pg_lion.indexonly_rate, 5}'::text[]) AS same_at_every_rate
   FROM (VALUES ('count, forced', 'SELECT count(*) FROM lcr WHERE g200 = 17 AND c2 = 1',
 				'{enable_seqscan, off, enable_bitmapscan, off, enable_indexscan, off, enable_indexonlyscan, off, enable_tidscan, off}'::text[]),
 			   ('group, forced', 'SELECT g20, count(*) FROM lcr GROUP BY g20',
@@ -310,8 +312,8 @@ SELECT lcr_lion(q, '{enable_sort, off, pg_lion.hashagg_rate, 0.001}') AS lowest,
 -- the same at every rate and every margin; LionOrdered (core's ordered index
 -- scan off) at every rate, while the margin marks it up
 SELECT n, lcr_lion(q, sw) AS plan,
-	   lcr_cost(q, sw || '{pg_lion.hashagg_rate, 0.05, pg_lion.agg_rate, 0.05, pg_lion.hashjoin_rate, 0.05, pg_lion.mergejoin_rate, 0.05, pg_lion.nestloop_rate, 0.05, pg_lion.bitmap_rate, 0.05}'::text[]) =
-	   lcr_cost(q, sw || '{pg_lion.hashagg_rate, 5, pg_lion.agg_rate, 5, pg_lion.hashjoin_rate, 5, pg_lion.mergejoin_rate, 5, pg_lion.nestloop_rate, 5, pg_lion.bitmap_rate, 5}'::text[]) AS same_at_every_rate,
+	   lcr_cost(q, sw || '{pg_lion.hashagg_rate, 0.05, pg_lion.agg_rate, 0.05, pg_lion.hashjoin_rate, 0.05, pg_lion.mergejoin_rate, 0.05, pg_lion.nestloop_rate, 0.05, pg_lion.bitmap_rate, 0.05, pg_lion.bitmap_heap_rate, 0.05, pg_lion.indexscan_rate, 0.05, pg_lion.indexonly_rate, 0.05}'::text[]) =
+	   lcr_cost(q, sw || '{pg_lion.hashagg_rate, 5, pg_lion.agg_rate, 5, pg_lion.hashjoin_rate, 5, pg_lion.mergejoin_rate, 5, pg_lion.nestloop_rate, 5, pg_lion.bitmap_rate, 5, pg_lion.bitmap_heap_rate, 5, pg_lion.indexscan_rate, 5, pg_lion.indexonly_rate, 5}'::text[]) AS same_at_every_rate,
 	   lcr_cost(q, sw || '{pg_lion.pushdown_margin, 0.5}') =
 	   lcr_cost(q, sw || '{pg_lion.pushdown_margin, 1}') AS same_at_every_margin
   FROM (VALUES ('am scans', 'SELECT count(*) FROM lcr WHERE g200 = 17 AND c2 = 1',

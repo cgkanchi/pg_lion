@@ -84,6 +84,9 @@ double		lion_hashjoin_rate;
 double		lion_mergejoin_rate;
 double		lion_nestloop_rate;
 double		lion_bitmap_rate;
+double		lion_indexscan_rate;
+double		lion_indexonly_rate;
+double		lion_bitmap_heap_rate;
 double		lion_pushdown_margin;
 
 typedef struct LionCostSetting
@@ -239,6 +242,32 @@ static const LionRateSetting lion_rate_settings[] = {
 	/* §10: 544 to 4,419 page-bound; §22: about 70 TID-bound - no one rate */
 	{"pg_lion.bitmap_rate", &lion_bitmap_rate, 1.0,
 	 "a bitmap heap scan"},
+
+	/*
+	 * The scans of a base relation, unaggregated, which only the row gather
+	 * (LionStoreScan) is priced against (DESIGN.md §40, "As built: the row
+	 * gather, priced"), measured on the quick benchmark's 5,000,000-row fact
+	 * table, release build, warm.  Lion's plain index scans: 1,200 to 1,900
+	 * units a millisecond for 2,500 to 100,000 rows, 840 to 930 where their
+	 * heap pages outgrew shared_buffers.
+	 */
+	{"pg_lion.indexscan_rate", &lion_indexscan_rate, 3.0,
+	 "a plain index scan"},
+	/*
+	 * lion's index-only scans over a store: 410 to 830 where pages are most
+	 * of the price, 230 to 540 where the rows handed up are - priced at
+	 * pg_lion.store_value_cost a value, which LionStoreScan's gather of the
+	 * same values is not (LS_VALUE_COST) - and the node's own price runs at
+	 * up to 930 on a table of a few thousand rows a probe.  Below the low
+	 * end: the node gathers no more columns than the scan, from the same
+	 * chains, and was faster wherever it was timed against it (DESIGN.md
+	 * §40, "As built: the row gather, priced").
+	 */
+	{"pg_lion.indexonly_rate", &lion_indexonly_rate, 0.4,
+	 "an index-only scan"},
+	/* lion's bitmap heap scans of one index: 1,300 to 2,300 (an AND: 520 to 730) */
+	{"pg_lion.bitmap_heap_rate", &lion_bitmap_heap_rate, 3.5,
+	 "a bitmap heap scan of one index, unaggregated"},
 };
 
 /*
