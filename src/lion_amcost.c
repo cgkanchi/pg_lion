@@ -52,6 +52,7 @@
 #include "lion.h"
 #include "lion_costs.h"
 #include "lion_count.h"
+#include "lion_store.h"
 
 /*
  * Peel binary-coercion relabels off an expression, so that a varchar column
@@ -967,7 +968,14 @@ lion_index_correlation(PlannerInfo *root, IndexPath *path)
  * its index quals on every row it fetches: when it leaves a qual unanswered
  * (a range beside its column's sets, a second walk or long list, a walk
  * beside a list, an `IS NOT NULL` beside anything that answers), when it
- * answers a multi-key column, and for a UNION.
+ * answers a multi-key column, and for a UNION.  An index-only scan does not
+ * recheck what a multi-key column's sets answer exactly, LION_QMODE_KEYS
+ * (liongettuple(), DESIGN.md §40): only a query that needs every row
+ * (lion_cost_qual_is_full()), and the column's `IS NOT NULL`.
+ *
+ * *unions says whether the scan is a UNION (lion_source_build()): a
+ * multi-key column read whole is all it answers, or nothing is and column 1
+ * is multi-key.  An index-only scan looks every TID of one up in the heap.
  */
 #define LION_PLAIN_SORTED	0
 #define LION_PLAIN_WALK		1
@@ -975,9 +983,10 @@ lion_index_correlation(PlannerInfo *root, IndexPath *path)
 
 static int
 lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
-					  bool *rechecks)
+					  bool *rechecks, bool *unions)
 {
 	IndexOptInfo *index = path->indexinfo;
+	bool		indexonly = (path->path.pathtype == T_IndexOnlyScan);
 	int			ncols = index->nkeycolumns;
 	int			nsets = 0;
 	int			nlists = 0;
@@ -986,11 +995,14 @@ lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
 	int			nnotnull = 0;
 	int			nrangecols = 0;
 	int			ndropped = 0;
+	int			nmkwhole = 0;	/* multi-key columns read whole */
+	int			nmkkeys = 0;	/* ... whose sets look keys up */
 	bool		anychosen = false;
 	int			c;
 
 	*walkcol = 0;
 	*rechecks = false;
+	*unions = false;
 	if (ncols < 1 || ncols > INDEX_MAX_KEYS)
 		return LION_PLAIN_LIST;
 
@@ -1016,7 +1028,28 @@ lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
 		{
 			nsets++;
 			if (!cc.nomatch)
-				*rechecks = true;
+			{
+				bool		whole = (cc.walk != NULL);
+				bool		keys = false;
+
+				foreach(lc, cc.sets)
+				{
+					bool		all;
+
+					if (lion_cost_qual_is_full(index, c,
+											   (Node *) lfirst_node(RestrictInfo, lc)->clause,
+											   &all))
+						whole = true;
+					else
+						keys = true;
+				}
+				if (!indexonly || whole)
+					*rechecks = true;
+				if (keys)
+					nmkkeys++;
+				else
+					nmkwhole++;
+			}
 			lion_cost_col_free(&cc);
 			continue;
 		}
@@ -1063,9 +1096,12 @@ lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
 	if (!anychosen)
 	{
 		*rechecks = lion_index_is_multikey(index, 0);
+		*unions = lion_index_is_multikey(index, 0);
 		return lion_index_is_multikey(index, 0) ? LION_PLAIN_SORTED :
 			LION_PLAIN_WALK;
 	}
+	*unions = nmkwhole > 0 && nmkkeys == 0 && nsets == nmkwhole &&
+		nlists == 0 && nrangecols == 0 && nnotnull == 0;
 	if (nlists > 0)
 		return LION_PLAIN_LIST;
 	if (nsets > 0)
@@ -1101,6 +1137,78 @@ lion_plain_walk_entries(PlannerInfo *root, IndexPath *path, int c)
 															  JOIN_INNER, NULL));
 	list_free(ranges);
 	return Max(1.0, entries);
+}
+
+/*
+ * What LionStoreScan (lion_ordered.c; DESIGN.md §40, "As built: the row
+ * gather") asks of each lion leaf it streams under its pins: does the source
+ * of path answer its quals exactly - no recheck and no UNION
+ * (lion_plain_scan_shape()) - and does it hand out its containers in ONE
+ * ascending run of container keys, which is what an OR merges its arms by?
+ * Returned is how many runs over the heap's windows it makes: 1 for a SETS
+ * source, a WALK's entries (lion_plain_walk_entries()), a long list's
+ * batches.  A range beside other columns' sets is a WALK there, not the
+ * WINDOW lion_plain_scan_shape() calls sorted: a source that keeps its pins
+ * walks entry by entry (lion_source_build()).
+ */
+double
+lion_plain_scan_passes(PlannerInfo *root, IndexPath *path, bool *sorted,
+					   bool *exact)
+{
+	int			walkcol;
+	bool		rechecks;
+	bool		unions;
+	int			shape;
+	int			c;
+
+	shape = lion_plain_scan_shape(root, path, &walkcol, &rechecks, &unions);
+	*exact = !rechecks && !unions;
+	*sorted = false;
+	if (shape == LION_PLAIN_WALK)
+		return lion_plain_walk_entries(root, path, walkcol);
+	if (shape == LION_PLAIN_LIST)
+	{
+		double		batches = 1.0;
+		ListCell   *lc;
+
+		foreach(lc, path->indexclauses)
+		{
+			IndexClause *iclause = (IndexClause *) lfirst(lc);
+			ListCell   *lc2;
+
+			foreach(lc2, iclause->indexquals)
+			{
+				Node	   *cl = (Node *) lfirst_node(RestrictInfo, lc2)->clause;
+				double		n;
+
+				if (!IsA(cl, ScalarArrayOpExpr))
+					continue;
+#if PG_VERSION_NUM >= 170000
+				n = estimate_array_length(root,
+										  (Node *) lsecond(((ScalarArrayOpExpr *) cl)->args));
+#else
+				n = estimate_array_length((Node *) lsecond(((ScalarArrayOpExpr *) cl)->args));
+#endif
+				batches = Max(batches, ceil(n / (double) lion_scan_list_batch()));
+			}
+		}
+		return batches;
+	}
+	for (c = 0; c < path->indexinfo->nkeycolumns; c++)
+	{
+		LionCostCol cc;
+		bool		range;
+
+		lion_cost_col_quals(path, c, &cc);
+		range = cc.nquals > 0 && !cc.nomatch && cc.walk != NULL &&
+			!IsA(cc.walk->clause, NullTest) &&
+			!lion_index_is_multikey(path->indexinfo, c);
+		lion_cost_col_free(&cc);
+		if (range)
+			return lion_plain_walk_entries(root, path, c);
+	}
+	*sorted = true;
+	return 1.0;
 }
 
 /*
@@ -1166,6 +1274,136 @@ lion_plain_meets_workers(RelOptInfo *rel, double pages)
 		return false;
 	return compute_parallel_worker(rel, pages, -1,
 								   max_parallel_workers_per_gather) > 0;
+}
+
+/*
+ * What an index-only scan of index gathers (DESIGN.md §40, "Index-only
+ * scans"): the number of stored columns it returns - every one
+ * lioncanreturn() answers for, whichever of them the query reads, since
+ * liongettuple() is not told and gathers them all - with the number of
+ * stored columns and the store pages the meta page counts.  Nothing for a
+ * hypothetical index, which has no pages to read it off.
+ */
+static int
+lion_ios_store_info(IndexOptInfo *index, int *nstored, double *storepages)
+{
+	Relation	indexrel;
+	LionIndexState *ix;
+	int			nret = 0;
+	int			i;
+
+	*nstored = 0;
+	*storepages = 0.0;
+	if (index->hypothetical)
+		return 0;
+
+	indexrel = index_open(index->indexoid, AccessShareLock);
+	ix = lion_get_index_state(indexrel);
+	for (i = 0; i < ix->nstored; i++)
+		if (ix->stored[i].returnable)
+			nret++;
+	*nstored = ix->nstored;
+	if (nret > 0)
+	{
+		LionMetaPageData meta;
+		LionMetaStore store;
+
+		/* the count is kept exact on the meta page, not in the cached state */
+		lion_read_meta(indexrel, &meta);
+		lion_read_meta_store(indexrel, &meta, &store);
+		*storepages = (double) store.store_pages;
+	}
+	index_close(indexrel, AccessShareLock);
+	return nret;
+}
+
+/*
+ * The gather of an index-only scan (DESIGN.md §40, "Costs"), in core's units.
+ * The index-only path is core's own, priced beside core's index and bitmap
+ * scans of the heap, so the pages its gather reads are priced as core prices
+ * the heap's, and not in lion's units alone (lion_plan_units.c), which the
+ * custom nodes are priced in and converted at the margin: liongettuple()
+ * gathers every column lioncanreturn() answers for - it is not told which
+ * the query reads - and for every window a batch touches it reads that
+ * window's whole chain of store pages of each of the nret columns, the first
+ * page of a chain found through the map (spc_random_page_cost) and the rest
+ * in its order (spc_seq_page_cost each), decodes each page it reads
+ * (LION_STORE_PAGE_COST, the CPU the custom nodes are charged for a store
+ * page), and hands up a value of each column for every row returned
+ * (LION_STORE_VALUE_COST).  A window's pages of a column are the store's
+ * pages spread over the windows of the heap and its stored columns, one at
+ * least.  The windows `tuples` rows touch are counted as the heap pages are,
+ * in units of a window: Cardenas's count for rows scattered over them, the
+ * share of them the rows cover for rows packed in heap order, interpolated
+ * by the column's correlation squared, as cost_index() interpolates its
+ * ends.  A WALK touches a pass's windows once per pass.
+ *
+ * Priced at LION_STORE_PAGE_COST a page and nothing for the read (0.02 at
+ * the defaults, CPU against the heap page's I/O) the scan was taken for a
+ * filter keeping 0.5% of 5M rows scattered over every window, where it read
+ * the whole store - 62,000 pages for 25,000 rows, 4 columns of 58,600, one
+ * of them wide - at 2,800 against the heap scan's 58,000, and ran three
+ * times slower than that heap scan (2026-10-03, DESIGN.md §40, "As built:
+ * the price of the index-only scan").  At core's page costs the same scan is
+ * 81,000, and the heap is taken (even with it cold, three times faster
+ * warm); for the filter keeping 5% the same columns are 94,000 against the
+ * heap scan's 104,000, and the store is taken, faster cold and warm.  The
+ * index-only scan of four narrow stored columns for the 0.5% filter, 21,000
+ * pages against the heap's 22,000, is 37,000 and taken, and is four times
+ * faster than the heap scan cold and twice slower warm, which is what core's
+ * page costs say of a scan that reads as many pages in chains as the heap
+ * scan reads at random.
+ */
+static Cost
+lion_ios_gather_cost(RelOptInfo *baserel, double tuples, double passes,
+					 double corr, int nret, int nstored, double storepages)
+{
+	double		W;
+	double		perpass;
+	double		scattered;
+	double		packed;
+	double		windows;
+	double		colpages;
+	double		spc_random_page_cost;
+	double		spc_seq_page_cost;
+
+	Assert(nret > 0 && nstored >= nret);
+	get_tablespace_page_costs(baserel->reltablespace, &spc_random_page_cost,
+							  &spc_seq_page_cost);
+	W = ceil(Max((double) baserel->pages, 1.0) /
+			 (double) LION_BLOCKS_PER_CONTAINER);
+	passes = Max(passes, 1.0);
+	perpass = Max(tuples / passes, 1.0);
+	scattered = Min(W, (2.0 * W * perpass) / (2.0 * W + perpass));
+	packed = Min(W, ceil(W * perpass / Max(baserel->tuples, 1.0)));
+	windows = scattered + corr * corr * (packed - scattered);
+	windows = Min(passes * Max(windows, 1.0), Max(tuples, 1.0));
+	colpages = Max(1.0, storepages / (W * (double) nstored));
+
+	return tuples * (double) nret * LION_STORE_VALUE_COST +
+		windows * (double) nret *
+		(colpages * LION_STORE_PAGE_COST +
+		 spc_random_page_cost + (colpages - 1.0) * spc_seq_page_cost);
+}
+
+/*
+ * Does the index-only path answer its quals with no recheck, and from its
+ * own sets rather than a UNION (lion_plain_scan_shape())?  What lion's
+ * planner hook asks of an index-only path whose quals name a key column the
+ * store does not return (lion_selfuncs.c): the executor never evaluates such
+ * a qual, nor reads the column, only when the scan sets no xs_recheck - and
+ * liongettuple() takes every row of one that does from the heap.
+ */
+bool
+lion_index_only_exact(PlannerInfo *root, IndexPath *path)
+{
+	int			walkcol;
+	bool		rechecks;
+	bool		unions;
+
+	Assert(path->path.pathtype == T_IndexOnlyScan);
+	(void) lion_plain_scan_shape(root, path, &walkcol, &rechecks, &unions);
+	return !rechecks && !unions;
 }
 
 /*
@@ -1236,6 +1474,23 @@ lion_plain_meets_workers(RelOptInfo *rel, double pages)
  * every page is clamped there, about the bitmap heap scan's, and the fetches
  * that make the plain scan dearer are lost; what the correlation cannot carry
  * is charged to the path once it is built (lion_plain_note_remainder()).
+ *
+ * An index-only scan that returns stored columns (DESIGN.md §40, "Index-only
+ * scans") is priced as the plain scan of the same shape, its heap side as
+ * cost_index() prices one: the pages and the per-row fetches of the share of
+ * the heap that is not all-visible (allvisfrac), the executor's fetches - and
+ * cost_index()'s ends scaled as it scales them - plus the gather
+ * (lion_ios_gather_cost()).  A UNION looks every TID up in the heap itself,
+ * whatever the visibility map says, and gathers nothing: its heap side is the
+ * plain scan's.  The gather is not part of the index's own cost, which the
+ * bitmap scan of the same index path is charged as well and which gathers
+ * nothing, so it rides on the correlation as the fetches do, and what that
+ * cannot carry - most of it, on a table that is mostly all-visible, where
+ * both ends are near zero - is the remainder, noted for a parameterized path
+ * too (lion_plain_set_rel_pathlist() charges it).  One that returns no
+ * column - `count(*)`, the only kind an index that stores nothing gets - is
+ * left as it was: no qual and a whole column, and a multi-key one, the only
+ * kind in heap order, fetches every TID it hands out (liongettuple()).
  */
 static double
 lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
@@ -1263,21 +1518,36 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
 	double		bmpages;		/* the pages a bitmap heap scan reads */
 	double		share;			/* of the price between random and seq */
 	bool		serial;			/* against a parallel bitmap heap scan */
+	bool		indexonly = (path->path.pathtype == T_IndexOnlyScan);
+	bool		unions;
+	double		fetchfrac = 1.0;	/* the share of the heap fetched */
+	int			nret = 0;		/* stored columns an index-only scan returns */
+	int			nstored = 0;
+	double		storepages = 0.0;
 	int			walkcol;
 	int			shape;
 
-	/*
-	 * An index-only scan is left as it was: lion's are of queries that need no
-	 * column, so they have no qual and read a whole column, and a multi-key
-	 * one - the only kind in heap order - fetches every TID it hands out
-	 * (liongettuple()), which the all-visible fraction cost_index() applies
-	 * would not describe.
-	 */
-	if (path->path.pathtype == T_IndexOnlyScan)
-		return corr;
-	shape = lion_plain_scan_shape(root, path, &walkcol, &rechecks);
+	/* An index-only scan that returns no column is left as it was. */
+	if (indexonly)
+	{
+		nret = lion_ios_store_info(index, &nstored, &storepages);
+		if (nret == 0)
+			return corr;
+	}
+	shape = lion_plain_scan_shape(root, path, &walkcol, &rechecks, &unions);
 	if (shape == LION_PLAIN_LIST)
+	{
+		/* a LIST's heap side is cost_index()'s; the gather is the remainder */
+		if (indexonly)
+			lion_plain_note_remainder(root, path,
+									  lion_ios_gather_cost(baserel,
+														   clamp_row_est(sel * baserel->tuples),
+														   1.0, corr, nret,
+														   nstored, storepages));
 		return corr;
+	}
+	if (indexonly && !unions)
+		fetchfrac = 1.0 - baserel->allvisfrac;
 
 	T = (baserel->pages > 1) ? (double) baserel->pages : 1.0;
 	tuples = clamp_row_est(sel * baserel->tuples);
@@ -1351,6 +1621,31 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
 	target += corr * corr * (min_io - target);
 
 	/*
+	 * An index-only scan: the share of that the executor fetches, and
+	 * cost_index()'s ends as it computes them for one, each count of pages
+	 * scaled by the share of the heap that is not all-visible.
+	 */
+	if (indexonly)
+	{
+		double		visfrac = 1.0 - baserel->allvisfrac;
+
+		target *= fetchfrac;
+		max_pages = ceil(max_pages * visfrac);
+		min_pages = ceil(min_pages * visfrac);
+		if (loop_count > 1)
+		{
+			max_io = max_pages * spc_random_page_cost / loop_count;
+			min_io = min_pages * spc_random_page_cost / loop_count;
+		}
+		else
+		{
+			max_io = max_pages * spc_random_page_cost;
+			min_io = (min_pages > 0) ? spc_random_page_cost +
+				Max(min_pages - 1.0, 0.0) * spc_seq_page_cost : 0.0;
+		}
+	}
+
+	/*
 	 * The rows: the bitmap entry, the index quals when the scan rechecks them
 	 * (§29.6) - cost_bitmap_heap_scan() charges them always, but an exact
 	 * scan evaluates none, and charged them it lost `lion_pdn`'s count of
@@ -1362,11 +1657,16 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
 	target += tuples * ((rechecks ? qcost.per_tuple : 0.0) +
 						LION_BITMAP_ROW_COST * cpu_operator_cost);
 	target += LION_PLAIN_FETCH_ROW_COST * cpu_tuple_cost *
-		Max(tuples - visits, 0.0);
+		Max(tuples - visits, 0.0) * fetchfrac;
 	target += LION_WALK_PASS_COST * cpu_tuple_cost * Max(passes - 1.0, 0.0);
+	if (indexonly && !unions)
+		target += lion_ios_gather_cost(baserel, tuples, passes, corr, nret,
+									   nstored, storepages);
 
 	/* what the uncorrelated end cannot carry is charged to the path later */
-	if (target > max_io && loop_count <= 1.0 && path->path.param_info == NULL)
+	if (target > max_io &&
+		(indexonly ||
+		 (loop_count <= 1.0 && path->path.param_info == NULL)))
 		lion_plain_note_remainder(root, path, target - max_io);
 
 	if (max_io <= min_io)

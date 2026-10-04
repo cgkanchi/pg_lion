@@ -56,9 +56,14 @@
 
 #include <math.h>
 
+#include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/itup.h"
 #include "access/relscan.h"
 #include "access/xlog.h"
+#include "catalog/index.h"
+#include "executor/executor.h"
+#include "executor/tuptable.h"
 #if PG_VERSION_NUM >= 190000
 #include "executor/instrument_node.h"
 #endif
@@ -73,6 +78,8 @@
 
 #include "lion.h"
 #include "lion_count.h"
+#include "lion_count_int.h"	/* lion_source_pinned(): the §9 rule, asked */
+#include "lion_store.h"
 
 /*
  * Per key column: the probe resolved for the last scan key type seen on that
@@ -116,12 +123,24 @@ typedef struct LionScanOpaqueData
 	int			nlo;
 	int			pos;
 	BlockNumber firstblk;		/* first heap block of the batch's container */
-	IndexTuple	nullitup;		/* what an index-only scan is handed (§29.9) */
-	bool		heapcheck;		/* ... after its TID is looked up in the heap */
+	bool		heapcheck;		/* an index-only scan looks every TID up in
+								 * the heap first (§29.9, §40) */
+
+	/*
+	 * An index-only scan (xs_want_itup).  wantitup is set before the source
+	 * is built, which then keeps a multi-key query's pins and does not
+	 * recheck what the sets answer exactly (lion_source_build()); ios is the
+	 * state of one that returns stored columns (DESIGN.md §40), NULL when
+	 * the index stores none it can return.
+	 */
+	bool		wantitup;
+	struct LionIosState *ios;
 } LionScanOpaqueData;
 
 typedef LionScanOpaqueData *LionScanOpaque;
 
+static void lion_ios_reset(struct LionIosState *ios);
+static void lion_ios_end(struct LionIosState *ios);
 static void lion_source_release(struct LionSource *src);
 static void lion_source_entry_set(Relation index, LionEntryTuple *entry,
 								  Size itemlen, MemoryContext cxt,
@@ -266,6 +285,7 @@ lion_scan_reset(LionScanOpaque so)
 	so->srcdone = false;
 	so->nlo = 0;
 	so->pos = 0;
+	lion_ios_reset(so->ios);
 	if (so->gtcxt != NULL)
 		MemoryContextReset(so->gtcxt);
 	if (so->keycxt != NULL)
@@ -293,6 +313,8 @@ lionendscan(IndexScanDesc scan)
 	if (so != NULL)
 	{
 		lion_scan_reset(so);
+		lion_ios_end(so->ios);
+		so->ios = NULL;
 		if (so->gtcxt != NULL)
 			MemoryContextDelete(so->gtcxt);
 		if (so->keycxt != NULL)
@@ -1245,6 +1267,15 @@ typedef struct LionScanSets
 	LionPostingSet *sets;
 	int			nsets;
 	int			maxsets;
+
+	/*
+	 * Keep the leaf pins of a multi-key query's sets, as far as the list pin
+	 * budget goes (lion_posting_set_lookup_budgeted_col()): an index-only
+	 * scan's, whose TIDs the executor takes past the heap at an all-visible
+	 * page and so need the §9 interlock (DESIGN.md §40).  Every other caller
+	 * lets them go.
+	 */
+	bool		keepmkpins;
 } LionScanSets;
 
 static int
@@ -1357,6 +1388,7 @@ lion_scan_col_tree(Relation index, LionState *col,
 		int			nqueries = 1;
 		LionKeyNode **args;
 		int			nargs = 0;
+		Buffer		lastpinned = InvalidBuffer;
 		int			i;
 
 		if ((skey->sk_flags & SK_SEARCHARRAY) != 0)
@@ -1399,14 +1431,27 @@ lion_scan_col_tree(Relation index, LionState *col,
 				return NULL;
 			}
 
-			/* No pins to keep: see lion_emit_query(). */
+			/*
+			 * No pins to keep (see lion_emit_query()), but for an index-only
+			 * scan's, under the budget: a set past it comes out NOPIN, and
+			 * the batches it contributes to go to the heap (liongettuple()).
+			 */
 			base = lion_sets_reserve(acc, q.nkeys);
 			for (k = 0; k < q.nkeys; k++)
 			{
-				(void) lion_posting_set_lookup_col(index, attno, q.keys[k],
-												  InvalidOid,
-												  &acc->sets[base + k]);
-				lion_posting_set_unpin(&acc->sets[base + k]);
+				if (acc->keepmkpins)
+					(void) lion_posting_set_lookup_budgeted_col(index, attno,
+																q.keys[k],
+																InvalidOid,
+																&acc->sets[base + k],
+																&lastpinned);
+				else
+				{
+					(void) lion_posting_set_lookup_col(index, attno, q.keys[k],
+													  InvalidOid,
+													  &acc->sets[base + k]);
+					lion_posting_set_unpin(&acc->sets[base + k]);
+				}
 				CHECK_FOR_INTERRUPTS();
 			}
 			lion_scan_shift(q.tree, base);
@@ -1506,6 +1551,7 @@ lion_scankey_sets(Relation index, ScanKey skey, int *nsets,
 
 	acc.maxsets = 4;
 	acc.nsets = 0;
+	acc.keepmkpins = false;
 	acc.sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) * acc.maxsets);
 
 	node = lion_scan_col_tree(index, col, skey, &acc, &ok, nomatch);
@@ -1544,6 +1590,7 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 
 	acc.maxsets = 8;
 	acc.nsets = 0;
+	acc.keepmkpins = false;
 	acc.sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * acc.maxsets);
 	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * nkeys);
 
@@ -1968,6 +2015,7 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 
 	acc.maxsets = 8;
 	acc.nsets = 0;
+	acc.keepmkpins = false;
 	acc.sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * acc.maxsets);
 	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * (nkeys + 1));
 
@@ -2615,6 +2663,15 @@ struct LionSource
 	bool		recheck;		/* §29.6 */
 	LionSourceShape shape;
 
+	/*
+	 * Does every container the stream yields come with the §9 pin on the
+	 * page it was read from (lion_source_pinned())?  SETS: decided when the
+	 * source is built; LIST: per batch; a WALK always, a WINDOW and a UNION
+	 * never.  An index-only scan asks, and LionStoreScan of each piece it
+	 * gathers (lion_source_interlocked()).
+	 */
+	bool		pinned;
+
 	/* the located sets of the SETS tree, or of the other columns' trees */
 	LionPostingSet *sets;		/* nsets of them, + 1 slot for a WALK entry */
 	int			nsets;
@@ -3046,6 +3103,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 	memset(&ch, 0, sizeof(ch));
 	acc.maxsets = 8;
 	acc.nsets = 0;
+	acc.keepmkpins = so->wantitup && keeppins;
 	acc.sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * acc.maxsets);
 
 	if (so->nkeys < 1)
@@ -3087,14 +3145,22 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 
 			if (col->multikey)
 			{
-				/* Answered, and rechecked all the same (§29.6). */
-				src->recheck = true;
+				/*
+				 * Answered, and rechecked all the same (§29.6) - but by an
+				 * index-only scan, which reads the column from no tuple of
+				 * its own (DESIGN.md §40, "Index-only scans"): what the sets
+				 * answer exactly, mode KEYS, as the bitmap path already
+				 * trusts it, is not rechecked there.
+				 */
+				if (!so->wantitup)
+					src->recheck = true;
 				node = lion_scan_col_tree(so->index, col, skey, &acc, &ok, &none);
 				if (none)
 					nomatch = true;
 				else if (!ok)
 				{
 					/* mode ALL: every row; the first such column, as below */
+					src->recheck = true;
 					if (unioncol < 0 || skey->sk_attno - 1 < unioncol)
 						unioncol = skey->sk_attno - 1;
 				}
@@ -3263,7 +3329,10 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 	/*
 	 * The located sets: one more slot for a WALK's entry.  Under an MVCC
 	 * snapshot no pin is kept at all (§29.5); otherwise a set located past
-	 * the list pin budget carries no interlock, and the TIDs are rechecked.
+	 * the list pin budget carries no interlock, and the TIDs are rechecked -
+	 * but for an index-only scan's, whose snapshot is MVCC: it keeps its pins
+	 * for the §9 interlock alone, and the batches a NOPIN set leaves without
+	 * one go to the heap instead (lion_source_interlocked()).
 	 */
 	src->nsets = acc.nsets;
 	src->sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * (acc.nsets + 1));
@@ -3273,7 +3342,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		if (!keeppins)
 			lion_posting_set_unpin(&src->sets[i]);
 		else if (src->sets[i].found && src->sets[i].is_inline &&
-				 !BufferIsValid(src->sets[i].pinbuf))
+				 !BufferIsValid(src->sets[i].pinbuf) && !so->wantitup)
 			src->recheck = true;
 	}
 
@@ -3289,6 +3358,9 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		src->tree = lion_scan_op(LION_KN_AND, args, nargs);
 		src->stream = lion_stream_begin(src->nsets, src->sets, src->tree,
 										keeppins);
+		/* the stream is built with no budget, as lion_stream_begin() says */
+		src->pinned = keeppins &&
+			lion_source_pinned(src->tree, src->sets, NULL);
 	}
 	else if (nargs > 0 && !keeppins &&
 			 lion_source_walk_is_long(src,
@@ -3321,7 +3393,14 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 	{
 		LionState  *col = lion_column(so->ix, (AttrNumber) (walkcol + 1));
 
+		/*
+		 * Interlocked whatever the other columns' sets are: an AND needs one
+		 * pin (lion_source_pinned()), and the walked entry has it - the walk
+		 * keeps its leaf pinned while an INLINE entry streams, and a CHAIN
+		 * entry's cursor its posting leaf (§29.5).
+		 */
 		src->shape = LION_SRC_WALK;
+		src->pinned = keeppins;
 		args[nargs++] = lion_scan_leaf(src->nsets);
 		src->tree = lion_scan_op(LION_KN_AND, args, nargs);
 		src->ix = so->ix;
@@ -3425,7 +3504,8 @@ lion_source_list_batch(LionSource *src)
 			if (!src->keeppins)
 				lion_posting_set_unpin(&src->bsets[i]);
 			else if (src->bsets[i].found && src->bsets[i].is_inline &&
-					 !BufferIsValid(src->bsets[i].pinbuf))
+					 !BufferIsValid(src->bsets[i].pinbuf) &&
+					 !src->so->wantitup)
 				src->recheck = true;
 		}
 
@@ -3445,10 +3525,15 @@ lion_source_list_batch(LionSource *src)
 			args[i] = src->restargs[i];
 		args[src->nrestargs] = lion_scan_op(LION_KN_OR, leaves, nb);
 
-		src->stream = lion_stream_begin(src->nsets + nb, all,
-										lion_scan_op(LION_KN_AND, args,
-													 src->nrestargs + 1),
-										src->keeppins);
+		{
+			LionKeyNode *tree = lion_scan_op(LION_KN_AND, args,
+											 src->nrestargs + 1);
+
+			src->stream = lion_stream_begin(src->nsets + nb, all, tree,
+											src->keeppins);
+			src->pinned = src->keeppins &&
+				lion_source_pinned(tree, all, NULL);
+		}
 		MemoryContextSwitchTo(oldcxt);
 		return true;
 	}
@@ -3968,6 +4053,385 @@ lion_source_close(LionSource *src)
 }
 
 /*
+ * Does every container the source yields still have the §9 pin behind it
+ * (DESIGN.md §9, §29.5)?  The question an index-only scan asks of each batch
+ * before it lets the executor take a TID past the heap, and LionStoreScan of
+ * each piece before it takes a row's values from the window store
+ * (lion_ordered.c): SETS and LIST say
+ * through lion_source_pinned(), of the tree and of each batch's tree; a WALK
+ * always has it, its walked entry's pin; a UNION and a WINDOW copy containers
+ * out of many pages and pin none of them.  NONE yields nothing.
+ */
+bool
+lion_source_interlocked(LionSource *src)
+{
+	switch (src->shape)
+	{
+		case LION_SRC_NONE:
+			return true;
+		case LION_SRC_SETS:
+		case LION_SRC_LIST:
+		case LION_SRC_WALK:
+			return src->pinned;
+		case LION_SRC_WINDOW:
+		case LION_SRC_UNION:
+			return false;
+	}
+	return false;				/* keep compiler quiet */
+}
+
+/* ---------------------------------------------------------------------
+ * Index-only scans (DESIGN.md §29.9, §40 "Index-only scans")
+ * --------------------------------------------------------------------- */
+
+/*
+ * What an index-only scan hands the executor, and where from.
+ *
+ * Core's IndexOnlyScan node fills its output from the tuple the AM hands it
+ * for EVERY TID it returns: it asks the visibility map, fetches the heap only
+ * to learn whether a row on a page that is not all-visible is visible, and
+ * then takes the values from the AM's tuple either way.  So the scan supplies
+ * the values of the columns lioncanreturn() promises for every TID:
+ *
+ *	- from the window store, gathered for the whole batch (one container =
+ *	  one window's members of one source container) right after it is
+ *	  loaded, while the page it came from is pinned - the §9 interlock,
+ *	  which the batch keeps until the next one is pulled (§29.5).  A value
+ *	  is the row's own: its slot was written by the row's insert before the
+ *	  TID reached any container (§40, "Writes"), the pin keeps VACUUM from
+ *	  reclaiming the TID, and a row the snapshot sees is not one whose slot
+ *	  VACUUM clears.  On a page that is not all-visible the executor's own
+ *	  heap fetch settles visibility, and a HOT successor it finds there has
+ *	  the same values in every indexed and INCLUDEd column;
+ *	- from the heap, fetched here under the scan's snapshot, for a TID the
+ *	  store does not answer - a heap page the gather reports absent (an
+ *	  ABSENT sub-array, or no store yet) - and for every TID of a batch that
+ *	  has no interlock behind it: a UNION's, a NOPIN set's, and every batch
+ *	  on a hot standby over a generic-mode index (§9, "Hot standby").  A
+ *	  tuple invisible to the snapshot is skipped, a visible one handed on
+ *	  with its values, and it stays visible to that snapshot, so nothing can
+ *	  take it away before the executor looks (the §29.9 argument).
+ *
+ * The tuple is a heap tuple (xs_hitup) over a descriptor of each index
+ * column's own type - the heap column's, or the expression's - which is what
+ * the executor's scan slot is made of (ExecInitIndexOnlyScan(), from the
+ * plan's index target list).  index_form_tuple() over the index's own
+ * descriptor would compress every value past 512 bytes, row after row, stop
+ * at 8 kB, and has a key column's opclass storage type where a value of the
+ * column's own type has to go when the heap supplies one.
+ *
+ * Every column the scan's keys name has a value in that tuple whenever the
+ * scan rechecks (xs_recheck), because the executor evaluates the recheck
+ * quals on it: a stored column's from the store, any other from the heap -
+ * a scan that would recheck a column the store does not return takes every
+ * TID from the heap (keynotret).  lion's planner hook builds index-only paths
+ * whose quals name such a column only when the sets answer them exactly
+ * (lion_selfuncs.c), and the scan of those sets no recheck, so that is the
+ * fallback and not the path.
+ */
+typedef struct LionIosState
+{
+	MemoryContext cxt;			/* this, for the scan's life */
+	int			natts;			/* index columns, key and INCLUDE */
+	int			nret;			/* ... the store returns (lioncanreturn()) */
+	int		   *retord;			/* [nret] their stored ordinals */
+	AttrNumber *retattno;		/* [nret] their index columns, 1-based */
+	TupleDesc	desc;			/* xs_hitupdesc */
+	HeapTuple	nulltup;		/* every column NULL, made once */
+	MemoryContext tupcxt;		/* the tuple handed out, reset per tuple */
+	Datum	   *values;			/* [natts] */
+	bool	   *isnull;			/* [natts] */
+
+	/* per source (gtcxt): reset by amrescan */
+	bool		viaheapall;		/* every TID through the heap */
+	bool		needvalues;		/* ... with its values (else for visibility) */
+	LionStoreReader **readers;	/* [nret], opened by the first batch */
+
+	/* per batch */
+	MemoryContext batchcxt;		/* in gtcxt */
+	bool		viaheap;		/* this batch's TIDs through the heap */
+	uint64		absent;			/* heap pages the store leaves to the heap */
+	Datum	  **bvals;			/* [nret][nlo] */
+	bool	  **bnulls;			/* [nret][nlo] */
+
+	/* the heap fetch */
+	Buffer		hbuf;			/* the heap page last read, pinned */
+	TupleTableSlot *hslot;
+	IndexInfo  *ii;
+	EState	   *estate;			/* only for an index with expressions */
+} LionIosState;
+
+/* The type of index column i (0-based): the heap column's or the expression's. */
+static void
+lion_ios_column_type(Relation index, Relation heap, int i, ListCell **exprlc,
+					 List *exprs, Oid *typid, int32 *typmod)
+{
+	AttrNumber	heapatt = index->rd_index->indkey.values[i];
+
+	if (heapatt != 0)
+	{
+		Form_pg_attribute att;
+
+		if (heapatt < 0 || heapatt > RelationGetDescr(heap)->natts)
+			elog(ERROR, "lion index \"%s\": column %d is not a column of \"%s\"",
+				 RelationGetRelationName(index), i + 1,
+				 RelationGetRelationName(heap));
+		att = TupleDescAttr(RelationGetDescr(heap), heapatt - 1);
+		*typid = att->atttypid;
+		*typmod = att->atttypmod;
+		return;
+	}
+	if (*exprlc == NULL)
+		elog(ERROR, "lion index \"%s\": no expression for column %d",
+			 RelationGetRelationName(index), i + 1);
+	*typid = exprType((Node *) lfirst(*exprlc));
+	*typmod = exprTypmod((Node *) lfirst(*exprlc));
+	*exprlc = lnext(exprs, *exprlc);
+}
+
+/* The state, made by the first call of an index-only scan. */
+static LionIosState *
+lion_ios_begin(IndexScanDesc scan, LionScanOpaque so)
+{
+	Relation	index = scan->indexRelation;
+	Relation	heap = scan->heapRelation;
+	LionIndexState *ix = so->ix;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	LionIosState *ios;
+	List	   *exprs;
+	ListCell   *exprlc;
+	int			i;
+
+	if (heap == NULL)
+		elog(ERROR, "lion index \"%s\": an index-only scan without its heap",
+			 RelationGetRelationName(index));
+
+	cxt = AllocSetContextCreate(GetMemoryChunkContext(so),
+								"lion index-only scan", ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+	ios = (LionIosState *) palloc0(sizeof(LionIosState));
+	ios->cxt = cxt;
+	ios->natts = IndexRelationGetNumberOfAttributes(index);
+	ios->hbuf = InvalidBuffer;
+
+	ios->retord = (int *) palloc(sizeof(int) * Max(ix->nstored, 1));
+	ios->retattno = (AttrNumber *) palloc(sizeof(AttrNumber) * Max(ix->nstored, 1));
+	for (i = 0; i < ix->nstored; i++)
+	{
+		if (!ix->stored[i].returnable)
+			continue;
+		ios->retord[ios->nret] = ix->stored[i].ord;
+		ios->retattno[ios->nret] = ix->stored[i].attno;
+		ios->nret++;
+	}
+
+	exprs = RelationGetIndexExpressions(index);
+	exprlc = list_head(exprs);
+	ios->desc = CreateTemplateTupleDesc(ios->natts);
+	for (i = 0; i < ios->natts; i++)
+	{
+		Oid			typid;
+		int32		typmod;
+
+		lion_ios_column_type(index, heap, i, &exprlc, exprs, &typid, &typmod);
+		TupleDescInitEntry(ios->desc, (AttrNumber) (i + 1), NULL, typid,
+						   typmod, 0);
+	}
+	TupleDescFinalize(ios->desc);
+
+	ios->values = (Datum *) palloc(sizeof(Datum) * ios->natts);
+	ios->isnull = (bool *) palloc(sizeof(bool) * ios->natts);
+	for (i = 0; i < ios->natts; i++)
+	{
+		ios->values[i] = (Datum) 0;
+		ios->isnull[i] = true;
+	}
+	ios->nulltup = heap_form_tuple(ios->desc, ios->values, ios->isnull);
+	ios->tupcxt = AllocSetContextCreate(cxt, "lion index-only tuple",
+										ALLOCSET_SMALL_SIZES);
+
+	ios->hslot = MakeSingleTupleTableSlot(RelationGetDescr(heap),
+										  &TTSOpsBufferHeapTuple);
+	ios->ii = BuildIndexInfo(index);
+	if (ios->ii->ii_Expressions != NIL)
+	{
+		ios->estate = CreateExecutorState();
+		GetPerTupleExprContext(ios->estate)->ecxt_scantuple = ios->hslot;
+	}
+	MemoryContextSwitchTo(oldcxt);
+
+	scan->xs_hitupdesc = ios->desc;
+	return ios;
+}
+
+/* What rescan and endscan let go of: the heap pin and the source's part. */
+static void
+lion_ios_reset(LionIosState *ios)
+{
+	if (ios == NULL)
+		return;
+	if (BufferIsValid(ios->hbuf))
+		ReleaseBuffer(ios->hbuf);
+	ios->hbuf = InvalidBuffer;
+	ios->readers = NULL;		/* in gtcxt, which the caller resets */
+	ios->batchcxt = NULL;
+	ios->bvals = NULL;
+	ios->bnulls = NULL;
+	ios->absent = 0;
+	ios->viaheap = false;
+	MemoryContextReset(ios->tupcxt);
+}
+
+static void
+lion_ios_end(LionIosState *ios)
+{
+	if (ios == NULL)
+		return;
+	lion_ios_reset(ios);
+	ExecDropSingleTupleTableSlot(ios->hslot);
+	if (ios->estate != NULL)
+		FreeExecutorState(ios->estate);
+	MemoryContextDelete(ios->cxt);
+}
+
+/* Hand values[] / isnull[] out as the scan's tuple. */
+static void
+lion_ios_emit(IndexScanDesc scan, LionIosState *ios)
+{
+	MemoryContext oldcxt;
+
+	MemoryContextReset(ios->tupcxt);
+	oldcxt = MemoryContextSwitchTo(ios->tupcxt);
+	scan->xs_hitup = heap_form_tuple(ios->desc, ios->values, ios->isnull);
+	MemoryContextSwitchTo(oldcxt);
+	scan->xs_itup = NULL;
+}
+
+/*
+ * The heap's answer for tid: false when no version of its HOT chain is
+ * visible to the scan's snapshot; else true, and with `form` the scan's tuple
+ * is the visible version's index columns (FormIndexDatum(), expressions and
+ * all).  heap_hot_search_buffer() takes the serializable conflict checks and
+ * the tuple's predicate lock, as the table AM's index fetch does (and as the
+ * count's recheck does, lion_count.c); the page is pinned until the next TID
+ * leaves it, as an index scan keeps it.
+ */
+static bool
+lion_ios_fetch(IndexScanDesc scan, LionIosState *ios, ItemPointer tid,
+			   bool form)
+{
+	BlockNumber blk = ItemPointerGetBlockNumber(tid);
+	ItemPointerData t = *tid;	/* the callee moves it along the chain */
+	HeapTupleData tup;
+	bool		found;
+
+	if (!BufferIsValid(ios->hbuf) || BufferGetBlockNumber(ios->hbuf) != blk)
+	{
+		if (BufferIsValid(ios->hbuf))
+			ReleaseBuffer(ios->hbuf);
+		ios->hbuf = InvalidBuffer;
+		ios->hbuf = ReadBuffer(scan->heapRelation, blk);
+	}
+	LockBuffer(ios->hbuf, BUFFER_LOCK_SHARE);
+	found = heap_hot_search_buffer(&t, scan->heapRelation, ios->hbuf,
+								   scan->xs_snapshot, &tup, NULL, true);
+	LockBuffer(ios->hbuf, BUFFER_LOCK_UNLOCK);
+	if (!found)
+		return false;
+	if (!form)
+	{
+		scan->xs_hitup = ios->nulltup;
+		scan->xs_itup = NULL;
+		return true;
+	}
+
+	/* the tuple stays put while the page is pinned, locked or not */
+	ExecStoreBufferHeapTuple(&tup, ios->hslot, ios->hbuf);
+	FormIndexDatum(ios->ii, ios->hslot, ios->estate, ios->values, ios->isnull);
+	lion_ios_emit(scan, ios);
+	ExecClearTuple(ios->hslot);
+	if (ios->estate != NULL)
+		ResetPerTupleExprContext(ios->estate);
+	return true;
+}
+
+/* Member j of the batch, from the values gathered for it. */
+static void
+lion_ios_store_tuple(IndexScanDesc scan, LionIosState *ios, int j)
+{
+	int			r;
+
+	if (ios->nret == 0)
+	{
+		scan->xs_hitup = ios->nulltup;
+		scan->xs_itup = NULL;
+		return;
+	}
+	for (r = 0; r < ios->natts; r++)
+	{
+		ios->values[r] = (Datum) 0;
+		ios->isnull[r] = true;
+	}
+	for (r = 0; r < ios->nret; r++)
+	{
+		ios->values[ios->retattno[r] - 1] = ios->bvals[r][j];
+		ios->isnull[ios->retattno[r] - 1] = ios->bnulls[r][j];
+	}
+	lion_ios_emit(scan, ios);
+}
+
+/*
+ * A batch has just been loaded, under the pin the source keeps for it:
+ * decide where its TIDs' values come from, and gather the store's - one
+ * reader per returned column, each a map lookup and the window's chain - while
+ * that pin stands (lion_store_gather()'s safe-use contract).
+ */
+static void
+lion_ios_batch(LionScanOpaque so, LionIosState *ios, uint32 ckey)
+{
+	MemoryContext oldcxt;
+	int			r;
+
+	ios->absent = 0;
+	ios->viaheap = ios->viaheapall || !lion_source_interlocked(so->src);
+	if (ios->viaheap || ios->nret == 0 || so->nlo == 0)
+		return;
+
+	if (ios->readers == NULL)
+	{
+		oldcxt = MemoryContextSwitchTo(so->gtcxt);
+		ios->readers = (LionStoreReader **)
+			palloc(sizeof(LionStoreReader *) * ios->nret);
+		for (r = 0; r < ios->nret; r++)
+			ios->readers[r] = lion_store_open(so->index, so->ix,
+											  ios->retord[r], so->gtcxt);
+		ios->batchcxt = AllocSetContextCreate(so->gtcxt,
+											  "lion index-only batch",
+											  ALLOCSET_DEFAULT_SIZES);
+		MemoryContextSwitchTo(oldcxt);
+	}
+	else
+		MemoryContextReset(ios->batchcxt);
+
+	oldcxt = MemoryContextSwitchTo(ios->batchcxt);
+	ios->bvals = (Datum **) palloc(sizeof(Datum *) * ios->nret);
+	ios->bnulls = (bool **) palloc(sizeof(bool *) * ios->nret);
+	for (r = 0; r < ios->nret; r++)
+	{
+		uint64		absent;
+
+		ios->bvals[r] = (Datum *) palloc(sizeof(Datum) * so->nlo);
+		ios->bnulls[r] = (bool *) palloc(sizeof(bool) * so->nlo);
+		lion_store_gather_reset(ios->readers[r]);
+		lion_store_gather(ios->readers[r], ckey, so->lo, so->nlo,
+						  ios->bvals[r], ios->bnulls[r], &absent);
+		ios->absent |= absent;
+	}
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
  * amgettuple (DESIGN.md §29): the next TID of the source, one container's
  * members at a time.
  */
@@ -4011,30 +4475,15 @@ liongettuple(IndexScanDesc scan, ScanDirection dir)
 												   sizeof(uint16) * LION_CONTAINER_RANGE);
 
 		/*
-		 * An index-only scan (DESIGN.md §29.9).  lion returns no column
-		 * (amcanreturn is NULL), so the planner builds one only for a query
-		 * that needs no column at all - `SELECT count(*) FROM t`, which
-		 * amoptionalkey lets it answer from a lion index with no key - and
-		 * nothing ever reads what the tuple holds.  It still has to BE one:
-		 * a tuple of NULLs of the index's own shape.
+		 * An index-only scan (DESIGN.md §29.9, §40): its state, made once -
+		 * the columns the store returns, which a build fixes, and the means
+		 * to fetch a row from the heap - for an index that stores none as
+		 * for one that does: the tuple of a scan that returns no column is
+		 * every column NULL, which nothing reads.
 		 */
-		if (scan->xs_want_itup && so->nullitup == NULL)
-		{
-			TupleDesc	desc = RelationGetDescr(scan->indexRelation);
-			Datum		values[INDEX_MAX_KEYS];
-			bool		isnull[INDEX_MAX_KEYS];
-			MemoryContext oldcxt;
-			int			i;
-
-			for (i = 0; i < desc->natts; i++)
-			{
-				values[i] = (Datum) 0;
-				isnull[i] = true;
-			}
-			oldcxt = MemoryContextSwitchTo(GetMemoryChunkContext(so));
-			so->nullitup = index_form_tuple(desc, values, isnull);
-			MemoryContextSwitchTo(oldcxt);
-		}
+		so->wantitup = scan->xs_want_itup;
+		if (scan->xs_want_itup && so->ios == NULL)
+			so->ios = lion_ios_begin(scan, so);
 
 		/*
 		 * nbtree's dropPin rule (nbtree.c, btrescan): an MVCC snapshot needs
@@ -4050,22 +4499,46 @@ liongettuple(IndexScanDesc scan, ScanDirection dir)
 
 		/*
 		 * Which TIDs an index-only scan has to look up in the heap before it
-		 * hands them on (see below).  The UNION shape's, always.  And on a hot
-		 * standby every shape's, when the index is in generic WAL mode
-		 * (DESIGN.md §9, "Hot standby"): replay of a generic record takes no
-		 * cleanup lock, so the pin a batch keeps does not stop the startup
-		 * process from removing its TIDs and then replaying the heap records
-		 * that set their pages all-visible - the executor would trust the
-		 * visibility map for a row that is dead to this snapshot.  The count
-		 * rechecks everything there for the same reason (cx.in_recovery in
-		 * lion_count.c).  An rmgr-mode index keeps the interlock on the
-		 * standby, because its removals replay under a cleanup lock behind
-		 * the barrier of §25.
+		 * hands them on.  The UNION shape's, always (its batches have no
+		 * interlock, lion_source_interlocked()).  And on a hot standby every
+		 * shape's, when the index is in generic WAL mode (DESIGN.md §9, "Hot
+		 * standby"): replay of a generic record takes no cleanup lock, so the
+		 * pin a batch keeps does not stop the startup process from removing
+		 * its TIDs and then replaying the heap records that set their pages
+		 * all-visible - the executor would trust the visibility map for a
+		 * row that is dead to this snapshot.  The count rechecks everything
+		 * there for the same reason (cx.in_recovery in lion_count.c).  An
+		 * rmgr-mode index keeps the interlock on the standby, because its
+		 * removals replay under a cleanup lock behind the barrier of §25.
+		 * Those TIDs take their values from the heap, not the store.
+		 *
+		 * And a scan that rechecks a column the store does not return, whose
+		 * value only the heap has (LionIosState, keynotret).
 		 */
 		so->heapcheck = scan->xs_want_itup &&
 			(so->src->shape == LION_SRC_UNION ||
 			 (RecoveryInProgress() &&
 			  lion_wal_mode(scan->indexRelation) != LION_WAL_MODE_RMGR));
+		if (scan->xs_want_itup)
+		{
+			LionIosState *ios = so->ios;
+			bool		keynotret = false;
+			int			i;
+
+			for (i = 0; i < so->nkeys; i++)
+			{
+				int			ord = lion_store_ordinal(so->ix,
+													 so->keys[i].sk_attno);
+
+				if (ord < 0 || !so->ix->stored[ord].returnable)
+					keynotret = true;
+			}
+			ios->viaheapall = so->heapcheck ||
+				(keynotret && so->src->recheck);
+			ios->needvalues = ios->nret > 0 ||
+				(keynotret && so->src->recheck);
+			so->heapcheck = ios->viaheapall;
+		}
 	}
 
 	for (;;)
@@ -4074,42 +4547,44 @@ liongettuple(IndexScanDesc scan, ScanDirection dir)
 
 		if (so->pos < so->nlo)
 		{
+			int			j = so->pos++;
 			uint16		blkinc;
 			OffsetNumber off;
 
-			lion_lo_split(so->lo[so->pos++], &blkinc, &off);
+			lion_lo_split(so->lo[j], &blkinc, &off);
 			ItemPointerSet(&scan->xs_heaptid, so->firstblk + blkinc, off);
 			scan->xs_recheck = so->src->recheck;
 
 			if (scan->xs_want_itup)
 			{
+				LionIosState *ios = so->ios;
+
 				/*
 				 * An index-only scan trusts the visibility map for every TID
-				 * it is handed.  The SETS, LIST and WALK shapes keep the page
-				 * each batch came from pinned until the next one
-				 * (xs_want_itup turned dropPin off), which is the §9
-				 * interlock the count relies on.  The UNION shape copies
-				 * containers out of many pages into its window and pins none
-				 * of them, and on a hot standby a generic-mode index's pins
-				 * interlock nothing (so->heapcheck): those TIDs are checked
-				 * in the heap here, and only a tuple visible to the snapshot
-				 * is handed on - which stays visible to it, so neither VACUUM
-				 * nor replay can take it away before the executor looks.
-				 * Every TID is one the index holds (§29.6), so a visible one
-				 * is a row the scan selects.  A WINDOW, which pins nothing
-				 * either, is only ever built without keeppins, so it never
-				 * gets here.
+				 * it is handed, and takes its values from the tuple handed
+				 * with it (LionIosState).  A TID of a batch with the §9
+				 * interlock behind it is handed on with the store's values;
+				 * one without - a UNION's, a NOPIN set's, any on a hot
+				 * standby over a generic-mode index - or on a heap page the
+				 * store leaves to the heap is looked up in the heap first,
+				 * and only a tuple visible to the snapshot is handed on, with
+				 * the values the heap holds.  Every TID is one the index
+				 * holds (§29.6), so a visible one is a row the scan selects.
+				 * A WINDOW, which pins nothing either, is only ever built
+				 * without keeppins, so it never gets here.
 				 */
 				Assert(so->src->shape != LION_SRC_WINDOW);
-				if (so->heapcheck)
+				if (ios->viaheap ||
+					(ios->absent & (((uint64) 1) << blkinc)) != 0)
 				{
 					ItemPointerData tid = scan->xs_heaptid;
 
-					if (!lion_table_fetch_tid(scan->heapRelation, &tid,
-											  scan->xs_snapshot, NULL))
+					if (!lion_ios_fetch(scan, ios, &tid,
+										ios->needvalues || !ios->viaheap))
 						continue;
 				}
-				scan->xs_itup = so->nullitup;
+				else
+					lion_ios_store_tuple(scan, ios, j);
 			}
 			return true;
 		}
@@ -4126,6 +4601,8 @@ liongettuple(IndexScanDesc scan, ScanDirection dir)
 		so->firstblk = lion_ckey_first_block(c->ckey);
 		so->nlo = (int) lion_container_to_array(c, so->lo);
 		so->pos = 0;
+		if (scan->xs_want_itup)
+			lion_ios_batch(so, so->ios, c->ckey);
 
 		/*
 		 * Test hook: a batch has just been loaded and none of it returned.

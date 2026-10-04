@@ -76,6 +76,8 @@ double		lion_fkjoin_sort_compare_cost;
 double		lion_fkjoin_sort_key_cost;
 double		lion_fkjoin_sort_seq_page_cost;
 double		lion_fkjoin_sort_random_page_cost;
+double		lion_store_value_cost;
+double		lion_store_page_cost;
 double		lion_hashagg_rate;
 double		lion_agg_rate;
 double		lion_hashjoin_rate;
@@ -190,6 +192,12 @@ static const LionCostSetting lion_cost_settings[] = {
 	 "Sets the planner's estimate of the cost of each page a lion FK-side join's key sort writes or reads past work_mem, the part read in sequence"},
 	{"pg_lion.fkjoin_sort_random_page_cost", &lion_fkjoin_sort_random_page_cost, 0.25, LION_RANDOM,
 	 "Sets the planner's estimate of the cost of each page a lion FK-side join's key sort writes or reads past work_mem, the part read at random"},
+
+	/* the window store's gather (DESIGN.md §40 "Costs") */
+	{"pg_lion.store_value_cost", &lion_store_value_cost, 0.2, LION_OP,
+	 "Sets the planner's estimate of the cost of each row's value a lion node gathers from the index's window store"},
+	{"pg_lion.store_page_cost", &lion_store_page_cost, 8.0, LION_OP,
+	 "Sets the planner's estimate of the cost of each window store page a lion node reads for a gather"},
 };
 
 /*

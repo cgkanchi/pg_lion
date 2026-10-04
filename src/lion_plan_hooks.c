@@ -356,6 +356,10 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	lfirst(list_nth_cell(priv, LION_PRIV_JOIN)) =
 		lappend_int(list_copy(join), (int) keyresno);
 
+	/* the join gathers nothing from a store (DESIGN.md §40) */
+	Assert(list_length(priv) == LION_PRIV_STORE);
+	priv = lappend(priv, NIL);
+
 	cscan->custom_scan_tlist = ctlist;
 	cscan->custom_relids = rel->relids;
 	cscan->custom_private = lappend(priv, kinds);
@@ -532,6 +536,105 @@ lion_wagg_add_target(Aggref *agg, Index rti, List *wattnos,
 }
 
 /*
+ * A column or an aggregate of the window store's gather (DESIGN.md §40) in
+ * the tuple the node produces: a GROUP BY column the node gathers
+ * (LION_TL_SKEY), or an aggregate over a gathered column (LION_TL_SAGG),
+ * whose LION_SAGG_* kind, column, argument width, aggregate, input collation
+ * and DISTINCT equality and collation it appends to *sspecs.  store is the
+ * plan's LION_PRIV_STORE member as the path made it.  False for anything
+ * else: count(*), a count(col) the group's rows answer - which is what the
+ * planner took one for when its column is not gathered - and a column a
+ * clause pins, which the other kinds print.  An expression already in
+ * *ctlist is done.
+ */
+static bool
+lion_store_add_target(Expr *expr, Index rti, List *store, List **ctlist,
+					  List **kinds, List **sspecs)
+{
+	List	   *attnos = (List *) lsecond(store);
+	List	   *groups = (List *) lfourth(store);
+	int			kind = -1;
+	ListCell   *lc;
+
+	if (IsA(expr, Var))
+	{
+		Var		   *v = (Var *) expr;
+		int			g = 0;
+
+		foreach(lc, groups)
+		{
+			int			pos = linitial_int((List *) lfirst(lc));
+
+			if ((AttrNumber) list_nth_int(attnos, pos) == v->varattno)
+			{
+				kind = LION_TL_SKEY(g);
+				break;
+			}
+			g++;
+		}
+		if (kind < 0)
+			return false;
+	}
+	else if (IsA(expr, Aggref))
+	{
+		Aggref	   *agg = (Aggref *) expr;
+		AttrNumber	attno;
+		int			width;
+		Oid			eqop;
+		Oid			coll;
+		int			skind = lion_store_agg_classify(agg, rti, &attno, &width,
+													&eqop, &coll);
+		int			pos = -1;
+		int			i = 0;
+
+		if (skind == LION_SAGG_NONE)
+			return false;
+		foreach(lc, attnos)
+		{
+			if ((AttrNumber) lfirst_int(lc) == attno)
+			{
+				pos = i;
+				break;
+			}
+			i++;
+		}
+		if (pos < 0)
+		{
+			/* a count the group's rows answer, as the planner took it */
+			if (LION_SAGG_IS_WAGG(skind))
+				elog(ERROR, "LionCount: an aggregate over column %d, which is not gathered",
+					 attno);
+			return false;
+		}
+		foreach(lc, *ctlist)
+		{
+			if (equal(((TargetEntry *) lfirst(lc))->expr, expr))
+				return true;
+		}
+		*sspecs = lappend(*sspecs,
+						  lappend_int(lappend_int(list_make5_int(skind, pos, width,
+																 (int) agg->aggfnoid,
+																 (int) agg->inputcollid),
+												  (int) eqop),
+									  (int) coll));
+		kind = LION_TL_SAGG(list_length(*sspecs) - 1);
+	}
+	else
+		return false;
+
+	foreach(lc, *ctlist)
+	{
+		if (equal(((TargetEntry *) lfirst(lc))->expr, expr))
+			return true;
+	}
+	*ctlist = lappend(*ctlist,
+					  makeTargetEntry((Expr *) copyObject(expr),
+									  list_length(*ctlist) + 1, NULL, false));
+	*kinds = lappend_int(*kinds, kind);
+	return true;
+}
+
+/*
  * Turn the path into a CustomScan.
  *
  * scan.scanrelid is 0 because this is an upper node, so custom_scan_tlist has
@@ -560,6 +663,8 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *wagg;
 	List	   *wspecs = NIL;
 	List	   *wargs = NIL;
+	List	   *store;
+	List	   *sspecs = NIL;
 	ListCell   *lc;
 
 	/*
@@ -582,6 +687,7 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	dist = (List *) list_nth(best_path->custom_private, LION_PRIV_DISTINCT);
 	distattno = (dist != NIL) ? (AttrNumber) linitial_int(dist) : 0;
 	wagg = (List *) list_nth(best_path->custom_private, LION_PRIV_WAGG);
+	store = (List *) list_nth(best_path->custom_private, LION_PRIV_STORE);
 
 	/*
 	 * A leaf of an OR constrains no column of the result (DESIGN.md §19), so
@@ -628,6 +734,10 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 								 (Index) linitial_int(ints),
 								 (List *) linitial(wagg), &ctlist, &kinds,
 								 &wspecs, &wargs))
+			continue;
+		if (store != NIL &&
+			lion_store_add_target((Expr *) expr, (Index) linitial_int(ints),
+								  store, &ctlist, &kinds, &sspecs))
 			continue;
 		if (IsA(expr, Aggref))
 		{
@@ -841,6 +951,11 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		cscan->custom_exprs = list_concat(list_copy(cscan->custom_exprs),
 										  wargs);
 	}
+
+	/* ... and those over the columns gathered from a store (DESIGN.md §40) */
+	if (store != NIL)
+		lfirst(list_nth_cell(priv, LION_PRIV_STORE)) =
+			lappend(list_copy(store), sspecs);
 
 	cscan->custom_scan_tlist = ctlist;
 	cscan->custom_relids = rel->relids;

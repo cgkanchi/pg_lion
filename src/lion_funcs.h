@@ -107,7 +107,7 @@
 #include "lion_count.h"
 
 
-#define LION_STATS_NCOLS		30
+#define LION_STATS_NCOLS		37
 
 /*
  * A check a concurrent INSERT can make fail on a sound index, recorded instead
@@ -201,6 +201,13 @@ typedef struct LionVerifyState
 	int64		nsetholds;		/* ... made with the entry's leaf held */
 	int64		nsetuncompared;	/* sets a standby kept without their totals */
 	int			nwaits;			/* WaitForLockers() calls */
+
+	/* The window store (DESIGN.md §40), lion_verify_store.c */
+	LionMetaStore store;		/* the meta page's record; cols 0 = none */
+	int64		nstorepages;	/* store pages the walk reached */
+	int64		nmappages;		/* ... and map pages */
+	struct LionStoreReader **readers;	/* heapallindexed: per ordinal */
+	MemoryContext storecxt;		/* ... and where they live */
 } LionVerifyState;
 
 /*
@@ -261,7 +268,9 @@ typedef enum LionVerifyUnref
 	LION_UNREF_LEAK,			/* what an interrupted allocation leaves */
 	LION_UNREF_INTERNAL,		/* an internal posting page */
 	LION_UNREF_LIVE,			/* a live page, which has to be reachable */
-	LION_UNREF_FOREIGN			/* not a page of this index at all */
+	LION_UNREF_FOREIGN,			/* not a page of this index at all */
+	LION_UNREF_LINKED			/* a store or map page a writer linked in
+								 * behind the walk (§40): nothing to report */
 } LionVerifyUnref;
 /* A macro, so that the compiler sees the ERROR does not return. */
 #define lion_verify_unreachable(vs, blk) \
@@ -287,6 +296,7 @@ extern bool lion_verify_has_block(const BlockNumber *sorted, int n,
 								  BlockNumber blk);
 extern Page lion_verify_read_page(LionVerifyState *vs, BlockNumber blk,
 								  uint16 kind, Buffer *bufp);
+extern const char *lion_verify_kind_name(uint16 kind);
 extern ItemId lion_verify_itemid(LionVerifyState *vs, BlockNumber blk,
 								 Page page, OffsetNumber off);
 extern LionEntryTuple *lion_verify_dir_item(LionVerifyState *vs,
@@ -311,5 +321,15 @@ extern void lion_verify_heapallindexed(LionVerifyState *vs);
 
 /* lion_verify_summary.c */
 extern void lion_verify_summaries(LionVerifyState *vs);
+
+/* lion_verify_store.c */
+extern void lion_verify_store_meta(LionVerifyState *vs, Page metapage);
+extern void lion_verify_store(LionVerifyState *vs);
+extern LionVerifyUnref lion_verify_store_classify(LionVerifyState *vs,
+												  BlockNumber blk, Page page,
+												  Buffer buf);
+extern void lion_verify_store_heap(LionVerifyState *vs, ItemPointer tid,
+								   Datum *values, bool *isnull);
+extern void lion_verify_store_end(LionVerifyState *vs);
 
 #endif							/* LION_FUNCS_H */

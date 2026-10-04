@@ -1196,6 +1196,16 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 					((PageHeader) page)->pd_lower = LION_META_NDISTINCT_END;
 				break;
 
+			case LION_OP_STORE_META:
+				if (op.len != sizeof(LionMetaStore) || !LionPageIsMeta(page))
+					elog(PANIC, "pg_lion: bad STORE_META payload on block %u",
+						 blkno);
+				memcpy(LionPageGetMetaStore(page), payload,
+					   sizeof(LionMetaStore));
+				if (((PageHeader) page)->pd_lower < LION_META_STORE_END)
+					((PageHeader) page)->pd_lower = LION_META_STORE_END;
+				break;
+
 			case LION_OP_DELETED:
 				{
 					FullTransactionId safexid;
@@ -1364,7 +1374,7 @@ lion_redo(XLogReaderState *record)
 	int			maxblk = XLogRecMaxBlockId(record);
 	int			i;
 
-	if (info > LION_XLOG_VACUUM_VISIT || (info & 0x0F) != 0)
+	if (info > LION_XLOG_STORE || (info & 0x0F) != 0)
 		elog(PANIC, "pg_lion: unknown record type %u", info);
 
 	if (XLogRecGetDataLen(record) < SizeOfLionHeader)
@@ -1495,6 +1505,8 @@ lion_op_name(uint8 op)
 			return "delta";
 		case LION_OP_NDISTINCT:
 			return "ndistinct";
+		case LION_OP_STORE_META:
+			return "store_meta";
 		default:
 			return "?";
 	}
@@ -1603,6 +1615,8 @@ lion_identify(uint8 info)
 			return "ENTRY";
 		case LION_XLOG_VACUUM_VISIT:
 			return "VACUUM_VISIT";
+		case LION_XLOG_STORE:
+			return "STORE";
 		default:
 			return NULL;
 	}
@@ -1649,7 +1663,8 @@ lion_mask_item_padding(Page page)
 	if (opaque->page_id != LION_PAGE_ID)
 		return;
 	if ((opaque->flags & (LION_PAGE_BUCKET | LION_PAGE_DIR |
-						  LION_PAGE_CONTAINER)) == 0)
+						  LION_PAGE_CONTAINER | LION_PAGE_STOREMAP |
+						  LION_PAGE_STORE)) == 0)
 		return;					/* the meta page holds no items */
 	if ((opaque->flags & LION_PAGE_DELETED) != 0)
 		return;					/* nor does a freed one; pd_lower is its body */

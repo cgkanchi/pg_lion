@@ -212,6 +212,31 @@
 #define LION_TL_IS_WKEY(kind)		((kind) >= 0x20000000 && (kind) < 0x30000000)
 #define LION_TL_WKEY_COL(kind)		((kind) - 0x20000000)
 
+/*
+ * The window store's gather (DESIGN.md §40, "The custom shapes"):
+ * LION_TL_SKEY(g) is the value of the g'th GROUP BY column the node gathers,
+ * LION_TL_SAGG(a) the a'th aggregate it computes from the gathered values,
+ * one of the LION_SAGG_* below.  Far above the kinds of §37.
+ */
+#define LION_TL_SKEY(g)				(0x30000000 + (g))
+#define LION_TL_IS_SKEY(kind)		((kind) >= 0x30000000 && (kind) < 0x38000000)
+#define LION_TL_SKEY_NO(kind)		((kind) - 0x30000000)
+#define LION_TL_SAGG(a)				(0x38000000 + (a))
+#define LION_TL_IS_SAGG(kind)		((kind) >= 0x38000000 && (kind) < 0x40000000)
+#define LION_TL_SAGG_NO(kind)		((kind) - 0x38000000)
+
+/*
+ * An aggregate over a gathered column x: count(x), count(DISTINCT x), and the
+ * aggregates of §37 over x itself - LION_SAGG_WAGG(LION_WAGG_*).  count(*),
+ * and a count(col) the group's rows answer, are LION_TL_COUNT as everywhere.
+ */
+#define LION_SAGG_NONE		0
+#define LION_SAGG_COUNTCOL	1	/* count(x): the rows with x non-NULL */
+#define LION_SAGG_DISTINCT	2	/* count(DISTINCT x) */
+#define LION_SAGG_WAGG(k)	(2 + (k))	/* sum, avg, min, max of x */
+#define LION_SAGG_IS_WAGG(s)	((s) > 2 && (s) <= 2 + LION_WAGG_EXTREME)
+#define LION_SAGG_WAGG_KIND(s)	((s) - 2)
+
 /* ... and what each one computes */
 #define LION_WAGG_NONE		0
 #define LION_WAGG_SUM		1	/* sum(int2), sum(int4): an int8 */
@@ -942,8 +967,9 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  *		lion_plan_custom_path() moves it into the CustomScan's plan.qual -
  *		where setrefs.c rewrites its aggregates into references to the
  *		node's own count columns - and leaves this member empty.  Empty for
- *		a partitioned table, whose HAVING is applied by the Finalize Agg
- *		above the node (§16)
+ *		a partitioned GROUP BY of partial aggregates, whose HAVING is applied
+ *		by the Finalize Agg above the node (§16); a partitioned table's
+ *		gather (member 19) forms its groups itself and applies it
  *	9	IntList: the attnum of the column a count(DISTINCT k) counts, or
  *		empty (DESIGN.md §26).  Its index is in member 1: in the outer group
  *		slot when there is no GROUP BY (k's entries drive the scan), in the
@@ -1009,7 +1035,30 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  *		IntList per aggregate - its LION_WAGG_* kind, the column's position in
  *		those lists and the width of its integer argument - whose argument
  *		expressions it appends to custom_exprs after the clause values
- *	19	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	19	List, or empty: the columns the node GATHERS from the window store
+ *		of one lion index (DESIGN.md §40, "The custom shapes") - their values
+ *		for every row it counts, from which it computes its groups and
+ *		aggregates itself: an OidList of the index; an IntList of the
+ *		columns' attnums and one of their column numbers in the index; and a
+ *		List of one IntList per GROUP BY column, {its position in those
+ *		lists, its equality operator, its collation}.  For a partitioned
+ *		table the OidList has one index per live leaf partition, in member
+ *		5's order, each that partition's own, and the column numbers are 0:
+ *		each partition's index may place the columns differently, and the
+ *		executor finds every relation's from the index it opens
+ *		(lion_store_count()), a plain table's too.  Then an IntList of the
+ *		planner's estimates of the groups and of the count(DISTINCT) pairs,
+ *		each capped at INT_MAX, from which the executor chooses the
+ *		partitions of a spill (DESIGN.md §40, "As built: spilling").
+ *		lion_plan_custom_path() adds a List of one IntList per aggregate over
+ *		a gathered column: its LION_SAGG_* kind, its column's position, the
+ *		width of an integer argument, the aggregate, its input collation,
+ *		and - for a count(DISTINCT) - the equality the DISTINCT compares with
+ *		and its collation.  The count itself is the count(*) every other member
+ *		describes: of the WHERE, or the sum over every row.  The FK-side
+ *		join's path carries members 0 - 18 (lion_plan_fkjoin.c) and its plan
+ *		an empty one here (lion_plan_fkjoin_path())
+ *	20	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -1031,7 +1080,8 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_PRIV_ALLROWS	16
 #define LION_PRIV_TOPK		17
 #define LION_PRIV_WAGG		18
-#define LION_PRIV_TLKINDS	19
+#define LION_PRIV_STORE		19
+#define LION_PRIV_TLKINDS	20
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -1103,6 +1153,20 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * and maxima over the entries of lion columns (DESIGN.md §37), which an older
  * build would have taken for counts.
  *
+ * Shape 22 added the STORE member (19) in front of the target-list kinds,
+ * and the target-list kinds of the gathered GROUP BY columns and aggregates
+ * (DESIGN.md §40, "The custom shapes"): a count whose groups an older build
+ * would not have formed at all.
+ *
+ * Shape 23 moved no member but let the STORE member (19) name one index per
+ * partition: a partitioned table's gather (DESIGN.md §40, "As built:
+ * partitioned tables"), whose groups the node forms over every partition.
+ *
+ * Shape 24 added the estimates of the groups and pairs to the STORE member
+ * (19), in front of its aggregates: the gather's spill (DESIGN.md §40, "As
+ * built: spilling"), whose partitions they choose, and which an older build
+ * would have read as the aggregates.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1115,8 +1179,14 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424915
-#define LION_PRIV_NMEMBERS	20
+#define LION_PRIV_MAGIC		0x52424918
+#define LION_PRIV_NMEMBERS	21
+
+/*
+ * (LionOrdered's and LionStoreScan's custom_private are not this layout:
+ * each has its own, behind a marker of its own - LO_PRIV_* and LS_PRIV_*, in
+ * lion_ordered.c, where both nodes live.)
+ */
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -1235,11 +1305,15 @@ typedef struct LionPartState
 	Const	   *fgconst;		/* ... and then the one value the bounds give
 								 * it (DESIGN.md §27, "Grouped by a fact
 								 * column") */
+	Oid			storeidxoid;	/* the index whose window store the gather
+								 * reads here (DESIGN.md §40), or InvalidOid
+								 * when the node gathers nothing */
 	Relation	heap;
 	Relation	groupidx;
 	Relation	groupidx2;
 	Relation   *clauseidx;		/* one per WHERE clause */
 	Relation	fgidx;
+	Relation	storeidx;
 } LionPartState;
 
 /*
@@ -1753,6 +1827,13 @@ typedef struct LionCountScanState
 	int64		wslow;
 
 	/*
+	 * The gather of the window store (DESIGN.md §40, "The custom shapes";
+	 * LION_PRIV_STORE), or NULL: the groups and aggregates the node computes
+	 * from the stored values of the rows it counts.  lion_exec_store.c.
+	 */
+	struct LionStoreRun *store;
+
+	/*
 	 * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel"; granged,
 	 * the plan node being parallel-aware and no join): each participant claims
 	 * a range of container keys at a time (lion_key_ranges(), the counter in
@@ -2238,6 +2319,10 @@ typedef struct LionCountTarget
 												 * (LionDriveInfo.bound), with
 												 * no index in driveidx; NULL
 												 * otherwise */
+	IndexOptInfo *storeidx;		/* the lion index whose window store holds
+								 * every column the store's gather reads
+								 * (DESIGN.md §40), this relation's own;
+								 * NULL for a path that gathers nothing */
 } LionCountTarget;
 
 /*
@@ -2360,6 +2445,10 @@ extern Oid lion_index_equality_op(IndexOptInfo *idx, AttrNumber col);
 extern bool lion_type_equalimage(Oid typid, Oid collation);
 extern bool lion_index_can_emit_value(IndexOptInfo *idx, AttrNumber col);
 extern bool lion_contains_param(Node *expr);
+extern int	lion_store_agg_classify(Aggref *agg, Index rti, AttrNumber *attno,
+									int *width, Oid *eqop, Oid *collation);
+extern IndexOptInfo *lion_find_store_index(RelOptInfo *rel, List *attnos,
+										   List **idxcols);
 extern int	lion_wagg_classify(Aggref *agg, Index rti, AttrNumber *attno,
 							   int *argwidth);
 extern IndexOptInfo *lion_match_index(RelOptInfo *rel, AttrNumber attno,
@@ -2462,6 +2551,13 @@ extern double lion_units_margin_for(RelOptInfo *rel);
 
 /* lion_plan_cost.c */
 extern double lion_index_dir_pages(IndexOptInfo *idx, double *height);
+extern double lion_index_store_pages(IndexOptInfo *idx, int *nstored);
+extern void lion_cost_store_path(PlannerInfo *root, CustomPath *cpath,
+								 List *targets, int ncols, int ngroup,
+								 double groups, double outrows, int naggs,
+								 int ndistinct, double distinctpairs,
+								 double hashbytes, double pairbytes,
+								 int32 rowwidth, int32 pairwidth);
 extern double lion_index_column_share(PlannerInfo *root, RelOptInfo *rel,
 									  IndexOptInfo *idx, AttrNumber col);
 extern bool lion_index_orders_naturally(IndexOptInfo *idx, AttrNumber col);
@@ -2614,9 +2710,22 @@ extern TupleTableSlot *lion_next_group_ranged(LionCountScanState *st,
 											  bool *exhausted);
 extern TupleTableSlot *lion_distinct_relation(LionCountScanState *st);
 extern void lion_wagg_run(LionCountScanState *st);
+extern void lion_wagg_finish(LionWAgg *a);
 extern TupleTableSlot *lion_next_group_any(LionCountScanState *st,
 										   bool *exhausted);
 extern void lion_decode_reset(LionCountScanState *st);
+
+/* lion_exec_store.c */
+extern void lion_store_begin(LionCountScanState *st, CustomScan *cscan,
+							 EState *estate);
+extern TupleTableSlot *lion_store_next(LionCountScanState *st);
+extern Datum lion_store_emit_value(LionCountScanState *st, int kind,
+								   bool *isnull);
+extern void lion_store_reset(LionCountScanState *st);
+extern void lion_store_explain(LionCountScanState *st, ExplainState *es);
+extern double lion_store_chunk_bytes(double size);
+extern double lion_store_group_bytes(int ngroup, int naggs, bool hasdistinct);
+extern double lion_store_pair_bytes(double copybytes);
 
 /* lion_exec_run.c */
 extern void lion_pause_run(LionCountScanState *st);
