@@ -3,8 +3,9 @@
  * lion_verify_store.c
  *		lion_index_verify()'s checks of the window store (DESIGN.md §40):
  *		the meta page's record, the map, every chain and every page on it,
- *		the store pages no walk reached, and - with heapallindexed - the
- *		value of every stored column of every row the check's snapshot sees.
+ *		an ordered index's windows whole (§41), the store pages no walk
+ *		reached, and - with heapallindexed - the value of every stored
+ *		column of every row the check's snapshot sees.
  *
  * Part of the SQL-callable helpers of the lion index; lion_funcs.h
  * describes them and declares what their files share.
@@ -69,6 +70,28 @@ lion_verify_store_meta(LionVerifyState *vs, Page metapage)
 		vs->store.store_root != vs->ix->store.store_root)
 		lion_corrupt("lion index \"%s\": meta page names window map root %u",
 					RelationGetRelationName(vs->index), vs->store.store_root);
+
+	/* the order of a version 10 index (§41), and of no other */
+	if (LION_META_HAS_ORDER(meta))
+	{
+		LionMetaStoreOrder *mo;
+
+		if (!LionMetaHasOrderArea(metapage))
+			lion_corrupt("lion index \"%s\": meta page version %u ends at byte %u, before its order record",
+						RelationGetRelationName(vs->index), meta->version,
+						((PageHeader) metapage)->pd_lower);
+		mo = LionPageGetMetaStoreOrder(metapage);
+		if (mo->order_ord < 0 || mo->order_ord >= vs->ix->nstored ||
+			mo->order_ord != vs->ix->store_order ||
+			(mo->order_flags & ~LION_STORE_ORDER_CLUSTER) != 0)
+			lion_corrupt("lion index \"%s\": meta page names order column ordinal %d with flags %u, expected ordinal %d",
+						RelationGetRelationName(vs->index), (int) mo->order_ord,
+						(unsigned) mo->order_flags, vs->ix->store_order);
+	}
+	else if (vs->ix->store_order >= 0)
+		lion_corrupt("lion index \"%s\": meta page version %u has no order, but the index is ordered by ordinal %d",
+					RelationGetRelationName(vs->index), meta->version,
+					vs->ix->store_order);
 }
 
 /* Read and check map page blk, (level, number), and copy its entries. */
@@ -108,9 +131,11 @@ static void
 lion_verify_store_chain(LionVerifyState *vs, uint64 slot, BlockNumber head)
 {
 	LionIndexState *ix = vs->ix;
-	uint32		ckey = (uint32) (slot / (uint64) ix->nstored);
-	int			ord = (int) (slot % (uint64) ix->nstored);
-	const LionStoreCol *col = &ix->stored[ord];
+	int			stride = lion_store_stride(ix);
+	uint32		ckey = (uint32) (slot / (uint64) stride);
+	int			ord = (int) (slot % (uint64) stride);
+	const LionStoreCol *col = (ord < ix->nstored) ? &ix->stored[ord] : ix->storeperm;
+	int			npagesmax = lion_store_col_pages(col);
 	BlockNumber blk = head;
 	int			nexthi = 0;
 	int			npages = 0;
@@ -150,8 +175,8 @@ lion_verify_store_chain(LionVerifyState *vs, uint64 slot, BlockNumber head)
 		UnlockReleaseBuffer(buf);
 
 		vs->nstorepages++;
-		if (++npages > LION_BLOCKS_PER_CONTAINER ||
-			(BlockNumberIsValid(next) && nexthi >= LION_BLOCKS_PER_CONTAINER))
+		if (++npages > npagesmax ||
+			(BlockNumberIsValid(next) && nexthi >= npagesmax))
 			lion_corrupt("lion index \"%s\": the store chain of window %u column %d goes on past heap page %d at block %u",
 						RelationGetRelationName(vs->index), ckey, col->attno,
 						nexthi - 1, blk);
@@ -167,6 +192,8 @@ lion_verify_store(LionVerifyState *vs)
 	BlockNumber *innerents;
 	BlockNumber *leafents;
 	uint32		a;
+	int			stride = lion_store_stride(vs->ix);
+	int64		lastwin = -1;
 
 	vs->storecxt = CurrentMemoryContext;
 	if (vs->store.store_cols == 0)
@@ -202,13 +229,26 @@ lion_verify_store(LionVerifyState *vs)
 									   leafno, leafents);
 			for (c = 0; c < LION_STOREMAP_FANOUT; c++)
 			{
+				uint64		slot = leafno * LION_STOREMAP_FANOUT + c;
+
 				if (leafents[c] == 0)
 					continue;
-				lion_verify_store_chain(vs, leafno * LION_STOREMAP_FANOUT + c,
-										leafents[c]);
+
+				/*
+				 * An ordered index's windows (§41) are checked whole once
+				 * each of their chains has been on its own.
+				 */
+				if (vs->ix->store_order >= 0 && lastwin >= 0 &&
+					(int64) (slot / (uint64) stride) != lastwin)
+					lion_store_verify_window(vs->index, vs->ix, (uint32) lastwin);
+				lastwin = (int64) (slot / (uint64) stride);
+				lion_verify_store_chain(vs, slot, leafents[c]);
 			}
 		}
 	}
+
+	if (vs->ix->store_order >= 0 && lastwin >= 0)
+		lion_store_verify_window(vs->index, vs->ix, (uint32) lastwin);
 
 	pfree(leafents);
 	pfree(innerents);
@@ -245,7 +285,7 @@ lion_verify_store_classify(LionVerifyState *vs, BlockNumber blk, Page page,
 		return LION_UNREF_LIVE;
 	}
 
-	if (ord >= (uint32) vs->ix->nstored)
+	if (ord >= (uint32) lion_store_stride(vs->ix))
 		return LION_UNREF_LIVE;
 	if (lion_store_page_linked(vs->index, vs->ix, blk, owner, (uint16) ord))
 		return LION_UNREF_LINKED;
