@@ -91,9 +91,14 @@ CREATE INDEX lion_rec_arr ON lion_rec USING lion (arr) WITH (inline_limit = 64, 
  * key and its three INCLUDE columns are a dense int, the thin text column
  * (about one value a row), a nullable int and a bool.  lion_rec_stb, built
  * after the load, stores a distinct int8 a row and citext in capped slots.
+ * lion_rec_st and lion_rec_sto have an order column (§41, cluster_column):
+ * lion_rec_st its key, built before the load, so its windows start with no
+ * permutation and VACUUM sorts them; lion_rec_sto an INCLUDE column, built
+ * after it, so the build sorts them.  lion_rec_stb names none, and stays in
+ * the heap order of version 9.
  */
 CREATE INDEX lion_rec_st  ON lion_rec USING lion (k4) INCLUDE (t, nn, b)
-	WITH (store_values = true);
+	WITH (store_values = true, cluster_column = k4);
 
 INSERT INTO lion_rec
 SELECT g.* FROM generate_series(1, 40000) i, lion_rec_gen(i) g;
@@ -104,6 +109,8 @@ CREATE INDEX lion_rec_nn  ON lion_rec USING lion (nn) WITH (buckets = 8);
 CREATE INDEX lion_rec_tsv ON lion_rec USING lion (tsv);
 CREATE INDEX lion_rec_stb ON lion_rec USING lion (nn) INCLUDE (id, ct)
 	WITH (store_max_len = 16);
+CREATE INDEX lion_rec_sto ON lion_rec USING lion (nn) INCLUDE (id, t)
+	WITH (cluster_column = t);
 
 /*
  * A MULTICOLUMN index (DESIGN.md §24), so that every crash round exercises
@@ -562,7 +569,8 @@ BEGIN
 	FOR r IN SELECT * FROM (VALUES
 			('lion_rec_st'::text,
 			 'ARRAY[k4::text, t, nn::text, CASE WHEN b THEN ''t'' ELSE ''f'' END]'::text),
-			('lion_rec_stb', 'ARRAY[id::text, ct::text]')
+			('lion_rec_stb', 'ARRAY[id::text, ct::text]'),
+			('lion_rec_sto', 'ARRAY[id::text, t]')
 		) v(idx, vals)
 	LOOP
 		EXECUTE format('SELECT count(*) FROM lion_rec '

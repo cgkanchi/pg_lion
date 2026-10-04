@@ -688,6 +688,29 @@ COMMENT ON FUNCTION lion_index_stored(regclass, tid) IS
 	'diagnostic: the stored column values of the row at ctid, as text, NULL for NULL or not stored';
 
 /*
+ * One window of an index whose store is in key-ordered windows (DESIGN.md
+ * §41): its order column and its permutation's state.  A DIAGNOSTIC for
+ * tests.
+ */
+CREATE FUNCTION lion_index_store_window(idx regclass, win int8,
+										OUT order_attno int2,
+										OUT generation int4,
+										OUT nsorted int4,
+										OUT per_page int4,
+										OUT directory int4,
+										OUT thinned bool,
+										OUT entries int8,
+										OUT appended int8,
+										OUT perm_pages int4,
+										OUT pages int4)
+RETURNS record
+AS 'MODULE_PATHNAME', 'lion_index_store_window'
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
+
+COMMENT ON FUNCTION lion_index_store_window(regclass, int8) IS
+	'diagnostic: one window of a store in key-ordered windows (§41): the order column (NULL in heap order), the generation, the rows the last sort ordered and how many a virtual page, directory entries and whether thinned, positions with a permutation entry, append-region slots, and permutation and data pages';
+
+/*
  * The ROOT block of one key's posting tree (DESIGN.md §22), NULL when the key
  * has no entry or its posting set is still INLINE.  For tests: the root block
  * is the identity of a posting set and must never move, which is what a root
