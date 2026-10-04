@@ -118,10 +118,12 @@ bool		lion_enable_lazy_set = true;
 static bool lion_enable_ordered_store = true;
 
 /*
- * LionStoreScan (DESIGN.md §40, "As built: the row gather").  Off, no path of
- * it is offered: the query gets core's scans and lion's own, as before.
+ * LionStoreScan (DESIGN.md §40, "As built: the row gather" and "As built: the
+ * row gather, priced").  On by default: the gather is priced in the units of
+ * the scan of core's it would displace and offered beside it.  Off, no path
+ * of it is offered: the query gets core's scans and lion's own.
  */
-static bool lion_enable_store_scan = false;
+static bool lion_enable_store_scan = true;
 static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 
 /*
@@ -1143,6 +1145,38 @@ lo_scratch_index_paths(PlannerInfo *root, RelOptInfo *scratch)
 #endif
 
 /*
+ * create_index_paths() on the scratch relation of lo_lion_accesses(),
+ * without index-only scans: the copy's paths compete in add_path() as a
+ * relation's do, and an index-only scan of one of the indexes - a lion index
+ * storing the columns - dominated the bitmap heap path over the AND of two,
+ * which was then no candidate.  The row gather took one leaf with the other
+ * column as its filter, 75,000 rows gathered for 11,000 kept, in twice the
+ * time the AND took (DESIGN.md §40, "As built: the row gather, priced").
+ * Disabled, the scan still lands, and loses to every enabled path
+ * (disabled_nodes; disable_cost before 18).
+ */
+static void
+lo_scratch_create_paths(PlannerInfo *root, RelOptInfo *scratch)
+{
+	bool		save_indexonlyscan = enable_indexonlyscan;
+
+	enable_indexonlyscan = false;
+	PG_TRY();
+	{
+#if PG_VERSION_NUM >= 180000
+		create_index_paths(root, scratch);
+#else
+		lo_scratch_index_paths(root, scratch);
+#endif
+	}
+	PG_FINALLY();
+	{
+		enable_indexonlyscan = save_indexonlyscan;
+	}
+	PG_END_TRY();
+}
+
+/*
  * The lion accesses core builds for rel's restriction clauses less `exclude`:
  * create_index_paths() run on a scratch copy of rel that sees only its lion
  * indexes, no join clauses and no parallelism, so that only unparameterized,
@@ -1191,11 +1225,8 @@ lo_lion_accesses(PlannerInfo *root, RelOptInfo *rel, List *lionidx,
 	scratch->consider_parallel = false;
 	if (scratch->baserestrictinfo == NIL)
 		return NIL;
-#if PG_VERSION_NUM >= 180000
-	create_index_paths(root, scratch);
-#else
-	lo_scratch_index_paths(root, scratch);
-#endif
+
+	lo_scratch_create_paths(root, scratch);
 
 	foreach(lc, scratch->pathlist)
 	{
@@ -2027,16 +2058,19 @@ static double lo_margin = 1.0;
 
 /*
  * One LionOrdered path - or a LionStoreScan one, by its methods - offered
- * to add_path() (DESIGN.md §30.2, step 3) at pg_lion.pushdown_margin
- * (§39): its price divided by the margin, startup
+ * to add_path() (DESIGN.md §30.2, step 3) at `margin`, pg_lion.pushdown_margin
+ * or none (§39): its price divided by the margin, startup
  * and total alike, so that whatever it is compared with - the btree scan it
  * walks, a Sort over another path, a LIMIT's fraction of either - it is
- * taken only by that margin.  Its competitors are the relation's scans, which
- * are lion's reference units already: it has no rate.
+ * taken only by that margin.  LionOrdered's competitors are the relation's
+ * scans, which it is not converted into (lo_cost_store()): it has no rate.
+ * LionStoreScan's price comes converted (ls_cost()), with the margin of its
+ * competitor (lion_units_for()).
  */
 static void
 lo_add_path(RelOptInfo *rel, List *pathkeys, List *priv, double rows,
-			Cost startup, Cost total, const CustomPathMethods *methods)
+			Cost startup, Cost total, double margin,
+			const CustomPathMethods *methods)
 {
 	CustomPath *cp = makeNode(CustomPath);
 
@@ -2048,8 +2082,8 @@ lo_add_path(RelOptInfo *rel, List *pathkeys, List *priv, double rows,
 	cp->path.parallel_safe = false;
 	cp->path.parallel_workers = 0;
 	cp->path.rows = rows;
-	cp->path.startup_cost = startup / lo_margin;
-	cp->path.total_cost = total / lo_margin;
+	cp->path.startup_cost = startup / margin;
+	cp->path.total_cost = total / margin;
 	cp->path.pathkeys = pathkeys;
 	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cp->custom_paths = NIL;
@@ -2483,76 +2517,246 @@ ls_tree_ok(PlannerInfo *root, Path *path, double tuples, double pages,
 }
 
 /*
- * What a page of a window store costs LionStoreScan to read - before
- * LION_STORE_PAGE_COST's decoding - when `pages` of the `total` pages of one
- * column's store are read: as cost_bitmap_heap_scan() prices a heap page,
- * random_page_cost for a page among few, moving to seq_page_cost by the root
- * of the share read, the index's tablespace's costs.
+ * What LionStoreScan's own work costs, in lion's units (DESIGN.md §40, "As
+ * built: the row gather, priced"): fitted on the quick benchmark's
+ * 5,000,000-row table (release build, warm), the node forced, one to five
+ * columns gathered over results of 231 to 250,000 rows - a store page
+ * 1.1 to 1.4 us read and decoded, a value 0.05 us beyond the page it is on,
+ * a piece - one window's members, its visibility-map probes and each
+ * column's gather started - 1.8 us, at the 500 units a millisecond lion's
+ * constants are fitted at (§10, "The reference").  A member's tuple is
+ * cpu_tuple_cost, which it measured at (0.016 us).
  *
- * Not argued down for residency as the count's index pages are (§39,
- * "Resident index pages"; lion_index_page_cost()), nor as lion's recheck
- * prices the heap pages it reads (lion_heap_page_cost()).  Those compete with
- * plans that are charged no page for the same work - a BitmapAnd's CPU per
- * TID - or that read the same heap pages; this node's store pages stand in
- * for the heap pages of the scans it competes with, which core charges as
- * I/O whatever the cache holds, and a store page takes about the time a heap
- * page does to reach (a buffer either way: the release build measured a
- * page of a gather at a few microseconds, as a bitmap heap scan's page).  A
- * store page priced as a buffer hit against a heap page priced as a read
- * put the node within an eighth of an index scan's price where it read six
- * times the pages in four times the time: a few rows' gather reads a chain
- * in each of their windows for each column, where an index scan reads a
- * heap page a row.
+ *	LS_PAGE_DECODE_COST	a store page's decoding, beyond LION_STORE_PAGE_COST
+ *						and what reaching it costs (ls_store_page_cost());
+ *	LS_VALUE_COST		a value handed up, beyond LION_STORE_VALUE_COST;
+ *	LS_PIECE_COST		a piece;
+ *	LS_COLUMN_START_COST	a column's reader opened, its index's store
+ *						found: 12 us a column, measured on
+ *						store_gather.sql's table of 30,000 rows, where a
+ *						scan of no rows took 0.07 ms gathering one column
+ *						and 0.11 ms gathering five, and a dozen rows' scan
+ *						was a bitmap heap scan's 0.17 ms at 0.22 ms.
+ *
+ * pg_lion.store_page_cost and pg_lion.store_value_cost still move the
+ * node's price, as they move the count's gather and the index-only scan's;
+ * those two are not refitted here, and the count, priced against aggregates
+ * that pay their own hashing, has shown no mispick.
+ */
+#define LS_PAGE_DECODE_COST		(112.0 * cpu_operator_cost)
+#define LS_VALUE_COST			(9.0 * cpu_operator_cost)
+#define LS_PIECE_COST			(240.0 * cpu_operator_cost)
+#define LS_COLUMN_START_COST	(2400.0 * cpu_operator_cost)
+
+/*
+ * The store pages a gather reads of one column's chain in one window, for m
+ * members spread over a chain of P pages (`pagesper`): it walks the chain
+ * from its head to the page of its last member, 1 + (P - 1) m / (m + 1) of
+ * them.  The one place the node's price says where a window's members lie
+ * in its chain.
+ */
+static double
+ls_window_chain_pages(double pagesper, double m)
+{
+	return 1.0 + (Max(pagesper, 1.0) - 1.0) * m / (m + 1.0);
+}
+
+/*
+ * What a page of a window store costs LionStoreScan to reach and decode,
+ * when `pages` of the `total` pages of one column's store are read: reached
+ * as lion's own index pages are (lion_index_page_cost(), DESIGN.md §39,
+ * "Resident index pages") - a buffer hit, LION_RESIDENT_PAGE_COST, for a
+ * store the cache holds, and otherwise the device's price, as
+ * cost_bitmap_heap_scan() prices a heap page: random_page_cost among few of
+ * the column's pages, moving to seq_page_cost by the root of the share read,
+ * the index's tablespace's costs - then LION_STORE_PAGE_COST and
+ * LS_PAGE_DECODE_COST to decode it.
+ *
+ * It was the device's price alone until the node was converted into its
+ * competitor's units (ls_cost()): a store page stood in for the heap page
+ * core charges as I/O however cached, so that the node competed with the
+ * relation's scans in their units, unconverted.  That made a page dear
+ * against the node's rows, which were near free, and a result of a few
+ * rows a window was priced by its pages and one of many rows a window at a
+ * third of its time (DESIGN.md §40, "As built: the row gather", "Measured").
  */
 static Cost
-ls_store_page_price(IndexOptInfo *index, double pages, double total)
+ls_store_page_cost(PlannerInfo *root, IndexOptInfo *index, double pages,
+				   double total)
 {
 	double		spc_random;
 	double		spc_seq;
 	double		share;
+	Cost		device;
 
 	if (pages <= 0.0)
 		return 0.0;
 	get_tablespace_page_costs(index->reltablespace, &spc_random, &spc_seq);
 	share = Min(pages / Max(total, 1.0), 1.0);
-	return spc_random - (spc_random - spc_seq) * sqrt(share);
+	device = spc_random - (spc_random - spc_seq) * sqrt(share);
+	return lion_index_page_cost(root, Max((double) index->pages, total),
+								device) +
+		LION_STORE_PAGE_COST + LS_PAGE_DECODE_COST;
+}
+
+/*
+ * The node's own reading of the lion side, in lion's units: what its stream
+ * and its AND's mask cost the executor (ls_cursor_open(), lo_build_leaf()),
+ * which is not what core's bitmap paths are priced for.  cost_bitmap_tree_node()
+ * is the AM's bitmap scan, a TID a member handed to a TIDBitmap and, for an
+ * AND, core's BitmapAnd of them: priced so, the mask of `c20 IN (3, 4, 5)`
+ * (750,000 members) was 8,700 units, and the AND of it with `c200 IN (17, 18,
+ * 19)` lost to the one leaf with the other as a filter, which gathered seven
+ * times the rows in twice the time (DESIGN.md §40, "As built: the row gather,
+ * priced").  The node reads the same sets a container at a time, and for
+ * each clause of each leaf, fitted on the quick benchmark's table (release
+ * build, warm), it costs:
+ *
+ *	- a container's work in each window the clause's members meet,
+ *	  LS_CONTAINER_COST (0.6 us);
+ *	- for a list of n sets - an IN list, the values of `= ANY` - a step of
+ *	  each set at each window, LS_SET_STEP_COST (0.015 us), and, where the
+ *	  list is streamed (the leaf the node reads, or an AND's driver) and not
+ *	  built into a mask, their union under the pins: a container of each set
+ *	  merged, LS_UNION_CONTAINER_COST (1 us), or where the containers hold a
+ *	  member or two, LS_UNION_MEMBER_COST (0.15 us) for each member the leaf
+ *	  keeps - beside another column's clause in the same leaf, only the
+ *	  members both keep come out of the stream.  `c200 IN (17, 18)` read 3 ms
+ *	  slower than `c200 = 17` from the same store pages, a second set's 1,500
+ *	  containers, and `c20k IN` 400 values 20 ms for 100,000 members of
+ *	  as many containers; where the list is masked, `c20 IN (3, 4, 5)` -
+ *	  750,000 members - cost a few;
+ *	- every member of the clause, cpu_operator_cost.
+ *
+ * A multi-key clause is one set, as the count prices it (§22).  The
+ * selectivity is still cost_bitmap_tree_node()'s, as the AM's paths have it.
+ */
+#define LS_CONTAINER_COST		(120.0 * cpu_operator_cost)
+#define LS_SET_STEP_COST		(3.0 * cpu_operator_cost)
+#define LS_UNION_CONTAINER_COST	(200.0 * cpu_operator_cost)
+#define LS_UNION_MEMBER_COST	(30.0 * cpu_operator_cost)
+
+static Cost
+ls_lion_cost(PlannerInfo *root, RelOptInfo *rel, Path *path, double windows,
+			 bool streamed)
+{
+	double		tuples = Max(rel->tuples, 1.0);
+	Cost		cost = 0.0;
+	ListCell   *lc;
+
+	if (IsA(path, IndexPath))
+	{
+		Cost		leafcost;
+		Selectivity leafsel;
+		double		leafmembers;
+
+		/* a union streams only the members the whole leaf keeps */
+		cost_bitmap_tree_node(path, &leafcost, &leafsel);
+		leafmembers = clamp_row_est(leafsel * tuples);
+		foreach(lc, ((IndexPath *) path)->indexclauses)
+		{
+			IndexClause *iclause = lfirst_node(IndexClause, lc);
+			ListCell   *lc2;
+
+			foreach(lc2, iclause->indexquals)
+			{
+				RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+				Node	   *cl = (Node *) rinfo->clause;
+				Selectivity sel = clause_selectivity(root, (Node *) rinfo, 0,
+													 JOIN_INNER, NULL);
+				double		members = clamp_row_est(sel * tuples);
+				double		touched = Max(1.0, Min(members,
+												   windows * (1.0 - exp(-members / windows))));
+				double		n = 1.0;
+
+				if (IsA(cl, ScalarArrayOpExpr) &&
+					((ScalarArrayOpExpr *) cl)->useOr)
+#if PG_VERSION_NUM >= 170000
+					n = Max(1.0, (double) estimate_array_length(root,
+																(Node *) lsecond(((ScalarArrayOpExpr *) cl)->args)));
+#else
+					n = Max(1.0, (double) estimate_array_length((Node *) lsecond(((ScalarArrayOpExpr *) cl)->args)));
+#endif
+				cost += touched * LS_CONTAINER_COST;
+				if (n > 1.0)
+					cost += n * windows * LS_SET_STEP_COST;
+				cost += members * cpu_operator_cost;
+				if (n > 1.0 && streamed)
+				{
+					double		conts = n * Max(1.0, Min(windows, members / n));
+
+					cost += Min(conts * LS_UNION_CONTAINER_COST,
+								Min(members, leafmembers) * LS_UNION_MEMBER_COST);
+				}
+			}
+		}
+		return cost;
+	}
+	if (IsA(path, BitmapAndPath))
+	{
+		List	   *arms = ((BitmapAndPath *) path)->bitmapquals;
+		Path	   *driver = NULL;
+
+		/* the driver as ls_tree_ok() takes it: the first LEAF child */
+		foreach(lc, arms)
+		{
+			if (IsA(lfirst(lc), IndexPath))
+			{
+				driver = (Path *) lfirst(lc);
+				break;
+			}
+		}
+		if (driver == NULL)
+			driver = (Path *) linitial(arms);
+		foreach(lc, arms)
+			cost += ls_lion_cost(root, rel, (Path *) lfirst(lc), windows,
+								 streamed && lfirst(lc) == driver);
+		return cost;
+	}
+	foreach(lc, castNode(BitmapOrPath, path)->bitmapquals)
+		cost += ls_lion_cost(root, rel, (Path *) lfirst(lc), windows,
+							 streamed);
+	return cost;
 }
 
 /*
  * The price of LionStoreScan over lion access `lion` (DESIGN.md §40, "As
- * built: the row gather"), gathering the columns `chosen` (LsStoreCol) and
- * filtering by residual; rows is what it returns (lion_probe_rel_rows()) and
- * passes the runs its stream makes over the heap's windows (ls_tree_ok()).
- * As lo_cost_store() prices the store order's set and gather, without the
- * ranking:
+ * built: the row gather, priced"), gathering the columns `chosen`
+ * (LsStoreCol) and filtering by residual; rows is what it returns
+ * (lion_probe_rel_rows()) and passes the runs its stream makes over the
+ * heap's windows (ls_tree_ok()).  In lion's units:
  *
- *	- start-up: the lion lookups, the AND's sets built among them;
- *	- a container's work for each piece the stream hands out, the windows
- *	  each run meets a member in (Cardenas's count, as the count's gather);
+ *	- start-up: the lion side as the node reads it (ls_lion_cost()), the
+ *	  AND's sets built among it, and each column's reader opened
+ *	  (LS_COLUMN_START_COST);
+ *	- a piece for each window each run meets a member in (Cardenas's count,
+ *	  as the count's gather), LS_PIECE_COST;
  *	- for the members on all-visible pages - the share rel->allvisfrac says -
- *	  LION_STORE_VALUE_COST a value of each column, and for each column the
- *	  store pages a piece reads: a gather walks the column's chain of the
- *	  window from its head to the page of its last member, which for m
- *	  members spread over a chain of P pages is 1 + (P - 1) m / (m + 1) of
- *	  them, each LION_STORE_PAGE_COST and its read (ls_store_page_price());
- *	  and before them the page of the store's map that names the chain's
- *	  head (lion_storemap_head()), read again by every gather - a buffer
- *	  each, in the windows' order, so seq_page_cost: as many buffers as a
- *	  chain of one page, and on a sparse result most of what the gather
- *	  reads (five columns, a row or three a window: two of every five);
+ *	  a value of each column (LION_STORE_VALUE_COST and LS_VALUE_COST), and
+ *	  for each column the store pages each piece reads
+ *	  (ls_window_chain_pages()), and before them the page of the store's map
+ *	  that names the chain's head (lion_storemap_head()), read again by every
+ *	  gather: each at ls_store_page_cost();
  *	- the members on the other pages fetched from the heap, as §9 prices a
  *	  recheck (a heap page's read, lion_heap_page_cost(), and
  *	  LION_RECHECK_TID_COST a row);
  *	- a tuple's work for every member, the filter's for each, and the
  *	  target's for every row returned.
  *
- * Nothing is converted (§39, "Not converted at all"): like LionOrdered it
- * competes with the relation's own scans, and is offered at the margin.
+ * Then converted into the units of the relation's cheapest scan of core's,
+ * as LionCount is into its aggregate's (DESIGN.md §39; u from
+ * lion_units_for()): the rate of an index scan, an index-only scan, a bitmap
+ * heap scan of one index or of an AND or OR of them, or a sequential scan.
+ * Its competitors are those scans, which core prices with a cached heap page
+ * charged as a read, so that they run at 1,000 to 3,000 units a millisecond
+ * where the node, priced at lion's reference, runs at about 500: compared
+ * unconverted, the node took results it is two to three times slower on.
+ * The margin is lo_add_path()'s to apply, the competitor's (u->margin).
  */
 static void
 ls_cost(PlannerInfo *root, RelOptInfo *rel, Path *lion, List *chosen,
-		List *residual, double rows, double passes, Cost *startup_p,
-		Cost *total_p)
+		List *residual, double rows, double passes, const LionUnits *u,
+		Cost *startup_p, Cost *total_p)
 {
 	double		tuples = Max(rel->tuples, 1.0);
 	double		pages = Max((double) rel->pages, 1.0);
@@ -2574,9 +2778,10 @@ ls_cost(PlannerInfo *root, RelOptInfo *rel, Path *lion, List *chosen,
 	members = clamp_row_est(sel * tuples);
 	runs = Max(passes, 1.0) * windows;
 
-	startup = lioncost;
+	startup = ls_lion_cost(root, rel, lion, windows, true) +
+		list_length(chosen) * LS_COLUMN_START_COST;
 	pieces = Max(1.0, Min(members, runs * (1.0 - exp(-members / runs))));
-	run += pieces * cpu_operator_cost;
+	run += pieces * LS_PIECE_COST;
 
 	stored = members * allvis;
 	dirty = members - stored;
@@ -2589,17 +2794,14 @@ ls_cost(PlannerInfo *root, RelOptInfo *rel, Path *lion, List *chosen,
 		foreach(lc, chosen)
 		{
 			LsStoreCol *sc = (LsStoreCol *) lfirst(lc);
-			double		reads = touched * (1.0 + (sc->pagesper - 1.0) * m / (m + 1.0));
-			double		spc_random;
-			double		spc_seq;
+			double		total = windows * sc->pagesper;
+			double		reads = touched * ls_window_chain_pages(sc->pagesper, m);
 
-			get_tablespace_page_costs(sc->index->reltablespace, &spc_random,
-									  &spc_seq);
-			run += stored * LION_STORE_VALUE_COST;
-			run += reads * (ls_store_page_price(sc->index, reads,
-												windows * sc->pagesper) +
-							LION_STORE_PAGE_COST);
-			run += touched * (spc_seq + LION_STORE_PAGE_COST);	/* the map */
+			run += stored * (LION_STORE_VALUE_COST + LS_VALUE_COST);
+			run += reads * ls_store_page_cost(root, sc->index, reads, total);
+			/* the map, in the windows' order */
+			run += touched * ls_store_page_cost(root, sc->index, touched,
+												touched);
 		}
 	}
 	if (dirty > 0.0)
@@ -2615,8 +2817,8 @@ ls_cost(PlannerInfo *root, RelOptInfo *rel, Path *lion, List *chosen,
 	run += members * (cpu_tuple_cost + qcost.per_tuple) +
 		rows * rel->reltarget->cost.per_tuple;
 
-	*startup_p = startup;
-	*total_p = startup + run;
+	*startup_p = startup * u->rate;
+	*total_p = (startup + run) * u->rate;
 }
 
 /*
@@ -2638,6 +2840,8 @@ ls_add_paths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	List	   *storecols = NIL;
 	Bitmapset  *want = bms_copy(attnos);
 	bool		looked = false;
+	bool		priced = false;
+	LionUnits	units;
 	ListCell   *lc;
 	int			x = -1;
 
@@ -2735,10 +2939,20 @@ ls_add_paths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 				lappend_int((List *) list_nth(srccols, i), sc->indexcol);
 		}
 
-		ls_cost(root, rel, lion, chosen, residual, rows, passes, &startup,
-				&total);
+		if (!priced)
+		{
+			/*
+			 * The units, found before the first path is added, which can
+			 * free the scan of core's the next one would be priced against
+			 * (lion_units_pin(), DESIGN.md §39).
+			 */
+			lion_units_for(rel, &units);
+			priced = true;
+		}
+		ls_cost(root, rel, lion, chosen, residual, rows, passes, &units,
+				&startup, &total);
 		lo_add_path(rel, NIL, list_make4(lion, srcs, srcattnos, srccols),
-					rows, startup, total, &ls_path_methods);
+					rows, startup, total, units.margin, &ls_path_methods);
 	}
 }
 
@@ -2899,7 +3113,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			if (setbytes > (double) limit)
 				continue;		/* the set would not fit (§30.3) */
 			lo_add_path(rel, ord->path.pathkeys, list_make2(ord, lion), rows,
-						startup, total, &lo_path_methods);
+						startup, total, lo_margin, &lo_path_methods);
 		}
 	}
 
@@ -2942,7 +3156,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			priv = lappend(priv, lion);
 			priv = lappend(priv, w->vrinfos);
 			lo_add_path(rel, list_make1(w->pathkey), priv, rows, startup,
-						total, &lo_path_methods);
+						total, lo_margin, &lo_path_methods);
 		}
 	}
 
@@ -2991,7 +3205,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			lo_add_path(rel, root->sort_pathkeys,
 						list_make3(storeinfo, store.index, lion),
 						clamp_row_est(Min(storek, rows)), startup, total,
-						&lo_path_methods);
+						lo_margin, &lo_path_methods);
 		}
 	}
 }
@@ -3586,8 +3800,13 @@ lo_build_leaf(LionOrderedState *st, LoLeaf *leaf)
 	LionSource *src;
 	const LionContainer *c;
 
-	src = lion_source_open(leaf->index, leaf->keys, leaf->nkeys, false,
-						   st->buildcxt);
+	/*
+	 * LionStoreScan's mask trusts what a multi-key column's sets answer
+	 * exactly (lion_source_open_ext()), as its streamed leaves do: a row of
+	 * the store is checked against nothing.
+	 */
+	src = lion_source_open_ext(leaf->index, leaf->keys, leaf->nkeys, false,
+							   st->gscan, st->buildcxt);
 	pgstat_count_index_scan(leaf->index);
 	if (!lion_source_exact(src))
 		st->exact = false;
@@ -6061,8 +6280,8 @@ ls_cursor_open(LionOrderedState *st, LoNode *node)
 	{
 		LoLeaf	   *leaf = node->leaf;
 
-		cur->src = lion_source_open(leaf->index, leaf->keys, leaf->nkeys, true,
-									st->buildcxt);
+		cur->src = lion_source_open_ext(leaf->index, leaf->keys, leaf->nkeys,
+										true, true, st->buildcxt);
 		pgstat_count_index_scan(leaf->index);
 		cur->sorted = lion_source_sorted(cur->src);
 		return cur;
@@ -7162,9 +7381,9 @@ lion_ordered_init(void)
 	 */
 	DefineCustomBoolVariable("pg_lion.enable_store_scan",
 							 "Lets LionStoreScan return the rows lion indexes select with the columns their window stores hold.",
-							 "Off, such a query reads its columns from the heap, as core's scans do.",
+							 "On, the planner chooses it by price over core's index, index-only and bitmap scans; off, such a query reads its columns as core's scans do.",
 							 &lion_enable_store_scan,
-							 false,
+							 true,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);

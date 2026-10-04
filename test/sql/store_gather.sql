@@ -354,12 +354,34 @@ SELECT lsg_uses('SELECT id, x FROM lsg WHERE a = 1') AS setting_off;
 SET pg_lion.enable_store_scan = on;
 SELECT lsg_uses('SELECT id, x FROM lsg WHERE a = 1') AS setting_on;
 
--- 12. The prices, with every scan on: a dense filter's rows are gathered
---     rather than fetched from the heap pages they cover, and a few rows -
---     whose store pages, a window's of every column each, are many more than
---     the heap pages they lie on - are fetched.
-SELECT lsg_uses('SELECT id, a, b, x, t FROM lsg WHERE a IN (1, 2) AND b IN (3, 4, 5)', false) AS dense;
-SELECT lsg_uses('SELECT id, a, b, x, t FROM lsg WHERE e = 7 AND b = 3', false) AS few;
+-- 12. The prices, with every scan on (DESIGN.md §40, "As built: the row
+--     gather, priced"): the node priced in the units of the scan it would
+--     displace.  It takes the rows of one index where it gathers no more
+--     columns than the index-only scan, which gathers every one the index
+--     returns; a dense filter's five columns from two indexes, and a few
+--     rows - whose store pages, a window's of every column each, are many
+--     more than the heap pages they lie on - come from the heap.
+SELECT lsg_uses('SELECT id, x FROM lsg WHERE a = 1', false) AS one_index,
+	   lsg_uses('SELECT x FROM lsg WHERE a IN (1, 2, 3, 4)', false) AS one_column,
+	   lsg_uses('SELECT id, a, b, x, t FROM lsg WHERE a IN (1, 2) AND b IN (3, 4, 5)', false) AS dense,
+	   lsg_uses('SELECT id, a, b, x, t FROM lsg WHERE e = 7 AND b = 3', false) AS few;
+
+-- ... and an AND of two indexes is offered beside one index and a filter on a
+-- column it stores, though the index-only scan of that one index with the
+-- filter is cheaper than core's bitmap AND of the two: the AND's rows are a
+-- tenth of the index's.
+CREATE TABLE lsg_and2 (id int8, a int4, b int4, x int4, pad text)
+	WITH (autovacuum_enabled = off, fillfactor = 90);
+SELECT setseed(0.25);
+INSERT INTO lsg_and2
+SELECT g, floor(random() * 200), floor(random() * 20), g % 1000, repeat('p', 60)
+  FROM generate_series(1, 100000) g;
+CREATE INDEX lsg_and2_a ON lsg_and2 USING lion (a) INCLUDE (id, b, x)
+	WITH (store_values = on);
+CREATE INDEX lsg_and2_b ON lsg_and2 USING lion (b) INCLUDE (id);
+VACUUM (FREEZE, ANALYZE) lsg_and2;
+SELECT * FROM lsg_plan('SELECT id, x FROM lsg_and2 WHERE a IN (17, 18, 19) AND b IN (3, 4, 5)');
+SELECT lsg_check('SELECT id, x FROM lsg_and2 WHERE a IN (17, 18, 19) AND b IN (3, 4, 5)');
 
 -- 13. A set that outgrows hash_mem at run time - planned at 64MB (a generic
 --     plan keeps it), run at 64kB - degrades to container keys (§30.4): the
@@ -408,5 +430,5 @@ RESET plan_cache_mode;
 DEALLOCATE lsg_and;
 DEALLOCATE lsg_or;
 
-DROP TABLE lsg, lsg_abs, lsgp, lsg_big;
+DROP TABLE lsg, lsg_abs, lsgp, lsg_big, lsg_and2;
 DROP FUNCTION lsg_check(text, text), lsg_uses(text, boolean), lsg_plan(text, boolean), lsg_pinned();
