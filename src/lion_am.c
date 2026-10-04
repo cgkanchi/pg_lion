@@ -93,7 +93,8 @@ static const relopt_parse_elt lion_relopt_tab[] = {
 	{"summaries", RELOPT_TYPE_ENUM, offsetof(LionOptions, summaries)},
 	{"summary_tids", RELOPT_TYPE_INT, offsetof(LionOptions, summary_tids)},
 	{"store_values", RELOPT_TYPE_BOOL, offsetof(LionOptions, store_values)},
-	{"store_max_len", RELOPT_TYPE_INT, offsetof(LionOptions, store_max_len)}
+	{"store_max_len", RELOPT_TYPE_INT, offsetof(LionOptions, store_max_len)},
+	{"cluster_column", RELOPT_TYPE_STRING, offsetof(LionOptions, cluster_column)}
 };
 
 /* DESIGN.md §32: which key columns a build gives summary posting sets. */
@@ -204,6 +205,17 @@ _PG_init(void)
 					  AccessExclusiveLock);
 
 	/*
+	 * DESIGN.md §41: the stored column whose order an index's windows are
+	 * laid out in; without it they are in heap order.  Read at build time
+	 * only and recorded on the meta page; the name is checked against the
+	 * index then.
+	 */
+	add_string_reloption(lion_relopt_kind, "cluster_column",
+						 "Stored column whose order the window store is laid out in",
+						 NULL, NULL,
+						 AccessExclusiveLock);
+
+	/*
 	 * The resource manager itself, which only registers while
 	 * shared_preload_libraries is being processed (DESIGN.md §25).  The GUC
 	 * it takes its id from, pg_lion.rmgr_id, is a postmaster setting, which
@@ -245,6 +257,21 @@ _PG_init(void)
 							PGC_USERSET,
 							GUC_NOT_IN_SAMPLE,
 							NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §41: a testing knob.  On, a build writes an index in heap
+	 * order (version 9) whatever its order column, so that the heap-ordered
+	 * store of §40 - every index built before version 10 - stays tested
+	 * beside the key-ordered one.
+	 */
+	DefineCustomBoolVariable("pg_lion.store_heap_order",
+							 "Builds lay the window store out in heap order, as version 9 did.",
+							 "A testing setting: off, an index with an order column is built in key-ordered windows.",
+							 &lion_store_heap_order,
+							 false,
+							 PGC_USERSET,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("pg_lion.enable_count_pushdown",
 							 "Answer count(*) over lion indexes from the index and the visibility map.",
@@ -1076,6 +1103,8 @@ lionbuildempty(Relation index)
 	LionMetaPageData meta;
 	LionMetaStore store;
 	LionIndexState ix;
+	int			order = -1;
+	uint16		orderflags = 0;
 
 	inline_limit = opts ? (uint32) opts->inline_limit : LION_DEFAULT_INLINE_LIMIT;
 	wal_mode = lion_wal_mode_for_build(index);
@@ -1121,6 +1150,10 @@ lionbuildempty(Relation index)
 		store.store_root = LION_FIRST_BLKNO + 1;
 		store.store_max_len = opts ? (uint32) opts->store_max_len : 0;
 		store.store_pages = 1;
+
+		/* ... in the order a build would choose (§41) */
+		lion_store_fill_state(index, &ix, &store, CurrentMemoryContext);
+		order = lion_store_choose_order(index, &ix, &orderflags);
 	}
 
 	/* Meta page, pointing at the one leaf that is also the root (§21). */
@@ -1137,6 +1170,7 @@ lionbuildempty(Relation index)
 	LionPageGetMeta(BufferGetPage(buf))->summary_cols = meta.summary_cols;
 	LionPageGetMeta(BufferGetPage(buf))->summary_tids = meta.summary_tids;
 	lion_meta_record_store(BufferGetPage(buf), &store);
+	lion_meta_record_store_order(BufferGetPage(buf), order, orderflags);
 	MarkBufferDirty(buf);
 	log_newpage_buffer(buf, true);
 	END_CRIT_SECTION();

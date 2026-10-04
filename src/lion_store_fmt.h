@@ -31,6 +31,18 @@
  * Slot i of a sub-array is heap offset i + 1.  Nothing on a store page is
  * aligned beyond the item itself, so every multi-byte read is a memcpy.
  *
+ * KEY-ORDERED WINDOWS (DESIGN.md §41) use the same page with two meanings
+ * added, both said by the header's flags.  A VIRTUAL page is a data page of
+ * an ordered index: its "heap pages" are the window's virtual pages, 0 ..
+ * LION_STORE_MAX_VPAGES - 1, the lower half the sorted region and the upper
+ * half the append region (heap page k at virtual page
+ * LION_BLOCKS_PER_CONTAINER + k).  A PERM page holds the window's
+ * permutation: a two-byte RAW column in heap coordinates whose slots are the
+ * virtual lo of each row's sorted slot; the dictionary item of the chain's
+ * head is the window header (LionStoreWinHdr and its directory) instead of
+ * an empty dictionary.  The upper six bits of the flags of both are the
+ * window's generation.
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef LION_STORE_FMT_H
@@ -57,7 +69,7 @@ typedef struct LionStoreHeader
 	uint8		lo;				/* first heap page of the window covered */
 	uint8		hi;				/* last heap page covered */
 	uint8		mode;			/* LION_STORE_DICT or LION_STORE_RAW */
-	uint8		flags;			/* none defined; zero */
+	uint8		flags;			/* LION_STORE_F_*; zero in heap order */
 	uint16		width;			/* DICT: bits per code; RAW: bytes per slot */
 	uint16		ndict;			/* DICT: dictionary entries; RAW: 0 */
 	int16		typlen;			/* the column's typlen, -1 for varlena */
@@ -65,6 +77,104 @@ typedef struct LionStoreHeader
 
 StaticAssertDecl(sizeof(LionStoreHeader) == 16,
 				 "the lion store page header must not change size");
+
+/* LionStoreHeader.flags (DESIGN.md §41) */
+#define LION_STORE_F_VIRTUAL	0x01	/* a data page over virtual pages */
+#define LION_STORE_F_PERM		0x02	/* a page of the permutation */
+#define LION_STORE_F_KINDS		0x03
+#define LION_STORE_GEN_SHIFT	2
+#define LION_STORE_GEN_MAX		63		/* six bits; never 0 once sorted */
+
+static inline int
+lion_store_flags_gen(uint8 flags)
+{
+	return flags >> LION_STORE_GEN_SHIFT;
+}
+
+static inline uint8
+lion_store_make_flags(uint8 kind, int gen)
+{
+	return (uint8) (kind | (gen << LION_STORE_GEN_SHIFT));
+}
+
+/* The generation after gen: 1 .. LION_STORE_GEN_MAX, round again. */
+static inline int
+lion_store_next_gen(int gen)
+{
+	return (gen >= LION_STORE_GEN_MAX) ? 1 : gen + 1;
+}
+
+/*
+ * The virtual pages of a window of an ordered index: the sorted region
+ * below LION_BLOCKS_PER_CONTAINER, the append region from it.  A virtual lo
+ * is vpage << LION_OFFSET_BITS | offset, as a container's lo is for a heap
+ * page, and so fits 16 bits.
+ */
+#define LION_STORE_MAX_VPAGES	(2 * LION_BLOCKS_PER_CONTAINER)
+#define LION_STORE_APPEND_VPAGE	LION_BLOCKS_PER_CONTAINER
+
+StaticAssertDecl(LION_CONTAINER_BITS + 1 <= 16,
+				 "a virtual lo must fit 16 bits");
+
+static inline uint16
+lion_store_vlo(int vpage, int off)
+{
+	return (uint16) ((vpage << LION_OFFSET_BITS) | off);
+}
+
+static inline int
+lion_store_vlo_page(uint16 vlo)
+{
+	return vlo >> LION_OFFSET_BITS;
+}
+
+static inline int
+lion_store_vlo_off(uint16 vlo)
+{
+	return vlo & ((1 << LION_OFFSET_BITS) - 1);
+}
+
+/* The append region's address of heap lo (heap page k, offset). */
+static inline uint16
+lion_store_append_vlo(uint16 lo)
+{
+	return (uint16) (lo + (LION_STORE_APPEND_VPAGE << LION_OFFSET_BITS));
+}
+
+/* Sorted slot s of a window sorted V to a virtual page. */
+static inline uint16
+lion_store_sorted_vlo(uint32 s, uint32 vwidth)
+{
+	return lion_store_vlo((int) (s / vwidth), (int) (s % vwidth) + 1);
+}
+
+/*
+ * The window header (DESIGN.md §41): the dictionary item of a permutation
+ * chain's head, LionStoreDict (ndict 0, nbytes the rest) and then this and
+ * ndir directory entries, ascending by (ord, lo).  An entry names the block
+ * of a data chain's page whose range starts at virtual page lo, for every
+ * page whose range starts in the sorted region.
+ */
+typedef struct LionStoreWinHdr
+{
+	uint16		nsorted;		/* rows the last sort ordered */
+	uint16		vwidth;			/* their slots per virtual page, V */
+	uint16		ndir;			/* directory entries that follow */
+	uint16		flags;			/* LION_STORE_WH_THIN, or zero */
+} LionStoreWinHdr;
+
+/* The directory was thinned to fit: it names some of the pages, not all. */
+#define LION_STORE_WH_THIN		0x0001
+
+typedef struct LionStoreDirEnt
+{
+	uint16		ord;			/* stored column ordinal */
+	uint16		lo;				/* first virtual page of the page's range */
+	uint32		blk;			/* its block */
+} LionStoreDirEnt;
+
+StaticAssertDecl(sizeof(LionStoreWinHdr) == 8 && sizeof(LionStoreDirEnt) == 8,
+				 "the lion window header must not change size");
 
 /* Item 2: the dictionary's own header, so that the item is never empty. */
 typedef struct LionStoreDict
