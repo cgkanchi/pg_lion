@@ -285,9 +285,9 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 
 	/*
 	 * Version 6 is the base format, version 7 the same with summary posting
-	 * sets (DESIGN.md §32) and version 8 either with NARROW items (§38): all
-	 * three are read, and a version 6 index is one whose columns have no
-	 * summaries.  Anything older predates a format change that moved or
+	 * sets (DESIGN.md §32), version 8 either with NARROW items (§38) and
+	 * version 9 any of them with a window store (§40): all four are read, and
+	 * a version 6 index is one whose columns have no summaries.  Anything older predates a format change that moved or
 	 * reinterpreted items, and anything newer is a format this build does
 	 * not know - and the hint says which of the two it is, since REINDEX
 	 * with this build is the way out of either, but the reason differs.
@@ -301,14 +301,15 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 						   meta->magic, LION_MAGIC)));
 	if (meta->version != LION_VERSION &&
 		meta->version != LION_VERSION_SUMMARIES &&
-		meta->version != LION_VERSION_NARROW)
+		meta->version != LION_VERSION_NARROW &&
+		meta->version != LION_VERSION_STORE)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a valid lion index",
 						RelationGetRelationName(index)),
-				 errdetail("Meta page magic %08X version %u, expected %08X version %u, %u or %u.",
+				 errdetail("Meta page magic %08X version %u, expected %08X version %u to %u.",
 						   meta->magic, meta->version, LION_MAGIC, LION_VERSION,
-						   LION_VERSION_SUMMARIES, LION_VERSION_NARROW),
+						   LION_VERSION_STORE),
 				 meta->version < LION_VERSION ?
 				 errhint("REINDEX the index: its on-disk format predates this build of pg_lion.") :
 				 errhint("The index was written by a newer build of pg_lion than this one: use that build, or REINDEX the index with this one.")));
@@ -406,4 +407,22 @@ lion_meta_record_narrow(LionMetaPageData *meta, bool narrow)
 {
 	if (narrow)
 		meta->version = LION_VERSION_NARROW;
+}
+
+/*
+ * Put the window store's record on a meta page image nothing else can see
+ * yet (ambuild, ambuildempty), after the key counts: an index that stores a
+ * column is version 9 whatever it was going to be (DESIGN.md §40), and one
+ * that stores none is left exactly as it was.
+ */
+void
+lion_meta_record_store(Page metapage, const LionMetaStore *store)
+{
+	if (store == NULL || store->store_cols == 0)
+		return;
+	Assert(LionMetaHasNdistinct(metapage));
+	LionPageGetMeta(metapage)->version = LION_VERSION_STORE;
+	memcpy(LionPageGetMetaStore(metapage), store, sizeof(LionMetaStore));
+	((PageHeader) metapage)->pd_lower = LION_META_STORE_END;
+	Assert(((PageHeader) metapage)->pd_lower <= ((PageHeader) metapage)->pd_upper);
 }

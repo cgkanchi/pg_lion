@@ -12,6 +12,7 @@
 #include "postgres.h"
 
 #include "lion_customscan.h"
+#include "lion_store.h"
 
 /*
  * Peel binary-coercion relabels off an expression.  A varchar column
@@ -77,9 +78,9 @@ lion_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey,
 
 		/*
 		 * ANY key column, not just the first (DESIGN.md §24).  INCLUDE columns
-		 * (ncolumns > nkeycolumns) cannot happen - amcaninclude is false - but
-		 * the loop is bounded by nkeycolumns anyway, because an INCLUDE column
-		 * has no opclass to ask about.
+		 * (ncolumns > nkeycolumns) are stored values (§40) with no posting
+		 * sets and no opclass to ask about, so the loop is bounded by
+		 * nkeycolumns: an INCLUDE column is never a key the count can use.
 		 *
 		 * `indexprs`: an expression column has indexkeys[i] == 0 and can never
 		 * match a heap attno, so the skip above could in principle be relaxed
@@ -1526,4 +1527,137 @@ lion_wagg_classify(Aggref *agg, Index rti, AttrNumber *attno, int *argwidth)
 	if (argwidth != NULL)
 		*argwidth = width;
 	return kind;
+}
+
+/*
+ * An aggregate the LionCount node computes from a column it gathers from a
+ * window store (DESIGN.md §40, "The custom shapes"): count(x), count(DISTINCT
+ * x), or one of §37's - sum, avg, min, max - over x itself, x being a plain
+ * column of rti (a binary-coercion relabel aside).  Returns its LION_SAGG_*
+ * kind and sets *attno to x, *width to an integer argument's width, and - for
+ * count(DISTINCT x) - *eqop and *collation to the equality the DISTINCT
+ * compares with and its collation (lion_agg_distinct_var()), which must have
+ * a hash function: the node hashes the values.  LION_SAGG_NONE for anything
+ * else, count(*) included, whose answer is the group's rows.
+ *
+ * Whether x is stored is the caller's question: the planner asks it of the
+ * indexes (lion_find_store_index()), and lion_plan_custom_path() of the
+ * columns the path gathers.
+ */
+int
+lion_store_agg_classify(Aggref *agg, Index rti, AttrNumber *attno, int *width,
+						Oid *eqop, Oid *collation)
+{
+	Node	   *arg;
+	Var		   *var;
+	int			wkind;
+
+	*attno = 0;
+	*width = 0;
+	*eqop = InvalidOid;
+	*collation = InvalidOid;
+	if (agg->aggorder != NIL || agg->aggfilter != NULL || agg->aggvariadic ||
+		agg->agglevelsup != 0 || agg->aggsplit != AGGSPLIT_SIMPLE ||
+		agg->aggkind != AGGKIND_NORMAL || agg->aggstar ||
+		list_length(agg->args) != 1)
+		return LION_SAGG_NONE;
+	arg = lion_strip((Node *) ((TargetEntry *) linitial(agg->args))->expr);
+	if (arg == NULL || !IsA(arg, Var))
+		return LION_SAGG_NONE;
+	var = (Var *) arg;
+	if (var->varno != (int) rti || var->varattno <= 0 || var->varlevelsup != 0)
+		return LION_SAGG_NONE;
+
+	if (agg->aggdistinct != NIL)
+	{
+		Var		   *dv;
+		RegProcedure hashfn;
+
+		if (!lion_agg_distinct_var(agg, rti, &dv, eqop, collation) ||
+			dv->varattno != var->varattno ||
+			!get_op_hash_functions(*eqop, &hashfn, NULL))
+			return LION_SAGG_NONE;
+		*attno = var->varattno;
+		return LION_SAGG_DISTINCT;
+	}
+	if (agg->aggfnoid == F_COUNT_ANY)
+	{
+		*attno = var->varattno;
+		return LION_SAGG_COUNTCOL;
+	}
+
+	/* §37's kinds, over the column itself and not an expression of it */
+	wkind = lion_wagg_classify(agg, rti, attno, width);
+	if (wkind == LION_WAGG_NONE || *attno != var->varattno)
+	{
+		*attno = 0;
+		return LION_SAGG_NONE;
+	}
+	return LION_SAGG_WAGG(wkind);
+}
+
+/*
+ * A lion index whose window store holds every one of the heap columns
+ * attnos (DESIGN.md §40), or NULL; *idxcols receives the column number of
+ * each in that index.  A stored key column and an INCLUDE column serve
+ * alike: what the store holds of either is the row's own value.  Not a
+ * partial index, whose store holds its predicate's rows alone, nor a key
+ * column that is an expression, whose value is not the heap column's (its
+ * indexkeys entry is 0 and matches nothing).  Of several, the one with the
+ * fewest stored columns, whose store pages are fewer for the same windows.
+ */
+IndexOptInfo *
+lion_find_store_index(RelOptInfo *rel, List *attnos, List **idxcols)
+{
+	Oid			amoid = lion_get_am_oid();
+	IndexOptInfo *best = NULL;
+	int			bestn = 0;
+	ListCell   *lc;
+
+	*idxcols = NIL;
+	if (attnos == NIL)
+		return NULL;
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		Relation	indexrel;
+		LionIndexState *ix;
+		List	   *cols = NIL;
+		ListCell   *la;
+		bool		all = true;
+
+		if (idx->relam != amoid || idx->hypothetical || idx->indpred != NIL)
+			continue;
+
+		indexrel = index_open(idx->indexoid, AccessShareLock);
+		ix = lion_get_index_state(indexrel);
+		foreach(la, attnos)
+		{
+			AttrNumber	attno = (AttrNumber) lfirst_int(la);
+			int			ord;
+
+			for (ord = 0; ord < ix->nstored; ord++)
+			{
+				AttrNumber	col = ix->stored[ord].attno;
+
+				if (col >= 1 && col <= idx->ncolumns &&
+					idx->indexkeys[col - 1] == attno)
+					break;
+			}
+			if (ord >= ix->nstored)
+			{
+				all = false;
+				break;
+			}
+			cols = lappend_int(cols, (int) ix->stored[ord].attno);
+		}
+		if (all && (best == NULL || ix->nstored < bestn))
+		{
+			best = idx;
+			bestn = ix->nstored;
+			*idxcols = cols;
+		}
+		index_close(indexrel, AccessShareLock);
+	}
+	return best;
 }

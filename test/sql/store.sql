@@ -1,0 +1,402 @@
+-- The window store (DESIGN.md §40): the values of an index's stored columns
+-- - its scalar key columns under store_values, its INCLUDE columns always -
+-- kept per 64-page window of the heap and addressed by TID.
+--
+-- lion_index_stored(index, ctid) reads one row's slots through the store's
+-- own gather, so "the store gives back what the heap has" is checked row by
+-- row against the table, after the build (serial and parallel), every kind
+-- of insert, UPDATE, DELETE and VACUUM; lion_index_verify(.., true) checks
+-- the structure and every visible row's stored values at each step, and
+-- lion_index_stats() shows the pages each step made.  The order of the
+-- sections:
+--
+--	1. the options and every refusal
+--	2. every storable type, NULLs, serial and parallel builds
+--	3. the insert path: a window's first page, codes widened at each width,
+--	   DICT to RAW, pages appended and split at the end of a chain
+--	4. a split in the middle of a page's range
+--	5. ABSENT heap pages, at build and at insert
+--	6. the map growing past its first leaf
+--	7. VACUUM: dead slots cleared in place, pages rewritten
+--	8. the windows past a truncated heap's end freed, and filled again
+\set VERBOSITY terse
+SET client_min_messages = warning;
+SET max_parallel_workers_per_gather = 0;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+
+-- The rows of tbl whose stored values the store does not give back as the
+-- heap has them; vals is the stored columns as a text[], in index column
+-- order, as their output functions spell them.
+CREATE FUNCTION lion_st_mismatch(idx regclass, tbl regclass, vals text)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+	n bigint;
+BEGIN
+	EXECUTE format('SELECT count(*) FROM %s WHERE lion_index_stored(%L, ctid) IS DISTINCT FROM %s',
+				   tbl, idx, vals) INTO n;
+	RETURN n;
+END $$;
+
+-- The store's columns of lion_index_stats()
+CREATE FUNCTION lion_st_stats(idx regclass)
+RETURNS TABLE (attno int2, pages int8, map_pages int8, dict_pages int8,
+			   raw_pages int8, absent int8, dict_bytes int8, slot_bytes int8)
+LANGUAGE sql AS $$
+	SELECT attno, store_pages, store_map_pages, store_dict_pages,
+		   store_raw_pages, store_absent, store_dict_bytes, store_slot_bytes
+	  FROM lion_index_stats(idx) ORDER BY attno $$;
+
+-- ---------------------------------------------------------------------
+-- 1. The options, and every refusal
+-- ---------------------------------------------------------------------
+
+CREATE TABLE lion_st_opt (k int, t text, a int[], tv tsvector);
+INSERT INTO lion_st_opt VALUES (1, 'one', '{1}', 'a b'), (2, NULL, NULL, NULL);
+
+CREATE INDEX ON lion_st_opt USING lion (k) WITH (store_values = maybe);
+CREATE INDEX ON lion_st_opt USING lion (k) WITH (store_max_len = -1);
+CREATE INDEX ON lion_st_opt USING lion (k) WITH (store_max_len = 2001);
+
+-- a multi-key key column is left out, with a NOTICE; the others are stored
+CREATE INDEX lion_st_opt_ka ON lion_st_opt USING lion (k, a)
+	WITH (store_values = true);
+SELECT attno, dict_pages IS NOT NULL AS stored FROM lion_st_stats('lion_st_opt_ka');
+SELECT ctid, lion_index_stored('lion_st_opt_ka', ctid) FROM lion_st_opt ORDER BY k;
+
+-- store_values with nothing it can store is an ERROR
+CREATE INDEX ON lion_st_opt USING lion (a, tv) WITH (store_values = true);
+
+-- store_max_len on an index that stores nothing: a NOTICE, and no store
+CREATE INDEX lion_st_opt_none ON lion_st_opt USING lion (k)
+	WITH (store_max_len = 8);
+SELECT pages, map_pages, dict_pages FROM lion_st_stats('lion_st_opt_none');
+SELECT lion_index_stored('lion_st_opt_none', '(0,1)');
+
+-- INCLUDE columns are always stored, an array as one plain value
+CREATE INDEX lion_st_opt_inc ON lion_st_opt USING lion (k) INCLUDE (a, t, tv);
+SELECT ctid, lion_index_stored('lion_st_opt_inc', ctid) FROM lion_st_opt ORDER BY k;
+SELECT lion_index_stored('lion_st_opt_inc', '(0,7)') AS no_such_row;
+SELECT lion_index_stored('lion_st_opt_inc', '(0,0)');
+SELECT lion_index_stored('lion_st_opt_inc', '(0,600)');
+
+-- store_max_len caps a varlena value, at build and at insert
+CREATE INDEX ON lion_st_opt USING lion (k) INCLUDE (t) WITH (store_max_len = 2);
+CREATE INDEX lion_st_opt_cap ON lion_st_opt USING lion (k) INCLUDE (t)
+	WITH (store_max_len = 3);
+INSERT INTO lion_st_opt (k, t) VALUES (3, 'four');
+INSERT INTO lion_st_opt (k, t) VALUES (3, 'two');
+SELECT k, lion_index_stored('lion_st_opt_cap', ctid) FROM lion_st_opt ORDER BY k;
+DROP INDEX lion_st_opt_cap;
+
+-- a value of more than 2000 bytes, detoasted, is an ERROR, as a key is
+INSERT INTO lion_st_opt (k, t) VALUES (4, repeat('x', 2100));
+CREATE TABLE lion_st_long (k int, t text);
+INSERT INTO lion_st_long VALUES (1, repeat('y', 1996)), (2, repeat('y', 1997));
+CREATE INDEX ON lion_st_long USING lion (k) INCLUDE (t);
+DELETE FROM lion_st_long WHERE k = 2;
+CREATE INDEX lion_st_long_i ON lion_st_long USING lion (k) INCLUDE (t);
+SELECT length((lion_index_stored('lion_st_long_i', ctid))[1]) FROM lion_st_long;
+DROP TABLE lion_st_long;
+
+-- which columns are stored is the build's: ALTER INDEX changes nothing until
+-- a REINDEX
+ALTER INDEX lion_st_opt_inc SET (store_values = true);
+SELECT attno, dict_pages IS NOT NULL AS stored FROM lion_st_stats('lion_st_opt_inc');
+REINDEX INDEX lion_st_opt_inc;
+SELECT attno, dict_pages IS NOT NULL AS stored FROM lion_st_stats('lion_st_opt_inc');
+SELECT k, lion_index_stored('lion_st_opt_inc', ctid) FROM lion_st_opt ORDER BY k;
+SELECT lion_index_verify('lion_st_opt_inc', true);
+DROP TABLE lion_st_opt;
+
+-- ---------------------------------------------------------------------
+-- 2. Every storable type, NULLs among them, DICT and RAW; serial and
+--    parallel builds
+-- ---------------------------------------------------------------------
+
+CREATE TABLE lion_st_types (
+	id int, k int, i2 int2, i4 int4, i8 int8, b bool, d date,
+	ts timestamptz, u uuid, n numeric, t text, vc varchar(20), by bytea,
+	ia int[]) WITH (parallel_workers = 2);
+INSERT INTO lion_st_types
+SELECT g, g % 13,
+	   CASE WHEN g % 7 = 0 THEN NULL ELSE (g % 100)::int2 END,
+	   CASE WHEN g % 11 = 0 THEN NULL ELSE g * 7 END,
+	   CASE WHEN g % 13 = 0 THEN NULL ELSE g::int8 * 1000003 END,
+	   CASE WHEN g % 5 = 0 THEN NULL ELSE g % 3 = 0 END,
+	   CASE WHEN g % 17 = 0 THEN NULL ELSE date '2024-01-01' + g % 400 END,
+	   CASE WHEN g % 19 = 0 THEN NULL
+			ELSE timestamptz '2024-01-01 00:00:00+00' + g * interval '17 minutes' END,
+	   CASE WHEN g % 23 = 0 THEN NULL ELSE md5(g::text)::uuid END,
+	   CASE WHEN g % 29 = 0 THEN NULL ELSE g / 7.0 END,
+	   CASE WHEN g % 31 = 0 THEN NULL ELSE 'text ' || (g % 50) END,
+	   CASE WHEN g % 37 = 0 THEN NULL ELSE 'v' || g END,
+	   CASE WHEN g % 41 = 0 THEN NULL ELSE decode(md5(g::text), 'hex') END,
+	   CASE WHEN g % 43 = 0 THEN NULL WHEN g % 43 = 1 THEN '{}'
+			ELSE ARRAY[g, NULL, g % 5] END
+  FROM generate_series(1, 6000) g;
+
+\set vals 'ARRAY[k::text, i4::text, t, i2::text, i8::text, CASE b WHEN true THEN ''t'' WHEN false THEN ''f'' END, d::text, ts::text, u::text, n::text, vc::text, by::text, ia::text]'
+
+-- key columns k, i4 and t under store_values, and the rest INCLUDE
+CREATE INDEX lion_st_types_s ON lion_st_types USING lion (k, i4, t)
+	INCLUDE (i2, i8, b, d, ts, u, n, vc, by, ia) WITH (store_values = true);
+-- the same with capped varlena columns, which can be RAW
+CREATE INDEX lion_st_types_c ON lion_st_types USING lion (k, i4, t)
+	INCLUDE (i2, i8, b, d, ts, u, n, vc, by, ia)
+	WITH (store_values = true, store_max_len = 40);
+-- and in parallel, where the leader builds the store in a scan of its own
+SET max_parallel_maintenance_workers = 2;
+CREATE INDEX lion_st_types_p ON lion_st_types USING lion (k, i4, t)
+	INCLUDE (i2, i8, b, d, ts, u, n, vc, by, ia) WITH (store_values = true);
+RESET max_parallel_maintenance_workers;
+
+SELECT * FROM lion_st_stats('lion_st_types_s');
+SELECT * FROM lion_st_stats('lion_st_types_c');
+SELECT (SELECT array_agg(s ORDER BY s.attno) FROM lion_st_stats('lion_st_types_p') s) =
+	   (SELECT array_agg(s ORDER BY s.attno) FROM lion_st_stats('lion_st_types_s') s)
+	   AS parallel_same;
+SELECT lion_st_mismatch('lion_st_types_s', 'lion_st_types', :'vals') AS serial,
+	   lion_st_mismatch('lion_st_types_c', 'lion_st_types', :'vals') AS capped,
+	   lion_st_mismatch('lion_st_types_p', 'lion_st_types', :'vals') AS parallel;
+SELECT lion_index_stored('lion_st_types_s', ctid) FROM lion_st_types
+ WHERE id IN (1, 2, 43, 44, 2639) ORDER BY id;
+SELECT lion_index_verify('lion_st_types_s', true),
+	   lion_index_verify('lion_st_types_c', true),
+	   lion_index_verify('lion_st_types_p', true);
+
+-- INSERT, UPDATE (never HOT: every column is in an index) and DELETE
+INSERT INTO lion_st_types
+SELECT g, g % 13, (g % 100)::int2, g * 7, NULL, g % 2 = 0, date '2025-06-01',
+	   NULL, md5((g * 3)::text)::uuid, g, 'new ' || g, 'w' || g,
+	   '\x00ff'::bytea, ARRAY[g]
+  FROM generate_series(6001, 8000) g;
+UPDATE lion_st_types SET t = 'updated ' || (id % 9), n = n * 2 WHERE id % 4 = 0;
+UPDATE lion_st_types SET ia = NULL, by = NULL, b = NOT b WHERE id % 6 = 1;
+DELETE FROM lion_st_types WHERE id % 10 = 3;
+SELECT lion_st_mismatch('lion_st_types_s', 'lion_st_types', :'vals') AS serial,
+	   lion_st_mismatch('lion_st_types_c', 'lion_st_types', :'vals') AS capped,
+	   lion_st_mismatch('lion_st_types_p', 'lion_st_types', :'vals') AS parallel;
+SELECT lion_index_verify('lion_st_types_s', true),
+	   lion_index_verify('lion_st_types_c', true),
+	   lion_index_verify('lion_st_types_p', true);
+VACUUM lion_st_types;
+SELECT lion_st_mismatch('lion_st_types_s', 'lion_st_types', :'vals') AS serial,
+	   lion_st_mismatch('lion_st_types_c', 'lion_st_types', :'vals') AS capped,
+	   lion_st_mismatch('lion_st_types_p', 'lion_st_types', :'vals') AS parallel;
+SELECT lion_index_verify('lion_st_types_s', true),
+	   lion_index_verify('lion_st_types_c', true),
+	   lion_index_verify('lion_st_types_p', true);
+SELECT * FROM lion_st_stats('lion_st_types_c');
+DROP TABLE lion_st_types;
+
+-- ---------------------------------------------------------------------
+-- 3. The insert path, on an index built empty: the window's first page,
+--    a code widened at each width (the 2nd, 4th, 16th and 256th distinct
+--    value), a page's dictionary turned RAW when it stops paying, and the
+--    chain grown at its end - its last page's range extended, a page
+--    appended, its last heap page split off.
+-- ---------------------------------------------------------------------
+
+CREATE TABLE lion_st_ins (v int8, w int8);
+CREATE INDEX lion_st_ins_i ON lion_st_ins USING lion (v)
+	WITH (store_values = true);
+SELECT pages, map_pages, dict_pages FROM lion_st_stats('lion_st_ins_i');
+INSERT INTO lion_st_ins VALUES (1, 1);
+SELECT * FROM lion_st_stats('lion_st_ins_i');
+INSERT INTO lion_st_ins VALUES (1, 1), (NULL, NULL);
+SELECT * FROM lion_st_stats('lion_st_ins_i');
+INSERT INTO lion_st_ins VALUES (2, 2);
+SELECT * FROM lion_st_stats('lion_st_ins_i');
+INSERT INTO lion_st_ins SELECT g, g FROM generate_series(3, 4) g;
+SELECT * FROM lion_st_stats('lion_st_ins_i');
+INSERT INTO lion_st_ins SELECT g, g FROM generate_series(5, 16) g;
+SELECT * FROM lion_st_stats('lion_st_ins_i');
+INSERT INTO lion_st_ins SELECT g, g FROM generate_series(17, 256) g;
+SELECT * FROM lion_st_stats('lion_st_ins_i');
+SELECT lion_st_mismatch('lion_st_ins_i', 'lion_st_ins', 'ARRAY[v::text]');
+SELECT lion_index_verify('lion_st_ins_i', true);
+-- unique values until DICT stops paying, a row at a time
+DO $$ BEGIN
+	FOR i IN 257 .. 1200 LOOP
+		INSERT INTO lion_st_ins VALUES (i, i);
+	END LOOP;
+END $$;
+SELECT * FROM lion_st_stats('lion_st_ins_i');
+-- and on, to pages that fill and split their last heap page off
+INSERT INTO lion_st_ins SELECT g, CASE WHEN g % 9 = 0 THEN NULL ELSE g END
+  FROM generate_series(1201, 30000) g;
+SELECT * FROM lion_st_stats('lion_st_ins_i');
+SELECT lion_st_mismatch('lion_st_ins_i', 'lion_st_ins', 'ARRAY[v::text]');
+SELECT lion_index_verify('lion_st_ins_i', true);
+-- the same rows built at once
+CREATE INDEX lion_st_ins_b ON lion_st_ins USING lion (v)
+	WITH (store_values = true);
+SELECT * FROM lion_st_stats('lion_st_ins_b');
+SELECT lion_st_mismatch('lion_st_ins_b', 'lion_st_ins', 'ARRAY[v::text]');
+-- and a second stored column, INCLUDE, written into the windows the first
+-- already has
+CREATE INDEX lion_st_ins_w ON lion_st_ins USING lion (v) INCLUDE (w);
+INSERT INTO lion_st_ins SELECT g, -g FROM generate_series(30001, 31000) g;
+SELECT lion_st_mismatch('lion_st_ins_w', 'lion_st_ins', 'ARRAY[w::text]');
+SELECT lion_index_verify('lion_st_ins_w', true);
+DROP TABLE lion_st_ins;
+
+-- ---------------------------------------------------------------------
+-- 4. A split in the middle of a page's range: VACUUM empties a heap page,
+--    and rows half the size fill it again with twice the offsets, which a
+--    full store page has no room for.
+-- ---------------------------------------------------------------------
+
+CREATE TABLE lion_st_mid (v int8, pad text);
+INSERT INTO lion_st_mid SELECT g, repeat('p', 200) FROM generate_series(1, 2000) g;
+CREATE INDEX lion_st_mid_i ON lion_st_mid USING lion (v) WITH (store_values = true);
+SELECT * FROM lion_st_stats('lion_st_mid_i');
+DELETE FROM lion_st_mid WHERE (ctid::text::point)[0] = 5;
+VACUUM lion_st_mid;
+INSERT INTO lion_st_mid SELECT g, NULL FROM generate_series(2001, 2200) g;
+SELECT count(*) > 35 AS refilled FROM lion_st_mid WHERE (ctid::text::point)[0] = 5;
+SELECT * FROM lion_st_stats('lion_st_mid_i');
+SELECT lion_st_mismatch('lion_st_mid_i', 'lion_st_mid', 'ARRAY[v::text]');
+SELECT lion_index_verify('lion_st_mid_i', true);
+DROP TABLE lion_st_mid;
+
+-- ---------------------------------------------------------------------
+-- 5. ABSENT: a heap page whose values no store page can hold - dozens of
+--    distinct strings of 1,984 bytes, which the heap compresses inline once
+--    a wide row makes it try - is left to the heap, at build and at insert;
+--    lion_index_stored() says NULL for its rows, and verify() takes it.
+-- ---------------------------------------------------------------------
+
+CREATE TABLE lion_st_abs (id int, s text, f text) WITH (toast_tuple_target = 128);
+INSERT INTO lion_st_abs SELECT g, repeat(md5(g::text), 62), repeat('f', 100) FROM generate_series(1, 400) g;
+INSERT INTO lion_st_abs SELECT g, 'short ' || g FROM generate_series(401, 900) g;
+-- The long rows take several heap pages - how many depends on the heap's
+-- page layout, which differs between majors - and those pages are the ABSENT
+-- ones: the stats count them, and their rows, long and short alike, are the
+-- rows the store has no value for.
+CREATE FUNCTION lion_st_long_pages(tbl regclass) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE n bigint;
+BEGIN
+	EXECUTE format('SELECT count(DISTINCT (ctid::text::point)[0]) FROM %s WHERE id <= 400', tbl) INTO n;
+	RETURN n;
+END $$;
+SELECT lion_st_long_pages('lion_st_abs') > 3 AS several_long_pages;
+CREATE INDEX lion_st_abs_b ON lion_st_abs USING lion (id) INCLUDE (s);
+CREATE TABLE lion_st_abs2 (LIKE lion_st_abs) WITH (toast_tuple_target = 128);
+CREATE INDEX lion_st_abs_i ON lion_st_abs2 USING lion (id) INCLUDE (s);
+INSERT INTO lion_st_abs2 SELECT * FROM lion_st_abs ORDER BY id;
+SELECT lion_st_long_pages('lion_st_abs') = lion_st_long_pages('lion_st_abs2') AS same_layout;
+SELECT attno, pages > 0 AS some_pages, map_pages, dict_pages = pages AS all_dict,
+	   raw_pages, absent = lion_st_long_pages('lion_st_abs') AS absent_long_pages,
+	   dict_bytes > 0 AS some_dict, slot_bytes > 0 AS some_slots
+  FROM lion_st_stats('lion_st_abs_b');
+SELECT attno, pages > 0 AS some_pages, map_pages, dict_pages = pages AS all_dict,
+	   raw_pages, absent = lion_st_long_pages('lion_st_abs2') AS absent_long_pages,
+	   dict_bytes > 0 AS some_dict, slot_bytes > 0 AS some_slots
+  FROM lion_st_stats('lion_st_abs_i');
+SELECT count(*) AS rows,
+	   count(*) FILTER (WHERE st IS NULL) = count(*) FILTER (WHERE longpage) AS absent_long_pages_rows,
+	   count(*) FILTER (WHERE st IS NULL AND NOT longpage) AS absent_elsewhere,
+	   count(*) FILTER (WHERE st IS NOT NULL) > 0 AS some_stored,
+	   count(*) FILTER (WHERE st IS NOT NULL AND st IS DISTINCT FROM s) AS wrong
+  FROM (SELECT s, (lion_index_stored('lion_st_abs_b', ctid))[1] AS st,
+			   (ctid::text::point)[0] IN (SELECT (ctid::text::point)[0] FROM lion_st_abs WHERE id <= 400) AS longpage
+		  FROM lion_st_abs) x;
+SELECT count(*) AS rows,
+	   count(*) FILTER (WHERE st IS NULL) = count(*) FILTER (WHERE longpage) AS absent_long_pages_rows,
+	   count(*) FILTER (WHERE st IS NULL AND NOT longpage) AS absent_elsewhere,
+	   count(*) FILTER (WHERE st IS NOT NULL) > 0 AS some_stored,
+	   count(*) FILTER (WHERE st IS NOT NULL AND st IS DISTINCT FROM s) AS wrong
+  FROM (SELECT s, (lion_index_stored('lion_st_abs_i', ctid))[1] AS st,
+			   (ctid::text::point)[0] IN (SELECT (ctid::text::point)[0] FROM lion_st_abs2 WHERE id <= 400) AS longpage
+		  FROM lion_st_abs2) x;
+SELECT lion_index_verify('lion_st_abs_b', true), lion_index_verify('lion_st_abs_i', true);
+DROP TABLE lion_st_abs, lion_st_abs2;
+DROP FUNCTION lion_st_long_pages(regclass);
+
+-- ---------------------------------------------------------------------
+-- 6. The map past its first leaf: with 32 stored columns a leaf holds the
+--    slots of 63.5 windows, and a row on heap page 4096 is in window 64.
+--    The heap gets there with a row a page; the rows of every page but the
+--    first are deleted before the build, which skips them, so the insert is
+--    the one that adds the leaf.
+-- ---------------------------------------------------------------------
+
+DO $$ BEGIN
+	EXECUTE 'CREATE TABLE lion_st_map (k int, ' ||
+			(SELECT string_agg(format('c%s int', i), ', ') FROM generate_series(1, 31) i) ||
+			', pad text) WITH (fillfactor = 10, autovacuum_enabled = off)';
+END $$;
+INSERT INTO lion_st_map (k, c1, c31, pad)
+SELECT g, g, -g, repeat('m', 500) FROM generate_series(0, 4096) g;
+SELECT max((ctid::text::point)[0]) AS last_block FROM lion_st_map;
+DELETE FROM lion_st_map WHERE k > 0;
+DO $$ BEGIN
+	EXECUTE 'CREATE INDEX lion_st_map_i ON lion_st_map USING lion (k) INCLUDE (' ||
+			(SELECT string_agg(format('c%s', i), ', ') FROM generate_series(1, 31) i) ||
+			') WITH (store_values = true)';
+END $$;
+SELECT pages, map_pages FROM lion_st_stats('lion_st_map_i') WHERE attno = 1;
+INSERT INTO lion_st_map (k, c1, c2, c31) VALUES (5000, 5, 6, 7);
+SELECT (ctid::text::point)[0] >= 4096 AS past_the_leaf FROM lion_st_map WHERE k = 5000;
+SELECT pages, map_pages FROM lion_st_stats('lion_st_map_i') WHERE attno = 1;
+SELECT k, lion_index_stored('lion_st_map_i', ctid) FROM lion_st_map ORDER BY k;
+SELECT lion_index_verify('lion_st_map_i', true);
+DROP TABLE lion_st_map;
+
+-- ---------------------------------------------------------------------
+-- 7. VACUUM: a few dead rows a page are cleared in place; a page a quarter
+--    of whose written slots are dead is written again, which drops the
+--    dictionary entries no row names any more.  A cleared slot reads NULL.
+-- ---------------------------------------------------------------------
+
+CREATE TABLE lion_st_vac (id int, k int, t text);
+INSERT INTO lion_st_vac SELECT g, g % 5, 'value ' || (g % 400) FROM generate_series(1, 20000) g;
+CREATE INDEX lion_st_vac_i ON lion_st_vac USING lion (k) INCLUDE (id, t);
+SELECT * FROM lion_st_stats('lion_st_vac_i');
+CREATE TABLE lion_st_vac_dead AS SELECT ctid AS tid FROM lion_st_vac WHERE id % 10 = 7;
+DELETE FROM lion_st_vac WHERE id % 10 = 7;
+SELECT count(*) FILTER (WHERE array_remove(lion_index_stored('lion_st_vac_i', tid), NULL) <> '{}')
+	   AS written_before
+  FROM lion_st_vac_dead;
+VACUUM lion_st_vac;
+SELECT count(*) FILTER (WHERE array_remove(lion_index_stored('lion_st_vac_i', tid), NULL) <> '{}')
+	   AS written_after
+  FROM lion_st_vac_dead;
+SELECT * FROM lion_st_stats('lion_st_vac_i');
+SELECT lion_st_mismatch('lion_st_vac_i', 'lion_st_vac', 'ARRAY[id::text, t]');
+-- every value of t but a few gone from most windows: their pages are rewritten
+DELETE FROM lion_st_vac WHERE id % 400 >= 20;
+VACUUM lion_st_vac;
+SELECT * FROM lion_st_stats('lion_st_vac_i');
+SELECT lion_st_mismatch('lion_st_vac_i', 'lion_st_vac', 'ARRAY[id::text, t]');
+SELECT lion_index_verify('lion_st_vac_i', true);
+-- the TIDs come back, with other values
+INSERT INTO lion_st_vac SELECT g, g % 5, 'again ' || g FROM generate_series(20001, 30000) g;
+SELECT lion_st_mismatch('lion_st_vac_i', 'lion_st_vac', 'ARRAY[id::text, t]');
+SELECT lion_index_verify('lion_st_vac_i', true);
+
+-- ---------------------------------------------------------------------
+-- 8. A truncated heap: VACUUM clears the slots of the dead rows, then cuts
+--    the heap; the next VACUUM finds every window past the heap's end and
+--    frees its pages.  Rows inserted afterwards start new chains.
+-- ---------------------------------------------------------------------
+
+DELETE FROM lion_st_vac;
+VACUUM lion_st_vac;
+SELECT pg_relation_size('lion_st_vac') AS heap_bytes;
+SELECT attno, pages, map_pages FROM lion_st_stats('lion_st_vac_i');
+VACUUM lion_st_vac;
+SELECT attno, pages, map_pages FROM lion_st_stats('lion_st_vac_i');
+SELECT deleted_pages > 0 AS freed FROM lion_index_stats('lion_st_vac_i') WHERE attno = 1;
+SELECT lion_index_verify('lion_st_vac_i', true);
+INSERT INTO lion_st_vac SELECT g, g % 5, 'third ' || (g % 7) FROM generate_series(1, 3000) g;
+SELECT * FROM lion_st_stats('lion_st_vac_i');
+SELECT lion_st_mismatch('lion_st_vac_i', 'lion_st_vac', 'ARRAY[id::text, t]');
+SELECT lion_index_verify('lion_st_vac_i', true);
+DROP TABLE lion_st_vac, lion_st_vac_dead;
+
+DROP FUNCTION lion_st_mismatch(regclass, regclass, text);
+DROP FUNCTION lion_st_stats(regclass);

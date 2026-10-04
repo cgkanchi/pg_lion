@@ -40,10 +40,18 @@
 #define LION_PAGE_ROOT		0x0020	/* ... and it is the current root (§21) */
 #define LION_PAGE_INCOMPLETE_SPLIT 0x0040	/* its right sibling has no
 											 * downlink yet (§21) */
+#define LION_PAGE_STOREMAP	0x0080	/* a page of the window map (§40) */
+#define LION_PAGE_STORE		0x0100	/* a window store page (§40) */
 
-/* The three page KINDS; exactly one of them is set on every page. */
+/*
+ * The page KINDS; exactly one of them is set on every page.  The two of the
+ * window store (DESIGN.md §40) are kinds of their own rather than CONTAINER
+ * pages with a flag, so that nothing that walks or frees posting pages - the
+ * leak sweep, verify(), the owner checks of §18 - can take one for the other.
+ */
 #define LION_PAGE_KINDS \
-	(LION_PAGE_META | LION_PAGE_BUCKET | LION_PAGE_CONTAINER | LION_PAGE_DIR)
+	(LION_PAGE_META | LION_PAGE_BUCKET | LION_PAGE_CONTAINER | LION_PAGE_DIR | \
+	 LION_PAGE_STOREMAP | LION_PAGE_STORE)
 
 /*
  * The special area of every page (format version 4, DESIGN.md §18 and §21).
@@ -107,6 +115,8 @@ typedef LionPageOpaqueData *LionPageOpaque;
 #define LionPageIsDir(page)		((LionPageGetOpaque(page)->flags & LION_PAGE_DIR) != 0)
 #define LionPageIsLeaf(page)		LionPageIsBucket(page)
 #define LionPageIsRoot(page)		((LionPageGetOpaque(page)->flags & LION_PAGE_ROOT) != 0)
+#define LionPageIsStoreMap(page)	((LionPageGetOpaque(page)->flags & LION_PAGE_STOREMAP) != 0)
+#define LionPageIsStore(page)	((LionPageGetOpaque(page)->flags & LION_PAGE_STORE) != 0)
 #define LionPageIncompleteSplit(page) \
 	((LionPageGetOpaque(page)->flags & LION_PAGE_INCOMPLETE_SPLIT) != 0)
 #define LionPageIsRightmost(page) \
@@ -375,13 +385,30 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * makes one only of a NARROW, which it widens, so that an index of version 6
  * or 7 stays one, readable by the builds before this one, until it is
  * rebuilt.
+ *
+ * Version 9 (DESIGN.md §40) is version 8 plus the WINDOW STORE: stored key
+ * columns and INCLUDE columns, kept per 64-page window of the heap in pages of
+ * two new kinds (LION_PAGE_STOREMAP and LION_PAGE_STORE) and found through a
+ * LionMetaStore after the key counts of §33.  An addition again: every page
+ * and item of a version 6, 7 or 8 index reads as it did.  A build writes
+ * version 9 only when it stores at least one column, so an index without
+ * `store_values` or INCLUDE is written as before and stays readable by the
+ * builds before this one; a version 9 index may hold NARROW items too.
  */
 #define LION_VERSION			6	/* the base format every index has */
 #define LION_VERSION_SUMMARIES	7	/* ... plus the summaries of §32 */
 #define LION_VERSION_NARROW		8	/* ... plus the NARROW items of §38 */
+#define LION_VERSION_STORE		9	/* ... plus the window store of §40 */
 
 /* May an index of this meta page's version hold NARROW items (§38)? */
 #define LION_META_ALLOWS_NARROW(meta)	((meta)->version >= LION_VERSION_NARROW)
+
+/*
+ * Does an index of this meta page's version have a window store (§40)?  An
+ * index of version 8 or below has none, whatever its meta page holds past
+ * the key counts.
+ */
+#define LION_META_HAS_STORE(meta)	((meta)->version >= LION_VERSION_STORE)
 
 typedef struct LionMetaPageData
 {
@@ -533,6 +560,47 @@ StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
 /* Does this meta page carry the counts at all? */
 #define LionMetaHasNdistinct(page) \
 	(((PageHeader) (page))->pd_lower >= LION_META_NDISTINCT_END)
+
+/*
+ * THE WINDOW STORE'S RECORD (DESIGN.md §40), after the key counts and for the
+ * same reason: LionMetaPageData has no word left.  It is there when the
+ * version says so (LION_META_HAS_STORE) and pd_lower covers it; a version 9
+ * meta page without it is damage.  It is written whole, by the build and by
+ * its own operation (LION_OP_STORE_META), which a LION_XLOG_META record never
+ * touches: that one copies the 56 bytes of LionMetaPageData and nothing else.
+ *
+ *	store_root		the root of the window map, which never moves: the build
+ *					writes it and nothing replaces it
+ *	store_cols		bit i - 1: index column i, key or INCLUDE, is stored.
+ *					Decided when the index is built and fixed for its life;
+ *					the stored columns are numbered 0 .. nstored - 1 in this
+ *					order (their ORDINALS), which is what every store page
+ *					and map slot carries
+ *	store_max_len	the `store_max_len` reloption at build time; 0 = none
+ *	store_pages		the map and store pages the index holds, kept exact by
+ *					every record that adds or frees one (the meta page is a
+ *					block of that record), for the cost model: they are not
+ *					posting pages
+ */
+typedef struct LionMetaStore
+{
+	BlockNumber store_root;
+	uint32		store_cols;
+	uint32		store_max_len;
+	uint32		store_pages;
+} LionMetaStore;
+
+StaticAssertDecl(sizeof(LionMetaStore) == 16,
+				 "the lion meta page's store record must not change size");
+
+#define LION_META_STORE_OFFSET	MAXALIGN(LION_META_NDISTINCT_END)
+#define LION_META_STORE_END \
+	(LION_META_STORE_OFFSET + sizeof(LionMetaStore))
+#define LionPageGetMetaStore(page) \
+	((LionMetaStore *) ((char *) (page) + LION_META_STORE_OFFSET))
+/* Does this meta page carry the record at all? */
+#define LionMetaHasStoreArea(page) \
+	(((PageHeader) (page))->pd_lower >= LION_META_STORE_END)
 
 /* The first block after the meta page; where ambuild puts the first leaf. */
 #define LION_FIRST_BLKNO		((BlockNumber) 1)
@@ -790,7 +858,16 @@ typedef struct LionOptions
 	int			wal_mode;		/* LION_WALOPT_*, DESIGN.md §25 */
 	int			summaries;		/* LION_SUMOPT_*, DESIGN.md §32 */
 	int			summary_tids;	/* TIDs a summary bucket takes (§32) */
+	bool		store_values;	/* store the scalar key columns (§40) */
+	int			store_max_len;	/* fixed varlena slots of this size (§40) */
 } LionOptions;
+
+/*
+ * The `store_max_len` reloption (DESIGN.md §40): 0, the default, stores a
+ * varlena column dictionary-coded only; a length lets a page of it go RAW, in
+ * slots of that many bytes, and makes a longer value an ERROR.
+ */
+#define LION_MAX_STORE_MAX_LEN		2000
 
 /*
  * The `summaries` reloption (DESIGN.md §32): which ORDERED SCALAR key columns
@@ -939,6 +1016,19 @@ struct LionIndexState
 	LionMetaPageData meta;		/* copy of the meta page */
 	int			ncolumns;		/* key columns, 1 .. INDEX_MAX_KEYS (§24) */
 	LionState  *cols;			/* [ncolumns]; cols[i] is key column i + 1 */
+
+	/*
+	 * The window store (DESIGN.md §40): the meta page's record of it, zero
+	 * when the index has none, and its stored columns in ordinal order.  A
+	 * stored column is described on its own (lion_store.h), not by a
+	 * LionState: an INCLUDE column has no operator class, and a stored key
+	 * column keeps the column's datum, not the key.  The root is cached here
+	 * as the directory's is and checked by its page kind on every use.
+	 */
+	LionMetaStore store;
+	int			nstored;		/* stored columns; 0 = no store */
+	struct LionStoreCol *stored;	/* [nstored], by ordinal */
+	struct LionStoreCache *storecache;	/* the insert path's map cache */
 
 	/*
 	 * The backend's pg_proc invalidation count when the recorded order's
@@ -1163,9 +1253,10 @@ lion_page_set_owner(Page page, uint32 hash, BlockNumber head)
 }
 
 /*
- * Mark a container page free.  The page keeps its owner (verify() and the
- * leak sweep read it) but loses everything else; safexid is the transaction
- * id from which on nothing can still hold a link to it.
+ * Mark a container page - or a window store page (DESIGN.md §40) - free.
+ * The page keeps its owner (verify() and the leak sweep read it) but loses
+ * everything else; safexid is the transaction id from which on nothing can
+ * still hold a link to it.
  */
 extern void lion_page_set_deleted(Page page, FullTransactionId safexid);
 extern FullTransactionId lion_page_get_safexid(Page page);
@@ -1630,6 +1721,12 @@ extern bool lionvalidate(Oid opclassoid);
 extern void lioncostestimate(struct PlannerInfo *root, struct IndexPath *path, double loop_count,
 							Cost *indexStartupCost, Cost *indexTotalCost, Selectivity *indexSelectivity,
 							double *indexCorrelation, double *indexPages);
+/* an index-only path answered with no recheck (lion_amcost.c, §40) */
+extern bool lion_index_only_exact(struct PlannerInfo *root, struct IndexPath *path);
+/* a plain source's exactness, order and passes, for LionStoreScan (§40) */
+extern double lion_plain_scan_passes(struct PlannerInfo *root,
+									 struct IndexPath *path, bool *sorted,
+									 bool *exact);
 extern bool lion_enable_plain_scan;	/* GUC pg_lion.enable_plain_scan */
 
 /*
@@ -1692,6 +1789,12 @@ extern void lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
  * the meta page version 8; after lion_meta_record_summaries().
  */
 extern void lion_meta_record_narrow(LionMetaPageData *meta, bool narrow);
+
+/*
+ * ... and the window store's record (DESIGN.md §40), which makes it version
+ * 9 when it stores a column; last, after lion_meta_record_ndistinct().
+ */
+extern void lion_meta_record_store(Page metapage, const LionMetaStore *store);
 
 /*
  * The distinct keys of each key column (DESIGN.md §33).  Fill in a count of

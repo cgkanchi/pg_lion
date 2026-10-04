@@ -154,6 +154,7 @@
 #include "utils/syscache.h"
 
 #include "lion.h"
+#include "lion_store.h"
 
 /*
  * Where ambulkdelete's time goes (DESIGN.md §18, "Measure first").
@@ -415,6 +416,8 @@ static LionEntryTuple *lion_vacuum_entry_copy(Relation index, Buffer entrybuf,
 static void lion_vacuum_free_chain(LionVacState *vs, uint32 hash,
 								  BlockNumber head);
 static void lion_vacuum_sweep(LionVacState *vs);
+static void lion_vac_store_visit(void *arg, BlockNumber blk);
+static bool lion_vac_store_orphan(LionVacState *vs, Buffer buf, BlockNumber blk);
 static bool lion_vac_may_write(Relation index);
 static bool lion_vac_may_count(Relation index, LionIndexState *ix);
 static void lion_vacuum_count_keys(IndexVacuumInfo *info);
@@ -563,6 +566,28 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	}
 
 	/*
+	 * The window store (DESIGN.md §40, "VACUUM"), after the posting sets and
+	 * with none of their pages held: every map and store page is visited -
+	 * which is what keeps the sweep below off them - and the slots of the
+	 * dead TIDs are cleared, under an EXCLUSIVE lock per store page.  It is
+	 * hygiene, not correctness (§40, "Why it is safe"), so a VACUUM that may
+	 * not write the index only visits.
+	 */
+	if (vs.ix->nstored > 0)
+	{
+		LionStoreVacStats sst;
+
+		memset(&sst, 0, sizeof(sst));
+		lion_store_bulkdelete(index, vs.ix, callback, callback_state,
+							  lion_vac_may_write(index), lion_vac_store_visit,
+							  &vs, &sst);
+		vs.prof.records += sst.records;
+		elog(DEBUG1, "lion vacuum \"%s\": store %ld pages and %ld map pages visited, %ld slots cleared, %ld pages rewritten",
+			 RelationGetRelationName(index), (long) sst.pages,
+			 (long) sst.mappages, (long) sst.cleared, (long) sst.rewritten);
+	}
+
+	/*
 	 * Everything reachable has been walked, so whatever is left unvisited is
 	 * a leak: recover it before the FSM is vacuumed (DESIGN.md §18).  This
 	 * costs a buffer read per unvisited block and nothing at all for the
@@ -664,6 +689,8 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 IndexBulkDeleteResult *
 lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
+	int64		storefreed = 0;
+
 	/*
 	 * The distinct keys of each key column, for the planner (DESIGN.md §33).
 	 * A VACUUM that called ambulkdelete has counted them already, on the walk
@@ -677,6 +704,21 @@ lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 
 	if (info->analyze_only)
 		return stats;
+
+	/*
+	 * The store of the windows the heap no longer reaches (DESIGN.md §40,
+	 * "VACUUM"): VACUUM truncates the heap after this call, so these are the
+	 * windows an EARLIER VACUUM cut off, and a store whose heap was truncated
+	 * gives its pages back on the VACUUM after the one that truncated.
+	 */
+	{
+		LionIndexState *ix = lion_get_index_state(info->index);
+
+		if (ix->nstored > 0 && info->heaprel != NULL &&
+			lion_vac_may_write(info->index))
+			storefreed = lion_store_vacuum_cleanup(info->index, info->heaprel,
+												   ix);
+	}
 
 	/*
 	 * Make the pages ambulkdelete recorded as free visible to the upper
@@ -716,7 +758,57 @@ lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 			info->num_heap_tuples : 0;
 	}
 
+	if (storefreed > 0)
+	{
+		stats->pages_newly_deleted += (BlockNumber) storefreed;
+		stats->pages_deleted += (BlockNumber) storefreed;
+	}
+
 	return stats;
+}
+
+/* lion_store_bulkdelete()'s mark: the sweep leaves a visited page alone. */
+static void
+lion_vac_store_visit(void *arg, BlockNumber blk)
+{
+	lion_vac_visit((LionVacState *) arg, blk);
+}
+
+/*
+ * A live store page the walk did not reach (DESIGN.md §40): a page an insert
+ * added to a chain behind the walk, or an orphan of a cleanup that stopped
+ * between clearing a window's map slot and freeing the rest of its chain.
+ * Only the chain its special area names can tell, and it is asked with
+ * nothing held (lion_store_page_linked()); an orphan stays one, since nothing
+ * links a page that is not new.  buf is cleanup-locked and is released.
+ */
+static bool
+lion_vac_store_orphan(LionVacState *vs, Buffer buf, BlockNumber blk)
+{
+	Page		page = BufferGetPage(buf);
+	uint32		ckey = LionPageGetOpaque(page)->owner_head;
+	uint16		ord = (uint16) LionPageGetOpaque(page)->owner_hash;
+
+	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+	if (vs->ix->nstored == 0 || !lion_vac_may_write(vs->index) ||
+		lion_store_page_linked(vs->index, vs->ix, blk, ckey, ord))
+	{
+		ReleaseBuffer(buf);
+		return false;
+	}
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	if (!lion_store_page_owned(BufferGetPage(buf), ckey, ord))
+	{
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+	lion_store_free_page(vs->index, buf);
+	lion_vac_visit(vs, blk);
+	vs->pages_newly_deleted++;
+	vs->pages_deleted++;
+	vs->prof.records++;
+	return true;
 }
 
 /*
@@ -2133,10 +2225,23 @@ lion_vacuum_sweep(LionVacState *vs)
 
 			if (PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
 				LionPageGetOpaque(page)->page_id != LION_PAGE_ID ||
-				!LionPageIsContainer(page))
+				!(LionPageIsContainer(page) || LionPageIsStore(page)))
 			{
 				UnlockReleaseBuffer(buf);
 				continue;		/* not ours to reason about */
+			}
+
+			/*
+			 * A store page (DESIGN.md §40): a DELETED one is handed to the
+			 * free space map below as a posting page is; a live one the walk
+			 * did not reach is freed if it is an orphan.  Map pages are never
+			 * freed and never reach here.
+			 */
+			if (LionPageIsStore(page) && !LionPageIsDeleted(page))
+			{
+				if (lion_vac_store_orphan(vs, buf, blk))
+					progress = true;
+				continue;
 			}
 
 			if (LionPageIsDeleted(page))
