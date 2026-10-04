@@ -1112,6 +1112,15 @@ extern LionSource *lion_source_open(Relation index, ScanKey keys, int nkeys,
 									bool keeppins, MemoryContext cxt);
 
 /*
+ * ... trusting what a multi-key column's sets answer exactly (mode KEYS,
+ * §29.6) as an index-only scan does, keysexact: no recheck for them, and
+ * their pins kept under the list pin budget when keeppins.
+ */
+extern LionSource *lion_source_open_ext(Relation index, ScanKey keys,
+										int nkeys, bool keeppins,
+										bool keysexact, MemoryContext cxt);
+
+/*
  * The posting sets ONE scan key selects and the tree that combines them,
  * located as a scan locates them (§29.2), for a caller outside a scan - the
  * planner's intersection probe (DESIGN.md §29.11, "Correlated sets").  False
