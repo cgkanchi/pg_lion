@@ -5595,6 +5595,8 @@ lo_store_build(LionOrderedState *st)
 			elog(ERROR, "LionOrdered: index \"%s\" does not store column %d",
 				 RelationGetRelationName(st->ordidx), st->storeattnos[k]);
 		st->readers[k] = lion_store_open(st->ordidx, ix, ord, st->buildcxt);
+		if (k > 0)
+			lion_store_share(st->readers[k], st->readers[0]);
 	}
 
 	/*
@@ -6906,6 +6908,8 @@ ls_start(LionOrderedState *st)
 					 (int) st->gattnos[k]);
 			st->readers[k] = lion_store_open(st->srcidx[i], ix, ord,
 											 st->buildcxt);
+			if (k > st->srcfirst[i])
+				lion_store_share(st->readers[k], st->readers[st->srcfirst[i]]);
 		}
 	}
 

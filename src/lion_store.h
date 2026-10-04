@@ -313,6 +313,17 @@ extern LionStoreReader *lion_store_open(Relation index, LionIndexState *ix,
 extern void lion_store_close(LionStoreReader *r);
 
 /*
+ * Let reader r take an ordered window's permutation (DESIGN.md §41) from
+ * leader, a reader of another column of the same index: when r gathers the
+ * window and the members leader gathered last, it uses the entries leader
+ * read instead of reading the permutation again, and checks every data page
+ * against their generation as it would its own.  The caller gathers with
+ * leader first for each window, and closes the two together.  A no-op in
+ * heap order.
+ */
+extern void lion_store_share(LionStoreReader *r, LionStoreReader *leader);
+
+/*
  * The values of window ckey's members lo[0 .. nlo - 1], which must be in
  * ascending order (heap page, then offset: the order a container iterates
  * in), into values[] and isnull[].  A by-reference value is copied into the

@@ -324,6 +324,8 @@ lion_gather_create(Relation heap, Relation index, int ncols, const int *ords,
 		g->heapattno[j] = heapattno;
 		g->typlen[j] = col->typlen;
 		g->readers[j] = lion_store_open(index, ix, ords[j], gcxt);
+		if (j > 0)
+			lion_store_share(g->readers[j], g->readers[0]);
 	}
 	MemoryContextSwitchTo(oldcxt);
 	return g;
