@@ -19078,3 +19078,179 @@ forced plans' prices; `store_gather.sql` section 12 checks the price's choice bo
 for one index's rows of one or two columns, the heap for a dense filter of five columns from two
 indexes and for a few rows - and the AND chosen over one index and a filter; `store_ordered.sql`
 turns the node off.
+
+## 41. Key-ordered windows: the store in the order of a column (format version 10, designed 2026-10-04)
+
+§40 lays a window's slots out by heap position: slot i of a heap page's sub-array is the row at
+offset i + 1, and a chain's pages follow the heap pages. A predicate that selects a few rows of
+every window therefore touches every page of every chain its rows fall in: a key held by 0.5% of
+a table puts ten to twenty rows in each 64-page window, spread over the whole window, and a window
+whose chain for a wide column is thirty pages long is read whole for those twenty rows. This
+section lays a window's slots out in the order of one column's values instead, behind a per-window
+**permutation** from heap position to slot, so that the rows one value of that column selects sit
+on one or two pages of each chain. Nothing about the posting sets changes; nothing about which
+rows a reader asks for changes; only where a row's values are inside its window.
+
+The order helps exactly the predicates on the order column, and the gain is bounded by the
+windows a result touches: the floor is the permutation page and one data page per window per
+column, so a result sparser than one row a window gains nothing, and a predicate on another
+column gains nothing either (its rows are as scattered in the order column's order as in heap
+order, a little less local). An index whose order column is not the one its queries filter on
+pays the permutation's reads for nothing; the reloption below lets the user say which column.
+
+### The order column
+
+- An index whose **first key column is scalar and stored** (`store_values = on`) is ordered by it.
+- **`cluster_column = name`** (a string reloption, read at build like the others) names any
+  stored column, key or INCLUDE, by its name in the index, and orders the index by it instead.
+  It is how an index whose first key column is multi-key (an array, a tsvector) gets an order:
+  such a column gives a row many keys and has no order of its own. A name that is not a stored
+  column of the index, or a column whose type has no default B-tree ordering, is an ERROR at
+  CREATE INDEX.
+- An index with neither keeps the heap order of §40 and is written as version 9, exactly as
+  before, readable by the builds before this one.
+
+The sort key is the stored datum, compared with its type's default B-tree ordering under the
+index column's collation; NULLs sort last; ties break by heap position, which keeps the locality a
+heap-ordered window has among equal values.
+
+### Format
+
+**Version.** `LION_VERSION_ORDERED_STORE` is 10, written only by a build that has an order column.
+A version 10 meta page carries, past `LionMetaStore`, a `LionMetaStoreOrder` (16 bytes, written by
+the build and never changed): the stored ordinal of the order column and whether a `cluster_column`
+chose it. `LION_OP_STORE_META` copies `LionMetaStore` only, so it never touches it.
+
+**Virtual pages.** A window of an ordered index has twice as many virtual pages as heap pages: the
+**sorted region**, virtual pages 0 .. 63 (at 8K; `LION_BLOCKS_PER_CONTAINER` in general), holds the
+rows the last sort ordered, V to a virtual page, V = ⌈n / 64⌉ for the n rows sorted, so a virtual
+page holds about what an average heap page of the window does and the "fits a page" arithmetic of
+§40 is unchanged; the **append region**, virtual pages 64 .. 127, holds the rows inserted since,
+at virtual page 64 + k for heap page k and their heap offset, exactly §40's layout shifted by 64. A
+virtual address is a 16-bit **virtual lo**, `vpage << LION_OFFSET_BITS | offset`, the same
+arithmetic as a container's lo, with the top bit meaning the append region. Every data chain of an
+ordered index is a §40 chain over virtual pages (its pages' `flags` say `VIRTUAL`); the encoder,
+the decoder, the in-place writes, splits, appends, DICT to RAW and ABSENT are §40's, and a page is
+as self-contained as before.
+
+**The permutation** is one more chain per window, at ordinal `nstored` (the map's stride becomes
+nstored + 1 for an ordered index): a store chain of a two-byte column in RAW mode, in heap
+coordinates, whose slot for heap position (k, offset) is the virtual lo of the row's sorted slot,
+or NULL when the row is not in the sorted region (it is in the append region, or there is no row).
+Its pages' `flags` say `PERM`. It is per window and per index, not per column: the order is the
+index's. A window of 3,000 rows takes 6.4 kB of it, one page; the widest a window can be, 18,624
+rows, takes three.
+
+**The window header** is the dictionary item of the permutation's head page, which a RAW page
+otherwise leaves empty: the n rows the last sort ordered, V, and a **directory** of every page of
+every data chain whose range starts in the sorted region, as (ordinal, first virtual page, block).
+A reader of a selective predicate goes from the permutation straight to the page holding its
+slots; without the directory it would walk the chain from its head, which is what heap order
+costs today. The directory is written whole by the sort that writes the pages it names, and it
+stays exact: nothing writes into the sorted region after a sort but VACUUM, which clears slots in
+place or rewrites a page over the same range, and a page that spans both regions splits at the
+boundary.
+
+**The generation.** The upper six bits of `flags` on every page of an ordered window's chains are
+the window's generation, which every sort of the window advances; a reader that took slots from
+a permutation of one generation and finds a data page of another reads the window again (below).
+
+### Build
+
+A window's values are held until the window closes, as now. At the close the rows are sorted by
+the order column, given slots 0 .. n − 1 in that order, slot s at virtual lo
+`(s / V) << LION_OFFSET_BITS | (s mod V) + 1`, and each column's chain is laid out over the sorted
+region with §40's emitter; the permutation's chain follows, with the window header naming the
+blocks just written. The chains of a window are written before its permutation, so the directory
+is known when the head is.
+
+### Writes
+
+**Insert.** A row of an ordered window goes to the append region: each column's slot is written at
+virtual page 64 + k, offset, exactly as §40 writes heap page k. A heap position VACUUM freed and a
+new row took may still have a permutation entry (a crash between VACUUM's clearing of its slot and
+of its entry, or a sort that gave a slot to a position whose row had died); the insert clears it,
+under the permutation page's exclusive lock, before it writes the columns, so that a reader of the
+new row is sent to the append region. A new window has no permutation at all, and every row of it
+is in the append region until VACUUM sorts it.
+
+**The window lock.** A sort rewrites every chain of a window, and a row whose columns are half
+written into the old chains when the new ones replace them would lose the other half. So every
+insert into an ordered index holds a heavyweight page lock on the window (`LockPage` on a block
+number past any real one, `MaxBlockNumber − ckey`) in share mode while it writes the row's slots,
+taken before any buffer lock; the sort takes it exclusively, without waiting
+(`ConditionalLockPage`): a window busy with inserts is sorted by a later VACUUM. Readers take no
+such lock; they have the generation.
+
+**The sort** (VACUUM's, `amvacuumcleanup`). A window is sorted again when the rows outside the
+sorted order - appended since the last sort, plus the sorted slots VACUUM has cleared - pass a
+quarter of its rows, and a window that has never been sorted is sorted as soon as it has rows. The
+sort reads the window's chains, sorts the rows, writes new chains and a new permutation (one
+record per page, as a build-free emitter must), then switches every map slot of the window to the
+new heads in ONE record (one or two map leaves), and then frees the old pages through §18's DELETED
+protocol, all under the exclusive window lock. A crash before the switch leaves the new pages
+unreachable and a crash after it the old ones; either way the leak sweep of the next VACUUM frees
+them (`lion_store_page_linked()` says no chain holds them). The insert path never sorts: an
+INSERT does not rewrite a window under a lock that blocks the window's other inserts.
+
+**VACUUM's bulk delete** takes a window's permutation first: every position with an entry is asked
+of the callback once, and the dead ones' sorted slots are cleared in every column's chain, in place
+or by §40's quarter-dead rewrite; the append region is cleared as §40 clears a heap page, one
+callback per written slot; and the dead entries of the permutation are cleared last, so that a
+crash between leaves an entry naming a cleared slot, never a slot of a dead row that nothing names.
+`amvacuumcleanup` frees the windows past the heap's end with the permutation's map slot last for
+the same reason.
+
+**WAL.** No new operation: the permutation's pages are store pages, written whole (INIT, ADDMANY,
+SPECIAL) or in place (SETBYTES), and the switch is SETBYTES into the map leaves. Both WAL modes
+and `wal_consistency_checking` cover them as they cover §40's pages.
+
+### Reads
+
+`lion_store_gather()` keeps its contract, so the index-only scan, `LionCount`, `LionOrdered` and
+`LionStoreScan` read an ordered index without a change. For an ordered window it reads the members'
+permutation entries from the permutation chain (the window header with them), turns each member's
+lo into a virtual lo (its sorted slot, or 64 + k with its offset), sorts those, and walks the
+column's chain over virtual pages, entering it at the directory's page for the first slot it
+needs and jumping ahead by the directory whenever the next slot is past the page it is on. The
+values go back to the members in their order; a member whose virtual page is ABSENT, or which has
+no slot, is reported on its heap page's bit as before. A permutation or data page of a generation
+other than the first permutation page's sends the whole window back to the start, as a page that
+is no longer the window's sends §40's gather back to the map. `lion_store_compare()` (verify)
+follows the same path.
+
+**Why it is safe.** §40's argument holds unchanged for a member's value: its slot was written by
+its own insert before its TID reached a container, in the append region, and a sort that moved it
+copied the value with the slot under the window lock that excludes inserts; VACUUM clears only dead
+rows' slots and entries. What is new is that a reader joins two reads, the permutation's entry and
+the data page's slot, without a lock across them; a sort between the two replaces every page of the
+window with pages of a new generation and frees the old ones, so the reader either still reads the
+old pages, whose contents the sort did not change, or finds a page that is freed, or of another
+generation, and starts the window again. A freed page is not reused while the reader's snapshot
+stands (§18).
+
+### Costs
+
+The readers' page models count `1 + (P − 1) m / (m + 1)` chain pages a window for `m` members
+(§40). Under an equality or IN on an ordered index's order column the members of one value are
+adjacent slots, so the count becomes the pages that `m` adjacent slots span, `1 + (m − 1) / s`
+for s slots a page, per value of the list, plus the permutation page; under any other predicate it
+is §40's, plus the permutation page. `lion_store_window_pages()` in `lion_store.c` computes it from
+the meta page's order column, for every reader's cost function.
+
+### verify()
+
+On top of §40's checks: every page of an ordered window's chains carries the permutation's
+generation; the permutation is a bijection from the positions that have an entry onto distinct
+sorted slots below n, and every sorted slot holding a value in any column is named by one entry;
+the directory names exactly the chains' pages whose ranges start in the sorted region; and with
+heapallindexed every visible row's value is read through the permutation.
+
+### Tests
+
+`store.sql`: the layout (a build's permutation and directory, `lion_index_stats()`), the append
+region, a reused heap position, the quarter-dead and the append-area sort, cleanup past the heap's
+end, `cluster_column` and its refusals, and `verify()` after each; the debug setting
+`pg_lion.store_heap_order`, which makes a build write version 9 in heap order, so that the §40
+path stays tested beside the new one until version 9 is dropped. The recovery harness's phase 2
+under `wal_consistency_checking`, in both WAL modes.
