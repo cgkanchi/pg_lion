@@ -89,12 +89,25 @@ lion_index_dir_pages(IndexOptInfo *idx, double *height)
 double
 lion_index_store_pages(IndexOptInfo *idx, int *nstored)
 {
+	return lion_index_store_shape(idx, nstored, NULL);
+}
+
+/*
+ * The same, and in *sh, when given, what the readers' page model needs of
+ * the store's layout (DESIGN.md §41, "Costs": lion_store_shape()).
+ */
+double
+lion_index_store_shape(IndexOptInfo *idx, int *nstored, LionStoreShape *sh)
+{
 	Relation	indexrel = index_open(idx->indexoid, AccessShareLock);
 	LionMetaPageData meta;
 	LionMetaStore store;
 
 	lion_read_meta(indexrel, &meta);
 	lion_read_meta_store(indexrel, &meta, &store);
+	if (sh != NULL)
+		lion_store_shape(lion_get_index_state(indexrel), idx,
+						 (double) store.store_pages, sh);
 	index_close(indexrel, AccessShareLock);
 	if (nstored != NULL)
 		*nstored = pg_popcount32(store.store_cols);
@@ -3820,7 +3833,11 @@ lion_cost_store_spill(double entries, double entrybytes, double tuples,
  *	  the heap touch nkeys * (1 - e^(-rows / nkeys)), and a column's pages in
  *	  one its share of the store - the meta record's store_pages over the
  *	  windows and the columns stored - and never less than one
- *	  (LION_STORE_PAGE_COST).  The entries of a range, an IN list or the sum
+ *	  (LION_STORE_PAGE_COST); for an index in key-ordered windows the
+ *	  permutation's pages are not a column's, every window read reads them
+ *	  too, and under an equality or IN on the order column a window's rows
+ *	  are on the pages their adjacent slots span (lion_store_window_pages(),
+ *	  DESIGN.md §41, "Costs").  The entries of a range, an IN list or the sum
  *	  over every row are merged into one union under a gather, a directory
  *	  leaf's at a time, so a window's pages are read about once (the count
  *	  engine, lion_count_sources_run() and lion_sum_walk());
@@ -3873,16 +3890,20 @@ lion_cost_store_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 		double		rows = Max(rel->rows, 1.0);
 		double		touched;
 		double		perwindow;
-		double		storepages;
+		LionStoreShape shape;
 		int			nstored = 0;
 
 		Assert(t->storeidx != NULL);
-		storepages = lion_index_store_pages(t->storeidx, &nstored);
+		(void) lion_index_store_shape(t->storeidx, &nstored, &shape);
+		lion_store_shape_pin(t->storeidx, &shape, rel->baserestrictinfo, NIL);
 		touched = Max(windows * (1.0 - exp(-rows / windows)), 1.0);
-		perwindow = Max(storepages / windows / (double) Max(nstored, 1), 1.0);
+		perwindow = Max(shape.datapages / windows / (double) Max(nstored, 1),
+						1.0);
 
 		run += rows * ncols * LION_STORE_VALUE_COST;
-		run += touched * ncols * perwindow * LION_STORE_PAGE_COST;
+		run += touched * ncols *
+			lion_store_window_pages(&shape, perwindow, perwindow,
+									rows / touched) * LION_STORE_PAGE_COST;
 		if (ngroup > 0)
 			run += rows * (LION_DECODE_HASH_ROW_COST +
 						   (ngroup - 1) * LION_DECODE_ROW_COL_COST);

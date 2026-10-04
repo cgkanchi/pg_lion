@@ -283,6 +283,45 @@ extern void lion_store_window_info(Relation index, LionIndexState *ix,
 								   uint32 ckey, LionStoreWindowInfo *wi);
 
 /*
+ * The readers' page model (DESIGN.md §41, "Costs").  A planner's view of an
+ * index's store: whether it is in key-ordered windows, its rows a window,
+ * the permutation's pages a window, the store pages the columns have (the
+ * meta page's count less the permutation's), and the values of the order
+ * column the gathered members have (0: not pinned, lion_store_shape_pin()).  Every reader's cost
+ * function prices a window's chain of a column as for heap order -
+ * heapreads pages of colpages for `members` members of the window - and
+ * lion_store_window_pages() says what the order makes of it: the pages the
+ * members of each pinned value span as adjacent slots, never more than
+ * heapreads, plus the permutation's pages, which every gather reads.  In
+ * heap order it is heapreads, unchanged.
+ */
+typedef struct LionStoreShape
+{
+	bool		ordered;
+	double		rowsper;
+	double		permpages;
+	double		datapages;
+	int			ordercol;		/* the order column's index column */
+	double		nvals;
+} LionStoreShape;
+
+struct IndexOptInfo;
+extern void lion_store_shape(LionIndexState *ix, struct IndexOptInfo *idx,
+							 double storepages, LionStoreShape *sh);
+
+/*
+ * Which values the members a reader gathers have in the order column: the
+ * equality or IN list of constants or parameters among clauses (RestrictInfos
+ * or bare clauses) on it, leaving out those in except - the filters a reader
+ * applies after the gather, whose rows it gathers all the same.
+ */
+extern void lion_store_shape_pin(struct IndexOptInfo *idx, LionStoreShape *sh,
+								 List *clauses, List *except);
+extern double lion_store_window_pages(const LionStoreShape *sh,
+									  double heapreads, double colpages,
+									  double members);
+
+/*
  * The leak sweep's question about a live STORE page VACUUM's walk did not
  * reach (lion_vacuum_sweep()): is it on the chain its special area names?
  * Asked with nothing held.  A page that is not is an orphan of an interrupted

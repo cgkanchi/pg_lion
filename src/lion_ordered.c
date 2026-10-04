@@ -1922,6 +1922,7 @@ lo_store_find(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		if (ok)
 		{
 			LionMetaStore ms;
+			LionStoreShape shape;
 			double		windows = Max(1.0, ceil((double) rel->pages /
 												LION_BLOCKS_PER_CONTAINER));
 			double		pagesper = 0.0;
@@ -1932,17 +1933,21 @@ lo_store_find(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			/*
 			 * The store's pages a window, shared among its columns by the
 			 * width of their slots - a gather reads only its column's pages
-			 * - and at least one a column read.
+			 * - and at least one a column read, with the permutation's of
+			 * an index in key-ordered windows (§41, "Costs").
 			 */
 			lion_read_meta_store(indexrel, &ix->meta, &ms);
+			lion_store_shape(ix, idx, (double) ms.store_pages, &shape);
 			for (i = 0; i < ix->nstored; i++)
 				allw += (double) Max(ix->stored[i].rawwidth, 1);
 			foreach(lc2, ords)
 			{
 				double		w = (double) Max(ix->stored[lfirst_int(lc2)].rawwidth, 1);
+				double		colpages = Max(1.0, shape.datapages * w / allw /
+										   windows);
 
-				pagesper += Max(1.0, (double) ms.store_pages * w / allw /
-								windows);
+				pagesper += lion_store_window_pages(&shape, colpages, colpages,
+													0.0);
 			}
 			if (found_any &&
 				(pagesper > st->pagesper ||
@@ -2166,6 +2171,7 @@ typedef struct LsStoreCol
 	AttrNumber	attno;			/* the table's column */
 	int			indexcol;		/* the index column storing it, 1-based */
 	double		pagesper;		/* store pages a window of it */
+	LionStoreShape shape;		/* the index's store layout (§41) */
 } LsStoreCol;
 
 /* The bytes of a store page its sub-arrays can fill, about (lion_store_fmt.h). */
@@ -2271,6 +2277,7 @@ ls_store_cols(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		LionIndexState *ix;
 		LionMetaPageData meta;
 		LionMetaStore ms;
+		LionStoreShape shape;
 		double	   *modeled;
 		double		sum = 0.0;
 		double		scale = 1.0;
@@ -2290,6 +2297,7 @@ ls_store_cols(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		/* the count is kept exact on the meta page, not in the cached state */
 		lion_read_meta(indexrel, &meta);
 		lion_read_meta_store(indexrel, &meta, &ms);
+		lion_store_shape(ix, idx, (double) ms.store_pages, &shape);
 		modeled = (double *) palloc(sizeof(double) * ix->nstored);
 		for (o = 0; o < ix->nstored; o++)
 		{
@@ -2311,8 +2319,8 @@ ls_store_cols(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 							 LS_STORE_PAGE_BYTES);
 			sum += modeled[o];
 		}
-		if (ms.store_pages > 0 && sum > 0.0)
-			scale = (double) ms.store_pages / windows / sum;
+		if (shape.datapages > 0 && sum > 0.0)
+			scale = shape.datapages / windows / sum;
 
 		for (c = 0; c < idx->ncolumns; c++)
 		{
@@ -2331,6 +2339,7 @@ ls_store_cols(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			sc->attno = hattno;
 			sc->indexcol = c + 1;
 			sc->pagesper = Max(1.0, modeled[ord] * scale);
+			sc->shape = shape;
 			result = lappend(result, sc);
 		}
 		pfree(modeled);
@@ -2801,8 +2810,17 @@ ls_cost(PlannerInfo *root, RelOptInfo *rel, Path *lion, List *chosen,
 		foreach(lc, chosen)
 		{
 			LsStoreCol *sc = (LsStoreCol *) lfirst(lc);
+			LionStoreShape shape = sc->shape;
 			double		total = windows * sc->pagesper;
-			double		reads = touched * ls_window_chain_pages(sc->pagesper, m);
+			double		reads;
+
+			/* the order column's values, if the access pins them (§41) */
+			lion_store_shape_pin(sc->index, &shape, rel->baserestrictinfo,
+								 residual);
+			reads = touched *
+				lion_store_window_pages(&shape,
+										ls_window_chain_pages(sc->pagesper, m),
+										sc->pagesper, m);
 
 			run += stored * (LION_STORE_VALUE_COST + LS_VALUE_COST);
 			run += reads * ls_store_page_cost(root, sc->index, reads, total);

@@ -1300,7 +1300,8 @@ lion_plain_meets_workers(RelOptInfo *rel, double pages)
  * hypothetical index, which has no pages to read it off.
  */
 static int
-lion_ios_store_info(IndexOptInfo *index, int *nstored, double *storepages)
+lion_ios_store_info(IndexOptInfo *index, int *nstored, double *storepages,
+					LionStoreShape *sh)
 {
 	Relation	indexrel;
 	LionIndexState *ix;
@@ -1327,6 +1328,7 @@ lion_ios_store_info(IndexOptInfo *index, int *nstored, double *storepages)
 		lion_read_meta(indexrel, &meta);
 		lion_read_meta_store(indexrel, &meta, &store);
 		*storepages = (double) store.store_pages;
+		lion_store_shape(ix, index, *storepages, sh);
 	}
 	index_close(indexrel, AccessShareLock);
 	return nret;
@@ -1347,7 +1349,11 @@ lion_ios_store_info(IndexOptInfo *index, int *nstored, double *storepages)
  * page), and hands up a value of each column for every row returned
  * (LION_STORE_VALUE_COST).  A window's pages of a column are the store's
  * pages spread over the windows of the heap and its stored columns, one at
- * least.  The windows `tuples` rows touch are counted as the heap pages are,
+ * least; for an index in key-ordered windows the permutation's pages are not
+ * a column's, and lion_store_window_pages() adds them to each window's read
+ * and, under an equality or IN on the order column, cuts the chain to the
+ * pages the members' adjacent slots span (DESIGN.md §41, "Costs").  The
+ * windows `tuples` rows touch are counted as the heap pages are,
  * in units of a window: Cardenas's count for rows scattered over them, the
  * share of them the rows cover for rows packed in heap order, interpolated
  * by the column's correlation squared, as cost_index() interpolates its
@@ -1371,7 +1377,8 @@ lion_ios_store_info(IndexOptInfo *index, int *nstored, double *storepages)
  */
 static Cost
 lion_ios_gather_cost(RelOptInfo *baserel, double tuples, double passes,
-					 double corr, int nret, int nstored, double storepages)
+					 double corr, int nret, int nstored,
+					 const LionStoreShape *sh)
 {
 	double		W;
 	double		perpass;
@@ -1379,6 +1386,7 @@ lion_ios_gather_cost(RelOptInfo *baserel, double tuples, double passes,
 	double		packed;
 	double		windows;
 	double		colpages;
+	double		reads;
 	double		spc_random_page_cost;
 	double		spc_seq_page_cost;
 
@@ -1393,12 +1401,13 @@ lion_ios_gather_cost(RelOptInfo *baserel, double tuples, double passes,
 	packed = Min(W, ceil(W * perpass / Max(baserel->tuples, 1.0)));
 	windows = scattered + corr * corr * (packed - scattered);
 	windows = Min(passes * Max(windows, 1.0), Max(tuples, 1.0));
-	colpages = Max(1.0, storepages / (W * (double) nstored));
+	colpages = Max(1.0, sh->datapages / (W * (double) nstored));
+	reads = lion_store_window_pages(sh, colpages, colpages, tuples / windows);
 
 	return tuples * (double) nret * LION_STORE_VALUE_COST +
 		windows * (double) nret *
-		(colpages * LION_STORE_PAGE_COST +
-		 spc_random_page_cost + (colpages - 1.0) * spc_seq_page_cost);
+		(reads * LION_STORE_PAGE_COST +
+		 spc_random_page_cost + (reads - 1.0) * spc_seq_page_cost);
 }
 
 /*
@@ -1539,15 +1548,19 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
 	int			nret = 0;		/* stored columns an index-only scan returns */
 	int			nstored = 0;
 	double		storepages = 0.0;
+	LionStoreShape storeshape;	/* ... and its layout (§41) */
 	int			walkcol;
 	int			shape;
 
 	/* An index-only scan that returns no column is left as it was. */
 	if (indexonly)
 	{
-		nret = lion_ios_store_info(index, &nstored, &storepages);
+		nret = lion_ios_store_info(index, &nstored, &storepages, &storeshape);
 		if (nret == 0)
 			return corr;
+		lion_store_shape_pin(index, &storeshape,
+							 get_quals_from_indexclauses(path->indexclauses),
+							 NIL);
 	}
 	shape = lion_plain_scan_shape(root, path, &walkcol, &rechecks, &unions);
 	if (shape == LION_PLAIN_LIST)
@@ -1558,7 +1571,7 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
 									  lion_ios_gather_cost(baserel,
 														   clamp_row_est(sel * baserel->tuples),
 														   1.0, corr, nret,
-														   nstored, storepages));
+														   nstored, &storeshape));
 		return corr;
 	}
 	if (indexonly && !unions)
@@ -1676,7 +1689,7 @@ lion_plain_heap_correlation(PlannerInfo *root, IndexPath *path,
 	target += LION_WALK_PASS_COST * cpu_tuple_cost * Max(passes - 1.0, 0.0);
 	if (indexonly && !unions)
 		target += lion_ios_gather_cost(baserel, tuples, passes, corr, nret,
-									   nstored, storepages);
+									   nstored, &storeshape);
 
 	/* what the uncorrelated end cannot carry is charged to the path later */
 	if (target > max_io &&
