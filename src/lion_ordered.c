@@ -1152,14 +1152,21 @@ lo_scratch_index_paths(PlannerInfo *root, RelOptInfo *scratch)
  * which was then no candidate.  The row gather took one leaf with the other
  * column as its filter, 75,000 rows gathered for 11,000 kept, in twice the
  * time the AND took (DESIGN.md §40, "As built: the row gather, priced").
- * Disabled, the scan still lands, and loses to every enabled path
- * (disabled_nodes; disable_cost before 18).
+ * Not considered, an index-only scan is built as the plain index scan it
+ * would have been (check_index_only()).  Before 19 that is
+ * enable_indexonlyscan, read as the paths are built; from 19 the setting is
+ * folded into the relation's pgs_mask when planning starts, and the copy's
+ * own mask loses PGS_CONSIDER_INDEXONLY instead - setting the GUC here
+ * changes nothing there.
  */
 static void
 lo_scratch_create_paths(PlannerInfo *root, RelOptInfo *scratch)
 {
 	bool		save_indexonlyscan = enable_indexonlyscan;
 
+#if PG_VERSION_NUM >= 190000
+	scratch->pgs_mask &= ~PGS_CONSIDER_INDEXONLY;
+#endif
 	enable_indexonlyscan = false;
 	PG_TRY();
 	{

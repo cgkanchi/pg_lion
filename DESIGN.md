@@ -19011,8 +19011,9 @@ across the measurements below, around the 500 lion's constants are fitted at.
 mispriced but missing: the accesses are found by running core's index paths into a scratch copy of
 the relation, and there the index-only scan of the one index that stores the other key dominated
 the AND's bitmap heap path and `add_path()` freed it. Index-only scans are now kept out of the
-scratch rel (`lo_scratch_create_paths()`, `enable_indexonlyscan` off around it); they are never a
-lion access of their own. `store_gather.sql` holds it with a table where the one index's
+scratch rel (`lo_scratch_create_paths()`: `enable_indexonlyscan` off around it, and from PostgreSQL
+19, which folds that setting into each relation's `pgs_mask` when planning starts, the copy's
+`PGS_CONSIDER_INDEXONLY` cleared); they are never a lion access of their own. `store_gather.sql` holds it with a table where the one index's
 index-only scan with the filter is cheaper than core's bitmap AND, and the node reads the AND.
 
 **Multi-key accesses.** An `@>`, `&&` or `@@` the index answers exactly (KEYS mode, §29.6) no
