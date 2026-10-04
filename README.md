@@ -588,19 +588,26 @@ What it takes:
   UPDATE`, and no `UPDATE` or `DELETE` of the table;
 - not parallel, not parameterized; a partitioned table is scanned partition by partition.
 
-The planner prices it at `pg_lion.pushdown_margin` against the table's own scans: the set, a
-value a column for each row on an all-visible page (`pg_lion.store_value_cost`), the store pages
-each column reads in each window the rows lie in - priced as I/O as a heap page is, so that a few
-rows scattered over many windows, whose gather would read many more store pages than the heap
-pages an index scan reads, keep the index scan - and a heap visit for the rest.
-`pg_lion.enable_store_scan = on` offers it; it is off by default until its price is settled (below). On the quick benchmark's table of 5,000,000 rows
-with the four indexes `(c2)`, `(c20)`, `(c200)` and `(c20k)`, each `INCLUDE (id)` under
-`store_values` (release build, warm), `SELECT id, c2, c20, c200, c20k ... WHERE c200 IN (17, 18,
-19) AND c20 IN (3, 4, 5)` (11,214 rows) took 39 ms against 65 ms for the bitmap heap scan it
-replaces, `WHERE c200 IN (17, 18, 19)` (75,106 rows) 66 ms as the index scan did, and results of a
-few thousand rows stayed index scans. Between about 7,500 and 50,000 rows of that table, all five
-columns returned, the node is chosen over Lion's plain index scan and runs up to 2.8 times slower
-(DESIGN.md §40, "As built: the row gather", "Measured").
+It is on by default (`pg_lion.enable_store_scan`). The planner prices it with constants fitted to
+its own run time - the set, a store page read and decoded, a value a column for each row on an
+all-visible page, a heap visit for the rest - and converts that price into the units of the scan
+it would displace (DESIGN.md §39, §40 "As built: the row gather, priced"): a plain index scan, an
+index-only scan or a bitmap heap scan, each with a rate below, since core charges a cached heap
+page as a read and those scans run two to three times faster than their price says. So a few
+rows scattered over many windows, whose gather reads many more store pages than an index scan
+reads heap pages, keep the index scan; a dense AND of two indexes, a query that gathers fewer
+columns than the index-only scan would, and an `@>`, `&&` or `@@` whose rows the index selects
+exactly take the store. On the quick benchmark's tables of 5,000,000 rows (release build, warm, a
+shared machine): `SELECT id, c20k FROM fact WHERE c200 = 17` from `(c200) INCLUDE (id, c2, c20,
+c20k)` took 24 ms against 47 for the index-only scan it displaces; the AND of `c200 IN (17, 18,
+19) AND c20 IN (3, 4, 5)` over four indexes, the `(c200)` one storing the other keys, 44 ms
+against 77 for its index-only scan and a filter; `SELECT id, grp FROM
+docs WHERE tags @> ARRAY['t123']` from `(tags) INCLUDE (grp, id, payload)` 25 ms against 41 for
+the index scan. `c20k IN` lists of up to 100 values (25,000 rows) stay index scans, and the
+same AND over one multi-column index stays a bitmap heap scan. Two known misplans remain: a list of
+400 values (100,000 rows) keeps the index scan at 1.2 to 1.4 times the node's time, and a
+multi-key AND inside one index (`tags @> ARRAY['t1', 't17']`) takes the node at 1.7 times the
+plain index scan's (DESIGN.md §40, "As built: the row gather, priced").
 
 ### `ORDER BY` a stored column `LIMIT n`
 
@@ -851,8 +858,9 @@ working around a bad choice:
   only its walks are offered.
 - `pg_lion.enable_store_scan`: offer `LionStoreScan`, which returns the rows a Lion `WHERE`
   selects with every column taken from the window stores of the table's Lion indexes (DESIGN.md
-  §40, "As built: the row gather"; "Rows from the store" above). Off, the default, those queries
-  are core's index, bitmap or sequential scans.
+  §40, "As built: the row gather" and "As built: the row gather, priced"; "Rows from the store"
+  above). On by default, and chosen by price; off, those queries are core's index, bitmap or
+  sequential scans.
 - `pg_lion.enable_decoded_walk`: count a `GROUP BY` of several Lion-indexed columns by decoding,
   at each range of 64 heap blocks, which value of each column every row has (DESIGN.md §34): three
   or more columns, and two where that is cheaper than the nested loop over their entries. Off, a
@@ -947,7 +955,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 Rate settings (DESIGN.md §39, "The competitor's units"). The cost settings above are fitted at 500
 cost units a millisecond, the rate of PostgreSQL's own sequential and index-only scans; its other
 plans run at rates of their own - a hash aggregate at about 200, a nested loop into a warm index at
-1,000 or more. A `LionCount`, `LionSemiJoin` or `LionAntiJoin` path is priced in the units of the
+1,000 or more. A `LionCount`, `LionSemiJoin`, `LionAntiJoin` or `LionStoreScan` path is priced in the units of the
 cheapest PostgreSQL plan it competes with: its own price, pages and CPU alike, times that kind of
 plan's rate below, so its cost in `EXPLAIN` is that plan's units; which of its own forms Lion runs
 is decided before, in its own units. Set a rate to 1 to price Lion as fitted against that kind of
@@ -966,9 +974,12 @@ planner's mispicks, on synthetic tables (DESIGN.md §39, "The matrix").
 | `mergejoin_rate` | 1.0 | a merge join |
 | `nestloop_rate` | 2.0 | a nested loop into a parameterized index or bitmap scan |
 | `bitmap_rate` | 1.0 | a bitmap heap scan |
+| `bitmap_heap_rate` | 3.5 | a bitmap heap scan of one index, unaggregated (`LionStoreScan`'s competitor) |
+| `indexscan_rate` | 3.0 | a plain index scan (`LionStoreScan`'s competitor) |
+| `indexonly_rate` | 0.4 | an index-only scan (`LionStoreScan`'s competitor; below its measured 0.5 to 1.7, since the node gathers no more columns from the same store) |
 
 `pg_lion.pushdown_margin` (1, no margin): the share of the cheapest competing plan's cost a Lion
-custom path (`LionCount`, `LionSemiJoin`, `LionAntiJoin`, `LionOrdered`) must be priced at to be
+custom path (`LionCount`, `LionSemiJoin`, `LionAntiJoin`, `LionOrdered`, `LionStoreScan`) must be priced at to be
 chosen. Set below 1, its own price is divided by it, so a near tie goes to PostgreSQL's plan, and
 its cost in `EXPLAIN` is marked up by it. It is not applied where it hedges nothing: to a plan
 forced with nothing of PostgreSQL's left enabled, to a count whose cheapest competitor is the

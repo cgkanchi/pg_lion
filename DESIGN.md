@@ -17124,9 +17124,15 @@ model prefers.
 | `pg_lion.mergejoin_rate` | 1.0 | a merge join | none measured |
 | `pg_lion.nestloop_rate` | 2.0 | a nested loop into a parameterized index or bitmap scan | 1,057 into a btree; about 2,000 over warm indexes (§31, `fk fwd tsq dim2 1.2k`) |
 | `pg_lion.bitmap_rate` | 1.0 | a bitmap heap scan | 4,419, 1,702, 544 for 500, 25,000 and 250,000 scattered rows; about 70 for §22's BitmapAnd |
+| `pg_lion.bitmap_heap_rate` | 3.5 | a bitmap heap scan of one index, unaggregated (added 2026-10-04, §40) | 1,300 to 2,300 on the quick benchmark's `fact` table, release build |
+| `pg_lion.indexscan_rate` | 3.0 | a plain index scan (added 2026-10-04, §40) | 1,200 to 1,900; 840 to 930 where the heap outgrew `shared_buffers` |
+| `pg_lion.indexonly_rate` | 0.4 | an index-only scan (added 2026-10-04, §40) | 410 to 830 for lion's over a store; 230 to 540 where rows are most of its price |
 
-Sequential, index-only and plain index scans are the reference and have no setting, and so is
-everything else (`OTHER`: a function scan, a MinMaxAgg, a nested loop over a materialized side).
+Sequential scans are the reference and have no setting, and so is everything else (`OTHER`: a
+function scan, a MinMaxAgg, a nested loop over a materialized side). Index-only and plain index
+scans were the reference too until the row gather met them (§40, "As built: the row gather,
+priced"): the last three rows are the rates of a base relation's scans, unaggregated, which only
+`LionStoreScan` is priced against.
 
 - **Hashed aggregates, 0.42.** Both measurements and both machines agree: hashing is charged one or
   two `cpu_operator_cost` a row for about 94 ns (§10), and every plan with a hash aggregate runs at
@@ -17528,7 +17534,8 @@ under a LIMIT to an index scan three times slower (0.13 to 0.15 ms against 0.04 
   LionOrdered, but four queries are too few to set one.
 - **Bitmap heap scans** have one rate for plans that run at 70 and at 4,400 units a millisecond;
   splitting the kind by what the scan's price is made of (pages or TIDs) would let §22's BitmapAnd
-  have its own rate. Every bitmap scan the matrix timed was the AM's own, priced by lion's model,
+  have its own rate. (A bitmap heap scan of one index, unaggregated, has had its own since §40's
+  row gather was priced against it; aggregated, or over an AND or OR, it is still this one.) Every bitmap scan the matrix timed was the AM's own, priced by lion's model,
   and measures nothing of the rate.
 - **The parallel GROUP BY's participants** are priced with the serial node's competitor; core's
   partial paths are not searched for one of their own.
@@ -18762,7 +18769,8 @@ The name: the count engine has its `LionGather` already (the gather of a count's
 rows is a scan, as `LionCount` and `LionOrdered` are named for what they answer.
 
 **The planner** (`ls_add_paths()`, from `lion_ordered_set_rel_pathlist()`;
-`pg_lion.enable_store_scan`, off by default while its price is settled). For a relation `lo_rel_ok()` accepts and a query with a
+`pg_lion.enable_store_scan`, on by default since its price was settled: "As built: the row gather,
+priced" below). For a relation `lo_rel_ok()` accepts and a query with a
 WHERE clause, the columns to return are the Vars of the relation's target, through placeholders
 (`ls_target_attnos()`): plain columns only - a whole-row Var or a system column declines, which
 takes in every row mark's ctid, so the rows of an UPDATE, a DELETE, a FOR UPDATE and an
@@ -18777,7 +18785,8 @@ lion access `lo_lion_accesses()` builds - the AND/OR trees `LionOrdered` streams
 - the restriction clauses the lion side does not answer (`lo_residual()`) are the node's filter,
   and the columns they read must be gathered too;
 - the access must stream (`ls_tree_ok()`): every leaf exact (`lion_plain_scan_passes()`,
-  `lion_amcost.c`, from `lion_plain_scan_shape()`: no recheck, no UNION); an AND's first LEAF
+  `lion_amcost.c`, from `lion_plain_scan_shape()`: no recheck, no UNION; a multi-key `@>`, `&&` or
+  `@@` the index answers exactly counts as exact since "As built: the row gather, priced"); an AND's first LEAF
   child is its DRIVER, whose pieces may come in several passes - a WALK, an IN list longer than
   `lion_scan_list_batch()` - and its other children one set, priced (`ls_set_bytes()`) within
   `hash_mem`; an OR's children each one ascending run of container keys, so an OR with a range
@@ -18791,7 +18800,8 @@ lion access `lo_lion_accesses()` builds - the AND/OR trees `LionOrdered` streams
 The path is unparameterized, not parallel, and has no pathkeys.
 
 **The price** (`ls_cost()`), as `lo_cost_store()` prices the store order's set and gather, offered
-at the margin (§39) as `LionOrdered` is:
+at the margin (§39) as `LionOrdered` is - as first built; "As built: the row gather, priced" below
+replaced it:
 
 - start-up: the lion side's cost (`cost_bitmap_tree_node()`), the AND's set built in it;
 - a container's work a piece: Cardenas's count of the members over the windows, once a pass of
@@ -18888,7 +18898,7 @@ holds the leaves' index quals and the lion side's original qual, the recheck.
 - No EvalPlanQual (`ls_recheck()` is an error: no row mark reaches the node), no parameterized
   path, no parallel plan, no OR with an arm that is not one ascending run.
 - The band of "Measured" below, where the node is chosen over lion's plain index scan and is
-  slower than it, is left to a rate for index scans.
+  slower than it, is left to a rate for index scans ("As built: the row gather, priced").
 
 **Tests.** `test/sql/store_gather.sql`: every query run through the node with core's scans off and
 compared as a multiset with a sequential scan with lion's custom scans off - ANDs of two and three
@@ -18951,3 +18961,119 @@ it there (at their 64 kB `work_mem` it undercuts the count's spilling price), so
 the row gather off. The partition test's check that one index is not read counts what planning
 reads too, and the row gather's planning reads the meta page of a store that could give the
 column; it turns the setting off around itself.
+
+### As built: the row gather, priced (2026-10-04)
+
+The first build offered `LionStoreScan` at the margin against the relation's scans, unconverted,
+and left it off by default ("Measured" above: chosen over lion's plain index scan between 7,500
+and 50,000 rows and up to 2.8 times slower). Its price is now its own run time, in lion's units,
+converted into the units of the scan it would displace as `LionCount`'s is into its aggregate's
+(§39), and the setting is on.
+
+**The rates.** A base relation's scans, unaggregated, get rates of their own, measured on the quick
+benchmark's `fact` table (5,000,000 rows, release build, warm) with the node off and each kind of
+plan forced:
+
+| kind | setting | units a millisecond | rate |
+|---|---|---|---|
+| lion's plain index scan, 2,500 to 100,000 rows | `pg_lion.indexscan_rate` | 1,200 to 1,900; 840 to 930 where its heap pages outgrew `shared_buffers` | 3.0 |
+| a bitmap heap scan of one index, unaggregated (`LION_COMPETITOR_BITMAP_HEAP`, new) | `pg_lion.bitmap_heap_rate` | 1,300 to 2,300 | 3.5 |
+| a bitmap heap scan of an AND (still `BITMAP`) | `pg_lion.bitmap_rate` | 520 to 730 | 1.0 (unchanged) |
+| lion's index-only scan over a store | `pg_lion.indexonly_rate` | 410 to 830; 230 to 540 where the rows handed up are most of its price | 0.4 |
+
+Core charges a cached heap page as a read: the index and bitmap heap scans run two to four times
+faster than their price says, and the node, priced at lion's reference, took results it was two
+to three times slower on. The index-only scan is lion's own model (`lion_ios_gather_cost()`), whose
+gathered values are priced at `pg_lion.store_value_cost` alone; on `store_gather.sql`'s 30,000-row
+table it ran at 230 units a millisecond where the node's own price ran at up to 930, and at 1.25
+it kept queries the node ran in half its time (`SELECT id, x ... WHERE a IN (1, 2, 3, 4)`: 1.2 ms
+against 2.3). The node gathers no more columns than the index-only scan, which gathers every one
+its index returns, from the same chains: 0.4, below the measured range, lets it take every such
+scan it was timed against. Only the node meets these three kinds - lion's other paths of a base
+relation are `LionOrdered`, not converted (§39, "Not done"), and the count's and the joins'
+competitors are aggregates and joins over the scans.
+
+**The node's own price** (`ls_cost()`, `ls_lion_cost()`): constants fitted to its run time on the
+same table, forced, one to five columns over results of 231 to 250,000 rows - a store page read
+and decoded 1.1 to 1.4 µs (`LS_PAGE_DECODE_COST` beyond `store_page_cost` and the page's reach,
+`ls_store_page_cost()`), a value 0.05 µs (`LS_VALUE_COST`), a piece 1.8 µs (`LS_PIECE_COST`), a
+column's reader opened 12 µs (`LS_COLUMN_START_COST`, measured where it matters, on
+`store_gather.sql`'s small table) - and the lion side priced as the node reads it rather than as
+the AM's bitmap paths are: a container's work a window a clause meets, a step of each set of a list
+a window, and the union of a streamed list under its pins - a container of each set, or, where the
+containers hold a member or two, a member the leaf keeps. `cost_bitmap_tree_node()` priced the mask
+of `c20 IN (3, 4, 5)` (750,000 members) at 8,700 units, a TID each into a TIDBitmap the node never
+builds. The chain-page count is `ls_window_chain_pages()`, the one place the price says where a
+window's members lie in its chain. Forced, the node's price ran at 330 to 670 units a millisecond
+across the measurements below, around the 500 lion's constants are fitted at.
+
+**The AND against one leaf and a filter** (`lo_lion_accesses()`). The AND's candidate was not
+mispriced but missing: the accesses are found by running core's index paths into a scratch copy of
+the relation, and there the index-only scan of the one index that stores the other key dominated
+the AND's bitmap heap path and `add_path()` freed it. Index-only scans are now kept out of the
+scratch rel (`lo_scratch_create_paths()`, `enable_indexonlyscan` off around it); they are never a
+lion access of their own. `store_gather.sql` holds it with a table where the one index's
+index-only scan with the filter is cheaper than core's bitmap AND, and the node reads the AND.
+
+**Multi-key accesses.** An `@>`, `&&` or `@@` the index answers exactly (KEYS mode, §29.6) no
+longer declines: `lion_source_open_ext()` opens the node's sources with `keysexact`, keeping their
+pins and handing out sure members, as the bitmap path and the index-only scan already trusted
+them; `lion_plain_scan_shape_ext()` says such an access does not recheck. A plain index scan still
+rechecks them.
+
+**Upper rels over the node.** Core builds its GROUP BY over the cheapest scan only, so with the node
+cheapest every aggregate path of core's was over a lion path and `lion_competitor_path()` found
+none: `LionCount` was priced at the reference rate, about 2.4 times its price against the hash
+aggregate, and an Agg over the node displaced it (`docs`: `SELECT grp, count(*) ... WHERE tags &&
+...`, 85 ms against the count's 51). A core plan over `LionStoreScan` now counts as a competitor -
+the node is a scan priced in core's units - classified as the aggregate over a lion scan it is.
+
+**Measured** (release build, warm, the quick benchmark's tables at 5,000,000 rows, `shared_buffers`
+512MB, no parallel workers; the median of seven runs of `EXPLAIN (ANALYZE, TIMING OFF)` after a warm-up pass; the machine
+shared with another build and benchmark, load 1 to 2, so the same plans ran 10 to 40% slower
+than in the morning's baseline and only plans timed in the same pass are compared; two passes,
+the second shown, where they differ by more than a tenth both):
+
+| query (index portfolio) | before: plan, ms | now: plan, ms | node off, same pass | node forced |
+|---|---|---|---|---|
+| `c20k IN` 30 values, 7,547 rows, five columns (one index a column) | node, 30.5 | index scan, 14.6 | 24.7 | 29.0 |
+| ... 60 values, 14,930 rows | node, 40.1 | index scan, 28.4 | 39.5 | 37.9 |
+| ... 100 values, 24,826 rows | node, 49.3 | index scan, 47.3 | 57.9 | 51.1 |
+| ... 200 values, 50,024 rows | node, 69.2 | node, 75.3 | 80.9 | 71.6 |
+| ... 400 values, 99,725 rows | node, 92.2 | index scan, 133.0 (121.0) | 110.4 | 93.1 |
+| `c200 IN (17,18,19) AND c20 IN (3,4,5)`, the multi-column index | node, 28.5 | bitmap heap scan, 38.0 (36.6) | 34.7 | 41.2 (37.7) |
+| the same, four indexes, `(c200)` storing the other keys | one leaf and a filter, 53.9 | the AND, 44.1 | index-only scan, 76.6 | 45.0 |
+| `c200 IN (17,18,19)`, 75,106 rows, the multi-column index | node, 57.6 | node, 71.7 (76.7) | index-only, 70.0 (81.3) | 75.8 |
+| `SELECT id, c20k ... WHERE c200 = 17` (0.5%), `(c200) INCLUDE (id, c2, c20, c20k)` | index-only scan, 44.7 | node, 24.1 | index-only, 46.8 | 25.4 |
+| `docs`: `SELECT id, grp ... WHERE tags @> '{t123}'` (0.5%), the wide store | index scan, 32.7 | node, 24.9 | index scan, 41.3 | 38.3 |
+| ... `tsv @@ 'w123'` | index scan, 32.4 | node, 25.3 | index scan, 47.1 | 25.2 |
+| ... `tags @> '{t1}'` (5%) | index-only scan, 191 | node, 66.2 | index-only, 194 | 71.6 |
+| ... `tags @> '{t17}' AND tsv @@ 'w123'` | bitmap AND, 43.2 | node, 6.1 | 38.9 | 6.7 |
+| ... `SELECT grp, count(*) ... WHERE tags && '{t1,t17}' GROUP BY grp` | `LionCount`, 51.0 | `LionCount`, 46.0 | 54.8 | - |
+
+"Before" is the morning's baseline with the node offered (it was off by default: off, the same
+plans as "node off" here). The three misplans are gone; the `docs` row query comes from the store.
+
+**What is not settled.**
+
+- **400 values.** The index scan's price stops growing as its heap pages approach the table's
+  (100,000 rows over 96,154 pages), its time does not: it ran at 780 to 940 units a millisecond
+  there against 1,200 to 1,900 below, and at 3.0 it is chosen 1.2 to 1.4 times slower than the
+  node. One rate for every size of index scan cannot hold both ends.
+- **A multi-key AND inside one leaf** (`docs`: `tags @> '{t1,t17}'`, `tsv @@ 'w1 & w17'`; 2,782
+  rows against an estimate of 14,833): the node is chosen, 10.8 to 12.2 ms against the plain index
+  scan's 6.5 to 7.3. That index scan is lion's own price at 6,300 to 6,900 units a millisecond -
+  the AM's estimate of a multi-key plain scan, not a rate - and with its heap pages cold the
+  node ran faster (17.4 against 26.4).
+- **Small top-N probes.** On `store_ordered.sql`'s 30,000-row table `LionStoreScan` under a Sort is
+  priced under `LionOrdered` (107 against 148 even at rate 1) and runs 10 to 37% slower;
+  `store_ordered.sql` turns the node off, as its subject is `LionOrdered`. On `fact` the top-N
+  queries tried stayed `LionOrdered`.
+- **`store_gather.sql`'s `id, t ... WHERE a = 1 AND b = 3`** stays a bitmap heap scan (0.53 ms)
+  where the node took 0.43: within the column start-up's error.
+
+**Tests.** `costrates.sql` lists the three settings and holds them, with the others, out of the
+forced plans' prices; `store_gather.sql` section 12 checks the price's choice both ways - the node
+for one index's rows of one or two columns, the heap for a dense filter of five columns from two
+indexes and for a few rows - and the AND chosen over one index and a filter; `store_ordered.sql`
+turns the node off.
