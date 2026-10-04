@@ -22,6 +22,10 @@ SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
 SET default_statistics_target = 1000;
 SET work_mem = '64MB';
+-- LionOrdered is the subject: at this table's few thousand rows a probe,
+-- LionStoreScan under a Sort can be priced under it, and that plan is
+-- store_gather's
+SET pg_lion.enable_store_scan = off;
 
 -- The text column's collation: ICU's English where the build has ICU and the
 -- database is UTF8, a copy of "C" otherwise.  Every answer is compared with
