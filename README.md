@@ -593,7 +593,7 @@ value a column for each row on an all-visible page (`pg_lion.store_value_cost`),
 each column reads in each window the rows lie in - priced as I/O as a heap page is, so that a few
 rows scattered over many windows, whose gather would read many more store pages than the heap
 pages an index scan reads, keep the index scan - and a heap visit for the rest.
-`pg_lion.enable_store_scan = off` turns it off. On the quick benchmark's table of 5,000,000 rows
+`pg_lion.enable_store_scan = on` offers it; it is off by default until its price is settled (below). On the quick benchmark's table of 5,000,000 rows
 with the four indexes `(c2)`, `(c20)`, `(c200)` and `(c20k)`, each `INCLUDE (id)` under
 `store_values` (release build, warm), `SELECT id, c2, c20, c200, c20k ... WHERE c200 IN (17, 18,
 19) AND c20 IN (3, 4, 5)` (11,214 rows) took 39 ms against 65 ms for the bitmap heap scan it
@@ -851,8 +851,8 @@ working around a bad choice:
   only its walks are offered.
 - `pg_lion.enable_store_scan`: offer `LionStoreScan`, which returns the rows a Lion `WHERE`
   selects with every column taken from the window stores of the table's Lion indexes (DESIGN.md
-  §40, "As built: the row gather"; "Rows from the store" above). Off, those queries are core's
-  index, bitmap or sequential scans.
+  §40, "As built: the row gather"; "Rows from the store" above). Off, the default, those queries
+  are core's index, bitmap or sequential scans.
 - `pg_lion.enable_decoded_walk`: count a `GROUP BY` of several Lion-indexed columns by decoding,
   at each range of 64 heap blocks, which value of each column every row has (DESIGN.md §34): three
   or more columns, and two where that is cheaper than the nested loop over their entries. Off, a

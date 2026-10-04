@@ -69,6 +69,7 @@ setup
 {
 	SET enable_seqscan = off; SET enable_bitmapscan = off;
 	SET enable_indexscan = off; SET enable_indexonlyscan = off;
+	SET pg_lion.enable_store_scan = on;
 }
 step s1_begin	{ BEGIN ISOLATION LEVEL REPEATABLE READ; }
 step s1_plan	{ EXPLAIN (COSTS OFF) SELECT id, a, x, t FROM lss WHERE a IN (1, 2) AND b IN (3, 4); }
