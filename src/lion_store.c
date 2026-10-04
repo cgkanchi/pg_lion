@@ -4949,6 +4949,24 @@ struct LionStoreReader
 	LionStoreDirEnt *dir;
 	int			ndir;
 	int			dircap;
+
+	/*
+	 * The permutation shared among the readers of one index's columns
+	 * (lion_store_share()): a follower's leader, and a leader's last
+	 * permutation read - the window, the members, their entries in
+	 * pval/pnull, the generation and the whole directory - valid while
+	 * pvalid.
+	 */
+	LionStoreReader *leader;
+	bool		pvalid;
+	uint32		pckey;
+	int			pnlo;
+	uint16	   *plo;
+	int			pgen;
+	bool		pheadseen;
+	LionStoreDirEnt *alldir;
+	int			nalldir;
+	int			alldircap;
 };
 
 /*
@@ -5005,6 +5023,14 @@ lion_store_open(Relation index, LionIndexState *ix, int ord, MemoryContext cxt)
 	r->pcache.leafblk = InvalidBlockNumber;
 	r->pcache.head = InvalidBlockNumber;
 	return r;
+}
+
+void
+lion_store_share(LionStoreReader *r, LionStoreReader *leader)
+{
+	Assert(r != leader && r->index == leader->index && r->ix == leader->ix);
+	Assert(leader->leader == NULL);
+	r->leader = leader;
 }
 
 void
@@ -5182,7 +5208,32 @@ lion_store_dir_find(const LionStoreWalk *w, int k)
 	return best;
 }
 
-/* Keep the window header's directory entries for the reader's column. */
+/* Of a window header's directory entries, the reader's column's. */
+static void
+lion_store_pick_dir(LionStoreReader *r, const LionStoreDirEnt *all, int n)
+{
+	int			i;
+
+	if (r->dircap < n)
+	{
+		if (r->dir != NULL)
+			pfree(r->dir);
+		r->dircap = Max(16, n);
+		r->dir = (LionStoreDirEnt *)
+			MemoryContextAlloc(r->cxt, sizeof(LionStoreDirEnt) * r->dircap);
+	}
+	r->ndir = 0;
+	for (i = 0; i < n; i++)
+	{
+		if (all[i].ord != (uint16) r->col->ord)
+			continue;
+		if (r->ndir > 0 && all[i].lo <= r->dir[r->ndir - 1].lo)
+			continue;			/* out of order: verify() says so */
+		r->dir[r->ndir++] = all[i];
+	}
+}
+
+/* Keep the window header's directory, and the reader's column's entries. */
 static void
 lion_store_keep_dir(LionStoreReader *r, Page page)
 {
@@ -5193,27 +5244,20 @@ lion_store_keep_dir(LionStoreReader *r, Page page)
 
 	/* lion_store_check_header() checked the sizes */
 	memcpy(&wh, item + sizeof(LionStoreDict), sizeof(LionStoreWinHdr));
-	if (r->dircap < wh.ndir)
+	if (r->alldircap < wh.ndir)
 	{
-		if (r->dir != NULL)
-			pfree(r->dir);
-		r->dircap = Max(16, wh.ndir);
-		r->dir = (LionStoreDirEnt *)
-			MemoryContextAlloc(r->cxt, sizeof(LionStoreDirEnt) * r->dircap);
+		if (r->alldir != NULL)
+			pfree(r->alldir);
+		r->alldircap = Max(16, wh.ndir);
+		r->alldir = (LionStoreDirEnt *)
+			MemoryContextAlloc(r->cxt, sizeof(LionStoreDirEnt) * r->alldircap);
 	}
-	r->ndir = 0;
+	r->nalldir = wh.ndir;
 	for (i = 0; i < wh.ndir; i++)
-	{
-		LionStoreDirEnt e;
-
-		memcpy(&e, item + sizeof(LionStoreDict) + sizeof(LionStoreWinHdr) +
-			   (Size) i * sizeof(LionStoreDirEnt), sizeof(LionStoreDirEnt));
-		if (e.ord != (uint16) r->col->ord)
-			continue;
-		if (r->ndir > 0 && e.lo <= r->dir[r->ndir - 1].lo)
-			continue;			/* out of order: verify() says so */
-		r->dir[r->ndir++] = e;
-	}
+		memcpy(&r->alldir[i], item + sizeof(LionStoreDict) +
+			   sizeof(LionStoreWinHdr) + (Size) i * sizeof(LionStoreDirEnt),
+			   sizeof(LionStoreDirEnt));
+	lion_store_pick_dir(r, r->alldir, r->nalldir);
 }
 
 /*
@@ -5451,7 +5495,9 @@ lion_store_reader_room(LionStoreReader *r, int n)
 		pfree(r->vlo);
 		pfree(r->vval);
 		pfree(r->vnull);
+		pfree(r->plo);
 	}
+	r->pvalid = false;
 	r->scap = Max(n, 256);
 	r->pval = (Datum *) MemoryContextAlloc(r->cxt, sizeof(Datum) * r->scap);
 	r->pnull = (bool *) MemoryContextAlloc(r->cxt, sizeof(bool) * r->scap);
@@ -5459,6 +5505,7 @@ lion_store_reader_room(LionStoreReader *r, int n)
 	r->vlo = (uint16 *) MemoryContextAlloc(r->cxt, sizeof(uint16) * r->scap);
 	r->vval = (Datum *) MemoryContextAlloc(r->cxt, sizeof(Datum) * r->scap);
 	r->vnull = (bool *) MemoryContextAlloc(r->cxt, sizeof(bool) * r->scap);
+	r->plo = (uint16 *) MemoryContextAlloc(r->cxt, sizeof(uint16) * r->scap);
 }
 
 static int
@@ -5468,6 +5515,30 @@ lion_store_uint32_cmp(const void *a, const void *b)
 	uint32		y = *(const uint32 *) b;
 
 	return (x > y) - (x < y);
+}
+
+/*
+ * A follower's permutation from its leader (lion_store_share()), when the
+ * leader's last read was of this window and these members: the entries, the
+ * generation, and the follower's own entries of the directory.  The data
+ * walk that follows checks every page against that generation, as after a
+ * read of its own; a mismatch reads the permutation again itself.
+ */
+static bool
+lion_store_shared_perm(LionStoreReader *r, uint32 ckey, const uint16 *lo,
+					   int nlo, LionStoreWalk *pw)
+{
+	LionStoreReader *l = r->leader;
+
+	if (l == NULL || !l->pvalid || l->pckey != ckey || l->pnlo != nlo ||
+		memcmp(l->plo, lo, sizeof(uint16) * nlo) != 0)
+		return false;
+	memcpy(r->pval, l->pval, sizeof(Datum) * nlo);
+	memcpy(r->pnull, l->pnull, sizeof(bool) * nlo);
+	pw->gen = l->pgen;
+	pw->headseen = l->pheadseen;
+	lion_store_pick_dir(r, l->alldir, l->nalldir);
+	return true;
 }
 
 /*
@@ -5499,9 +5570,25 @@ lion_store_gather_ordered(LionStoreReader *r, uint32 ckey, const uint16 *lo,
 		pw.takegen = true;
 		pw.wanthdr = true;
 		r->ndir = 0;
-		if (!lion_store_walk(r, r->ix->storeperm, &r->pcache, ckey, pslot, fresh,
-							 lo, nlo, r->pval, r->pnull, &pw))
+		r->nalldir = 0;
+		r->pvalid = false;
+		if (!fresh && lion_store_shared_perm(r, ckey, lo, nlo, &pw))
+		{
+			/* the leader's read of this window's permutation, just made */
+		}
+		else if (!lion_store_walk(r, r->ix->storeperm, &r->pcache, ckey, pslot,
+								  fresh, lo, nlo, r->pval, r->pnull, &pw))
 			continue;
+		else if (r->leader == NULL)
+		{
+			/* for the followers, which gather the same members next */
+			r->pvalid = true;
+			r->pckey = ckey;
+			r->pnlo = nlo;
+			memcpy(r->plo, lo, sizeof(uint16) * nlo);
+			r->pgen = pw.gen;
+			r->pheadseen = pw.headseen;
+		}
 
 		/*
 		 * Each member's address: its sorted slot, or with no entry its heap

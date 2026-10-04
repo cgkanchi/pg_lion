@@ -4421,8 +4421,12 @@ lion_ios_batch(LionScanOpaque so, LionIosState *ios, uint32 ckey)
 		ios->readers = (LionStoreReader **)
 			palloc(sizeof(LionStoreReader *) * ios->nret);
 		for (r = 0; r < ios->nret; r++)
+		{
 			ios->readers[r] = lion_store_open(so->index, so->ix,
 											  ios->retord[r], so->gtcxt);
+			if (r > 0)
+				lion_store_share(ios->readers[r], ios->readers[0]);
+		}
 		ios->batchcxt = AllocSetContextCreate(so->gtcxt,
 											  "lion index-only batch",
 											  ALLOCSET_DEFAULT_SIZES);

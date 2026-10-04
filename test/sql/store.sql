@@ -478,10 +478,16 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SELECT k, count(*), sum(g), min(t), max(t) FROM lion_st_ord WHERE k IN (2, 5) GROUP BY k ORDER BY k;
 SELECT g, count(*), min(t) FROM lion_st_ord WHERE tags @> ARRAY[3] AND g < 4 GROUP BY g ORDER BY g;
+-- rows, three columns from one store: the readers of an index share its
+-- permutation read for each window
+SELECT count(*), md5(string_agg(k || ',' || g || ',' || t, ';' ORDER BY k, g, t))
+  FROM lion_st_ord WHERE k IN (2, 5);
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 SELECT k, count(*), sum(g), min(t), max(t) FROM lion_st_ord WHERE k IN (2, 5) GROUP BY k ORDER BY k;
 SELECT g, count(*), min(t) FROM lion_st_ord WHERE tags @> ARRAY[3] AND g < 4 GROUP BY g ORDER BY g;
+SELECT count(*), md5(string_agg(k || ',' || g || ',' || t, ';' ORDER BY k, g, t))
+  FROM lion_st_ord WHERE k IN (2, 5);
 
 -- inserts: into the last window's append region, and windows of their own
 -- with no permutation yet, all of whose rows are appended
