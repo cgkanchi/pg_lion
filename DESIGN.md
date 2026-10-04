@@ -19100,15 +19100,16 @@ pays the permutation's reads for nothing; the reloption below lets the user say 
 
 ### The order column
 
-- An index whose **first key column is scalar and stored** (`store_values = on`) is ordered by it.
 - **`cluster_column = name`** (a string reloption, read at build like the others) names any
-  stored column, key or INCLUDE, by its name in the index, and orders the index by it instead.
-  It is how an index whose first key column is multi-key (an array, a tsvector) gets an order:
+  stored column, key or INCLUDE, by its name in the index, and orders the index by it. It is
+  also how an index whose first key column is multi-key (an array, a tsvector) gets an order:
   such a column gives a row many keys and has no order of its own. A name that is not a stored
   column of the index, or a column whose type has no default B-tree ordering, is an ERROR at
   CREATE INDEX.
-- An index with neither keeps the heap order of §40 and is written as version 9, exactly as
-  before, readable by the builds before this one.
+- An index without it keeps the heap order of §40, even when its first key column is scalar and
+  stored, and is written as version 9, exactly as before, readable by the builds before this
+  one. (The design first ordered such an index by its first key column by default; "As built"
+  says why it does not.)
 
 The sort key is the stored datum, compared with its type's default B-tree ordering under the
 index column's collation; NULLs sort last; ties break by heap position, which keeps the locality a
@@ -19254,3 +19255,149 @@ end, `cluster_column` and its refusals, and `verify()` after each; the debug set
 `pg_lion.store_heap_order`, which makes a build write version 9 in heap order, so that the §40
 path stays tested beside the new one until version 9 is dropped. The recovery harness's phase 2
 under `wal_consistency_checking`, in both WAL modes.
+
+### As built (2026-10-04)
+
+Format, build, the insert path, VACUUM's bulk delete, verify() and WAL are as designed above. Where
+the build differs, or where the design left a choice open:
+
+**The order is asked for.** The design ordered an index by its first key column when that is
+stored. Built that way, the quick benchmark's `fact` indexes - `(c2, c20, c200, c20k)` ordered by
+`c2`, four single-column indexes each by its key - made most of the row and aggregate queries
+that filter on `c200` 1.5 to 2 times slower, with 40 to 70% more buffers (the tables are in the
+benchmark directory of the write-up). Two things were the build's and are fixed (below: every
+reader read the permutation for itself, and the count took its store from whichever index came
+first); the rest is the order's own price. A predicate on another column reads the permutation
+page in every window it touches, and loses the locality its rows had in heap order: on `fact`,
+`c200 = 17` falls on about three of the four pages of a window's `id` chain in heap order and
+on all four in `c2` order. So no index is ordered unless its owner says by what:
+`cluster_column` is the only way to an order, and an index without it, its first key column
+stored or not, is version 9 in heap order as before. The quick benchmark's suites are then
+unchanged by this section, and an index ordered by the column its queries pin gains what the
+measurements below say.
+
+**The permutation is read once a window per index.** Each reader is of one column; the first
+build had each of them read the window's permutation, so an index-only scan of five columns read
+the permutation page five times a window. `lion_store_share()` makes the readers a caller opens
+on one index followers of the first: a follower gathering the window and the members its leader
+gathered last takes the leader's entries, generation and directory, and checks every data page
+against that generation as after a read of its own. The index-only scan, the count's gather,
+`LionOrdered` and `LionStoreScan` (per source index) share.
+
+**The count's store.** `lion_find_store_index()`, which picks the one index a count gathers from,
+took the index with the fewest stored columns, the first of equals. With four indexes each
+storing `id`, a count of `sum(id) WHERE c200 = 17` took `id` from the index ordered by `c2`
+(10,397 buffers) rather than from the one ordered by `c200` (6,035). It now ranks an index
+ordered by a column the restriction pins first, then one in heap order, then one ordered by
+another column, and only then counts stored columns.
+
+**The re-sort runs in VACUUM's cleanup only.** The plan this section came from had the insert
+path sort a window too; it does not. A sort rewrites every chain of the window under the
+exclusive window lock, which would make the INSERT that triggered it wait for, and block, every
+other insert into its window. `amvacuumcleanup` calls `lion_store_vacuum_sort()` after
+`lion_store_vacuum_cleanup()`; it walks the map for the windows below the heap's end, asks
+`lion_store_window_wants_sort()` of each (the permutation chain's live entries against the window
+header's n, plus the non-NULL append-region slots of the order column's chain - one page read a
+permutation page and an order-column page or two a window, which is what an idle VACUUM of an
+ordered index now costs), and sorts a window that passes the quarter under
+`ConditionalLockPage`. A window that never passes the quarter keeps its appended rows in the append
+region, which is read as heap order is.
+
+**Phantom positions.** A sort reads every position that has a permutation entry or an append slot.
+A position whose every column is NULL might be a row whose values are all NULL, or nothing at all
+(a slot VACUUM cleared, or one a page's nslots reaches without a write); the sort gives it a sorted
+slot only if its heap line pointer is in use (`lion_store_heap_used()`, one heap page read for a
+heap page that has such a position, under a share lock). Without the check a window full of
+cleared slots kept them as sorted slots forever, and its count of rows outside the order never
+fell.
+
+**Counting what is outside the order.** `appended` counts the non-NULL values of the order
+column's append-region sub-arrays (`lion_store_sub_values()`), not their nslots: a sub-array's
+nslots is the highest offset written, and a heap page with one new row at offset 120 would
+otherwise count 120.
+
+**The directory may be thinned.** The window header lives in the permutation's head page with the
+first heap page's permutation. When a window has more data pages than half a page of directory
+entries holds (very wide stores: about 680 entries), the build keeps each column's first page and
+every other one after it, as often as needed, and sets `LION_STORE_WH_THIN` in the header's flags.
+A reader that misses a page in the directory walks right from the entry before it; verify() checks
+the directory entry by entry, and requires every page only when the flag is clear.
+
+**The insert's probe.** Every insert into an ordered index reads its heap page's permutation
+sub-array (share lock, one page, usually the head) to learn the window's generation and whether
+the position still has an entry. Besides the crash case above, the entry can be live after a sort
+that ran while the row's heap tuple existed but its index insert had not yet taken the window
+lock: the sort reads the heap tuple's line pointer, sees it in use and gives it a sorted slot with
+NULL values, and the insert, arriving next, clears that entry and writes the append region. No
+test reaches that order deterministically (it needs an injection point inside the insert path);
+the recovery and isolation tests pass through the clearing path only by chance.
+
+**Gather.** `lion_store_gather_ordered()` walks the permutation (taking the generation and the
+directory from its head), then each requested column's chain over ascending virtual lo, entering
+by the directory and jumping ahead with it; a generation mismatch or a page no longer owned by the
+window restarts the whole window (at most `LION_STORE_MAX_ATTEMPTS`, 64, then an ERROR); a
+directory jump to a page that is not where the directory says falls back to the walk from the
+head. Every gather of an ordered window therefore reads the permutation page(s) once a window for
+the readers of one index (above).
+
+**`lion_index_store_window(idx, window)`** is the diagnostic the tests use: the order column (NULL
+in heap order), the generation, n, V, the directory's entries and whether thinned, the positions
+with an entry, the append-region slots, and the permutation's and the data chains' pages.
+
+**Costs.** `lion_store_shape()` reads the meta page's order column and estimates the permutation's
+pages a window as ⌈rows a window × 2.25 / page capacity⌉ (two bytes and the sub-arrays' share),
+taking them out of the store's page count to leave the columns' share; `lion_store_shape_pin()`
+finds an equality or IN on the order column among the clauses the access answers (never a residual
+filter, which does not choose rows); `lion_store_window_pages()` turns §40's per-window chain pages
+into `min(heap-order count, nvals × (1 + (m / nvals − 1) × P / rows a window))` plus the permutation
+page. The callers are the index-only scan's gather (`lion_ios_gather_cost()`), `LionStoreScan`
+(`ls_store_cols()`, `ls_cost()`), `LionOrdered`'s store order (`lo_store_find()`), and the count's
+store path (`lion_cost_store_path()` through `lion_index_store_shape()`). The plan named
+`lion_store_estimate()` for the count; the count's page model is in `lion_cost_store_path()`, and
+the helper went there.
+
+**A version 9 index** built by the build before this one is read, written, VACUUMed and verified
+as before (its meta page has no order record; `ix->store_order` is −1 and every path is §40's);
+REINDEX makes it version 10 when it has an order column.
+
+**Measured** (release build, the quick benchmark's tables at 5,000,000 rows, `shared_buffers`
+512 MB, on four cores shared with another job; medians, the raw runs and the scripts in
+`benchmarks/store_followup_item2_2026-10-04/` of the project files):
+
+- *Indexes without `cluster_column`* are version 9 and read as before: every query of the `fact`
+  suites read the same buffers under both builds, and an A/B that swapped the two libraries on
+  the same indexes three times over found the times within -11% .. +8% of `main`'s (geometric
+  mean 0.98), inside the noise of single queries on a shared machine. Inserts and VACUUM of the
+  write and VACUUM micro-benchmarks (which store no column) were within the run-to-run noise as
+  well: the eight-index roaring insert +6.5% and its steady state -6%, the B-tree inserts beside
+  them, which this change cannot touch, +10%; VACUUM +5% (portfolio) and +4% (churn).
+- *`(c200) INCLUDE (c20, c20k, id, payload)` ordered by `c200`*: `SELECT id, c20, payload WHERE
+  c200 = 17` (0.5% of the rows) from the store reads 12,968 buffers instead of 57,879, 21 ms warm
+  and 369 ms cold instead of 80 and 665; the heap path takes 35 and 597. The planner takes the
+  index-only scan by default, 31 ms warm and 386 cold; `IN (17, 18, 19)` 2.4 times faster. The
+  index is 5% larger (the permutation: about 3,000 pages, two a window).
+- *An order the query does not pin* costs: on `docs` ordered by `grp`, the 5% tag query's
+  index-only scan read 12% more buffers and ran 1.7 times slower with the pages cached and 3 times
+  slower when the extra pages pushed its working set past `shared_buffers`; with four indexes
+  each ordered by its own key, a count or row scan that took a column from an index ordered by
+  another column ran 1.3 to 1.8 times slower.
+- *The writes of an ordered index* (a million rows, `(k) INCLUDE (g, id, p)` ordered by `k`):
+  inserts as fast as heap order (2.8 s for 100,000 rows either way); the build 1.4 times slower
+  (517 ms against 360), 1.2 to 1.9 times on the benchmark's indexes ordered by a scalar key and
+  no slower for the `docs` index ordered by `grp`; the VACUUM that clears a tenth of the rows 1.2 times slower (215 ms against 176), and the one that sorts the windows
+  again 2.6 times (399 against 156), with the relation 48% larger after it, since a sort writes the
+  new chains before it frees the old ones and the free space map hands those back only to later
+  writes. An idle VACUUM reads every window's permutation and order-column chain to decide.
+
+The `docs` 0.5% query the plan named cannot gain from this section: its rows are chosen by
+`tags`, which no scalar column of the index orders, so their slots are as scattered in `grp`'s
+order (or `id`'s, which is heap order) as in the heap's. The row gather's exact multi-key access
+(§40, "As built: the row gather, priced") answers it from the store: `SELECT id, grp ... WHERE
+tags @> '{t123}'` in heap order took 438 ms cold and 26.5 warm, 13,380 buffers, against the heap
+path's 1,612 and 43. Ordered by `grp` or by `id`, the same plan read 18,250 buffers and took 610
+to 630 cold and 35 to 38 warm: the permutation's page in every window, and nothing gained. A
+forced gather of the wide `payload` column read a third fewer buffers ordered (42,094 against
+62,028) and ran faster warm (77 ms against 105) but twice as slow cold (1,040 against 500). That
+is the directory, not the order: an ordered gather jumps to the pages that hold its slots, where
+a heap-order gather walks each chain from its head to its last member's page, and the jumps read
+fewer pages but defeat the kernel's readahead.
