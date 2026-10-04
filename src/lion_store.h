@@ -69,6 +69,14 @@ lion_storemap_slot(uint32 ckey, int nstored, int ord)
 	return (uint64) ckey * (uint64) nstored + (uint64) ord;
 }
 
+/*
+ * The map slots a window takes: one per stored column, and for an index in
+ * key-ordered windows (DESIGN.md §41) one more, the permutation's, at
+ * ordinal nstored.  Every slot computation passes this as its "nstored".
+ */
+#define lion_store_stride(ix) \
+	((ix)->nstored + ((ix)->store_order >= 0 ? 1 : 0))
+
 /* ---------- a stored column ---------- */
 
 /*
@@ -99,7 +107,23 @@ typedef struct LionStoreCol
 	/* RAW slot bytes: typlen, or store_max_len + 2; 0 = DICT only */
 	int			rawwidth;
 	int			maxlen;			/* store_max_len for a varlena, else 0 */
+
+	/*
+	 * Which pages its chains have (DESIGN.md §41): LION_STORE_KIND_HEAP, a
+	 * column of an index in heap order; _ORDERED, a column of an ordered
+	 * index, over virtual pages; _PERM, the permutation (ordinal nstored).
+	 */
+	uint8		kind;
 } LionStoreCol;
+
+#define LION_STORE_KIND_HEAP		0
+#define LION_STORE_KIND_ORDERED		1
+#define LION_STORE_KIND_PERM		2
+
+/* The heap or virtual pages a chain of col covers: 0 .. this - 1. */
+#define lion_store_col_pages(col) \
+	((col)->kind == LION_STORE_KIND_ORDERED ? LION_STORE_MAX_VPAGES : \
+	 LION_BLOCKS_PER_CONTAINER)
 
 /*
  * Which index columns a build stores (DESIGN.md §40, "Which columns"), as a
@@ -121,6 +145,30 @@ extern void lion_store_fill_state(Relation index, LionIndexState *ix,
 
 /* The stored ordinal of index column attno, or -1. */
 extern int	lion_store_ordinal(const LionIndexState *ix, AttrNumber attno);
+
+/*
+ * The order column of a build (DESIGN.md §41): the stored ordinal its
+ * windows are sorted by, or -1 for heap order, from `cluster_column` and
+ * pg_lion.store_heap_order; ERRORs for a
+ * `cluster_column` that names no stored column with an ordering.  *flags gets
+ * LION_STORE_ORDER_CLUSTER when the reloption chose it.
+ */
+extern int	lion_store_choose_order(Relation index, LionIndexState *ix,
+									uint16 *flags);
+
+/*
+ * Make ix an index in key-ordered windows by order column `order` (-1: heap
+ * order, nothing changes): the columns' kinds and the permutation's column.
+ */
+extern void lion_store_fill_order(Relation index, LionIndexState *ix,
+								  int order, MemoryContext cxt);
+
+/* The order column a version 10 meta page records, -1 for any other. */
+extern int	lion_read_meta_store_order(Relation index,
+									   const LionMetaPageData *meta);
+
+/* pg_lion.store_heap_order: builds write heap order (a testing knob, §41). */
+extern bool lion_store_heap_order;
 
 /*
  * Read the meta page's store record into *store, zeroed when meta's version
@@ -198,6 +246,41 @@ extern void lion_store_bulkdelete(Relation index, LionIndexState *ix,
  */
 extern int64 lion_store_vacuum_cleanup(Relation index, Relation heaprel,
 									   LionIndexState *ix);
+
+/*
+ * amvacuumcleanup's sort of an ordered index's windows (DESIGN.md §41,
+ * "The sort"): every window whose rows outside the sorted order pass a
+ * quarter of its rows, and which no insert holds, is sorted again.  Returns
+ * the windows sorted; *freed gets the pages freed.
+ */
+extern int64 lion_store_vacuum_sort(Relation index, Relation heaprel,
+									LionIndexState *ix, int64 *freed);
+
+/*
+ * verify()'s check of an ordered window whole (DESIGN.md §41, "verify()"):
+ * generations, the permutation a bijection onto the sorted slots that hold
+ * values, the directory.  ERRORs on damage; a no-op in heap order.
+ */
+extern void lion_store_verify_window(Relation index, LionIndexState *ix,
+									 uint32 ckey);
+
+/* lion_index_store_window()'s look at one window of an ordered index (§41). */
+typedef struct LionStoreWindowInfo
+{
+	bool		exists;			/* the window has a store at all */
+	int			gen;			/* the permutation's generation, 0: none */
+	int			nsorted;		/* its window header */
+	int			vwidth;
+	int			ndir;
+	bool		thin;
+	int64		entries;		/* positions with a permutation entry */
+	int64		appended;		/* the order column's append-region values */
+	int			perm_pages;		/* the permutation's chain */
+	int			pages;			/* every data chain */
+} LionStoreWindowInfo;
+
+extern void lion_store_window_info(Relation index, LionIndexState *ix,
+								   uint32 ckey, LionStoreWindowInfo *wi);
 
 /*
  * The leak sweep's question about a live STORE page VACUUM's walk did not

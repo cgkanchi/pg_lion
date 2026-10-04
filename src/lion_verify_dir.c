@@ -723,11 +723,12 @@ lion_verify_meta(LionVerifyState *vs)
 		(meta->version != LION_VERSION &&
 		 meta->version != LION_VERSION_SUMMARIES &&
 		 meta->version != LION_VERSION_NARROW &&
-		 meta->version != LION_VERSION_STORE))
+		 meta->version != LION_VERSION_STORE &&
+		 meta->version != LION_VERSION_ORDERED_STORE))
 		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u to %u",
 					RelationGetRelationName(vs->index), meta->magic,
 					meta->version, LION_MAGIC, LION_VERSION,
-					LION_VERSION_STORE);
+					LION_VERSION_ORDERED_STORE);
 
 	/*
 	 * DESIGN.md §32: version 7 is version 6 with summaries, and only that;

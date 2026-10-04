@@ -716,8 +716,25 @@ lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 
 		if (ix->nstored > 0 && info->heaprel != NULL &&
 			lion_vac_may_write(info->index))
+		{
+			int64		sortfreed = 0;
+			int64		sorted;
+
 			storefreed = lion_store_vacuum_cleanup(info->index, info->heaprel,
 												   ix);
+
+			/*
+			 * An ordered index's windows whose rows have drifted out of the
+			 * order are sorted again (DESIGN.md §41, "The sort").
+			 */
+			sorted = lion_store_vacuum_sort(info->index, info->heaprel, ix,
+											&sortfreed);
+			storefreed += sortfreed;
+			if (sorted > 0)
+				elog(DEBUG1, "lion vacuum \"%s\": %ld store windows sorted, %ld pages freed",
+					 RelationGetRelationName(info->index), (long) sorted,
+					 (long) sortfreed);
+		}
 	}
 
 	/*

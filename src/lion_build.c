@@ -501,6 +501,10 @@ typedef struct LionBuildState
 	 */
 	LionMetaStore storerec;
 	LionStoreBuild *store;
+
+	/* the order of its windows (§41): a stored ordinal, -1 = heap order */
+	int			storeorder;
+	uint16		storeorderflags;
 } LionBuildState;
 
 static void lion_build_callback(Relation index, ItemPointer tid, Datum *values,
@@ -2341,10 +2345,16 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 */
 	memset(&bs.storerec, 0, sizeof(bs.storerec));
 	bs.storerec.store_cols = lion_store_columns(index, &bs.ix, true);
+	bs.storeorder = -1;
+	bs.storeorderflags = 0;
 	if (bs.storerec.store_cols != 0)
 	{
 		bs.storerec.store_max_len = opts ? (uint32) opts->store_max_len : 0;
 		lion_store_fill_state(index, &bs.ix, &bs.storerec, bs.buildctx);
+		/* ... and the column its windows are sorted by, if any (§41) */
+		bs.storeorder = lion_store_choose_order(index, &bs.ix,
+												&bs.storeorderflags);
+		lion_store_fill_order(index, &bs.ix, bs.storeorder, bs.buildctx);
 	}
 
 	/*
@@ -2495,6 +2505,9 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	}
 	/* ... and the window store's record, which makes it version 9 (§40). */
 	lion_meta_record_store((Page) metabuf->data, &bs.storerec);
+	/* ... and the order of its windows, which makes it version 10 (§41). */
+	lion_meta_record_store_order((Page) metabuf->data, bs.storeorder,
+								 bs.storeorderflags);
 	smgr_bulk_write(bs.bulk, LION_METAPAGE_BLKNO, metabuf, true);
 
 	smgr_bulk_finish(bs.bulk);

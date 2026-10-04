@@ -394,11 +394,18 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * version 9 only when it stores at least one column, so an index without
  * `store_values` or INCLUDE is written as before and stays readable by the
  * builds before this one; a version 9 index may hold NARROW items too.
+ *
+ * Version 10 (DESIGN.md §41) is version 9 with KEY-ORDERED WINDOWS: each
+ * window's store laid out in the order of one stored column, behind a
+ * permutation chain at one more ordinal, with a LionMetaStoreOrder after the
+ * store record naming that column.  A build writes it only when the index
+ * has an order column, so an index in heap order stays version 9.
  */
 #define LION_VERSION			6	/* the base format every index has */
 #define LION_VERSION_SUMMARIES	7	/* ... plus the summaries of §32 */
 #define LION_VERSION_NARROW		8	/* ... plus the NARROW items of §38 */
 #define LION_VERSION_STORE		9	/* ... plus the window store of §40 */
+#define LION_VERSION_ORDERED_STORE 10	/* ... in key-ordered windows (§41) */
 
 /* May an index of this meta page's version hold NARROW items (§38)? */
 #define LION_META_ALLOWS_NARROW(meta)	((meta)->version >= LION_VERSION_NARROW)
@@ -409,6 +416,9 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * the key counts.
  */
 #define LION_META_HAS_STORE(meta)	((meta)->version >= LION_VERSION_STORE)
+
+/* Are its windows key-ordered (§41)?  Only a version 10 index's are. */
+#define LION_META_HAS_ORDER(meta)	((meta)->version >= LION_VERSION_ORDERED_STORE)
 
 typedef struct LionMetaPageData
 {
@@ -601,6 +611,36 @@ StaticAssertDecl(sizeof(LionMetaStore) == 16,
 /* Does this meta page carry the record at all? */
 #define LionMetaHasStoreArea(page) \
 	(((PageHeader) (page))->pd_lower >= LION_META_STORE_END)
+
+/*
+ * THE ORDER OF A VERSION 10 INDEX (DESIGN.md §41), after the store record:
+ * the stored ordinal of the column its windows are sorted by.  Written by
+ * the build and never changed, so no WAL operation writes it but the build's
+ * image of the meta page.
+ *
+ *	order_ord		the stored ordinal (0 .. nstored - 1) of the order column
+ *	order_flags		LION_STORE_ORDER_CLUSTER when `cluster_column` chose it,
+ *					else it is the first key column
+ */
+typedef struct LionMetaStoreOrder
+{
+	int16		order_ord;
+	uint16		order_flags;
+	uint32		reserved[3];	/* zero */
+} LionMetaStoreOrder;
+
+StaticAssertDecl(sizeof(LionMetaStoreOrder) == 16,
+				 "the lion meta page's order record must not change size");
+
+#define LION_STORE_ORDER_CLUSTER	0x0001
+
+#define LION_META_ORDER_OFFSET	MAXALIGN(LION_META_STORE_END)
+#define LION_META_ORDER_END \
+	(LION_META_ORDER_OFFSET + sizeof(LionMetaStoreOrder))
+#define LionPageGetMetaStoreOrder(page) \
+	((LionMetaStoreOrder *) ((char *) (page) + LION_META_ORDER_OFFSET))
+#define LionMetaHasOrderArea(page) \
+	(((PageHeader) (page))->pd_lower >= LION_META_ORDER_END)
 
 /* The first block after the meta page; where ambuild puts the first leaf. */
 #define LION_FIRST_BLKNO		((BlockNumber) 1)
@@ -860,6 +900,7 @@ typedef struct LionOptions
 	int			summary_tids;	/* TIDs a summary bucket takes (§32) */
 	bool		store_values;	/* store the scalar key columns (§40) */
 	int			store_max_len;	/* fixed varlena slots of this size (§40) */
+	int			cluster_column; /* offset of the column name, 0 = none (§41) */
 } LionOptions;
 
 /*
@@ -1029,6 +1070,14 @@ struct LionIndexState
 	int			nstored;		/* stored columns; 0 = no store */
 	struct LionStoreCol *stored;	/* [nstored], by ordinal */
 	struct LionStoreCache *storecache;	/* the insert path's map cache */
+
+	/*
+	 * Key-ordered windows (§41): the stored ordinal of the order column, -1
+	 * for an index in heap order, and the permutation's own column (ordinal
+	 * nstored), NULL without one.
+	 */
+	int			store_order;
+	struct LionStoreCol *storeperm;
 
 	/*
 	 * The backend's pg_proc invalidation count when the recorded order's
@@ -1795,6 +1844,8 @@ extern void lion_meta_record_narrow(LionMetaPageData *meta, bool narrow);
  * 9 when it stores a column; last, after lion_meta_record_ndistinct().
  */
 extern void lion_meta_record_store(Page metapage, const LionMetaStore *store);
+extern void lion_meta_record_store_order(Page metapage, int order_ord,
+										 uint16 flags);
 
 /*
  * The distinct keys of each key column (DESIGN.md §33).  Fill in a count of

@@ -286,11 +286,13 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 	/*
 	 * Version 6 is the base format, version 7 the same with summary posting
 	 * sets (DESIGN.md §32), version 8 either with NARROW items (§38) and
-	 * version 9 any of them with a window store (§40): all four are read, and
-	 * a version 6 index is one whose columns have no summaries.  Anything older predates a format change that moved or
-	 * reinterpreted items, and anything newer is a format this build does
-	 * not know - and the hint says which of the two it is, since REINDEX
-	 * with this build is the way out of either, but the reason differs.
+	 * version 9 any of them with a window store (§40), version 10 with that
+	 * store in key-ordered windows (§41): all five are read, and a version 6
+	 * index is one whose columns have no summaries.  Anything older predates
+	 * a format change that moved or reinterpreted items, and anything newer
+	 * is a format this build does not know - and the hint says which of the
+	 * two it is, since REINDEX with this build is the way out of either, but
+	 * the reason differs.
 	 */
 	if (meta->magic != LION_MAGIC)
 		ereport(ERROR,
@@ -302,14 +304,15 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 	if (meta->version != LION_VERSION &&
 		meta->version != LION_VERSION_SUMMARIES &&
 		meta->version != LION_VERSION_NARROW &&
-		meta->version != LION_VERSION_STORE)
+		meta->version != LION_VERSION_STORE &&
+		meta->version != LION_VERSION_ORDERED_STORE)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a valid lion index",
 						RelationGetRelationName(index)),
 				 errdetail("Meta page magic %08X version %u, expected %08X version %u to %u.",
 						   meta->magic, meta->version, LION_MAGIC, LION_VERSION,
-						   LION_VERSION_STORE),
+						   LION_VERSION_ORDERED_STORE),
 				 meta->version < LION_VERSION ?
 				 errhint("REINDEX the index: its on-disk format predates this build of pg_lion.") :
 				 errhint("The index was written by a newer build of pg_lion than this one: use that build, or REINDEX the index with this one.")));
@@ -424,5 +427,27 @@ lion_meta_record_store(Page metapage, const LionMetaStore *store)
 	LionPageGetMeta(metapage)->version = LION_VERSION_STORE;
 	memcpy(LionPageGetMetaStore(metapage), store, sizeof(LionMetaStore));
 	((PageHeader) metapage)->pd_lower = LION_META_STORE_END;
+	Assert(((PageHeader) metapage)->pd_lower <= ((PageHeader) metapage)->pd_upper);
+}
+
+/*
+ * Put the order of key-ordered windows on the same image, after the store
+ * record (DESIGN.md §41): the index becomes version 10.  order_ord < 0, an
+ * index in heap order, leaves it version 9.
+ */
+void
+lion_meta_record_store_order(Page metapage, int order_ord, uint16 flags)
+{
+	LionMetaStoreOrder *mo;
+
+	if (order_ord < 0)
+		return;
+	Assert(LionMetaHasStoreArea(metapage));
+	LionPageGetMeta(metapage)->version = LION_VERSION_ORDERED_STORE;
+	mo = LionPageGetMetaStoreOrder(metapage);
+	memset(mo, 0, sizeof(LionMetaStoreOrder));
+	mo->order_ord = (int16) order_ord;
+	mo->order_flags = flags;
+	((PageHeader) metapage)->pd_lower = LION_META_ORDER_END;
 	Assert(((PageHeader) metapage)->pd_lower <= ((PageHeader) metapage)->pd_upper);
 }
