@@ -1,0 +1,133 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s2_delete_most s2_window s1_read s2_vacuum s2_window s2_detach s2_wakeup s1_check
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s2_delete_most: DELETE FROM stsr WHERE k % 4 <> 1;
+step s2_window: 
+	SELECT generation, nsorted, entries, appended
+	  FROM lion_index_store_window('stsr_i', 0);
+
+generation|nsorted|entries|appended
+----------+-------+-------+--------
+         1|   3000|   3000|       0
+(1 row)
+
+step s1_read: SELECT lion_index_stored('stsr_i', '(0,1)') AS stored; <waiting ...>
+step s2_vacuum: VACUUM stsr;
+step s2_window: 
+	SELECT generation, nsorted, entries, appended
+	  FROM lion_index_store_window('stsr_i', 0);
+
+generation|nsorted|entries|appended
+----------+-------+-------+--------
+         2|    750|    750|       0
+(1 row)
+
+step s2_detach: SELECT injection_points_detach('lion-store-gather-head');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s2_wakeup: SELECT injection_points_wakeup('lion-store-gather-head'); <waiting ...>
+step s1_read: <... completed>
+stored
+------
+{1,v1}
+(1 row)
+
+step s1_check: 
+	SELECT k, t, lion_index_stored('stsr_i', ctid) AS stored
+	  FROM stsr WHERE ctid = '(0,1)';
+	SELECT lion_index_verify('stsr_i', true);
+
+k|t |stored
+-+--+------
+1|v1|{1,v1}
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s2_wakeup: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+
+starting permutation: s2_delete_most s1_read s2_wakeup_once s2_parked s2_vacuum s2_window s2_detach s2_wakeup s1_check
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s2_delete_most: DELETE FROM stsr WHERE k % 4 <> 1;
+step s1_read: SELECT lion_index_stored('stsr_i', '(0,1)') AS stored; <waiting ...>
+step s2_wakeup_once: SELECT injection_points_wakeup('lion-store-gather-head');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s2_parked: 
+	DO $$
+	BEGIN
+		FOR i IN 1 .. 3000 LOOP
+			EXIT WHEN EXISTS (SELECT 1 FROM pg_stat_activity
+							   WHERE wait_event = 'lion-store-gather-head');
+			PERFORM pg_sleep(0.01);
+			PERFORM pg_stat_clear_snapshot();
+		END LOOP;
+	END $$;
+
+step s2_vacuum: VACUUM stsr;
+step s2_window: 
+	SELECT generation, nsorted, entries, appended
+	  FROM lion_index_store_window('stsr_i', 0);
+
+generation|nsorted|entries|appended
+----------+-------+-------+--------
+         2|    750|    750|       0
+(1 row)
+
+step s2_detach: SELECT injection_points_detach('lion-store-gather-head');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s2_wakeup: SELECT injection_points_wakeup('lion-store-gather-head'); <waiting ...>
+step s1_read: <... completed>
+stored
+------
+{1,v1}
+(1 row)
+
+step s1_check: 
+	SELECT k, t, lion_index_stored('stsr_i', ctid) AS stored
+	  FROM stsr WHERE ctid = '(0,1)';
+	SELECT lion_index_verify('stsr_i', true);
+
+k|t |stored
+-+--+------
+1|v1|{1,v1}
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s2_wakeup: <... completed>
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+

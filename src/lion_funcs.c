@@ -1,8 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * lion_funcs.c
- *		lion_index_stats(), lion_index_wal_mode(), lion_index_posting_root()
- *		and lion_index_stored().
+ *		lion_index_stats(), lion_index_wal_mode(), lion_index_posting_root(),
+ *		lion_index_stored() and lion_index_store_window().
  *
  * Part of the SQL-callable helpers of the lion index; lion_funcs.h
  * describes them and declares what their files share.
@@ -19,6 +19,7 @@ PG_FUNCTION_INFO_V1(lion_index_stats);
 PG_FUNCTION_INFO_V1(lion_index_posting_root);
 PG_FUNCTION_INFO_V1(lion_index_wal_mode);
 PG_FUNCTION_INFO_V1(lion_index_stored);
+PG_FUNCTION_INFO_V1(lion_index_store_window);
 
 /*
  * Open relid as a lion index.
@@ -863,4 +864,64 @@ lion_index_stored(PG_FUNCTION_ARGS)
 	index_close(index, AccessShareLock);
 
 	PG_RETURN_ARRAYTYPE_P(result);
+}
+
+/*
+ * lion_index_store_window(idx, win): one window of an index in key-ordered
+ * windows (DESIGN.md §41) - the stored column that orders it (NULL, and
+ * nothing else, for an index in heap order), its permutation's generation
+ * (0 before its first sort), the rows the last sort ordered and how many to
+ * a virtual page, the directory's entries, the positions with a permutation
+ * entry, the order column's slots in the append region, and the pages of
+ * the permutation and of the data chains.  NULLs past the order column for
+ * a window with no store.  A DIAGNOSTIC, for the tests.
+ */
+Datum
+lion_index_store_window(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int64		win = PG_GETARG_INT64(1);
+	Relation	index;
+	LionIndexState *ix;
+	TupleDesc	tupdesc;
+	Datum		values[10];
+	bool		nulls[10];
+	LionStoreWindowInfo wi;
+	int			i;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	if (win < 0 || win > (int64) PG_UINT32_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("window " INT64_FORMAT " is out of range", win)));
+
+	index = lion_open_index(relid, AccessShareLock);
+	ix = lion_get_index_state(index);
+	for (i = 0; i < 10; i++)
+		nulls[i] = true;
+	if (ix->store_order >= 0)
+	{
+		values[0] = Int16GetDatum(ix->stored[ix->store_order].attno);
+		nulls[0] = false;
+		lion_store_window_info(index, ix, (uint32) win, &wi);
+		if (wi.exists)
+		{
+			values[1] = Int32GetDatum(wi.gen);
+			values[2] = Int32GetDatum(wi.nsorted);
+			values[3] = Int32GetDatum(wi.vwidth);
+			values[4] = Int32GetDatum(wi.ndir);
+			values[5] = BoolGetDatum(wi.thin);
+			values[6] = Int64GetDatum(wi.entries);
+			values[7] = Int64GetDatum(wi.appended);
+			values[8] = Int32GetDatum(wi.perm_pages);
+			values[9] = Int32GetDatum(wi.pages);
+			for (i = 1; i < 10; i++)
+				nulls[i] = false;
+		}
+	}
+	index_close(index, AccessShareLock);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(tupdesc),
+													  values, nulls)));
 }

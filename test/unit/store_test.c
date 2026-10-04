@@ -570,6 +570,70 @@ test_prefer_raw(void)
 		  "1-bit codes for 9 one-byte values: DICT (2 bytes against 9)");
 }
 
+/* ----------------------------------------------------------------
+ *				Key-ordered windows (DESIGN.md section 41)
+ * ----------------------------------------------------------------
+ */
+
+static void
+test_ordered(void)
+{
+	bool		ok = true;
+	uint32		n;
+	int			g;
+
+	phase("virtual addresses and generations");
+	CHECK(LION_STORE_MAX_VPAGES == 2 * LION_BLOCKS_PER_CONTAINER,
+		  "a window has twice its heap pages in virtual pages");
+	CHECK(lion_store_vlo_page(lion_store_vlo(LION_STORE_MAX_VPAGES - 1,
+											 (1 << LION_OFFSET_BITS) - 1)) ==
+		  LION_STORE_MAX_VPAGES - 1, "the last virtual page fits 16 bits");
+	CHECK(lion_store_vlo_off(lion_store_vlo(5, 7)) == 7 &&
+		  lion_store_vlo_page(lion_store_vlo(5, 7)) == 5, "vlo round trip");
+	CHECK(lion_store_vlo_page(lion_store_append_vlo((uint16) ((3 << LION_OFFSET_BITS) | 9))) ==
+		  LION_STORE_APPEND_VPAGE + 3 &&
+		  lion_store_vlo_off(lion_store_append_vlo((uint16) ((3 << LION_OFFSET_BITS) | 9))) == 9,
+		  "heap page k is append page 64 + k, same offset");
+
+	/*
+	 * Sorted slots: n rows, V = ceil(n / 64) a page, fill virtual pages
+	 * 0 .. ceil(n / V) - 1, offsets 1 .. V, strictly ascending, all in the
+	 * sorted region.
+	 */
+	for (n = 1; n <= LION_BLOCKS_PER_CONTAINER * 291 && ok; n += (n < 200) ? 1 : 97)
+	{
+		uint32		vw = (n + LION_BLOCKS_PER_CONTAINER - 1) / LION_BLOCKS_PER_CONTAINER;
+		uint32		s;
+		uint16		prev = 0;
+
+		for (s = 0; s < n; s++)
+		{
+			uint16		v = lion_store_sorted_vlo(s, vw);
+
+			if (lion_store_vlo_page(v) >= LION_STORE_APPEND_VPAGE ||
+				lion_store_vlo_off(v) < 1 || lion_store_vlo_off(v) > (int) vw ||
+				(s > 0 && v <= prev) ||
+				(uint32) lion_store_vlo_page(v) * vw + lion_store_vlo_off(v) - 1 != s)
+				ok = false;
+			prev = v;
+		}
+	}
+	CHECK(ok, "sorted slots are ascending, inside the sorted region, and invertible");
+
+	ok = true;
+	for (g = 0; g <= LION_STORE_GEN_MAX; g++)
+	{
+		uint8		f = lion_store_make_flags(LION_STORE_F_PERM, g);
+
+		if (lion_store_flags_gen(f) != g || (f & LION_STORE_F_KINDS) != LION_STORE_F_PERM)
+			ok = false;
+		if (lion_store_next_gen(g) < 1 || lion_store_next_gen(g) > LION_STORE_GEN_MAX ||
+			lion_store_next_gen(g) == g)
+			ok = false;
+	}
+	CHECK(ok, "the generation round-trips through the flags, and the next is never 0 or the same");
+}
+
 int
 main(void)
 {
@@ -584,6 +648,7 @@ main(void)
 	test_bitmap();
 	test_vdict();
 	test_prefer_raw();
+	test_ordered();
 
 	printf("\n%ld checks, %ld failures\n", nchecks, nfail);
 	if (nfail == 0)
