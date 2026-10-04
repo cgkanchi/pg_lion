@@ -73,8 +73,16 @@ step s2_parked		{
 step s2_wakeup_once	{ SELECT injection_points_wakeup('lion-store-gather-head'); }
 step s2_detach		{ SELECT injection_points_detach('lion-store-gather-head'); }
 # (*, s1_read): the wakeup is reported as waiting, and complete once the
-# reader it woke is, as in store_vacuum_reader.spec
+# reader it woke is, as in store_vacuum_reader.spec.  It is followed by a
+# step of its own session, s2_window_after, which the tester runs only once
+# the wakeup is reported complete, so the completion is printed before
+# s1_check on every major (with an s1 step next, master printed it first
+# and 18 after).
 step s2_wakeup		{ SELECT injection_points_wakeup('lion-store-gather-head'); }
+step s2_window_after	{
+	SELECT generation, nsorted, entries, appended
+	  FROM lion_index_store_window('stsr_i', 0);
+}
 
 # the sort under the permutation's head
 permutation
@@ -85,6 +93,7 @@ permutation
 	s2_window
 	s2_detach
 	s2_wakeup(*, s1_read)
+	s2_window_after
 	s1_check
 
 # the sort between the permutation's walk and the column's
@@ -97,4 +106,5 @@ permutation
 	s2_window
 	s2_detach
 	s2_wakeup(*, s1_read)
+	s2_window_after
 	s1_check
