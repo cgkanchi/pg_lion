@@ -121,7 +121,7 @@ static bool lion_enable_ordered_store = true;
  * LionStoreScan (DESIGN.md §40, "As built: the row gather").  Off, no path of
  * it is offered: the query gets core's scans and lion's own, as before.
  */
-static bool lion_enable_store_scan = true;
+static bool lion_enable_store_scan = false;
 static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 
 /*
@@ -7164,7 +7164,7 @@ lion_ordered_init(void)
 							 "Lets LionStoreScan return the rows lion indexes select with the columns their window stores hold.",
 							 "Off, such a query reads its columns from the heap, as core's scans do.",
 							 &lion_enable_store_scan,
-							 true,
+							 false,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);

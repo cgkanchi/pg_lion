@@ -18762,7 +18762,7 @@ The name: the count engine has its `LionGather` already (the gather of a count's
 rows is a scan, as `LionCount` and `LionOrdered` are named for what they answer.
 
 **The planner** (`ls_add_paths()`, from `lion_ordered_set_rel_pathlist()`;
-`pg_lion.enable_store_scan`, on by default). For a relation `lo_rel_ok()` accepts and a query with a
+`pg_lion.enable_store_scan`, off by default while its price is settled). For a relation `lo_rel_ok()` accepts and a query with a
 WHERE clause, the columns to return are the Vars of the relation's target, through placeholders
 (`ls_target_attnos()`): plain columns only - a whole-row Var or a system column declines, which
 takes in every row mark's ctid, so the rows of an UPDATE, a DELETE, a FOR UPDATE and an

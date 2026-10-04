@@ -22,6 +22,7 @@ RESET client_min_messages;
 -- VACUUM can only set all-visible once the commit record is on disk
 SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
+SET pg_lion.enable_store_scan = on;
 -- an IN list of up to 128 values is one set tree (lion_scan_list_batch())
 SET work_mem = '4MB';
 
@@ -350,7 +351,7 @@ SELECT lsg_check('SELECT id, z FROM lsg WHERE a = 1');
 SELECT lsg_check('SELECT id FROM lsg WHERE a BETWEEN 2 AND 4 OR b = 3');
 SET pg_lion.enable_store_scan = off;
 SELECT lsg_uses('SELECT id, x FROM lsg WHERE a = 1') AS setting_off;
-RESET pg_lion.enable_store_scan;
+SET pg_lion.enable_store_scan = on;
 SELECT lsg_uses('SELECT id, x FROM lsg WHERE a = 1') AS setting_on;
 
 -- 12. The prices, with every scan on: a dense filter's rows are gathered
