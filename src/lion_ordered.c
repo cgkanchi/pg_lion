@@ -1946,8 +1946,9 @@ lo_store_find(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 				double		colpages = Max(1.0, shape.datapages * w / allw /
 										   windows);
 
-				pagesper += lion_store_window_pages(&shape, colpages, colpages,
-													0.0);
+				pagesper += lion_store_window_pages(&shape,
+													ix->stored[lfirst_int(lc2)].attno,
+													colpages, colpages, 0.0);
 			}
 			if (found_any &&
 				(pagesper > st->pagesper ||
@@ -2818,7 +2819,7 @@ ls_cost(PlannerInfo *root, RelOptInfo *rel, Path *lion, List *chosen,
 			lion_store_shape_pin(sc->index, &shape, rel->baserestrictinfo,
 								 residual);
 			reads = touched *
-				lion_store_window_pages(&shape,
+				lion_store_window_pages(&shape, sc->indexcol,
 										ls_window_chain_pages(sc->pagesper, m),
 										sc->pagesper, m);
 

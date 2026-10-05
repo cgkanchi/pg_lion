@@ -426,6 +426,10 @@ BEGIN
 		  ORDER BY c.w', tbl, idx);
 END $$;
 
+-- Every column in key order, however short its chains: this section is
+-- about the buckets, and section 10 about which columns an index orders.
+SET pg_lion.store_order_min_pages = 0;
+
 -- Eight heap pages of 75 rows a window would be too few to sort anything
 -- worth the name: a narrow row, 40,000 of them, in about eight windows.
 CREATE TABLE lion_st_ord (id int, k int, g int, tags int[], t text, p point)
@@ -643,6 +647,86 @@ SELECT lion_st_mismatch('lion_st_ord6_i', 'lion_st_ord6', 'ARRAY[k::text, t]');
 SELECT lion_index_verify('lion_st_ord6_i', true);
 
 DROP TABLE lion_st_ord, lion_st_ord2, lion_st_ord3, lion_st_ord4, lion_st_ord5, lion_st_ord6;
+RESET pg_lion.store_order_min_pages;
+
+-- ---------------------------------------------------------------------
+-- 10. Short chains in heap layout (DESIGN.md §41, "Revision 2"): an
+--     ordered index lays out in key order only the columns whose chain in
+--     a build's first window takes pg_lion.store_order_min_pages pages or
+--     more (3 by default), and the order column with them; the others keep
+--     §40's heap layout beside them.  No long column at all: heap order,
+--     version 9.  With no rows to measure, a column is long by its type.
+-- ---------------------------------------------------------------------
+
+CREATE TABLE lion_st_mix (id int, grp int, tags int[], pay text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lion_st_mix SELECT i, i % 50, ARRAY[i % 97], repeat('x', 40) || i
+  FROM generate_series(1, 30000) i;
+-- grp (one page a window) is the order column, pay (about thirty) is long,
+-- id (three) is long at the default ...
+CREATE INDEX lion_st_mix_i ON lion_st_mix USING lion (tags) INCLUDE (grp, id, pay)
+	WITH (cluster_column = grp);
+-- ... and short at 4
+SET pg_lion.store_order_min_pages = 4;
+CREATE INDEX lion_st_mix_j ON lion_st_mix USING lion (tags) INCLUDE (grp, id, pay)
+	WITH (cluster_column = grp);
+-- no column long: heap order
+SET pg_lion.store_order_min_pages = 100;
+CREATE INDEX lion_st_mix_h ON lion_st_mix USING lion (tags) INCLUDE (grp, id, pay)
+	WITH (cluster_column = grp);
+RESET pg_lion.store_order_min_pages;
+SELECT i::regclass AS index, w.order_attno, w.buckets, w.perm_pages, w.pages > 0 AS ordered,
+	   w.heap_pages
+  FROM unnest(ARRAY['lion_st_mix_i', 'lion_st_mix_j', 'lion_st_mix_h']::regclass[]) i,
+	   lion_index_store_window(i, 0) w;
+SELECT lion_st_mismatch('lion_st_mix_i', 'lion_st_mix', 'ARRAY[grp::text, id::text, pay]'),
+	   lion_st_mismatch('lion_st_mix_j', 'lion_st_mix', 'ARRAY[grp::text, id::text, pay]'),
+	   lion_st_mismatch('lion_st_mix_h', 'lion_st_mix', 'ARRAY[grp::text, id::text, pay]');
+
+-- inserts split the buckets of the columns in key order and write the others
+-- at their heap positions; VACUUM clears both
+INSERT INTO lion_st_mix SELECT i, i % 50, ARRAY[i % 97], repeat('y', 40) || i
+  FROM generate_series(30001, 40000) i;
+DELETE FROM lion_st_mix WHERE id % 7 = 0;
+VACUUM lion_st_mix;
+INSERT INTO lion_st_mix SELECT i, i % 50, ARRAY[i % 97], repeat('z', 40) || i
+  FROM generate_series(40001, 45000) i;
+SELECT * FROM lion_st_windows('lion_st_mix_j', 'lion_st_mix');
+SELECT lion_st_mismatch('lion_st_mix_i', 'lion_st_mix', 'ARRAY[grp::text, id::text, pay]'),
+	   lion_st_mismatch('lion_st_mix_j', 'lion_st_mix', 'ARRAY[grp::text, id::text, pay]'),
+	   lion_st_mismatch('lion_st_mix_h', 'lion_st_mix', 'ARRAY[grp::text, id::text, pay]');
+SELECT lion_index_verify('lion_st_mix_i', true), lion_index_verify('lion_st_mix_j', true),
+	   lion_index_verify('lion_st_mix_h', true);
+
+-- the readers of either layout, through one index
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT sum(id), count(pay), sum(grp), md5(string_agg(pay, ',' ORDER BY pay))
+  FROM lion_st_mix WHERE tags @> ARRAY[3];
+SELECT sum(id), count(*) FROM lion_st_mix WHERE tags @> ARRAY[3] AND grp = 3;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT sum(id), count(pay), sum(grp), md5(string_agg(pay, ',' ORDER BY pay))
+  FROM lion_st_mix WHERE tags @> ARRAY[3];
+SELECT sum(id), count(*) FROM lion_st_mix WHERE tags @> ARRAY[3] AND grp = 3;
+
+-- no rows to measure: by type, the text column in key order with grp, the
+-- ints in heap layout; and with no column of a long type, heap order
+TRUNCATE lion_st_mix;
+REINDEX INDEX lion_st_mix_i;
+CREATE INDEX lion_st_mix_n ON lion_st_mix USING lion (tags) INCLUDE (grp, id)
+	WITH (cluster_column = grp);
+INSERT INTO lion_st_mix SELECT i, i % 50, ARRAY[i % 97], repeat('x', 40) || i
+  FROM generate_series(1, 6000) i;
+SELECT i::regclass AS index, w.order_attno, w.perm_pages, w.pages > 0 AS ordered,
+	   w.heap_pages
+  FROM unnest(ARRAY['lion_st_mix_i', 'lion_st_mix_n']::regclass[]) i,
+	   lion_index_store_window(i, 0) w;
+SELECT lion_st_mismatch('lion_st_mix_i', 'lion_st_mix', 'ARRAY[grp::text, id::text, pay]'),
+	   lion_st_mismatch('lion_st_mix_n', 'lion_st_mix', 'ARRAY[grp::text, id::text]');
+SELECT lion_index_verify('lion_st_mix_i', true), lion_index_verify('lion_st_mix_n', true);
+
+DROP TABLE lion_st_mix;
 DROP FUNCTION lion_st_windows(regclass, regclass);
 
 DROP FUNCTION lion_st_mismatch(regclass, regclass, text);

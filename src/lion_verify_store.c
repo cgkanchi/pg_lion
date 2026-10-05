@@ -83,10 +83,13 @@ lion_verify_store_meta(LionVerifyState *vs, Page metapage)
 		mo = LionPageGetMetaStoreOrder(metapage);
 		if (mo->order_ord < 0 || mo->order_ord >= vs->ix->nstored ||
 			mo->order_ord != vs->ix->store_order ||
-			(mo->order_flags & ~LION_STORE_ORDER_CLUSTER) != 0)
-			lion_corrupt("lion index \"%s\": meta page names order column ordinal %d with flags %u, expected ordinal %d",
+			(mo->order_flags & ~LION_STORE_ORDER_CLUSTER) != 0 ||
+			mo->order_cols != lion_store_order_cols(vs->ix) ||
+			mo->reserved[0] != 0 || mo->reserved[1] != 0)
+			lion_corrupt("lion index \"%s\": meta page names order column ordinal %d with flags %u and columns 0x%x, expected ordinal %d",
 						RelationGetRelationName(vs->index), (int) mo->order_ord,
-						(unsigned) mo->order_flags, vs->ix->store_order);
+						(unsigned) mo->order_flags, mo->order_cols,
+						vs->ix->store_order);
 	}
 	else if (vs->ix->store_order >= 0)
 		lion_corrupt("lion index \"%s\": meta page version %u has no order, but the index is ordered by ordinal %d",

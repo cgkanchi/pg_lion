@@ -108,6 +108,9 @@ typedef struct LionStoreCache
 /* pg_lion.store_heap_order (DESIGN.md §41): builds write heap order. */
 bool		lion_store_heap_order = false;
 
+/* pg_lion.store_order_min_pages (§41): long chains only in key order. */
+int			lion_store_order_min_pages = 3;
+
 /* One slot's value, as the model holds it: data NULL is SQL NULL. */
 typedef struct LionStoreVal
 {
@@ -400,13 +403,15 @@ lion_store_choose_order(Relation index, LionIndexState *ix, uint16 *flags)
 
 void
 lion_store_fill_order(Relation index, LionIndexState *ix, int order,
-					  MemoryContext cxt)
+					  uint32 order_cols, MemoryContext cxt)
 {
 	LionStoreCol *pc;
 	int			i;
 
 	ix->store_order = -1;
 	ix->storeperm = NULL;
+	for (i = 0; i < ix->nstored; i++)
+		ix->stored[i].kind = LION_STORE_KIND_HEAP;
 	if (order < 0)
 		return;
 	if (order >= ix->nstored)
@@ -415,9 +420,23 @@ lion_store_fill_order(Relation index, LionIndexState *ix, int order,
 				 errmsg("index \"%s\" records stored column %d as its order, of %d stored columns",
 						RelationGetRelationName(index), order, ix->nstored),
 				 errhint("REINDEX the index.")));
+	if ((order_cols & (1U << order)) == 0 ||
+		(ix->nstored < 32 && (order_cols >> ix->nstored) != 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" records stored columns 0x%x in key order, ordered by column %d of %d",
+						RelationGetRelationName(index), order_cols, order,
+						ix->nstored),
+				 errhint("REINDEX the index.")));
 
+	/*
+	 * The columns in key order; the others, short chains, keep §40's heap
+	 * layout in an ordered index (§41, "Revision 2").  The order column is
+	 * always among the first: a bucket's split sorts its rows by it.
+	 */
 	for (i = 0; i < ix->nstored; i++)
-		ix->stored[i].kind = LION_STORE_KIND_ORDERED;
+		if ((order_cols & (1U << i)) != 0)
+			ix->stored[i].kind = LION_STORE_KIND_ORDERED;
 
 	/* the permutation: a two-byte RAW column at ordinal nstored */
 	pc = (LionStoreCol *) MemoryContextAllocZero(cxt, sizeof(LionStoreCol));
@@ -436,8 +455,44 @@ lion_store_fill_order(Relation index, LionIndexState *ix, int order,
 	ix->store_order = order;
 }
 
+uint32
+lion_store_order_cols(const LionIndexState *ix)
+{
+	uint32		cols = 0;
+	int			i;
+
+	if (ix->store_order < 0)
+		return 0;
+	for (i = 0; i < ix->nstored; i++)
+		if (ix->stored[i].kind == LION_STORE_KIND_ORDERED)
+			cols |= 1U << i;
+	return cols;
+}
+
+/*
+ * With no window to measure (an empty build, or ambuildempty), a column's
+ * chain is taken to be long when its values are: a varlena, or a fixed width
+ * of 8 bytes or more, which at the 2,000 to 3,500 rows of a full window takes
+ * 2 to 4 pages in RAW mode.  The order column goes with them when any does.
+ */
+uint32
+lion_store_order_cols_by_type(const LionIndexState *ix, int order)
+{
+	uint32		cols = 0;
+	int			i;
+
+	if (order < 0)
+		return 0;
+	for (i = 0; i < ix->nstored; i++)
+		if (lion_store_order_min_pages == 0 ||
+			ix->stored[i].typlen < 0 || ix->stored[i].typlen >= 8)
+			cols |= 1U << i;
+	return (cols != 0) ? (cols | (1U << order)) : 0;
+}
+
 int
-lion_read_meta_store_order(Relation index, const LionMetaPageData *meta)
+lion_read_meta_store_order(Relation index, const LionMetaPageData *meta,
+						   uint32 *order_cols)
 {
 	Buffer		buf;
 	Page		page;
@@ -445,6 +500,7 @@ lion_read_meta_store_order(Relation index, const LionMetaPageData *meta)
 	LionMetaStoreOrder mo;
 	LionMetaStore ms;
 
+	*order_cols = 0;
 	if (!LION_META_HAS_ORDER(meta))
 		return -1;
 
@@ -463,13 +519,15 @@ lion_read_meta_store_order(Relation index, const LionMetaPageData *meta)
 
 	if (!have || mo.order_ord < 0 ||
 		mo.order_ord >= pg_popcount32(ms.store_cols) ||
-		(mo.order_flags & ~LION_STORE_ORDER_CLUSTER) != 0)
+		(mo.order_flags & ~LION_STORE_ORDER_CLUSTER) != 0 ||
+		(mo.order_cols & (1U << mo.order_ord)) == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a valid lion index",
 						RelationGetRelationName(index)),
 				 errdetail("Its meta page is of version %u and has no sound order record.",
 						   meta->version)));
+	*order_cols = mo.order_cols;
 	return mo.order_ord;
 }
 
@@ -2320,6 +2378,7 @@ struct LionStoreBuild
 
 	/* an ordered index (§41): its comparator, and the open window's rows */
 	bool		ordered;
+	bool		decided;		/* its columns' layouts are settled */
 	SortSupportData ssup;
 	uint8		present[LION_BLOCKS_PER_CONTAINER][(MaxHeapTuplesPerPage + 7) / 8];
 
@@ -2507,6 +2566,73 @@ lion_store_build_close_sorted(LionStoreBuild *sb)
 	MemoryContextSwitchTo(old);
 }
 
+/* The pages window m's chain for col takes in heap layout. */
+static int
+lion_store_build_pages(LionStoreBuild *sb, const LionStoreCol *col,
+					   LionStoreModel *m)
+{
+	MemoryContext old = MemoryContextSwitchTo(sb->tmpcxt);
+	bool		absent[LION_STORE_MAX_VPAGES];
+	LionStoreImages li;
+	int			n;
+
+	memcpy(absent, m->absent, sizeof(absent));
+	memset(&li, 0, sizeof(li));
+	m->ckey = sb->ckey;
+	m->ord = (uint16) col->ord;
+	lion_store_layout(col, m, sb->maxpage, &sb->ds, &li);
+	n = li.n;
+	memcpy(m->absent, absent, sizeof(absent));
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(sb->tmpcxt);
+	return n;
+}
+
+/*
+ * Settle which columns of an ordered index go in key order (§41, "Revision
+ * 2: short chains in heap order"), from the first window's heap-layout
+ * chains: a column whose chain takes fewer than
+ * pg_lion.store_order_min_pages pages keeps heap layout, since a gather of a
+ * window reads at least the permutation's page and a data page in key order
+ * and no fewer than the whole chain in heap order.  None long: the index is
+ * built in heap order (version 9).  Every later window, and every insert,
+ * keeps the choice; it is the meta page's.
+ */
+static void
+lion_store_build_decide(LionStoreBuild *sb)
+{
+	LionIndexState *ix = sb->ix;
+	uint32		cols = 0;
+	int			ord;
+
+	if (!sb->ordered || sb->decided)
+		return;
+	sb->decided = true;
+	if (sb->open)
+	{
+		for (ord = 0; ord < ix->nstored; ord++)
+			if (lion_store_order_min_pages == 0 ||
+				lion_store_build_pages(sb, &ix->stored[ord], &sb->models[ord]) >=
+				lion_store_order_min_pages)
+				cols |= 1U << ord;
+		if (cols != 0)
+			cols |= 1U << ix->store_order;
+	}
+	else
+		cols = lion_store_order_cols_by_type(ix, ix->store_order);
+
+	if (cols == 0)
+	{
+		ix->store_order = -1;
+		ix->storeperm = NULL;
+		sb->ordered = false;
+		sb->stride = lion_store_stride(ix);
+	}
+	for (ord = 0; ord < ix->nstored; ord++)
+		ix->stored[ord].kind = (cols & (1U << ord)) != 0 ?
+			LION_STORE_KIND_ORDERED : LION_STORE_KIND_HEAP;
+}
+
 static void
 lion_store_build_close_window(LionStoreBuild *sb)
 {
@@ -2514,6 +2640,7 @@ lion_store_build_close_window(LionStoreBuild *sb)
 
 	if (!sb->open)
 		return;
+	lion_store_build_decide(sb);
 	if (sb->ordered)
 		lion_store_build_close_sorted(sb);
 	else
@@ -2602,6 +2729,7 @@ lion_store_build_finish(LionStoreBuild *sb, LionMetaStore *store)
 	uint64		innerno;
 
 	lion_store_build_close_window(sb);
+	lion_store_build_decide(sb);	/* no rows: by the columns' types */
 	lion_store_build_flush_leaf(sb);
 
 	/* the inner pages, then the root, which is always written */
@@ -6666,6 +6794,18 @@ lion_store_shape(LionIndexState *ix, IndexOptInfo *idx, double storepages,
 								  (double) LION_PAGE_CAPACITY));
 	sh->datapages = Max(storepages - sh->permpages * windows, 0.0);
 	sh->ordercol = ix->stored[ix->store_order].attno;
+	{
+		int			i;
+		int			n = 0;
+
+		for (i = 0; i < ix->nstored; i++)
+			if (ix->stored[i].kind == LION_STORE_KIND_ORDERED)
+			{
+				sh->keyordered |= 1U << (ix->stored[i].attno - 1);
+				n++;
+			}
+		sh->fracordered = (double) n / (double) ix->nstored;
+	}
 }
 
 void
@@ -6739,14 +6879,28 @@ lion_store_shape_pin(IndexOptInfo *idx, LionStoreShape *sh, List *clauses,
 }
 
 double
-lion_store_window_pages(const LionStoreShape *sh, double heapreads,
-						double colpages, double members)
+lion_store_window_pages(const LionStoreShape *sh, int indexcol,
+						double heapreads, double colpages, double members)
 {
 	double		nvals = sh->nvals;
 	double		reads = heapreads;
 
 	if (!sh->ordered)
 		return heapreads;
+	if (indexcol <= 0)
+	{
+		/* a column not known: the average of the stored columns */
+		LionStoreShape one = *sh;
+		int			i;
+
+		for (i = 0; i < 32 && (one.keyordered & (1U << i)) == 0; i++)
+			;
+		return sh->fracordered *
+			lion_store_window_pages(&one, i + 1, heapreads, colpages, members) +
+			(1.0 - sh->fracordered) * heapreads;
+	}
+	if (indexcol > 32 || (sh->keyordered & (1U << (indexcol - 1))) == 0)
+		return heapreads;		/* heap layout in an ordered index */
 	if (nvals >= 1.0 && members >= 1.0)
 	{
 		double		perslot = Max(colpages, 1.0) / Max(sh->rowsper, 1.0);

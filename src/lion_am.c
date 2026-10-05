@@ -273,6 +273,21 @@ _PG_init(void)
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
 
+	/*
+	 * DESIGN.md §41, "Revision 2": a column whose chain is this short in heap
+	 * order gains nothing from key order (a gather of it reads a page a
+	 * window either way, and the permutation's on top), so an ordered index
+	 * keeps it in heap layout.  A developer setting; 0 orders every column.
+	 */
+	DefineCustomIntVariable("pg_lion.store_order_min_pages",
+							"The heap-order pages a window's chain of a stored column must take for an ordered index to lay it out in key order.",
+							"Measured on a build's first window; 0 lays every stored column out in key order.",
+							&lion_store_order_min_pages,
+							3, 0, LION_BLOCKS_PER_CONTAINER * 2,
+							PGC_USERSET,
+							GUC_NOT_IN_SAMPLE,
+							NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("pg_lion.enable_count_pushdown",
 							 "Answer count(*) over lion indexes from the index and the visibility map.",
 							 NULL,
@@ -1105,6 +1120,7 @@ lionbuildempty(Relation index)
 	LionIndexState ix;
 	int			order = -1;
 	uint16		orderflags = 0;
+	uint32		ordercols = 0;
 
 	inline_limit = opts ? (uint32) opts->inline_limit : LION_DEFAULT_INLINE_LIMIT;
 	wal_mode = lion_wal_mode_for_build(index);
@@ -1154,6 +1170,9 @@ lionbuildempty(Relation index)
 		/* ... in the order a build would choose (§41) */
 		lion_store_fill_state(index, &ix, &store, CurrentMemoryContext);
 		order = lion_store_choose_order(index, &ix, &orderflags);
+		ordercols = lion_store_order_cols_by_type(&ix, order);
+		if (ordercols == 0)
+			order = -1;
 	}
 
 	/* Meta page, pointing at the one leaf that is also the root (§21). */
@@ -1170,7 +1189,8 @@ lionbuildempty(Relation index)
 	LionPageGetMeta(BufferGetPage(buf))->summary_cols = meta.summary_cols;
 	LionPageGetMeta(BufferGetPage(buf))->summary_tids = meta.summary_tids;
 	lion_meta_record_store(BufferGetPage(buf), &store);
-	lion_meta_record_store_order(BufferGetPage(buf), order, orderflags);
+	lion_meta_record_store_order(BufferGetPage(buf), order, orderflags,
+								 ordercols);
 	MarkBufferDirty(buf);
 	log_newpage_buffer(buf, true);
 	END_CRIT_SECTION();

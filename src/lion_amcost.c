@@ -1402,7 +1402,7 @@ lion_ios_gather_cost(RelOptInfo *baserel, double tuples, double passes,
 	windows = scattered + corr * corr * (packed - scattered);
 	windows = Min(passes * Max(windows, 1.0), Max(tuples, 1.0));
 	colpages = Max(1.0, sh->datapages / (W * (double) nstored));
-	reads = lion_store_window_pages(sh, colpages, colpages, tuples / windows);
+	reads = lion_store_window_pages(sh, 0, colpages, colpages, tuples / windows);
 
 	return tuples * (double) nret * LION_STORE_VALUE_COST +
 		windows * (double) nret *

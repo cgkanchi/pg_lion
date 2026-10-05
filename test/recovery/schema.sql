@@ -92,10 +92,12 @@ CREATE INDEX lion_rec_arr ON lion_rec USING lion (arr) WITH (inline_limit = 64, 
  * (about one value a row), a nullable int and a bool.  lion_rec_stb, built
  * after the load, stores a distinct int8 a row and citext in capped slots.
  * lion_rec_st and lion_rec_sto have an order column (§41, cluster_column):
- * lion_rec_st its key, built before the load, so its windows start with no
- * permutation and VACUUM sorts them; lion_rec_sto an INCLUDE column, built
- * after it, so the build sorts them.  lion_rec_stb names none, and stays in
- * the heap order of version 9.
+ * lion_rec_st its key, built before the load, so every window starts as one
+ * bucket that inserts split, and its columns' layouts are chosen by type -
+ * the text column in key order with the key, the narrow ones in heap layout;
+ * lion_rec_sto an INCLUDE column, built after it with every column in key
+ * order, so the build sorts the windows into buckets and inserts split them.
+ * lion_rec_stb names none, and stays in the heap order of version 9.
  */
 CREATE INDEX lion_rec_st  ON lion_rec USING lion (k4) INCLUDE (t, nn, b)
 	WITH (store_values = true, cluster_column = k4);
@@ -109,8 +111,10 @@ CREATE INDEX lion_rec_nn  ON lion_rec USING lion (nn) WITH (buckets = 8);
 CREATE INDEX lion_rec_tsv ON lion_rec USING lion (tsv);
 CREATE INDEX lion_rec_stb ON lion_rec USING lion (nn) INCLUDE (id, ct)
 	WITH (store_max_len = 16);
+SET pg_lion.store_order_min_pages = 0;
 CREATE INDEX lion_rec_sto ON lion_rec USING lion (nn) INCLUDE (id, t)
 	WITH (cluster_column = t);
+RESET pg_lion.store_order_min_pages;
 
 /*
  * A MULTICOLUMN index (DESIGN.md §24), so that every crash round exercises
