@@ -403,23 +403,23 @@ DROP TABLE lion_st_vac, lion_st_vac_dead;
 -- ---------------------------------------------------------------------
 -- 9. Key-ordered windows (DESIGN.md §41): an index with an order column,
 --    the stored column cluster_column names, lays each window out in that
---    column's order behind a permutation.  A build sorts every window; an
---    insert goes to the window's append region; VACUUM clears dead rows
---    from both and sorts a window again once a quarter of its rows are
---    outside the order.  Sections 2 to 8 build the heap order of §40
---    (format version 9), as every index without cluster_column is.
+--    column's order behind a permutation, in buckets of the column's value
+--    ranges.  A build sorts every window into buckets; an insert takes a
+--    slot in the bucket of its value, and a full bucket splits; VACUUM
+--    clears dead rows and sorts nothing.  Sections 2 to 8 build the heap
+--    order of §40 (format version 9), as every index without
+--    cluster_column is.
 -- ---------------------------------------------------------------------
 
 -- A window's state beside the rows the heap has in it.
 CREATE FUNCTION lion_st_windows(idx regclass, tbl regclass)
-RETURNS TABLE (win int, nrows bigint, generation int4, sorted bigint,
-			   entries bigint, appended bigint, per_page int4, directory bool,
-			   perm_pages int4)
+RETURNS TABLE (win int, nrows bigint, generation int8, buckets int4, slots bigint,
+			   entries bigint, orphaned bigint, directory bool, perm_pages int4)
 LANGUAGE plpgsql AS $$
 BEGIN
 	RETURN QUERY EXECUTE format(
-		'SELECT c.w, c.n, s.generation, s.nsorted::bigint, s.entries, s.appended,
-				s.per_page, s.directory > 0, s.perm_pages
+		'SELECT c.w, c.n, s.generation, s.buckets, s.slots, s.entries, s.orphaned,
+				s.directory > 0, s.perm_pages
 		   FROM (SELECT floor((ctid::text::point)[0] / 64)::int AS w, count(*) AS n
 				   FROM %s GROUP BY 1) c,
 				lion_index_store_window(%L, c.w) s
@@ -427,7 +427,7 @@ BEGIN
 END $$;
 
 -- Eight heap pages of 75 rows a window would be too few to sort anything
--- worth the name: a narrow row, 40,000 of them, in about four windows.
+-- worth the name: a narrow row, 40,000 of them, in about eight windows.
 CREATE TABLE lion_st_ord (id int, k int, g int, tags int[], t text, p point)
 	WITH (autovacuum_enabled = off, fillfactor = 90);
 INSERT INTO lion_st_ord
@@ -462,7 +462,8 @@ CREATE INDEX ON lion_st_ord USING lion (k) INCLUDE (g) WITH (cluster_column = k)
 CREATE INDEX ON lion_st_ord USING lion (k) INCLUDE (p) WITH (cluster_column = p);
 CREATE INDEX ON lion_st_ord USING lion (k, tags) WITH (store_values = on, cluster_column = tags);
 
--- every window sorted by the build, all its rows in the sorted region
+-- every window sorted by the build into 64 buckets, every row with an entry
+-- and every slot handed out
 SELECT * FROM lion_st_windows('lion_st_ord_k', 'lion_st_ord');
 SELECT * FROM lion_st_windows('lion_st_ord_tags', 'lion_st_ord');
 SELECT lion_st_mismatch('lion_st_ord_k', 'lion_st_ord', 'ARRAY[k::text, g::text, t]');
@@ -489,8 +490,8 @@ SELECT g, count(*), min(t) FROM lion_st_ord WHERE tags @> ARRAY[3] AND g < 4 GRO
 SELECT count(*), md5(string_agg(k || ',' || g || ',' || t, ';' ORDER BY k, g, t))
   FROM lion_st_ord WHERE k IN (2, 5);
 
--- inserts: into the last window's append region, and windows of their own
--- with no permutation yet, all of whose rows are appended
+-- inserts: into the last window's buckets, which split as they fill, and
+-- windows of their own, which start with one bucket and split into more
 INSERT INTO lion_st_ord
 SELECT i, i % 7, (i * 7919) % 101, ARRAY[i % 5, 10 + i % 11], 'w' || (i % 333),
 	   point(i, i)
@@ -500,9 +501,8 @@ SELECT lion_st_mismatch('lion_st_ord_k', 'lion_st_ord', 'ARRAY[k::text, g::text,
 SELECT lion_st_mismatch('lion_st_ord_tags', 'lion_st_ord', 'ARRAY[g::text, t]');
 SELECT lion_index_verify('lion_st_ord_k', true), lion_index_verify('lion_st_ord_tags', true);
 
--- VACUUM: a tenth of the sorted rows dead, cleared from the data chains and
--- the permutation, which leaves the first windows alone; the windows of
--- appended rows are sorted
+-- VACUUM: a tenth of the rows dead, cleared from the data chains and the
+-- permutation; nothing is sorted again, and no generation moves
 DELETE FROM lion_st_ord WHERE id % 10 = 3 AND id <= 40000;
 VACUUM lion_st_ord;
 SELECT * FROM lion_st_windows('lion_st_ord_k', 'lion_st_ord');
@@ -510,8 +510,7 @@ SELECT lion_st_mismatch('lion_st_ord_k', 'lion_st_ord', 'ARRAY[k::text, g::text,
 SELECT lion_st_mismatch('lion_st_ord_tags', 'lion_st_ord', 'ARRAY[g::text, t]');
 SELECT lion_index_verify('lion_st_ord_k', true), lion_index_verify('lion_st_ord_tags', true);
 
--- the freed positions taken by new rows, which go to the append region:
--- the permutation no longer names them
+-- the freed positions taken by new rows, each in the bucket of its value
 INSERT INTO lion_st_ord
 SELECT i, i % 7, (i * 7919) % 101, ARRAY[i % 5, 10 + i % 11], 'x' || (i % 333),
 	   point(i, i)
@@ -522,19 +521,15 @@ SELECT lion_st_mismatch('lion_st_ord_k', 'lion_st_ord', 'ARRAY[k::text, g::text,
 SELECT lion_st_mismatch('lion_st_ord_tags', 'lion_st_ord', 'ARRAY[g::text, t]');
 SELECT lion_index_verify('lion_st_ord_k', true), lion_index_verify('lion_st_ord_tags', true);
 
--- a third of the first window dead: sorted again, a generation on, with
--- only its live rows - the positions the heap no longer uses take no slot -
--- and rows inserted at those positions afterwards are appended
-DELETE FROM lion_st_ord WHERE id % 3 = 1 AND (ctid::text::point)[0] < 64;
+-- two thirds of the first window dead and as many rows again: each bucket
+-- hands out more of its slots, and moves no row
+DELETE FROM lion_st_ord WHERE id % 3 <> 0 AND (ctid::text::point)[0] < 64;
 VACUUM lion_st_ord;
-SELECT * FROM lion_st_windows('lion_st_ord_k', 'lion_st_ord');
-SELECT lion_st_mismatch('lion_st_ord_k', 'lion_st_ord', 'ARRAY[k::text, g::text, t]');
-SELECT lion_st_mismatch('lion_st_ord_tags', 'lion_st_ord', 'ARRAY[g::text, t]');
-SELECT lion_index_verify('lion_st_ord_k', true), lion_index_verify('lion_st_ord_tags', true);
 INSERT INTO lion_st_ord
 SELECT i, i % 7, (i * 7919) % 101, ARRAY[i % 5, 10 + i % 11], 'y' || (i % 333),
 	   point(i, i)
   FROM generate_series(54001, 60000) i;
+SELECT * FROM lion_st_windows('lion_st_ord_k', 'lion_st_ord') WHERE win = 0;
 SELECT lion_st_mismatch('lion_st_ord_k', 'lion_st_ord', 'ARRAY[k::text, g::text, t]');
 SELECT lion_st_mismatch('lion_st_ord_tags', 'lion_st_ord', 'ARRAY[g::text, t]');
 SELECT lion_st_mismatch('lion_st_ord_kt', 'lion_st_ord', 'ARRAY[k::text, g::text, t]');
@@ -554,18 +549,17 @@ SELECT (lion_index_store_window('lion_st_ord_k', 3)).*;
 SELECT lion_st_mismatch('lion_st_ord_k', 'lion_st_ord', 'ARRAY[k::text, g::text, t]');
 SELECT lion_index_verify('lion_st_ord_k', true), lion_index_verify('lion_st_ord_tags', true);
 
--- an index built empty, and every row inserted: no window has a
--- permutation until VACUUM sorts it
+-- an index built empty, and every row inserted: each window starts with
+-- one bucket and splits into more; VACUUM has nothing to do
 CREATE TABLE lion_st_ord2 (id int, k int, t text) WITH (autovacuum_enabled = off);
 CREATE INDEX lion_st_ord2_i ON lion_st_ord2 USING lion (k) INCLUDE (t, id)
 	WITH (store_values = on, cluster_column = k);
 INSERT INTO lion_st_ord2 SELECT i, i % 13, 'z' || (i % 77) FROM generate_series(1, 20000) i;
 SELECT * FROM lion_st_windows('lion_st_ord2_i', 'lion_st_ord2');
+SELECT lion_st_mismatch('lion_st_ord2_i', 'lion_st_ord2', 'ARRAY[k::text, t, id::text]');
 SELECT lion_index_verify('lion_st_ord2_i', true);
 VACUUM lion_st_ord2;
 SELECT * FROM lion_st_windows('lion_st_ord2_i', 'lion_st_ord2');
-SELECT lion_st_mismatch('lion_st_ord2_i', 'lion_st_ord2', 'ARRAY[k::text, t, id::text]');
-SELECT lion_index_verify('lion_st_ord2_i', true);
 -- REINDEX writes it again, every window sorted at build
 INSERT INTO lion_st_ord2 SELECT i, i % 13, 'z' || (i % 77) FROM generate_series(20001, 21000) i;
 REINDEX INDEX lion_st_ord2_i;
@@ -573,7 +567,82 @@ SELECT * FROM lion_st_windows('lion_st_ord2_i', 'lion_st_ord2');
 SELECT lion_st_mismatch('lion_st_ord2_i', 'lion_st_ord2', 'ARRAY[k::text, t, id::text]');
 SELECT lion_index_verify('lion_st_ord2_i', true);
 
-DROP TABLE lion_st_ord, lion_st_ord2;
+-- the order column rising with the heap: a row past every row of its bucket
+-- opens a new bucket, and no row moves - the generation stays where it was
+CREATE TABLE lion_st_ord3 (id int, k int, t text) WITH (autovacuum_enabled = off);
+CREATE INDEX lion_st_ord3_i ON lion_st_ord3 USING lion (k) INCLUDE (t)
+	WITH (store_values = on, cluster_column = k);
+INSERT INTO lion_st_ord3 SELECT i, i, 'r' || i FROM generate_series(1, 12000) i;
+SELECT * FROM lion_st_windows('lion_st_ord3_i', 'lion_st_ord3');
+SELECT lion_st_mismatch('lion_st_ord3_i', 'lion_st_ord3', 'ARRAY[k::text, t]');
+SELECT lion_index_verify('lion_st_ord3_i', true);
+
+-- values too wide for a bucket's slots to fit a page: a bucket splits when
+-- its values no longer fit, before it has handed out every slot
+CREATE TABLE lion_st_ord4 (id int, k int, t text) WITH (autovacuum_enabled = off);
+CREATE INDEX lion_st_ord4_i ON lion_st_ord4 USING lion (k) INCLUDE (t)
+	WITH (store_values = on, cluster_column = k);
+INSERT INTO lion_st_ord4 SELECT i, i % 5, repeat(chr(65 + i % 26), 300) || i
+  FROM generate_series(1, 3000) i;
+SELECT * FROM lion_st_windows('lion_st_ord4_i', 'lion_st_ord4');
+SELECT lion_st_mismatch('lion_st_ord4_i', 'lion_st_ord4', 'ARRAY[k::text, t]');
+SELECT lion_index_verify('lion_st_ord4_i', true);
+
+-- order values too long for the window header to keep many fences: the
+-- buckets stop splitting, and the rows they have no room for keep no values
+-- in the store - each such row has no entry, and readers take it from the
+-- heap
+CREATE TABLE lion_st_ord5 (id int, k text, t text) WITH (autovacuum_enabled = off);
+CREATE INDEX lion_st_ord5_i ON lion_st_ord5 USING lion (k) INCLUDE (t)
+	WITH (store_values = on, cluster_column = k);
+INSERT INTO lion_st_ord5 SELECT i, lpad((i * 7919 % 4000)::text, 240, '0'), 'u' || i
+  FROM generate_series(1, 4000) i;
+SELECT * FROM lion_st_windows('lion_st_ord5_i', 'lion_st_ord5');
+SELECT count(*) FILTER (WHERE s = ARRAY[NULL, NULL]::text[]) AS left_to_heap,
+	   count(*) FILTER (WHERE s <> ARRAY[NULL, NULL]::text[] AND s IS DISTINCT FROM ARRAY[k, t])
+		 AS mismatched
+  FROM (SELECT k, t, lion_index_stored('lion_st_ord5_i', ctid) s FROM lion_st_ord5) q;
+SELECT lion_index_verify('lion_st_ord5_i', true);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*), md5(string_agg(t, ',' ORDER BY t)) FROM lion_st_ord5 WHERE k > '0';
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT count(*), md5(string_agg(t, ',' ORDER BY t)) FROM lion_st_ord5 WHERE k > '0';
+
+-- a window whose rows are deleted and replaced again and again: its
+-- buckets hand out every slot they have, and then, holding few live rows,
+-- are compacted into a new bucket each rather than split in two
+CREATE TABLE lion_st_ord6 (id int, k int, t text) WITH (autovacuum_enabled = off);
+INSERT INTO lion_st_ord6 SELECT i, i % 101, 'c' || i FROM generate_series(1, 4000) i;
+CREATE INDEX lion_st_ord6_i ON lion_st_ord6 USING lion (k) INCLUDE (t)
+	WITH (store_values = on, cluster_column = k);
+DELETE FROM lion_st_ord6 WHERE id % 4 <> 0;
+VACUUM lion_st_ord6;
+INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_series(4001, 7000) i;
+DELETE FROM lion_st_ord6 WHERE id % 4 <> 0;
+VACUUM lion_st_ord6;
+INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_series(7001, 10000) i;
+DELETE FROM lion_st_ord6 WHERE id % 4 <> 0;
+VACUUM lion_st_ord6;
+INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_series(10001, 13000) i;
+DELETE FROM lion_st_ord6 WHERE id % 4 <> 0;
+VACUUM lion_st_ord6;
+INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_series(13001, 16000) i;
+DELETE FROM lion_st_ord6 WHERE id % 4 <> 0;
+VACUUM lion_st_ord6;
+INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_series(16001, 19000) i;
+DELETE FROM lion_st_ord6 WHERE id % 4 <> 0;
+VACUUM lion_st_ord6;
+INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_series(19001, 22000) i;
+DELETE FROM lion_st_ord6 WHERE id % 4 <> 0;
+VACUUM lion_st_ord6;
+INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_series(22001, 25000) i;
+SELECT * FROM lion_st_windows('lion_st_ord6_i', 'lion_st_ord6');
+SELECT lion_st_mismatch('lion_st_ord6_i', 'lion_st_ord6', 'ARRAY[k::text, t]');
+SELECT lion_index_verify('lion_st_ord6_i', true);
+
+DROP TABLE lion_st_ord, lion_st_ord2, lion_st_ord3, lion_st_ord4, lion_st_ord5, lion_st_ord6;
 DROP FUNCTION lion_st_windows(regclass, regclass);
 
 DROP FUNCTION lion_st_mismatch(regclass, regclass, text);

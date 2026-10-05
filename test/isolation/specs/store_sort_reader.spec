@@ -1,1 +1,0 @@
-../store_sort_reader.spec

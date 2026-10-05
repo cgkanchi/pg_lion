@@ -830,29 +830,29 @@ DROP TABLE lion_st_vac, lion_st_vac_dead;
 -- ---------------------------------------------------------------------
 -- 9. Key-ordered windows (DESIGN.md §41): an index with an order column,
 --    the stored column cluster_column names, lays each window out in that
---    column's order behind a permutation.  A build sorts every window; an
---    insert goes to the window's append region; VACUUM clears dead rows
---    from both and sorts a window again once a quarter of its rows are
---    outside the order.  Sections 2 to 8 build the heap order of §40
---    (format version 9), as every index without cluster_column is.
+--    column's order behind a permutation, in buckets of the column's value
+--    ranges.  A build sorts every window into buckets; an insert takes a
+--    slot in the bucket of its value, and a full bucket splits; VACUUM
+--    clears dead rows and sorts nothing.  Sections 2 to 8 build the heap
+--    order of §40 (format version 9), as every index without
+--    cluster_column is.
 -- ---------------------------------------------------------------------
 -- A window's state beside the rows the heap has in it.
 CREATE FUNCTION lion_st_windows(idx regclass, tbl regclass)
-RETURNS TABLE (win int, nrows bigint, generation int4, sorted bigint,
-			   entries bigint, appended bigint, per_page int4, directory bool,
-			   perm_pages int4)
+RETURNS TABLE (win int, nrows bigint, generation int8, buckets int4, slots bigint,
+			   entries bigint, orphaned bigint, directory bool, perm_pages int4)
 LANGUAGE plpgsql AS $$
 BEGIN
 	RETURN QUERY EXECUTE format(
-		'SELECT c.w, c.n, s.generation, s.nsorted::bigint, s.entries, s.appended,
-				s.per_page, s.directory > 0, s.perm_pages
+		'SELECT c.w, c.n, s.generation, s.buckets, s.slots, s.entries, s.orphaned,
+				s.directory > 0, s.perm_pages
 		   FROM (SELECT floor((ctid::text::point)[0] / 64)::int AS w, count(*) AS n
 				   FROM %s GROUP BY 1) c,
 				lion_index_store_window(%L, c.w) s
 		  ORDER BY c.w', tbl, idx);
 END $$;
 -- Eight heap pages of 75 rows a window would be too few to sort anything
--- worth the name: a narrow row, 40,000 of them, in about four windows.
+-- worth the name: a narrow row, 40,000 of them, in about eight windows.
 CREATE TABLE lion_st_ord (id int, k int, g int, tags int[], t text, p point)
 	WITH (autovacuum_enabled = off, fillfactor = 90);
 INSERT INTO lion_st_ord
@@ -898,31 +898,32 @@ ERROR:  cluster_column "p" of lion index "lion_st_ord_k_p_idx" has type point, w
 CREATE INDEX ON lion_st_ord USING lion (k, tags) WITH (store_values = on, cluster_column = tags);
 NOTICE:  key column 2 of lion index "lion_st_ord_k_tags_idx" is not stored
 ERROR:  cluster_column "tags" of lion index "lion_st_ord_k_tags_idx" is not a stored column
--- every window sorted by the build, all its rows in the sorted region
+-- every window sorted by the build into 64 buckets, every row with an entry
+-- and every slot handed out
 SELECT * FROM lion_st_windows('lion_st_ord_k', 'lion_st_ord');
- win | nrows | generation | sorted | entries | appended | per_page | directory | perm_pages 
------+-------+------------+--------+---------+----------+----------+-----------+------------
-   0 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   1 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   2 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   3 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   4 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   5 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   6 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   7 |  4608 |          1 |   4608 |    4608 |        0 |       72 | t         |          2
+ win | nrows | generation | buckets | slots | entries | orphaned | directory | perm_pages 
+-----+-------+------------+---------+-------+---------+----------+-----------+------------
+   0 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   1 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   2 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   3 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   4 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   5 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   6 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   7 |  4608 |          1 |      64 |  4608 |    4608 |        0 | t         |          2
 (8 rows)
 
 SELECT * FROM lion_st_windows('lion_st_ord_tags', 'lion_st_ord');
- win | nrows | generation | sorted | entries | appended | per_page | directory | perm_pages 
------+-------+------------+--------+---------+----------+----------+-----------+------------
-   0 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   1 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   2 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   3 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   4 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   5 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   6 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   7 |  4608 |          1 |   4608 |    4608 |        0 |       72 | t         |          2
+ win | nrows | generation | buckets | slots | entries | orphaned | directory | perm_pages 
+-----+-------+------------+---------+-------+---------+----------+-----------+------------
+   0 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   1 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   2 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   3 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   4 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   5 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   6 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   7 |  4608 |          1 |      64 |  4608 |    4608 |        0 | t         |          2
 (8 rows)
 
 SELECT lion_st_mismatch('lion_st_ord_k', 'lion_st_ord', 'ARRAY[k::text, g::text, t]');
@@ -1010,26 +1011,26 @@ SELECT count(*), md5(string_agg(k || ',' || g || ',' || t, ';' ORDER BY k, g, t)
  11429 | f5d60d59aa03104eeda6bda01b4e13b5
 (1 row)
 
--- inserts: into the last window's append region, and windows of their own
--- with no permutation yet, all of whose rows are appended
+-- inserts: into the last window's buckets, which split as they fill, and
+-- windows of their own, which start with one bucket and split into more
 INSERT INTO lion_st_ord
 SELECT i, i % 7, (i * 7919) % 101, ARRAY[i % 5, 10 + i % 11], 'w' || (i % 333),
 	   point(i, i)
   FROM generate_series(40001, 52000) i;
 SELECT * FROM lion_st_windows('lion_st_ord_k', 'lion_st_ord');
- win | nrows | generation | sorted | entries | appended | per_page | directory | perm_pages 
------+-------+------------+--------+---------+----------+----------+-----------+------------
-   0 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   1 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   2 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   3 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   4 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   5 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   6 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   7 |  5056 |          1 |   4608 |    4608 |      448 |       72 | t         |          2
-   8 |  5056 |          0 |      0 |       0 |     5056 |        0 | f         |          0
-   9 |  5056 |          0 |      0 |       0 |     5056 |        0 | f         |          0
-  10 |  1440 |          0 |      0 |       0 |     1440 |        0 | f         |          0
+ win | nrows | generation | buckets | slots | entries | orphaned | directory | perm_pages 
+-----+-------+------------+---------+-------+---------+----------+-----------+------------
+   0 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   1 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   2 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   3 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   4 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   5 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   6 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   7 |  5056 |          1 |      64 |  5056 |    5056 |        0 | t         |          2
+   8 |  5056 |         26 |      28 |  5056 |    5056 |        0 | t         |          3
+   9 |  5056 |         26 |      28 |  5056 |    5056 |        0 | t         |          3
+  10 |  1440 |          7 |       8 |  1440 |    1440 |        0 | f         |          1
 (11 rows)
 
 SELECT lion_st_mismatch('lion_st_ord_k', 'lion_st_ord', 'ARRAY[k::text, g::text, t]');
@@ -1050,25 +1051,24 @@ SELECT lion_index_verify('lion_st_ord_k', true), lion_index_verify('lion_st_ord_
                    | 
 (1 row)
 
--- VACUUM: a tenth of the sorted rows dead, cleared from the data chains and
--- the permutation, which leaves the first windows alone; the windows of
--- appended rows are sorted
+-- VACUUM: a tenth of the rows dead, cleared from the data chains and the
+-- permutation; nothing is sorted again, and no generation moves
 DELETE FROM lion_st_ord WHERE id % 10 = 3 AND id <= 40000;
 VACUUM lion_st_ord;
 SELECT * FROM lion_st_windows('lion_st_ord_k', 'lion_st_ord');
- win | nrows | generation | sorted | entries | appended | per_page | directory | perm_pages 
------+-------+------------+--------+---------+----------+----------+-----------+------------
-   0 |  4550 |          1 |   5056 |    4550 |        0 |       79 | t         |          2
-   1 |  4551 |          1 |   5056 |    4551 |        0 |       79 | t         |          2
-   2 |  4550 |          1 |   5056 |    4550 |        0 |       79 | t         |          2
-   3 |  4550 |          1 |   5056 |    4550 |        0 |       79 | t         |          2
-   4 |  4551 |          1 |   5056 |    4551 |        0 |       79 | t         |          2
-   5 |  4550 |          1 |   5056 |    4550 |        0 |       79 | t         |          2
-   6 |  4551 |          1 |   5056 |    4551 |        0 |       79 | t         |          2
-   7 |  4595 |          1 |   4608 |    4147 |      448 |       72 | t         |          2
-   8 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   9 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-  10 |  1440 |          1 |   1440 |    1440 |        0 |       23 | t         |          1
+ win | nrows | generation | buckets | slots | entries | orphaned | directory | perm_pages 
+-----+-------+------------+---------+-------+---------+----------+-----------+------------
+   0 |  4550 |          1 |      64 |  5056 |    4550 |        0 | t         |          2
+   1 |  4551 |          1 |      64 |  5056 |    4551 |        0 | t         |          2
+   2 |  4550 |          1 |      64 |  5056 |    4550 |        0 | t         |          2
+   3 |  4550 |          1 |      64 |  5056 |    4550 |        0 | t         |          2
+   4 |  4551 |          1 |      64 |  5056 |    4551 |        0 | t         |          2
+   5 |  4550 |          1 |      64 |  5056 |    4550 |        0 | t         |          2
+   6 |  4551 |          1 |      64 |  5056 |    4551 |        0 | t         |          2
+   7 |  4595 |          1 |      64 |  5056 |    4595 |        0 | t         |          2
+   8 |  5056 |         26 |      28 |  5056 |    5056 |        0 | t         |          3
+   9 |  5056 |         26 |      28 |  5056 |    5056 |        0 | t         |          3
+  10 |  1440 |          7 |       8 |  1440 |    1440 |        0 | f         |          1
 (11 rows)
 
 SELECT lion_st_mismatch('lion_st_ord_k', 'lion_st_ord', 'ARRAY[k::text, g::text, t]');
@@ -1089,8 +1089,7 @@ SELECT lion_index_verify('lion_st_ord_k', true), lion_index_verify('lion_st_ord_
                    | 
 (1 row)
 
--- the freed positions taken by new rows, which go to the append region:
--- the permutation no longer names them
+-- the freed positions taken by new rows, each in the bucket of its value
 INSERT INTO lion_st_ord
 SELECT i, i % 7, (i * 7919) % 101, ARRAY[i % 5, 10 + i % 11], 'x' || (i % 333),
 	   point(i, i)
@@ -1102,19 +1101,19 @@ SELECT count(*) AS reused FROM lion_st_ord WHERE id > 52000 AND (ctid::text::poi
 (1 row)
 
 SELECT * FROM lion_st_windows('lion_st_ord_k', 'lion_st_ord');
- win | nrows | generation | sorted | entries | appended | per_page | directory | perm_pages 
------+-------+------------+--------+---------+----------+----------+-----------+------------
-   0 |  5056 |          1 |   5056 |    4550 |      506 |       79 | t         |          2
-   1 |  5056 |          1 |   5056 |    4551 |      505 |       79 | t         |          2
-   2 |  5056 |          1 |   5056 |    4550 |      506 |       79 | t         |          2
-   3 |  5033 |          1 |   5056 |    4550 |      483 |       79 | t         |          2
-   4 |  4551 |          1 |   5056 |    4551 |        0 |       79 | t         |          2
-   5 |  4550 |          1 |   5056 |    4550 |        0 |       79 | t         |          2
-   6 |  4551 |          1 |   5056 |    4551 |        0 |       79 | t         |          2
-   7 |  4595 |          1 |   4608 |    4147 |      448 |       72 | t         |          2
-   8 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   9 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-  10 |  1440 |          1 |   1440 |    1440 |        0 |       23 | t         |          1
+ win | nrows | generation | buckets | slots | entries | orphaned | directory | perm_pages 
+-----+-------+------------+---------+-------+---------+----------+-----------+------------
+   0 |  5056 |          1 |      64 |  5562 |    5056 |        0 | t         |          2
+   1 |  5056 |          1 |      64 |  5561 |    5056 |        0 | t         |          2
+   2 |  5056 |          1 |      64 |  5562 |    5056 |        0 | t         |          2
+   3 |  5033 |          1 |      64 |  5539 |    5033 |        0 | t         |          2
+   4 |  4551 |          1 |      64 |  5056 |    4551 |        0 | t         |          2
+   5 |  4550 |          1 |      64 |  5056 |    4550 |        0 | t         |          2
+   6 |  4551 |          1 |      64 |  5056 |    4551 |        0 | t         |          2
+   7 |  4595 |          1 |      64 |  5056 |    4595 |        0 | t         |          2
+   8 |  5056 |         26 |      28 |  5056 |    5056 |        0 | t         |          3
+   9 |  5056 |         26 |      28 |  5056 |    5056 |        0 | t         |          3
+  10 |  1440 |          7 |       8 |  1440 |    1440 |        0 | f         |          1
 (11 rows)
 
 SELECT lion_st_mismatch('lion_st_ord_k', 'lion_st_ord', 'ARRAY[k::text, g::text, t]');
@@ -1135,49 +1134,20 @@ SELECT lion_index_verify('lion_st_ord_k', true), lion_index_verify('lion_st_ord_
                    | 
 (1 row)
 
--- a third of the first window dead: sorted again, a generation on, with
--- only its live rows - the positions the heap no longer uses take no slot -
--- and rows inserted at those positions afterwards are appended
-DELETE FROM lion_st_ord WHERE id % 3 = 1 AND (ctid::text::point)[0] < 64;
+-- two thirds of the first window dead and as many rows again: each bucket
+-- hands out more of its slots, and moves no row
+DELETE FROM lion_st_ord WHERE id % 3 <> 0 AND (ctid::text::point)[0] < 64;
 VACUUM lion_st_ord;
-SELECT * FROM lion_st_windows('lion_st_ord_k', 'lion_st_ord');
- win | nrows | generation | sorted | entries | appended | per_page | directory | perm_pages 
------+-------+------------+--------+---------+----------+----------+-----------+------------
-   0 |  3371 |          2 |   3371 |    3371 |        0 |       53 | t         |          2
-   1 |  5056 |          1 |   5056 |    4551 |      505 |       79 | t         |          2
-   2 |  5056 |          1 |   5056 |    4550 |      506 |       79 | t         |          2
-   3 |  5033 |          1 |   5056 |    4550 |      483 |       79 | t         |          2
-   4 |  4551 |          1 |   5056 |    4551 |        0 |       79 | t         |          2
-   5 |  4550 |          1 |   5056 |    4550 |        0 |       79 | t         |          2
-   6 |  4551 |          1 |   5056 |    4551 |        0 |       79 | t         |          2
-   7 |  4595 |          1 |   4608 |    4147 |      448 |       72 | t         |          2
-   8 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   9 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-  10 |  1440 |          1 |   1440 |    1440 |        0 |       23 | t         |          1
-(11 rows)
-
-SELECT lion_st_mismatch('lion_st_ord_k', 'lion_st_ord', 'ARRAY[k::text, g::text, t]');
- lion_st_mismatch 
-------------------
-                0
-(1 row)
-
-SELECT lion_st_mismatch('lion_st_ord_tags', 'lion_st_ord', 'ARRAY[g::text, t]');
- lion_st_mismatch 
-------------------
-                0
-(1 row)
-
-SELECT lion_index_verify('lion_st_ord_k', true), lion_index_verify('lion_st_ord_tags', true);
- lion_index_verify | lion_index_verify 
--------------------+-------------------
-                   | 
-(1 row)
-
 INSERT INTO lion_st_ord
 SELECT i, i % 7, (i * 7919) % 101, ARRAY[i % 5, 10 + i % 11], 'y' || (i % 333),
 	   point(i, i)
   FROM generate_series(54001, 60000) i;
+SELECT * FROM lion_st_windows('lion_st_ord_k', 'lion_st_ord') WHERE win = 0;
+ win | nrows | generation | buckets | slots | entries | orphaned | directory | perm_pages 
+-----+-------+------------+---------+-------+---------+----------+-----------+------------
+   0 |  5056 |          1 |      64 |  8933 |    5056 |        0 | t         |          2
+(1 row)
+
 SELECT lion_st_mismatch('lion_st_ord_k', 'lion_st_ord', 'ARRAY[k::text, g::text, t]');
  lion_st_mismatch 
 ------------------
@@ -1205,19 +1175,19 @@ SELECT lion_index_verify('lion_st_ord_k', true), lion_index_verify('lion_st_ord_
 
 VACUUM lion_st_ord;
 SELECT * FROM lion_st_windows('lion_st_ord_k', 'lion_st_ord');
- win | nrows | generation | sorted | entries | appended | per_page | directory | perm_pages 
------+-------+------------+--------+---------+----------+----------+-----------+------------
-   0 |  5056 |          3 |   5056 |    5056 |        0 |       79 | t         |          2
-   1 |  5056 |          1 |   5056 |    4551 |      505 |       79 | t         |          2
-   2 |  5056 |          1 |   5056 |    4550 |      506 |       79 | t         |          2
-   3 |  5056 |          1 |   5056 |    4550 |      506 |       79 | t         |          2
-   4 |  5056 |          1 |   5056 |    4551 |      505 |       79 | t         |          2
-   5 |  5056 |          1 |   5056 |    4550 |      506 |       79 | t         |          2
-   6 |  5056 |          1 |   5056 |    4551 |      505 |       79 | t         |          2
-   7 |  5056 |          2 |   5056 |    5056 |        0 |       79 | t         |          2
-   8 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-   9 |  5056 |          1 |   5056 |    5056 |        0 |       79 | t         |          2
-  10 |  3755 |          2 |   3755 |    3755 |        0 |       59 | t         |          2
+ win | nrows | generation | buckets | slots | entries | orphaned | directory | perm_pages 
+-----+-------+------------+---------+-------+---------+----------+-----------+------------
+   0 |  5056 |          1 |      64 |  8933 |    5056 |        0 | t         |          2
+   1 |  5056 |          1 |      64 |  5561 |    5056 |        0 | t         |          2
+   2 |  5056 |          1 |      64 |  5562 |    5056 |        0 | t         |          2
+   3 |  5056 |          1 |      64 |  5562 |    5056 |        0 | t         |          2
+   4 |  5056 |          1 |      64 |  5561 |    5056 |        0 | t         |          2
+   5 |  5056 |          1 |      64 |  5562 |    5056 |        0 | t         |          2
+   6 |  5056 |          1 |      64 |  5561 |    5056 |        0 | t         |          2
+   7 |  5056 |          1 |      64 |  5517 |    5056 |        0 | t         |          2
+   8 |  5056 |         26 |      28 |  5056 |    5056 |        0 | t         |          3
+   9 |  5056 |         26 |      28 |  5056 |    5056 |        0 | t         |          3
+  10 |  2069 |          8 |       9 |  2069 |    2069 |        0 | f         |          1
 (11 rows)
 
 SELECT lion_st_mismatch('lion_st_ord_k', 'lion_st_ord', 'ARRAY[k::text, g::text, t]');
@@ -1237,15 +1207,15 @@ DELETE FROM lion_st_ord WHERE (ctid::text::point)[0] >= 64;
 VACUUM lion_st_ord;
 VACUUM lion_st_ord;
 SELECT * FROM lion_st_windows('lion_st_ord_k', 'lion_st_ord');
- win | nrows | generation | sorted | entries | appended | per_page | directory | perm_pages 
------+-------+------------+--------+---------+----------+----------+-----------+------------
-   0 |  5056 |          3 |   5056 |    5056 |        0 |       79 | t         |          2
+ win | nrows | generation | buckets | slots | entries | orphaned | directory | perm_pages 
+-----+-------+------------+---------+-------+---------+----------+-----------+------------
+   0 |  5056 |          1 |      64 |  8933 |    5056 |        0 | t         |          2
 (1 row)
 
 SELECT (lion_index_store_window('lion_st_ord_k', 3)).*;
- order_attno | generation | nsorted | per_page | directory | thinned | entries | appended | perm_pages | pages 
--------------+------------+---------+----------+-----------+---------+---------+----------+------------+-------
-           1 |            |         |          |           |         |         |          |            |      
+ order_attno | generation | buckets | slots | entries | orphaned | directory | thinned | perm_pages | pages | heap_pages 
+-------------+------------+---------+-------+---------+----------+-----------+---------+------------+-------+------------
+           1 |            |         |       |         |          |           |         |            |       |           
 (1 row)
 
 SELECT lion_st_mismatch('lion_st_ord_k', 'lion_st_ord', 'ARRAY[k::text, g::text, t]');
@@ -1260,18 +1230,24 @@ SELECT lion_index_verify('lion_st_ord_k', true), lion_index_verify('lion_st_ord_
                    | 
 (1 row)
 
--- an index built empty, and every row inserted: no window has a
--- permutation until VACUUM sorts it
+-- an index built empty, and every row inserted: each window starts with
+-- one bucket and splits into more; VACUUM has nothing to do
 CREATE TABLE lion_st_ord2 (id int, k int, t text) WITH (autovacuum_enabled = off);
 CREATE INDEX lion_st_ord2_i ON lion_st_ord2 USING lion (k) INCLUDE (t, id)
 	WITH (store_values = on, cluster_column = k);
 INSERT INTO lion_st_ord2 SELECT i, i % 13, 'z' || (i % 77) FROM generate_series(1, 20000) i;
 SELECT * FROM lion_st_windows('lion_st_ord2_i', 'lion_st_ord2');
- win | nrows | generation | sorted | entries | appended | per_page | directory | perm_pages 
------+-------+------------+--------+---------+----------+----------+-----------+------------
-   0 | 11840 |          0 |      0 |       0 |    11840 |        0 | f         |          0
-   1 |  8160 |          0 |      0 |       0 |     8160 |        0 | f         |          0
+ win | nrows | generation | buckets | slots | entries | orphaned | directory | perm_pages 
+-----+-------+------------+---------+-------+---------+----------+-----------+------------
+   0 | 11840 |         72 |      75 | 11840 |   11840 |        0 | t         |          5
+   1 |  8160 |         48 |      50 |  8160 |    8160 |        0 | t         |          4
 (2 rows)
+
+SELECT lion_st_mismatch('lion_st_ord2_i', 'lion_st_ord2', 'ARRAY[k::text, t, id::text]');
+ lion_st_mismatch 
+------------------
+                0
+(1 row)
 
 SELECT lion_index_verify('lion_st_ord2_i', true);
  lion_index_verify 
@@ -1281,32 +1257,20 @@ SELECT lion_index_verify('lion_st_ord2_i', true);
 
 VACUUM lion_st_ord2;
 SELECT * FROM lion_st_windows('lion_st_ord2_i', 'lion_st_ord2');
- win | nrows | generation | sorted | entries | appended | per_page | directory | perm_pages 
------+-------+------------+--------+---------+----------+----------+-----------+------------
-   0 | 11840 |          1 |  11840 |   11840 |        0 |      185 | t         |          4
-   1 |  8160 |          1 |   8160 |    8160 |        0 |      128 | t         |          3
+ win | nrows | generation | buckets | slots | entries | orphaned | directory | perm_pages 
+-----+-------+------------+---------+-------+---------+----------+-----------+------------
+   0 | 11840 |         72 |      75 | 11840 |   11840 |        0 | t         |          5
+   1 |  8160 |         48 |      50 |  8160 |    8160 |        0 | t         |          4
 (2 rows)
-
-SELECT lion_st_mismatch('lion_st_ord2_i', 'lion_st_ord2', 'ARRAY[k::text, t, id::text]');
- lion_st_mismatch 
-------------------
-                0
-(1 row)
-
-SELECT lion_index_verify('lion_st_ord2_i', true);
- lion_index_verify 
--------------------
- 
-(1 row)
 
 -- REINDEX writes it again, every window sorted at build
 INSERT INTO lion_st_ord2 SELECT i, i % 13, 'z' || (i % 77) FROM generate_series(20001, 21000) i;
 REINDEX INDEX lion_st_ord2_i;
 SELECT * FROM lion_st_windows('lion_st_ord2_i', 'lion_st_ord2');
- win | nrows | generation | sorted | entries | appended | per_page | directory | perm_pages 
------+-------+------------+--------+---------+----------+----------+-----------+------------
-   0 | 11840 |          1 |  11840 |   11840 |        0 |      185 | t         |          4
-   1 |  9160 |          1 |   9160 |    9160 |        0 |      144 | t         |          3
+ win | nrows | generation | buckets | slots | entries | orphaned | directory | perm_pages 
+-----+-------+------------+---------+-------+---------+----------+-----------+------------
+   0 | 11840 |          1 |      64 | 11840 |   11840 |        0 | t         |          4
+   1 |  9160 |          1 |      64 |  9160 |    9160 |        0 | t         |          3
 (2 rows)
 
 SELECT lion_st_mismatch('lion_st_ord2_i', 'lion_st_ord2', 'ARRAY[k::text, t, id::text]');
@@ -1321,7 +1285,153 @@ SELECT lion_index_verify('lion_st_ord2_i', true);
  
 (1 row)
 
-DROP TABLE lion_st_ord, lion_st_ord2;
+-- the order column rising with the heap: a row past every row of its bucket
+-- opens a new bucket, and no row moves - the generation stays where it was
+CREATE TABLE lion_st_ord3 (id int, k int, t text) WITH (autovacuum_enabled = off);
+CREATE INDEX lion_st_ord3_i ON lion_st_ord3 USING lion (k) INCLUDE (t)
+	WITH (store_values = on, cluster_column = k);
+INSERT INTO lion_st_ord3 SELECT i, i, 'r' || i FROM generate_series(1, 12000) i;
+SELECT * FROM lion_st_windows('lion_st_ord3_i', 'lion_st_ord3');
+ win | nrows | generation | buckets | slots | entries | orphaned | directory | perm_pages 
+-----+-------+------------+---------+-------+---------+----------+-----------+------------
+   0 | 11840 |          1 |      41 | 11840 |   11840 |        0 | t         |          5
+   1 |   160 |          1 |       1 |   160 |     160 |        0 | f         |          1
+(2 rows)
+
+SELECT lion_st_mismatch('lion_st_ord3_i', 'lion_st_ord3', 'ARRAY[k::text, t]');
+ lion_st_mismatch 
+------------------
+                0
+(1 row)
+
+SELECT lion_index_verify('lion_st_ord3_i', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+-- values too wide for a bucket's slots to fit a page: a bucket splits when
+-- its values no longer fit, before it has handed out every slot
+CREATE TABLE lion_st_ord4 (id int, k int, t text) WITH (autovacuum_enabled = off);
+CREATE INDEX lion_st_ord4_i ON lion_st_ord4 USING lion (k) INCLUDE (t)
+	WITH (store_values = on, cluster_column = k);
+INSERT INTO lion_st_ord4 SELECT i, i % 5, repeat(chr(65 + i % 26), 300) || i
+  FROM generate_series(1, 3000) i;
+SELECT * FROM lion_st_windows('lion_st_ord4_i', 'lion_st_ord4');
+ win | nrows | generation | buckets | slots | entries | orphaned | directory | perm_pages 
+-----+-------+------------+---------+-------+---------+----------+-----------+------------
+   0 |  1472 |        110 |     110 |  1472 |    1472 |        0 | t         |          1
+   1 |  1472 |        110 |     110 |  1472 |    1472 |        0 | t         |          1
+   2 |    56 |          3 |       3 |    56 |      56 |        0 | t         |          1
+(3 rows)
+
+SELECT lion_st_mismatch('lion_st_ord4_i', 'lion_st_ord4', 'ARRAY[k::text, t]');
+ lion_st_mismatch 
+------------------
+                0
+(1 row)
+
+SELECT lion_index_verify('lion_st_ord4_i', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+-- order values too long for the window header to keep many fences: the
+-- buckets stop splitting, and the rows they have no room for keep no values
+-- in the store - each such row has no entry, and readers take it from the
+-- heap
+CREATE TABLE lion_st_ord5 (id int, k text, t text) WITH (autovacuum_enabled = off);
+CREATE INDEX lion_st_ord5_i ON lion_st_ord5 USING lion (k) INCLUDE (t)
+	WITH (store_values = on, cluster_column = k);
+INSERT INTO lion_st_ord5 SELECT i, lpad((i * 7919 % 4000)::text, 240, '0'), 'u' || i
+  FROM generate_series(1, 4000) i;
+SELECT * FROM lion_st_windows('lion_st_ord5_i', 'lion_st_ord5');
+ win | nrows | generation | buckets | slots | entries | orphaned | directory | perm_pages 
+-----+-------+------------+---------+-------+---------+----------+-----------+------------
+   0 |  1792 |         17 |      17 |  1792 |     561 |        0 | t         |          2
+   1 |  1792 |         17 |      17 |  1792 |     561 |        0 | t         |          2
+   2 |   416 |         17 |      17 |   416 |     411 |        0 | t         |          1
+(3 rows)
+
+SELECT count(*) FILTER (WHERE s = ARRAY[NULL, NULL]::text[]) AS left_to_heap,
+	   count(*) FILTER (WHERE s <> ARRAY[NULL, NULL]::text[] AND s IS DISTINCT FROM ARRAY[k, t])
+		 AS mismatched
+  FROM (SELECT k, t, lion_index_stored('lion_st_ord5_i', ctid) s FROM lion_st_ord5) q;
+ left_to_heap | mismatched 
+--------------+------------
+         2467 |          0
+(1 row)
+
+SELECT lion_index_verify('lion_st_ord5_i', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*), md5(string_agg(t, ',' ORDER BY t)) FROM lion_st_ord5 WHERE k > '0';
+ count |               md5                
+-------+----------------------------------
+  4000 | b23261184054f483bb2863123eddba4c
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT count(*), md5(string_agg(t, ',' ORDER BY t)) FROM lion_st_ord5 WHERE k > '0';
+ count |               md5                
+-------+----------------------------------
+  4000 | b23261184054f483bb2863123eddba4c
+(1 row)
+
+-- a window whose rows are deleted and replaced again and again: its
+-- buckets hand out every slot they have, and then, holding few live rows,
+-- are compacted into a new bucket each rather than split in two
+CREATE TABLE lion_st_ord6 (id int, k int, t text) WITH (autovacuum_enabled = off);
+INSERT INTO lion_st_ord6 SELECT i, i % 101, 'c' || i FROM generate_series(1, 4000) i;
+CREATE INDEX lion_st_ord6_i ON lion_st_ord6 USING lion (k) INCLUDE (t)
+	WITH (store_values = on, cluster_column = k);
+DELETE FROM lion_st_ord6 WHERE id % 4 <> 0;
+VACUUM lion_st_ord6;
+INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_series(4001, 7000) i;
+DELETE FROM lion_st_ord6 WHERE id % 4 <> 0;
+VACUUM lion_st_ord6;
+INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_series(7001, 10000) i;
+DELETE FROM lion_st_ord6 WHERE id % 4 <> 0;
+VACUUM lion_st_ord6;
+INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_series(10001, 13000) i;
+DELETE FROM lion_st_ord6 WHERE id % 4 <> 0;
+VACUUM lion_st_ord6;
+INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_series(13001, 16000) i;
+DELETE FROM lion_st_ord6 WHERE id % 4 <> 0;
+VACUUM lion_st_ord6;
+INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_series(16001, 19000) i;
+DELETE FROM lion_st_ord6 WHERE id % 4 <> 0;
+VACUUM lion_st_ord6;
+INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_series(19001, 22000) i;
+DELETE FROM lion_st_ord6 WHERE id % 4 <> 0;
+VACUUM lion_st_ord6;
+INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_series(22001, 25000) i;
+SELECT * FROM lion_st_windows('lion_st_ord6_i', 'lion_st_ord6');
+ win | nrows | generation | buckets | slots | entries | orphaned | directory | perm_pages 
+-----+-------+------------+---------+-------+---------+----------+-----------+------------
+   0 |  4000 |         64 |      69 | 10114 |    4000 |        0 | t         |          2
+(1 row)
+
+SELECT lion_st_mismatch('lion_st_ord6_i', 'lion_st_ord6', 'ARRAY[k::text, t]');
+ lion_st_mismatch 
+------------------
+                0
+(1 row)
+
+SELECT lion_index_verify('lion_st_ord6_i', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+DROP TABLE lion_st_ord, lion_st_ord2, lion_st_ord3, lion_st_ord4, lion_st_ord5, lion_st_ord6;
 DROP FUNCTION lion_st_windows(regclass, regclass);
 DROP FUNCTION lion_st_mismatch(regclass, regclass, text);
 DROP FUNCTION lion_st_stats(regclass);

@@ -884,8 +884,8 @@ lion_index_store_window(PG_FUNCTION_ARGS)
 	Relation	index;
 	LionIndexState *ix;
 	TupleDesc	tupdesc;
-	Datum		values[10];
-	bool		nulls[10];
+	Datum		values[11];
+	bool		nulls[11];
 	LionStoreWindowInfo wi;
 	int			i;
 
@@ -898,7 +898,7 @@ lion_index_store_window(PG_FUNCTION_ARGS)
 
 	index = lion_open_index(relid, AccessShareLock);
 	ix = lion_get_index_state(index);
-	for (i = 0; i < 10; i++)
+	for (i = 0; i < 11; i++)
 		nulls[i] = true;
 	if (ix->store_order >= 0)
 	{
@@ -907,16 +907,17 @@ lion_index_store_window(PG_FUNCTION_ARGS)
 		lion_store_window_info(index, ix, (uint32) win, &wi);
 		if (wi.exists)
 		{
-			values[1] = Int32GetDatum(wi.gen);
-			values[2] = Int32GetDatum(wi.nsorted);
-			values[3] = Int32GetDatum(wi.vwidth);
-			values[4] = Int32GetDatum(wi.ndir);
-			values[5] = BoolGetDatum(wi.thin);
-			values[6] = Int64GetDatum(wi.entries);
-			values[7] = Int64GetDatum(wi.appended);
+			values[1] = Int64GetDatum(wi.gen);
+			values[2] = Int32GetDatum(wi.buckets);
+			values[3] = Int64GetDatum(wi.slots);
+			values[4] = Int64GetDatum(wi.entries);
+			values[5] = Int64GetDatum(wi.orphaned);
+			values[6] = Int32GetDatum(wi.ndir);
+			values[7] = BoolGetDatum(wi.thin);
 			values[8] = Int32GetDatum(wi.perm_pages);
 			values[9] = Int32GetDatum(wi.pages);
-			for (i = 1; i < 10; i++)
+			values[10] = Int32GetDatum(wi.heap_pages);
+			for (i = 1; i < 11; i++)
 				nulls[i] = false;
 		}
 	}

@@ -248,18 +248,10 @@ extern int64 lion_store_vacuum_cleanup(Relation index, Relation heaprel,
 									   LionIndexState *ix);
 
 /*
- * amvacuumcleanup's sort of an ordered index's windows (DESIGN.md §41,
- * "The sort"): every window whose rows outside the sorted order pass a
- * quarter of its rows, and which no insert holds, is sorted again.  Returns
- * the windows sorted; *freed gets the pages freed.
- */
-extern int64 lion_store_vacuum_sort(Relation index, Relation heaprel,
-									LionIndexState *ix, int64 *freed);
-
-/*
  * verify()'s check of an ordered window whole (DESIGN.md §41, "verify()"):
- * generations, the permutation a bijection onto the sorted slots that hold
- * values, the directory.  ERRORs on damage; a no-op in heap order.
+ * the window header, the permutation naming distinct slots inside their
+ * buckets, each row inside its bucket's range, the directory.  ERRORs on
+ * damage; a no-op in heap order.
  */
 extern void lion_store_verify_window(Relation index, LionIndexState *ix,
 									 uint32 ckey);
@@ -268,15 +260,16 @@ extern void lion_store_verify_window(Relation index, LionIndexState *ix,
 typedef struct LionStoreWindowInfo
 {
 	bool		exists;			/* the window has a store at all */
-	int			gen;			/* the permutation's generation, 0: none */
-	int			nsorted;		/* its window header */
-	int			vwidth;
+	int64		gen;			/* the window header's generation */
+	int			buckets;		/* its buckets */
+	int64		slots;			/* the slots they have handed out */
 	int			ndir;
 	bool		thin;
 	int64		entries;		/* positions with a permutation entry */
-	int64		appended;		/* the order column's append-region values */
+	int64		orphaned;		/* ... naming a virtual page no bucket has */
 	int			perm_pages;		/* the permutation's chain */
-	int			pages;			/* every data chain */
+	int			pages;			/* the ordered columns' chains */
+	int			heap_pages;		/* the chains of columns in heap order */
 } LionStoreWindowInfo;
 
 extern void lion_store_window_info(Relation index, LionIndexState *ix,

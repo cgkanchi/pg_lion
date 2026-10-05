@@ -694,21 +694,22 @@ COMMENT ON FUNCTION lion_index_stored(regclass, tid) IS
  */
 CREATE FUNCTION lion_index_store_window(idx regclass, win int8,
 										OUT order_attno int2,
-										OUT generation int4,
-										OUT nsorted int4,
-										OUT per_page int4,
+										OUT generation int8,
+										OUT buckets int4,
+										OUT slots int8,
+										OUT entries int8,
+										OUT orphaned int8,
 										OUT directory int4,
 										OUT thinned bool,
-										OUT entries int8,
-										OUT appended int8,
 										OUT perm_pages int4,
-										OUT pages int4)
+										OUT pages int4,
+										OUT heap_pages int4)
 RETURNS record
 AS 'MODULE_PATHNAME', 'lion_index_store_window'
 LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 COMMENT ON FUNCTION lion_index_store_window(regclass, int8) IS
-	'diagnostic: one window of a store in key-ordered windows (§41): the order column (NULL in heap order), the generation, the rows the last sort ordered and how many a virtual page, directory entries and whether thinned, positions with a permutation entry, append-region slots, and permutation and data pages';
+	'diagnostic: one window of a store in key-ordered windows (§41): the order column (NULL in heap order), the generation, the buckets and the slots they have handed out, positions with a permutation entry and how many name a virtual page no bucket has, directory entries and whether thinned, and the pages of the permutation, of the ordered columns and of the columns in heap order';
 
 /*
  * The ROOT block of one key's posting tree (DESIGN.md §22), NULL when the key
