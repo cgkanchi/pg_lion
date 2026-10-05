@@ -1,0 +1,102 @@
+Parsed test spec with 1 sessions
+
+starting permutation: s1_delete s1_attach s1_vacuum_h s1_vacuum_o s1_detach s1_window s1_verify_h s1_verify_o s1_vacuum_h2 s1_vacuum_o2 s1_window s1_verify_h s1_verify_o s1_fill s1_check s1_verify_h s1_verify_o
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_delete: DELETE FROM stvi_h WHERE k % 4 <> 1; DELETE FROM stvi_o WHERE k % 4 <> 1;
+step s1_attach: SELECT injection_points_attach('lion-store-vacuum-chain-cleared', 'error');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_vacuum_h: VACUUM stvi_h;
+ERROR:  error triggered for injection point lion-store-vacuum-chain-cleared
+step s1_vacuum_o: VACUUM stvi_o;
+ERROR:  error triggered for injection point lion-store-vacuum-chain-cleared
+step s1_detach: SELECT injection_points_detach('lion-store-vacuum-chain-cleared');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s1_window: 
+	SELECT i AS index, w.order_attno, w.entries, w.orphaned, w.heap_pages > 0 AS heap_layout
+	  FROM unnest(ARRAY['lion_vi_h', 'lion_vi_o']::regclass[]) i,
+		   LATERAL lion_index_store_window(i, 0) w ORDER BY 1;
+
+index    |order_attno|entries|orphaned|heap_layout
+---------+-----------+-------+--------+-----------
+lion_vi_h|          1|    780|       0|t          
+lion_vi_o|          1|    780|       0|f          
+(2 rows)
+
+step s1_verify_h: SELECT lion_index_verify('lion_vi_h', true) AS verify_h;
+verify_h
+--------
+        
+(1 row)
+
+step s1_verify_o: SELECT lion_index_verify('lion_vi_o', true) AS verify_o;
+verify_o
+--------
+        
+(1 row)
+
+step s1_vacuum_h2: VACUUM stvi_h;
+step s1_vacuum_o2: VACUUM stvi_o;
+step s1_window: 
+	SELECT i AS index, w.order_attno, w.entries, w.orphaned, w.heap_pages > 0 AS heap_layout
+	  FROM unnest(ARRAY['lion_vi_h', 'lion_vi_o']::regclass[]) i,
+		   LATERAL lion_index_store_window(i, 0) w ORDER BY 1;
+
+index    |order_attno|entries|orphaned|heap_layout
+---------+-----------+-------+--------+-----------
+lion_vi_h|          1|    780|       0|t          
+lion_vi_o|          1|    780|       0|f          
+(2 rows)
+
+step s1_verify_h: SELECT lion_index_verify('lion_vi_h', true) AS verify_h;
+verify_h
+--------
+        
+(1 row)
+
+step s1_verify_o: SELECT lion_index_verify('lion_vi_o', true) AS verify_o;
+verify_o
+--------
+        
+(1 row)
+
+step s1_fill: 
+	INSERT INTO stvi_h SELECT i % 50, repeat(md5(i::text), 3) FROM generate_series(1, 9000) i;
+	INSERT INTO stvi_o SELECT i % 50, repeat(md5(i::text), 3) FROM generate_series(1, 9000) i;
+
+step s1_check: 
+	SELECT (SELECT count(*) FROM stvi_h
+			 WHERE lion_index_stored('lion_vi_h', ctid) IS DISTINCT FROM ARRAY[k::text, t]) AS mismatch_h,
+		   (SELECT count(*) FROM stvi_o
+			 WHERE lion_index_stored('lion_vi_o', ctid) IS DISTINCT FROM ARRAY[k::text, t]) AS mismatch_o,
+		   (lion_index_store_window('lion_vi_h', 1)).buckets > 1 AS split_h,
+		   (lion_index_store_window('lion_vi_o', 1)).buckets > 1 AS split_o;
+
+mismatch_h|mismatch_o|split_h|split_o
+----------+----------+-------+-------
+         0|         0|t      |t      
+(1 row)
+
+step s1_verify_h: SELECT lion_index_verify('lion_vi_h', true) AS verify_h;
+verify_h
+--------
+        
+(1 row)
+
+step s1_verify_o: SELECT lion_index_verify('lion_vi_o', true) AS verify_o;
+verify_o
+--------
+        
+(1 row)
+

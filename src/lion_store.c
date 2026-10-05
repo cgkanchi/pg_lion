@@ -5286,6 +5286,53 @@ lion_store_perm_dead(Relation index, LionIndexState *ix, uint32 ckey,
 	}
 }
 
+/*
+ * Clear the dead rows lion_store_perm_dead() found from window ckey's
+ * permutation, page by page.  The pages are visited, and counted, when the
+ * walk of the map comes to the permutation's chain.
+ */
+static void
+lion_store_vacuum_perm(LionStoreVacArg *va, uint32 ckey)
+{
+	const LionStoreCol *pc = va->ix->storeperm;
+	uint64		slot = lion_storemap_slot(ckey, lion_store_stride(va->ix), pc->ord);
+	BlockNumber head = lion_storemap_head(va->index, va->ix->store.store_root, slot, NULL);
+	BlockNumber blk = head;
+	int			steps = 0;
+
+	while (BlockNumberIsValid(blk))
+	{
+		Buffer		buf = ReadBuffer(va->index, blk);
+		Page		page;
+		BlockNumber next;
+		MemoryContext old;
+
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		if (!lion_store_page_owned(page, ckey, (uint16) pc->ord))
+		{
+			UnlockReleaseBuffer(buf);
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": block %u on the permutation of window %u is not one of its pages",
+							RelationGetRelationName(va->index), blk, ckey),
+					 errhint("REINDEX the index.")));
+		}
+		lion_store_check_or_error(va->index, page, blk, pc, true);
+		old = MemoryContextSwitchTo(va->pagecxt);
+		lion_store_vacuum_page(va->index, pc, buf, va->dead, va->st);
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(va->pagecxt);
+
+		next = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
+		UnlockReleaseBuffer(buf);
+		if (BlockNumberIsValid(next))
+			lion_store_chain_step(va->index, blk, next, &steps);
+		blk = next;
+		lion_vacuum_delay_point();
+	}
+}
+
 /* One window's chain for one column: visit each page, clear its dead slots. */
 static void
 lion_store_vacuum_chain(void *arg, uint64 slot, BlockNumber head)
@@ -5299,11 +5346,16 @@ lion_store_vacuum_chain(void *arg, uint64 slot, BlockNumber head)
 	int			steps = 0;
 
 	/*
-	 * An ordered window's chains are walked in ordinal order, the
-	 * permutation's last: its dead rows are found first, cleared from every
-	 * column, and only then from the permutation (§41, "VACUUM's bulk
-	 * delete"), all under the window lock in share mode, which keeps a split
-	 * from moving a row between the finding and the clearing.
+	 * An ordered window (§41, "VACUUM"): its dead rows are found through the
+	 * permutation and cleared from it first, before any column, all under
+	 * the window lock in share mode, which keeps a split from moving a row
+	 * between the finding and the clearing.  A crash or an ERROR part way
+	 * then leaves values that no entry names, which every reader, split and
+	 * verify() allows (an insert cut short leaves the same), and never an
+	 * entry naming a row whose values are gone: verify() would find its
+	 * order value outside its bucket's range, and a split would sort the row
+	 * by a value it no longer has.  The walk comes to the permutation's own
+	 * chain last (its ordinal is the highest), and only visits it.
 	 */
 	if (va->write && va->ix->store_order >= 0 &&
 		(!va->dead->valid || va->dead->ckey != ckey))
@@ -5313,6 +5365,7 @@ lion_store_vacuum_chain(void *arg, uint64 slot, BlockNumber head)
 		LockPage(va->index, LION_STORE_WINLOCK(ckey), ShareLock);
 		va->locked = ckey;
 		lion_store_perm_dead(va->index, va->ix, ckey, va->dead, va->st);
+		lion_store_vacuum_perm(va, ckey);
 	}
 
 	while (BlockNumberIsValid(blk))
@@ -5346,7 +5399,7 @@ lion_store_vacuum_chain(void *arg, uint64 slot, BlockNumber head)
 		va->st->pages++;
 
 		old = MemoryContextSwitchTo(va->pagecxt);
-		if (va->write)
+		if (va->write && col != va->ix->storeperm)
 			lion_store_vacuum_page(va->index, col, buf, va->dead, va->st);
 		MemoryContextSwitchTo(old);
 		MemoryContextReset(va->pagecxt);
@@ -5358,6 +5411,10 @@ lion_store_vacuum_chain(void *arg, uint64 slot, BlockNumber head)
 		blk = next;
 		lion_vacuum_delay_point();
 	}
+
+	/* for a test: VACUUM cut short after a chain of an ordered window */
+	if (va->write && va->ix->store_order >= 0)
+		LION_INJECTION_POINT("lion-store-vacuum-chain-cleared");
 }
 
 void

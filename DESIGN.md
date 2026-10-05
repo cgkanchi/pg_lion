@@ -19550,13 +19550,18 @@ checks it again after the data walk (`lion_store_gen_same()`); a split between t
 it, and the window is read again. The leader of a gather keeps the permutation's head pinned
 across its data walk (`LionStoreWalk.keephead`, released by the check, within one gather call:
 the row and count readers are not always closed, so no pin outlives a call), so the check costs
-no buffer lookup; a follower reads the head again. Pages no longer carry a generation. The window lock keeps splits out while an insert writes its row; readers take no
-lock.
+no buffer lookup; a follower reads the head again. Pages no longer carry a generation. The
+window lock keeps splits out while an insert writes its row; readers take no lock.
 
-**VACUUM** clears dead rows from the ordered columns (by the permutation's dead positions) and
-from the permutation, under the window lock in share mode, which keeps a split from moving a row
-between finding it dead and clearing it; it sorts nothing and frees nothing but windows past the
-heap's end. A cleared slot is not reused in place: `used` only grows, and a bucket that runs out
+**VACUUM** clears dead rows from the permutation first, then from the ordered columns (by the
+permutation's dead positions) and the heap-layout ones (by TID), under the window lock in share
+mode, which keeps a split from moving a row between finding it dead and clearing it. The order
+matters when VACUUM is cut short: a crash or an ERROR between the two then leaves values no entry
+names, as an interrupted insert does, never an entry whose row's values are gone (verify() would
+find that row's order value outside its bucket's range, and a split would sort the row by a value
+it no longer has; the first build of this revision cleared the permutation last, and CI's crash
+loop caught it). The values left behind stay until their bucket is next split, compacted or
+reset. VACUUM sorts nothing and frees nothing but windows past the heap's end. A cleared slot is not reused in place: `used` only grows, and a bucket that runs out
 of slots is compacted or split by the next insert that needs it. No generation is bumped,
 since nothing moves.
 
@@ -19666,5 +19671,8 @@ Section 10 tests the choice of columns: mixed windows through inserts, VACUUM an
 the fallback to heap order, and an empty build by type. `store_split_reader.spec` parks a reader
 before the permutation's walk and between the walks while an insert splits the bucket holding its
 row; with the generation check removed, the second permutation returns the row's order value as
-NULL (checked once by hand). The recovery schema has one index whose columns were chosen by type
+NULL (checked once by hand). `store_vacuum_interrupted.spec` cuts a VACUUM short with an ERROR at an
+injection point after the first chain it clears, on an index with a heap-layout order column and
+one with every column ordered, then verifies, VACUUMs, refills the freed positions and splits a
+new window; with the permutation cleared last, verify() fails on both. The recovery schema has one index whose columns were chosen by type
 (built empty) and one with every column ordered.
