@@ -53,6 +53,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/sortsupport.h"
+#include "utils/spccache.h"
 #include "utils/typcache.h"
 #include "varatt.h"
 
@@ -4955,6 +4956,13 @@ struct LionStoreReader
 	int			dircap;
 
 	/*
+	 * The index's tablespace's page costs, which decide per window whether a
+	 * data walk jumps by the directory or reads its pages in order.
+	 */
+	double		rpc;
+	double		spc;
+
+	/*
 	 * The permutation shared among the readers of one index's columns
 	 * (lion_store_share()): a follower's leader, and a leader's last
 	 * permutation read - the window, the members, their entries in
@@ -4986,6 +4994,7 @@ typedef struct LionStoreWalk
 	bool		wanthdr;		/* keep the head's window header (PERM) */
 	const LionStoreDirEnt *dir; /* entries for the column, ascending lo */
 	int			ndir;
+	bool		nojump;			/* enter by the directory, then walk right */
 	uint64		absent[2];		/* pages ABSENT, or without the slot */
 	uint64		missing[2];		/* of those, the ones not ABSENT */
 } LionStoreWalk;
@@ -5026,6 +5035,7 @@ lion_store_open(Relation index, LionIndexState *ix, int ord, MemoryContext cxt)
 	r->pcache.innerblk = InvalidBlockNumber;
 	r->pcache.leafblk = InvalidBlockNumber;
 	r->pcache.head = InvalidBlockNumber;
+	get_tablespace_page_costs(index->rd_rel->reltablespace, &r->rpc, &r->spc);
 	return r;
 }
 
@@ -5441,7 +5451,7 @@ lion_store_walk(LionStoreReader *r, const LionStoreCol *col,
 
 			next = LionPageGetOpaque(page)->rightlink;
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-			if (d >= 0 && w->dir[d].lo > h.hi)
+			if (!w->nojump && d >= 0 && w->dir[d].lo > h.hi)
 			{
 				/* the directory knows a page further on: go straight there */
 				blk = w->dir[d].blk;
@@ -5483,6 +5493,58 @@ lion_store_walk(LionStoreReader *r, const LionStoreCol *col,
 	if (BufferIsValid(buf))
 		ReleaseBuffer(buf);
 	return true;
+}
+
+/*
+ * Jump or read on (§41, "As built: the walk decides per window"), for a data
+ * walk over the ascending virtual lo vlo[0 .. nlo - 1].  The directory says
+ * which of the chain's pages hold them: a walk that enters at the first and
+ * jumps to each of the others reads J pages at random, one that enters at the
+ * first and reads on to the last reads R pages, all but the first in chain
+ * order - consecutive blocks, as a build or a split lays them, which the
+ * kernel reads ahead.  The walk jumps when J random reads cost less than one
+ * random and R - 1 sequential ones at the tablespace's page costs, and asks
+ * for the pages it will jump to ahead of the walk; otherwise it reads on.
+ */
+static void
+lion_store_plan_walk(LionStoreReader *r, LionStoreWalk *w, const uint16 *vlo,
+					 int nlo)
+{
+	int			first = -1;
+	int			last = -1;
+	int			npages = 0;
+	int			i;
+
+	if (w->ndir == 0 || nlo == 0)
+		return;					/* nothing to jump with: the walk reads on */
+	for (i = 0; i < nlo; i++)
+	{
+		int			d = lion_store_dir_find(w, lion_store_vlo_page(vlo[i]));
+
+		if (d != last || npages == 0)
+		{
+			npages++;
+			if (first < 0)
+				first = d;
+		}
+		last = d;
+	}
+	if ((double) npages * r->rpc <
+		r->rpc + (double) (last - first) * r->spc)
+	{
+		int			prev = first;
+
+		for (i = 0; i < nlo; i++)
+		{
+			int			d = lion_store_dir_find(w, lion_store_vlo_page(vlo[i]));
+
+			if (d != prev && d >= 0)
+				(void) PrefetchBuffer(r->index, MAIN_FORKNUM, w->dir[d].blk);
+			prev = d;
+		}
+		return;
+	}
+	w->nojump = true;
 }
 
 /* Room in the reader for an ordered gather of n members. */
@@ -5636,6 +5698,7 @@ lion_store_gather_ordered(LionStoreReader *r, uint32 ckey, const uint16 *lo,
 		dw.gen = pw.headseen ? pw.gen : 0;
 		dw.dir = r->dir;
 		dw.ndir = r->ndir;
+		lion_store_plan_walk(r, &dw, r->vlo, nlo);
 		if (!lion_store_walk(r, col, &r->cache, ckey, dslot, fresh, r->vlo, nlo,
 							 r->vval, r->vnull, &dw))
 			continue;
