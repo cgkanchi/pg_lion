@@ -869,12 +869,13 @@ lion_index_stored(PG_FUNCTION_ARGS)
 /*
  * lion_index_store_window(idx, win): one window of an index in key-ordered
  * windows (DESIGN.md §41) - the stored column that orders it (NULL, and
- * nothing else, for an index in heap order), its permutation's generation
- * (0 before its first sort), the rows the last sort ordered and how many to
- * a virtual page, the directory's entries, the positions with a permutation
- * entry, the order column's slots in the append region, and the pages of
- * the permutation and of the data chains.  NULLs past the order column for
- * a window with no store.  A DIAGNOSTIC, for the tests.
+ * nothing else, for an index in heap order), the window header's
+ * generation, its buckets and the slots they have handed out, the positions
+ * with a permutation entry and how many of them name a virtual page no
+ * bucket has (orphans of an interrupted split), the directory's entries and
+ * whether it is thinned, and the pages of the permutation, of the columns in
+ * key order and of the columns in heap layout.  NULLs past the order column
+ * for a window with no store.  A DIAGNOSTIC, for the tests.
  */
 Datum
 lion_index_store_window(PG_FUNCTION_ARGS)

@@ -19401,3 +19401,270 @@ forced gather of the wide `payload` column read a third fewer buffers ordered (4
 is the directory, not the order: an ordered gather jumps to the pages that hold its slots, where
 a heap-order gather walks each chain from its head to its last member's page, and the jumps read
 fewer pages but defeat the kernel's readahead.
+
+### Revision 2: adaptive gather, short chains in heap order, in-place inserts (2026-10-05)
+
+The version above did not ship. Three of its costs were measured as too high: a cold gather of a
+wide column ran twice as slow as heap order (the directory's jumps defeat readahead); every
+predicate not on the order column paid a permutation page a window and the order's loss of the
+heap's locality, on every column, the narrow ones included; and VACUUM re-sorted windows (2.6
+times version 9's VACUUM, the file 48% larger after it). Revision 2 changes the three, drawing on
+PostgreSQL 18's B-tree skip scan for the first: a scan decides at run time, from what it is about
+to read, whether skipping pays. The format stays version 10; no version 10 index was released,
+and this one does not read the first revision's.
+
+#### The adaptive walk
+
+A gather of an ordered window knows, once it has the permutation's entries and the directory,
+which pages of a column's chain it needs: J directory pages to visit, spanning R pages of the
+chain from the first needed to the last. `lion_store_plan_walk()` chooses per window and per
+column between jumping to the J pages and reading the R pages in chain order (entering at the
+directory's page for the first slot and following rightlinks). As built:
+
+- where `PrefetchBuffer()` can read ahead (`USE_PREFETCH`, and the tablespace's
+  `effective_io_concurrency` above 0, 16 by default in PostgreSQL 18), it jumps whenever it skips
+  at least one page, and first asks for every page it will jump to, so that the reads overlap;
+- where it cannot, it jumps only when `J × random_page_cost < random_page_cost + (R − 1) ×
+  seq_page_cost`, at the tablespace's costs (`get_tablespace_page_costs()`): a chain written by a
+  build is on consecutive blocks, which the kernel reads ahead.
+
+The first version of the walk used the cost test alone, with prefetching; it walked wherever a
+gather needed more than a quarter of a chain's pages, which on the `docs` store (0.5% of the rows,
+about 10 of a window's 21 `payload` pages) meant always. Measured over five cold runs each (a
+server restart and an OS cache drop before each): reading on took a median 664 ms cold (389 to
+1,034) and 93 warm, 65,448 buffers; jumping with prefetch, 281 cold (278 to 295) and 70 warm,
+42,418 buffers; heap order's own walk 384 cold and 80 warm, 62,028 buffers. The cold regression
+of the first revision (1,040 ms against 500) was jumps without prefetch, not jumps. So with
+prefetch the walk jumps.
+
+#### Short chains in heap layout
+
+An ordered index lays out in key order only its long columns; the others keep §40's heap layout,
+at their heap positions, beside them in the same window, and a gather of one of those reads no
+permutation and pays nothing for the order. A build measures each column's heap-layout chain in
+its first window (`lion_store_build_pages()`, the emitter's own page count, before anything is
+written) and orders the columns whose chain takes `pg_lion.store_order_min_pages` pages or more,
+4 by default. The order column follows the same rule: a short one - an index's own scalar key,
+one page a window - keeps heap layout, and a bucket's split then reads its rows' order values at
+their heap positions (verify() does the same). The window's buckets are still ranges of the
+order column; only where its values sit changes. When no column is long the index is built in
+heap order and written as version 9, as an index without `cluster_column` is. A build with no
+rows, and `ambuildempty()`, have nothing to measure and decide by type: a varlena, or a fixed
+width of 8 bytes or more (2 to 4 RAW pages at the 2,000 to 3,500 rows of a full window), is long.
+
+Why 4: a gather of an ordered column reads, a window, the permutation's page, at least one data
+page, and the window header again to check the generation (below) - about three page accesses -
+so a chain of three pages or fewer cannot gain even for a pinned value, and loses the heap's
+locality for every predicate that does not pin one. The first measurement used 3 and forced the
+order column into key order; on `docs` ordered by `grp`, `id` (2.9 pages a window) and `grp` (one)
+in key order made the unpinned tag queries read twice the buffers of heap order, while on
+`fact`, `id` (4 pages) in key order made the pinned sum 1.5 times faster than `id` in heap layout
+(the tables below).
+
+The set is fixed at build and recorded on the meta page's order record (`order_cols`, a bit per
+stored ordinal, in what was reserved space); every later window and every insert keeps it.
+`LionStoreCol.kind` says which layout a column has, and the code paths already branched on it:
+the insert writes a heap-layout column at (k, offset) and an ordered one at its bucket slot; a
+split moves ordered columns only; VACUUM clears a heap-layout page by the heap TID, as version 9
+does, and an ordered one by the permutation's dead positions; verify() checks each by its own
+layout; `lion_index_store_window()` reports the ordered columns' pages and the heap-layout
+columns' pages apart. WAL is unchanged: both kinds are store pages.
+
+The planner's page model (`lion_store_window_pages()`) takes the index column whose chain it
+prices: a heap-layout column is priced as in heap order, with no permutation page; an ordered
+one as before. A caller that does not know which columns it reads (the index-only scan's gather,
+which gathers every returnable column, and the count) prices the stored columns' average.
+
+#### Buckets: B-tree style inserts, no re-sort
+
+A window's 128 virtual pages are **buckets**: each holds the rows of one range of the order
+column, in key order within the window's bucket table, though not necessarily in key order
+within the bucket. The window header (still the permutation head's dictionary item) holds:
+
+- `LionStoreWinHdr`: a 32-bit generation, the bucket count, the directory's entries, the fence
+  bytes and flags (THIN);
+- one `LionStoreBucket` per bucket, in key order: its virtual page, the slots it has handed out
+  (`used`, a high-water mark, at most `MaxHeapTuplesPerPage`, 291), and its **low fence** - the
+  smallest (order value, NULL, heap lo) it may hold - as an offset into the fence bytes, with the
+  flag LOW on the first bucket (no lower bound), NULL for a NULL fence, and SAME for a fence
+  whose value is longer than 256 bytes and is taken to equal the previous fence's (a coarser
+  range, still sound);
+- the directory, as before (`LionStoreDirEnt`), thinned when the header passes half a page.
+
+A build sorts a window by (value, heap lo), gives each bucket V = ⌈n / 64⌉ rows (halved while a
+bucket's values would not fit one page, up to 128 buckets), and leaves the rest of each bucket's
+291 slots free. **Build slack**: an ordered column's chain pages are filled to the index's
+`fillfactor` (90 by default, the same reloption that fills its directory leaves), so an insert's
+new slot finds room on its page; a page of a single virtual page may fill the whole capacity, and
+heap-layout columns, whose inserts reuse heap positions, are packed full as before. When a page
+does run out, §40 splits it, byte-balanced (`lion_store_split_point()`), keeping the left page's
+block and first virtual page, so the directory stays right (the split adds the new right page to
+the directory through a `LionStoreNote`).
+
+The slack was added after a measurement, not before: without it the build packed every page of
+a chain but the last to the brim (the page count is the same either way for a chain of a few
+pages; what moves is where the free space is), the first insert into any bucket split its page,
+and the micro-benchmark below ended 35% larger than heap order. With it, 7% smaller.
+
+**Insert.** Under the window lock in share mode, `lion_store_take_slot()` finds the bucket whose
+fence range covers the row (binary search on the fences), and takes slot `used + 1` under the
+permutation head's exclusive lock, writing the header. Each ordered column is written at
+(bucket's virtual page, slot) with no ABSENT fallback; heap-layout columns at the heap position;
+the permutation entry last. Two inserts into one bucket take different slots under the head's
+lock and write their columns concurrently, as §40's inserts into one heap page do.
+
+**Split.** A bucket with no free slot, or one where a value no longer fits the column's page,
+is split under the window lock taken exclusively (`lion_store_split_bucket()`), and the insert
+tries again (at most eight times):
+
+- a bucket with no live row is reset: `used` back to 0, its sub-arrays cleared, no row moves;
+- a key above (or below) every live row of the bucket, when the bucket is merely full, opens a
+  new empty bucket at a free virtual page with the key as its fence, and moves nothing: rising
+  keys - a timestamp, a serial - append buckets as a B-tree's rightmost split does, and pay only
+  the header;
+- otherwise the live rows (the permutation's entries naming the bucket) are sorted and moved to
+  one new bucket when at most half the slots are live (compaction), or split at the median into
+  two (always two when a value did not fit). Each target virtual page's sub-array is written
+  whole in each ordered column; then the permutation entries are switched (one record a page);
+  then the header with the new buckets, fences and the next generation; and only then are the old
+  bucket's sub-arrays cleared.
+
+A crash between those steps leaves either the old layout whole (targets written, nothing
+switched: the targets' virtual pages are named by no bucket and no entry, and are reused), or
+entries naming target pages that the header does not yet list (**orphans**), with stale copies
+of their rows left in the old bucket's slots, which no entry names. verify() allows both. A
+reader follows an orphaned entry to the values, which are written; no split moves an orphaned
+row or reuses its virtual page (a fresh virtual page is one no bucket has and no entry names);
+VACUUM clears orphaned rows as they die, and a page no entry names any more is free again. Until
+then it counts against the window's 128. What never happens is an entry naming a cleared slot.
+
+No room: when the header cannot take another bucket and fence (a long order value and many
+buckets), or every one of the 128 virtual pages is taken, the split fails and the row is
+**unplaced**: its permutation entry is NULL and its ordered columns hold nothing for it. A
+reader reports an unplaced member on its heap page's absent bit, and takes the row from the heap,
+as §40 does with an ABSENT heap page. Only the extreme case in `store.sql` reaches it (order values
+of 240 bytes); an index whose order values are short never does.
+
+**Readers.** A reader takes the generation from the header with the permutation's entries and
+checks it again after the data walk (`lion_store_gen_same()`); a split between the two changed
+it, and the window is read again. The leader of a gather keeps the permutation's head pinned
+across its data walk (`LionStoreWalk.keephead`, released by the check, within one gather call:
+the row and count readers are not always closed, so no pin outlives a call), so the check costs
+no buffer lookup; a follower reads the head again. Pages no longer carry a generation. The window lock keeps splits out while an insert writes its row; readers take no
+lock.
+
+**VACUUM** clears dead rows from the ordered columns (by the permutation's dead positions) and
+from the permutation, under the window lock in share mode, which keeps a split from moving a row
+between finding it dead and clearing it; it sorts nothing and frees nothing but windows past the
+heap's end. A cleared slot is not reused in place: `used` only grows, and a bucket that runs out
+of slots is compacted or split by the next insert that needs it. No generation is bumped,
+since nothing moves.
+
+**What went away:** the append region and its virtual pages 64 .. 127, the re-sort in VACUUM's
+cleanup with its phantom check and its file growth, the per-page generation bits, the insert's
+probe of a stale entry, and the idle VACUUM's read of every window's permutation to decide
+whether to sort.
+
+#### As built: the insert's cost
+
+An ordered insert writes two pages a heap-layout insert does not: the window header (the
+bucket's `used`) and the permutation entry. Both are WAL-logged; in generic WAL mode (the default
+without `shared_preload_libraries`) each costs a page image delta (`computeRegionDelta()` took
+about 40% of the insert's time in a sampling profile). `lion_store_take_slot()` therefore reads
+the bucket table in place, with the bounds checks a reader makes, rather than parsing the header
+into memory, and logs the two bytes of `used` it changed (a SETBYTES edit in rmgr mode, a
+two-byte region in generic mode); the order column's SortSupport is set up once an insert state
+(`ix->storessup`). That took the 100k-row insert from 3,815 ms to 3,432 (heap layout: 2,627). A
+split rewrites the bucket's sub-arrays and the header as §40's page writes do.
+
+#### Measured
+
+A release build, 5,000,000 rows, `shared_buffers` 512 MB, 4 cores, load about 0.5 to 1.
+"Item 1" is the base branch alone, every index in heap order; "rev. 2" is this revision at its
+last commit, unless noted. Warm figures are medians of 5 after a warm-up; cold ones a restart and
+an OS cache drop each, interleaved A/B over 6 repetitions where marked (cold runs not interleaved
+varied by up to a factor of two for one index between sessions).
+
+Pinned predicates (the reason for an order):
+
+| query | item 1 default plan | item 1, store forced | rev. 2 (default plan: `LionStoreScan`) |
+|---|---|---|---|
+| `fact`, `sum(..) WHERE c200 = 17`, ix_wide by `c200` | bitmap heap, 33.3 ms, 21,974 bufs | 71.6 ms, 54,868 | 20.6 ms, 13,694 |
+| `fact`, rows `WHERE c200 = 17` | 32.9 ms | 64.8 ms, 57,879 | 25.8 ms, 16,706 |
+| `fact`, sums `c200 IN (3 values)` | 116 ms | | 41.3 ms |
+| `fact`, rows `c200 IN (3 values)` | 112 ms | | 45.2 ms |
+| `fact`, group `WHERE c200 = 17` | 24.8 ms | | 16.9 ms |
+
+Cold, single runs: rows `c200 = 17` 395 ms against item 1's 485. With
+`store_order_min_pages = 5`, which leaves `id` (4 pages) in heap layout, the pinned sum took
+31.6 ms against 22.9 with `id` ordered: the evidence for 4.
+
+Unpinned predicates:
+
+| query | item 1 (heap order) | rev. 2 | first revision |
+|---|---|---|---|
+| `docs` 0.5% tag, `id, grp`, ordered by `grp` | 29 ms, 13,380 | 29 to 34 ms, 13,384 | 38 ms, 18,247 |
+| `docs` tag group sum, by `grp` | 63 ms, 15,006 | 64 to 71 ms, 15,010 | |
+| `docs` 5% tag with `payload`, by `grp`, settled warm | 164 ms, 67,741 | 220 ms, 76,800 | 323 ms, 75,885 |
+| `fact` four indexes each by its own key: rows `IN` | 64 ms, 21,089 | 59 to 62 ms, 21,092 | 117 ms, 28,627 |
+| ... aggregate `IN` sum | 11.4 ms, 7,432 | 11.8 to 14.5 ms, 7,287 | |
+| ... group by `c20` (unpinned `id` from ix_c20) | 24 ms, 10,441 | 33 to 36 ms, 14,700 | 35.5 ms |
+
+The 5% `payload` query is the residual cost of an order on a predicate it does not pin: about
+one permutation page a window and 2.6 more `payload` pages, because a virtual page of the ordered
+chain holds 3 buckets of about 2.4 KB each, where heap layout packs the window's selected rows
+into fewer pages. A `fillfactor` of 100 did not change it. The `c20` group reads `id`, a long
+column there, in `c20`'s order. With no `cluster_column`, every `fact` query read the same
+buffers as item 1.
+
+The cold gather of `payload` (the store forced, `docs` 0.5%, interleaved, 6 repetitions): ordered
+by `grp` 301 ms cold, 70.6 warm, 42,416 buffers; heap order 398 cold, 76.8 warm, 62,028. The first
+revision took 1,040 ms cold.
+
+Writes (`store_micro`: 1,000,000 rows, `(k) INCLUDE (g, id, p)`, medians of 3):
+
+| step | item 1, heap | rev. 2, heap | rev. 2 by `k` | first revision by `k` |
+|---|---|---|---|---|
+| build (ms) | 321 | 353 | 651 | 564 |
+| insert 100k | 2,710 | 2,627 | 3,432 | 2,578 |
+| VACUUM, 10% dead | 146 | 167 | 154 | 205 |
+| insert 100k into the freed space | 3,435 | 3,574 | 4,693 | 3,029 |
+| VACUUM (the first revision's re-sort) | 145 | 150 | 155 | 362 |
+| idle VACUUM | 8 | 8 | 8 | 12 |
+| index size at the end | 32.3 MB | 32.3 MB | 29.8 MB | 47.8 MB |
+
+VACUUM is within 10% of heap order in both cases (run-to-run spread 130 to 190 ms), and the file
+does not grow from a re-sort: the ordered index ends smaller than heap order's. The insert into
+freed space grew it by 3.0 MB (heap order 3.2 MB).
+
+Builds: ix_docs 6.6 to 7.0 s and 625.9 MB (item 1 5.8 s, 571.5 MB); ix_wide 4.7 s, 533.5 MB
+(3.3 s, 508.9 MB); `fact`'s single-column indexes 1.5 to 1.6 times slower and 25 MB larger each,
+mostly the permutation (2 bytes a row) and header.
+
+#### Caveats
+
+- An ordered insert is about 30% slower than a heap-layout one in generic WAL mode (two more
+  pages logged); a build is 1.2 to 2 times slower (2 on the micro-benchmark).
+- A predicate that does not pin the order column still pays for the long columns: 34% slower and
+  13% more buffers for the `docs` 5% `payload` query, more where those buffers push the working
+  set past `shared_buffers`; 40% for the `c20` group on four separately ordered indexes.
+- Heap-layout columns get no build slack, as in §40; a dense window's permutation head
+  (thousands of rows, a long header) spills to two pages.
+- Unplaced rows are read from the heap; orphans of a crashed split stay until their rows die;
+  the directory remains a hint that a walk verifies.
+- The order stays opt-in. The composite order (several columns, skip-scan style) is not done.
+
+#### As built: tests
+
+`store.sql` section 9 tests the buckets on narrow rows with `pg_lion.store_order_min_pages = 0`:
+a build's 64 buckets; inserts into a built window and into new windows, which start as one bucket
+and split (75 buckets after 11,840 inserts); a heap position reused after VACUUM; compaction (a
+window whose rows are deleted and replaced seven times: 69 buckets, generation 64); rising keys,
+which open buckets without moving rows (generation 1 at 41 buckets); values too wide for a
+bucket's slots to fit a page (NOFIT splits); unplaced rows; truncation; an empty build; REINDEX.
+Section 10 tests the choice of columns: mixed windows through inserts, VACUUM and the readers,
+the fallback to heap order, and an empty build by type. `store_split_reader.spec` parks a reader
+before the permutation's walk and between the walks while an insert splits the bucket holding its
+row; with the generation check removed, the second permutation returns the row's order value as
+NULL (checked once by hand). The recovery schema has one index whose columns were chosen by type
+(built empty) and one with every column ordered.

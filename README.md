@@ -508,7 +508,7 @@ on an INCLUDE column goes to the heap, another index, or the filter of a scan th
 | --- | --- | --- | --- |
 | `store_values` | bool | off | store the scalar key columns too (INCLUDE columns are always stored) |
 | `store_max_len` | 0 .. 2000 | 0 | a stored varlena column may go RAW, in slots of this many bytes plus two; a longer value is an ERROR; 0 = dictionary-coded only |
-| `cluster_column` | name | none | lay each window's store out in the order of this stored column, key or INCLUDE (below); without it, heap order |
+| `cluster_column` | name | none | lay each window's long columns out in the order of this stored column, key or INCLUDE (below); without it, heap order |
 
 All three are read at build time and recorded in the index; `ALTER INDEX ... SET` takes effect at
 the next REINDEX.
@@ -548,24 +548,30 @@ cleared, and for a heap page left to the heap; it reads the store, not the heap,
 dead and never-committed rows too.
 
 **Key-ordered windows** (DESIGN.md §41). An index that names a stored column in `cluster_column`
-lays each window's store out in that column's order rather than the heap's, behind a per-window
-permutation from heap position to slot: the rows one value of the column selects are adjacent, so
-an `=` or `IN` on that column reads one or two pages of each column's chain a window instead of
-every page its rows fall on. On the quick benchmark's `fact` table, `(c200) INCLUDE (c20, c20k, id,
-payload)` ordered by `c200` returns `WHERE c200 = 17` (0.5% of the rows) from the store in 12,968
-buffers instead of 57,879, 21 ms warm instead of 80 and 369 ms cold instead of 665, ahead of the
-heap path's 35 ms warm and 597 cold. The price falls on every other predicate: a gather under a predicate on
-another column reads the window's permutation page too, and loses whatever locality its rows had
-in heap order (a 5% tag query on an index of `docs` ordered by `grp` read 12% more buffers and ran
-1.7 to 3 times slower), so order an index by the column its row and aggregate queries pin, and
-only then. An array or tsvector index gets an order the same way: name an INCLUDE column. An
-ordered index is format 10, which the builds before this one refuse; an index without
-`cluster_column` is written as format 9 exactly as before, and a format 9 index keeps working as
-it is. Inserts go to an append area of their window;
-VACUUM sorts a window again once a quarter of its rows are outside the sorted order (appended, or
-cleared by VACUUM), and only when no insert is writing to the window at that moment.
-`lion_index_store_window(idx, window)` reports one window's layout: the order column, the
-generation, the rows sorted and appended, the permutation's pages and directory.
+lays each window's long columns out in that column's order rather than the heap's, behind a
+per-window permutation from heap position to slot: the rows one value of the column selects are
+adjacent, so an `=` or `IN` on that column reads one or two pages of each such column's chain a
+window instead of every page its rows fall on. On the quick benchmark's `fact` table, `(c200)
+INCLUDE (c20, c20k, id, payload)` ordered by `c200` returns `WHERE c200 = 17` (0.5% of the rows)
+from the store several times faster than heap order's store, and ahead of the heap path (the
+measurements are in DESIGN.md §41, "Revision 2"). Only a column whose chain is long - 4 pages a
+window or more in a build's first window (`pg_lion.store_order_min_pages`) - is laid out in key
+order; the short ones, the order column itself included when it is short, keep heap layout beside
+them and cost a query exactly what they do in heap order. A predicate that does not pin the
+order column still pays for the long ones: the window's permutation page, and the heap's locality
+(on `docs` ordered by `grp`, the 5% tag query that returns the wide `payload` read 13% more
+buffers and ran a third slower with its pages cached), so order an index by the column its row and
+aggregate queries pin, and only then. An array or tsvector index gets an order the same way: name
+an INCLUDE column. An index none of whose columns is long is built in heap order whatever its
+`cluster_column`. An ordered index is format 10, which the builds before this one refuse; an index
+without `cluster_column` is written as format 9 exactly as before, and a format 9 index keeps
+working as it is. Each window is kept in order as a B-tree keeps its leaves: its 128 virtual pages
+are buckets of the order column's ranges, filled to the index's `fillfactor` at build; an insert
+takes a slot in the bucket of its value, and a full bucket is split or compacted by the insert
+that needs room, so VACUUM only clears dead rows and never sorts. `lion_index_store_window(idx,
+window)` reports one window's layout: the order column, the generation, the buckets and the slots
+they have handed out, the permutation's entries, the directory, and the pages of the permutation,
+of the ordered columns and of the others.
 
 ### Rows from the store: `LionStoreScan`
 
@@ -834,8 +840,9 @@ may still be replayed - the rule core states for every custom resource manager.
 store above (DESIGN.md §40).  `store_values` stores the index's scalar key columns as well as its
 INCLUDE columns; `store_max_len` lets a stored varlena column's pages turn RAW, in slots of that
 many bytes plus two, and makes a longer value an ERROR - with 0 a varlena column is only ever
-dictionary-coded.  `cluster_column` (a stored column's name) orders each window's store by
-that column (DESIGN.md §41).  All three are read at build time.
+dictionary-coded.  `cluster_column` (a stored column's name) orders each window's long columns
+by that column (DESIGN.md §41); `fillfactor` then also sets how full a build packs their pages.
+All three are read at build time.
 `lion_index_stats()` reports ONE ROW PER KEY COLUMN (DESIGN.md §24), with a leading `attno`: the
 directory's height, its leaf and internal pages and whether that column is `ordered` (false for a
 key type with no btree opclass, whose entries are then in a complete but arbitrary order), the
@@ -924,9 +931,11 @@ few rows rather than built (DESIGN.md §29.11, "Trees probed"; `Trees Built` and
 `pg_lion.enable_filter_switch` (on), whether an FK-side join that probes its fact filters may
 collect them part way through (DESIGN.md §27, "Probed, then collected"), and
 `pg_lion.vacuum_barrier_ranges` (superuser), how many visited-block ranges VACUUM batches in rmgr
-mode (DESIGN.md §25), and `pg_lion.store_heap_order` (off), which makes a build lay the window
+mode (DESIGN.md §25), `pg_lion.store_heap_order` (off), which makes a build lay the window
 store out in heap order as format 9 whatever its order column, so that format 9's path stays tested
-(DESIGN.md §41).
+(DESIGN.md §41), and `pg_lion.store_order_min_pages` (4), the pages a stored column's chain must
+take in a build's first window for an ordered index to lay that column out in key order (0: every
+column).
 `pg_lion.rmgr_id` is described under `wal_mode` above.
 
 Cost settings, for calibrating Lion's cost model on your own workload the way `random_page_cost`
