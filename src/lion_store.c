@@ -1786,10 +1786,15 @@ lion_store_layout_single(const LionStoreCol *col, LionStoreModel *m, int k,
 	lion_store_images_add(out, &img);
 }
 
-/* Lay heap (or virtual) pages 0 .. hi of m out as page images. */
+/*
+ * Lay heap (or virtual) pages 0 .. hi of m out as page images, filling each
+ * to cap bytes of LION_PAGE_CAPACITY: less leaves room for the slots later
+ * inserts add to an ordered window's buckets (§41, "Revision 2: build
+ * slack").  A page of one heap or virtual page may fill the whole capacity.
+ */
 static void
 lion_store_layout(const LionStoreCol *col, LionStoreModel *m, int hi,
-				  LionStoreDictSet *ds, LionStoreImages *out)
+				  Size cap, LionStoreDictSet *ds, LionStoreImages *out)
 {
 	LionStoreImage img;
 	int			mode;
@@ -1803,10 +1808,12 @@ lion_store_layout(const LionStoreCol *col, LionStoreModel *m, int hi,
 	lion_store_dset_reset(ds);
 	while (k <= hi)
 	{
+		Size		need;
+
 		if (mode == LION_STORE_DICT)
 			lion_store_dset_add_page(ds, m, k);
-		if (lion_store_group_need(col, m, start, k, mode, ds) <=
-			LION_PAGE_CAPACITY)
+		need = lion_store_group_need(col, m, start, k, mode, ds);
+		if (need <= cap || (k == start && need <= LION_PAGE_CAPACITY))
 		{
 			k++;
 			continue;
@@ -2379,6 +2386,7 @@ struct LionStoreBuild
 	/* an ordered index (§41): its comparator, and the open window's rows */
 	bool		ordered;
 	bool		decided;		/* its columns' layouts are settled */
+	Size		sortedcap;		/* the bytes it fills an ordered column's page to */
 	SortSupportData ssup;
 	uint8		present[LION_BLOCKS_PER_CONTAINER][(MaxHeapTuplesPerPage + 7) / 8];
 
@@ -2421,6 +2429,19 @@ lion_store_build_begin(Relation index, LionIndexState *ix, BulkWriteState *bulk,
 	sb->ordered = (ix->store_order >= 0);
 	if (sb->ordered)
 		lion_store_order_ssup(index, ix, &sb->ssup, cxt);
+
+	/*
+	 * An ordered column's pages are filled to the index's fillfactor, as its
+	 * directory leaves are: an insert adds a slot to its bucket's virtual
+	 * page rather than reusing a heap position's, and a page with no room
+	 * left splits (§41, "Revision 2: build slack").
+	 */
+	{
+		LionOptions *opts = (LionOptions *) index->rd_options;
+		int			ff = opts ? opts->fillfactor : LION_DEFAULT_FILLFACTOR;
+
+		sb->sortedcap = (Size) LION_PAGE_CAPACITY * (Size) ff / 100;
+	}
 	sb->leaf = (BlockNumber *) MemoryContextAlloc(cxt, LION_STOREMAP_ITEM_SIZE);
 	sb->maxleafblks = 16;
 	sb->leafblks = (BlockNumber *)
@@ -2503,7 +2524,10 @@ lion_store_build_emit(LionStoreBuild *sb, const LionStoreCol *col,
 	memset(&li, 0, sizeof(li));
 	m->ckey = sb->ckey;
 	m->ord = (uint16) col->ord;
-	lion_store_layout(col, m, hi, &sb->ds, &li);
+	lion_store_layout(col, m, hi,
+					  (so != NULL && col->kind == LION_STORE_KIND_ORDERED) ?
+					  sb->sortedcap : LION_PAGE_CAPACITY,
+					  &sb->ds, &li);
 	Assert(li.n > 0);
 
 	first = *sb->nblocks;
@@ -2580,7 +2604,7 @@ lion_store_build_pages(LionStoreBuild *sb, const LionStoreCol *col,
 	memset(&li, 0, sizeof(li));
 	m->ckey = sb->ckey;
 	m->ord = (uint16) col->ord;
-	lion_store_layout(col, m, sb->maxpage, &sb->ds, &li);
+	lion_store_layout(col, m, sb->maxpage, LION_PAGE_CAPACITY, &sb->ds, &li);
 	n = li.n;
 	memcpy(m->absent, absent, sizeof(absent));
 	MemoryContextSwitchTo(old);
