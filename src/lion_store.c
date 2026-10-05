@@ -5933,6 +5933,8 @@ typedef struct LionStoreWalk
 	const LionStoreDirEnt *dir; /* entries for the column, ascending lo */
 	int			ndir;
 	bool		nojump;			/* enter by the directory, then walk right */
+	bool		keephead;		/* keep the head's pin in headbuf (PERM) */
+	Buffer		headbuf;
 	uint64		absent[2];		/* pages ABSENT, or without the slot */
 	uint64		missing[2];		/* of those, the ones not ABSENT */
 } LionStoreWalk;
@@ -6215,6 +6217,22 @@ lion_store_keep_dir(LionStoreReader *r, Page page, LionStoreWalk *w)
 }
 
 /*
+ * Done with buf, which a walk read: released, unless it is the head a
+ * permutation walk keeps pinned for the generation's check after the data
+ * walk (lion_store_gen_same()), which then takes it without reading it
+ * again.  A pin, not a lock: the check locks it.
+ */
+static inline void
+lion_store_walk_drop(LionStoreWalk *w, Buffer buf, BlockNumber head)
+{
+	if (w->keephead && !BufferIsValid(w->headbuf) &&
+		BufferGetBlockNumber(buf) == head)
+		w->headbuf = buf;
+	else
+		ReleaseBuffer(buf);
+}
+
+/*
  * Walk the chain of map slot `slot` (column col of window ckey) for the
  * sorted addresses lo[0 .. nlo - 1], heap lo for a heap-order or a
  * permutation chain, virtual lo for a data chain of an ordered index.
@@ -6300,7 +6318,7 @@ lion_store_walk(LionStoreReader *r, const LionStoreCol *col,
 		if (!BufferIsValid(buf) || BufferGetBlockNumber(buf) != blk)
 		{
 			if (BufferIsValid(buf))
-				ReleaseBuffer(buf);
+				lion_store_walk_drop(w, buf, head);
 			buf = ReadBuffer(r->index, blk);
 		}
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -6414,7 +6432,7 @@ lion_store_walk(LionStoreReader *r, const LionStoreCol *col,
 	}
 
 	if (BufferIsValid(buf))
-		ReleaseBuffer(buf);
+		lion_store_walk_drop(w, buf, head);
 }
 
 /*
@@ -6559,19 +6577,29 @@ lion_store_keep_perm(LionStoreReader *r, uint32 ckey, const uint16 *lo, int nlo,
  * Is window ckey's generation still gen (§41, "Reads")?  The permutation
  * head's window header, read again after a data walk: a split that moved a
  * row the walk read, and wrote another row into its old slot, advanced it
- * first.  A head that is no longer the window's is a change too.
+ * first.  A head that is no longer the window's is a change too.  pinned is
+ * the head the permutation's walk kept pinned (InvalidBuffer for a follower,
+ * which took its leader's entries), used if it is still the head; released
+ * either way.
  */
 static bool
-lion_store_gen_same(LionStoreReader *r, uint32 ckey, uint64 pslot, int64 gen)
+lion_store_gen_same(LionStoreReader *r, uint32 ckey, uint64 pslot, int64 gen,
+					Buffer pinned)
 {
 	BlockNumber head = lion_store_reader_head(r, &r->pcache, pslot, false);
 	Buffer		buf;
 	Page		page;
 	bool		same = false;
 
+	if (BufferIsValid(pinned) &&
+		(!BlockNumberIsValid(head) || BufferGetBlockNumber(pinned) != head))
+	{
+		ReleaseBuffer(pinned);
+		pinned = InvalidBuffer;
+	}
 	if (!BlockNumberIsValid(head))
 		return false;
-	buf = ReadBuffer(r->index, head);
+	buf = BufferIsValid(pinned) ? pinned : ReadBuffer(r->index, head);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	if (lion_store_page_owned(page, ckey, (uint16) r->ix->nstored) &&
@@ -6620,6 +6648,8 @@ lion_store_gather_ordered(LionStoreReader *r, uint32 ckey, const uint16 *lo,
 		memset(&pw, 0, sizeof(pw));
 		pw.gen = -1;
 		pw.wanthdr = true;
+		pw.keephead = true;
+		pw.headbuf = InvalidBuffer;
 		r->ndir = 0;
 		r->nalldir = 0;
 		if (fresh || !lion_store_shared_perm(r, ckey, lo, nlo, &pw))
@@ -6674,8 +6704,13 @@ lion_store_gather_ordered(LionStoreReader *r, uint32 ckey, const uint16 *lo,
 		lion_store_plan_walk(r, &dw, r->vlo, np);
 		lion_store_walk(r, col, &r->cache, ckey, dslot, fresh, r->vlo, np,
 						r->vval, r->vnull, &dw);
-		if (pw.gen >= 0 && !lion_store_gen_same(r, ckey, pslot, pw.gen))
-			continue;
+		if (pw.gen >= 0)
+		{
+			if (!lion_store_gen_same(r, ckey, pslot, pw.gen, pw.headbuf))
+				continue;
+		}
+		else if (BufferIsValid(pw.headbuf))
+			ReleaseBuffer(pw.headbuf);
 
 		/* back to the members' order, and their heap pages' bits */
 		*absent_pages |= unplaced;
