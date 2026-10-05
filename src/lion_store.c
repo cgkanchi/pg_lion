@@ -5902,6 +5902,7 @@ struct LionStoreReader
 	 */
 	double		rpc;
 	double		spc;
+	bool		prefetch;		/* PrefetchBuffer() can read ahead */
 
 	/*
 	 * The permutation shared among the readers of one index's columns
@@ -5976,6 +5977,11 @@ lion_store_open(Relation index, LionIndexState *ix, int ord, MemoryContext cxt)
 	r->pcache.leafblk = InvalidBlockNumber;
 	r->pcache.head = InvalidBlockNumber;
 	get_tablespace_page_costs(index->rd_rel->reltablespace, &r->rpc, &r->spc);
+#ifdef USE_PREFETCH
+	r->prefetch = get_tablespace_io_concurrency(index->rd_rel->reltablespace) > 0;
+#else
+	r->prefetch = false;
+#endif
 	return r;
 }
 
@@ -6442,9 +6448,14 @@ lion_store_walk(LionStoreReader *r, const LionStoreCol *col,
  * jumps to each of the others reads J pages at random, one that enters at the
  * first and reads on to the last reads R pages, all but the first in chain
  * order - consecutive blocks, as a build or a split lays them, which the
- * kernel reads ahead.  The walk jumps when J random reads cost less than one
- * random and R - 1 sequential ones at the tablespace's page costs, and asks
- * for the pages it will jump to ahead of the walk; otherwise it reads on.
+ * kernel reads ahead.  Where the pages can be asked for ahead of the walk
+ * (PrefetchBuffer(), with the tablespace's effective_io_concurrency above
+ * 0), the walk jumps whenever it skips a page, asking for every page it will
+ * jump to first, so that the reads overlap: measured cold on the docs store,
+ * the jumps then beat both reading on and heap order's walk, which jumps
+ * without prefetching did not (DESIGN.md §41, "Revision 2").  Where they
+ * cannot, it jumps only when J random reads cost less than one random and
+ * R - 1 sequential ones at the tablespace's page costs.
  */
 static void
 lion_store_plan_walk(LionStoreReader *r, LionStoreWalk *w, const uint16 *vlo,
@@ -6469,8 +6480,8 @@ lion_store_plan_walk(LionStoreReader *r, LionStoreWalk *w, const uint16 *vlo,
 		}
 		last = d;
 	}
-	if ((double) npages * r->rpc <
-		r->rpc + (double) (last - first) * r->spc)
+	if (r->prefetch ? npages <= last - first :
+		(double) npages * r->rpc < r->rpc + (double) (last - first) * r->spc)
 	{
 		int			prev = first;
 
