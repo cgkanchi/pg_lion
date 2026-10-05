@@ -161,14 +161,39 @@ extern int	lion_store_choose_order(Relation index, LionIndexState *ix,
  * order, nothing changes): the columns' kinds and the permutation's column.
  */
 extern void lion_store_fill_order(Relation index, LionIndexState *ix,
-								  int order, MemoryContext cxt);
+								  int order, uint32 order_cols,
+								  MemoryContext cxt);
 
-/* The order column a version 10 meta page records, -1 for any other. */
+/*
+ * The stored ordinals of an ordered index laid out in key order (bit i for
+ * ordinal i; §41, "Revision 2: short chains in heap order"); 0 in heap order.
+ */
+extern uint32 lion_store_order_cols(const LionIndexState *ix);
+
+/*
+ * The columns an ordered index with no rows to measure lays out in key order,
+ * by their types (§41): 0 says no column is worth it, and the index is built
+ * in heap order.
+ */
+extern uint32 lion_store_order_cols_by_type(const LionIndexState *ix, int order);
+
+/*
+ * The order column a version 10 meta page records, -1 for any other, and the
+ * columns it lays out in key order (*order_cols).
+ */
 extern int	lion_read_meta_store_order(Relation index,
-									   const LionMetaPageData *meta);
+									   const LionMetaPageData *meta,
+									   uint32 *order_cols);
 
 /* pg_lion.store_heap_order: builds write heap order (a testing knob, §41). */
 extern bool lion_store_heap_order;
+
+/*
+ * pg_lion.store_order_min_pages: the heap-order chain pages a column's chain
+ * takes in a build's first window for an ordered index to lay that column out
+ * in key order (§41); 0 lays every column out in key order.
+ */
+extern int	lion_store_order_min_pages;
 
 /*
  * Read the meta page's store record into *store, zeroed when meta's version
@@ -283,10 +308,11 @@ extern void lion_store_window_info(Relation index, LionIndexState *ix,
  * column the gathered members have (0: not pinned, lion_store_shape_pin()).  Every reader's cost
  * function prices a window's chain of a column as for heap order -
  * heapreads pages of colpages for `members` members of the window - and
- * lion_store_window_pages() says what the order makes of it: the pages the
- * members of each pinned value span as adjacent slots, never more than
- * heapreads, plus the permutation's pages, which every gather reads.  In
- * heap order it is heapreads, unchanged.
+ * lion_store_window_pages() says what the order makes of it: for a column in
+ * key order, the pages the members of each pinned value span as adjacent
+ * slots, never more than heapreads, plus the permutation's pages, which
+ * every gather of one reads; for a column an ordered index keeps in heap
+ * layout (§41, "Revision 2"), and in heap order, heapreads, unchanged.
  */
 typedef struct LionStoreShape
 {
@@ -296,6 +322,8 @@ typedef struct LionStoreShape
 	double		datapages;
 	int			ordercol;		/* the order column's index column */
 	double		nvals;
+	uint32		keyordered;		/* index columns in key order, bit attno - 1 */
+	double		fracordered;	/* ... the share of the stored columns */
 } LionStoreShape;
 
 struct IndexOptInfo;
@@ -310,7 +338,11 @@ extern void lion_store_shape(LionIndexState *ix, struct IndexOptInfo *idx,
  */
 extern void lion_store_shape_pin(struct IndexOptInfo *idx, LionStoreShape *sh,
 								 List *clauses, List *except);
-extern double lion_store_window_pages(const LionStoreShape *sh,
+/*
+ * indexcol is the index column (1-based) whose chain is priced, or 0 for a
+ * column of the index's stored ones not known, priced as their average.
+ */
+extern double lion_store_window_pages(const LionStoreShape *sh, int indexcol,
 									  double heapreads, double colpages,
 									  double members);
 

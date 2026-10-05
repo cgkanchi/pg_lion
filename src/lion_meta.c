@@ -436,7 +436,8 @@ lion_meta_record_store(Page metapage, const LionMetaStore *store)
  * index in heap order, leaves it version 9.
  */
 void
-lion_meta_record_store_order(Page metapage, int order_ord, uint16 flags)
+lion_meta_record_store_order(Page metapage, int order_ord, uint16 flags,
+							 uint32 order_cols)
 {
 	LionMetaStoreOrder *mo;
 
@@ -448,6 +449,7 @@ lion_meta_record_store_order(Page metapage, int order_ord, uint16 flags)
 	memset(mo, 0, sizeof(LionMetaStoreOrder));
 	mo->order_ord = (int16) order_ord;
 	mo->order_flags = flags;
+	mo->order_cols = order_cols;
 	((PageHeader) metapage)->pd_lower = LION_META_ORDER_END;
 	Assert(((PageHeader) metapage)->pd_lower <= ((PageHeader) metapage)->pd_upper);
 }

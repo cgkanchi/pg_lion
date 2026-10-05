@@ -29,6 +29,7 @@ setup
 	CREATE EXTENSION IF NOT EXISTS injection_points;
 	CREATE TABLE stsp (k int, t text) WITH (autovacuum_enabled = off);
 	INSERT INTO stsp SELECT i, 'v' || i FROM generate_series(1, 3000) i;
+	SET pg_lion.store_order_min_pages = 0;
 	CREATE INDEX stsp_i ON stsp USING lion (k) INCLUDE (t)
 		WITH (store_values = on, cluster_column = k);
 }

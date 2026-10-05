@@ -626,7 +626,8 @@ typedef struct LionMetaStoreOrder
 {
 	int16		order_ord;
 	uint16		order_flags;
-	uint32		reserved[3];	/* zero */
+	uint32		order_cols;		/* the stored ordinals laid out in key order */
+	uint32		reserved[2];	/* zero */
 } LionMetaStoreOrder;
 
 StaticAssertDecl(sizeof(LionMetaStoreOrder) == 16,
@@ -1845,7 +1846,7 @@ extern void lion_meta_record_narrow(LionMetaPageData *meta, bool narrow);
  */
 extern void lion_meta_record_store(Page metapage, const LionMetaStore *store);
 extern void lion_meta_record_store_order(Page metapage, int order_ord,
-										 uint16 flags);
+										 uint16 flags, uint32 order_cols);
 
 /*
  * The distinct keys of each key column (DESIGN.md §33).  Fill in a count of

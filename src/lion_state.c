@@ -799,6 +799,7 @@ lion_get_index_state(Relation index)
 	LionMetaPageData meta;
 	LionMetaStore store;
 	int			order;
+	uint32		order_cols;
 	uint64		gen;
 
 	if (!lion_proc_callback_registered)
@@ -880,7 +881,7 @@ lion_get_index_state(Relation index)
 	gen = lion_proc_generation;
 	lion_read_meta(index, &meta);
 	lion_read_meta_store(index, &meta, &store);
-	order = lion_read_meta_store_order(index, &meta);
+	order = lion_read_meta_store_order(index, &meta, &order_cols);
 	lion_remember_wal_mode(index, meta.wal_mode);
 
 	ix = (LionIndexState *) MemoryContextAlloc(index->rd_indexcxt,
@@ -889,7 +890,7 @@ lion_get_index_state(Relation index)
 	/* ... and the stored columns of the window store, if any (§40) */
 	lion_store_fill_state(index, ix, &store, index->rd_indexcxt);
 	/* ... in the order of one of them, for a version 10 index (§41) */
-	lion_store_fill_order(index, ix, order, index->rd_indexcxt);
+	lion_store_fill_order(index, ix, order, order_cols, index->rd_indexcxt);
 	ix->procgen = gen;
 
 	/*

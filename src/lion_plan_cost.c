@@ -3902,7 +3902,7 @@ lion_cost_store_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 
 		run += rows * ncols * LION_STORE_VALUE_COST;
 		run += touched * ncols *
-			lion_store_window_pages(&shape, perwindow, perwindow,
+			lion_store_window_pages(&shape, 0, perwindow, perwindow,
 									rows / touched) * LION_STORE_PAGE_COST;
 		if (ngroup > 0)
 			run += rows * (LION_DECODE_HASH_ROW_COST +

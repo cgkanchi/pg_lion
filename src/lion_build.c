@@ -2354,7 +2354,9 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		/* ... and the column its windows are sorted by, if any (§41) */
 		bs.storeorder = lion_store_choose_order(index, &bs.ix,
 												&bs.storeorderflags);
-		lion_store_fill_order(index, &bs.ix, bs.storeorder, bs.buildctx);
+		lion_store_fill_order(index, &bs.ix, bs.storeorder,
+							  bs.storeorder >= 0 ? (1U << bs.ix.nstored) - 1 : 0,
+							  bs.buildctx);
 	}
 
 	/*
@@ -2506,8 +2508,14 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	/* ... and the window store's record, which makes it version 9 (§40). */
 	lion_meta_record_store((Page) metabuf->data, &bs.storerec);
 	/* ... and the order of its windows, which makes it version 10 (§41). */
-	lion_meta_record_store_order((Page) metabuf->data, bs.storeorder,
-								 bs.storeorderflags);
+	/*
+	 * The store's build decided, at its first window, which columns go in
+	 * key order, and whether any does (§41, "Revision 2"): an index none of
+	 * whose chains is long is written in heap order, as version 9.
+	 */
+	lion_meta_record_store_order((Page) metabuf->data, bs.ix.store_order,
+								 bs.storeorderflags,
+								 lion_store_order_cols(&bs.ix));
 	smgr_bulk_write(bs.bulk, LION_METAPAGE_BLKNO, metabuf, true);
 
 	smgr_bulk_finish(bs.bulk);
