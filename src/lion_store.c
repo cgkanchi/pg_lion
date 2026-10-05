@@ -410,6 +410,7 @@ lion_store_fill_order(Relation index, LionIndexState *ix, int order,
 
 	ix->store_order = -1;
 	ix->storeperm = NULL;
+	ix->storessup = NULL;
 	for (i = 0; i < ix->nstored; i++)
 		ix->stored[i].kind = LION_STORE_KIND_HEAP;
 	if (order < 0)
@@ -3930,6 +3931,13 @@ lion_store_order_datum(const LionIndexState *ix, const LionStoreVal *v,
  * header written with it taken.  false when the bucket has none left;
  * *bucket is the bucket's index either way.  The window gets its permutation
  * here when it has none.
+ *
+ * Every insert of an ordered index comes here, so the header is read in
+ * place rather than parsed whole: its counts against its length, and each
+ * fence the binary search compares inside the fence area, which is all a
+ * route reads (the full check, lion_store_winhdr_check(), is the split's and
+ * verify()'s); and the slot taken is logged as the two bytes of the bucket's
+ * count that change.
  */
 static bool
 lion_store_take_slot(Relation index, Relation heaprel, LionIndexState *ix,
@@ -3943,7 +3951,18 @@ lion_store_take_slot(Relation index, Relation heaprel, LionIndexState *ix,
 	for (;;)
 	{
 		Buffer		buf = lion_store_lock_head(index, ix, ckey, BUFFER_LOCK_EXCLUSIVE);
-		LionStoreHdr hd;
+		Page		page;
+		ItemId		iid;
+		char	   *item;
+		Size		len;
+		LionStoreWinHdr wh;
+		LionStoreHdr hdv;
+		LionStoreHdr *hd = &hdv;
+		const char *fences;
+		Size		usedoff;
+		uint16		used;
+		LionWalState *xs;
+		Page		p;
 		int			i;
 
 		if (!BufferIsValid(buf))
@@ -3951,17 +3970,71 @@ lion_store_take_slot(Relation index, Relation heaprel, LionIndexState *ix,
 			(void) lion_store_create_perm(index, heaprel, ix, ckey);
 			continue;
 		}
-		lion_store_hdr_read(index, ckey, buf, &hd);
-		i = lion_store_hdr_route(&hd, ocol, ssup, d, isnull, lo);
+		page = BufferGetPage(buf);
+		iid = PageGetItemId(page, LION_STORE_DICT_OFF);
+		item = (char *) PageGetItem(page, iid) + sizeof(LionStoreDict);
+		len = ItemIdGetLength(iid) - sizeof(LionStoreDict);
+		if (len >= sizeof(LionStoreWinHdr))
+			memcpy(&wh, item, sizeof(LionStoreWinHdr));
+		if (len < sizeof(LionStoreWinHdr) ||
+			wh.nbucket < 1 || wh.nbucket > LION_STORE_MAX_VPAGES ||
+			len != lion_store_winhdr_len(wh.nbucket, wh.ndir, wh.fencebytes))
+		{
+			UnlockReleaseBuffer(buf);
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": the window header of window %u has counts that do not add up to its length",
+							RelationGetRelationName(index), ckey),
+					 errhint("REINDEX the index.")));
+		}
+
+		/* the buckets and their fences, pointing into the page */
+		hd->nbucket = wh.nbucket;
+		memcpy(hd->bk, item + sizeof(LionStoreWinHdr),
+			   sizeof(LionStoreBucket) * wh.nbucket);
+		fences = item + sizeof(LionStoreWinHdr) +
+			sizeof(LionStoreBucket) * wh.nbucket +
+			sizeof(LionStoreDirEnt) * wh.ndir;
+		for (i = 0; i < wh.nbucket; i++)
+		{
+			if ((hd->bk[i].flags & (LION_STORE_BK_LOW | LION_STORE_BK_NULL |
+									LION_STORE_BK_SAME)) != 0)
+			{
+				hd->fence[i] = NULL;
+				continue;
+			}
+			if ((Size) hd->bk[i].fenceoff + hd->bk[i].fencelen > wh.fencebytes)
+			{
+				UnlockReleaseBuffer(buf);
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("lion index \"%s\": the window header of window %u has a fence outside its fence bytes",
+								RelationGetRelationName(index), ckey),
+						 errhint("REINDEX the index.")));
+			}
+			hd->fence[i] = fences + hd->bk[i].fenceoff;
+		}
+
+		i = lion_store_hdr_route(hd, ocol, ssup, d, isnull, lo);
 		*bucket = i;
-		if (hd.bk[i].used >= LION_STORE_BUCKET_SLOTS)
+		used = hd->bk[i].used;
+		if (used >= LION_STORE_BUCKET_SLOTS)
 		{
 			UnlockReleaseBuffer(buf);
 			return false;
 		}
-		hd.bk[i].used++;
-		*vlo = lion_store_vlo(hd.bk[i].vpage, hd.bk[i].used);
-		lion_store_hdr_put(index, heaprel, ix, buf, &hd);
+		used++;
+		*vlo = lion_store_vlo(hd->bk[i].vpage, used);
+
+		usedoff = sizeof(LionStoreDict) + sizeof(LionStoreWinHdr) +
+			(Size) i * sizeof(LionStoreBucket) + offsetof(LionStoreBucket, used);
+		xs = lion_wal_begin(index);
+		p = lion_wal_register_buffer(xs, buf, LION_WALBUF_STD);
+		memcpy((char *) PageGetItem(p, PageGetItemId(p, LION_STORE_DICT_OFF)) + usedoff,
+			   &used, sizeof(uint16));
+		lion_wal_op(xs, p, LION_OP_SETBYTES, LION_STORE_DICT_OFF, (uint16) usedoff,
+					&used, sizeof(uint16));
+		lion_wal_finish(xs, LION_XLOG_STORE);
 		UnlockReleaseBuffer(buf);
 		return true;
 	}
@@ -4668,7 +4741,7 @@ lion_store_insert(Relation index, Relation heaprel, LionIndexState *ix,
 	Datum	   *fix;
 	int			ord;
 	int			attempt;
-	SortSupportData ssup;
+	SortSupport ssup;
 	MemoryContext cxt;
 	MemoryContext old;
 	LionStoreVal none = {NULL, 0};
@@ -4705,10 +4778,18 @@ lion_store_insert(Relation index, Relation heaprel, LionIndexState *ix,
 	 * exclusively, and the row tries again.  A row the window has no room for
 	 * keeps no values in the ordered columns, and its entry says so.
 	 */
+	if (ix->storessup == NULL)
+	{
+		MemoryContext ixcxt = GetMemoryChunkContext(ix);
+		SortSupport ss = (SortSupport) MemoryContextAlloc(ixcxt, sizeof(SortSupportData));
+
+		lion_store_order_ssup(index, ix, ss, ixcxt);
+		ix->storessup = ss;
+	}
+	ssup = ix->storessup;
 	cxt = AllocSetContextCreate(CurrentMemoryContext, "lion store insert",
 								ALLOCSET_DEFAULT_SIZES);
 	old = MemoryContextSwitchTo(cxt);
-	lion_store_order_ssup(index, ix, &ssup, cxt);
 	LockPage(index, LION_STORE_WINLOCK(ckey), ShareLock);
 	for (attempt = 0; attempt < 8 && !placed; attempt++)
 	{
@@ -4716,7 +4797,7 @@ lion_store_insert(Relation index, Relation heaprel, LionIndexState *ix,
 		bool		fits = true;
 		bool		room;
 
-		if (lion_store_take_slot(index, heaprel, ix, &ssup, ckey,
+		if (lion_store_take_slot(index, heaprel, ix, ssup, ckey,
 								 &vals[ix->store_order], lo, &vlo, &bucket))
 		{
 			for (ord = 0; ord < ix->nstored && fits; ord++)
@@ -4743,12 +4824,11 @@ lion_store_insert(Relation index, Relation heaprel, LionIndexState *ix,
 		/* the bucket is full, or a value does not fit: split it */
 		UnlockPage(index, LION_STORE_WINLOCK(ckey), ShareLock);
 		LockPage(index, LION_STORE_WINLOCK(ckey), ExclusiveLock);
-		room = lion_store_split_bucket(index, heaprel, ix, &ssup, ckey,
+		room = lion_store_split_bucket(index, heaprel, ix, ssup, ckey,
 									   &vals[ix->store_order], lo, !fits);
 		UnlockPage(index, LION_STORE_WINLOCK(ckey), ExclusiveLock);
 		LockPage(index, LION_STORE_WINLOCK(ckey), ShareLock);
 		MemoryContextReset(cxt);
-		lion_store_order_ssup(index, ix, &ssup, cxt);
 		if (!room)
 			break;
 	}

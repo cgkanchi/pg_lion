@@ -1079,6 +1079,9 @@ struct LionIndexState
 	 */
 	int			store_order;
 	struct LionStoreCol *storeperm;
+	struct SortSupportData *storessup;	/* the order column's comparator,
+										 * made at the first insert; in the
+										 * state's own context */
 
 	/*
 	 * The backend's pg_proc invalidation count when the recorded order's
