@@ -1,0 +1,1 @@
+../store_split_reader.spec

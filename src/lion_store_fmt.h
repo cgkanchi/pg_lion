@@ -34,14 +34,13 @@
  * KEY-ORDERED WINDOWS (DESIGN.md §41) use the same page with two meanings
  * added, both said by the header's flags.  A VIRTUAL page is a data page of
  * an ordered index: its "heap pages" are the window's virtual pages, 0 ..
- * LION_STORE_MAX_VPAGES - 1, the lower half the sorted region and the upper
- * half the append region (heap page k at virtual page
- * LION_BLOCKS_PER_CONTAINER + k).  A PERM page holds the window's
- * permutation: a two-byte RAW column in heap coordinates whose slots are the
- * virtual lo of each row's sorted slot; the dictionary item of the chain's
- * head is the window header (LionStoreWinHdr and its directory) instead of
- * an empty dictionary.  The upper six bits of the flags of both are the
- * window's generation.
+ * LION_STORE_MAX_VPAGES - 1, each one BUCKET of rows whose order values fall
+ * in one range (the window header's bucket table says which).  A PERM page
+ * holds the window's permutation: a two-byte RAW column in heap coordinates
+ * whose slots are the virtual lo of each row's bucket slot; the dictionary
+ * item of the chain's head is the window header (LionStoreWinHdr, its
+ * buckets, its directory and its fence values) instead of an empty
+ * dictionary.
  *
  *-------------------------------------------------------------------------
  */
@@ -82,36 +81,13 @@ StaticAssertDecl(sizeof(LionStoreHeader) == 16,
 #define LION_STORE_F_VIRTUAL	0x01	/* a data page over virtual pages */
 #define LION_STORE_F_PERM		0x02	/* a page of the permutation */
 #define LION_STORE_F_KINDS		0x03
-#define LION_STORE_GEN_SHIFT	2
-#define LION_STORE_GEN_MAX		63		/* six bits; never 0 once sorted */
-
-static inline int
-lion_store_flags_gen(uint8 flags)
-{
-	return flags >> LION_STORE_GEN_SHIFT;
-}
-
-static inline uint8
-lion_store_make_flags(uint8 kind, int gen)
-{
-	return (uint8) (kind | (gen << LION_STORE_GEN_SHIFT));
-}
-
-/* The generation after gen: 1 .. LION_STORE_GEN_MAX, round again. */
-static inline int
-lion_store_next_gen(int gen)
-{
-	return (gen >= LION_STORE_GEN_MAX) ? 1 : gen + 1;
-}
 
 /*
- * The virtual pages of a window of an ordered index: the sorted region
- * below LION_BLOCKS_PER_CONTAINER, the append region from it.  A virtual lo
- * is vpage << LION_OFFSET_BITS | offset, as a container's lo is for a heap
- * page, and so fits 16 bits.
+ * The virtual pages of a window of an ordered index: each a bucket, or
+ * unused.  A virtual lo is vpage << LION_OFFSET_BITS | offset, as a
+ * container's lo is for a heap page, and so fits 16 bits.
  */
 #define LION_STORE_MAX_VPAGES	(2 * LION_BLOCKS_PER_CONTAINER)
-#define LION_STORE_APPEND_VPAGE	LION_BLOCKS_PER_CONTAINER
 
 StaticAssertDecl(LION_CONTAINER_BITS + 1 <= 16,
 				 "a virtual lo must fit 16 bits");
@@ -134,37 +110,49 @@ lion_store_vlo_off(uint16 vlo)
 	return vlo & ((1 << LION_OFFSET_BITS) - 1);
 }
 
-/* The append region's address of heap lo (heap page k, offset). */
-static inline uint16
-lion_store_append_vlo(uint16 lo)
-{
-	return (uint16) (lo + (LION_STORE_APPEND_VPAGE << LION_OFFSET_BITS));
-}
-
-/* Sorted slot s of a window sorted V to a virtual page. */
-static inline uint16
-lion_store_sorted_vlo(uint32 s, uint32 vwidth)
-{
-	return lion_store_vlo((int) (s / vwidth), (int) (s % vwidth) + 1);
-}
-
 /*
  * The window header (DESIGN.md §41): the dictionary item of a permutation
- * chain's head, LionStoreDict (ndict 0, nbytes the rest) and then this and
- * ndir directory entries, ascending by (ord, lo).  An entry names the block
- * of a data chain's page whose range starts at virtual page lo, for every
- * page whose range starts in the sorted region.
+ * chain's head, LionStoreDict (ndict 0, nbytes the rest) and then this,
+ * nbucket LionStoreBucket in the order of their ranges, ndir directory
+ * entries ascending by (ord, lo), and fencebytes of fence values.
+ *
+ * The generation advances whenever a slot that a permutation entry named
+ * may be written for another row: a reader that read an entry under one
+ * generation and finds another after its data walk reads the window again.
  */
 typedef struct LionStoreWinHdr
 {
-	uint16		nsorted;		/* rows the last sort ordered */
-	uint16		vwidth;			/* their slots per virtual page, V */
-	uint16		ndir;			/* directory entries that follow */
+	uint32		gen;			/* the window's generation */
+	uint16		nbucket;		/* buckets that follow, 1 .. MAX_VPAGES */
+	uint16		ndir;			/* directory entries after them */
+	uint16		fencebytes;		/* bytes of fence values after those */
 	uint16		flags;			/* LION_STORE_WH_THIN, or zero */
 } LionStoreWinHdr;
 
 /* The directory was thinned to fit: it names some of the pages, not all. */
 #define LION_STORE_WH_THIN		0x0001
+
+/*
+ * A bucket: a virtual page holding the rows whose (order value, heap lo) is
+ * at or above its fence and below the next bucket's.  Slots 1 .. used have
+ * been handed out since the bucket was made; the rest are free.  The first
+ * bucket has no fence (LOW, below everything); a bucket whose fence value
+ * was too long to keep has the fence of the bucket before it (SAME).
+ */
+typedef struct LionStoreBucket
+{
+	uint8		vpage;			/* its virtual page */
+	uint8		flags;			/* LION_STORE_BK_* */
+	uint16		used;			/* slots handed out */
+	uint16		lo;				/* the fence's heap lo */
+	uint16		fenceoff;		/* its value's bytes in the fence area */
+	uint16		fencelen;
+} LionStoreBucket;
+
+#define LION_STORE_BK_LOW		0x01	/* no fence: the first bucket */
+#define LION_STORE_BK_NULL		0x02	/* the fence value is NULL */
+#define LION_STORE_BK_SAME		0x04	/* the fence of the bucket before */
+#define LION_STORE_BK_FLAGS		0x07
 
 typedef struct LionStoreDirEnt
 {
@@ -173,8 +161,76 @@ typedef struct LionStoreDirEnt
 	uint32		blk;			/* its block */
 } LionStoreDirEnt;
 
-StaticAssertDecl(sizeof(LionStoreWinHdr) == 8 && sizeof(LionStoreDirEnt) == 8,
+StaticAssertDecl(sizeof(LionStoreWinHdr) == 12 && sizeof(LionStoreBucket) == 10 &&
+				 sizeof(LionStoreDirEnt) == 8,
 				 "the lion window header must not change size");
+
+/* The bytes of a window header of nbucket buckets, ndir entries, fencebytes. */
+static inline Size
+lion_store_winhdr_len(uint32 nbucket, uint32 ndir, uint32 fencebytes)
+{
+	return sizeof(LionStoreWinHdr) + (Size) nbucket * sizeof(LionStoreBucket) +
+		(Size) ndir * sizeof(LionStoreDirEnt) + fencebytes;
+}
+
+/*
+ * Is the window header of len bytes at item well formed for buckets of at
+ * most maxslots slots?  NULL if so, else what is wrong (a static string).
+ * Distinct virtual pages, the first bucket LOW and no other, the others' fence
+ * bytes inside the fence area, the directory ascending by (ord, lo).
+ */
+static inline const char *
+lion_store_winhdr_check(const char *item, Size len, uint32 maxslots)
+{
+	LionStoreWinHdr wh;
+	uint8		seen[LION_STORE_MAX_VPAGES / 8];
+	const char *bk;
+	const char *dir;
+	uint32		i;
+
+	if (len < sizeof(LionStoreWinHdr))
+		return "is shorter than its header";
+	memcpy(&wh, item, sizeof(LionStoreWinHdr));
+	if (wh.nbucket < 1 || wh.nbucket > LION_STORE_MAX_VPAGES ||
+		(wh.flags & ~LION_STORE_WH_THIN) != 0 ||
+		len != lion_store_winhdr_len(wh.nbucket, wh.ndir, wh.fencebytes))
+		return "has counts that do not add up to its length";
+	memset(seen, 0, sizeof(seen));
+	bk = item + sizeof(LionStoreWinHdr);
+	for (i = 0; i < wh.nbucket; i++)
+	{
+		LionStoreBucket b;
+
+		memcpy(&b, bk + (Size) i * sizeof(LionStoreBucket), sizeof(LionStoreBucket));
+		if (b.vpage >= LION_STORE_MAX_VPAGES || (b.flags & ~LION_STORE_BK_FLAGS) != 0 ||
+			b.used > maxslots)
+			return "has a bad bucket";
+		if ((seen[b.vpage / 8] & (1 << (b.vpage % 8))) != 0)
+			return "names a virtual page for two buckets";
+		seen[b.vpage / 8] |= (uint8) (1 << (b.vpage % 8));
+		if (((b.flags & LION_STORE_BK_LOW) != 0) != (i == 0))
+			return "has a bucket below the first";
+		if ((b.flags & (LION_STORE_BK_LOW | LION_STORE_BK_NULL | LION_STORE_BK_SAME)) != 0)
+		{
+			if (b.fencelen != 0)
+				return "has fence bytes for a bucket without a fence value";
+		}
+		else if ((uint32) b.fenceoff + b.fencelen > wh.fencebytes)
+			return "has a fence past its fence area";
+	}
+	dir = bk + (Size) wh.nbucket * sizeof(LionStoreBucket);
+	for (i = 1; i < wh.ndir; i++)
+	{
+		LionStoreDirEnt a;
+		LionStoreDirEnt b;
+
+		memcpy(&a, dir + (Size) (i - 1) * sizeof(LionStoreDirEnt), sizeof(LionStoreDirEnt));
+		memcpy(&b, dir + (Size) i * sizeof(LionStoreDirEnt), sizeof(LionStoreDirEnt));
+		if (b.ord < a.ord || (b.ord == a.ord && b.lo <= a.lo))
+			return "has a directory out of order";
+	}
+	return NULL;
+}
 
 /* Item 2: the dictionary's own header, so that the item is never empty. */
 typedef struct LionStoreDict

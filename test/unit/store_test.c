@@ -578,11 +578,13 @@ test_prefer_raw(void)
 static void
 test_ordered(void)
 {
-	bool		ok = true;
-	uint32		n;
-	int			g;
+	char		buf[1024];
+	LionStoreWinHdr wh;
+	LionStoreBucket bk[3];
+	LionStoreDirEnt de[2];
+	Size		len;
 
-	phase("virtual addresses and generations");
+	phase("virtual addresses and the window header");
 	CHECK(LION_STORE_MAX_VPAGES == 2 * LION_BLOCKS_PER_CONTAINER,
 		  "a window has twice its heap pages in virtual pages");
 	CHECK(lion_store_vlo_page(lion_store_vlo(LION_STORE_MAX_VPAGES - 1,
@@ -590,48 +592,62 @@ test_ordered(void)
 		  LION_STORE_MAX_VPAGES - 1, "the last virtual page fits 16 bits");
 	CHECK(lion_store_vlo_off(lion_store_vlo(5, 7)) == 7 &&
 		  lion_store_vlo_page(lion_store_vlo(5, 7)) == 5, "vlo round trip");
-	CHECK(lion_store_vlo_page(lion_store_append_vlo((uint16) ((3 << LION_OFFSET_BITS) | 9))) ==
-		  LION_STORE_APPEND_VPAGE + 3 &&
-		  lion_store_vlo_off(lion_store_append_vlo((uint16) ((3 << LION_OFFSET_BITS) | 9))) == 9,
-		  "heap page k is append page 64 + k, same offset");
 
-	/*
-	 * Sorted slots: n rows, V = ceil(n / 64) a page, fill virtual pages
-	 * 0 .. ceil(n / V) - 1, offsets 1 .. V, strictly ascending, all in the
-	 * sorted region.
-	 */
-	for (n = 1; n <= LION_BLOCKS_PER_CONTAINER * 291 && ok; n += (n < 200) ? 1 : 97)
-	{
-		uint32		vw = (n + LION_BLOCKS_PER_CONTAINER - 1) / LION_BLOCKS_PER_CONTAINER;
-		uint32		s;
-		uint16		prev = 0;
+	/* three buckets (the first LOW, one NULL, one with 4 fence bytes), two entries */
+	memset(bk, 0, sizeof(bk));
+	bk[0].vpage = 0;
+	bk[0].flags = LION_STORE_BK_LOW;
+	bk[0].used = 10;
+	bk[1].vpage = 7;
+	bk[1].used = 291;
+	bk[1].lo = 3;
+	bk[1].fenceoff = 0;
+	bk[1].fencelen = 4;
+	bk[2].vpage = 3;
+	bk[2].flags = LION_STORE_BK_NULL;
+	de[0].ord = 0;
+	de[0].lo = 2;
+	de[0].blk = 100;
+	de[1].ord = 1;
+	de[1].lo = 0;
+	de[1].blk = 200;
+	wh.gen = 9;
+	wh.nbucket = 3;
+	wh.ndir = 2;
+	wh.fencebytes = 4;
+	wh.flags = 0;
+	len = lion_store_winhdr_len(3, 2, 4);
+	CHECK(len == 12 + 30 + 16 + 4, "a window header's length");
+	memcpy(buf, &wh, sizeof(wh));
+	memcpy(buf + sizeof(wh), bk, sizeof(bk));
+	memcpy(buf + sizeof(wh) + sizeof(bk), de, sizeof(de));
+	memcpy(buf + sizeof(wh) + sizeof(bk) + sizeof(de), "abcd", 4);
+	CHECK(lion_store_winhdr_check(buf, len, 291) == NULL, "a sound header passes");
+	CHECK(lion_store_winhdr_check(buf, len - 1, 291) != NULL, "a short one does not");
+	CHECK(lion_store_winhdr_check(buf, len, 290) != NULL,
+		  "nor one whose bucket handed out more slots than a bucket has");
 
-		for (s = 0; s < n; s++)
-		{
-			uint16		v = lion_store_sorted_vlo(s, vw);
-
-			if (lion_store_vlo_page(v) >= LION_STORE_APPEND_VPAGE ||
-				lion_store_vlo_off(v) < 1 || lion_store_vlo_off(v) > (int) vw ||
-				(s > 0 && v <= prev) ||
-				(uint32) lion_store_vlo_page(v) * vw + lion_store_vlo_off(v) - 1 != s)
-				ok = false;
-			prev = v;
-		}
-	}
-	CHECK(ok, "sorted slots are ascending, inside the sorted region, and invertible");
-
-	ok = true;
-	for (g = 0; g <= LION_STORE_GEN_MAX; g++)
-	{
-		uint8		f = lion_store_make_flags(LION_STORE_F_PERM, g);
-
-		if (lion_store_flags_gen(f) != g || (f & LION_STORE_F_KINDS) != LION_STORE_F_PERM)
-			ok = false;
-		if (lion_store_next_gen(g) < 1 || lion_store_next_gen(g) > LION_STORE_GEN_MAX ||
-			lion_store_next_gen(g) == g)
-			ok = false;
-	}
-	CHECK(ok, "the generation round-trips through the flags, and the next is never 0 or the same");
+	bk[2].vpage = 7;
+	memcpy(buf + sizeof(wh), bk, sizeof(bk));
+	CHECK(lion_store_winhdr_check(buf, len, 291) != NULL,
+		  "two buckets of one virtual page do not");
+	bk[2].vpage = 3;
+	bk[1].fencelen = 5;
+	memcpy(buf + sizeof(wh), bk, sizeof(bk));
+	CHECK(lion_store_winhdr_check(buf, len, 291) != NULL,
+		  "a fence past the fence area does not");
+	bk[1].fencelen = 4;
+	bk[1].flags = LION_STORE_BK_LOW;
+	memcpy(buf + sizeof(wh), bk, sizeof(bk));
+	CHECK(lion_store_winhdr_check(buf, len, 291) != NULL,
+		  "a second LOW bucket does not");
+	bk[1].flags = 0;
+	memcpy(buf + sizeof(wh), bk, sizeof(bk));
+	de[1].ord = 0;
+	de[1].lo = 2;
+	memcpy(buf + sizeof(wh) + sizeof(bk), de, sizeof(de));
+	CHECK(lion_store_winhdr_check(buf, len, 291) != NULL,
+		  "a directory out of order does not");
 }
 
 int

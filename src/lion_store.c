@@ -74,9 +74,17 @@
 /*
  * The window lock of an ordered index (DESIGN.md §41, "The window lock"): a
  * heavyweight page lock on a block number no index reaches, one per window,
- * which inserts take in share mode and VACUUM's sort exclusively.
+ * which inserts and VACUUM's bulk delete take in share mode and a bucket's
+ * split exclusively.
  */
 #define LION_STORE_WINLOCK(ckey)	((BlockNumber) (MaxBlockNumber - (ckey)))
+
+/*
+ * The slots of a bucket of an ordered window (§41): as many as a heap page
+ * has offsets, so that a virtual page's sub-array is never wider than a heap
+ * page's.
+ */
+#define LION_STORE_BUCKET_SLOTS		MaxHeapTuplesPerPage
 
 /* What an item takes on a page: itself, aligned, and its line pointer. */
 #define LION_STORE_ITEM_COST(len)	(MAXALIGN(len) + sizeof(ItemIdData))
@@ -681,7 +689,9 @@ lion_store_check_header(Page page, const LionStoreCol *col)
 
 	/*
 	 * A permutation page is RAW, and the dictionary item of its chain's head
-	 * is the window header (§41): LionStoreWinHdr and its directory.
+	 * is the window header (§41).  Every lock checks that its counts add up
+	 * to its length; lion_store_page_check() and every writer check the rest
+	 * (lion_store_winhdr_check()).
 	 */
 	if (col->kind == LION_STORE_KIND_PERM)
 	{
@@ -705,13 +715,12 @@ lion_store_check_header(Page page, const LionStoreCol *col)
 							(unsigned) d.nbytes);
 		memcpy(&wh, (const char *) PageGetItem(page, iid) + sizeof(LionStoreDict),
 			   sizeof(LionStoreWinHdr));
-		if ((Size) d.nbytes != sizeof(LionStoreWinHdr) +
-			(Size) wh.ndir * sizeof(LionStoreDirEnt) ||
-			(wh.flags & ~LION_STORE_WH_THIN) != 0 || wh.vwidth == 0 || wh.vwidth > LION_MAX_OFFSET ||
-			(uint32) wh.nsorted > (uint32) wh.vwidth * LION_BLOCKS_PER_CONTAINER)
-			return psprintf("has a window header of %u bytes for %u directory entries, %u rows sorted %u to a page",
-							(unsigned) d.nbytes, (unsigned) wh.ndir,
-							(unsigned) wh.nsorted, (unsigned) wh.vwidth);
+		if ((Size) d.nbytes != lion_store_winhdr_len(wh.nbucket, wh.ndir,
+													 wh.fencebytes) ||
+			wh.nbucket < 1 || wh.nbucket > LION_STORE_MAX_VPAGES)
+			return psprintf("has a window header of %u bytes for %u buckets, %u directory entries and %u fence bytes",
+							(unsigned) d.nbytes, (unsigned) wh.nbucket,
+							(unsigned) wh.ndir, (unsigned) wh.fencebytes);
 		return NULL;
 	}
 
@@ -780,6 +789,18 @@ lion_store_page_check(Page page, const LionStoreCol *col)
 	for (k = h->lo; k <= h->hi; k++)
 		if ((msg = lion_store_check_sub(page, h, k)) != NULL)
 			return msg;
+	if (col->kind == LION_STORE_KIND_PERM && h->lo == 0)
+	{
+		ItemId		iid = PageGetItemId(page, LION_STORE_DICT_OFF);
+		const char *why;
+
+		why = lion_store_winhdr_check((const char *) PageGetItem(page, iid) +
+									  sizeof(LionStoreDict),
+									  ItemIdGetLength(iid) - sizeof(LionStoreDict),
+									  LION_STORE_BUCKET_SLOTS);
+		if (why != NULL)
+			return psprintf("has a window header that %s", why);
+	}
 	if (h->mode == LION_STORE_DICT && col->typlen == -1)
 	{
 		ItemId		iid = PageGetItemId(page, LION_STORE_DICT_OFF);
@@ -1388,6 +1409,27 @@ lion_store_model_set(LionStoreModel *m, int k, OffsetNumber off,
 	m->slots[k][off - 1] = *v;
 }
 
+/* A permutation model's entry for heap position (k, off), or false. */
+static inline bool
+lion_store_perm_entry(const LionStoreModel *pm, int k, OffsetNumber off,
+					  uint16 *vlo)
+{
+	if (k > pm->hi || pm->absent[k] || off > pm->nslots[k] ||
+		pm->slots[k][off - 1].data == NULL)
+		return false;
+	memcpy(vlo, pm->slots[k][off - 1].data, sizeof(uint16));
+	return true;
+}
+
+/* A model's value at (page k, offset off), or NULL past what it holds. */
+static inline const LionStoreVal *
+lion_store_model_get(const LionStoreModel *m, int k, OffsetNumber off)
+{
+	if (k > m->hi || m->absent[k] || off > m->nslots[k] || m->slots[k] == NULL)
+		return NULL;
+	return &m->slots[k][off - 1];
+}
+
 /* Put an image on a page nothing else can see (the build's). */
 static void
 lion_store_place(Page page, const LionStoreImage *img, BlockNumber rightlink)
@@ -1780,31 +1822,304 @@ lion_store_sortrow_cmp(const void *a, const void *b, void *arg)
 }
 
 /*
- * A sorted window (§41): its columns over virtual pages, its permutation, and
- * the window header being put together for the permutation's head.
+ * A window header (§41) in memory: the item's buckets, each one's fence value
+ * (fence[i], bk[i].fencelen bytes, or NULL), and the directory.
+ */
+typedef struct LionStoreHdr
+{
+	uint32		gen;
+	uint16		flags;
+	int			nbucket;
+	LionStoreBucket bk[LION_STORE_MAX_VPAGES];
+	const char *fence[LION_STORE_MAX_VPAGES];
+	int			ndir;
+	int			dircap;
+	LionStoreDirEnt *dir;
+} LionStoreHdr;
+
+/*
+ * What a window header may take of the permutation's head: half a page, so
+ * that the head always has room for its first heap page's permutation.
+ */
+#define LION_STORE_HDR_BUDGET		(LION_PAGE_CAPACITY / 2)
+
+/* A fence value longer than this is not kept: the bucket takes SAME. */
+#define LION_STORE_FENCE_MAX		256
+
+static Size
+lion_store_hdr_len(const LionStoreHdr *hd)
+{
+	Size		fb = 0;
+	int			i;
+
+	for (i = 0; i < hd->nbucket; i++)
+		fb += hd->bk[i].fencelen;
+	return lion_store_winhdr_len(hd->nbucket, hd->ndir, (uint32) fb);
+}
+
+/* Room for n directory entries. */
+static void
+lion_store_hdr_dir_room(LionStoreHdr *hd, int n)
+{
+	if (hd->dircap >= n)
+		return;
+	hd->dircap = Max(Max(n, 16), hd->dircap * 2);
+	if (hd->dir == NULL)
+		hd->dir = (LionStoreDirEnt *) palloc(sizeof(LionStoreDirEnt) * hd->dircap);
+	else
+		hd->dir = (LionStoreDirEnt *) repalloc(hd->dir,
+											   sizeof(LionStoreDirEnt) * hd->dircap);
+}
+
+/*
+ * Parse a window header of len bytes at item into hd, checked; the fence
+ * values point into a copy in the current memory context.
+ */
+static void
+lion_store_hdr_parse(Relation index, uint32 ckey, const char *item, Size len,
+					 LionStoreHdr *hd)
+{
+	char	   *copy = (char *) palloc(Max(len, 1));
+	const char *why;
+	LionStoreWinHdr wh;
+	const char *fences;
+	int			i;
+
+	memcpy(copy, item, len);
+	why = lion_store_winhdr_check(copy, len, LION_STORE_BUCKET_SLOTS);
+	if (why != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": the window header of window %u %s",
+						RelationGetRelationName(index), ckey, why),
+				 errhint("REINDEX the index.")));
+	memcpy(&wh, copy, sizeof(LionStoreWinHdr));
+	memset(hd, 0, sizeof(LionStoreHdr));
+	hd->gen = wh.gen;
+	hd->flags = wh.flags;
+	hd->nbucket = wh.nbucket;
+	memcpy(hd->bk, copy + sizeof(LionStoreWinHdr),
+		   sizeof(LionStoreBucket) * wh.nbucket);
+	hd->ndir = wh.ndir;
+	lion_store_hdr_dir_room(hd, Max(wh.ndir, 1));
+	memcpy(hd->dir, copy + sizeof(LionStoreWinHdr) +
+		   sizeof(LionStoreBucket) * wh.nbucket,
+		   sizeof(LionStoreDirEnt) * wh.ndir);
+	fences = copy + sizeof(LionStoreWinHdr) + sizeof(LionStoreBucket) * wh.nbucket +
+		sizeof(LionStoreDirEnt) * wh.ndir;
+	for (i = 0; i < hd->nbucket; i++)
+		hd->fence[i] = (hd->bk[i].flags & (LION_STORE_BK_LOW | LION_STORE_BK_NULL |
+										   LION_STORE_BK_SAME)) != 0 ?
+			NULL : fences + hd->bk[i].fenceoff;
+}
+
+/* The header's bytes, palloc'd, the fence offsets laid out afresh. */
+static char *
+lion_store_hdr_bytes(const LionStoreHdr *hd, Size *lenp)
+{
+	Size		len = lion_store_hdr_len(hd);
+	char	   *buf = (char *) palloc0(len);
+	LionStoreWinHdr wh;
+	char	   *bk = buf + sizeof(LionStoreWinHdr);
+	char	   *fences = bk + sizeof(LionStoreBucket) * hd->nbucket +
+		sizeof(LionStoreDirEnt) * hd->ndir;
+	uint16		off = 0;
+	int			i;
+
+	wh.gen = hd->gen;
+	wh.nbucket = (uint16) hd->nbucket;
+	wh.ndir = (uint16) hd->ndir;
+	wh.fencebytes = 0;
+	wh.flags = hd->flags;
+	for (i = 0; i < hd->nbucket; i++)
+	{
+		LionStoreBucket b = hd->bk[i];
+
+		b.fenceoff = 0;
+		if (hd->fence[i] != NULL && b.fencelen > 0)
+		{
+			memcpy(fences + off, hd->fence[i], b.fencelen);
+			b.fenceoff = off;
+			off += b.fencelen;
+		}
+		else if (hd->fence[i] == NULL)
+			b.fencelen = 0;
+		memcpy(bk + sizeof(LionStoreBucket) * i, &b, sizeof(LionStoreBucket));
+	}
+	wh.fencebytes = off;
+	memcpy(buf, &wh, sizeof(LionStoreWinHdr));
+	memcpy(bk + sizeof(LionStoreBucket) * hd->nbucket, hd->dir,
+		   sizeof(LionStoreDirEnt) * hd->ndir);
+	*lenp = len;
+	return buf;
+}
+
+/*
+ * Make hd fit LION_STORE_HDR_BUDGET by thinning its directory, each column's
+ * first page and every other one after it, as often as needed - a directory
+ * entry is a shortcut, and a reader walks right from the one before a page
+ * it lacks.  false when the buckets alone do not fit.
+ */
+static bool
+lion_store_hdr_fit(LionStoreHdr *hd)
+{
+	while (lion_store_hdr_len(hd) > LION_STORE_HDR_BUDGET)
+	{
+		int			i;
+		int			j = 0;
+
+		for (i = 0; i < hd->ndir; i++)
+			if (i == 0 || hd->dir[i].ord != hd->dir[i - 1].ord || (i % 2) == 0)
+				hd->dir[j++] = hd->dir[i];
+		if (j == hd->ndir)
+			return false;
+		hd->ndir = j;
+		hd->flags |= LION_STORE_WH_THIN;
+	}
+	return true;
+}
+
+/* Name block blk, a page of column ord from virtual page lo on, in hd. */
+static void
+lion_store_hdr_add_dir(LionStoreHdr *hd, uint16 ord, uint16 lo, BlockNumber blk)
+{
+	int			i;
+	int			at = hd->ndir;
+
+	for (i = 0; i < hd->ndir; i++)
+	{
+		if (hd->dir[i].ord == ord && hd->dir[i].lo == lo)
+		{
+			hd->dir[i].blk = blk;
+			return;
+		}
+		if (hd->dir[i].ord > ord || (hd->dir[i].ord == ord && hd->dir[i].lo > lo))
+		{
+			at = i;
+			break;
+		}
+	}
+	lion_store_hdr_dir_room(hd, hd->ndir + 1);
+	memmove(&hd->dir[at + 1], &hd->dir[at], sizeof(LionStoreDirEnt) * (hd->ndir - at));
+	hd->dir[at].ord = ord;
+	hd->dir[at].lo = lo;
+	hd->dir[at].blk = blk;
+	hd->ndir++;
+}
+
+/*
+ * Bucket i's fence against the row (d, isnull, lo): < 0 when the fence is
+ * below it.  A LOW bucket's fence is below everything; a SAME one's is the
+ * one of the bucket before it.
+ */
+static int
+lion_store_fence_cmp(const LionStoreHdr *hd, const LionStoreCol *ocol,
+					 SortSupport ssup, int i, Datum d, bool isnull, uint16 lo)
+{
+	int			c;
+
+	while (i > 0 && (hd->bk[i].flags & LION_STORE_BK_SAME) != 0)
+		i--;
+	if ((hd->bk[i].flags & LION_STORE_BK_LOW) != 0)
+		return -1;
+	if ((hd->bk[i].flags & LION_STORE_BK_NULL) != 0)
+		c = ApplySortComparator((Datum) 0, true, d, isnull, ssup);
+	else
+		c = ApplySortComparator(lion_store_datum(ocol, hd->fence[i],
+												 hd->bk[i].fencelen,
+												 CurrentMemoryContext),
+								false, d, isnull, ssup);
+	if (c != 0)
+		return c;
+	return (hd->bk[i].lo < lo) ? -1 : (hd->bk[i].lo > lo) ? 1 : 0;
+}
+
+/* The bucket the row (d, isnull, lo) belongs in: the last whose fence is at or below it. */
+static int
+lion_store_hdr_route(const LionStoreHdr *hd, const LionStoreCol *ocol,
+					 SortSupport ssup, Datum d, bool isnull, uint16 lo)
+{
+	int			lo_i = 0;
+	int			hi_i = hd->nbucket - 1;
+
+	while (lo_i < hi_i)
+	{
+		int			mid = (lo_i + hi_i + 1) / 2;
+
+		if (lion_store_fence_cmp(hd, ocol, ssup, mid, d, isnull, lo) <= 0)
+			lo_i = mid;
+		else
+			hi_i = mid - 1;
+	}
+	return lo_i;
+}
+
+/* Give bucket i the fence of the row (v, lo), or SAME when v is too long to keep. */
+static void
+lion_store_hdr_set_fence(LionStoreHdr *hd, int i, const LionStoreVal *v,
+						 uint16 lo)
+{
+	hd->bk[i].flags &= ~(LION_STORE_BK_NULL | LION_STORE_BK_SAME);
+	hd->bk[i].lo = lo;
+	hd->bk[i].fencelen = 0;
+	hd->fence[i] = NULL;
+	if (v == NULL || v->data == NULL)
+		hd->bk[i].flags |= LION_STORE_BK_NULL;
+	else if (v->len > LION_STORE_FENCE_MAX)
+		hd->bk[i].flags |= LION_STORE_BK_SAME;
+	else
+	{
+		char	   *copy = (char *) palloc(Max(v->len, 1));
+
+		memcpy(copy, v->data, v->len);
+		hd->fence[i] = copy;
+		hd->bk[i].fencelen = (uint16) v->len;
+	}
+}
+
+/*
+ * A sorted window (§41), as a build lays it out: its ordered columns over
+ * buckets, its permutation, and the window header.
  */
 typedef struct LionStoreSorted
 {
 	int			n;				/* rows */
-	int			vwidth;			/* V */
-	int			nvpages;		/* virtual pages the sorted region uses */
-	LionStoreModel *vm;			/* [nstored] */
+	int			nvpages;		/* buckets, virtual pages 0 .. nvpages - 1 */
+	LionStoreModel *vm;			/* [nstored], the ordered columns' */
 	LionStoreModel pm;			/* the permutation, heap coordinates */
-	int			ndir;
-	int			maxdir;
-	LionStoreDirEnt *dir;
+	LionStoreHdr hd;
 } LionStoreSorted;
+
+/*
+ * Do the values of virtual page k of m fit a page of their own, DICT or
+ * RAW?  A bucket that did not would be ABSENT, its values the heap's.
+ */
+static bool
+lion_store_vpage_fits(const LionStoreCol *col, LionStoreModel *m, int k,
+					  LionStoreDictSet *ds)
+{
+	lion_store_dset_reset(ds);
+	lion_store_dset_add_page(ds, m, k);
+	if (lion_store_group_need(col, m, k, k, LION_STORE_DICT, ds) <= LION_PAGE_CAPACITY)
+		return true;
+	return col->rawwidth > 0 &&
+		lion_store_group_need(col, m, k, k, LION_STORE_RAW, ds) <= LION_PAGE_CAPACITY;
+}
 
 /*
  * Sort a window's rows (§41): hm[ord] holds each column's values in heap
  * coordinates, rows[0 .. n - 1] the heap lo of every row, ascending.  Fills
- * so with the virtual models and the permutation, generation gen, all in the
- * current memory context; the values are hm's, referenced.
+ * so with the ordered columns' models over buckets, the permutation and the
+ * window header (its directory empty), all in the current memory context;
+ * the values are hm's, referenced.  The rows go V to a bucket in their
+ * order, V = ceil(n / 64) - about what a heap page of the window holds, so
+ * that a bucket's values fit a page as a heap page's do - or fewer, up to
+ * twice as many buckets, when a bucket of some column would not fit.
  */
 static void
 lion_store_sort_window(LionIndexState *ix, SortSupport ssup, uint32 ckey,
-					   LionStoreModel *hm, const uint16 *rows, int n, int gen,
-					   LionStoreSorted *so)
+					   LionStoreModel *hm, const uint16 *rows, int n,
+					   LionStoreDictSet *ds, LionStoreSorted *so)
 {
 	const LionStoreCol *ocol = &ix->stored[ix->store_order];
 	LionStoreModel *om = &hm[ix->store_order];
@@ -1835,28 +2150,51 @@ lion_store_sort_window(LionIndexState *ix, SortSupport ssup, uint32 ckey,
 
 	vw = (n + LION_BLOCKS_PER_CONTAINER - 1) / LION_BLOCKS_PER_CONTAINER;
 	so->n = n;
-	so->vwidth = vw;
-	so->nvpages = (n + vw - 1) / vw;
 	so->vm = (LionStoreModel *) palloc0(sizeof(LionStoreModel) * ix->nstored);
-	for (ord = 0; ord < ix->nstored; ord++)
+	for (;;)
 	{
-		LionStoreModel *vm = &so->vm[ord];
-		int			p;
+		bool		fits = true;
 
-		vm->ckey = ckey;
-		vm->ord = (uint16) ord;
-		vm->flags = lion_store_make_flags(LION_STORE_F_VIRTUAL, gen);
-		for (p = 0; p < so->nvpages; p++)
+		so->nvpages = (n + vw - 1) / vw;
+		for (ord = 0; ord < ix->nstored; ord++)
 		{
-			vm->nslots[p] = (uint16) Min(vw, n - p * vw);
-			vm->slots[p] = (LionStoreVal *) palloc0(sizeof(LionStoreVal) * vm->nslots[p]);
+			LionStoreModel *vm = &so->vm[ord];
+			int			p;
+
+			if (ix->stored[ord].kind != LION_STORE_KIND_ORDERED)
+				continue;
+			memset(vm, 0, sizeof(LionStoreModel));
+			vm->ckey = ckey;
+			vm->ord = (uint16) ord;
+			vm->flags = LION_STORE_F_VIRTUAL;
+			for (p = 0; p < so->nvpages; p++)
+			{
+				vm->nslots[p] = (uint16) Min(vw, n - p * vw);
+				vm->slots[p] = (LionStoreVal *) palloc0(sizeof(LionStoreVal) * vm->nslots[p]);
+			}
+			for (i = 0; i < n; i++)
+			{
+				uint16		k;
+				OffsetNumber off;
+				const LionStoreModel *m = &hm[ord];
+
+				lion_lo_split(sr[i].lo, &k, &off);
+				if (off <= m->nslots[k] && m->slots[k] != NULL)
+					vm->slots[i / vw][i % vw] = m->slots[k][off - 1];
+			}
+			for (p = 0; p < so->nvpages && fits; p++)
+				fits = lion_store_vpage_fits(&ix->stored[ord], vm, p, ds);
 		}
+		if (fits || vw == 1 ||
+			(n + vw / 2 - 1) / (vw / 2) > LION_STORE_MAX_VPAGES)
+			break;
+		vw = (vw + 1) / 2;		/* more buckets, each half as full */
 	}
 
 	memset(&so->pm, 0, sizeof(LionStoreModel));
 	so->pm.ckey = ckey;
 	so->pm.ord = (uint16) ix->nstored;
-	so->pm.flags = lion_store_make_flags(LION_STORE_F_PERM, gen);
+	so->pm.flags = LION_STORE_F_PERM;
 	permv = (uint16 *) palloc(sizeof(uint16) * n);
 	for (i = 0; i < n; i++)
 	{
@@ -1871,95 +2209,81 @@ lion_store_sort_window(LionIndexState *ix, SortSupport ssup, uint32 ckey,
 		if (so->pm.nslots[i] > 0)
 			so->pm.slots[i] = (LionStoreVal *)
 				palloc0(sizeof(LionStoreVal) * so->pm.nslots[i]);
-
 	for (i = 0; i < n; i++)
 	{
 		uint16		k;
 		OffsetNumber off;
-		uint16		vlo = lion_store_sorted_vlo((uint32) i, (uint32) vw);
-		int			p = lion_store_vlo_page(vlo);
-		int			o = lion_store_vlo_off(vlo);
 
 		lion_lo_split(sr[i].lo, &k, &off);
-		for (ord = 0; ord < ix->nstored; ord++)
-		{
-			LionStoreModel *m = &hm[ord];
-
-			if (off <= m->nslots[k] && m->slots[k] != NULL)
-				so->vm[ord].slots[p][o - 1] = m->slots[k][off - 1];
-		}
-		permv[i] = vlo;
+		permv[i] = lion_store_vlo(i / vw, i % vw + 1);
 		so->pm.slots[k][off - 1].data = (const char *) &permv[i];
 		so->pm.slots[k][off - 1].len = sizeof(uint16);
 	}
 	so->pm.lo = 0;
 	so->pm.hi = maxpage;
 
-	so->ndir = 0;
-	so->maxdir = 64;
-	so->dir = (LionStoreDirEnt *) palloc(sizeof(LionStoreDirEnt) * so->maxdir);
+	/* the buckets: bucket p is virtual page p, fenced by its first row */
+	memset(&so->hd, 0, sizeof(LionStoreHdr));
+	so->hd.gen = 1;
+	so->hd.nbucket = so->nvpages;
+	for (i = 0; i < so->nvpages; i++)
+	{
+		so->hd.bk[i].vpage = (uint8) i;
+		so->hd.bk[i].used = (uint16) Min(vw, n - i * vw);
+		if (i == 0)
+			so->hd.bk[i].flags = LION_STORE_BK_LOW;
+		else
+		{
+			uint16		k;
+			OffsetNumber off;
+
+			lion_lo_split(sr[i * vw].lo, &k, &off);
+			lion_store_hdr_set_fence(&so->hd, i,
+									 (off <= om->nslots[k] && om->slots[k] != NULL) ?
+									 &om->slots[k][off - 1] : NULL,
+									 sr[i * vw].lo);
+		}
+	}
+	lion_store_hdr_dir_room(&so->hd, 64);
 }
 
-/* Name page image img, written at blk, in the directory if it is in the sorted region. */
+/* Name page image img, written at blk, in the sorted window's directory. */
 static void
 lion_store_sorted_dir(LionStoreSorted *so, const LionStoreImage *img,
 					  BlockNumber blk)
 {
-	if (img->hdr.lo >= LION_STORE_APPEND_VPAGE)
-		return;
-	if (so->ndir >= so->maxdir)
-	{
-		so->maxdir *= 2;
-		so->dir = (LionStoreDirEnt *) repalloc(so->dir,
-											   sizeof(LionStoreDirEnt) * so->maxdir);
-	}
-	so->dir[so->ndir].ord = img->hdr.ord;
-	so->dir[so->ndir].lo = img->hdr.lo;
-	so->dir[so->ndir].blk = blk;
-	so->ndir++;
+	lion_store_hdr_add_dir(&so->hd, img->hdr.ord, img->hdr.lo, blk);
 }
 
 /*
  * The window header (§41) the permutation's head carries, once every column's
- * pages are placed: the directory, thinned to every other entry of a column
- * until the head can hold it with the first heap page's permutation - a
- * directory entry is a shortcut, and a reader walks right from the one before
- * a page it lacks.
+ * pages are placed: thinned to fit, and with fences dropped (SAME) from the
+ * longest down should the buckets alone not fit.
  */
 static void
 lion_store_sorted_header(LionStoreSorted *so)
 {
-	LionStoreWinHdr wh;
-	char	   *buf;
-	Size		budget = LION_PAGE_CAPACITY / 2;
-	bool		thin = false;
+	LionStoreHdr *hd = &so->hd;
+	Size		len;
 
-	while (sizeof(LionStoreWinHdr) + (Size) so->ndir * sizeof(LionStoreDirEnt) > budget)
+	while (!lion_store_hdr_fit(hd))
 	{
+		int			longest = -1;
 		int			i;
-		int			j = 0;
 
-		/* keep each column's first page and every other one after it */
-		for (i = 0; i < so->ndir; i++)
-			if (i == 0 || so->dir[i].ord != so->dir[i - 1].ord || (i % 2) == 0)
-				so->dir[j++] = so->dir[i];
-		if (j == so->ndir)
-			break;
-		so->ndir = j;
-		thin = true;
+		for (i = 1; i < hd->nbucket; i++)
+			if (hd->fence[i] != NULL &&
+				(longest < 0 || hd->bk[i].fencelen > hd->bk[longest].fencelen))
+				longest = i;
+		if (longest < 0)
+			elog(ERROR, "lion store: a window header of %d buckets does not fit",
+				 hd->nbucket);
+		hd->bk[longest].flags |= LION_STORE_BK_SAME;
+		hd->bk[longest].fencelen = 0;
+		hd->fence[longest] = NULL;
 	}
-
-	wh.nsorted = (uint16) so->n;
-	wh.vwidth = (uint16) so->vwidth;
-	wh.ndir = (uint16) so->ndir;
-	wh.flags = thin ? LION_STORE_WH_THIN : 0;
-	buf = (char *) palloc(sizeof(LionStoreWinHdr) + sizeof(LionStoreDirEnt) * so->ndir);
-	memcpy(buf, &wh, sizeof(LionStoreWinHdr));
-	memcpy(buf + sizeof(LionStoreWinHdr), so->dir,
-		   sizeof(LionStoreDirEnt) * so->ndir);
-	so->pm.extra = buf;
-	so->pm.extralen = (uint16) (sizeof(LionStoreWinHdr) +
-								sizeof(LionStoreDirEnt) * so->ndir);
+	so->pm.extra = lion_store_hdr_bytes(hd, &len);
+	so->pm.extralen = (uint16) len;
 }
 
 /* ---------------------------------------------------------------------
@@ -2164,11 +2488,18 @@ lion_store_build_close_sorted(LionStoreBuild *sb)
 			if ((sb->present[k][(off - 1) / 8] & (1 << ((off - 1) % 8))) != 0)
 				rows[n++] = lion_store_vlo(k, off);
 	}
-	lion_store_sort_window(ix, &sb->ssup, sb->ckey, sb->models, rows, n, 1, &so);
+	lion_store_sort_window(ix, &sb->ssup, sb->ckey, sb->models, rows, n, &sb->ds,
+						   &so);
 
 	for (ord = 0; ord < ix->nstored; ord++)
-		lion_store_build_emit(sb, &ix->stored[ord], &so.vm[ord],
-							  so.nvpages - 1, &so);
+	{
+		if (ix->stored[ord].kind == LION_STORE_KIND_ORDERED)
+			lion_store_build_emit(sb, &ix->stored[ord], &so.vm[ord],
+								  so.nvpages - 1, &so);
+		else
+			lion_store_build_emit(sb, &ix->stored[ord], &sb->models[ord],
+								  sb->maxpage, NULL);
+	}
 	MemoryContextSwitchTo(sb->wincxt);
 	lion_store_sorted_header(&so);
 	lion_store_build_emit(sb, ix->storeperm, &so.pm, so.pm.hi, NULL);
@@ -2457,20 +2788,19 @@ lion_storemap_extend(Relation index, Relation heaprel, LionIndexState *ix,
 }
 
 /*
- * Create the head of window ckey's chain for col, holding the one value being
- * written, and point the map slot at it, in one record (the page, the leaf,
- * the meta page).  false when another backend created it first.
+ * Create the head of window ckey's chain for col as the page m encodes (its
+ * range starting at 0), and point the map slot at it, in one record (the
+ * page, the leaf, the meta page).  false when another backend created it
+ * first.
  */
 static bool
-lion_store_create_head(Relation index, Relation heaprel, LionIndexState *ix,
-					   const LionStoreCol *col, uint32 ckey, int k,
-					   OffsetNumber off, const LionStoreVal *v, uint64 slot,
-					   uint8 flags)
+lion_store_create_head_model(Relation index, Relation heaprel,
+							 LionIndexState *ix, const LionStoreCol *col,
+							 const LionStoreModel *m, uint64 slot)
 {
 	uint64		leafno = slot / LION_STOREMAP_FANOUT;
 	uint32		i = (uint32) (slot % LION_STOREMAP_FANOUT);
 	BlockNumber leafblk = lion_storemap_extend(index, heaprel, ix, leafno);
-	LionStoreModel m;
 	LionStoreDictSet ds;
 	LionStoreImage img;
 	Buffer		sbuf;
@@ -2482,16 +2812,12 @@ lion_store_create_head(Relation index, Relation heaprel, LionIndexState *ix,
 	Page		pS;
 	Page		pL;
 
-	memset(&m, 0, sizeof(m));
-	m.ckey = ckey;
-	m.ord = (uint16) col->ord;
-	m.lo = 0;
-	m.hi = k;
-	m.flags = flags;
-	lion_store_model_set(&m, k, off, v);
+	Assert(m->lo == 0);
 	lion_store_dset_init(&ds, CurrentMemoryContext);
-	if (!lion_store_encode(col, &m, 0, k, LION_STORE_DICT, &ds, &img))
-		elog(ERROR, "lion store: a new window's first value does not fit a page");
+	if (!lion_store_encode(col, m, 0, m->hi,
+						   col->kind == LION_STORE_KIND_PERM ? LION_STORE_RAW :
+						   LION_STORE_DICT, &ds, &img))
+		elog(ERROR, "lion store: a new window's first page does not fit a page");
 
 	sbuf = lion_alloc_page(index, heaprel, true);
 	sblk = BufferGetBlockNumber(sbuf);
@@ -2524,6 +2850,28 @@ lion_store_create_head(Relation index, Relation heaprel, LionIndexState *ix,
 	ix->storecache->slot = slot;
 	ix->storecache->head = sblk;
 	return true;
+}
+
+/*
+ * Create the head of window ckey's chain for col, holding the one value being
+ * written, as lion_store_create_head_model() does.
+ */
+static bool
+lion_store_create_head(Relation index, Relation heaprel, LionIndexState *ix,
+					   const LionStoreCol *col, uint32 ckey, int k,
+					   OffsetNumber off, const LionStoreVal *v, uint64 slot,
+					   uint8 flags)
+{
+	LionStoreModel m;
+
+	memset(&m, 0, sizeof(m));
+	m.ckey = ckey;
+	m.ord = (uint16) col->ord;
+	m.lo = 0;
+	m.hi = k;
+	m.flags = flags;
+	lion_store_model_set(&m, k, off, v);
+	return lion_store_create_head_model(index, heaprel, ix, col, &m, slot);
 }
 
 /*
@@ -2614,10 +2962,32 @@ lion_store_rewrite(Relation index, Buffer buf, const LionStoreImage *img)
  * `mode` (two blocks and the meta page, one record).  Each half is part of a
  * page that fits, so each fits.
  */
+/*
+ * The pages a write added to a chain of an ordered window, by the virtual
+ * page their range starts at, for the window's directory (§41).
+ */
+typedef struct LionStoreNote
+{
+	int			n;
+	uint16		lo[8];
+	BlockNumber blk[8];
+} LionStoreNote;
+
+static void
+lion_store_note_page(LionStoreNote *note, int lo, BlockNumber blk)
+{
+	if (note != NULL && note->n < (int) lengthof(note->lo))
+	{
+		note->lo[note->n] = (uint16) lo;
+		note->blk[note->n] = blk;
+		note->n++;
+	}
+}
+
 static void
 lion_store_split(Relation index, Relation heaprel, Buffer buf,
 				 const LionStoreCol *col, const LionStoreModel *m, int at,
-				 int mode)
+				 int mode, LionStoreNote *note)
 {
 	BlockNumber rightlink = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
 	LionStoreDictSet ds;
@@ -2649,6 +3019,7 @@ lion_store_split(Relation index, Relation heaprel, Buffer buf,
 
 	UnlockReleaseBuffer(nbuf);
 	UnlockReleaseBuffer(metabuf);
+	lion_store_note_page(note, at, nblk);
 }
 
 /*
@@ -2659,7 +3030,7 @@ lion_store_split(Relation index, Relation heaprel, Buffer buf,
 static void
 lion_store_append(Relation index, Relation heaprel, Buffer buf,
 				  const LionStoreCol *col, uint32 ckey, int from, int to,
-				  int mode)
+				  int mode, LionStoreNote *note)
 {
 	LionStoreModel e;
 	LionStoreDictSet ds;
@@ -2696,6 +3067,33 @@ lion_store_append(Relation index, Relation heaprel, Buffer buf,
 
 	UnlockReleaseBuffer(nbuf);
 	UnlockReleaseBuffer(metabuf);
+	lion_store_note_page(note, from, nblk);
+}
+
+/*
+ * Where a page of an ordered window's data chain splits (§41): at the
+ * virtual page that halves its bytes, so that a page holding one full bucket
+ * among empty ones does not split into an empty half and a full one.  Some
+ * page from lo + 1 to hi.
+ */
+static int
+lion_store_split_point(const LionStoreModel *m, int mode, int width)
+{
+	Size		total = 0;
+	Size		run = 0;
+	int			k;
+
+	for (k = m->lo; k <= m->hi; k++)
+		total += LION_STORE_ITEM_COST(lion_store_sub_len(mode, width, m->nslots[k],
+														 m->absent[k]));
+	for (k = m->lo; k < m->hi; k++)
+	{
+		run += LION_STORE_ITEM_COST(lion_store_sub_len(mode, width, m->nslots[k],
+													   m->absent[k]));
+		if (run * 2 >= total)
+			return k + 1;
+	}
+	return m->hi;
 }
 
 /*
@@ -2925,15 +3323,23 @@ lion_store_write_inplace(Relation index, Buffer buf, const LionStoreCol *col,
 	return true;
 }
 
+/* What a structural write did (lion_store_write_rebuild()). */
+#define LION_STORE_W_DONE		0	/* written, or the page is ABSENT */
+#define LION_STORE_W_AGAIN		1	/* a page was split or appended */
+#define LION_STORE_W_NOFIT		2	/* the page alone does not fit: unwritten */
+
 /*
- * The structural write: decode, write, encode.  Returns true when the value
- * is written (or its heap page is ABSENT), false when the page was split or a
- * page appended and the write has to find its page again.  buf is released.
+ * The structural write: decode, write, encode.  Returns LION_STORE_W_DONE
+ * when the value is written (or its heap page is ABSENT), _AGAIN when the
+ * page was split or a page appended and the write has to find its page
+ * again, and with `noabsent`, _NOFIT, with nothing written, where the one
+ * page would otherwise become ABSENT.  buf is released.
  */
-static bool
+static int
 lion_store_write_rebuild(Relation index, Relation heaprel,
 						 const LionStoreCol *col, Buffer buf, int k,
-						 OffsetNumber off, const LionStoreVal *v)
+						 OffsetNumber off, const LionStoreVal *v,
+						 bool noabsent, LionStoreNote *note)
 {
 	Page		page = BufferGetPage(buf);
 	char	   *copy = (char *) palloc(BLCKSZ);
@@ -2964,7 +3370,7 @@ lion_store_write_rebuild(Relation index, Relation heaprel,
 	if (w.absent[k])
 	{
 		UnlockReleaseBuffer(buf);
-		return true;
+		return LION_STORE_W_DONE;
 	}
 	w.slots[k] = (LionStoreVal *)
 		palloc0(sizeof(LionStoreVal) * Max(w.nslots[k], off));
@@ -2981,14 +3387,14 @@ lion_store_write_rebuild(Relation index, Relation heaprel,
 	{
 		lion_store_rewrite(index, buf, &img);
 		UnlockReleaseBuffer(buf);
-		return true;
+		return LION_STORE_W_DONE;
 	}
 
 	if (w.lo < w.hi)
 	{
 		if (k > h.hi)
 			lion_store_append(index, heaprel, buf, col, h.ckey, h.hi + 1, k,
-							  h.mode);
+							  h.mode, note);
 		else
 		{
 			/*
@@ -2996,31 +3402,32 @@ lion_store_write_rebuild(Relation index, Relation heaprel,
 			 * heap page, that page alone, which is where a heap filling page
 			 * by page keeps writing: the left page is then full and stays so,
 			 * where a cut in the middle would leave two half-full pages behind
-			 * every heap page of the window.
+			 * every heap page of the window.  A page over an ordered window's
+			 * buckets, which are written in any order, splits where it halves
+			 * its bytes.  Either way the left page keeps its block and its
+			 * first page, which is what a directory entry names (§41).
 			 */
 			int			at = (k == h.hi) ? h.hi : (h.lo + h.hi + 1) / 2;
 
-			/*
-			 * A page of an ordered index that spans the sorted and the append
-			 * region splits at the boundary, so that the sorted region's pages
-			 * keep the ranges the directory names (§41): only the append
-			 * region is ever written after a sort.
-			 */
-			if ((h.flags & LION_STORE_F_VIRTUAL) != 0 &&
-				h.lo < LION_STORE_APPEND_VPAGE && h.hi >= LION_STORE_APPEND_VPAGE)
-				at = LION_STORE_APPEND_VPAGE;
-
-			lion_store_split(index, heaprel, buf, col, &m, at, h.mode);
+			if ((h.flags & LION_STORE_F_VIRTUAL) != 0)
+				at = lion_store_split_point(&m, h.mode, h.width);
+			lion_store_split(index, heaprel, buf, col, &m, at, h.mode, note);
 		}
 		UnlockReleaseBuffer(buf);
-		return false;
+		return LION_STORE_W_AGAIN;
 	}
 
 	/*
 	 * One heap page whose values fit no page in the page's mode, nor RAW: it
-	 * is ABSENT, and its rows are read from the heap (§40, "Growth").
+	 * is ABSENT, and its rows are read from the heap (§40, "Growth") - unless
+	 * the caller would rather make the page smaller (a bucket's split, §41).
 	 */
 	Assert(w.lo == k && w.hi == k);
+	if (noabsent)
+	{
+		UnlockReleaseBuffer(buf);
+		return LION_STORE_W_NOFIT;
+	}
 	w.absent[k] = true;
 	w.nslots[k] = 0;
 	w.slots[k] = NULL;
@@ -3028,18 +3435,21 @@ lion_store_write_rebuild(Relation index, Relation heaprel,
 		elog(ERROR, "lion store: an ABSENT heap page does not fit a page");
 	lion_store_rewrite(index, buf, &img);
 	UnlockReleaseBuffer(buf);
-	return true;
+	return LION_STORE_W_DONE;
 }
 
 /*
  * Write v as column col's value of (ckey, k, off): k a heap page, or a
  * virtual page of an ordered index (§41).  A chain this has to start gets
- * header flags `flags`, the window's kind and generation.
+ * header flags `flags`, the column's kind.  With `noabsent`, false, with
+ * nothing written, where page k alone would no longer fit a page; else true.
+ * note, if not NULL, gets the pages added.
  */
-static void
+static bool
 lion_store_write(Relation index, Relation heaprel, LionIndexState *ix,
 				 const LionStoreCol *col, uint32 ckey, int k, OffsetNumber off,
-				 const LionStoreVal *v, uint8 flags)
+				 const LionStoreVal *v, uint8 flags, bool noabsent,
+				 LionStoreNote *note)
 {
 	uint64		slot = lion_storemap_slot(ckey, lion_store_stride(ix), col->ord);
 	LionStoreCache *cache = ix->storecache;
@@ -3070,7 +3480,7 @@ lion_store_write(Relation index, Relation heaprel, LionIndexState *ix,
 		{
 			if (lion_store_create_head(index, heaprel, ix, col, ckey, k, off,
 									   v, slot, flags))
-				return;
+				return true;
 			cache->head = InvalidBlockNumber;
 			continue;
 		}
@@ -3086,42 +3496,544 @@ lion_store_write(Relation index, Relation heaprel, LionIndexState *ix,
 		if (lion_store_write_inplace(index, buf, col, k, off, v))
 		{
 			UnlockReleaseBuffer(buf);
-			return;
+			return true;
 		}
-		if (lion_store_write_rebuild(index, heaprel, col, buf, k, off, v))
-			return;
+		switch (lion_store_write_rebuild(index, heaprel, col, buf, k, off, v,
+										 noabsent, note))
+		{
+			case LION_STORE_W_DONE:
+				return true;
+			case LION_STORE_W_NOFIT:
+				return false;
+			default:
+				break;
+		}
 	}
 }
 
 /*
- * The insert's look at an ordered window's permutation (§41): its generation
- * (0 when the window has none) and whether heap position (k, off) still has
- * an entry, which a new row there must clear.  Pages are read SHARE, one at a
- * time; the caller holds the window lock, so no sort replaces the chain
- * meanwhile, and a VACUUM that clears the entry first only makes the clearing
- * a no-op.
+ * Read the chain at head, of window ckey and col, into m: every page checked,
+ * copied into the current memory context and decoded.  The caller holds the
+ * window lock, so no split rewrites the window meanwhile: a page that is not
+ * the window's is damage.
  */
 static void
-lion_store_perm_probe(Relation index, LionIndexState *ix, uint32 ckey, int k,
-					  OffsetNumber off, int *gen, bool *stale)
+lion_store_read_chain(Relation index, const LionStoreCol *col, uint32 ckey,
+					  BlockNumber head, LionStoreModel *m)
 {
-	const LionStoreCol *pc = ix->storeperm;
-	uint64		slot = lion_storemap_slot(ckey, lion_store_stride(ix), pc->ord);
-	BlockNumber head = lion_storemap_head(index, ix->store.store_root, slot,
-										  ix->storecache);
 	BlockNumber blk = head;
 	int			steps = 0;
 
-	*gen = 0;
-	*stale = false;
+	memset(m, 0, sizeof(LionStoreModel));
+	m->ckey = ckey;
+	m->ord = (uint16) col->ord;
+	m->hi = -1;
 	while (BlockNumberIsValid(blk))
 	{
 		Buffer		buf = ReadBuffer(index, blk);
 		Page		page;
-		LionStoreHeader *h;
+		char	   *copy;
+		LionStoreModel pm;
+		BlockNumber next;
+		int			k;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!lion_store_page_owned(page, ckey, (uint16) col->ord) ||
+			(blk == head && lion_store_check_header(page, col) == NULL &&
+			 lion_store_page_header(page)->lo != 0))
+		{
+			UnlockReleaseBuffer(buf);
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": block %u on the store chain of window %u ordinal %d is not one of its pages",
+							RelationGetRelationName(index), blk, ckey, col->ord),
+					 errhint("REINDEX the index.")));
+		}
+		lion_store_check_or_error(index, page, blk, col, true);
+		copy = (char *) palloc(BLCKSZ);
+		memcpy(copy, page, BLCKSZ);
+		next = LionPageGetOpaque(page)->rightlink;
+		UnlockReleaseBuffer(buf);
+
+		lion_store_decode(index, col, (Page) copy, blk, &pm);
+		if (pm.lo != m->hi + 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": store page %u of window %u covers pages %d to %d after %d",
+							RelationGetRelationName(index), blk, ckey, pm.lo,
+							pm.hi, m->hi),
+					 errhint("REINDEX the index.")));
+		for (k = pm.lo; k <= pm.hi; k++)
+		{
+			m->nslots[k] = pm.nslots[k];
+			m->slots[k] = pm.slots[k];
+			m->absent[k] = pm.absent[k];
+		}
+		m->hi = pm.hi;
+		if (pm.extra != NULL)
+		{
+			m->extra = pm.extra;
+			m->extralen = pm.extralen;
+		}
+		m->flags = pm.flags;
+		if (BlockNumberIsValid(next))
+			lion_store_chain_step(index, blk, next, &steps);
+		blk = next;
+	}
+}
+
+static int
+lion_store_uint32_cmp(const void *a, const void *b)
+{
+	uint32		x = *(const uint32 *) a;
+	uint32		y = *(const uint32 *) b;
+
+	return (x > y) - (x < y);
+}
+
+/*
+ * An ordered window's permutation head (§41), locked in `mode` and checked
+ * whole, window header included; InvalidBuffer when the window has none.
+ */
+static Buffer
+lion_store_lock_head(Relation index, LionIndexState *ix, uint32 ckey, int mode)
+{
+	const LionStoreCol *pc = ix->storeperm;
+	uint64		slot = lion_storemap_slot(ckey, lion_store_stride(ix), pc->ord);
+	int			attempts;
+
+	for (attempts = 0; attempts < LION_STORE_MAX_ATTEMPTS; attempts++)
+	{
+		BlockNumber head = lion_storemap_head(index, ix->store.store_root, slot,
+											  ix->storecache);
+		Buffer		buf;
+		Page		page;
+
+		if (!BlockNumberIsValid(head))
+			return InvalidBuffer;
+		buf = ReadBuffer(index, head);
+		LockBuffer(buf, mode);
+		page = BufferGetPage(buf);
+		if (lion_store_page_owned(page, ckey, (uint16) pc->ord))
+		{
+			lion_store_check_or_error(index, page, head, pc, true);
+			if (lion_store_page_header(page)->lo == 0)
+				return buf;
+		}
+		/* a head freed under the map's slot by a cleanup: read the map again */
+		UnlockReleaseBuffer(buf);
+		CHECK_FOR_INTERRUPTS();
+	}
+	ereport(ERROR,
+			(errcode(ERRCODE_INDEX_CORRUPTED),
+			 errmsg("lion index \"%s\": could not find the permutation of window %u",
+					RelationGetRelationName(index), ckey),
+			 errhint("REINDEX the index.")));
+	return InvalidBuffer;		/* keep the compiler quiet */
+}
+
+/* The window header of the permutation head in buf (locked, checked). */
+static void
+lion_store_hdr_read(Relation index, uint32 ckey, Buffer buf, LionStoreHdr *hd)
+{
+	Page		page = BufferGetPage(buf);
+	ItemId		iid = PageGetItemId(page, LION_STORE_DICT_OFF);
+
+	lion_store_hdr_parse(index, ckey,
+						 (const char *) PageGetItem(page, iid) + sizeof(LionStoreDict),
+						 ItemIdGetLength(iid) - sizeof(LionStoreDict), hd);
+}
+
+/*
+ * Write hd as the window header of the permutation head in buf (EXCLUSIVE):
+ * the bytes that changed when its length is the same, the item replaced when
+ * the page has the room, and otherwise the page encoded again - or split
+ * after its first heap page, the header staying on the head.  hd fits
+ * LION_STORE_HDR_BUDGET (lion_store_hdr_fit()), so the head with the first
+ * heap page's permutation always fits.
+ */
+static void
+lion_store_hdr_put(Relation index, Relation heaprel, LionIndexState *ix,
+				   Buffer buf, const LionStoreHdr *hd)
+{
+	const LionStoreCol *pc = ix->storeperm;
+	Page		page = BufferGetPage(buf);
+	ItemId		diid = PageGetItemId(page, LION_STORE_DICT_OFF);
+	Size		oldlen = ItemIdGetLength(diid);
+	const char *olditem = (const char *) PageGetItem(page, diid);
+	Size		hlen;
+	char	   *hb = lion_store_hdr_bytes(hd, &hlen);
+	Size		newlen = sizeof(LionStoreDict) + hlen;
+	char	   *item = (char *) palloc(newlen);
+	LionStoreDict d;
+	LionWalState *xs;
+	Page		p;
+
+	Assert(hlen <= LION_STORE_HDR_BUDGET);
+	d.ndict = 0;
+	d.nbytes = (uint16) hlen;
+	memcpy(item, &d, sizeof(LionStoreDict));
+	memcpy(item + sizeof(LionStoreDict), hb, hlen);
+
+	if (newlen == oldlen)
+	{
+		Size		first = 0;
+		Size		last = newlen;
+
+		while (first < newlen && olditem[first] == item[first])
+			first++;
+		while (last > first && olditem[last - 1] == item[last - 1])
+			last--;
+		if (last == first)
+			return;
+		xs = lion_wal_begin(index);
+		p = lion_wal_register_buffer(xs, buf, LION_WALBUF_STD);
+		memcpy((char *) PageGetItem(p, PageGetItemId(p, LION_STORE_DICT_OFF)) + first,
+			   item + first, last - first);
+		lion_wal_op(xs, p, LION_OP_SETBYTES, LION_STORE_DICT_OFF, (uint16) first,
+					item + first, last - first);
+		lion_wal_finish(xs, LION_XLOG_STORE);
+		return;
+	}
+	if (MAXALIGN(newlen) <= MAXALIGN(oldlen) ||
+		MAXALIGN(newlen) - MAXALIGN(oldlen) <= PageGetExactFreeSpace(page))
+	{
+		xs = lion_wal_begin(index);
+		p = lion_wal_register_buffer(xs, buf, LION_WALBUF_STD);
+		lion_wal_save_item(xs, p, LION_STORE_DICT_OFF);
+		if (!PageIndexTupleOverwrite(p, LION_STORE_DICT_OFF, item, newlen))
+			elog(ERROR, "lion store: could not replace a window header");
+		lion_wal_op_replace(xs, p, LION_STORE_DICT_OFF, item, newlen);
+		lion_wal_finish(xs, LION_XLOG_STORE);
+		return;
+	}
+	{
+		char	   *copy = (char *) palloc(BLCKSZ);
+		LionStoreModel m;
+		LionStoreDictSet ds;
+		LionStoreImage img;
+
+		memcpy(copy, page, BLCKSZ);
+		lion_store_decode(index, pc, (Page) copy, BufferGetBlockNumber(buf), &m);
+		m.extra = hb;
+		m.extralen = (uint16) hlen;
+		lion_store_dset_init(&ds, CurrentMemoryContext);
+		if (lion_store_encode(pc, &m, m.lo, m.hi, LION_STORE_RAW, &ds, &img))
+			lion_store_rewrite(index, buf, &img);
+		else if (m.hi > m.lo)
+			lion_store_split(index, heaprel, buf, pc, &m, m.lo + 1, LION_STORE_RAW,
+							 NULL);
+		else
+			elog(ERROR, "lion store: a window header does not fit its page");
+	}
+}
+
+/*
+ * Create window ckey's permutation (§41): a head with no entries and a
+ * window header of one bucket, virtual page 0, for every row.  false when
+ * another backend created it first.
+ */
+static bool
+lion_store_create_perm(Relation index, Relation heaprel, LionIndexState *ix,
+					   uint32 ckey)
+{
+	LionStoreModel m;
+	LionStoreHdr hd;
+	Size		len;
+
+	memset(&hd, 0, sizeof(hd));
+	hd.gen = 1;
+	hd.nbucket = 1;
+	hd.bk[0].vpage = 0;
+	hd.bk[0].flags = LION_STORE_BK_LOW;
+	memset(&m, 0, sizeof(m));
+	m.ckey = ckey;
+	m.ord = (uint16) ix->nstored;
+	m.lo = 0;
+	m.hi = 0;
+	m.flags = LION_STORE_F_PERM;
+	m.extra = lion_store_hdr_bytes(&hd, &len);
+	m.extralen = (uint16) len;
+	return lion_store_create_head_model(index, heaprel, ix, ix->storeperm, &m,
+										lion_storemap_slot(ckey, lion_store_stride(ix),
+														   ix->nstored));
+}
+
+/* The order value of a row as the sort compares it. */
+static Datum
+lion_store_order_datum(const LionIndexState *ix, const LionStoreVal *v,
+					   bool *isnull)
+{
+	*isnull = (v == NULL || v->data == NULL);
+	if (*isnull)
+		return (Datum) 0;
+	return lion_store_datum(&ix->stored[ix->store_order], v->data, v->len,
+							CurrentMemoryContext);
+}
+
+/*
+ * Hand the row (order value ov, heap lo) a slot of its bucket (§41): under
+ * the permutation head's exclusive lock, the bucket's next free slot, and the
+ * header written with it taken.  false when the bucket has none left;
+ * *bucket is the bucket's index either way.  The window gets its permutation
+ * here when it has none.
+ */
+static bool
+lion_store_take_slot(Relation index, Relation heaprel, LionIndexState *ix,
+					 SortSupport ssup, uint32 ckey, const LionStoreVal *ov,
+					 uint16 lo, uint16 *vlo, int *bucket)
+{
+	const LionStoreCol *ocol = &ix->stored[ix->store_order];
+	bool		isnull;
+	Datum		d = lion_store_order_datum(ix, ov, &isnull);
+
+	for (;;)
+	{
+		Buffer		buf = lion_store_lock_head(index, ix, ckey, BUFFER_LOCK_EXCLUSIVE);
+		LionStoreHdr hd;
+		int			i;
+
+		if (!BufferIsValid(buf))
+		{
+			(void) lion_store_create_perm(index, heaprel, ix, ckey);
+			continue;
+		}
+		lion_store_hdr_read(index, ckey, buf, &hd);
+		i = lion_store_hdr_route(&hd, ocol, ssup, d, isnull, lo);
+		*bucket = i;
+		if (hd.bk[i].used >= LION_STORE_BUCKET_SLOTS)
+		{
+			UnlockReleaseBuffer(buf);
+			return false;
+		}
+		hd.bk[i].used++;
+		*vlo = lion_store_vlo(hd.bk[i].vpage, hd.bk[i].used);
+		lion_store_hdr_put(index, heaprel, ix, buf, &hd);
+		UnlockReleaseBuffer(buf);
+		return true;
+	}
+}
+
+/* Name the pages note says a write to column ord added, in the window's directory. */
+static void
+lion_store_hdr_note(Relation index, Relation heaprel, LionIndexState *ix,
+					uint32 ckey, int ord, const LionStoreNote *note)
+{
+	Buffer		buf;
+	LionStoreHdr hd;
+	int			i;
+
+	if (note->n == 0)
+		return;
+	buf = lion_store_lock_head(index, ix, ckey, BUFFER_LOCK_EXCLUSIVE);
+	if (!BufferIsValid(buf))
+		return;
+	lion_store_hdr_read(index, ckey, buf, &hd);
+	for (i = 0; i < note->n; i++)
+		if (note->lo[i] > 0)
+			lion_store_hdr_add_dir(&hd, (uint16) ord, note->lo[i], note->blk[i]);
+	if (lion_store_hdr_fit(&hd))
+		lion_store_hdr_put(index, heaprel, ix, buf, &hd);
+	UnlockReleaseBuffer(buf);
+}
+
+/*
+ * The values of virtual page vp of window ckey's chain for col, pointing into
+ * a copy of its page in the current memory context: *nslots of them, none past
+ * the chain's range, and *absent when the page is ABSENT.
+ */
+static LionStoreVal *
+lion_store_read_vpage(Relation index, LionIndexState *ix,
+					  const LionStoreCol *col, uint32 ckey, int vp, int *nslots,
+					  bool *absent)
+{
+	BlockNumber head = lion_storemap_head(index, ix->store.store_root,
+										  lion_storemap_slot(ckey, lion_store_stride(ix),
+															 col->ord),
+										  NULL);
+	BlockNumber blk = head;
+	int			steps = 0;
+
+	*nslots = 0;
+	*absent = false;
+	while (BlockNumberIsValid(blk))
+	{
+		Buffer		buf = ReadBuffer(index, blk);
+		Page		page;
+		LionStoreHeader h;
 		BlockNumber next;
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!lion_store_page_owned(page, ckey, (uint16) col->ord))
+		{
+			UnlockReleaseBuffer(buf);
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": block %u on the store chain of window %u column %d is not one of its pages",
+							RelationGetRelationName(index), blk, ckey, col->attno),
+					 errhint("REINDEX the index.")));
+		}
+		lion_store_check_or_error(index, page, blk, col, true);
+		memcpy(&h, lion_store_page_header(page), sizeof(LionStoreHeader));
+		next = LionPageGetOpaque(page)->rightlink;
+		if (vp >= h.lo && vp <= h.hi)
+		{
+			char	   *copy = (char *) palloc(BLCKSZ);
+			LionStoreModel m;
+
+			memcpy(copy, page, BLCKSZ);
+			UnlockReleaseBuffer(buf);
+			lion_store_decode(index, col, (Page) copy, blk, &m);
+			*absent = m.absent[vp];
+			*nslots = m.nslots[vp];
+			return m.slots[vp];
+		}
+		UnlockReleaseBuffer(buf);
+		if (vp < h.lo)
+			break;
+		if (BlockNumberIsValid(next))
+			lion_store_chain_step(index, blk, next, &steps);
+		blk = next;
+	}
+	return NULL;
+}
+
+/*
+ * Make virtual page vp of window ckey's chain for col hold vals[0 .. n - 1]
+ * at slots 1 .. n, whatever it held: the page holding it decoded, changed and
+ * encoded again, split while it does not fit.  A bucket being written whole
+ * is one no permutation entry names yet, or one nothing names any more (§41,
+ * "The split").
+ */
+static void
+lion_store_write_sub(Relation index, Relation heaprel, LionIndexState *ix,
+					 const LionStoreCol *col, uint32 ckey, int vp,
+					 LionStoreVal *vals, int n, LionStoreNote *note)
+{
+	uint64		slot = lion_storemap_slot(ckey, lion_store_stride(ix), col->ord);
+	int			attempts = 0;
+
+	for (;;)
+	{
+		BlockNumber head;
+		Buffer		buf;
+		char	   *copy;
+		LionStoreHeader h;
+		LionStoreModel m;
+		LionStoreModel w;
+		LionStoreDictSet ds;
+		LionStoreImage img;
+		int			j;
+
+		if (++attempts > LION_STORE_MAX_ATTEMPTS)
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": could not find the store page of window %u column %d",
+							RelationGetRelationName(index), ckey, col->attno),
+					 errhint("REINDEX the index.")));
+		head = lion_storemap_head(index, ix->store.store_root, slot, NULL);
+		if (!BlockNumberIsValid(head))
+		{
+			if (n == 0)
+				return;
+			memset(&m, 0, sizeof(m));
+			m.ckey = ckey;
+			m.ord = (uint16) col->ord;
+			m.lo = 0;
+			m.hi = vp;
+			m.flags = LION_STORE_F_VIRTUAL;
+			m.nslots[vp] = (uint16) n;
+			m.slots[vp] = vals;
+			if (lion_store_create_head_model(index, heaprel, ix, col, &m, slot))
+				return;
+			continue;
+		}
+		buf = lion_store_find_page(index, col, ckey, head, vp);
+		if (!BufferIsValid(buf))
+			continue;
+
+		copy = (char *) palloc(BLCKSZ);
+		memcpy(copy, BufferGetPage(buf), BLCKSZ);
+		lion_store_decode(index, col, (Page) copy, BufferGetBlockNumber(buf), &m);
+		memcpy(&h, lion_store_page_header((Page) copy), sizeof(LionStoreHeader));
+		w = m;
+		if (vp > h.hi)
+		{
+			for (j = h.hi + 1; j <= vp; j++)
+			{
+				w.nslots[j] = 0;
+				w.slots[j] = NULL;
+				w.absent[j] = false;
+			}
+			w.hi = vp;
+		}
+		w.absent[vp] = false;
+		w.nslots[vp] = (uint16) n;
+		w.slots[vp] = vals;
+
+		lion_store_dset_init(&ds, CurrentMemoryContext);
+		if (lion_store_encode(col, &w, w.lo, w.hi, h.mode, &ds, &img) ||
+			(h.mode == LION_STORE_DICT && col->rawwidth > 0 &&
+			 lion_store_encode(col, &w, w.lo, w.hi, LION_STORE_RAW, &ds, &img)))
+		{
+			lion_store_rewrite(index, buf, &img);
+			UnlockReleaseBuffer(buf);
+			return;
+		}
+		if (w.lo < w.hi)
+		{
+			if (vp > h.hi)
+				lion_store_append(index, heaprel, buf, col, ckey, h.hi + 1, vp,
+								  h.mode, note);
+			else
+				lion_store_split(index, heaprel, buf, col, &m,
+								 lion_store_split_point(&m, h.mode, h.width),
+								 h.mode, note);
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+
+		/* half a bucket that fitted does not: only damage gets here */
+		w.absent[vp] = true;
+		w.nslots[vp] = 0;
+		w.slots[vp] = NULL;
+		if (!lion_store_encode(col, &w, vp, vp, h.mode, &ds, &img))
+			elog(ERROR, "lion store: an ABSENT virtual page does not fit a page");
+		lion_store_rewrite(index, buf, &img);
+		UnlockReleaseBuffer(buf);
+		return;
+	}
+}
+
+/*
+ * Set the permutation entries of the heap positions pos[0 .. n - 1]
+ * (ascending) to the virtual lo val[i], in place, one record a page.  Every
+ * position has an entry already (the rows a split moves), so its slot exists.
+ */
+static void
+lion_store_perm_update(Relation index, Relation heaprel, LionIndexState *ix,
+					   uint32 ckey, const uint16 *pos, const uint16 *val, int n)
+{
+	const LionStoreCol *pc = ix->storeperm;
+	BlockNumber blk = lion_storemap_head(index, ix->store.store_root,
+										 lion_storemap_slot(ckey, lion_store_stride(ix),
+															pc->ord),
+										 NULL);
+	int			steps = 0;
+	int			i = 0;
+
+	while (BlockNumberIsValid(blk) && i < n)
+	{
+		Buffer		buf = ReadBuffer(index, blk);
+		Page		page;
+		LionStoreHeader h;
+		BlockNumber next;
+		LionWalState *xs = NULL;
+		Page		p = NULL;
+
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		page = BufferGetPage(buf);
 		if (!lion_store_page_owned(page, ckey, (uint16) pc->ord))
 		{
@@ -3132,43 +4044,463 @@ lion_store_perm_probe(Relation index, LionIndexState *ix, uint32 ckey, int k,
 							RelationGetRelationName(index), blk, ckey),
 					 errhint("REINDEX the index.")));
 		}
-		lion_store_check_or_error(index, page, blk, pc, false);
-		h = lion_store_page_header(page);
-		if (blk == head)
-			*gen = lion_store_flags_gen(h->flags);
+		lion_store_check_or_error(index, page, blk, pc, true);
+		memcpy(&h, lion_store_page_header(page), sizeof(LionStoreHeader));
 		next = LionPageGetOpaque(page)->rightlink;
-		if (k >= h->lo && k <= h->hi)
+		while (i < n)
 		{
-			char	   *msg = lion_store_check_sub(page, h, k);
-			LionStoreSub *sub;
+			uint16		k;
+			OffsetNumber off;
 			Size		len;
+			LionStoreSub *sub;
+			uint8	   *body;
+			uint8	   *bitmap;
 
-			if (msg != NULL)
+			lion_lo_split(pos[i], &k, &off);
+			if (k > h.hi)
+				break;
+			if (xs == NULL)
 			{
-				UnlockReleaseBuffer(buf);
+				xs = lion_wal_begin(index);
+				p = lion_wal_register_buffer(xs, buf, LION_WALBUF_STD);
+			}
+			sub = lion_store_page_sub(p, k, &len);
+			if (k < h.lo || (sub->flags & LION_STORE_ABSENT) != 0 || off > sub->nslots)
 				ereport(ERROR,
 						(errcode(ERRCODE_INDEX_CORRUPTED),
-						 errmsg("lion index \"%s\": store page %u %s",
-								RelationGetRelationName(index), blk, msg),
+						 errmsg("lion index \"%s\": the permutation of window %u has no entry for heap page %u offset %u",
+								RelationGetRelationName(index), ckey,
+								(unsigned) k, (unsigned) off),
 						 errhint("REINDEX the index.")));
-			}
-			sub = lion_store_page_sub(page, k, &len);
-			if ((sub->flags & LION_STORE_ABSENT) == 0 && off <= sub->nslots)
-			{
-				const uint8 *body = (const uint8 *) sub + sizeof(LionStoreSub);
-
-				*stale = !lion_store_null_get(body + (Size) sub->nslots * h->width,
-											  off - 1);
-			}
-			UnlockReleaseBuffer(buf);
-			return;
+			body = (uint8 *) sub + sizeof(LionStoreSub);
+			bitmap = body + (Size) sub->nslots * h.width;
+			memcpy(body + (Size) (off - 1) * h.width, &val[i], sizeof(uint16));
+			lion_store_null_set(bitmap, off - 1, false);
+			lion_wal_op(xs, p, LION_OP_SETBYTES,
+						(OffsetNumber) (LION_STORE_SUB_FIRST + k - h.lo),
+						(uint16) (sizeof(LionStoreSub) + (Size) (off - 1) * h.width),
+						body + (Size) (off - 1) * h.width, sizeof(uint16));
+			lion_wal_op(xs, p, LION_OP_SETBYTES,
+						(OffsetNumber) (LION_STORE_SUB_FIRST + k - h.lo),
+						(uint16) (sizeof(LionStoreSub) + (Size) sub->nslots * h.width +
+								  (off - 1) / 8),
+						bitmap + (off - 1) / 8, 1);
+			i++;
 		}
+		if (xs != NULL)
+			lion_wal_finish(xs, LION_XLOG_STORE);
 		UnlockReleaseBuffer(buf);
-		if (k < h->lo || !BlockNumberIsValid(next))
-			return;
-		lion_store_chain_step(index, blk, next, &steps);
+		if (BlockNumberIsValid(next))
+			lion_store_chain_step(index, blk, next, &steps);
 		blk = next;
 	}
+	if (i < n)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": the permutation of window %u ends before heap lo %u",
+						RelationGetRelationName(index), ckey, (unsigned) pos[i]),
+				 errhint("REINDEX the index.")));
+}
+
+/* A row of a bucket being split: its heap lo, its slot, its order value. */
+typedef struct LionStoreMove
+{
+	uint16		lo;
+	uint16		off;			/* its slot in the bucket */
+	Datum		d;
+	bool		isnull;
+} LionStoreMove;
+
+static int
+lion_store_move_cmp(const void *a, const void *b, void *arg)
+{
+	const LionStoreMove *ma = (const LionStoreMove *) a;
+	const LionStoreMove *mb = (const LionStoreMove *) b;
+	int			c = ApplySortComparator(ma->d, ma->isnull, mb->d, mb->isnull,
+										(SortSupport) arg);
+
+	if (c != 0)
+		return c;
+	return (ma->lo < mb->lo) ? -1 : (ma->lo > mb->lo) ? 1 : 0;
+}
+
+/*
+ * A free virtual page for a new bucket: one no bucket has and no permutation
+ * entry names, nearest vp; -1 if none.  taken[] marks the ones in use and
+ * those already chosen.
+ */
+static int
+lion_store_fresh_vpage(const bool *taken, int vp)
+{
+	int			d;
+
+	for (d = 1; d < LION_STORE_MAX_VPAGES; d++)
+	{
+		if (vp + d < LION_STORE_MAX_VPAGES && !taken[vp + d])
+			return vp + d;
+		if (vp - d >= 0 && !taken[vp - d])
+			return vp - d;
+	}
+	return -1;
+}
+
+/*
+ * The split of the bucket the row (ov, lo) belongs in (§41, "The split"),
+ * under the window lock the caller holds exclusively: when the bucket has
+ * handed out every slot, or with `nofit` when one of its columns' values no
+ * longer fit a page.  Returns false when the window cannot make room - no
+ * free virtual page, a window header with no room for another bucket, or a
+ * bucket of one row that does not fit - and the row is then left to the heap.
+ *
+ * The bucket's rows are those its virtual page's permutation entries name.
+ * A row past every one of them (or below every one) opens a new, empty
+ * bucket beside it, and nothing moves: the heap filling in the order of the
+ * column, or a bucket whose rows all died, costs a header write.  Otherwise
+ * the rows are sorted and written whole, in that order, to one new bucket
+ * (when no more than half the slots are live: the holes VACUUM left) or two
+ * (the halves); their entries are switched; the header replaces the bucket,
+ * advancing the generation; and only then is the old bucket's page cleared.
+ * Until the switch every entry names a slot holding its row's values (old or
+ * new), and a slot that loses its name is written again only after the
+ * generation has moved on, which sends a reader that took the old name back
+ * to the start of the window.
+ */
+static bool
+lion_store_split_bucket(Relation index, Relation heaprel, LionIndexState *ix,
+						SortSupport ssup, uint32 ckey, const LionStoreVal *ov,
+						uint16 lo, bool nofit)
+{
+	const LionStoreCol *ocol = &ix->stored[ix->store_order];
+	LionStoreModel *pm = (LionStoreModel *) palloc(sizeof(LionStoreModel));
+	LionStoreModel *om = NULL;
+	LionStoreHdr hd;
+	LionStoreMove *mv;
+	LionStoreVal **cv;			/* [nstored]: the bucket's values, by slot */
+	int		   *cn;
+	bool		taken[LION_STORE_MAX_VPAGES];
+	BlockNumber head;
+	Buffer		buf;
+	bool		isnull;
+	Datum		d = lion_store_order_datum(ix, ov, &isnull);
+	int			i;
+	int			b;
+	int			nrows = 0;
+	int			k;
+	int			ord;
+
+	/* the header, and every permutation entry */
+	buf = lion_store_lock_head(index, ix, ckey, BUFFER_LOCK_SHARE);
+	if (!BufferIsValid(buf))
+		return true;			/* no window yet: the insert makes it */
+	lion_store_hdr_read(index, ckey, buf, &hd);
+	head = BufferGetBlockNumber(buf);
+	UnlockReleaseBuffer(buf);
+	lion_store_read_chain(index, ix->storeperm, ckey, head, pm);
+
+	i = lion_store_hdr_route(&hd, ocol, ssup, d, isnull, lo);
+	if (!nofit && hd.bk[i].used < LION_STORE_BUCKET_SLOTS)
+		return true;			/* another insert split it meanwhile */
+	b = hd.bk[i].vpage;
+
+	memset(taken, 0, sizeof(taken));
+	for (k = 0; k < hd.nbucket; k++)
+		taken[hd.bk[k].vpage] = true;
+	mv = (LionStoreMove *) palloc(sizeof(LionStoreMove) * (LION_STORE_BUCKET_SLOTS + 1));
+	for (k = 0; k <= pm->hi; k++)
+	{
+		OffsetNumber off;
+
+		for (off = FirstOffsetNumber; off <= pm->nslots[k]; off++)
+		{
+			uint16		vlo;
+
+			if (!lion_store_perm_entry(pm, k, off, &vlo))
+				continue;
+			taken[lion_store_vlo_page(vlo)] = true;
+			if (lion_store_vlo_page(vlo) == b && nrows <= LION_STORE_BUCKET_SLOTS)
+			{
+				mv[nrows].lo = lion_store_vlo(k, off);
+				mv[nrows].off = (uint16) lion_store_vlo_off(vlo);
+				nrows++;
+			}
+		}
+	}
+	if (nrows > LION_STORE_BUCKET_SLOTS)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": more than %d permutation entries of window %u name virtual page %d",
+						RelationGetRelationName(index), LION_STORE_BUCKET_SLOTS,
+						ckey, b),
+				 errhint("REINDEX the index.")));
+
+	/* every bucket rows was written in has been reused, or none: start it over */
+	if (nrows == 0)
+	{
+		buf = lion_store_lock_head(index, ix, ckey, BUFFER_LOCK_EXCLUSIVE);
+		lion_store_hdr_read(index, ckey, buf, &hd);
+		hd.bk[i].used = 0;
+		hd.gen++;
+		lion_store_hdr_put(index, heaprel, ix, buf, &hd);
+		UnlockReleaseBuffer(buf);
+		for (ord = 0; ord < ix->nstored; ord++)
+			if (ix->stored[ord].kind == LION_STORE_KIND_ORDERED)
+				lion_store_write_sub(index, heaprel, ix, &ix->stored[ord], ckey, b,
+									 NULL, 0, NULL);
+		return true;
+	}
+
+	/* the bucket's values, column by column */
+	cv = (LionStoreVal **) palloc0(sizeof(LionStoreVal *) * ix->nstored);
+	cn = (int *) palloc0(sizeof(int) * ix->nstored);
+	for (ord = 0; ord < ix->nstored; ord++)
+	{
+		bool		absent;
+
+		if (ix->stored[ord].kind != LION_STORE_KIND_ORDERED)
+			continue;
+		cv[ord] = lion_store_read_vpage(index, ix, &ix->stored[ord], ckey, b,
+										&cn[ord], &absent);
+		if (absent)
+			return false;		/* values only the heap has: they stay */
+	}
+	if (ocol->kind != LION_STORE_KIND_ORDERED)
+	{
+		BlockNumber ohead = lion_storemap_head(index, ix->store.store_root,
+											   lion_storemap_slot(ckey, lion_store_stride(ix),
+																  ocol->ord),
+											   NULL);
+
+		om = (LionStoreModel *) palloc(sizeof(LionStoreModel));
+		memset(om, 0, sizeof(LionStoreModel));
+		om->hi = -1;
+		if (BlockNumberIsValid(ohead))
+			lion_store_read_chain(index, ocol, ckey, ohead, om);
+	}
+	for (k = 0; k < nrows; k++)
+	{
+		const LionStoreVal *v;
+
+		if (om != NULL)
+		{
+			uint16		hk;
+			OffsetNumber hoff;
+
+			lion_lo_split(mv[k].lo, &hk, &hoff);
+			v = lion_store_model_get(om, hk, hoff);
+		}
+		else
+			v = (mv[k].off <= cn[ocol->ord] && cv[ocol->ord] != NULL) ?
+				&cv[ocol->ord][mv[k].off - 1] : NULL;
+		mv[k].d = lion_store_order_datum(ix, v, &mv[k].isnull);
+	}
+	qsort_arg(mv, nrows, sizeof(LionStoreMove), lion_store_move_cmp, ssup);
+
+	/*
+	 * A row past every row of the bucket, or below every one: a new empty
+	 * bucket on that side, and nothing moves.
+	 */
+	if (!nofit)
+	{
+		LionStoreMove nw;
+		bool		above;
+		bool		below;
+
+		nw.lo = lo;
+		nw.d = d;
+		nw.isnull = isnull;
+		above = lion_store_move_cmp(&nw, &mv[nrows - 1], ssup) > 0;
+		below = lion_store_move_cmp(&nw, &mv[0], ssup) < 0;
+		if (above || below)
+		{
+			int			f = lion_store_fresh_vpage(taken, b);
+			LionStoreHdr nh = hd;
+			int			at = above ? i + 1 : i;
+
+			if (f < 0 || nh.nbucket >= LION_STORE_MAX_VPAGES)
+				return false;
+			memmove(&nh.bk[at + 1], &nh.bk[at], sizeof(LionStoreBucket) * (nh.nbucket - at));
+			memmove(&nh.fence[at + 1], &nh.fence[at], sizeof(char *) * (nh.nbucket - at));
+			nh.nbucket++;
+			memset(&nh.bk[at], 0, sizeof(LionStoreBucket));
+			nh.bk[at].vpage = (uint8) f;
+			nh.fence[at] = NULL;
+			if (above)
+				lion_store_hdr_set_fence(&nh, at, ov, lo);
+			else
+			{
+				uint16		mk;
+				OffsetNumber moff;
+				const LionStoreVal *mvv = NULL;
+
+				/* the new bucket takes the old one's fence, the old one its first row's */
+				nh.bk[at].flags = hd.bk[i].flags;
+				nh.bk[at].lo = hd.bk[i].lo;
+				nh.bk[at].fencelen = hd.bk[i].fencelen;
+				nh.fence[at] = hd.fence[i];
+				lion_lo_split(mv[0].lo, &mk, &moff);
+				if (om != NULL)
+					mvv = lion_store_model_get(om, mk, moff);
+				else if (mv[0].off <= cn[ocol->ord] && cv[ocol->ord] != NULL)
+					mvv = &cv[ocol->ord][mv[0].off - 1];
+				nh.bk[at + 1].flags &= ~LION_STORE_BK_LOW;
+				lion_store_hdr_set_fence(&nh, at + 1, mvv, mv[0].lo);
+			}
+			if (!lion_store_hdr_fit(&nh))
+				return false;
+
+			/* a page a crash left values on is cleared before it is a bucket */
+			for (ord = 0; ord < ix->nstored; ord++)
+			{
+				int			fn;
+				bool		absent;
+
+				if (ix->stored[ord].kind != LION_STORE_KIND_ORDERED)
+					continue;
+				(void) lion_store_read_vpage(index, ix, &ix->stored[ord], ckey, f,
+											 &fn, &absent);
+				if (fn > 0 || absent)
+					lion_store_write_sub(index, heaprel, ix, &ix->stored[ord], ckey, f,
+										 NULL, 0, NULL);
+			}
+			buf = lion_store_lock_head(index, ix, ckey, BUFFER_LOCK_EXCLUSIVE);
+			lion_store_hdr_read(index, ckey, buf, &hd);
+			nh.ndir = hd.ndir;
+			nh.dir = hd.dir;
+			nh.dircap = hd.dircap;
+			nh.flags = hd.flags;
+			nh.gen = hd.gen;
+			if (lion_store_hdr_fit(&nh))
+				lion_store_hdr_put(index, heaprel, ix, buf, &nh);
+			UnlockReleaseBuffer(buf);
+			return true;
+		}
+	}
+
+	/* the rows move: to one new bucket, or two */
+	{
+		int			ntarget = (nofit || nrows * 2 > LION_STORE_BUCKET_SLOTS) ? 2 : 1;
+		int			t[2];
+		int			from[3];
+		LionStoreHdr nh = hd;
+		uint16	   *pos;
+		uint16	   *val;
+		LionStoreNote *notes;
+		int			j;
+
+		if (ntarget == 2 && nrows < 2)
+			return false;		/* one row that does not fit a page: the heap's */
+		for (j = 0; j < ntarget; j++)
+		{
+			t[j] = lion_store_fresh_vpage(taken, b);
+			if (t[j] < 0)
+				return false;
+			taken[t[j]] = true;
+		}
+		from[0] = 0;
+		from[1] = (ntarget == 2) ? nrows / 2 : nrows;
+		from[2] = nrows;
+
+		/* the header as it will be: bucket i becomes the targets */
+		if (ntarget == 2)
+		{
+			uint16		mk;
+			OffsetNumber moff;
+			const LionStoreVal *mvv = NULL;
+
+			if (nh.nbucket >= LION_STORE_MAX_VPAGES)
+				return false;
+			memmove(&nh.bk[i + 2], &nh.bk[i + 1], sizeof(LionStoreBucket) * (nh.nbucket - i - 1));
+			memmove(&nh.fence[i + 2], &nh.fence[i + 1], sizeof(char *) * (nh.nbucket - i - 1));
+			nh.nbucket++;
+			memset(&nh.bk[i + 1], 0, sizeof(LionStoreBucket));
+			nh.fence[i + 1] = NULL;
+			lion_lo_split(mv[from[1]].lo, &mk, &moff);
+			if (om != NULL)
+				mvv = lion_store_model_get(om, mk, moff);
+			else if (mv[from[1]].off <= cn[ocol->ord] && cv[ocol->ord] != NULL)
+				mvv = &cv[ocol->ord][mv[from[1]].off - 1];
+			lion_store_hdr_set_fence(&nh, i + 1, mvv, mv[from[1]].lo);
+		}
+		for (j = 0; j < ntarget; j++)
+		{
+			nh.bk[i + j].vpage = (uint8) t[j];
+			nh.bk[i + j].used = (uint16) (from[j + 1] - from[j]);
+		}
+		if (!lion_store_hdr_fit(&nh))
+			return false;
+
+		/* the values, in the rows' order, to the targets */
+		notes = (LionStoreNote *) palloc0(sizeof(LionStoreNote) * ix->nstored);
+		for (ord = 0; ord < ix->nstored; ord++)
+		{
+			if (ix->stored[ord].kind != LION_STORE_KIND_ORDERED)
+				continue;
+			for (j = 0; j < ntarget; j++)
+			{
+				int			cnt = from[j + 1] - from[j];
+				LionStoreVal *vals = (LionStoreVal *) palloc0(sizeof(LionStoreVal) * cnt);
+				int			r;
+
+				for (r = 0; r < cnt; r++)
+				{
+					int			o = mv[from[j] + r].off;
+
+					if (o <= cn[ord] && cv[ord] != NULL)
+						vals[r] = cv[ord][o - 1];
+				}
+				lion_store_write_sub(index, heaprel, ix, &ix->stored[ord], ckey, t[j],
+									 vals, cnt, &notes[ord]);
+			}
+		}
+
+		/* the entries, switched */
+		pos = (uint16 *) palloc(sizeof(uint16) * nrows);
+		val = (uint16 *) palloc(sizeof(uint16) * nrows);
+		{
+			uint32	   *byp = (uint32 *) palloc(sizeof(uint32) * nrows);
+
+			for (j = 0; j < ntarget; j++)
+			{
+				int			r;
+
+				for (r = from[j]; r < from[j + 1]; r++)
+					byp[r] = ((uint32) mv[r].lo << 16) |
+						lion_store_vlo(t[j], r - from[j] + 1);
+			}
+			qsort(byp, nrows, sizeof(uint32), lion_store_uint32_cmp);
+			for (j = 0; j < nrows; j++)
+			{
+				pos[j] = (uint16) (byp[j] >> 16);
+				val[j] = (uint16) (byp[j] & 0xFFFF);
+			}
+		}
+		lion_store_perm_update(index, heaprel, ix, ckey, pos, val, nrows);
+
+		/* the header: the targets in, the generation on */
+		buf = lion_store_lock_head(index, ix, ckey, BUFFER_LOCK_EXCLUSIVE);
+		lion_store_hdr_read(index, ckey, buf, &hd);
+		nh.ndir = hd.ndir;
+		nh.dir = hd.dir;
+		nh.dircap = hd.dircap;
+		nh.flags = hd.flags;
+		nh.gen = hd.gen + 1;
+		for (ord = 0; ord < ix->nstored; ord++)
+			for (j = 0; j < notes[ord].n; j++)
+				if (notes[ord].lo[j] > 0)
+					lion_store_hdr_add_dir(&nh, (uint16) ord, notes[ord].lo[j],
+										   notes[ord].blk[j]);
+		if (!lion_store_hdr_fit(&nh))
+			elog(ERROR, "lion store: a window header that fitted no longer does");
+		lion_store_hdr_put(index, heaprel, ix, buf, &nh);
+		UnlockReleaseBuffer(buf);
+
+		/* the old bucket's page, which nothing names now */
+		for (ord = 0; ord < ix->nstored; ord++)
+			if (ix->stored[ord].kind == LION_STORE_KIND_ORDERED)
+				lion_store_write_sub(index, heaprel, ix, &ix->stored[ord], ckey, b,
+									 NULL, 0, NULL);
+	}
+	return true;
 }
 
 void
@@ -3177,14 +4509,22 @@ lion_store_insert(Relation index, Relation heaprel, LionIndexState *ix,
 {
 	uint64		code = lion_tid_to_code(tid);
 	uint32		ckey = lion_code_ckey(code);
+	uint16		lo = lion_code_lo(code);
 	uint16		k;
 	OffsetNumber off;
 	LionStoreVal *vals;
 	Datum	   *fix;
 	int			ord;
+	int			attempt;
+	SortSupportData ssup;
+	MemoryContext cxt;
+	MemoryContext old;
+	LionStoreVal none = {NULL, 0};
+	uint16		vlo = 0;
+	bool		placed = false;
 
 	Assert(ix->nstored > 0);
-	lion_lo_split(lion_code_lo(code), &k, &off);
+	lion_lo_split(lo, &k, &off);
 
 	/* every value first, so that a value too long is refused before a write */
 	vals = (LionStoreVal *) palloc(sizeof(LionStoreVal) * ix->nstored);
@@ -3200,34 +4540,96 @@ lion_store_insert(Relation index, Relation heaprel, LionIndexState *ix,
 	{
 		for (ord = 0; ord < ix->nstored; ord++)
 			lion_store_write(index, heaprel, ix, &ix->stored[ord], ckey, k, off,
-							 &vals[ord], 0);
+							 &vals[ord], 0, false, NULL);
 		return;
 	}
 
 	/*
-	 * An ordered index (§41): the row goes to the append region, under the
-	 * window lock in share mode, which keeps VACUUM's sort out of the window
-	 * until every column is written.  A permutation entry left at the
-	 * position by a row that died is cleared first, so that the new row is
-	 * read from the append region.
+	 * An ordered index (§41): the row takes a slot in the bucket of its order
+	 * value, under the window lock in share mode, which keeps a split out of
+	 * the window until every column is written; its permutation entry is
+	 * written last, once its values are in place.  A full bucket, or one a
+	 * column's value no longer fits, is split under the lock taken
+	 * exclusively, and the row tries again.  A row the window has no room for
+	 * keeps no values in the ordered columns, and its entry says so.
 	 */
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "lion store insert",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cxt);
+	lion_store_order_ssup(index, ix, &ssup, cxt);
 	LockPage(index, LION_STORE_WINLOCK(ckey), ShareLock);
+	for (attempt = 0; attempt < 8 && !placed; attempt++)
 	{
-		int			gen = 0;
-		bool		stale = false;
-		LionStoreVal none = {NULL, 0};
-		uint8		flags;
+		int			bucket;
+		bool		fits = true;
+		bool		room;
 
-		lion_store_perm_probe(index, ix, ckey, k, off, &gen, &stale);
-		if (stale)
-			lion_store_write(index, heaprel, ix, ix->storeperm, ckey, k, off,
-							 &none, lion_store_make_flags(LION_STORE_F_PERM, gen));
-		flags = lion_store_make_flags(LION_STORE_F_VIRTUAL, gen);
-		for (ord = 0; ord < ix->nstored; ord++)
-			lion_store_write(index, heaprel, ix, &ix->stored[ord], ckey,
-							 LION_STORE_APPEND_VPAGE + k, off, &vals[ord], flags);
+		if (lion_store_take_slot(index, heaprel, ix, &ssup, ckey,
+								 &vals[ix->store_order], lo, &vlo, &bucket))
+		{
+			for (ord = 0; ord < ix->nstored && fits; ord++)
+			{
+				LionStoreNote note;
+
+				if (ix->stored[ord].kind != LION_STORE_KIND_ORDERED)
+					continue;
+				note.n = 0;
+				fits = lion_store_write(index, heaprel, ix, &ix->stored[ord], ckey,
+										lion_store_vlo_page(vlo),
+										(OffsetNumber) lion_store_vlo_off(vlo),
+										&vals[ord], LION_STORE_F_VIRTUAL, true,
+										&note);
+				lion_store_hdr_note(index, heaprel, ix, ckey, ord, &note);
+			}
+			if (fits)
+			{
+				placed = true;
+				break;
+			}
+		}
+
+		/* the bucket is full, or a value does not fit: split it */
+		UnlockPage(index, LION_STORE_WINLOCK(ckey), ShareLock);
+		LockPage(index, LION_STORE_WINLOCK(ckey), ExclusiveLock);
+		room = lion_store_split_bucket(index, heaprel, ix, &ssup, ckey,
+									   &vals[ix->store_order], lo, !fits);
+		UnlockPage(index, LION_STORE_WINLOCK(ckey), ExclusiveLock);
+		LockPage(index, LION_STORE_WINLOCK(ckey), ShareLock);
+		MemoryContextReset(cxt);
+		lion_store_order_ssup(index, ix, &ssup, cxt);
+		if (!room)
+			break;
+	}
+
+	for (ord = 0; ord < ix->nstored; ord++)
+		if (ix->stored[ord].kind != LION_STORE_KIND_ORDERED)
+			lion_store_write(index, heaprel, ix, &ix->stored[ord], ckey, k, off,
+							 &vals[ord], 0, false, NULL);
+	if (placed)
+	{
+		uint16		v = vlo;
+		LionStoreVal pv;
+
+		pv.data = (const char *) &v;
+		pv.len = sizeof(uint16);
+		lion_store_write(index, heaprel, ix, ix->storeperm, ckey, k, off, &pv,
+						 LION_STORE_F_PERM, false, NULL);
+	}
+	else
+	{
+		/* make sure the window has its permutation, and no entry here */
+		Buffer		buf = lion_store_lock_head(index, ix, ckey, BUFFER_LOCK_SHARE);
+
+		if (!BufferIsValid(buf))
+			(void) lion_store_create_perm(index, heaprel, ix, ckey);
+		else
+			UnlockReleaseBuffer(buf);
+		lion_store_write(index, heaprel, ix, ix->storeperm, ckey, k, off, &none,
+						 LION_STORE_F_PERM, false, NULL);
 	}
 	UnlockPage(index, LION_STORE_WINLOCK(ckey), ShareLock);
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
 }
 
 /* ---------------------------------------------------------------------
@@ -3270,10 +4672,9 @@ lion_store_free_page(Relation index, Buffer buf)
 }
 
 /*
- * Which slots VACUUM clears.  A heap-ordered page's, and an ordered window's
- * append region's, by the callback on the slot's TID; an ordered window's
- * sorted slots and permutation entries by the dead positions the
- * permutation's walk found (§41), so that a row of the sorted region is asked
+ * Which slots VACUUM clears.  A heap-ordered page's by the callback on the
+ * slot's TID; an ordered window's bucket slots and permutation entries by the
+ * dead positions the permutation's walk found (§41), so that a row is asked
  * about once, not once per column.
  */
 typedef struct LionStoreDead
@@ -3310,12 +4711,8 @@ lion_store_slot_dead(LionStoreDead *dd, const LionStoreHeader *h, int k,
 		return dd->valid && dd->ckey == h->ckey &&
 			lion_store_bit(dd->deadpos, lion_store_vlo(k, (int) i + 1));
 	if ((h->flags & LION_STORE_F_VIRTUAL) != 0)
-	{
-		if (k < LION_STORE_APPEND_VPAGE)
-			return dd->valid && dd->ckey == h->ckey &&
-				lion_store_bit(dd->deadvlo, lion_store_vlo(k, (int) i + 1));
-		k -= LION_STORE_APPEND_VPAGE;
-	}
+		return dd->valid && dd->ckey == h->ckey &&
+			lion_store_bit(dd->deadvlo, lion_store_vlo(k, (int) i + 1));
 	ItemPointerSet(&tid, first + k, (OffsetNumber) (i + 1));
 	return dd->callback(&tid, dd->callback_state);
 }
@@ -3571,6 +4968,7 @@ typedef struct LionStoreVacArg
 	LionStoreVacStats *st;
 	MemoryContext pagecxt;
 	LionStoreDead *dead;
+	int64		locked;			/* the window whose lock is held, or -1 */
 } LionStoreVacArg;
 
 /* The column of ordinal ord: a stored column, or an ordered index's permutation. */
@@ -3581,10 +4979,11 @@ lion_store_ord_col(const LionIndexState *ix, int ord)
 }
 
 /*
- * The dead rows of an ordered window's sorted region (§41): every position
- * the permutation names is asked of the callback, once, and the dead ones'
- * positions and sorted slots marked.  The pages are read SHARE, one at a
- * time: an insert may clear an entry meanwhile, never set one.
+ * The dead rows of an ordered window (§41): every position the permutation
+ * names is asked of the callback, once, and the dead ones' positions and
+ * bucket slots marked.  The pages are read SHARE, one at a time, under the
+ * window lock in share mode, which keeps a split from moving a row
+ * meanwhile; an insert may set an entry, but only for a row that is not dead.
  */
 static void
 lion_store_perm_dead(Relation index, LionIndexState *ix, uint32 ckey,
@@ -3671,11 +5070,18 @@ lion_store_vacuum_chain(void *arg, uint64 slot, BlockNumber head)
 	 * An ordered window's chains are walked in ordinal order, the
 	 * permutation's last: its dead rows are found first, cleared from every
 	 * column, and only then from the permutation (§41, "VACUUM's bulk
-	 * delete").
+	 * delete"), all under the window lock in share mode, which keeps a split
+	 * from moving a row between the finding and the clearing.
 	 */
 	if (va->write && va->ix->store_order >= 0 &&
 		(!va->dead->valid || va->dead->ckey != ckey))
+	{
+		if (va->locked >= 0)
+			UnlockPage(va->index, LION_STORE_WINLOCK((uint32) va->locked), ShareLock);
+		LockPage(va->index, LION_STORE_WINLOCK(ckey), ShareLock);
+		va->locked = ckey;
 		lion_store_perm_dead(va->index, va->ix, ckey, va->dead, va->st);
+	}
 
 	while (BlockNumberIsValid(blk))
 	{
@@ -3744,8 +5150,11 @@ lion_store_bulkdelete(Relation index, LionIndexState *ix,
 	va.pagecxt = AllocSetContextCreate(CurrentMemoryContext,
 									   "lion store vacuum page",
 									   ALLOCSET_DEFAULT_SIZES);
+	va.locked = -1;
 	lion_storemap_walk(index, ix, 0, visit, visitarg,
 					   lion_store_vacuum_chain, &va, &st->mappages);
+	if (va.locked >= 0)
+		UnlockPage(index, LION_STORE_WINLOCK((uint32) va.locked), ShareLock);
 	MemoryContextDelete(va.pagecxt);
 	pfree(va.dead);
 }
@@ -3934,696 +5343,101 @@ lion_store_vacuum_cleanup(Relation index, Relation heaprel, LionIndexState *ix)
 }
 
 /* ---------------------------------------------------------------------
- * VACUUM's sort of an ordered index's windows (DESIGN.md §41, "The sort")
+ * An ordered window as a whole (DESIGN.md §41): verify() and the diagnostic
  * --------------------------------------------------------------------- */
 
-/*
- * Read the chain at head, of window ckey and col, into m: every page checked,
- * of generation gen, copied into the current memory context and decoded.
- * The caller holds the window lock exclusively, so nothing but a reader is
- * on the chain: a page that is not the window's is damage.
- */
-static void
-lion_store_read_chain(Relation index, const LionStoreCol *col, uint32 ckey,
-					  BlockNumber head, int gen, LionStoreModel *m)
-{
-	BlockNumber blk = head;
-	int			steps = 0;
-
-	memset(m, 0, sizeof(LionStoreModel));
-	m->ckey = ckey;
-	m->ord = (uint16) col->ord;
-	m->hi = -1;
-	while (BlockNumberIsValid(blk))
-	{
-		Buffer		buf = ReadBuffer(index, blk);
-		Page		page;
-		char	   *copy;
-		LionStoreModel pm;
-		BlockNumber next;
-		int			k;
-
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		if (!lion_store_page_owned(page, ckey, (uint16) col->ord) ||
-			(blk == head && lion_store_check_header(page, col) == NULL &&
-			 lion_store_page_header(page)->lo != 0))
-		{
-			UnlockReleaseBuffer(buf);
-			ereport(ERROR,
-					(errcode(ERRCODE_INDEX_CORRUPTED),
-					 errmsg("lion index \"%s\": block %u on the store chain of window %u ordinal %d is not one of its pages",
-							RelationGetRelationName(index), blk, ckey, col->ord),
-					 errhint("REINDEX the index.")));
-		}
-		lion_store_check_or_error(index, page, blk, col, true);
-		if (lion_store_flags_gen(lion_store_page_header(page)->flags) != gen)
-		{
-			UnlockReleaseBuffer(buf);
-			ereport(ERROR,
-					(errcode(ERRCODE_INDEX_CORRUPTED),
-					 errmsg("lion index \"%s\": store page %u of window %u is of generation %d, its permutation of %d",
-							RelationGetRelationName(index), blk, ckey,
-							lion_store_flags_gen(lion_store_page_header(page)->flags),
-							gen),
-					 errhint("REINDEX the index.")));
-		}
-		copy = (char *) palloc(BLCKSZ);
-		memcpy(copy, page, BLCKSZ);
-		next = LionPageGetOpaque(page)->rightlink;
-		UnlockReleaseBuffer(buf);
-
-		lion_store_decode(index, col, (Page) copy, blk, &pm);
-		if (pm.lo != m->hi + 1)
-			ereport(ERROR,
-					(errcode(ERRCODE_INDEX_CORRUPTED),
-					 errmsg("lion index \"%s\": store page %u of window %u covers pages %d to %d after %d",
-							RelationGetRelationName(index), blk, ckey, pm.lo,
-							pm.hi, m->hi),
-					 errhint("REINDEX the index.")));
-		for (k = pm.lo; k <= pm.hi; k++)
-		{
-			m->nslots[k] = pm.nslots[k];
-			m->slots[k] = pm.slots[k];
-			m->absent[k] = pm.absent[k];
-		}
-		m->hi = pm.hi;
-		if (pm.extra != NULL)
-		{
-			m->extra = pm.extra;
-			m->extralen = pm.extralen;
-		}
-		m->flags = pm.flags;
-		if (BlockNumberIsValid(next))
-			lion_store_chain_step(index, blk, next, &steps);
-		blk = next;
-	}
-}
-
-/* A permutation model's entry for heap position (k, off), or false. */
-static inline bool
-lion_store_perm_entry(const LionStoreModel *pm, int k, OffsetNumber off,
-					  uint16 *vlo)
-{
-	if (k > pm->hi || pm->absent[k] || off > pm->nslots[k] ||
-		pm->slots[k][off - 1].data == NULL)
-		return false;
-	memcpy(vlo, pm->slots[k][off - 1].data, sizeof(uint16));
-	return true;
-}
-
-/* A model's value at (page k, offset off), or NULL past what it holds. */
-static inline const LionStoreVal *
-lion_store_model_get(const LionStoreModel *m, int k, OffsetNumber off)
-{
-	if (k > m->hi || m->absent[k] || off > m->nslots[k] || m->slots[k] == NULL)
-		return NULL;
-	return &m->slots[k][off - 1];
-}
-
-/*
- * Write a page image nothing can reach yet as a new page linked to
- * rightlink, in a record of its own with the meta page's count.
- */
-static BlockNumber
-lion_store_write_new_page(Relation index, Relation heaprel,
-						  const LionStoreImage *img, BlockNumber rightlink)
-{
-	Buffer		nbuf = lion_alloc_page(index, heaprel, true);
-	BlockNumber blk = BufferGetBlockNumber(nbuf);
-	Buffer		metabuf = lion_store_lock_meta(index);
-	LionWalState *xs;
-	Page		p;
-
-	xs = lion_wal_begin(index);
-	p = lion_wal_register_buffer(xs, nbuf, LION_WALBUF_INIT);
-	lion_store_log_image(xs, p, img, rightlink);
-	lion_store_meta_count(xs, metabuf, 1);
-	lion_wal_finish(xs, LION_XLOG_STORE);
-	UnlockReleaseBuffer(nbuf);
-	UnlockReleaseBuffer(metabuf);
-	return blk;
-}
-
-/*
- * Write a chain's images as new pages, the last first so that each page is
- * written with the block of the one after it; returns the head.  The pages
- * go into the sorted window's directory as they are placed.
- */
-static BlockNumber
-lion_store_write_new_chain(Relation index, Relation heaprel,
-						   const LionStoreImages *li, LionStoreSorted *so,
-						   bool dir)
-{
-	BlockNumber next = InvalidBlockNumber;
-	BlockNumber *blks = (BlockNumber *) palloc(sizeof(BlockNumber) * li->n);
-	int			i;
-
-	for (i = li->n - 1; i >= 0; i--)
-	{
-		next = lion_store_write_new_page(index, heaprel, &li->imgs[i], next);
-		blks[i] = next;
-		CHECK_FOR_INTERRUPTS();
-	}
-	if (dir)
-		for (i = 0; i < li->n; i++)
-			lion_store_sorted_dir(so, &li->imgs[i], blks[i]);
-	return next;
-}
-
-/*
- * Point every map slot of window ckey at its new head, in one record: the
- * slots of one window are consecutive, so one map leaf or two.
- */
-static void
-lion_store_switch_heads(Relation index, Relation heaprel, LionIndexState *ix,
-						uint32 ckey, const BlockNumber *heads)
-{
-	int			stride = lion_store_stride(ix);
-	uint64		s0 = lion_storemap_slot(ckey, stride, 0);
-	uint64		s1 = s0 + (uint64) stride - 1;
-	uint64		leafno[2];
-	BlockNumber leafblk[2];
-	Buffer		buf[2];
-	int			nleaf = 1;
-	LionWalState *xs;
-	int			j;
-
-	leafno[0] = s0 / LION_STOREMAP_FANOUT;
-	leafno[1] = s1 / LION_STOREMAP_FANOUT;
-	if (leafno[1] != leafno[0])
-		nleaf = 2;
-	for (j = 0; j < nleaf; j++)
-		leafblk[j] = lion_storemap_extend(index, heaprel, ix, leafno[j]);
-	for (j = 0; j < nleaf; j++)
-	{
-		buf[j] = ReadBuffer(index, leafblk[j]);
-		LockBuffer(buf[j], BUFFER_LOCK_EXCLUSIVE);
-		lion_storemap_check(index, BufferGetPage(buf[j]), leafblk[j],
-							LION_STOREMAP_LEAF, leafno[j]);
-	}
-
-	xs = lion_wal_begin(index);
-	for (j = 0; j < nleaf; j++)
-	{
-		Page		p = lion_wal_register_buffer(xs, buf[j], LION_WALBUF_STD);
-		BlockNumber *ents = lion_storemap_entries(p);
-		uint64		from = Max(s0, leafno[j] * LION_STOREMAP_FANOUT);
-		uint64		to = Min(s1, (leafno[j] + 1) * LION_STOREMAP_FANOUT - 1);
-		uint64		sl;
-
-		for (sl = from; sl <= to; sl++)
-			ents[sl % LION_STOREMAP_FANOUT] = heads[sl - s0];
-		lion_wal_op(xs, p, LION_OP_SETBYTES, FirstOffsetNumber,
-					(uint16) ((from % LION_STOREMAP_FANOUT) * sizeof(BlockNumber)),
-					&ents[from % LION_STOREMAP_FANOUT],
-					(to - from + 1) * sizeof(BlockNumber));
-	}
-	lion_wal_finish(xs, LION_XLOG_STORE);
-	for (j = 0; j < nleaf; j++)
-		UnlockReleaseBuffer(buf[j]);
-}
-
-/*
- * The line pointers in use on heap block blk, as bits by offset: a row's
- * (normal, or the root of a HOT chain) or one being pruned.  None for a
- * block past the heap's end.
- */
-static void
-lion_store_heap_used(Relation heaprel, BlockNumber blk, uint8 *used)
-{
-	Buffer		buf;
-	Page		page;
-	OffsetNumber maxoff;
-	OffsetNumber off;
-
-	memset(used, 0, (MaxHeapTuplesPerPage + 1 + 7) / 8);
-	if (blk >= RelationGetNumberOfBlocks(heaprel))
-		return;
-	buf = ReadBufferExtended(heaprel, MAIN_FORKNUM, blk, RBM_NORMAL, NULL);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page = BufferGetPage(buf);
-	if (!PageIsNew(page))
-	{
-		maxoff = PageGetMaxOffsetNumber(page);
-		for (off = FirstOffsetNumber; off <= Min(maxoff, MaxHeapTuplesPerPage); off++)
-			if (ItemIdIsUsed(PageGetItemId(page, off)))
-				lion_store_bit_set(used, off);
-	}
-	UnlockReleaseBuffer(buf);
-}
-
-/*
- * Sort window ckey again, under the window lock the caller holds
- * exclusively: read its chains, sort its rows, write the new chains and
- * permutation, switch the map, free the old pages.  false, with nothing
- * written, for a window it leaves alone (no rows, or an ABSENT page whose
- * values only the heap has).
- */
-static bool
-lion_store_sort_window_now(Relation index, Relation heaprel, LionIndexState *ix,
-						   SortSupport ssup, uint32 ckey, int64 *freed)
-{
-	int			stride = lion_store_stride(ix);
-	BlockNumber *oldheads = (BlockNumber *) palloc(sizeof(BlockNumber) * stride);
-	BlockNumber *newheads = (BlockNumber *) palloc(sizeof(BlockNumber) * stride);
-	LionStoreModel *vm = (LionStoreModel *) palloc(sizeof(LionStoreModel) * ix->nstored);
-	LionStoreModel *hm = (LionStoreModel *) palloc0(sizeof(LionStoreModel) * ix->nstored);
-	LionStoreModel pm;
-	LionStoreDictSet ds;
-	LionStoreSorted so;
-	uint16	   *rows;
-	const LionStoreVal **vals;
-	uint8		used[(MaxHeapTuplesPerPage + 1 + 7) / 8];
-	int			n = 0;
-	int			gen = 0;
-	int			ord;
-	int			k;
-	bool		any = false;
-
-	for (ord = 0; ord < stride; ord++)
-	{
-		oldheads[ord] = lion_storemap_head(index, ix->store.store_root,
-										   lion_storemap_slot(ckey, stride, ord),
-										   NULL);
-		if (ord < ix->nstored && BlockNumberIsValid(oldheads[ord]))
-			any = true;
-	}
-	if (!any)
-		return false;
-
-	memset(&pm, 0, sizeof(pm));
-	pm.hi = -1;
-	if (BlockNumberIsValid(oldheads[ix->nstored]))
-	{
-		Buffer		buf = ReadBuffer(index, oldheads[ix->nstored]);
-
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		if (lion_store_page_owned(BufferGetPage(buf), ckey, (uint16) ix->nstored))
-			gen = lion_store_flags_gen(lion_store_page_header(BufferGetPage(buf))->flags);
-		UnlockReleaseBuffer(buf);
-		lion_store_read_chain(index, ix->storeperm, ckey, oldheads[ix->nstored],
-							  gen, &pm);
-	}
-	for (ord = 0; ord < ix->nstored; ord++)
-	{
-		if (!BlockNumberIsValid(oldheads[ord]))
-		{
-			memset(&vm[ord], 0, sizeof(LionStoreModel));
-			vm[ord].hi = -1;
-			continue;
-		}
-		lion_store_read_chain(index, &ix->stored[ord], ckey, oldheads[ord], gen,
-							  &vm[ord]);
-		for (k = 0; k <= vm[ord].hi; k++)
-			if (vm[ord].absent[k])
-				return false;	/* values only the heap has: leave it be */
-	}
-
-	/*
-	 * The window's rows, in heap coordinates: a position with a permutation
-	 * entry reads its sorted slot, any other its append slot - what a reader
-	 * reads.  A slot does not tell a NULL from no row, so a position whose
-	 * every value is NULL is a row only if the heap has a line pointer in use
-	 * there: a slot no row wrote, below one an insert did, or an entry a
-	 * crash left behind, takes no slot in the new order.  An insert that
-	 * puts a row at such a position meanwhile waits for the window lock, and
-	 * writes its slots in the append region after the sort.
-	 */
-	rows = (uint16 *) palloc(sizeof(uint16) * LION_BLOCKS_PER_CONTAINER * MaxHeapTuplesPerPage);
-	vals = (const LionStoreVal **) palloc(sizeof(LionStoreVal *) * ix->nstored);
-	for (k = 0; k < LION_BLOCKS_PER_CONTAINER; k++)
-	{
-		int			vp = LION_STORE_APPEND_VPAGE + k;
-		int			maxoff = 0;
-		bool		heapread = false;
-		OffsetNumber off;
-
-		for (ord = 0; ord < ix->nstored; ord++)
-			if (vp <= vm[ord].hi)
-				maxoff = Max(maxoff, (int) vm[ord].nslots[vp]);
-		if (k <= pm.hi && !pm.absent[k])
-			maxoff = Max(maxoff, (int) pm.nslots[k]);
-		maxoff = Min(maxoff, MaxHeapTuplesPerPage);
-
-		for (off = FirstOffsetNumber; off <= maxoff; off++)
-		{
-			uint16		vlo;
-			bool		sorted = lion_store_perm_entry(&pm, k, off, &vlo);
-			bool		present = sorted;
-			bool		anyvalue = false;
-
-			if (!sorted)
-				for (ord = 0; ord < ix->nstored && !present; ord++)
-					present = (vp <= vm[ord].hi && off <= vm[ord].nslots[vp]);
-			if (!present)
-				continue;
-			for (ord = 0; ord < ix->nstored; ord++)
-			{
-				vals[ord] = sorted ?
-					lion_store_model_get(&vm[ord], lion_store_vlo_page(vlo),
-										 (OffsetNumber) lion_store_vlo_off(vlo)) :
-					lion_store_model_get(&vm[ord], vp, off);
-				if (vals[ord] != NULL && vals[ord]->data != NULL)
-					anyvalue = true;
-			}
-			if (!anyvalue)
-			{
-				if (!heapread)
-				{
-					lion_store_heap_used(heaprel,
-										 (BlockNumber) ckey * LION_BLOCKS_PER_CONTAINER + k,
-										 used);
-					heapread = true;
-				}
-				if (!lion_store_bit(used, off))
-					continue;
-			}
-			for (ord = 0; ord < ix->nstored; ord++)
-			{
-				if (hm[ord].slots[k] == NULL)
-					hm[ord].slots[k] = (LionStoreVal *)
-						palloc0(sizeof(LionStoreVal) * MaxHeapTuplesPerPage);
-				if (vals[ord] != NULL)
-					hm[ord].slots[k][off - 1] = *vals[ord];
-				hm[ord].nslots[k] = Max(hm[ord].nslots[k], off);
-				hm[ord].hi = Max(hm[ord].hi, k);
-			}
-			rows[n++] = lion_store_vlo(k, off);
-		}
-	}
-	if (n == 0)
-		return false;
-
-	lion_store_sort_window(ix, ssup, ckey, hm, rows, n, lion_store_next_gen(gen),
-						   &so);
-	lion_store_dset_init(&ds, CurrentMemoryContext);
-	for (ord = 0; ord < ix->nstored; ord++)
-	{
-		LionStoreImages li;
-
-		memset(&li, 0, sizeof(li));
-		lion_store_layout(&ix->stored[ord], &so.vm[ord], so.nvpages - 1, &ds, &li);
-		newheads[ord] = lion_store_write_new_chain(index, heaprel, &li, &so, true);
-	}
-	lion_store_sorted_header(&so);
-	{
-		LionStoreImages li;
-
-		memset(&li, 0, sizeof(li));
-		lion_store_layout(ix->storeperm, &so.pm, so.pm.hi, &ds, &li);
-		newheads[ix->nstored] = lion_store_write_new_chain(index, heaprel, &li,
-														   &so, false);
-	}
-
-	/* the switch, after which the old pages are nobody's */
-	lion_store_switch_heads(index, heaprel, ix, ckey, newheads);
-	for (ord = 0; ord < stride; ord++)
-		if (BlockNumberIsValid(oldheads[ord]))
-			*freed += lion_store_free_chain(index, ckey, (uint16) ord,
-											oldheads[ord], 0);
-	return true;
-}
-
-/*
- * The non-NULL slots of sub-array sub of a checked page with header h: the
- * rows a page holds, as far as a slot can tell (a NULL is not told apart
- * from a slot no row wrote).
- */
-static int
-lion_store_sub_values(const LionStoreHeader *h, const LionStoreSub *sub)
-{
-	const uint8 *body = (const uint8 *) sub + sizeof(LionStoreSub);
-	int			n = 0;
-	uint32		i;
-
-	if ((sub->flags & LION_STORE_ABSENT) != 0)
-		return 0;
-	for (i = 0; i < sub->nslots; i++)
-	{
-		if (h->mode == LION_STORE_DICT)
-			n += (lion_store_code_get(body, h->width, i) != 0);
-		else
-			n += !lion_store_null_get(body + (Size) sub->nslots * h->width, i);
-	}
-	return n;
-}
-
-/*
- * Does window ckey want sorting (§41)?  Its permutation says how many rows
- * the last sort ordered and how many of them still have an entry; the order
- * column's chain how many values its append region has (a row whose order
- * value is NULL is not counted: a slot does not tell it from no row).  A
- * quarter of the window's rows outside the sorted order, dead or appended,
- * and it does.
- */
-static bool
-lion_store_window_wants_sort(Relation index, LionIndexState *ix, uint32 ckey)
-{
-	int			stride = lion_store_stride(ix);
-	const LionStoreCol *ocol = &ix->stored[ix->store_order];
-	BlockNumber blk;
-	int			steps = 0;
-	int64		nsorted = 0;
-	int64		live = 0;
-	int64		appended = 0;
-	int64		outside;
-
-	blk = lion_storemap_head(index, ix->store.store_root,
-							 lion_storemap_slot(ckey, stride, ix->nstored), NULL);
-	while (BlockNumberIsValid(blk))
-	{
-		Buffer		buf = ReadBuffer(index, blk);
-		Page		page;
-		LionStoreHeader *h;
-		BlockNumber next;
-		int			k;
-
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		if (!lion_store_page_owned(page, ckey, (uint16) ix->nstored) ||
-			lion_store_page_check(page, ix->storeperm) != NULL)
-		{
-			UnlockReleaseBuffer(buf);
-			return false;		/* the sort itself will say what is wrong */
-		}
-		h = lion_store_page_header(page);
-		if (h->lo == 0)
-		{
-			LionStoreWinHdr wh;
-
-			memcpy(&wh, (const char *) PageGetItem(page, PageGetItemId(page, LION_STORE_DICT_OFF)) +
-				   sizeof(LionStoreDict), sizeof(LionStoreWinHdr));
-			nsorted = wh.nsorted;
-		}
-		for (k = h->lo; k <= h->hi; k++)
-		{
-			Size		len;
-			LionStoreSub *sub = lion_store_page_sub(page, k, &len);
-			const uint8 *body = (const uint8 *) sub + sizeof(LionStoreSub);
-			uint32		i;
-
-			for (i = 0; i < sub->nslots; i++)
-				if (!lion_store_null_get(body + (Size) sub->nslots * h->width, i))
-					live++;
-		}
-		next = LionPageGetOpaque(page)->rightlink;
-		UnlockReleaseBuffer(buf);
-		if (BlockNumberIsValid(next))
-			lion_store_chain_step(index, blk, next, &steps);
-		blk = next;
-	}
-
-	steps = 0;
-	blk = lion_storemap_head(index, ix->store.store_root,
-							 lion_storemap_slot(ckey, stride, ocol->ord), NULL);
-	while (BlockNumberIsValid(blk))
-	{
-		Buffer		buf = ReadBuffer(index, blk);
-		Page		page;
-		LionStoreHeader *h;
-		BlockNumber next;
-		int			k;
-
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		if (!lion_store_page_owned(page, ckey, (uint16) ocol->ord) ||
-			lion_store_page_check(page, ocol) != NULL)
-		{
-			UnlockReleaseBuffer(buf);
-			return false;
-		}
-		h = lion_store_page_header(page);
-		for (k = Max(h->lo, LION_STORE_APPEND_VPAGE); k <= h->hi; k++)
-		{
-			Size		len;
-
-			appended += lion_store_sub_values(h, lion_store_page_sub(page, k, &len));
-		}
-		next = LionPageGetOpaque(page)->rightlink;
-		UnlockReleaseBuffer(buf);
-		if (BlockNumberIsValid(next))
-			lion_store_chain_step(index, blk, next, &steps);
-		blk = next;
-	}
-
-	outside = Max(nsorted - live, 0) + appended;
-	return outside > 0 && outside * 4 > live + appended;
-}
-
-/* The windows a map walk found, for the sort. */
-typedef struct LionStoreWindows
-{
-	int			n;
-	int			cap;
-	uint32	   *ckeys;
-	int			stride;
-} LionStoreWindows;
-
-static void
-lion_store_note_window(void *arg, uint64 slot, BlockNumber head)
-{
-	LionStoreWindows *w = (LionStoreWindows *) arg;
-	uint32		ckey = (uint32) (slot / (uint64) w->stride);
-
-	if (w->n > 0 && w->ckeys[w->n - 1] == ckey)
-		return;
-	if (w->n >= w->cap)
-	{
-		w->cap = Max(64, w->cap * 2);
-		w->ckeys = (uint32 *) repalloc_array(w->ckeys, uint32, w->cap);
-	}
-	w->ckeys[w->n++] = ckey;
-}
-
-int64
-lion_store_vacuum_sort(Relation index, Relation heaprel, LionIndexState *ix,
-					   int64 *freed)
-{
-	LionStoreWindows w;
-	MemoryContext wcxt;
-	MemoryContext old;
-	SortSupportData ssup;
-	BlockNumber nblocks;
-	uint32		firstwin;
-	int64		sorted = 0;
-	int			i;
-
-	*freed = 0;
-	if (ix->store_order < 0)
-		return 0;
-
-	memset(&w, 0, sizeof(w));
-	w.stride = lion_store_stride(ix);
-	w.cap = 64;
-	w.ckeys = palloc_array(uint32, w.cap);
-	lion_storemap_walk(index, ix, 0, NULL, NULL, lion_store_note_window, &w, NULL);
-
-	/* the windows past the heap's end are lion_store_vacuum_cleanup()'s */
-	nblocks = RelationGetNumberOfBlocks(heaprel);
-	firstwin = (uint32) ((nblocks + LION_BLOCKS_PER_CONTAINER - 1) /
-						 LION_BLOCKS_PER_CONTAINER);
-	wcxt = AllocSetContextCreate(CurrentMemoryContext, "lion store sort",
-								 ALLOCSET_DEFAULT_SIZES);
-	lion_store_order_ssup(index, ix, &ssup, CurrentMemoryContext);
-
-	for (i = 0; i < w.n; i++)
-	{
-		uint32		ckey = w.ckeys[i];
-
-		if (ckey >= firstwin)
-			break;
-		old = MemoryContextSwitchTo(wcxt);
-		if (lion_store_window_wants_sort(index, ix, ckey) &&
-			ConditionalLockPage(index, LION_STORE_WINLOCK(ckey), ExclusiveLock))
-		{
-			if (lion_store_sort_window_now(index, heaprel, ix, &ssup, ckey, freed))
-				sorted++;
-			UnlockPage(index, LION_STORE_WINLOCK(ckey), ExclusiveLock);
-		}
-		MemoryContextSwitchTo(old);
-		MemoryContextReset(wcxt);
-		lion_vacuum_delay_point();
-	}
-	MemoryContextDelete(wcxt);
-	pfree(w.ckeys);
-	return sorted;
-}
 
 /*
  * verify()'s check of an ordered window as a whole (DESIGN.md §41,
- * "verify()"), after each of its chains has passed on its own: every page
- * of the generation of the permutation's head (0 without one), no sorted
- * slot without a permutation, the permutation a bijection from the
- * positions with an entry onto distinct sorted slots below nsorted, every
- * sorted slot holding a value named by an entry, and the directory naming
- * the pages that hold sorted slots - all of them unless it was thinned.
- * ERRORs on damage.  The caller holds what keeps VACUUM out.
+ * "verify()"), after each of its chains has passed on its own, under the
+ * window lock in share mode, which keeps splits out: the window header well
+ * formed and its fences in order; the permutation naming distinct slots, each
+ * of a bucket within the slots it has handed out (or of a virtual page no
+ * bucket has, which a split a crash cut short leaves behind); every row of a
+ * bucket inside the bucket's range; and every directory entry the page of
+ * its column whose range starts where it says.  A slot no entry names may
+ * hold a value: an insert writes its values before its entry, and a crash
+ * between leaves them.  ERRORs on damage.
  */
 void
 lion_store_verify_window(Relation index, LionIndexState *ix, uint32 ckey)
 {
 	int			stride = lion_store_stride(ix);
+	const LionStoreCol *ocol = &ix->stored[ix->store_order];
 	BlockNumber *heads = (BlockNumber *) palloc(sizeof(BlockNumber) * stride);
-	LionStoreModel *vm = (LionStoreModel *) palloc(sizeof(LionStoreModel));
 	LionStoreModel *pm = (LionStoreModel *) palloc(sizeof(LionStoreModel));
-	LionStoreWinHdr wh;
-	LionStoreDirEnt *dir = NULL;
+	LionStoreModel *om = (LionStoreModel *) palloc(sizeof(LionStoreModel));
+	LionStoreHdr hd;
+	SortSupportData ssup;
+	int			bucketof[LION_STORE_MAX_VPAGES];
 	uint8	   *named;
-	int			gen = 0;
-	int			ndirseen = 0;
-	int			nvpages;
 	int			ord;
 	int			k;
+	int			i;
 
 	if (ix->store_order < 0)
 		return;
+	LockPage(index, LION_STORE_WINLOCK(ckey), ShareLock);
 	for (ord = 0; ord < stride; ord++)
 		heads[ord] = lion_storemap_head(index, ix->store.store_root,
 										lion_storemap_slot(ckey, stride, ord),
 										NULL);
-
-	memset(&wh, 0, sizeof(wh));
-	memset(pm, 0, sizeof(LionStoreModel));
-	pm->hi = -1;
-	if (BlockNumberIsValid(heads[ix->nstored]))
+	if (!BlockNumberIsValid(heads[ix->nstored]))
 	{
-		Buffer		buf = ReadBuffer(index, heads[ix->nstored]);
-
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		if (lion_store_page_owned(BufferGetPage(buf), ckey, (uint16) ix->nstored))
-			gen = lion_store_flags_gen(lion_store_page_header(BufferGetPage(buf))->flags);
-		UnlockReleaseBuffer(buf);
-		lion_store_read_chain(index, ix->storeperm, ckey, heads[ix->nstored],
-							  gen, pm);
-		if (pm->extra == NULL || gen == 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_INDEX_CORRUPTED),
-					 errmsg("lion index \"%s\": the permutation of window %u has no window header, or generation 0",
-							RelationGetRelationName(index), ckey)));
-		memcpy(&wh, pm->extra, sizeof(LionStoreWinHdr));
-		dir = (LionStoreDirEnt *) palloc(sizeof(LionStoreDirEnt) * Max(wh.ndir, 1));
-		memcpy(dir, pm->extra + sizeof(LionStoreWinHdr),
-			   sizeof(LionStoreDirEnt) * wh.ndir);
-		for (k = 1; k < wh.ndir; k++)
-			if (dir[k].ord < dir[k - 1].ord ||
-				(dir[k].ord == dir[k - 1].ord && dir[k].lo <= dir[k - 1].lo))
+		for (ord = 0; ord < ix->nstored; ord++)
+			if (ix->stored[ord].kind == LION_STORE_KIND_ORDERED &&
+				BlockNumberIsValid(heads[ord]))
 				ereport(ERROR,
 						(errcode(ERRCODE_INDEX_CORRUPTED),
-						 errmsg("lion index \"%s\": the directory of window %u is out of order at entry %d",
-								RelationGetRelationName(index), ckey, k)));
+						 errmsg("lion index \"%s\": window %u has values for column %d and no permutation",
+								RelationGetRelationName(index), ckey,
+								ix->stored[ord].attno)));
+		UnlockPage(index, LION_STORE_WINLOCK(ckey), ShareLock);
+		return;
 	}
 
-	/*
-	 * The virtual pages the sorted region uses: every page starting below
-	 * them is in the directory unless it was thinned.  A page past them holds
-	 * no sorted slot (an append after a sort starts where the last page
-	 * ended), and needs no entry.
-	 */
-	nvpages = (wh.vwidth > 0) ? (wh.nsorted + wh.vwidth - 1) / wh.vwidth : 0;
+	lion_store_read_chain(index, ix->storeperm, ckey, heads[ix->nstored], pm);
+	if (pm->extra == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": the permutation of window %u has no window header",
+						RelationGetRelationName(index), ckey)));
+	lion_store_hdr_parse(index, ckey, pm->extra, pm->extralen, &hd);
+	lion_store_order_ssup(index, ix, &ssup, CurrentMemoryContext);
+	for (k = 0; k < LION_STORE_MAX_VPAGES; k++)
+		bucketof[k] = -1;
+	for (i = 0; i < hd.nbucket; i++)
+		bucketof[hd.bk[i].vpage] = i;
 
-	/* the permutation: distinct sorted slots below nsorted */
-	named = (uint8 *) palloc0((Max(wh.nsorted, 1) + 7) / 8);
+	/* the fences, ascending */
+	for (i = 1; i < hd.nbucket; i++)
+	{
+		bool		fnull;
+		Datum		fd;
+		int			prev;
+
+		if ((hd.bk[i].flags & LION_STORE_BK_SAME) != 0)
+			continue;
+		fnull = (hd.bk[i].flags & LION_STORE_BK_NULL) != 0;
+		fd = fnull ? (Datum) 0 :
+			lion_store_datum(ocol, hd.fence[i], hd.bk[i].fencelen, CurrentMemoryContext);
+		for (prev = i - 1; prev > 0 && (hd.bk[prev].flags & LION_STORE_BK_SAME) != 0; prev--)
+			;
+		if (lion_store_fence_cmp(&hd, ocol, &ssup, prev, fd, fnull, hd.bk[i].lo) > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": the fence of bucket %d of window %u is below the one before it",
+							RelationGetRelationName(index), i, ckey)));
+	}
+
+	/* the order column, to place each row */
+	memset(om, 0, sizeof(LionStoreModel));
+	om->hi = -1;
+	if (BlockNumberIsValid(heads[ocol->ord]))
+		lion_store_read_chain(index, ocol, ckey, heads[ocol->ord], om);
+
+	/* the permutation: distinct slots, within their buckets */
+	named = (uint8 *) palloc0((1 << 16) / 8);
 	for (k = 0; k <= pm->hi; k++)
 	{
 		OffsetNumber off;
@@ -4638,117 +5452,103 @@ lion_store_verify_window(Relation index, LionIndexState *ix, uint32 ckey)
 			uint16		vlo;
 			int			p;
 			int			o;
-			uint32		s;
+			int			b;
+			const LionStoreVal *v;
+			bool		isnull;
+			Datum		d;
 
 			if (!lion_store_perm_entry(pm, k, off, &vlo))
 				continue;
 			p = lion_store_vlo_page(vlo);
 			o = lion_store_vlo_off(vlo);
-			s = (uint32) p * wh.vwidth + (uint32) (o - 1);
-			if (p >= LION_STORE_APPEND_VPAGE || o < FirstOffsetNumber ||
-				o > wh.vwidth || s >= wh.nsorted)
+			b = bucketof[p];
+			if (o < FirstOffsetNumber || o > LION_STORE_BUCKET_SLOTS ||
+				(b >= 0 && o > hd.bk[b].used))
 				ereport(ERROR,
 						(errcode(ERRCODE_INDEX_CORRUPTED),
-						 errmsg("lion index \"%s\": the permutation of window %u gives heap page %d offset %u the slot %u, outside the %u rows sorted %u to a page",
+						 errmsg("lion index \"%s\": the permutation of window %u gives heap page %d offset %u the slot %u, past what its bucket handed out",
 								RelationGetRelationName(index), ckey, k,
-								(unsigned) off, (unsigned) vlo,
-								(unsigned) wh.nsorted, (unsigned) wh.vwidth)));
-			if (lion_store_bit(named, s))
+								(unsigned) off, (unsigned) vlo)));
+			if (lion_store_bit(named, vlo))
 				ereport(ERROR,
 						(errcode(ERRCODE_INDEX_CORRUPTED),
 						 errmsg("lion index \"%s\": the permutation of window %u gives slot %u to two rows",
 								RelationGetRelationName(index), ckey,
 								(unsigned) vlo)));
-			lion_store_bit_set(named, s);
+			lion_store_bit_set(named, vlo);
+			if (b < 0)
+				continue;
+
+			/* the row inside its bucket's range */
+			if (ocol->kind == LION_STORE_KIND_ORDERED)
+				v = lion_store_model_get(om, p, (OffsetNumber) o);
+			else
+				v = lion_store_model_get(om, k, off);
+			d = lion_store_order_datum(ix, v, &isnull);
+			if (lion_store_fence_cmp(&hd, ocol, &ssup, b, d, isnull,
+									 lion_store_vlo(k, off)) > 0 ||
+				(b + 1 < hd.nbucket &&
+				 lion_store_fence_cmp(&hd, ocol, &ssup, b + 1, d, isnull,
+									  lion_store_vlo(k, off)) <= 0 &&
+				 (hd.bk[b + 1].flags & LION_STORE_BK_SAME) == 0))
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("lion index \"%s\": heap page %d offset %u of window %u is in bucket %d, outside its range",
+								RelationGetRelationName(index), k, (unsigned) off,
+								ckey, b)));
 		}
 	}
 
-	/* every column: its generation, its sorted values named, its directory */
-	for (ord = 0; ord < ix->nstored; ord++)
+	/* the directory, entry by entry */
+	for (i = 0; i < hd.ndir; i++)
 	{
-		const LionStoreCol *col = &ix->stored[ord];
-		BlockNumber blk = heads[ord];
+		const LionStoreDirEnt *e = &hd.dir[i];
+		BlockNumber blk;
 		int			steps = 0;
-		int			p;
+		bool		found = false;
 
-		if (!BlockNumberIsValid(blk))
-			continue;
-		lion_store_read_chain(index, col, ckey, blk, gen, vm);
-		for (p = 0; p < LION_STORE_APPEND_VPAGE && p <= vm->hi; p++)
-		{
-			OffsetNumber off;
-
-			if (vm->absent[p] || vm->slots[p] == NULL)
-				continue;
-			for (off = FirstOffsetNumber; off <= vm->nslots[p]; off++)
-			{
-				uint32		s = (uint32) p * wh.vwidth + (uint32) (off - 1);
-
-				if (vm->slots[p][off - 1].data == NULL)
-					continue;
-				if (off > wh.vwidth || s >= wh.nsorted || !lion_store_bit(named, s))
-					ereport(ERROR,
-							(errcode(ERRCODE_INDEX_CORRUPTED),
-							 errmsg("lion index \"%s\": window %u column %d has a value at virtual page %d offset %u that no permutation entry names",
-									RelationGetRelationName(index), ckey,
-									col->attno, p, (unsigned) off)));
-			}
-		}
-
-		/* the directory, page by page */
-		while (BlockNumberIsValid(blk))
+		if (e->ord >= ix->nstored ||
+			ix->stored[e->ord].kind != LION_STORE_KIND_ORDERED)
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": the directory of window %u names ordinal %u, which is not an ordered column",
+							RelationGetRelationName(index), ckey, (unsigned) e->ord)));
+		for (blk = heads[e->ord]; BlockNumberIsValid(blk);)
 		{
 			Buffer		buf = ReadBuffer(index, blk);
-			Page		page;
 			int			lo;
 			BlockNumber next;
-			bool		found = false;
-			int			d;
 
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			page = BufferGetPage(buf);
-			lo = lion_store_page_header(page)->lo;
-			next = LionPageGetOpaque(page)->rightlink;
+			lo = lion_store_page_header(BufferGetPage(buf))->lo;
+			next = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
 			UnlockReleaseBuffer(buf);
-
-			for (d = 0; d < wh.ndir; d++)
-				if (dir[d].ord == ord && dir[d].lo == lo)
-				{
-					if (dir[d].blk != blk)
-						ereport(ERROR,
-								(errcode(ERRCODE_INDEX_CORRUPTED),
-								 errmsg("lion index \"%s\": the directory of window %u names block %u for column %d virtual page %d, which is at block %u",
-										RelationGetRelationName(index), ckey,
-										dir[d].blk, col->attno, lo, blk)));
-					found = true;
-					ndirseen++;
-				}
-			if (!found && lo > 0 && lo < nvpages &&
-				(wh.flags & LION_STORE_WH_THIN) == 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_INDEX_CORRUPTED),
-						 errmsg("lion index \"%s\": the directory of window %u does not name block %u, column %d from virtual page %d",
-								RelationGetRelationName(index), ckey, blk,
-								col->attno, lo)));
+			if (lo == e->lo)
+			{
+				found = (blk == e->blk);
+				break;
+			}
+			if (lo > e->lo)
+				break;
 			if (BlockNumberIsValid(next))
 				lion_store_chain_step(index, blk, next, &steps);
 			blk = next;
 		}
+		if (!found)
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": the directory of window %u names block %u for column %d virtual page %u, which is not that page",
+							RelationGetRelationName(index), ckey, e->blk,
+							ix->stored[e->ord].attno, (unsigned) e->lo)));
 	}
-	if (ndirseen != wh.ndir)
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("lion index \"%s\": the directory of window %u has %u entries, %d of them pages of its chains",
-						RelationGetRelationName(index), ckey,
-						(unsigned) wh.ndir, ndirseen)));
+	UnlockPage(index, LION_STORE_WINLOCK(ckey), ShareLock);
 }
 
 /*
  * What lion_index_store_window() shows of window ckey of an ordered index
- * (§41): its permutation's generation and window header, the positions with
- * an entry, the order column's append-region slots, and the pages of its
- * chains.  The chains are read as the sort reads them, and a damaged one is
- * an ERROR.
+ * (§41): its generation and buckets, the positions with an entry and how
+ * many of them name a virtual page no bucket has, the directory, and the
+ * pages of its chains.  A damaged chain is an ERROR.
  */
 void
 lion_store_window_info(Relation index, LionIndexState *ix, uint32 ckey,
@@ -4762,6 +5562,7 @@ lion_store_window_info(Relation index, LionIndexState *ix, uint32 ckey,
 	memset(wi, 0, sizeof(LionStoreWindowInfo));
 	if (ix->store_order < 0)
 		return;
+	LockPage(index, LION_STORE_WINLOCK(ckey), ShareLock);
 	for (ord = 0; ord < stride; ord++)
 	{
 		BlockNumber blk = lion_storemap_head(index, ix->store.store_root,
@@ -4785,23 +5586,20 @@ lion_store_window_info(Relation index, LionIndexState *ix, uint32 ckey,
 						 errmsg("lion index \"%s\": block %u on the store chain of window %u ordinal %d is not one of its pages",
 								RelationGetRelationName(index), blk, ckey, ord)));
 			}
-			if (ord == ix->nstored && steps == 0)
-				wi->gen = lion_store_flags_gen(lion_store_page_header(BufferGetPage(buf))->flags);
 			next = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
 			UnlockReleaseBuffer(buf);
 			if (ord == ix->nstored)
 				wi->perm_pages++;
-			else
+			else if (ix->stored[ord].kind == LION_STORE_KIND_ORDERED)
 				wi->pages++;
+			else
+				wi->heap_pages++;
 			if (BlockNumberIsValid(next))
 				lion_store_chain_step(index, blk, next, &steps);
 			blk = next;
 		}
 	}
-	if (!wi->exists)
-		return;
-
-	/* the permutation */
+	if (wi->exists)
 	{
 		BlockNumber head = lion_storemap_head(index, ix->store.store_root,
 											  lion_storemap_slot(ckey, stride, ix->nstored),
@@ -4809,50 +5607,41 @@ lion_store_window_info(Relation index, LionIndexState *ix, uint32 ckey,
 
 		if (BlockNumberIsValid(head))
 		{
-			LionStoreWinHdr wh;
+			LionStoreHdr hd;
+			bool		inbucket[LION_STORE_MAX_VPAGES];
+			int			i;
 
-			lion_store_read_chain(index, ix->storeperm, ckey, head, wi->gen, m);
+			lion_store_read_chain(index, ix->storeperm, ckey, head, m);
 			if (m->extra != NULL)
 			{
-				memcpy(&wh, m->extra, sizeof(LionStoreWinHdr));
-				wi->nsorted = wh.nsorted;
-				wi->vwidth = wh.vwidth;
-				wi->ndir = wh.ndir;
-				wi->thin = (wh.flags & LION_STORE_WH_THIN) != 0;
-			}
-			for (k = 0; k <= m->hi; k++)
-			{
-				OffsetNumber off;
-				uint16		vlo;
+				lion_store_hdr_parse(index, ckey, m->extra, m->extralen, &hd);
+				wi->gen = hd.gen;
+				wi->buckets = hd.nbucket;
+				wi->ndir = hd.ndir;
+				wi->thin = (hd.flags & LION_STORE_WH_THIN) != 0;
+				memset(inbucket, 0, sizeof(inbucket));
+				for (i = 0; i < hd.nbucket; i++)
+				{
+					wi->slots += hd.bk[i].used;
+					inbucket[hd.bk[i].vpage] = true;
+				}
+				for (k = 0; k <= m->hi; k++)
+				{
+					OffsetNumber off;
+					uint16		vlo;
 
-				for (off = FirstOffsetNumber; off <= m->nslots[k]; off++)
-					if (lion_store_perm_entry(m, k, off, &vlo))
-						wi->entries++;
-			}
-		}
-	}
-
-	/* the order column's append region */
-	{
-		const LionStoreCol *ocol = &ix->stored[ix->store_order];
-		BlockNumber head = lion_storemap_head(index, ix->store.store_root,
-											  lion_storemap_slot(ckey, stride, ocol->ord),
-											  NULL);
-
-		if (BlockNumberIsValid(head))
-		{
-			lion_store_read_chain(index, ocol, ckey, head, wi->gen, m);
-			for (k = LION_STORE_APPEND_VPAGE; k <= m->hi; k++)
-			{
-				OffsetNumber off;
-
-				if (m->absent[k] || m->slots[k] == NULL)
-					continue;
-				for (off = FirstOffsetNumber; off <= m->nslots[k]; off++)
-					wi->appended += (m->slots[k][off - 1].data != NULL);
+					for (off = FirstOffsetNumber; off <= m->nslots[k]; off++)
+						if (lion_store_perm_entry(m, k, off, &vlo))
+						{
+							wi->entries++;
+							if (!inbucket[lion_store_vlo_page(vlo)])
+								wi->orphaned++;
+						}
+				}
 			}
 		}
 	}
+	UnlockPage(index, LION_STORE_WINLOCK(ckey), ShareLock);
 }
 
 bool
@@ -4974,8 +5763,7 @@ struct LionStoreReader
 	uint32		pckey;
 	int			pnlo;
 	uint16	   *plo;
-	int			pgen;
-	bool		pheadseen;
+	int64		pgen;
 	LionStoreDirEnt *alldir;
 	int			nalldir;
 	int			alldircap;
@@ -4988,9 +5776,7 @@ struct LionStoreReader
  */
 typedef struct LionStoreWalk
 {
-	int			gen;			/* every page's generation; -1: any */
-	bool		takegen;		/* the head's generation becomes gen */
-	bool		headseen;		/* the head was read */
+	int64		gen;			/* the window header's generation, -1: unread */
 	bool		wanthdr;		/* keep the head's window header (PERM) */
 	const LionStoreDirEnt *dir; /* entries for the column, ascending lo */
 	int			ndir;
@@ -5247,17 +6033,22 @@ lion_store_pick_dir(LionStoreReader *r, const LionStoreDirEnt *all, int n)
 	}
 }
 
-/* Keep the window header's directory, and the reader's column's entries. */
+/*
+ * Keep the window header's generation and directory, and the reader's
+ * column's entries of it.
+ */
 static void
-lion_store_keep_dir(LionStoreReader *r, Page page)
+lion_store_keep_dir(LionStoreReader *r, Page page, LionStoreWalk *w)
 {
 	ItemId		iid = PageGetItemId(page, LION_STORE_DICT_OFF);
-	const char *item = (const char *) PageGetItem(page, iid);
+	const char *item = (const char *) PageGetItem(page, iid) + sizeof(LionStoreDict);
+	const char *dir;
 	LionStoreWinHdr wh;
-	int			i;
 
 	/* lion_store_check_header() checked the sizes */
-	memcpy(&wh, item + sizeof(LionStoreDict), sizeof(LionStoreWinHdr));
+	memcpy(&wh, item, sizeof(LionStoreWinHdr));
+	w->gen = (int64) wh.gen;
+	dir = item + sizeof(LionStoreWinHdr) + (Size) wh.nbucket * sizeof(LionStoreBucket);
 	if (r->alldircap < wh.ndir)
 	{
 		if (r->alldir != NULL)
@@ -5267,10 +6058,7 @@ lion_store_keep_dir(LionStoreReader *r, Page page)
 			MemoryContextAlloc(r->cxt, sizeof(LionStoreDirEnt) * r->alldircap);
 	}
 	r->nalldir = wh.ndir;
-	for (i = 0; i < wh.ndir; i++)
-		memcpy(&r->alldir[i], item + sizeof(LionStoreDict) +
-			   sizeof(LionStoreWinHdr) + (Size) i * sizeof(LionStoreDirEnt),
-			   sizeof(LionStoreDirEnt));
+	memcpy(r->alldir, dir, sizeof(LionStoreDirEnt) * wh.ndir);
 	lion_store_pick_dir(r, r->alldir, r->nalldir);
 }
 
@@ -5278,10 +6066,8 @@ lion_store_keep_dir(LionStoreReader *r, Page page)
  * Walk the chain of map slot `slot` (column col of window ckey) for the
  * sorted addresses lo[0 .. nlo - 1], heap lo for a heap-order or a
  * permutation chain, virtual lo for a data chain of an ordered index.
- * false when a page is of another generation than w->gen: the window
- * changed under the read, and the caller reads it again.
  */
-static bool
+static void
 lion_store_walk(LionStoreReader *r, const LionStoreCol *col,
 				LionStoreCache *cache, uint32 ckey, uint64 slot, bool fresh,
 				const uint16 *lo, int nlo, Datum *values, bool *isnull,
@@ -5305,7 +6091,7 @@ lion_store_walk(LionStoreReader *r, const LionStoreCol *col,
 #endif
 	}
 	if (nlo == 0)
-		return true;
+		return;
 
 	head = lion_store_reader_head(r, cache, slot, fresh);
 
@@ -5423,26 +6209,11 @@ lion_store_walk(LionStoreReader *r, const LionStoreCol *col,
 			continue;
 		}
 
-		/* the generation (§41, "Reads") */
-		if (blk == head)
+		/* the window header: the generation, the directory (§41, "Reads") */
+		if (blk == head && w->wanthdr && h.lo == 0)
 		{
-			if (w->takegen)
-			{
-				w->gen = lion_store_flags_gen(h.flags);
-				w->takegen = false;
-			}
-			if (w->wanthdr && h.lo == 0)
-			{
-				lion_store_keep_dir(r, page);
-				w->wanthdr = false;
-			}
-			w->headseen = true;
-		}
-		if (w->gen >= 0 && lion_store_flags_gen(h.flags) != w->gen)
-		{
-			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-			ReleaseBuffer(buf);
-			return false;
+			lion_store_keep_dir(r, page, w);
+			w->wanthdr = false;
 		}
 
 		if (k > h.hi)
@@ -5492,7 +6263,6 @@ lion_store_walk(LionStoreReader *r, const LionStoreCol *col,
 
 	if (BufferIsValid(buf))
 		ReleaseBuffer(buf);
-	return true;
 }
 
 /*
@@ -5574,43 +6344,105 @@ lion_store_reader_room(LionStoreReader *r, int n)
 	r->plo = (uint16 *) MemoryContextAlloc(r->cxt, sizeof(uint16) * r->scap);
 }
 
-static int
-lion_store_uint32_cmp(const void *a, const void *b)
+/*
+ * The permutation read shared among an index's readers (lion_store_share()):
+ * kept by the leader, made by whichever reader read it.  A follower
+ * gathering the window and the members of the last read takes its entries,
+ * its generation and its own column's entries of the directory.  The data
+ * walk that follows is checked against that generation as after a read of
+ * its own; a mismatch reads the permutation again.
+ */
+static LionStoreReader *
+lion_store_memo(LionStoreReader *r)
 {
-	uint32		x = *(const uint32 *) a;
-	uint32		y = *(const uint32 *) b;
-
-	return (x > y) - (x < y);
+	return (r->leader != NULL) ? r->leader : r;
 }
 
-/*
- * A follower's permutation from its leader (lion_store_share()), when the
- * leader's last read was of this window and these members: the entries, the
- * generation, and the follower's own entries of the directory.  The data
- * walk that follows checks every page against that generation, as after a
- * read of its own; a mismatch reads the permutation again itself.
- */
 static bool
 lion_store_shared_perm(LionStoreReader *r, uint32 ckey, const uint16 *lo,
 					   int nlo, LionStoreWalk *pw)
 {
-	LionStoreReader *l = r->leader;
+	LionStoreReader *l = lion_store_memo(r);
 
-	if (l == NULL || !l->pvalid || l->pckey != ckey || l->pnlo != nlo ||
+	if (l == r || !l->pvalid || l->pckey != ckey || l->pnlo != nlo ||
 		memcmp(l->plo, lo, sizeof(uint16) * nlo) != 0)
 		return false;
 	memcpy(r->pval, l->pval, sizeof(Datum) * nlo);
 	memcpy(r->pnull, l->pnull, sizeof(bool) * nlo);
 	pw->gen = l->pgen;
-	pw->headseen = l->pheadseen;
 	lion_store_pick_dir(r, l->alldir, l->nalldir);
 	return true;
 }
 
+static void
+lion_store_keep_perm(LionStoreReader *r, uint32 ckey, const uint16 *lo, int nlo,
+					 const LionStoreWalk *pw)
+{
+	LionStoreReader *l = lion_store_memo(r);
+
+	if (l != r)
+	{
+		lion_store_reader_room(l, nlo);
+		memcpy(l->pval, r->pval, sizeof(Datum) * nlo);
+		memcpy(l->pnull, r->pnull, sizeof(bool) * nlo);
+		if (l->alldircap < r->nalldir)
+		{
+			if (l->alldir != NULL)
+				pfree(l->alldir);
+			l->alldircap = Max(16, r->nalldir);
+			l->alldir = (LionStoreDirEnt *)
+				MemoryContextAlloc(l->cxt, sizeof(LionStoreDirEnt) * l->alldircap);
+		}
+		memcpy(l->alldir, r->alldir, sizeof(LionStoreDirEnt) * r->nalldir);
+		l->nalldir = r->nalldir;
+	}
+	l->pvalid = true;
+	l->pckey = ckey;
+	l->pnlo = nlo;
+	memcpy(l->plo, lo, sizeof(uint16) * nlo);
+	l->pgen = pw->gen;
+}
+
+/*
+ * Is window ckey's generation still gen (§41, "Reads")?  The permutation
+ * head's window header, read again after a data walk: a split that moved a
+ * row the walk read, and wrote another row into its old slot, advanced it
+ * first.  A head that is no longer the window's is a change too.
+ */
+static bool
+lion_store_gen_same(LionStoreReader *r, uint32 ckey, uint64 pslot, int64 gen)
+{
+	BlockNumber head = lion_store_reader_head(r, &r->pcache, pslot, false);
+	Buffer		buf;
+	Page		page;
+	bool		same = false;
+
+	if (!BlockNumberIsValid(head))
+		return false;
+	buf = ReadBuffer(r->index, head);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	if (lion_store_page_owned(page, ckey, (uint16) r->ix->nstored) &&
+		lion_store_check_header(page, r->ix->storeperm) == NULL &&
+		lion_store_page_header(page)->lo == 0)
+	{
+		LionStoreWinHdr wh;
+
+		memcpy(&wh, (const char *) PageGetItem(page, PageGetItemId(page, LION_STORE_DICT_OFF)) +
+			   sizeof(LionStoreDict), sizeof(LionStoreWinHdr));
+		same = ((int64) wh.gen == gen);
+	}
+	UnlockReleaseBuffer(buf);
+	return same;
+}
+
 /*
  * The gather of an ordered window (§41, "Reads"): the members' permutation
- * entries, then the column's chain at the virtual lo they give, ascending;
- * a page of another generation than the permutation's reads the window again.
+ * entries and the window header's generation, then the column's chain at the
+ * virtual lo the entries give, ascending, and the generation again; a window
+ * whose generation moved meanwhile is read again.  A member without an entry
+ * has no values in the ordered columns: its heap page's bit sends the caller
+ * to the heap.
  */
 static void
 lion_store_gather_ordered(LionStoreReader *r, uint32 ckey, const uint16 *lo,
@@ -5630,59 +6462,48 @@ lion_store_gather_ordered(LionStoreReader *r, uint32 ckey, const uint16 *lo,
 		LionStoreWalk pw;
 		LionStoreWalk dw;
 		bool		fresh = (attempt > 0);
+		uint64		unplaced = 0;
+		int			np = 0;
 
 		memset(&pw, 0, sizeof(pw));
 		pw.gen = -1;
-		pw.takegen = true;
 		pw.wanthdr = true;
 		r->ndir = 0;
 		r->nalldir = 0;
-		r->pvalid = false;
-		if (!fresh && lion_store_shared_perm(r, ckey, lo, nlo, &pw))
+		if (fresh || !lion_store_shared_perm(r, ckey, lo, nlo, &pw))
 		{
-			/* the leader's read of this window's permutation, just made */
-		}
-		else if (!lion_store_walk(r, r->ix->storeperm, &r->pcache, ckey, pslot,
-								  fresh, lo, nlo, r->pval, r->pnull, &pw))
-			continue;
-		else if (r->leader == NULL)
-		{
-			/* for the followers, which gather the same members next */
-			r->pvalid = true;
-			r->pckey = ckey;
-			r->pnlo = nlo;
-			memcpy(r->plo, lo, sizeof(uint16) * nlo);
-			r->pgen = pw.gen;
-			r->pheadseen = pw.headseen;
+			lion_store_walk(r, r->ix->storeperm, &r->pcache, ckey, pslot, fresh,
+							lo, nlo, r->pval, r->pnull, &pw);
+			lion_store_keep_perm(r, ckey, lo, nlo, &pw);
 		}
 
-		/*
-		 * Each member's address: its sorted slot, or with no entry its heap
-		 * position in the append region.  A window without a permutation
-		 * has had no sort, and its pages are of generation 0.
-		 */
+		/* each placed member's address: its bucket's virtual page and slot */
 		for (i = 0; i < nlo; i++)
 		{
 			uint16		v;
 
 			if (r->pnull[i])
-				v = lion_store_append_vlo(lo[i]);
-			else
 			{
-				v = (uint16) DatumGetInt16(r->pval[i]);
-				if (lion_store_vlo_page(v) >= LION_STORE_APPEND_VPAGE ||
-					lion_store_vlo_off(v) < FirstOffsetNumber)
-					ereport(ERROR,
-							(errcode(ERRCODE_INDEX_CORRUPTED),
-							 errmsg("lion index \"%s\": the permutation of window %u gives heap lo %u the slot %u",
-									RelationGetRelationName(r->index), ckey,
-									(unsigned) lo[i], (unsigned) v),
-							 errhint("REINDEX the index.")));
+				uint16		k;
+				OffsetNumber off;
+
+				lion_lo_split(lo[i], &k, &off);
+				unplaced |= ((uint64) 1) << k;
+				continue;
 			}
-			r->vorder[i] = ((uint32) v << 16) | (uint32) i;
+			v = (uint16) DatumGetInt16(r->pval[i]);
+			if (lion_store_vlo_off(v) < FirstOffsetNumber ||
+				lion_store_vlo_off(v) > LION_STORE_BUCKET_SLOTS)
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("lion index \"%s\": the permutation of window %u gives heap lo %u the slot %u",
+								RelationGetRelationName(r->index), ckey,
+								(unsigned) lo[i], (unsigned) v),
+						 errhint("REINDEX the index.")));
+			r->vorder[np++] = ((uint32) v << 16) | (uint32) i;
 		}
-		qsort(r->vorder, nlo, sizeof(uint32), lion_store_uint32_cmp);
-		for (i = 0; i < nlo; i++)
+		qsort(r->vorder, np, sizeof(uint32), lion_store_uint32_cmp);
+		for (i = 0; i < np; i++)
 		{
 			r->vlo[i] = (uint16) (r->vorder[i] >> 16);
 			if (i > 0 && r->vlo[i] == r->vlo[i - 1])
@@ -5695,16 +6516,18 @@ lion_store_gather_ordered(LionStoreReader *r, uint32 ckey, const uint16 *lo,
 		}
 
 		memset(&dw, 0, sizeof(dw));
-		dw.gen = pw.headseen ? pw.gen : 0;
+		dw.gen = -1;
 		dw.dir = r->dir;
 		dw.ndir = r->ndir;
-		lion_store_plan_walk(r, &dw, r->vlo, nlo);
-		if (!lion_store_walk(r, col, &r->cache, ckey, dslot, fresh, r->vlo, nlo,
-							 r->vval, r->vnull, &dw))
+		lion_store_plan_walk(r, &dw, r->vlo, np);
+		lion_store_walk(r, col, &r->cache, ckey, dslot, fresh, r->vlo, np,
+						r->vval, r->vnull, &dw);
+		if (pw.gen >= 0 && !lion_store_gen_same(r, ckey, pslot, pw.gen))
 			continue;
 
 		/* back to the members' order, and their heap pages' bits */
-		for (i = 0; i < nlo; i++)
+		*absent_pages |= unplaced;
+		for (i = 0; i < np; i++)
 		{
 			int			j = (int) (r->vorder[i] & 0xFFFF);
 			int			vp = lion_store_vlo_page(r->vlo[i]);
@@ -5740,7 +6563,7 @@ lion_store_gather(LionStoreReader *r, uint32 ckey, const uint16 *lo, int nlo,
 	r->missing = 0;
 	if (nlo == 0)
 		return;
-	if (r->ix->store_order >= 0)
+	if (r->col->kind == LION_STORE_KIND_ORDERED)
 	{
 		for (i = 0; i < nlo; i++)
 		{
@@ -5754,9 +6577,9 @@ lion_store_gather(LionStoreReader *r, uint32 ckey, const uint16 *lo, int nlo,
 
 	memset(&w, 0, sizeof(w));
 	w.gen = -1;
-	(void) lion_store_walk(r, r->col, &r->cache, ckey,
-						   lion_storemap_slot(ckey, r->ix->nstored, r->col->ord),
-						   false, lo, nlo, values, isnull, &w);
+	lion_store_walk(r, r->col, &r->cache, ckey,
+					lion_storemap_slot(ckey, lion_store_stride(r->ix), r->col->ord),
+					false, lo, nlo, values, isnull, &w);
 	*absent_pages = w.absent[0];
 	r->missing = w.missing[0];
 }
