@@ -109,7 +109,7 @@ typedef struct LionStoreCache
 bool		lion_store_heap_order = false;
 
 /* pg_lion.store_order_min_pages (§41): long chains only in key order. */
-int			lion_store_order_min_pages = 3;
+int			lion_store_order_min_pages = 4;
 
 /* One slot's value, as the model holds it: data NULL is SQL NULL. */
 typedef struct LionStoreVal
@@ -420,7 +420,7 @@ lion_store_fill_order(Relation index, LionIndexState *ix, int order,
 				 errmsg("index \"%s\" records stored column %d as its order, of %d stored columns",
 						RelationGetRelationName(index), order, ix->nstored),
 				 errhint("REINDEX the index.")));
-	if ((order_cols & (1U << order)) == 0 ||
+	if (order_cols == 0 ||
 		(ix->nstored < 32 && (order_cols >> ix->nstored) != 0))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -431,8 +431,9 @@ lion_store_fill_order(Relation index, LionIndexState *ix, int order,
 
 	/*
 	 * The columns in key order; the others, short chains, keep §40's heap
-	 * layout in an ordered index (§41, "Revision 2").  The order column is
-	 * always among the first: a bucket's split sorts its rows by it.
+	 * layout in an ordered index (§41, "Revision 2"), the order column too
+	 * when its chain is short: a bucket's split then reads its rows' order
+	 * values at their heap positions.
 	 */
 	for (i = 0; i < ix->nstored; i++)
 		if ((order_cols & (1U << i)) != 0)
@@ -473,7 +474,7 @@ lion_store_order_cols(const LionIndexState *ix)
  * With no window to measure (an empty build, or ambuildempty), a column's
  * chain is taken to be long when its values are: a varlena, or a fixed width
  * of 8 bytes or more, which at the 2,000 to 3,500 rows of a full window takes
- * 2 to 4 pages in RAW mode.  The order column goes with them when any does.
+ * 2 to 4 pages in RAW mode.
  */
 uint32
 lion_store_order_cols_by_type(const LionIndexState *ix, int order)
@@ -487,7 +488,7 @@ lion_store_order_cols_by_type(const LionIndexState *ix, int order)
 		if (lion_store_order_min_pages == 0 ||
 			ix->stored[i].typlen < 0 || ix->stored[i].typlen >= 8)
 			cols |= 1U << i;
-	return (cols != 0) ? (cols | (1U << order)) : 0;
+	return cols;
 }
 
 int
@@ -520,7 +521,7 @@ lion_read_meta_store_order(Relation index, const LionMetaPageData *meta,
 	if (!have || mo.order_ord < 0 ||
 		mo.order_ord >= pg_popcount32(ms.store_cols) ||
 		(mo.order_flags & ~LION_STORE_ORDER_CLUSTER) != 0 ||
-		(mo.order_cols & (1U << mo.order_ord)) == 0)
+		mo.order_cols == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a valid lion index",
@@ -2616,11 +2617,12 @@ lion_store_build_pages(LionStoreBuild *sb, const LionStoreCol *col,
  * Settle which columns of an ordered index go in key order (§41, "Revision
  * 2: short chains in heap order"), from the first window's heap-layout
  * chains: a column whose chain takes fewer than
- * pg_lion.store_order_min_pages pages keeps heap layout, since a gather of a
- * window reads at least the permutation's page and a data page in key order
- * and no fewer than the whole chain in heap order.  None long: the index is
- * built in heap order (version 9).  Every later window, and every insert,
- * keeps the choice; it is the meta page's.
+ * pg_lion.store_order_min_pages pages keeps heap layout, the order column
+ * like any other, since a gather of a window reads at least the
+ * permutation's page and a data page in key order and no fewer than the
+ * whole chain in heap order.  None long: the index is built in heap order
+ * (version 9).  Every later window, and every insert, keeps the choice; it
+ * is the meta page's.
  */
 static void
 lion_store_build_decide(LionStoreBuild *sb)
@@ -2639,8 +2641,6 @@ lion_store_build_decide(LionStoreBuild *sb)
 				lion_store_build_pages(sb, &ix->stored[ord], &sb->models[ord]) >=
 				lion_store_order_min_pages)
 				cols |= 1U << ord;
-		if (cols != 0)
-			cols |= 1U << ix->store_order;
 	}
 	else
 		cols = lion_store_order_cols_by_type(ix, ix->store_order);

@@ -642,7 +642,11 @@ INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_serie
 DELETE FROM lion_st_ord6 WHERE id % 4 <> 0;
 VACUUM lion_st_ord6;
 INSERT INTO lion_st_ord6 SELECT i * 4 + 1, i % 101, 'c' || i FROM generate_series(22001, 25000) i;
-SELECT * FROM lion_st_windows('lion_st_ord6_i', 'lion_st_ord6');
+-- (how many buckets, and the generation, depend on where the heap put each
+-- row, which varies a little from run to run)
+SELECT win, nrows, generation > 32 AS moved, buckets BETWEEN 64 AND 80 AS buckets,
+	   slots > 2 * nrows AS reused, entries = nrows AS entries, orphaned
+  FROM lion_st_windows('lion_st_ord6_i', 'lion_st_ord6');
 SELECT lion_st_mismatch('lion_st_ord6_i', 'lion_st_ord6', 'ARRAY[k::text, t]');
 SELECT lion_index_verify('lion_st_ord6_i', true);
 
@@ -653,7 +657,7 @@ RESET pg_lion.store_order_min_pages;
 -- 10. Short chains in heap layout (DESIGN.md §41, "Revision 2"): an
 --     ordered index lays out in key order only the columns whose chain in
 --     a build's first window takes pg_lion.store_order_min_pages pages or
---     more (3 by default), and the order column with them; the others keep
+--     more (4 by default), the order column like any other; the others keep
 --     §40's heap layout beside them.  No long column at all: heap order,
 --     version 9.  With no rows to measure, a column is long by its type.
 -- ---------------------------------------------------------------------
@@ -662,12 +666,12 @@ CREATE TABLE lion_st_mix (id int, grp int, tags int[], pay text)
 	WITH (autovacuum_enabled = off);
 INSERT INTO lion_st_mix SELECT i, i % 50, ARRAY[i % 97], repeat('x', 40) || i
   FROM generate_series(1, 30000) i;
--- grp (one page a window) is the order column, pay (about thirty) is long,
--- id (three) is long at the default ...
+-- grp (one page a window) is the order column, in heap layout; pay (about
+-- thirty pages) is long; id (three) is short at the default ...
 CREATE INDEX lion_st_mix_i ON lion_st_mix USING lion (tags) INCLUDE (grp, id, pay)
 	WITH (cluster_column = grp);
--- ... and short at 4
-SET pg_lion.store_order_min_pages = 4;
+-- ... and long at 3
+SET pg_lion.store_order_min_pages = 3;
 CREATE INDEX lion_st_mix_j ON lion_st_mix USING lion (tags) INCLUDE (grp, id, pay)
 	WITH (cluster_column = grp);
 -- no column long: heap order
@@ -710,8 +714,8 @@ SELECT sum(id), count(pay), sum(grp), md5(string_agg(pay, ',' ORDER BY pay))
   FROM lion_st_mix WHERE tags @> ARRAY[3];
 SELECT sum(id), count(*) FROM lion_st_mix WHERE tags @> ARRAY[3] AND grp = 3;
 
--- no rows to measure: by type, the text column in key order with grp, the
--- ints in heap layout; and with no column of a long type, heap order
+-- no rows to measure: by type, the text column in key order, the ints in
+-- heap layout; and with no column of a long type, heap order
 TRUNCATE lion_st_mix;
 REINDEX INDEX lion_st_mix_i;
 CREATE INDEX lion_st_mix_n ON lion_st_mix USING lion (tags) INCLUDE (grp, id)

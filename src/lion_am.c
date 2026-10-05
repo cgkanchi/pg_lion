@@ -283,7 +283,7 @@ _PG_init(void)
 							"The heap-order pages a window's chain of a stored column must take for an ordered index to lay it out in key order.",
 							"Measured on a build's first window; 0 lays every stored column out in key order.",
 							&lion_store_order_min_pages,
-							3, 0, LION_BLOCKS_PER_CONTAINER * 2,
+							4, 0, LION_BLOCKS_PER_CONTAINER * 2,
 							PGC_USERSET,
 							GUC_NOT_IN_SAMPLE,
 							NULL, NULL, NULL);
