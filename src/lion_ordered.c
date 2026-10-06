@@ -3148,7 +3148,7 @@ lo_lazy_convert(LionOrderedState *st)
 										  sizeof(uint32) * Max(st->memo->members, 1));
 	mvisited = (uint64 **) MemoryContextAlloc(st->scancxt,
 											  sizeof(uint64 *) * Max(st->memo->members, 1));
-	lo_memo_start_iterate(st->memo, &it);
+	LION_SH_START_ITERATE(lo_memo, st->memo, &it);
 	while ((e = lo_memo_iterate(st->memo, &it)) != NULL)
 	{
 		if (e->visited == NULL)
@@ -3790,7 +3790,7 @@ lo_scan_reset(LionOrderedState *st)
 		lo_memo_iterator it;
 		LoMemoEnt  *e;
 
-		lo_memo_start_iterate(st->memo, &it);
+		LION_SH_START_ITERATE(lo_memo, st->memo, &it);
 		while ((e = lo_memo_iterate(st->memo, &it)) != NULL)
 		{
 			if (e->visited != NULL)
