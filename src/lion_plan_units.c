@@ -55,7 +55,7 @@ static const char *const lion_competitor_names[] = {
 /*
  * Is cp one of lion's own custom paths?  By the name custom scans are known
  * by (RegisterCustomScanMethods()): LionCount, LionSemiJoin, LionAntiJoin,
- * LionJoinAgg, LionOrdered and LionStoreScan.
+ * LionJoinAgg and LionOrdered.
  */
 static bool
 lion_custom_is_lion(const CustomPath *cp)
@@ -67,8 +67,7 @@ lion_custom_is_lion(const CustomPath *cp)
 		 strcmp(name, "LionSemiJoin") == 0 ||
 		 strcmp(name, "LionAntiJoin") == 0 ||
 		 strcmp(name, "LionJoinAgg") == 0 ||
-		 strcmp(name, "LionOrdered") == 0 ||
-		 strcmp(name, "LionStoreScan") == 0);
+		 strcmp(name, "LionOrdered") == 0);
 }
 
 /*

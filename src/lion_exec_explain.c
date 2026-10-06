@@ -1366,12 +1366,6 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 
 	lion_explain_group_keys(st, ancestors, es);
 
-	/*
-	 * The columns gathered from the window store (DESIGN.md §40), and with
-	 * ANALYZE where their values came from.
-	 */
-	lion_store_explain(st, es);
-
 	if (es->analyze)
 		lion_explain_analyze(st, es);
 }

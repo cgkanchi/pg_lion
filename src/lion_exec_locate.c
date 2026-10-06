@@ -1384,13 +1384,6 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 					slot->tts_isnull[i] = true;
 					break;
 				}
-				if (LION_TL_IS_SKEY(kind) || LION_TL_IS_SAGG(kind))
-				{
-					/* a gathered column's value, or an aggregate of them (§40) */
-					slot->tts_values[i] = lion_store_emit_value(st, kind,
-																&slot->tts_isnull[i]);
-					break;
-				}
 				if (LION_TL_IS_COUNT_GROUPCOLN(kind))
 				{
 					int			g = LION_TL_GROUPN_COL(kind);

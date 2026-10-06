@@ -530,13 +530,21 @@ RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
 
 -- 8. A btree's walk over partitions (DESIGN.md §30.8's v2): ORDER BY a btree
---    column of each partition under a lion filter.
+--    column of each partition under a lion filter - without core's Sort, so
+--    that the ordered paths are what is left: the 55 rows the filter keeps
+--    sort for about what the five-row walk costs, and which of the two the
+--    planner takes varies by major.
 CREATE INDEX osf_id ON osf (id);
 ANALYZE osf;
+SET enable_sort = off;
 SELECT * FROM os_plan($$
 	SELECT f.id FROM osf f WHERE f.tags @> ARRAY['rare'] ORDER BY f.id LIMIT 5$$);
+RESET enable_sort;
 SELECT os_cmp($$
-	SELECT f.id FROM osf f WHERE f.tags @> ARRAY['rare'] ORDER BY f.id LIMIT 5$$);
+	SELECT f.id FROM osf f WHERE f.tags @> ARRAY['rare'] ORDER BY f.id LIMIT 5$$, true);
+-- a five-row LIMIT over one partition of 11,000 rows goes to core's backward
+-- scan with a filter: so short a walk does not pay the lion lookups' start-up
+-- (DESIGN.md §40.3), and the two run in the same time
 SELECT os_cmp($$
 	SELECT f.id FROM osf f WHERE f.kind = 'b' AND f.tags @> ARRAY['t3', 'u4']
 	 ORDER BY f.id DESC LIMIT 5$$, true);
