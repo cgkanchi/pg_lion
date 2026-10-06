@@ -746,7 +746,11 @@ lion_fill_index_state(Relation index, LionIndexState *ix,
 	ix->cols = (LionState *) MemoryContextAllocZero(cxt,
 													sizeof(LionState) * ncols);
 
-	for (i = 0; i < ncols; i++)
+	/*
+	 * i < INDEX_MAX_KEYS is the check above again, in the loop, where an
+	 * analyser sees that i + 1 fits an AttrNumber.
+	 */
+	for (i = 0; i < ncols && i < INDEX_MAX_KEYS; i++)
 	{
 		ix->cols[i].ix = ix;
 		lion_fill_column_state(index, &ix->cols[i], (AttrNumber) (i + 1), cxt);
