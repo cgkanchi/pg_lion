@@ -236,7 +236,8 @@ SELECT * FROM lion_ord_run('SELECT o.v, x.id FROM (VALUES (100), (50000), (99990
 				 LATERAL (SELECT id FROM lo WHERE c200 = 17 AND k > o.v ORDER BY k, id LIMIT 3) x');
 
 -- 7. The counters: entries walked, members, heap fetches; an exact set is
---    never rechecked, a multi-key one always is.
+--    never rechecked, and a multi-key AND of whole keys is one (DESIGN.md
+--    §29.6).
 SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 AND c2 = 1 ORDER BY k, id LIMIT 10');
 SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 AND length(note) = 5 ORDER BY k, id LIMIT 10');
 SELECT * FROM lion_ord_run($$SELECT id FROM lo WHERE tags @> ARRAY['t3', 'u5'] ORDER BY k, id LIMIT 10$$);

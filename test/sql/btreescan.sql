@@ -236,8 +236,8 @@ SELECT lion_bs('SELECT id, k FROM bs WHERE c200 = 17 AND c20 = 3 ORDER BY k LIMI
 SELECT lion_bs('SELECT id, k FROM bs WHERE c200 = 17 AND c20 = 3 AND k > 90000');
 
 -- 3. The aggregate shape: a full walk of the covering btree with no btree
---    qual, only a lion filter - an exact one and a multi-key one that is
---    rechecked - under a GROUP BY and under a plain aggregate.
+--    qual, only a lion filter - a scalar one and a multi-key one, exact
+--    both (DESIGN.md §29.6) - under a GROUP BY and under a plain aggregate.
 SELECT lion_bs('SELECT grp, sum(x) FROM bs WHERE tags @> ARRAY[''t3''] GROUP BY grp');
 SELECT lion_bs('SELECT grp, sum(x) FROM bs WHERE tags @> ARRAY[''t3'', ''u5''] GROUP BY grp ORDER BY grp', true);
 SELECT lion_bs('SELECT sum(x), max(x) FROM bs WHERE tags @> ARRAY[''t3'']');
@@ -245,8 +245,7 @@ SELECT lion_bs('SELECT grp, x FROM bs WHERE tags && ARRAY[''u5'', ''u6'']');
 SELECT lion_bs('SELECT grp, sum(x) FROM bs WHERE tags @> ARRAY[''t3''] AND grp BETWEEN 10 AND 19 GROUP BY grp ORDER BY grp', true);
 
 -- 4. The counters: on a table VACUUM has left all-visible nothing is read
---    from the heap; a multi-key filter's members are rechecked on the index
---    tuple's values.
+--    from the heap, under a scalar filter and under a multi-key one alike.
 SELECT * FROM lion_bs_run('SELECT id, k, x FROM bs WHERE c200 = 17 ORDER BY k LIMIT 10');
 SELECT * FROM lion_bs_run('SELECT id, k, x FROM bs WHERE c200 = 17 AND c20 = 3 ORDER BY k DESC');
 SELECT * FROM lion_bs_run('SELECT grp, x FROM bs WHERE tags @> ARRAY[''t3'', ''u5'']');
@@ -355,29 +354,37 @@ SELECT lion_bs('SELECT grp, sum(x) FROM bs WHERE tags @> ARRAY[''t3''] GROUP BY 
 RESET pg_lion.enable_ordered_scan;
 
 -- 12. The plan choice, with nothing disabled: the index-only node for a lion
---     filter under ORDER BY a btree column LIMIT 10, the heap-mode node when
---     a column is not covered, the bitmap scan and Sort when the filter is so
+--     filter under ORDER BY a btree column LIMIT 10 when the btree lacks the
+--     filter's column; when it holds it, core's own Index Only Scan with the
+--     filter walks the same entries for one cpu_operator_cost each where the
+--     node's probe costs two cpu_tuple_costs more (DESIGN.md §40.3), and is
+--     chosen - the two run in the same time here; the heap-mode node when a
+--     column is not covered; the bitmap scan and Sort when the filter is so
 --     selective that the walk to a tenth member is long; the aggregate shape
---     through the covering walk when the covering btree is narrow against
---     the heap, through the bitmap scan when it is wide (bs_k) and through
---     the lion index's own scan when the filter is selective; a covered
---     btree qual with a lion filter.
+--     through core's filtered Index Only Scan when the btree holds the
+--     filter column, and otherwise through the bitmap scan or the lion
+--     index's own scan - on a heap of 4,350 pages the probes of a full
+--     covering walk cost more than the heap pages it saves; a covered btree
+--     qual with a lion filter the same way.
+SELECT * FROM lion_bs_plan('SELECT grp, x FROM bs WHERE c200 = 17 ORDER BY grp LIMIT 10');
 SELECT * FROM lion_bs_plan('SELECT id, k, x FROM bs WHERE c200 = 17 ORDER BY k LIMIT 10');
 SELECT * FROM lion_bs_plan('SELECT id, k, x, payload FROM bs WHERE c200 = 17 ORDER BY k LIMIT 10');
 SELECT * FROM lion_bs_plan('SELECT id, k, x FROM bs WHERE c200 = 17 AND c20 = 3 ORDER BY k LIMIT 10');
 SELECT * FROM lion_bs_plan('SELECT grp, sum(x) FROM bs WHERE tags @> ARRAY[''t3''] GROUP BY grp');
 SELECT * FROM lion_bs_plan('SELECT sum(x) FROM bs WHERE tags @> ARRAY[''t3'']');
+SELECT * FROM lion_bs_plan('SELECT grp, sum(x) FROM bs WHERE c20 = 3 GROUP BY grp');
 SELECT * FROM lion_bs_plan('SELECT sum(x) FROM bs WHERE c20 IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)');
 SELECT * FROM lion_bs_plan('SELECT grp, sum(x) FROM bs WHERE tags @> ARRAY[''t3'', ''u5''] GROUP BY grp');
 SELECT * FROM lion_bs_plan('SELECT id, k, x FROM bs WHERE k BETWEEN 1000 AND 9000 AND c200 = 17');
 
 -- 13. A btree that lacks the lion filter's columns covers the query all the
---     same (DESIGN.md §40.1): an exact set needs no recheck, and a set that
---     turns out inexact (a multi-key filter: hashed keys) or degraded at run
---     time is rechecked on the heap tuple, fetched for that alone and
---     counted.  Lion marks no clause lossy at plan time, so a tsquery prefix
---     or NOT - a superset, rechecked on every member - walks index-only too,
---     reading the heap for each member as heap mode would.
+--     same (DESIGN.md §40.1): an exact set - a multi-key AND or OR of whole
+--     keys included (§29.6) - needs no recheck, and a set that turns out
+--     inexact or degraded at run time is rechecked on the heap tuple,
+--     fetched for that alone and counted.  Lion marks no clause lossy at
+--     plan time, so a tsquery prefix or NOT - a superset, rechecked on every
+--     member - walks index-only too, reading the heap for each member as
+--     heap mode would.
 SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
 EXPLAIN (COSTS OFF) SELECT grp, x FROM bs WHERE c200 = 17 ORDER BY grp LIMIT 10;
 EXPLAIN (COSTS OFF) SELECT id, k, x FROM bs WHERE tags @> ARRAY['t3'] ORDER BY k LIMIT 10;
@@ -387,13 +394,13 @@ SELECT lion_bs('SELECT grp, x FROM bs WHERE c200 = 17 ORDER BY grp LIMIT 10', tr
 SELECT * FROM lion_bs_run('SELECT grp, x FROM bs WHERE c200 = 17 ORDER BY grp LIMIT 10');
 SELECT lion_bs('SELECT grp, sum(x) FROM bs WHERE c20 = 3 GROUP BY grp ORDER BY grp', true);
 SELECT * FROM lion_bs_run('SELECT grp, sum(x) FROM bs WHERE c20 = 3 GROUP BY grp ORDER BY grp');
--- an inexact set: each member's heap tuple is fetched for the recheck
+-- a multi-key filter over a btree without its column: exact as well, and
+-- the heap is not read either
 SELECT lion_bs('SELECT id, k, x FROM bs WHERE tags @> ARRAY[''t3''] ORDER BY k LIMIT 10', true);
 SELECT * FROM lion_bs_run('SELECT id, k, x FROM bs WHERE tags @> ARRAY[''t3''] ORDER BY k LIMIT 10');
 SELECT lion_bs('SELECT id, k, x FROM bs WHERE tags @> ARRAY[''t3'', ''u5''] AND k > 50000');
 SELECT * FROM lion_bs_run('SELECT id, k, x FROM bs WHERE tags @> ARRAY[''t3'', ''u5''] AND k > 50000');
--- rows not all-visible on an inexact set: fetched once, for their visibility
--- and for the recheck both
+-- rows not all-visible: fetched for their visibility, nothing to recheck
 BEGIN;
 INSERT INTO bs
 SELECT 200000 + i, 200003 + i, i % 100, i, 17, 3, ARRAY['t3', 'u5'], true,
@@ -433,8 +440,8 @@ RESET hash_mem_multiplier;
 RESET work_mem;
 DEALLOCATE bs_deg;
 DROP TABLE bsd;
--- a tsquery: a prefix or a NOT widens the set to a superset, and every
--- member is rechecked on its heap tuple
+-- a tsquery: an AND of lexemes is exact; a prefix or a NOT widens the set to
+-- a superset, and every member is rechecked on its heap tuple
 CREATE TABLE bst (id int PRIMARY KEY, k int NOT NULL, tsv tsvector)
 	WITH (autovacuum_enabled = off);
 INSERT INTO bst
@@ -450,6 +457,15 @@ SELECT lion_bs($$SELECT id, k FROM bst WHERE tsv @@ 'w3:*'::tsquery ORDER BY k L
 SELECT * FROM lion_bs_run($$SELECT id, k FROM bst WHERE tsv @@ 'w3:*'::tsquery ORDER BY k LIMIT 5$$);
 SELECT lion_bs($$SELECT id, k FROM bst WHERE tsv @@ '!w3'::tsquery ORDER BY k LIMIT 5$$, true);
 SELECT * FROM lion_bs_run($$SELECT id, k FROM bst WHERE tsv @@ '!w3'::tsquery ORDER BY k LIMIT 5$$);
+-- rows not all-visible on an inexact set: fetched once, for their visibility
+-- and for the recheck both
+BEGIN;
+INSERT INTO bst
+SELECT 20000 + i, 30000 + i, to_tsvector('simple', 'w3 x' || (i % 7) || ' y0')
+  FROM generate_series(1, 20) i;
+SELECT lion_bs($$SELECT id, k FROM bst WHERE tsv @@ 'w3:*'::tsquery AND k > 30000 ORDER BY k$$, true);
+SELECT * FROM lion_bs_run($$SELECT id, k FROM bst WHERE tsv @@ 'w3:*'::tsquery AND k > 30000 ORDER BY k$$);
+ROLLBACK;
 DROP TABLE bst;
 
 -- 14. The fetch-and-sort switch in index-only mode (DESIGN.md §40.4): a

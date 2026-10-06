@@ -409,7 +409,7 @@ SELECT lion_iq('SELECT id FROM lis WHERE t = ''v7'' COLLATE "POSIX"');
  no index scan, 600 rows
 (1 row)
 
--- arrays: exact queries (rechecked all the same) and ones that need every row
+-- arrays: exact queries (mode KEYS, no recheck) and ones that need every row
 SELECT lion_iq('SELECT id FROM lis WHERE tags @> ''{3}''');
               lion_iq              
 -----------------------------------
