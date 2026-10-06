@@ -387,4 +387,13 @@ extern void smgr_bulk_write(BulkWriteState *bulkstate, BlockNumber blocknum,
 extern void smgr_bulk_finish(BulkWriteState *bulkstate);
 #endif
 
+/*
+ * pg_noreturn (PostgreSQL 18), written before the declaration.  Before it
+ * there was pg_attribute_noreturn(), which is GCC's attribute where there is
+ * one, and that may stand before the declaration too.
+ */
+#ifndef pg_noreturn
+#define pg_noreturn pg_attribute_noreturn()
+#endif
+
 #endif							/* LION_COMPAT_H */

@@ -1294,6 +1294,9 @@ lion_mat_container(LionCountCtx *cx, const LionMatSet *mat, int i,
 		return mat->containers[i];
 	if (i == 0 && mat->first != NULL)
 		return mat->first;
+	/* only a copy that spills keeps a container out of memory */
+	if (buf == NULL)
+		elog(ERROR, "lion index count: container %d of a copy is in no file", i);
 	lion_spill_read(mat, i, buf);
 	cx->stats.copy_file_reads++;
 	return buf;

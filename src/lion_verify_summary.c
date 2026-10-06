@@ -1379,8 +1379,8 @@ lion_verify_column_summaries(LionVerifyState *vs, LionState *col)
 		memcpy(prevkey, key, keylen);
 		prevlen = keylen;
 	}
-	if (havevps)
-		lion_posting_set_release(&vps);
+	/* only the open bucket ends the walk, and it reads every key left */
+	Assert(!havevps && valsdone);
 	lion_entry_scan_end(&vals);
 
 	lion_verify_settle(&ss);

@@ -697,7 +697,7 @@ lion_acc_sorted(LionAccCol *col, uint8 **flagsp, int *np)
 	}
 	vals = items + nres;
 
-	lionacc_start_iterate(col->table, &it);
+	LION_SH_START_ITERATE(lionacc, col->table, &it);
 	while ((slot = lionacc_iterate(col->table, &it)) != NULL)
 	{
 		vals[n].datum1 = slot->entry->key;

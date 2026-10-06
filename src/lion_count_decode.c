@@ -166,7 +166,7 @@ lion_decode_tally_spill(LionDecodeTally *t)
 		t->spill = BufFileCreateTemp(false);
 		MemoryContextSwitchTo(oldcxt);
 	}
-	lion_tally_start_iterate(t->hash, &it);
+	LION_SH_START_ITERATE(lion_tally, t->hash, &it);
 	while ((e = lion_tally_iterate(t->hash, &it)) != NULL)
 	{
 		BufFileWrite(t->spill, &e->code, sizeof(e->code));
@@ -210,7 +210,7 @@ lion_decode_tally_next(LionDecodeTally *t, uint64 *code, int64 *count)
 	{
 		t->reading = true;
 		if (t->hash != NULL)
-			lion_tally_start_iterate(t->hash, &t->it);
+			LION_SH_START_ITERATE(lion_tally, t->hash, &t->it);
 	}
 
 	if (t->phase == 0)

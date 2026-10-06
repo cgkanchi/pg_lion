@@ -1697,8 +1697,8 @@ lion_sum_finish(LionBuildState *bs, LionSumBuild *sum)
 		LionSumBucketHdr hdr;
 		LionContainer *item = (LionContainer *)
 			MemoryContextAlloc(sum->cxt, LION_CONTAINER_MAX_SIZE);
-		char	   *raw = NULL;
-		Size		rawcap = 0;
+		Size		rawcap = 64;
+		char	   *raw = (char *) MemoryContextAlloc(sum->cxt, rawcap);
 		int64		i;
 
 		if (BufFileSeek(sum->file, 0, 0, SEEK_SET) != 0)
@@ -1716,7 +1716,7 @@ lion_sum_finish(LionBuildState *bs, LionSumBuild *sum)
 			BufFileReadExact(sum->file, &hdr, sizeof(hdr));
 			if (hdr.rawlen > rawcap)
 			{
-				rawcap = Max((Size) hdr.rawlen, (Size) 64);
+				rawcap = (Size) hdr.rawlen;
 				raw = (char *) MemoryContextAlloc(sum->cxt, rawcap);
 			}
 			BufFileReadExact(sum->file, raw, hdr.rawlen);
