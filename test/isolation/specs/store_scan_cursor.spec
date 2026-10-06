@@ -1,1 +1,0 @@
-../store_scan_cursor.spec

@@ -69,20 +69,6 @@ extern PGDLLIMPORT double lion_fkjoin_sort_seq_page_cost;
 extern PGDLLIMPORT double lion_fkjoin_sort_random_page_cost;
 
 /*
- * The window store's gather (DESIGN.md §40 "Costs"): a value decoded from a
- * store page for a row the filter kept, and a store page pinned and read.
- * Shared by every reader of the store - the count's shapes, the index-only
- * scan and LionOrdered - so that the three price one gather the same way.
- * The defaults are first estimates (a value is a few bit operations and a
- * copy, a page a container's read); the measured fit is Phase C's.
- */
-extern PGDLLIMPORT double lion_store_value_cost;
-extern PGDLLIMPORT double lion_store_page_cost;
-
-#define LION_STORE_VALUE_COST	(lion_store_value_cost * cpu_operator_cost)
-#define LION_STORE_PAGE_COST	(lion_store_page_cost * cpu_operator_cost)
-
-/*
  * The units a lion path is priced in against the plan it competes with
  * (DESIGN.md §39): the cost units a millisecond each kind of core plan runs
  * at, as a multiple of the 500 that lion's CPU constants are fitted at (§10,

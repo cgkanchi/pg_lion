@@ -59,28 +59,6 @@
 #endif
 
 /*
- * murmurhash64() (17): hashfn.h's 64-bit finalizer, the hash of a 64-bit
- * key in a simplehash table.
- */
-#include "common/hashfn.h"
-
-#if PG_VERSION_NUM < 170000
-static inline uint64
-murmurhash64(uint64 data)
-{
-	uint64		h = data;
-
-	h ^= h >> 33;
-	h *= 0xff51afd7ed558ccd;
-	h ^= h >> 33;
-	h *= 0xc4ceb9fe1a85ec53;
-	h ^= h >> 33;
-
-	return h;
-}
-#endif
-
-/*
  * old_snapshot_threshold (16 only; 17 removed the feature).  When it is set,
  * VACUUM removes rows an old snapshot can still see and marks their pages
  * all-visible, and every read of a page has to call TestForOldSnapshot() to
@@ -115,6 +93,20 @@ murmurhash64(uint64 data)
 #define lion_vacuum_delay_point()	vacuum_delay_point(false)
 #else
 #define lion_vacuum_delay_point()	vacuum_delay_point()
+#endif
+
+/*
+ * Does EXPLAIN qualify a deparsed Var with its table, as core's useprefix
+ * decides it?  18 appends an RTE_GROUP entry to every GROUP BY query's range
+ * table and counts the entries without it in es->rtable_size; below 18 the
+ * range table's length is that count.
+ */
+#include "commands/explain.h"
+
+#if PG_VERSION_NUM >= 180000
+#define lion_explain_useprefix(es)	((es)->rtable_size > 1 || (es)->verbose)
+#else
+#define lion_explain_useprefix(es)	(list_length((es)->rtable) > 1 || (es)->verbose)
 #endif
 
 /*
@@ -294,20 +286,6 @@ lion_pstmt_written_rtis(const PlannedStmt *pstmt)
 typedef SysCacheIdentifier LionSysCacheId;
 #else
 typedef int LionSysCacheId;
-#endif
-
-/*
- * heap_form_minimal_tuple() took the room to leave before the tuple in 18,
- * and its values and nulls as const in 17; the casts are for 16.
- */
-#include "access/htup_details.h"
-
-#if PG_VERSION_NUM >= 180000
-#define lion_form_minimal_tuple(desc, values, isnull) \
-	heap_form_minimal_tuple(desc, values, isnull, 0)
-#else
-#define lion_form_minimal_tuple(desc, values, isnull) \
-	heap_form_minimal_tuple(desc, (Datum *) (values), (bool *) (isnull))
 #endif
 
 /* 19 requires TupleDescFinalize() on a hand-built descriptor; before, nothing. */

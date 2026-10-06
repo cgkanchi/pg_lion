@@ -75,7 +75,6 @@
 #include "varatt.h"
 
 #include "lion.h"
-#include "lion_store.h"
 #include "lion_compat.h"
 
 static void lion_insert_new_entry(Relation index, Relation heaprel,
@@ -1645,20 +1644,6 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 	code = lion_tid_to_code(ht_ctid);
 	ckey = lion_code_ckey(code);
 	lo = lion_code_lo(code);
-
-	/*
-	 * The window store first (DESIGN.md §40, "Writes"): every stored column's
-	 * value - a key column's under store_values, an INCLUDE column's always -
-	 * is in its slot before the TID is in any posting set, so that a reader
-	 * that has the TID from a container finds the slot written.  A crash
-	 * after this leaves a slot no container names, which the next row to
-	 * take the TID overwrites.  Test hook: test/recovery crashes here.
-	 */
-	if (ix->nstored > 0)
-	{
-		lion_store_insert(index, heapRel, ix, ht_ctid, values, isnull);
-		LION_INJECTION_POINT("lion-insert-after-store");
-	}
 
 	for (c = 0; c < ix->ncolumns; c++)
 	{

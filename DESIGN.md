@@ -12480,10 +12480,17 @@ are exact:
 - a qual was not answered: a range beside its column's sets (§29.2), a second WALK column or long
   list, a multi-key column in mode ALL or an `IS NOT NULL` next to another column that does answer
   (dropped, as in the bitmap path; `IS NOT NULL` is then the recheck of a null test per row);
-- a MULTI-KEY column's query was answered at all (strategies 2 .. 5, §17). The bitmap path passes
-  mode KEYS through unrechecked because `lion_extract_query()` classifies it as exact; the plain
-  path is chosen for selective lookups, where one operator call per fetched row costs nothing next
-  to the fetch, and it does not have to rest on that classification;
+- a MULTI-KEY column's query in mode ALL (strategies 2 .. 5, §17: a prefix, a NOT, weights, a NULL
+  key, INCLUDE_EMPTY, `<@`, too many keys): every row, rechecked. A query in mode KEYS is exact on
+  the plain path as it is on the bitmap path, which has always passed it through unrechecked: both
+  rest on `lion_extract_query()`'s classification - mode KEYS is exactly the rows an AND/OR of
+  whole key sets selects, and a key's set is its own, a hash tie being resolved by the opclass
+  equality in the directory descent (§21) - and on the one `lion_scan_col_tree()` they share,
+  which fails the tree (`*ok = false`) unless every element of the query is in mode KEYS. *(Until
+  2026-10-06 the plain path rechecked every multi-key answer, on the ground that one operator call
+  per fetched row costs nothing next to the fetch. §40's index-only mode broke that ground: a set
+  reported inexact made the node fetch every member's heap tuple for the recheck, for a filter the
+  index had answered exactly.)*
 - the UNION shape (§29.3), always;
 - a non-MVCC scan with a NOPIN set (§29.5).
 
@@ -13846,6 +13853,12 @@ the node works on every supported major (16 .. 20), and DESC, multi-column ORDER
 FIRST/LAST, expression indexes and the btree's own index quals come with it for free. This
 replaces native ordered lion scans (§29.8, `amcanorder` on 18+), which stay deferred.
 
+*(Since 2026-10-06 the node has an INDEX-ONLY mode, §40: when the btree returns every column the
+node must produce - `(k) INCLUDE (...)`, as for an Index Only Scan - the row's values come from the
+index tuple and the heap is read only for pages the visibility map does not call all-visible. EXPLAIN
+says `Ordered By: <index> (index only)`. The same walk is then also offered without an ORDER BY, as
+`LionBtreeScan`. Everything in this section stands for both modes unless §40 says otherwise.)*
+
 ### 30.1 What qualifies
 
 - **The relation.** A plain base relation (`RELOPT_BASEREL`, `RTE_RELATION`, relkind table or
@@ -13944,7 +13957,8 @@ ordered path's selectivity `s_o` (the fraction of the index its own quals leave)
 
 - **start-up** = `C_lion` + copying the answer into the set, `containers x cpu_operator_cost`,
   with `containers = min(heap pages / LION_BLOCKS_PER_CONTAINER, s T)`;
-- **the walk** = `C_ord` + `s_o T` membership tests at `cpu_operator_cost` each;
+- **the walk** = `C_ord` + `s_o T` probes at `LO_PROBE_TUPLES` (2) × `cpu_tuple_cost` +
+  `cpu_operator_cost` each (§40.3, "The probe's price"; one `cpu_operator_cost` until 2026-10-06);
 - **the heap** = `F = s_o T s` members fetched, priced as `cost_index()` prices heap fetches:
   `index_pages_fetched()` at `random_page_cost` for an uncorrelated order, the members' share of
   the heap for a correlated one, interpolated by the square of the ordered index's correlation
@@ -14149,7 +14163,9 @@ than overruns (§30.4).
 - **When the walk is not paying: fetch and sort.** The set's exact size is known before the walk
   starts, so the walk is a bet on reaching `LIMIT` rows early, and the executor can cap the bet.
   Once this scan has walked at least `LO_SWITCH_MIN_WALK` (10,000) entries and at least
-  `LO_SWITCH_RATIO` (32) entries per member it has not met yet, it stops walking, fetches every
+  `LO_SWITCH_RATIO` (32) entries per member it has not met yet - the ratio is the setting
+  `pg_lion.ordered_switch_ratio` (real, default 32, 1 to 1,000,000; a large value keeps a walk from
+  ever switching, and index-only mode adds a density gate to it, §40.4) - it stops walking, fetches every
   member it has not met in TID order (the HOT chain under the snapshot, then the version it
   sees), keeps the visible ones that pass the lion recheck (an inexact set) and the ordered
   index's own original clauses (these rows did not come through the index), sorts them by the
@@ -17533,1421 +17549,359 @@ under a LIMIT to an index scan three times slower (0.13 to 0.15 ms against 0.04 
 - **The parallel GROUP BY's participants** are priced with the serial node's competitor; core's
   partial paths are not searched for one of their own.
 
-## 40. The window store: stored columns and INCLUDE (format version 9, designed 2026-10-02)
-
-Everything lion answers, it answers from keys and TIDs: which rows a key has, how many, in which
-window. What it cannot do is say which key a row has, cheaply, when the question is asked of many
-rows at once. The decoded walk of §34 rebuilds row → key for a window from every container of a
-column, which is cheap exactly while the column has few keys; `count(DISTINCT userid) WHERE ...`,
-`GROUP BY` a high-cardinality column under a filter, `ORDER BY ts LIMIT 10` under a filter, and
-`sum(amount) WHERE ... GROUP BY ...` all want the row's value for every row the filter keeps, and
-today every one of them ends in the heap. An index-only scan that returns a column is the same
-want through core's own executor, and lion has none (§29.9: `amcanreturn` is NULL).
-
-This section adds a second structure beside the posting sets: a **window store**, which holds for
-each stored column and each 64-page window of the heap the column's value of every row in the
-window, addressed by the row's TID. It is a column-store chunk aligned to lion's windows. It is
-opt-in, because it changes the write path and the format: `store_values = true` stores the index's
-scalar key columns, and an `INCLUDE` list stores its columns, which is the only meaning INCLUDE
-has in lion. Four query shapes are the reason for it, in the order they pay: `count(DISTINCT c)`
-and `GROUP BY c` under a filter where c has many keys; index-only scans through `amgettuple` that
-return stored columns, including the shape no PostgreSQL index offers today, a GIN-class predicate
-(`tags && '{a,b}'`, `tsv @@ 'x & y'`) with other columns returned and no heap visit; `ORDER BY c
-LIMIT n` under a filter; and aggregates over a stored column with a WHERE or GROUP BY. Each is the
-same primitive, a **gather** of values for the TIDs the count already found, after the merge the
-count already does, under the interlock the count already holds (§9).
-
-Two things it is not. It is not a filter: a stored column answers `SELECT`, `ORDER BY`, `GROUP BY`
-and aggregates, never a WHERE; that is what the posting sets are for, and an INCLUDE column has
-none. And it changes nothing about dirty pages: a stored value belongs to the tuple version its TID
-names, which is stable (an UPDATE that changes any indexed or INCLUDEd column is forced non-HOT and
-gets a new TID), so a row on a page that is not all-visible costs the same heap visit it costs
-today, for visibility, and the store still supplies its value. The fast path skips the heap only at
-all-visible pages, which is the rule every index-only scan lives by.
-
-### Which columns, and what is stored for them
-
-- **Key columns** are stored when `store_values` is on, and only the scalar ones: a column whose
-  operator class yields one key per row (§10's value rule). An array, tsvector or jsonb column gives a
-  row many keys and has no single value to store; such a column is skipped with a NOTICE at build,
-  and a `store_values` index with no storable column at all is an ERROR. The stored value is the
-  column's datum, not the key.
-- **INCLUDE columns** are always stored; that is what INCLUDE means here. Any type with a fixed
-  width (`typlen > 0`, by value or by reference: ints, dates, timestamps, bool, floats, enums, uuid)
-  or a varlena type (`typlen = -1`: text, varchar, bytea, numeric, arrays as plain values) is
-  storable; cstring and the other `typlen = -2` types are refused at CREATE INDEX. A varlena value
-  is stored detoasted and uncompressed, as `index_form_tuple()` stores it for a btree INCLUDE, and
-  one longer than LION_MAX_KEY_SIZE (2000 bytes) is an ERROR at insert or build, as a key that long
-  is. The btree limit for an INCLUDE value is 2704 bytes for the whole tuple; this is the same kind
-  of limit.
-- **Which columns are stored is fixed when the index is built**, like `summaries` and `wal_mode`:
-  `ALTER INDEX ... SET (store_values = ...)` changes nothing until a REINDEX. The meta page records
-  the set, and every reader asks the meta page, never the reloption.
-
-One promise is walked back from the discussion that led here. A stored key column was going to
-hold **entry codes**, references into the directory, so that no value would be stored twice. The
-directory cannot give one: it is a B-tree (§21) whose entries move when a leaf splits, so neither an
-ordinal nor a position is stable, and a stable id assigned at entry creation would need its own
-id → key map, a second copy of every key in id order, plus a lookup per gathered row to turn an id
-into a value. A window-local code is what the store uses instead, for key and INCLUDE columns alike:
-the values a window actually holds are listed once in the window's own page and every row carries
-an index into that list. For a column with few keys, that duplicates each value once per window,
-about a kilobyte per window per column, which is bounded and local; for a column with many keys
-every value in a window is distinct anyway and the list IS the values, which is what a btree
-stores too, without the TIDs beside them.
-
-### The reloptions
-
-| option | type | default | meaning |
-|---|---|---|---|
-| `store_values` | bool | off | store the scalar key columns |
-| `store_max_len` | int, 0..2000 | 0 | varlena columns are stored inline in fixed slots of this many bytes; a longer value is an ERROR; 0 = no cap, varlena is dictionary-coded only |
-
-An index with neither `store_values` nor INCLUDE has no store and is written as format 8 or below,
-exactly as before, readable by every build before this one. `amcaninclude` turns on with this
-section (`lion_am.c`), and `amcanreturn` answers true for exactly the stored, returnable columns
-(Phase B; see "As built" below).
-
-### Format
-
-**Meta page.** `LionMetaPageData` has no reserved word left (its 56 bytes are asserted, and the
-ndistinct record of §33 begins where it ends), so the store's record lives where §33's does: a
-`LionMetaStore` past `LION_META_NDISTINCT_END`, present when `pd_lower` covers it and the version
-says so, written by an op of its own (`LION_OP_STORE_META`, as `LION_OP_NDISTINCT` is), which a
-`LION_XLOG_META` record never touches since that op copies the 56 bytes only:
-
-	BlockNumber store_root;    /* root of the window map */
-	uint32      store_cols;    /* bit i-1: index column i (key or INCLUDE) is stored */
-	uint32      store_max_len; /* the reloption at build time; 0 = none */
-	uint32      store_pages;   /* map and store pages, for the cost model (below); every
-	                            * record that adds or frees one carries the new count */
-
-`LION_VERSION_STORE` is 9; a build writes it only when `store_cols` is nonzero, and the version
-gate in `lion_meta.c` refuses a 9 to any build before this one, as 8 was refused before §38.
-`LION_META_HAS_STORE(meta)` is `version >= LION_VERSION_STORE`; an index of version 8 or below has
-no store, whatever is past its ndistinct record. The root is cached in `LionIndexState` beside the
-directory root and validated the same way (the root page's kind), since every gather starts there.
-
-**Stored column ordinals.** The stored columns are numbered 0 .. nstored-1 in index column order
-(`store_cols` low bit first); the ordinal is what every page and map slot carries, so the per-row
-cost of a column does not depend on how many columns the index has.
-
-**The window map** (page kind `LION_PAGE_STOREMAP`, 0x0080) answers "where is the store of window
-ckey for stored column ord": slot = ckey × nstored + ord, slot value = the head block of that
-window's store chain, 0 = none yet. It is a radix of fixed depth two with fan-out
-LION_STOREMAP_FANOUT = 2032 (the BlockNumbers one item of LION_MAX_ITEM_SIZE, 8,128 bytes, holds):
-the root page's one item is an array of inner-page blocks, each inner page's one item an array of
-leaf-page blocks, each leaf's one item an array of slot values; slot s lives at leaf s / 2032,
-which is entry (s / 2032) mod 2032 of inner (s / 2032²). That addresses 8.4 billion slots, so the map never has to change shape, and a
-lookup is three buffer reads, all hot. Pages are added at the end as slots are first used; a slot is
-written once, when a window's store is created, and cleared only by VACUUM when the heap has been
-truncated below the window. Every write is `LION_OP_SETBYTES` into the one item.
-
-**A store page** (page kind `LION_PAGE_STORE`, 0x0100) is self-contained: it holds the values of
-one stored column for a contiguous range of heap pages inside one window, and everything a reader
-needs to decode them. Its special area carries `owner_head = ckey` and `owner_hash = ord`, which
-every reader checks after pinning a page it reached through the map or a rightlink, as container
-readers check theirs (§18): the page may have been freed and reused. The pages of one window's
-store are rightlinked in heap-page order, and together their ranges partition the heap pages of
-the window that have ever had a row; the head's range starts at the window's first heap page.
-
-Its items, in order:
-
-1. **The header** `LionStoreHeader`: `ckey`, `ord`, `lo` and `hi` (heap pages covered, 0..63
-   within the window), `mode` (DICT or RAW), `width` (bits per code in DICT, bytes per slot in RAW),
-   `ndict`, `typlen`, `flags`.
-2. **The dictionary**: the distinct values the page's rows hold, in the order they were first
-   seen, so that an insert appends and never renumbers. Fixed-width values are packed at `typlen`;
-   varlena values as their bytes back to back followed by a `uint16` offset array of ndict + 1
-   entries at the item's end (off[0] = 0, off[i + 1] the end of entry i). The item is on every
-   page, empty in RAW mode, so that item 3 + k is always heap page lo + k.
-   Code c ≥ 1 names entry c − 1; **code 0 is NULL**, and it is also what a slot holds that no row
-   has written, which the insert order below makes the same thing.
-3. **One sub-array item per heap page** of the range, in heap page order, so item 3 + k is heap
-   page lo + k. A sub-array is a `LionStoreSub` (`uint16 nslots`, the highest heap offset written,
-   and `uint16 flags`) and then the slots, indexed by heap offset − 1: in DICT mode `width` bits
-   each, packed least significant bit first, `width` = the bits that hold ndict (1, 2, 4, 8 or 16,
-   so that no code straddles a byte); in RAW mode `width` bytes per slot and then a null bitmap of
-   nslots bits, the value itself (`typlen` bytes, or for a capped varlena `store_max_len` + 2 bytes, a `uint16`
-   length and the bytes). A sub-array with the `LION_STORE_ABSENT` flag has no slots: the page could
-   not hold its heap page's values (below), and a reader treats every TID on that heap page as it
-   treats one on a page that is not all-visible, by fetching the heap, which carries both the row's
-   visibility and its value.
-
-A heap page's values are therefore at most one page lookup away from its window: the map, then
-the chain, then one item, and a row's slot is arithmetic on its heap offset. A reader never
-searches.
-
-**DICT or RAW** is decided per page from its content. A page starts DICT; it converts to RAW, a
-rewrite of the one page, when its dictionary stops paying - when `ndict × slotlen + rows ×
-width / 8 > rows × slotlen`, that is, when the distinct values and their codes take more room than
-the values written out - and only if the column can be RAW at all: a fixed-width type, or a varlena
-column with `store_max_len`. It never converts back; REINDEX chooses afresh. A column with few
-values is DICT forever at 1 to 8 bits a row; a column with many is RAW at `typlen` bytes a row after
-its first page fills, which is the btree's price without the TIDs; an uncapped text column is DICT
-with the strings once each per page.
-
-**Growth.** An insert that does not fit its page - a new dictionary value, a wider code, a longer
-sub-array - first compacts the page, then, if the page covers more than one heap page, **splits** it:
-the upper half of its heap pages move to a new page that takes the old page's rightlink, with the
-dictionary each half needs rebuilt from the codes it keeps (two blocks, one record). A page that
-covers one heap page and still does not fit converts to RAW if it can, and otherwise marks that
-heap page's sub-array ABSENT and drops its codes. ABSENT is reachable only by a varlena column whose
-one heap page holds more distinct bytes than a store page can, which heap physics allows only
-through inline compression (sixty 1,900-byte strings compressed to a hundred bytes each); it is the
-fallback that lets every other rule stay simple, not a mode. Widening a code (the 2nd, 4th, 16th,
-256th distinct value) rewrites the page's sub-arrays in place at the new width, one block.
-
-A 64-page window of 32-row pages has 2,048 rows: a 4-byte RAW column costs it one page, about 2 MB
-per million rows, and a DICT column with a dozen values a quarter of that; a window of 291-row pages
-(the widest a heap page can be) is 18,624 rows and spans at most three pages at RAW int4, which is
-why a window's store is a chain and not a page.
-
-### Writes
-
-**Order.** `aminsert` writes the store **before** the posting sets, in a record of its own. A crash
-between the two leaves a slot written for a TID no container names, which no reader can reach, and
-which the next row to take that TID overwrites before anyone can; the other order would leave a TID
-in a container with an unwritten slot, which reads as NULL, which is wrong. Build has no such gap:
-it writes a window's store pages and its posting sets from the same scan.
-
-**Insert.** For each stored column: read the map slot; if 0, create the window's head page (a
-`LION_OP_INIT` with the header and one empty sub-array) and set the slot, in one record of up to
-three blocks (store page, map leaf, and a new map leaf or inner page when the map grows). Else walk
-the chain to the page whose range holds the heap page, extending the last page's range when the heap
-page is past every range (the heap grew), lock it exclusively, and write the slot: in DICT mode find
-the value in the dictionary (a linear scan; a dictionary is small by construction, and a page whose
-dictionary is not small converts or splits) or append it, widening if needed; in RAW mode copy the
-bytes and clear the null bit. Store pages are never locked together with a directory or posting
-page, in either order, so no lock-order argument of §21 or §22 changes.
-
-**Build.** A serial build's callback sees TIDs in heap order: it buffers the current window's
-values for every stored column and, when the TID moves to the next window, emits that window's
-pages through the bulk writer, choosing DICT or RAW once from the whole window and splitting into
-as many pages as the content needs, and records the head blocks for the map, which is written
-last. A parallel build's workers share one heap scan whose chunks do not align to windows, so the
-leader builds the store in a second, serial heap scan after the posting sets, with the same
-emitter. The second pass is the honest first version; spooling (TID, values) to a shared tape
-sorted by TID, the way the codes are spooled, is the follow-up that removes it.
-
-**WAL.** In rmgr mode (§25) every change is `LION_XLOG_STORE` (0xD0), an op-stream record over the
-existing ops: INIT and ADDMANY for a page written whole (create, rewrite, split, convert), REPLACE or
-DELTA for a sub-array or dictionary that grew, SETBYTES for a slot inside a sub-array and for a map
-slot, SPECIAL for a rightlink, ADD for a sub-array that extends a page's range, DELETED for a
-freed page. One new op, `LION_OP_STORE_META` (18), copies the meta page's store record, as
-`LION_OP_NDISTINCT` copies §33's; nothing else needs new replay code. In generic mode every
-touched page is registered with GenericXLog and the diff does the rest. `wal_consistency_checking`
-covers both, and a store or map page's masking is a container page's (the LSN, and the padding
-after each item).
-
-**VACUUM.** `ambulkdelete` visits every store page once, after the posting sets, holding it
-exclusively (not a cleanup lock: readers hold a store page only while decoding one sub-array, and
-never carry a pin on it across a visibility check), and for every written slot asks the callback
-whether its TID is dead; a dead slot is cleared to code 0 or its null bit, and a page whose dead
-slots reach a quarter of its written ones is rewritten, which drops the dictionary values nothing
-references any more and re-chooses DICT or RAW. `amvacuumcleanup` clears the map slots of windows
-past the heap's end and frees their pages through §18's DELETED protocol. Clearing dead slots is
-hygiene, not correctness - see "Why it is safe" - which is why VACUUM can do it under an ordinary
-exclusive lock, in the same pass, at the cost of one callback per written slot, the price a btree
-pays per index tuple.
-
-### Reads
-
-**The gather** (`lion_store_gather()`): given a window, a stored column, and the window's kept
-members as `lo` codes in order (which is heap page then offset order, the order the merge of §9
-already yields), it pins the window's chain and, heap page by heap page, decodes the sub-array
-into the caller's arrays of Datum and isnull, copying by-reference values into the caller's
-context so that nothing points into a page after its lock is dropped. Heap pages it cannot supply
-(ABSENT, or a window with no store yet) it reports as such, and the caller fetches those TIDs from
-the heap as it fetches the TIDs of a page that is not all-visible - one path for both. The
-visibility decision stays the caller's, made per heap page under the container pin as §9 makes it:
-all-visible, take the store's value and skip the heap; else fetch the heap, which settles
-visibility and value together, and the store is not consulted. A gather is one map lookup and one
-chain pin per window per column, then arithmetic.
-
-**Why it is safe.** The count engine's interlock (§9) is the index-only scan's: the TIDs a reader
-holds came from a container page it keeps pinned, VACUUM's `ambulkdelete` needs a cleanup lock on
-that page before it can finish, and VACUUM reclaims a dead TID's line pointer (after which a new row
-can take the TID) and sets a page all-visible only after `ambulkdelete` returns. So a TID read from a
-pinned container whose heap page the visibility map calls all-visible is a row every snapshot sees,
-and the slot it names was written by that row's own insert, before the TID reached any container.
-VACUUM can clear the slot of a TID that is still in the container only if the TID is dead to every
-snapshot, and such a TID is on a page the map does not call all-visible, so the reader takes the
-heap path and never reads the slot. A TID visible to the reader's snapshot is not dead to VACUUM's
-horizon and its slot is never cleared. On a hot standby a generic-mode index loses the interlock as
-§9 says, and the readers that consult the store inherit the recheck the count already makes there
-(`cx.in_recovery`): every TID through the heap.
-
-**Index-only scans** (`amcanreturn`, `amgettuple`). `amcanreturn(index, attno)` is true for a stored
-column. `liongettuple` with `xs_want_itup` fills `xs_itup` with the stored columns of the TID it
-returns and NULL in the others, gathering a container's members at a time through the same
-primitive, so the scan of §29 keeps its batching; for a TID on an ABSENT heap page it fetches the
-heap tuple itself and forms the index tuple from it. Core's `IndexOnlyScan` node asks the visibility
-map and fetches the heap for a page that is not all-visible, as it does over a btree, and fills its
-output from `xs_itup` either way, which is why the AM supplies the values for every TID and not only
-the all-visible ones. This is the path that returns a column under a GIN-class predicate: the key
-column's posting sets answer `tags && '{a,b}'` exactly (§15), the store supplies the other columns,
-and the heap is visited for the dirty pages only. Three bounds: the predicate must be one the sets
-answer without a recheck (`<@`, `@> '{}'`, a tsquery with `!` or a prefix, and a generic plan's
-parameter cases still recheck, and a recheck needs the heap); the multi-key column itself is never
-returnable, since a row has many keys and one slot; and `SELECT *` over such an index is therefore
-a plain scan, as before.
-
-**The custom shapes**, each a reader of the gather inside a node that exists:
-
-1. **`count(DISTINCT c)` and `GROUP BY c` under a WHERE** (LionCount, §9 and §34). The decoded
-   walk's price is the column's containers in the window; the gather's is the rows kept times the
-   code width. The planner prices both and takes the cheaper; for a stored INCLUDE column there is
-   no walk and the gather is the only reader. The gathered values are hashed exactly as the walk's
-   groups are; this is the ClickBench Q12 class (`GROUP BY userid` under a filter), and the
-   `count(DISTINCT)` that §39 found priced as a walk it never made.
-2. **`ORDER BY c LIMIT n` under a WHERE** (LionOrdered, §30). The node already builds the exact
-   TID set and walks a btree or the column's own entries for the order; with c stored it gathers c
-   for the kept TIDs, keeps a top-n heap, and fetches n rows. The gather and the fold into the heap
-   happen while the set is being built, window by window under the §9 pin, because §30's finished
-   set holds no pin and a TID in it can have been reclaimed and reused by the time it is read: a
-   value taken under the pin at an all-visible page, or from the heap at a dirty one, belongs to a
-   row the snapshot sees, and the n rows fetched at the end are those rows. Where today's §30 walks
-   a btree in order and tests each TID against the set, this touches no btree and no heap page but
-   the n it returns.
-3. **Aggregates over a stored column with a WHERE or GROUP BY** (§37 extended). §37 answers
-   `sum(x)` from x's entries when there is no WHERE and no GROUP BY; with x stored and a filter, the
-   gather supplies x for the kept rows, per window, under the same group machinery as 1.
-4. **The join pushdown** (§27): a fact table filtered on a lion column with its foreign key stored
-   gathers the join keys without a heap visit, the FK-side probe's input today.
-
-Each shape rejects the store, and prices nothing, for a column that is not stored.
-
-### Costs (§31, §39)
-
-A gather is priced as rows kept × a per-row constant that is the code width in bytes times a
-decode rate, plus a page's read cost per store page the window has (one, usually) and the map's
-three reads per window, in the units of the competitor (§39) and under its margin. The store's
-pages are not posting pages: every formula that takes the posting pages as `pages - 1 - dirpages`
-subtracts `store_pages` too, which the build records and `amvacuumcleanup` refreshes. It is the
-simplest of lion's prices because it is linear in a number the count already estimates: the rows
-kept. Where a shape has two readers (the walk and the gather), both are priced and the cheaper
-taken, so a low-cardinality column is never gathered when its containers decode faster. A heap
-fetch for a dirty or ABSENT page is priced as §9 prices the dirty page's visit.
-
-### `lion_index_stats()`, `verify()`, EXPLAIN
-
-Statistics add the store's page counts (map and store), per stored column the number of DICT and
-RAW pages, ABSENT sub-arrays, dictionary bytes and slot bytes. `verify()` checks that every nonzero
-map slot points to a STORE page whose special area names its window and ordinal, that a chain's
-ranges partition its heap pages in order, that every DICT code is below ndict + 1, that widths hold
-their ndict, that a RAW page's column can be RAW, and that no page past the heap's end has a slot.
-EXPLAIN names the columns a node gathers (`Store: userid`) and, for an index-only scan, core's own
-`Heap Fetches` says what the dirty pages cost.
-
-### Limits of the first version
-
-- Multi-key columns are never stored; `cstring` types are refused; a value over 2000 bytes is an
-  ERROR, as a key is.
-- A stored column is not a filter. An INCLUDE column cannot appear in a lion WHERE; the planner uses
-  the heap or another index for it.
-- `store_values` and `store_max_len` take effect at build; ALTER INDEX SET changes nothing until
-  REINDEX.
-- A parallel build makes a second serial heap pass for the store.
-- Dictionaries are per store page, so a split window lists a value once per page it appears in.
-- Dirty-page behaviour is unchanged: a row on a page that is not all-visible costs a heap visit, for
-  every reader of the store as for the count.
-- The map is written at the end of a build and grows at the end on insert; it is never compacted.
-
-### Tests
-
-Regression: option validation (every refusal above, the NOTICE, the no-storable-column ERROR);
-build serial and parallel against a seq scan over every shape; every insert path (append, widen at
-each width, split, DICT → RAW, ABSENT via a compressible column, the map growing past a leaf);
-VACUUM clearing and rewriting, and cleanup after a heap truncation; index-only scans and the four
-custom shapes against seq-scan answers over a table with updates and deletes outstanding (dirty
-pages), after VACUUM (clean), and with NULLs; `verify()` on each; `lion_index_stats()` fields. The
-recovery harness: a crash between the store record and the posting record (an injection point in
-the cassert builds), and replay of every store record kind on a standby under
-`wal_consistency_checking = pg_lion`, in both WAL modes.
-
-### As built: Phase A (2026-10-02)
-
-Phase A is the store's format, its writers and its checks: the reloptions, the meta record and the
-version gate, the map and store pages, the serial and parallel build, the insert path and its WAL,
-VACUUM, `lion_index_stats()`, `lion_index_verify()`, `lion_index_stored()` and the gather API. No
-planner or executor path reads the store yet. Where it differs from the design above, and why:
-
-**Not yet: Phase B.** `amcanreturn` stays NULL; index-only scans, the four custom shapes, the
-gather's prices and EXPLAIN's `Store:` line come with the readers. `LionStoreCol.returnable` is
-already computed: a key column is returnable only when its stored type is the index tuple
-descriptor's, which `amstorage` can make differ (an opclass with a storage type). The cost model
-does not subtract `store_pages` yet: the three formulas that take the posting pages as `pages - 1 -
-dirpages` (`lion_plan_cost.c:845`, `lion_plan_fkjoin_cost.c:286` and `:429`) count an index's
-store pages as posting pages, which overprices posting reads of an index with a store - harmless
-while nothing chooses a plan for the store, and the first thing Phase B fixes.
-
-**The map.** Fan-out 2032, not 2035: one item of `LION_MAX_ITEM_SIZE` (8,128 bytes). Every map
-page records its level (`LionPageOpaque.level`: 0 leaf, 1 inner, 2 root) and its number within the
-level (`owner_head`), and every reader checks both against the path that reached it. The root is
-written by every build that stores a column, even of an empty heap, and by `ambuildempty` at block
-2 (an unlogged index's init fork); an inner or leaf page is added by an insert in a record of its
-own (the new page, its parent's entry, the meta count) before the record that creates a head.
-Map pages are never freed.
-
-**The page.** The dictionary item is on every page, empty in RAW mode; a varlena dictionary keeps
-its offsets at the item's end, after the bytes, so that an appended value moves nothing before it.
-A sub-array's header is `LionStoreSub` (`nslots`, `flags`), ABSENT is its flag, and a RAW
-sub-array's null bitmap follows its slots. `LionStoreHeader` repeats `ckey` and `ord`, carries
-`typlen`, and is 16 bytes; `lion_store_fmt.h` is the whole byte format, unit-tested on its own
-(`test/unit/store_test.c`).
-
-**`store_pages` is exact.** Every record that allocates or frees a map or store page carries
-`LION_OP_STORE_META` with the new count, so the cost model can read it at any time rather than
-after a build or a VACUUM.
-
-**A head starts at heap page 0, always.** A window's head is created covering heap pages 0 .. k,
-with empty sub-arrays before k; a page's `lo` never changes and ranges only move right (a split or
-an append), which is what a reader checks after reaching a page: the page names this window and
-column, a head has `lo` = 0, and the heap page is not before `lo`.
-
-**DICT or RAW.** Applied to every insert, the rule above would turn each new page RAW at its first
-rows, which are all distinct. As built:
-- the build applies it once per window, to the window's rows (`lion_store_prefer_raw()`), and
-  writes every page of the window in that mode;
-- an insert turns a DICT page RAW only when a write no longer fits the page as DICT, at any code
-  width, and does fit it as RAW; a page a split or an append creates inherits its page's mode;
-- VACUUM's rewrite encodes the page both ways when the column can be RAW and keeps the smaller, so
-  a RAW page whose rows mostly died can go back to DICT: "never converts back" holds for inserts.
-
-**Growth.** An insert first tries the page in place: the same value again (nothing), a slot set in
-its sub-array (SETBYTES of the bytes that changed), a longer sub-array (DELTA), a dictionary entry
-appended at the same code width, the range extended by ADDed sub-arrays. Anything else rebuilds
-the page from its decoded content: in its mode at whatever width it needs, then RAW as above, then
-- when the page covers more than one heap page - a split, or, for a heap page past the range of the
-chain's last page, a new last page of its own (an append), after which the write starts again from
-the map (at most 64 times). A split cuts the range in the middle, except that a write to the
-range's last heap page moves that heap page alone to the new page: a heap that fills page by page
-keeps writing there, and a cut in the middle would leave two half-full pages behind each heap page
-of the window. A page of one heap page that fits in neither mode marks it ABSENT; at build, a heap
-page too big for a page in the window's mode tries the other mode before ABSENT. The regression
-test reaches ABSENT with dozens of distinct 1,984-byte strings a heap page, compressed inline.
-
-**Unwritten slots.** A heap offset past its sub-array's `nslots`, a heap page past the chain's last
-range and a window with no head are reported by the gather as absent, which sends the caller to the
-heap, and as "missing" to `verify()`; a slot inside `nslots` that no row wrote reads NULL, which the
-insert order makes unreachable for a TID in a container. A parallel build's second scan can find
-dead a row the first one indexed and leave its slot unwritten, which is the same case.
-
-**Insert order and records.** `lion_store_insert()` computes every stored column's value first, so
-that a value too long is refused before anything is written, then writes the columns in order, a
-record per page touched; the injection point `lion-insert-after-store` follows it, before the key
-loop. A head is created in one record of three blocks: the store page, the map leaf's slot and the
-meta page.
-
-**Parallel build.** The leader's second heap scan (17 and later, as the parallel build is) writes
-the store after the posting sets, where a serial build writes each window's store pages as the scan
-leaves the window, before the posting sets: the two builds' block layouts differ, their stores do
-not (the regression test compares their statistics).
-
-**VACUUM.**
-- `ambulkdelete`'s store pass runs after the posting sets and before the leak sweep. It walks the
-  map from the root and every chain, marks each map and store page visited for the sweep, and asks
-  the callback about every written slot. Dead slots under a quarter of a page's written ones are
-  cleared in place, a SETBYTES per sub-array (code 0, or the null bit set and the RAW bytes
-  zeroed); a quarter or more rewrites the page in the smaller mode. An rmgr-mode index on a server
-  without the resource manager is visited and not written.
-- The sweep frees a live store page that the walk did not reach once a walk of the map from the
-  root (`lion_store_page_linked()`, where any doubt counts as linked) finds nothing that links it:
-  an orphan of a cleanup that freed a chain's head and failed before its other pages. A DELETED
-  store page goes the way a DELETED container page goes.
-- `amvacuumcleanup` frees the windows whose first heap block is at or past the heap's end. It
-  clears their map slots and deletes their heads while holding the HEAP's extension lock: no heap
-  page can be added meanwhile, so no insert can be writing into such a window, and one that comes
-  later finds the slot clear, or its cached head DELETED, and starts a new chain. The free space map
-  hears of the heads after the lock is released (the extension lock forbids other heavyweight
-  locks), and the rest of each chain is freed after that. Lazy VACUUM truncates the heap after
-  `amvacuumcleanup`, so the windows one VACUUM truncates away are freed by the next.
-
-**Reads.** The gather API (`lion_store.h`):
-
-	LionStoreReader *lion_store_open(Relation index, LionIndexState *ix, int ord,
-	                                 MemoryContext cxt);
-	void lion_store_gather(LionStoreReader *r, uint32 ckey, const uint16 *lo, int nlo,
-	                       Datum *values, bool *isnull, uint64 *absent_pages);
-	void lion_store_gather_reset(LionStoreReader *r);
-	void lion_store_close(LionStoreReader *r);
-
-`ord` is the stored ordinal (`lion_store_ordinal()`); `lo` is a window's members in ascending
-order; bit k of `*absent_pages` is set for heap page k when its rows must come from the heap. A
-reader holds one store page at a time, share-locked while it decodes one heap page's members, and
-a pin only within one call; it reads the map again when a page fails the check above (at most 64
-times). By-reference values are copied into the reader's context, a DICT page's values once per
-visit, and live until `lion_store_gather_reset()`. Between the map lookup and the first lock it
-holds nothing (the injection point `lion-store-gather-head`, which
-`test/isolation/store_vacuum_reader.spec` uses to free and reuse a chain under a parked reader).
-
-**`lion_index_stats()`** returns a row for each INCLUDE column as well, after the key columns,
-with no entries; its last seven columns are the store's: `store_pages` and `store_map_pages`
-(index-wide, on every row), and `store_dict_pages`, `store_raw_pages`, `store_absent`,
-`store_dict_bytes` and `store_slot_bytes`, NULL on the row of a column that is not stored.
-**`lion_index_stored(index, ctid) RETURNS text[]`**, revoked from PUBLIC, returns a TID's stored
-values through the gather, NULL where it reports the heap page absent.
-
-**`verify()`** checks the meta record against the index's columns, every map page's level and
-number, every head an owned STORE page, each chain's ranges contiguous from 0 (`lo` = the previous
-`hi` + 1) over at most 64 pages, and every page's header, dictionary, sub-arrays and codes; an
-unreachable store page is a leak (a WARNING), as an unreachable container page is. It does not
-check that no window past the heap's end has a slot - true only after the VACUUM that follows a
-truncation. With `heapallindexed` it compares every visible row's stored values with the heap's
-(`lion_store_compare()`), skipping ABSENT heap pages; a difference, or a slot the store does not
-have, is an ERROR naming the TID and not the values.
-
-**Unreachable refusals.** An INCLUDE column of a `typlen` -2 type, and a fixed-width type longer
-than 2,000 bytes, are refused with their own messages, but no table column has the one and no
-built-in type is the other; the checks stay as guards.
-
-**Tests as built.** `test/sql/store.sql` (options and refusals; every storable type and NULLs,
-serial, capped and parallel builds; each insert path - a window's head, codes widened at each
-width, DICT to RAW, appends, splits at the end and in the middle, ABSENT at build and at insert,
-the map growing past its first leaf; VACUUM clearing and rewriting; the store of a truncated heap
-freed and refilled; every step checked row by row against the heap and by `verify()`);
-`test/isolation/store_vacuum_reader.spec` (a parked reader whose page VACUUM rewrites, frees, and
-frees and reuses); the recovery harness (two store indexes in the crash-under-load fixture, their
-values compared with the heap after every crash and on the standby, and phase 1g, a crash between
-an insert's store record and its posting record); `test/unit/store_test.c`. INCLUDE used to be
-refused, so `multicolumn` and `options` changed.
-
-**What Phase B starts from.**
-- The count engine: the gather belongs where a window's result container, its visibility-map mask
-  and the posting pins are all held - `lion_count_container_masks()` / `lion_count_container()`
-  (`lion_count.c`) before the cursors advance; rows on dirty pages take their values from the heap
-  recheck that already reads them. In the decoded walk (`lion_count_groups_decode()`), a stored
-  column's values replace the reconstruction from its containers.
-- `amgettuple`: `liongettuple()` loads a container's members into `so->lo[]` (`lion_scan.c`, the
-  batch load); that is where a window's values are gathered, and the per-TID emission, which sets
-  `xs_itup = so->nullitup` today, is where the index tuple is formed from them. `amcanreturn`
-  answers from `LionStoreCol.returnable`, and `xs_want_itup` must keep the §9 pin.
-- LionOrdered: `lo_switch()` takes the sort keys with `heap_getattr()` and `lo_next()` fetches
-  before it tests; both run on the pinless set, so §40's fold has to move into the set's build,
-  under the pin.
-- The cost model: subtract `store_pages` at the three sites above.
-- Open: a parallel build's second heap scan; an uncapped, mostly distinct varlena column costs its
-  bytes plus a 2-byte code (15 bytes a row on the measured 11-byte strings) because dictionaries
-  are per page; the heap's extension lock is held across the WAL records of a cleanup that frees
-  windows (only after a truncation); inserts into the middle of an old window split by halves and
-  can leave half-full pages behind; `lion_index_stats()` reads every store page.
-
-### As built: Phase B, LionOrdered (2026-10-02)
-
-The store order, shape 2 of "The custom shapes": `SELECT ... WHERE <lion> ORDER BY c LIMIT n`
-with c stored, in `src/lion_ordered.c` alone. LionOrdered gets a third kind of path beside the
-btree walk (§30) and the lion column's walk (§30.11); it has no ordered side. Where it differs
-from the design above, and why:
-
-**The fold runs on a pinned walk of the tree, not in the set's build.** §30.4 reads each leaf whole
-and pinless and combines the leaves afterwards, so a container key's answer is final only once
-every leaf is read, long after any pin is gone; holding every leaf's pins until then is the budget
-§29.5 refuses. The store order (`lo_store_build()` → `lo_store_node()`) reads the tree itself:
-- a LEAF is opened with `keeppins` (`lion_source_open(..., true, ...)`), and each container it
-  hands out is folded (`lo_store_piece()`) before `lion_source_next()` moves past it, so the page
-  its members came from is still pinned;
-- an OR folds each of its children; a row two of them hold is ranked once (a simplehash of the
-  kept TIDs, consulted only for a row that would be kept);
-- an AND drives its first LEAF child under its pins and builds every other child as §30.4 builds
-  a set, pinless; those sets mask each driven container (`lion_container_and()`) before the fold.
-  Every row of the AND is a member of the driver's container, whose page is pinned, and one pin
-  suffices (`lion_count_int.h`). A mask that degraded (§30.4) keeps the driver's container whole,
-  rechecked.
-The piece is exact when its source is (`lion_source_exact()`: a UNION, a NOPIN set past the pin
-budget and a multi-key leaf, which §29.6 rechecks, are not), every mask was, and no lion clause is
-lossy. For an exact piece, `lo_store_piece()` asks the visibility map about each heap page of the
-container under the pin; the members on all-visible pages get their sort keys from
-`lion_store_gather()` (one call per sort key), except those of the pages it reports in
-`absent_pages`; every other member - a dirty page, an ABSENT one, any member of an inexact piece,
-and every member on a hot standby unless every index the node reads is in rmgr mode (§9, "Hot
-standby") - is fetched (`lo_fetch_tid()`, the HOT chain from its root), which settles visibility
-and value together, and an inexact piece's row is tested against the lion qual as §30.4's recheck
-tests one. Under SERIALIZABLE the heap pages served from the store are `PredicateLockPage()`d, as
-the count locks them; the rows fetched are locked by the fetch.
-
-**The candidates.** A max-heap of `limit + offset` slots, the worst on top, compared with the
-ORDER BY's own SortSupport (its operators, collations, directions and NULLS placement, from
-LO_PRIV_SORT); a row is taken only when it comes strictly before the worst, so a row that ties with
-the worst is not, the first met of a tie wins, and a TID met again needs looking up only among the
-slots kept. By-reference values are copied into the node's context (`datumCopy()`), a heap row's
-detoasted first; the arrays grow by doubling from 1,024 slots. After the fold the slots are sorted
-(`qsort_arg()`) and fetched in order; a slot whose row is not visible is an ERROR - it was visible
-to the same snapshot when it was ranked - and an assert-enabled build checks that the row fetched
-has the values ranked. A rescan returns the same rows; one whose Params changed the lion quals
-builds again.
-
-**The plan shape** (`lo_store_limit()`, `lo_store_find()`): offered when
-- core's `limit_tuples` is known (a constant LIMIT and OFFSET; no grouping, aggregate, window,
-  DISTINCT or set-returning target), with no FOR UPDATE (LockRows between the node and the LIMIT
-  can drop a row) and no WITH TIES (which takes the rows that tie with the last);
-- the relation is the whole query, or a partition or UNION ALL member of the relation that is
-  (`top_parent_relids`), so that nothing between the node and the LIMIT can want another row;
-  each partition then has its own store order under core's Merge Append;
-- every ORDER BY key is a plain column (`lo_sort_keys()`) that one lion index stores with
-  `LionStoreCol.returnable` and the table's type, the index being non-partial or implied by the
-  query - not necessarily one the WHERE reads (the pin of any index of the table interlocks the
-  slot of every index, `lion_count_int.h`). Several keys are supported when all are stored in that
-  one index; a key that is not stored, first or later, means no store order (core's Incremental
-  Sort above it would need every row that ties with the last). Of several such indexes, the one
-  whose store reads the fewest pages for the keys, then one the lion side reads;
-- the lion access answers the whole WHERE: no residual filter and no lossy index clause (a row the
-  node ranks is a row it returns).
-Its pathkeys are `root->sort_pathkeys`, so core puts no Sort above it, and its rows are
-`min(limit + offset, rows)`. `custom_private` gains LO_PRIV_STORE: limit + offset, the number of
-keys, the store index's column of each key, and each key's direction. `pg_lion.enable_ordered_store`
-(on) turns the shape off alone; it is a planner switch, not a cost setting.
-
-**The cost rule as implemented** (`lo_cost_store()`), with N the rows the lion side keeps
-(`cost_bitmap_tree_node()`'s selectivity times the tuples), C = min(⌈pages / 64⌉, N) the
-containers, f the relation's `allvisfrac`, k the sort keys, K = limit + offset:
-- start-up = the lion side's cost + C × `cpu_operator_cost` (as §30.3)
-  + N × f × k × LION_STORE_VALUE_COST
-  + C × P × LION_STORE_PAGE_COST, P being the store pages a window reads for the k keys: the
-    meta record's `store_pages` over the heap's windows, shared among the stored columns by the
-    width of their slots (`rawwidth`, a gather reads only its column's chain), at least one a key
-  + for the N × (1 - f) rows on other pages, min(those rows, pages × (1 - f)) heap pages at
-    `lion_heap_page_cost()` and LION_RECHECK_TID_COST a row (§9's price of a recheck)
-  + 2 × `cpu_operator_cost` × N × log2(2K), core's price of a bounded sort (`cost_sort()`), not
-    N log N
-  + the target's start-up;
-- run = `index_pages_fetched(min(K, N))` × `random_page_cost` + min(K, N) × (`cpu_tuple_cost` +
-  the target per row);
-- both divided by `pg_lion.pushdown_margin` (`lo_add_path()`, as the walks are, §39); nothing is
-  converted, the competitors being the relation's own scans.
-It is refused when K > N / 4, when K candidates - a TID and a slot, about 30 bytes, and for each
-key its value's width, a Datum and a null flag, 16 bytes more by reference - pass `work_mem`, and,
-for a BitmapAnd or BitmapOr lion side, when the set would pass `hash_mem` (only an AND's masks are
-ever held as sets). When the sort column is also a lion key column, the walk of its entries is
-priced beside it (§30.11) and `add_path()` keeps the cheaper. "Costs" above prices a value as its
-code width times a decode rate and adds the map's three reads a window; as built, the two settings
-every reader of the store shares stand for those, LION_STORE_VALUE_COST a value and
-LION_STORE_PAGE_COST a page, and the map's reads are not priced apart.
-
-**EXPLAIN**: `Store: c4[, c8]` and `Order: c4 DESC NULLS FIRST[, ...]`, with ` COLLATE x` for a
-key whose collation is not the column's, in place of `Ordered By`; `Lion Indexes` names the store's
-index too when the set does not read it. ANALYZE: `Rows Ranked` (rows folded; a row both sides of
-an OR hold counts twice), `Store Values` (rows whose keys the store gave), `Heap Fetches` (the
-others, and the rows returned), `Rows Removed by Lion Recheck` (for an inexact set), and `Lion Set:
-<containers folded>, exact|rechecked|degraded[, <builds>]`.
-
-**Measured** (2026-10-02, assert-enabled PostgreSQL 18.6 at -O1, warm cache, no parallel workers,
-the median of nine runs after two). A synthetic table of 2,000,000 rows (`a` of 100 values, `g` of
-7, `c4` of about a million random ints, an md5 text; 20,619 heap pages) with `lion (a) INCLUDE
-(c4)` and `lion (g)`, all-visible: `WHERE a = 7 ORDER BY c4 DESC LIMIT 10` (20,000 rows kept) took
-4.8 ms through the store order (`Store Values: 20000`, `Heap Fetches: 10`, 1,633 buffers) against
-25.4 ms for the plan with `pg_lion.enable_ordered_store` off (an index scan of `lsb_a` and a top-N
-Sort, 20,008 buffers); `WHERE a = 7 AND g = 3 ... LIMIT 10` (2,857 rows) 3.4 ms against 21.8 ms (a
-bitmap heap scan and a Sort). With one row updated on every heap page and no VACUUM, every row
-comes from the heap and the two are level: 23.5 ms against 24.6 ms.
-
-**Tests.** `test/sql/store_ordered.sql`: every query runs through the node (core's scans off) and
-through the ordinary plan (`pg_lion.enable_ordered_scan` off), and the sequences of their sort keys
-are compared - ties may come in any order - and every row the node returned is checked to be a
-distinct row its WHERE selects. ASC and DESC, NULLS FIRST and LAST, OFFSET, ties (500 values over
-4,286 rows), two and three keys; int4, int8, date, timestamptz, and text under an ICU collation (a
-copy of "C" where there is no ICU, with the same output) and under `COLLATE "C"`; AND, OR, an OR
-under an AND, IN and `= ANY`, ranges, a two-column index's quals, a multi-key WHERE (`@>`, `&&`,
-`<@`, OR'd with a scalar one) ranking an INCLUDE column; a generic plan whose LIMIT outruns the set
-and one with an empty set; a SubPlan rescanned with new Params (`5 builds`); a SCROLL cursor; a key
-column both walkable and stored, its two plans shown by `pg_lion.enable_ordered_store`; every
-refusal (a column not stored, first or second; an expression; a filter; FOR UPDATE; WITH TIES; a
-LIMIT parameter; a join; a LIMIT past a quarter of the set; one past `work_mem`); dirty pages
-(updates to new values, HOT updates, deletes and inserts over two thirds of the heap: the counters
-show the store and the heap sharing the rows), then VACUUM (every row from the store); SERIALIZABLE;
-an ABSENT window (`Store Values` 71 and 109 rows from the heap); a partitioned table under Merge
-Append. No existing expected output changed.
-
-**What is left.**
-- A piece that must be rechecked takes every row from the heap, though its pin and the visibility
-  map would let the store rank it: ranking by the stored value and rechecking only the candidates
-  needs a way to refill the heap when a candidate fails. This is every multi-key WHERE (§29.6
-  rechecks it), and every AND with a multi-key side.
-- A UNION ALL whose arms core plans as subqueries (`Subquery Scan`) gets no store order: each arm's
-  plan knows neither the ORDER BY nor the LIMIT.
-- `ORDER BY stored, not_stored`: no partial use (the rows that tie on the stored prefix at the
-  cut would all be needed).
-- Not parallel-aware.
-- The hot-standby rule is tested by reading, not by the recovery harness (the store order is not
-  in its fixture).
-- Built and tested on PostgreSQL 18 only; the version guards are the file's own.
-
-### As built: Phase B, the count's shapes (2026-10-02)
-
-Shapes 1 and 3 of "The custom shapes" are one path of LionCount: the gather. It answers
-`count(DISTINCT c)`, `GROUP BY c` with `count(*)` and `count(x)` per group, and `sum`, `avg`,
-`min`, `max` and `count` of c with or without a `GROUP BY`, for stored columns c, under a lion
-WHERE or with none. Where it differs from the design above, and why:
-
-**One accumulator, not the decoded walk.** The design put the gathered values in place of the
-decoded walk's reconstruction (§34). As built the gather is a path of its own beside the walks: the
-node counts what `count(*)` under the same WHERE counts - the WHERE's intersection
-(`lion_count_relation()`), or with no WHERE the sum over every entry of a driver column
-(`lion_sumall_relation()`) - and the count engine hands it each counted row with the gathered
-columns' values (`LionGather`, `lion_count.h`); the node hashes them by its `GROUP BY` columns and
-keeps per group the rows and each aggregate's state (`lion_exec_store.c`). The walks are untouched
-and still offered: the planner builds the walk path and the gather path for the same query and
-`add_path()` keeps the cheaper. So §37's walk stays for no WHERE and no `GROUP BY` over key
-columns, and the decoded walk for a `GROUP BY` of key columns with no WHERE, by cost rather than
-by exclusion; a stored INCLUDE column has only the gather.
-
-**The engine** (`lion_count.c`). A `LionGather` is created over the heap, the store index and the
-gathered columns' store ordinals, with a row callback, and attached to the node's visibility cache
-(`lion_vis_cache_set_gather()`); `lion_count_sources_run()` hands it to every count of that heap
-except an existence test and a collection of the WHERE, which count no rows. In
-`lion_count_container_masks()` a gather takes the container's members on the heap pages the map
-calls all-visible (the `allvis` mask, which is 0 in recovery, without a map and under a row
-filter, as before), gathers each column for them (`lion_store_gather()`) and hands every row not on
-an ABSENT page to the callback; the members of the other pages, and of the ABSENT ones, are queued
-for the heap recheck. The recheck (`lion_recheck_heap_rows()`, the former filtered recheck, now
-also run with no filter) fetches each TID, tests it against the snapshot and hands a visible
-tuple's values to the callback, detoasted; the sequential fallback of a filtered count does the
-same (`lion_count_heap_gather()`). Predicate locks: `PredicateLockPage` on each all-visible page
-whose rows came from the store; an ABSENT page's rows are heap fetches and are locked by them. The
-container is a copy of a page the count still pins (§9), with no buffer lock held, so the gather's
-one share lock at a time is never held beside a posting or directory page. The node checks that it
-was handed exactly the rows the count counted, and errors otherwise: a count path that counted
-rows without handing them over would be a wrong answer, not a slow one.
-
-**What the count does differently with a gather.** The subtractive paths count rows they never
-see (a range's complement, `LION_RANGE_EVAL_COMPLEMENT`), so a node with a gather forces `INSIDE`
-(`lion_walk_count()`, `lion_sumall_relation()`); the full-column sum (`lion_count_nonnull()`)
-sees every member and stays. And the disjoint entries a count sums one at a time - an IN list's
-under §15's short-circuit, a range's or a whole column's large entries in `lion_sum_walk()` - are
-merged into one union per container key instead (a directory leaf's entries at a time, in
-batches when the union is wider than the pins it may hold): the gather reads a window's store
-pages at every count of a container there, so summed entry by entry a range of 90 values read
-each window's pages 90 times. Measured on the table below, `max(g) ... WHERE k < 90` read 139,595
-buffers in 305 ms summed and 2,179 in 52 ms merged; the sum is kept where only it holds the
-interlock (a list past the pin budget, NOPIN sets). The gather is not used beside the node's own walks (a group column, a
-distinct column, aggregates over keys, a join, partitions, the top k, the decoded walk): the plan
-never builds that, and `lion_store_begin()` refuses it. (Partitions were in that list until "As
-built: partitioned tables" below.)
-
-**The planner** (`lion_plan_count.c`, `lion_try_store_path()`). The path is built as the count's
-is - query, relation, WHERE, HAVING, strategy, targets, estimate - with a `GROUP BY` and outputs
-of its own: every `GROUP BY` item a plain column with a hashable equality (its collation the
-column's), every output a `GROUP BY` column, `count(*)`, or an aggregate over a plain column that
-`lion_store_agg_classify()` accepts: `count(c)`, `count(DISTINCT c)` with a hash function, or
-§37's `lion_wagg_classify()` set (sum and avg of int2, int4 and int8 in 128 bits, min and max
-under the aggregate's sort operator; float8 and numeric sums were not trivial and are left out).
-`lion_find_store_index()` then picks the lion index that stores every gathered column, the one
-storing fewest columns when several do. The FK-side join is declined. A hash table the planner
-expects to exceed `hash_mem` was too, until "As built: spilling" below, and a partitioned table,
-until "As built: partitioned tables" below. The plan carries the
-gather as private member 19 (`LION_PRIV_STORE`: the index, the heap columns, their index columns,
-the `GROUP BY`'s position, equality and collation per column, and per aggregate its kind, column,
-width, aggregate, input collation and DISTINCT equality and collation); the target-list kinds move
-to member 20, and `LION_PRIV_MAGIC` and `LION_PRIV_NMEMBERS` changed with it. Two new target-list
-kinds name a gathered `GROUP BY` column and a gathered aggregate (`LION_TL_SKEY`, `LION_TL_SAGG`).
-EXPLAIN prints `Group Key:` and `Store: col1, col2`, and with ANALYZE `Store Rows`, `Store Rows
-From Heap`, `Store Pages Absent` and `Store Groups`.
-
-**The cost rule as implemented** (`lion_cost_store_path()`, added to the count's own price before
-the competitor's units and the §39 margin are applied, as every term of the count is):
-
-	windows   = ceil(heap pages / 64)
-	touched   = windows * (1 - exp(-rows / windows))        windows holding a kept row
-	perwindow = max(store_pages / windows / nstored, 1)      one column's store pages a window
-	gather    = rows * ncols * LION_STORE_VALUE_COST
-	          + touched * ncols * perwindow * LION_STORE_PAGE_COST
-	hash      = rows * (LION_DECODE_HASH_ROW_COST + (ngroup - 1) * LION_DECODE_ROW_COL_COST)
-	                                                          when there is a GROUP BY
-	          + rows * naggs * cpu_operator_cost
-	          + rows * ndistinct * LION_DECODE_HASH_ROW_COST
-	          + (groups + distinct pairs) * cpu_operator_cost
-
-with rows the rows the WHERE keeps (`rel->rows`), ncols the gathered columns, nstored the columns
-the index stores (`store_pages` counts them all, map pages included), and the path's rows the
-estimated groups. Departures from the design's rule: the value cost is one constant per value, not
-a code width times a decode rate; the page cost is apportioned by column and paid only in the
-windows a kept row is in; the map's reads are not priced apart (its pages are in `store_pages`);
-and an ABSENT page's or a dirty page's heap fetch is priced as the count already prices its
-recheck, nothing more. A window's pages are priced once, because the entries the count would
-sum are merged under a gather (above). The per-row terms are the decoded walk's release-build
-constants (§34); they were not refitted for the gather's fmgr hash and equality calls. `store_pages` is subtracted from the posting pages at the three sites Phase
-A named (`lion_plan_cost.c`, `lion_plan_fkjoin_cost.c` twice), read from the meta record by
-`lion_index_store_pages()`.
-
-**Tests.** `test/sql/store_count.sql`, every answer compared with a sequential scan with the
-pushdown off: the plans with their `Store:` line; `GROUP BY` with `count(*)` and `count(x)`, the
-NULL group, `count(DISTINCT)` not counting NULL, min and max ignoring it; int2, int4, int8, date,
-timestamptz, uuid and numeric as `GROUP BY` columns and under `count(DISTINCT)`; sums past int8's
-range; `GROUP BY` two columns; a WHERE on a multi-key column (`@>` and `&&`) with a stored INCLUDE
-column grouped; no WHERE; key columns both walked and stored, with §37's walk, the decoded walk and
-the gather shown by toggling `pg_lion.enable_decoded_walk`; a range beside another clause
-(walked inside where a count alone takes the complement, and probed); dirty pages (updates, deletes, inserts,
-and an open transaction's changes) and the same after VACUUM; nothing matching; a correlated
-subquery's rescans; the shapes declined; an ABSENT window (all from the heap, mixed, all from the
-store); a text column under an ICU collation (min and max in its order) and under a
-case-insensitive one (`GROUP BY` and `count(DISTINCT)` folding case), clean and dirty.
-`store_count_1.out` is that file without the ICU part, for a build without ICU, as
-`ordered_collate` and `countcoll` have.
-
-**Measured.** An assert-enabled build (`-O1`), warm shared buffers, no parallel workers; a
-synthetic table of 2,000,000 rows, `(id int, k int4, g int4, v int8, pad text)` with `k` = id mod
-100, `g` 20,000 values and a 40-byte pad, 24,692 heap pages, all-visible; `lion (k) INCLUDE (g,
-v)`, whose store is 3,473 pages. Medians of seven runs, the gather against the same build with
-`pg_lion.enable_count_pushdown = off` (the plan the base branch makes, which has no path for an
-INCLUDE column):
-
-| query | rows kept | gather | before |
-| --- | --- | --- | --- |
-| `g, count(*), sum(v) WHERE k < 10 GROUP BY g` | 200,000 | 27.7 ms | 124.1 ms (bitmap heap scan, HashAggregate) |
-| `count(DISTINCT g) WHERE k IN (3, 7, 11)` | 60,000 | 11.2 ms | 53.3 ms (index scan, Sort, Aggregate) |
-| `sum(v), min(g), max(g) WHERE k = 42` | 20,000 | 13.4 ms | 35.5 ms (index scan, Aggregate) |
-| `g, count(*), sum(v) WHERE k < 90 GROUP BY g` | 1,800,000 | 169 ms | 556 ms (seq scan, HashAggregate) |
-| `g, count(*) GROUP BY g` (no WHERE) | 2,000,000 | 137 ms | 501 ms (seq scan, HashAggregate) |
-
-In an earlier run, before the entries were merged under a gather, the first took 77 ms and the
-fourth 660 ms (best of four), which lost to the `HashAggregate`'s 492 ms then.
-
-**What is left.**
-- A `GROUP BY` that mixes a walked column with a stored one, and columns stored by two indexes:
-  every gathered column is in one index's store, and every `GROUP BY` column is gathered.
-- A parallel gather: the node's partitioned mode would need partial aggregate states for sum,
-  avg, min, max and `count(DISTINCT)`. A partitioned table does without them, counted a partition
-  at a time into one set of groups ("As built: partitioned tables", below).
-- Spilling past `hash_mem`, which the planner declined: built in "As built: spilling", below.
-- Expressions: an aggregate argument or a `GROUP BY` item that is not a plain column, and a target
-  that is an expression of a `GROUP BY` column.
-- float8 and numeric sums and averages; `FILTER` and ordered aggregates.
-- Shape 2 (LionOrdered) and the index-only scans are the other Phase B branches; shape 4 (the
-  join's keys) is not built.
-- A gather in place of the decoded walk's reconstruction, as the design has it, for a `GROUP BY`
-  of key columns both walked and stored under a WHERE.
-- The per-row prices measured on a release build; the numbers above are an assert build's.
-- An isolation test racing VACUUM against a parked gather: the interlock is the count's (§9),
-  which `test/isolation` already races, and the store reader's own race is Phase A's
-  `store_vacuum_reader.spec`; none drives the two together.
-
-### As built: partitioned tables (2026-10-03)
-
-The gather of "the count's shapes" over a partitioned table. A partitioned parent takes the store
-path when every live leaf partition has a lion index that stores every gathered column; the node
-counts each leaf in turn, as §16 counts one, and gathers its rows from that leaf's own store.
-Where it departs from §16 and from the one table's gather, and why:
-
-**One set of groups, not partial aggregates.** §16's `GROUP BY` over partitions emits partial
-rows per partition under core's Finalize HashAggregate. The gather does not: the node hashes every
-partition's rows into its one hash table, emits the final groups when the last partition has been
-counted, applies the `HAVING` itself as it does over one table, and has no Agg above it. Three
-reasons. `count(DISTINCT c)` has no partial state: two partitions' distinct counts cannot be
-added, and a Finalize Agg could only merge them if the partials carried the values themselves.
-The sums' partial states are core's internal ones - for int8 a 128-bit accumulator, serialized by
-`int8_avg_serialize()` - which the node would have to build to core's layout. And the store path
-over one table bounds its groups by `hash_mem` - by a plan-time guard when this was built
-(`lion_store_hash_bytes()`), by a spill since "As built: spilling" below: holding every
-partition's groups is bounded the same way, while partials would hold one partition's groups at a
-time but emit a group once for every partition it has rows in, for a Finalize Agg to hash them all
-again.
-
-**The planner** (`lion_plan_count.c`). `lion_try_store_path()` no longer returns for a partitioned
-table. The leaves are §16's targets (`lion_collect_targets()`): the live leaves after plan-time
-pruning, a clause a leaf's bounds imply having no index there (`LION_PRIV_IMPLIED`).
-`lion_store_relations()` translates each gathered column of the parent into each leaf's own,
-through every level of partitioning (`lion_store_leaf_var()`,
-`adjust_appendrel_attrs_multilevel()`), and asks `lion_find_store_index()` of the leaf's
-RelOptInfo, which takes the index storing fewest columns when several qualify; the leaf's target
-keeps it (`LionCountTarget.storeidx`). A leaf without one declines the whole query, as a leaf
-without an index for a WHERE clause does (§16): the node forms one set of groups and has no
-per-partition fallback. §16's other bounds stay: partitionwise aggregation declines the node, the
-FK-side join gathers nothing, the gather has no parallel form, and run-time pruning is not done.
-The cost (`lion_cost_store_path()`) is the rule above summed over the leaves, each with its own
-heap pages, windows, rows kept and store pages; the (groups + distinct pairs) term is paid once.
-
-**The estimate** (`lion_store_estimate()`). The groups the node forms are estimated
-as the SUM over the live leaves of each leaf's own estimate - `estimate_num_groups()` of the
-leaf's own columns over the rows its WHERE keeps, capped by those rows - and a `count(DISTINCT)`'s
-(group, value) pairs the same way. A group with rows in several partitions is counted once for
-each, so the sum is at least the groups formed, and the memory compared with `hash_mem` errs
-toward pricing a spill the node may not need (toward declining, while the planner declined past
-`hash_mem`; "As built: spilling", below). The parent's estimate is not used for it: a partitioned
-parent is never auto-analyzed, so its statistics are missing or as old as the last manual ANALYZE,
-while the leaves' are kept current. The path's rows are the fewer of the parent's estimate and the
-sum. A column's width is the widest leaf's (`lion_store_width()`): `get_attavgwidth()` reads a
-relation's own statistics, and a partitioned parent has only its inheritance tree's.
-
-**The plan.** Member 19 (`LION_PRIV_STORE`) names one index per live leaf, in member 5's order, and
-its column numbers are 0 for a partitioned table: a leaf's index may place the columns differently,
-and the executor finds each relation's from the index it opens. The `LION_PRIV_MAGIC` changed with
-it (shape 23).
-
-**The executor** (`lion_exec_store.c`). `lion_store_begin()` accepts partitions and puts each
-leaf's store index in its `LionPartState`, which `lion_open_parts()` opens and `lion_close_parts()`
-closes with the leaf's other relations. `lion_store_count()` gives each partition its turn as
-`lion_run_partition()` does - its relations opened, its WHERE located, its rows counted, what it
-located released, its relations closed, so no pin outlives the turn (§16) - and
-`lion_store_count_relation()` counts it with a gather over its own store into the one hash table.
-Each gathered column is found by its place in that store from the leaf's own column number
-(`lion_heap_attno_in()`, by name, as the node finds every partition's columns); its type is the
-parent's in every leaf, so the groups hash and compare alike. The check that the rows handed over
-are the rows counted holds per partition, and the gather's counters are summed over the
-partitions. `lion_exec_custom_scan_internal()` sends a partitioned node with a gather to
-`lion_store_next()`, which counts every partition before its first row; a rescan resets the groups
-(`lion_store_reset()`) and counts them all again.
-
-**EXPLAIN** is the one table's - `Custom Scan (LionCount)` with `Group Key:` and `Store:`, and no
-Finalize Agg above it - with §16's `Partitions:` line. ANALYZE's `Store Rows`, `Store Rows From
-Heap` and `Store Pages Absent` are totals over the partitions, and `Store Groups` the groups formed
-over all of them.
-
-**Tests.** `test/sql/store_partition.sql`, every answer compared with the plan with the pushdown
-off: a list-partitioned table of four leaves - one with a dropped column, one partitioned again by
-range, one with its columns and its INCLUDE list in another order and a second, narrower lion index
-storing only the group column - whose groups span partitions, with the NULL group and sums past
-int8's range. The plans (`Store:`, the `HAVING` as the node's filter, no Agg) and ANALYZE's totals;
-`GROUP BY` with every aggregate, two columns and `count(DISTINCT)`, `HAVING`, `ORDER BY`; no `GROUP
-BY`, no WHERE, nothing matching; clauses a leaf's bounds imply, at both levels; pruning to one
-partition and to none; the narrower index read for the group column alone and the wider one for a
-sum (`pg_statio_user_indexes`); the declines - a leaf whose index does not store a column and a
-leaf with no lion index, and the path taken again where pruning excludes it; dirty pages in one
-leaf, an open transaction's changes, and all from the store after VACUUM; correlated subqueries'
-rescans; and, under a small `work_mem`, groups past `hash_mem` that the parent's stale statistics
-would have let through the guard, which declined them until "As built: spilling" below and which
-now spill. The output names no actual rows, no SubPlan and no counter that depends on the heap's
-page layout, so it is one file for every major.
-
-**What is left.**
-- Partial aggregates, for a parallel gather (above). A partitioned table larger than `hash_mem` in
-  groups was here too; the node spills its groups since "As built: spilling", below.
-- Run-time pruning, as for every partitioned count (§16).
-- A leaf's store index is the one storing fewest columns, not priced against the others.
-
-### As built: spilling (2026-10-03)
-
-The gather's hash table past `hash_mem`, spilled to batch files as core's HashAggregate spills its
-own (`nodeAgg.c`), so that the planner no longer declines a store path whose groups or
-`count(DISTINCT)` pairs would not fit, and the node's tables stay within `hash_mem` whatever the
-estimate said. The answer is the one the node gave in memory. Where it follows nodeAgg and where it
-departs, and why:
-
-**The memory check** (`lion_store_check_group()`, `lion_store_check_pair()`). After every new group
-and every new (group, value) pair of a `count(DISTINCT)`, the node compares what the groups' context
-has allocated - `MemoryContextMemAllocated()`, the pairs' child context included: the groups, their
-keys and extremes, the distinct values and both hash tables - with `get_hash_memory_limit()`. Past
-it the rest of the pass is in spill mode. The check comes after the entry has gone in, as
-`hash_agg_check_limits()`'s does, so a pass always keeps one entry and gets somewhere however little
-room it has. One departure: with a `count(DISTINCT)` the groups alone, the context without its
-pairs' child, are also held to half of `hash_mem`. The pairs that come for a pass's groups after it
-began to spill are counted from their batches beside those groups, in what they leave of `hash_mem`;
-groups that had filled it left a batch of pairs no room, and in a first build one test's query took
-64,450 batches, each keeping a pair or two. The tables' contexts also grow from small blocks to
-blocks of a sixteenth of `hash_mem` at most, as `hash_create_memory()` sizes a HashAggregate's under
-a small `work_mem`, and a pass's tables start at no more than 256 entries, so that the check is not
-made a block of several times the limit too late and an empty pass costs little.
-
-**Spill mode** (`lion_store_add()`, `lion_store_add_pair()`). No new group and no new pair enters a
-table. A row whose group the table does not hold is written to a batch file of groups, the partition
-chosen by the next bits of the group's hash (`lion_store_group_hash()`, the columns' hash functions
-combined as `execGrouping.c` combines them, then `murmurhash32()`); a row of a group the table holds
-updates it as before, and a `count(DISTINCT)` value the group has not had - a pair the table does
-not hold - is written to a batch file of pairs, by the next bits of the pair's hash. A row is its
-hash and a `MinimalTuple` of every gathered column over a `TupleDesc` of their parent's types
-(`lion_form_minimal_tuple()`, `lion_compat.h`, over 18's extra argument); a pair is its hash, the
-group's id, the aggregate's number and a tuple of the value alone. The partitions are chosen as
-`hash_choose_num_partitions()` chooses them (`lion_spill_num_partitions()`): 1.5 times what the
-input's estimate over `hash_mem` asks for, between 4 and 1024, a power of two of the bits the hash
-has left - one partition when none are left, a pass still keeping one entry - and no more than keep
-a block's buffer for every open file within a quarter of `hash_mem`, the batches still waiting and
-the one being read counted in: a BufFile holds its buffer for as long as it is open. The first
-pass's estimate is the plan's; a batch's is the HyperLogLog of the hashes written to it
-(`LION_SPILL_HLL_BIT_WIDTH`), and its `used_bits` advance by the bits its spill took. A partition's
-file is `BufFileCreateTemp(false)`, made at its first record.
-
-**The passes** (`lion_store_pass_begin()`, `lion_store_pass_end()`, `lion_store_next()`). The count
-is the first pass. At a pass's end its spill of groups goes onto a stack of batches, and its spill
-of pairs is counted at once: each batch of pairs, deepest first, into a fresh table in the pairs'
-context, a pair new to that table adding 1 to its group's count - the group found by its id
-(`run->byid`), which the pass still holds - and a batch that overflows split again by the next bits
-of the pair's hash. Then the pass's groups go out, and `lion_store_next()` is a loop: the next group
-of the pass, or, when there is none, the next batch of groups off the stack, deepest first, read in
-a pass of its own under the hashes it was written with, which may spill rows and pairs a level
-deeper and counts its pairs the same way before its groups go out; until the stack is empty. Without
-a `GROUP BY` only pairs spill, and the one row waits for them. The rows are counted once, at the
-gather (`run->rows`, and the check that the count handed over the rows it counted, per partition),
-not again as a batch replays them; `Store Groups` counts every pass's.
-
-**Why no pair is counted twice.** In spill mode no new pair enters the table, so a pair is written
-to a batch only when the table does not hold it - and then it never held it, since nothing leaves a
-table before its pass ends: the pair was not counted in memory. Every later row of the pair has the
-same hash and goes to the same partition, so one batch holds every occurrence memory did not count,
-and that batch's table counts it once; a batch that spills again keeps the same rule a level deeper.
-Nor is a group split: once a pass is spilling no group enters its table, and a group in it keeps its
-rows to the pass's end, so a group's rows - and with them its distinct values - are all in memory or
-all in one batch, as a HashAggregate's are. The pass's pair table may therefore go before its
-batches of pairs are read.
-
-**Files and memory.** A batch's file is closed once the batch has been read (`lion_batch_close()`),
-and every file still open at a rescan and at the node's end (`lion_store_close_files()`, from
-`lion_store_reset()`); an error leaves them to the resource owner, as for every temporary BufFile.
-The spills, the batches and the files' own structs and buffers are in a context of their own
-(`LionCount store spill`), reset with them.
-
-**EXPLAIN ANALYZE** adds `Store Batches` - 1 when nothing spilled and one more for every batch of
-groups or pairs written, as a HashAggregate's `Batches` - and `Store Disk Usage` in kB, the most the
-open batch files held at once. Departure: nodeAgg measures `hash_disk_used` from its tape set's
-blocks, which the `BufFileSize()` of each file would give here, but `BufFileSize()` asserts a
-FileSet on 16 and 17 and a file of `BufFileCreateTemp()` has none (the assertion went in 18, not
-backpatched), so the node sums the bytes written to the files still open. Both accumulate over
-rescans, as `Store Groups` does.
-
-**The planner** (`lion_try_store_path()`). The guard is gone: groups and pairs past `hash_mem` are
-priced, not declined, from the memory `lion_store_hash_bytes()` estimates, the pairs' part of it
-apart. That estimate was a constant per group and per aggregate (64 and 48 bytes), which a guard
-could live with; priced, it put the 20,000 groups of `g, count(*)` in the spill test at 1.7 MB,
-where the node used 4.4. It is now what the node allocates, from functions of the executor beside
-the structs they measure (`lion_store_chunk_bytes()`, `lion_store_group_bytes()`,
-`lion_store_pair_bytes()`): a group's struct rounded up to its AllocSet chunk with the chunk's
-header, its keys' and nulls' arrays the same way, its entry in the table of groups and, beside a
-`count(DISTINCT)`, its place by id, each at the average fill of a table that doubles at 0.9 full,
-and a copy of every by-reference key and min or max (`storeextvars`) at its column's average width;
-a pair, its entry and its value's copy the same way. Measured through a cursor
-(`pg_backend_memory_contexts` after the first row) on that table it is 5 to 14% under what the
-groups use - 192 bytes a group against 218 for `g, count(*)`, 612 against 647 with six aggregates
-and a `count(DISTINCT)` - and the pairs 48 against 55 to 72, by the table's fill. Member 19
-(`LION_PRIV_STORE`) carries the estimates of the groups and the pairs, capped at `INT_MAX`, for the
-first pass's partitions as an Agg's `numGroups`; `LION_PRIV_MAGIC` changed with it (shape 24). The
-partitioned estimate - the sum over the leaves - is as it was.
-
-**The cost rule as implemented** (`lion_cost_store_spill()`, from `lion_cost_store_path()`) is
-`cost_agg()`'s for an `AGG_HASHED` spill, added only when the estimated memory - or, beside a
-`count(DISTINCT)`, twice the groups' own - exceeds `hash_mem`, so a path that does not spill is
-priced as before:
-
-	mem_limit, ngroups_limit, partitions = hash_agg_set_limits(entrybytes, entries)
-	nbatches = max(ceil(max(entries * entrybytes / mem_limit, entries / ngroups_limit)), 1)
-	depth    = ceil(log(nbatches) / log(max(partitions, 2)))
-	pages    = tuples * (MAXALIGN(width) + MAXALIGN(SizeofHeapTupleHeader)) / BLCKSZ
-	startup += pages * depth * 2 * random_page_cost + depth * tuples * 2 * cpu_tuple_cost
-	total   += the same + pages * depth * 2 * seq_page_cost
-
-nothing when nbatches is 1. It is applied once with a `GROUP BY`, the groups the entries, the memory
-over the groups each (beside a `count(DISTINCT)`, twice the groups' own where that is more, since
-they are held to half of `hash_mem`), every row the WHERE keeps the tuples, and the gathered
-columns' summed widths (`lion_store_width()`) the width; and once with a `count(DISTINCT)`, the
-pairs the entries, the pairs' memory over the pairs each, every row once per distinct aggregate the
-tuples, and the widest distinct column with a group id and an aggregate number the width
-(`lion_store_spill_widths()`). As in `cost_agg()` the writes are at `random_page_cost` and the reads
-at `seq_page_cost`, both twice over, and the spill's CPU is paid once a level.
-
-**Tests.** `test/sql/store_spill.sql`, every answer compared with the plan with the pushdown off,
-under `work_mem = 64` and `hash_mem_multiplier = 1`: a synthetic table of 60,000 rows whose 20,000
-groups take a `GROUP BY` with `count(*)`, `sum`, `min`, `max` and `count(DISTINCT)`, with a `HAVING`
-and over two columns, with a WHERE and with none; `count(DISTINCT)` of 30,000 values with no
-`GROUP BY`, and two at once; few groups with many distinct values; a range-partitioned copy whose
-groups span the partitions; a correlated subquery's rescans, one stopping after a few groups with
-batches unread; and a `work_mem` everything fits in, where `Store Batches` is 1 - 64MB,
-`./dev.sh`'s, set in the test, since at PostgreSQL's default of 4MB the first query's groups, 13 MB
-of them, spill. The whole suite ran on 18, and the three store tests on 16, 17, 19 and master too.
-ANALYZE's `Store Batches > 1` and `Store Disk Usage > 0` are printed as booleans, and nothing that
-depends on the page layout or the batches' exact number, so it is one file for every major.
-`store_count.sql`'s decline under a small `work_mem` is now a spill, and so is
-`store_partition.sql`'s over partitions; both files' ANALYZE output gains the two lines.
-
-**Measured.** An assert-enabled build (`-O1`) on 18, a synthetic table of 1,000,000 rows, a
-`GROUP BY` of 200,000 groups with `count(*)`, `sum`, `min` of a text column and `count(DISTINCT)` of
-300,000 values, the node's contexts sampled with `pg_log_backend_memory_contexts()` while it ran. At
-`work_mem = 64`: 10,921 batches, 10,920 temporary files (`log_temp_files = 0`) of 290 MB together,
-the largest 13 MB, a `Store Disk Usage` of 63,487 kB, 2.3 s; the groups' and pairs' contexts at most
-42 kB together, the spill's 50 to 158 kB, the node's at most 201 kB. At `work_mem = 1024`: 1,221
-batches, 62,923 kB at most on disk, 1.0 s; the tables at most 656 kB, the spill's at most 383 kB,
-the node's at most 1,039,392 bytes, under the 1,048,576 of `hash_mem`.
-
-**What is left.**
-- The files' buffers are outside the check, as nodeAgg's tapes' are, and a BufFile keeps its block
-  while its batch waits, where a tape frees its write buffer once rewound; nor are the expected
-  buffers taken off the tables' limit, as `hash_agg_set_limits()` takes them. At the minimum of 4
-  partitions, with a spill of rows and one of pairs open at once and the waiting batches' files, a
-  tiny `hash_mem` is exceeded several times over (201 kB at 64 kB above).
-- A held group's min or max of a variable-width type may still grow in spill mode, a new extreme
-  replacing the old, as a HashAggregate's transition state may.
-- A batch of pairs that cannot fit beside its pass's groups - groups whose extremes outgrew
-  `hash_mem` - keeps one pair a level; the half of `hash_mem` makes that unlikely, not impossible.
-
-### As built: Phase B, index-only scans (2026-10-02)
-
-What Phase B built for `amcanreturn` and `amgettuple`, and where it departs from "Index-only
-scans" above.
-
-**`amcanreturn`** (`lioncanreturn()`, `lion_am.c`) is `LionStoreCol.returnable` from the cached
-relation state: true for every INCLUDE column and every key column under `store_values` whose
-stored type is the index column's. A multi-key column is never stored and so never returned. A
-citext key column IS returnable: `citext_ops` has no storage type, and the store holds each row's
-own spelling (`store_ios.sql` shows `'Alice'`, `'ALICE'` and `'alice'` returned for
-`name = 'alice'`). A partitioned index has no pages: false there (get_relation_info() asks it too).
-
-**The tuple** is a heap tuple, `xs_hitup`, over a descriptor of each index column's own type -
-the heap column's, or the expression's - which is what the executor's scan slot is built from, and
-not `index_form_tuple()` over `xs_itupdesc`: that would compress every value past 512 bytes, row
-after row, refuse one past 8 kB, and has the opclass storage type where a heap-supplied value of
-the column's type goes. Columns the index does not return are NULL.
-
-**Where the values come from** (`LionIosState`, `lion_scan.c`), decided per batch - one container
-of the source, one window's members - right after it is loaded:
-
-- the store, for a batch the §9 interlock covers: the gather runs for every returnable column
-  under the pin the batch keeps (`xs_want_itup` turns dropPin off), one reader a column, opened by
-  the scan's first batch and reset per batch. `lion_source_interlocked()` says whether a batch has
-  the pin: SETS and LIST through `lion_source_pinned()` of the (batch's) tree, a WALK always, a
-  UNION and a WINDOW never;
-- the heap, fetched by the scan under its snapshot (`heap_hot_search_buffer()`, which takes the
-  serializable checks and the tuple's predicate lock), for a heap page the gather reports absent,
-  for every TID of a batch without the interlock, and for every TID of every batch where the scan
-  looked TIDs up in the heap before: a UNION, and a hot standby over a generic-mode index. The
-  values are `FormIndexDatum()` of the visible version; an invisible TID is skipped;
-- the heap too, for every TID, when the scan would recheck (`xs_recheck`) a key column it does
-  not return - the executor evaluates the recheck on the tuple handed to it. The planner does not
-  build such a path (below); this is the fallback that keeps one correct.
-
-A multi-key query's sets are no longer released before the scan when it is an index-only scan:
-they keep their leaf pins as far as the list pin budget goes
-(`lion_posting_set_lookup_budgeted_col()`), and a set past it, NOPIN, takes the batches it
-contributes to through the heap instead of setting the recheck. What the sets answer exactly
-(`LION_QMODE_KEYS`) is not rechecked by an index-only scan - the bitmap scan already trusts it -
-while mode ALL still is.
-
-**The planner** (`lion_ios_paths()`, `lion_selfuncs.c`): core builds an index-only path only when
-every column the query reads, its WHERE clause included, is returnable (`check_index_only()`), so
-`SELECT inc FROM t WHERE tags && '{a,b}'` never got one. lion's `set_rel_pathlist_hook` builds it:
-the key columns a restriction clause names, the output does not and the index cannot return are
-relaxed in a copy of the IndexOptInfo, `create_index_paths()` runs on a scratch copy of the
-relation that sees only the copies (no join clauses, no parallelism, as LionOrdered builds its
-lion side), and an index-only path is kept when every clause naming a relaxed column is one of its
-index clauses, not lossy, and the scan answers its quals with no recheck and not by a UNION
-(`lion_index_only_exact()`, from `lion_plain_scan_shape()`). The copy stays the path's index:
-createplan marks what it cannot return resjunk, and setrefs resolves the plan's recheck quals
-against the rest, relaxed columns among them. Unparameterized paths only; none for a relation an
-UPDATE, a DELETE or a row mark reads, nor for a query that needs no column.
-
-**The cost rule as implemented** (`lion_plain_heap_correlation()`, `lion_amcost.c`). An index-only
-scan that returns no column - `count(*)` - is priced as before. One that returns stored columns is
-the plain scan of its shape - the bitmap-like heap side of §29.11, its rechecks, its row and pass
-charges - with the heap's pages and per-row fetches scaled by `1 - allvisfrac`, as `cost_index()`
-scales its own ends for an index-only scan (a UNION is not scaled: the scan fetches every TID
-itself), plus the gather:
-
-    pages = max(1, store_pages / (W × nstored))
-    G = rows × nret × store_value_cost
-      + windows × nret × (pages × store_page_cost + random_page_cost + (pages - 1) × seq_page_cost)
-
-with nret the returnable stored columns (all of them: the AM is not told which the query reads),
-W the heap's windows (pages / 64), store_pages from the meta page, and windows the windows the
-batches touch - Cardenas's count of `rows` over W, interpolated to the share the rows cover by the
-column's correlation squared, once per pass of a WALK. The page costs are the tablespace's;
-`store_page_cost` (8 operator costs, 0.02) is the decoding of a store page and `store_value_cost`
-the value handed up, the CPU the custom nodes are charged for the same. Until 2026-10-03 those two
-were the whole price: lion's own constants, which the custom nodes are priced in and converted to
-their competitor's units at the margin (§39), but the index-only path is core's, priced beside
-core's index and bitmap scans with no conversion, and a store page was CPU while a heap page was
-I/O. Core's units for core's path: a window's chain of a column is one page found through the map
-and the rest read in order, each decoded ("As built: the price of the index-only scan", below).
-The gather is not the index's own cost: the
-bitmap scan of the same IndexPath is charged that and gathers nothing. It rides on the correlation
-handed to `cost_index()`, and what that cannot carry - nearly all of it on a mostly all-visible
-table, where both of `cost_index()`'s ends are near zero - is the remainder
-(`lion_plain_note_remainder()`), now noted for parameterized index-only paths too and charged by
-the hook to every index-only path in the relation's list, and to the hook's own before
-`add_path()`. A LIST's heap side stays `cost_index()`'s; its gather is the remainder. No margin
-is applied: the plain scan this extends applies none.
-
-**Tests.** `test/sql/store_ios.sql`: a scalar key under `store_values` with INCLUDE columns (NULL
-keys and values, a "C"-collated text column, values of 1,800 bytes); an array column's `&&`,
-`@>` and `IS NULL`, with a filter on a returned column; a tsvector's `@@` of `&` and `|`;
-`store_max_len`; ABSENT heap pages (and a walk that the planner keeps on the plain scan); a
-multi-key query past the pin budget of a temporary table (12 leaves), whose batches go to the
-heap; the plans taken for `SELECT *`, the array column in the output, `<@`, `@> '{}'`, `!` and a
-prefix; citext. Each answer is compared row by row, as its text spelling, with a sequential
-scan's: clean, with updates and deletes not vacuumed (`Heap Fetches` > 0), and after VACUUM
-(`Heap Fetches: 0`). The recovery harness: three index-only queries over the two store indexes in
-`lion_rec_queries()` (checked after every crash and on the standby, and their node named
-`indexonly`), and `standby_index_only()` now returns stored columns - a scalar key with INCLUDE
-columns and INCLUDE columns under `&&` - on the standby against its sequential scan and the
-primary, clean, dirty and after VACUUM, in both WAL modes.
-
-**Plans that change.** No regression test's. In the recovery harness, `count(*)` and `GROUP BY`
-queries over `lion_rec` whose columns `lion_rec_st` stores now plan an index-only scan of it
-where the count pushdown answered before (its price is above the index-only scan's): `k4 = 3 AND b`, `k4 = 5 AND t = 'v13'`, `nn` grouped under `k4 = 7` and others. A test
-that wants LionCount over an index with stored columns now competes with that path.
-
-**What is left.**
-- The scan gathers every returnable stored column, whichever the query reads; an `INCLUDE` list
-  wider than the query pays for all of it.
-- The gather walks a window's chain from its head on every call, so a scattered result - a few
-  rows a window - reads most of each window's store pages: measured warm (release build, 2M rows,
-  52 a page), `k = 42` returning two INCLUDE columns beside a stored key read 7,443 buffers in
-  2.8 ms against the plain index scan's 2,005 in 0.9 ms, while `tags && '{t7,t8}'` (20,000 rows)
-  read 6,030 in 8.2 ms against 10,014 in 10.1 ms. The price of those pages is core's since
-  2026-10-03 (below); the chain walk itself remains.
-- Parameterized index-only paths come only from core (every column they filter on returnable);
-  the hook builds unparameterized ones.
-- EXPLAIN says nothing of the batches that went to the heap (absent pages, NOPIN sets); core's
-  `Heap Fetches` counts only its own.
-
-### As built: the price of the index-only scan (2026-10-03)
-
-Measured on the quick benchmark's `fact` table at 5M rows (752 MB, 52 rows a page, 1,500 windows;
-release build, warm) with `lion (c200) INCLUDE (c20, c20k, id, payload)` (474 MB, 58,595 store
-pages: `id` 6,010, `c20k` 3,005, `c20` 1,503, `payload` 48,077): `sum(id), sum(length(payload))
-WHERE c200 = 17` (24,959 rows, 0.5%, scattered over every window) read 62,388 buffers through the
-index-only scan - the whole store and the map, and the same 62,388 whether the query read `id`,
-`payload` or both - in 64 ms warm and 412 ms cold, against the heap index scan's 21,974 buffers in
-21 ms warm and 157 ms cold; the planner priced the index-only scan at 2,826 and the heap scan at
-57,998 and took the index-only scan. At 5% (`c20 = 3`, 250,362 rows) the index-only scan reads the
-same store pages (57,159) in 125 ms and the heap scan 89,653 in 473 ms, and the index-only scan is
-the right choice.
-
-The gather of the index-only scan is now priced in core's units (`lion_ios_gather_cost()`): for
-every window the batches touch, every returnable column's chain at `random_page_cost` for its
-first page and `seq_page_cost` for each page after it, plus `store_page_cost` for the decoding of
-each, and a value of each column for every row at `store_value_cost`. The 0.5% scan prices at
-about 81,000 against the heap scan's 57,000, and the heap is taken: measured again with the OS
-cache dropped, the two are even cold (645 ms against 637 ms) and the heap scan is 2.9 times faster
-warm (27 ms against 78 ms). The same four columns for the 5% filter (`lion (c20) INCLUDE (c200,
-c20k, id, payload)`) price at 94,000 against the heap scan's 104,000: the store is taken, 1.5
-times faster cold (547 ms against 826 ms) and 3.5 times warm (152 ms against 529 ms). With four
-narrow stored columns instead (`lion (c200) INCLUDE (id, c2, c20, c20k) WITH (store_values = on)`, 121 MB,
-`sum(id), sum(c20k)` for the same filter) the index-only scan reads 21,000 pages against the heap
-scan's 22,000 and prices at 37,000: it is taken, and it is 4.5 times faster than the heap scan
-cold (136 ms against 608 ms, the OS cache dropped) and 1.8 times slower warm (41 ms against 23 ms),
-which is what core's page costs say of chains read in order against pages read at random. At 5%
-(`c20 = 3`, 250,362 rows, `lion (c20) INCLUDE (id, c2, c200, c20k)`) the index-only scan reads
-18,000 pages against the heap scan's 90,000 and is 37,000 against 104,000: taken, and 6.7 times
-faster cold (209 ms against 1,399 ms), 5 times warm (103 ms against 523 ms, the heap not fitting
-shared_buffers). `pg_lion.store_page_cost` and `pg_lion.store_value_cost` keep pricing the custom
-nodes' gathers as before, in lion's units under §39's conversion, where the measured times have
-shown no mispick: LionCount's gather reads only the columns it needs (6,010 pages for `sum(id)`,
-13.9 ms against the heap's 20.8 ms at 0.5%; 47,446 for `count(DISTINCT payload)`, 53 ms against
-the heap's 120 ms), and its competitors pay their sorts and hashing. What the index-only scan
-still does - gather every returnable column, walk a window's chain from its head, once per pass
-of a WALK - is unchanged, and priced for. On the small tables of
-`test/sql/store_ios.sql` the heap now wins some of the scans the file exercises, and no setting
-puts the index-only scan of a lion index ahead of the plain scan of the same index
-(`enable_indexscan = off` takes both away; `store_page_cost = 0`, which the file used, no longer
-touches it). The section on a stored key keeps the heap scans out (`enable_seqscan`,
-`enable_bitmapscan`), which is enough: with the key stored, core builds the index-only path and no
-plain one beside it, so a WALK of five entries over the five windows of 287 pages is still the
-index-only scan. The ABSENT section's six rows on nine pages were a plain scan, so its table was
-reshaped until the index-only scan is the planner's own choice: the short rows spread ten to a
-page by a column the heap neither compresses nor toasts, a key of fifty rows scattered over as
-many pages, four of them on the ABSENT pages. A section of its own shows the choice on a table of
-200,000 rows: the heap for a few hundred rows scattered over every window, the store for a tenth
-of the table. The file turns the row gather (below) off: it answers the same queries from the same
-stores and undercuts the index-only scan on tables this small.
-
-### As built: the row gather (2026-10-03)
-
-`LionStoreScan` (`lion_ordered.c`, beside `LionOrdered`, whose set it shares): a plain scan of the
-rows an AND/OR of lion indexes keeps, returning every column the query reads from the window
-stores of the relation's lion indexes, and reading the heap only for the rows the stores cannot
-answer for. Each column may come from a different index: a key column of an index built with
-`store_values`, or an INCLUDE column, of any lion index of the table. Over the quick benchmark's
-table with `(c2) INCLUDE (id)`, `(c20) INCLUDE (id)`, `(c200) INCLUDE (id)` and `(c20k) INCLUDE
-(id)`, each under `store_values`:
-
-```
-SELECT id, c2, c20, c200, c20k FROM fact WHERE c200 IN (17,18,19) AND c20 IN (3,4,5);
-
- Custom Scan (LionStoreScan) on fact
-   Lion Cond: ((c200 = ANY ('{17,18,19}'::integer[])) AND (c20 = ANY ('{3,4,5}'::integer[])))
-   Lion Indexes: fact_c200, fact_c20, fact_c2, fact_c20k
-   Store: id, c200 (fact_c200)
-   Store: c2 (fact_c2)
-   Store: c20 (fact_c20)
-   Store: c20k (fact_c20k)
-```
-
-The name: the count engine has its `LionGather` already (the gather of a count's stored columns,
-`lion_count_int.h`), and core's `Gather` is parallel query's; a node that returns a relation's
-rows is a scan, as `LionCount` and `LionOrdered` are named for what they answer.
-
-**The planner** (`ls_add_paths()`, from `lion_ordered_set_rel_pathlist()`;
-`pg_lion.enable_store_scan`, off by default while its price is settled). For a relation `lo_rel_ok()` accepts and a query with a
-WHERE clause, the columns to return are the Vars of the relation's target, through placeholders
-(`ls_target_attnos()`): plain columns only - a whole-row Var or a system column declines, which
-takes in every row mark's ctid, so the rows of an UPDATE, a DELETE, a FOR UPDATE and an
-EvalPlanQual recheck are never this node's - and at least one, since a query that reads no column
-has nothing to gather (a count is `LionCount`'s). Before any index is opened the catalog says
-whether each of them is a column of some lion index at all, and only the stores with a column the
-scan could take have their meta page read: most queries pay nothing for the node. Then, for each
-lion access `lo_lion_accesses()` builds - the AND/OR trees `LionOrdered` streams, the same
-`lo_lion_tree()` / `lo_lion_qual()` / `lo_residual()` analysis:
-
-- a lossy lion clause declines: the store's value cannot stand for a row that must be rechecked;
-- the restriction clauses the lion side does not answer (`lo_residual()`) are the node's filter,
-  and the columns they read must be gathered too;
-- the access must stream (`ls_tree_ok()`): every leaf exact (`lion_plain_scan_passes()`,
-  `lion_amcost.c`, from `lion_plain_scan_shape()`: no recheck, no UNION); an AND's first LEAF
-  child is its DRIVER, whose pieces may come in several passes - a WALK, an IN list longer than
-  `lion_scan_list_batch()` - and its other children one set, priced (`ls_set_bytes()`) within
-  `hash_mem`; an OR's children each one ascending run of container keys, so an OR with a range
-  arm declines;
-- every column to gather must be stored as its own datum (`LionStoreCol.returnable`), in the
-  table's type, by a lion index that is not partial or whose predicate the query implies
-  (`ls_store_cols()`). Each comes from the index with the fewest store pages a window of it, and
-  among those within a tenth of each other from one already chosen - one chain fewer to find a
-  window - then one the set reads (`ls_choose_sources()`).
-
-The path is unparameterized, not parallel, and has no pathkeys.
-
-**The price** (`ls_cost()`), as `lo_cost_store()` prices the store order's set and gather, offered
-at the margin (§39) as `LionOrdered` is:
-
-- start-up: the lion side's cost (`cost_bitmap_tree_node()`), the AND's set built in it;
-- a container's work a piece: Cardenas's count of the members over the windows, once a pass of
-  the driver;
-- for the members on all-visible pages (`allvisfrac`), `store_value_cost` a value of each column;
-  and for each column the store pages a window it touches reads: a gather walks the window's
-  chain from its head to the page of its last member, `1 + (P - 1) m / (m + 1)` of a chain of `P`
-  pages for `m` members, each `store_page_cost` and its read. `P` comes from a model of a window's
-  bytes (`ls_window_bytes()`: DICT codes for a column of few values, the values themselves for
-  one of many), scaled so that an index's stored columns add up to the store pages its meta record
-  counts;
-- the read is priced as `cost_bitmap_heap_scan()` prices a heap page (`ls_store_page_price()`):
-  `random_page_cost` among few of the column's store pages, moving to `seq_page_cost` by the
-  root of the share read. It is not argued down for residency as the count's index pages are
-  (§39, "Resident index pages"): those compete with plans charged nothing for the same work,
-  where a store page here stands in for a heap page that core charges as I/O however cached it
-  is, and a store page takes about a heap page's time to reach. Priced as a buffer hit, the
-  first build put the node within an eighth of the index scan for `c20k IN (100, ..., 109) AND
-  c2 = 1` - 2,532 candidates, 15,257 buffers against the index scan's 2,509, four times its time
-  in an assert-enabled build - where it is 2.4 times the index scan's price now: a few rows'
-  gather reads a chain in each of their windows for each column, an index scan a heap page a row;
-- and for each column and window, the page of the store's map that names the chain's head
-  (`lion_storemap_head()`), which every gather reads again: in the windows' order, so
-  `seq_page_cost` each. It is as many buffers as a chain of one page, and two of every five a
-  sparse result reads (five columns, a row or three a window). Counted, it moved the node off
-  `c20k IN (...)` of 20 values (5,062 rows: 18,876 buffers against the index scan's 4,965);
-- the members on the other pages fetched from the heap, as §9 prices a recheck;
-- `cpu_tuple_cost` and the filter a member, the target a row returned.
-
-**The executor** (`ls_start()`, `ls_next()`). Each scan opens one reader a gathered column
-(`lion_store_open()`) and a cursor over the lion tree (`LsCursor`), which hands the set out one
-piece - the members at one container key - at a time, with the members it is sure of and the ones
-it holds the §9 pin for:
-
-- LEAF: a lion source opened with `keeppins`, its containers handed out as they come, pinned when
-  the source is exact and still holds the page's pin (`lion_source_interlocked()`, exported from
-  `lion_scan.c` for this);
-- AND: the driver streamed, the other children built first into one set without pins
-  (`lo_build_node()`), which masks each of the driver's pieces. Every member of the AND is a
-  member of the driver's piece, so the driver's pin is the interlock for all of them, as one pin
-  is for the count (`lion_count_int.h`). A mask that outgrew `hash_mem` and degraded (§30.4)
-  leaves the driver's piece whole at its keys, every member rechecked from the heap;
-- OR: the children merged by container key, a member pinned when a child holding it held its
-  pin; a row two of them hold is returned once;
-- SET: a child of an OR that does not come as one ascending run at run time - the shape is the
-  source's to decide, and a generic plan's parameter can make an IN list long - is built into a
-  set without pins and handed out key by key, every member from the heap; a key the set dropped
-  when it degraded is every TID of its window's heap pages, each rechecked.
-
-For each piece (`ls_piece()`) the visibility map is read for the heap pages its pinned members lie
-on, the pinned members on all-visible pages are gathered - a source's columns each by one
-`lion_store_gather()` for the same members, aligned by position - and a heap page the store reports
-ABSENT is dropped from them (`Store Pages Absent`). Then one tuple a member, in TID order: a member
-the store served is a virtual tuple of the gathered values, NULL in every column the plan does not
-read (`ls_begin()` checks that its target and filter read only gathered ones); any other is
-fetched from the heap with the scan's snapshot (`lo_fetch_tid()`, which takes the serializable
-checks and the tuple's predicate lock), copied into the scan slot, and rechecked against the lion
-side's qual when its piece was not sure. Under SERIALIZABLE a heap page the store served takes a
-page predicate lock, as the count takes one. On a hot standby over a generic-mode index every row
-comes from the heap (§9, "Hot standby").
-
-One window of rows at a time and no spill: a piece is one container, its gathers one window's
-values a column. The AND's mask is the only set; the planner declines one priced past `hash_mem`,
-and one that grows past it at run time degrades as above.
-
-**Pins.** Between two rows the node keeps the pins its streamed sources hold - opened with
-`keeppins`, as lion's index-only scan opens its source (§29.5): each located set's page and the
-posting leaf each stream stands on, a walk's leaf - since the piece it is returning came from them
-and an OR's children's pieces wait on them. A cursor paused between two FETCHes keeps them, and
-VACUUM's cleanup lock on those index pages waits for it, as it waits for an index-only scan's;
-the AND's mask holds none. They are let go at the end of the stream, at a rescan and at the end of
-the node. (`LionCount`, which pauses between groups only, holds none: countpause.sql.)
-
-**EXPLAIN**: `Lion Cond`, `Lion Indexes` (the set's, then the stores'), a `Store: <columns>
-(<index>)` line a source (a `Store` list in the structured formats); under ANALYZE `Store Rows`
-(rows the stores answered for), `Store Rows From Heap`, `Store Pages Absent`, `Heap Fetches`,
-`Rows Removed by Lion Recheck` when anything was rechecked, and `Lion Set: N containers,
-exact | rechecked | degraded`, with `, N scans` after a rescan. The counters add up over rescans.
-
-**The private layout** (`LS_PRIV_*`, `lion_ordered.c`): a shape marker of its own -
-`LS_PRIV_MAGIC`, "LSSC", and 7 members - since it is another node, not a shape of `LionOrdered`'s:
-the shape, the flags, the lion tree (as `LO_PRIV_TREE`), the leaves' indexes, the source indexes,
-and per source the table's columns it gives and the index columns that store them; custom_exprs
-holds the leaves' index quals and the lion side's original qual, the recheck.
-
-**Decisions and what it does not do.**
-
-- "A page with no store yet" cannot hold a row of any set: every insert writes its stored
-  columns' slots before its posting sets (`lion_store_insert()`), and a build stores every row it
-  indexes. The reader reports a window with no chain as ABSENT anyway, which sends its rows to the
-  heap; the test exercises ABSENT with values too long for any store page.
-- The AND's other children are built whole before the first piece; the lazy probe of §30.4 is
-  `LionOrdered`'s and is not used here.
-- No EvalPlanQual (`ls_recheck()` is an error: no row mark reaches the node), no parameterized
-  path, no parallel plan, no OR with an arm that is not one ascending run.
-- The band of "Measured" below, where the node is chosen over lion's plain index scan and is
-  slower than it, is left to a rate for index scans.
-
-**Tests.** `test/sql/store_gather.sql`: every query run through the node with core's scans off and
-compared as a multiset with a sequential scan with lion's custom scans off - ANDs of two and three
-indexes with the columns from two and three, key columns under `store_values` and INCLUDE columns
-with NULLs, an index whose key is not stored, ORs (of lists, of ANDs, under an AND), a range and a
-long IN list as the AND's driver, filters on gathered columns; dirty pages (updates, deletes,
-inserts, and a transaction's own changes: store and heap together) and the same after VACUUM; ABSENT
-pages; rescans under a nested loop (`, 3 scans`) and a semi join that stops each after its first
-row; a cursor holding pins while paused and none when done; a partitioned table; the cases
-declined (a column nobody stores, a key column its index does not store, a whole row, ctid, a
-filter on an unstored column, a WHERE lion cannot answer, an OR with a range arm, FOR UPDATE, no
-column, the setting off); the price's choice both ways; and a set that degrades at run time, an
-AND's mask and an OR's arm read as a set. `test/isolation/store_scan_cursor.spec`: a cursor paused
-after five rows while rows are inserted, deleted and updated into and out of the WHERE - before
-its first FETCH and while it is paused - returns exactly what its snapshot saw, from the store and
-the heap. It runs no VACUUM while paused: one with entries to remove would wait for the pins.
-
-**Measured** (release build, warm; the quick benchmark's table at 5,000,000 rows - 96,154 heap
-pages, fillfactor 90 - with the four indexes above; `shared_buffers` 512MB, no parallel workers;
-the median of five runs of `EXPLAIN (ANALYZE, TIMING OFF)` after one more; the columns returned
-are `id, c2, c20, c200, c20k` throughout):
-
-| WHERE | rows | plan | ms | buffers | node off: plan | ms | buffers |
-|---|---|---|---|---|---|---|---|
-| `c200 IN (17,18,19) AND c20 IN (3,4,5)` | 11,214 | LionStoreScan | 39.3 | 20,701 | Bitmap Heap Scan | 64.8 | 10,841 |
-| the same `AND c2 = 1` | 5,636 | LionStoreScan | 40.0 | 20,701 | Bitmap Heap Scan | 67.8 | 10,841 |
-| `c200 IN (17,18,19)` | 75,106 | LionStoreScan | 66.4 | 21,089 | Index Scan | 65.9 | 52,573 |
-| `c20k IN (100, ..., 109) AND c2 = 1` | 1,264 | Index Scan | 6.4 | 2,509 | Index Scan | 6.1 | 2,509 |
-| `c20k = 123` | 231 | Index Scan | 0.96 | 234 | Index Scan | 0.80 | 234 |
-
-Forced, the node took 12.9 ms (15,257 buffers) and 2.5 ms (2,554) for the last two. A result
-that meets every window reads about 21,000 buffers whatever its size - five chains and five map
-pages a window - so the node wins where its competitor reads more pages or pays more for each: a
-bitmap heap scan's page cost about 6 µs here. Against lion's plain index scan, whose cached heap
-page cost about 1.3 µs, `c20k IN (...)` of the first n values from 100, the same five columns:
-
-| n | rows | chosen | ms | node off: Index Scan, ms | buffers, node / index scan |
-|---|---|---|---|---|---|
-| 10 | 2,532 | Index Scan | 2.4 | 1.8 | 15,257 / 2,509 |
-| 20 | 5,062 | Index Scan | 5.3 | 5.0 | 18,876 / 4,965 |
-| 30 | 7,547 | LionStoreScan | 21.8 | 7.9 | 19,861 / 7,302 |
-| 60 | 14,930 | LionStoreScan | 33.9 | 17.7 | 20,782 / 13,908 |
-| 100 | 24,826 | LionStoreScan | 47.5 | 27.7 | 21,050 / 22,061 |
-| 200 | 50,024 | LionStoreScan | 66.5 | 49.0 | 21,260 / 39,316 |
-| 400 | 99,725 | LionStoreScan | 82.6 | 94.4 | 21,478 / 62,693 |
-
-From 30 to 200 values the node is chosen and 1.35 to 2.8 times slower: the index scan's heap
-pages are priced at `random_page_cost` however cached - it ran at 1,700 to 2,900 units a
-millisecond here, where §39 takes index scans for the reference, 500 - while the node's price ran
-at 300 to 1,000. The node's buffers stay at most 2.7 times the index scan's where it is chosen, as the
-pricing intends; it is the index scan's page that is cheaper than its price says. A rate for index
-scans (§39, "The rates") would move the band; until then it is a known misplan, at its worst
-where a result of a few thousand rows meets every window. Against the bitmap heap scan the same
-pages are priced and paid alike: the AND above is chosen at 0.76 of the bitmap scan's price and
-runs in 0.61 of its time.
-
-**Plans that change.** `store_count.sql`, `store_partition.sql` and `store_spill.sql` force
-`LionCount` by turning core's scans off; an ordinary `Agg` over `LionStoreScan` now competes with
-it there (at their 64 kB `work_mem` it undercuts the count's spilling price), so their helpers turn
-the row gather off. The partition test's check that one index is not read counts what planning
-reads too, and the row gather's planning reads the meta page of a store that could give the
-column; it turns the setting off around itself.
+## 40. Lion-filtered walks of a covering B-tree, index-only (`LionOrdered`'s index-only mode and `LionBtreeScan`, lion_ordered.c; 2026-10-06)
+
+The shape is
+
+    SELECT <columns a B-tree holds> FROM t
+    WHERE <clauses lion indexes answer> [AND <the B-tree's own quals>]
+    [ORDER BY <the B-tree's columns> [LIMIT n]]
+
+over a B-tree the user created to cover it - `(k) INCLUDE (...)`, as for an Index Only Scan - and
+lion indexes on the filter columns. §30's node already filters a B-tree's walk through lion's set
+before it touches the heap; what it fetched from the heap was the row's VALUES. When the B-tree
+returns every column the node must produce, the values come from the index tuple and the heap is
+read for visibility alone, on pages the visibility map does not call all-visible, exactly as core's
+Index Only Scan reads it (`nodeIndexonlyscan.c`): a `LIMIT 10` of a selective filter then costs the
+lion lookups, the entries walked and ten visibility-map tests. And since the walk pays without an
+ORDER BY once the heap is out of it, the same node is offered for any B-tree path of the relation
+whose index covers the query - a full walk of `(grp) INCLUDE (x, tags)` under `WHERE tags @> '{t}'
+GROUP BY grp` included - under the name `LionBtreeScan` when it claims no order. Lion's part is the
+membership test, which answers what a B-tree cannot hold: multi-key columns, a column behind a
+high-cardinality leader, ANDs and ORs across independent indexes. This is what replaces the window
+store (format version 9, reverted 2026-10-06): a value store partitioned by heap window cannot beat
+a B-tree's clustering on a pinned key, and the B-tree is the user's to create.
+
+### 40.1 What qualifies
+
+- **The relation, the WHERE and the lion side**: §30.1 and §30.2, unchanged (`lo_rel_ok()`,
+  `lo_lion_accesses()`). The target of an UPDATE, DELETE or MERGE, a relation with security quals,
+  another table AM: declined as there. So is a relation the planner has proven empty
+  (`IS_DUMMY_REL()`: a constant-false or NULL restriction, constraint exclusion) - core builds no
+  index path for one and `make_one_rel()` leaves its pages out of `root->total_table_pages`, which
+  `cost_index()` asserts they are in; before `LionBtreeScan` the hook never reached
+  `create_index_paths()` for such a relation, because its path list held only the empty Append and
+  there was no ordered path to match, but `lo_btree_paths()` runs it whenever a B-tree covers the
+  target, and ordered.sql's `EXECUTE lo_p(NULL, 0)` tripped the assertion (2026-10-06).
+- **Coverage.** The B-tree covers the node when every column it must produce is a plain column of
+  the index - a key column (`indexkeys[i] != 0`) or an INCLUDE column - that the AM can return
+  (`canreturn[i]`, true of every B-tree column). The columns the node must produce are decided per
+  (ordered path, lion access) pair (`lo_needed_attrs()`, `lo_index_only()`): every Var of the
+  relation in `rel->reltarget->exprs`, in the residual filter (`lo_residual()`: the clauses the
+  node still tests itself, a partial lion index's predicate when the query spells it included), in
+  the ordered B-tree's own clauses (its recheck under `xs_recheck`) and - only when a lion index
+  clause is lossy at plan time (`IndexClause.lossy`), so that every member would need the recheck
+  and heap mode is the honest plan - in the lion qual. The lion filter's columns are otherwise NOT
+  required, where core's `check_index_only()` would ask for every restriction clause's: whether a
+  set needs rechecking is a run-time property (an inexact source, a set that degraded under
+  `hash_mem`), and a member of such a set the B-tree cannot recheck is rechecked on its heap
+  tuple, fetched for that alone (§40.4) - heap mode, the alternative, fetches every member's. So
+  `(created_at) INCLUDE (id, title)` under `WHERE tags @> '{t}'` is covered. Lion's planner marks
+  no clause lossy today (a tsquery prefix, NOT or weight widens the set to a superset the executor
+  rechecks, §17), so the lossy branch is dormant until one does. The pre-filter that decides which
+  B-trees get unordered paths at all (§40.2) tests the target's Vars alone, a necessary condition;
+  the pair decides. An expression
+  column matches no Var: it may still give the order, as in §30, but no value. A system column
+  makes the index non-covering, as in core: `SELECT ... FOR UPDATE` adds the row mark's `ctid` to
+  the target, so a locked relation is always heap mode, and EvalPlanQual never meets an index-only
+  plan. So does a partial B-tree's predicate column when the query spells the predicate: the clause
+  stays in the node's filter (§30.2 step 4 - core's index scan drops it, but the fetch-and-sort
+  switch rechecks rows that did not come through the index, which the predicate does not hold for),
+  so `(k) INCLUDE (x) WHERE flag` under `WHERE flag AND ...` is covered only with `flag` among the
+  INCLUDE columns. The mapping of index columns to relation attnos goes into `custom_private`
+  (`LO_PRIV_IOCOLS`), so that the executor looks nothing up per row.
+- **`enable_indexonlyscan`**: off, there is no index-only mode - the ordered node keeps its heap
+  mode, and no unordered path is offered.
+
+### 40.2 Planner integration (`lion_ordered_set_rel_pathlist()`)
+
+- **Ordered paths** (§30.2): as before, from `rel->pathlist`; each (ordered path, lion access)
+  pair decides coverage (§40.1) and is priced in index-only mode when covered, in heap mode as
+  before otherwise.
+- **Unordered paths.** For each B-tree of the relation that holds the query's target columns (a
+  necessary condition; the pair decides the rest, §40.1), `create_index_paths()` is run on a scratch copy of the RelOptInfo that sees that index ALONE
+  (`lo_scratch_rel()`, the helper `lo_lion_accesses()` now builds its copy with; `lo_btree_paths()`)
+  - alone, so that its paths compete with nothing: in the relation itself the full walk of a
+  covering index without a qual, which core builds as an index-only scan whenever
+  `check_index_only()` passes, loses to the sequential scan and never reaches `rel->pathlist`, and
+  a path with quals may lose to another index's. Core builds, for that index, the paths with its
+  matching quals - with pathkeys where the query finds them useful, without otherwise - a backward
+  one where that order is useful, and the no-qual one; an IndexPath that `add_path()` dropped for a
+  bitmap scan of the same index is taken from that scan's one-leaf `bitmapqual`. Each resulting
+  IndexPath - a B-tree, not hypothetical, `param_info == NULL`, no ORDER BY operators,
+  `lo_indexpath_ok()` - whose twin is not among the ordered paths (the same index, direction and
+  pathkeys: offered above already) is paired with each lion access from `lo_lion_accesses()`, as
+  the ordered loop pairs them, less the pairs in which the lion access adds nothing: every clause
+  of its every leaf, an OR arm's too, is one of the B-tree path's own index clauses
+  (`lo_lion_adds()`), so every entry walked would be a member - the same RestrictInfo, or an
+  `equal()` clause: 18 and later match an OR of equalities to each index as a `ScalarArrayOpExpr`
+  RestrictInfo of that index's own (`match_orclause_to_indexcol()`), so the B-tree's `k = ANY` and
+  the lion index's are two objects spelling one clause (`lo_same_clause()`, which `lo_cost()`'s
+  shared-clause correction uses too, or the OR's selectivity would be squared and the node
+  underprice itself against the plain Index Only Scan). A leaf with no index clauses at all - a
+  partial lion index walked whole for its predicate, which `lo_lion_tree_ok()` allows - adds that
+  predicate's selectivity and counts as adding; `lo_cost()`'s `lo_pred_implied()` correction
+  prices it. The pair must cover (§40.1) and is priced in index-only mode. The CustomPath carries the IndexPath's pathkeys when
+  it has them - a free order - under the name `LionOrdered`, and none otherwise under the name
+  `LionBtreeScan`: a second `CustomPathMethods`/`CustomScanMethods` pair over the same plan
+  function, state struct and executor functions. `pg_lion.enable_ordered_scan` keeps gating the
+  ordered paths and the lion columns' walks of §30.11, and with it off the unordered paths claim no
+  order whatever core found useful - a `LionOrdered` must not appear with its switch off - and are
+  all `LionBtreeScan`s; `pg_lion.enable_btree_scan` (bool, default on) gates the unordered paths.
+  Core's `enable_indexscan` leaves both alone, as it left `LionOrdered` alone: the node is priced
+  from `indextotalcost`, which carries no `disable_cost`.
+- **Partitions**: as §30.11, each leaf is scanned like a table under core's Append or MergeAppend.
+
+### 40.3 Cost (`lo_cost()`, index-only)
+
+§30.3's start-up (the lion lookups and the set), walk (`indextotalcost` plus a membership test per
+entry) and shared-clause correction stand. The heap term changes: the `F` members' pages are
+priced as `cost_index()` prices an index-only scan's - `index_pages_fetched()` for an uncorrelated
+order and the members' share of the heap for a correlated one, EACH scaled by `(1 -
+rel->allvisfrac)`, the fraction of pages the visibility map does not call all-visible, and
+interpolated by the squared correlation as before - plus a visibility-map test per member at
+`cpu_operator_cost`; `cpu_tuple_cost` per member (now the index tuple's deform) and the filter's
+cost were charged already. `lo_margin` applies as §39 applies it. For an unordered path core has no
+LIMIT to scale by, so the planner prices the whole walk, and a path whose walk is the whole index
+competes on `indextotalcost + T × cpu_operator_cost` against the bitmap heap scan's heap pages,
+which is right: on `btreescan.sql`'s 100,000 rows, whose heap is six times the covering B-tree,
+the covering walk is chosen over the bitmap scan for a filter of a tenth of the rows, the bitmap
+scan over it where only the wide `(k) INCLUDE (...)` B-tree covers the columns, and the lion
+index's own scan for a filter of three in a thousand (§40.7, "the plan choice"). The recheck
+from the heap (§40.4) is not priced: an inexact source or a degraded set is not knowable at plan
+time, and the fetches it costs are bounded by the members - the bound heap mode pays for every
+member. The planner also hands the executor the entries the walk is expected to visit,
+`indexselectivity × rel->tuples`, for the switch's density gate (§40.4; `LO_PRIV_EXPECTED`, a
+float8 Const in `custom_private`, 0 when the ordered path is a lion column's walk).
+
+**The probe's price** (2026-10-06). The walk is CPU-bound. On bench/quick.py's 5M-row `fact` table
+(its covering B-tree `(c20k) INCLUDE (c1m)`, 107 MB, under `WHERE c20 = 3 GROUP BY c20k`, a 5%
+filter) the covering walk took 830 to 925 ms for 5M entries, 170 ns an entry - the btree step, the
+probe (a binary search over the container keys and a membership test) and the met-before mark -
+against 85 ns a row for the sequential scan with its filter, which the planner charges
+`cpu_tuple_cost + cpu_operator_cost` (0.0125). Priced at `indextotalcost`'s `cpu_index_tuple_cost`
+plus one `cpu_operator_cost` for the probe, a fifth of that for twice the work, the walk came out at
+97,072 against 102,912 for the lion index's own scan and HashAggregate, which run in 200 to 250 ms,
+and was chosen at `random_page_cost` 1.1 as well (57,055 against 101,486). Each walked entry's probe
+is now `LO_PROBE_TUPLES` (2) × `cpu_tuple_cost` + `cpu_operator_cost`, 0.0225, 1.8 times the
+sequential scan's row, which puts that walk at 197,072 (157,055 at `random_page_cost` 1.1, against
+the lion index scan's 101,486) and sends the query to the lion index's scan at either setting,
+while the LIMIT walks keep the node (§40.7, "On the benchmark's tables"). The lion column walk of
+§30.11 keeps its own pricing (`lo_cost_walk()`). Where the covering B-tree holds the filter's
+column as well, core's own Index Only Scan with the filter walks the same entries for one
+`cpu_operator_cost` each, and is now priced below the node; on btreescan.sql's 100,000 rows the two
+run in the same time for `c200 = 17 ORDER BY k LIMIT 10` (0.5 ms either way), and core's filtered
+scan of `tags @> '{t3}'` over 94,000 entries takes 18 to 28 ms against the node's 13 to 17, the
+containment operator costing core more than the one `cpu_operator_cost` it is charged at.
+
+**Warm and cold.** A full covering walk reads the B-tree (107 MB here) in place of the heap (751
+MB) but spends those 170 ns an entry, so warm it loses to the lion index's own scan of a 5% filter
+by four times and to the sequential scan by two; it pays when the heap would be read cold, or the
+filter is far wider than the B-tree's share of the heap. The planner's I/O constants decide,
+`pg_lion.enable_btree_scan` turns the unordered walks off and `pg_lion.enable_ordered_scan` the
+ordered ones.
+
+### 40.4 Execution
+
+- **The slot.** The mode is fixed per plan, so the scan slot's type is: `TTSOpsBufferHeapTuple` of
+  the relation's descriptor in heap mode, as before; `TTSOpsVirtual` of the relation's descriptor
+  in index-only mode - the relation's, not the index's as core's node uses, so that the plan's Vars
+  (`scanrelid`, no `custom_scan_tlist`) and the rechecks read it unchanged. `lo_create_state()`
+  picks it from the plan's flags, not `BeginCustomScan`: `ExecInitCustomScan()` initialises the
+  projection and the quals on the scan slot's type before `BeginCustomScan` runs, and the expression
+  machinery specialises on it, so one plan never returns slots of two types.
+- **A row.** `xs_want_itup` is set on the B-tree scan before `index_rescan()`. For a member TID
+  (`lo_fetch_indexonly()`): `VM_ALL_VISIBLE(heapRelation, blkno, &vmbuffer)`, the map's buffer kept
+  across calls and released at rescan and end, as `ioss_VMBuffer` is. All-visible, the row is
+  visible to every snapshot, this one included, and the heap is not read. Not all-visible, the
+  heap tuple is fetched into a slot of the table AM's kept for this alone (`index_fetch_heap()` on
+  16 to 19, `table_fetch_tid()` and `table_tuple_fetch_row_version()` on 20 - `lo_fetch_btree()`,
+  as heap mode fetches), counted as a heap fetch and kept in that slot until the row's rechecks
+  are done (below); a TID with no visible version is skipped. Either way the values are the INDEX TUPLE's: `xs_itup` deformed with `xs_itupdesc` (or
+  `xs_hitup`, had the AM returned a heap-format tuple) and laid into the virtual slot through the
+  mapping, every other attribute NULL - the visible version reached from the root TID has the
+  index's values for indexed and INCLUDE columns, since those are HOT-blocking (§30.5). A `name`
+  column a B-tree stores as a cstring (`name_ops`'s storage type) is copied back into a Name of the
+  node's, reused per row, as core copies it. The "met before" bitmap of §30.4 stands: a TID met
+  twice is skipped before any of this.
+- **The rechecks.** `ordrecheck` under `xs_recheck` and EvalPlanQual's `lo_recheck` evaluate on
+  the scan slot as before; coverage guarantees the columns are there. So does `lionrecheck`, for
+  an inexact or degraded set, when the B-tree holds the lion qual's columns. When it does not
+  (`LO_FLAG_HEAPRECHECK`, decided at plan time from the lion qual's Vars against the mapping;
+  `st->lionheaprecheck`), the member is rechecked on its heap tuple (`lo_lion_recheck()`): fetched
+  now into the table AM's slot if the visibility test did not fetch it already - counted as a heap
+  fetch, a TID with no visible version skipped - `slot_getallattrs()`, and `ExecQual(lionrecheck)`
+  with that slot as `ecxt_scantuple`, which is sound although the qual was initialised for the
+  virtual scan slot (§40.5). A row the heap was read for holds its tuple predicate lock
+  (`fromheap`). The heap tuple is let go at the end of the row's iteration. The switch's rows, in
+  index-only mode, are heap tuples copied whole into the scan slot, so their recheck reads the slot
+  as before.
+- **The fetch-and-sort switch** (§30.4) fetches members from the heap in TID order: in index-only
+  mode each lands in the table AM's slot and is copied into the virtual scan slot
+  (`ExecCopySlot()`, a deform) before the rechecks and the sort, so the slot type stays fixed, and
+  each copy carries its row's TID. Its ratio is `LO_SWITCH_RATIO` (32) in both modes, the setting
+  `pg_lion.ordered_switch_ratio` (§30.4). In index-only mode the walk would not have read the
+  members' heap pages at all, so a switch pays for pages the walk never touches: a uniform full
+  walk under no LIMIT - the aggregate shape - must never switch (it would fetch every remaining
+  member from the heap; under the heap-mode rule alone a filter of a tenth of the rows switched
+  three quarters of the way through the index and fetched the 2,300 members left), while the
+  hazard the switch exists for (§30.3: a LIMIT walk whose members sit at the far end of the order)
+  must switch, and a ratio large enough to spare the former - some 530 at the planner's page and
+  entry costs - spares the latter too for any set over a fifth of a percent of the index. The two
+  are told apart by density instead: at both decision sites (the lazy set's conversion trigger and
+  the switch itself, `lo_switch_due()`) the switch is considered, in index-only mode, only when
+  the walk has met markedly fewer members than a uniform spread predicts - `distinct <
+  LO_SWITCH_DENSITY (0.5) × members × scanwalked / expected`, `expected` the entries the walk was
+  expected to visit (§40.3; 0 when unknown, and a gate with no expectation passes); the lazy site
+  uses `lazymembers`. A uniform walk meets `members × scanwalked / expected` members and never
+  passes; the correlated hazard keeps `distinct` near 0 while `scanwalked` grows and switches at
+  the measured 32 (§40.8 has the gate's blind spot). In heap mode the gate does not apply: the
+  members the switch fetches would have been fetched by the walk anyway. Under ANALYZE a switch's
+  heap visits count in `Heap Fetches` in index-only mode as the walk's do (§40.6). An unordered
+  path has no sort keys and never switches, as a path whose pathkeys were not plain columns never
+  did; the planner priced the full walk.
+- **Unchanged**: the lazy set, the early stop, degradation, rescans with changed Params, the
+  relation predicate locks on the lion indexes.
+
+### 40.5 Correctness
+
+§30.5's argument stands for which TIDs come out of the walk and are members. What changes is how a
+member's visibility is decided and where its values come from, and both are core's Index Only
+Scan's.
+
+- **The visibility map.** A page's all-visible bit says every tuple on it is visible to every
+  snapshot. It is cleared, under the page's lock, before a row is inserted on the page, and the
+  B-tree entry for that row is inserted after; the walk reads a TID under the B-tree page's shared
+  lock, serialised with the insert's exclusive lock, and the lock released between the clearing and
+  the index insert is a full barrier - so a TID the walk meets whose row was inserted after the bit
+  was set is met with the bit cleared (`nodeIndexonlyscan.c`'s "memory ordering effects" note,
+  which `visibilitymap_get_status()` reading without a lock rests on). A delete clears the bit too
+  and does not touch the index, but the deleted row stays visible to the snapshot until its
+  deleter commits, and a snapshot that sees the commit was taken under ProcArrayLock after the bit
+  was cleared. Lion adds no TID the B-tree did not return, so nothing new arises on its side.
+- **A recycled TID, and a hot standby.** `xs_want_itup` makes nbtree keep its pin on the leaf page
+  while the executor tests the map (its `dropPin` rule, nbtree's README): VACUUM cannot remove the
+  page's TIDs from the index, and so cannot free the heap slots they name, until the walk has moved
+  on - the interlock core's Index Only Scan relies on, and now the node's. The set's own hazard
+  (§30.5, "A recycled TID") is unchanged: a member whose slot was reused names a tuple the snapshot
+  cannot see, and on a page still marked all-visible no such tuple exists. On a hot standby the
+  same pin rule protects the walk as it protects core's scan, and the lion side still reads no
+  visibility map and holds no pin (§30.5).
+- **SERIALIZABLE.** A row returned without a heap visit has no tuple to predicate-lock - a tuple
+  lock needs the tuple's xmin, which was not read - so the node takes `PredicateLockPage()` on its
+  heap page as core's Index Only Scan does, after the rechecks pass, for each row it returns; a row
+  the heap was visited for holds its tuple lock from the fetch. The B-tree page locks and the lion
+  relation locks are §30.5's. test/isolation/btreescan_serializable.spec is the write skew of two
+  HOT updates of rows the other transaction read index-only: it must fail, and without the page
+  lock neither update would conflict with anything the other read (a HOT update writes no index)
+  and both would commit.
+- **The recheck from the heap** (§40.4) evaluates `lionrecheck`, initialised for the virtual scan
+  slot, on the table AM's slot. That is sound because the scan slot's type is fixed
+  (`ExecInitScanTupleSlot()` sets `scanopsfixed`), so `ExecInitQual()` emitted no
+  `EEOP_SCAN_FETCHSOME` step for it - `ExecComputeSlotInfo()` drops the step for a fixed virtual
+  slot, and with it the slot-type check that step makes (`CheckOpSlotCompatibility`) - and the
+  qual's Var steps read `tts_values[]` and `tts_isnull[]` directly, which `slot_getallattrs()`
+  fills for the heap tuple. The tuple it tests is the version the snapshot sees of the TID the
+  walk returned (the HOT chain followed from its root, as the visibility fetch follows it), so the
+  recheck tests the values the row has for this snapshot, the same version whose indexed and
+  INCLUDE columns the index tuple returned (§40.4).
+- **EvalPlanQual** never meets an index-only plan: a row mark's `ctid` is in the target (§40.1).
+  `lo_recheck()` asserts the test tuple's slot type is the scan slot's; the recheck from the heap
+  is index-only mode's alone and never reaches it.
+
+### 40.6 EXPLAIN
+
+    Custom Scan (LionBtreeScan) on bs
+      Index: bs_grp (index only)
+      Lion Cond: (tags @> '{t3}'::text[])
+      Lion Indexes: bs_tags
+
+    Limit
+      ->  Custom Scan (LionOrdered) on bs
+            Ordered By: bs_k (backward, index only)
+            Lion Cond: ((c200 = 17) AND (c20 = 3))
+            Lion Indexes: bs_c200, bs_c20
+
+`LionOrdered`'s lines are §30.7's; `index only` joins the `Ordered By` line's parenthesis in
+index-only mode (heap mode prints as before, so no existing output changes), and a `LionBtreeScan`
+names the index it walks under `Index`, with the same qual and counter lines. Under ANALYZE, `Heap
+Fetches` counts in index-only mode the heap visits: the members whose page the visibility map did
+not call all-visible, the members an inexact or degraded set had rechecked on their heap tuple
+(§40.4) and the fetch-and-sort switch's, visible or not, as core's Index Only Scan counts its
+visits (in heap mode, as before, the members with a visible version); `Heap Fetches: 0` on a
+vacuumed table under an exact set, or an inexact one the B-tree can recheck.
+
+### 40.7 Tests
+
+test/sql/btreescan.sql, on a 100,000-row table - its heap six times its covering B-trees - with
+covering B-trees `(k) INCLUDE (id, grp, x, c200, c20, nm)` and `(grp) INCLUDE (x, tags)`, two
+partial ones and an expression one, and lion indexes on `c200`, `c20` and `tags`: every query run
+through the node (every core scan off) and through the ordinary plan (both of the node's settings
+off) and compared - in order under an ORDER BY, as multisets otherwise - with the node and its mode
+named. A covered `=`, ranges and `IN` lists on the B-tree side with lion filters, lion `IN` lists, a
+`name` INCLUDE column filtered and returned, DESC with a LIMIT, OFFSET, an empty answer, a LIMIT
+beyond the match count; the aggregate shape under a GROUP BY and a plain aggregate, with a scalar
+filter and a multi-key one (exact as well, §29.6); the counters (`Heap Fetches: 0` after VACUUM, `Rows Removed
+by Lion Recheck` evaluated on the index tuple's values, the switch in index-only mode with its heap
+fetches counted); rows inserted in the same transaction and a dirty heap (HOT and non-HOT updates,
+deletes) before VACUUM, their heap fetches counted, and after VACUUM with none; `FOR UPDATE` (heap
+mode); cursors fetched in pieces in both modes; a generic plan and LATERAL and correlated
+subqueries rescanned with the outer value in the lion filter and in the B-tree's quals; the partial
+B-trees, with the predicate column covered and not; the expression B-tree (the order, no values);
+each setting off; and the plan choice with nothing disabled. Then a B-tree lacking the lion
+filter's columns (§40.1): an exact set (`Heap Fetches: 0`), an inexact one (each member fetched
+for its recheck), rows not all-visible on an inexact set (fetched once), a set that degrades under
+`hash_mem` through a kept plan (as ordered.sql's section 10 does, on a 400,000-row table of its
+own: `Lion Set: degraded`, heap fetches and rows removed, the numbers filtered out) and tsquery
+prefix and NOT filters (supersets, rechecked from the heap); the switch in index-only mode
+(§40.4): the far-end shape switches and matches the ordinary plan, a large
+`pg_lion.ordered_switch_ratio` keeps it walking, the uniform GROUP BY walk and a uniform backward
+walk to the end never switch and read nothing from the heap, and the same backward walk in heap
+mode (a `ctid` in the target) switches as before; NULLs in key and INCLUDE columns, a NULL `name`
+among them, over `(grp DESC NULLS FIRST, id) INCLUDE (x, nm)` walked both ways, `IS NULL` filters,
+on a table with a dropped column (the mapping with a gap); `ctid`, `tableoid` and a whole-row Var
+(heap mode), both settings off (no node), a SCROLL cursor fetched backward; and the pairs that add
+nothing (§40.2) - `k = 1 OR k = 7` with a lion index on `k` and a B-tree leading with it, with
+core's scans on and off: no node, its presence alone printed since the plan's text differs between
+majors - against a partial lion index walked whole, which is offered.
+test/isolation/btreescan_serializable.spec is §40.5's write skew, and passes only with the page
+lock; a step shows the read ran index-only with `Heap Fetches: 0`, so the conflict is the page
+lock's.
+
+**On the benchmark's tables** (2026-10-06): bench/quick.py's `fact` (5M rows) and `docs` (1M), warm,
+through the node, with both of its settings off, and in heap mode (`enable_indexonlyscan = off`),
+EXPLAIN (ANALYZE, TIMING OFF) three times each. `SELECT c20k, sum(c1m) FROM fact WHERE c20 = 3
+GROUP BY c20k`: the lion index's scan and HashAggregate at `random_page_cost` 4 and 1.1 (the node
+forced: the 5M-entry walk, §40.3). `... WHERE c200 = 17 GROUP BY c20k`: the same plan. `SELECT id,
+payload FROM fact WHERE c200 = 17 ORDER BY id DESC LIMIT 2000` over `(id) INCLUDE (payload)`: the
+node, index only, 400,000 entries walked and no heap read, against core's backward index scan with
+a filter. `... WHERE c200 = 17 AND c20 = 3 ORDER BY id DESC LIMIT 10`: the node. `SELECT id,
+payload FROM docs WHERE tags @> ARRAY['t1','t17'] ORDER BY id DESC LIMIT 10` over `(id) INCLUDE
+(payload)`: the node, index only, the set exact (§29.6) and `Heap Fetches: 0`. Timed on the dev
+cluster after the probe was priced: the `c20 = 3` GROUP BY 217 to 247 ms through the lion index's
+scan (the node forced: 973 to 1,002 ms), the `c200 = 17` one 40 to 48 ms (the node forced: 722 to
+746); the LIMIT 2000 walk 28.8 to 29.6 ms through the node against 44 to 49 for core's backward scan
+with a filter; the two-filter LIMIT 10 2.5 to 2.9 ms against 5.2 to 7.5; the `tags` LIMIT 10 over
+`docs` 1.5 to 1.7 ms against 4.0 to 4.5.
+
+### 40.8 Not done
+
+- **The density gate's blind spot** (§40.4): members dense early in the order and the rest at its
+  far end, under a LIMIT the early ones do not satisfy (a residual filter removes them, say), keep
+  `distinct` at the uniform rate while the walk crosses the empty middle, so the gate never opens
+  and the walk goes to the end where heap mode's rule would have switched.
+- **The recheck from the heap is unpriced** (§40.3): an inexact source or a degraded set is
+  unknown at plan time; its fetches are bounded by the members, every one of which heap mode
+  fetches.
+- **Pending CI on 20.** `index_beginscan()`'s third argument and the `IndexScanDesc` fields the
+  index-only walk reads (`xs_want_itup`, `xs_itup`, `xs_itupdesc`, `xs_hitup`) are taken as 16 to
+  19 have them; an index-only walk whose `xs_want_itup` went unhonoured errors with "no index
+  tuple returned", which the master job's btreescan run will tell.
+- **A partial B-tree's predicate clause** stays in the filter (§40.1); dropping it as core's index
+  scan does would need the switch's recheck to take the predicate on.
+- **A faster probe.** Each entry's probe is a binary search over the set's container keys and then
+  a membership test, about half of the 170 ns an entry (§40.3); a directory indexed by container key
+  would find the container in O(1), and a bitset container's test is O(1) already where an array
+  container's is a second binary search. The price above would then come down with it.
+- **Expression columns** returning a value for a matching expression of the target; **parallel**
+  walks (`parallel_safe = false`, as §30).

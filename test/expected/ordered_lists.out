@@ -401,15 +401,14 @@ SELECT * FROM ol_run($$SELECT id FROM lol
 
 SELECT * FROM ol_run($$SELECT id FROM lol
 	WHERE tags @> ARRAY['t2'] AND g IN ('g10', 'g11') ORDER BY g LIMIT 5$$);
-               ol_run               
-------------------------------------
+             ol_run             
+--------------------------------
  Index Entries Walked: 38
  Lion Keys Walked: 1
  Lion Set Hits: 5
  Heap Fetches: 5
- Rows Removed by Lion Recheck: 0
- Lion Set: 35 containers, rechecked
-(6 rows)
+ Lion Set: 35 containers, exact
+(5 rows)
 
 SELECT ol_cmp($$SELECT id, g FROM lol
 	WHERE a = 'a3' AND b > 'b25' AND g IN ('g10', 'g11') ORDER BY g, id LIMIT 20$$);
@@ -443,7 +442,7 @@ SELECT * FROM ol_run($$SELECT id FROM lol
 ------------------------------------------------------
  Index Entries Walked: 6179
  Lion Set Hits: 5
- Heap Fetches: 5
+ Heap Fetches: 0
  Lion Set: 31 containers, exact, after 11 keys probed
 (4 rows)
 
