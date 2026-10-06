@@ -1,0 +1,63 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s0_vacuum s1_plan s1_begin s2_begin s1_read s2_read s1_update s2_update s1_commit s2_commit
+step s0_vacuum: VACUUM bss;
+step s1_plan: EXPLAIN (COSTS OFF) SELECT id, k FROM bss WHERE c = 1 ORDER BY k, id LIMIT 3;
+QUERY PLAN                            
+--------------------------------------
+Limit                                 
+  ->  Custom Scan (LionOrdered) on bss
+        Ordered By: bss_k (index only)
+        Lion Cond: (c = 1)            
+        Lion Indexes: bss_c           
+(5 rows)
+
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_read: SELECT id, k FROM bss WHERE c = 1 ORDER BY k, id LIMIT 3;
+ id|k
+---+-
+191|4
+491|5
+791|6
+(3 rows)
+
+step s2_read: SELECT id, k FROM bss WHERE c = 2 ORDER BY k, id LIMIT 3;
+ id|k
+---+-
+ 82|7
+382|8
+682|9
+(3 rows)
+
+step s1_update: UPDATE bss SET note = 's1' WHERE id = 82;
+step s2_update: UPDATE bss SET note = 's2' WHERE id = 191;
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s0_vacuum s1_begin s2_begin s1_read s2_read s1_update s1_commit s2_update s2_commit
+step s0_vacuum: VACUUM bss;
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_read: SELECT id, k FROM bss WHERE c = 1 ORDER BY k, id LIMIT 3;
+ id|k
+---+-
+191|4
+491|5
+791|6
+(3 rows)
+
+step s2_read: SELECT id, k FROM bss WHERE c = 2 ORDER BY k, id LIMIT 3;
+ id|k
+---+-
+ 82|7
+382|8
+682|9
+(3 rows)
+
+step s1_update: UPDATE bss SET note = 's1' WHERE id = 82;
+step s1_commit: COMMIT;
+step s2_update: UPDATE bss SET note = 's2' WHERE id = 191;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+step s2_commit: COMMIT;

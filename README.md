@@ -345,6 +345,36 @@ SELECT count(*) FROM docs WHERE tags @> ARRAY['t1', 't17'];
 CREATE INDEX docs_tsv_gin ON docs USING gin (tsv);
 ```
 
+To return ROWS rather than counts under a Lion filter, give the query a covering B-tree, as you
+would for an Index Only Scan, and let Lion filter its walk (DESIGN.md §30 and §40): the node walks
+the B-tree in its order, tests each entry's TID against the Lion indexes' posting sets before it
+touches the heap, and returns the members' values from the index tuples, reading the heap only for
+pages the visibility map does not call all-visible (`Heap Fetches` in `EXPLAIN ANALYZE`, 0 after a
+`VACUUM`). Lion's part is the membership test, which answers what the B-tree cannot hold: a
+multi-key column (`tags @> ...`), a column behind a high-cardinality key, ANDs and ORs across
+independent indexes. The B-tree must hold every column the query reads - its target and its `WHERE`
+clauses, the Lion-filtered ones included (they may be rechecked) - as key or `INCLUDE` columns:
+
+```sql
+CREATE INDEX docs_created_cov ON docs (created_at) INCLUDE (id, title, tags);
+
+-- the latest matching rows: LionOrdered walks the B-tree backward and stops at the tenth member
+SELECT id, title FROM docs WHERE tags @> ARRAY['t1', 't17'] ORDER BY created_at DESC LIMIT 10;
+
+-- no ORDER BY: LionBtreeScan walks the whole covering B-tree, never the heap
+CREATE INDEX events_country_cov ON events (country) INCLUDE (amount, event_type);
+SELECT country, sum(amount) FROM events WHERE event_type = 'purchase' GROUP BY country;
+```
+
+`EXPLAIN` shows `Custom Scan (LionOrdered)` with `Ordered By: <index> (index only)` for a walk that
+gives the query its order, and `Custom Scan (LionBtreeScan)` with `Index: <index> (index only)` for
+one that does not; `Lion Cond` is what Lion answered. A query that reads a column the B-tree lacks
+walks in heap mode under an `ORDER BY` (as before) and gets no unordered walk; `SELECT ... FOR
+UPDATE` needs the row's `ctid` and is heap mode too. The cost model chooses between the node, the
+B-tree's own scans and a bitmap scan of the Lion indexes; `pg_lion.enable_ordered_scan` and
+`pg_lion.enable_btree_scan` turn the two forms off, and `enable_indexonlyscan = off` turns the
+index-only mode off.
+
 ## SQL functions
 
 Ordinary SQL is the interface - the planner uses the index and the `LionCount` pushdown on its own -
@@ -431,7 +461,8 @@ table's owner (DESIGN.md §7).
                             join, the run and parallel DSM, EXPLAIN
     src/lion_costs.[ch]     the cost model's constants as planner settings (pg_lion.*_cost)
     src/lion_fkjoin.[ch]    the FK-side joins a LionCount answers (fact JOIN dim, EXISTS / NOT EXISTS), and the semi/anti join paths
-    src/lion_ordered.c      CustomScan "LionOrdered": lion-filtered scans in a btree's or a lion column's order
+    src/lion_ordered.c      CustomScans "LionOrdered" and "LionBtreeScan": lion-filtered walks of a btree (its
+                            values from the index tuples when it covers the query) or of a lion column's order
     src/lion_multikey.c     array_ops/tsvector_ops: GIN-style extraction and tsquery key trees
     test/sql, test/isolation, test/unit, test/recovery, test/modules
 
@@ -555,7 +586,16 @@ working around a bad choice:
   the clauses themselves; on a table, or on each partition of one (DESIGN.md §30, §30.11). EXPLAIN
   names a column's walk `Ordered By: <index> (<column>[, backward])`. A filter on the walked column
   alone (`WHERE s LIKE 'p1%' ORDER BY s`) is decided for a whole key by its first visible row, and
-  a key that fails is skipped unread (`Filter per Value`, DESIGN.md §35).
+  a key that fails is skipped unread (`Filter per Value`, DESIGN.md §35). When the B-tree holds
+  every column the query reads, the rows' values come from its index tuples and the heap is read
+  only for pages not all-visible (`Ordered By: <index> (index only)`, DESIGN.md §40); off, no order
+  is claimed and the covering walks below are the only ones left.
+- `pg_lion.enable_btree_scan`: offer `LionBtreeScan`, a Lion-filtered walk of a covering B-tree
+  that claims no order (`SELECT grp, sum(x) FROM t WHERE tags @> '{t}' GROUP BY grp` over a B-tree
+  on `(grp) INCLUDE (x, tags)`): the values come from the index tuples, the heap is read only for
+  pages not all-visible, and the planner prices the whole walk against the bitmap scan (DESIGN.md
+  §40). EXPLAIN names the index it walks `Index: <index> (index only)`. `enable_indexonlyscan =
+  off` takes these walks away too, and the index-only mode of the ordered ones.
 - `pg_lion.enable_lazy_set`: let `LionOrdered` evaluate its Lion set only at the ranges of 64 heap
   blocks its walk reaches, and build it for the whole table only once that has cost what the build
   would (DESIGN.md §30.4, "The set, lazily"). Off, the set is built before the walk starts.
@@ -689,8 +729,9 @@ switches above still force a plan either way.
 Equality, `IN` lists, scalar ranges and the multi-key operators above are supported, through bitmap
 scans and plain index scans (`amgettuple`, DESIGN.md §29). There are no ordered scans of the
 access method itself (an `ORDER BY` is `LionOrdered`'s: a B-tree walked with a lion filter, or a
-lion index's own ordered column walked, §30), no index-only scans
-that return a column (only those that need none, like `count(*)`), no INCLUDE columns, no
+lion index's own ordered column walked, §30), no index-only scans of a lion index
+that return a column (only those that need none, like `count(*)`; the rows of a Lion-filtered
+query come from a covering B-tree instead, §40), no INCLUDE columns, no
 parallel build or scan, no reclaim of an emptied directory leaf or of an emptied posting-tree leaf
 (both wait for the whole set or the whole index to go). Inserts serialise on the directory
 leaf that holds the key; see the measured
