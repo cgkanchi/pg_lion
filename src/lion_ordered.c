@@ -1014,8 +1014,15 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		bool		dup = false;
 
 		foreach(lc2, shared)
-			if (equal(lfirst_node(RestrictInfo, lc2)->clause, clause))
+		{
+			Node	   *c = (Node *) lfirst(lc2);
+
+			/* an index clause's RestrictInfo, or an implied bare clause */
+			if (IsA(c, RestrictInfo))
+				c = (Node *) ((RestrictInfo *) c)->clause;
+			if (equal(c, clause))
 				dup = true;
+		}
 		if (!dup)
 			shared = lappend(shared, clause);
 	}
