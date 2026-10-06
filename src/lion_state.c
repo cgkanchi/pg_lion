@@ -47,7 +47,6 @@
 #include "varatt.h"
 
 #include "lion.h"
-#include "lion_store.h"
 
 /*
  * May this transaction answer a query from this index at all?
@@ -796,7 +795,6 @@ lion_get_index_state(Relation index)
 {
 	LionIndexState *ix;
 	LionMetaPageData meta;
-	LionMetaStore store;
 	uint64		gen;
 
 	if (!lion_proc_callback_registered)
@@ -877,14 +875,11 @@ lion_get_index_state(Relation index)
 
 	gen = lion_proc_generation;
 	lion_read_meta(index, &meta);
-	lion_read_meta_store(index, &meta, &store);
 	lion_remember_wal_mode(index, meta.wal_mode);
 
 	ix = (LionIndexState *) MemoryContextAlloc(index->rd_indexcxt,
 											   sizeof(LionIndexState));
 	lion_fill_index_state(index, ix, &meta, index->rd_indexcxt);
-	/* ... and the stored columns of the window store, if any (§40) */
-	lion_store_fill_state(index, ix, &store, index->rd_indexcxt);
 	ix->procgen = gen;
 
 	/*

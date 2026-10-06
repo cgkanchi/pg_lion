@@ -659,33 +659,13 @@ CREATE FUNCTION lion_index_stats(idx regclass,
 									OUT summary_bytes int8,
 									OUT summary_pages int8,
 									OUT ndistinct int8,
-									OUT narrow_containers int8,
-									OUT store_pages int8,
-									OUT store_map_pages int8,
-									OUT store_dict_pages int8,
-									OUT store_raw_pages int8,
-									OUT store_absent int8,
-									OUT store_dict_bytes int8,
-									OUT store_slot_bytes int8)
+									OUT narrow_containers int8)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'lion_index_stats'
 LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 COMMENT ON FUNCTION lion_index_stats(regclass) IS
-	'shape of a lion index, one row per key column and then per INCLUDE column: directory shape, entries, containers by kind (narrow_containers, DESIGN.md §38), sparse segments, posting trees, NULL keys and key-less rows, summary posting sets, the distinct keys the planner is given, and the window store (§40: its pages, and per stored column its DICT and RAW pages, ABSENT heap pages, dictionary and slot bytes; NULL for a column it does not store)';
-
-/*
- * The window store's values of one row (DESIGN.md §40), in stored column
- * order, as text; NULL for a NULL and for a value the store does not have.
- * A DIAGNOSTIC for tests: it reads the slot whatever the row's visibility.
- */
-CREATE FUNCTION lion_index_stored(idx regclass, ctid tid)
-RETURNS text[]
-AS 'MODULE_PATHNAME', 'lion_index_stored'
-LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
-
-COMMENT ON FUNCTION lion_index_stored(regclass, tid) IS
-	'diagnostic: the stored column values of the row at ctid, as text, NULL for NULL or not stored';
+	'shape of a lion index, one row per key column: directory shape, entries, containers by kind (narrow_containers last, DESIGN.md §38), sparse segments, posting trees, NULL keys and key-less rows, summary posting sets, and the distinct keys the planner is given';
 
 /*
  * The ROOT block of one key's posting tree (DESIGN.md §22), NULL when the key
@@ -726,8 +706,7 @@ COMMENT ON FUNCTION lion_index_verify(regclass, bool) IS
  * Who may call the diagnostic functions.  None of them checks table
  * privileges or row-level security: lion_index_posting_root() answers "is
  * this key in the index" for any key, lion_index_stats() gives row and key
- * counts, lion_index_verify() reads the whole heap (2026-09-23 review), and
- * lion_index_stored() prints any row's stored values (DESIGN.md §40).
+ * counts, and lion_index_verify() reads the whole heap (2026-09-23 review).
  * lion_index_wal_mode() says little, but it too takes a lock on whatever
  * relation it is handed and checks nothing.  So, like pageinspect's and
  * amcheck's functions, they are not executable by PUBLIC, and as with
@@ -739,7 +718,6 @@ REVOKE EXECUTE ON FUNCTION lion_index_posting_root(regclass, anyelement) FROM PU
 REVOKE EXECUTE ON FUNCTION lion_index_verify(regclass, bool) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION lion_index_wal_mode(regclass) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION lion_index_stats(regclass) FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION lion_index_stored(regclass, tid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION lion_index_stats(regclass) TO pg_stat_scan_tables;
 
 DROP FUNCTION lion_create_opclass_pre18(text, text, text);

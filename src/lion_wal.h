@@ -78,7 +78,6 @@
 #define LION_XLOG_PAGE_DELETED		0xA0	/* a page handed to the FSM */
 #define LION_XLOG_ENTRY				0xB0	/* entry add/replace/delete */
 #define LION_XLOG_VACUUM_VISIT		0xC0	/* cleanup-lock barrier, no change */
-#define LION_XLOG_STORE				0xD0	/* the window store (§40) */
 
 /* ---------- the per-block operation stream ---------- */
 
@@ -118,7 +117,6 @@ StaticAssertDecl(sizeof(xl_lion_op) == 8, "xl_lion_op must be 8 bytes");
 #define LION_OP_SPARSE_INS	15	/* lion_sparse_insert(off, payload ckey, aux) */
 #define LION_OP_DELTA		16	/* REPLACE at off by aux bytes, as a diff */
 #define LION_OP_NDISTINCT	17	/* payload = LionMetaNdistinct (§33) */
-#define LION_OP_STORE_META	18	/* payload = LionMetaStore (§40) */
 
 /*
  * LION_OP_DELTA: the item at `off` becomes `aux` bytes long, and the bytes

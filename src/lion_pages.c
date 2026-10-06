@@ -71,7 +71,7 @@ lion_init_page(Page page, uint16 flags)
 }
 
 /*
- * Mark a container page, or a store page (§40), free (DESIGN.md §18).
+ * Mark a container page free (DESIGN.md §18).
  *
  * Everything on the page goes except the special area, whose owner_hash and
  * owner_head are deliberately kept: verify() uses them to say which chain a
@@ -86,8 +86,7 @@ lion_page_set_deleted(Page page, FullTransactionId safexid)
 	LionPageOpaque opaque = LionPageGetOpaque(page);
 	LionDeletedPageData *contents;
 
-	/* a posting page, or a window store page (DESIGN.md §40) */
-	Assert((opaque->flags & (LION_PAGE_CONTAINER | LION_PAGE_STORE)) != 0);
+	Assert((opaque->flags & LION_PAGE_CONTAINER) != 0);
 
 	/* Drop every item and the chain link; keep the owner. */
 	((PageHeader) page)->pd_lower = SizeOfPageHeaderData;

@@ -11,9 +11,6 @@
 #include "postgres.h"
 
 #include "lion_customscan.h"
-#include "lion_store.h"
-
-#include "executor/nodeAgg.h"
 
 static LionQueryMode lion_multikey_cost_mode_ex(IndexOptInfo *idx,
 												AttrNumber col, Node *clause,
@@ -76,29 +73,6 @@ lion_index_dir_pages(IndexOptInfo *idx, double *height)
 
 	index_close(indexrel, AccessShareLock);
 	return Max(dirpages, 1.0);
-}
-
-/*
- * The pages of idx's window store (DESIGN.md §40): the map and store pages
- * the meta page's record counts, which the build sets and every page added
- * or freed keeps exact - 0 for an index that stores nothing - and in
- * *nstored how many columns it stores.  They are no posting pages: every
- * formula below that takes the posting pages as what is left of the index
- * after its meta page and its directory takes these out too.
- */
-double
-lion_index_store_pages(IndexOptInfo *idx, int *nstored)
-{
-	Relation	indexrel = index_open(idx->indexoid, AccessShareLock);
-	LionMetaPageData meta;
-	LionMetaStore store;
-
-	lion_read_meta(indexrel, &meta);
-	lion_read_meta_store(indexrel, &meta, &store);
-	index_close(indexrel, AccessShareLock);
-	if (nstored != NULL)
-		*nstored = pg_popcount32(store.store_cols);
-	return (double) store.store_pages;
 }
 
 /* A key column's n_distinct, or -1 for an expression column. */
@@ -868,8 +842,7 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	share = lion_index_column_share(root, rel, idx, col);
 	dirpages = lion_index_dir_pages(idx, &height);
 
-	container_pages = ((double) idx->pages - 1.0 - dirpages -
-					   lion_index_store_pages(idx, NULL)) *
+	container_pages = ((double) idx->pages - 1.0 - dirpages) *
 		lion_index_column_posting_share(root, rel, idx, col);
 	container_pages = Max(container_pages, 0.0);
 	dirpages = Max(dirpages * share, 1.0);
@@ -3757,168 +3730,6 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	cpath->path.startup_cost = run;
 	cpath->path.total_cost = run + outrows * cpu_tuple_cost;
 	(void) numgroups;
-}
-
-/*
- * The spill of one hash table of the gather (DESIGN.md §40, "As built:
- * spilling"), priced as cost_agg() prices an AGG_HASHED spill, onto *startup
- * and *total: entries of entrybytes each, the batches they make beside the
- * memory hash_agg_set_limits() leaves them - hash_mem, less the buffers of
- * the partitions when they will not fit - and the levels of recursion the
- * partitions per level make of those batches; and at every level, tuples of
- * width bytes each written and read back - the pages written at
- * random_page_cost and read at seq_page_cost, both twice over for the
- * spill's poorer I/O pattern, and two cpu_tuple_costs a tuple, as
- * cost_agg() has it.  The reads are paid as the batches are read, so only
- * in the total; nothing when the entries fit.
- */
-static void
-lion_cost_store_spill(double entries, double entrybytes, double tuples,
-					  int32 width, Cost *startup, Cost *total)
-{
-	Size		mem_limit;
-	uint64		ngroups_limit;
-	int			num_partitions;
-	double		nbatches;
-	double		depth;
-	double		pages;
-	Cost		written;
-	Cost		cpu;
-
-	entrybytes = Max(entrybytes, 1.0);
-	hash_agg_set_limits(entrybytes, entries, 0, &mem_limit, &ngroups_limit,
-						&num_partitions);
-	nbatches = Max((entries * entrybytes) / (double) mem_limit,
-				   entries / (double) Max(ngroups_limit, 1));
-	nbatches = Max(ceil(nbatches), 1.0);
-	if (nbatches <= 1.0)
-		return;
-	num_partitions = Max(num_partitions, 2);
-	depth = ceil(log(nbatches) / log(num_partitions));
-
-	/* relation_byte_size()'s pages of the tuples */
-	pages = tuples * (MAXALIGN(Max(width, 1)) +
-					  MAXALIGN(SizeofHeapTupleHeader)) / BLCKSZ;
-	written = pages * depth * 2.0 * random_page_cost;
-	cpu = depth * tuples * 2.0 * cpu_tuple_cost;
-	*startup += written + cpu;
-	*total += written + cpu + pages * depth * 2.0 * seq_page_cost;
-}
-
-/*
- * THE GATHER OF THE WINDOW STORE (DESIGN.md §40, "Costs"): what the count
- * cpath already carries - of the WHERE, or the sum over every row, whose
- * rows are each relation's rel->rows - becomes the count of a node that
- * gathers ncols columns of the relation's store index (t->storeidx) for each
- * of those rows and forms its groups and aggregates of them.  Per relation
- * counted - the table, or each live leaf partition with its own pages, rows
- * and store, summed as lion_cost_count_path() sums the count:
- *
- *	- a value per row per column decoded (LION_STORE_VALUE_COST);
- *	- each column's store pages in every window the rows lie in, the windows
- *	  being the heap's 64-page container keys, of which rows scattered over
- *	  the heap touch nkeys * (1 - e^(-rows / nkeys)), and a column's pages in
- *	  one its share of the store - the meta record's store_pages over the
- *	  windows and the columns stored - and never less than one
- *	  (LION_STORE_PAGE_COST).  The entries of a range, an IN list or the sum
- *	  over every row are merged into one union under a gather, a directory
- *	  leaf's at a time, so a window's pages are read about once (the count
- *	  engine, lion_count_sources_run() and lion_sum_walk());
- *	- each row hashed into its group, as the decoded walk prices a row into
- *	  its hash table of combinations (LION_DECODE_HASH_ROW_COST, and
- *	  LION_DECODE_ROW_COL_COST a column after the first), an operator per
- *	  aggregate it steps, and the hash of a count(DISTINCT)'s pairs;
- *
- * and once, for the one hash table every relation's rows go into:
- *
- *	- the groups, all of which come out once the count is over;
- *	- when the table - hashbytes, the pairs' pairbytes of it - would not fit
- *	  in hash_mem, or beside a count(DISTINCT) the groups alone in half of
- *	  it, the spill (DESIGN.md §40, "As built: spilling"), priced as
- *	  cost_agg() prices a HashAggregate's (lion_cost_store_spill()): with a
- *	  GROUP BY, every row of rowwidth bytes written and read back once a
- *	  level, the groups being the entries and the memory per group
- *	  hashbytes / groups, or twice the groups' own where the half binds;
- *	  with a count(DISTINCT), each row's value, a pair of pairwidth bytes,
- *	  the same way, the pairs being the entries.  Nothing when it fits: the
- *	  estimate of a path that does not spill is as it was.
- *
- * A row on a page that is not all-visible, or one the store leaves to the
- * heap, has its values read from the tuple its recheck fetches, which the
- * count has priced already (§9).  The units and the margin of §39 are the
- * caller's, as for every count path.
- */
-void
-lion_cost_store_path(PlannerInfo *root, CustomPath *cpath, List *targets,
-					 int ncols, int ngroup, double groups, double outrows,
-					 int naggs, int ndistinct, double distinctpairs,
-					 double hashbytes, double pairbytes, int32 rowwidth,
-					 int32 pairwidth)
-{
-	Cost		run = cpath->path.total_cost;
-	Cost		spillstartup = 0;
-	Cost		spilltotal = 0;
-	double		allrows = 0;
-	double		needbytes;
-	ListCell   *lc;
-
-	Assert(ncols > 0);
-	foreach(lc, targets)
-	{
-		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
-		RelOptInfo *rel = t->rel;
-		double		heap_pages = Max((double) rel->pages, 1.0);
-		double		windows = Max(ceil(heap_pages / LION_BLOCKS_PER_CONTAINER),
-								  1.0);
-		double		rows = Max(rel->rows, 1.0);
-		double		touched;
-		double		perwindow;
-		double		storepages;
-		int			nstored = 0;
-
-		Assert(t->storeidx != NULL);
-		storepages = lion_index_store_pages(t->storeidx, &nstored);
-		touched = Max(windows * (1.0 - exp(-rows / windows)), 1.0);
-		perwindow = Max(storepages / windows / (double) Max(nstored, 1), 1.0);
-
-		run += rows * ncols * LION_STORE_VALUE_COST;
-		run += touched * ncols * perwindow * LION_STORE_PAGE_COST;
-		if (ngroup > 0)
-			run += rows * (LION_DECODE_HASH_ROW_COST +
-						   (ngroup - 1) * LION_DECODE_ROW_COL_COST);
-		run += rows * naggs * cpu_operator_cost;
-		run += rows * ndistinct * LION_DECODE_HASH_ROW_COST;
-		allrows += rows;
-	}
-	run += (groups + distinctpairs) * cpu_operator_cost;
-
-	/*
-	 * Beside a count(DISTINCT) the groups alone are held to half of hash_mem
-	 * (lion_store_check_group()), so they spill when twice their memory
-	 * would not fit, and are priced as if each took twice its own.
-	 */
-	needbytes = hashbytes;
-	if (ndistinct > 0)
-		needbytes = Max(needbytes, 2.0 * (hashbytes - pairbytes));
-	if (needbytes > (double) get_hash_memory_limit())
-	{
-		if (ngroup > 0)
-			lion_cost_store_spill(Max(groups, 1.0),
-								  needbytes / Max(groups, 1.0),
-								  allrows, rowwidth,
-								  &spillstartup, &spilltotal);
-		if (ndistinct > 0 && distinctpairs >= 1.0)
-			lion_cost_store_spill(distinctpairs, pairbytes / distinctpairs,
-								  allrows * ndistinct, pairwidth,
-								  &spillstartup, &spilltotal);
-	}
-
-	cpath->path.rows = outrows;
-#if PG_VERSION_NUM >= 180000
-	cpath->path.disabled_nodes = 0;
-#endif
-	cpath->path.startup_cost = run + spillstartup;
-	cpath->path.total_cost = run + spilltotal + outrows * cpu_tuple_cost;
 }
 
 /*
