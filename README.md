@@ -370,7 +370,12 @@ SELECT country, sum(amount) FROM events WHERE event_type = 'purchase' GROUP BY c
 
 `EXPLAIN` shows `Custom Scan (LionOrdered)` with `Ordered By: <index> (index only)` for a walk that
 gives the query its order, and `Custom Scan (LionBtreeScan)` with `Index: <index> (index only)` for
-one that does not; `Lion Cond` is what Lion answered. A query that reads a column the B-tree lacks
+one that does not; `Lion Cond` is what Lion answered. A full covering walk reads the B-tree in place
+of the heap but spends about 170 ns an entry on the membership probe, so with a warm cache it loses
+to the Lion index's own scan for a filter of a few percent and to a sequential scan for a wide one;
+it pays when the heap would be read cold or the filter is far wider than the B-tree's share of the
+heap, and the planner's I/O constants (`random_page_cost`, `seq_page_cost`) decide (DESIGN.md
+§40.3). A query that reads a column the B-tree lacks
 walks in heap mode under an `ORDER BY` (as before) and gets no unordered walk; `SELECT ... FOR
 UPDATE` needs the row's `ctid` and is heap mode too. The cost model chooses between the node, the
 B-tree's own scans and a bitmap scan of the Lion indexes; `pg_lion.enable_ordered_scan` and

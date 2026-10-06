@@ -12480,10 +12480,17 @@ are exact:
 - a qual was not answered: a range beside its column's sets (§29.2), a second WALK column or long
   list, a multi-key column in mode ALL or an `IS NOT NULL` next to another column that does answer
   (dropped, as in the bitmap path; `IS NOT NULL` is then the recheck of a null test per row);
-- a MULTI-KEY column's query was answered at all (strategies 2 .. 5, §17). The bitmap path passes
-  mode KEYS through unrechecked because `lion_extract_query()` classifies it as exact; the plain
-  path is chosen for selective lookups, where one operator call per fetched row costs nothing next
-  to the fetch, and it does not have to rest on that classification;
+- a MULTI-KEY column's query in mode ALL (strategies 2 .. 5, §17: a prefix, a NOT, weights, a NULL
+  key, INCLUDE_EMPTY, `<@`, too many keys): every row, rechecked. A query in mode KEYS is exact on
+  the plain path as it is on the bitmap path, which has always passed it through unrechecked: both
+  rest on `lion_extract_query()`'s classification - mode KEYS is exactly the rows an AND/OR of
+  whole key sets selects, and a key's set is its own, a hash tie being resolved by the opclass
+  equality in the directory descent (§21) - and on the one `lion_scan_col_tree()` they share,
+  which fails the tree (`*ok = false`) unless every element of the query is in mode KEYS. *(Until
+  2026-10-06 the plain path rechecked every multi-key answer, on the ground that one operator call
+  per fetched row costs nothing next to the fetch. §40's index-only mode broke that ground: a set
+  reported inexact made the node fetch every member's heap tuple for the recheck, for a filter the
+  index had answered exactly.)*
 - the UNION shape (§29.3), always;
 - a non-MVCC scan with a NOPIN set (§29.5).
 
@@ -13950,7 +13957,8 @@ ordered path's selectivity `s_o` (the fraction of the index its own quals leave)
 
 - **start-up** = `C_lion` + copying the answer into the set, `containers x cpu_operator_cost`,
   with `containers = min(heap pages / LION_BLOCKS_PER_CONTAINER, s T)`;
-- **the walk** = `C_ord` + `s_o T` membership tests at `cpu_operator_cost` each;
+- **the walk** = `C_ord` + `s_o T` probes at `LO_PROBE_TUPLES` (2) × `cpu_tuple_cost` +
+  `cpu_operator_cost` each (§40.3, "The probe's price"; one `cpu_operator_cost` until 2026-10-06);
 - **the heap** = `F = s_o T s` members fetched, priced as `cost_index()` prices heap fetches:
   `index_pages_fetched()` at `random_page_cost` for an uncorrelated order, the members' share of
   the heap for a correlated one, interpolated by the square of the ordered index's correlation
@@ -17568,7 +17576,13 @@ a B-tree's clustering on a pinned key, and the B-tree is the user's to create.
 
 - **The relation, the WHERE and the lion side**: §30.1 and §30.2, unchanged (`lo_rel_ok()`,
   `lo_lion_accesses()`). The target of an UPDATE, DELETE or MERGE, a relation with security quals,
-  another table AM: declined as there.
+  another table AM: declined as there. So is a relation the planner has proven empty
+  (`IS_DUMMY_REL()`: a constant-false or NULL restriction, constraint exclusion) - core builds no
+  index path for one and `make_one_rel()` leaves its pages out of `root->total_table_pages`, which
+  `cost_index()` asserts they are in; before `LionBtreeScan` the hook never reached
+  `create_index_paths()` for such a relation, because its path list held only the empty Append and
+  there was no ordered path to match, but `lo_btree_paths()` runs it whenever a B-tree covers the
+  target, and ordered.sql's `EXECUTE lo_p(NULL, 0)` tripped the assertion (2026-10-06).
 - **Coverage.** The B-tree covers the node when every column it must produce is a plain column of
   the index - a key column (`indexkeys[i] != 0`) or an INCLUDE column - that the AM can return
   (`canreturn[i]`, true of every B-tree column). The columns the node must produce are decided per
@@ -17659,6 +17673,33 @@ time, and the fetches it costs are bounded by the members - the bound heap mode 
 member. The planner also hands the executor the entries the walk is expected to visit,
 `indexselectivity × rel->tuples`, for the switch's density gate (§40.4; `LO_PRIV_EXPECTED`, a
 float8 Const in `custom_private`, 0 when the ordered path is a lion column's walk).
+
+**The probe's price** (2026-10-06). The walk is CPU-bound. On bench/quick.py's 5M-row `fact` table
+(its covering B-tree `(c20k) INCLUDE (c1m)`, 107 MB, under `WHERE c20 = 3 GROUP BY c20k`, a 5%
+filter) the covering walk took 830 to 925 ms for 5M entries, 170 ns an entry - the btree step, the
+probe (a binary search over the container keys and a membership test) and the met-before mark -
+against 85 ns a row for the sequential scan with its filter, which the planner charges
+`cpu_tuple_cost + cpu_operator_cost` (0.0125). Priced at `indextotalcost`'s `cpu_index_tuple_cost`
+plus one `cpu_operator_cost` for the probe, a fifth of that for twice the work, the walk came out at
+97,072 against 102,912 for the lion index's own scan and HashAggregate, which run in 200 to 250 ms,
+and was chosen at `random_page_cost` 1.1 as well (57,055 against 101,486). Each walked entry's probe
+is now `LO_PROBE_TUPLES` (2) × `cpu_tuple_cost` + `cpu_operator_cost`, 0.0225, 1.8 times the
+sequential scan's row, which puts that walk at 197,072 (157,055 at `random_page_cost` 1.1, against
+the lion index scan's 101,486) and sends the query to the lion index's scan at either setting,
+while the LIMIT walks keep the node (§40.7, "On the benchmark's tables"). The lion column walk of
+§30.11 keeps its own pricing (`lo_cost_walk()`). Where the covering B-tree holds the filter's
+column as well, core's own Index Only Scan with the filter walks the same entries for one
+`cpu_operator_cost` each, and is now priced below the node; on btreescan.sql's 100,000 rows the two
+run in the same time for `c200 = 17 ORDER BY k LIMIT 10` (0.5 ms either way), and core's filtered
+scan of `tags @> '{t3}'` over 94,000 entries takes 18 to 28 ms against the node's 13 to 17, the
+containment operator costing core more than the one `cpu_operator_cost` it is charged at.
+
+**Warm and cold.** A full covering walk reads the B-tree (107 MB here) in place of the heap (751
+MB) but spends those 170 ns an entry, so warm it loses to the lion index's own scan of a 5% filter
+by four times and to the sequential scan by two; it pays when the heap would be read cold, or the
+filter is far wider than the B-tree's share of the heap. The planner's I/O constants decide,
+`pg_lion.enable_btree_scan` turns the unordered walks off and `pg_lion.enable_ordered_scan` the
+ordered ones.
 
 ### 40.4 Execution
 
@@ -17799,8 +17840,8 @@ through the node (every core scan off) and through the ordinary plan (both of th
 off) and compared - in order under an ORDER BY, as multisets otherwise - with the node and its mode
 named. A covered `=`, ranges and `IN` lists on the B-tree side with lion filters, lion `IN` lists, a
 `name` INCLUDE column filtered and returned, DESC with a LIMIT, OFFSET, an empty answer, a LIMIT
-beyond the match count; the aggregate shape under a GROUP BY and a plain aggregate, with an exact
-filter and a rechecked (multi-key) one; the counters (`Heap Fetches: 0` after VACUUM, `Rows Removed
+beyond the match count; the aggregate shape under a GROUP BY and a plain aggregate, with a scalar
+filter and a multi-key one (exact as well, §29.6); the counters (`Heap Fetches: 0` after VACUUM, `Rows Removed
 by Lion Recheck` evaluated on the index tuple's values, the switch in index-only mode with its heap
 fetches counted); rows inserted in the same transaction and a dirty heap (HOT and non-HOT updates,
 deletes) before VACUUM, their heap fetches counted, and after VACUUM with none; `FOR UPDATE` (heap
@@ -17827,6 +17868,22 @@ test/isolation/btreescan_serializable.spec is §40.5's write skew, and passes on
 lock; a step shows the read ran index-only with `Heap Fetches: 0`, so the conflict is the page
 lock's.
 
+**On the benchmark's tables** (2026-10-06): bench/quick.py's `fact` (5M rows) and `docs` (1M), warm,
+through the node, with both of its settings off, and in heap mode (`enable_indexonlyscan = off`),
+EXPLAIN (ANALYZE, TIMING OFF) three times each. `SELECT c20k, sum(c1m) FROM fact WHERE c20 = 3
+GROUP BY c20k`: the lion index's scan and HashAggregate at `random_page_cost` 4 and 1.1 (the node
+forced: the 5M-entry walk, §40.3). `... WHERE c200 = 17 GROUP BY c20k`: the same plan. `SELECT id,
+payload FROM fact WHERE c200 = 17 ORDER BY id DESC LIMIT 2000` over `(id) INCLUDE (payload)`: the
+node, index only, 400,000 entries walked and no heap read, against core's backward index scan with
+a filter. `... WHERE c200 = 17 AND c20 = 3 ORDER BY id DESC LIMIT 10`: the node. `SELECT id,
+payload FROM docs WHERE tags @> ARRAY['t1','t17'] ORDER BY id DESC LIMIT 10` over `(id) INCLUDE
+(payload)`: the node, index only, the set exact (§29.6) and `Heap Fetches: 0`. Timed on the dev
+cluster after the probe was priced: the `c20 = 3` GROUP BY 217 to 247 ms through the lion index's
+scan (the node forced: 973 to 1,002 ms), the `c200 = 17` one 40 to 48 ms (the node forced: 722 to
+746); the LIMIT 2000 walk 28.8 to 29.6 ms through the node against 44 to 49 for core's backward scan
+with a filter; the two-filter LIMIT 10 2.5 to 2.9 ms against 5.2 to 7.5; the `tags` LIMIT 10 over
+`docs` 1.5 to 1.7 ms against 4.0 to 4.5.
+
 ### 40.8 Not done
 
 - **The density gate's blind spot** (§40.4): members dense early in the order and the rest at its
@@ -17842,5 +17899,9 @@ lock's.
   tuple returned", which the master job's btreescan run will tell.
 - **A partial B-tree's predicate clause** stays in the filter (§40.1); dropping it as core's index
   scan does would need the switch's recheck to take the predicate on.
+- **A faster probe.** Each entry's probe is a binary search over the set's container keys and then
+  a membership test, about half of the 170 ns an entry (§40.3); a directory indexed by container key
+  would find the container in O(1), and a bitset container's test is O(1) already where an array
+  container's is a second binary search. The price above would then come down with it.
 - **Expression columns** returning a value for a matching expression of the target; **parallel**
   walks (`parallel_safe = false`, as §30).

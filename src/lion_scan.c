@@ -3087,14 +3087,18 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 
 			if (col->multikey)
 			{
-				/* Answered, and rechecked all the same (§29.6). */
-				src->recheck = true;
+				/*
+				 * A query in mode KEYS is exactly the rows its AND/OR of
+				 * whole key sets selects, and exact here as it is for the
+				 * bitmap path (§29.6); one in mode ALL is every row, rechecked.
+				 */
 				node = lion_scan_col_tree(so->index, col, skey, &acc, &ok, &none);
 				if (none)
 					nomatch = true;
 				else if (!ok)
 				{
 					/* mode ALL: every row; the first such column, as below */
+					src->recheck = true;
 					if (unioncol < 0 || skey->sk_attno - 1 < unioncol)
 						unioncol = skey->sk_attno - 1;
 				}

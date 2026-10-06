@@ -228,7 +228,7 @@ SELECT lion_iq('SELECT id FROM lis WHERE ci = ''Alice''');
 SELECT lion_iq('SELECT id FROM lis WHERE ci IN (''BOB1'', ''bob2'')');
 -- a collation the index was not built under is not answered by it
 SELECT lion_iq('SELECT id FROM lis WHERE t = ''v7'' COLLATE "POSIX"');
--- arrays: exact queries (rechecked all the same) and ones that need every row
+-- arrays: exact queries (mode KEYS, no recheck) and ones that need every row
 SELECT lion_iq('SELECT id FROM lis WHERE tags @> ''{3}''');
 SELECT lion_iq('SELECT id FROM lis WHERE tags @> ''{3, 13}''');
 SELECT lion_iq('SELECT id FROM lis WHERE tags && ''{3, 50}''');

@@ -175,6 +175,20 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 #define LO_SWITCH_DENSITY	0.5
 
 /*
+ * What the walk spends on each btree entry it meets (DESIGN.md §30.3,
+ * §40.3): the btree step, the set probe (a binary search over the container
+ * keys and a membership test) and the met-before mark, in cpu_tuple_costs
+ * over the one cpu_operator_cost indextotalcost does not hold.  Measured on
+ * the quick benchmark's 5M-row table (§40.3): a full covering walk takes
+ * 670 to 890 ms, 170 ns an entry, against 85 ns a row for a sequential scan
+ * with its filter, which the planner charges cpu_tuple_cost +
+ * cpu_operator_cost; one cpu_operator_cost for the probe was a fifth of that
+ * for twice the work, and chose the walk over plans it ran three to four
+ * times slower than.
+ */
+#define LO_PROBE_TUPLES		2
+
+/*
  * The set evaluated lazily (DESIGN.md §30.4, "The set, lazily"), until its
  * probes have cost what building it would: a probe of a stream is a unit of
  * work for each of its posting sets, starting a stream again behind where it
@@ -960,9 +974,10 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	/* the lookups, and the copy of their answer into the set */
 	startup = lioncost + ncont * cpu_operator_cost;
 
-	/* the walk: the ordered index's own cost, and one test per entry */
+	/* the walk: the ordered index's own cost, and the probe of each entry */
 	walked = clamp_row_est(ord->indexselectivity * tuples);
-	run = ord->indextotalcost + walked * cpu_operator_cost;
+	run = ord->indextotalcost +
+		walked * (LO_PROBE_TUPLES * cpu_tuple_cost + cpu_operator_cost);
 
 	/*
 	 * The members' heap fetches, priced as cost_index() prices them: of the
@@ -1070,6 +1085,15 @@ lo_rel_ok(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	if (rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW)
 		return false;
 	if (rte->securityQuals != NIL)
+		return false;
+
+	/*
+	 * Proven empty already (a constant-false or NULL restriction, or
+	 * constraint exclusion): core costs no index path for it, and neither
+	 * does the node - the planner leaves such a relation's pages out of
+	 * root->total_table_pages, which cost_index() asserts they are in.
+	 */
+	if (IS_DUMMY_REL(rel))
 		return false;
 
 	/*

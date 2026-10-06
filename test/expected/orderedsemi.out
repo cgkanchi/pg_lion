@@ -532,9 +532,8 @@ SELECT * FROM os_run($$
  Lion Keys Walked: 131
  Lion Set Hits: 10
  Heap Fetches: 10
- Rows Removed by Lion Recheck: 0
- Lion Set: 7 containers, rechecked
-(8 rows)
+ Lion Set: 7 containers, exact
+(7 rows)
 
 SET enable_sort = off;
 SELECT * FROM os_run($$
@@ -548,10 +547,9 @@ SELECT * FROM os_run($$
  Lion Keys Walked: 3235
  Lion Set Hits: 16
  Heap Fetches: 60
- Rows Removed by Lion Recheck: 0
- Lion Set: 7 containers, rechecked
+ Lion Set: 7 containers, exact
  Switched to Fetch and Sort: 1 of 1 scans, 44 members fetched
-(9 rows)
+(8 rows)
 
 RESET enable_sort;
 SELECT os_cmp($$
@@ -920,12 +918,15 @@ SELECT os_cmp($$
  LionOrdered, 5 rows
 (1 row)
 
+-- a five-row LIMIT over one partition of 11,000 rows goes to core's backward
+-- scan with a filter: so short a walk does not pay the lion lookups' start-up
+-- (DESIGN.md §40.3), and the two run in the same time
 SELECT os_cmp($$
 	SELECT f.id FROM osf f WHERE f.kind = 'b' AND f.tags @> ARRAY['t3', 'u4']
 	 ORDER BY f.id DESC LIMIT 5$$, true);
-       os_cmp        
----------------------
- LionOrdered, 5 rows
+         os_cmp         
+------------------------
+ no LionOrdered, 5 rows
 (1 row)
 
 DROP INDEX osf_id;

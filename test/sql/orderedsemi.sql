@@ -537,6 +537,9 @@ SELECT * FROM os_plan($$
 	SELECT f.id FROM osf f WHERE f.tags @> ARRAY['rare'] ORDER BY f.id LIMIT 5$$);
 SELECT os_cmp($$
 	SELECT f.id FROM osf f WHERE f.tags @> ARRAY['rare'] ORDER BY f.id LIMIT 5$$);
+-- a five-row LIMIT over one partition of 11,000 rows goes to core's backward
+-- scan with a filter: so short a walk does not pay the lion lookups' start-up
+-- (DESIGN.md §40.3), and the two run in the same time
 SELECT os_cmp($$
 	SELECT f.id FROM osf f WHERE f.kind = 'b' AND f.tags @> ARRAY['t3', 'u4']
 	 ORDER BY f.id DESC LIMIT 5$$, true);
