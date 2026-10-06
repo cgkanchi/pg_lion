@@ -1,1 +1,0 @@
-../store_vacuum_reader.spec

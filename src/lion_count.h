@@ -267,74 +267,6 @@ extern int64 lion_count_heap_filtered(Relation heap, Snapshot snapshot,
 									  LionCountStats *stats);
 
 /*
- * A GATHER (DESIGN.md §40, "The custom shapes"): the values of some stored
- * columns of one lion index for every row a count counts, handed to `row`
- * one row at a time - values[i] and isnull[i] being column i's, in the order
- * the columns were named - while the count goes on.  The count's own number
- * is unchanged: it is the number of rows handed over.
- *
- * Where the values come from is the §9 interlock's decision, made once per
- * heap page of a container, under the pins of the pages the container came
- * from (lion_count_container_masks()): a page the visibility map calls
- * all-visible takes its rows' values from the window store
- * (lion_store_gather()), and every other row - on a page that is not
- * all-visible, on one the store leaves to the heap (ABSENT, or no store yet),
- * every row of a count with a row filter, every row on a hot standby whose
- * indexes are not all in rmgr mode - is read from the heap tuple the
- * snapshot sees, which settles its visibility and its values together.  The
- * index the values are read from need not be one the count reads posting
- * sets of: the all-visible bit is set only after every index's ambulkdelete
- * has returned, so the pin of any index carries the interlock for all of
- * them (lion_count_int.h).
- *
- * A value handed to `row` lives until it returns, and may point into a heap
- * page the caller keeps pinned or into memory that is reset afterwards: what
- * the callback keeps, it copies.  A varlena from the heap is detoasted
- * first.  Every gathered column must be a plain column of the heap (an
- * INCLUDE column, or a key column that is not an expression), which the
- * heap path reads by its attribute number.
- *
- * The gather is attached to the counts of one node through its visibility
- * cache (lion_vis_cache_set_gather()), as a row filter is: every count that
- * is handed the cache afterwards gathers, until it is detached with NULL.
- * An existence test and a collection never gather.
- */
-typedef void (*LionGatherRowFn) (void *arg, const Datum *values,
-								 const bool *isnull);
-
-typedef struct LionGather LionGather;
-
-typedef struct LionGatherStats
-{
-	int64		store_rows;		/* rows whose values came from the store */
-	int64		heap_rows;		/* ... from the heap tuple */
-	int64		store_pages;	/* heap pages whose rows the store supplied */
-	int64		absent_pages;	/* all-visible heap pages it left to the heap */
-} LionGatherStats;
-
-/*
- * ords are the columns' ordinals in index's store (lion_store_ordinal()); the
- * caller keeps index open for as long as the gather lives.  The gather's
- * memory is a child of cxt.
- */
-extern LionGather *lion_gather_create(Relation heap, Relation index,
-									  int ncols, const int *ords,
-									  LionGatherRowFn row, void *arg,
-									  MemoryContext cxt);
-extern void lion_gather_destroy(LionGather *g);
-extern void lion_gather_get_stats(const LionGather *g, LionGatherStats *out);
-extern void lion_vis_cache_set_gather(LionVisCache *cache, LionGather *g);
-extern LionGather *lion_vis_cache_get_gather(LionVisCache *cache);
-
-/*
- * lion_count_heap_filtered() for a node that gathers: every row it counts is
- * handed to g as well, from the tuple the scan returns.  g may be NULL.
- */
-extern int64 lion_count_heap_gather(Relation heap, Snapshot snapshot,
-									LionRowFilter *filter, LionGather *g,
-									LionCountStats *stats);
-
-/*
  * A located posting set: everything the counting code needs in order to
  * iterate the containers of one (index, key) pair.
  *
@@ -1127,13 +1059,6 @@ extern const LionContainer *lion_source_next(LionSource *src);
 extern bool lion_source_sorted(LionSource *src);
 extern bool lion_source_exact(LionSource *src);
 extern void lion_source_close(LionSource *src);
-
-/*
- * Does the container lion_source_next() handed out last still have the §9
- * pin of the page it came from behind it (DESIGN.md §9, §29.5)?  Only a
- * source opened with keeppins can say yes; a LIST answers per batch.
- */
-extern bool lion_source_interlocked(LionSource *src);
 
 /*
  * The TIDs of one ordered scalar key column in the column's order (DESIGN.md

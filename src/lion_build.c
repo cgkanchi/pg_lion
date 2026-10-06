@@ -92,7 +92,6 @@
 
 #include "lion.h"
 #include "lion_spool.h"
-#include "lion_store.h"
 
 #if PG_VERSION_NUM < 170000
 #include "access/xloginsert.h"
@@ -493,14 +492,6 @@ typedef struct LionBuildState
 
 	/* A NARROW item written, which makes the index version 8 (§38). */
 	bool		wrote_narrow;
-
-	/*
-	 * The window store (DESIGN.md §40): its record, store_cols decided before
-	 * the scan, and its builder while rows are fed to it - during the scan of
-	 * a serial build, in a second scan of a parallel one.
-	 */
-	LionMetaStore storerec;
-	LionStoreBuild *store;
 } LionBuildState;
 
 static void lion_build_callback(Relation index, ItemPointer tid, Datum *values,
@@ -1787,31 +1778,6 @@ lion_build_callback(Relation index, ItemPointer tid, Datum *values,
 }
 
 /*
- * A serial build of an index with a window store (DESIGN.md §40): the same,
- * and the row's stored values to the store's builder, which writes a window's
- * pages as soon as the scan has left it.
- */
-static void
-lion_build_callback_store(Relation index, ItemPointer tid, Datum *values,
-						  bool *isnull, bool tupleIsAlive, void *arg)
-{
-	LionBuildState *bs = (LionBuildState *) arg;
-
-	lion_spool_add(bs->spool, tid, values, isnull);
-	lion_store_build_add(bs->store, tid, values, isnull);
-}
-
-#if PG_VERSION_NUM >= 170000
-/* The parallel build's second scan, which feeds the store alone. */
-static void
-lion_build_callback_storeonly(Relation index, ItemPointer tid, Datum *values,
-							  bool *isnull, bool tupleIsAlive, void *arg)
-{
-	lion_store_build_add((LionStoreBuild *) arg, tid, values, isnull);
-}
-#endif
-
-/*
  * The one pass over the spool's output: each group it hands over is the
  * entries of one directory position - one key, or every key of a colliding
  * hash under an unordered opclass - with their codes in ascending order,
@@ -2335,39 +2301,6 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.cur = NULL;
 
 	/*
-	 * Which columns the window store keeps (DESIGN.md §40), decided once and
-	 * recorded on the meta page: the NOTICEs and ERRORs about columns it
-	 * cannot store come now, before the scan.
-	 */
-	memset(&bs.storerec, 0, sizeof(bs.storerec));
-	bs.storerec.store_cols = lion_store_columns(index, &bs.ix, true);
-	if (bs.storerec.store_cols != 0)
-	{
-		bs.storerec.store_max_len = opts ? (uint32) opts->store_max_len : 0;
-		lion_store_fill_state(index, &bs.ix, &bs.storerec, bs.buildctx);
-	}
-
-	/*
-	 * Everything below writes pages, and all of it goes through one bulk
-	 * writer: nothing may touch these blocks through the buffer manager until
-	 * smgr_bulk_finish() has written and (if needed) synced them.  It starts
-	 * before the scan, because a serial build writes the window store's pages
-	 * during it; the meta page's block is reserved first, as it always was.
-	 */
-	{
-		/*
-		 * The bulk writer allocates its page buffers in the context that is
-		 * current when it starts, and frees them as it writes them; keep them
-		 * in the build context, which outlives smgr_bulk_finish().
-		 */
-		MemoryContext oldctx = MemoryContextSwitchTo(bs.buildctx);
-
-		bs.bulk = smgr_bulk_start_rel(index, MAIN_FORKNUM);
-		MemoryContextSwitchTo(oldctx);
-	}
-	lion_build_init_pages(&bs);
-
-	/*
 	 * The scan.  Core asks for workers only where the AM can take them
 	 * (amcanbuildparallel, 17 and later) and plan_create_index_workers()
 	 * allows them: max_parallel_maintenance_workers, the table's
@@ -2388,26 +2321,30 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		/*
 		 * No synchronized scan: TIDs in ascending order is what lets the spool
 		 * append instead of sort (lion_spool.c), which is also why GIN's
-		 * serial build asks for none - and what lets the window store write
-		 * each window as the scan leaves it (§40).
+		 * serial build asks for none.
 		 */
-		if (bs.ix.nstored > 0)
-		{
-			bs.store = lion_store_build_begin(index, &bs.ix, bs.bulk,
-											  &bs.nblocks);
-			reltuples = table_index_build_scan(heap, index, indexInfo, false,
-											   true, lion_build_callback_store,
-											   &bs, NULL);
-			lion_store_build_finish(bs.store, &bs.storerec);
-			bs.store = NULL;
-		}
-		else
-			reltuples = table_index_build_scan(heap, index, indexInfo, false,
-											   true, lion_build_callback,
-											   bs.spool, NULL);
+		reltuples = table_index_build_scan(heap, index, indexInfo, false, true,
+										   lion_build_callback, bs.spool, NULL);
 		bs.indtuples = lion_spool_ntids(bs.spool);
 	}
 
+	/*
+	 * Everything below writes pages, and all of it goes through one bulk
+	 * writer: nothing may touch these blocks through the buffer manager until
+	 * smgr_bulk_finish() has written and (if needed) synced them.
+	 */
+	{
+		/*
+		 * The bulk writer allocates its page buffers in the context that is
+		 * current when it starts, and frees them as it writes them; keep them
+		 * in the build context, which outlives smgr_bulk_finish().
+		 */
+		MemoryContext oldctx = MemoryContextSwitchTo(bs.buildctx);
+
+		bs.bulk = smgr_bulk_start_rel(index, MAIN_FORKNUM);
+		MemoryContextSwitchTo(oldctx);
+	}
+	lion_build_init_pages(&bs);
 	bs.leaf = lion_build_level(&bs, 0);
 
 	/*
@@ -2443,36 +2380,6 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	lion_build_finish_dir(&bs);
 
-#if PG_VERSION_NUM >= 170000
-
-	/*
-	 * A parallel build's participants scanned chunks of the heap that do not
-	 * line up with the store's windows, so the leader builds the store in a
-	 * second, serial scan of its own, with the same snapshot and the same
-	 * emitter as a serial build (DESIGN.md §40, "Build").  Spooling the
-	 * stored values beside the codes would save the scan; this is the first
-	 * version.  With SnapshotAny a tuple that was RECENTLY_DEAD for the first
-	 * scan may be DEAD for this one and go unstored, leaving a slot that reads
-	 * as NULL for a TID no snapshot can see - which no reader takes from the
-	 * store, because such a TID's heap page is not all-visible (§40, "Why it
-	 * is safe").
-	 */
-	if (bs.leader != NULL && bs.ix.nstored > 0)
-	{
-		TableScanDesc scan;
-
-		bs.store = lion_store_build_begin(index, &bs.ix, bs.bulk, &bs.nblocks);
-		scan = table_beginscan_strat(heap, bs.leader->snapshot, 0, NULL,
-									 true, false);
-		/* allow_sync is what core asserts with a scan supplied; this one has none */
-		(void) table_index_build_scan(heap, index, indexInfo, true, false,
-									  lion_build_callback_storeonly, bs.store,
-									  scan);
-		lion_store_build_finish(bs.store, &bs.storerec);
-		bs.store = NULL;
-	}
-#endif
-
 	Assert(BlockNumberIsValid(bs.root));
 	metabuf = smgr_bulk_get_buf(bs.bulk);
 	lion_init_metapage((Page) metabuf->data, bs.inline_limit, bs.root,
@@ -2493,8 +2400,6 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		lion_meta_fill_ndistinct(&nd, &bs.ix, bs.nvalues, bs.rows);
 		lion_meta_record_ndistinct((Page) metabuf->data, &nd);
 	}
-	/* ... and the window store's record, which makes it version 9 (§40). */
-	lion_meta_record_store((Page) metabuf->data, &bs.storerec);
 	smgr_bulk_write(bs.bulk, LION_METAPAGE_BLKNO, metabuf, true);
 
 	smgr_bulk_finish(bs.bulk);

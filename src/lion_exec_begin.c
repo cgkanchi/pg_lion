@@ -434,7 +434,6 @@ lion_open_parts(LionCountScanState *st)
 		for (i = 0; i < st->nclause; i++)
 			part->clauseidx[i] = lion_open_index(part->clauseidxoid[i]);
 		part->fgidx = lion_open_index(part->fgidxoid);
-		part->storeidx = lion_open_index(part->storeidxoid);
 	}
 }
 
@@ -449,9 +448,6 @@ lion_close_parts(LionCountScanState *st)
 	{
 		LionPartState *part = &st->part[p];
 
-		if (part->storeidx != NULL)
-			index_close(part->storeidx, AccessShareLock);
-		part->storeidx = NULL;
 		if (part->fgidx != NULL)
 			index_close(part->fgidx, AccessShareLock);
 		part->fgidx = NULL;
@@ -1808,7 +1804,6 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_run_state(st, cscan);
 	lion_begin_contexts(st, estate);
 	lion_begin_decoded_walk(st, cscan, estate);
-	lion_store_begin(st, cscan, estate);
 	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
 	st->writtenrels = lion_statement_written_rels(estate);
 	lion_begin_join_child(st, node, cscan, estate, eflags);

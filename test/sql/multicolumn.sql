@@ -297,11 +297,8 @@ SELECT lion_mccmp($$SELECT id FROM lion_mc_ts WHERE g = 4 AND tsv IS NULL$$);
 
 -- ---- 10. what the DDL accepts and refuses ----------------------------------
 
--- INCLUDE columns are stored, in the window store (DESIGN.md §40, and
--- store.sql), and are not key columns: the index has one key column
-CREATE INDEX lion_mc_inc ON lion_mc USING lion (k) INCLUDE (t);
-SELECT count(*) AS key_columns FROM lion_index_stats('lion_mc_inc') WHERE entries > 0;
-DROP INDEX lion_mc_inc;
+-- INCLUDE columns are not supported (amcaninclude is false)
+CREATE INDEX ON lion_mc USING lion (k) INCLUDE (t);
 
 -- more than INDEX_MAX_KEYS columns is core's own limit
 DO $$ BEGIN

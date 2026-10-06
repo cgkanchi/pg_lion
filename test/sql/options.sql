@@ -101,7 +101,7 @@ CREATE INDEX ON lion_opt USING lion (k, t);
 DROP INDEX lion_opt_k_t_idx;
 
 -- Things a lion index cannot do.
-CREATE INDEX ON lion_opt USING lion (k) INCLUDE (t) WITH (store_max_len = 2001);
+CREATE INDEX ON lion_opt USING lion (k) INCLUDE (t);
 -- (as WARNINGs: PostgreSQL 19 reports the ERROR's position and 18 does not)
 DO $$ BEGIN CREATE INDEX ON lion_opt USING lion (k DESC);
 EXCEPTION WHEN feature_not_supported THEN RAISE WARNING '%', SQLERRM; END $$;

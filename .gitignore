@@ -10,7 +10,6 @@ test/unit/container_test_nosimd
 regression.*
 log/
 test/unit/sparse_test
-test/unit/store_test
 __pycache__/
 *.pyc
 .deps/
