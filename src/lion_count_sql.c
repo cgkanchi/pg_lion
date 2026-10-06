@@ -171,7 +171,7 @@ lion_check_functions_walker(Node *node, void *context)
  * one dropped since the caller named it, or one that never existed (a
  * regclass argument accepts any number).
  */
-static void
+pg_noreturn static void
 lion_count_no_relation(Oid relid)
 {
 	ereport(ERROR,

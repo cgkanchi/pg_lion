@@ -1403,7 +1403,7 @@ lion_cost_range_side(double nkeys, double nedges, const LionSumModel *sum,
 
 	if (sum != NULL)
 		whole = Max(0.0, nkeys / sum->keysper - 0.5 * nedges);
-	if (whole < 1.0)
+	if (sum == NULL || whole < 1.0)
 	{
 		*counts = nkeys;
 		*pages = nkeys * pageper;

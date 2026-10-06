@@ -186,6 +186,13 @@ extern Size lion_container_size_for(LionContainerType type, uint32 cardinality, 
 
 /* Initialise an empty ARRAY container for ckey in buf. */
 extern void lion_container_init(LionContainer *c, uint32 ckey);
+/*
+ * dest (capacity LION_CONTAINER_MAX_SIZE, not overlapping c) = c: byte for
+ * byte when c is well formed, and its clamped self when its header claims
+ * more than a container can hold, so that the copy never runs past dest
+ * whatever c says ("untrusted containers").
+ */
+extern void lion_container_copy(const LionContainer *c, LionContainer *dest);
 
 /*
  * GROWTH IN PLACE (above): the bytes from the start of c that
