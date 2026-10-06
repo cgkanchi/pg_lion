@@ -812,16 +812,25 @@ lion_entry_scan_plan_sum(LionEntryScan *es, Relation index, LionRange *range,
 
 	if (!col->summarized)
 		return false;
-	if (range != NULL && (!range->ordered || range->empty))
-		return false;
-	/* a bucket may hold a hole's rows (DESIGN.md §35): key by key */
-	if (range != NULL && range->nholes > 0)
-		return false;
-	if (part == LION_WALK_ABOVE && range->nupper == 0)
-		return false;
+	if (range == NULL)
+	{
+		/* without a range the walk is the whole column */
+		Assert(part == LION_WALK_ALL);
+		haslowerend = false;
+	}
+	else
+	{
+		if (!range->ordered || range->empty)
+			return false;
+		/* a bucket may hold a hole's rows (DESIGN.md §35): key by key */
+		if (range->nholes > 0)
+			return false;
+		if (part == LION_WALK_ABOVE && range->nupper == 0)
+			return false;
 
-	haslowerend = (part == LION_WALK_ABOVE) ||
-		(part == LION_WALK_INSIDE && range->lower >= 0);
+		haslowerend = (part == LION_WALK_ABOVE) ||
+			(part == LION_WALK_INSIDE && range->lower >= 0);
+	}
 
 	if (haslowerend)
 	{

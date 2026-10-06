@@ -3864,6 +3864,26 @@ run_and_run_cardinality(const LionContainer *a, const LionContainer *b)
 }
 
 /*
+ * The bytes of c that its clamped self occupies (container_clamp()): at most
+ * LION_CONTAINER_MAX_SIZE whatever c's header claims, and
+ * lion_container_size(c) for a well-formed c.
+ */
+static Size
+container_size_clamped(const LionContainer *c)
+{
+	switch (c->type)
+	{
+		case LION_CT_ARRAY:
+			return lion_container_size_for(LION_CT_ARRAY, array_card(c), 0);
+		case LION_CT_RUN:
+			return lion_container_size_for(LION_CT_RUN, 0, run_nruns(c));
+		default:
+			/* a bitmap, of the width lion_container_width() reads */
+			return lion_container_size(c);
+	}
+}
+
+/*
  * o = c, for the set algebra's shortcuts, in what c's readers here look at:
  * a well-formed c is copied byte for byte, and a header claiming more than
  * LION_ARRAY_MAX_CARD members or LION_RUN_MAX_NRUNS runs, or a NARROW's width
@@ -3876,23 +3896,9 @@ run_and_run_cardinality(const LionContainer *a, const LionContainer *b)
 static void
 container_copy(const LionContainer *c, LionContainer *o)
 {
-	Size		size;
 	uint32		i;
 
-	switch (c->type)
-	{
-		case LION_CT_ARRAY:
-			size = lion_container_size_for(LION_CT_ARRAY, array_card(c), 0);
-			break;
-		case LION_CT_RUN:
-			size = lion_container_size_for(LION_CT_RUN, 0, run_nruns(c));
-			break;
-		default:
-			/* a bitmap, of the width lion_container_width() reads */
-			size = lion_container_size(c);
-			break;
-	}
-	memcpy(o, c, size);
+	memcpy(o, c, container_size_clamped(c));
 	container_clamp(o);
 	/* the flags are 0, or a NARROW's width as container_clamp() left it */
 	if (o->type != LION_CT_NARROW)
@@ -3926,14 +3932,26 @@ container_copy(const LionContainer *c, LionContainer *o)
 	}
 }
 
-/* Finish a freshly computed result: optimize and copy into dest. */
+/*
+ * Finish a freshly computed result: optimize and copy into dest.  The size
+ * copied is the clamped one, which never exceeds LION_CONTAINER_MAX_SIZE
+ * whatever o's header says; for the well-formed o every operation here
+ * builds it is lion_container_size(o).
+ */
 static uint32
 container_emit_result(LionContainer *o, LionContainer *dest)
 {
 	lion_container_optimize(o);
 	Assert(lion_container_size(o) <= LION_CONTAINER_MAX_SIZE);
-	memcpy(dest, o, lion_container_size(o));
+	memcpy(dest, o, container_size_clamped(o));
 	return o->cardinality;
+}
+
+/* o = c, clamped as container_copy() clamps it (lion_container.h). */
+void
+lion_container_copy(const LionContainer *c, LionContainer *o)
+{
+	container_copy(c, o);
 }
 
 /*

@@ -980,7 +980,8 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 					sizeof(OffsetNumber) * ndel);
 	}
 
-	if (!needm)
+	/* pM is the page needm asked for, and pN the one the moved items need */
+	if (pM == NULL)
 	{
 		Assert(PageGetExactFreeSpace(pP) >= need);
 		for (i = 0; i < nitems; i++)
@@ -1007,8 +1008,9 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 		}
 	}
 
-	if (nmove > 0)
+	if (pN != NULL)
 	{
+		Assert(nmove > 0);
 		for (i = 0; i < nmove; i++)
 		{
 			OffsetNumber noff = PageAddItemExtended(pN, moveptr[i], movelen[i],
@@ -1035,22 +1037,22 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	{
 		BlockNumber after_m = BlockNumberIsValid(nblk) ? nblk : oldright;
 
-		if (BlockNumberIsValid(mblk))
+		if (pM != NULL)
 		{
 			LionPageGetOpaque(pM)->rightlink = after_m;
 			LionPageGetOpaque(pP)->rightlink = mblk;
 			LionPageGetOpaque(pP)->flags |= LION_PAGE_INCOMPLETE_SPLIT;
-			if (BlockNumberIsValid(nblk))
+			if (pN != NULL)
 				LionPageGetOpaque(pM)->flags |= LION_PAGE_INCOMPLETE_SPLIT;
 		}
 		else
 		{
 			LionPageGetOpaque(pP)->rightlink = after_m;
-			if (BlockNumberIsValid(nblk))
+			if (pN != NULL)
 				LionPageGetOpaque(pP)->flags |= LION_PAGE_INCOMPLETE_SPLIT;
 		}
 
-		if (BlockNumberIsValid(nblk))
+		if (pN != NULL)
 			LionPageGetOpaque(pN)->rightlink = oldright;
 	}
 
