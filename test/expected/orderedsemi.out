@@ -900,15 +900,15 @@ SELECT * FROM os_plan($$
    ->  Merge Append
          Sort Key: f.id
          ->  Custom Scan (LionOrdered) on osf_a f_1
-               Ordered By: osf_a_id_idx
+               Ordered By: osf_a_id_idx (index only)
                Lion Cond: (f_1.tags @> '{rare}'::text[])
                Lion Indexes: osf_a_tags_ts_fk_idx
          ->  Custom Scan (LionOrdered) on osf_b f_2
-               Ordered By: osf_b_id_idx
+               Ordered By: osf_b_id_idx (index only)
                Lion Cond: (f_2.tags @> '{rare}'::text[])
                Lion Indexes: osf_b_tags_ts_fk_idx
          ->  Custom Scan (LionOrdered) on osf_o f_3
-               Ordered By: osf_o_id_idx
+               Ordered By: osf_o_id_idx (index only)
                Lion Cond: (f_3.tags @> '{rare}'::text[])
                Lion Indexes: osf_o_tags_ts_fk_idx
 (15 rows)

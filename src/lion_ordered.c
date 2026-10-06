@@ -90,6 +90,7 @@
 #include "utils/typcache.h"
 
 #include "lion.h"
+#include "lion_compat.h"
 #include "lion_count.h"
 #include "lion_costs.h"
 #include "lion_customscan.h"
@@ -98,6 +99,7 @@
 bool		lion_enable_ordered_scan = true;
 bool		lion_enable_btree_scan = true;
 bool		lion_enable_lazy_set = true;
+static double lion_ordered_switch_ratio = 32.0;
 static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 
 /*
@@ -125,6 +127,10 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *	LO_PRIV_IOCOLS	IntList, index-only mode (LO_FLAG_INDEXONLY, §40): for
  *					each column of the btree, the relation attno it returns,
  *					0 for one it does not (an expression); NIL in heap mode
+ *	LO_PRIV_EXPECTED a float8 Const: the entries the planner expects the walk
+ *					to visit (the ordered index's selectivity times the
+ *					relation's tuples), for the switch's density gate (§40.4);
+ *					0 for a lion column's walk
  *
  * and custom_exprs holds five lists:
  *
@@ -149,7 +155,8 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 #define LO_PRIV_LEAVES		5
 #define LO_PRIV_SORT		6
 #define LO_PRIV_IOCOLS		7
-#define LO_PRIV_NMEMBERS	8
+#define LO_PRIV_EXPECTED	8
+#define LO_PRIV_NMEMBERS	9
 
 /*
  * The fetch-and-sort switch (DESIGN.md §30.4, "When the walk is not paying"):
@@ -157,14 +164,15 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  * it has not met yet - and at least LO_SWITCH_MIN_WALK entries - the members
  * left are fetched and sorted instead.  The ratio is what one heap fetch of a
  * member costs in index entries walked, measured (§30.10: 0.04 us an entry,
- * 1-2 us a fetch, warm).  In index-only mode (§40.4) the walk would not have
- * read those members' heap pages at all, so a fetch is priced as the planner
- * prices a heap page: the tablespace's random_page_cost against an entry's
- * cpu_index_tuple_cost + cpu_operator_cost (some 530 at the defaults), never
- * below LO_SWITCH_RATIO.
+ * 1-2 us a fetch, warm); pg_lion.ordered_switch_ratio sets it.  In
+ * index-only mode (§40.4) the switch would read heap pages the walk never
+ * touches, so there it is considered only while the walk has met markedly
+ * fewer members than a uniform spread of them over the entries it is expected
+ * to visit would have given it: LO_SWITCH_DENSITY of that count.
  */
 #define LO_SWITCH_RATIO		32
 #define LO_SWITCH_MIN_WALK	10000
+#define LO_SWITCH_DENSITY	0.5
 
 /*
  * The set evaluated lazily (DESIGN.md §30.4, "The set, lazily"), until its
@@ -210,6 +218,7 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 #define LO_FLAG_LOSSY		0x0001	/* a lion index clause was lossy */
 #define LO_FLAG_LIONWALK	0x0002	/* the order is a lion column's walk */
 #define LO_FLAG_INDEXONLY	0x0004	/* the values come from the btree (§40) */
+#define LO_FLAG_HEAPRECHECK	0x0008	/* the lion recheck reads the heap tuple */
 
 /* ---------------------------------------------------------------------
  * The TID set
@@ -360,6 +369,7 @@ typedef struct LionOrderedState
 	 * btree stores as a cstring is copied into a Name of the node's.
 	 */
 	bool		indexonly;
+	bool		lionheaprecheck;	/* the btree lacks the lion qual's columns */
 	int			niocols;		/* the btree's columns */
 	AttrNumber *iocols;			/* [niocols] the attno each returns, or 0 */
 	bool	   *ionames;		/* [niocols] stored as cstring, returned as name */
@@ -424,6 +434,7 @@ typedef struct LionOrderedState
 	uint64		scanwalked;		/* entries walked in this scan */
 	int			nsort;			/* sort keys; 0: the walk never switches */
 	double		switchratio;	/* entries walked a member's fetch is worth */
+	double		expectwalk;		/* entries the planner expects the walk to visit */
 	AttrNumber *sortattnos;
 	SortSupport sortkeys;
 	bool		noswitch;		/* the switch gave up for this scan */
@@ -779,45 +790,51 @@ lo_pred_implied(IndexOptInfo *idx, List *lionqual)
 }
 
 /*
- * The columns the node must produce (DESIGN.md §40.1), as check_index_only()
- * finds them: every Var of rel in its target and in its restriction clauses -
- * the filter, the rechecks of the lion qual and the ordered index's clauses,
- * EvalPlanQual's - offset as pull_varattnos() offsets them.  A system column
- * (ctid, which a row mark adds) or a whole-row Var is among them as one no
- * index returns.
+ * The columns the node must produce for one (ordered path, lion access) pair
+ * (DESIGN.md §40.1), offset as pull_varattnos() offsets them: every Var of
+ * rel in its target; in the residual filter; in the ordered index's own
+ * clauses (the recheck under xs_recheck, EvalPlanQual's); and in the lion
+ * qual when a lion index clause is lossy at plan time - every member is then
+ * rechecked, and a walk that read the heap for each would be heap mode under
+ * another name.  A lion qual that is not lossy is rechecked only when its set
+ * turns out inexact or degraded at run time, and then from the heap tuple
+ * where the btree lacks its columns (§40.4), so its Vars are not required.  A
+ * system column (ctid, which a row mark adds) or a whole-row Var is among
+ * the Vars as one no index returns.
  */
 static Bitmapset *
-lo_needed_attrs(RelOptInfo *rel)
+lo_needed_attrs(RelOptInfo *rel, List *residual, List *ordclauses,
+				List *lionqual, bool lossy)
 {
 	Bitmapset  *attrs = NULL;
 	ListCell   *lc;
 
 	pull_varattnos((Node *) rel->reltarget->exprs, rel->relid, &attrs);
-	foreach(lc, rel->baserestrictinfo)
+	foreach(lc, residual)
 		pull_varattnos((Node *) lfirst_node(RestrictInfo, lc)->clause,
 					   rel->relid, &attrs);
+	foreach(lc, ordclauses)
+		pull_varattnos((Node *) lfirst_node(IndexClause, lc)->rinfo->clause,
+					   rel->relid, &attrs);
+	if (lossy)
+		pull_varattnos((Node *) lionqual, rel->relid, &attrs);
 	return attrs;
 }
 
 /*
- * Does the btree return every column the node must produce (DESIGN.md §40.1)?
- * A plain column the AM can return does; an expression column matches no Var
- * (it may still give the order, as today, but no value).  The lion qual's
- * columns are asked too: a partial lion index's predicate is part of it.
- * *iocols is the relation attno each index column returns, 0 for none - the
- * mapping the executor fills the scan tuple through.
+ * The relation columns a btree returns (DESIGN.md §40.1), offset as
+ * pull_varattnos() offsets them: a plain column the AM can return; an
+ * expression column matches no Var (it may still give the order, as today,
+ * but no value).  *cols is the relation attno each index column returns, 0
+ * for none - the mapping the executor fills the scan tuple through.
  */
-static bool
-lo_index_only(RelOptInfo *rel, IndexOptInfo *idx, Bitmapset *needed,
-			  List *lionqual, List **iocols)
+static Bitmapset *
+lo_returned_attrs(IndexOptInfo *idx, List **cols)
 {
 	Bitmapset  *returned = NULL;
-	Bitmapset  *attrs;
-	List	   *cols = NIL;
 	int			i;
 
-	if (!enable_indexonlyscan)
-		return false;
+	*cols = NIL;
 	for (i = 0; i < idx->ncolumns; i++)
 	{
 		int			attno = idx->indexkeys[i];
@@ -827,20 +844,46 @@ lo_index_only(RelOptInfo *rel, IndexOptInfo *idx, Bitmapset *needed,
 									  attno - FirstLowInvalidHeapAttributeNumber);
 		else
 			attno = 0;
-		cols = lappend_int(cols, attno);
+		*cols = lappend_int(*cols, attno);
 	}
-	attrs = bms_copy(needed);
-	pull_varattnos((Node *) lionqual, rel->relid, &attrs);
-	if (!bms_is_subset(attrs, returned))
+	return returned;
+}
+
+/*
+ * Does the btree return every column in `needed` (DESIGN.md §40.1)?  When it
+ * does, *iocols is the mapping of lo_returned_attrs().
+ */
+static bool
+lo_index_only(IndexOptInfo *idx, Bitmapset *needed, List **iocols)
+{
+	List	   *cols;
+
+	if (!enable_indexonlyscan)
+		return false;
+	if (!bms_is_subset(needed, lo_returned_attrs(idx, &cols)))
 		return false;
 	*iocols = cols;
 	return true;
 }
 
 /*
+ * The same restriction clause?  The RestrictInfo itself, or one spelling the
+ * same clause: 18's matching of `k = 1 OR k = 7` to an index makes a fresh
+ * `k = ANY ('{1,7}')` RestrictInfo for EACH index it matches, so the btree's
+ * and the lion index's clause for one OR are two objects (DESIGN.md §40.2).
+ */
+static bool
+lo_same_clause(RestrictInfo *a, RestrictInfo *b)
+{
+	return a == b || equal(a->clause, b->clause);
+}
+
+/*
  * Does the lion access answer a clause the btree's own index clauses do not
  * (DESIGN.md §40.2)?  One whose every leaf's clauses - an OR arm's too - are
  * among the btree's adds nothing to its walk: every entry walked is a member.
+ * A leaf with no clauses is a partial lion index walked whole, whose
+ * predicate is what it selects by: it adds.
  */
 static bool
 lo_lion_adds(Path *lion, List *ordclauses)
@@ -849,6 +892,8 @@ lo_lion_adds(Path *lion, List *ordclauses)
 
 	if (IsA(lion, IndexPath))
 	{
+		if (((IndexPath *) lion)->indexclauses == NIL)
+			return true;
 		foreach(lc, ((IndexPath *) lion)->indexclauses)
 		{
 			IndexClause *iclause = lfirst_node(IndexClause, lc);
@@ -856,7 +901,8 @@ lo_lion_adds(Path *lion, List *ordclauses)
 			bool		found = false;
 
 			foreach(lc2, ordclauses)
-				if (lfirst_node(IndexClause, lc2)->rinfo == iclause->rinfo)
+				if (lo_same_clause(lfirst_node(IndexClause, lc2)->rinfo,
+								   iclause->rinfo))
 					found = true;
 			if (!found)
 				return true;
@@ -935,9 +981,16 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	foreach(lc, ord->indexclauses)
 	{
 		IndexClause *iclause = lfirst_node(IndexClause, lc);
+		ListCell   *lc2;
 
-		if (list_member_ptr(lionrinfos, iclause->rinfo))
-			shared = lappend(shared, iclause->rinfo);
+		foreach(lc2, lionrinfos)
+		{
+			if (lo_same_clause(lfirst_node(RestrictInfo, lc2), iclause->rinfo))
+			{
+				shared = lappend(shared, iclause->rinfo);
+				break;
+			}
+		}
 	}
 	foreach(lc, lo_pred_implied(ord->indexinfo, lionqual))
 	{
@@ -1731,7 +1784,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	List	   *lionidx = NIL;
 	List	   *cands = NIL;
 	List	   *walks = NIL;
-	Bitmapset  *needed = NULL;
+	Bitmapset  *targetattrs = NULL;
 	ListCell   *lc;
 	ListCell   *lc2;
 	Size		limit;
@@ -1763,7 +1816,8 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		return;
 	lo_margin = lion_units_margin_for(rel);
 	if (enable_indexonlyscan)
-		needed = lo_needed_attrs(rel);
+		pull_varattnos((Node *) rel->reltarget->exprs, rel->relid,
+					   &targetattrs);
 
 	/* the ordered side: core's ordered btree paths ... */
 	if (lion_enable_ordered_scan && rel->baserestrictinfo != NIL)
@@ -1798,9 +1852,11 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		walks = lo_lion_walks(root, rel, rte, lionidx);
 
 	/*
-	 * ... and the paths of the relation's covering btrees, whether or not
-	 * core found their order useful (DESIGN.md §40.2): with the row's values
-	 * coming from the index tuple, their walk pays without an ORDER BY.
+	 * ... and the paths of the relation's btrees that return at least the
+	 * target's columns (what every pair below needs, and the rest is the
+	 * pair's), whether or not core found their order useful (DESIGN.md
+	 * §40.2): with the row's values coming from the index tuple, their walk
+	 * pays without an ORDER BY.
 	 */
 	if (lion_enable_btree_scan && enable_indexonlyscan &&
 		rel->baserestrictinfo != NIL)
@@ -1811,7 +1867,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			List	   *iocols;
 
 			if (idx->relam != BTREE_AM_OID || idx->hypothetical ||
-				!lo_index_only(rel, idx, needed, NIL, &iocols))
+				!lo_index_only(idx, targetattrs, &iocols))
 				continue;
 			btpaths = list_concat(btpaths, lo_btree_paths(root, rel, idx));
 		}
@@ -1871,7 +1927,10 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			double		setbytes;
 
 			/* the values from the index tuple when the btree has them (§40) */
-			indexonly = lo_index_only(rel, ord->indexinfo, needed, lionqual,
+			indexonly = lo_index_only(ord->indexinfo,
+									  lo_needed_attrs(rel, residual,
+													  ord->indexclauses,
+													  lionqual, lossy),
 									  &iocols);
 			lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual, rows,
 					indexonly, &startup, &total, &setbytes);
@@ -1926,11 +1985,14 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			if (!lo_lion_adds(lion, ipath->indexclauses))
 				continue;
 			lionqual = lo_lion_qual(lion, &lionrinfos, &lossy);
-			if (!lo_index_only(rel, ipath->indexinfo, needed, lionqual,
-							   &iocols))
-				continue;
 			residual = lo_residual(rel->baserestrictinfo, ordrinfos,
 								   lionrinfos, lionqual);
+			if (!lo_index_only(ipath->indexinfo,
+							   lo_needed_attrs(rel, residual,
+											   ipath->indexclauses,
+											   lionqual, lossy),
+							   &iocols))
+				continue;
 			lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
 					rows, true, &startup, &total, &setbytes);
 			if (setbytes > (double) limit)
@@ -2083,6 +2145,7 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *ordorig = NIL;
 	List	   *vrinfos = NIL;
 	List	   *iocols = NIL;
+	double		expected = 0.0;
 	int			dir;
 	int			flags = 0;
 	int			nulls = LION_ORDER_NULLS_NONE;
@@ -2119,6 +2182,7 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		}
 		ordoid = ord->indexinfo->indexoid;
 		dir = (int) ord->indexscandir;
+		expected = ord->indexselectivity * rel->tuples;
 	}
 	else
 	{
@@ -2158,6 +2222,28 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	}
 	residual = lo_residual(clauses, ordrinfos, lionrinfos, lionqual);
 
+	/*
+	 * Index-only mode: does the lion recheck of an inexact or degraded set
+	 * need the heap tuple, the btree lacking a column of the lion qual (§40.4)?
+	 */
+	if (iocols != NIL)
+	{
+		Bitmapset  *lionattrs = NULL;
+		Bitmapset  *returned = NULL;
+
+		pull_varattnos((Node *) lionqual, rel->relid, &lionattrs);
+		foreach(lc, iocols)
+		{
+			int			attno = lfirst_int(lc);
+
+			if (attno > 0)
+				returned = bms_add_member(returned,
+										  attno - FirstLowInvalidHeapAttributeNumber);
+		}
+		if (!bms_is_subset(lionattrs, returned))
+			flags |= LO_FLAG_HEAPRECHECK;
+	}
+
 	cscan->scan.plan.targetlist = tlist;
 	cscan->scan.plan.qual = extract_actual_clauses(residual, false);
 	cscan->scan.scanrelid = rel->relid;
@@ -2176,6 +2262,11 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->custom_private = lappend(cscan->custom_private,
 									lo_sort_keys(rel, best_path->path.pathkeys));
 	cscan->custom_private = lappend(cscan->custom_private, iocols);
+	cscan->custom_private = lappend(cscan->custom_private,
+									makeConst(FLOAT8OID, -1, InvalidOid,
+											  sizeof(float8),
+											  Float8GetDatum(expected),
+											  false, FLOAT8PASSBYVAL));
 	cscan->methods = (best_path->methods == &lo_btree_path_methods) ?
 		&lo_btree_scan_methods : &lo_scan_methods;
 
@@ -3208,6 +3299,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->lossyqual = (lsecond_int(ints) & LO_FLAG_LOSSY) != 0;
 	st->lionwalk = (lsecond_int(ints) & LO_FLAG_LIONWALK) != 0;
 	st->indexonly = (lsecond_int(ints) & LO_FLAG_INDEXONLY) != 0;
+	st->lionheaprecheck = (lsecond_int(ints) & LO_FLAG_HEAPRECHECK) != 0;
 	st->vmbuffer = InvalidBuffer;
 	st->walknulls = lthird_int(ints);
 	st->walkattno = (AttrNumber) lfourth_int(ints);
@@ -3302,20 +3394,16 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 		}
 	}
 
-	/*
-	 * The switch's price of a member's fetch, in entries walked: in
-	 * index-only mode a heap page the walk would not have read.
-	 */
-	st->switchratio = LO_SWITCH_RATIO;
-	if (st->indexonly)
+	/* the switch's terms (§30.4, §40.4): the setting, and the planner's walk */
+	st->switchratio = lion_ordered_switch_ratio;
 	{
-		double		spc_random;
-		double		entry = cpu_index_tuple_cost + cpu_operator_cost;
+		Const	   *c = (Const *) list_nth(cscan->custom_private,
+										   LO_PRIV_EXPECTED);
 
-		get_tablespace_page_costs(st->css.ss.ss_currentRelation->rd_rel->reltablespace,
-								  &spc_random, NULL);
-		if (entry > 0)
-			st->switchratio = Max(st->switchratio, spc_random / entry);
+		if (c == NULL || !IsA(c, Const) || c->consttype != FLOAT8OID ||
+			c->constisnull)
+			elog(ERROR, "LionOrdered: malformed expected walk");
+		st->expectwalk = DatumGetFloat8(c->constvalue);
 	}
 	st->lrtcxt = CreateExprContext(estate);
 
@@ -3362,8 +3450,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 				TupleDescAttr(idxdesc, i)->atttypid == CSTRINGOID &&
 				TupleDescAttr(heapdesc, attno - 1)->atttypid == NAMEOID;
 		}
-		st->tabslot = ExecAllocTableSlot(&estate->es_tupleTable, heapdesc,
-										 table_slot_callbacks(heap));
+		st->tabslot = table_slot_create(heap, &estate->es_tupleTable);
 	}
 	if (st->lionwalk)
 	{
@@ -3497,12 +3584,14 @@ lo_fetch(LionOrderedState *st, TupleTableSlot *slot)
  * §40.4), as core's Index Only Scan makes it: when the visibility map calls
  * its page all-visible every tuple there is visible to every snapshot, this
  * one included, and the heap is not read; otherwise the heap tuple is fetched
- * - into the node's own slot, for its visibility alone - and a TID with no
- * visible version is skipped.  Either way the values are the index tuple's,
- * which the visible version reached from the root TID shares (an update of an
- * indexed or INCLUDE column is never HOT), laid into the scan slot through
- * the mapping, every other column NULL.  *fromheap says the heap was read,
- * and the row holds its tuple predicate lock already.
+ * - into the node's own slot, for its visibility - and a TID with no visible
+ * version is skipped.  Either way the values are the index tuple's, which the
+ * visible version reached from the root TID shares (an update of an indexed
+ * or INCLUDE column is never HOT), laid into the scan slot through the
+ * mapping, every other column NULL.  *fromheap says the heap was read: the
+ * row then holds its tuple predicate lock already, and its heap tuple stays
+ * in the node's slot for a recheck from the heap (lo_lion_recheck()) until
+ * the caller is done with the row.
  */
 static bool
 lo_fetch_indexonly(LionOrderedState *st, TupleTableSlot *slot, bool *fromheap)
@@ -3518,7 +3607,6 @@ lo_fetch_indexonly(LionOrderedState *st, TupleTableSlot *slot, bool *fromheap)
 		st->fetched++;
 		if (!lo_fetch_btree(st, st->tabslot))
 			return false;
-		ExecClearTuple(st->tabslot);
 		*fromheap = true;
 	}
 
@@ -3559,6 +3647,47 @@ lo_fetch_indexonly(LionOrderedState *st, TupleTableSlot *slot, bool *fromheap)
 	slot->tts_tid = *tid;
 	slot->tts_tableOid = RelationGetRelid(scan->heapRelation);
 	return true;
+}
+
+/*
+ * The lion recheck of a row the walk met, when the set is inexact or degraded
+ * (DESIGN.md §30.4): on the scan slot, as every recheck is - or, in index-only
+ * mode over a btree that lacks a column of the lion qual (§40.4), on the heap
+ * tuple, fetched now into the node's table slot if the visibility test did
+ * not fetch it already (and counted as a heap fetch; a TID with no visible
+ * version is skipped).  Evaluating the recheck on that slot is sound although
+ * it was initialised for the virtual scan slot: the scan slot's type is fixed
+ * (ExecInitScanTupleSlot sets scanopsfixed), so ExecInitQual emitted no
+ * EEOP_SCAN_FETCHSOME step for it (ExecComputeSlotInfo drops the step for a
+ * fixed virtual slot, and with it the slot type check that step makes), and
+ * its Var steps read tts_values[] and tts_isnull[] directly - which
+ * slot_getallattrs() fills for the heap tuple.  *fromheap is set when the heap
+ * was read here: the row then holds its tuple predicate lock.
+ */
+static bool
+lo_lion_recheck(LionOrderedState *st, TupleTableSlot *slot, bool *fromheap)
+{
+	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
+	TupleTableSlot *rslot = slot;
+
+	if (st->indexonly && st->lionheaprecheck)
+	{
+		if (!*fromheap)
+		{
+			st->fetched++;
+			if (!lo_fetch_btree(st, st->tabslot))
+				return false;
+			*fromheap = true;
+		}
+		slot_getallattrs(st->tabslot);
+		rslot = st->tabslot;
+	}
+	ResetExprContext(econtext);
+	econtext->ecxt_scantuple = rslot;
+	if (ExecQual(st->lionrecheck, econtext))
+		return true;
+	st->removed++;
+	return false;
 }
 
 /* End this scan's walk of a lion column, keeping its count of keys. */
@@ -3723,6 +3852,33 @@ lo_cmp_rows(const void *a, const void *b, void *arg)
 }
 
 /*
+ * Is the fetch-and-sort switch due (DESIGN.md §30.4, "When the walk is not
+ * paying")?  This scan's walk has met at least LO_SWITCH_MIN_WALK entries and
+ * switchratio of them for every member it has not met - and, in index-only
+ * mode (§40.4), markedly fewer members than a uniform spread of them over
+ * the entries the planner expects it to visit would have given it by now:
+ * the walk of a uniform filter under no LIMIT then never switches, which
+ * would fetch every member left from a heap the walk never touches, while
+ * the correlated hazard of §30.3 - members at the far end of the order,
+ * `distinct` near zero as the entries go by - still switches at the measured
+ * ratio.  `members` is the set's count, or the lazy set's estimate of it.
+ */
+static bool
+lo_switch_due(LionOrderedState *st, double members)
+{
+	if (st->nsort == 0 || st->noswitch || st->scanwalked < LO_SWITCH_MIN_WALK)
+		return false;
+	if ((double) st->scanwalked <
+		st->switchratio * (members - (double) st->distinct))
+		return false;
+	if (st->indexonly && st->expectwalk > 0 &&
+		(double) st->distinct >= LO_SWITCH_DENSITY * members *
+		((double) st->scanwalked / st->expectwalk))
+		return false;
+	return true;
+}
+
+/*
  * The fetch-and-sort switch (DESIGN.md §30.4, "When the walk is not paying"):
  * fetch every member this scan's walk has not met, keep the visible ones that
  * pass the lion recheck (for an inexact set) and the ordered index's own
@@ -3773,10 +3929,14 @@ lo_switch(LionOrderedState *st)
 			CHECK_FOR_INTERRUPTS();
 			lion_code_to_tid(lion_make_code(st->set->keys[i], los[j]), &tid);
 			st->sortfetched++;
+			/* a heap visit counts as the walk counts them in that mode (§40.6) */
+			if (st->indexonly)
+				st->fetched++;
 			if (!lion_table_fetch_tid(heap, &tid, snapshot, &all_dead) ||
 				!table_tuple_fetch_row_version(heap, &tid, snapshot, fslot))
 				continue;
-			st->fetched++;
+			if (!st->indexonly)
+				st->fetched++;
 			if (fslot != slot)
 			{
 				/* the scan slot's type is fixed per plan (§40.4) */
@@ -3800,6 +3960,8 @@ lo_switch(LionOrderedState *st)
 			}
 			row = &st->srt[st->nsrt++];
 			row->tup = ExecCopySlotHeapTuple(slot);
+			/* a virtual slot's copy has no TID of its own: the row's (§40.4) */
+			row->tup->t_self = tid;
 			row->vals = (Datum *) palloc(sizeof(Datum) * st->nsort);
 			row->nulls = (bool *) palloc(sizeof(bool) * st->nsort);
 			for (k = 0; k < st->nsort; k++)
@@ -3879,6 +4041,7 @@ lo_next(ScanState *ss)
 		int			idx;
 		bool		counted;
 		bool		ordrecheck;
+		bool		keep;
 		bool		fromheap = true;
 
 		CHECK_FOR_INTERRUPTS();
@@ -3896,10 +4059,7 @@ lo_next(ScanState *ss)
 			((st->lazyevals >= LO_LAZY_ORDER_KEYS &&
 			  st->lazyback * LO_LAZY_BACK_SHARE >= st->lazyevals) ||
 			 st->lazywork >= st->lazybudget ||
-			 (st->nsort > 0 && !st->noswitch &&
-			  st->scanwalked >= LO_SWITCH_MIN_WALK &&
-			  (double) st->scanwalked >=
-			  st->switchratio * (st->lazymembers - (double) st->distinct)) ||
+			 lo_switch_due(st, st->lazymembers) ||
 			 st->scanwalked >= LO_LAZY_MAX_WALK ||
 			 st->memobytes > st->limit / 2))
 			lo_lazy_convert(st);
@@ -3918,10 +4078,7 @@ lo_next(ScanState *ss)
 		 * fetch and sort those instead (§30.4, "When the walk is not
 		 * paying").
 		 */
-		if (counted && st->nsort > 0 && !st->noswitch &&
-			st->scanwalked >= LO_SWITCH_MIN_WALK &&
-			(double) st->scanwalked >=
-			st->switchratio * (double) (st->members - st->distinct) &&
+		if (counted && lo_switch_due(st, (double) st->members) &&
 			lo_switch(st))
 			return lo_sort_next(st, slot);
 
@@ -3967,22 +4124,24 @@ lo_next(ScanState *ss)
 		/*
 		 * A lion column's walk is exact: its entries are tested against the
 		 * range with the column's own comparison (§28).  Without a set there
-		 * is nothing to recheck either: the clauses are the filter.
+		 * is nothing to recheck either: the clauses are the filter.  In
+		 * index-only mode the heap tuple fetched for the row, if any, is let
+		 * go once the rechecks are done with it.
 		 */
 		ordrecheck = !st->lionwalk && st->scan->xs_recheck;
-		if ((!st->noset && !st->exact) || ordrecheck)
+		keep = true;
+		if (!st->noset && !st->exact)
+			keep = lo_lion_recheck(st, slot, &fromheap);
+		if (keep && ordrecheck)
 		{
 			ResetExprContext(econtext);
 			econtext->ecxt_scantuple = slot;
-			if (!st->noset && !st->exact &&
-				!ExecQual(st->lionrecheck, econtext))
-			{
-				st->removed++;
-				continue;
-			}
-			if (ordrecheck && !ExecQual(st->ordrecheck, econtext))
-				continue;
+			keep = ExecQual(st->ordrecheck, econtext);
 		}
+		if (st->indexonly && fromheap)
+			ExecClearTuple(st->tabslot);
+		if (!keep)
+			continue;
 
 		/*
 		 * A filter on the walked column (DESIGN.md §30.11): the rows of one
@@ -4029,8 +4188,10 @@ lo_recheck(ScanState *ss, TupleTableSlot *slot)
 
 	/*
 	 * The quals were initialised on the scan slot's type.  A row mark's ctid
-	 * keeps an index-only plan from being made for a locked relation (§40.1),
-	 * so the test tuple EvalPlanQual hands in is always a heap-mode one.
+	 * is a system column no index returns, so a locked relation never gets an
+	 * index-only plan (§40.1) and the test tuple EvalPlanQual hands in is
+	 * always a heap-mode one; the recheck from the heap of lo_lion_recheck()
+	 * is index-only mode's alone and never meets this path.
 	 */
 	Assert(slot->tts_ops == ss->ss_ScanTupleSlot->tts_ops);
 	ResetExprContext(econtext);
@@ -4142,8 +4303,7 @@ lo_explain_qual(CustomScanState *node, List *qual, const char *label,
 	context = set_deparse_context_plan(es->deparse_cxt, node->ss.ps.plan,
 									   ancestors);
 	str = deparse_expression((Node *) make_ands_explicit(qual), context,
-							 list_length(es->rtable) > 1 || es->verbose,
-							 false);
+							 lion_explain_useprefix(es), false);
 	ExplainPropertyText(label, str, es);
 }
 
@@ -4308,6 +4468,20 @@ lion_ordered_init(void)
 							 "The rows' values come from the index tuples; the heap is read only for pages not all-visible.",
 							 &lion_enable_btree_scan,
 							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §30.4: what a member's heap fetch is worth in index entries
+	 * walked, the fetch-and-sort switch's term.
+	 */
+	DefineCustomRealVariable("pg_lion.ordered_switch_ratio",
+							 "Sets the index entries LionOrdered walks per member not yet met before it fetches and sorts the rest.",
+							 "The measured price of a member's heap fetch in index entries walked; a large value keeps the walk from switching.",
+							 &lion_ordered_switch_ratio,
+							 LO_SWITCH_RATIO,
+							 1.0, 1e6,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);

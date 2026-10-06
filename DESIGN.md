@@ -14155,7 +14155,9 @@ than overruns (§30.4).
 - **When the walk is not paying: fetch and sort.** The set's exact size is known before the walk
   starts, so the walk is a bet on reaching `LIMIT` rows early, and the executor can cap the bet.
   Once this scan has walked at least `LO_SWITCH_MIN_WALK` (10,000) entries and at least
-  `LO_SWITCH_RATIO` (32) entries per member it has not met yet, it stops walking, fetches every
+  `LO_SWITCH_RATIO` (32) entries per member it has not met yet - the ratio is the setting
+  `pg_lion.ordered_switch_ratio` (real, default 32, 1 to 1,000,000; a large value keeps a walk from
+  ever switching, and index-only mode adds a density gate to it, §40.4) - it stops walking, fetches every
   member it has not met in TID order (the HOT chain under the snapshot, then the version it
   sees), keeps the visible ones that pass the lion recheck (an inexact set) and the ordered
   index's own original clauses (these rows did not come through the index), sorts them by the
@@ -17569,14 +17571,22 @@ a B-tree's clustering on a pinned key, and the B-tree is the user's to create.
   another table AM: declined as there.
 - **Coverage.** The B-tree covers the node when every column it must produce is a plain column of
   the index - a key column (`indexkeys[i] != 0`) or an INCLUDE column - that the AM can return
-  (`canreturn[i]`, true of every B-tree column). The columns the node must produce are what core's
-  `check_index_only()` computes: every Var of the relation in `rel->reltarget->exprs` and in every
-  clause of `rel->baserestrictinfo` - which covers the residual filter, the lion recheck of an
-  inexact or degraded set, the ordered index's recheck under `xs_recheck` and EvalPlanQual's - and,
-  since a partial lion index's predicate is part of it, the lion qual's (`lo_needed_attrs()`,
-  `lo_index_only()`). The lion filter's columns are therefore in the index too, as core asks of an
-  index-only scan's restriction clauses even where the index quals are exact: whether the set needs
-  rechecking is known at run time, not plan time (a set that degrades is rechecked). An expression
+  (`canreturn[i]`, true of every B-tree column). The columns the node must produce are decided per
+  (ordered path, lion access) pair (`lo_needed_attrs()`, `lo_index_only()`): every Var of the
+  relation in `rel->reltarget->exprs`, in the residual filter (`lo_residual()`: the clauses the
+  node still tests itself, a partial lion index's predicate when the query spells it included), in
+  the ordered B-tree's own clauses (its recheck under `xs_recheck`) and - only when a lion index
+  clause is lossy at plan time (`IndexClause.lossy`), so that every member would need the recheck
+  and heap mode is the honest plan - in the lion qual. The lion filter's columns are otherwise NOT
+  required, where core's `check_index_only()` would ask for every restriction clause's: whether a
+  set needs rechecking is a run-time property (an inexact source, a set that degraded under
+  `hash_mem`), and a member of such a set the B-tree cannot recheck is rechecked on its heap
+  tuple, fetched for that alone (§40.4) - heap mode, the alternative, fetches every member's. So
+  `(created_at) INCLUDE (id, title)` under `WHERE tags @> '{t}'` is covered. Lion's planner marks
+  no clause lossy today (a tsquery prefix, NOT or weight widens the set to a superset the executor
+  rechecks, §17), so the lossy branch is dormant until one does. The pre-filter that decides which
+  B-trees get unordered paths at all (§40.2) tests the target's Vars alone, a necessary condition;
+  the pair decides. An expression
   column matches no Var: it may still give the order, as in §30, but no value. A system column
   makes the index non-covering, as in core: `SELECT ... FOR UPDATE` adds the row mark's `ctid` to
   the target, so a locked relation is always heap mode, and EvalPlanQual never meets an index-only
@@ -17592,10 +17602,10 @@ a B-tree's clustering on a pinned key, and the B-tree is the user's to create.
 ### 40.2 Planner integration (`lion_ordered_set_rel_pathlist()`)
 
 - **Ordered paths** (§30.2): as before, from `rel->pathlist`; each (ordered path, lion access)
-  pair decides coverage - the lion access's qual included - and is priced in index-only mode when
-  covered, in heap mode as before otherwise.
-- **Unordered paths.** For each B-tree of the relation that covers the query's target and clauses,
-  `create_index_paths()` is run on a scratch copy of the RelOptInfo that sees that index ALONE
+  pair decides coverage (§40.1) and is priced in index-only mode when covered, in heap mode as
+  before otherwise.
+- **Unordered paths.** For each B-tree of the relation that holds the query's target columns (a
+  necessary condition; the pair decides the rest, §40.1), `create_index_paths()` is run on a scratch copy of the RelOptInfo that sees that index ALONE
   (`lo_scratch_rel()`, the helper `lo_lion_accesses()` now builds its copy with; `lo_btree_paths()`)
   - alone, so that its paths compete with nothing: in the relation itself the full walk of a
   covering index without a qual, which core builds as an index-only scan whenever
@@ -17609,8 +17619,15 @@ a B-tree's clustering on a pinned key, and the B-tree is the user's to create.
   pathkeys: offered above already) is paired with each lion access from `lo_lion_accesses()`, as
   the ordered loop pairs them, less the pairs in which the lion access adds nothing: every clause
   of its every leaf, an OR arm's too, is one of the B-tree path's own index clauses
-  (`lo_lion_adds()`), so every entry walked would be a member. The pair must cover (the lion qual
-  included) and is priced in index-only mode. The CustomPath carries the IndexPath's pathkeys when
+  (`lo_lion_adds()`), so every entry walked would be a member - the same RestrictInfo, or an
+  `equal()` clause: 18 and later match an OR of equalities to each index as a `ScalarArrayOpExpr`
+  RestrictInfo of that index's own (`match_orclause_to_indexcol()`), so the B-tree's `k = ANY` and
+  the lion index's are two objects spelling one clause (`lo_same_clause()`, which `lo_cost()`'s
+  shared-clause correction uses too, or the OR's selectivity would be squared and the node
+  underprice itself against the plain Index Only Scan). A leaf with no index clauses at all - a
+  partial lion index walked whole for its predicate, which `lo_lion_tree_ok()` allows - adds that
+  predicate's selectivity and counts as adding; `lo_cost()`'s `lo_pred_implied()` correction
+  prices it. The pair must cover (§40.1) and is priced in index-only mode. The CustomPath carries the IndexPath's pathkeys when
   it has them - a free order - under the name `LionOrdered`, and none otherwise under the name
   `LionBtreeScan`: a second `CustomPathMethods`/`CustomScanMethods` pair over the same plan
   function, state struct and executor functions. `pg_lion.enable_ordered_scan` keeps gating the
@@ -17636,7 +17653,12 @@ competes on `indextotalcost + T × cpu_operator_cost` against the bitmap heap sc
 which is right: on `btreescan.sql`'s 100,000 rows, whose heap is six times the covering B-tree,
 the covering walk is chosen over the bitmap scan for a filter of a tenth of the rows, the bitmap
 scan over it where only the wide `(k) INCLUDE (...)` B-tree covers the columns, and the lion
-index's own scan for a filter of three in a thousand (§40.7, "the plan choice").
+index's own scan for a filter of three in a thousand (§40.7, "the plan choice"). The recheck
+from the heap (§40.4) is not priced: an inexact source or a degraded set is not knowable at plan
+time, and the fetches it costs are bounded by the members - the bound heap mode pays for every
+member. The planner also hands the executor the entries the walk is expected to visit,
+`indexselectivity × rel->tuples`, for the switch's density gate (§40.4; `LO_PRIV_EXPECTED`, a
+float8 Const in `custom_private`, 0 when the ordered path is a lion column's walk).
 
 ### 40.4 Execution
 
@@ -17653,31 +17675,50 @@ index's own scan for a filter of three in a thousand (§40.7, "the plan choice")
   visible to every snapshot, this one included, and the heap is not read. Not all-visible, the
   heap tuple is fetched into a slot of the table AM's kept for this alone (`index_fetch_heap()` on
   16 to 19, `table_fetch_tid()` and `table_tuple_fetch_row_version()` on 20 - `lo_fetch_btree()`,
-  as heap mode fetches), counted as a heap fetch and let go; a TID with no visible version is
-  skipped. Either way the values are the INDEX TUPLE's: `xs_itup` deformed with `xs_itupdesc` (or
+  as heap mode fetches), counted as a heap fetch and kept in that slot until the row's rechecks
+  are done (below); a TID with no visible version is skipped. Either way the values are the INDEX TUPLE's: `xs_itup` deformed with `xs_itupdesc` (or
   `xs_hitup`, had the AM returned a heap-format tuple) and laid into the virtual slot through the
   mapping, every other attribute NULL - the visible version reached from the root TID has the
   index's values for indexed and INCLUDE columns, since those are HOT-blocking (§30.5). A `name`
   column a B-tree stores as a cstring (`name_ops`'s storage type) is copied back into a Name of the
   node's, reused per row, as core copies it. The "met before" bitmap of §30.4 stands: a TID met
   twice is skipped before any of this.
-- **The rechecks** - `lionrecheck` for an inexact or degraded set, `ordrecheck` under
-  `xs_recheck`, EvalPlanQual's `lo_recheck` - evaluate on the scan slot as before; coverage
-  guarantees the columns are there.
+- **The rechecks.** `ordrecheck` under `xs_recheck` and EvalPlanQual's `lo_recheck` evaluate on
+  the scan slot as before; coverage guarantees the columns are there. So does `lionrecheck`, for
+  an inexact or degraded set, when the B-tree holds the lion qual's columns. When it does not
+  (`LO_FLAG_HEAPRECHECK`, decided at plan time from the lion qual's Vars against the mapping;
+  `st->lionheaprecheck`), the member is rechecked on its heap tuple (`lo_lion_recheck()`): fetched
+  now into the table AM's slot if the visibility test did not fetch it already - counted as a heap
+  fetch, a TID with no visible version skipped - `slot_getallattrs()`, and `ExecQual(lionrecheck)`
+  with that slot as `ecxt_scantuple`, which is sound although the qual was initialised for the
+  virtual scan slot (§40.5). A row the heap was read for holds its tuple predicate lock
+  (`fromheap`). The heap tuple is let go at the end of the row's iteration. The switch's rows, in
+  index-only mode, are heap tuples copied whole into the scan slot, so their recheck reads the slot
+  as before.
 - **The fetch-and-sort switch** (§30.4) fetches members from the heap in TID order: in index-only
   mode each lands in the table AM's slot and is copied into the virtual scan slot
-  (`ExecCopySlot()`, a deform) before the rechecks and the sort, so the slot type stays fixed. Its
-  rule changes with the mode. In heap mode the members it fetches would have been fetched by the
-  walk anyway, so its ratio - what a member's fetch costs in entries walked - is a warm fetch's
-  measured 32. In index-only mode the walk would not have read those members' heap pages at all,
-  so a fetch is priced as the planner prices a heap page: the tablespace's `random_page_cost`
-  against an entry's `cpu_index_tuple_cost + cpu_operator_cost`, some 530 at the defaults and never
-  below 32 (`switchratio`, set in `lo_begin()`). Under the heap-mode ratio a full walk for a filter
-  of a tenth of the rows switched three quarters of the way through the index and fetched the
-  2,300 members left from a heap it had not touched; under this one it walks to its end, and a
-  LIMIT's walk that is not meeting its members still switches, later. An unordered path has no
-  sort keys and never switches, as a path whose pathkeys were not plain columns never did; the
-  planner priced the full walk.
+  (`ExecCopySlot()`, a deform) before the rechecks and the sort, so the slot type stays fixed, and
+  each copy carries its row's TID. Its ratio is `LO_SWITCH_RATIO` (32) in both modes, the setting
+  `pg_lion.ordered_switch_ratio` (§30.4). In index-only mode the walk would not have read the
+  members' heap pages at all, so a switch pays for pages the walk never touches: a uniform full
+  walk under no LIMIT - the aggregate shape - must never switch (it would fetch every remaining
+  member from the heap; under the heap-mode rule alone a filter of a tenth of the rows switched
+  three quarters of the way through the index and fetched the 2,300 members left), while the
+  hazard the switch exists for (§30.3: a LIMIT walk whose members sit at the far end of the order)
+  must switch, and a ratio large enough to spare the former - some 530 at the planner's page and
+  entry costs - spares the latter too for any set over a fifth of a percent of the index. The two
+  are told apart by density instead: at both decision sites (the lazy set's conversion trigger and
+  the switch itself, `lo_switch_due()`) the switch is considered, in index-only mode, only when
+  the walk has met markedly fewer members than a uniform spread predicts - `distinct <
+  LO_SWITCH_DENSITY (0.5) × members × scanwalked / expected`, `expected` the entries the walk was
+  expected to visit (§40.3; 0 when unknown, and a gate with no expectation passes); the lazy site
+  uses `lazymembers`. A uniform walk meets `members × scanwalked / expected` members and never
+  passes; the correlated hazard keeps `distinct` near 0 while `scanwalked` grows and switches at
+  the measured 32 (§40.8 has the gate's blind spot). In heap mode the gate does not apply: the
+  members the switch fetches would have been fetched by the walk anyway. Under ANALYZE a switch's
+  heap visits count in `Heap Fetches` in index-only mode as the walk's do (§40.6). An unordered
+  path has no sort keys and never switches, as a path whose pathkeys were not plain columns never
+  did; the planner priced the full walk.
 - **Unchanged**: the lazy set, the early stop, degradation, rescans with changed Params, the
   relation predicate locks on the lion indexes.
 
@@ -17713,8 +17754,19 @@ Scan's.
   HOT updates of rows the other transaction read index-only: it must fail, and without the page
   lock neither update would conflict with anything the other read (a HOT update writes no index)
   and both would commit.
+- **The recheck from the heap** (§40.4) evaluates `lionrecheck`, initialised for the virtual scan
+  slot, on the table AM's slot. That is sound because the scan slot's type is fixed
+  (`ExecInitScanTupleSlot()` sets `scanopsfixed`), so `ExecInitQual()` emitted no
+  `EEOP_SCAN_FETCHSOME` step for it - `ExecComputeSlotInfo()` drops the step for a fixed virtual
+  slot, and with it the slot-type check that step makes (`CheckOpSlotCompatibility`) - and the
+  qual's Var steps read `tts_values[]` and `tts_isnull[]` directly, which `slot_getallattrs()`
+  fills for the heap tuple. The tuple it tests is the version the snapshot sees of the TID the
+  walk returned (the HOT chain followed from its root, as the visibility fetch follows it), so the
+  recheck tests the values the row has for this snapshot, the same version whose indexed and
+  INCLUDE columns the index tuple returned (§40.4).
 - **EvalPlanQual** never meets an index-only plan: a row mark's `ctid` is in the target (§40.1).
-  `lo_recheck()` asserts the test tuple's slot type is the scan slot's.
+  `lo_recheck()` asserts the test tuple's slot type is the scan slot's; the recheck from the heap
+  is index-only mode's alone and never reaches it.
 
 ### 40.6 EXPLAIN
 
@@ -17732,9 +17784,11 @@ Scan's.
 `LionOrdered`'s lines are §30.7's; `index only` joins the `Ordered By` line's parenthesis in
 index-only mode (heap mode prints as before, so no existing output changes), and a `LionBtreeScan`
 names the index it walks under `Index`, with the same qual and counter lines. Under ANALYZE, `Heap
-Fetches` counts in index-only mode the members whose page the visibility map did not call
-all-visible and the heap was visited for, visible or not, as core's Index Only Scan counts them (in
-heap mode, as before, the members with a visible version); `Heap Fetches: 0` on a vacuumed table.
+Fetches` counts in index-only mode the heap visits: the members whose page the visibility map did
+not call all-visible, the members an inexact or degraded set had rechecked on their heap tuple
+(§40.4) and the fetch-and-sort switch's, visible or not, as core's Index Only Scan counts its
+visits (in heap mode, as before, the members with a visible version); `Heap Fetches: 0` on a
+vacuumed table under an exact set, or an inexact one the B-tree can recheck.
 
 ### 40.7 Tests
 
@@ -17753,17 +17807,39 @@ deletes) before VACUUM, their heap fetches counted, and after VACUUM with none; 
 mode); cursors fetched in pieces in both modes; a generic plan and LATERAL and correlated
 subqueries rescanned with the outer value in the lion filter and in the B-tree's quals; the partial
 B-trees, with the predicate column covered and not; the expression B-tree (the order, no values);
-each setting off; and the plan choice with nothing disabled.
+each setting off; and the plan choice with nothing disabled. Then a B-tree lacking the lion
+filter's columns (§40.1): an exact set (`Heap Fetches: 0`), an inexact one (each member fetched
+for its recheck), rows not all-visible on an inexact set (fetched once), a set that degrades under
+`hash_mem` through a kept plan (as ordered.sql's section 10 does, on a 400,000-row table of its
+own: `Lion Set: degraded`, heap fetches and rows removed, the numbers filtered out) and tsquery
+prefix and NOT filters (supersets, rechecked from the heap); the switch in index-only mode
+(§40.4): the far-end shape switches and matches the ordinary plan, a large
+`pg_lion.ordered_switch_ratio` keeps it walking, the uniform GROUP BY walk and a uniform backward
+walk to the end never switch and read nothing from the heap, and the same backward walk in heap
+mode (a `ctid` in the target) switches as before; NULLs in key and INCLUDE columns, a NULL `name`
+among them, over `(grp DESC NULLS FIRST, id) INCLUDE (x, nm)` walked both ways, `IS NULL` filters,
+on a table with a dropped column (the mapping with a gap); `ctid`, `tableoid` and a whole-row Var
+(heap mode), both settings off (no node), a SCROLL cursor fetched backward; and the pairs that add
+nothing (§40.2) - `k = 1 OR k = 7` with a lion index on `k` and a B-tree leading with it, with
+core's scans on and off: no node, its presence alone printed since the plan's text differs between
+majors - against a partial lion index walked whole, which is offered.
 test/isolation/btreescan_serializable.spec is §40.5's write skew, and passes only with the page
-lock.
+lock; a step shows the read ran index-only with `Heap Fetches: 0`, so the conflict is the page
+lock's.
 
 ### 40.8 Not done
 
-- **A recheck from the heap.** Where the lion filter's columns are not in the B-tree - `(grp)
-  INCLUDE (x)` under `WHERE tags @> '{t}'` - the heap could be read only for the members an inexact
-  or degraded set needs rechecked, and not at all for an exact one; the scan slot being the
-  relation's shape, the heap tuple could be copied into it as the switch copies it. v1 follows
-  core's rule and needs `tags` among the INCLUDE columns.
+- **The density gate's blind spot** (§40.4): members dense early in the order and the rest at its
+  far end, under a LIMIT the early ones do not satisfy (a residual filter removes them, say), keep
+  `distinct` at the uniform rate while the walk crosses the empty middle, so the gate never opens
+  and the walk goes to the end where heap mode's rule would have switched.
+- **The recheck from the heap is unpriced** (§40.3): an inexact source or a degraded set is
+  unknown at plan time; its fetches are bounded by the members, every one of which heap mode
+  fetches.
+- **Pending CI on 20.** `index_beginscan()`'s third argument and the `IndexScanDesc` fields the
+  index-only walk reads (`xs_want_itup`, `xs_itup`, `xs_itupdesc`, `xs_hitup`) are taken as 16 to
+  19 have them; an index-only walk whose `xs_want_itup` went unhonoured errors with "no index
+  tuple returned", which the master job's btreescan run will tell.
 - **A partial B-tree's predicate clause** stays in the filter (§40.1); dropping it as core's index
   scan does would need the switch's recheck to take the predicate on.
 - **Expression columns** returning a value for a matching expression of the target; **parallel**

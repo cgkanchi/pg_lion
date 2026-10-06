@@ -352,17 +352,19 @@ touches the heap, and returns the members' values from the index tuples, reading
 pages the visibility map does not call all-visible (`Heap Fetches` in `EXPLAIN ANALYZE`, 0 after a
 `VACUUM`). Lion's part is the membership test, which answers what the B-tree cannot hold: a
 multi-key column (`tags @> ...`), a column behind a high-cardinality key, ANDs and ORs across
-independent indexes. The B-tree must hold every column the query reads - its target and its `WHERE`
-clauses, the Lion-filtered ones included (they may be rechecked) - as key or `INCLUDE` columns:
+independent indexes. The B-tree must hold, as key or `INCLUDE` columns, every column the query
+reads - its target and the `WHERE` clauses the node still tests itself - but not the Lion-filtered
+columns: a set that turns out inexact at run time is rechecked on the heap tuple, fetched for that
+alone (`Heap Fetches` counts those too).
 
 ```sql
-CREATE INDEX docs_created_cov ON docs (created_at) INCLUDE (id, title, tags);
+CREATE INDEX docs_created_cov ON docs (created_at) INCLUDE (id, title);
 
 -- the latest matching rows: LionOrdered walks the B-tree backward and stops at the tenth member
 SELECT id, title FROM docs WHERE tags @> ARRAY['t1', 't17'] ORDER BY created_at DESC LIMIT 10;
 
 -- no ORDER BY: LionBtreeScan walks the whole covering B-tree, never the heap
-CREATE INDEX events_country_cov ON events (country) INCLUDE (amount, event_type);
+CREATE INDEX events_country_cov ON events (country) INCLUDE (amount);
 SELECT country, sum(amount) FROM events WHERE event_type = 'purchase' GROUP BY country;
 ```
 
@@ -714,15 +716,24 @@ planner's mispicks, on synthetic tables (DESIGN.md §39, "The matrix").
 | `bitmap_rate` | 1.0 | a bitmap heap scan |
 
 `pg_lion.pushdown_margin` (1, no margin): the share of the cheapest competing plan's cost a Lion
-custom path (`LionCount`, `LionSemiJoin`, `LionAntiJoin`, `LionOrdered`) must be priced at to be
-chosen. Set below 1, its own price is divided by it, so a near tie goes to PostgreSQL's plan, and
-its cost in `EXPLAIN` is marked up by it. It is not applied where it hedges nothing: to a plan
+custom path (`LionCount`, `LionSemiJoin`, `LionAntiJoin`, `LionOrdered`, `LionBtreeScan`) must be
+priced at to be chosen. Set below 1, its own price is divided by it, so a near tie goes to
+PostgreSQL's plan, and its cost in `EXPLAIN` is marked up by it. It tips `LionBtreeScan` against
+the sequential scan the same way: the covering walk's marked-up price must beat the sequential
+scan's for the walk to be kept. It is not applied where it hedges nothing: to a plan
 forced with nothing of PostgreSQL's left enabled, to a count whose cheapest competitor is the
 access method's own scan of a Lion index (both prices Lion's), and to a count whose multi-key query
 is a generic plan's parameter (priced at its dearest already). The default was 0.8 until the
 decision matrix found Lion the faster plan in most of its near ties, and every plan 0.8 moved
 moved to a slower one (DESIGN.md §39, "The margin"). PostgreSQL's `enable_*` settings and Lion's
 switches above still force a plan either way.
+
+`pg_lion.ordered_switch_ratio` (32, 1 to 1,000,000): how many B-tree entries `LionOrdered` walks per
+member it has not met yet before it stops walking, fetches the members left in TID order and sorts
+them (DESIGN.md §30.4, "When the walk is not paying"; `Switched to Fetch and Sort` in `EXPLAIN
+ANALYZE`). In index-only mode the switch is also held back while the walk meets members at the rate
+a uniform spread predicts, since there it would read heap pages the walk never touches (DESIGN.md
+§40.4). A large value keeps a walk from switching at all.
 
 ## Known limitations
 
