@@ -443,7 +443,7 @@ SELECT * FROM ol_run($$SELECT id FROM lol
 ------------------------------------------------------
  Index Entries Walked: 6179
  Lion Set Hits: 5
- Heap Fetches: 5
+ Heap Fetches: 0
  Lion Set: 31 containers, exact, after 11 keys probed
 (4 rows)
 

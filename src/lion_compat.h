@@ -96,6 +96,20 @@
 #endif
 
 /*
+ * Does EXPLAIN qualify a deparsed Var with its table, as core's useprefix
+ * decides it?  18 appends an RTE_GROUP entry to every GROUP BY query's range
+ * table and counts the entries without it in es->rtable_size; below 18 the
+ * range table's length is that count.
+ */
+#include "commands/explain.h"
+
+#if PG_VERSION_NUM >= 180000
+#define lion_explain_useprefix(es)	((es)->rtable_size > 1 || (es)->verbose)
+#else
+#define lion_explain_useprefix(es)	(list_length((es)->rtable) > 1 || (es)->verbose)
+#endif
+
+/*
  * Is ltopr the `<` of a btree ordering, and of which family and input type?
  * 18 turned the strategy number get_ordering_op_properties() reports into a
  * CompareType.
