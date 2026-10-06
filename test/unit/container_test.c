@@ -2307,6 +2307,32 @@ static bool raw_in_range(const LionContainer *c);
  * filter's).  Members that hit and miss, at 0 and 32767, and at a run's
  * edges and just past them; the small operand on either side.
  */
+/* copy() of a well-formed container of every type is the container, byte for byte. */
+static void
+test_copy(void)
+{
+	static const LionContainerType types[] = {LION_CT_ARRAY, LION_CT_BITSET, LION_CT_RUN, LION_CT_NARROW};
+	uint32		t;
+	uint32		trial;
+
+	phase("copy() of a well-formed container");
+	rng_seed(UINT64CONST(0x5EED0C09));
+	for (t = 0; t < lengthof(types); t++)
+		for (trial = 0; trial < 20; trial++)
+		{
+			Size		size;
+
+			gen_typed(&ref_a, &buf_a, types[t]);
+			size = lion_container_size(&buf_a.c);
+			memset(buf_d.data, 0xA5, sizeof(buf_d.data));
+			lion_container_copy(&buf_a.c, &buf_d.c);
+			CHECK(memcmp(buf_a.data, buf_d.data, size) == 0,
+				  "copy() of a well-formed container is byte for byte");
+			CHECK(size == sizeof(buf_d.data) || (uint8) buf_d.data[size] == 0xA5,
+				  "copy() of a well-formed container writes its size and no more");
+		}
+}
+
 static void
 test_and_probe(void)
 {
@@ -3209,6 +3235,7 @@ damage_exercise(const LionContainer *c, const LionContainer *other)
 	DAMAGE_SETOP("or_raw()", (void) lion_container_or_raw(other, c, dmg_dst));
 	DAMAGE_SETOP("andnot_raw()", (void) lion_container_andnot_raw(c, other, dmg_dst));
 	DAMAGE_SETOP("andnot_raw()", (void) lion_container_andnot_raw(other, c, dmg_dst));
+	DAMAGE_SETOP("copy()", lion_container_copy(c, dmg_dst));
 #undef DAMAGE_SETOP
 	CHECK(guard_ok(dmg_dst, LION_CONTAINER_MAX_SIZE), "damaged: set algebra stays inside dest");
 
@@ -6427,6 +6454,7 @@ main(void)
 	test_gallop_intersection();
 	test_and_shapes();
 	test_and_probe();
+	test_copy();
 	test_run_intersection_overflow();
 	test_remove_if_rebuild();
 	test_check_rejects();

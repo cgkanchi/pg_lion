@@ -175,7 +175,7 @@ lion_collect_container(LionCollect *col, const LionContainer *c)
 	if (lion_container_cardinality(c) == 0)
 		return;
 
-	memcpy(opt.data, c, lion_container_size(c));
+	lion_container_copy(c, &opt.hdr);
 	lion_container_optimize(&opt.hdr);
 	c = &opt.hdr;
 	sz = lion_item_size(c);

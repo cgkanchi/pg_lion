@@ -553,7 +553,7 @@ lion_units_for(RelOptInfo *rel, LionUnits *u)
 	Cost		cost;
 	bool		ownscan;
 
-	if (rel != NULL && rel == lion_units_pinned_rel)
+	if (lion_units_pinned_rel != NULL && rel == lion_units_pinned_rel)
 	{
 		u->kind = lion_units_pinned_kind;
 		cost = lion_units_pinned_cost;
