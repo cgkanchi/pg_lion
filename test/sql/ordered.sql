@@ -570,6 +570,26 @@ SELECT lion_ord('SELECT id, k FROM lpart WHERE s <> '''' ORDER BY k');
 SELECT lion_ord('SELECT id, k FROM lpart WHERE s <> '''' AND e = 4 ORDER BY k LIMIT 10');
 DROP TABLE lpart;
 
+-- 19. Two or more lion clauses the btree's predicate implies: lo_cost() kept
+--     the index clauses it shares with the lion access as RestrictInfos and
+--     the implied clauses as bare expressions in one list, and read every
+--     element as a RestrictInfo when it checked the next implied clause for
+--     a duplicate - the second one crashed the planner (a benchmark,
+--     2026-10-06).  A partial btree whose predicate implies both lion
+--     clauses; then one with an index clause the lion access shares ahead of
+--     two the predicate implies.
+CREATE TABLE lpred2 (id int PRIMARY KEY, e int, h int, g int, k int, pad text)
+  WITH (autovacuum_enabled = off);
+INSERT INTO lpred2 SELECT i, i % 50, i % 7, i % 3, (i * 7919) % 100003, repeat('x', 60)
+  FROM generate_series(1, 100000) i;
+CREATE INDEX lpred2_k ON lpred2 (k) WHERE e = 4 AND h = 3;
+CREATE INDEX lpred2_ek ON lpred2 (e, k) WHERE h = 3 AND g = 1;
+CREATE INDEX lpred2_ehg ON lpred2 USING lion (e, h, g);
+VACUUM (FREEZE, ANALYZE) lpred2;
+SELECT lion_ord('SELECT id, k FROM lpred2 WHERE e = 4 AND h = 3 ORDER BY k LIMIT 10');
+SELECT lion_ord('SELECT id, k FROM lpred2 WHERE e = 4 AND h = 3 AND g = 1 ORDER BY k');
+DROP TABLE lpred2;
+
 DROP FUNCTION lion_ord_try(text, boolean);
 DROP TABLE lo_rls;
 REVOKE SELECT ON lo FROM lion_ord_user;
