@@ -13846,6 +13846,12 @@ the node works on every supported major (16 .. 20), and DESC, multi-column ORDER
 FIRST/LAST, expression indexes and the btree's own index quals come with it for free. This
 replaces native ordered lion scans (§29.8, `amcanorder` on 18+), which stay deferred.
 
+*(Since 2026-10-06 the node has an INDEX-ONLY mode, §40: when the btree returns every column the
+node must produce - `(k) INCLUDE (...)`, as for an Index Only Scan - the row's values come from the
+index tuple and the heap is read only for pages the visibility map does not call all-visible. EXPLAIN
+says `Ordered By: <index> (index only)`. The same walk is then also offered without an ORDER BY, as
+`LionBtreeScan`. Everything in this section stands for both modes unless §40 says otherwise.)*
+
 ### 30.1 What qualifies
 
 - **The relation.** A plain base relation (`RELOPT_BASEREL`, `RTE_RELATION`, relkind table or
@@ -17532,3 +17538,233 @@ under a LIMIT to an index scan three times slower (0.13 to 0.15 ms against 0.04 
   and measures nothing of the rate.
 - **The parallel GROUP BY's participants** are priced with the serial node's competitor; core's
   partial paths are not searched for one of their own.
+
+## 40. Lion-filtered walks of a covering B-tree, index-only (`LionOrdered`'s index-only mode and `LionBtreeScan`, lion_ordered.c; 2026-10-06)
+
+The shape is
+
+    SELECT <columns a B-tree holds> FROM t
+    WHERE <clauses lion indexes answer> [AND <the B-tree's own quals>]
+    [ORDER BY <the B-tree's columns> [LIMIT n]]
+
+over a B-tree the user created to cover it - `(k) INCLUDE (...)`, as for an Index Only Scan - and
+lion indexes on the filter columns. §30's node already filters a B-tree's walk through lion's set
+before it touches the heap; what it fetched from the heap was the row's VALUES. When the B-tree
+returns every column the node must produce, the values come from the index tuple and the heap is
+read for visibility alone, on pages the visibility map does not call all-visible, exactly as core's
+Index Only Scan reads it (`nodeIndexonlyscan.c`): a `LIMIT 10` of a selective filter then costs the
+lion lookups, the entries walked and ten visibility-map tests. And since the walk pays without an
+ORDER BY once the heap is out of it, the same node is offered for any B-tree path of the relation
+whose index covers the query - a full walk of `(grp) INCLUDE (x, tags)` under `WHERE tags @> '{t}'
+GROUP BY grp` included - under the name `LionBtreeScan` when it claims no order. Lion's part is the
+membership test, which answers what a B-tree cannot hold: multi-key columns, a column behind a
+high-cardinality leader, ANDs and ORs across independent indexes. This is what replaces the window
+store (format version 9, reverted 2026-10-06): a value store partitioned by heap window cannot beat
+a B-tree's clustering on a pinned key, and the B-tree is the user's to create.
+
+### 40.1 What qualifies
+
+- **The relation, the WHERE and the lion side**: §30.1 and §30.2, unchanged (`lo_rel_ok()`,
+  `lo_lion_accesses()`). The target of an UPDATE, DELETE or MERGE, a relation with security quals,
+  another table AM: declined as there.
+- **Coverage.** The B-tree covers the node when every column it must produce is a plain column of
+  the index - a key column (`indexkeys[i] != 0`) or an INCLUDE column - that the AM can return
+  (`canreturn[i]`, true of every B-tree column). The columns the node must produce are what core's
+  `check_index_only()` computes: every Var of the relation in `rel->reltarget->exprs` and in every
+  clause of `rel->baserestrictinfo` - which covers the residual filter, the lion recheck of an
+  inexact or degraded set, the ordered index's recheck under `xs_recheck` and EvalPlanQual's - and,
+  since a partial lion index's predicate is part of it, the lion qual's (`lo_needed_attrs()`,
+  `lo_index_only()`). The lion filter's columns are therefore in the index too, as core asks of an
+  index-only scan's restriction clauses even where the index quals are exact: whether the set needs
+  rechecking is known at run time, not plan time (a set that degrades is rechecked). An expression
+  column matches no Var: it may still give the order, as in §30, but no value. A system column
+  makes the index non-covering, as in core: `SELECT ... FOR UPDATE` adds the row mark's `ctid` to
+  the target, so a locked relation is always heap mode, and EvalPlanQual never meets an index-only
+  plan. So does a partial B-tree's predicate column when the query spells the predicate: the clause
+  stays in the node's filter (§30.2 step 4 - core's index scan drops it, but the fetch-and-sort
+  switch rechecks rows that did not come through the index, which the predicate does not hold for),
+  so `(k) INCLUDE (x) WHERE flag` under `WHERE flag AND ...` is covered only with `flag` among the
+  INCLUDE columns. The mapping of index columns to relation attnos goes into `custom_private`
+  (`LO_PRIV_IOCOLS`), so that the executor looks nothing up per row.
+- **`enable_indexonlyscan`**: off, there is no index-only mode - the ordered node keeps its heap
+  mode, and no unordered path is offered.
+
+### 40.2 Planner integration (`lion_ordered_set_rel_pathlist()`)
+
+- **Ordered paths** (§30.2): as before, from `rel->pathlist`; each (ordered path, lion access)
+  pair decides coverage - the lion access's qual included - and is priced in index-only mode when
+  covered, in heap mode as before otherwise.
+- **Unordered paths.** For each B-tree of the relation that covers the query's target and clauses,
+  `create_index_paths()` is run on a scratch copy of the RelOptInfo that sees that index ALONE
+  (`lo_scratch_rel()`, the helper `lo_lion_accesses()` now builds its copy with; `lo_btree_paths()`)
+  - alone, so that its paths compete with nothing: in the relation itself the full walk of a
+  covering index without a qual, which core builds as an index-only scan whenever
+  `check_index_only()` passes, loses to the sequential scan and never reaches `rel->pathlist`, and
+  a path with quals may lose to another index's. Core builds, for that index, the paths with its
+  matching quals - with pathkeys where the query finds them useful, without otherwise - a backward
+  one where that order is useful, and the no-qual one; an IndexPath that `add_path()` dropped for a
+  bitmap scan of the same index is taken from that scan's one-leaf `bitmapqual`. Each resulting
+  IndexPath - a B-tree, not hypothetical, `param_info == NULL`, no ORDER BY operators,
+  `lo_indexpath_ok()` - whose twin is not among the ordered paths (the same index, direction and
+  pathkeys: offered above already) is paired with each lion access from `lo_lion_accesses()`, as
+  the ordered loop pairs them, less the pairs in which the lion access adds nothing: every clause
+  of its every leaf, an OR arm's too, is one of the B-tree path's own index clauses
+  (`lo_lion_adds()`), so every entry walked would be a member. The pair must cover (the lion qual
+  included) and is priced in index-only mode. The CustomPath carries the IndexPath's pathkeys when
+  it has them - a free order - under the name `LionOrdered`, and none otherwise under the name
+  `LionBtreeScan`: a second `CustomPathMethods`/`CustomScanMethods` pair over the same plan
+  function, state struct and executor functions. `pg_lion.enable_ordered_scan` keeps gating the
+  ordered paths and the lion columns' walks of §30.11, and with it off the unordered paths claim no
+  order whatever core found useful - a `LionOrdered` must not appear with its switch off - and are
+  all `LionBtreeScan`s; `pg_lion.enable_btree_scan` (bool, default on) gates the unordered paths.
+  Core's `enable_indexscan` leaves both alone, as it left `LionOrdered` alone: the node is priced
+  from `indextotalcost`, which carries no `disable_cost`.
+- **Partitions**: as §30.11, each leaf is scanned like a table under core's Append or MergeAppend.
+
+### 40.3 Cost (`lo_cost()`, index-only)
+
+§30.3's start-up (the lion lookups and the set), walk (`indextotalcost` plus a membership test per
+entry) and shared-clause correction stand. The heap term changes: the `F` members' pages are
+priced as `cost_index()` prices an index-only scan's - `index_pages_fetched()` for an uncorrelated
+order and the members' share of the heap for a correlated one, EACH scaled by `(1 -
+rel->allvisfrac)`, the fraction of pages the visibility map does not call all-visible, and
+interpolated by the squared correlation as before - plus a visibility-map test per member at
+`cpu_operator_cost`; `cpu_tuple_cost` per member (now the index tuple's deform) and the filter's
+cost were charged already. `lo_margin` applies as §39 applies it. For an unordered path core has no
+LIMIT to scale by, so the planner prices the whole walk, and a path whose walk is the whole index
+competes on `indextotalcost + T × cpu_operator_cost` against the bitmap heap scan's heap pages,
+which is right: on `btreescan.sql`'s 100,000 rows, whose heap is six times the covering B-tree,
+the covering walk is chosen over the bitmap scan for a filter of a tenth of the rows, the bitmap
+scan over it where only the wide `(k) INCLUDE (...)` B-tree covers the columns, and the lion
+index's own scan for a filter of three in a thousand (§40.7, "the plan choice").
+
+### 40.4 Execution
+
+- **The slot.** The mode is fixed per plan, so the scan slot's type is: `TTSOpsBufferHeapTuple` of
+  the relation's descriptor in heap mode, as before; `TTSOpsVirtual` of the relation's descriptor
+  in index-only mode - the relation's, not the index's as core's node uses, so that the plan's Vars
+  (`scanrelid`, no `custom_scan_tlist`) and the rechecks read it unchanged. `lo_create_state()`
+  picks it from the plan's flags, not `BeginCustomScan`: `ExecInitCustomScan()` initialises the
+  projection and the quals on the scan slot's type before `BeginCustomScan` runs, and the expression
+  machinery specialises on it, so one plan never returns slots of two types.
+- **A row.** `xs_want_itup` is set on the B-tree scan before `index_rescan()`. For a member TID
+  (`lo_fetch_indexonly()`): `VM_ALL_VISIBLE(heapRelation, blkno, &vmbuffer)`, the map's buffer kept
+  across calls and released at rescan and end, as `ioss_VMBuffer` is. All-visible, the row is
+  visible to every snapshot, this one included, and the heap is not read. Not all-visible, the
+  heap tuple is fetched into a slot of the table AM's kept for this alone (`index_fetch_heap()` on
+  16 to 19, `table_fetch_tid()` and `table_tuple_fetch_row_version()` on 20 - `lo_fetch_btree()`,
+  as heap mode fetches), counted as a heap fetch and let go; a TID with no visible version is
+  skipped. Either way the values are the INDEX TUPLE's: `xs_itup` deformed with `xs_itupdesc` (or
+  `xs_hitup`, had the AM returned a heap-format tuple) and laid into the virtual slot through the
+  mapping, every other attribute NULL - the visible version reached from the root TID has the
+  index's values for indexed and INCLUDE columns, since those are HOT-blocking (§30.5). A `name`
+  column a B-tree stores as a cstring (`name_ops`'s storage type) is copied back into a Name of the
+  node's, reused per row, as core copies it. The "met before" bitmap of §30.4 stands: a TID met
+  twice is skipped before any of this.
+- **The rechecks** - `lionrecheck` for an inexact or degraded set, `ordrecheck` under
+  `xs_recheck`, EvalPlanQual's `lo_recheck` - evaluate on the scan slot as before; coverage
+  guarantees the columns are there.
+- **The fetch-and-sort switch** (§30.4) fetches members from the heap in TID order: in index-only
+  mode each lands in the table AM's slot and is copied into the virtual scan slot
+  (`ExecCopySlot()`, a deform) before the rechecks and the sort, so the slot type stays fixed. Its
+  rule changes with the mode. In heap mode the members it fetches would have been fetched by the
+  walk anyway, so its ratio - what a member's fetch costs in entries walked - is a warm fetch's
+  measured 32. In index-only mode the walk would not have read those members' heap pages at all,
+  so a fetch is priced as the planner prices a heap page: the tablespace's `random_page_cost`
+  against an entry's `cpu_index_tuple_cost + cpu_operator_cost`, some 530 at the defaults and never
+  below 32 (`switchratio`, set in `lo_begin()`). Under the heap-mode ratio a full walk for a filter
+  of a tenth of the rows switched three quarters of the way through the index and fetched the
+  2,300 members left from a heap it had not touched; under this one it walks to its end, and a
+  LIMIT's walk that is not meeting its members still switches, later. An unordered path has no
+  sort keys and never switches, as a path whose pathkeys were not plain columns never did; the
+  planner priced the full walk.
+- **Unchanged**: the lazy set, the early stop, degradation, rescans with changed Params, the
+  relation predicate locks on the lion indexes.
+
+### 40.5 Correctness
+
+§30.5's argument stands for which TIDs come out of the walk and are members. What changes is how a
+member's visibility is decided and where its values come from, and both are core's Index Only
+Scan's.
+
+- **The visibility map.** A page's all-visible bit says every tuple on it is visible to every
+  snapshot. It is cleared, under the page's lock, before a row is inserted on the page, and the
+  B-tree entry for that row is inserted after; the walk reads a TID under the B-tree page's shared
+  lock, serialised with the insert's exclusive lock, and the lock released between the clearing and
+  the index insert is a full barrier - so a TID the walk meets whose row was inserted after the bit
+  was set is met with the bit cleared (`nodeIndexonlyscan.c`'s "memory ordering effects" note,
+  which `visibilitymap_get_status()` reading without a lock rests on). A delete clears the bit too
+  and does not touch the index, but the deleted row stays visible to the snapshot until its
+  deleter commits, and a snapshot that sees the commit was taken under ProcArrayLock after the bit
+  was cleared. Lion adds no TID the B-tree did not return, so nothing new arises on its side.
+- **A recycled TID, and a hot standby.** `xs_want_itup` makes nbtree keep its pin on the leaf page
+  while the executor tests the map (its `dropPin` rule, nbtree's README): VACUUM cannot remove the
+  page's TIDs from the index, and so cannot free the heap slots they name, until the walk has moved
+  on - the interlock core's Index Only Scan relies on, and now the node's. The set's own hazard
+  (§30.5, "A recycled TID") is unchanged: a member whose slot was reused names a tuple the snapshot
+  cannot see, and on a page still marked all-visible no such tuple exists. On a hot standby the
+  same pin rule protects the walk as it protects core's scan, and the lion side still reads no
+  visibility map and holds no pin (§30.5).
+- **SERIALIZABLE.** A row returned without a heap visit has no tuple to predicate-lock - a tuple
+  lock needs the tuple's xmin, which was not read - so the node takes `PredicateLockPage()` on its
+  heap page as core's Index Only Scan does, after the rechecks pass, for each row it returns; a row
+  the heap was visited for holds its tuple lock from the fetch. The B-tree page locks and the lion
+  relation locks are §30.5's. test/isolation/btreescan_serializable.spec is the write skew of two
+  HOT updates of rows the other transaction read index-only: it must fail, and without the page
+  lock neither update would conflict with anything the other read (a HOT update writes no index)
+  and both would commit.
+- **EvalPlanQual** never meets an index-only plan: a row mark's `ctid` is in the target (§40.1).
+  `lo_recheck()` asserts the test tuple's slot type is the scan slot's.
+
+### 40.6 EXPLAIN
+
+    Custom Scan (LionBtreeScan) on bs
+      Index: bs_grp (index only)
+      Lion Cond: (tags @> '{t3}'::text[])
+      Lion Indexes: bs_tags
+
+    Limit
+      ->  Custom Scan (LionOrdered) on bs
+            Ordered By: bs_k (backward, index only)
+            Lion Cond: ((c200 = 17) AND (c20 = 3))
+            Lion Indexes: bs_c200, bs_c20
+
+`LionOrdered`'s lines are §30.7's; `index only` joins the `Ordered By` line's parenthesis in
+index-only mode (heap mode prints as before, so no existing output changes), and a `LionBtreeScan`
+names the index it walks under `Index`, with the same qual and counter lines. Under ANALYZE, `Heap
+Fetches` counts in index-only mode the members whose page the visibility map did not call
+all-visible and the heap was visited for, visible or not, as core's Index Only Scan counts them (in
+heap mode, as before, the members with a visible version); `Heap Fetches: 0` on a vacuumed table.
+
+### 40.7 Tests
+
+test/sql/btreescan.sql, on a 100,000-row table - its heap six times its covering B-trees - with
+covering B-trees `(k) INCLUDE (id, grp, x, c200, c20, nm)` and `(grp) INCLUDE (x, tags)`, two
+partial ones and an expression one, and lion indexes on `c200`, `c20` and `tags`: every query run
+through the node (every core scan off) and through the ordinary plan (both of the node's settings
+off) and compared - in order under an ORDER BY, as multisets otherwise - with the node and its mode
+named. A covered `=`, ranges and `IN` lists on the B-tree side with lion filters, lion `IN` lists, a
+`name` INCLUDE column filtered and returned, DESC with a LIMIT, OFFSET, an empty answer, a LIMIT
+beyond the match count; the aggregate shape under a GROUP BY and a plain aggregate, with an exact
+filter and a rechecked (multi-key) one; the counters (`Heap Fetches: 0` after VACUUM, `Rows Removed
+by Lion Recheck` evaluated on the index tuple's values, the switch in index-only mode with its heap
+fetches counted); rows inserted in the same transaction and a dirty heap (HOT and non-HOT updates,
+deletes) before VACUUM, their heap fetches counted, and after VACUUM with none; `FOR UPDATE` (heap
+mode); cursors fetched in pieces in both modes; a generic plan and LATERAL and correlated
+subqueries rescanned with the outer value in the lion filter and in the B-tree's quals; the partial
+B-trees, with the predicate column covered and not; the expression B-tree (the order, no values);
+each setting off; and the plan choice with nothing disabled.
+test/isolation/btreescan_serializable.spec is §40.5's write skew, and passes only with the page
+lock.
+
+### 40.8 Not done
+
+- **A recheck from the heap.** Where the lion filter's columns are not in the B-tree - `(grp)
+  INCLUDE (x)` under `WHERE tags @> '{t}'` - the heap could be read only for the members an inexact
+  or degraded set needs rechecked, and not at all for an exact one; the scan slot being the
+  relation's shape, the heap tuple could be copied into it as the switch copies it. v1 follows
+  core's rule and needs `tags` among the INCLUDE columns.
+- **A partial B-tree's predicate clause** stays in the filter (§40.1); dropping it as core's index
+  scan does would need the switch's recheck to take the predicate on.
+- **Expression columns** returning a value for a matching expression of the target; **parallel**
+  walks (`parallel_safe = false`, as §30).
