@@ -1068,14 +1068,54 @@ typedef struct LionQueryEmitState
 	TIDBitmap  *tbm;
 	bool		recheck;
 	int64		ntids;
+	LionPosFilter *posfilter;	/* decides each member, or NULL */
+	uint16	   *keep;			/* the members it keeps */
+	ItemPointerData tids[LION_MAX_OFFSET + 1];
 } LionQueryEmitState;
 
 static bool
 lion_query_emit_cb(const LionContainer *c, void *arg)
 {
 	LionQueryEmitState *es = (LionQueryEmitState *) arg;
+	BlockNumber firstblk;
+	BlockNumber curblk = InvalidBlockNumber;
+	int			nkeep;
+	int			ntids = 0;
+	int			i;
 
-	es->ntids += lion_container_to_tbm(c, es->tbm, es->recheck);
+	if (es->posfilter == NULL)
+	{
+		es->ntids += lion_container_to_tbm(c, es->tbm, es->recheck);
+		return true;
+	}
+
+	/*
+	 * The members the positions say match, one tbm_add_tuples() call per
+	 * heap block as lion_container_to_tbm() makes them: exact, so with the
+	 * scan's own recheck flag and not the superset's.
+	 */
+	nkeep = lion_posfilter_container(es->posfilter, c, es->keep);
+	firstblk = lion_ckey_first_block(c->ckey);
+	for (i = 0; i < nkeep; i++)
+	{
+		uint16		blkinc;
+		OffsetNumber off;
+		BlockNumber blk;
+
+		lion_lo_split(es->keep[i], &blkinc, &off);
+		blk = firstblk + (BlockNumber) blkinc;
+		if (ntids > 0 && (blk != curblk || ntids > LION_MAX_OFFSET))
+		{
+			tbm_add_tuples(es->tbm, es->tids, ntids, es->recheck);
+			ntids = 0;
+		}
+		curblk = blk;
+		ItemPointerSet(&es->tids[ntids], blk, off);
+		ntids++;
+	}
+	if (ntids > 0)
+		tbm_add_tuples(es->tbm, es->tids, ntids, es->recheck);
+	es->ntids += nkeep;
 	return true;
 }
 
@@ -1104,7 +1144,9 @@ lion_emit_query(Relation index, LionState *col, StrategyNumber strategy,
 {
 	LionQuery	q;
 	LionPostingSet *sets;
-	LionQueryEmitState es;
+	LionQueryEmitState *es;
+	LionPosFilter *posfilter = NULL;
+	int64		total;
 	MemoryContext cxt;
 	MemoryContext oldcxt;
 	int			i;
@@ -1131,8 +1173,15 @@ lion_emit_query(Relation index, LionState *col, StrategyNumber strategy,
 	lion_extract_query_superset(col, query, strategy, &q);
 	if (q.mode == LION_QMODE_LOSSY)
 	{
+		/*
+		 * A column that stores positions decides each candidate from them
+		 * instead (lion_posfilter.c), and what it keeps needs no recheck.
+		 */
+		if (col->positions)
+			posfilter = lion_posfilter_begin(index, col, query, strategy);
 		q.mode = LION_QMODE_KEYS;
-		recheck = true;
+		if (posfilter == NULL)
+			recheck = true;
 	}
 
 	if (q.mode != LION_QMODE_KEYS)
@@ -1164,20 +1213,28 @@ lion_emit_query(Relation index, LionState *col, StrategyNumber strategy,
 		CHECK_FOR_INTERRUPTS();
 	}
 
-	es.tbm = tbm;
-	es.recheck = recheck;
-	es.ntids = 0;
+	es = (LionQueryEmitState *) palloc(sizeof(LionQueryEmitState));
+	es->tbm = tbm;
+	es->recheck = recheck;
+	es->ntids = 0;
+	es->posfilter = posfilter;
+	es->keep = posfilter == NULL ? NULL :
+		(uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
 
-	(void) lion_sets_iterate(q.nkeys, sets, q.tree, lion_query_emit_cb, &es);
+	(void) lion_sets_iterate(q.nkeys, sets, q.tree, lion_query_emit_cb, es);
 
 	/* Every pin goes before the memory the sets live in does. */
 	for (i = 0; i < q.nkeys; i++)
 		lion_posting_set_release(&sets[i]);
 
+	if (posfilter != NULL)
+		lion_posfilter_end(posfilter);
+	total = es->ntids;
+
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
 
-	return es.ntids;
+	return total;
 }
 
 /*
@@ -1630,6 +1687,8 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 	es.tbm = tbm;
 	es.recheck = so->recheck;
 	es.ntids = 0;
+	es.posfilter = NULL;
+	es.keep = NULL;
 
 	(void) lion_sets_iterate(acc.nsets, acc.sets, tree, lion_query_emit_cb,
 							 &es);
@@ -2654,6 +2713,15 @@ struct LionSource
 	bool		recheck;		/* §29.6 */
 	LionSourceShape shape;
 
+	/*
+	 * Queries decided from stored positions (lion_posfilter.c): every
+	 * container the shape below yields goes through each, which is exact for
+	 * the scan because its keys are ANDed - whatever else the shape answers,
+	 * a row is returned only if each of these queries selects it.
+	 */
+	LionPosFilter **posfilters;
+	int			nposfilters;
+
 	/* the located sets of the SETS tree, or of the other columns' trees */
 	LionPostingSet *sets;		/* nsets of them, + 1 slot for a WALK entry */
 	int			nsets;
@@ -3145,8 +3213,33 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 				}
 				else
 				{
+					/*
+					 * A superset is rechecked, unless the column stores
+					 * positions and the query can be decided from them -
+					 * one query, not `@@ ANY (array)`'s union of several,
+					 * and under an MVCC snapshot, which is what makes the
+					 * positions safe to read at any moment of the scan
+					 * (lion_posfilter.c).
+					 */
 					if (lossy)
-						src->recheck = true;	/* a superset, rechecked */
+					{
+						LionPosFilter *pf = NULL;
+
+						if (col->positions && !keeppins &&
+							(skey->sk_flags & SK_SEARCHARRAY) == 0)
+							pf = lion_posfilter_begin(so->index, col,
+													  skey->sk_argument,
+													  skey->sk_strategy);
+						if (pf != NULL)
+						{
+							if (src->posfilters == NULL)
+								src->posfilters = (LionPosFilter **)
+									palloc(sizeof(LionPosFilter *) * ch.nsets);
+							src->posfilters[src->nposfilters++] = pf;
+						}
+						else
+							src->recheck = true;
+					}
 					args[nargs++] = node;
 				}
 				continue;
@@ -3839,8 +3932,8 @@ lion_source_window_next(LionSource *src)
  * The next container of the source, or NULL at the end.  Valid until the
  * next call, which is where the pins it was read under - if any - go.
  */
-const LionContainer *
-lion_source_next(LionSource *src)
+static const LionContainer *
+lion_source_next_raw(LionSource *src)
 {
 	const LionContainer *c;
 
@@ -3972,7 +4065,30 @@ lion_source_release(LionSource *src)
 	for (i = 0; i < src->nsets; i++)
 		lion_posting_set_release(&src->sets[i]);
 	src->nsets = 0;
+	for (i = 0; i < src->nposfilters; i++)
+		lion_posfilter_end(src->posfilters[i]);
+	src->nposfilters = 0;
 	src->shape = LION_SRC_NONE;
+}
+
+/* ... and through the position filters, when the source has some. */
+const LionContainer *
+lion_source_next(LionSource *src)
+{
+	const LionContainer *c;
+
+	while ((c = lion_source_next_raw(src)) != NULL)
+	{
+		int			i;
+
+		for (i = 0; i < src->nposfilters &&
+			 lion_container_cardinality(c) > 0; i++)
+			c = lion_posfilter_apply(src->posfilters[i], c);
+		if (lion_container_cardinality(c) > 0)
+			return c;
+		CHECK_FOR_INTERRUPTS();
+	}
+	return NULL;
 }
 
 LionSource *

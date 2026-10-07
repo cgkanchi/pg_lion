@@ -1,12 +1,12 @@
--- Stored positions (DESIGN.md §17, "Stored positions"): insert, VACUUM and
--- CREATE INDEX.
+-- Stored positions (DESIGN.md §17, "Stored positions"): insert, VACUUM,
+-- CREATE INDEX, and the bitmap scans they answer.
 --
 -- A column whose multi-key opclass has support function 5 stores, for every
 -- key, each row's word positions and weights: in the entry while it is
--- INLINE, in a position tree once the entry spills.  Nothing reads them yet,
--- so the opclass is not part of the extension: this test creates it, and a
--- test function that lists what the index stores for one key, and compares
--- that with unnest() of the rows' tsvectors.
+-- INLINE, in a position tree once the entry spills.  The opclass is not part
+-- of the extension yet: this test creates it, and a test function that lists
+-- what the index stores for one key, and compares that with unnest() of the
+-- rows' tsvectors.
 --
 -- The table keeps autovacuum off so that the VACUUMs below are the only ones.
 
@@ -129,6 +129,110 @@ DELETE FROM pos_docs WHERE id % 11 = 0;
 VACUUM pos_docs;
 SELECT * FROM pos_compare;
 SELECT lion_index_verify('pos_docs_d', true);
+
+-- Queries answered from the positions (lion_posfilter.c): the posting sets
+-- give the candidates, and each one is decided from its stored positions, so
+-- a bitmap scan or an index scan returns exactly what the heap's @@ does and
+-- has nothing to recheck.  Every shape against a seq scan, over inline keys
+-- and position trees, with stripped rows and the last position there is.
+INSERT INTO pos_docs VALUES
+	(20001, strip(to_tsvector('simple', 'common again common'))),
+	(20002, 'near:16382 far:16383'),
+	(20003, 'far:1A near:3B,16383C');
+CREATE TEMP TABLE pos_queries (q tsquery);
+INSERT INTO pos_queries VALUES
+	('common <-> again'), ('again <-> common'), ('again <2> common'),
+	('common <-> again <-> common'), ('everywhere <-> again <-> again'),
+	('dense <-> dense'), ('dense <-> few1'), ('dense <200> few2'),
+	('w1:A'), ('w1:B & w2'), ('w1:AB <-> w2'), ('w2:D <-> w1:CD'),
+	('common & !again'), ('everywhere & !again'), ('again & !(common <-> again)'),
+	('common <-> !again'), ('!common <-> again'), ('common & !nosuch'),
+	('(common <-> again) | (w1 <-> w2)'), ('(common | dense) <-> again'),
+	('common <-> (again | new5)'), ('near <-> far'), ('far <-> near'),
+	('near:C <2> far'), ('far:A <2> near:B'), ('nosuch <-> common'),
+	('w5 <-> w5'), ('rare3 <-> common'), ('common <-> ag:*');
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+CREATE TEMP TABLE pos_by_index AS
+SELECT q::text, (SELECT array_agg(id ORDER BY id) FROM pos_docs WHERE d @@ q) AS ids
+FROM pos_queries;
+RESET enable_indexscan;
+SET enable_bitmapscan = off;
+CREATE TEMP TABLE pos_by_iscan AS
+SELECT q::text, (SELECT array_agg(id ORDER BY id) FROM pos_docs WHERE d @@ q) AS ids
+FROM pos_queries;
+RESET enable_seqscan;
+SET enable_indexscan = off;
+CREATE TEMP TABLE pos_by_heap AS
+SELECT q::text, (SELECT array_agg(id ORDER BY id) FROM pos_docs WHERE d @@ q) AS ids
+FROM pos_queries;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+SELECT i.q, coalesce(cardinality(h.ids), 0) AS rows,
+	   i.ids IS NOT DISTINCT FROM h.ids AS bitmap_same,
+	   s.ids IS NOT DISTINCT FROM h.ids AS iscan_same
+FROM pos_by_index i JOIN pos_by_heap h USING (q) JOIN pos_by_iscan s USING (q)
+ORDER BY i.q;
+
+-- what the bitmap heap scan still rechecks: nothing, but for a prefix
+-- lexeme, which names keys the filter cannot follow
+CREATE FUNCTION pos_rechecked(q tsquery) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	SET LOCAL enable_seqscan = off;
+	SET LOCAL enable_indexscan = off;
+	FOR l IN EXECUTE format('EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) '
+							'SELECT id FROM pos_docs WHERE d @@ %L', q) LOOP
+		IF l LIKE '%Rows Removed by Index Recheck%' THEN
+			RETURN true;
+		END IF;
+	END LOOP;
+	RETURN false;
+END $$;
+SELECT q, pos_rechecked(q) FROM (VALUES
+	('common <-> again'::tsquery), ('everywhere & !again'), ('w1:A'),
+	('common <-> ag:*')) v(q);
+DROP FUNCTION pos_rechecked(tsquery);
+
+-- The count pushdown decides the same candidates from the positions before
+-- it asks the visibility map, so a vacuumed table is counted without the
+-- heap; a literal query and a generic plan's parameter alike
+VACUUM pos_docs;
+CREATE TEMP TABLE pos_counted AS
+SELECT q::text, (SELECT count(*) FROM pos_docs WHERE d @@ q) AS n FROM pos_queries;
+PREPARE pos_count(tsquery) AS SELECT count(*) FROM pos_docs WHERE d @@ $1;
+SET plan_cache_mode = force_generic_plan;
+CREATE TEMP TABLE pos_generic (q text, n bigint);
+DO $$
+DECLARE
+	r record;
+	n bigint;
+BEGIN
+	FOR r IN SELECT q FROM pos_queries LOOP
+		EXECUTE format('EXECUTE pos_count(%L)', r.q) INTO n;
+		INSERT INTO pos_generic VALUES (r.q::text, n);
+	END LOOP;
+END $$;
+RESET plan_cache_mode;
+DEALLOCATE pos_count;
+SELECT c.q, c.n AS counted, g.n AS generic, coalesce(cardinality(h.ids), 0) AS heap
+FROM pos_counted c JOIN pos_generic g USING (q) JOIN pos_by_heap h USING (q)
+WHERE c.n <> coalesce(cardinality(h.ids), 0) OR g.n <> c.n;
+CREATE FUNCTION pos_count_explain(q tsquery) RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	FOR l IN EXECUTE format('EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) '
+							'SELECT count(*) FROM pos_docs WHERE d @@ %L', q) LOOP
+		IF l ~ '(Custom Scan|Heap TIDs Rechecked|Position|Removed)' THEN
+			RETURN NEXT l;
+		END IF;
+	END LOOP;
+END $$;
+SELECT pos_count_explain('common <-> again');
+SELECT pos_count_explain('common <-> ag:*');
+DROP FUNCTION pos_count_explain(tsquery);
 
 DROP TABLE pos_docs CASCADE;
 DROP OPERATOR CLASS tsvector_pos_ops USING lion;

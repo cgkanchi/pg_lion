@@ -4589,8 +4589,32 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   in the extension's SQL yet) and compares what the index stores with `unnest()` of the rows after
   inserts, an UPDATE, deletes with VACUUM, a key emptied and refilled, and a REINDEX.
 
-Still to come: the reader that checks phrases, weights and `a & !b` against stored positions, its
-planning and costing, and then the opclass in the extension's SQL.
+- **Queries** (`lion_posfilter.c`).  The posting sets give the candidates, as
+  `lion_extract_query_superset()` already did for a recheck, and PostgreSQL's own `TS_execute()`
+  decides each one from the stored positions: a cursor per lexeme the query names (those under a
+  NOT too) walks the key's members in TID order, skipping chunks by their headers, and the
+  callback is `checkclass_str()`'s over the candidate's member, stripped members included.  No
+  member under a lexeme is a row without it (P ⊇ C).  So phrases at any distance, weights,
+  `a & !b`, `a <-> !b` and ORs of them come out exactly what the heap's `@@` gives.  A query with
+  a prefix lexeme keeps the recheck: its keys cannot be named.
+  - A **bitmap scan** emits what the filter keeps with `recheck = false`, and a plain **index
+    scan** puts its source's containers through it (the scan's keys are ANDed, so filtering the
+    result by one of them is exact), under an MVCC snapshot.
+  - The **count pushdown** puts every container through the filter before it asks the
+    visibility map, while the container's pages are still pinned (R1, R2), so an all-visible
+    page is counted without the heap.  EXPLAIN shows `Position Checks` and `Rows Removed by
+    Positions`.  This is for a clause ANDed with the rest of the WHERE, where the heap row filter
+    used to apply; under an OR, in a GROUP BY or a join the planner still treats the query as
+    one it cannot push down.
+  - Why reading positions at any moment of a scan is safe: a member's TID can change hands only
+    after VACUUM has removed the old row's positions, and the new row is then inserted after the
+    scan's snapshot was taken, so it is invisible to the scan and its page is not all-visible to
+    it either.  A mix of two rows' positions can therefore only be applied to a TID the heap
+    visit drops.
+
+Still to come: the filter under an OR, a GROUP BY and a join (an expression node rather than a
+filter on the result), `@@ ANY (array)`, the cost model, and then the opclass in the extension's
+SQL.
 
 ### Cardinality guard
 

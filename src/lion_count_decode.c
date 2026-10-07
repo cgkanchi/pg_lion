@@ -727,7 +727,7 @@ lion_count_groups_decode(Relation heap, Snapshot snapshot, int ncol,
 			 * lion_count_container_vm()).
 			 */
 			LION_INJECTION_POINT("lion-count-containers-pinned");
-			if (base.in_recovery || base.filter != NULL)
+			if (base.in_recovery || lion_row_filter_heap(base.filter))
 				allvis = 0;
 			else
 			{
