@@ -856,6 +856,19 @@ lion_explain_scan_counters(LionCountScanState *st, const LionCountStats *tot,
 	if (tot->rows_removed > 0)
 		ExplainPropertyInteger("Rows Removed by Recheck", NULL,
 							   tot->rows_removed, es);
+
+	/*
+	 * ... and what a query decided from stored positions did instead
+	 * (DESIGN.md §17, "Stored positions"): the candidates it decided, and
+	 * those it turned away without the heap.  Only for such a query.
+	 */
+	if (tot->pos_checked > 0)
+	{
+		ExplainPropertyInteger("Position Checks", NULL,
+							   tot->pos_checked, es);
+		ExplainPropertyInteger("Rows Removed by Positions", NULL,
+							   tot->pos_removed, es);
+	}
 	ExplainPropertyInteger("Containers Visited", NULL,
 						   tot->containers_visited, es);
 	/*

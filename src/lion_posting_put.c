@@ -48,10 +48,31 @@
 #include "lion.h"
 
 static void lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
-								OffsetNumber off,
-								bool replace, Buffer entrybuf,
-								OffsetNumber entryoff, LionEntryTuple *entry,
+								OffsetNumber off, bool replace,
+								const LionTreeRef *tree,
 								LionContainer **items, int nitems);
+
+/*
+ * An item of a leaf of the tree, checked as a reader checks it: a posting
+ * set's container or segment, or a position chunk.
+ */
+static LionContainer *
+lion_tree_item_fetch(Relation index, const LionTreeRef *tree, Page page,
+					 BlockNumber blk, OffsetNumber off)
+{
+	if (tree->kind != 0)
+		return lion_page_poschunk_fetch(index, page, blk, off);
+	return lion_page_item_fetch(index, page, blk, off);
+}
+
+/* The entry travels with every change to a posting tree; a position tree has none. */
+static void
+lion_tree_put_entry(Relation index, LionWalState *xstate, const LionTreeRef *tree)
+{
+	if (tree->entry != NULL)
+		lion_put_entry(index, xstate, tree->entrybuf, tree->entryoff,
+					   tree->entry);
+}
 
 /* ---------------------------------------------------------------------
  * Container chains
@@ -117,6 +138,32 @@ lion_chain_put_items_locked_ext(Relation index, Relation heaprel, Buffer buf,
 							   OffsetNumber off, bool replace,
 							   LionContainer **items, int nitems, bool slack)
 {
+	LionTreeRef tree;
+
+	Assert((entry->flags & LION_ENTRY_CHAIN) != 0);
+	Assert(BlockNumberIsValid(entry->head) && BlockNumberIsValid(entry->tail));
+
+	tree.hash = entry->hash;
+	tree.root = entry->head;
+	tree.kind = 0;
+	tree.entrybuf = entrybuf;
+	tree.entryoff = entryoff;
+	tree.entry = entry;
+	lion_tree_put_items_locked(index, heaprel, buf, &tree, off, replace, items,
+							   nitems, slack);
+}
+
+/*
+ * The leaf write of either kind of tree (lion.h).  A position tree's items
+ * are ordered by header ckey like a posting tree's, but two chunks may share
+ * one: the members of one ckey can run across chunks (lion_positions.h).
+ */
+void
+lion_tree_put_items_locked(Relation index, Relation heaprel, Buffer buf,
+						   const LionTreeRef *tree, OffsetNumber off,
+						   bool replace, LionContainer **items, int nitems,
+						   bool slack)
+{
 	Page		page = BufferGetPage(buf);
 	Size		sizes[LION_MAX_PUT_ITEMS];
 	Size		allocs[LION_MAX_PUT_ITEMS];
@@ -125,17 +172,20 @@ lion_chain_put_items_locked_ext(Relation index, Relation heaprel, Buffer buf,
 	Size		have;
 	int			i;
 
-	Assert((entry->flags & LION_ENTRY_CHAIN) != 0);
-	Assert(BlockNumberIsValid(entry->head) && BlockNumberIsValid(entry->tail));
+	Assert((tree->entry == NULL) == (tree->kind != 0));
 	Assert(LionPageIsContainer(page));
+	Assert((LionPageGetOpaque(page)->flags & LION_PAGE_POSITIONS) == tree->kind);
 	Assert(nitems >= 1 && nitems <= LION_MAX_PUT_ITEMS);
 
 	for (i = 0; i < nitems; i++)
 	{
 		sizes[i] = lion_item_size(items[i]);
 		Assert(sizes[i] <= LION_CONTAINER_MAX_SIZE);
+		Assert(lion_item_is_positions(items[i]) == (tree->kind != 0));
 		Assert(i == 0 ||
-			   lion_item_first_ckey(items[i]) > lion_item_last_ckey(items[i - 1]));
+			   (tree->kind != 0 ?
+				items[i]->ckey >= items[i - 1]->ckey :
+				lion_item_first_ckey(items[i]) > lion_item_last_ckey(items[i - 1])));
 		allocs[i] = slack ? lion_item_alloc_size(items[i], sizes[i]) : sizes[i];
 		need += MAXALIGN(sizes[i]) + sizeof(ItemIdData);
 		want += MAXALIGN(allocs[i]) + sizeof(ItemIdData);
@@ -149,8 +199,8 @@ lion_chain_put_items_locked_ext(Relation index, Relation heaprel, Buffer buf,
 	 */
 	if (replace)
 	{
-		(void) lion_page_item_fetch(index, page, BufferGetBlockNumber(buf),
-									off);
+		(void) lion_tree_item_fetch(index, tree, page,
+									BufferGetBlockNumber(buf), off);
 		lion_page_check_alone(index, page, BufferGetBlockNumber(buf), off);
 	}
 
@@ -200,7 +250,7 @@ lion_chain_put_items_locked_ext(Relation index, Relation heaprel, Buffer buf,
 				lion_wal_op_replace(xstate, p, off, items[0], writesz);
 				lion_page_update_minmax(p);
 				lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
-				lion_put_entry(index, xstate, entrybuf, entryoff, entry);
+				lion_tree_put_entry(index, xstate, tree);
 				lion_wal_finish(xstate, LION_XLOG_ITEM_REPLACE);
 				return;
 			}
@@ -250,7 +300,7 @@ lion_chain_put_items_locked_ext(Relation index, Relation heaprel, Buffer buf,
 
 		lion_page_update_minmax(p);
 		lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
-		lion_put_entry(index, xstate, entrybuf, entryoff, entry);
+		lion_tree_put_entry(index, xstate, tree);
 		lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
 		return;
 	}
@@ -260,8 +310,7 @@ lion_chain_put_items_locked_ext(Relation index, Relation heaprel, Buffer buf,
 	 * them at their exact size - a page that has just been split has room to
 	 * spare, and the items get their slack back the next time they grow.
 	 */
-	lion_split_and_place(index, heaprel, buf, off, replace, entrybuf, entryoff,
-						entry, items, nitems);
+	lion_split_and_place(index, heaprel, buf, off, replace, tree, items, nitems);
 }
 
 void
@@ -471,7 +520,8 @@ lion_spill_fill_leaf(LionWalState *xstate, Page page, const char *payload,
 static void
 lion_spill_set_chain(LionEntryTuple *entry, BlockNumber root, BlockNumber tail)
 {
-	entry->flags = (entry->flags & LION_ENTRY_KINDFLAGS) | LION_ENTRY_CHAIN;
+	entry->flags = (entry->flags & (LION_ENTRY_KINDFLAGS | LION_ENTRY_POSITIONS)) |
+		LION_ENTRY_CHAIN;
 	entry->head = root;
 	entry->tail = tail;
 }
@@ -486,12 +536,65 @@ lion_spill_set_chain(LionEntryTuple *entry, BlockNumber root, BlockNumber tail)
  * held EXCLUSIVE by the caller (a cleanup lock, when VACUUM calls) and is
  * rewritten here, in the last record.
  */
+/*
+ * The root of a spilled entry's position tree, in the spill's last record:
+ * one leaf holding the entry's inline positions chunk (none when poschunk is
+ * NULL or empty).  It goes into the same record as the entry that starts
+ * pointing at it, so that it is never a root nothing references; its block,
+ * like the posting root's, comes from extending the relation.
+ */
+static void
+lion_spill_posroot(LionWalState *xstate, Buffer posbuf, uint32 hash,
+				   const LionContainer *poschunk, LionEntryTuple *entry)
+{
+	Page		page;
+	BlockNumber posroot = BufferGetBlockNumber(posbuf);
+
+	page = lion_wal_init_buffer(xstate, posbuf,
+								LION_PAGE_CONTAINER | LION_PAGE_POSITIONS);
+	lion_page_set_owner(page, hash, posroot);
+	if (poschunk != NULL && poschunk->cardinality > 0)
+	{
+		Size		sz = lion_poschunk_size(poschunk);
+
+		if (PageAddItemExtended(page, poschunk, sz, FirstOffsetNumber,
+								0) == InvalidOffsetNumber)
+			elog(ERROR, "lion index: failed to place a position chunk on a new root");
+		lion_wal_op(xstate, page, LION_OP_ADD, FirstOffsetNumber, 0, poschunk,
+					sz);
+		lion_page_update_minmax(page);
+		lion_wal_op(xstate, page, LION_OP_MINMAX, 0, 0, NULL, 0);
+	}
+	lion_wal_log_special(xstate, page);
+	lion_entry_posext(entry)->pos_root = posroot;
+}
+
 void
 lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 				OffsetNumber entryoff, LionEntryTuple *entry,
 				const char *payload, Size paylen)
 {
+	if ((entry->flags & LION_ENTRY_POSITIONS) != 0)
+		elog(ERROR, "lion index \"%s\": an entry with positions spills with them",
+			 RelationGetRelationName(index));
+	lion_entry_spill_pos(index, heaprel, entrybuf, entryoff, entry, payload,
+						 paylen, NULL);
+}
+
+/*
+ * lion_entry_spill() for an entry that stores positions: its inline chunk
+ * (poschunk, an aligned copy, or NULL for none) becomes the first leaf of a
+ * new position tree, whose root goes into the last record with the entry.
+ * That record registers one buffer more than it did, three at most.
+ */
+void
+lion_entry_spill_pos(Relation index, Relation heaprel, Buffer entrybuf,
+					 OffsetNumber entryoff, LionEntryTuple *entry,
+					 const char *payload, Size paylen,
+					 const LionContainer *poschunk)
+{
 	LionWalState *xstate;
+	Buffer		posbuf = InvalidBuffer;
 	Buffer		rootbuf;
 	Page		rootpage;
 	BlockNumber root;
@@ -532,6 +635,8 @@ lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 	 */
 	rootbuf = lion_alloc_page(index, heaprel, false);
 	root = BufferGetBlockNumber(rootbuf);
+	if ((entry->flags & LION_ENTRY_POSITIONS) != 0)
+		posbuf = lion_alloc_page(index, heaprel, false);
 
 	if (nleaves == 1)
 	{
@@ -547,10 +652,14 @@ lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 		lion_wal_log_special(xstate, rootpage);
 
 		lion_spill_set_chain(entry, root, root);
+		if (BufferIsValid(posbuf))
+			lion_spill_posroot(xstate, posbuf, entry->hash, poschunk, entry);
 		lion_put_entry(index, xstate, entrybuf, entryoff, entry);
 		lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
 
 		UnlockReleaseBuffer(rootbuf);
+		if (BufferIsValid(posbuf))
+			UnlockReleaseBuffer(posbuf);
 		pfree(cbuf);
 		return;
 	}
@@ -650,9 +759,13 @@ lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 					LION_POSTING_PIVOT_SIZE);
 	}
 	lion_wal_log_special(xstate, rootpage);
+	if (BufferIsValid(posbuf))
+		lion_spill_posroot(xstate, posbuf, entry->hash, poschunk, entry);
 	lion_put_entry(index, xstate, entrybuf, entryoff, entry);
 	lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
 	UnlockReleaseBuffer(rootbuf);
+	if (BufferIsValid(posbuf))
+		UnlockReleaseBuffer(posbuf);
 
 	pfree(pivots);
 	pfree(cbuf);
@@ -761,9 +874,8 @@ lion_posting_root_live(Relation index, uint32 hash, BlockNumber head, bool wait)
  */
 static void
 lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
-					OffsetNumber off, bool replace,
-					Buffer entrybuf, OffsetNumber entryoff,
-					LionEntryTuple *entry, LionContainer **items, int nitems)
+					OffsetNumber off, bool replace, const LionTreeRef *tree,
+					LionContainer **items, int nitems)
 {
 	Page		page;
 	BlockNumber blk = BufferGetBlockNumber(buf);
@@ -800,8 +912,7 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	 * the push-down path below.
 	 */
 	if (LionPageIncompleteSplit(BufferGetPage(buf)))
-		lion_posting_finish_split(index, heaprel, entry->hash, entry->head,
-								  buf);
+		lion_posting_finish_split(index, heaprel, tree->hash, tree->root, buf);
 
 	page = BufferGetPage(buf);
 	maxoff = PageGetMaxOffsetNumber(page);
@@ -814,7 +925,7 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	Assert(LionPageIsPostingLeaf(page));
 	Assert(!LionPageIncompleteSplit(page));
 
-	if (blk == entry->head)
+	if (blk == tree->root)
 	{
 		/*
 		 * The whole set is this one page, so there is no parent to take a
@@ -845,8 +956,8 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 		 */
 		Buffer		cbuf;
 
-		cbuf = lion_posting_root_pushdown(index, heaprel, buf, entrybuf,
-										  entryoff, entry);
+		cbuf = lion_posting_root_pushdown(index, heaprel, buf, tree->entrybuf,
+										  tree->entryoff, tree->entry);
 
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
@@ -857,9 +968,8 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 		 */
 		LION_INJECTION_POINT("lion-posting-pushdown-child");
 
-		lion_chain_put_items_locked_ext(index, heaprel, cbuf, entrybuf,
-										entryoff, entry, off, replace, items,
-										nitems, false);
+		lion_tree_put_items_locked(index, heaprel, cbuf, tree, off, replace,
+								   items, nitems, false);
 
 		UnlockReleaseBuffer(cbuf);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
@@ -903,7 +1013,7 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 			 * - which the check above already makes sure of; this one keeps
 			 * movebuf, a page, from being overrun whatever the page holds.
 			 */
-			item = lion_page_item_fetch(index, page, blk, firstright + i);
+			item = lion_tree_item_fetch(index, tree, page, blk, firstright + i);
 			budget += MAXALIGN(sz) + sizeof(ItemIdData);
 			if (unlikely(budget > (Size) LION_PAGE_CAPACITY))
 				ereport(ERROR,
@@ -964,13 +1074,13 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 
 	if (BufferIsValid(nbuf))
 	{
-		pN = lion_wal_init_buffer(xstate, nbuf, LION_PAGE_CONTAINER);
-		lion_page_set_owner(pN, entry->hash, entry->head);
+		pN = lion_wal_init_buffer(xstate, nbuf, LION_PAGE_CONTAINER | tree->kind);
+		lion_page_set_owner(pN, tree->hash, tree->root);
 	}
 	if (BufferIsValid(mbuf))
 	{
-		pM = lion_wal_init_buffer(xstate, mbuf, LION_PAGE_CONTAINER);
-		lion_page_set_owner(pM, entry->hash, entry->head);
+		pM = lion_wal_init_buffer(xstate, mbuf, LION_PAGE_CONTAINER | tree->kind);
+		lion_page_set_owner(pM, tree->hash, tree->root);
 	}
 
 	if (ndel > 0)
@@ -1063,17 +1173,17 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 		lion_wal_log_special(xstate, pM);
 
 	/* If P was the tail, the chain has a new last page. */
-	if (entry->tail == blk)
+	if (tree->entry != NULL && tree->entry->tail == blk)
 	{
 		BlockNumber newtail = BlockNumberIsValid(nblk) ? nblk : mblk;
 
 		Assert(!BlockNumberIsValid(oldright));
 		if (BlockNumberIsValid(newtail))
-			entry->tail = newtail;
+			tree->entry->tail = newtail;
 	}
 
 	/* The entry always travels with the container change. */
-	lion_put_entry(index, xstate, entrybuf, entryoff, entry);
+	lion_tree_put_entry(index, xstate, tree);
 
 	lion_wal_finish(xstate, LION_XLOG_SPLIT);
 
@@ -1111,15 +1221,15 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 		uint32		sep = BlockNumberIsValid(mblk) ?
 			lion_item_first_ckey(items[0]) : firstmoved;
 
-		lion_posting_finish_split_sep(index, heaprel, entry->hash, entry->head,
+		lion_posting_finish_split_sep(index, heaprel, tree->hash, tree->root,
 									  buf, &sep);
 	}
 
 	if (BufferIsValid(mbuf))
 	{
 		if (LionPageIncompleteSplit(BufferGetPage(mbuf)))
-			lion_posting_finish_split_sep(index, heaprel, entry->hash,
-										  entry->head, mbuf, &firstmoved);
+			lion_posting_finish_split_sep(index, heaprel, tree->hash,
+										  tree->root, mbuf, &firstmoved);
 		UnlockReleaseBuffer(mbuf);
 	}
 }

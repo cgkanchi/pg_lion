@@ -1268,6 +1268,7 @@ gen_typed(Ref *r, CBuf *b, LionContainerType t)
 				break;
 			}
 		case LION_CT_SPARSE:
+		case LION_CT_POSITIONS:
 			/* not a container: see test/unit/sparse_test.c */
 			CHECK(false, "gen_typed() asked for a sparse segment");
 			break;
