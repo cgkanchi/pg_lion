@@ -57,6 +57,7 @@
 #include "funcapi.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/tuplestore.h"
 #include "utils/rel.h"
 
 #include "lion.h"
