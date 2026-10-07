@@ -31,12 +31,15 @@
 
 #include "access/gin.h"
 #include "access/stratnum.h"
+#include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "tsearch/ts_type.h"
+#include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "varatt.h"
 
 #include "lion.h"
 
@@ -259,6 +262,17 @@ lion_extract_value_pos(LionState *state, Datum value, Datum **keys,
 	return lion_extract_internal(state, value, keys, pos);
 }
 
+/*
+ * Is key the length key of a column that stores positions: the empty text
+ * (DESIGN.md §17, "Ranking")?
+ */
+bool
+lion_is_length_key(const LionState *state, Datum key)
+{
+	return state->positions && state->typid == TEXTOID &&
+		VARSIZE_ANY_EXHDR(DatumGetPointer(key)) == 0;
+}
+
 static int
 lion_extract_internal(LionState *state, Datum value, Datum **keys,
 					  LionKeyPositions **pos)
@@ -326,14 +340,25 @@ lion_extract_internal(LionState *state, Datum value, Datum **keys,
 		qsort_arg(ord, (size_t) nlive, sizeof(LionHashPos), lion_hashpos_cmp,
 				  &ha);
 
-	out = (Datum *) palloc(sizeof(Datum) * nlive);
+	/* one more for the length key */
+	out = (Datum *) palloc(sizeof(Datum) * (nlive + 1));
 	if (pos != NULL)
-		outpos = (LionKeyPositions *) palloc(sizeof(LionKeyPositions) * nlive);
+		outpos = (LionKeyPositions *)
+			palloc(sizeof(LionKeyPositions) * (nlive + 1));
 
 	for (i = 0; i < nlive; i++)
 	{
 		Datum		key = raw[ord[i].pos];
 		bool		dup = false;
+
+		/*
+		 * The empty key is the row's length in a column that stores
+		 * positions (below), never a lexeme: tsvector_in() and
+		 * array_to_tsvector() refuse an empty one, and no tsquery can name
+		 * it.
+		 */
+		if (lion_is_length_key(state, key))
+			continue;
 
 		/*
 		 * A new hash value, or a key the ordering puts after the previous
@@ -371,7 +396,39 @@ lion_extract_internal(LionState *state, Datum value, Datum **keys,
 
 	pfree(ord);
 
-	Assert(nout > 0);
+	/*
+	 * THE ROW'S LENGTH (DESIGN.md §17, "Ranking"): a column that stores
+	 * positions also files every row with a lexeme under the empty key, with
+	 * one "position" that is the row's length - the number of its lexeme
+	 * occurrences, a stripped lexeme counted once - in all sixteen bits of a
+	 * WordEntryPos, capped at 65535.  BM25 needs it for every candidate, and
+	 * the empty key's position tree hands it over in TID order like any
+	 * other key's.
+	 */
+	if (state->positions && state->typid == TEXTOID && nout > 0)
+	{
+		uint32		len = 0;
+
+		for (j = 0; j < nout; j++)
+			len += (outpos != NULL) ? Max((uint32) outpos[j].npos, 1) : 1;
+		if (outpos != NULL)
+		{
+			uint16	   *lp = (uint16 *) palloc(sizeof(uint16));
+
+			*lp = (uint16) Min(len, (uint32) PG_UINT16_MAX);
+			outpos[nout].npos = 1;
+			outpos[nout].pos = lp;
+		}
+		out[nout++] = PointerGetDatum(cstring_to_text_with_len("", 0));
+	}
+
+	if (nout == 0)
+	{
+		pfree(out);
+		if (outpos != NULL)
+			pfree(outpos);
+		return 0;
+	}
 	*keys = out;
 	if (pos != NULL)
 		*pos = outpos;

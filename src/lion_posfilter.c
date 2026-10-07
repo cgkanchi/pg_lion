@@ -84,6 +84,7 @@ typedef struct LionPosCursor
 	bool		itvalid;		/* it reads chunks[chunkno] */
 	bool		mvalid;			/* m is the first member at or after the last
 								 * seek's code */
+	bool		countsonly;		/* m gets its code and npos, no positions */
 	LionPosMember m;
 } LionPosCursor;
 
@@ -231,7 +232,9 @@ lion_poscursor_seek(Relation index, LionPosCursor *cur, uint64 code)
 	{
 		if (cur->itvalid)
 		{
-			while (lion_poschunk_iter_next(&cur->it, &cur->m))
+			while (cur->countsonly ?
+				   lion_poschunk_iter_next_npos(&cur->it, &cur->m) :
+				   lion_poschunk_iter_next(&cur->it, &cur->m))
 			{
 				if (cur->m.code >= code)
 				{
@@ -609,4 +612,67 @@ lion_posfilter_end(LionPosFilter *pf)
 	pfree(pf->cursors);
 	pfree(pf->itemcur);
 	pfree(pf);
+}
+
+/* ---------------------------------------------------------------------
+ * A key's members in TID order, for a caller other than the filter
+ * (lion_bm25.c)
+ * --------------------------------------------------------------------- */
+
+/*
+ * A cursor over key's members, or NULL when the column's entry for it does
+ * not say where its positions are.  A key no row has gives a cursor with no
+ * members.
+ */
+LionPosCursor *
+lion_poscursor_open(Relation index, LionState *col, Datum key,
+					bool countsonly)
+{
+	LionPosCursor *cur = (LionPosCursor *) palloc(sizeof(LionPosCursor));
+
+	if (!lion_poscursor_init(index, col, key, cur))
+	{
+		pfree(cur);
+		return NULL;
+	}
+	cur->countsonly = countsonly;
+	return cur;
+}
+
+/*
+ * The first member whose code is at least code, or NULL when there is none;
+ * it stays valid until the next call.  Codes only grow from one call to the
+ * next.  A countsonly cursor's member has no positions, only their number.
+ */
+const LionPosMember *
+lion_poscursor_next(Relation index, LionPosCursor *cur, uint64 code)
+{
+	for (;;)
+	{
+		(void) lion_poscursor_seek(index, cur, code);
+		if (cur->mvalid)
+			return &cur->m;
+		if (cur->done)
+			return NULL;
+
+		/*
+		 * The seek stopped at a chunk whose block is past code's, which only
+		 * says code has no member: the next member is that chunk's first.
+		 */
+		Assert(!cur->itvalid && cur->chunkno < cur->nchunks);
+		code = Max(code + 1,
+				   lion_pos_block_base(cur->chunks[cur->chunkno]->ckey));
+	}
+}
+
+void
+lion_poscursor_close(LionPosCursor *cur)
+{
+	if (cur->leaf != NULL)
+		pfree(cur->leaf);
+	if (cur->inl != NULL)
+		pfree(cur->inl);
+	if (cur->chunks != NULL)
+		pfree(cur->chunks);
+	pfree(cur);
 }
