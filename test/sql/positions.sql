@@ -122,6 +122,56 @@ VACUUM pos_docs;
 SELECT * FROM pos_compare;
 SELECT lion_index_verify('pos_docs_d', true);
 
+-- A build in the least memory there is writes the keys' positions out to a
+-- file more than once and reads each key's parts back in order; heap-only
+-- tuples, which the scan reports under their chain's root offset, bring a
+-- page's rows to it out of order
+CREATE TABLE pos_hot (id int, d tsvector)
+	WITH (fillfactor = 50, autovacuum_enabled = off);
+INSERT INTO pos_hot
+SELECT g, to_tsvector('simple', repeat('dense ', 100 + g % 3) || 'w' || (g % 50) ||
+							   repeat(' pad', g % 2) || ' hot' || (g % 3))
+FROM generate_series(1, 3000) g;
+CREATE INDEX pos_hot_d ON pos_hot USING lion (d tsvector_pos_ops);
+UPDATE pos_hot SET id = -id WHERE id % 4 = 0;
+SELECT count(*) AS moved FROM pos_hot WHERE id < 0;
+SET maintenance_work_mem = '1MB';
+REINDEX INDEX pos_hot_d;
+RESET maintenance_work_mem;
+-- the index keeps a chain's root offset, so its entries are compared with the
+-- heap's by block; the phrases, whose answer differs between neighbours on a
+-- page, check each row got its own positions
+WITH idx AS (
+	SELECT l.lexeme, (p.tid::text::point)[0] AS blk, p.positions, p.weights
+	FROM (SELECT DISTINCT unnest(tsvector_to_array(d)) AS lexeme FROM pos_hot) l,
+		 lion_debug_key_positions('pos_hot_d', l.lexeme) p),
+heap AS (
+	SELECT u.lexeme, (pos_hot.ctid::text::point)[0] AS blk, u.positions, u.weights
+	FROM pos_hot, unnest(d) u)
+SELECT (SELECT count(*) FROM heap) AS heap_rows,
+	   (SELECT count(*) FROM (SELECT * FROM idx EXCEPT ALL SELECT * FROM heap) x) AS only_index,
+	   (SELECT count(*) FROM (SELECT * FROM heap EXCEPT ALL SELECT * FROM idx) x) AS only_heap;
+CREATE TEMP TABLE pos_hot_q AS
+SELECT format('w%s <-> hot%s', w, h)::tsquery AS q
+FROM generate_series(0, 49) w, generate_series(0, 2) h;
+SET enable_seqscan = off;
+CREATE TEMP TABLE pos_hot_idx AS
+SELECT q, (SELECT count(*) FROM pos_hot WHERE d @@ q) AS n FROM pos_hot_q;
+RESET enable_seqscan;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) AS phrases, sum(i.n) AS matched,
+	   count(*) FILTER (WHERE i.n IS DISTINCT FROM
+		   (SELECT count(*) FROM pos_hot WHERE d @@ i.q)) AS differ
+FROM pos_hot_idx i;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+RESET pg_lion.enable_count_pushdown;
+DROP TABLE pos_hot_q, pos_hot_idx;
+SELECT lion_index_verify('pos_hot_d', true);
+DROP TABLE pos_hot;
+
 -- Queries answered from the positions (lion_posfilter.c): the posting sets
 -- give the candidates, and each one is decided from its stored positions, so
 -- a bitmap scan or an index scan returns exactly what the heap's @@ does and
