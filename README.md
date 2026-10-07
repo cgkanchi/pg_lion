@@ -508,10 +508,10 @@ bitmap and index scans need no recheck, and counts skip the heap on all-visible 
 row on top of `tsvector_ops`. Only a prefix lexeme (`foo:*`) is still rechecked.
 
     CREATE INDEX ON doc USING lion (tsv tsvector_pos_ops);
- Everything a plain AND/OR of key sets cannot
-express is rechecked in the heap. A NULL element and a tsquery phrase, weight or `a & !b` are
-answered from the rows of their keys (the other elements, the phrase's lexemes, `a`), then
-rechecked, in counts and scans alike. `<@`, `@> '{}'`, a bare `!a` and `foo:*` fall back to scanning
+
+Without positions, everything a plain AND/OR of key sets cannot express is rechecked in the heap. A
+NULL element and a tsquery phrase, weight or `a & !b` are answered from the rows of their keys (the
+other elements, the phrase's lexemes, `a`), then rechecked, in counts and scans alike. `<@`, `@> '{}'`, a bare `!a` and `foo:*` fall back to scanning
 every indexed row and rechecking it if the Lion index is used; the planner may choose a sequential
 scan instead, and GIN wins the measured prefix case below.
 
