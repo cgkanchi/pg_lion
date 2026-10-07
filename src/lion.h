@@ -621,6 +621,14 @@ StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
 #define LION_ENTRY_SUMMARY	0x0080
 #define LION_ENTRY_SUMLAST	0x0100
 
+/*
+ * An entry that stores word positions (DESIGN.md §17, "Stored positions"):
+ * a LionEntryPosExt follows its key, before its payload.  Never on a pivot,
+ * which is made of the header and key alone (lion_pivot_kindflags() does not
+ * keep it).
+ */
+#define LION_ENTRY_POSITIONS	0x0200
+
 #define LION_ENTRY_RESERVED	(LION_ENTRY_NULLKEY | LION_ENTRY_EMPTYKEY)
 #define LION_ENTRY_SUMKINDS	(LION_ENTRY_SUMMARY | LION_ENTRY_SUMLAST)
 /*
@@ -631,7 +639,8 @@ StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
 #define LION_ENTRY_PIVOT		(LION_ENTRY_HIGHKEY | LION_ENTRY_DOWNLINK)
 #define LION_ENTRY_ALLFLAGS \
 	(LION_ENTRY_INLINE | LION_ENTRY_CHAIN | LION_ENTRY_RESERVED | \
-	 LION_ENTRY_PIVOT | LION_ENTRY_MINUSINF | LION_ENTRY_SUMKINDS)
+	 LION_ENTRY_PIVOT | LION_ENTRY_MINUSINF | LION_ENTRY_SUMKINDS | \
+	 LION_ENTRY_POSITIONS)
 
 #define LionEntryIsPivot(e)		(((e)->flags & LION_ENTRY_PIVOT) != 0)
 #define LionEntryIsHighKey(e)	(((e)->flags & LION_ENTRY_HIGHKEY) != 0)
@@ -743,9 +752,35 @@ StaticAssertDecl(offsetof(LionEntryTuple, attno) == 20,
 StaticAssertDecl(sizeof(LionEntryTuple) == 32,
 				 "the lion entry header must stay 32 bytes");
 #define LionEntryGetKey(e)		((char *) (e) + LION_ENTRY_HDRSZ)
-#define LionEntryPayloadOffset(e) MAXALIGN(LION_ENTRY_HDRSZ + (e)->keylen)
+
+/*
+ * The positions extension of an entry flagged LION_ENTRY_POSITIONS, right
+ * after its key (DESIGN.md §17, "Stored positions"):
+ *
+ *	- on a CHAIN entry pos_root is the root of the key's position tree
+ *	  (lion_postree.c), or InvalidBlockNumber while it has none, and pos_len
+ *	  is 0;
+ *	- on an INLINE entry pos_root is InvalidBlockNumber and pos_len is the
+ *	  size of the positions section: the last pos_len bytes of the item, a
+ *	  run of position chunks after the container items and their slack.
+ *
+ * The header's 32 bytes are full, hence an extension, and only entries that
+ * store positions carry it: every other entry is laid out as it always was.
+ */
+typedef struct LionEntryPosExt
+{
+	BlockNumber pos_root;
+	uint32		pos_len;
+} LionEntryPosExt;
+
+#define LION_ENTRY_POSEXT_SIZE	MAXALIGN(sizeof(LionEntryPosExt))	/* 8 */
+
+#define LionEntryExtOffset(e)	MAXALIGN(LION_ENTRY_HDRSZ + (e)->keylen)
+#define LionEntryPayloadOffset(e) \
+	(LionEntryExtOffset(e) + \
+	 (((e)->flags & LION_ENTRY_POSITIONS) != 0 ? LION_ENTRY_POSEXT_SIZE : 0))
 #define LionEntryGetPayload(e)	((char *) (e) + LionEntryPayloadOffset(e))
-/* payload length must be computed from the item size: itemsz - LionEntryPayloadOffset(e) */
+/* payload length must be computed from the item size: LION_ENTRY_PAYLOAD_LEN() */
 
 #define LION_MAX_KEY_SIZE		2000
 #define LION_DEFAULT_INLINE_LIMIT 4096
@@ -1727,8 +1762,40 @@ extern int64 lion_container_to_tbm(const LionContainer *c, TIDBitmap *tbm,
 extern Size lion_inline_fetch(const char *payload, Size paylen, Size *off,
 							 LionContainer *buf);
 
-/* Length in bytes of an INLINE entry's payload, given the page item size. */
-#define LION_ENTRY_PAYLOAD_LEN(e, itemsz)	((Size) (itemsz) - LionEntryPayloadOffset(e))
+/*
+ * The positions extension of e, or NULL for an entry without one.  Entries
+ * sit MAXALIGNed on their pages, and so does the extension.
+ */
+static inline LionEntryPosExt *
+lion_entry_posext(const LionEntryTuple *e)
+{
+	if ((e->flags & LION_ENTRY_POSITIONS) == 0)
+		return NULL;
+	return (LionEntryPosExt *) ((char *) e + LionEntryExtOffset(e));
+}
+
+/*
+ * Bytes of an INLINE entry's positions section, given the page item size:
+ * never more than what follows the payload offset, whatever pos_len claims
+ * (lion_page_entry_fetch() and verify report a pos_len that overruns).
+ */
+static inline Size
+lion_entry_pos_len(const LionEntryTuple *e, Size itemsz)
+{
+	const LionEntryPosExt *x = lion_entry_posext(e);
+	Size		off = LionEntryPayloadOffset(e);
+
+	if (x == NULL || itemsz <= off)
+		return 0;
+	return Min((Size) x->pos_len, itemsz - off);
+}
+
+/*
+ * Length in bytes of an INLINE entry's payload - its container items and
+ * their slack, not its positions - given the page item size.
+ */
+#define LION_ENTRY_PAYLOAD_LEN(e, itemsz) \
+	((Size) (itemsz) - LionEntryPayloadOffset(e) - lion_entry_pos_len((e), (itemsz)))
 
 /*
  * Fill *ix - every key column of it - using the supplied meta page image.
@@ -1855,6 +1922,12 @@ extern LionEntryTuple *lion_entry_rebuild_slack(const LionEntryTuple *entry,
 												const char *payload,
 												Size payloadlen, Size allocsz,
 												Size *size);
+extern LionEntryTuple *lion_entry_rebuild_pos(const LionEntryTuple *entry,
+											  const char *payload,
+											  Size payloadlen,
+											  const char *positions,
+											  Size poslen, Size allocsz,
+											  Size *size);
 
 /*
  * How many bytes to give an INLINE entry an INSERT is rewriting: its payload
