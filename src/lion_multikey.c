@@ -975,6 +975,60 @@ lion_extract_query_superset(LionState *state, Datum query,
 	q->mode = lossy ? LION_QMODE_LOSSY : LION_QMODE_KEYS;
 }
 
+/*
+ * For the position filter (lion_posfilter.c): the key of every QI_VAL item
+ * of a tsquery, by item index - (*itemkeys)[i] for items[i] a QI_VAL, and
+ * nothing for the operators - from the very extraction lion_extract_query()
+ * runs, whose j'th key is the j'th QI_VAL item's (lion_tsquery_plan()).
+ * False when some operand has no key a filter can follow: a prefix lexeme
+ * (any number of keys), or a key extractQuery flagged partial or NULL, or an
+ * extraction that is not the plain one.  The filter then stays out of the way
+ * and the caller rechecks, as it always did.
+ */
+bool
+lion_tsquery_item_keys(LionState *state, Datum query, StrategyNumber strategy,
+					   Datum **itemkeys)
+{
+	LionRawQuery raw;
+	TSQuery		tsq = DatumGetTSQuery(query);
+	QueryItem  *items;
+	Datum	   *out;
+	int32		j = 0;
+	int32		i;
+
+	*itemkeys = NULL;
+	if (strategy != LION_STRAT_MATCH || tsq->size <= 0)
+		return false;
+
+	lion_call_extractquery(state, query, strategy, &raw);
+	if (raw.searchMode != GIN_SEARCH_MODE_DEFAULT || raw.nkeys <= 0 ||
+		raw.keys == NULL || raw.nkeys > LION_MAX_QUERY_KEYS)
+		return false;
+
+	items = GETQUERY(tsq);
+	out = (Datum *) palloc0(sizeof(Datum) * tsq->size);
+	for (i = 0; i < tsq->size; i++)
+	{
+		if (items[i].type != QI_VAL)
+			continue;
+		if (j >= raw.nkeys || items[i].qoperand.prefix ||
+			lion_raw_key_unusable(&raw, j))
+		{
+			pfree(out);
+			return false;
+		}
+		out[i] = raw.keys[j++];
+	}
+	if (j != raw.nkeys)
+	{
+		pfree(out);
+		return false;
+	}
+
+	*itemkeys = out;
+	return true;
+}
+
 /* ---------------------------------------------------------------------
  * Support proc 5 for tsvector (DESIGN.md §17, "Stored positions")
  * --------------------------------------------------------------------- */

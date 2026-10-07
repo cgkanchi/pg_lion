@@ -274,7 +274,7 @@ lion_count_groups_copy(Relation heap, Snapshot snapshot, int ngroups,
 		 */
 		LION_INJECTION_POINT("lion-count-containers-pinned");
 		wanted = lion_container_block_mask(w);
-		if (base.in_recovery || base.filter != NULL)
+		if (base.in_recovery || lion_row_filter_heap(base.filter))
 			allvis = 0;
 		else
 		{

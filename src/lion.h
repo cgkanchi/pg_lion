@@ -1215,6 +1215,8 @@ extern void lion_extract_query(LionState *state, Datum query,
  */
 extern void lion_extract_query_superset(LionState *state, Datum query,
 									   StrategyNumber strategy, LionQuery *q);
+extern bool lion_tsquery_item_keys(LionState *state, Datum query,
+								   StrategyNumber strategy, Datum **itemkeys);
 
 
 /* ---------- the page layer (lion_pages.c, lion_meta.c, lion_state.c, lion_entry.c,
@@ -2201,6 +2203,22 @@ extern bool lion_postree_put(Relation index, Relation heaprel, uint32 hash,
 							 BlockNumber root, const LionPosMember *m);
 extern bool lion_postree_fetch(Relation index, uint32 hash, BlockNumber root,
 							   uint64 code, LionPosMember *m);
+
+/*
+ * The position filter (lion_posfilter.c): a tsquery decided exactly, member
+ * by member, from the positions a column stores.  begin returns NULL when the
+ * query has an operand it cannot follow (a prefix lexeme).
+ */
+typedef struct LionPosFilter LionPosFilter;
+extern LionPosFilter *lion_posfilter_begin(Relation index, LionState *col,
+										   Datum query, StrategyNumber strategy);
+extern int	lion_posfilter_container(LionPosFilter *pf, const LionContainer *c,
+									 uint16 *keep);
+extern const LionContainer *lion_posfilter_apply(LionPosFilter *pf,
+												 const LionContainer *c);
+extern void lion_posfilter_counts(const LionPosFilter *pf, int64 *nchecked,
+								  int64 *nremoved);
+extern void lion_posfilter_end(LionPosFilter *pf);
 
 /*
  * The number of DIRECTORY PAGES the current backend has read: the counter

@@ -284,7 +284,7 @@ lion_count_container_vm(LionCountCtx *cx, const LionContainer *c)
 	members = lion_container_block_mask(c);
 	if (cx->in_recovery || cx->novm)
 		allvis = 0;				/* see lion_count_sources(): no interlock */
-	else if (cx->filter != NULL)
+	else if (lion_row_filter_heap(cx->filter))
 		allvis = 0;				/* the map vouches for visibility, and every
 								 * row has to be tested as well */
 	else
@@ -314,6 +314,30 @@ lion_count_container_masks(LionCountCtx *cx, const LionContainer *c,
 {
 	BlockNumber firstblk = lion_ckey_first_block(c->ckey);
 	uint64		dirty;			/* blocks with members that need a heap recheck */
+
+	/*
+	 * The members a query decided from stored positions does not select go
+	 * first (LionRowFilter.pos).  The positions are read here, after the
+	 * container was copied and while the pages it came from are still
+	 * pinned, as everything else about it is (the design note's R1 and R2).
+	 * The map's answer for the blocks that are left stands.
+	 */
+	if (cx->filter != NULL && cx->filter->npos > 0)
+	{
+		int			i;
+
+		for (i = 0; i < cx->filter->npos; i++)
+		{
+			uint32		before = lion_container_cardinality(c);
+
+			c = lion_posfilter_apply(cx->filter->pos[i], c);
+			cx->stats.pos_checked += before;
+			cx->stats.pos_removed += before - lion_container_cardinality(c);
+		}
+		if (lion_container_cardinality(c) == 0)
+			return;
+		members &= lion_container_block_mask(c);
+	}
 
 	dirty = members & ~allvis;
 
@@ -954,7 +978,7 @@ lion_recheck_heap(LionCountCtx *cx)
 	 * gives it that way; the count pushdown refuses every other table AM
 	 * before it gets here (DESIGN.md §10).
 	 */
-	if (cx->filter != NULL)
+	if (lion_row_filter_heap(cx->filter))
 	{
 		if (cx->heap->rd_tableam != GetHeapamTableAmRoutine())
 			elog(ERROR, "lion index count: a row filter over a table that is not a heap");
@@ -2557,6 +2581,8 @@ lion_count_stats_add(LionCountStats *dst, const LionCountStats *src)
 	dst->cache_full += src->cache_full;
 	dst->sets_summed += src->sets_summed;
 	dst->rows_removed += src->rows_removed;
+	dst->pos_checked += src->pos_checked;
+	dst->pos_removed += src->pos_removed;
 	dst->key_containers += src->key_containers;
 	dst->copy_containers += src->copy_containers;
 	dst->copy_seeks += src->copy_seeks;
