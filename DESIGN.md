@@ -1633,7 +1633,7 @@ Planner integration
     comparison; at run time a NULL value selects no rows, which every operator involved agrees with
     by being strict.
   - **So does any expression an index scan would take as a run-time key** (2026-09-27, a
-    real-workload benchmark). A time window is written `ts >= now() - interval '90 days'` or `d >=
+    benchmark). A time window is written `ts >= now() - interval '90 days'` or `d >=
     current_date - 30`, and neither is a Const or a Param: `eval_const_expressions()` folds only
     immutable functions, and `now()`, `current_date` and `timestamptz` arithmetic (which depends on
     the time zone) are stable. Such a clause was declined before any cost was asked, on the filter
@@ -13474,7 +13474,7 @@ would mean building every index path again, lion's among them - and would have h
 the plain path with its remainder and more than without it. `plaincost.sql`'s 43% query at 1.1 is
 one that had lost its sequential scan (about 7,550 by core's formula, against the plain path's 7,294
 before the charge); the bitmap scan, at 7,273, still wins it. At 1.1, 43% of the
-rows, 18 to a page, on every page (`plaincost.sql`'s shape, `status = 0 AND supp = 0
+rows, 18 to a page, on every page (`plaincost.sql`'s shape, `status = 0 AND sel = 0
 AND flag`):
 
 | table | plain / bitmap price before | now | plain | bitmap |
@@ -13484,7 +13484,7 @@ AND flag`):
 | 1M rows, heap in shared buffers | 37,985 / 37,898 (plain chosen) | 41,038 / 37,898 | 135-163 ms | 114-131 ms |
 | `plaincost.sql`'s 200k rows | 7,294 / 7,273 (plain chosen) | 7,896 / 7,273 | 26 ms | 22 ms |
 
-A result of 2.5 rows to a page on 93% of the pages (`status = 0 AND supp = 1`) fits
+A result of 2.5 rows to a page on 93% of the pages (`status = 0 AND sel = 1`) fits
 under the end and is unchanged; it is the plain scan's in shared buffers (34 ms against 39-49) and
 the bitmap scan's from the OS cache (815-1,087 against 975-1,105), which is a tie. With parallel plans
 the large ones go to the parallel sequential or bitmap scan, before and after.
@@ -13500,8 +13500,8 @@ cost_index()'s all-visible fraction would not describe.
 
 On the benchmark shape (8M rows, 190k heap pages, a five-column index; assert build, warm OS cache
 and 256 MB of shared buffers, the paths interleaved in one backend, median of three; count pushdown
-off, parallel plans off unless marked; `L13` is `status = 0 AND supp = 0 AND
-flag AND tags && '{ga}'`, 13% of the rows on every page, `L13r` the same `AND pc >= 0` (2000
+off, parallel plans off unless marked; `L13` is `status = 0 AND sel = 0 AND
+flag AND tags && '{t0}'`, 13% of the rows on every page, `L13r` the same `AND pc >= 0` (2000
 keys), `M4` `country IN ('c1', 'c2')`, 4% on 82% of the pages, `M2` `country = 'c7'`, 2% on 57%,
 `M05` 0.5% on 13%; cold is after evicting the relation from shared buffers and the OS cache):
 
@@ -13522,7 +13522,7 @@ heap order never pays), so results of a few percent went to a bitmap scan up to 
 warm and 2.5 cold; at 1.1 the tie-break correlation gave large results the packed end's discount,
 which is how a benchmark's large count (costed just below the parallel bitmap scan's)
 went to the plain scan: reconstructed from its plan, a correlation of about 0.38 took a large share off
-its heap I/O, and the WALK above did the rest. For comparison, a btree on `(status, supp, flag, pc,
+its heap I/O, and the WALK above did the rest. For comparison, a btree on `(status, sel, flag, pc,
 country)` reads `L13`'s rows in key order, the heap at random: 17 s against its own bitmap scan's
 2.5, priced 795k against 316k (2.5 times for 6.8). The column-correlation model is btree's; applied
 to a lion plain scan, whose heap is read in order, it erred the other way - 3 times the bitmap
@@ -14751,7 +14751,7 @@ What is left, the worst first:
   indexes at 2,000 units a millisecond; it was §27's one wrong choice too, and at rpc 1.1 the
   nested loop is chosen.
 - **Plain against bitmap lion scans of 20 to 50% of a table** (`fetch w.country2`, `w.val2
-  supp`, `s.c20`): the lion plain scan is 17 to 31% faster than the bitmap heap scan both builds
+  sel`, `s.c20`): the lion plain scan is 17 to 31% faster than the bitmap heap scan both builds
   pick, by the 0.5 us a page §29.11 measured and does not credit; at rpc 1.1 both builds take the
   btree's plain scan instead, 49 to 87% slower than lion's (`w.country` too). Not a regression;
   the plain-scan costing's to take.

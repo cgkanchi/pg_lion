@@ -27,10 +27,10 @@ SET default_statistics_target = 1000;
 SET max_parallel_workers_per_gather = 0;
 
 -- 200000 rows, 44 to a page; every column a hash of the row number.  status
--- has three values (60/20/20%), supp two (90/10%), flag is 80% true, pc has
--- 200 values and tags holds 'ga' 30% of the time; all placed at random.  cl
+-- has three values (60/20/20%), sel two (90/10%), flag is 80% true, pc has
+-- 200 values and tags holds 't0' 30% of the time; all placed at random.  cl
 -- has four values stored in value order.
-CREATE TABLE lpc (id int, status int, supp int, flag bool, pc int, cl int,
+CREATE TABLE lpc (id int, status int, sel int, flag bool, pc int, cl int,
 				  tags text[], pad text);
 INSERT INTO lpc
 SELECT g,
@@ -40,11 +40,11 @@ SELECT g,
 	   ((hashint8extended(g, 4) & 2147483647) % 200)::int,
 	   (g - 1) / 50000,
 	   CASE WHEN (hashint8extended(g, 6) & 2147483647) % 10 < 3
-			THEN ARRAY['ga', 'p' || ((hashint8extended(g, 7) & 2147483647) % 11)]
+			THEN ARRAY['t0', 'p' || ((hashint8extended(g, 7) & 2147483647) % 11)]
 			ELSE ARRAY['p' || ((hashint8extended(g, 7) & 2147483647) % 11)] END,
 	   repeat('x', 100)
   FROM generate_series(1, 200000) g;
-CREATE INDEX lpc_lion ON lpc USING lion (status, supp, flag, pc, tags);
+CREATE INDEX lpc_lion ON lpc USING lion (status, sel, flag, pc, tags);
 CREATE INDEX lpc_cl ON lpc USING lion (cl);
 VACUUM (FREEZE, ANALYZE) lpc;
 
@@ -100,12 +100,12 @@ SET pg_lion.enable_count_pushdown = off;
 -- and 20 rows, about one to a page.
 CREATE TABLE lpc_q (n int, q text);
 INSERT INTO lpc_q VALUES
-	(1, $$SELECT count(*) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND tags && '{ga}'$$),
-	(2, $$SELECT count(*) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc >= 0 AND tags && '{ga}'$$),
-	(3, $$SELECT sum(id) FROM lpc WHERE status = 0 AND supp = 0 AND flag$$),
+	(1, $$SELECT count(*) FROM lpc WHERE status = 0 AND sel = 0 AND flag AND tags && '{t0}'$$),
+	(2, $$SELECT count(*) FROM lpc WHERE status = 0 AND sel = 0 AND flag AND pc >= 0 AND tags && '{t0}'$$),
+	(3, $$SELECT sum(id) FROM lpc WHERE status = 0 AND sel = 0 AND flag$$),
 	(4, $$SELECT sum(id) FROM lpc WHERE pc = 5$$),
 	(5, $$SELECT sum(id) FROM lpc WHERE pc = 5 AND status = 1$$),
-	(6, $$SELECT sum(id) FROM lpc WHERE pc = 5 AND status = 1 AND supp = 1$$);
+	(6, $$SELECT sum(id) FROM lpc WHERE pc = 5 AND status = 1 AND sel = 1$$);
 SELECT n, lpc_plan(q) FROM lpc_q ORDER BY n;
 -- 43% of the rows at 1.1: with a random read priced near a sequential one,
 -- cost_index() charges a result on every page no more than its I/O at
@@ -130,20 +130,20 @@ SELECT lpc_plan('SELECT sum(id) FROM lpc WHERE cl IN (1, 2)');
 -- the plain scan is a WINDOW now (DESIGN.md §29.3) and reads about what the
 -- bitmap scan reads.
 SELECT lpc_bufs(q, true) <= 2 * lpc_bufs(q, false) AS plain_reads_about_the_bitmaps
-  FROM (VALUES ('SELECT count(*) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc < 20'),
-			   ('SELECT count(*) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc >= 0 AND tags && ''{ga}'''),
+  FROM (VALUES ('SELECT count(*) FROM lpc WHERE status = 0 AND sel = 0 AND flag AND pc < 20'),
+			   ('SELECT count(*) FROM lpc WHERE status = 0 AND sel = 0 AND flag AND pc >= 0 AND tags && ''{t0}'''),
 			   ('SELECT count(*) FROM lpc WHERE status = 0 AND pc BETWEEN 3 AND 5')) v(q);
 -- and the answers are the sequential scan's
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc < 20;
-SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc >= 0 AND tags && '{ga}';
+SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND sel = 0 AND flag AND pc < 20;
+SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND sel = 0 AND flag AND pc >= 0 AND tags && '{t0}';
 SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND pc BETWEEN 3 AND 5;
 RESET enable_bitmapscan;
 SET enable_indexscan = off;
 SET enable_seqscan = on;
-SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc < 20;
-SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND pc >= 0 AND tags && '{ga}';
+SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND sel = 0 AND flag AND pc < 20;
+SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND sel = 0 AND flag AND pc >= 0 AND tags && '{t0}';
 SELECT count(*), sum(id) FROM lpc WHERE status = 0 AND pc BETWEEN 3 AND 5;
 RESET enable_indexscan;
 RESET enable_seqscan;
