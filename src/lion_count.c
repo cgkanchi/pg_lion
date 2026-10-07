@@ -175,9 +175,13 @@ lion_collect_container(LionCollect *col, const LionContainer *c)
 	if (lion_container_cardinality(c) == 0)
 		return;
 
-	lion_container_copy(c, &opt.hdr);
-	lion_container_optimize(&opt.hdr);
-	c = &opt.hdr;
+	/*
+	 * The whole buffer, not &opt.hdr: a static analyser sizes a pointer by
+	 * the member it was taken of, and hdr is only the 8-byte header.
+	 */
+	lion_container_copy(c, (LionContainer *) opt.data);
+	lion_container_optimize((LionContainer *) opt.data);
+	c = (const LionContainer *) opt.data;
 	sz = lion_item_size(c);
 	if (!col->spilled &&
 		sizeof(LionMatSet) + MAXALIGN(col->used + sz) +

@@ -112,7 +112,10 @@ StaticAssertDecl(LION_HEAP_MAX_OFFSET == MaxHeapTuplesPerPage,
 
 /*
  * A work buffer large enough for any container.  The union forces 8-byte
- * alignment so that the bitset payload (offset 8) is aligned as well.
+ * alignment so that the bitset payload (offset 8) is aligned as well.  Take
+ * the container as (LionContainer *) buf.data, the whole buffer, not as
+ * &buf.hdr: a static analyser sizes a pointer by what it was taken of, and
+ * hdr is only the 8-byte header.
  */
 typedef union LionContainerBuf
 {
@@ -4072,7 +4075,7 @@ lion_container_and(const LionContainer *a, const LionContainer *b,
 				  LionContainer *dest)
 {
 	LionContainerBuf buf;
-	LionContainer *o = &buf.hdr;
+	LionContainer *o = (LionContainer *) buf.data;
 
 	Assert(a->ckey == b->ckey);
 
@@ -4129,7 +4132,7 @@ lion_container_or(const LionContainer *a, const LionContainer *b,
 				 LionContainer *dest)
 {
 	LionContainerBuf buf;
-	LionContainer *o = &buf.hdr;
+	LionContainer *o = (LionContainer *) buf.data;
 
 	Assert(a->ckey == b->ckey);
 	lion_container_init(o, a->ckey);
@@ -4166,7 +4169,7 @@ lion_container_andnot(const LionContainer *a, const LionContainer *b,
 					 LionContainer *dest)
 {
 	LionContainerBuf buf;
-	LionContainer *o = &buf.hdr;
+	LionContainer *o = (LionContainer *) buf.data;
 
 	Assert(a->ckey == b->ckey);
 	lion_container_init(o, a->ckey);
