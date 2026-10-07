@@ -369,6 +369,8 @@ lion_meta_record_order(LionMetaPageData *meta, LionIndexState *ix)
 	int			i;
 
 	meta->order_flags |= LION_META_ORDER_RECORDED;
+	/* ... and whether it stored positions, which ix was filled with (§17) */
+	meta->order_flags |= ix->meta.order_flags & LION_META_POSITIONS;
 	meta->ordered_cols = 0;
 	for (i = 0; i < ix->ncolumns; i++)
 	{

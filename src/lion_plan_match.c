@@ -320,10 +320,7 @@ lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 							  idx->opcintype[i],
 							  LION_EXTRACTQUERY_PROC) != extractquery)
 			return NULL;
-		if (positions &&
-			!OidIsValid(get_opfamily_proc(idx->opfamily[i], idx->opcintype[i],
-										  idx->opcintype[i],
-										  LION_POSITIONS_PROC)))
+		if (positions && !lion_index_stores_positions(idx, col))
 			return NULL;
 		if (colp != NULL)
 			*colp = col;
@@ -442,6 +439,29 @@ lion_op_roaring_strategy(Oid opno, Oid *opfamily, Oid *lefttype)
 		break;
 	}
 	ReleaseSysCacheList(catlist);
+
+	return result;
+}
+
+/*
+ * Does key column col of idx store positions (DESIGN.md §17)?  Its opclass
+ * has support function 5 and the index was built with store_positions = true,
+ * which only its meta page knows (LION_META_POSITIONS) - the reloption may
+ * have been changed by ALTER INDEX since.
+ */
+bool
+lion_index_stores_positions(IndexOptInfo *idx, AttrNumber col)
+{
+	Relation	indexrel;
+	LionIndexState *ix;
+	bool		result;
+
+	if (col < 1 || col > idx->nkeycolumns)
+		return false;
+	indexrel = index_open(idx->indexoid, AccessShareLock);
+	ix = lion_get_index_state(indexrel);
+	result = col <= ix->ncolumns && ix->cols[col - 1].positions;
+	index_close(indexrel, AccessShareLock);
 
 	return result;
 }
@@ -758,6 +778,81 @@ lion_boolean_not_test(Node *clause)
 }
 
 /*
+ * `tsv @@ ANY (array)` - a multi-key operator (DESIGN.md §17) over a literal
+ * array, which only a query type that is not itself an array can have -
+ * holds where one element's query does: they are the OR of one clause per element, which is returned for the
+ * machinery of DESIGN.md §19 to take apart like any other.  A NULL element
+ * holds nowhere and is left out.  NULL for every other clause, and for an
+ * empty array or one of more elements than an OR may have leaves.
+ */
+Node *
+lion_multikey_any_as_or(Node *clause)
+{
+	ScalarArrayOpExpr *saop;
+	Node	   *left;
+	Node	   *right;
+	Const	   *arrc;
+	Oid			opfamily;
+	Oid			lefttype;
+	StrategyNumber strat;
+	Oid			elemtype;
+	int16		elemlen;
+	bool		elembyval;
+	char		elemalign;
+	ArrayType  *arr;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+	List	   *args = NIL;
+	int			i;
+
+	if (clause == NULL || !IsA(clause, ScalarArrayOpExpr))
+		return NULL;
+	saop = (ScalarArrayOpExpr *) clause;
+	if (!saop->useOr || list_length(saop->args) != 2 || !op_strict(saop->opno))
+		return NULL;
+	left = lion_strip((Node *) linitial(saop->args));
+	right = lion_strip((Node *) lsecond(saop->args));
+	if (left == NULL || right == NULL || !IsA(left, Var) || !IsA(right, Const))
+		return NULL;
+	strat = lion_op_roaring_strategy(saop->opno, &opfamily, &lefttype);
+	if (strat != LION_STRAT_CONTAINS && strat != LION_STRAT_OVERLAP &&
+		strat != LION_STRAT_MATCH)
+		return NULL;
+	arrc = (Const *) right;
+	nelems = lion_array_const_nelems(arrc);
+	if (nelems <= 0 || nelems > LION_MAX_ARRAY_ELEMS)
+		return NULL;
+
+	elemtype = get_element_type(arrc->consttype);
+	get_typlenbyvalalign(elemtype, &elemlen, &elembyval, &elemalign);
+	arr = DatumGetArrayTypeP(arrc->constvalue);
+	deconstruct_array(arr, elemtype, elemlen, elembyval, elemalign,
+					  &elems, &nulls, &nelems);
+	for (i = 0; i < nelems; i++)
+	{
+		Const	   *elem;
+
+		if (nulls[i])
+			continue;
+		elem = makeConst(elemtype, -1, arrc->constcollid, elemlen,
+						 elembyval ? elems[i] :
+						 datumCopy(elems[i], elembyval, elemlen),
+						 false, elembyval);
+		args = lappend(args,
+					   make_opclause(saop->opno, BOOLOID, false,
+									 (Expr *) linitial(saop->args),
+									 (Expr *) elem, InvalidOid,
+									 saop->inputcollid));
+	}
+	if (args == NIL)
+		return NULL;
+	if (list_length(args) == 1)
+		return (Node *) linitial(args);
+	return (Node *) makeBoolExpr(OR_EXPR, args, -1);
+}
+
+/*
  * The walker of lion_or_arms(): node in disjunctive normal form, as a list of
  * arms that are each the list of their leaves, with the number of leaves of
  * them all in *nleaves; NIL once that number would pass LION_MAX_ARRAY_ELEMS.
@@ -766,6 +861,7 @@ static List *
 lion_or_dnf(Node *node, int *nleaves)
 {
 	BoolExpr   *orform = lion_boolean_not_test(node);
+	Node	   *anyform = lion_multikey_any_as_or(node);
 	List	   *result;
 	double		total;
 	ListCell   *lc;
@@ -774,6 +870,8 @@ lion_or_dnf(Node *node, int *nleaves)
 
 	if (orform != NULL)
 		node = (Node *) orform;
+	else if (anyform != NULL)
+		node = anyform;
 
 	if (IsA(node, BoolExpr) && ((BoolExpr *) node)->boolop == OR_EXPR)
 	{

@@ -1,11 +1,12 @@
 -- Stored positions (DESIGN.md §17, "Stored positions"): insert, VACUUM,
 -- CREATE INDEX, and the bitmap scans they answer.
 --
--- A column whose multi-key opclass has support function 5 - tsvector_pos_ops
--- - stores, for every key, each row's word positions and weights: in the
--- entry while it is INLINE, in a position tree once the entry spills.  The
--- test creates a function that lists what the index stores for one key, and
--- compares that with unnest() of the rows' tsvectors.
+-- A column whose multi-key opclass has support function 5 (tsvector_ops), in
+-- an index built WITH (store_positions = true), stores for every key each
+-- row's word positions and weights: in the entry while it is INLINE, in a
+-- position tree once the entry spills.  The test creates a function that
+-- lists what the index stores for one key, and compares that with unnest() of
+-- the rows' tsvectors.
 --
 -- The table keeps autovacuum off so that the VACUUMs below are the only ones.
 
@@ -22,7 +23,7 @@ CREATE FUNCTION lion_debug_key_positions(regclass, text,
 	AS '$libdir/pg_lion' LANGUAGE C STRICT;
 
 CREATE TABLE pos_docs (id int, d tsvector) WITH (autovacuum_enabled = off);
-CREATE INDEX pos_docs_d ON pos_docs USING lion (d tsvector_pos_ops);
+CREATE INDEX pos_docs_d ON pos_docs USING lion (d) WITH (store_positions = true);
 
 -- What the index stores for every lexeme of the table, live rows only (an
 -- UPDATE leaves the old row's positions behind, for VACUUM), against the
@@ -132,7 +133,7 @@ INSERT INTO pos_hot
 SELECT g, to_tsvector('simple', repeat('dense ', 100 + g % 3) || 'w' || (g % 50) ||
 							   repeat(' pad', g % 2) || ' hot' || (g % 3))
 FROM generate_series(1, 3000) g;
-CREATE INDEX pos_hot_d ON pos_hot USING lion (d tsvector_pos_ops);
+CREATE INDEX pos_hot_d ON pos_hot USING lion (d) WITH (store_positions = true);
 UPDATE pos_hot SET id = -id WHERE id % 4 = 0;
 SELECT count(*) AS moved FROM pos_hot WHERE id < 0;
 -- the index keeps a chain's root offset, so its entries are compared with the
@@ -339,7 +340,7 @@ DROP FUNCTION pos_count_explain(tsquery);
 -- distinct count and the join's per-key counts likewise
 CREATE TABLE pos_grouped (id int, cat int, d tsvector) WITH (autovacuum_enabled = off);
 INSERT INTO pos_grouped SELECT id, id % 7, d FROM pos_docs;
-CREATE INDEX pos_grouped_cd ON pos_grouped USING lion (cat, d tsvector_pos_ops);
+CREATE INDEX pos_grouped_cd ON pos_grouped USING lion (cat, d) WITH (store_positions = true);
 CREATE TABLE pos_dim (id int PRIMARY KEY, name text);
 INSERT INTO pos_dim SELECT g, 'n' || (g % 3) FROM generate_series(0, 6) g;
 VACUUM ANALYZE pos_grouped, pos_dim;
@@ -388,8 +389,9 @@ RESET enable_indexscan;
 
 -- Under an OR no recheck sees a leaf alone, so a leaf the sets only bound is
 -- decided from the positions as the count walks it (LION_KN_POSFILTER): two
--- queries ORed, a query ORed with another column, and the same with a GROUP
--- BY, each counted by the pushdown and by the heap.  At the smallest
+-- queries ORed, a query ORed with another column, the same with a GROUP BY,
+-- and `@@ ANY (array)`, which is the OR of its elements' queries, each
+-- counted by the pushdown and by the heap.  At the smallest
 -- work_mem the union is read a window at a time, without its pins.
 CREATE FUNCTION pos_or_count(sql text, pushed OUT bool, n OUT text)
 LANGUAGE plpgsql AS $$
@@ -414,7 +416,15 @@ UNION ALL
 SELECT format('SELECT cat, count(*) FROM pos_grouped WHERE d @@ %L OR d @@ %L '
 			  'GROUP BY cat', a.q, b.q)
 FROM pos_queries a, pos_queries b
-WHERE a.q::text < b.q::text AND b.q IN ('common <-> again', 'w1:A');
+WHERE a.q::text < b.q::text AND b.q IN ('common <-> again', 'w1:A')
+UNION ALL
+SELECT format('SELECT count(*) FROM pos_grouped WHERE d @@ ANY (%L::tsquery[])',
+			  ARRAY[a.q, b.q])
+FROM pos_queries a, pos_queries b WHERE a.q::text < b.q::text
+UNION ALL
+SELECT format('SELECT cat, count(*) FROM pos_grouped '
+			  'WHERE d @@ ANY (%L::tsquery[]) GROUP BY cat', ARRAY[q, NULL, q])
+FROM pos_queries;
 CREATE TEMP TABLE pos_or_pushed AS
 SELECT s, (pos_or_count(s)).* FROM pos_or_shapes;
 SET work_mem = '64kB';
@@ -450,6 +460,36 @@ BEGIN
 END $$;
 DROP FUNCTION pos_or_count(text);
 DROP TABLE pos_grouped, pos_dim;
+
+-- store_positions is off by default, read at build time only and recorded
+-- on the meta page: ALTER INDEX changes nothing until a REINDEX.
+CREATE TABLE pos_opt (id int, d tsvector) WITH (autovacuum_enabled = off);
+INSERT INTO pos_opt
+SELECT i, to_tsvector('simple', 'a b c ' || (i % 7)) FROM generate_series(1, 500) i;
+CREATE INDEX pos_opt_d ON pos_opt USING lion (d);
+SELECT count(*) FROM lion_debug_key_positions('pos_opt_d', 'a');
+CREATE INDEX pos_opt_id ON pos_opt USING lion (id) WITH (store_positions = true);
+ALTER INDEX pos_opt_d SET (store_positions = true);
+INSERT INTO pos_opt VALUES (501, to_tsvector('simple', 'a b'));
+SELECT count(*) FROM lion_debug_key_positions('pos_opt_d', 'a');
+REINDEX INDEX pos_opt_d;
+SELECT count(*) FROM lion_debug_key_positions('pos_opt_d', 'a');
+ALTER INDEX pos_opt_d SET (store_positions = false);
+INSERT INTO pos_opt VALUES (502, to_tsvector('simple', 'a b'));
+SELECT count(*) FROM lion_debug_key_positions('pos_opt_d', 'a');
+-- an OR of phrases is pushed down only while the index stores positions
+VACUUM pos_opt;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM pos_opt WHERE d @@ 'a <-> b' OR d @@ 'b <-> c';
+SELECT count(*) FROM pos_opt WHERE d @@ 'a <-> b' OR d @@ 'b <-> c';
+REINDEX INDEX pos_opt_d;
+SELECT count(*) FROM lion_debug_key_positions('pos_opt_d', 'a');
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM pos_opt WHERE d @@ 'a <-> b' OR d @@ 'b <-> c';
+SELECT count(*) FROM pos_opt WHERE d @@ 'a <-> b' OR d @@ 'b <-> c';
+RESET enable_seqscan;
+DROP TABLE pos_opt;
 
 DROP TABLE pos_docs CASCADE;
 DROP FUNCTION lion_debug_key_positions(regclass, text);

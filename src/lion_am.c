@@ -90,7 +90,8 @@ static const relopt_parse_elt lion_relopt_tab[] = {
 	{"fillfactor", RELOPT_TYPE_INT, offsetof(LionOptions, fillfactor)},
 	{"wal_mode", RELOPT_TYPE_ENUM, offsetof(LionOptions, wal_mode)},
 	{"summaries", RELOPT_TYPE_ENUM, offsetof(LionOptions, summaries)},
-	{"summary_tids", RELOPT_TYPE_INT, offsetof(LionOptions, summary_tids)}
+	{"summary_tids", RELOPT_TYPE_INT, offsetof(LionOptions, summary_tids)},
+	{"store_positions", RELOPT_TYPE_BOOL, offsetof(LionOptions, store_positions)}
 };
 
 /* DESIGN.md §32: which key columns a build gives summary posting sets. */
@@ -182,6 +183,17 @@ _PG_init(void)
 					  LION_DEFAULT_SUMMARY_TIDS, LION_MIN_SUMMARY_TIDS,
 					  LION_MAX_SUMMARY_TIDS,
 					  AccessExclusiveLock);
+
+	/*
+	 * DESIGN.md §17, "Stored positions".  Off by default: positions more than
+	 * double a tsvector index and answer only phrases, weights and `a & !b`.
+	 * Read at build time only and recorded on the meta page
+	 * (LION_META_POSITIONS), so it is REINDEX that adds or drops them.
+	 */
+	add_bool_reloption(lion_relopt_kind, "store_positions",
+					   "Store word positions for phrase, weight and NOT queries",
+					   false,
+					   AccessExclusiveLock);
 
 	/*
 	 * The resource manager itself, which only registers while
@@ -1052,7 +1064,10 @@ lionbuildempty(Relation index)
 	 * the catalog, with a state no meta page has recorded anything in yet.
 	 */
 	memset(&meta, 0, sizeof(meta));
+	if (opts != NULL && opts->store_positions)
+		meta.order_flags |= LION_META_POSITIONS;
 	lion_fill_index_state(index, &ix, &meta, CurrentMemoryContext);
+	lion_check_store_positions(index, &ix);
 	lion_meta_record_order(&meta, &ix);	/* not in the critical section */
 
 	/*
