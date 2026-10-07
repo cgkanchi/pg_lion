@@ -867,6 +867,7 @@ lion_entry_scan_plan_sum(LionEntryScan *es, Relation index, LionRange *range,
 		es->hassumprev = true;
 		lion_scan_keycopy(es, ej, &es->sumprev, &es->sumprevlen);
 		es->sumprevhash = ej->hash;
+		pfree(ej);
 		es->blkno = (part == LION_WALK_INSIDE) ?
 			lion_range_first_leaf(index, range) :
 			lion_range_side_leaf(index, range, false, LION_KIND_VALUE, NULL);
@@ -879,8 +880,6 @@ lion_entry_scan_plan_sum(LionEntryScan *es, Relation index, LionRange *range,
 		es->blkno = lion_summary_first_leaf(index, col);
 	}
 	es->nextphase = es->phase;
-	if (ej != NULL)
-		pfree(ej);
 	es->state = lion_index_column_state(index, es->attno);
 	if (range != NULL)
 		range->state = es->state;
