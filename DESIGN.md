@@ -4588,7 +4588,10 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   then memory) as it writes the key's entry, into the entry's chunk or into a position tree
   written bottom up through the bulk writer.  A 225k-row build takes about 1.5x as long as one
   without positions (it was 10x with a tuplesort, plus a quadratic append into the chunk).
-  Serial only for now: a parallel build's workers have no sink.
+  A parallel build gives each participant a sink of its own, writing to the build's shared
+  fileset; at the end of its scan a participant writes everything out with a directory of its
+  keys' parts, the leader reads every directory into its own table, and taking a key merges its
+  participants' parts by heap block, which a parallel heap scan never splits between two.
 - **Tested** by `test/sql/positions.sql`, which compares what the index stores with `unnest()` of
   the rows after inserts, an UPDATE, deletes with VACUUM, a key emptied and refilled, a REINDEX,
   and a REINDEX at 1MB over heap-only tuples (spilled streams, page disorder).

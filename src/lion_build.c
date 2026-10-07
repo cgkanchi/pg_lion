@@ -1893,7 +1893,7 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 
 	/*
 	 * A key of a column that stores positions (DESIGN.md §17): its positions
-	 * are next in the column's sort (lion_posbuild.c).  Ones that fit a chunk
+	 * are taken from the side (lion_posbuild.c).  Ones that fit a chunk
 	 * travel with the entry, and an INLINE posting set then has to leave
 	 * them room; a tree means a CHAIN entry.
 	 */
@@ -2066,6 +2066,7 @@ lion_parallel_scan_and_spool(LionBuildShared *shared, TapeShare *tapes,
 	MemoryContext oldctx = MemoryContextSwitchTo(cxt);
 	LionIndexState ix;
 	LionSpool  *spool;
+	LionPosBuild *posbuild;
 	IndexInfo  *indexInfo;
 	TableScanDesc scan;
 	double		reltuples;
@@ -2073,6 +2074,10 @@ lion_parallel_scan_and_spool(LionBuildShared *shared, TapeShare *tapes,
 	(void) lion_build_index_state(index, &ix, cxt);
 	spool = lion_spool_begin(&ix, (Size) memkb * 1024, &shared->fileset,
 							 filenum);
+	posbuild = lion_posbuild_begin_shared(index, &ix, memkb, &shared->fileset,
+										  filenum);
+	if (posbuild != NULL)
+		lion_spool_set_possink(spool, lion_posbuild_sink, posbuild);
 
 	indexInfo = BuildIndexInfo(index);
 	indexInfo->ii_Concurrent = shared->isconcurrent;
@@ -2082,6 +2087,11 @@ lion_parallel_scan_and_spool(LionBuildShared *shared, TapeShare *tapes,
 									   lion_build_callback, spool, scan);
 
 	lion_spool_export(spool, &tapes[filenum]);
+	if (posbuild != NULL)
+	{
+		lion_posbuild_export(posbuild);
+		lion_posbuild_end(posbuild);
+	}
 
 	SpinLockAcquire(&shared->mutex);
 	shared->nparticipantsdone++;
@@ -2277,6 +2287,9 @@ lion_parallel_heapscan(LionBuildState *bs, bool *brokenhotchain)
 										 leader->nparticipants, filenums,
 										 shares,
 										 (Size) maintenance_work_mem * 1024);
+	if (bs->posbuild != NULL)
+		lion_posbuild_import(bs->posbuild, &shared->fileset,
+							 leader->nparticipants, filenums);
 	return reltuples;
 }
 
@@ -2418,9 +2431,9 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * parallel_workers, and 32MB of maintenance_work_mem per participant.
 	 */
 	/*
-	 * A column that stores positions (DESIGN.md §17) sorts them on the side,
-	 * in a serial build only: the workers of a parallel one have no sink for
-	 * them (lion_posbuild.c).
+	 * A column that stores positions (DESIGN.md §17) keeps them on the side
+	 * (lion_posbuild.c); in a parallel build each participant keeps its own
+	 * and the leader reads them all once the scan is done.
 	 */
 	posbuild = lion_posbuild_begin(index, &bs.ix, maintenance_work_mem);
 	bs.posbuild = posbuild;
@@ -2430,7 +2443,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.pw.put = lion_build_pw_put;
 
 #if PG_VERSION_NUM >= 170000
-	if (indexInfo->ii_ParallelWorkers > 0 && posbuild == NULL)
+	if (indexInfo->ii_ParallelWorkers > 0)
 		lion_begin_parallel(&bs, heap, index, indexInfo->ii_Concurrent,
 							indexInfo->ii_ParallelWorkers);
 	if (bs.leader != NULL)
