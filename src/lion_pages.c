@@ -46,6 +46,7 @@
 #include "varatt.h"
 
 #include "lion.h"
+#include "lion_positions.h"
 
 /*
  * Initialise a page of the lion index.  Sets up the special area.
@@ -298,16 +299,14 @@ lion_new_buffer(Relation index, Relation heaprel, uint16 flags)
  * copy of the block - the readers copy a leaf under its lock and read the
  * copy - which is why the block number is passed in, for the message.
  */
-LionContainer *
-lion_page_item_fetch(Relation index, Page page, BlockNumber blkno,
-					 OffsetNumber off)
+static ItemId
+lion_page_item_lp(Relation index, Page page, BlockNumber blkno,
+				  OffsetNumber off)
 {
 	PageHeader	phdr = (PageHeader) page;
 	ItemId		iid;
-	LionContainer *item;
 	unsigned	lpoff;
 	unsigned	lplen;
-	Size		size;
 
 	/* the line pointer array and the item space are on the page */
 	if (unlikely(phdr->pd_lower > phdr->pd_upper ||
@@ -343,6 +342,19 @@ lion_page_item_fetch(Relation index, Page page, BlockNumber blkno,
 				 errmsg("lion index \"%s\": line pointer %u on container page %u points at %u bytes at offset %u, outside the item space %u .. %u",
 						RelationGetRelationName(index), off, blkno, lplen,
 						lpoff, phdr->pd_upper, phdr->pd_special)));
+
+	return iid;
+}
+
+/* The checks above, for an item of a posting set: a container or a segment. */
+LionContainer *
+lion_page_item_fetch(Relation index, Page page, BlockNumber blkno,
+					 OffsetNumber off)
+{
+	ItemId		iid = lion_page_item_lp(index, page, blkno, off);
+	unsigned	lplen = ItemIdGetLength(iid);
+	LionContainer *item;
+	Size		size;
 
 	item = (LionContainer *) PageGetItem(page, iid);
 	if (unlikely(!lion_container_type_valid(item->type) &&
@@ -617,9 +629,62 @@ lion_page_update_minmax(Page page)
 	opaque->minckey = lion_item_first_ckey((LionContainer *)
 										  PageGetItem(page,
 													  PageGetItemId(page, FirstOffsetNumber)));
+	if (opaque->flags & LION_PAGE_POSITIONS)
+	{
+		/*
+		 * A chunk's header ckey only bounds its members from below (a
+		 * removal can leave it under the first one), which is still the
+		 * right minckey; the last ckey is its last member's.
+		 */
+		LionContainer *last = (LionContainer *)
+			PageGetItem(page, PageGetItemId(page, maxoff));
+		uint64		code;
+
+		opaque->maxckey = lion_poschunk_last_code(last, &code) ?
+			lion_code_ckey(code) : last->ckey;
+		return;
+	}
 	opaque->maxckey = lion_item_last_ckey((LionContainer *)
 										 PageGetItem(page,
 													 PageGetItemId(page, maxoff)));
+}
+
+/*
+ * lion_page_item_fetch() for a page of a position tree: the same checks of
+ * the page and the line pointer, then that the item is a position chunk
+ * whose byte count fits its item and whose slack is bounded.  What its
+ * members hold is lion_poschunk_check()'s to say; every reader of the chunk
+ * is safe for any member bytes (lion_positions.h).
+ */
+LionContainer *
+lion_page_poschunk_fetch(Relation index, Page page, BlockNumber blkno,
+						 OffsetNumber off)
+{
+	ItemId		iid = lion_page_item_lp(index, page, blkno, off);
+	unsigned	lplen = ItemIdGetLength(iid);
+	LionContainer *item = (LionContainer *) PageGetItem(page, iid);
+	Size		size;
+
+	if (unlikely(item->type != LION_CT_POSITIONS))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": item %u on position page %u has type %u, not a position chunk",
+						RelationGetRelationName(index), off, blkno,
+						item->type)));
+	if (unlikely(lplen < LION_POS_HDRSZ))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": position chunk %u on page %u is %u bytes, shorter than its header",
+						RelationGetRelationName(index), off, blkno, lplen)));
+	size = lion_poschunk_size(item);
+	if (unlikely(size > lplen || lplen > LION_CONTAINER_MAX_SIZE ||
+				 lplen - size > LION_ITEM_SLACK_BOUND))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": position chunk %u on page %u occupies %u bytes for its %zu (at most %d bytes of slack)",
+						RelationGetRelationName(index), off, blkno, lplen,
+						size, LION_ITEM_SLACK_BOUND)));
+	return item;
 }
 
 /*
