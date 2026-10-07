@@ -4615,7 +4615,7 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     visit drops.
 
 Still to come: the filter under an OR (an expression node rather than a filter on the result),
-`@@ ANY (array)`, and then the opclass in the extension's SQL.
+and `@@ ANY (array)`.  The opclass is `tsvector_pos_ops` in the extension's SQL (README.md).
 
 ### Cardinality guard
 
