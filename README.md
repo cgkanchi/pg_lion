@@ -504,7 +504,8 @@ combined with a `GROUP BY` on a scalar roaring column.
 `tsvector_pos_ops` also stores every lexeme's positions and weights per row, so phrases (`a <-> b`,
 `a <3> b`), weights (`a:A`) and NOTs (`a & !b`, `a <-> !b`) are answered exactly from the index:
 bitmap and index scans need no recheck, and counts skip the heap on all-visible pages, under a
-`GROUP BY`, `count(DISTINCT)` or the FK-side join too, and under an OR. It costs about three bytes per lexeme and
+`GROUP BY`, `count(DISTINCT)` or the FK-side join too, under an OR, and for `@@ ANY (array)`
+in scans. It costs about three bytes per lexeme and
 row on top of `tsvector_ops`. Only a prefix lexeme (`foo:*`) is still rechecked.
 
     CREATE INDEX ON doc USING lion (tsv tsvector_pos_ops);
