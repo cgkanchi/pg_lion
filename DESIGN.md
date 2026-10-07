@@ -4579,15 +4579,22 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   position page whose root is gone for a leak.
 - **Verify** walks every position tree (chunks, order, levels) and, on a primary, checks that
   every TID of the posting set has positions.
-- **Build**: the spool hands each key's positions to a sink (`lion_posbuild.c`) that sorts them by
-  (key in directory order, code); `lion_build.c` reads a key's positions as it writes the key's
-  entry, into the entry's chunk or into a position tree written bottom up through the bulk
-  writer.  Serial only for now: a parallel build's workers have no sink.  The sort is the cost -
-  a 300k-row build takes about 7x as long as one without positions - and appending positions to
-  the spool's per-key streams instead is the obvious next step.
-- **Tested** by `test/sql/positions.sql`, which creates the opclass from the library (it is not
-  in the extension's SQL yet) and compares what the index stores with `unnest()` of the rows after
-  inserts, an UPDATE, deletes with VACUUM, a key emptied and refilled, and a REINDEX.
+- **Build**: the spool hands each row's positions for a key to a sink (`lion_posbuild.c`) that
+  appends them to that key's own stream, found by a hash table on the key's bytes.  The heap scan
+  delivers a key's rows in TID order, so nothing is sorted, except each heap page's members as
+  they are read back (a heap-only tuple comes under its chain's root offset).  The streams get a
+  quarter of `maintenance_work_mem`; past that every stream is written to one temporary file, the
+  key keeping where its parts went.  `lion_build.c` takes a key's positions (file parts in order,
+  then memory) as it writes the key's entry, into the entry's chunk or into a position tree
+  written bottom up through the bulk writer.  A 225k-row build takes about 1.5x as long as one
+  without positions (it was 10x with a tuplesort, plus a quadratic append into the chunk).
+  A parallel build gives each participant a sink of its own, writing to the build's shared
+  fileset; at the end of its scan a participant writes everything out with a directory of its
+  keys' parts, the leader reads every directory into its own table, and taking a key merges its
+  participants' parts by heap block, which a parallel heap scan never splits between two.
+- **Tested** by `test/sql/positions.sql`, which compares what the index stores with `unnest()` of
+  the rows after inserts, an UPDATE, deletes with VACUUM, a key emptied and refilled, a REINDEX,
+  and a REINDEX at 1MB over heap-only tuples (spilled streams, page disorder).
 
 - **Queries** (`lion_posfilter.c`).  The posting sets give the candidates, as
   `lion_extract_query_superset()` already did for a recheck, and PostgreSQL's own `TS_execute()`
@@ -4607,15 +4614,32 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     used to apply, and so for GROUP BY, count(DISTINCT) and the FK-side join too: the walks that
     intersect a copy of the WHERE with many sets at once filter the copy's container once a key.
     The cost model charges such a clause an operator call per key and candidate instead of the
-    heap recheck (`lion_cost_recheck()`).  Under an OR the planner still declines the query.
+    heap recheck (`lion_cost_recheck()`).
+  - **Under an OR** no recheck sees a leaf alone: the row passes when any arm holds, and the
+    other arms are answered from posting sets.  A leaf the sets only bound is taken there when it
+    is a literal an index that stores positions can follow (`lion_query_posexact()`;
+    `lion_match_index()` then takes only such an index), and its tree is wrapped in a
+    `LION_KN_POSFILTER` node: one child, the superset, whose every container the node's cursor
+    puts through a filter of its own as it gets there, skipping the containers it empties.  The
+    child is built eagerly and the node is never pending, so a leapfrog, a union or a probe above
+    it sees an ordinary built container; the child stands at the key while its positions are
+    read, so its pins carry §9 as any node's do, and a wide union opens the node a window at a
+    time like any child.  Its cost is the filter's, per candidate, as above.
   - Why reading positions at any moment of a scan is safe: a member's TID can change hands only
     after VACUUM has removed the old row's positions, and the new row is then inserted after the
     scan's snapshot was taken, so it is invisible to the scan and its page is not all-visible to
     it either.  A mix of two rows' positions can therefore only be applied to a TID the heap
     visit drops.
 
-Still to come: the filter under an OR (an expression node rather than a filter on the result),
-and `@@ ANY (array)`.  The opclass is `tsvector_pos_ops` in the extension's SQL (README.md).
+  - **`@@ ANY (array)`**: a bitmap scan emits each element through its own filter
+    (`lion_emit_multikey()`), and a plain index scan under an MVCC snapshot wraps each element's
+    superset in a `LION_KN_POSFILTER` node of its union (`lion_scan_col_tree()`), so neither
+    rechecks unless an element has a prefix lexeme.  The count takes a multi-key operator over a
+    literal array (`tsv @@ ANY`) as the OR of one clause per element
+    (`lion_multikey_any_as_or()`, §19), so an element the sets only bound is decided from the
+    positions there as under any OR.  An index stores them when built `WITH (store_positions = true)` over a column whose opclass has
+    support function 5 (`tsvector_ops`); the build records that on the meta page (`LION_META_POSITIONS`
+    in `order_flags`), so `ALTER INDEX` changes nothing until a `REINDEX` (README.md).
 
 ### Cardinality guard
 

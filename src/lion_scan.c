@@ -1391,7 +1391,7 @@ lion_scan_shift(LionKeyNode *node, int base)
 static LionKeyNode *
 lion_scan_col_tree(Relation index, LionState *col,
 				  ScanKey skey, LionScanSets *acc, bool *ok, bool *nomatch,
-				  bool *lossy)
+				  bool *lossy, bool posok)
 {
 	AttrNumber	attno = (AttrNumber) col->attno;
 
@@ -1458,6 +1458,7 @@ lion_scan_col_tree(Relation index, LionState *col,
 			LionQuery	q;
 			int			base;
 			int			k;
+			bool		posquery = false;
 
 			if (qnulls != NULL && qnulls[i])
 				continue;		/* a strict operator with a NULL is not true */
@@ -1479,7 +1480,22 @@ lion_scan_col_tree(Relation index, LionState *col,
 			if (q.mode == LION_QMODE_NONE)
 				continue;		/* this element selects nothing */
 			if (q.mode == LION_QMODE_LOSSY)
-				*lossy = true;
+			{
+				Datum	   *itemkeys;
+
+				/*
+				 * ... or, where the caller says positions may be read
+				 * (posok), the element's superset goes through a position
+				 * filter as it is walked (LION_KN_POSFILTER), which needs no
+				 * recheck - one filter per element of `@@ ANY (array)`.
+				 */
+				if (posok && col->positions &&
+					lion_tsquery_item_keys(col, queries[i], skey->sk_strategy,
+										   &itemkeys))
+					posquery = true;
+				else
+					*lossy = true;
+			}
 			else if (q.mode != LION_QMODE_KEYS)
 			{
 				*ok = false;	/* needs every indexed row */
@@ -1497,6 +1513,9 @@ lion_scan_col_tree(Relation index, LionState *col,
 				CHECK_FOR_INTERRUPTS();
 			}
 			lion_scan_shift(q.tree, base);
+			if (posquery)
+				q.tree = lion_posfilter_keynode(index, col, queries[i],
+												skey->sk_strategy, q.tree);
 			args[nargs++] = q.tree;
 		}
 
@@ -1595,7 +1614,8 @@ lion_scankey_sets(Relation index, ScanKey skey, int *nsets,
 	acc.nsets = 0;
 	acc.sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) * acc.maxsets);
 
-	node = lion_scan_col_tree(index, col, skey, &acc, &ok, nomatch, NULL);
+	node = lion_scan_col_tree(index, col, skey, &acc, &ok, nomatch, NULL,
+							  false);
 
 	*nsets = acc.nsets;
 	*sets = acc.sets;
@@ -1643,7 +1663,7 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 		bool		lossy;
 
 		node = lion_scan_col_tree(so->index, col, keys[i], &acc, &ok, &nomatch,
-								  &lossy);
+								  &lossy, false);
 
 		if (nomatch)
 		{
@@ -2094,7 +2114,7 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 
 		node = lion_scan_col_tree(so->index,
 								  lion_column(so->ix, keys[i]->sk_attno),
-								  keys[i], &acc, &ok, &none, &lossy);
+								  keys[i], &acc, &ok, &none, &lossy, false);
 		if (none)
 			nomatch = true;
 		else if (!ok || node == NULL)
@@ -3201,7 +3221,9 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 				 * bitmap path (§29.6); one in mode ALL is every row, rechecked.
 				 */
 				node = lion_scan_col_tree(so->index, col, skey, &acc, &ok, &none,
-										  &lossy);
+										  &lossy,
+										  !keeppins &&
+										  (skey->sk_flags & SK_SEARCHARRAY) != 0);
 				if (none)
 					nomatch = true;
 				else if (!ok)
@@ -3215,11 +3237,12 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 				{
 					/*
 					 * A superset is rechecked, unless the column stores
-					 * positions and the query can be decided from them -
-					 * one query, not `@@ ANY (array)`'s union of several,
-					 * and under an MVCC snapshot, which is what makes the
+					 * positions and the query can be decided from them,
+					 * under an MVCC snapshot, which is what makes the
 					 * positions safe to read at any moment of the scan
-					 * (lion_posfilter.c).
+					 * (lion_posfilter.c): one query by a filter on the
+					 * source's containers, `@@ ANY (array)` by a filter
+					 * per element in its tree (lion_scan_col_tree()).
 					 */
 					if (lossy)
 					{
@@ -3261,7 +3284,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 					 (int) skey->sk_strategy);
 
 			node = lion_scan_col_tree(so->index, col, skey, &acc, &ok, &none,
-									  NULL);
+									  NULL, false);
 			if (none)
 				nomatch = true;
 			else

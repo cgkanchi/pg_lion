@@ -832,7 +832,8 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 		IndexOptInfo *idx = lion_match_index(rel, (AttrNumber) lfirst_int(l1),
 											ci->kind, ci->opno, ci->cmptype,
 											ci->strategy, ci->extractquery,
-											ci->collation, &col);
+											ci->collation, ci->positions,
+											&col);
 
 		/*
 		 * Same rule for a pinned column whose value the output prints: an

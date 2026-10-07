@@ -34,6 +34,8 @@
 #include "miscadmin.h"
 #include "tsearch/ts_type.h"
 #include "utils/datum.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 #include "lion.h"
@@ -1027,6 +1029,47 @@ lion_tsquery_item_keys(LionState *state, Datum query, StrategyNumber strategy,
 
 	*itemkeys = out;
 	return true;
+}
+
+/*
+ * Will a superset of `col op query` be decided from stored positions
+ * (lion_posfilter.c), on a column of opfamily over lefttype?  When the
+ * opfamily stores them (support function 5) and the query names no key a
+ * position cursor cannot follow, as lion_tsquery_item_keys() says - the
+ * planner's question, asked of a literal before any index is open.
+ */
+bool
+lion_query_posexact(Oid opfamily, Oid lefttype, Oid opno, Datum query,
+					Oid collation)
+{
+	int			strategy = get_op_opfamily_strategy(opno, opfamily);
+	Oid			proc = get_opfamily_proc(opfamily, lefttype, lefttype,
+										 LION_EXTRACTQUERY_PROC);
+	LionState	state;
+	Datum	   *itemkeys;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	bool		result;
+
+	if (strategy == 0 || !OidIsValid(proc) ||
+		!OidIsValid(get_opfamily_proc(opfamily, lefttype, lefttype,
+									  LION_POSITIONS_PROC)))
+		return false;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"lion position query",
+								ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+	memset(&state, 0, sizeof(state));
+	state.multikey = true;
+	state.collation = collation;
+	fmgr_info(proc, &state.extractquery);
+	result = lion_tsquery_item_keys(&state, query, (StrategyNumber) strategy,
+									&itemkeys);
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
+
+	return result;
 }
 
 /* ---------------------------------------------------------------------
