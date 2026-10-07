@@ -487,9 +487,9 @@ SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1 & x2''', 
 (1 row)
 
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1 <-> x1''', 'force_custom_plan');
-      lion_mk       
---------------------
- not pushed, 1 rows
+                    lion_mk                    
+-----------------------------------------------
+ LionCount, 1 rows, 912 rechecked, 729 removed
 (1 row)
 
 -- What EXPLAIN prints: the parameter as core prints it, in both plans.

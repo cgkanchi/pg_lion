@@ -237,7 +237,7 @@ SELECT lion_iq('SELECT id FROM lis WHERE tags @> ''{}''');
 SELECT lion_iq('SELECT id FROM lis WHERE tags IS NULL');
 SELECT lion_iq('SELECT id FROM lis WHERE tags IS NOT NULL');
 SELECT lion_ir('SELECT id FROM lis WHERE tags <@ ''{1, 11, 41, 2, 12, 42}''');
--- tsvector: a tree of lexemes, and a NOT, which needs every row
+-- tsvector: a tree of lexemes, and a NOT beside one, answered from the lexeme's rows and rechecked
 SELECT lion_iq('SELECT id FROM lis WHERE tsv @@ ''w3 & x2''::tsquery');
 SELECT lion_iq('SELECT id FROM lis WHERE tsv @@ ''w3 | x5''::tsquery');
 SELECT lion_iq('SELECT id FROM lis WHERE tsv @@ ''w3 & !x2''::tsquery');
