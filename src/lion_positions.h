@@ -161,6 +161,19 @@ extern bool lion_poschunk_last_code(const LionContainer *c, uint64 *code);
 extern Size lion_posmember_size(uint64 prev_code, const LionPosMember *m);
 extern Size lion_poschunk_append_need(const LionContainer *c, const LionPosMember *m);
 extern bool lion_poschunk_append(LionContainer *c, Size cap, const LionPosMember *m);
+
+/* Where a chunk's last member ends, kept by a caller that appends many. */
+typedef struct LionPosTail
+{
+	bool		valid;			/* false: found again at the next append */
+	bool		any;			/* the chunk has a member */
+	uint64		last;			/* its last member's code */
+	uint32		used;			/* member bytes up to its end */
+	uint32		n;				/* members */
+} LionPosTail;
+
+extern bool lion_poschunk_append_tail(LionContainer *c, Size cap,
+									  const LionPosMember *m, LionPosTail *tail);
 extern bool lion_poschunk_insert(LionContainer *c, Size cap, const LionPosMember *m,
 								 bool *replaced);
 

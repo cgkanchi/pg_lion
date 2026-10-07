@@ -2257,6 +2257,8 @@ typedef struct LionClauseInfo
 								 * so the index has to be able to produce it
 								 * (lion_index_can_emit_value()) */
 	bool		inor;			/* a leaf of an OR restriction (§19) */
+	bool		positions;		/* a superset only the stored positions of
+								 * the index can decide (LionLeafInfo) */
 	int			rinfono;		/* the restriction it came from, its position
 								 * in the relation's baserestrictinfo; -1 for
 								 * the FK-side join's key, which is none */
@@ -2346,6 +2348,10 @@ typedef struct LionLeafInfo
 	Oid			extractquery;	/* multi-key clauses only */
 	Oid			collation;		/* clause input collation, or none */
 	int			kind;			/* LION_CLAUSE_* */
+	bool		positions;		/* multi-key: an OR's leaf whose literal the
+								 * posting sets only bound, which an index
+								 * that stores positions decides instead of
+								 * the heap (lion_query_posexact()) */
 } LionLeafInfo;
 
 
@@ -2366,7 +2372,7 @@ extern IndexOptInfo *lion_match_index(RelOptInfo *rel, AttrNumber attno,
 									  int kind, Oid opno, Oid cmptype,
 									  StrategyNumber strategy,
 									  Oid extractquery, Oid exprcoll,
-									  AttrNumber *colp);
+									  bool positions, AttrNumber *colp);
 extern BoolExpr *lion_boolean_not_test(Node *clause);
 extern List *lion_or_arms(Node *clause);
 extern bool lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,

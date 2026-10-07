@@ -418,6 +418,32 @@ lion_posfilter_check(void *arg, QueryOperand *val, ExecPhraseData *data)
 }
 
 /*
+ * A LION_KN_POSFILTER node over child, the superset of query on the positions
+ * column col of index, which the caller has made sure the filter can follow
+ * (lion_tsquery_item_keys()).  Every cursor of the node begins a filter of
+ * its own (lion_expr.c).
+ */
+LionKeyNode *
+lion_posfilter_keynode(Relation index, LionState *col, Datum query,
+					   StrategyNumber strategy, LionKeyNode *child)
+{
+	LionPosSpec *spec = (LionPosSpec *) palloc0(sizeof(LionPosSpec));
+	LionKeyNode *n = (LionKeyNode *) palloc0(sizeof(LionKeyNode));
+
+	spec->index = index;
+	spec->col = col;
+	spec->query = query;
+	spec->strategy = strategy;
+
+	n->kind = LION_KN_POSFILTER;
+	n->nargs = 1;
+	n->args = (LionKeyNode **) palloc(sizeof(LionKeyNode *));
+	n->args[0] = child;
+	n->pos = spec;
+	return n;
+}
+
+/*
  * A filter for query against the positions column col of index, or NULL when
  * the query has an operand it cannot follow (lion_tsquery_item_keys()); the
  * caller then rechecks the candidates in the heap, as it always did.

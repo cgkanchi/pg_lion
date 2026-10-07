@@ -105,6 +105,29 @@ lion_bool_node(LionKeyNodeKind kind, LionKeyNode **args, int nargs)
 }
 
 /*
+ * A leaf of an OR whose sets only bound its query - a phrase, a weight - and
+ * which no recheck can see to, since the row passes when any arm holds: the
+ * planner took it only where the column stores positions and the query can
+ * be followed through them (lion_query_posexact()), and its superset is put
+ * through the position filter as the count walks it (LION_KN_POSFILTER).
+ */
+static LionKeyNode *
+lion_posfilter_node(LionClauseState *cl, LionKeyNode *child)
+{
+	LionState  *istate = lion_index_column_state(cl->idx, cl->idxcol);
+	StrategyNumber strategy = (StrategyNumber)
+		get_op_opfamily_strategy(cl->opno,
+								 cl->idx->rd_opfamily[cl->idxcol - 1]);
+	Datum	   *itemkeys;
+
+	if (!istate->positions ||
+		!lion_tsquery_item_keys(istate, cl->val, strategy, &itemkeys))
+		elog(ERROR, "roaring count: query for index \"%s\" can no longer be decided from positions",
+			 RelationGetRelationName(cl->idx));
+	return lion_posfilter_keynode(cl->idx, istate, cl->val, strategy, child);
+}
+
+/*
  * Renumber a tree's leaves, which name posting sets by position: the leaves
  * of an OR's arms are concatenated into one array, so each clause's tree has
  * to be moved to where its own sets ended up.
@@ -669,7 +692,12 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 			Assert(!walked);
 		}
 		else
+		{
 			leaftree[i] = lion_locate_leaf(cl, &leafsets[i], &leafn[i]);
+			if (leaftree[i] != NULL && cl->kind == LION_CLAUSE_MULTI &&
+				cl->qmode == LION_QMODE_LOSSY)
+				leaftree[i] = lion_posfilter_node(cl, leaftree[i]);
+		}
 		total += leafn[i];
 		CHECK_FOR_INTERRUPTS();
 	}

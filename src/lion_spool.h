@@ -62,7 +62,7 @@ extern void lion_spool_add(LionSpool *spool, ItemPointer tid, Datum *values,
 						   bool *isnull);
 /*
  * Where a column that stores positions (DESIGN.md §17) sends each key's
- * positions in a row; a serial build only (lion_posbuild.c).
+ * positions in a row (lion_posbuild.c).
  */
 typedef void (*LionSpoolPosSink) (void *arg, int col, Datum key, uint64 code,
 								  const LionKeyPositions *kp);
@@ -86,6 +86,19 @@ typedef struct LionPageWriter
 typedef struct LionPosBuild LionPosBuild;
 extern LionPosBuild *lion_posbuild_begin(Relation index, LionIndexState *ix,
 										 int workmem);
+/*
+ * A parallel build: each participant's sink writes to files of the build's
+ * shared fileset, under its file number (begin_shared), and exports them when
+ * its scan is done; the leader's own LionPosBuild imports every participant's
+ * (lion_posbuild_import()) before it writes the index.
+ */
+extern LionPosBuild *lion_posbuild_begin_shared(Relation index,
+												LionIndexState *ix, int workmem,
+												SharedFileSet *fileset,
+												int filenum);
+extern void lion_posbuild_export(LionPosBuild *pb);
+extern void lion_posbuild_import(LionPosBuild *pb, SharedFileSet *fileset,
+								 int nparticipants, const int *filenums);
 extern void lion_posbuild_sink(void *arg, int col, Datum key, uint64 code,
 							   const LionKeyPositions *kp);
 extern bool lion_posbuild_column(LionPosBuild *pb, int col);
