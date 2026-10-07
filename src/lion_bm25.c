@@ -68,6 +68,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/tuplestore.h"
 
 #include "lion.h"
 #include "lion_compat.h"
