@@ -40,6 +40,9 @@
 #define LION_PAGE_ROOT		0x0020	/* ... and it is the current root (§21) */
 #define LION_PAGE_INCOMPLETE_SPLIT 0x0040	/* its right sibling has no
 											 * downlink yet (§21) */
+#define LION_PAGE_POSITIONS	0x0080	/* a CONTAINER page of a key's position
+									 * tree, holding position chunks
+									 * (lion_positions.h), never containers */
 
 /* The three page KINDS; exactly one of them is set on every page. */
 #define LION_PAGE_KINDS \
@@ -157,9 +160,32 @@ lion_page_owns(Page page, BlockNumber head)
 	opaque = LionPageGetOpaque(page);
 
 	return opaque->page_id == LION_PAGE_ID &&
-		(opaque->flags & (LION_PAGE_CONTAINER | LION_PAGE_DELETED)) ==
-		LION_PAGE_CONTAINER &&
+		(opaque->flags & (LION_PAGE_CONTAINER | LION_PAGE_DELETED |
+						  LION_PAGE_POSITIONS)) == LION_PAGE_CONTAINER &&
 		opaque->owner_head == head;
+}
+
+/*
+ * Is this page a live page of the position tree whose root block is root?
+ * Position pages are container pages with LION_PAGE_POSITIONS set, stamped
+ * with their own tree's root rather than the posting set's head, so that
+ * neither tree's readers, its sweep nor verify can take a page of the other
+ * for one of its own.
+ */
+static inline bool
+lion_page_owns_positions(Page page, BlockNumber root)
+{
+	LionPageOpaque opaque;
+
+	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE)
+		return false;
+	opaque = LionPageGetOpaque(page);
+
+	return opaque->page_id == LION_PAGE_ID &&
+		(opaque->flags & (LION_PAGE_CONTAINER | LION_PAGE_DELETED |
+						  LION_PAGE_POSITIONS)) ==
+		(LION_PAGE_CONTAINER | LION_PAGE_POSITIONS) &&
+		opaque->owner_head == root;
 }
 
 /* The same with the entry's hash checked as well, for readers that have it. */
@@ -1593,6 +1619,8 @@ extern void lion_chain_put_container(Relation index, Relation heaprel,
 
 /* Page-level min/max maintenance after any change of a container page's items. */
 extern void lion_page_update_minmax(Page page);
+extern LionContainer *lion_page_poschunk_fetch(Relation index, Page page,
+											   BlockNumber blkno, OffsetNumber off);
 
 /* Convenience: read the meta page once and validate it (used by lion_get_state). */
 extern void lion_read_meta(Relation index, LionMetaPageData *meta);
