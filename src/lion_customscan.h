@@ -2373,6 +2373,7 @@ extern IndexOptInfo *lion_match_index(RelOptInfo *rel, AttrNumber attno,
 									  StrategyNumber strategy,
 									  Oid extractquery, Oid exprcoll,
 									  bool positions, AttrNumber *colp);
+extern bool lion_index_stores_positions(IndexOptInfo *idx, AttrNumber col);
 extern BoolExpr *lion_boolean_not_test(Node *clause);
 extern List *lion_or_arms(Node *clause);
 extern Node *lion_multikey_any_as_or(Node *clause);
