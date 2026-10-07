@@ -60,7 +60,43 @@ extern LionSpool *lion_spool_begin(LionIndexState *ix, Size membytes,
 								   SharedFileSet *fileset, int filenum);
 extern void lion_spool_add(LionSpool *spool, ItemPointer tid, Datum *values,
 						   bool *isnull);
+/*
+ * Where a column that stores positions (DESIGN.md §17) sends each key's
+ * positions in a row; a serial build only (lion_posbuild.c).
+ */
+typedef void (*LionSpoolPosSink) (void *arg, int col, Datum key, uint64 code,
+								  const LionKeyPositions *kp);
+extern void lion_spool_set_possink(LionSpool *spool, LionSpoolPosSink sink,
+								   void *arg);
 extern double lion_spool_ntids(const LionSpool *spool);
+
+/*
+ * The build's positions (lion_posbuild.c): NULL from begin when no column
+ * stores any.  A LionPageWriter is how it writes position trees: through
+ * the build's own block counter and bulk writer (lion_build.c).
+ */
+typedef struct LionPageWriter
+{
+	void	   *arg;
+	BlockNumber (*alloc) (void *arg);
+	void	   *(*get) (void *arg, Page *page, uint16 flags);
+	void		(*put) (void *arg, BlockNumber blk, void *handle);
+} LionPageWriter;
+
+typedef struct LionPosBuild LionPosBuild;
+extern LionPosBuild *lion_posbuild_begin(Relation index, LionIndexState *ix,
+										 int workmem);
+extern void lion_posbuild_sink(void *arg, int col, Datum key, uint64 code,
+							   const LionKeyPositions *kp);
+extern bool lion_posbuild_column(LionPosBuild *pb, int col);
+extern void lion_posbuild_take(LionPosBuild *pb, Datum key, uint32 hash,
+							   const LionPageWriter *w, LionContainer **chunk,
+							   BlockNumber *root, uint64 *nmembers);
+extern BlockNumber lion_posbuild_chunk_tree(const LionPageWriter *w,
+											uint32 hash,
+											const LionContainer *chunk);
+extern void lion_posbuild_column_done(LionPosBuild *pb, int col);
+extern void lion_posbuild_end(LionPosBuild *pb);
 extern int	lion_spool_nruns(const LionSpool *spool);
 
 /*

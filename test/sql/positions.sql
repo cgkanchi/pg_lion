@@ -1,4 +1,5 @@
--- Stored positions (DESIGN.md §17, "Stored positions"): insert and VACUUM.
+-- Stored positions (DESIGN.md §17, "Stored positions"): insert, VACUUM and
+-- CREATE INDEX.
 --
 -- A column whose multi-key opclass has support function 5 stores, for every
 -- key, each row's word positions and weights: in the entry while it is
@@ -7,8 +8,7 @@
 -- test function that lists what the index stores for one key, and compares
 -- that with unnest() of the rows' tsvectors.
 --
--- Not done yet: CREATE INDEX over existing rows (an error below).  The table
--- keeps autovacuum off so that the VACUUMs below are the only ones.
+-- The table keeps autovacuum off so that the VACUUMs below are the only ones.
 
 \set VERBOSITY terse
 SET client_min_messages = warning;
@@ -108,8 +108,27 @@ SELECT g, to_tsvector('simple', 'common again ' || g || ' common') FROM generate
 SELECT * FROM pos_compare;
 SELECT lion_index_verify('pos_docs_d', true);
 
--- the build does not write positions yet
-CREATE INDEX pos_docs_d2 ON pos_docs USING lion (d tsvector_pos_ops);
+-- A build over the rows there are (REINDEX): the same positions, with keys of
+-- every shape - inline ones, a few rows with many positions each (a chunk
+-- too large for the entry, or more than a chunk: a CHAIN entry with a small
+-- posting set), and a key in every row whose tree is more than a leaf
+INSERT INTO pos_docs
+SELECT 3000 + g, to_tsvector('simple', repeat('dense ', 200) || 'few' || (g % 3))
+FROM generate_series(1, 12) g;
+INSERT INTO pos_docs
+SELECT 4000 + g, to_tsvector('simple', 'everywhere ' || repeat('again ', 1 + g % 20))
+FROM generate_series(1, 4000) g;
+REINDEX INDEX pos_docs_d;
+SELECT * FROM pos_compare;
+SELECT lion_index_verify('pos_docs_d', true);
+
+-- and it goes on from there: inserts, deletes, VACUUM
+INSERT INTO pos_docs
+SELECT 9000 + g, to_tsvector('simple', 'everywhere dense new' || g) FROM generate_series(1, 300) g;
+DELETE FROM pos_docs WHERE id % 11 = 0;
+VACUUM pos_docs;
+SELECT * FROM pos_compare;
+SELECT lion_index_verify('pos_docs_d', true);
 
 DROP TABLE pos_docs CASCADE;
 DROP OPERATOR CLASS tsvector_pos_ops USING lion;
