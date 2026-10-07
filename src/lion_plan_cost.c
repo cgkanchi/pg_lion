@@ -3868,6 +3868,64 @@ lion_where_query_unknown(List *whereclauses, List *wherekinds,
 	return false;
 }
 
+/*
+ * Will the superset of a LOSSY multi-key clause be decided from stored
+ * positions rather than in the heap (lion_posfilter.c)?  When the index
+ * column's opclass stores them (support function 5) and the query names no
+ * key a position cursor cannot follow - lion_tsquery_item_keys(), as the
+ * executor asks it.  Only a literal is known now.
+ */
+static bool
+lion_multikey_posexact(IndexOptInfo *idx, AttrNumber col, Node *clause)
+{
+	OpExpr	   *op;
+	Node	   *arg;
+	Const	   *con;
+	Oid			opfamily;
+	Oid			lefttype;
+	Oid			proc;
+	int			strategy;
+	LionState	state;
+	Datum	   *itemkeys;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	bool		result;
+
+	if (clause == NULL || !IsA(clause, OpExpr) || col < 1 ||
+		col > idx->nkeycolumns || list_length(((OpExpr *) clause)->args) != 2)
+		return false;
+	op = (OpExpr *) clause;
+	arg = lion_strip((Node *) lsecond(op->args));
+	if (arg == NULL || !IsA(arg, Const) || ((Const *) arg)->constisnull)
+		return false;
+	con = (Const *) arg;
+
+	opfamily = idx->opfamily[col - 1];
+	lefttype = idx->opcintype[col - 1];
+	strategy = get_op_opfamily_strategy(op->opno, opfamily);
+	proc = get_opfamily_proc(opfamily, lefttype, lefttype,
+							 LION_EXTRACTQUERY_PROC);
+	if (strategy == 0 || !OidIsValid(proc) ||
+		!OidIsValid(get_opfamily_proc(opfamily, lefttype, lefttype,
+									  LION_POSITIONS_PROC)))
+		return false;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"roaring count position query",
+								ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+	memset(&state, 0, sizeof(state));
+	state.multikey = true;
+	state.collation = con->constcollid;
+	fmgr_info(proc, &state.extractquery);
+	result = lion_tsquery_item_keys(&state, con->constvalue,
+									(StrategyNumber) strategy, &itemkeys);
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
+
+	return result;
+}
+
 double
 lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
 {
@@ -3898,6 +3956,10 @@ lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
  * reads for itself (a filtered recheck keeps no visibility cache), and tested
  * at the clauses' own evaluation cost.  §10's recheck of the dirty pages is
  * still charged beside it by the caller; it is the smaller of the two.
+ *
+ * A superset decided from stored positions (lion_posfilter.c) reads no heap:
+ * each candidate costs an operator call per key of the query, the cursors'
+ * decoding, and nothing else is charged for it here.
  */
 Cost
 lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
@@ -3908,6 +3970,7 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	double		cand = Max(matched, 1.0);
 	int		   *orgrp = lion_or_group_map(ors, list_length(whereclauses));
 	Cost		perrow = cpu_tuple_cost;
+	Cost		poscost = 0.0;	/* per candidate, the position filters' */
 	bool		any = false;
 	double		pages;
 	int			ci = 0;
@@ -3932,6 +3995,13 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 									   &nkeys);
 		if (mode != LION_QMODE_LOSSY && mode != LION_QMODE_ALL)
 			continue;
+		if (mode == LION_QMODE_LOSSY &&
+			lion_multikey_posexact((IndexOptInfo *) lfirst(lc1),
+								   (AttrNumber) lfirst_int(lc4), clause))
+		{
+			poscost += nkeys * cpu_operator_cost;
+			continue;
+		}
 
 		any = true;
 		cost_qual_eval_node(&qual_cost, clause, root);
@@ -3942,11 +4012,11 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	}
 	pfree(orgrp);
 	if (!any)
-		return 0.0;
+		return Min(cand, Max(ceiling, 1.0)) * Max(counts, 1.0) * poscost;
 
 	cand = Min(cand, Max(ceiling, 1.0));
 	pages = Min(cand, heap_pages * Max(counts, 1.0));
 
 	return pages * lion_heap_page_cost(root, rel, pages, heap_pages) +
-		cand * perrow;
+		cand * (perrow + Max(counts, 1.0) * poscost);
 }

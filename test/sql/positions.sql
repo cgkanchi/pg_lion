@@ -234,6 +234,56 @@ SELECT pos_count_explain('common <-> again');
 SELECT pos_count_explain('common <-> ag:*');
 DROP FUNCTION pos_count_explain(tsquery);
 
+-- ... and per group: the walk that intersects a copy of the WHERE with every
+-- group's set filters the copy once a key (lion_count_groups.c), the
+-- distinct count and the join's per-key counts likewise
+CREATE TABLE pos_grouped (id int, cat int, d tsvector) WITH (autovacuum_enabled = off);
+INSERT INTO pos_grouped SELECT id, id % 7, d FROM pos_docs;
+CREATE INDEX pos_grouped_cd ON pos_grouped USING lion (cat, d tsvector_pos_ops);
+CREATE TABLE pos_dim (id int PRIMARY KEY, name text);
+INSERT INTO pos_dim SELECT g, 'n' || (g % 3) FROM generate_series(0, 6) g;
+VACUUM ANALYZE pos_grouped, pos_dim;
+EXPLAIN (COSTS OFF)
+SELECT cat, count(*) FROM pos_grouped WHERE d @@ 'everywhere <-> again' GROUP BY cat;
+EXPLAIN (COSTS OFF)
+SELECT count(DISTINCT cat) FROM pos_grouped WHERE d @@ 'common <-> again & !new5';
+EXPLAIN (COSTS OFF)
+SELECT pos_dim.name, count(*)
+FROM pos_grouped JOIN pos_dim ON pos_grouped.cat = pos_dim.id
+WHERE pos_grouped.d @@ 'w1:A | (common <-> again)' GROUP BY pos_dim.name;
+CREATE TEMP TABLE pos_pushed AS
+SELECT 'group' AS what, cat::text AS k, count(*) AS n
+FROM pos_grouped WHERE d @@ 'everywhere <-> again' GROUP BY cat
+UNION ALL
+SELECT 'distinct', NULL, count(DISTINCT cat)
+FROM pos_grouped WHERE d @@ 'common <-> again & !new5'
+UNION ALL
+SELECT 'join', pos_dim.name, count(*)
+FROM pos_grouped JOIN pos_dim ON pos_grouped.cat = pos_dim.id
+WHERE pos_grouped.d @@ 'w1:A | (common <-> again)' GROUP BY pos_dim.name;
+SET pg_lion.enable_count_pushdown = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SELECT what, count(*) AS rows,
+	   count(*) FILTER (WHERE n IS DISTINCT FROM heap_n) AS differ
+FROM (SELECT p.what, p.n,
+			 CASE p.what
+				 WHEN 'group' THEN (SELECT count(*) FROM pos_grouped
+									WHERE d @@ 'everywhere <-> again' AND cat::text = p.k)
+				 WHEN 'distinct' THEN (SELECT count(DISTINCT cat) FROM pos_grouped
+									   WHERE d @@ 'common <-> again & !new5')
+				 ELSE (SELECT count(*) FROM pos_grouped JOIN pos_dim
+					   ON pos_grouped.cat = pos_dim.id
+					   WHERE pos_grouped.d @@ 'w1:A | (common <-> again)'
+					   AND pos_dim.name = p.k)
+			 END AS heap_n
+	  FROM pos_pushed p) x
+GROUP BY what ORDER BY what;
+RESET pg_lion.enable_count_pushdown;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+DROP TABLE pos_grouped, pos_dim;
+
 DROP TABLE pos_docs CASCADE;
 DROP OPERATOR CLASS tsvector_pos_ops USING lion;
 DROP FUNCTION lion_debug_key_positions(regclass, text);

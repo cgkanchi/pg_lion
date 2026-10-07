@@ -4604,17 +4604,18 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     visibility map, while the container's pages are still pinned (R1, R2), so an all-visible
     page is counted without the heap.  EXPLAIN shows `Position Checks` and `Rows Removed by
     Positions`.  This is for a clause ANDed with the rest of the WHERE, where the heap row filter
-    used to apply; under an OR, in a GROUP BY or a join the planner still treats the query as
-    one it cannot push down.
+    used to apply, and so for GROUP BY, count(DISTINCT) and the FK-side join too: the walks that
+    intersect a copy of the WHERE with many sets at once filter the copy's container once a key.
+    The cost model charges such a clause an operator call per key and candidate instead of the
+    heap recheck (`lion_cost_recheck()`).  Under an OR the planner still declines the query.
   - Why reading positions at any moment of a scan is safe: a member's TID can change hands only
     after VACUUM has removed the old row's positions, and the new row is then inserted after the
     scan's snapshot was taken, so it is invisible to the scan and its page is not all-visible to
     it either.  A mix of two rows' positions can therefore only be applied to a TID the heap
     visit drops.
 
-Still to come: the filter under an OR, a GROUP BY and a join (an expression node rather than a
-filter on the result), `@@ ANY (array)`, the cost model, and then the opclass in the extension's
-SQL.
+Still to come: the filter under an OR (an expression node rather than a filter on the result),
+`@@ ANY (array)`, and then the opclass in the extension's SQL.
 
 ### Cardinality guard
 

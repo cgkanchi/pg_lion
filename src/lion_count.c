@@ -324,16 +324,7 @@ lion_count_container_masks(LionCountCtx *cx, const LionContainer *c,
 	 */
 	if (cx->filter != NULL && cx->filter->npos > 0)
 	{
-		int			i;
-
-		for (i = 0; i < cx->filter->npos; i++)
-		{
-			uint32		before = lion_container_cardinality(c);
-
-			c = lion_posfilter_apply(cx->filter->pos[i], c);
-			cx->stats.pos_checked += before;
-			cx->stats.pos_removed += before - lion_container_cardinality(c);
-		}
+		c = lion_count_posfilter(cx, c);
 		if (lion_container_cardinality(c) == 0)
 			return;
 		members &= lion_container_block_mask(c);
@@ -403,6 +394,51 @@ lion_count_container_masks(LionCountCtx *cx, const LionContainer *c,
 		}
 	}
 
+}
+
+/*
+ * c through the count's position filters (LionRowFilter.pos): what is left
+ * of it, in a container of the last filter's, valid until that filter is
+ * used again.  The walks that intersect a copy of the WHERE with many groups'
+ * sets at once (lion_count_groups.c, lion_count_decode.c) filter the copy's
+ * container here, once a key, and count the groups with
+ * lion_row_filter_nopos().
+ */
+const LionContainer *
+lion_count_posfilter(LionCountCtx *cx, const LionContainer *c)
+{
+	int			i;
+
+	for (i = 0; cx->filter != NULL && i < cx->filter->npos; i++)
+	{
+		uint32		before = lion_container_cardinality(c);
+
+		c = lion_posfilter_apply(cx->filter->pos[i], c);
+		cx->stats.pos_checked += before;
+		cx->stats.pos_removed += before - lion_container_cardinality(c);
+	}
+	return c;
+}
+
+/*
+ * filter without its position filters, for counts of containers that have
+ * been through them already: filter itself when it has none, NULL when the
+ * heap has nothing to test either.
+ */
+LionRowFilter *
+lion_row_filter_nopos(LionRowFilter *filter)
+{
+	LionRowFilter *copy;
+
+	if (filter == NULL || filter->npos == 0)
+		return filter;
+	if (filter->nheap == 0)
+		return NULL;
+	copy = (LionRowFilter *) palloc(sizeof(LionRowFilter));
+	*copy = *filter;
+	copy->npos = 0;
+	copy->pos = NULL;
+	return copy;
 }
 
 /*
