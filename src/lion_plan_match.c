@@ -281,7 +281,8 @@ lion_index_can_emit_value(IndexOptInfo *idx, AttrNumber col)
  * whose opfamily gives opno the strategy the planner decided on, and whose
  * extractQuery function is the very one the plan-time extraction used: the
  * plan was only made because that function called the query exact, and a
- * different function might not.
+ * different function might not.  An OR's leaf the posting sets only bound
+ * (`positions`) needs a column that stores positions, which decide it.
  *
  * Every partition is checked separately, because nothing stops one of them
  * from carrying a lion index built with a different opclass.
@@ -289,7 +290,7 @@ lion_index_can_emit_value(IndexOptInfo *idx, AttrNumber col)
 IndexOptInfo *
 lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 				Oid cmptype, StrategyNumber strategy, Oid extractquery,
-				Oid exprcoll, AttrNumber *colp)
+				Oid exprcoll, bool positions, AttrNumber *colp)
 {
 	bool		multikey = (kind == LION_CLAUSE_MULTI);
 	AttrNumber	col = 1;
@@ -318,6 +319,11 @@ lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 		if (get_opfamily_proc(idx->opfamily[i], idx->opcintype[i],
 							  idx->opcintype[i],
 							  LION_EXTRACTQUERY_PROC) != extractquery)
+			return NULL;
+		if (positions &&
+			!OidIsValid(get_opfamily_proc(idx->opfamily[i], idx->opcintype[i],
+										  idx->opcintype[i],
+										  LION_POSITIONS_PROC)))
 			return NULL;
 		if (colp != NULL)
 			*colp = col;
@@ -434,6 +440,39 @@ lion_op_roaring_strategy(Oid opno, Oid *opfamily, Oid *lefttype)
 		*opfamily = amop->amopfamily;
 		*lefttype = amop->amoplefttype;
 		break;
+	}
+	ReleaseSysCacheList(catlist);
+
+	return result;
+}
+
+/*
+ * Could a lion opfamily that has opno, extractquery as its extractQuery and
+ * stored positions decide the superset of `col opno con` exactly
+ * (lion_query_posexact())?  Any one: lion_match_index() then takes only an
+ * index of such a family.
+ */
+static bool
+lion_op_posexact(Oid opno, Oid extractquery, Const *con)
+{
+	Oid			amoid = lion_get_am_oid();
+	CatCList   *catlist;
+	bool		result = false;
+	int			i;
+
+	catlist = SearchSysCacheList1(AMOPOPID, ObjectIdGetDatum(opno));
+	for (i = 0; i < catlist->n_members && !result; i++)
+	{
+		Form_pg_amop amop =
+			(Form_pg_amop) GETSTRUCT(&catlist->members[i]->tuple);
+
+		if (amop->amopmethod != amoid || amop->amoppurpose != AMOP_SEARCH ||
+			get_opfamily_proc(amop->amopfamily, amop->amoplefttype,
+							  amop->amoplefttype,
+							  LION_EXTRACTQUERY_PROC) != extractquery)
+			continue;
+		result = lion_query_posexact(amop->amopfamily, amop->amoplefttype,
+									 opno, con->constvalue, con->constcollid);
 	}
 	ReleaseSysCacheList(catlist);
 
@@ -1057,13 +1096,26 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 					 * (below), where a recheck is allowed.  One no key
 					 * narrows stays with the ordinary plan.
 					 */
-					if (!allow_recheck ||
-						!OidIsValid(out->extractquery) ||
+					if (!OidIsValid(out->extractquery) ||
 						lion_multikey_query_mode(out->extractquery,
 												 out->strategy,
 												 (Const *) out->val,
 												 true) != LION_QMODE_LOSSY)
 						return false;
+
+					/*
+					 * Under an OR no recheck sees the leaf alone (below).
+					 * There it has to be one an index that stores positions
+					 * decides exactly (lion_posfilter.c, LION_KN_POSFILTER),
+					 * and lion_match_index() takes only such an index.
+					 */
+					if (!allow_recheck)
+					{
+						if (!lion_op_posexact(op->opno, out->extractquery,
+											  (Const *) out->val))
+							return false;
+						out->positions = true;
+					}
 				}
 			}
 			else
@@ -1283,6 +1335,7 @@ lion_append_clause(const LionLeafInfo *leaf, Node *clause, bool inor,
 	ci->extractquery = leaf->extractquery;
 	ci->collation = leaf->collation;
 	ci->inor = inor;
+	ci->positions = leaf->positions;
 	ci->rinfono = -1;			/* the caller's to say */
 
 	*whereattnos = lappend_int(*whereattnos, (int) leaf->var->varattno);
