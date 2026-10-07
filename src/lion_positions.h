@@ -156,6 +156,8 @@ lion_pos_varint_size(uint64 v)
 extern void lion_poschunk_init(LionContainer *c, uint32 block);
 extern void lion_poschunk_iter_init(LionPosIter *it, const LionContainer *c);
 extern bool lion_poschunk_iter_next(LionPosIter *it, LionPosMember *m);
+/* ... the member's code and npos only, its positions stepped over */
+extern bool lion_poschunk_iter_next_npos(LionPosIter *it, LionPosMember *m);
 extern bool lion_poschunk_find(const LionContainer *c, uint64 code, LionPosMember *m);
 extern bool lion_poschunk_last_code(const LionContainer *c, uint64 *code);
 
