@@ -1,4 +1,4 @@
--- Stored positions (DESIGN.md §17, "Stored positions"): the insert path.
+-- Stored positions (DESIGN.md §17, "Stored positions"): insert and VACUUM.
 --
 -- A column whose multi-key opclass has support function 5 stores, for every
 -- key, each row's word positions and weights: in the entry while it is
@@ -7,8 +7,8 @@
 -- test function that lists what the index stores for one key, and compares
 -- that with unnest() of the rows' tsvectors.
 --
--- Not covered yet, and refused or not done: CREATE INDEX over existing rows
--- (an error below), VACUUM (the table keeps autovacuum off).
+-- Not done yet: CREATE INDEX over existing rows (an error below).  The table
+-- keeps autovacuum off so that the VACUUMs below are the only ones.
 
 \set VERBOSITY terse
 SET client_min_messages = warning;
@@ -85,6 +85,28 @@ SELECT * FROM pos_compare;
 SELECT lion_index_verify('pos_docs_d');
 SELECT lion_index_verify('pos_docs_d', true);
 SELECT count(*) FROM pos_docs WHERE d @@ 'common & again';
+
+-- VACUUM takes the dead rows' positions out with their TIDs: inline ones in
+-- the entry's rewrite, spilled ones from the position tree after the posting
+-- set; what is left matches the rows exactly, dead versions and all gone
+DELETE FROM pos_docs WHERE id % 7 = 0;
+VACUUM pos_docs;
+SELECT * FROM pos_compare;
+SELECT count(*) AS dead_left
+FROM (SELECT DISTINCT unnest(tsvector_to_array(d)) AS lexeme FROM pos_docs) l,
+	 lion_debug_key_positions('pos_docs_d', l.lexeme) p
+WHERE p.tid NOT IN (SELECT ctid FROM pos_docs);
+SELECT lion_index_verify('pos_docs_d', true);
+
+-- a key whose rows all go takes its position tree with it, and the next
+-- rows of that key start a new one
+DELETE FROM pos_docs WHERE d @@ 'common';
+VACUUM pos_docs;
+SELECT count(*) FROM lion_debug_key_positions('pos_docs_d', 'common');
+INSERT INTO pos_docs
+SELECT g, to_tsvector('simple', 'common again ' || g || ' common') FROM generate_series(1, 600) g;
+SELECT * FROM pos_compare;
+SELECT lion_index_verify('pos_docs_d', true);
 
 -- the build does not write positions yet
 CREATE INDEX pos_docs_d2 ON pos_docs USING lion (d tsvector_pos_ops);
