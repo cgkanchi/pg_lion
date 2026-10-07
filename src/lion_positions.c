@@ -306,6 +306,34 @@ lion_poschunk_iter_next(LionPosIter *it, LionPosMember *m)
 }
 
 bool
+lion_poschunk_iter_next_npos(LionPosIter *it, LionPosMember *m)
+{
+	const uint8 *p = it->p;
+	uint64		npos;
+
+	if (it->left == 0)
+		return false;
+	/* skip_member() checks the member as decode_member() does, bar positions */
+	if (skip_member(&it->p, it->end, it->code, it->first, &m->code) != POS_OK)
+	{
+		it->left = 0;
+		return false;
+	}
+	/* npos is the second varint, already found sound by skip_member() */
+	{
+		uint64		delta;
+
+		(void) read_varint(&p, it->end, &delta);
+		(void) read_varint(&p, it->end, &npos);
+	}
+	m->npos = (uint16) npos;
+	it->code = m->code;
+	it->first = false;
+	it->left--;
+	return true;
+}
+
+bool
 lion_poschunk_find(const LionContainer *c, uint64 code, LionPosMember *m)
 {
 	LionPosIter it;

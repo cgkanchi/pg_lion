@@ -4641,6 +4641,36 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     support function 5 (`tsvector_ops`); the build records that on the meta page (`LION_META_POSITIONS`
     in `order_flags`), so `ALTER INDEX` changes nothing until a `REINDEX` (README.md).
 
+### Ranking: BM25 from the index (2026-10-07)
+
+`lion_bm25(index, query, k, k1, b)` (lion_bm25.c) ranks the rows of an index that stores positions
+by Okapi BM25, in Lucene's form: `idf = ln(1 + (N - df + 0.5) / (df + 0.5))` and
+`tf * (k1 + 1) / (tf + k1 * (1 - b + b * |d| / avgdl))` per query lexeme.
+
+- **tf** is the npos of the row's member under the lexeme, a stripped lexeme counting once; **df**
+  is the lexeme's members. Both come from the position trees, read with a counts-only cursor that
+  steps over the positions.
+- **|d|**, the row's length, is its lexeme occurrences. The extraction files every row that has a
+  lexeme under the EMPTY TEXT key as well, with one "position" holding the length in all 16 bits of
+  a WordEntryPos (capped at 65535). The empty key is free: `tsvector_in()` and `array_to_tsvector()`
+  refuse an empty lexeme and no tsquery can name one, and the extraction drops one that arrives
+  some other way. It is an ordinary VALUE entry, so insert, build, parallel build, VACUUM and
+  verify carry it with no change, and it costs one member per row (about 2 MB at 500k rows).
+- **N** and **avgdl** are the empty key's members and their mean. Reading them walks the whole key,
+  so a backend keeps them per index until the key's `ntids` moves by more than 1/64 or the index
+  is rebuilt.
+
+The query's lexemes are its operands not under a NOT, once each; a prefix is refused. Candidates
+stream out of a merge of the lexemes' member arrays in TID order, each scored as it comes, with the
+empty key's cursor moving forward beside them; a min-heap keeps the best `k + 16`. Those are sorted
+and fetched best first under the caller's snapshot, the TID following a HOT chain to the visible
+version, until `k` are visible; when dead rows leave fewer, every candidate is sorted and the walk
+continues. Dead rows count in N, df and avgdl until VACUUM removes them, as a search engine's
+deleted documents do until a merge.
+
+The work is linear in the members of the query's lexemes, not in `k`. No block-max skipping
+(WAND, MaxScore) yet: that needs per-chunk upper bounds, and the merge is where it would go.
+
 ### Cardinality guard
 
 Reloption `max_entries` (int, default 0 = unlimited, ShareUpdateExclusiveLock).  Exceeding it is a

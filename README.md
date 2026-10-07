@@ -510,6 +510,22 @@ row on top of a plain lion index, more than doubling it, so it is off by default
 
     CREATE INDEX ON doc USING lion (tsv) WITH (store_positions = true);
 
+Such an index also ranks. `lion_bm25(index, query, k [, k1, b])` returns the `k` rows with the
+highest BM25 score for the query's lexemes, best first, scored entirely from the index (term
+frequencies, document frequencies and each row's length, which the index keeps under its own key);
+the heap is read only to check that the rows returned are visible. Join on `ctid` for the rows:
+
+    SELECT d.*, s.score
+      FROM lion_bm25('doc_tsv_idx', to_tsquery('english', 'cat | dog'), 10) s
+      JOIN doc d ON d.ctid = s.ctid
+     ORDER BY s.score DESC;
+
+The score is Lucene's BM25 (`k1` 1.2 and `b` 0.75 by default) over the query's lexemes, each
+counted once; lexemes under a NOT do not score, and operators, phrases and weights do not change
+it, so add `WHERE d.tsv @@ query` to keep only rows that match the query as a whole. As in a search
+engine, the statistics count deleted rows until VACUUM removes them, and a backend keeps the row
+count and mean length it read until the row count moves by more than 1/64.
+
 Without positions, everything a plain AND/OR of key sets cannot express is rechecked in the heap. A
 NULL element and a tsquery phrase, weight or `a & !b` are answered from the rows of their keys (the
 other elements, the phrase's lexemes, `a`), then rechecked, in counts and scans alike. `<@`, `@> '{}'`, a bare `!a` and `foo:*` fall back to scanning

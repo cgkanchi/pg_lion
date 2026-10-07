@@ -212,6 +212,17 @@ compare(const LionContainer *c, const Ref *r, Size itemsz)
 		i++;
 	}
 	CHECK(same && i == r->n, "iteration matches the reference");
+	/* ... and so does the counts-only iteration, codes and npos */
+	same = true;
+	i = 0;
+	lion_poschunk_iter_init(&it, c);
+	while (lion_poschunk_iter_next_npos(&it, &m))
+	{
+		if (i >= r->n || m.code != r->m[i].code || m.npos != r->m[i].npos)
+			same = false;
+		i++;
+	}
+	CHECK(same && i == r->n, "counts-only iteration matches the reference");
 	if (r->n > 0)
 	{
 		CHECK(c->ckey <= lion_pos_block(r->m[0].code), "header block is a lower bound");
