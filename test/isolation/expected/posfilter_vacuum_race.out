@@ -1,0 +1,66 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s3_prep s2_predel s1_begin s1_snap s2_delete s1_count s3_vacuum s2_wakeup s1_commit s3_seq s3_count s3_verify s2_detach
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_prep: VACUUM pv_race;
+step s2_predel: DELETE FROM pv_race WHERE id > 3800;
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_snap: SELECT pv_race_pushed() AS pushed;
+pushed
+------
+t     
+(1 row)
+
+step s2_delete: DELETE FROM pv_race WHERE id % 4 = 1 AND id <= 2000;
+step s1_count: SELECT count(*) FROM pv_race WHERE d @@ 'alpha <-> beta'; <waiting ...>
+step s3_vacuum: VACUUM pv_race; <waiting ...>
+step s2_wakeup: 
+	SELECT pv_race_wait_for_vacuum() AS vacuum_waited_for_the_pin;
+	SELECT injection_points_wakeup('lion-count-containers-pinned');
+
+vacuum_waited_for_the_pin
+-------------------------
+t                        
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_count: <... completed>
+count
+-----
+  950
+(1 row)
+
+step s3_vacuum: <... completed>
+step s1_commit: COMMIT;
+step s3_seq: SELECT count(*) FROM pv_race WHERE d @@ 'alpha <-> beta';
+count
+-----
+  450
+(1 row)
+
+step s3_count: RESET enable_bitmapscan; RESET enable_indexscan; SET pg_lion.enable_count_pushdown = on; SELECT count(*) FROM pv_race WHERE d @@ 'alpha <-> beta';
+count
+-----
+  450
+(1 row)
+
+step s3_verify: SELECT lion_index_verify('pv_race_d', true);
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s2_detach: SELECT injection_points_detach('lion-count-containers-pinned');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+

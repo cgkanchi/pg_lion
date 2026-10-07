@@ -962,6 +962,9 @@ extern int lion_recheck_budget(void);
 extern void lion_count_container_masks(LionCountCtx *cx,
 									   const LionContainer *c, uint64 members,
 									   uint64 allvis);
+extern const LionContainer *lion_count_posfilter(LionCountCtx *cx,
+												 const LionContainer *c);
+extern LionRowFilter *lion_row_filter_nopos(LionRowFilter *filter);
 extern void lion_recheck_flush(LionCountCtx *cx);
 extern int64 lion_recheck_visible(LionCountCtx *cx, bool *vis);
 

@@ -4539,7 +4539,7 @@ counts need stored positions, which is a separate design.
 
 ### Stored positions: position trees (in progress, 2026-10-07)
 
-Not reachable from SQL yet: no operator class writes positions.  What exists is the storage layer.
+Not reachable from the extension's SQL yet: nothing reads positions, so no operator class in it writes them.
 
 - **Chunks** (`lion_positions.[ch]`, item type `LION_CT_POSITIONS`): a key's members - one per
   row, its heap TID code and its tsvector positions with weights - varint-encoded in ascending
@@ -4563,9 +4563,59 @@ Not reachable from SQL yet: no operator class writes positions.  What exists is 
   page splits, which `posting_tree.sql` cannot reach.  Replayed on a standby under
   `wal_consistency_checking = 'pg_lion'` with no difference.
 
-Still to come: the entry's pointer to its position tree, the operator class that writes positions
-on insert and build, VACUUM, verify, and the reader that checks phrases, weights and `a & !b`
-against stored positions.
+- **Entries** of a column whose opclass has support function 5 (`lion_tsvector_positions()`) carry
+  the flag `LION_ENTRY_POSITIONS` and an 8-byte extension after the key (`LionEntryPosExt`): an
+  INLINE entry keeps one chunk after its payload, at a MAXALIGNed offset, `pos_len` bytes long; a
+  CHAIN entry points at its position tree (`pos_root`).  Reserved entries never store positions.
+- **Insert** writes a row's positions before its TID (W1): in the INLINE entry's one record, or
+  into the position tree before the posting set.  An INLINE entry that outgrows itself spills
+  both, the new position root written in the spill's last record with the entry.
+- **VACUUM** takes a TID's positions out after the TID (V1), and asks the callback about every
+  member (V2).  INLINE: the chunk is filtered in the same rewrite as the payload.  CHAIN: after
+  the posting set's leaves, every leaf of the position tree is filtered under an EXCLUSIVE lock
+  (no reader's correctness rests on a position page), and every page of the tree is marked
+  visited.  An entry that empties is deleted in one record with its position root; the rest of
+  the tree is freed afterwards whatever it holds, and the sweep (and verify) take an unreferenced
+  position page whose root is gone for a leak.
+- **Verify** walks every position tree (chunks, order, levels) and, on a primary, checks that
+  every TID of the posting set has positions.
+- **Build**: the spool hands each key's positions to a sink (`lion_posbuild.c`) that sorts them by
+  (key in directory order, code); `lion_build.c` reads a key's positions as it writes the key's
+  entry, into the entry's chunk or into a position tree written bottom up through the bulk
+  writer.  Serial only for now: a parallel build's workers have no sink.  The sort is the cost -
+  a 300k-row build takes about 7x as long as one without positions - and appending positions to
+  the spool's per-key streams instead is the obvious next step.
+- **Tested** by `test/sql/positions.sql`, which creates the opclass from the library (it is not
+  in the extension's SQL yet) and compares what the index stores with `unnest()` of the rows after
+  inserts, an UPDATE, deletes with VACUUM, a key emptied and refilled, and a REINDEX.
+
+- **Queries** (`lion_posfilter.c`).  The posting sets give the candidates, as
+  `lion_extract_query_superset()` already did for a recheck, and PostgreSQL's own `TS_execute()`
+  decides each one from the stored positions: a cursor per lexeme the query names (those under a
+  NOT too) walks the key's members in TID order, skipping chunks by their headers, and the
+  callback is `checkclass_str()`'s over the candidate's member, stripped members included.  No
+  member under a lexeme is a row without it (P ⊇ C).  So phrases at any distance, weights,
+  `a & !b`, `a <-> !b` and ORs of them come out exactly what the heap's `@@` gives.  A query with
+  a prefix lexeme keeps the recheck: its keys cannot be named.
+  - A **bitmap scan** emits what the filter keeps with `recheck = false`, and a plain **index
+    scan** puts its source's containers through it (the scan's keys are ANDed, so filtering the
+    result by one of them is exact), under an MVCC snapshot.
+  - The **count pushdown** puts every container through the filter before it asks the
+    visibility map, while the container's pages are still pinned (R1, R2), so an all-visible
+    page is counted without the heap.  EXPLAIN shows `Position Checks` and `Rows Removed by
+    Positions`.  This is for a clause ANDed with the rest of the WHERE, where the heap row filter
+    used to apply, and so for GROUP BY, count(DISTINCT) and the FK-side join too: the walks that
+    intersect a copy of the WHERE with many sets at once filter the copy's container once a key.
+    The cost model charges such a clause an operator call per key and candidate instead of the
+    heap recheck (`lion_cost_recheck()`).  Under an OR the planner still declines the query.
+  - Why reading positions at any moment of a scan is safe: a member's TID can change hands only
+    after VACUUM has removed the old row's positions, and the new row is then inserted after the
+    scan's snapshot was taken, so it is invisible to the scan and its page is not all-visible to
+    it either.  A mix of two rows' positions can therefore only be applied to a TID the heap
+    visit drops.
+
+Still to come: the filter under an OR (an expression node rather than a filter on the result),
+and `@@ ANY (array)`.  The opclass is `tsvector_pos_ops` in the extension's SQL (README.md).
 
 ### Cardinality guard
 

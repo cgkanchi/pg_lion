@@ -602,6 +602,18 @@ lion_page_entry_fetch(Relation index, Page page, BlockNumber blkno,
 				 errmsg("lion index \"%s\": chain entry %u on block %u is %zu bytes, expected %zu",
 						RelationGetRelationName(index), off, blkno, len,
 						LionEntryPayloadOffset(entry))));
+	if ((entry->flags & LION_ENTRY_POSITIONS) != 0)
+	{
+		const LionEntryPosExt *x = lion_entry_posext(entry);
+
+		if (unlikely(((entry->flags & LION_ENTRY_CHAIN) != 0 && x->pos_len != 0) ||
+					 x->pos_len > len - LionEntryPayloadOffset(entry)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": entry %u on block %u claims %u bytes of positions in %zu bytes",
+							RelationGetRelationName(index), off, blkno,
+							x->pos_len, len - LionEntryPayloadOffset(entry))));
+	}
 
 	return entry;
 }
@@ -849,4 +861,28 @@ lion_item_zero_slack(LionContainer *item, Size size, Size alloc)
 	Assert(alloc >= size);
 	if (alloc > size)
 		memset((char *) item + size, 0, alloc - size);
+}
+
+bool
+lion_entry_inline_poschunk(Relation index, const LionEntryTuple *e,
+						   Size itemsz, BlockNumber blkno, OffsetNumber off,
+						   LionContainer *buf)
+{
+	Size		poslen = lion_entry_pos_len(e, itemsz);
+	char		err[256];
+
+	if (poslen == 0)
+		return false;
+	if (poslen > LION_CONTAINER_MAX_SIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": entry %u on block %u has %zu bytes of inline positions, more than a chunk",
+						RelationGetRelationName(index), off, blkno, poslen)));
+	memcpy(buf, (const char *) e + itemsz - poslen, poslen);
+	if (!lion_poschunk_check(buf, poslen, err, sizeof(err)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": the inline positions of entry %u on block %u are damaged: %s",
+						RelationGetRelationName(index), off, blkno, err)));
+	return true;
 }

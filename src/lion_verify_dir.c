@@ -857,6 +857,32 @@ lion_verify_classify(LionVerifyState *vs, BlockNumber blk)
 		UnlockReleaseBuffer(buf);
 		return LION_UNREF_LIVE;
 	}
+
+	/*
+	 * A page of a position tree (DESIGN.md §17) is leaked when its root is
+	 * gone: the root goes in its entry's own record and the rest of the tree
+	 * after it, so that is what a crash or a busy page in between leaves,
+	 * whatever the page holds (lion_vacuum_free_postree()).  A root is its
+	 * tree's identity and is live until then.
+	 */
+	if ((LionPageGetOpaque(page)->flags & LION_PAGE_POSITIONS) != 0)
+	{
+		BlockNumber root = LionPageGetOpaque(page)->owner_head;
+		Buffer		rbuf;
+		bool		live;
+
+		UnlockReleaseBuffer(buf);
+		if (root == blk)
+			return LION_UNREF_LIVE;
+		if (!BlockNumberIsValid(root) || root == LION_METAPAGE_BLKNO ||
+			root >= RelationGetNumberOfBlocks(vs->index))
+			return LION_UNREF_LEAK;
+		rbuf = ReadBuffer(vs->index, root);
+		LockBuffer(rbuf, BUFFER_LOCK_SHARE);
+		live = lion_page_owns_positions(BufferGetPage(rbuf), root);
+		UnlockReleaseBuffer(rbuf);
+		return live ? LION_UNREF_LIVE : LION_UNREF_LEAK;
+	}
 	if (PageGetMaxOffsetNumber(page) == 0)
 	{
 		UnlockReleaseBuffer(buf);

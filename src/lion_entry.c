@@ -211,6 +211,20 @@ lion_make_reserved_entry(AttrNumber attno, uint16 reservedflag, uint16 flags,
  * The caller owns the result and fills in flags, head, tail, ncontainers and
  * ntids as needed.
  */
+/*
+ * These two keep an entry's positions extension as it is, and so cannot
+ * carry an INLINE positions section over: an entry that has one is rebuilt
+ * by lion_entry_rebuild_pos(), which says what its positions become.
+ */
+static void
+lion_entry_rebuild_check(const LionEntryTuple *entry)
+{
+	const LionEntryPosExt *x = lion_entry_posext(entry);
+
+	if (x != NULL && x->pos_len != 0)
+		elog(ERROR, "lion index: an entry with inline positions cannot be rebuilt without them");
+}
+
 LionEntryTuple *
 lion_entry_rebuild(const LionEntryTuple *entry, const char *payload,
 				  Size payloadlen, Size *size)
@@ -218,6 +232,8 @@ lion_entry_rebuild(const LionEntryTuple *entry, const char *payload,
 	Size		payoff = LionEntryPayloadOffset(entry);
 	Size		total = payoff + payloadlen;
 	LionEntryTuple *copy;
+
+	lion_entry_rebuild_check(entry);
 
 	if (total > LION_MAX_ENTRY_SIZE)
 		ereport(ERROR,
@@ -255,6 +271,7 @@ lion_entry_rebuild_slack(const LionEntryTuple *entry, const char *payload,
 	Size		payoff = LionEntryPayloadOffset(entry);
 	LionEntryTuple *copy;
 
+	lion_entry_rebuild_check(entry);
 	Assert(allocsz >= payoff + payloadlen);
 
 	if (allocsz > LION_MAX_ENTRY_SIZE)
@@ -272,6 +289,70 @@ lion_entry_rebuild_slack(const LionEntryTuple *entry, const char *payload,
 	}
 
 	*size = allocsz;
+	return copy;
+}
+
+/*
+ * A private copy of an entry that stores positions (LION_ENTRY_POSITIONS),
+ * with a new payload AND a new positions section: header, key and extension
+ * from entry, then the payload in a payload area of payarea bytes (at least
+ * payloadlen; the rest is zeroed growth slack), then the poslen bytes of
+ * positions at the next MAXALIGN boundary - so that the chunk there can be
+ * read in place - with the extension's pos_len set to match.  A CHAIN shape
+ * has neither; its pos_root is the caller's to set.
+ */
+LionEntryTuple *
+lion_entry_rebuild_pos(const LionEntryTuple *entry, const char *payload,
+					   Size payloadlen, Size payarea, const char *positions,
+					   Size poslen, Size *size)
+{
+	Size		payoff = LionEntryPayloadOffset(entry);
+	Size		posoff = (poslen > 0) ? MAXALIGN(payoff + payarea) :
+		payoff + payarea;
+	Size		total = posoff + poslen;
+	LionEntryTuple *copy;
+
+	Assert((entry->flags & LION_ENTRY_POSITIONS) != 0);
+	Assert(payarea >= payloadlen);
+
+	if (total > LION_MAX_ENTRY_SIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("lion index entry of %zu bytes is too large for a directory leaf",
+						total)));
+
+	copy = (LionEntryTuple *) palloc0(total);
+	memcpy(copy, entry, payoff);
+	if (payloadlen > 0)
+		memcpy(((char *) copy) + payoff, payload, payloadlen);
+	if (poslen > 0)
+		memcpy(((char *) copy) + posoff, positions, poslen);
+	lion_entry_posext(copy)->pos_len = (uint32) poslen;
+
+	*size = total;
+	return copy;
+}
+
+/*
+ * shape - an entry built with no payload (lion_make_entry()) - as an entry
+ * that stores positions: the flag, and an extension with no tree and no
+ * inline positions.  Its size is its payload offset.
+ */
+LionEntryTuple *
+lion_entry_add_posext(const LionEntryTuple *shape, Size *size)
+{
+	Size		keyend = LionEntryExtOffset(shape);
+	LionEntryTuple *copy;
+	LionEntryPosExt *x;
+
+	Assert((shape->flags & LION_ENTRY_POSITIONS) == 0);
+	copy = (LionEntryTuple *) palloc0(keyend + LION_ENTRY_POSEXT_SIZE);
+	memcpy(copy, shape, keyend);
+	copy->flags |= LION_ENTRY_POSITIONS;
+	x = lion_entry_posext(copy);
+	x->pos_root = InvalidBlockNumber;
+	x->pos_len = 0;
+	*size = LionEntryPayloadOffset(copy);
 	return copy;
 }
 
