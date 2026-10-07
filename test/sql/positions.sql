@@ -11,6 +11,9 @@
 
 \set VERBOSITY terse
 SET client_min_messages = warning;
+-- a heap page becomes all-visible only once its rows' commits are flushed,
+-- and the dev cluster commits asynchronously (count.sql says more)
+SET synchronous_commit = on;
 
 CREATE EXTENSION IF NOT EXISTS pg_lion;
 
@@ -215,7 +218,7 @@ BEGIN
 	FOR l IN EXECUTE format('EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) '
 							'SELECT count(*) FROM pos_docs WHERE d @@ %L', q) LOOP
 		IF l ~ '(Custom Scan|Heap TIDs Rechecked|Position|Removed)' THEN
-			RETURN NEXT l;
+			RETURN NEXT regexp_replace(l, ' \(actual .*\)$', '');
 		END IF;
 	END LOOP;
 END $$;
