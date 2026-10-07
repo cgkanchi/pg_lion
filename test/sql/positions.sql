@@ -268,8 +268,9 @@ DECLARE
 BEGIN
 	SET LOCAL enable_seqscan = off;
 	SET LOCAL enable_bitmapscan = off;
-	FOR l IN EXECUTE format('EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) '
+	FOR l IN EXECUTE format('EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) '
 							'SELECT id FROM pos_docs WHERE d @@ ANY (%L)', arr) LOOP
+		CONTINUE WHEN l LIKE '%Index Searches:%';
 		RETURN NEXT regexp_replace(l, ' \(actual .*\)$', '');
 	END LOOP;
 END $$;
