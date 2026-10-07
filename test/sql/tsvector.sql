@@ -114,7 +114,8 @@ SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 					WHERE tsv @@ to_tsquery('english', 'w1 & w2')$$);
 SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 					WHERE tsv @@ to_tsquery('english', 'w1 | w2')$$);
--- NOT, prefix, phrase and weights are never pushed down
+-- NOT beside a lexeme, phrase and weights are counted from the superset of
+-- their lexemes' rows and rechecked; a prefix is never pushed down
 SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 					WHERE tsv @@ to_tsquery('english', 'alpha & !w1')$$);
 SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
@@ -317,7 +318,8 @@ EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc
 	WHERE tsv @@ 'rare500 & endword'::tsquery;
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc
 	WHERE tsv @@ 'rare500 | rare501'::tsquery;
--- ALL mode: a phrase, a prefix, a weight mask, a NOT
+-- a superset, rechecked: a phrase, a weight mask, a NOT beside a lexeme;
+-- ALL mode: a prefix
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc
 	WHERE tsv @@ 'common <-> w1'::tsquery;
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc WHERE tsv @@ 'rare50:*'::tsquery;
@@ -336,6 +338,23 @@ SELECT lion_tscmp($$SELECT count(*) FROM lion_tsc
 				   WHERE tsv @@ 'common <-> w1'::tsquery$$);
 SELECT lion_tscmp($$SELECT count(*) FROM lion_tsc
 				   WHERE tsv @@ 'rare500 & endword'::tsquery$$);
+-- the superset's rows, fetched by the bitmap scan and rechecked in the heap
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ 'common <-> w1'::tsquery$$);
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ 'w1 <-> common'::tsquery$$);
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ 'rare500 <2> w0'::tsquery$$);
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ 'rare500:A'::tsquery$$);
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ 'rare500 & !endword'::tsquery$$);
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ 'w3 & !(w3 <-> w3)'::tsquery$$);
+SELECT lion_tscmp($$SELECT count(*) FROM lion_tsc
+				   WHERE tsv @@ 'w3 <-> w3'::tsquery$$);
+SELECT lion_tscmp($$SELECT count(*) FROM lion_tsc
+				   WHERE tsv @@ 'w1 <-> w1 | rare7'::tsquery$$);
 DROP TABLE lion_tsc;
 
 -- ---- max_entries on a lexeme index -------------------------------------

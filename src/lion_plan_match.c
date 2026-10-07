@@ -1048,7 +1048,23 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 												 out->strategy,
 												 (Const *) out->val,
 												 &out->extractquery))
-					return false;
+				{
+					/*
+					 * One the sets can only bound - a phrase is its lexemes'
+					 * AND, a weight the lexeme at any weight - is counted
+					 * from that superset with every candidate rechecked in
+					 * the heap, exactly as a value known only at run time is
+					 * (below), where a recheck is allowed.  One no key
+					 * narrows stays with the ordinary plan.
+					 */
+					if (!allow_recheck ||
+						!OidIsValid(out->extractquery) ||
+						lion_multikey_query_mode(out->extractquery,
+												 out->strategy,
+												 (Const *) out->val,
+												 true) != LION_QMODE_LOSSY)
+						return false;
+				}
 			}
 			else
 			{

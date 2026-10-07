@@ -368,8 +368,8 @@ DROP TABLE lion_arr_odd;
 
 -- ---- costing the ALL-mode fallback (2026-09-21 follow-up review) -------
 /*
- * `<@`, `@> '{}'` and any query with a NULL element cannot be answered from
- * the stored element memberships: the extractor falls back to LION_QMODE_ALL,
+ * `<@` and `@> '{}'` cannot be answered from the stored element
+ * memberships: the extractor falls back to LION_QMODE_ALL,
  * the scan emits the union of every entry, and every candidate row is
  * fetched and rechecked in the heap (DESIGN.md §17).  The generic index
  * estimate used to price that with the PREDICATE's selectivity, which made a
@@ -396,7 +396,8 @@ EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc
 	WHERE tags @> ARRAY['u500', 't0'];
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc
 	WHERE tags && ARRAY['u500', 'u501'];
--- ALL mode: `<@`, the empty array, a NULL element
+-- ALL mode: `<@`, the empty array; a NULL element is the AND of the others,
+-- rechecked (it is then false everywhere, which the recheck finds)
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc
 	WHERE tags <@ ARRAY['u500', 't0', 't1'];
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc WHERE tags @> ARRAY[]::text[];

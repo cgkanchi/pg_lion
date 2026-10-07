@@ -4314,9 +4314,10 @@ bail.
   the roaring AM), not from an index, because the parent of a partitioned table has no index list
   (§16) and the clause kind has to be known before any index is matched.  `lion_match_index()` then
   re-checks the strategy against the index that will really answer the clause, per partition.
-- A LITERAL query is extracted AT PLAN TIME and the clause is only pushed down when the mode is
-  KEYS.  An ALL-mode query would have every row rechecked in the heap, which is what the ordinary
-  bitmap plan already does, better.  `lion_match_index()` additionally insists that each relation's
+- A LITERAL query is extracted AT PLAN TIME and the clause is pushed down when the mode is KEYS,
+  or, since 2026-10-07, when its superset is LOSSY ("Literal queries through the superset" below).
+  An ALL-mode query would have every row rechecked in the heap, which is what the ordinary bitmap
+  plan already does, better.  `lion_match_index()` additionally insists that each relation's
   index carries the very extractQuery function the plan-time extraction used, so the run-time
   extraction cannot come out differently.
 - **A multi-key clause used to require a Const**, even though §10 accepts a Param for equality and
@@ -4505,6 +4506,37 @@ widened; an exec Param under LATERAL; the cost model's choices; a partitioned ta
 number the column differently; the FK-side join's inner, semi, anti and count(DISTINCT) forms, and
 in parallel plans; and a dirty heap before and after VACUUM.
 
+### Literal queries through the superset (2026-10-07)
+
+Until now a LITERAL phrase, weight mask or `a & !b` was extracted exactly, came out ALL, and every
+consumer treated it as every row: the bitmap scan emitted the union of every entry with recheck, the
+cost model priced that walk and lost to a sequential scan, and the count declined the clause.  The
+superset above was used only for values known at run time, yet nothing in it depends on when the
+value is known.  Every consumer that can recheck now asks for the superset of a literal too:
+
+- the bitmap and plain scans (`lion_emit_query()`, `lion_scan_col_tree()` for a multicolumn
+  index's AND and for the plain-scan source) take a LOSSY superset as its KEYS tree and set the
+  scan's recheck flag, so core's Recheck Cond decides each candidate - which is GIN's own
+  answer to a phrase.  The paths that must be exact (`lion_scankey_sets()`, a scalar column)
+  still use the exact extraction;
+- the cost model (`lion_query_is_full_scan()`) calls only an ALL superset a full scan;
+- the count pushdown (`lion_analyze_leaf()`) accepts a literal whose superset is LOSSY wherever
+  it accepts a run-time value - that is, where the clause can take the row filter, so not under an
+  OR - and `lion_locate_multikey()` locates it exactly as a run-time LOSSY value: the superset's
+  tree is the source and the clause goes to the row filter.  A plan-time LOSSY literal that the
+  executor extracts as anything other than KEYS or LOSSY is an error: both extractions are pure
+  functions of the same Const and the same extractQuery, which `lion_match_index()` already insists
+  on.
+
+A prefix lexeme and a bare NOT are still ALL, and still go where they went.  The answer stays
+exact everywhere: the scans by core's recheck, the count by the row filter's.  What changes is
+the price, which is now the superset's size rather than the index's: a rare phrase (1,033 rows,
+1,273 rows with both lexemes) counted in 10 ms where it took 914 ms, against GIN's 9; a common one
+(401,520 rows) in 985 ms against GIN's 949 (PostgreSQL 16.15, 500,000 synthetic documents of a
+median 120 words, warm).  The count's gain over GIN is the heap-skipping kind only where the
+superset is narrow; on a wide superset both do the same detoast per candidate.  Exact phrase
+counts need stored positions, which is a separate design.
+
 ### Cardinality guard
 
 Reloption `max_entries` (int, default 0 = unlimited, ShareUpdateExclusiveLock).  Exceeding it is a
@@ -4520,8 +4552,8 @@ WARNING, once per backend per index (a static HTAB keyed by relation Oid), and n
 ### Not supported
 
 `<@` from the posting sets (a row matches when it has no key OUTSIDE the query array, which the index
-cannot tell); prefix, phrase and weighted tsqueries from the posting sets, except as the superset a
-query known only at run time is counted from (above); `col op ANY (...)` in the count pushdown (only
+cannot tell); prefix, phrase and weighted tsqueries from the posting sets, except as a superset
+rechecked in the heap (above); `col op ANY (...)` in the count pushdown (only
 in the bitmap scan); a query known only at run time under an OR (above);
 a multi-key index as the GROUP BY or sum-over-all driver;
 `lion_index_count(idx, key)` on a multi-key index (it needs a strategy-1 operator and errors out).

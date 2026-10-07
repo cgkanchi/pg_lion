@@ -115,7 +115,12 @@ lion_query_is_full_scan(IndexOptInfo *index, int col, StrategyNumber strategy,
 	fmgr_info(proc, &flinfo);
 	state.extractquery = flinfo;
 
-	lion_extract_query(&state, query, strategy, &q);
+	/*
+	 * The scan answers what the superset can bound and rechecks it
+	 * (lion_scan.c, lion_emit_query()), so only a query no key narrows -
+	 * `!a`, `@> '{}'`, `<@` - reads the whole index.
+	 */
+	lion_extract_query_superset(&state, query, strategy, &q);
 	full = (q.mode == LION_QMODE_ALL);
 
 	MemoryContextSwitchTo(oldcxt);
