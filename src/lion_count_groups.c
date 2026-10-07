@@ -119,6 +119,7 @@ lion_count_groups_copy(Relation heap, Snapshot snapshot, int ngroups,
 	int			nheap = 0;
 	LionContainer *img;
 	LionContainer *work;
+	LionRowFilter *gfilter;
 	LionContainer *buf = NULL;
 	int			batchmax;
 	int			idx = 0;
@@ -186,11 +187,19 @@ lion_count_groups_copy(Relation heap, Snapshot snapshot, int ngroups,
 	if (lion_mat_spills(mat))
 		buf = (LionContainer *) palloc(MAXALIGN(LION_CONTAINER_MAX_SIZE));
 
+	/*
+	 * The copy's containers go through the position filters once a key,
+	 * below, and so the groups' counts need only the heap's part of the row
+	 * filter.
+	 */
+	gfilter = lion_row_filter_nopos(base.filter);
+
 	for (g = 0; g < ngroups; g++)
 	{
 		LionPostingSet *ps = &groups[g];
 
 		gcx[g] = base;
+		gcx[g].filter = gfilter;
 		gcx[g].vmbuf = InvalidBuffer;
 		gcx[g].batchmax = batchmax;
 		gcx[g].keyset = ps;
@@ -252,7 +261,7 @@ lion_count_groups_copy(Relation heap, Snapshot snapshot, int ngroups,
 		 * against dense groups would otherwise test every member of every
 		 * group's container against an image of one or two.
 		 */
-		w = lion_mat_container(&base, mat, idx, buf);
+		w = lion_count_posfilter(&base, lion_mat_container(&base, mat, idx, buf));
 		if (w->type == LION_CT_BITSET)
 			wc = w;
 		else if (lion_container_cardinality(w) * (uint32) nhot <
