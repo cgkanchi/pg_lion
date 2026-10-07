@@ -4539,7 +4539,7 @@ counts need stored positions, which is a separate design.
 
 ### Stored positions: position trees (in progress, 2026-10-07)
 
-Not reachable from SQL yet: no operator class writes positions.  What exists is the storage layer.
+Not reachable from the extension's SQL yet: nothing reads positions, so no operator class in it writes them.
 
 - **Chunks** (`lion_positions.[ch]`, item type `LION_CT_POSITIONS`): a key's members - one per
   row, its heap TID code and its tsvector positions with weights - varint-encoded in ascending
@@ -4563,9 +4563,34 @@ Not reachable from SQL yet: no operator class writes positions.  What exists is 
   page splits, which `posting_tree.sql` cannot reach.  Replayed on a standby under
   `wal_consistency_checking = 'pg_lion'` with no difference.
 
-Still to come: the entry's pointer to its position tree, the operator class that writes positions
-on insert and build, VACUUM, verify, and the reader that checks phrases, weights and `a & !b`
-against stored positions.
+- **Entries** of a column whose opclass has support function 5 (`lion_tsvector_positions()`) carry
+  the flag `LION_ENTRY_POSITIONS` and an 8-byte extension after the key (`LionEntryPosExt`): an
+  INLINE entry keeps one chunk after its payload, at a MAXALIGNed offset, `pos_len` bytes long; a
+  CHAIN entry points at its position tree (`pos_root`).  Reserved entries never store positions.
+- **Insert** writes a row's positions before its TID (W1): in the INLINE entry's one record, or
+  into the position tree before the posting set.  An INLINE entry that outgrows itself spills
+  both, the new position root written in the spill's last record with the entry.
+- **VACUUM** takes a TID's positions out after the TID (V1), and asks the callback about every
+  member (V2).  INLINE: the chunk is filtered in the same rewrite as the payload.  CHAIN: after
+  the posting set's leaves, every leaf of the position tree is filtered under an EXCLUSIVE lock
+  (no reader's correctness rests on a position page), and every page of the tree is marked
+  visited.  An entry that empties is deleted in one record with its position root; the rest of
+  the tree is freed afterwards whatever it holds, and the sweep (and verify) take an unreferenced
+  position page whose root is gone for a leak.
+- **Verify** walks every position tree (chunks, order, levels) and, on a primary, checks that
+  every TID of the posting set has positions.
+- **Build**: the spool hands each key's positions to a sink (`lion_posbuild.c`) that sorts them by
+  (key in directory order, code); `lion_build.c` reads a key's positions as it writes the key's
+  entry, into the entry's chunk or into a position tree written bottom up through the bulk
+  writer.  Serial only for now: a parallel build's workers have no sink.  The sort is the cost -
+  a 300k-row build takes about 7x as long as one without positions - and appending positions to
+  the spool's per-key streams instead is the obvious next step.
+- **Tested** by `test/sql/positions.sql`, which creates the opclass from the library (it is not
+  in the extension's SQL yet) and compares what the index stores with `unnest()` of the rows after
+  inserts, an UPDATE, deletes with VACUUM, a key emptied and refilled, and a REINDEX.
+
+Still to come: the reader that checks phrases, weights and `a & !b` against stored positions, its
+planning and costing, and then the opclass in the extension's SQL.
 
 ### Cardinality guard
 
