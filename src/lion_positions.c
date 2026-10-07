@@ -409,20 +409,50 @@ lion_poschunk_append_need(const LionContainer *c, const LionPosMember *m)
 bool
 lion_poschunk_append(LionContainer *c, Size cap, const LionPosMember *m)
 {
-	uint64		last;
+	LionPosTail tail;
+
+	tail.valid = false;
+	return lion_poschunk_append_tail(c, cap, m, &tail);
+}
+
+/*
+ * The same, for a caller that appends to one chunk many times - the build
+ * fills chunk after chunk this way - and keeps where its last member ends in
+ * *tail, so that the chunk is not decoded again at every call: tail->valid
+ * false makes the first call find it.  A failed append leaves *tail as it
+ * was.
+ */
+bool
+lion_poschunk_append_tail(LionContainer *c, Size cap, const LionPosMember *m,
+						  LionPosTail *tail)
+{
 	uint64		prev;
-	const uint8 *end;
 	Size		need;
-	uint32		used;
-	uint32		n;
 
 	if (!member_valid(m))
 		return false;
-	if (pos_last(c, &last, &end, &n))
+	if (!tail->valid)
 	{
-		if (m->code <= last)
+		const uint8 *end;
+		uint32		n;
+		uint64		last;
+
+		tail->any = pos_last(c, &last, &end, &n);
+		tail->last = tail->any ? last : 0;
+		/*
+		 * Write after the last member the iterator could read: on a damaged
+		 * chunk that drops the bytes it could not, rather than burying the
+		 * new member behind them.
+		 */
+		tail->used = (uint32) (end - pos_members_const(c));
+		tail->n = n;
+		tail->valid = true;
+	}
+	if (tail->any)
+	{
+		if (m->code <= tail->last)
 			return false;
-		prev = last;
+		prev = tail->last;
 	}
 	else
 	{
@@ -431,18 +461,17 @@ lion_poschunk_append(LionContainer *c, Size cap, const LionPosMember *m)
 		prev = pos_base(c);
 	}
 
-	/*
-	 * Write after the last member the iterator could read: on a damaged
-	 * chunk that drops the bytes it could not, rather than burying the new
-	 * member behind them.
-	 */
-	used = (uint32) (end - pos_members_const(c));
 	need = lion_posmember_size(prev, m);
-	if (LION_POS_HDRSZ + used + need > cap || used + need > LION_POS_MAX_BYTES)
+	if (LION_POS_HDRSZ + tail->used + need > cap ||
+		tail->used + need > LION_POS_MAX_BYTES)
 		return false;
-	encode_member(pos_members(c) + used, prev, m);
-	pos_set_used(c, used + (uint32) need);
-	c->cardinality = (uint16) (n + 1);
+	encode_member(pos_members(c) + tail->used, prev, m);
+	tail->used += (uint32) need;
+	tail->n++;
+	tail->last = m->code;
+	tail->any = true;
+	pos_set_used(c, tail->used);
+	c->cardinality = (uint16) tail->n;
 	return true;
 }
 
