@@ -65,6 +65,7 @@
 #include "c.h"
 
 #include "lion_container.h"
+#include "lion_positions.h"
 
 /* Bytes one (ckey, lo) pair costs. */
 #define LION_SPARSE_PAIR_SIZE	(sizeof(uint32) + sizeof(uint16))	/* 6 */
@@ -136,14 +137,17 @@ lion_sparse_npairs(const LionContainer *s)
 }
 
 /*
- * Size of any item of a posting set, container or segment.  Everything that
- * derives an item's length from its header goes through this.
+ * Size of any item of a posting set, container or segment - or of a position
+ * chunk, the item of a position tree, which shares the page code.  Everything
+ * that derives an item's length from its header goes through this.
  */
 static inline Size
 lion_item_size(const LionContainer *item)
 {
 	if (item->type == LION_CT_SPARSE)
 		return lion_sparse_size(item);
+	if (item->type == LION_CT_POSITIONS)
+		return lion_poschunk_size(item);
 	return lion_container_size(item);
 }
 

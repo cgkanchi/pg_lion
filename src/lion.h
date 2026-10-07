@@ -166,6 +166,30 @@ lion_page_owns(Page page, BlockNumber head)
 }
 
 /*
+ * Is this page a live page of the tree - posting or position - whose root
+ * block is root?  The tree code (lion_posting.c) serves both kinds and asks
+ * this: a root block is a tree's identity for the whole life of the index
+ * (a head is never recycled as a head, lion_new_buffer()), so the owner
+ * stamp alone tells the trees apart, and a page of one can never pass for a
+ * page of the other.  The kind of a page is in its LION_PAGE_POSITIONS bit,
+ * which every page of a tree shares with its root.
+ */
+static inline bool
+lion_page_owns_tree(Page page, BlockNumber root)
+{
+	LionPageOpaque opaque;
+
+	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE)
+		return false;
+	opaque = LionPageGetOpaque(page);
+
+	return opaque->page_id == LION_PAGE_ID &&
+		(opaque->flags & (LION_PAGE_CONTAINER | LION_PAGE_DELETED)) ==
+		LION_PAGE_CONTAINER &&
+		opaque->owner_head == root;
+}
+
+/*
  * Is this page a live page of the position tree whose root block is root?
  * Position pages are container pages with LION_PAGE_POSITIONS set, stamped
  * with their own tree's root rather than the posting set's head, so that
@@ -2008,6 +2032,34 @@ extern void lion_chain_put_container_locked_ext(Relation index, Relation heaprel
 											   Buffer entrybuf, OffsetNumber entryoff,
 											   LionEntryTuple *entry, LionContainer *c,
 											   int *ncontainers_delta, bool slack);
+
+/*
+ * The tree a leaf write goes to: a key's posting tree, whose entry travels in
+ * every record that changes it, or one of its position trees (DESIGN.md §17),
+ * which has no entry to keep in step.  root is the owner stamp of every page
+ * of the tree, kind the page kind its pages carry (0 or LION_PAGE_POSITIONS).
+ * entry is NULL exactly when kind is LION_PAGE_POSITIONS.
+ */
+typedef struct LionTreeRef
+{
+	uint32		hash;
+	BlockNumber root;
+	uint16		kind;
+	Buffer		entrybuf;
+	OffsetNumber entryoff;
+	LionEntryTuple *entry;
+} LionTreeRef;
+
+/*
+ * lion_chain_put_items_locked_ext() for either kind of tree.  For a position
+ * tree the items are position chunks, ordered by header ckey (which, unlike
+ * the posting tree's, may repeat), and buf is a leaf of that tree.
+ */
+extern void lion_tree_put_items_locked(Relation index, Relation heaprel,
+									   Buffer buf, const LionTreeRef *tree,
+									   OffsetNumber off, bool replace,
+									   LionContainer **items, int nitems,
+									   bool slack);
 
 /*
  * The number of DIRECTORY PAGES the current backend has read: the counter
