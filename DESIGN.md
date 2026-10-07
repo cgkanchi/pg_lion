@@ -4314,9 +4314,10 @@ bail.
   the roaring AM), not from an index, because the parent of a partitioned table has no index list
   (§16) and the clause kind has to be known before any index is matched.  `lion_match_index()` then
   re-checks the strategy against the index that will really answer the clause, per partition.
-- A LITERAL query is extracted AT PLAN TIME and the clause is only pushed down when the mode is
-  KEYS.  An ALL-mode query would have every row rechecked in the heap, which is what the ordinary
-  bitmap plan already does, better.  `lion_match_index()` additionally insists that each relation's
+- A LITERAL query is extracted AT PLAN TIME and the clause is pushed down when the mode is KEYS,
+  or, since 2026-10-07, when its superset is LOSSY ("Literal queries through the superset" below).
+  An ALL-mode query would have every row rechecked in the heap, which is what the ordinary bitmap
+  plan already does, better.  `lion_match_index()` additionally insists that each relation's
   index carries the very extractQuery function the plan-time extraction used, so the run-time
   extraction cannot come out differently.
 - **A multi-key clause used to require a Const**, even though §10 accepts a Param for equality and
@@ -4505,6 +4506,37 @@ widened; an exec Param under LATERAL; the cost model's choices; a partitioned ta
 number the column differently; the FK-side join's inner, semi, anti and count(DISTINCT) forms, and
 in parallel plans; and a dirty heap before and after VACUUM.
 
+### Literal queries through the superset (2026-10-07)
+
+Until now a LITERAL phrase, weight mask or `a & !b` was extracted exactly, came out ALL, and every
+consumer treated it as every row: the bitmap scan emitted the union of every entry with recheck, the
+cost model priced that walk and lost to a sequential scan, and the count declined the clause.  The
+superset above was used only for values known at run time, yet nothing in it depends on when the
+value is known.  Every consumer that can recheck now asks for the superset of a literal too:
+
+- the bitmap and plain scans (`lion_emit_query()`, `lion_scan_col_tree()` for a multicolumn
+  index's AND and for the plain-scan source) take a LOSSY superset as its KEYS tree and set the
+  scan's recheck flag, so core's Recheck Cond decides each candidate - which is GIN's own
+  answer to a phrase.  The paths that must be exact (`lion_scankey_sets()`, a scalar column)
+  still use the exact extraction;
+- the cost model (`lion_query_is_full_scan()`) calls only an ALL superset a full scan;
+- the count pushdown (`lion_analyze_leaf()`) accepts a literal whose superset is LOSSY wherever
+  it accepts a run-time value - that is, where the clause can take the row filter, so not under an
+  OR - and `lion_locate_multikey()` locates it exactly as a run-time LOSSY value: the superset's
+  tree is the source and the clause goes to the row filter.  A plan-time LOSSY literal that the
+  executor extracts as anything other than KEYS or LOSSY is an error: both extractions are pure
+  functions of the same Const and the same extractQuery, which `lion_match_index()` already insists
+  on.
+
+A prefix lexeme and a bare NOT are still ALL, and still go where they went.  The answer stays
+exact everywhere: the scans by core's recheck, the count by the row filter's.  What changes is
+the price, which is now the superset's size rather than the index's: a rare phrase (1,033 rows,
+1,273 rows with both lexemes) counted in 10 ms where it took 914 ms, against GIN's 9; a common one
+(401,520 rows) in 985 ms against GIN's 949 (PostgreSQL 16.15, 500,000 synthetic documents of a
+median 120 words, warm).  The count's gain over GIN is the heap-skipping kind only where the
+superset is narrow; on a wide superset both do the same detoast per candidate.  Exact phrase
+counts need stored positions, which is a separate design.
+
 ### Cardinality guard
 
 Reloption `max_entries` (int, default 0 = unlimited, ShareUpdateExclusiveLock).  Exceeding it is a
@@ -4520,8 +4552,8 @@ WARNING, once per backend per index (a static HTAB keyed by relation Oid), and n
 ### Not supported
 
 `<@` from the posting sets (a row matches when it has no key OUTSIDE the query array, which the index
-cannot tell); prefix, phrase and weighted tsqueries from the posting sets, except as the superset a
-query known only at run time is counted from (above); `col op ANY (...)` in the count pushdown (only
+cannot tell); prefix, phrase and weighted tsqueries from the posting sets, except as a superset
+rechecked in the heap (above); `col op ANY (...)` in the count pushdown (only
 in the bitmap scan); a query known only at run time under an OR (above);
 a multi-key index as the GROUP BY or sum-over-all driver;
 `lion_index_count(idx, key)` on a multi-key index (it needs a strategy-1 operator and errors out).
@@ -12820,18 +12852,14 @@ AND for its own estimates.
   how often the AND's later sources are sought ("Wide filters", below). Whatever else a
   conjunction holds - a range, a clause without a constant - is taken as independent of them, as
   core takes it.
-- **What it leaves.** `rel->rows`, and every other path's estimate, stay core's. Core sizes the
-  relation (`set_baserel_size_estimates()`) before it builds any of its paths; a row count
-  rewritten from `set_rel_pathlist_hook` would leave the paths built before it priced for another
-  relation than the ones built after, and core has no hook between the two, nor one for a
-  conjunction's selectivity. A future hook would have to run once the relation's restriction
-  clauses are attached and before its first path is built, and be allowed to read an index there.
-  Core's own answer to correlated columns applies to every path: `CREATE STATISTICS ...
-  (dependencies, mcv)` on them corrects core's estimate, and the probe then agrees with it and
-  changes nothing. *(Until 2026-09-28 the probe did not correct the merge's guess of how often the
-  later sources are sought either - `lion_merge_cpu_cost()`'s `1 - exp(-lambda)`, §22's open item -
-  which took the sets as independent; it does now, for an ungrouped count and a scan, "Wide
-  filters", below. A grouped count's merges still take them as independent.)*
+- **What it leaves.** Every other path's estimate stays core's. `rel->rows` did too until
+  2026-10-07, and is now corrected ("The relation's rows", below). Core's own answer to correlated
+  columns applies to every path: `CREATE STATISTICS ... (dependencies, mcv)` on them corrects core's
+  estimate, and the probe then agrees with it and changes nothing. *(Until 2026-09-28 the probe did
+  not correct the merge's guess of how often the later sources are sought either -
+  `lion_merge_cpu_cost()`'s `1 - exp(-lambda)`, §22's open item - which took the sets as
+  independent; it does now, for an ungrouped count and a scan, "Wide filters", below. A grouped
+  count's merges still take them as independent.)*
 - **Visibility.** The TIDs are counted whatever their visibility: the probe reads no heap page and
   holds no lock or pin from one container to the next (the sets are located and their pins let go
   of before the first container is read, and the streams copy each posting leaf and release it,
@@ -12874,6 +12902,35 @@ going to `LionCount` only with the probe. Without it the lion scan that leaves t
 heap filter and ANDs the other four sets is priced for two rows, a third of the ungrouped count
 and a ninth of the grouped one; with it, at fourteen and four times theirs. The ungrouped count ran
 in 0.2 ms against that scan's 1.2 to 1.7.
+
+**The relation's rows** (2026-10-07, `lion_correct_rel_rows()` in lion_selfuncs.c;
+`pg_lion.enable_rows_correction`, bool, default on, `PGC_USERSET`). Correcting lion's own estimates
+left the joins above the relation sized from core's product: on a private benchmark, a join of a
+dimension filtered by correlated columns was estimated at a small fraction of the rows the filters
+left, and the nested loops chosen for that ran far past the alternatives.
+Core sizes a relation (`set_baserel_size_estimates()`) before it builds any of its paths and has no
+hook between the two, so the correction is made in `set_rel_pathlist_hook`, first in lion's chain,
+once the paths are built - and it is made to the paths too:
+
+- `rel->rows` becomes `lion_probe_rel_rows()` - core's estimate of the restriction clauses with the
+  probed AND in place of core's product - where the probe found that AND `LION_ISECT_ERROR` times
+  off (`lion_isect_rel_factor()` other than 1); elsewhere nothing changes.
+- Every path already built takes the same ratio on its rows. An unparameterized scan's rows are
+  `rel->rows` (a partial path's divided among its workers) and its cost does not depend on them -
+  a sequential scan's on the tuples it reads, an index or bitmap scan's on its own clauses'
+  selectivity - so the paths built before the hook and after it, the Gathers and the joins, all see
+  one relation. A parameterized path's rows, and its `ParamPathInfo`'s, are the same restriction
+  clauses with its join clauses ANDed in, taken as independent of them, and take the same ratio; a
+  `ParamPathInfo` first made after the hook (a reparameterization) has core's.
+- `lion_probe_rel_rows()` then reads `rel->rows` as it is, rather than applying the factor twice;
+  inside a probe scope it recomputes from the clauses, and applies it, as before.
+- A plain relation of its own only: an inheritance parent's rows are its children's sum, added up
+  before any child's paths are built, which a child's correction would not reach.
+
+`test/sql/rowscorrect.sql` pins it: three filters derived from one hidden group, whose product is
+about 20 rows for 1,000, are estimated within a factor of two at the scan and at a join and semi
+join of 3,000 rows above it, and fifty times short without the correction; an independent pair is
+left exactly as it was, and with the probe off nothing changes.
 
 **An OR of equalities is its IN list** (2026-09-28, `lion_or_as_array()`, `lion_canonical_clause()`).
 A benchmark wrote one wide filter two ways, each multi-value column as `a = x OR a = y` and as `a IN

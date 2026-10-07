@@ -1120,7 +1120,20 @@ lion_emit_query(Relation index, LionState *col, StrategyNumber strategy,
 								ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(cxt);
 
-	lion_extract_query(col, query, strategy, &q);
+	/*
+	 * The superset: a query the sets answer exactly comes out as
+	 * lion_extract_query() would give it, and one they can only bound - a
+	 * phrase, a weight - as the tree over the keys that bound it, emitted
+	 * with recheck so that the bitmap heap scan re-applies the operator
+	 * (DESIGN.md §17, "Literal queries through the superset").  Only a query
+	 * no key narrows is every indexed row.
+	 */
+	lion_extract_query_superset(col, query, strategy, &q);
+	if (q.mode == LION_QMODE_LOSSY)
+	{
+		q.mode = LION_QMODE_KEYS;
+		recheck = true;
+	}
 
 	if (q.mode != LION_QMODE_KEYS)
 	{
@@ -1320,12 +1333,15 @@ lion_scan_shift(LionKeyNode *node, int base)
  */
 static LionKeyNode *
 lion_scan_col_tree(Relation index, LionState *col,
-				  ScanKey skey, LionScanSets *acc, bool *ok, bool *nomatch)
+				  ScanKey skey, LionScanSets *acc, bool *ok, bool *nomatch,
+				  bool *lossy)
 {
 	AttrNumber	attno = (AttrNumber) col->attno;
 
 	*ok = true;
 	*nomatch = false;
+	if (lossy != NULL)
+		*lossy = false;
 
 	/* The null tests carry no strategy number and must be tested first. */
 	if ((skey->sk_flags & SK_SEARCHNULL) != 0)
@@ -1389,11 +1405,25 @@ lion_scan_col_tree(Relation index, LionState *col,
 			if (qnulls != NULL && qnulls[i])
 				continue;		/* a strict operator with a NULL is not true */
 
-			lion_extract_query(col, queries[i], skey->sk_strategy, &q);
+			/*
+			 * A caller that rechecks takes the SUPERSET the posting sets can
+			 * give of a query they cannot answer exactly - a phrase is its
+			 * lexemes' AND, a weight the lexeme at any weight (DESIGN.md
+			 * §17, "Literal queries through the superset") - and sets
+			 * *lossy so that the heap re-applies the operator.  Every other
+			 * caller wants the rows exactly or not at all.
+			 */
+			if (lossy != NULL)
+				lion_extract_query_superset(col, queries[i],
+											skey->sk_strategy, &q);
+			else
+				lion_extract_query(col, queries[i], skey->sk_strategy, &q);
 
 			if (q.mode == LION_QMODE_NONE)
 				continue;		/* this element selects nothing */
-			if (q.mode != LION_QMODE_KEYS)
+			if (q.mode == LION_QMODE_LOSSY)
+				*lossy = true;
+			else if (q.mode != LION_QMODE_KEYS)
 			{
 				*ok = false;	/* needs every indexed row */
 				return NULL;
@@ -1508,7 +1538,7 @@ lion_scankey_sets(Relation index, ScanKey skey, int *nsets,
 	acc.nsets = 0;
 	acc.sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) * acc.maxsets);
 
-	node = lion_scan_col_tree(index, col, skey, &acc, &ok, nomatch);
+	node = lion_scan_col_tree(index, col, skey, &acc, &ok, nomatch, NULL);
 
 	*nsets = acc.nsets;
 	*sets = acc.sets;
@@ -1553,8 +1583,10 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 		LionKeyNode *node;
 		bool		ok;
 		bool		nomatch;
+		bool		lossy;
 
-		node = lion_scan_col_tree(so->index, col, keys[i], &acc, &ok, &nomatch);
+		node = lion_scan_col_tree(so->index, col, keys[i], &acc, &ok, &nomatch,
+								  &lossy);
 
 		if (nomatch)
 		{
@@ -1570,6 +1602,8 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 			so->recheck = true;	/* the heap scan re-applies this qual */
 			continue;
 		}
+		if (lossy)
+			so->recheck = true; /* a superset: the heap re-applies it */
 		args[nargs++] = node;
 	}
 
@@ -1997,16 +2031,21 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 		LionKeyNode *node;
 		bool		ok;
 		bool		none;
+		bool		lossy;
 
 		node = lion_scan_col_tree(so->index,
 								  lion_column(so->ix, keys[i]->sk_attno),
-								  keys[i], &acc, &ok, &none);
+								  keys[i], &acc, &ok, &none, &lossy);
 		if (none)
 			nomatch = true;
 		else if (!ok || node == NULL)
 			so->recheck = true; /* the heap scan re-applies this qual */
 		else
+		{
+			if (lossy)
+				so->recheck = true; /* a superset: the heap re-applies it */
 			args[nargs++] = node;
+		}
 	}
 
 	if (!nomatch && nargs == 0 && nrange == 1)
@@ -3084,6 +3123,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 			LionKeyNode *node;
 			bool		ok;
 			bool		none;
+			bool		lossy;
 
 			if (col->multikey)
 			{
@@ -3092,7 +3132,8 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 				 * whole key sets selects, and exact here as it is for the
 				 * bitmap path (§29.6); one in mode ALL is every row, rechecked.
 				 */
-				node = lion_scan_col_tree(so->index, col, skey, &acc, &ok, &none);
+				node = lion_scan_col_tree(so->index, col, skey, &acc, &ok, &none,
+										  &lossy);
 				if (none)
 					nomatch = true;
 				else if (!ok)
@@ -3103,7 +3144,11 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 						unioncol = skey->sk_attno - 1;
 				}
 				else
+				{
+					if (lossy)
+						src->recheck = true;	/* a superset, rechecked */
 					args[nargs++] = node;
+				}
 				continue;
 			}
 
@@ -3122,7 +3167,8 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 					 RelationGetRelationName(so->index),
 					 (int) skey->sk_strategy);
 
-			node = lion_scan_col_tree(so->index, col, skey, &acc, &ok, &none);
+			node = lion_scan_col_tree(so->index, col, skey, &acc, &ok, &none,
+									  NULL);
 			if (none)
 				nomatch = true;
 			else
