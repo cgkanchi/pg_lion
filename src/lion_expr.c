@@ -424,7 +424,8 @@ lion_plan_node(LionNodePlan *p, const LionKeyNode *node,
 		return;
 	}
 
-	Assert(node->kind == LION_KN_AND);
+	/* a filter's child stands at the key its result was built from, too */
+	Assert(node->kind == LION_KN_AND || node->kind == LION_KN_POSFILTER);
 	p->mem = summem;
 	/* every child stands at the key the result was built from: any one */
 	p->pinned = anypinned;
@@ -964,6 +965,31 @@ lion_ecursor_init_ex(LionExprCursor *c, const LionNodePlan *plan,
 	{
 		Assert(node->kind == LION_KN_OR);
 		lion_wide_init(c, sets, nsets, cx);
+	}
+	else if (node->kind == LION_KN_POSFILTER)
+	{
+		const LionPosSpec *spec = node->pos;
+
+		/*
+		 * The child is built eagerly, raw: every container it stands on is
+		 * filtered as it gets there, while its pages are still pinned
+		 * (lion_ecursor_build()), and this node is never pending.  A filter
+		 * of its own, whose container is the one the node stands on, so that
+		 * two cursors over one tree - a count per group, a window of a wide
+		 * union - never share a filter's place.
+		 */
+		Assert(node->nargs == 1 && plan->nsub == 1 && spec != NULL);
+		c->nsub = 1;
+		c->sub = (LionExprCursor *) palloc0(sizeof(LionExprCursor));
+		lion_ecursor_init_ex(&c->sub[0], &plan->sub[0], sets, nsets, cx,
+							 droppins ||
+							 (plan->keep != LION_KEEP_ALL && plan->keep != 0),
+							 true, false);
+		c->pf = lion_posfilter_begin(spec->index, spec->col, spec->query,
+									 spec->strategy);
+		if (c->pf == NULL)
+			elog(ERROR, "roaring count: query for index \"%s\" can no longer be decided from positions",
+				 RelationGetRelationName(spec->index));
 	}
 	else
 	{
@@ -1787,6 +1813,38 @@ lion_ecursor_build(LionExprCursor *c)
 		return;
 	}
 
+	if (c->kind == LION_KN_POSFILTER)
+	{
+		LionExprCursor *sub = &c->sub[0];
+
+		/*
+		 * The child's next container that keeps a member through the filter.
+		 * The positions are read while the child stands at the key, so its
+		 * pages are pinned as they are for any other container (DESIGN.md
+		 * §9); the ones it passes over had nothing counted from them.
+		 */
+		while (sub->valid)
+		{
+			const LionContainer *in = lion_ecursor_container(sub);
+
+			if (lion_container_cardinality(in) > 0)
+			{
+				const LionContainer *out = lion_posfilter_apply(c->pf, in);
+
+				if (lion_container_cardinality(out) > 0)
+				{
+					c->cur = out;
+					c->ckey = in->ckey;
+					c->valid = true;
+					return;
+				}
+			}
+			lion_ecursor_next(sub);
+			CHECK_FOR_INTERRUPTS();
+		}
+		return;
+	}
+
 	Assert(c->kind == LION_KN_AND);
 
 	/*
@@ -1887,6 +1945,10 @@ lion_ecursor_next(LionExprCursor *c)
 			 */
 			lion_ecursor_next(&c->sub[c->order[0]]);
 			break;
+
+		case LION_KN_POSFILTER:
+			lion_ecursor_next(&c->sub[0]);
+			break;
 	}
 
 	lion_ecursor_build(c);
@@ -1959,6 +2021,10 @@ lion_ecursor_seek(LionExprCursor *c, uint32 target)
 			 */
 			lion_ecursor_seek(&c->sub[c->order[0]], target);
 			break;
+
+		case LION_KN_POSFILTER:
+			lion_ecursor_seek(&c->sub[0], target);
+			break;
 	}
 
 	lion_ecursor_build(c);
@@ -1984,6 +2050,18 @@ lion_ecursor_close(LionExprCursor *c)
 	{
 		for (i = 0; i < c->nsub; i++)
 			lion_ecursor_close(&c->sub[i]);
+	}
+
+	if (c->pf != NULL)
+	{
+		int64		nchecked;
+		int64		nremoved;
+
+		lion_posfilter_counts(c->pf, &nchecked, &nremoved);
+		c->cx->stats.pos_checked += nchecked;
+		c->cx->stats.pos_removed += nremoved;
+		lion_posfilter_end(c->pf);
+		c->pf = NULL;
 	}
 
 	c->nheap = 0;
@@ -2050,6 +2128,7 @@ lion_source_satisfiable(const LionKeyNode *node, const LionPostingSet *sets)
 			return sets[node->keyno].found;
 
 		case LION_KN_AND:
+		case LION_KN_POSFILTER:
 			for (i = 0; i < node->nargs; i++)
 			{
 				if (!lion_source_satisfiable(node->args[i], sets))

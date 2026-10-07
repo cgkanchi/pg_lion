@@ -4607,15 +4607,24 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     used to apply, and so for GROUP BY, count(DISTINCT) and the FK-side join too: the walks that
     intersect a copy of the WHERE with many sets at once filter the copy's container once a key.
     The cost model charges such a clause an operator call per key and candidate instead of the
-    heap recheck (`lion_cost_recheck()`).  Under an OR the planner still declines the query.
+    heap recheck (`lion_cost_recheck()`).
+  - **Under an OR** no recheck sees a leaf alone: the row passes when any arm holds, and the
+    other arms are answered from posting sets.  A leaf the sets only bound is taken there when it
+    is a literal an index that stores positions can follow (`lion_query_posexact()`;
+    `lion_match_index()` then takes only such an index), and its tree is wrapped in a
+    `LION_KN_POSFILTER` node: one child, the superset, whose every container the node's cursor
+    puts through a filter of its own as it gets there, skipping the containers it empties.  The
+    child is built eagerly and the node is never pending, so a leapfrog, a union or a probe above
+    it sees an ordinary built container; the child stands at the key while its positions are
+    read, so its pins carry §9 as any node's do, and a wide union opens the node a window at a
+    time like any child.  Its cost is the filter's, per candidate, as above.
   - Why reading positions at any moment of a scan is safe: a member's TID can change hands only
     after VACUUM has removed the old row's positions, and the new row is then inserted after the
     scan's snapshot was taken, so it is invisible to the scan and its page is not all-visible to
     it either.  A mix of two rows' positions can therefore only be applied to a TID the heap
     visit drops.
 
-Still to come: the filter under an OR (an expression node rather than a filter on the result),
-and `@@ ANY (array)`.  The opclass is `tsvector_pos_ops` in the extension's SQL (README.md).
+Still to come: `@@ ANY (array)` in counts and plain index scans.  The opclass is `tsvector_pos_ops` in the extension's SQL (README.md).
 
 ### Cardinality guard
 

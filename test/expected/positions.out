@@ -457,6 +457,78 @@ GROUP BY what ORDER BY what;
 RESET pg_lion.enable_count_pushdown;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
+-- Under an OR no recheck sees a leaf alone, so a leaf the sets only bound is
+-- decided from the positions as the count walks it (LION_KN_POSFILTER): two
+-- queries ORed, a query ORed with another column, and the same with a GROUP
+-- BY, each counted by the pushdown and by the heap.  At the smallest
+-- work_mem the union is read a window at a time, without its pins.
+CREATE FUNCTION pos_or_count(sql text, pushed OUT bool, n OUT text)
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	pushed := false;
+	FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || sql LOOP
+		pushed := pushed OR l LIKE '%Custom Scan (LionCount)%';
+	END LOOP;
+	EXECUTE 'SELECT string_agg(x::text, '','' ORDER BY x::text) FROM (' ||
+		sql || ') x' INTO n;
+END $$;
+CREATE TEMP TABLE pos_or_shapes AS
+SELECT format('SELECT count(*) FROM pos_grouped WHERE d @@ %L OR d @@ %L',
+			  a.q, b.q) AS s
+FROM pos_queries a, pos_queries b WHERE a.q::text < b.q::text
+UNION ALL
+SELECT format('SELECT count(*) FROM pos_grouped WHERE d @@ %L OR cat = 3', q)
+FROM pos_queries
+UNION ALL
+SELECT format('SELECT cat, count(*) FROM pos_grouped WHERE d @@ %L OR d @@ %L '
+			  'GROUP BY cat', a.q, b.q)
+FROM pos_queries a, pos_queries b
+WHERE a.q::text < b.q::text AND b.q IN ('common <-> again', 'w1:A');
+CREATE TEMP TABLE pos_or_pushed AS
+SELECT s, (pos_or_count(s)).* FROM pos_or_shapes;
+SET work_mem = '64kB';
+CREATE TEMP TABLE pos_or_narrow AS
+SELECT s, (pos_or_count(s)).* FROM pos_or_shapes;
+RESET work_mem;
+SET pg_lion.enable_count_pushdown = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+CREATE TEMP TABLE pos_or_heap AS
+SELECT s, (pos_or_count(s)).* FROM pos_or_shapes;
+RESET pg_lion.enable_count_pushdown;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+-- every shape but those with a prefix lexeme is pushed down
+SELECT count(*) AS shapes,
+	   count(*) FILTER (WHERE p.pushed) AS pushed,
+	   count(*) FILTER (WHERE NOT p.pushed AND p.s NOT LIKE '%:*%') AS not_pushed,
+	   count(*) FILTER (WHERE p.n IS DISTINCT FROM h.n) AS differ,
+	   count(*) FILTER (WHERE w.n IS DISTINCT FROM h.n) AS differ_narrow
+FROM pos_or_pushed p JOIN pos_or_narrow w USING (s) JOIN pos_or_heap h USING (s);
+ shapes | pushed | not_pushed | differ | differ_narrow 
+--------+--------+------------+--------+---------------
+    466 |    435 |          0 |      0 |             0
+(1 row)
+
+DO $$
+DECLARE
+	l text;
+BEGIN
+	FOR l IN EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+		SELECT count(*) FROM pos_grouped
+		WHERE d @@ 'common <-> again' OR d @@ 'w1:A' LOOP
+		IF l ~ '(Custom Scan|Heap TIDs Rechecked|Position|Removed)' THEN
+			RAISE WARNING '%', regexp_replace(l, ' \(actual .*\)$', '');
+		END IF;
+	END LOOP;
+END $$;
+WARNING:  Custom Scan (LionCount)
+WARNING:    Heap TIDs Rechecked: 0
+WARNING:    Position Checks: 986
+WARNING:    Rows Removed by Positions: 1
+DROP FUNCTION pos_or_count(text);
 DROP TABLE pos_grouped, pos_dim;
 DROP TABLE pos_docs CASCADE;
 DROP FUNCTION lion_debug_key_positions(regclass, text);

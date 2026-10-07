@@ -1141,8 +1141,24 @@ typedef enum LionKeyNodeKind
 {
 	LION_KN_KEY = 0,
 	LION_KN_AND,
-	LION_KN_OR
+	LION_KN_OR,
+	LION_KN_POSFILTER			/* its one child's members, those of them a
+								 * tsquery matches by the stored positions
+								 * (lion_posfilter.c); the count's only */
 } LionKeyNodeKind;
+
+/*
+ * What a LION_KN_POSFILTER node decides its child's members with: the
+ * arguments of lion_posfilter_begin(), which every cursor of the node calls
+ * for a filter of its own.
+ */
+typedef struct LionPosSpec
+{
+	Relation	index;
+	LionState  *col;
+	Datum		query;
+	StrategyNumber strategy;
+} LionPosSpec;
 
 typedef struct LionKeyNode
 {
@@ -1150,6 +1166,7 @@ typedef struct LionKeyNode
 	int			keyno;			/* LION_KN_KEY only */
 	int			nargs;
 	struct LionKeyNode **args;
+	LionPosSpec *pos;			/* LION_KN_POSFILTER only */
 } LionKeyNode;
 
 typedef struct LionQuery
@@ -2210,6 +2227,15 @@ extern bool lion_postree_fetch(Relation index, uint32 hash, BlockNumber root,
  * query has an operand it cannot follow (a prefix lexeme).
  */
 typedef struct LionPosFilter LionPosFilter;
+
+/*
+ * What a LION_KN_POSFILTER cursor holds, about: the filter's two member
+ * arrays and its container, and a leaf page copied for each position cursor,
+ * taken to be four.
+ */
+#define LION_POSFILTER_MEM \
+	(2 * sizeof(uint16) * LION_CONTAINER_RANGE + LION_CONTAINER_MAX_SIZE + \
+	 4 * BLCKSZ)
 extern LionPosFilter *lion_posfilter_begin(Relation index, LionState *col,
 										   Datum query, StrategyNumber strategy);
 extern int	lion_posfilter_container(LionPosFilter *pf, const LionContainer *c,
@@ -2219,6 +2245,8 @@ extern const LionContainer *lion_posfilter_apply(LionPosFilter *pf,
 extern void lion_posfilter_counts(const LionPosFilter *pf, int64 *nchecked,
 								  int64 *nremoved);
 extern void lion_posfilter_end(LionPosFilter *pf);
+extern bool lion_query_posexact(Oid opfamily, Oid lefttype, Oid opno,
+								Datum query, Oid collation);
 
 /*
  * The number of DIRECTORY PAGES the current backend has read: the counter
