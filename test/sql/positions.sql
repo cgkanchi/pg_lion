@@ -1,12 +1,11 @@
 -- Stored positions (DESIGN.md §17, "Stored positions"): insert, VACUUM,
 -- CREATE INDEX, and the bitmap scans they answer.
 --
--- A column whose multi-key opclass has support function 5 stores, for every
--- key, each row's word positions and weights: in the entry while it is
--- INLINE, in a position tree once the entry spills.  The opclass is not part
--- of the extension yet: this test creates it, and a test function that lists
--- what the index stores for one key, and compares that with unnest() of the
--- rows' tsvectors.
+-- A column whose multi-key opclass has support function 5 - tsvector_pos_ops
+-- - stores, for every key, each row's word positions and weights: in the
+-- entry while it is INLINE, in a position tree once the entry spills.  The
+-- test creates a function that lists what the index stores for one key, and
+-- compares that with unnest() of the rows' tsvectors.
 --
 -- The table keeps autovacuum off so that the VACUUMs below are the only ones.
 
@@ -15,19 +14,9 @@ SET client_min_messages = warning;
 
 CREATE EXTENSION IF NOT EXISTS pg_lion;
 
-CREATE FUNCTION lion_tsvector_positions(tsvector, internal) RETURNS internal
-	AS '$libdir/pg_lion' LANGUAGE C STRICT;
 CREATE FUNCTION lion_debug_key_positions(regclass, text,
 	OUT tid tid, OUT positions int2[], OUT weights text[]) RETURNS SETOF record
 	AS '$libdir/pg_lion' LANGUAGE C STRICT;
-CREATE OPERATOR CLASS tsvector_pos_ops FOR TYPE tsvector USING lion AS
-	OPERATOR	5	@@ (tsvector, tsquery),
-	FUNCTION	1	hashtext(text),
-	FUNCTION	4	bttextcmp(text, text),
-	FUNCTION	2	gin_extract_tsvector(tsvector, internal, internal),
-	FUNCTION	3	gin_extract_tsquery(tsvector, internal, int2, internal, internal, internal, internal),
-	FUNCTION	5	lion_tsvector_positions(tsvector, internal),
-	STORAGE		text;
 
 CREATE TABLE pos_docs (id int, d tsvector) WITH (autovacuum_enabled = off);
 CREATE INDEX pos_docs_d ON pos_docs USING lion (d tsvector_pos_ops);
@@ -285,6 +274,4 @@ RESET enable_indexscan;
 DROP TABLE pos_grouped, pos_dim;
 
 DROP TABLE pos_docs CASCADE;
-DROP OPERATOR CLASS tsvector_pos_ops USING lion;
 DROP FUNCTION lion_debug_key_positions(regclass, text);
-DROP FUNCTION lion_tsvector_positions(tsvector, internal);
