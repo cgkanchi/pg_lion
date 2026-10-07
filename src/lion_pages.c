@@ -632,16 +632,19 @@ lion_page_update_minmax(Page page)
 	if (opaque->flags & LION_PAGE_POSITIONS)
 	{
 		/*
-		 * A chunk's header ckey only bounds its members from below (a
+		 * On a position page the "ckeys" are heap blocks (lion_positions.h).
+		 * A chunk's header block only bounds its members from below (a
 		 * removal can leave it under the first one), which is still the
-		 * right minckey; the last ckey is its last member's.
+		 * right minckey; the max is its last member's block, or an empty
+		 * last chunk's header, which by (P2) of lion_postree.c is at least
+		 * every block before it.
 		 */
 		LionContainer *last = (LionContainer *)
 			PageGetItem(page, PageGetItemId(page, maxoff));
 		uint64		code;
 
 		opaque->maxckey = lion_poschunk_last_code(last, &code) ?
-			lion_code_ckey(code) : last->ckey;
+			lion_pos_block(code) : last->ckey;
 		return;
 	}
 	opaque->maxckey = lion_item_last_ckey((LionContainer *)

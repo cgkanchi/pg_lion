@@ -376,21 +376,26 @@ lion_posting_getbuf(Relation index, BlockNumber blk, BlockNumber head,
  * the move-right rule walks to it.  blk is the page's block, for the ERROR a
  * damaged pivot raises; an offset past the last item comes back as it is, for
  * lion_posting_downlink() to refuse.
+ *
+ * With `before` it is the last separator strictly BELOW ckey instead: the
+ * child that holds what sorts just before ckey, which is where a position
+ * tree's reader of ckey starts (lion_posting_search_before()).
  */
 static OffsetNumber
 lion_posting_downlink_off(Relation index, Page page, BlockNumber blk,
-						  uint32 ckey)
+						  uint32 ckey, bool before)
 {
 	OffsetNumber first = lion_posting_first_data(page);
 	OffsetNumber lo = first;
 	OffsetNumber hi = OffsetNumberNext(PageGetMaxOffsetNumber(page));
 
-	/* first offset whose separator is strictly above ckey */
+	/* first offset whose separator is above ckey (at or above, before) */
 	while (lo < hi)
 	{
 		OffsetNumber mid = lo + (hi - lo) / 2;
+		uint32		sep = lion_posting_pivot_at(index, page, blk, mid)->ckey;
 
-		if (lion_posting_pivot_at(index, page, blk, mid)->ckey > ckey)
+		if (before ? sep >= ckey : sep > ckey)
 			hi = mid;
 		else
 			lo = OffsetNumberNext(mid);
@@ -443,9 +448,31 @@ lion_posting_restart(Relation index, BlockNumber head, int *restarts,
  * The descent
  * --------------------------------------------------------------------- */
 
+static Buffer lion_posting_descend(Relation index, Relation heaprel,
+								   uint32 hash, BlockNumber head, uint32 ckey,
+								   bool before, int lockmode, bool forwrite);
+
 Buffer
 lion_posting_search(Relation index, Relation heaprel, uint32 hash,
 					BlockNumber head, uint32 ckey, int lockmode, bool forwrite)
+{
+	return lion_posting_descend(index, heaprel, hash, head, ckey, false,
+								lockmode, forwrite);
+}
+
+Buffer
+lion_posting_search_before(Relation index, Relation heaprel, uint32 hash,
+						   BlockNumber root, uint32 ckey, int lockmode,
+						   bool forwrite)
+{
+	return lion_posting_descend(index, heaprel, hash, root, ckey, true,
+								lockmode, forwrite);
+}
+
+static Buffer
+lion_posting_descend(Relation index, Relation heaprel, uint32 hash,
+					 BlockNumber head, uint32 ckey, bool before, int lockmode,
+					 bool forwrite)
 {
 	Buffer		buf;
 	Page		page;
@@ -545,9 +572,14 @@ restart:
 			goto restart;
 		}
 
-		/* An internal page whose high key no longer exceeds ckey: move right. */
+		/*
+		 * An internal page whose high key no longer exceeds ckey (no longer
+		 * reaches it, before): move right.
+		 */
 		if (level > 0 && !LionPageIsRightmost(page) &&
-			lion_posting_highkey_at(index, page, blk)->ckey <= ckey)
+			(before ?
+			 lion_posting_highkey_at(index, page, blk)->ckey < ckey :
+			 lion_posting_highkey_at(index, page, blk)->ckey <= ckey))
 		{
 			buf = lion_posting_step_right(index, buf, head, BUFFER_LOCK_SHARE,
 										  forwrite, &walk);
@@ -611,7 +643,8 @@ restart:
 
 		child = lion_posting_downlink(index, page, blk,
 									  lion_posting_downlink_off(index, page,
-																blk, ckey));
+																blk, ckey,
+																before));
 		childlock = (level == 1) ? lockmode : BUFFER_LOCK_SHARE;
 
 		/* Release the parent BEFORE locking the child; see the file header. */
@@ -729,7 +762,8 @@ restart:
 
 		child = lion_posting_downlink(index, page, blk,
 									  lion_posting_downlink_off(index, page,
-																blk, ckey));
+																blk, ckey,
+																false));
 
 		/* Release the parent BEFORE locking the child; see the file header. */
 		UnlockReleaseBuffer(buf);
@@ -1540,7 +1574,8 @@ lion_posting_level_start(Relation index, BlockNumber head, uint16 level,
 				blk = BufferGetBlockNumber(buf);
 				lion_posting_check_level(index, page, blk, plevel);
 			}
-			off = lion_posting_downlink_off(index, page, blk, routeckey);
+			off = lion_posting_downlink_off(index, page, blk, routeckey,
+											false);
 		}
 		else
 			off = lion_posting_first_data(page);

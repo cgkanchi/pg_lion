@@ -214,7 +214,7 @@ compare(const LionContainer *c, const Ref *r, Size itemsz)
 	CHECK(same && i == r->n, "iteration matches the reference");
 	if (r->n > 0)
 	{
-		CHECK(c->ckey <= lion_code_ckey(r->m[0].code), "header ckey is a lower bound");
+		CHECK(c->ckey <= lion_pos_block(r->m[0].code), "header block is a lower bound");
 		CHECK(lion_poschunk_last_code(c, &last) && last == r->m[r->n - 1].code,
 			  "last_code is the reference's last");
 		/* find: a few members and a few misses */
@@ -275,7 +275,7 @@ test_encoding(void)
 	LionContainer *c = new_buf();
 	LionPosMember m;
 	LionPosMember out;
-	uint64		base = lion_make_code(7, 0);
+	uint64		base = lion_pos_block_base(7);
 
 	phase("encoding");
 	lion_poschunk_init(c, 7);
@@ -314,9 +314,12 @@ test_encoding(void)
 	m.code = base + 11;
 	m.npos = 0;
 	CHECK(lion_poschunk_append(c, LION_CONTAINER_MAX_SIZE, &m), "stripped member");
-	m.code = lion_make_code(0xFFFFFFFF, LION_CONTAINER_RANGE - 1);
+	m.code = LION_POS_MAX_CODE + 1;
 	m.npos = 1;
 	m.pos[0] = LION_POS_MAKE(1, 0);
+	CHECK(!lion_poschunk_append(c, LION_CONTAINER_MAX_SIZE, &m),
+		  "a code past the largest heap TID refused");
+	m.code = LION_POS_MAX_CODE;
 	CHECK(lion_poschunk_append(c, LION_CONTAINER_MAX_SIZE, &m), "the largest code");
 	CHECK(lion_poschunk_check(c, lion_poschunk_size(c), NULL, 0), "check accepts");
 	CHECK(c->cardinality == 4, "four members");
@@ -331,8 +334,8 @@ test_encoding(void)
 		char		save[LION_CONTAINER_MAX_SIZE];
 
 		memcpy(save, c, before);
-		m.code = lion_make_code(0xFFFFFFFF, LION_CONTAINER_RANGE - 1) + 1;	/* past 47 bits is fine */
-		CHECK(!lion_poschunk_append(c, before + 1, &m), "append past cap refused");
+		m.code = base + 12;
+		CHECK(!lion_poschunk_insert(c, before + 1, &m, NULL), "insert past cap refused");
 		CHECK(memcmp(save, c, before) == 0, "refused append changed nothing");
 	}
 	free(c);
@@ -350,7 +353,7 @@ test_append_random(uint64 seed)
 	rng_seed(seed);
 	ref_init(&r);
 	code = lion_make_code(rng_below(1000000), rng_below(LION_CONTAINER_RANGE));
-	lion_poschunk_init(c, lion_code_ckey(code));
+	lion_poschunk_init(c, lion_pos_block(code));
 	for (;;)
 	{
 		Size		need;
@@ -404,7 +407,7 @@ test_insert_remove_split(uint64 seed)
 			if (rng_below(8) == 0 && r.n > 0)
 				code = r.m[rng_below(r.n)].code;	/* replace */
 			if (rng_below(16) == 0)
-				code = rng_below(lion_make_code(100, 0) + 1);	/* below the ckey */
+				code = rng_below(lion_make_code(100, 0) + 1);	/* below the block */
 			rand_member(&m, code);
 			memcpy(save, c, before);
 			if (lion_poschunk_insert(c, cap, &m, &replaced))
@@ -452,11 +455,11 @@ test_insert_remove_split(uint64 seed)
 			CHECK(l->cardinality + rt->cardinality == r.n, "split keeps every member");
 			CHECK(lion_poschunk_check(l, lion_poschunk_size(l), NULL, 0) &&
 				  lion_poschunk_check(rt, lion_poschunk_size(rt), NULL, 0), "both halves check");
-			CHECK(l->ckey == c->ckey, "left keeps the ckey");
+			CHECK(l->ckey == c->ckey, "left keeps the block");
 			lion_poschunk_iter_init(&it, l);
 			while (lion_poschunk_iter_next(&it, &a))
 				same &= member_eq(&a, &r.m[i++]);
-			CHECK(rt->ckey == lion_code_ckey(r.m[i].code), "right takes its first ckey");
+			CHECK(rt->ckey == lion_pos_block(r.m[i].code), "right takes its first block");
 			lion_poschunk_iter_init(&it, rt);
 			while (lion_poschunk_iter_next(&it, &a))
 				same &= (i < r.n) && member_eq(&a, &r.m[i++]);
@@ -560,7 +563,7 @@ test_damaged(uint64 seed)
 			uint32		nflip = 1 + rng_below(4);
 
 			memset(c, 0, LION_CONTAINER_MAX_SIZE);
-			lion_poschunk_init(c, lion_code_ckey(code));
+			lion_poschunk_init(c, lion_pos_block(code));
 			for (i = 0; i < 1 + rng_below(60); i++)
 			{
 				code += 1 + rng_below(30);

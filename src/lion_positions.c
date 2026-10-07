@@ -31,7 +31,8 @@ typedef enum PosDecode
 	POS_ORDER,					/* a code that does not ascend */
 	POS_NPOS,					/* npos above LION_POS_MAX_NPOS */
 	POS_POSORDER,				/* positions that do not ascend */
-	POS_POSLIMIT				/* a position at or above LION_POS_LIMIT */
+	POS_POSLIMIT,				/* a position at or above LION_POS_LIMIT */
+	POS_CODE					/* a code above LION_POS_MAX_CODE */
 } PosDecode;
 
 static const char *const pos_decode_msg[] = {
@@ -42,7 +43,8 @@ static const char *const pos_decode_msg[] = {
 	"member codes do not ascend",
 	"too many positions in a member",
 	"positions do not ascend",
-	"position out of range"
+	"position out of range",
+	"member code beyond the largest heap TID"
 };
 
 static inline uint16
@@ -78,7 +80,7 @@ pos_members_const(const LionContainer *c)
 static inline uint64
 pos_base(const LionContainer *c)
 {
-	return lion_make_code(c->ckey, 0);
+	return lion_pos_block_base(c->ckey);
 }
 
 static PosDecode
@@ -142,6 +144,8 @@ decode_member(const uint8 **pp, const uint8 *end, uint64 prev, bool first,
 		return r;
 	if ((!first && delta == 0) || prev + delta < prev)
 		return POS_ORDER;
+	if (prev + delta > LION_POS_MAX_CODE)
+		return POS_CODE;
 	m->code = prev + delta;
 	if ((r = read_varint(&p, end, &npos)) != POS_OK)
 		return r;
@@ -167,13 +171,53 @@ decode_member(const uint8 **pp, const uint8 *end, uint64 prev, bool first,
 	return POS_OK;
 }
 
+/*
+ * Step over one member at *pp without decoding its positions, for the walks
+ * that only want codes: its code goes to *code and *pp past it.  Positions
+ * are counted by their varints' last bytes, so a damaged member can be
+ * stepped over at a boundary decode_member() would refuse; nothing a caller
+ * hands out comes from here without going through decode_member() too.
+ */
+static PosDecode
+skip_member(const uint8 **pp, const uint8 *end, uint64 prev, bool first,
+			uint64 *code)
+{
+	const uint8 *p = *pp;
+	uint64		delta;
+	uint64		npos;
+	PosDecode	r;
+
+	if (p >= end)
+		return POS_END;
+	if ((r = read_varint(&p, end, &delta)) != POS_OK)
+		return r;
+	if ((!first && delta == 0) || prev + delta < prev)
+		return POS_ORDER;
+	if (prev + delta > LION_POS_MAX_CODE)
+		return POS_CODE;
+	if ((r = read_varint(&p, end, &npos)) != POS_OK)
+		return r;
+	if (npos > LION_POS_MAX_NPOS)
+		return POS_NPOS;
+	while (npos > 0)
+	{
+		if (p >= end)
+			return POS_TRUNCATED;
+		if ((*p++ & 0x80) == 0)
+			npos--;
+	}
+	*code = prev + delta;
+	*pp = p;
+	return POS_OK;
+}
+
 /* Is m a member this module may write: positions ascending and in range? */
 static bool
 member_valid(const LionPosMember *m)
 {
 	uint32		i;
 
-	if (m->npos > LION_POS_MAX_NPOS)
+	if (m->npos > LION_POS_MAX_NPOS || m->code > LION_POS_MAX_CODE)
 		return false;
 	for (i = 0; i < m->npos; i++)
 	{
@@ -222,9 +266,9 @@ encode_member(uint8 *dst, uint64 prev_code, const LionPosMember *m)
 }
 
 void
-lion_poschunk_init(LionContainer *c, uint32 ckey)
+lion_poschunk_init(LionContainer *c, uint32 block)
 {
-	c->ckey = ckey;
+	c->ckey = block;
 	c->cardinality = 0;
 	c->type = LION_CT_POSITIONS;
 	c->flags = 0;
@@ -267,12 +311,23 @@ lion_poschunk_find(const LionContainer *c, uint64 code, LionPosMember *m)
 	LionPosIter it;
 
 	lion_poschunk_iter_init(&it, c);
-	while (lion_poschunk_iter_next(&it, m))
+	while (it.left > 0)
 	{
-		if (m->code == code)
-			return true;
-		if (m->code > code)
+		const uint8 *at = it.p;
+		uint64		mcode;
+
+		if (skip_member(&it.p, it.end, it.code, it.first, &mcode) != POS_OK ||
+			mcode > code)
 			break;
+		if (mcode == code)
+		{
+			/* the one member handed out is decoded, and checked, in full */
+			it.p = at;
+			return lion_poschunk_iter_next(&it, m) && m->code == code;
+		}
+		it.code = mcode;
+		it.first = false;
+		it.left--;
 	}
 	return false;
 }
@@ -304,7 +359,23 @@ pos_last(const LionContainer *c, uint64 *code, const uint8 **endp, uint32 *nread
 bool
 lion_poschunk_last_code(const LionContainer *c, uint64 *code)
 {
-	return pos_last(c, code, NULL, NULL);
+	LionPosIter it;
+	bool		any = false;
+
+	/* codes only: stepped over, not decoded (skip_member()) */
+	lion_poschunk_iter_init(&it, c);
+	while (it.left > 0)
+	{
+		uint64		mcode;
+
+		if (skip_member(&it.p, it.end, it.code, it.first, &mcode) != POS_OK)
+			break;
+		*code = it.code = mcode;
+		it.first = false;
+		it.left--;
+		any = true;
+	}
+	return any;
 }
 
 /*
@@ -388,10 +459,10 @@ typedef struct PosOut
 } PosOut;
 
 static inline void
-posout_init(PosOut *o, uint8 *dst, uint32 ckey)
+posout_init(PosOut *o, uint8 *dst, uint32 block)
 {
 	o->dst = dst;
-	o->prev = lion_make_code(ckey, 0);
+	o->prev = lion_pos_block_base(block);
 	o->bytes = 0;
 	o->n = 0;
 }
@@ -458,8 +529,10 @@ pos_merge(PosOut *o, const LionContainer *src, const LionPosMember *m, bool *rep
  * Insert m where its code belongs, replacing a member of the same code (a
  * row's positions are a function of its TID while the TID lives: a
  * same-TID member can only be an orphan of a dead tuple, DESIGN.md §17).
- * The header ckey drops to m's when m comes below it.  Fails, leaving c as
- * it was, when the result needs more than cap bytes.
+ * The header block drops to m's when m comes below it, and never rises, not
+ * even for an empty chunk: a position tree's separators were copied from
+ * headers (lion_positions_put()).  Fails, leaving c as it was, when the result
+ * needs more than cap bytes.
  */
 bool
 lion_poschunk_insert(LionContainer *c, Size cap, const LionPosMember *m,
@@ -467,23 +540,23 @@ lion_poschunk_insert(LionContainer *c, Size cap, const LionPosMember *m,
 {
 	PosCopy		copy;
 	PosOut		o;
-	uint32		ckey;
+	uint32		block;
 
 	if (!member_valid(m))
 		return false;
-	ckey = lion_code_ckey(m->code);
-	if (c->cardinality > 0 && c->ckey < ckey)
-		ckey = c->ckey;
+	block = lion_pos_block(m->code);
+	if (c->ckey < block)
+		block = c->ckey;
 
-	posout_init(&o, NULL, ckey);
+	posout_init(&o, NULL, block);
 	pos_merge(&o, c, m, NULL);
 	if (o.bytes > LION_POS_MAX_BYTES || LION_POS_HDRSZ + o.bytes > cap)
 		return false;
 
 	pos_copy(&copy, c);
-	posout_init(&o, pos_members(c), ckey);
+	posout_init(&o, pos_members(c), block);
 	pos_merge(&o, &copy.hdr, m, replaced);
-	c->ckey = ckey;
+	c->ckey = block;
 	c->cardinality = (uint16) o.n;
 	pos_set_used(c, (uint32) o.bytes);
 	/* a replaced member can be shorter: keep the bytes it freed zero */
@@ -498,7 +571,7 @@ lion_poschunk_insert(LionContainer *c, Size cap, const LionPosMember *m,
  * The chunk never grows (a kept member's code delta is the sum of the
  * deltas it replaces, and a varint of a sum is no longer than the varints of
  * its terms), the bytes it frees are zeroed so that slack stays zero, and
- * the header ckey is left as it was: still a lower bound.
+ * the header block is left as it was: still a lower bound.
  */
 uint32
 lion_poschunk_remove(LionContainer *c, LionPosRemoveCallback cb, void *arg)
@@ -533,7 +606,7 @@ lion_poschunk_remove(LionContainer *c, LionPosRemoveCallback cb, void *arg)
  * Split c's members between left and right (each a buffer of
  * LION_CONTAINER_MAX_SIZE bytes, neither c) at the member boundary nearest
  * half its bytes, keeping at least one member on each side.  left keeps c's
- * ckey; right takes its first member's.  False when c has fewer than two
+ * block; right takes its first member's.  False when c has fewer than two
  * members.
  */
 bool
@@ -565,7 +638,7 @@ lion_poschunk_split(const LionContainer *c, LionContainer *left, LionContainer *
 		if (!inright && n > 0 && lo.bytes + lion_posmember_size(lo.prev, &cur) / 2 > half)
 		{
 			inright = true;
-			lion_poschunk_init(right, lion_code_ckey(cur.code));
+			lion_poschunk_init(right, lion_pos_block(cur.code));
 			posout_init(&ro, pos_members(right), right->ckey);
 		}
 		if (inright)
@@ -590,7 +663,7 @@ lion_poschunk_split(const LionContainer *c, LionContainer *left, LionContainer *
 				break;
 			posout_add(&lo, &prev);
 		}
-		lion_poschunk_init(right, lion_code_ckey(prev.code));
+		lion_poschunk_init(right, lion_pos_block(prev.code));
 		posout_init(&ro, pos_members(right), right->ckey);
 		posout_add(&ro, &prev);
 	}
@@ -606,7 +679,7 @@ lion_poschunk_split(const LionContainer *c, LionContainer *left, LionContainer *
  * says why.  Everything the readers tolerate is reported here: a byte count
  * past the largest chunk, members that the header does not count or that
  * do not fill the byte count exactly, damaged members, a first member below
- * the header ckey, and slack (the item's bytes past the chunk) that is not
+ * the header block, and slack (the item's bytes past the chunk) that is not
  * zero.
  */
 bool

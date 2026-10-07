@@ -8,9 +8,10 @@
  *	  posting set: chunks live in a key's position tree, or in the positions
  *	  section at the end of an INLINE entry's payload.  The header is
  *
- *		ckey		= a lower bound on the ckey of every member: the first
- *					  member's ckey when the chunk was written, which removing
- *					  members may leave below the new first one
+ *		ckey		= the chunk's BLOCK, not a container key: a lower bound on
+ *					  the heap block of every member, the first member's block
+ *					  when the chunk was written, which removing members may
+ *					  leave below the new first one
  *		cardinality	= number of members, 0 .. LION_POS_MAX_MEMBERS
  *		type		= LION_CT_POSITIONS
  *		flags		= reserved, 0
@@ -18,8 +19,9 @@
  *	  and the payload is a uint16 count of the member bytes that follow, then
  *	  the members, ascending by heap TID code and unique:
  *
- *		varint	code delta: from lion_make_code(ckey, 0) for the first member,
- *				and from the previous member's code for the others (so >= 1)
+ *		varint	code delta: from lion_pos_block_base(block) for the first
+ *				member, and from the previous member's code for the others
+ *				(so >= 1)
  *		varint	npos, 0 .. LION_POS_MAX_NPOS; 0 is a member whose tsvector
  *				was stripped of positions
  *		npos varints	(pos delta << 2) | weight, the positions ascending
@@ -30,9 +32,12 @@
  *	  tsvector's own WordEntryPos form (weight << 14 | pos), which is what
  *	  TS_execute()'s callback hands to ExecPhraseData.
  *
- *	  A chunk may cover members of several ckeys, and the members of one
- *	  ckey may continue in the next chunk of the same tree: separators of a
- *	  position tree are, like the posting tree's (§22), non-decreasing.
+ *	  A chunk may cover members of several heap blocks, and the members of
+ *	  one block may continue in the next chunk of the same tree: separators
+ *	  of a position tree are, like the posting tree's (§22), non-decreasing,
+ *	  and they are blocks too.  A block rather than a container key because a
+ *	  run of equal separators is walked, not searched (lion_postree.c): one
+ *	  heap page's rows bound it, where a container key's are 64 pages' worth.
  *
  *	  Like lion_container.[ch] and lion_sparse.[ch] this module depends only
  *	  on c.h, so test/unit/positions_test.c runs it outside the server.  No
@@ -55,6 +60,23 @@
 #include "c.h"
 
 #include "lion_container.h"
+
+/* A chunk's block: the heap block of a code, and the first code of a block. */
+static inline uint32
+lion_pos_block(uint64 code)
+{
+	return (uint32) (code >> LION_OFFSET_BITS);
+}
+
+static inline uint64
+lion_pos_block_base(uint32 block)
+{
+	return ((uint64) block) << LION_OFFSET_BITS;
+}
+
+/* The largest code a heap TID makes, and so the largest a member may have. */
+#define LION_POS_MAX_CODE \
+	((((uint64) 1) << (32 + LION_OFFSET_BITS)) - 1)
 
 /* tsvector's limits (tsearch/ts_type.h): MAXNUMPOS and MAXENTRYPOS. */
 #define LION_POS_MAX_NPOS		256
@@ -130,7 +152,7 @@ lion_pos_varint_size(uint64 v)
 	return n;
 }
 
-extern void lion_poschunk_init(LionContainer *c, uint32 ckey);
+extern void lion_poschunk_init(LionContainer *c, uint32 block);
 extern void lion_poschunk_iter_init(LionPosIter *it, const LionContainer *c);
 extern bool lion_poschunk_iter_next(LionPosIter *it, LionPosMember *m);
 extern bool lion_poschunk_find(const LionContainer *c, uint64 code, LionPosMember *m);

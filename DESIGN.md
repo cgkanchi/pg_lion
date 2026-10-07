@@ -4537,6 +4537,36 @@ median 120 words, warm).  The count's gain over GIN is the heap-skipping kind on
 superset is narrow; on a wide superset both do the same detoast per candidate.  Exact phrase
 counts need stored positions, which is a separate design.
 
+### Stored positions: position trees (in progress, 2026-10-07)
+
+Not reachable from SQL yet: no operator class writes positions.  What exists is the storage layer.
+
+- **Chunks** (`lion_positions.[ch]`, item type `LION_CT_POSITIONS`): a key's members - one per
+  row, its heap TID code and its tsvector positions with weights - varint-encoded in ascending
+  code order, at most 4,104 bytes a chunk.  The header's `ckey` field holds a heap **block**, a
+  lower bound on the block of every member.  `test/unit/positions_test.c` checks every operation
+  against a brute-force reference and fuzzes damaged chunks.
+- **Position trees** (`lion_postree.c`): a posting tree (§22) whose pages carry
+  `LION_PAGE_POSITIONS` and are stamped with the position tree's own root, whose leaf items are
+  chunks, and whose keys are heap blocks.  Descent, root push-down, leaf and internal splits are
+  §22's code, reached through a `LionTreeRef` that carries no entry.
+- **Routing.** One block's members can fill several leaves, so separators repeat.  Readers and
+  writers of block X descend to the last separator strictly *below* X
+  (`lion_posting_search_before()`) and walk right.  The invariants that make this complete are in
+  the header of `lion_postree.c`: members ascend; a chunk's members reach at most the next chunk's
+  header block; and a leaf's first chunk carries the leaf's separator.  VACUUM, when it removes
+  positions, must keep a leaf's first chunk even when it empties it.  Blocks rather than container
+  keys because a run of equal separators is walked, not searched: one heap page's rows bound it.
+- **Tested** by `test/sql/postree.sql`, through a C test function the test creates from the
+  library: puts into a tree (runs in hot blocks, scattered, appended, replacing), then a walk and a
+  lookup of every member against a reference.  It reaches three levels, so it also covers internal
+  page splits, which `posting_tree.sql` cannot reach.  Replayed on a standby under
+  `wal_consistency_checking = 'pg_lion'` with no difference.
+
+Still to come: the entry's pointer to its position tree, the operator class that writes positions
+on insert and build, VACUUM, verify, and the reader that checks phrases, weights and `a & !b`
+against stored positions.
+
 ### Cardinality guard
 
 Reloption `max_entries` (int, default 0 = unlimited, ShareUpdateExclusiveLock).  Exceeding it is a
