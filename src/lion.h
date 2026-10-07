@@ -40,6 +40,9 @@
 #define LION_PAGE_ROOT		0x0020	/* ... and it is the current root (§21) */
 #define LION_PAGE_INCOMPLETE_SPLIT 0x0040	/* its right sibling has no
 											 * downlink yet (§21) */
+#define LION_PAGE_POSITIONS	0x0080	/* a CONTAINER page of a key's position
+									 * tree, holding position chunks
+									 * (lion_positions.h), never containers */
 
 /* The three page KINDS; exactly one of them is set on every page. */
 #define LION_PAGE_KINDS \
@@ -157,9 +160,56 @@ lion_page_owns(Page page, BlockNumber head)
 	opaque = LionPageGetOpaque(page);
 
 	return opaque->page_id == LION_PAGE_ID &&
+		(opaque->flags & (LION_PAGE_CONTAINER | LION_PAGE_DELETED |
+						  LION_PAGE_POSITIONS)) == LION_PAGE_CONTAINER &&
+		opaque->owner_head == head;
+}
+
+/*
+ * Is this page a live page of the tree - posting or position - whose root
+ * block is root?  The tree code (lion_posting.c) serves both kinds and asks
+ * this: a root block is a tree's identity for the whole life of the index
+ * (a head is never recycled as a head, lion_new_buffer()), so the owner
+ * stamp alone tells the trees apart, and a page of one can never pass for a
+ * page of the other.  The kind of a page is in its LION_PAGE_POSITIONS bit,
+ * which every page of a tree shares with its root.
+ */
+static inline bool
+lion_page_owns_tree(Page page, BlockNumber root)
+{
+	LionPageOpaque opaque;
+
+	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE)
+		return false;
+	opaque = LionPageGetOpaque(page);
+
+	return opaque->page_id == LION_PAGE_ID &&
 		(opaque->flags & (LION_PAGE_CONTAINER | LION_PAGE_DELETED)) ==
 		LION_PAGE_CONTAINER &&
-		opaque->owner_head == head;
+		opaque->owner_head == root;
+}
+
+/*
+ * Is this page a live page of the position tree whose root block is root?
+ * Position pages are container pages with LION_PAGE_POSITIONS set, stamped
+ * with their own tree's root rather than the posting set's head, so that
+ * neither tree's readers, its sweep nor verify can take a page of the other
+ * for one of its own.
+ */
+static inline bool
+lion_page_owns_positions(Page page, BlockNumber root)
+{
+	LionPageOpaque opaque;
+
+	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE)
+		return false;
+	opaque = LionPageGetOpaque(page);
+
+	return opaque->page_id == LION_PAGE_ID &&
+		(opaque->flags & (LION_PAGE_CONTAINER | LION_PAGE_DELETED |
+						  LION_PAGE_POSITIONS)) ==
+		(LION_PAGE_CONTAINER | LION_PAGE_POSITIONS) &&
+		opaque->owner_head == root;
 }
 
 /* The same with the entry's hash checked as well, for readers that have it. */
@@ -571,6 +621,14 @@ StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
 #define LION_ENTRY_SUMMARY	0x0080
 #define LION_ENTRY_SUMLAST	0x0100
 
+/*
+ * An entry that stores word positions (DESIGN.md §17, "Stored positions"):
+ * a LionEntryPosExt follows its key, before its payload.  Never on a pivot,
+ * which is made of the header and key alone (lion_pivot_kindflags() does not
+ * keep it).
+ */
+#define LION_ENTRY_POSITIONS	0x0200
+
 #define LION_ENTRY_RESERVED	(LION_ENTRY_NULLKEY | LION_ENTRY_EMPTYKEY)
 #define LION_ENTRY_SUMKINDS	(LION_ENTRY_SUMMARY | LION_ENTRY_SUMLAST)
 /*
@@ -581,7 +639,8 @@ StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
 #define LION_ENTRY_PIVOT		(LION_ENTRY_HIGHKEY | LION_ENTRY_DOWNLINK)
 #define LION_ENTRY_ALLFLAGS \
 	(LION_ENTRY_INLINE | LION_ENTRY_CHAIN | LION_ENTRY_RESERVED | \
-	 LION_ENTRY_PIVOT | LION_ENTRY_MINUSINF | LION_ENTRY_SUMKINDS)
+	 LION_ENTRY_PIVOT | LION_ENTRY_MINUSINF | LION_ENTRY_SUMKINDS | \
+	 LION_ENTRY_POSITIONS)
 
 #define LionEntryIsPivot(e)		(((e)->flags & LION_ENTRY_PIVOT) != 0)
 #define LionEntryIsHighKey(e)	(((e)->flags & LION_ENTRY_HIGHKEY) != 0)
@@ -693,9 +752,35 @@ StaticAssertDecl(offsetof(LionEntryTuple, attno) == 20,
 StaticAssertDecl(sizeof(LionEntryTuple) == 32,
 				 "the lion entry header must stay 32 bytes");
 #define LionEntryGetKey(e)		((char *) (e) + LION_ENTRY_HDRSZ)
-#define LionEntryPayloadOffset(e) MAXALIGN(LION_ENTRY_HDRSZ + (e)->keylen)
+
+/*
+ * The positions extension of an entry flagged LION_ENTRY_POSITIONS, right
+ * after its key (DESIGN.md §17, "Stored positions"):
+ *
+ *	- on a CHAIN entry pos_root is the root of the key's position tree
+ *	  (lion_postree.c), or InvalidBlockNumber while it has none, and pos_len
+ *	  is 0;
+ *	- on an INLINE entry pos_root is InvalidBlockNumber and pos_len is the
+ *	  size of the positions section: the last pos_len bytes of the item, a
+ *	  run of position chunks after the container items and their slack.
+ *
+ * The header's 32 bytes are full, hence an extension, and only entries that
+ * store positions carry it: every other entry is laid out as it always was.
+ */
+typedef struct LionEntryPosExt
+{
+	BlockNumber pos_root;
+	uint32		pos_len;
+} LionEntryPosExt;
+
+#define LION_ENTRY_POSEXT_SIZE	MAXALIGN(sizeof(LionEntryPosExt))	/* 8 */
+
+#define LionEntryExtOffset(e)	MAXALIGN(LION_ENTRY_HDRSZ + (e)->keylen)
+#define LionEntryPayloadOffset(e) \
+	(LionEntryExtOffset(e) + \
+	 (((e)->flags & LION_ENTRY_POSITIONS) != 0 ? LION_ENTRY_POSEXT_SIZE : 0))
 #define LionEntryGetPayload(e)	((char *) (e) + LionEntryPayloadOffset(e))
-/* payload length must be computed from the item size: itemsz - LionEntryPayloadOffset(e) */
+/* payload length must be computed from the item size: LION_ENTRY_PAYLOAD_LEN() */
 
 #define LION_MAX_KEY_SIZE		2000
 #define LION_DEFAULT_INLINE_LIMIT 4096
@@ -926,6 +1011,15 @@ typedef struct LionState
 	FmgrInfo	extractquery;	/* support proc 3 */
 
 	/*
+	 * The column STORES POSITIONS (DESIGN.md §17, "Stored positions"): its
+	 * multi-key opclass has support proc 5, which hands back the positions of
+	 * every key proc 2 extracts, in the same order.  Every VALUE entry of the
+	 * column then carries LION_ENTRY_POSITIONS.
+	 */
+	bool		positions;
+	FmgrInfo	positionsproc;	/* support proc 5 */
+
+	/*
 	 * The column has SUMMARY POSTING SETS (DESIGN.md §32): its bit in the meta
 	 * page's summary_cols.  Only ever set on an ordered scalar column, and only
 	 * on a version 7 index; inserts keep the summaries current and ranges read
@@ -1014,7 +1108,8 @@ lion_index_row_column(const LionIndexState *ix)
 #define LION_EXTRACTVALUE_PROC	2
 #define LION_EXTRACTQUERY_PROC	3
 #define LION_CMP_PROC			4	/* btree comparison of the KEY type (§21) */
-#define LION_NPROC				4
+#define LION_POSITIONS_PROC		5	/* word positions per extracted key (§17) */
+#define LION_NPROC				5
 
 /*
  * What a query over a multi-key index selects.
@@ -1074,6 +1169,35 @@ typedef struct LionQuery
 extern int lion_extract_value(LionState *state, Datum value, Datum **keys);
 
 /*
+ * The positions of one extracted key, as support proc 5 returns them: npos
+ * WordEntryPos values (weight << 14 | position), ascending by position.
+ * npos 0 is a key of a tsvector stripped of positions.
+ */
+typedef struct LionKeyPositions
+{
+	uint16		npos;
+	const uint16 *pos;
+} LionKeyPositions;
+
+/*
+ * lion_extract_value() for a column that stores positions: (*pos)[i] are the
+ * positions of (*keys)[i].
+ */
+extern int lion_extract_value_pos(LionState *state, Datum value, Datum **keys,
+								  LionKeyPositions **pos);
+extern void lion_posmember_from_key(LionPosMember *m, uint64 code,
+									const LionKeyPositions *kp);
+
+/*
+ * An aligned copy of the INLINE entry's positions chunk into buf (capacity
+ * LION_CONTAINER_MAX_SIZE): false when it has no positions section.  A
+ * section that is not one well-formed chunk is an ERROR.
+ */
+extern bool lion_entry_inline_poschunk(Relation index, const LionEntryTuple *e,
+									   Size itemsz, BlockNumber blkno,
+									   OffsetNumber off, LionContainer *buf);
+
+/*
  * Extract a query with support proc 3 and work out how its keys combine
  * (DESIGN.md §17).  Everything is palloc'd in the current context.
  */
@@ -1091,6 +1215,8 @@ extern void lion_extract_query(LionState *state, Datum query,
  */
 extern void lion_extract_query_superset(LionState *state, Datum query,
 									   StrategyNumber strategy, LionQuery *q);
+extern bool lion_tsquery_item_keys(LionState *state, Datum query,
+								   StrategyNumber strategy, Datum **itemkeys);
 
 
 /* ---------- the page layer (lion_pages.c, lion_meta.c, lion_state.c, lion_entry.c,
@@ -1458,6 +1584,18 @@ extern Buffer lion_posting_search(Relation index, Relation heaprel,
 								  int lockmode, bool forwrite);
 
 /*
+ * lion_posting_search() routed by the last separator strictly below ckey
+ * rather than at or below it: the leaf that holds what sorts just before
+ * ckey (the leftmost leaf for ckey 0).  A position tree's separators repeat
+ * when one ckey's members fill several leaves, and every one of those leaves
+ * is to the right of this one (DESIGN.md §17).
+ */
+extern Buffer lion_posting_search_before(Relation index, Relation heaprel,
+										 uint32 hash, BlockNumber root,
+										 uint32 ckey, int lockmode,
+										 bool forwrite);
+
+/*
  * A reader's descent of the set rooted at head, stopped at `level`: the page
  * of that level the separators route ckey to, locked SHARE, or InvalidBuffer.
  * For lion_index_verify() (DESIGN.md §7), as lion_dir_search_level() is.
@@ -1593,6 +1731,8 @@ extern void lion_chain_put_container(Relation index, Relation heaprel,
 
 /* Page-level min/max maintenance after any change of a container page's items. */
 extern void lion_page_update_minmax(Page page);
+extern LionContainer *lion_page_poschunk_fetch(Relation index, Page page,
+											   BlockNumber blkno, OffsetNumber off);
 
 /* Convenience: read the meta page once and validate it (used by lion_get_state). */
 extern void lion_read_meta(Relation index, LionMetaPageData *meta);
@@ -1663,8 +1803,40 @@ extern int64 lion_container_to_tbm(const LionContainer *c, TIDBitmap *tbm,
 extern Size lion_inline_fetch(const char *payload, Size paylen, Size *off,
 							 LionContainer *buf);
 
-/* Length in bytes of an INLINE entry's payload, given the page item size. */
-#define LION_ENTRY_PAYLOAD_LEN(e, itemsz)	((Size) (itemsz) - LionEntryPayloadOffset(e))
+/*
+ * The positions extension of e, or NULL for an entry without one.  Entries
+ * sit MAXALIGNed on their pages, and so does the extension.
+ */
+static inline LionEntryPosExt *
+lion_entry_posext(const LionEntryTuple *e)
+{
+	if ((e->flags & LION_ENTRY_POSITIONS) == 0)
+		return NULL;
+	return (LionEntryPosExt *) ((char *) e + LionEntryExtOffset(e));
+}
+
+/*
+ * Bytes of an INLINE entry's positions section, given the page item size:
+ * never more than what follows the payload offset, whatever pos_len claims
+ * (lion_page_entry_fetch() and verify report a pos_len that overruns).
+ */
+static inline Size
+lion_entry_pos_len(const LionEntryTuple *e, Size itemsz)
+{
+	const LionEntryPosExt *x = lion_entry_posext(e);
+	Size		off = LionEntryPayloadOffset(e);
+
+	if (x == NULL || itemsz <= off)
+		return 0;
+	return Min((Size) x->pos_len, itemsz - off);
+}
+
+/*
+ * Length in bytes of an INLINE entry's payload - its container items and
+ * their slack, not its positions - given the page item size.
+ */
+#define LION_ENTRY_PAYLOAD_LEN(e, itemsz) \
+	((Size) (itemsz) - LionEntryPayloadOffset(e) - lion_entry_pos_len((e), (itemsz)))
 
 /*
  * Fill *ix - every key column of it - using the supplied meta page image.
@@ -1791,6 +1963,13 @@ extern LionEntryTuple *lion_entry_rebuild_slack(const LionEntryTuple *entry,
 												const char *payload,
 												Size payloadlen, Size allocsz,
 												Size *size);
+extern LionEntryTuple *lion_entry_rebuild_pos(const LionEntryTuple *entry,
+											  const char *payload,
+											  Size payloadlen, Size payarea,
+											  const char *positions,
+											  Size poslen, Size *size);
+extern LionEntryTuple *lion_entry_add_posext(const LionEntryTuple *shape,
+											 Size *size);
 
 /*
  * How many bytes to give an INLINE entry an INSERT is rewriting: its payload
@@ -1857,6 +2036,10 @@ extern void lion_chain_put_items_locked(Relation index, Relation heaprel,
 extern void lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 							OffsetNumber entryoff, LionEntryTuple *entry,
 							const char *payload, Size paylen);
+extern void lion_entry_spill_pos(Relation index, Relation heaprel,
+								 Buffer entrybuf, OffsetNumber entryoff,
+								 LionEntryTuple *entry, const char *payload,
+								 Size paylen, const LionContainer *poschunk);
 
 /*
  * Does `head` name the live root of a posting set whose key hashes to `hash`?
@@ -1980,6 +2163,62 @@ extern void lion_chain_put_container_locked_ext(Relation index, Relation heaprel
 											   Buffer entrybuf, OffsetNumber entryoff,
 											   LionEntryTuple *entry, LionContainer *c,
 											   int *ncontainers_delta, bool slack);
+
+/*
+ * The tree a leaf write goes to: a key's posting tree, whose entry travels in
+ * every record that changes it, or one of its position trees (DESIGN.md §17),
+ * which has no entry to keep in step.  root is the owner stamp of every page
+ * of the tree, kind the page kind its pages carry (0 or LION_PAGE_POSITIONS).
+ * entry is NULL exactly when kind is LION_PAGE_POSITIONS.
+ */
+typedef struct LionTreeRef
+{
+	uint32		hash;
+	BlockNumber root;
+	uint16		kind;
+	Buffer		entrybuf;
+	OffsetNumber entryoff;
+	LionEntryTuple *entry;
+} LionTreeRef;
+
+/*
+ * lion_chain_put_items_locked_ext() for either kind of tree.  For a position
+ * tree the items are position chunks, ordered by header ckey (which, unlike
+ * the posting tree's, may repeat), and buf is a leaf of that tree.
+ */
+extern void lion_tree_put_items_locked(Relation index, Relation heaprel,
+									   Buffer buf, const LionTreeRef *tree,
+									   OffsetNumber off, bool replace,
+									   LionContainer **items, int nitems,
+									   bool slack);
+
+/*
+ * Position trees (lion_postree.c): a key's position chunks once they outgrow
+ * its entry.  put replaces a member of the same code and says so; the caller
+ * holds the key's directory leaf EXCLUSIVE.  fetch is a reader's lookup.
+ */
+extern BlockNumber lion_postree_create(Relation index, Relation heaprel,
+									   uint32 hash);
+extern bool lion_postree_put(Relation index, Relation heaprel, uint32 hash,
+							 BlockNumber root, const LionPosMember *m);
+extern bool lion_postree_fetch(Relation index, uint32 hash, BlockNumber root,
+							   uint64 code, LionPosMember *m);
+
+/*
+ * The position filter (lion_posfilter.c): a tsquery decided exactly, member
+ * by member, from the positions a column stores.  begin returns NULL when the
+ * query has an operand it cannot follow (a prefix lexeme).
+ */
+typedef struct LionPosFilter LionPosFilter;
+extern LionPosFilter *lion_posfilter_begin(Relation index, LionState *col,
+										   Datum query, StrategyNumber strategy);
+extern int	lion_posfilter_container(LionPosFilter *pf, const LionContainer *c,
+									 uint16 *keep);
+extern const LionContainer *lion_posfilter_apply(LionPosFilter *pf,
+												 const LionContainer *c);
+extern void lion_posfilter_counts(const LionPosFilter *pf, int64 *nchecked,
+								  int64 *nremoved);
+extern void lion_posfilter_end(LionPosFilter *pf);
 
 /*
  * The number of DIRECTORY PAGES the current backend has read: the counter

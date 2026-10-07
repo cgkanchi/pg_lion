@@ -671,7 +671,9 @@ lion_count_groups_decode(Relation heap, Snapshot snapshot, int ncol,
 		/* ... of them, the ones the WHERE keeps */
 		if (mat != NULL)
 		{
-			const LionContainer *w = lion_mat_container(&base, mat, idx, buf);
+			/* through the position filters, once a key (lion_count.c) */
+			const LionContainer *w =
+				lion_count_posfilter(&base, lion_mat_container(&base, mat, idx, buf));
 
 			if (w->type == LION_CT_BITSET)
 				wbits = LION_BITSET_DATA(w);
@@ -727,7 +729,7 @@ lion_count_groups_decode(Relation heap, Snapshot snapshot, int ncol,
 			 * lion_count_container_vm()).
 			 */
 			LION_INJECTION_POINT("lion-count-containers-pinned");
-			if (base.in_recovery || base.filter != NULL)
+			if (base.in_recovery || lion_row_filter_heap(base.filter))
 				allvis = 0;
 			else
 			{

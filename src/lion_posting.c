@@ -350,7 +350,7 @@ lion_posting_getbuf(Relation index, BlockNumber blk, BlockNumber head,
 	LockBuffer(buf, lockmode);
 	page = BufferGetPage(buf);
 
-	if (!lion_page_owns(page, head))
+	if (!lion_page_owns_tree(page, head))
 	{
 		UnlockReleaseBuffer(buf);
 		if (strict)
@@ -376,21 +376,26 @@ lion_posting_getbuf(Relation index, BlockNumber blk, BlockNumber head,
  * the move-right rule walks to it.  blk is the page's block, for the ERROR a
  * damaged pivot raises; an offset past the last item comes back as it is, for
  * lion_posting_downlink() to refuse.
+ *
+ * With `before` it is the last separator strictly BELOW ckey instead: the
+ * child that holds what sorts just before ckey, which is where a position
+ * tree's reader of ckey starts (lion_posting_search_before()).
  */
 static OffsetNumber
 lion_posting_downlink_off(Relation index, Page page, BlockNumber blk,
-						  uint32 ckey)
+						  uint32 ckey, bool before)
 {
 	OffsetNumber first = lion_posting_first_data(page);
 	OffsetNumber lo = first;
 	OffsetNumber hi = OffsetNumberNext(PageGetMaxOffsetNumber(page));
 
-	/* first offset whose separator is strictly above ckey */
+	/* first offset whose separator is above ckey (at or above, before) */
 	while (lo < hi)
 	{
 		OffsetNumber mid = lo + (hi - lo) / 2;
+		uint32		sep = lion_posting_pivot_at(index, page, blk, mid)->ckey;
 
-		if (lion_posting_pivot_at(index, page, blk, mid)->ckey > ckey)
+		if (before ? sep >= ckey : sep > ckey)
 			hi = mid;
 		else
 			lo = OffsetNumberNext(mid);
@@ -443,9 +448,31 @@ lion_posting_restart(Relation index, BlockNumber head, int *restarts,
  * The descent
  * --------------------------------------------------------------------- */
 
+static Buffer lion_posting_descend(Relation index, Relation heaprel,
+								   uint32 hash, BlockNumber head, uint32 ckey,
+								   bool before, int lockmode, bool forwrite);
+
 Buffer
 lion_posting_search(Relation index, Relation heaprel, uint32 hash,
 					BlockNumber head, uint32 ckey, int lockmode, bool forwrite)
+{
+	return lion_posting_descend(index, heaprel, hash, head, ckey, false,
+								lockmode, forwrite);
+}
+
+Buffer
+lion_posting_search_before(Relation index, Relation heaprel, uint32 hash,
+						   BlockNumber root, uint32 ckey, int lockmode,
+						   bool forwrite)
+{
+	return lion_posting_descend(index, heaprel, hash, root, ckey, true,
+								lockmode, forwrite);
+}
+
+static Buffer
+lion_posting_descend(Relation index, Relation heaprel, uint32 hash,
+					 BlockNumber head, uint32 ckey, bool before, int lockmode,
+					 bool forwrite)
 {
 	Buffer		buf;
 	Page		page;
@@ -486,7 +513,7 @@ restart:
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 		LockBuffer(buf, lockmode);
 		page = BufferGetPage(buf);
-		if (!lion_page_owns(page, head))
+		if (!lion_page_owns_tree(page, head))
 		{
 			UnlockReleaseBuffer(buf);
 			if (forwrite)
@@ -534,7 +561,7 @@ restart:
 			{
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 				LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-				if (!lion_page_owns(BufferGetPage(buf), head))
+				if (!lion_page_owns_tree(BufferGetPage(buf), head))
 					elog(ERROR, "lion index \"%s\": the posting set at %u went away under a writer",
 						 RelationGetRelationName(index), head);
 			}
@@ -545,9 +572,14 @@ restart:
 			goto restart;
 		}
 
-		/* An internal page whose high key no longer exceeds ckey: move right. */
+		/*
+		 * An internal page whose high key no longer exceeds ckey (no longer
+		 * reaches it, before): move right.
+		 */
 		if (level > 0 && !LionPageIsRightmost(page) &&
-			lion_posting_highkey_at(index, page, blk)->ckey <= ckey)
+			(before ?
+			 lion_posting_highkey_at(index, page, blk)->ckey < ckey :
+			 lion_posting_highkey_at(index, page, blk)->ckey <= ckey))
 		{
 			buf = lion_posting_step_right(index, buf, head, BUFFER_LOCK_SHARE,
 										  forwrite, &walk);
@@ -611,7 +643,8 @@ restart:
 
 		child = lion_posting_downlink(index, page, blk,
 									  lion_posting_downlink_off(index, page,
-																blk, ckey));
+																blk, ckey,
+																before));
 		childlock = (level == 1) ? lockmode : BUFFER_LOCK_SHARE;
 
 		/* Release the parent BEFORE locking the child; see the file header. */
@@ -729,7 +762,8 @@ restart:
 
 		child = lion_posting_downlink(index, page, blk,
 									  lion_posting_downlink_off(index, page,
-																blk, ckey));
+																blk, ckey,
+																false));
 
 		/* Release the parent BEFORE locking the child; see the file header. */
 		UnlockReleaseBuffer(buf);
@@ -857,6 +891,7 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	int			nmoved;
 	LionEntryTuple *logged = NULL;
 	Size		loggedsz = 0;
+	uint16		kind = LionPageGetOpaque(page)->flags & LION_PAGE_POSITIONS;
 
 	Assert(LionPageIsContainer(page));
 	Assert(!LionPageIncompleteSplit(page));
@@ -877,7 +912,9 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	lion_page_check_items(index, page, head);
 	for (off = FirstOffsetNumber; off <= maxoff; off++)
 	{
-		if (level == 0)
+		if (level == 0 && kind != 0)
+			(void) lion_page_poschunk_fetch(index, page, head, off);
+		else if (level == 0)
 			(void) lion_page_item_fetch(index, page, head, off);
 		else
 			(void) lion_posting_pivot_at(index, page, head, off);
@@ -898,7 +935,7 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	 * is copied here because an rmgr-mode record is a critical section, where
 	 * nothing may be palloc'd.
 	 */
-	if (level == 0)
+	if (level == 0 && kind == 0)
 	{
 		Page		epage;
 		LionEntryTuple *onpage;
@@ -926,7 +963,7 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	 * one downlink below, with no full-page image at all.
 	 */
 	pR = lion_wal_register_buffer(xstate, buf, LION_WALBUF_INIT);
-	pC = lion_wal_init_buffer(xstate, cbuf, LION_PAGE_CONTAINER);
+	pC = lion_wal_init_buffer(xstate, cbuf, LION_PAGE_CONTAINER | kind);
 
 	/* The child takes the root's items, at the bytes they were allotted. */
 	LionPageGetOpaque(pC)->level = level;
@@ -956,8 +993,8 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	lion_wal_log_special(xstate, pC);
 
 	/* ... and the root block becomes the level above, with one downlink. */
-	lion_init_page(pR, LION_PAGE_CONTAINER);
-	lion_wal_op(xstate, pR, LION_OP_INIT, 0, LION_PAGE_CONTAINER, NULL, 0);
+	lion_init_page(pR, LION_PAGE_CONTAINER | kind);
+	lion_wal_op(xstate, pR, LION_OP_INIT, 0, LION_PAGE_CONTAINER | kind, NULL, 0);
 	LionPageGetOpaque(pR)->level = level + 1;
 	lion_page_set_owner(pR, hash, head);
 	pivot.ckey = 0;				/* minus infinity: it owns everything */
@@ -975,7 +1012,7 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	}
 	lion_wal_log_special(xstate, pR);
 
-	if (level == 0)
+	if (logged != NULL)
 	{
 		if (!lion_replace_entry(index, xstate, entrybuf, entryoff, logged,
 								loggedsz))
@@ -998,7 +1035,9 @@ lion_posting_root_pushdown(Relation index, Relation heaprel, Buffer buf,
 						   LionEntryTuple *entry)
 {
 	Assert(LionPageIsPostingLeaf(BufferGetPage(buf)));
-	Assert(BufferGetBlockNumber(buf) == entry->head);
+	Assert(entry == NULL ?
+		   (LionPageGetOpaque(BufferGetPage(buf))->flags & LION_PAGE_POSITIONS) != 0 :
+		   BufferGetBlockNumber(buf) == entry->head);
 
 	return lion_posting_pushdown(index, heaprel, buf, entrybuf, entryoff,
 								 entry);
@@ -1064,6 +1103,7 @@ lion_posting_split_internal(Relation index, Relation heaprel, uint32 hash,
 							const LionPostingHeld *held)
 {
 	Page		page = BufferGetPage(buf);
+	uint16		kind = LionPageGetOpaque(page)->flags & LION_PAGE_POSITIONS;
 	BlockNumber pblk = BufferGetBlockNumber(buf);
 	uint16		level = LionPageGetOpaque(page)->level;
 	BlockNumber oldright = LionPageGetOpaque(page)->rightlink;
@@ -1142,11 +1182,11 @@ lion_posting_split_internal(Relation index, Relation heaprel, uint32 hash,
 	 * full-page image.
 	 */
 	pP = lion_wal_register_buffer(xstate, buf, LION_WALBUF_INIT);
-	pR = lion_wal_init_buffer(xstate, rbuf, LION_PAGE_CONTAINER);
+	pR = lion_wal_init_buffer(xstate, rbuf, LION_PAGE_CONTAINER | kind);
 
-	lion_init_page(pP, LION_PAGE_CONTAINER | LION_PAGE_INCOMPLETE_SPLIT);
+	lion_init_page(pP, LION_PAGE_CONTAINER | LION_PAGE_INCOMPLETE_SPLIT | kind);
 	lion_wal_op(xstate, pP, LION_OP_INIT, 0,
-				LION_PAGE_CONTAINER | LION_PAGE_INCOMPLETE_SPLIT, NULL, 0);
+				LION_PAGE_CONTAINER | LION_PAGE_INCOMPLETE_SPLIT | kind, NULL, 0);
 	LionPageGetOpaque(pP)->level = level;
 	LionPageGetOpaque(pP)->rightlink = rblk;
 	lion_page_set_owner(pP, hash, head);
@@ -1534,7 +1574,8 @@ lion_posting_level_start(Relation index, BlockNumber head, uint16 level,
 				blk = BufferGetBlockNumber(buf);
 				lion_posting_check_level(index, page, blk, plevel);
 			}
-			off = lion_posting_downlink_off(index, page, blk, routeckey);
+			off = lion_posting_downlink_off(index, page, blk, routeckey,
+											false);
 		}
 		else
 			off = lion_posting_first_data(page);

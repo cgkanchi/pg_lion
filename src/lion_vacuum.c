@@ -324,6 +324,9 @@ typedef struct LionVacEntry
 	int			kind;			/* LION_KIND_* */
 	uint16		keylen;
 	char	   *keydata;
+	BlockNumber posroot;		/* its position tree, when it has one: what
+								 * pass 2 walked, and what the final step
+								 * frees with it (DESIGN.md §17) */
 } LionVacEntry;
 
 /*
@@ -385,6 +388,8 @@ typedef struct LionVacInline
 	LionEntryTuple *tuple;
 	char	   *payload;		/* the filtered payload, for a spill */
 	Size		paylen;
+	LionContainer *poschunk;	/* its filtered positions, for a spill: NULL
+								 * when it has none (DESIGN.md §17) */
 	bool		spill;			/* it no longer fits: move it to a chain */
 } LionVacInline;
 
@@ -415,6 +420,8 @@ static LionEntryTuple *lion_vacuum_entry_copy(Relation index, Buffer entrybuf,
 static void lion_vacuum_free_chain(LionVacState *vs, uint32 hash,
 								  BlockNumber head);
 static void lion_vacuum_sweep(LionVacState *vs);
+static void lion_vacuum_postree(LionVacState *vs, BlockNumber root);
+static void lion_vac_free_page(LionVacState *vs, Buffer buf, BlockNumber blk);
 static bool lion_vac_may_write(Relation index);
 static bool lion_vac_may_count(Relation index, LionIndexState *ix);
 static void lion_vacuum_count_keys(IndexVacuumInfo *info);
@@ -432,6 +439,22 @@ lion_vac_is_dead(uint16 lo, void *arg)
 	lion_code_to_tid(lion_make_code(pred->ckey, lo), &tid);
 
 	return pred->callback(&tid, pred->callback_state);
+}
+
+/*
+ * The same predicate for lion_poschunk_remove(), whose members carry whole
+ * TID codes (DESIGN.md §17).  Every member asks (V2): it is how a member
+ * left behind by an insert that never added its TID goes.
+ */
+static bool
+lion_vac_pos_is_dead(uint64 code, void *arg)
+{
+	LionVacState *vs = (LionVacState *) arg;
+	ItemPointerData tid;
+
+	lion_code_to_tid(code, &tid);
+
+	return vs->callback(&tid, vs->callback_state);
 }
 
 /*
@@ -930,6 +953,71 @@ lion_vac_inline_append(LionVacState *vs, StringInfo newpay, LionContainer *item,
 }
 
 /*
+ * The rest of lion_vacuum_inline_filter() for an entry that stores positions
+ * (DESIGN.md §17): its inline chunk loses the members of the TIDs its payload
+ * lost, in the same rewrite and so in the same record (V1 for an INLINE
+ * entry), and the entry is rebuilt with both sections - or, when the payload
+ * grew out of the entry, set to spill with the filtered chunk.
+ *
+ * The chunk is filtered by asking the callback about every member (V2), and
+ * then has to hold exactly one member per TID left, as an INLINE entry
+ * always does: anything else is a damaged entry.
+ */
+static void
+lion_vacuum_inline_positions(LionVacState *vs, BlockNumber blkno,
+							 OffsetNumber off,
+							 const LionEntryTuple *entry, Size itemsz,
+							 uint64 ntids, Size inlinemax, LionVacInline *res)
+{
+	Size		payoff = LionEntryPayloadOffset(entry);
+	Size		oldposlen = lion_entry_pos_len(entry, itemsz);
+	Size		oldarea = itemsz - oldposlen - payoff;
+	Size		poslen = 0;
+	Size		payarea;
+	LionContainer *chunk = (LionContainer *) palloc0(LION_CONTAINER_MAX_SIZE);
+
+	if (lion_entry_inline_poschunk(vs->index, entry, itemsz, blkno, off,
+								   chunk))
+		(void) lion_poschunk_remove(chunk, lion_vac_pos_is_dead, vs);
+	else
+		chunk->cardinality = 0;
+
+	if ((uint64) chunk->cardinality != ntids)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": entry %u holds %llu TIDs after VACUUM, but positions for %u",
+						RelationGetRelationName(vs->index), off,
+						(unsigned long long) ntids, chunk->cardinality)));
+	if (ntids > 0)
+		poslen = lion_poschunk_size(chunk);
+
+	/* Kept for a spill, which the write may still find it needs. */
+	res->poschunk = (poslen > 0) ? chunk : NULL;
+
+	if ((MAXALIGN(payoff + res->paylen) - payoff) + poslen > inlinemax)
+	{
+		/* It grew out of the entry: both sections spill. */
+		res->spill = true;
+		res->tuple = lion_entry_rebuild_pos(entry, NULL, 0, 0, NULL, 0,
+											&res->writesz);
+		return;
+	}
+
+	/*
+	 * The payload keeps the area it had, slack and all, as long as it fits
+	 * there and the slack stays bounded (lion_vacuum_inline_filter()); the
+	 * positions follow it at their filtered size.
+	 */
+	payarea = res->paylen;
+	if (res->paylen <= oldarea && oldarea - res->paylen <= LION_ENTRY_SLACK_BOUND &&
+		(MAXALIGN(payoff + oldarea) - payoff) + poslen <= inlinemax)
+		payarea = oldarea;
+	res->tuple = lion_entry_rebuild_pos(entry, res->payload, res->paylen,
+										payarea, (const char *) chunk, poslen,
+										&res->writesz);
+}
+
+/*
  * Filter the payload of one INLINE entry, which pass 1 has under a cleanup
  * lock, and say what has to happen to it.  Nothing is written here.
  *
@@ -962,8 +1050,8 @@ lion_vac_inline_append(LionVacState *vs, StringInfo newpay, LionContainer *item,
  * page is done.
  */
 static bool
-lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
-						 LionVacInline *res)
+lion_vacuum_inline_filter(LionVacState *vs, Page page, BlockNumber blkno,
+						 OffsetNumber off, LionVacInline *res)
 {
 	ItemId		iid = PageGetItemId(page, off);
 	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
@@ -1028,10 +1116,20 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, OffsetNumber off,
 	res->spill = false;
 	res->payload = newpay.data;
 	res->paylen = (Size) newpay.len;
+	res->poschunk = NULL;
 
 	payoff = LionEntryPayloadOffset(entry);
 	need = payoff + res->paylen;
 	inlinemax = lion_inline_max(payoff, (Size) vs->ix->meta.inline_limit);
+
+	if ((entry->flags & LION_ENTRY_POSITIONS) != 0)
+	{
+		lion_vacuum_inline_positions(vs, blkno, off, entry, itemsz, ntids,
+									 inlinemax, res);
+		res->tuple->ncontainers = ncontainers;
+		res->tuple->ntids = ntids;
+		return true;
+	}
 
 	/*
 	 * A filtered payload that still fits inside the bytes this entry already
@@ -1351,11 +1449,12 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		ent->kind = lion_entry_kind(entry);
 		ent->keylen = entry->keylen;
 		ent->keydata = NULL;
+		ent->posroot = InvalidBlockNumber;
 
 		if ((entry->flags & LION_ENTRY_INLINE) != 0)
 		{
 			ent->ischain = false;
-			if (lion_vacuum_inline_filter(vs, page, off, &inl[ninl]))
+			if (lion_vacuum_inline_filter(vs, page, blk, off, &inl[ninl]))
 			{
 				ent->maydelete = (inl[ninl].tuple->ntids == 0);
 				ninl++;
@@ -1479,8 +1578,26 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 			if (!inl[i].spill)
 				continue;
 			lion_wal_removal_begin(buf);
-			lion_entry_spill(vs->index, vs->heaprel, buf, inl[i].off,
-							inl[i].tuple, inl[i].payload, inl[i].paylen);
+			if ((inl[i].tuple->flags & LION_ENTRY_POSITIONS) != 0)
+			{
+				/*
+				 * The spill writes the entry in CHAIN shape, and the tuple
+				 * may be the INLINE one the overwrite above had no room for:
+				 * its positions go with the chunk, not with the entry.
+				 */
+				Size		chainsz;
+				LionEntryTuple *chain = lion_entry_rebuild_pos(inl[i].tuple,
+															   NULL, 0, 0,
+															   NULL, 0,
+															   &chainsz);
+
+				lion_entry_spill_pos(vs->index, vs->heaprel, buf, inl[i].off,
+									 chain, inl[i].payload, inl[i].paylen,
+									 inl[i].poschunk);
+			}
+			else
+				lion_entry_spill(vs->index, vs->heaprel, buf, inl[i].off,
+								inl[i].tuple, inl[i].payload, inl[i].paylen);
 			lion_wal_removal_end();
 			nspill++;
 			vs->prof.records++;
@@ -1700,8 +1817,268 @@ lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 	entry = lion_page_entry(BufferGetPage(ref.buf), ref.off);
 	lion_vac_count(vs, entry, entry->ntids);
 	ent->maydelete = (entry->ntids == 0 && entry->ncontainers == 0);
+	if ((entry->flags & LION_ENTRY_POSITIONS) != 0)
+		ent->posroot = lion_entry_posext(entry)->pos_root;
 	LockBuffer(ref.buf, BUFFER_LOCK_UNLOCK);
 	ReleaseBuffer(ref.buf);
+
+	/*
+	 * Then its positions (DESIGN.md §17): after every leaf of the posting
+	 * set, so that no TID of this cycle is still in the set when its
+	 * positions go (V1).
+	 */
+	if (BlockNumberIsValid(ent->posroot))
+		lion_vacuum_postree(vs, ent->posroot);
+}
+
+/*
+ * Filter one leaf of a position tree, which the caller holds EXCLUSIVE:
+ * every member asks the callback (V2).  A chunk left empty is deleted,
+ * except the leaf's first, which keeps the leaf's separator (P3 of
+ * lion_postree.c); the rest are written back at their size, keeping their
+ * slack while it is bounded.  One record, and no cleanup lock: no reader's
+ * correctness rests on a position page (DESIGN.md §17).
+ */
+static void
+lion_vacuum_postree_leaf(LionVacState *vs, Buffer buf)
+{
+	Page		page = BufferGetPage(buf);
+	BlockNumber blk = BufferGetBlockNumber(buf);
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+	OffsetNumber off;
+	OffsetNumber *delofs;
+	OffsetNumber *workofs;
+	LionContainer **work;
+	Size	   *worksz;
+	LionContainer *scratch;
+	int			ndel = 0;
+	int			nwork = 0;
+	int			i;
+	LionWalState *xstate;
+	Page		p;
+	instr_time	t0;
+
+	if (maxoff < FirstOffsetNumber)
+		return;
+
+	delofs = (OffsetNumber *) palloc(sizeof(OffsetNumber) * maxoff);
+	workofs = (OffsetNumber *) palloc(sizeof(OffsetNumber) * maxoff);
+	work = (LionContainer **) palloc(sizeof(LionContainer *) * maxoff);
+	worksz = (Size *) palloc(sizeof(Size) * maxoff);
+	scratch = (LionContainer *) palloc0(LION_CONTAINER_MAX_SIZE);
+
+	INSTR_TIME_SET_CURRENT(t0);
+	for (off = FirstOffsetNumber; off <= maxoff; off++)
+	{
+		LionContainer *c = lion_page_poschunk_fetch(vs->index, page, blk, off);
+		Size		lplen = ItemIdGetLength(PageGetItemId(page, off));
+		Size		newsize;
+
+		memcpy(scratch, c, lplen);
+		if (lion_poschunk_remove(scratch, lion_vac_pos_is_dead, vs) == 0)
+			continue;
+
+		if (scratch->cardinality == 0 && off != FirstOffsetNumber)
+		{
+			delofs[ndel++] = off;
+			continue;
+		}
+
+		newsize = lion_poschunk_size(scratch);
+		worksz[nwork] = (lplen - newsize <= LION_ITEM_SLACK_BOUND) ? lplen : newsize;
+		work[nwork] = (LionContainer *) palloc(worksz[nwork]);
+		memcpy(work[nwork], scratch, worksz[nwork]);
+		workofs[nwork++] = off;
+	}
+	lion_vac_tick(&vs->prof.filter, t0);
+
+	if (ndel > 0 || nwork > 0)
+	{
+		INSTR_TIME_SET_CURRENT(t0);
+		xstate = lion_wal_begin(vs->index);
+		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
+		if (ndel > 0)
+		{
+			PageIndexMultiDelete(p, delofs, ndel);
+			lion_wal_op(xstate, p, LION_OP_MULTIDEL, 0, (uint16) ndel,
+						delofs, sizeof(OffsetNumber) * ndel);
+			for (i = 0; i < nwork; i++)
+			{
+				int			shift = 0;
+				int			j;
+
+				for (j = 0; j < ndel; j++)
+					if (delofs[j] < workofs[i])
+						shift++;
+				workofs[i] -= shift;
+			}
+		}
+		for (i = 0; i < nwork; i++)
+		{
+			lion_wal_save_item(xstate, p, workofs[i]);
+			if (!PageIndexTupleOverwrite(p, workofs[i], work[i], worksz[i]))
+				elog(ERROR, "lion index: filtered position chunk %u on block %u no longer fits",
+					 workofs[i], blk);
+			lion_wal_op_replace(xstate, p, workofs[i], work[i], worksz[i]);
+		}
+		lion_page_update_minmax(p);
+		lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
+		lion_wal_finish(xstate, LION_XLOG_VACUUM_PAGE);
+		lion_vac_tick(&vs->prof.apply, t0);
+
+		vs->prof.pages_changed++;
+		vs->prof.records++;
+		vs->prof.items_rewritten += nwork;
+		vs->prof.items_deleted += ndel;
+	}
+
+	for (i = 0; i < nwork; i++)
+		pfree(work[i]);
+	pfree(scratch);
+	pfree(worksz);
+	pfree(work);
+	pfree(workofs);
+	pfree(delofs);
+}
+
+/*
+ * Pass 2 for a CHAIN entry's position tree (DESIGN.md §17): mark every page
+ * of it visited, so that the sweep leaves the tree alone, and filter every
+ * leaf, left to right, one page at a time and EXCLUSIVE.
+ *
+ * Inserts into the key go on meanwhile; they split leaves only to the right
+ * and push the root down, and a page made after this walk passed is full,
+ * names a live root, and is kept by the sweep (lion_vac_postree_root_live()).
+ * A root that was a leaf when the descent read it and is not one when the
+ * leaf walk locks it has been pushed down: the walk starts again, which
+ * re-filters what it had done, at the cost of a callback per member.
+ */
+static void
+lion_vacuum_postree(LionVacState *vs, BlockNumber root)
+{
+	Relation	index = vs->index;
+	int			attempt;
+
+	for (attempt = 0;; attempt++)
+	{
+		BlockNumber blk = root;
+		int			depth = 0;
+		LionRightWalk walk;
+		bool		restart = false;
+
+		/* down the leftmost path, every internal level walked and marked */
+		for (;;)
+		{
+			Buffer		buf = ReadBuffer(index, blk);
+			Page		page;
+			BlockNumber child;
+			BlockNumber lblk;
+
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+			if (!lion_page_owns_positions(page, root))
+			{
+				UnlockReleaseBuffer(buf);
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("lion index \"%s\": block %u is not a page of the position tree at %u",
+								RelationGetRelationName(index), blk, root)));
+			}
+			if (LionPageIsPostingLeaf(page))
+			{
+				UnlockReleaseBuffer(buf);
+				break;
+			}
+			if (depth > LION_POSTING_MAX_HEIGHT)
+			{
+				UnlockReleaseBuffer(buf);
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("lion index \"%s\": the position tree at %u is more than %d levels deep",
+								RelationGetRelationName(index), root,
+								LION_POSTING_MAX_HEIGHT)));
+			}
+			child = lion_posting_downlink(index, page, blk,
+										  lion_posting_first_data(page));
+			UnlockReleaseBuffer(buf);
+
+			/* the rest of this level: nothing to filter, only to mark */
+			lion_rightwalk_init(&walk);
+			lblk = blk;
+			while (BlockNumberIsValid(lblk))
+			{
+				BlockNumber next;
+
+				buf = ReadBuffer(index, lblk);
+				LockBuffer(buf, BUFFER_LOCK_SHARE);
+				page = BufferGetPage(buf);
+				if (!lion_page_owns_positions(page, root))
+				{
+					UnlockReleaseBuffer(buf);
+					ereport(ERROR,
+							(errcode(ERRCODE_INDEX_CORRUPTED),
+							 errmsg("lion index \"%s\": block %u is not a page of the position tree at %u",
+									RelationGetRelationName(index), lblk, root)));
+				}
+				lion_vac_visit(vs, lblk);
+				next = LionPageIsRightmost(page) ? InvalidBlockNumber :
+					LionPageGetOpaque(page)->rightlink;
+				UnlockReleaseBuffer(buf);
+				if (BlockNumberIsValid(next))
+					lion_rightwalk_step(index, &walk, lblk, next);
+				lblk = next;
+				CHECK_FOR_INTERRUPTS();
+			}
+
+			blk = child;
+			depth++;
+		}
+
+		/* the leaves */
+		lion_rightwalk_init(&walk);
+		while (BlockNumberIsValid(blk))
+		{
+			Buffer		buf = ReadBuffer(index, blk);
+			Page		page;
+			BlockNumber next;
+
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			page = BufferGetPage(buf);
+			if (!lion_page_owns_positions(page, root))
+			{
+				UnlockReleaseBuffer(buf);
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("lion index \"%s\": block %u is not a page of the position tree at %u",
+								RelationGetRelationName(index), blk, root)));
+			}
+			if (!LionPageIsPostingLeaf(page))
+			{
+				/* the root, pushed down since the descent read it */
+				UnlockReleaseBuffer(buf);
+				if (blk != root || attempt > LION_POSTING_MAX_HEIGHT)
+					ereport(ERROR,
+							(errcode(ERRCODE_INDEX_CORRUPTED),
+							 errmsg("lion index \"%s\": block %u of the position tree at %u is not a leaf",
+									RelationGetRelationName(index), blk, root)));
+				restart = true;
+				break;
+			}
+			vs->prof.pages_visited++;
+			lion_vac_visit(vs, blk);
+			lion_vacuum_postree_leaf(vs, buf);
+			next = LionPageIsRightmost(page) ? InvalidBlockNumber :
+				LionPageGetOpaque(page)->rightlink;
+			UnlockReleaseBuffer(buf);
+			if (BlockNumberIsValid(next))
+				lion_rightwalk_step(index, &walk, blk, next);
+			blk = next;
+			lion_vacuum_delay_point();
+		}
+
+		if (!restart)
+			return;
+	}
 }
 
 /*
@@ -1729,6 +2106,196 @@ lion_vac_cmp_offset(const void *a, const void *b)
 	return (x < y) ? -1 : ((x > y) ? 1 : 0);
 }
 
+/* An entry the final step deletes, and the position tree it frees with it. */
+typedef struct LionVacDel
+{
+	OffsetNumber off;
+	BlockNumber posroot;
+} LionVacDel;
+
+/*
+ * A position tree whose root went with its entry: the leftmost page of each
+ * level below the root, which the final step frees once the leaf is let go
+ * (lion_vacuum_free_postree()).
+ */
+typedef struct LionVacPosFree
+{
+	BlockNumber root;
+	int			nlevels;
+	BlockNumber levelfirst[LION_POSTING_MAX_HEIGHT + 1];
+} LionVacPosFree;
+
+static int
+lion_vac_cmp_del(const void *a, const void *b)
+{
+	return lion_vac_cmp_offset(&((const LionVacDel *) a)->off,
+							   &((const LionVacDel *) b)->off);
+}
+
+/*
+ * The leftmost page of every level of the position tree at root, below the
+ * root itself, into pf.  The caller holds the key's directory leaf, so no
+ * insert changes the tree's shape meanwhile.
+ */
+static void
+lion_vac_postree_shape(LionVacState *vs, BlockNumber root, LionVacPosFree *pf)
+{
+	BlockNumber blk = root;
+
+	pf->root = root;
+	pf->nlevels = 0;
+	while (BlockNumberIsValid(blk) && pf->nlevels <= LION_POSTING_MAX_HEIGHT)
+	{
+		Buffer		buf = ReadBuffer(vs->index, blk);
+		Page		page;
+		BlockNumber child = InvalidBlockNumber;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!lion_page_owns_positions(page, root))
+		{
+			UnlockReleaseBuffer(buf);
+			break;
+		}
+		if (LionPageGetOpaque(page)->level > 0)
+		{
+			OffsetNumber f = lion_posting_first_data(page);
+
+			if (f <= PageGetMaxOffsetNumber(page))
+				child = lion_posting_pivot(page, f)->child;
+		}
+		UnlockReleaseBuffer(buf);
+
+		if (blk != root)
+			pf->levelfirst[pf->nlevels++] = blk;
+		blk = child;
+	}
+}
+
+/*
+ * Delete the entries at offs (ascending) from the directory leaf buf, which
+ * the caller holds under a cleanup lock, in ONE record with the roots of the
+ * position trees they own (dels[i].posroot, at most LION_WAL_MAX_BLOCKS - 1
+ * of them) marked DELETED (DESIGN.md §17).
+ *
+ * The root has to go in the entry's own record.  The rest of a position tree
+ * is freed afterwards, as a posting set's chain is, and a crash in between
+ * leaves pages the sweep frees because their root is no longer live
+ * (lion_vac_postree_root_live()).  Freed later than its entry, the root
+ * itself would look live for ever after such a crash.  A position tree is
+ * freed whatever it still holds: the posting set is empty, so whatever is
+ * left belongs to rows no TID of the key points at - members of an insert
+ * that failed between its two writes (W1).
+ */
+static void
+lion_vac_delete_group(LionVacState *vs, Buffer buf, OffsetNumber *offs,
+					  int noffs, const LionVacDel *dels, LionVacPosFree *posfree,
+					  int *nposfree)
+{
+	Buffer		rootbufs[LION_WAL_MAX_BLOCKS];
+	BlockNumber roots[LION_WAL_MAX_BLOCKS];
+	int			nroots = 0;
+	LionWalState *xstate;
+	Page		p;
+	FullTransactionId safexid;
+	int			i;
+
+	for (i = 0; i < noffs; i++)
+	{
+		BlockNumber root = dels[i].posroot;
+
+		if (!BlockNumberIsValid(root))
+			continue;
+		Assert(nroots < LION_WAL_MAX_BLOCKS - 1);
+		lion_vac_postree_shape(vs, root, &posfree[*nposfree]);
+		(*nposfree)++;
+		rootbufs[nroots] = ReadBuffer(vs->index, root);
+		LockBuffer(rootbufs[nroots], BUFFER_LOCK_EXCLUSIVE);
+		roots[nroots] = root;
+		if (!lion_page_owns_positions(BufferGetPage(rootbufs[nroots]), root))
+		{
+			UnlockReleaseBuffer(rootbufs[nroots]);
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": block %u is not the root of a position tree",
+							RelationGetRelationName(vs->index), root)));
+		}
+		nroots++;
+	}
+
+	safexid = ReadNextFullTransactionId();
+	xstate = lion_wal_begin(vs->index);
+	p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_CLEANUP);
+	PageIndexMultiDelete(p, offs, noffs);
+	lion_wal_op(xstate, p, LION_OP_MULTIDEL, 0, (uint16) noffs, offs,
+				sizeof(OffsetNumber) * noffs);
+	for (i = 0; i < nroots; i++)
+	{
+		Page		rp = lion_wal_register_buffer(xstate, rootbufs[i],
+												  LION_WALBUF_STD);
+
+		lion_page_set_deleted(rp, safexid);
+		lion_wal_op(xstate, rp, LION_OP_DELETED, 0, 0, &safexid,
+					sizeof(FullTransactionId));
+	}
+	lion_wal_finish(xstate, LION_XLOG_ENTRY);
+	vs->prof.records++;
+
+	for (i = 0; i < nroots; i++)
+	{
+		UnlockReleaseBuffer(rootbufs[i]);
+		RecordFreeIndexPage(vs->index, roots[i]);
+		lion_vac_visit(vs, roots[i]);
+		vs->pages_newly_deleted++;
+		vs->pages_deleted++;
+	}
+}
+
+/*
+ * Free what is left of a position tree whose root went with its entry
+ * (lion_vac_delete_group()): every page of every level, whatever it holds.
+ * As lion_vacuum_free_level(), never a wait: a page that cannot be taken now
+ * is left to the sweep, which frees it because its root is gone.
+ */
+static void
+lion_vacuum_free_postree(LionVacState *vs, const LionVacPosFree *pf)
+{
+	int			l;
+
+	for (l = pf->nlevels - 1; l >= 0; l--)
+	{
+		BlockNumber blk = pf->levelfirst[l];
+		LionRightWalk walk;
+
+		lion_rightwalk_init(&walk);
+		while (BlockNumberIsValid(blk))
+		{
+			Buffer		buf = ReadBuffer(vs->index, blk);
+			Page		page;
+			BlockNumber next;
+
+			if (!ConditionalLockBufferForCleanup(buf))
+			{
+				ReleaseBuffer(buf);
+				break;
+			}
+			page = BufferGetPage(buf);
+			if (!lion_page_owns_positions(page, pf->root))
+			{
+				UnlockReleaseBuffer(buf);
+				break;
+			}
+			next = LionPageIsRightmost(page) ? InvalidBlockNumber :
+				LionPageGetOpaque(page)->rightlink;
+			lion_vac_free_page(vs, buf, blk);
+			if (BlockNumberIsValid(next))
+				lion_rightwalk_step(vs->index, &walk, blk, next);
+			blk = next;
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
+}
+
 static void
 lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
 						  int nents)
@@ -1738,8 +2305,11 @@ lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
 	BlockNumber *heads;
 	uint32	   *hashes;
 	instr_time	t0;
+	LionVacDel *dels;
+	LionVacPosFree *posfree = NULL;
 	int			ndel = 0;
 	int			nfree = 0;
+	int			nposfree = 0;
 	int			i;
 
 	if (nents == 0)
@@ -1748,6 +2318,7 @@ lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
 	delofs = (OffsetNumber *) palloc(sizeof(OffsetNumber) * nents);
 	heads = (BlockNumber *) palloc(sizeof(BlockNumber) * nents);
 	hashes = (uint32 *) palloc(sizeof(uint32) * nents);
+	dels = (LionVacDel *) palloc(sizeof(LionVacDel) * nents);
 
 	INSTR_TIME_SET_CURRENT(t0);
 	LockBufferForCleanup(buf);
@@ -1790,7 +2361,12 @@ lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
 		if (LionEntryIsSumLast(entry))
 			continue;
 
-		delofs[ndel++] = ref.off;
+		dels[ndel].off = ref.off;
+		dels[ndel].posroot = InvalidBlockNumber;
+		if ((entry->flags & LION_ENTRY_CHAIN) != 0 &&
+			(entry->flags & LION_ENTRY_POSITIONS) != 0)
+			dels[ndel].posroot = lion_entry_posext(entry)->pos_root;
+		ndel++;
 
 		if ((entry->flags & LION_ENTRY_CHAIN) != 0)
 		{
@@ -1802,10 +2378,38 @@ lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
 
 	if (ndel > 0)
 	{
+		int			end = ndel;
+
 		if (ndel > 1)
-			qsort(delofs, ndel, sizeof(OffsetNumber), lion_vac_cmp_offset);
-		lion_dir_delete(vs->index, buf, delofs, ndel);
-		vs->prof.records++;
+			qsort(dels, ndel, sizeof(LionVacDel), lion_vac_cmp_del);
+		posfree = (LionVacPosFree *) palloc(sizeof(LionVacPosFree) * ndel);
+
+		/*
+		 * From the highest offset down, in groups: a deletion renumbers only
+		 * what is above it, so every group's offsets still mean what they
+		 * did.  A group is as large as it can be while the position roots
+		 * it frees fit the record with the leaf (lion_vac_delete_group()).
+		 */
+		while (end > 0)
+		{
+			int			start = end;
+			int			nroots = 0;
+
+			while (start > 0)
+			{
+				bool		hasroot = BlockNumberIsValid(dels[start - 1].posroot);
+
+				if (hasroot && nroots == LION_WAL_MAX_BLOCKS - 1)
+					break;
+				nroots += hasroot ? 1 : 0;
+				start--;
+			}
+			for (i = start; i < end; i++)
+				delofs[i - start] = dels[i].off;
+			lion_vac_delete_group(vs, buf, delofs, end - start, dels + start,
+								  posfree, &nposfree);
+			end = start;
+		}
 		vs->prof.entries_deleted += ndel;
 	}
 
@@ -1829,7 +2433,12 @@ lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
 	 */
 	for (i = 0; i < nfree; i++)
 		lion_vacuum_free_chain(vs, hashes[i], heads[i]);
+	for (i = 0; i < nposfree; i++)
+		lion_vacuum_free_postree(vs, &posfree[i]);
 
+	if (posfree != NULL)
+		pfree(posfree);
+	pfree(dels);
 	pfree(hashes);
 	pfree(heads);
 	pfree(delofs);
@@ -2085,6 +2694,31 @@ lion_vac_free_page(LionVacState *vs, Buffer buf, BlockNumber blk)
 	vs->prof.records++;
 }
 
+/*
+ * Is root still the root of a position tree?  Locked only conditionally,
+ * with the caller holding a page of the tree: a busy root is taken for a
+ * live one, as lion_posting_root_live() does.
+ */
+static bool
+lion_vac_postree_root_live(LionVacState *vs, BlockNumber root)
+{
+	Buffer		buf;
+	bool		live;
+
+	if (!BlockNumberIsValid(root) || root == LION_METAPAGE_BLKNO ||
+		root >= RelationGetNumberOfBlocks(vs->index))
+		return false;
+	buf = ReadBuffer(vs->index, root);
+	if (!ConditionalLockBuffer(buf))
+	{
+		ReleaseBuffer(buf);
+		return true;
+	}
+	live = lion_page_owns_positions(BufferGetPage(buf), root);
+	UnlockReleaseBuffer(buf);
+	return live;
+}
+
 static void
 lion_vacuum_sweep(LionVacState *vs)
 {
@@ -2150,6 +2784,29 @@ lion_vacuum_sweep(LionVacState *vs)
 				if (reusable)
 					vs->pages_free++;
 				progress = true;
+				continue;
+			}
+
+			/*
+			 * A page of a position tree (DESIGN.md §17).  Pass 2 marked every
+			 * page of every live tree it walked, so an unvisited one belongs
+			 * to a tree made or grown since - whose root is live - or to one
+			 * whose root went with its entry and whose free did not finish.
+			 * Its contents say nothing either way: a tree is freed whatever
+			 * it holds.  A root is its own tree's identity, and goes only
+			 * with its entry.
+			 */
+			if ((LionPageGetOpaque(page)->flags & LION_PAGE_POSITIONS) != 0)
+			{
+				BlockNumber root = LionPageGetOpaque(page)->owner_head;
+
+				if (root != blk && !lion_vac_postree_root_live(vs, root))
+				{
+					lion_vac_free_page(vs, buf, blk);
+					progress = true;
+					continue;
+				}
+				UnlockReleaseBuffer(buf);
 				continue;
 			}
 

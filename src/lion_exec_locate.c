@@ -861,6 +861,7 @@ lion_build_filter(LionCountScanState *st)
 	filter->tmpcxt = AllocSetContextCreate(st->wherecxt,
 										   "LionCount row filter",
 										   ALLOCSET_SMALL_SIZES);
+	filter->pos = (LionPosFilter **) palloc0(sizeof(LionPosFilter *) * n);
 	for (i = 0; i < st->nclause; i++)
 	{
 		LionClauseState *cl = &st->clause[i];
@@ -880,6 +881,28 @@ lion_build_filter(LionCountScanState *st)
 			continue;
 
 		c = &filter->clauses[filter->nclauses++];
+
+		/*
+		 * A superset over a column that stores positions is decided from
+		 * them, before the visibility map is asked (lion_posfilter.c), and
+		 * the heap need not see its rows; anything else - a query no key
+		 * narrows, one with a prefix lexeme - only the heap can decide.
+		 */
+		{
+			LionState  *istate = lion_index_column_state(cl->idx, cl->idxcol);
+			LionPosFilter *pf = NULL;
+
+			if (cl->qmode == LION_QMODE_LOSSY && istate->positions)
+				pf = lion_posfilter_begin(cl->idx, istate, cl->val,
+										  (StrategyNumber)
+										  get_op_opfamily_strategy(cl->opno,
+																   cl->idx->rd_opfamily[cl->idxcol - 1]));
+			if (pf != NULL)
+				filter->pos[filter->npos++] = pf;
+			else
+				filter->nheap++;
+		}
+
 		c->attno = cl->idx->rd_index->indkey.values[cl->idxcol - 1];
 		if (c->attno <= 0 || c->attno > RelationGetDescr(st->heap)->natts)
 			elog(ERROR, "LionCount: a multi-key clause on an index expression");

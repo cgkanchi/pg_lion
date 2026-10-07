@@ -216,6 +216,9 @@ struct LionSpool
 	double		ntids;			/* (key, code) pairs added */
 	int			nspills;		/* runs spilled, all columns together */
 	int			unchecked;		/* pairs added since the budget was checked */
+	LionSpoolPosSink possink;	/* where a positions column's positions go
+								 * (DESIGN.md §17), or NULL */
+	void	   *possinkarg;
 };
 
 struct LionSpoolReader
@@ -1990,13 +1993,32 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 			 * look at every indexed row (`tags @> '{}'`) can still find it.
 			 */
 			Datum	   *keys;
-			int			nkeys = lion_extract_value(cs, values[c], &keys);
+			int			nkeys;
 			int			i;
+
+			LionKeyPositions *kpos = NULL;
+
+			/*
+			 * A column that stores positions (DESIGN.md §17) hands each key's
+			 * positions to the sink the build gave, which writes them once
+			 * the directory is on disk (lion_posbuild.c); the spool itself
+			 * keeps only the codes, as for any column.
+			 */
+			if (cs->positions)
+			{
+				if (sp->possink == NULL)
+					elog(ERROR, "lion index: a column that stores positions has no sink for them");
+				nkeys = lion_extract_value_pos(cs, values[c], &keys, &kpos);
+			}
+			else
+				nkeys = lion_extract_value(cs, values[c], &keys);
 
 			if (nkeys == 0)
 				lion_acc_add_reserved(sp, col, LION_KIND_EMPTY, code);
 			for (i = 0; i < nkeys; i++)
 			{
+				if (kpos != NULL)
+					sp->possink(sp->possinkarg, c, keys[i], code, &kpos[i]);
 				lion_acc_add(sp, col, keys[i], code);
 				/* one row can have any number of them */
 				if (sp->unchecked >= LION_CHECK_KEYS)
@@ -2024,6 +2046,13 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(sp->rowcxt);
+}
+
+void
+lion_spool_set_possink(LionSpool *sp, LionSpoolPosSink sink, void *arg)
+{
+	sp->possink = sink;
+	sp->possinkarg = arg;
 }
 
 double

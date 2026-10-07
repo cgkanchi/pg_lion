@@ -288,7 +288,7 @@ lion_count_container_vm(LionCountCtx *cx, const LionContainer *c)
 	members = lion_container_block_mask(c);
 	if (cx->in_recovery || cx->novm)
 		allvis = 0;				/* see lion_count_sources(): no interlock */
-	else if (cx->filter != NULL)
+	else if (lion_row_filter_heap(cx->filter))
 		allvis = 0;				/* the map vouches for visibility, and every
 								 * row has to be tested as well */
 	else
@@ -318,6 +318,21 @@ lion_count_container_masks(LionCountCtx *cx, const LionContainer *c,
 {
 	BlockNumber firstblk = lion_ckey_first_block(c->ckey);
 	uint64		dirty;			/* blocks with members that need a heap recheck */
+
+	/*
+	 * The members a query decided from stored positions does not select go
+	 * first (LionRowFilter.pos).  The positions are read here, after the
+	 * container was copied and while the pages it came from are still
+	 * pinned, as everything else about it is (the design note's R1 and R2).
+	 * The map's answer for the blocks that are left stands.
+	 */
+	if (cx->filter != NULL && cx->filter->npos > 0)
+	{
+		c = lion_count_posfilter(cx, c);
+		if (lion_container_cardinality(c) == 0)
+			return;
+		members &= lion_container_block_mask(c);
+	}
 
 	dirty = members & ~allvis;
 
@@ -383,6 +398,51 @@ lion_count_container_masks(LionCountCtx *cx, const LionContainer *c,
 		}
 	}
 
+}
+
+/*
+ * c through the count's position filters (LionRowFilter.pos): what is left
+ * of it, in a container of the last filter's, valid until that filter is
+ * used again.  The walks that intersect a copy of the WHERE with many groups'
+ * sets at once (lion_count_groups.c, lion_count_decode.c) filter the copy's
+ * container here, once a key, and count the groups with
+ * lion_row_filter_nopos().
+ */
+const LionContainer *
+lion_count_posfilter(LionCountCtx *cx, const LionContainer *c)
+{
+	int			i;
+
+	for (i = 0; cx->filter != NULL && i < cx->filter->npos; i++)
+	{
+		uint32		before = lion_container_cardinality(c);
+
+		c = lion_posfilter_apply(cx->filter->pos[i], c);
+		cx->stats.pos_checked += before;
+		cx->stats.pos_removed += before - lion_container_cardinality(c);
+	}
+	return c;
+}
+
+/*
+ * filter without its position filters, for counts of containers that have
+ * been through them already: filter itself when it has none, NULL when the
+ * heap has nothing to test either.
+ */
+LionRowFilter *
+lion_row_filter_nopos(LionRowFilter *filter)
+{
+	LionRowFilter *copy;
+
+	if (filter == NULL || filter->npos == 0)
+		return filter;
+	if (filter->nheap == 0)
+		return NULL;
+	copy = (LionRowFilter *) palloc(sizeof(LionRowFilter));
+	*copy = *filter;
+	copy->npos = 0;
+	copy->pos = NULL;
+	return copy;
 }
 
 /*
@@ -958,7 +1018,7 @@ lion_recheck_heap(LionCountCtx *cx)
 	 * gives it that way; the count pushdown refuses every other table AM
 	 * before it gets here (DESIGN.md §10).
 	 */
-	if (cx->filter != NULL)
+	if (lion_row_filter_heap(cx->filter))
 	{
 		if (cx->heap->rd_tableam != GetHeapamTableAmRoutine())
 			elog(ERROR, "lion index count: a row filter over a table that is not a heap");
@@ -2561,6 +2621,8 @@ lion_count_stats_add(LionCountStats *dst, const LionCountStats *src)
 	dst->cache_full += src->cache_full;
 	dst->sets_summed += src->sets_summed;
 	dst->rows_removed += src->rows_removed;
+	dst->pos_checked += src->pos_checked;
+	dst->pos_removed += src->pos_removed;
 	dst->key_containers += src->key_containers;
 	dst->copy_containers += src->copy_containers;
 	dst->copy_seeks += src->copy_seeks;

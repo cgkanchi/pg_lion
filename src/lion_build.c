@@ -370,6 +370,11 @@ typedef struct LionBuilder
 	 */
 	uint16		sumflags;
 	BufFile    *tofile;
+	/* a key of a column that stores positions (DESIGN.md §17) */
+	bool		haspos;
+	LionContainer *poschunk;	/* its positions, when they fit one chunk */
+	BlockNumber posroot;		/* else the position tree written for them */
+	uint64		posmembers;		/* the rows they cover */
 } LionBuilder;
 
 /*
@@ -492,6 +497,10 @@ typedef struct LionBuildState
 
 	/* A NARROW item written, which makes the index version 8 (§38). */
 	bool		wrote_narrow;
+	/* the positions of the columns that store them (lion_posbuild.c) */
+	LionPosBuild *posbuild;
+	bool		curpos;			/* ... for the column being written */
+	LionPageWriter pw;
 } LionBuildState;
 
 static void lion_build_callback(Relation index, ItemPointer tid, Datum *values,
@@ -527,6 +536,29 @@ lion_build_get_page(LionBuildState *bs, uint16 flags)
 	lion_init_page((Page) buf->data, flags);
 
 	return buf;
+}
+
+/* The page writer lion_posbuild.c writes position trees through. */
+static BlockNumber
+lion_build_pw_alloc(void *arg)
+{
+	return lion_build_alloc_block((LionBuildState *) arg);
+}
+
+static void *
+lion_build_pw_get(void *arg, Page *page, uint16 flags)
+{
+	BulkWriteBuffer buf = lion_build_get_page((LionBuildState *) arg, flags);
+
+	*page = (Page) buf->data;
+	return buf;
+}
+
+static void
+lion_build_pw_put(void *arg, BlockNumber blk, void *handle)
+{
+	smgr_bulk_write(((LionBuildState *) arg)->bulk, blk,
+					(BulkWriteBuffer) handle, true);
 }
 
 /*
@@ -1273,6 +1305,45 @@ lion_builder_add(LionBuildState *bs, LionBuilder *b, uint64 code)
 }
 
 /*
+ * entry, which the flush below has made, as an entry that stores positions
+ * (DESIGN.md §17): the INLINE one with its chunk after the payload, the
+ * CHAIN one pointing at its position tree - the one written for it, or a
+ * one-leaf tree for positions that fit a chunk.
+ */
+static LionEntryTuple *
+lion_builder_add_positions(LionBuildState *bs, LionBuilder *b,
+						   LionEntryTuple *entry, Size *size)
+{
+	LionEntryTuple *ext;
+	Size		extsz;
+
+	if (b->posmembers != b->ntids)
+		elog(ERROR, "lion index \"%s\": the build has positions for " UINT64_FORMAT " rows of a key it has " UINT64_FORMAT " for",
+			 RelationGetRelationName(bs->index), b->posmembers, b->ntids);
+
+	ext = lion_entry_add_posext(entry, &extsz);
+	pfree(entry);
+	if ((ext->flags & LION_ENTRY_INLINE) != 0)
+	{
+		LionEntryTuple *withpos;
+
+		Assert(b->poschunk != NULL);
+		withpos = lion_entry_rebuild_pos(ext, b->inlinebuf, b->inlineused,
+										 b->inlineused,
+										 (const char *) b->poschunk,
+										 lion_poschunk_size(b->poschunk),
+										 size);
+		pfree(ext);
+		return withpos;
+	}
+
+	lion_entry_posext(ext)->pos_root = BlockNumberIsValid(b->posroot) ?
+		b->posroot : lion_posbuild_chunk_tree(&bs->pw, b->hash, b->poschunk);
+	*size = extsz;
+	return ext;
+}
+
+/*
  * Close a posting set: write out any pending container page and add the entry
  * tuple to its bucket.
  */
@@ -1326,6 +1397,9 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 	entry->ncontainers = b->nitems;
 	entry->ntids = b->ntids;
 	entry->flags |= b->sumflags;
+
+	if (b->haspos)
+		entry = lion_builder_add_positions(bs, b, entry, &size);
 
 	lion_build_add_entry(bs, entry, size);
 
@@ -1817,6 +1891,42 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 		b[i] = lion_builder_create(bs, e->key, e->kind, e->hash);
 	}
 
+	/*
+	 * A key of a column that stores positions (DESIGN.md §17): its positions
+	 * are next in the column's sort (lion_posbuild.c).  Ones that fit a chunk
+	 * travel with the entry, and an INLINE posting set then has to leave
+	 * them room; a tree means a CHAIN entry.
+	 */
+	if (bs->curpos && lion_spool_group_entry(group, 0)->kind == LION_KIND_VALUE)
+	{
+		const LionSpoolEntry *e = lion_spool_group_entry(group, 0);
+		LionContainer *chunk;
+
+		if (n != 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("lion index \"%s\": keys that compare equal but differ cannot store positions",
+							RelationGetRelationName(bs->index))));
+		b[0]->haspos = true;
+		lion_posbuild_take(bs->posbuild, e->key, e->hash, &bs->pw, &chunk,
+						   &b[0]->posroot, &b[0]->posmembers);
+		if (chunk != NULL)
+		{
+			Size		poslen = lion_poschunk_size(chunk);
+			Size		payoff = MAXALIGN(LION_ENTRY_HDRSZ + b[0]->rawlen) +
+				LION_ENTRY_POSEXT_SIZE;
+			Size		limit = lion_inline_max(payoff, (Size) bs->inline_limit);
+
+			b[0]->poschunk = (LionContainer *) palloc(poslen);
+			memcpy(b[0]->poschunk, chunk, poslen);
+			b[0]->inlinemax = Min(b[0]->inlinemax,
+								  limit > poslen ?
+								  MAXALIGN_DOWN(limit - poslen) : 0);
+		}
+		else
+			b[0]->inlinemax = 0;
+	}
+
 	while (lion_spool_group_next(group, &which, &code))
 	{
 		lion_builder_add(bs, b[which], code);
@@ -2235,6 +2345,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	double		reltuples;
 	BulkWriteBuffer metabuf;
 	Size		sumreserve;
+	LionPosBuild *posbuild;
 	int			ncols;
 	int			c;
 
@@ -2306,8 +2417,20 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * allows them: max_parallel_maintenance_workers, the table's
 	 * parallel_workers, and 32MB of maintenance_work_mem per participant.
 	 */
+	/*
+	 * A column that stores positions (DESIGN.md §17) sorts them on the side,
+	 * in a serial build only: the workers of a parallel one have no sink for
+	 * them (lion_posbuild.c).
+	 */
+	posbuild = lion_posbuild_begin(index, &bs.ix, maintenance_work_mem);
+	bs.posbuild = posbuild;
+	bs.pw.arg = &bs;
+	bs.pw.alloc = lion_build_pw_alloc;
+	bs.pw.get = lion_build_pw_get;
+	bs.pw.put = lion_build_pw_put;
+
 #if PG_VERSION_NUM >= 170000
-	if (indexInfo->ii_ParallelWorkers > 0)
+	if (indexInfo->ii_ParallelWorkers > 0 && posbuild == NULL)
 		lion_begin_parallel(&bs, heap, index, indexInfo->ii_Concurrent,
 							indexInfo->ii_ParallelWorkers);
 	if (bs.leader != NULL)
@@ -2317,6 +2440,8 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	{
 		bs.spool = lion_spool_begin(&bs.ix, (Size) maintenance_work_mem * 1024,
 									NULL, -1);
+		if (posbuild != NULL)
+			lion_spool_set_possink(bs.spool, lion_posbuild_sink, posbuild);
 
 		/*
 		 * No synchronized scan: TIDs in ascending order is what lets the spool
@@ -2362,6 +2487,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		 * they take comes out of the spool's maintenance_work_mem, not on top
 		 * of it.
 		 */
+		bs.curpos = lion_posbuild_column(posbuild, c);
 		bs.sum = lion_sum_begin(&bs, bs.cur);
 		sumreserve = (bs.sum != NULL) ? LION_SUM_MEMORY : 0;
 		if (bs.reader != NULL)
@@ -2375,6 +2501,8 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 			lion_sum_finish(&bs, bs.sum);
 			bs.sum = NULL;
 		}
+		lion_posbuild_column_done(posbuild, c);
+		bs.curpos = false;
 	}
 	bs.cur = NULL;
 
@@ -2425,6 +2553,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	if (bs.spool != NULL)
 		lion_spool_end(bs.spool);
+	lion_posbuild_end(posbuild);
 #if PG_VERSION_NUM >= 170000
 	if (bs.reader != NULL)
 		lion_spool_reader_end(bs.reader);
