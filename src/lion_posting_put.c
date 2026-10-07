@@ -520,7 +520,8 @@ lion_spill_fill_leaf(LionWalState *xstate, Page page, const char *payload,
 static void
 lion_spill_set_chain(LionEntryTuple *entry, BlockNumber root, BlockNumber tail)
 {
-	entry->flags = (entry->flags & LION_ENTRY_KINDFLAGS) | LION_ENTRY_CHAIN;
+	entry->flags = (entry->flags & (LION_ENTRY_KINDFLAGS | LION_ENTRY_POSITIONS)) |
+		LION_ENTRY_CHAIN;
 	entry->head = root;
 	entry->tail = tail;
 }
@@ -535,12 +536,65 @@ lion_spill_set_chain(LionEntryTuple *entry, BlockNumber root, BlockNumber tail)
  * held EXCLUSIVE by the caller (a cleanup lock, when VACUUM calls) and is
  * rewritten here, in the last record.
  */
+/*
+ * The root of a spilled entry's position tree, in the spill's last record:
+ * one leaf holding the entry's inline positions chunk (none when poschunk is
+ * NULL or empty).  It goes into the same record as the entry that starts
+ * pointing at it, so that it is never a root nothing references; its block,
+ * like the posting root's, comes from extending the relation.
+ */
+static void
+lion_spill_posroot(LionWalState *xstate, Buffer posbuf, uint32 hash,
+				   const LionContainer *poschunk, LionEntryTuple *entry)
+{
+	Page		page;
+	BlockNumber posroot = BufferGetBlockNumber(posbuf);
+
+	page = lion_wal_init_buffer(xstate, posbuf,
+								LION_PAGE_CONTAINER | LION_PAGE_POSITIONS);
+	lion_page_set_owner(page, hash, posroot);
+	if (poschunk != NULL && poschunk->cardinality > 0)
+	{
+		Size		sz = lion_poschunk_size(poschunk);
+
+		if (PageAddItemExtended(page, poschunk, sz, FirstOffsetNumber,
+								0) == InvalidOffsetNumber)
+			elog(ERROR, "lion index: failed to place a position chunk on a new root");
+		lion_wal_op(xstate, page, LION_OP_ADD, FirstOffsetNumber, 0, poschunk,
+					sz);
+		lion_page_update_minmax(page);
+		lion_wal_op(xstate, page, LION_OP_MINMAX, 0, 0, NULL, 0);
+	}
+	lion_wal_log_special(xstate, page);
+	lion_entry_posext(entry)->pos_root = posroot;
+}
+
 void
 lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 				OffsetNumber entryoff, LionEntryTuple *entry,
 				const char *payload, Size paylen)
 {
+	if ((entry->flags & LION_ENTRY_POSITIONS) != 0)
+		elog(ERROR, "lion index \"%s\": an entry with positions spills with them",
+			 RelationGetRelationName(index));
+	lion_entry_spill_pos(index, heaprel, entrybuf, entryoff, entry, payload,
+						 paylen, NULL);
+}
+
+/*
+ * lion_entry_spill() for an entry that stores positions: its inline chunk
+ * (poschunk, an aligned copy, or NULL for none) becomes the first leaf of a
+ * new position tree, whose root goes into the last record with the entry.
+ * That record registers one buffer more than it did, three at most.
+ */
+void
+lion_entry_spill_pos(Relation index, Relation heaprel, Buffer entrybuf,
+					 OffsetNumber entryoff, LionEntryTuple *entry,
+					 const char *payload, Size paylen,
+					 const LionContainer *poschunk)
+{
 	LionWalState *xstate;
+	Buffer		posbuf = InvalidBuffer;
 	Buffer		rootbuf;
 	Page		rootpage;
 	BlockNumber root;
@@ -581,6 +635,8 @@ lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 	 */
 	rootbuf = lion_alloc_page(index, heaprel, false);
 	root = BufferGetBlockNumber(rootbuf);
+	if ((entry->flags & LION_ENTRY_POSITIONS) != 0)
+		posbuf = lion_alloc_page(index, heaprel, false);
 
 	if (nleaves == 1)
 	{
@@ -596,10 +652,14 @@ lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 		lion_wal_log_special(xstate, rootpage);
 
 		lion_spill_set_chain(entry, root, root);
+		if (BufferIsValid(posbuf))
+			lion_spill_posroot(xstate, posbuf, entry->hash, poschunk, entry);
 		lion_put_entry(index, xstate, entrybuf, entryoff, entry);
 		lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
 
 		UnlockReleaseBuffer(rootbuf);
+		if (BufferIsValid(posbuf))
+			UnlockReleaseBuffer(posbuf);
 		pfree(cbuf);
 		return;
 	}
@@ -699,9 +759,13 @@ lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 					LION_POSTING_PIVOT_SIZE);
 	}
 	lion_wal_log_special(xstate, rootpage);
+	if (BufferIsValid(posbuf))
+		lion_spill_posroot(xstate, posbuf, entry->hash, poschunk, entry);
 	lion_put_entry(index, xstate, entrybuf, entryoff, entry);
 	lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
 	UnlockReleaseBuffer(rootbuf);
+	if (BufferIsValid(posbuf))
+		UnlockReleaseBuffer(posbuf);
 
 	pfree(pivots);
 	pfree(cbuf);

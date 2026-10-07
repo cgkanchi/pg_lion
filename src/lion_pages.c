@@ -862,3 +862,27 @@ lion_item_zero_slack(LionContainer *item, Size size, Size alloc)
 	if (alloc > size)
 		memset((char *) item + size, 0, alloc - size);
 }
+
+bool
+lion_entry_inline_poschunk(Relation index, const LionEntryTuple *e,
+						   Size itemsz, BlockNumber blkno, OffsetNumber off,
+						   LionContainer *buf)
+{
+	Size		poslen = lion_entry_pos_len(e, itemsz);
+	char		err[256];
+
+	if (poslen == 0)
+		return false;
+	if (poslen > LION_CONTAINER_MAX_SIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": entry %u on block %u has %zu bytes of inline positions, more than a chunk",
+						RelationGetRelationName(index), off, blkno, poslen)));
+	memcpy(buf, (const char *) e + itemsz - poslen, poslen);
+	if (!lion_poschunk_check(buf, poslen, err, sizeof(err)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": the inline positions of entry %u on block %u are damaged: %s",
+						RelationGetRelationName(index), off, blkno, err)));
+	return true;
+}

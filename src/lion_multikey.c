@@ -234,13 +234,39 @@ lion_hashpos_cmp(const void *a, const void *b, void *arg)
  * is palloc'd in the current context (NULL when there are none).  Zero means
  * the row belongs in the reserved EMPTY entry (DESIGN.md §17).
  */
+static int lion_extract_internal(LionState *state, Datum value, Datum **keys,
+								 LionKeyPositions **pos);
+
 int
 lion_extract_value(LionState *state, Datum value, Datum **keys)
+{
+	return lion_extract_internal(state, value, keys, NULL);
+}
+
+/*
+ * The same, with the positions of every key: support proc 5 returns them for
+ * the raw keys of proc 2, one per key in proc 2's order, and they travel with
+ * their keys through the sort.  A key extracted twice keeps the positions of
+ * its first copy (a tsvector never has two; its lexemes are unique).
+ */
+int
+lion_extract_value_pos(LionState *state, Datum value, Datum **keys,
+					   LionKeyPositions **pos)
+{
+	Assert(state->positions);
+	return lion_extract_internal(state, value, keys, pos);
+}
+
+static int
+lion_extract_internal(LionState *state, Datum value, Datum **keys,
+					  LionKeyPositions **pos)
 {
 	Datum	   *raw;
 	int32		nraw = 0;
 	bool	   *nulls = NULL;
 	Datum	   *out;
+	LionKeyPositions *rawpos = NULL;
+	LionKeyPositions *outpos = NULL;
 	LionHashPos *ord;
 	LionHashPosArg ha;
 	int			nlive = 0;
@@ -258,8 +284,23 @@ lion_extract_value(LionState *state, Datum value, Datum **keys)
 													  PointerGetDatum(&nulls)));
 
 	*keys = NULL;
+	if (pos != NULL)
+		*pos = NULL;
 	if (nraw <= 0 || raw == NULL)
 		return 0;
+
+	if (pos != NULL)
+	{
+		int32		npos = 0;
+
+		rawpos = (LionKeyPositions *)
+			DatumGetPointer(FunctionCall2Coll(&state->positionsproc,
+											  state->collation, value,
+											  PointerGetDatum(&npos)));
+		if (npos != nraw || rawpos == NULL)
+			elog(ERROR, "lion index: support function %d returned positions for %d keys, but support function %d extracted %d",
+				 LION_POSITIONS_PROC, npos, LION_EXTRACTVALUE_PROC, nraw);
+	}
 
 	/* Hash every non-NULL key once, then sort. */
 	ord = (LionHashPos *) palloc(sizeof(LionHashPos) * nraw);
@@ -284,6 +325,8 @@ lion_extract_value(LionState *state, Datum value, Datum **keys)
 				  &ha);
 
 	out = (Datum *) palloc(sizeof(Datum) * nlive);
+	if (pos != NULL)
+		outpos = (LionKeyPositions *) palloc(sizeof(LionKeyPositions) * nlive);
 
 	for (i = 0; i < nlive; i++)
 	{
@@ -315,7 +358,11 @@ lion_extract_value(LionState *state, Datum value, Datum **keys)
 			CHECK_FOR_INTERRUPTS();
 		}
 		if (!dup)
+		{
+			if (outpos != NULL)
+				outpos[nout] = rawpos[ord[i].pos];
 			out[nout++] = key;
+		}
 
 		CHECK_FOR_INTERRUPTS();
 	}
@@ -324,6 +371,8 @@ lion_extract_value(LionState *state, Datum value, Datum **keys)
 
 	Assert(nout > 0);
 	*keys = out;
+	if (pos != NULL)
+		*pos = outpos;
 	return nout;
 }
 
@@ -924,4 +973,95 @@ lion_extract_query_superset(LionState *state, Datum query,
 	q->keys = keys;
 	q->tree = tree;
 	q->mode = lossy ? LION_QMODE_LOSSY : LION_QMODE_KEYS;
+}
+
+/* ---------------------------------------------------------------------
+ * Support proc 5 for tsvector (DESIGN.md §17, "Stored positions")
+ * --------------------------------------------------------------------- */
+
+PG_FUNCTION_INFO_V1(lion_tsvector_positions);
+
+/*
+ * lion_tsvector_positions(tsvector, internal) returns internal: the positions
+ * of every lexeme of the tsvector, in its own order - the order
+ * gin_extract_tsvector() returns the lexemes in, one key per lexeme - and the
+ * count through the second argument.  The positions point into the
+ * detoasted tsvector, which lives as long as the caller's memory context.
+ */
+Datum
+lion_tsvector_positions(PG_FUNCTION_ARGS)
+{
+	TSVector	vector = PG_GETARG_TSVECTOR(0);
+	int32	   *nentries = (int32 *) PG_GETARG_POINTER(1);
+	WordEntry  *we = ARRPTR(vector);
+	LionKeyPositions *out;
+	int32		i;
+
+	*nentries = vector->size;
+	if (vector->size == 0)
+		PG_RETURN_POINTER(NULL);
+
+	out = (LionKeyPositions *) palloc(sizeof(LionKeyPositions) * vector->size);
+	for (i = 0; i < vector->size; i++)
+	{
+		if (we[i].haspos)
+		{
+			out[i].npos = (uint16) POSDATALEN(vector, &we[i]);
+			out[i].pos = (const uint16 *) POSDATAPTR(vector, &we[i]);
+		}
+		else
+		{
+			out[i].npos = 0;
+			out[i].pos = NULL;
+		}
+	}
+	PG_RETURN_POINTER(out);
+}
+
+/*
+ * The position member of the row at code for one extracted key: its
+ * positions as support proc 5 gave them, sorted and with repeats dropped
+ * should a tsvector not have them so (one that came from tsvector_in() or
+ * to_tsvector() always does), the higher weight kept for a repeat.
+ */
+void
+lion_posmember_from_key(LionPosMember *m, uint64 code,
+						const LionKeyPositions *kp)
+{
+	uint32		n = Min((uint32) kp->npos, (uint32) LION_POS_MAX_NPOS);
+	uint32		i;
+	uint32		j;
+	bool		sorted = true;
+
+	m->code = code;
+	for (i = 0; i < n; i++)
+	{
+		m->pos[i] = kp->pos[i];
+		if (i > 0 && LION_POS_POS(m->pos[i]) <= LION_POS_POS(m->pos[i - 1]))
+			sorted = false;
+	}
+	if (!sorted)
+	{
+		/* an insertion sort: npos is at most 256 */
+		for (i = 1; i < n; i++)
+		{
+			uint16		v = m->pos[i];
+
+			for (j = i; j > 0 && LION_POS_POS(m->pos[j - 1]) > LION_POS_POS(v); j--)
+				m->pos[j] = m->pos[j - 1];
+			m->pos[j] = v;
+		}
+		for (i = 0, j = 0; i < n; i++)
+		{
+			if (j > 0 && LION_POS_POS(m->pos[j - 1]) == LION_POS_POS(m->pos[i]))
+			{
+				if (LION_POS_WEIGHT(m->pos[i]) > LION_POS_WEIGHT(m->pos[j - 1]))
+					m->pos[j - 1] = m->pos[i];
+			}
+			else
+				m->pos[j++] = m->pos[i];
+		}
+		n = j;
+	}
+	m->npos = (uint16) n;
 }

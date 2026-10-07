@@ -742,6 +742,13 @@ lionvalidate(Oid opclassoid)
 											INTERNALOID, INTERNALOID,
 											INTERNALOID);
 				break;
+			case LION_POSITIONS_PROC:
+				/* the positions of every key proc 2 extracts (§17) */
+				ok = check_amproc_signature(procform->amproc, INTERNALOID,
+											false, 2, 2,
+											procform->amproclefttype,
+											INTERNALOID);
+				break;
 			default:
 				ereport(INFO,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
