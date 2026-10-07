@@ -2075,7 +2075,15 @@ container_make_run(LionContainer *c)
 			n++;
 		}
 	}
-	Assert(n <= LION_RUN_MAX_NRUNS);
+	/*
+	 * optimize() asks for a RUN only of members that make at most
+	 * LION_RUN_MAX_NRUNS runs (container_count_runs() counts them as the
+	 * walks above do), so n is never more.  Were it, tmp holds only the
+	 * first runs, and c is left as it is - as container_make_array() leaves
+	 * a container whose members do not fit an ARRAY.
+	 */
+	if (n > LION_RUN_MAX_NRUNS)
+		return;
 	c->type = LION_CT_RUN;
 	c->flags = 0;
 	run_set_nruns(c, n);
@@ -2100,6 +2108,11 @@ container_rebuild(LionContainer *c, const uint64 *w, uint32 card)
 	Assert(card <= LION_CONTAINER_RANGE);
 	c->cardinality = (uint16) card;
 
+	/*
+	 * Each extraction is used only when it fit its buffer, which with the
+	 * count and card it was chosen by it always does; otherwise the bitset
+	 * below holds the members whatever they are.
+	 */
 	nruns = bits_count_runs(w);
 	if (nruns <= LION_RUN_MAX_NRUNS)
 	{
@@ -2107,10 +2120,13 @@ container_rebuild(LionContainer *c, const uint64 *w, uint32 card)
 		uint32		n = bits_extract_runs(w, runs, LION_RUN_MAX_NRUNS);
 
 		Assert(n == nruns);
-		c->type = LION_CT_RUN;
-		run_set_nruns(c, n);
-		memcpy(run_mdata(c), runs, (size_t) n * sizeof(LionRun));
-		return;
+		if (n <= LION_RUN_MAX_NRUNS)
+		{
+			c->type = LION_CT_RUN;
+			run_set_nruns(c, n);
+			memcpy(run_mdata(c), runs, (size_t) n * sizeof(LionRun));
+			return;
+		}
 	}
 	if (card <= LION_ARRAY_MAX_CARD)
 	{
@@ -2118,9 +2134,12 @@ container_rebuild(LionContainer *c, const uint64 *w, uint32 card)
 		uint32		n = bits_extract_array(w, vals, LION_ARRAY_MAX_CARD);
 
 		Assert(n == card);
-		c->type = LION_CT_ARRAY;
-		memcpy(array_mdata(c), vals, (size_t) n * sizeof(uint16));
-		return;
+		if (n <= LION_ARRAY_MAX_CARD)
+		{
+			c->type = LION_CT_ARRAY;
+			memcpy(array_mdata(c), vals, (size_t) n * sizeof(uint16));
+			return;
+		}
 	}
 	bitmap_set_header(c, LION_BITSET_WIDTH);
 	memcpy(bitmap_mdata(c), w, LION_BITSET_BYTES);
