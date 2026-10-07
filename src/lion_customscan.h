@@ -2375,6 +2375,7 @@ extern IndexOptInfo *lion_match_index(RelOptInfo *rel, AttrNumber attno,
 									  bool positions, AttrNumber *colp);
 extern BoolExpr *lion_boolean_not_test(Node *clause);
 extern List *lion_or_arms(Node *clause);
+extern Node *lion_multikey_any_as_or(Node *clause);
 extern bool lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 							  bool allow_negated, bool allow_range,
 							  bool allow_recheck, LionLeafInfo *out);
