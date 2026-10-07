@@ -4624,7 +4624,11 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     it either.  A mix of two rows' positions can therefore only be applied to a TID the heap
     visit drops.
 
-Still to come: `@@ ANY (array)` in counts and plain index scans.  The opclass is `tsvector_pos_ops` in the extension's SQL (README.md).
+  - **`@@ ANY (array)`**: a bitmap scan emits each element through its own filter
+    (`lion_emit_multikey()`), and a plain index scan under an MVCC snapshot wraps each element's
+    superset in a `LION_KN_POSFILTER` node of its union (`lion_scan_col_tree()`), so neither
+    rechecks unless an element has a prefix lexeme.  The count does not take a multi-key
+    `= ANY` at all yet, positions or not.  The opclass is `tsvector_pos_ops` in the extension's SQL (README.md).
 
 ### Cardinality guard
 

@@ -115,29 +115,16 @@ static LionKeyNode *
 lion_posfilter_node(LionClauseState *cl, LionKeyNode *child)
 {
 	LionState  *istate = lion_index_column_state(cl->idx, cl->idxcol);
-	LionPosSpec *spec;
-	LionKeyNode *n;
-	Datum	   *itemkeys;
-
-	spec = (LionPosSpec *) palloc0(sizeof(LionPosSpec));
-	spec->index = cl->idx;
-	spec->col = istate;
-	spec->query = cl->val;
-	spec->strategy = (StrategyNumber)
+	StrategyNumber strategy = (StrategyNumber)
 		get_op_opfamily_strategy(cl->opno,
 								 cl->idx->rd_opfamily[cl->idxcol - 1]);
+	Datum	   *itemkeys;
+
 	if (!istate->positions ||
-		!lion_tsquery_item_keys(istate, cl->val, spec->strategy, &itemkeys))
+		!lion_tsquery_item_keys(istate, cl->val, strategy, &itemkeys))
 		elog(ERROR, "roaring count: query for index \"%s\" can no longer be decided from positions",
 			 RelationGetRelationName(cl->idx));
-
-	n = (LionKeyNode *) palloc0(sizeof(LionKeyNode));
-	n->kind = LION_KN_POSFILTER;
-	n->nargs = 1;
-	n->args = (LionKeyNode **) palloc(sizeof(LionKeyNode *));
-	n->args[0] = child;
-	n->pos = spec;
-	return n;
+	return lion_posfilter_keynode(cl->idx, istate, cl->val, strategy, child);
 }
 
 /*

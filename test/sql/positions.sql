@@ -187,6 +187,46 @@ SELECT q, pos_rechecked(q) FROM (VALUES
 	('common <-> ag:*')) v(q);
 DROP FUNCTION pos_rechecked(tsquery);
 
+-- `@@ ANY (array)` in a plain index scan: the union of its elements, each
+-- element's superset through a filter of its own (LION_KN_POSFILTER), so
+-- the heap rechecks nothing unless an element has a prefix lexeme
+CREATE TEMP TABLE pos_arrays AS
+SELECT ARRAY[a.q, b.q] AS arr FROM pos_queries a, pos_queries b
+WHERE a.q::text < b.q::text
+UNION ALL SELECT ARRAY[q, NULL] FROM pos_queries;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+CREATE TEMP TABLE pos_any_iscan AS
+SELECT arr::text AS a,
+	   (SELECT array_agg(id ORDER BY id) FROM pos_docs WHERE d @@ ANY (arr)) AS ids
+FROM pos_arrays;
+RESET enable_seqscan;
+SET enable_indexscan = off;
+CREATE TEMP TABLE pos_any_heap AS
+SELECT arr::text AS a,
+	   (SELECT array_agg(id ORDER BY id) FROM pos_docs WHERE d @@ ANY (arr)) AS ids
+FROM pos_arrays;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+SELECT count(*) AS arrays,
+	   count(*) FILTER (WHERE i.ids IS DISTINCT FROM h.ids) AS differ
+FROM pos_any_iscan i JOIN pos_any_heap h USING (a);
+CREATE FUNCTION pos_any_explain(arr tsquery[]) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	SET LOCAL enable_seqscan = off;
+	SET LOCAL enable_bitmapscan = off;
+	FOR l IN EXECUTE format('EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) '
+							'SELECT id FROM pos_docs WHERE d @@ ANY (%L)', arr) LOOP
+		RETURN NEXT regexp_replace(l, ' \(actual .*\)$', '');
+	END LOOP;
+END $$;
+SELECT pos_any_explain('{"common <-> again", "far <-> near"}');
+SELECT pos_any_explain('{"common <-> again", "common <-> ag:*"}');
+DROP FUNCTION pos_any_explain(tsquery[]);
+
 -- The count pushdown decides the same candidates from the positions before
 -- it asks the visibility map, so a vacuumed table is counted without the
 -- heap; a literal query and a generic plan's parameter alike
