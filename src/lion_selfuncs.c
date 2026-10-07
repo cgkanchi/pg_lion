@@ -176,6 +176,7 @@ typedef struct LionProbeCache
 	List	   *isects;			/* LionIsect: the intersection probe's */
 	int			nisectprobes;	/* ... how many it has made */
 	int64		isectbuffers;	/* ... and the buffers they accessed */
+	List	   *rowsfixed;		/* RelOptInfos whose rows the probe corrected */
 } LionProbeCache;
 
 static LionProbeCache lion_probe_cache;
@@ -205,6 +206,7 @@ lion_probe_cache_for(PlannerInfo *root)
 		lion_probe_cache.ends = NIL;
 		lion_probe_cache.remainders = NIL;
 		lion_probe_cache.isects = NIL;
+		lion_probe_cache.rowsfixed = NIL;
 		lion_probe_cache.nisectprobes = 0;
 		lion_probe_cache.isectbuffers = 0;
 	}
@@ -1738,6 +1740,9 @@ lion_or_list_paths(PlannerInfo *root, RelOptInfo *rel, List *lionidx)
 /* GUC pg_lion.enable_intersection_probe (DESIGN.md §29.11) */
 bool		lion_enable_intersection_probe = true;
 
+/* GUC pg_lion.enable_rows_correction (DESIGN.md §29.11) */
+bool		lion_enable_rows_correction = true;
+
 /*
  * The driver containers the probe samples at most, and at least however many
  * sets it seeks; and the seeks it makes of all its sets together at most, the
@@ -2818,6 +2823,13 @@ lion_probe_rel_rows(PlannerInfo *root, RelOptInfo *rel)
 			break;
 		}
 	}
+	/* rel->rows already is what this would compute (lion_correct_rel_rows()) */
+	if (!scoped && lion_probe_cache.glob == root->glob &&
+		list_member_ptr(lion_probe_cache.rowsfixed, rel))
+	{
+		list_free(canon);
+		return clamp_row_est(rows);
+	}
 	if (!scoped && changed)
 		rows = clamp_row_est(rel->tuples *
 							 clauselist_selectivity(root, canon, 0,
@@ -2908,6 +2920,61 @@ lion_plain_note_remainder(PlannerInfo *root, IndexPath *path, Cost remainder)
 }
 
 /*
+ * set_rel_pathlist_hook, first: rel's row count as the intersection probe
+ * measures its restriction clauses (DESIGN.md §29.11, "The relation's rows").
+ * Where the probe found the AND of the set clauses of one lion index at least
+ * LION_ISECT_ERROR times off core's estimate, rel->rows becomes
+ * lion_probe_rel_rows() - core's estimate of the clauses with that AND
+ * measured - and so do the rows of every path already built for rel, which
+ * were core's: an unparameterized path's rows are rel->rows (divided among a
+ * partial path's workers), and its cost does not depend on them, each scan
+ * pricing its own clauses' selectivity; a parameterized path's rows and its
+ * ParamPathInfo's are the same restriction clauses with its join clauses
+ * ANDed in, and take the same factor.  Joins are sized from rel->rows after
+ * this, and the paths and Gathers built from here on read it.
+ *
+ * Only a plain relation of its own: an inheritance parent's rows are its
+ * children's sum, made before any child's paths are built, and a child's
+ * correction would not reach it.
+ */
+static void
+lion_correct_rel_rows(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+{
+	double		oldrows = rel->rows;
+	double		newrows;
+	double		ratio;
+	MemoryContext oldcxt;
+	ListCell   *lc;
+
+	if (!lion_enable_rows_correction || !lion_enable_intersection_probe ||
+		root->glob == NULL || rel->reloptkind != RELOPT_BASEREL ||
+		rte->rtekind != RTE_RELATION || rte->inh || rel->indexlist == NIL ||
+		lion_isect_rel_factor(root, rel) == 1.0)
+		return;
+
+	newrows = lion_probe_rel_rows(root, rel);
+	if (newrows == oldrows)
+		return;
+	ratio = newrows / Max(oldrows, 1.0);
+
+	rel->rows = newrows;
+	foreach(lc, rel->pathlist)
+		((Path *) lfirst(lc))->rows =
+			clamp_row_est(((Path *) lfirst(lc))->rows * ratio);
+	foreach(lc, rel->partial_pathlist)
+		((Path *) lfirst(lc))->rows =
+			clamp_row_est(((Path *) lfirst(lc))->rows * ratio);
+	foreach(lc, rel->ppilist)
+		((ParamPathInfo *) lfirst(lc))->ppi_rows =
+			clamp_row_est(((ParamPathInfo *) lfirst(lc))->ppi_rows * ratio);
+
+	/* lion_probe_rel_rows() reads it as it is from here on */
+	oldcxt = MemoryContextSwitchTo(lion_probe_cache_for(root)->cxt);
+	lion_probe_cache.rowsfixed = lappend(lion_probe_cache.rowsfixed, rel);
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
  * set_rel_pathlist_hook: each plain lion path of rel with a remainder noted
  * pays it, and is offered again with the bitmap heap scan of the same index
  * path beside it, which add_path() may have discarded for the plain one - the
@@ -2930,6 +2997,8 @@ static void
 lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 							RangeTblEntry *rte)
 {
+	lion_correct_rel_rows(root, rel, rte);
+
 #if PG_VERSION_NUM < 180000
 
 	/*
