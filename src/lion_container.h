@@ -72,7 +72,8 @@ typedef enum LionContainerType
 	LION_CT_BITSET = 2,
 	LION_CT_RUN = 3,
 	LION_CT_SPARSE = 4,			/* not a container; see lion_sparse.h */
-	LION_CT_NARROW = 5			/* DESIGN.md §38 */
+	LION_CT_NARROW = 5,			/* DESIGN.md §38 */
+	LION_CT_POSITIONS = 6		/* not a container; see lion_positions.h */
 } LionContainerType;
 
 /* Is type one of the four container kinds? */
