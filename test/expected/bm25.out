@@ -99,6 +99,31 @@ SELECT bm_same('w3', '{w3}', 10, 1.2, 0);			-- no length normalisation
  10 rows, 0 differ
 (1 row)
 
+-- a small k next to common lexemes, where MaxScore skips the most
+SELECT bm_same('w1 | w2 | t7 | w30', '{w1,w2,t7,w30}', 5);
+     bm_same      
+------------------
+ 5 rows, 0 differ
+(1 row)
+
+SELECT bm_same('w0 | w1 | w9 | t3', '{w0,w1,w9,t3}', 1);
+     bm_same      
+------------------
+ 1 rows, 0 differ
+(1 row)
+
+SELECT bm_same('w1 | w9 | t3', '{w1,w9,t3}', 3, 0, 0.75);	-- k1 = 0: tf ignored
+     bm_same      
+------------------
+ 3 rows, 0 differ
+(1 row)
+
+SELECT bm_same('w1 | w9 | t3', '{w1,w9,t3}', 3, 3.0, 1.0);
+     bm_same      
+------------------
+ 3 rows, 0 differ
+(1 row)
+
 -- the stripped row counts each lexeme once
 SELECT id, round(score::numeric, 6) FROM bm_lion('w2', 3000) WHERE id = 3001;
   id  |  round   
@@ -140,6 +165,20 @@ SELECT count(*) AS returned, count(t.id) AS joined, count(*) FILTER (WHERE t.not
  returned | joined | hot 
 ----------+--------+-----
        10 |     10 |   6
+(1 row)
+
+-- more dead rows among the best than the first walk keeps: the walk is made
+-- again for more, and the next best rows come back
+CREATE TEMP TABLE bm_before AS
+SELECT row_number() OVER () AS r, id, score FROM bm_lion('w5', 40);
+DELETE FROM bm_docs WHERE id IN (SELECT id FROM bm_before WHERE r <= 30);
+SELECT count(*) AS returned,
+	   count(*) FILTER (WHERE a.id = b.id AND a.score = b.score) AS same_as_before
+  FROM (SELECT row_number() OVER () + 30 AS r, id, score FROM bm_lion('w5', 10)) a
+  JOIN bm_before b USING (r);
+ returned | same_as_before 
+----------+----------------
+       10 |             10
 (1 row)
 
 -- after VACUUM the statistics no longer count the deleted rows, once a
