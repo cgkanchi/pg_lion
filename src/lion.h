@@ -1508,6 +1508,18 @@ extern Buffer lion_posting_search(Relation index, Relation heaprel,
 								  int lockmode, bool forwrite);
 
 /*
+ * lion_posting_search() routed by the last separator strictly below ckey
+ * rather than at or below it: the leaf that holds what sorts just before
+ * ckey (the leftmost leaf for ckey 0).  A position tree's separators repeat
+ * when one ckey's members fill several leaves, and every one of those leaves
+ * is to the right of this one (DESIGN.md §17).
+ */
+extern Buffer lion_posting_search_before(Relation index, Relation heaprel,
+										 uint32 hash, BlockNumber root,
+										 uint32 ckey, int lockmode,
+										 bool forwrite);
+
+/*
  * A reader's descent of the set rooted at head, stopped at `level`: the page
  * of that level the separators route ckey to, locked SHARE, or InvalidBuffer.
  * For lion_index_verify() (DESIGN.md §7), as lion_dir_search_level() is.
@@ -2060,6 +2072,18 @@ extern void lion_tree_put_items_locked(Relation index, Relation heaprel,
 									   OffsetNumber off, bool replace,
 									   LionContainer **items, int nitems,
 									   bool slack);
+
+/*
+ * Position trees (lion_postree.c): a key's position chunks once they outgrow
+ * its entry.  put replaces a member of the same code and says so; the caller
+ * holds the key's directory leaf EXCLUSIVE.  fetch is a reader's lookup.
+ */
+extern BlockNumber lion_postree_create(Relation index, Relation heaprel,
+									   uint32 hash);
+extern bool lion_postree_put(Relation index, Relation heaprel, uint32 hash,
+							 BlockNumber root, const LionPosMember *m);
+extern bool lion_postree_fetch(Relation index, uint32 hash, BlockNumber root,
+							   uint64 code, LionPosMember *m);
 
 /*
  * The number of DIRECTORY PAGES the current backend has read: the counter
