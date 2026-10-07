@@ -46,7 +46,7 @@ estimate that benefit; dirty pages require visibility checks in the heap.
 | Range filters on high-cardinality columns (timestamps, ids, prices) | Build the index `WITH (summaries = auto)` (or `on`). Without it a range is answered one distinct key at a time, so its cost grows with the number of distinct values in the range (or outside it, whichever is smaller), and a time window over a timestamp column is slow. With it the column keeps one summary posting set per bucket of about 4096 rows, and a range counts whole buckets at once: a million-key range went from 346 ms to 3.9 ms on an assert build (DESIGN.md §32). When the column's rows lie in no heap order, a range beside a clause with far fewer rows reads its buckets only at that clause's rows (DESIGN.md §32, "Summed ranges: dense and probed"). Bitmap and plain index scans of a range read the buckets too, and on a multicolumn index a range beside other columns bounds the bitmap exactly, however little `work_mem` it has for the range alone (DESIGN.md §28). Summaries cost inserts CPU - 31% more for single-row INSERTs and 73% for a bulk INSERT in that measurement, with two of the index's three columns summarized - and a few percent of index size. |
 | Ordered retrieval or uniqueness | Keep B-tree. Lion supplies bitmap and plain index scans and count pushdown, not ordered row retrieval or unique indexes. |
 | Array membership or exact-lexeme counts | Consider Lion when counts dominate; compare against GIN on your predicates and result sizes. |
-| Full-text phrase/prefix search, or searches returning documents | Prefer GIN for the measured phrase/prefix cases; ordinary document fetching shows no clear Lion advantage. |
+| Full-text phrase/prefix search, or searches returning documents | Prefer GIN for prefix search. Phrases, weights and `a & !b` are answered from the rows with all their lexemes and rechecked in the heap, which is what GIN does too, so expect parity rather than a win; ordinary document fetching shows no clear Lion advantage. |
 | Frequent inserts or indexed updates | B-tree/GIN build more cheaply. Write results are mixed: Lion's inserts are slower and emit more WAL, but its indexed UPDATE is faster than B-tree in this run. GIN defers work, so include VACUUM costs. |
 
 Lion, B-tree and GIN can coexist. Add Lion for queries that benefit, retain B-tree for transactional
@@ -341,7 +341,7 @@ VACUUM (ANALYZE) docs;
 EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
 SELECT count(*) FROM docs WHERE tags @> ARRAY['t1', 't17'];
 
--- Choose GIN for phrase/prefix searches on the text-search column.
+-- Choose GIN for prefix searches on the text-search column.
 CREATE INDEX docs_tsv_gin ON docs USING gin (tsv);
 ```
 
@@ -500,11 +500,13 @@ column, are ANDed in the index, as quals on several columns are, so the heap get
 select together (DESIGN.md §5, SCAN step 5).
 `count(*)` over `@>`, `&&` and an AND/OR tsquery is pushed down like any other clause, and can be
 combined with a `GROUP BY` on a scalar roaring column. Everything a plain AND/OR of key sets cannot
-express - `<@`, `@> '{}'`, a NULL element, and a tsquery with `!`, `<->`, `foo:*` or weights - falls
-back to scanning every indexed row and rechecking it if the Lion index is used. The planner may
-choose a sequential scan instead; GIN wins the measured phrase/prefix cases below.
+express is rechecked in the heap. A NULL element and a tsquery phrase, weight or `a & !b` are
+answered from the rows of their keys (the other elements, the phrase's lexemes, `a`), then
+rechecked, in counts and scans alike. `<@`, `@> '{}'`, a bare `!a` and `foo:*` fall back to scanning
+every indexed row and rechecking it if the Lion index is used; the planner may choose a sequential
+scan instead, and GIN wins the measured prefix case below.
 
-A literal query is only pushed down when it is exact. A query the count only sees at run time - a
+A query the count only sees at run time - a
 prepared statement's generic plan (`tags @> $1`, `tsv @@ to_tsquery($1)`) or a stable expression
 (`tsv @@ to_tsquery(current_setting('app.q'))`) - is pushed down whatever it turns out to be
 (DESIGN.md §17): exactly when the key sets answer it; from a superset of its rows, each rechecked in
