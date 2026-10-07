@@ -1990,8 +1990,16 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 			 * look at every indexed row (`tags @> '{}'`) can still find it.
 			 */
 			Datum	   *keys;
-			int			nkeys = lion_extract_value(cs, values[c], &keys);
+			int			nkeys;
 			int			i;
+
+			/* The build does not write positions yet (DESIGN.md §17). */
+			if (cs->positions)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("building an index that stores positions over existing rows is not supported yet"),
+						 errhint("Create the index on an empty table and insert the rows.")));
+			nkeys = lion_extract_value(cs, values[c], &keys);
 
 			if (nkeys == 0)
 				lion_acc_add_reserved(sp, col, LION_KIND_EMPTY, code);

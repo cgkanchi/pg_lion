@@ -434,6 +434,14 @@ lion_fill_column_state(Relation index, LionState *state, AttrNumber attno,
 		fmgr_info_copy(&state->extractquery,
 					   index_getprocinfo(index, attno, LION_EXTRACTQUERY_PROC),
 					   cxt);
+
+		/* Stored positions (§17): support proc 5. */
+		state->positions =
+			OidIsValid(index_getprocid(index, attno, LION_POSITIONS_PROC));
+		if (state->positions)
+			fmgr_info_copy(&state->positionsproc,
+						   index_getprocinfo(index, attno, LION_POSITIONS_PROC),
+						   cxt);
 	}
 
 	/*

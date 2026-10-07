@@ -1011,6 +1011,15 @@ typedef struct LionState
 	FmgrInfo	extractquery;	/* support proc 3 */
 
 	/*
+	 * The column STORES POSITIONS (DESIGN.md §17, "Stored positions"): its
+	 * multi-key opclass has support proc 5, which hands back the positions of
+	 * every key proc 2 extracts, in the same order.  Every VALUE entry of the
+	 * column then carries LION_ENTRY_POSITIONS.
+	 */
+	bool		positions;
+	FmgrInfo	positionsproc;	/* support proc 5 */
+
+	/*
 	 * The column has SUMMARY POSTING SETS (DESIGN.md §32): its bit in the meta
 	 * page's summary_cols.  Only ever set on an ordered scalar column, and only
 	 * on a version 7 index; inserts keep the summaries current and ranges read
@@ -1099,7 +1108,8 @@ lion_index_row_column(const LionIndexState *ix)
 #define LION_EXTRACTVALUE_PROC	2
 #define LION_EXTRACTQUERY_PROC	3
 #define LION_CMP_PROC			4	/* btree comparison of the KEY type (§21) */
-#define LION_NPROC				4
+#define LION_POSITIONS_PROC		5	/* word positions per extracted key (§17) */
+#define LION_NPROC				5
 
 /*
  * What a query over a multi-key index selects.
@@ -1157,6 +1167,35 @@ typedef struct LionQuery
  * belongs in the reserved EMPTY entry.
  */
 extern int lion_extract_value(LionState *state, Datum value, Datum **keys);
+
+/*
+ * The positions of one extracted key, as support proc 5 returns them: npos
+ * WordEntryPos values (weight << 14 | position), ascending by position.
+ * npos 0 is a key of a tsvector stripped of positions.
+ */
+typedef struct LionKeyPositions
+{
+	uint16		npos;
+	const uint16 *pos;
+} LionKeyPositions;
+
+/*
+ * lion_extract_value() for a column that stores positions: (*pos)[i] are the
+ * positions of (*keys)[i].
+ */
+extern int lion_extract_value_pos(LionState *state, Datum value, Datum **keys,
+								  LionKeyPositions **pos);
+extern void lion_posmember_from_key(LionPosMember *m, uint64 code,
+									const LionKeyPositions *kp);
+
+/*
+ * An aligned copy of the INLINE entry's positions chunk into buf (capacity
+ * LION_CONTAINER_MAX_SIZE): false when it has no positions section.  A
+ * section that is not one well-formed chunk is an ERROR.
+ */
+extern bool lion_entry_inline_poschunk(Relation index, const LionEntryTuple *e,
+									   Size itemsz, BlockNumber blkno,
+									   OffsetNumber off, LionContainer *buf);
 
 /*
  * Extract a query with support proc 3 and work out how its keys combine
@@ -1924,10 +1963,11 @@ extern LionEntryTuple *lion_entry_rebuild_slack(const LionEntryTuple *entry,
 												Size *size);
 extern LionEntryTuple *lion_entry_rebuild_pos(const LionEntryTuple *entry,
 											  const char *payload,
-											  Size payloadlen,
+											  Size payloadlen, Size payarea,
 											  const char *positions,
-											  Size poslen, Size allocsz,
-											  Size *size);
+											  Size poslen, Size *size);
+extern LionEntryTuple *lion_entry_add_posext(const LionEntryTuple *shape,
+											 Size *size);
 
 /*
  * How many bytes to give an INLINE entry an INSERT is rewriting: its payload
@@ -1994,6 +2034,10 @@ extern void lion_chain_put_items_locked(Relation index, Relation heaprel,
 extern void lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 							OffsetNumber entryoff, LionEntryTuple *entry,
 							const char *payload, Size paylen);
+extern void lion_entry_spill_pos(Relation index, Relation heaprel,
+								 Buffer entrybuf, OffsetNumber entryoff,
+								 LionEntryTuple *entry, const char *payload,
+								 Size paylen, const LionContainer *poschunk);
 
 /*
  * Does `head` name the live root of a posting set whose key hashes to `hash`?
