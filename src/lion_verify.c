@@ -1529,7 +1529,8 @@ lion_verify_set(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
  * whole tree and each chunk's reaching no further than the next one's header
  * ((P1) and (P2) of lion_postree.c); and at least as many members as the
  * entry has TIDs, since a row's positions are written before its TID and
- * removed after it.
+ * removed after it - and, on a primary, that every one of those TIDs has
+ * positions (lion_verify_pos_covers()).
  *
  * On a primary the entry's leaf is held SHARE for the walk, which keeps the
  * key's writers out (they hold it EXCLUSIVE for the whole insert), so the
@@ -1537,6 +1538,122 @@ lion_verify_set(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
  * held while a set is walked (lion_verify_set_walks() says why), so there the
  * walk checks the pages and leaves the count alone.
  */
+/*
+ * P ⊇ C (DESIGN.md §17): every TID of the posting set of entry has positions,
+ * i.e. is among codes (the position tree's members, ascending).  The caller
+ * holds the entry's leaf, which keeps the key's writers out, and the
+ * verification's lock keeps VACUUM out, so neither side moves meanwhile.
+ */
+typedef struct LionVerifyCover
+{
+	const uint64 *codes;
+	uint64		ncodes;
+	uint64		missing;
+	uint64		first_missing;
+	uint32		ckey;
+} LionVerifyCover;
+
+static bool
+lion_verify_cover_code(LionVerifyCover *cv, uint64 code)
+{
+	uint64		lo = 0;
+	uint64		hi = cv->ncodes;
+
+	while (lo < hi)
+	{
+		uint64		mid = lo + (hi - lo) / 2;
+
+		if (cv->codes[mid] < code)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	if (lo == cv->ncodes || cv->codes[lo] != code)
+	{
+		if (cv->missing++ == 0)
+			cv->first_missing = code;
+	}
+	return true;
+}
+
+static bool
+lion_verify_cover_lo(uint16 lo, void *arg)
+{
+	LionVerifyCover *cv = (LionVerifyCover *) arg;
+
+	return lion_verify_cover_code(cv, lion_make_code(cv->ckey, lo));
+}
+
+static bool
+lion_verify_cover_pair(uint32 ckey, uint16 lo, void *arg)
+{
+	return lion_verify_cover_code((LionVerifyCover *) arg,
+								  lion_make_code(ckey, lo));
+}
+
+static void
+lion_verify_pos_covers(LionVerifyState *vs, const LionEntryTuple *entry,
+					   const uint64 *codes, uint64 ncodes, BlockNumber eblk,
+					   OffsetNumber eoff)
+{
+	LionVerifyCover cv;
+	Buffer		buf;
+
+	cv.codes = codes;
+	cv.ncodes = ncodes;
+	cv.missing = 0;
+	cv.first_missing = 0;
+
+	buf = lion_posting_search(vs->index, NULL, entry->hash, entry->head, 0,
+							  BUFFER_LOCK_SHARE, false);
+	while (BufferIsValid(buf))
+	{
+		Page		page = BufferGetPage(buf);
+		BlockNumber blk = BufferGetBlockNumber(buf);
+		OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+		OffsetNumber o;
+		BlockNumber next;
+
+		if (!lion_page_owns_entry(page, entry->hash, entry->head) ||
+			!LionPageIsPostingLeaf(page))
+			lion_corrupt("lion index \"%s\": block %u is not a leaf of the posting set at %u",
+						RelationGetRelationName(vs->index), blk, entry->head);
+		for (o = FirstOffsetNumber; o <= maxoff; o++)
+		{
+			LionContainer *c = lion_page_item_fetch(vs->index, page, blk, o);
+
+			if (c->type == LION_CT_SPARSE)
+				lion_sparse_iterate(c, lion_verify_cover_pair, &cv);
+			else
+			{
+				cv.ckey = c->ckey;
+				lion_container_iterate(c, lion_verify_cover_lo, &cv);
+			}
+		}
+		next = LionPageIsRightmost(page) ? InvalidBlockNumber :
+			LionPageGetOpaque(page)->rightlink;
+		UnlockReleaseBuffer(buf);
+		buf = InvalidBuffer;
+		if (BlockNumberIsValid(next))
+		{
+			buf = ReadBuffer(vs->index, next);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	if (cv.missing > 0)
+	{
+		ItemPointerData tid;
+
+		lion_code_to_tid(cv.first_missing, &tid);
+		lion_corrupt("lion index \"%s\": " UINT64_FORMAT " TIDs of chain entry %u on block %u have no positions, the first (%u,%u)",
+					RelationGetRelationName(vs->index), cv.missing, eoff, eblk,
+					ItemPointerGetBlockNumber(&tid),
+					ItemPointerGetOffsetNumber(&tid));
+	}
+}
+
 static void
 lion_verify_postree(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 					const LionEntryTuple *entry)
@@ -1558,6 +1675,8 @@ lion_verify_postree(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 	uint32		lastheader = 0;
 	LionPosMember *m = (LionPosMember *) palloc(sizeof(LionPosMember));
 	char		err[256];
+	Size		codecap = 1024;
+	uint64	   *codes = (uint64 *) palloc(sizeof(uint64) * codecap);
 
 	memcpy(cur, entry, sz);
 	if (vs->concurrent)
@@ -1643,6 +1762,16 @@ lion_verify_postree(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 						any = true;
 						lastcode = m->code;
 						lastblock = lion_pos_block(m->code);
+						if (BufferIsValid(leaf))
+						{
+							if (nmembers == codecap)
+							{
+								codecap *= 2;
+								codes = (uint64 *) repalloc_huge(codes,
+																 sizeof(uint64) * codecap);
+							}
+							codes[nmembers] = m->code;
+						}
 						nmembers++;
 					}
 				}
@@ -1665,8 +1794,10 @@ lion_verify_postree(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 			lion_corrupt("lion index \"%s\": chain entry %u on block %u has " UINT64_FORMAT " TIDs but positions for " UINT64_FORMAT " rows",
 						RelationGetRelationName(vs->index), off, blk,
 						cur->ntids, nmembers);
+		lion_verify_pos_covers(vs, cur, codes, nmembers, blk, off);
 		UnlockReleaseBuffer(leaf);
 	}
+	pfree(codes);
 	pfree(m);
 	pfree(cur);
 }
