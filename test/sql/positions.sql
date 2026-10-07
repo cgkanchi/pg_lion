@@ -329,6 +329,8 @@ EXPLAIN (COSTS OFF)
 SELECT cat, count(*) FROM pos_grouped WHERE d @@ 'everywhere <-> again' GROUP BY cat;
 EXPLAIN (COSTS OFF)
 SELECT count(DISTINCT cat) FROM pos_grouped WHERE d @@ 'common <-> again & !new5';
+-- PostgreSQL 19 may aggregate below the join instead (eager aggregation)
+DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN PERFORM set_config('enable_eager_aggregate', 'off', false); END IF; END$$;
 EXPLAIN (COSTS OFF)
 SELECT pos_dim.name, count(*)
 FROM pos_grouped JOIN pos_dim ON pos_grouped.cat = pos_dim.id
@@ -343,6 +345,7 @@ UNION ALL
 SELECT 'join', pos_dim.name, count(*)
 FROM pos_grouped JOIN pos_dim ON pos_grouped.cat = pos_dim.id
 WHERE pos_grouped.d @@ 'w1:A | (common <-> again)' GROUP BY pos_dim.name;
+DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN EXECUTE 'RESET enable_eager_aggregate'; END IF; END$$;
 SET pg_lion.enable_count_pushdown = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
