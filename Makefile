@@ -113,7 +113,7 @@ test/unit/container_test_nosimd: test/unit/container_test.c src/lion_container.c
 	$(CC) $(UNIT_CFLAGS) $(UNIT_NOSIMD_CFLAGS) -o $@ test/unit/container_test.c src/lion_container.c $(UNIT_LDFLAGS)
 
 test/unit/sparse_test: test/unit/sparse_test.c src/lion_sparse.c src/lion_container.c \
-                       src/lion_sparse.h src/lion_container.h src/lion_tid.h
+                       src/lion_sparse.h src/lion_positions.h src/lion_container.h src/lion_tid.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/sparse_test.c src/lion_sparse.c src/lion_container.c $(UNIT_LDFLAGS)
 
 test/unit/positions_test: test/unit/positions_test.c src/lion_positions.c \
