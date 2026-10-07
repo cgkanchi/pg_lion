@@ -817,8 +817,8 @@ SELECT lion_arrcmp($$SELECT d FROM lion_arr_odd WHERE d @> '{b}'$$);
 DROP TABLE lion_arr_odd;
 -- ---- costing the ALL-mode fallback (2026-09-21 follow-up review) -------
 /*
- * `<@`, `@> '{}'` and any query with a NULL element cannot be answered from
- * the stored element memberships: the extractor falls back to LION_QMODE_ALL,
+ * `<@` and `@> '{}'` cannot be answered from the stored element
+ * memberships: the extractor falls back to LION_QMODE_ALL,
  * the scan emits the union of every entry, and every candidate row is
  * fetched and rechecked in the heap (DESIGN.md §17).  The generic index
  * estimate used to price that with the PREDICATE's selectivity, which made a
@@ -866,7 +866,8 @@ EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc
          Index Cond: (tags && '{u500,u501}'::text[])
 (3 rows)
 
--- ALL mode: `<@`, the empty array, a NULL element
+-- ALL mode: `<@`, the empty array; a NULL element is the AND of the others,
+-- rechecked (it is then false everywhere, which the recheck finds)
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc
 	WHERE tags <@ ARRAY['u500', 't0', 't1'];
                     QUERY PLAN                    
@@ -886,11 +887,11 @@ EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc WHERE tags @> ARRAY[]::text[];
 
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_arrc
 	WHERE tags @> ARRAY['u500', NULL];
-                   QUERY PLAN                    
--------------------------------------------------
+                     QUERY PLAN                      
+-----------------------------------------------------
  Aggregate
-   ->  Seq Scan on lion_arrc
-         Filter: (tags @> '{u500,NULL}'::text[])
+   ->  Index Scan using lion_arrc_tags on lion_arrc
+         Index Cond: (tags @> '{u500,NULL}'::text[])
 (3 rows)
 
 -- an unknown value has to be priced as the expensive shape as well

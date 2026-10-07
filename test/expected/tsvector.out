@@ -139,17 +139,15 @@ SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
    Lion Indexes: lion_ts_tsv (tsv @@ '''w1'' | ''w2'''::tsquery)
 (2 rows)
 
--- NOT, prefix, phrase and weights are never pushed down
+-- NOT beside a lexeme, phrase and weights are counted from the superset of
+-- their lexemes' rows and rechecked; a prefix is never pushed down
 SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 					WHERE tsv @@ to_tsquery('english', 'alpha & !w1')$$);
-                            lion_tsplan                            
--------------------------------------------------------------------
- Aggregate
-   ->  Bitmap Heap Scan on lion_ts
-         Recheck Cond: (tsv @@ '''alpha'' & !''w1'''::tsquery)
-         ->  Bitmap Index Scan on lion_ts_tsv
-               Index Cond: (tsv @@ '''alpha'' & !''w1'''::tsquery)
-(5 rows)
+                             lion_tsplan                             
+---------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_ts_tsv (tsv @@ '''alpha'' & !''w1'''::tsquery)
+(2 rows)
 
 SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 					WHERE tsv @@ to_tsquery('english', 'w1:*')$$);
@@ -164,25 +162,19 @@ SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 
 SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 					WHERE tsv @@ phraseto_tsquery('english', 'bravo charlie')$$);
-                              lion_tsplan                               
-------------------------------------------------------------------------
- Aggregate
-   ->  Bitmap Heap Scan on lion_ts
-         Recheck Cond: (tsv @@ '''bravo'' <-> ''charli'''::tsquery)
-         ->  Bitmap Index Scan on lion_ts_tsv
-               Index Cond: (tsv @@ '''bravo'' <-> ''charli'''::tsquery)
-(5 rows)
+                               lion_tsplan                                
+--------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_ts_tsv (tsv @@ '''bravo'' <-> ''charli'''::tsquery)
+(2 rows)
 
 SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 					WHERE tsv @@ to_tsquery('english', 'alpha:A')$$);
-                        lion_tsplan                        
------------------------------------------------------------
- Aggregate
-   ->  Bitmap Heap Scan on lion_ts
-         Recheck Cond: (tsv @@ '''alpha'':A'::tsquery)
-         ->  Bitmap Index Scan on lion_ts_tsv
-               Index Cond: (tsv @@ '''alpha'':A'::tsquery)
-(5 rows)
+                         lion_tsplan                         
+-------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_ts_tsv (tsv @@ '''alpha'':A'::tsquery)
+(2 rows)
 
 SELECT lion_tsplan($$SELECT grp, count(*) FROM lion_ts
 					WHERE tsv @@ to_tsquery('english', 'w1 & w2') GROUP BY grp$$);
@@ -403,9 +395,9 @@ SELECT lion_tscmp($$SELECT count(*) FROM lion_ts
 
 SELECT lion_tscmp($$SELECT count(*) FROM lion_ts
 				  WHERE tsv @@ to_tsquery('english', 'alpha & !w1')$$);
-     lion_tscmp     
---------------------
- index scan, 1 rows
+     lion_tscmp      
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_tscmp($$SELECT count(*) FROM lion_ts
@@ -674,15 +666,18 @@ EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc
          Index Cond: (tsv @@ '''rare500'' | ''rare501'''::tsquery)
 (3 rows)
 
--- ALL mode: a phrase, a prefix, a weight mask, a NOT
+-- a superset, rechecked: a phrase, a weight mask, a NOT beside a lexeme;
+-- ALL mode: a prefix
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc
 	WHERE tsv @@ 'common <-> w1'::tsquery;
-                        QUERY PLAN                         
------------------------------------------------------------
+                             QUERY PLAN                              
+---------------------------------------------------------------------
  Aggregate
-   ->  Seq Scan on lion_tsc
-         Filter: (tsv @@ '''common'' <-> ''w1'''::tsquery)
-(3 rows)
+   ->  Bitmap Heap Scan on lion_tsc
+         Recheck Cond: (tsv @@ '''common'' <-> ''w1'''::tsquery)
+         ->  Bitmap Index Scan on lion_tsc_tsv
+               Index Cond: (tsv @@ '''common'' <-> ''w1'''::tsquery)
+(5 rows)
 
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc WHERE tsv @@ 'rare50:*'::tsquery;
                     QUERY PLAN                    
@@ -693,20 +688,20 @@ EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc WHERE tsv @@ 'rare50:*'::tsquer
 (3 rows)
 
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc WHERE tsv @@ 'rare500:A'::tsquery;
-                    QUERY PLAN                     
----------------------------------------------------
+                      QUERY PLAN                       
+-------------------------------------------------------
  Aggregate
-   ->  Seq Scan on lion_tsc
-         Filter: (tsv @@ '''rare500'':A'::tsquery)
+   ->  Index Scan using lion_tsc_tsv on lion_tsc
+         Index Cond: (tsv @@ '''rare500'':A'::tsquery)
 (3 rows)
 
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc
 	WHERE tsv @@ 'rare500 & !endword'::tsquery;
-                           QUERY PLAN                           
-----------------------------------------------------------------
+                             QUERY PLAN                             
+--------------------------------------------------------------------
  Aggregate
-   ->  Seq Scan on lion_tsc
-         Filter: (tsv @@ '''rare500'' & !''endword'''::tsquery)
+   ->  Index Scan using lion_tsc_tsv on lion_tsc
+         Index Cond: (tsv @@ '''rare500'' & !''endword'''::tsquery)
 (3 rows)
 
 -- an unknown value has to be priced as the expensive shape as well
@@ -731,13 +726,70 @@ SELECT lion_tscmp($$SELECT count(*) FROM lion_tsc WHERE tsv @@ 'rare50:*'::tsque
 
 SELECT lion_tscmp($$SELECT count(*) FROM lion_tsc
 				   WHERE tsv @@ 'common <-> w1'::tsquery$$);
-     lion_tscmp     
---------------------
- index scan, 1 rows
+     lion_tscmp      
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_tscmp($$SELECT count(*) FROM lion_tsc
 				   WHERE tsv @@ 'rare500 & endword'::tsquery$$);
+     lion_tscmp      
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- the superset's rows, fetched by the bitmap scan and rechecked in the heap
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ 'common <-> w1'::tsquery$$);
+      lion_tscmp       
+-----------------------
+ index scan, 1000 rows
+(1 row)
+
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ 'w1 <-> common'::tsquery$$);
+     lion_tscmp     
+--------------------
+ index scan, 0 rows
+(1 row)
+
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ 'rare500 <2> w0'::tsquery$$);
+     lion_tscmp     
+--------------------
+ index scan, 0 rows
+(1 row)
+
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ 'rare500:A'::tsquery$$);
+     lion_tscmp     
+--------------------
+ index scan, 0 rows
+(1 row)
+
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ 'rare500 & !endword'::tsquery$$);
+     lion_tscmp     
+--------------------
+ index scan, 0 rows
+(1 row)
+
+SELECT lion_tscmp($$SELECT id FROM lion_tsc
+				   WHERE tsv @@ 'w3 & !(w3 <-> w3)'::tsquery$$);
+      lion_tscmp      
+----------------------
+ index scan, 950 rows
+(1 row)
+
+SELECT lion_tscmp($$SELECT count(*) FROM lion_tsc
+				   WHERE tsv @@ 'w3 <-> w3'::tsquery$$);
+     lion_tscmp      
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_tscmp($$SELECT count(*) FROM lion_tsc
+				   WHERE tsv @@ 'w1 <-> w1 | rare7'::tsquery$$);
      lion_tscmp      
 ---------------------
  pushed down, 1 rows

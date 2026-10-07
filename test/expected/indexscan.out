@@ -459,7 +459,7 @@ SELECT lion_ir('SELECT id FROM lis WHERE tags <@ ''{1, 11, 41, 2, 12, 42}''');
  Rows Removed by Index Recheck: 25123
 (2 rows)
 
--- tsvector: a tree of lexemes, and a NOT, which needs every row
+-- tsvector: a tree of lexemes, and a NOT beside one, answered from the lexeme's rows and rechecked
 SELECT lion_iq('SELECT id FROM lis WHERE tsv @@ ''w3 & x2''::tsquery');
              lion_iq             
 ---------------------------------
@@ -479,10 +479,10 @@ SELECT lion_iq('SELECT id FROM lis WHERE tsv @@ ''w3 & !x2''::tsquery');
 (1 row)
 
 SELECT lion_ir('SELECT id FROM lis WHERE tsv @@ ''w3 & !x2''::tsquery');
-               lion_ir                
---------------------------------------
+              lion_ir               
+------------------------------------
  Index Scan using lis_tsv
- Rows Removed by Index Recheck: 24936
+ Rows Removed by Index Recheck: 390
 (2 rows)
 
 -- partial indexes answered with no key at all: a scalar column and a multi-key one

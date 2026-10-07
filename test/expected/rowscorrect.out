@@ -1,0 +1,117 @@
+-- The relation's rows (DESIGN.md §29.11, "The relation's rows"): what the
+-- intersection probe measures of a relation's own restriction clauses
+-- corrects rel->rows as well as lion's own estimates, so that a join above
+-- the relation is sized for the rows its filters leave.
+--
+-- The filters below follow one hidden attribute, and their AND holds fifty
+-- times the rows the product of their selectivities says.  Sized for that
+-- product, a join over the relation is estimated at a few rows; sized for
+-- what the probe measures, at about what it returns.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+-- a sample of every row: the statistics, and the plans, do not depend on it
+SET default_statistics_target = 1000;
+SET max_parallel_workers_per_gather = 0;
+-- 50,000 rows in 50 hidden groups h = id % 50, each group on every page;
+-- c5, c25 and c50 follow h, p (7 values) and q (11) do not.  lrc_f has
+-- three rows for every row of lrc.
+CREATE TABLE lrc (id int PRIMARY KEY, c5 int NOT NULL, c25 int NOT NULL,
+				  c50 int NOT NULL, p int NOT NULL, q int NOT NULL, pad text);
+INSERT INTO lrc
+SELECT i, (i % 50) / 10, (i % 50) / 2, i % 50, i % 7, i % 11, repeat('x', 100)
+  FROM generate_series(1, 50000) i;
+CREATE INDEX lrc_i ON lrc USING lion (c5, c25, c50, p, q);
+CREATE TABLE lrc_f (id int, rid int NOT NULL, v int NOT NULL);
+INSERT INTO lrc_f SELECT i, (i % 50000) + 1, i % 13 FROM generate_series(1, 150000) i;
+VACUUM (FREEZE, ANALYZE) lrc, lrc_f;
+/*
+ * lrc_est() is the planner's row estimate of q's top node, with the
+ * correction on or off; lrc_scan() that of the scan of lrc in it.
+ */
+CREATE FUNCTION lrc_est(q text, fix boolean, node text DEFAULT NULL)
+RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	j	json;
+	r	bigint;
+BEGIN
+	PERFORM set_config('pg_lion.enable_rows_correction',
+					   CASE WHEN fix THEN 'on' ELSE 'off' END, true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+	IF node IS NULL THEN
+		r := (j->0->'Plan'->>'Plan Rows')::bigint;
+	ELSE
+		r := (regexp_match(j::text, '"Relation Name": "' || node ||
+						   '",[^}]*"Plan Rows": (\d+)'))[1];
+	END IF;
+	PERFORM set_config('pg_lion.enable_rows_correction', 'on', true);
+	RETURN r;
+END $$;
+CREATE FUNCTION lrc_actual(q text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	n	bigint;
+BEGIN
+	EXECUTE 'SELECT count(*) FROM (' || q || ') s' INTO n;
+	RETURN n;
+END $$;
+-- 1: three clauses that follow h, and hold exactly h = 11's 1,000 rows; the
+--    product of their selectivities is about 20.
+-- 2: p and q are independent: the probe finds what core estimated, and the
+--    estimate stays exactly as it was.
+-- 3: the join of 1 with three rows of lrc_f for each of its rows.
+-- 4: the same join, whose other side's rows are what is filtered.
+CREATE TABLE lrc_q (n int, q text, node text);
+INSERT INTO lrc_q VALUES
+	(1, $$SELECT id FROM lrc WHERE c5 = 1 AND c25 = 5 AND c50 = 11$$, 'lrc'),
+	(2, $$SELECT id FROM lrc WHERE p = 3 AND q = 5$$, 'lrc'),
+	(3, $$SELECT f.v FROM lrc_f f JOIN lrc r ON f.rid = r.id WHERE r.c5 = 1 AND r.c25 = 5 AND r.c50 = 11$$, NULL),
+	(4, $$SELECT f.v FROM lrc_f f WHERE f.rid IN (SELECT id FROM lrc WHERE c5 = 1 AND c25 = 5 AND c50 = 11)$$, NULL);
+SELECT n, lrc_actual(q) AS actual,
+	   lrc_est(q, true, node) BETWEEN lrc_actual(q) / 2 AND lrc_actual(q) * 2 AS corrected_within_2x,
+	   lrc_est(q, false, node) BETWEEN lrc_actual(q) / 2 AND lrc_actual(q) * 2 AS uncorrected_within_2x,
+	   lrc_est(q, true, node) = lrc_est(q, false, node) AS unchanged
+  FROM lrc_q ORDER BY n;
+ n | actual | corrected_within_2x | uncorrected_within_2x | unchanged 
+---+--------+---------------------+-----------------------+-----------
+ 1 |   1000 | t                   | f                     | f
+ 2 |    649 | t                   | t                     | t
+ 3 |   3000 | t                   | f                     | f
+ 4 |   3000 | t                   | f                     | f
+(4 rows)
+
+-- With the probe off there is nothing to correct with.
+SET pg_lion.enable_intersection_probe = off;
+SELECT lrc_est(q, true, node) = lrc_est(q, false, node) AS unchanged
+  FROM lrc_q WHERE n = 1;
+ unchanged 
+-----------
+ t
+(1 row)
+
+RESET pg_lion.enable_intersection_probe;
+-- The answers do not depend on it.
+SELECT count(*), sum(f.v) FROM lrc_f f JOIN lrc r ON f.rid = r.id
+ WHERE r.c5 = 1 AND r.c25 = 5 AND r.c50 = 11;
+ count |  sum  
+-------+-------
+  3000 | 18002
+(1 row)
+
+SET pg_lion.enable_rows_correction = off;
+SELECT count(*), sum(f.v) FROM lrc_f f JOIN lrc r ON f.rid = r.id
+ WHERE r.c5 = 1 AND r.c25 = 5 AND r.c50 = 11;
+ count |  sum  
+-------+-------
+  3000 | 18002
+(1 row)
+
+RESET pg_lion.enable_rows_correction;
+DROP TABLE lrc, lrc_f, lrc_q;
+DROP FUNCTION lrc_est(text, boolean, text), lrc_actual(text);
+RESET default_statistics_target;

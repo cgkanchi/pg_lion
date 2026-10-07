@@ -309,17 +309,23 @@ lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 	else
 	{
 		lion_extract_query(istate, cl->val, strategy, &q);
+		cl->qmode = LION_QMODE_KEYS;
 
 		/*
 		 * The plan was only made because this extraction came out exact
-		 * (lion_multikey_query_is_exact()), against this very function and
-		 * this very constant.  A different answer now would mean the count
-		 * could silently miss rows, so say so instead.
+		 * (lion_multikey_query_is_exact()) or a superset the row filter
+		 * rechecks (a phrase, a weight: lion_analyze_leaf()), against this
+		 * very function and this very constant.  Anything else now would
+		 * mean the count could silently miss rows, so say so instead.
 		 */
 		if (q.mode != LION_QMODE_KEYS)
-			elog(ERROR, "roaring count: query for index \"%s\" is no longer exact",
-				 RelationGetRelationName(cl->idx));
-		cl->qmode = LION_QMODE_KEYS;
+		{
+			lion_extract_query_superset(istate, cl->val, strategy, &q);
+			if (q.mode != LION_QMODE_LOSSY)
+				elog(ERROR, "roaring count: query for index \"%s\" is no longer exact",
+					 RelationGetRelationName(cl->idx));
+			cl->qmode = LION_QMODE_LOSSY;
+		}
 	}
 
 	*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * Max(q.nkeys, 1));
