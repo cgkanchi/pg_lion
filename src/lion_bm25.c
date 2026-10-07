@@ -64,6 +64,7 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "tsearch/ts_type.h"
+#include "tsearch/ts_utils.h"
 #include "utils/acl.h"
 #include "utils/hsearch.h"
 #include "utils/builtins.h"
@@ -73,15 +74,17 @@
 #include "utils/tuplestore.h"
 
 #include "lion.h"
+#include "lion_bm25.h"
 #include "lion_compat.h"
 #include "lion_count.h"
 #include "lion_positions.h"
 #include "lion_tid.h"
 
 PG_FUNCTION_INFO_V1(lion_bm25);
+PG_FUNCTION_INFO_V1(lion_bm25_score);
 
 /*
- * One query lexeme: a cursor over its members in TID order, the member it
+ * One query lexeme in a walk: a cursor over its members in TID order, the member it
  * stands on (NULL once past the last), its idf, and the most it can add to a
  * score.
  */
@@ -92,13 +95,6 @@ typedef struct LionBm25Term
 	double		idf;
 	double		ub;
 } LionBm25Term;
-
-/* A candidate row. */
-typedef struct LionBm25Cand
-{
-	uint64		code;
-	double		score;
-} LionBm25Cand;
 
 /* N and the sum of the lengths, per index, for this backend. */
 typedef struct LionBm25Stats
@@ -114,10 +110,12 @@ static HTAB *lion_bm25_stats_cache = NULL;
 
 /*
  * The lexemes of query that count: every operand not under a NOT, once.
- * A prefix operand is refused, since it names no one key.
+ * A prefix operand names no one key: it is refused, or with prefix given,
+ * reported there.
  */
 static void
-lion_bm25_terms_walk(TSQuery query, int i, bool negated, List **out)
+lion_bm25_terms_walk(TSQuery query, int i, bool negated, bool *prefix,
+					 List **out)
 {
 	QueryItem  *item = GETQUERY(query) + i;
 
@@ -129,6 +127,11 @@ lion_bm25_terms_walk(TSQuery query, int i, bool negated, List **out)
 		text	   *lex;
 		ListCell   *lc;
 
+		if (op->prefix && prefix != NULL)
+		{
+			*prefix = true;
+			return;
+		}
 		if (op->prefix)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -153,11 +156,33 @@ lion_bm25_terms_walk(TSQuery query, int i, bool negated, List **out)
 	/* an operator: its right operand at i + 1, its left at i + left */
 	if (item->qoperator.oper == OP_NOT)
 	{
-		lion_bm25_terms_walk(query, i + 1, !negated, out);
+		lion_bm25_terms_walk(query, i + 1, !negated, prefix, out);
 		return;
 	}
-	lion_bm25_terms_walk(query, i + 1, negated, out);
-	lion_bm25_terms_walk(query, i + item->qoperator.left, negated, out);
+	lion_bm25_terms_walk(query, i + 1, negated, prefix, out);
+	lion_bm25_terms_walk(query, i + item->qoperator.left, negated, prefix,
+						 out);
+}
+
+List *
+lion_bm25_lexemes(TSQuery query, bool *prefix)
+{
+	List	   *out = NIL;
+
+	if (prefix != NULL)
+		*prefix = false;
+	if (query->size > 0)
+		lion_bm25_terms_walk(query, 0, false, prefix, &out);
+	return out;
+}
+
+void
+lion_bm25_check_params(double k1, double b)
+{
+	if (!(k1 >= 0) || !(b >= 0 && b <= 1))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("k1 must be at least 0 and b between 0 and 1")));
 }
 
 static LionPosCursor *
@@ -344,7 +369,7 @@ lion_bm25_heap_add(LionBm25Cand *heap, int64 *n, int64 cap, const LionBm25Cand *
 }
 
 /* The key column of index that stores positions, 0-based. */
-static int
+int
 lion_bm25_column(Relation index, LionIndexState *ix)
 {
 	int			found = -1;
@@ -400,24 +425,146 @@ lion_bm25_emit(ReturnSetInfo *rsinfo, Relation heap, Snapshot snapshot,
 	}
 }
 
-
-/* BM25 of one member: what tf adds to a row whose norm is norm. */
+/* What tf occurrences of a lexeme of idf idf add to a row whose norm is norm. */
 static inline double
-lion_bm25_term_score(const LionBm25Term *term, const LionPosMember *m,
-					 double k1, double norm)
+lion_bm25_tf_score(double idf, double tf, double k1, double norm)
 {
-	double		tf = (double) Max(m->npos, 1);	/* a stripped lexeme: once */
-
-	return term->idf * tf * (k1 + 1.0) / (tf + norm);
+	return idf * tf * (k1 + 1.0) / (tf + norm);
 }
 
-static int
-lion_bm25_term_ub_cmp(const void *a, const void *b)
+/* k1 * (1 - b + b * |d| / avgdl) */
+static inline double
+lion_bm25_norm(const LionBm25Query *q, double dl)
 {
-	const LionBm25Term *x = (const LionBm25Term *) a;
-	const LionBm25Term *y = (const LionBm25Term *) b;
+	return q->k1 * (1.0 - q->b + q->b * dl / q->avgdl);
+}
 
-	return (x->ub > y->ub) - (x->ub < y->ub);
+/* The order of a query's lexemes: by idf, then as the query has them. */
+static const double *lion_bm25_sort_idfs;
+
+static int
+lion_bm25_order_cmp(const void *a, const void *b)
+{
+	int			x = *(const int *) a;
+	int			y = *(const int *) b;
+	double		ix = lion_bm25_sort_idfs[x];
+	double		iy = lion_bm25_sort_idfs[y];
+
+	if (ix != iy)
+		return (ix > iy) - (ix < iy);
+	return (x > y) - (x < y);
+}
+
+/*
+ * Make query ready to rank against index, which must be a lion index that
+ * stores positions for one tsvector column.  False when no row can score:
+ * no lexeme counts, no row has one, or none has any of the query's.
+ */
+bool
+lion_bm25_prepare(Relation index, TSQuery query, double k1, double b,
+				  LionBm25Query *q)
+{
+	LionIndexState *ix = lion_get_index_state(index);
+	Datum		lenkey = PointerGetDatum(cstring_to_text_with_len("", 0));
+	List	   *lexemes;
+	ListCell   *lc;
+	int64		nrows;
+	int			t;
+
+	memset(q, 0, sizeof(LionBm25Query));
+	q->index = index;
+	q->col = &ix->cols[lion_bm25_column(index, ix)];
+	q->k1 = k1;
+	q->b = b;
+
+	lexemes = lion_bm25_lexemes(query, NULL);
+	q->nterms = list_length(lexemes);
+	if (q->nterms == 0 ||
+		!lion_bm25_stats(index, q->col, lenkey, &nrows, &q->avgdl))
+		return false;
+
+	/* each lexeme's idf, from the rows its entry says it has */
+	q->lexemes = (text **) palloc(sizeof(text *) * q->nterms);
+	q->idfs = (double *) palloc(sizeof(double) * q->nterms);
+	q->order = (int *) palloc(sizeof(int) * q->nterms);
+	t = 0;
+	foreach(lc, lexemes)
+	{
+		uint64		df = lion_bm25_ntids(index, q->col,
+										 PointerGetDatum(lfirst(lc)));
+
+		q->ncodes += df;
+		df = Min(df, (uint64) nrows);
+		q->lexemes[t] = (text *) lfirst(lc);
+		q->idfs[t] = log(1.0 + ((double) nrows - (double) df + 0.5) /
+						 ((double) df + 0.5));
+		q->order[t] = t;
+		t++;
+	}
+	lion_bm25_sort_idfs = q->idfs;
+	qsort(q->order, q->nterms, sizeof(int), lion_bm25_order_cmp);
+	return q->ncodes > 0;
+}
+
+/* Best first, equal scores in TID order. */
+void
+lion_bm25_sort(LionBm25Cand *cands, int64 n)
+{
+	qsort(cands, n, sizeof(LionBm25Cand), lion_bm25_cand_cmp);
+}
+
+/*
+ * The score of one row from its tsvector, as the walk would give it: the
+ * same tf (a stripped lexeme once), the same length (every occurrence of
+ * every lexeme but an empty one, capped at 65535) and the same order of
+ * adding up.
+ */
+double
+lion_bm25_score_row(const LionBm25Query *q, TSVector doc)
+{
+	WordEntry  *we = ARRPTR(doc);
+	char	   *str = STRPTR(doc);
+	uint32		dl = 0;
+	double		norm;
+	double		score = 0;
+	int			i;
+	int			t;
+
+	for (i = 0; i < doc->size; i++)
+		if (we[i].len > 0)
+			dl += we[i].haspos ? Max((uint32) POSDATALEN(doc, &we[i]), 1) : 1;
+	norm = lion_bm25_norm(q, (double) Min(dl, (uint32) PG_UINT16_MAX));
+
+	for (t = q->nterms - 1; t >= 0; t--)
+	{
+		text	   *lex = q->lexemes[q->order[t]];
+		int			lo = 0;
+		int			hi = doc->size;
+
+		while (lo < hi)
+		{
+			int			mid = lo + (hi - lo) / 2;
+			int32		c = tsCompareString(VARDATA_ANY(lex),
+											VARSIZE_ANY_EXHDR(lex),
+											str + we[mid].pos, we[mid].len,
+											false);
+
+			if (c == 0)
+			{
+				double		tf = we[mid].haspos ?
+					(double) Max(POSDATALEN(doc, &we[mid]), 1) : 1.0;
+
+				score += lion_bm25_tf_score(q->idfs[q->order[t]], tf, q->k1,
+											norm);
+				break;
+			}
+			if (c < 0)
+				hi = mid;
+			else
+				lo = mid + 1;
+		}
+	}
+	return score;
 }
 
 /*
@@ -439,40 +586,36 @@ lion_bm25_term_ub_cmp(const void *a, const void *b)
  * gets in only with a score above the heap's worst: at a bound no higher than
  * that, a row is not scored on.
  */
-static int64
-lion_bm25_topk(Relation index, LionState *col, Datum lenkey, List *lexemes,
-			   const double *idfs, double k1, double b, double avgdl,
-			   int64 L, LionBm25Cand *best)
+int64
+lion_bm25_topk(const LionBm25Query *q, int64 L, LionBm25Cand *best)
 {
-	int			nterms = list_length(lexemes);
+	Relation	index = q->index;
+	int			nterms = q->nterms;
 	LionBm25Term *terms = (LionBm25Term *) palloc0(sizeof(LionBm25Term) * nterms);
 	double	   *below;			/* below[i]: the maxima of terms[0, i) */
+	Datum		lenkey = PointerGetDatum(cstring_to_text_with_len("", 0));
 	LionPosCursor *lencur;
 	int64		nbest = 0;
 	int			nlow = 0;
 	int64		nscored = 0;
-	ListCell   *lc;
 	int			t;
 
-	t = 0;
-	foreach(lc, lexemes)
-	{
-		LionBm25Term *term = &terms[t];
-
-		term->cur = lion_bm25_open(index, col, PointerGetDatum(lfirst(lc)),
-								   true);
-		term->m = lion_poscursor_next(index, term->cur, 0);
-		term->idf = idfs[t];
-		term->ub = idfs[t] * (k1 + 1.0) * (1.0 + 1e-9);
-		t++;
-	}
-	qsort(terms, nterms, sizeof(LionBm25Term), lion_bm25_term_ub_cmp);
 	below = (double *) palloc(sizeof(double) * (nterms + 1));
 	below[0] = 0;
 	for (t = 0; t < nterms; t++)
-		below[t + 1] = below[t] + terms[t].ub;
+	{
+		LionBm25Term *term = &terms[t];
+		int			l = q->order[t];
 
-	lencur = lion_bm25_open(index, col, lenkey, false);
+		term->cur = lion_bm25_open(index, q->col,
+								   PointerGetDatum(q->lexemes[l]), true);
+		term->m = lion_poscursor_next(index, term->cur, 0);
+		term->idf = q->idfs[l];
+		term->ub = q->idfs[l] * (q->k1 + 1.0) * (1.0 + 1e-9);
+		below[t + 1] = below[t] + term->ub;
+	}
+
+	lencur = lion_bm25_open(index, q->col, lenkey, false);
 	for (;;)
 	{
 		uint64		code = PG_UINT64_MAX;
@@ -488,9 +631,8 @@ lion_bm25_topk(Relation index, LionState *col, Datum lenkey, List *lexemes,
 			break;
 
 		m = lion_poscursor_next(index, lencur, code);
-		norm = k1 * (1.0 - b + b *
-					 ((m != NULL && m->code == code) ?
-					  lion_bm25_length(m) : avgdl) / avgdl);
+		norm = lion_bm25_norm(q, (m != NULL && m->code == code) ?
+							  lion_bm25_length(m) : q->avgdl);
 
 		/* the essential terms, then the rest from the one that can add most */
 		for (t = nterms - 1; t >= nlow; t--)
@@ -499,7 +641,9 @@ lion_bm25_topk(Relation index, LionState *col, Datum lenkey, List *lexemes,
 
 			if (term->m != NULL && term->m->code == code)
 			{
-				score += lion_bm25_term_score(term, term->m, k1, norm);
+				score += lion_bm25_tf_score(term->idf,
+											(double) Max(term->m->npos, 1),
+											q->k1, norm);
 				term->m = lion_poscursor_next(index, term->cur, code + 1);
 			}
 		}
@@ -512,7 +656,9 @@ lion_bm25_topk(Relation index, LionState *col, Datum lenkey, List *lexemes,
 			if (term->m != NULL && term->m->code < code)
 				term->m = lion_poscursor_next(index, term->cur, code);
 			if (term->m != NULL && term->m->code == code)
-				score += lion_bm25_term_score(term, term->m, k1, norm);
+				score += lion_bm25_tf_score(term->idf,
+											(double) Max(term->m->npos, 1),
+											q->k1, norm);
 		}
 		if (t < 0 && (nbest < L || score > best[0].score))
 		{
@@ -534,46 +680,17 @@ lion_bm25_topk(Relation index, LionState *col, Datum lenkey, List *lexemes,
 	return nbest;
 }
 
-Datum
-lion_bm25(PG_FUNCTION_ARGS)
+/*
+ * Open the index for lion_bm25() or lion_bm25_score(), its table's SELECT
+ * privilege checked before any lock; the table is opened too when heap is
+ * given.
+ */
+static Relation
+lion_bm25_open_index(Oid indexoid, Relation *heap)
 {
-	Oid			indexoid = PG_GETARG_OID(0);
-	TSQuery		query = PG_GETARG_TSQUERY(1);
-	int32		k = PG_GETARG_INT32(2);
-	double		k1 = PG_GETARG_FLOAT8(3);
-	double		b = PG_GETARG_FLOAT8(4);
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	Oid			heapoid;
-	Relation	heap;
 	Relation	index;
-	LionIndexState *ix;
-	LionState  *col;
-	Datum		lenkey = PointerGetDatum(cstring_to_text_with_len("", 0));
-	List	   *lexemes = NIL;
-	ListCell   *lc;
-	double	   *idfs;
-	int			nterms;
-	int64		nrows;
-	double		avgdl;
-	uint64		ncodes = 0;
-	int64		L;
-	int64		done = 0;
-	Snapshot	snapshot;
-	int64		emitted = 0;
-	int			t;
 
-	if (k < 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("k must not be negative")));
-	if (!(k1 >= 0) || !(b >= 0 && b <= 1))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("k1 must be at least 0 and b between 0 and 1")));
-
-	InitMaterializedSRF(fcinfo, 0);
-
-	/* The relations, the privilege checked before any lock. */
 	if (get_rel_relkind(indexoid) != RELKIND_INDEX)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -583,39 +700,46 @@ lion_bm25(PG_FUNCTION_ARGS)
 		aclcheck_error(ACLCHECK_NO_PRIV,
 					   get_relkind_objtype(get_rel_relkind(heapoid)),
 					   get_rel_name(heapoid));
-	heap = table_open(heapoid, AccessShareLock);
+	if (heap != NULL)
+		*heap = table_open(heapoid, AccessShareLock);
 	index = index_open(indexoid, AccessShareLock);
 	if (index->rd_rel->relam != lion_get_am_oid())
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("index \"%s\" is not a lion index",
 						RelationGetRelationName(index))));
-	lion_check_table_am(heap);
+	if (heap != NULL)
+		lion_check_table_am(*heap);
+	return index;
+}
 
-	ix = lion_get_index_state(index);
-	col = &ix->cols[lion_bm25_column(index, ix)];
+Datum
+lion_bm25(PG_FUNCTION_ARGS)
+{
+	Oid			indexoid = PG_GETARG_OID(0);
+	TSQuery		query = PG_GETARG_TSQUERY(1);
+	int32		k = PG_GETARG_INT32(2);
+	double		k1 = PG_GETARG_FLOAT8(3);
+	double		b = PG_GETARG_FLOAT8(4);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Relation	heap;
+	Relation	index;
+	LionBm25Query q;
+	int64		L;
+	int64		done = 0;
+	Snapshot	snapshot;
+	int64		emitted = 0;
 
-	if (query->size > 0)
-		lion_bm25_terms_walk(query, 0, false, &lexemes);
-	nterms = list_length(lexemes);
-	if (nterms == 0 || k == 0 ||
-		!lion_bm25_stats(index, col, lenkey, &nrows, &avgdl))
-		goto out;
+	if (k < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("k must not be negative")));
+	lion_bm25_check_params(k1, b);
 
-	/* each lexeme's idf, from the rows its entry says it has */
-	idfs = (double *) palloc(sizeof(double) * nterms);
-	t = 0;
-	foreach(lc, lexemes)
-	{
-		uint64		df = lion_bm25_ntids(index, col,
-										 PointerGetDatum(lfirst(lc)));
+	InitMaterializedSRF(fcinfo, 0);
 
-		ncodes += df;
-		df = Min(df, (uint64) nrows);
-		idfs[t++] = log(1.0 + ((double) nrows - (double) df + 0.5) /
-						((double) df + 0.5));
-	}
-	if (ncodes == 0)
+	index = lion_bm25_open_index(indexoid, &heap);
+	if (!lion_bm25_prepare(index, query, k1, b, &q) || k == 0)
 		goto out;
 
 	/*
@@ -624,26 +748,85 @@ lion_bm25(PG_FUNCTION_ARGS)
 	 * which the first are the ones already tried.
 	 */
 	snapshot = GetActiveSnapshot();
-	L = Min((int64) k + 16, (int64) ncodes);
+	L = Min((int64) k + 16, (int64) q.ncodes);
 	for (;;)
 	{
 		LionBm25Cand *best = (LionBm25Cand *)
 			palloc_extended(sizeof(LionBm25Cand) * L, MCXT_ALLOC_HUGE);
 		int64		nbest;
 
-		nbest = lion_bm25_topk(index, col, lenkey, lexemes, idfs, k1, b,
-							   avgdl, L, best);
-		qsort(best, nbest, sizeof(LionBm25Cand), lion_bm25_cand_cmp);
+		nbest = lion_bm25_topk(&q, L, best);
+		lion_bm25_sort(best, nbest);
 		lion_bm25_emit(rsinfo, heap, snapshot, best, done, nbest, k, &emitted);
 		pfree(best);
-		if (emitted >= k || nbest < L || L >= (int64) ncodes)
+		if (emitted >= k || nbest < L || L >= (int64) q.ncodes)
 			break;
 		done = nbest;
-		L = Min(L * 4, (int64) ncodes);
+		L = Min(L * 4, (int64) q.ncodes);
 	}
 
 out:
 	index_close(index, AccessShareLock);
 	table_close(heap, AccessShareLock);
 	return (Datum) 0;
+}
+
+/* What lion_bm25_score() keeps across the rows of one call site. */
+typedef struct LionBm25ScoreCache
+{
+	Oid			indexoid;
+	double		k1;
+	double		b;
+	TSQuery		query;			/* a copy */
+	bool		valid;			/* any row can score */
+	LionBm25Query q;
+} LionBm25ScoreCache;
+
+/*
+ * lion_bm25_score(doc tsvector, query tsquery, index regclass,
+ *				   k1 float8 DEFAULT 1.2, b float8 DEFAULT 0.75) RETURNS float8
+ *
+ * The BM25 score lion_bm25() would give a row whose tsvector is doc, with
+ * the statistics of index, read once per call site and query.  Under
+ * `ORDER BY lion_bm25_score(...) DESC`, a LionBm25 scan returns the rows in
+ * that order from the index (lion_bm25_scan.c); anywhere else this scores
+ * one row at a time.
+ */
+Datum
+lion_bm25_score(PG_FUNCTION_ARGS)
+{
+	TSVector	doc = PG_GETARG_TSVECTOR(0);
+	TSQuery		query = PG_GETARG_TSQUERY(1);
+	Oid			indexoid = PG_GETARG_OID(2);
+	double		k1 = PG_GETARG_FLOAT8(3);
+	double		b = PG_GETARG_FLOAT8(4);
+	LionBm25ScoreCache *cache = (LionBm25ScoreCache *) fcinfo->flinfo->fn_extra;
+
+	if (cache == NULL || cache->indexoid != indexoid || cache->k1 != k1 ||
+		cache->b != b || VARSIZE(cache->query) != VARSIZE(query) ||
+		memcmp(cache->query, query, VARSIZE(query)) != 0)
+	{
+		MemoryContext old = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+		Relation	index;
+
+		lion_bm25_check_params(k1, b);
+		if (cache == NULL)
+			cache = (LionBm25ScoreCache *)
+				palloc0(sizeof(LionBm25ScoreCache));
+		index = lion_bm25_open_index(indexoid, NULL);
+		cache->valid = lion_bm25_prepare(index, query, k1, b, &cache->q);
+		cache->q.index = NULL;
+		cache->q.col = NULL;
+		index_close(index, AccessShareLock);
+		cache->indexoid = indexoid;
+		cache->k1 = k1;
+		cache->b = b;
+		cache->query = (TSQuery) palloc(VARSIZE(query));
+		memcpy(cache->query, query, VARSIZE(query));
+		fcinfo->flinfo->fn_extra = cache;
+		MemoryContextSwitchTo(old);
+	}
+	if (!cache->valid)
+		PG_RETURN_FLOAT8(0);
+	PG_RETURN_FLOAT8(lion_bm25_score_row(&cache->q, doc));
 }

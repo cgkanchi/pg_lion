@@ -4685,6 +4685,35 @@ the walk still reads every member. Block-max bounds (a maximum per chunk, not pe
 skip whole chunks there, but need a maximum tf and a minimum length stored per chunk, which the
 format does not have.
 
+**The planner path.** `lion_bm25_score(doc, query, index, k1, b)` is the score of one row,
+computed from its tsvector with the index's N, df and avgdl, read once per call site. Its tf, length
+(every occurrence of every non-empty lexeme, capped at 65535) and order of addition are the walk's:
+both add a row's terms in descending order of idf, ties in query order, so a row gets the same
+float from either, bit for bit, as an incremental sort over the scan's order needs.
+
+`LionBm25` (lion_bm25_scan.c) is a CustomScan offered from `set_rel_pathlist_hook` for a base table
+whose query's first pathkey is `lion_bm25_score(col, Const, Const, Const, Const) DESC`, the index a
+lion index on that table storing positions for `col`. The order is claimed only when the walk's
+candidates hold every row the scan may return, so a restriction `col @@ q2` must be there with:
+
+- q2's lexemes not under a NOT all among the scored query's, and no prefix in q2;
+- an empty document not matching q2.
+
+A tsquery is monotone in its operands once its NOTs are pushed down to them, so a row with none of
+q2's positive lexemes evaluates no higher than the empty document, and fails q2. Every row that
+passes therefore has a scored lexeme and is a candidate. The usual query has the same q in both
+places.
+
+The scan asks the walk for the best `L` rows: the planner's `limit_tuples` plus 16, or 64 when the
+LIMIT is not known. It fetches them best first under the scan's snapshot, following HOT chains, and
+applies the restrictions as its qual. When the node above pulls past them, it repeats the walk for
+`4L` and goes on from where it stopped, until the walk returns fewer than asked. Its startup cost is
+two index tuples and two operators per member of the scored lexemes (their `ntids`, read at plan
+time). Each row then costs a random page, a tuple and the restrictions. Against a bitmap scan that
+fetches, scores and sorts every match, on the synthetic 500k-row benchmark (top 10): 120 ms to 20
+ms for two mid-frequency words, 157 ms to 51 ms for two common ones, and 160 ms to 21 ms for one
+very common word with two rarer ones. A rare AND keeps the bitmap scan, which is the cheaper plan.
+
 ### Cardinality guard
 
 Reloption `max_entries` (int, default 0 = unlimited, ShareUpdateExclusiveLock).  Exceeding it is a
