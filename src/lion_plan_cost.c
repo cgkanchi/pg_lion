@@ -3880,16 +3880,6 @@ lion_multikey_posexact(IndexOptInfo *idx, AttrNumber col, Node *clause)
 {
 	OpExpr	   *op;
 	Node	   *arg;
-	Const	   *con;
-	Oid			opfamily;
-	Oid			lefttype;
-	Oid			proc;
-	int			strategy;
-	LionState	state;
-	Datum	   *itemkeys;
-	MemoryContext cxt;
-	MemoryContext oldcxt;
-	bool		result;
 
 	if (clause == NULL || !IsA(clause, OpExpr) || col < 1 ||
 		col > idx->nkeycolumns || list_length(((OpExpr *) clause)->args) != 2)
@@ -3898,32 +3888,10 @@ lion_multikey_posexact(IndexOptInfo *idx, AttrNumber col, Node *clause)
 	arg = lion_strip((Node *) lsecond(op->args));
 	if (arg == NULL || !IsA(arg, Const) || ((Const *) arg)->constisnull)
 		return false;
-	con = (Const *) arg;
 
-	opfamily = idx->opfamily[col - 1];
-	lefttype = idx->opcintype[col - 1];
-	strategy = get_op_opfamily_strategy(op->opno, opfamily);
-	proc = get_opfamily_proc(opfamily, lefttype, lefttype,
-							 LION_EXTRACTQUERY_PROC);
-	if (strategy == 0 || !OidIsValid(proc) ||
-		!OidIsValid(get_opfamily_proc(opfamily, lefttype, lefttype,
-									  LION_POSITIONS_PROC)))
-		return false;
-
-	cxt = AllocSetContextCreate(CurrentMemoryContext,
-								"roaring count position query",
-								ALLOCSET_SMALL_SIZES);
-	oldcxt = MemoryContextSwitchTo(cxt);
-	memset(&state, 0, sizeof(state));
-	state.multikey = true;
-	state.collation = con->constcollid;
-	fmgr_info(proc, &state.extractquery);
-	result = lion_tsquery_item_keys(&state, con->constvalue,
-									(StrategyNumber) strategy, &itemkeys);
-	MemoryContextSwitchTo(oldcxt);
-	MemoryContextDelete(cxt);
-
-	return result;
+	return lion_query_posexact(idx->opfamily[col - 1], idx->opcintype[col - 1],
+							   op->opno, ((Const *) arg)->constvalue,
+							   ((Const *) arg)->constcollid);
 }
 
 double
@@ -3987,19 +3955,24 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		double		nkeys;
 		QualCost	qual_cost;
 
-		/* an OR leaf's query is always a literal (lion_analyze_leaf()) */
-		if (lfirst_int(lc3) != LION_CLAUSE_MULTI || inor)
+		if (lfirst_int(lc3) != LION_CLAUSE_MULTI)
 			continue;
 		mode = lion_multikey_cost_mode((IndexOptInfo *) lfirst(lc1),
 									   (AttrNumber) lfirst_int(lc4), clause,
 									   &nkeys);
 		if (mode != LION_QMODE_LOSSY && mode != LION_QMODE_ALL)
 			continue;
-		if (mode == LION_QMODE_LOSSY &&
+
+		/*
+		 * An OR leaf's query is always a literal, and one the sets only bound
+		 * is always decided from positions (lion_analyze_leaf()).
+		 */
+		if (inor || (mode == LION_QMODE_LOSSY &&
 			lion_multikey_posexact((IndexOptInfo *) lfirst(lc1),
-								   (AttrNumber) lfirst_int(lc4), clause))
+								   (AttrNumber) lfirst_int(lc4), clause)))
 		{
-			poscost += nkeys * cpu_operator_cost;
+			if (mode == LION_QMODE_LOSSY)
+				poscost += nkeys * cpu_operator_cost;
 			continue;
 		}
 
