@@ -1587,6 +1587,13 @@ extern double lion_probe_rel_factor(PlannerInfo *root, RelOptInfo *rel);
 extern PGDLLIMPORT bool lion_enable_intersection_probe;
 
 /*
+ * Whether what the intersection probe measures of a relation's own
+ * restriction clauses also corrects the relation's row count, rel->rows, that
+ * the planner sizes its joins from (DESIGN.md §29.11, "The relation's rows").
+ */
+extern PGDLLIMPORT bool lion_enable_rows_correction;
+
+/*
  * Whether an AND of posting sets may look its running intersection up in the
  * containers of a union at a key instead of building the union (DESIGN.md
  * §29.11, "Unions probed"): an executor setting, for comparing the two.

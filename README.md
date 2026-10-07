@@ -622,8 +622,12 @@ working around a bad choice:
   two or more equality, `IN` or multi-key clauses on one Lion index really selects, when the
   planner's product of their selectivities may be far off - correlated filters - and price its
   own paths (its index scans and the count pushdown) from that (DESIGN.md §29.11, "Correlated
-  sets"). A bounded sample of the index, about 1,000 buffer accesses a planner run at most; the
-  planner's own row counts are left alone. Off, Lion prices its paths from the planner's estimate.
+  sets"). A bounded sample of the index, about 1,000 buffer accesses a planner run at most. Off,
+  Lion prices its paths from the planner's estimate.
+- `pg_lion.enable_rows_correction`: let what the intersection probe measures of a table's own
+  filters correct the planner's row estimate for that table as well, so that joins above it are
+  sized for the rows its filters really leave (DESIGN.md §29.11, "The relation's rows"). Off, the
+  probe corrects Lion's own estimates only and the planner keeps its own row count.
 - `pg_lion.enable_index_ndistinct`: give the planner a column's number of distinct values from a
   Lion index on it - the index's count of its keys, taken at build, by every VACUUM that deletes
   rows (in the walk it makes anyway) and by an ANALYZE when the index's directory is no larger than
