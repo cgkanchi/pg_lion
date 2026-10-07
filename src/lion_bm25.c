@@ -16,14 +16,15 @@
  *	tf(t, d)	the number of positions row d has under lexeme t, a stripped
  *				lexeme counting once: the npos of d's member in t's position
  *				tree;
- *	df(t)		the rows with a member under t;
+ *	df(t)		the rows filed under t: its entry's ntids;
  *	|d|			the row's length: the one "position" the row has under the
  *				empty key, which the extraction files for every row with a
  *				lexeme (lion_extract_internal());
- *	N, avgdl	the members of the empty key and the mean of their lengths,
- *				which a backend computes once and keeps until the empty
- *				key's row count has moved by more than 1/64 or the index has
- *				been rebuilt (lion_bm25_stats()).
+ *	N			the rows filed under the empty key;
+ *	avgdl		the mean length of the empty key's members, which a backend
+ *				computes once and keeps until the empty key's row count has
+ *				moved by more than 1/64 or the index has been rebuilt
+ *				(lion_bm25_stats()).
  *
  *		score(d) = sum over t of idf(t) * tf * (k1 + 1) /
  *								(tf + k1 * (1 - b + b * |d| / avgdl))
@@ -40,12 +41,13 @@
  * N, the statistics count rows VACUUM has not removed yet, as a search
  * engine's do until a merge drops its deleted documents.
  *
- * Every member of every query lexeme is read once per call, and the empty
- * key's member of each row that has one: the work grows with the rows that
- * have the lexemes, not with k.  The candidates stream out of a merge of the
- * lexemes' members in TID order, each scored as it comes, and only the best
- * k + 16 are sorted; the rest are sorted only when that many are not enough
- * because some are invisible to the snapshot.
+ * The candidates stream out of a merge of the lexemes' members in TID order,
+ * each scored as it comes into a heap of the best k + 16, pruned by MaxScore
+ * (lion_bm25_topk()): once the heap is full, the lexemes that together
+ * cannot lift a row past its worst are only looked up for rows the others
+ * bring, so a common lexeme next to a rarer one is mostly skipped.  When the
+ * snapshot does not see k of those k + 16, the walk is made again for four
+ * times as many.
  *
  *-------------------------------------------------------------------------
  */
@@ -78,14 +80,17 @@
 
 PG_FUNCTION_INFO_V1(lion_bm25);
 
-/* One lexeme's members: (code, tf) in TID order, and where the merge is. */
+/*
+ * One query lexeme: a cursor over its members in TID order, the member it
+ * stands on (NULL once past the last), its idf, and the most it can add to a
+ * score.
+ */
 typedef struct LionBm25Term
 {
-	uint64	   *codes;
-	uint16	   *tfs;
-	int64		n;
-	int64		next;
+	LionPosCursor *cur;
+	const LionPosMember *m;
 	double		idf;
+	double		ub;
 } LionBm25Term;
 
 /* A candidate row. */
@@ -169,38 +174,25 @@ lion_bm25_open(Relation index, LionState *col, Datum key, bool countsonly)
 	return cur;
 }
 
-/* Read every member of a lexeme: its codes and term frequencies. */
-static void
-lion_bm25_read_term(Relation index, LionState *col, Datum key,
-					LionBm25Term *term)
+/* The rows filed under key: its entry's ntids, 0 when it has none. */
+static uint64
+lion_bm25_ntids(Relation index, LionState *col, Datum key)
 {
-	LionPosCursor *cur = lion_bm25_open(index, col, key, true);
-	const LionPosMember *m;
-	int64		cap = 1024;
-	uint64		code = 0;
+	uint64		ntids = 0;
+	Buffer		buf = InvalidBuffer;
+	OffsetNumber off;
 
-	term->n = 0;
-	term->next = 0;
-	term->codes = (uint64 *) palloc(sizeof(uint64) * cap);
-	term->tfs = (uint16 *) palloc(sizeof(uint16) * cap);
-	while ((m = lion_poscursor_next(index, cur, code)) != NULL)
+	if (lion_find_entry(index, col, BUFFER_LOCK_SHARE, key,
+						lion_hash_key(col, key), &buf, &off))
 	{
-		if (term->n == cap)
-		{
-			cap *= 2;
-			term->codes = (uint64 *)
-				repalloc_huge(term->codes, sizeof(uint64) * cap);
-			term->tfs = (uint16 *)
-				repalloc_huge(term->tfs, sizeof(uint16) * cap);
-		}
-		term->codes[term->n] = m->code;
-		term->tfs[term->n] = Max(m->npos, 1);	/* a stripped lexeme: once */
-		term->n++;
-		code = m->code + 1;
-		if ((term->n & 0xfff) == 0)
-			CHECK_FOR_INTERRUPTS();
+		Page		page = BufferGetPage(buf);
+
+		ntids = lion_page_entry_fetch(index, page, BufferGetBlockNumber(buf),
+									  off)->ntids;
 	}
-	lion_poscursor_close(cur);
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
+	return ntids;
 }
 
 /* The length a member of the empty key holds: its one "position". */
@@ -211,30 +203,19 @@ lion_bm25_length(const LionPosMember *m)
 }
 
 /*
- * N and the sum of the lengths: walked from the empty key, or this backend's
- * last walk while the key's ntids is within 1/64 of what it was then and the
- * index has not been rebuilt.  False when no row has a lexeme.
+ * N, the empty key's ntids, and avgdl: the mean length of the empty key's
+ * members, walked from it, or this backend's last walk while the key's ntids
+ * is within 1/64 of what it was then and the index has not been rebuilt.
+ * False when no row has a lexeme.
  */
 static bool
 lion_bm25_stats(Relation index, LionState *col, Datum lenkey,
-				int64 *nrows, double *sumlen)
+				int64 *nrows, double *avgdl)
 {
 	LionBm25Stats *st;
-	uint64		ntids = 0;
+	uint64		ntids = lion_bm25_ntids(index, col, lenkey);
 	bool		found;
-	Buffer		buf = InvalidBuffer;
-	OffsetNumber off;
 
-	if (lion_find_entry(index, col, BUFFER_LOCK_SHARE, lenkey,
-						lion_hash_key(col, lenkey), &buf, &off))
-	{
-		Page		page = BufferGetPage(buf);
-
-		ntids = lion_page_entry_fetch(index, page, BufferGetBlockNumber(buf),
-									  off)->ntids;
-	}
-	if (BufferIsValid(buf))
-		UnlockReleaseBuffer(buf);
 	if (ntids == 0)
 		return false;
 
@@ -274,9 +255,13 @@ lion_bm25_stats(Relation index, LionState *col, Datum lenkey,
 		st->nrows = n;
 		st->sumlen = sum;
 	}
-	*nrows = st->nrows;
-	*sumlen = st->sumlen;
-	return st->nrows > 0;
+	if (st->nrows == 0)
+		return false;
+	*nrows = (int64) ntids;
+	*avgdl = st->sumlen / (double) st->nrows;
+	if (*avgdl <= 0)
+		*avgdl = 1;
+	return true;
 }
 
 /* Best first; equal scores in TID order, so the answer is deterministic. */
@@ -306,13 +291,13 @@ lion_bm25_cand_cmp(const void *a, const void *b)
  * them, n of at most L.
  */
 static void
-lion_bm25_heap_sift(LionBm25Cand *heap, int n, int i)
+lion_bm25_heap_sift(LionBm25Cand *heap, int64 n, int64 i)
 {
 	for (;;)
 	{
-		int			l = 2 * i + 1;
-		int			r = l + 1;
-		int			w = i;
+		int64		l = 2 * i + 1;
+		int64		r = l + 1;
+		int64		w = i;
 
 		if (l < n && lion_bm25_better(&heap[w], &heap[l]))
 			w = l;
@@ -331,16 +316,16 @@ lion_bm25_heap_sift(LionBm25Cand *heap, int n, int i)
 }
 
 static void
-lion_bm25_heap_add(LionBm25Cand *heap, int *n, int cap, const LionBm25Cand *c)
+lion_bm25_heap_add(LionBm25Cand *heap, int64 *n, int64 cap, const LionBm25Cand *c)
 {
 	if (*n < cap)
 	{
-		int			i = (*n)++;
+		int64		i = (*n)++;
 
 		heap[i] = *c;
 		while (i > 0)
 		{
-			int			parent = (i - 1) / 2;
+			int64		parent = (i - 1) / 2;
 			LionBm25Cand tmp;
 
 			if (!lion_bm25_better(&heap[parent], &heap[i]))
@@ -415,6 +400,140 @@ lion_bm25_emit(ReturnSetInfo *rsinfo, Relation heap, Snapshot snapshot,
 	}
 }
 
+
+/* BM25 of one member: what tf adds to a row whose norm is norm. */
+static inline double
+lion_bm25_term_score(const LionBm25Term *term, const LionPosMember *m,
+					 double k1, double norm)
+{
+	double		tf = (double) Max(m->npos, 1);	/* a stripped lexeme: once */
+
+	return term->idf * tf * (k1 + 1.0) / (tf + norm);
+}
+
+static int
+lion_bm25_term_ub_cmp(const void *a, const void *b)
+{
+	const LionBm25Term *x = (const LionBm25Term *) a;
+	const LionBm25Term *y = (const LionBm25Term *) b;
+
+	return (x->ub > y->ub) - (x->ub < y->ub);
+}
+
+/*
+ * The best L rows into best[], unsorted; returns how many.  MaxScore (Turtle
+ * and Flood): the terms in ascending order of the most they can add, the
+ * first nlow of them "non-essential" while those maxima sum to no more than
+ * the worst score the heap holds once it is full.  A row with none of the
+ * other, essential, terms then cannot get in, so only the essential terms'
+ * members are candidates, merged in TID order; each non-essential term is
+ * sought only for a candidate, best first, and only while what is left of
+ * them could still lift it past the heap's worst.  The heap's worst only
+ * rises, so nlow only grows.  A row's score is the same sum the full merge
+ * would make, in the same term order.
+ *
+ * A term adds less than idf * (k1 + 1) to any row, since tf / (tf + norm) is
+ * below 1 (and at most 1 when k1 is 0); that, nudged up so a sum of maxima
+ * rounded down cannot pass for a score, is its maximum.  Equal scores rank by
+ * TID and a candidate's TID is above every TID the heap holds, so a candidate
+ * gets in only with a score above the heap's worst: at a bound no higher than
+ * that, a row is not scored on.
+ */
+static int64
+lion_bm25_topk(Relation index, LionState *col, Datum lenkey, List *lexemes,
+			   const double *idfs, double k1, double b, double avgdl,
+			   int64 L, LionBm25Cand *best)
+{
+	int			nterms = list_length(lexemes);
+	LionBm25Term *terms = (LionBm25Term *) palloc0(sizeof(LionBm25Term) * nterms);
+	double	   *below;			/* below[i]: the maxima of terms[0, i) */
+	LionPosCursor *lencur;
+	int64		nbest = 0;
+	int			nlow = 0;
+	int64		nscored = 0;
+	ListCell   *lc;
+	int			t;
+
+	t = 0;
+	foreach(lc, lexemes)
+	{
+		LionBm25Term *term = &terms[t];
+
+		term->cur = lion_bm25_open(index, col, PointerGetDatum(lfirst(lc)),
+								   true);
+		term->m = lion_poscursor_next(index, term->cur, 0);
+		term->idf = idfs[t];
+		term->ub = idfs[t] * (k1 + 1.0) * (1.0 + 1e-9);
+		t++;
+	}
+	qsort(terms, nterms, sizeof(LionBm25Term), lion_bm25_term_ub_cmp);
+	below = (double *) palloc(sizeof(double) * (nterms + 1));
+	below[0] = 0;
+	for (t = 0; t < nterms; t++)
+		below[t + 1] = below[t] + terms[t].ub;
+
+	lencur = lion_bm25_open(index, col, lenkey, false);
+	for (;;)
+	{
+		uint64		code = PG_UINT64_MAX;
+		const LionPosMember *m;
+		double		norm;
+		double		score = 0;
+		LionBm25Cand c;
+
+		for (t = nlow; t < nterms; t++)
+			if (terms[t].m != NULL && terms[t].m->code < code)
+				code = terms[t].m->code;
+		if (code == PG_UINT64_MAX)
+			break;
+
+		m = lion_poscursor_next(index, lencur, code);
+		norm = k1 * (1.0 - b + b *
+					 ((m != NULL && m->code == code) ?
+					  lion_bm25_length(m) : avgdl) / avgdl);
+
+		/* the essential terms, then the rest from the one that can add most */
+		for (t = nterms - 1; t >= nlow; t--)
+		{
+			LionBm25Term *term = &terms[t];
+
+			if (term->m != NULL && term->m->code == code)
+			{
+				score += lion_bm25_term_score(term, term->m, k1, norm);
+				term->m = lion_poscursor_next(index, term->cur, code + 1);
+			}
+		}
+		for (t = nlow - 1; t >= 0; t--)
+		{
+			LionBm25Term *term = &terms[t];
+
+			if (nbest == L && score + below[t + 1] <= best[0].score)
+				break;
+			if (term->m != NULL && term->m->code < code)
+				term->m = lion_poscursor_next(index, term->cur, code);
+			if (term->m != NULL && term->m->code == code)
+				score += lion_bm25_term_score(term, term->m, k1, norm);
+		}
+		if (t < 0 && (nbest < L || score > best[0].score))
+		{
+			c.code = code;
+			c.score = score;
+			lion_bm25_heap_add(best, &nbest, L, &c);
+			while (nbest == L && nlow < nterms &&
+				   below[nlow + 1] <= best[0].score)
+				nlow++;
+		}
+		if ((++nscored & 0xfff) == 0)
+			CHECK_FOR_INTERRUPTS();
+	}
+	lion_poscursor_close(lencur);
+	for (t = 0; t < nterms; t++)
+		lion_poscursor_close(terms[t].cur);
+	pfree(terms);
+	pfree(below);
+	return nbest;
+}
+
 Datum
 lion_bm25(PG_FUNCTION_ARGS)
 {
@@ -432,18 +551,13 @@ lion_bm25(PG_FUNCTION_ARGS)
 	Datum		lenkey = PointerGetDatum(cstring_to_text_with_len("", 0));
 	List	   *lexemes = NIL;
 	ListCell   *lc;
-	LionBm25Term *terms;
+	double	   *idfs;
 	int			nterms;
 	int64		nrows;
-	double		sumlen;
 	double		avgdl;
-	int64		ncodes = 0;
-	LionBm25Cand *cands;
-	int64		ncands = 0;
-	LionBm25Cand *best;
-	int			nbest = 0;
-	int			bestcap;
-	LionPosCursor *lencur;
+	uint64		ncodes = 0;
+	int64		L;
+	int64		done = 0;
 	Snapshot	snapshot;
 	int64		emitted = 0;
 	int			t;
@@ -485,87 +599,50 @@ lion_bm25(PG_FUNCTION_ARGS)
 		lion_bm25_terms_walk(query, 0, false, &lexemes);
 	nterms = list_length(lexemes);
 	if (nterms == 0 || k == 0 ||
-		!lion_bm25_stats(index, col, lenkey, &nrows, &sumlen))
-		goto done;
-	avgdl = sumlen / (double) nrows;
-	if (avgdl <= 0)
-		avgdl = 1;
+		!lion_bm25_stats(index, col, lenkey, &nrows, &avgdl))
+		goto out;
 
-	/* every query lexeme's members */
-	terms = (LionBm25Term *) palloc0(sizeof(LionBm25Term) * nterms);
+	/* each lexeme's idf, from the rows its entry says it has */
+	idfs = (double *) palloc(sizeof(double) * nterms);
 	t = 0;
 	foreach(lc, lexemes)
 	{
-		LionBm25Term *term = &terms[t++];
-		double		df;
+		uint64		df = lion_bm25_ntids(index, col,
+										 PointerGetDatum(lfirst(lc)));
 
-		lion_bm25_read_term(index, col, PointerGetDatum(lfirst(lc)), term);
-		df = (double) Min(term->n, nrows);
-		term->idf = log(1.0 + ((double) nrows - df + 0.5) / (df + 0.5));
-		ncodes += term->n;
+		ncodes += df;
+		df = Min(df, (uint64) nrows);
+		idfs[t++] = log(1.0 + ((double) nrows - (double) df + 0.5) /
+						((double) df + 0.5));
 	}
 	if (ncodes == 0)
-		goto done;
+		goto out;
 
 	/*
-	 * Merge them in TID order: each candidate gets its length from the
-	 * empty key, whose cursor only moves forward, and its score at once.
+	 * The best k + 16, best first, until k of them are visible: when the
+	 * snapshot does not see enough of them, the best 4 times as many, of
+	 * which the first are the ones already tried.
 	 */
-	cands = (LionBm25Cand *)
-		palloc_extended(sizeof(LionBm25Cand) * ncodes, MCXT_ALLOC_HUGE);
-	bestcap = (int) Min((int64) k + 16, ncodes);
-	best = (LionBm25Cand *) palloc(sizeof(LionBm25Cand) * bestcap);
-	lencur = lion_bm25_open(index, col, lenkey, false);
+	snapshot = GetActiveSnapshot();
+	L = Min((int64) k + 16, (int64) ncodes);
 	for (;;)
 	{
-		uint64		code = PG_UINT64_MAX;
-		const LionPosMember *m;
-		double		norm;
-		double		score = 0;
+		LionBm25Cand *best = (LionBm25Cand *)
+			palloc_extended(sizeof(LionBm25Cand) * L, MCXT_ALLOC_HUGE);
+		int64		nbest;
 
-		for (t = 0; t < nterms; t++)
-			if (terms[t].next < terms[t].n &&
-				terms[t].codes[terms[t].next] < code)
-				code = terms[t].codes[terms[t].next];
-		if (code == PG_UINT64_MAX)
+		nbest = lion_bm25_topk(index, col, lenkey, lexemes, idfs, k1, b,
+							   avgdl, L, best);
+		qsort(best, nbest, sizeof(LionBm25Cand), lion_bm25_cand_cmp);
+		lion_bm25_emit(rsinfo, heap, snapshot, best, done, nbest, k, &emitted);
+		pfree(best);
+		if (emitted >= k || nbest < L || L >= (int64) ncodes)
 			break;
-
-		m = lion_poscursor_next(index, lencur, code);
-		norm = k1 * (1.0 - b + b *
-					 ((m != NULL && m->code == code) ?
-					  lion_bm25_length(m) : avgdl) / avgdl);
-		for (t = 0; t < nterms; t++)
-		{
-			LionBm25Term *term = &terms[t];
-
-			if (term->next < term->n && term->codes[term->next] == code)
-			{
-				double		tf = (double) term->tfs[term->next++];
-
-				score += term->idf * tf * (k1 + 1.0) / (tf + norm);
-			}
-		}
-		cands[ncands].code = code;
-		cands[ncands].score = score;
-		lion_bm25_heap_add(best, &nbest, bestcap, &cands[ncands]);
-		ncands++;
-		if ((ncands & 0xfff) == 0)
-			CHECK_FOR_INTERRUPTS();
-	}
-	lion_poscursor_close(lencur);
-
-	/* the best k + 16, best first; all of them only if those fall short */
-	snapshot = GetActiveSnapshot();
-	qsort(best, nbest, sizeof(LionBm25Cand), lion_bm25_cand_cmp);
-	lion_bm25_emit(rsinfo, heap, snapshot, best, 0, nbest, k, &emitted);
-	if (emitted < k && ncands > nbest)
-	{
-		qsort(cands, ncands, sizeof(LionBm25Cand), lion_bm25_cand_cmp);
-		lion_bm25_emit(rsinfo, heap, snapshot, cands, nbest, ncands, k,
-					   &emitted);
+		done = nbest;
+		L = Min(L * 4, (int64) ncodes);
 	}
 
-done:
+out:
 	index_close(index, AccessShareLock);
 	table_close(heap, AccessShareLock);
 	return (Datum) 0;
