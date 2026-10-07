@@ -1004,9 +1004,17 @@ lion_count_path_where(LionCountPathBuild *cx)
 		 */
 		{
 			BoolExpr   *orform = lion_boolean_not_test(clause);
+			Node	   *anyform;
 
 			if (orform != NULL)
 				clause = (Node *) orform;
+
+			/*
+			 * `tsv @@ ANY (array)` is the OR of its elements' clauses
+			 * (lion_multikey_any_as_or()).
+			 */
+			else if ((anyform = lion_multikey_any_as_or(clause)) != NULL)
+				clause = anyform;
 		}
 
 		/*

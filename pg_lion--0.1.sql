@@ -475,26 +475,18 @@ CREATE OPERATOR CLASS array_ops DEFAULT FOR TYPE anyarray USING lion AS
 	FUNCTION	3	ginqueryarrayextract(anyarray, internal, int2, internal, internal, internal, internal),
 	STORAGE		anyelement;
 
-CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING lion AS
-	OPERATOR	5	@@ (tsvector, tsquery),
-	FUNCTION	1	hashtext(text),
-	FUNCTION	4	bttextcmp(text, text),
-	FUNCTION	2	gin_extract_tsvector(tsvector, internal, internal),
-	FUNCTION	3	gin_extract_tsquery(tsvector, internal, int2, internal, internal, internal, internal),
-	STORAGE		text;
-
 /*
- * tsvector_pos_ops is tsvector_ops that also STORES every lexeme's positions
- * and weights per row (DESIGN.md §17, "Stored positions"): support function
- * 5 hands them to the index beside the keys.  A phrase, a weight and `a & !b`
- * are then answered exactly from the index - no heap recheck in a scan, and
- * none on an all-visible page in a count - for about three bytes per lexeme
- * and row more than tsvector_ops takes.
+ * Support function 5 hands the index every lexeme's positions and weights
+ * beside its key.  An index stores them only when it is built WITH
+ * (store_positions = true) (DESIGN.md §17, "Stored positions"): a phrase, a
+ * weight and `a & !b` are then answered exactly from the index - no heap
+ * recheck in a scan, and none on an all-visible page in a count - for about
+ * three bytes per lexeme and row more.
  */
 CREATE FUNCTION lion_tsvector_positions(tsvector, internal) RETURNS internal
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
-CREATE OPERATOR CLASS tsvector_pos_ops FOR TYPE tsvector USING lion AS
+CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING lion AS
 	OPERATOR	5	@@ (tsvector, tsquery),
 	FUNCTION	1	hashtext(text),
 	FUNCTION	4	bttextcmp(text, text),

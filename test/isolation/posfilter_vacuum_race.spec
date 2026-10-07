@@ -27,7 +27,7 @@ setup
 						 WHEN 2 THEN 'beta:1 alpha:2 gamma:3'
 						 ELSE 'gamma:1' END::tsvector
 	FROM generate_series(1, 4000) i;
-	CREATE INDEX pv_race_d ON pv_race USING lion (d tsvector_pos_ops);
+	CREATE INDEX pv_race_d ON pv_race USING lion (d) WITH (store_positions = true);
 
 	CREATE FUNCTION pv_race_pushed() RETURNS boolean
 	LANGUAGE plpgsql AS $fn$

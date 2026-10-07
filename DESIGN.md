@@ -4634,8 +4634,12 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   - **`@@ ANY (array)`**: a bitmap scan emits each element through its own filter
     (`lion_emit_multikey()`), and a plain index scan under an MVCC snapshot wraps each element's
     superset in a `LION_KN_POSFILTER` node of its union (`lion_scan_col_tree()`), so neither
-    rechecks unless an element has a prefix lexeme.  The count does not take a multi-key
-    `= ANY` at all yet, positions or not.  The opclass is `tsvector_pos_ops` in the extension's SQL (README.md).
+    rechecks unless an element has a prefix lexeme.  The count takes a multi-key operator over a
+    literal array (`tsv @@ ANY`) as the OR of one clause per element
+    (`lion_multikey_any_as_or()`, §19), so an element the sets only bound is decided from the
+    positions there as under any OR.  An index stores them when built `WITH (store_positions = true)` over a column whose opclass has
+    support function 5 (`tsvector_ops`); the build records that on the meta page (`LION_META_POSITIONS`
+    in `order_flags`), so `ALTER INDEX` changes nothing until a `REINDEX` (README.md).
 
 ### Cardinality guard
 
