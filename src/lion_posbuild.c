@@ -35,8 +35,9 @@
  * entry's, is an ERROR when the column is done: equal keys whose bytes
  * differ (a nondeterministic collation) cannot store positions.
  *
- * A parallel build does not run the sink in its workers, so a positions
- * column builds serially (lion_build.c).
+ * A parallel build's participants each run the sink on their share of the
+ * heap, and the leader takes a key's positions from all of them (see "A
+ * parallel build" below).
  *
  *-------------------------------------------------------------------------
  */
@@ -75,6 +76,7 @@ typedef struct LionPosBlock
 /* A part of a key's stream written to the file. */
 typedef struct LionPosPart
 {
+	int			src;			/* whose file: a parallel build's participant */
 	int			fileno;
 	off_t		offset;
 	Size		len;
@@ -117,6 +119,14 @@ struct LionPosBuild
 	Size		arenafree;
 	BufFile    *file;			/* the streams written out, once there are */
 	int			nspills;
+	/* a parallel build's participant: the files are the build's shared ones */
+	SharedFileSet *fileset;
+	int			filenum;
+	/* a parallel build's leader: every participant's streams */
+	int			nsrcs;
+	BufFile   **srcfiles;
+	uint8	  **srcbufs;
+	Size	   *srccaps;
 	/* taking a key's positions */
 	int			col;
 	LionContainer *chunk;
@@ -345,6 +355,13 @@ lion_posbuild_get_varbyte(const uint8 **pp, const uint8 *end)
 	return 0;					/* keep compiler quiet */
 }
 
+/* The name of a parallel build participant's positions file. */
+static void
+lion_posbuild_filename(char *name, const char *what, int filenum)
+{
+	snprintf(name, MAXPGPATH, "lionpos.%s.%d", what, filenum);
+}
+
 /*
  * Write every key's stream in memory to the file, the key keeping where its
  * part went, and let the memory go.
@@ -356,7 +373,17 @@ lion_posbuild_spill(LionPosBuild *pb)
 	int			c;
 
 	if (pb->file == NULL)
-		pb->file = BufFileCreateTemp(false);
+	{
+		if (pb->fileset != NULL)
+		{
+			char		name[MAXPGPATH];
+
+			lion_posbuild_filename(name, "data", pb->filenum);
+			pb->file = BufFileCreateFileSet(&pb->fileset->fs, name);
+		}
+		else
+			pb->file = BufFileCreateTemp(false);
+	}
 	for (c = 0; c < pb->ncols; c++)
 	{
 		LionPosCol *pc = pb->cols[c];
@@ -381,6 +408,7 @@ lion_posbuild_spill(LionPosBuild *pb)
 											 sizeof(LionPosPart) * k->maxparts);
 			}
 			part = &k->parts[k->nparts++];
+			part->src = 0;
 			BufFileTell(pb->file, &part->fileno, &part->offset);
 			part->len = 0;
 			for (b = k->head; b != NULL; b = b->next)
@@ -446,6 +474,182 @@ lion_posbuild_column(LionPosBuild *pb, int col)
 		return false;
 	pb->col = col;
 	return true;
+}
+
+/* ---------------------------------------------------------------------
+ * A parallel build
+ *
+ * A participant's sink is the serial one, except that its file is in the
+ * build's shared fileset.  When its scan is done it writes what is still in
+ * memory out too, so that every stream is on file, and a directory beside
+ * it: each key's column, bytes and parts.  The leader reads every
+ * participant's directory into its own table of keys, each part marked with
+ * whose file it is in.  A parallel heap scan hands each participant whole
+ * block ranges in ascending order, so a key's parts from one participant
+ * hold its rows in TID order but for the disorder within a heap page (see
+ * the file header), and no heap page is in two participants' parts: taking a
+ * key merges its participants' streams by heap block.
+ * --------------------------------------------------------------------- */
+
+LionPosBuild *
+lion_posbuild_begin_shared(Relation index, LionIndexState *ix, int workmem,
+						   SharedFileSet *fileset, int filenum)
+{
+	LionPosBuild *pb = lion_posbuild_begin(index, ix, workmem);
+
+	if (pb != NULL)
+	{
+		pb->fileset = fileset;
+		pb->filenum = filenum;
+	}
+	return pb;
+}
+
+static void
+lion_posbuild_dir_write(BufFile *f, const void *p, Size len)
+{
+	BufFileWrite(f, p, len);
+}
+
+void
+lion_posbuild_export(LionPosBuild *pb)
+{
+	char		name[MAXPGPATH];
+	BufFile    *dir;
+	int32		end = -1;
+	int			c;
+
+	Assert(pb->fileset != NULL);
+	/* every stream on file; the data file exists even when it is empty */
+	if (pb->used > 0 || pb->file == NULL)
+		lion_posbuild_spill(pb);
+
+	lion_posbuild_filename(name, "dir", pb->filenum);
+	dir = BufFileCreateFileSet(&pb->fileset->fs, name);
+	for (c = 0; c < pb->ncols; c++)
+	{
+		LionPosCol *pc = pb->cols[c];
+		int			i;
+
+		if (pc == NULL)
+			continue;
+		for (i = 0; i < pc->nkeys; i++)
+		{
+			LionPosKey *k = pc->keys[i];
+			int32		col = c;
+			int32		nparts = k->nparts;
+			int			j;
+
+			lion_posbuild_dir_write(dir, &col, sizeof(col));
+			lion_posbuild_dir_write(dir, &k->len, sizeof(k->len));
+			lion_posbuild_dir_write(dir, k->bytes, k->len);
+			lion_posbuild_dir_write(dir, &nparts, sizeof(nparts));
+			for (j = 0; j < k->nparts; j++)
+			{
+				int32		fileno = k->parts[j].fileno;
+				int64		offset = (int64) k->parts[j].offset;
+				uint64		len = (uint64) k->parts[j].len;
+
+				lion_posbuild_dir_write(dir, &fileno, sizeof(fileno));
+				lion_posbuild_dir_write(dir, &offset, sizeof(offset));
+				lion_posbuild_dir_write(dir, &len, sizeof(len));
+			}
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	lion_posbuild_dir_write(dir, &end, sizeof(end));
+	BufFileClose(dir);
+	BufFileClose(pb->file);
+	pb->file = NULL;
+}
+
+void
+lion_posbuild_import(LionPosBuild *pb, SharedFileSet *fileset,
+					 int nparticipants, const int *filenums)
+{
+	MemoryContext old = MemoryContextSwitchTo(pb->cxt);
+	char		name[MAXPGPATH];
+	char	   *bytes = NULL;
+	uint32		bytescap = 0;
+	int			i;
+
+	Assert(pb->fileset == NULL && pb->nsrcs == 0);
+	pb->nsrcs = nparticipants;
+	pb->srcfiles = (BufFile **) palloc0(sizeof(BufFile *) * nparticipants);
+	pb->srcbufs = (uint8 **) palloc0(sizeof(uint8 *) * nparticipants);
+	pb->srccaps = (Size *) palloc0(sizeof(Size) * nparticipants);
+	for (i = 0; i < nparticipants; i++)
+	{
+		BufFile    *dir;
+
+		lion_posbuild_filename(name, "data", filenums[i]);
+		pb->srcfiles[i] = BufFileOpenFileSet(&fileset->fs, name, O_RDONLY,
+											 false);
+		lion_posbuild_filename(name, "dir", filenums[i]);
+		dir = BufFileOpenFileSet(&fileset->fs, name, O_RDONLY, false);
+		for (;;)
+		{
+			int32		col;
+			uint32		len;
+			int32		nparts;
+			LionPosCol *pc;
+			LionPosKey *k;
+			int			j;
+
+			BufFileReadExact(dir, &col, sizeof(col));
+			if (col < 0)
+				break;
+			if (col >= pb->ncols || pb->cols[col] == NULL)
+				elog(ERROR, "lion index \"%s\": a parallel build's positions are for a column that stores none",
+					 RelationGetRelationName(pb->index));
+			pc = pb->cols[col];
+			BufFileReadExact(dir, &len, sizeof(len));
+			if (len + 1 > bytescap)
+			{
+				bytescap = Max(len + 1, 64);
+				bytes = (bytes == NULL) ? palloc(bytescap) :
+					repalloc(bytes, bytescap);
+			}
+			BufFileReadExact(dir, bytes, len);
+			BufFileReadExact(dir, &nparts, sizeof(nparts));
+
+			k = lion_posbuild_lookup(pc, bytes, len,
+									 hash_bytes((const unsigned char *) bytes,
+												(int) len));
+			if (k == NULL)
+				k = lion_posbuild_new_key(pb, pc, bytes, len,
+										  hash_bytes((const unsigned char *) bytes,
+													 (int) len));
+			if (k->nparts + nparts > k->maxparts)
+			{
+				k->maxparts = Max(k->maxparts * 2, k->nparts + nparts);
+				k->parts = (k->parts == NULL) ?
+					(LionPosPart *) palloc(sizeof(LionPosPart) * k->maxparts) :
+					(LionPosPart *) repalloc(k->parts,
+											 sizeof(LionPosPart) * k->maxparts);
+			}
+			for (j = 0; j < nparts; j++)
+			{
+				LionPosPart *part = &k->parts[k->nparts++];
+				int32		fileno;
+				int64		offset;
+				uint64		plen;
+
+				BufFileReadExact(dir, &fileno, sizeof(fileno));
+				BufFileReadExact(dir, &offset, sizeof(offset));
+				BufFileReadExact(dir, &plen, sizeof(plen));
+				part->src = i;
+				part->fileno = fileno;
+				part->offset = (off_t) offset;
+				part->len = (Size) plen;
+			}
+			CHECK_FOR_INTERRUPTS();
+		}
+		BufFileClose(dir);
+	}
+	if (bytes != NULL)
+		pfree(bytes);
+	MemoryContextSwitchTo(old);
 }
 
 /* ---------------------------------------------------------------------
@@ -736,33 +940,159 @@ lion_posbuild_flush_page(LionPosTake *t)
 	pb->npage = 0;
 }
 
+/* One member of a key's stream: onto the heap page's, which it may close. */
+static void
+lion_posbuild_member(LionPosTake *t, uint64 code, uint32 npos,
+					 const uint8 *pos)
+{
+	LionPosBuild *pb = t->pb;
+	LionKeyPositions kp;
+	uint16		posbuf[LION_POS_MAX_NPOS];
+
+	memcpy(posbuf, pos, sizeof(uint16) * npos);
+	if (pb->npage > 0 &&
+		(lion_pos_block(code) != lion_pos_block(pb->page[0].code) ||
+		 pb->npage >= LION_PAGE_CODES_MAX))
+		lion_posbuild_flush_page(t);
+	kp.npos = (uint16) npos;
+	kp.pos = posbuf;
+	lion_posmember_from_key(&pb->page[pb->npage++], code, &kp);
+}
+
+/* The next member of a stream at *pp, false at end. */
+static bool
+lion_posbuild_decode(const uint8 **pp, const uint8 *end, uint64 *code,
+					 uint32 *npos, const uint8 **pos)
+{
+	const uint8 *p = *pp;
+	uint64		n;
+
+	if (p >= end)
+		return false;
+	*code = lion_posbuild_get_varbyte(&p, end);
+	n = lion_posbuild_get_varbyte(&p, end);
+	if (n > LION_POS_MAX_NPOS || (Size) (end - p) < sizeof(uint16) * n)
+		elog(ERROR, "lion index: a position stream of the build is damaged");
+	*npos = (uint32) n;
+	*pos = p;
+	*pp = p + sizeof(uint16) * n;
+	return true;
+}
+
 /* Decode the members of len bytes of a key's stream. */
 static void
 lion_posbuild_read(LionPosTake *t, const uint8 *p, Size len)
 {
-	LionPosBuild *pb = t->pb;
 	const uint8 *end = p + len;
+	uint64		code;
+	uint32		npos;
+	const uint8 *pos;
 
-	while (p < end)
+	while (lion_posbuild_decode(&p, end, &code, &npos, &pos))
+		lion_posbuild_member(t, code, npos, pos);
+}
+
+/* Read a part of a key's stream, from whichever file it is in, into *buf. */
+static void
+lion_posbuild_load_part(LionPosBuild *pb, const LionPosPart *part,
+						uint8 **buf, Size *cap)
+{
+	BufFile    *f = (pb->nsrcs > 0) ? pb->srcfiles[part->src] : pb->file;
+
+	if (part->len > *cap)
 	{
-		uint64		code = lion_posbuild_get_varbyte(&p, end);
-		uint64		npos = lion_posbuild_get_varbyte(&p, end);
-		LionKeyPositions kp;
-		uint16		posbuf[LION_POS_MAX_NPOS];
-
-		if (npos > LION_POS_MAX_NPOS || (Size) (end - p) < sizeof(uint16) * npos)
-			elog(ERROR, "lion index: a position stream of the build is damaged");
-		memcpy(posbuf, p, sizeof(uint16) * npos);
-		p += sizeof(uint16) * npos;
-
-		if (pb->npage > 0 &&
-			(lion_pos_block(code) != lion_pos_block(pb->page[0].code) ||
-			 pb->npage >= LION_PAGE_CODES_MAX))
-			lion_posbuild_flush_page(t);
-		kp.npos = (uint16) npos;
-		kp.pos = posbuf;
-		lion_posmember_from_key(&pb->page[pb->npage++], code, &kp);
+		if (*buf != NULL)
+			pfree(*buf);
+		*cap = Max(part->len, (Size) BLCKSZ);
+		*buf = (uint8 *) MemoryContextAllocHuge(pb->cxt, *cap);
 	}
+	if (BufFileSeek(f, part->fileno, part->offset, SEEK_SET) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not seek in the positions file of lion index \"%s\"",
+						RelationGetRelationName(pb->index))));
+	BufFileReadExact(f, *buf, part->len);
+	CHECK_FOR_INTERRUPTS();
+}
+
+/* One parallel build participant's parts of a key, as the merge reads them. */
+typedef struct LionPosSrc
+{
+	int			src;
+	const LionPosPart *parts;
+	int			nparts;
+	int			next;			/* the part to load next */
+	const uint8 *p;				/* in the part loaded */
+	const uint8 *end;
+	/* the member at the head */
+	bool		has;
+	uint64		code;
+	uint32		npos;
+	const uint8 *pos;
+} LionPosSrc;
+
+static void
+lion_posbuild_src_advance(LionPosBuild *pb, LionPosSrc *s)
+{
+	while (!lion_posbuild_decode(&s->p, s->end, &s->code, &s->npos, &s->pos))
+	{
+		const LionPosPart *part;
+
+		if (s->next >= s->nparts)
+		{
+			s->has = false;
+			return;
+		}
+		part = &s->parts[s->next++];
+		lion_posbuild_load_part(pb, part, &pb->srcbufs[s->src],
+								&pb->srccaps[s->src]);
+		s->p = pb->srcbufs[s->src];
+		s->end = s->p + part->len;
+	}
+	s->has = true;
+}
+
+/*
+ * A key's parts from more than one participant of a parallel build, merged
+ * by heap block (see "A parallel build" above).
+ */
+static void
+lion_posbuild_merge(LionPosTake *t, const LionPosKey *k)
+{
+	LionPosBuild *pb = t->pb;
+	LionPosSrc *srcs = (LionPosSrc *) palloc0(sizeof(LionPosSrc) * pb->nsrcs);
+	int			nsrcs = 0;
+	int			i;
+
+	for (i = 0; i < k->nparts; i++)
+	{
+		if (nsrcs == 0 || srcs[nsrcs - 1].src != k->parts[i].src)
+		{
+			srcs[nsrcs].src = k->parts[i].src;
+			srcs[nsrcs].parts = &k->parts[i];
+			nsrcs++;
+		}
+		srcs[nsrcs - 1].nparts++;
+	}
+	for (i = 0; i < nsrcs; i++)
+		lion_posbuild_src_advance(pb, &srcs[i]);
+	for (;;)
+	{
+		LionPosSrc *best = NULL;
+
+		for (i = 0; i < nsrcs; i++)
+		{
+			if (srcs[i].has &&
+				(best == NULL ||
+				 lion_pos_block(srcs[i].code) < lion_pos_block(best->code)))
+				best = &srcs[i];
+		}
+		if (best == NULL)
+			break;
+		lion_posbuild_member(t, best->code, best->npos, best->pos);
+		lion_posbuild_src_advance(pb, best);
+	}
+	pfree(srcs);
 }
 
 /*
@@ -806,28 +1136,20 @@ lion_posbuild_take(LionPosBuild *pb, Datum key, uint32 hash,
 	t.hash = hash;
 	pb->npage = 0;
 
-	for (i = 0; i < k->nparts; i++)
+	if (k->nparts > 0 && k->parts[0].src != k->parts[k->nparts - 1].src)
+		lion_posbuild_merge(&t, k);
+	else
 	{
-		LionPosPart *part = &k->parts[i];
-
-		if (part->len > pb->readcap)
+		/* one scan's parts, in the order it wrote them, then its memory */
+		for (i = 0; i < k->nparts; i++)
 		{
-			if (pb->readbuf != NULL)
-				pfree(pb->readbuf);
-			pb->readcap = Max(part->len, (Size) BLCKSZ);
-			pb->readbuf = (uint8 *) MemoryContextAllocHuge(pb->cxt, pb->readcap);
+			lion_posbuild_load_part(pb, &k->parts[i], &pb->readbuf,
+									&pb->readcap);
+			lion_posbuild_read(&t, pb->readbuf, k->parts[i].len);
 		}
-		if (BufFileSeek(pb->file, part->fileno, part->offset, SEEK_SET) != 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not seek in the positions file of lion index \"%s\"",
-							RelationGetRelationName(pb->index))));
-		BufFileReadExact(pb->file, pb->readbuf, part->len);
-		lion_posbuild_read(&t, pb->readbuf, part->len);
-		CHECK_FOR_INTERRUPTS();
+		for (b = k->head; b != NULL; b = b->next)
+			lion_posbuild_read(&t, b->data, b->used);
 	}
-	for (b = k->head; b != NULL; b = b->next)
-		lion_posbuild_read(&t, b->data, b->used);
 	if (pb->npage > 0)
 		lion_posbuild_flush_page(&t);
 
@@ -893,5 +1215,7 @@ lion_posbuild_end(LionPosBuild *pb)
 		 RelationGetRelationName(pb->index), pb->nspills);
 	if (pb->file != NULL)
 		BufFileClose(pb->file);
+	for (int i = 0; i < pb->nsrcs; i++)
+		BufFileClose(pb->srcfiles[i]);
 	MemoryContextDelete(pb->cxt);
 }

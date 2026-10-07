@@ -235,56 +235,78 @@ SELECT count(*) AS moved FROM pos_hot WHERE id < 0;
    750
 (1 row)
 
-SET maintenance_work_mem = '1MB';
-REINDEX INDEX pos_hot_d;
-RESET maintenance_work_mem;
 -- the index keeps a chain's root offset, so its entries are compared with the
 -- heap's by block; the phrases, whose answer differs between neighbours on a
 -- page, check each row got its own positions
-WITH idx AS (
-	SELECT l.lexeme, (p.tid::text::point)[0] AS blk, p.positions, p.weights
-	FROM (SELECT DISTINCT unnest(tsvector_to_array(d)) AS lexeme FROM pos_hot) l,
-		 lion_debug_key_positions('pos_hot_d', l.lexeme) p),
-heap AS (
-	SELECT u.lexeme, (pos_hot.ctid::text::point)[0] AS blk, u.positions, u.weights
-	FROM pos_hot, unnest(d) u)
-SELECT (SELECT count(*) FROM heap) AS heap_rows,
-	   (SELECT count(*) FROM (SELECT * FROM idx EXCEPT ALL SELECT * FROM heap) x) AS only_index,
-	   (SELECT count(*) FROM (SELECT * FROM heap EXCEPT ALL SELECT * FROM idx) x) AS only_heap;
- heap_rows | only_index | only_heap 
------------+------------+-----------
-     10500 |          0 |         0
+CREATE FUNCTION pos_hot_check(OUT heap_rows bigint, OUT only_index bigint,
+							  OUT only_heap bigint, OUT phrases bigint,
+							  OUT matched numeric, OUT differ bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+	WITH idx AS (
+		SELECT l.lexeme, (p.tid::text::point)[0] AS blk, p.positions, p.weights
+		FROM (SELECT DISTINCT unnest(tsvector_to_array(d)) AS lexeme FROM pos_hot) l,
+			 lion_debug_key_positions('pos_hot_d', l.lexeme) p),
+	heap AS (
+		SELECT u.lexeme, (pos_hot.ctid::text::point)[0] AS blk, u.positions, u.weights
+		FROM pos_hot, unnest(d) u)
+	SELECT (SELECT count(*) FROM heap),
+		   (SELECT count(*) FROM (SELECT * FROM idx EXCEPT ALL SELECT * FROM heap) x),
+		   (SELECT count(*) FROM (SELECT * FROM heap EXCEPT ALL SELECT * FROM idx) x)
+	INTO heap_rows, only_index, only_heap;
+	PERFORM set_config('enable_seqscan', 'off', true);
+	CREATE TEMP TABLE pos_hot_idx AS
+	SELECT format('w%s <-> hot%s', w, h)::tsquery AS q, 0::bigint AS n
+	FROM generate_series(0, 49) w, generate_series(0, 2) h;
+	UPDATE pos_hot_idx SET n = (SELECT count(*) FROM pos_hot WHERE d @@ q);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	SELECT count(*), sum(i.n),
+		   count(*) FILTER (WHERE i.n IS DISTINCT FROM
+			   (SELECT count(*) FROM pos_hot WHERE d @@ i.q))
+	INTO phrases, matched, differ
+	FROM pos_hot_idx i;
+	DROP TABLE pos_hot_idx;
+END $$;
+SET maintenance_work_mem = '1MB';
+REINDEX INDEX pos_hot_d;
+RESET maintenance_work_mem;
+SELECT * FROM pos_hot_check();
+ heap_rows | only_index | only_heap | phrases | matched | differ 
+-----------+------------+-----------+---------+---------+--------
+     10500 |          0 |         0 |     150 |    1500 |      0
 (1 row)
 
-CREATE TEMP TABLE pos_hot_q AS
-SELECT format('w%s <-> hot%s', w, h)::tsquery AS q
-FROM generate_series(0, 49) w, generate_series(0, 2) h;
-SET enable_seqscan = off;
-CREATE TEMP TABLE pos_hot_idx AS
-SELECT q, (SELECT count(*) FROM pos_hot WHERE d @@ q) AS n FROM pos_hot_q;
-RESET enable_seqscan;
-SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET pg_lion.enable_count_pushdown = off;
-SELECT count(*) AS phrases, sum(i.n) AS matched,
-	   count(*) FILTER (WHERE i.n IS DISTINCT FROM
-		   (SELECT count(*) FROM pos_hot WHERE d @@ i.q)) AS differ
-FROM pos_hot_idx i;
- phrases | matched | differ 
----------+---------+--------
-     150 |    1500 |      0
-(1 row)
-
-RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET pg_lion.enable_count_pushdown;
-DROP TABLE pos_hot_q, pos_hot_idx;
 SELECT lion_index_verify('pos_hot_d', true);
  lion_index_verify 
 -------------------
  
 (1 row)
 
+-- A parallel build: each participant keeps the positions of its share of the
+-- heap, and the leader merges a key's by heap block (PostgreSQL 17 and later;
+-- before, the same build runs serially)
+ALTER TABLE pos_hot SET (parallel_workers = 2);
+SET max_parallel_maintenance_workers = 2;
+SET maintenance_work_mem = '96MB';
+REINDEX INDEX pos_hot_d;
+RESET maintenance_work_mem;
+RESET max_parallel_maintenance_workers;
+SELECT * FROM pos_hot_check();
+ heap_rows | only_index | only_heap | phrases | matched | differ 
+-----------+------------+-----------+---------+---------+--------
+     10500 |          0 |         0 |     150 |    1500 |      0
+(1 row)
+
+SELECT lion_index_verify('pos_hot_d', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+DROP FUNCTION pos_hot_check();
 DROP TABLE pos_hot;
 -- Queries answered from the positions (lion_posfilter.c): the posting sets
 -- give the candidates, and each one is decided from its stored positions, so
