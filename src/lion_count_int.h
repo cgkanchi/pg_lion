@@ -667,6 +667,12 @@ typedef struct LionExprCursor
 	/* LION_KN_OR planned wide: everything is in here instead */
 	struct LionWideOr *wide;
 
+	/*
+	 * LION_KN_POSFILTER: the filter its one child's containers go through
+	 * (lion_posfilter.c), whose container cur is.
+	 */
+	struct LionPosFilter *pf;
+
 	/* LION_KN_AND / LION_KN_OR */
 	int			nsub;
 	struct LionExprCursor *sub;
@@ -1147,6 +1153,8 @@ lion_node_overhead(LionKeyNodeKind kind, int nargs)
 		mem += 2 * lion_alloc_size(LION_CONTAINER_MAX_SIZE);	/* acc[] */
 	if (kind == LION_KN_AND)
 		mem += (Size) nargs * sizeof(int);	/* order */
+	if (kind == LION_KN_POSFILTER)
+		mem += LION_POSFILTER_MEM;	/* the filter */
 	if (kind == LION_KN_OR)
 	{
 		mem += (Size) nargs * LION_OR_CHILD_OVERHEAD;	/* heap, hot, hotc */

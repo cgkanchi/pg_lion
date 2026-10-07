@@ -1,7 +1,8 @@
 /*-------------------------------------------------------------------------
  * lion_positions.h
  *	  Position chunks for pg_lion: the per-row word positions of a lexeme,
- *	  stored beside its posting set for tsvector_pos_ops.
+ *	  stored beside its posting set in an index built WITH
+ *	  (store_positions = true).
  *
  *	  A chunk is a sixth kind of item (LION_CT_POSITIONS).  It shares the
  *	  8-byte LionContainer header, and it never appears among the items of a
@@ -161,6 +162,19 @@ extern bool lion_poschunk_last_code(const LionContainer *c, uint64 *code);
 extern Size lion_posmember_size(uint64 prev_code, const LionPosMember *m);
 extern Size lion_poschunk_append_need(const LionContainer *c, const LionPosMember *m);
 extern bool lion_poschunk_append(LionContainer *c, Size cap, const LionPosMember *m);
+
+/* Where a chunk's last member ends, kept by a caller that appends many. */
+typedef struct LionPosTail
+{
+	bool		valid;			/* false: found again at the next append */
+	bool		any;			/* the chunk has a member */
+	uint64		last;			/* its last member's code */
+	uint32		used;			/* member bytes up to its end */
+	uint32		n;				/* members */
+} LionPosTail;
+
+extern bool lion_poschunk_append_tail(LionContainer *c, Size cap,
+									  const LionPosMember *m, LionPosTail *tail);
 extern bool lion_poschunk_insert(LionContainer *c, Size cap, const LionPosMember *m,
 								 bool *replaced);
 

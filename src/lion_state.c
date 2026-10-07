@@ -435,8 +435,12 @@ lion_fill_column_state(Relation index, LionState *state, AttrNumber attno,
 					   index_getprocinfo(index, attno, LION_EXTRACTQUERY_PROC),
 					   cxt);
 
-		/* Stored positions (§17): support proc 5. */
+		/*
+		 * Stored positions (§17): support proc 5, in an index built with
+		 * store_positions = true, which the meta page records.
+		 */
 		state->positions =
+			(state->ix->meta.order_flags & LION_META_POSITIONS) != 0 &&
 			OidIsValid(index_getprocid(index, attno, LION_POSITIONS_PROC));
 		if (state->positions)
 			fmgr_info_copy(&state->positionsproc,
@@ -797,6 +801,27 @@ lion_fill_index_state(Relation index, LionIndexState *ix,
 				 errmsg("index \"%s\" was built in the order of a comparison function its operator class no longer uses",
 						RelationGetRelationName(index)),
 				 errhint("REINDEX the index.")));
+}
+
+/*
+ * store_positions = true on an index none of whose columns can store them is
+ * a mistake worth saying so about, at build time.
+ */
+void
+lion_check_store_positions(Relation index, const LionIndexState *ix)
+{
+	int			i;
+
+	if ((ix->meta.order_flags & LION_META_POSITIONS) == 0)
+		return;
+	for (i = 0; i < ix->ncolumns; i++)
+		if (ix->cols[i].positions)
+			return;
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("store_positions needs a key column whose operator class can store positions"),
+			 errdetail("Index \"%s\" has none; tsvector_ops is one that can.",
+					   RelationGetRelationName(index))));
 }
 
 /*
