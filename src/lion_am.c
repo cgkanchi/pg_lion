@@ -282,6 +282,20 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §29.11, "The relation's rows": whether what the probe measures
+	 * of a relation's own restriction clauses corrects rel->rows too, which
+	 * the planner sizes its joins from, or lion's own estimates only.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_rows_correction",
+							 "Corrects a relation's row estimate with what the intersection probe measures.",
+							 "Off, the probe corrects lion's own cost estimates only, and the planner sizes joins from its own estimate.",
+							 &lion_enable_rows_correction,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
 	 * DESIGN.md §29.11, "Unions probed": whether the AND of posting sets may
 	 * look its running intersection up in the containers of an IN list's or
 	 * a multi-key query's union at a key, where that is cheaper than building
