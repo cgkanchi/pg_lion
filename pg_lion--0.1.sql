@@ -495,6 +495,22 @@ CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING lion AS
 	FUNCTION	5	lion_tsvector_positions(tsvector, internal),
 	STORAGE		text;
 
+/*
+ * BM25 ranking (lion_bm25.c, DESIGN.md §17 "Ranking"): the k rows with the
+ * highest Okapi BM25 score for the query's lexemes, best first, scored from
+ * an index built WITH (store_positions = true).  Join on ctid for the rows:
+ *
+ *   SELECT d.*, s.score
+ *     FROM lion_bm25('doc_tsv_idx', to_tsquery('english', 'cat & dog'), 10) s
+ *     JOIN doc d ON d.ctid = s.ctid
+ *    ORDER BY s.score DESC;
+ */
+CREATE FUNCTION lion_bm25(index regclass, query tsquery, k int,
+						  k1 float8 DEFAULT 1.2, b float8 DEFAULT 0.75,
+						  OUT ctid tid, OUT score float8)
+	RETURNS SETOF record
+	AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED ROWS 10;
+
 /* ---------------------------------------------------------------------
  * count functions (lion_count.c)
  *

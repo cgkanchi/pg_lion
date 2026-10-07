@@ -1211,6 +1211,7 @@ typedef struct LionKeyPositions
  * lion_extract_value() for a column that stores positions: (*pos)[i] are the
  * positions of (*keys)[i].
  */
+extern bool lion_is_length_key(const LionState *state, Datum key);
 extern int lion_extract_value_pos(LionState *state, Datum value, Datum **keys,
 								  LionKeyPositions **pos);
 extern void lion_posmember_from_key(LionPosMember *m, uint64 code,
@@ -2238,6 +2239,15 @@ extern bool lion_postree_fetch(Relation index, uint32 hash, BlockNumber root,
  * query has an operand it cannot follow (a prefix lexeme).
  */
 typedef struct LionPosFilter LionPosFilter;
+
+/* A forward reader over one key's members (lion_posfilter.c). */
+typedef struct LionPosCursor LionPosCursor;
+extern LionPosCursor *lion_poscursor_open(Relation index, LionState *col,
+										  Datum key, bool countsonly);
+extern const LionPosMember *lion_poscursor_next(Relation index,
+												LionPosCursor *cur,
+												uint64 code);
+extern void lion_poscursor_close(LionPosCursor *cur);
 
 /*
  * What a LION_KN_POSFILTER cursor holds, about: the filter's two member
