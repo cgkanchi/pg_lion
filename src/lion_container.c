@@ -2162,7 +2162,8 @@ lion_container_size_for(LionContainerType type, uint32 cardinality, uint32 nruns
 			Assert(nruns >= 1 && nruns <= LION_NARROW_MAX_WIDTH);
 			return LION_NARROW_SIZE(nruns);
 		case LION_CT_SPARSE:
-			/* a segment is not a container: lion_sparse_size() sizes those */
+		case LION_CT_POSITIONS:
+			/* not containers: lion_sparse_size() and lion_poschunk_size() size those */
 			break;
 	}
 	Assert(false);
