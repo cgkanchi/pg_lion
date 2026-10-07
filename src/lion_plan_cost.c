@@ -3871,7 +3871,7 @@ lion_where_query_unknown(List *whereclauses, List *wherekinds,
 /*
  * Will the superset of a LOSSY multi-key clause be decided from stored
  * positions rather than in the heap (lion_posfilter.c)?  When the index
- * column's opclass stores them (support function 5) and the query names no
+ * column stores them (lion_index_stores_positions()) and the query names no
  * key a position cursor cannot follow - lion_tsquery_item_keys(), as the
  * executor asks it.  Only a literal is known now.
  */
@@ -3891,7 +3891,8 @@ lion_multikey_posexact(IndexOptInfo *idx, AttrNumber col, Node *clause)
 
 	return lion_query_posexact(idx->opfamily[col - 1], idx->opcintype[col - 1],
 							   op->opno, ((Const *) arg)->constvalue,
-							   ((Const *) arg)->constcollid);
+							   ((Const *) arg)->constcollid) &&
+		lion_index_stores_positions(idx, col);
 }
 
 double

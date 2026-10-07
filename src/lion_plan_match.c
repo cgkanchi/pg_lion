@@ -320,10 +320,7 @@ lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 							  idx->opcintype[i],
 							  LION_EXTRACTQUERY_PROC) != extractquery)
 			return NULL;
-		if (positions &&
-			!OidIsValid(get_opfamily_proc(idx->opfamily[i], idx->opcintype[i],
-										  idx->opcintype[i],
-										  LION_POSITIONS_PROC)))
+		if (positions && !lion_index_stores_positions(idx, col))
 			return NULL;
 		if (colp != NULL)
 			*colp = col;
@@ -442,6 +439,29 @@ lion_op_roaring_strategy(Oid opno, Oid *opfamily, Oid *lefttype)
 		break;
 	}
 	ReleaseSysCacheList(catlist);
+
+	return result;
+}
+
+/*
+ * Does key column col of idx store positions (DESIGN.md §17)?  Its opclass
+ * has support function 5 and the index was built with store_positions = true,
+ * which only its meta page knows (LION_META_POSITIONS) - the reloption may
+ * have been changed by ALTER INDEX since.
+ */
+bool
+lion_index_stores_positions(IndexOptInfo *idx, AttrNumber col)
+{
+	Relation	indexrel;
+	LionIndexState *ix;
+	bool		result;
+
+	if (col < 1 || col > idx->nkeycolumns)
+		return false;
+	indexrel = index_open(idx->indexoid, AccessShareLock);
+	ix = lion_get_index_state(indexrel);
+	result = col <= ix->ncolumns && ix->cols[col - 1].positions;
+	index_close(indexrel, AccessShareLock);
 
 	return result;
 }

@@ -502,6 +502,16 @@ typedef struct LionMetaPageData
 
 #define LION_META_ORDER_RECORDED	0x0001
 
+/*
+ * The build stored word positions (DESIGN.md §17, "Stored positions") for
+ * every key column whose opclass can extract them (support function 5): the
+ * `store_positions` reloption at build time.  It shares order_flags because
+ * the reserved words are spent; an index written before it has the bit clear,
+ * which is exactly "no positions".  ALTER INDEX changes nothing until a
+ * REINDEX.
+ */
+#define LION_META_POSITIONS			0x0002
+
 /* ordered_cols has one bit per key column. */
 StaticAssertDecl(INDEX_MAX_KEYS <= 32,
 				 "lion's meta page records the order of at most 32 key columns");
@@ -875,6 +885,7 @@ typedef struct LionOptions
 	int			wal_mode;		/* LION_WALOPT_*, DESIGN.md §25 */
 	int			summaries;		/* LION_SUMOPT_*, DESIGN.md §32 */
 	int			summary_tids;	/* TIDs a summary bucket takes (§32) */
+	bool		store_positions;	/* positions at build time (§17) */
 } LionOptions;
 
 /*
@@ -2248,6 +2259,8 @@ extern void lion_posfilter_end(LionPosFilter *pf);
 extern LionKeyNode *lion_posfilter_keynode(Relation index, LionState *col,
 										   Datum query, StrategyNumber strategy,
 										   LionKeyNode *child);
+extern void lion_check_store_positions(Relation index,
+									   const LionIndexState *ix);
 extern bool lion_query_posexact(Oid opfamily, Oid lefttype, Oid opno,
 								Datum query, Oid collation);
 

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  * positions_test.c
  *	  Standalone unit tests for src/lion_positions.c, the position chunks of
- *	  tsvector_pos_ops.
+ *	  an index built WITH (store_positions = true).
  *
  *	  Built by "make unit PG_CONFIG=..." with -DFRONTEND, so this program
  *	  links against nothing but libc and the chunk library.
