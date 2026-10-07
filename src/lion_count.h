@@ -146,6 +146,13 @@ typedef struct LionCountStats
 	int64		rows_removed;
 
 	/*
+	 * Candidates decided from stored positions (LionRowFilter.pos), and
+	 * those of them the query does not select.
+	 */
+	int64		pos_checked;
+	int64		pos_removed;
+
+	/*
 	 * What a count's work is made of, container by container (DESIGN.md §27,
 	 * "Where a key's time goes"), which the FK-side join reports per key:
 	 *
@@ -237,7 +244,27 @@ typedef struct LionRowFilter
 	int			nclauses;
 	LionRowFilterClause *clauses;
 	MemoryContext tmpcxt;		/* one row's evaluation, reset after it */
+
+	/*
+	 * Clauses on a column that stores positions are decided from the index
+	 * instead (lion_posfilter.c, DESIGN.md §17 "Stored positions"): pos[] are
+	 * their filters, which every container is put through before the
+	 * visibility map is asked about it.  They stay among clauses[] as well,
+	 * for the sequential scan of lion_count_heap_filtered() and for a row the
+	 * heap is visited for anyway; nheap counts the clauses that only the
+	 * heap can decide, and the map is ignored only when there are some.
+	 */
+	int			nheap;
+	int			npos;
+	struct LionPosFilter **pos;
 } LionRowFilter;
+
+/* Does a count with this filter have to test every candidate in the heap? */
+static inline bool
+lion_row_filter_heap(const LionRowFilter *filter)
+{
+	return filter != NULL && filter->nheap > 0;
+}
 
 /*
  * Every count that is handed `cache` afterwards (lion_count_sources_cached(),

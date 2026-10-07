@@ -53,7 +53,11 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "catalog/pg_type.h"
+#include "funcapi.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/tuplestore.h"
 #include "utils/rel.h"
 
 #include "lion.h"
@@ -666,4 +670,158 @@ lion_debug_postree_stress(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(psprintf("members " INT64_FORMAT ", replaced " INT64_FORMAT ", leaves " INT64_FORMAT ", height %u",
 											  nmembers, replaced, leaves,
 											  (unsigned) height)));
+}
+
+/* ---------------------------------------------------------------------
+ * lion_debug_key_positions(): what the index stores for one key
+ * --------------------------------------------------------------------- */
+
+/*
+ * lion_debug_key_positions(idx regclass, key text) returns setof (tid tid,
+ * positions int2[], weights text[]): every member the index stores for the
+ * key of its first column, in TID order, shaped like unnest(tsvector), so a
+ * test can compare the two.  Inline positions or the position tree, whichever
+ * the entry has.  A test function like lion_debug_postree_stress(): the
+ * tests create it from the library.  Superuser only.
+ */
+PG_FUNCTION_INFO_V1(lion_debug_key_positions);
+
+static void
+pos_debug_emit(ReturnSetInfo *rsinfo, const LionPosMember *m)
+{
+	ItemPointerData *tid = palloc(sizeof(ItemPointerData));
+	Datum	   *pos = palloc(sizeof(Datum) * Max(m->npos, 1));
+	Datum	   *wt = palloc(sizeof(Datum) * Max(m->npos, 1));
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+	int			i;
+
+	lion_code_to_tid(m->code, tid);
+	for (i = 0; i < m->npos; i++)
+	{
+		char		w[2] = {"DCBA"[LION_POS_WEIGHT(m->pos[i])], '\0'};
+
+		pos[i] = Int16GetDatum((int16) LION_POS_POS(m->pos[i]));
+		wt[i] = CStringGetTextDatum(w);
+	}
+	values[0] = PointerGetDatum(tid);
+	if (m->npos == 0)
+	{
+		nulls[1] = true;
+		nulls[2] = true;
+	}
+	else
+	{
+		values[1] = PointerGetDatum(construct_array(pos, m->npos, INT2OID, 2,
+													true, TYPALIGN_SHORT));
+		values[2] = PointerGetDatum(construct_array(wt, m->npos, TEXTOID, -1,
+													false, TYPALIGN_INT));
+	}
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+Datum
+lion_debug_key_positions(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid			relid = PG_GETARG_OID(0);
+	Datum		key = PG_GETARG_DATUM(1);
+	Relation	index;
+	LionState  *state;
+	Buffer		buf = InvalidBuffer;
+	OffsetNumber off;
+	LionPosMember *m = palloc(sizeof(LionPosMember));
+	uint32		hash = 0;
+	BlockNumber root = InvalidBlockNumber;
+	LionContainer *chunk = NULL;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("lion_debug_key_positions() is for superusers")));
+	InitMaterializedSRF(fcinfo, 0);
+
+	index = lion_open_index(relid, AccessShareLock);
+	state = lion_get_state(index);
+	if (!state->positions)
+		elog(ERROR, "index \"%s\" does not store positions",
+			 RelationGetRelationName(index));
+
+	key = PointerGetDatum(PG_DETOAST_DATUM(key));
+	if (lion_find_entry(index, state, BUFFER_LOCK_SHARE, key,
+						lion_hash_key(state, key), &buf, &off))
+	{
+		Page		page = BufferGetPage(buf);
+		LionEntryTuple *e = lion_page_entry_fetch(index, page,
+												  BufferGetBlockNumber(buf),
+												  off);
+		const LionEntryPosExt *x = lion_entry_posext(e);
+
+		if (x == NULL)
+			elog(ERROR, "postree debug: the entry has no positions extension");
+		hash = e->hash;
+		if ((e->flags & LION_ENTRY_CHAIN) != 0)
+			root = x->pos_root;
+		else
+		{
+			chunk = palloc(LION_CONTAINER_MAX_SIZE);
+			if (!lion_entry_inline_poschunk(index, e,
+											ItemIdGetLength(PageGetItemId(page, off)),
+											BufferGetBlockNumber(buf), off,
+											chunk))
+			{
+				pfree(chunk);
+				chunk = NULL;
+			}
+		}
+	}
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
+
+	if (chunk != NULL)
+	{
+		LionPosIter it;
+
+		lion_poschunk_iter_init(&it, chunk);
+		while (lion_poschunk_iter_next(&it, m))
+			pos_debug_emit(rsinfo, m);
+	}
+	else if (BlockNumberIsValid(root))
+	{
+		buf = lion_posting_search_before(index, NULL, hash, root, 0,
+										 BUFFER_LOCK_SHARE, false);
+		while (BufferIsValid(buf))
+		{
+			Page		page = BufferGetPage(buf);
+			BlockNumber blk = BufferGetBlockNumber(buf);
+			OffsetNumber maxoff;
+			OffsetNumber o;
+			BlockNumber next;
+
+			lion_postree_check_leaf(index, buf, root);
+			maxoff = PageGetMaxOffsetNumber(page);
+			for (o = FirstOffsetNumber; o <= maxoff; o++)
+			{
+				LionPosIter it;
+
+				lion_poschunk_iter_init(&it,
+										lion_page_poschunk_fetch(index, page,
+																 blk, o));
+				while (lion_poschunk_iter_next(&it, m))
+					pos_debug_emit(rsinfo, m);
+			}
+			next = LionPageGetOpaque(page)->rightlink;
+			if (LionPageIsRightmost(page))
+			{
+				UnlockReleaseBuffer(buf);
+				break;
+			}
+			UnlockReleaseBuffer(buf);
+			buf = ReadBuffer(index, next);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+		}
+	}
+
+	index_close(index, AccessShareLock);
+	return (Datum) 0;
 }

@@ -499,10 +499,19 @@ Several such quals on one column (`tags && '{a}' AND tags && '{b}'`), like two l
 column, are ANDed in the index, as quals on several columns are, so the heap gets only the rows they
 select together (DESIGN.md §5, SCAN step 5).
 `count(*)` over `@>`, `&&` and an AND/OR tsquery is pushed down like any other clause, and can be
-combined with a `GROUP BY` on a scalar roaring column. Everything a plain AND/OR of key sets cannot
-express is rechecked in the heap. A NULL element and a tsquery phrase, weight or `a & !b` are
-answered from the rows of their keys (the other elements, the phrase's lexemes, `a`), then
-rechecked, in counts and scans alike. `<@`, `@> '{}'`, a bare `!a` and `foo:*` fall back to scanning
+combined with a `GROUP BY` on a scalar roaring column.
+
+`tsvector_pos_ops` also stores every lexeme's positions and weights per row, so phrases (`a <-> b`,
+`a <3> b`), weights (`a:A`) and NOTs (`a & !b`, `a <-> !b`) are answered exactly from the index:
+bitmap and index scans need no recheck, and counts skip the heap on all-visible pages, under a
+`GROUP BY`, `count(DISTINCT)` or the FK-side join too. It costs about three bytes per lexeme and
+row on top of `tsvector_ops`. Only a prefix lexeme (`foo:*`) is still rechecked.
+
+    CREATE INDEX ON doc USING lion (tsv tsvector_pos_ops);
+
+Without positions, everything a plain AND/OR of key sets cannot express is rechecked in the heap. A
+NULL element and a tsquery phrase, weight or `a & !b` are answered from the rows of their keys (the
+other elements, the phrase's lexemes, `a`), then rechecked, in counts and scans alike. `<@`, `@> '{}'`, a bare `!a` and `foo:*` fall back to scanning
 every indexed row and rechecking it if the Lion index is used; the planner may choose a sequential
 scan instead, and GIN wins the measured prefix case below.
 
