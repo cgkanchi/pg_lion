@@ -8,7 +8,8 @@
 -- no heap was priced out of the plan.  Each such clause is a posting set of a
 -- lion index, so lion now measures their AND from the index for its OWN
 -- estimates - the smallest set's containers, sampled, with the others ANDed
--- in - while core's estimates and the relation's row count stay core's.
+-- in - while core's estimates stay core's (the relation's row count is
+-- rowscorrect.sql's).
 --
 -- The table is sampled whole by ANALYZE, so its statistics - and the plans -
 -- are the same on every run; and its hidden groups take turns row by row, so
