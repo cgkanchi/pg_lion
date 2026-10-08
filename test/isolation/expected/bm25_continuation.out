@@ -1,0 +1,31 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s1_plan s1_open s1_fetch64 s2_insert s1_rest s1_check s1_commit
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_plan: EXPLAIN (COSTS OFF) SELECT id FROM bm_cont WHERE d @@ 'hit'
+					ORDER BY lion_bm25_score(d, 'hit', 'bm_cont_d') DESC;
+QUERY PLAN                         
+-----------------------------------
+Custom Scan (LionBm25) on bm_cont  
+  Filter: (d @@ '''hit'''::tsquery)
+  Index: bm_cont_d                 
+(3 rows)
+
+step s1_open: DECLARE c NO SCROLL CURSOR FOR SELECT id FROM bm_cont WHERE d @@ 'hit'
+					ORDER BY lion_bm25_score(d, 'hit', 'bm_cont_d') DESC;
+step s1_fetch64: DO $$ DECLARE c refcursor := 'c'; r record;
+					BEGIN FOR i IN 1..64 LOOP FETCH c INTO r;
+					  INSERT INTO bm_cont_got (id) VALUES (r.id); END LOOP; END $$;
+step s2_insert: INSERT INTO bm_cont VALUES (-1, to_tsvector('simple', repeat('hit ', 300)));
+step s1_rest: DO $$ DECLARE c refcursor := 'c'; r record;
+					BEGIN LOOP FETCH c INTO r; EXIT WHEN NOT FOUND;
+					  INSERT INTO bm_cont_got (id) VALUES (r.id); END LOOP; END $$;
+step s1_check: SELECT count(*) AS fetched, count(DISTINCT id) AS distinct_rows,
+						 bool_and(id = 101 - n) AS best_first
+					FROM bm_cont_got;
+fetched|distinct_rows|best_first
+-------+-------------+----------
+    100|          100|t         
+(1 row)
+
+step s1_commit: COMMIT;

@@ -1,0 +1,53 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s2_begin s1_func s2_func s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_func: SELECT count(*) FROM lion_bm25('bm_ser_d', 'secret', 10);
+count
+-----
+    0
+(1 row)
+
+step s2_func: SELECT count(*) FROM lion_bm25('bm_ser_d', 'secret', 10);
+count
+-----
+    0
+(1 row)
+
+step s1_insert: INSERT INTO bm_ser VALUES (-1, to_tsvector('simple', 'secret one'));
+step s2_insert: INSERT INTO bm_ser VALUES (-2, to_tsvector('simple', 'secret two'));
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_plan s1_scan s2_scan s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_plan: EXPLAIN (COSTS OFF) SELECT id FROM bm_ser WHERE d @@ 'secret'
+					ORDER BY lion_bm25_score(d, 'secret', 'bm_ser_d') DESC LIMIT 10;
+QUERY PLAN                                  
+--------------------------------------------
+Limit                                       
+  ->  Custom Scan (LionBm25) on bm_ser      
+        Filter: (d @@ '''secret'''::tsquery)
+        Index: bm_ser_d                     
+(4 rows)
+
+step s1_scan: SELECT id FROM bm_ser WHERE d @@ 'secret'
+					ORDER BY lion_bm25_score(d, 'secret', 'bm_ser_d') DESC LIMIT 10;
+id
+--
+(0 rows)
+
+step s2_scan: SELECT id FROM bm_ser WHERE d @@ 'secret'
+					ORDER BY lion_bm25_score(d, 'secret', 'bm_ser_d') DESC LIMIT 10;
+id
+--
+(0 rows)
+
+step s1_insert: INSERT INTO bm_ser VALUES (-1, to_tsvector('simple', 'secret one'));
+step s2_insert: INSERT INTO bm_ser VALUES (-2, to_tsvector('simple', 'secret two'));
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
