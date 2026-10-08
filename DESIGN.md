@@ -4771,7 +4771,11 @@ The scan also returns each row's score: the ORDER BY expression is the last colu
 tuple (`custom_scan_tlist`, after the table columns the plan uses), and setrefs.c replaces every
 copy of the expression above the scan with it. Evaluated on its own, `lion_bm25_score()` would read
 N, df and avgdl when the first row is fetched, the walk when the executor started; a cursor whose
-table gained rows in between would show scores out of the order it ranked by. A relation locked
+table gained rows in between would show scores out of the order it ranked by. With no call left
+above the scan for ExecInitFunc() to check, the scan checks EXECUTE on `lion_bm25_score()` for the
+current user itself, every time it is initialised and under plain EXPLAIN too (§9, "EXECUTE on what
+a count replaces"), so a cached plan answers a REVOKE or a SET ROLE as the ordinary plan does
+(test/sql/security_exec.sql). A relation locked
 `FOR UPDATE` or the like is left to the ordinary plan, since EvalPlanQual hands a scan the table's
 row rather than that tuple. Its startup cost is
 two index tuples and two operators per member of the scored lexemes (their `ntids`, read at plan

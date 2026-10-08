@@ -613,7 +613,18 @@ lion_bm25_begin(CustomScanState *node, EState *estate, int eflags)
 		if (IsA(e, Var))
 			st->attnos[i] = ((Var *) e)->varattno;
 		else if (lion_bm25_is_score(e))
+		{
+			/*
+			 * The score stands in for every copy of the lion_bm25_score()
+			 * call above the scan, so it asks the EXECUTE that ExecInitFunc()
+			 * would have asked of them: of the current user, every time the
+			 * node is initialised - plain EXPLAIN included, as core asks it
+			 * then too - so that a cached plan answers a REVOKE and a SET
+			 * ROLE as the ordinary plan does.
+			 */
+			lion_check_execute(((FuncExpr *) e)->funcid);
 			st->isscore[i] = true;
+		}
 		else
 			elog(ERROR, "LionBm25 scan tuple has an unexpected column");
 		i++;
