@@ -1,9 +1,9 @@
 /*-------------------------------------------------------------------------
  *
  * lion_plan_private.c
- *		Reading a LionCount plan's custom_private: the positional list
- *		decoded into a LionCountPriv, and the rules between its members
- *		checked.
+ *		A LionCount plan's custom_private: the positional list decoded into
+ *		a LionCountPriv and encoded back from one, and the rules between its
+ *		members checked.
  *
  * Part of the LionCount custom scan: lion_customscan.h describes the node
  * and declares what its files share, and lion_plan_private.h the struct.
@@ -507,6 +507,8 @@ lion_count_priv_decode(List *priv, LionPrivStage stage, LionCountPriv *out)
 	{
 		lion_priv_expect_length(m, LION_PRIV_DISTINCT, 1);
 		out->distattno = (AttrNumber) linitial_int(m);
+		if (out->distattno <= 0)
+			elog(ERROR, "LionCount: malformed DISTINCT member of custom_private");
 	}
 
 	lion_priv_decode_join(priv, stage, out);
@@ -530,6 +532,8 @@ lion_count_priv_decode(List *priv, LionPrivStage stage, LionCountPriv *out)
 	{
 		lion_priv_expect_length(m, LION_PRIV_ALLROWS, 1);
 		out->allattno = (AttrNumber) linitial_int(m);
+		if (out->allattno <= 0)
+			elog(ERROR, "LionCount: malformed ALLROWS member of custom_private");
 	}
 
 	/* the top k by count (DESIGN.md §36): k, the candidates, the tie rule */
@@ -547,6 +551,211 @@ lion_count_priv_decode(List *priv, LionPrivStage stage, LionCountPriv *out)
 	lion_priv_decode_wagg(priv, stage, out);
 	if (stage == LION_PRIV_STAGE_PLAN)
 		lion_priv_decode_tlkinds(priv, out);
+}
+
+/*
+ * The members lion_count_priv_decode() reads, written back from *p in the
+ * same positions and as the same nodes: a decoded list encoded at the stage
+ * it was decoded at is equal() to it.  A member the struct leaves empty is
+ * NIL.  Lists and nodes the struct points to are shared, not copied.
+ */
+static List *
+lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
+{
+	List	   *priv;
+	List	   *oids;
+	List	   *ints;
+	List	   *ckinds = NIL;
+	List	   *ops = NIL;
+	List	   *parts = NIL;
+	List	   *ors = NIL;
+	List	   *m;
+	int			i;
+	int			j;
+
+	Assert(stage == LION_PRIV_STAGE_PLAN ||
+		   (p->join.keyresno == 0 && p->nwagg == 0 && p->ntl == 0));
+	Assert(stage == LION_PRIV_STAGE_PATH ||
+		   (p->consts == NIL && p->having == NIL));
+
+	oids = list_make3_oid(p->heapoid, p->groupidxoid, p->groupidxoid2);
+	ints = list_make4_int((int) p->scanrelid, (int) p->groupattno,
+						  (int) p->groupattno2, p->flags);
+	for (i = 0; i < p->nclause; i++)
+	{
+		oids = lappend_oid(oids, p->clause[i].idxoid);
+		ints = lappend_int(ints, (int) p->clause[i].attno);
+		ckinds = lappend_int(ckinds, p->clause[i].kind);
+		ops = lappend_oid(ops, p->clause[i].opno);
+	}
+	for (i = 0; i < p->npart; i++)
+	{
+		const LionCountPrivPart *part = &p->part[i];
+		List	   *one = list_make3_oid(part->heapoid, part->groupidxoid,
+										 part->groupidxoid2);
+
+		for (j = 0; j < p->nclause; j++)
+			one = lappend_oid(one, part->clauseidxoid[j]);
+		parts = lappend(parts, one);
+	}
+	for (i = 0; i < p->nor; i++)
+	{
+		const LionOrState *o = &p->ors[i];
+		List	   *one = list_make2_int(o->first, o->narms);
+
+		for (j = 0; j < o->narms; j++)
+			one = lappend_int(one, o->armlen[j]);
+		ors = lappend(ors, one);
+	}
+
+	priv = list_make1(list_make2_int(LION_PRIV_MAGIC, LION_PRIV_NMEMBERS));
+	priv = lappend(priv, oids);
+	priv = lappend(priv, ints);
+	priv = lappend(priv, p->consts);
+	priv = lappend(priv, ckinds);
+	priv = lappend(priv, parts);
+	priv = lappend(priv, ops);
+	priv = lappend(priv, ors);
+	priv = lappend(priv, p->having);
+	priv = lappend(priv, (p->distattno != 0) ?
+				   list_make1_int((int) p->distattno) : NIL);
+
+	/* the operator and collation are OIDs in an IntList, cast both ways */
+	m = NIL;
+	if (p->hasjoin)
+	{
+		m = list_make5_int(p->join.clause, p->join.type, p->join.flags,
+						   (int) p->join.sortop, (int) p->join.sortcoll);
+		if (stage == LION_PRIV_STAGE_PLAN)
+			m = lappend_int(m, (int) p->join.keyresno);
+	}
+	priv = lappend(priv, m);
+
+	priv = lappend(priv, list_make3(p->exec_aggs, p->exec_funcs,
+									p->exec_groupfuncs));
+	priv = lappend(priv, (p->coalconst != NULL) ?
+				   list_make2(p->coalconst,
+							  list_make2_oid(p->coaleqop, p->coalcoll)) :
+				   NIL);
+	priv = lappend(priv, p->implied);
+
+	m = NIL;
+	if (p->fgattno != 0)
+	{
+		List	   *fgoids = NIL;
+		List	   *fgconsts = NIL;
+
+		for (i = 0; i < Max(p->npart, 1); i++)
+		{
+			fgoids = lappend_oid(fgoids, p->fgidxoid[i]);
+			fgconsts = lappend(fgconsts, p->fgconst[i]);
+		}
+		m = list_make3(list_make1_int((int) p->fgattno), fgoids, fgconsts);
+	}
+	priv = lappend(priv, m);
+
+	m = NIL;
+	if (p->ngroupn > 0)
+	{
+		List	   *attnos = NIL;
+		List	   *idxoids = NIL;
+
+		for (i = 0; i < p->ngroupn; i++)
+		{
+			attnos = lappend_int(attnos, (int) p->groupn_attno[i]);
+			idxoids = lappend_oid(idxoids, p->groupn_idx[i]);
+		}
+		m = list_make2(attnos, idxoids);
+	}
+	priv = lappend(priv, m);
+
+	priv = lappend(priv, (p->allattno != 0) ?
+				   list_make1_int((int) p->allattno) : NIL);
+	priv = lappend(priv, (p->topkn > 0) ?
+				   list_make3_int((int) p->topkn, p->topkcand,
+								  p->topkstrict ? 1 : 0) : NIL);
+
+	/* the aggregates and their OIDs are IntLists too, at the PLAN stage */
+	m = NIL;
+	if (p->nwcol > 0)
+	{
+		List	   *attnos = NIL;
+		List	   *idxoids = NIL;
+		List	   *cols = NIL;
+
+		for (i = 0; i < p->nwcol; i++)
+		{
+			attnos = lappend_int(attnos, (int) p->wcol[i].attno);
+			idxoids = lappend_oid(idxoids, p->wcol[i].idxoid);
+			cols = lappend_int(cols, (int) p->wcol[i].idxcol);
+		}
+		m = list_make3(attnos, idxoids, cols);
+		if (stage == LION_PRIV_STAGE_PLAN)
+		{
+			List	   *specs = NIL;
+
+			for (i = 0; i < p->nwagg; i++)
+			{
+				const LionCountPrivWAgg *a = &p->wagg[i];
+
+				specs = lappend(specs,
+								list_make5_int(a->kind, a->col, a->argwidth,
+											   (int) a->aggfnoid,
+											   (int) a->collation));
+			}
+			m = lappend(m, specs);
+		}
+	}
+	priv = lappend(priv, m);
+
+	if (stage == LION_PRIV_STAGE_PLAN)
+	{
+		m = NIL;
+		for (i = 0; i < p->ntl; i++)
+			m = lappend_int(m, p->tlkind[i]);
+		priv = lappend(priv, m);
+	}
+	return priv;
+}
+
+/*
+ * Write *p as the custom_private of a LionCount node at `stage`: the list
+ * lion_count_priv_decode() reads (lion_plan_private.h), positional, behind
+ * the shape marker.  At the PLAN stage the clause values and the HAVING have
+ * to have left the struct already: they are custom_exprs' and plan.qual's.
+ *
+ * An assert-enabled build decodes what it wrote, writes that again and
+ * checks the two are equal(), so that any member the two halves of the codec
+ * disagree on fails on the first plan that has it.
+ */
+List *
+lion_count_priv_encode(const LionCountPriv *p, LionPrivStage stage)
+{
+	List	   *priv = lion_priv_encode(p, stage);
+
+#ifdef USE_ASSERT_CHECKING
+	{
+		LionCountPriv again;
+
+		lion_count_priv_decode(priv, stage, &again);
+		Assert(equal(priv, lion_priv_encode(&again, stage)));
+	}
+#endif
+	return priv;
+}
+
+/*
+ * The fact column an FK-side join's custom_private groups by (DESIGN.md §27,
+ * "Grouped by a fact column"), or 0: of a PATH's list, the join's or the
+ * base of it lion_fkjoin_setup() makes.
+ */
+AttrNumber
+lion_count_priv_fact_group_attno(List *priv)
+{
+	LionCountPriv p;
+
+	lion_count_priv_decode(priv, LION_PRIV_STAGE_PATH, &p);
+	return p.fgattno;
 }
 
 /*

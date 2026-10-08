@@ -13,7 +13,8 @@
  * rules BETWEEN members - a top k is one column's walk, a fact group needs
  * an inner join - that a plan this build wrote always keeps.  Either one
  * failing is planner/executor drift, or a plan from another build, and is
- * an ERROR rather than a misread Oid.
+ * an ERROR rather than a misread Oid.  lion_count_priv_encode() writes a
+ * struct back as that list, the same members in the same positions.
  *
  * The list has two stages.  The PATH's is 19 members (its marker already
  * says 20): the clause values in CONSTS and the HAVING in HAVING, the JOIN
@@ -163,9 +164,12 @@ typedef struct LionCountPriv
  */
 extern PGDLLEXPORT void lion_count_priv_decode(List *priv, LionPrivStage stage,
 											   LionCountPriv *out);
+extern List *lion_count_priv_encode(const LionCountPriv *p,
+								   LionPrivStage stage);
 extern void lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 								  int ncustom_plans);
 extern AttrNumber lion_count_priv_drive_attno(const LionCountPriv *p);
 extern AttrNumber lion_count_priv_inner_attno(const LionCountPriv *p);
+extern AttrNumber lion_count_priv_fact_group_attno(List *priv);
 
 #endif							/* LION_PLAN_PRIVATE_H */
