@@ -1409,9 +1409,35 @@ typedef struct LionWAgg
 	bool		resnull;
 } LionWAgg;
 
+/*
+ * What the node does, fixed by the plan at begin (lion_count_mode_of()) and
+ * dispatched on by the run: the one choice among the shapes below, in the
+ * order the run tries them.  Whether the table is partitioned is apart from
+ * it (npart), and so is every choice the run makes as it goes - an IN list
+ * driving the groups, a long one located in batches, a join walked in key
+ * order, a parallel GROUP BY run without the Gather's shared memory.
+ */
+typedef enum LionCountMode
+{
+	LION_MODE_COUNT,			/* no index to iterate: one row */
+	LION_MODE_SUM,				/* every entry summed (§14), + aggregates
+								 * over keys (§37) */
+	LION_MODE_DISTINCT,			/* count(DISTINCT k), no GROUP BY (§26) */
+	LION_MODE_GROUP,			/* one column's entries (§10) */
+	LION_MODE_GROUP2,			/* two columns, nested (§20) */
+	LION_MODE_GROUP_DISTINCT,	/* (g, k) pairs (§26) */
+	LION_MODE_DECODE,			/* the decoded walk (§34) */
+	LION_MODE_GROUP_RANGED,		/* a parallel GROUP BY (§10), or GROUP's
+								 * walk without the shared memory */
+	LION_MODE_JOIN,				/* the FK-side join (§27) */
+	LION_MODE_JOIN_FACTGROUP	/* ... grouped by a fact column */
+} LionCountMode;
+
 typedef struct LionCountScanState
 {
 	CustomScanState css;
+
+	LionCountMode mode;			/* lion_count_mode_of() */
 
 	/* decoded from custom_private */
 	Oid			heapoid;
