@@ -716,14 +716,29 @@ lion_begin_plan(LionCountScanState *st, const LionCountPriv *priv)
 	st->nclause = priv->nclause;
 	st->distattno = priv->distattno;
 	st->allattno = priv->allattno;
+}
 
-	/*
-	 * The top k by count (DESIGN.md §36) is made of one grouping column
-	 * walked in one table, counted a group at a time.
-	 */
-	st->topkn = priv->topkn;
-	st->topkcand = priv->topkcand;
-	st->topkstrict = priv->topkstrict;
+/*
+ * The top k by count (DESIGN.md §36) is made of one grouping column walked
+ * in one table, counted a group at a time.  Its state is there only when the
+ * plan has a k.
+ */
+static void
+lion_begin_topk(LionCountScanState *st, const LionCountPriv *priv,
+				EState *estate)
+{
+	LionTopkState *tk;
+
+	st->topk = NULL;
+	if (priv->topkn <= 0)
+		return;
+
+	tk = (LionTopkState *) MemoryContextAllocZero(estate->es_query_cxt,
+												  sizeof(LionTopkState));
+	tk->n = priv->topkn;
+	tk->cand = priv->topkcand;
+	tk->strict = priv->topkstrict;
+	st->topk = tk;
 }
 
 /* GROUP BY coalesce(g, c) (DESIGN.md §10): c and its equality */
@@ -1514,6 +1529,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 			 priv.nclause, list_length(exprs) - priv.nwagg);
 
 	lion_begin_plan(st, &priv);
+	lion_begin_topk(st, &priv, estate);
 	lion_begin_coalesce(st, &priv, estate);
 	lion_begin_join(st, &priv);
 	lion_begin_target_list(st, cscan, &priv);

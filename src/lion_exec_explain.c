@@ -819,12 +819,12 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 	 * The top k by count (DESIGN.md §36): k, and how many entries the walk of
 	 * their counts keeps as candidates.
 	 */
-	if (st->topkn > 0)
+	if (st->topk != NULL)
 	{
 		initStringInfo(&buf);
 		appendStringInfo(&buf, INT64_FORMAT " by count%s, %d candidates",
-						 st->topkn, st->topkstrict ? " with ties" : "",
-						 st->topkcand);
+						 st->topk->n, st->topk->strict ? " with ties" : "",
+						 st->topk->cand);
 		ExplainPropertyText("Top K", buf.data, es);
 		pfree(buf.data);
 	}
@@ -1112,15 +1112,15 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 	 * groups counted, and how often the candidates were not enough and every
 	 * group was counted instead.
 	 */
-	if (st->topkn > 0)
+	if (st->topk != NULL)
 	{
-		ExplainPropertyInteger("Top K Entries Walked", NULL, st->topkwalked,
+		ExplainPropertyInteger("Top K Entries Walked", NULL, st->topk->walked,
 							   es);
 		ExplainPropertyInteger("Top K Groups Counted", NULL,
-							   st->topkcounted, es);
-		if (st->topkwholes > 0)
+							   st->topk->counted, es);
+		if (st->topk->wholes > 0)
 			ExplainPropertyInteger("Top K Walked Whole", NULL,
-								   st->topkwholes, es);
+								   st->topk->wholes, es);
 	}
 }
 
