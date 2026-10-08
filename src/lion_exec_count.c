@@ -415,7 +415,8 @@ lion_sum_walk(LionCountScanState *st, LionCountSource *sources, int nsource,
 	 * §32): still disjoint sets, still exactly the rows of the part.
 	 */
 	lion_entry_scan_begin_sum(&st->escan, st->groupidx, st->groupidxcol,
-							  st->hasrange ? &st->range : NULL, part);
+							  lion_plan_flag(st, LION_FLAG_RANGE) ?
+							  &st->range : NULL, part);
 	st->scanning = true;
 
 	/* One leaf's entries, which is at most what lion_range.c copies of one. */
@@ -895,7 +896,7 @@ lion_sumall_relation(LionCountScanState *st)
 		nsource = st->nsource;
 	}
 
-	if (st->hasrange)
+	if (lion_plan_flag(st, LION_FLAG_RANGE))
 		eval = lion_range_choose(st, sources, nsource);
 
 	switch (eval)
@@ -911,12 +912,12 @@ lion_sumall_relation(LionCountScanState *st)
 			break;
 		default:
 			total = lion_sum_walk(st, sources, nsource,
-								  st->hasrange ? LION_WALK_INSIDE :
-								  LION_WALK_ALL);
+								  lion_plan_flag(st, LION_FLAG_RANGE) ?
+								  LION_WALK_INSIDE : LION_WALK_ALL);
 			break;
 	}
 
-	if (st->hasrange)
+	if (lion_plan_flag(st, LION_FLAG_RANGE))
 		st->rangeeval[eval]++;
 	return total;
 }
@@ -1621,7 +1622,8 @@ lion_topk_run(LionCountScanState *st)
 	/* ---- the entries' own counts: the tk->cand largest, and maxout ---- */
 	cand = (LionTopkCand *) palloc(sizeof(LionTopkCand) * 2 * cap);
 	lion_entry_scan_begin_range(&es, st->groupidx, st->groupidxcol,
-								st->hasrange ? &st->range : NULL);
+								lion_plan_flag(st, LION_FLAG_RANGE) ?
+								&st->range : NULL);
 	byval = es.state->typbyval;
 	typlen = es.state->typlen;
 	for (;;)
@@ -2189,7 +2191,8 @@ lion_distinct_relation(LionCountScanState *st)
 	if (!listdrive)
 	{
 		lion_entry_scan_begin_range(&st->escan, st->groupidx, st->groupidxcol,
-									st->hasrange ? &st->range : NULL);
+									lion_plan_flag(st, LION_FLAG_RANGE) ?
+									&st->range : NULL);
 		st->scanning = true;
 	}
 
@@ -2275,8 +2278,8 @@ lion_distinct_relation(LionCountScanState *st)
 	 * never under a list or a range on k (DESIGN.md §28), which no NULL
 	 * satisfies.
 	 */
-	if (st->singlegroup && !found && !listdrive && st->sumallitem < 0 &&
-		!st->hasrange)
+	if (lion_plan_flag(st, LION_FLAG_SINGLEGROUP) && !found && !listdrive &&
+		st->sumallitem < 0 && !lion_plan_flag(st, LION_FLAG_RANGE))
 	{
 		MemoryContextReset(st->pergroup);
 		oldcxt = MemoryContextSwitchTo(st->pergroup);
@@ -2288,7 +2291,7 @@ lion_distinct_relation(LionCountScanState *st)
 	}
 
 	st->done = true;
-	if (st->singlegroup && !found)
+	if (lion_plan_flag(st, LION_FLAG_SINGLEGROUP) && !found)
 		return NULL;
 
 	dist->count = ndistinct;
@@ -3340,16 +3343,16 @@ lion_next_group_any(LionCountScanState *st, bool *exhausted)
 			Assert(st->decode != NULL);
 			return lion_next_group_decode(st, exhausted);
 		case LION_MODE_GROUP_DISTINCT:
-			Assert(st->decode == NULL && st->distattno != 0);
+			Assert(st->decode == NULL && st->plan.distattno != 0);
 			return lion_next_group_distinct(st, exhausted);
 		case LION_MODE_GROUP2:
-			Assert(st->decode == NULL && st->distattno == 0 &&
-				   st->groupattno2 != 0);
+			Assert(st->decode == NULL && st->plan.distattno == 0 &&
+				   st->plan.groupattno2 != 0);
 			return lion_next_group2(st, exhausted);
 		case LION_MODE_GROUP:
 		case LION_MODE_GROUP_RANGED:
-			Assert(st->decode == NULL && st->distattno == 0 &&
-				   st->groupattno2 == 0);
+			Assert(st->decode == NULL && st->plan.distattno == 0 &&
+				   st->plan.groupattno2 == 0);
 			if (st->ingroupitem >= 0)
 				return lion_next_group_inlist(st, exhausted);
 			return lion_next_group(st, exhausted);
