@@ -2004,9 +2004,18 @@ lion_next_join_row(LionCountScanState *st)
 	int64		count;
 	MemoryContext oldcxt;
 
-	/* grouped by a fact column: each key counted once per group */
-	if (st->fgattno != 0)
-		return lion_next_join_group(st);
+	switch (st->mode)
+	{
+		case LION_MODE_JOIN_FACTGROUP:
+			/* grouped by a fact column: each key counted once per group */
+			Assert(st->fgattno != 0);
+			return lion_next_join_group(st);
+		case LION_MODE_JOIN:
+			Assert(st->fgattno == 0);
+			break;
+		default:
+			elog(ERROR, "LionCount: mode %d is no join", (int) st->mode);
+	}
 
 	/* a partitioned fact table: every batch to every partition in turn */
 	if (st->joinpart != NULL)
