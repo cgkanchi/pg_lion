@@ -23,8 +23,8 @@
  * the planner knows the LIMIT, else 64 - fetches them best first under the
  * scan's snapshot, following a HOT chain to the visible version, and applies
  * the WHERE to each; when whatever is above it pulls past them, it asks for
- * four times as many and goes on from where it was, until the walk has no
- * more.  The ORDER BY expression itself is evaluated by lion_bm25_score()
+ * four times as many ranked below the last row it had, until the walk has
+ * no more.  The ORDER BY expression itself is evaluated by lion_bm25_score()
  * for the rows returned, and gives the score the walk ranked them by.
  *
  *-------------------------------------------------------------------------
@@ -50,6 +50,7 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
+#include "storage/predicate.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -87,6 +88,7 @@ typedef struct LionBm25ScanState
 	int64		nbest;
 	int64		next;			/* the next of them to return */
 	int64		L;				/* what the last walk was asked for; 0: none */
+	int64		seen;			/* the rows the walks have given, added up */
 	bool		last;			/* that walk was the last one */
 } LionBm25ScanState;
 
@@ -464,6 +466,13 @@ lion_bm25_begin(CustomScanState *node, EState *estate, int eflags)
 		return;
 	st->index = index_open(indexoid, AccessShareLock);
 	lion_check_table_am(node->ss.ss_currentRelation);
+
+	/*
+	 * The relation-level predicate lock index_beginscan() takes for an AM
+	 * without ampredlocks, before the index is read, so that a SERIALIZABLE
+	 * search that finds nothing is covered too.
+	 */
+	PredicateLockRelation(st->index, estate->es_snapshot);
 	st->valid = lion_bm25_prepare(st->index, st->query, st->k1, st->b, &st->q);
 }
 
@@ -493,17 +502,29 @@ lion_bm25_next(ScanState *ss)
 		if (!st->valid || st->last)
 			return ExecClearTuple(slot);
 
-		/* the walk again for more: the rows already returned come first */
-		st->next = st->nbest;
+		/*
+		 * The walk again for more: the rows ranked below the last one it
+		 * gave, which is where the scan has got to (lion_bm25_topk()).
+		 */
 		st->L = (st->L == 0) ? st->firstL : st->L * 4;
-		st->L = Max(Min(st->L, (int64) st->q.ncodes), 1);
-		if (st->best != NULL)
-			pfree(st->best);
-		st->best = (LionBm25Cand *)
-			palloc_extended(sizeof(LionBm25Cand) * st->L, MCXT_ALLOC_HUGE);
-		st->nbest = lion_bm25_topk(&st->q, st->L, st->best);
+		st->L = Max(Min(st->L, (int64) st->q.ncodes - st->seen), 1);
+		{
+			LionBm25Cand after;
+			bool		have_after = (st->nbest > 0);
+
+			if (have_after)
+				after = st->best[st->nbest - 1];
+			if (st->best != NULL)
+				pfree(st->best);
+			st->best = (LionBm25Cand *)
+				palloc_extended(sizeof(LionBm25Cand) * st->L, MCXT_ALLOC_HUGE);
+			st->nbest = lion_bm25_topk(&st->q, st->L,
+									   have_after ? &after : NULL, st->best);
+		}
 		lion_bm25_sort(st->best, st->nbest);
-		if (st->nbest < st->L || st->L >= (int64) st->q.ncodes)
+		st->next = 0;
+		st->seen += st->nbest;
+		if (st->nbest < st->L || st->seen >= (int64) st->q.ncodes)
 			st->last = true;
 	}
 }
@@ -542,6 +563,7 @@ lion_bm25_rescan(CustomScanState *node)
 	st->nbest = 0;
 	st->next = 0;
 	st->L = 0;
+	st->seen = 0;
 	st->last = false;
 }
 
@@ -554,7 +576,7 @@ lion_bm25_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 
 	ExplainPropertyText("Index", get_rel_name(indexoid), es);
 	if (es->analyze)
-		ExplainPropertyInteger("Rows Ranked", NULL, st->L, es);
+		ExplainPropertyInteger("Rows Ranked", NULL, st->seen, es);
 }
 
 /* ---------------------------------------------------------------------
