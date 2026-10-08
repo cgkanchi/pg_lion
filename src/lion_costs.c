@@ -213,9 +213,13 @@ typedef struct LionRateSetting
 } LionRateSetting;
 
 static const LionRateSetting lion_rate_settings[] = {
-	/* §10: 208 and 157 units a millisecond at 200 and 20,000 groups */
-	{"pg_lion.hashagg_rate", &lion_hashagg_rate, 0.42,
-	 "a hashed aggregate"},
+	/*
+	 * §39, "A hashed aggregate's own rate": the hashing of the calibration
+	 * matrix's four whole-table GROUP BYs, its time less its scan's at the
+	 * reference, ran at 0.087 to 0.116 of it
+	 */
+	{"pg_lion.hashagg_rate", &lion_hashagg_rate, 0.1,
+	 "a hashed aggregate's own work, its cost less its input's"},
 	/* §10: 401 to 695 over sequential scans, 415 to 536 over index-only ones */
 	{"pg_lion.agg_rate", &lion_agg_rate, 1.0,
 	 "a plain or sorted aggregate over a scan"},

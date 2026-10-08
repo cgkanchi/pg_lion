@@ -312,8 +312,6 @@ lion_competitor_rate(LionCompetitor kind)
 {
 	switch (kind)
 	{
-		case LION_COMPETITOR_HASHAGG:
-			return lion_hashagg_rate;
 		case LION_COMPETITOR_AGG:
 			return lion_agg_rate;
 		case LION_COMPETITOR_HASHJOIN:
@@ -322,6 +320,7 @@ lion_competitor_rate(LionCompetitor kind)
 			return lion_mergejoin_rate;
 		case LION_COMPETITOR_BITMAP:
 			return lion_bitmap_rate;
+		case LION_COMPETITOR_HASHAGG:	/* per plan: lion_hashagg_plan_rate() */
 		case LION_COMPETITOR_NONE:
 		case LION_COMPETITOR_DISABLED:
 		case LION_COMPETITOR_NESTLOOP:
@@ -332,6 +331,86 @@ lion_competitor_rate(LionCompetitor kind)
 			break;
 	}
 	return 1.0;
+}
+
+/*
+ * The rate of a plan that hashes, path (DESIGN.md §39, "A hashed aggregate's
+ * own rate"): not one rate for the whole plan.  What core charges far below
+ * its time is the hashing alone - a cpu_operator_cost or two a row for about
+ * 100 ns - and the scan or join under it runs at its own rate, near the
+ * reference: a hash aggregate over a whole table spends most of its time
+ * hashing, one over the few thousand rows of a selective index scan almost
+ * none.  So the hashed aggregates' own cost, total less input, is taken at
+ * pg_lion.hashagg_rate and the rest at the reference, and the plan's rate is
+ * its cost over that: its cost units a millisecond, as a multiple of 500.
+ * Down from the top through what passes rows up, every hashed aggregate on
+ * the way counted (a Finalize over the Partial ones of a parallel plan), to
+ * the first join or scan; an Append's dearest child, as for its kind.
+ */
+static double
+lion_hashagg_plan_rate(Path *path)
+{
+	Cost		total = (path != NULL) ? path->total_cost : 0.0;
+	Cost		hashing = 0.0;
+	double		rate = (lion_hashagg_rate > 0.0) ? lion_hashagg_rate : 1.0;
+	Cost		reference;
+
+	while (path != NULL)
+	{
+		Path	   *input = NULL;
+		bool		hashes = false;
+
+		switch (nodeTag(path))
+		{
+			case T_AggPath:
+				input = ((AggPath *) path)->subpath;
+				hashes = (((AggPath *) path)->aggstrategy == AGG_HASHED ||
+						  ((AggPath *) path)->aggstrategy == AGG_MIXED);
+				break;
+			case T_GroupingSetsPath:
+				input = ((GroupingSetsPath *) path)->subpath;
+				hashes = (((GroupingSetsPath *) path)->aggstrategy == AGG_HASHED ||
+						  ((GroupingSetsPath *) path)->aggstrategy == AGG_MIXED);
+				break;
+			case T_NestPath:
+			case T_MergePath:
+			case T_HashPath:
+			case T_BitmapHeapPath:
+			case T_IndexPath:
+			case T_Path:
+				path = NULL;
+				continue;
+			case T_AppendPath:
+			case T_MergeAppendPath:
+				{
+					List	   *subpaths = IsA(path, AppendPath) ?
+						((AppendPath *) path)->subpaths :
+						((MergeAppendPath *) path)->subpaths;
+					Path	   *dearest = NULL;
+					ListCell   *lc;
+
+					foreach(lc, subpaths)
+					{
+						Path	   *p = (Path *) lfirst(lc);
+
+						if (dearest == NULL ||
+							p->total_cost > dearest->total_cost)
+							dearest = p;
+					}
+					path = dearest;
+					continue;
+				}
+			default:
+				break;
+		}
+		if (hashes && input != NULL && path->total_cost > input->total_cost)
+			hashing += path->total_cost - input->total_cost;
+		path = (input != NULL) ? input : lion_path_input(path);
+	}
+	if (total <= 0.0 || hashing <= 0.0 || hashing > total)
+		return 1.0;
+	reference = (total - hashing) + hashing / rate;
+	return total / reference;
 }
 
 /*
@@ -489,21 +568,26 @@ lion_path_is_lion_scan(Path *path)
  * and DISABLED when every one it has is disabled - a plan forced by core's
  * enable_* settings, which leave a lion path nothing to compete with.
  * *ownscan says whether that path is one of the AM's own scans of a lion
- * index (lion_path_is_lion_scan()).
+ * index (lion_path_is_lion_scan()), *rate its rate.
  */
 static LionCompetitor
-lion_competitor_of(RelOptInfo *rel, Cost *cost, bool *ownscan)
+lion_competitor_of(RelOptInfo *rel, Cost *cost, bool *ownscan, double *rate)
 {
 	Path	   *best = lion_competitor_path(rel);
+	LionCompetitor kind;
 
 	*cost = (best != NULL) ? best->total_cost : 0.0;
 	*ownscan = false;
+	*rate = 1.0;
 	if (best == NULL)
 		return LION_COMPETITOR_NONE;
 	if (lion_path_disabled(best))
 		return LION_COMPETITOR_DISABLED;
 	*ownscan = lion_path_is_lion_scan(best);
-	return lion_competitor_kind(best);
+	kind = lion_competitor_kind(best);
+	*rate = (kind == LION_COMPETITOR_HASHAGG) ?
+		lion_hashagg_plan_rate(best) : lion_competitor_rate(kind);
+	return kind;
 }
 
 /*
@@ -541,6 +625,7 @@ static RelOptInfo *lion_units_pinned_rel = NULL;
 static LionCompetitor lion_units_pinned_kind;
 static Cost lion_units_pinned_cost;
 static bool lion_units_pinned_ownscan;
+static double lion_units_pinned_rate;
 
 /*
  * The units a lion path of rel is to be priced in - the cheapest core path's
@@ -558,10 +643,10 @@ lion_units_for(RelOptInfo *rel, LionUnits *u)
 		u->kind = lion_units_pinned_kind;
 		cost = lion_units_pinned_cost;
 		ownscan = lion_units_pinned_ownscan;
+		u->rate = lion_units_pinned_rate;
 	}
 	else
-		u->kind = lion_competitor_of(rel, &cost, &ownscan);
-	u->rate = lion_competitor_rate(u->kind);
+		u->kind = lion_competitor_of(rel, &cost, &ownscan, &u->rate);
 	if (u->rate <= 0.0)
 		u->rate = 1.0;
 	u->margin = lion_competitor_margin(u->kind, ownscan);
@@ -580,7 +665,8 @@ lion_units_pin(RelOptInfo *rel)
 {
 	lion_units_pinned_rel = NULL;
 	lion_units_pinned_kind = lion_competitor_of(rel, &lion_units_pinned_cost,
-												&lion_units_pinned_ownscan);
+												&lion_units_pinned_ownscan,
+												&lion_units_pinned_rate);
 	lion_units_pinned_rel = rel;
 }
 
@@ -621,7 +707,8 @@ lion_units_margin_for(RelOptInfo *rel)
 {
 	Cost		cost;
 	bool		ownscan;
-	LionCompetitor kind = lion_competitor_of(rel, &cost, &ownscan);
+	double		rate;
+	LionCompetitor kind = lion_competitor_of(rel, &cost, &ownscan, &rate);
 
 	return lion_competitor_margin(kind, false);
 }
