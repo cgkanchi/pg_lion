@@ -32,7 +32,6 @@ them. The on-disk format may still change. Don't put data you can't rebuild behi
 | Dashboards, facet counts, `GROUP BY` over large tables | **Lion.** This is what it is for. |
 | Range counts on a column with many distinct values (timestamps, ids) | Lion `WITH (summaries = auto)` |
 | Array membership and full-text search, especially counts | Lion. Add `store_positions = true` for phrases and ranking. |
-| Full-text prefix search (`foo:*`) | GIN for now. Lion falls back to checking every row. |
 | Unique constraints, or `ORDER BY col LIMIT n` on a single column | B-tree |
 | Returning many filtered rows in order | A covering B-tree, which lion can filter as it walks it (see below) |
 | Write-heavy tables | Measure first. Lion inserts are slower and write more WAL than B-tree. |
@@ -143,8 +142,9 @@ GIN index would. A fuzz test in CI checks this against both.
 
 AND/OR queries are answered from the index alone. Phrases (`<->`), weights (`:A`) and NOT need
 `store_positions = true`. Without it they still work, but each candidate row is rechecked in the
-heap, as GIN does. Storing positions roughly doubles the index size. Prefix queries (`foo:*`) are the
-remaining gap: lion currently rechecks every row for them.
+heap, as GIN does. Storing positions roughly doubles the index size. A prefix (`foo:*`) is answered
+from the index too, as the OR of the indexed words that start with `foo`, unless it matches more than
+1000 words; then lion rechecks rows, and GIN is faster.
 
 ### Ranking with BM25
 
@@ -176,7 +176,8 @@ columns and can be built in parallel on PostgreSQL 17 and later.
   Use a covering B-tree for ordered or row-returning queries, as shown above.
 - Inserts are about 1.3× slower than B-tree and write about 1.5× the WAL.
 - A plain `ORDER BY col LIMIT n` on one column is faster with a B-tree.
-- Full-text prefix queries (`foo:*`) recheck every row. GIN is the better choice for them.
+- A full-text prefix (`foo:*`) matching more than 1000 distinct words is rechecked row by row, and
+  is slower than GIN.
 - BM25 top-k is slower than GIN + `ts_rank` when a query matches only a few hundred rows, and slows
   down when every query term is very common.
 - The count pushdown doesn't use expression indexes (for example, lion on `(data->>'key')`).
@@ -204,7 +205,7 @@ PostgreSQL 18), with how lion compares. "lion 10× faster" means the other index
 | `WHERE c >= .. ORDER BY c LIMIT 100` | 0.45 ms | 0.030 ms (lion **15× slower**) |  |
 | Full-text count, `'w1 & w17'` (200k docs) | 0.16 ms |  | 1.33 ms (lion 8.4× faster) |
 | Full-text count, phrase `'common <-> w1'` | 3.90 ms |  | 14.7 ms (lion 3.8× faster) |
-| Full-text count, prefix `'rare12:*'` | 40.2 ms |  | 3.57 ms (lion **11× slower**) |
+| Full-text count, prefix `'rare12:*'` | 1.20 ms |  | 2.57 ms (lion 2.1× faster) |
 | Top 10 by BM25 vs `ts_rank`, 33k matches (500k docs) | 9.9 ms | | 121 ms (lion 12× faster) |
 | Top 10 by BM25 vs `ts_rank`, 584 matches | 7.1 ms | | 3.7 ms (lion **1.9× slower**) |
 

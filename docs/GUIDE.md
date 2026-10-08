@@ -203,9 +203,6 @@ CREATE INDEX docs_tags_lion ON docs USING lion (tags);
 VACUUM (ANALYZE) docs;
 EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
 SELECT count(*) FROM docs WHERE tags @> ARRAY['t1', 't17'];
-
--- Choose GIN for prefix searches on the text-search column.
-CREATE INDEX docs_tsv_gin ON docs USING gin (tsv);
 ```
 
 To return ROWS rather than counts under a Lion filter, give the query a covering B-tree, as you
