@@ -526,15 +526,17 @@ lion_reset_run(LionCountScanState *st)
 		lion_posting_set_release(&st->join->filter);
 		st->join->collected = false;
 		st->join->filtered = false;
+		st->join->pcopy.viewshared = false;
 	}
-	st->joinviewshared = false;
 
 	/* ... or a partitioned fact table's, one copy per partition */
-	if (st->joinpart != NULL)
+	if (st->join != NULL && st->join->part.leaf != NULL)
 	{
+		LionJoinParts *jparts = &st->join->part;
+
 		for (i = 0; i < st->npart; i++)
 		{
-			LionJoinPart *jp = &st->joinpart[i];
+			LionJoinPart *jp = &jparts->leaf[i];
 
 			lion_posting_set_release(&jp->filter);
 			memset(&jp->filter, 0, sizeof(jp->filter));
@@ -545,7 +547,7 @@ lion_reset_run(LionCountScanState *st)
 			jp->viewshared = false;
 			MemoryContextReset(jp->cxt);
 		}
-		st->joinrunfilterrows = 0;
+		jparts->runfilterrows = 0;
 	}
 
 	/* ... and the account of a plan that probes them, begun again */
@@ -617,8 +619,8 @@ lion_reset_run(LionCountScanState *st)
 
 	if (st->npart > 0)
 		lion_close_relation(st);
-	if (st->joinvisitcxt != NULL)
-		MemoryContextReset(st->joinvisitcxt);
+	if (st->join != NULL && st->join->part.visitcxt != NULL)
+		MemoryContextReset(st->join->part.visitcxt);
 
 	if (st->pergroup != NULL)
 		MemoryContextReset(st->pergroup);
@@ -748,7 +750,8 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 {
 	LionCountScanState *st = (LionCountScanState *) node;
 	LionJoinShared *shared = (LionJoinShared *) coordinate;
-	bool		collect = (st->join != NULL && st->join->collect);
+	LionJoinState *js = st->join;
+	bool		collect = (js != NULL && js->collect);
 
 	memset(shared, 0, sizeof(LionJoinShared));
 	SpinLockInit(&shared->mutex);
@@ -783,15 +786,16 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	 * The leader keeps its parallel context, which says once the workers are
 	 * launched whether any of them started.
 	 */
-	st->joinpcxt = pcxt;
-	if (collect && pcxt->seg != NULL && st->joinpart == NULL)
+	if (js != NULL)
+		js->pcopy.pcxt = pcxt;
+	if (collect && pcxt->seg != NULL && js->part.leaf == NULL)
 	{
 		lion_shared_copy_init(LION_JOIN_SHARED_COPY(shared), pcxt->seg,
 							  shared->participants,
 							  get_hash_memory_limit() * (Size) shared->participants,
 							  RelationGetNumberOfBlocks(st->heap));
 		shared->copyready = true;
-		st->joinsharedcopy = LION_JOIN_SHARED_COPY(shared);
+		js->pcopy.copy = LION_JOIN_SHARED_COPY(shared);
 	}
 
 	/*
@@ -800,7 +804,7 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	 * memory a Parallel Hash would have is divided among them by their heaps'
 	 * sizes, and past its share each copy's chunks go to its own files.
 	 */
-	if (collect && pcxt->seg != NULL && st->joinpart != NULL)
+	if (collect && pcxt->seg != NULL && js->part.leaf != NULL)
 	{
 		Size		memory = get_hash_memory_limit() * (Size) shared->participants;
 		double		total;
@@ -815,7 +819,8 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 			lion_shared_copy_init(LION_JOIN_SHARED_PART_COPY(shared, p),
 								  pcxt->seg, shared->participants,
 								  (Size) ((double) memory * frac), blocks[p]);
-			st->joinpart[p].shared = LION_JOIN_SHARED_PART_COPY(shared, p);
+			js->part.leaf[p].shared =
+				LION_JOIN_SHARED_PART_COPY(shared, p);
 		}
 		pfree(blocks);
 		shared->copyready = true;
@@ -842,6 +847,7 @@ lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 {
 	LionCountScanState *st = (LionCountScanState *) node;
 	LionJoinShared *shared = (LionJoinShared *) coordinate;
+	LionJoinState *js = st->join;
 
 	pg_atomic_write_u32(&shared->nextchunk, 0);
 	SpinLockAcquire(&shared->mutex);
@@ -856,24 +862,22 @@ lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 										  lion_parallel_range_keys,
 										  &shared->ckeys);
 
-	if (st->joinsharedcopy != NULL)
+	if (js != NULL && js->pcopy.copy != NULL)
 	{
-		if (st->joinviewshared)
+		if (js->pcopy.viewshared)
 		{
-			LionJoinState *js = lion_st_join(st);
-
 			lion_posting_set_release(&js->filter);
-			st->joinviewshared = false;
+			js->pcopy.viewshared = false;
 			js->filtered = false;
 			js->collected = false;
 		}
-		lion_shared_copy_reinit(st->joinsharedcopy,
+		lion_shared_copy_reinit(js->pcopy.copy,
 								node->ss.ps.state->es_query_dsa,
 								RelationGetNumberOfBlocks(st->heap));
 	}
 
 	/* ... one per leaf partition of a partitioned fact table */
-	if (st->joinpart != NULL && shared->copyready)
+	if (js != NULL && js->part.leaf != NULL && shared->copyready)
 	{
 		double		total;
 		BlockNumber *blocks = lion_join_part_blocks(st, &total);
@@ -881,7 +885,7 @@ lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 
 		for (p = 0; p < st->npart; p++)
 		{
-			LionJoinPart *jp = &st->joinpart[p];
+			LionJoinPart *jp = &js->part.leaf[p];
 
 			if (jp->viewshared)
 			{
@@ -902,27 +906,31 @@ void
 lion_initialize_worker(CustomScanState *node, shm_toc *toc, void *coordinate)
 {
 	LionCountScanState *st = (LionCountScanState *) node;
+	LionJoinState *js = st->join;
 
 	st->shared = (LionJoinShared *) coordinate;
 	lion_list_pin_participants(st->shared->participants);
 
-	/* the fact filters' copy, and the file set its chunks may spill to */
-	if (st->shared->copyready && st->joinpart == NULL)
+	/*
+	 * The fact filters' copy, and the file set its chunks may spill to: only
+	 * a join that collects them has one (lion_initialize_dsm()).
+	 */
+	if (st->shared->copyready && js != NULL && js->part.leaf == NULL)
 	{
-		st->joinsharedcopy = LION_JOIN_SHARED_COPY(st->shared);
-		lion_shared_copy_attach(st->joinsharedcopy);
+		js->pcopy.copy = LION_JOIN_SHARED_COPY(st->shared);
+		lion_shared_copy_attach(js->pcopy.copy);
 	}
 
 	/* ... or each leaf partition's */
-	if (st->shared->copyready && st->joinpart != NULL)
+	if (st->shared->copyready && js != NULL && js->part.leaf != NULL)
 	{
 		int			p;
 
 		for (p = 0; p < st->npart; p++)
 		{
-			st->joinpart[p].shared =
+			js->part.leaf[p].shared =
 				LION_JOIN_SHARED_PART_COPY(st->shared, p);
-			lion_shared_copy_attach(st->joinpart[p].shared);
+			lion_shared_copy_attach(js->part.leaf[p].shared);
 		}
 	}
 }
@@ -953,18 +961,18 @@ lion_shutdown_custom_scan(CustomScanState *node)
 	if (shared == NULL)
 		return;
 
-	if (st->joinviewshared)
+	if (js != NULL && js->pcopy.viewshared)
 	{
-		lion_posting_set_release(&lion_st_join(st)->filter);
-		st->joinviewshared = false;
+		lion_posting_set_release(&js->filter);
+		js->pcopy.viewshared = false;
 	}
-	if (st->joinpart != NULL)
+	if (js != NULL && js->part.leaf != NULL)
 	{
 		int			p;
 
 		for (p = 0; p < st->npart; p++)
 		{
-			LionJoinPart *jp = &st->joinpart[p];
+			LionJoinPart *jp = &js->part.leaf[p];
 
 			if (jp->viewshared)
 			{
@@ -978,7 +986,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 
 	if (IsParallelWorker())
 	{
-		if (st->joinreported)
+		if (st->reported)
 			return;
 		SpinLockAcquire(&shared->mutex);
 		lion_count_stats_add(&shared->stats, &st->stats);
@@ -996,10 +1004,10 @@ lion_shutdown_custom_scan(CustomScanState *node)
 				INSTR_TIME_ADD(shared->time[i], js->time[i]);
 			shared->sorted = Max(shared->sorted, js->sort.sorted);
 			shared->batches += js->batch.batches;
+			shared->copies += js->pcopy.copies;
+			shared->copychunks += js->pcopy.chunks;
 		}
 		shared->dirpages += st->dirpages;
-		shared->copies += st->joincopies;
-		shared->copychunks += st->joincopychunks;
 		if (rs != NULL)
 			shared->ranges += rs->ranges;
 		shared->wherecollected += st->wherecollected;
@@ -1009,27 +1017,32 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		if (st->fg != NULL)
 			shared->factgroupcounts += st->fg->groupcounts;
 		SpinLockRelease(&shared->mutex);
-		st->joinreported = true;
+		st->reported = true;
 		return;
 	}
 
 	SpinLockAcquire(&shared->mutex);
-	st->joinworkerstats = shared->stats;
-	st->joinworkerlookups = shared->lookups;
-	st->joinworkermissing = shared->missing;
-	st->joinworkerdirpages = shared->dirpages;
-	st->joinworkerfilterrows = shared->filterrows;
-	st->joinworkerspilled = shared->spilled;
-	st->joinworkersorted = shared->sortedruns + shared->sorted;
-	st->joinworkerbatches = shared->batches;
-	st->joinworkerchildrows = shared->childrows;
-	st->joinworkerposting = shared->posting;
-	st->joinworkercopies = shared->copies;
-	st->joinworkercopychunks = shared->copychunks;
-	st->joinworkerswitches = shared->switches;
-	st->joinworkerswitchkeys = shared->switchkeys;
-	for (i = 0; i < LION_JT_N; i++)
-		st->joinworkertime[i] = shared->time[i];
+	st->workerstats = shared->stats;
+	st->workerdirpages = shared->dirpages;
+	if (js != NULL)
+	{
+		LionJoinWorkerSums *w = &js->worker;
+
+		w->lookups = shared->lookups;
+		w->missing = shared->missing;
+		w->filterrows = shared->filterrows;
+		w->spilled = shared->spilled;
+		w->sorted = shared->sortedruns + shared->sorted;
+		w->batches = shared->batches;
+		w->childrows = shared->childrows;
+		w->posting = shared->posting;
+		w->copies = shared->copies;
+		w->copychunks = shared->copychunks;
+		w->switches = shared->switches;
+		w->switchkeys = shared->switchkeys;
+		for (i = 0; i < LION_JT_N; i++)
+			w->time[i] = shared->time[i];
+	}
 	if (rs != NULL)
 	{
 		rs->workerranges = shared->ranges;
@@ -1126,17 +1139,22 @@ lion_end_custom_scan(CustomScanState *node)
 			js->batch.cxt = NULL;
 		}
 	}
-	if (st->joinvisitcxt != NULL)
+	if (st->join != NULL)
 	{
-		MemoryContextDelete(st->joinvisitcxt);
-		st->joinvisitcxt = NULL;
+		LionJoinParts *jparts = &st->join->part;
+
+		if (jparts->visitcxt != NULL)
+		{
+			MemoryContextDelete(jparts->visitcxt);
+			jparts->visitcxt = NULL;
+		}
+		if (jparts->cxt != NULL)
+		{
+			MemoryContextDelete(jparts->cxt);
+			jparts->cxt = NULL;
+		}
+		jparts->leaf = NULL;
 	}
-	if (st->joinpartcxt != NULL)
-	{
-		MemoryContextDelete(st->joinpartcxt);
-		st->joinpartcxt = NULL;
-	}
-	st->joinpart = NULL;
 	if (st->fg != NULL)
 	{
 		LionFactGroupState *fg = st->fg;

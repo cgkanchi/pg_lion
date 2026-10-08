@@ -1318,13 +1318,13 @@ lion_begin_join_child(LionCountScanState *st, CustomScanState *node,
 	LionJoinState *js = st->join;
 	int			i;
 
-	st->joinworkerfilterrows = -1;
-	for (i = 0; i < LION_JT_N; i++)
-		INSTR_TIME_SET_ZERO(st->joinworkertime[i]);
 	if (js == NULL)
 		return;
 
 	js->filterrows = -1;
+	js->worker.filterrows = -1;
+	for (i = 0; i < LION_JT_N; i++)
+		INSTR_TIME_SET_ZERO(js->worker.time[i]);
 	js->sort.chunk = -1;
 	js->filter.pinbuf = InvalidBuffer;
 	lion_join_switch_reset(st);
@@ -1422,30 +1422,30 @@ lion_begin_join_batches(LionCountScanState *st, EState *estate)
 	 */
 	if (js != NULL && st->npart > 0)
 	{
-		st->joinpart = (LionJoinPart *)
+		js->part.leaf = (LionJoinPart *)
 			palloc0(sizeof(LionJoinPart) * st->npart);
-		st->joinpartcxt = AllocSetContextCreate(estate->es_query_cxt,
-												"LionCount partition copies",
-												ALLOCSET_DEFAULT_SIZES);
-		st->joinvisitcxt = AllocSetContextCreate(estate->es_query_cxt,
-												 "LionCount partition turn",
-												 ALLOCSET_SMALL_SIZES);
+		js->part.cxt = AllocSetContextCreate(estate->es_query_cxt,
+											 "LionCount partition copies",
+											 ALLOCSET_DEFAULT_SIZES);
+		js->part.visitcxt = AllocSetContextCreate(estate->es_query_cxt,
+												  "LionCount partition turn",
+												  ALLOCSET_SMALL_SIZES);
 		for (i = 0; i < st->npart; i++)
 		{
-			LionJoinPart *jp = &st->joinpart[i];
+			LionJoinPart *jp = &js->part.leaf[i];
 
 			jp->filter.pinbuf = InvalidBuffer;
 			jp->buy = -1;
 			jp->qmode = (LionQueryMode *)
 				palloc0(sizeof(LionQueryMode) * Max(st->nclause, 1));
-			jp->cxt = AllocSetContextCreate(st->joinpartcxt,
+			jp->cxt = AllocSetContextCreate(js->part.cxt,
 											"LionCount partition copy",
 											ALLOCSET_DEFAULT_SIZES);
 		}
 	}
 
 	if (js != NULL &&
-		(js->batch.walk || st->joinpart != NULL || st->fg != NULL))
+		(js->batch.walk || js->part.leaf != NULL || st->fg != NULL))
 	{
 		TupleDesc	childdesc = ExecGetResultType(js->child);
 

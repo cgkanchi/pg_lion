@@ -284,13 +284,13 @@ lion_join_switch_reset(LionCountScanState *st)
 	js->probed = 0;
 	js->rentp = &js->rent;
 	js->probedp = &js->probed;
-	if (st->joinpart != NULL)
+	if (js->part.leaf != NULL)
 	{
 		for (p = 0; p < st->npart; p++)
 		{
-			st->joinpart[p].rent = 0;
-			st->joinpart[p].buy = -1;
-			st->joinpart[p].probed = 0;
+			js->part.leaf[p].rent = 0;
+			js->part.leaf[p].buy = -1;
+			js->part.leaf[p].probed = 0;
 		}
 	}
 }
@@ -500,11 +500,13 @@ lion_join_copy_price(LionCountScanState *st, Size budget)
 static bool
 lion_join_shares_copy(LionCountScanState *st, LionSharedCopy *shared)
 {
+	LionJoinState *js = lion_st_join(st);
+
 	if (shared == NULL || st->css.ss.ps.state->es_query_dsa == NULL)
 		return false;
 	if (IsParallelWorker())
 		return true;
-	return st->joinpcxt != NULL && st->joinpcxt->nworkers_launched > 0;
+	return js->pcopy.pcxt != NULL && js->pcopy.pcxt->nworkers_launched > 0;
 }
 
 /*
@@ -583,9 +585,9 @@ lion_join_collect_into(LionCountScanState *st, LionPostingSet *out,
 								 &st->sources[1], out, &chunks,
 								 &built, &spilled, &cstats);
 		*viewshared = true;
-		st->joincopychunks += chunks;
+		js->pcopy.chunks += chunks;
 		if (built)
-			st->joincopies++;
+			js->pcopy.copies++;
 		else
 			spilled = false;
 		ok = true;
@@ -614,8 +616,8 @@ lion_join_collect_into(LionCountScanState *st, LionPostingSet *out,
 	if (st->npart > 0)
 	{
 		/* a partitioned fact table's copies are one per partition: summed */
-		st->joinrunfilterrows += (int64) out->ntids;
-		js->filterrows = st->joinrunfilterrows;
+		js->part.runfilterrows += (int64) out->ntids;
+		js->filterrows = js->part.runfilterrows;
 	}
 	else
 		js->filterrows = (int64) out->ntids;
@@ -657,7 +659,7 @@ lion_join_collect(LionCountScanState *st)
 	LionJoinState *js = lion_st_join(st);
 
 	lion_join_collect_into(st, &js->filter, st->outercxt,
-						   st->joinsharedcopy, &st->joinviewshared,
+						   js->pcopy.copy, &js->pcopy.viewshared,
 						   get_hash_memory_limit(), false);
 }
 
@@ -692,7 +694,7 @@ lion_join_maybe_switch(LionCountScanState *st)
 	if (js->batch.walkbegun)
 		lion_lookup_walk_pause(&js->batch.walker);
 	lion_join_collect_into(st, &js->filter, st->outercxt, NULL,
-						   &st->joinviewshared, get_hash_memory_limit(), true);
+						   &js->pcopy.viewshared, get_hash_memory_limit(), true);
 	if (js->filtered)
 	{
 		js->switches++;
@@ -711,7 +713,7 @@ static void
 lion_join_part_maybe_switch(LionCountScanState *st, int p)
 {
 	LionJoinState *js = lion_st_join(st);
-	LionJoinPart *jp = &st->joinpart[p];
+	LionJoinPart *jp = &js->part.leaf[p];
 	Size		limit;
 	Size		held;
 	Size		budget;
@@ -719,7 +721,7 @@ lion_join_part_maybe_switch(LionCountScanState *st, int p)
 	if (!js->mayswitch || js->filtered || jp->buy == 0)
 		return;
 	limit = get_hash_memory_limit();
-	held = MemoryContextMemAllocated(st->joinpartcxt, true);
+	held = MemoryContextMemAllocated(js->part.cxt, true);
 	budget = (held < limit) ? limit - held : 0;
 	if (jp->buy < 0)
 		jp->buy = lion_join_copy_price(st, budget);
@@ -1011,7 +1013,7 @@ lion_join_fill_batch(LionCountScanState *st)
 			ent->key = datumCopy(key, js->keybyval, js->keylen);
 
 			/* a partitioned fact table sorts it for each partition's walk */
-			if (st->joinpart == NULL)
+			if (js->part.leaf == NULL)
 				ent->hash = lion_lookup_walk_hash(&js->batch.walker, ent->key);
 		}
 		ent->tuple = js->sort.unique ? NULL : ExecCopySlotMinimalTuple(slot);
@@ -1023,7 +1025,7 @@ lion_join_fill_batch(LionCountScanState *st)
 	if (n == 0)
 		return false;
 	js->batch.batches++;
-	if (n > 1 && st->joinpart == NULL)
+	if (n > 1 && js->part.leaf == NULL)
 		qsort_arg(js->batch.ent, n, sizeof(LionJoinEnt), lion_join_ent_cmp,
 				  &js->batch.walker);
 	return true;
@@ -1354,14 +1356,14 @@ static void
 lion_join_part_open(LionCountScanState *st, int p)
 {
 	LionJoinState *js = lion_st_join(st);
-	LionJoinPart *jp = &st->joinpart[p];
+	LionJoinPart *jp = &js->part.leaf[p];
 	LionClauseState *jcl = &st->clause[js->clause];
 	MemoryContext oldcxt;
 	int			i;
 
 	lion_open_relation(st, p);
 
-	oldcxt = MemoryContextSwitchTo(st->joinvisitcxt);
+	oldcxt = MemoryContextSwitchTo(js->part.visitcxt);
 	lion_lookup_walk_begin(&js->batch.walker, jcl->idx, jcl->idxcol,
 						   jcl->valtype);
 	MemoryContextSwitchTo(oldcxt);
@@ -1425,7 +1427,7 @@ lion_join_part_open(LionCountScanState *st, int p)
 	if (js->collect)
 	{
 		Size		limit = get_hash_memory_limit();
-		Size		held = MemoryContextMemAllocated(st->joinpartcxt, true);
+		Size		held = MemoryContextMemAllocated(js->part.cxt, true);
 
 		lion_join_collect_into(st, &jp->filter, jp->cxt, jp->shared,
 							   &jp->viewshared,
@@ -1455,7 +1457,7 @@ lion_join_part_close(LionCountScanState *st)
 	js->rentp = &js->rent;
 	js->probedp = &js->probed;
 	lion_close_relation(st);
-	MemoryContextReset(st->joinvisitcxt);
+	MemoryContextReset(js->part.visitcxt);
 }
 
 /*
@@ -1471,7 +1473,7 @@ lion_join_part_sort(LionCountScanState *st)
 	int			k;
 
 	lion_lookup_walk_order(&js->batch.walker, &order);
-	if (lion_walk_order_equal(&order, &st->joinorder))
+	if (lion_walk_order_equal(&order, &js->part.order))
 		return;
 	for (k = 0; k < js->batch.n; k++)
 	{
@@ -1483,7 +1485,7 @@ lion_join_part_sort(LionCountScanState *st)
 	if (js->batch.n > 1)
 		qsort_arg(js->batch.ent, js->batch.n, sizeof(LionJoinEnt),
 				  lion_join_ent_cmp, &js->batch.walker);
-	st->joinorder = order;
+	js->part.order = order;
 }
 
 /*
@@ -1639,9 +1641,9 @@ lion_join_next_parts(LionCountScanState *st, int64 *countp)
 				lion_join_batch_reset(st);
 				return false;
 			}
-			if (st->joinpart != NULL)
+			if (js->part.leaf != NULL)
 			{
-				memset(&st->joinorder, 0, sizeof(st->joinorder));
+				memset(&js->part.order, 0, sizeof(js->part.order));
 				lion_join_count_parts(st);
 			}
 			else
@@ -1954,7 +1956,7 @@ lion_next_join_group(LionCountScanState *st)
 	 * the query's memory, before the first batch is sorted into its order.
 	 * A partition's are its turn's (lion_join_part_open()).
 	 */
-	if (st->joinpart == NULL)
+	if (js->part.leaf == NULL)
 	{
 		LionClauseState *jcl = &st->clause[js->clause];
 
@@ -2008,9 +2010,9 @@ lion_next_join_group(LionCountScanState *st)
 				return NULL;
 			}
 			fg->turn = 0;
-			memset(&st->joinorder, 0, sizeof(st->joinorder));
+			memset(&js->part.order, 0, sizeof(js->part.order));
 		}
-		lion_join_group_turn(st, (st->joinpart != NULL) ? fg->turn : -1);
+		lion_join_group_turn(st, (js->part.leaf != NULL) ? fg->turn : -1);
 		fg->turn++;
 	}
 }
@@ -2062,7 +2064,7 @@ lion_next_join_row(LionCountScanState *st)
 	}
 
 	/* a partitioned fact table: every batch to every partition in turn */
-	if (st->joinpart != NULL)
+	if (js->part.leaf != NULL)
 	{
 		if (js->sort.unique && !js->sort.done)
 			lion_join_sort_keys(st);
