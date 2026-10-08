@@ -1,0 +1,1 @@
+../bm25_serializable.spec

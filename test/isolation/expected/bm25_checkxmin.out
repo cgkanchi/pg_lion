@@ -1,0 +1,39 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s2_begin s2_snap s1_update s1_index s1_check s2_plain s2_sp s2_old s2_back s2_new s2_back s2_commit s3_new
+step s2_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s2_snap: SELECT id, d FROM bm_cx;
+id|d              
+--+---------------
+ 1|'doc':2 'old':1
+(1 row)
+
+step s1_update: UPDATE bm_cx SET d = to_tsvector('simple', 'new doc');
+step s1_index: CREATE INDEX bm_cx_d ON bm_cx USING lion (d) WITH (store_positions = true);
+step s1_check: SELECT indisvalid, indisready, indcheckxmin
+					FROM pg_index WHERE indexrelid = 'bm_cx_d'::regclass;
+indisvalid|indisready|indcheckxmin
+----------+----------+------------
+t         |t         |t           
+(1 row)
+
+step s2_plain: SELECT id FROM bm_cx WHERE d @@ 'old';
+id
+--
+ 1
+(1 row)
+
+step s2_sp: SAVEPOINT p;
+step s2_old: SELECT t.id FROM lion_bm25('bm_cx_d', 'old', 10) s JOIN bm_cx t ON t.ctid = s.ctid;
+ERROR:  cannot rank through index "bm_cx_d" because it was built from a broken HOT chain (indcheckxmin) and cannot be used by this transaction's snapshot
+step s2_back: ROLLBACK TO p;
+step s2_new: SELECT t.id FROM lion_bm25('bm_cx_d', 'new', 10) s JOIN bm_cx t ON t.ctid = s.ctid;
+ERROR:  cannot rank through index "bm_cx_d" because it was built from a broken HOT chain (indcheckxmin) and cannot be used by this transaction's snapshot
+step s2_back: ROLLBACK TO p;
+step s2_commit: COMMIT;
+step s3_new: SELECT t.id, t.d FROM lion_bm25('bm_cx_d', 'new', 10) s JOIN bm_cx t ON t.ctid = s.ctid;
+id|d              
+--+---------------
+ 1|'doc':2 'new':1
+(1 row)
+

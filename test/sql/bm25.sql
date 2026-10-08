@@ -117,7 +117,44 @@ CREATE ROLE bm_nobody;
 SET ROLE bm_nobody;
 SELECT * FROM lion_bm25('bm_docs_d', 'w1', 10);
 RESET ROLE;
+
+-- row-level security: lion_bm25() cannot apply the policies, so it refuses,
+-- as the direct count functions do; the planner path applies them
+GRANT SELECT ON bm_docs TO bm_nobody;
+ALTER TABLE bm_docs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY bm_hide_w1 ON bm_docs FOR SELECT USING (NOT d @@ 'w1');
+SET ROLE bm_nobody;
+SELECT count(*) FROM bm_docs WHERE d @@ 'w1';
+SELECT * FROM lion_bm25('bm_docs_d', 'w1', 10);
+SELECT count(*) FROM (SELECT id FROM bm_docs WHERE d @@ 'w1'
+	ORDER BY lion_bm25_score(d, 'w1', 'bm_docs_d') DESC LIMIT 10) x;
+RESET ROLE;
+DROP POLICY bm_hide_w1 ON bm_docs;
+ALTER TABLE bm_docs DISABLE ROW LEVEL SECURITY;
+REVOKE SELECT ON bm_docs FROM bm_nobody;
 DROP ROLE bm_nobody;
+
+-- lion_bm25_score() with arguments that change from row to row keeps only
+-- what the latest ones prepared: memory does not grow with the rows
+CREATE FUNCTION bm_score_growth(vary bool) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE
+	before int8;
+	after int8;
+	s float8;
+BEGIN
+	FOR i IN 1..10 LOOP
+		s := lion_bm25_score('w1'::tsvector, 'w1', 'bm_docs_d', 1 + i / 10000.0);
+	END LOOP;
+	SELECT sum(total_bytes) INTO before FROM pg_backend_memory_contexts;
+	FOR i IN 1..10000 LOOP
+		s := lion_bm25_score('w1'::tsvector, 'w1', 'bm_docs_d',
+							 CASE WHEN vary THEN 1 + i / 10000.0 ELSE 1.2 END);
+	END LOOP;
+	SELECT sum(total_bytes) INTO after FROM pg_backend_memory_contexts;
+	RETURN after - before < 512 * 1024;
+END $$;
+SELECT bm_score_growth(false) AS constant_ok, bm_score_growth(true) AS varying_ok;
+DROP FUNCTION bm_score_growth(bool);
 
 DROP TABLE bm_docs;
 DROP FUNCTION bm_same(tsquery, text[], int, float8, float8);
