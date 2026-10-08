@@ -371,7 +371,7 @@ query come from a covering B-tree instead, §40), no INCLUDE columns, no
 parallel scan (a parallel build is supported from PostgreSQL 17), no reclaim of an emptied directory leaf or of an emptied posting-tree leaf
 (both wait for the whole set or the whole index to go). Inserts serialise on the directory
 leaf that holds the key; see the measured
-[write costs](BENCHMARKS.md#writes-and-maintenance-5m-rows). Count pushdown supports constants, parameters
+[write costs](BENCHMARKS.md#size-build-and-writes-5m-rows-all-seven-indexes). Count pushdown supports constants, parameters
 and stable expressions such as `now() - interval '30 days'` or `current_date - 30` (evaluated once
 per execution; a volatile one like `random()` goes to the ordinary plan) on any indexed column, enum
 columns included, a boolean column tested by itself (`flag`, `NOT flag`, `flag IS TRUE`, `flag IS

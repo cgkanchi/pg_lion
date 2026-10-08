@@ -1,196 +1,155 @@
 # pg_lion benchmarks
 
-> **These measurements are from 2026-09-24 and are out of date for full-text search and ordered
-> retrieval.** They predate stored positions (exact phrase, weight and NOT queries), BM25 ranking,
-> `LionOrdered`/`LionBtreeScan` and NARROW containers, so the "Where Lion loses" rows for phrases and
-> ordered `LIMIT` no longer describe the current code. The count and grouping results still apply. A
-> fresh run is pending.
+Relative speeds from a synthetic benchmark. Absolute times depend on the machine; the ratios are what
+to take away. "5× faster" means the other index took five times as long as lion.
 
-Measured on **2026-09-24 (UTC), PostgreSQL 18.6, commit `118f623`**, using the
-[focused benchmark](../bench/comprehensive/README.md): **1M and 5M scalar rows, 200k documents,
-286 exact-result checks and 858 timings**, all passing. The run took **394.0 seconds
-(6m 34s)** including cluster setup and shutdown; extension compilation and report generation
-are separate. [Full report](../bench/results/2026-09-24-118f623-pg18-focused/REPORT.md) · [HTML](../bench/results/2026-09-24-118f623-pg18-focused/index.html) ·
-[CSV](../bench/results/2026-09-24-118f623-pg18-focused/summary.csv) · [Audit](../bench/results/2026-09-24-118f623-pg18-focused/AUDIT.json).
+**Setup.** The extension at `6bf193b` (the run itself is recorded as `85c991c`, the same code plus this
+benchmark's own changes), PostgreSQL 16.15 (Ubuntu release build), 4 vCPUs, 16 GB RAM. Lion
+preloaded, so its indexes use lion's own WAL format. Shared buffers 512 MB, `work_mem` 64 MB,
+parallel query and JIT off, warm cache. Each query is the median of three timed runs after one
+warmup, measured as EXPLAIN ANALYZE execution time. Every result is checked against a sequential
+scan, and all 394 checks passed. The default planner chooses the plan.
 
-At 5M rows, Lion's clean dense count is **90.0× faster** than B-tree,
-200-group aggregation is **23.8× faster**, and the 1,000-value IN count is
-**2.5× faster**. Range-count pushdown now wins too: **0.663 ms versus B-tree's
-1.629 ms (2.5×)**. Tiny equality probes are at practical parity. Keep B-tree for
-ordered retrieval and GIN for phrase/prefix search; dirty pages and build/write costs
-still matter.
+**Data.** The scalar table has 5M rows (1M-row results are in the full report and tell the same
+story) and one single-column index per column: B-tree, GIN (`btree_gin`) or lion. Columns hold 2,
+20, 200, 20,000 and 1M distinct values, plus a skewed column (90% one value) and a column that is
+10% NULL. The documents table has 200k rows with a `text[]` and a `tsvector`, indexed by GIN or lion
+(`store_positions = true`).
 
-## Setup and interpretation
+Full report: [REPORT.md](../bench/results/2026-10-08-85c991c-pg16-focused/REPORT.md) ·
+[HTML](../bench/results/2026-10-08-85c991c-pg16-focused/index.html) ·
+[CSV](../bench/results/2026-10-08-85c991c-pg16-focused/summary.csv).
 
-Release PostgreSQL 18.6 (`-O2`, assertions off), AMD Ryzen 7 5700X3D, 16 logical CPUs, WSL2;
-512 MB shared buffers and 64 MB work_mem. Durability is enabled; parallel query, JIT and autovacuum
-are disabled. Lion is preloaded and uses its **custom WAL resource manager**. Each query has one
-warmup and three timed rounds. Tables show median EXPLAIN execution time in **milliseconds**;
-planning is separate. Three samples characterize a progress run, not statistical equivalence.
-Warm means no deliberate cache eviction, not that every page fits in shared buffers.
-[Environment and build provenance](../bench/results/2026-09-24-118f623-pg18-focused/metadata.json) · [Archived source](../bench/results/2026-09-24-118f623-pg18-focused/source.tar.gz).
+## Counts (5M rows, vacuumed)
 
-Each scalar portfolio has **seven** single-column indexes: `c2`, `c20`, `c200`, `c20k`, `c1m`,
-`skew`, and `nullable`. Documents have `tags` and `tsv` indexes. GIN uses `btree_gin` for scalars
-with `fastupdate=on`. Lion and **Lion (pushdown off)** share the same `USING lion` indexes;
-their artifact labels are `roaring` and `roaring_bitmap`. The tables use the default planner:
-**† marks an actual sequential scan**, not index performance. The report also contains forced-index
-and 64 kB work_mem diagnostics.
-
-## Where Lion wins: counts and grouping
-
-Clean measurements follow VACUUM FREEZE. Speedups are competitor median divided by Lion median,
-computed before rounding; higher is better for Lion. A dash means B-tree has no matching document
-measurement. Ratios include any sequential fallbacks marked †.
-
-| Dataset | Query / state | B-tree ms | GIN ms | Lion ms | Speedup vs B-tree / GIN |
-| --- | --- | --- | --- | --- | --- |
-| 1M scalar | Count ~50% / clean | 30.464 | 80.748 | 0.350 | 87.0× / 230.7× |
-| 1M scalar | Count ~0.5% / clean | 0.334 | 3.095 | 0.028 | 11.9× / 110.5× |
-| 1M scalar | Two equality predicates / clean | 2.619 | 31.742 | 0.362 | 7.2× / 87.7× |
-| 1M scalar | 1,000-value IN / clean | 3.327 | 18.954 | 1.608 | 2.1× / 11.8× |
-| 1M scalar | Count per 200 groups / clean | 79.972 | 139.114 † | 3.648 | 21.9× / 38.1× |
-| 1M scalar | Count `c20k BETWEEN 100 AND 199` / clean | 0.304 | 37.070 | 0.190 | 1.6× / 195.1× |
-| 5M scalar | Count ~50% / clean | 157.028 | 665.041 | 1.744 | 90.0× / 381.3× |
-| 5M scalar | Count ~0.5% / clean | 1.612 | 18.097 | 0.095 | 17.0× / 190.5× |
-| 5M scalar | Two equality predicates / clean | 16.380 | 171.158 | 1.778 | 9.2× / 96.3× |
-| 5M scalar | 1,000-value IN / clean | 17.107 | 373.333 | 6.736 | 2.5× / 55.4× |
-| 5M scalar | Count per 200 groups / clean | 405.735 | 1,045.313 † | 17.074 | 23.8× / 61.2× |
-| 5M scalar | Count `c20k BETWEEN 100 AND 199` / clean | 1.629 | 428.312 | 0.663 | 2.5× / 646.0× |
-| 200k documents | Array contains `t1` | — | 4.045 | 0.024 | — / 168.5× |
-| 200k documents | Array contains `t1` and `t17` | — | 0.820 | 0.125 | — / 6.6× |
-| 200k documents | Array overlaps three tags | — | 6.449 | 0.227 | — / 28.4× |
-| 200k documents | Full-text `w1 & w17` count | — | 0.952 | 0.118 | — / 8.1× |
-
-These gains apply to the supported count shapes, not arbitrary aggregates or retrieving every match.
-The same Lion indexes with count pushdown disabled show the difference:
-
-| 5M-row query / clean | Lion ms | Lion, pushdown off ms |
+| Query | Lion vs B-tree | Lion vs GIN |
 | --- | --- | --- |
-| Count ~50% | 1.744 | 509.001 |
-| Two equality predicates | 1.778 | 46.238 |
-| Count per 200 groups | 17.074 | 1,059.507 † |
-| Range count | 0.663 | 152.083 |
+| Count a value in 50% of rows | 536× faster | 2,805× faster |
+| Count the hot value of a skewed column (90%) | 452× faster | 902× faster |
+| Count a value in 0.5% of rows | 12× faster | 353× faster |
+| Count a value in 0.005% of rows | 1.8× faster | 23× faster |
+| Count a value of a 1M-value column | 1.7× faster | 4× faster |
+| Two equality filters ANDed | 39× faster | 215× faster |
+| Three selective equality filters ANDed | 24× faster | 34× faster |
+| Two `IN` lists ANDed | 27× faster | 43× faster |
+| Two columns ORed | 438× faster | 440× faster |
+| `IN` list of 10 values | 2.1× faster | 61× faster |
+| `IN` list of 1,000 values | 3.8× faster | 48× faster |
+| `IS NULL` (10% of rows) | 70× faster | 995× faster |
+| Range over 100 of 20,000 values | 1.9× faster | 517× faster |
 
-The range count is an aggregate-pushdown gain: with pushdown off,
-Lion's bitmap range count takes **152.083 ms**, versus B-tree's **1.629 ms** index-only
-scan. Do not generalize the count result to fetching the matching rows. Small changes in
-other cases are not established improvements from three timing rounds.
+## GROUP BY (5M rows, vacuumed)
 
-## Dirty data: the visibility-map trade-off
+| Query | Lion vs B-tree | Lion vs GIN |
+| --- | --- | --- |
+| Count per group, 2 groups | 368× faster | 733× faster |
+| Count per group, 200 groups | 16× faster | 34× faster |
+| Count per group, 20 groups, with a filter | 2.4× faster | 3.3× faster |
 
-After scattered payload updates to 1% of rows and ANALYZE, without VACUUM, Lion must check
-visibility in the heap for affected pages. That 1% is a row fraction, not a heap-page fraction;
-the [raw operations](../bench/results/2026-09-24-118f623-pg18-focused/operations.jsonl) record actual all-visible coverage.
+## Unvacuumed tables (5M rows)
 
-| Dataset | Query / state | B-tree ms | GIN ms | Lion ms | Speedup vs B-tree / GIN |
-| --- | --- | --- | --- | --- | --- |
-| 5M scalar | Count ~50% / dirty | 711.865 | 829.709 | 81.315 | 8.8× / 10.2× |
-| 5M scalar | Count ~0.5% / dirty | 5.940 | 61.288 | 5.608 | 1.1× / 10.9× |
-| 5M scalar | Two equality predicates / dirty | 18.284 | 171.558 | 3.962 | 4.6× / 43.3× |
-| 5M scalar | Count per 200 groups / dirty | 925.271 † | 962.271 † | 283.387 | 3.3× / 3.4× |
+The same counts after updating 1% of rows, scattered, without a VACUUM. Lion has to check the
+affected pages in the heap, so its lead shrinks. It doesn't disappear.
 
-Vacuum cadence and update distribution matter: do not apply the clean-data speedups to a frequently
-updated table. The dirty 0.5%-selectivity count is effectively at parity with B-tree here
-(5.608 versus 5.940 ms), despite its large clean-data advantage. The suite also checks results
-after indexed writes, deletes, and VACUUM.
+| Query | Lion vs B-tree | Lion vs GIN |
+| --- | --- | --- |
+| Count a value in 50% of rows | 5.1× faster | 5.6× faster |
+| Count a value in 0.5% of rows | 1.1× faster | 2.6× faster |
+| Two equality filters ANDed | 7.2× faster | 26× faster |
+| Count per group, 200 groups | 1.9× faster | 1.9× faster |
 
-## Where it is at practical parity: tiny probes and fetching rows
+## Fetching rows (5M rows, vacuumed)
 
-Selective equality counts finish in tens of microseconds for both B-tree and Lion. The absolute
-gap is too small to justify an additional index on these three samples alone. Fetching payloads
-requires heap access and does not benefit from count pushdown.
+Queries that read the matching rows (`sum(id), sum(length(payload))`), so every index has to visit
+the heap. Lion is a little faster, because its bitmaps are cheaper to combine.
 
-| Dataset | Query / state | B-tree ms | GIN ms | Lion ms |
-| --- | --- | --- | --- | --- |
-| 1M scalar | Count ~0.005% | 0.020 | 0.056 | 0.013 |
-| 5M scalar | Count ~0.005% | 0.034 | 0.975 | 0.017 |
-| 5M scalar | Rare equality (up to 1M keys) | 0.035 | 0.382 | 0.019 |
-| 1M scalar | Sum ID/payload length for `c200=17` | 3.445 | 3.482 | 3.053 |
-| 5M scalar | Sum ID/payload length for `c200=17` | 14.828 | 57.216 | 16.280 |
-| 200k documents | Sum ID/payload length for full-text `w1` | — | 4.179 | 4.325 |
+| Query | Lion vs B-tree | Lion vs GIN |
+| --- | --- | --- |
+| One rare value (a few rows) | 1.3–1.8× faster | 1.5–1.8× faster |
+| A value in 0.5% of rows | 1.1× faster | 1.9× faster |
+| A value in 5% of rows | 1.4× faster | 1.4× faster |
+| Two or three filters ANDed | 1.4–1.5× faster | 2.2–2.3× faster |
 
-“Practical parity” means similar scale or no demonstrated useful advantage, not statistical
-equivalence. Heap-fetch results are cache-sensitive, especially at 5M rows; differences between
-Lion and pushdown-off executions of the same bitmap plan are not a count-pushdown benefit.
+## Ordered queries with LIMIT (5M rows, vacuumed)
 
-## Where Lion loses: ordering, phrase and prefix search
+| Query | Lion vs B-tree |
+| --- | --- |
+| `WHERE a = .. AND b = .. ORDER BY c LIMIT 10` (0.25% match) | 6.6–9.6× faster |
+| `WHERE b = .. ORDER BY c LIMIT 10` (50% match) | about the same |
+| `WHERE c >= .. ORDER BY c LIMIT 100` on one column | **17× slower** |
 
-| Dataset | Query / state | B-tree ms | GIN ms | Lion ms |
-| --- | --- | --- | --- | --- |
-| 5M scalar | Ordered LIMIT 100 | 0.021 | 720.948 † | 857.024 † |
-| 200k documents | Phrase `common <-> w1` | — | 6.997 | 32.481 † |
-| 200k documents | Prefix `rare12:*` | — | 1.552 | 25.077 † |
+Lion walks the `ORDER BY` column's index in order and skips rows its filter rules out
+(`LionOrdered`). A B-tree's index-only scan on the one column wins the last case: keep a B-tree for
+plain "first N by this column".
 
-Lion does not provide ordered row retrieval and stores no full-text positions or sorted lexemes
-for phrase/prefix pruning. These queries use sequential fallbacks here. Keep B-tree for ordered
-retrieval and GIN for richer full-text search. The report additionally includes skew,
-OR/IN intersections, selective three-predicate AND, NULL counts, and low-memory cases.
-FK-side join pushdown is not timed by this benchmark.
-[Exact SQL and workload manifest](../bench/results/2026-09-24-118f623-pg18-focused/queries.json).
+## Arrays and full-text search (200k documents, vacuumed)
 
-## Build time and index storage
+| Query | Lion vs GIN |
+| --- | --- |
+| Count `tags @> '{t1}'` (5% of rows) | 218× faster |
+| Count `tags @> '{t1,t17}'` | 10× faster |
+| Count `tags && '{t1,t17,t123}'` | 83× faster |
+| Count `tsv @@ 'common'` (nearly every row) | 748× faster |
+| Count `tsv @@ 'w1 & w17'` | 9.5× faster |
+| Count `tsv @@ '(w1 \| w2) & (w17 \| w18)'` | 17× faster |
+| Count a rare word | 2.4× faster |
+| Count a phrase, `common <-> w1` | 3.9× faster |
+| Count a weight, `w1:D` | 21× faster |
+| Count a NOT, `common & !w1` | 4.8× faster |
+| Count a prefix, `rare12:*` | **12× slower** |
+| Fetch the rows matching `w1` | 1.1× faster |
 
-One build per index; times are summed across each portfolio and sizes are measured before mutations.
-Scalar portfolios contain seven indexes and documents two. Pushdown changes neither construction
-nor storage. These are portfolio totals: high-cardinality columns can change the space trade-off,
-and Lion is not smaller for every distribution.
+Lion answers prefix queries by checking every row, so GIN wins them.
 
-At 5M rows, Lion uses about **25% less space than B-tree** and **23% more than GIN**;
-at 1M, it uses about **15% more than either**. Its scalar build takes roughly **2.8–2.9×**
-the B-tree time. The additional high-cardinality and skew indexes matter to these totals.
+## Ranked search: top 10 by score
 
-These runs predate NARROW containers (DESIGN.md §38). A dense container is now a NARROW bitmap
-only as wide as its heap pages' offsets - 520 bytes for pages of at most 63 rows, 1032 for 127, and
-so on to 2568 for the 291 an 8 kB page can hold - where it was a 4104-byte bitset. On synthetic
-tables of 1M rows, a two-valued column went from 15.34, 11.40 and 9.31 bits a row to 3.28, 2.49
-and 3.41 at 136, 185 and 226 rows a page, and its counts and GROUP BYs became about twice as fast;
-at 65 rows a page, 2M rows went from 30.93 to 4.65 bits a row (GIN: 8.91), with counts and GROUP
-BYs 2.8 to 4 times faster. Columns whose containers are arrays or runs are unchanged.
+Top 10 rows for an OR of words, over 500k synthetic documents of 20–200 words from a Zipf-like
+50,000-word vocabulary ([script](../bench/ranking/run.py),
+[results](../bench/results/2026-10-08-ranking/RESULTS.md)). GIN finds every match, scores it with
+`ts_rank` and sorts. Lion's `LionBm25` scan scores from the index and skips rows that can't reach
+the top 10.
 
-| Dataset | Family | Build seconds | Index MiB |
+| Query | Matches | Lion BM25 vs GIN + ts_rank |
+| --- | --- | --- |
+| One common word and two rare words | 492,031 | 39× faster |
+| Two mid-frequency words | 32,934 | 27× faster |
+| Three common words | 499,985 | 11× faster |
+| Two rare words | 584 | **3.7× slower** |
+| Two rare words ANDed | 18 | about the same |
+
+With only a few hundred matches, scoring them all is cheaper than lion's ranked walk, but the
+planner still picks the walk. Set `pg_lion.enable_bm25_scan = off` for queries you know are this
+selective.
+
+## Size, build and writes (5M rows, all seven indexes)
+
+| | B-tree | GIN | Lion |
 | --- | --- | --- | --- |
-| 1M scalar | B-tree | 1.692 | 58.984 |
-| 1M scalar | GIN | 2.000 | 58.680 |
-| 1M scalar | Lion | 4.656 | 67.797 |
-| 5M scalar | B-tree | 8.958 | 256.289 |
-| 5M scalar | GIN | 7.622 | 156.961 |
-| 5M scalar | Lion | 25.723 | 192.484 |
-| 200k documents | GIN | 0.304 | 6.375 |
-| 200k documents | Lion | 1.732 | 7.672 |
+| Index size | 256 MiB | 157 MiB | 180 MiB |
+| Build time | 16.7 s | 25.9 s | 16.0 s |
+| Insert 50k rows | 1.3 s, 120 MiB WAL | 0.6 s, 61 MiB WAL | 1.9 s, 177 MiB WAL |
+| Update an indexed column in 50k rows | 2.2 s, 132 MiB WAL | 1.0 s, 71 MiB WAL | 2.3 s, 202 MiB WAL |
+| Delete 50k rows | 1.4 s | 1.6 s | 1.6 s |
+| VACUUM | 4.0 s | 4.0 s | 4.3 s |
 
-## Writes and maintenance: 5M rows
+Lion is 30% smaller than B-tree and 15% larger than GIN here, and builds as fast as B-tree.
+Inserts are about 1.4× slower than B-tree and write about 1.5× the WAL. GIN's writes look cheap
+because it defers work to its pending list.
 
-Each portfolio inserts 50k rows, updates `c200` in 50k existing rows, deletes rows where
-`id % 100 = 1`, then runs VACUUM ANALYZE. A checkpoint precedes each operation. Cells show
-**wall time in ms / WAL in MiB**, including all seven indexes. These are single observations;
-GIN's fast updates defer work, so include its VACUUM/drain cost.
-
-| Operation | B-tree ms / MiB | GIN ms / MiB | Lion ms / MiB |
-| --- | --- | --- | --- |
-| INSERT | 983.2 / 119.58 | 344.6 / 61.37 | 1,228.0 / 176.91 |
-| Indexed UPDATE | 2,533.0 / 138.53 | 756.4 / 77.89 | 1,675.6 / 209.36 |
-| DELETE | 1,871.6 / 366.12 | 1,007.5 / 366.12 | 1,139.8 / 366.12 |
-| VACUUM ANALYZE | 3,439.5 / 634.38 | 3,554.4 / 587.33 | 3,750.8 / 569.33 |
-
-This run uses Lion's custom WAL manager. The suite does not measure sustained concurrent-write
-throughput.
-
-Here Lion's insert is **1.25× slower than B-tree**, while its indexed UPDATE takes about
-**0.66× the time**; both generate roughly **1.5× the WAL**. GIN's insert/update steps are faster
-than Lion's, before its deferred work is drained. Lion's VACUUM is slower than both B-tree
-and GIN in this run.
+On the documents table, lion's `tsvector` index with positions is 2.8× the size of GIN's
+(12.0 vs 4.3 MiB). Lion's `text[]` index is 1.3× the size of GIN's.
 
 ## Reproducing
 
-Build/install against the desired release PostgreSQL version, then:
+Install pg_lion into a release PostgreSQL build, then:
 
 ```sh
-python3 bench/comprehensive/run.py --prefix /path/to/postgresql --preload \
-  --output bench/results/my-focused-run
-python3 bench/comprehensive/report.py bench/results/my-focused-run
-python3 bench/comprehensive/audit.py bench/results/my-focused-run
+python3 bench/comprehensive/run.py --prefix /path/to/postgresql --preload --output bench/results/my-run
+python3 bench/comprehensive/report.py bench/results/my-run      # needs matplotlib
+python3 bench/comprehensive/audit.py bench/results/my-run
+python3 bench/ranking/run.py --dsn 'dbname=rank' --docs 500000 # needs pg_lion in that database
 ```
 
-The defaults retain 1M/5M rows and 200k documents. See the [focused suite documentation](../bench/comprehensive/README.md)
-for coverage and `--profile full`; [quick.py](../bench/QUICK.md) remains the smaller progress check.
+The suite runs its own temporary cluster and must run as a non-root user. On a 4-vCPU machine it
+takes about 11 minutes, and the ranking script about 4. See
+[bench/comprehensive/README.md](../bench/comprehensive/README.md) for options.

@@ -33,7 +33,7 @@ them. The on-disk format may still change. Don't put data you can't rebuild behi
 | Range counts on a column with many distinct values (timestamps, ids) | Lion `WITH (summaries = auto)` |
 | Array membership and full-text search, especially counts | Lion. Add `store_positions = true` for phrases and ranking. |
 | Full-text prefix search (`foo:*`) | GIN for now. Lion falls back to checking every row. |
-| Fetching a few rows by key, uniqueness | B-tree |
+| Unique constraints, or `ORDER BY col LIMIT n` on a single column | B-tree |
 | Returning many filtered rows in order | A covering B-tree, which lion can filter as it walks it (see below) |
 | Write-heavy tables | Measure first. Lion inserts are slower and write more WAL than B-tree. |
 
@@ -174,10 +174,11 @@ columns and can be built in parallel on PostgreSQL 17 and later.
 
 - No `ORDER BY` from the index itself, no unique indexes, no `INCLUDE` columns, no parallel scans.
   Use a covering B-tree for ordered or row-returning queries, as shown above.
-- Inserts are slower than B-tree and write more WAL. Index builds take about three times as long as
-  B-tree's.
+- Inserts are about 1.4× slower than B-tree and write about 1.5× the WAL.
+- A plain `ORDER BY col LIMIT n` on one column is faster with a B-tree.
 - Full-text prefix queries (`foo:*`) recheck every row. GIN is the better choice for them.
-- BM25 slows down when every query term is very common.
+- BM25 top-k is slower than GIN + `ts_rank` when a query matches only a few hundred rows, and slows
+  down when every query term is very common.
 - The count pushdown doesn't use expression indexes (for example, lion on `(data->>'key')`).
 - On a hot standby, indexes using the default (generic) WAL mode recheck every row in counts.
   Preloading the library avoids this.
@@ -186,20 +187,29 @@ The [full list](docs/REFERENCE.md#known-limitations) has the details.
 
 ## Performance
 
-The last full benchmark (2026-09-24, PostgreSQL 18, 5M rows, vacuumed) measured, against B-tree:
+Relative speeds on a synthetic benchmark (5M rows, vacuumed, warm cache). "10×" means the other
+index took ten times as long as lion.
 
-| Query | B-tree | Lion |
+| Query | Lion vs B-tree | Lion vs GIN |
 | --- | --- | --- |
-| Count of a value matching ~50% of rows | 157 ms | 1.7 ms |
-| Count with two equality filters | 16 ms | 1.8 ms |
-| Count per group, 200 groups | 406 ms | 17 ms |
-| Count of a small range | 1.6 ms | 0.7 ms |
-| Count of a value matching ~0.005% of rows | 0.03 ms | 0.02 ms |
+| Count a value in 50% of rows | 536× faster | 2,805× faster |
+| Count a value in 0.5% of rows | 12× faster | 353× faster |
+| Count a very rare value | 1.7–1.8× faster | 4–23× faster |
+| Two equality filters ANDed | 39× faster | 215× faster |
+| Count per group, 200 groups | 16× faster | 34× faster |
+| Count a small range | 1.9× faster | 517× faster |
+| The same counts, 1% of rows updated, no VACUUM | 1.1–7× faster | 1.9–26× faster |
+| Fetch the matching rows | 1.1–1.8× faster | 1.4–2.3× faster |
+| Two filters, `ORDER BY` another column, `LIMIT 10` | 7–10× faster | |
+| `WHERE c >= .. ORDER BY c LIMIT 100` | 17× slower | |
+| Full-text counts: AND/OR, phrase, weight, NOT | | 2.4–750× faster |
+| Full-text prefix (`foo:*`) | | 12× slower |
+| Top 10 by BM25 vs `ts_rank`, tens of thousands of matches or more | | 11–39× faster |
+| Top 10 by BM25 vs `ts_rank`, a few hundred matches | | 3.7× slower |
 
-After updating 1% of rows without a vacuum, the 50% count took 81 ms (B-tree: 712 ms). That run
-predates stored positions, BM25 and ordered retrieval, so its full-text and ordering results are out
-of date. The [benchmark page](docs/BENCHMARKS.md) has the full tables, the setup, write and build
-costs, and how to reproduce it.
+Index size sits between GIN and B-tree, builds are as fast as B-tree, and inserts are about 1.4×
+slower than B-tree with 1.5× the WAL. The [benchmark page](docs/BENCHMARKS.md) has every query, the
+setup and how to reproduce it.
 
 ## Documentation
 
