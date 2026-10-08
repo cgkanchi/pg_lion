@@ -31,9 +31,13 @@
 
 #include "access/gin.h"
 #include "access/stratnum.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "tsearch/ts_type.h"
+#include "tsearch/ts_utils.h"
+#include "utils/fmgroids.h"
+#include "utils/pg_crc.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
@@ -42,6 +46,7 @@
 #include "varatt.h"
 
 #include "lion.h"
+#include "lion_count.h"
 
 /*
  * Extracting more keys than this from one query is refused rather than
@@ -457,8 +462,9 @@ lion_extract_internal(LionState *state, Datum value, Datum **keys,
  *	  all rows (`!a` is "every row minus a's"), and the ALL fallback is that
  *	  set anyway;
  *	- OP_PHRASE needs lexeme positions, which the index does not store;
- *	- a prefix lexeme (`foo:*`) matches a RANGE of keys, and entries are
- *	  hashed, so there is no range to walk;
+ *	- a prefix lexeme (`foo:*`) matches a RANGE of keys; by the time a
+ *	  query gets here lion_tsquery_expand_prefixes() has replaced every prefix
+ *	  it could with the OR of its keys, so one left over is past the cap;
  *	- a weight mask (`foo:A`) needs the weights, which the index does not
  *	  store either.
  *
@@ -648,8 +654,8 @@ lion_call_extractquery(LionState *state, Datum query, StrategyNumber strategy,
  * pmatch/nullFlags are only read when extractQuery set them.
  *
  * Anything that is not "the rows are exactly the ones an AND/OR of whole key
- * sets selects" becomes LION_QMODE_ALL: a partial (prefix) match, because the
- * keys are hashed and a range of them cannot be walked; a NULL key, because
+ * sets selects" becomes LION_QMODE_ALL: a partial (prefix) match, which is
+ * only left when lion_tsquery_expand_prefixes() could not expand it; a NULL key, because
  * no row is indexed under one; INCLUDE_EMPTY and ALL, because the rows a
  * multi-key opclass extracted nothing from are not under any key.
  */
@@ -774,7 +780,8 @@ lion_raw_key_unusable(const LionRawQuery *raw, int k)
  *
  *	- a lexeme with a weight mask is the lexeme at any weight;
  *	- a prefix lexeme, or one extractQuery flagged partial or NULL, is every
- *	  row: the keys are hashed and a range of them cannot be walked;
+ *	  row: an expandable prefix was already rewritten into the OR of its keys
+ *	  by lion_tsquery_expand_prefixes(), so one left over is past the cap;
  *	- `!a` is every row: no posting set is the complement of another;
  *	- `a <N> b` is `a & b`: a phrase matches only where both of its operands
  *	  match, at positions the index does not store, and an operand that is
@@ -1121,6 +1128,9 @@ lion_query_posexact(Oid opfamily, Oid lefttype, Oid opno, Datum query,
 	state.multikey = true;
 	state.collation = collation;
 	fmgr_info(proc, &state.extractquery);
+	/* a prefix lexeme as the lexemes the executor will expand it into */
+	if (strategy == LION_STRAT_MATCH)
+		query = lion_tsquery_strip_prefixes(query);
 	result = lion_tsquery_item_keys(&state, query, (StrategyNumber) strategy,
 									&itemkeys);
 	MemoryContextSwitchTo(oldcxt);
@@ -1218,4 +1228,290 @@ lion_posmember_from_key(LionPosMember *m, uint64 code,
 		n = j;
 	}
 	m->npos = (uint16) n;
+}
+
+
+/* ---------------------------------------------------------------------
+ * Prefix lexemes (DESIGN.md §17, "Prefix lexemes")
+ * --------------------------------------------------------------------- */
+
+/*
+ * Does the tsquery have a prefix operand (`foo:*`)?
+ */
+bool
+lion_tsquery_has_prefix(Datum query)
+{
+	TSQuery		tsq = DatumGetTSQuery(query);
+	QueryItem  *items = GETQUERY(tsq);
+	int32		i;
+
+	for (i = 0; i < tsq->size; i++)
+	{
+		if (items[i].type == QI_VAL && items[i].qoperand.prefix)
+			return true;
+	}
+	return false;
+}
+
+/* A QI_VAL node for the lexeme word[0 .. len), at weight. */
+static QTNode *
+lion_qtn_lexeme(const char *word, int len, uint8 weight)
+{
+	QTNode	   *n = (QTNode *) palloc0(sizeof(QTNode));
+	pg_crc32	crc;
+
+	n->valnode = (QueryItem *) palloc0(sizeof(QueryItem));
+	n->valnode->qoperand.type = QI_VAL;
+	n->valnode->qoperand.weight = weight;
+	n->valnode->qoperand.prefix = false;
+	n->valnode->qoperand.length = len;
+	INIT_LEGACY_CRC32(crc);
+	COMP_LEGACY_CRC32(crc, word, len);
+	FIN_LEGACY_CRC32(crc);
+	n->valnode->qoperand.valcrc = (int32) crc;
+	n->word = (char *) palloc(len + 1);
+	memcpy(n->word, word, len);
+	n->word[len] = '\0';
+	n->sign = ((uint32) 1) << (((unsigned int) crc) % 32);
+	return n;
+}
+
+/* The OR of nodes[0 .. n), as a balanced tree of binary ORs. */
+static QTNode *
+lion_qtn_or(QTNode **nodes, int n)
+{
+	QTNode	   *o;
+	int			half;
+
+	if (n == 1)
+		return nodes[0];
+	half = n / 2;
+	o = (QTNode *) palloc0(sizeof(QTNode));
+	o->valnode = (QueryItem *) palloc0(sizeof(QueryItem));
+	o->valnode->qoperator.type = QI_OPR;
+	o->valnode->qoperator.oper = OP_OR;
+	o->nchild = 2;
+	o->child = (QTNode **) palloc(sizeof(QTNode *) * 2);
+	o->child[0] = lion_qtn_or(nodes, half);
+	o->child[1] = lion_qtn_or(nodes + half, n - half);
+	o->sign = o->child[0]->sign | o->child[1]->sign;
+	return o;
+}
+
+/*
+ * The keys of a text column that start with prefix[0 .. plen), as text
+ * Datums in *keys, from a walk of the directory from the prefix up: the
+ * column is ordered by bttextcmp() under C (lion_state.c), which is byte
+ * order, so they are one run and the first key past it ends the walk.
+ * Returns the number found, or -1 once there are more than max of them, or
+ * when the walk cannot be bounded by the prefix.
+ */
+static int
+lion_prefix_keys(Relation index, LionState *col, const char *prefix,
+				 int plen, int max, Datum **keys)
+{
+	LionRange	range;
+	LionEntryScan es;
+	int			n = 0;
+	int			cap = 16;
+
+	lion_range_init(&range, index, (AttrNumber) col->attno);
+	/* the bound is a key of the column's own (text) type: InvalidOid says so */
+	lion_range_add(&range, index, LION_STRAT_GE, F_TEXT_GE, InvalidOid,
+				   PointerGetDatum(cstring_to_text_with_len(prefix, plen)),
+				   false, C_COLLATION_OID);
+	if (!range.ordered)
+		return -1;
+
+	*keys = (Datum *) palloc(sizeof(Datum) * cap);
+	lion_entry_scan_begin_range(&es, index, (AttrNumber) col->attno, &range);
+	for (;;)
+	{
+		Datum		key;
+		LionPostingSet ps;
+		text	   *t;
+		bool		inside;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!lion_entry_scan_next(&es, &key, &ps))
+			break;
+		if (ps.keyisnull)
+		{
+			lion_posting_set_release(&ps);
+			continue;
+		}
+		t = DatumGetTextPP(key);
+		inside = (int) VARSIZE_ANY_EXHDR(t) >= plen &&
+			memcmp(VARDATA_ANY(t), prefix, plen) == 0;
+		lion_posting_set_release(&ps);
+		if (!inside)
+			break;
+		if (n >= max)
+		{
+			n = -1;
+			break;
+		}
+		if (n >= cap)
+		{
+			cap *= 2;
+			*keys = (Datum *) repalloc(*keys, sizeof(Datum) * cap);
+		}
+		(*keys)[n++] = PointerGetDatum(t);
+	}
+	lion_entry_scan_end(&es);
+	return n;
+}
+
+/*
+ * Rewrite the prefix operands of a QTNode tree in place; *budget is how many
+ * more lexemes the query may grow to.  False when one cannot be expanded.
+ */
+static bool
+lion_qtn_expand(Relation index, LionState *col, QTNode *node, int *budget)
+{
+	int			i;
+
+	check_stack_depth();
+
+	if (node->valnode->type == QI_OPR)
+	{
+		for (i = 0; i < node->nchild; i++)
+		{
+			if (!lion_qtn_expand(index, col, node->child[i], budget))
+				return false;
+		}
+		return true;
+	}
+
+	if (node->valnode->qoperand.prefix)
+	{
+		QueryOperand *op = &node->valnode->qoperand;
+		Datum	   *keys = NULL;
+		QTNode	  **leaves;
+		QTNode	   *repl;
+		int			n;
+
+		n = lion_prefix_keys(index, col, node->word, op->length,
+							 *budget + 1, &keys);
+		if (n < 0)
+			return false;
+
+		if (n == 0)
+		{
+			/*
+			 * No lexeme in the index starts with it, so no row does: the
+			 * lexeme itself, which no row has either, answers the same.
+			 */
+			repl = lion_qtn_lexeme(node->word, op->length, op->weight);
+		}
+		else
+		{
+			*budget -= n - 1;
+			if (*budget < 0)
+				return false;
+			leaves = (QTNode **) palloc(sizeof(QTNode *) * n);
+			for (i = 0; i < n; i++)
+			{
+				text	   *t = DatumGetTextPP(keys[i]);
+
+				leaves[i] = lion_qtn_lexeme(VARDATA_ANY(t),
+											VARSIZE_ANY_EXHDR(t),
+											op->weight);
+			}
+			repl = lion_qtn_or(leaves, n);
+		}
+		*node = *repl;
+	}
+	return true;
+}
+
+/*
+ * Rewrite every prefix operand `foo:*` of a tsquery into the OR of the
+ * lexemes the index holds that start with foo, keeping its weight mask:
+ * `foo:*A` is `(foo1:A | foo2:A ...)`, also inside a phrase or under a NOT,
+ * where an OR operand means exactly what the prefix did.
+ *
+ * Every row the caller's snapshot can see is indexed under each of its
+ * lexemes, by an insert that happened before that row's transaction
+ * committed, and so before this walk: a lexeme a visible row has is a key
+ * here.  The rewritten query therefore selects exactly the rows the original
+ * does, among the rows the caller can see.  Keys of rows the caller cannot
+ * see may be found too, and only make the query longer.
+ *
+ * *expanded is false, and the query is returned as it was, when the column
+ * is not one whose keys are byte strings in byte order, or when the query
+ * would grow past LION_MAX_QUERY_KEYS lexemes; the caller then answers the
+ * prefix the way it did before, by every row and a recheck.
+ */
+Datum
+lion_tsquery_expand_prefixes(Relation index, LionState *col, Datum query,
+							 bool *expanded)
+{
+	TSQuery		tsq = DatumGetTSQuery(query);
+	QueryItem  *items = GETQUERY(tsq);
+	QTNode	   *root;
+	int			budget;
+	int			nvals = 0;
+	int32		i;
+
+	*expanded = true;
+	if (!lion_tsquery_has_prefix(query))
+		return query;
+
+	if (!col->multikey || !col->ordered || col->typid != TEXTOID ||
+		col->collation != C_COLLATION_OID)
+	{
+		*expanded = false;
+		return query;
+	}
+
+	for (i = 0; i < tsq->size; i++)
+	{
+		if (items[i].type == QI_VAL)
+			nvals++;
+	}
+	budget = LION_MAX_QUERY_KEYS - nvals;
+	if (budget < 0)
+	{
+		*expanded = false;
+		return query;
+	}
+
+	root = QT2QTN(items, GETOPERAND(tsq));
+	if (!lion_qtn_expand(index, col, root, &budget))
+	{
+		*expanded = false;
+		return query;
+	}
+	return PointerGetDatum(QTN2QT(root));
+}
+
+/*
+ * The planner's stand-in for lion_tsquery_expand_prefixes(), which needs the
+ * index: each `foo:*` becomes the lexeme `foo` at the same weight.  The OR
+ * the executor will put in its place combines like one lexeme, so the
+ * question "how do the key sets answer this query" has the same answer for
+ * both, except when the expansion turns out too long, which the executor
+ * handles (it answers the original query by a recheck).
+ */
+Datum
+lion_tsquery_strip_prefixes(Datum query)
+{
+	TSQuery		tsq;
+	TSQuery		out;
+	QueryItem  *items;
+	int32		i;
+
+	if (!lion_tsquery_has_prefix(query))
+		return query;
+	tsq = DatumGetTSQuery(query);
+	out = (TSQuery) palloc(VARSIZE(tsq));
+	memcpy(out, tsq, VARSIZE(tsq));
+	items = GETQUERY(out);
+	for (i = 0; i < out->size; i++)
+	{
+		if (items[i].type == QI_VAL)
+			items[i].qoperand.prefix = false;
+	}
+	return PointerGetDatum(out);
 }

@@ -1103,11 +1103,10 @@ SELECT * FROM lion_bs_run($$SELECT id, k FROM bst WHERE tsv @@ 'w3:*'::tsquery O
  ->  Custom Scan (LionOrdered) on bst
  Ordered By: bst_k (index only)
  Index Entries Walked: 19
- Lion Set Hits: 19
- Heap Fetches: 19
- Rows Removed by Lion Recheck: 14
- Lion Set: 3 containers, rechecked
-(7 rows)
+ Lion Set Hits: 5
+ Heap Fetches: 0
+ Lion Set: 3 containers, exact
+(6 rows)
 
 SELECT lion_bs($$SELECT id, k FROM bst WHERE tsv @@ '!w3'::tsquery ORDER BY k LIMIT 5$$, true);
             lion_bs             
@@ -1140,16 +1139,15 @@ SELECT lion_bs($$SELECT id, k FROM bst WHERE tsv @@ 'w3:*'::tsquery AND k > 3000
 (1 row)
 
 SELECT * FROM lion_bs_run($$SELECT id, k FROM bst WHERE tsv @@ 'w3:*'::tsquery AND k > 30000 ORDER BY k$$);
-            lion_bs_run            
------------------------------------
+           lion_bs_run            
+----------------------------------
  Custom Scan (LionOrdered) on bst
  Ordered By: bst_k (index only)
  Index Entries Walked: 20
  Lion Set Hits: 20
  Heap Fetches: 20
- Rows Removed by Lion Recheck: 0
- Lion Set: 3 containers, rechecked
-(7 rows)
+ Lion Set: 3 containers, exact
+(6 rows)
 
 ROLLBACK;
 DROP TABLE bst;
