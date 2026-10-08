@@ -133,9 +133,15 @@ SELECT otr_same('EXECUTE otr_pad(3)',
 	'SELECT id, k, pad FROM otr WHERE a = 3 AND b = 4 ORDER BY k, id');
 
 -- 7. ... and gives up when the members' rows do not fit in work_mem, while
---    hash_mem still holds the visited bitmaps: the walk goes on to the end
+--    hash_mem still holds the visited bitmaps: the walk goes on to the end.
+--    In 64kB the rows kept pass work_mem before 1,024 members are fetched;
+--    in 256kB the first 1,024 foretell that the 2,738 would not fit, and the
+--    rest are not fetched
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 8;
+SELECT * FROM otr_run('EXECUTE otr_pad(3)');
+SET work_mem = '256kB';
+SET hash_mem_multiplier = 2;
 SELECT * FROM otr_run('EXECUTE otr_pad(3)');
 SELECT otr_same('EXECUTE otr_pad(3)',
 	'SELECT id, k, pad FROM otr WHERE a = 3 AND b = 4 ORDER BY k, id');
