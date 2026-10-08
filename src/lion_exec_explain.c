@@ -1090,8 +1090,8 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 	 * entry of k without a GROUP BY, one per group and one per (g, k) pair
 	 * with one (DESIGN.md §26).
 	 */
-	if (st->distattno != 0)
-		ExplainPropertyInteger("Distinct Keys Tested", NULL, st->disttests,
+	if (st->dist != NULL)
+		ExplainPropertyInteger("Distinct Keys Tested", NULL, st->dist->tests,
 							   es);
 
 	/*

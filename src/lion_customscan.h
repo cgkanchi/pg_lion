@@ -1439,6 +1439,50 @@ typedef struct LionListBatch
 } LionListBatch;
 
 /*
+ * The nested loop of a two-column GROUP BY (DESIGN.md §20), and of the (g, k)
+ * pairs of a count(DISTINCT k) per group (§26).  The outer index's entries
+ * drive the scan exactly as a single group column's do; the inner index's
+ * KEYS are read once per relation into innercxt - key and isnull, nkey of
+ * them - and each pair's inner posting set is located afresh, because a
+ * located set holds a buffer pin and there must be no pin per distinct inner
+ * value (DESIGN.md §9).  next is the next inner key of the current outer
+ * group.  When the keys do not fit the work_mem budget key is NULL and the
+ * inner index's entry scan, escan, is walked once per outer group instead,
+ * which needs no memory at all; scanning says it is begun.  outeropen says
+ * groupset holds the current outer group, whose key is outerkey.
+ */
+typedef struct LionInnerState
+{
+	Datum	   *key;
+	bool	   *isnull;
+	int			nkey;
+	int			next;
+	bool		outeropen;
+	Datum		outerkey;
+	bool		outerisnull;
+	LionEntryScan escan;
+	bool		scanning;
+} LionInnerState;
+
+/*
+ * count(DISTINCT k) (DESIGN.md §26).  full says a test has to COUNT rather
+ * than stop at the first visible row, because the target list wants rows as
+ * well: without a GROUP BY any other count does (the total is the sum over
+ * k's entries), with one only count(k) does - count(*) and count(g) need the
+ * GROUP's count, which is groupcount.  count and colcount are the finished
+ * group's count(DISTINCT k) and count(k), read by lion_emit_tuple(), and
+ * tests is what EXPLAIN ANALYZE reports as "Distinct Keys Tested".
+ */
+typedef struct LionDistinctState
+{
+	bool		full;
+	bool		groupcount;
+	int64		count;
+	int64		colcount;
+	int64		tests;
+} LionDistinctState;
+
+/*
  * A lion column whose entries the aggregates of DESIGN.md §37 are taken
  * over, and one of those aggregates.
  */
@@ -1560,23 +1604,12 @@ typedef struct LionCountScanState
 	 * innerattno is the heap column of groupidx2 in either use - the second
 	 * grouping column of §20, or k - and is what everything that reads the
 	 * inner index asks, while groupattno2 keeps meaning "a second GROUP BY
-	 * column".
-	 *
-	 * distfull says a test has to COUNT rather than stop at the first visible
-	 * row, because the target list wants rows as well: without a GROUP BY any
-	 * other count does (the total is the sum over k's entries), with one only
-	 * count(k) does - count(*) and count(g) need the GROUP's count, which is
-	 * distgroupcount.  distcount and distcolcount are the finished group's
-	 * count(DISTINCT k) and count(k), read by lion_emit_tuple(), and
-	 * disttests is what EXPLAIN ANALYZE reports as "Distinct Keys Tested".
+	 * column".  dist is the walk's state, or NULL when distattno is 0
+	 * (lion_st_dist()).
 	 */
 	AttrNumber	distattno;
 	AttrNumber	innerattno;
-	bool		distfull;
-	bool		distgroupcount;
-	int64		distcount;
-	int64		distcolcount;
-	int64		disttests;
+	struct LionDistinctState *dist;
 
 	/*
 	 * GROUP BY coalesce(g, c) (DESIGN.md §10), or NULL when the plan groups
@@ -1700,26 +1733,13 @@ typedef struct LionCountScanState
 	LionEntryScan escan;
 
 	/*
-	 * The nested loop of a two-column GROUP BY (DESIGN.md §20).  The outer
-	 * index's entries drive the scan exactly as a single group column's do;
-	 * the inner index's KEYS are read once per relation into innercxt and
-	 * each pair's inner posting set is located afresh, because a located set
-	 * holds a buffer pin and there must be no pin per distinct inner value
-	 * (DESIGN.md §9).  When the keys do not fit the work_mem budget innerkey
-	 * is NULL and the inner index's entry scan is walked once per outer group
-	 * instead, which needs no memory at all.
+	 * The nested loop of a two-column GROUP BY (DESIGN.md §20) or of the
+	 * (g, k) pairs of a count(DISTINCT k) per group (§26), or NULL when
+	 * innerattno is 0 (lion_st_inner()).
 	 */
-	Datum	   *innerkey;
-	bool	   *innerisnull;
-	int			ninnerkey;
-	int			inneridx;		/* next inner key of the current outer group */
-	bool		outeropen;		/* groupset holds the current outer group */
+	struct LionInnerState *inner;
 	bool		wherepinned;	/* WHERE sets may hold pins (since the last
 								 * lion_locate_where()) */
-	Datum		outerkey;
-	bool		outerisnull;
-	LionEntryScan escan2;		/* the innerkey == NULL fallback */
-	bool		scanning2;
 
 	/*
 	 * A WHERE item that the DRIVER makes redundant, because the entries of a
@@ -2193,6 +2213,22 @@ lion_st_wagg(LionCountScanState *st)
 {
 	Assert(st->wagg != NULL);
 	return st->wagg;
+}
+
+/* The nested loop's state, which only an inner index has (§20, §26) */
+static inline LionInnerState *
+lion_st_inner(LionCountScanState *st)
+{
+	Assert(st->inner != NULL);
+	return st->inner;
+}
+
+/* count(DISTINCT k)'s state, which only a plan with one has (§26) */
+static inline LionDistinctState *
+lion_st_dist(LionCountScanState *st)
+{
+	Assert(st->dist != NULL);
+	return st->dist;
 }
 
 /* A long IN list's batches, which only a count of one row per relation has */

@@ -30,6 +30,24 @@ lion_coal_reset(LionCountScanState *st)
 }
 
 /*
+ * The nested loop of DESIGN.md §20 and §26 between outer groups: the inner
+ * index's walk, if one is begun, ended, and no outer group open - the caller
+ * releases groupset, which held it.
+ */
+static void
+lion_inner_reset(LionCountScanState *st)
+{
+	if (st->inner == NULL)
+		return;
+	if (st->inner->scanning)
+	{
+		lion_entry_scan_end(&st->inner->escan);
+		st->inner->scanning = false;
+	}
+	st->inner->outeropen = false;
+}
+
+/*
  * Walk one partition without a group key: its turn, in which it is the
  * relation counted - its clauses located, it counted, and everything it
  * located let go of again (DESIGN.md §16).
@@ -183,11 +201,11 @@ lion_pause_run(LionCountScanState *st)
 {
 	if (st->scanning)
 		lion_entry_scan_pause(&st->escan);
-	if (st->scanning2)
-		lion_entry_scan_pause(&st->escan2);
+	if (st->inner != NULL && st->inner->scanning)
+		lion_entry_scan_pause(&st->inner->escan);
 
 	lion_unpin_where(st);
-	if (st->outeropen)
+	if (st->inner != NULL && st->inner->outeropen)
 		lion_posting_set_unpin(&st->groupset);
 
 	/*
@@ -241,14 +259,9 @@ lion_finish_run(LionCountScanState *st)
 		lion_entry_scan_end(&st->escan);
 		st->scanning = false;
 	}
-	if (st->scanning2)
-	{
-		lion_entry_scan_end(&st->escan2);
-		st->scanning2 = false;
-	}
+	lion_inner_reset(st);
 	lion_posting_set_release(&st->groupset);
 	lion_posting_set_release(&st->groupset2);
-	st->outeropen = false;
 	lion_decode_reset(st);
 	lion_join_batch_reset(st);
 	lion_release_where(st);
@@ -372,8 +385,11 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		 * a count(DISTINCT k) without a GROUP BY (DESIGN.md §26) - unless the
 		 * planner folded a GROUP BY to one group, which does not exist then.
 		 */
-		st->distcount = 0;
-		st->distcolcount = 0;
+		if (st->dist != NULL)
+		{
+			st->dist->count = 0;
+			st->dist->colcount = 0;
+		}
 		Assert((st->mode == LION_MODE_SUM || st->mode == LION_MODE_DISTINCT) ==
 			   (st->sumall || (st->distattno != 0 && st->groupattno == 0)));
 		if ((st->mode == LION_MODE_SUM || st->mode == LION_MODE_DISTINCT) &&
@@ -495,15 +511,11 @@ lion_reset_run(LionCountScanState *st)
 		lion_entry_scan_end(&st->escan);
 		st->scanning = false;
 	}
-	if (st->scanning2)
-	{
-		lion_entry_scan_end(&st->escan2);
-		st->scanning2 = false;
-	}
+	lion_inner_reset(st);
+	if (st->inner != NULL)
+		st->inner->next = 0;
 	lion_posting_set_release(&st->groupset);
 	lion_posting_set_release(&st->groupset2);
-	st->outeropen = false;
-	st->inneridx = 0;
 	lion_coal_reset(st);
 	lion_decode_reset(st);
 	lion_release_where(st);
@@ -1039,9 +1051,12 @@ lion_end_custom_scan(CustomScanState *node)
 		MemoryContextDelete(st->innercxt);
 		st->innercxt = NULL;
 	}
-	st->innerkey = NULL;
-	st->innerisnull = NULL;
-	st->ninnerkey = 0;
+	if (st->inner != NULL)
+	{
+		st->inner->key = NULL;
+		st->inner->isnull = NULL;
+		st->inner->nkey = 0;
+	}
 	if (st->wherecxt != NULL)
 	{
 		MemoryContextDelete(st->wherecxt);

@@ -1986,7 +1986,7 @@ lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
  * pair's inner set is located, counted and released inside pergroup, so at
  * most two group pins exist at a time however many distinct values either
  * column has.  The inner keys were read once per relation into innercxt
- * (lion_load_inner_keys()); when they did not fit its budget, innerkey is
+ * (lion_load_inner_keys()); when they did not fit its budget, inner->key is
  * NULL and the inner index's entry scan is walked once per outer group
  * instead, which holds one pin at a time as well.  The WHERE items are
  * collected once per relation when that pays (lion_group_count()), and the
@@ -2003,6 +2003,7 @@ lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
 static TupleTableSlot *
 lion_next_group2(LionCountScanState *st, bool *exhausted)
 {
+	LionInnerState *inner = lion_st_inner(st);
 	MemoryContext oldcxt;
 
 	*exhausted = false;
@@ -2017,30 +2018,31 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 		CHECK_FOR_INTERRUPTS();
 
 		/* ---- the outer group ---- */
-		if (!st->outeropen)
+		if (!inner->outeropen)
 		{
 			MemoryContextReset(st->outercxt);
 			oldcxt = MemoryContextSwitchTo(st->outercxt);
-			if (!lion_entry_scan_next(&st->escan, &st->outerkey, &st->groupset))
+			if (!lion_entry_scan_next(&st->escan, &inner->outerkey,
+									  &st->groupset))
 			{
 				MemoryContextSwitchTo(oldcxt);
 				*exhausted = true;
 				return NULL;
 			}
 			MemoryContextSwitchTo(oldcxt);
-			st->outerisnull = st->groupset.keyisnull;
-			st->outeropen = true;
-			st->inneridx = 0;
+			inner->outerisnull = st->groupset.keyisnull;
+			inner->outeropen = true;
+			inner->next = 0;
 		}
 
 		/* ---- the fallback: the inner index's walk, per outer group ---- */
-		if (st->innerkey == NULL && !st->scanning2)
+		if (inner->key == NULL && !inner->scanning)
 		{
 			oldcxt = MemoryContextSwitchTo(st->css.ss.ps.state->es_query_cxt);
-			lion_entry_scan_begin_col(&st->escan2, st->groupidx2,
+			lion_entry_scan_begin_col(&inner->escan, st->groupidx2,
 									 st->groupidxcol2);
 			MemoryContextSwitchTo(oldcxt);
-			st->scanning2 = true;
+			inner->scanning = true;
 		}
 
 		/*
@@ -2053,21 +2055,21 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 		oldcxt = MemoryContextSwitchTo(st->pergroup);
 
 		/* ---- the next inner group of it ---- */
-		if (st->innerkey != NULL)
+		if (inner->key != NULL)
 		{
-			int			i = st->inneridx;
+			int			i = inner->next;
 
-			if (i >= st->ninnerkey)
+			if (i >= inner->nkey)
 			{
 				MemoryContextSwitchTo(oldcxt);
 				lion_posting_set_release(&st->groupset);
-				st->outeropen = false;
+				inner->outeropen = false;
 				continue;
 			}
-			st->inneridx++;
+			inner->next++;
 
-			ikey = st->innerkey[i];
-			ikeyisnull = st->innerisnull[i];
+			ikey = inner->key[i];
+			ikeyisnull = inner->isnull[i];
 			if (ikeyisnull)
 				(void) lion_posting_set_lookup_null_col(st->groupidx2,
 													   st->groupidxcol2,
@@ -2079,14 +2081,14 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 		}
 		else
 		{
-			Assert(st->scanning2);
-			if (!lion_entry_scan_next(&st->escan2, &ikey, &st->groupset2))
+			Assert(inner->scanning);
+			if (!lion_entry_scan_next(&inner->escan, &ikey, &st->groupset2))
 			{
 				MemoryContextSwitchTo(oldcxt);
-				lion_entry_scan_end(&st->escan2);
-				st->scanning2 = false;
+				lion_entry_scan_end(&inner->escan);
+				inner->scanning = false;
 				lion_posting_set_release(&st->groupset);
-				st->outeropen = false;
+				inner->outeropen = false;
 				continue;
 			}
 			ikeyisnull = st->groupset2.keyisnull;
@@ -2097,8 +2099,8 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 		 * counted against the copy; another inner key, or another outer entry
 		 * in hand, is another count to come.
 		 */
-		more = (st->innerkey != NULL) ? (st->inneridx < st->ninnerkey) :
-			(lion_entry_scan_batch_left(&st->escan2) > 0);
+		more = (inner->key != NULL) ? (inner->next < inner->nkey) :
+			(lion_entry_scan_batch_left(&inner->escan) > 0);
 		more = more || lion_entry_scan_batch_left(&st->escan) > 0;
 		count = lion_group_count(st, st->nsource, st->sources, st->nitem,
 								 Min(st->groupset.ntids, st->groupset2.ntids),
@@ -2110,7 +2112,7 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 		if (count == 0)
 			continue;
 
-		return lion_emit_tuple(st, st->outerkey, st->outerisnull,
+		return lion_emit_tuple(st, inner->outerkey, inner->outerisnull,
 							  ikey, ikeyisnull, count);
 	}
 }
@@ -2127,7 +2129,7 @@ static int64
 lion_distinct_test(LionCountScanState *st, int nsource,
 				   LionCountSource *sources, bool count)
 {
-	st->disttests++;
+	lion_st_dist(st)->tests++;
 	return lion_node_count(st, nsource, sources, !count);
 }
 
@@ -2159,6 +2161,7 @@ lion_distinct_test(LionCountScanState *st, int nsource,
 TupleTableSlot *
 lion_distinct_relation(LionCountScanState *st)
 {
+	LionDistinctState *dist = lion_st_dist(st);
 	LionCountSource *sources;
 	MemoryContext oldcxt;
 	int			nsource;
@@ -2236,12 +2239,12 @@ lion_distinct_relation(LionCountScanState *st)
 			 * says `k IS NOT NULL` (st->sumallitem), which excludes exactly
 			 * them.
 			 */
-			if (st->distfull && st->sumallitem < 0)
+			if (dist->full && st->sumallitem < 0)
 				total += lion_distinct_test(st, nsource, sources, true);
 		}
 		else
 		{
-			n = lion_distinct_test(st, nsource, sources, st->distfull);
+			n = lion_distinct_test(st, nsource, sources, dist->full);
 			if (n > 0)
 			{
 				ndistinct++;
@@ -2285,8 +2288,8 @@ lion_distinct_relation(LionCountScanState *st)
 	if (st->singlegroup && !found)
 		return NULL;
 
-	st->distcount = ndistinct;
-	st->distcolcount = nonnull;
+	dist->count = ndistinct;
+	dist->colcount = nonnull;
 	return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, total);
 }
 
@@ -2311,6 +2314,8 @@ lion_distinct_relation(LionCountScanState *st)
 static TupleTableSlot *
 lion_next_group_distinct(LionCountScanState *st, bool *exhausted)
 {
+	LionInnerState *inner = lion_st_inner(st);
+	LionDistinctState *dist = lion_st_dist(st);
 	MemoryContext oldcxt;
 
 	*exhausted = false;
@@ -2327,50 +2332,50 @@ lion_next_group_distinct(LionCountScanState *st, bool *exhausted)
 		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
 		MemoryContextReset(st->outercxt);
 		oldcxt = MemoryContextSwitchTo(st->outercxt);
-		if (!lion_entry_scan_next(&st->escan, &st->outerkey, &st->groupset))
+		if (!lion_entry_scan_next(&st->escan, &inner->outerkey, &st->groupset))
 		{
 			MemoryContextSwitchTo(oldcxt);
 			*exhausted = true;
 			return NULL;
 		}
 		MemoryContextSwitchTo(oldcxt);
-		st->outerisnull = st->groupset.keyisnull;
-		st->outeropen = true;
+		inner->outerisnull = st->groupset.keyisnull;
+		inner->outeropen = true;
 
 		/* ---- the group: slot 0 and the WHERE items, not the inner slot ---- */
 		MemoryContextReset(st->pergroup);
 		oldcxt = MemoryContextSwitchTo(st->pergroup);
 		count = lion_distinct_test(st, st->nsource - 1, st->sources,
-								   st->distgroupcount);
+								   dist->groupcount);
 		MemoryContextSwitchTo(oldcxt);
 		if (count == 0)
 		{
 			lion_posting_set_release(&st->groupset);
-			st->outeropen = false;
+			inner->outeropen = false;
 			continue;
 		}
 
 		/* ---- every non-NULL key of k ---- */
-		if (st->innerkey != NULL)
+		if (inner->key != NULL)
 		{
 			int			i;
 
-			for (i = 0; i < st->ninnerkey; i++)
+			for (i = 0; i < inner->nkey; i++)
 			{
 				int64		n;
 
 				CHECK_FOR_INTERRUPTS();
-				if (st->innerisnull[i])
+				if (inner->isnull[i])
 					continue;
 
 				MemoryContextReset(st->pergroup);
 				oldcxt = MemoryContextSwitchTo(st->pergroup);
 				(void) lion_posting_set_lookup_col(st->groupidx2,
 												   st->groupidxcol2,
-												   st->innerkey[i], InvalidOid,
+												   inner->key[i], InvalidOid,
 												   &st->groupset2);
 				n = lion_distinct_test(st, st->nsource, st->sources,
-									   st->distfull);
+									   dist->full);
 				lion_posting_set_release(&st->groupset2);
 				MemoryContextSwitchTo(oldcxt);
 
@@ -2383,9 +2388,9 @@ lion_next_group_distinct(LionCountScanState *st, bool *exhausted)
 		}
 		else
 		{
-			lion_entry_scan_begin_col(&st->escan2, st->groupidx2,
+			lion_entry_scan_begin_col(&inner->escan, st->groupidx2,
 									 st->groupidxcol2);
-			st->scanning2 = true;
+			inner->scanning = true;
 			for (;;)
 			{
 				Datum		ikey;
@@ -2394,7 +2399,8 @@ lion_next_group_distinct(LionCountScanState *st, bool *exhausted)
 				CHECK_FOR_INTERRUPTS();
 				MemoryContextReset(st->pergroup);
 				oldcxt = MemoryContextSwitchTo(st->pergroup);
-				if (!lion_entry_scan_next(&st->escan2, &ikey, &st->groupset2))
+				if (!lion_entry_scan_next(&inner->escan, &ikey,
+										  &st->groupset2))
 				{
 					MemoryContextSwitchTo(oldcxt);
 					break;
@@ -2402,7 +2408,7 @@ lion_next_group_distinct(LionCountScanState *st, bool *exhausted)
 				n = 0;
 				if (!st->groupset2.keyisnull)
 					n = lion_distinct_test(st, st->nsource, st->sources,
-										   st->distfull);
+										   dist->full);
 				lion_posting_set_release(&st->groupset2);
 				MemoryContextSwitchTo(oldcxt);
 
@@ -2412,16 +2418,16 @@ lion_next_group_distinct(LionCountScanState *st, bool *exhausted)
 					nonnull += n;
 				}
 			}
-			lion_entry_scan_end(&st->escan2);
-			st->scanning2 = false;
+			lion_entry_scan_end(&inner->escan);
+			inner->scanning = false;
 		}
 
 		lion_posting_set_release(&st->groupset);
-		st->outeropen = false;
+		inner->outeropen = false;
 
-		st->distcount = ndistinct;
-		st->distcolcount = nonnull;
-		return lion_emit_tuple(st, st->outerkey, st->outerisnull,
+		dist->count = ndistinct;
+		dist->colcount = nonnull;
+		return lion_emit_tuple(st, inner->outerkey, inner->outerisnull,
 							  (Datum) 0, true, count);
 	}
 }

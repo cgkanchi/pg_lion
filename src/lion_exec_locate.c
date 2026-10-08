@@ -1424,12 +1424,13 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 
 			case LION_TL_COUNT_DISTINCT:
 				/* count(DISTINCT k) of the finished group (DESIGN.md §26) */
-				slot->tts_values[i] = Int64GetDatum(st->distcount);
+				slot->tts_values[i] = Int64GetDatum(lion_st_dist(st)->count);
 				break;
 
 			case LION_TL_COUNT_DISTCOL:
 				/* count(k): the rows of k's non-NULL entries (§26) */
-				slot->tts_values[i] = Int64GetDatum(st->distcolcount);
+				slot->tts_values[i] =
+					Int64GetDatum(lion_st_dist(st)->colcount);
 				break;
 
 			default:
