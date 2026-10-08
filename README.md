@@ -187,25 +187,26 @@ The [full list](docs/REFERENCE.md#known-limitations) has the details.
 
 ## Performance
 
-Relative speeds on a synthetic benchmark (5M rows, vacuumed, warm cache). "10×" means the other
-index took ten times as long as lion.
+Query execution times on a synthetic benchmark (5M rows unless noted, vacuumed, warm cache, 4 vCPUs,
+PostgreSQL 16), with how lion compares. "lion 10× faster" means the other index took ten times as long.
 
-| Query | Lion vs B-tree | Lion vs GIN |
-| --- | --- | --- |
-| Count a value in 50% of rows | 536× faster | 2,805× faster |
-| Count a value in 0.5% of rows | 12× faster | 353× faster |
-| Count a very rare value | 1.7–1.8× faster | 4–23× faster |
-| Two equality filters ANDed | 39× faster | 215× faster |
-| Count per group, 200 groups | 16× faster | 34× faster |
-| Count a small range | 1.9× faster | 517× faster |
-| The same counts, 1% of rows updated, no VACUUM | 1.1–7× faster | 1.9–26× faster |
-| Fetch the matching rows | 1.1–1.8× faster | 1.4–2.3× faster |
-| Two filters, `ORDER BY` another column, `LIMIT 10` | 7–10× faster | |
-| `WHERE c >= .. ORDER BY c LIMIT 100` | 17× slower | |
-| Full-text counts: AND/OR, phrase, weight, NOT | | 2.4–750× faster |
-| Full-text prefix (`foo:*`) | | 12× slower |
-| Top 10 by BM25 vs `ts_rank`, tens of thousands of matches or more | | 11–39× faster |
-| Top 10 by BM25 vs `ts_rank`, a few hundred matches | | 3.7× slower |
+| Query | Lion | B-tree | GIN |
+| --- | --- | --- | --- |
+| Count a value in 50% of rows | 0.37 ms | 196 ms (lion 536× faster) | 1,027 ms (lion 2,805× faster) |
+| Count a value in 0.5% of rows | 0.17 ms | 1.98 ms (lion 12× faster) | 58.9 ms (lion 353× faster) |
+| Count a value in 0.005% of rows | 0.038 ms | 0.070 ms (lion 1.8× faster) | 0.87 ms (lion 23× faster) |
+| Two equality filters ANDed | 1.07 ms | 41.3 ms (lion 39× faster) | 231 ms (lion 215× faster) |
+| Count per group, 200 groups | 35.0 ms | 563 ms (lion 16× faster) | 1,188 ms (lion 34× faster) |
+| Count a small range | 1.05 ms | 1.97 ms (lion 1.9× faster) | 544 ms (lion 517× faster) |
+| Count a value in 50% of rows, 1% of rows updated, no VACUUM | 172 ms | 875 ms (lion 5.1× faster) | 969 ms (lion 5.6× faster) |
+| Fetch the rows matching two filters | 17.8 ms | 25.9 ms (lion 1.5× faster) | 39.4 ms (lion 2.2× faster) |
+| Two filters, `ORDER BY` another column, `LIMIT 10` | 1.81 ms | 17.4 ms (lion 9.6× faster) |  |
+| `WHERE c >= .. ORDER BY c LIMIT 100` | 0.52 ms | 0.031 ms (lion **17× slower**) |  |
+| Full-text count, `'w1 & w17'` (200k docs) | 0.14 ms |  | 1.28 ms (lion 9.5× faster) |
+| Full-text count, phrase `'common <-> w1'` | 3.59 ms |  | 14.1 ms (lion 3.9× faster) |
+| Full-text count, prefix `'rare12:*'` | 41.2 ms |  | 3.32 ms (lion **12× slower**) |
+| Top 10 by BM25 vs `ts_rank`, 33k matches (500k docs) | 9.0 ms | | 244 ms (lion 27× faster) |
+| Top 10 by BM25 vs `ts_rank`, 584 matches | 6.3 ms | | 1.7 ms (lion **3.7× slower**) |
 
 Index size sits between GIN and B-tree, builds are as fast as B-tree, and inserts are about 1.4×
 slower than B-tree with 1.5× the WAL. The [benchmark page](docs/BENCHMARKS.md) has every query, the
