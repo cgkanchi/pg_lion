@@ -8,13 +8,13 @@ SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
 CREATE EXTENSION IF NOT EXISTS lion_hooktest;
 SELECT lion_hooktest_priv_decode('plan') AS nclause;
- nclause
+ nclause 
 ---------
        1
 (1 row)
 
 SELECT lion_hooktest_priv_decode('path') AS nclause;
- nclause
+ nclause 
 ---------
        1
 (1 row)
