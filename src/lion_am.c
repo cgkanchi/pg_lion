@@ -50,6 +50,7 @@
 #include "utils/typcache.h"
 
 #include "lion.h"
+#include "lion_bm25.h"
 #include "lion_costs.h"
 #include "lion_count.h"
 
@@ -393,6 +394,12 @@ _PG_init(void)
 	 * and the set_rel_pathlist_hook that offers it, chained like the other.
 	 */
 	lion_ordered_init();
+
+	/*
+	 * The LionBm25 CustomScan (DESIGN.md §17, "Ranking"): ORDER BY
+	 * lion_bm25_score(...) DESC from the index.
+	 */
+	lion_bm25_scan_init();
 
 	/*
 	 * The endpoint probe (DESIGN.md §28): the statistics hook through which

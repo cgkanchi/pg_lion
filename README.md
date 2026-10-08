@@ -527,6 +527,22 @@ engine, the statistics count deleted rows until VACUUM removes them, and a backe
 row length it read until the row count moves by more than 1/64. Rows that cannot reach the top `k`
 are skipped (MaxScore), so a very common lexeme next to rarer ones costs little.
 
+`lion_bm25_score(tsv, query, index [, k1, b])` is the same score for one row, from its tsvector and
+the index's statistics. Ordered by it, with a `WHERE` that matches on the same column, the planner
+returns the rows best first straight from the index (a `LionBm25` scan) instead of scoring and
+sorting every match:
+
+    SELECT d.*, lion_bm25_score(d.tsv, 'cat | dog', 'doc_tsv_idx') AS score
+      FROM doc d
+     WHERE d.tsv @@ 'cat | dog'
+     ORDER BY lion_bm25_score(d.tsv, 'cat | dog', 'doc_tsv_idx') DESC
+     LIMIT 10;
+
+The scan is offered when the query and index are constants and every row the `WHERE`'s tsquery can
+match has one of the scored lexemes - the usual case of the same query in both places. Other
+`WHERE` clauses filter its rows, and a second sort key is an incremental sort above it. Anywhere
+else, the function scores row by row. `pg_lion.enable_bm25_scan` turns the scan off.
+
 Without positions, everything a plain AND/OR of key sets cannot express is rechecked in the heap. A
 NULL element and a tsquery phrase, weight or `a & !b` are answered from the rows of their keys (the
 other elements, the phrase's lexemes, `a`), then rechecked, in counts and scans alike. `<@`, `@> '{}'`, a bare `!a` and `foo:*` fall back to scanning
@@ -643,6 +659,9 @@ working around a bad choice:
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot
   catch up (DESIGN.md §36). Off, every group is counted.
+- `pg_lion.enable_bm25_scan`: offer `LionBm25` for `ORDER BY lion_bm25_score(col, query, index)
+  DESC` with a `WHERE col @@ ...` it covers: the rows best first from the index's BM25 walk
+  (DESIGN.md §17, "Ranking"). Off, every match is scored and sorted.
 - `pg_lion.enable_plain_scan`: let the planner use plain and index-only scans of Lion indexes
   (`amgettuple`, DESIGN.md §29). Off, Lion indexes are planned for bitmap scans only, as GIN
   indexes are, and every other index's scans are unaffected - where `enable_indexscan = off` would

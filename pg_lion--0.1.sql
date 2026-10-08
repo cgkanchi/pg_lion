@@ -511,6 +511,23 @@ CREATE FUNCTION lion_bm25(index regclass, query tsquery, k int,
 	RETURNS SETOF record
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED ROWS 10;
 
+/*
+ * The score lion_bm25() would give one row, from its tsvector and the
+ * index's statistics.  Ordered by it, with the rows matching a query on the
+ * same column, a LionBm25 scan returns them best first from the index
+ * (lion_bm25_scan.c):
+ *
+ *   SELECT d.*, lion_bm25_score(d.tsv, 'cat & dog', 'doc_tsv_idx') AS score
+ *     FROM doc d
+ *    WHERE d.tsv @@ 'cat & dog'
+ *    ORDER BY lion_bm25_score(d.tsv, 'cat & dog', 'doc_tsv_idx') DESC
+ *    LIMIT 10;
+ */
+CREATE FUNCTION lion_bm25_score(doc tsvector, query tsquery, index regclass,
+								k1 float8 DEFAULT 1.2, b float8 DEFAULT 0.75)
+	RETURNS float8
+	AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE PARALLEL SAFE COST 10;
+
 /* ---------------------------------------------------------------------
  * count functions (lion_count.c)
  *
