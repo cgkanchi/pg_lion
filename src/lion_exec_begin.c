@@ -12,6 +12,7 @@
 #include "postgres.h"
 
 #include "lion_customscan.h"
+#include "lion_plan_private.h"
 
 static const CustomExecMethods lion_count_exec_methods = {
 	.CustomName = "LionCount",
@@ -679,160 +680,62 @@ lion_close_relation(LionCountScanState *st)
  * table, which EXPLAIN does not, so neither does this.
  */
 static void
-lion_check_replaced_execute(List *exec, int eflags)
+lion_check_replaced_execute(const LionCountPriv *priv, int eflags)
 {
 	ListCell   *lc;
 
-	if (exec == NIL || !IsA(exec, List) || list_length(exec) != 3)
-		elog(ERROR, "LionCount: malformed EXECUTE list");
-
-	foreach(lc, (List *) lsecond(exec))
+	foreach(lc, priv->exec_funcs)
 		lion_check_execute(lfirst_oid(lc));
 	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
 	{
-		foreach(lc, (List *) lthird(exec))
+		foreach(lc, priv->exec_groupfuncs)
 			lion_check_execute(lfirst_oid(lc));
 	}
-	foreach(lc, (List *) linitial(exec))
+	foreach(lc, priv->exec_aggs)
 		lion_check_aggregate_execute(lfirst_oid(lc));
 }
 
 /*
- * The members of custom_private - and custom_exprs - that the phases of
- * lion_begin_custom_scan() read, once lion_begin_decode() has taken them out
- * of their positions.
- */
-typedef struct LionBeginPrivate
-{
-	List	   *oids;
-	List	   *ints;
-	List	   *exprs;
-	List	   *ckinds;
-	List	   *partlist;
-	List	   *clauseops;
-	List	   *orlist;
-	List	   *kinds;
-	List	   *dist;
-	List	   *join;
-	List	   *coal;
-} LionBeginPrivate;
-
-/*
- * custom_private is read positionally, so check that it is the list this
- * build writes before reading a single offset of it.  A mismatch means
- * the planner half and the executor half of this file have drifted apart
- * (or a plan from another build has been handed to us); saying so is far
- * better than decoding Oids out of the wrong member.
+ * The plan's Oids, attribute numbers and flags, from custom_private as
+ * lion_count_priv_decode() took it apart (lion_plan_private.h).
  */
 static void
-lion_begin_check_shape(CustomScan *cscan)
+lion_begin_plan(LionCountScanState *st, const LionCountPriv *priv)
 {
-	List	   *shape;
+	st->implied = priv->implied;
+	st->heapoid = priv->heapoid;
+	st->groupidxoid = priv->groupidxoid;
+	st->groupidxoid2 = priv->groupidxoid2;
+	st->scanrelid = priv->scanrelid;
+	st->groupattno = priv->groupattno;
+	st->groupattno2 = priv->groupattno2;
+	st->singlegroup = (priv->flags & LION_FLAG_SINGLEGROUP) != 0;
+	st->sumall = (priv->flags & LION_FLAG_SUMALL) != 0;
+	st->hasgroupidx = (priv->flags & LION_FLAG_GROUPIDX) != 0;
+	st->hasrange = (priv->flags & LION_FLAG_RANGE) != 0;
+	st->nclause = priv->nclause;
+	st->distattno = priv->distattno;
+	st->allattno = priv->allattno;
 
-	shape = (list_length(cscan->custom_private) == LION_PRIV_NMEMBERS) ?
-		(List *) list_nth(cscan->custom_private, LION_PRIV_VERSION) : NIL;
-	if (shape == NIL || !IsA(shape, IntList) || list_length(shape) != 2 ||
-		linitial_int(shape) != LION_PRIV_MAGIC ||
-		lsecond_int(shape) != LION_PRIV_NMEMBERS)
-		elog(ERROR, "LionCount: unrecognized custom_private shape (%d members)",
-			 list_length(cscan->custom_private));
-}
-
-/*
- * Take custom_private apart: the lists the phases below read go into *priv,
- * and the plan's Oids, attribute numbers and flags into the scan state.
- */
-static void
-lion_begin_decode(LionCountScanState *st, CustomScan *cscan,
-				  LionBeginPrivate *priv)
-{
-	int			flags;
-
-	priv->oids = (List *) list_nth(cscan->custom_private, LION_PRIV_OIDS);
-	priv->ints = (List *) list_nth(cscan->custom_private, LION_PRIV_INTS);
-	priv->ckinds = (List *) list_nth(cscan->custom_private,
-									 LION_PRIV_CLAUSEKINDS);
-	priv->exprs = cscan->custom_exprs;
-	priv->partlist = (List *) list_nth(cscan->custom_private,
-									   LION_PRIV_PARTS);
-	priv->clauseops = (List *) list_nth(cscan->custom_private,
-										LION_PRIV_CLAUSEOPS);
-	priv->orlist = (List *) list_nth(cscan->custom_private, LION_PRIV_ORS);
-	priv->dist = (List *) list_nth(cscan->custom_private,
-								   LION_PRIV_DISTINCT);
-	priv->join = (List *) list_nth(cscan->custom_private, LION_PRIV_JOIN);
-	priv->coal = (List *) list_nth(cscan->custom_private,
-								   LION_PRIV_COALESCE);
-	priv->kinds = (List *) list_nth(cscan->custom_private,
-									LION_PRIV_TLKINDS);
-	st->implied = (List *) list_nth(cscan->custom_private, LION_PRIV_IMPLIED);
-
-	st->heapoid = linitial_oid(priv->oids);
-	st->groupidxoid = lsecond_oid(priv->oids);
-	st->groupidxoid2 = lthird_oid(priv->oids);
-	st->scanrelid = (Index) linitial_int(priv->ints);
-	st->groupattno = (AttrNumber) lsecond_int(priv->ints);
-	st->groupattno2 = (AttrNumber) lthird_int(priv->ints);
-	flags = lfourth_int(priv->ints);
-	st->singlegroup = (flags & LION_FLAG_SINGLEGROUP) != 0;
-	st->sumall = (flags & LION_FLAG_SUMALL) != 0;
-	st->hasgroupidx = (flags & LION_FLAG_GROUPIDX) != 0;
-	st->hasrange = (flags & LION_FLAG_RANGE) != 0;
-	st->nclause = list_length(priv->ckinds);
-	st->distattno = (priv->dist != NIL) ?
-		(AttrNumber) linitial_int(priv->dist) : 0;
-	{
-		List	   *all = (List *) list_nth(cscan->custom_private,
-											LION_PRIV_ALLROWS);
-
-		st->allattno = (all != NIL) ? (AttrNumber) linitial_int(all) : 0;
-		if (st->allattno != 0 && !st->sumall)
-			elog(ERROR, "LionCount: a column for every row without a sum");
-	}
-	{
-		List	   *topk = (List *) list_nth(cscan->custom_private,
-											 LION_PRIV_TOPK);
-
-		/*
-		 * The top k by count (DESIGN.md §36) is made of one grouping column
-		 * walked in one table, counted a group at a time.
-		 */
-		st->topkn = 0;
-		if (topk != NIL)
-		{
-			if (list_length(topk) != 3 || linitial_int(topk) <= 0 ||
-				lsecond_int(topk) < linitial_int(topk) ||
-				st->groupattno == 0 || st->groupattno2 != 0 ||
-				st->distattno != 0 || st->sumall || priv->partlist != NIL ||
-				priv->coal != NIL)
-				elog(ERROR, "LionCount: a top k of another shape");
-			st->topkn = linitial_int(topk);
-			st->topkcand = lsecond_int(topk);
-			st->topkstrict = (lthird_int(topk) != 0);
-		}
-	}
+	/*
+	 * The top k by count (DESIGN.md §36) is made of one grouping column
+	 * walked in one table, counted a group at a time.
+	 */
+	st->topkn = priv->topkn;
+	st->topkcand = priv->topkcand;
+	st->topkstrict = priv->topkstrict;
 }
 
 /* GROUP BY coalesce(g, c) (DESIGN.md §10): c and its equality */
 static void
-lion_begin_coalesce(LionCountScanState *st, List *coal, EState *estate)
+lion_begin_coalesce(LionCountScanState *st, const LionCountPriv *priv,
+					EState *estate)
 {
-	if (coal != NIL)
+	if (priv->coalconst != NULL)
 	{
-		List	   *ops;
-
-		if (list_length(coal) != 2 || !IsA(linitial(coal), Const) ||
-			!IsA(lsecond(coal), OidList) ||
-			list_length((List *) lsecond(coal)) != 2 ||
-			st->groupattno == 0 || st->groupattno2 != 0 ||
-			st->distattno != 0 || !st->hasgroupidx)
-			elog(ERROR, "LionCount: malformed coalesce group");
-		st->coalconst = (Const *) linitial(coal);
-		ops = (List *) lsecond(coal);
-		st->coaleqop = linitial_oid(ops);
-		st->coalcoll = lsecond_oid(ops);
-		if (st->coalconst->constisnull || !OidIsValid(st->coaleqop))
-			elog(ERROR, "LionCount: malformed coalesce group");
+		st->coalconst = priv->coalconst;
+		st->coaleqop = priv->coaleqop;
+		st->coalcoll = priv->coalcoll;
 		fmgr_info_cxt(get_opcode(st->coaleqop), &st->coaleqfn,
 					  estate->es_query_cxt);
 		st->hascoal = true;
@@ -845,44 +748,27 @@ lion_begin_coalesce(LionCountScanState *st, List *coal, EState *estate)
  * has neither, and no child.
  */
 static void
-lion_begin_join(LionCountScanState *st, CustomScan *cscan, List *join)
+lion_begin_join(LionCountScanState *st, const LionCountPriv *priv)
 {
 	st->joinclause = -1;
 	st->jointype = LION_JOIN_INNER;
-	if (join != NIL)
+	if (priv->hasjoin)
 	{
-		if (list_length(join) != 6 ||
-			list_length(cscan->custom_plans) != 1)
-			elog(ERROR, "LionCount: malformed join");
-		st->joinclause = linitial_int(join);
-		st->jointype = lsecond_int(join);
-		st->joincollect = (lthird_int(join) & LION_JOINFLAG_COLLECT) != 0;
-		st->joinrows = (lthird_int(join) & LION_JOINFLAG_ROWS) != 0;
-		st->joinsum = (lthird_int(join) & LION_JOINFLAG_SUM) != 0;
-		st->joincounts = (lthird_int(join) & LION_JOINFLAG_COUNTS) != 0;
-		st->joinouter = (lthird_int(join) & LION_JOINFLAG_OUTER) != 0;
-		st->joinordered = (lthird_int(join) & LION_JOINFLAG_ORDERED) != 0;
-		st->joinunique = (lthird_int(join) & LION_JOINFLAG_UNIQUE) != 0;
-		st->joinwalk = (lthird_int(join) & LION_JOINFLAG_WALK) != 0;
-		st->joinsortop = (Oid) list_nth_int(join, 3);
-		st->joinsortcoll = (Oid) list_nth_int(join, 4);
-		st->joinkeyresno = (AttrNumber) list_nth_int(join, 5);
-		if (st->joinclause < 0 || st->joinclause >= st->nclause ||
-			st->joinkeyresno <= 0 ||
-			(st->jointype != LION_JOIN_INNER &&
-			 st->jointype != LION_JOIN_SEMI &&
-			 st->jointype != LION_JOIN_ANTI) ||
-			(st->joinunique &&
-			 (st->jointype != LION_JOIN_INNER ||
-			  !OidIsValid(st->joinsortop))) ||
-			(st->joinsum && st->joinrows) ||
-			(st->joincounts &&
-			 (!st->joinrows || st->jointype != LION_JOIN_INNER)) ||
-			(st->joinouter &&
-			 (!st->joinrows || st->jointype == LION_JOIN_INNER ||
-			  st->joinunique || st->joincounts)) ||
-			(st->joinordered && !st->joinouter))
-			elog(ERROR, "LionCount: malformed join");
+		int			flags = priv->join.flags;
+
+		st->joinclause = priv->join.clause;
+		st->jointype = priv->join.type;
+		st->joincollect = (flags & LION_JOINFLAG_COLLECT) != 0;
+		st->joinrows = (flags & LION_JOINFLAG_ROWS) != 0;
+		st->joinsum = (flags & LION_JOINFLAG_SUM) != 0;
+		st->joincounts = (flags & LION_JOINFLAG_COUNTS) != 0;
+		st->joinouter = (flags & LION_JOINFLAG_OUTER) != 0;
+		st->joinordered = (flags & LION_JOINFLAG_ORDERED) != 0;
+		st->joinunique = (flags & LION_JOINFLAG_UNIQUE) != 0;
+		st->joinwalk = (flags & LION_JOINFLAG_WALK) != 0;
+		st->joinsortop = priv->join.sortop;
+		st->joinsortcoll = priv->join.sortcoll;
+		st->joinkeyresno = priv->join.keyresno;
 	}
 }
 
@@ -891,18 +777,13 @@ lion_begin_join(LionCountScanState *st, CustomScan *cscan, List *join)
  * scan.
  */
 static void
-lion_begin_target_list(LionCountScanState *st, CustomScan *cscan, List *kinds)
+lion_begin_target_list(LionCountScanState *st, CustomScan *cscan,
+					   const LionCountPriv *priv)
 {
 	int			i;
 
-	st->ntlist = list_length(kinds);
-	st->tlkind = (int *) palloc(sizeof(int) * Max(st->ntlist, 1));
-	for (i = 0; i < st->ntlist; i++)
-	{
-		st->tlkind[i] = list_nth_int(kinds, i);
-		if (LION_TL_IS_CHILDCOL(st->tlkind[i]) && st->joinclause < 0)
-			elog(ERROR, "LionCount: a child column without a join");
-	}
+	st->ntlist = priv->ntl;
+	st->tlkind = priv->tlkind;
 
 	/*
 	 * A summed join's one row stands for no dimension row (LION_JOINFLAG_SUM),
@@ -968,63 +849,42 @@ lion_begin_target_list(LionCountScanState *st, CustomScan *cscan, List *kinds)
  */
 static void
 lion_begin_wagg(LionCountScanState *st, CustomScanState *node,
-				CustomScan *cscan, List *exprs)
+				const LionCountPriv *priv, List *exprs)
 {
-	List	   *w = (List *) list_nth(cscan->custom_private, LION_PRIV_WAGG);
-	List	   *attnos;
-	List	   *oids;
-	List	   *cols;
-	List	   *specs;
 	int			i;
 
 	st->nwcol = 0;
 	st->nwagg = 0;
-	if (w == NIL)
+	if (priv->nwcol == 0)
 		return;
-	if (list_length(w) != 4 || !st->sumall || st->groupattno != 0)
-		elog(ERROR, "LionCount: malformed aggregates over keys");
-	attnos = (List *) linitial(w);
-	oids = (List *) lsecond(w);
-	cols = (List *) lthird(w);
-	specs = (List *) lfourth(w);
 
-	st->nwcol = list_length(attnos);
+	st->nwcol = priv->nwcol;
 	st->wcol = (LionWCol *) palloc0(sizeof(LionWCol) * st->nwcol);
 	for (i = 0; i < st->nwcol; i++)
 	{
-		st->wcol[i].attno = (AttrNumber) list_nth_int(attnos, i);
-		st->wcol[i].idxoid = list_nth_oid(oids, i);
-		st->wcol[i].idxcol = (AttrNumber) list_nth_int(cols, i);
+		st->wcol[i].attno = priv->wcol[i].attno;
+		st->wcol[i].idxoid = priv->wcol[i].idxoid;
+		st->wcol[i].idxcol = priv->wcol[i].idxcol;
 		st->wcol[i].slotcol = -1;
 	}
 
-	st->nwagg = list_length(specs);
+	st->nwagg = priv->nwagg;
 	st->wagg = (LionWAgg *) palloc0(sizeof(LionWAgg) * Max(st->nwagg, 1));
 	for (i = 0; i < st->nwagg; i++)
 	{
-		List	   *spec = (List *) list_nth(specs, i);
 		LionWAgg   *a = &st->wagg[i];
 		Expr	   *arg = (Expr *) list_nth(exprs, st->nclause + i);
 		Node	   *bare = lion_strip((Node *) arg);
 
-		if (list_length(spec) != 5)
-			elog(ERROR, "LionCount: malformed aggregates over keys");
-		a->kind = list_nth_int(spec, 0);
-		a->col = list_nth_int(spec, 1);
-		a->argwidth = list_nth_int(spec, 2);
-		if (a->col < 0 || a->col >= st->nwcol ||
-			a->kind <= LION_WAGG_NONE || a->kind > LION_WAGG_EXTREME)
-			elog(ERROR, "LionCount: malformed aggregates over keys");
-#ifndef HAVE_INT128
-		if (a->kind != LION_WAGG_EXTREME)
-			elog(ERROR, "LionCount: a sum over keys without 128-bit integers");
-#endif
+		a->kind = priv->wagg[i].kind;
+		a->col = priv->wagg[i].col;
+		a->argwidth = priv->wagg[i].argwidth;
 		a->arg = ExecInitExpr(arg, &node->ss.ps);
 		a->argiskey = (bare != NULL && IsA(bare, Var));
 		get_typlenbyval(exprType((Node *) arg), &a->typlen, &a->typbyval);
 		if (a->kind == LION_WAGG_EXTREME)
 		{
-			Oid			aggfnoid = (Oid) list_nth_int(spec, 3);
+			Oid			aggfnoid = priv->wagg[i].aggfnoid;
 			HeapTuple	tup;
 			Oid			sortop;
 
@@ -1037,7 +897,7 @@ lion_begin_wagg(LionCountScanState *st, CustomScanState *node,
 				elog(ERROR, "LionCount: aggregate %u has no sort operator",
 					 aggfnoid);
 			fmgr_info(get_opcode(sortop), &a->cmp);
-			a->collation = (Oid) list_nth_int(spec, 4);
+			a->collation = priv->wagg[i].collation;
 		}
 	}
 
@@ -1048,16 +908,9 @@ lion_begin_wagg(LionCountScanState *st, CustomScanState *node,
 		int			kind = st->tlkind[i];
 
 		if (LION_TL_IS_WKEY(kind))
-		{
-			if (LION_TL_WKEY_COL(kind) >= st->nwcol)
-				elog(ERROR, "LionCount: malformed aggregates over keys");
 			st->wcol[LION_TL_WKEY_COL(kind)].slotcol = i;
-		}
 		else if (LION_TL_IS_WAGG(kind))
-		{
-			if (LION_TL_WAGG_NO(kind) >= st->nwagg)
-				elog(ERROR, "LionCount: malformed aggregates over keys");
-		}
+			continue;
 		else
 			st->wneedcount = true;
 	}
@@ -1074,7 +927,7 @@ lion_begin_wagg(LionCountScanState *st, CustomScanState *node,
  */
 static void
 lion_begin_clauses(LionCountScanState *st, CustomScanState *node,
-				   const LionBeginPrivate *priv)
+				   const LionCountPriv *priv, List *exprs)
 {
 	int			i;
 
@@ -1084,10 +937,10 @@ lion_begin_clauses(LionCountScanState *st, CustomScanState *node,
 	{
 		LionClauseState *cl = &st->clause[i];
 
-		cl->kind = list_nth_int(priv->ckinds, i);
-		cl->idxoid = list_nth_oid(priv->oids, 3 + i);
-		cl->attno = (AttrNumber) list_nth_int(priv->ints, 4 + i);
-		cl->opno = list_nth_oid(priv->clauseops, i);
+		cl->kind = priv->clause[i].kind;
+		cl->idxoid = priv->clause[i].idxoid;
+		cl->attno = priv->clause[i].attno;
+		cl->opno = priv->clause[i].opno;
 		cl->strategy = 0;
 
 		/*
@@ -1096,7 +949,7 @@ lion_begin_clauses(LionCountScanState *st, CustomScanState *node,
 		 * generic IN list, a stable expression - gets an ExprState and is
 		 * evaluated at the start of each scan (lion_eval_clause_values()).
 		 */
-		cl->valexpr = (Expr *) list_nth(priv->exprs, i);
+		cl->valexpr = (Expr *) list_nth(exprs, i);
 		cl->valtype = exprType((Node *) cl->valexpr);
 
 		/*
@@ -1127,78 +980,16 @@ lion_begin_clauses(LionCountScanState *st, CustomScanState *node,
 }
 
 /*
- * The heap columns the driving walk and the inner walk are on, and the check
- * that the range clauses bound the driving one.
+ * The heap columns the driving walk and the inner walk are on: the driving
+ * index's entries' (DESIGN.md §24 needs it to name that index's KEY COLUMN)
+ * and the inner side's of a nested loop (§20, §26).  lion_count_priv_check()
+ * has seen that the range clauses bound the first.
  */
 static void
-lion_begin_driving_column(LionCountScanState *st)
+lion_begin_driving_column(LionCountScanState *st, const LionCountPriv *priv)
 {
-	int			i;
-
-	/*
-	 * Which HEAP column the driving index's entries belong to (DESIGN.md §24
-	 * needs it to name that index's KEY COLUMN).  With a GROUP BY it is the
-	 * outer group column; a sum-over-all (§14) has none, and its driver is the
-	 * index of the FIRST `IS NOT NULL` clause - which is exactly the clause
-	 * the planner took its driving column from (`notnullvar`, set at the first
-	 * such leaf of the same list this array was built from, and an OR leaf can
-	 * never be one).
-	 */
-	st->driveattno = st->groupattno;
-	if (st->sumall)
-	{
-		/*
-		 * ... or, when the plan has RANGE clauses (DESIGN.md §28), the column
-		 * they bound, which is the one the planner drove the sum from: they
-		 * all name it.
-		 */
-		int			drivekind = st->hasrange ? LION_CLAUSE_RANGE :
-			LION_CLAUSE_NOTNULL;
-
-		st->driveattno = 0;
-		if (st->allattno != 0 && !st->hasrange)
-			st->driveattno = st->allattno;	/* the plan's (DESIGN.md §35) */
-		for (i = 0; i < st->nclause && st->driveattno == 0; i++)
-		{
-			if (st->clause[i].kind == drivekind)
-			{
-				st->driveattno = st->clause[i].attno;
-				break;
-			}
-		}
-		if (st->driveattno == 0)
-			elog(ERROR, "LionCount: sum-over-all without an IS NOT NULL or range clause");
-	}
-
-	/*
-	 * count(DISTINCT k) (DESIGN.md §26): without a GROUP BY k's own entries
-	 * drive the scan; beside one, k's index is the inner side of the nested
-	 * loop, which is also what a second grouping column's is (§20).
-	 */
-	if (st->distattno != 0 && st->groupattno == 0)
-		st->driveattno = st->distattno;
-	if (st->groupattno2 != 0)
-		st->innerattno = st->groupattno2;
-	else if (st->distattno != 0 && st->groupattno != 0)
-		st->innerattno = st->distattno;
-	else
-		st->innerattno = 0;
-	if (st->distattno != 0 && !st->hasgroupidx)
-		elog(ERROR, "LionCount: count(DISTINCT) without its index");
-
-	/*
-	 * RANGE clauses bound the driving walk (DESIGN.md §28), so there has to
-	 * be one, and they have to be on its column: anything else is planner
-	 * drift, said here rather than counted wrong.
-	 */
-	for (i = 0; i < st->nclause; i++)
-	{
-		if (st->clause[i].kind != LION_CLAUSE_RANGE)
-			continue;
-		if (!st->hasrange || !st->hasgroupidx ||
-			st->clause[i].attno != st->driveattno)
-			elog(ERROR, "LionCount: a range clause that does not bound the driving walk");
-	}
+	st->driveattno = lion_count_priv_drive_attno(priv);
+	st->innerattno = lion_count_priv_inner_attno(priv);
 }
 
 /*
@@ -1209,34 +1000,18 @@ lion_begin_driving_column(LionCountScanState *st)
  * anywhere below.
  */
 static void
-lion_begin_ors_and_items(LionCountScanState *st, List *orlist)
+lion_begin_ors_and_items(LionCountScanState *st, const LionCountPriv *priv)
 {
 	int			i;
 	int			k;
 
-	st->nor = list_length(orlist);
-	st->inor = lion_or_leaf_map(orlist, st->nclause);
-	if (st->nor > 0)
+	st->nor = priv->nor;
+	st->ors = priv->ors;
+	st->inor = (bool *) palloc0(sizeof(bool) * Max(st->nclause, 1));
+	for (i = 0; i < st->nor; i++)
 	{
-		st->ors = (LionOrState *) palloc0(sizeof(LionOrState) * st->nor);
-		for (i = 0; i < st->nor; i++)
-		{
-			List	   *one = (List *) list_nth(orlist, i);
-			LionOrState *o = &st->ors[i];
-
-			o->first = linitial_int(one);
-			o->narms = lsecond_int(one);
-			o->armlen = (int *) palloc0(sizeof(int) * Max(o->narms, 1));
-			o->nleaves = 0;
-			for (k = 0; k < o->narms; k++)
-			{
-				o->armlen[k] = list_nth_int(one, 2 + k);
-				o->nleaves += o->armlen[k];
-			}
-			if (o->narms < 1 || o->nleaves < 1 ||
-				o->first < 0 || o->first + o->nleaves > st->nclause)
-				elog(ERROR, "LionCount: malformed OR structure");
-		}
+		for (k = 0; k < st->ors[i].nleaves; k++)
+			st->inor[st->ors[i].first + k] = true;
 	}
 
 	st->item = (LionSourceItem *)
@@ -1298,39 +1073,21 @@ lion_begin_ors_and_items(LionCountScanState *st, List *orlist)
 
 /* One target per live leaf partition, in the planner's order. */
 static void
-lion_begin_partitions(LionCountScanState *st, List *partlist)
+lion_begin_partitions(LionCountScanState *st, const LionCountPriv *priv)
 {
 	int			i;
 
-	st->npart = list_length(partlist);
+	st->npart = priv->npart;
 	if (st->npart > 0)
 	{
 		st->part = (LionPartState *) palloc0(sizeof(LionPartState) * st->npart);
 		for (i = 0; i < st->npart; i++)
 		{
-			List	   *one = (List *) list_nth(partlist, i);
-			int			j;
-
-			st->part[i].heapoid = linitial_oid(one);
-			st->part[i].groupidxoid = lsecond_oid(one);
-			st->part[i].groupidxoid2 = lthird_oid(one);
-			st->part[i].clauseidxoid = (Oid *)
-				palloc0(sizeof(Oid) * Max(st->nclause, 1));
-			for (j = 0; j < st->nclause; j++)
-				st->part[i].clauseidxoid[j] = list_nth_oid(one, 3 + j);
-
-			/*
-			 * A clause a partition leaves out has to be one the executor
-			 * can do without there (lion_leaf_drops()): never the join's
-			 * key, nor a range that bounds the driving walk.
-			 */
-			for (j = 0; j < st->nclause; j++)
-			{
-				if (!OidIsValid(st->part[i].clauseidxoid[j]) &&
-					(j == st->joinclause ||
-					 st->clause[j].kind == LION_CLAUSE_RANGE))
-					elog(ERROR, "LionCount: a partition leaves out a clause it needs");
-			}
+			/* InvalidOid for a clause the partition leaves out (§16) */
+			st->part[i].heapoid = priv->part[i].heapoid;
+			st->part[i].groupidxoid = priv->part[i].groupidxoid;
+			st->part[i].groupidxoid2 = priv->part[i].groupidxoid2;
+			st->part[i].clauseidxoid = priv->part[i].clauseidxoid;
 		}
 
 		/* ... whose items are the plan's, less what each leaves out */
@@ -1347,46 +1104,20 @@ lion_begin_partitions(LionCountScanState *st, List *partlist)
  * or, for a partition, the value its bounds give the column.
  */
 static void
-lion_begin_fact_group(LionCountScanState *st, CustomScan *cscan)
+lion_begin_fact_group(LionCountScanState *st, const LionCountPriv *priv)
 {
-	List	   *fg;
 	int			i;
 
-	fg = (List *) list_nth(cscan->custom_private, LION_PRIV_FACTGROUP);
-	if (fg != NIL)
+	if (priv->fgattno != 0)
 	{
-		List	   *fgoids;
-		List	   *fgconsts;
-
-		if (list_length(fg) != 3 || !IsA(linitial(fg), IntList) ||
-			list_length((List *) linitial(fg)) != 1 ||
-			!IsA(lsecond(fg), OidList) || !IsA(lthird(fg), List) ||
-			st->joinclause < 0 || st->jointype != LION_JOIN_INNER ||
-			st->joinrows || st->joinsum || st->joinouter)
-			elog(ERROR, "LionCount: malformed fact group");
-		st->fgattno = (AttrNumber) linitial_int((List *) linitial(fg));
-		fgoids = (List *) lsecond(fg);
-		fgconsts = (List *) lthird(fg);
-		if (st->fgattno <= 0 ||
-			list_length(fgoids) != Max(st->npart, 1) ||
-			list_length(fgconsts) != Max(st->npart, 1))
-			elog(ERROR, "LionCount: malformed fact group");
+		st->fgattno = priv->fgattno;
 		if (st->npart == 0)
-		{
-			st->fgidxoid = linitial_oid(fgoids);
-			if (!OidIsValid(st->fgidxoid))
-				elog(ERROR, "LionCount: malformed fact group");
-		}
+			st->fgidxoid = priv->fgidxoid[0];
 		for (i = 0; i < st->npart; i++)
 		{
-			st->part[i].fgidxoid = list_nth_oid(fgoids, i);
-			st->part[i].fgconst = NULL;
-			if (!OidIsValid(st->part[i].fgidxoid))
-			{
-				st->part[i].fgconst = (Const *) list_nth(fgconsts, i);
-				if (!IsA(st->part[i].fgconst, Const))
-					elog(ERROR, "LionCount: malformed fact group");
-			}
+			st->part[i].fgidxoid = priv->fgidxoid[i];
+			st->part[i].fgconst = OidIsValid(priv->fgidxoid[i]) ? NULL :
+				priv->fgconst[i];
 		}
 	}
 }
@@ -1404,14 +1135,10 @@ lion_begin_run_state(LionCountScanState *st, CustomScan *cscan)
 	/*
 	 * A parallel-aware node that is no join is a parallel GROUP BY (DESIGN.md
 	 * §10, "A GROUP BY in parallel"), which the planner offers for one shape
-	 * alone: one column's entries walked whole, over one table.
+	 * alone: one column's entries walked whole, over one table
+	 * (lion_count_priv_check()).
 	 */
 	st->granged = cscan->scan.plan.parallel_aware && st->joinclause < 0;
-	if (st->granged &&
-		(!st->hasgroupidx || st->groupattno == 0 || st->groupattno2 != 0 ||
-		 st->sumall || st->singlegroup || st->hascoal ||
-		 st->distattno != 0 || st->hasrange || st->npart > 0))
-		elog(ERROR, "LionCount: malformed parallel GROUP BY");
 	st->grange = -1;
 	st->grangecxt = NULL;		/* made by the first range */
 }
@@ -1507,29 +1234,18 @@ lion_begin_join_child(LionCountScanState *st, CustomScanState *node,
 static void
 lion_begin_join_distinct_key(LionCountScanState *st, EState *estate)
 {
-	int			i;
-
 	if (st->joinunique)
 	{
 		TupleDesc	childdesc = ExecGetResultType(st->child);
 		Form_pg_attribute keyatt;
 		Oid			eqop;
 
+		/*
+		 * Only the key comes out of the sort, and it is the only column of
+		 * the child the target list reads (lion_count_priv_check()).
+		 */
 		if (st->joinkeyresno > childdesc->natts)
 			elog(ERROR, "LionCount: malformed join");
-
-		/*
-		 * Only the key comes out of the sort, so the key is the only column
-		 * of the child the target list may read: the dimension of a forward
-		 * semi join is not visible to the query above it, and what the join
-		 * rows of a count(DISTINCT) carry is the key (lion_plan_fkjoin_path()).
-		 */
-		for (i = 0; i < st->ntlist; i++)
-		{
-			if (LION_TL_IS_CHILDCOL(st->tlkind[i]) &&
-				LION_TL_CHILDRESNO(st->tlkind[i]) != st->joinkeyresno)
-				elog(ERROR, "LionCount: a distinct-key join reads a column other than its key");
-		}
 
 		keyatt = TupleDescAttr(childdesc, st->joinkeyresno - 1);
 		st->joinkeytype = keyatt->atttypid;
@@ -1708,46 +1424,23 @@ lion_begin_sources(LionCountScanState *st)
  * (lion_open_relation()).
  */
 static void
-lion_begin_decoded_walk(LionCountScanState *st, CustomScan *cscan,
+lion_begin_decoded_walk(LionCountScanState *st, const LionCountPriv *priv,
 						EState *estate)
 {
-	List	   *gn = (List *) list_nth(cscan->custom_private, LION_PRIV_GROUPN);
-	int			flags = lfourth_int((List *) list_nth(cscan->custom_private,
-													  LION_PRIV_INTS));
 	LionDecodeRun *dr;
-	List	   *attnos;
-	List	   *oids;
 	int			c;
 
 	st->decode = NULL;
-	if ((flags & LION_FLAG_DECODE) == 0)
-	{
-		if (gn != NIL)
-			elog(ERROR, "LionCount: malformed decoded walk");
+	if ((priv->flags & LION_FLAG_DECODE) == 0)
 		return;
-	}
-	if (list_length(gn) != 2 || !IsA(linitial(gn), IntList) ||
-		!IsA(lsecond(gn), OidList))
-		elog(ERROR, "LionCount: malformed decoded walk");
-	attnos = (List *) linitial(gn);
-	oids = (List *) lsecond(gn);
-	if (list_length(attnos) < 2 || list_length(attnos) > LION_MAX_GROUPCOLS ||
-		list_length(oids) != list_length(attnos) ||
-		st->groupattno != (AttrNumber) linitial_int(attnos) ||
-		st->groupattno2 != 0 || st->distattno != 0 || st->hascoal ||
-		st->sumall || !st->hasgroupidx || st->hasrange || st->npart > 0 ||
-		st->joinclause >= 0)
-		elog(ERROR, "LionCount: malformed decoded walk");
 
 	dr = (LionDecodeRun *) MemoryContextAllocZero(estate->es_query_cxt,
 												  sizeof(LionDecodeRun));
-	dr->ncol = list_length(attnos);
+	dr->ncol = priv->ngroupn;
 	for (c = 0; c < dr->ncol; c++)
 	{
-		dr->attno[c] = (AttrNumber) list_nth_int(attnos, c);
-		dr->idxoid[c] = list_nth_oid(oids, c);
-		if (dr->attno[c] <= 0 || !OidIsValid(dr->idxoid[c]))
-			elog(ERROR, "LionCount: malformed decoded walk");
+		dr->attno[c] = priv->groupn_attno[c];
+		dr->idxoid[c] = priv->groupn_idx[c];
 		dr->chunkcxt[c] = AllocSetContextCreate(estate->es_query_cxt,
 												"LionCount decoded chunk",
 												ALLOCSET_DEFAULT_SIZES);
@@ -1765,45 +1458,45 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 {
 	LionCountScanState *st = (LionCountScanState *) node;
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
-	LionBeginPrivate priv;
-
-	lion_begin_check_shape(cscan);
-
-	/* Before anything is opened or read (DESIGN.md §9, "Privileges"). */
-	lion_check_replaced_execute((List *) list_nth(cscan->custom_private,
-												  LION_PRIV_EXECUTE),
-								eflags);
-
-	lion_begin_decode(st, cscan, &priv);
-	lion_begin_coalesce(st, priv.coal, estate);
+	List	   *exprs = cscan->custom_exprs;
+	LionCountPriv priv;
 
 	/*
-	 * One value expression per clause, in custom_exprs (see the shape marker
-	 * above).  A mismatch is planner/executor drift, exactly like a wrong
-	 * shape marker, and is said rather than decoded.
+	 * custom_private is positional: every member's shape is checked before a
+	 * single value of it is used, and the rules between the members after
+	 * (lion_plan_private.h).
 	 */
-	{
-		List	   *wagg = (List *) list_nth(cscan->custom_private,
-											 LION_PRIV_WAGG);
-		int			nwagg = (wagg != NIL && list_length(wagg) == 4) ?
-			list_length((List *) lfourth(wagg)) : 0;
+	lion_count_priv_decode(cscan->custom_private, LION_PRIV_STAGE_PLAN, &priv);
 
-		if (list_length(priv.exprs) != st->nclause + nwagg)
-			elog(ERROR, "LionCount: %d clauses but %d value expressions",
-				 st->nclause, list_length(priv.exprs) - nwagg);
-	}
+	/* Before anything is opened or read (DESIGN.md §9, "Privileges"). */
+	lion_check_replaced_execute(&priv, eflags);
 
-	lion_begin_join(st, cscan, priv.join);
-	lion_begin_target_list(st, cscan, priv.kinds);
-	lion_begin_wagg(st, node, cscan, priv.exprs);
-	lion_begin_clauses(st, node, &priv);
-	lion_begin_driving_column(st);
-	lion_begin_ors_and_items(st, priv.orlist);
-	lion_begin_partitions(st, priv.partlist);
-	lion_begin_fact_group(st, cscan);
+	lion_count_priv_check(&priv, cscan->scan.plan.parallel_aware,
+						  list_length(cscan->custom_plans));
+
+	/*
+	 * One value expression per clause in custom_exprs, then one argument per
+	 * aggregate over keys (DESIGN.md §37).  A mismatch is planner/executor
+	 * drift, exactly like a wrong shape marker, and is said rather than
+	 * decoded.
+	 */
+	if (list_length(exprs) != priv.nclause + priv.nwagg)
+		elog(ERROR, "LionCount: %d clauses but %d value expressions",
+			 priv.nclause, list_length(exprs) - priv.nwagg);
+
+	lion_begin_plan(st, &priv);
+	lion_begin_coalesce(st, &priv, estate);
+	lion_begin_join(st, &priv);
+	lion_begin_target_list(st, cscan, &priv);
+	lion_begin_wagg(st, node, &priv, exprs);
+	lion_begin_clauses(st, node, &priv, exprs);
+	lion_begin_driving_column(st, &priv);
+	lion_begin_ors_and_items(st, &priv);
+	lion_begin_partitions(st, &priv);
+	lion_begin_fact_group(st, &priv);
 	lion_begin_run_state(st, cscan);
 	lion_begin_contexts(st, estate);
-	lion_begin_decoded_walk(st, cscan, estate);
+	lion_begin_decoded_walk(st, &priv, estate);
 	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
 	st->writtenrels = lion_statement_written_rels(estate);
 	lion_begin_join_child(st, node, cscan, estate, eflags);
