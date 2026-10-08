@@ -15,7 +15,7 @@
 # The injection-point specs - the race tests of the VACUUM/count/split
 # interlocks - therefore run on 19 and master only.  16 has no injection
 # points at all, and 17 and 18 would need a source build of their own
-# (PGDG ships no injection_points module); README.md says so.
+# (PGDG ships no injection_points module); docs/DEVELOPING.md says so.
 #
 # The crash-recovery and hot-standby harness (test/recovery/run.sh) runs on
 # every major, in both WAL modes and with wal_consistency_checking, so that

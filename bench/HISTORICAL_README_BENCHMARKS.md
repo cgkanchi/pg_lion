@@ -6,7 +6,7 @@ These earlier implementation and feasibility measurements were moved from the RE
 are relative to the repository root. Their workloads, timing methods and server settings differ
 from the latest quick run, and their performance/correctness claims are not current validation.
 
-See the [current README benchmarks](../README.md#latest-benchmarks) for the latest measurements.
+See the [current README benchmarks](../docs/BENCHMARKS.md) for the latest measurements.
 
 ## Index size after the v1 build policy (5M rows, 2026-09-20)
 
