@@ -12,6 +12,7 @@
 #include "postgres.h"
 
 #include "lion_customscan.h"
+#include "lion_plan_private.h"
 
 /*
  * Is the aggregate one the FK-side join can answer (DESIGN.md §27)?  Its
@@ -923,18 +924,6 @@ lion_fact_groups(PlannerInfo *root, const LionCountTarget *t)
 											 NULL));
 }
 
-/*
- * The fact column an FK-side join's custom_private (or the base of it, which
- * lion_fkjoin_setup() makes) groups by, or 0 (LION_PRIV_FACTGROUP).
- */
-AttrNumber
-lion_fact_group_attno(List *priv)
-{
-	List	   *fg = (List *) list_nth(priv, LION_PRIV_FACTGROUP);
-
-	return (fg != NIL) ? (AttrNumber) linitial_int((List *) linitial(fg)) : 0;
-}
-
 /* ... summed over the relations: the groups a key is counted in, all told */
 static double
 lion_fact_groups_all(PlannerInfo *root, List *targets)
@@ -1186,7 +1175,7 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	 * counted, that has rows: no more than the join's own ("Grouped by a
 	 * fact column")
 	 */
-	if (lion_fact_group_attno(base) != 0)
+	if (lion_count_priv_fact_group_attno(base) != 0)
 		rows = clamp_row_est(Min(rows * lion_fact_groups_all(root, targets),
 								 fj->joinrel->rows * share));
 
