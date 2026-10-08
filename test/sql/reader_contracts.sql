@@ -1,0 +1,93 @@
+-- The contract every reader of a lion index keeps (DESIGN.md §9, "Direct
+-- readers"), run against each one, so a new reader gets a line here:
+--   - a function handed an index by name refuses a table where row-level
+--     security applies to the caller, and an unpopulated materialized view
+--     (lion_reader_vet()); one that reads only statistics does neither;
+--   - the planner's paths answer under a policy exactly what seq scan does.
+-- Snapshot eligibility and predicate locks need two sessions:
+-- test/isolation/reader_checkxmin.spec and reader_serializable.spec.
+
+\set VERBOSITY terse
+SET client_min_messages = warning;
+
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+
+CREATE TABLE rcon (id int, k int NOT NULL, j int NOT NULL, d tsvector)
+	WITH (autovacuum_enabled = off);
+INSERT INTO rcon SELECT g, g % 10, g % 7,
+	to_tsvector('simple', 'w' || (g % 10) || CASE WHEN g % 3 = 0 THEN ' secret' ELSE '' END)
+  FROM generate_series(1, 3000) g;
+CREATE INDEX rcon_k ON rcon USING lion (k);
+CREATE INDEX rcon_j ON rcon USING lion (j);
+CREATE INDEX rcon_d ON rcon USING lion (d) WITH (store_positions = true);
+VACUUM ANALYZE rcon;
+
+-- every direct reader, each as one statement; a new one goes here
+CREATE TABLE rcon_readers (name text, stmt text);
+INSERT INTO rcon_readers VALUES
+	('lion_index_count',             $$SELECT lion_index_count('%1$s_k', 3)$$),
+	('lion_index_count, two keys',   $$SELECT lion_index_count('%1$s_k', 3, '%1$s_j', 3)$$),
+	('lion_index_count_any',         $$SELECT lion_index_count_any('%1$s_k', ARRAY[3, 6])$$),
+	('lion_index_count_stats',       $$SELECT count FROM lion_index_count_stats('%1$s_k', 3)$$),
+	('lion_index_count_group_stats', $$SELECT count(*) FROM lion_index_count_group_stats('%1$s_k')$$),
+	('lion_bm25',                    $$SELECT count(*) FROM lion_bm25('%1$s_d', 'secret', 10)$$);
+
+-- what each reader says for the relation rel: its answer, or its error
+CREATE FUNCTION rcon_try(stmt text, rel text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE r text;
+BEGIN
+	EXECUTE format(stmt, rel) INTO r;
+	RETURN r;
+EXCEPTION WHEN OTHERS THEN
+	RETURN SQLERRM;
+END $$;
+
+SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
+
+-- sql's rows with lion's paths allowed and with all of them off
+CREATE FUNCTION rcon_same(sql text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE a text; b text;
+BEGIN
+	EXECUTE 'SELECT string_agg(x::text, '','') FROM (' || sql || ') x' INTO a;
+	SET LOCAL enable_indexscan = off;
+	SET LOCAL enable_bitmapscan = off;
+	SET LOCAL pg_lion.enable_count_pushdown = off;
+	SET LOCAL pg_lion.enable_bm25_scan = off;
+	SET LOCAL pg_lion.enable_ordered_scan = off;
+	EXECUTE 'SELECT string_agg(x::text, '','') FROM (' || sql || ') x' INTO b;
+	RETURN CASE WHEN a IS NOT DISTINCT FROM b THEN 'same' ELSE a || ' <> ' || b END;
+END $$;
+
+-- row-level security applying to the caller: refused
+CREATE ROLE rcon_reader;
+GRANT SELECT ON rcon, rcon_readers TO rcon_reader;
+ALTER TABLE rcon ENABLE ROW LEVEL SECURITY;
+CREATE POLICY rcon_hide ON rcon FOR SELECT USING (NOT d @@ 'secret');
+SET ROLE rcon_reader;
+SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
+
+-- statistics only: lion_bm25_score() reads N, df and avgdl, never rows
+SELECT lion_bm25_score('secret'::tsvector, 'secret', 'rcon_d') > 0 AS scores;
+
+-- the planner's paths apply the policy: the same rows as seq scan
+SELECT rcon_same($$SELECT count(*) FROM rcon WHERE k = 3$$);
+SELECT rcon_same($$SELECT k, count(*) FROM rcon GROUP BY k ORDER BY k$$);
+SELECT rcon_same($$SELECT count(*) FROM rcon WHERE d @@ 'secret'$$);
+SELECT rcon_same($$SELECT id FROM rcon WHERE d @@ 'w3 | secret'
+	ORDER BY lion_bm25_score(d, 'w3 | secret', 'rcon_d') DESC, id LIMIT 20$$);
+RESET ROLE;
+DROP POLICY rcon_hide ON rcon;
+ALTER TABLE rcon DISABLE ROW LEVEL SECURITY;
+
+-- an unpopulated materialized view: refused, as querying it is
+CREATE MATERIALIZED VIEW rcon_mv AS SELECT * FROM rcon WITH NO DATA;
+CREATE INDEX rcon_mv_k ON rcon_mv USING lion (k);
+CREATE INDEX rcon_mv_j ON rcon_mv USING lion (j);
+CREATE INDEX rcon_mv_d ON rcon_mv USING lion (d) WITH (store_positions = true);
+SELECT name, rcon_try(stmt, 'rcon_mv') FROM rcon_readers ORDER BY name;
+
+DROP MATERIALIZED VIEW rcon_mv;
+DROP FUNCTION rcon_same(text);
+DROP FUNCTION rcon_try(text, text);
+DROP TABLE rcon, rcon_readers;
+DROP ROLE rcon_reader;

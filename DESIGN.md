@@ -1531,6 +1531,38 @@ not use at all (count_checkxmin.spec: a HOT update before CREATE INDEX makes the
 indcheckxmin, and the old REPEATABLE READ reader must get the eligibility error rather than a count
 that is missing the row it still sees).
 
+
+### Direct readers (2026-10-08)
+
+An index scan the executor starts through `index_beginscan()` gets four guarantees from PostgreSQL:
+the planner offers only an index the snapshot may use, row-level security is applied above it,
+`index_beginscan()` takes a relation-level predicate lock for an AM without `ampredlocks`, and the
+executor refuses an unpopulated materialized view. lion reads its indexes without a scan in two
+kinds of places, and `lion_reader.c` is where each gets what is missing:
+
+- **Functions handed an index by name** (the count functions, `lion_bm25()`) call
+  `lion_reader_vet()`, or `lion_reader_open()`, which opens the index and table and then vets
+  them. Vetting refuses an unpopulated materialized view, a table where row-level security applies
+  to the caller (the policies cannot be evaluated without reading the rows; the same query through
+  the planner applies them, since lion's custom paths decline relations with security quals),
+  and an index `lion_index_usable()` rejects for the snapshot. It also applies the PostgreSQL 16
+  `old_snapshot_threshold` guard, and takes the predicate lock before the first read so a
+  SERIALIZABLE read that finds nothing still conflicts with a later insert. `lion_reader_open()`
+  takes a policy: `LION_READ_ROWS` for anything that returns or counts rows, which vets, and
+  `LION_READ_STATS` for `lion_bm25_score()`, which reads only N, df and avgdl, is evaluated per row
+  of a query that applies the policies, and checks privileges only.
+- **Custom scan nodes**, whose index the planner vetted, call `lion_reader_lock()` for the
+  predicate lock on each lion index they read.
+
+Privileges beyond SELECT on the table (per-column grants, EXECUTE on the functions a count stands
+for) depend on what the call stands for and stay with the caller (`lion_count_open_indexes()`).
+
+The ranking functions first opened their index on their own and missed three of these. So the
+contract is now tested across every reader rather than per feature: `test/sql/reader_contracts.sql`
+(row-level security, an unpopulated materialized view, the planner's paths under a policy) and the
+`reader_checkxmin` and `reader_serializable` specs each list every reader. A new reader adds a line
+to each.
+
 ## 10. Phase 2b: CustomScan for `count(*) [GROUP BY k] FROM t WHERE k1 = c1 AND ...` (`lion_plan_*.c`, `lion_exec_*.c`)
 
 Planner integration
