@@ -14,6 +14,7 @@
 -- 5. A NARROW (DESIGN.md §38) whose cardinality is not its payload's.
 -- 6. A NARROW in an index whose meta page says version 6.
 -- 7. A NARROW of a width the build does not have, which sizes it.
+-- 8. A directory entry whose key length claims more than its item holds.
 --
 -- The pages are damaged on disk, as corrupt.sql does it (pg_buffercache_evict(),
 -- PostgreSQL 17 and later - on 16 the test is skipped,
@@ -269,6 +270,25 @@ SELECT lion_di_try('SELECT count(*) FROM lion_di_n WHERE k = 1');
 SELECT lion_di_try($$SELECT lion_index_count('lion_di_n_i', 1)$$);
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_n_i')$$);
 DROP TABLE lion_di_n;
+
+-- ---------- 8. a directory entry whose key length runs past its item ----------
+-- The entry the first probe of leaf 1 compares against claims a key of 65535
+-- bytes (keylen, bytes 6 and 7 of the entry).  Every comparison and key
+-- decode reads keylen bytes after the header, so readers check it against
+-- the item's length before looking (lion_entry_at()).
+CREATE TABLE lion_di_t (t text NOT NULL);
+INSERT INTO lion_di_t SELECT md5((i % 50)::text) FROM generate_series(1, 5000) i;
+CREATE INDEX lion_di_t_i ON lion_di_t USING lion (t);
+SELECT lion_di_evict('lion_di_t_i');
+SELECT lion_di_poke('lion_di_t_i', 1, lion_di_item(p, (2 + (n - 1) / 2)::int) + 6, '\xffff'::bytea)
+  FROM lion_di_block('lion_di_t_i', 1) p,
+	   LATERAL (SELECT ((lion_di_u32(p, 12) & 65535) - 24) / 4 AS n) s;
+SELECT lion_di_try($$SELECT count(*) FROM lion_di_t WHERE t = md5('7')$$);
+SELECT lion_di_try($$SELECT count(*) FROM lion_di_t WHERE t > md5('7')$$);
+SELECT lion_di_try($$SELECT t, count(*) FROM lion_di_t GROUP BY t ORDER BY t$$);
+SELECT lion_di_try($$INSERT INTO lion_di_t VALUES (md5('7'))$$);
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_t_i')$$);
+DROP TABLE lion_di_t;
 
 -- ---------- an undamaged index still works ----------
 CREATE INDEX lion_di_i ON lion_di USING lion (k);
