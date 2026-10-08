@@ -21,7 +21,7 @@ CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_
 # share the private header src/lion_funcs.h.
 FUNCS_OBJS = src/lion_funcs.o src/lion_verify.o src/lion_verify_dir.o src/lion_verify_heap.o \
        src/lion_verify_summary.o
-OBJS = src/lion_container.o src/lion_sparse.o src/lion_positions.o src/lion_wal.o $(PAGES_OBJS) src/lion_dir.o src/lion_posting.o src/lion_postree.o src/lion_posbuild.o src/lion_posfilter.o src/lion_bm25.o src/lion_bm25_scan.o \
+OBJS = src/lion_container.o src/lion_sparse.o src/lion_positions.o src/lion_wal.o $(PAGES_OBJS) src/lion_dir.o src/lion_posting.o src/lion_postree.o src/lion_posbuild.o src/lion_posfilter.o src/lion_bm25.o src/lion_bm25_scan.o src/lion_reader.o \
        src/lion_am.o src/lion_amcost.o src/lion_build.o src/lion_spool.o src/lion_scan.o \
        src/lion_insert.o src/lion_vacuum.o $(FUNCS_OBJS) $(COUNT_OBJS) $(CUSTOMSCAN_OBJS) \
        src/lion_multikey.o src/lion_fkjoin.o src/lion_ordered.o src/lion_selfuncs.o \
@@ -158,6 +158,28 @@ src/lion_build.o src/lion_spool.o: src/lion_spool.h
 # it, and removes that directory on exit.
 RECOVERY_PREFIX ?=
 EXTRA_CLEAN += test/recovery/log
+
+# What the expected outputs assume of the server, established by installcheck
+# itself rather than left to whichever cluster it runs against.  The session
+# settings go to every connection the suite makes, regression and isolation
+# alike, through PGOPTIONS: plans and their EXPLAIN shapes depend on them, and
+# a test that needs another value SETs it, as before.  ./dev.sh's cluster sets
+# the same values server-wide.  What a session cannot set is checked first:
+# the contrib modules some tests read pages and WAL with, whose absence
+# otherwise shows up as a dozen unrelated diffs.
+LION_TEST_OPTIONS = -c work_mem=64MB -c maintenance_work_mem=1GB \
+                    -c max_parallel_workers_per_gather=0 \
+                    -c max_parallel_maintenance_workers=0 -c jit=off
+LION_TEST_EXTENSIONS = citext pageinspect pg_buffercache pg_walinspect
+installcheck: export PGOPTIONS := $(PGOPTIONS) $(LION_TEST_OPTIONS)
+installcheck: lion-test-env
+.PHONY: lion-test-env
+lion-test-env:
+	@missing=$$($(bindir)/psql -X -At -d postgres -c "SELECT string_agg(e, ' ') FROM unnest(string_to_array('$(LION_TEST_EXTENSIONS)', ' ')) e WHERE e NOT IN (SELECT name FROM pg_available_extensions)") || exit 1; \
+	if [ -n "$$missing" ]; then \
+		echo "pg_lion: the server has no $$missing extension, which the tests need (install PostgreSQL's contrib modules)" >&2; \
+		exit 1; \
+	fi
 
 # The whole suite with the custom WAL resource manager registered (DESIGN.md
 # §25).  The resource manager can only be registered from

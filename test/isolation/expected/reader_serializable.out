@@ -1,0 +1,185 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s2_begin s1_count s2_count s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_count: SELECT lion_index_count('rc_k', 99);
+lion_index_count
+----------------
+               0
+(1 row)
+
+step s2_count: SELECT lion_index_count('rc_k', 99);
+lion_index_count
+----------------
+               0
+(1 row)
+
+step s1_insert: INSERT INTO rc VALUES (-1, 99, 99, to_tsvector('simple', 'secret'));
+step s2_insert: INSERT INTO rc VALUES (-2, 99, 99, to_tsvector('simple', 'secret'));
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_count2 s2_count2 s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_count2: SELECT lion_index_count('rc_k', 99, 'rc_j', 99);
+lion_index_count
+----------------
+               0
+(1 row)
+
+step s2_count2: SELECT lion_index_count('rc_k', 99, 'rc_j', 99);
+lion_index_count
+----------------
+               0
+(1 row)
+
+step s1_insert: INSERT INTO rc VALUES (-1, 99, 99, to_tsvector('simple', 'secret'));
+step s2_insert: INSERT INTO rc VALUES (-2, 99, 99, to_tsvector('simple', 'secret'));
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_any s2_any s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_any: SELECT lion_index_count_any('rc_k', ARRAY[98, 99]);
+lion_index_count_any
+--------------------
+                   0
+(1 row)
+
+step s2_any: SELECT lion_index_count_any('rc_k', ARRAY[98, 99]);
+lion_index_count_any
+--------------------
+                   0
+(1 row)
+
+step s1_insert: INSERT INTO rc VALUES (-1, 99, 99, to_tsvector('simple', 'secret'));
+step s2_insert: INSERT INTO rc VALUES (-2, 99, 99, to_tsvector('simple', 'secret'));
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_stats s2_stats s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_stats: SELECT count FROM lion_index_count_stats('rc_k', 99);
+count
+-----
+    0
+(1 row)
+
+step s2_stats: SELECT count FROM lion_index_count_stats('rc_k', 99);
+count
+-----
+    0
+(1 row)
+
+step s1_insert: INSERT INTO rc VALUES (-1, 99, 99, to_tsvector('simple', 'secret'));
+step s2_insert: INSERT INTO rc VALUES (-2, 99, 99, to_tsvector('simple', 'secret'));
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_groups s2_groups s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_groups: SELECT count(*) FROM lion_index_count_group_stats('rc_k');
+count
+-----
+    1
+(1 row)
+
+step s2_groups: SELECT count(*) FROM lion_index_count_group_stats('rc_k');
+count
+-----
+    1
+(1 row)
+
+step s1_insert: INSERT INTO rc VALUES (-1, 99, 99, to_tsvector('simple', 'secret'));
+step s2_insert: INSERT INTO rc VALUES (-2, 99, 99, to_tsvector('simple', 'secret'));
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_bm25 s2_bm25 s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_bm25: SELECT count(*) FROM lion_bm25('rc_d', 'secret', 10);
+count
+-----
+    0
+(1 row)
+
+step s2_bm25: SELECT count(*) FROM lion_bm25('rc_d', 'secret', 10);
+count
+-----
+    0
+(1 row)
+
+step s1_insert: INSERT INTO rc VALUES (-1, 99, 99, to_tsvector('simple', 'secret'));
+step s2_insert: INSERT INTO rc VALUES (-2, 99, 99, to_tsvector('simple', 'secret'));
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_push s2_push s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_push: SELECT count(*) FROM rc WHERE k = 99;
+count
+-----
+    0
+(1 row)
+
+step s2_push: SELECT count(*) FROM rc WHERE k = 99;
+count
+-----
+    0
+(1 row)
+
+step s1_insert: INSERT INTO rc VALUES (-1, 99, 99, to_tsvector('simple', 'secret'));
+step s2_insert: INSERT INTO rc VALUES (-2, 99, 99, to_tsvector('simple', 'secret'));
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_rank s2_rank s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_rank: SELECT id FROM rc WHERE d @@ 'secret' ORDER BY lion_bm25_score(d, 'secret', 'rc_d') DESC LIMIT 10;
+id
+--
+(0 rows)
+
+step s2_rank: SELECT id FROM rc WHERE d @@ 'secret' ORDER BY lion_bm25_score(d, 'secret', 'rc_d') DESC LIMIT 10;
+id
+--
+(0 rows)
+
+step s1_insert: INSERT INTO rc VALUES (-1, 99, 99, to_tsvector('simple', 'secret'));
+step s2_insert: INSERT INTO rc VALUES (-2, 99, 99, to_tsvector('simple', 'secret'));
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_plans
+step s1_plans: EXPLAIN (COSTS OFF) SELECT count(*) FROM rc WHERE k = 99;
+				  EXPLAIN (COSTS OFF) SELECT id FROM rc WHERE d @@ 'secret' ORDER BY lion_bm25_score(d, 'secret', 'rc_d') DESC LIMIT 10;
+QUERY PLAN                   
+-----------------------------
+Custom Scan (LionCount)      
+  Lion Indexes: rc_k (k = 99)
+(2 rows)
+
+QUERY PLAN                                  
+--------------------------------------------
+Limit                                       
+  ->  Custom Scan (LionBm25) on rc          
+        Filter: (d @@ '''secret'''::tsquery)
+        Index: rc_d                         
+(4 rows)
+
