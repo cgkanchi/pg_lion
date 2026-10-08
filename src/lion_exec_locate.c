@@ -240,7 +240,7 @@ lion_array_batch_prepare(LionCountScanState *st, int k, LionClauseState *cl)
 	int			nelems;
 	LionListBatch *lb;
 
-	if (st->hasgroupidx || st->join != NULL ||
+	if (lion_plan_flag(st, LION_FLAG_GROUPIDX) || st->join != NULL ||
 		lion_st_lbatch(st)->item >= 0 || cl->valisnull)
 		return false;
 	lb = st->lbatch;
@@ -1121,7 +1121,7 @@ lion_locate_where(LionCountScanState *st)
 	 * clause on another index or column is drift and not a query.  A NULL
 	 * bound - a Param that came out NULL - selects nothing.
 	 */
-	if (st->hasrange)
+	if (lion_plan_flag(st, LION_FLAG_RANGE))
 	{
 		lion_range_init(&st->range, st->groupidx, st->groupidxcol);
 		for (k = 0; k < st->nclause; k++)
@@ -1164,8 +1164,8 @@ lion_locate_where(LionCountScanState *st)
 	 */
 	st->ingroupitem = -1;
 	st->ingroupset = 0;
-	if (st->hasgroupidx && st->driveattno != 0 && st->innerattno == 0 &&
-		!st->sumall)
+	if (lion_plan_flag(st, LION_FLAG_GROUPIDX) && st->driveattno != 0 &&
+		st->innerattno == 0 && !lion_plan_flag(st, LION_FLAG_SUMALL))
 	{
 		for (k = 0; k < st->nitem; k++)
 		{
@@ -1175,9 +1175,9 @@ lion_locate_where(LionCountScanState *st)
 				continue;
 			cl = &st->clause[st->item[k].clauseno];
 			if (!(cl->kind == LION_CLAUSE_ARRAY ||
-				  (cl->kind == LION_CLAUSE_EQ && st->distattno != 0)) ||
+				  (cl->kind == LION_CLAUSE_EQ && st->plan.distattno != 0)) ||
 				cl->attno != st->driveattno ||
-				cl->idxoid != st->groupidxoid ||
+				cl->idxoid != st->plan.groupidxoid ||
 				cl->idxcol != st->groupidxcol)
 				continue;
 			st->ingroupitem = k;
@@ -1212,8 +1212,9 @@ lion_locate_where(LionCountScanState *st)
 	 * distinct value.
 	 */
 	st->sumallitem = -1;
-	if ((st->sumall || (st->distattno != 0 && st->groupattno == 0)) &&
-		st->hasgroupidx)
+	if ((lion_plan_flag(st, LION_FLAG_SUMALL) ||
+		 (st->plan.distattno != 0 && st->plan.groupattno == 0)) &&
+		lion_plan_flag(st, LION_FLAG_GROUPIDX))
 	{
 		for (k = 0; k < st->nitem; k++)
 		{
@@ -1224,7 +1225,7 @@ lion_locate_where(LionCountScanState *st)
 			cl = &st->clause[st->item[k].clauseno];
 			if (cl->kind != LION_CLAUSE_NOTNULL ||
 				cl->attno != st->driveattno ||
-				cl->idxoid != st->groupidxoid ||
+				cl->idxoid != st->plan.groupidxoid ||
 				cl->idxcol != st->groupidxcol)
 				continue;
 			st->sumallitem = k;
