@@ -12,6 +12,7 @@
 #include "postgres.h"
 
 #include "lion_customscan.h"
+#include "lion_plan_private.h"
 
 bool		lion_enable_count_pushdown = true;
 bool		lion_enable_filter_switch = true;
@@ -207,6 +208,19 @@ lion_child_resno(Plan *child, Var *var)
 	return 0;					/* keep the compiler quiet */
 }
 
+/* The target-list kinds of the plan's custom_private, from `kinds` */
+static void
+lion_priv_set_tlkinds(LionCountPriv *priv, List *kinds)
+{
+	int			i = 0;
+	ListCell   *lc;
+
+	priv->ntl = list_length(kinds);
+	priv->tlkind = (int *) palloc(sizeof(int) * Max(priv->ntl, 1));
+	foreach(lc, kinds)
+		priv->tlkind[i++] = lfirst_int(lc);
+}
+
 /*
  * Turn an FK-side join path (DESIGN.md §27) into a CustomScan.
  *
@@ -230,17 +244,14 @@ lion_child_resno(Plan *child, Var *var)
  */
 static Plan *
 lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
-					  CustomPath *best_path, List *tlist, List *custom_plans)
+					  CustomPath *best_path, LionCountPriv *priv,
+					  List *tlist, List *custom_plans)
 {
 	CustomScan *cscan = makeNode(CustomScan);
 	Plan	   *child;
-	List	   *consts;
 	List	   *want;
 	List	   *ctlist = NIL;
 	List	   *kinds = NIL;
-	List	   *priv;
-	List	   *join;
-	List	   *ints;
 	int			joinclause;
 	Node	   *keyexpr;
 	Var		   *keyvar;
@@ -254,10 +265,8 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 		elog(ERROR, "LionCount: a join needs exactly one child plan");
 	child = (Plan *) linitial(custom_plans);
 
-	join = (List *) list_nth(best_path->custom_private, LION_PRIV_JOIN);
-	joinclause = linitial_int(join);
-	consts = (List *) list_nth(best_path->custom_private, LION_PRIV_CONSTS);
-	keyexpr = (Node *) list_nth(consts, joinclause);
+	joinclause = priv->join.clause;
+	keyexpr = (Node *) list_nth(priv->consts, joinclause);
 	keyvar = (Var *) lion_strip(keyexpr);
 	Assert(keyvar != NULL && IsA(keyvar, Var));
 	keyresno = lion_child_resno(child, keyvar);
@@ -270,16 +279,15 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	 * (a count of it is answered from the rows' counts).  The fact rel and
 	 * the column are the join clause's.
 	 */
-	ints = (List *) list_nth(best_path->custom_private, LION_PRIV_INTS);
-	factrelid = (Index) linitial_int(ints);
-	fkattno = (AttrNumber) list_nth_int(ints, 4 + joinclause);
+	factrelid = priv->scanrelid;
+	fkattno = priv->clause[joinclause].attno;
 
 	/*
 	 * ... and a fact column grouped by, whose value each row carries as the
 	 * group it counts ("Grouped by a fact column"): the entry's stored key,
 	 * or the value the partition's bounds give it.
 	 */
-	fgattno = lion_fact_group_attno(best_path->custom_private);
+	fgattno = priv->fgattno;
 
 	want = pull_var_clause((Node *) tlist,
 						   PVC_INCLUDE_AGGREGATES |
@@ -293,7 +301,7 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	 * create_projection_plan()) - so its tuple is every column of the join
 	 * rel's rows, from which any such target list is computed.
 	 */
-	if ((lthird_int(join) & LION_JOINFLAG_OUTER) != 0)
+	if ((priv->join.flags & LION_JOINFLAG_OUTER) != 0)
 		want = list_concat(want,
 						   pull_var_clause((Node *) best_path->path.pathtarget->exprs,
 										   PVC_RECURSE_PLACEHOLDERS));
@@ -308,7 +316,7 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 
 		if (IsA(expr, Var) && ((Var *) expr)->varno == (int) factrelid &&
 			((Var *) expr)->varattno == fkattno &&
-			lsecond_int(join) != LION_JOIN_ANTI)
+			priv->join.type != LION_JOIN_ANTI)
 			kind = LION_TL_CHILDCOL(keyresno);
 		else if (IsA(expr, Var) && fgattno != 0 &&
 				 ((Var *) expr)->varno == (int) factrelid &&
@@ -349,23 +357,22 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	cscan->custom_plans = custom_plans;
 
 	/* The clause values go to custom_exprs, as for every other shape. */
-	cscan->custom_exprs = consts;
-	priv = list_copy(best_path->custom_private);
-	lfirst(list_nth_cell(priv, LION_PRIV_CONSTS)) = NIL;
-	lfirst(list_nth_cell(priv, LION_PRIV_HAVING)) = NIL;
-	lfirst(list_nth_cell(priv, LION_PRIV_JOIN)) =
-		lappend_int(list_copy(join), (int) keyresno);
+	cscan->custom_exprs = priv->consts;
+	priv->consts = NIL;
+	priv->having = NIL;
+	priv->join.keyresno = keyresno;
+	lion_priv_set_tlkinds(priv, kinds);
 
 	cscan->custom_scan_tlist = ctlist;
 	cscan->custom_relids = rel->relids;
-	cscan->custom_private = lappend(priv, kinds);
+	cscan->custom_private = lion_count_priv_encode(priv, LION_PRIV_STAGE_PLAN);
 
 	/*
 	 * A semi or anti join path (LION_JOINFLAG_OUTER, DESIGN.md §27, "The semi
 	 * and anti join as a join path") is named for what it is in EXPLAIN.
 	 */
-	if ((lthird_int(join) & LION_JOINFLAG_OUTER) != 0)
-		cscan->methods = (lsecond_int(join) == LION_JOIN_ANTI) ?
+	if ((priv->join.flags & LION_JOINFLAG_OUTER) != 0)
+		cscan->methods = (priv->join.type == LION_JOIN_ANTI) ?
 			&lion_antijoin_scan_methods : &lion_semijoin_scan_methods;
 	else
 		cscan->methods = &lion_count_scan_methods;
@@ -449,42 +456,42 @@ lion_plan_join_agg_path(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * Which of the decoded walk's GROUP BY columns (DESIGN.md §34) attno is, in
- * the order the walk takes them: 0 for the first, which member 2 of
- * custom_private names as the group column, 1 and on for the others, and -1
- * for a column that is not one of them.
+ * the order the walk takes them: 0 for the first, which is priv's group
+ * column, 1 and on for the others, and -1 for a column that is not one of
+ * them.
  */
 static int
-lion_groupn_col(List *attnos, AttrNumber attno)
+lion_groupn_col(const LionCountPriv *priv, AttrNumber attno)
 {
-	int			i = 0;
-	ListCell   *lc;
+	int			i;
 
-	foreach(lc, attnos)
+	for (i = 0; i < priv->ngroupn; i++)
 	{
-		if ((AttrNumber) lfirst_int(lc) == attno)
+		if (priv->groupn_attno[i] == attno)
 			return i;
-		i++;
 	}
 	return -1;
 }
 
 /*
  * An aggregate of DESIGN.md §37 in the tuple the node produces: agg over the
- * entries of one of the columns in wattnos, weighted by their rows.  Appends
- * it to *ctlist with its LION_TL_WAGG kind, what it computes to *wspecs - its
- * LION_WAGG_* kind, its column's position in wattnos, the width of an integer
- * argument, the aggregate and its input collation - and its argument to
- * *wargs; and the column itself, once, as LION_TL_WKEY: the key the argument
- * is evaluated on.  False for any other aggregate.  An aggregate already in
- * *ctlist is done.
+ * entries of one of priv's columns, weighted by their rows.  Appends it to
+ * *ctlist with its LION_TL_WAGG kind, what it computes to priv's aggregates -
+ * its LION_WAGG_* kind, its column's position in priv's, the width of an
+ * integer argument, the aggregate and its input collation - and its argument
+ * to *wargs; and the column itself, once, as LION_TL_WKEY: the key the
+ * argument is evaluated on.  False for any other aggregate.  An aggregate
+ * already in *ctlist is done.  priv->wagg has room for one more.
  */
 static bool
-lion_wagg_add_target(Aggref *agg, Index rti, List *wattnos,
-					 List **ctlist, List **kinds, List **wspecs, List **wargs)
+lion_wagg_add_target(Aggref *agg, LionCountPriv *priv,
+					 List **ctlist, List **kinds, List **wargs)
 {
 	AttrNumber	attno;
 	int			width = 0;
-	int			wkind = lion_wagg_classify(agg, rti, &attno, &width);
+	int			wkind = lion_wagg_classify(agg, priv->scanrelid, &attno,
+										   &width);
+	LionCountPrivWAgg *a;
 	Node	   *arg;
 	List	   *vars;
 	int			c;
@@ -492,14 +499,12 @@ lion_wagg_add_target(Aggref *agg, Index rti, List *wattnos,
 
 	if (wkind == LION_WAGG_NONE)
 		return false;
-	c = 0;
-	foreach(lc, wattnos)
+	for (c = 0; c < priv->nwcol; c++)
 	{
-		if ((AttrNumber) lfirst_int(lc) == attno)
+		if (priv->wcol[c].attno == attno)
 			break;
-		c++;
 	}
-	if (lc == NULL)
+	if (c == priv->nwcol)
 		elog(ERROR, "LionCount: an aggregate over column %d, which is not walked",
 			 attno);
 
@@ -509,14 +514,17 @@ lion_wagg_add_target(Aggref *agg, Index rti, List *wattnos,
 			return true;
 	}
 	arg = (Node *) ((TargetEntry *) linitial(agg->args))->expr;
-	*wspecs = lappend(*wspecs, list_make5_int(wkind, c, width,
-											  (int) agg->aggfnoid,
-											  (int) agg->inputcollid));
+	a = &priv->wagg[priv->nwagg++];
+	a->kind = wkind;
+	a->col = c;
+	a->argwidth = width;
+	a->aggfnoid = agg->aggfnoid;
+	a->collation = agg->inputcollid;
 	*wargs = lappend(*wargs, copyObject(arg));
 	*ctlist = lappend(*ctlist,
 					  makeTargetEntry((Expr *) copyObject(agg),
 									  list_length(*ctlist) + 1, NULL, false));
-	*kinds = lappend_int(*kinds, LION_TL_WAGG(list_length(*wspecs) - 1));
+	*kinds = lappend_int(*kinds, LION_TL_WAGG(priv->nwagg - 1));
 
 	vars = pull_var_clause(arg, PVC_RECURSE_PLACEHOLDERS);
 	foreach(lc, *ctlist)
@@ -545,22 +553,16 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	CustomScan *cscan = makeNode(CustomScan);
 	List	   *ctlist = NIL;
 	List	   *kinds = NIL;
-	List	   *priv;
-	List	   *ints;
-	List	   *ckinds;
+	LionCountPriv priv;
 	List	   *having;
 	List	   *want;
 	bool	   *inor;
 	AttrNumber	groupattno;
 	AttrNumber	groupattno2;
-	List	   *groupn;
-	List	   *groupnattnos;
 	AttrNumber	distattno;
-	List	   *dist;
-	List	   *wagg;
-	List	   *wspecs = NIL;
 	List	   *wargs = NIL;
 	ListCell   *lc;
+	int			o;
 
 	/*
 	 * The name has to be resolvable before any CustomScan node of ours is
@@ -570,27 +572,29 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	 */
 	lion_count_scan_register();
 
-	if ((List *) list_nth(best_path->custom_private, LION_PRIV_JOIN) != NIL)
-		return lion_plan_fkjoin_path(root, rel, best_path, tlist, custom_plans);
+	lion_count_priv_decode(best_path->custom_private, LION_PRIV_STAGE_PATH,
+						   &priv);
+	if (priv.hasjoin)
+		return lion_plan_fkjoin_path(root, rel, best_path, &priv, tlist,
+									 custom_plans);
 
-	ints =(List *) list_nth(best_path->custom_private, LION_PRIV_INTS);
-	ckinds = (List *) list_nth(best_path->custom_private, LION_PRIV_CLAUSEKINDS);
-	groupattno = (AttrNumber) lsecond_int(ints);
-	groupattno2 = (AttrNumber) lthird_int(ints);
-	groupn = (List *) list_nth(best_path->custom_private, LION_PRIV_GROUPN);
-	groupnattnos = (groupn != NIL) ? (List *) linitial(groupn) : NIL;
-	dist = (List *) list_nth(best_path->custom_private, LION_PRIV_DISTINCT);
-	distattno = (dist != NIL) ? (AttrNumber) linitial_int(dist) : 0;
-	wagg = (List *) list_nth(best_path->custom_private, LION_PRIV_WAGG);
+	groupattno = priv.groupattno;
+	groupattno2 = priv.groupattno2;
+	distattno = priv.distattno;
 
 	/*
 	 * A leaf of an OR constrains no column of the result (DESIGN.md §19), so
 	 * it neither pins a value the target list may print nor makes a
 	 * `count(col)` zero: the other arms select rows it says nothing about.
 	 */
-	inor = lion_or_leaf_map((List *) list_nth(best_path->custom_private,
-											  LION_PRIV_ORS),
-							list_length(ckinds));
+	inor = (bool *) palloc0(sizeof(bool) * Max(priv.nclause, 1));
+	for (o = 0; o < priv.nor; o++)
+	{
+		int			j;
+
+		for (j = 0; j < priv.ors[o].nleaves; j++)
+			inor[priv.ors[o].first + j] = true;
+	}
 
 	/*
 	 * The tuple the node produces has to hold every column and count the
@@ -600,7 +604,7 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	 * node but Agg can evaluate.  A count the HAVING alone mentions becomes
 	 * a column the projection above simply does not print.
 	 */
-	having = (List *) list_nth(best_path->custom_private, LION_PRIV_HAVING);
+	having = priv.having;
 	want = list_copy(tlist);
 	if (having != NIL)
 	{
@@ -615,6 +619,11 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 												 NULL, true));
 	}
 
+	/* an aggregate over keys per target entry at most */
+	if (priv.nwcol > 0)
+		priv.wagg = (LionCountPrivWAgg *)
+			palloc0(sizeof(LionCountPrivWAgg) * Max(list_length(want), 1));
+
 	foreach(lc, want)
 	{
 		TargetEntry *tle = (TargetEntry *) lfirst(lc);
@@ -623,11 +632,9 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		ListCell   *l2;
 		bool		dup = false;
 
-		if (IsA(expr, Aggref) && wagg != NIL &&
-			lion_wagg_add_target((Aggref *) expr,
-								 (Index) linitial_int(ints),
-								 (List *) linitial(wagg), &ctlist, &kinds,
-								 &wspecs, &wargs))
+		if (IsA(expr, Aggref) && priv.nwcol > 0 &&
+			lion_wagg_add_target((Aggref *) expr, &priv, &ctlist, &kinds,
+								 &wargs))
 			continue;
 		if (IsA(expr, Aggref))
 		{
@@ -669,16 +676,16 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 					kind = LION_TL_COUNT_GROUPCOL;
 				else if (groupattno2 != 0 && attno == groupattno2)
 					kind = LION_TL_COUNT_GROUPCOL2;
-				else if ((i = lion_groupn_col(groupnattnos, attno)) > 0)
+				else if ((i = lion_groupn_col(&priv, attno)) > 0)
 					kind = (i == 1) ? LION_TL_COUNT_GROUPCOL2 :
 						LION_TL_COUNT_GROUPCOLN(i);
 				else
 				{
-					for (i = 0; i < list_length(ckinds); i++)
+					for (i = 0; i < priv.nclause; i++)
 					{
 						if (!inor[i] &&
-							list_nth_int(ckinds, i) == LION_CLAUSE_NULL &&
-							list_nth_int(ints, 4 + i) == (int) attno)
+							priv.clause[i].kind == LION_CLAUSE_NULL &&
+							priv.clause[i].attno == attno)
 						{
 							kind = LION_TL_COUNT_ZERO;
 							break;
@@ -696,7 +703,7 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				kind = LION_TL_GROUPKEY;
 			else if (groupattno2 != 0 && attno == groupattno2)
 				kind = LION_TL_GROUPKEY2;
-			else if ((i = lion_groupn_col(groupnattnos, attno)) > 0)
+			else if ((i = lion_groupn_col(&priv, attno)) > 0)
 				kind = (i == 1) ? LION_TL_GROUPKEY2 : LION_TL_GROUPKEYN(i);
 			else
 			{
@@ -709,17 +716,17 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				 * about the value.
 				 */
 				kind = -1;
-				for (i = 4; i < list_length(ints); i++)
+				for (i = 0; i < priv.nclause; i++)
 				{
-					int			ckind = list_nth_int(ckinds, i - 4);
+					int			ckind = priv.clause[i].kind;
 
-					if (inor[i - 4])
+					if (inor[i])
 						continue;	/* §19: an OR leaf pins nothing */
 					if (ckind != LION_CLAUSE_EQ && ckind != LION_CLAUSE_NULL)
 						continue;
-					if (list_nth_int(ints, i) == (int) attno)
+					if (priv.clause[i].attno == attno)
 					{
-						kind = LION_TL_WHEREKEY + (i - 4);
+						kind = LION_TL_WHEREKEY + i;
 						break;
 					}
 				}
@@ -728,9 +735,7 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 						 attno);
 			}
 		}
-		else if (IsA(expr, CoalesceExpr) &&
-				 (List *) list_nth(best_path->custom_private,
-								   LION_PRIV_COALESCE) != NIL)
+		else if (IsA(expr, CoalesceExpr) && priv.coalconst != NULL)
 		{
 			/*
 			 * GROUP BY coalesce(col, c) (DESIGN.md §10): the only expression
@@ -760,7 +765,7 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 					kind = LION_TL_GROUPKEY;
 				else if (groupattno2 != 0 && attno == groupattno2)
 					kind = LION_TL_GROUPKEY2;
-				else if ((i = lion_groupn_col(groupnattnos, attno)) > 0)
+				else if ((i = lion_groupn_col(&priv, attno)) > 0)
 					kind = (i == 1) ? LION_TL_GROUPKEY2 : LION_TL_GROUPKEYN(i);
 				else
 					elog(ERROR, "LionCount: an expression of column %d, which is not grouped",
@@ -823,28 +828,25 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	 * node when an exec Param changes (DESIGN.md §10).  A value left only in
 	 * custom_private would be invisible to both.
 	 */
-	cscan->custom_exprs = (List *) list_nth(best_path->custom_private,
-											LION_PRIV_CONSTS);
-	priv = list_copy(best_path->custom_private);
-	lfirst(list_nth_cell(priv, LION_PRIV_CONSTS)) = NIL;
-	lfirst(list_nth_cell(priv, LION_PRIV_HAVING)) = NIL;
+	cscan->custom_exprs = priv.consts;
+	priv.consts = NIL;
+	priv.having = NIL;
 
 	/*
 	 * The aggregates over lion columns' entries (DESIGN.md §37): what each
-	 * computes, and its argument after the clause values, where setrefs.c
-	 * points its column at the key's place in custom_scan_tlist.
+	 * computes is in priv already, and its argument goes after the clause
+	 * values, where setrefs.c points its column at the key's place in
+	 * custom_scan_tlist.
 	 */
-	if (wagg != NIL)
-	{
-		lfirst(list_nth_cell(priv, LION_PRIV_WAGG)) =
-			lappend(list_copy(wagg), wspecs);
+	if (priv.nwcol > 0)
 		cscan->custom_exprs = list_concat(list_copy(cscan->custom_exprs),
 										  wargs);
-	}
+	lion_priv_set_tlkinds(&priv, kinds);
 
 	cscan->custom_scan_tlist = ctlist;
 	cscan->custom_relids = rel->relids;
-	cscan->custom_private = lappend(priv, kinds);
+	cscan->custom_private = lion_count_priv_encode(&priv,
+												   LION_PRIV_STAGE_PLAN);
 	cscan->methods = &lion_count_scan_methods;
 
 	return &cscan->scan.plan;
