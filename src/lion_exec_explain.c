@@ -710,7 +710,7 @@ lion_explain_join(LionCountScanState *st, ExplainState *es)
 	if (js->collect)
 		ExplainPropertyText("Fact Filters", "collected once", es);
 	else if (es->analyze &&
-			 js->switches + st->joinworkerswitches > 0)
+			 js->switches + js->worker.switches > 0)
 		ExplainPropertyText("Fact Filters", "probed, then collected", es);
 
 	/*
@@ -928,7 +928,7 @@ lion_explain_scan_counters(LionCountScanState *st, const LionCountStats *tot,
 	 * values live on plus one descent, not a descent per value.
 	 */
 	ExplainPropertyInteger("Directory Pages Read", NULL,
-						   st->dirpages + st->joinworkerdirpages, es);
+						   st->dirpages + st->workerdirpages, es);
 }
 
 /*
@@ -1167,7 +1167,7 @@ lion_explain_fact_filter_counters(LionCountScanState *st,
 	if (js->collect || switched)
 		ExplainPropertyInteger("Fact Filter Rows Collected", NULL,
 							   Max(js->filterrows,
-								   st->joinworkerfilterrows), es);
+								   js->worker.filterrows), es);
 
 	/*
 	 * Copies past a hash join's memory, which went to a temporary
@@ -1175,9 +1175,9 @@ lion_explain_fact_filter_counters(LionCountScanState *st,
 	 * copy shared by the participants (any of whose chunks went to
 	 * a file).  Only when there were any.
 	 */
-	if (js->spilled + st->joinworkerspilled > 0)
+	if (js->spilled + js->worker.spilled > 0)
 		ExplainPropertyInteger("Fact Filter Copies Spilled", NULL,
-							   js->spilled + st->joinworkerspilled,
+							   js->spilled + js->worker.spilled,
 							   es);
 
 	/*
@@ -1185,14 +1185,14 @@ lion_explain_fact_filter_counters(LionCountScanState *st,
 	 * parallel plan - one a run - and the chunks the participants
 	 * collected of them, summed.  Only when there were any.
 	 */
-	if (st->joincopies + st->joinworkercopies > 0)
+	if (js->pcopy.copies + js->worker.copies > 0)
 	{
 		ExplainPropertyInteger("Fact Filter Copies Shared", NULL,
-							   st->joincopies + st->joinworkercopies,
+							   js->pcopy.copies + js->worker.copies,
 							   es);
 		ExplainPropertyInteger("Fact Filter Copy Chunks", NULL,
-							   st->joincopychunks +
-							   st->joinworkercopychunks, es);
+							   js->pcopy.chunks +
+							   js->worker.copychunks, es);
 	}
 
 	/*
@@ -1208,7 +1208,7 @@ lion_explain_fact_filter_counters(LionCountScanState *st,
 							   switches, es);
 		ExplainPropertyInteger("Fact Filter Keys Probed", NULL,
 							   js->switchkeys +
-							   st->joinworkerswitchkeys, es);
+							   js->worker.switchkeys, es);
 	}
 
 	/*
@@ -1237,7 +1237,7 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 						   ExplainState *es)
 {
 	LionJoinState *js = lion_st_join(st);
-	int64		switches = js->switches + st->joinworkerswitches;
+	int64		switches = js->switches + js->worker.switches;
 	bool		switched = (switches > 0);
 	int			i;
 
@@ -1252,7 +1252,7 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 	{
 		ExplainPropertyInteger("Join Keys Sorted", NULL,
 							   Max(js->sort.sorted,
-								   st->joinworkersorted), es);
+								   js->worker.sorted), es);
 		if (js->sort.havestats)
 		{
 			ExplainPropertyText("Join Key Sort Method",
@@ -1274,12 +1274,12 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 	 * that many times the dimension's rows - ...
 	 */
 	ExplainPropertyInteger("Join Child Rows", NULL,
-						   js->childrows + st->joinworkerchildrows,
+						   js->childrows + js->worker.childrows,
 						   es);
 	ExplainPropertyInteger("Join Keys Looked Up", NULL,
-						   js->lookups + st->joinworkerlookups, es);
+						   js->lookups + js->worker.lookups, es);
 	ExplainPropertyInteger("Join Keys Without Entry", NULL,
-						   js->missing + st->joinworkermissing, es);
+						   js->missing + js->worker.missing, es);
 
 	/* ... and counted in each group of a fact column grouped by */
 	if (st->fg != NULL)
@@ -1297,7 +1297,7 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 	ExplainPropertyInteger("Join Key Containers Read", NULL,
 						   tot->key_containers, es);
 	ExplainPropertyInteger("Join Posting Pages Read", NULL,
-						   js->posting + st->joinworkerposting, es);
+						   js->posting + js->worker.posting, es);
 	ExplainPropertyInteger("Visibility Map Checks", NULL,
 						   tot->vm_checks, es);
 	ExplainPropertyInteger("Visibility Map Pages Pinned", NULL,
@@ -1309,7 +1309,7 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 	 */
 	if (js->batch.walk)
 		ExplainPropertyInteger("Join Key Batches", NULL,
-							   js->batch.batches + st->joinworkerbatches,
+							   js->batch.batches + js->worker.batches,
 							   es);
 
 	lion_explain_fact_filter_counters(st, tot, switches, switched, es);
@@ -1335,7 +1335,7 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 
 			if (i == LION_JT_COLLECT && !js->collect && !switched)
 				continue;
-			INSTR_TIME_ADD(t, st->joinworkertime[i]);
+			INSTR_TIME_ADD(t, js->worker.time[i]);
 			ExplainPropertyFloat(phasename[i], "ms",
 								 INSTR_TIME_GET_MILLISEC(t), 3, es);
 		}
@@ -1353,7 +1353,7 @@ lion_explain_analyze(LionCountScanState *st, ExplainState *es)
 	 */
 	LionCountStats tot = st->stats;
 
-	lion_count_stats_add(&tot, &st->joinworkerstats);
+	lion_count_stats_add(&tot, &st->workerstats);
 
 	lion_explain_scan_counters(st, &tot, es);
 	lion_explain_range_counters(st, es);
