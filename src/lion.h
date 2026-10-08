@@ -1970,7 +1970,8 @@ extern void lion_check_old_snapshot(Relation index, Snapshot snapshot);
  * index by name, or a node reading one without index_beginscan(), owes the
  * caller.  LION_READ_ROWS for anything that returns or counts rows, which
  * vets the index for the snapshot, refuses row-level security and takes the
- * predicate lock; LION_READ_STATS for index-wide statistics only.
+ * predicate lock; LION_READ_STATS for index-wide statistics only, which
+ * refuses row-level security too.
  */
 typedef enum LionReadPolicy
 {

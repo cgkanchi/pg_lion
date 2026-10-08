@@ -24,8 +24,18 @@
  * scan's snapshot, following a HOT chain to the visible version, and applies
  * the WHERE to each; when whatever is above it pulls past them, it asks for
  * four times as many ranked below the last row it had, until the walk has
- * no more.  The ORDER BY expression itself is evaluated by lion_bm25_score()
- * for the rows returned, and gives the score the walk ranked them by.
+ * no more: until one comes up short, since rows inserted meanwhile are in
+ * the index too, and the snapshot does not see them (lion_bm25_next_L()).
+ *
+ * The scan returns the score it ranked a row by as well: the ORDER BY
+ * expression is a column of its scan tuple (custom_scan_tlist), which
+ * setrefs.c puts in place of every copy of the expression above it.  Called
+ * on its own, lion_bm25_score() would read the index's statistics when the
+ * first row comes, not when the walk did, and after rows are inserted in
+ * between the scores shown would not be in the order they were ranked by.
+ * The scan's tuple is the table's columns the plan needs, then the score.
+ * A relation that is locked FOR UPDATE or the like is left to the ordinary
+ * plan: EvalPlanQual hands a scan the table's row, not that tuple.
  *
  *-------------------------------------------------------------------------
  */
@@ -49,6 +59,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
@@ -89,6 +100,10 @@ typedef struct LionBm25ScanState
 	int64		L;				/* what the last walk was asked for; 0: none */
 	int64		seen;			/* the rows the walks have given, added up */
 	bool		last;			/* that walk was the last one */
+	TupleTableSlot *heapslot;	/* the table's row, fetched */
+	int			natts;			/* the scan tuple's columns */
+	AttrNumber *attnos;			/* each one's table column; the score: none */
+	bool	   *isscore;
 } LionBm25ScanState;
 
 static Plan *lion_bm25_plan_path(PlannerInfo *root, RelOptInfo *rel,
@@ -172,6 +187,29 @@ lion_bm25_is_score(Expr *e)
 	return fi.fn_addr == lion_bm25_score;
 }
 
+/* The lion_bm25_score() call the query is ordered by first, or NULL. */
+static FuncExpr *
+lion_bm25_order_score(PlannerInfo *root)
+{
+	PathKey    *pk;
+	ListCell   *lc;
+
+	if (root->query_pathkeys == NIL)
+		return NULL;
+	pk = linitial_node(PathKey, root->query_pathkeys);
+	if (pk->pk_eclass->ec_has_volatile)
+		return NULL;
+	foreach(lc, pk->pk_eclass->ec_members)
+	{
+		EquivalenceMember *em = (EquivalenceMember *) lfirst(lc);
+		Expr	   *e = (Expr *) lion_bm25_strip((Node *) em->em_expr);
+
+		if (lion_bm25_is_score(e))
+			return (FuncExpr *) e;
+	}
+	return NULL;
+}
+
 static TSTernaryValue
 lion_bm25_absent(void *arg, QueryOperand *val, ExecPhraseData *data)
 {
@@ -239,8 +277,7 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 						   RangeTblEntry *rte)
 {
 	PathKey    *pk;
-	EquivalenceClass *ec;
-	FuncExpr   *score = NULL;
+	FuncExpr   *score;
 	Var		   *var = NULL;
 	Const	   *cquery;
 	Const	   *cindex;
@@ -272,7 +309,8 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		rel->indexlist == NIL)
 		return;
 	if (root->parse->resultRelation == (int) rel->relid ||
-		bms_is_member((int) rel->relid, root->all_result_relids))
+		bms_is_member((int) rel->relid, root->all_result_relids) ||
+		get_plan_rowmark(root->rowMarks, rti) != NULL)
 		return;
 	if (lion_old_snapshot_threshold_active())
 		return;
@@ -286,20 +324,7 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 #endif
 	if (!desc)
 		return;
-	ec = pk->pk_eclass;
-	if (ec->ec_has_volatile)
-		return;
-	foreach(lc, ec->ec_members)
-	{
-		EquivalenceMember *em = (EquivalenceMember *) lfirst(lc);
-		Expr	   *e = (Expr *) lion_bm25_strip((Node *) em->em_expr);
-
-		if (lion_bm25_is_score(e))
-		{
-			score = (FuncExpr *) e;
-			break;
-		}
-	}
+	score = lion_bm25_order_score(root);
 	if (score == NULL)
 		return;
 	var = lion_bm25_rel_var(linitial(score->args), rel);
@@ -415,15 +440,43 @@ lion_bm25_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 					List *tlist, List *clauses, List *custom_plans)
 {
 	CustomScan *cscan = makeNode(CustomScan);
+	List	   *quals = extract_actual_clauses(clauses, false);
+	List	   *vars;
+	List	   *scantl = NIL;
+	ListCell   *lc;
+
+	/* the scan tuple: the table's columns the plan uses, then the score */
+	vars = pull_var_clause((Node *) list_concat(list_concat(NIL, tlist), quals),
+						   PVC_RECURSE_AGGREGATES | PVC_RECURSE_WINDOWFUNCS |
+						   PVC_RECURSE_PLACEHOLDERS);
+	vars = list_concat(vars,
+					   pull_var_clause((Node *) rel->reltarget->exprs,
+									   PVC_RECURSE_PLACEHOLDERS));
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (v->varno != (int) rel->relid || v->varlevelsup != 0)
+			elog(ERROR, "LionBm25 scan of relation %u given a column of another",
+				 rel->relid);
+		if (!tlist_member((Expr *) v, scantl))
+			scantl = lappend(scantl,
+							 makeTargetEntry((Expr *) copyObject(v),
+											 list_length(scantl) + 1,
+											 NULL, false));
+	}
+	scantl = lappend(scantl,
+					 makeTargetEntry((Expr *) copyObject(lion_bm25_order_score(root)),
+									 list_length(scantl) + 1, NULL, false));
 
 	cscan->scan.plan.targetlist = tlist;
-	cscan->scan.plan.qual = extract_actual_clauses(clauses, false);
+	cscan->scan.plan.qual = quals;
 	cscan->scan.scanrelid = rel->relid;
 	cscan->flags = best_path->flags;
 	cscan->custom_plans = NIL;
 	cscan->custom_exprs = NIL;
 	cscan->custom_private = best_path->custom_private;
-	cscan->custom_scan_tlist = NIL;
+	cscan->custom_scan_tlist = scantl;
 	cscan->methods = &lion_bm25_scan_methods;
 	return &cscan->scan.plan;
 }
@@ -439,8 +492,8 @@ lion_bm25_create_state(CustomScan *cscan)
 		newNode(sizeof(LionBm25ScanState), T_CustomScanState);
 
 	st->css.methods = &lion_bm25_exec_methods;
-	/* a heap table's rows, which lion_check_table_am() holds them to be */
-	st->css.slotOps = &TTSOpsBufferHeapTuple;
+	/* built from the table's row (heapslot) and the score */
+	st->css.slotOps = &TTSOpsVirtual;
 	return (Node *) st;
 }
 
@@ -451,6 +504,8 @@ lion_bm25_begin(CustomScanState *node, EState *estate, int eflags)
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 	List	   *priv = cscan->custom_private;
 	Oid			indexoid;
+	ListCell   *lc;
+	int			i = 0;
 
 	if (list_length(priv) != LION_BM25_PRIV_LEN)
 		elog(ERROR, "LionBm25 plan has %d private items, not %d",
@@ -461,10 +516,28 @@ lion_bm25_begin(CustomScanState *node, EState *estate, int eflags)
 	st->b = DatumGetFloat8(((Const *) lfourth(priv))->constvalue);
 	st->firstL = DatumGetInt64(((Const *) list_nth(priv, 4))->constvalue);
 
+	st->natts = list_length(cscan->custom_scan_tlist);
+	st->attnos = (AttrNumber *) palloc0(sizeof(AttrNumber) * st->natts);
+	st->isscore = (bool *) palloc0(sizeof(bool) * st->natts);
+	foreach(lc, cscan->custom_scan_tlist)
+	{
+		Expr	   *e = lfirst_node(TargetEntry, lc)->expr;
+
+		if (IsA(e, Var))
+			st->attnos[i] = ((Var *) e)->varattno;
+		else if (lion_bm25_is_score(e))
+			st->isscore[i] = true;
+		else
+			elog(ERROR, "LionBm25 scan tuple has an unexpected column");
+		i++;
+	}
+
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
 	st->index = index_open(indexoid, AccessShareLock);
 	lion_check_table_am(node->ss.ss_currentRelation);
+	st->heapslot = table_slot_create(node->ss.ss_currentRelation,
+									 &estate->es_tupleTable);
 
 	/*
 	 * The relation-level predicate lock index_beginscan() takes for an AM
@@ -473,6 +546,43 @@ lion_bm25_begin(CustomScanState *node, EState *estate, int eflags)
 	 */
 	lion_reader_lock(st->index, estate->es_snapshot);
 	st->valid = lion_bm25_prepare(st->index, st->query, st->k1, st->b, &st->q);
+}
+
+/* The scan tuple of the row in heapslot, whose score is score. */
+static TupleTableSlot *
+lion_bm25_store(LionBm25ScanState *st, double score)
+{
+	TupleTableSlot *slot = st->css.ss.ss_ScanTupleSlot;
+	TupleTableSlot *row = st->heapslot;
+	int			i;
+
+	ExecClearTuple(slot);
+	for (i = 0; i < st->natts; i++)
+	{
+		AttrNumber	a = st->attnos[i];
+
+		slot->tts_isnull[i] = false;
+		if (st->isscore[i])
+			slot->tts_values[i] = Float8GetDatum(score);
+		else if (a > 0)
+			slot->tts_values[i] = slot_getattr(row, a, &slot->tts_isnull[i]);
+		else if (a == 0)
+		{
+			/* a whole-row Var: in the tuple's memory, reset per row */
+			MemoryContext old = MemoryContextSwitchTo(
+				st->css.ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
+
+			slot->tts_values[i] = ExecFetchSlotHeapTupleDatum(row);
+			MemoryContextSwitchTo(old);
+		}
+		else if (a == SelfItemPointerAttributeNumber)
+			slot->tts_values[i] = PointerGetDatum(&row->tts_tid);
+		else if (a == TableOidAttributeNumber)
+			slot->tts_values[i] = ObjectIdGetDatum(row->tts_tableOid);
+		else
+			slot->tts_values[i] = slot_getsysattr(row, a, &slot->tts_isnull[i]);
+	}
+	return ExecStoreVirtualTuple(slot);
 }
 
 /* The next row best first that the snapshot sees, or NULL. */
@@ -489,14 +599,16 @@ lion_bm25_next(ScanState *ss)
 		CHECK_FOR_INTERRUPTS();
 		if (st->next < st->nbest)
 		{
+			const LionBm25Cand *c = &st->best[st->next++];
 			ItemPointerData tid;
 
-			lion_code_to_tid(st->best[st->next++].code, &tid);
+			lion_code_to_tid(c->code, &tid);
 			if (!lion_table_fetch_tid(heap, &tid, snapshot, NULL))
 				continue;
-			if (!table_tuple_fetch_row_version(heap, &tid, snapshot, slot))
+			if (!table_tuple_fetch_row_version(heap, &tid, snapshot,
+											   st->heapslot))
 				continue;
-			return slot;
+			return lion_bm25_store(st, c->score);
 		}
 		if (!st->valid || st->last)
 			return ExecClearTuple(slot);
@@ -505,8 +617,7 @@ lion_bm25_next(ScanState *ss)
 		 * The walk again for more: the rows ranked below the last one it
 		 * gave, which is where the scan has got to (lion_bm25_topk()).
 		 */
-		st->L = (st->L == 0) ? st->firstL : st->L * 4;
-		st->L = Max(Min(st->L, (int64) st->q.ncodes - st->seen), 1);
+		st->L = lion_bm25_next_L(st->L, st->firstL, &st->q, st->seen);
 		{
 			LionBm25Cand after;
 			bool		have_after = (st->nbest > 0);
@@ -523,7 +634,7 @@ lion_bm25_next(ScanState *ss)
 		lion_bm25_sort(st->best, st->nbest);
 		st->next = 0;
 		st->seen += st->nbest;
-		if (st->nbest < st->L || st->seen >= (int64) st->q.ncodes)
+		if (st->nbest < st->L)
 			st->last = true;
 	}
 }
