@@ -438,12 +438,12 @@ RESET work_mem;
 --    reads - here at once, the sets being small.
 SELECT * FROM ol_run($$SELECT id FROM lol
 	WHERE a = 'a3' AND b = 'b4' ORDER BY k LIMIT 5$$);
-                        ol_run                        
-------------------------------------------------------
+                               ol_run                                
+---------------------------------------------------------------------
  Index Entries Walked: 6179
  Lion Set Hits: 5
  Heap Fetches: 0
- Lion Set: 31 containers, exact, after 11 keys probed
+ Lion Set: 31 containers, exact, after 11 keys probed (probe budget)
 (4 rows)
 
 SELECT ol_cmp($$SELECT id, k FROM lol WHERE a = 'a3' AND b = 'b4' ORDER BY k, id LIMIT 10$$);
@@ -452,18 +452,18 @@ SELECT ol_cmp($$SELECT id, k FROM lol WHERE a = 'a3' AND b = 'b4' ORDER BY k, id
  LionOrdered, 10 rows
 (1 row)
 
--- and a long walk: built once it has met 40,000 entries, the members it met
--- lazily counted as met, so the early stop ends the walk and the switch,
--- should it come, fetches none of them again
+-- and a long walk: built once the probes have met every key of the set, the
+-- members it met lazily counted as met, so the switch that follows fetches
+-- none of them again (ordered_transitions.sql forces each other reason)
 SELECT * FROM ol_run($$SELECT id FROM lol
 	WHERE a IN ('a1', 'a2') AND b IN ('b1', 'b2', 'b3') ORDER BY g$$);
-                            ol_run                             
----------------------------------------------------------------
+                               ol_run                                
+---------------------------------------------------------------------
  Index Entries Walked: 14496
  Lion Keys Walked: 13
  Lion Set Hits: 166
  Heap Fetches: 619
- Lion Set: 35 containers, exact, after 35 keys probed
+ Lion Set: 35 containers, exact, after 35 keys probed (probe budget)
  Switched to Fetch and Sort: 1 of 1 scans, 453 members fetched
 (6 rows)
 
@@ -621,13 +621,13 @@ SELECT ol_cmp('EXECUTE ol_s(NULL)',
 (1 row)
 
 SELECT * FROM ol_run($$EXECUTE ol_s(ARRAY['a1', NULL, 'a11'])$$);
-                        ol_run                        
-------------------------------------------------------
+                               ol_run                                
+---------------------------------------------------------------------
  Index Entries Walked: 2422
  Lion Keys Walked: 3
  Lion Set Hits: 8
  Heap Fetches: 8
- Lion Set: 35 containers, exact, after 35 keys probed
+ Lion Set: 35 containers, exact, after 35 keys probed (probe budget)
 (5 rows)
 
 SELECT ol_cmp($$EXECUTE ol_s(ARRAY['a1', NULL, 'a11'])$$,

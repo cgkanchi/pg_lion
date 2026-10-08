@@ -442,49 +442,49 @@ SELECT lion_ord('SELECT o.v, x.id, x.k FROM (VALUES (100), (50000), (99990)) o(v
 
 SELECT * FROM lion_ord_run('SELECT o.v, x.id FROM (VALUES (17), (18), (250), (3)) o(v),
 				 LATERAL (SELECT id FROM lo WHERE c200 = o.v ORDER BY k, id LIMIT 3) x');
-                          lion_ord_run                          
-----------------------------------------------------------------
+                                   lion_ord_run                                   
+----------------------------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on lo
  Index Entries Walked: 1778
  Lion Set Hits: 9
  Heap Fetches: 9
- Lion Set: 32 containers, exact, 3 builds, after 69 keys probed
+ Lion Set: 32 containers, exact, 3 builds, after 69 keys probed (probe budget x3)
 (5 rows)
 
 SELECT * FROM lion_ord_run('SELECT o.v, x.id FROM (VALUES (100), (50000), (99990)) o(v),
 				 LATERAL (SELECT id FROM lo WHERE c200 = 17 AND k > o.v ORDER BY k, id LIMIT 3) x');
-                     lion_ord_run                     
-------------------------------------------------------
+                            lion_ord_run                             
+---------------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on lo
  Index Entries Walked: 1496
  Lion Set Hits: 6
  Heap Fetches: 6
- Lion Set: 32 containers, exact, after 22 keys probed
+ Lion Set: 32 containers, exact, after 22 keys probed (probe budget)
 (5 rows)
 
 -- 7. The counters: entries walked, members, heap fetches; an exact set is
 --    never rechecked, and a multi-key AND of whole keys is one (DESIGN.md
 --    §29.6).
 SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 AND c2 = 1 ORDER BY k, id LIMIT 10');
-                     lion_ord_run                     
-------------------------------------------------------
+                            lion_ord_run                             
+---------------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on lo
  Rows Removed by Filter: 14
  Index Entries Walked: 6081
  Lion Set Hits: 24
  Heap Fetches: 24
- Lion Set: 32 containers, exact, after 23 keys probed
+ Lion Set: 32 containers, exact, after 23 keys probed (probe budget)
 (6 rows)
 
 SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 AND length(note) = 5 ORDER BY k, id LIMIT 10');
-                         lion_ord_run                          
----------------------------------------------------------------
+                            lion_ord_run                             
+---------------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on lo
  Rows Removed by Filter: 505
  Index Entries Walked: 14272
  Lion Set Hits: 59
  Heap Fetches: 505
- Lion Set: 32 containers, exact, after 23 keys probed
+ Lion Set: 32 containers, exact, after 23 keys probed (probe budget)
  Switched to Fetch and Sort: 1 of 1 scans, 446 members fetched
 (7 rows)
 
@@ -1040,13 +1040,13 @@ SELECT lion_ord('SELECT id, k FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
 (1 row)
 
 SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
-                          lion_ord_run                          
-----------------------------------------------------------------
+                          lion_ord_run                           
+-----------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on lcor
  Index Entries Walked: 32000
  Lion Set Hits: 0
  Heap Fetches: 1000
- Lion Set: 1 containers, exact, after 4 keys probed
+ Lion Set: 1 containers, exact, after 4 keys probed (switch due)
  Switched to Fetch and Sort: 1 of 1 scans, 1000 members fetched
 (6 rows)
 
@@ -1058,14 +1058,14 @@ SELECT lion_ord('SELECT id, k FROM lcor WHERE c = 190 AND g = 1 ORDER BY k LIMIT
 (1 row)
 
 SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE c = 190 AND g = 1 ORDER BY k LIMIT 10');
-                          lion_ord_run                          
-----------------------------------------------------------------
+                          lion_ord_run                           
+-----------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on lcor
  Rows Removed by Filter: 1000
  Index Entries Walked: 32000
  Lion Set Hits: 0
  Heap Fetches: 1000
- Lion Set: 1 containers, exact, after 4 keys probed
+ Lion Set: 1 containers, exact, after 4 keys probed (switch due)
  Switched to Fetch and Sort: 1 of 1 scans, 1000 members fetched
 (7 rows)
 
@@ -1083,13 +1083,13 @@ SELECT lion_ord('SELECT id, k FROM lcor WHERE h = 1 ORDER BY k');
 (1 row)
 
 SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE h = 1 ORDER BY k LIMIT 20');
-                          lion_ord_run                          
-----------------------------------------------------------------
+                          lion_ord_run                           
+-----------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on lcor
  Index Entries Walked: 32000
  Lion Set Hits: 3
  Heap Fetches: 1003
- Lion Set: 2 containers, exact, after 4 keys probed
+ Lion Set: 2 containers, exact, after 4 keys probed (switch due)
  Switched to Fetch and Sort: 1 of 1 scans, 1000 members fetched
 (6 rows)
 
@@ -1113,13 +1113,13 @@ SELECT lion_ord('SELECT id, k3 FROM lcor WHERE h2 = 1 ORDER BY k3 DESC NULLS FIR
 (1 row)
 
 SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE h2 = 1 ORDER BY k3 DESC, id DESC LIMIT 40');
-                         lion_ord_run                          
----------------------------------------------------------------
+                            lion_ord_run                            
+--------------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on lcor
  Index Entries Walked: 31360
  Lion Set Hits: 22
  Heap Fetches: 1002
- Lion Set: 2 containers, exact, after 14 keys probed
+ Lion Set: 2 containers, exact, after 14 keys probed (probe budget)
  Switched to Fetch and Sort: 1 of 1 scans, 980 members fetched
 (6 rows)
 
