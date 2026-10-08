@@ -747,21 +747,24 @@ lion_fkjoin_rewrite_mutator(Node *node, LionFkAggRewrite *cx)
 
 /*
  * The custom_private of an FK-side join path (DESIGN.md §27): the members
- * lion_try_fkjoin_path() built, with the join member of this path - the
- * clause, the kind of join, the flags, and the sort operator and collation of
- * a forward semi join's distinct keys - in LION_PRIV_JOIN.  The operator and
- * the collation are OIDs in an IntList, which casting to int and back keeps.
+ * lion_fkjoin_setup() built, with the join of this path - the clause, the
+ * kind of join, the flags, and the sort operator and collation of a forward
+ * semi join's distinct keys.
  */
 static List *
-lion_fkjoin_private(List *base, int joinclause, int jointype, int flags,
-					Oid sortop, Oid sortcoll)
+lion_fkjoin_private(const LionCountPriv *base, int joinclause, int jointype,
+					int flags, Oid sortop, Oid sortcoll)
 {
-	List	   *priv = list_copy(base);
+	LionCountPriv priv = *base;
 
-	lfirst(list_nth_cell(priv, LION_PRIV_JOIN)) =
-		list_make5_int(joinclause, jointype, flags, (int) sortop,
-					   (int) sortcoll);
-	return priv;
+	priv.hasjoin = true;
+	priv.join.clause = joinclause;
+	priv.join.type = jointype;
+	priv.join.flags = flags;
+	priv.join.sortop = sortop;
+	priv.join.sortcoll = sortcoll;
+	priv.join.keyresno = 0;		/* the plan's: lion_plan_fkjoin_path() */
+	return lion_count_priv_encode(&priv, LION_PRIV_STAGE_PATH);
 }
 
 /*
@@ -1054,8 +1057,8 @@ static void
 lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 					  RelOptInfo *output_rel, const LionFkJoin *fj,
 					  List *having, List *targets, Path *child,
-					  int workers, PathTarget *nodetarget, List *base,
-					  int joinclause, int jointype,
+					  int workers, PathTarget *nodetarget,
+					  const LionCountPriv *base, int joinclause, int jointype,
 					  const LionFkJoinAgg *rowagg, bool perrow,
 					  List *whereclauses, List *wherekinds, List *ors,
 					  double dimrows, double found, bool parallel_safe)
@@ -1175,7 +1178,7 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	 * counted, that has rows: no more than the join's own ("Grouped by a
 	 * fact column")
 	 */
-	if (lion_count_priv_fact_group_attno(base) != 0)
+	if (base->fgattno != 0)
 		rows = clamp_row_est(Min(rows * lion_fact_groups_all(root, targets),
 								 fj->joinrel->rows * share));
 
@@ -1325,7 +1328,7 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
  * the dimension's (the outer side's) column; the relations to count - the
  * fact table, or each of its live leaf partitions - each with a lion index
  * for the key and for every fact filter it keeps (lion_collect_targets());
- * and custom_private but for its join member.  `tlexprs` and `having` are
+ * and custom_private but for its join.  `tlexprs` and `having` are
  * what the node's target and HAVING evaluate, for the EXECUTE checks
  * (lion_replaced_functions()).  False when the fact side declines.
  */
@@ -1337,8 +1340,8 @@ typedef struct LionFkJoinSetup
 	double		fkpages;		/* the fk index's pages, in every partition */
 	List	   *whereclauses;	/* the clauses, the key's appended */
 	List	   *wherekinds;		/* ... and their kinds */
-	List	   *consts;			/* ... and values */
-	List	   *base;			/* custom_private, its join member NIL */
+	LionCountPriv base;			/* custom_private, without the join: the
+								 * clauses' values are base.consts */
 } LionFkJoinSetup;
 
 static bool
@@ -1356,16 +1359,9 @@ lion_fkjoin_setup(PlannerInfo *root, RelOptInfo *rel, const LionFkJoin *fj,
 	List	   *targets = NIL;
 	bool		partitioned;
 	double		fkpages;
-	List	   *parts = NIL;
-	List	   *oids;
-	List	   *ints;
-	List	   *consts = NIL;
-	List	   *ckinds = NIL;
-	List	   *base;
+	LionCountPriv *base = &out->base;
+	List	   *exec;
 	ListCell   *lc;
-	ListCell   *l1;
-	ListCell   *l2;
-	ListCell   *l3;
 	int			i;
 
 	/* ---- the join key: one more equality clause on the fact rel ---- */
@@ -1416,82 +1412,56 @@ lion_fkjoin_setup(PlannerInfo *root, RelOptInfo *rel, const LionFkJoin *fj,
 	 * partitions' in LION_PRIV_PARTS - InvalidOid where a partition leaves a
 	 * fact filter out - as for a count (DESIGN.md §16).
 	 */
-	oids = list_make3_oid(rte->relid, InvalidOid, InvalidOid);
-	ints = list_make4_int((int) rel->relid, 0, 0, 0);
-	i = 0;
-	forthree(l1, whereattnos, l2, whereconsts, l3, wherekinds)
-	{
-		oids = lappend_oid(oids, partitioned ? InvalidOid :
-						   ((IndexOptInfo *) list_nth(((LionCountTarget *) linitial(targets))->whereidx,
-													  i))->indexoid);
-		ints = lappend_int(ints, lfirst_int(l1));
-		consts = lappend(consts, copyObject((Node *) lfirst(l2)));
-		ckinds = lappend_int(ckinds, lfirst_int(l3));
-		i++;
-	}
+	memset(base, 0, sizeof(LionCountPriv));
+	base->heapoid = rte->relid;
+	base->scanrelid = rel->relid;
+	lion_count_priv_set_where(base,
+							  partitioned ? NIL :
+							  ((LionCountTarget *) linitial(targets))->whereidx,
+							  whereattnos, whereconsts, wherekinds,
+							  whereopnos, ors);
 	if (partitioned)
-	{
-		foreach(lc, targets)
-		{
-			LionCountTarget *t = (LionCountTarget *) lfirst(lc);
-			List	   *one = list_make3_oid(t->heapoid, InvalidOid, InvalidOid);
+		lion_count_priv_set_parts(base, targets, false);
 
-			foreach(l1, t->whereidx)
-				one = lappend_oid(one, lfirst(l1) != NULL ?
-								  ((IndexOptInfo *) lfirst(l1))->indexoid :
-								  InvalidOid);
-			parts = lappend(parts, one);
-		}
-	}
-
-	base = list_make1(list_make2_int(LION_PRIV_MAGIC, LION_PRIV_NMEMBERS));
-	base = lappend(base, oids);
-	base = lappend(base, ints);
-	base = lappend(base, consts);
-	base = lappend(base, ckinds);
-	base = lappend(base, parts);
-	base = lappend(base, whereopnos);
-	base = lappend(base, ors);
-	base = lappend(base, NIL);	/* having */
-	base = lappend(base, NIL);	/* distinct */
-	base = lappend(base, NIL);	/* join: lion_fkjoin_private() */
 	/* the dimension's GROUP BY is the Agg's, which checks it */
-	base = lappend(base, lion_replaced_functions(rel, tlexprs, having, NIL,
-												 fj));
-	base = lappend(base, NIL);	/* coalesce: the fact side groups nothing */
-	base = lappend(base, (imply != NULL) ? imply->skipped : NIL);
+	exec = lion_replaced_functions(rel, tlexprs, having, NIL, fj);
+	base->exec_aggs = (List *) linitial(exec);
+	base->exec_funcs = (List *) lsecond(exec);
+	base->exec_groupfuncs = (List *) lthird(exec);
+	base->implied = (imply != NULL) ? imply->skipped : NIL;
 
-	/* a fact column grouped by: each relation's index for it, or its value */
+	/*
+	 * A fact column grouped by: each relation's index for it, or its value.
+	 * Nothing else the fact side counts by - no HAVING, DISTINCT, coalesce
+	 * or decoded walk, no sum over every row (the join key drives), no top
+	 * k and no aggregates over a column's entries: the Agg above groups.
+	 */
 	if (fgdrive != NULL)
 	{
-		List	   *fgoids = NIL;
-		List	   *fgconsts = NIL;
+		int			nrel = list_length(targets);
 
+		base->fgattno = fgdrive->attno;
+		base->fgidxoid = (Oid *) palloc0(sizeof(Oid) * nrel);
+		base->fgconst = (Const **) palloc0(sizeof(Const *) * nrel);
+		i = 0;
 		foreach(lc, targets)
 		{
 			LionCountTarget *t = (LionCountTarget *) lfirst(lc);
 
 			if (t->driveconst[0] != NULL)
 			{
-				fgoids = lappend_oid(fgoids, InvalidOid);
-				fgconsts = lappend(fgconsts, copyObject(t->driveconst[0]));
+				base->fgidxoid[i] = InvalidOid;
+				base->fgconst[i] = copyObject(t->driveconst[0]);
 			}
 			else
 			{
 				Assert(t->driveidx[0] != NULL);
-				fgoids = lappend_oid(fgoids, t->driveidx[0]->indexoid);
-				fgconsts = lappend(fgconsts, makeBoolConst(false, true));
+				base->fgidxoid[i] = t->driveidx[0]->indexoid;
+				base->fgconst[i] = (Const *) makeBoolConst(false, true);
 			}
+			i++;
 		}
-		base = lappend(base, list_make3(list_make1_int((int) fgdrive->attno),
-										fgoids, fgconsts));
 	}
-	else
-		base = lappend(base, NIL);
-	base = lappend(base, NIL);	/* decoded walk: the dimension's groups */
-	base = lappend(base, NIL);	/* every row: the join key drives */
-	base = lappend(base, NIL);	/* top k: the Agg above groups */
-	base = lappend(base, NIL);	/* aggregates over a column's entries */
 
 	out->joinclause = joinclause;
 	out->targets = targets;
@@ -1499,8 +1469,6 @@ lion_fkjoin_setup(PlannerInfo *root, RelOptInfo *rel, const LionFkJoin *fj,
 	out->fkpages = fkpages;
 	out->whereclauses = whereclauses;
 	out->wherekinds = wherekinds;
-	out->consts = consts;
-	out->base = base;
 	return true;
 }
 
@@ -1564,7 +1532,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	double		fkpages;		/* the fk index's pages, in every partition */
 	PathTarget *nodetarget;
 	List	   *consts;
-	List	   *base;
+	const LionCountPriv *base;
 	double		dimrows;
 	double		found;
 	int			jointype;
@@ -1807,8 +1775,8 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	fkpages = setup.fkpages;
 	whereclauses = setup.whereclauses;
 	wherekinds = setup.wherekinds;
-	consts = setup.consts;
-	base = setup.base;
+	consts = setup.base.consts;
+	base = &setup.base;
 
 	/*
 	 * ---- what every path of it carries ----
@@ -2112,7 +2080,7 @@ lion_add_semijoin_path(PlannerInfo *root, const LionFkJoin *fj,
 #if PG_VERSION_NUM >= 170000
 	cpath->custom_restrictinfo = NIL;
 #endif
-	cpath->custom_private = lion_fkjoin_private(setup->base,
+	cpath->custom_private = lion_fkjoin_private(&setup->base,
 												setup->joinclause, jointype,
 												flags, InvalidOid, InvalidOid);
 	cpath->methods = (jointype == LION_JOIN_ANTI) ?
@@ -2214,7 +2182,7 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	parallel = (joinrel->consider_parallel && rel->consider_parallel &&
 				outerrel->consider_parallel &&
-				is_parallel_safe(root, (Node *) setup.consts));
+				is_parallel_safe(root, (Node *) setup.base.consts));
 
 	/*
 	 * ---- serial: over each path of the outer side ----
