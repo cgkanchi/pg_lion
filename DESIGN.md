@@ -17410,11 +17410,11 @@ model prefers.
 | `pg_lion.agg_rate` | 1.0 | a plain or sorted aggregate over a scan | 401 to 695 over sequential scans, 415 to 536 over index-only ones, 699 sorted: around the reference by construction (§10 fitted lion to these); 263 on the repro |
 | `pg_lion.hashjoin_rate` | 0.5 | a hash join | 280 and 283 with 1,000 and 4,400 rows hashed, 185 at 140,000, 57 at 1.4M (in batches); 219 parallel |
 | `pg_lion.mergejoin_rate` | 1.0 | a merge join | none measured |
-| `pg_lion.nestloop_rate` | 2.0 | a nested loop into a parameterized index or bitmap scan | 1,057 into a btree; about 2,000 over warm indexes (§31, `fk fwd tsq dim2 1.2k`) |
 | `pg_lion.bitmap_rate` | 1.0 | a bitmap heap scan | 4,419, 1,702, 544 for 500, 25,000 and 250,000 scattered rows; about 70 for §22's BitmapAnd |
 
-Sequential, index-only and plain index scans are the reference and have no setting, and so is
-everything else (`OTHER`: a function scan, a MinMaxAgg, a nested loop over a materialized side).
+Sequential, index-only and plain index scans are the reference and have no setting, and so are
+nested loops (below, "Held out") and everything else (`OTHER`: a function scan, a MinMaxAgg, a
+nested loop over a materialized side).
 
 - **Hashed aggregates, 0.42.** Both measurements and both machines agree: hashing is charged one or
   two `cpu_operator_cost` a row for about 94 ns (§10), and every plan with a hash aggregate runs at
@@ -17423,10 +17423,12 @@ everything else (`OTHER`: a function scan, a MinMaxAgg, a nested loop over a mat
 - **Hash joins, 0.5.** The FK-side join's competitor is a hash join of the fact with a filtered
   dimension, the small-hash end of §10's measurements (0.56, 0.57); joins that hash more run lower
   (0.37 at 140,000 rows, 0.11 in batches). 0.5 is the conservative end: a lower rate favours lion.
-- **Nested loops, 2.0.** A nested loop into an index is charged a random page a probe of a warm
-  index; it is the one kind whose plans run ABOVE the reference, and §31's one remaining FK-join
-  mispick (the node 36.9 ms at 13,700 against a nested loop's 11.8 at 23,800) is it. 2.0 is §10's
-  measurement, the low end; §31's 2,000 would be 4.
+- **Nested loops, the reference.** §10 measured a nested loop into an index at 1,057 units a
+  millisecond, §31 about 2,000 over warm indexes (`fk fwd tsq dim2 1.2k`). A rate of 2.0 built from
+  those changed no plan of the two matrices and was taken out ("Held out", below). §31's FK-join
+  mispick against a nested loop, which 2.0 would have priced away, did not reproduce on the held-out
+  tables: over 14 dimension sets of 250 to 375,000 keys, lion's node was chosen at either rate and
+  was the faster plan or within noise of it.
 - **Aggregates over a scan, 1.0.** Around the reference by construction - lion was fitted to the
   middle of these very plans. The repro measured 0.53 on another machine and version, where lion's
   own reference would have to be measured again too; the setting is there for that.
@@ -17641,7 +17643,7 @@ python3 bench/calib/matrix.py --label before --out before.json
 python3 bench/calib/matrix.py --label after --out after.json
 python3 bench/calib/matrix.py --label own --out own.json --set pg_lion.pushdown_margin=1 \
     --set pg_lion.hashagg_rate=1 --set pg_lion.agg_rate=1 --set pg_lion.hashjoin_rate=1 \
-    --set pg_lion.mergejoin_rate=1 --set pg_lion.nestloop_rate=1 --set pg_lion.bitmap_rate=1
+    --set pg_lion.mergejoin_rate=1 --set pg_lion.bitmap_rate=1
 python3 bench/calib/matrix.py compare before.json after.json
 ```
 
@@ -17736,7 +17738,7 @@ an index-only scan and run 1.4 times faster.
 | hash aggregate | 18 | 212 | 121 | 799 | 0.62 | 0.42 | `hashagg_rate` 0.42 |
 | hash join | 19 | 298 | 175 | 558 | 0.87 | 0.60 | `hashjoin_rate` 0.5 |
 | merge join | 7 | 547 | 213 | 675 | 1.59 | 1.09 | `mergejoin_rate` 1 |
-| nested loop | 12 | 516 | 167 | 2,258 | 1.50 | 1.03 | `nestloop_rate` 2 |
+| nested loop | 12 | 516 | 167 | 2,258 | 1.50 | 1.03 | the reference, 1 |
 | aggregate over the AM's bitmap scan | 20 | 870 | 52 | 20,242 | | | (lion's model) |
 | index scan in order, under a LIMIT | 4 | 54 | 40 | 115 | | 0.11 | (LionOrdered's competitor) |
 | LionOrdered | 6 | 908 | 276 | 4,294 | | | |
@@ -17753,6 +17755,43 @@ in the first own run's sweeps, no choice of the 39 moves with `hashagg_rate` fro
 `nestloop_rate` from 1 to 4, and one moves with `hashjoin_rate` - `fk.status.kind`, which 0.5
 decides for lion, 1.2 to 1.3 times faster, and 0.87 would give back to the hash join. Refit on a
 release build, over the near ties rather than the medians, they may move; not on this evidence.
+
+### Held out
+
+The rates were fitted on the matrix's own 39 queries, whose choices barely depend on them (above).
+`bench/calib/heldout.sql` and `heldout.py` are 41 queries the model was never fitted to, on a
+different schema: 3M rows with 10% dirtied, a column of geometric skew, 24 runs of uneven length
+in heap order, a 30% NULL column, 300 text tags, and dimensions of 64, 300,000 and 1.5M keys. A
+release build of PostgreSQL 18, five repetitions, the margin at 1; a mispick is a chosen plan 15%
+and 0.05 ms slower than the fastest of the matrix's arms.
+
+```sh
+python3 bench/calib/matrix.py --setup-only --rows 3000000 --dirty 10 --setup-file bench/calib/heldout.sql
+python3 bench/calib/matrix.py --queries bench/calib/heldout.py --sweep pg_lion.pushdown_margin=1 \
+    --repeats 5 --label default --out ho_default.json
+```
+
+| rates | calibration set (39): mispicks, time lost | held out (41): mispicks, time lost | held-out plans changed |
+|---|---|---|---|
+| hash aggregate 0.42, hash join 0.5, nested loop 2 | 3, 81 ms of 514 | 10, 509 ms of 4,549 | |
+| all three at 1 | 3, 76 ms of 539 | 13, 1,182 ms of 5,254 | 9 |
+| only `hashagg_rate` at 1 | | 13, 1,188 ms | 8 GROUP BYs |
+| only `hashjoin_rate` at 1 | | 10, 562 ms | 1, `h.fk.semi.d10` |
+| only the nested loop's at 1 | | 10, 557 ms | none |
+
+Differences of about 50 ms in time lost with no plan changed are the fastest arm's noise.
+
+- `hashagg_rate` carries most of the layer: at 1, six GROUP BYs over the whole table go to a hash
+  aggregate 1.0 to 2.4 times slower (`h.group.c5` 261 ms to 461, `h.group.c50.c5` 197 to 476).
+  The calibration set cannot show it: none of its GROUP BYs sits near the boundary.
+- `hashjoin_rate` decides two near ties, `fk.status.kind` in the calibration set and
+  `h.fk.semi.d10`. Timed seven times each on their own, the node is the faster in both (47 ms
+  against 58; 52 against 73), though one matrix run had the hash join ahead in the second. It stays.
+- The nested loop's rate moved nothing, and is gone.
+
+What the held-out set found that no constant rate can fix: two GROUP BYs under a selective WHERE
+(`h.group.tag.w.c50`, `h.group.c1k.w.geo`) where the node, chosen at any of these rates, takes 148
+and 256 ms against a hash aggregate's 46 and 85.
 
 ### Tests
 

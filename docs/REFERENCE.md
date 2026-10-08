@@ -329,8 +329,8 @@ was fitted at, and changing one changes plans, not results. Settable per session
 
 Rate settings (DESIGN.md §39, "The competitor's units"). The cost settings above are fitted at 500
 cost units a millisecond, the rate of PostgreSQL's own sequential and index-only scans; its other
-plans run at rates of their own - a hash aggregate at about 200, a nested loop into a warm index at
-1,000 or more. A `LionCount`, `LionSemiJoin` or `LionAntiJoin` path is priced in the units of the
+plans run at rates of their own - a hash aggregate at about 200, a hash join at about 250. A kind
+of plan with no setting below (scans, nested loops) is priced at the reference, 1. A `LionCount`, `LionSemiJoin` or `LionAntiJoin` path is priced in the units of the
 cheapest PostgreSQL plan it competes with: its own price, pages and CPU alike, times that kind of
 plan's rate below, so its cost in `EXPLAIN` is that plan's units; which of its own forms Lion runs
 is decided before, in its own units. Set a rate to 1 to price Lion as fitted against that kind of
@@ -347,7 +347,6 @@ planner's mispicks, on synthetic tables (DESIGN.md §39, "The matrix").
 | `agg_rate` | 1.0 | a plain or sorted aggregate over a scan |
 | `hashjoin_rate` | 0.5 | a hash join |
 | `mergejoin_rate` | 1.0 | a merge join |
-| `nestloop_rate` | 2.0 | a nested loop into a parameterized index or bitmap scan |
 | `bitmap_rate` | 1.0 | a bitmap heap scan |
 
 `pg_lion.pushdown_margin` (1, no margin): the share of the cheapest competing plan's cost a Lion

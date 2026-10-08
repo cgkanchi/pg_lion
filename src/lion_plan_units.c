@@ -304,7 +304,8 @@ lion_competitor_kind(Path *path)
 /*
  * The rate of a kind of core plan: the cost units a millisecond its plans
  * run at, as a multiple of the 500 lion's CPU constants are fitted at.  The
- * scans the constants were fitted against are the reference, 1.
+ * scans the constants were fitted against are the reference, 1, and so are
+ * nested loops, whose rate moved no plan (DESIGN.md §39, "Held out").
  */
 double
 lion_competitor_rate(LionCompetitor kind)
@@ -319,12 +320,11 @@ lion_competitor_rate(LionCompetitor kind)
 			return lion_hashjoin_rate;
 		case LION_COMPETITOR_MERGEJOIN:
 			return lion_mergejoin_rate;
-		case LION_COMPETITOR_NESTLOOP:
-			return lion_nestloop_rate;
 		case LION_COMPETITOR_BITMAP:
 			return lion_bitmap_rate;
 		case LION_COMPETITOR_NONE:
 		case LION_COMPETITOR_DISABLED:
+		case LION_COMPETITOR_NESTLOOP:
 		case LION_COMPETITOR_SEQSCAN:
 		case LION_COMPETITOR_INDEXONLY:
 		case LION_COMPETITOR_INDEX:
