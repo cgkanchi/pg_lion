@@ -1015,6 +1015,25 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 static void
 lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 {
+	LionRangedState *rs = st->ranged;
+	int64		workerwherecollected = 0;
+	int64		workerwherespilled = 0;
+	int64		workergroupbatches = 0;
+	int64		workergroupsbatched = 0;
+
+	/*
+	 * A parallel GROUP BY's workers' counters (DESIGN.md §10, "A GROUP BY
+	 * in parallel"): it is the only node whose workers collect WHERE sets
+	 * or count groups in batches.
+	 */
+	if (rs != NULL)
+	{
+		workerwherecollected = rs->workerwherecollected;
+		workerwherespilled = rs->workerwherespilled;
+		workergroupbatches = rs->workergroupbatches;
+		workergroupsbatched = rs->workergroupsbatched;
+	}
+
 	/*
 	 * The WHERE items of a GROUP BY collected into one set that the groups
 	 * were counted against (DESIGN.md §10, "The WHERE sets, collected
@@ -1022,13 +1041,13 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 	 * that did; and of those, the ones past a hash table's memory that
 	 * went to a temporary file.  Only when there were any.
 	 */
-	if (st->wherecollected + st->workerwherecollected > 0)
+	if (st->wherecollected + workerwherecollected > 0)
 		ExplainPropertyInteger("WHERE Sets Collected", NULL,
 							   st->wherecollected +
-							   st->workerwherecollected, es);
-	if (st->wherespilled + st->workerwherespilled > 0)
+							   workerwherecollected, es);
+	if (st->wherespilled + workerwherespilled > 0)
 		ExplainPropertyInteger("WHERE Sets Spilled", NULL,
-							   st->wherespilled + st->workerwherespilled,
+							   st->wherespilled + workerwherespilled,
 							   es);
 
 	/*
@@ -1036,13 +1055,13 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 	 * walk of container keys each (DESIGN.md §10, "The groups of a walk,
 	 * counted together").  Only when there were any.
 	 */
-	if (st->groupbatches + st->workergroupbatches > 0)
+	if (st->groupbatches + workergroupbatches > 0)
 	{
 		ExplainPropertyInteger("Group Batches", NULL,
-							   st->groupbatches + st->workergroupbatches,
+							   st->groupbatches + workergroupbatches,
 							   es);
 		ExplainPropertyInteger("Groups Counted in Batches", NULL,
-							   st->groupsbatched + st->workergroupsbatched,
+							   st->groupsbatched + workergroupsbatched,
 							   es);
 	}
 
@@ -1073,9 +1092,9 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 	 * entries - which is every range of the cut, whichever participants
 	 * took them.
 	 */
-	if (st->granged)
+	if (rs != NULL)
 		ExplainPropertyInteger("Key Ranges", NULL,
-							   st->granges + st->workerranges, es);
+							   rs->ranges + rs->workerranges, es);
 
 	/*
 	 * The batches an IN list too long to locate at once was counted in

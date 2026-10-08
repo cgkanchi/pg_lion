@@ -1540,6 +1540,29 @@ typedef struct LionWaggState
 } LionWaggState;
 
 /*
+ * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel"): each
+ * participant claims a range of container keys at a time (lion_key_ranges(),
+ * the counter in the node's shared struct), collects the WHERE of that range
+ * alone into wherecoll - in cxt, emptied at the next range - and counts every
+ * group of the entry walk against it, a partial row per group; the Finalize
+ * Agg above adds a group's rows up.  range is the range being counted, -1
+ * between them, and ranges how many this participant counted, which EXPLAIN
+ * ANALYZE reports with the workers' (workerranges, and the workers'
+ * collections and batches beside it).
+ */
+typedef struct LionRangedState
+{
+	int			range;
+	MemoryContext cxt;
+	int64		ranges;
+	int64		workerranges;
+	int64		workerwherecollected;
+	int64		workerwherespilled;
+	int64		workergroupbatches;
+	int64		workergroupsbatched;
+} LionRangedState;
+
+/*
  * What the node does, fixed by the plan at begin (lion_count_mode_of()) and
  * dispatched on by the run: the one choice among the shapes below, in the
  * order the run tries them.  Whether the table is partitioned is apart from
@@ -1854,26 +1877,13 @@ typedef struct LionCountScanState
 	struct LionWaggState *wagg;
 
 	/*
-	 * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel"; granged,
-	 * the plan node being parallel-aware and no join): each participant claims
-	 * a range of container keys at a time (lion_key_ranges(), the counter in
-	 * joinshared), collects the WHERE of that range alone into wherecoll - in
-	 * grangecxt, emptied at the next range - and counts every group of the
-	 * entry walk against it, a partial row per group; the Finalize Agg above
-	 * adds a group's rows up.  grange is the range being counted, -1 between
-	 * them, and granges how many this participant counted, which EXPLAIN
-	 * ANALYZE reports with the workers' (workerranges, and the workers'
-	 * collections and batches beside it).
+	 * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel"), or NULL
+	 * when the plan node is not parallel-aware or is a join
+	 * (lion_st_ranged()).  It counts by ranges only when shared is set as
+	 * well; run without the Gather's shared memory, the node walks the
+	 * entries as the serial GROUP BY does.
 	 */
-	bool		granged;
-	int			grange;
-	MemoryContext grangecxt;
-	int64		granges;
-	int64		workerranges;
-	int64		workerwherecollected;
-	int64		workerwherespilled;
-	int64		workergroupbatches;
-	int64		workergroupsbatched;
+	struct LionRangedState *ranged;
 
 	/*
 	 * An IN list too long to locate at once (DESIGN.md §15, "A list too long
@@ -2105,12 +2115,13 @@ typedef struct LionCountScanState
 	/*
 	 * A parallel FK-side join (DESIGN.md §27, "Parallel"): every participant
 	 * counts the dimension rows its share of the child returns and adds what
-	 * EXPLAIN ANALYZE reports into joinshared, in the dynamic shared memory
-	 * of the Gather above it, when it shuts down; the leader copies the sums
+	 * EXPLAIN ANALYZE reports into shared, in the dynamic shared memory of
+	 * the Gather above it, when it shuts down; the leader copies the sums
 	 * into the joinworker fields before that memory goes.  They are NULL,
-	 * zero and -1 outside a parallel plan.
+	 * zero and -1 outside a parallel plan.  A parallel GROUP BY (ranged)
+	 * keeps its ranges and its counters' sums in the same struct.
 	 */
-	struct LionJoinShared *joinshared;
+	struct LionJoinShared *shared;
 	bool		joinreported;
 
 	/*
@@ -2237,6 +2248,14 @@ lion_st_lbatch(LionCountScanState *st)
 {
 	Assert(st->lbatch != NULL);
 	return st->lbatch;
+}
+
+/* A parallel GROUP BY's ranges, which only a parallel non-join has (§10) */
+static inline LionRangedState *
+lion_st_ranged(LionCountScanState *st)
+{
+	Assert(st->ranged != NULL);
+	return st->ranged;
 }
 
 /*
