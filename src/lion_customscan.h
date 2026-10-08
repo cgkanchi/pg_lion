@@ -1563,6 +1563,42 @@ typedef struct LionRangedState
 } LionRangedState;
 
 /*
+ * The FK-side join grouped by a fact column (DESIGN.md §27, "Grouped by a
+ * fact column"): attno is the column, in the parent's numbering.  Each batch
+ * of keys is taken to each relation in turn - the plain table once, or every
+ * leaf partition (turn is the next) - and each key is counted there once per
+ * group of the column: in a partition whose bounds give it one value, the
+ * key's count with that value; otherwise once per entry of the column's lion
+ * index (idxoid, or the partition's), a chunk of up to
+ * LION_FKJOIN_GROUP_CHUNK located sets at a time (sets and key, in cxt), each
+ * ANDed into the count as one more source (src).  The counts that are not 0
+ * wait in rows - their keys in rowcxt - until the relation's turn is over,
+ * and go up one a call.  groupcounts is how many counts there were, for
+ * EXPLAIN ANALYZE, and workergroupcounts the workers' sum.
+ */
+typedef struct LionFactGroupState
+{
+	AttrNumber	attno;
+	Oid			idxoid;
+	Relation	idx;			/* a plain table's, open for the node's life */
+	int			turn;
+	MemoryContext cxt;
+	MemoryContext rowcxt;
+	LionPostingSet *sets;
+	Datum	   *key;
+	bool	   *isnull;
+	int			n;
+	LionCountSource *src;
+	int			nsrc;
+	LionJoinGroupRow *rows;
+	int			nrows;
+	int			rowcap;
+	int			rowpos;
+	int64		groupcounts;
+	int64		workergroupcounts;
+} LionFactGroupState;
+
+/*
  * What the node does, fixed by the plan at begin (lion_count_mode_of()) and
  * dispatched on by the run: the one choice among the shapes below, in the
  * order the run tries them.  Whether the table is partitioned is apart from
@@ -2170,36 +2206,9 @@ typedef struct LionCountScanState
 
 	/*
 	 * The FK-side join grouped by a fact column (DESIGN.md §27, "Grouped by a
-	 * fact column"): fgattno is the column, in the parent's numbering, or 0.
-	 * Each batch of keys is taken to each relation in turn - the plain table
-	 * once, or every leaf partition (fgturn is the next) - and each key is
-	 * counted there once per group of the column: in a partition whose
-	 * bounds give it one value, the key's count with that value; otherwise
-	 * once per entry of the column's lion index (fgidxoid, or the
-	 * partition's), a chunk of up to LION_FKJOIN_GROUP_CHUNK located sets at a
-	 * time (fgsets and fgkey, in fgcxt), each ANDed into the count as one more
-	 * source (fgsrc).  The counts that are not 0 wait in fgrows - their keys
-	 * in fgrowcxt - until the relation's turn is over, and go up one a call.
-	 * fggroupcounts is how many counts there were, for EXPLAIN ANALYZE.
+	 * fact column"), or NULL for every other shape (lion_st_fg()).
 	 */
-	AttrNumber	fgattno;
-	Oid			fgidxoid;
-	Relation	fgidx;			/* a plain table's, open for the node's life */
-	int			fgturn;
-	MemoryContext fgcxt;
-	MemoryContext fgrowcxt;
-	LionPostingSet *fgsets;
-	Datum	   *fgkey;
-	bool	   *fgnull;
-	int			fgn;
-	LionCountSource *fgsrc;
-	int			fgnsrc;
-	LionJoinGroupRow *fgrows;
-	int			fgnrows;
-	int			fgrowcap;
-	int			fgrowpos;
-	int64		fggroupcounts;
-	int64		fgworkergroupcounts;
+	struct LionFactGroupState *fg;
 } LionCountScanState;
 
 /* The top k's state, which only a plan with a k has (DESIGN.md §36) */
@@ -2256,6 +2265,14 @@ lion_st_ranged(LionCountScanState *st)
 {
 	Assert(st->ranged != NULL);
 	return st->ranged;
+}
+
+/* A fact column's groups, which only a join grouped by one has (§27) */
+static inline LionFactGroupState *
+lion_st_fg(LionCountScanState *st)
+{
+	Assert(st->fg != NULL);
+	return st->fg;
 }
 
 /*
