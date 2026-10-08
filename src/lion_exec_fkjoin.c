@@ -108,13 +108,14 @@ lion_rescan_join_agg(CustomScanState *node)
 static inline void
 lion_join_clock(LionCountScanState *st, int phase, instr_time *since)
 {
+	LionJoinState *js = lion_st_join(st);
 	instr_time	now;
 
-	if (!st->jointiming)
+	if (!js->timing)
 		return;
 	INSTR_TIME_SET_CURRENT(now);
 	if (phase >= 0)
-		INSTR_TIME_ACCUM_DIFF(st->jointime[phase], now, *since);
+		INSTR_TIME_ACCUM_DIFF(js->time[phase], now, *since);
 	*since = now;
 }
 
@@ -141,15 +142,16 @@ lion_join_locate_where(LionCountScanState *st)
 static TupleTableSlot *
 lion_join_child_next(LionCountScanState *st)
 {
+	LionJoinState *js = lion_st_join(st);
 	TupleTableSlot *slot;
 	instr_time	t;
 
 	INSTR_TIME_SET_ZERO(t);
 	lion_join_clock(st, -1, &t);
-	slot = ExecProcNode(st->child);
+	slot = ExecProcNode(js->child);
 	lion_join_clock(st, LION_JT_CHILD, &t);
 	if (!TupIsNull(slot))
-		st->joinchildrows++;
+		js->childrows++;
 	return slot;
 }
 
@@ -185,22 +187,23 @@ lion_join_child_next(LionCountScanState *st)
 static int64
 lion_join_count_key(LionCountScanState *st)
 {
+	LionJoinState *js = lion_st_join(st);
 	int64		pages = lion_posting_pages_read;
 	int64		visited = st->stats.containers_visited;
 	int64		keyc = st->stats.key_containers;
 	int64		copyc = st->stats.copy_containers;
 	int64		unions = st->stats.unions_built;
 	int64		count;
-	bool		exists = (st->jointype != LION_JOIN_INNER ||
-						  (st->joinrows && !st->joincounts));
+	bool		exists = (js->type != LION_JOIN_INNER ||
+						  (js->rows && !js->counts));
 
-	count = st->joinfiltered ?
-		lion_node_count(st, 2, st->joinsources, exists) :
+	count = js->filtered ?
+		lion_node_count(st, 2, js->sources, exists) :
 		lion_node_count(st, st->nsource, st->sources, exists);
 	pages = lion_posting_pages_read - pages;
-	st->joinposting += pages;
+	js->posting += pages;
 
-	if (!st->joinfiltered && st->joinswitch)
+	if (!js->filtered && js->mayswitch)
 	{
 		double		key = (double) (st->stats.key_containers - keyc);
 		double		mem = (double) (st->stats.copy_containers - copyc);
@@ -222,8 +225,8 @@ lion_join_count_key(LionCountScanState *st)
 			(double) pages * LION_FKJOIN_PROBE_PAGE_COST +
 			(double) (st->stats.unions_built - unions) * LION_UNION_KEY_COST -
 			key * LION_FKJOIN_COPY_PROBE_COST;
-		*st->joinrentp = Max(*st->joinrentp + rent, 0.0);
-		(*st->joinprobedp)++;
+		*js->rentp = Max(*js->rentp + rent, 0.0);
+		(*js->probedp)++;
 	}
 	return count;
 }
@@ -264,20 +267,23 @@ lion_join_count_key(LionCountScanState *st)
  * account and makes its own copy, as the leader of a plan run without its
  * workers does: a probing plan has sized no shared copy, and the
  * participants reach the price at keys of their own.  Each run - each
- * rescan - starts its account again.
+ * rescan - starts its account again.  A node that is no join has none.
  */
 void
 lion_join_switch_reset(LionCountScanState *st)
 {
+	LionJoinState *js = st->join;
 	int			p;
 
-	st->joinswitch = (st->joinclause >= 0 && !st->joincollect &&
-					  lion_enable_filter_switch && !RecoveryInProgress());
-	st->joinrent = 0;
-	st->joinbuy = -1;
-	st->joinprobed = 0;
-	st->joinrentp = &st->joinrent;
-	st->joinprobedp = &st->joinprobed;
+	if (js == NULL)
+		return;
+	js->mayswitch = (!js->collect &&
+					 lion_enable_filter_switch && !RecoveryInProgress());
+	js->rent = 0;
+	js->buy = -1;
+	js->probed = 0;
+	js->rentp = &js->rent;
+	js->probedp = &js->probed;
 	if (st->joinpart != NULL)
 	{
 		for (p = 0; p < st->npart; p++)
@@ -503,7 +509,7 @@ lion_join_shares_copy(LionCountScanState *st, LionSharedCopy *shared)
 
 /*
  * The copy is made into *out, in memory context cxt, from the relation being
- * counted, and shared as `shared` says: st->joinfilter in outercxt for a
+ * counted, and shared as `shared` says: st->join->filter in outercxt for a
  * plain table, and each leaf partition's own copy for a partitioned one
  * (lion_join_part_open()), held for the whole run, all of them within the
  * one hash table's memory `budget` leaves them.  `force` makes it for a plan
@@ -515,6 +521,7 @@ lion_join_collect_into(LionCountScanState *st, LionPostingSet *out,
 					   MemoryContext cxt, LionSharedCopy *shared,
 					   bool *viewshared, Size budget, bool force)
 {
+	LionJoinState *js = lion_st_join(st);
 	EState	   *estate = st->css.ss.ps.state;
 	MemoryContext oldcxt;
 	LionCountStats cstats;
@@ -523,8 +530,8 @@ lion_join_collect_into(LionCountScanState *st, LionPostingSet *out,
 	bool		spilled;
 	int			k;
 
-	st->joincollected = true;
-	if ((!st->joincollect && !force) || st->wheremissing || st->nitem == 0)
+	js->collected = true;
+	if ((!js->collect && !force) || st->wheremissing || st->nitem == 0)
 		return;
 	if (RecoveryInProgress())
 		return;
@@ -603,17 +610,17 @@ lion_join_collect_into(LionCountScanState *st, LionPostingSet *out,
 	if (!ok)
 		return;
 
-	st->joinfiltered = true;
+	js->filtered = true;
 	if (st->npart > 0)
 	{
 		/* a partitioned fact table's copies are one per partition: summed */
 		st->joinrunfilterrows += (int64) out->ntids;
-		st->joinfilterrows = st->joinrunfilterrows;
+		js->filterrows = st->joinrunfilterrows;
 	}
 	else
-		st->joinfilterrows = (int64) out->ntids;
+		js->filterrows = (int64) out->ntids;
 	if (spilled)
-		st->joinspilled++;
+		js->spilled++;
 
 	/*
 	 * No count reads the WHERE sets again this run - each reads its fk set
@@ -625,14 +632,14 @@ lion_join_collect_into(LionCountScanState *st, LionPostingSet *out,
 	lion_unpin_where(st);
 
 	/*
-	 * Every count from here on reads its fk set and the copy - joinfiltered
+	 * Every count from here on reads its fk set and the copy - js->filtered
 	 * says so, whatever the copy holds.
 	 */
-	memset(st->joinsources, 0, sizeof(st->joinsources));
-	st->joinsources[0].nsets = 1;
-	st->joinsources[0].sets = &st->groupset;
-	st->joinsources[1].nsets = 1;
-	st->joinsources[1].sets = out;
+	memset(js->sources, 0, sizeof(js->sources));
+	js->sources[0].nsets = 1;
+	js->sources[0].sets = &st->groupset;
+	js->sources[1].nsets = 1;
+	js->sources[1].sets = out;
 
 	/*
 	 * The filters select no row at all: as a clause with no entry does, and
@@ -647,7 +654,9 @@ lion_join_collect_into(LionCountScanState *st, LionPostingSet *out,
 static void
 lion_join_collect(LionCountScanState *st)
 {
-	lion_join_collect_into(st, &st->joinfilter, st->outercxt,
+	LionJoinState *js = lion_st_join(st);
+
+	lion_join_collect_into(st, &js->filter, st->outercxt,
 						   st->joinsharedcopy, &st->joinviewshared,
 						   get_hash_memory_limit(), false);
 }
@@ -665,27 +674,29 @@ lion_join_collect(LionCountScanState *st)
 static void
 lion_join_maybe_switch(LionCountScanState *st)
 {
-	if (!st->joinswitch || st->joinfiltered)
+	LionJoinState *js = lion_st_join(st);
+
+	if (!js->mayswitch || js->filtered)
 		return;
-	if (st->joinbuy < 0)
-		st->joinbuy = lion_join_copy_price(st, get_hash_memory_limit());
-	if (st->joinbuy <= 0)
+	if (js->buy < 0)
+		js->buy = lion_join_copy_price(st, get_hash_memory_limit());
+	if (js->buy <= 0)
 	{
-		st->joinswitch = false;
+		js->mayswitch = false;
 		return;
 	}
-	if (st->joinrent < st->joinbuy)
+	if (js->rent < js->buy)
 		return;
 
-	st->joinswitch = false;
+	js->mayswitch = false;
 	if (st->joinwalkbegun)
 		lion_lookup_walk_pause(&st->joinwalker);
-	lion_join_collect_into(st, &st->joinfilter, st->outercxt, NULL,
+	lion_join_collect_into(st, &js->filter, st->outercxt, NULL,
 						   &st->joinviewshared, get_hash_memory_limit(), true);
-	if (st->joinfiltered)
+	if (js->filtered)
 	{
-		st->joinswitches++;
-		st->joinswitchkeys += st->joinprobed;
+		js->switches++;
+		js->switchkeys += js->probed;
 	}
 }
 
@@ -699,12 +710,13 @@ lion_join_maybe_switch(LionCountScanState *st)
 static void
 lion_join_part_maybe_switch(LionCountScanState *st, int p)
 {
+	LionJoinState *js = lion_st_join(st);
 	LionJoinPart *jp = &st->joinpart[p];
 	Size		limit;
 	Size		held;
 	Size		budget;
 
-	if (!st->joinswitch || st->joinfiltered || jp->buy == 0)
+	if (!js->mayswitch || js->filtered || jp->buy == 0)
 		return;
 	limit = get_hash_memory_limit();
 	held = MemoryContextMemAllocated(st->joinpartcxt, true);
@@ -721,13 +733,13 @@ lion_join_part_maybe_switch(LionCountScanState *st, int p)
 	lion_lookup_walk_pause(&st->joinwalker);
 	lion_join_collect_into(st, &jp->filter, jp->cxt, NULL, &jp->viewshared,
 						   budget, true);
-	jp->filtered = st->joinfiltered;
+	jp->filtered = js->filtered;
 	if (jp->filtered)
 	{
 		if (jp->filter.index != NULL)
 			jp->filterindex = RelationGetRelid(jp->filter.index);
-		st->joinswitches++;
-		st->joinswitchkeys += jp->probed;
+		js->switches++;
+		js->switchkeys += jp->probed;
 	}
 	jp->missing = st->wheremissing;
 }
@@ -744,6 +756,7 @@ lion_join_part_maybe_switch(LionCountScanState *st, int p)
 static void
 lion_join_sort_keys(LionCountScanState *st)
 {
+	LionJoinState *js = lion_st_join(st);
 	EState	   *estate = st->css.ss.ps.state;
 	MemoryContext oldcxt;
 
@@ -763,7 +776,7 @@ lion_join_sort_keys(LionCountScanState *st)
 		slot = lion_join_child_next(st);
 		if (TupIsNull(slot))
 			break;
-		key = slot_getattr(slot, st->joinkeyresno, &isnull);
+		key = slot_getattr(slot, js->keyresno, &isnull);
 		if (isnull)
 			continue;
 		tuplesort_putdatum(st->joinsort, key, false);
@@ -796,6 +809,7 @@ lion_join_sort_keys(LionCountScanState *st)
 static TupleTableSlot *
 lion_join_next_key(LionCountScanState *st)
 {
+	LionJoinState *js = lion_st_join(st);
 	TupleTableSlot *slot = st->joinsortslot;
 
 	for (;;)
@@ -835,8 +849,8 @@ lion_join_next_key(LionCountScanState *st)
 
 		memset(slot->tts_isnull, true,
 			   sizeof(bool) * slot->tts_tupleDescriptor->natts);
-		slot->tts_values[st->joinkeyresno - 1] = st->joinprevkey;
-		slot->tts_isnull[st->joinkeyresno - 1] = false;
+		slot->tts_values[js->keyresno - 1] = st->joinprevkey;
+		slot->tts_isnull[js->keyresno - 1] = false;
 		return ExecStoreVirtualTuple(slot);
 	}
 }
@@ -931,13 +945,14 @@ lion_join_batch_reset(LionCountScanState *st)
 static bool
 lion_join_fill_batch(LionCountScanState *st)
 {
-	bool		anti = (st->jointype == LION_JOIN_ANTI);
+	LionJoinState *js = lion_st_join(st);
+	bool		anti = (js->type == LION_JOIN_ANTI);
 	Size		limit = (Size) work_mem * 1024;
 	MemoryContext oldcxt;
 	int			n = 0;
 
 	ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
-	st->childslot = NULL;
+	js->childslot = NULL;
 	lion_join_batch_reset(st);
 	lion_pause_run(st);
 
@@ -961,7 +976,7 @@ lion_join_fill_batch(LionCountScanState *st)
 			st->joinchilddone = true;
 			break;
 		}
-		key = slot_getattr(slot, st->joinkeyresno, &isnull);
+		key = slot_getattr(slot, js->keyresno, &isnull);
 		if (isnull && !anti)
 			continue;
 
@@ -1013,6 +1028,8 @@ lion_join_fill_batch(LionCountScanState *st)
 static void
 lion_join_batch_row(LionCountScanState *st, const LionJoinEnt *ent)
 {
+	LionJoinState *js = lion_st_join(st);
+
 	if (st->joinunique)
 	{
 		TupleTableSlot *slot = st->joinsortslot;
@@ -1020,12 +1037,12 @@ lion_join_batch_row(LionCountScanState *st, const LionJoinEnt *ent)
 		ExecClearTuple(slot);
 		memset(slot->tts_isnull, true,
 			   sizeof(bool) * slot->tts_tupleDescriptor->natts);
-		slot->tts_values[st->joinkeyresno - 1] = ent->key;
-		slot->tts_isnull[st->joinkeyresno - 1] = false;
-		st->childslot = ExecStoreVirtualTuple(slot);
+		slot->tts_values[js->keyresno - 1] = ent->key;
+		slot->tts_isnull[js->keyresno - 1] = false;
+		js->childslot = ExecStoreVirtualTuple(slot);
 	}
 	else
-		st->childslot = ExecStoreMinimalTuple(ent->tuple, st->joinbatchslot,
+		js->childslot = ExecStoreMinimalTuple(ent->tuple, st->joinbatchslot,
 											  false);
 }
 
@@ -1092,7 +1109,8 @@ lion_join_lookup_ent(LionCountScanState *st, const LionJoinEnt *ent,
 static bool
 lion_join_next_walked(LionCountScanState *st, int64 *countp)
 {
-	bool		anti = (st->jointype == LION_JOIN_ANTI);
+	LionJoinState *js = lion_st_join(st);
+	bool		anti = (js->type == LION_JOIN_ANTI);
 
 	for (;;)
 	{
@@ -1130,22 +1148,22 @@ lion_join_next_walked(LionCountScanState *st, int64 *countp)
 			 */
 			if (!anti)
 				continue;
-			if (!st->joinsum)
+			if (!js->sum)
 				lion_join_batch_row(st, ent);
 			*countp = 1;
 			return true;
 		}
-		st->joinlookups++;
+		js->lookups++;
 		count = lion_join_lookup_ent(st, ent, true, -1, &found);
 
 		if (!found)
-			st->joinmissing++;
+			js->missing++;
 		if (anti)
 			count = 1 - count;	/* no entry, or a test that found nothing */
 		if (count == 0)
 			continue;
 
-		if (!st->joinsum)
+		if (!js->sum)
 			lion_join_batch_row(st, ent);
 		*countp = count;
 		return true;
@@ -1176,10 +1194,10 @@ lion_join_next_walked(LionCountScanState *st, int64 *countp)
  * stopped at the first visible row) and the partial count is 1.  An ANTI
  * join's row is the dimension row that joins none: a NULL key, a key with no
  * entry, a key whose test finds nothing, and every row when a fact filter
- * selects nothing at all.  The rows of a count(DISTINCT) (joinrows) are the
+ * selects nothing at all.  The rows of a count(DISTINCT) (js->rows) are the
  * same existence tests over an inner join: the dimension rows that join,
  * once each, with no count at all - unless they carry their counts
- * (joincounts), when each is the inner join's count, for the Agg above to
+ * (js->counts), when each is the inner join's count, for the Agg above to
  * add up in place of count() (DESIGN.md §27, "Every aggregate over the
  * node's rows").
  *
@@ -1190,7 +1208,7 @@ lion_join_next_walked(LionCountScanState *st, int64 *countp)
  * keys cannot both equal it - so the counts add up to the fact rows with at
  * least one matching dimension row, each once: the semi join's count.
  *
- * A summed join (joinsum, lion_next_join_row()) wants no row, only the
+ * A summed join (js->sum, lion_next_join_row()) wants no row, only the
  * count: the child's next row is fetched with no pin of the node's held
  * (lion_pause_run(), which has something to let go of only the first time -
  * the WHERE sets' pins - as a row-at-a-time join that hands its rows up lets
@@ -1199,7 +1217,8 @@ lion_join_next_walked(LionCountScanState *st, int64 *countp)
 static bool
 lion_join_next_row(LionCountScanState *st, int64 *countp)
 {
-	bool		anti = (st->jointype == LION_JOIN_ANTI);
+	LionJoinState *js = lion_st_join(st);
+	bool		anti = (js->type == LION_JOIN_ANTI);
 	MemoryContext oldcxt;
 
 	for (;;)
@@ -1219,32 +1238,32 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
 		 */
 		if (st->wheremissing && !anti)
 		{
-			st->childslot = NULL;
+			js->childslot = NULL;
 			return false;
 		}
 
-		if (st->joinsum)
+		if (js->sum)
 			lion_pause_run(st);
 		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
 		childslot = st->joinunique ? lion_join_next_key(st) :
 			lion_join_child_next(st);
 		if (TupIsNull(childslot))
 		{
-			st->childslot = NULL;
+			js->childslot = NULL;
 			return false;
 		}
 
-		key = slot_getattr(childslot, st->joinkeyresno, &isnull);
+		key = slot_getattr(childslot, js->keyresno, &isnull);
 		if (isnull || st->wheremissing)
 		{
 			/* joins nothing: a row only of an anti join */
 			if (!anti)
 				continue;
-			st->childslot = childslot;
+			js->childslot = childslot;
 			*countp = 1;
 			return true;
 		}
-		st->joinlookups++;
+		js->lookups++;
 
 		INSTR_TIME_SET_ZERO(t);
 		lion_join_clock(st, -1, &t);
@@ -1258,10 +1277,10 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
 		{
 			lion_posting_set_release(&st->groupset);
 			MemoryContextSwitchTo(oldcxt);
-			st->joinmissing++;
+			js->missing++;
 			if (!anti)
 				continue;
-			st->childslot = childslot;
+			js->childslot = childslot;
 			*countp = 1;
 			return true;
 		}
@@ -1279,7 +1298,7 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
 		if (count == 0)
 			continue;
 
-		st->childslot = childslot;
+		js->childslot = childslot;
 		*countp = count;
 		return true;
 	}
@@ -1327,8 +1346,9 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
 static void
 lion_join_part_open(LionCountScanState *st, int p)
 {
+	LionJoinState *js = lion_st_join(st);
 	LionJoinPart *jp = &st->joinpart[p];
-	LionClauseState *jcl = &st->clause[st->joinclause];
+	LionClauseState *jcl = &st->clause[js->clause];
 	MemoryContext oldcxt;
 	int			i;
 
@@ -1340,7 +1360,7 @@ lion_join_part_open(LionCountScanState *st, int p)
 	MemoryContextSwitchTo(oldcxt);
 	st->joinwalkbegun = true;
 	st->joinlasthave = false;
-	st->joinfiltered = false;
+	js->filtered = false;
 
 	if (jp->collected && jp->filtered)
 	{
@@ -1363,12 +1383,12 @@ lion_join_part_open(LionCountScanState *st, int p)
 		lion_build_filter(st);
 		st->located = true;
 		st->wheremissing = jp->missing;
-		st->joinfiltered = true;
-		memset(st->joinsources, 0, sizeof(st->joinsources));
-		st->joinsources[0].nsets = 1;
-		st->joinsources[0].sets = &st->groupset;
-		st->joinsources[1].nsets = 1;
-		st->joinsources[1].sets = &jp->filter;
+		js->filtered = true;
+		memset(js->sources, 0, sizeof(js->sources));
+		js->sources[0].nsets = 1;
+		js->sources[0].sets = &st->groupset;
+		js->sources[1].nsets = 1;
+		js->sources[1].sets = &jp->filter;
 		return;
 	}
 
@@ -1378,14 +1398,14 @@ lion_join_part_open(LionCountScanState *st, int p)
 	 * collected"): its directory pages go on the leaf's account, as the
 	 * counts' posting pages do.
 	 */
-	st->joinrentp = &jp->rent;
-	st->joinprobedp = &jp->probed;
+	js->rentp = &jp->rent;
+	js->probedp = &jp->probed;
 	if (jp->collected)
 	{
 		int64		dirpages = lion_dir_pages_read;
 
 		lion_join_locate_where(st);
-		if (st->joinswitch)
+		if (js->mayswitch)
 			jp->rent += (double) (lion_dir_pages_read - dirpages) *
 				LION_DESCENT_COST;
 		return;					/* probed, and located again each turn */
@@ -1395,7 +1415,7 @@ lion_join_part_open(LionCountScanState *st, int p)
 	jp->collected = true;
 	for (i = 0; i < st->nclause; i++)
 		jp->qmode[i] = st->clause[i].qmode;
-	if (st->joincollect)
+	if (js->collect)
 	{
 		Size		limit = get_hash_memory_limit();
 		Size		held = MemoryContextMemAllocated(st->joinpartcxt, true);
@@ -1403,7 +1423,7 @@ lion_join_part_open(LionCountScanState *st, int p)
 		lion_join_collect_into(st, &jp->filter, jp->cxt, jp->shared,
 							   &jp->viewshared,
 							   (held < limit) ? limit - held : 0, false);
-		jp->filtered = st->joinfiltered;
+		jp->filtered = js->filtered;
 		if (jp->filtered && jp->filter.index != NULL)
 			jp->filterindex = RelationGetRelid(jp->filter.index);
 	}
@@ -1414,6 +1434,8 @@ lion_join_part_open(LionCountScanState *st, int p)
 static void
 lion_join_part_close(LionCountScanState *st)
 {
+	LionJoinState *js = lion_st_join(st);
+
 	if (st->joinwalkbegun)
 	{
 		lion_lookup_walk_pause(&st->joinwalker);
@@ -1421,10 +1443,10 @@ lion_join_part_close(LionCountScanState *st)
 	}
 	lion_posting_set_release(&st->groupset);
 	lion_release_where(st);
-	st->joinfiltered = false;
-	memset(st->joinsources, 0, sizeof(st->joinsources));
-	st->joinrentp = &st->joinrent;
-	st->joinprobedp = &st->joinprobed;
+	js->filtered = false;
+	memset(js->sources, 0, sizeof(js->sources));
+	js->rentp = &js->rent;
+	js->probedp = &js->probed;
 	lion_close_relation(st);
 	MemoryContextReset(st->joinvisitcxt);
 }
@@ -1466,8 +1488,9 @@ lion_join_part_sort(LionCountScanState *st)
 static void
 lion_join_count_parts(LionCountScanState *st)
 {
-	bool		exists = (st->jointype != LION_JOIN_INNER ||
-						  (st->joinrows && !st->joincounts));
+	LionJoinState *js = lion_st_join(st);
+	bool		exists = (js->type != LION_JOIN_INNER ||
+						  (js->rows && !js->counts));
 	int			p;
 	int			k;
 
@@ -1495,10 +1518,10 @@ lion_join_count_parts(LionCountScanState *st)
 			if (ent->isnull || (exists && ent->acc > 0))
 				continue;
 			CHECK_FOR_INTERRUPTS();
-			st->joinlookups++;
+			js->lookups++;
 			count = lion_join_lookup_ent(st, ent, walked, p, &found);
 			if (!found)
-				st->joinmissing++;
+				js->missing++;
 			ent->acc += count;
 
 			/* a copy made part way through that selects nothing */
@@ -1523,6 +1546,7 @@ lion_join_count_parts(LionCountScanState *st)
 static void
 lion_join_count_batch(LionCountScanState *st)
 {
+	LionJoinState *js = lion_st_join(st);
 	int			k;
 
 	for (k = 0; k < st->joinbatchn; k++)
@@ -1535,10 +1559,10 @@ lion_join_count_batch(LionCountScanState *st)
 		if (ent->isnull)
 			continue;
 		CHECK_FOR_INTERRUPTS();
-		st->joinlookups++;
+		js->lookups++;
 		ent->acc = lion_join_lookup_ent(st, ent, true, -1, &found);
 		if (!found)
-			st->joinmissing++;
+			js->missing++;
 	}
 }
 
@@ -1581,9 +1605,10 @@ lion_join_batch_unsort(LionCountScanState *st)
 static bool
 lion_join_next_parts(LionCountScanState *st, int64 *countp)
 {
-	bool		anti = (st->jointype == LION_JOIN_ANTI);
-	bool		exists = (st->jointype != LION_JOIN_INNER ||
-						  (st->joinrows && !st->joincounts));
+	LionJoinState *js = lion_st_join(st);
+	bool		anti = (js->type == LION_JOIN_ANTI);
+	bool		exists = (js->type != LION_JOIN_INNER ||
+						  (js->rows && !js->counts));
 
 	for (;;)
 	{
@@ -1611,7 +1636,7 @@ lion_join_next_parts(LionCountScanState *st, int64 *countp)
 			}
 			else
 				lion_join_count_batch(st);
-			if (st->joinordered)
+			if (js->ordered)
 				lion_join_batch_unsort(st);
 		}
 		ent = &st->joinbatch[st->joinbatchpos++];
@@ -1627,7 +1652,7 @@ lion_join_next_parts(LionCountScanState *st, int64 *countp)
 		if (count == 0)
 			continue;
 
-		if (!st->joinsum)
+		if (!js->sum)
 			lion_join_batch_row(st, ent);
 		*countp = count;
 		return true;
@@ -1701,6 +1726,7 @@ lion_join_group_row(LionCountScanState *st, int ent, Datum key, bool isnull,
 static void
 lion_join_count_groups(LionCountScanState *st, int k, bool walked)
 {
+	LionJoinState *js = lion_st_join(st);
 	LionFactGroupState *fg = lion_st_fg(st);
 	LionJoinEnt *ent = &st->joinbatch[k];
 	MemoryContext oldcxt;
@@ -1718,11 +1744,11 @@ lion_join_count_groups(LionCountScanState *st, int k, bool walked)
 		lion_lookup_walk_descend(&st->joinwalker, ent->key, &st->groupset);
 	lion_join_clock(st, LION_JT_LOOKUP, &t);
 	if (!found)
-		st->joinmissing++;
+		js->missing++;
 	else
 	{
-		LionCountSource *base = st->joinfiltered ? st->joinsources : st->sources;
-		int			nbase = st->joinfiltered ? 2 : st->nsource;
+		LionCountSource *base = js->filtered ? js->sources : st->sources;
+		int			nbase = js->filtered ? 2 : st->nsource;
 		int64		pages = lion_posting_pages_read;
 
 		/* the key's set and the filters - or their copy - and one group */
@@ -1740,7 +1766,7 @@ lion_join_count_groups(LionCountScanState *st, int k, bool walked)
 			if (count > 0)
 				lion_join_group_row(st, k, fg->key[j], fg->isnull[j], count);
 		}
-		st->joinposting += lion_posting_pages_read - pages;
+		js->posting += lion_posting_pages_read - pages;
 	}
 	lion_posting_set_release(&st->groupset);
 	MemoryContextSwitchTo(oldcxt);
@@ -1755,6 +1781,7 @@ lion_join_count_groups(LionCountScanState *st, int k, bool walked)
 static void
 lion_join_group_turn(LionCountScanState *st, int p)
 {
+	LionJoinState *js = lion_st_join(st);
 	LionFactGroupState *fg = lion_st_fg(st);
 	Relation	fgidx = (p < 0) ? fg->idx : st->part[p].fgidx;
 	Const	   *fgconst = (p < 0) ? NULL : st->part[p].fgconst;
@@ -1796,10 +1823,10 @@ lion_join_group_turn(LionCountScanState *st, int p)
 			if (ent->isnull)
 				continue;
 			CHECK_FOR_INTERRUPTS();
-			st->joinlookups++;
+			js->lookups++;
 			count = lion_join_lookup_ent(st, ent, walked, p, &found);
 			if (!found)
-				st->joinmissing++;
+				js->missing++;
 			if (count > 0)
 				lion_join_group_row(st, k, fgconst->constvalue,
 									fgconst->constisnull, count);
@@ -1880,7 +1907,7 @@ lion_join_group_turn(LionCountScanState *st, int p)
 			if (st->joinbatch[k].isnull)
 				continue;
 			CHECK_FOR_INTERRUPTS();
-			st->joinlookups++;
+			js->lookups++;
 			lion_join_count_groups(st, k, walked);
 		}
 
@@ -1907,6 +1934,7 @@ lion_join_group_turn(LionCountScanState *st, int p)
 static TupleTableSlot *
 lion_next_join_group(LionCountScanState *st)
 {
+	LionJoinState *js = lion_st_join(st);
 	LionFactGroupState *fg = lion_st_fg(st);
 	int			nturn = Max(st->npart, 1);
 
@@ -1918,9 +1946,9 @@ lion_next_join_group(LionCountScanState *st)
 	 */
 	if (st->joinpart == NULL)
 	{
-		LionClauseState *jcl = &st->clause[st->joinclause];
+		LionClauseState *jcl = &st->clause[js->clause];
 
-		if (!st->joincollected)
+		if (!js->collected)
 			lion_join_collect(st);
 		if (st->wheremissing)
 		{
@@ -1965,7 +1993,7 @@ lion_next_join_group(LionCountScanState *st)
 			if (!lion_join_fill_batch(st))
 			{
 				lion_join_batch_reset(st);
-				st->childslot = NULL;
+				js->childslot = NULL;
 				st->done = true;
 				return NULL;
 			}
@@ -1982,9 +2010,9 @@ lion_next_join_group(LionCountScanState *st)
  * row with fact rows - its dimension columns and its count - which core's
  * Finalize Agg above groups by the dimension columns and adds up, the join's
  * count for each group being a sum over the group's dimension rows; or, for
- * joinrows, a row core's plain Agg aggregates as it would the join's.
+ * js->rows, a row core's plain Agg aggregates as it would the join's.
  *
- * SUMMED (joinsum, LION_JOINFLAG_SUM): when the target list is counts alone -
+ * SUMMED (js->sum, LION_JOINFLAG_SUM): when the target list is counts alone -
  * `SELECT count(*) FROM fact JOIN dim ...` and its semi, anti and distinct-key
  * forms, with no dimension column to group by or to print - the rows'
  * partial counts differ in nothing the Finalize Agg looks at but the count,
@@ -2003,8 +2031,9 @@ lion_next_join_group(LionCountScanState *st)
 TupleTableSlot *
 lion_next_join_row(LionCountScanState *st)
 {
-	LionClauseState *jcl = &st->clause[st->joinclause];
-	bool		anti = (st->jointype == LION_JOIN_ANTI);
+	LionJoinState *js = lion_st_join(st);
+	LionClauseState *jcl = &st->clause[js->clause];
+	bool		anti = (js->type == LION_JOIN_ANTI);
 	bool		walked;
 	int64		count;
 	MemoryContext oldcxt;
@@ -2027,14 +2056,14 @@ lion_next_join_row(LionCountScanState *st)
 	{
 		if (st->joinunique && !st->joinsortdone)
 			lion_join_sort_keys(st);
-		if (st->joinsum)
+		if (js->sum)
 		{
 			int64		total = 0;
 
 			while (lion_join_next_parts(st, &count))
 				total += count;
 			st->done = true;
-			st->childslot = NULL;
+			js->childslot = NULL;
 			if (total == 0)
 				return NULL;
 			return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true,
@@ -2057,7 +2086,7 @@ lion_next_join_row(LionCountScanState *st)
 	 */
 	if (!st->joinbegun)
 	{
-		if (!st->joincollected)
+		if (!js->collected)
 			lion_join_collect(st);
 
 		/*
@@ -2101,7 +2130,7 @@ lion_next_join_row(LionCountScanState *st)
 	}
 	walked = st->joinwalked;
 
-	if (st->joinsum)
+	if (js->sum)
 	{
 		int64		total = 0;
 
@@ -2109,7 +2138,7 @@ lion_next_join_row(LionCountScanState *st)
 			   lion_join_next_row(st, &count))
 			total += count;
 		st->done = true;
-		st->childslot = NULL;
+		js->childslot = NULL;
 		if (total == 0)
 			return NULL;
 		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, total);
@@ -2121,7 +2150,7 @@ lion_next_join_row(LionCountScanState *st)
 	 * semi and anti join as a join path"); a row at a time, its rows are in
 	 * the child's order anyway.
 	 */
-	if (!(walked ? (st->joinouter ? lion_join_next_parts(st, &count) :
+	if (!(walked ? (js->outer ? lion_join_next_parts(st, &count) :
 					lion_join_next_walked(st, &count)) :
 		  lion_join_next_row(st, &count)))
 	{
