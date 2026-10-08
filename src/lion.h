@@ -1965,6 +1965,26 @@ extern bool lion_index_usable(Relation index, Snapshot snapshot,
  */
 extern void lion_check_old_snapshot(Relation index, Snapshot snapshot);
 
+/*
+ * Direct readers of a lion index (lion_reader.c): what a function handed an
+ * index by name, or a node reading one without index_beginscan(), owes the
+ * caller.  LION_READ_ROWS for anything that returns or counts rows, which
+ * vets the index for the snapshot, refuses row-level security and takes the
+ * predicate lock; LION_READ_STATS for index-wide statistics only.
+ */
+typedef enum LionReadPolicy
+{
+	LION_READ_ROWS,
+	LION_READ_STATS,
+} LionReadPolicy;
+
+extern Relation lion_reader_open(Oid indexoid, LionReadPolicy policy,
+								 Snapshot snapshot, const char *action,
+								 Relation *heap);
+extern void lion_reader_vet(Relation heap, Relation index, Snapshot snapshot,
+							const char *action);
+extern void lion_reader_lock(Relation index, Snapshot snapshot);
+
 
 /* ---------- additive helpers (wave 2, insert/vacuum/verify) ---------- */
 
