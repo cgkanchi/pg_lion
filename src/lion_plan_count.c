@@ -12,6 +12,7 @@
 #include "postgres.h"
 
 #include "lion_customscan.h"
+#include "lion_plan_private.h"
 
 /*
  * A PARALLEL GROUP BY (DESIGN.md §10, "A GROUP BY in parallel"): the serial
@@ -45,6 +46,7 @@ lion_add_parallel_group_path(PlannerInfo *root, RelOptInfo *rel,
 {
 	PathTarget *partialtarget;
 	CustomPath *cpath;
+	LionCountPriv priv;
 	Path	   *gather;
 	AggClauseCosts agg_final_costs;
 	double		pages;
@@ -95,8 +97,11 @@ lion_add_parallel_group_path(PlannerInfo *root, RelOptInfo *rel,
 	cpath->custom_restrictinfo = NIL;
 #endif
 	/* the serial node's plan, but for the HAVING, which is the Agg's here */
-	cpath->custom_private = list_copy(serial->custom_private);
-	lfirst(list_nth_cell(cpath->custom_private, LION_PRIV_HAVING)) = NIL;
+	lion_count_priv_decode(serial->custom_private, LION_PRIV_STAGE_PATH,
+						   &priv);
+	priv.having = NIL;
+	cpath->custom_private = lion_count_priv_encode(&priv,
+												   LION_PRIV_STAGE_PATH);
 	cpath->methods = serial->methods;
 
 	gather = (Path *) create_gather_path(root, output_rel, &cpath->path,
@@ -206,11 +211,7 @@ typedef struct LionCountPathBuild
 	bool		pinnedsrc;		/* a source outside ranges that holds the
 								 * §9 pin: a clause, or an OR of them */
 	Selectivity rangesel;		/* the share of its entries they select */
-	List	   *oids;
-	List	   *ints;
-	List	   *consts;
-	List	   *ckinds;
-	List	   *parts;
+	LionCountPriv priv;			/* the path's custom_private */
 	double		numgroups;
 	double		outrows;
 	bool		havepositive;
@@ -300,9 +301,6 @@ lion_count_path_init(LionCountPathBuild *cx, PlannerInfo *root,
 	cx->hasrangesrc = false;
 	cx->pinnedsrc = false;
 	cx->rangesel = 1.0;
-	cx->consts = NIL;
-	cx->ckinds = NIL;
-	cx->parts = NIL;
 	cx->havepositive = false;
 	cx->distvar = NULL;
 	cx->disteqop = InvalidOid;
@@ -2229,14 +2227,19 @@ lion_count_path_topk(LionCountPathBuild *cx)
 }
 
 /*
- * The lists custom_private carries the relation and its clauses in: oids,
- * ints, consts and ckinds, and parts for a partitioned table.
+ * What the path's custom_private carries (lion_plan_private.h), begun again
+ * for each path made: the relation and its clauses, a partitioned table's
+ * partitions, and what the query asks of them.
  */
 static void
-lion_count_path_encode(LionCountPathBuild *cx)
+lion_count_path_fill(LionCountPathBuild *cx)
 {
+	PlannerInfo *root = cx->root;
 	LionCountTarget *first = cx->first;
-	ListCell   *lc;
+	LionCountPriv *p = &cx->priv;
+	List	   *exec;
+
+	memset(p, 0, sizeof(LionCountPriv));
 
 	/*
 	 * A plain table's own Oids go in LION_PRIV_OIDS, which is where the
@@ -2244,57 +2247,97 @@ lion_count_path_encode(LionCountPathBuild *cx)
 	 * them invalid - there is no single index - and fills LION_PRIV_PARTS
 	 * instead, one OidList per partition in the same clause order.
 	 */
-	cx->oids = list_make3_oid(cx->rte->relid,
-							  (!cx->partitioned &&
-							   first->driveidx[0] != NULL) ?
-							  first->driveidx[0]->indexoid : InvalidOid,
-							  (!cx->partitioned && !cx->decode &&
-							   first->driveidx[1] != NULL) ?
-							  first->driveidx[1]->indexoid : InvalidOid);
-	cx->ints = list_make4_int((int) cx->rti, (int) cx->groupattno[0],
-							  cx->decode ? 0 : (int) cx->groupattno[1],
-							  (cx->singlegroup ? LION_FLAG_SINGLEGROUP : 0) |
-							  (cx->sumall ? LION_FLAG_SUMALL : 0) |
-							  (cx->driveattno != 0 ? LION_FLAG_GROUPIDX : 0) |
-							  (cx->rangevar != NULL ? LION_FLAG_RANGE : 0) |
-							  (cx->decode ? LION_FLAG_DECODE : 0));
+	p->heapoid = cx->rte->relid;
+	p->groupidxoid = (!cx->partitioned && first->driveidx[0] != NULL) ?
+		first->driveidx[0]->indexoid : InvalidOid;
+	p->groupidxoid2 = (!cx->partitioned && !cx->decode &&
+					   first->driveidx[1] != NULL) ?
+		first->driveidx[1]->indexoid : InvalidOid;
+	p->scanrelid = cx->rti;
+	p->groupattno = cx->groupattno[0];
+	p->groupattno2 = cx->decode ? 0 : cx->groupattno[1];
+	p->flags = (cx->singlegroup ? LION_FLAG_SINGLEGROUP : 0) |
+		(cx->sumall ? LION_FLAG_SUMALL : 0) |
+		(cx->driveattno != 0 ? LION_FLAG_GROUPIDX : 0) |
+		(cx->rangevar != NULL ? LION_FLAG_RANGE : 0) |
+		(cx->decode ? LION_FLAG_DECODE : 0);
+
+	/*
+	 * The strategy of a multi-key clause travels with its operator: the
+	 * executor re-extracts the query and EXPLAIN prints the operator's name,
+	 * and both need the Oid.
+	 */
+	lion_count_priv_set_where(p, cx->partitioned ? NIL : first->whereidx,
+							  cx->whereattnos, cx->whereconsts,
+							  cx->wherekinds, cx->whereopnos, cx->ors);
+	if (cx->partitioned)
+		lion_count_priv_set_parts(p, cx->targets, true);
+
+	/* a partitioned GROUP BY's HAVING is the Finalize Agg's */
+	p->having = (cx->partialtarget != NULL) ? NIL : cx->having;
+	if (cx->distvar != NULL)
+		p->distattno = cx->distvar->varattno;
+	exec = lion_replaced_functions(cx->input_rel,
+								   cx->output_rel->reltarget->exprs,
+								   cx->having, root->processed_groupClause,
+								   NULL);
+	p->exec_aggs = (List *) linitial(exec);
+	p->exec_funcs = (List *) lsecond(exec);
+	p->exec_groupfuncs = (List *) lthird(exec);
+
+	/*
+	 * GROUP BY coalesce(col, c) (DESIGN.md §10): c, and the grouping equality
+	 * the walk tells c's own entry by, under the grouping collation - which
+	 * lion_collect_targets() has made the driving index's strategy 1 and its
+	 * collation, per relation.
+	 */
+	if (cx->groupcoal != NULL)
+	{
+		p->coalconst = copyObject(cx->groupcoal);
+		p->coaleqop = cx->groupeqop[0];
+		p->coalcoll = cx->groupvar[0]->varcollid;
+	}
+	p->implied = cx->impliedtexts;
+
+	/* the decoded walk's columns (DESIGN.md §34), in the order it takes them */
+	if (cx->decode)
+	{
+		int			g;
+
+		p->ngroupn = cx->ngroup;
+		for (g = 0; g < cx->ngroup; g++)
+		{
+			p->groupn_attno[g] = cx->groupattno[g];
+			p->groupn_idx[g] = first->driveidx[g]->indexoid;
+		}
+	}
+
+	/* the column a sum over every row drives by (DESIGN.md §35) */
+	if (cx->allvar != NULL)
+		p->allattno = cx->allvar->varattno;
+
+	/* the top k by count (DESIGN.md §36) */
+	p->topkn = cx->topkn;
+	p->topkcand = cx->topkcand;
+	p->topkstrict = cx->topkstrict;
+
+	/* the columns aggregates are taken over (DESIGN.md §37) */
+	if (cx->wattnos != NIL)
 	{
 		ListCell   *l1;
 		ListCell   *l2;
 		ListCell   *l3;
 		int			i = 0;
 
-		forthree(l1, cx->whereattnos, l2, cx->whereconsts, l3, cx->wherekinds)
+		p->nwcol = list_length(cx->wattnos);
+		p->wcol = (LionCountPrivWCol *)
+			palloc0(sizeof(LionCountPrivWCol) * p->nwcol);
+		forthree(l1, cx->wattnos, l2, cx->widx, l3, cx->wcols)
 		{
-			cx->oids = lappend_oid(cx->oids, cx->partitioned ? InvalidOid :
-								   ((IndexOptInfo *) list_nth(first->whereidx,
-															  i))->indexoid);
-			cx->ints = lappend_int(cx->ints, lfirst_int(l1));
-			cx->consts = lappend(cx->consts, copyObject((Node *) lfirst(l2)));
-			cx->ckinds = lappend_int(cx->ckinds, lfirst_int(l3));
+			p->wcol[i].attno = (AttrNumber) lfirst_int(l1);
+			p->wcol[i].idxoid = ((IndexOptInfo *) lfirst(l2))->indexoid;
+			p->wcol[i].idxcol = (AttrNumber) lfirst_int(l3);
 			i++;
-		}
-	}
-
-	if (cx->partitioned)
-	{
-		foreach(lc, cx->targets)
-		{
-			LionCountTarget *t = (LionCountTarget *) lfirst(lc);
-			List	   *one;
-			ListCell   *l1;
-
-			one = list_make3_oid(t->heapoid,
-								 t->driveidx[0] ? t->driveidx[0]->indexoid :
-								 InvalidOid,
-								 t->driveidx[1] ? t->driveidx[1]->indexoid :
-								 InvalidOid);
-			/* InvalidOid: a clause the partition's bounds imply (§16) */
-			foreach(l1, t->whereidx)
-				one = lappend_oid(one, lfirst(l1) != NULL ?
-								  ((IndexOptInfo *) lfirst(l1))->indexoid :
-								  InvalidOid);
-			cx->parts = lappend(cx->parts, one);
 		}
 	}
 }
@@ -2311,12 +2354,6 @@ lion_count_path_make(LionCountPathBuild *cx)
 	RelOptInfo *output_rel = cx->output_rel;
 	LionCountTarget *first = cx->first;
 	CustomPath *cpath;
-
-	/*
-	 * The strategy of a multi-key clause travels with its operator: the
-	 * executor re-extracts the query and EXPLAIN prints the operator's name,
-	 * and both need the Oid.
-	 */
 
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
@@ -2399,96 +2436,8 @@ lion_count_path_make(LionCountPathBuild *cx)
 #if PG_VERSION_NUM >= 170000
 	cpath->custom_restrictinfo = NIL;
 #endif
-	/*
-	 * The shape marker comes first, so that lion_begin_custom_scan() can
-	 * refuse a list it does not recognise instead of reading it positionally.
-	 */
-	cpath->custom_private = list_make1(list_make2_int(LION_PRIV_MAGIC,
-													  LION_PRIV_NMEMBERS));
-	cpath->custom_private = lappend(cpath->custom_private, cx->oids);
-	cpath->custom_private = lappend(cpath->custom_private, cx->ints);
-	cpath->custom_private = lappend(cpath->custom_private, cx->consts);
-	cpath->custom_private = lappend(cpath->custom_private, cx->ckinds);
-	cpath->custom_private = lappend(cpath->custom_private, cx->parts);
-	cpath->custom_private = lappend(cpath->custom_private, cx->whereopnos);
-	cpath->custom_private = lappend(cpath->custom_private, cx->ors);
-	cpath->custom_private = lappend(cpath->custom_private,
-									(cx->partialtarget != NULL) ? NIL :
-									cx->having);
-	cpath->custom_private =
-		lappend(cpath->custom_private,
-				(cx->distvar != NULL) ?
-				list_make1_int((int) cx->distvar->varattno) :
-				NIL);
-	cpath->custom_private = lappend(cpath->custom_private, NIL);	/* join */
-	cpath->custom_private = lappend(cpath->custom_private,
-									lion_replaced_functions(input_rel,
-															output_rel->reltarget->exprs,
-															cx->having,
-															root->processed_groupClause,
-															NULL));
-
-	/*
-	 * GROUP BY coalesce(col, c) (DESIGN.md §10): c, and the grouping equality
-	 * the walk tells c's own entry by, under the grouping collation - which
-	 * lion_collect_targets() has made the driving index's strategy 1 and its
-	 * collation, per relation.
-	 */
-	cpath->custom_private =
-		lappend(cpath->custom_private,
-				(cx->groupcoal != NULL) ?
-				list_make2(copyObject(cx->groupcoal),
-						   list_make2_oid(cx->groupeqop[0],
-										  cx->groupvar[0]->varcollid)) :
-				NIL);
-	cpath->custom_private = lappend(cpath->custom_private, cx->impliedtexts);
-	cpath->custom_private = lappend(cpath->custom_private, NIL);	/* fact group */
-
-	/* the decoded walk's columns (DESIGN.md §34), in the order it takes them */
-	if (cx->decode)
-	{
-		List	   *attnos = NIL;
-		List	   *idxoids = NIL;
-		int			g;
-
-		for (g = 0; g < cx->ngroup; g++)
-		{
-			attnos = lappend_int(attnos, (int) cx->groupattno[g]);
-			idxoids = lappend_oid(idxoids, first->driveidx[g]->indexoid);
-		}
-		cpath->custom_private = lappend(cpath->custom_private,
-										list_make2(attnos, idxoids));
-	}
-	else
-		cpath->custom_private = lappend(cpath->custom_private, NIL);
-
-	/* the column a sum over every row drives by (DESIGN.md §35) */
-	cpath->custom_private =
-		lappend(cpath->custom_private,
-				(cx->allvar != NULL) ?
-				list_make1_int((int) cx->allvar->varattno) : NIL);
-
-	/* the top k by count (DESIGN.md §36) */
-	cpath->custom_private =
-		lappend(cpath->custom_private,
-				(cx->topkn > 0) ?
-				list_make3_int((int) cx->topkn, cx->topkcand,
-							   cx->topkstrict ? 1 : 0) : NIL);
-
-	/* the columns aggregates are taken over (DESIGN.md §37) */
-	if (cx->wattnos != NIL)
-	{
-		List	   *oids = NIL;
-		ListCell   *lc;
-
-		foreach(lc, cx->widx)
-			oids = lappend_oid(oids, ((IndexOptInfo *) lfirst(lc))->indexoid);
-		cpath->custom_private = lappend(cpath->custom_private,
-										list_make3(cx->wattnos, oids,
-												   cx->wcols));
-	}
-	else
-		cpath->custom_private = lappend(cpath->custom_private, NIL);
+	cpath->custom_private = lion_count_priv_encode(&cx->priv,
+												   LION_PRIV_STAGE_PATH);
 	cpath->methods = &lion_count_path_methods;
 
 	return cpath;
@@ -2646,7 +2595,7 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 		cx->groupdeps == NIL &&
 		first->driveidx[0] != NULL &&
 		input_rel->consider_parallel && output_rel->consider_parallel &&
-		is_parallel_safe(root, (Node *) cx->consts) &&
+		is_parallel_safe(root, (Node *) cx->priv.consts) &&
 		extra != NULL && (extra->flags & GROUPING_CAN_PARTIAL_AGG) != 0 &&
 		grouping_is_hashable(root->processed_groupClause) &&
 		!RecoveryInProgress())
@@ -2732,7 +2681,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 
 	lion_count_path_estimate(&cx);
 	lion_count_path_topk(&cx);
-	lion_count_path_encode(&cx);
+	lion_count_path_fill(&cx);
 	cpath = lion_count_path_make(&cx);
 	lion_count_path_add(&cx, cpath);
 
@@ -2740,17 +2689,13 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	 * Two columns are the nested loop of DESIGN.md §20, which ANDs the sets of
 	 * every pair, or the decoded walk of §34, which reads each column's sets
 	 * once whatever the number of pairs: both are priced, and add_path()
-	 * keeps the cheaper.  The lists encode appends to are begun again, the
-	 * first path keeping its own.
+	 * keeps the cheaper.
 	 */
 	if (lion_count_path_decodable(&cx))
 	{
 		cx.decode = true;
-		cx.consts = NIL;
-		cx.ckinds = NIL;
-		cx.parts = NIL;
 		lion_count_path_estimate(&cx);
-		lion_count_path_encode(&cx);
+		lion_count_path_fill(&cx);
 		cpath = lion_count_path_make(&cx);
 		lion_count_path_add(&cx, cpath);
 	}
