@@ -878,8 +878,12 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_RANGE_EVAL_FULL		2
 
 /* Flag bits of the third integer of LION_PRIV_INTS. */
-#define LION_FLAG_SINGLEGROUP	0x01
-#define LION_FLAG_SUMALL			0x02
+#define LION_FLAG_SINGLEGROUP	0x01	/* GROUP BY over constant columns
+										 * only */
+#define LION_FLAG_SUMALL			0x02	/* no GROUP BY, but every entry of the
+										 * group index is counted and summed
+										 * (DESIGN.md §14, `col IS NOT NULL`
+										 * with nothing else) */
 #define LION_FLAG_GROUPIDX		0x04	/* an index drives the entry scan */
 #define LION_FLAG_RANGE			0x08	/* its walk is bounded by the RANGE
 										 * clauses (DESIGN.md §28) */
@@ -1854,27 +1858,155 @@ typedef enum LionCountMode
 	LION_MODE_JOIN_FACTGROUP	/* ... grouped by a fact column */
 } LionCountMode;
 
+/*
+ * The plan's custom_private as a C struct, the members LION_PRIV_* above
+ * describe: lion_count_priv_decode() (lion_plan_private.h) fills it and
+ * checks every member's shape, and lion_count_priv_encode() writes it back
+ * as the list.  The scan state keeps the plan's, decoded once at begin, as
+ * st->plan, and never changes it.
+ */
+
+/* One WHERE clause: CLAUSEKINDS, OIDS[3 + i], INTS[4 + i] and CLAUSEOPS */
+typedef struct LionCountPrivClause
+{
+	int			kind;			/* LION_CLAUSE_* */
+	Oid			idxoid;			/* InvalidOid for a partitioned table */
+	AttrNumber	attno;			/* the PARENT's */
+	Oid			opno;			/* InvalidOid for a null test */
+} LionCountPrivClause;
+
+/* One live leaf partition (DESIGN.md §16): an OidList of PARTS */
+typedef struct LionCountPrivPart
+{
+	Oid			heapoid;
+	Oid			groupidxoid;
+	Oid			groupidxoid2;
+	Oid		   *clauseidxoid;	/* nclause; InvalidOid for a clause the
+								 * partition's bounds imply */
+} LionCountPrivPart;
+
+/* The FK-side join (DESIGN.md §27): JOIN */
+typedef struct LionCountPrivJoin
+{
+	int			clause;			/* the join key's clause */
+	int			type;			/* LION_JOIN_* */
+	int			flags;			/* LION_JOINFLAG_* */
+	Oid			sortop;			/* LION_JOINFLAG_UNIQUE's, or InvalidOid */
+	Oid			sortcoll;
+	AttrNumber	keyresno;		/* the key's column of the child: PLAN
+								 * stage only, 0 at the PATH stage */
+} LionCountPrivJoin;
+
+/* A column the aggregates of DESIGN.md §37 are taken over: WAGG's lists */
+typedef struct LionCountPrivWCol
+{
+	AttrNumber	attno;
+	Oid			idxoid;
+	AttrNumber	idxcol;
+} LionCountPrivWCol;
+
+/* ... and one of those aggregates, from WAGG's fourth list (PLAN stage) */
+typedef struct LionCountPrivWAgg
+{
+	int			kind;			/* LION_WAGG_* */
+	int			col;			/* its column, in wcol */
+	int			argwidth;
+	Oid			aggfnoid;		/* LION_WAGG_EXTREME: the aggregate ... */
+	Oid			collation;		/* ... and its collation */
+} LionCountPrivWAgg;
+
+/*
+ * The whole list.  Lists and nodes point into the plan, which outlives
+ * every reader; the arrays are palloc'd in the caller's context.  A member
+ * the plan leaves empty decodes as zero, NULL or NIL.
+ */
+typedef struct LionCountPriv
+{
+	/* OIDS and INTS: the relation and its drivers */
+	Oid			heapoid;		/* the PARENT's, for a partitioned table */
+	Oid			groupidxoid;	/* InvalidOid if none, or partitioned */
+	Oid			groupidxoid2;	/* ... and InvalidOid for the decoded walk */
+	Index		scanrelid;
+	AttrNumber	groupattno;
+	AttrNumber	groupattno2;	/* 0 for the decoded walk too */
+	int			flags;			/* LION_FLAG_* */
+
+	int			nclause;
+	LionCountPrivClause *clause;
+
+	int			npart;			/* PARTS: 0 for a plain table */
+	LionCountPrivPart *part;
+
+	int			nor;			/* ORS (DESIGN.md §19), nleaves summed */
+	LionOrState *ors;
+
+	AttrNumber	distattno;		/* DISTINCT (§26), or 0 */
+
+	bool		hasjoin;		/* JOIN (§27) */
+	LionCountPrivJoin join;
+
+	/* EXECUTE (DESIGN.md §9, "Privileges"): NIL or an OidList each */
+	List	   *exec_aggs;		/* the target list's and HAVING's aggregates */
+	List	   *exec_funcs;		/* the WHERE clauses' and join clause's */
+	List	   *exec_groupfuncs;	/* the GROUP BY's equality functions */
+
+	Const	   *coalconst;		/* COALESCE (§10), or NULL */
+	Oid			coaleqop;
+	Oid			coalcoll;
+
+	List	   *implied;		/* IMPLIED (§16): String nodes */
+
+	/* FACTGROUP (§27, "Grouped by a fact column"): Max(npart, 1) each */
+	AttrNumber	fgattno;		/* or 0 */
+	Oid		   *fgidxoid;		/* InvalidOid where fgconst is the value */
+	Const	  **fgconst;
+
+	/* GROUPN (§34): the decoded walk's columns, or ngroupn 0 */
+	int			ngroupn;
+	AttrNumber	groupn_attno[LION_MAX_GROUPCOLS];
+	Oid			groupn_idx[LION_MAX_GROUPCOLS];
+
+	AttrNumber	allattno;		/* ALLROWS (§35), or 0 */
+
+	int64		topkn;			/* TOPK (§36), or 0 */
+	int			topkcand;
+	bool		topkstrict;
+
+	int			nwcol;			/* WAGG (§37), or 0 */
+	LionCountPrivWCol *wcol;
+	int			nwagg;			/* PLAN stage only */
+	LionCountPrivWAgg *wagg;
+
+	int			ntl;			/* TLKINDS: PLAN stage only */
+	int		   *tlkind;
+
+	List	   *consts;			/* CONSTS: PATH stage only */
+	List	   *having;			/* HAVING: PATH stage only */
+} LionCountPriv;
+
 typedef struct LionCountScanState
 {
 	CustomScanState css;
 
 	LionCountMode mode;			/* lion_count_mode_of() */
 
-	/* decoded from custom_private */
-	Oid			heapoid;
-	Index		scanrelid;
-	Oid			groupidxoid;
-	Oid			groupidxoid2;	/* the inner index of a two-column GROUP BY */
-	AttrNumber	groupattno;
-	AttrNumber	groupattno2;
+	/*
+	 * custom_private, decoded and checked at begin and never changed after:
+	 * the relation and its indexes (plan.heapoid, plan.groupidxoid and
+	 * plan.groupidxoid2, the inner index of a two-column GROUP BY), the
+	 * grouping columns (plan.groupattno, plan.groupattno2), count(DISTINCT
+	 * k)'s k (plan.distattno), the LION_FLAG_* bits (lion_plan_flag()) and
+	 * the clauses a partition's bounds imply, for EXPLAIN (plan.implied).
+	 */
+	LionCountPriv plan;
 
 	/*
 	 * The HEAP column whose entries drive the scan: groupattno, or - for the
 	 * sum-over-all of DESIGN.md §14, which has no group column at all - the
 	 * column of the `IS NOT NULL` clause the planner chose as its driver.  It
 	 * is what the driving index's KEY COLUMN is derived from (§24), and it is
-	 * NOT groupattno: the target list, EXPLAIN and the partitioned dispatch
-	 * all ask `groupattno != 0` to mean "there is a GROUP BY".
+	 * NOT plan.groupattno: the target list, EXPLAIN and the partitioned
+	 * dispatch all ask `plan.groupattno != 0` to mean "there is a GROUP BY".
 	 */
 	AttrNumber	driveattno;
 	AttrNumber	groupidxcol;	/* key column of groupidx (§24) */
@@ -1889,16 +2021,15 @@ typedef struct LionCountScanState
 	struct LionDecodeRun *decode;
 
 	/*
-	 * count(DISTINCT k) (DESIGN.md §26).  distattno is k, or 0.  Without a
-	 * GROUP BY k's index is groupidx and drives the scan (driveattno is k);
+	 * count(DISTINCT k) (DESIGN.md §26).  plan.distattno is k, or 0.  Without
+	 * a GROUP BY k's index is groupidx and drives the scan (driveattno is k);
 	 * beside a GROUP BY g it is groupidx2, the INNER side of the nested loop.
 	 * innerattno is the heap column of groupidx2 in either use - the second
 	 * grouping column of §20, or k - and is what everything that reads the
-	 * inner index asks, while groupattno2 keeps meaning "a second GROUP BY
-	 * column".  dist is the walk's state, or NULL when distattno is 0
+	 * inner index asks, while plan.groupattno2 keeps meaning "a second GROUP
+	 * BY column".  dist is the walk's state, or NULL when plan.distattno is 0
 	 * (lion_st_dist()).
 	 */
-	AttrNumber	distattno;
 	AttrNumber	innerattno;
 	struct LionDistinctState *dist;
 
@@ -1907,23 +2038,14 @@ typedef struct LionCountScanState
 	 * by no coalesce (lion_st_coal()).
 	 */
 	struct LionCoalState *coal;
-	bool		singlegroup;	/* GROUP BY over constant columns only */
-	bool		sumall;			/* no GROUP BY, but every entry of the group
-								 * index is counted and summed (DESIGN.md §14,
-								 * `col IS NOT NULL` with nothing else) */
-	AttrNumber	allattno;		/* ... of this column, the plan's choice, when
-								 * nothing names it (DESIGN.md §35, "Every
-								 * row"); 0 otherwise */
-	bool		hasgroupidx;	/* an index's entries drive the count */
 
 	/*
-	 * The RANGE clauses of DESIGN.md §28: they bound the driving index's
-	 * entry walk instead of being sources, all of them on its column and
-	 * ANDed into `range`, which lion_locate_where() resolves against the
-	 * relation being counted (a partition's own index, §16) and every begin
-	 * of the driver's walk hands to lion_entry_scan_begin_range().
+	 * The RANGE clauses of DESIGN.md §28 (LION_FLAG_RANGE): they bound the
+	 * driving index's entry walk instead of being sources, all of them on its
+	 * column and ANDed into `range`, which lion_locate_where() resolves
+	 * against the relation being counted (a partition's own index, §16) and
+	 * every begin of the driver's walk hands to lion_entry_scan_begin_range().
 	 */
-	bool		hasrange;
 	LionRange	range;
 
 	/*
@@ -1982,7 +2104,6 @@ typedef struct LionCountScanState
 	 */
 	int			nplanitem;
 	LionSourceItem *planitem;
-	List	   *implied;		/* LION_PRIV_IMPLIED, for EXPLAIN */
 
 	/*
 	 * The relations to count.  npart is 0 for a plain table, whose heap and
@@ -2249,6 +2370,13 @@ typedef struct LionCountScanState
 	 */
 	struct LionFactGroupState *fg;
 } LionCountScanState;
+
+/* Whether the plan sets one of the LION_FLAG_* bits */
+static inline bool
+lion_plan_flag(const LionCountScanState *st, int flag)
+{
+	return (st->plan.flags & flag) != 0;
+}
 
 /* The top k's state, which only a plan with a k has (DESIGN.md §36) */
 static inline LionTopkState *

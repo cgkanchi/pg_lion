@@ -60,10 +60,10 @@ lion_run_partition(LionCountScanState *st, int p)
 	lion_open_relation(st, p);
 	lion_locate_where(st);
 
-	if (st->hasgroupidx)
+	if (lion_plan_flag(st, LION_FLAG_GROUPIDX))
 	{
 		/* No group key of its own: the only driver left is a sum-over-all. */
-		Assert(st->sumall);
+		Assert(lion_plan_flag(st, LION_FLAG_SUMALL));
 		count = lion_sumall_relation(st);
 	}
 	else
@@ -113,9 +113,11 @@ lion_next_partial_group(LionCountScanState *st)
 			 */
 			if (!st->wheremissing)
 			{
+				bool		bounded = lion_plan_flag(st, LION_FLAG_RANGE);
+
 				lion_entry_scan_begin_range(&st->escan, st->groupidx,
 											st->groupidxcol,
-											st->hasrange ? &st->range : NULL);
+											bounded ? &st->range : NULL);
 				st->scanning = true;
 				/* each partition's group of c is its own partial row */
 				lion_coal_reset(st);
@@ -153,7 +155,7 @@ lion_exec_partitioned(LionCountScanState *st)
 	int64		total = 0;
 	int			p;
 
-	if (st->hasgroupidx && st->groupattno != 0)
+	if (lion_plan_flag(st, LION_FLAG_GROUPIDX) && st->plan.groupattno != 0)
 		return lion_next_partial_group(st);
 
 	for (p = 0; p < st->npart; p++)
@@ -165,7 +167,7 @@ lion_exec_partitioned(LionCountScanState *st)
 	 * A plain aggregate always produces its one row; a GROUP BY whose columns
 	 * the planner folded to constants produces one only if the group exists.
 	 */
-	if (total == 0 && st->singlegroup)
+	if (total == 0 && lion_plan_flag(st, LION_FLAG_SINGLEGROUP))
 		return NULL;
 
 	return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, total);
@@ -263,7 +265,8 @@ lion_finish_run(LionCountScanState *st)
 	lion_posting_set_release(&st->groupset);
 	lion_posting_set_release(&st->groupset2);
 	lion_decode_reset(st);
-	lion_join_batch_reset(st);
+	if (st->join != NULL)
+		lion_join_batch_reset(st);
 	lion_release_where(st);
 
 	/*
@@ -358,7 +361,8 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		lion_locate_where(st);
 
 	/* ---- no index to iterate: exactly one row ---- */
-	Assert((st->mode == LION_MODE_COUNT) == !st->hasgroupidx);
+	Assert((st->mode == LION_MODE_COUNT) ==
+		   !lion_plan_flag(st, LION_FLAG_GROUPIDX));
 	if (st->mode == LION_MODE_COUNT)
 	{
 		/* Without a group index a clause has to drive the count. */
@@ -370,7 +374,7 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		 * columns the planner folded to constants produces one only if the
 		 * group exists.
 		 */
-		if (count == 0 && st->singlegroup)
+		if (count == 0 && lion_plan_flag(st, LION_FLAG_SINGLEGROUP))
 			return NULL;
 
 		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, count);
@@ -391,9 +395,10 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 			st->dist->colcount = 0;
 		}
 		Assert((st->mode == LION_MODE_SUM || st->mode == LION_MODE_DISTINCT) ==
-			   (st->sumall || (st->distattno != 0 && st->groupattno == 0)));
+			   (lion_plan_flag(st, LION_FLAG_SUMALL) ||
+				(st->plan.distattno != 0 && st->plan.groupattno == 0)));
 		if ((st->mode == LION_MODE_SUM || st->mode == LION_MODE_DISTINCT) &&
-			!st->singlegroup)
+			!lion_plan_flag(st, LION_FLAG_SINGLEGROUP))
 			return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, 0);
 		return NULL;
 	}
@@ -402,13 +407,13 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 	{
 		case LION_MODE_DISTINCT:
 			/* ---- count(DISTINCT k) over the WHERE: one row (§26) ---- */
-			Assert(st->distattno != 0 && st->groupattno == 0);
+			Assert(st->plan.distattno != 0 && st->plan.groupattno == 0);
 			return lion_distinct_relation(st);
 
 		case LION_MODE_SUM:
 			/* ---- every entry of the index, summed into one row ---- */
-			Assert(st->sumall &&
-				   !(st->distattno != 0 && st->groupattno == 0));
+			Assert(lion_plan_flag(st, LION_FLAG_SUMALL) &&
+				   !(st->plan.distattno != 0 && st->plan.groupattno == 0));
 			{
 				/*
 				 * ... and the aggregates over lion columns' entries
@@ -427,7 +432,7 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 				 * the group is empty - which a range-bounded sum (DESIGN.md
 				 * §28) can be: `... WHERE g = 3 AND k < 20 GROUP BY g`.
 				 */
-				if (total == 0 && st->singlegroup)
+				if (total == 0 && lion_plan_flag(st, LION_FLAG_SINGLEGROUP))
 					return NULL;
 				return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true,
 									   total);
@@ -444,7 +449,9 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 			 * group whole as the serial node does: one partial row a group,
 			 * which the Finalize Agg takes as it takes any.
 			 */
-			Assert(st->ranged != NULL && !st->sumall && st->distattno == 0);
+			Assert(st->ranged != NULL &&
+				   !lion_plan_flag(st, LION_FLAG_SUMALL) &&
+				   st->plan.distattno == 0);
 			if (st->shared != NULL)
 			{
 				bool		exhausted;
@@ -460,8 +467,9 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		case LION_MODE_GROUP2:
 		case LION_MODE_GROUP_DISTINCT:
 		case LION_MODE_DECODE:
-			Assert(st->ranged == NULL && !st->sumall &&
-				   !(st->distattno != 0 && st->groupattno == 0));
+			Assert(st->ranged == NULL &&
+				   !lion_plan_flag(st, LION_FLAG_SUMALL) &&
+				   !(st->plan.distattno != 0 && st->plan.groupattno == 0));
 			break;
 
 		case LION_MODE_COUNT:
@@ -479,7 +487,8 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 	if (!st->scanning && st->ingroupitem < 0 && st->decode == NULL)
 	{
 		lion_entry_scan_begin_range(&st->escan, st->groupidx, st->groupidxcol,
-									st->hasrange ? &st->range : NULL);
+									lion_plan_flag(st, LION_FLAG_RANGE) ?
+									&st->range : NULL);
 		st->scanning = true;
 		lion_coal_reset(st);
 	}
@@ -520,42 +529,39 @@ lion_reset_run(LionCountScanState *st)
 	lion_decode_reset(st);
 	lion_release_where(st);
 
-	/* The FK-side join's collected filters (in outercxt, reset below). */
-	if (st->join != NULL)
-	{
-		lion_posting_set_release(&st->join->filter);
-		st->join->collected = false;
-		st->join->filtered = false;
-		st->join->pcopy.viewshared = false;
-	}
-
-	/* ... or a partitioned fact table's, one copy per partition */
-	if (st->join != NULL && st->join->part.leaf != NULL)
-	{
-		LionJoinParts *jparts = &st->join->part;
-
-		for (i = 0; i < st->npart; i++)
-		{
-			LionJoinPart *jp = &jparts->leaf[i];
-
-			lion_posting_set_release(&jp->filter);
-			memset(&jp->filter, 0, sizeof(jp->filter));
-			jp->filter.pinbuf = InvalidBuffer;
-			jp->collected = false;
-			jp->filtered = false;
-			jp->missing = false;
-			jp->viewshared = false;
-			MemoryContextReset(jp->cxt);
-		}
-		jparts->runfilterrows = 0;
-	}
-
-	/* ... and the account of a plan that probes them, begun again */
-	lion_join_switch_reset(st);
-
 	if (st->join != NULL)
 	{
 		LionJoinState *js = st->join;
+
+		/* The FK-side join's collected filters (in outercxt, reset below) */
+		lion_posting_set_release(&js->filter);
+		js->collected = false;
+		js->filtered = false;
+		js->pcopy.viewshared = false;
+
+		/* ... or a partitioned fact table's, one copy per partition */
+		if (js->part.leaf != NULL)
+		{
+			LionJoinParts *jparts = &js->part;
+
+			for (i = 0; i < st->npart; i++)
+			{
+				LionJoinPart *jp = &jparts->leaf[i];
+
+				lion_posting_set_release(&jp->filter);
+				memset(&jp->filter, 0, sizeof(jp->filter));
+				jp->filter.pinbuf = InvalidBuffer;
+				jp->collected = false;
+				jp->filtered = false;
+				jp->missing = false;
+				jp->viewshared = false;
+				MemoryContextReset(jp->cxt);
+			}
+			jparts->runfilterrows = 0;
+		}
+
+		/* ... and the account of a plan that probes them, begun again */
+		lion_join_switch_reset(st);
 
 		/* ... and a forward semi join's sorted keys, sorted again next run. */
 		if (js->sort.tuplesort != NULL)
@@ -1138,22 +1144,17 @@ lion_end_custom_scan(CustomScanState *node)
 			MemoryContextDelete(js->batch.cxt);
 			js->batch.cxt = NULL;
 		}
-	}
-	if (st->join != NULL)
-	{
-		LionJoinParts *jparts = &st->join->part;
-
-		if (jparts->visitcxt != NULL)
+		if (js->part.visitcxt != NULL)
 		{
-			MemoryContextDelete(jparts->visitcxt);
-			jparts->visitcxt = NULL;
+			MemoryContextDelete(js->part.visitcxt);
+			js->part.visitcxt = NULL;
 		}
-		if (jparts->cxt != NULL)
+		if (js->part.cxt != NULL)
 		{
-			MemoryContextDelete(jparts->cxt);
-			jparts->cxt = NULL;
+			MemoryContextDelete(js->part.cxt);
+			js->part.cxt = NULL;
 		}
-		jparts->leaf = NULL;
+		js->part.leaf = NULL;
 	}
 	if (st->fg != NULL)
 	{

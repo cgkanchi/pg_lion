@@ -282,7 +282,7 @@ lion_rel_read_only(LionCountScanState *st, Relation heap)
 	if (st->writtenrels == NIL)
 		return true;
 	if (list_member_oid(st->writtenrels, relid) ||
-		list_member_oid(st->writtenrels, st->heapoid))
+		list_member_oid(st->writtenrels, st->plan.heapoid))
 		return false;
 	if (heap->rd_rel->relispartition)
 	{
@@ -489,12 +489,12 @@ lion_open_relation(LionCountScanState *st, int p)
 
 	if (part == NULL)
 	{
-		st->heap = lion_open_heap(st->heapoid);
+		st->heap = lion_open_heap(st->plan.heapoid);
 		for (i = 0; i < st->nclause; i++)
 			st->clause[i].idx = index_open(st->clause[i].idxoid,
 										   AccessShareLock);
-		st->groupidx = lion_open_index(st->groupidxoid);
-		st->groupidx2 = lion_open_index(st->groupidxoid2);
+		st->groupidx = lion_open_index(st->plan.groupidxoid);
+		st->groupidx2 = lion_open_index(st->plan.groupidxoid2);
 		if (st->fg != NULL)
 			st->fg->idx = lion_open_index(st->fg->idxoid);
 		if (st->decode != NULL)
@@ -526,7 +526,7 @@ lion_open_relation(LionCountScanState *st, int p)
 			continue;
 		st->clause[i].idxcol =
 			lion_index_col_for(st->clause[i].idx,
-							   lion_heap_attno_in(st->heap, st->heapoid,
+							   lion_heap_attno_in(st->heap, st->plan.heapoid,
 												  st->clause[i].attno),
 							   st->clause[i].kind == LION_CLAUSE_MULTI);
 	}
@@ -544,13 +544,13 @@ lion_open_relation(LionCountScanState *st, int p)
 	if (st->groupidx != NULL)
 		st->groupidxcol =
 			lion_index_col_for(st->groupidx,
-							   lion_heap_attno_in(st->heap, st->heapoid,
+							   lion_heap_attno_in(st->heap, st->plan.heapoid,
 												  st->driveattno),
 							   false);
 	if (st->groupidx2 != NULL)
 		st->groupidxcol2 =
 			lion_index_col_for(st->groupidx2,
-							   lion_heap_attno_in(st->heap, st->heapoid,
+							   lion_heap_attno_in(st->heap, st->plan.heapoid,
 												  st->innerattno),
 							   false);
 	if (st->decode != NULL)
@@ -564,7 +564,7 @@ lion_open_relation(LionCountScanState *st, int p)
 				dr->idxcol[c] =
 					lion_index_col_for(dr->idx[c],
 									   lion_heap_attno_in(st->heap,
-														  st->heapoid,
+														  st->plan.heapoid,
 														  dr->attno[c]),
 									   false);
 		}
@@ -701,29 +701,6 @@ lion_check_replaced_execute(const LionCountPriv *priv, int eflags)
 	}
 	foreach(lc, priv->exec_aggs)
 		lion_check_aggregate_execute(lfirst_oid(lc));
-}
-
-/*
- * The plan's Oids, attribute numbers and flags, from custom_private as
- * lion_count_priv_decode() took it apart (lion_plan_private.h).
- */
-static void
-lion_begin_plan(LionCountScanState *st, const LionCountPriv *priv)
-{
-	st->implied = priv->implied;
-	st->heapoid = priv->heapoid;
-	st->groupidxoid = priv->groupidxoid;
-	st->groupidxoid2 = priv->groupidxoid2;
-	st->scanrelid = priv->scanrelid;
-	st->groupattno = priv->groupattno;
-	st->groupattno2 = priv->groupattno2;
-	st->singlegroup = (priv->flags & LION_FLAG_SINGLEGROUP) != 0;
-	st->sumall = (priv->flags & LION_FLAG_SUMALL) != 0;
-	st->hasgroupidx = (priv->flags & LION_FLAG_GROUPIDX) != 0;
-	st->hasrange = (priv->flags & LION_FLAG_RANGE) != 0;
-	st->nclause = priv->nclause;
-	st->distattno = priv->distattno;
-	st->allattno = priv->allattno;
 }
 
 /*
@@ -911,7 +888,7 @@ lion_begin_target_list(LionCountScanState *st, CustomScan *cscan,
 	 * other count is a sum over k's entries; beside one, count(k) is a sum
 	 * over the (g, k) pairs, and count(*) and count(g) are the group's own.
 	 */
-	for (i = 0; st->distattno != 0 && i < st->ntlist; i++)
+	for (i = 0; st->plan.distattno != 0 && i < st->ntlist; i++)
 	{
 		switch (st->tlkind[i])
 		{
@@ -921,7 +898,7 @@ lion_begin_target_list(LionCountScanState *st, CustomScan *cscan,
 			case LION_TL_COUNT:
 			case LION_TL_COUNT_GROUPCOL:
 			case LION_TL_COUNT_GROUPCOL2:
-				if (st->groupattno == 0)
+				if (st->plan.groupattno == 0)
 					lion_st_dist(st)->full = true;
 				else
 					lion_st_dist(st)->groupcount = true;
@@ -1585,55 +1562,29 @@ lion_begin_decoded_walk(LionCountScanState *st, const LionCountPriv *priv,
 	st->decode = dr;
 }
 
-#ifdef USE_ASSERT_CHECKING
-/*
- * The mode as the run's tests of the fields begin set would find it, which
- * lion_count_mode_of() has to agree with.
- */
-static LionCountMode
-lion_begin_legacy_mode(LionCountScanState *st)
-{
-	if (st->join != NULL)
-		return (st->fg != NULL) ? LION_MODE_JOIN_FACTGROUP : LION_MODE_JOIN;
-	if (!st->hasgroupidx)
-		return LION_MODE_COUNT;
-	if (st->distattno != 0 && st->groupattno == 0)
-		return LION_MODE_DISTINCT;
-	if (st->sumall)
-		return LION_MODE_SUM;
-	if (st->ranged != NULL)
-		return LION_MODE_GROUP_RANGED;
-	if (st->decode != NULL)
-		return LION_MODE_DECODE;
-	if (st->distattno != 0)
-		return LION_MODE_GROUP_DISTINCT;
-	if (st->groupattno2 != 0)
-		return LION_MODE_GROUP2;
-	return LION_MODE_GROUP;
-}
-#endif
-
 void
 lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 {
 	LionCountScanState *st = (LionCountScanState *) node;
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 	List	   *exprs = cscan->custom_exprs;
-	LionCountPriv priv;
+	const LionCountPriv *priv = &st->plan;
 
 	/*
 	 * custom_private is positional: every member's shape is checked before a
 	 * single value of it is used, and the rules between the members after
-	 * (lion_plan_private.h).
+	 * (lion_plan_private.h).  The node keeps it, decoded, as st->plan, and
+	 * reads the plan's Oids, attribute numbers and flags from there.
 	 */
-	lion_count_priv_decode(cscan->custom_private, LION_PRIV_STAGE_PLAN, &priv);
+	lion_count_priv_decode(cscan->custom_private, LION_PRIV_STAGE_PLAN,
+						   &st->plan);
 
 	/* Before anything is opened or read (DESIGN.md §9, "Privileges"). */
-	lion_check_replaced_execute(&priv, eflags);
+	lion_check_replaced_execute(priv, eflags);
 
-	lion_count_priv_check(&priv, cscan->scan.plan.parallel_aware,
+	lion_count_priv_check(priv, cscan->scan.plan.parallel_aware,
 						  list_length(cscan->custom_plans));
-	st->mode = lion_count_mode_of(&priv, cscan->scan.plan.parallel_aware);
+	st->mode = lion_count_mode_of(priv, cscan->scan.plan.parallel_aware);
 
 	/*
 	 * One value expression per clause in custom_exprs, then one argument per
@@ -1641,34 +1592,33 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	 * drift, exactly like a wrong shape marker, and is said rather than
 	 * decoded.
 	 */
-	if (list_length(exprs) != priv.nclause + priv.nwagg)
+	if (list_length(exprs) != priv->nclause + priv->nwagg)
 		elog(ERROR, "LionCount: %d clauses but %d value expressions",
-			 priv.nclause, list_length(exprs) - priv.nwagg);
+			 priv->nclause, list_length(exprs) - priv->nwagg);
+	st->nclause = priv->nclause;
 
-	lion_begin_plan(st, &priv);
-	lion_begin_topk(st, &priv, estate);
-	lion_begin_coalesce(st, &priv, estate);
+	lion_begin_topk(st, priv, estate);
+	lion_begin_coalesce(st, priv, estate);
 	lion_begin_list_batch(st, estate);
-	lion_begin_distinct(st, &priv, estate);
-	lion_begin_inner(st, &priv, estate);
-	lion_begin_join(st, &priv, estate);
-	lion_begin_target_list(st, cscan, &priv);
-	lion_begin_wagg(st, node, &priv, exprs, estate);
-	lion_begin_clauses(st, node, &priv, exprs);
-	lion_begin_driving_column(st, &priv);
-	lion_begin_ors_and_items(st, &priv);
-	lion_begin_partitions(st, &priv);
-	lion_begin_fact_group(st, &priv, estate);
+	lion_begin_distinct(st, priv, estate);
+	lion_begin_inner(st, priv, estate);
+	lion_begin_join(st, priv, estate);
+	lion_begin_target_list(st, cscan, priv);
+	lion_begin_wagg(st, node, priv, exprs, estate);
+	lion_begin_clauses(st, node, priv, exprs);
+	lion_begin_driving_column(st, priv);
+	lion_begin_ors_and_items(st, priv);
+	lion_begin_partitions(st, priv);
+	lion_begin_fact_group(st, priv, estate);
 	lion_begin_run_state(st, cscan, estate);
 	lion_begin_contexts(st, estate);
-	lion_begin_decoded_walk(st, &priv, estate);
+	lion_begin_decoded_walk(st, priv, estate);
 	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
 	st->writtenrels = lion_statement_written_rels(estate);
 	lion_begin_join_child(st, node, cscan, estate, eflags);
 	lion_begin_join_key(st);
 	lion_begin_join_distinct_key(st, estate);
 	lion_begin_join_batches(st, estate);
-	Assert(st->mode == lion_begin_legacy_mode(st));
 
 	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
 		return;
