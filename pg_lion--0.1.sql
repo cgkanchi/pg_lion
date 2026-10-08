@@ -522,11 +522,16 @@ CREATE FUNCTION lion_bm25(index regclass, query tsquery, k int,
  *    WHERE d.tsv @@ 'cat & dog'
  *    ORDER BY lion_bm25_score(d.tsv, 'cat & dog', 'doc_tsv_idx') DESC
  *    LIMIT 10;
+ *
+ * PARALLEL RESTRICTED: each backend reads the index's statistics once per
+ * call site, so two parallel workers that read them on either side of an
+ * insert would score rows by different N, df and avgdl, and the merged order
+ * would not be one ranking.  In the leader every row is scored by one read.
  */
 CREATE FUNCTION lion_bm25_score(doc tsvector, query tsquery, index regclass,
 								k1 float8 DEFAULT 1.2, b float8 DEFAULT 0.75)
 	RETURNS float8
-	AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE PARALLEL SAFE COST 10;
+	AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE PARALLEL RESTRICTED COST 10;
 
 /* ---------------------------------------------------------------------
  * count functions (lion_count.c)

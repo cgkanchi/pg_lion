@@ -240,8 +240,14 @@ lion_array_batch_prepare(LionCountScanState *st, int k, LionClauseState *cl)
 	int			nelems;
 	LionListBatch *lb;
 
+	/*
+	 * No batch state is the plan's mode not being a one-row count
+	 * (lion_count_mode_of()); checked rather than only asserted, so that a
+	 * plan and an executor that disagree count unbatched instead of
+	 * crashing.
+	 */
 	if (lion_plan_flag(st, LION_FLAG_GROUPIDX) || st->join != NULL ||
-		lion_st_lbatch(st)->item >= 0 || cl->valisnull)
+		st->lbatch == NULL || st->lbatch->item >= 0 || cl->valisnull)
 		return false;
 	lb = st->lbatch;
 

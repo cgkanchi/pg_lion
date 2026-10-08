@@ -2482,9 +2482,12 @@ lion_decode_fill(LionCountScanState *st, int c, bool restart)
 
 	MemoryContextReset(dr->chunkcxt[c]);
 	oldcxt = MemoryContextSwitchTo(dr->chunkcxt[c]);
-	dr->keys[c] = (Datum *) palloc(sizeof(Datum) * cap);
-	dr->isnull[c] = (bool *) palloc(sizeof(bool) * cap);
-	dr->sets[c] = (LionPostingSet *) palloc(sizeof(LionPostingSet) * cap);
+	dr->keys[c] = (Datum *) palloc_extended(sizeof(Datum) * (Size) cap,
+											MCXT_ALLOC_HUGE);
+	dr->isnull[c] = (bool *) palloc_extended(sizeof(bool) * (Size) cap,
+											 MCXT_ALLOC_HUGE);
+	dr->sets[c] = (LionPostingSet *)
+		palloc_extended(sizeof(LionPostingSet) * (Size) cap, MCXT_ALLOC_HUGE);
 	while (n < cap &&
 		   lion_entry_scan_next(&dr->escan[c], &dr->keys[c][n], &dr->sets[c][n]))
 	{
@@ -2562,10 +2565,11 @@ lion_decode_caps(LionCountScanState *st)
 			break;
 		dr->cap[widest] = Max(dr->cap[widest] / 2, 1);
 	}
+	/* huge: a column's share of a work_mem past 1 GB is past MaxAllocSize */
 	for (c = 0; c < dr->ncol; c++)
 		dr->images[c] = (PGAlignedBlock *)
-			MemoryContextAlloc(st->css.ss.ps.state->es_query_cxt,
-							   sizeof(PGAlignedBlock) * dr->cap[c]);
+			MemoryContextAllocHuge(st->css.ss.ps.state->es_query_cxt,
+								   sizeof(PGAlignedBlock) * (Size) dr->cap[c]);
 }
 
 /* One pass: every combination of the chunks the columns stand at, tallied. */
