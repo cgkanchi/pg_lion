@@ -1442,7 +1442,8 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 				if (LION_TL_IS_WAGG(kind))
 				{
 					/* an aggregate over a column's entries (DESIGN.md §37) */
-					LionWAgg   *a = &st->wagg[LION_TL_WAGG_NO(kind)];
+					LionWAgg   *a =
+						&lion_st_wagg(st)->agg[LION_TL_WAGG_NO(kind)];
 
 					slot->tts_values[i] = a->result;
 					slot->tts_isnull[i] = a->resnull;
