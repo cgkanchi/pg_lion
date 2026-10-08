@@ -14492,9 +14492,15 @@ than overruns (§30.4).
   in any order, which is all the pathkeys promise. The switch needs the pathkeys to be plain
   columns of the relation - an expression index's order would evaluate its functions where the
   ordinary plan calls none, which a revoked EXECUTE could tell apart (§30.6) - and gives up,
-  letting the walk go on, if the rows do not fit in `work_mem`. EXPLAIN ANALYZE says
-  `Switched to Fetch and Sort: S of N scans, M members fetched`, and `Fetch and Sort Given Up: G`
-  for the scans that gave up. A rescan starts afresh.
+  letting the walk go on, if the rows do not fit in `work_mem`. It need not fetch them all to
+  know: once it has tried `LO_SWITCH_SAMPLE` (1,024) members, the rows they gave, scaled to every
+  member not met, foretell whether the rest fit, members in TID order being a fair sample of them.
+  Without that, a switch at PostgreSQL's default 4 MB fetched some 19,000 rows of a 20,000-member
+  set before it found they did not fit, and ran slower than no switch at all (106.7 ms against
+  87 ms, a synthetic 2M-row table, index-only); now it gives up after 1,024 and runs as no switch
+  does (83 ms against 84; with heap fetches, 56 against 59). EXPLAIN ANALYZE says `Switched to Fetch and Sort:
+  S of N scans, M members fetched`, and `Fetch and Sort Given Up: G scans, M members fetched` for
+  the scans that gave up. A rescan starts afresh.
 - **EvalPlanQual** (`SELECT ... FOR UPDATE` over the node): the recheck method tests the
   substituted row against the `lionqual` and the ordered index's original clauses, as an Index
   Scan's `IndexRecheck()` does; `ExecScan()` applies the filter.

@@ -172,6 +172,12 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  */
 #define LO_SWITCH_RATIO		32
 #define LO_SWITCH_MIN_WALK	10000
+
+/*
+ * The members the switch fetches before it judges whether the rest will fit
+ * in work_mem from the rows they gave (lo_switch()).
+ */
+#define LO_SWITCH_SAMPLE	1024
 #define LO_SWITCH_DENSITY	0.5
 
 /*
@@ -486,6 +492,7 @@ typedef struct LionOrderedState
 	uint64		sortfetched;	/* members fetched by the switch */
 	uint64		earlystops;		/* scans the early stop ended */
 	uint64		givenup;		/* scans whose switch gave up on work_mem */
+	uint64		givenupfetched;	/* members those switches fetched */
 	uint64		uncounted;		/* scans that stopped counting members */
 } LionOrderedState;
 
@@ -3954,6 +3961,8 @@ lo_switch(LionOrderedState *st)
 	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
 	Size		budget = (Size) work_mem * 1024;
 	Size		used = 0;
+	double		unmet = (double) (st->members - st->distinct);
+	uint64		tried = 0;
 	int			cap = 64;
 	uint16	   *los;
 	MemoryContext oldcxt;
@@ -3983,6 +3992,7 @@ lo_switch(LionOrderedState *st)
 			CHECK_FOR_INTERRUPTS();
 			lion_code_to_tid(lion_make_code(st->set->keys[i], los[j]), &tid);
 			st->sortfetched++;
+			tried++;
 			/* a heap visit counts as the walk counts them in that mode (§40.6) */
 			if (st->indexonly)
 				st->fetched++;
@@ -4023,9 +4033,19 @@ lo_switch(LionOrderedState *st)
 											&row->nulls[k]);
 			used += HEAPTUPLESIZE + row->tup->t_len +
 				st->nsort * (sizeof(Datum) + sizeof(bool)) + sizeof(LoSortRow);
-			if (used > budget)
+
+			/*
+			 * Too big to sort here: the walk goes on (§30.4).  Known once
+			 * the rows kept pass work_mem, or foreseen as soon as the
+			 * members tried are enough to go by: the rows so far, scaled
+			 * to every member not met, members fetched in TID order being
+			 * a fair sample of them.  A switch that would fail at the end
+			 * fetches a part of what it would have, not all of it.
+			 */
+			if (used > budget ||
+				(tried >= LO_SWITCH_SAMPLE &&
+				 (double) used * unmet / (double) tried > (double) budget))
 			{
-				/* too big to sort here: the walk goes on (§30.4) */
 				MemoryContextSwitchTo(oldcxt);
 				MemoryContextDelete(st->sortcxt);
 				st->sortcxt = NULL;
@@ -4033,6 +4053,7 @@ lo_switch(LionOrderedState *st)
 				st->nsrt = 0;
 				st->noswitch = true;
 				st->givenup++;
+				st->givenupfetched += tried;
 				ExecClearTuple(slot);
 				return false;
 			}
@@ -4522,8 +4543,13 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 			ExplainPropertyText("Switched to Fetch and Sort", buf.data, es);
 		}
 		if (st->givenup > 0)
-			ExplainPropertyInteger("Fetch and Sort Given Up", NULL,
-								   (int64) st->givenup, es);
+		{
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "%llu scans, %llu members fetched",
+							 (unsigned long long) st->givenup,
+							 (unsigned long long) st->givenupfetched);
+			ExplainPropertyText("Fetch and Sort Given Up", buf.data, es);
+		}
 		if (st->uncounted > 0)
 			ExplainPropertyInteger("Scans Not Counting Members", NULL,
 								   (int64) st->uncounted, es);
