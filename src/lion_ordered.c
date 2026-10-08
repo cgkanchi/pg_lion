@@ -218,6 +218,21 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 #define LO_LAZY_ORDER_KEYS		64
 #define LO_LAZY_BACK_SHARE		4
 
+/* Why a lazy set was built, for EXPLAIN ANALYZE: lo_lazy_why()'s answers. */
+typedef enum LoLazyWhy
+{
+	LO_LAZY_HEAP_ORDER,			/* the walk does not go in heap order */
+	LO_LAZY_BUDGET,				/* the probes cost what the build would */
+	LO_LAZY_SWITCH,				/* the switch could be due */
+	LO_LAZY_LONG_WALK,			/* LO_LAZY_MAX_WALK entries met */
+	LO_LAZY_MEMO,				/* the memo outgrew half of hash_mem */
+	LO_LAZY_NWHY
+} LoLazyWhy;
+
+static const char *const lo_lazy_why_names[LO_LAZY_NWHY] = {
+	"heap order", "probe budget", "switch due", "long walk", "memo size"
+};
+
 #define LO_EXPR_LIONQUALS	0
 #define LO_EXPR_ORDQUALS	1
 #define LO_EXPR_LIONQUAL	2
@@ -434,6 +449,7 @@ typedef struct LionOrderedState
 	uint64		lazyback;		/* ... that lay behind the key before them */
 	uint32		lazylast;		/* the key evaluated last */
 	uint64		lazykeys;		/* EXPLAIN ANALYZE: keys evaluated */
+	uint64		lazywhy[LO_LAZY_NWHY];	/* ... and why it was built, per build */
 
 	/*
 	 * This scan's walk (DESIGN.md §30.4): which members it has met, one
@@ -468,6 +484,9 @@ typedef struct LionOrderedState
 	uint64		scans;			/* walks started */
 	uint64		switches;		/* scans that switched */
 	uint64		sortfetched;	/* members fetched by the switch */
+	uint64		earlystops;		/* scans the early stop ended */
+	uint64		givenup;		/* scans whose switch gave up on work_mem */
+	uint64		uncounted;		/* scans that stopped counting members */
 } LionOrderedState;
 
 static Plan *lo_plan_path(PlannerInfo *root, RelOptInfo *rel,
@@ -3183,8 +3202,11 @@ lo_lazy_convert(LionOrderedState *st)
 		st->visitedbytes += LION_BITSET_BYTES;
 	}
 	st->visited = visited;
-	if (lost)
+	if (lost && !st->novisit)
+	{
 		st->novisit = true;
+		st->uncounted++;
+	}
 	pfree(mkeys);
 	pfree(mvisited);
 }
@@ -3850,6 +3872,7 @@ lo_mark(LionOrderedState *st, int idx, ItemPointer tid)
 		if (st->visitedbytes + LION_BITSET_BYTES > get_hash_memory_limit())
 		{
 			st->novisit = true;
+			st->uncounted++;
 			return true;
 		}
 		st->visited[idx] = (uint64 *)
@@ -4009,6 +4032,7 @@ lo_switch(LionOrderedState *st)
 				st->srt = NULL;
 				st->nsrt = 0;
 				st->noswitch = true;
+				st->givenup++;
 				ExecClearTuple(slot);
 				return false;
 			}
@@ -4039,6 +4063,33 @@ lo_sort_next(LionOrderedState *st, TupleTableSlot *slot)
 	slot->tts_tid = tup->t_self;
 	slot->tts_tableOid = RelationGetRelid(st->css.ss.ss_currentRelation);
 	return slot;
+}
+
+/*
+ * Should the lazy set be built now, and why (LoLazyWhy), or -1: the walk
+ * does not go in heap order, or the lazy set's probes have cost what
+ * building it would, or the walk has gone as far as the switch would let it
+ * go were the set as big as its entries' counts say - or far enough anyway
+ * that the early stop and the switch should have the set's size to go by -
+ * or the memo has outgrown its share of hash_mem (§30.4, "The set,
+ * lazily").  Whether the switch comes is decided on the set built, so a
+ * count that is off moves only when the set is built.
+ */
+static int
+lo_lazy_why(LionOrderedState *st)
+{
+	if (st->lazyevals >= LO_LAZY_ORDER_KEYS &&
+		st->lazyback * LO_LAZY_BACK_SHARE >= st->lazyevals)
+		return LO_LAZY_HEAP_ORDER;
+	if (st->lazywork >= st->lazybudget)
+		return LO_LAZY_BUDGET;
+	if (lo_switch_due(st, st->lazymembers))
+		return LO_LAZY_SWITCH;
+	if (st->scanwalked >= LO_LAZY_MAX_WALK)
+		return LO_LAZY_LONG_WALK;
+	if (st->memobytes > st->limit / 2)
+		return LO_LAZY_MEMO;
+	return -1;
 }
 
 /* ExecScan's access method: the next member with a visible version. */
@@ -4077,23 +4128,17 @@ lo_next(ScanState *ss)
 
 		CHECK_FOR_INTERRUPTS();
 
-		/*
-		 * The walk does not go in heap order, or the lazy set's probes have
-		 * cost what building it would, or the walk has gone as far as the
-		 * switch below would let it go were the set as big as its entries'
-		 * counts say - or far enough anyway that the early stop and the
-		 * switch should have the set's size to go by: build it (§30.4, "The
-		 * set, lazily").  Whether the switch comes is decided on the set
-		 * built, so a count that is off moves only when the set is built.
-		 */
-		if (st->lazy &&
-			((st->lazyevals >= LO_LAZY_ORDER_KEYS &&
-			  st->lazyback * LO_LAZY_BACK_SHARE >= st->lazyevals) ||
-			 st->lazywork >= st->lazybudget ||
-			 lo_switch_due(st, st->lazymembers) ||
-			 st->scanwalked >= LO_LAZY_MAX_WALK ||
-			 st->memobytes > st->limit / 2))
-			lo_lazy_convert(st);
+		/* the lazy set built, when lo_lazy_why() says it is time */
+		if (st->lazy)
+		{
+			int			why = lo_lazy_why(st);
+
+			if (why >= 0)
+			{
+				st->lazywhy[why]++;
+				lo_lazy_convert(st);
+			}
+		}
 		counted = !st->noset && !st->lazy && !st->degraded && !st->novisit;
 
 		/*
@@ -4102,7 +4147,10 @@ lo_next(ScanState *ss)
 		 * meets its TID; not knowable once the set has degraded.
 		 */
 		if (counted && st->distinct >= st->members)
+		{
+			st->earlystops++;
 			break;
+		}
 
 		/*
 		 * The walk has cost what fetching the members it has not met would:
@@ -4434,8 +4482,25 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 				appendStringInfo(&buf, ", %llu builds",
 								 (unsigned long long) st->builds);
 			if (st->lazykeys > 0)
+			{
+				int			w;
+				const char *sep = " (";
+
 				appendStringInfo(&buf, ", after %llu keys probed",
 								 (unsigned long long) st->lazykeys);
+				for (w = 0; w < LO_LAZY_NWHY; w++)
+				{
+					if (st->lazywhy[w] == 0)
+						continue;
+					appendStringInfo(&buf, "%s%s", sep, lo_lazy_why_names[w]);
+					if (st->lazywhy[w] > 1)
+						appendStringInfo(&buf, " x%llu",
+										 (unsigned long long) st->lazywhy[w]);
+					sep = ", ";
+				}
+				if (*sep == ',')
+					appendStringInfoChar(&buf, ')');
+			}
 			ExplainPropertyText("Lion Set", buf.data, es);
 		}
 		else if (st->lazykeys > 0)
@@ -4456,6 +4521,15 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 							 (unsigned long long) st->sortfetched);
 			ExplainPropertyText("Switched to Fetch and Sort", buf.data, es);
 		}
+		if (st->givenup > 0)
+			ExplainPropertyInteger("Fetch and Sort Given Up", NULL,
+								   (int64) st->givenup, es);
+		if (st->uncounted > 0)
+			ExplainPropertyInteger("Scans Not Counting Members", NULL,
+								   (int64) st->uncounted, es);
+		if (st->earlystops > 0)
+			ExplainPropertyInteger("Scans Stopped Early", NULL,
+								   (int64) st->earlystops, es);
 	}
 	pfree(buf.data);
 }

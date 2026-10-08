@@ -383,25 +383,25 @@ SELECT lion_bs('SELECT grp, sum(x) FROM bs WHERE tags @> ARRAY[''t3''] AND grp B
 -- 4. The counters: on a table VACUUM has left all-visible nothing is read
 --    from the heap, under a scalar filter and under a multi-key one alike.
 SELECT * FROM lion_bs_run('SELECT id, k, x FROM bs WHERE c200 = 17 ORDER BY k LIMIT 10');
-                     lion_bs_run                      
-------------------------------------------------------
+                             lion_bs_run                             
+---------------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on bs
  Ordered By: bs_k (index only)
  Index Entries Walked: 3025
  Lion Set Hits: 10
  Heap Fetches: 0
- Lion Set: 83 containers, exact, after 28 keys probed
+ Lion Set: 83 containers, exact, after 28 keys probed (probe budget)
 (6 rows)
 
 SELECT * FROM lion_bs_run('SELECT id, k, x FROM bs WHERE c200 = 17 AND c20 = 3 ORDER BY k DESC');
-                     lion_bs_run                      
-------------------------------------------------------
+                             lion_bs_run                             
+---------------------------------------------------------------------
  Custom Scan (LionOrdered) on bs
  Ordered By: bs_k (backward, index only)
  Index Entries Walked: 86577
  Lion Set Hits: 26
  Heap Fetches: 0
- Lion Set: 22 containers, exact, after 29 keys probed
+ Lion Set: 22 containers, exact, after 29 keys probed (probe budget)
 (6 rows)
 
 SELECT * FROM lion_bs_run('SELECT grp, x FROM bs WHERE tags @> ARRAY[''t3'', ''u5'']');
@@ -650,26 +650,26 @@ SELECT lion_bs('SELECT o.v, (SELECT sum(x) FROM bs WHERE c200 = o.v AND k < 2000
 
 SELECT * FROM lion_bs_run('SELECT o.v, x.id FROM (VALUES (17), (18), (250), (3)) o(v),
 				LATERAL (SELECT id FROM bs WHERE c200 = o.v ORDER BY k LIMIT 3) x');
-                          lion_bs_run                           
-----------------------------------------------------------------
+                                   lion_bs_run                                    
+----------------------------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on bs
  Ordered By: bs_k (index only)
  Index Entries Walked: 2038
  Lion Set Hits: 9
  Heap Fetches: 0
- Lion Set: 82 containers, exact, 3 builds, after 82 keys probed
+ Lion Set: 82 containers, exact, 3 builds, after 82 keys probed (probe budget x3)
 (6 rows)
 
 SELECT * FROM lion_bs_run('SELECT o.v, x.id FROM (VALUES (100), (50000), (99990)) o(v),
 				LATERAL (SELECT id FROM bs WHERE c200 = 17 AND k > o.v ORDER BY k LIMIT 3) x');
-                     lion_bs_run                      
-------------------------------------------------------
+                             lion_bs_run                             
+---------------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on bs
  Ordered By: bs_k (index only)
  Index Entries Walked: 1754
  Lion Set Hits: 9
  Heap Fetches: 0
- Lion Set: 78 containers, exact, after 26 keys probed
+ Lion Set: 78 containers, exact, after 26 keys probed (probe budget)
 (6 rows)
 
 -- 9. A partial btree: its predicate's clause stays in the filter, so the
@@ -922,14 +922,14 @@ SELECT lion_bs('SELECT grp, x FROM bs WHERE c200 = 17 ORDER BY grp LIMIT 10', tr
 (1 row)
 
 SELECT * FROM lion_bs_run('SELECT grp, x FROM bs WHERE c200 = 17 ORDER BY grp LIMIT 10');
-                     lion_bs_run                      
-------------------------------------------------------
+                             lion_bs_run                             
+---------------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on bs
  Ordered By: bs_grp (index only)
  Index Entries Walked: 1939
  Lion Set Hits: 10
  Heap Fetches: 0
- Lion Set: 78 containers, exact, after 77 keys probed
+ Lion Set: 78 containers, exact, after 77 keys probed (probe budget)
 (6 rows)
 
 SELECT lion_bs('SELECT grp, sum(x) FROM bs WHERE c20 = 3 GROUP BY grp ORDER BY grp', true);
@@ -939,14 +939,14 @@ SELECT lion_bs('SELECT grp, sum(x) FROM bs WHERE c20 = 3 GROUP BY grp ORDER BY g
 (1 row)
 
 SELECT * FROM lion_bs_run('SELECT grp, sum(x) FROM bs WHERE c20 = 3 GROUP BY grp ORDER BY grp');
-                     lion_bs_run                      
-------------------------------------------------------
+                             lion_bs_run                             
+---------------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on bs
  Ordered By: bs_grp (index only)
  Index Entries Walked: 99979
  Lion Set Hits: 4987
  Heap Fetches: 0
- Lion Set: 83 containers, exact, after 83 keys probed
+ Lion Set: 83 containers, exact, after 83 keys probed (probe budget)
 (6 rows)
 
 -- a multi-key filter over a btree without its column: exact as well, and
