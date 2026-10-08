@@ -1213,8 +1213,11 @@ lion_begin_fact_group(LionCountScanState *st, const LionCountPriv *priv)
  * ranges are handed out as it runs.
  */
 static void
-lion_begin_run_state(LionCountScanState *st, CustomScan *cscan)
+lion_begin_run_state(LionCountScanState *st, CustomScan *cscan,
+					 EState *estate)
 {
+	LionRangedState *rs;
+
 	st->wherecoll.pinbuf = InvalidBuffer;
 	st->gbatchcxt = NULL;		/* made by the first batch */
 
@@ -1222,11 +1225,19 @@ lion_begin_run_state(LionCountScanState *st, CustomScan *cscan)
 	 * A parallel-aware node that is no join is a parallel GROUP BY (DESIGN.md
 	 * §10, "A GROUP BY in parallel"), which the planner offers for one shape
 	 * alone: one column's entries walked whole, over one table
-	 * (lion_count_priv_check()).
+	 * (lion_count_priv_check()).  Its state is there only then - in the
+	 * leader and in every worker, whose begin comes before the Gather's
+	 * shared memory is set up or attached to.
 	 */
-	st->granged = cscan->scan.plan.parallel_aware && st->joinclause < 0;
-	st->grange = -1;
-	st->grangecxt = NULL;		/* made by the first range */
+	st->ranged = NULL;
+	if (!cscan->scan.plan.parallel_aware || st->joinclause >= 0)
+		return;
+
+	rs = (LionRangedState *) MemoryContextAllocZero(estate->es_query_cxt,
+													sizeof(LionRangedState));
+	rs->range = -1;
+	rs->cxt = NULL;				/* made by the first range */
+	st->ranged = rs;
 }
 
 /*
@@ -1554,7 +1565,7 @@ lion_begin_legacy_mode(LionCountScanState *st)
 		return LION_MODE_DISTINCT;
 	if (st->sumall)
 		return LION_MODE_SUM;
-	if (st->granged)
+	if (st->ranged != NULL)
 		return LION_MODE_GROUP_RANGED;
 	if (st->decode != NULL)
 		return LION_MODE_DECODE;
@@ -1612,7 +1623,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_ors_and_items(st, &priv);
 	lion_begin_partitions(st, &priv);
 	lion_begin_fact_group(st, &priv);
-	lion_begin_run_state(st, cscan);
+	lion_begin_run_state(st, cscan, estate);
 	lion_begin_contexts(st, estate);
 	lion_begin_decoded_walk(st, &priv, estate);
 	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
