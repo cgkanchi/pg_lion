@@ -1,0 +1,63 @@
+# Queries over bench/calib/heldout.sql's tables, for matrix.py --queries:
+# a held-out check of the rates of DESIGN.md §39, which were fitted on
+# matrix.py's own set.  The same categories, other shapes.
+IN50 = ', '.join(str(v) for v in range(0, 100000, 2000))
+TAGS = ', '.join("'tag-%d'" % v for v in range(0, 300, 30))
+
+QUERIES = [
+    ('eq', 'h.eq.c5', 'SELECT count(*) FROM ho_s WHERE c5 = 2'),
+    ('eq', 'h.eq.c50', 'SELECT count(*) FROM ho_s WHERE c50 = 9'),
+    ('eq', 'h.eq.c1k', 'SELECT count(*) FROM ho_s WHERE c1k = 321'),
+    ('eq', 'h.eq.c100k', 'SELECT count(*) FROM ho_s WHERE c100k = 4321'),
+    ('eq', 'h.eq.tag', "SELECT count(*) FROM ho_s WHERE tag = 'tag-42'"),
+    ('eq', 'h.eq.tag.in10', 'SELECT count(*) FROM ho_s WHERE tag IN (%s)' % TAGS),
+    ('eq', 'h.eq.c100k.in50', 'SELECT count(*) FROM ho_s WHERE c100k IN (%s)' % IN50),
+    ('eq', 'h.eq.geo.hot', 'SELECT count(*) FROM ho_s WHERE geo = 0'),
+    ('eq', 'h.eq.geo.mid', 'SELECT count(*) FROM ho_s WHERE geo = 6'),
+    ('eq', 'h.eq.geo.rare', 'SELECT count(*) FROM ho_s WHERE geo = 15'),
+    ('eq', 'h.eq.run', 'SELECT count(*) FROM ho_s WHERE run = 20'),
+    ('eq', 'h.eq.n30.null', 'SELECT count(*) FROM ho_s WHERE n30 IS NULL'),
+    ('eq', 'h.eq.c50.c5', 'SELECT count(*) FROM ho_s WHERE c50 = 9 AND c5 = 2'),
+    ('eq', 'h.eq.c1k.tag', "SELECT count(*) FROM ho_s WHERE c1k = 321 AND tag = 'tag-42'"),
+    ('eq', 'h.eq.c5.geo.n30', 'SELECT count(*) FROM ho_s WHERE c5 = 2 AND geo = 1 AND n30 = 3'),
+    ('range', 'h.range.run', 'SELECT count(*) FROM ho_s WHERE run BETWEEN 3 AND 5'),
+    ('range', 'h.range.c100k', 'SELECT count(*) FROM ho_s WHERE c100k BETWEEN 5000 AND 5999'),
+    ('range', 'h.range.c1k.c5',
+     'SELECT count(*) FROM ho_s WHERE c1k BETWEEN 100 AND 299 AND c5 = 2'),
+    ('group', 'h.group.c5', 'SELECT c5, count(*) FROM ho_s GROUP BY c5'),
+    ('group', 'h.group.c50', 'SELECT c50, count(*) FROM ho_s GROUP BY c50'),
+    ('group', 'h.group.c1k', 'SELECT c1k, count(*) FROM ho_s GROUP BY c1k'),
+    ('group', 'h.group.c100k', 'SELECT c100k, count(*) FROM ho_s GROUP BY c100k'),
+    ('group', 'h.group.tag', 'SELECT tag, count(*) FROM ho_s GROUP BY tag'),
+    ('group', 'h.group.geo', 'SELECT geo, count(*) FROM ho_s GROUP BY geo'),
+    ('group', 'h.group.run.w.c5', 'SELECT run, count(*) FROM ho_s WHERE c5 = 2 GROUP BY run'),
+    ('group', 'h.group.tag.w.c50', 'SELECT tag, count(*) FROM ho_s WHERE c50 = 9 GROUP BY tag'),
+    ('group', 'h.group.c1k.w.geo', 'SELECT c1k, count(*) FROM ho_s WHERE geo = 3 GROUP BY c1k'),
+    ('group', 'h.group.c50.c5', 'SELECT c50, c5, count(*) FROM ho_s GROUP BY c50, c5'),
+    ('group', 'h.distinct.tag.w.c5', 'SELECT count(DISTINCT tag) FROM ho_s WHERE c5 = 2'),
+    ('group', 'h.topk.c1k',
+     'SELECT c1k, count(*) FROM ho_s GROUP BY c1k ORDER BY count(*) DESC LIMIT 5'),
+    ('fk', 'h.fk.d10.region',
+     'SELECT count(*) FROM ho_f f JOIN ho_d10 d ON f.f10 = d.pk WHERE d.region = 4'),
+    ('fk', 'h.fk.d10.region.tier',
+     'SELECT count(*) FROM ho_f f JOIN ho_d10 d ON f.f10 = d.pk WHERE d.region = 4 AND d.tier = 1'),
+    ('fk', 'h.fk.d10.region.state',
+     'SELECT count(*) FROM ho_f f JOIN ho_d10 d ON f.f10 = d.pk WHERE d.region = 4 AND f.state = 2'),
+    ('fk', 'h.fk.d10.group.region',
+     'SELECT d.region, count(*) FROM ho_f f JOIN ho_d10 d ON f.f10 = d.pk '
+     'WHERE f.y = 7 GROUP BY d.region'),
+    ('fk', 'h.fk.d2.flag',
+     'SELECT count(*) FROM ho_f f JOIN ho_d2 d ON f.f2 = d.pk WHERE d.flag = 11'),
+    ('fk', 'h.fk.d64.family',
+     'SELECT count(*) FROM ho_f f JOIN ho_d64 d ON f.f64 = d.pk WHERE d.family = 5'),
+    ('fk', 'h.fk.semi.d10',
+     'SELECT count(*) FROM ho_d10 d WHERE d.region = 4 AND EXISTS '
+     '(SELECT 1 FROM ho_f f WHERE f.f10 = d.pk AND f.state = 2 AND f.y = 7)'),
+    ('fk', 'h.fk.anti.d10',
+     'SELECT count(*) FROM ho_d10 d WHERE d.tier = 2 AND NOT EXISTS '
+     '(SELECT 1 FROM ho_f f WHERE f.f10 = d.pk AND f.state = 2)'),
+    ('ordered', 'h.ord.c50', 'SELECT id FROM ho_s WHERE c50 = 9 ORDER BY k, id LIMIT 10'),
+    ('ordered', 'h.ord.c1k.tag',
+     "SELECT id FROM ho_s WHERE c1k = 321 AND tag = 'tag-42' ORDER BY k, id LIMIT 10"),
+    ('ordered', 'h.ord.geo.rare', 'SELECT id FROM ho_s WHERE geo = 12 ORDER BY k, id LIMIT 20'),
+]

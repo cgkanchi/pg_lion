@@ -78,7 +78,6 @@ extern PGDLLIMPORT double lion_hashagg_rate;
 extern PGDLLIMPORT double lion_agg_rate;
 extern PGDLLIMPORT double lion_hashjoin_rate;
 extern PGDLLIMPORT double lion_mergejoin_rate;
-extern PGDLLIMPORT double lion_nestloop_rate;
 extern PGDLLIMPORT double lion_bitmap_rate;
 
 /*

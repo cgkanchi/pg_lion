@@ -355,11 +355,21 @@ def mispick(chosen_ms, best_ms):
     return chosen_ms > best_ms * 1.15 and chosen_ms - best_ms > 0.05
 
 
+def load_queries(path):
+    """Another query set: a Python file that defines QUERIES as above."""
+    env = {}
+    exec(compile(Path(path).read_text(), str(path), 'exec'), env)
+    return env['QUERIES']
+
+
 def run(args):
+    global QUERIES
     psql = Psql(args)
+    if args.queries:
+        QUERIES = load_queries(args.queries)
     if args.setup:
         script = '\\set rows %d\n\\set dirty %d\n' % (args.rows, args.dirty)
-        script += (HERE / 'setup.sql').read_text()
+        script += Path(args.setup_file or HERE / 'setup.sql').read_text()
         t0 = time.time()
         psql.run(script)
         print('setup: %d rows, %d%% dirty, %.0f s' % (args.rows, args.dirty, time.time() - t0),
@@ -527,6 +537,9 @@ def main():
     ap.add_argument('--dbname')
     ap.add_argument('--setup', action='store_true', help='build the tables first (setup.sql)')
     ap.add_argument('--setup-only', action='store_true')
+    ap.add_argument('--setup-file', help='another setup script (default: setup.sql)')
+    ap.add_argument('--queries', help='another query set: a Python file defining QUERIES '
+                    '(heldout.py: tables and queries the rates were not fitted on)')
     ap.add_argument('--rows', type=int, default=2000000)
     ap.add_argument('--dirty', type=int, default=0,
                     help='percent of calib_s rows updated after the VACUUM')
