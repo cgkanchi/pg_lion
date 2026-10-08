@@ -81,8 +81,21 @@ bool		lion_enable_bm25_scan = true;
 
 static set_rel_pathlist_hook_type lion_bm25_prev_set_rel_pathlist_hook = NULL;
 
-/* custom_private: the index, the query, k1, b and the first L, as Consts */
+/*
+ * custom_private: the index, the query, k1, b and the first L, as Consts, in
+ * that order.  lion_bm25_priv_decode() is its one reader and
+ * lion_bm25_priv_encode() its one writer.
+ */
 #define LION_BM25_PRIV_LEN	5
+
+typedef struct LionBm25Priv
+{
+	Oid			indexoid;		/* a regclass */
+	Datum		query;			/* a tsquery, pointing into the plan */
+	double		k1;
+	double		b;
+	int64		firstL;
+} LionBm25Priv;
 
 typedef struct LionBm25ScanState
 {
@@ -135,6 +148,82 @@ static const CustomExecMethods lion_bm25_exec_methods = {
 	.ReScanCustomScan = lion_bm25_rescan,
 	.ExplainCustomScan = lion_bm25_explain,
 };
+
+/* ---------------------------------------------------------------------
+ * custom_private
+ * --------------------------------------------------------------------- */
+
+/* Member i of custom_private, which has to be a non-null Const of type */
+static Datum
+lion_bm25_priv_const(List *priv, int i, Oid type)
+{
+	Const	   *c = (Const *) list_nth(priv, i);
+
+	if (c == NULL || !IsA(c, Const) || c->consttype != type ||
+		c->constisnull)
+		elog(ERROR, "LionBm25 plan's private item %d is not a %s", i,
+			 format_type_be(type));
+	return c->constvalue;
+}
+
+/*
+ * Read a LionBm25 plan's custom_private into *out: a list this build did
+ * not write is an ERROR, not a misread Oid.
+ */
+static void
+lion_bm25_priv_decode(List *priv, LionBm25Priv *out)
+{
+	if (list_length(priv) != LION_BM25_PRIV_LEN)
+		elog(ERROR, "LionBm25 plan has %d private items, not %d",
+			 list_length(priv), LION_BM25_PRIV_LEN);
+	out->indexoid = DatumGetObjectId(lion_bm25_priv_const(priv, 0,
+														  REGCLASSOID));
+	out->query = lion_bm25_priv_const(priv, 1, TSQUERYOID);
+	out->k1 = DatumGetFloat8(lion_bm25_priv_const(priv, 2, FLOAT8OID));
+	out->b = DatumGetFloat8(lion_bm25_priv_const(priv, 3, FLOAT8OID));
+	out->firstL = DatumGetInt64(lion_bm25_priv_const(priv, 4, INT8OID));
+}
+
+/* lion_bm25_priv_encode() without its check */
+static List *
+lion_bm25_priv_build(const LionBm25Priv *p)
+{
+	return list_make5(makeConst(REGCLASSOID, -1, InvalidOid, sizeof(Oid),
+								ObjectIdGetDatum(p->indexoid), false, true),
+					  makeConst(TSQUERYOID, -1, InvalidOid, -1,
+								p->query, false, false),
+					  makeConst(FLOAT8OID, -1, InvalidOid, sizeof(float8),
+								Float8GetDatum(p->k1), false,
+								FLOAT8PASSBYVAL),
+					  makeConst(FLOAT8OID, -1, InvalidOid, sizeof(float8),
+								Float8GetDatum(p->b), false,
+								FLOAT8PASSBYVAL),
+					  makeConst(INT8OID, -1, InvalidOid, sizeof(int64),
+								Int64GetDatum(p->firstL), false,
+								FLOAT8PASSBYVAL));
+}
+
+/*
+ * Write *p as a LionBm25 path's custom_private, which the plan takes over.
+ * The query is not copied: it points into a Const the caller has copied.  An
+ * assert-enabled build decodes what it wrote, writes that again and checks
+ * the two are equal(), as lion_count_priv_encode() does.
+ */
+static List *
+lion_bm25_priv_encode(const LionBm25Priv *p)
+{
+	List	   *priv = lion_bm25_priv_build(p);
+
+#ifdef USE_ASSERT_CHECKING
+	{
+		LionBm25Priv again;
+
+		lion_bm25_priv_decode(priv, &again);
+		Assert(equal(priv, lion_bm25_priv_build(&again)));
+	}
+#endif
+	return priv;
+}
 
 /* ---------------------------------------------------------------------
  * Planning
@@ -294,6 +383,7 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	Cost		startup;
 	Cost		perrow;
 	CustomPath *cp;
+	LionBm25Priv priv;
 	ListCell   *lc;
 	bool		desc;
 
@@ -426,11 +516,12 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	cp->path.pathkeys = list_make1(pk);
 	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cp->custom_paths = NIL;
-	cp->custom_private =
-		list_make5(copyObject(cindex), copyObject(cquery), copyObject(ck1),
-				   copyObject(cb),
-				   makeConst(INT8OID, -1, InvalidOid, sizeof(int64),
-							 Int64GetDatum(firstL), false, FLOAT8PASSBYVAL));
+	priv.indexoid = DatumGetObjectId(cindex->constvalue);
+	priv.query = ((Const *) copyObject(cquery))->constvalue;
+	priv.k1 = DatumGetFloat8(ck1->constvalue);
+	priv.b = DatumGetFloat8(cb->constvalue);
+	priv.firstL = firstL;
+	cp->custom_private = lion_bm25_priv_encode(&priv);
 	cp->methods = &lion_bm25_path_methods;
 	add_path(rel, &cp->path);
 }
@@ -502,19 +593,15 @@ lion_bm25_begin(CustomScanState *node, EState *estate, int eflags)
 {
 	LionBm25ScanState *st = (LionBm25ScanState *) node;
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
-	List	   *priv = cscan->custom_private;
-	Oid			indexoid;
+	LionBm25Priv priv;
 	ListCell   *lc;
 	int			i = 0;
 
-	if (list_length(priv) != LION_BM25_PRIV_LEN)
-		elog(ERROR, "LionBm25 plan has %d private items, not %d",
-			 list_length(priv), LION_BM25_PRIV_LEN);
-	indexoid = DatumGetObjectId(((Const *) linitial(priv))->constvalue);
-	st->query = DatumGetTSQuery(((Const *) lsecond(priv))->constvalue);
-	st->k1 = DatumGetFloat8(((Const *) lthird(priv))->constvalue);
-	st->b = DatumGetFloat8(((Const *) lfourth(priv))->constvalue);
-	st->firstL = DatumGetInt64(((Const *) list_nth(priv, 4))->constvalue);
+	lion_bm25_priv_decode(cscan->custom_private, &priv);
+	st->query = DatumGetTSQuery(priv.query);
+	st->k1 = priv.k1;
+	st->b = priv.b;
+	st->firstL = priv.firstL;
 
 	st->natts = list_length(cscan->custom_scan_tlist);
 	st->attnos = (AttrNumber *) palloc0(sizeof(AttrNumber) * st->natts);
@@ -534,7 +621,7 @@ lion_bm25_begin(CustomScanState *node, EState *estate, int eflags)
 
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
-	st->index = index_open(indexoid, AccessShareLock);
+	st->index = index_open(priv.indexoid, AccessShareLock);
 	lion_check_table_am(node->ss.ss_currentRelation);
 	st->heapslot = table_slot_create(node->ss.ss_currentRelation,
 									 &estate->es_tupleTable);
@@ -682,9 +769,10 @@ lion_bm25_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
 	LionBm25ScanState *st = (LionBm25ScanState *) node;
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
-	Oid			indexoid = DatumGetObjectId(((Const *) linitial(cscan->custom_private))->constvalue);
+	LionBm25Priv priv;
 
-	ExplainPropertyText("Index", get_rel_name(indexoid), es);
+	lion_bm25_priv_decode(cscan->custom_private, &priv);
+	ExplainPropertyText("Index", get_rel_name(priv.indexoid), es);
 	if (es->analyze)
 		ExplainPropertyInteger("Rows Ranked", NULL, st->seen, es);
 }
