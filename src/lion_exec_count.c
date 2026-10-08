@@ -3308,18 +3308,40 @@ lion_wagg_run(LionCountScanState *st)
 }
 
 /*
- * Whichever of them the plan asks for.
+ * Whichever of them the plan asks for.  A parallel GROUP BY run without the
+ * Gather's shared memory walks as the serial one does; an IN list on the
+ * grouping column drives the groups of either, as the relation's locate
+ * decided (lion_locate_where()).
  */
 TupleTableSlot *
 lion_next_group_any(LionCountScanState *st, bool *exhausted)
 {
-	if (st->decode != NULL)
-		return lion_next_group_decode(st, exhausted);
-	if (st->distattno != 0)
-		return lion_next_group_distinct(st, exhausted);
-	if (st->groupattno2 != 0)
-		return lion_next_group2(st, exhausted);
-	if (st->ingroupitem >= 0)
-		return lion_next_group_inlist(st, exhausted);
-	return lion_next_group(st, exhausted);
+	switch (st->mode)
+	{
+		case LION_MODE_DECODE:
+			Assert(st->decode != NULL);
+			return lion_next_group_decode(st, exhausted);
+		case LION_MODE_GROUP_DISTINCT:
+			Assert(st->decode == NULL && st->distattno != 0);
+			return lion_next_group_distinct(st, exhausted);
+		case LION_MODE_GROUP2:
+			Assert(st->decode == NULL && st->distattno == 0 &&
+				   st->groupattno2 != 0);
+			return lion_next_group2(st, exhausted);
+		case LION_MODE_GROUP:
+		case LION_MODE_GROUP_RANGED:
+			Assert(st->decode == NULL && st->distattno == 0 &&
+				   st->groupattno2 == 0);
+			if (st->ingroupitem >= 0)
+				return lion_next_group_inlist(st, exhausted);
+			return lion_next_group(st, exhausted);
+		case LION_MODE_COUNT:
+		case LION_MODE_SUM:
+		case LION_MODE_DISTINCT:
+		case LION_MODE_JOIN:
+		case LION_MODE_JOIN_FACTGROUP:
+			break;
+	}
+	elog(ERROR, "LionCount: mode %d has no groups", (int) st->mode);
+	return NULL;				/* keep compiler quiet */
 }

@@ -306,26 +306,34 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		lion_eval_clause_values(st);
 
 	/*
-	 * A partitioned table counts one partition at a time - and the FK-side
-	 * join over one takes each batch of keys to every partition in turn.
+	 * ---- the FK-side join: one partial row per dimension row ----
+	 *
+	 * The join over a partitioned fact table takes each batch of keys to
+	 * every partition in turn, and locates nothing of its own here.
 	 */
-	if (st->npart > 0)
-		return (st->joinclause >= 0) ? lion_next_join_row(st) :
-			lion_exec_partitioned(st);
-
-	/* ---- the FK-side join: one partial row per dimension row ---- */
-	if (st->joinclause >= 0)
+	switch (st->mode)
 	{
-		if (!st->located)
-			lion_join_locate_where(st);
-		return lion_next_join_row(st);
+		case LION_MODE_JOIN:
+		case LION_MODE_JOIN_FACTGROUP:
+			Assert(st->joinclause >= 0);
+			if (st->npart == 0 && !st->located)
+				lion_join_locate_where(st);
+			return lion_next_join_row(st);
+		default:
+			Assert(st->joinclause < 0);
+			break;
 	}
+
+	/* A partitioned table counts one partition at a time. */
+	if (st->npart > 0)
+		return lion_exec_partitioned(st);
 
 	if (!st->located)
 		lion_locate_where(st);
 
 	/* ---- no index to iterate: exactly one row ---- */
-	if (!st->hasgroupidx)
+	Assert((st->mode == LION_MODE_COUNT) == !st->hasgroupidx);
+	if (st->mode == LION_MODE_COUNT)
 	{
 		/* Without a group index a clause has to drive the count. */
 		st->done = true;
@@ -353,56 +361,83 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		 */
 		st->distcount = 0;
 		st->distcolcount = 0;
-		if ((st->sumall || (st->distattno != 0 && st->groupattno == 0)) &&
+		Assert((st->mode == LION_MODE_SUM || st->mode == LION_MODE_DISTINCT) ==
+			   (st->sumall || (st->distattno != 0 && st->groupattno == 0)));
+		if ((st->mode == LION_MODE_SUM || st->mode == LION_MODE_DISTINCT) &&
 			!st->singlegroup)
 			return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, 0);
 		return NULL;
 	}
 
-	/* ---- count(DISTINCT k) over the WHERE: one row (DESIGN.md §26) ---- */
-	if (st->distattno != 0 && st->groupattno == 0)
-		return lion_distinct_relation(st);
-
-	/* ---- every entry of the index, summed into one row ---- */
-	if (st->sumall)
+	switch (st->mode)
 	{
-		/*
-		 * ... and the aggregates over lion columns' entries (DESIGN.md §37),
-		 * beside the counts or without any.
-		 */
-		int64		total = (st->nwagg == 0 || st->wneedcount) ?
-			lion_sumall_relation(st) : 0;
+		case LION_MODE_DISTINCT:
+			/* ---- count(DISTINCT k) over the WHERE: one row (§26) ---- */
+			Assert(st->distattno != 0 && st->groupattno == 0);
+			return lion_distinct_relation(st);
 
-		if (st->nwagg > 0)
-			lion_wagg_run(st);
-		st->done = true;
+		case LION_MODE_SUM:
+			/* ---- every entry of the index, summed into one row ---- */
+			Assert(st->sumall &&
+				   !(st->distattno != 0 && st->groupattno == 0));
+			{
+				/*
+				 * ... and the aggregates over lion columns' entries
+				 * (DESIGN.md §37), beside the counts or without any.
+				 */
+				int64		total = (st->nwagg == 0 || st->wneedcount) ?
+					lion_sumall_relation(st) : 0;
 
-		/*
-		 * A GROUP BY the planner folded to one group has no row when the group
-		 * is empty - which a range-bounded sum (DESIGN.md §28) can be:
-		 * `... WHERE g = 3 AND k < 20 GROUP BY g`.
-		 */
-		if (total == 0 && st->singlegroup)
-			return NULL;
-		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, total);
-	}
+				if (st->nwagg > 0)
+					lion_wagg_run(st);
+				st->done = true;
 
-	/*
-	 * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel") walks the
-	 * entries once per range of container keys it counts, and begins each walk
-	 * itself.  Run without the Gather's shared memory - which a Gather that
-	 * cannot run in parallel mode does not set up - the node is the only
-	 * participant, and counts every group whole as the serial node does: one
-	 * partial row a group, which the Finalize Agg takes as it takes any.
-	 */
-	if (st->granged && st->joinshared != NULL)
-	{
-		bool		exhausted;
-		TupleTableSlot *slot = lion_next_group_ranged(st, &exhausted);
+				/*
+				 * A GROUP BY the planner folded to one group has no row when
+				 * the group is empty - which a range-bounded sum (DESIGN.md
+				 * §28) can be: `... WHERE g = 3 AND k < 20 GROUP BY g`.
+				 */
+				if (total == 0 && st->singlegroup)
+					return NULL;
+				return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true,
+									   total);
+			}
 
-		if (exhausted)
-			st->done = true;
-		return slot;
+		case LION_MODE_GROUP_RANGED:
+
+			/*
+			 * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel")
+			 * walks the entries once per range of container keys it counts,
+			 * and begins each walk itself.  Run without the Gather's shared
+			 * memory - which a Gather that cannot run in parallel mode does
+			 * not set up - the node is the only participant, and counts every
+			 * group whole as the serial node does: one partial row a group,
+			 * which the Finalize Agg takes as it takes any.
+			 */
+			Assert(st->granged && !st->sumall && st->distattno == 0);
+			if (st->joinshared != NULL)
+			{
+				bool		exhausted;
+				TupleTableSlot *slot = lion_next_group_ranged(st, &exhausted);
+
+				if (exhausted)
+					st->done = true;
+				return slot;
+			}
+			break;
+
+		case LION_MODE_GROUP:
+		case LION_MODE_GROUP2:
+		case LION_MODE_GROUP_DISTINCT:
+		case LION_MODE_DECODE:
+			Assert(!st->granged && !st->sumall &&
+				   !(st->distattno != 0 && st->groupattno == 0));
+			break;
+
+		case LION_MODE_COUNT:
+		case LION_MODE_JOIN:
+		case LION_MODE_JOIN_FACTGROUP:
+			elog(ERROR, "LionCount: mode %d past its dispatch", (int) st->mode);
 	}
 
 	/*

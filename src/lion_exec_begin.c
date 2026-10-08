@@ -1453,6 +1453,34 @@ lion_begin_decoded_walk(LionCountScanState *st, const LionCountPriv *priv,
 	st->decode = dr;
 }
 
+#ifdef USE_ASSERT_CHECKING
+/*
+ * The mode as the run's tests of the fields begin set would find it, which
+ * lion_count_mode_of() has to agree with.
+ */
+static LionCountMode
+lion_begin_legacy_mode(LionCountScanState *st)
+{
+	if (st->joinclause >= 0)
+		return (st->fgattno != 0) ? LION_MODE_JOIN_FACTGROUP : LION_MODE_JOIN;
+	if (!st->hasgroupidx)
+		return LION_MODE_COUNT;
+	if (st->distattno != 0 && st->groupattno == 0)
+		return LION_MODE_DISTINCT;
+	if (st->sumall)
+		return LION_MODE_SUM;
+	if (st->granged)
+		return LION_MODE_GROUP_RANGED;
+	if (st->decode != NULL)
+		return LION_MODE_DECODE;
+	if (st->distattno != 0)
+		return LION_MODE_GROUP_DISTINCT;
+	if (st->groupattno2 != 0)
+		return LION_MODE_GROUP2;
+	return LION_MODE_GROUP;
+}
+#endif
+
 void
 lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 {
@@ -1473,6 +1501,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 
 	lion_count_priv_check(&priv, cscan->scan.plan.parallel_aware,
 						  list_length(cscan->custom_plans));
+	st->mode = lion_count_mode_of(&priv, cscan->scan.plan.parallel_aware);
 
 	/*
 	 * One value expression per clause in custom_exprs, then one argument per
@@ -1502,6 +1531,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_join_child(st, node, cscan, estate, eflags);
 	lion_begin_join_distinct_key(st, estate);
 	lion_begin_join_batches(st, estate);
+	Assert(st->mode == lion_begin_legacy_mode(st));
 
 	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
 		return;

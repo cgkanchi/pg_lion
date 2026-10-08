@@ -913,6 +913,34 @@ lion_count_priv_inner_attno(const LionCountPriv *p)
 }
 
 /*
+ * What the node does (LionCountMode), in the order the run has always asked:
+ * a join before anything else, then no index to iterate, a count(DISTINCT k)
+ * without a GROUP BY before a sum, and a parallel GROUP BY before the walks
+ * of the serial one.  `parallel_aware` is the CustomScan's.
+ */
+LionCountMode
+lion_count_mode_of(const LionCountPriv *p, bool parallel_aware)
+{
+	if (p->hasjoin)
+		return (p->fgattno != 0) ? LION_MODE_JOIN_FACTGROUP : LION_MODE_JOIN;
+	if ((p->flags & LION_FLAG_GROUPIDX) == 0)
+		return LION_MODE_COUNT;
+	if (p->distattno != 0 && p->groupattno == 0)
+		return LION_MODE_DISTINCT;
+	if ((p->flags & LION_FLAG_SUMALL) != 0)
+		return LION_MODE_SUM;
+	if (parallel_aware)
+		return LION_MODE_GROUP_RANGED;
+	if ((p->flags & LION_FLAG_DECODE) != 0)
+		return LION_MODE_DECODE;
+	if (p->distattno != 0)
+		return LION_MODE_GROUP_DISTINCT;
+	if (p->groupattno2 != 0)
+		return LION_MODE_GROUP2;
+	return LION_MODE_GROUP;
+}
+
+/*
  * The rules between the members of a decoded plan, which every plan this
  * build makes keeps: which shapes go together, and what each needs of the
  * others.  `parallel_aware` and `ncustom_plans` are the CustomScan's; at the
