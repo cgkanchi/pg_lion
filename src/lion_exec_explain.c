@@ -747,7 +747,7 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 {
 	StringInfoData buf;
 
-	if (st->hasgroupidx && st->groupattno != 0 && st->hascoal)
+	if (st->hasgroupidx && st->groupattno != 0 && st->coal != NULL)
 	{
 		/*
 		 * GROUP BY coalesce(g, c) (DESIGN.md §10), printed as core prints the
@@ -756,7 +756,7 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 		List	   *context = set_deparse_context_plan(es->deparse_cxt,
 													   st->css.ss.ps.plan,
 													   ancestors);
-		char	   *val = deparse_expression((Node *) st->coalconst, context,
+		char	   *val = deparse_expression((Node *) st->coal->value, context,
 											 false, false);
 
 		initStringInfo(&buf);

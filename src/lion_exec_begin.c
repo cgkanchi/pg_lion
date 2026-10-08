@@ -741,20 +741,27 @@ lion_begin_topk(LionCountScanState *st, const LionCountPriv *priv,
 	st->topk = tk;
 }
 
-/* GROUP BY coalesce(g, c) (DESIGN.md §10): c and its equality */
+/*
+ * GROUP BY coalesce(g, c) (DESIGN.md §10): c and its equality.  Their state
+ * is there only when the plan groups by a coalesce.
+ */
 static void
 lion_begin_coalesce(LionCountScanState *st, const LionCountPriv *priv,
 					EState *estate)
 {
-	if (priv->coalconst != NULL)
-	{
-		st->coalconst = priv->coalconst;
-		st->coaleqop = priv->coaleqop;
-		st->coalcoll = priv->coalcoll;
-		fmgr_info_cxt(get_opcode(st->coaleqop), &st->coaleqfn,
-					  estate->es_query_cxt);
-		st->hascoal = true;
-	}
+	LionCoalState *coal;
+
+	st->coal = NULL;
+	if (priv->coalconst == NULL)
+		return;
+
+	coal = (LionCoalState *) MemoryContextAllocZero(estate->es_query_cxt,
+													sizeof(LionCoalState));
+	coal->value = priv->coalconst;
+	coal->eqop = priv->coaleqop;
+	coal->coll = priv->coalcoll;
+	fmgr_info_cxt(get_opcode(coal->eqop), &coal->eqfn, estate->es_query_cxt);
+	st->coal = coal;
 }
 
 /*
