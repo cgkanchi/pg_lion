@@ -97,6 +97,14 @@ lion_cursor_init_at(LionSetCursor *cur, const LionPostingSet *set,
 		 * descent hands back a page that WAS a leaf under the lock it read it
 		 * with.
 		 */
+		/*
+		 * A borrowed image is never freed here, nor anywhere in this file:
+		 * the caller's must outlive the cursor.  The cursor keeps its
+		 * current leaf in it from one call to the next (cur->img), so it is
+		 * this cursor's alone while the cursor is in use - a caller may
+		 * hand the same image to the next cursor it sets up in this slot,
+		 * never to two that are live at once.
+		 */
 		cur->imgbuf = (image != NULL) ? image :
 			(PGAlignedBlock *) palloc(sizeof(PGAlignedBlock));
 		cur->img = (Page) cur->imgbuf->data;

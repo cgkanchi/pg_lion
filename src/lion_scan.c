@@ -2570,6 +2570,13 @@ lion_scan_key_ne_any(Relation index, LionState *col, ScanKey k)
 		LionProbe	probe;
 		int			i;
 
+		/*
+		 * Nothing here is freed, by design: it is all in the context the
+		 * rewritten keys live in (lion_scan_keys_rewrite()), freed with
+		 * them, and `one` - the value a key with one distinct element keeps
+		 * - points into the detoasted array and its deconstructed elements.
+		 * Freeing arr or elems here would leave that key's argument dangling.
+		 */
 		get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
 		deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
 						  &elems, &nulls, &nelems);
@@ -4422,6 +4429,13 @@ struct LionOrderWalk
 	int64		leaves;
 };
 
+/*
+ * Unchecked on purpose: w->codes has room for Max(LION_CONTAINER_RANGE,
+ * LION_SPARSE_MAX_PAIRS) codes, and lion_sparse_iterate() yields at most
+ * lion_sparse_npairs() pairs, a damaged count clamped to
+ * LION_SPARSE_MAX_PAIRS.  A caller that iterated anything not so bounded
+ * would need a check here.
+ */
 static bool
 lion_order_pair_cb(uint32 ckey, uint16 lo, void *arg)
 {

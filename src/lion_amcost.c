@@ -1503,6 +1503,11 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	 * change, nor does what reads them: LionOrdered takes its lion side from
 	 * a bitmap path when there is no plain one (lion_ordered.c).  The next
 	 * planning run reads the flag from the handler again.
+	 *
+	 * That order inside get_index_paths() - cost first, the flag read after
+	 * - is core's implementation, not a promise: test/sql/plainscan.sql
+	 * pins it on every major CI builds, and it is to be checked again when
+	 * a new major is added.
 	 */
 	if (!lion_enable_plain_scan)
 		path->indexinfo->amhasgettuple = false;
