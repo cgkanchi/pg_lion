@@ -212,8 +212,8 @@ lion_pause_run(LionCountScanState *st)
 	 * ... and a walk of the fk index in key order (§27) lets go of the leaf it
 	 * stands on; the next key reads it again by its block number.
 	 */
-	if (st->joinwalkbegun)
-		lion_lookup_walk_pause(&st->joinwalker);
+	if (st->join != NULL && st->join->batch.walkbegun)
+		lion_lookup_walk_pause(&st->join->batch.walker);
 }
 
 /*
@@ -551,28 +551,33 @@ lion_reset_run(LionCountScanState *st)
 	/* ... and the account of a plan that probes them, begun again */
 	lion_join_switch_reset(st);
 
-	/* ... and a forward semi join's sorted keys, sorted again next run. */
-	if (st->joinsort != NULL)
+	if (st->join != NULL)
 	{
-		tuplesort_end(st->joinsort);
-		st->joinsort = NULL;
+		LionJoinState *js = st->join;
+
+		/* ... and a forward semi join's sorted keys, sorted again next run. */
+		if (js->sort.tuplesort != NULL)
+		{
+			tuplesort_end(js->sort.tuplesort);
+			js->sort.tuplesort = NULL;
+		}
+		if (js->sort.slot != NULL)
+			ExecClearTuple(js->sort.slot);
+		if (js->sort.cxt != NULL)
+			MemoryContextReset(js->sort.cxt);
+		js->sort.done = false;
+		js->sort.haveprev = false;
+		js->sort.keypos = 0;
+		js->sort.chunk = -1;
+
+		/* ... and the batch of keys looked up in key order, and the walk */
+		lion_join_batch_reset(st);
+		js->batch.childdone = false;
+
+		/* ... and the way the child is read, decided again at the next row */
+		js->batch.begun = false;
+		js->batch.walked = false;
 	}
-	if (st->joinsortslot != NULL)
-		ExecClearTuple(st->joinsortslot);
-	if (st->joinkeycxt != NULL)
-		MemoryContextReset(st->joinkeycxt);
-	st->joinsortdone = false;
-	st->joinhaveprev = false;
-	st->joinkeypos = 0;
-	st->joinchunk = -1;
-
-	/* ... and the batch of keys being looked up in key order, and the walk */
-	lion_join_batch_reset(st);
-	st->joinchilddone = false;
-
-	/* ... and the way the child is read, decided again at the next row */
-	st->joinbegun = false;
-	st->joinwalked = false;
 
 	/* ... and a fact column's groups: the rows put by, and the next turn */
 	if (st->fg != NULL)
@@ -989,10 +994,10 @@ lion_shutdown_custom_scan(CustomScanState *node)
 			shared->switchkeys += js->switchkeys;
 			for (i = 0; i < LION_JT_N; i++)
 				INSTR_TIME_ADD(shared->time[i], js->time[i]);
+			shared->sorted = Max(shared->sorted, js->sort.sorted);
+			shared->batches += js->batch.batches;
 		}
 		shared->dirpages += st->dirpages;
-		shared->sorted = Max(shared->sorted, st->joinsorted);
-		shared->batches += st->joinbatches;
 		shared->copies += st->joincopies;
 		shared->copychunks += st->joincopychunks;
 		if (rs != NULL)
@@ -1106,15 +1111,20 @@ lion_end_custom_scan(CustomScanState *node)
 		MemoryContextDelete(st->valcxt);
 		st->valcxt = NULL;
 	}
-	if (st->joinkeycxt != NULL)
+	if (st->join != NULL)
 	{
-		MemoryContextDelete(st->joinkeycxt);
-		st->joinkeycxt = NULL;
-	}
-	if (st->joinbatchcxt != NULL)
-	{
-		MemoryContextDelete(st->joinbatchcxt);
-		st->joinbatchcxt = NULL;
+		LionJoinState *js = st->join;
+
+		if (js->sort.cxt != NULL)
+		{
+			MemoryContextDelete(js->sort.cxt);
+			js->sort.cxt = NULL;
+		}
+		if (js->batch.cxt != NULL)
+		{
+			MemoryContextDelete(js->batch.cxt);
+			js->batch.cxt = NULL;
+		}
 	}
 	if (st->joinvisitcxt != NULL)
 	{
