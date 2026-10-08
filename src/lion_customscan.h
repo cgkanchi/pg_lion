@@ -1599,6 +1599,87 @@ typedef struct LionFactGroupState
 } LionFactGroupState;
 
 /*
+ * The FK-side join (DESIGN.md §27).  clause is the clause that is the join
+ * key; its value is column keyresno of the child plan's current row,
+ * childslot, which is also where the target list's dimension columns are
+ * read from.  The key's posting set is located into the scan's groupset and
+ * counted as source slot 0, once per child row.  lookups and missing are
+ * what EXPLAIN ANALYZE reports.
+ *
+ * What each child row's count is: the number of fact rows it joins for an
+ * inner join, and for a semi or anti join whether it joins any - type, one
+ * of LION_JOIN_*.  collect says the plan wants the fact filters collected
+ * once into filter (lion_sources_collect(), in the scan's outercxt) and each
+ * fk set counted against that copy instead of against the filters
+ * themselves; collected says the attempt has been made for this run, and
+ * filtered that it worked - sources is then what each count reads.
+ * filterrows is the copy's size, for EXPLAIN.
+ *
+ * PROBED, THEN COLLECTED: a plan that probes the fact filters, because the
+ * planner expected few dimension rows, keeps an account of what probing
+ * them has cost this run - rent, in the planner's units, from what the
+ * counts read (lion_join_count_key()) - and collects them once it reaches
+ * what collecting would cost, buy (lion_join_copy_price(), from the located
+ * sets; -1 until they are priced, 0 where no copy of them can be made or
+ * would fit).  mayswitch says this run may still switch; probed counts its
+ * keys counted by probing.  A partitioned fact table keeps the same account
+ * per leaf (LionJoinPart), rentp pointing at the one of the leaf whose turn
+ * it is.  switches and switchkeys are what EXPLAIN ANALYZE reports: the
+ * copies made by switching, and the keys probed before each, summed over
+ * the runs and the leaves.
+ *
+ * Where a key's time goes: the rows the child returned, the posting-tree
+ * pages the keys' counts read (lion_posting_pages_read over each count) and
+ * - only under EXPLAIN ANALYZE with its TIMING option, which is what timing
+ * says, as core times a node only then - the time spent in each phase
+ * (LION_JT_*).  The count's own counters are in the scan's stats
+ * (LionCountStats: key_containers, copy_containers, ...).
+ *
+ * The workers' sums of these counters stay in the scan state
+ * (joinworker*), with the rest of a parallel plan's.
+ */
+typedef struct LionJoinState
+{
+	int			clause;
+	AttrNumber	keyresno;
+	PlanState  *child;
+	TupleTableSlot *childslot;
+	int64		lookups;
+	int64		missing;
+
+	int			type;
+	bool		collect;
+	bool		rows;
+	bool		sum;			/* LION_JOINFLAG_SUM: one row, the sum */
+	bool		counts;			/* LION_JOINFLAG_COUNTS: rows, each with its
+								 * count */
+	bool		outer;			/* LION_JOINFLAG_OUTER: a semi or anti join
+								 * path, whose rows are the outer side's */
+	bool		ordered;		/* LION_JOINFLAG_ORDERED: ... handed up in
+								 * the child's order */
+	bool		collected;
+	bool		filtered;
+	LionPostingSet filter;
+	LionCountSource sources[2];
+	int64		filterrows;
+	int64		spilled;		/* copies that went to a temporary file */
+
+	bool		mayswitch;
+	double		rent;
+	double		buy;
+	int64		probed;
+	double	   *rentp;
+	int64	   *probedp;
+	int64		switches;
+	int64		switchkeys;
+
+	int64		childrows;
+	int64		posting;
+	bool		timing;
+	instr_time	time[LION_JT_N];
+} LionJoinState;
+
+/*
  * What the node does, fixed by the plan at begin (lion_count_mode_of()) and
  * dispatched on by the run: the one choice among the shapes below, in the
  * order the run tries them.  Whether the table is partitioned is apart from
@@ -1989,70 +2070,18 @@ typedef struct LionCountScanState
 	int64		dirpages;
 
 	/*
-	 * The FK-side join (DESIGN.md §27).  joinclause is the clause that is the
-	 * join key, or -1 for every other shape; its value is column joinkeyresno
-	 * of the child plan's current row, childslot, which is also where the
-	 * target list's dimension columns are read from.  The key's posting set is
-	 * located into groupset and counted as source slot 0, once per child row.
-	 * joinlookups and joinmissing are what EXPLAIN ANALYZE reports.
+	 * The FK-side join (DESIGN.md §27): its plan's flags, its child, its
+	 * keys' counters and its fact filters' copy, or NULL for every other
+	 * shape (lion_st_join()).  What it sorts and batches, a partitioned fact
+	 * table's turns and what the participants of a parallel plan share are
+	 * below.
 	 */
-	int			joinclause;
-	AttrNumber	joinkeyresno;
-	PlanState  *child;
-	TupleTableSlot *childslot;
-	int64		joinlookups;
-	int64		joinmissing;
+	struct LionJoinState *join;
 
 	/*
-	 * What each child row's count is (DESIGN.md §27): the number of fact rows
-	 * it joins for an inner join, and for a semi or anti join whether it
-	 * joins any - LION_JOIN_*.  joincollect says the plan wants the fact
-	 * filters collected once into joinfilter (lion_sources_collect(), in
-	 * outercxt) and each fk set counted against that copy instead of against
-	 * the filters themselves; joincollected says the attempt has been made
-	 * for this run, and joinfiltered that it worked - joinsources is then
-	 * what each count reads.  joinfilterrows is the copy's size, for EXPLAIN.
+	 * The workers' sums of a probing plan's switches (LionJoinState's
+	 * switches and switchkeys), for EXPLAIN ANALYZE.
 	 */
-	int			jointype;
-	bool		joincollect;
-	bool		joinrows;
-	bool		joinsum;		/* LION_JOINFLAG_SUM: one row, the sum */
-	bool		joincounts;		/* LION_JOINFLAG_COUNTS: rows, each with
-								 * its count */
-	bool		joinouter;		/* LION_JOINFLAG_OUTER: a semi or anti join
-								 * path, whose rows are the outer side's */
-	bool		joinordered;	/* LION_JOINFLAG_ORDERED: ... handed up in
-								 * the child's order */
-	bool		joincollected;
-	bool		joinfiltered;
-	LionPostingSet joinfilter;
-	LionCountSource joinsources[2];
-	int64		joinfilterrows;
-	int64		joinspilled;	/* copies that went to a temporary file */
-
-	/*
-	 * PROBED, THEN COLLECTED (DESIGN.md §27): a plan that probes the fact
-	 * filters, because the planner expected few dimension rows, keeps an
-	 * account of what probing them has cost this run - joinrent, in the
-	 * planner's units, from what the counts read (lion_join_count_key()) - and
-	 * collects them once it reaches what collecting would cost, joinbuy
-	 * (lion_join_copy_price(), from the located sets; -1 until they are
-	 * priced, 0 where no copy of them can be made or would fit).  joinswitch
-	 * says this run may still switch; joinprobed counts its keys counted by
-	 * probing.  A partitioned fact table keeps the same account per leaf
-	 * (LionJoinPart), joinrentp pointing at the one of the leaf whose turn it
-	 * is.  joinswitches and joinswitchkeys are what EXPLAIN ANALYZE reports:
-	 * the copies made by switching, and the keys probed before each, summed
-	 * over the runs, the leaves and - joinworker* - the workers.
-	 */
-	bool		joinswitch;
-	double		joinrent;
-	double		joinbuy;
-	int64		joinprobed;
-	double	   *joinrentp;
-	int64	   *joinprobedp;
-	int64		joinswitches;
-	int64		joinswitchkeys;
 	int64		joinworkerswitches;
 	int64		joinworkerswitchkeys;
 
@@ -2164,7 +2193,7 @@ typedef struct LionCountScanState
 	 * One copy per query (DESIGN.md §27, "One copy per query"): in a parallel
 	 * plan whose workers started, the fact filters are collected once, by all
 	 * the participants together, into joinsharedcopy in the Gather's dynamic
-	 * shared memory, and joinfilter is this participant's view of it
+	 * shared memory, and join->filter is this participant's view of it
 	 * (joinviewshared).  joinpcxt is the leader's parallel context, which
 	 * says whether any worker started.  joincopies counts the shared copies
 	 * this participant indexed - one a run - and joincopychunks the chunks of
@@ -2188,18 +2217,9 @@ typedef struct LionCountScanState
 	int64		joinworkerbatches;
 
 	/*
-	 * Where a key's time goes (DESIGN.md §27): the rows the child returned,
-	 * the posting-tree pages the keys' counts read (lion_posting_pages_read
-	 * over each count) and - only under EXPLAIN ANALYZE with its TIMING
-	 * option, which is what jointiming says, as core times a node only then -
-	 * the time spent in each phase (LION_JT_*).  The count's own counters are
-	 * in stats (LionCountStats: key_containers, copy_containers, ...).  The
-	 * joinworker* copies are the workers' sums, as for the counters above.
+	 * The workers' sums of where a key's time goes (LionJoinState's
+	 * childrows, posting and time), as for the counters above.
 	 */
-	int64		joinchildrows;
-	int64		joinposting;
-	bool		jointiming;
-	instr_time	jointime[LION_JT_N];
 	int64		joinworkerchildrows;
 	int64		joinworkerposting;
 	instr_time	joinworkertime[LION_JT_N];
@@ -2273,6 +2293,14 @@ lion_st_fg(LionCountScanState *st)
 {
 	Assert(st->fg != NULL);
 	return st->fg;
+}
+
+/* The FK-side join's state, which only a join has (§27) */
+static inline LionJoinState *
+lion_st_join(LionCountScanState *st)
+{
+	Assert(st->join != NULL);
+	return st->join;
 }
 
 /*

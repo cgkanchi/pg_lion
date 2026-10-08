@@ -832,31 +832,39 @@ lion_begin_coalesce(LionCountScanState *st, const LionCountPriv *priv,
 /*
  * The FK-side join (DESIGN.md §27): which clause is the join key, and
  * which column of the child's rows carries its value.  Every other shape
- * has neither, and no child.
+ * has neither, and no child: its state is there only for a join
+ * (lion_st_join()).
  */
 static void
-lion_begin_join(LionCountScanState *st, const LionCountPriv *priv)
+lion_begin_join(LionCountScanState *st, const LionCountPriv *priv,
+				EState *estate)
 {
-	st->joinclause = -1;
-	st->jointype = LION_JOIN_INNER;
-	if (priv->hasjoin)
-	{
-		int			flags = priv->join.flags;
+	LionJoinState *js;
+	int			flags;
 
-		st->joinclause = priv->join.clause;
-		st->jointype = priv->join.type;
-		st->joincollect = (flags & LION_JOINFLAG_COLLECT) != 0;
-		st->joinrows = (flags & LION_JOINFLAG_ROWS) != 0;
-		st->joinsum = (flags & LION_JOINFLAG_SUM) != 0;
-		st->joincounts = (flags & LION_JOINFLAG_COUNTS) != 0;
-		st->joinouter = (flags & LION_JOINFLAG_OUTER) != 0;
-		st->joinordered = (flags & LION_JOINFLAG_ORDERED) != 0;
-		st->joinunique = (flags & LION_JOINFLAG_UNIQUE) != 0;
-		st->joinwalk = (flags & LION_JOINFLAG_WALK) != 0;
-		st->joinsortop = priv->join.sortop;
-		st->joinsortcoll = priv->join.sortcoll;
-		st->joinkeyresno = priv->join.keyresno;
-	}
+	st->join = NULL;
+	if (!priv->hasjoin)
+		return;
+
+	flags = priv->join.flags;
+	js = (LionJoinState *) MemoryContextAllocZero(estate->es_query_cxt,
+												  sizeof(LionJoinState));
+	js->clause = priv->join.clause;
+	js->keyresno = priv->join.keyresno;
+	js->type = priv->join.type;
+	js->collect = (flags & LION_JOINFLAG_COLLECT) != 0;
+	js->rows = (flags & LION_JOINFLAG_ROWS) != 0;
+	js->sum = (flags & LION_JOINFLAG_SUM) != 0;
+	js->counts = (flags & LION_JOINFLAG_COUNTS) != 0;
+	js->outer = (flags & LION_JOINFLAG_OUTER) != 0;
+	js->ordered = (flags & LION_JOINFLAG_ORDERED) != 0;
+	st->join = js;
+
+	/* ... and what it sorts and batches, still in the scan state */
+	st->joinunique = (flags & LION_JOINFLAG_UNIQUE) != 0;
+	st->joinwalk = (flags & LION_JOINFLAG_WALK) != 0;
+	st->joinsortop = priv->join.sortop;
+	st->joinsortcoll = priv->join.sortcoll;
 }
 
 /*
@@ -878,7 +886,7 @@ lion_begin_target_list(LionCountScanState *st, CustomScan *cscan,
 	 * join key's column is in custom_scan_tlist for the clause's value, and is
 	 * read by nothing else.  Said, rather than trusted, like a malformed join.
 	 */
-	if (st->joinsum)
+	if (st->join != NULL && st->join->sum)
 	{
 		List	   *vars = pull_var_clause((Node *) cscan->scan.plan.targetlist,
 										   PVC_RECURSE_AGGREGATES |
@@ -1048,7 +1056,7 @@ lion_begin_clauses(LionCountScanState *st, CustomScanState *node,
 		 * expression is kept for EXPLAIN, which deparses it as the dimension
 		 * column it references.
 		 */
-		if (i == st->joinclause)
+		if (st->join != NULL && i == st->join->clause)
 		{
 			cl->con = NULL;
 			cl->valstate = NULL;
@@ -1112,7 +1120,7 @@ lion_begin_ors_and_items(LionCountScanState *st, const LionCountPriv *priv)
 		int			orno = -1;
 
 		/* The join key is looked up per child row, into slot 0, not here. */
-		if (i == st->joinclause)
+		if (st->join != NULL && i == st->join->clause)
 			continue;
 
 		/* A range bounds the driving walk and is no source (DESIGN.md §28). */
@@ -1242,7 +1250,7 @@ lion_begin_run_state(LionCountScanState *st, CustomScan *cscan,
 	 * shared memory is set up or attached to.
 	 */
 	st->ranged = NULL;
-	if (!cscan->scan.plan.parallel_aware || st->joinclause >= 0)
+	if (!cscan->scan.plan.parallel_aware || st->join != NULL)
 		return;
 
 	rs = (LionRangedState *) MemoryContextAllocZero(estate->es_query_cxt,
@@ -1309,12 +1317,18 @@ static void
 lion_begin_join_child(LionCountScanState *st, CustomScanState *node,
 					  CustomScan *cscan, EState *estate, int eflags)
 {
+	LionJoinState *js = st->join;
 	int			i;
 
-	st->joinfilterrows = -1;
 	st->joinworkerfilterrows = -1;
-	st->joinfilter.pinbuf = InvalidBuffer;
 	st->joinchunk = -1;
+	for (i = 0; i < LION_JT_N; i++)
+		INSTR_TIME_SET_ZERO(st->joinworkertime[i]);
+	if (js == NULL)
+		return;
+
+	js->filterrows = -1;
+	js->filter.pinbuf = InvalidBuffer;
 	lion_join_switch_reset(st);
 
 	/*
@@ -1322,18 +1336,12 @@ lion_begin_join_child(LionCountScanState *st, CustomScanState *node,
 	 * TIMING option (or auto_explain's), which is what es_instrument says in
 	 * every participant, as it says so to InstrAlloc() for each node.
 	 */
-	st->jointiming = (estate->es_instrument & INSTRUMENT_TIMER) != 0;
+	js->timing = (estate->es_instrument & INSTRUMENT_TIMER) != 0;
 	for (i = 0; i < LION_JT_N; i++)
-	{
-		INSTR_TIME_SET_ZERO(st->jointime[i]);
-		INSTR_TIME_SET_ZERO(st->joinworkertime[i]);
-	}
-	if (st->joinclause >= 0)
-	{
-		st->child = ExecInitNode((Plan *) linitial(cscan->custom_plans),
-								 estate, eflags);
-		node->custom_ps = list_make1(st->child);
-	}
+		INSTR_TIME_SET_ZERO(js->time[i]);
+	js->child = ExecInitNode((Plan *) linitial(cscan->custom_plans),
+							 estate, eflags);
+	node->custom_ps = list_make1(js->child);
 }
 
 /*
@@ -1347,7 +1355,8 @@ lion_begin_join_distinct_key(LionCountScanState *st, EState *estate)
 {
 	if (st->joinunique)
 	{
-		TupleDesc	childdesc = ExecGetResultType(st->child);
+		LionJoinState *js = lion_st_join(st);
+		TupleDesc	childdesc = ExecGetResultType(js->child);
 		Form_pg_attribute keyatt;
 		Oid			eqop;
 
@@ -1355,10 +1364,10 @@ lion_begin_join_distinct_key(LionCountScanState *st, EState *estate)
 		 * Only the key comes out of the sort, and it is the only column of
 		 * the child the target list reads (lion_count_priv_check()).
 		 */
-		if (st->joinkeyresno > childdesc->natts)
+		if (js->keyresno > childdesc->natts)
 			elog(ERROR, "LionCount: malformed join");
 
-		keyatt = TupleDescAttr(childdesc, st->joinkeyresno - 1);
+		keyatt = TupleDescAttr(childdesc, js->keyresno - 1);
 		st->joinkeytype = keyatt->atttypid;
 		st->joinkeybyval = keyatt->attbyval;
 		st->joinkeylen = keyatt->attlen;
@@ -1392,7 +1401,7 @@ lion_begin_join_batches(LionCountScanState *st, EState *estate)
 	 * each batch goes to every partition in turn, with a turn of its own and
 	 * a copy of each partition's fact filters kept from batch to batch.
 	 */
-	if (st->joinclause >= 0 && st->npart > 0)
+	if (st->join != NULL && st->npart > 0)
 	{
 		st->joinpart = (LionJoinPart *)
 			palloc0(sizeof(LionJoinPart) * st->npart);
@@ -1418,12 +1427,13 @@ lion_begin_join_batches(LionCountScanState *st, EState *estate)
 
 	if (st->joinwalk || st->joinpart != NULL || st->fg != NULL)
 	{
-		TupleDesc	childdesc = ExecGetResultType(st->child);
+		LionJoinState *js = lion_st_join(st);
+		TupleDesc	childdesc = ExecGetResultType(js->child);
 		Form_pg_attribute keyatt;
 
-		if (st->joinkeyresno > childdesc->natts)
+		if (js->keyresno > childdesc->natts)
 			elog(ERROR, "LionCount: malformed join");
-		keyatt = TupleDescAttr(childdesc, st->joinkeyresno - 1);
+		keyatt = TupleDescAttr(childdesc, js->keyresno - 1);
 		st->joinkeytype = keyatt->atttypid;
 		st->joinkeybyval = keyatt->attbyval;
 		st->joinkeylen = keyatt->attlen;
@@ -1571,7 +1581,7 @@ lion_begin_decoded_walk(LionCountScanState *st, const LionCountPriv *priv,
 static LionCountMode
 lion_begin_legacy_mode(LionCountScanState *st)
 {
-	if (st->joinclause >= 0)
+	if (st->join != NULL)
 		return (st->fg != NULL) ? LION_MODE_JOIN_FACTGROUP : LION_MODE_JOIN;
 	if (!st->hasgroupidx)
 		return LION_MODE_COUNT;
@@ -1629,7 +1639,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_list_batch(st, estate);
 	lion_begin_distinct(st, &priv, estate);
 	lion_begin_inner(st, &priv, estate);
-	lion_begin_join(st, &priv);
+	lion_begin_join(st, &priv, estate);
 	lion_begin_target_list(st, cscan, &priv);
 	lion_begin_wagg(st, node, &priv, exprs, estate);
 	lion_begin_clauses(st, node, &priv, exprs);

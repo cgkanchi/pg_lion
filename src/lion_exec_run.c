@@ -341,12 +341,12 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 	{
 		case LION_MODE_JOIN:
 		case LION_MODE_JOIN_FACTGROUP:
-			Assert(st->joinclause >= 0);
+			Assert(st->join != NULL);
 			if (st->npart == 0 && !st->located)
 				lion_join_locate_where(st);
 			return lion_next_join_row(st);
 		default:
-			Assert(st->joinclause < 0);
+			Assert(st->join == NULL);
 			break;
 	}
 
@@ -521,9 +521,12 @@ lion_reset_run(LionCountScanState *st)
 	lion_release_where(st);
 
 	/* The FK-side join's collected filters (in outercxt, reset below). */
-	lion_posting_set_release(&st->joinfilter);
-	st->joincollected = false;
-	st->joinfiltered = false;
+	if (st->join != NULL)
+	{
+		lion_posting_set_release(&st->join->filter);
+		st->join->collected = false;
+		st->join->filtered = false;
+	}
 	st->joinviewshared = false;
 
 	/* ... or a partitioned fact table's, one copy per partition */
@@ -666,14 +669,19 @@ lion_rescan_custom_scan(CustomScanState *node)
 	 * is handed on here; a child that has one rescans itself on its next
 	 * ExecProcNode().
 	 */
-	if (st->child != NULL)
+	if (st->join != NULL)
 	{
-		if (node->ss.ps.chgParam != NULL)
-			UpdateChangedParamSet(st->child, node->ss.ps.chgParam);
-		if (st->child->chgParam == NULL)
-			ExecReScan(st->child);
+		LionJoinState *js = st->join;
+
+		if (js->child != NULL)
+		{
+			if (node->ss.ps.chgParam != NULL)
+				UpdateChangedParamSet(js->child, node->ss.ps.chgParam);
+			if (js->child->chgParam == NULL)
+				ExecReScan(js->child);
+		}
+		js->childslot = NULL;
 	}
-	st->childslot = NULL;
 }
 
 /*
@@ -695,11 +703,13 @@ Size
 lion_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
 {
 	LionCountScanState *st = (LionCountScanState *) node;
+	LionJoinState *js;
 
 	if (st->ranged != NULL)
 		return MAXALIGN(sizeof(LionJoinShared));
+	js = lion_st_join(st);
 	return MAXALIGN(sizeof(LionJoinShared)) +
-		(Size) ((st->joincollect && st->npart > 0) ? st->npart : 1) *
+		(Size) ((js->collect && st->npart > 0) ? st->npart : 1) *
 		lion_shared_copy_size();
 }
 
@@ -733,6 +743,7 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 {
 	LionCountScanState *st = (LionCountScanState *) node;
 	LionJoinShared *shared = (LionJoinShared *) coordinate;
+	bool		collect = (st->join != NULL && st->join->collect);
 
 	memset(shared, 0, sizeof(LionJoinShared));
 	SpinLockInit(&shared->mutex);
@@ -768,7 +779,7 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	 * launched whether any of them started.
 	 */
 	st->joinpcxt = pcxt;
-	if (st->joincollect && pcxt->seg != NULL && st->joinpart == NULL)
+	if (collect && pcxt->seg != NULL && st->joinpart == NULL)
 	{
 		lion_shared_copy_init(LION_JOIN_SHARED_COPY(shared), pcxt->seg,
 							  shared->participants,
@@ -784,7 +795,7 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	 * memory a Parallel Hash would have is divided among them by their heaps'
 	 * sizes, and past its share each copy's chunks go to its own files.
 	 */
-	if (st->joincollect && pcxt->seg != NULL && st->joinpart != NULL)
+	if (collect && pcxt->seg != NULL && st->joinpart != NULL)
 	{
 		Size		memory = get_hash_memory_limit() * (Size) shared->participants;
 		double		total;
@@ -844,10 +855,12 @@ lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	{
 		if (st->joinviewshared)
 		{
-			lion_posting_set_release(&st->joinfilter);
+			LionJoinState *js = lion_st_join(st);
+
+			lion_posting_set_release(&js->filter);
 			st->joinviewshared = false;
-			st->joinfiltered = false;
-			st->joincollected = false;
+			js->filtered = false;
+			js->collected = false;
 		}
 		lion_shared_copy_reinit(st->joinsharedcopy,
 								node->ss.ps.state->es_query_dsa,
@@ -929,6 +942,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 	LionCountScanState *st = (LionCountScanState *) node;
 	LionJoinShared *shared = st->shared;
 	LionRangedState *rs = st->ranged;
+	LionJoinState *js = st->join;
 	int			i;
 
 	if (shared == NULL)
@@ -936,7 +950,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 
 	if (st->joinviewshared)
 	{
-		lion_posting_set_release(&st->joinfilter);
+		lion_posting_set_release(&lion_st_join(st)->filter);
 		st->joinviewshared = false;
 	}
 	if (st->joinpart != NULL)
@@ -963,21 +977,24 @@ lion_shutdown_custom_scan(CustomScanState *node)
 			return;
 		SpinLockAcquire(&shared->mutex);
 		lion_count_stats_add(&shared->stats, &st->stats);
-		shared->lookups += st->joinlookups;
-		shared->missing += st->joinmissing;
+		if (js != NULL)
+		{
+			shared->lookups += js->lookups;
+			shared->missing += js->missing;
+			shared->filterrows = Max(shared->filterrows, js->filterrows);
+			shared->spilled += js->spilled;
+			shared->childrows += js->childrows;
+			shared->posting += js->posting;
+			shared->switches += js->switches;
+			shared->switchkeys += js->switchkeys;
+			for (i = 0; i < LION_JT_N; i++)
+				INSTR_TIME_ADD(shared->time[i], js->time[i]);
+		}
 		shared->dirpages += st->dirpages;
-		shared->filterrows = Max(shared->filterrows, st->joinfilterrows);
-		shared->spilled += st->joinspilled;
 		shared->sorted = Max(shared->sorted, st->joinsorted);
 		shared->batches += st->joinbatches;
-		shared->childrows += st->joinchildrows;
-		shared->posting += st->joinposting;
 		shared->copies += st->joincopies;
 		shared->copychunks += st->joincopychunks;
-		shared->switches += st->joinswitches;
-		shared->switchkeys += st->joinswitchkeys;
-		for (i = 0; i < LION_JT_N; i++)
-			INSTR_TIME_ADD(shared->time[i], st->jointime[i]);
 		if (rs != NULL)
 			shared->ranges += rs->ranges;
 		shared->wherecollected += st->wherecollected;
@@ -1032,12 +1049,17 @@ lion_end_custom_scan(CustomScanState *node)
 	if (st->shared != NULL && !IsParallelWorker())
 		lion_list_pin_participants(1);
 
-	if (st->child != NULL)
+	if (st->join != NULL)
 	{
-		ExecEndNode(st->child);
-		st->child = NULL;
+		LionJoinState *js = st->join;
+
+		if (js->child != NULL)
+		{
+			ExecEndNode(js->child);
+			js->child = NULL;
+		}
+		js->childslot = NULL;
 	}
-	st->childslot = NULL;
 
 	/*
 	 * A plain table's relations were opened once and are closed once, and so
