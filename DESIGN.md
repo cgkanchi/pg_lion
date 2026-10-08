@@ -14416,8 +14416,11 @@ than overruns (§30.4).
   build reads (`ncontainers`, never below `LO_LAZY_MIN_WORK`, 64) - or once the walk has gone as
   far as the fetch-and-sort switch below would let it go were the set as big as its entries'
   recorded member counts say (`ntids`: an AND no bigger than its smallest child, an OR than its
-  children together), or `LO_LAZY_MAX_WALK` (40,000) entries in any case, so that the early stop
-  and the switch, which need the set's size, can act; or once the memo holds half of `hash_mem`.
+  children together), or once the walk has met `LO_LAZY_WALK_WORK` (8) entries for each unit of
+  that budget, and at least the switch's 10,000: an entry walked costs 30 to 70 ns and a unit of
+  the build about 350 (the 5M-row list query below has a budget of 24,040 and builds in 8.5 ms),
+  so by then the walk has cost about what the build will, and the early stop and the switch,
+  which need the set's size, can act from there on; or once the memo holds half of `hash_mem`.
   The counts are hints, and decide only when the set is built: whether the switch comes is
   decided on the set built, and in the regression suite it comes at the same entry it came at
   before. And a walk that does not go in heap order is built for at once: once
@@ -14434,26 +14437,44 @@ than overruns (§30.4).
   walk met (`lo_lazy_convert()`): each memo key's bitmap goes to its container's slot, so the
   members already returned count as met and the switch does not fetch them again. A small set,
   whose build is cheap, is built at once, before the walk has cost more than a few dozen probes:
-  the worst case costs about twice the build. A leaf key that selects nothing makes an AND of it
+  the worst case costs about twice the build. And the set starts lazily only where the planner
+  expects the walk to stop short: the node alone in its query under a `LIMIT` (with its
+  `OFFSET`) below `LO_LAZY_MAX_SHARE` (a fifth) of the rows it would return, or a walk it expects
+  to end within the switch's 10,000 entries anyway (the ordered index's selectivity, or the
+  walked range's, times the rows, times that share); otherwise the plan says `LO_FLAG_BUILD`
+  and the set is built at the start. A walk that goes further meets
+  most of the set's container keys - one in heap order passes over them once for each entry it
+  walks - and a probe of a key costs more than the build's read of it. Over the 5M rows below,
+  `LIMIT 500` (a third of the 1,420 rows estimated) walks 70,000 entries over 4,224 of the 6,010
+  keys: built at a fixed 40,000 entries it took 22.8 ms warm, and lazy throughout 13.8, against
+  16.3 built at the start; `LIMIT 1000` and no `LIMIT` took 25.5 and 34.8 ms with the build at
+  40,000 entries, 31.4 and 43.2 lazy until the probe budget, and 20.5 and 24.3 built at the start.
+  A walk the planner misjudges still meets the rules above: a far-end walk under `LIMIT 10`, its
+  members all in the last 1% of the order, builds at 10,000 entries and switches at 12,160,
+  0.63 ms where building at 40,000 took 1.40. A leaf key that selects nothing makes an AND of it
   empty, as before (`lo_lazy_empty()`). Exactness is the lion quals' own (every lazy key is an
   exact set). A rescan keeps the memo unless a Param of the lion quals changed, as it keeps a
   built set; the members met are the scan's and go with it. EXPLAIN ANALYZE says `Lion Set:
   lazy, K keys probed, exact`, or `N containers, exact, after K keys probed (why)` when it was
   built, `why` naming the rule that built it - `heap order`, `probe budget`, `switch due`,
-  `long walk` (`LO_LAZY_MAX_WALK` entries) or `memo size` (the memo past half of `hash_mem`) -
-  with a count when rescans built it for more than one. `test/sql/ordered_transitions.sql`
-  forces every rule but the heap order one, which needs sets of more than about 256 containers
-  (some 16,000 heap pages each) before a random walk's restarts leave it 64 keys within budget.
+  `long walk` (`LO_LAZY_WALK_WORK` entries a unit of the budget) or `memo size` (the memo past
+  half of `hash_mem`) - with a count when rescans built it for more than one; a set the plan
+  builds at the start says `N containers, exact`, as with the lazy set off.
+  `test/sql/ordered_transitions.sql` forces the probe budget, long walk and memo size rules and
+  the plan's build at the start (its walks that go far bound the walked column by parameters, so
+  that the generic plan expects them short), `ordered.sql` the switch due one; not the heap order
+  one, which needs sets of more than about 256 containers (some 16,000 heap pages each) before a
+  random walk's restarts leave it 64 keys within budget.
   The planner still prices the set as built (§30.3): the lazy set makes the node cheaper than
   its estimate, never dearer by more than the build. `pg_lion.enable_lazy_set` (on) turns it
   off, for comparing the two and for the tests of the build (a set that degrades).
   `test/sql/ordered_lists.sql`. Measured on a release PostgreSQL 18, 5M rows of a 3 GB heap,
   `long IN (2 of 20) AND here IN (2 of 50) AND we IN (2 of 30) ORDER BY here LIMIT 50` (§30.11,
   "Lists"): the set of `long` and `we` built is 5,989 containers read before the first row, 8.0 ms
-  warm; lazily the walk probes 468 of the table's 5,860 container keys, 1.3 ms warm, and 6.0 ms
-  from disk (direct I/O, 55 pages) where it was 128 ms (1,509 pages) before the list was the
-  walk's. A btree on `(here, long, we) INCLUDE (...)` answers the same in 0.02 ms warm and 0.8 ms
-  from disk (10 pages), for that query shape alone, at 936 MB against the lion index's 39 MB.
+  warm and 21 ms from disk (direct I/O, 147 pages); lazily the walk probes 468 of the table's
+  5,860 container keys, 1.3 ms warm and 6.0 ms from disk (55 pages). A btree on
+  `(here, long, we) INCLUDE (...)` answers the same in 0.02 ms warm and 0.8 ms from disk
+  (10 pages), for that query shape alone, at 936 MB against the lion index's 39 MB.
 - **The walk.** `index_beginscan()` on the ordered index under the executor snapshot and
   `index_rescan()` with its keys, in the path's direction. On 16 .. 19 each TID comes from
   `index_getnext_tid()`, which reads only the index, and a member is fetched with

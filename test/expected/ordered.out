@@ -477,14 +477,14 @@ SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 AND c2 = 1 ORDER B
 (6 rows)
 
 SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 AND length(note) = 5 ORDER BY k, id LIMIT 10');
-                            lion_ord_run                             
----------------------------------------------------------------------
+                         lion_ord_run                          
+---------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on lo
  Rows Removed by Filter: 505
  Index Entries Walked: 14272
  Lion Set Hits: 59
  Heap Fetches: 505
- Lion Set: 32 containers, exact, after 23 keys probed (probe budget)
+ Lion Set: 32 containers, exact
  Switched to Fetch and Sort: 1 of 1 scans, 446 members fetched
 (7 rows)
 
@@ -1040,16 +1040,38 @@ SELECT lion_ord('SELECT id, k FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
 (1 row)
 
 SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
-                          lion_ord_run                           
------------------------------------------------------------------
+                          lion_ord_run                          
+----------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on lcor
  Index Entries Walked: 32000
  Lion Set Hits: 0
  Heap Fetches: 1000
- Lion Set: 1 containers, exact, after 4 keys probed (switch due)
+ Lion Set: 1 containers, exact, after 2 keys probed (long walk)
  Switched to Fetch and Sort: 1 of 1 scans, 1000 members fetched
 (6 rows)
 
+-- at a ratio of 8 the switch that the set's recorded member count foresees
+-- comes at 10,000 entries, ahead of the long-walk rule: the lazy set is built
+-- for it (switch due), and the switch follows on the count built
+SET pg_lion.ordered_switch_ratio = 8;
+SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
+                          lion_ord_run                           
+-----------------------------------------------------------------
+ ->  Custom Scan (LionOrdered) on lcor
+ Index Entries Walked: 10000
+ Lion Set Hits: 0
+ Heap Fetches: 1000
+ Lion Set: 1 containers, exact, after 2 keys probed (switch due)
+ Switched to Fetch and Sort: 1 of 1 scans, 1000 members fetched
+(6 rows)
+
+SELECT lion_ord('SELECT id, k FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
+       lion_ord       
+----------------------
+ LionOrdered, 10 rows
+(1 row)
+
+RESET pg_lion.ordered_switch_ratio;
 -- no row at all: every c = 190 row has g = 0
 SELECT lion_ord('SELECT id, k FROM lcor WHERE c = 190 AND g = 1 ORDER BY k LIMIT 10');
       lion_ord       
@@ -1058,14 +1080,14 @@ SELECT lion_ord('SELECT id, k FROM lcor WHERE c = 190 AND g = 1 ORDER BY k LIMIT
 (1 row)
 
 SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE c = 190 AND g = 1 ORDER BY k LIMIT 10');
-                          lion_ord_run                           
------------------------------------------------------------------
+                          lion_ord_run                          
+----------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on lcor
  Rows Removed by Filter: 1000
  Index Entries Walked: 32000
  Lion Set Hits: 0
  Heap Fetches: 1000
- Lion Set: 1 containers, exact, after 4 keys probed (switch due)
+ Lion Set: 1 containers, exact, after 2 keys probed (long walk)
  Switched to Fetch and Sort: 1 of 1 scans, 1000 members fetched
 (7 rows)
 
@@ -1083,13 +1105,13 @@ SELECT lion_ord('SELECT id, k FROM lcor WHERE h = 1 ORDER BY k');
 (1 row)
 
 SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE h = 1 ORDER BY k LIMIT 20');
-                          lion_ord_run                           
------------------------------------------------------------------
+                          lion_ord_run                          
+----------------------------------------------------------------
  ->  Custom Scan (LionOrdered) on lcor
  Index Entries Walked: 32000
  Lion Set Hits: 3
  Heap Fetches: 1003
- Lion Set: 2 containers, exact, after 4 keys probed (switch due)
+ Lion Set: 2 containers, exact, after 2 keys probed (long walk)
  Switched to Fetch and Sort: 1 of 1 scans, 1000 members fetched
 (6 rows)
 
