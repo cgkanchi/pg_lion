@@ -1862,7 +1862,8 @@ lion_join_group_turn(LionCountScanState *st, int p)
 	Assert(fgidx != NULL);
 	lion_reader_lock(fgidx, st->css.ss.ps.state->es_snapshot);
 	fgidxcol = lion_index_col_for(fgidx,
-								  lion_heap_attno_in(st->heap, st->heapoid,
+								  lion_heap_attno_in(st->heap,
+													 st->plan.heapoid,
 													 fg->attno),
 								  false);
 	istate = lion_index_column_state(fgidx, fgidxcol);

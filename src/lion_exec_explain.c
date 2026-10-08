@@ -34,7 +34,7 @@ static void
 lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors,
 				   ExplainState *es, StringInfo buf)
 {
-	const char *attname = get_attname(st->heapoid, cl->attno, false);
+	const char *attname = get_attname(st->plan.heapoid, cl->attno, false);
 
 	switch (cl->kind)
 	{
@@ -359,8 +359,9 @@ lion_explain_partitions(LionCountScanState *st, ExplainState *es)
 
 /*
  * The entry of "Lion Indexes" for the index whose entries drive the count
- * (hasgroupidx): the index, what is walked of it - a range's bounds, the
- * column or all of its keys - and the inner index of a pair walked, if any.
+ * (LION_FLAG_GROUPIDX): the index, what is walked of it - a range's bounds,
+ * the column or all of its keys - and the inner index of a pair walked, if
+ * any.
  */
 static void
 lion_explain_group_index(LionCountScanState *st, List *ancestors,
@@ -369,10 +370,10 @@ lion_explain_group_index(LionCountScanState *st, List *ancestors,
 	int			i;
 
 	if (st->npart == 0)
-		appendStringInfo(buf, "%s%s ", get_rel_name(st->groupidxoid),
-						 lion_explain_col(st->groupidxoid,
+		appendStringInfo(buf, "%s%s ", get_rel_name(st->plan.groupidxoid),
+						 lion_explain_col(st->plan.groupidxoid,
 										  st->driveattno, false));
-	if (st->hasrange)
+	if (lion_plan_flag(st, LION_FLAG_RANGE))
 	{
 		bool		firstrange = true;
 
@@ -389,9 +390,9 @@ lion_explain_group_index(LionCountScanState *st, List *ancestors,
 		}
 		appendStringInfoChar(buf, ')');
 	}
-	else if (st->groupattno != 0 || st->distattno != 0)
+	else if (st->plan.groupattno != 0 || st->plan.distattno != 0)
 		appendStringInfo(buf, "(%s)",
-						 get_attname(st->heapoid, st->driveattno, false));
+						 get_attname(st->plan.heapoid, st->driveattno, false));
 	else
 	{
 		bool		keys = false;
@@ -415,11 +416,11 @@ lion_explain_group_index(LionCountScanState *st, List *ancestors,
 	{
 		appendStringInfoString(buf, ", ");
 		if (st->npart == 0)
-			appendStringInfo(buf, "%s%s ", get_rel_name(st->groupidxoid2),
-							 lion_explain_col(st->groupidxoid2,
+			appendStringInfo(buf, "%s%s ", get_rel_name(st->plan.groupidxoid2),
+							 lion_explain_col(st->plan.groupidxoid2,
 											  st->innerattno, false));
 		appendStringInfo(buf, "(%s)",
-						 get_attname(st->heapoid, st->innerattno, false));
+						 get_attname(st->plan.heapoid, st->innerattno, false));
 	}
 
 	/*
@@ -433,8 +434,8 @@ lion_explain_group_index(LionCountScanState *st, List *ancestors,
 							 get_rel_name(st->decode->idxoid[i]),
 							 lion_explain_col(st->decode->idxoid[i],
 											  st->decode->attno[i], false),
-							 get_attname(st->heapoid, st->decode->attno[i],
-										 false));
+							 get_attname(st->plan.heapoid,
+										 st->decode->attno[i], false));
 	}
 }
 
@@ -559,7 +560,7 @@ lion_explain_indexes(LionCountScanState *st, List *ancestors,
 
 	initStringInfo(&buf);
 
-	if (st->hasgroupidx)
+	if (lion_plan_flag(st, LION_FLAG_GROUPIDX))
 		lion_explain_group_index(st, ancestors, es, &buf);
 
 	/*
@@ -604,7 +605,7 @@ lion_explain_bounds(LionCountScanState *st, List *ancestors, ExplainState *es)
 	ListCell   *lc;
 
 	initStringInfo(&buf);
-	foreach(lc, st->implied)
+	foreach(lc, st->plan.implied)
 	{
 		if (buf.len > 0)
 			appendStringInfoString(&buf, ", ");
@@ -723,7 +724,8 @@ lion_explain_join(LionCountScanState *st, ExplainState *es)
 		int			bound = 0;
 
 		ExplainPropertyText("Fact Group Key",
-							get_attname(st->heapoid, st->fg->attno, false),
+							get_attname(st->plan.heapoid, st->fg->attno,
+										false),
 							es);
 		for (i = 0; i < st->npart; i++)
 			bound += (st->part[i].fgconst != NULL) ? 1 : 0;
@@ -748,7 +750,8 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 {
 	StringInfoData buf;
 
-	if (st->hasgroupidx && st->groupattno != 0 && st->coal != NULL)
+	if (lion_plan_flag(st, LION_FLAG_GROUPIDX) && st->plan.groupattno != 0 &&
+		st->coal != NULL)
 	{
 		/*
 		 * GROUP BY coalesce(g, c) (DESIGN.md §10), printed as core prints the
@@ -762,7 +765,9 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 
 		initStringInfo(&buf);
 		appendStringInfo(&buf, "COALESCE(%s, %s)",
-						 get_attname(st->heapoid, st->groupattno, false), val);
+						 get_attname(st->plan.heapoid, st->plan.groupattno,
+									 false),
+						 val);
 		ExplainPropertyText("Group Key", buf.data, es);
 		pfree(buf.data);
 		pfree(val);
@@ -778,28 +783,33 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 		initStringInfo(&buf);
 		for (c = 0; c < st->decode->ncol; c++)
 			appendStringInfo(&buf, "%s%s", (c > 0) ? ", " : "",
-							 get_attname(st->heapoid, st->decode->attno[c],
-										 false));
+							 get_attname(st->plan.heapoid,
+										 st->decode->attno[c], false));
 		ExplainPropertyText("Group Key", buf.data, es);
 		ExplainPropertyText("Group Strategy", "Decoded", es);
 		pfree(buf.data);
 	}
-	else if (st->hasgroupidx && st->groupattno != 0)
+	else if (lion_plan_flag(st, LION_FLAG_GROUPIDX) &&
+			 st->plan.groupattno != 0)
 	{
 		initStringInfo(&buf);
 		appendStringInfoString(&buf,
-							   get_attname(st->heapoid, st->groupattno, false));
-		if (st->groupattno2 != 0)
+							   get_attname(st->plan.heapoid,
+										   st->plan.groupattno, false));
+		if (st->plan.groupattno2 != 0)
 			appendStringInfo(&buf, ", %s",
-							 get_attname(st->heapoid, st->groupattno2, false));
+							 get_attname(st->plan.heapoid,
+										 st->plan.groupattno2, false));
 		ExplainPropertyText("Group Key", buf.data, es);
 		pfree(buf.data);
 	}
 
 	/* The column count(DISTINCT) counts (DESIGN.md §26). */
-	if (st->distattno != 0)
+	if (st->plan.distattno != 0)
 		ExplainPropertyText("Distinct Key",
-							get_attname(st->heapoid, st->distattno, false), es);
+							get_attname(st->plan.heapoid, st->plan.distattno,
+										false),
+							es);
 
 	/* the columns aggregates are taken over (DESIGN.md §37) */
 	if (st->wagg != NULL)
@@ -810,8 +820,8 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 		for (c = 0; c < st->wagg->ncol; c++)
 			appendStringInfo(&buf, "%s%s (%s)", (c > 0) ? ", " : "",
 							 get_rel_name(st->wagg->col[c].idxoid),
-							 get_attname(st->heapoid, st->wagg->col[c].attno,
-										 false));
+							 get_attname(st->plan.heapoid,
+										 st->wagg->col[c].attno, false));
 		ExplainPropertyText("Aggregates Over Keys", buf.data, es);
 		pfree(buf.data);
 	}
@@ -948,7 +958,8 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 	 * ("full domain").  A partitioned table, or a rescan, may take more
 	 * than one way; each is then printed with how often it was taken.
 	 */
-	if (st->hasrange && st->sumall)
+	if (lion_plan_flag(st, LION_FLAG_RANGE) &&
+		lion_plan_flag(st, LION_FLAG_SUMALL))
 	{
 		static const char *const evalname[] = {"inside", "complement",
 		"full domain"};
