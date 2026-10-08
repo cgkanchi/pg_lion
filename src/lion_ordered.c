@@ -234,6 +234,208 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 #define LO_FLAG_INDEXONLY	0x0004	/* the values come from the btree (§40) */
 #define LO_FLAG_HEAPRECHECK	0x0008	/* the lion recheck reads the heap tuple */
 
+/*
+ * The plan's custom_private as a C struct: lo_priv_decode() is its one
+ * reader and lo_priv_encode() its one writer, the members above in their
+ * positions.  Lists point into the plan; the sort keys' arrays are palloc'd
+ * in the caller's context.  The lion tree stays a List: lo_decode_tree()
+ * checks it against the leaves and the quals, which are custom_exprs'.
+ */
+typedef struct LoPriv
+{
+	Oid			ordoid;			/* ORD */
+	int			dir;			/* INTS: a ScanDirection */
+	int			flags;			/* ... LO_FLAG_* */
+	int			nulls;			/* ... LION_ORDER_NULLS_* */
+	AttrNumber	walkattno;		/* ... 0 for a btree */
+	List	   *ordcols;		/* ORDCOLS: IntList */
+	List	   *tree;			/* TREE: NIL when there is no set */
+	List	   *leaves;			/* LEAVES: OidList */
+	bool		hassort;		/* SORT: false for NIL */
+	int			nsort;
+	AttrNumber *sortattno;
+	Oid		   *sortop;
+	Oid		   *sortcoll;
+	bool	   *nullsfirst;
+	List	   *iocols;			/* IOCOLS: IntList, NIL in heap mode */
+	double		expected;		/* EXPECTED */
+} LoPriv;
+
+/*
+ * The flags of a LionOrdered plan, or 0 if it does not look like one: for
+ * lo_create_state(), which has to fix the slot's type before lo_begin()
+ * decodes the rest and errors out on a malformed list.
+ */
+static int
+lo_priv_flags(List *priv)
+{
+	List	   *ints;
+
+	if (list_length(priv) != LO_PRIV_NMEMBERS)
+		return 0;
+	ints = (List *) list_nth(priv, LO_PRIV_INTS);
+	if (ints == NIL || !IsA(ints, IntList) || list_length(ints) != 4)
+		return 0;
+	return lsecond_int(ints);
+}
+
+/* A member that has to be NIL or a list of node type tag */
+static List *
+lo_priv_list(List *priv, int member, NodeTag tag)
+{
+	List	   *l = (List *) list_nth(priv, member);
+
+	if (l != NIL && nodeTag(l) != tag)
+		elog(ERROR, "LionOrdered: malformed custom_private member %d", member);
+	return l;
+}
+
+/*
+ * Read a LionOrdered plan's custom_private into *out, checking the shape
+ * marker, every member's node type and the sort keys' lengths.  A list this
+ * build did not write is an ERROR, not a misread Oid.
+ */
+static void
+lo_priv_decode(List *priv, LoPriv *out)
+{
+	List	   *shape;
+	List	   *ord;
+	List	   *ints;
+	List	   *sk;
+	Const	   *c;
+	int			i;
+
+	memset(out, 0, sizeof(LoPriv));
+	shape = (list_length(priv) == LO_PRIV_NMEMBERS) ?
+		(List *) list_nth(priv, LO_PRIV_SHAPE) : NIL;
+	if (shape == NIL || !IsA(shape, IntList) || list_length(shape) != 2 ||
+		linitial_int(shape) != LO_PRIV_MAGIC ||
+		lsecond_int(shape) != LO_PRIV_NMEMBERS)
+		elog(ERROR, "LionOrdered: unrecognized custom_private shape (%d members)",
+			 list_length(priv));
+
+	ord = lo_priv_list(priv, LO_PRIV_ORD, T_OidList);
+	ints = lo_priv_list(priv, LO_PRIV_INTS, T_IntList);
+	if (list_length(ord) != 1 || list_length(ints) != 4)
+		elog(ERROR, "LionOrdered: malformed custom_private");
+	out->ordoid = linitial_oid(ord);
+	out->dir = linitial_int(ints);
+	out->flags = lsecond_int(ints);
+	out->nulls = lthird_int(ints);
+	out->walkattno = (AttrNumber) lfourth_int(ints);
+
+	out->ordcols = lo_priv_list(priv, LO_PRIV_ORDCOLS, T_IntList);
+	out->tree = lo_priv_list(priv, LO_PRIV_TREE, T_List);
+	out->leaves = lo_priv_list(priv, LO_PRIV_LEAVES, T_OidList);
+	out->iocols = lo_priv_list(priv, LO_PRIV_IOCOLS, T_IntList);
+
+	/* the sort keys: four lists of one element per key each */
+	sk = lo_priv_list(priv, LO_PRIV_SORT, T_List);
+	if (sk != NIL)
+	{
+		List	   *attnos;
+		List	   *ops;
+		List	   *colls;
+		List	   *nulls;
+
+		if (list_length(sk) != 4)
+			elog(ERROR, "LionOrdered: malformed sort keys");
+		attnos = (List *) linitial(sk);
+		ops = (List *) lsecond(sk);
+		colls = (List *) lthird(sk);
+		nulls = (List *) lfourth(sk);
+		out->nsort = list_length(attnos);
+		if ((attnos != NIL && !IsA(attnos, IntList)) ||
+			(ops != NIL && !IsA(ops, OidList)) ||
+			(colls != NIL && !IsA(colls, OidList)) ||
+			(nulls != NIL && !IsA(nulls, IntList)) ||
+			list_length(ops) != out->nsort ||
+			list_length(colls) != out->nsort ||
+			list_length(nulls) != out->nsort)
+			elog(ERROR, "LionOrdered: malformed sort keys");
+		out->hassort = true;
+		out->sortattno = (AttrNumber *)
+			palloc(sizeof(AttrNumber) * Max(out->nsort, 1));
+		out->sortop = (Oid *) palloc(sizeof(Oid) * Max(out->nsort, 1));
+		out->sortcoll = (Oid *) palloc(sizeof(Oid) * Max(out->nsort, 1));
+		out->nullsfirst = (bool *) palloc(sizeof(bool) * Max(out->nsort, 1));
+		for (i = 0; i < out->nsort; i++)
+		{
+			out->sortattno[i] = (AttrNumber) list_nth_int(attnos, i);
+			out->sortop[i] = list_nth_oid(ops, i);
+			out->sortcoll[i] = list_nth_oid(colls, i);
+			out->nullsfirst[i] = list_nth_int(nulls, i) != 0;
+		}
+	}
+
+	c = (Const *) list_nth(priv, LO_PRIV_EXPECTED);
+	if (c == NULL || !IsA(c, Const) || c->consttype != FLOAT8OID ||
+		c->constisnull)
+		elog(ERROR, "LionOrdered: malformed expected walk");
+	out->expected = DatumGetFloat8(c->constvalue);
+}
+
+/* lo_priv_encode() without its check */
+static List *
+lo_priv_build(const LoPriv *p)
+{
+	List	   *sk = NIL;
+	List	   *priv;
+
+	if (p->hassort)
+	{
+		List	   *attnos = NIL;
+		List	   *ops = NIL;
+		List	   *colls = NIL;
+		List	   *nulls = NIL;
+		int			i;
+
+		for (i = 0; i < p->nsort; i++)
+		{
+			attnos = lappend_int(attnos, p->sortattno[i]);
+			ops = lappend_oid(ops, p->sortop[i]);
+			colls = lappend_oid(colls, p->sortcoll[i]);
+			nulls = lappend_int(nulls, p->nullsfirst[i] ? 1 : 0);
+		}
+		sk = list_make4(attnos, ops, colls, nulls);
+	}
+
+	priv = list_make5(list_make2_int(LO_PRIV_MAGIC, LO_PRIV_NMEMBERS),
+					  list_make1_oid(p->ordoid),
+					  list_make4_int(p->dir, p->flags, p->nulls,
+									 (int) p->walkattno),
+					  p->ordcols,
+					  p->tree);
+	priv = lappend(priv, p->leaves);
+	priv = lappend(priv, sk);
+	priv = lappend(priv, p->iocols);
+	priv = lappend(priv, makeConst(FLOAT8OID, -1, InvalidOid, sizeof(float8),
+								   Float8GetDatum(p->expected),
+								   false, FLOAT8PASSBYVAL));
+	return priv;
+}
+
+/*
+ * Write *p as a LionOrdered plan's custom_private.  An assert-enabled build
+ * decodes what it wrote, writes that again and checks the two are equal(),
+ * as lion_count_priv_encode() does.
+ */
+static List *
+lo_priv_encode(const LoPriv *p)
+{
+	List	   *priv = lo_priv_build(p);
+
+#ifdef USE_ASSERT_CHECKING
+	{
+		LoPriv		again;
+
+		lo_priv_decode(priv, &again);
+		Assert(equal(priv, lo_priv_build(&again)));
+	}
+#endif
+	return priv;
+}
+
 /* ---------------------------------------------------------------------
  * The TID set
  * --------------------------------------------------------------------- */
@@ -2081,19 +2283,23 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 
 /*
  * The path's pathkeys as sort keys over plain columns of rel, for the
- * fetch-and-sort switch; NIL when one of them is not a plain column (an
- * expression index's order: its functions would be evaluated where the
- * ordinary plan calls none, which EXECUTE could tell apart, §30.6).
+ * fetch-and-sort switch, into p; none (hassort false) when one of them is
+ * not a plain column (an expression index's order: its functions would be
+ * evaluated where the ordinary plan calls none, which EXECUTE could tell
+ * apart, §30.6).
  */
-static List *
-lo_sort_keys(RelOptInfo *rel, List *pathkeys)
+static void
+lo_sort_keys(RelOptInfo *rel, List *pathkeys, LoPriv *p)
 {
-	List	   *attnos = NIL;
-	List	   *ops = NIL;
-	List	   *colls = NIL;
-	List	   *nulls = NIL;
+	int			n = list_length(pathkeys);
 	ListCell   *lc;
 
+	p->hassort = false;
+	p->nsort = 0;
+	p->sortattno = (AttrNumber *) palloc(sizeof(AttrNumber) * Max(n, 1));
+	p->sortop = (Oid *) palloc(sizeof(Oid) * Max(n, 1));
+	p->sortcoll = (Oid *) palloc(sizeof(Oid) * Max(n, 1));
+	p->nullsfirst = (bool *) palloc(sizeof(bool) * Max(n, 1));
 	foreach(lc, pathkeys)
 	{
 		PathKey    *pk = (PathKey *) lfirst(lc);
@@ -2139,7 +2345,10 @@ lo_sort_keys(RelOptInfo *rel, List *pathkeys)
 			}
 		}
 		if (var == NULL)
-			return NIL;
+		{
+			p->nsort = 0;
+			return;
+		}
 #if PG_VERSION_NUM >= 180000
 		desc = (pk->pk_cmptype == COMPARE_GT);
 #else
@@ -2148,13 +2357,17 @@ lo_sort_keys(RelOptInfo *rel, List *pathkeys)
 		op = get_opfamily_member(pk->pk_opfamily, type, type,
 								 desc ? BTGreaterStrategyNumber : BTLessStrategyNumber);
 		if (!OidIsValid(op))
-			return NIL;
-		attnos = lappend_int(attnos, var->varattno);
-		ops = lappend_oid(ops, op);
-		colls = lappend_oid(colls, ec->ec_collation);
-		nulls = lappend_int(nulls, pk->pk_nulls_first ? 1 : 0);
+		{
+			p->nsort = 0;
+			return;
+		}
+		p->sortattno[p->nsort] = var->varattno;
+		p->sortop[p->nsort] = op;
+		p->sortcoll[p->nsort] = ec->ec_collation;
+		p->nullsfirst[p->nsort] = pk->pk_nulls_first;
+		p->nsort++;
 	}
-	return list_make4(attnos, ops, colls, nulls);
+	p->hassort = true;
 }
 
 static Plan *
@@ -2182,6 +2395,7 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	int			nulls = LION_ORDER_NULLS_NONE;
 	int			walkattno = 0;
 	Oid			ordoid;
+	LoPriv		priv;
 	ListCell   *lc;
 
 	if (IsA(linitial(best_path->custom_private), IndexPath))
@@ -2283,21 +2497,18 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->custom_scan_tlist = NIL;
 	cscan->custom_exprs = list_make5(lionquals, ordquals, lionqual, ordorig,
 									 extract_actual_clauses(vrinfos, false));
-	cscan->custom_private =
-		list_make5(list_make2_int(LO_PRIV_MAGIC, LO_PRIV_NMEMBERS),
-				   list_make1_oid(ordoid),
-				   list_make4_int(dir, flags, nulls, walkattno),
-				   ordcols,
-				   tree);
-	cscan->custom_private = lappend(cscan->custom_private, leaves);
-	cscan->custom_private = lappend(cscan->custom_private,
-									lo_sort_keys(rel, best_path->path.pathkeys));
-	cscan->custom_private = lappend(cscan->custom_private, iocols);
-	cscan->custom_private = lappend(cscan->custom_private,
-									makeConst(FLOAT8OID, -1, InvalidOid,
-											  sizeof(float8),
-											  Float8GetDatum(expected),
-											  false, FLOAT8PASSBYVAL));
+	priv.ordoid = ordoid;
+	priv.dir = dir;
+	priv.flags = flags;
+	priv.nulls = nulls;
+	priv.walkattno = (AttrNumber) walkattno;
+	priv.ordcols = ordcols;
+	priv.tree = tree;
+	priv.leaves = leaves;
+	lo_sort_keys(rel, best_path->path.pathkeys, &priv);
+	priv.iocols = iocols;
+	priv.expected = expected;
+	cscan->custom_private = lo_priv_encode(&priv);
 	cscan->methods = (best_path->methods == &lo_btree_path_methods) ?
 		&lo_btree_scan_methods : &lo_scan_methods;
 
@@ -3198,7 +3409,7 @@ lo_create_state(CustomScan *cscan)
 {
 	LionOrderedState *st = (LionOrderedState *)
 		newNode(sizeof(LionOrderedState), T_CustomScanState);
-	bool		indexonly = false;
+	bool		indexonly;
 
 	st->css.methods = &lo_exec_methods;
 
@@ -3209,14 +3420,7 @@ lo_create_state(CustomScan *cscan)
 	 * index tuple's values in a virtual slot of the relation's shape
 	 * (DESIGN.md §40.4).  lo_begin() checks the rest of the shape.
 	 */
-	if (list_length(cscan->custom_private) == LO_PRIV_NMEMBERS)
-	{
-		List	   *ints = (List *) list_nth(cscan->custom_private, LO_PRIV_INTS);
-
-		indexonly = ints != NIL && IsA(ints, IntList) &&
-			list_length(ints) >= 2 &&
-			(lsecond_int(ints) & LO_FLAG_INDEXONLY) != 0;
-	}
+	indexonly = (lo_priv_flags(cscan->custom_private) & LO_FLAG_INDEXONLY) != 0;
 	st->css.slotOps = indexonly ? &TTSOpsVirtual : &TTSOpsBufferHeapTuple;
 	return (Node *) st;
 }
@@ -3302,9 +3506,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 {
 	LionOrderedState *st = (LionOrderedState *) node;
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
-	List	   *shape;
-	List	   *ints;
-	List	   *ordcols;
+	LoPriv		priv;
 	List	   *tree;
 	List	   *leafoids;
 	List	   *lionquals;
@@ -3315,30 +3517,26 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	int			qualno = 0;
 	int			i;
 
-	shape = (list_length(cscan->custom_private) == LO_PRIV_NMEMBERS) ?
-		(List *) list_nth(cscan->custom_private, LO_PRIV_SHAPE) : NIL;
-	if (shape == NIL || !IsA(shape, IntList) || list_length(shape) != 2 ||
-		linitial_int(shape) != LO_PRIV_MAGIC ||
-		lsecond_int(shape) != LO_PRIV_NMEMBERS ||
-		list_length(cscan->custom_exprs) != LO_EXPR_NLISTS)
-		elog(ERROR, "LionOrdered: unrecognized custom_private shape (%d members)",
-			 list_length(cscan->custom_private));
+	lo_priv_decode(cscan->custom_private, &priv);
+	if (list_length(cscan->custom_exprs) != LO_EXPR_NLISTS)
+		elog(ERROR, "LionOrdered: unrecognized custom_exprs shape (%d lists)",
+			 list_length(cscan->custom_exprs));
 
-	st->ordoid = linitial_oid((List *) list_nth(cscan->custom_private, LO_PRIV_ORD));
-	ints = (List *) list_nth(cscan->custom_private, LO_PRIV_INTS);
-	st->dir = (ScanDirection) linitial_int(ints);
-	st->lossyqual = (lsecond_int(ints) & LO_FLAG_LOSSY) != 0;
-	st->lionwalk = (lsecond_int(ints) & LO_FLAG_LIONWALK) != 0;
-	st->indexonly = (lsecond_int(ints) & LO_FLAG_INDEXONLY) != 0;
-	st->lionheaprecheck = (lsecond_int(ints) & LO_FLAG_HEAPRECHECK) != 0;
+	st->ordoid = priv.ordoid;
+	st->dir = (ScanDirection) priv.dir;
+	st->lossyqual = (priv.flags & LO_FLAG_LOSSY) != 0;
+	st->lionwalk = (priv.flags & LO_FLAG_LIONWALK) != 0;
+	st->indexonly = (priv.flags & LO_FLAG_INDEXONLY) != 0;
+	st->lionheaprecheck = (priv.flags & LO_FLAG_HEAPRECHECK) != 0;
 	st->vmbuffer = InvalidBuffer;
-	st->walknulls = lthird_int(ints);
-	st->walkattno = (AttrNumber) lfourth_int(ints);
-	ordcols = (List *) list_nth(cscan->custom_private, LO_PRIV_ORDCOLS);
-	tree = (List *) list_nth(cscan->custom_private, LO_PRIV_TREE);
-	leafoids = (List *) list_nth(cscan->custom_private, LO_PRIV_LEAVES);
+	st->walknulls = priv.nulls;
+	st->walkattno = priv.walkattno;
+	tree = priv.tree;
+	leafoids = priv.leaves;
 	lionquals = (List *) list_nth(cscan->custom_exprs, LO_EXPR_LIONQUALS);
 	ordquals = (List *) list_nth(cscan->custom_exprs, LO_EXPR_ORDQUALS);
+	if (list_length(priv.ordcols) != list_length(ordquals))
+		elog(ERROR, "LionOrdered: malformed ordered index quals");
 
 	/*
 	 * What the node evaluates in place of the ordinary plan, initialised - and
@@ -3397,45 +3595,28 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 											ALLOCSET_DEFAULT_SIZES);
 
 	/* the fetch-and-sort switch's sort keys (§30.4), when there are any */
+	if (priv.hassort)
 	{
-		List	   *sk = (List *) list_nth(cscan->custom_private, LO_PRIV_SORT);
-
-		if (sk != NIL)
+		st->nsort = priv.nsort;
+		st->sortattnos = priv.sortattno;
+		st->sortkeys = (SortSupport) palloc0(sizeof(SortSupportData) *
+											 Max(st->nsort, 1));
+		for (i = 0; i < st->nsort; i++)
 		{
-			List	   *attnos = (List *) linitial(sk);
-			List	   *ops = (List *) lsecond(sk);
-			List	   *colls = (List *) lthird(sk);
-			List	   *nulls = (List *) lfourth(sk);
+			SortSupport ssup = &st->sortkeys[i];
 
-			st->nsort = list_length(attnos);
-			st->sortattnos = (AttrNumber *) palloc(sizeof(AttrNumber) * st->nsort);
-			st->sortkeys = (SortSupport) palloc0(sizeof(SortSupportData) * st->nsort);
-			for (i = 0; i < st->nsort; i++)
-			{
-				SortSupport ssup = &st->sortkeys[i];
-
-				st->sortattnos[i] = (AttrNumber) list_nth_int(attnos, i);
-				ssup->ssup_cxt = CurrentMemoryContext;
-				ssup->ssup_collation = list_nth_oid(colls, i);
-				ssup->ssup_nulls_first = list_nth_int(nulls, i) != 0;
-				ssup->ssup_attno = st->sortattnos[i];
-				ssup->abbreviate = false;
-				PrepareSortSupportFromOrderingOp(list_nth_oid(ops, i), ssup);
-			}
+			ssup->ssup_cxt = CurrentMemoryContext;
+			ssup->ssup_collation = priv.sortcoll[i];
+			ssup->ssup_nulls_first = priv.nullsfirst[i];
+			ssup->ssup_attno = st->sortattnos[i];
+			ssup->abbreviate = false;
+			PrepareSortSupportFromOrderingOp(priv.sortop[i], ssup);
 		}
 	}
 
 	/* the switch's terms (§30.4, §40.4): the setting, and the planner's walk */
 	st->switchratio = lion_ordered_switch_ratio;
-	{
-		Const	   *c = (Const *) list_nth(cscan->custom_private,
-										   LO_PRIV_EXPECTED);
-
-		if (c == NULL || !IsA(c, Const) || c->consttype != FLOAT8OID ||
-			c->constisnull)
-			elog(ERROR, "LionOrdered: malformed expected walk");
-		st->expectwalk = DatumGetFloat8(c->constvalue);
-	}
+	st->expectwalk = priv.expected;
 	st->lrtcxt = CreateExprContext(estate);
 
 	/* the ordered index and its scan keys */
@@ -3443,7 +3624,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	i = 0;
 	foreach(pos, ordquals)
 		fixed = lappend(fixed, lo_fix_qual((Expr *) lfirst(pos),
-										   list_nth_int(ordcols, i++)));
+										   list_nth_int(priv.ordcols, i++)));
 	ExecIndexBuildScanKeys(&node->ss.ps, st->ordidx, fixed, false,
 						   &st->okeys, &st->nokeys,
 						   &st->ortkeys, &st->nortkeys, NULL, NULL);
@@ -3459,8 +3640,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 		Relation	heap = node->ss.ss_currentRelation;
 		TupleDesc	heapdesc = RelationGetDescr(heap);
 		TupleDesc	idxdesc = RelationGetDescr(st->ordidx);
-		List	   *iocols = (List *) list_nth(cscan->custom_private,
-											   LO_PRIV_IOCOLS);
+		List	   *iocols = priv.iocols;
 
 		if (st->lionwalk || list_length(iocols) != idxdesc->natts)
 			elog(ERROR, "LionOrdered: malformed index-only mapping");
