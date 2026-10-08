@@ -238,10 +238,12 @@ lion_array_batch_prepare(LionCountScanState *st, int k, LionClauseState *cl)
 	Datum	   *elems;
 	bool	   *nulls;
 	int			nelems;
+	LionListBatch *lb;
 
-	if (st->hasgroupidx || st->joinclause >= 0 || st->batchitem >= 0 ||
-		cl->valisnull)
+	if (st->hasgroupidx || st->joinclause >= 0 ||
+		lion_st_lbatch(st)->item >= 0 || cl->valisnull)
 		return false;
+	lb = st->lbatch;
 
 	arr = DatumGetArrayTypeP(cl->val);
 	if (ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr)) <= lion_array_batch_size())
@@ -256,17 +258,16 @@ lion_array_batch_prepare(LionCountScanState *st, int k, LionClauseState *cl)
 	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
 					  &elems, &nulls, &nelems);
 
-	st->batchval = (Datum *)
+	lb->val = (Datum *)
 		palloc_extended(sizeof(Datum) * Max(nelems, 1), MCXT_ALLOC_HUGE);
-	st->batchhash = (uint32 *)
+	lb->hash = (uint32 *)
 		palloc_extended(sizeof(uint32) * Max(nelems, 1), MCXT_ALLOC_HUGE);
-	st->nbatchval = lion_probe_sort(cl->idx, cl->idxcol, elemtype, nelems,
-									elems, nulls, st->batchval,
-									st->batchhash);
-	st->nbatchval = lion_probe_sort_unique(st->batchval, st->batchhash,
-										   st->nbatchval, elmbyval, elmlen);
-	st->batchtype = elemtype;
-	st->batchitem = k;
+	lb->nval = lion_probe_sort(cl->idx, cl->idxcol, elemtype, nelems,
+							   elems, nulls, lb->val, lb->hash);
+	lb->nval = lion_probe_sort_unique(lb->val, lb->hash, lb->nval,
+									  elmbyval, elmlen);
+	lb->type = elemtype;
+	lb->item = k;
 
 	/* a by-reference value points into arr, which stays in wherecxt */
 	pfree(elems);
@@ -1302,10 +1303,13 @@ lion_release_where(LionCountScanState *st)
 		MemoryContextReset(st->grangecxt);
 
 	/* ... and so do the values of a list counted in batches */
-	st->batchitem = -1;
-	st->batchval = NULL;
-	st->batchhash = NULL;
-	st->nbatchval = 0;
+	if (st->lbatch != NULL)
+	{
+		st->lbatch->item = -1;
+		st->lbatch->val = NULL;
+		st->lbatch->hash = NULL;
+		st->lbatch->nval = 0;
+	}
 
 	/* the row filter lives in wherecxt too, and names this relation */
 	st->filter = NULL;

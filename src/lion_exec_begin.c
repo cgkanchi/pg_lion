@@ -742,6 +742,27 @@ lion_begin_topk(LionCountScanState *st, const LionCountPriv *priv,
 }
 
 /*
+ * An IN list too long to locate at once (DESIGN.md §15, "A list too long to
+ * locate at once").  Only a count of one row per relation takes it, so only
+ * that has its state; which list, if any, is chosen per relation as its WHERE
+ * is located (lion_array_batch_prepare()).
+ */
+static void
+lion_begin_list_batch(LionCountScanState *st, EState *estate)
+{
+	LionListBatch *lb;
+
+	st->lbatch = NULL;
+	if (st->mode != LION_MODE_COUNT)
+		return;
+
+	lb = (LionListBatch *) MemoryContextAllocZero(estate->es_query_cxt,
+												  sizeof(LionListBatch));
+	lb->item = -1;
+	st->lbatch = lb;
+}
+
+/*
  * GROUP BY coalesce(g, c) (DESIGN.md §10): c and its equality.  Their state
  * is there only when the plan groups by a coalesce.
  */
@@ -1432,7 +1453,6 @@ lion_begin_sources(LionCountScanState *st)
 	st->sumallitem = -1;
 	st->dsources = (LionCountSource *)
 		palloc0(sizeof(LionCountSource) * st->nsource);
-	st->batchitem = -1;
 
 	/*
 	 * A count against the collected WHERE (lion_group_count()) takes one slot
@@ -1541,6 +1561,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_plan(st, &priv);
 	lion_begin_topk(st, &priv, estate);
 	lion_begin_coalesce(st, &priv, estate);
+	lion_begin_list_batch(st, estate);
 	lion_begin_join(st, &priv);
 	lion_begin_target_list(st, cscan, &priv);
 	lion_begin_wagg(st, node, &priv, exprs, estate);

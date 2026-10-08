@@ -1420,6 +1420,25 @@ typedef struct LionCoalState
 } LionCoalState;
 
 /*
+ * An IN list too long to locate at once (DESIGN.md §15, "A list too long to
+ * locate at once"): item is the WHERE item it is, -1 for none, and val its
+ * nval non-NULL values - of type type - sorted into the order a lookup takes
+ * them in, with their hashes, which lion_count_batched() locates and counts a
+ * batch at a time.  The values live in wherecxt, and item, val, hash and nval
+ * go with it when the relation's WHERE is released.  batches is how many
+ * batches were counted, for EXPLAIN ANALYZE.
+ */
+typedef struct LionListBatch
+{
+	int			item;
+	Oid			type;
+	int			nval;
+	Datum	   *val;
+	uint32	   *hash;
+	int64		batches;
+} LionListBatch;
+
+/*
  * A lion column whose entries the aggregates of DESIGN.md §37 are taken
  * over, and one of those aggregates.
  */
@@ -1838,19 +1857,10 @@ typedef struct LionCountScanState
 
 	/*
 	 * An IN list too long to locate at once (DESIGN.md §15, "A list too long
-	 * to locate at once"): the WHERE item it is, -1 for none, and its non-NULL
-	 * values - of type batchtype - sorted into the order a lookup takes them
-	 * in, with their hashes, which lion_count_batched() locates and counts a
-	 * batch at a time.  Only a count of one row per relation takes it; the
-	 * values live in wherecxt.  listbatches is how many batches were counted,
-	 * for EXPLAIN ANALYZE.
+	 * to locate at once"), or NULL when the node is not a count of one row
+	 * per relation, the only one that takes it (lion_st_lbatch()).
 	 */
-	int			batchitem;
-	Oid			batchtype;
-	int			nbatchval;
-	Datum	   *batchval;
-	uint32	   *batchhash;
-	int64		listbatches;
+	struct LionListBatch *lbatch;
 
 	/*
 	 * GROUP BY over a partitioned table (DESIGN.md §16): the partitions are
@@ -2183,6 +2193,14 @@ lion_st_wagg(LionCountScanState *st)
 {
 	Assert(st->wagg != NULL);
 	return st->wagg;
+}
+
+/* A long IN list's batches, which only a count of one row per relation has */
+static inline LionListBatch *
+lion_st_lbatch(LionCountScanState *st)
+{
+	Assert(st->lbatch != NULL);
+	return st->lbatch;
 }
 
 /*
