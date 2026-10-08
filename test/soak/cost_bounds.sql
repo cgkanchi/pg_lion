@@ -65,7 +65,7 @@ CREATE OR REPLACE FUNCTION cm_set(sw text[]) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE n text; i int;
 BEGIN
 	FOREACH n IN ARRAY ARRAY['pg_lion.pushdown_margin', 'pg_lion.hashagg_rate', 'pg_lion.agg_rate',
-		'pg_lion.hashjoin_rate', 'pg_lion.mergejoin_rate', 'pg_lion.nestloop_rate', 'pg_lion.bitmap_rate',
+		'pg_lion.hashjoin_rate', 'pg_lion.mergejoin_rate', 'pg_lion.bitmap_rate',
 		'pg_lion.resident_page_cost', 'effective_cache_size', 'work_mem',
 		'pg_lion.enable_count_pushdown', 'pg_lion.enable_semijoin', 'pg_lion.enable_ordered_scan',
 		'enable_seqscan', 'enable_indexscan', 'enable_indexonlyscan', 'enable_bitmapscan', 'enable_sort',
@@ -145,17 +145,17 @@ CREATE TEMP TABLE cm_s (sn text, sw text[]);
 INSERT INTO cm_s VALUES
  ('default', '{}'),
  ('margin.01', '{pg_lion.pushdown_margin,0.01}'),
- ('rates.001', '{pg_lion.hashagg_rate,0.001,pg_lion.agg_rate,0.001,pg_lion.hashjoin_rate,0.001,pg_lion.mergejoin_rate,0.001,pg_lion.nestloop_rate,0.001,pg_lion.bitmap_rate,0.001}'),
- ('rates1000 m.01', '{pg_lion.hashagg_rate,1000,pg_lion.agg_rate,1000,pg_lion.hashjoin_rate,1000,pg_lion.mergejoin_rate,1000,pg_lion.nestloop_rate,1000,pg_lion.bitmap_rate,1000,pg_lion.pushdown_margin,0.01}'),
+ ('rates.001', '{pg_lion.hashagg_rate,0.001,pg_lion.agg_rate,0.001,pg_lion.hashjoin_rate,0.001,pg_lion.mergejoin_rate,0.001,pg_lion.bitmap_rate,0.001}'),
+ ('rates1000 m.01', '{pg_lion.hashagg_rate,1000,pg_lion.agg_rate,1000,pg_lion.hashjoin_rate,1000,pg_lion.mergejoin_rate,1000,pg_lion.bitmap_rate,1000,pg_lion.pushdown_margin,0.01}'),
  ('cheap pages', '{pg_lion.hashagg_rate,0.001,pg_lion.agg_rate,0.001,pg_lion.bitmap_rate,0.001,pg_lion.resident_page_cost,0,effective_cache_size,1TB}'),
  ('dear pages', '{pg_lion.resident_page_cost,1000000,effective_cache_size,8kB,pg_lion.pushdown_margin,0.01}'),
- ('joins off m.01', '{enable_hashjoin,off,enable_mergejoin,off,enable_nestloop,off,pg_lion.pushdown_margin,0.01,pg_lion.hashjoin_rate,1000,pg_lion.nestloop_rate,1000,pg_lion.mergejoin_rate,1000}'),
+ ('joins off m.01', '{enable_hashjoin,off,enable_mergejoin,off,enable_nestloop,off,pg_lion.pushdown_margin,0.01,pg_lion.hashjoin_rate,1000,pg_lion.mergejoin_rate,1000}'),
  ('agg off m.01', '{enable_hashagg,off,enable_sort,off,pg_lion.pushdown_margin,0.01,pg_lion.hashagg_rate,1000,pg_lion.agg_rate,1000}'),
  ('scans off m.01', '{enable_seqscan,off,enable_indexscan,off,enable_indexonlyscan,off,enable_bitmapscan,off,pg_lion.pushdown_margin,0.01,pg_lion.agg_rate,1000,pg_lion.bitmap_rate,1000}'),
  ('par rates.001', '{max_parallel_workers_per_gather,4,parallel_setup_cost,0,parallel_tuple_cost,0,min_parallel_table_scan_size,0,min_parallel_index_scan_size,0,pg_lion.hashagg_rate,0.001,pg_lion.agg_rate,0.001,pg_lion.hashjoin_rate,0.001,pg_lion.bitmap_rate,0.001}'),
  ('par rates1000', '{max_parallel_workers_per_gather,4,parallel_setup_cost,0,parallel_tuple_cost,0,min_parallel_table_scan_size,0,min_parallel_index_scan_size,0,pg_lion.hashagg_rate,1000,pg_lion.agg_rate,1000,pg_lion.hashjoin_rate,1000,pg_lion.pushdown_margin,0.01}'),
- ('wm64k rates.001', '{work_mem,64kB,pg_lion.hashagg_rate,0.001,pg_lion.agg_rate,0.001,pg_lion.hashjoin_rate,0.001,pg_lion.nestloop_rate,0.001,pg_lion.bitmap_rate,0.001}'),
- ('lion off', '{pg_lion.enable_count_pushdown,off,pg_lion.enable_semijoin,off,pg_lion.enable_ordered_scan,off,pg_lion.hashagg_rate,0.001,pg_lion.agg_rate,0.001,pg_lion.hashjoin_rate,0.001,pg_lion.bitmap_rate,0.001,pg_lion.nestloop_rate,0.001}');
+ ('wm64k rates.001', '{work_mem,64kB,pg_lion.hashagg_rate,0.001,pg_lion.agg_rate,0.001,pg_lion.hashjoin_rate,0.001,pg_lion.bitmap_rate,0.001}'),
+ ('lion off', '{pg_lion.enable_count_pushdown,off,pg_lion.enable_semijoin,off,pg_lion.enable_ordered_scan,off,pg_lion.hashagg_rate,0.001,pg_lion.agg_rate,0.001,pg_lion.hashjoin_rate,0.001,pg_lion.bitmap_rate,0.001}');
 
 CREATE TEMP TABLE cm_r AS
 SELECT q.qn, s.sn, r.plan, round(r.cost::numeric, 2) AS cost, r.same
