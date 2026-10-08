@@ -14,6 +14,7 @@
 -- 5. A NARROW (DESIGN.md §38) whose cardinality is not its payload's.
 -- 6. A NARROW in an index whose meta page says version 6.
 -- 7. A NARROW of a width the build does not have, which sizes it.
+-- 8. A directory entry whose key length claims more than its item holds.
 --
 -- The pages are damaged on disk, as corrupt.sql does it (pg_buffercache_evict(),
 -- PostgreSQL 17 and later - on 16 the test is skipped,

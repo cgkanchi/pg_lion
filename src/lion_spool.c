@@ -684,10 +684,16 @@ lion_acc_sorted(LionAccCol *col, uint8 **flagsp, int *np)
 	lionacc_iterator it;
 	LionAccSlot *slot;
 	int64		n = 0;
-	int			i;
+	int64		i;
 
-	if (col->nentries > (int64) (MaxAllocHugeSize / sizeof(LionSortItem)) - 2)
-		elog(ERROR, "lion index build: too many keys in one column");
+	/* *np, and the runs written from these items, count in an int */
+	if (col->nentries > (int64) (MaxAllocHugeSize / sizeof(LionSortItem)) - 2 ||
+		nvals > INT_MAX - 2)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("lion index build: too many distinct keys in one column"),
+				 errdetail("A column can have at most %d distinct keys in memory at once.",
+						   INT_MAX - 2)));
 	items = MemoryContextAllocHuge(CurrentMemoryContext,
 								   sizeof(LionSortItem) * (nvals + 2));
 	for (i = 0; i < 2; i++)

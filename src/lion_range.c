@@ -1295,7 +1295,7 @@ lion_entry_scan_fill(LionEntryScan *es, bool copy)
 
 		if (!ItemIdIsUsed(iid))
 			continue;
-		entry = (LionEntryTuple *) PageGetItem(page, iid);
+		entry = lion_entry_at(page, iid);
 
 		if (es->resumekind >= 0)
 		{

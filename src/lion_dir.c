@@ -104,7 +104,7 @@ lion_dir_readbuf(Relation index, BlockNumber blk)
 static inline LionEntryTuple *
 lion_page_item(Page page, OffsetNumber off)
 {
-	return (LionEntryTuple *) PageGetItem(page, PageGetItemId(page, off));
+	return lion_page_entry(page, off);
 }
 
 static inline Size
@@ -874,7 +874,7 @@ lion_dir_find_by_scan(Relation index, LionIndexState *ix,
 
 			if (!ItemIdIsUsed(iid))
 				continue;
-			e = (LionEntryTuple *) PageGetItem(page, iid);
+			e = lion_entry_at(page, iid);
 			if (e->attno != sk->attno)
 				continue;		/* another key column (DESIGN.md §24) */
 			if (lion_entry_kind(e) != sk->kind)
@@ -982,7 +982,7 @@ lion_dir_scan_run_ext(Relation index, const LionSearchKey *sk,
 
 			if (!ItemIdIsUsed(iid))
 				continue;
-			e = (LionEntryTuple *) PageGetItem(page, iid);
+			e = lion_entry_at(page, iid);
 
 			c = lion_cmp_prefix(e, sk);
 			if (c > 0)

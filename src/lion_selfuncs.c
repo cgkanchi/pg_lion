@@ -515,7 +515,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 
 			if (!ItemIdIsUsed(iid))
 				continue;
-			entry = (LionEntryTuple *) PageGetItem(page, iid);
+			entry = lion_entry_at(page, iid);
 
 			/* before (< 0), in (0) or past (> 0) the column's VALUE run */
 			if (entry->attno != state->attno)
