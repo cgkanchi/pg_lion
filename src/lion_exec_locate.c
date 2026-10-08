@@ -121,10 +121,10 @@ lion_posfilter_node(LionClauseState *cl, LionKeyNode *child)
 	Datum	   *itemkeys;
 
 	if (!istate->positions ||
-		!lion_tsquery_item_keys(istate, cl->val, strategy, &itemkeys))
+		!lion_tsquery_item_keys(istate, cl->xval, strategy, &itemkeys))
 		elog(ERROR, "roaring count: query for index \"%s\" can no longer be decided from positions",
 			 RelationGetRelationName(cl->idx));
-	return lion_posfilter_keynode(cl->idx, istate, cl->val, strategy, child);
+	return lion_posfilter_keynode(cl->idx, istate, cl->xval, strategy, child);
 }
 
 /*
@@ -300,6 +300,7 @@ lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 	StrategyNumber strategy;
 	LionQuery	q;
 	Buffer		lastpinned = InvalidBuffer;
+	bool		expanded;
 	int			i;
 
 	/*
@@ -318,9 +319,22 @@ lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 		get_op_opfamily_strategy(cl->opno,
 								 cl->idx->rd_opfamily[cl->idxcol - 1]);
 
-	if (cl->con == NULL)
+	/*
+	 * A prefix lexeme is answered as the OR of the index's lexemes that have
+	 * it (DESIGN.md §17, "Prefix lexemes").  One the expansion cannot take
+	 * stays a prefix, answered from every row and a recheck, as a value
+	 * known only at run time is; the planner took such a literal only where
+	 * a recheck is allowed (lion_analyze_leaf()).
+	 */
+	expanded = true;
+	cl->xval = cl->val;
+	if (strategy == LION_STRAT_MATCH)
+		cl->xval = lion_tsquery_expand_prefixes(cl->idx, istate, cl->val,
+												&expanded);
+
+	if (cl->con == NULL || !expanded)
 	{
-		lion_extract_query_superset(istate, cl->val, strategy, &q);
+		lion_extract_query_superset(istate, cl->xval, strategy, &q);
 		cl->qmode = q.mode;
 		if (q.mode != LION_QMODE_KEYS && q.mode != LION_QMODE_LOSSY)
 		{
@@ -331,7 +345,7 @@ lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 	}
 	else
 	{
-		lion_extract_query(istate, cl->val, strategy, &q);
+		lion_extract_query(istate, cl->xval, strategy, &q);
 		cl->qmode = LION_QMODE_KEYS;
 
 		/*
@@ -343,7 +357,7 @@ lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 		 */
 		if (q.mode != LION_QMODE_KEYS)
 		{
-			lion_extract_query_superset(istate, cl->val, strategy, &q);
+			lion_extract_query_superset(istate, cl->xval, strategy, &q);
 			if (q.mode != LION_QMODE_LOSSY)
 				elog(ERROR, "roaring count: query for index \"%s\" is no longer exact",
 					 RelationGetRelationName(cl->idx));
@@ -921,7 +935,7 @@ lion_build_filter(LionCountScanState *st)
 			LionPosFilter *pf = NULL;
 
 			if (cl->qmode == LION_QMODE_LOSSY && istate->positions)
-				pf = lion_posfilter_begin(cl->idx, istate, cl->val,
+				pf = lion_posfilter_begin(cl->idx, istate, cl->xval,
 										  (StrategyNumber)
 										  get_op_opfamily_strategy(cl->opno,
 																   cl->idx->rd_opfamily[cl->idxcol - 1]));

@@ -307,15 +307,15 @@ SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''!w1''');
 (1 row)
 
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1:*''');
-                     lion_mk                      
---------------------------------------------------
- LionCount, 1 rows, 12000 rechecked, 5614 removed
+                  lion_mk                  
+-------------------------------------------
+ LionCount, 1 rows, 0 rechecked, 0 removed
 (1 row)
 
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1:* & x3''');
-                     lion_mk                     
--------------------------------------------------
- LionCount, 1 rows, 2371 rechecked, 1093 removed
+                  lion_mk                  
+-------------------------------------------
+ LionCount, 1 rows, 0 rechecked, 0 removed
 (1 row)
 
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''''');

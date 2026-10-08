@@ -1170,6 +1170,18 @@ lion_emit_query(Relation index, LionState *col, StrategyNumber strategy,
 	 * (DESIGN.md §17, "Literal queries through the superset").  Only a query
 	 * no key narrows is every indexed row.
 	 */
+	/*
+	 * A prefix lexeme is the OR of the index's lexemes that have it
+	 * (DESIGN.md §17, "Prefix lexemes"); one the expansion cannot take stays
+	 * a prefix, which the superset answers from every row, rechecked.
+	 */
+	if (strategy == LION_STRAT_MATCH)
+	{
+		bool		expanded;
+
+		query = lion_tsquery_expand_prefixes(index, col, query, &expanded);
+	}
+
 	lion_extract_query_superset(col, query, strategy, &q);
 	if (q.mode == LION_QMODE_LOSSY)
 	{
@@ -1462,6 +1474,16 @@ lion_scan_col_tree(Relation index, LionState *col,
 
 			if (qnulls != NULL && qnulls[i])
 				continue;		/* a strict operator with a NULL is not true */
+
+			/* a prefix lexeme as the OR of the lexemes that have it (§17) */
+			if (skey->sk_strategy == LION_STRAT_MATCH)
+			{
+				bool		expanded;
+
+				queries[i] = lion_tsquery_expand_prefixes(index, col,
+														  queries[i],
+														  &expanded);
+			}
 
 			/*
 			 * A caller that rechecks takes the SUPERSET the posting sets can
