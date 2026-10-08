@@ -1,7 +1,7 @@
 {
   "arguments": {
-    "prefix": "/home/claude/pg16prefix",
-    "output": "/home/claude/benchout/full",
+    "prefix": "/home/claude/pg18",
+    "output": "/home/claude/benchout/full18",
     "profile": "focused",
     "rows": [
       1000000,
@@ -30,18 +30,18 @@
     "seed": 20260920,
     "preload": true
   },
-  "started_utc": "2026-10-08T01:14:54Z",
+  "started_utc": "2026-10-08T01:50:48Z",
   "platform": "Linux-6.18.44-fc-v80-x86_64-with-glibc2.39",
   "cpu_count": 4,
   "cpuinfo": "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 85\nmodel name\t: Intel(R) Xeon(R) Processor @ 2.80GHz\nstepping\t: 7\nmicrocode\t: 0x1\ncpu MHz\t\t: 2800.272\ncache size\t: 33792 KB\nphysical id\t: 0\nsiblings\t: 4\ncore id\t\t: 0\ncpu cores\t: 4\napicid\t\t: 0\ninitial apicid\t: 0\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 13\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves arat umip avx512_vnni md_clear arch_capabilities\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs taa mmio_stale_data retbleed eibrs_pbrsb bhi ibpb_no_ret spectre_v2_user its\nbogomips\t: 5600.54\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 46 bits physical, 48 bits virtual\npower management:",
-  "meminfo": "MemTotal:       16480952 kB\nMemFree:        15764940 kB\nMemAvailable:   15942500 kB\nBuffers:            8152 kB\nCached:           383088 kB\nSwapCached:            0 kB\nActive:            99936 kB\nInactive:         537812 kB\nActive(anon):         44 kB\nInactive(anon):   260760 kB\nActive(file):      99892 kB\nInactive(file):   277052 kB\nUnevictable:        8616 kB\nMlocked:            8616 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              1096 kB\nWriteback:            88 kB\nAnonPages:        255284 kB\nMapped:           191624 kB\nShmem:             14288 kB\nKReclaimable:      10280 kB\nSlab:              30928 kB\nSReclaimable:      10280 kB\nSUnreclaim:        20648 kB\nKernelStack:        1872 kB\nPageTables:         2472 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:     8240476 kB\nCommitted_AS:     590540 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:        6956 kB\nVmallocChunk:          0 kB\nPercpu:              992 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nBalloon:               0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       20480 kB\nDirectMap2M:     2076672 kB\nDirectMap1G:    16777216 kB\n",
-  "commit": "85c991c3ad5e8b7d108bc5fbaf6d989186389a44",
+  "meminfo": "MemTotal:       16480952 kB\nMemFree:        15219112 kB\nMemAvailable:   15857104 kB\nBuffers:           15860 kB\nCached:           831628 kB\nSwapCached:            0 kB\nActive:           423588 kB\nInactive:         694124 kB\nActive(anon):         52 kB\nInactive(anon):   284456 kB\nActive(file):     423536 kB\nInactive(file):   409668 kB\nUnevictable:        8616 kB\nMlocked:            8616 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:             11096 kB\nWriteback:             0 kB\nAnonPages:        278924 kB\nMapped:           193848 kB\nShmem:             14288 kB\nKReclaimable:      53856 kB\nSlab:              78868 kB\nSReclaimable:      53856 kB\nSUnreclaim:        25012 kB\nKernelStack:        1872 kB\nPageTables:         2720 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:     8240476 kB\nCommitted_AS:     590716 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:        6956 kB\nVmallocChunk:          0 kB\nPercpu:              992 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nBalloon:               0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       20480 kB\nDirectMap2M:     2076672 kB\nDirectMap1G:    16777216 kB\n",
+  "commit": "c0380579becfe1ac6831be1fce494cd026495ccf",
   "git_diff": "",
-  "pg_config": "'--build=x86_64-linux-gnu' '--prefix=/usr' '--includedir=${prefix}/include' '--mandir=${prefix}/share/man' '--infodir=${prefix}/share/info' '--sysconfdir=/etc' '--localstatedir=/var' '--disable-option-checking' '--disable-silent-rules' '--libdir=${prefix}/lib/x86_64-linux-gnu' '--runstatedir=/run' '--disable-maintainer-mode' '--disable-dependency-tracking' '--with-tcl' '--with-perl' '--with-python' '--with-pam' '--with-openssl' '--with-libxml' '--with-libxslt' '--mandir=/usr/share/postgresql/16/man' '--docdir=/usr/share/doc/postgresql-doc-16' '--sysconfdir=/etc/postgresql-common' '--datarootdir=/usr/share/' '--datadir=/usr/share/postgresql/16' '--bindir=/usr/lib/postgresql/16/bin' '--libdir=/usr/lib/x86_64-linux-gnu/' '--libexecdir=/usr/lib/postgresql/' '--includedir=/usr/include/postgresql/' '--with-extra-version= (Ubuntu 16.15-0ubuntu0.24.04.1)' '--enable-nls' '--enable-thread-safety' '--enable-debug' '--enable-dtrace' '--disable-rpath' '--with-uuid=e2fs' '--with-gnu-ld' '--with-gssapi' '--with-ldap' '--with-pgport=5432' '--with-system-tzdata=/usr/share/zoneinfo' 'AWK=mawk' 'MKDIR_P=/bin/mkdir -p' 'PROVE=/usr/bin/prove' 'PYTHON=/usr/bin/python3' 'TAR=/bin/tar' 'XSLTPROC=xsltproc --nonet' 'CFLAGS=-g -O2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -flto=auto -ffat-lto-objects -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -fno-omit-frame-pointer' 'LDFLAGS=-Wl,-Bsymbolic-functions -flto=auto -ffat-lto-objects -Wl,-z,relro -Wl,-z,now' '--enable-tap-tests' '--with-icu' '--with-llvm' 'LLVM_CONFIG=/usr/bin/llvm-config-17' 'CLANG=/usr/bin/clang-17' '--with-lz4' '--with-zstd' '--with-systemd' '--with-selinux' 'build_alias=x86_64-linux-gnu' 'CPPFLAGS=-Wdate-time -D_FORTIFY_SOURCE=3' 'CXXFLAGS=-g -O2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -flto=auto -ffat-lto-objects -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection'",
+  "pg_config": "'--prefix=/home/claude/pg18' '--without-icu' '--without-readline' 'CFLAGS=-O2'",
   "schema": "Synthetic integer equality/cardinality and text-array/full-text workloads",
   "cache": "Warm process/OS cache; optional shared-buffer-cold retains OS cache",
   "clock": "EXPLAIN ANALYZE TIMING OFF Execution Time; planning recorded separately",
-  "server_version": "PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
+  "server_version": "PostgreSQL 18.6 on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
   "settings": [
     {
       "name": "DateStyle",
@@ -60,6 +60,12 @@
       "setting": "Etc/UTC",
       "unit": null,
       "source": "configuration file"
+    },
+    {
+      "name": "allow_alter_system",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
     },
     {
       "name": "allow_in_place_tablespaces",
@@ -188,6 +194,12 @@
       "source": "default"
     },
     {
+      "name": "autovacuum_vacuum_max_threshold",
+      "setting": "100000000",
+      "unit": null,
+      "source": "default"
+    },
+    {
       "name": "autovacuum_vacuum_scale_factor",
       "setting": "0.2",
       "unit": null,
@@ -204,6 +216,12 @@
       "setting": "-1",
       "unit": "kB",
       "source": "default"
+    },
+    {
+      "name": "autovacuum_worker_slots",
+      "setting": "16",
+      "unit": null,
+      "source": "configuration file"
     },
     {
       "name": "backend_flush_after",
@@ -338,6 +356,12 @@
       "source": "default"
     },
     {
+      "name": "commit_timestamp_buffers",
+      "setting": "128",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
       "name": "compute_query_id",
       "setting": "auto",
       "unit": null,
@@ -345,7 +369,7 @@
     },
     {
       "name": "config_file",
-      "setting": "/tmp/lion-comparison-u4tiqwkr/data/postgresql.conf",
+      "setting": "/tmp/lion-comparison-1dysmegj/data/postgresql.conf",
       "unit": null,
       "source": "override"
     },
@@ -387,13 +411,13 @@
     },
     {
       "name": "data_checksums",
-      "setting": "off",
+      "setting": "on",
       "unit": null,
       "source": "default"
     },
     {
       "name": "data_directory",
-      "setting": "/tmp/lion-comparison-u4tiqwkr/data",
+      "setting": "/tmp/lion-comparison-1dysmegj/data",
       "unit": null,
       "source": "override"
     },
@@ -405,12 +429,6 @@
     },
     {
       "name": "data_sync_retry",
-      "setting": "off",
-      "unit": null,
-      "source": "default"
-    },
-    {
-      "name": "db_user_namespace",
       "setting": "off",
       "unit": null,
       "source": "default"
@@ -543,7 +561,7 @@
     },
     {
       "name": "effective_io_concurrency",
-      "setting": "1",
+      "setting": "16",
       "unit": null,
       "source": "default"
     },
@@ -560,7 +578,19 @@
       "source": "default"
     },
     {
+      "name": "enable_distinct_reordering",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
       "name": "enable_gathermerge",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "enable_group_by_reordering",
       "setting": "on",
       "unit": null,
       "source": "default"
@@ -656,6 +686,12 @@
       "source": "default"
     },
     {
+      "name": "enable_self_join_elimination",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
       "name": "enable_seqscan",
       "setting": "on",
       "unit": null,
@@ -686,14 +722,20 @@
       "source": "default"
     },
     {
+      "name": "event_triggers",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
       "name": "exit_on_error",
       "setting": "off",
       "unit": null,
       "source": "default"
     },
     {
-      "name": "extension_destdir",
-      "setting": "",
+      "name": "extension_control_path",
+      "setting": "$system",
       "unit": null,
       "source": "default"
     },
@@ -706,6 +748,12 @@
     {
       "name": "extra_float_digits",
       "setting": "1",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "file_copy_method",
+      "setting": "copy",
       "unit": null,
       "source": "default"
     },
@@ -801,7 +849,7 @@
     },
     {
       "name": "hba_file",
-      "setting": "/tmp/lion-comparison-u4tiqwkr/data/pg_hba.conf",
+      "setting": "/tmp/lion-comparison-1dysmegj/data/pg_hba.conf",
       "unit": null,
       "source": "override"
     },
@@ -830,6 +878,12 @@
       "source": "default"
     },
     {
+      "name": "huge_pages_status",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
       "name": "icu_validation_level",
       "setting": "warning",
       "unit": null,
@@ -837,7 +891,7 @@
     },
     {
       "name": "ident_file",
-      "setting": "/tmp/lion-comparison-u4tiqwkr/data/pg_ident.conf",
+      "setting": "/tmp/lion-comparison-1dysmegj/data/pg_ident.conf",
       "unit": null,
       "source": "override"
     },
@@ -845,6 +899,12 @@
       "name": "idle_in_transaction_session_timeout",
       "setting": "0",
       "unit": "ms",
+      "source": "default"
+    },
+    {
+      "name": "idle_replication_slot_timeout",
+      "setting": "0",
+      "unit": "s",
       "source": "default"
     },
     {
@@ -880,6 +940,36 @@
     {
       "name": "integer_datetimes",
       "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "io_combine_limit",
+      "setting": "16",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "io_max_combine_limit",
+      "setting": "16",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "io_max_concurrency",
+      "setting": "64",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "io_method",
+      "setting": "worker",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "io_workers",
+      "setting": "3",
       "unit": null,
       "source": "default"
     },
@@ -957,7 +1047,7 @@
     },
     {
       "name": "krb_server_keyfile",
-      "setting": "FILE:/etc/postgresql-common/krb5.keytab",
+      "setting": "",
       "unit": null,
       "source": "default"
     },
@@ -1023,7 +1113,7 @@
     },
     {
       "name": "log_connections",
-      "setting": "off",
+      "setting": "",
       "unit": null,
       "source": "default"
     },
@@ -1084,6 +1174,12 @@
     {
       "name": "log_line_prefix",
       "setting": "%m [%p] ",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "log_lock_failures",
+      "setting": "off",
       "unit": null,
       "source": "default"
     },
@@ -1227,7 +1323,7 @@
     },
     {
       "name": "maintenance_io_concurrency",
-      "setting": "10",
+      "setting": "16",
       "unit": null,
       "source": "default"
     },
@@ -1236,6 +1332,12 @@
       "setting": "524288",
       "unit": "kB",
       "source": "configuration file"
+    },
+    {
+      "name": "max_active_replication_origins",
+      "setting": "10",
+      "unit": null,
+      "source": "default"
     },
     {
       "name": "max_connections",
@@ -1276,6 +1378,12 @@
     {
       "name": "max_logical_replication_workers",
       "setting": "4",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "max_notify_queue_pages",
+      "setting": "1048576",
       "unit": null,
       "source": "default"
     },
@@ -1382,6 +1490,12 @@
       "source": "default"
     },
     {
+      "name": "md5_password_warnings",
+      "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
       "name": "min_dynamic_shared_memory",
       "setting": "0",
       "unit": "MB",
@@ -1406,9 +1520,33 @@
       "source": "configuration file"
     },
     {
-      "name": "old_snapshot_threshold",
-      "setting": "-1",
-      "unit": "min",
+      "name": "multixact_member_buffers",
+      "setting": "32",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "multixact_offset_buffers",
+      "setting": "16",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "notify_buffers",
+      "setting": "16",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "num_os_semaphores",
+      "setting": "174",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "oauth_validator_libraries",
+      "setting": "",
+      "unit": null,
       "source": "default"
     },
     {
@@ -2060,6 +2198,12 @@
       "source": "default"
     },
     {
+      "name": "serializable_buffers",
+      "setting": "32",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
       "name": "server_encoding",
       "setting": "SQL_ASCII",
       "unit": null,
@@ -2067,13 +2211,13 @@
     },
     {
       "name": "server_version",
-      "setting": "16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)",
+      "setting": "18.6",
       "unit": null,
       "source": "default"
     },
     {
       "name": "server_version_num",
-      "setting": "160015",
+      "setting": "180006",
       "unit": null,
       "source": "default"
     },
@@ -2097,13 +2241,13 @@
     },
     {
       "name": "shared_memory_size",
-      "setting": "551",
+      "setting": "558",
       "unit": "MB",
       "source": "default"
     },
     {
       "name": "shared_memory_size_in_huge_pages",
-      "setting": "276",
+      "setting": "279",
       "unit": null,
       "source": "default"
     },
@@ -2139,7 +2283,7 @@
     },
     {
       "name": "ssl_ciphers",
-      "setting": "HIGH:MEDIUM:+3DES:!aNULL",
+      "setting": "none",
       "unit": null,
       "source": "default"
     },
@@ -2162,8 +2306,8 @@
       "source": "default"
     },
     {
-      "name": "ssl_ecdh_curve",
-      "setting": "prime256v1",
+      "name": "ssl_groups",
+      "setting": "none",
       "unit": null,
       "source": "default"
     },
@@ -2175,7 +2319,7 @@
     },
     {
       "name": "ssl_library",
-      "setting": "OpenSSL",
+      "setting": "",
       "unit": null,
       "source": "default"
     },
@@ -2210,6 +2354,12 @@
       "source": "default"
     },
     {
+      "name": "ssl_tls13_ciphers",
+      "setting": "",
+      "unit": null,
+      "source": "default"
+    },
+    {
       "name": "standard_conforming_strings",
       "setting": "on",
       "unit": null,
@@ -2228,14 +2378,38 @@
       "source": "default"
     },
     {
+      "name": "subtransaction_buffers",
+      "setting": "128",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
+      "name": "summarize_wal",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
       "name": "superuser_reserved_connections",
       "setting": "3",
       "unit": null,
       "source": "default"
     },
     {
+      "name": "sync_replication_slots",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
       "name": "synchronize_seqscans",
       "setting": "on",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "synchronized_standby_slots",
+      "setting": "",
       "unit": null,
       "source": "default"
     },
@@ -2324,14 +2498,14 @@
       "source": "default"
     },
     {
-      "name": "trace_notify",
+      "name": "trace_connection_negotiation",
       "setting": "off",
       "unit": null,
       "source": "default"
     },
     {
-      "name": "trace_recovery_messages",
-      "setting": "log",
+      "name": "trace_notify",
+      "setting": "off",
       "unit": null,
       "source": "default"
     },
@@ -2355,6 +2529,12 @@
     },
     {
       "name": "track_commit_timestamp",
+      "setting": "off",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "track_cost_delay_timing",
       "setting": "off",
       "unit": null,
       "source": "default"
@@ -2384,6 +2564,12 @@
       "source": "default"
     },
     {
+      "name": "transaction_buffers",
+      "setting": "128",
+      "unit": "8kB",
+      "source": "default"
+    },
+    {
       "name": "transaction_deferrable",
       "setting": "off",
       "unit": null,
@@ -2402,6 +2588,12 @@
       "source": "override"
     },
     {
+      "name": "transaction_timeout",
+      "setting": "0",
+      "unit": "ms",
+      "source": "default"
+    },
+    {
       "name": "transform_null_equals",
       "setting": "off",
       "unit": null,
@@ -2409,7 +2601,7 @@
     },
     {
       "name": "unix_socket_directories",
-      "setting": "/tmp/lion-comparison-u4tiqwkr/socket",
+      "setting": "/tmp/lion-comparison-1dysmegj/socket",
       "unit": null,
       "source": "configuration file"
     },
@@ -2433,7 +2625,7 @@
     },
     {
       "name": "vacuum_buffer_usage_limit",
-      "setting": "256",
+      "setting": "2048",
       "unit": "kB",
       "source": "default"
     },
@@ -2486,6 +2678,12 @@
       "source": "default"
     },
     {
+      "name": "vacuum_max_eager_freeze_failure_rate",
+      "setting": "0.03",
+      "unit": null,
+      "source": "default"
+    },
+    {
       "name": "vacuum_multixact_failsafe_age",
       "setting": "1600000000",
       "unit": null,
@@ -2500,6 +2698,12 @@
     {
       "name": "vacuum_multixact_freeze_table_age",
       "setting": "150000000",
+      "unit": null,
+      "source": "default"
+    },
+    {
+      "name": "vacuum_truncate",
+      "setting": "on",
       "unit": null,
       "source": "default"
     },
@@ -2606,6 +2810,12 @@
       "source": "default"
     },
     {
+      "name": "wal_summary_keep_time",
+      "setting": "14400",
+      "unit": "min",
+      "source": "default"
+    },
+    {
       "name": "wal_sync_method",
       "setting": "fdatasync",
       "unit": null,
@@ -2648,7 +2858,7 @@
       "source": "default"
     }
   ],
-  "completed_utc": "2026-10-08T01:25:44Z",
+  "completed_utc": "2026-10-08T02:00:34Z",
   "errors": 0,
   "status": "complete"
 }
