@@ -18,7 +18,7 @@ FOCUSED_SCALAR = [
 ]
 FOCUSED_DOCS = [
     'array_common', 'array_and', 'array_or', 'ts_common', 'ts_rare', 'ts_and',
-    'ts_tree', 'ts_phrase', 'ts_prefix', 'ts_fetch',
+    'ts_tree', 'ts_phrase', 'ts_not', 'ts_weight', 'ts_prefix', 'ts_fetch',
 ]
 AFTER_MAINTENANCE = ['eq_c200_17', 'and2', 'is_null', 'group_c200']
 LOW_MEMORY = ['eq_c2_0', 'in_c20k_1000', 'group_c200', 'fetch_medium']
@@ -211,5 +211,9 @@ def index_specs(suite, family):
         if family=='gist':
             return [('ix_tsv','CREATE INDEX ix_tsv ON docs USING gist (tsv)'),
                     ('ix_grp','CREATE INDEX ix_grp ON docs USING gist (grp)')]
-        return [(f'ix_{c}',f'CREATE INDEX ix_{c} ON docs USING {am_name(family)} ({c})') for c in ['tags','tsv','grp']]
+        # Lion's tsvector index stores positions, its recommended setup for full-text search:
+        # phrases, weights and NOT are then answered from the index.
+        opts={'tsv':' WITH (store_positions = true)'} if am_name(family)=='lion' else {}
+        return [(f'ix_{c}',f'CREATE INDEX ix_{c} ON docs USING {am_name(family)} ({c}){opts.get(c,"")}')
+                for c in ['tags','tsv','grp']]
     raise ValueError(suite)
