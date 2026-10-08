@@ -394,14 +394,14 @@ SELECT * FROM lion_bs_run('SELECT id, k, x FROM bs WHERE c200 = 17 ORDER BY k LI
 (6 rows)
 
 SELECT * FROM lion_bs_run('SELECT id, k, x FROM bs WHERE c200 = 17 AND c20 = 3 ORDER BY k DESC');
-                             lion_bs_run                             
----------------------------------------------------------------------
+               lion_bs_run               
+-----------------------------------------
  Custom Scan (LionOrdered) on bs
  Ordered By: bs_k (backward, index only)
  Index Entries Walked: 86577
  Lion Set Hits: 26
  Heap Fetches: 0
- Lion Set: 22 containers, exact, after 29 keys probed (probe budget)
+ Lion Set: 22 containers, exact
 (6 rows)
 
 SELECT * FROM lion_bs_run('SELECT grp, x FROM bs WHERE tags @> ARRAY[''t3'', ''u5'']');
@@ -939,14 +939,14 @@ SELECT lion_bs('SELECT grp, sum(x) FROM bs WHERE c20 = 3 GROUP BY grp ORDER BY g
 (1 row)
 
 SELECT * FROM lion_bs_run('SELECT grp, sum(x) FROM bs WHERE c20 = 3 GROUP BY grp ORDER BY grp');
-                             lion_bs_run                             
----------------------------------------------------------------------
+             lion_bs_run             
+-------------------------------------
  ->  Custom Scan (LionOrdered) on bs
  Ordered By: bs_grp (index only)
  Index Entries Walked: 99979
  Lion Set Hits: 4987
  Heap Fetches: 0
- Lion Set: 83 containers, exact, after 83 keys probed (probe budget)
+ Lion Set: 83 containers, exact
 (6 rows)
 
 -- a multi-key filter over a btree without its column: exact as well, and
