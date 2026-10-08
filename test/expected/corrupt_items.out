@@ -15,6 +15,7 @@
 -- 6. A NARROW in an index whose meta page says version 6.
 -- 7. A NARROW of a width the build does not have, which sizes it.
 -- 8. A directory entry whose key length claims more than its item holds.
+-- 9. An entry whose TID count is less than what VACUUM removes from it.
 --
 -- The pages are damaged on disk, as corrupt.sql does it (pg_buffercache_evict(),
 -- PostgreSQL 17 and later - on 16 the test is skipped,
@@ -593,6 +594,41 @@ SELECT lion_di_try($$SELECT lion_index_verify('lion_di_t_i')$$);
 (1 row)
 
 DROP TABLE lion_di_t;
+-- ---------- 9. an entry that counts fewer TIDs than VACUUM removes ----------
+-- Key 7's CHAIN entry on its leaf says it has one TID (ntids, bytes 24 to 31 of
+-- the entry; its key, a by-value int4, is the 8 bytes after the header).
+-- VACUUM subtracting the hundreds it removes wrapped the count and wrote it
+-- (an assertion only); now it refuses before its record begins.
+CREATE TABLE lion_di_v (k int NOT NULL) WITH (autovacuum_enabled = off);
+INSERT INTO lion_di_v
+	SELECT CASE WHEN i % 16 = 0 THEN 7 ELSE 1 END FROM generate_series(0, 4 * 14464 - 1) i;
+CREATE INDEX lion_di_v_i ON lion_di_v USING lion (k);
+SELECT lion_di_evict('lion_di_v_i');
+ lion_di_evict 
+---------------
+ 
+(1 row)
+
+-- the entry: the one item of the index with an 8-byte key reading 7
+SELECT blk AS lion_di_blk, it AS lion_di_at
+  FROM generate_series(0, (pg_relation_size('lion_di_v_i') / 8192 - 1)::int) blk,
+	   LATERAL lion_di_block('lion_di_v_i', blk) p,
+	   LATERAL generate_series(1, GREATEST(0, LEAST(200, (((lion_di_u32(p, 12) & 65535) - 24) / 4)::int))) o,
+	   LATERAL (SELECT lion_di_item(p, o) AS it) y
+ WHERE it BETWEEN 24 AND 8100 AND get_byte(p, it + 6) = 8
+   AND substring(p FROM it + 33 FOR 8) = '\x0700000000000000'::bytea \gset
+SELECT lion_di_poke('lion_di_v_i', :lion_di_blk, :lion_di_at + 24, '\x0100000000000000'::bytea);
+ lion_di_poke 
+--------------
+ 
+(1 row)
+
+DELETE FROM lion_di_v WHERE k = 7;
+\set VERBOSITY terse
+VACUUM lion_di_v;
+ERROR:  lion index "lion_di_v_i": entry 2 on block 4 counts 1 TIDs in 4 containers, fewer than VACUUM removes (3616 TIDs, 4 containers)
+\set VERBOSITY default
+DROP TABLE lion_di_v;
 -- ---------- an undamaged index still works ----------
 CREATE INDEX lion_di_i ON lion_di USING lion (k);
 SELECT count(*) FROM lion_di WHERE k = 7;

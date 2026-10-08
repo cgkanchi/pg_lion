@@ -2164,7 +2164,8 @@ lion_spool_merge_column(LionSpool *sp, int colno, LionSpoolEmit emit,
 			break;
 		lion_spool_spill_column(sp, victim);
 	}
-	workmem = (used < sp->membytes) ? (int) ((sp->membytes - used) / 1024) : 0;
+	workmem = (used < sp->membytes) ?
+		(int) Min((sp->membytes - used) / 1024, (Size) INT_MAX) : 0;
 
 	inmemory = (col->nentries > 0);
 	if (col->nruns > 0)
@@ -2312,7 +2313,8 @@ lion_spool_reader_emit_column(LionSpoolReader *rd, int col,
 
 	used = (Size) rd->nparts * (rd->readbuf + LION_RUN_CHUNK + LION_ESCAPED_MAX) +
 		reserve;
-	workmem = (used < rd->membytes) ? (int) ((rd->membytes - used) / 1024) : 0;
+	workmem = (used < rd->membytes) ?
+		(int) Min((rd->membytes - used) / 1024, (Size) INT_MAX) : 0;
 
 	for (i = 0; i < rd->nparts; i++)
 	{
