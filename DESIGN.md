@@ -10513,8 +10513,9 @@ or semi join has no row left, and an anti join's are every row, as when a filter
 
 - **The empty copy does not change how the run reads its child** (2026-09-30 review). Over a plain
   fact, whether the rows come a batch at a time, walked in key order, or a row at a time is decided
-  once, at the run's first row (`joinbegun`, `joinwalked`), and kept to its end. It used to be
-  worked out again at every row from `wheremissing`, which a clause with no entry sets before the
+  once, at the run's first row (`join->batch.begun`, `join->batch.walked`), and kept to its end.
+  It used to be worked out again at every row from `wheremissing`, which a clause with no entry
+  sets before the
   first row and the empty copy sets part way through - so the row after the switch was read a row at
   a time: the rest of the batch in hand was dropped and the child read on, or read again where a
   finished scan starts over, and an anti join lost rows or counted them twice (on PostgreSQL 16,
@@ -11525,9 +11526,10 @@ whose keys repeat and are sometimes NULL; each walked over one batch and over se
 `work_mem` of 64 kB and a row at a time; rescans (the upper node below a correlated subquery, the
 paths below a nested loop's LATERAL), each run switching again; parallel plans of both; a
 partitioned fact; and the switch off. EXPLAIN (COSTS OFF) of the plans, and each answer against the
-pushdown off as multisets. Before `joinbegun` every anti join walked in key order - the upper node's
-and the join path's, over one batch and several, rescanned and in parallel - lost or repeated rows,
-ten answers of the file; the others passed then too, and hold the ways the fix did not mean to change.
+pushdown off as multisets. Before `join->batch.begun` every anti join walked in key order - the
+upper node's and the join path's, over one batch and several, rescanned and in parallel - lost or
+repeated rows, ten answers of the file; the others passed then too, and hold the ways the fix did
+not mean to change.
 
 `test/sql/fkjoin_semipath.sql` (2026-09-29), the semi and anti join as a join path, against the
 pushdown off (`lion_sp()`, as `lion_gj()` does: with core's join methods disabled - so that the path
