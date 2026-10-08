@@ -1567,6 +1567,14 @@ contract is now tested across every reader rather than per feature: `test/sql/re
 `reader_checkxmin` and `reader_serializable` specs each list every reader. A new reader adds a line
 to each.
 
+The custom scan nodes keep the executor's side of the contract for what they stand in for (a
+clause's operator answered from a posting set, an aggregate, the BM25 score), and that is tested
+across every node the same way: `test/sql/node_contracts.sql` runs one query per node with the
+function revoked from PUBLIC (a role without it, plain EXPLAIN, a generic plan made by a role with
+it, SECURITY DEFINER functions) against the ordinary plan, and
+`test/modules/lion_hooktest/sql/exec_hook.sql` runs the same list under an object access hook that
+refuses the function (`make hookcheck`). A new node adds a line to both.
+
 ## 10. Phase 2b: CustomScan for `count(*) [GROUP BY k] FROM t WHERE k1 = c1 AND ...` (`lion_plan_*.c`, `lion_exec_*.c`)
 
 Planner integration
@@ -14471,11 +14479,12 @@ than overruns (§30.4).
   `long walk` (`LO_LAZY_WALK_WORK` entries a unit of the budget) or `memo size` (the memo past
   half of `hash_mem`) - with a count when rescans built it for more than one; a set the plan
   builds at the start says `N containers, exact`, as with the lazy set off.
-  `test/sql/ordered_transitions.sql` forces the probe budget, long walk and memo size rules and
-  the plan's build at the start (its walks that go far bound the walked column by parameters, so
-  that the generic plan expects them short), `ordered.sql` the switch due one; not the heap order
-  one, which needs sets of more than about 256 containers (some 16,000 heap pages each) before a
-  random walk's restarts leave it 64 keys within budget.
+  `test/sql/ordered_transitions.sql` forces the probe budget, long walk, memo size and heap order
+  rules and the plan's build at the start (its walks that go far bound the walked column by
+  parameters, so that the generic plan expects them short), `ordered.sql` the switch due one. The
+  heap order rule needs 64 keys evaluated within the budget: there a walk that goes behind at one
+  key in four, over a 72-container table whose first leaf key's set is empty where the walk
+  starts, so that each key costs a probe of that set alone while the budget counts all three.
   The planner still prices the set as built (§30.3): the lazy set makes the node cheaper than
   its estimate, never dearer by more than the build. `pg_lion.enable_lazy_set` (on) turns it
   off, for comparing the two and for the tests of the build (a set that degrades).
