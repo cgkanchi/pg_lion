@@ -717,12 +717,12 @@ lion_explain_join(LionCountScanState *st, ExplainState *es)
 	 * counted once per group of it - an entry of its index, or, in a
 	 * partition whose bounds give it one value, that value.
 	 */
-	if (st->fgattno != 0)
+	if (st->fg != NULL)
 	{
 		int			bound = 0;
 
 		ExplainPropertyText("Fact Group Key",
-							get_attname(st->heapoid, st->fgattno, false),
+							get_attname(st->heapoid, st->fg->attno, false),
 							es);
 		for (i = 0; i < st->npart; i++)
 			bound += (st->part[i].fgconst != NULL) ? 1 : 0;
@@ -1278,10 +1278,10 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 						   st->joinmissing + st->joinworkermissing, es);
 
 	/* ... and counted in each group of a fact column grouped by */
-	if (st->fgattno != 0)
+	if (st->fg != NULL)
 		ExplainPropertyInteger("Fact Group Counts", NULL,
-							   st->fggroupcounts +
-							   st->fgworkergroupcounts, es);
+							   st->fg->groupcounts +
+							   st->fg->workergroupcounts, es);
 
 	/*
 	 * ... what their counts read of the keys' own fk sets - their

@@ -495,7 +495,8 @@ lion_open_relation(LionCountScanState *st, int p)
 										   AccessShareLock);
 		st->groupidx = lion_open_index(st->groupidxoid);
 		st->groupidx2 = lion_open_index(st->groupidxoid2);
-		st->fgidx = lion_open_index(st->fgidxoid);
+		if (st->fg != NULL)
+			st->fg->idx = lion_open_index(st->fg->idxoid);
 		if (st->decode != NULL)
 		{
 			LionDecodeRun *dr = st->decode;
@@ -633,9 +634,12 @@ lion_close_relation(LionCountScanState *st)
 		index_close(st->groupidx2, AccessShareLock);
 	st->groupidx2 = NULL;
 	st->groupidxcol2 = 0;
-	if (st->fgidx != NULL)		/* a plain table's only */
-		index_close(st->fgidx, AccessShareLock);
-	st->fgidx = NULL;
+	if (st->fg != NULL)			/* a plain table's only */
+	{
+		if (st->fg->idx != NULL)
+			index_close(st->fg->idx, AccessShareLock);
+		st->fg->idx = NULL;
+	}
 	if (st->decode != NULL)		/* ... and so is the decoded walk */
 	{
 		LionDecodeRun *dr = st->decode;
@@ -1187,25 +1191,33 @@ lion_begin_partitions(LionCountScanState *st, const LionCountPriv *priv)
 /*
  * An FK-side join grouped by a fact column (DESIGN.md §27, "Grouped by a
  * fact column"): the column, and each relation's index for its groups -
- * or, for a partition, the value its bounds give the column.
+ * or, for a partition, the value its bounds give the column.  Its state is
+ * there only then (lion_st_fg()).
  */
 static void
-lion_begin_fact_group(LionCountScanState *st, const LionCountPriv *priv)
+lion_begin_fact_group(LionCountScanState *st, const LionCountPriv *priv,
+					  EState *estate)
 {
+	LionFactGroupState *fg;
 	int			i;
 
-	if (priv->fgattno != 0)
+	st->fg = NULL;
+	if (priv->fgattno == 0)
+		return;
+
+	fg = (LionFactGroupState *)
+		MemoryContextAllocZero(estate->es_query_cxt,
+							   sizeof(LionFactGroupState));
+	fg->attno = priv->fgattno;
+	if (st->npart == 0)
+		fg->idxoid = priv->fgidxoid[0];
+	for (i = 0; i < st->npart; i++)
 	{
-		st->fgattno = priv->fgattno;
-		if (st->npart == 0)
-			st->fgidxoid = priv->fgidxoid[0];
-		for (i = 0; i < st->npart; i++)
-		{
-			st->part[i].fgidxoid = priv->fgidxoid[i];
-			st->part[i].fgconst = OidIsValid(priv->fgidxoid[i]) ? NULL :
-				priv->fgconst[i];
-		}
+		st->part[i].fgidxoid = priv->fgidxoid[i];
+		st->part[i].fgconst = OidIsValid(priv->fgidxoid[i]) ? NULL :
+			priv->fgconst[i];
 	}
+	st->fg = fg;
 }
 
 /*
@@ -1272,17 +1284,19 @@ lion_begin_contexts(LionCountScanState *st, EState *estate)
 	 * they go up.  A count reads the key's set, the fact filters - or their
 	 * copy - and one group's set: at most every source of the plan and one.
 	 */
-	if (st->fgattno != 0)
+	if (st->fg != NULL)
 	{
-		st->fgcxt = AllocSetContextCreate(estate->es_query_cxt,
-										  "LionCount fact groups",
-										  ALLOCSET_DEFAULT_SIZES);
-		st->fgrowcxt = AllocSetContextCreate(estate->es_query_cxt,
-											 "LionCount fact group rows",
-											 ALLOCSET_DEFAULT_SIZES);
-		st->fgnsrc = Max(st->nplanitem + 1, 2) + 1;
-		st->fgsrc = (LionCountSource *)
-			palloc0(sizeof(LionCountSource) * st->fgnsrc);
+		LionFactGroupState *fg = st->fg;
+
+		fg->cxt = AllocSetContextCreate(estate->es_query_cxt,
+										"LionCount fact groups",
+										ALLOCSET_DEFAULT_SIZES);
+		fg->rowcxt = AllocSetContextCreate(estate->es_query_cxt,
+										   "LionCount fact group rows",
+										   ALLOCSET_DEFAULT_SIZES);
+		fg->nsrc = Max(st->nplanitem + 1, 2) + 1;
+		fg->src = (LionCountSource *)
+			palloc0(sizeof(LionCountSource) * fg->nsrc);
 	}
 }
 
@@ -1402,7 +1416,7 @@ lion_begin_join_batches(LionCountScanState *st, EState *estate)
 		}
 	}
 
-	if (st->joinwalk || st->joinpart != NULL || st->fgattno != 0)
+	if (st->joinwalk || st->joinpart != NULL || st->fg != NULL)
 	{
 		TupleDesc	childdesc = ExecGetResultType(st->child);
 		Form_pg_attribute keyatt;
@@ -1558,7 +1572,7 @@ static LionCountMode
 lion_begin_legacy_mode(LionCountScanState *st)
 {
 	if (st->joinclause >= 0)
-		return (st->fgattno != 0) ? LION_MODE_JOIN_FACTGROUP : LION_MODE_JOIN;
+		return (st->fg != NULL) ? LION_MODE_JOIN_FACTGROUP : LION_MODE_JOIN;
 	if (!st->hasgroupidx)
 		return LION_MODE_COUNT;
 	if (st->distattno != 0 && st->groupattno == 0)
@@ -1622,7 +1636,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_driving_column(st, &priv);
 	lion_begin_ors_and_items(st, &priv);
 	lion_begin_partitions(st, &priv);
-	lion_begin_fact_group(st, &priv);
+	lion_begin_fact_group(st, &priv, estate);
 	lion_begin_run_state(st, cscan, estate);
 	lion_begin_contexts(st, estate);
 	lion_begin_decoded_walk(st, &priv, estate);

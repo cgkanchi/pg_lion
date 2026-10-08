@@ -572,19 +572,24 @@ lion_reset_run(LionCountScanState *st)
 	st->joinwalked = false;
 
 	/* ... and a fact column's groups: the rows put by, and the next turn */
-	st->fgturn = 0;
-	st->fgnrows = 0;
-	st->fgrowpos = 0;
-	st->fgrowcap = 0;
-	st->fgrows = NULL;
-	st->fgn = 0;
-	st->fgsets = NULL;
-	st->fgkey = NULL;
-	st->fgnull = NULL;
-	if (st->fgcxt != NULL)
-		MemoryContextReset(st->fgcxt);
-	if (st->fgrowcxt != NULL)
-		MemoryContextReset(st->fgrowcxt);
+	if (st->fg != NULL)
+	{
+		LionFactGroupState *fg = st->fg;
+
+		fg->turn = 0;
+		fg->nrows = 0;
+		fg->rowpos = 0;
+		fg->rowcap = 0;
+		fg->rows = NULL;
+		fg->n = 0;
+		fg->sets = NULL;
+		fg->key = NULL;
+		fg->isnull = NULL;
+		if (fg->cxt != NULL)
+			MemoryContextReset(fg->cxt);
+		if (fg->rowcxt != NULL)
+			MemoryContextReset(fg->rowcxt);
+	}
 
 	/* ... and the top k's groups, found again (DESIGN.md §36) */
 	if (st->topk != NULL)
@@ -979,7 +984,8 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		shared->wherespilled += st->wherespilled;
 		shared->groupbatches += st->groupbatches;
 		shared->groupsbatched += st->groupsbatched;
-		shared->factgroupcounts += st->fggroupcounts;
+		if (st->fg != NULL)
+			shared->factgroupcounts += st->fg->groupcounts;
 		SpinLockRelease(&shared->mutex);
 		st->joinreported = true;
 		return;
@@ -1010,7 +1016,8 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		rs->workergroupbatches = shared->groupbatches;
 		rs->workergroupsbatched = shared->groupsbatched;
 	}
-	st->fgworkergroupcounts = shared->factgroupcounts;
+	if (st->fg != NULL)
+		st->fg->workergroupcounts = shared->factgroupcounts;
 	SpinLockRelease(&shared->mutex);
 }
 
@@ -1098,15 +1105,20 @@ lion_end_custom_scan(CustomScanState *node)
 		st->joinpartcxt = NULL;
 	}
 	st->joinpart = NULL;
-	if (st->fgcxt != NULL)
+	if (st->fg != NULL)
 	{
-		MemoryContextDelete(st->fgcxt);
-		st->fgcxt = NULL;
-	}
-	if (st->fgrowcxt != NULL)
-	{
-		MemoryContextDelete(st->fgrowcxt);
-		st->fgrowcxt = NULL;
+		LionFactGroupState *fg = st->fg;
+
+		if (fg->cxt != NULL)
+		{
+			MemoryContextDelete(fg->cxt);
+			fg->cxt = NULL;
+		}
+		if (fg->rowcxt != NULL)
+		{
+			MemoryContextDelete(fg->rowcxt);
+			fg->rowcxt = NULL;
+		}
 	}
 	if (st->viscache != NULL)
 	{
