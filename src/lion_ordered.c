@@ -128,9 +128,9 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *					each column of the btree, the relation attno it returns,
  *					0 for one it does not (an expression); NIL in heap mode
  *	LO_PRIV_EXPECTED a float8 Const: the entries the planner expects the walk
- *					to visit (the ordered index's selectivity times the
- *					relation's tuples), for the switch's density gate (§40.4);
- *					0 for a lion column's walk
+ *					to visit (the ordered index's selectivity, or the walked
+ *					range's, times the relation's tuples), for the switch's
+ *					density gate (§40.4)
  *
  * and custom_exprs holds five lists:
  *
@@ -200,13 +200,27 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  * work for each of its posting sets, starting a stream again behind where it
  * stands LO_LAZY_RESTART_WORK more for each, and the build reads each of the
  * sets' containers once - the budget, never below LO_LAZY_MIN_WORK.  A walk
- * that has met LO_LAZY_MAX_WALK entries is built for too, so that the early
- * stop and the fetch-and-sort switch, which need the set's size, can act on
- * it; as is one whose memo has taken half of hash_mem.
+ * that has met LO_LAZY_WALK_WORK entries for each unit of the budget - and
+ * at least LO_SWITCH_MIN_WALK - is built for too, so that the early stop and
+ * the fetch-and-sort switch, which need the set's size, can act on it once
+ * the walk has cost about what the build will: an entry walked costs 30 to
+ * 70 ns, a unit of the build 350 (§30.4: 8.5 ms for a budget of 24,040);
+ * as is one whose memo has taken half of hash_mem.
  */
 #define LO_LAZY_MIN_WORK		64
 #define LO_LAZY_RESTART_WORK	4
-#define LO_LAZY_MAX_WALK		(4 * LO_SWITCH_MIN_WALK)
+#define LO_LAZY_WALK_WORK		8
+
+/*
+ * The set is started lazily only when the planner expects the walk to stop
+ * short: the node alone in its query under a LIMIT (and OFFSET) of fewer
+ * than LO_LAZY_MAX_SHARE of the rows it would return, or a walk expected to
+ * end before LO_SWITCH_MIN_WALK entries anyway.  A walk that goes on further
+ * meets most of the set's container keys - one in heap order passes over
+ * them once for each entry it walks - and a probe of a key costs more than
+ * the build's read of it, so the set is built at once.
+ */
+#define LO_LAZY_MAX_SHARE		0.2
 
 /*
  * ... and a walk that does not go in heap order is built for at once: once
@@ -230,7 +244,7 @@ typedef enum LoLazyWhy
 	LO_LAZY_HEAP_ORDER,			/* the walk does not go in heap order */
 	LO_LAZY_BUDGET,				/* the probes cost what the build would */
 	LO_LAZY_SWITCH,				/* the switch could be due */
-	LO_LAZY_LONG_WALK,			/* LO_LAZY_MAX_WALK entries met */
+	LO_LAZY_LONG_WALK,			/* LO_LAZY_WALK_WORK entries a unit met */
 	LO_LAZY_MEMO,				/* the memo outgrew half of hash_mem */
 	LO_LAZY_NWHY
 } LoLazyWhy;
@@ -254,6 +268,7 @@ static const char *const lo_lazy_why_names[LO_LAZY_NWHY] = {
 #define LO_FLAG_LIONWALK	0x0002	/* the order is a lion column's walk */
 #define LO_FLAG_INDEXONLY	0x0004	/* the values come from the btree (§40) */
 #define LO_FLAG_HEAPRECHECK	0x0008	/* the lion recheck reads the heap tuple */
+#define LO_FLAG_BUILD		0x0010	/* the set built at once, never lazily */
 
 /* ---------------------------------------------------------------------
  * The TID set
@@ -2268,6 +2283,27 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		flags |= LO_FLAG_LIONWALK;
 		nulls = lfourth_int(walkinfo);
 		walkattno = indexcol + 1;
+		expected = rel->tuples;
+		if (ordrinfos != NIL)
+			expected *= clauselist_selectivity(root, ordrinfos, rel->relid,
+											   JOIN_INNER, NULL);
+	}
+
+	/*
+	 * The set lazily only for a walk expected to stop short (§30.4): the
+	 * share of its walk a LIMIT on the node alone lets it go, and the entries
+	 * that comes to.
+	 */
+	{
+		double		share = 1.0;
+
+		if (root->limit_tuples > 0 &&
+			bms_membership(root->all_baserels) == BMS_SINGLETON &&
+			best_path->path.rows > 0)
+			share = Min(1.0, root->limit_tuples / best_path->path.rows);
+		if (share >= LO_LAZY_MAX_SHARE &&
+			share * expected >= LO_SWITCH_MIN_WALK)
+			flags |= LO_FLAG_BUILD;
 	}
 
 	if (lion != NULL)
@@ -3549,7 +3585,8 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->lionparams = pull_paramids((Expr *) lionquals);
 
 	/* the set evaluated lazily, when every leaf's keys can be sought (§30.4) */
-	st->lazyok = lion_enable_lazy_set && lo_lazy_ok(st);
+	st->lazyok = lion_enable_lazy_set &&
+		(lsecond_int(ints) & LO_FLAG_BUILD) == 0 && lo_lazy_ok(st);
 	if (st->lazyok)
 	{
 		st->lazycxt = AllocSetContextCreate(estate->es_query_cxt,
@@ -4090,11 +4127,11 @@ lo_sort_next(LionOrderedState *st, TupleTableSlot *slot)
  * Should the lazy set be built now, and why (LoLazyWhy), or -1: the walk
  * does not go in heap order, or the lazy set's probes have cost what
  * building it would, or the walk has gone as far as the switch would let it
- * go were the set as big as its entries' counts say - or far enough anyway
- * that the early stop and the switch should have the set's size to go by -
- * or the memo has outgrown its share of hash_mem (§30.4, "The set,
- * lazily").  Whether the switch comes is decided on the set built, so a
- * count that is off moves only when the set is built.
+ * go were the set as big as its entries' counts say - or has cost about what
+ * the build will, so that the early stop and the switch have the set's size
+ * to go by from there on - or the memo has outgrown its share of hash_mem
+ * (§30.4, "The set, lazily").  Whether the switch comes is decided on the
+ * set built, so a count that is off moves only when the set is built.
  */
 static int
 lo_lazy_why(LionOrderedState *st)
@@ -4106,7 +4143,8 @@ lo_lazy_why(LionOrderedState *st)
 		return LO_LAZY_BUDGET;
 	if (lo_switch_due(st, st->lazymembers))
 		return LO_LAZY_SWITCH;
-	if (st->scanwalked >= LO_LAZY_MAX_WALK)
+	if ((double) st->scanwalked >= Max((double) LO_SWITCH_MIN_WALK,
+									   LO_LAZY_WALK_WORK * st->lazybudget))
 		return LO_LAZY_LONG_WALK;
 	if (st->memobytes > st->limit / 2)
 		return LO_LAZY_MEMO;

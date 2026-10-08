@@ -366,13 +366,14 @@ SELECT ol_cmp($$SELECT id, g FROM lol
 
 -- a key of no entry makes its AND empty: no walk at all
 SELECT * FROM ol_run($$SELECT id FROM lol WHERE a = 'zz' AND b = 'b1' ORDER BY g LIMIT 5$$);
-         ol_run          
--------------------------
+            ol_run             
+-------------------------------
  Index Entries Walked: 0
  Lion Keys Walked: 0
  Lion Set Hits: 0
  Heap Fetches: 0
-(4 rows)
+ Lion Set: 0 containers, exact
+(5 rows)
 
 SELECT ol_cmp($$SELECT id, g FROM lol WHERE a = 'zz' AND b = 'b1' ORDER BY g, id LIMIT 5$$);
        ol_cmp        
@@ -452,18 +453,18 @@ SELECT ol_cmp($$SELECT id, k FROM lol WHERE a = 'a3' AND b = 'b4' ORDER BY k, id
  LionOrdered, 10 rows
 (1 row)
 
--- and a long walk: built once the probes have met every key of the set, the
--- members it met lazily counted as met, so the switch that follows fetches
--- none of them again (ordered_transitions.sql forces each other reason)
+-- and a walk with no LIMIT, which the planner expects to go far: the set
+-- built at the start, the switch following (ordered_transitions.sql forces
+-- each reason a lazy set is built for)
 SELECT * FROM ol_run($$SELECT id FROM lol
 	WHERE a IN ('a1', 'a2') AND b IN ('b1', 'b2', 'b3') ORDER BY g$$);
-                               ol_run                                
----------------------------------------------------------------------
+                            ol_run                             
+---------------------------------------------------------------
  Index Entries Walked: 14496
  Lion Keys Walked: 13
  Lion Set Hits: 166
  Heap Fetches: 619
- Lion Set: 35 containers, exact, after 35 keys probed (probe budget)
+ Lion Set: 35 containers, exact
  Switched to Fetch and Sort: 1 of 1 scans, 453 members fetched
 (6 rows)
 
