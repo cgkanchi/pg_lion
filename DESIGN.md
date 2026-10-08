@@ -10523,7 +10523,7 @@ or semi join has no row left, and an anti join's are every row, as when a filter
   lookup and a semi or inner join's run ends; a semi or anti join path's batch tested whole
   (`lion_join_count_batch()`) tests no key after it - those join nothing - and hands up what it
   tested, and its later batches are tested no more. The copy is set up as the counts' filters
-  (`joinsources`) even when empty, so that `joinfiltered` always means what the counts read. A
+  (`join->sources`) even when empty, so that `join->filtered` always means what the counts read. A
   partitioned fact's leaves already stopped at their turn's empty copy (`lion_join_count_parts()`),
   and that leaf has no turn after it.
 

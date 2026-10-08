@@ -240,7 +240,7 @@ lion_array_batch_prepare(LionCountScanState *st, int k, LionClauseState *cl)
 	int			nelems;
 	LionListBatch *lb;
 
-	if (st->hasgroupidx || st->joinclause >= 0 ||
+	if (st->hasgroupidx || st->join != NULL ||
 		lion_st_lbatch(st)->item >= 0 || cl->valisnull)
 		return false;
 	lb = st->lbatch;
@@ -1379,14 +1379,16 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 		 */
 		if (LION_TL_IS_CHILDCOL(kind))
 		{
-			if (st->childslot == NULL)
+			LionJoinState *js = lion_st_join(st);
+
+			if (js->childslot == NULL)
 			{
-				Assert(st->joinsum);
+				Assert(js->sum);
 				slot->tts_values[i] = (Datum) 0;
 				slot->tts_isnull[i] = true;
 				continue;
 			}
-			slot->tts_values[i] = slot_getattr(st->childslot,
+			slot->tts_values[i] = slot_getattr(js->childslot,
 											   LION_TL_CHILDRESNO(kind),
 											   &slot->tts_isnull[i]);
 			continue;

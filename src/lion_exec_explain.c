@@ -64,8 +64,8 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 				 * as core prints a join clause.
 				 */
 				val = deparse_expression((Node *) cl->valexpr, context,
-										 st->joinclause >= 0 &&
-										 cl == &st->clause[st->joinclause],
+										 st->join != NULL &&
+										 cl == &st->clause[st->join->clause],
 										 false);
 				if (cl->kind == LION_CLAUSE_ARRAY)
 					appendStringInfo(buf, "%s %s ANY (%s)", attname, opname,
@@ -566,9 +566,9 @@ lion_explain_indexes(LionCountScanState *st, List *ancestors,
 	 * The FK-side join's key first (DESIGN.md §27): the fk index and the
 	 * clause, whose value prints as the dimension column it is read from.
 	 */
-	if (st->joinclause >= 0)
+	if (st->join != NULL)
 	{
-		LionClauseState *cl = &st->clause[st->joinclause];
+		LionClauseState *cl = &st->clause[st->join->clause];
 
 		/* a partitioned fact table's fk index is one per partition (§16) */
 		if (st->npart == 0)
@@ -659,6 +659,7 @@ lion_explain_bounds(LionCountScanState *st, List *ancestors, ExplainState *es)
 static void
 lion_explain_join(LionCountScanState *st, ExplainState *es)
 {
+	LionJoinState *js = lion_st_join(st);
 	StringInfoData buf;
 	int			i;
 
@@ -667,10 +668,10 @@ lion_explain_join(LionCountScanState *st, ExplainState *es)
 	 * each DISTINCT key of the dimension, which it sorts to find them.
 	 */
 	/* ... which a semi or anti join path's name says (LionSemiJoin) */
-	if (!st->joinouter &&
-		(st->jointype == LION_JOIN_SEMI || st->joinunique))
+	if (!js->outer &&
+		(js->type == LION_JOIN_SEMI || st->joinunique))
 		ExplainPropertyText("Join Type", "Semi", es);
-	else if (!st->joinouter && st->jointype == LION_JOIN_ANTI)
+	else if (!js->outer && js->type == LION_JOIN_ANTI)
 		ExplainPropertyText("Join Type", "Anti", es);
 	if (st->joinunique)
 		ExplainPropertyText("Join Keys", "distinct, sorted", es);
@@ -686,30 +687,30 @@ lion_explain_join(LionCountScanState *st, ExplainState *es)
 	 * §27, "The semi and anti join as a join path"), in the child's order
 	 * where the path claims it.
 	 */
-	if (st->joinouter)
+	if (js->outer)
 		ExplainPropertyText("Join Rows",
-							st->jointype == LION_JOIN_ANTI ?
-							(st->joinordered ?
+							js->type == LION_JOIN_ANTI ?
+							(js->ordered ?
 							 "the outer rows without a match, in their order" :
 							 "the outer rows without a match") :
-							(st->joinordered ?
+							(js->ordered ?
 							 "the outer rows with a match, in their order" :
 							 "the outer rows with a match"), es);
-	else if (st->joinrows)
+	else if (js->rows)
 		ExplainPropertyText("Join Rows",
-							st->jointype == LION_JOIN_ANTI ?
+							js->type == LION_JOIN_ANTI ?
 							"the dimension rows without a match" :
 							st->joinunique ?
-							(st->joincounts ?
+							(js->counts ?
 							 "the distinct keys with a match, each with its count" :
 							 "the distinct keys with a match") :
-							st->joincounts ?
+							js->counts ?
 							"the dimension rows with a match, each with its count" :
 							"the dimension rows with a match", es);
-	if (st->joincollect)
+	if (js->collect)
 		ExplainPropertyText("Fact Filters", "collected once", es);
 	else if (es->analyze &&
-			 st->joinswitches + st->joinworkerswitches > 0)
+			 js->switches + st->joinworkerswitches > 0)
 		ExplainPropertyText("Fact Filters", "probed, then collected", es);
 
 	/*
@@ -1154,6 +1155,8 @@ lion_explain_fact_filter_counters(LionCountScanState *st,
 								  const LionCountStats *tot, int64 switches,
 								  bool switched, ExplainState *es)
 {
+	LionJoinState *js = lion_st_join(st);
+
 	/*
 	 * The rows of the collected fact filters, or -1 when the plan
 	 * collected them and the run could not (a standby) and every
@@ -1161,9 +1164,9 @@ lion_explain_fact_filter_counters(LionCountScanState *st,
 	 * largest copy any participant made, which is the one they all
 	 * read when they share it.
 	 */
-	if (st->joincollect || switched)
+	if (js->collect || switched)
 		ExplainPropertyInteger("Fact Filter Rows Collected", NULL,
-							   Max(st->joinfilterrows,
+							   Max(js->filterrows,
 								   st->joinworkerfilterrows), es);
 
 	/*
@@ -1172,9 +1175,9 @@ lion_explain_fact_filter_counters(LionCountScanState *st,
 	 * copy shared by the participants (any of whose chunks went to
 	 * a file).  Only when there were any.
 	 */
-	if (st->joinspilled + st->joinworkerspilled > 0)
+	if (js->spilled + st->joinworkerspilled > 0)
 		ExplainPropertyInteger("Fact Filter Copies Spilled", NULL,
-							   st->joinspilled + st->joinworkerspilled,
+							   js->spilled + st->joinworkerspilled,
 							   es);
 
 	/*
@@ -1204,7 +1207,7 @@ lion_explain_fact_filter_counters(LionCountScanState *st,
 		ExplainPropertyInteger("Fact Filter Switches", NULL,
 							   switches, es);
 		ExplainPropertyInteger("Fact Filter Keys Probed", NULL,
-							   st->joinswitchkeys +
+							   js->switchkeys +
 							   st->joinworkerswitchkeys, es);
 	}
 
@@ -1214,7 +1217,7 @@ lion_explain_fact_filter_counters(LionCountScanState *st,
 	 * a spilled copy's temporary file - one read each, never the
 	 * copy again.
 	 */
-	if (st->joincollect || switched)
+	if (js->collect || switched)
 	{
 		ExplainPropertyInteger("Fact Filter Copy Containers Read", NULL,
 							   tot->copy_containers, es);
@@ -1233,7 +1236,8 @@ static void
 lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 						   ExplainState *es)
 {
-	int64		switches = st->joinswitches + st->joinworkerswitches;
+	LionJoinState *js = lion_st_join(st);
+	int64		switches = js->switches + st->joinworkerswitches;
 	bool		switched = (switches > 0);
 	int			i;
 
@@ -1270,12 +1274,12 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 	 * that many times the dimension's rows - ...
 	 */
 	ExplainPropertyInteger("Join Child Rows", NULL,
-						   st->joinchildrows + st->joinworkerchildrows,
+						   js->childrows + st->joinworkerchildrows,
 						   es);
 	ExplainPropertyInteger("Join Keys Looked Up", NULL,
-						   st->joinlookups + st->joinworkerlookups, es);
+						   js->lookups + st->joinworkerlookups, es);
 	ExplainPropertyInteger("Join Keys Without Entry", NULL,
-						   st->joinmissing + st->joinworkermissing, es);
+						   js->missing + st->joinworkermissing, es);
 
 	/* ... and counted in each group of a fact column grouped by */
 	if (st->fg != NULL)
@@ -1293,7 +1297,7 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 	ExplainPropertyInteger("Join Key Containers Read", NULL,
 						   tot->key_containers, es);
 	ExplainPropertyInteger("Join Posting Pages Read", NULL,
-						   st->joinposting + st->joinworkerposting, es);
+						   js->posting + st->joinworkerposting, es);
 	ExplainPropertyInteger("Visibility Map Checks", NULL,
 						   tot->vm_checks, es);
 	ExplainPropertyInteger("Visibility Map Pages Pinned", NULL,
@@ -1327,9 +1331,9 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 
 		for (i = 0; i < LION_JT_N; i++)
 		{
-			instr_time	t = st->jointime[i];
+			instr_time	t = js->time[i];
 
-			if (i == LION_JT_COLLECT && !st->joincollect && !switched)
+			if (i == LION_JT_COLLECT && !js->collect && !switched)
 				continue;
 			INSTR_TIME_ADD(t, st->joinworkertime[i]);
 			ExplainPropertyFloat(phasename[i], "ms",
@@ -1360,7 +1364,7 @@ lion_explain_analyze(LionCountScanState *st, ExplainState *es)
 	 * looked up (a NULL key joins nothing and is not), and how many of
 	 * those keys have no entry in the fk index at all.
 	 */
-	if (st->joinclause >= 0)
+	if (st->join != NULL)
 		lion_explain_join_counters(st, &tot, es);
 }
 
@@ -1395,7 +1399,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 	 * whether the fact filters are collected once for all of them.  An inner
 	 * join that reads the filters per count prints neither, as it always has.
 	 */
-	if (st->joinclause >= 0)
+	if (st->join != NULL)
 		lion_explain_join(st, es);
 
 	lion_explain_group_keys(st, ancestors, es);
