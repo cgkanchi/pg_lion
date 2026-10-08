@@ -2835,6 +2835,7 @@ static void
 lion_wagg_add(LionCountScanState *st, int c, Datum key, bool isnull,
 			  int64 rows)
 {
+	LionWaggState *wg = lion_st_wagg(st);
 	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
 	TupleTableSlot *slot = st->css.ss.ss_ScanTupleSlot;
 	bool		slotset = false;
@@ -2843,9 +2844,9 @@ lion_wagg_add(LionCountScanState *st, int c, Datum key, bool isnull,
 	if (rows <= 0)
 		return;
 	ResetExprContext(econtext);
-	for (i = 0; i < st->nwagg; i++)
+	for (i = 0; i < wg->nagg; i++)
 	{
-		LionWAgg   *a = &st->wagg[i];
+		LionWAgg   *a = &wg->agg[i];
 		Datum		v;
 		bool		vnull;
 
@@ -2869,8 +2870,8 @@ lion_wagg_add(LionCountScanState *st, int c, Datum key, bool isnull,
 					slot->tts_values[j] = (Datum) 0;
 					slot->tts_isnull[j] = true;
 				}
-				slot->tts_values[st->wcol[c].slotcol] = key;
-				slot->tts_isnull[st->wcol[c].slotcol] = isnull;
+				slot->tts_values[wg->col[c].slotcol] = key;
+				slot->tts_isnull[wg->col[c].slotcol] = isnull;
 				ExecStoreVirtualTuple(slot);
 				econtext->ecxt_scantuple = slot;
 				slotset = true;
@@ -2901,7 +2902,7 @@ lion_wagg_add(LionCountScanState *st, int c, Datum key, bool isnull,
 					DatumGetBool(FunctionCall2Coll(&a->cmp, a->collation, v,
 												   a->ext)))
 				{
-					MemoryContext oldcxt = MemoryContextSwitchTo(st->wcxt);
+					MemoryContext oldcxt = MemoryContextSwitchTo(wg->cxt);
 
 					if (a->hasext && !a->typbyval)
 						pfree(DatumGetPointer(a->ext));
@@ -2952,14 +2953,15 @@ typedef struct LionWBatch
 static bool
 lion_wagg_unchanged(LionCountScanState *st, BlockNumber before)
 {
+	LionWaggState *wg = lion_st_wagg(st);
 	BlockNumber after;
 	int			c;
 
 	if (!lion_heap_all_visible(st->heap, &after) || after != before)
 		return false;
-	for (c = 0; c < st->nwcol; c++)
+	for (c = 0; c < wg->ncol; c++)
 	{
-		if (lion_wagg_bulkdeletes(st->wcol[c].idx) != st->wcol[c].bulkdeletes)
+		if (lion_wagg_bulkdeletes(wg->col[c].idx) != wg->col[c].bulkdeletes)
 			return false;
 	}
 	return true;
@@ -2999,7 +3001,7 @@ lion_wagg_defer(LionCountScanState *st, LionWBatch *b, int c,
 	LionWPending *p;
 
 	if (b->cxt == NULL)
-		b->cxt = AllocSetContextCreate(st->wcxt,
+		b->cxt = AllocSetContextCreate(lion_st_wagg(st)->cxt,
 									   "LionCount keys awaiting a look",
 									   ALLOCSET_DEFAULT_SIZES);
 	if (b->n > 0 &&
@@ -3039,16 +3041,17 @@ lion_wagg_defer(LionCountScanState *st, LionWBatch *b, int c,
 static bool
 lion_wagg_walk(LionCountScanState *st, int c, LionWBatch *batch)
 {
-	LionWCol   *wc = &st->wcol[c];
+	LionWaggState *wg = lion_st_wagg(st);
+	LionWCol   *wc = &wg->col[c];
 	LionEntryScan es;
 	MemoryContext oldcxt;
 	bool		defer = false;
 	bool		ok = true;
 	int			i;
 
-	for (i = 0; batch != NULL && i < st->nwagg; i++)
+	for (i = 0; batch != NULL && i < wg->nagg; i++)
 	{
-		if (st->wagg[i].col == c && !st->wagg[i].argiskey)
+		if (wg->agg[i].col == c && !wg->agg[i].argiskey)
 			defer = true;
 	}
 
@@ -3105,7 +3108,7 @@ lion_wagg_walk(LionCountScanState *st, int c, LionWBatch *batch)
 			lion_posting_set_release(&ps);
 			lion_wagg_add(st, c, key, isnull, rows);
 		}
-		st->wentries++;
+		wg->entries++;
 		MemoryContextSwitchTo(oldcxt);
 	}
 	lion_entry_scan_end(&es);
@@ -3116,13 +3119,14 @@ lion_wagg_walk(LionCountScanState *st, int c, LionWBatch *batch)
 static void
 lion_wagg_reset(LionCountScanState *st)
 {
+	LionWaggState *wg = lion_st_wagg(st);
 	int			i;
 
-	if (st->wcxt != NULL)
-		MemoryContextReset(st->wcxt);
-	for (i = 0; i < st->nwagg; i++)
+	if (wg->cxt != NULL)
+		MemoryContextReset(wg->cxt);
+	for (i = 0; i < wg->nagg; i++)
 	{
-		LionWAgg   *a = &st->wagg[i];
+		LionWAgg   *a = &wg->agg[i];
 
 #ifdef HAVE_INT128
 		a->sum = 0;
@@ -3181,19 +3185,20 @@ void
 lion_wagg_run(LionCountScanState *st)
 {
 	EState	   *estate = st->css.ss.ps.state;
+	LionWaggState *wg = lion_st_wagg(st);
 	BlockNumber before;
 	bool		fast;
 	int			c;
 	int			i;
 
-	if (st->wcxt == NULL)
-		st->wcxt = AllocSetContextCreate(estate->es_query_cxt,
-										 "LionCount aggregates over keys",
-										 ALLOCSET_DEFAULT_SIZES);
-	for (c = 0; c < st->nwcol; c++)
+	if (wg->cxt == NULL)
+		wg->cxt = AllocSetContextCreate(estate->es_query_cxt,
+										"LionCount aggregates over keys",
+										ALLOCSET_DEFAULT_SIZES);
+	for (c = 0; c < wg->ncol; c++)
 	{
-		if (st->wcol[c].idx == NULL)
-			st->wcol[c].idx = index_open(st->wcol[c].idxoid, AccessShareLock);
+		if (wg->col[c].idx == NULL)
+			wg->col[c].idx = index_open(wg->col[c].idxoid, AccessShareLock);
 	}
 	PredicateLockRelation(st->heap, estate->es_snapshot);
 
@@ -3201,8 +3206,8 @@ lion_wagg_run(LionCountScanState *st)
 	fast = !RecoveryInProgress();
 	if (fast)
 	{
-		for (c = 0; c < st->nwcol; c++)
-			st->wcol[c].bulkdeletes = lion_wagg_bulkdeletes(st->wcol[c].idx);
+		for (c = 0; c < wg->ncol; c++)
+			wg->col[c].bulkdeletes = lion_wagg_bulkdeletes(wg->col[c].idx);
 		fast = lion_heap_all_visible(st->heap, &before);
 	}
 	if (fast)
@@ -3220,7 +3225,7 @@ lion_wagg_run(LionCountScanState *st)
 		 * --enable-injection-points.
 		 */
 		LION_INJECTION_POINT("lion-wagg-looked");
-		for (c = 0; fast && c < st->nwcol; c++)
+		for (c = 0; fast && c < wg->ncol; c++)
 			fast = lion_wagg_walk(st, c, &batch);
 
 		/*
@@ -3236,21 +3241,21 @@ lion_wagg_run(LionCountScanState *st)
 			lion_wagg_flush(st, &batch);
 		if (batch.cxt != NULL)
 			MemoryContextDelete(batch.cxt);
-		st->wfast += st->nwcol;
+		wg->fast += wg->ncol;
 		if (!fast)
 			lion_wagg_reset(st);
 	}
 	if (!fast)
 	{
-		for (c = 0; c < st->nwcol; c++)
+		for (c = 0; c < wg->ncol; c++)
 			(void) lion_wagg_walk(st, c, NULL);
-		st->wslow += st->nwcol;
+		wg->slow += wg->ncol;
 	}
 
-	for (i = 0; i < st->nwagg; i++)
+	for (i = 0; i < wg->nagg; i++)
 	{
-		LionWAgg   *a = &st->wagg[i];
-		MemoryContext oldcxt = MemoryContextSwitchTo(st->wcxt);
+		LionWAgg   *a = &wg->agg[i];
+		MemoryContext oldcxt = MemoryContextSwitchTo(wg->cxt);
 
 		a->resnull = true;
 		switch (a->kind)
@@ -3303,10 +3308,10 @@ lion_wagg_run(LionCountScanState *st)
 		MemoryContextSwitchTo(oldcxt);
 	}
 
-	for (c = 0; c < st->nwcol; c++)
+	for (c = 0; c < wg->ncol; c++)
 	{
-		index_close(st->wcol[c].idx, AccessShareLock);
-		st->wcol[c].idx = NULL;
+		index_close(wg->col[c].idx, AccessShareLock);
+		wg->col[c].idx = NULL;
 	}
 }
 

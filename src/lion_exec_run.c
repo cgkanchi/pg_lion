@@ -385,10 +385,11 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 				 * ... and the aggregates over lion columns' entries
 				 * (DESIGN.md §37), beside the counts or without any.
 				 */
-				int64		total = (st->nwagg == 0 || st->wneedcount) ?
+				bool		hasagg = (st->wagg != NULL && st->wagg->nagg > 0);
+				int64		total = (!hasagg || st->wagg->needcount) ?
 					lion_sumall_relation(st) : 0;
 
-				if (st->nwagg > 0)
+				if (hasagg)
 					lion_wagg_run(st);
 				st->done = true;
 
