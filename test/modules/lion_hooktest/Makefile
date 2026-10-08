@@ -7,7 +7,7 @@ PGFILEDESC = "lion_hooktest - test-only hook and table-AM companion for pg_lion"
 
 # The tests are chosen per server configuration by test/hook-check.sh, which
 # passes REGRESS itself; this default is what runs with nothing preloaded.
-REGRESS ?= tableam priv_decode hooks_setup hooks_lion_outer
+REGRESS ?= tableam priv_decode exec_hook hooks_setup hooks_lion_outer
 REGRESS_OPTS = --inputdir=. --outputdir=.
 
 # pg_lion's own headers, for the decoder test (lion_hooktest_priv_decode())
