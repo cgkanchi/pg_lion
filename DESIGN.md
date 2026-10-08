@@ -5371,7 +5371,7 @@ index small enough for the cost model to have chosen this plan. The alternative 
 index's entry scan once per OUTER group - needs no memory but re-reads every bucket page of the
 inner index `outer_entries` times; it is kept as the FALLBACK for when the keys do not fit the
 `work_mem` budget (checked every 256 keys with `MemoryContextMemAllocated()`), because the §16
-lesson is that a plan-time bound is only as good as `estimate_num_groups`. `innerkey == NULL` selects
+lesson is that a plan-time bound is only as good as `estimate_num_groups`. `inner->key == NULL` selects
 that path, and then the inner key lives in the per-pair context like a single-column group's does.
 The walk itself does not: it outlives every pair of its outer group, and the contexts its position
 and batch live in are created under whatever context is current when it begins, so it begins in the
