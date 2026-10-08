@@ -6,6 +6,8 @@
 -- writes.  Only differences print.
 \set VERBOSITY terse
 SET client_min_messages = warning;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
 SELECT setseed(0.17) IS NULL AS seeded;
  seeded 
@@ -29,9 +31,9 @@ FROM (SELECT i, (SELECT string_agg(format('%s:%s%s',
 				 FROM generate_series(1, 1 + (random()*8)::int) p
 				 WHERE i > 0)::tsvector AS d
 	  FROM generate_series(1, 6000) i) s;
-CREATE TABLE px_l AS SELECT * FROM px; CREATE INDEX px_l_i ON px_l USING lion (tsv);
-CREATE TABLE px_lp AS SELECT * FROM px; CREATE INDEX px_lp_i ON px_lp USING lion (tsv) WITH (store_positions = true);
-VACUUM ANALYZE px, px_l, px_lp;
+CREATE TABLE px_l WITH (autovacuum_enabled = off) AS SELECT * FROM px; CREATE INDEX px_l_i ON px_l USING lion (tsv);
+CREATE TABLE px_lp WITH (autovacuum_enabled = off) AS SELECT * FROM px; CREATE INDEX px_lp_i ON px_lp USING lion (tsv) WITH (store_positions = true);
+VACUUM (FREEZE, ANALYZE) px, px_l, px_lp;
 CREATE FUNCTION px_ids(tab text, q tsquery, mode text) RETURNS int[] LANGUAGE plpgsql AS $$
 DECLARE r int[];
 BEGIN
