@@ -16,6 +16,20 @@
 static TupleTableSlot *lion_exec_custom_scan_internal(CustomScanState *node);
 
 /*
+ * The group of c of GROUP BY coalesce(g, c) (DESIGN.md §10), not yet counted
+ * or emitted: before each entry walk that may meet it.
+ */
+static void
+lion_coal_reset(LionCountScanState *st)
+{
+	if (st->coal != NULL)
+	{
+		st->coal->count = 0;
+		st->coal->walked = false;
+	}
+}
+
+/*
  * Walk one partition without a group key: its turn, in which it is the
  * relation counted - its clauses located, it counted, and everything it
  * located let go of again (DESIGN.md §16).
@@ -86,8 +100,7 @@ lion_next_partial_group(LionCountScanState *st)
 											st->hasrange ? &st->range : NULL);
 				st->scanning = true;
 				/* each partition's group of c is its own partial row */
-				st->coalcount = 0;
-				st->coalwalked = false;
+				lion_coal_reset(st);
 			}
 		}
 
@@ -452,8 +465,7 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		lion_entry_scan_begin_range(&st->escan, st->groupidx, st->groupidxcol,
 									st->hasrange ? &st->range : NULL);
 		st->scanning = true;
-		st->coalcount = 0;
-		st->coalwalked = false;
+		lion_coal_reset(st);
 	}
 
 	/* ---- GROUP BY: one row per non-empty group ---- */
@@ -492,8 +504,7 @@ lion_reset_run(LionCountScanState *st)
 	lion_posting_set_release(&st->groupset2);
 	st->outeropen = false;
 	st->inneridx = 0;
-	st->coalcount = 0;
-	st->coalwalked = false;
+	lion_coal_reset(st);
 	lion_decode_reset(st);
 	lion_release_where(st);
 
