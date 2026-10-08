@@ -672,43 +672,15 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 	lion_check_aggregate_execute(F_COUNT_);
 
 	/*
-	 * Row-level security: the policies would have to be evaluated per row,
-	 * and the whole point of this count is not to look at rows.  Refuse.
-	 * The same query through the planner still works: the pushdown declines
-	 * relations with security quals and the ordinary plan applies them.
-	 */
-	if (check_enable_rls(heapoid, InvalidOid, false) == RLS_ENABLED)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("cannot count through index \"%s\" because row-level security is enabled on table \"%s\"",
-						RelationGetRelationName(call->index[0]),
-						RelationGetRelationName(call->heap))));
-
-	/*
-	 * Snapshot eligibility.  The planner decides this for a query that
-	 * mentions the table; a direct SQL count was handed an index nobody
-	 * vetted, so it asks the same question itself - once the snapshot is
-	 * known, which is why this is the last thing lion_count_sql() does before
-	 * the lookup.  An index that indcheckxmin makes unusable does not contain
-	 * the HOT-chain versions an old snapshot still sees, and rechecking
-	 * cannot invent a TID that is not in the posting set (DESIGN.md §9).
+	 * Row-level security, snapshot eligibility and the predicate lock, as
+	 * for every direct reader (lion_reader_vet()).  The snapshot is known by
+	 * now, which is why this is the last thing done before the lookup; the
+	 * lock is taken before looking, so that an absent key is covered too:
+	 * otherwise two SERIALIZABLE transactions could each count an absent
+	 * key, insert it, and both commit.
 	 */
 	for (i = 0; i < nidx; i++)
-	{
-		const char *why;
-
-		if (!lion_index_usable(call->index[i], snapshot, &why))
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("cannot count through index \"%s\" because %s",
-							RelationGetRelationName(call->index[i]), why)));
-
-		/*
-		 * And none at all under PostgreSQL 16's old_snapshot_threshold, which
-		 * the planner's pushdown declines for the same reason (DESIGN.md §9).
-		 */
-		lion_check_old_snapshot(call->index[i], snapshot);
-	}
+		lion_reader_vet(call->heap, call->index[i], snapshot, "count");
 }
 
 /*
@@ -764,23 +736,12 @@ lion_count_sql(FunctionCallInfo fcinfo, int nkeys, LionCountStats *stats)
 	LionCountCall call;
 	Snapshot	snapshot;
 	int64		result;
-	int			i;
 
 	snapshot = GetActiveSnapshot();
 	if (snapshot == NULL)
 		elog(ERROR, "lion index count requires an active snapshot");
 
 	lion_count_sql_open(fcinfo, nkeys, snapshot, &call);
-
-	/*
-	 * index_beginscan() takes a relation-level predicate lock on an index
-	 * whose AM has no ampredlocks (indexam.c).  We read the index without a
-	 * scan, so take the same lock ourselves - before looking, so that an
-	 * absent key is covered too: otherwise two SERIALIZABLE transactions could
-	 * each count an absent key, insert it, and both commit.
-	 */
-	for (i = 0; i < nkeys; i++)
-		PredicateLockRelation(call.index[i], snapshot);
 
 	result = lion_count_keys(call.heap, snapshot, nkeys, call.index,
 							call.key, call.keytype, stats);
@@ -962,7 +923,6 @@ lion_index_count_any(PG_FUNCTION_ARGS)
 	keycoll = lion_count_arg_collation(fcinfo, 1);
 	lion_count_open_indexes(snapshot, 1, &idxoid, &elemtype, &keycoll, 0,
 						   &call);
-	PredicateLockRelation(call.index[0], snapshot);
 
 	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
 	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
@@ -1071,8 +1031,6 @@ lion_index_count_group_stats(PG_FUNCTION_ARGS)
 	}
 
 	lion_count_open_indexes(snapshot, 1, &idxoid, NULL, NULL, attno, &call);
-
-	PredicateLockRelation(call.index[0], snapshot);
 
 	memset(&stats, 0, sizeof(stats));
 	/* use_cache = false is the pre-cache behaviour, for an A/B in one query */

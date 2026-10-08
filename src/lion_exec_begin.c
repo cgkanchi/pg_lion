@@ -580,12 +580,12 @@ lion_open_relation(LionCountScanState *st, int p)
 		for (i = 0; i < st->nclause; i++)
 		{
 			if (st->clause[i].idx != NULL)
-				PredicateLockRelation(st->clause[i].idx, snapshot);
+				lion_reader_lock(st->clause[i].idx, snapshot);
 		}
 		if (st->groupidx != NULL)
-			PredicateLockRelation(st->groupidx, snapshot);
+			lion_reader_lock(st->groupidx, snapshot);
 		if (st->groupidx2 != NULL)
-			PredicateLockRelation(st->groupidx2, snapshot);
+			lion_reader_lock(st->groupidx2, snapshot);
 		if (st->decode != NULL)
 		{
 			int			c;
@@ -593,7 +593,7 @@ lion_open_relation(LionCountScanState *st, int p)
 			for (c = 0; c < st->decode->ncol; c++)
 			{
 				if (st->decode->idx[c] != NULL)
-					PredicateLockRelation(st->decode->idx[c], snapshot);
+					lion_reader_lock(st->decode->idx[c], snapshot);
 			}
 		}
 	}
