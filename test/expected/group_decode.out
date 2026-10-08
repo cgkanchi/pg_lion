@@ -260,7 +260,7 @@ SELECT a, b, c, count(*) FROM lgd WHERE e GROUP BY a, b, c ORDER BY count(*) DES
 (5 rows)
 
 -- A work_mem too small for one pass: the first column's values are taken a
--- few at a time and the others' in chunks, and the tally spills.
+-- few at a time and the others' in chunks.
 SET work_mem = '64kB';
 SELECT lgd_check('SELECT a, b, c, d, e, count(*) AS n FROM lgd GROUP BY a, b, c, d, e');
                          lgd_check                         
