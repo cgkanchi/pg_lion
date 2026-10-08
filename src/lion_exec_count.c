@@ -155,8 +155,9 @@ lion_node_count(LionCountScanState *st, int nsource, LionCountSource *sources,
 static int64
 lion_count_batched(LionCountScanState *st)
 {
-	LionClauseState *cl = &st->clause[st->item[st->batchitem].clauseno];
-	LionCountSource *src = &st->sources[st->batchitem + 1];
+	LionListBatch *lb = lion_st_lbatch(st);
+	LionClauseState *cl = &st->clause[st->item[lb->item].clauseno];
+	LionCountSource *src = &st->sources[lb->item + 1];
 	int			batch = lion_array_batch_size();
 	MemoryContext batchcxt;
 	MemoryContext oldcxt;
@@ -165,26 +166,25 @@ lion_count_batched(LionCountScanState *st)
 
 	batchcxt = AllocSetContextCreate(st->wherecxt, "LionCount list batch",
 									 ALLOCSET_DEFAULT_SIZES);
-	while (start < st->nbatchval)
+	while (start < lb->nval)
 	{
-		int			end = start + Min(batch, st->nbatchval - start);
+		int			end = start + Min(batch, lb->nval - start);
 		LionPostingSet *sets;
 		int			nsets;
 		int			nfound;
 		int			i;
 
-		while (end < st->nbatchval &&
-			   st->batchhash[end] == st->batchhash[end - 1])
+		while (end < lb->nval && lb->hash[end] == lb->hash[end - 1])
 			end++;
 
-		st->listbatches++;
+		lb->batches++;
 		oldcxt = MemoryContextSwitchTo(batchcxt);
 		sets = (LionPostingSet *)
 			palloc_extended(sizeof(LionPostingSet) * (end - start),
 							MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
 		nsets = lion_posting_set_lookup_many_col(cl->idx, cl->idxcol,
-												 st->batchtype, end - start,
-												 &st->batchval[start], NULL,
+												 lb->type, end - start,
+												 &lb->val[start], NULL,
 												 sets, &nfound);
 		src->sets = sets;
 		src->nsets = nsets;
@@ -233,7 +233,7 @@ lion_count_relation(LionCountScanState *st)
 		return 0;
 
 	/* the positive list is there, so this is never the filtered scan below */
-	if (st->batchitem >= 0)
+	if (st->lbatch != NULL && st->lbatch->item >= 0)
 		return lion_count_batched(st);
 
 	MemoryContextReset(st->pergroup);
