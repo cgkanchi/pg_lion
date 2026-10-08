@@ -1671,6 +1671,71 @@ typedef struct LionJoinBatch
 } LionJoinBatch;
 
 /*
+ * A partitioned fact table (DESIGN.md §27, "A partitioned fact table"): every
+ * batch of keys is taken to each leaf partition in turn, and each key's
+ * counts added up in its entry (LionJoinEnt.acc).  leaf is the partitions'
+ * state from batch to batch, one per leaf, their copies in cxt; visitcxt is
+ * one partition's turn - its walk of the fk index, begun again each turn - and
+ * order the order the batch is sorted in, which a partition whose fk index
+ * orders its keys another way sorts it into again.  runfilterrows is the
+ * run's copies' rows, summed.  leaf is NULL, and the contexts too, for a
+ * plain fact table.
+ */
+typedef struct LionJoinParts
+{
+	LionJoinPart *leaf;
+	MemoryContext cxt;
+	MemoryContext visitcxt;
+	LionWalkOrder order;
+	int64		runfilterrows;
+} LionJoinParts;
+
+/*
+ * One copy per query (DESIGN.md §27, "One copy per query"): in a parallel
+ * plan whose workers started, the fact filters are collected once, by all the
+ * participants together, into copy in the Gather's dynamic shared memory, and
+ * the join's filter is this participant's view of it (viewshared).  pcxt is
+ * the leader's parallel context, which says whether any worker started.
+ * copies counts the shared copies this participant indexed - one a run - and
+ * chunks the chunks of them it collected, for EXPLAIN ANALYZE.  They are
+ * NULL, false and zero outside a parallel plan.
+ */
+typedef struct LionJoinPcopy
+{
+	struct LionSharedCopy *copy;
+	ParallelContext *pcxt;
+	bool		viewshared;
+	int64		copies;
+	int64		chunks;
+} LionJoinPcopy;
+
+/*
+ * The workers' sums of a parallel FK-side join's counters (DESIGN.md §27,
+ * "Parallel"), which the leader copies out of the scan's shared struct at
+ * shutdown (lion_shutdown_custom_scan()) for EXPLAIN ANALYZE: the keys'
+ * counters, the fact filters' copies, a probing plan's switches, and where a
+ * key's time goes (childrows, posting and time).  filterrows is the largest
+ * copy any worker made, -1 when none did; sorted the keys a participant
+ * sorted, summed over the runs.  Zero (and -1) outside a parallel plan.
+ */
+typedef struct LionJoinWorkerSums
+{
+	int64		lookups;
+	int64		missing;
+	int64		filterrows;
+	int64		spilled;
+	int64		sorted;
+	int64		batches;
+	int64		copies;
+	int64		copychunks;
+	int64		switches;
+	int64		switchkeys;
+	int64		childrows;
+	int64		posting;
+	instr_time	time[LION_JT_N];
+} LionJoinWorkerSums;
+
+/*
  * The FK-side join (DESIGN.md §27).  clause is the clause that is the join
  * key; its value is column keyresno of the child plan's current row,
  * childslot, which is also where the target list's dimension columns are
@@ -1709,8 +1774,11 @@ typedef struct LionJoinBatch
  * (LION_JT_*).  The count's own counters are in the scan's stats
  * (LionCountStats: key_containers, copy_containers, ...).
  *
- * The workers' sums of these counters stay in the scan state
- * (joinworker*), with the rest of a parallel plan's.
+ * A partitioned fact table's turns (part), the parallel plan's shared copy of
+ * the fact filters (pcopy) and the workers' sums of these counters (worker)
+ * are groups of their own.  What every participant of a parallel plan adds
+ * up, and the workers' sums of the scan's own counters, stay in the scan
+ * state, which a parallel GROUP BY shares them with.
  */
 typedef struct LionJoinState
 {
@@ -1757,6 +1825,9 @@ typedef struct LionJoinState
 
 	LionJoinSort sort;
 	LionJoinBatch batch;
+	LionJoinParts part;
+	LionJoinPcopy pcopy;
+	LionJoinWorkerSums worker;
 } LionJoinState;
 
 /*
@@ -2151,82 +2222,26 @@ typedef struct LionCountScanState
 
 	/*
 	 * The FK-side join (DESIGN.md §27): its plan's flags, its child, its
-	 * keys' counters, its fact filters' copy and what it sorts and batches,
-	 * or NULL for every other shape (lion_st_join()).  A partitioned fact
-	 * table's turns and what the participants of a parallel plan share are
-	 * below.
+	 * keys' counters, its fact filters' copy, what it sorts and batches, a
+	 * partitioned fact table's turns, the shared copy of a parallel plan and
+	 * its workers' sums, or NULL for every other shape (lion_st_join()).
 	 */
 	struct LionJoinState *join;
 
 	/*
-	 * The workers' sums of a probing plan's switches (LionJoinState's
-	 * switches and switchkeys), for EXPLAIN ANALYZE.
-	 */
-	int64		joinworkerswitches;
-	int64		joinworkerswitchkeys;
-
-	/*
-	 * A partitioned fact table (DESIGN.md §27, "A partitioned fact table"):
-	 * every batch of keys is taken to each leaf partition in turn, and each
-	 * key's counts added up in its entry (LionJoinEnt.acc).  joinpart is the
-	 * partitions' state from batch to batch, their copies in joinpartcxt;
-	 * joinvisitcxt is one partition's turn - its walk of the fk index, begun
-	 * again each turn - and joinorder the order the batch is sorted in, which
-	 * a partition whose fk index orders its keys another way sorts it into
-	 * again.  joinrunfilterrows is the run's copies' rows, summed.
-	 */
-	LionJoinPart *joinpart;
-	MemoryContext joinpartcxt;
-	MemoryContext joinvisitcxt;
-	LionWalkOrder joinorder;
-	int64		joinrunfilterrows;
-
-	/*
-	 * A parallel FK-side join (DESIGN.md §27, "Parallel"): every participant
-	 * counts the dimension rows its share of the child returns and adds what
+	 * A parallel FK-side join (DESIGN.md §27, "Parallel") or GROUP BY
+	 * (DESIGN.md §10, "A GROUP BY in parallel"): every participant adds what
 	 * EXPLAIN ANALYZE reports into shared, in the dynamic shared memory of
-	 * the Gather above it, when it shuts down; the leader copies the sums
-	 * into the joinworker fields before that memory goes.  They are NULL,
-	 * zero and -1 outside a parallel plan.  A parallel GROUP BY (ranged)
-	 * keeps its ranges and its counters' sums in the same struct.
+	 * the Gather above it, when it shuts down - a worker once, which reported
+	 * says - and the leader copies the sums before that memory goes: the
+	 * scan's own counters into workerstats and workerdirpages, and a join's
+	 * or a ranged GROUP BY's into their own state.  shared is NULL outside a
+	 * parallel plan, and the sums zero.
 	 */
 	struct LionJoinShared *shared;
-	bool		joinreported;
-
-	/*
-	 * One copy per query (DESIGN.md §27, "One copy per query"): in a parallel
-	 * plan whose workers started, the fact filters are collected once, by all
-	 * the participants together, into joinsharedcopy in the Gather's dynamic
-	 * shared memory, and join->filter is this participant's view of it
-	 * (joinviewshared).  joinpcxt is the leader's parallel context, which
-	 * says whether any worker started.  joincopies counts the shared copies
-	 * this participant indexed - one a run - and joincopychunks the chunks of
-	 * them it collected, for EXPLAIN ANALYZE.
-	 */
-	LionSharedCopy *joinsharedcopy;
-	ParallelContext *joinpcxt;
-	bool		joinviewshared;
-	int64		joincopies;
-	int64		joincopychunks;
-	int64		joinworkercopies;
-	int64		joinworkercopychunks;
-
-	LionCountStats joinworkerstats;
-	int64		joinworkerlookups;
-	int64		joinworkermissing;
-	int64		joinworkerdirpages;
-	int64		joinworkerfilterrows;
-	int64		joinworkersorted;
-	int64		joinworkerspilled;
-	int64		joinworkerbatches;
-
-	/*
-	 * The workers' sums of where a key's time goes (LionJoinState's
-	 * childrows, posting and time), as for the counters above.
-	 */
-	int64		joinworkerchildrows;
-	int64		joinworkerposting;
-	instr_time	joinworkertime[LION_JT_N];
+	bool		reported;
+	LionCountStats workerstats;
+	int64		workerdirpages;
 
 	/*
 	 * The FK-side join grouped by a fact column (DESIGN.md §27, "Grouped by a
