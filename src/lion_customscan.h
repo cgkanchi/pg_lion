@@ -1599,12 +1599,86 @@ typedef struct LionFactGroupState
 } LionFactGroupState;
 
 /*
+ * The forward semi join over a non-unique key (DESIGN.md §27, "Forward semi
+ * joins over a non-unique key"): unique says each key is counted once however
+ * many child rows carry it.  The keys of the child's rows go into tuplesort
+ * first, a datum sort by op under coll, and a key eqfn finds equal to the
+ * previous distinct one, prevkey (in cxt), is skipped; each distinct key is
+ * handed on as the key column of slot, a row of the child's shape whose other
+ * columns nothing reads.  keypos numbers the distinct keys, and in a parallel
+ * plan chunk is the run of them this participant claimed last, -1 before the
+ * first.  sorted is the keys sorted, and stats what the sort did, for EXPLAIN
+ * ANALYZE.
+ */
+typedef struct LionJoinSort
+{
+	bool		unique;			/* LION_JOINFLAG_UNIQUE */
+	Oid			op;
+	Oid			coll;
+	FmgrInfo	eqfn;
+	Tuplesortstate *tuplesort;
+	bool		done;
+	TupleTableSlot *slot;
+	MemoryContext cxt;
+	Datum		prevkey;
+	bool		haveprev;
+	int64		keypos;
+	int64		chunk;
+	int64		sorted;
+	bool		havestats;
+	TuplesortInstrumentation stats;
+} LionJoinSort;
+
+/*
+ * Lookups in key order (DESIGN.md §27, "Lookups in key order"): walk says the
+ * plan reads the child's rows - or the distinct keys - a batch at a time, as
+ * many as work_mem holds, into ent in cxt, sorts them into the fk index's
+ * directory order and locates their keys with one walk of its leaves,
+ * walker, begun at the first batch (walkbegun).  pos is the next row of the
+ * batch to look up, childdone that the child has no rows left, slot the slot
+ * a batched row is handed to the target list in, and batches how many
+ * batches there were, for EXPLAIN ANALYZE.  The last key looked up and what
+ * it found (last*) answer the next row as well when it has the same key: a
+ * duplicated dimension key is looked up once a batch.
+ *
+ * How a run over a plain fact table reads its child: in those batches,
+ * walked in key order (walked), or a row at a time.  It is decided once, at
+ * the run's first row (begun), and kept to the run's end: a copy of the fact
+ * filters made part way through that finds them to select nothing sets
+ * wheremissing, which each way answers for itself (DESIGN.md §27, "Probed,
+ * then collected"), and must not change the way - the batch in hand would be
+ * dropped and the child read on, or read again, a row at a time.
+ */
+typedef struct LionJoinBatch
+{
+	bool		walk;			/* LION_JOINFLAG_WALK */
+	bool		walkbegun;
+	LionLookupWalk walker;
+	MemoryContext cxt;
+	LionJoinEnt *ent;
+	int			n;
+	int			cap;
+	int			pos;
+	bool		childdone;
+	TupleTableSlot *slot;
+	int64		batches;
+	bool		lasthave;
+	Datum		lastkey;
+	bool		lastfound;
+	int64		lastcount;
+	bool		begun;
+	bool		walked;
+} LionJoinBatch;
+
+/*
  * The FK-side join (DESIGN.md §27).  clause is the clause that is the join
  * key; its value is column keyresno of the child plan's current row,
  * childslot, which is also where the target list's dimension columns are
  * read from.  The key's posting set is located into the scan's groupset and
  * counted as source slot 0, once per child row.  lookups and missing are
- * what EXPLAIN ANALYZE reports.
+ * what EXPLAIN ANALYZE reports.  keytype, keybyval and keylen are the key
+ * column's type, set once at begin (lion_begin_join_key()) for a join that
+ * sorts its keys (sort) or looks them up a batch at a time (batch).
  *
  * What each child row's count is: the number of fact rows it joins for an
  * inner join, and for a semi or anti join whether it joins any - type, one
@@ -1642,6 +1716,9 @@ typedef struct LionJoinState
 {
 	int			clause;
 	AttrNumber	keyresno;
+	Oid			keytype;
+	bool		keybyval;
+	int16		keylen;
 	PlanState  *child;
 	TupleTableSlot *childslot;
 	int64		lookups;
@@ -1677,6 +1754,9 @@ typedef struct LionJoinState
 	int64		posting;
 	bool		timing;
 	instr_time	time[LION_JT_N];
+
+	LionJoinSort sort;
+	LionJoinBatch batch;
 } LionJoinState;
 
 /*
@@ -2071,8 +2151,8 @@ typedef struct LionCountScanState
 
 	/*
 	 * The FK-side join (DESIGN.md §27): its plan's flags, its child, its
-	 * keys' counters and its fact filters' copy, or NULL for every other
-	 * shape (lion_st_join()).  What it sorts and batches, a partitioned fact
+	 * keys' counters, its fact filters' copy and what it sorts and batches,
+	 * or NULL for every other shape (lion_st_join()).  A partitioned fact
 	 * table's turns and what the participants of a parallel plan share are
 	 * below.
 	 */
@@ -2084,82 +2164,6 @@ typedef struct LionCountScanState
 	 */
 	int64		joinworkerswitches;
 	int64		joinworkerswitchkeys;
-
-	/*
-	 * The forward semi join over a non-unique key (DESIGN.md §27, "Forward
-	 * semi joins over a non-unique key"): joinunique says each key is counted
-	 * once however many child rows carry it.  The keys of the child's rows go
-	 * into joinsort first, a datum sort by joinsortop under joinsortcoll, and
-	 * a key joineqfn finds equal to the previous distinct one, joinprevkey
-	 * (in joinkeycxt), is skipped; each distinct key is handed on as the key
-	 * column of joinsortslot, a row of the child's shape whose other columns
-	 * nothing reads.  joinkeypos numbers the distinct keys, and in a parallel
-	 * plan joinchunk is the run of them this participant claimed last, -1
-	 * before the first.  joinsorted is the keys sorted, and joinsortstats
-	 * what the sort did, for EXPLAIN ANALYZE.
-	 */
-	bool		joinunique;
-	Oid			joinsortop;
-	Oid			joinsortcoll;
-	FmgrInfo	joineqfn;
-	Oid			joinkeytype;
-	bool		joinkeybyval;
-	int16		joinkeylen;
-	Tuplesortstate *joinsort;
-	bool		joinsortdone;
-	TupleTableSlot *joinsortslot;
-	MemoryContext joinkeycxt;
-	Datum		joinprevkey;
-	bool		joinhaveprev;
-	int64		joinkeypos;
-	int64		joinchunk;
-	int64		joinsorted;
-	bool		joinhavesortstats;
-	TuplesortInstrumentation joinsortstats;
-
-	/*
-	 * Lookups in key order (DESIGN.md §27, "Lookups in key order"): joinwalk
-	 * says the plan reads the child's rows - or the distinct keys - a batch
-	 * at a time, as many as work_mem holds, into joinbatch in joinbatchcxt,
-	 * sorts them into the fk index's directory order and locates their keys
-	 * with one walk of its leaves, joinwalker, begun at the first batch
-	 * (joinwalkbegun).  joinbatchpos is the next row of the batch to look up,
-	 * joinchilddone that the child has no rows left, joinbatchslot the slot a
-	 * batched row is handed to the target list in, and joinbatches how many
-	 * batches there were, for EXPLAIN ANALYZE.  The last key looked up and
-	 * what it found (joinlast*) answer the next row as well when it has the
-	 * same key: a duplicated dimension key is looked up once a batch.  The
-	 * key's type (joinkeytype, joinkeybyval, joinkeylen) is set for this as
-	 * for joinunique.
-	 */
-	bool		joinwalk;
-	bool		joinwalkbegun;
-	LionLookupWalk joinwalker;
-	MemoryContext joinbatchcxt;
-	LionJoinEnt *joinbatch;
-	int			joinbatchn;
-	int			joinbatchcap;
-	int			joinbatchpos;
-	bool		joinchilddone;
-	TupleTableSlot *joinbatchslot;
-	int64		joinbatches;
-	bool		joinlasthave;
-	Datum		joinlastkey;
-	bool		joinlastfound;
-	int64		joinlastcount;
-
-	/*
-	 * How a run over a plain fact table reads its child: in those batches,
-	 * walked in key order (joinwalked), or a row at a time.  It is decided
-	 * once, at the run's first row (joinbegun), and kept to the run's end:
-	 * a copy of the fact filters made part way through that finds them to
-	 * select nothing sets wheremissing, which each way answers for itself
-	 * (DESIGN.md §27, "Probed, then collected"), and must not change the way
-	 * - the batch in hand would be dropped and the child read on, or read
-	 * again, a row at a time.
-	 */
-	bool		joinbegun;
-	bool		joinwalked;
 
 	/*
 	 * A partitioned fact table (DESIGN.md §27, "A partitioned fact table"):
