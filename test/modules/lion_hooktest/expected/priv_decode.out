@@ -1,0 +1,43 @@
+-- The decoder of a LionCount plan's custom_private (src/lion_plan_private.c)
+-- handed lists no planner makes: each one a plan of one equality clause with
+-- one thing changed, which it must refuse rather than read at the wrong
+-- offsets.  The first two are the lists a planner does make, at the plan
+-- and the path stage.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS lion_hooktest;
+SELECT lion_hooktest_priv_decode('plan') AS nclause;
+ nclause 
+---------
+       1
+(1 row)
+
+SELECT lion_hooktest_priv_decode('path') AS nclause;
+ nclause 
+---------
+       1
+(1 row)
+
+-- the shape marker, and the plan's number of members
+SELECT lion_hooktest_priv_decode('magic');
+ERROR:  LionCount: unrecognized custom_private shape (20 members)
+SELECT lion_hooktest_priv_decode('path at plan');
+ERROR:  LionCount: unrecognized custom_private shape (19 members)
+-- a member's node type, and its length against the number of clauses
+SELECT lion_hooktest_priv_decode('oids as ints');
+ERROR:  LionCount: malformed OIDS member of custom_private
+SELECT lion_hooktest_priv_decode('short oids');
+ERROR:  LionCount: custom_private member OIDS has length 3, not 4
+SELECT lion_hooktest_priv_decode('partition length');
+ERROR:  LionCount: partition 0 has 3 Oids for 1 clauses
+SELECT lion_hooktest_priv_decode('or length');
+ERROR:  LionCount: malformed OR structure
+-- a kind there is no such clause of
+SELECT lion_hooktest_priv_decode('clause kind');
+ERROR:  LionCount: unknown clause kind 8
+-- the members that grow at plan time, still the path's
+SELECT lion_hooktest_priv_decode('path join at plan');
+ERROR:  LionCount: malformed join
+SELECT lion_hooktest_priv_decode('path wagg at plan');
+ERROR:  LionCount: malformed aggregates over keys

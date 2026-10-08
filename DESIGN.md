@@ -1960,7 +1960,10 @@ Planner integration
   marker - an IntList of `LION_PRIV_MAGIC` and the number of members - which BeginCustomScan checks
   before reading any offset and ERRORs on. §16 added `LION_PRIV_PARTS` and §19 `LION_PRIV_ORS`, the
   structure of each OR restriction over the flattened clause array. Planner/executor drift, or a plan built by a differently
-  shaped build of the library, is then a message and not a misread Oid.
+  shaped build of the library, is then a message and not a misread Oid. The executor reads the list
+  through one decoder, `lion_count_priv_decode()` (`src/lion_plan_private.c`), into a struct: it
+  checks every member's node type, each per-clause and per-partition list's length against the
+  number of clauses, and the kinds, and `lion_count_priv_check()` holds the rules between members.
 
 Executor
 - BeginCustomScan: open heap with NoLock (the executor already locked every RTE); index_open each
