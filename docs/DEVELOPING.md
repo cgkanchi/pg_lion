@@ -57,8 +57,12 @@ replay, so turning it on for a primary that never replays proves nothing.
   suite creates all four.  Without `pageinspect` the `build`, `corrupt`, `corrupt_items` and
   `summary` files fail, without `pg_buffercache` the `corrupt`, `corrupt_items`, `pinbudget` and
   `range` files and the `count_batch_race` and `gettuple_pause` specs fail, without
-  `pg_walinspect` `walrecords` fails, and most files use `citext`.  The PGDG packages
+  `pg_walinspect` `walrecords` fails, and most files use `citext`.  `installcheck` checks for
+  all four before it starts and stops with one message if any is missing.  The PGDG packages
   (`postgresql-N`) include contrib; a source build needs `make -C contrib install`.
+- **Session settings** the expected plans assume (`work_mem`, `maintenance_work_mem`, no parallel
+  workers, no JIT) are passed to every connection the suite makes through `PGOPTIONS`
+  (`LION_TEST_OPTIONS` in the Makefile), so a cluster other than `./dev.sh`'s gives the same plans.
 - **`pg_isolation_regress`** for the isolation specs: a source build installs it with
   `make -C src/test/isolation install`, and the packages ship it in `postgresql-server-dev-N`.
 - **`injection_points`** for the specs that park a backend on an injection point: a server

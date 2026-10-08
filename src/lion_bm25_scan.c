@@ -50,7 +50,6 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
-#include "storage/predicate.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -472,7 +471,7 @@ lion_bm25_begin(CustomScanState *node, EState *estate, int eflags)
 	 * without ampredlocks, before the index is read, so that a SERIALIZABLE
 	 * search that finds nothing is covered too.
 	 */
-	PredicateLockRelation(st->index, estate->es_snapshot);
+	lion_reader_lock(st->index, estate->es_snapshot);
 	st->valid = lion_bm25_prepare(st->index, st->query, st->k1, st->b, &st->q);
 }
 
