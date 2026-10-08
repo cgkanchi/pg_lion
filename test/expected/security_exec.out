@@ -1,11 +1,12 @@
--- EXECUTE privileges on the functions the count paths stand in for (2026-09-23
--- review).  LionCount replaces an Agg and a scan's quals, and the SQL count
--- functions replace a whole query, so each must ask for the EXECUTE
--- privileges the executor would have asked for on the plan it replaces - the
--- aggregate, the operators of the WHERE clause, the grouping equality, the
--- join operator - no more and no less (DESIGN.md §9, "Privileges").
+-- EXECUTE privileges on the functions lion's paths stand in for.  LionCount
+-- replaces an Agg and a scan's quals, the SQL count functions replace a whole
+-- query, and LionBm25 replaces the lion_bm25_score() calls above it, so each
+-- must ask for the EXECUTE privileges the executor would have asked for on
+-- the plan it replaces - the aggregate, the operators of the WHERE clause,
+-- the grouping equality, the join operator, the score - no more and no less
+-- (DESIGN.md §9, "Privileges").
 --
--- Revoking a pg_catalog function from PUBLIC affects the whole database, so
+-- Revoking a function from PUBLIC affects the whole database, so
 -- every REVOKE here is paired with a GRANT a few lines below it, and the file
 -- ends by checking that nothing is left revoked.
 \set VERBOSITY terse
@@ -587,6 +588,132 @@ RESET ROLE;
 DEALLOCATE lion_ex_q;
 DEALLOCATE lion_ex_qg;
 RESET plan_cache_mode;
+-- ---------- the LionBm25 scan's score: lion_bm25_score() ----------
+-- The scan returns the score as a column of its tuple, which setrefs.c puts
+-- in place of every copy of the call above it, so ExecInitFunc() never sees
+-- the call: the scan asks EXECUTE on it itself, every time it is initialised.
+CREATE TABLE lion_exb (id int, d tsvector);
+INSERT INTO lion_exb
+SELECT i, to_tsvector('simple', 'w' || (i % 5) || ' w' || (i % 7) || ' w' || (i % 11))
+  FROM generate_series(1, 2000) i;
+CREATE INDEX lion_exb_d ON lion_exb USING lion (d) WITH (store_positions = true);
+VACUUM (FREEZE, ANALYZE) lion_exb;
+GRANT SELECT ON lion_exb TO lion_exec_user, lion_exec_other;
+-- lion_ex() for the scan: is it planned (the other scans off, since the
+-- planner rightly sorts a table this small), then role r's answer through it
+-- and through the ordinary plan
+CREATE FUNCTION lion_exb(q text, r text DEFAULT 'lion_exec_user') RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	scanned boolean := false;
+	ron text;
+	roff text;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionBm25)%' THEN
+			scanned := true;
+		END IF;
+	END LOOP;
+	PERFORM set_config('role', r, true);
+	ron := lion_ex_try(q);
+	PERFORM set_config('pg_lion.enable_bm25_scan', 'off', true);
+	roff := lion_ex_try(q);
+	RETURN CASE WHEN scanned THEN 'scanned: ' ELSE 'NOT SCANNED: ' END || ron ||
+		CASE WHEN ron = roff THEN ' (as the ordinary plan)'
+			 ELSE ' | the ordinary plan: ' || roff END;
+END $$;
+REVOKE EXECUTE ON FUNCTION lion_bm25_score(tsvector, tsquery, regclass, float8, float8) FROM PUBLIC;
+SELECT lion_exb('SELECT id FROM lion_exb WHERE d @@ ''w1 & w3 & w4''
+	ORDER BY lion_bm25_score(d, ''w1 & w3 & w4'', ''lion_exb_d'') DESC');
+                                       lion_exb                                        
+---------------------------------------------------------------------------------------
+ scanned: ERROR: permission denied for function lion_bm25_score (as the ordinary plan)
+(1 row)
+
+-- the score shown as well, which the scan's column stands in for too
+SELECT lion_exb('SELECT id, lion_bm25_score(d, ''w1 & w3 & w4'', ''lion_exb_d'') FROM lion_exb
+	WHERE d @@ ''w1 & w3 & w4'' ORDER BY lion_bm25_score(d, ''w1 & w3 & w4'', ''lion_exb_d'') DESC');
+                                       lion_exb                                        
+---------------------------------------------------------------------------------------
+ scanned: ERROR: permission denied for function lion_bm25_score (as the ordinary plan)
+(1 row)
+
+-- granted to one role: that one may, the other may not
+GRANT EXECUTE ON FUNCTION lion_bm25_score(tsvector, tsquery, regclass, float8, float8) TO lion_exec_user;
+SELECT lion_exb('SELECT id FROM lion_exb WHERE d @@ ''w1 & w3 & w4''
+	ORDER BY lion_bm25_score(d, ''w1 & w3 & w4'', ''lion_exb_d'') DESC');
+                                                                                                              lion_exb                                                                                                               
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ scanned: (1026) (1068) (1093) (1114) (1291) (1354) (136) (1411) (1453) (1478) (1499) (1676) (1739) (1796) (1838) (1863) (1884) (199) (256) (298) (323) (344) (521) (584) (641) (683) (708) (729) (906) (969) (as the ordinary plan)
+(1 row)
+
+SELECT lion_exb('SELECT id FROM lion_exb WHERE d @@ ''w1 & w3 & w4''
+	ORDER BY lion_bm25_score(d, ''w1 & w3 & w4'', ''lion_exb_d'') DESC', 'lion_exec_other');
+                                       lion_exb                                        
+---------------------------------------------------------------------------------------
+ scanned: ERROR: permission denied for function lion_bm25_score (as the ordinary plan)
+(1 row)
+
+-- plain EXPLAIN initialises the plan, which asks for the privilege too
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SET ROLE lion_exec_other;
+EXPLAIN (COSTS OFF) SELECT id FROM lion_exb WHERE d @@ 'w1 & w3 & w4'
+	ORDER BY lion_bm25_score(d, 'w1 & w3 & w4', 'lion_exb_d') DESC LIMIT 5;
+ERROR:  permission denied for function lion_bm25_score
+RESET ROLE;
+-- a cached plan, made by a role that may call the function, run by one that
+-- may not: the privilege is asked when the plan runs, not when it was made
+SET plan_cache_mode = force_generic_plan;
+PREPARE lion_exb_q AS SELECT count(*) FROM (SELECT id FROM lion_exb WHERE d @@ 'w1 & w3 & w4'
+	ORDER BY lion_bm25_score(d, 'w1 & w3 & w4', 'lion_exb_d') DESC LIMIT 5) s;
+EXPLAIN (COSTS OFF) EXECUTE lion_exb_q;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Aggregate
+   ->  Limit
+         ->  Custom Scan (LionBm25) on lion_exb
+               Filter: (d @@ '''w1'' & ''w3'' & ''w4'''::tsquery)
+               Index: lion_exb_d
+(5 rows)
+
+EXECUTE lion_exb_q;
+ count 
+-------
+     5
+(1 row)
+
+SET ROLE lion_exec_other;
+EXECUTE lion_exb_q;
+ERROR:  permission denied for function lion_bm25_score
+SET ROLE lion_exec_user;
+EXECUTE lion_exb_q;
+ count 
+-------
+     5
+(1 row)
+
+RESET ROLE;
+DEALLOCATE lion_exb_q;
+RESET plan_cache_mode;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+REVOKE EXECUTE ON FUNCTION lion_bm25_score(tsvector, tsquery, regclass, float8, float8) FROM lion_exec_user;
+GRANT EXECUTE ON FUNCTION lion_bm25_score(tsvector, tsquery, regclass, float8, float8) TO PUBLIC;
+-- granted again: every role, and the same rows as the ordinary plan
+SELECT lion_exb('SELECT id FROM lion_exb WHERE d @@ ''w1 & w3 & w4''
+	ORDER BY lion_bm25_score(d, ''w1 & w3 & w4'', ''lion_exb_d'') DESC', 'lion_exec_other');
+                                                                                                              lion_exb                                                                                                               
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ scanned: (1026) (1068) (1093) (1114) (1291) (1354) (136) (1411) (1453) (1478) (1499) (1676) (1739) (1796) (1838) (1863) (1884) (199) (256) (298) (323) (344) (521) (584) (641) (683) (708) (729) (906) (969) (as the ordinary plan)
+(1 row)
+
 -- ---------- positive controls: every privilege back, every answer exact ----------
 SELECT lion_ex('SELECT count(*) FROM lion_ex WHERE k = 1');
                lion_ex                
@@ -674,13 +801,14 @@ SELECT groups, count FROM lion_index_count_group_stats('lion_ex_g');
 (1 row)
 
 RESET ROLE;
--- nothing in pg_catalog is left revoked from PUBLIC by this file
+-- nothing is left revoked from PUBLIC by this file
 SELECT p.oid::regprocedure
   FROM pg_proc p
  WHERE p.oid IN ('int4eq(int4,int4)'::regprocedure, 'int4lt(int4,int4)'::regprocedure,
                  'hashint4(int4)'::regprocedure,
                  'enum_eq(anyenum,anyenum)'::regprocedure, 'texteq(text,text)'::regprocedure,
-                 'count()'::regprocedure, 'count("any")'::regprocedure)
+                 'count()'::regprocedure, 'count("any")'::regprocedure,
+                 'lion_bm25_score(tsvector,tsquery,regclass,float8,float8)'::regprocedure)
    AND NOT has_function_privilege('public', p.oid, 'EXECUTE');
  oid 
 -----
@@ -688,8 +816,9 @@ SELECT p.oid::regprocedure
 
 DROP FUNCTION lion_ex_def_other(int);
 DROP FUNCTION lion_ex_def_user(int);
+DROP FUNCTION lion_exb(text, text);
 DROP FUNCTION lion_ex(text, text);
 DROP FUNCTION lion_ex_try(text);
-DROP TABLE lion_ex, lion_exd, lion_exp;
+DROP TABLE lion_ex, lion_exd, lion_exp, lion_exb;
 DROP ROLE lion_exec_user;
 DROP ROLE lion_exec_other;
