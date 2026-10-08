@@ -3490,7 +3490,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 		 * set does: a relation predicate lock first (§30.5), and the heap
 		 * fetch state of an index scan for what it meets.
 		 */
-		PredicateLockRelation(st->ordidx, estate->es_snapshot);
+		lion_reader_lock(st->ordidx, estate->es_snapshot);
 #if PG_VERSION_NUM >= 200000
 #elif PG_VERSION_NUM >= 190000
 		st->fetch = table_index_fetch_begin(node->ss.ss_currentRelation,
@@ -3513,7 +3513,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 		ExecIndexBuildScanKeys(&node->ss.ps, leaf->index, leaf->quals, false,
 							   &leaf->keys, &leaf->nkeys,
 							   &leaf->rtkeys, &leaf->nrtkeys, NULL, NULL);
-		PredicateLockRelation(leaf->index, estate->es_snapshot);
+		lion_reader_lock(leaf->index, estate->es_snapshot);
 	}
 
 	/* which Params a rescan has to rebuild the set for */

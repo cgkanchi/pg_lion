@@ -1817,7 +1817,7 @@ lion_join_group_turn(LionCountScanState *st, int p)
 	 * partition), and stays open after the turn.
 	 */
 	Assert(fgidx != NULL);
-	PredicateLockRelation(fgidx, st->css.ss.ps.state->es_snapshot);
+	lion_reader_lock(fgidx, st->css.ss.ps.state->es_snapshot);
 	fgidxcol = lion_index_col_for(fgidx,
 								  lion_heap_attno_in(st->heap, st->heapoid,
 													 st->fgattno),
