@@ -425,8 +425,13 @@ UNION ALL
 SELECT format('SELECT cat, count(*) FROM pos_grouped '
 			  'WHERE d @@ ANY (%L::tsquery[]) GROUP BY cat', ARRAY[q, NULL, q])
 FROM pos_queries;
+-- core's GROUP BYs hash, over a scan whose @@ core charges far below its
+-- time, and a small one can come out the cheaper (DESIGN.md §39, "A hashed
+-- aggregate's own rate"): hashing is off here, so that every shape is counted
+SET enable_hashagg = off;
 CREATE TEMP TABLE pos_or_pushed AS
 SELECT s, (pos_or_count(s)).* FROM pos_or_shapes;
+RESET enable_hashagg;
 SET work_mem = '64kB';
 CREATE TEMP TABLE pos_or_narrow AS
 SELECT s, (pos_or_count(s)).* FROM pos_or_shapes;
