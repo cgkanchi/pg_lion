@@ -13,7 +13,8 @@
  *
  *	- the SQL-callable functions that are handed an index by name (the count
  *	  functions, lion_bm25(), lion_bm25_score()), which nothing vetted:
- *	  lion_reader_open() for a whole index-and-table open, or
+ *	  lion_reader_open() for a whole index-and-table open (which also
+ *	  refuses a partial index: its readers rank over the whole table), or
  *	  lion_reader_vet() for a caller that opens them itself;
  *	- the custom scans' executor nodes, whose index the planner vetted: for
  *	  them only the predicate lock is missing, which lion_reader_lock()
@@ -44,9 +45,11 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/table.h"
 #include "catalog/index.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_index.h"
 #include "miscadmin.h"
 #include "storage/predicate.h"
 #include "utils/acl.h"
@@ -155,6 +158,18 @@ lion_reader_open(Oid indexoid, LionReadPolicy policy, Snapshot snapshot,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("index \"%s\" is not a lion index",
 						RelationGetRelationName(index))));
+	/*
+	 * Both of its readers rank or score over the whole table: a partial
+	 * index's walk would miss the rows its predicate leaves out, and its N,
+	 * df and avgdl would describe only the rows it holds.  The planner's
+	 * LionBm25 path declines a partial index for the same reason.
+	 */
+	if (!heap_attisnull(index->rd_indextuple, Anum_pg_index_indpred, NULL))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot %s with partial index \"%s\"", action,
+						RelationGetRelationName(index)),
+				 errdetail("Ranking reads the statistics and candidates of every row of the table.")));
 	if (policy == LION_READ_ROWS)
 	{
 		lion_check_table_am(table);

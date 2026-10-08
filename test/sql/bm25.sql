@@ -113,6 +113,13 @@ SELECT * FROM lion_bm25('bm_docs_plain', 'w1', 10);
 CREATE INDEX bm_docs_btree ON bm_docs (id);
 SELECT * FROM lion_bm25('bm_docs_btree', 'w1', 10);
 SELECT * FROM lion_bm25('bm_docs', 'w1', 10);
+-- a partial index: its walk would miss the rows it leaves out, and its
+-- statistics describe only the rows it holds, so neither function takes it
+CREATE INDEX bm_docs_partial ON bm_docs USING lion (d) WITH (store_positions = true)
+	WHERE id % 2 = 0;
+SELECT * FROM lion_bm25('bm_docs_partial', 'w1', 10);
+SELECT lion_bm25_score(d, 'w1', 'bm_docs_partial') FROM bm_docs WHERE id = 1;
+DROP INDEX bm_docs_partial;
 CREATE ROLE bm_nobody;
 SET ROLE bm_nobody;
 SELECT * FROM lion_bm25('bm_docs_d', 'w1', 10);

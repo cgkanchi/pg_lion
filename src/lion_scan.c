@@ -406,7 +406,7 @@ lion_emit_entry(Relation index, Buffer entrybuf,
 {
 	Page		page = BufferGetPage(entrybuf);
 	ItemId		iid = PageGetItemId(page, entryoff);
-	LionEntryTuple *entry = (LionEntryTuple *) PageGetItem(page, iid);
+	LionEntryTuple *entry = lion_entry_at(page, iid);
 	char	   *payload = NULL;
 	Size		paylen = 0;
 	BlockNumber blkno = InvalidBlockNumber;
@@ -766,7 +766,7 @@ lion_walk_next(LionLeafWalk *w, Size *itemlen)
 			w->off = OffsetNumberNext(w->off);
 			if (!ItemIdIsUsed(iid))
 				continue;
-			entry = (LionEntryTuple *) PageGetItem(cpage, iid);
+			entry = lion_entry_at(cpage, iid);
 
 			/*
 			 * Bounded to one key column (DESIGN.md §24), and to its values:
@@ -4792,7 +4792,7 @@ lion_order_next_value(LionOrderWalk *w)
 			w->off += w->backward ? -1 : 1;
 			if (!ItemIdIsUsed(iid))
 				continue;
-			entry = (LionEntryTuple *) PageGetItem(cpage, iid);
+			entry = lion_entry_at(cpage, iid);
 			kind = lion_entry_kind(entry);
 
 			/*
@@ -4856,7 +4856,7 @@ lion_order_null_entry(LionOrderWalk *w)
 		Page		page = BufferGetPage(buf);
 		ItemId		iid = PageGetItemId(page, off);
 
-		lion_order_take_entry(w, (LionEntryTuple *) PageGetItem(page, iid),
+		lion_order_take_entry(w, lion_entry_at(page, iid),
 							  ItemIdGetLength(iid));
 	}
 	if (BufferIsValid(buf))

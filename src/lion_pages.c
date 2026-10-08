@@ -578,6 +578,23 @@ lion_page_check_alone(Relation index, Page page, BlockNumber blkno,
  * that rewrites one relies on (lion_put_entry(): the entry keeps its size, so
  * "this cannot fail", inside a critical section).
  */
+/* lion_entry_at()'s ERROR, out of line */
+void
+lion_entry_size_error(Page page, ItemId iid)
+{
+	Size		len = ItemIdGetLength(iid);
+
+	if ((Size) ItemIdGetOffset(iid) + len > BLCKSZ || len < LION_ENTRY_HDRSZ)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index entry of %zu bytes at page offset %u does not hold an entry header",
+						len, ItemIdGetOffset(iid))));
+	ereport(ERROR,
+			(errcode(ERRCODE_INDEX_CORRUPTED),
+			 errmsg("lion index entry of %zu bytes claims a key of %u bytes",
+					len, ((LionEntryTuple *) PageGetItem(page, iid))->keylen)));
+}
+
 LionEntryTuple *
 lion_page_entry_fetch(Relation index, Page page, BlockNumber blkno,
 					  OffsetNumber off)
