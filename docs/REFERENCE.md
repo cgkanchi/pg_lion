@@ -98,7 +98,9 @@ counted once; lexemes under a NOT do not score, and operators, phrases and weigh
 it, so add `WHERE d.tsv @@ query` to keep only rows that match the query as a whole. As in a search
 engine, the statistics count deleted rows until VACUUM removes them, and a backend keeps the mean
 row length it read until the row count moves by more than 1/64. Rows that cannot reach the top `k`
-are skipped (MaxScore), so a very common lexeme next to rarer ones costs little.
+are skipped (MaxScore), so a very common lexeme next to rarer ones costs little. Like the counts,
+`lion_bm25()` needs SELECT on the table and refuses a table where row-level security applies to the
+caller, since it cannot apply the policies; the `ORDER BY lion_bm25_score(...)` form below can.
 
 `lion_bm25_score(tsv, query, index [, k1, b])` is the same score for one row, from its tsvector and
 the index's statistics. Ordered by it, with a `WHERE` that matches on the same column, the planner

@@ -46,8 +46,12 @@
  * (lion_bm25_topk()): once the heap is full, the lexemes that together
  * cannot lift a row past its worst are only looked up for rows the others
  * bring, so a common lexeme next to a rarer one is mostly skipped.  When the
- * snapshot does not see k of those k + 16, the walk is made again for four
- * times as many.
+ * snapshot does not see k of those k + 16, the walk is made again for the
+ * next four times as many, ranked below the last of them.
+ *
+ * Like an ordinary scan of the index, the function refuses a table with
+ * row-level security and an index the snapshot cannot use, and takes the
+ * index's predicate lock before reading (lion_bm25_check_snapshot()).
  *
  *-------------------------------------------------------------------------
  */
@@ -63,6 +67,7 @@
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/predicate.h"
 #include "tsearch/ts_type.h"
 #include "tsearch/ts_utils.h"
 #include "utils/acl.h"
@@ -70,6 +75,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/tuplestore.h"
 
@@ -397,17 +403,16 @@ lion_bm25_column(Relation index, LionIndexState *ix)
 }
 
 /*
- * Emit the best of cands[from, to), already sorted, that the snapshot sees,
+ * Emit the best of cands[0, n), already sorted, that the snapshot sees,
  * until *emitted reaches k.
  */
 static void
 lion_bm25_emit(ReturnSetInfo *rsinfo, Relation heap, Snapshot snapshot,
-			   const LionBm25Cand *cands, int64 from, int64 to, int32 k,
-			   int64 *emitted)
+			   const LionBm25Cand *cands, int64 n, int32 k, int64 *emitted)
 {
 	int64		i;
 
-	for (i = from; i < to && *emitted < k; i++)
+	for (i = 0; i < n && *emitted < k; i++)
 	{
 		ItemPointerData tid;
 		Datum		values[2];
@@ -585,9 +590,19 @@ lion_bm25_score_row(const LionBm25Query *q, TSVector doc)
  * TID and a candidate's TID is above every TID the heap holds, so a candidate
  * gets in only with a score above the heap's worst: at a bound no higher than
  * that, a row is not scored on.
+ *
+ * With after given, only the rows ranked below it count: the walk goes on
+ * from where an earlier one with the same LionBm25Query stopped.  A row's
+ * score depends only on its members and on q, which neither changes, so the
+ * rows ranked below after are the ones the earlier walk had not reached -
+ * plus rows inserted since, which the caller's snapshot does not see.  An
+ * offset into a bigger walk would not do: a row inserted meanwhile above it
+ * moves every row after it down one place, and one would be returned twice
+ * and another never.
  */
 int64
-lion_bm25_topk(const LionBm25Query *q, int64 L, LionBm25Cand *best)
+lion_bm25_topk(const LionBm25Query *q, int64 L, const LionBm25Cand *after,
+			   LionBm25Cand *best)
 {
 	Relation	index = q->index;
 	int			nterms = q->nterms;
@@ -660,10 +675,11 @@ lion_bm25_topk(const LionBm25Query *q, int64 L, LionBm25Cand *best)
 											(double) Max(term->m->npos, 1),
 											q->k1, norm);
 		}
-		if (t < 0 && (nbest < L || score > best[0].score))
+		c.code = code;
+		c.score = score;
+		if (t < 0 && (nbest < L || score > best[0].score) &&
+			(after == NULL || lion_bm25_better(after, &c)))
 		{
-			c.code = code;
-			c.score = score;
 			lion_bm25_heap_add(best, &nbest, L, &c);
 			while (nbest == L && nlow < nterms &&
 				   below[nlow + 1] <= best[0].score)
@@ -713,6 +729,37 @@ lion_bm25_open_index(Oid indexoid, Relation *heap)
 	return index;
 }
 
+/*
+ * Refuse what an ordinary scan of the index under snapshot would never
+ * return, as the direct count functions do (lion_count_sql.c): rows hidden
+ * by row-level security, which ranking cannot apply its policies to, and an
+ * index whose entries the snapshot cannot trust (lion_index_usable()).  Then
+ * take the relation-level predicate lock index_beginscan() takes for an AM
+ * without ampredlocks, before reading, so that a SERIALIZABLE search that
+ * finds nothing is covered too.
+ */
+static void
+lion_bm25_check_snapshot(Relation heap, Relation index, Snapshot snapshot)
+{
+	const char *why;
+
+	if (check_enable_rls(RelationGetRelid(heap), InvalidOid, false) ==
+		RLS_ENABLED)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("cannot rank through index \"%s\" because row-level security is enabled on table \"%s\"",
+						RelationGetRelationName(index),
+						RelationGetRelationName(heap)),
+				 errhint("Use ORDER BY lion_bm25_score(...) in a query on the table, which applies the policies.")));
+	if (!lion_index_usable(index, snapshot, &why))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot rank through index \"%s\" because %s",
+						RelationGetRelationName(index), why)));
+	lion_check_old_snapshot(index, snapshot);
+	PredicateLockRelation(index, snapshot);
+}
+
 Datum
 lion_bm25(PG_FUNCTION_ARGS)
 {
@@ -725,8 +772,10 @@ lion_bm25(PG_FUNCTION_ARGS)
 	Relation	heap;
 	Relation	index;
 	LionBm25Query q;
+	LionBm25Cand after;
+	bool		have_after = false;
 	int64		L;
-	int64		done = 0;
+	int64		seen = 0;
 	Snapshot	snapshot;
 	int64		emitted = 0;
 
@@ -738,16 +787,19 @@ lion_bm25(PG_FUNCTION_ARGS)
 
 	InitMaterializedSRF(fcinfo, 0);
 
+	snapshot = GetActiveSnapshot();
+	if (snapshot == NULL)
+		elog(ERROR, "lion_bm25 requires an active snapshot");
 	index = lion_bm25_open_index(indexoid, &heap);
+	lion_bm25_check_snapshot(heap, index, snapshot);
 	if (!lion_bm25_prepare(index, query, k1, b, &q) || k == 0)
 		goto out;
 
 	/*
 	 * The best k + 16, best first, until k of them are visible: when the
-	 * snapshot does not see enough of them, the best 4 times as many, of
-	 * which the first are the ones already tried.
+	 * snapshot does not see enough of them, the next 4 times as many, ranked
+	 * below the last of those already tried.
 	 */
-	snapshot = GetActiveSnapshot();
 	L = Min((int64) k + 16, (int64) q.ncodes);
 	for (;;)
 	{
@@ -755,14 +807,19 @@ lion_bm25(PG_FUNCTION_ARGS)
 			palloc_extended(sizeof(LionBm25Cand) * L, MCXT_ALLOC_HUGE);
 		int64		nbest;
 
-		nbest = lion_bm25_topk(&q, L, best);
+		nbest = lion_bm25_topk(&q, L, have_after ? &after : NULL, best);
 		lion_bm25_sort(best, nbest);
-		lion_bm25_emit(rsinfo, heap, snapshot, best, done, nbest, k, &emitted);
+		lion_bm25_emit(rsinfo, heap, snapshot, best, nbest, k, &emitted);
+		seen += nbest;
+		if (nbest > 0)
+		{
+			after = best[nbest - 1];
+			have_after = true;
+		}
 		pfree(best);
-		if (emitted >= k || nbest < L || L >= (int64) q.ncodes)
+		if (emitted >= k || nbest < L || seen >= (int64) q.ncodes)
 			break;
-		done = nbest;
-		L = Min(L * 4, (int64) q.ncodes);
+		L = Min(L * 4, (int64) q.ncodes - seen);
 	}
 
 out:
@@ -774,6 +831,7 @@ out:
 /* What lion_bm25_score() keeps across the rows of one call site. */
 typedef struct LionBm25ScoreCache
 {
+	MemoryContext cxt;			/* what follows points into; reset on change */
 	Oid			indexoid;
 	double		k1;
 	double		b;
@@ -802,17 +860,35 @@ lion_bm25_score(PG_FUNCTION_ARGS)
 	double		b = PG_GETARG_FLOAT8(4);
 	LionBm25ScoreCache *cache = (LionBm25ScoreCache *) fcinfo->flinfo->fn_extra;
 
-	if (cache == NULL || cache->indexoid != indexoid || cache->k1 != k1 ||
+	if (cache == NULL || cache->query == NULL ||
+		cache->indexoid != indexoid || cache->k1 != k1 ||
 		cache->b != b || VARSIZE(cache->query) != VARSIZE(query) ||
 		memcmp(cache->query, query, VARSIZE(query)) != 0)
 	{
-		MemoryContext old = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+		MemoryContext old;
 		Relation	index;
 
 		lion_bm25_check_params(k1, b);
+
+		/*
+		 * The arguments may change from row to row: what the last ones
+		 * prepared goes with them, rather than piling up in fn_mcxt until
+		 * the statement ends.
+		 */
 		if (cache == NULL)
+		{
 			cache = (LionBm25ScoreCache *)
-				palloc0(sizeof(LionBm25ScoreCache));
+				MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt,
+									   sizeof(LionBm25ScoreCache));
+			cache->cxt = AllocSetContextCreate(fcinfo->flinfo->fn_mcxt,
+											   "lion_bm25_score cache",
+											   ALLOCSET_SMALL_SIZES);
+			fcinfo->flinfo->fn_extra = cache;
+		}
+		else
+			MemoryContextReset(cache->cxt);
+		cache->query = NULL;
+		old = MemoryContextSwitchTo(cache->cxt);
 		index = lion_bm25_open_index(indexoid, NULL);
 		cache->valid = lion_bm25_prepare(index, query, k1, b, &cache->q);
 		cache->q.index = NULL;
@@ -823,7 +899,6 @@ lion_bm25_score(PG_FUNCTION_ARGS)
 		cache->b = b;
 		cache->query = (TSQuery) palloc(VARSIZE(query));
 		memcpy(cache->query, query, VARSIZE(query));
-		fcinfo->flinfo->fn_extra = cache;
 		MemoryContextSwitchTo(old);
 	}
 	if (!cache->valid)

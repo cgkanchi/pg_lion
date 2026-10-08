@@ -4664,9 +4664,22 @@ The query's lexemes are its operands not under a NOT, once each; a prefix is ref
 stream out of a merge of the lexemes' cursors in TID order, each scored as it comes, with the empty
 key's cursor moving forward beside them; a min-heap keeps the best `L = k + 16`. Those are sorted
 and fetched best first under the caller's snapshot, the TID following a HOT chain to the visible
-version, until `k` are visible; when dead rows leave fewer, the walk is made again for `4L`, whose
-first `L` are the ones already tried. Dead rows count in N, df and avgdl until VACUUM removes them,
-as a search engine's deleted documents do until a merge.
+version, until `k` are visible; when dead rows leave fewer, the walk is made again for the next
+`4L`: the rows ranked strictly below the last one already tried, by (score, TID). A row's score
+depends only on its members and on the prepared query (N, df and avgdl are read once per call), so
+that is exactly where the last walk stopped. An offset into a bigger walk is not: a row inserted
+meanwhile, invisible to the snapshot but in the index, moves every row ranked below it down a place,
+and one row would be returned twice and another never. Dead rows count in N, df and avgdl until
+VACUUM removes them, as a search engine's deleted documents do until a merge.
+
+Ranking must answer what an ordinary scan of the index would, so `lion_bm25()` refuses, as the
+direct count functions do, a table with row-level security enabled (it cannot apply the policies;
+`ORDER BY lion_bm25_score(...)` in a query on the table can, and the LionBm25 scan is not offered
+there) and an index `lion_index_usable()` rejects for the snapshot (an `indcheckxmin` index built
+over a broken HOT chain holds the newest version only, which no heap recheck can repair). Before
+reading it takes the relation-level predicate lock on the index that `index_beginscan()` takes for
+an AM without `ampredlocks`, as the LionBm25 scan does too, so a SERIALIZABLE search that finds
+nothing still conflicts with a later insert of what it looked for.
 
 **MaxScore** (Turtle and Flood) prunes the merge. A lexeme adds less than `idf * (k1 + 1)` to any
 row, since `tf / (tf + norm) < 1`; with the lexemes in ascending order of that maximum, the first
@@ -4707,7 +4720,8 @@ places.
 The scan asks the walk for the best `L` rows: the planner's `limit_tuples` plus 16, or 64 when the
 LIMIT is not known. It fetches them best first under the scan's snapshot, following HOT chains, and
 applies the restrictions as its qual. When the node above pulls past them, it repeats the walk for
-`4L` and goes on from where it stopped, until the walk returns fewer than asked. Its startup cost is
+the next `4L` rows ranked below the last one it had, as `lion_bm25()` does, until the walk returns
+fewer than asked. Its startup cost is
 two index tuples and two operators per member of the scored lexemes (their `ntids`, read at plan
 time). Each row then costs a random page, a tuple and the restrictions. Against a bitmap scan that
 fetches, scores and sorts every match, on the synthetic 500k-row benchmark (top 10): 120 ms to 20
