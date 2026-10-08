@@ -17406,7 +17406,7 @@ model prefers.
 
 | setting | default | the plans | §10's data, units a millisecond |
 |---|---|---|---|
-| `pg_lion.hashagg_rate` | 0.42 | an aggregate that hashes | 208 (200 groups), 157 (20,000), 309 (parallel); 210 on the PostgreSQL 16 repro above, against lion's 510 there |
+| `pg_lion.hashagg_rate` | 0.1 | an aggregate that hashes: its own cost, less its input's ("A hashed aggregate's own rate") | whole plans: 208 (200 groups), 157 (20,000), 309 (parallel); 210 on the PostgreSQL 16 repro above, against lion's 510 there |
 | `pg_lion.agg_rate` | 1.0 | a plain or sorted aggregate over a scan | 401 to 695 over sequential scans, 415 to 536 over index-only ones, 699 sorted: around the reference by construction (§10 fitted lion to these); 263 on the repro |
 | `pg_lion.hashjoin_rate` | 0.5 | a hash join | 280 and 283 with 1,000 and 4,400 rows hashed, 185 at 140,000, 57 at 1.4M (in batches); 219 parallel |
 | `pg_lion.mergejoin_rate` | 1.0 | a merge join | none measured |
@@ -17416,10 +17416,11 @@ Sequential, index-only and plain index scans are the reference and have no setti
 nested loops (below, "Held out") and everything else (`OTHER`: a function scan, a MinMaxAgg, a
 nested loop over a materialized side).
 
-- **Hashed aggregates, 0.42.** Both measurements and both machines agree: hashing is charged one or
-  two `cpu_operator_cost` a row for about 94 ns (§10), and every plan with a hash aggregate runs at
-  0.31 to 0.62 of the reference. 0.42 is the 200-group plan, and the PostgreSQL 16 repro's ratio
-  (210 against lion's 510 there).
+- **Hashed aggregates, 0.1 of their own cost.** Hashing is charged one or two `cpu_operator_cost`
+  a row for about 94 ns (§10). Over a whole table that is most of the plan's time, and every such
+  plan ran at 0.31 to 0.62 of the reference; over a selective index scan it is almost none of it.
+  The rate is the hashing's, and a plan's own rate follows from its shape ("A hashed aggregate's
+  own rate", below).
 - **Hash joins, 0.5.** The FK-side join's competitor is a hash join of the fact with a filtered
   dimension, the small-hash end of §10's measurements (0.56, 0.57); joins that hash more run lower
   (0.37 at 140,000 rows, 0.11 in batches). 0.5 is the conservative end: a lower rate favours lion.
@@ -17735,7 +17736,7 @@ an index-only scan and run 1.4 times faster.
 | LionCount | 33 | 344 | 118 | 1,219 | | | |
 | aggregate over a sequential scan | 23 | 244 | 142 | 795 | 0.71 | 0.49 | `agg_rate` 1 |
 | aggregate over an index-only scan | 9 | 396 | 95 | 1,089 | 1.15 | 0.79 | `agg_rate` 1 |
-| hash aggregate | 18 | 212 | 121 | 799 | 0.62 | 0.42 | `hashagg_rate` 0.42 |
+| hash aggregate | 18 | 212 | 121 | 799 | 0.62 | 0.42 | per plan, from `hashagg_rate` 0.1 |
 | hash join | 19 | 298 | 175 | 558 | 0.87 | 0.60 | `hashjoin_rate` 0.5 |
 | merge join | 7 | 547 | 213 | 675 | 1.59 | 1.09 | `mergejoin_rate` 1 |
 | nested loop | 12 | 516 | 167 | 2,258 | 1.50 | 1.03 | the reference, 1 |
@@ -17792,6 +17793,42 @@ Differences of about 50 ms in time lost with no plan changed are the fastest arm
 What the held-out set found that no constant rate can fix: two GROUP BYs under a selective WHERE
 (`h.group.tag.w.c50`, `h.group.c1k.w.geo`) where the node, chosen at any of these rates, takes 148
 and 256 ms against a hash aggregate's 46 and 85.
+
+### A hashed aggregate's own rate
+
+Those two lost to one rate for every plan with a hash aggregate. Over `WHERE c50 = 9` (60,000 rows
+by an index scan) core's HashAggregate costs 60,997 and runs in 49 ms warm, 1,245 units a
+millisecond: its cost is the scan's, which runs near or above the reference, and its hashing is 314
+of it. At 0.42 the node's own 76,157 came to 31,986 and won; it takes 150 ms.
+
+So `pg_lion.hashagg_rate` is now the rate of the hashing alone - each hashed aggregate's cost less
+its input's - and the rest of the plan is taken at the reference
+(`lion_hashagg_plan_rate()`):
+
+    rate = total / ((total - hashing) + hashing / hashagg_rate)
+
+Fitted on the calibration matrix alone, its four whole-table GROUP BYs over a sequential scan
+(their time less the scan's cost at 500 units a millisecond, over the aggregate's own cost):
+0.106, 0.087, 0.116 and 0.110 for `c20`, `c200`, `c20, c2` and `c200, c20`; 0.1. A whole-table
+GROUP BY comes to 0.35 to 0.43 as before, the two above to 0.96 and 0.88.
+
+| | calibration set (39): mispicks, time lost | held out (41): mispicks, time lost |
+|---|---|---|
+| 0.42 for the whole plan | 3, 81 ms of 514 | 10, 509 ms of 4,549 |
+| 0.1 for the hashing | 4, 93 ms of 560 | 9, 311 ms of 4,432 |
+
+The plans that changed are the two above, now the hash aggregate (148 ms to 55, 256 to 127), and
+`fk.status.kind` and `h.fk.semi.d10`, the hash join's near ties, which moved with the run's noise
+and not with this rate: neither has a hashed aggregate over a scan. No GROUP BY of either set moved
+to a slower plan.
+
+What it gives back, in the regression suite: three small GROUP BYs. A whole-table one over a dirty
+heap of wide rows (`pushdown.sql`) is a tie on the release build, 14.8 ms against 15.6, and goes to
+the hash aggregate. A prepared top-k with its LIMIT a parameter (`topk.sql`) goes the other way, to
+the node. And a GROUP BY under `d @@ ANY (...)` over 4,000 rows (`positions.sql`) goes to the hash
+aggregate at 4.5 ms against the node's 2.4 (assert build): its input is a sequential scan whose `@@`
+core charges one `cpu_operator_cost` a row, far below its time, and only the hashing is now priced
+below its time. That error is the filter's cost, not the aggregate's.
 
 ### Tests
 

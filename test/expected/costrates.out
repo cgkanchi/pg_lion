@@ -10,8 +10,8 @@
 -- it, and that it is not applied where it hedges nothing - against a plan
 -- forced with nothing of core's left enabled, or the AM's own scan of a lion
 -- index; that each kind of competitor's rate moves the cost of the lion paths
--- that compete with that kind, linearly, decides a choice, and that no other
--- rate moves it; and that the AM's own scans and LionOrdered are not
+-- that compete with that kind - linearly, or for a hash aggregate through the
+-- share of its plan that hashes - and that no other rate moves it; and that the AM's own scans and LionOrdered are not
 -- converted.  The rows of every plan are checked against the same query run
 -- with lion's paths off and sequential scans only.
 \set VERBOSITY terse
@@ -35,7 +35,7 @@ SELECT name, setting, boot_val, min_val, max_val, context
 -------------------------+---------+----------+---------+---------+---------
  pg_lion.agg_rate        | 1       | 1        | 0.001   | 1000    | user
  pg_lion.bitmap_rate     | 1       | 1        | 0.001   | 1000    | user
- pg_lion.hashagg_rate    | 0.42    | 0.42     | 0.001   | 1000    | user
+ pg_lion.hashagg_rate    | 0.1     | 0.1      | 0.001   | 1000    | user
  pg_lion.hashjoin_rate   | 0.5     | 0.5      | 0.001   | 1000    | user
  pg_lion.mergejoin_rate  | 1       | 1        | 0.001   | 1000    | user
  pg_lion.pushdown_margin | 1       | 1        | 0.01    | 1       | user
@@ -305,9 +305,10 @@ SELECT n, lcr_lion(q, '{enable_bitmapscan, off}') AS plan,
 -- ---------- 3. the rates ----------
 -- Each kind of competitor, made the cheapest by core's settings: a plain
 -- aggregate over a sequential scan (index scans off), a hash aggregate
--- (sorts off), and a hash or merge join with the other two off.  The count, the
--- GROUP BY, the FK-side join and the semi and anti join paths each move with
--- their competitor's rate, linearly, and with no other.
+-- (sorts off), and a hash or merge join with the other two off.  The count,
+-- the FK-side join and the semi and anti join paths each move with their
+-- competitor's rate, linearly, and with no other; the GROUP BY moves with
+-- the hash aggregate's, and with no other (below for how).
 SELECT n, r.*
   FROM (VALUES ('count', 'SELECT count(*) FROM lcr WHERE g200 = 17',
 				'{enable_bitmapscan, off, enable_indexscan, off, enable_indexonlyscan, off}'::text[],
@@ -330,7 +331,7 @@ SELECT n, r.*
        n       |     plan     | moves | linear | others_do_not 
 ---------------+--------------+-------+--------+---------------
  count         | LionCount    | t     | t      | t
- group         | LionCount    | t     | t      | t
+ group         | LionCount    | t     | f      | t
  fkjoin, hash  | LionCount    | t     | t      | t
  fkjoin, merge | LionCount    | t     | t      | t
  semi, hash    | LionSemiJoin | t     | t      | t
@@ -349,15 +350,51 @@ SELECT lcr_lion(q, sw) AS plan,
  LionCount | t
 (1 row)
 
--- and the rate decides a choice: the GROUP BY against the hash aggregate at
--- the lowest rate and at the highest
-SELECT lcr_lion(q, '{enable_sort, off, pg_lion.hashagg_rate, 0.001}') AS lowest,
-	   lcr_lion(q, '{enable_sort, off, pg_lion.hashagg_rate, 1000}') AS highest
-  FROM (VALUES ('SELECT g20, count(*) FROM lcr GROUP BY g20')) v(q);
-  lowest   | highest 
------------+---------
- LionCount | core
-(1 row)
+-- A hash aggregate's rate is its hashing's (DESIGN.md §39, "A hashed
+-- aggregate's own rate"): pg_lion.hashagg_rate prices each hashed
+-- aggregate's own cost, its total less its input's, and the rest of core's
+-- plan is at the reference, so that a GROUP BY's price is its own times
+-- total / ((total - hashing) + hashing / rate).  lcr_hashrate() reads total
+-- and hashing from core's plan.
+CREATE FUNCTION lcr_hashrate(q text, sw text[], r float8) RETURNS float8
+LANGUAGE plpgsql AS $$
+DECLARE
+	p json;
+	n json;
+	total float8;
+	hashing float8 := 0;
+BEGIN
+	PERFORM lcr_set(sw || '{pg_lion.enable_count_pushdown, off}'::text[]);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
+	n := p->0->'Plan';
+	total := (n->>'Total Cost')::float8;
+	WHILE n IS NOT NULL LOOP
+		IF n->>'Node Type' = 'Aggregate' AND n->>'Strategy' = 'Hashed' THEN
+			hashing := hashing + (n->>'Total Cost')::float8 -
+				(n->'Plans'->0->>'Total Cost')::float8;
+		END IF;
+		n := n->'Plans'->0;
+	END LOOP;
+	RETURN total / ((total - hashing) + hashing / r);
+END $$;
+-- over the whole table the hashing is most of the time, and the rate low;
+-- over a selective WHERE it is almost none of it, and the rate near 1
+SELECT n, lcr_lion(q, sw) AS plan, lcr_hashrate(q, sw, 0.1) < 0.6 AS hashing_bound,
+	   lcr_hashrate(q, sw, 0.1) > 0.9 AS input_bound,
+	   bool_and(abs(lcr_cost(q, sw || ARRAY['pg_lion.hashagg_rate', r::text]) -
+					lcr_cost(q, sw || '{pg_lion.hashagg_rate, 1}'::text[]) *
+					lcr_hashrate(q, sw, r)) < 0.01) AS priced_so
+  FROM (VALUES ('group', 'SELECT g20, count(*) FROM lcr GROUP BY g20',
+				'{enable_sort, off}'::text[]),
+			   ('group, filtered', 'SELECT g20, count(*) FROM lcr WHERE g200 = 17 GROUP BY g20',
+				'{enable_sort, off}'::text[])) v(n, q, sw),
+	   unnest('{0.05, 0.1, 0.5}'::float8[]) r
+ GROUP BY n, q, sw ORDER BY n;
+        n        |   plan    | hashing_bound | input_bound | priced_so 
+-----------------+-----------+---------------+-------------+-----------
+ group           | LionCount | t             | f           | t
+ group, filtered | LionCount | f             | t           | t
+(2 rows)
 
 -- ---------- 4. what is not converted ----------
 -- the AM's own scans (the count's pushdown off, sequential scans off) cost
@@ -405,6 +442,7 @@ SELECT n, lcr_same(q, sw) AS answer
 (8 rows)
 
 DROP TABLE lcr, lcrp, lcrf, lcrd;
+DROP FUNCTION lcr_hashrate(text, text[], float8);
 DROP FUNCTION lcr_rates(text, text[], text[], text[]);
 DROP FUNCTION lcr_same(text, text[]);
 DROP FUNCTION lcr_lion(text, text[]);
