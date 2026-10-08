@@ -120,6 +120,8 @@ lion_query_is_full_scan(IndexOptInfo *index, int col, StrategyNumber strategy,
 	 * (lion_scan.c, lion_emit_query()), so only a query no key narrows -
 	 * `!a`, `@> '{}'`, `<@` - reads the whole index.
 	 */
+	if (strategy == LION_STRAT_MATCH)
+		query = lion_tsquery_strip_prefixes(query);	/* §17, "Prefix lexemes" */
 	lion_extract_query_superset(&state, query, strategy, &q);
 	full = (q.mode == LION_QMODE_ALL);
 

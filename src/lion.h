@@ -1247,6 +1247,20 @@ extern void lion_extract_query_superset(LionState *state, Datum query,
 extern bool lion_tsquery_item_keys(LionState *state, Datum query,
 								   StrategyNumber strategy, Datum **itemkeys);
 
+/*
+ * Prefix lexemes (DESIGN.md §17, "Prefix lexemes").  lion_tsquery_expand_prefixes()
+ * rewrites each `foo:*` of a tsquery into the OR of the lexemes the index
+ * holds that start with foo, which every caller then answers like any other
+ * query; *expanded says whether it could (false: the query comes back as it
+ * was).  lion_tsquery_strip_prefixes() is the planner's stand-in, before any
+ * index is open: `foo:*` becomes the lexeme `foo`, which has the expansion's
+ * shape.  lion_tsquery_has_prefix() says whether a query has one at all.
+ */
+extern Datum lion_tsquery_expand_prefixes(Relation index, LionState *col,
+										  Datum query, bool *expanded);
+extern Datum lion_tsquery_strip_prefixes(Datum query);
+extern bool lion_tsquery_has_prefix(Datum query);
+
 
 /* ---------- the page layer (lion_pages.c, lion_meta.c, lion_state.c, lion_entry.c,
  * lion_posting_put.c): primitives shared by build/insert/scan/vacuum ---------- */

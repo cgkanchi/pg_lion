@@ -409,7 +409,7 @@ SELECT q, pos_rechecked(q) FROM (VALUES
  'common' <-> 'again'    | f
  'everywhere' & !'again' | f
  'w1':A                  | f
- 'common' <-> 'ag':*     | t
+ 'common' <-> 'ag':*     | f
 (4 rows)
 
 DROP FUNCTION pos_rechecked(tsquery);
@@ -467,8 +467,7 @@ SELECT pos_any_explain('{"common <-> again", "common <-> ag:*"}');
 ------------------------------------------------------------------------------------------------
  Index Scan using pos_docs_d on pos_docs
    Index Cond: (d @@ ANY ('{"''common'' <-> ''again''","''common'' <-> ''ag'':*"}'::tsquery[]))
-   Rows Removed by Index Recheck: 1
-(3 rows)
+(2 rows)
 
 DROP FUNCTION pos_any_explain(tsquery[]);
 -- The count pushdown decides the same candidates from the positions before
@@ -520,12 +519,13 @@ SELECT pos_count_explain('common <-> again');
 (4 rows)
 
 SELECT pos_count_explain('common <-> ag:*');
-      pos_count_explain       
-------------------------------
+       pos_count_explain        
+--------------------------------
  Custom Scan (LionCount)
-   Heap TIDs Rechecked: 547
-   Rows Removed by Recheck: 1
-(3 rows)
+   Heap TIDs Rechecked: 0
+   Position Checks: 547
+   Rows Removed by Positions: 1
+(4 rows)
 
 DROP FUNCTION pos_count_explain(tsquery);
 -- ... and per group: the walk that intersects a copy of the WHERE with every
