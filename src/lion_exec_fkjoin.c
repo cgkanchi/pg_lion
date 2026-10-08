@@ -824,11 +824,11 @@ lion_join_next_key(LionCountScanState *st)
 		st->joinhaveprev = true;
 
 		chunk = st->joinkeypos++ / LION_FKJOIN_UNIQUE_CHUNK;
-		if (st->joinshared != NULL)
+		if (st->shared != NULL)
 		{
 			if (st->joinchunk < chunk)
 				st->joinchunk = (int64)
-					pg_atomic_fetch_add_u32(&st->joinshared->nextchunk, 1);
+					pg_atomic_fetch_add_u32(&st->shared->nextchunk, 1);
 			if (st->joinchunk != chunk)
 				continue;
 		}

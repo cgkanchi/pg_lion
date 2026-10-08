@@ -1240,8 +1240,8 @@ lion_group_batch_fill(LionCountScanState *st)
 /*
  * The WHERE items of a parallel GROUP BY collected for one range of container
  * keys, lo up to hi (lion_sources_collect_range()), into st->wherecoll in
- * grangecxt: lion_where_collect() for the keys of the range alone, under the
- * same budget and spilling the same way.  False when the range needs no
+ * st->ranged->cxt: lion_where_collect() for the keys of the range alone, under
+ * the same budget and spilling the same way.  False when the range needs no
  * counting at all: the intersection has no container there, or no source has
  * a found set - which leaves a positive source with none, and nothing in the
  * intersection anywhere.  A WHERE of negated sources alone has nothing to
@@ -1261,7 +1261,7 @@ lion_where_collect_range(LionCountScanState *st, uint32 lo, uint64 hi)
 	if (RecoveryInProgress())
 		elog(ERROR, "LionCount: a parallel GROUP BY during recovery");
 
-	oldcxt = MemoryContextSwitchTo(st->grangecxt);
+	oldcxt = MemoryContextSwitchTo(lion_st_ranged(st)->cxt);
 	items = (LionCountSource *) palloc(sizeof(LionCountSource) *
 									   Max(st->nitem, 1));
 	for (k = 1; k <= st->nitem; k++)
@@ -1317,7 +1317,8 @@ lion_where_collect_range(LionCountScanState *st, uint32 lo, uint64 hi)
 static bool
 lion_group_range_next(LionCountScanState *st)
 {
-	LionJoinShared *shared = st->joinshared;
+	LionJoinShared *shared = st->shared;
+	LionRangedState *rs = lion_st_ranged(st);
 	EState	   *estate = st->css.ss.ps.state;
 	int			k;
 
@@ -1329,12 +1330,12 @@ lion_group_range_next(LionCountScanState *st)
 	}
 	lion_posting_set_release(&st->wherecoll);
 	st->wcollected = false;
-	st->grange = -1;
-	if (st->grangecxt == NULL)
-		st->grangecxt = AllocSetContextCreate(estate->es_query_cxt,
-											  "LionCount key range",
-											  ALLOCSET_DEFAULT_SIZES);
-	MemoryContextReset(st->grangecxt);
+	rs->range = -1;
+	if (rs->cxt == NULL)
+		rs->cxt = AllocSetContextCreate(estate->es_query_cxt,
+										"LionCount key range",
+										ALLOCSET_DEFAULT_SIZES);
+	MemoryContextReset(rs->cxt);
 
 	/*
 	 * Every count is the group's set ANDed with the one copy: nothing else
@@ -1358,21 +1359,21 @@ lion_group_range_next(LionCountScanState *st)
 			return false;
 		CHECK_FOR_INTERRUPTS();
 
-		st->granges++;
+		rs->ranges++;
 		lion_key_range(shared->nranges, shared->ckeys, (int) r, &lo, &hi);
 		if (!lion_where_collect_range(st, lo, hi))
 		{
 			/* nothing of the WHERE in the range: no group has a row there */
 			lion_posting_set_release(&st->wherecoll);
 			st->wcollected = false;
-			MemoryContextReset(st->grangecxt);
+			MemoryContextReset(rs->cxt);
 			continue;
 		}
 
 		lion_entry_scan_begin_range(&st->escan, st->groupidx, st->groupidxcol,
 									NULL);
 		st->scanning = true;
-		st->grange = (int) r;
+		rs->range = (int) r;
 		return true;
 	}
 }
@@ -1386,6 +1387,8 @@ lion_group_range_next(LionCountScanState *st)
 TupleTableSlot *
 lion_next_group_ranged(LionCountScanState *st, bool *exhausted)
 {
+	LionRangedState *rs = lion_st_ranged(st);
+
 	*exhausted = false;
 
 	for (;;)
@@ -1405,7 +1408,7 @@ lion_next_group_ranged(LionCountScanState *st, bool *exhausted)
 			return lion_emit_tuple(st, st->gbkey[i], st->gbnull[i],
 								   (Datum) 0, true, st->gbcount[i]);
 		}
-		if (st->grange >= 0 && lion_group_batch_fill(st))
+		if (rs->range >= 0 && lion_group_batch_fill(st))
 			continue;
 		if (!lion_group_range_next(st))
 		{

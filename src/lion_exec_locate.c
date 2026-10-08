@@ -1297,10 +1297,13 @@ lion_release_where(LionCountScanState *st)
 	if (st->gbatchcxt != NULL)
 		MemoryContextReset(st->gbatchcxt);
 
-	/* ... and a parallel GROUP BY's range, whose copy it was (grangecxt) */
-	st->grange = -1;
-	if (st->grangecxt != NULL)
-		MemoryContextReset(st->grangecxt);
+	/* ... and a parallel GROUP BY's range, whose copy it was (its cxt) */
+	if (st->ranged != NULL)
+	{
+		st->ranged->range = -1;
+		if (st->ranged->cxt != NULL)
+			MemoryContextReset(st->ranged->cxt);
+	}
 
 	/* ... and so do the values of a list counted in batches */
 	if (st->lbatch != NULL)
