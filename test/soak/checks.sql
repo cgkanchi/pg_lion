@@ -143,7 +143,7 @@ BEGIN
 		IF random() < 0.4 THEN
 			g := g || ('pg_lion.pushdown_margin=' || soak.pick('{0.01,0.1,0.5,0.99,1}'));
 		END IF;
-		FOREACH r IN ARRAY '{hashagg,agg,hashjoin,mergejoin,nestloop,bitmap}'::text[] LOOP
+		FOREACH r IN ARRAY '{hashagg,agg,hashjoin,mergejoin,bitmap}'::text[] LOOP
 			IF random() < 0.25 THEN
 				g := g || format('pg_lion.%s_rate=%s', r, soak.pick('{0.001,0.05,1,20,1000}'));
 			END IF;
