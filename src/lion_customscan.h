@@ -1375,6 +1375,33 @@ typedef struct LionDecodeRun
 } LionDecodeRun;
 
 /*
+ * The top k of a GROUP BY ordered by its count (DESIGN.md §36): n is k,
+ * cand how many entries the walk of the entries' counts keeps, strict that
+ * every group tied with the k-th must come out.  lion_topk_run() fills key,
+ * isnull and count with the groups it counted, in cxt, and the rows go up
+ * one a call; ran says it has run, and whole that it could not prove its
+ * candidates enough, so the walk counts every group as without a k.  walked
+ * and counted are what EXPLAIN ANALYZE reports.
+ */
+typedef struct LionTopkState
+{
+	int64		n;
+	int			cand;
+	bool		strict;
+	bool		ran;
+	bool		whole;
+	MemoryContext cxt;
+	Datum	   *key;
+	bool	   *isnull;
+	int64	   *count;
+	int			out;
+	int			pos;
+	int64		walked;
+	int64		counted;
+	int64		wholes;
+} LionTopkState;
+
+/*
  * A lion column whose entries the aggregates of DESIGN.md §37 are taken
  * over, and one of those aggregates.
  */
@@ -1746,29 +1773,10 @@ typedef struct LionCountScanState
 	int64		groupsbatched;
 
 	/*
-	 * The top k of a GROUP BY ordered by its count (DESIGN.md §36): topkn is
-	 * k (0: every group), topkcand how many entries the walk of the entries'
-	 * counts keeps, topkstrict that every group tied with the k-th must come
-	 * out.  lion_topk_run() fills topkkey, topknull and topkcount with the
-	 * groups it counted, in topkcxt, and the rows go up one a call; topkran
-	 * says it has run, and topkwhole that it could not prove its candidates
-	 * enough, so the walk counts every group as without a k.  topkwalked and
-	 * topkcounted are what EXPLAIN ANALYZE reports.
+	 * The top k of a GROUP BY ordered by its count (DESIGN.md §36), or NULL
+	 * when the plan has no k (lion_st_topk()).
 	 */
-	int64		topkn;
-	int			topkcand;
-	bool		topkstrict;
-	bool		topkran;
-	bool		topkwhole;
-	MemoryContext topkcxt;
-	Datum	   *topkkey;
-	bool	   *topknull;
-	int64	   *topkcount;
-	int			topkout;
-	int			topkpos;
-	int64		topkwalked;
-	int64		topkcounted;
-	int64		topkwholes;
+	struct LionTopkState *topk;
 
 	/*
 	 * The aggregates over the entries of lion columns (DESIGN.md §37): nwcol
@@ -2135,6 +2143,14 @@ typedef struct LionCountScanState
 	int64		fggroupcounts;
 	int64		fgworkergroupcounts;
 } LionCountScanState;
+
+/* The top k's state, which only a plan with a k has (DESIGN.md §36) */
+static inline LionTopkState *
+lion_st_topk(LionCountScanState *st)
+{
+	Assert(st->topk != NULL);
+	return st->topk;
+}
 
 /*
  * What the participants of a parallel FK-side join add up for EXPLAIN

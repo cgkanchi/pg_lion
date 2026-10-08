@@ -1527,8 +1527,8 @@ lion_topk_push(int64 *heap, int *n, int64 cap, int64 v)
 
 /*
  * THE TOP k OF A GROUP BY ORDERED BY ITS COUNT (DESIGN.md §36): the groups
- * that can be among the first k, counted, into topkkey, topknull and
- * topkcount - or topkwhole set when the candidates could not be shown to be
+ * that can be among the first k, counted, into the top k's key, isnull and
+ * count - or its whole set when the candidates could not be shown to be
  * enough, and the walk then counts every group as it would without a k.
  *
  * An entry's ntids is the number of TIDs its posting set holds, and a group
@@ -1539,7 +1539,7 @@ lion_topk_push(int64 *heap, int *n, int64 cap, int64 v)
  *
  * One walk of the driving column's entries (the same walk, under the same
  * range, as the groups would be counted in) reads nothing but their headers
- * and keeps the topkcand largest; maxout is the largest count it left out.
+ * and keeps the tk->cand largest; maxout is the largest count it left out.
  * The candidates are then counted exactly, largest bound first, until the
  * k-th largest count so far is at least the next bound - more than it, when
  * every group tied with the k-th has to come out: no group not yet counted
@@ -1553,12 +1553,13 @@ static void
 lion_topk_run(LionCountScanState *st)
 {
 	EState	   *estate = st->css.ss.ps.state;
+	LionTopkState *tk = lion_st_topk(st);
 	LionEntryScan es;
 	LionTopkCand *cand;
 	MemoryContext oldcxt;
 	int64	   *heap;
 	int			nheap = 0;
-	int			cap = st->topkcand;
+	int			cap = tk->cand;
 	int			n = 0;
 	int			i;
 	uint64		maxout = 0;
@@ -1572,13 +1573,13 @@ lion_topk_run(LionCountScanState *st)
 	bool		exclnull = false;
 	int			k;
 
-	st->topkran = true;
-	if (st->topkcxt == NULL)
-		st->topkcxt = AllocSetContextCreate(estate->es_query_cxt,
-											"LionCount top k",
-											ALLOCSET_DEFAULT_SIZES);
-	MemoryContextReset(st->topkcxt);
-	oldcxt = MemoryContextSwitchTo(st->topkcxt);
+	tk->ran = true;
+	if (tk->cxt == NULL)
+		tk->cxt = AllocSetContextCreate(estate->es_query_cxt,
+										"LionCount top k",
+										ALLOCSET_DEFAULT_SIZES);
+	MemoryContextReset(tk->cxt);
+	oldcxt = MemoryContextSwitchTo(tk->cxt);
 
 	/*
 	 * The entries the WHERE takes out whole: `g <> c` subtracts c's entry and
@@ -1614,7 +1615,7 @@ lion_topk_run(LionCountScanState *st)
 		}
 	}
 
-	/* ---- the entries' own counts: the topkcand largest, and maxout ---- */
+	/* ---- the entries' own counts: the tk->cand largest, and maxout ---- */
 	cand = (LionTopkCand *) palloc(sizeof(LionTopkCand) * 2 * cap);
 	lion_entry_scan_begin_range(&es, st->groupidx, st->groupidxcol,
 								st->hasrange ? &st->range : NULL);
@@ -1628,7 +1629,7 @@ lion_topk_run(LionCountScanState *st)
 		entry = lion_entry_scan_next_copy(&es, &itemlen);
 		if (entry == NULL)
 			break;
-		st->topkwalked++;
+		tk->walked++;
 
 		if (LionEntryIsNullKey(entry) ? exclnull :
 			lion_topk_excluded(es.state, entry, excl, nexcl))
@@ -1655,13 +1656,13 @@ lion_topk_run(LionCountScanState *st)
 	n = lion_topk_trim(cand, n, cap, byval, &maxout);
 
 	/* ---- counted, largest bound first, until the rest cannot matter ---- */
-	st->topkkey = (Datum *) palloc(sizeof(Datum) * Max(n, 1));
-	st->topknull = (bool *) palloc(sizeof(bool) * Max(n, 1));
-	st->topkcount = (int64 *) palloc(sizeof(int64) * Max(n, 1));
+	tk->key = (Datum *) palloc(sizeof(Datum) * Max(n, 1));
+	tk->isnull = (bool *) palloc(sizeof(bool) * Max(n, 1));
+	tk->count = (int64 *) palloc(sizeof(int64) * Max(n, 1));
 	heap = (int64 *) palloc(sizeof(int64) * Min((int64) Max(n, 1),
-												 st->topkn));
-	st->topkout = 0;
-	st->topkpos = 0;
+												 tk->n));
+	tk->out = 0;
+	tk->pos = 0;
 	MemoryContextSwitchTo(oldcxt);
 
 	for (i = 0; i < n && !enough; i++)
@@ -1693,15 +1694,15 @@ lion_topk_run(LionCountScanState *st)
 							 st->groupset.ntids, i + 1 < n) : 0;
 		lion_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
-		st->topkcounted++;
+		tk->counted++;
 
 		if (count > 0)
 		{
-			st->topkkey[st->topkout] = cand[i].key;
-			st->topknull[st->topkout] = cand[i].isnull;
-			st->topkcount[st->topkout] = count;
-			st->topkout++;
-			lion_topk_push(heap, &nheap, st->topkn, count);
+			tk->key[tk->out] = cand[i].key;
+			tk->isnull[tk->out] = cand[i].isnull;
+			tk->count[tk->out] = count;
+			tk->out++;
+			lion_topk_push(heap, &nheap, tk->n, count);
 		}
 
 		/*
@@ -1710,8 +1711,8 @@ lion_topk_run(LionCountScanState *st)
 		 */
 		if (next == 0)
 			enough = true;
-		else if (nheap >= st->topkn &&
-				 (st->topkstrict ? (uint64) heap[0] > next :
+		else if (nheap >= tk->n &&
+				 (tk->strict ? (uint64) heap[0] > next :
 				  (uint64) heap[0] >= next))
 			enough = true;
 	}
@@ -1720,13 +1721,13 @@ lion_topk_run(LionCountScanState *st)
 
 	if (!enough)
 	{
-		st->topkwhole = true;
-		st->topkwholes++;
-		MemoryContextReset(st->topkcxt);
-		st->topkkey = NULL;
-		st->topknull = NULL;
-		st->topkcount = NULL;
-		st->topkout = 0;
+		tk->whole = true;
+		tk->wholes++;
+		MemoryContextReset(tk->cxt);
+		tk->key = NULL;
+		tk->isnull = NULL;
+		tk->count = NULL;
+		tk->out = 0;
 	}
 }
 
@@ -1777,22 +1778,24 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 		 * them, counted before the first row goes up - unless that could not
 		 * be shown, when the walk below counts every group.
 		 */
-		if (st->topkn > 0 && !st->topkwhole)
+		if (st->topk != NULL && !st->topk->whole)
 		{
-			if (!st->topkran)
+			LionTopkState *tk = st->topk;
+
+			if (!tk->ran)
 				lion_topk_run(st);
-			if (!st->topkwhole)
+			if (!tk->whole)
 			{
 				int			i;
 
-				if (st->topkpos >= st->topkout)
+				if (tk->pos >= tk->out)
 				{
 					*exhausted = true;
 					return NULL;
 				}
-				i = st->topkpos++;
-				return lion_emit_tuple(st, st->topkkey[i], st->topknull[i],
-									   (Datum) 0, true, st->topkcount[i]);
+				i = tk->pos++;
+				return lion_emit_tuple(st, tk->key[i], tk->isnull[i],
+									   (Datum) 0, true, tk->count[i]);
 			}
 		}
 
