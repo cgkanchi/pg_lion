@@ -444,8 +444,8 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 			 * group whole as the serial node does: one partial row a group,
 			 * which the Finalize Agg takes as it takes any.
 			 */
-			Assert(st->granged && !st->sumall && st->distattno == 0);
-			if (st->joinshared != NULL)
+			Assert(st->ranged != NULL && !st->sumall && st->distattno == 0);
+			if (st->shared != NULL)
 			{
 				bool		exhausted;
 				TupleTableSlot *slot = lion_next_group_ranged(st, &exhausted);
@@ -460,7 +460,7 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		case LION_MODE_GROUP2:
 		case LION_MODE_GROUP_DISTINCT:
 		case LION_MODE_DECODE:
-			Assert(!st->granged && !st->sumall &&
+			Assert(st->ranged == NULL && !st->sumall &&
 				   !(st->distattno != 0 && st->groupattno == 0));
 			break;
 
@@ -691,7 +691,7 @@ lion_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
 {
 	LionCountScanState *st = (LionCountScanState *) node;
 
-	if (st->granged)
+	if (st->ranged != NULL)
 		return MAXALIGN(sizeof(LionJoinShared));
 	return MAXALIGN(sizeof(LionJoinShared)) +
 		(Size) ((st->joincollect && st->npart > 0) ? st->npart : 1) *
@@ -733,7 +733,7 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	SpinLockInit(&shared->mutex);
 	shared->filterrows = -1;
 	pg_atomic_init_u32(&shared->nextchunk, 0);
-	st->joinshared = shared;
+	st->shared = shared;
 
 	/*
 	 * Every participant locates the fact filters for itself, so each takes
@@ -748,7 +748,7 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	 * made for, whether they all start or not - the ones that do claim the
 	 * ranges of the ones that do not.
 	 */
-	if (st->granged)
+	if (st->ranged != NULL)
 		shared->nranges = lion_key_ranges(RelationGetNumberOfBlocks(st->heap),
 										  shared->participants,
 										  lion_parallel_range_keys,
@@ -829,7 +829,7 @@ lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	SpinLockRelease(&shared->mutex);
 
 	/* a parallel GROUP BY's ranges, cut again over the heap as it is now */
-	if (st->granged)
+	if (st->ranged != NULL)
 		shared->nranges = lion_key_ranges(RelationGetNumberOfBlocks(st->heap),
 										  shared->participants,
 										  lion_parallel_range_keys,
@@ -880,25 +880,25 @@ lion_initialize_worker(CustomScanState *node, shm_toc *toc, void *coordinate)
 {
 	LionCountScanState *st = (LionCountScanState *) node;
 
-	st->joinshared = (LionJoinShared *) coordinate;
-	lion_list_pin_participants(st->joinshared->participants);
+	st->shared = (LionJoinShared *) coordinate;
+	lion_list_pin_participants(st->shared->participants);
 
 	/* the fact filters' copy, and the file set its chunks may spill to */
-	if (st->joinshared->copyready && st->joinpart == NULL)
+	if (st->shared->copyready && st->joinpart == NULL)
 	{
-		st->joinsharedcopy = LION_JOIN_SHARED_COPY(st->joinshared);
+		st->joinsharedcopy = LION_JOIN_SHARED_COPY(st->shared);
 		lion_shared_copy_attach(st->joinsharedcopy);
 	}
 
 	/* ... or each leaf partition's */
-	if (st->joinshared->copyready && st->joinpart != NULL)
+	if (st->shared->copyready && st->joinpart != NULL)
 	{
 		int			p;
 
 		for (p = 0; p < st->npart; p++)
 		{
 			st->joinpart[p].shared =
-				LION_JOIN_SHARED_PART_COPY(st->joinshared, p);
+				LION_JOIN_SHARED_PART_COPY(st->shared, p);
 			lion_shared_copy_attach(st->joinpart[p].shared);
 		}
 	}
@@ -922,7 +922,8 @@ void
 lion_shutdown_custom_scan(CustomScanState *node)
 {
 	LionCountScanState *st = (LionCountScanState *) node;
-	LionJoinShared *shared = st->joinshared;
+	LionJoinShared *shared = st->shared;
+	LionRangedState *rs = st->ranged;
 	int			i;
 
 	if (shared == NULL)
@@ -972,7 +973,8 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		shared->switchkeys += st->joinswitchkeys;
 		for (i = 0; i < LION_JT_N; i++)
 			INSTR_TIME_ADD(shared->time[i], st->jointime[i]);
-		shared->ranges += st->granges;
+		if (rs != NULL)
+			shared->ranges += rs->ranges;
 		shared->wherecollected += st->wherecollected;
 		shared->wherespilled += st->wherespilled;
 		shared->groupbatches += st->groupbatches;
@@ -1000,11 +1002,14 @@ lion_shutdown_custom_scan(CustomScanState *node)
 	st->joinworkerswitchkeys = shared->switchkeys;
 	for (i = 0; i < LION_JT_N; i++)
 		st->joinworkertime[i] = shared->time[i];
-	st->workerranges = shared->ranges;
-	st->workerwherecollected = shared->wherecollected;
-	st->workerwherespilled = shared->wherespilled;
-	st->workergroupbatches = shared->groupbatches;
-	st->workergroupsbatched = shared->groupsbatched;
+	if (rs != NULL)
+	{
+		rs->workerranges = shared->ranges;
+		rs->workerwherecollected = shared->wherecollected;
+		rs->workerwherespilled = shared->wherespilled;
+		rs->workergroupbatches = shared->groupbatches;
+		rs->workergroupsbatched = shared->groupsbatched;
+	}
 	st->fgworkergroupcounts = shared->factgroupcounts;
 	SpinLockRelease(&shared->mutex);
 }
@@ -1017,7 +1022,7 @@ lion_end_custom_scan(CustomScanState *node)
 	lion_reset_run(st);
 
 	/* the leader's share of the list pin budget is its whole again */
-	if (st->joinshared != NULL && !IsParallelWorker())
+	if (st->shared != NULL && !IsParallelWorker())
 		lion_list_pin_participants(1);
 
 	if (st->child != NULL)
