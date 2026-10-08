@@ -70,11 +70,12 @@ lion_create_custom_scan_state(CustomScan *cscan)
  * outer_entries times.  It is kept as the fallback for the case the keys do
  * not fit the work_mem budget - a grouping the cost model did not expect, the
  * §16 lesson that a plan-time bound is only as good as estimate_num_groups -
- * and then innerkey is left NULL.
+ * and then the inner key array is left NULL.
  */
 static void
 lion_load_inner_keys(LionCountScanState *st)
 {
+	LionInnerState *inner = lion_st_inner(st);
 	LionEntryScan es;
 	LionState  *istate = lion_index_column_state(st->groupidx2,
 												st->groupidxcol2);
@@ -87,7 +88,7 @@ lion_load_inner_keys(LionCountScanState *st)
 	bool	   *isnull;
 	bool		full = false;
 
-	Assert(st->innerkey == NULL);
+	Assert(inner->key == NULL);
 
 	MemoryContextReset(st->innercxt);
 	oldcxt = MemoryContextSwitchTo(st->innercxt);
@@ -144,15 +145,15 @@ lion_load_inner_keys(LionCountScanState *st)
 	{
 		/* Too many to keep: walk the inner index per outer group instead. */
 		MemoryContextReset(st->innercxt);
-		st->innerkey = NULL;
-		st->innerisnull = NULL;
-		st->ninnerkey = 0;
+		inner->key = NULL;
+		inner->isnull = NULL;
+		inner->nkey = 0;
 		return;
 	}
 
-	st->innerkey = keys;
-	st->innerisnull = isnull;
-	st->ninnerkey = n;
+	inner->key = keys;
+	inner->isnull = isnull;
+	inner->nkey = n;
 }
 
 /*
@@ -649,9 +650,12 @@ lion_close_relation(LionCountScanState *st)
 			dr->idxcol[c] = 0;
 		}
 	}
-	st->innerkey = NULL;
-	st->innerisnull = NULL;
-	st->ninnerkey = 0;
+	if (st->inner != NULL)
+	{
+		st->inner->key = NULL;
+		st->inner->isnull = NULL;
+		st->inner->nkey = 0;
+	}
 	if (st->innercxt != NULL)
 		MemoryContextReset(st->innercxt);
 	for (i = 0; i < st->nclause; i++)
@@ -763,6 +767,42 @@ lion_begin_list_batch(LionCountScanState *st, EState *estate)
 }
 
 /*
+ * count(DISTINCT k) (DESIGN.md §26): what its tests count and what they
+ * found.  Its state is there only when the plan has a k; which tests count
+ * is set from the target list (lion_begin_target_list()).
+ */
+static void
+lion_begin_distinct(LionCountScanState *st, const LionCountPriv *priv,
+					EState *estate)
+{
+	st->dist = NULL;
+	if (priv->distattno == 0)
+		return;
+
+	st->dist = (LionDistinctState *)
+		MemoryContextAllocZero(estate->es_query_cxt,
+							   sizeof(LionDistinctState));
+}
+
+/*
+ * The nested loop of a two-column GROUP BY (DESIGN.md §20) or of the (g, k)
+ * pairs of a count(DISTINCT k) per group (§26).  Its state is there only when
+ * the plan has an inner index; its keys are read per relation
+ * (lion_load_inner_keys()).
+ */
+static void
+lion_begin_inner(LionCountScanState *st, const LionCountPriv *priv,
+				 EState *estate)
+{
+	st->inner = NULL;
+	if (lion_count_priv_inner_attno(priv) == 0)
+		return;
+
+	st->inner = (LionInnerState *)
+		MemoryContextAllocZero(estate->es_query_cxt, sizeof(LionInnerState));
+}
+
+/*
  * GROUP BY coalesce(g, c) (DESIGN.md §10): c and its equality.  Their state
  * is there only when the plan groups by a coalesce.
  */
@@ -866,15 +906,15 @@ lion_begin_target_list(LionCountScanState *st, CustomScan *cscan,
 		switch (st->tlkind[i])
 		{
 			case LION_TL_COUNT_DISTCOL:
-				st->distfull = true;
+				lion_st_dist(st)->full = true;
 				break;
 			case LION_TL_COUNT:
 			case LION_TL_COUNT_GROUPCOL:
 			case LION_TL_COUNT_GROUPCOL2:
 				if (st->groupattno == 0)
-					st->distfull = true;
+					lion_st_dist(st)->full = true;
 				else
-					st->distgroupcount = true;
+					lion_st_dist(st)->groupcount = true;
 				break;
 			default:
 				break;
@@ -1562,6 +1602,8 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_topk(st, &priv, estate);
 	lion_begin_coalesce(st, &priv, estate);
 	lion_begin_list_batch(st, estate);
+	lion_begin_distinct(st, &priv, estate);
+	lion_begin_inner(st, &priv, estate);
 	lion_begin_join(st, &priv);
 	lion_begin_target_list(st, cscan, &priv);
 	lion_begin_wagg(st, node, &priv, exprs, estate);
