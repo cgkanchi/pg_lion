@@ -1669,23 +1669,24 @@ static void
 lion_join_group_row(LionCountScanState *st, int ent, Datum key, bool isnull,
 					int64 count)
 {
+	LionFactGroupState *fg = lion_st_fg(st);
 	LionJoinGroupRow *r;
 
-	if (st->fgnrows >= st->fgrowcap)
+	if (fg->nrows >= fg->rowcap)
 	{
-		Size		cap = (st->fgrowcap == 0) ? 256 : (Size) st->fgrowcap * 2;
+		Size		cap = (fg->rowcap == 0) ? 256 : (Size) fg->rowcap * 2;
 
-		if (st->fgrows == NULL)
-			st->fgrows = (LionJoinGroupRow *)
-				MemoryContextAllocExtended(st->fgrowcxt,
+		if (fg->rows == NULL)
+			fg->rows = (LionJoinGroupRow *)
+				MemoryContextAllocExtended(fg->rowcxt,
 										   sizeof(LionJoinGroupRow) * cap,
 										   MCXT_ALLOC_HUGE);
 		else
-			st->fgrows = (LionJoinGroupRow *)
-				repalloc_huge(st->fgrows, sizeof(LionJoinGroupRow) * cap);
-		st->fgrowcap = (int) Min(cap, (Size) INT_MAX);
+			fg->rows = (LionJoinGroupRow *)
+				repalloc_huge(fg->rows, sizeof(LionJoinGroupRow) * cap);
+		fg->rowcap = (int) Min(cap, (Size) INT_MAX);
 	}
-	r = &st->fgrows[st->fgnrows++];
+	r = &fg->rows[fg->nrows++];
 	r->ent = ent;
 	r->key = key;
 	r->isnull = isnull;
@@ -1694,11 +1695,13 @@ lion_join_group_row(LionCountScanState *st, int ent, Datum key, bool isnull,
 
 /*
  * Batch entry k's key looked up in the relation being counted and counted in
- * each group of the chunk located (fgsets), the counts that are not 0 put by.
+ * each group of the chunk located (fg->sets), the counts that are not 0 put
+ * by.
  */
 static void
 lion_join_count_groups(LionCountScanState *st, int k, bool walked)
 {
+	LionFactGroupState *fg = lion_st_fg(st);
 	LionJoinEnt *ent = &st->joinbatch[k];
 	MemoryContext oldcxt;
 	instr_time	t;
@@ -1723,19 +1726,19 @@ lion_join_count_groups(LionCountScanState *st, int k, bool walked)
 		int64		pages = lion_posting_pages_read;
 
 		/* the key's set and the filters - or their copy - and one group */
-		Assert(nbase + 1 <= st->fgnsrc);
-		for (j = 0; j < st->fgn; j++)
+		Assert(nbase + 1 <= fg->nsrc);
+		for (j = 0; j < fg->n; j++)
 		{
 			int64		count;
 
-			memcpy(st->fgsrc, base, sizeof(LionCountSource) * nbase);
-			memset(&st->fgsrc[nbase], 0, sizeof(LionCountSource));
-			st->fgsrc[nbase].nsets = 1;
-			st->fgsrc[nbase].sets = &st->fgsets[j];
-			count = lion_node_count(st, nbase + 1, st->fgsrc, false);
-			st->fggroupcounts++;
+			memcpy(fg->src, base, sizeof(LionCountSource) * nbase);
+			memset(&fg->src[nbase], 0, sizeof(LionCountSource));
+			fg->src[nbase].nsets = 1;
+			fg->src[nbase].sets = &fg->sets[j];
+			count = lion_node_count(st, nbase + 1, fg->src, false);
+			fg->groupcounts++;
 			if (count > 0)
-				lion_join_group_row(st, k, st->fgkey[j], st->fgnull[j], count);
+				lion_join_group_row(st, k, fg->key[j], fg->isnull[j], count);
 		}
 		st->joinposting += lion_posting_pages_read - pages;
 	}
@@ -1752,7 +1755,8 @@ lion_join_count_groups(LionCountScanState *st, int k, bool walked)
 static void
 lion_join_group_turn(LionCountScanState *st, int p)
 {
-	Relation	fgidx = (p < 0) ? st->fgidx : st->part[p].fgidx;
+	LionFactGroupState *fg = lion_st_fg(st);
+	Relation	fgidx = (p < 0) ? fg->idx : st->part[p].fgidx;
 	Const	   *fgconst = (p < 0) ? NULL : st->part[p].fgconst;
 	AttrNumber	fgidxcol;
 	LionState  *istate;
@@ -1820,12 +1824,12 @@ lion_join_group_turn(LionCountScanState *st, int p)
 	lion_reader_lock(fgidx, st->css.ss.ps.state->es_snapshot);
 	fgidxcol = lion_index_col_for(fgidx,
 								  lion_heap_attno_in(st->heap, st->heapoid,
-													 st->fgattno),
+													 fg->attno),
 								  false);
 	istate = lion_index_column_state(fgidx, fgidxcol);
 
 	/* the walk lives for the turn; the rows' keys with it, until they go up */
-	oldcxt = MemoryContextSwitchTo(st->fgrowcxt);
+	oldcxt = MemoryContextSwitchTo(fg->rowcxt);
 	lion_entry_scan_begin_col(&es, fgidx, fgidxcol);
 	MemoryContextSwitchTo(oldcxt);
 
@@ -1833,36 +1837,36 @@ lion_join_group_turn(LionCountScanState *st, int p)
 	{
 		int			n = 0;
 
-		MemoryContextReset(st->fgcxt);
-		oldcxt = MemoryContextSwitchTo(st->fgcxt);
-		st->fgsets = (LionPostingSet *)
+		MemoryContextReset(fg->cxt);
+		oldcxt = MemoryContextSwitchTo(fg->cxt);
+		fg->sets = (LionPostingSet *)
 			palloc0(sizeof(LionPostingSet) * LION_FKJOIN_GROUP_CHUNK);
-		st->fgkey = (Datum *) palloc(sizeof(Datum) * LION_FKJOIN_GROUP_CHUNK);
-		st->fgnull = (bool *) palloc(sizeof(bool) * LION_FKJOIN_GROUP_CHUNK);
+		fg->key = (Datum *) palloc(sizeof(Datum) * LION_FKJOIN_GROUP_CHUNK);
+		fg->isnull = (bool *) palloc(sizeof(bool) * LION_FKJOIN_GROUP_CHUNK);
 		while (n < LION_FKJOIN_GROUP_CHUNK)
 		{
 			Datum		key;
 
 			CHECK_FOR_INTERRUPTS();
-			if (!lion_entry_scan_next(&es, &key, &st->fgsets[n]))
+			if (!lion_entry_scan_next(&es, &key, &fg->sets[n]))
 			{
 				more = false;
 				break;
 			}
-			st->fgnull[n] = st->fgsets[n].keyisnull;
-			st->fgkey[n] = (Datum) 0;
-			if (!st->fgnull[n])
+			fg->isnull[n] = fg->sets[n].keyisnull;
+			fg->key[n] = (Datum) 0;
+			if (!fg->isnull[n])
 			{
 				/* the key goes up with the rows, after the chunk is gone */
-				MemoryContextSwitchTo(st->fgrowcxt);
-				st->fgkey[n] = datumCopy(key, istate->typbyval,
-										 istate->typlen);
-				MemoryContextSwitchTo(st->fgcxt);
+				MemoryContextSwitchTo(fg->rowcxt);
+				fg->key[n] = datumCopy(key, istate->typbyval,
+									   istate->typlen);
+				MemoryContextSwitchTo(fg->cxt);
 			}
 			n++;
 		}
 		MemoryContextSwitchTo(oldcxt);
-		st->fgn = n;
+		fg->n = n;
 		if (n == 0)
 			break;
 
@@ -1881,14 +1885,14 @@ lion_join_group_turn(LionCountScanState *st, int p)
 		}
 
 		for (j = 0; j < n; j++)
-			lion_posting_set_release(&st->fgsets[j]);
-		st->fgn = 0;
+			lion_posting_set_release(&fg->sets[j]);
+		fg->n = 0;
 	}
 	lion_entry_scan_end(&es);
-	MemoryContextReset(st->fgcxt);
-	st->fgsets = NULL;
-	st->fgkey = NULL;
-	st->fgnull = NULL;
+	MemoryContextReset(fg->cxt);
+	fg->sets = NULL;
+	fg->key = NULL;
+	fg->isnull = NULL;
 
 	if (p >= 0)
 		lion_join_part_close(st);
@@ -1903,6 +1907,7 @@ lion_join_group_turn(LionCountScanState *st, int p)
 static TupleTableSlot *
 lion_next_join_group(LionCountScanState *st)
 {
+	LionFactGroupState *fg = lion_st_fg(st);
 	int			nturn = Max(st->npart, 1);
 
 	/*
@@ -1939,9 +1944,9 @@ lion_next_join_group(LionCountScanState *st)
 	for (;;)
 	{
 		CHECK_FOR_INTERRUPTS();
-		if (st->fgrowpos < st->fgnrows)
+		if (fg->rowpos < fg->nrows)
 		{
-			LionJoinGroupRow *r = &st->fgrows[st->fgrowpos++];
+			LionJoinGroupRow *r = &fg->rows[fg->rowpos++];
 
 			lion_join_batch_row(st, &st->joinbatch[r->ent]);
 			return lion_emit_tuple(st, r->key, r->isnull, (Datum) 0, true,
@@ -1949,13 +1954,13 @@ lion_next_join_group(LionCountScanState *st)
 		}
 
 		/* every row of the last turn has gone up */
-		st->fgnrows = 0;
-		st->fgrowpos = 0;
-		st->fgrowcap = 0;
-		st->fgrows = NULL;
-		MemoryContextReset(st->fgrowcxt);
+		fg->nrows = 0;
+		fg->rowpos = 0;
+		fg->rowcap = 0;
+		fg->rows = NULL;
+		MemoryContextReset(fg->rowcxt);
 
-		if (st->fgturn >= nturn || st->joinbatchn == 0)
+		if (fg->turn >= nturn || st->joinbatchn == 0)
 		{
 			if (!lion_join_fill_batch(st))
 			{
@@ -1964,11 +1969,11 @@ lion_next_join_group(LionCountScanState *st)
 				st->done = true;
 				return NULL;
 			}
-			st->fgturn = 0;
+			fg->turn = 0;
 			memset(&st->joinorder, 0, sizeof(st->joinorder));
 		}
-		lion_join_group_turn(st, (st->joinpart != NULL) ? st->fgturn : -1);
-		st->fgturn++;
+		lion_join_group_turn(st, (st->joinpart != NULL) ? fg->turn : -1);
+		fg->turn++;
 	}
 }
 
@@ -2008,10 +2013,10 @@ lion_next_join_row(LionCountScanState *st)
 	{
 		case LION_MODE_JOIN_FACTGROUP:
 			/* grouped by a fact column: each key counted once per group */
-			Assert(st->fgattno != 0);
+			Assert(st->fg != NULL);
 			return lion_next_join_group(st);
 		case LION_MODE_JOIN:
-			Assert(st->fgattno == 0);
+			Assert(st->fg == NULL);
 			break;
 		default:
 			elog(ERROR, "LionCount: mode %d is no join", (int) st->mode);
