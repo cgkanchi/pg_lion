@@ -1164,7 +1164,7 @@ lion_group_batch_ok(LionCountScanState *st)
 {
 	int			k;
 
-	if (!st->wcollected || st->hascoal || st->nsource != st->nitem + 1)
+	if (!st->wcollected || st->coal != NULL || st->nsource != st->nitem + 1)
 		return false;
 	for (k = 1; k <= st->nitem; k++)
 	{
@@ -1740,19 +1740,20 @@ lion_topk_run(LionCountScanState *st)
  * partitioned one (§16), which is why nothing here knows about partitions:
  * the caller has opened one relation and located its WHERE clauses.
  *
- * GROUP BY coalesce(g, c) (st->hascoal, DESIGN.md §10) takes two entries out
+ * GROUP BY coalesce(g, c) (st->coal, DESIGN.md §10) takes two entries out
  * of the stream: the NULL entry, whose rows are c's group, and the entry whose
  * key the grouping equality finds equal to c, if the walk meets one.  Their
- * counts are added up in coalcount and the one group they make is emitted,
- * with the value c, after the last entry - wherever the two came in the walk,
- * and whichever of them exists.  An entry of c that VACUUM removes before the
- * walk reaches it held no row this snapshot sees, so the group is the same
- * without it; a key equal to c inserted meanwhile holds none either.  The
- * classes of one index are disjoint, so no other entry can equal c.
+ * counts are added up in st->coal->count and the one group they make is
+ * emitted, with the value c, after the last entry - wherever the two came in
+ * the walk, and whichever of them exists.  An entry of c that VACUUM removes
+ * before the walk reaches it held no row this snapshot sees, so the group is
+ * the same without it; a key equal to c inserted meanwhile holds none either.
+ * The classes of one index are disjoint, so no other entry can equal c.
  */
 static TupleTableSlot *
 lion_next_group(LionCountScanState *st, bool *exhausted)
 {
+	LionCoalState *coal = st->coal;
 	MemoryContext oldcxt;
 
 	*exhausted = false;
@@ -1824,7 +1825,7 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 
 		oldcxt = MemoryContextSwitchTo(st->pergroup);
 
-		if (st->coalwalked ||
+		if ((coal != NULL && coal->walked) ||
 			!lion_entry_scan_next(&st->escan, &key, &st->groupset))
 		{
 			MemoryContextSwitchTo(oldcxt);
@@ -1834,13 +1835,13 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 			 * back here, and the walk is not asked for another entry after
 			 * it has run out.
 			 */
-			if (st->hascoal && !st->coalwalked)
+			if (coal != NULL && !coal->walked)
 			{
-				st->coalwalked = true;
-				if (st->coalcount > 0)
-					return lion_emit_tuple(st, st->coalconst->constvalue,
+				coal->walked = true;
+				if (coal->count > 0)
+					return lion_emit_tuple(st, coal->value->constvalue,
 										   false, (Datum) 0, true,
-										   st->coalcount);
+										   coal->count);
 			}
 			*exhausted = true;
 			return NULL;
@@ -1853,12 +1854,12 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 		keyisnull = st->groupset.keyisnull;
 		lion_posting_set_release(&st->groupset);
 
-		if (st->hascoal &&
+		if (coal != NULL &&
 			(keyisnull ||
-			 DatumGetBool(FunctionCall2Coll(&st->coaleqfn, st->coalcoll, key,
-											st->coalconst->constvalue))))
+			 DatumGetBool(FunctionCall2Coll(&coal->eqfn, coal->coll, key,
+											coal->value->constvalue))))
 		{
-			st->coalcount += count;
+			coal->count += count;
 			MemoryContextSwitchTo(oldcxt);
 			continue;
 		}
