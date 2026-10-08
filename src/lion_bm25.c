@@ -51,7 +51,7 @@
  *
  * Like an ordinary scan of the index, the function refuses a table with
  * row-level security and an index the snapshot cannot use, and takes the
- * index's predicate lock before reading (lion_bm25_check_snapshot()).
+ * index's predicate lock before reading (lion_reader_open()).
  *
  *-------------------------------------------------------------------------
  */
@@ -62,20 +62,15 @@
 #include "access/genam.h"
 #include "access/table.h"
 #include "access/tableam.h"
-#include "catalog/index.h"
-#include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "miscadmin.h"
-#include "storage/predicate.h"
 #include "tsearch/ts_type.h"
 #include "tsearch/ts_utils.h"
-#include "utils/acl.h"
 #include "utils/hsearch.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
-#include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/tuplestore.h"
 
@@ -696,70 +691,6 @@ lion_bm25_topk(const LionBm25Query *q, int64 L, const LionBm25Cand *after,
 	return nbest;
 }
 
-/*
- * Open the index for lion_bm25() or lion_bm25_score(), its table's SELECT
- * privilege checked before any lock; the table is opened too when heap is
- * given.
- */
-static Relation
-lion_bm25_open_index(Oid indexoid, Relation *heap)
-{
-	Oid			heapoid;
-	Relation	index;
-
-	if (get_rel_relkind(indexoid) != RELKIND_INDEX)
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not an index", get_rel_name(indexoid))));
-	heapoid = IndexGetRelation(indexoid, false);
-	if (pg_class_aclcheck(heapoid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
-		aclcheck_error(ACLCHECK_NO_PRIV,
-					   get_relkind_objtype(get_rel_relkind(heapoid)),
-					   get_rel_name(heapoid));
-	if (heap != NULL)
-		*heap = table_open(heapoid, AccessShareLock);
-	index = index_open(indexoid, AccessShareLock);
-	if (index->rd_rel->relam != lion_get_am_oid())
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("index \"%s\" is not a lion index",
-						RelationGetRelationName(index))));
-	if (heap != NULL)
-		lion_check_table_am(*heap);
-	return index;
-}
-
-/*
- * Refuse what an ordinary scan of the index under snapshot would never
- * return, as the direct count functions do (lion_count_sql.c): rows hidden
- * by row-level security, which ranking cannot apply its policies to, and an
- * index whose entries the snapshot cannot trust (lion_index_usable()).  Then
- * take the relation-level predicate lock index_beginscan() takes for an AM
- * without ampredlocks, before reading, so that a SERIALIZABLE search that
- * finds nothing is covered too.
- */
-static void
-lion_bm25_check_snapshot(Relation heap, Relation index, Snapshot snapshot)
-{
-	const char *why;
-
-	if (check_enable_rls(RelationGetRelid(heap), InvalidOid, false) ==
-		RLS_ENABLED)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("cannot rank through index \"%s\" because row-level security is enabled on table \"%s\"",
-						RelationGetRelationName(index),
-						RelationGetRelationName(heap)),
-				 errhint("Use ORDER BY lion_bm25_score(...) in a query on the table, which applies the policies.")));
-	if (!lion_index_usable(index, snapshot, &why))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("cannot rank through index \"%s\" because %s",
-						RelationGetRelationName(index), why)));
-	lion_check_old_snapshot(index, snapshot);
-	PredicateLockRelation(index, snapshot);
-}
-
 Datum
 lion_bm25(PG_FUNCTION_ARGS)
 {
@@ -790,8 +721,8 @@ lion_bm25(PG_FUNCTION_ARGS)
 	snapshot = GetActiveSnapshot();
 	if (snapshot == NULL)
 		elog(ERROR, "lion_bm25 requires an active snapshot");
-	index = lion_bm25_open_index(indexoid, &heap);
-	lion_bm25_check_snapshot(heap, index, snapshot);
+	index = lion_reader_open(indexoid, LION_READ_ROWS, snapshot, "rank",
+							 &heap);
 	if (!lion_bm25_prepare(index, query, k1, b, &q) || k == 0)
 		goto out;
 
@@ -889,7 +820,8 @@ lion_bm25_score(PG_FUNCTION_ARGS)
 			MemoryContextReset(cache->cxt);
 		cache->query = NULL;
 		old = MemoryContextSwitchTo(cache->cxt);
-		index = lion_bm25_open_index(indexoid, NULL);
+		index = lion_reader_open(indexoid, LION_READ_STATS, NULL, "score",
+								 NULL);
 		cache->valid = lion_bm25_prepare(index, query, k1, b, &cache->q);
 		cache->q.index = NULL;
 		cache->q.col = NULL;
