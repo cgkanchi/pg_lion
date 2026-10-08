@@ -2,7 +2,8 @@
 -- readers"), run against each one, so a new reader gets a line here:
 --   - a function handed an index by name refuses a table where row-level
 --     security applies to the caller, and an unpopulated materialized view
---     (lion_reader_vet()); one that reads only statistics does neither;
+--     (lion_reader_vet()); one that reads only statistics refuses row-level
+--     security too, since they count the hidden rows;
 --   - the planner's paths answer under a policy exactly what seq scan does.
 -- Snapshot eligibility and predicate locks need two sessions:
 -- test/isolation/reader_checkxmin.spec and reader_serializable.spec.
@@ -26,7 +27,8 @@ INSERT INTO rcon_readers VALUES
 	('lion_index_count_any',         $$SELECT lion_index_count_any('%1$s_k', ARRAY[3, 6])$$),
 	('lion_index_count_stats',       $$SELECT count FROM lion_index_count_stats('%1$s_k', 3)$$),
 	('lion_index_count_group_stats', $$SELECT count(*) FROM lion_index_count_group_stats('%1$s_k')$$),
-	('lion_bm25',                    $$SELECT count(*) FROM lion_bm25('%1$s_d', 'secret', 10)$$);
+	('lion_bm25',                    $$SELECT count(*) FROM lion_bm25('%1$s_d', 'secret', 10)$$),
+	('lion_bm25_score',              $$SELECT lion_bm25_score('secret'::tsvector, 'secret', '%1$s_d') > 0$$);
 -- what each reader says for the relation rel: its answer, or its error
 CREATE FUNCTION rcon_try(stmt text, rel text) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE r text;
@@ -40,12 +42,13 @@ SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
              name             | rcon_try 
 ------------------------------+----------
  lion_bm25                    | 10
+ lion_bm25_score              | true
  lion_index_count             | 300
  lion_index_count, two keys   | 43
  lion_index_count_any         | 600
  lion_index_count_group_stats | 1
  lion_index_count_stats       | 300
-(6 rows)
+(7 rows)
 
 -- sql's rows with lion's paths allowed and with all of them off
 CREATE FUNCTION rcon_same(sql text) RETURNS text LANGUAGE plpgsql AS $$
@@ -70,19 +73,13 @@ SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
              name             |                                         rcon_try                                          
 ------------------------------+-------------------------------------------------------------------------------------------
  lion_bm25                    | cannot rank through index "rcon_d" because row-level security is enabled on table "rcon"
+ lion_bm25_score              | cannot score through index "rcon_d" because row-level security is enabled on table "rcon"
  lion_index_count             | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
  lion_index_count, two keys   | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
  lion_index_count_any         | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
  lion_index_count_group_stats | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
  lion_index_count_stats       | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
-(6 rows)
-
--- statistics only: lion_bm25_score() reads N, df and avgdl, never rows
-SELECT lion_bm25_score('secret'::tsvector, 'secret', 'rcon_d') > 0 AS scores;
- scores 
---------
- t
-(1 row)
+(7 rows)
 
 -- the planner's paths apply the policy: the same rows as seq scan
 SELECT rcon_same($$SELECT count(*) FROM rcon WHERE k = 3$$);
@@ -103,11 +100,13 @@ SELECT rcon_same($$SELECT count(*) FROM rcon WHERE d @@ 'secret'$$);
  same
 (1 row)
 
-SELECT rcon_same($$SELECT id FROM rcon WHERE d @@ 'w3 | secret'
-	ORDER BY lion_bm25_score(d, 'w3 | secret', 'rcon_d') DESC, id LIMIT 20$$);
- rcon_same 
------------
- same
+-- ranking scores by statistics of every row, so it is refused here too
+SELECT rcon_try($$SELECT string_agg(id::text, ',') FROM (SELECT id FROM %1$s
+	WHERE d @@ 'w3 | secret' ORDER BY lion_bm25_score(d, 'w3 | secret', 'rcon_d') DESC,
+	id LIMIT 20) x$$, 'rcon');
+                                         rcon_try                                          
+-------------------------------------------------------------------------------------------
+ cannot score through index "rcon_d" because row-level security is enabled on table "rcon"
 (1 row)
 
 RESET ROLE;
@@ -122,12 +121,13 @@ SELECT name, rcon_try(stmt, 'rcon_mv') FROM rcon_readers ORDER BY name;
              name             |                      rcon_try                      
 ------------------------------+----------------------------------------------------
  lion_bm25                    | materialized view "rcon_mv" has not been populated
+ lion_bm25_score              | false
  lion_index_count             | materialized view "rcon_mv" has not been populated
  lion_index_count, two keys   | materialized view "rcon_mv" has not been populated
  lion_index_count_any         | materialized view "rcon_mv" has not been populated
  lion_index_count_group_stats | materialized view "rcon_mv" has not been populated
  lion_index_count_stats       | materialized view "rcon_mv" has not been populated
-(6 rows)
+(7 rows)
 
 DROP MATERIALIZED VIEW rcon_mv;
 DROP FUNCTION rcon_same(text);

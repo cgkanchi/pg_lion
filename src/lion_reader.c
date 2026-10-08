@@ -30,8 +30,11 @@
  *					first read, so that a SERIALIZABLE read that finds
  *					nothing still conflicts with a later insert of it.
  *	LION_READ_STATS	only index-wide statistics, as lion_bm25_score() reads
- *					N, df and avgdl: the privilege checks alone.  It can be
- *					called per row of a query that applies the policies.
+ *					N, df and avgdl: the privilege checks, and the same
+ *					refusal of row-level security.  The statistics count
+ *					every row, so a score - even of a made-up document, even
+ *					per row of a query that applies the policies - tells
+ *					whether hidden rows hold a lexeme, and how many.
  *
  * Privileges beyond SELECT on the table - per-column grants, EXECUTE on the
  * functions a call stands for - depend on what the call stands for, and stay
@@ -55,6 +58,24 @@
 #include "lion_count.h"
 
 /*
+ * Row-level security: the policies would have to be evaluated per row, and a
+ * direct reader does not look at rows.  The same count or ranking through
+ * the planner still works where it reads rows: lion's custom paths decline
+ * relations with security quals, and the ordinary plan applies them.
+ */
+static void
+lion_reader_check_rls(Relation heap, Relation index, const char *action)
+{
+	if (check_enable_rls(RelationGetRelid(heap), InvalidOid, false) ==
+		RLS_ENABLED)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("cannot %s through index \"%s\" because row-level security is enabled on table \"%s\"",
+						action, RelationGetRelationName(index),
+						RelationGetRelationName(heap))));
+}
+
+/*
  * Refuse what an ordinary scan of index under snapshot would not return, and
  * take the predicate lock index_beginscan() would (LION_READ_ROWS above).
  * action reads after "cannot ... through index": "count", "rank".
@@ -72,19 +93,7 @@ lion_reader_vet(Relation heap, Relation index, Snapshot snapshot,
 						RelationGetRelationName(heap)),
 				 errhint("Use the REFRESH MATERIALIZED VIEW command.")));
 
-	/*
-	 * Row-level security: the policies would have to be evaluated per row,
-	 * and a direct reader does not look at rows.  The same query through the
-	 * planner still works: lion's custom paths decline relations with
-	 * security quals, and the ordinary plan applies them.
-	 */
-	if (check_enable_rls(RelationGetRelid(heap), InvalidOid, false) ==
-		RLS_ENABLED)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("cannot %s through index \"%s\" because row-level security is enabled on table \"%s\"",
-						action, RelationGetRelationName(index),
-						RelationGetRelationName(heap))));
+	lion_reader_check_rls(heap, index, action);
 
 	/*
 	 * Snapshot eligibility, which the planner decides for a query: an index
@@ -151,6 +160,8 @@ lion_reader_open(Oid indexoid, LionReadPolicy policy, Snapshot snapshot,
 		lion_check_table_am(table);
 		lion_reader_vet(table, index, snapshot, action);
 	}
+	else
+		lion_reader_check_rls(table, index, action);
 
 	/* not given: still locked until the transaction ends, as the index is */
 	if (heap != NULL)

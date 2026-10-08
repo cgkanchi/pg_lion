@@ -7,6 +7,14 @@
 # row had shifted down a place: it returned row 64 twice and never row 100.
 # Every row must come back once, in the order the scan with the new row
 # left out would give.
+#
+# A row committed below where the scan has got to is in the next walk too:
+# the walks used to stop once they had given as many rows as the lexeme had
+# when the scan started, and so lost the last visible row to it (99 of 100).
+#
+# The scores shown are the ones the rows were ranked by: a cursor opened
+# before s2 commits many rows ranks by the statistics as they were then, and
+# shows those, rather than ones read at the first FETCH.
 
 setup
 {
@@ -22,7 +30,7 @@ setup
 	  FROM generate_series(1, 200) g;
 	CREATE INDEX bm_cont_d ON bm_cont USING lion (d) WITH (store_positions = true);
 	ANALYZE bm_cont;
-	CREATE TABLE bm_cont_got (n serial, id int);
+	CREATE TABLE bm_cont_got (n serial, id int, s float8);
 }
 teardown
 {
@@ -46,9 +54,24 @@ step s1_rest	{ DO $$ DECLARE c refcursor := 'c'; r record;
 step s1_check	{ SELECT count(*) AS fetched, count(DISTINCT id) AS distinct_rows,
 						 bool_and(id = 101 - n) AS best_first
 					FROM bm_cont_got; }
+step s1_open_scores { DECLARE c NO SCROLL CURSOR FOR
+					SELECT id, lion_bm25_score(d, 'hit | pad', 'bm_cont_d') AS s
+					  FROM bm_cont WHERE d @@ 'hit | pad'
+					 ORDER BY lion_bm25_score(d, 'hit | pad', 'bm_cont_d') DESC; }
+step s1_scores	{ DO $$ DECLARE c refcursor := 'c'; r record;
+					BEGIN LOOP FETCH c INTO r; EXIT WHEN NOT FOUND;
+					  INSERT INTO bm_cont_got (id, s) VALUES (r.id, r.s); END LOOP; END $$; }
+step s1_check_scores { SELECT count(*) AS fetched,
+						 count(*) FILTER (WHERE s > prev) AS out_of_order
+					FROM (SELECT s, lag(s) OVER (ORDER BY n) AS prev FROM bm_cont_got) x; }
 step s1_commit	{ COMMIT; }
 
 session s2
 step s2_insert	{ INSERT INTO bm_cont VALUES (-1, to_tsvector('simple', repeat('hit ', 300))); }
+step s2_insert_below { INSERT INTO bm_cont VALUES (-2, to_tsvector('simple', repeat('hit ', 20) || 'pad pad pad pad pad')); }
+step s2_insert_many { INSERT INTO bm_cont SELECT 5000 + g, to_tsvector('simple', 'other')
+					FROM generate_series(1, 3000) g; }
 
 permutation s1_begin s1_plan s1_open s1_fetch64 s2_insert s1_rest s1_check s1_commit
+permutation s1_begin s1_plan s1_open s1_fetch64 s2_insert_below s1_rest s1_check s1_commit
+permutation s1_begin s1_open_scores s2_insert_many s1_scores s1_check_scores s1_commit
