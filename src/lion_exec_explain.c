@@ -1082,8 +1082,8 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 	 * (DESIGN.md §15, "A list too long to locate at once").  Only when
 	 * there were any.
 	 */
-	if (st->listbatches > 0)
-		ExplainPropertyInteger("List Batches", NULL, st->listbatches, es);
+	if (st->lbatch != NULL && st->lbatch->batches > 0)
+		ExplainPropertyInteger("List Batches", NULL, st->lbatch->batches, es);
 
 	/*
 	 * The existence (or count) tests a count(DISTINCT k) made: one per
