@@ -1402,6 +1402,24 @@ typedef struct LionTopkState
 } LionTopkState;
 
 /*
+ * GROUP BY coalesce(g, c) (DESIGN.md §10): value is c, and eqop, eqfn and
+ * coll the grouping equality and collation the entry walk recognises c's own
+ * entry by.  The walk adds the NULL entry's count and that entry's into count
+ * instead of emitting either, and emits their one group - as c - after the
+ * last entry of the relation; walked says that has happened, so the next call
+ * returns nothing more.
+ */
+typedef struct LionCoalState
+{
+	Const	   *value;
+	Oid			eqop;
+	Oid			coll;
+	FmgrInfo	eqfn;
+	int64		count;
+	bool		walked;
+} LionCoalState;
+
+/*
  * A lion column whose entries the aggregates of DESIGN.md §37 are taken
  * over, and one of those aggregates.
  */
@@ -1542,20 +1560,10 @@ typedef struct LionCountScanState
 	int64		disttests;
 
 	/*
-	 * GROUP BY coalesce(g, c) (DESIGN.md §10), when hascoal: c, and the
-	 * grouping equality and collation the entry walk recognises c's own entry
-	 * by.  The walk adds the NULL entry's count and that entry's into
-	 * coalcount instead of emitting either, and emits their one group - as c
-	 * - after the last entry of the relation; coalwalked says that has
-	 * happened, so the next call returns nothing more.
+	 * GROUP BY coalesce(g, c) (DESIGN.md §10), or NULL when the plan groups
+	 * by no coalesce (lion_st_coal()).
 	 */
-	bool		hascoal;
-	Const	   *coalconst;
-	Oid			coaleqop;
-	Oid			coalcoll;
-	FmgrInfo	coaleqfn;
-	int64		coalcount;
-	bool		coalwalked;
+	struct LionCoalState *coal;
 	bool		singlegroup;	/* GROUP BY over constant columns only */
 	bool		sumall;			/* no GROUP BY, but every entry of the group
 								 * index is counted and summed (DESIGN.md §14,
@@ -2159,6 +2167,14 @@ lion_st_topk(LionCountScanState *st)
 {
 	Assert(st->topk != NULL);
 	return st->topk;
+}
+
+/* The coalesce group's state, which only GROUP BY coalesce(g, c) has (§10) */
+static inline LionCoalState *
+lion_st_coal(LionCountScanState *st)
+{
+	Assert(st->coal != NULL);
+	return st->coal;
 }
 
 /* The aggregates over keys' state, which only a plan with them has (§37) */
