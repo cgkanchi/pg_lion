@@ -170,6 +170,13 @@ extern void lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 								  int ncustom_plans);
 extern AttrNumber lion_count_priv_drive_attno(const LionCountPriv *p);
 extern AttrNumber lion_count_priv_inner_attno(const LionCountPriv *p);
-extern AttrNumber lion_count_priv_fact_group_attno(List *priv);
+
+/* For the path builders: the planner's lists, into the struct */
+extern void lion_count_priv_set_where(LionCountPriv *p, List *whereidx,
+									  List *whereattnos, List *whereconsts,
+									  List *wherekinds, List *whereopnos,
+									  List *ors);
+extern void lion_count_priv_set_parts(LionCountPriv *p, List *targets,
+									  bool groupidx);
 
 #endif							/* LION_PLAN_PRIVATE_H */

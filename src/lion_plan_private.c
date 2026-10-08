@@ -745,17 +745,106 @@ lion_count_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 }
 
 /*
- * The fact column an FK-side join's custom_private groups by (DESIGN.md §27,
- * "Grouped by a fact column"), or 0: of a PATH's list, the join's or the
- * base of it lion_fkjoin_setup() makes.
+ * The WHERE clauses of a path being built, from the planner's parallel lists
+ * of them (one element per clause each) and its OR restrictions, one IntList
+ * {first, narms, armlen...} each: the clauses' kinds, columns and operators,
+ * a copy of each value for CONSTS, and the index of each clause in
+ * `whereidx` (IndexOptInfo, one per clause) - or InvalidOid throughout when
+ * it is NIL, as for a partitioned table, whose indexes are its partitions'.
  */
-AttrNumber
-lion_count_priv_fact_group_attno(List *priv)
+void
+lion_count_priv_set_where(LionCountPriv *p, List *whereidx, List *whereattnos,
+						  List *whereconsts, List *wherekinds,
+						  List *whereopnos, List *ors)
 {
-	LionCountPriv p;
+	ListCell   *lc;
+	int			i;
+	int			k;
 
-	lion_count_priv_decode(priv, LION_PRIV_STAGE_PATH, &p);
-	return p.fgattno;
+	Assert(list_length(whereconsts) == list_length(whereattnos) &&
+		   list_length(wherekinds) == list_length(whereattnos) &&
+		   list_length(whereopnos) == list_length(whereattnos) &&
+		   (whereidx == NIL ||
+			list_length(whereidx) == list_length(whereattnos)));
+
+	p->nclause = list_length(whereattnos);
+	p->clause = (LionCountPrivClause *)
+		palloc0(sizeof(LionCountPrivClause) * Max(p->nclause, 1));
+	p->consts = NIL;
+	for (i = 0; i < p->nclause; i++)
+	{
+		LionCountPrivClause *cl = &p->clause[i];
+
+		cl->kind = list_nth_int(wherekinds, i);
+		cl->idxoid = (whereidx != NIL) ?
+			((IndexOptInfo *) list_nth(whereidx, i))->indexoid : InvalidOid;
+		cl->attno = (AttrNumber) list_nth_int(whereattnos, i);
+		cl->opno = list_nth_oid(whereopnos, i);
+		p->consts = lappend(p->consts,
+							copyObject((Node *) list_nth(whereconsts, i)));
+	}
+
+	p->nor = list_length(ors);
+	p->ors = (p->nor > 0) ?
+		(LionOrState *) palloc0(sizeof(LionOrState) * p->nor) : NULL;
+	i = 0;
+	foreach(lc, ors)
+	{
+		List	   *one = (List *) lfirst(lc);
+		LionOrState *o = &p->ors[i++];
+
+		o->first = linitial_int(one);
+		o->narms = lsecond_int(one);
+		o->armlen = (int *) palloc0(sizeof(int) * Max(o->narms, 1));
+		o->nleaves = 0;
+		for (k = 0; k < o->narms; k++)
+		{
+			o->armlen[k] = list_nth_int(one, 2 + k);
+			o->nleaves += o->armlen[k];
+		}
+	}
+}
+
+/*
+ * One PARTS target per relation of a partitioned table's `targets`
+ * (LionCountTarget, DESIGN.md §16): its heap, its driving indexes when
+ * `groupidx` - InvalidOid where it has none, and always for an FK-side join,
+ * whose fact column grouped by is FACTGROUP's - and its index for each of
+ * the clauses lion_count_priv_set_where() has set, InvalidOid for a clause
+ * the partition's bounds imply.
+ */
+void
+lion_count_priv_set_parts(LionCountPriv *p, List *targets, bool groupidx)
+{
+	ListCell   *lc;
+	int			i = 0;
+	int			j;
+
+	p->npart = list_length(targets);
+	p->part = (p->npart > 0) ?
+		(LionCountPrivPart *) palloc0(sizeof(LionCountPrivPart) * p->npart) :
+		NULL;
+	foreach(lc, targets)
+	{
+		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+		LionCountPrivPart *part = &p->part[i++];
+
+		Assert(list_length(t->whereidx) == p->nclause);
+		part->heapoid = t->heapoid;
+		part->groupidxoid = (groupidx && t->driveidx[0] != NULL) ?
+			t->driveidx[0]->indexoid : InvalidOid;
+		part->groupidxoid2 = (groupidx && t->driveidx[1] != NULL) ?
+			t->driveidx[1]->indexoid : InvalidOid;
+		part->clauseidxoid = (Oid *) palloc0(sizeof(Oid) *
+											 Max(p->nclause, 1));
+		for (j = 0; j < p->nclause; j++)
+		{
+			IndexOptInfo *idx = (IndexOptInfo *) list_nth(t->whereidx, j);
+
+			part->clauseidxoid[j] = (idx != NULL) ? idx->indexoid :
+				InvalidOid;
+		}
+	}
 }
 
 /*
