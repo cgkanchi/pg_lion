@@ -344,9 +344,9 @@ EXPLAIN (COSTS OFF) EXECUTE tkp(2);
  Limit
    ->  Sort
          Sort Key: (count(*)) DESC, g
-         ->  HashAggregate
+         ->  Custom Scan (LionCount)
+               Lion Indexes: tk_g (g)
                Group Key: g
-               ->  Seq Scan on tk
 (6 rows)
 
 EXECUTE tkp(2);
