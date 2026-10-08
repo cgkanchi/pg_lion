@@ -128,9 +128,9 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *					each column of the btree, the relation attno it returns,
  *					0 for one it does not (an expression); NIL in heap mode
  *	LO_PRIV_EXPECTED a float8 Const: the entries the planner expects the walk
- *					to visit (the ordered index's selectivity times the
- *					relation's tuples), for the switch's density gate (§40.4);
- *					0 for a lion column's walk
+ *					to visit (the ordered index's selectivity, or the walked
+ *					range's, times the relation's tuples), for the switch's
+ *					density gate (§40.4)
  *
  * and custom_exprs holds five lists:
  *
@@ -172,6 +172,12 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  */
 #define LO_SWITCH_RATIO		32
 #define LO_SWITCH_MIN_WALK	10000
+
+/*
+ * The members the switch fetches before it judges whether the rest will fit
+ * in work_mem from the rows they gave (lo_switch()).
+ */
+#define LO_SWITCH_SAMPLE	1024
 #define LO_SWITCH_DENSITY	0.5
 
 /*
@@ -194,13 +200,27 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  * work for each of its posting sets, starting a stream again behind where it
  * stands LO_LAZY_RESTART_WORK more for each, and the build reads each of the
  * sets' containers once - the budget, never below LO_LAZY_MIN_WORK.  A walk
- * that has met LO_LAZY_MAX_WALK entries is built for too, so that the early
- * stop and the fetch-and-sort switch, which need the set's size, can act on
- * it; as is one whose memo has taken half of hash_mem.
+ * that has met LO_LAZY_WALK_WORK entries for each unit of the budget - and
+ * at least LO_SWITCH_MIN_WALK - is built for too, so that the early stop and
+ * the fetch-and-sort switch, which need the set's size, can act on it once
+ * the walk has cost about what the build will: an entry walked costs 30 to
+ * 70 ns, a unit of the build 350 (§30.4: 8.5 ms for a budget of 24,040);
+ * as is one whose memo has taken half of hash_mem.
  */
 #define LO_LAZY_MIN_WORK		64
 #define LO_LAZY_RESTART_WORK	4
-#define LO_LAZY_MAX_WALK		(4 * LO_SWITCH_MIN_WALK)
+#define LO_LAZY_WALK_WORK		8
+
+/*
+ * The set is started lazily only when the planner expects the walk to stop
+ * short: the node alone in its query under a LIMIT (and OFFSET) of fewer
+ * than LO_LAZY_MAX_SHARE of the rows it would return, or a walk expected to
+ * end before LO_SWITCH_MIN_WALK entries anyway.  A walk that goes on further
+ * meets most of the set's container keys - one in heap order passes over
+ * them once for each entry it walks - and a probe of a key costs more than
+ * the build's read of it, so the set is built at once.
+ */
+#define LO_LAZY_MAX_SHARE		0.2
 
 /*
  * ... and a walk that does not go in heap order is built for at once: once
@@ -218,6 +238,21 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 #define LO_LAZY_ORDER_KEYS		64
 #define LO_LAZY_BACK_SHARE		4
 
+/* Why a lazy set was built, for EXPLAIN ANALYZE: lo_lazy_why()'s answers. */
+typedef enum LoLazyWhy
+{
+	LO_LAZY_HEAP_ORDER,			/* the walk does not go in heap order */
+	LO_LAZY_BUDGET,				/* the probes cost what the build would */
+	LO_LAZY_SWITCH,				/* the switch could be due */
+	LO_LAZY_LONG_WALK,			/* LO_LAZY_WALK_WORK entries a unit met */
+	LO_LAZY_MEMO,				/* the memo outgrew half of hash_mem */
+	LO_LAZY_NWHY
+} LoLazyWhy;
+
+static const char *const lo_lazy_why_names[LO_LAZY_NWHY] = {
+	"heap order", "probe budget", "switch due", "long walk", "memo size"
+};
+
 #define LO_EXPR_LIONQUALS	0
 #define LO_EXPR_ORDQUALS	1
 #define LO_EXPR_LIONQUAL	2
@@ -233,6 +268,7 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 #define LO_FLAG_LIONWALK	0x0002	/* the order is a lion column's walk */
 #define LO_FLAG_INDEXONLY	0x0004	/* the values come from the btree (§40) */
 #define LO_FLAG_HEAPRECHECK	0x0008	/* the lion recheck reads the heap tuple */
+#define LO_FLAG_BUILD		0x0010	/* the set built at once, never lazily */
 
 /*
  * The plan's custom_private as a C struct: lo_priv_decode() is its one
@@ -636,6 +672,7 @@ typedef struct LionOrderedState
 	uint64		lazyback;		/* ... that lay behind the key before them */
 	uint32		lazylast;		/* the key evaluated last */
 	uint64		lazykeys;		/* EXPLAIN ANALYZE: keys evaluated */
+	uint64		lazywhy[LO_LAZY_NWHY];	/* ... and why it was built, per build */
 
 	/*
 	 * This scan's walk (DESIGN.md §30.4): which members it has met, one
@@ -670,6 +707,10 @@ typedef struct LionOrderedState
 	uint64		scans;			/* walks started */
 	uint64		switches;		/* scans that switched */
 	uint64		sortfetched;	/* members fetched by the switch */
+	uint64		earlystops;		/* scans the early stop ended */
+	uint64		givenup;		/* scans whose switch gave up on work_mem */
+	uint64		givenupfetched;	/* members those switches fetched */
+	uint64		uncounted;		/* scans that stopped counting members */
 } LionOrderedState;
 
 static Plan *lo_plan_path(PlannerInfo *root, RelOptInfo *rel,
@@ -2456,6 +2497,27 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		flags |= LO_FLAG_LIONWALK;
 		nulls = lfourth_int(walkinfo);
 		walkattno = indexcol + 1;
+		expected = rel->tuples;
+		if (ordrinfos != NIL)
+			expected *= clauselist_selectivity(root, ordrinfos, rel->relid,
+											   JOIN_INNER, NULL);
+	}
+
+	/*
+	 * The set lazily only for a walk expected to stop short (§30.4): the
+	 * share of its walk a LIMIT on the node alone lets it go, and the entries
+	 * that comes to.
+	 */
+	{
+		double		share = 1.0;
+
+		if (root->limit_tuples > 0 &&
+			bms_membership(root->all_baserels) == BMS_SINGLETON &&
+			best_path->path.rows > 0)
+			share = Min(1.0, root->limit_tuples / best_path->path.rows);
+		if (share >= LO_LAZY_MAX_SHARE &&
+			share * expected >= LO_SWITCH_MIN_WALK)
+			flags |= LO_FLAG_BUILD;
 	}
 
 	if (lion != NULL)
@@ -3394,8 +3456,11 @@ lo_lazy_convert(LionOrderedState *st)
 		st->visitedbytes += LION_BITSET_BYTES;
 	}
 	st->visited = visited;
-	if (lost)
+	if (lost && !st->novisit)
+	{
 		st->novisit = true;
+		st->uncounted++;
+	}
 	pfree(mkeys);
 	pfree(mvisited);
 }
@@ -3700,7 +3765,8 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->lionparams = pull_paramids((Expr *) lionquals);
 
 	/* the set evaluated lazily, when every leaf's keys can be sought (§30.4) */
-	st->lazyok = lion_enable_lazy_set && lo_lazy_ok(st);
+	st->lazyok = lion_enable_lazy_set &&
+		(priv.flags & LO_FLAG_BUILD) == 0 && lo_lazy_ok(st);
 	if (st->lazyok)
 	{
 		st->lazycxt = AllocSetContextCreate(estate->es_query_cxt,
@@ -4030,6 +4096,7 @@ lo_mark(LionOrderedState *st, int idx, ItemPointer tid)
 		if (st->visitedbytes + LION_BITSET_BYTES > get_hash_memory_limit())
 		{
 			st->novisit = true;
+			st->uncounted++;
 			return true;
 		}
 		st->visited[idx] = (uint64 *)
@@ -4111,6 +4178,8 @@ lo_switch(LionOrderedState *st)
 	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
 	Size		budget = (Size) work_mem * 1024;
 	Size		used = 0;
+	double		unmet = (double) (st->members - st->distinct);
+	uint64		tried = 0;
 	int			cap = 64;
 	uint16	   *los;
 	MemoryContext oldcxt;
@@ -4140,6 +4209,7 @@ lo_switch(LionOrderedState *st)
 			CHECK_FOR_INTERRUPTS();
 			lion_code_to_tid(lion_make_code(st->set->keys[i], los[j]), &tid);
 			st->sortfetched++;
+			tried++;
 			/* a heap visit counts as the walk counts them in that mode (§40.6) */
 			if (st->indexonly)
 				st->fetched++;
@@ -4180,15 +4250,27 @@ lo_switch(LionOrderedState *st)
 											&row->nulls[k]);
 			used += HEAPTUPLESIZE + row->tup->t_len +
 				st->nsort * (sizeof(Datum) + sizeof(bool)) + sizeof(LoSortRow);
-			if (used > budget)
+
+			/*
+			 * Too big to sort here: the walk goes on (§30.4).  Known once
+			 * the rows kept pass work_mem, or foreseen as soon as the
+			 * members tried are enough to go by: the rows so far, scaled
+			 * to every member not met, members fetched in TID order being
+			 * a fair sample of them.  A switch that would fail at the end
+			 * fetches a part of what it would have, not all of it.
+			 */
+			if (used > budget ||
+				(tried >= LO_SWITCH_SAMPLE &&
+				 (double) used * unmet / (double) tried > (double) budget))
 			{
-				/* too big to sort here: the walk goes on (§30.4) */
 				MemoryContextSwitchTo(oldcxt);
 				MemoryContextDelete(st->sortcxt);
 				st->sortcxt = NULL;
 				st->srt = NULL;
 				st->nsrt = 0;
 				st->noswitch = true;
+				st->givenup++;
+				st->givenupfetched += tried;
 				ExecClearTuple(slot);
 				return false;
 			}
@@ -4219,6 +4301,34 @@ lo_sort_next(LionOrderedState *st, TupleTableSlot *slot)
 	slot->tts_tid = tup->t_self;
 	slot->tts_tableOid = RelationGetRelid(st->css.ss.ss_currentRelation);
 	return slot;
+}
+
+/*
+ * Should the lazy set be built now, and why (LoLazyWhy), or -1: the walk
+ * does not go in heap order, or the lazy set's probes have cost what
+ * building it would, or the walk has gone as far as the switch would let it
+ * go were the set as big as its entries' counts say - or has cost about what
+ * the build will, so that the early stop and the switch have the set's size
+ * to go by from there on - or the memo has outgrown its share of hash_mem
+ * (§30.4, "The set, lazily").  Whether the switch comes is decided on the
+ * set built, so a count that is off moves only when the set is built.
+ */
+static int
+lo_lazy_why(LionOrderedState *st)
+{
+	if (st->lazyevals >= LO_LAZY_ORDER_KEYS &&
+		st->lazyback * LO_LAZY_BACK_SHARE >= st->lazyevals)
+		return LO_LAZY_HEAP_ORDER;
+	if (st->lazywork >= st->lazybudget)
+		return LO_LAZY_BUDGET;
+	if (lo_switch_due(st, st->lazymembers))
+		return LO_LAZY_SWITCH;
+	if ((double) st->scanwalked >= Max((double) LO_SWITCH_MIN_WALK,
+									   LO_LAZY_WALK_WORK * st->lazybudget))
+		return LO_LAZY_LONG_WALK;
+	if (st->memobytes > st->limit / 2)
+		return LO_LAZY_MEMO;
+	return -1;
 }
 
 /* ExecScan's access method: the next member with a visible version. */
@@ -4257,23 +4367,17 @@ lo_next(ScanState *ss)
 
 		CHECK_FOR_INTERRUPTS();
 
-		/*
-		 * The walk does not go in heap order, or the lazy set's probes have
-		 * cost what building it would, or the walk has gone as far as the
-		 * switch below would let it go were the set as big as its entries'
-		 * counts say - or far enough anyway that the early stop and the
-		 * switch should have the set's size to go by: build it (§30.4, "The
-		 * set, lazily").  Whether the switch comes is decided on the set
-		 * built, so a count that is off moves only when the set is built.
-		 */
-		if (st->lazy &&
-			((st->lazyevals >= LO_LAZY_ORDER_KEYS &&
-			  st->lazyback * LO_LAZY_BACK_SHARE >= st->lazyevals) ||
-			 st->lazywork >= st->lazybudget ||
-			 lo_switch_due(st, st->lazymembers) ||
-			 st->scanwalked >= LO_LAZY_MAX_WALK ||
-			 st->memobytes > st->limit / 2))
-			lo_lazy_convert(st);
+		/* the lazy set built, when lo_lazy_why() says it is time */
+		if (st->lazy)
+		{
+			int			why = lo_lazy_why(st);
+
+			if (why >= 0)
+			{
+				st->lazywhy[why]++;
+				lo_lazy_convert(st);
+			}
+		}
 		counted = !st->noset && !st->lazy && !st->degraded && !st->novisit;
 
 		/*
@@ -4282,7 +4386,10 @@ lo_next(ScanState *ss)
 		 * meets its TID; not knowable once the set has degraded.
 		 */
 		if (counted && st->distinct >= st->members)
+		{
+			st->earlystops++;
 			break;
+		}
 
 		/*
 		 * The walk has cost what fetching the members it has not met would:
@@ -4614,8 +4721,25 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 				appendStringInfo(&buf, ", %llu builds",
 								 (unsigned long long) st->builds);
 			if (st->lazykeys > 0)
+			{
+				int			w;
+				const char *sep = " (";
+
 				appendStringInfo(&buf, ", after %llu keys probed",
 								 (unsigned long long) st->lazykeys);
+				for (w = 0; w < LO_LAZY_NWHY; w++)
+				{
+					if (st->lazywhy[w] == 0)
+						continue;
+					appendStringInfo(&buf, "%s%s", sep, lo_lazy_why_names[w]);
+					if (st->lazywhy[w] > 1)
+						appendStringInfo(&buf, " x%llu",
+										 (unsigned long long) st->lazywhy[w]);
+					sep = ", ";
+				}
+				if (*sep == ',')
+					appendStringInfoChar(&buf, ')');
+			}
 			ExplainPropertyText("Lion Set", buf.data, es);
 		}
 		else if (st->lazykeys > 0)
@@ -4636,6 +4760,20 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 							 (unsigned long long) st->sortfetched);
 			ExplainPropertyText("Switched to Fetch and Sort", buf.data, es);
 		}
+		if (st->givenup > 0)
+		{
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "%llu scans, %llu members fetched",
+							 (unsigned long long) st->givenup,
+							 (unsigned long long) st->givenupfetched);
+			ExplainPropertyText("Fetch and Sort Given Up", buf.data, es);
+		}
+		if (st->uncounted > 0)
+			ExplainPropertyInteger("Scans Not Counting Members", NULL,
+								   (int64) st->uncounted, es);
+		if (st->earlystops > 0)
+			ExplainPropertyInteger("Scans Stopped Early", NULL,
+								   (int64) st->earlystops, es);
 	}
 	pfree(buf.data);
 }

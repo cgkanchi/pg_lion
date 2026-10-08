@@ -140,7 +140,7 @@ SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgd GROUP BY a, b, c HAVING
 SELECT a, b, c, count(*) FROM lgd WHERE e GROUP BY a, b, c ORDER BY count(*) DESC, a, b, c LIMIT 5;
 
 -- A work_mem too small for one pass: the first column's values are taken a
--- few at a time and the others' in chunks, and the tally spills.
+-- few at a time and the others' in chunks.
 SET work_mem = '64kB';
 SELECT lgd_check('SELECT a, b, c, d, e, count(*) AS n FROM lgd GROUP BY a, b, c, d, e');
 SELECT lgd_check('SELECT f, b, d, count(*) AS n FROM lgd WHERE a IN (1, 2) GROUP BY f, b, d');
