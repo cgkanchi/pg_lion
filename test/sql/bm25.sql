@@ -61,6 +61,11 @@ SELECT bm_same('w4 | w8', '{w4,w8}', 40, 2.0, 0.3);
 SELECT bm_same('w4 | w8', '{w4,w8}', 40, 0.5, 1.0);
 SELECT bm_same('w6 & t0', '{w6,t0}', 5000);			-- every candidate
 SELECT bm_same('w3', '{w3}', 10, 1.2, 0);			-- no length normalisation
+-- a small k next to common lexemes, where MaxScore skips the most
+SELECT bm_same('w1 | w2 | t7 | w30', '{w1,w2,t7,w30}', 5);
+SELECT bm_same('w0 | w1 | w9 | t3', '{w0,w1,w9,t3}', 1);
+SELECT bm_same('w1 | w9 | t3', '{w1,w9,t3}', 3, 0, 0.75);	-- k1 = 0: tf ignored
+SELECT bm_same('w1 | w9 | t3', '{w1,w9,t3}', 3, 3.0, 1.0);
 -- the stripped row counts each lexeme once
 SELECT id, round(score::numeric, 6) FROM bm_lion('w2', 3000) WHERE id = 3001;
 -- a lexeme no row has, an empty query, a NOT alone, k = 0
@@ -75,6 +80,15 @@ DELETE FROM bm_docs WHERE id IN (SELECT id FROM bm_ref('{w1}', 3));
 UPDATE bm_docs SET note = 'hot' WHERE id IN (SELECT id FROM bm_ref('{w1}', 6));
 SELECT count(*) AS returned, count(t.id) AS joined, count(*) FILTER (WHERE t.note = 'hot') AS hot
   FROM lion_bm25('bm_docs_d', 'w1', 10) s LEFT JOIN bm_docs t ON t.ctid = s.ctid;
+-- more dead rows among the best than the first walk keeps: the walk is made
+-- again for more, and the next best rows come back
+CREATE TEMP TABLE bm_before AS
+SELECT row_number() OVER () AS r, id, score FROM bm_lion('w5', 40);
+DELETE FROM bm_docs WHERE id IN (SELECT id FROM bm_before WHERE r <= 30);
+SELECT count(*) AS returned,
+	   count(*) FILTER (WHERE a.id = b.id AND a.score = b.score) AS same_as_before
+  FROM (SELECT row_number() OVER () + 30 AS r, id, score FROM bm_lion('w5', 10)) a
+  JOIN bm_before b USING (r);
 -- after VACUUM the statistics no longer count the deleted rows, once a
 -- backend reads them again: it keeps N and avgdl until the row count moves by
 -- more than 1/64

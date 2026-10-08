@@ -523,8 +523,9 @@ the heap is read only to check that the rows returned are visible. Join on `ctid
 The score is Lucene's BM25 (`k1` 1.2 and `b` 0.75 by default) over the query's lexemes, each
 counted once; lexemes under a NOT do not score, and operators, phrases and weights do not change
 it, so add `WHERE d.tsv @@ query` to keep only rows that match the query as a whole. As in a search
-engine, the statistics count deleted rows until VACUUM removes them, and a backend keeps the row
-count and mean length it read until the row count moves by more than 1/64.
+engine, the statistics count deleted rows until VACUUM removes them, and a backend keeps the mean
+row length it read until the row count moves by more than 1/64. Rows that cannot reach the top `k`
+are skipped (MaxScore), so a very common lexeme next to rarer ones costs little.
 
 Without positions, everything a plain AND/OR of key sets cannot express is rechecked in the heap. A
 NULL element and a tsquery phrase, weight or `a & !b` are answered from the rows of their keys (the

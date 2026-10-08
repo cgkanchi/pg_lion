@@ -4647,29 +4647,43 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
 by Okapi BM25, in Lucene's form: `idf = ln(1 + (N - df + 0.5) / (df + 0.5))` and
 `tf * (k1 + 1) / (tf + k1 * (1 - b + b * |d| / avgdl))` per query lexeme.
 
-- **tf** is the npos of the row's member under the lexeme, a stripped lexeme counting once; **df**
-  is the lexeme's members. Both come from the position trees, read with a counts-only cursor that
-  steps over the positions.
+- **tf** is the npos of the row's member under the lexeme, a stripped lexeme counting once, read
+  from the position tree with a counts-only cursor that steps over the positions. **df** is the
+  lexeme's entry's `ntids`.
 - **|d|**, the row's length, is its lexeme occurrences. The extraction files every row that has a
   lexeme under the EMPTY TEXT key as well, with one "position" holding the length in all 16 bits of
   a WordEntryPos (capped at 65535). The empty key is free: `tsvector_in()` and `array_to_tsvector()`
   refuse an empty lexeme and no tsquery can name one, and the extraction drops one that arrives
   some other way. It is an ordinary VALUE entry, so insert, build, parallel build, VACUUM and
   verify carry it with no change, and it costs one member per row (about 2 MB at 500k rows).
-- **N** and **avgdl** are the empty key's members and their mean. Reading them walks the whole key,
-  so a backend keeps them per index until the key's `ntids` moves by more than 1/64 or the index
-  is rebuilt.
+- **N** is the empty key's `ntids`. **avgdl** is the mean of its members' lengths; reading it walks
+  the whole key, so a backend keeps it per index until the key's `ntids` moves by more than 1/64 or
+  the index is rebuilt.
 
 The query's lexemes are its operands not under a NOT, once each; a prefix is refused. Candidates
-stream out of a merge of the lexemes' member arrays in TID order, each scored as it comes, with the
-empty key's cursor moving forward beside them; a min-heap keeps the best `k + 16`. Those are sorted
+stream out of a merge of the lexemes' cursors in TID order, each scored as it comes, with the empty
+key's cursor moving forward beside them; a min-heap keeps the best `L = k + 16`. Those are sorted
 and fetched best first under the caller's snapshot, the TID following a HOT chain to the visible
-version, until `k` are visible; when dead rows leave fewer, every candidate is sorted and the walk
-continues. Dead rows count in N, df and avgdl until VACUUM removes them, as a search engine's
-deleted documents do until a merge.
+version, until `k` are visible; when dead rows leave fewer, the walk is made again for `4L`, whose
+first `L` are the ones already tried. Dead rows count in N, df and avgdl until VACUUM removes them,
+as a search engine's deleted documents do until a merge.
 
-The work is linear in the members of the query's lexemes, not in `k`. No block-max skipping
-(WAND, MaxScore) yet: that needs per-chunk upper bounds, and the merge is where it would go.
+**MaxScore** (Turtle and Flood) prunes the merge. A lexeme adds less than `idf * (k1 + 1)` to any
+row, since `tf / (tf + norm) < 1`; with the lexemes in ascending order of that maximum, the first
+ones whose maxima sum to no more than the heap's worst score, once the heap is full, are
+non-essential: a row with none of the others cannot get in. Only the essential lexemes' members are
+candidates. The non-essential ones are sought for a candidate only, from the largest maximum down,
+and only while what is left of them could still lift it past the heap's worst. The heap's worst
+only rises, so the essential set only shrinks. Equal scores rank by TID and candidates come in TID
+order, so a candidate needs a score strictly above the worst to get in; the maxima are nudged up by
+one part in 10^9 so a sum of them rounded down cannot pass for a score.
+
+This pays most when a common lexeme sits beside rarer ones: on a synthetic 500k-row benchmark, top
+10 for one very common lexeme and two rarer ones went from 41 ms to 16 ms. When every lexeme is
+common, each one's maximum is close to the scores at the top, nothing becomes non-essential, and
+the walk still reads every member. Block-max bounds (a maximum per chunk, not per lexeme) would
+skip whole chunks there, but need a maximum tf and a minimum length stored per chunk, which the
+format does not have.
 
 ### Cardinality guard
 
