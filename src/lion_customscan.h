@@ -893,7 +893,8 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * node, so it is six plain lists plus one filled in at plan time, behind a
  * shape marker.  The executor reads it through lion_count_priv_decode()
  * (lion_plan_private.h), which checks each member below against this
- * description:
+ * description, and lion_plan_custom_path() writes the plan's through
+ * lion_count_priv_encode():
  *
  *	0	IntList: LION_PRIV_MAGIC and LION_PRIV_NMEMBERS.  The list is
  *		positional, so the executor checks this before reading anything else:
@@ -2553,7 +2554,6 @@ extern Cost lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 /* lion_plan_fkjoin.c */
 extern double lion_leaf_turn_share(PlannerInfo *root, RelOptInfo *rel);
 extern double lion_fact_groups(PlannerInfo *root, const LionCountTarget *t);
-extern AttrNumber lion_fact_group_attno(List *priv);
 extern void lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 								 RelOptInfo *output_rel,
 								 GroupPathExtraData *extra,
