@@ -17,8 +17,10 @@
 # put back the way it was found: restarted in generic mode if it was running,
 # left stopped if it was stopped.
 #
-#   1. nothing preloaded: the table-AM test, then LOAD-on-first-use in both
-#      orders - lion_hooktest LOADed before pg_lion's first use, and after;
+#   1. nothing preloaded: the table-AM test, the plan decoder's (malformed
+#      custom_private lists, which no planner makes), then LOAD-on-first-use
+#      in both orders - lion_hooktest LOADed before pg_lion's first use, and
+#      after;
 #   2. shared_preload_libraries = 'pg_lion,lion_hooktest' (the other hook
 #      outermost) and 'lion_hooktest,pg_lion' (pg_lion's outermost), with
 #      pg_lion.rmgr_id moved to 129 so the two resource managers coexist;
@@ -89,7 +91,8 @@ run()
 	if make -s -C "$MOD" PG_CONFIG="$PG_CONFIG" installcheck REGRESS="$*"; then
 		:
 	else
-		echo "== FAILED: $label (see $MOD/regression.diffs)"
+		echo "== FAILED: $label"
+		cat "$MOD/regression.diffs" 2>/dev/null
 		cp "$MOD/regression.diffs" "$MOD/regression.diffs.$(echo "$label" | tr -c 'a-z0-9\n' _)" 2>/dev/null
 		FAILED="$FAILED [$label]"
 	fi
@@ -115,6 +118,7 @@ eval "$("$ROOT/dev.sh" env)"
 # ---- 1. nothing preloaded -------------------------------------------------
 start_with "" || exit 1
 run "no preload, table AMs" tableam
+run "no preload, the plan decoder" priv_decode
 run "no preload, lion_hooktest LOADed first" hooks_setup hooks_lion_outer
 run "no preload, pg_lion loaded first" hooks_setup hooks_hooktest_outer
 

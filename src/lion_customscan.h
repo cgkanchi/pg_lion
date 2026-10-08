@@ -891,7 +891,9 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * What the planner decided, in a form the executor can be handed through
  * custom_private.  Everything in there has to be a copyable/serialisable
  * node, so it is six plain lists plus one filled in at plan time, behind a
- * shape marker:
+ * shape marker.  The executor reads it through lion_count_priv_decode()
+ * (lion_plan_private.h), which checks each member below against this
+ * description:
  *
  *	0	IntList: LION_PRIV_MAGIC and LION_PRIV_NMEMBERS.  The list is
  *		positional, so the executor checks this before reading anything else:
