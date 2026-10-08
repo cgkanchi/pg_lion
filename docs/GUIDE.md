@@ -239,7 +239,7 @@ to the Lion index's own scan for a filter of a few percent and to a sequential s
 it pays when the heap would be read cold or the filter is far wider than the B-tree's share of the
 heap, and the planner's I/O constants (`random_page_cost`, `seq_page_cost`) decide (DESIGN.md
 §40.3). A query that reads a column the B-tree lacks
-walks in heap mode under an `ORDER BY` (as before) and gets no unordered walk; `SELECT ... FOR
+walks in heap mode under an `ORDER BY` and gets no unordered walk; `SELECT ... FOR
 UPDATE` needs the row's `ctid` and is heap mode too. The cost model chooses between the node, the
 B-tree's own scans and a bitmap scan of the Lion indexes; `pg_lion.enable_ordered_scan` and
 `pg_lion.enable_btree_scan` turn the two forms off, and `enable_indexonlyscan = off` turns the

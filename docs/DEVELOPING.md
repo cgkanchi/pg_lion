@@ -4,9 +4,8 @@ Building, testing and finding your way around the source. Section numbers (§) r
 
 ## Supported versions and CI
 
-Status: prototype.  Builds against PostgreSQL 16, 17, 18, 19 and master (20devel); the version
-differences live in `src/lion_compat.h`, and the first validation across all of them (16.15, 17.11,
-18.6, 19beta4 and master) was at `eb1579e`.  CI (`.github/workflows/ci.yml`) builds and tests every
+Builds against PostgreSQL 16, 17, 18, 19 and master (20devel); the version differences live in
+`src/lion_compat.h`.  CI (`.github/workflows/ci.yml`) builds and tests every
 one of those majors on each push: the container and sparse unit tests, every SQL regression file in
 `test/sql` and every isolation spec in `test/isolation` in both WAL modes, and, on the 19 and master
 source builds, the crash-recovery/hot-standby harness in both modes.  One gap is deliberate and worth

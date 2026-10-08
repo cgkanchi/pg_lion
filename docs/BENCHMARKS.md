@@ -20,9 +20,6 @@ At 5M rows, Lion's clean dense count is **90.0× faster** than B-tree,
 ordered retrieval and GIN for phrase/prefix search; dirty pages and build/write costs
 still matter.
 
-These timings include the range changes through `118f623`. The subsequent comparator-guard
-fix at `07f8fcb` passed correctness verification but was not separately benchmarked.
-
 ## Setup and interpretation
 
 Release PostgreSQL 18.6 (`-O2`, assertions off), AMD Ryzen 7 5700X3D, 16 logical CPUs, WSL2;
@@ -38,8 +35,7 @@ Each scalar portfolio has **seven** single-column indexes: `c2`, `c20`, `c200`, 
 with `fastupdate=on`. Lion and **Lion (pushdown off)** share the same `USING lion` indexes;
 their artifact labels are `roaring` and `roaring_bitmap`. The tables use the default planner:
 **† marks an actual sequential scan**, not index performance. The report also contains forced-index
-and 64 kB work_mem diagnostics. This profile has more indexes and different query/mutation coverage
-than the earlier quick runs; their portfolio costs and timings are not a like-for-like change series.
+and 64 kB work_mem diagnostics.
 
 ## Where Lion wins: counts and grouping
 
@@ -76,8 +72,7 @@ The same Lion indexes with count pushdown disabled show the difference:
 | Count per 200 groups | 17.074 | 1,059.507 † |
 | Range count | 0.663 | 152.083 |
 
-The 5M range count fell from **712.504 ms** at `7cb7711` (sequential fallback) to
-**0.663 ms** with `LionCount`. This is an aggregate-pushdown gain: with pushdown off,
+The range count is an aggregate-pushdown gain: with pushdown off,
 Lion's bitmap range count takes **152.083 ms**, versus B-tree's **1.629 ms** index-only
 scan. Do not generalize the count result to fetching the matching rows. Small changes in
 other cases are not established improvements from three timing rounds.
@@ -99,16 +94,6 @@ Vacuum cadence and update distribution matter: do not apply the clean-data speed
 updated table. The dirty 0.5%-selectivity count is effectively at parity with B-tree here
 (5.608 versus 5.940 ms), despite its large clean-data advantage. The suite also checks results
 after indexed writes, deletes, and VACUUM.
-
-**Version caveat — earlier PG16–20 runs (`eb1579e`):** ordinary reads on PG19/20 can restore
-all-visible pages during heap pruning. In that scattered-update fixture, reference scans and
-warmups restored almost all visibility before timing on **19beta4 and 20devel**.
-The 5M-row dense count then took about **2 ms**, versus
-**74–80 ms on PG16–18**. These are warmed post-update reads, not equivalent dirty-page conditions
-or a general 40× Lion speedup; the first read's cleanup cost is outside the timed samples.
-Clean dense counts in that earlier comparison were about **1.8–2.1 ms** across all five versions.
-See the [per-sample visibility evidence from those earlier runs](../bench/results/2026-09-24-118f623-pg18-focused/earlier-version-visibility.csv).
-The headline tables above remain PostgreSQL 18 measurements.
 
 ## Where it is at practical parity: tiny probes and fetching rows
 
@@ -188,16 +173,15 @@ GIN's fast updates defer work, so include its VACUUM/drain cost.
 | DELETE | 1,871.6 / 366.12 | 1,007.5 / 366.12 | 1,139.8 / 366.12 |
 | VACUUM ANALYZE | 3,439.5 / 634.38 | 3,554.4 / 587.33 | 3,750.8 / 569.33 |
 
-This run uses Lion's custom WAL manager; earlier quick measurements used generic WAL and a smaller
-portfolio. Do not attribute their difference solely to code changes. The focused suite does not
-measure sustained concurrent-write throughput.
+This run uses Lion's custom WAL manager. The suite does not measure sustained concurrent-write
+throughput.
 
 Here Lion's insert is **1.25× slower than B-tree**, while its indexed UPDATE takes about
 **0.66× the time**; both generate roughly **1.5× the WAL**. GIN's insert/update steps are faster
 than Lion's, before its deferred work is drained. Lion's VACUUM is slower than both B-tree
 and GIN in this run.
 
-## Reproduce and earlier measurements
+## Reproducing
 
 Build/install against the desired release PostgreSQL version, then:
 
@@ -210,7 +194,3 @@ python3 bench/comprehensive/audit.py bench/results/my-focused-run
 
 The defaults retain 1M/5M rows and 200k documents. See the [focused suite documentation](../bench/comprehensive/README.md)
 for coverage and `--profile full`; [quick.py](../bench/QUICK.md) remains the smaller progress check.
-The [previous quick report](../bench/results/quick/2026-09-22-3906538/REPORT.md),
-[older comparison](../bench/COMPARISON.md), [growth/churn supplement](../bench/results/2026-09-21-stress/REPORT.md),
-and [historical README archive](../bench/HISTORICAL_README_BENCHMARKS.md) describe earlier commits and workloads.
-The [follow-up review](../FOLLOWUP_REVIEW.md) records correctness and compatibility validation.
