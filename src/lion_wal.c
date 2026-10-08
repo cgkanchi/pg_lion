@@ -1117,8 +1117,13 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 
 			case LION_OP_SETBYTES:
 				{
-					ItemId		iid = PageGetItemId(page, op.off);
+					ItemId		iid;
 
+					if (op.off < FirstOffsetNumber ||
+						op.off > PageGetMaxOffsetNumber(page))
+						elog(PANIC, "pg_lion: SETBYTES for item %u past the end of block %u",
+							 op.off, blkno);
+					iid = PageGetItemId(page, op.off);
 					if (!ItemIdHasStorage(iid) ||
 						(Size) op.aux + op.len > ItemIdGetLength(iid))
 						elog(PANIC, "pg_lion: SETBYTES past the end of item %u on block %u",

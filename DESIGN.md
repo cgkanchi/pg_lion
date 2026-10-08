@@ -1552,7 +1552,9 @@ kinds of places, and `lion_reader.c` is where each gets what is missing:
   `LION_READ_STATS` for `lion_bm25_score()`, which reads only N, df and avgdl, and checks
   privileges and row-level security only. The statistics count every row, hidden ones included, so
   under a policy a score - even of a made-up document, even per row of a query that applies the
-  policies - would tell whether hidden rows hold a lexeme, and how many.
+  policies - would tell whether hidden rows hold a lexeme, and how many. It also refuses a
+  partial index: both its callers rank over the whole table, and a partial index's walk would
+  miss the rows its predicate leaves out while its N, df and avgdl described only the rest.
 - **Custom scan nodes**, whose index the planner vetted, call `lion_reader_lock()` for the
   predicate lock on each lion index they read.
 

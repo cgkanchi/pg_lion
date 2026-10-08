@@ -101,9 +101,9 @@ typedef struct LionPosCol
 	LionPosKey **buckets;
 	uint32		nbuckets;		/* a power of two */
 	LionPosKey **keys;			/* every key, in the order first seen */
-	int			nkeys;
-	int			maxkeys;
-	int			ntaken;
+	int64		nkeys;			/* never spilled, so bounded only by memory */
+	int64		maxkeys;
+	int64		ntaken;
 } LionPosCol;
 
 struct LionPosBuild
@@ -228,13 +228,13 @@ lion_posbuild_new_key(LionPosBuild *pb, LionPosCol *pc, const char *bytes,
 	pc->keys[pc->nkeys++] = k;
 
 	/* twice the keys' buckets, rehashed */
-	if ((uint32) pc->nkeys > pc->nbuckets && pc->nbuckets < (PG_UINT32_MAX >> 2))
+	if ((uint64) pc->nkeys > pc->nbuckets && pc->nbuckets < (PG_UINT32_MAX >> 2))
 	{
 		uint32		nb = pc->nbuckets * 2;
 		LionPosKey **buckets = (LionPosKey **)
 			palloc_extended(sizeof(LionPosKey *) * nb,
 							MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
-		int			i;
+		int64		i;
 
 		for (i = 0; i < pc->nkeys - 1; i++)
 		{
@@ -387,7 +387,7 @@ lion_posbuild_spill(LionPosBuild *pb)
 	for (c = 0; c < pb->ncols; c++)
 	{
 		LionPosCol *pc = pb->cols[c];
-		int			i;
+		int64		i;
 
 		if (pc == NULL)
 			continue;
@@ -529,7 +529,7 @@ lion_posbuild_export(LionPosBuild *pb)
 	for (c = 0; c < pb->ncols; c++)
 	{
 		LionPosCol *pc = pb->cols[c];
-		int			i;
+		int64		i;
 
 		if (pc == NULL)
 			continue;

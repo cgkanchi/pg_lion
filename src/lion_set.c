@@ -314,7 +314,7 @@ lion_fill_posting_set(Relation index, LionState *state, Buffer buf,
 	ItemId		iid = PageGetItemId(page, offnum);
 
 	lion_fill_posting_set_entry(index, state,
-								(LionEntryTuple *) PageGetItem(page, iid),
+								lion_entry_at(page, iid),
 								ItemIdGetLength(iid), BufferGetBlockNumber(buf),
 								offnum, ps, keeppin);
 }
