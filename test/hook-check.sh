@@ -91,7 +91,8 @@ run()
 	if make -s -C "$MOD" PG_CONFIG="$PG_CONFIG" installcheck REGRESS="$*"; then
 		:
 	else
-		echo "== FAILED: $label (see $MOD/regression.diffs)"
+		echo "== FAILED: $label"
+		cat "$MOD/regression.diffs" 2>/dev/null
 		cp "$MOD/regression.diffs" "$MOD/regression.diffs.$(echo "$label" | tr -c 'a-z0-9\n' _)" 2>/dev/null
 		FAILED="$FAILED [$label]"
 	fi
