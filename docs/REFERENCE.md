@@ -147,8 +147,6 @@ insert that adds a key as the entries on its directory leaf times the number of 
 rejects a row.  For a multi-key column the keys are the extracted elements or lexemes.
 `inline_limit` (64 .. 4096 bytes, default 4096): how large a key's posting set may be before it
 moves out of its entry tuple onto container pages of its own.
-`buckets` is accepted and ignored since format 4 - the entry directory is a B-tree keyed by the
-index key, and it grows by splitting instead of being sized once.
 `summaries` (`off` | `on` | `auto`, default `off`): summary posting sets for ranges (DESIGN.md §32).
 With `on` every ordered scalar key column keeps, after its keys, one posting set per bucket of
 consecutive keys, and a count over a range sums the buckets it covers whole instead of walking their
@@ -156,13 +154,8 @@ keys; `auto` gives them only to the columns whose keys are small next to a bucke
 values), which is where ranges are slow.  Every insert into a summarized column also updates its
 bucket's set.  `summary_tids` (16 .. 16777216, default 4096) is the rows a bucket closes at.  Both
 are read at build time: `ALTER INDEX ... SET (summaries = ...)` takes effect at the next REINDEX.
-An index with summaries is format 7, which an older build refuses; one without is format 6, as
-before.  A range on a column that does not drive a count (`g, count(*) ... WHERE ts >= $1 GROUP BY
+A range on a column that does not drive a count (`g, count(*) ... WHERE ts >= $1 GROUP BY
 g`, a range in an OR, a join's fact filter) is answered too, collected once from the same walk.
-A build that writes a NARROW container (DESIGN.md §38) makes the index format 8, which older builds
-refuse in turn: REINDEX such an index under the older build before going back to it.  Inserts never
-make a NARROW of anything else (they widen one when a row's offset is past it), and VACUUM makes one
-only in a format 8 index, so an existing index stays format 6 or 7 until it is rebuilt.
 `wal_mode` (`auto` | `generic` | `rmgr`, default `auto`): which WAL resource manager this index is
 logged through (DESIGN.md §25).  Measured on a release build: the 8-client hot-key insert burst goes
 from 765 to 1275 tps (p95 14.8 to 9.9 ms, against btree's 1632 / 7.8), 10,000 inserts into the
@@ -301,7 +294,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `union_set_cost` | 100 | `cpu_tuple_cost` | a set of an `IN` list or `OR` rebuilt by each count of a GROUP BY |
 | `recheck_tid_cost` | 1.5 | `cpu_tuple_cost` | a candidate row of a count's heap recheck |
 | `recheck_group_tid_cost` | 6.0 | `cpu_tuple_cost` | the same in a grouped count |
-| `resident_page_cost` | 120 | `cpu_operator_cost` | a page of a Lion index a count reads while the index fits in `effective_cache_size` with the query's tables (DESIGN.md §39); a page that does not is priced as I/O, as before |
+| `resident_page_cost` | 120 | `cpu_operator_cost` | a page of a Lion index a count reads while the index fits in `effective_cache_size` with the query's tables (DESIGN.md §39); a page that does not is priced as I/O |
 | `entry_count_cost` | 50 | `cpu_tuple_cost` | a count of a GROUP BY: an entry, or a pair of two |
 | `list_group_cost` | 18 | `cpu_tuple_cost` | a count of a group an `IN` list drives |
 | `distinct_test_cost` | 50 | `cpu_tuple_cost` | a test of a `count(DISTINCT)` walk |
@@ -357,9 +350,7 @@ the sequential scan the same way: the covering walk's marked-up price must beat 
 scan's for the walk to be kept. It is not applied where it hedges nothing: to a plan
 forced with nothing of PostgreSQL's left enabled, to a count whose cheapest competitor is the
 access method's own scan of a Lion index (both prices Lion's), and to a count whose multi-key query
-is a generic plan's parameter (priced at its dearest already). The default was 0.8 until the
-decision matrix found Lion the faster plan in most of its near ties, and every plan 0.8 moved
-moved to a slower one (DESIGN.md §39, "The margin"). PostgreSQL's `enable_*` settings and Lion's
+is a generic plan's parameter (priced at its dearest already). PostgreSQL's `enable_*` settings and Lion's
 switches above still force a plan either way.
 
 `pg_lion.ordered_switch_ratio` (32, 1 to 1,000,000): how many B-tree entries `LionOrdered` walks per
@@ -398,8 +389,7 @@ collation; on a partitioned table, one on the parent, and then only without a `G
 lists of more than 1000 values are left to the ordinary plan, a multi-key index can never drive a
 `GROUP BY` or a sum-over-all-entries count (its entries are keys, not row values), and the cost
 model inherits the
-stale `relallvisible` blind spot of index-only scans. Indexes built before NULL keys existed (meta page version 1) are refused
-with an error and have to be rebuilt with REINDEX.
+stale `relallvisible` blind spot of index-only scans.
 On a hot standby a GENERIC-mode index's count paths recheck every candidate TID in the heap instead
 of trusting the visibility map, because generic WAL replay does not take the cleanup locks the pin
 interlock relies on; they stay correct there but are no longer O(1) per container.  Index-only
