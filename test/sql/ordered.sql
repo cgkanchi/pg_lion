@@ -468,6 +468,13 @@ VACUUM (FREEZE, ANALYZE) lcor;
 SELECT * FROM lion_ord_plan('SELECT id FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
 SELECT lion_ord('SELECT id, k FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
 SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
+-- at a ratio of 8 the switch that the set's recorded member count foresees
+-- comes at 10,000 entries, ahead of the long-walk rule: the lazy set is built
+-- for it (switch due), and the switch follows on the count built
+SET pg_lion.ordered_switch_ratio = 8;
+SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
+SELECT lion_ord('SELECT id, k FROM lcor WHERE c = 190 ORDER BY k LIMIT 10');
+RESET pg_lion.ordered_switch_ratio;
 -- no row at all: every c = 190 row has g = 0
 SELECT lion_ord('SELECT id, k FROM lcor WHERE c = 190 AND g = 1 ORDER BY k LIMIT 10');
 SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE c = 190 AND g = 1 ORDER BY k LIMIT 10');
