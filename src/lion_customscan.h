@@ -1167,6 +1167,14 @@ typedef struct LionClauseState
 	 * every candidate rechecked in the heap - ALL with no posting set at all.
 	 */
 	LionQueryMode qmode;
+
+	/*
+	 * LION_CLAUSE_MULTI: the query as this scan answers it, val with each
+	 * prefix lexeme expanded into the index's lexemes that have it
+	 * (lion_tsquery_expand_prefixes()); val itself otherwise.  Set by
+	 * lion_locate_multikey(), in wherecxt.
+	 */
+	Datum		xval;
 	Relation	idx;
 	Datum		storedkey;
 	bool		hasstoredkey;

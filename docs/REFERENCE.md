@@ -79,7 +79,7 @@ An index built `WITH (store_positions = true)` also stores every lexeme's positi
 bitmap and index scans need no recheck, and counts skip the heap on all-visible pages, under a
 `GROUP BY`, `count(DISTINCT)` or the FK-side join too, under an OR, and for `@@ ANY (array)`
 in scans. It costs about three bytes per lexeme and
-row on top of a plain lion index, more than doubling it, so it is off by default. Only a prefix lexeme (`foo:*`) is still rechecked.
+row on top of a plain lion index, more than doubling it, so it is off by default.
 
     CREATE INDEX ON doc USING lion (tsv) WITH (store_positions = true);
 
@@ -120,10 +120,16 @@ else, the function scores row by row. `pg_lion.enable_bm25_scan` turns the scan 
 
 Without positions, everything a plain AND/OR of key sets cannot express is rechecked in the heap. A
 NULL element and a tsquery phrase, weight or `a & !b` are answered from the rows of their keys (the
-other elements, the phrase's lexemes, `a`), then rechecked, in counts and scans alike. `<@`, `@> '{}'`, a bare `!a` and `foo:*` fall back to scanning
+other elements, the phrase's lexemes, `a`), then rechecked, in counts and scans alike. `<@`, `@> '{}'` and a bare `!a` fall back to scanning
 every indexed row and rechecking it if the Lion index is used; the planner may choose a sequential
-scan instead. GIN answers a prefix from its index, so it is the better choice for prefix-heavy
-search for now.
+scan instead.
+
+A prefix lexeme (`foo:*`) is replaced at scan time by the OR of the indexed lexemes starting with
+`foo`, with the same weight mask, so it is answered like any other lexeme: inside phrases and NOTs
+too, and from stored positions when the index has them. A prefix with no indexed match matches no
+row. When the expansion would pass 1000 lexemes for the whole query, the query is answered as
+before: every indexed row is a candidate and the heap rechecks it. GIN is faster for such very
+common prefixes.
 
 A query the count only sees at run time - a
 prepared statement's generic plan (`tags @> $1`, `tsv @@ to_tsquery($1)`) or a stable expression

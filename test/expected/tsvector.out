@@ -151,14 +151,11 @@ SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 
 SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 					WHERE tsv @@ to_tsquery('english', 'w1:*')$$);
-                      lion_tsplan                       
---------------------------------------------------------
- Aggregate
-   ->  Bitmap Heap Scan on lion_ts
-         Recheck Cond: (tsv @@ '''w1'':*'::tsquery)
-         ->  Bitmap Index Scan on lion_ts_tsv
-               Index Cond: (tsv @@ '''w1'':*'::tsquery)
-(5 rows)
+                       lion_tsplan                        
+----------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_ts_tsv (tsv @@ '''w1'':*'::tsquery)
+(2 rows)
 
 SELECT lion_tsplan($$SELECT count(*) FROM lion_ts
 					WHERE tsv @@ phraseto_tsquery('english', 'bravo charlie')$$);
@@ -680,11 +677,11 @@ EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc
 (5 rows)
 
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc WHERE tsv @@ 'rare50:*'::tsquery;
-                    QUERY PLAN                    
---------------------------------------------------
+                      QUERY PLAN                      
+------------------------------------------------------
  Aggregate
-   ->  Seq Scan on lion_tsc
-         Filter: (tsv @@ '''rare50'':*'::tsquery)
+   ->  Index Scan using lion_tsc_tsv on lion_tsc
+         Index Cond: (tsv @@ '''rare50'':*'::tsquery)
 (3 rows)
 
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc WHERE tsv @@ 'rare500:A'::tsquery;
@@ -719,9 +716,9 @@ RESET plan_cache_mode;
 DEALLOCATE lion_tsc_p;
 -- and the answers are the same whichever plan runs
 SELECT lion_tscmp($$SELECT count(*) FROM lion_tsc WHERE tsv @@ 'rare50:*'::tsquery$$);
-     lion_tscmp     
---------------------
- index scan, 1 rows
+     lion_tscmp      
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_tscmp($$SELECT count(*) FROM lion_tsc

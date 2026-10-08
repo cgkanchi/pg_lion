@@ -515,6 +515,7 @@ lion_multikey_query_mode(Oid extractquery, StrategyNumber strategy,
 	MemoryContext cxt;
 	MemoryContext oldcxt;
 	LionQueryMode mode;
+	Datum		query;
 
 	if (con->constisnull)
 		return LION_QMODE_NONE; /* every operator involved is strict */
@@ -538,10 +539,19 @@ lion_multikey_query_mode(Oid extractquery, StrategyNumber strategy,
 	fmgr_info(extractquery, &flinfo);
 	state.extractquery = flinfo;
 
+	/*
+	 * The executor answers a prefix lexeme as the OR of the index's lexemes
+	 * that have it (lion_tsquery_expand_prefixes()), which combines like the
+	 * one lexeme the stand-in leaves (DESIGN.md §17, "Prefix lexemes").
+	 */
+	query = con->constvalue;
+	if (strategy == LION_STRAT_MATCH)
+		query = lion_tsquery_strip_prefixes(query);
+
 	if (superset)
-		lion_extract_query_superset(&state, con->constvalue, strategy, &q);
+		lion_extract_query_superset(&state, query, strategy, &q);
 	else
-		lion_extract_query(&state, con->constvalue, strategy, &q);
+		lion_extract_query(&state, query, strategy, &q);
 	mode = q.mode;
 
 	MemoryContextSwitchTo(oldcxt);
@@ -1172,6 +1182,16 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 			if (IsA(right, Const))
 			{
 				if (((Const *) out->val)->constisnull)
+					return false;
+
+				/*
+				 * A prefix lexeme is expanded at run time into the index's
+				 * lexemes that have it, and one too common to expand is
+				 * answered from every row and a recheck (DESIGN.md §17,
+				 * "Prefix lexemes"), which no leaf of an OR can have.
+				 */
+				if (!allow_recheck && out->strategy == LION_STRAT_MATCH &&
+					lion_tsquery_has_prefix(((Const *) out->val)->constvalue))
 					return false;
 
 				/*

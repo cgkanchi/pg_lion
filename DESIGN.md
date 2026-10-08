@@ -4603,7 +4603,7 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   callback is `checkclass_str()`'s over the candidate's member, stripped members included.  No
   member under a lexeme is a row without it (P ⊇ C).  So phrases at any distance, weights,
   `a & !b`, `a <-> !b` and ORs of them come out exactly what the heap's `@@` gives.  A query with
-  a prefix lexeme keeps the recheck: its keys cannot be named.
+  a prefix lexeme is first expanded into the OR of its keys (see "Prefix lexemes" below).
   - A **bitmap scan** emits what the filter keeps with `recheck = false`, and a plain **index
     scan** puts its source's containers through it (the scan's keys are ANDed, so filtering the
     result by one of them is exact), under an MVCC snapshot.
@@ -4727,6 +4727,30 @@ time). Each row then costs a random page, a tuple and the restrictions. Against 
 fetches, scores and sorts every match, on the synthetic 500k-row benchmark (top 10): 120 ms to 20
 ms for two mid-frequency words, 157 ms to 51 ms for two common ones, and 160 ms to 21 ms for one
 very common word with two rarer ones. A rare AND keeps the bitmap scan, which is the cheaper plan.
+
+### Prefix lexemes (2026-10-08)
+
+The tsvector opclass's keys are text compared under the C collation, so the key directory is in
+byte order and every key starting with `foo` is one contiguous run of it.
+`lion_tsquery_expand_prefixes()` (lion_multikey.c) rewrites each `foo:*` in a tsquery into the OR
+of the index keys in that run, keeping the item's weight mask on every key: a walk from `>= foo`
+that stops at the first key not starting with `foo`.  The rewrite runs at scan time (bitmap
+scan, index scan, count pushdown), never in the planner, so new lexemes are always seen.
+
+- **Exactness.**  A row visible to the scan's snapshot was indexed under all its lexemes before
+  it committed, so its `foo...` lexemes are all in the run and the OR selects exactly the rows
+  `foo:*` does.  Keys that only dead or uncommitted rows have add candidates and no matches.
+- **Anywhere in the query.**  An OR of lexemes stands where the prefix stood, so under a phrase
+  (`foo:* <-> bar`), a NOT or a weight it means what the prefix meant, and the position filter
+  decides it like any other query.
+- **Nothing matches.**  An empty run becomes the bare lexeme `foo`, which is not in the index
+  either (an indexed `foo` would be in the run), so it selects no row.
+- **The cap.**  At most `LION_MAX_QUERY_KEYS` (1000) lexemes over the whole query.  Past it the
+  original query is kept and the old path applies: the prefix is every row and the heap rechecks.
+- **Planner.**  Costing and the count pushdown's mode choice see the query with its prefix flags
+  cleared (`lion_tsquery_strip_prefixes()`), the closest stand-in for an expansion they cannot
+  do.  A prefix under an OR of clauses in the count pushdown is refused: that path has no
+  recheck to fall back on if the expansion goes past the cap.
 
 ### Cardinality guard
 

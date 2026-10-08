@@ -101,10 +101,13 @@ plain "first N by this column".
 | Count a phrase, `common <-> w1` | 3.90 | 14.7 | 3.8× faster |
 | Count a weight, `w1:D` | 0.52 | 18.1 | 35× faster |
 | Count a NOT, `common & !w1` | 11.3 | 66.5 | 5.9× faster |
-| Count a prefix, `rare12:*` | 40.2 | 3.57 | **11× slower** |
+| Count a prefix, `rare12:*` (111 words) | 1.20 | 2.57 | 2.1× faster |
+| Count a prefix, `rare1:*` (1,111 words) | 44.2 | 16.2 | **2.7× slower** |
 | Fetch the rows matching `w1` | 9.51 | 16.6 | 1.8× faster |
 
-Lion answers prefix queries by checking every row, so GIN wins them.
+Lion answers a prefix as the OR of the indexed words that start with it, up to 1000 words. Past
+that it rechecks rows, and GIN wins. The prefix rows were measured separately from the rest of the
+table, on the same data and server.
 
 ## Ranked search: top 10 by score
 

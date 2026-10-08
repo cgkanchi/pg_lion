@@ -1,0 +1,137 @@
+-- Prefix lexemes (`foo:*`, DESIGN.md §17 "Prefix lexemes"): lion expands each
+-- into the OR of the lexemes the index holds that start with it.  Every way
+-- lion answers a prefix query must return the rows a sequential scan returns:
+-- prefixes that match nothing, one lexeme, many, and more than a query may
+-- expand to; with weights, in phrases, under NOT and OR; before and after
+-- writes.  Only differences print.
+
+\set VERBOSITY terse
+SET client_min_messages = warning;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+SELECT setseed(0.17) IS NULL AS seeded;
+CREATE TABLE px (id int, tsv tsvector);
+-- lexemes ab0 .. ab2999 share the prefix "ab", "abc*" a few hundred of them,
+-- plus words of every length from one shared root
+INSERT INTO px
+SELECT i, CASE WHEN i % 101 = 0 THEN NULL
+			   WHEN i % 97 = 0 THEN ''::tsvector
+			   WHEN i % 13 = 0 THEN strip(d)
+			   ELSE d END
+FROM (SELECT i, (SELECT string_agg(format('%s:%s%s',
+						(ARRAY['ab' || (random()*2999)::int, 'abc' || (random()*300)::int,
+							   'x' || (random()*20)::int, 'root', 'roots', 'rooted', 'r',
+							   'zz' || (random()*3)::int])[1 + (random()*7)::int],
+						p, (ARRAY['','A','B','C','D'])[1 + (random()*4)::int]), ' ')
+				 FROM generate_series(1, 1 + (random()*8)::int) p
+				 WHERE i > 0)::tsvector AS d
+	  FROM generate_series(1, 6000) i) s;
+CREATE TABLE px_l WITH (autovacuum_enabled = off) AS SELECT * FROM px; CREATE INDEX px_l_i ON px_l USING lion (tsv);
+CREATE TABLE px_lp WITH (autovacuum_enabled = off) AS SELECT * FROM px; CREATE INDEX px_lp_i ON px_lp USING lion (tsv) WITH (store_positions = true);
+VACUUM (FREEZE, ANALYZE) px, px_l, px_lp;
+
+CREATE FUNCTION px_ids(tab text, q tsquery, mode text) RETURNS int[] LANGUAGE plpgsql AS $$
+DECLARE r int[];
+BEGIN
+	PERFORM set_config('enable_seqscan', CASE WHEN mode = 'seq' THEN 'on' ELSE 'off' END, true);
+	PERFORM set_config('enable_bitmapscan', CASE WHEN mode IN ('bitmap','count') THEN 'on' ELSE 'off' END, true);
+	PERFORM set_config('enable_indexscan', CASE WHEN mode IN ('index','count') THEN 'on' ELSE 'off' END, true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	IF mode = 'count' THEN
+		EXECUTE format('SELECT ARRAY[count(*)::int] FROM %I WHERE tsv @@ $1', tab) INTO r USING q;
+	ELSIF mode = 'literal' THEN
+		-- a literal, so the planner sees the query (a count pushed down as KEYS)
+		EXECUTE format('SELECT ARRAY[count(*)::int] FROM %I WHERE tsv @@ %L::tsquery', tab, q) INTO r;
+	ELSE
+		EXECUTE format('SELECT coalesce(array_agg(id ORDER BY id), ''{}'') FROM %I WHERE tsv @@ $1', tab) INTO r USING q;
+	END IF;
+	RETURN r;
+END $$;
+
+CREATE FUNCTION px_check(qs text[]) RETURNS TABLE (q text, path text, got int, want int) LANGUAGE plpgsql AS $$
+DECLARE qq text; ref int[]; t text; m text; g int[];
+BEGIN
+	FOREACH qq IN ARRAY qs LOOP
+		ref := px_ids('px', qq::tsquery, 'seq');
+		FOREACH t IN ARRAY ARRAY['px_l','px_lp'] LOOP
+			FOREACH m IN ARRAY ARRAY['bitmap','index','count','literal'] LOOP
+				BEGIN
+					g := px_ids(t, qq::tsquery, m);
+				EXCEPTION WHEN others THEN
+					q := qq; path := t || '/' || m || ' ERROR ' || SQLERRM; got := -1; want := cardinality(ref);
+					RETURN NEXT; CONTINUE;
+				END;
+				IF (m IN ('count','literal') AND g[1] <> cardinality(ref)) OR
+				   (m NOT IN ('count','literal') AND g IS DISTINCT FROM ref) THEN
+					q := qq; path := t || '/' || m;
+					got := CASE WHEN m IN ('count','literal') THEN g[1] ELSE cardinality(g) END;
+					want := cardinality(ref);
+					RETURN NEXT;
+				END IF;
+			END LOOP;
+		END LOOP;
+	END LOOP;
+END $$;
+
+CREATE TABLE px_queries (q text);
+INSERT INTO px_queries VALUES
+	('nomatch:*'), ('q:*'), ('roote:*'), ('rooted:*'), ('root:*'), ('roo:*'), ('r:*'),
+	('abc29:*'), ('abc1:*'), ('abc:*'), ('ab1:*'),
+	-- more lexemes than one query may expand to: answered by a recheck
+	('ab:*'), ('a:*'),
+	('x1:*A'), ('x1:*AB'), ('root:*CD'), ('abc1:*D'),
+	('root:* & x1:*'), ('root:* | zz:*'), ('!root:*'), ('x1:* & !root:*'), ('!(x1:* | zz1:*)'),
+	('root:* <-> x1'), ('x1:* <-> root:*'), ('zz:* <2> x1:*'), ('root:*A <-> x1:*'),
+	('(root:* | x2) <-> zz0'), ('!root:* <-> x1'), ('x1 <-> !zz:*'), ('ab:* <-> root'),
+	('x1:* & root:* & zz:* & r:*');
+SELECT * FROM px_check(ARRAY(SELECT q FROM px_queries));
+
+-- the plans: the node, and how many rows it took to the heap
+CREATE FUNCTION px_plan(sql text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE l text; node text := 'other'; rechecked text := '';
+BEGIN
+	FOR l IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || sql LOOP
+		IF l ~ 'LionCount' THEN node := 'LionCount'; END IF;
+		IF l ~ 'Heap TIDs Rechecked' THEN rechecked := ', ' || trim(l); END IF;
+	END LOOP;
+	RETURN node || rechecked;
+END $$;
+SET enable_seqscan = off;
+-- an exact count from the index: no row goes to the heap on a vacuumed table
+SELECT px_plan($$SELECT count(*) FROM px_l WHERE tsv @@ 'root:* & x1:*'$$);
+-- a phrase with a prefix, decided from stored positions
+SELECT px_plan($$SELECT count(*) FROM px_lp WHERE tsv @@ 'root:* <-> x1:*'$$);
+-- a prefix too common to expand: every candidate is rechecked
+SELECT px_plan($$SELECT count(*) FROM px_l WHERE tsv @@ 'ab:*'$$) ~ 'Rechecked: [1-9]' AS rechecked;
+-- a prefix under an OR of clauses stays with the ordinary plan
+SELECT px_plan($$SELECT count(*) FROM px_l WHERE tsv @@ 'root:*' OR id = 7$$);
+RESET enable_seqscan;
+
+-- writes: new lexemes with the prefix, in this transaction and committed;
+-- deleted and updated rows, not vacuumed
+BEGIN;
+INSERT INTO px VALUES (100001, 'rootless:1 brandnew:2'), (100002, 'brandnewer:1A');
+INSERT INTO px_l VALUES (100001, 'rootless:1 brandnew:2'), (100002, 'brandnewer:1A');
+INSERT INTO px_lp VALUES (100001, 'rootless:1 brandnew:2'), (100002, 'brandnewer:1A');
+SELECT * FROM px_check(ARRAY['brandnew:*', 'brandnew:*A', 'rootl:*', 'root:* <-> brandnew:*']);
+COMMIT;
+UPDATE px SET tsv = tsv || 'rootbeer:30B'::tsvector WHERE id % 7 = 0;
+UPDATE px_l SET tsv = tsv || 'rootbeer:30B'::tsvector WHERE id % 7 = 0;
+UPDATE px_lp SET tsv = tsv || 'rootbeer:30B'::tsvector WHERE id % 7 = 0;
+DELETE FROM px WHERE id % 11 = 0; DELETE FROM px_l WHERE id % 11 = 0;
+DELETE FROM px_lp WHERE id % 11 = 0;
+SELECT * FROM px_check(ARRAY(SELECT q FROM px_queries) || ARRAY['rootb:*', 'rootb:*B', 'brand:*']);
+-- a rolled-back insert leaves its lexemes in the index: they find nothing
+BEGIN;
+INSERT INTO px_l VALUES (100003, 'ghostword:1'); INSERT INTO px_lp VALUES (100003, 'ghostword:1');
+ROLLBACK;
+SELECT * FROM px_check(ARRAY['ghost:*', 'ghost:* | root']);
+-- a prepared statement, executed after new lexemes arrive
+PREPARE pq AS SELECT count(*) FROM px_l WHERE tsv @@ 'late:*';
+EXECUTE pq;
+INSERT INTO px_l VALUES (100004, 'latecomer:1'), (100005, 'lately:1');
+EXECUTE pq;
+DEALLOCATE pq;
+DROP TABLE px, px_l, px_lp, px_queries;
+DROP FUNCTION px_ids(text, tsquery, text), px_check(text[]), px_plan(text);
