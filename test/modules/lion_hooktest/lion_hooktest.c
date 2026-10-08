@@ -24,6 +24,11 @@
  * but is not, by pointer, the heap, which is the only kind of "other" table
  * AM a test can create without shipping a real one.
  *
+ * And lion_hooktest_priv_decode(), which feeds pg_lion's decoder of a
+ * LionCount plan's custom_private (src/lion_plan_private.h) lists no planner
+ * makes.  It has nothing to do with the hooks: this module is simply the
+ * test-only C code the checks already build.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -38,7 +43,12 @@
 #include "optimizer/planner.h"
 #include "utils/guc.h"
 
+#include "lion_plan_private.h"
+
 PG_MODULE_MAGIC;
+
+typedef void (*lion_priv_decode_fn) (List *priv, LionPrivStage stage,
+									 LionCountPriv *out);
 
 PG_FUNCTION_INFO_V1(lion_hooktest_calls);
 PG_FUNCTION_INFO_V1(lion_hooktest_saw_lion);
@@ -46,6 +56,7 @@ PG_FUNCTION_INFO_V1(lion_hooktest_reset);
 PG_FUNCTION_INFO_V1(lion_hooktest_rel_calls);
 PG_FUNCTION_INFO_V1(lion_hooktest_rel_saw_ordered);
 PG_FUNCTION_INFO_V1(lion_hooktest_heapcopy_handler);
+PG_FUNCTION_INFO_V1(lion_hooktest_priv_decode);
 
 static create_upper_paths_hook_type prev_create_upper_paths_hook = NULL;
 static int64 hook_calls = 0;
@@ -195,4 +206,104 @@ lion_hooktest_heapcopy_handler(PG_FUNCTION_ARGS)
 {
 	heapcopy_routine = *GetHeapamTableAmRoutine();
 	PG_RETURN_POINTER(&heapcopy_routine);
+}
+
+/*
+ * pg_lion's decoder of a LionCount plan's custom_private
+ * (lion_count_priv_decode(), src/lion_plan_private.h), handed a list a
+ * planner of this build would make - one equality clause, a count - with one
+ * thing changed, named by `variant`; the number of clauses it decoded.  Every
+ * variant but "plan" and "path" is a list it must refuse: no plan carries
+ * one, so this is the only way to see that it does.
+ */
+Datum
+lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
+{
+	char	   *variant = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	lion_priv_decode_fn decode;
+	LionPrivStage stage = LION_PRIV_STAGE_PLAN;
+	LionCountPriv out;
+	List	   *priv = NIL;
+	int			n;
+
+	decode = (lion_priv_decode_fn)
+		load_external_function("$libdir/pg_lion", "lion_count_priv_decode",
+							   true, NULL);
+
+	for (n = 0; n < LION_PRIV_NMEMBERS; n++)
+	{
+		List	   *m = NIL;
+
+		switch (n)
+		{
+			case LION_PRIV_VERSION:
+				m = list_make2_int(LION_PRIV_MAGIC, LION_PRIV_NMEMBERS);
+				break;
+			case LION_PRIV_OIDS:
+				m = list_make4_oid(RelationRelationId, InvalidOid, InvalidOid,
+								   ClassOidIndexId);
+				break;
+			case LION_PRIV_INTS:
+				m = list_make5_int(1, 0, 0, 0, Anum_pg_class_oid);
+				break;
+			case LION_PRIV_CLAUSEKINDS:
+				m = list_make1_int(LION_CLAUSE_EQ);
+				break;
+			case LION_PRIV_CLAUSEOPS:
+				m = list_make1_oid((Oid) 607); /* oid = oid */
+				break;
+			case LION_PRIV_EXECUTE:
+				m = list_make3(NIL, NIL, NIL);
+				break;
+			case LION_PRIV_TLKINDS:
+				m = list_make1_int(LION_TL_COUNT);
+				break;
+		}
+		priv = lappend(priv, m);
+	}
+
+	if (strcmp(variant, "plan") == 0)
+		;
+	else if (strcmp(variant, "path") == 0)
+	{
+		/* the path's list: no target-list kinds, and the clause's value */
+		stage = LION_PRIV_STAGE_PATH;
+		priv = list_truncate(priv, LION_PRIV_NMEMBERS - 1);
+		lfirst(list_nth_cell(priv, LION_PRIV_CONSTS)) =
+			list_make1(makeConst(OIDOID, -1, InvalidOid, sizeof(Oid),
+								 ObjectIdGetDatum(InvalidOid), false, true));
+	}
+	else if (strcmp(variant, "magic") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_VERSION)) =
+			list_make2_int(LION_PRIV_MAGIC - 1, LION_PRIV_NMEMBERS);
+	else if (strcmp(variant, "path at plan") == 0)
+		priv = list_truncate(priv, LION_PRIV_NMEMBERS - 1);
+	else if (strcmp(variant, "short oids") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_OIDS)) =
+			list_make3_oid(RelationRelationId, InvalidOid, InvalidOid);
+	else if (strcmp(variant, "oids as ints") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_OIDS)) =
+			list_make4_int(RelationRelationId, 0, 0, ClassOidIndexId);
+	else if (strcmp(variant, "clause kind") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_CLAUSEKINDS)) =
+			list_make1_int(LION_CLAUSE_NE + 1);
+	else if (strcmp(variant, "path join at plan") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_JOIN)) =
+			list_make5_int(0, LION_JOIN_INNER, 0, 0, 0);
+	else if (strcmp(variant, "or length") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_ORS)) =
+			list_make1(list_make3_int(0, 2, 1));
+	else if (strcmp(variant, "partition length") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_PARTS)) =
+			list_make1(list_make3_oid(RelationRelationId, InvalidOid,
+									  InvalidOid));
+	else if (strcmp(variant, "path wagg at plan") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_WAGG)) =
+			list_make3(list_make1_int(1), list_make1_oid(ClassOidIndexId),
+					   list_make1_int(1));
+	else
+		elog(ERROR, "unknown variant \"%s\"", variant);
+
+	decode(priv, stage, &out);
+	PG_RETURN_INT32(out.nclause);
 }
