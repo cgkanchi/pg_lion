@@ -801,15 +801,15 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 							get_attname(st->heapoid, st->distattno, false), es);
 
 	/* the columns aggregates are taken over (DESIGN.md §37) */
-	if (st->nwcol > 0)
+	if (st->wagg != NULL)
 	{
 		int			c;
 
 		initStringInfo(&buf);
-		for (c = 0; c < st->nwcol; c++)
+		for (c = 0; c < st->wagg->ncol; c++)
 			appendStringInfo(&buf, "%s%s (%s)", (c > 0) ? ", " : "",
-							 get_rel_name(st->wcol[c].idxoid),
-							 get_attname(st->heapoid, st->wcol[c].attno,
+							 get_rel_name(st->wagg->col[c].idxoid),
+							 get_attname(st->heapoid, st->wagg->col[c].attno,
 										 false));
 		ExplainPropertyText("Aggregates Over Keys", buf.data, es);
 		pfree(buf.data);
@@ -1098,13 +1098,15 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 	 * The aggregates over keys (DESIGN.md §37): the entries they took, and
 	 * how many walks read the entries' own counts and how many counted them.
 	 */
-	if (st->nwcol > 0)
+	if (st->wagg != NULL)
 	{
-		ExplainPropertyInteger("Keys Aggregated", NULL, st->wentries, es);
-		ExplainPropertyInteger("Key Walks From Entry Counts", NULL, st->wfast,
+		ExplainPropertyInteger("Keys Aggregated", NULL, st->wagg->entries,
 							   es);
-		if (st->wslow > 0)
-			ExplainPropertyInteger("Key Walks Counted", NULL, st->wslow, es);
+		ExplainPropertyInteger("Key Walks From Entry Counts", NULL,
+							   st->wagg->fast, es);
+		if (st->wagg->slow > 0)
+			ExplainPropertyInteger("Key Walks Counted", NULL, st->wagg->slow,
+								   es);
 	}
 
 	/*

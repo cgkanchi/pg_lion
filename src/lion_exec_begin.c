@@ -860,34 +860,36 @@ lion_begin_target_list(LionCountScanState *st, CustomScan *cscan,
  * columns, each aggregate's kind, argument and - for a minimum or a maximum -
  * its sort operator, and where each column's key goes in the scan tuple.
  * Whether the target list has counts besides, which the sum over every row
- * answers.
+ * answers.  Their state is there only when the plan has them.
  */
 static void
 lion_begin_wagg(LionCountScanState *st, CustomScanState *node,
-				const LionCountPriv *priv, List *exprs)
+				const LionCountPriv *priv, List *exprs, EState *estate)
 {
+	LionWaggState *wg;
 	int			i;
 
-	st->nwcol = 0;
-	st->nwagg = 0;
+	st->wagg = NULL;
 	if (priv->nwcol == 0)
 		return;
 
-	st->nwcol = priv->nwcol;
-	st->wcol = (LionWCol *) palloc0(sizeof(LionWCol) * st->nwcol);
-	for (i = 0; i < st->nwcol; i++)
+	wg = (LionWaggState *) MemoryContextAllocZero(estate->es_query_cxt,
+												  sizeof(LionWaggState));
+	wg->ncol = priv->nwcol;
+	wg->col = (LionWCol *) palloc0(sizeof(LionWCol) * wg->ncol);
+	for (i = 0; i < wg->ncol; i++)
 	{
-		st->wcol[i].attno = priv->wcol[i].attno;
-		st->wcol[i].idxoid = priv->wcol[i].idxoid;
-		st->wcol[i].idxcol = priv->wcol[i].idxcol;
-		st->wcol[i].slotcol = -1;
+		wg->col[i].attno = priv->wcol[i].attno;
+		wg->col[i].idxoid = priv->wcol[i].idxoid;
+		wg->col[i].idxcol = priv->wcol[i].idxcol;
+		wg->col[i].slotcol = -1;
 	}
 
-	st->nwagg = priv->nwagg;
-	st->wagg = (LionWAgg *) palloc0(sizeof(LionWAgg) * Max(st->nwagg, 1));
-	for (i = 0; i < st->nwagg; i++)
+	wg->nagg = priv->nwagg;
+	wg->agg = (LionWAgg *) palloc0(sizeof(LionWAgg) * Max(wg->nagg, 1));
+	for (i = 0; i < wg->nagg; i++)
 	{
-		LionWAgg   *a = &st->wagg[i];
+		LionWAgg   *a = &wg->agg[i];
 		Expr	   *arg = (Expr *) list_nth(exprs, st->nclause + i);
 		Node	   *bare = lion_strip((Node *) arg);
 
@@ -917,23 +919,24 @@ lion_begin_wagg(LionCountScanState *st, CustomScanState *node,
 	}
 
 	/* each column's key in the scan tuple, and whether counts are wanted */
-	st->wneedcount = false;
+	wg->needcount = false;
 	for (i = 0; i < st->ntlist; i++)
 	{
 		int			kind = st->tlkind[i];
 
 		if (LION_TL_IS_WKEY(kind))
-			st->wcol[LION_TL_WKEY_COL(kind)].slotcol = i;
+			wg->col[LION_TL_WKEY_COL(kind)].slotcol = i;
 		else if (LION_TL_IS_WAGG(kind))
 			continue;
 		else
-			st->wneedcount = true;
+			wg->needcount = true;
 	}
-	for (i = 0; i < st->nwagg; i++)
+	for (i = 0; i < wg->nagg; i++)
 	{
-		if (!st->wagg[i].argiskey && st->wcol[st->wagg[i].col].slotcol < 0)
+		if (!wg->agg[i].argiskey && wg->col[wg->agg[i].col].slotcol < 0)
 			elog(ERROR, "LionCount: an aggregate's argument without its key");
 	}
+	st->wagg = wg;
 }
 
 /*
@@ -1533,7 +1536,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_coalesce(st, &priv, estate);
 	lion_begin_join(st, &priv);
 	lion_begin_target_list(st, cscan, &priv);
-	lion_begin_wagg(st, node, &priv, exprs);
+	lion_begin_wagg(st, node, &priv, exprs, estate);
 	lion_begin_clauses(st, node, &priv, exprs);
 	lion_begin_driving_column(st, &priv);
 	lion_begin_ors_and_items(st, &priv);

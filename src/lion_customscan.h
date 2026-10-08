@@ -1418,7 +1418,7 @@ typedef struct LionWCol
 typedef struct LionWAgg
 {
 	int			kind;			/* LION_WAGG_* */
-	int			col;			/* its column, in the scan's wcol */
+	int			col;			/* its column, in LionWaggState.col */
 	int			argwidth;		/* 2, 4 or 8: a sum's or average's argument */
 	ExprState  *arg;			/* the argument, over the key's column */
 	bool		argiskey;		/* ... which is the key itself */
@@ -1430,11 +1430,33 @@ typedef struct LionWAgg
 	int128		sum;			/* SUM, AVG: the weighted sum */
 #endif
 	int64		n;				/* ... and the rows with a value */
-	Datum		ext;			/* EXTREME: the value so far, in wcxt */
+	Datum		ext;			/* EXTREME: the value so far, in cxt */
 	bool		hasext;
 	Datum		result;
 	bool		resnull;
 } LionWAgg;
+
+/*
+ * The aggregates over the entries of lion columns (DESIGN.md §37): ncol
+ * columns, each walked once, and nagg aggregates over them, each an argument
+ * evaluated on an entry's key and weighted by the entry's rows.  needcount
+ * says the target list has counts too, which the sum over every row answers
+ * as before.  entries, fast and slow are what EXPLAIN ANALYZE reports: the
+ * entries taken, the walks that read the entries' own counts, and those that
+ * counted each entry.
+ */
+typedef struct LionWaggState
+{
+	int			ncol;
+	LionWCol   *col;
+	int			nagg;
+	LionWAgg   *agg;
+	bool		needcount;
+	MemoryContext cxt;
+	int64		entries;
+	int64		fast;
+	int64		slow;
+} LionWaggState;
 
 /*
  * What the node does, fixed by the plan at begin (lion_count_mode_of()) and
@@ -1779,23 +1801,10 @@ typedef struct LionCountScanState
 	struct LionTopkState *topk;
 
 	/*
-	 * The aggregates over the entries of lion columns (DESIGN.md §37): nwcol
-	 * columns, each walked once, and nwagg aggregates over them, each an
-	 * argument evaluated on an entry's key and weighted by the entry's rows.
-	 * wneedcount says the target list has counts too, which the sum over
-	 * every row answers as before.  wfast and wslow are what EXPLAIN ANALYZE
-	 * reports: the walks that read the entries' own counts, and those that
-	 * counted each entry.
+	 * The aggregates over the entries of lion columns (DESIGN.md §37), or
+	 * NULL when the plan has none (lion_st_wagg()).
 	 */
-	int			nwcol;
-	struct LionWCol *wcol;
-	int			nwagg;
-	struct LionWAgg *wagg;
-	bool		wneedcount;
-	MemoryContext wcxt;
-	int64		wentries;
-	int64		wfast;
-	int64		wslow;
+	struct LionWaggState *wagg;
 
 	/*
 	 * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel"; granged,
@@ -2150,6 +2159,14 @@ lion_st_topk(LionCountScanState *st)
 {
 	Assert(st->topk != NULL);
 	return st->topk;
+}
+
+/* The aggregates over keys' state, which only a plan with them has (§37) */
+static inline LionWaggState *
+lion_st_wagg(LionCountScanState *st)
+{
+	Assert(st->wagg != NULL);
+	return st->wagg;
 }
 
 /*
