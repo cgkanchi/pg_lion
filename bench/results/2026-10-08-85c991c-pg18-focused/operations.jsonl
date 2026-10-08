@@ -1,19 +1,19 @@
-{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 4995.30816600003, "wal_bytes": 161365552, "suite": "scalar", "family": "roaring_btree", "rows": 1000000}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 233.064904999992, "wal_bytes": 387072, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c2"}
+{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 3263.4791410000616, "wal_bytes": 161420488, "suite": "scalar", "family": "roaring_btree", "rows": 1000000}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 115.11060500015446, "wal_bytes": 417464, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c2"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c2", "bytes": 376832}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 291.1672810000141, "wal_bytes": 2189128, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c20"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 138.32529299997987, "wal_bytes": 2197824, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c20"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c20", "bytes": 2473984}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 324.0346759999966, "wal_bytes": 3035832, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c200"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 136.95287900009134, "wal_bytes": 3044288, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c200"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c200", "bytes": 4947968}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 678.4282089999465, "wal_bytes": 7349384, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c20k"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 323.2847730000685, "wal_bytes": 7355680, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c20k"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c20k", "bytes": 8282112}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1993.9928459999692, "wal_bytes": 41805912, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c1m"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1196.3432790003026, "wal_bytes": 41797736, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c1m"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c1m", "bytes": 46415872}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 265.0477529999762, "wal_bytes": 898728, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_skew"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 169.70703100014362, "wal_bytes": 890472, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_skew"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_skew", "bytes": 966656}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 294.6491760000072, "wal_bytes": 2997056, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_nullable"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 165.68585400000302, "wal_bytes": 2988832, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_nullable"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_nullable", "bytes": 5128192}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 504.47234699998944, "wal_bytes": 17989736, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c1m_btree"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 537.2216439996009, "wal_bytes": 17881272, "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c1m_btree"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "repeat": 0, "index": "ix_c1m_btree", "bytes": 19726336}
 {"kind": "portfolio", "suite": "scalar", "family": "roaring_btree", "rows": 1000000, "completeness": "complete", "failed_indexes": [], "index_bytes": 88317952, "heap_bytes": 157884416}
 {"kind": "visibility", "suite": "scalar", "rows": 1000000, "family": "roaring_btree", "phase": "clean", "heap_pages": 19264, "all_visible": "19231", "all_frozen": "19231"}
@@ -21,20 +21,20 @@
 {"kind": "correctness", "status": "pass", "digest": "141d1e3ccf8d1f9ddbeaf1692945fc274b1f2df35ccac5b604204fd0a36c82fb", "suite": "scalar", "rows": 1000000, "variant": "roaring_btree", "phase": "clean", "mode": "default", "memory": "64MB", "case": "ordered_broad", "category": "ordered_filter"}
 {"kind": "correctness", "status": "pass", "digest": "962d7484851ebc632e7ea692add0ee49282ddee04c19ca2bc6274ff2adc06d55", "suite": "scalar", "rows": 1000000, "variant": "roaring_btree", "phase": "clean", "mode": "default", "memory": "64MB", "case": "ordered_filter_desc", "category": "ordered_filter"}
 {"kind": "dataset_complete", "suite": "scalar", "rows": 1000000, "family": "roaring_btree"}
-{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 3412.588711000012, "wal_bytes": 161323688, "suite": "scalar", "family": "gin", "rows": 1000000}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 288.41987900000277, "wal_bytes": 1142080, "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_c2"}
+{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 2114.4797160000053, "wal_bytes": 161324784, "suite": "scalar", "family": "gin", "rows": 1000000}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 136.52769200007242, "wal_bytes": 1195208, "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_c2"}
 {"kind": "index_size", "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_c2", "bytes": 1146880}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 355.0579459999881, "wal_bytes": 1473544, "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_c20"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 158.897302999776, "wal_bytes": 1481952, "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_c20"}
 {"kind": "index_size", "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_c20", "bytes": 1654784}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 380.4417869999952, "wal_bytes": 2155336, "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_c200"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 221.35715700005676, "wal_bytes": 2162352, "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_c200"}
 {"kind": "index_size", "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_c200", "bytes": 4931584}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 839.10799399996, "wal_bytes": 3745496, "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_c20k"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 415.3773410002941, "wal_bytes": 3753344, "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_c20k"}
 {"kind": "index_size", "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_c20k", "bytes": 7061504}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 3675.6968119999556, "wal_bytes": 20417640, "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_c1m"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2383.993370999633, "wal_bytes": 20424616, "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_c1m"}
 {"kind": "index_size", "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_c1m", "bytes": 40050688}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 366.8676620000042, "wal_bytes": 1351880, "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_skew"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 205.99336699979176, "wal_bytes": 1358824, "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_skew"}
 {"kind": "index_size", "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_skew", "bytes": 1613824}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 386.0221389999765, "wal_bytes": 2112552, "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_nullable"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 198.64707600027032, "wal_bytes": 2119536, "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_nullable"}
 {"kind": "index_size", "suite": "scalar", "family": "gin", "rows": 1000000, "repeat": 0, "index": "ix_nullable", "bytes": 5070848}
 {"kind": "portfolio", "suite": "scalar", "family": "gin", "rows": 1000000, "completeness": "complete", "failed_indexes": [], "index_bytes": 61530112, "heap_bytes": 157884416}
 {"kind": "visibility", "suite": "scalar", "rows": 1000000, "family": "gin", "phase": "clean", "heap_pages": 19264, "all_visible": "19231", "all_frozen": "19231"}
@@ -79,33 +79,33 @@
 {"kind": "correctness", "status": "pass", "digest": "89e8e98ed0f8ac3818a2859fe67ca7f9cded8ad007685991f74a362044647627", "suite": "scalar", "rows": 1000000, "variant": "gin", "phase": "dirty_scattered", "mode": "default", "memory": "64MB", "case": "group_c200", "category": "grouping"}
 {"kind": "correctness", "status": "pass", "digest": "4302235f975505ab457122c270add39f44ecdc781de9539be3c9711c0fb6dc70", "suite": "scalar", "rows": 1000000, "variant": "gin", "phase": "dirty_scattered", "mode": "default", "memory": "64MB", "case": "eq_c2_0", "category": "equality"}
 {"kind": "correctness", "status": "pass", "digest": "89e8e98ed0f8ac3818a2859fe67ca7f9cded8ad007685991f74a362044647627", "suite": "scalar", "rows": 1000000, "variant": "gin", "phase": "dirty_scattered", "mode": "prefer_index", "memory": "64MB", "case": "group_c200", "category": "grouping"}
-{"kind": "insert", "status": "ok", "error": null, "elapsed_ms": 115.41804699999147, "wal_bytes": 12869584, "suite": "scalar", "rows": 1000000, "family": "gin"}
+{"kind": "insert", "status": "ok", "error": null, "elapsed_ms": 98.18644500001028, "wal_bytes": 12894416, "suite": "scalar", "rows": 1000000, "family": "gin"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 1000000, "family": "gin", "operation": "insert", "index_bytes": 62971904}
-{"kind": "indexed_update", "status": "ok", "error": null, "elapsed_ms": 217.97130700002754, "wal_bytes": 14934880, "suite": "scalar", "rows": 1000000, "family": "gin"}
+{"kind": "indexed_update", "status": "ok", "error": null, "elapsed_ms": 205.659654000101, "wal_bytes": 16380632, "suite": "scalar", "rows": 1000000, "family": "gin"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 1000000, "family": "gin", "operation": "indexed_update", "index_bytes": 64413696}
-{"kind": "delete", "status": "ok", "error": null, "elapsed_ms": 253.5239989999809, "wal_bytes": 74743048, "suite": "scalar", "rows": 1000000, "family": "gin"}
+{"kind": "delete", "status": "ok", "error": null, "elapsed_ms": 258.9064909998342, "wal_bytes": 76784096, "suite": "scalar", "rows": 1000000, "family": "gin"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 1000000, "family": "gin", "operation": "delete", "index_bytes": 64413696}
-{"kind": "vacuum", "status": "ok", "error": null, "elapsed_ms": 1107.5219730000185, "wal_bytes": 139613720, "suite": "scalar", "rows": 1000000, "family": "gin"}
-{"kind": "maintenance_size", "suite": "scalar", "rows": 1000000, "family": "gin", "operation": "vacuum", "index_bytes": 64675840}
+{"kind": "vacuum", "status": "ok", "error": null, "elapsed_ms": 930.5468669999755, "wal_bytes": 148145416, "suite": "scalar", "rows": 1000000, "family": "gin"}
+{"kind": "maintenance_size", "suite": "scalar", "rows": 1000000, "family": "gin", "operation": "vacuum", "index_bytes": 64659456}
 {"kind": "correctness", "status": "pass", "digest": "49ead5050a4bf7637f0dfa7b05e6f150b242315e14ad0e693faab262228b717d", "suite": "scalar", "rows": 1000000, "variant": "gin", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "eq_c200_17", "category": "equality"}
 {"kind": "correctness", "status": "pass", "digest": "70019c7ce2a1b95f981c727c7f66821be933aac1551d15681ce81854b336e1de", "suite": "scalar", "rows": 1000000, "variant": "gin", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "and2", "category": "intersection"}
 {"kind": "correctness", "status": "pass", "digest": "0f9cab2da33873a0bc57263fdbc7e1ab77274aa5edbecd4251d9f5f5beb51069", "suite": "scalar", "rows": 1000000, "variant": "gin", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "group_c200", "category": "grouping"}
 {"kind": "correctness", "status": "pass", "digest": "d4be25b741af35c10fcd6d37dd7485557659f83de2b753922fc0aa2c1bb31d76", "suite": "scalar", "rows": 1000000, "variant": "gin", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "is_null", "category": "null"}
 {"kind": "dataset_complete", "suite": "scalar", "rows": 1000000, "family": "gin"}
-{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 3604.3150890000106, "wal_bytes": 161363496, "suite": "scalar", "family": "btree", "rows": 1000000}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 469.6071739999752, "wal_bytes": 6359736, "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_c2"}
+{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 2545.173979000083, "wal_bytes": 161371056, "suite": "scalar", "family": "btree", "rows": 1000000}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 520.8114810002371, "wal_bytes": 6328992, "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_c2"}
 {"kind": "index_size", "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_c2", "bytes": 6955008}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 506.3986470000259, "wal_bytes": 6360512, "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_c20"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 444.6804049998718, "wal_bytes": 6328240, "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_c20"}
 {"kind": "index_size", "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_c20", "bytes": 6963200}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 517.6230780000424, "wal_bytes": 6364880, "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_c200"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 449.7292189998916, "wal_bytes": 6332152, "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_c200"}
 {"kind": "index_size", "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_c200", "bytes": 7045120}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 484.7992050000016, "wal_bytes": 6658984, "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_c20k"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 523.5725960001218, "wal_bytes": 6627152, "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_c20k"}
 {"kind": "index_size", "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_c20k", "bytes": 7135232}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 520.4978490000371, "wal_bytes": 17988208, "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_c1m"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 381.71023400036574, "wal_bytes": 17894672, "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_c1m"}
 {"kind": "index_size", "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_c1m", "bytes": 19726336}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 367.959170000006, "wal_bytes": 6370048, "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_skew"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 302.6027000000795, "wal_bytes": 6337864, "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_skew"}
 {"kind": "index_size", "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_skew", "bytes": 6979584}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 410.0385309999979, "wal_bytes": 6368016, "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_nullable"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 393.7139049999132, "wal_bytes": 6335232, "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_nullable"}
 {"kind": "index_size", "suite": "scalar", "family": "btree", "rows": 1000000, "repeat": 0, "index": "ix_nullable", "bytes": 7045120}
 {"kind": "portfolio", "suite": "scalar", "family": "btree", "rows": 1000000, "completeness": "complete", "failed_indexes": [], "index_bytes": 61849600, "heap_bytes": 157884416}
 {"kind": "visibility", "suite": "scalar", "rows": 1000000, "family": "btree", "phase": "clean", "heap_pages": 19264, "all_visible": "19231", "all_frozen": "19231"}
@@ -150,33 +150,33 @@
 {"kind": "correctness", "status": "pass", "digest": "626a4640118b284502ab2f0a2a0829a0695670e809cad1f8a12073726471eeaa", "suite": "scalar", "rows": 1000000, "variant": "btree", "phase": "dirty_scattered", "mode": "default", "memory": "64MB", "case": "and2", "category": "intersection"}
 {"kind": "correctness", "status": "pass", "digest": "817f26320883163dea0e6ef03fe76451d6283adc1af9cb30c8bf413997e43152", "suite": "scalar", "rows": 1000000, "variant": "btree", "phase": "dirty_scattered", "mode": "default", "memory": "64MB", "case": "eq_c200_17", "category": "equality"}
 {"kind": "correctness", "status": "pass", "digest": "89e8e98ed0f8ac3818a2859fe67ca7f9cded8ad007685991f74a362044647627", "suite": "scalar", "rows": 1000000, "variant": "btree", "phase": "dirty_scattered", "mode": "prefer_index", "memory": "64MB", "case": "group_c200", "category": "grouping"}
-{"kind": "insert", "status": "ok", "error": null, "elapsed_ms": 261.5643450000107, "wal_bytes": 34188000, "suite": "scalar", "rows": 1000000, "family": "btree"}
+{"kind": "insert", "status": "ok", "error": null, "elapsed_ms": 278.54301900015344, "wal_bytes": 34212816, "suite": "scalar", "rows": 1000000, "family": "btree"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 1000000, "family": "btree", "operation": "insert", "index_bytes": 62267392}
-{"kind": "indexed_update", "status": "ok", "error": null, "elapsed_ms": 431.73646399998233, "wal_bytes": 37239808, "suite": "scalar", "rows": 1000000, "family": "btree"}
+{"kind": "indexed_update", "status": "ok", "error": null, "elapsed_ms": 493.48025900007997, "wal_bytes": 38681728, "suite": "scalar", "rows": 1000000, "family": "btree"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 1000000, "family": "btree", "operation": "indexed_update", "index_bytes": 62652416}
-{"kind": "delete", "status": "ok", "error": null, "elapsed_ms": 260.05653300001086, "wal_bytes": 74743048, "suite": "scalar", "rows": 1000000, "family": "btree"}
+{"kind": "delete", "status": "ok", "error": null, "elapsed_ms": 289.5849020001151, "wal_bytes": 76784112, "suite": "scalar", "rows": 1000000, "family": "btree"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 1000000, "family": "btree", "operation": "delete", "index_bytes": 62652416}
-{"kind": "vacuum", "status": "ok", "error": null, "elapsed_ms": 836.0025260000157, "wal_bytes": 131927800, "suite": "scalar", "rows": 1000000, "family": "btree"}
+{"kind": "vacuum", "status": "ok", "error": null, "elapsed_ms": 707.5362199998381, "wal_bytes": 140298736, "suite": "scalar", "rows": 1000000, "family": "btree"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 1000000, "family": "btree", "operation": "vacuum", "index_bytes": 62652416}
 {"kind": "correctness", "status": "pass", "digest": "49ead5050a4bf7637f0dfa7b05e6f150b242315e14ad0e693faab262228b717d", "suite": "scalar", "rows": 1000000, "variant": "btree", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "eq_c200_17", "category": "equality"}
 {"kind": "correctness", "status": "pass", "digest": "0f9cab2da33873a0bc57263fdbc7e1ab77274aa5edbecd4251d9f5f5beb51069", "suite": "scalar", "rows": 1000000, "variant": "btree", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "group_c200", "category": "grouping"}
 {"kind": "correctness", "status": "pass", "digest": "d4be25b741af35c10fcd6d37dd7485557659f83de2b753922fc0aa2c1bb31d76", "suite": "scalar", "rows": 1000000, "variant": "btree", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "is_null", "category": "null"}
 {"kind": "correctness", "status": "pass", "digest": "70019c7ce2a1b95f981c727c7f66821be933aac1551d15681ce81854b336e1de", "suite": "scalar", "rows": 1000000, "variant": "btree", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "and2", "category": "intersection"}
 {"kind": "dataset_complete", "suite": "scalar", "rows": 1000000, "family": "btree"}
-{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 2851.762260999976, "wal_bytes": 161366888, "suite": "scalar", "family": "roaring", "rows": 1000000}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 213.85952200000702, "wal_bytes": 387144, "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_c2"}
+{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 1771.0175140000501, "wal_bytes": 161366128, "suite": "scalar", "family": "roaring", "rows": 1000000}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 110.41796000017712, "wal_bytes": 405616, "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_c2"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_c2", "bytes": 376832}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 239.2772949999653, "wal_bytes": 2189496, "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_c20"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 134.57529200013596, "wal_bytes": 2199648, "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_c20"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_c20", "bytes": 2473984}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 248.03346599998122, "wal_bytes": 3036304, "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_c200"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 162.2307570000885, "wal_bytes": 3043984, "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_c200"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_c200", "bytes": 4947968}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 566.8138490000274, "wal_bytes": 7349936, "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_c20k"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 330.16986299981, "wal_bytes": 7357800, "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_c20k"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_c20k", "bytes": 8282112}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1838.6692880000055, "wal_bytes": 41808520, "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_c1m"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1261.879210999723, "wal_bytes": 41813264, "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_c1m"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_c1m", "bytes": 46415872}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 281.32874700003185, "wal_bytes": 901280, "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_skew"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 119.41745700005413, "wal_bytes": 906000, "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_skew"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_skew", "bytes": 966656}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 263.953373999982, "wal_bytes": 2999624, "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_nullable"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 136.77357500000653, "wal_bytes": 3004376, "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_nullable"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring", "rows": 1000000, "repeat": 0, "index": "ix_nullable", "bytes": 5128192}
 {"kind": "portfolio", "suite": "scalar", "family": "roaring", "rows": 1000000, "completeness": "complete", "failed_indexes": [], "index_bytes": 68591616, "heap_bytes": 157884416}
 {"kind": "visibility", "suite": "scalar", "rows": 1000000, "family": "roaring", "phase": "clean", "heap_pages": 19264, "all_visible": "19231", "all_frozen": "19231"}
@@ -261,13 +261,13 @@
 {"kind": "correctness", "status": "pass", "digest": "626a4640118b284502ab2f0a2a0829a0695670e809cad1f8a12073726471eeaa", "suite": "scalar", "rows": 1000000, "variant": "roaring_bitmap", "phase": "dirty_scattered", "mode": "default", "memory": "64MB", "case": "and2", "category": "intersection"}
 {"kind": "correctness", "status": "pass", "digest": "817f26320883163dea0e6ef03fe76451d6283adc1af9cb30c8bf413997e43152", "suite": "scalar", "rows": 1000000, "variant": "roaring_bitmap", "phase": "dirty_scattered", "mode": "default", "memory": "64MB", "case": "eq_c200_17", "category": "equality"}
 {"kind": "correctness", "status": "pass", "digest": "89e8e98ed0f8ac3818a2859fe67ca7f9cded8ad007685991f74a362044647627", "suite": "scalar", "rows": 1000000, "variant": "roaring_bitmap", "phase": "dirty_scattered", "mode": "prefer_index", "memory": "64MB", "case": "group_c200", "category": "grouping"}
-{"kind": "insert", "status": "ok", "error": null, "elapsed_ms": 367.30741399998124, "wal_bytes": 53452648, "suite": "scalar", "rows": 1000000, "family": "roaring"}
+{"kind": "insert", "status": "ok", "error": null, "elapsed_ms": 374.3501369999649, "wal_bytes": 53477448, "suite": "scalar", "rows": 1000000, "family": "roaring"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 1000000, "family": "roaring", "operation": "insert", "index_bytes": 68608000}
-{"kind": "indexed_update", "status": "ok", "error": null, "elapsed_ms": 534.9377099999515, "wal_bytes": 61265088, "suite": "scalar", "rows": 1000000, "family": "roaring"}
+{"kind": "indexed_update", "status": "ok", "error": null, "elapsed_ms": 534.5943729998908, "wal_bytes": 62712632, "suite": "scalar", "rows": 1000000, "family": "roaring"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 1000000, "family": "roaring", "operation": "indexed_update", "index_bytes": 69951488}
-{"kind": "delete", "status": "ok", "error": null, "elapsed_ms": 258.82280600001195, "wal_bytes": 74743048, "suite": "scalar", "rows": 1000000, "family": "roaring"}
+{"kind": "delete", "status": "ok", "error": null, "elapsed_ms": 265.1867559998209, "wal_bytes": 76784112, "suite": "scalar", "rows": 1000000, "family": "roaring"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 1000000, "family": "roaring", "operation": "delete", "index_bytes": 69951488}
-{"kind": "vacuum", "status": "ok", "error": null, "elapsed_ms": 971.4291699999649, "wal_bytes": 133875896, "suite": "scalar", "rows": 1000000, "family": "roaring"}
+{"kind": "vacuum", "status": "ok", "error": null, "elapsed_ms": 795.5809899999622, "wal_bytes": 142238312, "suite": "scalar", "rows": 1000000, "family": "roaring"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 1000000, "family": "roaring", "operation": "vacuum", "index_bytes": 69951488}
 {"kind": "correctness", "status": "pass", "digest": "49ead5050a4bf7637f0dfa7b05e6f150b242315e14ad0e693faab262228b717d", "suite": "scalar", "rows": 1000000, "variant": "roaring", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "eq_c200_17", "category": "equality"}
 {"kind": "correctness", "status": "pass", "digest": "70019c7ce2a1b95f981c727c7f66821be933aac1551d15681ce81854b336e1de", "suite": "scalar", "rows": 1000000, "variant": "roaring", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "and2", "category": "intersection"}
@@ -278,22 +278,22 @@
 {"kind": "correctness", "status": "pass", "digest": "70019c7ce2a1b95f981c727c7f66821be933aac1551d15681ce81854b336e1de", "suite": "scalar", "rows": 1000000, "variant": "roaring_bitmap", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "and2", "category": "intersection"}
 {"kind": "correctness", "status": "pass", "digest": "49ead5050a4bf7637f0dfa7b05e6f150b242315e14ad0e693faab262228b717d", "suite": "scalar", "rows": 1000000, "variant": "roaring_bitmap", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "eq_c200_17", "category": "equality"}
 {"kind": "dataset_complete", "suite": "scalar", "rows": 1000000, "family": "roaring"}
-{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 23642.238009000037, "wal_bytes": 806452608, "suite": "scalar", "family": "roaring_btree", "rows": 5000000}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1163.8666799999555, "wal_bytes": 1670808, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c2"}
+{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 17630.265686000257, "wal_bytes": 806457744, "suite": "scalar", "family": "roaring_btree", "rows": 5000000}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 502.4187600001824, "wal_bytes": 1672248, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c2"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c2", "bytes": 1687552}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1168.0190550000589, "wal_bytes": 10667672, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c20"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 529.4172320000143, "wal_bytes": 10661696, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c20"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c20", "bytes": 10993664}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1239.4061770000917, "wal_bytes": 14799408, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c200"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 578.5091449997708, "wal_bytes": 14793464, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c200"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c200", "bytes": 16506880}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2580.6505040000047, "wal_bytes": 32065184, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c20k"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1397.76328500011, "wal_bytes": 32059264, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c20k"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c20k", "bytes": 41197568}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 6528.11220000001, "wal_bytes": 86854176, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c1m"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 4168.291826999848, "wal_bytes": 86848168, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c1m"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c1m", "bytes": 96641024}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1403.4110679999685, "wal_bytes": 4016632, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_skew"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 657.0662720000655, "wal_bytes": 4010712, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_skew"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_skew", "bytes": 4980736}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1423.3467960000326, "wal_bytes": 14601352, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_nullable"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 629.9915469999178, "wal_bytes": 14595328, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_nullable"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_nullable", "bytes": 17252352}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 3237.448762999975, "wal_bytes": 53800120, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c1m_btree"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2759.6336450001218, "wal_bytes": 53504392, "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c1m_btree"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "repeat": 0, "index": "ix_c1m_btree", "bytes": 58990592}
 {"kind": "portfolio", "suite": "scalar", "family": "roaring_btree", "rows": 5000000, "completeness": "complete", "failed_indexes": [], "index_bytes": 248250368, "heap_bytes": 788250624}
 {"kind": "visibility", "suite": "scalar", "rows": 5000000, "family": "roaring_btree", "phase": "clean", "heap_pages": 96192, "all_visible": "96154", "all_frozen": "96154"}
@@ -301,20 +301,20 @@
 {"kind": "correctness", "status": "pass", "digest": "a464ad98c633053711a69d838b24cb4842c7a95cb15be27b4e76d0bb2cc1b064", "suite": "scalar", "rows": 5000000, "variant": "roaring_btree", "phase": "clean", "mode": "default", "memory": "64MB", "case": "ordered_broad", "category": "ordered_filter"}
 {"kind": "correctness", "status": "pass", "digest": "411e33fe083bfc23c92dae6286daad76552ef40cc7f908053959a267b7804fa6", "suite": "scalar", "rows": 5000000, "variant": "roaring_btree", "phase": "clean", "mode": "default", "memory": "64MB", "case": "ordered_filter", "category": "ordered_filter"}
 {"kind": "dataset_complete", "suite": "scalar", "rows": 5000000, "family": "roaring_btree"}
-{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 17368.080740000096, "wal_bytes": 806405808, "suite": "scalar", "family": "roaring", "rows": 5000000}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1268.5679730000174, "wal_bytes": 1678160, "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_c2"}
+{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 12695.68967899977, "wal_bytes": 806406296, "suite": "scalar", "family": "roaring", "rows": 5000000}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 572.5465700002133, "wal_bytes": 1677096, "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_c2"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_c2", "bytes": 1687552}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1220.2316300000575, "wal_bytes": 10675112, "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_c20"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 648.1514269999025, "wal_bytes": 10673968, "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_c20"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_c20", "bytes": 10993664}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1298.34670799994, "wal_bytes": 14806864, "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_c200"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 649.9988810001014, "wal_bytes": 14805704, "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_c200"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_c200", "bytes": 16506880}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2746.328250000033, "wal_bytes": 32072664, "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_c20k"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1412.0331350000015, "wal_bytes": 32071496, "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_c20k"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_c20k", "bytes": 41197568}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 6672.622799999999, "wal_bytes": 86861736, "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_c1m"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 3911.9636979999086, "wal_bytes": 86860432, "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_c1m"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_c1m", "bytes": 96641024}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1358.5759049999524, "wal_bytes": 4024128, "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_skew"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 556.1888639999779, "wal_bytes": 4022928, "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_skew"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_skew", "bytes": 4980736}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1399.7000569999045, "wal_bytes": 14608784, "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_nullable"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 647.3511799999869, "wal_bytes": 14607608, "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_nullable"}
 {"kind": "index_size", "suite": "scalar", "family": "roaring", "rows": 5000000, "repeat": 0, "index": "ix_nullable", "bytes": 17252352}
 {"kind": "portfolio", "suite": "scalar", "family": "roaring", "rows": 5000000, "completeness": "complete", "failed_indexes": [], "index_bytes": 189259776, "heap_bytes": 788250624}
 {"kind": "visibility", "suite": "scalar", "rows": 5000000, "family": "roaring", "phase": "clean", "heap_pages": 96192, "all_visible": "96154", "all_frozen": "96154"}
@@ -399,13 +399,13 @@
 {"kind": "correctness", "status": "pass", "digest": "e4d911c6e694393cce640497058b2158a32b95a6058490d4923251d5d353ec3e", "suite": "scalar", "rows": 5000000, "variant": "roaring_bitmap", "phase": "dirty_scattered", "mode": "default", "memory": "64MB", "case": "and2", "category": "intersection"}
 {"kind": "correctness", "status": "pass", "digest": "1f3732db092e54e66a3a8f73b736b7ff7388b8521cd62c39756adeccc1d85c6f", "suite": "scalar", "rows": 5000000, "variant": "roaring_bitmap", "phase": "dirty_scattered", "mode": "default", "memory": "64MB", "case": "eq_c200_17", "category": "equality"}
 {"kind": "correctness", "status": "pass", "digest": "a260e80f4c1ec3534b3fc789209ad4655a6f2d085896dab5dbb8271599e7e4f5", "suite": "scalar", "rows": 5000000, "variant": "roaring_bitmap", "phase": "dirty_scattered", "mode": "prefer_index", "memory": "64MB", "case": "group_c200", "category": "grouping"}
-{"kind": "insert", "status": "ok", "error": null, "elapsed_ms": 1930.0029919999133, "wal_bytes": 185454808, "suite": "scalar", "rows": 5000000, "family": "roaring"}
+{"kind": "insert", "status": "ok", "error": null, "elapsed_ms": 1885.9030749999874, "wal_bytes": 185479568, "suite": "scalar", "rows": 5000000, "family": "roaring"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 5000000, "family": "roaring", "operation": "insert", "index_bytes": 190767104}
-{"kind": "indexed_update", "status": "ok", "error": null, "elapsed_ms": 2345.719770999949, "wal_bytes": 211809000, "suite": "scalar", "rows": 5000000, "family": "roaring"}
+{"kind": "indexed_update", "status": "ok", "error": null, "elapsed_ms": 2535.085066999727, "wal_bytes": 218938592, "suite": "scalar", "rows": 5000000, "family": "roaring"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 5000000, "family": "roaring", "operation": "indexed_update", "index_bytes": 195264512}
-{"kind": "delete", "status": "ok", "error": null, "elapsed_ms": 1570.5691619999698, "wal_bytes": 373704984, "suite": "scalar", "rows": 5000000, "family": "roaring"}
+{"kind": "delete", "status": "ok", "error": null, "elapsed_ms": 1731.3042400000995, "wal_bytes": 383910080, "suite": "scalar", "rows": 5000000, "family": "roaring"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 5000000, "family": "roaring", "operation": "delete", "index_bytes": 195264512}
-{"kind": "vacuum", "status": "ok", "error": null, "elapsed_ms": 4273.602102000041, "wal_bytes": 544762288, "suite": "scalar", "rows": 5000000, "family": "roaring"}
+{"kind": "vacuum", "status": "ok", "error": null, "elapsed_ms": 4377.121592000094, "wal_bytes": 586514528, "suite": "scalar", "rows": 5000000, "family": "roaring"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 5000000, "family": "roaring", "operation": "vacuum", "index_bytes": 195264512}
 {"kind": "correctness", "status": "pass", "digest": "5279e3297731613a615671611d4959b0e03e3cc61eb948405f92541b0fefa119", "suite": "scalar", "rows": 5000000, "variant": "roaring", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "group_c200", "category": "grouping"}
 {"kind": "correctness", "status": "pass", "digest": "0066b2e6aeff5e5534c3113b59ddad538145ba5fcc0047ee35b8efce64a00146", "suite": "scalar", "rows": 5000000, "variant": "roaring", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "is_null", "category": "null"}
@@ -416,20 +416,20 @@
 {"kind": "correctness", "status": "pass", "digest": "5279e3297731613a615671611d4959b0e03e3cc61eb948405f92541b0fefa119", "suite": "scalar", "rows": 5000000, "variant": "roaring_bitmap", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "group_c200", "category": "grouping"}
 {"kind": "correctness", "status": "pass", "digest": "0066b2e6aeff5e5534c3113b59ddad538145ba5fcc0047ee35b8efce64a00146", "suite": "scalar", "rows": 5000000, "variant": "roaring_bitmap", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "is_null", "category": "null"}
 {"kind": "dataset_complete", "suite": "scalar", "rows": 5000000, "family": "roaring"}
-{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 20495.10150499998, "wal_bytes": 806460160, "suite": "scalar", "family": "btree", "rows": 5000000}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2483.3692769999516, "wal_bytes": 31567896, "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_c2"}
+{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 14896.078908000163, "wal_bytes": 806458008, "suite": "scalar", "family": "btree", "rows": 5000000}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2266.610156999832, "wal_bytes": 31386352, "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_c2"}
 {"kind": "index_size", "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_c2", "bytes": 34668544}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2787.6229969999713, "wal_bytes": 31568792, "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_c20"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2325.865874000101, "wal_bytes": 31379328, "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_c20"}
 {"kind": "index_size", "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_c20", "bytes": 34676736}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2512.6934109999866, "wal_bytes": 31572832, "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_c200"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2113.078943000346, "wal_bytes": 31383072, "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_c200"}
 {"kind": "index_size", "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_c200", "bytes": 34758656}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2224.5370169999887, "wal_bytes": 31727216, "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_c20k"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2455.8699940002953, "wal_bytes": 31539160, "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_c20k"}
 {"kind": "index_size", "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_c20k", "bytes": 36052992}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2503.5854239999935, "wal_bytes": 53803992, "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_c1m"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2313.367673000357, "wal_bytes": 53503248, "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_c1m"}
 {"kind": "index_size", "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_c1m", "bytes": 58990592}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1822.0604159999993, "wal_bytes": 31574232, "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_skew"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1844.441647000167, "wal_bytes": 31391904, "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_skew"}
 {"kind": "index_size", "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_skew", "bytes": 34832384}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2384.256960000016, "wal_bytes": 31568792, "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_nullable"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2564.589513000101, "wal_bytes": 31386320, "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_nullable"}
 {"kind": "index_size", "suite": "scalar", "family": "btree", "rows": 5000000, "repeat": 0, "index": "ix_nullable", "bytes": 34758656}
 {"kind": "portfolio", "suite": "scalar", "family": "btree", "rows": 5000000, "completeness": "complete", "failed_indexes": [], "index_bytes": 268738560, "heap_bytes": 788250624}
 {"kind": "visibility", "suite": "scalar", "rows": 5000000, "family": "btree", "phase": "clean", "heap_pages": 96192, "all_visible": "96154", "all_frozen": "96154"}
@@ -474,35 +474,35 @@
 {"kind": "correctness", "status": "pass", "digest": "1f3732db092e54e66a3a8f73b736b7ff7388b8521cd62c39756adeccc1d85c6f", "suite": "scalar", "rows": 5000000, "variant": "btree", "phase": "dirty_scattered", "mode": "default", "memory": "64MB", "case": "eq_c200_17", "category": "equality"}
 {"kind": "correctness", "status": "pass", "digest": "4217c73a8cc97ddd6aaf847e5a8341550b1622a5b9f4793896c882db4c927280", "suite": "scalar", "rows": 5000000, "variant": "btree", "phase": "dirty_scattered", "mode": "default", "memory": "64MB", "case": "eq_c2_0", "category": "equality"}
 {"kind": "correctness", "status": "pass", "digest": "a260e80f4c1ec3534b3fc789209ad4655a6f2d085896dab5dbb8271599e7e4f5", "suite": "scalar", "rows": 5000000, "variant": "btree", "phase": "dirty_scattered", "mode": "prefer_index", "memory": "64MB", "case": "group_c200", "category": "grouping"}
-{"kind": "insert", "status": "ok", "error": null, "elapsed_ms": 1332.8338479999502, "wal_bytes": 125369560, "suite": "scalar", "rows": 5000000, "family": "btree"}
+{"kind": "insert", "status": "ok", "error": null, "elapsed_ms": 1415.3181659999063, "wal_bytes": 125394376, "suite": "scalar", "rows": 5000000, "family": "btree"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 5000000, "family": "btree", "operation": "insert", "index_bytes": 272711680}
-{"kind": "indexed_update", "status": "ok", "error": null, "elapsed_ms": 2234.302458000002, "wal_bytes": 138122504, "suite": "scalar", "rows": 5000000, "family": "btree"}
+{"kind": "indexed_update", "status": "ok", "error": null, "elapsed_ms": 2952.549437000016, "wal_bytes": 145256544, "suite": "scalar", "rows": 5000000, "family": "btree"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 5000000, "family": "btree", "operation": "indexed_update", "index_bytes": 275881984}
-{"kind": "delete", "status": "ok", "error": null, "elapsed_ms": 1443.0766309999399, "wal_bytes": 373704984, "suite": "scalar", "rows": 5000000, "family": "btree"}
+{"kind": "delete", "status": "ok", "error": null, "elapsed_ms": 2275.4253600000993, "wal_bytes": 383910080, "suite": "scalar", "rows": 5000000, "family": "btree"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 5000000, "family": "btree", "operation": "delete", "index_bytes": 275881984}
-{"kind": "vacuum", "status": "ok", "error": null, "elapsed_ms": 4040.8901140000353, "wal_bytes": 623439336, "suite": "scalar", "rows": 5000000, "family": "btree"}
+{"kind": "vacuum", "status": "ok", "error": null, "elapsed_ms": 4158.197972999915, "wal_bytes": 665194432, "suite": "scalar", "rows": 5000000, "family": "btree"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 5000000, "family": "btree", "operation": "vacuum", "index_bytes": 275881984}
 {"kind": "correctness", "status": "pass", "digest": "e8c24b0fea28b14194b07a8910411e2dc6a2fb6478fd5c9b4051e8d838d57b10", "suite": "scalar", "rows": 5000000, "variant": "btree", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "and2", "category": "intersection"}
 {"kind": "correctness", "status": "pass", "digest": "b1fe894e70145123b7136ff3050ad25927a9b436818f86e61bbb7cdd9a315b41", "suite": "scalar", "rows": 5000000, "variant": "btree", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "eq_c200_17", "category": "equality"}
 {"kind": "correctness", "status": "pass", "digest": "0066b2e6aeff5e5534c3113b59ddad538145ba5fcc0047ee35b8efce64a00146", "suite": "scalar", "rows": 5000000, "variant": "btree", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "is_null", "category": "null"}
 {"kind": "correctness", "status": "pass", "digest": "5279e3297731613a615671611d4959b0e03e3cc61eb948405f92541b0fefa119", "suite": "scalar", "rows": 5000000, "variant": "btree", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "group_c200", "category": "grouping"}
 {"kind": "dataset_complete", "suite": "scalar", "rows": 5000000, "family": "btree"}
-{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 17404.945449000024, "wal_bytes": 806454840, "suite": "scalar", "family": "gin", "rows": 5000000}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1407.0027630000368, "wal_bytes": 5476328, "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c2"}
+{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 13026.333985999827, "wal_bytes": 806445272, "suite": "scalar", "family": "gin", "rows": 5000000}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 633.7525220001226, "wal_bytes": 5477576, "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c2"}
 {"kind": "index_size", "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c2", "bytes": 5554176}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1700.0627920000397, "wal_bytes": 7130560, "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c20"}
-{"kind": "index_size", "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c20", "bytes": 7389184}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1887.4114129999953, "wal_bytes": 10494264, "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c200"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 711.5870249999716, "wal_bytes": 7132912, "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c20"}
+{"kind": "index_size", "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c20", "bytes": 7397376}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 852.2354080000696, "wal_bytes": 10495384, "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c200"}
 {"kind": "index_size", "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c200", "bytes": 13123584}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 3974.701874999937, "wal_bytes": 16156064, "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c20k"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1883.925316999921, "wal_bytes": 16157272, "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c20k"}
 {"kind": "index_size", "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c20k", "bytes": 27557888}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 13034.128714999952, "wal_bytes": 46768984, "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c1m"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 7053.762105999795, "wal_bytes": 46765992, "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c1m"}
 {"kind": "index_size", "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_c1m", "bytes": 91611136}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 1774.5255999999472, "wal_bytes": 6392664, "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_skew"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 829.9322249999932, "wal_bytes": 6381480, "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_skew"}
 {"kind": "index_size", "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_skew", "bytes": 7217152}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 2097.495485999957, "wal_bytes": 10253392, "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_nullable"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 827.7654200001052, "wal_bytes": 10242192, "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_nullable"}
 {"kind": "index_size", "suite": "scalar", "family": "gin", "rows": 5000000, "repeat": 0, "index": "ix_nullable", "bytes": 12124160}
-{"kind": "portfolio", "suite": "scalar", "family": "gin", "rows": 5000000, "completeness": "complete", "failed_indexes": [], "index_bytes": 164577280, "heap_bytes": 788250624}
+{"kind": "portfolio", "suite": "scalar", "family": "gin", "rows": 5000000, "completeness": "complete", "failed_indexes": [], "index_bytes": 164585472, "heap_bytes": 788250624}
 {"kind": "visibility", "suite": "scalar", "rows": 5000000, "family": "gin", "phase": "clean", "heap_pages": 96192, "all_visible": "96154", "all_frozen": "96154"}
 {"kind": "correctness", "status": "pass", "digest": "d3b703eff77570175f56284b785b40ed195e122eb13701a28fbef8ee0e191148", "suite": "scalar", "rows": 5000000, "variant": "gin", "phase": "clean", "mode": "default", "memory": "64MB", "case": "or_columns", "category": "union"}
 {"kind": "correctness", "status": "pass", "digest": "a464ad98c633053711a69d838b24cb4842c7a95cb15be27b4e76d0bb2cc1b064", "suite": "scalar", "rows": 5000000, "variant": "gin", "phase": "clean", "mode": "default", "memory": "64MB", "case": "ordered_broad", "category": "ordered_filter"}
@@ -545,23 +545,23 @@
 {"kind": "correctness", "status": "pass", "digest": "e4d911c6e694393cce640497058b2158a32b95a6058490d4923251d5d353ec3e", "suite": "scalar", "rows": 5000000, "variant": "gin", "phase": "dirty_scattered", "mode": "default", "memory": "64MB", "case": "and2", "category": "intersection"}
 {"kind": "correctness", "status": "pass", "digest": "1f3732db092e54e66a3a8f73b736b7ff7388b8521cd62c39756adeccc1d85c6f", "suite": "scalar", "rows": 5000000, "variant": "gin", "phase": "dirty_scattered", "mode": "default", "memory": "64MB", "case": "eq_c200_17", "category": "equality"}
 {"kind": "correctness", "status": "pass", "digest": "a260e80f4c1ec3534b3fc789209ad4655a6f2d085896dab5dbb8271599e7e4f5", "suite": "scalar", "rows": 5000000, "variant": "gin", "phase": "dirty_scattered", "mode": "prefer_index", "memory": "64MB", "case": "group_c200", "category": "grouping"}
-{"kind": "insert", "status": "ok", "error": null, "elapsed_ms": 600.0711120000233, "wal_bytes": 64324184, "suite": "scalar", "rows": 5000000, "family": "gin"}
-{"kind": "maintenance_size", "suite": "scalar", "rows": 5000000, "family": "gin", "operation": "insert", "index_bytes": 171671552}
-{"kind": "indexed_update", "status": "ok", "error": null, "elapsed_ms": 1039.4872850001775, "wal_bytes": 74538248, "suite": "scalar", "rows": 5000000, "family": "gin"}
-{"kind": "maintenance_size", "suite": "scalar", "rows": 5000000, "family": "gin", "operation": "indexed_update", "index_bytes": 178765824}
-{"kind": "delete", "status": "ok", "error": null, "elapsed_ms": 1559.9295910001274, "wal_bytes": 373704984, "suite": "scalar", "rows": 5000000, "family": "gin"}
-{"kind": "maintenance_size", "suite": "scalar", "rows": 5000000, "family": "gin", "operation": "delete", "index_bytes": 178765824}
-{"kind": "vacuum", "status": "ok", "error": null, "elapsed_ms": 3967.090270999961, "wal_bytes": 573947600, "suite": "scalar", "rows": 5000000, "family": "gin"}
+{"kind": "insert", "status": "ok", "error": null, "elapsed_ms": 496.1474269998689, "wal_bytes": 64349024, "suite": "scalar", "rows": 5000000, "family": "gin"}
+{"kind": "maintenance_size", "suite": "scalar", "rows": 5000000, "family": "gin", "operation": "insert", "index_bytes": 171679744}
+{"kind": "indexed_update", "status": "ok", "error": null, "elapsed_ms": 1190.3207129998918, "wal_bytes": 81671008, "suite": "scalar", "rows": 5000000, "family": "gin"}
+{"kind": "maintenance_size", "suite": "scalar", "rows": 5000000, "family": "gin", "operation": "indexed_update", "index_bytes": 178774016}
+{"kind": "delete", "status": "ok", "error": null, "elapsed_ms": 1767.4297949997708, "wal_bytes": 383910080, "suite": "scalar", "rows": 5000000, "family": "gin"}
+{"kind": "maintenance_size", "suite": "scalar", "rows": 5000000, "family": "gin", "operation": "delete", "index_bytes": 178774016}
+{"kind": "vacuum", "status": "ok", "error": null, "elapsed_ms": 4776.457391000349, "wal_bytes": 615851576, "suite": "scalar", "rows": 5000000, "family": "gin"}
 {"kind": "maintenance_size", "suite": "scalar", "rows": 5000000, "family": "gin", "operation": "vacuum", "index_bytes": 180666368}
 {"kind": "correctness", "status": "pass", "digest": "5279e3297731613a615671611d4959b0e03e3cc61eb948405f92541b0fefa119", "suite": "scalar", "rows": 5000000, "variant": "gin", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "group_c200", "category": "grouping"}
 {"kind": "correctness", "status": "pass", "digest": "b1fe894e70145123b7136ff3050ad25927a9b436818f86e61bbb7cdd9a315b41", "suite": "scalar", "rows": 5000000, "variant": "gin", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "eq_c200_17", "category": "equality"}
 {"kind": "correctness", "status": "pass", "digest": "0066b2e6aeff5e5534c3113b59ddad538145ba5fcc0047ee35b8efce64a00146", "suite": "scalar", "rows": 5000000, "variant": "gin", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "is_null", "category": "null"}
 {"kind": "correctness", "status": "pass", "digest": "e8c24b0fea28b14194b07a8910411e2dc6a2fb6478fd5c9b4051e8d838d57b10", "suite": "scalar", "rows": 5000000, "variant": "gin", "phase": "after_maintenance", "mode": "default", "memory": "64MB", "case": "and2", "category": "intersection"}
 {"kind": "dataset_complete", "suite": "scalar", "rows": 5000000, "family": "gin"}
-{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 1475.5170229998384, "wal_bytes": 53346992, "suite": "documents", "family": "gin", "rows": 200000}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 289.71823799997765, "wal_bytes": 1428432, "suite": "documents", "family": "gin", "rows": 200000, "repeat": 0, "index": "ix_tags"}
+{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 1371.5488240000013, "wal_bytes": 53343712, "suite": "documents", "family": "gin", "rows": 200000}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 147.4383769996166, "wal_bytes": 1419384, "suite": "documents", "family": "gin", "rows": 200000, "repeat": 0, "index": "ix_tags"}
 {"kind": "index_size", "suite": "documents", "family": "gin", "rows": 200000, "repeat": 0, "index": "ix_tags", "bytes": 2170880}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 563.0693989999145, "wal_bytes": 2817080, "suite": "documents", "family": "gin", "rows": 200000, "repeat": 0, "index": "ix_tsv"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 344.4908219998979, "wal_bytes": 2809032, "suite": "documents", "family": "gin", "rows": 200000, "repeat": 0, "index": "ix_tsv"}
 {"kind": "index_size", "suite": "documents", "family": "gin", "rows": 200000, "repeat": 0, "index": "ix_tsv", "bytes": 4513792}
 {"kind": "portfolio", "suite": "documents", "family": "gin", "rows": 200000, "completeness": "complete", "failed_indexes": [], "index_bytes": 6684672, "heap_bytes": 54575104}
 {"kind": "visibility", "suite": "documents", "rows": 200000, "family": "gin", "phase": "clean", "heap_pages": 6656, "all_visible": "6628", "all_frozen": "6628"}
@@ -578,10 +578,10 @@
 {"kind": "correctness", "status": "pass", "digest": "48b45751927aac12289959adbf212d7f9629cf7d4f3880e1cea619b5bea22783", "suite": "documents", "rows": 200000, "variant": "gin", "phase": "clean", "mode": "default", "memory": "64MB", "case": "array_common", "category": "array_contains"}
 {"kind": "correctness", "status": "pass", "digest": "dfc47210d5caad4a93ed2daf83ffe2ac8b7744bc9a272d144ff3d4907e26172f", "suite": "documents", "rows": 200000, "variant": "gin", "phase": "clean", "mode": "default", "memory": "64MB", "case": "ts_phrase", "category": "text_fallback"}
 {"kind": "dataset_complete", "suite": "documents", "rows": 200000, "family": "gin"}
-{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 1388.4895969999889, "wal_bytes": 53294872, "suite": "documents", "family": "roaring", "rows": 200000}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 200.68340799980433, "wal_bytes": 2324408, "suite": "documents", "family": "roaring", "rows": 200000, "repeat": 0, "index": "ix_tags"}
+{"kind": "load", "status": "ok", "error": null, "elapsed_ms": 1197.5504609999916, "wal_bytes": 53296280, "suite": "documents", "family": "roaring", "rows": 200000}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 106.6565270002684, "wal_bytes": 2332576, "suite": "documents", "family": "roaring", "rows": 200000, "repeat": 0, "index": "ix_tags"}
 {"kind": "index_size", "suite": "documents", "family": "roaring", "rows": 200000, "repeat": 0, "index": "ix_tags", "bytes": 2924544}
-{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 648.2718019999538, "wal_bytes": 9874416, "suite": "documents", "family": "roaring", "rows": 200000, "repeat": 0, "index": "ix_tsv"}
+{"kind": "build", "status": "ok", "error": null, "elapsed_ms": 460.19287000035547, "wal_bytes": 9883544, "suite": "documents", "family": "roaring", "rows": 200000, "repeat": 0, "index": "ix_tsv"}
 {"kind": "index_size", "suite": "documents", "family": "roaring", "rows": 200000, "repeat": 0, "index": "ix_tsv", "bytes": 12558336}
 {"kind": "portfolio", "suite": "documents", "family": "roaring", "rows": 200000, "completeness": "complete", "failed_indexes": [], "index_bytes": 15482880, "heap_bytes": 54575104}
 {"kind": "visibility", "suite": "documents", "rows": 200000, "family": "roaring", "phase": "clean", "heap_pages": 6656, "all_visible": "6628", "all_frozen": "6628"}

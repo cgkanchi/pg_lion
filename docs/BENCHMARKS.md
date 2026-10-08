@@ -5,9 +5,9 @@ ratios carry over better. "5× faster" means the other index took five times as 
 are milliseconds of query execution.
 
 **Setup.** The extension at `6bf193b` (the run itself is recorded as `85c991c`, the same code plus this
-benchmark's own changes), PostgreSQL 16.15 (Ubuntu release build), 4 vCPUs, 16 GB RAM. Lion
+benchmark's own changes), PostgreSQL 18.6 (built from source with `-O2`), 4 vCPUs, 16 GB RAM. Lion
 preloaded, so its indexes use lion's own WAL format. Shared buffers 512 MB, `work_mem` 64 MB,
-parallel query and JIT off, warm cache. Each query is the median of three timed runs after one
+parallel query and JIT off (index builds may still use parallel workers), warm cache. Each query is the median of three timed runs after one
 warmup, measured as EXPLAIN ANALYZE execution time. Every result is checked against a sequential
 scan, and all 394 checks passed. The default planner chooses the plan.
 
@@ -17,35 +17,35 @@ story) and one single-column index per column: B-tree, GIN (`btree_gin`) or lion
 10% NULL. The documents table has 200k rows with a `text[]` and a `tsvector`, indexed by GIN or lion
 (`store_positions = true`).
 
-Full report: [REPORT.md](../bench/results/2026-10-08-85c991c-pg16-focused/REPORT.md) ·
-[HTML](../bench/results/2026-10-08-85c991c-pg16-focused/index.html) ·
-[CSV](../bench/results/2026-10-08-85c991c-pg16-focused/summary.csv).
+Full report: [REPORT.md](../bench/results/2026-10-08-85c991c-pg18-focused/REPORT.md) ·
+[HTML](../bench/results/2026-10-08-85c991c-pg18-focused/index.html) ·
+[CSV](../bench/results/2026-10-08-85c991c-pg18-focused/summary.csv).
 
 ## Counts (5M rows, vacuumed)
 
 | Query | Lion ms | B-tree ms | GIN ms | Lion vs B-tree | Lion vs GIN |
 | --- | --- | --- | --- | --- | --- |
-| Count a value in 50% of rows | 0.37 | 196 | 1,027 | 536× faster | 2,805× faster |
-| Count the hot value of a skewed column (90%) | 0.85 | 383 | 764 | 452× faster | 902× faster |
-| Count a value in 0.5% of rows | 0.17 | 1.98 | 58.9 | 12× faster | 353× faster |
-| Count a value in 0.005% of rows | 0.038 | 0.070 | 0.87 | 1.8× faster | 23× faster |
-| Count a value of a 1M-value column | 0.027 | 0.046 | 0.11 | 1.7× faster | 4.0× faster |
-| Two equality filters ANDed | 1.07 | 41.3 | 231 | 39× faster | 215× faster |
-| Three selective equality filters ANDed | 0.11 | 2.62 | 3.75 | 24× faster | 34× faster |
-| Two `IN` lists ANDed | 3.31 | 89.2 | 143 | 27× faster | 43× faster |
-| Two columns ORed | 1.26 | 550 | 552 | 438× faster | 440× faster |
-| `IN` list of 10 values | 0.14 | 0.30 | 8.84 | 2.1× faster | 61× faster |
-| `IN` list of 1,000 values | 11.7 | 44.2 | 561 | 3.8× faster | 48× faster |
-| `IS NULL` (10% of rows) | 0.59 | 41.8 | 591 | 70× faster | 995× faster |
-| Range over 100 of 20,000 values | 1.05 | 1.97 | 544 | 1.9× faster | 517× faster |
+| Count a value in 50% of rows | 0.41 | 189 | 933 | 464× faster | 2,287× faster |
+| Count the hot value of a skewed column (90%) | 0.82 | 358 | 1,092 | 433× faster | 1,324× faster |
+| Count a value in 0.5% of rows | 0.18 | 1.86 | 89.2 | 10× faster | 485× faster |
+| Count a value in 0.005% of rows | 0.039 | 0.069 | 1.24 | 1.8× faster | 32× faster |
+| Count a value of a 1M-value column | 0.024 | 0.048 | 0.32 | 2.0× faster | 14× faster |
+| Two equality filters ANDed | 1.21 | 34.9 | 296 | 29× faster | 245× faster |
+| Three selective equality filters ANDed | 0.11 | 2.47 | 4.13 | 22× faster | 36× faster |
+| Two `IN` lists ANDed | 3.45 | 113 | 180 | 33× faster | 52× faster |
+| Two columns ORed | 1.25 | 448 | 548 | 358× faster | 438× faster |
+| `IN` list of 10 values | 0.18 | 0.23 | 12.8 | 1.3× faster | 71× faster |
+| `IN` list of 1,000 values | 11.5 | 20.4 | 587 | 1.8× faster | 51× faster |
+| `IS NULL` (10% of rows) | 0.81 | 38.5 | 687 | 48× faster | 853× faster |
+| Range over 100 of 20,000 values | 1.02 | 1.91 | 666 | 1.9× faster | 653× faster |
 
 ## GROUP BY (5M rows, vacuumed)
 
 | Query | Lion ms | B-tree ms | GIN ms | Lion vs B-tree | Lion vs GIN |
 | --- | --- | --- | --- | --- | --- |
-| Count per group, 2 groups | 1.35 | 495 | 986 | 368× faster | 733× faster |
-| Count per group, 200 groups | 35.0 | 563 | 1,188 | 16× faster | 34× faster |
-| Count per group, 20 groups, with a filter | 21.2 | 50.1 | 70.2 | 2.4× faster | 3.3× faster |
+| Count per group, 2 groups | 1.64 | 474 | 1,164 | 289× faster | 711× faster |
+| Count per group, 200 groups | 31.8 | 493 | 1,275 | 15× faster | 40× faster |
+| Count per group, 20 groups, with a filter | 23.9 | 36.5 | 103 | 1.5× faster | 4.3× faster |
 
 ## Unvacuumed tables (5M rows)
 
@@ -54,10 +54,10 @@ affected pages in the heap, so its lead shrinks. It doesn't disappear.
 
 | Query | Lion ms | B-tree ms | GIN ms | Lion vs B-tree | Lion vs GIN |
 | --- | --- | --- | --- | --- | --- |
-| Count a value in 50% of rows | 172 | 875 | 969 | 5.1× faster | 5.6× faster |
-| Count a value in 0.5% of rows | 13.5 | 14.7 | 35.7 | 1.1× faster | 2.6× faster |
-| Two equality filters ANDed | 8.32 | 60.3 | 213 | 7.2× faster | 26× faster |
-| Count per group, 200 groups | 586 | 1,125 | 1,137 | 1.9× faster | 1.9× faster |
+| Count a value in 50% of rows | 183 | 882 | 1,021 | 4.8× faster | 5.6× faster |
+| Count a value in 0.5% of rows | 13.4 | 14.3 | 37.0 | 1.1× faster | 2.8× faster |
+| Two equality filters ANDed | 7.92 | 125 | 212 | 16× faster | 27× faster |
+| Count per group, 200 groups | 577 | 1,225 | 1,212 | 2.1× faster | 2.1× faster |
 
 ## Fetching rows (5M rows, vacuumed)
 
@@ -66,22 +66,22 @@ the heap. Lion is a little faster, because its bitmaps are cheaper to combine.
 
 | Query | Lion ms | B-tree ms | GIN ms | Lion vs B-tree | Lion vs GIN |
 | --- | --- | --- | --- | --- | --- |
-| A value of a 1M-value column | 0.051 | 0.091 | 0.093 | 1.8× faster | 1.8× faster |
-| A value in 0.005% of rows | 0.57 | 0.72 | 0.84 | 1.3× faster | 1.5× faster |
-| A value in 0.5% of rows | 39.5 | 42.5 | 74.1 | 1.1× faster | 1.9× faster |
-| A value in 5% of rows | 401 | 549 | 542 | 1.4× faster | 1.4× faster |
-| Two filters ANDed | 17.8 | 25.9 | 39.4 | 1.5× faster | 2.2× faster |
-| Three filters ANDed | 17.3 | 24.6 | 40.1 | 1.4× faster | 2.3× faster |
-| Two `IN` lists ANDed | 56.5 | 72.7 | 150 | 1.3× faster | 2.7× faster |
+| A value of a 1M-value column | 0.059 | 0.095 | 0.28 | 1.6× faster | 4.8× faster |
+| A value in 0.005% of rows | 0.84 | 1.64 | 1.26 | 1.9× faster | 1.5× faster |
+| A value in 0.5% of rows | 35.5 | 37.6 | 102 | 1.1× faster | 2.9× faster |
+| A value in 5% of rows | 531 | 599 | 525 | 1.1× faster | same |
+| Two filters ANDed | 20.8 | 22.1 | 39.9 | 1.1× faster | 1.9× faster |
+| Three filters ANDed | 20.4 | 24.7 | 47.1 | 1.2× faster | 2.3× faster |
+| Two `IN` lists ANDed | 64.0 | 66.9 | 146 | same | 2.3× faster |
 
 ## Ordered queries with LIMIT (5M rows, vacuumed)
 
 | Query | Lion ms | B-tree ms | Lion vs B-tree |
 | --- | --- | --- | --- |
-| `WHERE a = .. AND b = .. ORDER BY c LIMIT 10` (0.25% match) | 1.81 | 17.4 | 9.6× faster |
-| The same, `ORDER BY c DESC` | 1.61 | 10.6 | 6.6× faster |
-| `WHERE b = .. ORDER BY c LIMIT 10` (50% match) | 0.084 | 0.079 | **1.1× slower** |
-| `WHERE c >= .. ORDER BY c LIMIT 100` on one column | 0.52 | 0.031 | **17× slower** |
+| `WHERE a = .. AND b = .. ORDER BY c LIMIT 10` (0.25% match) | 1.88 | 20.7 | 11× faster |
+| The same, `ORDER BY c DESC` | 1.57 | 13.4 | 8.6× faster |
+| `WHERE b = .. ORDER BY c LIMIT 10` (50% match) | 0.11 | 0.097 | **1.2× slower** |
+| `WHERE c >= .. ORDER BY c LIMIT 100` on one column | 0.45 | 0.030 | **15× slower** |
 
 Lion walks the `ORDER BY` column's index in order and skips rows its filter rules out
 (`LionOrdered`). A B-tree's index-only scan on the one column wins the last case: keep a B-tree for
@@ -91,18 +91,18 @@ plain "first N by this column".
 
 | Query | Lion ms | GIN ms | Lion vs GIN |
 | --- | --- | --- | --- |
-| Count `tags @> '{t1}'` (5% of rows) | 0.040 | 8.74 | 218× faster |
-| Count `tags @> '{t1,t17}'` | 0.11 | 1.16 | 10× faster |
-| Count `tags && '{t1,t17,t123}'` | 0.15 | 12.7 | 83× faster |
-| Count `tsv @@ 'common'` (nearly every row) | 0.063 | 47.1 | 748× faster |
-| Count `tsv @@ 'w1 & w17'` | 0.14 | 1.28 | 9.5× faster |
-| Count `tsv @@ '(w1 \| w2) & (w17 \| w18)'` | 0.25 | 4.39 | 17× faster |
-| Count a rare word | 0.028 | 0.066 | 2.4× faster |
-| Count a phrase, `common <-> w1` | 3.59 | 14.1 | 3.9× faster |
-| Count a weight, `w1:D` | 0.52 | 10.8 | 21× faster |
-| Count a NOT, `common & !w1` | 11.5 | 55.4 | 4.8× faster |
-| Count a prefix, `rare12:*` | 41.2 | 3.32 | **12× slower** |
-| Fetch the rows matching `w1` | 9.36 | 10.4 | 1.1× faster |
+| Count `tags @> '{t1}'` (5% of rows) | 0.043 | 12.0 | 280× faster |
+| Count `tags @> '{t1,t17}'` | 0.12 | 1.25 | 10× faster |
+| Count `tags && '{t1,t17,t123}'` | 0.17 | 20.0 | 114× faster |
+| Count `tsv @@ 'common'` (nearly every row) | 0.092 | 52.9 | 575× faster |
+| Count `tsv @@ 'w1 & w17'` | 0.16 | 1.33 | 8.4× faster |
+| Count `tsv @@ '(w1 \| w2) & (w17 \| w18)'` | 0.26 | 4.84 | 19× faster |
+| Count a rare word | 0.031 | 0.073 | 2.4× faster |
+| Count a phrase, `common <-> w1` | 3.90 | 14.7 | 3.8× faster |
+| Count a weight, `w1:D` | 0.52 | 18.1 | 35× faster |
+| Count a NOT, `common & !w1` | 11.3 | 66.5 | 5.9× faster |
+| Count a prefix, `rare12:*` | 40.2 | 3.57 | **11× slower** |
+| Fetch the rows matching `w1` | 9.51 | 16.6 | 1.8× faster |
 
 Lion answers prefix queries by checking every row, so GIN wins them.
 
@@ -116,11 +116,11 @@ the top 10.
 
 | Query | Matches | Lion BM25 ms | GIN + ts_rank ms | Lion vs GIN |
 | --- | --- | --- | --- | --- |
-| One common word and two rare words | 492,031 | 16.6 | 639 | 39× faster |
-| Two mid-frequency words | 32,934 | 9.0 | 244 | 27× faster |
-| Three common words | 499,985 | 59.4 | 662 | 11× faster |
-| Two rare words | 584 | 6.3 | 1.7 | **3.7× slower** |
-| Two rare words ANDed | 18 | 0.49 | 0.46 | same |
+| One common word and two rare words | 492,031 | 18.5 | 986 | 53× faster |
+| Two mid-frequency words | 32,934 | 9.9 | 121 | 12× faster |
+| Three common words | 499,985 | 63.2 | 1,074 | 17× faster |
+| Two rare words | 584 | 7.1 | 3.7 | **1.9× slower** |
+| Two rare words ANDed | 18 | 0.61 | 0.54 | **1.1× slower** |
 
 With only a few hundred matches, scoring them all is cheaper than lion's ranked walk, but the
 planner still picks the walk. Set `pg_lion.enable_bm25_scan = off` for queries you know are this
@@ -131,14 +131,15 @@ selective.
 | | B-tree | GIN | Lion |
 | --- | --- | --- | --- |
 | Index size | 256 MiB | 157 MiB | 180 MiB |
-| Build time | 16.7 s | 25.9 s | 16.0 s |
-| Insert 50k rows | 1.3 s, 120 MiB WAL | 0.6 s, 61 MiB WAL | 1.9 s, 177 MiB WAL |
-| Update an indexed column in 50k rows | 2.2 s, 132 MiB WAL | 1.0 s, 71 MiB WAL | 2.3 s, 202 MiB WAL |
-| Delete 50k rows | 1.4 s | 1.6 s | 1.6 s |
-| VACUUM | 4.0 s | 4.0 s | 4.3 s |
+| Build time | 15.9 s | 12.8 s | 8.4 s |
+| Insert 50k rows | 1.4 s, 120 MiB WAL | 0.5 s, 61 MiB WAL | 1.9 s, 177 MiB WAL |
+| Update an indexed column in 50k rows | 3.0 s, 139 MiB WAL | 1.2 s, 78 MiB WAL | 2.5 s, 209 MiB WAL |
+| Delete 50k rows | 2.3 s | 1.8 s | 1.7 s |
+| VACUUM | 4.2 s | 4.8 s | 4.4 s |
 
-Lion is 30% smaller than B-tree and 15% larger than GIN here, and builds as fast as B-tree.
-Inserts are about 1.4× slower than B-tree and write about 1.5× the WAL. GIN's writes look cheap
+Lion is 30% smaller than B-tree and 15% larger than GIN here, and builds about twice as fast as
+B-tree because its build runs in parallel. Inserts are about 1.3× slower than B-tree and write about
+1.5× the WAL. GIN's writes look cheap
 because it defers work to its pending list.
 
 On the documents table, lion's `tsvector` index with positions is 2.8× the size of GIN's
