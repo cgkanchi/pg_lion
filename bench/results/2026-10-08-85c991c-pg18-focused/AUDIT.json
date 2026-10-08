@@ -1,0 +1,12 @@
+{
+  "status": "pass",
+  "samples": 1182,
+  "plans": 1182,
+  "query_configurations": 394,
+  "correctness_checks": 394,
+  "explicitly_skipped_configurations": 0,
+  "cross_portfolio_result_groups": 98,
+  "recorded_failures": 0,
+  "failure_types": [],
+  "note": "Artifact consistency; recorded build/query errors remain errors. Not proof of untested semantics."
+}
