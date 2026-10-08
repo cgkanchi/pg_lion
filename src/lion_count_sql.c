@@ -965,6 +965,9 @@ lion_index_count_any(PG_FUNCTION_ARGS)
 
 	for (i = 0; i < nsets; i++)
 		lion_posting_set_release(&sets[i]);
+	pfree(sets);
+	pfree(elems);
+	pfree(nulls);
 
 	lion_count_sql_close(&call);
 

@@ -2210,6 +2210,16 @@ lion_vac_delete_group(LionVacState *vs, Buffer buf, OffsetNumber *offs,
 		lion_vac_postree_shape(vs, root, &posfree[*nposfree]);
 		(*nposfree)++;
 		rootbufs[nroots] = ReadBuffer(vs->index, root);
+
+		/*
+		 * This waits while holding the leaf's cleanup lock, which is safe by
+		 * DESIGN.md §5's order alone: a directory page before posting pages,
+		 * of which a position tree's are some, and nothing that holds one of
+		 * those waits for a directory lock.  An EXCLUSIVE lock waits for
+		 * other locks, not for pins, so a reader that only pins the root
+		 * cannot hold it up.  Waiting here for another directory page, or
+		 * for a cleanup lock on the root, would not be safe.
+		 */
 		LockBuffer(rootbufs[nroots], BUFFER_LOCK_EXCLUSIVE);
 		roots[nroots] = root;
 		if (!lion_page_owns_positions(BufferGetPage(rootbufs[nroots]), root))
@@ -3189,6 +3199,26 @@ lion_vacuum_filter_page(LionVacState *vs, Buffer buf, LionVacWork *w,
 }
 
 /*
+ * An entry's counters cannot be fewer than what VACUUM takes out of them on
+ * a sound index; on a damaged one, subtracting would wrap them and the
+ * wrapped value would be written.  An ERROR, asked before the WAL record is
+ * begun - in rmgr mode that is a critical section, where it would be a
+ * PANIC.
+ */
+static void
+lion_vac_check_counts(Relation index, Buffer entrybuf, OffsetNumber entryoff,
+					  const LionEntryTuple *e, uint64 ntids, uint32 ncontainers)
+{
+	if (unlikely(e->ntids < ntids || e->ncontainers < ncontainers))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": entry %u on block %u counts " UINT64_FORMAT " TIDs in %u containers, fewer than VACUUM removes (" UINT64_FORMAT " TIDs, %u containers)",
+						RelationGetRelationName(index), entryoff,
+						BufferGetBlockNumber(entrybuf), e->ntids,
+						e->ncontainers, ntids, ncontainers)));
+}
+
+/*
  * Apply the result of lion_vacuum_filter_page() to the page: everything that
  * fits in place goes into one WAL record that also carries the entry tuple
  * with its new counters.  The caller holds a cleanup lock on buf and the
@@ -3223,6 +3253,15 @@ lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref, Buffer buf,
 	/* The entry may have been changed by inserts since the last window. */
 	ecopy = lion_vacuum_entry_copy(index, entrybuf, entryoff, &esize);
 	grown = (uint32 *) palloc(sizeof(uint32) * (w->nwork + 1));
+	{
+		uint64		most = removed;
+
+		/* at most every item's removals, if each one fits in place */
+		for (i = 0; i < w->nwork; i++)
+			most += w->work[i].removed;
+		lion_vac_check_counts(index, entrybuf, entryoff, ecopy, most,
+							  (uint32) w->ndel);
+	}
 
 	/*
 	 * Replay takes a CLEANUP lock on the container page (block 0), because
@@ -3298,9 +3337,7 @@ lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref, Buffer buf,
 	lion_page_update_minmax(p);
 	lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
 
-	Assert(ecopy->ntids >= removed);
-	ecopy->ntids -= removed;
-	Assert(ecopy->ncontainers >= (uint32) w->ndel);
+	ecopy->ntids -= removed;	/* checked above */
 	ecopy->ncontainers -= (uint32) w->ndel;
 
 	if (!lion_replace_entry(index, xstate, entrybuf, entryoff, ecopy, esize))
@@ -3461,7 +3498,8 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 
 		if (nremoved > 0)
 		{
-			Assert(ecopy->ntids >= nremoved);
+			lion_vac_check_counts(index, entrybuf, entryoff, ecopy, nremoved,
+								  vs->cbuf->cardinality == 0 ? 1 : 0);
 			ecopy->ntids -= nremoved;
 
 			if (vs->cbuf->cardinality == 0)
@@ -3482,8 +3520,7 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 				lion_page_update_minmax(p);
 				lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
 
-				Assert(ecopy->ncontainers >= 1);
-				ecopy->ncontainers -= 1;
+				ecopy->ncontainers -= 1;	/* checked above */
 
 				if (!lion_replace_entry(index, xstate, entrybuf, entryoff,
 									   ecopy, esize))

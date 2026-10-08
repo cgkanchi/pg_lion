@@ -337,14 +337,19 @@ lion_range_union_cb(const LionContainer *c, void *arg)
 		(void) lion_container_or_inplace(e->c, c);
 	}
 	else if (e->c->type == LION_CT_ARRAY && c->type == LION_CT_ARRAY &&
-			 c->cardinality <= LION_RANGE_UNION_PEND_MIN)
+			 Min((uint32) c->cardinality, (uint32) LION_ARRAY_MAX_CARD) <=
+			 LION_RANGE_UNION_PEND_MIN)
 	{
 		/*
 		 * A few members: pending, until half as many as the union holds
-		 * have come.  The buffer grows with the union, never past that.
+		 * have come.  The buffer grows with the union, never past that.  The
+		 * counts are clamped as everywhere a header's count sizes a copy.
 		 */
+		uint32		ncard = Min((uint32) c->cardinality,
+								(uint32) LION_ARRAY_MAX_CARD);
 		uint32		fold = Max((uint32) LION_RANGE_UNION_PEND_MIN,
-							   (uint32) e->c->cardinality / 2);
+							   Min((uint32) e->c->cardinality,
+								   (uint32) LION_ARRAY_MAX_CARD) / 2);
 		uint32		want = fold + LION_RANGE_UNION_PEND_MIN;
 
 		if (e->pendcap < want)
@@ -360,8 +365,8 @@ lion_range_union_cb(const LionContainer *c, void *arg)
 			u->held -= Min(u->held, had);
 		}
 		memcpy(&e->pend[e->npend], LION_ARRAY_DATA((LionContainer *) c),
-			   sizeof(uint16) * c->cardinality);
-		e->npend += c->cardinality;
+			   sizeof(uint16) * ncard);
+		e->npend += ncard;
 		if (e->npend >= fold)
 			lion_range_union_fold(u, e);
 	}

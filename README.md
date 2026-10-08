@@ -183,6 +183,11 @@ columns and can be built in parallel on PostgreSQL 17 and later.
 - The count pushdown doesn't use expression indexes (for example, lion on `(data->>'key')`).
 - On a hot standby, indexes using the default (generic) WAL mode recheck every row in counts.
   Preloading the library avoids this.
+- Loading the library changes estimates, and so plans, that have nothing to do with lion: a column
+  with a lion index takes its number of distinct values from the index, and a table's row estimate
+  can be corrected from one, even with `pg_lion.enable_count_pushdown` off. Results never change.
+  Set `pg_lion.enable_index_ndistinct` and `pg_lion.enable_rows_correction` off to keep the
+  planner's own estimates.
 
 The [full list](docs/REFERENCE.md#known-limitations) has the details.
 
