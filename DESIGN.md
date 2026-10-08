@@ -1549,8 +1549,10 @@ kinds of places, and `lion_reader.c` is where each gets what is missing:
   `old_snapshot_threshold` guard, and takes the predicate lock before the first read so a
   SERIALIZABLE read that finds nothing still conflicts with a later insert. `lion_reader_open()`
   takes a policy: `LION_READ_ROWS` for anything that returns or counts rows, which vets, and
-  `LION_READ_STATS` for `lion_bm25_score()`, which reads only N, df and avgdl, is evaluated per row
-  of a query that applies the policies, and checks privileges only.
+  `LION_READ_STATS` for `lion_bm25_score()`, which reads only N, df and avgdl, and checks
+  privileges and row-level security only. The statistics count every row, hidden ones included, so
+  under a policy a score - even of a made-up document, even per row of a query that applies the
+  policies - would tell whether hidden rows hold a lexeme, and how many.
 - **Custom scan nodes**, whose index the planner vetted, call `lion_reader_lock()` for the
   predicate lock on each lion index they read.
 
@@ -1559,7 +1561,7 @@ for) depend on what the call stands for and stay with the caller (`lion_count_op
 
 The ranking functions first opened their index on their own and missed three of these. So the
 contract is now tested across every reader rather than per feature: `test/sql/reader_contracts.sql`
-(row-level security, an unpopulated materialized view, the planner's paths under a policy) and the
+(row-level security, an unpopulated materialized view) and the
 `reader_checkxmin` and `reader_serializable` specs each list every reader. A new reader adds a line
 to each.
 
@@ -4704,10 +4706,17 @@ meanwhile, invisible to the snapshot but in the index, moves every row ranked be
 and one row would be returned twice and another never. Dead rows count in N, df and avgdl until
 VACUUM removes them, as a search engine's deleted documents do until a merge.
 
+The walks stop only at one that returns fewer than it asked for, never on a count: rows inserted
+since the query was prepared are in the index too, and a walk that counted them towards the rows
+the lexemes had at the start stopped one short of the last visible row. Each walk asks for at most
+one row past that count, so in the usual case the walk that reaches the end comes up short and no
+further walk is made.
+
 Ranking must answer what an ordinary scan of the index would, so `lion_bm25()` refuses, as the
-direct count functions do, a table with row-level security enabled (it cannot apply the policies;
-`ORDER BY lion_bm25_score(...)` in a query on the table can, and the LionBm25 scan is not offered
-there) and an index `lion_index_usable()` rejects for the snapshot (an `indcheckxmin` index built
+direct count functions do, a table with row-level security enabled (it cannot apply the policies),
+and so does `lion_bm25_score()`: N, df and avgdl count the hidden rows, so under a policy any
+score, even one of a made-up document, would tell whether hidden rows hold a lexeme and how many.
+The index `lion_index_usable()` rejects for the snapshot (an `indcheckxmin` index built
 over a broken HOT chain holds the newest version only, which no heap recheck can repair). Before
 reading it takes the relation-level predicate lock on the index that `index_beginscan()` takes for
 an AM without `ampredlocks`, as the LionBm25 scan does too, so a SERIALIZABLE search that finds
@@ -4753,7 +4762,15 @@ The scan asks the walk for the best `L` rows: the planner's `limit_tuples` plus 
 LIMIT is not known. It fetches them best first under the scan's snapshot, following HOT chains, and
 applies the restrictions as its qual. When the node above pulls past them, it repeats the walk for
 the next `4L` rows ranked below the last one it had, as `lion_bm25()` does, until the walk returns
-fewer than asked. Its startup cost is
+fewer than asked.
+
+The scan also returns each row's score: the ORDER BY expression is the last column of its scan
+tuple (`custom_scan_tlist`, after the table columns the plan uses), and setrefs.c replaces every
+copy of the expression above the scan with it. Evaluated on its own, `lion_bm25_score()` would read
+N, df and avgdl when the first row is fetched, the walk when the executor started; a cursor whose
+table gained rows in between would show scores out of the order it ranked by. A relation locked
+`FOR UPDATE` or the like is left to the ordinary plan, since EvalPlanQual hands a scan the table's
+row rather than that tuple. Its startup cost is
 two index tuples and two operators per member of the scored lexemes (their `ntids`, read at plan
 time). Each row then costs a random page, a tuple and the restrictions. Against a bitmap scan that
 fetches, scores and sorts every match, on the synthetic 500k-row benchmark (top 10): 120 ms to 20

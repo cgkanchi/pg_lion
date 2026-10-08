@@ -2,7 +2,8 @@
 -- readers"), run against each one, so a new reader gets a line here:
 --   - a function handed an index by name refuses a table where row-level
 --     security applies to the caller, and an unpopulated materialized view
---     (lion_reader_vet()); one that reads only statistics does neither;
+--     (lion_reader_vet()); one that reads only statistics refuses row-level
+--     security too, since they count the hidden rows;
 --   - the planner's paths answer under a policy exactly what seq scan does.
 -- Snapshot eligibility and predicate locks need two sessions:
 -- test/isolation/reader_checkxmin.spec and reader_serializable.spec.
@@ -30,7 +31,8 @@ INSERT INTO rcon_readers VALUES
 	('lion_index_count_any',         $$SELECT lion_index_count_any('%1$s_k', ARRAY[3, 6])$$),
 	('lion_index_count_stats',       $$SELECT count FROM lion_index_count_stats('%1$s_k', 3)$$),
 	('lion_index_count_group_stats', $$SELECT count(*) FROM lion_index_count_group_stats('%1$s_k')$$),
-	('lion_bm25',                    $$SELECT count(*) FROM lion_bm25('%1$s_d', 'secret', 10)$$);
+	('lion_bm25',                    $$SELECT count(*) FROM lion_bm25('%1$s_d', 'secret', 10)$$),
+	('lion_bm25_score',              $$SELECT lion_bm25_score('secret'::tsvector, 'secret', '%1$s_d') > 0$$);
 
 -- what each reader says for the relation rel: its answer, or its error
 CREATE FUNCTION rcon_try(stmt text, rel text) RETURNS text LANGUAGE plpgsql AS $$
@@ -66,15 +68,14 @@ CREATE POLICY rcon_hide ON rcon FOR SELECT USING (NOT d @@ 'secret');
 SET ROLE rcon_reader;
 SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
 
--- statistics only: lion_bm25_score() reads N, df and avgdl, never rows
-SELECT lion_bm25_score('secret'::tsvector, 'secret', 'rcon_d') > 0 AS scores;
-
 -- the planner's paths apply the policy: the same rows as seq scan
 SELECT rcon_same($$SELECT count(*) FROM rcon WHERE k = 3$$);
 SELECT rcon_same($$SELECT k, count(*) FROM rcon GROUP BY k ORDER BY k$$);
 SELECT rcon_same($$SELECT count(*) FROM rcon WHERE d @@ 'secret'$$);
-SELECT rcon_same($$SELECT id FROM rcon WHERE d @@ 'w3 | secret'
-	ORDER BY lion_bm25_score(d, 'w3 | secret', 'rcon_d') DESC, id LIMIT 20$$);
+-- ranking scores by statistics of every row, so it is refused here too
+SELECT rcon_try($$SELECT string_agg(id::text, ',') FROM (SELECT id FROM %1$s
+	WHERE d @@ 'w3 | secret' ORDER BY lion_bm25_score(d, 'w3 | secret', 'rcon_d') DESC,
+	id LIMIT 20) x$$, 'rcon');
 RESET ROLE;
 DROP POLICY rcon_hide ON rcon;
 ALTER TABLE rcon DISABLE ROW LEVEL SECURITY;

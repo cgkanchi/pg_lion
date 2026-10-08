@@ -133,6 +133,71 @@ SELECT v.n, x.id FROM (VALUES (1), (2)) v(n),
 	LATERAL (SELECT id FROM bs_docs WHERE d @@ 'w5' AND id > v.n
 			  ORDER BY lion_bm25_score(d, 'w5', 'bs_docs_d') DESC LIMIT 2) x;
 
+-- rows inserted while a cursor is open: in the index, not in the snapshot.
+-- After the first walk of 64, a row inserted among the rest must not cost
+-- one of them (the walks stop only when one comes up short), and the scores
+-- shown are the ones the rows were ranked by, read when the scan started
+CREATE TABLE bs_cur (id int, d tsvector) WITH (autovacuum_enabled = off);
+INSERT INTO bs_cur SELECT i, to_tsvector('simple', 'w ' || repeat('x ', i))
+  FROM generate_series(1, 100) i;
+CREATE INDEX bs_cur_d ON bs_cur USING lion (d) WITH (store_positions = true);
+VACUUM ANALYZE bs_cur;
+CREATE TEMP TABLE bs_shown (n serial, id int, s float8);
+-- what is left of cursor bs_c, into bs_shown
+CREATE FUNCTION bs_drain() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE c refcursor := 'bs_c'; r record;
+BEGIN
+	LOOP
+		FETCH c INTO r;
+		EXIT WHEN NOT FOUND;
+		INSERT INTO bs_shown (id, s) VALUES (r.id, r.s);
+	END LOOP;
+END $$;
+BEGIN;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_bitmapscan = off;
+SET LOCAL enable_sort = off;
+DECLARE bs_c CURSOR FOR SELECT id, 0::float8 AS s FROM bs_cur WHERE d @@ 'w'
+	ORDER BY lion_bm25_score(d, 'w', 'bs_cur_d') DESC;
+MOVE 64 IN bs_c;
+INSERT INTO bs_cur VALUES (1000, to_tsvector('simple', 'w ' || repeat('x ', 70)));
+SELECT bs_drain();
+SELECT count(*) AS rest, min(id), max(id) FROM bs_shown;
+ROLLBACK;
+BEGIN;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_bitmapscan = off;
+SET LOCAL enable_sort = off;
+DECLARE bs_c CURSOR FOR SELECT id, lion_bm25_score(d, 'w | x', 'bs_cur_d') AS s
+	FROM bs_cur WHERE d @@ 'w | x'
+	ORDER BY lion_bm25_score(d, 'w | x', 'bs_cur_d') DESC;
+INSERT INTO bs_cur SELECT 2000 + i, to_tsvector('simple', 'q') FROM generate_series(1, 3000) i;
+SELECT bs_drain();
+SELECT count(*) AS shown, count(*) FILTER (WHERE s > prev) AS out_of_order
+  FROM (SELECT s, lag(s) OVER (ORDER BY n) AS prev FROM bs_shown) x;
+ROLLBACK;
+DROP FUNCTION bs_drain();
+
+-- the scan tuple carries the columns the plan uses: system columns and a
+-- whole row too
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_sort = off;
+SELECT ctid = (SELECT ctid FROM bs_cur WHERE id = 1) AS ctid,
+	   tableoid::regclass, (c).id
+  FROM bs_cur c WHERE d @@ 'w'
+ ORDER BY lion_bm25_score(d, 'w', 'bs_cur_d') DESC LIMIT 1;
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT id, lion_bm25_score(d, 'w', 'bs_cur_d') FROM bs_cur WHERE d @@ 'w'
+ ORDER BY lion_bm25_score(d, 'w', 'bs_cur_d') DESC LIMIT 1;
+-- a row locked for update is left to the ordinary plan
+SELECT bs_scanned($$SELECT id FROM bs_cur WHERE d @@ 'w'
+	ORDER BY lion_bm25_score(d, 'w', 'bs_cur_d') DESC LIMIT 1 FOR UPDATE$$) AS for_update;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_sort;
+DROP TABLE bs_cur;
+
 -- errors
 SELECT lion_bm25_score(d, 'w1:*', 'bs_docs_d') FROM bs_docs LIMIT 1;
 SELECT lion_bm25_score(d, 'w1', 'bs_docs_d', -1) FROM bs_docs LIMIT 1;
