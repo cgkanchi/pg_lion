@@ -4639,7 +4639,7 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     (`lion_multikey_any_as_or()`, §19), so an element the sets only bound is decided from the
     positions there as under any OR.  An index stores them when built `WITH (store_positions = true)` over a column whose opclass has
     support function 5 (`tsvector_ops`); the build records that on the meta page (`LION_META_POSITIONS`
-    in `order_flags`), so `ALTER INDEX` changes nothing until a `REINDEX` (README.md).
+    in `order_flags`), so `ALTER INDEX` changes nothing until a `REINDEX` (docs/REFERENCE.md, "Reloptions").
 
 ### Ranking: BM25 from the index (2026-10-07)
 
