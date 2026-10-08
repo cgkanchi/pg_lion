@@ -234,9 +234,9 @@ RESET work_mem;
 SELECT * FROM ol_run($$SELECT id FROM lol
 	WHERE a = 'a3' AND b = 'b4' ORDER BY k LIMIT 5$$);
 SELECT ol_cmp($$SELECT id, k FROM lol WHERE a = 'a3' AND b = 'b4' ORDER BY k, id LIMIT 10$$);
--- and a long walk: built once it has met 40,000 entries, the members it met
--- lazily counted as met, so the early stop ends the walk and the switch,
--- should it come, fetches none of them again
+-- and a long walk: built once the probes have met every key of the set, the
+-- members it met lazily counted as met, so the switch that follows fetches
+-- none of them again (ordered_transitions.sql forces each other reason)
 SELECT * FROM ol_run($$SELECT id FROM lol
 	WHERE a IN ('a1', 'a2') AND b IN ('b1', 'b2', 'b3') ORDER BY g$$);
 SELECT ol_cmp($$SELECT id, g FROM lol

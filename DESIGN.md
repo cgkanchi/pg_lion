@@ -14438,7 +14438,12 @@ than overruns (§30.4).
   empty, as before (`lo_lazy_empty()`). Exactness is the lion quals' own (every lazy key is an
   exact set). A rescan keeps the memo unless a Param of the lion quals changed, as it keeps a
   built set; the members met are the scan's and go with it. EXPLAIN ANALYZE says `Lion Set:
-  lazy, K keys probed, exact`, or `N containers, exact, after K keys probed` when it was built.
+  lazy, K keys probed, exact`, or `N containers, exact, after K keys probed (why)` when it was
+  built, `why` naming the rule that built it - `heap order`, `probe budget`, `switch due`,
+  `long walk` (`LO_LAZY_MAX_WALK` entries) or `memo size` (the memo past half of `hash_mem`) -
+  with a count when rescans built it for more than one. `test/sql/ordered_transitions.sql`
+  forces every rule but the heap order one, which needs sets of more than about 256 containers
+  (some 16,000 heap pages each) before a random walk's restarts leave it 64 keys within budget.
   The planner still prices the set as built (§30.3): the lazy set makes the node cheaper than
   its estimate, never dearer by more than the build. `pg_lion.enable_lazy_set` (on) turns it
   off, for comparing the two and for the tests of the build (a set that degrades).
@@ -14466,7 +14471,9 @@ than overruns (§30.4).
   cardinality, known unless it degraded) it stops: nothing further along can be one. The walk
   remembers which members it has met - one 4 kB bitmap per container key it touches, in a per-scan
   context, within `hash_mem` (past that it stops tracking and simply walks on, neither stopping
-  early nor switching) - and a member counts once however often the walk meets its TID.
+  early nor switching; EXPLAIN ANALYZE counts such scans as `Scans Not Counting Members`) - and
+  a member counts once however often the walk meets its TID. `Scans Stopped Early` counts the
+  scans the stop ended.
   *(Fixed 2026-09-25: the first version counted every meeting, on the premise that a btree
   returns each TID once. Within one scan it returns each INDEX TUPLE once, but under an MVCC
   snapshot the paused walk holds no pin (nbtree's `dropPin`, and lion's §29.5), so while a
@@ -14503,7 +14510,8 @@ than overruns (§30.4).
   columns of the relation - an expression index's order would evaluate its functions where the
   ordinary plan calls none, which a revoked EXECUTE could tell apart (§30.6) - and gives up,
   letting the walk go on, if the rows do not fit in `work_mem`. EXPLAIN ANALYZE says
-  `Switched to Fetch and Sort: S of N scans, M members fetched`. A rescan starts afresh.
+  `Switched to Fetch and Sort: S of N scans, M members fetched`, and `Fetch and Sort Given Up: G`
+  for the scans that gave up. A rescan starts afresh.
 - **EvalPlanQual** (`SELECT ... FOR UPDATE` over the node): the recheck method tests the
   substituted row against the `lionqual` and the ordered index's original clauses, as an Index
   Scan's `IndexRecheck()` does; `ExecScan()` applies the filter.
