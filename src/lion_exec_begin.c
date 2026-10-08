@@ -858,13 +858,11 @@ lion_begin_join(LionCountScanState *st, const LionCountPriv *priv,
 	js->counts = (flags & LION_JOINFLAG_COUNTS) != 0;
 	js->outer = (flags & LION_JOINFLAG_OUTER) != 0;
 	js->ordered = (flags & LION_JOINFLAG_ORDERED) != 0;
+	js->sort.unique = (flags & LION_JOINFLAG_UNIQUE) != 0;
+	js->sort.op = priv->join.sortop;
+	js->sort.coll = priv->join.sortcoll;
+	js->batch.walk = (flags & LION_JOINFLAG_WALK) != 0;
 	st->join = js;
-
-	/* ... and what it sorts and batches, still in the scan state */
-	st->joinunique = (flags & LION_JOINFLAG_UNIQUE) != 0;
-	st->joinwalk = (flags & LION_JOINFLAG_WALK) != 0;
-	st->joinsortop = priv->join.sortop;
-	st->joinsortcoll = priv->join.sortcoll;
 }
 
 /*
@@ -1321,13 +1319,13 @@ lion_begin_join_child(LionCountScanState *st, CustomScanState *node,
 	int			i;
 
 	st->joinworkerfilterrows = -1;
-	st->joinchunk = -1;
 	for (i = 0; i < LION_JT_N; i++)
 		INSTR_TIME_SET_ZERO(st->joinworkertime[i]);
 	if (js == NULL)
 		return;
 
 	js->filterrows = -1;
+	js->sort.chunk = -1;
 	js->filter.pinbuf = InvalidBuffer;
 	lion_join_switch_reset(st);
 
@@ -1345,6 +1343,37 @@ lion_begin_join_child(LionCountScanState *st, CustomScanState *node,
 }
 
 /*
+ * The join key's type, which a forward semi join's distinct keys and the
+ * batches of keys looked up in key order are copied by: set once, here, for
+ * a join that has either - a partitioned fact table and a fact column's
+ * groups look their keys up a batch at a time whatever the plan says.
+ */
+static void
+lion_begin_join_key(LionCountScanState *st)
+{
+	LionJoinState *js = st->join;
+	TupleDesc	childdesc;
+	Form_pg_attribute keyatt;
+
+	if (js == NULL ||
+		!(js->sort.unique || js->batch.walk || st->npart > 0 ||
+		  st->fg != NULL))
+		return;
+
+	/*
+	 * Where only the key comes out of the sort, it is the only column of the
+	 * child the target list reads (lion_count_priv_check()).
+	 */
+	childdesc = ExecGetResultType(js->child);
+	if (js->keyresno > childdesc->natts)
+		elog(ERROR, "LionCount: malformed join");
+	keyatt = TupleDescAttr(childdesc, js->keyresno - 1);
+	js->keytype = keyatt->atttypid;
+	js->keybyval = keyatt->attbyval;
+	js->keylen = keyatt->attlen;
+}
+
+/*
  * A forward semi join over a non-unique key (DESIGN.md §27) sorts the
  * child's rows by their key and compares neighbours with the equality of
  * the sort operator's btree family, which is the join operator's family
@@ -1353,46 +1382,36 @@ lion_begin_join_child(LionCountScanState *st, CustomScanState *node,
 static void
 lion_begin_join_distinct_key(LionCountScanState *st, EState *estate)
 {
-	if (st->joinunique)
+	LionJoinState *js = st->join;
+
+	if (js != NULL && js->sort.unique)
 	{
-		LionJoinState *js = lion_st_join(st);
 		TupleDesc	childdesc = ExecGetResultType(js->child);
-		Form_pg_attribute keyatt;
 		Oid			eqop;
 
-		/*
-		 * Only the key comes out of the sort, and it is the only column of
-		 * the child the target list reads (lion_count_priv_check()).
-		 */
-		if (js->keyresno > childdesc->natts)
-			elog(ERROR, "LionCount: malformed join");
-
-		keyatt = TupleDescAttr(childdesc, js->keyresno - 1);
-		st->joinkeytype = keyatt->atttypid;
-		st->joinkeybyval = keyatt->attbyval;
-		st->joinkeylen = keyatt->attlen;
-		eqop = get_equality_op_for_ordering_op(st->joinsortop, NULL);
+		eqop = get_equality_op_for_ordering_op(js->sort.op, NULL);
 		if (!OidIsValid(eqop))
 			elog(ERROR, "could not find equality operator for ordering operator %u",
-				 st->joinsortop);
-		fmgr_info_cxt(get_opcode(eqop), &st->joineqfn, estate->es_query_cxt);
-		st->joinsortslot = ExecInitExtraTupleSlot(estate, childdesc,
-												  &TTSOpsVirtual);
-		st->joinkeycxt = AllocSetContextCreate(estate->es_query_cxt,
-											   "LionCount join key",
-											   ALLOCSET_SMALL_SIZES);
+				 js->sort.op);
+		fmgr_info_cxt(get_opcode(eqop), &js->sort.eqfn, estate->es_query_cxt);
+		js->sort.slot = ExecInitExtraTupleSlot(estate, childdesc,
+											   &TTSOpsVirtual);
+		js->sort.cxt = AllocSetContextCreate(estate->es_query_cxt,
+											 "LionCount join key",
+											 ALLOCSET_SMALL_SIZES);
 	}
 }
 
 /*
  * Lookups in key order (DESIGN.md §27): the batches of rows - or of the
- * distinct keys, which the target list reads through joinsortslot above -
+ * distinct keys, which the target list reads through the sort's slot above -
  * live in a context of their own, emptied at every batch, and a batched
  * row goes back to the target list through a slot of the child's shape.
  */
 static void
 lion_begin_join_batches(LionCountScanState *st, EState *estate)
 {
+	LionJoinState *js = st->join;
 	int			i;
 
 	/*
@@ -1401,7 +1420,7 @@ lion_begin_join_batches(LionCountScanState *st, EState *estate)
 	 * each batch goes to every partition in turn, with a turn of its own and
 	 * a copy of each partition's fact filters kept from batch to batch.
 	 */
-	if (st->join != NULL && st->npart > 0)
+	if (js != NULL && st->npart > 0)
 	{
 		st->joinpart = (LionJoinPart *)
 			palloc0(sizeof(LionJoinPart) * st->npart);
@@ -1425,24 +1444,17 @@ lion_begin_join_batches(LionCountScanState *st, EState *estate)
 		}
 	}
 
-	if (st->joinwalk || st->joinpart != NULL || st->fg != NULL)
+	if (js != NULL &&
+		(js->batch.walk || st->joinpart != NULL || st->fg != NULL))
 	{
-		LionJoinState *js = lion_st_join(st);
 		TupleDesc	childdesc = ExecGetResultType(js->child);
-		Form_pg_attribute keyatt;
 
-		if (js->keyresno > childdesc->natts)
-			elog(ERROR, "LionCount: malformed join");
-		keyatt = TupleDescAttr(childdesc, js->keyresno - 1);
-		st->joinkeytype = keyatt->atttypid;
-		st->joinkeybyval = keyatt->attbyval;
-		st->joinkeylen = keyatt->attlen;
 		/*
 		 * A batch is full when the context's blocks reach work_mem, and a
 		 * block may overshoot it by as much as a block: an eighth of it at
 		 * most, rather than the allocator's usual 8 MB.
 		 */
-		st->joinbatchcxt =
+		js->batch.cxt =
 			AllocSetContextCreate(estate->es_query_cxt,
 								  "LionCount join batch",
 								  ALLOCSET_DEFAULT_MINSIZE,
@@ -1450,8 +1462,8 @@ lion_begin_join_batches(LionCountScanState *st, EState *estate)
 								  Min((Size) ALLOCSET_DEFAULT_MAXSIZE,
 									  Max((Size) ALLOCSET_DEFAULT_INITSIZE,
 										  pg_prevpower2_size_t((Size) work_mem * 1024 / 8))));
-		st->joinbatchslot = ExecInitExtraTupleSlot(estate, childdesc,
-												   &TTSOpsMinimalTuple);
+		js->batch.slot = ExecInitExtraTupleSlot(estate, childdesc,
+												&TTSOpsMinimalTuple);
 	}
 }
 
@@ -1653,6 +1665,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
 	st->writtenrels = lion_statement_written_rels(estate);
 	lion_begin_join_child(st, node, cscan, estate, eflags);
+	lion_begin_join_key(st);
 	lion_begin_join_distinct_key(st, estate);
 	lion_begin_join_batches(st, estate);
 	Assert(st->mode == lion_begin_legacy_mode(st));

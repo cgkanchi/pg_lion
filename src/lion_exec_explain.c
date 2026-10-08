@@ -669,18 +669,18 @@ lion_explain_join(LionCountScanState *st, ExplainState *es)
 	 */
 	/* ... which a semi or anti join path's name says (LionSemiJoin) */
 	if (!js->outer &&
-		(js->type == LION_JOIN_SEMI || st->joinunique))
+		(js->type == LION_JOIN_SEMI || js->sort.unique))
 		ExplainPropertyText("Join Type", "Semi", es);
 	else if (!js->outer && js->type == LION_JOIN_ANTI)
 		ExplainPropertyText("Join Type", "Anti", es);
-	if (st->joinunique)
+	if (js->sort.unique)
 		ExplainPropertyText("Join Keys", "distinct, sorted", es);
 
 	/*
 	 * The keys are looked up a batch at a time, sorted into the fk
 	 * index's order ("Lookups in key order").
 	 */
-	if (st->joinwalk)
+	if (js->batch.walk)
 		ExplainPropertyText("Join Key Lookups", "in index order", es);
 	/*
 	 * A semi or anti join path's rows are the outer side's (DESIGN.md
@@ -700,7 +700,7 @@ lion_explain_join(LionCountScanState *st, ExplainState *es)
 		ExplainPropertyText("Join Rows",
 							js->type == LION_JOIN_ANTI ?
 							"the dimension rows without a match" :
-							st->joinunique ?
+							js->sort.unique ?
 							(js->counts ?
 							 "the distinct keys with a match, each with its count" :
 							 "the distinct keys with a match") :
@@ -1248,20 +1248,20 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 	 * if it ran here.  "Looked Up" below is then the DISTINCT keys,
 	 * each by one participant.
 	 */
-	if (st->joinunique)
+	if (js->sort.unique)
 	{
 		ExplainPropertyInteger("Join Keys Sorted", NULL,
-							   Max(st->joinsorted,
+							   Max(js->sort.sorted,
 								   st->joinworkersorted), es);
-		if (st->joinhavesortstats)
+		if (js->sort.havestats)
 		{
 			ExplainPropertyText("Join Key Sort Method",
-								tuplesort_method_name(st->joinsortstats.sortMethod),
+								tuplesort_method_name(js->sort.stats.sortMethod),
 								es);
 			ExplainPropertyInteger("Join Key Sort Space Used", "kB",
-								   st->joinsortstats.spaceUsed, es);
+								   js->sort.stats.spaceUsed, es);
 			ExplainPropertyText("Join Key Sort Space Type",
-								tuplesort_space_type_name(st->joinsortstats.spaceType),
+								tuplesort_space_type_name(js->sort.stats.spaceType),
 								es);
 		}
 	}
@@ -1307,9 +1307,9 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 	 * The batches the keys were looked up in, in the fk index's order:
 	 * one per work_mem of the child's rows, per participant and run.
 	 */
-	if (st->joinwalk)
+	if (js->batch.walk)
 		ExplainPropertyInteger("Join Key Batches", NULL,
-							   st->joinbatches + st->joinworkerbatches,
+							   js->batch.batches + st->joinworkerbatches,
 							   es);
 
 	lion_explain_fact_filter_counters(st, tot, switches, switched, es);
