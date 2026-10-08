@@ -80,7 +80,6 @@ double		lion_hashagg_rate;
 double		lion_agg_rate;
 double		lion_hashjoin_rate;
 double		lion_mergejoin_rate;
-double		lion_nestloop_rate;
 double		lion_bitmap_rate;
 double		lion_pushdown_margin;
 
@@ -201,8 +200,9 @@ static const LionCostSetting lion_cost_settings[] = {
  * (lion_plan_units.c).  pg_lion.<kind>_rate is that ratio
  * for one kind of core plan, its default what §10's table measured; a kind
  * the table has too little of to say, or whose rate is the reference, is
- * priced at 1, as before.  Sequential, index-only and plain index scans are
- * the reference itself and have no setting.
+ * priced at 1.  Sequential, index-only and plain index scans are the
+ * reference itself and have no setting; nor have nested loops, whose
+ * measured rate changed no plan of §39's matrices (§39, "Held out").
  */
 typedef struct LionRateSetting
 {
@@ -225,9 +225,6 @@ static const LionRateSetting lion_rate_settings[] = {
 	/* no measurement */
 	{"pg_lion.mergejoin_rate", &lion_mergejoin_rate, 1.0,
 	 "a merge join"},
-	/* §10: 1,057 into a btree; §31: about 2,000 over warm indexes */
-	{"pg_lion.nestloop_rate", &lion_nestloop_rate, 2.0,
-	 "a nested loop into a parameterized index or bitmap scan"},
 	/* §10: 544 to 4,419 page-bound; §22: about 70 TID-bound - no one rate */
 	{"pg_lion.bitmap_rate", &lion_bitmap_rate, 1.0,
 	 "a bitmap heap scan"},
