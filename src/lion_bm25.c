@@ -506,6 +506,25 @@ lion_bm25_prepare(Relation index, TSQuery query, double k1, double b,
 	return q->ncodes > 0;
 }
 
+/*
+ * How many rows the next walk asks for, after one that asked for L (0: none
+ * yet) and the walks' seen rows: first, then four times as many - but no
+ * more than one past the rows the lexemes had when q was prepared.  Rows
+ * inserted since are in the index too, and the snapshot does not see them;
+ * so a walk that fills its L is never taken to be the last, however many it
+ * has given in all, and only one that comes up short is.  The one extra row
+ * is what lets the walk that reaches the end come up short without a walk
+ * more.
+ */
+int64
+lion_bm25_next_L(int64 L, int64 first, const LionBm25Query *q, int64 seen)
+{
+	L = (L == 0) ? first : L * 4;
+	if ((int64) q->ncodes > seen)
+		L = Min(L, (int64) q->ncodes - seen + 1);
+	return Max(L, 1);
+}
+
 /* Best first, equal scores in TID order. */
 void
 lion_bm25_sort(LionBm25Cand *cands, int64 n)
@@ -729,9 +748,10 @@ lion_bm25(PG_FUNCTION_ARGS)
 	/*
 	 * The best k + 16, best first, until k of them are visible: when the
 	 * snapshot does not see enough of them, the next 4 times as many, ranked
-	 * below the last of those already tried.
+	 * below the last of those already tried, until a walk comes up short
+	 * (lion_bm25_next_L()).
 	 */
-	L = Min((int64) k + 16, (int64) q.ncodes);
+	L = lion_bm25_next_L(0, (int64) k + 16, &q, 0);
 	for (;;)
 	{
 		LionBm25Cand *best = (LionBm25Cand *)
@@ -748,9 +768,9 @@ lion_bm25(PG_FUNCTION_ARGS)
 			have_after = true;
 		}
 		pfree(best);
-		if (emitted >= k || nbest < L || seen >= (int64) q.ncodes)
+		if (emitted >= k || nbest < L)
 			break;
-		L = Min(L * 4, (int64) q.ncodes - seen);
+		L = lion_bm25_next_L(L, (int64) k + 16, &q, seen);
 	}
 
 out:

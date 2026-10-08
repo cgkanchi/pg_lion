@@ -49,6 +49,8 @@ extern bool lion_bm25_prepare(Relation index, TSQuery query, double k1,
 							  double b, LionBm25Query *q);
 extern int64 lion_bm25_topk(const LionBm25Query *q, int64 L,
 							const LionBm25Cand *after, LionBm25Cand *best);
+extern int64 lion_bm25_next_L(int64 L, int64 first, const LionBm25Query *q,
+							  int64 seen);
 extern void lion_bm25_sort(LionBm25Cand *cands, int64 n);
 extern double lion_bm25_score_row(const LionBm25Query *q, TSVector doc);
 
