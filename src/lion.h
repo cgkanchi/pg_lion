@@ -1091,7 +1091,8 @@ lion_index_row_column(const LionIndexState *ix)
  * opclass has; 2 .. 5 belong to the multi-key classes; 6 .. 9 are the range
  * comparisons of DESIGN.md §28, in btree's order, which an ORDERED scalar
  * class has beside its proc 4, and 10 is `<>` (§35), which it has beside
- * them: every entry but one, a range with a hole in it.
+ * them: every entry but one, a range with a hole in it.  11 .. 14 are
+ * jsonb_contains_ops' (DESIGN.md §42), which are multi-key too.
  */
 #define LION_STRAT_EQUAL			1
 #define LION_STRAT_CONTAINS		2	/* anyarray @> anyarray */
@@ -1103,7 +1104,19 @@ lion_index_row_column(const LionIndexState *ix)
 #define LION_STRAT_GE			8	/* key >= value */
 #define LION_STRAT_GT			9	/* key > value */
 #define LION_STRAT_NE			10	/* key <> value (§35) */
-#define LION_NSTRATEGIES			10
+#define LION_STRAT_JSONB_CONTAINS	11	/* jsonb @> jsonb (§42) */
+#define LION_STRAT_JSONB_EXISTS	12	/* jsonb ? text */
+#define LION_STRAT_JSONB_EXISTS_ANY	13	/* jsonb ?| text[] */
+#define LION_STRAT_JSONB_EXISTS_ALL	14	/* jsonb ?& text[] */
+#define LION_NSTRATEGIES			14
+
+/* a multi-key strategy (§17) */
+#define LION_STRAT_IS_MULTI(s) \
+	(((s) >= LION_STRAT_CONTAINS && (s) <= LION_STRAT_MATCH) || \
+	 ((s) >= LION_STRAT_JSONB_CONTAINS && (s) <= LION_STRAT_JSONB_EXISTS_ALL))
+/* ... and one whose rows the posting sets can select: all but `<@` */
+#define LION_STRAT_IS_MULTI_SEARCH(s) \
+	(LION_STRAT_IS_MULTI(s) && (s) != LION_STRAT_CONTAINED)
 
 #define LION_STRAT_IS_RANGE(s) \
 	((s) >= LION_STRAT_LT && (s) <= LION_STRAT_GT)
@@ -1121,6 +1134,14 @@ lion_index_row_column(const LionIndexState *ix)
 #define LION_CMP_PROC			4	/* btree comparison of the KEY type (§21) */
 #define LION_POSITIONS_PROC		5	/* word positions per extracted key (§17) */
 #define LION_NPROC				5
+
+/*
+ * A search mode of lion's own, beyond GIN's (access/gin.h), that a multi-key
+ * extractQuery may answer: the AND/OR its strategy makes of the keys selects
+ * a SUPERSET of the rows, which the caller rechecks (jsonb_contains_ops'
+ * `@>` with a multi-leaf array element, DESIGN.md §42).
+ */
+#define LION_SEARCH_MODE_LOSSY	16
 
 /*
  * What a query over a multi-key index selects.

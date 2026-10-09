@@ -1,0 +1,284 @@
+-- jsonb_contains_ops: `@>`, `?`, `?|` and `?&` answered through lion - bitmap
+-- scan, plain index scan, the count pushdown with the query a literal or a
+-- parameter - return exactly the rows a sequential scan and GIN return.
+-- Random documents (nested objects and arrays, raw scalars, empty containers,
+-- numbers written several ways, NULL) against random queries, many of them
+-- pieces of a document so that they match, before and after updates and
+-- deletes; only differences print.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+SET synchronous_commit = on;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+SELECT setseed(0.42) IS NULL AS seeded;
+ seeded 
+--------
+ f
+(1 row)
+
+CREATE FUNCTION jz_val(depth int) RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE r float8 := random(); o jsonb; n int;
+BEGIN
+	IF depth = 0 OR r < 0.45 THEN
+		RETURN (ARRAY['0','1','2','1.0','1e0','-0','10','"s0"','"s1"','"s2"','"k0"','"k1"',
+					  'true','false','null'])[1 + (random()*14)::int]::jsonb;
+	ELSIF r < 0.75 THEN
+		o := '{}';
+		n := (random()*3)::int;
+		FOR i IN 1..n LOOP
+			o := o || jsonb_build_object('k' || (random()*3)::int, jz_val(depth - 1));
+		END LOOP;
+		RETURN o;
+	ELSE
+		o := '[]';
+		n := (random()*3)::int;
+		FOR i IN 1..n LOOP
+			o := o || jsonb_build_array(jz_val(depth - 1));
+		END LOOP;
+		RETURN o;
+	END IF;
+END $$;
+-- a random piece of d: some of an object's members, some of an array's elements
+CREATE FUNCTION jz_prune(d jsonb) RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE o jsonb; k text; v jsonb;
+BEGIN
+	IF jsonb_typeof(d) = 'object' THEN
+		o := '{}';
+		FOR k, v IN SELECT * FROM jsonb_each(d) LOOP
+			IF random() < 0.6 THEN o := o || jsonb_build_object(k, jz_prune(v)); END IF;
+		END LOOP;
+		RETURN o;
+	ELSIF jsonb_typeof(d) = 'array' THEN
+		o := '[]';
+		FOR v IN SELECT * FROM jsonb_array_elements(d) LOOP
+			IF random() < 0.6 THEN o := o || jsonb_build_array(jz_prune(v)); END IF;
+		END LOOP;
+		RETURN o;
+	END IF;
+	RETURN d;
+END $$;
+CREATE TABLE jz (id int, doc jsonb);
+INSERT INTO jz
+SELECT i, CASE WHEN i % 97 = 0 THEN NULL
+			   WHEN i % 5 = 0 THEN jz_val(3)
+			   ELSE (SELECT jsonb_object_agg('k' || j, jz_val(3)) FROM generate_series(0, (random()*3)::int) j WHERE i > 0)
+		  END
+FROM generate_series(1, 3000) i;
+CREATE TABLE jz_g AS SELECT * FROM jz; CREATE INDEX ON jz_g USING gin (doc);
+CREATE TABLE jz_gp AS SELECT * FROM jz; CREATE INDEX ON jz_gp USING gin (doc jsonb_path_ops);
+CREATE TABLE jz_l AS SELECT * FROM jz; CREATE INDEX jz_l_i ON jz_l USING lion (doc jsonb_contains_ops);
+VACUUM ANALYZE jz, jz_g, jz_gp, jz_l;
+-- the ids (or, for a count, the count) `doc op q` selects on tab, through mode
+CREATE FUNCTION jz_ids(tab text, op text, q text, mode text) RETURNS int[] LANGUAGE plpgsql AS $$
+DECLARE r int[]; typ text; cond text;
+BEGIN
+	typ := CASE op WHEN '@>' THEN 'jsonb' WHEN '?' THEN 'text' ELSE 'text[]' END;
+	PERFORM set_config('enable_seqscan', CASE WHEN mode = 'seq' THEN 'on' ELSE 'off' END, true);
+	PERFORM set_config('enable_bitmapscan', CASE WHEN mode IN ('bitmap','count','countp') THEN 'on' ELSE 'off' END, true);
+	PERFORM set_config('enable_indexscan', CASE WHEN mode IN ('index','count','countp') THEN 'on' ELSE 'off' END, true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	IF mode = 'countp' THEN
+		EXECUTE format('SELECT ARRAY[count(*)::int] FROM %I WHERE doc %s $1::%s', tab, op, typ) INTO r USING q;
+	ELSE
+		cond := format('doc %s %L::%s', op, q, typ);
+		IF mode = 'count' THEN
+			EXECUTE format('SELECT ARRAY[count(*)::int] FROM %I WHERE %s', tab, cond) INTO r;
+		ELSE
+			EXECUTE format('SELECT coalesce(array_agg(id ORDER BY id), ''{}'') FROM %I WHERE %s', tab, cond) INTO r;
+		END IF;
+	END IF;
+	RETURN r;
+END $$;
+-- every path's answer to one query that differs from the sequential scan's
+CREATE FUNCTION jz_check(op text, qs text) RETURNS TABLE (q text, path text, got int, want int) LANGUAGE plpgsql AS $$
+DECLARE ref int[]; t text; m text; g int[];
+BEGIN
+	ref := jz_ids('jz', op, qs, 'seq');
+	FOREACH t IN ARRAY ARRAY['jz_g','jz_gp','jz_l'] LOOP
+		CONTINUE WHEN t = 'jz_gp' AND op <> '@>';
+		FOREACH m IN ARRAY ARRAY['bitmap','index','count','countp'] LOOP
+			CONTINUE WHEN t <> 'jz_l' AND m <> 'bitmap';
+			BEGIN
+				g := jz_ids(t, op, qs, m);
+			EXCEPTION WHEN others THEN
+				q := op || ' ' || qs; path := t || '/' || m || ' ERROR ' || SQLERRM;
+				got := -1; want := cardinality(ref);
+				RETURN NEXT; CONTINUE;
+			END;
+			IF (m LIKE 'count%' AND g[1] <> cardinality(ref)) OR
+			   (m NOT LIKE 'count%' AND g IS DISTINCT FROM ref) THEN
+				q := op || ' ' || qs; path := t || '/' || m;
+				got := CASE WHEN m LIKE 'count%' THEN g[1] ELSE cardinality(g) END;
+				want := cardinality(ref);
+				RETURN NEXT;
+			END IF;
+		END LOOP;
+	END LOOP;
+END $$;
+CREATE FUNCTION jz_run(n int) RETURNS TABLE (q text, path text, got int, want int) LANGUAGE plpgsql AS $$
+DECLARE qs text; op text; r float8; names text[] := ARRAY['k0','k1','k2','k3','s0','s1','k9'];
+BEGIN
+	FOR i IN 1..n LOOP
+		r := random();
+		IF r < 0.45 THEN
+			op := '@>';
+			SELECT jz_prune(doc)::text INTO qs FROM jz WHERE doc IS NOT NULL
+			 ORDER BY random() LIMIT 1;
+		ELSIF r < 0.6 THEN
+			op := '@>'; qs := jz_val(3)::text;
+		ELSIF r < 0.75 THEN
+			op := '?'; qs := names[1 + (random()*6)::int];
+		ELSE
+			op := CASE WHEN random() < 0.5 THEN '?|' ELSE '?&' END;
+			SELECT coalesce(array_agg(CASE WHEN random() < 0.1 THEN NULL ELSE names[1 + (random()*6)::int] END), '{}')::text
+			  INTO qs FROM generate_series(1, (random()*3)::int) WHERE i > 0;
+		END IF;
+		RETURN QUERY SELECT * FROM jz_check(op, qs);
+	END LOOP;
+END $$;
+SELECT * FROM jz_run(200);
+ q | path | got | want 
+---+------+-----+------
+(0 rows)
+
+-- updates and deletes, not vacuumed: dead rows and pages not all-visible
+UPDATE jz SET doc = doc || '{"k3": [{"k0": 1, "k1": "s0"}]}' WHERE id % 7 = 0 AND jsonb_typeof(doc) = 'object';
+UPDATE jz_g SET doc = doc || '{"k3": [{"k0": 1, "k1": "s0"}]}' WHERE id % 7 = 0 AND jsonb_typeof(doc) = 'object';
+UPDATE jz_gp SET doc = doc || '{"k3": [{"k0": 1, "k1": "s0"}]}' WHERE id % 7 = 0 AND jsonb_typeof(doc) = 'object';
+UPDATE jz_l SET doc = doc || '{"k3": [{"k0": 1, "k1": "s0"}]}' WHERE id % 7 = 0 AND jsonb_typeof(doc) = 'object';
+DELETE FROM jz WHERE id % 11 = 0; DELETE FROM jz_g WHERE id % 11 = 0;
+DELETE FROM jz_gp WHERE id % 11 = 0; DELETE FROM jz_l WHERE id % 11 = 0;
+SELECT * FROM jz_run(200);
+ q | path | got | want 
+---+------+-----+------
+(0 rows)
+
+-- fixed edge cases: raw scalars, empty containers, numbers, nesting, NULLs
+INSERT INTO jz VALUES (9001, '"s0"'), (9002, '["s0", 1]'), (9003, '[]'), (9004, '{}'),
+	(9005, '{"k0": {}}'), (9006, '{"k0": []}'), (9007, '{"k0": [[]]}'), (9008, '{"k0": [{"k1": 1}, {"k2": 2}]}'),
+	(9009, '{"k0": [{"k1": 1, "k2": 2}]}'), (9010, '[[1], [2]]'), (9011, '[[1, 2]]'), (9012, 'null'),
+	(9013, '{"k0": 1e2}'), (9014, '{"k0": [1, [1]]}'), (9015, '{"k0": {"k1": [1]}}');
+INSERT INTO jz_g SELECT * FROM jz WHERE id > 9000;
+INSERT INTO jz_gp SELECT * FROM jz WHERE id > 9000;
+INSERT INTO jz_l SELECT * FROM jz WHERE id > 9000;
+SELECT x.* FROM (VALUES
+	('@>', '"s0"'), ('@>', '["s0"]'), ('@>', '[]'), ('@>', '{}'), ('@>', '{"k0": {}}'),
+	('@>', '{"k0": []}'), ('@>', '{"k0": [[]]}'), ('@>', '{"k0": [{}]}'), ('@>', '{"k0": [{"k1": 1, "k2": 2}]}'),
+	('@>', '{"k0": [{"k1": 1}, {"k2": 2}]}'), ('@>', '[[1, 2]]'), ('@>', '[[1], [2]]'), ('@>', 'null'),
+	('@>', '{"k0": 100}'), ('@>', '{"k0": 100.000}'), ('@>', '{"k0": [[1]]}'), ('@>', '{"k0": 1}'),
+	('@>', '{"k0": {"k1": []}}'), ('@>', '1'), ('@>', '[1, 1]'), ('@>', '{"k0": [1, 1]}'),
+	('?', 's0'), ('?', 'k0'), ('?', ''), ('?|', '{}'), ('?&', '{}'), ('?|', '{NULL}'), ('?&', '{NULL}'),
+	('?|', '{NULL,k0}'), ('?&', '{NULL,k0}'), ('?&', '{k0,k1}'), ('?|', '{s0,k9}')) e(op, q),
+	LATERAL jz_check(e.op, e.q) x;
+ q | path | got | want 
+---+------+-----+------
+(0 rows)
+
+-- keys too long to be keys are hashed; a query that needs one is rechecked
+INSERT INTO jz VALUES (9101, jsonb_build_object('k0', repeat('x', 3000))),
+	(9102, jsonb_build_object(repeat('y', 3000), 1)), (9103, jsonb_build_array(repeat('z', 3000)));
+INSERT INTO jz_g SELECT * FROM jz WHERE id > 9100;
+INSERT INTO jz_gp SELECT * FROM jz WHERE id > 9100;
+INSERT INTO jz_l SELECT * FROM jz WHERE id > 9100;
+SELECT x.* FROM (VALUES
+	('@>', jsonb_build_object('k0', repeat('x', 3000))::text), ('@>', jsonb_build_object('k0', repeat('x', 2999))::text),
+	('@>', jsonb_build_object(repeat('y', 3000), 1)::text), ('@>', jsonb_build_array(repeat('z', 3000))::text),
+	('?', repeat('y', 3000)), ('?', repeat('z', 3000)), ('?&', ARRAY[repeat('y', 3000), 'k0']::text)) e(op, q),
+	LATERAL jz_check(e.op, e.q) x;
+ q | path | got | want 
+---+------+-----+------
+(0 rows)
+
+-- `= ANY (array)` forms, which the count pushdown answers as an OR
+CREATE FUNCTION jz_any(cond text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE a int; b int;
+BEGIN
+	EXECUTE 'SELECT count(*) FROM jz WHERE ' || cond INTO a;
+	PERFORM set_config('enable_seqscan', 'off', true);
+	EXECUTE 'SELECT count(*) FROM jz_l WHERE ' || cond INTO b;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	RETURN a = b;
+END $$;
+SELECT cond, jz_any(cond) AS same FROM (VALUES
+	($$doc @> ANY (ARRAY['{"k0": 1}', '"s0"']::jsonb[])$$),
+	($$doc @> ANY (ARRAY['{"k0": [{"k1": 1, "k2": 2}]}', '{"k1": true}']::jsonb[])$$),
+	($$doc ? ANY (ARRAY['k0', 's1'])$$)) v(cond);
+                                    cond                                     | same 
+-----------------------------------------------------------------------------+------
+ doc @> ANY (ARRAY['{"k0": 1}', '"s0"']::jsonb[])                            | t
+ doc @> ANY (ARRAY['{"k0": [{"k1": 1, "k2": 2}]}', '{"k1": true}']::jsonb[]) | t
+ doc ? ANY (ARRAY['k0', 's1'])                                               | t
+(3 rows)
+
+-- what the plans are: an exact query is counted from the index, one whose
+-- keys only bound it is counted with a recheck, and `?& '{}'` (every row)
+-- stays with the ordinary plan
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM jz_l WHERE doc @> '{"k0": [{"k1": 1}]}';
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: jz_l_i (doc @> '{"k0": [{"k1": 1}]}'::jsonb)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM jz_l WHERE doc @> '{"k0": [{"k1": 1, "k2": 2}]}';
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: jz_l_i (doc @> '{"k0": [{"k1": 1, "k2": 2}]}'::jsonb)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM jz_l WHERE doc ? 'k0' AND doc ?| '{s0,s1}';
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: jz_l_i (doc ? 'k0'::text), jz_l_i (doc ?| '{s0,s1}'::text[])
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM jz_l WHERE doc ?& '{}';
+                   QUERY PLAN                    
+-------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on jz_l
+         Recheck Cond: (doc ?& '{}'::text[])
+         ->  Bitmap Index Scan on jz_l_i
+               Index Cond: (doc ?& '{}'::text[])
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM jz_l WHERE doc ? ANY (ARRAY['k0', 's1']);
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: jz_l_i, jz_l_i ((doc ? 'k0'::text) OR (doc ? 's1'::text))
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM jz_l WHERE doc @> '{"k0": 1}';
+                   QUERY PLAN                    
+-------------------------------------------------
+ Bitmap Heap Scan on jz_l
+   Recheck Cond: (doc @> '{"k0": 1}'::jsonb)
+   ->  Bitmap Index Scan on jz_l_i
+         Index Cond: (doc @> '{"k0": 1}'::jsonb)
+(4 rows)
+
+RESET enable_seqscan;
+-- the opclass validates, and is not the default for jsonb
+SELECT amvalidate(oid) FROM pg_opclass WHERE opcname = 'jsonb_contains_ops';
+ amvalidate 
+------------
+ t
+(1 row)
+
+SELECT opcdefault FROM pg_opclass c JOIN pg_am a ON a.oid = c.opcmethod
+ WHERE a.amname = 'lion' AND c.opcname = 'jsonb_contains_ops';
+ opcdefault 
+------------
+ f
+(1 row)
+
+DROP TABLE jz, jz_g, jz_gp, jz_l;
+DROP FUNCTION jz_run(int);
+DROP FUNCTION jz_any(text);
+DROP FUNCTION jz_check(text, text);
+DROP FUNCTION jz_ids(text, text, text, text);
+DROP FUNCTION jz_prune(jsonb);
+DROP FUNCTION jz_val(int);
