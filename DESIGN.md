@@ -17934,6 +17934,39 @@ aggregate at 4.5 ms against the node's 2.4 (assert build): its input is a sequen
 core charges one `cpu_operator_cost` a row, far below its time, and only the hashing is now priced
 below its time. That error is the filter's cost, not the aggregate's.
 
+### A nested loop's cold reads (2026-10-09)
+
+A nested loop into a parameterized index scan is priced by core at `random_page_cost` for each page
+`index_pages_fetched()` says its probes fetch. On a private workload that price was right warm and
+far off cold: a semi join probing a table several times `effective_cache_size` was a little faster
+than the FK-side join warm and orders of magnitude slower cold, and the two were priced alike. A cold
+page costs a probe a synchronous read - nothing reads ahead of a parameterized scan - which is
+tens of times what `random_page_cost` stands for, set low as it is for an SSD.
+
+So against a nested loop whose inner side is one parameterized index scan (`lion_nestloop_cold()`,
+lion_plan_units.c):
+
+- **its cold reads** are the pages core counts it fetching, a leaf a probe and the heap pages of the
+  rows a probe fetches (`index_pages_fetched()` over the loops, as core counts them), in the share
+  the cache cannot hold: one less the residency `lion_index_page_cost()` argues from,
+  `effective_cache_size` over the query's tables and the index. Each is charged
+  `pg_lion.cold_page_cost`, 50 `seq_page_cost` (100 us at the reference: a local SSD's synchronous
+  read with the kernel's share), less the `random_page_cost` core charged it;
+- **the FK-side join's own cold reads** are counted the same way (`lion_cost_fkjoin_path()`'s
+  `reads`): the directory leaves and fk sets of its lookups, the fact filters it locates, the heap
+  of a recheck;
+- **the path is priced with both added** (`lion_units_cold()`): (own x rate + its cold reads) over
+  (the loop's cost + the loop's cold reads), of the loop's cost - a factor of the rate, each path
+  of the relation with its own reads. It is at most 1, so a path that reads more than the loop
+  keeps its price, and at least 1 / 1.5 (`LION_COLD_MAX_DISCOUNT`).
+
+The floor is what this costs warm. With the inner table's working set in the cache the loop runs at
+core's price, and a lion path chosen over it can take up to 1.5 times its time. Nothing changes where the tables and the index fit in `effective_cache_size`,
+which every table of the regression suite does but `fkjoin_cold.sql`'s, nor against any other kind
+of plan. Not counted: the probes a semi join stops early, which the loop's reads overstate; a
+Memoize over the inner scan, which takes no charge; the count paths other than the FK-side join's,
+which compare with the loop at its price as before.
+
 ### Tests
 
 `test/sql/costrates.sql`: the settings and their ranges; the margin as a threshold - a GROUP BY the

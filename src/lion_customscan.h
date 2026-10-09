@@ -853,6 +853,16 @@ typedef struct LionVColScope
 #define LION_RESIDENT_PAGE_COST	(lion_resident_page_cost * cpu_operator_cost)
 
 /*
+ * A page that a nested loop's inner index scan reads from the device, not
+ * the cache, as a lion path's competitor (lion_nestloop_cold(), DESIGN.md
+ * §39, "A nested loop's cold reads"): one synchronous read, the probe waiting
+ * on it, since nothing reads ahead of a parameterized index scan.  50
+ * seq_page_cost is 100 us at 500 units a millisecond, a local SSD's read
+ * with the kernel's share; a network disk takes several times that.
+ */
+#define LION_COLD_PAGE_COST		(lion_cold_page_cost * seq_page_cost)
+
+/*
  * One candidate TID of a heap recheck (DESIGN.md §9): the visibility check of
  * its tuple, on a page the recheck has pinned (the page itself is charged as
  * I/O).  Fitted on the release build to counts of 99 to 1M candidates on a
@@ -2853,6 +2863,9 @@ typedef struct LionUnits
 	LionCompetitor kind;		/* the cheapest core path's kind */
 	double		rate;			/* ... and its rate */
 	double		margin;			/* pg_lion.pushdown_margin, or 1 */
+	Cost		nlcost;			/* the cheapest core path's cost */
+	Cost		nlcold;			/* a nested loop's cold reads, over that */
+	Cost		coldpage;		/* ... and a cold page's charge, for lion's */
 } LionUnits;
 
 /* lion_plan_units.c */
@@ -2860,10 +2873,11 @@ extern bool lion_path_has_lion(Path *path);
 extern LionCompetitor lion_competitor_kind(Path *path);
 extern double lion_competitor_rate(LionCompetitor kind);
 extern Path *lion_competitor_path(RelOptInfo *rel);
-extern void lion_units_for(RelOptInfo *rel, LionUnits *u);
-extern void lion_units_pin(RelOptInfo *rel);
+extern void lion_units_for(PlannerInfo *root, RelOptInfo *rel, LionUnits *u);
+extern void lion_units_pin(PlannerInfo *root, RelOptInfo *rel);
 extern void lion_units_unpin(void);
 extern Cost lion_units_price(const LionUnits *u, Cost own);
+extern void lion_units_cold(LionUnits *u, Cost own, double reads);
 extern double lion_units_margin(void);
 extern double lion_units_margin_for(RelOptInfo *rel);
 
@@ -2937,7 +2951,8 @@ extern Cost lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 								  List *whereclauses, List *wherekinds,
 								  List *ors, double dimrows, double found,
 								  bool exists, double rowbytes, int workers,
-								  bool *collect, bool *walk, bool force);
+								  bool *collect, bool *walk, bool force,
+								  double *reads);
 
 /* lion_plan_fkjoin.c */
 extern double lion_leaf_turn_share(PlannerInfo *root, RelOptInfo *rel);
