@@ -1182,7 +1182,7 @@ lion_emit_query(Relation index, LionState *col, StrategyNumber strategy,
 		query = lion_tsquery_expand_prefixes(index, col, query, &expanded);
 	}
 
-	lion_extract_query_superset(col, query, strategy, &q);
+	lion_extract_query_superset(col, index, query, strategy, &q);
 	if (q.mode == LION_QMODE_LOSSY)
 	{
 		/*
@@ -1494,7 +1494,7 @@ lion_scan_col_tree(Relation index, LionState *col,
 			 * caller wants the rows exactly or not at all.
 			 */
 			if (lossy != NULL)
-				lion_extract_query_superset(col, queries[i],
+				lion_extract_query_superset(col, index, queries[i],
 											skey->sk_strategy, &q);
 			else
 				lion_extract_query(col, queries[i], skey->sk_strategy, &q);

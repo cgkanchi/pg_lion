@@ -3817,7 +3817,7 @@ lion_multikey_cost_mode_ex(IndexOptInfo *idx, AttrNumber col, Node *clause,
 	state.extractquery = flinfo;
 
 	/* a query the exact extraction answers comes out the same either way */
-	lion_extract_query_superset(&state,
+	lion_extract_query_superset(&state, NULL,
 								strategy == LION_STRAT_MATCH ?
 								lion_tsquery_strip_prefixes(con->constvalue) :
 								con->constvalue,
