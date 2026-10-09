@@ -2785,6 +2785,8 @@ extern Node *lion_vcol_subst(Node *node);
 extern Node *lion_vcol_subst_with(Node *node, List *vcols, Index rti);
 extern Node *lion_vcol_unvar(Node *node);
 extern bool lion_vcol_used(Node *node);
+extern List *lion_vcol_refs(Node *node);
+extern List *lion_vcol_refs_with(Node *node, List *vcols);
 extern bool lion_index_col_is_vcol(Relation index, int col, Node *vcol);
 extern char *lion_vcol_name(Oid relid, Node *vcol);
 
