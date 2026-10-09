@@ -18358,6 +18358,77 @@ with a filter; the two-filter LIMIT 10 2.5 to 2.9 ms against 5.2 to 7.5; the `ta
 - **Expression columns** returning a value for a matching expression of the target; **parallel**
   walks (`parallel_safe = false`, as §30).
 
+## 41. Expression columns in the count pushdown (2026-10-09)
+
+A lion index on an expression - `(doc->>'status')`, `((doc->>'qty')::int)`, `(lower(email))` - is
+a scalar column whose values the table does not store. Its entries are those values, one per row,
+exactly as a column's are, so everything the count pushdown does with a column's entries holds for
+it: a clause on the expression is a posting set, a GROUP BY on it is the walk of its entries, a
+`count(DISTINCT)` of it is the number of entries with a visible row. The pushdown treats each
+expression such an index holds as a column of its own, an **expression column**, numbered past every heap column (`LION_VCOL_ATTNO(i)`,
+`MaxHeapAttributeNumber + 1 + i`, lion_customscan.h).
+
+### Matching (`lion_vcol_collect()`, `lion_vcol_subst()`, lion_plan_match.c)
+
+- **Which expressions**: those of the table's valid, non-partial lion indexes, under a scalar
+  opclass, deduplicated, at most `LION_MAX_VCOLS` (64), collected when the pushdown is tried on one
+  table that is not partitioned. A multi-key opclass over an expression (`to_tsvector(...)`) is not
+  one: its entries are keys, not row values.
+- **The query's expressions**: the GROUP BY items, the WHERE clauses, the HAVING and the target
+  list are rewritten with every subexpression equal to an expression column - as core's
+  `match_index_to_operand()` compares them, relabels stripped - replaced by a Var of that column's
+  number. Everything downstream then sees `Var op Const`, a grouping Var or an aggregate's Var
+  argument and takes the paths a column takes; an expression that is not one of them (`upper(doc->>'s')
+  = 'A'` against an index on `doc->>'s'`) stays as it was and declines as before.
+- **The index**: `lion_find_roaring_index()` answers an expression column with the first key column,
+  in index order, whose expression is equal to it, as a column is answered by the first key column
+  on it. The expression must be written as the index writes it, under its collation.
+
+The rewrite lives only while the path is built: the scope is entered in `lion_try_count_path()` after
+the relation is known and left in a `PG_FINALLY`, and anything that asks the planner's statistics -
+`estimate_num_groups()`, `examine_variable()`, `clause_selectivity()` - gets the expression back
+first (`lion_vcol_unvar()`), so that core finds the index expression's own statistics as it would
+for the ordinary plan. The expression-statistics hook (§33) declines for a partitioned table or an
+inheritance parent, as the column hook does: one index of the parent counts no partition's rows, and
+a partitioned index has no pages to read a count from.
+
+### The plan
+
+- **VCOLS** (custom_private member 19, shape 22): the expression columns' expressions, renumbered
+  to varno 1 when the plan is made (`lion_plan_custom_path()`); setrefs.c does not look into
+  custom_private. The codec checks each is an expression of the table's columns, and
+  `lion_count_priv_check()` that every expression column a member names is one of them, and that
+  there are none with partitions, a join or `coalesce`.
+- **custom_scan_tlist** holds the expressions themselves, not the virtual Vars: setrefs.c matches
+  the plan's target list and HAVING against it by `equal()`, and finds `doc->>'s'` there as it
+  would a column. A HAVING that names an expression column is wanted as that expression, not as
+  the columns inside it (`lion_having_refs()`).
+- **The executor** finds each key column the same way (`lion_index_col_for()` with VCOLS,
+  `lion_index_col_is_vcol()`), comparing with the index's own expressions, which are of varno 1.
+- **EXPLAIN** prints the expression, deparsed against the table, where it prints a column name.
+
+### Privileges
+
+The ordinary plan computes a grouped or counted expression in its scan's projection, so it checks
+EXECUTE on the expression's functions; a WHERE clause's functions are in baserestrictinfo already.
+The plan adds the functions of each expression column it uses to `exec_funcs`
+(`lion_expr_functions()`), and `test/sql/node_contracts.sql` checks both a filtered and a grouped
+expression column against the ordinary plan.
+
+### Not done
+
+- **Partitioned tables**: each partition's index would have to be matched to the parent's
+  expression through the partition's own attribute numbers.
+- **FK-side joins** (§27), **aggregates over keys** (§37) and **`coalesce()`** (§10) of an
+  expression column.
+
+### Tests
+
+`test/sql/exprindex.sql`: jsonb fields and a cast, filtered (`=`, `IN`, `<>`, ranges, `IS NULL`,
+OR), grouped by one, two and three columns, `count(DISTINCT)`, HAVING, a generic plan's parameter,
+through LionCount and through the ordinary plan before and after updates and deletes, only
+differences printed; what declines; and EXECUTE on a function an expression calls.
+
 ## 42. jsonb containment and existence: `jsonb_contains_ops` (lion_jsonb.c, 2026-10-09)
 
 A multi-key opclass (§17) for jsonb that answers `@>`, `?`, `?|` and `?&` with the rows a

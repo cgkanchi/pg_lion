@@ -30,7 +30,7 @@
 static const char *const lion_priv_name[LION_PRIV_NMEMBERS] = {
 	"VERSION", "OIDS", "INTS", "CONSTS", "CLAUSEKINDS", "PARTS", "CLAUSEOPS",
 	"ORS", "HAVING", "DISTINCT", "JOIN", "EXECUTE", "COALESCE", "IMPLIED",
-	"FACTGROUP", "GROUPN", "ALLROWS", "TOPK", "WAGG", "TLKINDS"
+	"FACTGROUP", "GROUPN", "ALLROWS", "TOPK", "WAGG", "VCOLS", "TLKINDS"
 };
 
 static const NodeTag lion_priv_tag[LION_PRIV_NMEMBERS] = {
@@ -53,6 +53,7 @@ static const NodeTag lion_priv_tag[LION_PRIV_NMEMBERS] = {
 	T_IntList,					/* ALLROWS */
 	T_IntList,					/* TOPK */
 	T_List,						/* WAGG */
+	T_List,						/* VCOLS */
 	T_IntList					/* TLKINDS */
 };
 
@@ -549,6 +550,47 @@ lion_count_priv_decode(List *priv, LionPrivStage stage, LionCountPriv *out)
 	}
 
 	lion_priv_decode_wagg(priv, stage, out);
+
+	/* the expression columns (DESIGN.md §41) */
+	out->vcols = (List *) list_nth(priv, LION_PRIV_VCOLS);
+	if (list_length(out->vcols) > LION_MAX_VCOLS)
+		elog(ERROR, "LionCount: malformed VCOLS member of custom_private");
+	foreach(lc, out->vcols)
+	{
+		Node	   *e = (Node *) lfirst(lc);
+
+		/* an index's expression: never a bare column, always of one */
+		if (e == NULL || IsA(e, Var) || IsA(e, List) || IsA(e, IntList) ||
+			IsA(e, OidList) || !contain_var_clause(e))
+			elog(ERROR, "LionCount: malformed VCOLS member of custom_private");
+	}
+
+	/* every column number past the heap's is one of them */
+	{
+		int			nvcol = list_length(out->vcols);
+		int			i;
+
+#define LION_CHECK_VCOL(a) \
+		do { \
+			if (LION_ATTNO_IS_VCOL(a) && LION_VCOL_INDEX(a) >= nvcol) \
+				elog(ERROR, "LionCount: expression column %d of %d", \
+					 (int) (a), nvcol); \
+		} while (0)
+
+		LION_CHECK_VCOL(out->groupattno);
+		LION_CHECK_VCOL(out->groupattno2);
+		LION_CHECK_VCOL(out->distattno);
+		LION_CHECK_VCOL(out->allattno);
+		LION_CHECK_VCOL(out->fgattno);
+		for (i = 0; i < out->nclause; i++)
+			LION_CHECK_VCOL(out->clause[i].attno);
+		for (i = 0; i < out->ngroupn; i++)
+			LION_CHECK_VCOL(out->groupn_attno[i]);
+		for (i = 0; i < out->nwcol; i++)
+			LION_CHECK_VCOL(out->wcol[i].attno);
+#undef LION_CHECK_VCOL
+	}
+
 	if (stage == LION_PRIV_STAGE_PLAN)
 		lion_priv_decode_tlkinds(priv, out);
 }
@@ -707,6 +749,7 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 		}
 	}
 	priv = lappend(priv, m);
+	priv = lappend(priv, p->vcols);
 
 	if (stage == LION_PRIV_STAGE_PLAN)
 	{
@@ -1105,6 +1148,32 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 		 p->distattno != 0 || p->coalconst != NULL || sumall ||
 		 !hasgroupidx || hasrange || p->npart > 0 || p->hasjoin))
 		elog(ERROR, "LionCount: malformed decoded walk");
+
+	/*
+	 * An expression column (DESIGN.md §41) is of one table counted with no
+	 * join and no partitions, and no aggregate over keys is taken over one;
+	 * the decoder has checked each is one of VCOLS.
+	 */
+	{
+		bool		any = LION_ATTNO_IS_VCOL(p->groupattno) ||
+			LION_ATTNO_IS_VCOL(p->groupattno2) ||
+			LION_ATTNO_IS_VCOL(p->distattno) ||
+			LION_ATTNO_IS_VCOL(p->allattno);
+
+		for (i = 0; i < p->nclause; i++)
+			any |= LION_ATTNO_IS_VCOL(p->clause[i].attno);
+		for (i = 0; i < p->ngroupn; i++)
+			any |= LION_ATTNO_IS_VCOL(p->groupn_attno[i]);
+		for (i = 0; i < p->nwcol; i++)
+		{
+			if (LION_ATTNO_IS_VCOL(p->wcol[i].attno))
+				elog(ERROR, "LionCount: an aggregate over an expression column's keys");
+		}
+		if (p->vcols != NIL &&
+			(!any || p->npart > 0 || p->hasjoin || p->fgattno != 0 ||
+			 p->coalconst != NULL))
+			elog(ERROR, "LionCount: malformed expression columns");
+	}
 
 	/*
 	 * Only the key comes out of the sort of a forward semi join's distinct

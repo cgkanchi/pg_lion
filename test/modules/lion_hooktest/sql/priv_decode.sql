@@ -24,6 +24,10 @@ SELECT lion_hooktest_priv_decode('or length');
 -- a kind there is no such clause of
 SELECT lion_hooktest_priv_decode('clause kind');
 
+-- an expression column VCOLS does not have, and one that is no expression
+SELECT lion_hooktest_priv_decode('expression column');
+SELECT lion_hooktest_priv_decode('bare expression column');
+
 -- the members that grow at plan time, still the path's
 SELECT lion_hooktest_priv_decode('path join at plan');
 SELECT lion_hooktest_priv_decode('path wagg at plan');

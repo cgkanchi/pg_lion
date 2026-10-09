@@ -352,6 +352,18 @@ lion_replaced_funcs_walker(Node *node, List **funcs)
 								  (void *) funcs);
 }
 
+/*
+ * funcs plus the functions of expr the executor would check EXECUTE on: an
+ * expression column's (DESIGN.md §41), which core's plan computes in the
+ * scan's projection.
+ */
+List *
+lion_expr_functions(Node *expr, List *funcs)
+{
+	(void) lion_replaced_funcs_walker(expr, &funcs);
+	return funcs;
+}
+
 /* The aggregates of an expression, which ExecInitAgg() would check. */
 static bool
 lion_replaced_aggs_walker(Node *node, List **aggs)

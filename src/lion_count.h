@@ -1564,7 +1564,7 @@ extern double lion_index_column_posting_share(PlannerInfo *root,
 											  IndexOptInfo *idx,
 											  AttrNumber col);
 extern double lion_var_heap_correlation(PlannerInfo *root, Index relid,
-										Var *var);
+										Node *var);
 
 /* ---------------------------------------------------------------------
  * lion_ordered.c (DESIGN.md section 30): the LionOrdered CustomScan
