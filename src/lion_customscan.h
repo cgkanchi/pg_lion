@@ -1317,6 +1317,8 @@ typedef struct LionJoinGroupRow
 typedef struct LionJoinEnt
 {
 	Datum		key;
+	Datum		abbrev;			/* its abbreviated key, a plain fact's batch
+								 * (lion_lookup_walk_abbrev()) */
 	uint32		hash;
 	bool		isnull;			/* joins nothing: an anti join's row only */
 	int32		seq;

@@ -327,8 +327,9 @@ SELECT * FROM lion_wj_explain('SELECT count(*) FROM lion_kof f WHERE EXISTS (SEL
          ->  (the dimension's plan)
 (7 rows)
 
--- a few dozen keys over five hundred leaves: a descent each, as before
-SELECT * FROM lion_wj_explain('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2');
+-- a handful of keys, far apart over five hundred leaves: a descent each, as
+-- before
+SELECT * FROM lion_wj_explain('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2 AND d.pk < 3000');
                 lion_wj_explain                
 -----------------------------------------------
  Finalize Aggregate
@@ -510,11 +511,19 @@ SELECT lion_wj('SELECT count(DISTINCT f.fk), count(*) FROM lion_kof f WHERE f.t 
  pushed down, in key order, 1 rows
 (1 row)
 
--- three filters keep too few keys to walk; the answer is the same
-SELECT lion_wj('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2');
+-- four filters keep too few keys to walk; the answer is the same
+SELECT lion_wj('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2 AND d.pk < 3000');
                lion_wj                
 --------------------------------------
  pushed down, a row at a time, 1 rows
+(1 row)
+
+-- some sixty keys, several leaves apart: walked, a descent each from the
+-- level-1 page above the last one
+SELECT lion_wj('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.attr = 2 AND d.grp IN (''g1'', ''g2'')');
+              lion_wj              
+-----------------------------------
+ pushed down, in key order, 1 rows
 (1 row)
 
 -- ---- 3. what the walk read -------------------------------------------------------
@@ -546,10 +555,20 @@ SELECT lion_wj_counter('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 F
  t
 (1 row)
 
-SELECT lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2', 'Directory Pages Read')
-	>= 3 * lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2', 'Join Keys Looked Up') AS a_descent_a_key;
+SELECT lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2 AND d.pk < 3000', 'Directory Pages Read')
+	>= 3 * lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2 AND d.pk < 3000', 'Join Keys Looked Up') AS a_descent_a_key;
  a_descent_a_key 
 -----------------
+ t
+(1 row)
+
+-- ... where the keys several leaves apart descend from the level-1 page the
+-- last descent went through while they are under it: two pages a key, and
+-- three for the first under each level-1 page
+SELECT lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.attr = 2 AND d.grp IN (''g1'', ''g2'')', 'Directory Pages Read')
+	< 2.5 * lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.attr = 2 AND d.grp IN (''g1'', ''g2'')', 'Join Keys Looked Up') AS from_the_level_1_page;
+ from_the_level_1_page 
+-----------------------
  t
 (1 row)
 
