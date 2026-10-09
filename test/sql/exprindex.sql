@@ -129,7 +129,7 @@ DEALLOCATE xp;
 -- declined, and answered by the ordinary plan: an expression the index does
 -- not hold (another collation, another field), a partial expression index, a
 -- multi-key opclass over an expression, and a partitioned table
-EXPLAIN (COSTS OFF) SELECT count(*) FROM xd WHERE doc->>'zz' = 'a';
+SELECT xq_planned($$SELECT count(*) FROM xd WHERE doc->>'zz' = 'a'$$) AS other_field;
 SELECT xq_planned($$SELECT (doc->>'s') COLLATE "C", count(*) FROM xd GROUP BY 1$$) AS other_collation;
 CREATE TABLE xpart (id int, doc jsonb);
 INSERT INTO xpart SELECT id, doc FROM xd;
