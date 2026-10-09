@@ -239,7 +239,7 @@ lion_group_coalesce(CoalesceExpr *ce, Index rti, Var **var, Const **con)
  * above all - would not be found.
  *
  * Our target only ever holds plain Vars and count Aggrefs at the top level
- * (the checks above refuse everything else), which is why pull_var_clause()
+ * (the checks above refuse everything else), which is why lion_vcol_refs()
  * needs no SRF or window handling here.
  */
 PathTarget *
@@ -281,10 +281,16 @@ lion_make_partial_target(PlannerInfo *root, PathTarget *grouping_target,
 	 */
 	if (having != NIL)
 		non_group_cols = lappend(non_group_cols, having);
-	non_group_exprs = pull_var_clause((Node *) non_group_cols,
-									  PVC_INCLUDE_AGGREGATES |
-									  PVC_RECURSE_WINDOWFUNCS |
-									  PVC_INCLUDE_PLACEHOLDERS);
+
+	/*
+	 * What they read, as core's pull_var_clause() finds it - but for an
+	 * expression column (DESIGN.md §41), which is taken whole: the node
+	 * emits `doc->>'a'`, and could not emit doc.  A HAVING that compares a
+	 * grouped one, or a target that prints one a WHERE equality pinned (core
+	 * drops that from processed_groupClause), would otherwise ask for the
+	 * column inside it.
+	 */
+	non_group_exprs = lion_vcol_refs((Node *) non_group_cols);
 	add_new_columns_to_pathtarget(partial_target, non_group_exprs);
 
 	foreach(lc, partial_target->exprs)

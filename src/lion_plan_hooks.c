@@ -540,54 +540,6 @@ lion_wagg_add_target(Aggref *agg, LionCountPriv *priv,
 }
 
 /*
- * What the HAVING refers to, which the node's tuple has to hold: as
- * pull_var_clause() finds them (aggregates whole, columns), except that an
- * expression column (DESIGN.md §41) is one reference, its expression, rather
- * than the columns inside it.
- */
-typedef struct LionHavingRefs
-{
-	List	   *vcols;
-	List	   *refs;
-} LionHavingRefs;
-
-static bool
-lion_having_refs_walker(Node *node, LionHavingRefs *cxt)
-{
-	ListCell   *lc;
-
-	if (node == NULL)
-		return false;
-	if (IsA(node, Aggref) || IsA(node, GroupingFunc) ||
-		IsA(node, PlaceHolderVar) || IsA(node, Var))
-	{
-		cxt->refs = lappend(cxt->refs, node);
-		return false;
-	}
-	foreach(lc, cxt->vcols)
-	{
-		if (equal(lion_strip(node), lfirst(lc)))
-		{
-			cxt->refs = lappend(cxt->refs, node);
-			return false;
-		}
-	}
-	return expression_tree_walker(node, lion_having_refs_walker,
-								  (void *) cxt);
-}
-
-static List *
-lion_having_refs(Node *having, List *vcols)
-{
-	LionHavingRefs cxt;
-
-	cxt.vcols = vcols;
-	cxt.refs = NIL;
-	(void) lion_having_refs_walker(having, &cxt);
-	return cxt.refs;
-}
-
-/*
  * Turn the path into a CustomScan.
  *
  * scan.scanrelid is 0 because this is an upper node, so custom_scan_tlist has
@@ -656,7 +608,8 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	want = list_copy(tlist);
 	if (having != NIL)
 	{
-		List	   *refs = lion_having_refs((Node *) having, priv.vcols);
+		List	   *refs = lion_vcol_refs_with((Node *) having,
+												 priv.vcols);
 
 		foreach(lc, refs)
 		{
