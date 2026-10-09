@@ -40,6 +40,7 @@ extern PGDLLIMPORT double lion_union_set_cost;
 extern PGDLLIMPORT double lion_recheck_tid_cost;
 extern PGDLLIMPORT double lion_recheck_group_tid_cost;
 extern PGDLLIMPORT double lion_resident_page_cost;
+extern PGDLLIMPORT double lion_cold_page_cost;
 
 /* The count's walks: GROUP BY, count(DISTINCT), ranges (§20, §26, §28, §32) */
 extern PGDLLIMPORT double lion_entry_count_cost;

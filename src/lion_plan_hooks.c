@@ -96,7 +96,7 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	 * cheapest now, before the first of them can free it (§39,
 	 * lion_units_pin()).
 	 */
-	lion_units_pin(output_rel);
+	lion_units_pin(root, output_rel);
 
 	/*
 	 * A join may be the FK-side join of DESIGN.md §27: of two tables, either
@@ -176,7 +176,7 @@ lion_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 	if (!lion_fkjoin_recognize_join(root, joinrel, outerrel, innerrel,
 									jointype, extra, &fj))
 		return;
-	lion_units_pin(joinrel);
+	lion_units_pin(root, joinrel);
 	lion_try_count_path(root, innerrel, joinrel, NULL, &fj);
 	lion_units_unpin();
 }

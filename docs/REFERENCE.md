@@ -336,6 +336,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `recheck_tid_cost` | 1.5 | `cpu_tuple_cost` | a candidate row of a count's heap recheck |
 | `recheck_group_tid_cost` | 6.0 | `cpu_tuple_cost` | the same in a grouped count |
 | `resident_page_cost` | 120 | `cpu_operator_cost` | a page of a Lion index a count reads while the index fits in `effective_cache_size` with the query's tables (DESIGN.md §39); a page that does not is priced as I/O |
+| `cold_page_cost` | 50 | `seq_page_cost` | a page read from the device, not the cache, one synchronous read at a time: a nested loop's inner index scan competing with an FK-side join, and that join's own reads, in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A nested loop's cold reads"); 0 turns the charge off |
 | `entry_count_cost` | 50 | `cpu_tuple_cost` | a count of a GROUP BY: an entry, or a pair of two |
 | `list_group_cost` | 18 | `cpu_tuple_cost` | a count of a group an `IN` list drives |
 | `distinct_test_cost` | 50 | `cpu_tuple_cost` | a test of a `count(DISTINCT)` walk |
