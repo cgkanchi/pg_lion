@@ -208,7 +208,11 @@ SELECT o.amopstrategy, count(DISTINCT c.opcname) AS classes
             8 |      29
             9 |      29
            10 |      29
-(10 rows)
+           11 |       1
+           12 |       1
+           13 |       1
+           14 |       1
+(14 rows)
 
 SELECT c.opcname
   FROM pg_opclass c
@@ -216,13 +220,14 @@ SELECT c.opcname
    AND NOT EXISTS (SELECT 1 FROM pg_amop o
 					WHERE o.amopfamily = c.opcfamily AND o.amopstrategy = 6)
  ORDER BY 1;
-   opcname    
---------------
+      opcname       
+--------------------
  array_ops
  cid_ops
+ jsonb_contains_ops
  tsvector_ops
  xid_ops
-(4 rows)
+(5 rows)
 
 -- every range operator of a family sits beside a proc 4 for its type pair
 SELECT count(*) AS range_members,
@@ -245,7 +250,7 @@ SELECT amvalidate(c.oid) AS valid, count(*)
  GROUP BY 1;
  valid | count 
 -------+-------
- t     |    33
+ t     |    34
 (1 row)
 
 -- the validator refuses a range strategy without proc 4, and one in a multi-key class
