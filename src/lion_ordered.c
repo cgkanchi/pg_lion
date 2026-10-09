@@ -1989,7 +1989,7 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 		}
 	}
 	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
-	corr = lion_var_heap_correlation(root, rel->relid, w->var);
+	corr = lion_var_heap_correlation(root, rel->relid, (Node *) w->var);
 	max_io = index_pages_fetched(fetched, rel->pages,
 								 (double) w->index->pages, root) * spc_random;
 	pages_corr = ceil(Min(fetched, walked / tuples * pages));

@@ -540,6 +540,54 @@ lion_wagg_add_target(Aggref *agg, LionCountPriv *priv,
 }
 
 /*
+ * What the HAVING refers to, which the node's tuple has to hold: as
+ * pull_var_clause() finds them (aggregates whole, columns), except that an
+ * expression column (DESIGN.md §41) is one reference, its expression, rather
+ * than the columns inside it.
+ */
+typedef struct LionHavingRefs
+{
+	List	   *vcols;
+	List	   *refs;
+} LionHavingRefs;
+
+static bool
+lion_having_refs_walker(Node *node, LionHavingRefs *cxt)
+{
+	ListCell   *lc;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref) || IsA(node, GroupingFunc) ||
+		IsA(node, PlaceHolderVar) || IsA(node, Var))
+	{
+		cxt->refs = lappend(cxt->refs, node);
+		return false;
+	}
+	foreach(lc, cxt->vcols)
+	{
+		if (equal(lion_strip(node), lfirst(lc)))
+		{
+			cxt->refs = lappend(cxt->refs, node);
+			return false;
+		}
+	}
+	return expression_tree_walker(node, lion_having_refs_walker,
+								  (void *) cxt);
+}
+
+static List *
+lion_having_refs(Node *having, List *vcols)
+{
+	LionHavingRefs cxt;
+
+	cxt.vcols = vcols;
+	cxt.refs = NIL;
+	(void) lion_having_refs_walker(having, &cxt);
+	return cxt.refs;
+}
+
+/*
  * Turn the path into a CustomScan.
  *
  * scan.scanrelid is 0 because this is an upper node, so custom_scan_tlist has
@@ -608,15 +656,16 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	want = list_copy(tlist);
 	if (having != NIL)
 	{
-		List	   *refs = pull_var_clause((Node *) having,
-										   PVC_INCLUDE_AGGREGATES |
-										   PVC_RECURSE_WINDOWFUNCS |
-										   PVC_INCLUDE_PLACEHOLDERS);
+		List	   *refs = lion_having_refs((Node *) having, priv.vcols);
 
 		foreach(lc, refs)
-			want = lappend(want, makeTargetEntry((Expr *) lfirst(lc),
+		{
+			Node	   *ref = (Node *) lfirst(lc);
+
+			want = lappend(want, makeTargetEntry((Expr *) ref,
 												 list_length(want) + 1,
 												 NULL, true));
+		}
 	}
 
 	/* an aggregate over keys per target entry at most */
@@ -628,17 +677,27 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	{
 		TargetEntry *tle = (TargetEntry *) lfirst(lc);
 		Node	   *expr = (Node *) tle->expr;
+		Node	   *sexpr;
 		int			kind;
 		ListCell   *l2;
 		bool		dup = false;
 
-		if (IsA(expr, Aggref) && priv.nwcol > 0 &&
-			lion_wagg_add_target((Aggref *) expr, &priv, &ctlist, &kinds,
+		/*
+		 * An expression column (DESIGN.md §41) is classified as the virtual
+		 * column it stands for, and goes into custom_scan_tlist as the
+		 * expression itself, which is what setrefs.c matches the plan's
+		 * target list against.
+		 */
+		sexpr = (priv.vcols != NIL) ?
+			lion_vcol_subst_with(expr, priv.vcols, priv.scanrelid) : expr;
+
+		if (IsA(sexpr, Aggref) && priv.nwcol > 0 &&
+			lion_wagg_add_target((Aggref *) sexpr, &priv, &ctlist, &kinds,
 								 &wargs))
 			continue;
-		if (IsA(expr, Aggref))
+		if (IsA(sexpr, Aggref))
 		{
-			Aggref	   *agg = (Aggref *) expr;
+			Aggref	   *agg = (Aggref *) sexpr;
 			AttrNumber	attno = 0;
 
 			if (agg->args != NIL)
@@ -694,9 +753,9 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				}
 			}
 		}
-		else if (IsA(expr, Var))
+		else if (IsA(sexpr, Var))
 		{
-			AttrNumber	attno = ((Var *) expr)->varattno;
+			AttrNumber	attno = ((Var *) sexpr)->varattno;
 			int			i;
 
 			if (groupattno != 0 && attno == groupattno)
@@ -735,7 +794,7 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 						 attno);
 			}
 		}
-		else if (IsA(expr, CoalesceExpr) && priv.coalconst != NULL)
+		else if (IsA(sexpr, CoalesceExpr) && priv.coalconst != NULL)
 		{
 			/*
 			 * GROUP BY coalesce(col, c) (DESIGN.md §10): the only expression
@@ -745,20 +804,22 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			 */
 			kind = LION_TL_GROUPKEY;
 		}
-		else if (!contain_agg_clause(expr) && pull_var_clause(expr, 0) != NIL)
+		else if (!contain_agg_clause(sexpr) &&
+				 pull_var_clause(sexpr, 0) != NIL)
 		{
 			/*
 			 * An expression of the grouping columns (DESIGN.md §36): the node
 			 * emits the columns, and setrefs.c makes the expression over them
 			 * part of the plan's projection.  The planner let through no
-			 * other.
+			 * other.  An expression column is emitted as its expression.
 			 */
-			List	   *vars = pull_var_clause(expr, 0);
+			List	   *vars = pull_var_clause(sexpr, 0);
 			ListCell   *l3;
 
 			foreach(l3, vars)
 			{
 				AttrNumber	attno = ((Var *) lfirst(l3))->varattno;
+				Node	   *col = (Node *) lfirst(l3);
 				int			i;
 
 				if (groupattno != 0 && attno == groupattno)
@@ -771,10 +832,12 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 					elog(ERROR, "LionCount: an expression of column %d, which is not grouped",
 						 attno);
 
+				if (LION_ATTNO_IS_VCOL(attno))
+					col = (Node *) list_nth(priv.vcols, LION_VCOL_INDEX(attno));
 				dup = false;
 				foreach(l2, ctlist)
 				{
-					if (equal(((TargetEntry *) lfirst(l2))->expr, lfirst(l3)))
+					if (equal(((TargetEntry *) lfirst(l2))->expr, col))
 					{
 						dup = true;
 						break;
@@ -783,7 +846,7 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				if (dup)
 					continue;
 				ctlist = lappend(ctlist,
-								 makeTargetEntry((Expr *) copyObject(lfirst(l3)),
+								 makeTargetEntry((Expr *) copyObject(col),
 												 list_length(ctlist) + 1,
 												 NULL, false));
 				kinds = lappend_int(kinds, kind);
@@ -842,6 +905,17 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		cscan->custom_exprs = list_concat(list_copy(cscan->custom_exprs),
 										  wargs);
 	lion_priv_set_tlkinds(&priv, kinds);
+
+	/*
+	 * The expression columns are matched to the index's expressions by the
+	 * executor (lion_index_col_is_vcol()), which are of varno 1; setrefs.c
+	 * does not look into custom_private, so they are renumbered here.
+	 */
+	if (priv.vcols != NIL)
+	{
+		priv.vcols = copyObject(priv.vcols);
+		ChangeVarNodes((Node *) priv.vcols, priv.scanrelid, 1, 0);
+	}
 
 	cscan->custom_scan_tlist = ctlist;
 	cscan->custom_relids = rel->relids;

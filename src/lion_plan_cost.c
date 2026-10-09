@@ -285,7 +285,8 @@ lion_var_ndistinct(PlannerInfo *root, RelOptInfo *rel, Var *var)
 	double		ndistinct;
 	bool		isdefault;
 
-	examine_variable(root, (Node *) var, rel->relid, &vardata);
+	examine_variable(root, lion_vcol_unvar((Node *) var), rel->relid,
+					 &vardata);
 	ndistinct = get_variable_numdistinct(&vardata, &isdefault);
 	ReleaseVariableStats(vardata);
 
@@ -315,7 +316,8 @@ lion_range_entries(PlannerInfo *root, RelOptInfo *rel, Var *var,
 static double
 lion_var_correlation(PlannerInfo *root, RelOptInfo *rel, Var *var)
 {
-	return lion_var_heap_correlation(root, rel->relid, var);
+	return lion_var_heap_correlation(root, rel->relid,
+									 lion_vcol_unvar((Node *) var));
 }
 
 /*
@@ -827,7 +829,8 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	double		sel;
 
 	memset(sc, 0, sizeof(*sc));
-	sel = clause_selectivity(root, clause, 0, JOIN_INNER, NULL);
+	sel = clause_selectivity(root, lion_vcol_unvar(clause), 0, JOIN_INNER,
+							 NULL);
 	sc->sel = sel;
 
 	/*
@@ -1786,6 +1789,7 @@ lion_probed_selectivity(PlannerInfo *root, RelOptInfo *rel, List *clauses)
 {
 	volatile Selectivity sel = 1.0;
 
+	clauses = (List *) lion_vcol_unvar((Node *) clauses);
 	if (!lion_probe_begin(root, rel, clauses))
 		return clauselist_selectivity(root, clauses, 0, JOIN_INNER, NULL);
 	PG_TRY();
@@ -3984,7 +3988,8 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		cost_qual_eval_node(&qual_cost, clause, root);
 		perrow += qual_cost.per_tuple;
 		if (mode == LION_QMODE_ALL)
-			cand /= Max(clause_selectivity(root, clause, 0, JOIN_INNER, NULL),
+			cand /= Max(clause_selectivity(root, lion_vcol_unvar(clause), 0,
+										   JOIN_INNER, NULL),
 						1e-10);
 	}
 	pfree(orgrp);

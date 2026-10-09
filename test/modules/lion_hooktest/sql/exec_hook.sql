@@ -25,6 +25,9 @@ CREATE INDEX nc_k ON nc USING lion (k);
 CREATE INDEX nc_j ON nc USING lion (j);
 CREATE INDEX nc_d ON nc USING lion (d) WITH (store_positions = true);
 CREATE INDEX nc_o ON nc (o) INCLUDE (id);
+CREATE FUNCTION nc_bucket(int) RETURNS int IMMUTABLE LANGUAGE plpgsql
+	AS 'BEGIN RETURN $1 % 4; END';
+CREATE INDEX nc_b ON nc USING lion (nc_bucket(j));
 CREATE TABLE ncd (pk int PRIMARY KEY, name text NOT NULL);
 INSERT INTO ncd SELECT i, 'n' || (i % 2) FROM generate_series(0, 12) i;
 VACUUM (FREEZE, ANALYZE) nc;
@@ -36,6 +39,10 @@ INSERT INTO nc_nodes VALUES
 	 'SELECT count(*) FROM nc WHERE k = 3', 'int4eq(int4,int4)', ''),
 	('LionCount, its aggregate',
 	 'SELECT count(*) FROM nc WHERE k = 3', 'count()', ''),
+	('LionCount, an expression column filtered',
+	 'SELECT count(*) FROM nc WHERE nc_bucket(j) = 1', 'nc_bucket(int4)', ''),
+	('LionCount, an expression column grouped',
+	 'SELECT nc_bucket(j), count(*) FROM nc GROUP BY 1', 'nc_bucket(int4)', ''),
 	('LionJoinAgg',
 	 'SELECT count(DISTINCT d.name), count(*) FROM nc JOIN ncd d ON d.pk = nc.k WHERE nc.j = 3',
 	 'int4eq(int4,int4)', ''),
@@ -156,3 +163,4 @@ DROP FUNCTION nc_try(text);
 DROP FUNCTION nc_rows(text);
 DROP FUNCTION nc_paths(text, boolean);
 DROP TABLE nc_nodes, nc, ncd;
+DROP FUNCTION nc_bucket(int);

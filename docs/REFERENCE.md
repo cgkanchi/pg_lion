@@ -383,7 +383,8 @@ leaf that holds the key; see the measured
 [write costs](BENCHMARKS.md#size-build-and-writes-5m-rows-all-seven-indexes). Count pushdown supports constants, parameters
 and stable expressions such as `now() - interval '30 days'` or `current_date - 30` (evaluated once
 per execution; a volatile one like `random()` goes to the ordinary plan) on any indexed column, enum
-columns included, a boolean column tested by itself (`flag`, `NOT flag`, `flag IS TRUE`, `flag IS
+columns included, or on an indexed expression such as `data->>'key'` treated as a column (on a
+table that is not partitioned, outside joins and aggregates over keys; DESIGN.md §41), a boolean column tested by itself (`flag`, `NOT flag`, `flag IS TRUE`, `flag IS
 NOT FALSE`), an `OR` of such clauses and of `AND`s of them, nested as deep as the query writes it
 (`(a = 1 AND flag IS NOT TRUE) OR b = 2` is distributed into the arms it stands for, up to 1000
 clauses in all), a `GROUP BY` of up to eight indexed columns - three or more, and two where the

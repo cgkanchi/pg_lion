@@ -24,6 +24,9 @@ CREATE INDEX nc_k ON nc USING lion (k);
 CREATE INDEX nc_j ON nc USING lion (j);
 CREATE INDEX nc_d ON nc USING lion (d) WITH (store_positions = true);
 CREATE INDEX nc_o ON nc (o) INCLUDE (id);
+CREATE FUNCTION nc_bucket(int) RETURNS int IMMUTABLE LANGUAGE plpgsql
+	AS 'BEGIN RETURN $1 % 4; END';
+CREATE INDEX nc_b ON nc USING lion (nc_bucket(j));
 CREATE TABLE ncd (pk int PRIMARY KEY, name text NOT NULL);
 INSERT INTO ncd SELECT i, 'n' || (i % 2) FROM generate_series(0, 12) i;
 VACUUM (FREEZE, ANALYZE) nc;
@@ -34,6 +37,10 @@ INSERT INTO nc_nodes VALUES
 	 'SELECT count(*) FROM nc WHERE k = 3', 'int4eq(int4,int4)', ''),
 	('LionCount, its aggregate',
 	 'SELECT count(*) FROM nc WHERE k = 3', 'count()', ''),
+	('LionCount, an expression column filtered',
+	 'SELECT count(*) FROM nc WHERE nc_bucket(j) = 1', 'nc_bucket(int4)', ''),
+	('LionCount, an expression column grouped',
+	 'SELECT nc_bucket(j), count(*) FROM nc GROUP BY 1', 'nc_bucket(int4)', ''),
 	('LionJoinAgg',
 	 'SELECT count(DISTINCT d.name), count(*) FROM nc JOIN ncd d ON d.pk = nc.k WHERE nc.j = 3',
 	 'int4eq(int4,int4)', ''),
@@ -138,49 +145,59 @@ BEGIN
 	DEALLOCATE nc_p;
 END $$;
 SELECT node, nc_hook(node) FROM nc_nodes ORDER BY node;
-           node           |                                                                        nc_hook                                                                        
---------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------
- LionAntiJoin             | plan: planned
- LionAntiJoin             | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
- LionAntiJoin             | plain EXPLAIN: as the ordinary plan
- LionAntiJoin             | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
- LionAntiJoin             | allowed again: the answer
- LionBm25                 | plan: planned
- LionBm25                 | refused: ERROR: lion_hooktest: execution of lion_bm25_score(tsvector,tsquery,regclass,double precision,double precision) denied, as the ordinary plan
- LionBm25                 | plain EXPLAIN: as the ordinary plan
- LionBm25                 | a cached plan: ERROR: lion_hooktest: execution of lion_bm25_score(tsvector,tsquery,regclass,double precision,double precision) denied
- LionBm25                 | allowed again: the answer
- LionBtreeScan            | plan: planned
- LionBtreeScan            | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
- LionBtreeScan            | plain EXPLAIN: as the ordinary plan
- LionBtreeScan            | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
- LionBtreeScan            | allowed again: the answer
- LionCount                | plan: planned
- LionCount                | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
- LionCount                | plain EXPLAIN: as the ordinary plan
- LionCount                | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
- LionCount                | allowed again: the answer
- LionCount, its aggregate | plan: planned
- LionCount, its aggregate | refused: ERROR: lion_hooktest: execution of count() denied, as the ordinary plan
- LionCount, its aggregate | plain EXPLAIN: as the ordinary plan
- LionCount, its aggregate | a cached plan: ERROR: lion_hooktest: execution of count() denied
- LionCount, its aggregate | allowed again: the answer
- LionJoinAgg              | plan: planned
- LionJoinAgg              | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
- LionJoinAgg              | plain EXPLAIN: as the ordinary plan
- LionJoinAgg              | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
- LionJoinAgg              | allowed again: the answer
- LionOrdered              | plan: planned
- LionOrdered              | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
- LionOrdered              | plain EXPLAIN: as the ordinary plan
- LionOrdered              | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
- LionOrdered              | allowed again: the answer
- LionSemiJoin             | plan: planned
- LionSemiJoin             | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
- LionSemiJoin             | plain EXPLAIN: as the ordinary plan
- LionSemiJoin             | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
- LionSemiJoin             | allowed again: the answer
-(40 rows)
+                   node                   |                                                                        nc_hook                                                                        
+------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------
+ LionAntiJoin                             | plan: planned
+ LionAntiJoin                             | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
+ LionAntiJoin                             | plain EXPLAIN: as the ordinary plan
+ LionAntiJoin                             | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
+ LionAntiJoin                             | allowed again: the answer
+ LionBm25                                 | plan: planned
+ LionBm25                                 | refused: ERROR: lion_hooktest: execution of lion_bm25_score(tsvector,tsquery,regclass,double precision,double precision) denied, as the ordinary plan
+ LionBm25                                 | plain EXPLAIN: as the ordinary plan
+ LionBm25                                 | a cached plan: ERROR: lion_hooktest: execution of lion_bm25_score(tsvector,tsquery,regclass,double precision,double precision) denied
+ LionBm25                                 | allowed again: the answer
+ LionBtreeScan                            | plan: planned
+ LionBtreeScan                            | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
+ LionBtreeScan                            | plain EXPLAIN: as the ordinary plan
+ LionBtreeScan                            | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
+ LionBtreeScan                            | allowed again: the answer
+ LionCount                                | plan: planned
+ LionCount                                | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
+ LionCount                                | plain EXPLAIN: as the ordinary plan
+ LionCount                                | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
+ LionCount                                | allowed again: the answer
+ LionCount, an expression column filtered | plan: planned
+ LionCount, an expression column filtered | refused: ERROR: lion_hooktest: execution of nc_bucket(integer) denied, as the ordinary plan
+ LionCount, an expression column filtered | plain EXPLAIN: as the ordinary plan
+ LionCount, an expression column filtered | a cached plan: ERROR: lion_hooktest: execution of nc_bucket(integer) denied
+ LionCount, an expression column filtered | allowed again: the answer
+ LionCount, an expression column grouped  | plan: planned
+ LionCount, an expression column grouped  | refused: ERROR: lion_hooktest: execution of nc_bucket(integer) denied, as the ordinary plan
+ LionCount, an expression column grouped  | plain EXPLAIN: as the ordinary plan
+ LionCount, an expression column grouped  | a cached plan: ERROR: lion_hooktest: execution of nc_bucket(integer) denied
+ LionCount, an expression column grouped  | allowed again: the answer
+ LionCount, its aggregate                 | plan: planned
+ LionCount, its aggregate                 | refused: ERROR: lion_hooktest: execution of count() denied, as the ordinary plan
+ LionCount, its aggregate                 | plain EXPLAIN: as the ordinary plan
+ LionCount, its aggregate                 | a cached plan: ERROR: lion_hooktest: execution of count() denied
+ LionCount, its aggregate                 | allowed again: the answer
+ LionJoinAgg                              | plan: planned
+ LionJoinAgg                              | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
+ LionJoinAgg                              | plain EXPLAIN: as the ordinary plan
+ LionJoinAgg                              | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
+ LionJoinAgg                              | allowed again: the answer
+ LionOrdered                              | plan: planned
+ LionOrdered                              | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
+ LionOrdered                              | plain EXPLAIN: as the ordinary plan
+ LionOrdered                              | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
+ LionOrdered                              | allowed again: the answer
+ LionSemiJoin                             | plan: planned
+ LionSemiJoin                             | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
+ LionSemiJoin                             | plain EXPLAIN: as the ordinary plan
+ LionSemiJoin                             | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
+ LionSemiJoin                             | allowed again: the answer
+(50 rows)
 
 SHOW lion_hooktest.deny_execute;
  lion_hooktest.deny_execute 
@@ -195,3 +212,4 @@ DROP FUNCTION nc_try(text);
 DROP FUNCTION nc_rows(text);
 DROP FUNCTION nc_paths(text, boolean);
 DROP TABLE nc_nodes, nc, ncd;
+DROP FUNCTION nc_bucket(int);

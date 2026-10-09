@@ -3557,6 +3557,7 @@ lion_index_expr_stats(PlannerInfo *root, Oid indexOid, AttrNumber indexattnum,
 	LionNdistinctCache *cache;
 	LionNdistinctRow *row;
 	IndexOptInfo *idx = NULL;
+	RangeTblEntry *rte;
 	VariableStatData core;
 	float4		stadistinct = 0;
 	ListCell   *lc;
@@ -3570,6 +3571,16 @@ lion_index_expr_stats(PlannerInfo *root, Oid indexOid, AttrNumber indexattnum,
 	if (!lion_enable_index_ndistinct || root == NULL || root->glob == NULL ||
 		vardata->rel == NULL || vardata->var == NULL ||
 		!IS_SIMPLE_REL(vardata->rel) || indexattnum < 1)
+		return false;
+
+	/*
+	 * Not for an inheritance tree or a partitioned table, as above: the
+	 * parent's index counts no partition's rows, and a partitioned index has
+	 * no pages to read the count from.
+	 */
+	rte = planner_rt_fetch(vardata->rel->relid, root);
+	if (rte->rtekind != RTE_RELATION || rte->inh ||
+		rte->relkind == RELKIND_PARTITIONED_TABLE)
 		return false;
 	foreach(lc, vardata->rel->indexlist)
 	{
