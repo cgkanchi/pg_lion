@@ -68,12 +68,10 @@ PG_FUNCTION_INFO_V1(lion_handler);
 /*
  * Strategies and support procedure numbers live in lion.h, because build,
  * insert, scan and count all need them.  The multi-key strategies of
- * DESIGN.md §17 are 2 .. 5; a scalar opclass has strategy 1, and an ordered
- * one the range strategies 6 .. 9 of §28 and the `<>` of §35 (10) as well.
+ * DESIGN.md §17 are 2 .. 5 and jsonb's 11 .. 14 (§42); a scalar opclass has
+ * strategy 1, and an ordered one the range strategies 6 .. 9 of §28 and the
+ * `<>` of §35 (10) as well.
  */
-#define LION_MULTI_STRATEGY_MASK \
-	((1 << LION_STRAT_CONTAINS) | (1 << LION_STRAT_OVERLAP) | \
-	 (1 << LION_STRAT_CONTAINED) | (1 << LION_STRAT_MATCH))
 #define LION_RANGE_STRATEGY_MASK \
 	((1 << LION_STRAT_LT) | (1 << LION_STRAT_LE) | \
 	 (1 << LION_STRAT_GE) | (1 << LION_STRAT_GT) | (1 << LION_STRAT_NE))
@@ -719,7 +717,9 @@ lionvalidate(Oid opclassoid)
 			case LION_HASH_PROC:
 				if (multikey)
 					ok = check_amproc_signature(procform->amproc, INT4OID,
-												false, 1, 1, opckeytype);
+												false, 1, 1, opckeytype) ||
+						lion_hash_substitution_ok(procform->amproc,
+												  opckeytype);
 				else
 					ok = check_amproc_signature(procform->amproc, INT4OID,
 												false, 1, 1,
@@ -832,9 +832,7 @@ lionvalidate(Oid opclassoid)
 		 * could be answered from them).
 		 */
 		stratok = multikey ?
-			(oprform->amopstrategy >= 1 &&
-			 oprform->amopstrategy <= LION_NSTRATEGIES &&
-			 (LION_MULTI_STRATEGY_MASK & (1 << oprform->amopstrategy)) != 0) :
+			LION_STRAT_IS_MULTI(oprform->amopstrategy) :
 			(oprform->amopstrategy == LION_STRAT_EQUAL ||
 			 LION_STRAT_IS_WALK(oprform->amopstrategy));
 

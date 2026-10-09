@@ -1927,8 +1927,7 @@ lion_isect_scankey(IndexOptInfo *idx, int col0, Node *clause, ScanKey skey)
 		return false;
 	get_op_opfamily_properties(opno, opfamily, false, &strategy, &lefttype,
 							   &righttype);
-	if (multikey ? (strategy < LION_STRAT_CONTAINS ||
-					strategy > LION_STRAT_MATCH) :
+	if (multikey ? !LION_STRAT_IS_MULTI(strategy) :
 		strategy != LION_STRAT_EQUAL)
 		return false;
 
