@@ -181,13 +181,25 @@ lion_load_inner_keys(LionCountScanState *st)
  * plan was made for, and that is said rather than read.
  */
 AttrNumber
-lion_index_col_for(Relation index, AttrNumber heapattno, bool multikey)
+lion_index_col_for(Relation index, AttrNumber heapattno, bool multikey,
+				   List *vcols)
 {
+	Node	   *vcol = NULL;
 	int			c;
+
+	/* an expression column (DESIGN.md §41) is matched by its expression */
+	if (LION_ATTNO_IS_VCOL(heapattno))
+	{
+		if (LION_VCOL_INDEX(heapattno) >= list_length(vcols))
+			elog(ERROR, "LionCount: expression column %d of %d",
+				 (int) heapattno, list_length(vcols));
+		vcol = (Node *) list_nth(vcols, LION_VCOL_INDEX(heapattno));
+	}
 
 	for (c = 0; c < IndexRelationGetNumberOfKeyAttributes(index); c++)
 	{
-		if (index->rd_index->indkey.values[c] != heapattno)
+		if (vcol != NULL ? !lion_index_col_is_vcol(index, c, vcol) :
+			index->rd_index->indkey.values[c] != heapattno)
 			continue;
 		if (lion_opfamily_is_multikey(index->rd_opfamily[c],
 									 index->rd_opcintype[c]) != multikey)
@@ -195,6 +207,10 @@ lion_index_col_for(Relation index, AttrNumber heapattno, bool multikey)
 		return (AttrNumber) (c + 1);
 	}
 
+	if (vcol != NULL)
+		elog(ERROR, "lion index \"%s\" has no %s key column on expression %s",
+			 RelationGetRelationName(index), multikey ? "multi-key" : "scalar",
+			 lion_vcol_name(index->rd_index->indrelid, vcol));
 	elog(ERROR, "lion index \"%s\" has no %s key column on column %d of \"%s\"",
 		 RelationGetRelationName(index), multikey ? "multi-key" : "scalar",
 		 (int) heapattno, get_rel_name(index->rd_index->indrelid));
@@ -216,7 +232,8 @@ lion_heap_attno_in(Relation heap, Oid parentoid, AttrNumber parentattno)
 	char	   *name;
 	AttrNumber	attno;
 
-	if (RelationGetRelid(heap) == parentoid || parentattno <= 0)
+	if (RelationGetRelid(heap) == parentoid || parentattno <= 0 ||
+		LION_ATTNO_IS_VCOL(parentattno))
 		return parentattno;
 
 	name = get_attname(parentoid, parentattno, false);
@@ -528,7 +545,8 @@ lion_open_relation(LionCountScanState *st, int p)
 			lion_index_col_for(st->clause[i].idx,
 							   lion_heap_attno_in(st->heap, st->plan.heapoid,
 												  st->clause[i].attno),
-							   st->clause[i].kind == LION_CLAUSE_MULTI);
+							   st->clause[i].kind == LION_CLAUSE_MULTI,
+							   st->plan.vcols);
 	}
 	if (part != NULL)
 		lion_relation_items(st);
@@ -546,13 +564,13 @@ lion_open_relation(LionCountScanState *st, int p)
 			lion_index_col_for(st->groupidx,
 							   lion_heap_attno_in(st->heap, st->plan.heapoid,
 												  st->driveattno),
-							   false);
+							   false, st->plan.vcols);
 	if (st->groupidx2 != NULL)
 		st->groupidxcol2 =
 			lion_index_col_for(st->groupidx2,
 							   lion_heap_attno_in(st->heap, st->plan.heapoid,
 												  st->innerattno),
-							   false);
+							   false, st->plan.vcols);
 	if (st->decode != NULL)
 	{
 		LionDecodeRun *dr = st->decode;
@@ -566,7 +584,7 @@ lion_open_relation(LionCountScanState *st, int p)
 									   lion_heap_attno_in(st->heap,
 														  st->plan.heapoid,
 														  dr->attno[c]),
-									   false);
+									   false, st->plan.vcols);
 		}
 	}
 

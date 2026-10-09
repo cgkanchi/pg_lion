@@ -63,6 +63,13 @@ its group's count, so the largest entries are counted first and the rest never o
 catch up - ten groups of 3.4 million on ClickBench's `UserID`. Expressions of the grouping column
 (`GROUP BY ip, ip - 1`) split no group and are computed from it.
 
+An expression index counts as a column of its expression (DESIGN.md §41). With `CREATE INDEX ON
+events USING lion ((payload->>'status'))`, `WHERE payload->>'status' = 'paid'`, `IN`, ranges,
+`<>`, `IS NULL`, `GROUP BY payload->>'status'` and `count(DISTINCT payload->>'status')` are
+pushed down like the same queries on a column; so is a cast of a field, such as an index on
+`((payload->>'qty')::int)` and `WHERE (payload->>'qty')::int > 10`. The query has to write the
+expression as the index does. EXPLAIN prints the expression where it would print a column name.
+
 With no `WHERE` and no `GROUP BY`, `sum`, `avg` (of integers), `min`, `max`, `bool_and` and
 `bool_or` of an expression of one Lion-indexed column are computed from the column's keys, each
 weighted by its rows (`Aggregates Over Keys` in EXPLAIN; DESIGN.md §37): `SELECT sum(width),

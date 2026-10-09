@@ -29,6 +29,7 @@
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
@@ -870,14 +871,14 @@ lion_stats_sum_sq_freq(VariableStatData *vardata)
  * raw, a low-cardinality column placed at random looked packed there too.
  */
 double
-lion_var_heap_correlation(PlannerInfo *root, Index relid, Var *var)
+lion_var_heap_correlation(PlannerInfo *root, Index relid, Node *var)
 {
 	VariableStatData vardata;
 	TypeCacheEntry *tce;
 	double		corr = 0.0;
 
-	examine_variable(root, (Node *) var, relid, &vardata);
-	tce = lookup_type_cache(var->vartype, TYPECACHE_LT_OPR);
+	examine_variable(root, var, relid, &vardata);
+	tce = lookup_type_cache(exprType(var), TYPECACHE_LT_OPR);
 	if (HeapTupleIsValid(vardata.statsTuple) && OidIsValid(tce->lt_opr))
 	{
 		AttStatsSlot sslot;
@@ -942,7 +943,7 @@ lion_index_correlation(PlannerInfo *root, IndexPath *path)
 	var = makeVar(index->rel->relid, index->indexkeys[col],
 				  get_atttype(rte->relid, index->indexkeys[col]), -1,
 				  index->indexcollations[col], 0);
-	corr = lion_var_heap_correlation(root, index->rel->relid, var);
+	corr = lion_var_heap_correlation(root, index->rel->relid, (Node *) var);
 
 	if (index->nkeycolumns > 1)
 		corr *= 0.75;

@@ -1,0 +1,182 @@
+-- Expression columns in the count pushdown (DESIGN.md §41): a lion index on
+-- an expression - a jsonb field, a cast of one - answers counts, GROUP BY
+-- and count(DISTINCT) over that expression as it does over a column.  Every
+-- query below runs through LionCount and through the ordinary plan, and only
+-- differences print, before and after updates and deletes; then the plans,
+-- what is declined, and EXECUTE on a function the expression calls.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+SELECT setseed(0.17) IS NULL AS seeded;
+
+-- documents with a string field s (absent, JSON null, or one of five
+-- values), a number n (sometimes a string, sometimes absent), a nested
+-- field and a plain column
+CREATE TABLE xd (id int, c int, doc jsonb);
+INSERT INTO xd
+SELECT i, i % 7,
+	   jsonb_strip_nulls(jsonb_build_object(
+		   's', CASE WHEN r < 0.1 THEN NULL ELSE (ARRAY['a','b','c','d','é'])[1 + (r * 100)::int % 5] END,
+		   'n', CASE WHEN r2 < 0.05 THEN NULL ELSE (r2 * 40)::int END,
+		   'o', jsonb_build_object('t', 'x' || (i % 3))))
+	   || CASE WHEN i % 13 = 0 THEN '{"s": null}'::jsonb ELSE '{}'::jsonb END
+  FROM (SELECT i, random() AS r, random() AS r2 FROM generate_series(1, 6000) i) g;
+CREATE INDEX xd_s ON xd USING lion ((doc->>'s'));
+CREATE INDEX xd_n ON xd USING lion (((doc->>'n')::int));
+CREATE INDEX xd_t ON xd USING lion ((doc->'o'->>'t'));
+CREATE INDEX xd_c ON xd USING lion (c);
+VACUUM (FREEZE, ANALYZE) xd;
+
+CREATE TABLE xq (q text);
+INSERT INTO xq VALUES
+	($$SELECT count(*) FROM xd WHERE doc->>'s' = 'a'$$),
+	($$SELECT count(*) FROM xd WHERE doc->>'s' = 'é'$$),
+	($$SELECT count(*) FROM xd WHERE doc->>'s' = 'zz'$$),
+	($$SELECT count(*) FROM xd WHERE doc->>'s' IN ('a', 'c', 'zz')$$),
+	($$SELECT count(*) FROM xd WHERE doc->>'s' <> 'b'$$),
+	($$SELECT count(*) FROM xd WHERE doc->>'s' IS NULL$$),
+	($$SELECT count(*) FROM xd WHERE doc->>'s' IS NOT NULL$$),
+	($$SELECT count(*) FROM xd WHERE doc->>'s' > 'b'$$),
+	($$SELECT count(*) FROM xd WHERE (doc->>'n')::int = 7$$),
+	($$SELECT count(*) FROM xd WHERE (doc->>'n')::int BETWEEN 5 AND 20$$),
+	($$SELECT count(*) FROM xd WHERE (doc->>'n')::int = 3 OR doc->>'s' = 'd'$$),
+	($$SELECT count(*) FROM xd WHERE doc->'o'->>'t' = 'x1' AND doc->>'s' = 'a'$$),
+	($$SELECT count(*) FROM xd WHERE doc->>'s' = 'a' AND c = 3$$),
+	($$SELECT count(doc->>'s') FROM xd WHERE doc->>'s' IS NULL$$),
+	($$SELECT doc->>'s', count(*) FROM xd GROUP BY 1$$),
+	($$SELECT doc->>'s' AS s, count(*), count(doc->>'s') FROM xd WHERE c < 4 GROUP BY 1$$),
+	($$SELECT (doc->>'n')::int, count(*) FROM xd WHERE doc->>'s' = 'b' GROUP BY 1$$),
+	($$SELECT doc->>'s', doc->'o'->>'t', count(*) FROM xd GROUP BY 1, 2$$),
+	($$SELECT doc->>'s', doc->'o'->>'t', c, count(*) FROM xd GROUP BY 1, 2, 3$$),
+	($$SELECT doc->>'s', count(*) FROM xd GROUP BY 1 HAVING count(*) > 1000$$),
+	($$SELECT doc->>'s', count(*) FROM xd GROUP BY 1 HAVING count(*) > 1100 OR doc->>'s' = 'a'$$),
+	($$SELECT doc->>'s' FROM xd GROUP BY 1 HAVING count(doc->>'s') > 1100 OR upper(doc->>'s') = 'B'$$),
+	($$SELECT doc->>'s', upper(doc->>'s'), count(*) FROM xd GROUP BY 1, 2$$),
+	($$SELECT c, count(*) FROM xd WHERE doc->>'s' = 'c' GROUP BY c$$),
+	($$SELECT count(DISTINCT doc->>'s') FROM xd$$),
+	($$SELECT count(DISTINCT (doc->>'n')::int) FROM xd WHERE doc->>'s' IN ('a', 'b')$$),
+	($$SELECT count(DISTINCT c) FROM xd WHERE doc->>'s' = 'd'$$);
+
+-- q's rows as one sorted string, through LionCount or not
+CREATE FUNCTION xq_rows(q text, lion boolean) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	r text;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', lion::text, true);
+	PERFORM set_config('enable_seqscan', (NOT lion)::text, true);
+	PERFORM set_config('enable_bitmapscan', (NOT lion)::text, true);
+	PERFORM set_config('enable_indexscan', (NOT lion)::text, true);
+	EXECUTE format('SELECT coalesce(string_agg(s::text, '' '' ORDER BY s::text), ''(none)'') FROM (%s) s', q)
+		INTO r;
+	RETURN r;
+END $$;
+
+-- did q plan LionCount?
+CREATE FUNCTION xq_planned(q text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			RETURN true;
+		END IF;
+	END LOOP;
+	RETURN false;
+END $$;
+
+-- every query plans LionCount ...
+SELECT q FROM xq WHERE NOT xq_planned(q);
+-- ... and answers as the ordinary plan does
+SELECT q, xq_rows(q, true) AS lion, xq_rows(q, false) AS ordinary
+  FROM xq WHERE xq_rows(q, true) IS DISTINCT FROM xq_rows(q, false);
+
+-- updates and deletes, not vacuumed: dead rows, pages not all-visible
+UPDATE xd SET doc = doc || '{"s": "b", "n": "12"}' WHERE id % 5 = 0;
+UPDATE xd SET doc = doc - 's' WHERE id % 11 = 0;
+DELETE FROM xd WHERE id % 17 = 0;
+SELECT q, xq_rows(q, true) AS lion, xq_rows(q, false) AS ordinary
+  FROM xq WHERE xq_rows(q, true) IS DISTINCT FROM xq_rows(q, false);
+VACUUM (FREEZE, ANALYZE) xd;
+
+-- the plans name the expression
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM xd WHERE doc->>'s' IN ('a', 'b') AND (doc->>'n')::int > 3;
+EXPLAIN (COSTS OFF) SELECT doc->>'s', doc->'o'->>'t', count(*) FROM xd GROUP BY 1, 2;
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT doc->>'s') FROM xd WHERE c = 1;
+EXPLAIN (COSTS OFF) SELECT doc->>'s', upper(doc->>'s'), count(*) FROM xd GROUP BY 1, 2;
+
+-- a generic plan's parameter
+PREPARE xp(text) AS SELECT count(*) FROM xd WHERE doc->>'s' = $1;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE xp('a');
+EXECUTE xp('a');
+EXECUTE xp('zz');
+SELECT count(*) FROM xd WHERE doc->>'s' = 'a';
+RESET plan_cache_mode;
+DEALLOCATE xp;
+
+-- declined, and answered by the ordinary plan: an expression the index does
+-- not hold (another collation, another field), a partial expression index, a
+-- multi-key opclass over an expression, and a partitioned table
+EXPLAIN (COSTS OFF) SELECT count(*) FROM xd WHERE doc->>'zz' = 'a';
+SELECT xq_planned($$SELECT (doc->>'s') COLLATE "C", count(*) FROM xd GROUP BY 1$$) AS other_collation;
+CREATE TABLE xpart (id int, doc jsonb);
+INSERT INTO xpart SELECT id, doc FROM xd;
+CREATE INDEX xpart_s ON xpart USING lion ((doc->>'s')) WHERE id > 100;
+CREATE INDEX xpart_v ON xpart USING lion ((to_tsvector('simple', coalesce(doc->>'s', ''))));
+VACUUM ANALYZE xpart;
+SELECT xq_planned($$SELECT count(*) FROM xpart WHERE doc->>'s' = 'a' AND id > 100$$) AS partial_index;
+SELECT xq_planned($$SELECT count(*) FROM xpart WHERE to_tsvector('simple', coalesce(doc->>'s', '')) @@ 'a'$$) AS multikey;
+SELECT xq_rows($$SELECT count(*) FROM xpart WHERE to_tsvector('simple', coalesce(doc->>'s', '')) @@ 'a'$$, true) =
+	   xq_rows($$SELECT count(*) FROM xpart WHERE to_tsvector('simple', coalesce(doc->>'s', '')) @@ 'a'$$, false) AS multikey_same;
+CREATE TABLE xpt (id int, doc jsonb) PARTITION BY RANGE (id);
+CREATE TABLE xpt1 PARTITION OF xpt FOR VALUES FROM (0) TO (3000);
+CREATE TABLE xpt2 PARTITION OF xpt FOR VALUES FROM (3000) TO (10000);
+INSERT INTO xpt SELECT id, doc FROM xd;
+CREATE INDEX ON xpt USING lion ((doc->>'s'));
+VACUUM ANALYZE xpt;
+SELECT xq_planned($$SELECT doc->>'s', count(*) FROM xpt GROUP BY 1$$) AS partitioned;
+SELECT xq_rows($$SELECT doc->>'s', count(*) FROM xpt GROUP BY 1$$, true) =
+	   xq_rows($$SELECT doc->>'s', count(*) FROM xpt GROUP BY 1$$, false) AS partitioned_same;
+
+-- EXECUTE on a function of the expression (DESIGN.md §9, "Privileges"): the
+-- ordinary plan calls it in its scan, for the WHERE clause and for a grouped
+-- expression alike, so the node asks for it too
+CREATE FUNCTION xd_bucket(int) RETURNS int IMMUTABLE LANGUAGE plpgsql
+	AS 'BEGIN RETURN $1 % 3; END';
+CREATE INDEX xd_b ON xd USING lion (xd_bucket(c));
+ANALYZE xd;
+SELECT xq_planned('SELECT count(*) FROM xd WHERE xd_bucket(c) = 1') AS where_planned,
+	   xq_planned('SELECT xd_bucket(c), count(*) FROM xd GROUP BY 1') AS group_planned;
+CREATE ROLE lion_xd_no;
+GRANT SELECT ON xd TO lion_xd_no;
+REVOKE EXECUTE ON FUNCTION xd_bucket(int) FROM PUBLIC;
+SET ROLE lion_xd_no;
+SELECT count(*) FROM xd WHERE xd_bucket(c) = 1;
+SELECT xd_bucket(c), count(*) FROM xd GROUP BY 1;
+SET pg_lion.enable_count_pushdown = off;
+SELECT xd_bucket(c), count(*) FROM xd GROUP BY 1;
+RESET pg_lion.enable_count_pushdown;
+RESET ROLE;
+SELECT xd_bucket(c), count(*) FROM xd GROUP BY 1 ORDER BY 1;
+GRANT EXECUTE ON FUNCTION xd_bucket(int) TO PUBLIC;
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+DROP TABLE xd, xq, xpart, xpt;
+DROP FUNCTION xq_rows(text, boolean);
+DROP FUNCTION xq_planned(text);
+DROP FUNCTION xd_bucket(int);
+DROP ROLE lion_xd_no;
