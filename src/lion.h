@@ -1545,6 +1545,35 @@ extern Buffer lion_dir_search(Relation index, Relation heaprel,
 							 int lockmode, bool forwrite, OffsetNumber *offp);
 
 /*
+ * The level-1 page a read-only descent took its leaf's downlink from, for a
+ * caller that looks keys up in their order (lion_lookup_walk_find()): its
+ * block, and a copy of its high key as it was then - in hikey, which the
+ * caller allocates at MAXALIGN(LION_ENTRY_HDRSZ + LION_MAX_KEY_SIZE) - or
+ * that it was the rightmost page of its level.  blk is InvalidBlockNumber
+ * when there is none: a directory of one level, or a high key that did not
+ * look like one.
+ */
+typedef struct LionDirParent
+{
+	BlockNumber blk;
+	bool		rightmost;
+	Size		hikeylen;
+	LionEntryTuple *hikey;
+} LionDirParent;
+
+/*
+ * lion_dir_search() for a reader, BUFFER_LOCK_SHARE, that records the level-1
+ * page it went through in *parent - and starts there, instead of at the root,
+ * when parent->blk is valid.  The caller vouches that sk does not sort below
+ * any key that page had when it was recorded: a page's lower bound never
+ * moves, so sk's leaf is below it or below a page to its right, which the
+ * descent moves right to as it always does.
+ */
+extern Buffer lion_dir_search_from(Relation index, LionIndexState *ix,
+								   const LionSearchKey *sk,
+								   LionDirParent *parent, OffsetNumber *offp);
+
+/*
  * The same, handing back the first ITEM at or after sk instead: the leaf is
  * the one that item is on, stepping right from the landing leaf when sk sorts
  * after everything on it.
