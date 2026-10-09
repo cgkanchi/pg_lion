@@ -454,8 +454,10 @@ scan_log "$SERVER_LOG" "$SLOG_START" primary
 	echo "== soak summary ($(date '+%F %T'))"
 	echo "mode: $MODE   preload: '$preload'   shared_buffers: $sbuf   duration: ${DURATION}s   seed: $SEED   standby: ${SB_PORT:-none}"
 	echo "rows now: soak.t $(psqlp -tAc 'select count(*) from soak.t'), soak.p $(psqlp -tAc 'select count(*) from soak.p')"
-	echo "writer transactions: $(grep -h 'number of transactions actually processed' "$OUT/writers.log" | awk '{s += $NF} END {print s + 0}')" \
-		"(failed: $(grep -h 'number of failed transactions' "$OUT/writers.log" | awk '{s += $5} END {print s + 0}'))"
+	# Match only pgbench's run totals: its per-script lines (" - number of
+	# transactions actually processed: N (tps = X)") end in the tps, not a count.
+	echo "writer transactions: $(grep -h '^number of transactions actually processed' "$OUT/writers.log" | awk '{s += $NF} END {print s + 0}')" \
+		"(failed: $(grep -h '^number of failed transactions' "$OUT/writers.log" | awk '{s += $5} END {print s + 0}'))"
 	echo "vacuums: $(grep -c VACUUM "$OUT/vacuum.log")   verify passes: $(cat "$OUT"/verify-*.log 2>/dev/null | grep -c '== ')"
 	# narrow_containers is a column only builds with NARROW containers have
 	echo "containers at the end (table: array bitset run narrow):"
