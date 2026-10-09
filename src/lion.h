@@ -1091,8 +1091,8 @@ lion_index_row_column(const LionIndexState *ix)
  * opclass has; 2 .. 5 belong to the multi-key classes; 6 .. 9 are the range
  * comparisons of DESIGN.md §28, in btree's order, which an ORDERED scalar
  * class has beside its proc 4, and 10 is `<>` (§35), which it has beside
- * them: every entry but one, a range with a hole in it.  11 .. 14 are
- * jsonb_contains_ops' (DESIGN.md §42), which are multi-key too.
+ * them: every entry but one, a range with a hole in it.  11 .. 16 are
+ * jsonb_contains_ops' (DESIGN.md §42, §43), which are multi-key too.
  */
 #define LION_STRAT_EQUAL			1
 #define LION_STRAT_CONTAINS		2	/* anyarray @> anyarray */
@@ -1108,12 +1108,17 @@ lion_index_row_column(const LionIndexState *ix)
 #define LION_STRAT_JSONB_EXISTS	12	/* jsonb ? text */
 #define LION_STRAT_JSONB_EXISTS_ANY	13	/* jsonb ?| text[] */
 #define LION_STRAT_JSONB_EXISTS_ALL	14	/* jsonb ?& text[] */
-#define LION_NSTRATEGIES			14
+#define LION_STRAT_JSONPATH_EXISTS	15	/* jsonb @? jsonpath (§43) */
+#define LION_STRAT_JSONPATH_MATCH	16	/* jsonb @@ jsonpath */
+#define LION_NSTRATEGIES			16
 
 /* a multi-key strategy (§17) */
 #define LION_STRAT_IS_MULTI(s) \
 	(((s) >= LION_STRAT_CONTAINS && (s) <= LION_STRAT_MATCH) || \
-	 ((s) >= LION_STRAT_JSONB_CONTAINS && (s) <= LION_STRAT_JSONB_EXISTS_ALL))
+	 ((s) >= LION_STRAT_JSONB_CONTAINS && (s) <= LION_STRAT_JSONPATH_MATCH))
+/* a jsonpath one, which the keys only ever bound (§43) */
+#define LION_STRAT_IS_JSONPATH(s) \
+	((s) == LION_STRAT_JSONPATH_EXISTS || (s) == LION_STRAT_JSONPATH_MATCH)
 /* ... and one whose rows the posting sets can select: all but `<@` */
 #define LION_STRAT_IS_MULTI_SEARCH(s) \
 	(LION_STRAT_IS_MULTI(s) && (s) != LION_STRAT_CONTAINED)
@@ -1262,9 +1267,23 @@ extern void lion_extract_query(LionState *state, Datum query,
  * exists, and LION_QMODE_ALL where none does.  keys[] then holds only the
  * keys the tree names.  A query lion_extract_query() answers exactly comes
  * back the same here.
+ *
+ * A jsonpath query (§43) names PREFIXES of keys.  With index, the executor's
+ * call, each is replaced by the OR of the index's keys that start with it.
+ * Without one, at plan time, each stands for that OR as one key and must
+ * never be looked up.
  */
-extern void lion_extract_query_superset(LionState *state, Datum query,
-									   StrategyNumber strategy, LionQuery *q);
+extern void lion_extract_query_superset(LionState *state, Relation index,
+									   Datum query, StrategyNumber strategy,
+									   LionQuery *q);
+
+/* Key tree nodes, for an extractQuery of lion's own that builds its tree. */
+extern LionKeyNode *lion_keynode_leaf(int keyno);
+extern LionKeyNode *lion_keynode_op(LionKeyNodeKind kind, LionKeyNode **args,
+									int nargs);
+
+/* jsonb_contains_ops' extractQuery (lion_jsonb.c), which hands over a tree */
+extern Datum lion_jsonb_extract_query(PG_FUNCTION_ARGS);
 extern bool lion_tsquery_item_keys(LionState *state, Datum query,
 								   StrategyNumber strategy, Datum **itemkeys);
 

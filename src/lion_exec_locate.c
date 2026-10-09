@@ -339,9 +339,17 @@ lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 		cl->xval = lion_tsquery_expand_prefixes(cl->idx, istate, cl->val,
 												&expanded);
 
+	/*
+	 * A jsonpath is only ever a superset, over key prefixes the extraction
+	 * expands, and a prefix too common to expand is every row (DESIGN.md
+	 * §43): the planner took it only where a recheck is allowed.
+	 */
+	if (LION_STRAT_IS_JSONPATH(strategy))
+		expanded = false;
+
 	if (cl->con == NULL || !expanded)
 	{
-		lion_extract_query_superset(istate, cl->xval, strategy, &q);
+		lion_extract_query_superset(istate, cl->idx, cl->xval, strategy, &q);
 		cl->qmode = q.mode;
 		if (q.mode != LION_QMODE_KEYS && q.mode != LION_QMODE_LOSSY)
 		{
@@ -364,7 +372,7 @@ lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 		 */
 		if (q.mode != LION_QMODE_KEYS)
 		{
-			lion_extract_query_superset(istate, cl->xval, strategy, &q);
+			lion_extract_query_superset(istate, cl->idx, cl->xval, strategy, &q);
 			if (q.mode != LION_QMODE_LOSSY)
 				elog(ERROR, "roaring count: query for index \"%s\" is no longer exact",
 					 RelationGetRelationName(cl->idx));

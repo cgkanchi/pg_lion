@@ -1,8 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * lion_jsonb.c
- *		jsonb_contains_ops: path keys for jsonb `@>`, `?`, `?|` and `?&`
- *		(DESIGN.md §42).
+ *		jsonb_contains_ops: path keys for jsonb `@>`, `?`, `?|`, `?&`, and jsonpath
+ *		`@?` and `@@` (DESIGN.md §42, §43).
  *
  * The operator class indexes a jsonb document under these keys, each a bytea
  * that starts with a tag byte:
@@ -41,6 +41,13 @@
  * skipped as PostgreSQL skips them.  `?& '{}'` is true for every document,
  * which no key says, so it asks for every row (GIN_SEARCH_MODE_ALL).
  *
+ * `@?` and `@@` with a jsonpath (DESIGN.md §43) are always a superset and
+ * rechecked.  The query is a tree of AND and OR over key PREFIXES, which the
+ * executor expands into the index's keys (lion_extract_query_superset()):
+ * `path == scalar` is the leaf keys that start with the path and the value,
+ * at any array levels, and a path that must exist is the leaf and container
+ * keys under it.  See lion_jp_bool() for what is taken apart.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -55,6 +62,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/jsonb.h"
+#include "utils/jsonpath.h"
 #include "utils/numeric.h"
 #include "varatt.h"
 
@@ -450,6 +458,468 @@ lion_jsonb_unique(LionJsonbKeys *out)
 	out->nkeys = n;
 }
 
+/* ---------------------------------------------------------------------
+ * jsonpath (DESIGN.md §43)
+ * --------------------------------------------------------------------- */
+
+/* One object key name of a jsonpath's path, and the names before it. */
+typedef struct LionJpName
+{
+	const char *name;
+	int			len;
+	struct LionJpName *up;
+} LionJpName;
+
+/*
+ * Where the items a jsonpath accessor chain yields are in the document.
+ *
+ *	indoc	false: they are not the document's (a variable, a literal, an
+ *			arithmetic result), and say nothing about it.
+ *	names	the object key names from the root, the last one first.  Array
+ *			accessors add none: array levels are not part of a key's names.
+ *	cut		an accessor the names cannot follow (`.*`, `.**`, an item
+ *			method) came after them: the items lie at or below them, and
+ *			once there is an item at all, something of the document is.
+ */
+typedef struct LionJpPath
+{
+	bool		indoc;
+	bool		cut;
+	int			nnames;
+	LionJpName *last;
+} LionJpPath;
+
+typedef struct LionJpCxt
+{
+	LionJsonbKeys out;			/* the prefixes, unique */
+	StringInfoData buf;
+	int			hashed;			/* the 'H' prefix's key number, or -1 */
+} LionJpCxt;
+
+static LionKeyNode *lion_jp_bool(LionJpCxt *cx, LionJpPath path,
+								 JsonPathItem *jsp, bool not);
+
+/* The key number of prefix buf, added when it is new. */
+static int
+lion_jp_key(LionJpCxt *cx, const StringInfoData *buf)
+{
+	bytea	   *key;
+	int			i;
+
+	for (i = 0; i < cx->out.nkeys; i++)
+	{
+		bytea	   *k = (bytea *) DatumGetPointer(cx->out.keys[i]);
+
+		if ((int) (VARSIZE(k) - VARHDRSZ) == buf->len &&
+			memcmp(VARDATA(k), buf->data, buf->len) == 0)
+			return i;
+	}
+
+	key = (bytea *) palloc(VARHDRSZ + buf->len);
+	SET_VARSIZE(key, VARHDRSZ + buf->len);
+	memcpy(VARDATA(key), buf->data, buf->len);
+	if (cx->out.nkeys >= cx->out.maxkeys)
+	{
+		cx->out.maxkeys = cx->out.maxkeys * 2 + 16;
+		cx->out.keys = cx->out.keys == NULL ?
+			(Datum *) palloc(sizeof(Datum) * cx->out.maxkeys) :
+			(Datum *) repalloc(cx->out.keys, sizeof(Datum) * cx->out.maxkeys);
+	}
+	cx->out.keys[cx->out.nkeys] = PointerGetDatum(key);
+	return cx->out.nkeys++;
+}
+
+/* A tag byte and the path's names, with no ENDPATH: the start of a prefix. */
+static void
+lion_jp_put_names(StringInfo buf, char tag, const LionJpPath *path)
+{
+	LionJpName **names;
+	LionJpName *n;
+	int			i = path->nnames;
+
+	resetStringInfo(buf);
+	appendStringInfoChar(buf, tag);
+	names = (LionJpName **) palloc(sizeof(LionJpName *) * Max(i, 1));
+	for (n = path->last; n != NULL; n = n->up)
+		names[--i] = n;
+	for (i = 0; i < path->nnames; i++)
+	{
+		appendStringInfoChar(buf, LION_JK_STEP);
+		lion_jsonb_put_bytes(buf, names[i]->name, names[i]->len);
+	}
+	pfree(names);
+}
+
+/*
+ * The prefix in cx->buf as a leaf; or, when a key starting with it can be
+ * long enough to be stored hashed, that leaf OR every hashed key: a hash
+ * keeps no prefix of what it hashed.  maxtail is the most bytes such a key
+ * can have past the prefix, or -1 for no limit.
+ */
+static LionKeyNode *
+lion_jp_prefix(LionJpCxt *cx, int maxtail)
+{
+	LionKeyNode **args;
+	StringInfoData h;
+
+	if (maxtail >= 0 && VARHDRSZ + cx->buf.len + maxtail <= LION_MAX_KEY_SIZE)
+		return lion_keynode_leaf(lion_jp_key(cx, &cx->buf));
+
+	if (cx->hashed < 0)
+	{
+		initStringInfo(&h);
+		appendStringInfoChar(&h, LION_JK_HASHED);
+		cx->hashed = lion_jp_key(cx, &h);
+		pfree(h.data);
+	}
+	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * 2);
+	args[0] = lion_keynode_leaf(lion_jp_key(cx, &cx->buf));
+	args[1] = lion_keynode_leaf(cx->hashed);
+	return lion_keynode_op(LION_KN_OR, args, 2);
+}
+
+/*
+ * Something of the document at or below the path's names: a leaf or a
+ * container key under them.  NULL (no constraint) when there are no names,
+ * which every document has something under.
+ */
+static LionKeyNode *
+lion_jp_exists(LionJpCxt *cx, const LionJpPath *path)
+{
+	LionKeyNode **args;
+
+	if (!path->indoc || path->nnames == 0)
+		return NULL;
+	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * 2);
+	lion_jp_put_names(&cx->buf, LION_JK_LEAF, path);
+	args[0] = lion_jp_prefix(cx, -1);
+	lion_jp_put_names(&cx->buf, LION_JK_CONTAINER, path);
+	args[1] = lion_jp_prefix(cx, -1);
+	return lion_keynode_op(LION_KN_OR, args, 2);
+}
+
+/*
+ * A scalar equal to v at the path: its leaf keys, which hold the names, the
+ * value, and then one array-level count per name and one more - at most
+ * five bytes each.  A cut path only says something is under its names.
+ */
+static LionKeyNode *
+lion_jp_equals(LionJpCxt *cx, const LionJpPath *path, const JsonbValue *v)
+{
+	if (!path->indoc)
+		return NULL;
+	if (path->cut)
+		return lion_jp_exists(cx, path);
+	lion_jp_put_names(&cx->buf, LION_JK_LEAF, path);
+	appendStringInfoChar(&cx->buf, LION_JK_ENDPATH);
+	lion_jsonb_put_scalar(&cx->buf, v);
+	return lion_jp_prefix(cx, 5 * (path->nnames + 1));
+}
+
+/* The AND of a list of nodes, or NULL for none. */
+static LionKeyNode *
+lion_jp_and(List *nodes)
+{
+	LionKeyNode **args;
+	ListCell   *lc;
+	int			n = 0;
+
+	if (nodes == NIL)
+		return NULL;
+	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * list_length(nodes));
+	foreach(lc, nodes)
+		args[n++] = (LionKeyNode *) lfirst(lc);
+	return lion_keynode_op(LION_KN_AND, args, n);
+}
+
+/*
+ * Follow an accessor chain from jsp, starting at path (the filter's current
+ * item `@`, or nowhere), into *end; add to *nodes what its filters require.
+ * Those hold whenever the chain yields an item: a filter passes only items
+ * it is true for.
+ */
+static void
+lion_jp_chain(LionJpCxt *cx, LionJpPath path, JsonPathItem *jsp,
+			  LionJpPath *end, List **nodes)
+{
+	JsonPathItem next;
+	bool		first = true;
+
+	check_stack_depth();
+
+	for (;;)
+	{
+		switch (jsp->type)
+		{
+			case jpiRoot:
+				path.indoc = first;
+				path.cut = false;
+				path.nnames = 0;
+				path.last = NULL;
+				break;
+
+			case jpiCurrent:
+				if (!first)
+					path.indoc = false;
+				break;
+
+			case jpiKey:
+				if (!path.cut)
+				{
+					LionJpName *n = (LionJpName *) palloc(sizeof(LionJpName));
+
+					n->name = jspGetString(jsp, &n->len);
+					n->up = path.last;
+					path.last = n;
+					path.nnames++;
+				}
+				break;
+
+			case jpiAnyArray:
+			case jpiIndexArray:
+				/* array levels are not in the names; lax treats a non-array
+				 * as an array of one */
+				break;
+
+			case jpiFilter:
+				{
+					JsonPathItem arg;
+					LionKeyNode *f;
+
+					jspGetArg(jsp, &arg);
+					f = lion_jp_bool(cx, path, &arg, false);
+					if (f != NULL)
+						*nodes = lappend(*nodes, f);
+					break;
+				}
+
+			default:
+
+				/*
+				 * Anything else at the start - a variable, a literal, an
+				 * arithmetic or boolean expression - yields items that are
+				 * not the document's.  Further along - `.*`, `.**`, an item
+				 * method - it takes an item and yields items the names
+				 * cannot follow.
+				 */
+				if (first)
+					path.indoc = false;
+				else
+					path.cut = true;
+				break;
+		}
+
+		if (!path.indoc)
+			break;
+		first = false;
+		if (!jspGetNext(jsp, &next))
+			break;
+		jsp = &next;
+	}
+
+	*end = path;
+}
+
+/* What `exists (chain)` requires: its filters, and something at its end. */
+static LionKeyNode *
+lion_jp_exists_chain(LionJpCxt *cx, LionJpPath path, JsonPathItem *jsp)
+{
+	List	   *nodes = NIL;
+	LionJpPath end;
+	LionKeyNode *e;
+
+	lion_jp_chain(cx, path, jsp, &end, &nodes);
+	e = lion_jp_exists(cx, &end);
+	if (e != NULL)
+		nodes = lappend(nodes, e);
+	return lion_jp_and(nodes);
+}
+
+/* A jsonpath scalar literal as a JsonbValue. */
+static void
+lion_jp_scalar(JsonPathItem *jsp, JsonbValue *v)
+{
+	switch (jsp->type)
+	{
+		case jpiNull:
+			v->type = jbvNull;
+			break;
+		case jpiBool:
+			v->type = jbvBool;
+			v->val.boolean = jspGetBool(jsp);
+			break;
+		case jpiNumeric:
+			v->type = jbvNumeric;
+			v->val.numeric = jspGetNumeric(jsp);
+			break;
+		case jpiString:
+			v->type = jbvString;
+			v->val.string.val = jspGetString(jsp, &v->val.string.len);
+			break;
+		default:
+			elog(ERROR, "unexpected jsonpath scalar type %d", (int) jsp->type);
+	}
+}
+
+/*
+ * What a comparison or a string predicate being true requires.  It is true
+ * only for some item of each operand, so each operand that is a chain yields
+ * one: its filters hold, and something is at its end.  `chain == scalar`,
+ * which jsonpath answers with byte-equal strings and equal numbers - what the
+ * leaf keys store - is the leaf keys of that value.
+ */
+static LionKeyNode *
+lion_jp_compare(LionJpCxt *cx, LionJpPath path, JsonPathItem *jsp)
+{
+	JsonPathItem ops[2];
+	int			nops = 2;
+	List	   *nodes = NIL;
+	int			i;
+
+	if (jsp->type == jpiLikeRegex)
+	{
+		jspInitByBuffer(&ops[0], jsp->base, jsp->content.like_regex.expr);
+		nops = 1;
+	}
+	else
+	{
+		jspGetLeftArg(jsp, &ops[0]);
+		jspGetRightArg(jsp, &ops[1]);
+	}
+
+	for (i = 0; i < nops; i++)
+	{
+		JsonPathItem *other = nops == 2 ? &ops[1 - i] : NULL;
+		LionJpPath end;
+		LionKeyNode *n;
+
+		if (jspIsScalar(ops[i].type))
+			continue;
+		lion_jp_chain(cx, path, &ops[i], &end, &nodes);
+		if (jsp->type == jpiEqual && other != NULL &&
+			jspIsScalar(other->type))
+		{
+			JsonbValue	v;
+
+			lion_jp_scalar(other, &v);
+			n = lion_jp_equals(cx, &end, &v);
+		}
+		else
+			n = lion_jp_exists(cx, &end);
+		if (n != NULL)
+			nodes = lappend(nodes, n);
+	}
+	return lion_jp_and(nodes);
+}
+
+/*
+ * A tree that selects at least the documents for which the jsonpath
+ * predicate jsp is true (not false: is false), or NULL when no tree narrower
+ * than every document does.  path is what `@` stands for.
+ *
+ * What is taken apart, as GIN's jsonb_ops does, and a little more:
+ *
+ *	- `a && b`, `a || b`, `!a`: the AND or OR of the parts, with NOT pushed
+ *	  down to the leaves; an AND keeps the parts that narrow, an OR needs
+ *	  both.  Which of the two an operator is under a NOT is decided by the
+ *	  NOT too: `!(a && b)` is an OR.
+ *	- `exists (chain)`, and a comparison, `starts with` or `like_regex`
+ *	  (lion_jp_compare()): never under a NOT, where `$.a != 1` being false
+ *	  includes $.a being absent.
+ *	- `is unknown` and anything else: no tree.
+ */
+static LionKeyNode *
+lion_jp_bool(LionJpCxt *cx, LionJpPath path, JsonPathItem *jsp, bool not)
+{
+	check_stack_depth();
+
+	switch (jsp->type)
+	{
+		case jpiAnd:
+		case jpiOr:
+			{
+				JsonPathItem arg;
+				LionKeyNode *l;
+				LionKeyNode *r;
+				LionKeyNode **args;
+				bool		isand = (jsp->type == jpiAnd) != not;
+
+				jspGetLeftArg(jsp, &arg);
+				l = lion_jp_bool(cx, path, &arg, not);
+				jspGetRightArg(jsp, &arg);
+				r = lion_jp_bool(cx, path, &arg, not);
+				if (l == NULL || r == NULL)
+					return isand ? (l != NULL ? l : r) : NULL;
+				args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * 2);
+				args[0] = l;
+				args[1] = r;
+				return lion_keynode_op(isand ? LION_KN_AND : LION_KN_OR, args, 2);
+			}
+
+		case jpiNot:
+			{
+				JsonPathItem arg;
+
+				jspGetArg(jsp, &arg);
+				return lion_jp_bool(cx, path, &arg, !not);
+			}
+
+		case jpiExists:
+			{
+				JsonPathItem arg;
+
+				if (not)
+					return NULL;
+				jspGetArg(jsp, &arg);
+				return lion_jp_exists_chain(cx, path, &arg);
+			}
+
+		case jpiEqual:
+		case jpiNotEqual:
+		case jpiLess:
+		case jpiGreater:
+		case jpiLessOrEqual:
+		case jpiGreaterOrEqual:
+		case jpiStartsWith:
+		case jpiLikeRegex:
+			if (not)
+				return NULL;
+			return lion_jp_compare(cx, path, jsp);
+
+		default:
+			return NULL;
+	}
+}
+
+/*
+ * The jsonpath query: keys (all prefixes) and the tree over them, or false
+ * when nothing narrower than every document can be said.  `doc @? path` is
+ * `doc @@ exists (path)`.
+ */
+static bool
+lion_jp_query(JsonPath *jp, StrategyNumber strategy, LionJsonbKeys *out,
+			  LionKeyNode **tree)
+{
+	LionJpCxt	cx;
+	LionJpPath path;
+	JsonPathItem root;
+
+	memset(&cx, 0, sizeof(cx));
+	cx.hashed = -1;
+	initStringInfo(&cx.buf);
+	memset(&path, 0, sizeof(path));
+
+	jspInit(&root, jp);
+	if (strategy == LION_STRAT_JSONPATH_EXISTS)
+		*tree = lion_jp_exists_chain(&cx, path, &root);
+	else
+		*tree = lion_jp_bool(&cx, path, &root, false);
+
+	pfree(cx.buf.data);
+	*out = cx.out;
+	return *tree != NULL;
+}
+
 PG_FUNCTION_INFO_V1(lion_jsonb_extract_value);
 
 /*
@@ -543,6 +1013,36 @@ lion_jsonb_extract_query(PG_FUNCTION_ARGS)
 				if (out.nkeys == 0 && strategy == LION_STRAT_JSONB_EXISTS_ALL)
 					*searchMode = GIN_SEARCH_MODE_ALL;
 				break;
+			}
+
+		case LION_STRAT_JSONPATH_EXISTS:
+		case LION_STRAT_JSONPATH_MATCH:
+			{
+				bool	  **pmatch = (bool **) PG_GETARG_POINTER(3);
+				Pointer   **extra_data = (Pointer **) PG_GETARG_POINTER(4);
+				LionKeyNode *tree;
+				int			i;
+
+				/*
+				 * The tree goes to lion_extract_query_superset() in
+				 * extra_data[0]; every key is a prefix (pmatch), and every
+				 * answer is rechecked.
+				 */
+				if (!lion_jp_query(PG_GETARG_JSONPATH_P(0), strategy, &out,
+								   &tree))
+				{
+					*nentries = 0;
+					*searchMode = GIN_SEARCH_MODE_ALL;
+					PG_RETURN_POINTER(NULL);
+				}
+				*pmatch = (bool *) palloc(sizeof(bool) * out.nkeys);
+				for (i = 0; i < out.nkeys; i++)
+					(*pmatch)[i] = true;
+				*extra_data = (Pointer *) palloc0(sizeof(Pointer) * out.nkeys);
+				(*extra_data)[0] = (Pointer) tree;
+				*searchMode = LION_SEARCH_MODE_LOSSY;
+				*nentries = out.nkeys;
+				PG_RETURN_POINTER(out.keys);
 			}
 
 		default:
