@@ -499,8 +499,9 @@ CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING lion AS
  * jsonb_contains_ops (lion_jsonb.c, DESIGN.md §42): a jsonb document under
  * one key per path to each of its scalars (with the scalar), per container,
  * and per top-level key, so that `@>`, `?`, `?|` and `?&` are answered from
- * the index.  Keys are bytea and compare bytewise.  Not the default: the
- * default jsonb_ops indexes whole documents for `=`.
+ * the index, and jsonpath `@?` and `@@` (§43) narrowed by it and rechecked.
+ * Keys are bytea and compare bytewise.  Not the default: the default
+ * jsonb_ops indexes whole documents for `=`.
  *
  *   CREATE INDEX ON docs USING lion (doc jsonb_contains_ops);
  */
@@ -514,6 +515,8 @@ SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS jsonb_contains_ops FOR T
 	OPERATOR	12	? (jsonb, text),
 	OPERATOR	13	?| (jsonb, text[]),
 	OPERATOR	14	?& (jsonb, text[]),
+	OPERATOR	15	@? (jsonb, jsonpath),
+	OPERATOR	16	@@ (jsonb, jsonpath),
 	FUNCTION	1	%s,
 	FUNCTION	4	byteacmp(bytea, bytea),
 	FUNCTION	2	lion_jsonb_extract_value(jsonb, internal, internal),

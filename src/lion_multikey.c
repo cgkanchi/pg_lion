@@ -104,6 +104,8 @@ lion_gin_strategy(StrategyNumber strategy)
 		case LION_STRAT_JSONB_EXISTS:
 		case LION_STRAT_JSONB_EXISTS_ANY:
 		case LION_STRAT_JSONB_EXISTS_ALL:
+		case LION_STRAT_JSONPATH_EXISTS:
+		case LION_STRAT_JSONPATH_MATCH:
 			return strategy;
 	}
 
@@ -116,7 +118,7 @@ lion_gin_strategy(StrategyNumber strategy)
  * Key trees
  * --------------------------------------------------------------------- */
 
-static LionKeyNode *
+LionKeyNode *
 lion_keynode_leaf(int keyno)
 {
 	LionKeyNode *n = (LionKeyNode *) palloc0(sizeof(LionKeyNode));
@@ -131,7 +133,7 @@ lion_keynode_leaf(int keyno)
  * one-child operator is folded away: the evaluator would handle it, but the
  * tree is easier to read in a debugger without it.
  */
-static LionKeyNode *
+LionKeyNode *
 lion_keynode_op(LionKeyNodeKind kind, LionKeyNode **args, int nargs)
 {
 	LionKeyNode *n;
@@ -615,6 +617,7 @@ typedef struct LionRawQuery
 	Datum	   *keys;
 	bool	   *pmatch;
 	bool	   *nulls;
+	Pointer    *extra_data;
 	int32		searchMode;
 } LionRawQuery;
 
@@ -622,8 +625,6 @@ static void
 lion_call_extractquery(LionState *state, Datum query, StrategyNumber strategy,
 					  LionRawQuery *raw)
 {
-	Pointer    *extra_data = NULL;
-
 	/*
 	 * Only a multi-key column's state has an extractQuery: a scalar one's is
 	 * left unset (lion_fill_state()), and calling through it would jump to
@@ -640,6 +641,7 @@ lion_call_extractquery(LionState *state, Datum query, StrategyNumber strategy,
 	raw->nkeys = 0;
 	raw->pmatch = NULL;
 	raw->nulls = NULL;
+	raw->extra_data = NULL;
 	raw->searchMode = GIN_SEARCH_MODE_DEFAULT;
 
 	raw->keys = (Datum *)
@@ -649,7 +651,7 @@ lion_call_extractquery(LionState *state, Datum query, StrategyNumber strategy,
 										  PointerGetDatum(&raw->nkeys),
 										  UInt16GetDatum(lion_gin_strategy(strategy)),
 										  PointerGetDatum(&raw->pmatch),
-										  PointerGetDatum(&extra_data),
+										  PointerGetDatum(&raw->extra_data),
 										  PointerGetDatum(&raw->nulls),
 										  PointerGetDatum(&raw->searchMode)));
 
@@ -905,11 +907,13 @@ lion_tsquery_superset(QueryItem *items, int32 size, int32 i, const int *map,
 /*
  * Renumber a tree's leaves onto the keys it names, in the order it first
  * names them, and keep only those: a superset may leave keys out - a partial
- * one, a NULL one - that must never be looked up.
+ * one, a NULL one - that must never be looked up.  topartial, when given,
+ * receives the pmatch flag of each key kept.
  */
 static void
 lion_superset_renumber(LionKeyNode *node, int *newno, const Datum *from,
-					   Datum *to, int *nto)
+					   const bool *frompartial, Datum *to, bool *topartial,
+					   int *nto)
 {
 	int			i;
 
@@ -918,13 +922,223 @@ lion_superset_renumber(LionKeyNode *node, int *newno, const Datum *from,
 		if (newno[node->keyno] < 0)
 		{
 			newno[node->keyno] = *nto;
+			if (topartial != NULL)
+				topartial[*nto] = frompartial != NULL &&
+					frompartial[node->keyno];
 			to[(*nto)++] = from[node->keyno];
 		}
 		node->keyno = newno[node->keyno];
 		return;
 	}
 	for (i = 0; i < node->nargs; i++)
-		lion_superset_renumber(node->args[i], newno, from, to, nto);
+		lion_superset_renumber(node->args[i], newno, from, frompartial, to,
+							   topartial, nto);
+}
+
+/*
+ * The tree a jsonpath extraction hands over in extra_data[0] (DESIGN.md §43),
+ * or NULL.  Only lion_jsonb_extract_query() builds one, so only from it is
+ * extra_data read as a LionKeyNode: GIN's own jsonb extractQuery leaves a
+ * tree of a different type there.  Its leaves name keys 0 .. nkeys-1; a key
+ * pmatch flags is a prefix (lion_query_expand()), and a NULL one is refused.
+ */
+static LionKeyNode *
+lion_jsonpath_tree(const LionState *state, const LionRawQuery *raw)
+{
+	int			i;
+
+	if (state->extractquery.fn_addr != lion_jsonb_extract_query ||
+		raw->extra_data == NULL || raw->extra_data[0] == NULL)
+		return NULL;
+	if (raw->nulls != NULL)
+	{
+		for (i = 0; i < raw->nkeys; i++)
+			if (raw->nulls[i])
+				return NULL;
+	}
+	return (LionKeyNode *) raw->extra_data[0];
+}
+
+/* ---------------------------------------------------------------------
+ * Prefix keys (DESIGN.md §43)
+ * --------------------------------------------------------------------- */
+
+/*
+ * A jsonpath superset names its keys by prefix: `$.a.b == 1` is every key
+ * that starts with the path a.b and the value 1, whatever array levels
+ * follow.  lion_query_expand() replaces each prefix leaf with the OR of the
+ * index's keys that start with it, read off the directory with
+ * lion_prefix_keys(), as lion_tsquery_expand_prefixes() does for `foo:*`, and
+ * on the same grounds: a key a visible row has was in the directory before
+ * this walk began.  A prefix no key starts with selects no row, and one with
+ * more keys than the query has room for is every row; the tree is folded
+ * around both.
+ */
+typedef struct LionExpand
+{
+	Relation	index;
+	LionState  *col;
+	const Datum *from;			/* the extraction's keys */
+	const bool *partial;		/* ... and which are prefixes */
+	int		   *first;			/* per key: its first key in to[], or -1 */
+	int		   *count;			/* ... how many, or -1 for every row */
+	Datum	   *to;
+	int			nto;
+	int			maxto;
+	int			budget;			/* keys to[] may still take */
+} LionExpand;
+
+typedef enum LionTruth
+{
+	LION_TRUTH_NODE = 0,		/* the node selects what it says */
+	LION_TRUTH_NONE,			/* no row */
+	LION_TRUTH_ALL				/* every row */
+} LionTruth;
+
+static void lion_expand_key(LionExpand *x, int k);
+static int	lion_prefix_keys(Relation index, LionState *col,
+							 const char *prefix, int plen, int max,
+							 Datum **keys);
+
+static LionKeyNode *
+lion_expand_node(LionExpand *x, LionKeyNode *node, LionTruth *truth)
+{
+	LionKeyNode **args;
+	int			nargs = 0;
+	int			i;
+
+	check_stack_depth();
+
+	*truth = LION_TRUTH_NODE;
+	if (node->kind == LION_KN_KEY)
+	{
+		int			k = node->keyno;
+
+		if (x->count[k] == -2)
+			lion_expand_key(x, k);
+		if (x->count[k] < 0)
+		{
+			*truth = LION_TRUTH_ALL;
+			return NULL;
+		}
+		if (x->count[k] == 0)
+		{
+			*truth = LION_TRUTH_NONE;
+			return NULL;
+		}
+		args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * x->count[k]);
+		for (i = 0; i < x->count[k]; i++)
+			args[i] = lion_keynode_leaf(x->first[k] + i);
+		return lion_keynode_op(LION_KN_OR, args, x->count[k]);
+	}
+
+	if (node->kind != LION_KN_AND && node->kind != LION_KN_OR)
+		elog(ERROR, "lion index: unexpected key tree node %d",
+			 (int) node->kind);
+
+	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * node->nargs);
+	for (i = 0; i < node->nargs; i++)
+	{
+		LionTruth	t;
+		LionKeyNode *child = lion_expand_node(x, node->args[i], &t);
+
+		if (t == LION_TRUTH_NODE)
+			args[nargs++] = child;
+		else if (node->kind == LION_KN_AND ?
+				 t == LION_TRUTH_NONE : t == LION_TRUTH_ALL)
+		{
+			/* a NONE operand decides an AND, an ALL one an OR */
+			*truth = t;
+			return NULL;
+		}
+		/* ... and the other kind leaves it out */
+	}
+	if (nargs == 0)
+	{
+		*truth = node->kind == LION_KN_AND ? LION_TRUTH_ALL : LION_TRUTH_NONE;
+		return NULL;
+	}
+	return lion_keynode_op(node->kind, args, nargs);
+}
+
+/* Look key k up: itself, or the run of keys it is a prefix of. */
+static void
+lion_expand_key(LionExpand *x, int k)
+{
+	Datum	   *run = NULL;
+	int			n;
+	int			i;
+
+	if (!x->partial[k])
+	{
+		run = (Datum *) palloc(sizeof(Datum));
+		run[0] = x->from[k];
+		n = 1;
+	}
+	else
+	{
+		struct varlena *p = (struct varlena *) DatumGetPointer(x->from[k]);
+
+		n = lion_prefix_keys(x->index, x->col, VARDATA_ANY(p),
+							 VARSIZE_ANY_EXHDR(p), x->budget, &run);
+	}
+	if (n < 0 || n > x->budget)
+	{
+		x->count[k] = -1;
+		return;
+	}
+	if (x->nto + n > x->maxto)
+	{
+		x->maxto = Max(x->maxto * 2, x->nto + n);
+		x->to = (Datum *) repalloc(x->to, sizeof(Datum) * x->maxto);
+	}
+	x->first[k] = x->nto;
+	x->count[k] = n;
+	for (i = 0; i < n; i++)
+		x->to[x->nto++] = run[i];
+	x->budget -= n;
+}
+
+/*
+ * Replace the prefix keys of q, a superset over keys[] whose partial[i] says
+ * keys[i] is a prefix, by the index's keys they stand for.  q comes back NONE,
+ * LOSSY over the keys found, or ALL.
+ */
+static void
+lion_query_expand(Relation index, LionState *col, LionQuery *q,
+				  const bool *partial)
+{
+	LionExpand	x;
+	LionTruth	truth;
+	LionKeyNode *tree;
+	int			i;
+
+	x.index = index;
+	x.col = col;
+	x.from = q->keys;
+	x.partial = partial;
+	x.first = (int *) palloc(sizeof(int) * q->nkeys);
+	x.count = (int *) palloc(sizeof(int) * q->nkeys);
+	for (i = 0; i < q->nkeys; i++)
+		x.count[i] = -2;		/* not looked up yet */
+	x.maxto = Max(q->nkeys, 16);
+	x.to = (Datum *) palloc(sizeof(Datum) * x.maxto);
+	x.nto = 0;
+	x.budget = LION_MAX_QUERY_KEYS;
+
+	tree = lion_expand_node(&x, q->tree, &truth);
+	if (truth == LION_TRUTH_NODE)
+	{
+		q->keys = x.to;
+		q->nkeys = x.nto;
+		q->tree = tree;
+		q->mode = LION_QMODE_LOSSY;
+		return;
+	}
+	q->keys = NULL;
+	q->nkeys = 0;
+	q->tree = NULL;
+	q->mode = truth == LION_TRUTH_NONE ? LION_QMODE_NONE : LION_QMODE_ALL;
 }
 
 /*
@@ -944,6 +1158,8 @@ lion_superset_renumber(LionKeyNode *node, int *newno, const Datum *from,
  *	- a tsquery is widened as lion_tsquery_superset() says;
  *	- keys extractQuery calls LION_SEARCH_MODE_LOSSY combine as they would
  *	  exactly, and select a superset;
+ *	- a jsonpath is the tree its extraction built over key prefixes (§43),
+ *	  each expanded into the keys it stands for when index is given;
  *	- INCLUDE_EMPTY and ALL, more keys than LION_MAX_QUERY_KEYS, `<@` and
  *	  anything else are every row, as they are for lion_extract_query().
  *
@@ -951,15 +1167,17 @@ lion_superset_renumber(LionKeyNode *node, int *newno, const Datum *from,
  * answers exactly comes back KEYS with the same keys, and needs no recheck.
  */
 void
-lion_extract_query_superset(LionState *state, Datum query,
+lion_extract_query_superset(LionState *state, Relation index, Datum query,
 						   StrategyNumber strategy, LionQuery *q)
 {
 	LionRawQuery raw;
 	LionKeyNode *tree = NULL;
 	bool		lossy = false;
 	bool		ok = true;
+	bool		prefixes = false;
 	int		   *newno;
 	Datum	   *keys;
+	bool	   *partial;
 	int			nkeys = 0;
 	int			i;
 
@@ -1044,6 +1262,13 @@ lion_extract_query_superset(LionState *state, Datum query,
 				break;
 			}
 
+		case LION_STRAT_JSONPATH_EXISTS:
+		case LION_STRAT_JSONPATH_MATCH:
+			tree = lion_jsonpath_tree(state, &raw);
+			lossy = true;
+			prefixes = raw.pmatch != NULL;
+			break;
+
 		default:
 			break;
 	}
@@ -1059,13 +1284,19 @@ lion_extract_query_superset(LionState *state, Datum query,
 	for (i = 0; i < raw.nkeys; i++)
 		newno[i] = -1;
 	keys = (Datum *) palloc(sizeof(Datum) * raw.nkeys);
-	lion_superset_renumber(tree, newno, raw.keys, keys, &nkeys);
+	partial = (bool *) palloc(sizeof(bool) * raw.nkeys);
+	lion_superset_renumber(tree, newno, raw.keys,
+						   prefixes ? raw.pmatch : NULL, keys, partial,
+						   &nkeys);
 	pfree(newno);
 
 	q->nkeys = nkeys;
 	q->keys = keys;
 	q->tree = tree;
 	q->mode = lossy ? LION_QMODE_LOSSY : LION_QMODE_KEYS;
+
+	if (prefixes && index != NULL)
+		lion_query_expand(index, state, q, partial);
 }
 
 /*
@@ -1326,12 +1557,12 @@ lion_qtn_or(QTNode **nodes, int n)
 }
 
 /*
- * The keys of a text column that start with prefix[0 .. plen), as text
- * Datums in *keys, from a walk of the directory from the prefix up: the
- * column is ordered by bttextcmp() under C (lion_state.c), which is byte
- * order, so they are one run and the first key past it ends the walk.
- * Returns the number found, or -1 once there are more than max of them, or
- * when the walk cannot be bounded by the prefix.
+ * The keys of a text or bytea column that start with prefix[0 .. plen), as
+ * Datums in *keys, from a walk of the directory from the prefix up: a text
+ * column is ordered by bttextcmp() under C (lion_state.c) and a bytea one by
+ * byteacmp(), both byte order, so they are one run and the first key past it
+ * ends the walk.  Returns the number found, or -1 once there are more than max
+ * of them, or when the walk cannot be bounded by the prefix.
  */
 static int
 lion_prefix_keys(Relation index, LionState *col, const char *prefix,
@@ -1342,11 +1573,25 @@ lion_prefix_keys(Relation index, LionState *col, const char *prefix,
 	int			n = 0;
 	int			cap = 16;
 
+	if (!col->ordered)
+		return -1;
 	lion_range_init(&range, index, (AttrNumber) col->attno);
-	/* the bound is a key of the column's own (text) type: InvalidOid says so */
-	lion_range_add(&range, index, LION_STRAT_GE, F_TEXT_GE, InvalidOid,
-				   PointerGetDatum(cstring_to_text_with_len(prefix, plen)),
-				   false, C_COLLATION_OID);
+	/* the bound is a key of the column's own type: InvalidOid says so */
+	if (col->typid == TEXTOID && col->collation == C_COLLATION_OID)
+		lion_range_add(&range, index, LION_STRAT_GE, F_TEXT_GE, InvalidOid,
+					   PointerGetDatum(cstring_to_text_with_len(prefix, plen)),
+					   false, C_COLLATION_OID);
+	else if (col->typid == BYTEAOID)
+	{
+		bytea	   *b = (bytea *) palloc(VARHDRSZ + plen);
+
+		SET_VARSIZE(b, VARHDRSZ + plen);
+		memcpy(VARDATA(b), prefix, plen);
+		lion_range_add(&range, index, LION_STRAT_GE, F_BYTEAGE, InvalidOid,
+					   PointerGetDatum(b), false, InvalidOid);
+	}
+	else
+		return -1;
 	if (!range.ordered)
 		return -1;
 
@@ -1356,7 +1601,7 @@ lion_prefix_keys(Relation index, LionState *col, const char *prefix,
 	{
 		Datum		key;
 		LionPostingSet ps;
-		text	   *t;
+		struct varlena *t;
 		bool		inside;
 
 		CHECK_FOR_INTERRUPTS();
@@ -1367,7 +1612,7 @@ lion_prefix_keys(Relation index, LionState *col, const char *prefix,
 			lion_posting_set_release(&ps);
 			continue;
 		}
-		t = DatumGetTextPP(key);
+		t = pg_detoast_datum_packed((struct varlena *) DatumGetPointer(key));
 		inside = (int) VARSIZE_ANY_EXHDR(t) >= plen &&
 			memcmp(VARDATA_ANY(t), prefix, plen) == 0;
 		lion_posting_set_release(&ps);

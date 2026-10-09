@@ -123,7 +123,7 @@ lion_query_is_full_scan(IndexOptInfo *index, int col, StrategyNumber strategy,
 	 */
 	if (strategy == LION_STRAT_MATCH)
 		query = lion_tsquery_strip_prefixes(query);	/* §17, "Prefix lexemes" */
-	lion_extract_query_superset(&state, query, strategy, &q);
+	lion_extract_query_superset(&state, NULL, query, strategy, &q);
 	full = (q.mode == LION_QMODE_ALL);
 
 	MemoryContextSwitchTo(oldcxt);
