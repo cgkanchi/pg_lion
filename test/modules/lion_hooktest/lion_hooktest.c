@@ -337,6 +337,16 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 		lfirst(list_nth_cell(priv, LION_PRIV_PARTS)) =
 			list_make1(list_make3_oid(RelationRelationId, InvalidOid,
 									  InvalidOid));
+	else if (strcmp(variant, "expression column") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_INTS)) =
+			list_make5_int(1, 0, 0, 0, LION_VCOL_ATTNO(0));
+	else if (strcmp(variant, "bare expression column") == 0)
+	{
+		lfirst(list_nth_cell(priv, LION_PRIV_INTS)) =
+			list_make5_int(1, 0, 0, 0, LION_VCOL_ATTNO(0));
+		lfirst(list_nth_cell(priv, LION_PRIV_VCOLS)) =
+			list_make1(makeVar(1, Anum_pg_class_oid, OIDOID, -1, InvalidOid, 0));
+	}
 	else if (strcmp(variant, "path wagg at plan") == 0)
 		lfirst(list_nth_cell(priv, LION_PRIV_WAGG)) =
 			list_make3(list_make1_int(1), list_make1_oid(ClassOidIndexId),

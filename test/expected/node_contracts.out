@@ -34,6 +34,10 @@ CREATE INDEX nc_k ON nc USING lion (k);
 CREATE INDEX nc_j ON nc USING lion (j);
 CREATE INDEX nc_d ON nc USING lion (d) WITH (store_positions = true);
 CREATE INDEX nc_o ON nc (o) INCLUDE (id);
+-- an expression column (DESIGN.md §41) over a function nothing inlines
+CREATE FUNCTION nc_bucket(int) RETURNS int IMMUTABLE LANGUAGE plpgsql
+	AS 'BEGIN RETURN $1 % 4; END';
+CREATE INDEX nc_b ON nc USING lion (nc_bucket(j));
 -- a dimension on nc.k, three of whose keys have no fact row
 CREATE TABLE ncd (pk int PRIMARY KEY, name text NOT NULL);
 INSERT INTO ncd SELECT i, 'n' || (i % 2) FROM generate_series(0, 12) i;
@@ -48,6 +52,10 @@ INSERT INTO nc_nodes VALUES
 	 'SELECT count(*) FROM nc WHERE k = 3', 'int4eq(int4,int4)', ''),
 	('LionCount, its aggregate',
 	 'SELECT count(*) FROM nc WHERE k = 3', 'count()', ''),
+	('LionCount, an expression column filtered',
+	 'SELECT count(*) FROM nc WHERE nc_bucket(j) = 1', 'nc_bucket(int4)', ''),
+	('LionCount, an expression column grouped',
+	 'SELECT nc_bucket(j), count(*) FROM nc GROUP BY 1', 'nc_bucket(int4)', ''),
 	('LionJoinAgg',
 	 'SELECT count(DISTINCT d.name), count(*) FROM nc JOIN ncd d ON d.pk = nc.k WHERE nc.j = 3',
 	 'int4eq(int4,int4)', ''),
@@ -204,65 +212,79 @@ BEGIN
 	EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO PUBLIC', n.fn);
 END $$;
 SELECT node, nc_check(node) FROM nc_nodes ORDER BY node;
-           node           |                                                                                   nc_check                                                                                   
---------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- LionAntiJoin             | plan: planned
- LionAntiJoin             | every privilege: the ordinary plan's answer
- LionAntiJoin             | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
- LionAntiJoin             | plain EXPLAIN: as the ordinary plan
- LionAntiJoin             | granted to the role: the answer
- LionAntiJoin             | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
- LionAntiJoin             | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
- LionBm25                 | plan: planned
- LionBm25                 | every privilege: the ordinary plan's answer
- LionBm25                 | without EXECUTE on lion_bm25_score(tsvector,tsquery,regclass,double precision,double precision): ERROR: permission denied for function lion_bm25_score, as the ordinary plan
- LionBm25                 | plain EXPLAIN: as the ordinary plan
- LionBm25                 | granted to the role: the answer
- LionBm25                 | a cached plan (planned, the answer) without it: ERROR: permission denied for function lion_bm25_score
- LionBm25                 | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function lion_bm25_score
- LionBtreeScan            | plan: planned
- LionBtreeScan            | every privilege: the ordinary plan's answer
- LionBtreeScan            | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
- LionBtreeScan            | plain EXPLAIN: as the ordinary plan
- LionBtreeScan            | granted to the role: the answer
- LionBtreeScan            | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
- LionBtreeScan            | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
- LionCount                | plan: planned
- LionCount                | every privilege: the ordinary plan's answer
- LionCount                | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
- LionCount                | plain EXPLAIN: as the ordinary plan
- LionCount                | granted to the role: the answer
- LionCount                | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
- LionCount                | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
- LionCount, its aggregate | plan: planned
- LionCount, its aggregate | every privilege: the ordinary plan's answer
- LionCount, its aggregate | without EXECUTE on count(): ERROR: permission denied for aggregate count, as the ordinary plan
- LionCount, its aggregate | plain EXPLAIN: as the ordinary plan
- LionCount, its aggregate | granted to the role: the answer
- LionCount, its aggregate | a cached plan (planned, the answer) without it: ERROR: permission denied for aggregate count
- LionCount, its aggregate | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for aggregate count
- LionJoinAgg              | plan: planned
- LionJoinAgg              | every privilege: the ordinary plan's answer
- LionJoinAgg              | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
- LionJoinAgg              | plain EXPLAIN: as the ordinary plan
- LionJoinAgg              | granted to the role: the answer
- LionJoinAgg              | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
- LionJoinAgg              | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
- LionOrdered              | plan: planned
- LionOrdered              | every privilege: the ordinary plan's answer
- LionOrdered              | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
- LionOrdered              | plain EXPLAIN: as the ordinary plan
- LionOrdered              | granted to the role: the answer
- LionOrdered              | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
- LionOrdered              | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
- LionSemiJoin             | plan: planned
- LionSemiJoin             | every privilege: the ordinary plan's answer
- LionSemiJoin             | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
- LionSemiJoin             | plain EXPLAIN: as the ordinary plan
- LionSemiJoin             | granted to the role: the answer
- LionSemiJoin             | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
- LionSemiJoin             | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
-(56 rows)
+                   node                   |                                                                                   nc_check                                                                                   
+------------------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ LionAntiJoin                             | plan: planned
+ LionAntiJoin                             | every privilege: the ordinary plan's answer
+ LionAntiJoin                             | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
+ LionAntiJoin                             | plain EXPLAIN: as the ordinary plan
+ LionAntiJoin                             | granted to the role: the answer
+ LionAntiJoin                             | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
+ LionAntiJoin                             | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
+ LionBm25                                 | plan: planned
+ LionBm25                                 | every privilege: the ordinary plan's answer
+ LionBm25                                 | without EXECUTE on lion_bm25_score(tsvector,tsquery,regclass,double precision,double precision): ERROR: permission denied for function lion_bm25_score, as the ordinary plan
+ LionBm25                                 | plain EXPLAIN: as the ordinary plan
+ LionBm25                                 | granted to the role: the answer
+ LionBm25                                 | a cached plan (planned, the answer) without it: ERROR: permission denied for function lion_bm25_score
+ LionBm25                                 | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function lion_bm25_score
+ LionBtreeScan                            | plan: planned
+ LionBtreeScan                            | every privilege: the ordinary plan's answer
+ LionBtreeScan                            | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
+ LionBtreeScan                            | plain EXPLAIN: as the ordinary plan
+ LionBtreeScan                            | granted to the role: the answer
+ LionBtreeScan                            | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
+ LionBtreeScan                            | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
+ LionCount                                | plan: planned
+ LionCount                                | every privilege: the ordinary plan's answer
+ LionCount                                | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
+ LionCount                                | plain EXPLAIN: as the ordinary plan
+ LionCount                                | granted to the role: the answer
+ LionCount                                | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
+ LionCount                                | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
+ LionCount, an expression column filtered | plan: planned
+ LionCount, an expression column filtered | every privilege: the ordinary plan's answer
+ LionCount, an expression column filtered | without EXECUTE on nc_bucket(integer): ERROR: permission denied for function nc_bucket, as the ordinary plan
+ LionCount, an expression column filtered | plain EXPLAIN: as the ordinary plan
+ LionCount, an expression column filtered | granted to the role: the answer
+ LionCount, an expression column filtered | a cached plan (planned, the answer) without it: ERROR: permission denied for function nc_bucket
+ LionCount, an expression column filtered | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function nc_bucket
+ LionCount, an expression column grouped  | plan: planned
+ LionCount, an expression column grouped  | every privilege: the ordinary plan's answer
+ LionCount, an expression column grouped  | without EXECUTE on nc_bucket(integer): ERROR: permission denied for function nc_bucket, as the ordinary plan
+ LionCount, an expression column grouped  | plain EXPLAIN: as the ordinary plan
+ LionCount, an expression column grouped  | granted to the role: the answer
+ LionCount, an expression column grouped  | a cached plan (planned, the answer) without it: ERROR: permission denied for function nc_bucket
+ LionCount, an expression column grouped  | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function nc_bucket
+ LionCount, its aggregate                 | plan: planned
+ LionCount, its aggregate                 | every privilege: the ordinary plan's answer
+ LionCount, its aggregate                 | without EXECUTE on count(): ERROR: permission denied for aggregate count, as the ordinary plan
+ LionCount, its aggregate                 | plain EXPLAIN: as the ordinary plan
+ LionCount, its aggregate                 | granted to the role: the answer
+ LionCount, its aggregate                 | a cached plan (planned, the answer) without it: ERROR: permission denied for aggregate count
+ LionCount, its aggregate                 | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for aggregate count
+ LionJoinAgg                              | plan: planned
+ LionJoinAgg                              | every privilege: the ordinary plan's answer
+ LionJoinAgg                              | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
+ LionJoinAgg                              | plain EXPLAIN: as the ordinary plan
+ LionJoinAgg                              | granted to the role: the answer
+ LionJoinAgg                              | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
+ LionJoinAgg                              | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
+ LionOrdered                              | plan: planned
+ LionOrdered                              | every privilege: the ordinary plan's answer
+ LionOrdered                              | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
+ LionOrdered                              | plain EXPLAIN: as the ordinary plan
+ LionOrdered                              | granted to the role: the answer
+ LionOrdered                              | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
+ LionOrdered                              | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
+ LionSemiJoin                             | plan: planned
+ LionSemiJoin                             | every privilege: the ordinary plan's answer
+ LionSemiJoin                             | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
+ LionSemiJoin                             | plain EXPLAIN: as the ordinary plan
+ LionSemiJoin                             | granted to the role: the answer
+ LionSemiJoin                             | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
+ LionSemiJoin                             | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
+(70 rows)
 
 -- nothing is left revoked from PUBLIC by this file
 SELECT fn FROM nc_nodes WHERE NOT has_function_privilege('public', fn, 'EXECUTE');
@@ -279,5 +301,6 @@ DROP FUNCTION nc_try(text);
 DROP FUNCTION nc_rows(text);
 DROP FUNCTION nc_paths(text, boolean);
 DROP TABLE nc_nodes, nc, ncd;
+DROP FUNCTION nc_bucket(int);
 DROP ROLE lion_nc_yes;
 DROP ROLE lion_nc_no;

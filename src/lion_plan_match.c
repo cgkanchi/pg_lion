@@ -38,6 +38,283 @@ lion_opfamily_is_multikey(Oid opfamily, Oid opcintype)
 										LION_EXTRACTVALUE_PROC));
 }
 
+/* ---------------------------------------------------------------------
+ * Expression columns (DESIGN.md §41)
+ *
+ * The count path being planned names its expression columns once
+ * (lion_vcol_collect()) and plans inside lion_vcol_enter() /
+ * lion_vcol_leave(): everything below it - the clause analysis, the grouping
+ * columns, the index matching, the estimates - then sees a Var of attno
+ * LION_VCOL_ATTNO(i) where the query had the i'th expression, and asks
+ * lion_vcol_expr() for the expression where a column's number is not enough:
+ * which index answers it, and what the statistics know of it.  The scope is
+ * this file's, as the planner's own state for one count path is that path's:
+ * lion_try_count_path() enters it after deciding what relation it counts and
+ * leaves it on every way out, errors included, and nothing it calls plans
+ * another query.
+ * ---------------------------------------------------------------------
+ */
+static LionVColScope lion_vcol_scope = {NIL, 0};
+
+/*
+ * idx's expression for key column i (0-based), relabels stripped, or NULL for
+ * a column of the heap.  The planner hands the expressions in order, one per
+ * key column whose indexkeys[] is 0.
+ */
+static Node *
+lion_index_col_expr(IndexOptInfo *idx, int i)
+{
+	ListCell   *lc;
+	int			j;
+
+	if (idx->indexkeys[i] != 0)
+		return NULL;
+	lc = list_head(idx->indexprs);
+	for (j = 0; j < i && lc != NULL; j++)
+	{
+		if (idx->indexkeys[j] == 0)
+			lc = lnext(idx->indexprs, lc);
+	}
+	return (lc != NULL) ? lion_strip((Node *) lfirst(lc)) : NULL;
+}
+
+/*
+ * The expressions of rel's lion indexes that a count can treat as columns:
+ * each key column of a whole (non-partial) index that is an expression and
+ * has a scalar opclass, whose entries are the expression's values, one per
+ * row, and that reads a column: an index on `(1)` has one entry for every
+ * row and stands for no expression a query writes.  A multi-key column's
+ * entries are keys, which answer only its own
+ * operators (DESIGN.md §17), and a partial index needs its predicate.  Each
+ * expression once, relabels stripped, in the order the indexes come: the
+ * position is its LION_VCOL_ATTNO().  The planner's index expressions are
+ * normalised as the query's clauses are - folded and fixed up the same way -
+ * so equal() is the test, as it is for core (match_index_to_operand()).
+ */
+List *
+lion_vcol_collect(RelOptInfo *rel)
+{
+	Oid			amoid = lion_get_am_oid();
+	List	   *vcols = NIL;
+	ListCell   *lc;
+
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		int			i;
+
+		if (idx->relam != amoid || idx->hypothetical ||
+			idx->indpred != NIL || idx->indexprs == NIL)
+			continue;
+		for (i = 0; i < idx->nkeycolumns; i++)
+		{
+			Node	   *expr = lion_index_col_expr(idx, i);
+
+			if (expr == NULL || !contain_var_clause(expr) ||
+				lion_opfamily_is_multikey(idx->opfamily[i],
+										 idx->opcintype[i]) ||
+				list_member(vcols, expr))
+				continue;
+			if (list_length(vcols) >= LION_MAX_VCOLS)
+				return vcols;
+			vcols = lappend(vcols, expr);
+		}
+	}
+	return vcols;
+}
+
+/*
+ * Plan with `vcols` (Vars of `rti`) as the expression columns, until
+ * lion_vcol_leave() is handed back what this returns.
+ */
+LionVColScope
+lion_vcol_enter(List *vcols, Index rti)
+{
+	LionVColScope saved = lion_vcol_scope;
+
+	lion_vcol_scope.vcols = vcols;
+	lion_vcol_scope.rti = rti;
+	return saved;
+}
+
+void
+lion_vcol_leave(LionVColScope saved)
+{
+	lion_vcol_scope = saved;
+}
+
+/* The expression of expression column attno, or NULL outside the scope. */
+static Node *
+lion_vcol_expr(AttrNumber attno)
+{
+	int			i = LION_VCOL_INDEX(attno);
+
+	if (i < 0 || i >= list_length(lion_vcol_scope.vcols))
+		return NULL;
+	return (Node *) list_nth(lion_vcol_scope.vcols, i);
+}
+
+typedef struct LionVColCxt
+{
+	List	   *vcols;
+	Index		rti;
+} LionVColCxt;
+
+/*
+ * Every expression of node that is one of the expression columns, replaced
+ * by its Var.  The outermost match wins, so an expression column inside
+ * another is never reached: `(doc->>'a')::int` is one column when it is one,
+ * and `doc->>'a'` only where it stands alone.  Constants and Vars are never
+ * expressions of an index; a sub-select's are not this query level's.
+ */
+static Node *
+lion_vcol_subst_mutator(Node *node, LionVColCxt *cx)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Query))
+		return node;
+	if (!IsA(node, Var) && !IsA(node, Const) && !IsA(node, Param) &&
+		!IsA(node, RelabelType))
+	{
+		ListCell   *lc;
+		int			i = 0;
+
+		foreach(lc, cx->vcols)
+		{
+			Node	   *e = (Node *) lfirst(lc);
+
+			if (equal(node, e))
+				return (Node *) makeVar(cx->rti, LION_VCOL_ATTNO(i),
+										exprType(e), exprTypmod(e),
+										exprCollation(e), 0);
+			i++;
+		}
+	}
+	return expression_tree_mutator(node, lion_vcol_subst_mutator, cx);
+}
+
+/* node with the expression columns of the scope replaced by their Vars */
+Node *
+lion_vcol_subst(Node *node)
+{
+	return lion_vcol_subst_with(node, lion_vcol_scope.vcols,
+								lion_vcol_scope.rti);
+}
+
+/* ... or of any list of them, as the plan carries it (LION_PRIV_VCOLS) */
+Node *
+lion_vcol_subst_with(Node *node, List *vcols, Index rti)
+{
+	LionVColCxt cx;
+
+	if (vcols == NIL || node == NULL)
+		return node;
+	cx.vcols = vcols;
+	cx.rti = rti;
+	return lion_vcol_subst_mutator(node, &cx);
+}
+
+static Node *
+lion_vcol_unvar_mutator(Node *node, void *context)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var))
+	{
+		Var		   *v = (Var *) node;
+
+		if (v->varlevelsup == 0 && LION_ATTNO_IS_VCOL(v->varattno) &&
+			v->varno == (int) lion_vcol_scope.rti)
+		{
+			Node	   *e = lion_vcol_expr(v->varattno);
+
+			if (e == NULL)
+				elog(ERROR, "LionCount: expression column %d out of scope",
+					 (int) v->varattno);
+			return copyObject(e);
+		}
+		return node;
+	}
+	if (IsA(node, Query))
+		return node;
+
+	/* the clause of a restriction, which keeps none of its caches */
+	if (IsA(node, RestrictInfo))
+		return lion_vcol_unvar_mutator((Node *) ((RestrictInfo *) node)->clause,
+									   context);
+	return expression_tree_mutator(node, lion_vcol_unvar_mutator, context);
+}
+
+/*
+ * node with every expression column put back: what the statistics are asked
+ * about.  An expression column has no pg_statistic row of its own as a
+ * column, but core keeps one for each expression of an index and finds it
+ * from the expression (examine_variable()), so the estimates of `doc->>'k'
+ * = 'x'` are the ones core would make of the query.
+ */
+Node *
+lion_vcol_unvar(Node *node)
+{
+	if (lion_vcol_scope.vcols == NIL || !lion_vcol_used(node))
+		return node;
+	return lion_vcol_unvar_mutator(node, NULL);
+}
+
+static bool
+lion_vcol_used_walker(Node *node, void *context)
+{
+	if (node == NULL || IsA(node, Query))
+		return false;
+	if (IsA(node, Var))
+		return LION_ATTNO_IS_VCOL(((Var *) node)->varattno);
+	return expression_tree_walker(node, lion_vcol_used_walker, context);
+}
+
+/* Does node mention an expression column? */
+bool
+lion_vcol_used(Node *node)
+{
+	return lion_vcol_used_walker(node, NULL);
+}
+
+/*
+ * Is key column col (0-based) of the index `index` the expression column
+ * vcol (DESIGN.md §41)?  The executor's half of the test the planner made
+ * (lion_find_roaring_index()): vcol is the plan's expression with its Vars
+ * renumbered 1, as an index's own expressions are.
+ */
+bool
+lion_index_col_is_vcol(Relation index, int col, Node *vcol)
+{
+	List	   *exprs;
+	ListCell   *lc;
+	int			j;
+
+	if (index->rd_index->indkey.values[col] != 0)
+		return false;
+	exprs = RelationGetIndexExpressions(index);
+	lc = list_head(exprs);
+	for (j = 0; j < col && lc != NULL; j++)
+	{
+		if (index->rd_index->indkey.values[j] == 0)
+			lc = lnext(exprs, lc);
+	}
+	return lc != NULL && equal(lion_strip((Node *) lfirst(lc)), vcol);
+}
+
+/*
+ * Expression column vcol of relation relid as EXPLAIN and errors print it,
+ * deparsed as core deparses an index's expression: its Vars are varno 1.
+ */
+char *
+lion_vcol_name(Oid relid, Node *vcol)
+{
+	return deparse_expression(vcol,
+							  deparse_context_for(get_rel_name(relid), relid),
+							  false, false);
+}
+
 /*
  * A usable lion index on one plain column of rel, or NULL.  Only indexes
  * the planner put in rel->indexlist are considered, which already excludes
@@ -61,7 +338,21 @@ lion_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey,
 					   AttrNumber *colp)
 {
 	Oid			amoid = lion_get_am_oid();
+	Node	   *vcol = NULL;
 	ListCell   *lc;
+
+	/*
+	 * An expression column (DESIGN.md §41) is answered by any key column whose
+	 * expression is that one: the first, in index order, like a column.
+	 */
+	if (LION_ATTNO_IS_VCOL(attno))
+	{
+		vcol = lion_vcol_expr(attno);
+		if (vcol == NULL)
+			return NULL;
+	}
+	else if (attno <= 0)
+		return NULL;			/* no expression's key column answers it */
 
 	foreach(lc, rel->indexlist)
 	{
@@ -72,7 +363,7 @@ lion_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey,
 			continue;
 		if (idx->hypothetical)
 			continue;
-		if (idx->indpred != NIL || idx->indexprs != NIL)
+		if (idx->indpred != NIL)
 			continue;
 
 		/*
@@ -81,16 +372,16 @@ lion_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey,
 		 * the loop is bounded by nkeycolumns anyway, because an INCLUDE column
 		 * has no opclass to ask about.
 		 *
-		 * `indexprs`: an expression column has indexkeys[i] == 0 and can never
-		 * match a heap attno, so the skip above could in principle be relaxed
-		 * to "skip the expression COLUMNS".  It is left as it is: the count
-		 * pushdown has no way to evaluate the expression for its output.
-		 * `indpred` likewise - a partial index would need its predicate
-		 * applied, which this node does not do.
+		 * An expression column has indexkeys[i] == 0, which no heap column's
+		 * attno is, and answers only the expression column whose expression
+		 * it is (DESIGN.md §41).  `indpred`: a partial index would need its
+		 * predicate applied, which this node does not do.
 		 */
 		for (i = 0; i < idx->nkeycolumns; i++)
 		{
-			if (idx->indexkeys[i] != attno)
+			if (vcol != NULL ?
+				!equal(lion_index_col_expr(idx, i), vcol) :
+				idx->indexkeys[i] != attno)
 				continue;
 			if (lion_opfamily_is_multikey(idx->opfamily[i],
 										 idx->opcintype[i]) != multikey)

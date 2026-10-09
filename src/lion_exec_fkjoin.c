@@ -1865,7 +1865,7 @@ lion_join_group_turn(LionCountScanState *st, int p)
 								  lion_heap_attno_in(st->heap,
 													 st->plan.heapoid,
 													 fg->attno),
-								  false);
+								  false, st->plan.vcols);
 	istate = lion_index_column_state(fgidx, fgidxcol);
 
 	/* the walk lives for the turn; the rows' keys with it, until they go up */
