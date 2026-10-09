@@ -180,7 +180,8 @@ columns and can be built in parallel on PostgreSQL 17 and later.
   is slower than GIN.
 - BM25 top-k is slower than GIN + `ts_rank` when a query matches only a few hundred rows, and slows
   down when every query term is very common.
-- The count pushdown doesn't use expression indexes (for example, lion on `(data->>'key')`).
+- The count pushdown uses an expression index (for example, lion on `(data->>'key')`) only on a
+  table that is not partitioned, and not in its joins.
 - On a hot standby, indexes using the default (generic) WAL mode recheck every row in counts.
   Preloading the library avoids this.
 - Loading the library changes estimates, and so plans, that have nothing to do with lion: a column

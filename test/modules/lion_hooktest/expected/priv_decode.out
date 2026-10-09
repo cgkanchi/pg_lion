@@ -21,9 +21,9 @@ SELECT lion_hooktest_priv_decode('path') AS nclause;
 
 -- the shape marker, and the plan's number of members
 SELECT lion_hooktest_priv_decode('magic');
-ERROR:  LionCount: unrecognized custom_private shape (20 members)
+ERROR:  LionCount: unrecognized custom_private shape (21 members)
 SELECT lion_hooktest_priv_decode('path at plan');
-ERROR:  LionCount: unrecognized custom_private shape (19 members)
+ERROR:  LionCount: unrecognized custom_private shape (20 members)
 -- a member's node type, and its length against the number of clauses
 SELECT lion_hooktest_priv_decode('oids as ints');
 ERROR:  LionCount: malformed OIDS member of custom_private
@@ -36,6 +36,11 @@ ERROR:  LionCount: malformed OR structure
 -- a kind there is no such clause of
 SELECT lion_hooktest_priv_decode('clause kind');
 ERROR:  LionCount: unknown clause kind 8
+-- an expression column VCOLS does not have, and one that is no expression
+SELECT lion_hooktest_priv_decode('expression column');
+ERROR:  LionCount: expression column 1601 of 0
+SELECT lion_hooktest_priv_decode('bare expression column');
+ERROR:  LionCount: malformed VCOLS member of custom_private
 -- the members that grow at plan time, still the path's
 SELECT lion_hooktest_priv_decode('path join at plan');
 ERROR:  LionCount: malformed join

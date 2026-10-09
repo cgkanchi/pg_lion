@@ -240,7 +240,10 @@ typedef struct LionCountPathBuild
 	int			topkcand;		/* ... the candidates its walk keeps */
 	double		topkrows;		/* ... and the rows of their entries */
 	bool		topkstrict;		/* ... every group tied with the k-th */
+	List	   *vcols;			/* the expression columns (DESIGN.md §41) */
 } LionCountPathBuild;
+
+static void lion_try_count_path_scoped(LionCountPathBuild *cxp);
 
 /*
  * Start the build of lion_try_count_path(): its arguments, and every other
@@ -310,6 +313,7 @@ lion_count_path_init(LionCountPathBuild *cx, PlannerInfo *root,
 	cx->groupcoal = NULL;
 	cx->groupexpr = NULL;
 	cx->plainpositive = false;
+	cx->vcols = NIL;
 }
 
 /*
@@ -516,11 +520,12 @@ lion_count_path_group_by(LionCountPathBuild *cx)
 	{
 		SortGroupClause *sgc = (SortGroupClause *) lfirst(lc);
 		TargetEntry *tle = get_sortgroupclause_tle(sgc, root->processed_tlist);
+		Node	   *gexpr = (tle != NULL) ?
+			lion_vcol_subst((Node *) tle->expr) : NULL;
 
-		if (tle != NULL &&
-			(IsA(tle->expr, CoalesceExpr) ||
-			 (lion_strip((Node *) tle->expr) != NULL &&
-			  IsA(lion_strip((Node *) tle->expr), Var))))
+		if (gexpr != NULL &&
+			(IsA(gexpr, CoalesceExpr) ||
+			 (lion_strip(gexpr) != NULL && IsA(lion_strip(gexpr), Var))))
 			nvar++;
 	}
 	if (fj == NULL && nvar > LION_MAX_GROUPCOLS)
@@ -543,11 +548,15 @@ lion_count_path_group_by(LionCountPathBuild *cx)
 			SortGroupClause *sgc = (SortGroupClause *) lfirst(lc);
 			TargetEntry *tle = get_sortgroupclause_tle(sgc,
 													   root->processed_tlist);
+			Node	   *gexpr;
 			Node	   *expr;
 			int			i;
 
 			if (tle == NULL)
 				return false;
+
+			/* an expression column is grouped as a column (DESIGN.md §41) */
+			gexpr = lion_vcol_subst((Node *) tle->expr);
 
 			/*
 			 * `GROUP BY coalesce(col, c)` is col's groups with the NULL group
@@ -556,18 +565,19 @@ lion_count_path_group_by(LionCountPathBuild *cx)
 			 * column, and only in the plain form, where the node's entry walk
 			 * can do the merge exactly (lion_group_coalesce()).
 			 */
-			if (IsA(tle->expr, CoalesceExpr))
+			if (IsA(gexpr, CoalesceExpr))
 			{
 				if (list_length(root->processed_groupClause) != 1 ||
-					!lion_group_coalesce((CoalesceExpr *) tle->expr, rti,
+					!lion_group_coalesce((CoalesceExpr *) gexpr, rti,
 										 &cx->groupvar[cx->ngroup],
-										 &cx->groupcoal))
+										 &cx->groupcoal) ||
+					LION_ATTNO_IS_VCOL(cx->groupvar[cx->ngroup]->varattno))
 					return false;
-				cx->groupexpr = (Node *) tle->expr;
+				cx->groupexpr = gexpr;
 				expr = (Node *) cx->groupvar[cx->ngroup];
 			}
 			else
-				expr = lion_strip((Node *) tle->expr);
+				expr = lion_strip(gexpr);
 			if (expr == NULL)
 				return false;
 
@@ -577,7 +587,7 @@ lion_count_path_group_by(LionCountPathBuild *cx)
 			 */
 			if (!IsA(expr, Var))
 			{
-				cx->groupdeps = lappend(cx->groupdeps, tle->expr);
+				cx->groupdeps = lappend(cx->groupdeps, gexpr);
 				continue;
 			}
 			cx->groupvar[cx->ngroup] = (Var *) expr;
@@ -993,7 +1003,9 @@ lion_count_path_where(LionCountPathBuild *cx)
 
 		cx->rinfono++;
 		cx->rinfoclauses = lappend(cx->rinfoclauses, rinfo->clause);
-		clause = (Node *) rinfo->clause;
+
+		/* a clause of an expression column is one of a column (§41) */
+		clause = lion_vcol_subst((Node *) rinfo->clause);
 
 		/*
 		 * `flag IS NOT TRUE` of a boolean column is `flag = false OR flag IS
@@ -1152,11 +1164,18 @@ lion_count_path_having(LionCountPathBuild *cx)
 			return false;
 		cx->checkexprs =
 			list_concat(cx->checkexprs,
-						pull_var_clause((Node *) cx->having,
+						pull_var_clause(lion_vcol_subst((Node *) cx->having),
 										PVC_INCLUDE_AGGREGATES |
 										PVC_RECURSE_WINDOWFUNCS |
 										PVC_INCLUDE_PLACEHOLDERS));
 	}
+
+	/*
+	 * An expression column in the target list is a column the node prints,
+	 * and in an aggregate's argument one it counts (DESIGN.md §41); the
+	 * HAVING's were replaced before its columns were taken out of it.
+	 */
+	cx->checkexprs = (List *) lion_vcol_subst((Node *) cx->checkexprs);
 	return true;
 }
 
@@ -1270,7 +1289,8 @@ lion_count_path_wagg(LionCountPathBuild *cx, AttrNumber attno)
 
 	if (cx->fj != NULL || cx->ngroup != 0 || cx->singlegroup ||
 		cx->partitioned || cx->distvar != NULL || cx->groupcoal != NULL ||
-		cx->input_rel->baserestrictinfo != NIL)
+		cx->input_rel->baserestrictinfo != NIL ||
+		LION_ATTNO_IS_VCOL(attno))
 		return false;
 	foreach(lc, cx->wattnos)
 	{
@@ -1799,7 +1819,7 @@ lion_count_path_targets(LionCountPathBuild *cx)
 	 */
 	for (g = 0; g < cx->ngroup; g++)
 		cx->groupest[g] = estimate_num_groups(root,
-											  list_make1(cx->groupvar[g]),
+											  list_make1(lion_vcol_unvar((Node *) cx->groupvar[g])),
 											  input_rel->rows, NULL, NULL);
 
 	/*
@@ -1884,7 +1904,8 @@ lion_count_path_targets(LionCountPathBuild *cx)
 		 * Every entry of k is tested, whether or not the WHERE leaves it any
 		 * row, so the walk is n_distinct(k) of the whole table long.
 		 */
-		cx->distest = estimate_num_groups(root, list_make1(cx->distvar),
+		cx->distest = estimate_num_groups(root,
+										  list_make1(lion_vcol_unvar((Node *) cx->distvar)),
 										  Max(input_rel->tuples, 1.0),
 										  NULL, NULL);
 	}
@@ -1944,7 +1965,7 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 		int			g;
 
 		for (g = 0; g < cx->ngroup; g++)
-			vars = lappend(vars, cx->groupvar[g]);
+			vars = lappend(vars, lion_vcol_unvar((Node *) cx->groupvar[g]));
 		cx->numgroups = estimate_num_groups(root, vars, input_rel->rows,
 											NULL, NULL);
 	}
@@ -1960,7 +1981,8 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 		Var		   *dv = (cx->allvar != NULL) ? cx->allvar : cx->notnullvar;
 
 		Assert(dv != NULL);
-		cx->numgroups = estimate_num_groups(root, list_make1(dv),
+		cx->numgroups = estimate_num_groups(root,
+											list_make1(lion_vcol_unvar((Node *) dv)),
 											input_rel->rows, NULL, NULL);
 	}
 	else if (cx->distvar != NULL)
@@ -2075,7 +2097,7 @@ lion_topk_rows(PlannerInfo *root, RelOptInfo *rel, Var *var, double cand,
 	double		tuples = Max(rel->tuples, 1.0);
 	double		rows = cand * tuples / Max(ngroups, 1.0);
 
-	examine_variable(root, (Node *) var, 0, &vardata);
+	examine_variable(root, lion_vcol_unvar((Node *) var), 0, &vardata);
 	if (HeapTupleIsValid(vardata.statsTuple) &&
 		get_attstatsslot(&sslot, vardata.statsTuple, STATISTIC_KIND_MCV,
 						 InvalidOid, ATTSTATSSLOT_NUMBERS))
@@ -2202,7 +2224,8 @@ lion_count_path_topk(LionCountPathBuild *cx)
 		Bitmapset  *attnos = NULL;
 		int			attno;
 
-		pull_varattnos((Node *) rinfo->clause, cx->rti, &attnos);
+		pull_varattnos(lion_vcol_subst((Node *) rinfo->clause), cx->rti,
+					   &attnos);
 		if (bms_get_singleton_member(attnos, &attno) &&
 			attno + FirstLowInvalidHeapAttributeNumber == cx->groupattno[0])
 			continue;
@@ -2338,6 +2361,43 @@ lion_count_path_fill(LionCountPathBuild *cx)
 			p->wcol[i].idxoid = ((IndexOptInfo *) lfirst(l2))->indexoid;
 			p->wcol[i].idxcol = (AttrNumber) lfirst_int(l3);
 			i++;
+		}
+	}
+
+	/*
+	 * The expression columns (DESIGN.md §41), when the plan uses one, and
+	 * the functions of each one used: core's plan computes a grouped or
+	 * counted expression in its scan's projection, and so checks EXECUTE on
+	 * them (a WHERE clause's are in baserestrictinfo already).
+	 */
+	if (cx->vcols != NIL)
+	{
+		Bitmapset  *used = NULL;
+		int			i;
+
+#define LION_NOTE_VCOL(a) \
+		do { \
+			if (LION_ATTNO_IS_VCOL(a)) \
+				used = bms_add_member(used, LION_VCOL_INDEX(a)); \
+		} while (0)
+
+		LION_NOTE_VCOL(p->groupattno);
+		LION_NOTE_VCOL(p->groupattno2);
+		LION_NOTE_VCOL(p->distattno);
+		LION_NOTE_VCOL(p->allattno);
+		for (i = 0; i < p->nclause; i++)
+			LION_NOTE_VCOL(p->clause[i].attno);
+		for (i = 0; i < p->ngroupn; i++)
+			LION_NOTE_VCOL(p->groupn_attno[i]);
+#undef LION_NOTE_VCOL
+
+		if (used != NULL)
+		{
+			p->vcols = cx->vcols;
+			i = -1;
+			while ((i = bms_next_member(used, i)) >= 0)
+				p->exec_funcs = lion_expr_functions(list_nth(cx->vcols, i),
+													p->exec_funcs);
 		}
 	}
 }
@@ -2651,7 +2711,7 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				   const LionFkJoin *fj)
 {
 	LionCountPathBuild cx;
-	CustomPath *cpath;
+	LionVColScope saved;
 
 	lion_count_path_init(&cx, root, input_rel, output_rel, extra, fj);
 
@@ -2659,6 +2719,37 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 		return;
 	if (!lion_count_path_rel(&cx))
 		return;
+
+	/*
+	 * The expressions of the table's lion indexes are columns from here on
+	 * (DESIGN.md §41): of one table, which no FK-side join reads.  A
+	 * partition numbers its own Vars, and its indexes' expressions are its
+	 * own, so a partitioned table has none.
+	 */
+	if (fj == NULL && !cx.partitioned)
+		cx.vcols = lion_vcol_collect(cx.input_rel);
+	saved = lion_vcol_enter(cx.vcols, cx.rti);
+	PG_TRY();
+	{
+		lion_try_count_path_scoped(&cx);
+	}
+	PG_FINALLY();
+	{
+		lion_vcol_leave(saved);
+	}
+	PG_END_TRY();
+}
+
+/*
+ * The rest of lion_try_count_path(), inside the scope of the relation's
+ * expression columns.
+ */
+static void
+lion_try_count_path_scoped(LionCountPathBuild *cxp)
+{
+	LionCountPathBuild cx = *cxp;
+	CustomPath *cpath;
+
 	if (!lion_count_path_group_by(&cx))
 		return;
 	if (!lion_count_path_where(&cx))
