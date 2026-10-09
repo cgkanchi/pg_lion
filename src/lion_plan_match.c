@@ -598,9 +598,12 @@ lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 	 * The index hashed and compared its keys with its own collation and the
 	 * count never rechecks the predicate, so a mismatch (say a case-
 	 * insensitive index under a case-sensitive query) would count rows the
-	 * query does not select.
+	 * query does not select.  An index with no collation compared nothing
+	 * under one, and matches any clause, as in the planner's rule
+	 * (jsonb_contains_ops under `doc ? 'k'`, whose text has one).
 	 */
-	if (OidIsValid(exprcoll) && idx->indexcollations[i] != exprcoll)
+	if (OidIsValid(exprcoll) && OidIsValid(idx->indexcollations[i]) &&
+		idx->indexcollations[i] != exprcoll)
 		return NULL;
 
 	if (multikey)
@@ -1117,8 +1120,7 @@ lion_multikey_any_as_or(Node *clause)
 	if (left == NULL || right == NULL || !IsA(left, Var) || !IsA(right, Const))
 		return NULL;
 	strat = lion_op_roaring_strategy(saop->opno, &opfamily, &lefttype);
-	if (strat != LION_STRAT_CONTAINS && strat != LION_STRAT_OVERLAP &&
-		strat != LION_STRAT_MATCH)
+	if (!LION_STRAT_IS_MULTI_SEARCH(strat))
 		return NULL;
 	arrc = (Const *) right;
 	nelems = lion_array_const_nelems(arrc);
@@ -1455,9 +1457,7 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 			out->cmptype = exprType(out->val);
 			out->kind = LION_CLAUSE_RANGE;
 		}
-		else if (out->strategy == LION_STRAT_CONTAINS ||
-				 out->strategy == LION_STRAT_OVERLAP ||
-				 out->strategy == LION_STRAT_MATCH)
+		else if (LION_STRAT_IS_MULTI_SEARCH(out->strategy))
 		{
 			/*
 			 * A multi-key operator (DESIGN.md §17).  Unlike equality it does

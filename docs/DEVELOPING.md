@@ -151,4 +151,5 @@ the suite as they are in production.
     src/lion_ordered.c      CustomScans "LionOrdered" and "LionBtreeScan": lion-filtered walks of a btree (its
                             values from the index tuples when it covers the query) or of a lion column's order
     src/lion_multikey.c     array_ops/tsvector_ops: GIN-style extraction and tsquery key trees
+    src/lion_jsonb.c        jsonb_contains_ops: path keys for jsonb @>, ?, ?| and ?&
     test/sql, test/isolation, test/unit, test/recovery, test/modules
