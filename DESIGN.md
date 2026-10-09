@@ -18357,3 +18357,92 @@ with a filter; the two-filter LIMIT 10 2.5 to 2.9 ms against 5.2 to 7.5; the `ta
   container's is a second binary search. The price above would then come down with it.
 - **Expression columns** returning a value for a matching expression of the target; **parallel**
   walks (`parallel_safe = false`, as §30).
+
+## 42. jsonb containment and existence: `jsonb_contains_ops` (lion_jsonb.c, 2026-10-09)
+
+A multi-key opclass (§17) for jsonb that answers `@>`, `?`, `?|` and `?&` with the rows a
+sequential scan and GIN return, from the posting sets alone wherever the keys make that exact.
+Strategies 11 .. 14 are its operators; it names its own extractValue and extractQuery
+(`lion_jsonb_extract_value()`, `lion_jsonb_extract_query()`), which take lion's strategy numbers
+(`lion_gin_strategy()` passes them through). STORAGE is bytea with `byteacmp` as the ordering, so
+keys compare bytewise and the directory is ordered (§21).
+
+### 42.1 Keys
+
+Each key is a bytea whose first byte says what it is:
+
+- `R` + `o` | `a`: the document is an object, an array. A raw scalar has none.
+- `L` names value marks: a scalar at a path. `names` is each object key on the path from the root
+  as `0x01`, its length (unsigned LEB128) and its bytes, then `0x00`; `value` is `z` (null), `t`,
+  `f`, `n` + length + `numeric_normalize()`'s text, or `s` + length + the string's bytes; `marks`
+  is, for each gap before, between and after the names, the number of array levels in it. Array
+  indexes are not on the path, because `@>` matches an array element wherever it is.
+- `C` names type marks: a container (`o`, `a`) at a path below the root.
+- `E` name: a top-level object key, a string element of a top-level array, a raw scalar string,
+  which is what `?` tests (`jsonb_exists()`).
+- `H` + SHA-256: any of the above whose varlena would pass `LION_MAX_KEY_SIZE`.
+
+A raw scalar document is a one-element array to the iterator, and gets the `L` key a scalar
+element of a top-level array gets: `'["foo"]' @> '"foo"'` and `'"foo"' @> '"foo"'` are both true,
+`'"foo"' @> '["foo"]'` is false (no `R a`). Numbers go through `numeric_normalize()`, as GIN's
+jsonb_ops does, so `1`, `1.0`, `1e0` and `-0`/`0` agree; strings are bytes, as jsonb equality
+compares them. The names come before the value and the array levels after it, so one run of the
+ordered directory holds every array nesting of one `path = value`, which a lax jsonpath search
+would want.
+
+### 42.2 Queries
+
+`@>` extracts the query's `L` keys, a `C` key for each EMPTY container in it (a non-empty one is
+implied by the paths below it), and an `R` key when the query is an array (which must not match a
+raw scalar) or an empty object, and ANDs them. The AND is exact unless one array element of the
+query contributes two or more keys: `{"a": [{"b": 1, "c": 2}]}` must find both in the SAME element
+of the row's `a`, and `{"a": [{"b": 1}, {"c": 2}]}` has the same keys. Then, and when a key was
+hashed, extractQuery answers `LION_SEARCH_MODE_LOSSY`, a search mode of lion's own beside GIN's:
+`lion_extract_query()` calls the query not exact, and `lion_extract_query_superset()` builds the
+same AND with LION_QMODE_LOSSY, which every caller already rechecks (§17, "Literal queries through
+the superset"). Duplicate query keys are dropped.
+
+`?` is one `E` key, `?|` their OR and `?&` their AND, NULL array elements skipped as
+`jsonb_exists_any()`/`_all()` skip them; `?| '{}'` and `?| '{NULL}'` select nothing, and `?& '{}'`
+every document, which no key names, so it answers GIN_SEARCH_MODE_ALL.
+
+Every document has at least one key (`R`, or a raw scalar's `L`), so nothing goes to the EMPTY
+entry.
+
+### 42.3 Elsewhere
+
+- `lion_match_index()` let an index with no collation match a clause with one (`doc ? 'k'`: the
+  text operand has the default collation), which is the planner's own `IndexCollMatchesExprColl()`.
+- lionvalidate() accepts the pre-18 `hashvarlena` for a multi-key class's bytea keys, as it does
+  for a scalar bytea class.
+- `LION_STRAT_IS_MULTI()` replaces the 2 .. 5 range checks; `doc @> ANY (array)` and `doc ? ANY
+  (array)` reach the count pushdown's OR like the other multi-key operators.
+
+### 42.4 Size and speed
+
+On synthetic corpora (1M rows each, PostgreSQL 18): about 15 to 21 keys per document; the index
+1.0 to 1.4 times GIN jsonb_ops and 1.5 to 1.8 times jsonb_path_ops; the build faster than
+jsonb_ops and level with jsonb_path_ops; `@>` and `?` counts 27 to 200 times faster than GIN
+whenever more than a few hundred rows match, because GIN rechecks every `@>` in the heap and the
+count pushdown needs no heap on all-visible pages. A lossy query ties GIN.
+
+### 42.5 Tests
+
+`jsonb_contains.sql`: random documents (nested objects and arrays, raw scalars, empty containers,
+numbers written several ways, NULL) and random queries, half of them pruned copies of a document,
+through bitmap scans, plain index scans and the count pushdown with the query a literal and a
+parameter, against a sequential scan, GIN jsonb_ops and jsonb_path_ops, before and after updates
+and deletes; fixed edge cases; keys over 2000 bytes; the plans. Disabling the lossy answer makes it
+fail.
+
+### 42.6 Not done
+
+- **Multi-leaf array elements exactly**: store each leaf's outermost array-element ordinal as a
+  per-(key, row) payload, as positions are (§17), and keep candidates with an ordinal all the
+  element's keys share.
+- **jsonpath** `@?`/`@@` as a superset and recheck, then ranges over the ordered `L` keys (which
+  needs an order-preserving number encoding).
+- **More than 1000 query keys** answers every row; dropping keys from the AND would still be a
+  superset.
+- **Opclass options** to leave chosen paths or value types out, which keeps every query a
+  superset.

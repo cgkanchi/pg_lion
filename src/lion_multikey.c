@@ -95,6 +95,16 @@ lion_gin_strategy(StrategyNumber strategy)
 			return LION_GIN_CONTAINED;
 		case LION_STRAT_MATCH:
 			return LION_GIN_TSMATCH;
+
+			/*
+			 * jsonb_contains_ops names its own extractQuery
+			 * (lion_jsonb_extract_query()), which reads lion's numbers.
+			 */
+		case LION_STRAT_JSONB_CONTAINS:
+		case LION_STRAT_JSONB_EXISTS:
+		case LION_STRAT_JSONB_EXISTS_ANY:
+		case LION_STRAT_JSONB_EXISTS_ALL:
+			return strategy;
 	}
 
 	elog(ERROR, "lion index: strategy %d is not a multi-key strategy",
@@ -596,7 +606,8 @@ lion_tsquery_plan(Datum query, int nkeys)
  * One call of the opclass's extractQuery (support proc 3), with GIN's
  * conventions applied: searchMode starts at GIN_SEARCH_MODE_DEFAULT, and an
  * out-of-range answer is treated as GIN_SEARCH_MODE_ALL (ginNewScanKey() does
- * the same).  pmatch and nulls stay NULL unless the function set them.
+ * the same), except lion's own LION_SEARCH_MODE_LOSSY.  pmatch and nulls stay
+ * NULL unless the function set them.
  */
 typedef struct LionRawQuery
 {
@@ -642,8 +653,9 @@ lion_call_extractquery(LionState *state, Datum query, StrategyNumber strategy,
 										  PointerGetDatum(&raw->nulls),
 										  PointerGetDatum(&raw->searchMode)));
 
-	if (raw->searchMode < GIN_SEARCH_MODE_DEFAULT ||
-		raw->searchMode > GIN_SEARCH_MODE_ALL)
+	if (raw->searchMode != LION_SEARCH_MODE_LOSSY &&
+		(raw->searchMode < GIN_SEARCH_MODE_DEFAULT ||
+		 raw->searchMode > GIN_SEARCH_MODE_ALL))
 		raw->searchMode = GIN_SEARCH_MODE_ALL;
 }
 
@@ -680,7 +692,10 @@ lion_extract_query(LionState *state, Datum query, StrategyNumber strategy,
 
 	if (raw.searchMode != GIN_SEARCH_MODE_DEFAULT)
 	{
-		/* INCLUDE_EMPTY and ALL both mean "every indexed row, then recheck". */
+		/*
+		 * INCLUDE_EMPTY and ALL both mean "every indexed row, then recheck",
+		 * and LOSSY keys are not an exact answer either.
+		 */
 		q->mode = LION_QMODE_ALL;
 		return;
 	}
@@ -716,11 +731,15 @@ lion_extract_query(LionState *state, Datum query, StrategyNumber strategy,
 	switch (strategy)
 	{
 		case LION_STRAT_CONTAINS:
-			/* every element of the query array must be present */
+		case LION_STRAT_JSONB_CONTAINS:
+		case LION_STRAT_JSONB_EXISTS:
+		case LION_STRAT_JSONB_EXISTS_ALL:
+			/* every element of the query array (path, key) must be present */
 			q->tree = lion_keynode_flat(LION_KN_AND, nkeys);
 			break;
 
 		case LION_STRAT_OVERLAP:
+		case LION_STRAT_JSONB_EXISTS_ANY:
 			/* at least one of them */
 			q->tree = lion_keynode_flat(LION_KN_OR, nkeys);
 			break;
@@ -923,6 +942,8 @@ lion_superset_renumber(LionKeyNode *node, int *newno, const Datum *from,
  *	- `&&` with a NULL or partial key is every row: an OR cannot leave a key
  *	  out and stay a superset;
  *	- a tsquery is widened as lion_tsquery_superset() says;
+ *	- keys extractQuery calls LION_SEARCH_MODE_LOSSY combine as they would
+ *	  exactly, and select a superset;
  *	- INCLUDE_EMPTY and ALL, more keys than LION_MAX_QUERY_KEYS, `<@` and
  *	  anything else are every row, as they are for lion_extract_query().
  *
@@ -946,7 +967,9 @@ lion_extract_query_superset(LionState *state, Datum query,
 
 	lion_call_extractquery(state, query, strategy, &raw);
 
-	if (raw.searchMode != GIN_SEARCH_MODE_DEFAULT)
+	if (raw.searchMode == LION_SEARCH_MODE_LOSSY)
+		lossy = true;
+	else if (raw.searchMode != GIN_SEARCH_MODE_DEFAULT)
 	{
 		/* the rows no key was extracted from may qualify too */
 		q->mode = LION_QMODE_ALL;
@@ -966,6 +989,9 @@ lion_extract_query_superset(LionState *state, Datum query,
 	switch (strategy)
 	{
 		case LION_STRAT_CONTAINS:
+		case LION_STRAT_JSONB_CONTAINS:
+		case LION_STRAT_JSONB_EXISTS:
+		case LION_STRAT_JSONB_EXISTS_ALL:
 			{
 				LionKeyNode **args = (LionKeyNode **)
 					palloc(sizeof(LionKeyNode *) * raw.nkeys);
@@ -984,6 +1010,7 @@ lion_extract_query_superset(LionState *state, Datum query,
 			}
 
 		case LION_STRAT_OVERLAP:
+		case LION_STRAT_JSONB_EXISTS_ANY:
 			for (i = 0; i < raw.nkeys; i++)
 			{
 				if (lion_raw_key_unusable(&raw, i))
