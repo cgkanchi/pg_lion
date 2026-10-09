@@ -9408,11 +9408,24 @@ sibling and a copy of its high key, all taken while the leaf was locked. A key b
 is on that leaf, or - if the leaf has split since - right of it, where the walk moves right as a
 descent does. A key at or above it is on the right sibling or further right, and while the keys
 have been close together the walk steps there, at most `height` pages (stepping over s pages reads
-s, a descent height + 1); otherwise, or past those, it descends from the root. A descent that
-lands on the old right sibling says the keys are close again. A key found by following a run of
+s, a descent height + 1); otherwise, or past those, it descends. A descent that lands on the old
+right sibling says the keys are close again. **A descent starts below the root where it can**: each
+one remembers the level-1 page it took its leaf's downlink from and a copy of that page's high key
+(`LionDirParent`, `lion_dir_search_from()`), and the next descent starts there while its key is
+below that high key - the level-1 page and the leaf, two pages a key instead of height + 1. Only
+the first key under each level-1 page descends from the root. The argument is the leaf's: a
+level-1 page stays at level 1 and its lower bound never moves, so a key at or after the last one is
+under it or to its right, and a split since then is crossed by the descent's moving right. A key found by following a run of
 hash collisions across a page boundary leaves the walk to the right of where that run begins, and
 the walk forgets its place, as the list walk does. So a batch whose keys are dense reads each leaf
-it covers once, and one whose keys are sparse costs a descent a key, as before.
+it covers once, and one whose keys are sparse costs two pages a key.
+
+**The batch is sorted with the key type's sort support** where its btree family has one (the
+probe's comparison is that family's, `BTSORTSUPPORT_PROC`): the abbreviated key is computed once
+per row as it is copied into the batch and compared first, with the full comparison and then the
+hash breaking ties, and abbreviation is given up as `tuplesort` gives it up when it stops telling
+keys apart. The order is the one the probe's comparison gives, so nothing below changes; a type
+with no sort support is sorted by calling the comparison as before.
 
 **Why the place may be kept.** A directory page never changes level and is never freed, and a split
 moves keys only rightwards (§21, "Readers"), so a page's lower bound never moves. A key that sorts
@@ -9452,7 +9465,10 @@ the visibility map is still counted under its own pin.
 does: a descent (height + 1 pages) per batch; per row, the visit of its leaf, one page, and its
 place in the batch - the row copied in, its share of the sort and the slot it is handed back in -
 `LION_FKJOIN_BATCH_ROW_COST`; and between two keys `leaves / keys` leaves on average, stepped over a
-page each while that is at most the height, or a descent's internal levels past it. The batches are
+page each while that is at most the height, or past it a descent's internal levels: one, the
+level-1 page, for a key under the last descent's level-1 page, and the height for the first key
+under each, taken as one key in `fanout / apart`, with the level-1 page's fanout taken as the
+directory's mean, its pages to the 1/height. The batches are
 `work_mem` over the child row's width plus `LION_FKJOIN_BATCH_ENT_BYTES`. The model takes the walk
 where it is cheaper than a descent a row, (height + 1) pages. `LION_FKJOIN_BATCH_ROW_COST` is priced
 as one page visit - its setting defaults to `LION_DESCENT_COST`'s (§31, "The settings") - on the

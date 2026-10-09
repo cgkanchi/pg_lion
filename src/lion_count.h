@@ -21,6 +21,7 @@
 #include "storage/buf.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
+#include "utils/sortsupport.h"
 
 #include "lion.h"
 
@@ -655,6 +656,22 @@ typedef struct LionLookupWalk
 	bool		prefetch;		/* read the next leaf ahead of the walk */
 	BlockNumber prefetched;		/* the last block prefetched */
 	uint32		ncmp;			/* comparisons made by a sort (interrupts) */
+	LionDirParent parent;		/* the last descent's level-1 page */
+
+	/*
+	 * The sort's comparison as the key type's own btree sort support makes it
+	 * (lion_lookup_walk_sortsupport()), when the probe's sortproc is that
+	 * family's comparison: hasssup.  fullcmp compares two whole keys; abbrev
+	 * says the keys also get abbreviated keys, compared first, until the
+	 * support says they do not tell enough keys apart (nabbrev keys
+	 * abbreviated so far, asked again at abbrevnext).
+	 */
+	bool		hasssup;
+	bool		abbrev;
+	int64		nabbrev;
+	int64		abbrevnext;
+	int			(*fullcmp) (Datum x, Datum y, SortSupport ssup);
+	SortSupportData ssup;
 } LionLookupWalk;
 
 extern void lion_lookup_walk_begin(LionLookupWalk *walk, Relation index,
@@ -663,6 +680,10 @@ extern bool lion_lookup_walk_ordered(const LionLookupWalk *walk);
 extern uint32 lion_lookup_walk_hash(LionLookupWalk *walk, Datum key);
 extern int	lion_lookup_walk_cmp(LionLookupWalk *walk, Datum a, uint32 ahash,
 								 Datum b, uint32 bhash);
+extern Datum lion_lookup_walk_abbrev(LionLookupWalk *walk, Datum key);
+extern int	lion_lookup_walk_cmp_abbrev(LionLookupWalk *walk, Datum a,
+										Datum aabbrev, uint32 ahash, Datum b,
+										Datum babbrev, uint32 bhash);
 extern bool lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 								  LionPostingSet *ps);
 extern void lion_lookup_walk_pause(LionLookupWalk *walk);
