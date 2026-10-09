@@ -18525,9 +18525,124 @@ fail.
 - **Multi-leaf array elements exactly**: store each leaf's outermost array-element ordinal as a
   per-(key, row) payload, as positions are (§17), and keep candidates with an ordinal all the
   element's keys share.
-- **jsonpath** `@?`/`@@` as a superset and recheck, then ranges over the ordered `L` keys (which
-  needs an order-preserving number encoding).
+- **jsonpath** ranges over the ordered `L` keys (§43.6).
 - **More than 1000 query keys** answers every row; dropping keys from the AND would still be a
   superset.
 - **Opclass options** to leave chosen paths or value types out, which keeps every query a
   superset.
+
+## 43. jsonpath `@?` and `@@` through `jsonb_contains_ops` (lion_jsonb.c, 2026-10-09)
+
+Strategies 15 (`jsonb @? jsonpath`) and 16 (`jsonb @@ jsonpath`) of `jsonb_contains_ops`, on the
+keys of §42 unchanged. A jsonpath is never answered exactly: the index selects a superset, which
+every caller rechecks, as GIN does for every jsonpath. `doc @? path` is `doc @@ exists (path)`.
+
+### 43.1 What a jsonpath requires (`lion_jp_bool()`)
+
+The query is a tree of AND and OR over key PREFIXES, true for at least the documents the jsonpath
+is true for:
+
+- **An accessor chain** (`lion_jp_chain()`) from `$`, or from `@` in a filter, is followed as the
+  object key names it passes; array accessors (`[*]`, `[n]`, `[last]`) add none, since array
+  levels are not part of a key's names, and lax mode's unwrapping of arrays only changes how many
+  levels there are. `.*`, `.**` and item methods cut the chain: its items lie at or below the names
+  so far. A chain that starts anywhere else (a variable, a literal, arithmetic) says nothing about
+  the document.
+- **`chain == scalar`** is the `L` keys that start with the names, `0x00` and the value, at any array
+  levels. jsonpath compares strings by their bytes and numbers by value, which is what the `L` key
+  stores. A cut chain only says something is under its names.
+- **A chain that must yield an item** (`exists (chain)`, either operand of `!=`, `<`, `<=`, `>`,
+  `>=`, `starts with`, `like_regex`, and `@?`'s path) is the `L` and `C` keys that start with its
+  names. The root (no names) is every document.
+- **A filter** (`? (pred)`) adds what pred requires, with `@` at the chain so far: it passes only
+  items pred is true for. When a chain's filters narrow, the chain is not also required to yield an
+  item: the keys under its names are a union that costs more than it narrows (§43.4).
+- **`&&`, `||`, `!`**: the AND or OR of the parts, NOT pushed down to the leaves. An AND keeps the
+  parts that narrow; an OR needs both. Under a NOT, `exists` and comparisons narrow nothing
+  (`$.a != 1` being false includes `$.a` being absent), and the operator flips: `!(a && b)` is an
+  OR. GIN's jsonb_ops and jsonb_path_ops decide AND or OR from the operator alone, so they take
+  `!(!($.a == 1) && $.a == 3)` as needing `$.a == 1` and miss every document where `$.a` is
+  neither 1 nor 3, for which the jsonpath is true (PostgreSQL 18). Lion returns the sequential
+  scan's rows there.
+- **`is unknown`**, and anything else, narrows nothing.
+
+### 43.2 Expanding the prefixes (`lion_query_expand()`, lion_multikey.c)
+
+extractQuery returns the prefixes as keys with pmatch set, LION_SEARCH_MODE_LOSSY, and the tree in
+extra_data[0], built of `LionKeyNode`s. `lion_extract_query_superset()` reads that tree only when the
+column's extractQuery is `lion_jsonb_extract_query()` (GIN's own jsonb extractQuery leaves a tree of
+another type there), and takes an index: the executor's callers pass theirs, and each prefix becomes
+the OR of the index's keys that start with it, read off the ordered directory by
+`lion_prefix_keys()`, which serves tsquery's `foo:*` too (§17, "Prefix lexemes") and now bytea
+columns as well. A key a visible row has was in the directory before the walk, so the OR selects
+every row the prefix does. A prefix no key starts with selects no row; one with more keys than the
+query has left of its 1000 is every row; the tree is folded around both, and may come out NONE,
+LOSSY or ALL. The planner's callers pass no index, and each prefix stands for its OR as one key.
+
+A key longer than `LION_MAX_KEY_SIZE` is stored as its hash (§42.1), which keeps no prefix. So a
+prefix that could start a hashed key - every `L`/`C` prefix of a chain that must exist, and an
+`L` prefix with a value when its length plus five bytes per array-level count could pass the limit -
+is ORed with the prefix `H`, every hashed key.
+
+In the count pushdown a jsonpath is always counted from the superset with a heap recheck
+(`lion_locate_multikey()` takes the superset branch for it), so the planner takes it only where a
+recheck is allowed: never under an OR.
+
+### 43.3 Elsewhere
+
+- `lion_extract_query_superset()` takes the index; `lion_keynode_leaf()`/`_op()` are exported for
+  lion_jsonb.c.
+- `LION_STRAT_IS_MULTI()` covers 15 and 16; `LION_STRAT_IS_JSONPATH()` names them.
+
+### 43.4 Speed
+
+On the §42.4 corpora (PostgreSQL 18, best of five, each index alone; every count the same as
+the other two indexes), counts over fifteen jsonpaths against GIN jsonb_ops and jsonb_path_ops:
+
+| jsonpath | rows | jsonb_ops | jsonb_path_ops | lion |
+|---|---:|---:|---:|---:|
+| `@@ '$.status == "active"'` | 250619 | 224 ms (1.3x) | 265 ms (1.6x) | 167 ms |
+| `@@ '$.status == "draft" \|\| $.status == "paused"'` | 374094 | 340 ms (1.3x) | 355 ms (1.3x) | 266 ms |
+| `@@ '$.tags[*] == "tag3"'` | 69551 | 125 ms (1.5x) | 112 ms (1.4x) | 82 ms |
+| `@@ '$.type == "type1" && $.flags.b == true'` | 11101 | 113 ms (8.6x) | 30 ms (2.3x) | 13 ms |
+| `@? '$.attrs ? (@.color == "c3" && @.size == "m")'` | 18315 | 60 ms (3.0x) | 42 ms (2.1x) | 20 ms |
+| `@@ '$.kind == "k3"'` | 52596 | 78 ms (1.8x) | 57 ms (1.4x) | 42 ms |
+| `@@ '$.kind == "k3" && $.user.country == "cc7"'` | 1073 | 25 ms (10x) | 3.6 ms (1.5x) | 2.5 ms |
+| `@@ '$.payload.amount == 500'` | 4 | 0.42 ms (3.2x) | 0.08 ms (0.6x) | 0.13 ms |
+| `@@ '$.customer == 123'` | 7 | 2.4 ms (22x) | 0.05 ms (0.5x) | 0.11 ms |
+| `@@ '$.customer > 99990'` | 107 | 1032 ms (1.5x) | 1091 ms (1.6x) | 669 ms |
+| `@? '$.gift'` (on 1000 rows) | 1000 | 943 ms (3400x) | 690 ms (2500x) | 0.28 ms |
+| `@@ '$.gift.wrap == true'` | 1000 | 0.50 ms (1.4x) | 0.79 ms (2.1x) | 0.37 ms |
+| `@? '$.items[*] ? (@.sku == "sku42" && @.qty == 3)'` | 76 | 13 ms (13x) | 2.1 ms (2.1x) | 0.97 ms |
+| `@@ '$.items[*].sku == "sku42"'` | 714 | 8.3 ms (4.5x) | 1.1 ms (0.6x) | 1.8 ms |
+| `@@ '$.shipping.method == "air"'` | 333711 | 382 ms (1.8x) | 293 ms (1.4x) | 214 ms |
+
+Ratios are the GIN time over lion's. Every jsonpath count rechecks the heap, so the gap is
+smaller than for `@>` (§42.4). Neither GIN index narrows a bare existence path (`$.gift`, on a
+thousandth of the rows, cost them as much as a range over the whole table); lion reads it from
+its `L`/`C` prefixes. The range (`$.customer > 99990`) narrows only to rows with the path, so
+all three indexes read most of the table. A filter's chain (`$.attrs ? (...)`) is not also
+required to exist when the filter narrows: that would be every key under its names, a union
+costing more than it narrows (counting this filter took 91 ms with it). Lion is slower than
+jsonb_path_ops, which hashes the path and value into one key, on point lookups of a few rows and
+on `$.items[*].sku == "sku42"`, by under a millisecond.
+
+### 43.5 Tests
+
+`jsonb_path.sql`: random documents as in §42.5 against random jsonpaths (lax and strict; key,
+array, wildcard and method accessors; filters; comparisons, `exists`, `starts with`, `like_regex`,
+`&&`, `||`, `!`, `is unknown`), a third of them a path and value read off a document, through
+bitmap scans, plain index scans and the count pushdown with the query a literal and a parameter,
+against a sequential scan, before and after updates and deletes; fixed cases (lax unwrapping, raw
+scalars, empty containers, numbers, the NOT case above); hashed keys; a path too common to expand;
+`op ANY (array)`; the plans. Each of these makes it fail: deciding AND/OR from the operator alone,
+pinning the array levels to zero, and leaving out the hashed keys.
+
+### 43.6 Not done
+
+- **Ranges** (`$.price > 10`) from the ordered `L` keys: needs an order-preserving number encoding
+  in place of `numeric_normalize()`'s text. Today a range only requires its path to exist.
+- **`.**` and `.*`** with the names after them: the names before the wildcard are all a key can
+  say.
+- **Hashed keys keeping a prefix** (`H` + the first bytes + the hash) would let a prefix find only
+  its own hashed keys instead of all of them.

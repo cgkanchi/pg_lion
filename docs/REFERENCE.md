@@ -144,7 +144,7 @@ turned away as `Rows Removed by Recheck`. A value the planner cannot estimate is
 that rechecks the most, so a lone `tags @> $1` in a generic plan usually goes to the ordinary plan
 and a custom plan of the literal to the pushdown. Such a query is not taken under an `OR`.
 
-## jsonb containment and existence (DESIGN.md §42)
+## jsonb containment, existence and jsonpath (DESIGN.md §42, §43)
 
 `jsonb_contains_ops` (not the default; the default `jsonb_ops` indexes whole documents for `=`)
 indexes a document under one key per path to a scalar (with the scalar), one per object or array
@@ -158,12 +158,23 @@ below the root, the root's type, and one per top-level key, string element or st
     doc ? 'k'                  one key, exact
     doc ?| '{k,l}'             their OR, exact; NULL elements are skipped
     doc ?& '{k,l}'             their AND, exact; `?& '{}'` is every row, rechecked
+    doc @@ '$.a[*].b == 1'     the keys under a.b with the value 1, rechecked
+    doc @? '$.a ? (@.b > 1)'   the keys under a.b (a range only requires the path), rechecked
 
 Numbers compare by value (`1`, `1.0` and `1e0` are one key) and strings by their bytes, as jsonb
 equality does. A key longer than 2000 bytes is stored as its SHA-256, and a query that needs one is
 rechecked. Counts are pushed down, the rechecked queries with each candidate checked in the heap,
-except `?& '{}'`, which stays with the ordinary plan. `<@` and jsonpath (`@?`, `@@`) are not
-indexed.
+except `?& '{}'`, which stays with the ordinary plan. `<@` is not indexed.
+
+A jsonpath is always a superset, rechecked. `path == scalar` narrows to the documents with that
+scalar under the path's object keys, at any array levels. A path that must yield something
+(`exists`, either side of another comparison, `starts with`, `like_regex`, `@?`'s path) narrows to
+the documents with something under its keys. Filters add what they require. `&&` keeps what either
+side requires, `||` needs both sides to narrow, and under `!` comparisons and `exists` narrow
+nothing. A path stops at `.*`, `.**` or an item method. A path's prefix that more than 1000 keys
+start with narrows nothing, nor does one that could start a hashed key once the index has more
+than 1000 hashed keys. Counts are pushed down with every candidate checked in the heap, but not
+under an OR.
 
 ## Reloptions
 
