@@ -1,0 +1,279 @@
+-- jsonb_contains_ops answers jsonpath `@?` and `@@` from a superset of the
+-- rows, rechecked: through lion - bitmap scan, plain index scan, the count
+-- pushdown with the query a literal or a parameter - they return exactly the
+-- rows a sequential scan returns.  Random documents against random jsonpaths
+-- (lax and strict; key, array, wildcard and method accessors; filters;
+-- comparisons, exists, starts with, like_regex, && || ! and is unknown), many
+-- of them a path and a value read off a document so that they match, before
+-- and after updates and deletes; only differences print.
+
+\set VERBOSITY terse
+SET client_min_messages = warning;
+SET synchronous_commit = on;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+SELECT setseed(0.31) IS NULL AS seeded;
+
+CREATE FUNCTION jp_val(depth int) RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE r float8 := random(); o jsonb; n int;
+BEGIN
+	IF depth = 0 OR r < 0.45 THEN
+		RETURN (ARRAY['0','1','2','1.0','1e0','-0','10','"s0"','"s1"','"s2"','"k0"','"k1"',
+					  'true','false','null'])[1 + (random()*14)::int]::jsonb;
+	ELSIF r < 0.75 THEN
+		o := '{}';
+		n := (random()*3)::int;
+		FOR i IN 1..n LOOP
+			o := o || jsonb_build_object('k' || (random()*3)::int, jp_val(depth - 1));
+		END LOOP;
+		RETURN o;
+	ELSE
+		o := '[]';
+		n := (random()*3)::int;
+		FOR i IN 1..n LOOP
+			o := o || jsonb_build_array(jp_val(depth - 1));
+		END LOOP;
+		RETURN o;
+	END IF;
+END $$;
+
+CREATE FUNCTION jp_scalar() RETURNS text LANGUAGE sql AS $$
+	SELECT (ARRAY['0','1','2','1.0','1e0','10','"s0"','"s1"','"s2"','"k0"','true','false','null',
+				  '"object"','"array"','"number"','"string"'])[1 + (random()*16)::int]
+$$;
+
+-- an accessor chain from $, or from @ inside a filter
+CREATE FUNCTION jp_chain(depth int, cur boolean) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE s text; r float8;
+BEGIN
+	s := CASE WHEN cur AND random() < 0.7 THEN '@' ELSE '$' END;
+	FOR i IN 1..(random()*3)::int LOOP
+		r := random();
+		IF r < 0.5 THEN s := s || '.k' || (random()*3)::int;
+		ELSIF r < 0.6 THEN s := s || '[*]';
+		ELSIF r < 0.64 THEN s := s || '[0]';
+		ELSIF r < 0.67 THEN s := s || '[last]';
+		ELSIF r < 0.71 THEN s := s || '.*';
+		ELSIF r < 0.74 THEN s := s || '.**';
+		ELSIF r < 0.77 THEN s := s || '.type()';
+		ELSIF r < 0.80 THEN s := s || '.size()';
+		ELSIF r < 0.92 AND depth > 0 THEN s := s || ' ? (' || jp_pred(depth - 1, true) || ')';
+		ELSE s := s || '.k' || (random()*3)::int;
+		END IF;
+	END LOOP;
+	RETURN s;
+END $$;
+
+-- a predicate
+CREATE FUNCTION jp_pred(depth int, cur boolean) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE r float8 := random(); op text;
+BEGIN
+	IF depth = 0 OR r < 0.45 THEN
+		op := CASE WHEN random() < 0.6 THEN '==' ELSE (ARRAY['!=','<','>','<=','>='])[1 + (random()*4)::int] END;
+		IF random() < 0.8 THEN
+			RETURN jp_chain(depth, cur) || ' ' || op || ' ' || jp_scalar();
+		END IF;
+		RETURN jp_scalar() || ' ' || op || ' ' || jp_chain(depth, cur);
+	ELSIF r < 0.55 THEN
+		RETURN 'exists (' || jp_chain(depth, cur) || ')';
+	ELSIF r < 0.6 THEN
+		RETURN jp_chain(depth, cur) || ' starts with "s"';
+	ELSIF r < 0.65 THEN
+		RETURN jp_chain(depth, cur) || ' like_regex "^[sk]1"';
+	ELSIF r < 0.75 THEN
+		RETURN '(' || jp_pred(depth - 1, cur) || ' && ' || jp_pred(depth - 1, cur) || ')';
+	ELSIF r < 0.85 THEN
+		RETURN '(' || jp_pred(depth - 1, cur) || ' || ' || jp_pred(depth - 1, cur) || ')';
+	ELSIF r < 0.95 THEN
+		RETURN '!(' || jp_pred(depth - 1, cur) || ')';
+	END IF;
+	RETURN '(' || jp_pred(depth - 1, cur) || ') is unknown';
+END $$;
+
+-- `$.a[*].b == v`, read off d down to one of its scalars
+CREATE FUNCTION jp_from_doc(d jsonb) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE s text := '$'; k text;
+BEGIN
+	LOOP
+		IF jsonb_typeof(d) = 'object' AND d <> '{}' THEN
+			SELECT key INTO k FROM jsonb_object_keys(d) key ORDER BY random() LIMIT 1;
+			s := s || '.' || to_json(k)::text;
+			d := d -> k;
+		ELSIF jsonb_typeof(d) = 'array' AND d <> '[]' THEN
+			s := s || '[*]';
+			SELECT e INTO d FROM jsonb_array_elements(d) e ORDER BY random() LIMIT 1;
+		ELSE
+			EXIT;
+		END IF;
+	END LOOP;
+	IF jsonb_typeof(d) IN ('object', 'array') THEN
+		RETURN s;
+	END IF;
+	RETURN s || ' == ' || d::text;
+END $$;
+
+CREATE TABLE jp (id int, doc jsonb);
+INSERT INTO jp
+SELECT i, CASE WHEN i % 97 = 0 THEN NULL
+			   WHEN i % 5 = 0 THEN jp_val(3)
+			   ELSE (SELECT jsonb_object_agg('k' || j, jp_val(3)) FROM generate_series(0, (random()*3)::int) j WHERE i > 0)
+		  END
+FROM generate_series(1, 3000) i;
+CREATE TABLE jp_l AS SELECT * FROM jp; CREATE INDEX jp_l_i ON jp_l USING lion (doc jsonb_contains_ops);
+VACUUM ANALYZE jp, jp_l;
+
+-- the ids (or, for a count, the count) `doc op q` selects on tab, through mode
+CREATE FUNCTION jp_ids(tab text, op text, q text, mode text) RETURNS int[] LANGUAGE plpgsql AS $$
+DECLARE r int[]; cond text;
+BEGIN
+	PERFORM set_config('enable_seqscan', CASE WHEN mode = 'seq' THEN 'on' ELSE 'off' END, true);
+	PERFORM set_config('enable_bitmapscan', CASE WHEN mode IN ('bitmap','count','countp') THEN 'on' ELSE 'off' END, true);
+	PERFORM set_config('enable_indexscan', CASE WHEN mode IN ('index','count','countp') THEN 'on' ELSE 'off' END, true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	IF mode = 'countp' THEN
+		EXECUTE format('SELECT ARRAY[count(*)::int] FROM %I WHERE doc %s $1::jsonpath', tab, op) INTO r USING q;
+	ELSE
+		cond := format('doc %s %L::jsonpath', op, q);
+		IF mode = 'count' THEN
+			EXECUTE format('SELECT ARRAY[count(*)::int] FROM %I WHERE %s', tab, cond) INTO r;
+		ELSE
+			EXECUTE format('SELECT coalesce(array_agg(id ORDER BY id), ''{}'') FROM %I WHERE %s', tab, cond) INTO r;
+		END IF;
+	END IF;
+	RETURN r;
+END $$;
+
+-- every path's answer to one query that differs from the sequential scan's
+CREATE FUNCTION jp_check(op text, qs text) RETURNS TABLE (q text, path text, got int, want int) LANGUAGE plpgsql AS $$
+DECLARE ref int[]; m text; g int[];
+BEGIN
+	BEGIN
+		ref := jp_ids('jp', op, qs, 'seq');
+	EXCEPTION WHEN others THEN
+		RETURN;					-- not a jsonpath PostgreSQL takes
+	END;
+	FOREACH m IN ARRAY ARRAY['bitmap','index','count','countp'] LOOP
+		BEGIN
+			g := jp_ids('jp_l', op, qs, m);
+		EXCEPTION WHEN others THEN
+			q := op || ' ' || qs; path := m || ' ERROR ' || SQLERRM;
+			got := -1; want := cardinality(ref);
+			RETURN NEXT; CONTINUE;
+		END;
+		IF (m LIKE 'count%' AND g[1] <> cardinality(ref)) OR
+		   (m NOT LIKE 'count%' AND g IS DISTINCT FROM ref) THEN
+			q := op || ' ' || qs; path := m;
+			got := CASE WHEN m LIKE 'count%' THEN g[1] ELSE cardinality(g) END;
+			want := cardinality(ref);
+			RETURN NEXT;
+		END IF;
+	END LOOP;
+END $$;
+
+CREATE FUNCTION jp_run(n int) RETURNS TABLE (q text, path text, got int, want int) LANGUAGE plpgsql AS $$
+DECLARE qs text; op text; r float8;
+BEGIN
+	FOR i IN 1..n LOOP
+		r := random();
+		IF r < 0.35 THEN
+			op := CASE WHEN random() < 0.5 THEN '@@' ELSE '@?' END;
+			SELECT jp_from_doc(doc) INTO qs FROM jp WHERE doc IS NOT NULL ORDER BY random() LIMIT 1;
+			IF op = '@?' THEN
+				qs := split_part(qs, ' == ', 1) ||
+					  CASE WHEN qs LIKE '% == %' THEN ' ? (@ == ' || split_part(qs, ' == ', 2) || ')' ELSE '' END;
+			ELSIF qs NOT LIKE '% == %' THEN
+				qs := 'exists (' || qs || ')';
+			END IF;
+		ELSIF r < 0.65 THEN
+			op := '@@'; qs := jp_pred(3, false);
+		ELSE
+			op := '@?'; qs := jp_chain(3, false);
+		END IF;
+		IF random() < 0.2 THEN
+			qs := 'strict ' || qs;
+		END IF;
+		RETURN QUERY SELECT * FROM jp_check(op, qs);
+	END LOOP;
+END $$;
+SELECT * FROM jp_run(300);
+
+-- updates and deletes, not vacuumed: dead rows and pages not all-visible
+UPDATE jp SET doc = doc || '{"k3": [{"k0": 1, "k1": "s0"}]}' WHERE id % 7 = 0 AND jsonb_typeof(doc) = 'object';
+UPDATE jp_l SET doc = doc || '{"k3": [{"k0": 1, "k1": "s0"}]}' WHERE id % 7 = 0 AND jsonb_typeof(doc) = 'object';
+DELETE FROM jp WHERE id % 11 = 0; DELETE FROM jp_l WHERE id % 11 = 0;
+SELECT * FROM jp_run(300);
+
+-- fixed cases: lax unwrapping, raw scalars, empty containers, numbers
+INSERT INTO jp VALUES (9001, '"s0"'), (9002, '["s0", 1]'), (9003, '[]'), (9004, '{}'),
+	(9005, '{"k0": {}}'), (9006, '{"k0": []}'), (9007, '{"k0": [[1]]}'), (9008, '{"k0": [{"k1": 1}, {"k2": 2}]}'),
+	(9009, '{"k0": {"k1": null}}'), (9010, '[[{"k0": 1}]]'), (9011, '[{"k0": 1}]'), (9012, 'null'),
+	(9013, '{"k0": 1e2}'), (9014, '{"k0": true}'), (9015, '{"k0": 2}');
+INSERT INTO jp_l SELECT * FROM jp WHERE id > 9000;
+SELECT x.* FROM (VALUES
+	('@@', '$ == "s0"'), ('@@', '$[*] == "s0"'), ('@@', 'strict $ == "s0"'), ('@?', '$'), ('@?', '$[*]'),
+	('@?', '$.k0'), ('@?', 'strict $.k0'), ('@?', '$.k0.k1'), ('@?', '$.k0[*]'), ('@?', '$.k0 ? (@ == 1)'),
+	('@?', 'strict $.k0 ? (@ == 1)'), ('@@', '$.k0 == 100'), ('@@', '$.k0 == 1e2'), ('@@', '$.k0[*].k1 == 1'),
+	('@@', '$.k0.k1 == null'), ('@@', '$.k0 == true'), ('@@', '$.k0'), ('@@', 'exists ($.k0)'),
+	('@?', 'exists ($.k0)'), ('@?', '$.k0 == 1'), ('@@', '$.k0.type() == "object"'), ('@@', '$.k0.size() == 0'),
+	('@@', '$.* == 2'), ('@@', '$.** == 2'), ('@@', '$.k0 > 1'), ('@@', '!($.k0 == 2)'), ('@@', '$.k0 != 2'),
+	('@@', '!(!($.k0 == 1) && $.k0 == 3)'), ('@@', '!(!($.k0 == 2))'), ('@@', '($.k0 == 2) is unknown'),
+	('@@', '$.k0 == $.k0'), ('@@', '$.k0 + 0 == 2'), ('@@', '1 == 1'), ('@?', '1'), ('@?', '$.k0 ? (@.k1 == null).k1')) e(op, q),
+	LATERAL jp_check(e.op, e.q) x;
+
+-- keys too long to be keys are hashed, and a prefix keeps nothing of a hash:
+-- a query that could need one looks at every hashed key too
+INSERT INTO jp VALUES (9101, jsonb_build_object('k0', repeat('x', 3000))),
+	(9102, jsonb_build_object(repeat('y', 3000), 1)), (9103, jsonb_build_array(repeat('z', 3000))),
+	(9104, jsonb_build_object('k0', jsonb_build_object(repeat('y', 3000), 's0')));
+INSERT INTO jp_l SELECT * FROM jp WHERE id > 9100;
+SELECT x.* FROM (VALUES
+	('@@', format('$.k0 == "%s"', repeat('x', 3000))), ('@@', format('$.k0 == "%s"', repeat('x', 2999))),
+	('@@', '$.k0 starts with "x"'), ('@?', format('$."%s"', repeat('y', 3000))),
+	('@@', format('$."%s" == 1', repeat('y', 3000))), ('@@', format('$[*] == "%s"', repeat('z', 3000))),
+	('@?', format('$.k0."%s"', repeat('y', 3000))), ('@@', format('$.k0."%s" == "s0"', repeat('y', 3000)))) e(op, q),
+	LATERAL jp_check(e.op, e.q) x;
+
+-- a path too common to expand (a value per row) is every row, rechecked
+INSERT INTO jp SELECT 10000 + i, jsonb_build_object('u', i, 'k0', i % 3) FROM generate_series(1, 1500) i;
+INSERT INTO jp_l SELECT * FROM jp WHERE id > 10000;
+SELECT x.* FROM (VALUES ('@?', '$.u'), ('@@', '$.u == 77'), ('@@', '$.u > 1400'),
+	('@@', '$.u > 1400 && $.k0 == 1'), ('@@', '$.u > 1400 || $.k0 == 1')) e(op, q),
+	LATERAL jp_check(e.op, e.q) x;
+
+-- `op ANY (array)`, and with other clauses on the index
+CREATE FUNCTION jp_any(cond text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE a int; b int;
+BEGIN
+	EXECUTE 'SELECT count(*) FROM jp WHERE ' || cond INTO a;
+	PERFORM set_config('enable_seqscan', 'off', true);
+	EXECUTE 'SELECT count(*) FROM jp_l WHERE ' || cond INTO b;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	RETURN a = b;
+END $$;
+SELECT cond, jp_any(cond) AS same FROM (VALUES
+	($$doc @? ANY (ARRAY['$.k0 ? (@ == 1)', '$.k1[*] ? (@ == "s0")']::jsonpath[])$$),
+	($$doc @@ ANY (ARRAY['$.k0 == 2', '$.u == 3']::jsonpath[])$$),
+	($$doc @@ ANY (ARRAY['$.k0 == 2', '1 == 1']::jsonpath[])$$),
+	($$doc @@ '$.k0 == 2' OR doc ? 'k1'$$),
+	($$doc @@ '$.k0 == 2' AND doc ? 'k1'$$),
+	($$doc @? '$.k1[*] ? (@ == "s0")' AND doc @> '{"k0": 1}'$$),
+	($$doc @@ '$.k0 == 2' AND doc @? '$.k1'$$)) v(cond);
+
+-- the plans: a jsonpath is always rechecked
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM jp_l WHERE doc @@ '$.k0 == 2';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM jp_l WHERE doc @? '$.k0[*] ? (@.k1 == 1)';
+RESET enable_seqscan;
+
+-- the opclass validates with the jsonpath operators in it
+SELECT amvalidate(oid) FROM pg_opclass WHERE opcname = 'jsonb_contains_ops';
+
+DROP TABLE jp, jp_l;
+DROP FUNCTION jp_run(int);
+DROP FUNCTION jp_any(text);
+DROP FUNCTION jp_check(text, text);
+DROP FUNCTION jp_ids(text, text, text, text);
+DROP FUNCTION jp_from_doc(jsonb);
+DROP FUNCTION jp_pred(int, boolean);
+DROP FUNCTION jp_chain(int, boolean);
+DROP FUNCTION jp_scalar();
+DROP FUNCTION jp_val(int);

@@ -18,7 +18,7 @@ bitmap. Many queries can then be answered by combining bitmaps instead of visiti
 - counts over a fact table joined to a filtered dimension;
 - array membership (`tags @> ...`) and full-text search (`tsv @@ ...`), with phrase search and BM25
   ranking;
-- jsonb containment and key existence (`doc @> ...`, `doc ? ...`).
+- jsonb containment, key existence and jsonpath (`doc @> ...`, `doc ? ...`, `doc @@ ...`).
 
 On a vacuumed table these counts never touch the heap, so they can be one or two orders of magnitude
 faster than a B-tree or GIN index. They show up in `EXPLAIN` as `Custom Scan (LionCount)`.
@@ -33,7 +33,7 @@ them. The on-disk format may still change. Don't put data you can't rebuild behi
 | Dashboards, facet counts, `GROUP BY` over large tables | **Lion.** This is what it is for. |
 | Range counts on a column with many distinct values (timestamps, ids) | Lion `WITH (summaries = auto)` |
 | Array membership and full-text search, especially counts | Lion. Add `store_positions = true` for phrases and ranking. |
-| jsonb `@>` and `?` filters, especially counts | Lion with `jsonb_contains_ops` |
+| jsonb `@>`, `?` and jsonpath filters, especially counts | Lion with `jsonb_contains_ops` |
 | Unique constraints, or `ORDER BY col LIMIT n` on a single column | B-tree |
 | Returning many filtered rows in order | A covering B-tree, which lion can filter as it walks it (see below) |
 | Write-heavy tables | Measure first. Lion inserts are slower and write more WAL than B-tree. |
@@ -155,6 +155,7 @@ CREATE INDEX docs_doc ON docs USING lion (doc jsonb_contains_ops);
 
 SELECT count(*) FROM docs WHERE doc @> '{"status": "active", "tags": ["sale"]}';
 SELECT count(*) FROM docs WHERE doc ? 'discount' AND doc ?| '{eu,uk}';
+SELECT count(*) FROM docs WHERE doc @@ '$.items[*].sku == "A1"';
 ```
 
 `jsonb_contains_ops` indexes every path to a value in the document, with the value, so `@>`, `?`,
@@ -164,6 +165,11 @@ The one exception is a query whose array element has two or more fields
 rechecked in the heap to see that they sit in the same element, as GIN does for every `@>`.
 The index is about the size of GIN's `jsonb_ops`. To filter or group on a known field, an
 expression index such as `USING lion ((doc->>'status'))` is smaller.
+
+jsonpath `@?` and `@@` use the same index, and like GIN, lion rechecks every row it finds in the
+heap. The index narrows the rows on each `path == value` and on each path that must exist. A path
+stops narrowing at `.*`, `.**` or an item method such as `.size()`. A range (`$.price > 10`) only
+requires the path to exist. A path with more than 1000 distinct values under it narrows nothing.
 
 ### Ranking with BM25
 
@@ -201,8 +207,9 @@ columns and can be built in parallel on PostgreSQL 17 and later.
   down when every query term is very common.
 - The count pushdown uses an expression index (for example, lion on `(data->>'key')`) only on a
   table that is not partitioned, and not in its joins.
-- jsonb `<@` and jsonpath (`@?`, `@@`) aren't indexed. Updating an indexed jsonb document writes
-  one entry per path, so it costs more than with GIN's pending list.
+- jsonb `<@` isn't indexed, and jsonpath (`@?`, `@@`) is always rechecked in the heap. Updating
+  an indexed jsonb document writes one entry per path, so it costs more than with GIN's pending
+  list.
 - On a hot standby, indexes using the default (generic) WAL mode recheck every row in counts.
   Preloading the library avoids this.
 - Loading the library changes estimates, and so plans, that have nothing to do with lion: a column

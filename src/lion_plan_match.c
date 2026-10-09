@@ -843,7 +843,7 @@ lion_multikey_query_mode(Oid extractquery, StrategyNumber strategy,
 		query = lion_tsquery_strip_prefixes(query);
 
 	if (superset)
-		lion_extract_query_superset(&state, query, strategy, &q);
+		lion_extract_query_superset(&state, NULL, query, strategy, &q);
 	else
 		lion_extract_query(&state, query, strategy, &q);
 	mode = q.mode;
