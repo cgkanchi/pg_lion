@@ -18544,7 +18544,8 @@ is true for:
   `>=`, `starts with`, `like_regex`, and `@?`'s path) is the `L` and `C` keys that start with its
   names. The root (no names) is every document.
 - **A filter** (`? (pred)`) adds what pred requires, with `@` at the chain so far: it passes only
-  items pred is true for.
+  items pred is true for. When a chain's filters narrow, the chain is not also required to yield an
+  item: the keys under its names are a union that costs more than it narrows (§43.4).
 - **`&&`, `||`, `!`**: the AND or OR of the parts, NOT pushed down to the leaves. An AND keeps the
   parts that narrow; an OR needs both. Under a NOT, `exists` and comparisons narrow nothing
   (`$.a != 1` being false includes `$.a` being absent), and the operator flips: `!(a && b)` is an
@@ -18584,7 +18585,36 @@ recheck is allowed: never under an OR.
 
 ### 43.4 Speed
 
-43.4-SPEED
+On the §42.4 corpora (PostgreSQL 18, best of five, each index alone; every count the same as
+the other two indexes), counts over fifteen jsonpaths against GIN jsonb_ops and jsonb_path_ops:
+
+| jsonpath | rows | jsonb_ops | jsonb_path_ops | lion |
+|---|---:|---:|---:|---:|
+| `@@ '$.status == "active"'` | 250619 | 224 ms (1.3x) | 265 ms (1.6x) | 167 ms |
+| `@@ '$.status == "draft" \|\| $.status == "paused"'` | 374094 | 340 ms (1.3x) | 355 ms (1.3x) | 266 ms |
+| `@@ '$.tags[*] == "tag3"'` | 69551 | 125 ms (1.5x) | 112 ms (1.4x) | 82 ms |
+| `@@ '$.type == "type1" && $.flags.b == true'` | 11101 | 113 ms (8.6x) | 30 ms (2.3x) | 13 ms |
+| `@? '$.attrs ? (@.color == "c3" && @.size == "m")'` | 18315 | 60 ms (3.0x) | 42 ms (2.1x) | 20 ms |
+| `@@ '$.kind == "k3"'` | 52596 | 78 ms (1.8x) | 57 ms (1.4x) | 42 ms |
+| `@@ '$.kind == "k3" && $.user.country == "cc7"'` | 1073 | 25 ms (10x) | 3.6 ms (1.5x) | 2.5 ms |
+| `@@ '$.payload.amount == 500'` | 4 | 0.42 ms (3.2x) | 0.08 ms (0.6x) | 0.13 ms |
+| `@@ '$.customer == 123'` | 7 | 2.4 ms (22x) | 0.05 ms (0.5x) | 0.11 ms |
+| `@@ '$.customer > 99990'` | 107 | 1032 ms (1.5x) | 1091 ms (1.6x) | 669 ms |
+| `@? '$.gift'` (on 1000 rows) | 1000 | 943 ms (3400x) | 690 ms (2500x) | 0.28 ms |
+| `@@ '$.gift.wrap == true'` | 1000 | 0.50 ms (1.4x) | 0.79 ms (2.1x) | 0.37 ms |
+| `@? '$.items[*] ? (@.sku == "sku42" && @.qty == 3)'` | 76 | 13 ms (13x) | 2.1 ms (2.1x) | 0.97 ms |
+| `@@ '$.items[*].sku == "sku42"'` | 714 | 8.3 ms (4.5x) | 1.1 ms (0.6x) | 1.8 ms |
+| `@@ '$.shipping.method == "air"'` | 333711 | 382 ms (1.8x) | 293 ms (1.4x) | 214 ms |
+
+Ratios are the GIN time over lion's. Every jsonpath count rechecks the heap, so the gap is
+smaller than for `@>` (§42.4). Neither GIN index narrows a bare existence path (`$.gift`, on a
+thousandth of the rows, cost them as much as a range over the whole table); lion reads it from
+its `L`/`C` prefixes. The range (`$.customer > 99990`) narrows only to rows with the path, so
+all three indexes read most of the table. A filter's chain (`$.attrs ? (...)`) is not also
+required to exist when the filter narrows: that would be every key under its names, a union
+costing more than it narrows (counting this filter took 91 ms with it). Lion is slower than
+jsonb_path_ops, which hashes the path and value into one key, on point lookups of a few rows and
+on `$.items[*].sku == "sku42"`, by under a millisecond.
 
 ### 43.5 Tests
 

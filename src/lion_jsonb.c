@@ -720,7 +720,12 @@ lion_jp_chain(LionJpCxt *cx, LionJpPath path, JsonPathItem *jsp,
 	*end = path;
 }
 
-/* What `exists (chain)` requires: its filters, and something at its end. */
+/*
+ * What `exists (chain)` requires: its filters, and something at its end.
+ * When a filter narrows, something at the end is left out: it is every key
+ * under the names, a union that costs more than it narrows (dropping a part
+ * of an AND only widens it).
+ */
 static LionKeyNode *
 lion_jp_exists_chain(LionJpCxt *cx, LionJpPath path, JsonPathItem *jsp)
 {
@@ -729,8 +734,7 @@ lion_jp_exists_chain(LionJpCxt *cx, LionJpPath path, JsonPathItem *jsp)
 	LionKeyNode *e;
 
 	lion_jp_chain(cx, path, jsp, &end, &nodes);
-	e = lion_jp_exists(cx, &end);
-	if (e != NULL)
+	if (nodes == NIL && (e = lion_jp_exists(cx, &end)) != NULL)
 		nodes = lappend(nodes, e);
 	return lion_jp_and(nodes);
 }
@@ -764,7 +768,8 @@ lion_jp_scalar(JsonPathItem *jsp, JsonbValue *v)
 /*
  * What a comparison or a string predicate being true requires.  It is true
  * only for some item of each operand, so each operand that is a chain yields
- * one: its filters hold, and something is at its end.  `chain == scalar`,
+ * one: its filters hold, and something is at its end (left out when a filter
+ * narrows, as in lion_jp_exists_chain()).  `chain == scalar`,
  * which jsonpath answers with byte-equal strings and equal numbers - what the
  * leaf keys store - is the leaf keys of that value.
  */
@@ -792,6 +797,7 @@ lion_jp_compare(LionJpCxt *cx, LionJpPath path, JsonPathItem *jsp)
 		JsonPathItem *other = nops == 2 ? &ops[1 - i] : NULL;
 		LionJpPath end;
 		LionKeyNode *n;
+		int			before = list_length(nodes);
 
 		if (jspIsScalar(ops[i].type))
 			continue;
@@ -804,8 +810,10 @@ lion_jp_compare(LionJpCxt *cx, LionJpPath path, JsonPathItem *jsp)
 			lion_jp_scalar(other, &v);
 			n = lion_jp_equals(cx, &end, &v);
 		}
-		else
+		else if (list_length(nodes) == before)
 			n = lion_jp_exists(cx, &end);
+		else
+			n = NULL;			/* as in lion_jp_exists_chain() */
 		if (n != NULL)
 			nodes = lappend(nodes, n);
 	}
