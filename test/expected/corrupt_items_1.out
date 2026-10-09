@@ -298,6 +298,33 @@ DELETE FROM lion_di_v WHERE k = 7;
 VACUUM lion_di_v;
 \set VERBOSITY default
 DROP TABLE lion_di_v;
+-- ---------- 10. an entry whose item ends inside its key's padding ----------
+-- The entry the first probe of leaf 1 compares against, of a text key of 36
+-- bytes (a four-byte varlena header and md5's 32): the key ends at byte 68
+-- of the item, and the payload begins at byte 72, the next 8-aligned end.
+-- Its line pointer's length is made 68: the key it claims fits, but the
+-- payload's offset does not, and a reader computing an INLINE payload's
+-- length from the two would count backwards past the item (lion_entry_at()).
+CREATE TABLE lion_di_w (t text NOT NULL);
+INSERT INTO lion_di_w SELECT md5((i % 50)::text) FROM generate_series(1, 5000) i;
+CREATE INDEX lion_di_w_i ON lion_di_w USING lion (t);
+SELECT lion_di_evict('lion_di_w_i');
+SELECT lion_di_lplen(p, (2 + (n - 1) / 2)::int) AS lp_len,
+	   get_byte(p, lion_di_item(p, (2 + (n - 1) / 2)::int) + 6) |
+	   (get_byte(p, lion_di_item(p, (2 + (n - 1) / 2)::int) + 7) << 8) AS keylen
+  FROM lion_di_block('lion_di_w_i', 1) p,
+	   LATERAL (SELECT ((lion_di_u32(p, 12) & 65535) - 24) / 4 AS n) s;
+SELECT lion_di_set_lplen('lion_di_w_i', 1, (2 + (n - 1) / 2)::int,
+						 32 + get_byte(p, lion_di_item(p, (2 + (n - 1) / 2)::int) + 6) +
+						 (get_byte(p, lion_di_item(p, (2 + (n - 1) / 2)::int) + 7) << 8))
+  FROM lion_di_block('lion_di_w_i', 1) p,
+	   LATERAL (SELECT ((lion_di_u32(p, 12) & 65535) - 24) / 4 AS n) s;
+SELECT lion_di_try($$SELECT count(*) FROM lion_di_w WHERE t = md5('7')$$);
+SELECT lion_di_try($$SELECT count(*) FROM lion_di_w WHERE t > md5('7')$$);
+SELECT lion_di_try($$SELECT t, count(*) FROM lion_di_w GROUP BY t ORDER BY t$$);
+SELECT lion_di_try($$INSERT INTO lion_di_w VALUES (md5('7'))$$);
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_w_i')$$);
+DROP TABLE lion_di_w;
 -- ---------- an undamaged index still works ----------
 CREATE INDEX lion_di_i ON lion_di USING lion (k);
 SELECT count(*) FROM lion_di WHERE k = 7;

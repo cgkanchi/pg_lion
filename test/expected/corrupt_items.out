@@ -16,6 +16,8 @@
 -- 7. A NARROW of a width the build does not have, which sizes it.
 -- 8. A directory entry whose key length claims more than its item holds.
 -- 9. An entry whose TID count is less than what VACUUM removes from it.
+-- 10. An entry whose item ends inside the alignment padding after its key,
+--     which puts its payload offset past the item's end.
 --
 -- The pages are damaged on disk, as corrupt.sql does it (pg_buffercache_evict(),
 -- PostgreSQL 17 and later - on 16 the test is skipped,
@@ -629,6 +631,73 @@ VACUUM lion_di_v;
 ERROR:  lion index "lion_di_v_i": entry 2 on block 4 counts 1 TIDs in 4 containers, fewer than VACUUM removes (3616 TIDs, 4 containers)
 \set VERBOSITY default
 DROP TABLE lion_di_v;
+-- ---------- 10. an entry whose item ends inside its key's padding ----------
+-- The entry the first probe of leaf 1 compares against, of a text key of 36
+-- bytes (a four-byte varlena header and md5's 32): the key ends at byte 68
+-- of the item, and the payload begins at byte 72, the next 8-aligned end.
+-- Its line pointer's length is made 68: the key it claims fits, but the
+-- payload's offset does not, and a reader computing an INLINE payload's
+-- length from the two would count backwards past the item (lion_entry_at()).
+CREATE TABLE lion_di_w (t text NOT NULL);
+INSERT INTO lion_di_w SELECT md5((i % 50)::text) FROM generate_series(1, 5000) i;
+CREATE INDEX lion_di_w_i ON lion_di_w USING lion (t);
+SELECT lion_di_evict('lion_di_w_i');
+ lion_di_evict 
+---------------
+ 
+(1 row)
+
+SELECT lion_di_lplen(p, (2 + (n - 1) / 2)::int) AS lp_len,
+	   get_byte(p, lion_di_item(p, (2 + (n - 1) / 2)::int) + 6) |
+	   (get_byte(p, lion_di_item(p, (2 + (n - 1) / 2)::int) + 7) << 8) AS keylen
+  FROM lion_di_block('lion_di_w_i', 1) p,
+	   LATERAL (SELECT ((lion_di_u32(p, 12) & 65535) - 24) / 4 AS n) s;
+ lp_len | keylen 
+--------+--------
+    280 |     36
+(1 row)
+
+SELECT lion_di_set_lplen('lion_di_w_i', 1, (2 + (n - 1) / 2)::int,
+						 32 + get_byte(p, lion_di_item(p, (2 + (n - 1) / 2)::int) + 6) +
+						 (get_byte(p, lion_di_item(p, (2 + (n - 1) / 2)::int) + 7) << 8))
+  FROM lion_di_block('lion_di_w_i', 1) p,
+	   LATERAL (SELECT ((lion_di_u32(p, 12) & 65535) - 24) / 4 AS n) s;
+ lion_di_set_lplen 
+-------------------
+ 
+(1 row)
+
+SELECT lion_di_try($$SELECT count(*) FROM lion_di_w WHERE t = md5('7')$$);
+                                        lion_di_try                                         
+--------------------------------------------------------------------------------------------
+ XX002: lion index entry of N bytes ends inside the alignment padding of its key of N bytes
+(1 row)
+
+SELECT lion_di_try($$SELECT count(*) FROM lion_di_w WHERE t > md5('7')$$);
+                                        lion_di_try                                         
+--------------------------------------------------------------------------------------------
+ XX002: lion index entry of N bytes ends inside the alignment padding of its key of N bytes
+(1 row)
+
+SELECT lion_di_try($$SELECT t, count(*) FROM lion_di_w GROUP BY t ORDER BY t$$);
+                                        lion_di_try                                         
+--------------------------------------------------------------------------------------------
+ XX002: lion index entry of N bytes ends inside the alignment padding of its key of N bytes
+(1 row)
+
+SELECT lion_di_try($$INSERT INTO lion_di_w VALUES (md5('7'))$$);
+                                        lion_di_try                                         
+--------------------------------------------------------------------------------------------
+ XX002: lion index entry of N bytes ends inside the alignment padding of its key of N bytes
+(1 row)
+
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_w_i')$$);
+                                         lion_di_try                                         
+---------------------------------------------------------------------------------------------
+ XX002: lion index "lion_di_w_i": item N on block N is N bytes, too small for its N byte key
+(1 row)
+
+DROP TABLE lion_di_w;
 -- ---------- an undamaged index still works ----------
 CREATE INDEX lion_di_i ON lion_di USING lion (k);
 SELECT count(*) FROM lion_di WHERE k = 7;

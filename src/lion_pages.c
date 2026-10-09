@@ -583,16 +583,23 @@ void
 lion_entry_size_error(Page page, ItemId iid)
 {
 	Size		len = ItemIdGetLength(iid);
+	LionEntryTuple *e;
 
 	if ((Size) ItemIdGetOffset(iid) + len > BLCKSZ || len < LION_ENTRY_HDRSZ)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lion index entry of %zu bytes at page offset %u does not hold an entry header",
 						len, ItemIdGetOffset(iid))));
+	e = (LionEntryTuple *) PageGetItem(page, iid);
+	if (len - LION_ENTRY_HDRSZ < (Size) e->keylen)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index entry of %zu bytes claims a key of %u bytes",
+						len, e->keylen)));
 	ereport(ERROR,
 			(errcode(ERRCODE_INDEX_CORRUPTED),
-			 errmsg("lion index entry of %zu bytes claims a key of %u bytes",
-					len, ((LionEntryTuple *) PageGetItem(page, iid))->keylen)));
+			 errmsg("lion index entry of %zu bytes ends inside the alignment padding of its key of %u bytes",
+					len, e->keylen)));
 }
 
 LionEntryTuple *

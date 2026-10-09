@@ -26,10 +26,12 @@ SELECT name, setting, boot_val, context, vartype
   FROM pg_settings
  WHERE name LIKE 'pg_lion.%\_cost'
  ORDER BY name;
--- from 0 up, among the customized options as every extension's settings are
+-- from 0 to 1.0e15, capped as core caps its own cost settings so no price
+-- multiplied into a cost overflows it to infinity, among the customized
+-- options as every extension's settings are
 SELECT count(*) AS settings,
 	   bool_and(min_val::float8 = 0) AS from_zero,
-	   bool_and(max_val::float8 > 1e300) AS unbounded,
+	   bool_and(max_val::float8 = 1e15) AS capped_like_core,
 	   bool_and(category = 'Customized Options') AS custom_group,
 	   bool_and(short_desc ~ ', in multiples of (cpu_operator_cost|cpu_tuple_cost|seq_page_cost|random_page_cost)\.$') AS unit_named
   FROM pg_settings
