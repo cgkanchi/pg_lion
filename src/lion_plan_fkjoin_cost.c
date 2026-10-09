@@ -206,6 +206,7 @@ typedef struct LionFkJoinCost
 	Cost		located;		/* the part of `other` locating the filters */
 	double		copybytes;		/* what the collected copy is expected to take */
 	bool		cancollect;		/* there is anything to collect at all */
+	double		reads;			/* the pages it reads (lion_units_cold()) */
 } LionFkJoinCost;
 
 static Cost
@@ -254,6 +255,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	Cost		located = 0;
 	Cost		probed = 0;
 	Cost		collected = 0;
+	double		reads;
 	int			ci = 0;
 	int			sno;
 	int		   *rangelead;
@@ -313,6 +315,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		parts->descents = descents;
 		parts->walked = walked;
 	}
+	reads = lookups + Min(found * container_pages / nd, container_pages);
 	run += Min(found * container_pages / nd, container_pages) * seq_page_cost;
 
 	/* ---- the fact filters: located once, each a source of every count ---- */
@@ -434,6 +437,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		located += Min(nkeys, Max(cdir * cshare, 1.0)) * random_page_cost +
 			nkeys * (cheight + 1.0) * LION_DESCENT_COST;
 		located += Max(Min(nkeys, cpages), cpages * sel) * seq_page_cost;
+		reads += Min(nkeys, Max(cdir * cshare, 1.0)) +
+			Max(Min(nkeys, cpages), cpages * sel);
 	}
 	run += located;
 
@@ -572,10 +577,14 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	run += recheck_pages * lion_heap_page_cost(root, rel, recheck_pages,
 											   heap_pages);
 	run += recheck_tids * LION_RECHECK_TID_COST;
+	reads += recheck_pages;
 
 	if (parts != NULL)
+	{
 		parts->other = run - (*walk ? walked : descents) -
 			(*collect ? collected : probed);
+		parts->reads = reads;
+	}
 	return run;
 }
 
@@ -586,7 +595,9 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
  * fact filter the node only has at run time (DESIGN.md §17, "A query known
  * only at run time") - the fact rows the keys reach, each count reading its
  * own.  *collect and *walk are the plan's two choices - or, with `force`,
- * the choices to price, made already (lion_cost_fkjoin_rel()).
+ * the choices to price, made already (lion_cost_fkjoin_rel()) - and *reads,
+ * when asked for, the pages it reads, which a nested loop competitor's cold
+ * reads are weighed against (lion_units_cold()).
  *
  * A partitioned fact table (DESIGN.md §27, "A partitioned fact table") is
  * every key looked up in every leaf partition, each with its own fk index,
@@ -621,7 +632,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 					  Var *fkvar, int joinclause, List *whereclauses,
 					  List *wherekinds, List *ors, double dimrows, double found,
 					  bool exists, double rowbytes, int workers, bool *collect,
-					  bool *walk, bool force)
+					  bool *walk, bool force, double *reads)
 {
 	LionCountTarget *first = (LionCountTarget *) linitial(targets);
 	bool		wantcollect = force && *collect;
@@ -637,6 +648,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 	double		batches;
 	double		unmatched = 1.0;
 	double		looked = 0.0;
+	double		allreads = 0.0;
 	Cost		run;
 	ListCell   *lc;
 
@@ -654,6 +666,8 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 								   whereclauses, wherekinds, ors, dimrows,
 								   found, exists, rowbytes, workers,
 								   collect, walk, force, &parts);
+		if (reads != NULL)
+			*reads = parts.reads;
 
 		/*
 		 * A fact column grouped by counts each key once per group
@@ -717,6 +731,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 		/* ... and a fact column's groups count each key once per group */
 		tgroups = lion_fact_groups(root, t);
 		other += parts.other;
+		allreads += parts.reads;
 		descents += parts.descents;
 		walked += parts.walked;
 		probed += parts.probed * tgroups;
@@ -750,6 +765,8 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 					   1.0));
 	probed += (batches - 1.0) * located;
 
+	if (reads != NULL)
+		*reads = allreads;
 	if (force)
 	{
 		*walk = wantwalk;

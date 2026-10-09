@@ -563,15 +563,148 @@ lion_path_is_lion_scan(Path *path)
 }
 
 /*
+ * A NESTED LOOP'S COLD READS (DESIGN.md §39, "A nested loop's cold reads"):
+ * what the inner index scan of path - a nested loop into a parameterized
+ * index scan, under whatever passes its rows up - would pay for the pages it
+ * finds outside the cache, over what core charged them, into *cold; and what
+ * each page a lion path reads outside the cache is charged the same way,
+ * into *perpage.  Both 0 when nothing is cold.
+ *
+ * Core prices the inner scan's page reads at random_page_cost, as many as
+ * index_pages_fetched() makes loops x its rows a probe come to - an index leaf
+ * and the heap pages of the rows each probe fetches.  A page that is not in
+ * the cache costs a probe far more than that: a synchronous read, the probe
+ * waiting on the device, since nothing reads ahead of a parameterized scan.
+ * A nested loop of a few thousand probes into a table the cache holds meets
+ * no such page once warm; one of a hundred thousand probes into a table
+ * several times the cache reads most of its pages from the device whenever
+ * the cache holds other things.  So the pages are taken as uncached in the
+ * share of the query's tables and the index that effective_cache_size cannot
+ * hold - the residency lion_index_page_cost() argues from - and each is
+ * charged LION_COLD_PAGE_COST less the random_page_cost core charged it.  A
+ * Memoize over the inner scan, which leaves the probes it saves unknown, and
+ * an inner side that is not one index scan, take no charge; probes a semi
+ * join stops early are counted whole.
+ */
+static void
+lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage)
+{
+	JoinPath   *jp = NULL;
+	Path	   *inner;
+	IndexPath  *ip;
+	RelOptInfo *baserel;
+	double		idxpages;
+	double		resident;
+	double		loops;
+	double		reads;
+	double		spc_random_page_cost;
+	double		spc_seq_page_cost;
+
+	*cold = 0.0;
+	*perpage = 0.0;
+	if (root == NULL)
+		return;
+	for (; path != NULL; path = lion_path_input(path))
+	{
+		if (IsA(path, NestPath))
+		{
+			jp = (JoinPath *) path;
+			break;
+		}
+	}
+	if (jp == NULL)
+		return;
+
+	inner = jp->innerjoinpath;
+	while (inner != NULL &&
+		   (IsA(inner, MaterialPath) || IsA(inner, ProjectionPath)))
+		inner = lion_path_input(inner);
+	if (inner == NULL || !IsA(inner, IndexPath) || inner->param_info == NULL)
+		return;
+	ip = (IndexPath *) inner;
+	baserel = ip->path.parent;
+	if (baserel == NULL || baserel->reloptkind != RELOPT_BASEREL)
+		return;
+
+	idxpages = Max((double) ip->indexinfo->pages, 1.0);
+	resident = Min((double) effective_cache_size /
+				   Max(root->total_table_pages + idxpages, 1.0), 1.0);
+	get_tablespace_page_costs(baserel->reltablespace,
+							  &spc_random_page_cost, &spc_seq_page_cost);
+	if (resident >= 1.0 || LION_COLD_PAGE_COST <= spc_random_page_cost)
+		return;
+	*perpage = (1.0 - resident) * (LION_COLD_PAGE_COST - spc_random_page_cost);
+
+	/* a leaf a probe, and the heap pages of its rows */
+	loops = Max(jp->outerjoinpath->rows, 1.0);
+	reads = index_pages_fetched(loops, (BlockNumber) idxpages, idxpages, root);
+	if (ip->path.pathtype != T_IndexOnlyScan || baserel->allvisfrac < 1.0)
+	{
+		double		heap = index_pages_fetched(loops *
+											   Max(ip->indexselectivity *
+												   baserel->tuples, 1.0),
+											   baserel->pages, idxpages,
+											   root);
+
+		if (ip->path.pathtype == T_IndexOnlyScan)
+			heap *= 1.0 - baserel->allvisfrac;
+		reads += heap;
+	}
+	*cold = reads * *perpage;
+}
+
+/*
+ * A lion path whose own price is `own`, in lion's units, and which reads
+ * `reads` pages, priced against a nested loop with cold reads
+ * (lion_nestloop_cold()): both plans with their uncached pages added, the
+ * loop's cost and cold reads against the path's price and its own cold reads
+ * - the path at (own x rate + its cold reads) / (cost + the loop's cold
+ * reads) of the loop's cost, which is a factor of its rate.  For the FK-side
+ * join, whose reads lion_cost_fkjoin_path() counts: a lookup's leaf and set,
+ * the fact filters located, the heap of a recheck.  Each path of a relation
+ * takes its own reads, so that two of lion's forms compare as their prices
+ * and their cold reads together say.  Nothing for any other kind of
+ * competitor, or a loop with nothing cold.
+ *
+ * The factor is at most 1 - a path that reads more than the loop keeps its
+ * price - and never below 1 / LION_COLD_MAX_DISCOUNT.  The charge is what a
+ * cold cache costs, and a warm one costs none of it: with the inner table's
+ * working set cached, the nested loop runs at core's price and the lion path
+ * can be the slower, by up to that factor where its own price is the dearer.
+ */
+#define LION_COLD_MAX_DISCOUNT	1.5
+
+void
+lion_units_cold(LionUnits *u, Cost own, double reads)
+{
+	Cost		price = own * u->rate;
+	Cost		lioncold;
+	double		factor;
+
+	if (u->kind != LION_COMPETITOR_NESTLOOP || u->nlcold <= 0.0 ||
+		u->nlcost <= 0.0 || price <= 0.0)
+		return;
+	lioncold = Max(reads, 0.0) * u->coldpage;
+	factor = (price + lioncold) * u->nlcost /
+		((u->nlcost + u->nlcold) * price);
+	factor = Min(Max(factor, 1.0 / LION_COLD_MAX_DISCOUNT), 1.0);
+	elog(DEBUG2, "lion: a nested loop's cold reads, %.2f over its %.2f against %.2f over %.2f, at factor %g",
+		 u->nlcold, u->nlcost, lioncold, price, factor);
+	u->rate *= factor;
+}
+
+/*
  * What a lion path of rel competes with: the kind of the cheapest core path
  * (lion_competitor_path()) and its cost; NONE when core has no path there yet,
  * and DISABLED when every one it has is disabled - a plan forced by core's
  * enable_* settings, which leave a lion path nothing to compete with.
  * *ownscan says whether that path is one of the AM's own scans of a lion
- * index (lion_path_is_lion_scan()), *rate its rate.
+ * index (lion_path_is_lion_scan()), *rate its rate; *nlcold and *coldpage
+ * a nested loop's cold reads (lion_nestloop_cold()), when root is given.
  */
 static LionCompetitor
-lion_competitor_of(RelOptInfo *rel, Cost *cost, bool *ownscan, double *rate)
+lion_competitor_of(PlannerInfo *root, RelOptInfo *rel, Cost *cost,
+				   bool *ownscan, double *rate, Cost *nlcold, Cost *coldpage)
 {
 	Path	   *best = lion_competitor_path(rel);
 	LionCompetitor kind;
@@ -579,6 +712,8 @@ lion_competitor_of(RelOptInfo *rel, Cost *cost, bool *ownscan, double *rate)
 	*cost = (best != NULL) ? best->total_cost : 0.0;
 	*ownscan = false;
 	*rate = 1.0;
+	*nlcold = 0.0;
+	*coldpage = 0.0;
 	if (best == NULL)
 		return LION_COMPETITOR_NONE;
 	if (lion_path_disabled(best))
@@ -587,6 +722,8 @@ lion_competitor_of(RelOptInfo *rel, Cost *cost, bool *ownscan, double *rate)
 	kind = lion_competitor_kind(best);
 	*rate = (kind == LION_COMPETITOR_HASHAGG) ?
 		lion_hashagg_plan_rate(best) : lion_competitor_rate(kind);
+	if (kind == LION_COMPETITOR_NESTLOOP)
+		lion_nestloop_cold(root, best, nlcold, coldpage);
 	return kind;
 }
 
@@ -626,6 +763,8 @@ static LionCompetitor lion_units_pinned_kind;
 static Cost lion_units_pinned_cost;
 static bool lion_units_pinned_ownscan;
 static double lion_units_pinned_rate;
+static Cost lion_units_pinned_nlcold;
+static Cost lion_units_pinned_coldpage;
 
 /*
  * The units a lion path of rel is to be priced in - the cheapest core path's
@@ -633,7 +772,7 @@ static double lion_units_pinned_rate;
  * offered at (lion_competitor_margin()).
  */
 void
-lion_units_for(RelOptInfo *rel, LionUnits *u)
+lion_units_for(PlannerInfo *root, RelOptInfo *rel, LionUnits *u)
 {
 	Cost		cost;
 	bool		ownscan;
@@ -644,12 +783,16 @@ lion_units_for(RelOptInfo *rel, LionUnits *u)
 		cost = lion_units_pinned_cost;
 		ownscan = lion_units_pinned_ownscan;
 		u->rate = lion_units_pinned_rate;
+		u->nlcold = lion_units_pinned_nlcold;
+		u->coldpage = lion_units_pinned_coldpage;
 	}
 	else
-		u->kind = lion_competitor_of(rel, &cost, &ownscan, &u->rate);
+		u->kind = lion_competitor_of(root, rel, &cost, &ownscan, &u->rate,
+									 &u->nlcold, &u->coldpage);
 	if (u->rate <= 0.0)
 		u->rate = 1.0;
 	u->margin = lion_competitor_margin(u->kind, ownscan);
+	u->nlcost = cost;
 	elog(DEBUG2, "lion: priced against a %s%s, cost %.2f, at rate %g and margin %g",
 		 ownscan ? "lion " : "", lion_competitor_names[u->kind], cost,
 		 u->rate, u->margin);
@@ -661,12 +804,15 @@ lion_units_for(RelOptInfo *rel, LionUnits *u)
  * every hook's start, so that a pin an error left behind is never read.
  */
 void
-lion_units_pin(RelOptInfo *rel)
+lion_units_pin(PlannerInfo *root, RelOptInfo *rel)
 {
 	lion_units_pinned_rel = NULL;
-	lion_units_pinned_kind = lion_competitor_of(rel, &lion_units_pinned_cost,
+	lion_units_pinned_kind = lion_competitor_of(root, rel,
+												&lion_units_pinned_cost,
 												&lion_units_pinned_ownscan,
-												&lion_units_pinned_rate);
+												&lion_units_pinned_rate,
+												&lion_units_pinned_nlcold,
+												&lion_units_pinned_coldpage);
 	lion_units_pinned_rel = rel;
 }
 
@@ -708,7 +854,10 @@ lion_units_margin_for(RelOptInfo *rel)
 	Cost		cost;
 	bool		ownscan;
 	double		rate;
-	LionCompetitor kind = lion_competitor_of(rel, &cost, &ownscan, &rate);
+	Cost		nlcold;
+	Cost		coldpage;
+	LionCompetitor kind = lion_competitor_of(NULL, rel, &cost, &ownscan,
+											 &rate, &nlcold, &coldpage);
 
 	return lion_competitor_margin(kind, false);
 }
