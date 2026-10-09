@@ -4,11 +4,7 @@
 -- and when the early stop ended a walk.  Each run's rows are compared, in
 -- order, with the same query with the node off.
 --
--- Not forced here: building a lazy set because the walk is not in heap
--- order.  It needs a walk of 64 keys within the probe budget, which a
--- random-order walk spends at about 8 a key per set, while the budget is
--- the sets' containers: sets of more than about 256 containers, 16,000
--- heap pages each.  Nor building one because the switch could be due by
+-- Not forced here: building a lazy set because the switch could be due by
 -- the set's recorded member count: ordered.sql forces that (case 15).
 \set VERBOSITY terse
 SET client_min_messages = warning;
@@ -169,6 +165,34 @@ RESET pg_lion.ordered_switch_ratio;
 SELECT * FROM otr_run('EXECUTE otr_far(3)');
 SELECT otr_same('EXECUTE otr_far(3)',
 	'SELECT id FROM otr WHERE a = 3 AND b = 4 ORDER BY id');
+
+-- 9. A lazy set built because the walk does not go in heap order: of the
+--    first 64 container keys it evaluates, one in four lies behind the one
+--    before.  The walk must get that far within the probe budget, which
+--    counts every leaf key's containers while a probe that finds the first
+--    key's set empty there seeks no other: a's rows lie in 8 containers the
+--    walk meets last, b's and c's in all 72 of a table of one row a page
+--    (64 pages a container), so the budget is 152 and the 64 keys cost 128
+--    (48 probes forward at 1, 16 behind at 5).  The walk: one row of each of
+--    the first 64 containers in the order 1, 2, 3, 0, 5, 6, 7, 4, ..., then
+--    every row in heap order.
+CREATE TABLE otr_h (id int, o int, a int, b int, c int, pad text)
+	WITH (fillfactor = 10, autovacuum_enabled = off);
+INSERT INTO otr_h SELECT p,
+	   CASE WHEN p % 64 = 0 AND p < 64 * 64
+			THEN (p / 256) * 4 + CASE WHEN (p / 64) % 4 = 0 THEN 3 ELSE (p / 64) % 4 - 1 END
+			ELSE 1000 + p END,
+	   (p >= 64 * 64)::int, p % 2, (p / 2) % 2, repeat('x', 1000)
+  FROM generate_series(0, 72 * 64 - 1) p;
+CREATE INDEX otr_h_l ON otr_h USING lion (a, b, c);
+CREATE INDEX otr_h_o ON otr_h (o, id);
+VACUUM (FREEZE, ANALYZE) otr_h;
+-- row p on page p
+SELECT count(*) FROM otr_h WHERE ctid <> format('(%s,1)', id)::tid;
+SELECT * FROM otr_run('SELECT id FROM otr_h WHERE a = 1 AND b = 1 AND c = 1 ORDER BY o, id LIMIT 10');
+SELECT otr_same('SELECT id FROM otr_h WHERE a = 1 AND b = 1 AND c = 1 ORDER BY o, id LIMIT 10',
+	'SELECT id FROM otr_h WHERE a = 1 AND b = 1 AND c = 1 ORDER BY o, id LIMIT 10');
+DROP TABLE otr_h;
 
 RESET plan_cache_mode;
 RESET enable_sort;

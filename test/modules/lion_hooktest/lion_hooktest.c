@@ -17,7 +17,12 @@
  *	- when preloaded, a custom WAL resource manager under the id in
  *	  lion_hooktest.rmgr_id, RM_EXPERIMENTAL_ID by default - pg_lion's own
  *	  default, so that the collision is the default case;
- *	- a GUC prefix of its own, reserved the way pg_lion reserves "pg_lion".
+ *	- a GUC prefix of its own, reserved the way pg_lion reserves "pg_lion";
+ *	- object_access_hook, refusing the execution of the one function named by
+ *	  OID in lion_hooktest.deny_execute, as a security module such as sepgsql
+ *	  refuses one: the hook that InvokeFunctionExecuteHook() calls, which a
+ *	  lion node that stands in for an expression must call as the executor
+ *	  would have (sql/exec_hook.sql).
  *
  * It also provides lion_hooktest_heapcopy_handler(), a table access method
  * whose routine is a copy of the heap's: a table AM that stores heap tuples
@@ -35,6 +40,8 @@
 
 #include "access/tableam.h"
 #include "access/xlog_internal.h"
+#include "catalog/objectaccess.h"
+#include "catalog/pg_proc.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
@@ -42,6 +49,7 @@
 #include "optimizer/paths.h"
 #include "optimizer/planner.h"
 #include "utils/guc.h"
+#include "utils/regproc.h"
 
 #include "lion_plan_private.h"
 
@@ -66,6 +74,8 @@ static int64 rel_hook_calls = 0;
 static int64 rel_hook_saw_ordered = 0;
 static int	hooktest_rmgr_id = RM_EXPERIMENTAL_ID;
 static TableAmRoutine heapcopy_routine;
+static object_access_hook_type prev_object_access_hook = NULL;
+static char *hooktest_deny_execute = NULL;
 
 static void
 hooktest_redo(XLogReaderState *record)
@@ -143,6 +153,26 @@ hooktest_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	}
 }
 
+/*
+ * The function lion_hooktest.deny_execute names (an OID, empty for none) may
+ * not be executed: refused as a privilege error, as sepgsql refuses one.
+ */
+static void
+hooktest_object_access(ObjectAccessType access, Oid classId, Oid objectId,
+					   int subId, void *arg)
+{
+	if (prev_object_access_hook != NULL)
+		prev_object_access_hook(access, classId, objectId, subId, arg);
+
+	if (access == OAT_FUNCTION_EXECUTE && classId == ProcedureRelationId &&
+		hooktest_deny_execute != NULL && hooktest_deny_execute[0] != '\0' &&
+		objectId == atooid(hooktest_deny_execute))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("lion_hooktest: execution of %s denied",
+						format_procedure(objectId))));
+}
+
 void
 _PG_init(void)
 {
@@ -159,12 +189,22 @@ _PG_init(void)
 								NULL, NULL, NULL);
 		RegisterCustomRmgr((RmgrId) hooktest_rmgr_id, &hooktest_rmgr);
 	}
+	DefineCustomStringVariable("lion_hooktest.deny_execute",
+							   "OID of a function whose execution the object access hook refuses.",
+							   NULL,
+							   &hooktest_deny_execute,
+							   "",
+							   PGC_SUSET,
+							   0,
+							   NULL, NULL, NULL);
 	MarkGUCPrefixReserved("lion_hooktest");
 
 	prev_create_upper_paths_hook = create_upper_paths_hook;
 	create_upper_paths_hook = hooktest_create_upper_paths;
 	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = hooktest_set_rel_pathlist;
+	prev_object_access_hook = object_access_hook;
+	object_access_hook = hooktest_object_access;
 }
 
 Datum
