@@ -83,7 +83,10 @@ lion_index_col_expr(IndexOptInfo *idx, int i)
  * each key column of a whole (non-partial) index that is an expression and
  * has a scalar opclass, whose entries are the expression's values, one per
  * row, and that reads a column: an index on `(1)` has one entry for every
- * row and stands for no expression a query writes.  A multi-key column's
+ * row and stands for no expression a query writes.  Nor is a binary-coercible
+ * cast of a column one, `(v::text)` of a varchar v: stripped of its relabel it
+ * is the bare column, which is a column already, not an expression the plan
+ * can carry (lion_count_priv_decode() refuses it).  A multi-key column's
  * entries are keys, which answer only its own
  * operators (DESIGN.md §17), and a partial index needs its predicate.  Each
  * expression once, relabels stripped, in the order the indexes come: the
@@ -110,7 +113,7 @@ lion_vcol_collect(RelOptInfo *rel)
 		{
 			Node	   *expr = lion_index_col_expr(idx, i);
 
-			if (expr == NULL || !contain_var_clause(expr) ||
+			if (expr == NULL || IsA(expr, Var) || !contain_var_clause(expr) ||
 				lion_opfamily_is_multikey(idx->opfamily[i],
 										 idx->opcintype[i]) ||
 				list_member(vcols, expr))
@@ -244,6 +247,63 @@ lion_vcol_unvar_mutator(Node *node, void *context)
 		return lion_vcol_unvar_mutator((Node *) ((RestrictInfo *) node)->clause,
 									   context);
 	return expression_tree_mutator(node, lion_vcol_unvar_mutator, context);
+}
+
+/*
+ * What an expression refers to, as pull_var_clause() finds it with aggregates
+ * kept whole and window functions recursed into - the Vars, Aggrefs,
+ * GroupingFuncs and PlaceHolderVars - except that an expression column is one
+ * reference, its expression, rather than the columns inside it.  A tuple
+ * that holds these can evaluate the expression, and the node's tuple holds an
+ * expression column where it could not hold the column it reads.
+ */
+typedef struct LionVColRefs
+{
+	List	   *vcols;
+	List	   *refs;
+} LionVColRefs;
+
+static bool
+lion_vcol_refs_walker(Node *node, LionVColRefs *cxt)
+{
+	ListCell   *lc;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref) || IsA(node, GroupingFunc) ||
+		IsA(node, PlaceHolderVar) || IsA(node, Var))
+	{
+		cxt->refs = lappend(cxt->refs, node);
+		return false;
+	}
+	foreach(lc, cxt->vcols)
+	{
+		if (equal(lion_strip(node), lfirst(lc)))
+		{
+			cxt->refs = lappend(cxt->refs, node);
+			return false;
+		}
+	}
+	return expression_tree_walker(node, lion_vcol_refs_walker, (void *) cxt);
+}
+
+/* node's references, with the expression columns of the scope ... */
+List *
+lion_vcol_refs(Node *node)
+{
+	return lion_vcol_refs_with(node, lion_vcol_scope.vcols);
+}
+
+/* ... or of any list of them, as the plan carries it (LION_PRIV_VCOLS) */
+List *
+lion_vcol_refs_with(Node *node, List *vcols)
+{
+	LionVColRefs cxt;
+
+	cxt.vcols = vcols;
+	cxt.refs = NIL;
+	(void) lion_vcol_refs_walker(node, &cxt);
+	return cxt.refs;
 }
 
 /*
