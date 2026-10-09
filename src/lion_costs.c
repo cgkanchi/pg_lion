@@ -236,12 +236,13 @@ static const LionRateSetting lion_rate_settings[] = {
 
 /*
  * Register the settings, from _PG_init.  They are user settings, real-valued
- * from 0 to DBL_MAX as core's cost settings are, and shown by EXPLAIN
- * (SETTINGS) when changed.  pg_settings lists them among the customized
- * options, as it does every extension's: no API puts a custom setting in one
- * of core's groups, and core's own records are not an extension's to edit.
- * The rates are ratios, from a thousandth to a thousand: a rate of 0 would
- * make lion's CPU free.
+ * from 0 to 1.0e15, capped as core caps its own cost settings so that no
+ * price, multiplied into the costs it is read for, overflows one to
+ * infinity, and shown by EXPLAIN (SETTINGS) when changed.  pg_settings lists
+ * them among the customized options, as it does every extension's: no API
+ * puts a custom setting in one of core's groups, and core's own records are
+ * not an extension's to edit.  The rates are ratios, from a thousandth to a
+ * thousand: a rate of 0 would make lion's CPU free.
  */
 void
 lion_costs_init(void)
@@ -260,7 +261,7 @@ lion_costs_init(void)
 								 "A multiplier of one price of lion's cost model, for calibrating the model; the default is the value the price was measured or derived at.",
 								 s->variable,
 								 s->boot,
-								 0.0, DBL_MAX,
+								 0.0, 1.0e15,
 								 PGC_USERSET,
 								 GUC_EXPLAIN,
 								 NULL, NULL, NULL);

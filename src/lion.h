@@ -1472,8 +1472,14 @@ extern void lion_entry_size_error(Page page, ItemId iid);
  * header and the key it claims: an ERROR (ERRCODE_INDEX_CORRUPTED) when the
  * item does not hold them whole, since every reader compares or decodes the
  * keylen bytes after the header, and a damaged keylen would send it past the
- * item.  A few compares per item, so readers can afford it on every entry
- * they look at; writers have lion_page_entry_fetch(), which checks more.
+ * item.  The key's aligned end is checked too: it is where the payload
+ * begins (LionEntryPayloadOffset(), which a CHAIN entry is exactly as long
+ * as and an INLINE one's payload follows), and a reader of an INLINE entry
+ * counts the payload's length from it against the item's, so an item that
+ * ends inside the key's alignment padding would make it count backwards -
+ * a huge length - and read past the item.  A few compares per item, so
+ * readers can afford it on every entry they look at; writers have
+ * lion_page_entry_fetch(), which checks more.
  */
 static inline LionEntryTuple *
 lion_entry_at(Page page, ItemId iid)
@@ -1483,7 +1489,8 @@ lion_entry_at(Page page, ItemId iid)
 
 	if (unlikely((Size) ItemIdGetOffset(iid) + len > BLCKSZ ||
 				 len < LION_ENTRY_HDRSZ ||
-				 len - LION_ENTRY_HDRSZ < (Size) e->keylen))
+				 len - LION_ENTRY_HDRSZ < (Size) e->keylen ||
+				 LionEntryPayloadOffset(e) > len))
 		lion_entry_size_error(page, iid);
 	return e;
 }
