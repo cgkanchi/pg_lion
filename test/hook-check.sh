@@ -20,7 +20,8 @@
 #   1. nothing preloaded: the table-AM test, the plan decoder's (malformed
 #      custom_private lists, which no planner makes), then LOAD-on-first-use
 #      in both orders - lion_hooktest LOADed before pg_lion's first use, and
-#      after;
+#      after - and every custom node under an object access hook that refuses
+#      the function it stands in for (sql/exec_hook.sql);
 #   2. shared_preload_libraries = 'pg_lion,lion_hooktest' (the other hook
 #      outermost) and 'lion_hooktest,pg_lion' (pg_lion's outermost), with
 #      pg_lion.rmgr_id moved to 129 so the two resource managers coexist;
@@ -119,6 +120,7 @@ eval "$("$ROOT/dev.sh" env)"
 start_with "" || exit 1
 run "no preload, table AMs" tableam
 run "no preload, the plan decoder" priv_decode
+run "no preload, the function-execute hook" exec_hook
 run "no preload, lion_hooktest LOADed first" hooks_setup hooks_lion_outer
 run "no preload, pg_lion loaded first" hooks_setup hooks_hooktest_outer
 
