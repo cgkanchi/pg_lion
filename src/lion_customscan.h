@@ -580,6 +580,33 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 	((k) == LION_CLAUSE_EQ || (k) == LION_CLAUSE_NULL)
 
 /*
+ * Expression columns (DESIGN.md §41).  An expression a lion index is built on
+ * - `(doc->>'status')` - is one more column of the table as far as the count
+ * pushdown is concerned: the planner gives it an attribute number past every
+ * heap column's, LION_VCOL_ATTNO(i) for the i'th expression of the plan's
+ * VCOLS member, and from there on it is grouped, pinned, counted and matched
+ * to its index as a column is.  No heap column has such a number
+ * (MaxHeapAttributeNumber), so nothing that reads one can mistake it for a
+ * column, and everything that asks the catalogue about a column by number is
+ * kept away from it.
+ */
+#define LION_VATTNO_BASE		((AttrNumber) (MaxHeapAttributeNumber + 1))
+#define LION_MAX_VCOLS			64
+#define LION_ATTNO_IS_VCOL(a)	((a) >= LION_VATTNO_BASE)
+#define LION_VCOL_ATTNO(i)		((AttrNumber) (LION_VATTNO_BASE + (i)))
+#define LION_VCOL_INDEX(a)		((int) ((a) - LION_VATTNO_BASE))
+
+/*
+ * The expression columns of the count path being planned, and the range
+ * table index their Vars carry (lion_vcol_enter()).
+ */
+typedef struct LionVColScope
+{
+	List	   *vcols;
+	Index		rti;
+} LionVColScope;
+
+/*
  * What the tests of a count(DISTINCT k) walk are (DESIGN.md §26), as far as
  * the cost model is concerned: none at all, existence tests that stop at the
  * first visible row, or full counts because the target list wants rows too.
@@ -1016,7 +1043,11 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  *		IntList per aggregate - its LION_WAGG_* kind, the column's position in
  *		those lists and the width of its integer argument - whose argument
  *		expressions it appends to custom_exprs after the clause values
- *	19	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	19	List, or empty: the expression columns (DESIGN.md §41), each the
+ *		expression of a lion index's key column as the scan's relation
+ *		numbers its Vars; an attnum of LION_VCOL_ATTNO(i) anywhere above names
+ *		the i'th.  Empty when no attnum does
+ *	20	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -1038,7 +1069,8 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_PRIV_ALLROWS	16
 #define LION_PRIV_TOPK		17
 #define LION_PRIV_WAGG		18
-#define LION_PRIV_TLKINDS	19
+#define LION_PRIV_VCOLS		19
+#define LION_PRIV_TLKINDS	20
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -1110,6 +1142,10 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * and maxima over the entries of lion columns (DESIGN.md §37), which an older
  * build would have taken for counts.
  *
+ * Shape 22 added the VCOLS member (19) in front of the target-list kinds:
+ * expression columns (DESIGN.md §41), whose attnums an older build would have
+ * looked up as heap columns.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1122,8 +1158,8 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424915
-#define LION_PRIV_NMEMBERS	20
+#define LION_PRIV_MAGIC		0x52424916
+#define LION_PRIV_NMEMBERS	21
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -1977,6 +2013,8 @@ typedef struct LionCountPriv
 	int			nwagg;			/* PLAN stage only */
 	LionCountPrivWAgg *wagg;
 
+	List	   *vcols;			/* VCOLS (§41): expressions, or NIL */
+
 	int			ntl;			/* TLKINDS: PLAN stage only */
 	int		   *tlkind;
 
@@ -2740,6 +2778,15 @@ extern bool *lion_or_leaf_map(List *ors, int nclause);
 extern int *lion_or_group_map(List *ors, int nclause);
 extern int *lion_rangesrc_leaders(List *whereidx, List *wherecol,
 								  List *wherekinds, List *ors, int nclause);
+extern List *lion_vcol_collect(RelOptInfo *rel);
+extern LionVColScope lion_vcol_enter(List *vcols, Index rti);
+extern void lion_vcol_leave(LionVColScope saved);
+extern Node *lion_vcol_subst(Node *node);
+extern Node *lion_vcol_subst_with(Node *node, List *vcols, Index rti);
+extern Node *lion_vcol_unvar(Node *node);
+extern bool lion_vcol_used(Node *node);
+extern bool lion_index_col_is_vcol(Relation index, int col, Node *vcol);
+extern char *lion_vcol_name(Oid relid, Node *vcol);
 
 /* lion_plan_partition.c */
 extern Var *lion_child_var(PlannerInfo *root, Index childrelid,
@@ -2774,6 +2821,7 @@ extern PathTarget *lion_make_partial_target(PlannerInfo *root,
 extern List *lion_replaced_functions(RelOptInfo *rel, List *tlexprs,
 									 List *having, List *groupclause,
 									 const LionFkJoin *fj);
+extern List *lion_expr_functions(Node *expr, List *funcs);
 
 /*
  * The kinds of core plan a lion path is priced against (DESIGN.md §39,
@@ -2927,7 +2975,7 @@ extern Plan *lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 /* lion_exec_begin.c */
 extern Node *lion_create_custom_scan_state(CustomScan *cscan);
 extern AttrNumber lion_index_col_for(Relation index, AttrNumber heapattno,
-									 bool multikey);
+									 bool multikey, List *vcols);
 extern AttrNumber lion_heap_attno_in(Relation heap, Oid parentoid,
 									 AttrNumber parentattno);
 extern void lion_open_relation(LionCountScanState *st, int p);

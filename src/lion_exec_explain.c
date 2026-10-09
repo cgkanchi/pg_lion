@@ -13,6 +13,20 @@
 #include "lion_customscan.h"
 
 /*
+ * A column of the plan by name, or an expression column (DESIGN.md §41) as
+ * its expression.
+ */
+static const char *
+lion_explain_attname(LionCountScanState *st, AttrNumber attno)
+{
+	if (LION_ATTNO_IS_VCOL(attno) &&
+		LION_VCOL_INDEX(attno) < list_length(st->plan.vcols))
+		return lion_vcol_name(st->plan.heapoid,
+							  list_nth(st->plan.vcols, LION_VCOL_INDEX(attno)));
+	return get_attname(st->plan.heapoid, attno, false);
+}
+
+/*
  * "col = 3", "col = ANY ('{1,2,3}'::integer[])", "col IS NULL",
  * "col IS NOT NULL", "tags @> '{a,b}'::text[]", "col >= 10" (a range,
  * DESIGN.md §28, with the column on the left whichever side the query had it
@@ -34,7 +48,7 @@ static void
 lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors,
 				   ExplainState *es, StringInfo buf)
 {
-	const char *attname = get_attname(st->plan.heapoid, cl->attno, false);
+	const char *attname = lion_explain_attname(st, cl->attno);
 
 	switch (cl->kind)
 	{
@@ -94,7 +108,7 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
  * index name at all, so it never gets here with a parent's numbering.
  */
 static const char *
-lion_explain_col(Oid idxoid, AttrNumber heapattno, bool multikey)
+lion_explain_col(Oid idxoid, AttrNumber heapattno, bool multikey, List *vcols)
 {
 	static char buf[NAMEDATALEN + 2];
 	Relation	idx;
@@ -110,7 +124,7 @@ lion_explain_col(Oid idxoid, AttrNumber heapattno, bool multikey)
 		return "";
 	}
 
-	col = lion_index_col_for(idx, heapattno, multikey);
+	col = lion_index_col_for(idx, heapattno, multikey, vcols);
 	snprintf(buf, sizeof(buf), ".%s",
 			 NameStr(TupleDescAttr(RelationGetDescr(idx), col - 1)->attname));
 	index_close(idx, AccessShareLock);
@@ -120,10 +134,10 @@ lion_explain_col(Oid idxoid, AttrNumber heapattno, bool multikey)
 
 /* ... for one clause, whose kind says which kind of column answers it. */
 static const char *
-lion_explain_clause_col(const LionClauseState *cl)
+lion_explain_clause_col(LionCountScanState *st, const LionClauseState *cl)
 {
 	return lion_explain_col(cl->idxoid, cl->attno,
-							cl->kind == LION_CLAUSE_MULTI);
+							cl->kind == LION_CLAUSE_MULTI, st->plan.vcols);
 }
 
 /* One arm of an OR, `len` leaves from leaf `at`: `((b = 2) AND (c = 3))`. */
@@ -372,7 +386,7 @@ lion_explain_group_index(LionCountScanState *st, List *ancestors,
 	if (st->npart == 0)
 		appendStringInfo(buf, "%s%s ", get_rel_name(st->plan.groupidxoid),
 						 lion_explain_col(st->plan.groupidxoid,
-										  st->driveattno, false));
+										  st->driveattno, false, st->plan.vcols));
 	if (lion_plan_flag(st, LION_FLAG_RANGE))
 	{
 		bool		firstrange = true;
@@ -392,7 +406,7 @@ lion_explain_group_index(LionCountScanState *st, List *ancestors,
 	}
 	else if (st->plan.groupattno != 0 || st->plan.distattno != 0)
 		appendStringInfo(buf, "(%s)",
-						 get_attname(st->plan.heapoid, st->driveattno, false));
+						 lion_explain_attname(st, st->driveattno));
 	else
 	{
 		bool		keys = false;
@@ -418,9 +432,9 @@ lion_explain_group_index(LionCountScanState *st, List *ancestors,
 		if (st->npart == 0)
 			appendStringInfo(buf, "%s%s ", get_rel_name(st->plan.groupidxoid2),
 							 lion_explain_col(st->plan.groupidxoid2,
-											  st->innerattno, false));
+											  st->innerattno, false, st->plan.vcols));
 		appendStringInfo(buf, "(%s)",
-						 get_attname(st->plan.heapoid, st->innerattno, false));
+						 lion_explain_attname(st, st->innerattno));
 	}
 
 	/*
@@ -433,9 +447,8 @@ lion_explain_group_index(LionCountScanState *st, List *ancestors,
 			appendStringInfo(buf, ", %s%s (%s)",
 							 get_rel_name(st->decode->idxoid[i]),
 							 lion_explain_col(st->decode->idxoid[i],
-											  st->decode->attno[i], false),
-							 get_attname(st->plan.heapoid,
-										 st->decode->attno[i], false));
+											  st->decode->attno[i], false, st->plan.vcols),
+							 lion_explain_attname(st, st->decode->attno[i]));
 	}
 }
 
@@ -466,7 +479,7 @@ lion_explain_range_item(LionCountScanState *st, LionSourceItem *it,
 		appendStringInfoString(buf, ", ");
 	if (st->npart == 0)
 		appendStringInfo(buf, "%s%s ", get_rel_name(first->idxoid),
-						 lion_explain_clause_col(first));
+						 lion_explain_clause_col(st, first));
 	appendStringInfoChar(buf, '(');
 	for (j = 0; j < st->nclause; j++)
 	{
@@ -513,7 +526,7 @@ lion_explain_item(LionCountScanState *st, LionSourceItem *it,
 			LionClauseState *cl = &st->clause[it->clauseno];
 
 			appendStringInfo(buf, "%s%s ", get_rel_name(cl->idxoid),
-							 lion_explain_clause_col(cl));
+							 lion_explain_clause_col(st, cl));
 		}
 		appendStringInfoChar(buf, '(');
 		lion_explain_clause(st, &st->clause[it->clauseno],
@@ -539,7 +552,7 @@ lion_explain_item(LionCountScanState *st, LionSourceItem *it,
 				appendStringInfo(buf, "%s%s%s",
 								 leaf > 0 ? ", " : "",
 								 get_rel_name(cl->idxoid),
-								 lion_explain_clause_col(cl));
+								 lion_explain_clause_col(st, cl));
 			}
 			appendStringInfoChar(buf, ' ');
 		}
@@ -574,7 +587,7 @@ lion_explain_indexes(LionCountScanState *st, List *ancestors,
 		/* a partitioned fact table's fk index is one per partition (§16) */
 		if (st->npart == 0)
 			appendStringInfo(&buf, "%s%s ", get_rel_name(cl->idxoid),
-							 lion_explain_clause_col(cl));
+							 lion_explain_clause_col(st, cl));
 		appendStringInfoChar(&buf, '(');
 		lion_explain_clause(st, cl, ancestors, es, &buf);
 		appendStringInfoChar(&buf, ')');
@@ -724,8 +737,7 @@ lion_explain_join(LionCountScanState *st, ExplainState *es)
 		int			bound = 0;
 
 		ExplainPropertyText("Fact Group Key",
-							get_attname(st->plan.heapoid, st->fg->attno,
-										false),
+							lion_explain_attname(st, st->fg->attno),
 							es);
 		for (i = 0; i < st->npart; i++)
 			bound += (st->part[i].fgconst != NULL) ? 1 : 0;
@@ -765,8 +777,7 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 
 		initStringInfo(&buf);
 		appendStringInfo(&buf, "COALESCE(%s, %s)",
-						 get_attname(st->plan.heapoid, st->plan.groupattno,
-									 false),
+						 lion_explain_attname(st, st->plan.groupattno),
 						 val);
 		ExplainPropertyText("Group Key", buf.data, es);
 		pfree(buf.data);
@@ -783,8 +794,7 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 		initStringInfo(&buf);
 		for (c = 0; c < st->decode->ncol; c++)
 			appendStringInfo(&buf, "%s%s", (c > 0) ? ", " : "",
-							 get_attname(st->plan.heapoid,
-										 st->decode->attno[c], false));
+							 lion_explain_attname(st, st->decode->attno[c]));
 		ExplainPropertyText("Group Key", buf.data, es);
 		ExplainPropertyText("Group Strategy", "Decoded", es);
 		pfree(buf.data);
@@ -794,12 +804,10 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 	{
 		initStringInfo(&buf);
 		appendStringInfoString(&buf,
-							   get_attname(st->plan.heapoid,
-										   st->plan.groupattno, false));
+							   lion_explain_attname(st, st->plan.groupattno));
 		if (st->plan.groupattno2 != 0)
 			appendStringInfo(&buf, ", %s",
-							 get_attname(st->plan.heapoid,
-										 st->plan.groupattno2, false));
+							 lion_explain_attname(st, st->plan.groupattno2));
 		ExplainPropertyText("Group Key", buf.data, es);
 		pfree(buf.data);
 	}
@@ -807,8 +815,7 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 	/* The column count(DISTINCT) counts (DESIGN.md §26). */
 	if (st->plan.distattno != 0)
 		ExplainPropertyText("Distinct Key",
-							get_attname(st->plan.heapoid, st->plan.distattno,
-										false),
+							lion_explain_attname(st, st->plan.distattno),
 							es);
 
 	/* the columns aggregates are taken over (DESIGN.md §37) */
@@ -820,8 +827,7 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 		for (c = 0; c < st->wagg->ncol; c++)
 			appendStringInfo(&buf, "%s%s (%s)", (c > 0) ? ", " : "",
 							 get_rel_name(st->wagg->col[c].idxoid),
-							 get_attname(st->plan.heapoid,
-										 st->wagg->col[c].attno, false));
+							 lion_explain_attname(st, st->wagg->col[c].attno));
 		ExplainPropertyText("Aggregates Over Keys", buf.data, es);
 		pfree(buf.data);
 	}
