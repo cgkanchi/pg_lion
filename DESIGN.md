@@ -18420,11 +18420,14 @@ entry.
 
 ### 42.4 Size and speed
 
-On synthetic corpora (1M rows each, PostgreSQL 18): about 15 to 21 keys per document; the index
-1.0 to 1.4 times GIN jsonb_ops and 1.5 to 1.8 times jsonb_path_ops; the build faster than
-jsonb_ops and level with jsonb_path_ops; `@>` and `?` counts 27 to 200 times faster than GIN
-whenever more than a few hundred rows match, because GIN rechecks every `@>` in the heap and the
-count pushdown needs no heap on all-visible pages. A lossy query ties GIN.
+On synthetic corpora (1M documents each, PostgreSQL 18; a catalog of low-cardinality fields, an
+event log with ids, timestamps and short text, orders with arrays of item objects): 15 to 21 keys
+per document; the index 1.0 to 1.4 times GIN jsonb_ops and 1.5 to 1.9 times jsonb_path_ops; a
+serial build 1.5 to 2.7 times faster than jsonb_ops and from 1.4 times slower to 1.5 times faster
+than jsonb_path_ops, and with three workers faster than either. Counts over `@>`, `?`, `?|` and
+`?&` were 25 to 500 times faster than through GIN, and twice as fast for one matching 4 rows
+(GIN rechecks every `@>` in the heap; the count pushdown reads no heap on all-visible pages), and
+the lossy `{"items": [{"sku": .., "qty": ..}]}` 17 times, rechecking only the rows its keys select.
 
 ### 42.5 Tests
 
