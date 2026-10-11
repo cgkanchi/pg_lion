@@ -708,8 +708,10 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				Node	   *arg = lion_strip((Node *)
 											((TargetEntry *) linitial(agg->args))->expr);
 
-				Assert(arg != NULL && IsA(arg, Var));
-				attno = ((Var *) arg)->varattno;
+				/* count(1) of a non-NULL constant is count(*) */
+				Assert(arg != NULL && (IsA(arg, Var) || IsA(arg, Const)));
+				if (IsA(arg, Var))
+					attno = ((Var *) arg)->varattno;
 			}
 
 			/*

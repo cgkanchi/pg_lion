@@ -1591,7 +1591,8 @@ Planner integration
     this only declines an index that got past it; the executor checks again when it opens the
     relation.
   - The query has no DISTINCT, window functions, grouping sets, ORDER BY inside aggregates,
-    FILTER clauses, or aggregates other than `count(*)` and the `count(col)` cases of §14.
+    FILTER clauses, or aggregates other than `count(*)` (or `count(1)` of any non-NULL constant)
+    and the `count(col)` cases of §14.
     The target list holds those counts, the columns the rules below let it print, and any
     expression over them ("Shapes rewritten to the node's counts" at the end of this section).
   - **HAVING** is accepted when it is a filter the node can apply itself. By the time the hook runs,
@@ -2527,6 +2528,12 @@ target already held only the aggregates and columns, and the Finalize Agg comput
 The grouping `coalesce(col, c)` is still the one expression the node emits itself, and only that
 exact expression: `coalesce(count(*), 0)` is an expression over a count. 1M rows: `count(*)::int`
 with two filters 23 ms to 0.3 ms; the grouped `round(...)` 97 ms to 3 ms.
+
+**count(1).** `count(c)` of a constant that is not NULL counts every row, which is `count(*)`
+(`lion_agg_is_count()`), as the FK-side join already took it: `count(1)`, `count('x')`, and a
+constant expression `eval_const_expressions()` has folded. `count(NULL)` and a Param or stable
+argument are not taken. The plan classifies it as `count(*)`, and the top k accepts it as one.
+1M rows: 23 ms to 0.2 ms.
 
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 

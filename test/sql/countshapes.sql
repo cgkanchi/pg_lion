@@ -137,6 +137,20 @@ SELECT btrim(p) FROM cs_plan('SELECT a, count(*) + (SELECT count(*) FROM cs c2 W
  WHERE p ~ '(Aggregate|LionCount|SubPlan)';
 SELECT cs_q('SELECT a, count(*) + (SELECT count(*) FROM cs c2 WHERE c2.a = cs.a) FROM cs GROUP BY a');
 
+-- ---- count(1): a non-NULL constant is counted in every row ----
+SELECT cs_plan('SELECT count(1) FROM cs WHERE a = 3 AND b = 1');
+SELECT q, cs_q(q) FROM (VALUES
+	('SELECT count(1) FROM cs WHERE a = 3 AND b = 1'),
+	('SELECT count(''x''), count(1::bigint), count(*) FROM cs WHERE n = 4'),
+	('SELECT a, count(1) FROM cs WHERE b = 2 GROUP BY a'),
+	('SELECT n, count(1) FROM cs GROUP BY n'),
+	('SELECT count(1) FROM cs'),
+	('SELECT t, count(1) FROM cs GROUP BY t ORDER BY count(1) DESC LIMIT 1'),
+	('SELECT d.r, count(1) FROM cs JOIN csd d ON d.pk = cs.a GROUP BY d.r')
+) v(q);
+-- count(NULL) is 0 in every group, and not taken
+SELECT cs_q('SELECT a, count(NULL::int) FROM cs GROUP BY a');
+
 DROP FUNCTION cs_q(text);
 DROP FUNCTION cs_plan(text);
 DROP TABLE cs, csd;

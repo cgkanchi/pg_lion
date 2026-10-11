@@ -190,6 +190,41 @@ SELECT cs_q('SELECT a, count(*) + (SELECT count(*) FROM cs c2 WHERE c2.a = cs.a)
  count, 7 rows
 (1 row)
 
+-- ---- count(1): a non-NULL constant is counted in every row ----
+SELECT cs_plan('SELECT count(1) FROM cs WHERE a = 3 AND b = 1');
+                  cs_plan                   
+--------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: cs_a (a = 3), cs_b (b = 1)
+(2 rows)
+
+SELECT q, cs_q(q) FROM (VALUES
+	('SELECT count(1) FROM cs WHERE a = 3 AND b = 1'),
+	('SELECT count(''x''), count(1::bigint), count(*) FROM cs WHERE n = 4'),
+	('SELECT a, count(1) FROM cs WHERE b = 2 GROUP BY a'),
+	('SELECT n, count(1) FROM cs GROUP BY n'),
+	('SELECT count(1) FROM cs'),
+	('SELECT t, count(1) FROM cs GROUP BY t ORDER BY count(1) DESC LIMIT 1'),
+	('SELECT d.r, count(1) FROM cs JOIN csd d ON d.pk = cs.a GROUP BY d.r')
+) v(q);
+                                  q                                   |      cs_q      
+----------------------------------------------------------------------+----------------
+ SELECT count(1) FROM cs WHERE a = 3 AND b = 1                        | count, 1 rows
+ SELECT count('x'), count(1::bigint), count(*) FROM cs WHERE n = 4    | count, 1 rows
+ SELECT a, count(1) FROM cs WHERE b = 2 GROUP BY a                    | count, 7 rows
+ SELECT n, count(1) FROM cs GROUP BY n                                | count, 12 rows
+ SELECT count(1) FROM cs                                              | count, 1 rows
+ SELECT t, count(1) FROM cs GROUP BY t ORDER BY count(1) DESC LIMIT 1 | count, 1 rows
+ SELECT d.r, count(1) FROM cs JOIN csd d ON d.pk = cs.a GROUP BY d.r  | count, 3 rows
+(7 rows)
+
+-- count(NULL) is 0 in every group, and not taken
+SELECT cs_q('SELECT a, count(NULL::int) FROM cs GROUP BY a');
+       cs_q       
+------------------
+ no count, 7 rows
+(1 row)
+
 DROP FUNCTION cs_q(text);
 DROP FUNCTION cs_plan(text);
 DROP TABLE cs, csd;
