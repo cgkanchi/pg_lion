@@ -198,6 +198,11 @@ SET plan_cache_mode = force_generic_plan;
 PREPARE lion_cfp(int, int) AS
 	SELECT g, count(*) FILTER (WHERE b = $1), sum(CASE WHEN c = $2 THEN 1 ELSE 0 END)
 	FROM lion_cft GROUP BY g;
+-- a multi-key condition whose value only the run knows: with '{}' it narrows
+-- nothing, every row's array containing the empty one and none overlapping it
+PREPARE lion_cfq(int[]) AS
+	SELECT g, a, b, count(*) FILTER (WHERE tags @> $1) AS has, sum(CASE WHEN tags && $1 THEN 1 ELSE 0 END) AS meets, count(*) AS n
+	FROM lion_cft WHERE c = 2 GROUP BY g, a, b;
 BEGIN;
 SET LOCAL enable_seqscan = off;
 SET LOCAL enable_bitmapscan = off;
@@ -206,10 +211,15 @@ SET LOCAL enable_indexonlyscan = off;
 EXPLAIN (COSTS OFF) EXECUTE lion_cfp(1, 3);
 CREATE TEMP TABLE lion_cfr1 AS EXECUTE lion_cfp(1, 3);
 CREATE TEMP TABLE lion_cfr2 AS EXECUTE lion_cfp(2, 12);
+EXPLAIN (COSTS OFF) EXECUTE lion_cfq('{}');
+CREATE TEMP TABLE lion_cfr3 AS EXECUTE lion_cfq('{}');
+CREATE TEMP TABLE lion_cfr4 AS EXECUTE lion_cfq('{4, 12}');
 COMMIT;
 SET pg_lion.enable_count_pushdown = off;
 CREATE TEMP TABLE lion_cfs1 AS EXECUTE lion_cfp(1, 3);
 CREATE TEMP TABLE lion_cfs2 AS EXECUTE lion_cfp(2, 12);
+CREATE TEMP TABLE lion_cfs3 AS EXECUTE lion_cfq('{}');
+CREATE TEMP TABLE lion_cfs4 AS EXECUTE lion_cfq('{4, 12}');
 RESET pg_lion.enable_count_pushdown;
 SELECT * FROM lion_cfr1 ORDER BY g;
 SELECT * FROM lion_cfr2 ORDER BY g;
@@ -218,8 +228,16 @@ SELECT * FROM lion_cfr2 ORDER BY g;
 UNION ALL (SELECT * FROM lion_cfs1 EXCEPT SELECT * FROM lion_cfr1)
 UNION ALL (SELECT * FROM lion_cfr2 EXCEPT SELECT * FROM lion_cfs2)
 UNION ALL (SELECT * FROM lion_cfs2 EXCEPT SELECT * FROM lion_cfr2);
-DROP TABLE lion_cfr1, lion_cfr2, lion_cfs1, lion_cfs2;
+SELECT count(*) AS rows, sum(has) AS has, sum(meets) AS meets, sum(n) AS n FROM lion_cfr3;
+SELECT count(*) AS rows, sum(has) AS has, sum(meets) AS meets, sum(n) AS n FROM lion_cfr4;
+SELECT count(*) AS differ FROM (
+	(SELECT * FROM lion_cfr3 EXCEPT SELECT * FROM lion_cfs3)
+	UNION ALL (SELECT * FROM lion_cfs3 EXCEPT SELECT * FROM lion_cfr3)
+	UNION ALL (SELECT * FROM lion_cfr4 EXCEPT SELECT * FROM lion_cfs4)
+	UNION ALL (SELECT * FROM lion_cfs4 EXCEPT SELECT * FROM lion_cfr4)) d;
+DROP TABLE lion_cfr1, lion_cfr2, lion_cfr3, lion_cfr4, lion_cfs1, lion_cfs2, lion_cfs3, lion_cfs4;
 DEALLOCATE lion_cfp;
+DEALLOCATE lion_cfq;
 RESET plan_cache_mode;
 
 /*
