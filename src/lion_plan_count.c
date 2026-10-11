@@ -1319,6 +1319,68 @@ lion_count_path_distinct(LionCountPathBuild *cx)
 }
 
 /*
+ * count(col) of a nullable column (DESIGN.md §10, "Shapes rewritten to the
+ * node's counts"): without a GROUP BY, where every aggregate is count(col)
+ * of that one column, it is count(*) of the rows the WHERE selects AND `col
+ * IS NOT NULL` - a clause the posting sets answer (§14, §35), added here as
+ * if the query had written it.  A GROUP BY is not taken: a group whose rows
+ * all have col NULL is a row of 0 in the query and no row at all once the
+ * clause is added.  Nothing is done, and the checks after this decide, when
+ * the count is one lion_agg_is_count() already answers or the target holds
+ * anything else.
+ */
+static bool
+lion_count_path_countcol(LionCountPathBuild *cx)
+{
+	Var		   *col = NULL;
+	NullTest   *nt;
+	ListCell   *lc;
+
+	if (cx->fj != NULL || cx->ngroup != 0 || cx->singlegroup ||
+		cx->groupcoal != NULL || cx->distvar != NULL)
+		return true;
+	foreach(lc, cx->checkexprs)
+	{
+		Aggref	   *agg = (Aggref *) lfirst(lc);
+		Node	   *arg;
+
+		if (!IsA(agg, Aggref))
+			continue;
+		if (agg->aggfnoid != F_COUNT_ANY || agg->aggdistinct != NIL ||
+			agg->aggorder != NIL || agg->aggfilter != NULL ||
+			agg->aggvariadic || agg->agglevelsup != 0 ||
+			agg->aggsplit != AGGSPLIT_SIMPLE ||
+			agg->aggkind != AGGKIND_NORMAL || list_length(agg->args) != 1)
+			return true;
+		arg = lion_strip((Node *) ((TargetEntry *) linitial(agg->args))->expr);
+		if (arg == NULL || !IsA(arg, Var) ||
+			((Var *) arg)->varno != (int) cx->rti ||
+			((Var *) arg)->varattno <= 0 || ((Var *) arg)->varlevelsup != 0)
+			return true;
+		if (col == NULL)
+			col = (Var *) arg;
+		else if (col->varattno != ((Var *) arg)->varattno)
+			return true;
+		if (lion_agg_is_count(cx->root, agg, cx->rti, cx->input_rel,
+							  cx->groupattno, cx->ngroup, cx->nonnullattnos,
+							  cx->nullattnos))
+			return true;
+	}
+	if (col == NULL)
+		return true;
+
+	nt = makeNode(NullTest);
+	nt->arg = (Expr *) copyObject(col);
+	nt->nulltesttype = IS_NOT_NULL;
+	nt->argisrow = false;
+	nt->location = -1;
+	cx->rinfono++;
+	cx->rinfoclauses = lappend(cx->rinfoclauses,
+							   lion_vcol_unvar((Node *) nt));
+	return lion_count_path_where_leaf(cx, NULL, (Node *) nt);
+}
+
+/*
  * An aggregate over the entries of lion column attno (DESIGN.md §37): taken
  * over one table with no WHERE and no GROUP BY, where every entry of a
  * scalar column is its rows' value, and from a whole index on the column
@@ -2814,6 +2876,8 @@ lion_try_count_path_scoped(LionCountPathBuild *cxp)
 	if (!lion_count_path_having(&cx))
 		return;
 	if (!lion_count_path_distinct(&cx))
+		return;
+	if (!lion_count_path_countcol(&cx))
 		return;
 	if (!lion_count_path_outputs(&cx))
 		return;
