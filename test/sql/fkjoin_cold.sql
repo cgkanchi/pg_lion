@@ -1,0 +1,80 @@
+-- A nested loop's cold reads (DESIGN.md §39, "A nested loop's cold reads"):
+-- a lion FK-side join priced against a nested loop into a parameterized index
+-- scan takes the pages that scan will find outside the cache into account -
+-- the share of the query's tables and the index that effective_cache_size
+-- cannot hold, each read charged pg_lion.cold_page_cost over what core
+-- charged it - and its own reads the same way.  With the tables inside the
+-- cache nothing changes.  Every answer is the same whichever plan is taken.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+
+-- small enough for ANALYZE to read every row: the estimates are exact
+CREATE TABLE lion_cold_d (pk int8 PRIMARY KEY, grp int NOT NULL);
+INSERT INTO lion_cold_d SELECT i, i % 100 FROM generate_series(1, 1500) i;
+CREATE TABLE lion_cold_f (fk int8 NOT NULL, x int NOT NULL);
+INSERT INTO lion_cold_f
+SELECT 1 + (i::int8 * 7919) % 1500, i % 10 FROM generate_series(1, 30000) i;
+CREATE INDEX lion_cold_f_fk ON lion_cold_f (fk);
+CREATE INDEX lion_cold_f_lion ON lion_cold_f USING lion (x, fk);
+VACUUM (FREEZE, ANALYZE) lion_cold_d;
+VACUUM (FREEZE, ANALYZE) lion_cold_f;
+
+/*
+ * lion_cold_plan() names the node that answers the semi join of q: the
+ * nested loop, lion's semi join, or lion's count over the dimension.
+ */
+CREATE FUNCTION lion_cold_plan(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Nested Loop Semi Join' THEN
+			RETURN 'nested loop';
+		ELSIF ln ~ 'LionSemiJoin' THEN
+			RETURN 'lion semi join';
+		ELSIF ln ~ 'LionCount' THEN
+			RETURN 'lion count';
+		ELSIF ln ~ 'Hash' THEN
+			RETURN 'hash join';
+		END IF;
+	END LOOP;
+	RETURN 'other';
+END $$;
+
+-- four keys, twenty fact rows each on as many heap pages
+-- the tables fit in the cache: the nested loop, at core's price
+SET effective_cache_size = '4GB';
+SELECT lion_cold_plan('SELECT count(*) FROM lion_cold_d d WHERE d.pk < 5 AND EXISTS (SELECT 1 FROM lion_cold_f f WHERE f.fk = d.pk AND f.x < 9)');
+-- a cache smaller than the tables: the loop's probes read some 70 pages,
+-- the semi join a handful, and the semi join is taken
+SET effective_cache_size = '1MB';
+SELECT lion_cold_plan('SELECT count(*) FROM lion_cold_d d WHERE d.pk < 5 AND EXISTS (SELECT 1 FROM lion_cold_f f WHERE f.fk = d.pk AND f.x < 9)');
+-- ... and not with the charge off: the nested loop again
+SET pg_lion.cold_page_cost = 0;
+SELECT lion_cold_plan('SELECT count(*) FROM lion_cold_d d WHERE d.pk < 5 AND EXISTS (SELECT 1 FROM lion_cold_f f WHERE f.fk = d.pk AND f.x < 9)');
+RESET pg_lion.cold_page_cost;
+
+-- the same answer either way: the semi join's, the loop's, and a plain scan's
+SET effective_cache_size = '1MB';
+SELECT count(*) FROM lion_cold_d d WHERE d.pk < 5 AND EXISTS (SELECT 1 FROM lion_cold_f f WHERE f.fk = d.pk AND f.x < 9);
+SET effective_cache_size = '4GB';
+SELECT count(*) FROM lion_cold_d d WHERE d.pk < 5 AND EXISTS (SELECT 1 FROM lion_cold_f f WHERE f.fk = d.pk AND f.x < 9);
+SET pg_lion.enable_count_pushdown = off;
+SET pg_lion.enable_semijoin = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) FROM lion_cold_d d WHERE d.pk < 5 AND EXISTS (SELECT 1 FROM lion_cold_f f WHERE f.fk = d.pk AND f.x < 9);
+RESET pg_lion.enable_count_pushdown;
+RESET pg_lion.enable_semijoin;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+RESET effective_cache_size;
+
+DROP TABLE lion_cold_f, lion_cold_d;
+DROP FUNCTION lion_cold_plan(text);
