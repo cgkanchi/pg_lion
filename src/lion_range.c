@@ -1058,7 +1058,7 @@ lion_entry_scan_remember(LionEntryScan *es, const LionEntryTuple *entry)
 {
 	MemoryContextReset(es->cxt);
 	es->lastkind = lion_entry_kind(entry);
-	es->lasthash = lion_entry_hash(es->state, entry);
+	es->lasthash = 0;			/* recomputed from the key (§21) */
 	es->lastkeylen = entry->keylen;
 	es->resumekind = -1;
 
@@ -1259,6 +1259,7 @@ lion_entry_scan_fill(LionEntryScan *es, bool copy)
 		sk.key = LION_KIND_HAS_KEY(es->lastkind) ?
 			lion_fetch_key(state, es->lastkey) : (Datum) 0;
 		sk.hash = es->lasthash;
+		sk.hashlazy = (es->lastkind == LION_KIND_VALUE);
 		sk.cmpproc = state->ordered ? &state->cmpproc : NULL;
 		sk.eqproc = &state->eqproc;
 		sk.collation = state->collation;

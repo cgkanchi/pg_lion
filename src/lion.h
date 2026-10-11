@@ -1410,6 +1410,10 @@ extern bool lion_keys_equal(LionState *state, Datum a, Datum b);
  *				one the index would have stored for it, which for a cross-type
  *				search is the SEARCH type's own hash function: a roaring
  *				opfamily's types hash compatibly)
+ *	hashlazy	hash is not filled in: it is lion_hash_key(col, key), and the
+ *				comparison computes it the first time the order needs it,
+ *				which in an ordered column is only on a proc-4 tie (a key
+ *				made from a stored entry, lion_search_key_exact())
  *	cmpproc		comparison of a STORED key against this one, stored key on the
  *				LEFT; NULL means the index has no ordering and the prefix is
  *				(kind, hash) alone
@@ -1429,6 +1433,7 @@ typedef struct LionSearchKey
 	int			kind;
 	Datum		key;
 	uint32		hash;
+	bool		hashlazy;
 	FmgrInfo   *cmpproc;
 	FmgrInfo   *eqproc;
 	Oid			collation;
