@@ -545,7 +545,7 @@ lion_open_relation(LionCountScanState *st, int p)
 			lion_index_col_for(st->clause[i].idx,
 							   lion_heap_attno_in(st->heap, st->plan.heapoid,
 												  st->clause[i].attno),
-							   st->clause[i].kind == LION_CLAUSE_MULTI,
+							   LION_CLAUSE_IS_MULTI(st->clause[i].kind),
 							   st->plan.vcols);
 	}
 	if (part != NULL)
@@ -1102,8 +1102,25 @@ lion_begin_ors_and_items(LionCountScanState *st, const LionCountPriv *priv)
 	st->inor = (bool *) palloc0(sizeof(bool) * Max(st->nclause, 1));
 	for (i = 0; i < st->nor; i++)
 	{
-		for (k = 0; k < st->ors[i].nleaves; k++)
-			st->inor[st->ors[i].first + k] = true;
+		LionOrState *o = &st->ors[i];
+		int			at = o->first;
+		int			a;
+
+		for (k = 0; k < o->nleaves; k++)
+			st->inor[o->first + k] = true;
+
+		/*
+		 * The complement arms (DESIGN.md §35): lion_count_priv_check() saw
+		 * to it that the leaves of an arm are all of one kind.
+		 */
+		o->armcompl = (bool *) palloc0(sizeof(bool) * Max(o->narms, 1));
+		o->compl = false;
+		for (a = 0; a < o->narms; a++)
+		{
+			o->armcompl[a] = LION_CLAUSE_IS_NEGATED(st->clause[at].kind);
+			o->compl |= o->armcompl[a];
+			at += o->armlen[a];
+		}
 	}
 
 	st->item = (LionSourceItem *)

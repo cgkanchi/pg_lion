@@ -560,6 +560,8 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_CLAUSE_RANGESRC	6	/* the same on a column that does not drive
 									 * the count: a source, DESIGN.md §32 */
 #define LION_CLAUSE_NE		7	/* col <> const, DESIGN.md §35 */
+#define LION_CLAUSE_DISTINCT	8	/* col IS DISTINCT FROM const, §35 */
+#define LION_CLAUSE_NOTMULTI	9	/* NOT (col @> / && / @@ const), §35 */
 
 /*
  * A RANGE clause is neither: it is not a source of the count at all, but a
@@ -570,11 +572,30 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  */
 #define LION_CLAUSE_IS_POSITIVE(k) \
 	((k) != LION_CLAUSE_NOTNULL && (k) != LION_CLAUSE_RANGE && \
-	 (k) != LION_CLAUSE_NE)
+	 !LION_CLAUSE_IS_NEGATED(k))
 
-/* ... and which are subtracted: a negated source (DESIGN.md §14, §35) */
+/*
+ * ... and which are subtracted: a negated source (DESIGN.md §14, §35).  Each
+ * is the complement of the sets it locates, which lion_locate_leaf() returns
+ * as they are: `IS NOT NULL` the NULL entry's, `<>` c's entry and the NULL
+ * one, `IS DISTINCT FROM c` c's entry alone (the NULL entry for a NULL c),
+ * and `NOT (multi-key query)` the query's exact sets and the NULL entry.  As
+ * a leaf of an OR such a clause is a complement arm's (§35, "Complements in
+ * an OR").
+ */
 #define LION_CLAUSE_IS_NEGATED(k) \
-	((k) == LION_CLAUSE_NOTNULL || (k) == LION_CLAUSE_NE)
+	((k) == LION_CLAUSE_NOTNULL || (k) == LION_CLAUSE_NE || \
+	 (k) == LION_CLAUSE_DISTINCT || (k) == LION_CLAUSE_NOTMULTI)
+
+/*
+ * The ORs with a complement arm one query may have (DESIGN.md §35,
+ * "Complements in an OR"): each turns every count into two.
+ */
+#define LION_MAX_COMPL_ORS	3
+
+/* Is the clause answered by a multi-key column (DESIGN.md §17)? */
+#define LION_CLAUSE_IS_MULTI(k) \
+	((k) == LION_CLAUSE_MULTI || (k) == LION_CLAUSE_NOTMULTI)
 
 /*
  * Which clause kinds pin their column to ONE value, so that a target list
@@ -1162,6 +1183,11 @@ typedef struct LionVColScope
  * expression columns (DESIGN.md §41), whose attnums an older build would have
  * looked up as heap columns.
  *
+ * Shape 23 moved no member but added two clause kinds, `IS DISTINCT FROM`
+ * and `NOT (multi-key query)`, and negated leaves in the arms of an OR
+ * (member 7): complements, counted by De Morgan (DESIGN.md §35, "Complements
+ * in an OR"), which an older build would have taken for selections.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1174,7 +1200,7 @@ typedef struct LionVColScope
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424916
+#define LION_PRIV_MAGIC		0x52424917
 #define LION_PRIV_NMEMBERS	21
 
 /*
@@ -1257,6 +1283,16 @@ typedef struct LionOrState
 	int			nleaves;
 	int			narms;
 	int		   *armlen;
+
+	/*
+	 * Which arms are COMPLEMENTS (DESIGN.md §35, "Complements in an OR"):
+	 * their leaves are negated clauses, and the arm is true of every row
+	 * outside the union of the sets they locate.  Derived from the leaves'
+	 * kinds when the node begins; NULL until then, and compl says whether
+	 * any arm is one.
+	 */
+	bool	   *armcompl;
+	bool		compl;
 } LionOrState;
 
 /*
@@ -2687,6 +2723,9 @@ typedef struct LionClauseInfo
 								 * so the index has to be able to produce it
 								 * (lion_index_can_emit_value()) */
 	bool		inor;			/* a leaf of an OR restriction (§19) */
+	bool		incompl;		/* ... of one with a complement arm, which
+								 * selects nothing and pins nothing by itself
+								 * (§35, "Complements in an OR") */
 	bool		positions;		/* a superset only the stored positions of
 								 * the index can decide (LionLeafInfo) */
 	int			rinfono;		/* the restriction it came from, its position
@@ -2806,6 +2845,7 @@ extern IndexOptInfo *lion_match_index(RelOptInfo *rel, AttrNumber attno,
 extern bool lion_index_stores_positions(IndexOptInfo *idx, AttrNumber col);
 extern BoolExpr *lion_boolean_not_test(Node *clause);
 extern List *lion_or_arms(Node *clause);
+extern List *lion_all_as_and(Node *clause);
 extern Node *lion_multikey_any_as_or(Node *clause);
 extern bool lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 							  bool allow_negated, bool allow_range,

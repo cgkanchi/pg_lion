@@ -243,6 +243,11 @@ typedef struct LionCountPathBuild
 	bool		topkstrict;		/* ... every group tied with the k-th */
 	List	   *vcols;			/* the expression columns (DESIGN.md §41) */
 	bool		distinctstage;	/* a SELECT DISTINCT's keys as the groups */
+	int			ncompl;			/* ORs with a complement arm (§35) */
+	bool		runtimemulti;	/* a multi-key clause outside the ORs whose
+								 * query is known only at run time (§17) */
+	bool		newnegated;		/* an `IS DISTINCT FROM` or `NOT (multi-key)`
+								 * clause outside the ORs (§35) */
 } LionCountPathBuild;
 
 static void lion_try_count_path_scoped(LionCountPathBuild *cxp);
@@ -714,6 +719,7 @@ lion_count_path_where_or(LionCountPathBuild *cx, Node *clause)
 	List	   *armlens = NIL;
 	int			orfirst = list_length(cx->whereattnos);
 	bool		thisrange = false;
+	bool		compl = false;
 	ListCell   *la;
 
 	/*
@@ -739,6 +745,15 @@ lion_count_path_where_or(LionCountPathBuild *cx, Node *clause)
 	 * (posattnos, eqattnos, nonnullattnos, nullattnos) takes them: the
 	 * other arm may hold rows where this arm's column is NULL, or is
 	 * anything at all.
+	 *
+	 * An arm may also be a COMPLEMENT (DESIGN.md §35, "Complements in an
+	 * OR"): an AND of clauses that each reject the rows of a few posting
+	 * sets - `<>`, `IS NOT NULL`, `IS DISTINCT FROM`, `NOT (tags @> ...)`.
+	 * Such an arm is true of every row outside the union N of its sets, and
+	 * the OR is then counted by De Morgan as two counts the executor adds
+	 * up: the rows outside M, the intersection of the complement arms' N,
+	 * and the rows inside M that a positive arm selects
+	 * (lion_node_count()).  An arm that mixes the two kinds is declined.
 	 */
 	if (list_length(((BoolExpr *) clause)->args) < 2)
 		return false;
@@ -751,12 +766,15 @@ lion_count_path_where_or(LionCountPathBuild *cx, Node *clause)
 	{
 		List	   *arm = (List *) lfirst(la);
 		ListCell   *lb;
+		int			nneg = 0;
 
 		foreach(lb, arm)
 		{
 			if (!lion_analyze_leaf(root, (Node *) lfirst(lb), rti,
-								  false, true, false, &leaf))
+								  true, true, false, &leaf))
 				return false;
+			if (LION_CLAUSE_IS_NEGATED(leaf.kind))
+				nneg++;
 
 			/*
 			 * A range in an arm is a leaf of the union like any other:
@@ -774,6 +792,10 @@ lion_count_path_where_or(LionCountPathBuild *cx, Node *clause)
 							  &cx->whereinor);
 			((LionClauseInfo *) llast(cx->clauseinfos))->rinfono = cx->rinfono;
 		}
+		if (nneg > 0 && nneg < list_length(arm))
+			return false;		/* a complement ANDed with a selection */
+		if (nneg > 0)
+			compl = true;
 		armlens = lappend_int(armlens, list_length(arm));
 	}
 
@@ -781,6 +803,25 @@ lion_count_path_where_or(LionCountPathBuild *cx, Node *clause)
 					  list_concat(list_make2_int(orfirst,
 												 list_length(armlens)),
 								  armlens));
+	if (thisrange)
+		cx->hasrangesrc = true;
+
+	/*
+	 * An OR with a complement arm selects nothing by itself: the rows
+	 * outside M are what something else - a group, the sum over every row
+	 * (§35) - has to hand the count, so it is no positive source of the AND
+	 * and carries no pin for one.  Each such OR doubles the counts every
+	 * count becomes, so there may be a few of them at most.
+	 */
+	if (compl)
+	{
+		ListCell   *lc;
+
+		for_each_from(lc, cx->clauseinfos, orfirst)
+			((LionClauseInfo *) lfirst(lc))->incompl = true;
+		cx->ncompl++;
+		return cx->ncompl <= LION_MAX_COMPL_ORS;
+	}
 	cx->havepositive = true;
 
 	/*
@@ -788,9 +829,7 @@ lion_count_path_where_or(LionCountPathBuild *cx, Node *clause)
 	 * leaf does, which a range collected into memory does not
 	 * (DESIGN.md §32).
 	 */
-	if (thisrange)
-		cx->hasrangesrc = true;
-	else
+	if (!thisrange)
 		cx->pinnedsrc = true;
 	return true;
 }
@@ -882,6 +921,8 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 		(leaf.kind == LION_CLAUSE_MULTI && leaf.val != NULL &&
 		 IsA(leaf.val, Const)))
 		cx->plainpositive = true;
+	else if (leaf.kind == LION_CLAUSE_MULTI)
+		cx->runtimemulti = true;
 
 	if (LION_CLAUSE_IS_POSITIVE(leaf.kind) && leaf.kind != LION_CLAUSE_MULTI)
 	{
@@ -976,6 +1017,16 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 			cx->nonnullattnos = lappend_int(cx->nonnullattnos,
 											(int) leaf.var->varattno);
 			break;
+		case LION_CLAUSE_NOTMULTI:
+			/* NOT of a strict operator: NULL, never true, of NULL (§35) */
+			cx->nonnullattnos = lappend_int(cx->nonnullattnos,
+											(int) leaf.var->varattno);
+			cx->newnegated = true;
+			break;
+		case LION_CLAUSE_DISTINCT:
+			/* true of NULL: it proves nothing of the column (§35) */
+			cx->newnegated = true;
+			break;
 		case LION_CLAUSE_ARRAY:
 		case LION_CLAUSE_MULTI:
 			/* a strict operator with a non-NULL constant */
@@ -1009,7 +1060,7 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
  * operator and input collation; whether a posting set answers it is the
  * caller's question.
  */
-static List *
+List *
 lion_all_as_and(Node *clause)
 {
 	ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
@@ -1210,6 +1261,16 @@ lion_count_path_fkjoin(LionCountPathBuild *cx)
 	RelOptInfo *output_rel = cx->output_rel;
 	GroupPathExtraData *extra = cx->extra;
 	const LionFkJoin *fj = cx->fj;
+
+	/*
+	 * An OR with a complement arm is two counts (DESIGN.md §35), which the
+	 * join's collected fact filters have no place for; nor do its counts
+	 * have a fallback beside a multi-key query known only at run time for
+	 * the new negated clauses (lion_count_path_strategy()).
+	 */
+	if (fj != NULL &&
+		(cx->ncompl > 0 || (cx->newnegated && cx->runtimemulti)))
+		return false;
 
 	/*
 	 * The FK-side join's fact filters are all sources, ANDed with every fk
@@ -1833,6 +1894,22 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 	 */
 	if (cx->decode && (cx->hasrangesrc || cx->rangevars != NIL ||
 					   (cx->wherekinds != NIL && !cx->havepositive)))
+		return false;
+
+	/*
+	 * An OR with a complement arm is two counts wherever one is made
+	 * (lion_node_count(), DESIGN.md §35, "Complements in an OR"), and the
+	 * shapes that read the WHERE some other way - the decoded walk's
+	 * collected copy, the FK-side join's fact filters - have no second
+	 * count to make: not beside them, as yet.  Nor beside a multi-key query
+	 * known only at run time, which may turn out to narrow nothing and
+	 * leave the count with no source to take its rows from but the heap
+	 * (lion_count_scan_filtered()); the new negated clauses of §35 are not
+	 * among the tests that scan makes either.
+	 */
+	if (cx->ncompl > 0 && cx->decode)
+		return false;
+	if ((cx->ncompl > 0 || cx->newnegated) && cx->runtimemulti)
 		return false;
 
 	/* Something has to drive the count. */
@@ -2877,7 +2954,7 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 		cx->groupcoal == NULL &&
 		cx->distvar == NULL && cx->rangevar == NULL && !cx->hasrangesrc &&
 		cx->plainpositive && rangeprice.batched && cx->topkn == 0 &&
-		cx->groupdeps == NIL &&
+		cx->groupdeps == NIL && cx->ncompl == 0 &&
 		first->driveidx[0] != NULL &&
 		input_rel->consider_parallel && output_rel->consider_parallel &&
 		is_parallel_safe(root, (Node *) cx->priv.consts) &&
@@ -2906,6 +2983,7 @@ lion_count_path_decodable(LionCountPathBuild *cx)
 		cx->ngroup == 2 && !cx->decode && cx->fj == NULL &&
 		!cx->partitioned && cx->distvar == NULL && cx->groupcoal == NULL &&
 		cx->groupdeps == NIL && !cx->sumall && !cx->singlegroup &&
+		cx->ncompl == 0 &&
 		!cx->hasrangesrc && cx->rangevars == NIL &&
 		(cx->wherekinds == NIL || cx->havepositive) &&
 		cx->first != NULL && cx->first->driveidx[0] != NULL &&

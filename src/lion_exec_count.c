@@ -20,6 +20,8 @@
 
 static int64 lion_walk_count(LionCountScanState *st, LionCountSource *sources,
 							 int nsource, int w, bool exists);
+static int64 lion_compl_count(LionCountScanState *st, LionCountSource *sources,
+							  int nsource, int w, bool exists);
 
 /*
  * Is any WHERE item of the relation being counted a source that SELECTS
@@ -98,7 +100,7 @@ lion_count_scan_filtered(LionCountScanState *st)
 static bool
 lion_source_drives(const LionCountSource *src)
 {
-	if (src->negated)
+	if (src->negated || src->compl != NULL)
 		return false;
 	if (src->rangewalk != NULL)
 		return true;
@@ -108,6 +110,72 @@ lion_source_drives(const LionCountSource *src)
 	return true;
 }
 
+
+/*
+ * The count of the AND of sources, sources[w] an OR with a complement arm
+ * (LionCountSource.compl; DESIGN.md §35, "Complements in an OR"): every row
+ * outside M, the intersection of the complement arms' sets, and the rows of
+ * P, the union of the positive arms, inside it.  The two are disjoint, so the
+ * count is the sum of two counts of the other sources F:
+ *
+ *		|F AND (P OR NOT M)| = |F AND NOT M| + |F AND M AND P|
+ *
+ * the first with M subtracted as a negated source is, the second with M and
+ * P intersected as positive ones.  Both come back through lion_node_count(),
+ * which expands the next such OR, or a range to be walked, in each.  An M of
+ * no row makes the OR every row, and the count F's alone; a P of no row
+ * leaves the first count alone.  Every count is made under the one snapshot,
+ * with the §9 interlock its sources carry as any count's: F holds a pinned
+ * positive source or the walk's own set (the planner made it so), M's sets
+ * are located sets, and P's leaves are pinned as any union's (§19).
+ */
+static int64
+lion_compl_count(LionCountScanState *st, LionCountSource *sources,
+				 int nsource, int w, bool exists)
+{
+	LionCountSource *m = sources[w].compl;
+	LionCountSource *srcs;
+	int64		total = 0;
+	int			n = 0;
+	int			i;
+
+	srcs = (LionCountSource *) palloc(sizeof(LionCountSource) *
+									  (nsource + 1));
+	for (i = 0; i < nsource; i++)
+	{
+		if (i != w)
+			srcs[n++] = sources[i];
+	}
+
+	/* M of no row: the OR is every row */
+	if (m->tree == NULL)
+	{
+		if (n == 0)
+			elog(ERROR, "LionCount: an OR with a complement arm and nothing to count it in");
+		total = lion_node_count(st, n, srcs, exists);
+		pfree(srcs);
+		return total;
+	}
+
+	/* F AND NOT M */
+	srcs[n] = *m;
+	srcs[n].negated = true;
+	srcs[n].compl = NULL;
+	total = lion_node_count(st, n + 1, srcs, exists);
+
+	/* F AND M AND P */
+	if (sources[w].tree != NULL && !(exists && total > 0))
+	{
+		srcs[n].negated = false;
+		srcs[n + 1] = sources[w];
+		srcs[n + 1].compl = NULL;
+		total += lion_node_count(st, n + 2, srcs, exists);
+		if (exists)
+			total = (total > 0) ? 1 : 0;
+	}
+	pfree(srcs);
+	return total;
+}
 
 /*
  * Every count the node makes, and every existence test (`exists`: 1 or 0),
@@ -126,6 +194,11 @@ lion_node_count(LionCountScanState *st, int nsource, LionCountSource *sources,
 	EState	   *estate = st->css.ss.ps.state;
 	int			w;
 
+	for (w = 0; w < nsource; w++)
+	{
+		if (sources[w].compl != NULL)
+			return lion_compl_count(st, sources, nsource, w, exists);
+	}
 	for (w = 0; w < nsource; w++)
 	{
 		if (sources[w].rangewalk != NULL)
@@ -304,7 +377,7 @@ lion_sum_probe_init(LionSumProbe *sp, const LionEntryScan *walk,
 
 		if (i == slot)
 			continue;
-		if (sources[i].rangewalk != NULL)
+		if (sources[i].rangewalk != NULL || sources[i].compl != NULL)
 		{
 			sp->frows = -1.0;
 			return;
@@ -968,6 +1041,15 @@ lion_where_describe(LionCountScanState *st, LionCountSource *sources,
 		double		rows = 0;
 		bool		any = false;
 
+		/*
+		 * An OR with a complement arm is two counts (lion_compl_count()), and
+		 * a collection is one set: the WHERE is read count by count.
+		 */
+		if (src->compl != NULL)
+		{
+			st->wtried = true;
+			return;
+		}
 		if (src->rangewalk != NULL)
 			continue;
 		for (j = 0; j < src->nsets; j++)
@@ -1603,7 +1685,8 @@ lion_topk_run(LionCountScanState *st)
 		if (it->orno >= 0 || it->rangesrc || !src->negated)
 			continue;
 		cl = &st->clause[it->clauseno];
-		if ((cl->kind != LION_CLAUSE_NE && cl->kind != LION_CLAUSE_NOTNULL) ||
+		if ((cl->kind != LION_CLAUSE_NE && cl->kind != LION_CLAUSE_NOTNULL &&
+			 cl->kind != LION_CLAUSE_DISTINCT) ||
 			cl->idx == NULL ||
 			RelationGetRelid(cl->idx) != RelationGetRelid(st->groupidx) ||
 			cl->idxcol != st->groupidxcol)

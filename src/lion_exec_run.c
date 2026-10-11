@@ -240,6 +240,11 @@ lion_unpin_where(LionCountScanState *st)
 
 		for (j = 0; j < src->nsets; j++)
 			lion_posting_set_unpin(&src->sets[j]);
+		if (src->compl != NULL)
+		{
+			for (j = 0; j < src->compl->nsets; j++)
+				lion_posting_set_unpin(&src->compl->sets[j]);
+		}
 	}
 	st->wherepinned = false;
 }

@@ -5511,10 +5511,10 @@ every heap page). The count evaluator already evaluates AND/OR trees over postin
 positive clause (equality, IN, IS NULL, exact multi-key) or an `AND` of such clauses, each on a plain
 column of the same relation; the collation, opfamily, cross-type, Param, IN-list-cap and
 per-partition rules are exactly the ones a plain clause goes through, because the analysis IS the
-same function (`lion_analyze_leaf()`, with `allow_negated = false` under an OR). A negated arm
-(`IS NOT NULL`, `NOT`) is declined: the complement of a posting set is not a posting set, and under a
-union there is nothing to subtract it from. So is an arm that is not indexable, one that would need a
-recheck (`b > 3`, a non-roaring operator, an ALL-mode multi-key query), and an `AND` arm one of whose
+same function (`lion_analyze_leaf()`). An arm of negated clauses (`IS NOT NULL`, `<>`, `IS DISTINCT
+FROM`, `NOT` of a multi-key query) is a COMPLEMENT arm, counted by §35's De Morgan rewrite ("Complements
+in an OR"); an arm that ANDs a negated clause with a positive one is declined. So is an arm that is
+not indexable, one that would need a recheck (`b > 3`, a non-roaring operator, an ALL-mode multi-key query), and an `AND` arm one of whose
 leaves is any of those.
 
 The OR is ONE count source whose expression tree has leaves in different indexes, and it is ANDed
@@ -17246,8 +17246,7 @@ two, subtracted at every container key the positive sources have, exactly as `IS
 entry is. Either set may be missing - no row has c, the column has no NULLs - and then there is
 less to subtract; a NULL c (a parameter) makes the count 0. It is taken wherever `IS NOT NULL` is:
 beside positive clauses, under a GROUP BY and a count(DISTINCT), a partitioned table's and an
-FK-side join's fact filters, and not under an OR, where a complement would be a leaf of a union
-(§19). The clause's operator has the column on its left (a commuted `c <> k` is rewritten), and it
+FK-side join's fact filters, and as an arm of an OR by the rewrite below. The clause's operator has the column on its left (a commuted `c <> k` is rewritten), and it
 is what a candidate is tested with when a multi-key query narrowed nothing and the heap is read
 (`lion_count_scan_filtered()`). EXECUTE on the operator's function is checked as for any WHERE
 function (§9).
@@ -17271,6 +17270,59 @@ clause names it. EXPLAIN prints the driver as `(all rows)`, or `(all keys)` when
 own `IS NOT NULL` that drives. `count(*) WHERE k IS NOT NULL` over a column of many keys is now
 driven by one of few: `lion_null_t (all rows), lion_null_k (k IS NOT NULL)` in `null.sql`, where it
 was `lion_null_k (all keys)`.
+
+### Complements: `IS DISTINCT FROM`, `NOT` of a multi-key query, and an OR
+
+Two more negated kinds join `IS NOT NULL` and `<>`, each the union of entries it rejects:
+
+- **`k IS DISTINCT FROM c`** (`LION_CLAUSE_DISTINCT`, either side) rejects c's entry ONLY: unlike
+  `<>` it is true of a NULL k. Its operator is the `=` it is built on (`DistinctExpr`), which has
+  to be the index's strategy 1 for the pair, and EXECUTE on that function is checked (§9). A NULL
+  literal c makes it `IS NOT NULL`; a NULL parameter rejects the NULL entry.
+- **`NOT (q)`** of an EXACT multi-key query (`LION_CLAUSE_NOTMULTI`: `@>`, `&&`, `@@` the
+  extractor answers from posting sets alone, with literal keys and no positions or prefixes)
+  rejects q's rows and the NULL entry, since `q` over a NULL array or document is NULL. A query
+  the sets only bound - an empty array, a NULL element, a phrase, a run-time value - is declined:
+  its complement would need a recheck. At run time the query is located as §17's; one that comes
+  out other than exact is an error, not a wrong count.
+
+Both are taken wherever `<>` is, the count of every row above included.
+
+**Complements in an OR.** `n <> 17 OR n IS NULL`, `c200 = 17 OR c20 <> 3`: an OR whose arms are each
+all positive or all negated clauses. Let P be the union of the positive arms (a §19 tree, or no row
+when there are none) and M the INTERSECTION over the complement arms of each arm's rejected set N,
+the union of its clauses' rejected entries (an arm `a <> 1 AND b <> 2` is true where neither
+rejects, so its N is `rej(a<>1) ∪ rej(b<>2)`). The OR is then `P ∪ ¬M`, and with F the rest of the
+WHERE:
+
+    |F ∩ (P ∪ ¬M)| = |F \ M| + |F ∩ M ∩ P|
+
+two counts the engine already makes: M as a negated source, then M and P as positive ones
+(`lion_compl_count()`, lion_exec_count.c). It is exact under NULLs because N is built from what each
+clause REJECTS, which for `<>` includes the NULL entry and for `IS DISTINCT FROM` does not. The second
+count is skipped when P has no row, or an existence test is answered by the first. A complement
+arm whose clauses reject nothing (`<>` of a value no row has) makes M empty and the OR every row; a
+`<>` of a NULL parameter is false and drops its arm. With nothing else selecting rows, F is the
+count of every row's driver (above).
+
+The OR travels as any other (`LION_PRIV_ORS`); its leaves are §19's, never materialized, and each
+arm's kind is read off its first leaf (`armcompl`). `lion_locate_or()` locates the complement arms'
+sets as a second source hung off the OR's (`LionCountSource.compl`), which nothing but
+`lion_node_count()` reads; the count engine refuses one. So everything that reads the WHERE other
+than as a count declines an OR with a complement arm: the decoded walk (§34), the parallel GROUP BY,
+an FK-side join (§27), the range probe (§32), the WHERE collection and the sum probe. A complement
+leaf is no selecting clause of a partition's bounds (`lion_leaf_drops()`). At most three such ORs
+(`LION_MAX_COMPL_ORS`): each doubles the counts in the worst case. A complement OR, an `IS DISTINCT
+FROM` or a `NOT` beside a multi-key query whose value is known only at run time is declined: that
+query may narrow nothing and leave the heap scan of `lion_count_scan_filtered()` as the count, and
+that scan tests none of them.
+
+The price (`lion_cost_count_rel()`) is the sum of the two counts': the WHERE with the complement ORs
+left out, as negated clauses are free in the model, and the WHERE with only their positive arms kept,
+an upper bound on the second count's sources. Neither is collected once (`nocollect`). The count of
+every row is priced as §35's driver always is, by its entries' members: over a narrow table whose
+cheapest driver has a few dozen sparse entries it can come out dearer than the sequential scan while
+running faster.
 
 ### A filter on the walked column
 
@@ -17305,6 +17357,12 @@ a generic plan with a NULL parameter, EXECUTE revoked on `int4ne`; the driver of
 row and the indexes that cannot be one; a dirty heap and a partitioned table; the walk's hole in
 both directions, with NULLs first and last, beside a range and a list; and the per-entry filter,
 the deleted row it must not evaluate `100 / k` on, and the numeric column it must not be taken on.
+`test/sql/countcompl.sql`: `IS DISTINCT FROM` and `NOT` of a multi-key query alone, and complement arms
+in ORs - beside equalities, ranges and IN lists, under GROUP BY of one and two columns, HAVING, top k
+and count(DISTINCT) - each against the sequential plan on a table with NULLs, negative values, NULL
+and empty arrays, and deleted and updated rows; what is declined; generic plans with NULL parameters;
+a LATERAL rescan; a partitioned table. `node_contracts.sql` revokes `int4eq` under `IS DISTINCT
+FROM`, `int4ne` under a complement arm and `ts_match_vq` under `NOT`.
 
 ## 36. The top k of a GROUP BY ordered by its count (implemented 2026-09-30)
 

@@ -79,6 +79,18 @@ node's counts"):
 - `GROUP BY` with no aggregate and `SELECT DISTINCT` of indexed columns over one table (`SELECT
   DISTINCT country FROM events`): the keys that have a visible row, each once.
 
+Clauses that exclude rows are counted by subtracting what they reject: `col <> v`, `col IS NOT
+NULL`, `col IS DISTINCT FROM v` (which, unlike `<>`, keeps the rows where `col` is NULL), and `NOT
+(tags @> '{x}')` or `NOT (doc @@ 'a & b')` of a literal multi-key query (which drops the NULL
+arrays or documents, as the query does). With nothing else in the `WHERE`, the count of every row
+is taken from one of the table's Lion columns (`(all rows)` in EXPLAIN). They may also stand alone
+in an arm of an `OR` - `n <> 17 OR n IS NULL`, `status = 'open' OR region <> 'eu'` - which is
+counted as two counts by De Morgan's rule (DESIGN.md §35, "Complements in an OR"); an arm that
+mixes them with an equality, such as `(a = 1 AND n <> 3) OR ...`, is left to the ordinary plan, as
+is a `NOT` of a query whose index sets only bound its rows (an empty array, a NULL element, a
+phrase). On five million rows `count(*) WHERE n IS DISTINCT FROM 17` took 1.6 ms against 380 for
+the sequential scan.
+
 An expression index counts as a column of its expression (DESIGN.md §41). With `CREATE INDEX ON
 events USING lion ((payload->>'status'))`, `WHERE payload->>'status' = 'paid'`, `IN`, ranges,
 `<>`, `IS NULL`, `GROUP BY payload->>'status'` and `count(DISTINCT payload->>'status')` are

@@ -2220,6 +2220,8 @@ typedef struct LionCountRelCost
 	double		recheckshare;	/* §26: what the existence tests recheck */
 	double		listrows;		/* rows of one entry of a group-driving list */
 	double		walked;			/* counts the merge runs: groups, pairs */
+	bool		nocollect;		/* ... never: an OR with a complement arm
+								 * makes two counts of each (§35) */
 	bool		whereonce;		/* the WHERE is collected once and the
 								 * groups counted in batches (§10) */
 	double		topk;			/* §36: the candidates counted, or 0 */
@@ -2714,7 +2716,7 @@ lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
 		c->recheckshare = share;
 	}
 	if (c->distinct == LION_DISTINCT_NONE && !c->groupdrive &&
-		c->walked >= 2.0 &&
+		c->walked >= 2.0 && !c->nocollect &&
 		lion_cost_where_collected(c->nsrc, c->srcmembers, c->srccontainers,
 								  c->srcunion))
 	{
@@ -3253,15 +3255,16 @@ lion_count_rel_recheck(LionCountRelCost *c)
  * heap recheck.
  */
 static Cost
-lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
-				   IndexOptInfo *groupidx, AttrNumber groupcol,
-				   IndexOptInfo *groupidx2, AttrNumber groupcol2,
-				   List *whereidx, List *wherecol, List *whereclauses,
-				   List *wherekinds,
-				   List *ors, double numgroups,
-				   double outer_entries, double inner_entries, int distinct,
-				   double drivefrac, Var *rangevar, bool rangesum,
-				   LionRangeCost *rc, double topk, double topkrows)
+lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
+						IndexOptInfo *groupidx, AttrNumber groupcol,
+						IndexOptInfo *groupidx2, AttrNumber groupcol2,
+						List *whereidx, List *wherecol, List *whereclauses,
+						List *wherekinds,
+						List *ors, double numgroups,
+						double outer_entries, double inner_entries,
+						int distinct, double drivefrac, Var *rangevar,
+						bool rangesum, LionRangeCost *rc, double topk,
+						double topkrows, bool nocollect)
 {
 	LionCountRelCost c;
 	bool		sumshort;		/* §15: the IN list is summed, not merged */
@@ -3296,6 +3299,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	c.ingroups = numgroups;
 	c.recheckshare = 1.0;
 	c.walked = 1.0;
+	c.nocollect = nocollect;
 
 	/*
 	 * The top k (DESIGN.md §36) counts its candidates' sets alone, and
@@ -3359,6 +3363,121 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	run += c.rangecost;
 	run += c.rangesrc_cost;
 
+	return run;
+}
+
+/*
+ * The count of one relation, priced.  An OR with a complement arm (DESIGN.md
+ * §35, "Complements in an OR") makes every count two: the rows outside M, the
+ * intersection of the complement arms' sets, and the rows inside it that a
+ * positive arm selects (lion_node_count()).  The first is priced as the count
+ * without the OR - a negated clause, which subtracts what the other sources
+ * select and is left out of the estimate like `<>` - and the second as the
+ * count with the OR's positive arms alone, as an OR of them (an upper bound:
+ * the count ANDs M besides).  Each is the whole of a count, so the two are
+ * added up, groups and all, as the executor makes them.
+ */
+static Cost
+lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
+					IndexOptInfo *groupidx, AttrNumber groupcol,
+					IndexOptInfo *groupidx2, AttrNumber groupcol2,
+					List *whereidx, List *wherecol, List *whereclauses,
+					List *wherekinds,
+					List *ors, double numgroups,
+					double outer_entries, double inner_entries, int distinct,
+					double drivefrac, Var *rangevar, bool rangesum,
+					LionRangeCost *rc, double topk, double topkrows)
+{
+	int			nclause = list_length(whereclauses);
+	bool	   *outside;		/* leaves of a complement OR: variant A */
+	bool	   *arms;			/* its complement arms' leaves: variant B */
+	bool		anycompl = false;
+	bool		anypositive = false;
+	LionCountTarget t;
+	List	   *idx;
+	List	   *col;
+	List	   *clauses;
+	List	   *kinds;
+	List	   *tors;
+	Cost		run;
+	ListCell   *lc;
+
+	outside = (bool *) palloc0(sizeof(bool) * Max(nclause, 1));
+	arms = (bool *) palloc0(sizeof(bool) * Max(nclause, 1));
+	foreach(lc, ors)
+	{
+		List	   *one = (List *) lfirst(lc);
+		int			first = linitial_int(one);
+		int			narms = lsecond_int(one);
+		int			at = first;
+		bool		compl = false;
+		bool		positive = false;
+		int			a;
+		int			j;
+
+		for (a = 0; a < narms; a++)
+		{
+			int			len = list_nth_int(one, 2 + a);
+
+			if (len > 0 && at < nclause &&
+				LION_CLAUSE_IS_NEGATED(list_nth_int(wherekinds, at)))
+			{
+				compl = true;
+				for (j = at; j < at + len && j < nclause; j++)
+					arms[j] = true;
+			}
+			else
+				positive = true;
+			at += len;
+		}
+		if (!compl)
+			continue;
+		anycompl = true;
+		if (positive)
+			anypositive = true;
+		for (j = first; j < at && j < nclause; j++)
+			outside[j] = true;
+	}
+
+	if (!anycompl)
+	{
+		pfree(outside);
+		pfree(arms);
+		return lion_cost_count_rel_one(root, rel, groupidx, groupcol,
+									   groupidx2, groupcol2, whereidx,
+									   wherecol, whereclauses, wherekinds,
+									   ors, numgroups, outer_entries,
+									   inner_entries, distinct, drivefrac,
+									   rangevar, rangesum, rc, topk,
+									   topkrows, false);
+	}
+
+	memset(&t, 0, sizeof(t));
+	t.whereidx = whereidx;
+	t.wherecol = wherecol;
+	t.dropped = outside;
+	t.ndropped = 1;
+	lion_target_lists(&t, whereclauses, wherekinds, ors, &idx, &col,
+					  &clauses, &kinds, &tors, NULL);
+	run = lion_cost_count_rel_one(root, rel, groupidx, groupcol, groupidx2,
+								  groupcol2, idx, col, clauses, kinds, tors,
+								  numgroups, outer_entries, inner_entries,
+								  distinct, drivefrac, rangevar, rangesum, rc,
+								  topk, topkrows, true);
+	if (anypositive)
+	{
+		t.dropped = arms;
+		lion_target_lists(&t, whereclauses, wherekinds, ors, &idx, &col,
+						  &clauses, &kinds, &tors, NULL);
+		run += lion_cost_count_rel_one(root, rel, groupidx, groupcol,
+									   groupidx2, groupcol2, idx, col,
+									   clauses, kinds, tors, numgroups,
+									   outer_entries, inner_entries,
+									   distinct, drivefrac, rangevar,
+									   rangesum, NULL, topk, topkrows, true);
+	}
+	pfree(outside);
+	pfree(arms);
 	return run;
 }
 

@@ -450,6 +450,19 @@ typedef struct LionCountSource
 	 * them (lion_node_count()).
 	 */
 	struct LionRangeSource *rangewalk;
+
+	/*
+	 * An OR with a COMPLEMENT arm (DESIGN.md §35, "Complements in an OR"):
+	 * the source is the rows of this one's own sets - the union of the OR's
+	 * positive arms, P, or no row at all when tree is NULL - and every row
+	 * outside compl's, M, the intersection of the complement arms' sets.  The
+	 * count of an AND with it is two counts, one with M subtracted and one
+	 * with P and M both intersected, which the count pushdown that defines
+	 * the structure makes (lion_node_count()); the count functions below
+	 * never take one.  A compl with no tree is an M of no row: the source is
+	 * then every row.
+	 */
+	struct LionCountSource *compl;
 } LionCountSource;
 
 /*

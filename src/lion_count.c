@@ -2141,6 +2141,8 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	{
 		if (sources[i].rangewalk != NULL)
 			elog(ERROR, "lion index: a range source to be walked handed to a count");
+		if (sources[i].compl != NULL)
+			elog(ERROR, "lion index: an OR with a complement arm handed to a count");
 		trees[i] = lion_source_tree(&sources[i]);
 
 		if (sources[i].negated)

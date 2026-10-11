@@ -84,6 +84,12 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 				if (cl->kind == LION_CLAUSE_ARRAY)
 					appendStringInfo(buf, "%s %s ANY (%s)", attname, opname,
 									 val);
+				else if (cl->kind == LION_CLAUSE_DISTINCT)
+					appendStringInfo(buf, "%s IS DISTINCT FROM %s", attname,
+									 val);
+				else if (cl->kind == LION_CLAUSE_NOTMULTI)
+					appendStringInfo(buf, "NOT (%s %s %s)", attname, opname,
+									 val);
 				else
 					appendStringInfo(buf, "%s %s %s", attname, opname, val);
 				pfree(opname);
@@ -137,7 +143,7 @@ static const char *
 lion_explain_clause_col(LionCountScanState *st, const LionClauseState *cl)
 {
 	return lion_explain_col(cl->idxoid, cl->attno,
-							cl->kind == LION_CLAUSE_MULTI, st->plan.vcols);
+							LION_CLAUSE_IS_MULTI(cl->kind), st->plan.vcols);
 }
 
 /* One arm of an OR, `len` leaves from leaf `at`: `((b = 2) AND (c = 3))`. */
