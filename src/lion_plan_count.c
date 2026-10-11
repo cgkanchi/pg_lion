@@ -2233,11 +2233,15 @@ lion_count_path_topk(LionCountPathBuild *cx)
 	{
 		Node	   *arg = lion_strip((Node *)
 									 ((TargetEntry *) linitial(agg->args))->expr);
-		AttrNumber	attno;
+		AttrNumber	attno = 0;
 
-		if (arg == NULL || !IsA(arg, Var))
+		/* count(1) of a non-NULL constant is count(*) */
+		if (arg != NULL && IsA(arg, Const) && !((Const *) arg)->constisnull)
+			attno = 0;
+		else if (arg == NULL || !IsA(arg, Var))
 			return;
-		attno = ((Var *) arg)->varattno;
+		else
+			attno = ((Var *) arg)->varattno;
 
 		/*
 		 * count(col) of a column a clause pins to NULL is 0, and of the group
