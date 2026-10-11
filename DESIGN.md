@@ -1592,6 +1592,8 @@ Planner integration
     relation.
   - The query has no DISTINCT, window functions, grouping sets, ORDER BY inside aggregates,
     FILTER clauses, or aggregates other than `count(*)` and the `count(col)` cases of §14.
+    The target list holds those counts, the columns the rules below let it print, and any
+    expression over them ("Shapes rewritten to the node's counts" at the end of this section).
   - **HAVING** is accepted when it is a filter the node can apply itself. By the time the hook runs,
     `havingQual` is an implicit-AND list of only those clauses that mention an aggregate (or are
     volatile, or contain a subquery): `subquery_planner()` has moved every other clause into WHERE,
@@ -2503,6 +2505,28 @@ correlation (`lion_key_containers()`: one a row when scattered, their share of t
 stored in value order, interpolated by the correlation's square): a GROUP BY over 365 days of a
 table loaded in date order cost 4,650 for 0.6 ms when every day was taken to be scattered, and
 costs 317.
+
+### Shapes rewritten to the node's counts (2026-10-11)
+
+Each of these is a query the node answers with the counts it already makes; nothing in the count
+engine or its visibility rules (§9, §11) changes, so every one is exact wherever the plain count
+is. `test/sql/countshapes.sql` checks each against a sequential scan, over NULLs and over dead
+and updated rows the visibility map no longer covers.
+
+**Expressions over the counts.** `SELECT count(*)::int`, `100.0 * count(*) / n`, `g, round(100.0 *
+count(*) / n, 2) ... GROUP BY g` or `g || '!'` of a group column: the grouped target holds the
+expression, and the checks used to refuse anything in it but a column or an aggregate. Now an
+expression is taken apart into what it reads - its aggregates whole and its columns, an expression
+column (§41) as one - and each must pass the rules of a target entry of its own
+(`lion_count_path_having()`); a SubPlan or a window function in it declines. The plan keeps the
+expression in the CustomScan's target list and puts only what it reads in `custom_scan_tlist`, so
+setrefs.c makes it the node's projection, evaluated once per row the node emits - once a group, as
+the Agg's projection would; a volatile function in it is called as often. Under a Finalize Agg (a
+partitioned table, a parallel or decoded GROUP BY, the FK-side join and the semi join) the partial
+target already held only the aggregates and columns, and the Finalize Agg computes the expression.
+The grouping `coalesce(col, c)` is still the one expression the node emits itself, and only that
+exact expression: `coalesce(count(*), 0)` is an expression over a count. 1M rows: `count(*)::int`
+with two filters 23 ms to 0.3 ms; the grouped `round(...)` 97 ms to 3 ms.
 
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 
