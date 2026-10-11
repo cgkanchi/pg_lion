@@ -1151,8 +1151,9 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 
 	/*
 	 * An expression column (DESIGN.md §41) is of one table counted with no
-	 * join and no partitions, and no aggregate over keys is taken over one;
-	 * the decoder has checked each is one of VCOLS.
+	 * join and no partitions, no aggregate over keys is taken over one, and
+	 * a coalesce group is not one - a coalesce of a column beside a clause on
+	 * one is fine; the decoder has checked each is one of VCOLS.
 	 */
 	{
 		bool		any = LION_ATTNO_IS_VCOL(p->groupattno) ||
@@ -1171,7 +1172,7 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 		}
 		if (p->vcols != NIL &&
 			(!any || p->npart > 0 || p->hasjoin || p->fgattno != 0 ||
-			 p->coalconst != NULL))
+			 (p->coalconst != NULL && LION_ATTNO_IS_VCOL(p->groupattno))))
 			elog(ERROR, "LionCount: malformed expression columns");
 	}
 
