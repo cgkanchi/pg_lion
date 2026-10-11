@@ -151,6 +151,28 @@ SELECT q, cs_q(q) FROM (VALUES
 -- count(NULL) is 0 in every group, and not taken
 SELECT cs_q('SELECT a, count(NULL::int) FROM cs GROUP BY a');
 
+-- ---- count(col) of a nullable column: count(*) AND col IS NOT NULL ----
+SELECT cs_plan('SELECT count(n) FROM cs WHERE a = 3');
+SELECT cs_plan('SELECT count(t) FROM cs');
+SELECT q, cs_q(q) FROM (VALUES
+	('SELECT count(n) FROM cs WHERE a = 3'),
+	('SELECT count(n) FROM cs'),
+	('SELECT count(t), count(t)::int + 1 FROM cs WHERE b = 2'),
+	('SELECT count(n) FROM cs WHERE n <> 3'),
+	('SELECT count(n) FROM cs WHERE a IN (1, 2) AND b = 4'),
+	('SELECT count(n) FROM cs WHERE a = 3 OR b = 1'),
+	('SELECT count(n) FROM cs WHERE a = 3 HAVING count(n) > 10'),
+	('SELECT count(n) FROM cs WHERE a = 99')
+) v(q);
+-- beside count(*) or another column's count, or under a GROUP BY (a group
+-- whose rows are all NULL counts 0), it is the ordinary plan's
+SELECT q, cs_q(q) FROM (VALUES
+	('SELECT count(n), count(*) FROM cs WHERE a = 3'),
+	('SELECT count(n), count(t) FROM cs'),
+	('SELECT a, count(n) FROM cs GROUP BY a'),
+	('SELECT count(u) FROM cs')
+) v(q);
+
 DROP FUNCTION cs_q(text);
 DROP FUNCTION cs_plan(text);
 DROP TABLE cs, csd;

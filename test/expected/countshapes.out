@@ -225,6 +225,59 @@ SELECT cs_q('SELECT a, count(NULL::int) FROM cs GROUP BY a');
  no count, 7 rows
 (1 row)
 
+-- ---- count(col) of a nullable column: count(*) AND col IS NOT NULL ----
+SELECT cs_plan('SELECT count(n) FROM cs WHERE a = 3');
+                      cs_plan                       
+----------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: cs_a (a = 3), cs_n (n IS NOT NULL)
+(2 rows)
+
+SELECT cs_plan('SELECT count(t) FROM cs');
+                        cs_plan                        
+-------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: cs_b (all rows), cs_t (t IS NOT NULL)
+(2 rows)
+
+SELECT q, cs_q(q) FROM (VALUES
+	('SELECT count(n) FROM cs WHERE a = 3'),
+	('SELECT count(n) FROM cs'),
+	('SELECT count(t), count(t)::int + 1 FROM cs WHERE b = 2'),
+	('SELECT count(n) FROM cs WHERE n <> 3'),
+	('SELECT count(n) FROM cs WHERE a IN (1, 2) AND b = 4'),
+	('SELECT count(n) FROM cs WHERE a = 3 OR b = 1'),
+	('SELECT count(n) FROM cs WHERE a = 3 HAVING count(n) > 10'),
+	('SELECT count(n) FROM cs WHERE a = 99')
+) v(q);
+                            q                             |     cs_q      
+----------------------------------------------------------+---------------
+ SELECT count(n) FROM cs WHERE a = 3                      | count, 1 rows
+ SELECT count(n) FROM cs                                  | count, 1 rows
+ SELECT count(t), count(t)::int + 1 FROM cs WHERE b = 2   | count, 1 rows
+ SELECT count(n) FROM cs WHERE n <> 3                     | count, 1 rows
+ SELECT count(n) FROM cs WHERE a IN (1, 2) AND b = 4      | count, 1 rows
+ SELECT count(n) FROM cs WHERE a = 3 OR b = 1             | count, 1 rows
+ SELECT count(n) FROM cs WHERE a = 3 HAVING count(n) > 10 | count, 1 rows
+ SELECT count(n) FROM cs WHERE a = 99                     | count, 1 rows
+(8 rows)
+
+-- beside count(*) or another column's count, or under a GROUP BY (a group
+-- whose rows are all NULL counts 0), it is the ordinary plan's
+SELECT q, cs_q(q) FROM (VALUES
+	('SELECT count(n), count(*) FROM cs WHERE a = 3'),
+	('SELECT count(n), count(t) FROM cs'),
+	('SELECT a, count(n) FROM cs GROUP BY a'),
+	('SELECT count(u) FROM cs')
+) v(q);
+                       q                       |       cs_q       
+-----------------------------------------------+------------------
+ SELECT count(n), count(*) FROM cs WHERE a = 3 | no count, 1 rows
+ SELECT count(n), count(t) FROM cs             | no count, 1 rows
+ SELECT a, count(n) FROM cs GROUP BY a         | no count, 7 rows
+ SELECT count(u) FROM cs                       | no count, 1 rows
+(4 rows)
+
 DROP FUNCTION cs_q(text);
 DROP FUNCTION cs_plan(text);
 DROP TABLE cs, csd;

@@ -173,7 +173,8 @@ SELECT lion_nullcmp('SELECT k, count(*) AS n_all, count(k) AS n_k FROM lion_null
 SELECT lion_nullcmp('SELECT count(k) FROM lion_null WHERE k IS NULL');
 SELECT lion_nullcmp('SELECT count(k) FROM lion_null WHERE k = 3');
 SELECT lion_nullcmp('SELECT count(k) FROM lion_null WHERE k IS NOT NULL');
--- count() of a column nothing constrains is still not pushed down
+-- count() of a column nothing constrains is count(*) AND t IS NOT NULL
+-- (DESIGN.md §10, "Shapes rewritten to the node's counts")
 SELECT lion_nullcmp('SELECT count(t) FROM lion_null WHERE k = 3');
 
 -- the results themselves

@@ -1592,7 +1592,8 @@ Planner integration
     relation.
   - The query has no DISTINCT, window functions, grouping sets, ORDER BY inside aggregates,
     FILTER clauses, or aggregates other than `count(*)` (or `count(1)` of any non-NULL constant)
-    and the `count(col)` cases of §14.
+    and the `count(col)` cases of §14 - and, without a GROUP BY, `count(col)` of any one column
+    whose index answers `col IS NOT NULL`.
     The target list holds those counts, the columns the rules below let it print, and any
     expression over them ("Shapes rewritten to the node's counts" at the end of this section).
   - **HAVING** is accepted when it is a filter the node can apply itself. By the time the hook runs,
@@ -2534,6 +2535,16 @@ with two filters 23 ms to 0.3 ms; the grouped `round(...)` 97 ms to 3 ms.
 constant expression `eval_const_expressions()` has folded. `count(NULL)` and a Param or stable
 argument are not taken. The plan classifies it as `count(*)`, and the top k accepts it as one.
 1M rows: 23 ms to 0.2 ms.
+
+**count(col) of a nullable column.** Without a GROUP BY, where every aggregate is `count(col)` of
+one column that nothing proves non-NULL (§14), the count is `count(*)` of the rows the WHERE
+selects AND `col IS NOT NULL`, which the posting sets answer (§14, §35: the NULL entry subtracted,
+or skipped when the column drives a count of every row). `lion_count_path_countcol()` adds the
+clause as if the query had written it, and EXPLAIN lists it (`cs_n (n IS NOT NULL)`); a column
+whose index cannot answer it declines as such a WHERE would. With a GROUP BY it is not taken: a
+group whose rows all have `col` NULL is a row of 0 in the query and no row at all under the
+clause. Beside `count(*)` or a count of another column it is not taken either, since the clause
+would change those. 1M rows, `count(nullable) WHERE c20 = 3`: 23 ms to 0.3 ms.
 
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 
