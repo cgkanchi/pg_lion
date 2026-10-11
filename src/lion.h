@@ -450,13 +450,23 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * order_flags, set when its build wrote one - the rule version 8 was, kept:
  * VACUUM makes a NARROW only in such an index, and inserts make none.  The
  * leaf-root posting trees share the number.
+ *
+ * Version 10 (DESIGN.md §21, "Entry tuples") lays out every directory item
+ * anew - a 12-byte header for an INLINE entry or a pivot and a 28-byte one
+ * for a CHAIN entry, where every item had the same 32 bytes; no stored hash;
+ * a by-value key at its type's width rather than as a whole Datum; the
+ * payload packed right after the key (lion_entryfmt.h) - and it stamps the
+ * pages of a posting tree with a hash of the key's bytes instead of the
+ * key's hash.  So version 9 is no longer read either: opening one is an
+ * ERROR whose hint asks for REINDEX.  Every index this build writes is
+ * version 10, and whether it has summaries or NARROW items is said as
+ * version 9 said it.
  */
 #define LION_VERSION			6	/* the base format of versions 6 .. 8 */
 #define LION_VERSION_SUMMARIES	7	/* ... plus the summaries of §32 */
 #define LION_VERSION_NARROW		8	/* ... plus the NARROW items of §38 */
-#define LION_VERSION_V9			9	/* varbyte sparse segments; another
-									 * worker's leaf-root posting trees will
-									 * share this version */
+#define LION_VERSION_V9			9	/* varbyte sparse segments (§13) */
+#define LION_VERSION_V10		10	/* compact entry tuples (§21) */
 
 /* May the index of this meta page hold NARROW items (§38)? */
 #define LION_META_ALLOWS_NARROW(meta) \
@@ -544,8 +554,8 @@ typedef struct LionMetaPageData
 /*
  * The build wrote a NARROW item (DESIGN.md §38), so VACUUM may make NARROWs
  * of the items it rewrites; an index without it has none, and gets none
- * until it is rebuilt.  Version 8 said this with its number; version 9
- * (§13) says it here, as LION_META_POSITIONS does for positions.
+ * until it is rebuilt.  Version 8 said this with its number; since version
+ * 9 (§13) it is said here, as LION_META_POSITIONS does for positions.
  */
 #define LION_META_NARROW			0x0004
 
@@ -634,60 +644,15 @@ StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
 /* The first block after the meta page; where ambuild puts the first leaf. */
 #define LION_FIRST_BLKNO		((BlockNumber) 1)
 
-/* ---------- entry tuples (items on bucket pages) ---------- */
-
-#define LION_ENTRY_INLINE	0x0001
-#define LION_ENTRY_CHAIN		0x0002
-#define LION_ENTRY_NULLKEY	0x0004	/* the reserved NULL-key entry, DESIGN.md §14 */
-#define LION_ENTRY_EMPTYKEY	0x0008	/* the reserved no-key entry, DESIGN.md §17 */
+/* ---------- entry tuples (items on directory pages) ---------- */
 
 /*
- * Pivot tuples (DESIGN.md §21).  A directory page's first item is its HIGH
- * KEY when the page is not the rightmost of its level, and every item of an
- * internal page is a DOWNLINK whose `head` is the child block.  Both are
- * LionEntryTuple-shaped so that the key helpers apply unchanged; they carry
- * neither INLINE nor CHAIN, and their ncontainers/ntids are zero.  A
- * downlink flagged MINUSINF is the leftmost child of its page and compares
- * below every key.
+ * The entry tuple's layout - its two header forms, its flags, where its key,
+ * positions extension and payload are, and the accessors of its counts and
+ * links - is in lion_entryfmt.h (DESIGN.md §21, "Entry tuples"), which the
+ * unit tests build without a server.
  */
-#define LION_ENTRY_HIGHKEY	0x0010
-#define LION_ENTRY_DOWNLINK	0x0020
-#define LION_ENTRY_MINUSINF	0x0040
-
-/*
- * SUMMARY entries (DESIGN.md §32, format version 7).  A summary entry's posting
- * set is the union of the posting sets of a run of its column's VALUE entries
- * - a BUCKET of keys - and its key is the largest key the bucket may hold: the
- * buckets of a column are (previous summary's key, this summary's key], in key
- * order, and sort after every VALUE entry of the column.  The last bucket of a
- * column is open above; its entry carries LION_ENTRY_SUMLAST as well, sorts
- * after every other summary of the column WHATEVER ITS KEY, and its key is the
- * largest key it holds so far, which an insert of a larger key raises.  So its
- * key is data, not position, and the order compares no key of it at all.
- */
-#define LION_ENTRY_SUMMARY	0x0080
-#define LION_ENTRY_SUMLAST	0x0100
-
-/*
- * An entry that stores word positions (DESIGN.md §17, "Stored positions"):
- * a LionEntryPosExt follows its key, before its payload.  Never on a pivot,
- * which is made of the header and key alone (lion_pivot_kindflags() does not
- * keep it).
- */
-#define LION_ENTRY_POSITIONS	0x0200
-
-#define LION_ENTRY_RESERVED	(LION_ENTRY_NULLKEY | LION_ENTRY_EMPTYKEY)
-#define LION_ENTRY_SUMKINDS	(LION_ENTRY_SUMMARY | LION_ENTRY_SUMLAST)
-/*
- * The flags that make an entry's KIND, which a pivot copied from it keeps -
- * all but SUMLAST (lion_pivot_kindflags()).
- */
-#define LION_ENTRY_KINDFLAGS	(LION_ENTRY_RESERVED | LION_ENTRY_SUMKINDS)
-#define LION_ENTRY_PIVOT		(LION_ENTRY_HIGHKEY | LION_ENTRY_DOWNLINK)
-#define LION_ENTRY_ALLFLAGS \
-	(LION_ENTRY_INLINE | LION_ENTRY_CHAIN | LION_ENTRY_RESERVED | \
-	 LION_ENTRY_PIVOT | LION_ENTRY_MINUSINF | LION_ENTRY_SUMKINDS | \
-	 LION_ENTRY_POSITIONS)
+#include "lion_entryfmt.h"
 
 #define LionEntryIsPivot(e)		(((e)->flags & LION_ENTRY_PIVOT) != 0)
 #define LionEntryIsHighKey(e)	(((e)->flags & LION_ENTRY_HIGHKEY) != 0)
@@ -695,8 +660,8 @@ StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
 #define LionEntryIsMinusInf(e)	(((e)->flags & LION_ENTRY_MINUSINF) != 0)
 
 /*
- * Two entries per index have no key at all: keylen 0, hash 0, always in
- * bucket 0, and recognised by a flag rather than by comparing keys.
+ * Two entries per key column have no key at all: keylen 0, hash 0, first in
+ * the column's run, and recognised by a flag rather than by comparing keys.
  *
  *	- LION_ENTRY_NULLKEY holds the rows whose indexed VALUE is NULL
  *	  (DESIGN.md §14).
@@ -769,66 +734,6 @@ StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
 /* Kinds whose order compares keys (the others are one entry per column). */
 #define LION_KIND_HAS_KEY(k)	((k) == LION_KIND_VALUE || (k) == LION_KIND_SUMMARY)
 
-typedef struct LionEntryTuple
-{
-	uint32		hash;
-	uint16		flags;			/* LION_ENTRY_INLINE or LION_ENTRY_CHAIN,
-								 * plus LION_ENTRY_NULLKEY for the null entry */
-	uint16		keylen;			/* bytes of key data (0 for the null entry) */
-	BlockNumber head;			/* CHAIN: first container page */
-	BlockNumber tail;			/* CHAIN: last container page */
-	uint32		ncontainers;	/* ITEMS: containers and sparse segments */
-	uint16		attno;			/* 1-based KEY COLUMN (DESIGN.md §24); 0 only
-								 * on a minus-infinity downlink */
-	uint16		unused;			/* the rest of what was alignment padding */
-	uint64		ntids;
-	/* key data (keylen bytes), MAXALIGN padding, then inline items */
-} LionEntryTuple;
-
-#define LION_ENTRY_HDRSZ			(offsetof(LionEntryTuple, ntids) + sizeof(uint64))	/* 32 */
-
-/*
- * DESIGN.md §24 spends the four bytes the header was padding out before
- * `ntids`, so the header is the same 32 bytes it has been since format 3 and
- * no item on any page moves.  Both halves of that are checked here rather
- * than trusted, because a compiler that laid the struct out differently would
- * make every existing index unreadable without a word of warning.
- */
-StaticAssertDecl(offsetof(LionEntryTuple, attno) == 20,
-				 "LionEntryTuple.attno must occupy the old header padding");
-StaticAssertDecl(sizeof(LionEntryTuple) == 32,
-				 "the lion entry header must stay 32 bytes");
-#define LionEntryGetKey(e)		((char *) (e) + LION_ENTRY_HDRSZ)
-
-/*
- * The positions extension of an entry flagged LION_ENTRY_POSITIONS, right
- * after its key (DESIGN.md §17, "Stored positions"):
- *
- *	- on a CHAIN entry pos_root is the root of the key's position tree
- *	  (lion_postree.c), or InvalidBlockNumber while it has none, and pos_len
- *	  is 0;
- *	- on an INLINE entry pos_root is InvalidBlockNumber and pos_len is the
- *	  size of the positions section: the last pos_len bytes of the item, a
- *	  run of position chunks after the container items and their slack.
- *
- * The header's 32 bytes are full, hence an extension, and only entries that
- * store positions carry it: every other entry is laid out as it always was.
- */
-typedef struct LionEntryPosExt
-{
-	BlockNumber pos_root;
-	uint32		pos_len;
-} LionEntryPosExt;
-
-#define LION_ENTRY_POSEXT_SIZE	MAXALIGN(sizeof(LionEntryPosExt))	/* 8 */
-
-#define LionEntryExtOffset(e)	MAXALIGN(LION_ENTRY_HDRSZ + (e)->keylen)
-#define LionEntryPayloadOffset(e) \
-	(LionEntryExtOffset(e) + \
-	 (((e)->flags & LION_ENTRY_POSITIONS) != 0 ? LION_ENTRY_POSEXT_SIZE : 0))
-#define LionEntryGetPayload(e)	((char *) (e) + LionEntryPayloadOffset(e))
-/* payload length must be computed from the item size: LION_ENTRY_PAYLOAD_LEN() */
-
 #define LION_MAX_KEY_SIZE		2000
 #define LION_DEFAULT_INLINE_LIMIT 4096
 #define LION_MIN_INLINE_LIMIT	64
@@ -862,11 +767,14 @@ lion_entry_kind(const LionEntryTuple *e)
  * with the open bucket's key at the time is a lower bound for the entry
  * whatever becomes of it, because its key only ever rises, and it is above
  * every other summary of the column, whose keys are below the open one's.
+ * The pivot keeps LION_ENTRY_ALIGNKEY too, because it carries the item's key
+ * where the item has it.
  */
 static inline uint16
 lion_pivot_kindflags(uint16 flags)
 {
-	uint16		k = flags & (LION_ENTRY_KINDFLAGS | LION_ENTRY_MINUSINF);
+	uint16		k = flags & (LION_ENTRY_KINDFLAGS | LION_ENTRY_MINUSINF |
+							 LION_ENTRY_ALIGNKEY);
 
 	if ((k & LION_ENTRY_SUMLAST) != 0)
 		k = (uint16) ((k & ~LION_ENTRY_SUMLAST) | LION_ENTRY_SUMMARY);
@@ -877,8 +785,9 @@ lion_pivot_kindflags(uint16 flags)
  * The largest PIVOT tuple (a high key or a downlink) the directory can hold,
  * and therefore what every split has to keep room for on both halves.
  */
-#define LION_MAX_PIVOT_SIZE \
-	(MAXALIGN(LION_ENTRY_HDRSZ + LION_MAX_KEY_SIZE) + sizeof(ItemIdData))
+#define LION_MAX_PIVOT_TUPLE \
+	MAXALIGN(DOUBLEALIGN(LION_ENTRY_SHORT_HDRSZ) + LION_MAX_KEY_SIZE)
+#define LION_MAX_PIVOT_SIZE		(LION_MAX_PIVOT_TUPLE + sizeof(ItemIdData))
 
 /*
  * The largest ENTRY tuple, which is smaller than the largest item a page can
@@ -1429,6 +1338,18 @@ extern void lion_store_key(LionState *state, Datum key, char *dest);
 extern Datum lion_fetch_key(LionState *state, const char *src);
 
 /*
+ * The layout flags an entry of this column's keys carries: LION_ENTRY_ALIGNKEY
+ * for a key type passed by reference whose alignment is double
+ * (lion_entryfmt.h), none otherwise.
+ */
+static inline uint16
+lion_key_layout_flags(const LionState *state)
+{
+	return (!state->typbyval && state->typalign == 'd') ?
+		LION_ENTRY_ALIGNKEY : 0;
+}
+
+/*
  * A key read off a page, checked for the form lion_store_key() gives it
  * before any opclass function sees it (lion_state.c): lion_key_is_valid()
  * says whether it has it, lion_check_key() raises ERRCODE_INDEX_CORRUPTED
@@ -1438,6 +1359,38 @@ extern Datum lion_fetch_key(LionState *state, const char *src);
 extern bool lion_key_is_valid(LionState *state, const char *key, Size keylen);
 extern void lion_check_key(LionState *state, const char *key, Size keylen);
 extern Datum lion_entry_key(LionState *state, const LionEntryTuple *entry);
+
+/*
+ * THE HASH OF AN ENTRY (DESIGN.md §21), which the directory order compares
+ * after proc 4 - or first, in a column without one - and which no entry
+ * stores: lion_hash_key() of the stored key for a VALUE entry, and of a
+ * pivot made of one, and 0 (LION_NULLKEY_HASH, LION_SUMMARY_HASH) for every
+ * other kind.  `state` is the column of the entry's attno.
+ */
+static inline uint32
+lion_entry_hash(LionState *state, const LionEntryTuple *entry)
+{
+	if (lion_entry_kind(entry) != LION_KIND_VALUE)
+		return 0;
+	return lion_hash_key(state, lion_entry_key(state, entry));
+}
+
+/*
+ * THE OWNER STAMP of the pages of a CHAIN entry's posting tree and position
+ * tree (DESIGN.md §18): what LionPageOpaqueData.owner_hash holds beside the
+ * root.  A hash of the stored key's bytes for a VALUE entry, and 0 for every
+ * other kind - for a summary because the open bucket's key is raised in
+ * place, and its pages must not then claim another entry.  It needs no
+ * opclass function, so every reader that holds the entry can check a page.
+ */
+extern uint32 lion_owner_stamp(int kind, const char *key, Size keylen);
+
+static inline uint32
+lion_entry_owner(const LionEntryTuple *entry)
+{
+	return lion_owner_stamp(lion_entry_kind(entry), LionEntryGetKey(entry),
+							entry->keylen);
+}
 extern bool lion_keys_equal(LionState *state, Datum a, Datum b);
 
 /* ---------- lion_dir.c: the sorted entry directory (DESIGN.md §21) ---------- */
@@ -1551,9 +1504,9 @@ extern void lion_entry_size_error(Page page, ItemId iid);
  * The entry a directory page's item holds, its size checked against the
  * header and the key it claims: an ERROR (ERRCODE_INDEX_CORRUPTED) when the
  * item does not hold them whole, since every reader compares or decodes the
- * keylen bytes after the header, and a damaged keylen would send it past the
- * item - and long enough for the aligned key and the positions extension its
- * flags claim, which is where LION_ENTRY_PAYLOAD_LEN() starts counting: an
+ * keylen bytes after the header its flags give it, and a damaged keylen or
+ * flags word would send it past the item - and long enough for the
+ * positions extension its flags claim, which is where LION_ENTRY_PAYLOAD_LEN() starts counting: an
  * item shorter than that would give a payload length wrapped around zero.  A
  * few compares per item, so readers can afford it on every entry they look
  * at; writers have lion_page_entry_fetch(), which checks more.
@@ -1565,8 +1518,7 @@ lion_entry_at(Page page, ItemId iid)
 	Size		len = ItemIdGetLength(iid);
 
 	if (unlikely((Size) ItemIdGetOffset(iid) + len > BLCKSZ ||
-				 len < LION_ENTRY_HDRSZ ||
-				 len - LION_ENTRY_HDRSZ < (Size) e->keylen ||
+				 len < LION_ENTRY_SHORT_HDRSZ ||
 				 len < LionEntryPayloadOffset(e)))
 		lion_entry_size_error(page, iid);
 	return e;
@@ -1592,7 +1544,7 @@ extern Buffer lion_dir_search(Relation index, Relation heaprel,
  * The level-1 page a read-only descent took its leaf's downlink from, for a
  * caller that looks keys up in their order (lion_lookup_walk_find()): its
  * block, and a copy of its high key as it was then - in hikey, which the
- * caller allocates at MAXALIGN(LION_ENTRY_HDRSZ + LION_MAX_KEY_SIZE) - or
+ * caller allocates at LION_MAX_PIVOT_TUPLE bytes - or
  * that it was the rightmost page of its level.  blk is InvalidBlockNumber
  * when there is none: a directory of one level, or a high key that did not
  * look like one.
@@ -1684,9 +1636,38 @@ extern void lion_dir_place(Relation index, Relation heaprel, LionIndexState *ix,
 extern void lion_dir_delete(Relation index, Buffer buf, OffsetNumber *offs,
 						   int noffs);
 
-/* Build an entry tuple in palloc'd memory; *size receives its total length. */
-extern LionEntryTuple *lion_make_entry(LionState *state, Datum key, uint32 hash, uint16 flags,
-									 const char *payload, Size payloadlen, Size *size);
+/*
+ * Build an entry tuple in palloc'd memory; *size receives its total length.
+ * It has no hash (lion_entryfmt.h): lion_entry_hash() recomputes it.
+ */
+extern LionEntryTuple *lion_make_entry(LionState *state, Datum key, uint16 flags,
+									   const char *payload, Size payloadlen,
+									   Size *size);
+
+/*
+ * A pivot - pivotflag is LION_ENTRY_HIGHKEY or LION_ENTRY_DOWNLINK - with
+ * src's key and kind (a NULL src: the minus-infinity downlink), and child as
+ * its downlink target (InvalidBlockNumber for a high key); and the size of
+ * one made from src.
+ */
+extern LionEntryTuple *lion_make_pivot(const LionEntryTuple *src,
+									   uint16 pivotflag, BlockNumber child,
+									   Size *size);
+
+static inline Size
+lion_pivot_size(const LionEntryTuple *src)
+{
+	return lion_entry_payoff_for(LION_ENTRY_HIGHKEY |
+								 (src->flags & LION_ENTRY_ALIGNKEY),
+								 src->keylen);
+}
+
+/*
+ * A private copy of an entry in the CHAIN header form, with its counts and
+ * no payload: what a spill turns an INLINE entry into (lion_entry.c).
+ */
+extern LionEntryTuple *lion_entry_chain_shape(const LionEntryTuple *entry,
+											  Size *size);
 
 /*
  * The same for a reserved entry (DESIGN.md §14 and §17): no key, hash 0, and
@@ -2056,6 +2037,40 @@ lion_entry_pos_len(const LionEntryTuple *e, Size itemsz)
 	((Size) (itemsz) - LionEntryPayloadOffset(e) - lion_entry_pos_len((e), (itemsz)))
 
 /*
+ * The short header's counts (lion_entryfmt.h) hold every INLINE posting set:
+ * its payload is at most LION_MAX_ENTRY_SIZE bytes, of items of at least
+ * LION_CONTAINER_HDRSZ bytes and at most LION_CONTAINER_RANGE members each.
+ */
+StaticAssertDecl(LION_MAX_ENTRY_SIZE / LION_CONTAINER_HDRSZ <= PG_UINT16_MAX,
+				 "an INLINE payload's item count fits the short entry header");
+StaticAssertDecl((uint64) (LION_MAX_ENTRY_SIZE / LION_CONTAINER_HDRSZ) *
+				 LION_CONTAINER_RANGE <= PG_UINT32_MAX,
+				 "an INLINE payload's TID count fits the short entry header");
+
+/*
+ * The setters of an entry's counts, which store into the entry's own header
+ * form; a count its form cannot hold is damage the caller read from a page,
+ * and an ERROR (ERRCODE_INDEX_CORRUPTED).
+ */
+extern void lion_entry_count_error(const LionEntryTuple *e, const char *what,
+								   uint64 n);
+
+static inline void
+lion_entry_set_ntids(LionEntryTuple *e, uint64 n)
+{
+	if (unlikely(!lion_entry_try_set_ntids(e, n)))
+		lion_entry_count_error(e, "TIDs", n);
+}
+
+static inline void
+lion_entry_set_ncontainers(LionEntryTuple *e, uint64 n)
+{
+	if (unlikely(n > PG_UINT32_MAX ||
+				 !lion_entry_try_set_ncontainers(e, (uint32) n)))
+		lion_entry_count_error(e, "items", n);
+}
+
+/*
  * Fill *ix - every key column of it - using the supplied meta page image.
  * ambuild uses this before the meta page exists; lion_get_index_state() uses
  * it afterwards.  The column array and the FmgrInfos are allocated in cxt.
@@ -2182,10 +2197,10 @@ extern Page lion_wal_init_buffer(LionWalState *state, Buffer buf, uint16 flags);
 extern void lion_wal_log_special(LionWalState *state, Page page);
 
 /*
- * Private copy of an entry tuple (header, key and padding taken from entry,
- * which may point into a page) with a new payload.  A zero-length payload
- * gives the shape of a CHAIN entry.  The caller fills in flags, head, tail,
- * ncontainers and ntids.
+ * Private copy of an entry tuple (header, key and positions extension taken
+ * from entry, which may point into a page, in its own header form) with a
+ * new payload.  The caller updates the counts; lion_entry_chain_shape() is
+ * what changes the form.
  */
 extern LionEntryTuple *lion_entry_rebuild(const LionEntryTuple *entry,
 										const char *payload, Size payloadlen,

@@ -1641,12 +1641,12 @@ lion_topk_run(LionCountScanState *st)
 			continue;
 
 		/* smaller than every one kept, once there are enough */
-		if (trimmed && entry->ntids <= floor)
+		if (trimmed && lion_entry_ntids(entry) <= floor)
 		{
-			maxout = Max(maxout, entry->ntids);
+			maxout = Max(maxout, lion_entry_ntids(entry));
 			continue;
 		}
-		cand[n].ntids = entry->ntids;
+		cand[n].ntids = lion_entry_ntids(entry);
 		cand[n].isnull = LionEntryIsNullKey(entry);
 		cand[n].key = cand[n].isnull ? (Datum) 0 :
 			datumCopy(lion_entry_key(es.state, entry), byval, typlen);
@@ -3094,10 +3094,10 @@ lion_wagg_walk(LionCountScanState *st, int c, LionWBatch *batch)
 			isnull = LionEntryIsNullKey(entry);
 			key = isnull ? (Datum) 0 : lion_entry_key(es.state, entry);
 			if (!defer)
-				lion_wagg_add(st, c, key, isnull, (int64) entry->ntids);
-			else if (entry->ntids > 0 &&
+				lion_wagg_add(st, c, key, isnull, (int64) lion_entry_ntids(entry));
+			else if (lion_entry_ntids(entry) > 0 &&
 					 !lion_wagg_defer(st, batch, c, es.state, key, isnull,
-									  (int64) entry->ntids))
+									  (int64) lion_entry_ntids(entry)))
 			{
 				MemoryContextSwitchTo(oldcxt);
 				ok = false;

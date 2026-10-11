@@ -583,17 +583,22 @@ void
 lion_entry_size_error(Page page, ItemId iid)
 {
 	Size		len = ItemIdGetLength(iid);
+	const LionEntryTuple *e;
 
-	if ((Size) ItemIdGetOffset(iid) + len > BLCKSZ || len < LION_ENTRY_HDRSZ)
+	/* the header is read only once the item is known to be on the page */
+	if ((Size) ItemIdGetOffset(iid) + len > BLCKSZ ||
+		len < LION_ENTRY_SHORT_HDRSZ ||
+		len < LionEntryHdrSize((const LionEntryTuple *) PageGetItem(page, iid)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lion index entry of %zu bytes at page offset %u does not hold an entry header",
 						len, ItemIdGetOffset(iid))));
-	if (len - LION_ENTRY_HDRSZ < (Size) ((LionEntryTuple *) PageGetItem(page, iid))->keylen)
+	e = (const LionEntryTuple *) PageGetItem(page, iid);
+	if (len < LionEntryKeyOffset(e) + (Size) e->keylen)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lion index entry of %zu bytes claims a key of %u bytes",
-						len, ((LionEntryTuple *) PageGetItem(page, iid))->keylen)));
+						len, e->keylen)));
 	ereport(ERROR,
 			(errcode(ERRCODE_INDEX_CORRUPTED),
 			 errmsg("lion index entry of %zu bytes at page offset %u is too small for its header, key and positions extension",
@@ -612,7 +617,8 @@ lion_page_entry_fetch(Relation index, Page page, BlockNumber blkno,
 	entry = (LionEntryTuple *) PageGetItem(page, PageGetItemId(page, off));
 	len = ItemIdGetLength(PageGetItemId(page, off));
 
-	if (unlikely(len < LION_ENTRY_HDRSZ || len < LionEntryPayloadOffset(entry)))
+	if (unlikely(len < LION_ENTRY_SHORT_HDRSZ ||
+				 len < LionEntryPayloadOffset(entry)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lion index \"%s\": entry %u on block %u is %zu bytes, too small for its header and key",
