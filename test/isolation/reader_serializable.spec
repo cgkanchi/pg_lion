@@ -32,6 +32,7 @@ step s1_any	{ SELECT lion_index_count_any('rc_k', ARRAY[98, 99]); }
 step s1_stats	{ SELECT count FROM lion_index_count_stats('rc_k', 99); }
 step s1_groups	{ SELECT count(*) FROM lion_index_count_group_stats('rc_k'); }
 step s1_bm25	{ SELECT count(*) FROM lion_bm25('rc_d', 'secret', 10); }
+step s1_facets	{ SELECT * FROM lion_index_facets('rc_d', 3, 'k = 99'); }
 step s1_push	{ SELECT count(*) FROM rc WHERE k = 99; }
 step s1_rank	{ SELECT id FROM rc WHERE d @@ 'secret' ORDER BY lion_bm25_score(d, 'secret', 'rc_d') DESC LIMIT 10; }
 step s1_plans	{ EXPLAIN (COSTS OFF) SELECT count(*) FROM rc WHERE k = 99;
@@ -48,6 +49,7 @@ step s2_any	{ SELECT lion_index_count_any('rc_k', ARRAY[98, 99]); }
 step s2_stats	{ SELECT count FROM lion_index_count_stats('rc_k', 99); }
 step s2_groups	{ SELECT count(*) FROM lion_index_count_group_stats('rc_k'); }
 step s2_bm25	{ SELECT count(*) FROM lion_bm25('rc_d', 'secret', 10); }
+step s2_facets	{ SELECT * FROM lion_index_facets('rc_d', 3, 'k = 99'); }
 step s2_push	{ SELECT count(*) FROM rc WHERE k = 99; }
 step s2_rank	{ SELECT id FROM rc WHERE d @@ 'secret' ORDER BY lion_bm25_score(d, 'secret', 'rc_d') DESC LIMIT 10; }
 step s2_insert	{ INSERT INTO rc VALUES (-2, 99, 99, to_tsvector('simple', 'secret')); }
@@ -59,6 +61,7 @@ permutation s1_begin s2_begin s1_any s2_any s1_insert s2_insert s1_commit s2_com
 permutation s1_begin s2_begin s1_stats s2_stats s1_insert s2_insert s1_commit s2_commit
 permutation s1_begin s2_begin s1_groups s2_groups s1_insert s2_insert s1_commit s2_commit
 permutation s1_begin s2_begin s1_bm25 s2_bm25 s1_insert s2_insert s1_commit s2_commit
+permutation s1_begin s2_begin s1_facets s2_facets s1_insert s2_insert s1_commit s2_commit
 permutation s1_begin s2_begin s1_push s2_push s1_insert s2_insert s1_commit s2_commit
 permutation s1_begin s2_begin s1_rank s2_rank s1_insert s2_insert s1_commit s2_commit
 # the custom scans above are the plans

@@ -1,6 +1,6 @@
 Parsed test spec with 3 sessions
 
-starting permutation: s2_begin s2_snap s1_update s1_index s1_check s2_sp s2_count s2_back s2_sp s2_count2 s2_back s2_sp s2_any s2_back s2_sp s2_stats s2_back s2_sp s2_groups s2_back s2_sp s2_bm25 s2_back s2_commit s3_count s3_count2 s3_any s3_stats s3_groups s3_bm25
+starting permutation: s2_begin s2_snap s1_update s1_index s1_check s2_sp s2_count s2_back s2_sp s2_count2 s2_back s2_sp s2_any s2_back s2_sp s2_stats s2_back s2_sp s2_groups s2_back s2_sp s2_bm25 s2_back s2_sp s2_facets s2_back s2_sp s2_facetsf s2_back s2_commit s3_count s3_count2 s3_any s3_stats s3_groups s3_bm25 s3_facets s3_facetsf
 step s2_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
 step s2_snap: SELECT k FROM rx;
 k
@@ -43,6 +43,14 @@ step s2_sp: SAVEPOINT p;
 step s2_bm25: SELECT count(*) FROM lion_bm25('rx_d', 'old', 10);
 ERROR:  cannot rank through index "rx_d" because it was built from a broken HOT chain (indcheckxmin) and cannot be used by this transaction's snapshot
 step s2_back: ROLLBACK TO p;
+step s2_sp: SAVEPOINT p;
+step s2_facets: SELECT * FROM lion_index_facets('rx_d', 5);
+ERROR:  cannot count through index "rx_d" because it was built from a broken HOT chain (indcheckxmin) and cannot be used by this transaction's snapshot
+step s2_back: ROLLBACK TO p;
+step s2_sp: SAVEPOINT p;
+step s2_facetsf: SELECT * FROM lion_index_facets('rx_k', NULL, $$d @@ 'old'$$);
+ERROR:  cannot count through index "rx_k" because it was built from a broken HOT chain (indcheckxmin) and cannot be used by this transaction's snapshot
+step s2_back: ROLLBACK TO p;
 step s2_commit: COMMIT;
 step s3_count: SELECT lion_index_count('rx_k', 2);
 lion_index_count
@@ -78,5 +86,17 @@ step s3_bm25: SELECT count(*) FROM lion_bm25('rx_d', 'new', 10);
 count
 -----
     1
+(1 row)
+
+step s3_facets: SELECT * FROM lion_index_facets('rx_d', 5);
+key|count
+---+-----
+new|    1
+(1 row)
+
+step s3_facetsf: SELECT * FROM lion_index_facets('rx_k', NULL, $$d @@ 'new'$$);
+key|count
+---+-----
+  2|    1
 (1 row)
 

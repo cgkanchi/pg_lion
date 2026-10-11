@@ -1284,6 +1284,9 @@ extern LionKeyNode *lion_keynode_op(LionKeyNodeKind kind, LionKeyNode **args,
 
 /* jsonb_contains_ops' extractQuery (lion_jsonb.c), which hands over a tree */
 extern Datum lion_jsonb_extract_query(PG_FUNCTION_ARGS);
+/* ... its extractValue, and one of its keys as text (lion_index_facets()) */
+extern Datum lion_jsonb_extract_value(PG_FUNCTION_ARGS);
+extern char *lion_jsonb_key_out(const bytea *key);
 extern bool lion_tsquery_item_keys(LionState *state, Datum query,
 								   StrategyNumber strategy, Datum **itemkeys);
 
