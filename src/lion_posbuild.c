@@ -672,6 +672,17 @@ typedef struct LionPosLoader
 	uint32		hash;
 	BlockNumber root;			/* reserved first, written last */
 	LionContainer *chunk;		/* the chunk being filled */
+
+	/*
+	 * Up to LION_POSTING_FLAT_LEAVES leaves make a tree without an internal
+	 * level, whose first leaf is at the root block (DESIGN.md §17, §22).
+	 * Until the tree is known to need more, the finished leaves are held
+	 * here, the first one without a block; `tree` once it has more, and the
+	 * first leaf then gets a block of its own.
+	 */
+	void	   *held[LION_POSTING_FLAT_LEAVES];
+	int			nheld;
+	bool		tree;
 	LionPosTail tail;			/* where its last member ends */
 	bool		chunkopen;
 	/* the leaf being filled */
@@ -691,13 +702,30 @@ lion_posload_newleaf(LionPosLoader *ld)
 	lion_page_set_owner(ld->leaf, ld->hash, ld->root);
 }
 
-/* Write the leaf being filled; next is its right sibling, if any. */
+/*
+ * Write the held leaves, the first one at firstblk: the root block when the
+ * tree stays without an internal level, a block of its own when it does not.
+ */
+static void
+lion_posload_put_held(LionPosLoader *ld, BlockNumber firstblk)
+{
+	int			i;
+
+	Assert(ld->nheld == ld->nleaves);
+	if (ld->nheld > 0)
+		ld->pivots[0].child = firstblk;
+	for (i = 0; i < ld->nheld; i++)
+		ld->w->put(ld->w->arg, ld->pivots[i].child, ld->held[i]);
+	ld->nheld = 0;
+}
+
+/* Finish the leaf being filled; next is its right sibling, if any. */
 static void
 lion_posload_putleaf(LionPosLoader *ld, BlockNumber next)
 {
-	BlockNumber blk = BlockNumberIsValid(ld->leafblk) ? ld->leafblk :
-		ld->w->alloc(ld->w->arg);
+	BlockNumber blk = ld->leafblk;
 
+	Assert(BlockNumberIsValid(blk) || ld->nleaves == 0);
 	lion_page_update_minmax(ld->leaf);
 	LionPageGetOpaque(ld->leaf)->rightlink = next;
 	if (ld->nleaves == ld->maxpivots)
@@ -712,7 +740,10 @@ lion_posload_putleaf(LionPosLoader *ld, BlockNumber next)
 		LionPageGetOpaque(ld->leaf)->minckey;
 	ld->pivots[ld->nleaves].child = blk;
 	ld->nleaves++;
-	ld->w->put(ld->w->arg, blk, ld->leafhandle);
+	if (ld->tree)
+		ld->w->put(ld->w->arg, blk, ld->leafhandle);
+	else
+		ld->held[ld->nheld++] = ld->leafhandle;
 	ld->leafhandle = NULL;
 	ld->leaf = NULL;
 }
@@ -728,6 +759,16 @@ lion_posload_close(LionPosLoader *ld)
 		BlockNumber next = ld->w->alloc(ld->w->arg);
 
 		lion_posload_putleaf(ld, next);
+
+		/*
+		 * One leaf more than a tree without an internal level has: the
+		 * root block is the internal root's, and the first leaf moves off it.
+		 */
+		if (!ld->tree && ld->nleaves + 1 > LION_POSTING_FLAT_LEAVES)
+		{
+			ld->tree = true;
+			lion_posload_put_held(ld, ld->w->alloc(ld->w->arg));
+		}
 		lion_posload_newleaf(ld);
 		ld->leafblk = next;
 	}
@@ -830,16 +871,14 @@ lion_posload_end(LionPosLoader *ld)
 	if (ld->chunkopen)
 		lion_posload_close(ld);
 
-	if (ld->nleaves == 0)
+	lion_posload_putleaf(ld, InvalidBlockNumber);
+	if (!ld->tree)
 	{
-		/* one leaf: it is the root */
-		ld->leafblk = ld->root;
-		ld->nleaves = 0;
-		lion_posload_putleaf(ld, InvalidBlockNumber);
+		/* no internal level: the first leaf is the root */
+		lion_posload_put_held(ld, ld->root);
 		return;
 	}
 
-	lion_posload_putleaf(ld, InvalidBlockNumber);
 	pivots = ld->pivots;
 	npivots = ld->nleaves;
 	while ((npivots = lion_posload_level(ld, level, pivots, npivots,

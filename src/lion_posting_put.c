@@ -569,6 +569,111 @@ lion_spill_posroot(LionWalState *xstate, Buffer posbuf, uint32 hash,
 	lion_entry_posext(entry)->pos_root = posroot;
 }
 
+/*
+ * A spill of more than one leaf and at most LION_POSTING_FLAT_LEAVES: a FLAT
+ * tree, whose head is its FIRST leaf and whose leaves are only a chain
+ * (DESIGN.md §22).  It keeps the order of records a larger spill keeps,
+ * for the same reasons (see the comment above LION_SPILL_MAX_LEAVES):
+ *
+ *	1. rootbuf, the head, is logged first as a page of the set with no
+ *	   downlink, which no reader or sweep takes for a live root
+ *	   (lion_posting_root_live()), and which keeps its block from being handed
+ *	   out again after an OS crash;
+ *	2. the other leaves, left to right, one record each, stamped with the head;
+ *	3. the head itself, re-initialised as the first leaf and linked to the
+ *	   second, in the last record with the entry that starts pointing at it.
+ *
+ * So the head is a leaf exactly from the record that makes the entry a CHAIN
+ * entry, and a crash or an ERROR before it leaves orphans whose root is not
+ * live, which the sweep frees, as it does a larger spill's.  rootbuf and
+ * posbuf come locked and are released here.
+ */
+static void
+lion_spill_flat(Relation index, Relation heaprel, Buffer entrybuf,
+				OffsetNumber entryoff, LionEntryTuple *entry,
+				const char *payload, Size paylen,
+				const LionContainer *poschunk, Buffer rootbuf, Buffer posbuf,
+				int nleaves, LionContainer *cbuf)
+{
+	BlockNumber root = BufferGetBlockNumber(rootbuf);
+	LionWalState *xstate;
+	Page		rootpage;
+	Buffer		leafbuf;
+	BlockNumber second;
+	BlockNumber tail = InvalidBlockNumber;
+	Size		end0;
+	Size		off;
+	bool		more;
+	int			i;
+
+	Assert(nleaves > 1 && nleaves <= LION_POSTING_FLAT_LEAVES);
+
+	xstate = lion_wal_begin(index);
+	rootpage = lion_wal_init_buffer(xstate, rootbuf, LION_PAGE_CONTAINER);
+	LionPageGetOpaque(rootpage)->level = 1;
+	lion_page_set_owner(rootpage, entry->hash, root);
+	lion_wal_log_special(xstate, rootpage);
+	lion_wal_finish(xstate, LION_XLOG_PAGE_INIT);
+
+	/* where the head's items end, and the second leaf, which follows it */
+	end0 = lion_spill_leaf_end(payload, paylen, 0, cbuf, &more);
+	if (!more)
+		elog(ERROR, "lion index \"%s\": a spilled payload of %zu bytes does not pack the way it was counted",
+			 RelationGetRelationName(index), paylen);
+	leafbuf = lion_alloc_page(index, heaprel, true);
+	second = BufferGetBlockNumber(leafbuf);
+
+	off = end0;
+	for (i = 1; i < nleaves; i++)
+	{
+		Buffer		nextbuf = InvalidBuffer;
+		BlockNumber leafblk = BufferGetBlockNumber(leafbuf);
+		Page		leafpage;
+		Size		end;
+
+		end = lion_spill_leaf_end(payload, paylen, off, cbuf, &more);
+		if (more != (i + 1 < nleaves))
+			elog(ERROR, "lion index \"%s\": a spilled payload of %zu bytes does not pack the way it was counted",
+				 RelationGetRelationName(index), paylen);
+		if (more)
+			nextbuf = lion_alloc_page(index, heaprel, true);
+
+		xstate = lion_wal_begin(index);
+		leafpage = lion_wal_init_buffer(xstate, leafbuf, LION_PAGE_CONTAINER);
+		lion_page_set_owner(leafpage, entry->hash, root);
+		lion_spill_fill_leaf(xstate, leafpage, payload, off, end, cbuf);
+		if (more)
+			LionPageGetOpaque(leafpage)->rightlink = BufferGetBlockNumber(nextbuf);
+		lion_wal_log_special(xstate, leafpage);
+		lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
+
+		tail = leafblk;
+		UnlockReleaseBuffer(leafbuf);
+		leafbuf = nextbuf;
+		off = end;
+	}
+	Assert(!BufferIsValid(leafbuf));
+
+	/* The same test hook as a larger spill's: see lion_entry_spill_pos(). */
+	LION_INJECTION_POINT("lion-spill-leaves-written");
+
+	/* The head, now the first leaf, and the entry, in one last record. */
+	lion_spill_set_chain(entry, root, tail);
+	xstate = lion_wal_begin(index);
+	rootpage = lion_wal_init_buffer(xstate, rootbuf, LION_PAGE_CONTAINER);
+	lion_page_set_owner(rootpage, entry->hash, root);
+	lion_spill_fill_leaf(xstate, rootpage, payload, 0, end0, cbuf);
+	LionPageGetOpaque(rootpage)->rightlink = second;
+	lion_wal_log_special(xstate, rootpage);
+	if (BufferIsValid(posbuf))
+		lion_spill_posroot(xstate, posbuf, entry->hash, poschunk, entry);
+	lion_put_entry(index, xstate, entrybuf, entryoff, entry);
+	lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
+	UnlockReleaseBuffer(rootbuf);
+	if (BufferIsValid(posbuf))
+		UnlockReleaseBuffer(posbuf);
+}
+
 void
 lion_entry_spill(Relation index, Relation heaprel, Buffer entrybuf,
 				OffsetNumber entryoff, LionEntryTuple *entry,
@@ -664,8 +769,17 @@ lion_entry_spill_pos(Relation index, Relation heaprel, Buffer entrybuf,
 		return;
 	}
 
+	if (nleaves <= LION_POSTING_FLAT_LEAVES)
+	{
+		lion_spill_flat(index, heaprel, entrybuf, entryoff, entry, payload,
+						paylen, poschunk, rootbuf, posbuf, nleaves, cbuf);
+		pfree(cbuf);
+		return;
+	}
+
 	/*
-	 * Several leaves.  The ROOT is written first, in a record of its own: an
+	 * Several leaves, more than a flat tree has (LION_POSTING_FLAT_LEAVES).
+	 * The ROOT is written first, in a record of its own: an
 	 * internal page of the set with no downlink yet.  Every leaf is stamped
 	 * with its block, and "a block is a root once in the life of the index"
 	 * rests on the block having been handed out by an extension that stays
@@ -852,8 +966,14 @@ lion_posting_root_live(Relation index, uint32 hash, BlockNumber head, bool wait)
  * EXCLUSIVE until its downlink has been inserted and the flag cleared.  A
  * crash in between costs nothing but the next write descent's repair.
  *
- * The ROOT is split by pushing it down instead, so that the root block - the
- * entry's `head`, and the owner stamp of every page of the set - never moves.
+ * A set WITHOUT an internal level - its head a leaf, at most
+ * LION_POSTING_FLAT_LEAVES leaves in one chain - has no parent to give a
+ * downlink to: its split is the one record and flags nothing, the new pages
+ * simply joining the chain.  The split that would make it one leaf longer
+ * than that promotes it first (lion_posting_promote()): the head is pushed
+ * down into a level-1 page with a downlink to every leaf, in one record, so
+ * that the head block - the entry's `head`, and the owner stamp of every page
+ * of the set - never moves, and the split then goes ahead in the tree.
  *
  * P itself may be the left half of a split that never finished - a crash or
  * an ERROR between that split's two records (DESIGN.md §22) - when the caller
@@ -902,6 +1022,7 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	uint32		firstmoved = 0;	/* first ckey of the items that move right */
 	PGAlignedBlock *trial = NULL;
 	bool		needm;
+	bool		flat;
 	int			i;
 
 	/*
@@ -925,56 +1046,17 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	Assert(LionPageIsPostingLeaf(page));
 	Assert(!LionPageIncompleteSplit(page));
 
-	if (blk == tree->root)
-	{
-		/*
-		 * The whole set is this one page, so there is no parent to take a
-		 * downlink.  Push the root down - its items go to a new child, the
-		 * root block becomes the level above - and place the items on the
-		 * child, which is a verbatim copy and therefore wants them at the
-		 * very same offset.
-		 *
-		 * The root's lock is dropped while that happens, because the child's
-		 * own split will have to take it to insert ITS downlink and buffer
-		 * locks are not reentrant.  Writers of one key serialise on the
-		 * entry's directory leaf (DESIGN.md §22), so nothing else can be in
-		 * this tree; a reader that looks in between sees the push-down, which
-		 * is already on disk, and descends.  The caller gets its buffer back
-		 * locked as it handed it over - with an EXCLUSIVE lock, which is what
-		 * a cleanup lock decays to here: the page it holds is the new ROOT,
-		 * an internal page that holds no TIDs at all.
-		 *
-		 * The CHILD, on the other hand, comes back from the push-down still
-		 * locked, and stays locked until the items are placed: when this is
-		 * VACUUM re-placing a container it filtered (lion_vacuum_regrow()),
-		 * the push-down has just copied the UNFILTERED container onto the
-		 * child, and a reader that could lock the child in between would copy
-		 * the dead TIDs, keep its pin, and have them removed under it by the
-		 * write below, which takes no cleanup lock (DESIGN.md §11).  Nobody
-		 * but this backend has ever locked the child, so nobody holds a copy
-		 * of what is on it.
-		 */
-		Buffer		cbuf;
-
-		cbuf = lion_posting_root_pushdown(index, heaprel, buf, tree->entrybuf,
-										  tree->entryoff, tree->entry);
-
-		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-
-		/*
-		 * Test hook: the push-down is on disk and the root is unlocked; the
-		 * child is not (see above).  test/isolation/vacuum_regrow_pushdown.spec
-		 * parks VACUUM's regrow here and sends a count's descent at the child.
-		 */
-		LION_INJECTION_POINT("lion-posting-pushdown-child");
-
-		lion_tree_put_items_locked(index, heaprel, cbuf, tree, off, replace,
-								   items, nitems, false);
-
-		UnlockReleaseBuffer(cbuf);
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		return;
-	}
+	/*
+	 * A FLAT tree - its head is a leaf, the first of at most
+	 * LION_POSTING_FLAT_LEAVES - has no level above to post a downlink to.
+	 * Its splits only link their new pages into the chain; the one that would
+	 * make the chain longer than the limit pushes the head down first (below).
+	 * The head is looked at with P held, which locks a page left of one this
+	 * backend holds, and is safe for the reason lion_posting_adopt() gives:
+	 * every writer of the key holds its directory leaf, and readers and
+	 * VACUUM never wait for a page while they hold one of this tree.
+	 */
+	flat = lion_posting_root_is_leaf(index, tree->root, buf);
 
 	for (i = 0; i < nitems; i++)
 	{
@@ -1056,6 +1138,123 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	if (ndel > 0)
 		PageIndexMultiDelete((Page) trial->data, delofs, ndel);
 	needm = PageGetExactFreeSpace((Page) trial->data) < need;
+
+	/*
+	 * A flat tree that this split would make longer than
+	 * LION_POSTING_FLAT_LEAVES gets its level 1 first: the head is pushed
+	 * down - its items go to a brand new leaf, and the head block becomes a
+	 * page with a downlink to every leaf of the chain, in one record
+	 * (lion_posting_promote()) - and the split is then an ordinary split of a
+	 * tree leaf, flags, downlinks, repair and all.  A crash between the
+	 * promotion and the split leaves a complete tree, of the leaves the chain
+	 * had: the promotion moves items without changing them, and the entry
+	 * keeps the counters of the items that are on pages.
+	 */
+	if (flat &&
+		lion_posting_flat_count(index, tree->root, buf,
+								LION_POSTING_FLAT_LEAVES) +
+		(nmove > 0 ? 1 : 0) + (needm ? 1 : 0) > LION_POSTING_FLAT_LEAVES)
+	{
+		if (movebuf)
+		{
+			pfree(movebuf);
+			pfree(movelen);
+			pfree(moveptr);
+		}
+		if (delofs)
+			pfree(delofs);
+		pfree(trial);
+
+		if (blk == tree->root)
+		{
+			/*
+			 * P is the head.  Its items go to the new leaf, which takes P's
+			 * place in the chain, and the caller's items are placed on that
+			 * leaf, which is a verbatim copy and therefore wants them at the
+			 * very same offset - as a split of a tree leaf.
+			 *
+			 * The head's lock is dropped while that happens, because the
+			 * leaf's own split will have to take it to insert ITS downlink and
+			 * buffer locks are not reentrant.  Writers of one key serialise on
+			 * the entry's directory leaf (DESIGN.md §22), so nothing else can
+			 * be in this tree; a reader that looks in between sees the
+			 * push-down, which is already on disk, and descends.  The caller
+			 * gets its buffer back locked as it handed it over - with an
+			 * EXCLUSIVE lock, which is what a cleanup lock decays to here: the
+			 * page it holds is the new ROOT, an internal page that holds no
+			 * TIDs at all.
+			 *
+			 * The new LEAF, on the other hand, comes back from the push-down
+			 * still locked, and stays locked until the items are placed: when
+			 * this is VACUUM re-placing a container it filtered
+			 * (lion_vacuum_regrow()), the push-down has just copied the
+			 * UNFILTERED container onto it, and a reader that could lock it
+			 * in between would copy the dead TIDs, keep its pin, and have them
+			 * removed under it by the write below, which takes no cleanup lock
+			 * (DESIGN.md §11).  Nobody but this backend has ever locked the
+			 * new leaf, so nobody holds a copy of what is on it.
+			 */
+			Buffer		cbuf;
+
+			cbuf = lion_posting_promote(index, heaprel, buf, InvalidBuffer,
+										tree->entrybuf, tree->entryoff,
+										tree->entry);
+
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+			/*
+			 * Test hook: the push-down is on disk and the root is unlocked;
+			 * the new leaf is not (see above).
+			 * test/isolation/vacuum_regrow_pushdown.spec parks VACUUM's
+			 * regrow here and sends a count's descent at the new leaf.
+			 */
+			LION_INJECTION_POINT("lion-posting-pushdown-child");
+
+			lion_tree_put_items_locked(index, heaprel, cbuf, tree, off, replace,
+									   items, nitems, false);
+
+			UnlockReleaseBuffer(cbuf);
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			return;
+		}
+
+		/*
+		 * P is another leaf of the chain, and stays where it is with what it
+		 * holds: the push-down copies only the head, and takes P's downlink
+		 * and minckey from the buffer this backend holds.  The new leaf is
+		 * let go at once - it holds the head's items, which no write of this
+		 * call touches - and so is the head; then P is split as a leaf of
+		 * the tree it now is.
+		 */
+		{
+			Buffer		hbuf = ReadBuffer(index, tree->root);
+			Buffer		cbuf;
+
+			LockBuffer(hbuf, BUFFER_LOCK_EXCLUSIVE);
+			if (!lion_page_owns_tree(BufferGetPage(hbuf), tree->root) ||
+				!LionPageIsPostingLeaf(BufferGetPage(hbuf)))
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("lion index \"%s\": the head %u of a posting set changed under a writer of it",
+								RelationGetRelationName(index), tree->root)));
+			cbuf = lion_posting_promote(index, heaprel, hbuf, buf,
+										tree->entrybuf, tree->entryoff,
+										tree->entry);
+			UnlockReleaseBuffer(cbuf);
+			UnlockReleaseBuffer(hbuf);
+		}
+
+		/*
+		 * Test hook: the head is pushed down and P is about to be split as a
+		 * leaf of the tree.  test/recovery/run.sh crashes the server here and
+		 * proves that the tree the promotion left takes the next insert.
+		 */
+		LION_INJECTION_POINT("lion-posting-promoted");
+
+		lion_split_and_place(index, heaprel, buf, off, replace, tree, items,
+							 nitems);
+		return;
+	}
 
 	/* Every page this record needs, taken before the record opens (§25). */
 	if (nmove > 0)
@@ -1147,19 +1346,22 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	{
 		BlockNumber after_m = BlockNumberIsValid(nblk) ? nblk : oldright;
 
+		/* A flat tree has no level to post a downlink to: nothing is flagged. */
+		uint16		incomplete = flat ? 0 : LION_PAGE_INCOMPLETE_SPLIT;
+
 		if (pM != NULL)
 		{
 			LionPageGetOpaque(pM)->rightlink = after_m;
 			LionPageGetOpaque(pP)->rightlink = mblk;
-			LionPageGetOpaque(pP)->flags |= LION_PAGE_INCOMPLETE_SPLIT;
+			LionPageGetOpaque(pP)->flags |= incomplete;
 			if (pN != NULL)
-				LionPageGetOpaque(pM)->flags |= LION_PAGE_INCOMPLETE_SPLIT;
+				LionPageGetOpaque(pM)->flags |= incomplete;
 		}
 		else
 		{
 			LionPageGetOpaque(pP)->rightlink = after_m;
 			if (pN != NULL)
-				LionPageGetOpaque(pP)->flags |= LION_PAGE_INCOMPLETE_SPLIT;
+				LionPageGetOpaque(pP)->flags |= incomplete;
 		}
 
 		if (pN != NULL)

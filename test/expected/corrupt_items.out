@@ -628,7 +628,7 @@ SELECT lion_di_poke('lion_di_v_i', :lion_di_blk, :lion_di_at + 24, '\x0100000000
 DELETE FROM lion_di_v WHERE k = 7;
 \set VERBOSITY terse
 VACUUM lion_di_v;
-ERROR:  lion index "lion_di_v_i": entry 2 on block 4 counts 1 TIDs in 4 containers, fewer than VACUUM removes (3616 TIDs, 4 containers)
+ERROR:  lion index "lion_di_v_i": entry 2 on block 3 counts 1 TIDs in 4 containers, fewer than VACUUM removes (3616 TIDs, 4 containers)
 \set VERBOSITY default
 DROP TABLE lion_di_v;
 -- ---------- 10. an entry too short for its aligned payload offset ----------

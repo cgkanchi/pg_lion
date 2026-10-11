@@ -488,7 +488,7 @@ SELECT scb_buffers(q, 'count') AS count_buffers,
   FROM (VALUES ('d0 = 1 AND d1 = 1 AND b = 1 AND c = 1')) v(q);
  count_buffers | bitmap_reads_less | plain_reads_less | both_read_alike 
 ---------------+-------------------+------------------+-----------------
-            23 | t                 | t                | t
+            17 | t                 | t                | t
 (1 row)
 
 DROP TABLE scb;

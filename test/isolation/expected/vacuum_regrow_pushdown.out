@@ -18,7 +18,7 @@ step s4_before:
 
 container_pages|posting_internal_pages
 ---------------+----------------------
-              3|                     1
+             33|                     1
 (1 row)
 
 step s1_count: SELECT lion_index_count('rgp_k', 1); <waiting ...>
@@ -63,7 +63,7 @@ rgp_release
 step s1_count: <... completed>
 lion_index_count
 ----------------
-            4341
+           42341
 (1 row)
 
 step s4_after: 
@@ -71,7 +71,7 @@ step s4_after:
 
 container_pages|posting_internal_pages
 ---------------+----------------------
-              4|                     2
+             34|                     2
 (1 row)
 
 step s4_count: 
@@ -80,7 +80,7 @@ step s4_count:
 
 count
 -----
- 4341
+42341
 (1 row)
 
 step s4_verify: SELECT lion_index_verify('rgp_k', true);
