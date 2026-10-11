@@ -1,23 +1,27 @@
 /*-------------------------------------------------------------------------
  *
  * lion_plan_gsets.c
- *		GROUP BY ROLLUP, CUBE and GROUPING SETS over one relation
- *		(DESIGN.md §10, "Grouping sets").
+ *		A grouping counted by the node at a finer grain, and core's Agg over
+ *		its groups: GROUP BY ROLLUP, CUBE and GROUPING SETS over one relation
+ *		(DESIGN.md §10, "Grouping sets"), and a GROUP BY whose DISTINCT
+ *		aggregates read columns outside it ("DISTINCT aggregates over a finer
+ *		grouping").
  *
- * Every grouping set of a query is a subset of the union of its sets, so each
- * set's groups are unions of the union's groups: the finest grouping, counted
- * by the node as the plain GROUP BY of every grouping column it is, holds
- * everything the sets ask of their rows - as long as each aggregate is one
- * the counts answer.  The plan is core's own grouping sets Agg, over the
- * node's rows instead of the table's: one row a group of the finest
- * grouping, carrying its count n, with every aggregate rewritten over the
- * rows as the FK-side join's rows mode does (DESIGN.md §27) - count(*) is
- * the sum of n, count(x) of a grouping column the sum of n where x is not
- * NULL, sum(x) of an int2 or int4 grouping column the sum of x * n, and an
- * aggregate that a group's repeated rows do not change (min, max, bool_and,
- * bool_or, anything DISTINCT) is left as it stands.  The Agg goes into the
- * grouped rel below a LionJoinAgg, whose target is the query's own.
- * GROUPING() is the Agg's, as it would be over the table.
+ * Every group of the query's is the union of some groups of a finer
+ * grouping - for grouping sets the union of the sets, for a DISTINCT
+ * aggregate the GROUP BY with the aggregate's columns added - so the finer
+ * grouping, counted by the node as the plain GROUP BY it is, holds everything
+ * the query asks of its rows, as long as each aggregate is one the counts
+ * answer.  The plan is core's own Agg over the node's rows instead of the
+ * table's: one row a group of the finer grouping, carrying its count n, with
+ * every aggregate rewritten over the rows as the FK-side join's rows mode
+ * does (DESIGN.md §27) - count(*) is the sum of n, count(x) of a column of
+ * the finer grouping the sum of n where x is not NULL, sum(x) of an int2 or
+ * int4 column of it the sum of x * n, and an aggregate that a group's
+ * repeated rows do not change (min, max, bool_and, bool_or, anything
+ * DISTINCT) is left as it stands.  The Agg goes into the grouped rel below a
+ * LionJoinAgg, whose target is the query's own.  GROUPING() is the Agg's, as
+ * it would be over the table.
  *
  * Part of the LionCount custom scan: lion_customscan.h describes the node
  * and declares what its files share.
@@ -63,7 +67,14 @@ lion_gsets_below(PlannerInfo *root, Node *node)
 	return node;
 }
 
-/* Is every Var of node a grouping column, and is there nothing else it reads? */
+/*
+ * Is every Var of an aggregate a column of the finer grouping, and is there
+ * nothing else it reads?  Each column's equality must also be its value's
+ * identity (lion_type_equalimage()): the finer grouping keeps one value of
+ * each group, which an expression of it inside the aggregate - `count(DISTINCT
+ * n::text)` of a numeric n, whose 1.0 and 1.00 are one group - would
+ * otherwise see in place of the others.
+ */
 static bool
 lion_gsets_reads_groups(LionGsetsRewrite *cx, Node *node)
 {
@@ -75,8 +86,15 @@ lion_gsets_reads_groups(LionGsetsRewrite *cx, Node *node)
 	foreach(lc, vars)
 	{
 		Node	   *v = lion_gsets_below(cx->root, (Node *) lfirst(lc));
+		TypeCacheEntry *typentry;
 
 		if (!IsA(v, Var) || !list_member(cx->gvars, v))
+			return false;
+		typentry = lookup_type_cache(((Var *) v)->vartype,
+									 TYPECACHE_BTREE_OPFAMILY);
+		if (!OidIsValid(typentry->btree_opintype) ||
+			!lion_type_equalimage(typentry->btree_opintype,
+								  ((Var *) v)->varcollid))
 			return false;
 	}
 	return true;
@@ -365,24 +383,29 @@ lion_gsets_rollups(PlannerInfo *root, List *tlist, double inrows)
 }
 
 /*
- * The finest grouping's paths into inner: lion_try_count_path() of the plain
- * GROUP BY of every grouping column, for which the query has no grouping
- * sets, no LIMIT and the target list below the grouping.
+ * The finer grouping's paths into inner: lion_try_count_path() of the plain
+ * GROUP BY of groupclause, for which the query has that GROUP BY, no grouping
+ * sets, no LIMIT - which is the query's, and which the top k (§36) would cut
+ * the finer grouping to - and tlist, the target list below the grouping.
  */
 static void
-lion_gsets_count_finest(PlannerInfo *root, RelOptInfo *input_rel,
-						RelOptInfo *inner, GroupPathExtraData *innerextra,
-						List *tlist)
+lion_gsets_count_finer(PlannerInfo *root, RelOptInfo *input_rel,
+					   RelOptInfo *inner, GroupPathExtraData *innerextra,
+					   List *groupclause, List *tlist)
 {
 	Query	   *parse = root->parse;
 	List	   *savedsets = parse->groupingSets;
 	Node	   *savedlimit = parse->limitCount;
 	List	   *savedtlist = root->processed_tlist;
+	List	   *savedgroup = parse->groupClause;
+	List	   *savedprocessed = root->processed_groupClause;
 	RelOptInfo *pinned = lion_units_pin_move(inner);
 
 	parse->groupingSets = NIL;
 	parse->limitCount = NULL;
 	root->processed_tlist = tlist;
+	parse->groupClause = groupclause;
+	root->processed_groupClause = groupclause;
 	PG_TRY();
 	{
 		lion_try_count_path(root, input_rel, inner, innerextra, NULL);
@@ -392,64 +415,53 @@ lion_gsets_count_finest(PlannerInfo *root, RelOptInfo *input_rel,
 		parse->groupingSets = savedsets;
 		parse->limitCount = savedlimit;
 		root->processed_tlist = savedtlist;
+		parse->groupClause = savedgroup;
+		root->processed_groupClause = savedprocessed;
 		(void) lion_units_pin_move(pinned);
 	}
 	PG_END_TRY();
 }
 
 /*
- * GROUP BY ROLLUP, CUBE or GROUPING SETS over input_rel, a base relation
- * (DESIGN.md §10, "Grouping sets"): the finest grouping counted into a rel of
- * its own by lion_try_count_path(), and core's grouping sets Agg over each of
- * its paths, below a LionJoinAgg, into output_rel.  Every failed check simply
- * returns: the normal plan is always available.
+ * The finer grouping groupclause of input_rel, each of whose columns is a
+ * column of the relation in tlist, counted into a rel of its own whose target
+ * is those columns - with their sortgrouprefs, below the grouping step - and
+ * a count(*); and the query's target and HAVING rewritten over its rows into
+ * *aggtarget and *having.  NULL when an aggregate is not one the counts answer
+ * or the node does not count the finer grouping.  The rel's paths are priced
+ * in the units pinned for the grouped rel (§39), whose competitor they meet.
  */
-void
-lion_try_gsets_path(PlannerInfo *root, RelOptInfo *input_rel,
-					RelOptInfo *output_rel, GroupPathExtraData *extra)
+static RelOptInfo *
+lion_gsets_finer(PlannerInfo *root, RelOptInfo *input_rel,
+				 RelOptInfo *output_rel, GroupPathExtraData *extra,
+				 List *groupclause, List *tlist,
+				 PathTarget **aggtarget, List **having)
 {
-	Query	   *parse = root->parse;
 	LionGsetsRewrite cx;
 	PathTarget *innertarget;
-	PathTarget *aggtarget;
-	List	   *having = NIL;
-	List	   *tlist;
 	RelOptInfo *inner;
 	GroupPathExtraData innerextra;
 	Aggref	   *n;
-	List	   *rollups;
-	List	   *pathkeys;
-	List	   *checkaggs;
 	ListCell   *lc;
-
-	if (extra == NULL || parse->groupingSets == NIL ||
-		root->processed_groupClause == NIL ||
-		parse->hasTargetSRFs || parse->hasDistinctOn ||
-		parse->distinctClause != NIL ||
-		!grouping_is_sortable(root->processed_groupClause))
-		return;
-	if (input_rel->reloptkind != RELOPT_BASEREL)
-		return;
 
 	memset(&cx, 0, sizeof(cx));
 	cx.root = root;
 	cx.ok = true;
 
 	/* the grouping columns, each a column of the relation */
-	tlist = (List *) lion_gsets_below(root, (Node *) root->processed_tlist);
 	innertarget = create_empty_pathtarget();
-	foreach(lc, root->processed_groupClause)
+	foreach(lc, groupclause)
 	{
 		SortGroupClause *sgc = (SortGroupClause *) lfirst(lc);
 		TargetEntry *tle = get_sortgroupclause_tle(sgc, tlist);
 		Var		   *v;
 
 		if (tle == NULL || !IsA(tle->expr, Var))
-			return;
+			return NULL;
 		v = (Var *) tle->expr;
 		if (v->varno != (int) input_rel->relid || v->varattno <= 0 ||
 			v->varlevelsup != 0)
-			return;
+			return NULL;
 		cx.gvars = lappend(cx.gvars, v);
 		add_column_to_pathtarget(innertarget, (Expr *) v,
 								 sgc->tleSortGroupRef);
@@ -470,23 +482,18 @@ lion_try_gsets_path(PlannerInfo *root, RelOptInfo *input_rel,
 
 	/* the query's aggregates, over the counted groups */
 	if (!lion_join_aggs_lookup(&cx.countfn, NULL, NULL, NULL))
-		return;
+		return NULL;
 	if (!lion_join_aggs_lookup(NULL, &cx.sumfn, &cx.mul2op, &cx.mul4op))
 		cx.sumfn = InvalidOid;
-	aggtarget = copy_pathtarget(output_rel->reltarget);
-	aggtarget->exprs = (List *) lion_gsets_mutator((Node *) aggtarget->exprs,
-												   &cx);
+	*aggtarget = copy_pathtarget(output_rel->reltarget);
+	(*aggtarget)->exprs = (List *) lion_gsets_mutator((Node *) (*aggtarget)->exprs,
+													  &cx);
+	*having = NIL;
 	if (extra->havingQual != NULL)
-		having = (List *) lion_gsets_mutator(extra->havingQual, &cx);
+		*having = (List *) lion_gsets_mutator(extra->havingQual, &cx);
 	if (!cx.ok)
-		return;
+		return NULL;
 
-	/*
-	 * The finest grouping, as the plain GROUP BY of every grouping column -
-	 * not to be cut to the query's LIMIT, which is the sets' (§36's top k
-	 * reads it) - into a rel of its own, priced in the units pinned for the
-	 * grouped rel (§39), whose competitor it meets.
-	 */
 	inner = makeNode(RelOptInfo);
 	memcpy(inner, output_rel, sizeof(RelOptInfo));
 	inner->pathlist = NIL;
@@ -504,20 +511,66 @@ lion_try_gsets_path(PlannerInfo *root, RelOptInfo *input_rel,
 	innerextra.targetList = tlist;
 	innerextra.target_parallel_safe = extra->target_parallel_safe;
 
-	lion_gsets_count_finest(root, input_rel, inner, &innerextra, tlist);
+	lion_gsets_count_finer(root, input_rel, inner, &innerextra, groupclause,
+						   tlist);
 	if (inner->pathlist == NIL)
+		return NULL;
+	return inner;
+}
+
+/*
+ * The query's aggregates, which the LionJoinAgg asks EXECUTE on as the Agg it
+ * replaces would (DESIGN.md §9, "Privileges"): the Agg below asks it of what
+ * it computes, the extension's aggregates and those left as they stand, and
+ * the node below of count().
+ */
+static List *
+lion_gsets_checkaggs(RelOptInfo *output_rel, GroupPathExtraData *extra)
+{
+	return (List *) linitial(lion_replaced_functions(output_rel,
+													 output_rel->reltarget->exprs,
+													 (List *) extra->havingQual,
+													 NIL, NULL));
+}
+
+/*
+ * GROUP BY ROLLUP, CUBE or GROUPING SETS over input_rel, a base relation
+ * (DESIGN.md §10, "Grouping sets"): the finest grouping - the union of the
+ * sets - counted into a rel of its own by lion_try_count_path(), and core's
+ * grouping sets Agg over each of its paths, below a LionJoinAgg, into
+ * output_rel.  Every failed check simply returns: the normal plan is always
+ * available.
+ */
+void
+lion_try_gsets_path(PlannerInfo *root, RelOptInfo *input_rel,
+					RelOptInfo *output_rel, GroupPathExtraData *extra)
+{
+	Query	   *parse = root->parse;
+	PathTarget *aggtarget;
+	List	   *having;
+	List	   *tlist;
+	RelOptInfo *inner;
+	List	   *rollups;
+	List	   *pathkeys;
+	List	   *checkaggs;
+	ListCell   *lc;
+
+	if (extra == NULL || parse->groupingSets == NIL ||
+		root->processed_groupClause == NIL ||
+		parse->hasTargetSRFs || parse->hasDistinctOn ||
+		parse->distinctClause != NIL ||
+		!grouping_is_sortable(root->processed_groupClause))
+		return;
+	if (input_rel->reloptkind != RELOPT_BASEREL)
 		return;
 
-	/*
-	 * The query's aggregates, which the LionJoinAgg asks EXECUTE on as the
-	 * Agg it replaces would (DESIGN.md §9, "Privileges"): the Agg below asks
-	 * it of what it computes, the extension's aggregates and those left as
-	 * they stand, and the node below of count().
-	 */
-	checkaggs = (List *) linitial(lion_replaced_functions(output_rel,
-														  output_rel->reltarget->exprs,
-														  (List *) extra->havingQual,
-														  NIL, NULL));
+	tlist = (List *) lion_gsets_below(root, (Node *) root->processed_tlist);
+	inner = lion_gsets_finer(root, input_rel, output_rel, extra,
+							 root->processed_groupClause, tlist,
+							 &aggtarget, &having);
+	if (inner == NULL)
+		return;
+	checkaggs = lion_gsets_checkaggs(output_rel, extra);
 
 	/* the Agg, over each of them sorted for its first rollup */
 	foreach(lc, inner->pathlist)
@@ -541,6 +594,172 @@ lion_try_gsets_path(PlannerInfo *root, RelOptInfo *input_rel,
 		gpath->path.pathkeys = NIL;
 		add_path(output_rel, (Path *) lion_join_agg_wrap(root, output_rel,
 														 (Path *) gpath,
+														 checkaggs));
+	}
+}
+
+/*
+ * A column a DISTINCT aggregate reads that the GROUP BY does not, appended to
+ * *groupclause and to *tlist (as a resjunk entry) as one more grouping column
+ * of the finer grouping, under the next free sortgroupref.  False for a
+ * column the finer grouping cannot group by.
+ */
+static bool
+lion_gsets_widen(Var *v, Index rti, List **groupclause, List **tlist,
+				 Index *nextref)
+{
+	SortGroupClause *sgc;
+	Oid			sortop;
+	Oid			eqop;
+	bool		hashable;
+	ListCell   *lc;
+
+	if (v->varno != (int) rti || v->varattno <= 0 || v->varlevelsup != 0)
+		return false;
+	foreach(lc, *groupclause)
+	{
+		TargetEntry *tle = get_sortgroupclause_tle((SortGroupClause *) lfirst(lc),
+												   *tlist);
+
+		if (tle != NULL && equal(tle->expr, v))
+			return true;		/* grouped by already */
+	}
+	get_sort_group_operators(v->vartype, false, false, false,
+							 &sortop, &eqop, NULL, &hashable);
+	if (!OidIsValid(sortop) || !OidIsValid(eqop))
+		return false;
+	sgc = makeNode(SortGroupClause);
+	sgc->tleSortGroupRef = (*nextref)++;
+	sgc->eqop = eqop;
+	sgc->sortop = sortop;
+	sgc->nulls_first = false;
+	sgc->hashable = hashable;
+	*groupclause = lappend(*groupclause, sgc);
+	*tlist = lappend(*tlist, makeTargetEntry((Expr *) copyObject(v),
+											 list_length(*tlist) + 1, NULL,
+											 true));
+	((TargetEntry *) llast(*tlist))->ressortgroupref = sgc->tleSortGroupRef;
+	return true;
+}
+
+/* The DISTINCT aggregates of an expression, onto *aggs. */
+static bool
+lion_gsets_distinct_walker(Node *node, List **aggs)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		if (((Aggref *) node)->aggdistinct != NIL)
+			*aggs = lappend(*aggs, node);
+		return false;
+	}
+	return expression_tree_walker(node, lion_gsets_distinct_walker,
+								  (void *) aggs);
+}
+
+/*
+ * A GROUP BY over input_rel, a base relation, whose DISTINCT aggregates read
+ * columns outside it (DESIGN.md §10, "DISTINCT aggregates over a finer
+ * grouping"): `count(DISTINCT c) ... GROUP BY a, b` is the number of groups
+ * of `GROUP BY a, b, c` within each group of a, b with c not NULL, so the
+ * GROUP BY with the aggregates' columns added is counted by the node, and
+ * core's Agg forms the query's groups over its rows, the DISTINCT aggregates
+ * standing as they are.  Its input is sorted by the query's group pathkeys,
+ * which core extends with a DISTINCT aggregate's own keys when it marks the
+ * aggregate presorted (adjust_group_pathkeys_for_groupagg()): the Agg then
+ * relies on that order, as it would over the table.  Every failed check
+ * simply returns.
+ */
+void
+lion_try_distinct_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
+						   RelOptInfo *output_rel, GroupPathExtraData *extra)
+{
+	Query	   *parse = root->parse;
+	List	   *aggs = NIL;
+	List	   *groupclause;
+	List	   *tlist;
+	Index		nextref = 0;
+	PathTarget *aggtarget;
+	List	   *having;
+	RelOptInfo *inner;
+	List	   *checkaggs;
+	List	   *groupexprs;
+	ListCell   *lc;
+
+	if (extra == NULL || parse->groupingSets != NIL ||
+		root->processed_groupClause == NIL ||
+		parse->hasTargetSRFs || parse->hasDistinctOn ||
+		parse->distinctClause != NIL || root->group_pathkeys == NIL ||
+		!grouping_is_sortable(root->processed_groupClause))
+		return;
+	if (input_rel->reloptkind != RELOPT_BASEREL)
+		return;
+
+	/*
+	 * Only where the node has not counted the GROUP BY as it stands - the
+	 * Distinct Key of §26, over at most one grouping column, is
+	 * a walk of its own, and a plan that groups by the column too would only
+	 * compete with it.
+	 */
+	foreach(lc, output_rel->pathlist)
+	{
+		if (lion_path_has_lion((Path *) lfirst(lc)))
+			return;
+	}
+
+	(void) lion_gsets_distinct_walker((Node *) output_rel->reltarget->exprs,
+									  &aggs);
+	(void) lion_gsets_distinct_walker(extra->havingQual, &aggs);
+	if (aggs == NIL)
+		return;
+
+	/* the GROUP BY, and each column of a DISTINCT aggregate after it */
+	tlist = list_copy(root->processed_tlist);
+	foreach(lc, tlist)
+		nextref = Max(nextref, ((TargetEntry *) lfirst(lc))->ressortgroupref);
+	nextref++;
+	groupclause = list_copy(root->processed_groupClause);
+	foreach(lc, aggs)
+	{
+		List	   *vars = pull_var_clause((Node *) lfirst(lc),
+										   PVC_RECURSE_AGGREGATES |
+										   PVC_INCLUDE_PLACEHOLDERS);
+		ListCell   *lv;
+
+		foreach(lv, vars)
+		{
+			if (!IsA(lfirst(lv), Var) ||
+				!lion_gsets_widen((Var *) lfirst(lv), input_rel->relid,
+								  &groupclause, &tlist, &nextref))
+				return;
+		}
+	}
+	if (list_length(groupclause) == list_length(root->processed_groupClause))
+		return;					/* the plain GROUP BY's own */
+
+	inner = lion_gsets_finer(root, input_rel, output_rel, extra, groupclause,
+							 tlist, &aggtarget, &having);
+	if (inner == NULL)
+		return;
+	checkaggs = lion_gsets_checkaggs(output_rel, extra);
+	groupexprs = get_sortgrouplist_exprs(root->processed_groupClause, tlist);
+
+	foreach(lc, inner->pathlist)
+	{
+		Path	   *sub = (Path *) lfirst(lc);
+		AggPath    *apath;
+
+		if (!pathkeys_contained_in(root->group_pathkeys, sub->pathkeys))
+			sub = (Path *) create_sort_path(root, inner, sub,
+											root->group_pathkeys, -1.0);
+		apath = create_agg_path(root, output_rel, sub, aggtarget, AGG_SORTED,
+								AGGSPLIT_SIMPLE, root->processed_groupClause,
+								having, &extra->agg_final_costs,
+								estimate_num_groups(root, groupexprs,
+													sub->rows, NULL, NULL));
+		add_path(output_rel, (Path *) lion_join_agg_wrap(root, output_rel,
+														 (Path *) apath,
 														 checkaggs));
 	}
 }

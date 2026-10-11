@@ -67,8 +67,10 @@ static const CustomScanMethods lion_join_agg_scan_methods = {
 };
 
 /*
- * The upper paths of one base relation: a DISTINCT, a GROUP BY, or grouping
- * sets (lion_try_gsets_path(), DESIGN.md §10, "Grouping sets").
+ * The upper paths of one base relation: a DISTINCT, a GROUP BY - counted
+ * directly, or at a finer grain for its DISTINCT aggregates
+ * (lion_try_distinct_agg_path()) - or grouping sets (lion_try_gsets_path();
+ * DESIGN.md §10, "Grouping sets").
  */
 static void
 lion_try_upper_path(PlannerInfo *root, UpperRelationKind stage,
@@ -80,8 +82,12 @@ lion_try_upper_path(PlannerInfo *root, UpperRelationKind stage,
 		lion_try_gsets_path(root, input_rel, output_rel,
 							(GroupPathExtraData *) extra);
 	else
+	{
 		lion_try_count_path(root, input_rel, output_rel,
 						   (GroupPathExtraData *) extra, NULL);
+		lion_try_distinct_agg_path(root, input_rel, output_rel,
+								   (GroupPathExtraData *) extra);
+	}
 }
 
 void

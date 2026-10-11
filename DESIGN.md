@@ -2798,7 +2798,9 @@ than the ordinary plan where the query has no `count(*)`: `count()`, of the node
 the extension's `lion_join_count` and `lion_join_sum`, which are looked up at plan time.
 
 **Declined**, to the ordinary plan: an aggregate that reads a column outside the grouping, or one
-not in the table above (`avg`, `array_agg` without DISTINCT, `bit_xor`, a `sum` of a bigint);
+not in the table above (`avg`, `array_agg` without DISTINCT, `bit_xor`, a `sum` of a bigint); an
+aggregate that reads a column whose equality is not its value's identity (a numeric, a float;
+"DISTINCT aggregates over a finer grouping", below);
 an aggregate with ORDER BY other than those left as they stand; a volatile function or a
 subquery inside an aggregate, which would run once a group of the finest grouping and not once a
 row; an ordered-set aggregate; a grouping expression that is not a plain column of the table; a
@@ -2811,6 +2813,61 @@ the node does not count (a column without a lion index, a WHERE it cannot answer
 core's MixedAggregate, at 4.8 s and 2.4 s. `test/sql/countgsets.sql` compares every shape with
 the sequential plan, over NULL grouping keys and dead and updated rows VACUUM has not seen, and
 of a partitioned table, and checks that the declined shapes are declined.
+
+### DISTINCT aggregates over a finer grouping (2026-10-11)
+
+`SELECT a, b, count(DISTINCT c) FROM t GROUP BY a, b` is the number of groups of `GROUP BY a, b,
+c` with `c` not NULL within each group of `(a, b)`, and in general a DISTINCT aggregate of a
+group is the same aggregate over the distinct values its rows hold - which the groups of the GROUP
+BY with the aggregate's columns added are, one row each. §26's distinct walk takes one grouping
+column at most and one distinct column; `lion_try_distinct_agg_path()` (`lion_plan_gsets.c`)
+takes the rest the way grouping sets are taken (above): the GROUP BY with every column of every
+DISTINCT aggregate appended - under fresh sortgrouprefs, as resjunk entries of a copy of the
+target list - is the finer grouping, counted by the node into a rel of its own, and core's sorted
+Agg forms the query's groups over its rows below a LionJoinAgg, every aggregate rewritten over the
+counts by the same rules (`lion_gsets_mutator()`): the DISTINCT aggregates stand as they are,
+`count(*)`, `count(x)` and `sum(x)` of the finer grouping's columns become `lion_join_count` and
+`lion_join_sum` of the counts, min, max, bool_and and bool_or stand as they are. An aggregate
+over any other column declines, so `max(u)` beside `count(DISTINCT c)` leaves the query to core.
+
+```
+Custom Scan (LionJoinAgg)
+  ->  GroupAggregate
+        Group Key: a, b
+        ->  Sort
+              Sort Key: a, b, c
+              ->  Finalize HashAggregate
+                    Group Key: a, b, c
+                    ->  Custom Scan (LionCount)   decoded walk of a, b, c (§34)
+```
+
+The Agg's input is sorted by `root->group_pathkeys`. When an aggregate's DISTINCT can use a
+sorted input, core appends its keys to those pathkeys and marks the aggregate presorted
+(`adjust_group_pathkeys_for_groupagg()`), and nodeAgg then only skips consecutive duplicates
+instead of sorting each group's values; the Agg relies on that order over the node's rows as it
+would over the table's, and the sort supplies it. With `enable_presorted_aggregate` off the
+pathkeys are the GROUP BY's alone and the Agg sorts each group's values itself.
+
+It is tried only where the node has not counted the GROUP BY as it stands: §26's walk of one
+grouping column and one distinct column keeps its plan, and a second form of the same query would
+only compete with it. Where §26 declines - two or more grouping columns, two distinct columns, a
+DISTINCT aggregate other than `count`, a partitioned table (whose (g, k) groups the Finalize Agg
+under the node merges, so the distinct counts above it are exact) - or loses to core on price,
+the finer grouping is offered. The cost is core's sort and Agg over the node's path, and
+`add_path()` chooses.
+
+A column the finer grouping adds is grouped by its type's default equality, so one value of each
+equality class reaches the Agg; every column an aggregate reads must therefore have an equality
+that is its value's identity (`lion_type_equalimage()`), or `count(DISTINCT n::text)` of a
+numeric n, whose 1.0 and 1.00 are one group, would count one text where the table has two. The
+same rule holds for grouping sets. Its grouping equality is one privilege more than the ordinary
+plan asks: nodeAgg compares a single DISTINCT column through an unchecked function (§26), while
+the Finalize Agg under the node checks the equality of every column it groups by.
+
+5M rows (two grouping columns of 20 and 2 values, a distinct column of 200): 3,252 ms to 92 ms.
+100k rows, `g200, count(DISTINCT k50) ... GROUP BY g200`, which §26's walk loses to core: 19 ms
+to 2.2 ms. `test/sql/countgsets.sql` compares each shape with the sequential plan over the same
+table, with and without `enable_presorted_aggregate`, and checks the declines.
 
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 
@@ -8629,9 +8686,10 @@ and includes the key deleted after the snapshot.
   relation (relabels stripped), with no FILTER and no ORDER BY, not variadic and not split, and
   every distinct aggregate of the target list and the HAVING must name the same column with the
   same equality and collation. `count(DISTINCT (a, b))`, `count(DISTINCT a + 1)`, other DISTINCT
-  aggregates and two different distinct columns decline.
+  aggregates and two different distinct columns decline here, and are counted at a finer grain
+  instead (§10, "DISTINCT aggregates over a finer grouping").
 - `k` must not be a GROUP BY column, and there may be at most one GROUP BY column (so at most two
-  driving columns, `LION_MAX_GROUPCOLS`).
+  driving columns, `LION_MAX_GROUPCOLS`); more GROUP BY columns go the same way.
 - `k` goes through `lion_collect_targets()` as a driving column, so every per-column rule of §10
   applies to it unchanged: a SCALAR lion index (a multi-key one is never found, so
   `count(DISTINCT tags)` - which counts distinct ARRAYS, not elements - declines); the index's
@@ -8642,9 +8700,10 @@ and includes the key deleted after the snapshot.
   2026-09-20 review, finding 3), so a coarser opclass declines and `citext_ops` over citext is
   accepted. No value of `k` is printed, so the representation gate of finding 4 does not apply.
 - Partitioned tables decline: distinct counts are not additive across partitions, and §16's shape
-  (partial aggregates added up by a Finalize Agg) would add them. A later version could emit
-  per-partition (g, k) pairs for core to deduplicate. (A column unique over the whole table is
-  not walked at all, below.)
+  (partial aggregates added up by a Finalize Agg) would add them. With a GROUP BY the
+  per-partition (g, k) groups are what is counted instead, and the Finalize Agg merges them for
+  core's Agg to count (§10, "DISTINCT aggregates over a finer grouping"). (A column unique over
+  the whole table is not walked at all, below.)
 - Everything else - WHERE clause kinds, OR, IN lists, Params, HAVING, privileges, RLS - is §10 as it
   stands. A query with no WHERE clause at all is accepted: `k`'s entries drive it.
 
