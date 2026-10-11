@@ -1433,6 +1433,7 @@ lion_begin_join_batches(LionCountScanState *st, EState *estate)
 			jp->buy = -1;
 			jp->qmode = (LionQueryMode *)
 				palloc0(sizeof(LionQueryMode) * Max(st->nclause, 1));
+			jp->xval = (Datum *) palloc0(sizeof(Datum) * Max(st->nclause, 1));
 			jp->cxt = AllocSetContextCreate(js->part.cxt,
 											"LionCount partition copy",
 											ALLOCSET_DEFAULT_SIZES);

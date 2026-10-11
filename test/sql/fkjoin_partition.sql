@@ -429,6 +429,44 @@ SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE NOT EXISTS (SELECT 1 FROM l
 SELECT lion_xj('SELECT count(DISTINCT d.pk), count(*) FROM lion_xf f JOIN lion_xd d ON d.pk = f.fk WHERE d.region = ''us'' AND f.kind IN (''a'', ''c'')');
 SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xf f WHERE f.fk = d.pk AND ((f.kind = ''a'' AND f.tags && ''{t1}'' AND f.tags && ''{u2}'') OR (f.kind = ''b'' AND f.x = 3) OR f.kind = ''c'' OR f.kind = ''d''))');
 
+-- ---- 9. a prefix phrase, expanded per partition ---------------------------------
+/*
+ * A fact filter with a prefix lexeme in a phrase is answered from the
+ * positions, with the prefix expanded into each partition's own index's
+ * lexemes (DESIGN.md §17, "Prefix lexemes"); here no two partitions share
+ * one.  The copy of the filters a partition keeps from batch to batch keeps
+ * the query it was located with as well, and builds the later batches' row
+ * filters from it: lion_xp_a's lexemes for lion_xp_a, after lion_xp_b's turn
+ * in between, and after the memory of the turn that located them is gone.
+ */
+CREATE TABLE lion_xp (id int NOT NULL, kind text, fk int8, tsv tsvector)
+	PARTITION BY LIST (kind);
+CREATE TABLE lion_xp_a PARTITION OF lion_xp FOR VALUES IN ('a');
+CREATE TABLE lion_xp_b PARTITION OF lion_xp FOR VALUES IN ('b');
+CREATE TABLE lion_xp_c PARTITION OF lion_xp FOR VALUES IN ('c');
+INSERT INTO lion_xp
+SELECT i, (ARRAY['a', 'b', 'c'])[1 + i % 3],
+	   CASE WHEN i % 40 = 0 THEN NULL ELSE 1 + (i * 7919) % 3600 END,
+	   to_tsvector('simple',
+				   CASE i % 5 WHEN 0 THEN 'foo' || (ARRAY['a', 'b', 'c'])[1 + i % 3] || ' bar'
+							  WHEN 1 THEN 'bar foo' || (ARRAY['a', 'b', 'c'])[1 + i % 3]
+							  WHEN 2 THEN 'foo' || (ARRAY['a', 'b', 'c'])[1 + i % 3] || ' x bar'
+							  ELSE 'x bar y' END || ' w' || (i % 50))
+  FROM generate_series(1, 30000) i;
+CREATE INDEX lion_xp_tf ON lion_xp USING lion (tsv, fk) WITH (store_positions = true);
+VACUUM (FREEZE, ANALYZE) lion_xp;
+SET work_mem = '64kB';
+SET max_parallel_workers_per_gather = 0;
+SELECT * FROM lion_xj_explain('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xp f WHERE f.fk = d.pk AND f.tsv @@ ''foo:* <-> bar''::tsquery)');
+SELECT lion_xj_counter('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xp f WHERE f.fk = d.pk AND f.tsv @@ ''foo:* <-> bar''::tsquery)', 'Join Key Batches') > 1 AS batches;
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE EXISTS (SELECT 1 FROM lion_xp f WHERE f.fk = d.pk AND f.tsv @@ ''foo:* <-> bar''::tsquery)');
+SELECT lion_xj('SELECT count(*) FROM lion_xd d WHERE NOT EXISTS (SELECT 1 FROM lion_xp f WHERE f.fk = d.pk AND f.tsv @@ ''foo:* <-> bar''::tsquery)');
+SELECT lion_xj('SELECT d.region, count(*) FROM lion_xp f JOIN lion_xd d ON f.fk = d.pk WHERE f.tsv @@ ''foo:* <-> bar''::tsquery GROUP BY d.region');
+SELECT lion_xj('SELECT count(*) FROM lion_xp f JOIN lion_xd d ON f.fk = d.pk WHERE f.tsv @@ ''bar <-> foo:*''::tsquery');
+SET max_parallel_workers_per_gather = 2;
+RESET work_mem;
+DROP TABLE lion_xp;
+
 DROP TABLE lion_xf, lion_xd, lion_xdn;
 DROP FUNCTION lion_xj(text);
 DROP FUNCTION lion_xj_explain(text);

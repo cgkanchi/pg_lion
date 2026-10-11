@@ -136,7 +136,8 @@ lion_decode_tally_begin(LionDecodeTally *t, int ncol, const int *radix)
 	t->densepos = 0;
 	t->nread = 0;
 
-	if (ncells <= t->maxbytes / (sizeof(int64) * LION_DECODE_DENSE_SHARE))
+	if (ncells <= t->maxbytes / (sizeof(int64) * LION_DECODE_DENSE_SHARE) &&
+		ncells <= MaxAllocSize / sizeof(int64))
 	{
 		t->dense = (int64 *) MemoryContextAllocZero(t->cxt,
 													sizeof(int64) * ncells);

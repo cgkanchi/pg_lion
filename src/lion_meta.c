@@ -155,8 +155,10 @@ lion_meta_put_ndistinct(Relation index, const LionMetaNdistinct *nd,
 		((PageHeader) page)->pd_upper < LION_META_NDISTINCT_END)
 	{
 		UnlockReleaseBuffer(buf);
-		elog(ERROR, "lion index \"%s\": block 0 is not the meta page",
-			 RelationGetRelationName(index));
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": block 0 is not the meta page",
+						RelationGetRelationName(index))));
 	}
 	has = LionMetaHasNdistinct(page);
 	if (has)
@@ -356,6 +358,22 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" has no directory root",
 						RelationGetRelationName(index))));
+
+	/*
+	 * What the build recorded from its reloptions, within the bounds the
+	 * reloptions enforce: an inline_limit past the page would have inserts
+	 * build entries no page can hold, and a height past what block numbers
+	 * allow is damage, not a tall tree.
+	 */
+	if (meta->inline_limit < LION_MIN_INLINE_LIMIT ||
+		meta->inline_limit > LION_MAX_INLINE_LIMIT ||
+		meta->height > 32)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" is not a valid lion index",
+						RelationGetRelationName(index)),
+				 errdetail("Meta page records inline_limit %u and directory height %u.",
+						   meta->inline_limit, meta->height)));
 }
 
 /*

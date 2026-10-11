@@ -1,0 +1,45 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_plan s1_begin s1_declare s1_take60 s2_vacuum s1_rest s1_commit s1_check
+step s1_plan: EXPLAIN (COSTS OFF) SELECT id, k FROM lz WHERE c = 1 ORDER BY k LIMIT 300;
+QUERY PLAN                           
+-------------------------------------
+Limit                                
+  ->  Custom Scan (LionOrdered) on lz
+        Ordered By: lz_k             
+        Lion Cond: (c = 1)           
+        Lion Indexes: lz_c           
+(5 rows)
+
+step s1_begin: BEGIN;
+step s1_declare: DECLARE lz_cur NO SCROLL CURSOR FOR SELECT id, k FROM lz WHERE c = 1 ORDER BY k LIMIT 300;
+step s1_take60: SELECT lz_take(60);
+lz_take
+-------
+     60
+(1 row)
+
+step s2_vacuum: VACUUM lz;
+step s1_rest: SELECT lz_take(NULL);
+lz_take
+-------
+    240
+(1 row)
+
+step s1_commit: COMMIT;
+step s1_check: 
+	SET enable_seqscan = on;
+	SET pg_lion.enable_ordered_scan = off;
+	SET pg_lion.enable_btree_scan = off;
+	SELECT (SELECT count(*) FROM lz_got) AS got,
+		   (SELECT count(*) FROM lz_got g
+			 FULL JOIN (SELECT row_number() OVER (ORDER BY k) AS n, id, k
+						  FROM (SELECT id, k FROM lz WHERE c = 1 ORDER BY k LIMIT 300) q) e
+			 USING (n)
+			WHERE g.id IS DISTINCT FROM e.id OR g.k IS DISTINCT FROM e.k) AS differ;
+
+got|differ
+---+------
+300|     0
+(1 row)
+

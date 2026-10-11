@@ -16,6 +16,8 @@
 -- 7. A NARROW of a width the build does not have, which sizes it.
 -- 8. A directory entry whose key length claims more than its item holds.
 -- 9. An entry whose TID count is less than what VACUUM removes from it.
+-- 10. An INLINE entry whose item ends between its key and the aligned start
+--     of its payload, where the payload length wrapped around zero.
 --
 -- The pages are damaged on disk, as corrupt.sql does it (pg_buffercache_evict(),
 -- PostgreSQL 17 and later - on 16 the test is skipped,
