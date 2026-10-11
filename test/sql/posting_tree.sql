@@ -4,9 +4,11 @@
 -- the container pages of §4, still rightlinked in ckey order.  What this file
 -- pins:
 --
---  1. a key grown by INSERTS through leaf splits and a root split, with the
---     entry's `head` - the ROOT block, which is the identity every page of the
---     set is stamped with (§18) - unchanged across the root split;
+--  1. a key grown by INSERTS through leaf splits - a chain of leaves with no
+--     internal level while there are at most 16 of them, headed by the first
+--     - and then the split that promotes it to a tree, with the entry's `head`
+--     - the ROOT block, which is the identity every page of the set is
+--     stamped with (§18) - unchanged across it;
 --  2. mid-chain inserts, which land by descent instead of by walking from the
 --     head;
 --  3. SEEK: an AND of a selective set with a dense one visits far fewer
@@ -46,10 +48,23 @@ SELECT lion_index_posting_root('pt_grow_k', 0) IS NOT NULL AS spilled_to_a_page;
 SELECT lion_index_posting_root('pt_grow_k', 0) AS root0 \gset
 SELECT lion_index_posting_root('pt_grow_k', 1) AS root1 \gset
 
--- Grow both keys until the sets need several leaves and therefore a root.
+-- Grow both keys to several leaves: still no internal level, the head is the
+-- first leaf of a chain.
 INSERT INTO pt_grow SELECT i, i % 2 FROM generate_series(10001, 200000) i;
 
 SELECT container_pages > 10 AS many_leaves,
+	   container_pages <= 2 * 16 AS at_most_16_leaves_a_key,
+	   posting_internal_pages = 0 AS no_internal_pages,
+	   max_posting_height = 0 AS one_level
+  FROM lion_index_stats('pt_grow_k');
+SELECT lion_index_posting_root('pt_grow_k', 0) = :root0 AS head0_unchanged,
+	   lion_index_posting_root('pt_grow_k', 1) = :root1 AS head1_unchanged;
+SELECT lion_index_verify('pt_grow_k', true);
+
+-- ... and past 16 leaves, which needs a root.
+INSERT INTO pt_grow SELECT i, i % 2 FROM generate_series(200001, 300000) i;
+
+SELECT container_pages > 2 * 16 AS many_leaves,
 	   posting_internal_pages = 2 AS one_root_per_key,
 	   max_posting_height = 1 AS two_levels
   FROM lion_index_stats('pt_grow_k');
@@ -197,9 +212,11 @@ SELECT lion_index_verify('pt_grow_k', true);
 SELECT count(*) FROM pt_grow WHERE k = 0;
 SELECT count(*) FROM pt_grow WHERE k = 1;
 
--- a bulk-built tree has the same shape as the one the inserts grew
-SELECT max_posting_height >= 1 AS still_a_tree,
-	   posting_internal_pages > 0 AS still_has_internal_pages
+-- a bulk build packs the containers tighter than the inserts left them -
+-- three NARROW items (§38) to a leaf where the inserts had one BITSET - so
+-- both sets fit 16 leaves again and are written without an internal level
+SELECT max_posting_height, posting_internal_pages,
+	   container_pages <= 2 * 16 AS at_most_16_leaves_a_key
   FROM lion_index_stats('pt_grow_k');
 
 DROP FUNCTION pt_containers(text);

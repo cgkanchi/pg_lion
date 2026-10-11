@@ -239,6 +239,7 @@ lion_cursor_next_item(LionSetCursor *cur)
 		if (cur->descend)
 		{
 			bool		found;
+			bool		flat = false;
 
 			/*
 			 * A descent for seekckey: the first leaf of the set, or the leaf a
@@ -246,8 +247,11 @@ lion_cursor_next_item(LionSetCursor *cur)
 			 * root push-down and no split can slip in between.
 			 */
 			cur->descend = false;
-			buf = lion_posting_search(cur->set->index, NULL, 0, cur->set->head,
-									  cur->seekckey, BUFFER_LOCK_SHARE, false);
+			buf = lion_posting_search_ext(cur->set->index, NULL, 0,
+										  cur->set->head, cur->seekckey,
+										  BUFFER_LOCK_SHARE, false, false,
+										  &flat);
+			cur->flat = cur->flat || flat;
 			if (!BufferIsValid(buf))
 			{
 				cur->nextblk = InvalidBlockNumber;
@@ -525,7 +529,12 @@ lion_cursor_seek_leaf(LionSetCursor *cur, uint32 target)
 			return;
 		}
 
-		if (steps >= LION_POSTING_SEEK_STEPS || cur->cx->farseeks)
+		/*
+		 * A flat set is never descended again (cur->flat): stepping right
+		 * reads at most the leaves the descent would walk from the head.
+		 */
+		if (!cur->flat &&
+			(steps >= LION_POSTING_SEEK_STEPS || cur->cx->farseeks))
 		{
 			cur->descend = true;
 			cur->seekckey = target;

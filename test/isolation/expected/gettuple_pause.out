@@ -39,7 +39,7 @@ step s2_pages:
 
 container_pages|max_posting_height
 ---------------+------------------
-             14|                 1
+             14|                 0
 (1 row)
 
 step s1_rest: SELECT gp_take('c', NULL) AS rest;

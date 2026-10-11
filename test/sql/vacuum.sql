@@ -309,8 +309,9 @@ CREATE TEMP TABLE lion_free_before AS
 	SELECT entries, container_pages, deleted_pages, posting_internal_pages,
 		   (SELECT relpages FROM pg_class WHERE relname = 'lion_free_k') AS relpages
 	  FROM lion_index_stats('lion_free_k');
+/* each key's set is a few leaves, with no internal level (DESIGN.md §22) */
 SELECT entries, container_pages > 0 AS has_chains, deleted_pages,
-	   posting_internal_pages > 0 AS has_posting_trees
+	   posting_internal_pages
   FROM lion_index_stats('lion_free_k');
 
 -- Two of the four keys vanish entirely.
@@ -319,11 +320,7 @@ VACUUM (FREEZE) lion_free;
 SELECT entries,
 	   deleted_pages > 0 AS pages_were_freed,
 	   container_pages < (SELECT container_pages FROM lion_free_before)
-		   AS fewer_live_container_pages,
-	   /* DESIGN.md §22: a freed posting set takes its INTERNAL pages with it */
-	   posting_internal_pages < (SELECT posting_internal_pages
-								   FROM lion_free_before)
-		   AS fewer_internal_pages
+		   AS fewer_live_container_pages
   FROM lion_index_stats('lion_free_k');
 SELECT lion_index_verify('lion_free_k', true);
 SELECT lion_cmp('lion_free', 'k = 0');
@@ -553,7 +550,8 @@ SELECT lion_index_verify('lion_vacbig_k', true);
  * lion_entry_spill()).  One key over 150,000 clustered rows is eleven RUN
  * containers of a few hundred bytes, INLINE; deleting every tenth row turns
  * ten of them into 4104-byte BITSETs, two of which never fit one page, so the
- * posting set VACUUM spills needs ten leaves and a root above them.  The
+ * posting set VACUUM spills needs ten leaves - a chain headed by the first,
+ * with no internal level above it (§22: at most 16 leaves have none).  The
  * spill refused more than four ("needs 10 container pages"), and since
  * nothing changes between two VACUUMs, every VACUUM of the table failed from
  * then on - autovacuum's and the anti-wraparound one's included.  The NULL

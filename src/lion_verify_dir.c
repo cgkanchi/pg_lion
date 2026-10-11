@@ -901,8 +901,8 @@ lion_verify_classify(LionVerifyState *vs, BlockNumber blk)
 	 * multi-leaf spill that an ERROR or a crash stopped before its last record
 	 * writes the leaves and never the root (lion_entry_spill(), DESIGN.md
 	 * §18).  The root is looked at with nothing held.  A leaf that is its own
-	 * root is a one-page set, which a spill writes in the same record as its
-	 * entry.
+	 * root heads a set without an internal level, which a spill writes in the
+	 * same record as its entry.
 	 */
 	ohead = LionPageGetOpaque(page)->owner_head;
 	ohash = LionPageGetOpaque(page)->owner_hash;

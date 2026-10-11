@@ -414,8 +414,10 @@ lion_exists_fraction(double containers, double survivors)
 
 /*
  * How tall the posting tree of a set that occupies `leaves` container pages is
- * (DESIGN.md §22): 0 while it fits on one page, and one level for every
- * LION_POSTING_FANOUT pages above that.
+ * (DESIGN.md §22): 0 while it has at most LION_POSTING_FLAT_LEAVES leaves -
+ * no internal level, the head is the first leaf of one chain, and a seek
+ * steps right through it - and one level for every LION_POSTING_FANOUT pages
+ * above that.
  *
  * The planner cannot read it anywhere: the meta page carries the height of the
  * entry DIRECTORY, not of any one key's posting tree, and asking a key's own
@@ -434,7 +436,9 @@ lion_posting_height(double leaves)
 {
 	double		height = 0;
 
-	for (leaves = Max(leaves, 1.0); leaves > 1.0; leaves /= LION_POSTING_FANOUT)
+	if (leaves <= (double) LION_POSTING_FLAT_LEAVES)
+		return 0.0;
+	for (; leaves > 1.0; leaves /= LION_POSTING_FANOUT)
 		height += 1.0;
 
 	return height;

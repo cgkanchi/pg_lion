@@ -340,17 +340,23 @@ typedef struct LionBuilder
 	Size		inlinemax;		/* lion_inline_max() for this key */
 
 	bool		spilled;		/* posting set lives on container pages */
-	BlockNumber head;			/* the set's ROOT block (DESIGN.md §22) */
+	BlockNumber head;			/* the set's head block (DESIGN.md §22) */
 	BlockNumber curblk;			/* block pagebuf will be written to */
 	BulkWriteBuffer pagebuf;	/* container page under construction */
 	bool		haspage;
 
 	/*
-	 * The posting tree above the leaves (DESIGN.md §22).  A set that fits one
-	 * leaf has none at all and `head` is that leaf; the moment a second leaf
-	 * is needed, a block is reserved for the ROOT, the first leaf is re-stamped
-	 * with it, and the internal levels are filled bottom-up.
+	 * The posting tree above the leaves (DESIGN.md §22).  A set of at most
+	 * LION_POSTING_FLAT_LEAVES leaves has none at all: `head` is its first
+	 * leaf and the leaves are one chain.  Their finished images wait in
+	 * `held` until the set is known to stay that small; the moment one leaf
+	 * more is needed, a block is reserved for the ROOT, the held leaves are
+	 * re-stamped with it and written, and the internal levels are filled
+	 * bottom-up.
 	 */
+	BulkWriteBuffer held[LION_POSTING_FLAT_LEAVES];
+	BlockNumber heldblk[LION_POSTING_FLAT_LEAVES];
+	int			nheld;
 	bool		hastree;
 	BlockNumber rootblk;
 	LionPostLevel *plevel;		/* the level just above the leaves */
@@ -1064,19 +1070,43 @@ lion_post_level_add(LionBuildState *bs, LionBuilder *b, LionPostLevel *lv,
 }
 
 /*
- * The set needs a second leaf, so it needs a ROOT above them.  Reserve its
- * block and re-stamp the first leaf, whose image has not been written yet.
+ * The set needs one leaf more than a set without an internal level may have
+ * (LION_POSTING_FLAT_LEAVES), so it needs a ROOT above them.  Reserve its
+ * block, re-stamp the held leaves, whose images have not been written yet,
+ * and write them with their downlinks.
  */
 static void
-lion_builder_start_tree(LionBuildState *bs, LionBuilder *b, Page firstleaf)
+lion_builder_start_tree(LionBuildState *bs, LionBuilder *b)
 {
+	int			i;
+
 	Assert(!b->hastree);
 
 	b->rootblk = lion_build_alloc_block(bs);
 	b->head = b->rootblk;
 	b->hastree = true;
 	b->plevel = lion_post_level(bs, 1);
-	lion_page_set_owner(firstleaf, b->hash, b->head);
+	for (i = 0; i < b->nheld; i++)
+	{
+		Page		leaf = (Page) b->held[i]->data;
+
+		lion_page_set_owner(leaf, b->hash, b->head);
+		lion_post_level_add(bs, b, b->plevel, LionPageGetOpaque(leaf)->minckey,
+							b->heldblk[i]);
+		smgr_bulk_write(bs->bulk, b->heldblk[i], b->held[i], true);
+	}
+	b->nheld = 0;
+}
+
+/* Write the leaves of a set that stays without an internal level. */
+static void
+lion_builder_write_held(LionBuildState *bs, LionBuilder *b)
+{
+	int			i;
+
+	for (i = 0; i < b->nheld; i++)
+		smgr_bulk_write(bs->bulk, b->heldblk[i], b->held[i], true);
+	b->nheld = 0;
 }
 
 /*
@@ -1137,22 +1167,36 @@ lion_builder_spill(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 	{
 		BlockNumber next;
 
-		/*
-		 * The page is final, and a second leaf means the set is a TREE: the
-		 * root block is reserved now and this first leaf is re-stamped with
-		 * it before it goes out, because every page of a set carries its root
-		 * block as the owner stamp (DESIGN.md §18, §22).
-		 */
-		if (!b->hastree)
-			lion_builder_start_tree(bs, b, img);
-
 		next = lion_build_alloc_block(bs);
 		lion_page_update_minmax(img);
 		LionPageGetOpaque(img)->rightlink = next;
-		lion_post_level_add(bs, b, b->plevel,
-							LionPageGetOpaque(img)->minckey, b->curblk);
-		/* the page is final: hand the image itself to the bulk writer */
-		smgr_bulk_write(bs->bulk, b->curblk, b->pagebuf, true);
+
+		/*
+		 * The page is final.  Up to LION_POSTING_FLAT_LEAVES leaves make a
+		 * set without an internal level, headed by its first leaf, and they
+		 * are held back until that is certain; the leaf after that makes the
+		 * set a TREE: the root block is reserved now and every held leaf is
+		 * re-stamped with it before it goes out, because every page of a set
+		 * carries its root block as the owner stamp (DESIGN.md §18, §22).
+		 */
+		if (!b->hastree && b->nheld + 2 <= LION_POSTING_FLAT_LEAVES)
+		{
+			b->held[b->nheld] = b->pagebuf;
+			b->heldblk[b->nheld] = b->curblk;
+			b->nheld++;
+		}
+		else
+		{
+			if (!b->hastree)
+			{
+				lion_builder_start_tree(bs, b);
+				lion_page_set_owner(img, b->hash, b->head);
+			}
+			lion_post_level_add(bs, b, b->plevel,
+								LionPageGetOpaque(img)->minckey, b->curblk);
+			/* the page is final: hand the image itself to the bulk writer */
+			smgr_bulk_write(bs->bulk, b->curblk, b->pagebuf, true);
+		}
 
 		b->curblk = next;
 		b->pagebuf = lion_build_get_page(bs, LION_PAGE_CONTAINER);
@@ -1366,6 +1410,8 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 		if (b->hastree)
 			lion_post_level_add(bs, b, b->plevel,
 								LionPageGetOpaque(img)->minckey, b->curblk);
+		else
+			lion_builder_write_held(bs, b);
 		smgr_bulk_write(bs->bulk, b->curblk, b->pagebuf, true);
 		b->pagebuf = NULL;
 		b->haspage = false;

@@ -23,6 +23,16 @@
  *	  a root split, "a head block is never recycled as a head" stays true, and
  *	  no record ever has to carry both the entry leaf and four tree pages.
  *
+ *	  A SMALL SET HAS NO INTERNAL LEVEL.  Up to LION_POSTING_FLAT_LEAVES
+ *	  leaves, the head is the FIRST LEAF and the leaves are one rightlinked
+ *	  chain with nothing above them: an internal root holding a handful of
+ *	  downlinks would be a nearly empty page per key.  A writer finds its
+ *	  leaf by walking the chain (lion_posting_flat_route()), a split of such a
+ *	  set is a single record that posts no downlink, and the split that would
+ *	  make it one leaf longer first PROMOTES it (lion_posting_promote()): the
+ *	  root push-down above, with a downlink to every leaf in the same record.
+ *	  Readers walk right from wherever they stand, as they always could.
+ *
  * 2. WRITERS OF ONE KEY SERIALISE ON THAT KEY'S DIRECTORY LEAF.  Every path
  *	  that changes a posting tree - aminsert, an INLINE spill, VACUUM's regrow
  *	  and its apply step - holds the directory leaf that carries the entry
@@ -450,14 +460,15 @@ lion_posting_restart(Relation index, BlockNumber head, int *restarts,
 
 static Buffer lion_posting_descend(Relation index, Relation heaprel,
 								   uint32 hash, BlockNumber head, uint32 ckey,
-								   bool before, int lockmode, bool forwrite);
+								   bool before, int lockmode, bool forwrite,
+								   bool *flat);
 
 Buffer
 lion_posting_search(Relation index, Relation heaprel, uint32 hash,
 					BlockNumber head, uint32 ckey, int lockmode, bool forwrite)
 {
 	return lion_posting_descend(index, heaprel, hash, head, ckey, false,
-								lockmode, forwrite);
+								lockmode, forwrite, NULL);
 }
 
 Buffer
@@ -466,13 +477,100 @@ lion_posting_search_before(Relation index, Relation heaprel, uint32 hash,
 						   bool forwrite)
 {
 	return lion_posting_descend(index, heaprel, hash, root, ckey, true,
-								lockmode, forwrite);
+								lockmode, forwrite, NULL);
+}
+
+Buffer
+lion_posting_search_ext(Relation index, Relation heaprel, uint32 hash,
+						BlockNumber head, uint32 ckey, int lockmode,
+						bool forwrite, bool before, bool *flat)
+{
+	return lion_posting_descend(index, heaprel, hash, head, ckey, before,
+								lockmode, forwrite, flat);
+}
+
+/*
+ * A WRITER's descent of a FLAT tree, one whose head is a leaf (DESIGN.md
+ * §22): there are no separators, so the leaf that owns ckey is found by
+ * walking the chain from the head - the last non-empty leaf whose first
+ * container key is at or below ckey (strictly below, before), or the head
+ * when no leaf's is.  Every leaf's keys are below the next non-empty one's,
+ * so a key between two leaves may go to either and the order holds; an empty
+ * leaf owns nothing and is walked past.  At most LION_POSTING_FLAT_LEAVES
+ * pages, which is the price of a write into the middle of a small set; an
+ * append goes through the entry's `tail` and does not get here.
+ *
+ * buf is the head, locked in lockmode, and the leaf that owns ckey comes back
+ * locked in lockmode.  Writers of one key serialise (rule 2), so the chain
+ * cannot change shape while it is walked, and holding the leaf found so far
+ * while locking the one to its right is the order every walk keeps.  A flat
+ * tree never has an unfinished split - its splits post no downlink - so a
+ * flagged leaf, like a right link to anything but a leaf of the set, is
+ * damage.
+ */
+static Buffer
+lion_posting_flat_route(Relation index, BlockNumber head, Buffer buf,
+						uint32 ckey, bool before, int lockmode)
+{
+	Buffer		target = buf;
+	BlockNumber blk = head;
+	BlockNumber next;
+	LionRightWalk walk;
+
+	if (LionPageIncompleteSplit(BufferGetPage(buf)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": the head %u of a posting set without an internal level is flagged as an unfinished split",
+						RelationGetRelationName(index), head)));
+
+	next = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
+	lion_rightwalk_init(&walk);
+	while (BlockNumberIsValid(next))
+	{
+		Buffer		nbuf;
+		Page		np;
+		BlockNumber after;
+
+		lion_rightwalk_step(index, &walk, blk, next);
+		if (next == BufferGetBlockNumber(target))
+			lion_posting_held(index, head, next);
+		nbuf = lion_posting_getbuf(index, next, head, lockmode, true);
+		np = BufferGetPage(nbuf);
+		if (!LionPageIsPostingLeaf(np) || LionPageIncompleteSplit(np))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": leaf %u of the posting set at %u, which has no internal level, links to block %u at level %u%s",
+							RelationGetRelationName(index), blk, head, next,
+							LionPageGetOpaque(np)->level,
+							LionPageIncompleteSplit(np) ? ", flagged as an unfinished split" : "")));
+		after = LionPageGetOpaque(np)->rightlink;
+
+		if (PageGetMaxOffsetNumber(np) >= FirstOffsetNumber)
+		{
+			uint32		mn = LionPageGetOpaque(np)->minckey;
+
+			if (before ? mn >= ckey : mn > ckey)
+			{
+				UnlockReleaseBuffer(nbuf);
+				break;
+			}
+			UnlockReleaseBuffer(target);
+			target = nbuf;
+		}
+		else
+			UnlockReleaseBuffer(nbuf);
+
+		blk = next;
+		next = after;
+	}
+
+	return target;
 }
 
 static Buffer
 lion_posting_descend(Relation index, Relation heaprel, uint32 hash,
 					 BlockNumber head, uint32 ckey, bool before, int lockmode,
-					 bool forwrite)
+					 bool forwrite, bool *flat)
 {
 	Buffer		buf;
 	Page		page;
@@ -486,8 +584,8 @@ lion_posting_descend(Relation index, Relation heaprel, uint32 hash,
 	 * unfinished split starts again each time, and that ends by itself: each
 	 * repair clears a flag for good, and nobody sets one meanwhile, because
 	 * writers of one key serialise (rule 2).  Every other restart is counted
-	 * (lion_posting_restart()).  A one-page root that is no longer a leaf
-	 * once it is relocked is a root push-down, and a set's root is pushed
+	 * (lion_posting_restart()).  A head that is no longer a leaf once it is
+	 * relocked is a root push-down, and a set's root is pushed
 	 * down at most LION_POSTING_MAX_HEIGHT times in its whole life.  A page at
 	 * a level its link does not promise is no race at all - only the root
 	 * changes level, and the root is nobody's child or sibling - but it is
@@ -506,9 +604,10 @@ restart:
 		lockmode != BUFFER_LOCK_SHARE)
 	{
 		/*
-		 * A one-page set: the root IS the leaf and has to be relocked in the
-		 * caller's mode.  A root push-down may have happened in between, and
-		 * then the page is no longer a leaf and the descent starts over.
+		 * A set without an internal level: the head IS a leaf and has to be
+		 * relocked in the caller's mode.  A root push-down may have happened
+		 * in between, and then the page is no longer a leaf and the descent
+		 * starts over.
 		 */
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 		LockBuffer(buf, lockmode);
@@ -530,6 +629,18 @@ restart:
 			goto restart;
 		}
 	}
+
+	if (flat != NULL)
+		*flat = LionPageIsPostingLeaf(BufferGetPage(buf));
+
+	/*
+	 * A head that is a leaf is a FLAT tree, which a writer walks rather than
+	 * descends; a reader takes the head as the leaf the descent ends on and
+	 * walks right from it below, as it does from any leaf.
+	 */
+	if (forwrite && LionPageIsPostingLeaf(BufferGetPage(buf)))
+		return lion_posting_flat_route(index, head, buf, ckey, before,
+									   lockmode);
 
 	lion_rightwalk_init(&walk);
 	for (;;)
@@ -841,9 +952,17 @@ lion_chain_find_page(Relation index, uint32 hash, BlockNumber head,
  * its block, so the entry's `head` - and with it the owner stamp of every
  * page of the set - is unchanged (see rule 1 in the file header).
  *
- * entrybuf/entry are only needed when the root is a LEAF, because then the
- * set's last leaf changes and `tail` travels in the same record; an internal
- * root's push-down touches no entry field at all and passes InvalidBuffer.
+ * A LEAF root is the head of a flat tree (LION_POSTING_FLAT_LEAVES), and the
+ * other leaves of its chain - siblings[], in chain order, each with the
+ * separator it gets - become downlinks of the new root after the child's:
+ * the child takes the root's place in the chain, linked to the root's old
+ * right sibling, so the leaves are the very chain they were with the child
+ * where the head was.  An internal root has no sibling and passes none.
+ *
+ * entrybuf/entry are only needed when the root is the set's LAST leaf - a
+ * flat tree of one leaf - because then `tail` moves to the child and travels
+ * in the same record; any other push-down touches no entry field at all, and
+ * a caller that knows it passes InvalidBuffer.
  *
  * What the record writes is the entry AS IT IS ON THE PAGE with `tail`
  * changed, and not the caller's copy: that copy already counts the items the
@@ -872,7 +991,8 @@ lion_chain_find_page(Relation index, uint32 hash, BlockNumber head,
 static Buffer
 lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 					  Buffer entrybuf, OffsetNumber entryoff,
-					  LionEntryTuple *entry)
+					  LionEntryTuple *entry,
+					  const LionPostingPivot *siblings, int nsiblings)
 {
 	Page		page = BufferGetPage(buf);
 	BlockNumber head = BufferGetBlockNumber(buf);
@@ -895,8 +1015,13 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 
 	Assert(LionPageIsContainer(page));
 	Assert(!LionPageIncompleteSplit(page));
-	Assert(LionPageIsRightmost(page));	/* a root has no sibling */
+	/* only the head of a flat tree has siblings, and they are given */
+	Assert(nsiblings == 0 || level == 0);
+	Assert(LionPageIsRightmost(page) == (nsiblings == 0));
 	Assert(level < LION_POSTING_MAX_HEIGHT);
+	Assert((Size) (nsiblings + 1) * (MAXALIGN(LION_POSTING_PIVOT_SIZE) +
+									 sizeof(ItemIdData)) <=
+		   (Size) LION_PAGE_CAPACITY);
 
 	/*
 	 * The items move by their line pointers, inside the record (see
@@ -935,7 +1060,7 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	 * is copied here because an rmgr-mode record is a critical section, where
 	 * nothing may be palloc'd.
 	 */
-	if (level == 0 && kind == 0)
+	if (level == 0 && kind == 0 && nsiblings == 0)
 	{
 		Page		epage;
 		LionEntryTuple *onpage;
@@ -960,14 +1085,17 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	/*
 	 * The root block is REBUILT as the level above, so it is registered as a
 	 * page this record initialises: replay zeroes it and rebuilds it from the
-	 * one downlink below, with no full-page image at all.
+	 * downlinks below, with no full-page image at all.
 	 */
 	pR = lion_wal_register_buffer(xstate, buf, LION_WALBUF_INIT);
 	pC = lion_wal_init_buffer(xstate, cbuf, LION_PAGE_CONTAINER | kind);
 
-	/* The child takes the root's items, at the bytes they were allotted. */
+	/*
+	 * The child takes the root's items, at the bytes they were allotted, and
+	 * its place in the chain of leaves.
+	 */
 	LionPageGetOpaque(pC)->level = level;
-	LionPageGetOpaque(pC)->rightlink = InvalidBlockNumber;
+	LionPageGetOpaque(pC)->rightlink = LionPageGetOpaque(cpage)->rightlink;
 	lion_page_set_owner(pC, hash, head);
 	nmoved = 0;
 	lion_wal_op(xstate, pC, LION_OP_ADDMANY, FirstOffsetNumber, 0, NULL, 0);
@@ -992,22 +1120,27 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 		lion_page_update_minmax(pC);
 	lion_wal_log_special(xstate, pC);
 
-	/* ... and the root block becomes the level above, with one downlink. */
+	/*
+	 * ... and the root block becomes the level above, with a downlink to the
+	 * child and one to each sibling.
+	 */
 	lion_init_page(pR, LION_PAGE_CONTAINER | kind);
 	lion_wal_op(xstate, pR, LION_OP_INIT, 0, LION_PAGE_CONTAINER | kind, NULL, 0);
 	LionPageGetOpaque(pR)->level = level + 1;
 	lion_page_set_owner(pR, hash, head);
 	pivot.ckey = 0;				/* minus infinity: it owns everything */
 	pivot.child = cblk;
+	for (off = 0; off <= nsiblings; off++)
 	{
-		OffsetNumber noff = PageAddItemExtended(pR, (char *) &pivot,
+		const LionPostingPivot *pv = (off == 0) ? &pivot : &siblings[off - 1];
+		OffsetNumber noff = PageAddItemExtended(pR, (char *) pv,
 												LION_POSTING_PIVOT_SIZE,
 												InvalidOffsetNumber, 0);
 
 		if (noff == InvalidOffsetNumber)
 			elog(ERROR, "lion index \"%s\": could not build the new root of the posting set at %u",
 				 RelationGetRelationName(index), head);
-		lion_wal_op(xstate, pR, LION_OP_ADD, noff, 0, &pivot,
+		lion_wal_op(xstate, pR, LION_OP_ADD, noff, 0, pv,
 					LION_POSTING_PIVOT_SIZE);
 	}
 	lion_wal_log_special(xstate, pR);
@@ -1029,18 +1162,194 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	return cbuf;
 }
 
-Buffer
-lion_posting_root_pushdown(Relation index, Relation heaprel, Buffer buf,
-						   Buffer entrybuf, OffsetNumber entryoff,
-						   LionEntryTuple *entry)
+/*
+ * A page of the flat tree rooted at root, for a writer that holds `held`: the
+ * held buffer itself when blk is its block, else blk read and locked SHARE,
+ * checked to be a leaf of the tree.  Writers of the key serialise, so a page
+ * that fails is damage.  *mine says which of the two it is (a held buffer is
+ * not released by the caller).
+ */
+static Buffer
+lion_posting_flat_page(Relation index, BlockNumber root, BlockNumber blk,
+					   Buffer held, bool *mine)
 {
-	Assert(LionPageIsPostingLeaf(BufferGetPage(buf)));
-	Assert(entry == NULL ?
-		   (LionPageGetOpaque(BufferGetPage(buf))->flags & LION_PAGE_POSITIONS) != 0 :
-		   BufferGetBlockNumber(buf) == entry->head);
+	Buffer		buf;
 
-	return lion_posting_pushdown(index, heaprel, buf, entrybuf, entryoff,
-								 entry);
+	if (BufferIsValid(held) && BufferGetBlockNumber(held) == blk)
+	{
+		*mine = false;
+		buf = held;
+	}
+	else
+	{
+		*mine = true;
+		buf = lion_posting_getbuf(index, blk, root, BUFFER_LOCK_SHARE, true);
+	}
+
+	if (!LionPageIsPostingLeaf(BufferGetPage(buf)) ||
+		LionPageIncompleteSplit(BufferGetPage(buf)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": block %u of the posting set at %u, which has no internal level, is not a leaf of it",
+						RelationGetRelationName(index), blk, root)));
+	return buf;
+}
+
+bool
+lion_posting_root_is_leaf(Relation index, BlockNumber root, Buffer held)
+{
+	Buffer		buf;
+	bool		leaf;
+
+	if (BufferIsValid(held) && BufferGetBlockNumber(held) == root)
+		return LionPageIsPostingLeaf(BufferGetPage(held));
+
+	buf = lion_posting_getbuf(index, root, root, BUFFER_LOCK_SHARE, true);
+	leaf = LionPageIsPostingLeaf(BufferGetPage(buf));
+	UnlockReleaseBuffer(buf);
+	return leaf;
+}
+
+int
+lion_posting_flat_count(Relation index, BlockNumber root, Buffer held,
+						int limit)
+{
+	BlockNumber blk = root;
+	LionRightWalk walk;
+	int			n = 0;
+
+	lion_rightwalk_init(&walk);
+	while (BlockNumberIsValid(blk))
+	{
+		bool		mine;
+		Buffer		buf = lion_posting_flat_page(index, root, blk, held, &mine);
+		BlockNumber next = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
+
+		if (mine)
+			UnlockReleaseBuffer(buf);
+		if (++n > limit)
+			break;
+		if (BlockNumberIsValid(next))
+			lion_rightwalk_step(index, &walk, blk, next);
+		blk = next;
+	}
+	return n;
+}
+
+/*
+ * The separator a leaf of a flat tree gets in the root its promotion builds
+ * (DESIGN.md §22): its own first key - which is what a split would have
+ * posted for it, and for a position tree's leaf the header of its first chunk
+ * ((P3) of lion_postree.c) - and for an EMPTY leaf, which only VACUUM leaves
+ * in a posting set, one past the last key of the non-empty leaf before it, so
+ * that the keys of that leaf still route to it.  Never below the separator
+ * before it.
+ */
+static uint32
+lion_posting_flat_sep(Page page, uint32 prevsep, bool havemax, uint32 lastmax)
+{
+	uint32		sep;
+
+	if (PageGetMaxOffsetNumber(page) >= FirstOffsetNumber)
+		sep = LionPageGetOpaque(page)->minckey;
+	else if (havemax)
+		sep = (lastmax == PG_UINT32_MAX) ? lastmax : lastmax + 1;
+	else
+		sep = prevsep;
+	return Max(sep, prevsep);
+}
+
+Buffer
+lion_posting_promote(Relation index, Relation heaprel, Buffer headbuf,
+					 Buffer held, Buffer entrybuf, OffsetNumber entryoff,
+					 LionEntryTuple *entry)
+{
+	Page		hpage = BufferGetPage(headbuf);
+	BlockNumber root = BufferGetBlockNumber(headbuf);
+	BlockNumber blk;
+	LionPostingPivot *sibs;
+	int			nsibs = 0;
+	int			maxsibs = LION_POSTING_FLAT_LEAVES + 1;
+	uint32		prevsep = 0;
+	bool		havemax;
+	uint32		lastmax;
+	LionRightWalk walk;
+	Buffer		cbuf;
+
+	Assert(LionPageIsPostingLeaf(hpage));
+	Assert(entry == NULL ?
+		   (LionPageGetOpaque(hpage)->flags & LION_PAGE_POSITIONS) != 0 :
+		   root == entry->head);
+
+	if (LionPageIncompleteSplit(hpage))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": the head %u of a posting set without an internal level is flagged as an unfinished split",
+						RelationGetRelationName(index), root)));
+
+	/*
+	 * Every other leaf of the chain, with the separator it gets.  The head's
+	 * own items go to the child, whose downlink is minus infinity.  A chain
+	 * longer than the limit is not refused here - it is not wrong, only
+	 * longer than the writers make one - as long as its downlinks fit a page.
+	 */
+	havemax = PageGetMaxOffsetNumber(hpage) >= FirstOffsetNumber;
+	lastmax = LionPageGetOpaque(hpage)->maxckey;
+	sibs = (LionPostingPivot *) palloc(sizeof(LionPostingPivot) * maxsibs);
+	blk = LionPageGetOpaque(hpage)->rightlink;
+	lion_rightwalk_init(&walk);
+	if (BlockNumberIsValid(blk))
+		lion_rightwalk_step(index, &walk, root, blk);
+	while (BlockNumberIsValid(blk))
+	{
+		bool		mine;
+		Buffer		buf;
+		Page		page;
+		BlockNumber next;
+
+		if (blk == root)
+			lion_posting_held(index, root, blk);
+		buf = lion_posting_flat_page(index, root, blk, held, &mine);
+		page = BufferGetPage(buf);
+
+		if (nsibs == maxsibs)
+		{
+			if ((Size) (maxsibs * 2 + 1) * (MAXALIGN(LION_POSTING_PIVOT_SIZE) +
+											sizeof(ItemIdData)) >
+				(Size) LION_PAGE_CAPACITY)
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("lion index \"%s\": the posting set at %u has more leaves without an internal level than one page can link",
+								RelationGetRelationName(index), root)));
+			maxsibs *= 2;
+			sibs = (LionPostingPivot *)
+				repalloc(sibs, sizeof(LionPostingPivot) * maxsibs);
+		}
+		sibs[nsibs].ckey = lion_posting_flat_sep(page, prevsep, havemax,
+												 lastmax);
+		sibs[nsibs].child = blk;
+		prevsep = sibs[nsibs].ckey;
+		nsibs++;
+		if (PageGetMaxOffsetNumber(page) >= FirstOffsetNumber)
+		{
+			havemax = true;
+			lastmax = LionPageGetOpaque(page)->maxckey;
+		}
+
+		next = LionPageGetOpaque(page)->rightlink;
+		if (mine)
+			UnlockReleaseBuffer(buf);
+		if (BlockNumberIsValid(next))
+			lion_rightwalk_step(index, &walk, blk, next);
+		blk = next;
+	}
+
+	cbuf = lion_posting_pushdown(index, heaprel, headbuf,
+								 nsibs == 0 ? entrybuf : InvalidBuffer,
+								 entryoff, nsibs == 0 ? entry : NULL,
+								 sibs, nsibs);
+	pfree(sibs);
+	return cbuf;
 }
 
 /* ---------------------------------------------------------------------
@@ -1268,7 +1577,7 @@ lion_posting_place_pivot(Relation index, Relation heaprel, uint32 hash,
 
 		Assert(!BufferIsValid(lion_posting_held_buffer(held, head)));
 		cbuf = lion_posting_pushdown(index, heaprel, buf, InvalidBuffer,
-									 InvalidOffsetNumber, NULL);
+									 InvalidOffsetNumber, NULL, NULL, 0);
 
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 		lion_posting_place_pivot(index, heaprel, hash, head, cbuf, off, pivot,
