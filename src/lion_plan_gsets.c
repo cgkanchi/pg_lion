@@ -544,6 +544,25 @@ lion_gsets_checkaggs(RelOptInfo *output_rel, GroupPathExtraData *extra)
 }
 
 /*
+ * The costs of the query's aggregates that the Agg over the finer grouping's
+ * rows is priced with: as core prices its own Agg over the table
+ * (AGGSPLIT_SIMPLE), computed here.  Not extra->agg_final_costs: core fills
+ * that only when it builds partially aggregated paths
+ * (create_partial_grouping_paths(), extra->partial_costs_set), which neither
+ * grouping sets nor a DISTINCT aggregate allow, and otherwise leaves it
+ * unset - whatever its stack held, which differs from one backend, and one
+ * build, to the next.  Read there, it priced the path at anything from its
+ * real cost to 1e108, and core's plan won (DESIGN.md §10, "Grouping
+ * sets").
+ */
+static void
+lion_gsets_agg_costs(PlannerInfo *root, AggClauseCosts *costs)
+{
+	MemSet(costs, 0, sizeof(AggClauseCosts));
+	get_agg_clause_costs(root, AGGSPLIT_SIMPLE, costs);
+}
+
+/*
  * GROUP BY ROLLUP, CUBE or GROUPING SETS over input_rel, a base relation
  * (DESIGN.md §10, "Grouping sets"): the finest grouping - the union of the
  * sets - counted into a rel of its own by lion_try_count_path(), and core's
@@ -563,6 +582,7 @@ lion_try_gsets_path(PlannerInfo *root, RelOptInfo *input_rel,
 	List	   *rollups;
 	List	   *pathkeys;
 	List	   *checkaggs;
+	AggClauseCosts aggcosts;
 	ListCell   *lc;
 
 	if (extra == NULL || parse->groupingSets == NIL ||
@@ -581,6 +601,7 @@ lion_try_gsets_path(PlannerInfo *root, RelOptInfo *input_rel,
 	if (inner == NULL)
 		return;
 	checkaggs = lion_gsets_checkaggs(output_rel, extra);
+	lion_gsets_agg_costs(root, &aggcosts);
 
 	/* the Agg, over each of them sorted for its first rollup */
 	foreach(lc, inner->pathlist)
@@ -597,8 +618,7 @@ lion_try_gsets_path(PlannerInfo *root, RelOptInfo *input_rel,
 		if (!pathkeys_contained_in(pathkeys, sub->pathkeys))
 			sub = (Path *) create_sort_path(root, inner, sub, pathkeys, -1.0);
 		gpath = create_groupingsets_path(root, output_rel, sub, having,
-										 AGG_SORTED, rollups,
-										 &extra->agg_final_costs);
+										 AGG_SORTED, rollups, &aggcosts);
 		gpath->path.pathtarget = aggtarget;
 		/* claims no order: its first rollup's need not be core's */
 		gpath->path.pathkeys = NIL;
@@ -695,6 +715,7 @@ lion_try_distinct_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
 	RelOptInfo *inner;
 	List	   *checkaggs;
 	List	   *groupexprs;
+	AggClauseCosts aggcosts;
 	ListCell   *lc;
 
 	if (extra == NULL || parse->groupingSets != NIL ||
@@ -754,6 +775,7 @@ lion_try_distinct_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
 		return;
 	checkaggs = lion_gsets_checkaggs(output_rel, extra);
 	groupexprs = get_sortgrouplist_exprs(root->processed_groupClause, tlist);
+	lion_gsets_agg_costs(root, &aggcosts);
 
 	foreach(lc, inner->pathlist)
 	{
@@ -765,7 +787,7 @@ lion_try_distinct_agg_path(PlannerInfo *root, RelOptInfo *input_rel,
 											root->group_pathkeys, -1.0);
 		apath = create_agg_path(root, output_rel, sub, aggtarget, AGG_SORTED,
 								AGGSPLIT_SIMPLE, root->processed_groupClause,
-								having, &extra->agg_final_costs,
+								having, &aggcosts,
 								estimate_num_groups(root, groupexprs,
 													sub->rows, NULL, NULL));
 		add_path(output_rel, (Path *) lion_join_agg_wrap(root, output_rel,
