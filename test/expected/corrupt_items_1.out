@@ -300,6 +300,31 @@ DELETE FROM lion_di_v WHERE k = 7;
 VACUUM lion_di_v;
 \set VERBOSITY default
 DROP TABLE lion_di_v;
+-- ---------- 10. an entry too short for its aligned payload offset ----------
+-- An INLINE entry of a 36-byte text key: 68 bytes of header and key, and its
+-- payload at byte 72, after the alignment padding.  Its line pointer is cut
+-- to 68: long enough for the header and the key, which is all readers used
+-- to check, but the payload length computed from it wrapped around zero, and
+-- a scan asked for that many bytes.  Now the entry is refused as corrupt.
+CREATE TABLE lion_di_s (t text NOT NULL);
+INSERT INTO lion_di_s SELECT md5((i % 50)::text) FROM generate_series(1, 5000) i;
+CREATE INDEX lion_di_s_i ON lion_di_s USING lion (t);
+SELECT lion_di_evict('lion_di_s_i');
+-- the first INLINE entry of leaf 1, and its key
+SELECT o AS lion_di_off, lion_di_lplen(p, o) AS lion_di_len,
+	   encode(substring(p FROM it + 37 FOR 32), 'escape') AS lion_di_key
+  FROM lion_di_block('lion_di_s_i', 1) p,
+	   LATERAL generate_series(1, (((lion_di_u32(p, 12) & 65535) - 24) / 4)::int) o,
+	   LATERAL (SELECT lion_di_item(p, o) AS it) y
+ WHERE get_byte(p, it + 4) & 1 = 1 AND get_byte(p, it + 6) = 36
+ ORDER BY o LIMIT 1 \gset
+SELECT :lion_di_len > 72 AS payload_after_byte_72, length(:'lion_di_key') AS keylen;
+SELECT lion_di_set_lplen('lion_di_s_i', 1, :lion_di_off, 68);
+SELECT lion_di_try($$SELECT count(*) FROM lion_di_s WHERE t = $$ || quote_literal(:'lion_di_key'));
+SELECT lion_di_try($$SELECT t, count(*) FROM lion_di_s GROUP BY t ORDER BY t$$);
+SELECT lion_di_try($$SELECT lion_index_count('lion_di_s_i', $$ || quote_literal(:'lion_di_key') || '::text)');
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_s_i')$$);
+DROP TABLE lion_di_s;
 -- ---------- an undamaged index still works ----------
 CREATE INDEX lion_di_i ON lion_di USING lion (k);
 SELECT count(*) FROM lion_di WHERE k = 7;
