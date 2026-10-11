@@ -212,6 +212,36 @@ EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)
 SELECT count(*) FROM docs WHERE tags @> ARRAY['t1', 't17'];
 ```
 
+The facet counts beside a search's results - the ten tags with the most matching documents, the
+lexemes of the matches, the documents in each group - come from `lion_index_facets(idx, k, filter)`
+(docs/REFERENCE.md, "Facet counts"). It counts the rows under each key of one Lion index column,
+exactly and under the caller's snapshot, and with a `k` it counts only the keys that can be among the
+k largest; `filter` is the search's `WHERE` clause, answered from the Lion indexes alone:
+
+```sql
+-- beside docs_tags_lion above, and a grp int column
+CREATE INDEX docs_tsv_lion ON docs USING lion (tsv);
+CREATE INDEX docs_grp_lion ON docs USING lion (grp);
+
+-- the search: documents matching 'w7 | w42' in group 3
+SELECT id, title FROM docs WHERE tsv @@ 'w7 | w42' AND grp = 3 ORDER BY id LIMIT 20;
+
+-- its facets: the ten most frequent tags of every match, and the matches in each group
+SELECT * FROM lion_index_facets('docs_tags_lion', 10, $$tsv @@ 'w7 | w42' AND grp = 3$$);
+SELECT * FROM lion_index_facets('docs_grp_lion', NULL, $$tsv @@ 'w7 | w42'$$);
+
+-- the twenty most frequent lexemes of group 3, the ndoc of
+-- ts_stat('SELECT tsv FROM docs WHERE grp = 3')
+SELECT * FROM lion_index_facets('docs_tsv_lion', 20, 'grp = 3');
+```
+
+A tag's count is the number of documents whose `tags` hold it, however often - `count(DISTINCT id)`
+over `unnest(tags)`, not `count(*)`, which counts a tag twice in a document that repeats it. The
+filter is an `AND`/`OR` of what the indexes answer as sets - `=`, `IN`, `IS NULL` on a column a Lion
+index keys, and `@>`, `&&`, `@@`, `?` on a multi-key one; a condition they cannot answer (`grp > 2`,
+a phrase query) is an error that names it, never a scan. Each call checks what the query would:
+SELECT on the columns, EXECUTE on the operators, no row-level security for the caller.
+
 To return ROWS rather than counts under a Lion filter, give the query a covering B-tree, as you
 would for an Index Only Scan, and let Lion filter its walk (DESIGN.md §30 and §40): the node walks
 the B-tree in its order, tests each entry's TID against the Lion indexes' posting sets before it

@@ -141,6 +141,7 @@ the suite as they are in production.
     src/lion_rangesrc.c     a range as a source: collected, or probed at the other sources' rows
     src/lion_range.c        range restrictions, and iterating every entry of an index
     src/lion_count_sql.c    the SQL count functions (lion_index_count() and the others)
+    src/lion_facets.c       lion_index_facets(): the rows under each key of a column, under a filter
     src/lion_customscan.h   the LionCount custom scan's private header, shared by its planner half:
     src/lion_plan_*.c       create_upper_paths_hook -> CustomPath/CustomScan "LionCount"; set_join_pathlist_hook
                             -> "LionSemiJoin"/"LionAntiJoin"; index matching, partitions, the cost model
