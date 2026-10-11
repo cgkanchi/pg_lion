@@ -148,7 +148,8 @@ Representation policy
   changes the representation of any of them; the conversions above happen only at those limits,
   which the in-place path checks and refuses - both it and its redo through one table,
   `lion_container_inplace_need()` (§38). The
-  sparse insert has the same shape: 6 bytes past a segment below 682 pairs (§13). Stated in
+  sparse insert has the same shape: it writes exactly the `lion_sparse_insert_size()` bytes the
+  in-place path and its redo check first, at most 11 past the segment (§13). Stated in
   lion_container.h and lion_sparse.h, and tested on exact-size heap allocations (test/unit).
 
 **Damaged containers** (2026-09-25 review). A container read from disk is data, and a reader checks
@@ -339,7 +340,10 @@ Block 0: meta page. Payload struct `LionMetaPageData` { magic 0x52424931, versio
 container_bits, nbuckets, inline_limit, unused padding to 64 bytes }. *(Version 7, §32: an index
 with summary posting sets, which records them in `summary_cols` and `summary_tids`, two words that
 were reserved; an index without them is still version 6, byte for byte. Version 8, §38: an index
-with NARROW items, with or without summaries, which builds before it refuse.)* Version 2 was the first that
+with NARROW items, with or without summaries, which builds before it refuse. Version 9, §13: sparse
+segments of delta varints, which every index this build writes is and the only one it reads;
+whether there are summaries is `summary_cols`, and whether the build wrote a NARROW is the
+`LION_META_NARROW` bit of `order_flags`.)* Version 2 was the first that
 indexes NULL keys (§14); version 3 (§18) added owner_hash/owner_head, which grows the special area
 from 16 to 24 bytes and therefore moves every item on every page. An index of an older version is
 structurally readable by nothing in this code, so opening one is an ERROR that asks for a REINDEX
@@ -454,8 +458,10 @@ when a segment's range really grew, and the WAL delta is the handful of bytes th
 BITSET always qualifies, a NARROW does for a member within its width (§38), an ARRAY needs 2 spare
 bytes and a cardinality below LION_ARRAY_MAX_CARD, a RUN needs 4 and a run count below
 LION_RUN_MAX_NRUNS (both would otherwise turn into a bitset), and
-a sparse segment needs 6 and a container key that stays below LION_SPARSE_THRESHOLD members (else
-the key is promoted, which is not an in-place change). Otherwise the general path runs - copy out,
+a sparse segment needs the bytes `lion_sparse_insert_size()` gives for the pair (one varint at the
+tail, at most 11 bytes anywhere, nothing once its stream would pass 255 bytes) and a container key
+that stays below LION_SPARSE_THRESHOLD members (else the key is promoted, which is not an in-place
+change). Otherwise the general path runs - copy out,
 mutate, write back, split if needed - and leaves fresh slack behind, which is where the slack of a
 growing key comes from in the first place. **Only inserts add slack**: ambuild writes items at
 their exact size, because a bulk-built index is read-mostly and the space would be pure loss, and
@@ -2847,15 +2853,51 @@ fewer than ~4 members per 64-page window (high-cardinality columns, tsvector lex
 cost 24 bytes per row where GIN costs 3.
 
 Item kind. Container pages and INLINE payloads may now hold a fourth item type, the **sparse
-segment**, sharing the 8-byte LionContainer header:
+segment**, sharing the 8-byte LionContainer header. Its pairs are heap TID codes (code = ckey << 15
+| lo, 41 bits at 8K), sorted and unique, stored as a stream of delta varints (format version 9):
 
     type        = LION_CT_SPARSE (4)
-    ckey        = first container key covered by the segment
-    cardinality = number of members n (1 .. LION_SPARSE_MAX_PAIRS = 682)
-    payload     = uint32 ckeys[n], then uint16 los[n]      -- both sorted by (ckey, lo); 6n bytes
-    total size  = 8 + 6n  <= 4104 (same bound as every other item)
+    ckey        = container key of the first pair; the stream's base is ckey << 15
+    cardinality = number of pairs n (1 .. LION_SPARSE_MAX_PAIRS = 255)
+    flags       = the stream's length in bytes (n .. LION_SPARSE_MAX_BYTES = 255)
+    stream      = n LEB128 varints: the first pair's lo (its code minus the base, so below 32768),
+                  then each code minus the one before it (at least 1)
+    total size  = 8 + flags <= LION_SPARSE_MAX_SIZE = 263
 
-A segment covers the ckey range [ckey, ckeys[n-1]]. Invariants: every ckey of a posting set appears
+Every varint is in its shortest form, so a set of pairs has exactly one encoding: the redo of an
+in-place insert (`LION_OP_SPARSE_INS`, §25) calls the same `lion_sparse_insert()` on the page item
+and has to land on the same bytes, which `wal_consistency_checking = 'pg_lion'` checks. A delta is
+at most `LION_SPARSE_VARINT_MAX` bytes (6 at 8K: a 41-bit code), a zero delta is a duplicate pair
+and is rejected by `lion_sparse_check()` with any varint that is overlong, truncated or carries a
+code past the largest heap TID, and with bytes after the n-th pair.
+
+Why a stream. The pairs of a key too sparse for a container are, by definition, far apart in the
+heap: a few to a few hundred heap blocks, a code delta of a few hundred to a few hundred thousand,
+which is two or three bytes as a varint against the six of a (uint32 ckey, uint16 lo) pair. And a
+pair above the last one - every insert of a row the heap appended - changes the header's count and
+length and adds bytes at the END, where with a fixed-width ckeys[] array followed by los[] it
+shifted the whole los[] array: the DELTA record of an INLINE entry (§25) went from covering the
+tail of both arrays to covering the header and the new varint. Measured on the 5M-row table of §12
+(50,000 rows appended, pg_walinspect; lion WAL per inserted row, index after the build):
+
+    column   lion WAL per row   index size
+    c20k     576 B -> 78 B      41.2 MB -> 19.1 MB
+    c1m       88 B -> 79 B      96.6 MB -> 83.2 MB
+    skew     158 B -> 80 B      4.98 MB -> 2.91 MB
+    c200      87 B -> 86 B      16.5 MB (containers only: unchanged)
+
+A middle insert (a row placed in space VACUUM freed) rewrites the tail from the insertion point,
+which is at most the segment's 255 bytes.
+
+The cap. 255 bytes of stream, which is what the one-byte flags field holds, and so at most 255
+pairs (about 85 at three bytes a pair). It keeps every look inside a segment a sequential decode of
+at most 255 bytes - a lookup by ckey, `lion_item_last_ckey()` (which the page ordering asks of
+every item), the cursor's seek past a segment's ckeys below a target - so there is no skip table:
+the GROUP BY pushdown over c20k's 20,000 keys, a 2,000-key count and a bitmap scan of ten keys take
+the same time as over the fixed-width segments, within run-to-run noise. A key with several hundred
+sparse pairs takes several segments, eight bytes of header each.
+
+A segment covers the ckey range [ckey, ckey of its last pair]. Invariants: every ckey of a posting set appears
 in at most one item (a regular container or inside one segment); items on a page are ordered by first
 ckey and their ranges do not overlap or interleave; page minckey/maxckey and chain ordering use each
 item's first and last ckey; `lion_item_size()` dispatches on type for containers and segments.
@@ -2864,18 +2906,22 @@ chain machinery maintains and verify() checks against the items it finds); the `
 `array_containers`, `bitset_containers`, `run_containers` and `narrow_containers` (§38) columns of
 lion_index_stats() count only real containers, and `container_bytes` is the bytes of every item, segments included.
 
-Policy. LION_SPARSE_THRESHOLD = 4: a ckey with ≥ 4 members is a regular container (array cost
-12 + 2n beats 6n from n = 4); with ≤ 3 members its pairs live in a segment.
+Policy. LION_SPARSE_THRESHOLD = 4: a ckey with ≥ 4 members is a regular container; with ≤ 3
+members its pairs live in a segment. (The threshold was chosen when a pair took six bytes and an
+ARRAY's 12 + 2n beat 6n from n = 4. At two or three bytes a pair a segment stays the smaller form
+for more members than that, but the threshold also decides what the count cursor and the set
+algebra get as real containers, and it is unchanged by the stream format.)
 - Build: per key, group sorted codes by ckey; dense ckeys emit containers, sparse ckeys append to the
   open segment; a container closes the open segment (ranges must not interleave); a segment also
-  closes at 682 members.
+  closes when a ckey's pairs would take its stream past 255 bytes (`lion_sparse_append()`, which
+  writes the same bytes as an insert of the same pair).
 - Insert: locate the item for the ckey (binary search by first ckey; a segment matches when its range
   covers the ckey or when the ckey falls between two items — then prefer appending to the preceding
   segment if it has room and no container lies between, else the following one, else a new 1-member
   segment). Insert the pair in sorted position. If the ckey's members within the segment reach the
   threshold, extract them into a new regular container item and split the segment around it
-  (left part, container, right part; empty parts vanish). If a segment overflows 682, split it in
-  half. All through lion_chain_put_container-style placement so page splits work unchanged.
+  (left part, container, right part; empty parts vanish). If the pair does not fit the segment's
+  255 bytes, split it in half. All through lion_chain_put_container-style placement so page splits work unchanged.
   Order matters: the threshold test comes FIRST, because promoting a ckey shrinks the segment, so a
   full segment only has to split in half when the pair really stays in it and one insert can never
   produce more than three items. The half-split therefore only happens for a pair that lands inside
@@ -2883,8 +2929,8 @@ Policy. LION_SPARSE_THRESHOLD = 4: a ckey with ≥ 4 members is a regular contai
   beyond the last item simply starts a new segment when the preceding one is full. A full segment
   all of whose pairs share one ckey cannot be split in half; that state is unreachable under the
   policy, and the insert promotes the ckey to a container instead of failing.
-  A key's first TID is a one-pair segment (14 bytes), not a one-member ARRAY container (10): one
-  more byte per singleton key, six instead of ten for every ckey after it.
+  A key's first TID is a one-pair segment (9 to 11 bytes: the header and its lo), not a one-member
+  ARRAY container (10), and every pair after it two or three bytes instead of ten for a container.
   A container built by promoting a ckey out of a segment gets one `lion_container_optimize()` call,
   exactly as the build path does when it closes a container — that is what makes 200 consecutive
   inserts of one key a 14-byte single-run container instead of a 408-byte array.
@@ -2907,13 +2953,12 @@ Policy. LION_SPARSE_THRESHOLD = 4: a ckey with ≥ 4 members is a regular contai
   container"); segment helpers live in `src/lion_sparse.[ch]` with their own standalone unit test
   (test/unit/sparse_test.c, `make unit`). Segments never grow while being filtered, so VACUUM's
   regrow path stays container-only.
-- Damaged segments are handled as §3 handles damaged containers (2026-09-25 review): every function
-  looks at `lion_sparse_npairs()` pairs - the header's count clamped to 682 - and finds `los[]` where
-  that many ckeys end, so a header claiming more never walks it past 4100 bytes, and a mutator
-  rewrites the claim first. The review's case was `lion_sparse_remove_if()`, whose `keep[682]` was
-  indexed by the header's count: VACUUM copies a page item into its work buffer by the line
-  pointer's length, not by the header, so a header claiming 1000 pairs wrote 318 bytes past the
-  array. `lion_sparse_extract()` builds its container with `lion_container_add()` rather than the
+- Damaged segments are handled as §3 handles damaged containers: every function decodes at most
+  the header's flags byte of stream - 255 bytes - and at most `lion_sparse_npairs()` pairs, the
+  header's count clamped to 255, stopping at a truncated or overlong varint, so a header claiming
+  more never walks a reader past 263 bytes, and a mutator rewrites the claim first. VACUUM copies a
+  page item into its work buffer by the line pointer's length, not by the header, which is why the
+  bound is the stream and not the count. `lion_sparse_extract()` builds its container with `lion_container_add()` rather than the
   bulk builder, which is promised ascending, unique members that a damaged segment need not have
   (the same bytes for a well-formed one, and at most three members).
 - And (2026-09-27 review): `lion_sparse_iterate()` and `lion_sparse_remove_if()` hand their callbacks
@@ -2921,7 +2966,7 @@ Policy. LION_SPARSE_THRESHOLD = 4: a ckey with ≥ 4 members is a regular contai
   count cursor, which expands a segment's pairs through the bulk builder, masks them too, while the
   builder itself now checks its promise instead of Assert()ing it (a value out of order or repeated
   is added the slow way). An EMPTY segment is never stored, but a damaged page can hold one, and
-  `lion_item_last_ckey()` read its pair n - 1, 16 GiB past it: it now answers the header ckey, and
+  `lion_item_last_ckey()` read its pair n - 1 far past it: it now answers the header ckey, and
   `lion_sparse_check()`, `lion_inline_fetch()` and `lion_page_item_fetch()` refuse one.
 
 Expected effect: c20k 475 MB → ~125 MB, c1m 337 MB → ~170 MB (GIN: 157 / 199 MB).
@@ -7974,7 +8019,16 @@ payload (redo would have to copy it out, call the library function and copy it
 back) would cut that to a dozen bytes, and it is the obvious next step; it is
 not done here. It is also why generic (173.0 B) is now marginally CHEAPER than
 rmgr (180.5 B) on c20k: a byte diff of a page describes that shift in fewer
-bytes than four-byte range headers do.
+bytes than four-byte range headers do. *(Since format version 9 a segment is a
+stream of delta varints (§13), so the shift is gone without a new operation:
+a pair appended above the last one - every row the heap appended - rewrites
+the header's count and length and adds one varint, two or three bytes, at the
+end of the stream, and the DELTA against the old entry covers those and the
+entry's own counters. On the 5M-row table of §12, 50,000 appended rows, the
+ENTRY record of c20k is 78 bytes a row, against 576 with the two arrays, c1m's
+79 against 88 and skew's lion WAL as a whole 80 against 158. A pair that lands
+in the middle of a segment, a row placed in space VACUUM freed, rewrites the
+stream from there to its end, at most 255 bytes.)*
 
 *Two costs, both small and both real.* The steady-state portfolio insert is
 unchanged to slightly faster in rmgr mode (143 -> 130 ms) - the delta comparison
@@ -17216,7 +17270,8 @@ that the item has the bytes the width sizes before any of them reads it.
   RUN of up to 128 k - 1 runs (a NARROW's bytes or fewer) stay what they are.
   `lion_container_optimize_ext(c, false)` leaves NARROW out, which is what an index of an older
   version gets. The build optimizes every container, so it writes NARROWs; VACUUM's re-optimize of
-  an item it changed allows one only in an index of version 8; inserts make none of anything else:
+  an item it changed allows one only in an index whose build wrote one (version 8, and since version
+  9 the meta page's `LION_META_NARROW`); inserts make none of anything else:
   the promotion of a sparse segment's container key optimizes without NARROW, and an ARRAY that
   reaches 2048 members becomes a BITSET as before.
 - **Widening.** `add()` of a member at an offset of 64 k or more makes the NARROW the narrowest
@@ -17297,8 +17352,14 @@ version 7), and its NARROW is the one above. A build writes it only when it emit
 inserts make none. So an index of version 6 or 7 stays one until it is rebuilt, and stays readable
 by the builds before §38, which refuse 8 with the "not a valid lion index" ERROR and its REINDEX
 hint rather than reading a type 5 item as the damaged item it would be to them. Going back to such
-a build means a REINDEX of the version 8 indexes, under it, first. This build reads 6, 7 and 8, with
-6 never naming summarized columns and 7 always naming one.
+a build means a REINDEX of the version 8 indexes, under it, first.
+
+Version 9 (§13) re-encodes every sparse segment, so a build of it reads no older index, and every
+index it writes is 9. The rule above is kept, as a flag instead of a number: the build sets
+`LION_META_NARROW` in `order_flags` when it wrote a NARROW (`lion_meta_record_narrow()`), VACUUM
+makes NARROWs only in an index that has it (`LION_META_ALLOWS_NARROW()`), inserts make none, and
+`lion_index_verify()` reports a NARROW in an index without it, as it reported one in a version 6 or
+7 index.
 
 The first version's NARROWs had flags 0 and two words a block; this build reads flags 0 as no width
 it has, and refuses the item as above. No build of the first version was released, so nothing
@@ -17363,10 +17424,11 @@ bits a row became NARROW(2)s at 4.65, against GIN's 8.91) stands: those are NARR
 ### Not done
 
 - **Inserts make no NARROW of anything else** (they only widen one). A full ARRAY still becomes a
-  BITSET, and an index that grows by inserts keeps its BITSETs until VACUUM changes the item - in a
-  version 8 index - or a REINDEX: an insert never pays for a re-optimize. An index built on an
-  empty table is version 6 and stays so.
-- **A version 6 or 7 index gets no NARROW without a REINDEX**, even where VACUUM could make one.
+  BITSET, and an index that grows by inserts keeps its BITSETs until VACUUM changes the item - in an
+  index whose build wrote a NARROW - or a REINDEX: an insert never pays for a re-optimize. An index
+  built on an empty table records no NARROW and stays so.
+- **An index whose build wrote no NARROW gets none without a REINDEX**, even where VACUUM could make
+  one.
 - **VACUUM narrows only the items it changed.** A NARROW whose widest members are deleted narrows
   when VACUUM takes them out, since it re-optimizes the item it rewrites; nothing narrows an item
   VACUUM has no dead rows in.
@@ -17377,7 +17439,7 @@ bits a row became NARROW(2)s at 4.65, against GIN's 8.91) stands: those are NARR
   BITSET WHERE as it is now runs only for a WHERE that is a BITSET, which an optimized one never
   is at 8K.
 - **No switch**: a build always makes NARROWs where they are smallest; there is no reloption or
-  setting to build a version 6 index for an older build to read.
+  setting to build an index without them.
 
 ### Tests
 
@@ -17396,11 +17458,11 @@ counts, GROUP BY, IN lists and `<>` over columns of several widths in one query,
 scans, `lion_index_count()` and the count pushdown, every answer against a sequential scan; a
 table whose keys hold one band of offsets each, so that one index has NARROWs of four widths;
 inserts within a width, past it (UPDATEs that widen a NARROW from 1 to 4 a width at a time) and
-into new keys; DELETE and VACUUM that narrow back, make an ARRAY, and leave a version 6 index's
-BITSETs alone until a REINDEX; summaries, whose items widen and narrow back the same way; and
+into new keys; DELETE and VACUUM that narrow back, make an ARRAY, and leave the BITSETs of an index
+whose build wrote no NARROW alone until a REINDEX; summaries, whose items widen and narrow back the same way; and
 `lion_index_verify()` throughout. `test/sql/bitset.sql` runs one set of queries over a table of
-136 rows a page (NARROW(3)), one of 226 (NARROW(4)) and a version 6 index of the same rows that
-inserts filled, whose dense containers are BITSETs: AND, OR, `<>`, GROUP BY, bitmap and plain
+136 rows a page (NARROW(3)), one of 226 (NARROW(4)) and an index without NARROWs of the same rows
+that inserts filled, whose dense containers are BITSETs: AND, OR, `<>`, GROUP BY, bitmap and plain
 scans, inserts that the bitmaps take in place and that grow ARRAYs into BITSETs, and an UPDATE, a
 DELETE and a VACUUM that shrink them. `test/sql/corrupt_items.sql` §7 writes widths 0, 6 and 2
 into a NARROW of width 1: readers refuse 0 and 6, verify() reports them, and width 2, which the
@@ -17422,7 +17484,7 @@ splits, since a dense set is NARROWs of a few to a leaf that an insert within th
 grow: `count_split_race.spec`, `verify_concurrent.spec`'s `vp` and the split case of
 `test/recovery/run.sh`'s phase 3 create their index before the rows, so that the inserts make it, of
 ARRAYs and BITSETs as before, and `posting_split_repair.spec` spreads the rows that were one dense
-key over 97 keys of small ARRAYs, so that its index stays version 6 and VACUUM's filtering still
+key over 97 keys of small ARRAYs, so that its build writes no NARROW and VACUUM's filtering still
 grows a RUN into an ARRAY larger than the leaf's spare bytes, where it would make a NARROW of width
 4 that fits them. The other expected changes follow from smaller containers and change no answer: a
 switch to the empty copy one key later (`fkjoin_switch.sql`), a range summed from its complement
