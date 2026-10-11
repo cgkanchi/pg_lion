@@ -46,8 +46,8 @@
  * This header is private to the count engine, the files lion_count.h
  * declares the interface of: lion_set.c, lion_set_copy.c, lion_cursor.c,
  * lion_expr.c, lion_vis.c, lion_count.c, lion_count_groups.c,
- * lion_count_shared.c, lion_rangesrc.c, lion_range.c and
- * lion_count_sql.c.  What they share and nothing else needs is declared
+ * lion_count_shared.c, lion_rangesrc.c, lion_range.c, lion_count_sql.c
+ * and lion_facets.c.  What they share and nothing else needs is declared
  * here.
  *
  *-------------------------------------------------------------------------
@@ -1312,5 +1312,42 @@ lion_mat_container(LionCountCtx *cx, const LionMatSet *mat, int i,
 	cx->stats.copy_file_reads++;
 	return buf;
 }
+
+/* ---------------------------------------------------------------------
+ * The SQL-callable counts (lion_count_sql.c), and lion_index_facets()
+ * (lion_facets.c), which opens its index the same way
+ * --------------------------------------------------------------------- */
+
+/*
+ * The indexes, keys and table of one SQL count, opened and vetted by
+ * lion_count_open_indexes() and closed by lion_count_sql_close().
+ */
+typedef struct LionCountCall
+{
+	int			nkeys;
+	Relation	heap;
+	Relation	index[2];
+	Datum		key[2];
+	Oid			keytype[2];
+} LionCountCall;
+
+/*
+ * Open and vet the nidx indexes idxoid[] of one SQL count: relkind, access
+ * method, key type, collation, privileges, EXECUTE on what the query the
+ * count stands for calls, row-level security and snapshot eligibility.
+ * multikey_ok lets key column wantcol be a multi-key one (lion_facets.c);
+ * every count of column values refuses it.
+ */
+extern void lion_count_open_indexes(Snapshot snapshot, int nidx,
+									const Oid *idxoid, const Oid *keytype,
+									const Oid *keycoll, AttrNumber wantcol,
+									bool multikey_ok, LionCountCall *call);
+extern void lion_count_sql_close(LionCountCall *call);
+
+/*
+ * EXECUTE on every function an expression calls, as the executor asks it
+ * (lion_check_execute()): an expression_tree_walker() callback, context NULL.
+ */
+extern bool lion_check_functions_walker(Node *node, void *context);
 
 #endif							/* LION_COUNT_INT_H */

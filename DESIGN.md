@@ -858,7 +858,7 @@ int2, int4, int8, oid, bool, "char", text, varchar (via text), bpchar, bytea, uu
 timestamp, timestamptz, interval, numeric, float4, float8, macaddr, inet, name, jsonb, enum types
 via anyenum (hashenum). Strategy 1 operator = the type's `=`.
 
-## 7. SQL functions (`lion_funcs.c`, `lion_verify*.c`, `lion_count_sql.c`)
+## 7. SQL functions (`lion_funcs.c`, `lion_verify*.c`, `lion_count_sql.c`, `lion_facets.c`)
 
     lion_index_stats(regclass, OUT attno int2, OUT directory_height int, OUT leaf_pages bigint,
         OUT internal_pages bigint, OUT ordered bool, OUT entries bigint,
@@ -1179,6 +1179,125 @@ reported as damage or would have; `verify.sql`'s sixth damage case is real damag
 recheck can tell from one of them. verify() says at DEBUG1 what writers cost it: candidates, waits,
 left links and root flags settled on the spot, and posting-set walks made, thrown away and held.
 
+### Facet counts (`lion_facets.c`)
+
+    lion_index_facets(idx regclass, k integer DEFAULT NULL, filter text DEFAULT NULL,
+                      attno int2 DEFAULT 1, OUT key text, OUT count bigint) RETURNS SETOF record
+
+A search page shows, beside its results, how many of them carry each tag, lexeme or category: a
+GROUP BY of the matching rows' keys, ordered by its count and cut at k. For a multi-key column the
+query is `FROM t, unnest(col) e ... GROUP BY e`, which reads and unnests every matching row; the
+index already holds each key's rows as a posting set, and the count engine (§9) counts a set
+against the snapshot without reading the rows. The count functions refuse a multi-key column (an
+entry's key is not a column value, so `col = key` is not what they would count); this one is
+written for it, and takes a scalar column too.
+
+**What it counts.** A key's count is the rows the snapshot sees whose value holds the key, under
+the filter: `count(DISTINCT ctid)` over `unnest(col)`, `ts_stat()`'s `ndoc`, or `GROUP BY col` with
+its NULL group for a scalar column. ROWS, not occurrences: the index files a row once per distinct
+key of its value (§17), so a `count(*)` over `unnest()` of arrays that repeat an element is not
+what it answers, and that query is not a shape the planner could hand it unless the elements are
+known to be distinct. NULL elements, NULL and empty values are under no key; the reserved NULL and
+EMPTY entries, and the length key of a column that stores positions (§17, "Ranking"), are not
+walked. The keys come out by count descending and then in the order the index keeps them in (the
+directory's order for an ordered column, byte order otherwise), and every key tied with the k-th
+is counted, so the cut is deterministic and equals `ORDER BY count DESC, key LIMIT k` wherever the
+key's order is the column's.
+
+**The filter** is text, parsed as `SELECT WHERE <filter>` (anything but a lone WHERE condition is
+refused) and analysed against the index's table as a query's WHERE is: names resolved,
+operators chosen, constants folded. It is then taken apart into posting sets
+(`lion_facets_filter_tree()`): AND and OR, a constant, `col IS NULL`, and an operator or
+`= ANY (array)` with a Var on one side (commuted when it is on the right) and a value on the other.
+Each atom is answered by the first valid, non-partial Lion index with the column as a key column
+whose operator family holds the operator - equality for a scalar column, a multi-key search
+strategy for a multi-key one - under the clause's collation, through `lion_scankey_sets()`, the
+locate the scans use. An atom it cannot answer exactly - a range, `<>`, NOT, IS NOT NULL, a lossy
+or ALL search (a tsquery phrase, weight or negation, jsonpath, `<@`, an empty containment), a
+column no Lion index keys, a value that reads the table, a volatile value, a sublink - is an
+ERROR that deparses the condition. It is never evaluated against the rows: a function whose cost
+depends on whether its filter happened to be indexable would hide a scan of the table behind a
+call that looks like an index read. The values are evaluated once, before anything is read.
+
+**The reader contract** (§9, "Direct readers"). `lion_count_open_indexes()` opens the faceted
+index, with a flag that admits a multi-key column for this caller only (its EXECUTE check is then
+on the element type's equality, the function `GROUP BY e` would call), and every index the filter
+uses goes through `lion_reader_vet()`: row-level security, an unpopulated materialized view, an
+index the snapshot may not use, the PostgreSQL 16 `old_snapshot_threshold` guard and the
+SERIALIZABLE predicate lock. The filter's columns need SELECT and its operators' functions EXECUTE
+(`lion_check_functions_walker()`), as the query's would. `reader_contracts.sql`,
+`reader_checkxmin.spec` and `reader_serializable.spec` list both forms, filtered and not.
+
+**Counting.** The filter's sets are collected ONCE into a pinless copy (`lion_sources_collect()`,
+spilling past `hash_mem`), as the GROUP BY pushdown does with its WHERE (§10, "The WHERE sets,
+collected once"); a filter with no row returns nothing. Each key's set is then located and ANDed
+with the copy, a batch of keys at a time (`lion_count_groups_copy()`), and counted against the
+visibility map and the heap under the caller's snapshot (`lion_count_sources_cached()`): the same
+engine, so the same exactness argument as every count. With no filter each key's set is counted
+alone. A key with no visible row under the filter has no row in the output.
+
+**The top k** is §36's walk, with the strict stop rule: the candidates with the largest `ntids`
+are counted largest bound first until the k-th count is LARGER than the next bound (equal is not
+enough, since a key tied with the k-th could come before it in key order), and when they run out
+short of that, the column is walked again counting every key whose bound is not below the k-th
+count so far. The number of candidates is §36's 2k/s, s the share of the table's rows the
+filter's copy holds.
+
+**A selective filter** is cheaper answered from its rows: when the copy holds fewer rows than
+`LION_FACET_KEY_ROWS` (5) times the keys that would have to be counted - the candidates whose
+bound reaches s times the k-th candidate's bound, or every key without a k - each TID of the copy
+is fetched under the snapshot (`table_index_fetch_tuple()`, which follows a HOT chain to its
+visible member), its value's keys extracted by the opclass (`lion_extract_value()`), and counted in
+a hash table under the column's own equality. The same rows, so the same counts: a TID is in the
+filter's sets only if the version it leads to was filed under the filter's keys, and a HOT chain's
+members share their indexed values. Only for a plain column of a non-partial index: an expression
+would have to be evaluated, and a partial index's rows are not all of the filter's. 5 is the ratio
+of a key counted in a batch (some 5 µs) to a row fetched and taken apart (some 1 µs), measured on
+the table below.
+
+DEBUG1 reports each call: entries read, keys counted, whether the column was walked whole, rows
+read from the heap.
+
+**A planner shape** would let `SELECT e, count(*) FROM t, unnest(t.col) e WHERE ... GROUP BY e
+ORDER BY 2 DESC LIMIT k` reach this code without the function. It would need: recognising the
+lateral function RTE `unnest(col)` (or `ts_stat()`, which is a function over a query string and
+cannot be) joined to one base relation with nothing else in the join tree; mapping `col` to a lion
+index whose multi-key key column it is; the WHERE classified into posting sets as §10 does,
+declining whatever is left over; and proving the count's semantics - `count(DISTINCT t.ctid)` or a
+key unique per row (a `tsvector`, whose lexemes are distinct; an array only under a constraint
+that says its elements are) - since `count(*)` counts repeated elements and the index cannot. The
+grouped rel's top k is then §36's (`lion_count_path_topk()`), with the keys the node's output in
+place of a column's values. The function exists first because the shape is narrow and the
+duplicate rule makes the obvious query the wrong one for arrays.
+
+**Measured** on a synthetic 500,000-row table (three tags drawn from pools of 20, 200 and 2,000,
+some repeated; five-lexeme tsvectors; 20 groups; lion indexes on the tags, the tsvector and the
+group; all-visible), PostgreSQL 18, warm cache, 4 shared CPUs:
+
+| facets | the query, ms | `lion_index_facets()`, ms | keys counted |
+| --- | --- | --- | --- |
+| top 10 tags | 560-585 | 0.9-1.4 | 10 of 2,000 |
+| top 10 tags, `grp = 3` | 37-40 | 5-6 | 200 |
+| top 10 lexemes, `grp = 3` (`ts_stat()`) | 40-44 | 7 | 202 of 12,002 |
+| top 10 tags, `tsv @@ 'w7 \| w42'` (29,573 rows) | 45-46 | 5-6 | 200 |
+| top 10 tags, `tsv @@ 'w7 & w42'` (133 rows) | 1.3 | 1.6 | none: 133 rows read |
+| every tag | 545 | 18 | 2,000 |
+
+The queries are `count(*)` over `unnest(tags)` and `ts_stat()`, as the planner runs them (the
+filtered ones find their rows through the lion indexes); they count occurrences, not rows, which
+is where the table's repeated tags make their answers differ. The first call after a restart is
+2-3 times slower. With a k the counting stops
+at the first 10 keys unfiltered and at 200 under a filter keeping 5%: what is left is the walk of
+the column's headers and the collection of the filter's sets.
+
+**Tests**: `test/sql/facets.sql` checks every answer against the query it stands for, in order,
+for 21 filters, five k and seven indexes (array, tsvector storing positions, int[], scalar, jsonb,
+an expression and a partial index, so both the key and the heap path answer), on the fresh table,
+after deletes, indexed and HOT updates and inserts without VACUUM, and after VACUUM; with NULL and
+empty values, NULL and repeated elements, the transaction's own changes and a rollback; and the
+errors, a multicolumn index and the privileges. `test/isolation/facets_snapshot.spec` compares it
+with the reference query under one snapshot while another session writes, commits and rolls back.
+
 ## 8. Module ownership
 
     src/lion_tid.h            TID ↔ code helpers                          (fixed; written by the architect)
@@ -1200,7 +1319,8 @@ left links and root flags settled on the spot, and posting-set walks made, throw
     src/lion_count.c          the count engine (§9) - since split into lion_set.c, lion_set_copy.c,
                               lion_cursor.c, lion_expr.c, lion_vis.c, lion_count.c,
                               lion_count_groups.c, lion_count_shared.c, lion_rangesrc.c,
-                              lion_range.c and lion_count_sql.c, which lion_count_int.h joins
+                              lion_range.c, lion_count_sql.c and lion_facets.c, which
+                              lion_count_int.h joins
     src/lion_customscan.c     the LionCount custom scan (§10) - since split into its planner half,
                               lion_plan_*.c, and its executor half, lion_exec_*.c, which
                               lion_customscan.h joins
@@ -1563,7 +1683,8 @@ for) depend on what the call stands for and stay with the caller (`lion_count_op
 
 The ranking functions first opened their index on their own and missed three of these. So the
 contract is now tested across every reader rather than per feature: `test/sql/reader_contracts.sql`
-(row-level security, an unpopulated materialized view) and the
+(row-level security, an unpopulated materialized view, EXECUTE revoked on a key type's equality,
+an index that is not valid) and the
 `reader_checkxmin` and `reader_serializable` specs each list every reader. A new reader adds a line
 to each.
 
@@ -16999,6 +17120,19 @@ expressions again - and the order of the entries is not claimed as the query's. 
 expression is computed for the groups that come out, so an error only another group's key would
 raise (`ClientIP + 1` at the type's maximum) is not raised; the ordinary plan computes it for
 every row.
+
+### The keys of a multi-key column (`lion_index_facets()`, §7)
+
+The bound holds for a multi-key column's entries as for a scalar one's: a row is filed under each
+distinct key of its value, once, so the TIDs of an entry are at least the visible rows whose value
+holds its key, under any filter. `lion_index_facets()` takes the walk above to such a column, where
+the planner has no grouped rel to offer it (§7, "Facet counts"): the candidates with the largest
+`ntids`, counted largest bound first in batches against the filter's collected copy, then a walk
+of the whole column when they run out. It always stops on the strict rule - the k-th count LARGER
+than the next bound - because its output is ordered by count and then key, so a key tied with the
+k-th may precede it and must be counted. The reserved NULL and EMPTY entries and a positions
+column's length key are not candidates. When the filter's copy is small next to the keys there
+are to count, the facets are read from its rows instead and the walk is not made.
 
 ### Measured (ClickBench, 5% sample, PostgreSQL 18 release build, warm)
 

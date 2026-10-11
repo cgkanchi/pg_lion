@@ -657,6 +657,37 @@ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
 COMMENT ON FUNCTION lion_index_count_group_stats(regclass, boolean, int2) IS
 	'count every key of one key column of a lion index, as the GROUP BY pushdown does, and report the heap visits';
 
+/*
+ * Facet counts (lion_facets.c, DESIGN.md §7 "Facet counts"): the k keys of
+ * one key column with the most rows the snapshot sees - every key with a row
+ * when k is NULL - largest count first, ties in the key's order.  For a
+ * multi-key column a key is an element (a tag, a lexeme, a jsonb path key)
+ * and its count the rows whose value holds it, which is
+ *
+ *   SELECT e, count(DISTINCT ctid) FROM t, unnest(col) e
+ *    WHERE <filter> AND e IS NOT NULL GROUP BY e ORDER BY 2 DESC, e LIMIT k
+ *
+ * and for a scalar column `GROUP BY col`, its NULL group included.  filter
+ * is a WHERE clause over the table made only of what lion indexes answer
+ * exactly from their posting sets: AND and OR of `col = value`, `col = ANY
+ * (array)`, `col IS NULL`, and the operators of multi-key lion indexes;
+ * anything else is an error, never a scan.  The counts are exact, as the
+ * count functions' are; each entry's TID count is only the bound the top k is
+ * pruned with.
+ */
+CREATE FUNCTION lion_index_facets(idx regclass,
+								  k integer DEFAULT NULL,
+								  filter text DEFAULT NULL,
+								  attno int2 DEFAULT 1,
+								  OUT key text,
+								  OUT count bigint)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'lion_index_facets'
+LANGUAGE C CALLED ON NULL INPUT VOLATILE PARALLEL UNSAFE ROWS 10;
+
+COMMENT ON FUNCTION lion_index_facets(regclass, integer, text, int2) IS
+	'the keys of a lion index column with the most visible rows under a filter of lion-indexed conditions, counted exactly';
+
 /* ---------------------------------------------------------------------
  * aggregates of the FK-side join (lion_customscan.c, DESIGN.md §27,
  * "Every aggregate over the node's rows")
