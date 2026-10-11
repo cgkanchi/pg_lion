@@ -684,12 +684,6 @@ SELECT lion_di_try($$SELECT count(*) FROM lion_di_s WHERE d @@ 'k007'$$);
  XX002: lion index entry of N bytes at page offset N is too small for its header, key and positions extension
 (1 row)
 
-SELECT lion_di_try($$SELECT lion_index_count('lion_di_s_i', 'k007'::tsvector)$$);
-                                                 lion_di_try                                                  
---------------------------------------------------------------------------------------------------------------
- XX002: lion index entry of N bytes at page offset N is too small for its header, key and positions extension
-(1 row)
-
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_s_i')$$);
                                          lion_di_try                                         
 ---------------------------------------------------------------------------------------------

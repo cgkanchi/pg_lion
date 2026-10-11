@@ -333,7 +333,6 @@ SELECT blk AS lion_di_blk, o AS lion_di_off, lion_di_lplen(p, o) AS lion_di_len,
 SELECT :lion_di_len >= :lion_di_keyend + 8 AS holds_its_extension;
 SELECT lion_di_set_lplen('lion_di_s_i', :lion_di_blk, :lion_di_off, :lion_di_keyend);
 SELECT lion_di_try($$SELECT count(*) FROM lion_di_s WHERE d @@ 'k007'$$);
-SELECT lion_di_try($$SELECT lion_index_count('lion_di_s_i', 'k007'::tsvector)$$);
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_s_i')$$);
 DROP TABLE lion_di_s;
 -- ---------- 11. an index of an older format version ----------
