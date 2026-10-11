@@ -618,6 +618,7 @@ lion_entry_scan_init(LionEntryScan *es, Relation index, AttrNumber attno)
 	es->lastinline = -1;
 	es->batchblk = InvalidBlockNumber;
 	es->batchbuf = InvalidBuffer;
+	es->sharepin = false;
 	es->nleaves = 0;
 }
 
@@ -1447,6 +1448,12 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 
 	while (es->nextbatch >= es->nbatch)
 	{
+		/* the sets of the batch before have all been released (see below) */
+		if (es->sharepin && BufferIsValid(es->batchbuf))
+		{
+			ReleaseBuffer(es->batchbuf);
+			es->batchbuf = InvalidBuffer;
+		}
 		/* a phase that has ended hands over at the next read (§32) */
 		if (es->done ||
 			(!BlockNumberIsValid(es->blkno) && es->nextphase == es->phase))
@@ -1484,7 +1491,9 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 		 * scan's pin over.
 		 */
 		Assert(BufferIsValid(es->batchbuf));
-		if (i == es->lastinline)
+		if (es->sharepin)
+			ps->pinbuf = InvalidBuffer; /* the scan's pin covers it */
+		else if (i == es->lastinline)
 		{
 			ps->pinbuf = es->batchbuf;
 			es->batchbuf = InvalidBuffer;
@@ -1497,6 +1506,23 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 	}
 
 	return true;
+}
+
+/*
+ * For a caller that takes a whole batch - lion_entry_scan_next() until
+ * lion_entry_scan_batch_left() says 0 - and releases every set of it before
+ * it asks for the next entry: the sums of lion_exec_count.c.  The scan then
+ * keeps ONE pin on the leaf for all of the batch's INLINE copies, which is
+ * what DESIGN.md §9 asks of each, and drops it when it reads the next leaf,
+ * instead of handing each copy a pin of its own.  A leaf holds a few hundred
+ * entries, and as many pins of one buffer cost the resource owner a search
+ * each when they are let go of.
+ */
+void
+lion_entry_scan_share_pin(LionEntryScan *es)
+{
+	Assert(es->nextbatch == 0 && es->nbatch == 0);
+	es->sharepin = true;
 }
 
 /*
