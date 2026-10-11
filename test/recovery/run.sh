@@ -23,7 +23,7 @@
 #              Phase 2 then expects the standby to TRUST the visibility map,
 #              which is the property §25 buys.
 #   --phases   which phases to run, e.g. "3" or "2 3" (default: all of
-#              "1 1b 1c 1d 1e 1f 2 3 4").  For development, and for a server
+#              "1 1b 1c 1d 1e 1f 1g 2 3 4").  For development, and for a server
 #              without injection points, which can run only "1 1f 2 4" (CI's
 #              packaged-server jobs do); `make recovery-check` always runs
 #              everything.
@@ -57,7 +57,7 @@
 #                     the installed one is reported, since the installed one
 #                     is what gets tested.
 #   INJECTION_POINTS=1
-#                     phases 1b-1e and 3 park a backend on an injection point
+#                     phases 1b-1e, 1g and 3 park a backend on an injection point
 #                     and are skipped, with a line in the summary, on a server
 #                     without the injection_points extension.  With this set
 #                     (as CI's source jobs set it) that is a failure instead:
@@ -124,7 +124,7 @@ REQUIRE_INJECTION=${INJECTION_POINTS:-0}
 ITERS=8
 KEEP=0
 MODE=generic
-PHASES="1 1b 1c 1d 1e 1f 2 3 4"
+PHASES="1 1b 1c 1d 1e 1f 1g 2 3 4"
 EXTRA_CONF=()
 
 # Set by make_private_dirs(), which the main section calls once the arguments
@@ -1008,20 +1008,25 @@ phase1d() {
 	psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1 ||
 		{ no_injection_points "phase 1d" "phase1d            skipped (no injection points)"; return 0; }
 
-	# Two keys taking alternate TIDs, so each container key is a dense bitset
-	# and fills a leaf by itself: the set is a tree after a few thousand rows.
+	# Two keys taking alternate TIDs of wide rows, about 75 to a heap page, so
+	# each container key is a dense bitset that fills a leaf by itself, and
+	# each set has more than the 16 leaves a set without an internal level
+	# may have (DESIGN.md §22): a tree, whose leaf splits take two records.
 	# The index is created EMPTY, so every split really happens in aminsert.
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1d: fixture failed"
 		SET synchronous_commit = on;
 		DROP TABLE IF EXISTS lion_psplit;
-		CREATE TABLE lion_psplit (id int, k int NOT NULL);
+		CREATE TABLE lion_psplit (id int, k int NOT NULL,
+								  pad char(80) NOT NULL DEFAULT 'x');
 		CREATE INDEX lion_psplit_k ON lion_psplit USING lion (k);
-		INSERT INTO lion_psplit SELECT i, i % 2 FROM generate_series(1, 60000) i;
+		INSERT INTO lion_psplit SELECT i, i % 2 FROM generate_series(1, 90000) i;
 	SQL
 	psql_p -c "VACUUM (ANALYZE) lion_psplit" >>"$RUNLOG" 2>&1
 	before=$(psql_p -tAc "select container_pages from lion_index_stats('lion_psplit_k')")
 	[ "${before:-0}" -gt 2 ] ||
 		die "phase 1d: the fixture did not split a posting page at all"
+	[ "$(psql_p -tAc "select max_posting_height from lion_index_stats('lion_psplit_k')")" = 1 ] ||
+		die "phase 1d: the fixture's posting sets are not trees"
 
 	psql_p -c "SELECT injection_points_attach('lion-posting-split-incomplete', 'wait')" \
 		>>"$RUNLOG" 2>&1 || die "phase 1d: could not attach the injection point"
@@ -1151,8 +1156,11 @@ phase1d() {
 # A crash in the middle of a MULTI-LEAF INLINE spill (DESIGN.md §18, "The
 # spill").  VACUUM's filtering turns one key's INLINE payload - eleven RUN
 # containers over 150,000 clustered rows - into ten BITSETs, which need a leaf
-# each; the spill writes a record per leaf and dies before its last record,
-# the root together with the rewritten entry.  Then:
+# each: a set of no more than 16 leaves, which has no internal level and whose
+# first leaf is its head (DESIGN.md §22).  The spill logs the head first, as
+# an internal page with no downlink, writes a record per other leaf, and dies
+# before its last record: the head, made the first leaf, together with the
+# rewritten entry.  Then:
 #
 #  * replay brings the leaves back and the entry stays INLINE with every TID
 #    it had, the dead ones included: nothing is lost and nothing is half-CHAIN;
@@ -1161,8 +1169,8 @@ phase1d() {
 #    leaves, which are FULL - the sweep used to free only empty unreferenced
 #    leaves, so these stayed leaked for good.  Its VERBOSE page counts
 #    (DESIGN.md §18, "Page counts") are checked here, where a shell can read
-#    them: the ten orphans and the root their spill logged before them (with
-#    no downlink yet) newly deleted, and never counted twice;
+#    them: the nine orphans and the head their spill logged before them (with
+#    no downlink) newly deleted, and never counted twice;
 #  * and a second crash replays that VACUUM, the whole multi-leaf spill
 #    included (under wal_consistency_checking when --conf asks for it).
 #
@@ -1171,7 +1179,7 @@ phase1d() {
 phase1e() {
 	local off parked warn ev
 	log ""
-	log "=== phase 1e: a crash between a spill's leaves and its root ==="
+	log "=== phase 1e: a crash between a spill's leaves and its head ==="
 
 	psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1 ||
 		{ no_injection_points "phase 1e" "phase1e            skipped (no injection points)"; return 0; }
@@ -1197,7 +1205,7 @@ phase1e() {
 
 	wait_true psql_p \
 		"select count(*) > 0 from pg_stat_activity where wait_event = 'lion-spill-leaves-written'" \
-		60 "the VACUUM to park between the spill's leaves and its root"
+		60 "the VACUUM to park between the spill's leaves and its head"
 
 	# The leaf records are inserted and not flushed: ambulkdelete's records
 	# belong to no transaction.  A COMMIT from another session flushes the
@@ -1222,15 +1230,16 @@ phase1e() {
 	warn=$(psql_p -c "SELECT lion_index_verify('lion_mspill_k', true)" 2>&1 >>"$RUNLOG" |
 		grep -c 'unused and unreachable' || true)
 	[ "$warn" -ge 10 ] ||
-		die "phase 1e: $warn unreachable page(s) after the crash, expected the ten orphan leaves and their root"
+		die "phase 1e: $warn unreachable page(s) after the crash, expected the nine orphan leaves and their head"
 	run_check "phase 1e post-crash" psql_p \
 		"select inline_entries = 1 and ntids = 150000,
 				format('the entry is still INLINE with every TID (%s entries INLINE, ntids %s)',
 					   inline_entries, ntids)
 		   from lion_index_stats('lion_mspill_k')
 		 union all
-		 select container_pages = 10,
-				format('the ten leaves came back unreferenced (%s container pages)', container_pages)
+		 select container_pages = 9 and posting_internal_pages = 1,
+				format('the nine leaves and their head came back unreferenced (%s container pages, %s internal)',
+					   container_pages, posting_internal_pages)
 		   from lion_index_stats('lion_mspill_k')
 		 union all
 		 select lion_index_count('lion_mspill_k', 0) = 135000,
@@ -1240,15 +1249,15 @@ phase1e() {
 		>>"$RUNLOG" 2>&1 || true
 
 	# The next VACUUM spills the set and sweeps the orphans away, and says so:
-	# the ten orphans and their root - logged first, as an internal page with
+	# the nine orphans and their head - logged first, as an internal page with
 	# no downlink, so that its block is never handed out again (DESIGN.md
 	# §18) - are what it newly deleted, and they are not reusable yet.  Any
 	# other free page is all-zero and reusable, so the two differences agree
 	# exactly unless a page is counted twice or a fresh one is called
 	# reusable.
 	vacuum_page_counts "phase 1e" lion_mspill lion_mspill_k
-	[ "$NEWLY" = 11 ] ||
-		die "phase 1e: VACUUM reported $NEWLY pages newly deleted, expected the ten orphan leaves and their root"
+	[ "$NEWLY" = 10 ] ||
+		die "phase 1e: VACUUM reported $NEWLY pages newly deleted, expected the nine orphan leaves and their head"
 	[ "$((CURRENT - NEWLY))" = "$REUSABLE" ] ||
 		die "phase 1e: VACUUM reported $CURRENT pages currently deleted and $REUSABLE reusable for $NEWLY newly deleted"
 
@@ -1257,18 +1266,18 @@ phase1e() {
 	[ "$warn" -le 1 ] ||
 		die "phase 1e: $warn page(s) are still leaked after the sweep"
 	run_check "phase 1e swept" psql_p \
-		"select inline_entries = 0 and posting_internal_pages = 1 and container_pages = 10,
+		"select inline_entries = 0 and posting_internal_pages = 0 and container_pages = 10,
 				format('spilled: %s INLINE, %s internal, %s leaves',
 					   inline_entries, posting_internal_pages, container_pages)
 		   from lion_index_stats('lion_mspill_k')
 		 union all
-		 select deleted_pages = 11, format('%s DELETED pages, the ten orphans and their root', deleted_pages)
+		 select deleted_pages = 10, format('%s DELETED pages, the nine orphans and their head', deleted_pages)
 		   from lion_index_stats('lion_mspill_k')
 		 union all
 		 select ntids = (select count(*) from lion_mspill), 'ntids agrees with the heap'
 		   from lion_index_stats('lion_mspill_k')"
 
-	# Replay that VACUUM too: the leaves, the root with the entry, the sweep.
+	# Replay that VACUUM too: the leaves, the head with the entry, the sweep.
 	off=$(stat -c %s "$PRIMARY_LOG")
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL
 		SET synchronous_commit = on;
@@ -1291,7 +1300,7 @@ phase1e() {
 
 	psql_p -c "DROP TABLE lion_mspill, lion_mspill_flush" >>"$RUNLOG" 2>&1
 
-	log "phase 1e: the crash left the entry INLINE and ten orphan leaves; the next VACUUM spilled it and freed them"
+	log "phase 1e: the crash left the entry INLINE and nine orphan leaves; the next VACUUM spilled it and freed them"
 	SUMMARY+=("phase1e            crash inside a 10-leaf spill; nothing lost, orphans swept")
 }
 
@@ -1417,6 +1426,160 @@ phase1f() {
 	log "phase 1f: no record of an unregistered manager in $before..$after, and recovery went through it"
 	SUMMARY+=("phase1f            VACUUM without the manager wrote nothing it could not replay")
 	SUMMARY+=("phase1f            an unlogged rmgr-mode index was written without the manager")
+}
+
+# ------------------------------------------------------------- phase 1g
+
+# A crash between a PROMOTION and the split that needed it (DESIGN.md §22, "A
+# small set has no internal level").  A posting set of up to 16 leaves is a
+# chain under its head, with no level above; the split that would make a 17th
+# leaf first pushes the head down under a new root that links every leaf -
+# one record - and then splits the leaf as a leaf of the tree, in records of
+# its own.  The insert parks in between, on an append to the last leaf, and
+# the server dies.  Then:
+#
+#  * the promotion came back: the head is an internal page over every leaf,
+#    nothing is flagged, verify() is clean and both keys answer exactly;
+#  * the next inserts split the full last leaf as a tree's, and post its
+#    downlink in the root the promotion made;
+#  * and a second crash replays all of it (under wal_consistency_checking
+#    when --conf asks for it).
+#
+# The crash point is deterministic: an injection point parks the inserting
+# backend after the promotion's record and the server is pulled out from
+# under it.
+phase1g() {
+	local off parked warn ev
+	log ""
+	log "=== phase 1g: a crash between a posting set's promotion and its split ==="
+
+	psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1 ||
+		{ no_injection_points "phase 1g" "phase1g            skipped (no injection points)"; return 0; }
+
+	# Two keys on alternate wide rows, about 75 to a heap page, so that each
+	# container key is a dense bitset filling a leaf by itself: 60000 rows
+	# give each key 14 leaves and no internal level.  The index is created
+	# EMPTY, so every split happens in aminsert.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1g: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS lion_promo;
+		CREATE TABLE lion_promo (id int, k int NOT NULL,
+								 pad char(80) NOT NULL DEFAULT 'x');
+		CREATE INDEX lion_promo_k ON lion_promo USING lion (k);
+		INSERT INTO lion_promo SELECT i, i % 2 FROM generate_series(1, 60000) i;
+	SQL
+	[ "$(psql_p -tAc "select max_posting_height || '/' || posting_internal_pages from lion_index_stats('lion_promo_k')")" = "0/0" ] ||
+		die "phase 1g: the fixture's posting sets are not without an internal level"
+
+	psql_p -c "SELECT injection_points_attach('lion-posting-promoted', 'wait')" \
+		>>"$RUNLOG" 2>&1 || die "phase 1g: could not attach the injection point"
+
+	off=$(stat -c %s "$PRIMARY_LOG")
+	"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres -d "$DBNAME" \
+		-c "SET synchronous_commit = on;
+		    INSERT INTO lion_promo SELECT 100000 + i, i % 2
+		      FROM generate_series(1, 20000) i" >>"$RUNLOG" 2>&1 &
+	parked=$!
+
+	wait_true psql_p \
+		"select count(*) > 0 from pg_stat_activity where wait_event = 'lion-posting-promoted'" \
+		60 "an insert to park between the promotion and the split"
+
+	# Flush the promotion's record with a COMMIT from another session, as
+	# phase 1d does, and not with a CHECKPOINT: the parked backend holds the
+	# leaf it is about to split EXCLUSIVE.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL
+		SET synchronous_commit = on;
+		CREATE TABLE IF NOT EXISTS lion_promo_flush (i int);
+		INSERT INTO lion_promo_flush VALUES (1);
+	SQL
+
+	crash_immediate
+	wait "$parked" 2>/dev/null || true
+
+	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+	verify_node psql_p "$PRIMARY_DATA"
+	ev=$(recovery_evidence "$off")
+	GENERIC_TOTAL=$((GENERIC_TOTAL + ${ev#* }))
+
+	# One set was promoted, and nothing is half done: the promotion is one
+	# record, and the split it was for had not begun.
+	warn=$(psql_p -c "SELECT lion_index_verify('lion_promo_k', true)" 2>&1 >>"$RUNLOG" |
+		grep -c 'unfinished split' || true)
+	[ "$warn" = 0 ] ||
+		die "phase 1g: $warn posting page(s) came back with an unfinished split"
+	run_check "phase 1g post-crash" psql_p \
+		"select max_posting_height = 1 and posting_internal_pages = 1,
+				format('one set came back promoted (height %s, %s internal pages)',
+					   max_posting_height, posting_internal_pages)
+		   from lion_index_stats('lion_promo_k')
+		 union all
+		 select true, 'verify() is clean after the crash'
+		   from (select lion_index_verify('lion_promo_k', true)) v
+		 union all
+		 select (select count(*) from lion_promo where k = 0) =
+				(select count(*) from lion_promo where id % 2 = 0),
+				'k = 0 still answers exactly'
+		 union all
+		 select (select count(*) from lion_promo where k = 1) =
+				(select count(*) from lion_promo where id % 2 = 1),
+				'k = 1 still answers exactly'"
+
+	psql_p -c "SELECT injection_points_detach('lion-posting-promoted')" \
+		>>"$RUNLOG" 2>&1 || true
+
+	# The next inserts split the full leaf as a leaf of the tree, and promote
+	# the other key's set on the way.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1g: inserting after the crash failed"
+		SET synchronous_commit = on;
+		INSERT INTO lion_promo SELECT 200000 + i, i % 2
+		  FROM generate_series(1, 20000) i;
+		VACUUM lion_promo;
+	SQL
+	run_check "phase 1g inserted" psql_p \
+		"select max_posting_height = 1 and posting_internal_pages = 2,
+				format('both sets are trees (height %s, %s internal pages)',
+					   max_posting_height, posting_internal_pages)
+		   from lion_index_stats('lion_promo_k')
+		 union all
+		 select true, 'verify() is clean after the inserts'
+		   from (select lion_index_verify('lion_promo_k', true)) v
+		 union all
+		 select (select count(*) from lion_promo where k = 0) = 40000,
+				'k = 0 answers 40000 rows'
+		 union all
+		 select (select count(*) from lion_promo where k = 1) = 40000,
+				'k = 1 answers 40000 rows'
+		 union all
+		 select ntids = (select count(*) from lion_promo), 'ntids agrees with the heap'
+		   from lion_index_stats('lion_promo_k')"
+
+	# Replay it all: the promotion, the split after it, the second promotion.
+	off=$(stat -c %s "$PRIMARY_LOG")
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL
+		SET synchronous_commit = on;
+		INSERT INTO lion_promo_flush VALUES (2);
+	SQL
+	crash_immediate
+	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+	verify_node psql_p "$PRIMARY_DATA"
+	ev=$(recovery_evidence "$off")
+	GENERIC_TOTAL=$((GENERIC_TOTAL + ${ev#* }))
+	run_check "phase 1g replayed" psql_p \
+		"select true, 'verify'
+		   from (select lion_index_verify('lion_promo_k', true)) v
+		 union all
+		 select (select count(*) from lion_promo where k = 0) = 40000 and
+				(select count(*) from lion_promo where k = 1) = 40000,
+				'both keys answer 40000 rows after the replay'
+		 union all
+		 select ntids = (select count(*) from lion_promo), 'ntids agrees with the heap'
+		   from lion_index_stats('lion_promo_k')"
+
+	psql_p -c "DROP TABLE lion_promo, lion_promo_flush" >>"$RUNLOG" 2>&1
+
+	log "phase 1g: the promotion survived the crash on its own, and the next inserts split the leaf it was for"
+	SUMMARY+=("phase1g            crash between a promotion and its split; the next insert split the leaf")
 }
 
 # ---------------------------------------------------------------- phase 2
@@ -1891,9 +2054,10 @@ phase2() {
 #             removes them there.  The pinned leaf itself has nothing left to
 #             remove, so the primary's VACUUM cleanup-locks it but writes no
 #             record for it.
-#   pushdown  the reader pins a one-page posting set's ROOT; an insert pushes
-#             the root down (§22), so the containers move to a new child and
-#             the root becomes an internal page.
+#   pushdown  the reader pins the HEAD of a posting set of 14 leaves with no
+#             internal level, its first leaf; an insert needs a 17th leaf and
+#             pushes the head down (§22), so the containers move to a new
+#             child and the head becomes an internal page.
 #   spill     the reader pins a directory leaf holding an INLINE posting set;
 #             the VACUUM's own filtering makes the payload outgrow the entry
 #             and spill onto container pages, which rewrites the entry on the
@@ -2022,11 +2186,15 @@ phase3() {
 		CREATE INDEX pin_split_k ON pin_split USING lion (k);
 		INSERT INTO pin_split SELECT i, i % 2, '' FROM generate_series(1, 100000) i;
 
-		-- pushdown: one container on one page (count_root_pushdown_race.spec)
+		-- pushdown: count_root_pushdown_race.spec's fixture.  k = 1's first
+		-- container on its head, and then wide rows, every other one k = 1,
+		-- which give it a BITSET a container key, 14 leaves in all
 		DROP TABLE IF EXISTS pin_push;
-		CREATE TABLE pin_push (id int, k int NOT NULL);
+		CREATE TABLE pin_push (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x');
 		INSERT INTO pin_push SELECT i, i % 4 FROM generate_series(1, 4000) i;
 		CREATE INDEX pin_push_k ON pin_push USING lion (k) WITH (inline_limit = 64);
+		INSERT INTO pin_push SELECT 10000 + i, CASE WHEN i % 2 = 0 THEN 1 ELSE 5 END
+		  FROM generate_series(1, 60000) i;
 
 		-- spill: k = 1 is 200 consecutive offsets of heap block 0, one RUN
 		-- container of a few bytes, INLINE; every other one deleted, it is a
@@ -2049,7 +2217,7 @@ phase3() {
 	psql_p -c "VACUUM (INDEX_CLEANUP ON) pin_split" >>"$RUNLOG" 2>&1
 
 	[ "$(psql_p -tAc "select max_posting_height from lion_index_stats('pin_push_k')")" = 0 ] ||
-		die "phase 3: the pushdown fixture is not a one-page posting set"
+		die "phase 3: the pushdown fixture's posting set has an internal level"
 	[ "$(psql_p -tAc "select inline_entries from lion_index_stats('pin_spill_k')")" = 1 ] ||
 		die "phase 3: the spill fixture does not have exactly one INLINE entry"
 
@@ -2090,7 +2258,7 @@ phase3() {
 			  FROM generate_series(1, 40000) i;
 			VACUUM (INDEX_CLEANUP ON) pin_push;"
 		[ "$(psql_p -tAc "select max_posting_height from lion_index_stats('pin_push_k')")" -ge 1 ] ||
-			die "phase 3: the pushdown case did not push the root down"
+			die "phase 3: the pushdown case did not push the head down"
 	fi
 
 	if want_case spill; then
@@ -2191,8 +2359,9 @@ phase4() {
 		SET synchronous_commit = on;
 		DROP TABLE IF EXISTS sv;
 		CREATE TABLE sv (k int NOT NULL, r int);
-		-- three keys, each a posting tree of about ten leaves and a root
-		INSERT INTO sv SELECT g % 3, g FROM generate_series(1, 300000) g;
+		-- three keys, each a posting tree of about twenty leaves and a root
+		-- (a set of up to 16 has none, DESIGN.md §22)
+		INSERT INTO sv SELECT g % 3, g FROM generate_series(1, 900000) g;
 		CREATE INDEX sv_k ON sv USING lion (k);
 	SQL
 	psql_p -c "VACUUM (FREEZE, ANALYZE) sv" >>"$RUNLOG" 2>&1 ||
@@ -2324,6 +2493,7 @@ want_phase 1c && phase1c
 want_phase 1d && phase1d
 want_phase 1e && phase1e
 want_phase 1f && phase1f
+want_phase 1g && phase1g
 want_phase 2 && phase2
 want_phase 3 && phase3
 want_phase 4 && phase4

@@ -234,8 +234,11 @@ $$;
 
 CREATE TEMP TABLE lion_vfy_bad (k int4);
 INSERT INTO lion_vfy_bad SELECT i % 50 FROM generate_series(1, 20000) i;
+-- Two keys of more than 16 leaves each, so that each set has a root above
+-- its leaves (DESIGN.md §22): a bulk build packs three of these containers
+-- onto a leaf.
 CREATE TEMP TABLE lion_vfy_badp (id int4, k int4);
-INSERT INTO lion_vfy_badp SELECT i, i % 2 FROM generate_series(1, 60000) i;
+INSERT INTO lion_vfy_badp SELECT i, i % 2 FROM generate_series(1, 900000) i;
 SET ignore_checksum_failure = on;
 
 -- (1) a line pointer that points past the page
@@ -280,10 +283,14 @@ SELECT lion_index_verify('lion_vfy_bad_child');
 SET client_min_messages = warning;
 SELECT pg_relation_size('lion_vfy_bad_child') = :size_before AS not_extended;
 
--- (5) a container of no known type on a posting leaf
+-- (5) a container of no known type on a posting leaf: the root's first child
 CREATE INDEX lion_vfy_bad_type ON lion_vfy_badp USING lion (k);
-SELECT lion_vfy_poke('lion_vfy_bad_type', :root + 1,
-					 lion_vfy_item('lion_vfy_bad_type', :root + 1, 1) + 6, '\x7f');
+SELECT get_byte(b, 0) + get_byte(b, 1) * 256 + get_byte(b, 2) * 65536 +
+	   get_byte(b, 3) * 16777216 AS leaf
+  FROM lion_vfy_peek('lion_vfy_bad_type', :root,
+					 lion_vfy_item('lion_vfy_bad_type', :root, 1) + 4, 4) b \gset
+SELECT lion_vfy_poke('lion_vfy_bad_type', :leaf,
+					 lion_vfy_item('lion_vfy_bad_type', :leaf, 1) + 6, '\x7f');
 SET client_min_messages = error;
 SELECT lion_index_verify('lion_vfy_bad_type');
 SELECT containers FROM lion_index_stats('lion_vfy_bad_type');

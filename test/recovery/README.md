@@ -47,7 +47,7 @@ install` and then run the harness as an ordinary user. The run checks that
 the control files and the library are there, and says so if the tree's
 `pg_lion.so` is not the installed one.
 
-Phases 1b-1e and 3 need the `injection_points` extension. On a server without
+Phases 1b-1e, 1g and 3 need the `injection_points` extension. On a server without
 it they are skipped - the log and the summary say which - and phases 1, 1f,
 2 and 4 still run; `--phases "1 1f 2 4"` asks for exactly those (CI does, on
 the packaged 16-19 servers). `INJECTION_POINTS=1` in the environment turns every
@@ -155,19 +155,21 @@ finish a half-applied two-pass bulkdelete. After every restart:
   `null_tids` and `empty_tids` are checked separately, because a reserved
   entry that lost its flag would hide inside the `ntids` total.
 
-**Phases 1b-1f, a crash or a restart at a chosen point.** Each builds a
+**Phases 1b-1g, a crash or a restart at a chosen point.** Each builds a
 table of its own. 1b parks a VACUUM between the two steps of a whole-chain
 free (injection point `lion-vacuum-entries-deleted`), 1c and 1d an insert
 between a directory or posting-tree split and its downlink, and each crashes
-the server there and checks what comes back. Two more (DESIGN.md §18, §25):
+the server there and checks what comes back. Three more (DESIGN.md §18, §22,
+§25):
 
 * **1e**, a crash inside a MULTI-LEAF spill. VACUUM's filtering turns one
-  key's INLINE payload into ten BITSETs, a leaf each; the spill parks at
-  `lion-spill-leaves-written`, after its last leaf record and before the root
-  and the entry, and the server dies. The entry must come back INLINE with
-  every TID, `lion_index_verify()` must call the ten leaves a leak and not
-  corruption, and the next VACUUM must spill the set and free the orphans in
-  its sweep. A second crash replays that VACUUM.
+  key's INLINE payload into ten BITSETs, a leaf each, a set with no internal
+  level whose first leaf is its head; the spill parks at
+  `lion-spill-leaves-written`, after its last leaf record and before the
+  head and the entry, and the server dies. The entry must come back INLINE
+  with every TID, `lion_index_verify()` must call the nine other leaves and
+  the head a leak and not corruption, and the next VACUUM must spill the set
+  and free the orphans in its sweep. A second crash replays that VACUUM.
 * **1f**, VACUUM of an rmgr-mode index on a server WITHOUT the resource
   manager. The partial index is built with the library preloaded, the server
   is restarted without it (and without `wal_consistency_checking`, which
@@ -176,6 +178,14 @@ the server there and checks what comes back. Two more (DESIGN.md §18, §25):
   find no record of a custom manager - it used to find `custom128` ones, which
   no such server can replay - and a crash right after it must recover. The
   primary is restarted in its `--mode` afterwards.
+* **1g**, a crash between a PROMOTION and the split it was for. A posting
+  set of up to 16 leaves has no internal level; the split that would make a
+  17th leaf first pushes the head down under a root that links every leaf,
+  in a record of its own. An append parks at `lion-posting-promoted`, after
+  that record and before the split, and the server dies. The set must come
+  back promoted with nothing flagged, verify() clean and both keys exact,
+  the next inserts must split the full leaf as a tree's, and a second crash
+  replays all of it.
 
 1b and 1e also read the page counts `VACUUM (VERBOSE)` reports for the index
 (DESIGN.md §18, "Page counts"), which no SQL function can see: the pages
@@ -239,8 +249,9 @@ page and VACUUM them there:
   there. The primary's VACUUM cleanup-locks the pinned leaf but writes nothing
   for it. Runs with `pg_lion.vacuum_barrier_ranges = 1`, so the barrier goes
   out in stand-alone VACUUM_VISIT records.
-* **pushdown**: the reader pins a one-page posting set's root; an insert
-  pushes it down and the VACUUM cleans the child.
+* **pushdown**: the reader pins the head of a posting set of 14 leaves with no
+  internal level; an insert needs a 17th leaf, pushes the head down, and the
+  VACUUM cleans the child.
 * **spill**: the reader pins a directory leaf for an INLINE set; the VACUUM's
   own filtering makes the payload outgrow the entry and spill.
 
@@ -263,7 +274,7 @@ page. The startup process and the backend then waited for each other on buffer
 content locks, which have no deadlock detector and ignore cancel and
 terminate: replay stopped for good, and only an immediate shutdown got the
 standby back. The phase makes a standby of its own, with a table of three keys
-whose posting sets are trees of about ten leaves, and for `PHASE4_SECS`
+whose posting sets are trees of about twenty leaves, and for `PHASE4_SECS`
 seconds (12) has pgbench insert into those keys on the primary while two loops
 on the standby call `lion_index_verify(sv_k)` and
 `lion_index_verify(sv_k, true)`. A watchdog asks the standby twice a second
@@ -289,7 +300,7 @@ waiting on `LWLock/BufferContent`.
 * **No long soak.** Eight rounds of two seconds is about 20000 transactions;
   it is a smoke test for the WAL records the write paths emit, not a
   statement about hours of churn. `--iters N` raises it.
-* **Crash injection at a few chosen points only.** Phases 1b-1e stop a
+* **Crash injection at a few chosen points only.** Phases 1b-1e and 1g stop a
   backend at an injection point and crash the server there; every other
   multi-record operation (a segment promotion, say) is crashed wherever the
   phase 1 workload happens to be, which reaches the frequent paths and not

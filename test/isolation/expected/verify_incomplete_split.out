@@ -53,7 +53,7 @@ injection_points_detach
                        
 (1 row)
 
-s1: WARNING:  lion index "vis_p_k": posting page 12 has an unfinished split
+s1: WARNING:  lion index "vis_p_k": posting page 46 has an unfinished split
 DETAIL:  Its right sibling has no downlink in the parent yet.
 HINT:  The next INSERT into that key repairs it.
 step s1_verify_posting: 
@@ -65,7 +65,7 @@ lion_index_verify
                  
 (1 row)
 
-s1: WARNING:  lion index "vis_p_k": posting page 12 has an unfinished split
+s1: WARNING:  lion index "vis_p_k": posting page 46 has an unfinished split
 DETAIL:  Its right sibling has no downlink in the parent yet.
 HINT:  The next INSERT into that key repairs it.
 lion_index_verify
@@ -95,8 +95,8 @@ lion_index_verify
 
 step s1_answers: 
 	SET enable_seqscan = off;
-	SELECT (SELECT count(*) FROM vis_p WHERE k = 0) = 30000 AS k0_exact,
-		   (SELECT count(*) FROM vis_p WHERE k = 1) = 30000 AS k1_exact,
+	SELECT (SELECT count(*) FROM vis_p WHERE k = 0) = 45000 AS k0_exact,
+		   (SELECT count(*) FROM vis_p WHERE k = 1) = 45000 AS k1_exact,
 		   (SELECT bool_and((SELECT count(*) FROM vis_d d2 WHERE d2.k = d1.k) = 1)
 			  FROM vis_d d1) AS every_key_is_found;
 	RESET enable_seqscan;

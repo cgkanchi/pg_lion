@@ -588,8 +588,8 @@ multi-key opclass, once per extracted key)
    plus fresh slack (§4). A grown entry that no longer fits its leaf splits the leaf
    (`lion_dir_place()`) instead of spilling, which the hash directory had to do. Otherwise SPILL:
    allocate one container page, move the containers there, make the entry CHAIN with head = tail =
-   that page - the root of a one-page posting tree, keeping every LION_ENTRY_RESERVED bit - and fall
-   through to CHAIN. The leaf is still held.
+   that page - the head of a posting set of one leaf and no level above it (§22), keeping every
+   LION_ENTRY_RESERVED bit - and fall through to CHAIN. The leaf is still held.
 4. CHAIN: find the posting LEAF that owns the ckey and lock it EXCLUSIVE. The tail is tried first
    (`lion_insert_lock_chain_page()`), with the exclusive lock the insert needs anyway, and kept when
    it is still the rightmost leaf, not incompletely split, and its minckey is at or below the ckey -
@@ -737,8 +737,8 @@ VACUUM (`lion_vacuum.c`, ambulkdelete)
    autovacuum's and the anti-wraparound one's included, until the failsafe stopped vacuuming
    indexes at all (2026-09-25 review).
    CHAIN → descend from `head` to the leftmost leaf with a cleanup lock on every page of the way,
-   the root first (`lion_vacuum_descend()`, §11, §22: a one-page set's root is a leaf a reader may
-   have copied containers from), then walk the leaves left to right, each under
+   the root first (`lion_vacuum_descend()`, §11, §22: the head of a set with no internal level is a
+   leaf a reader may have copied containers from), then walk the leaves left to right, each under
    LockBufferForCleanup whether or not the page has anything to remove, because this is the
    interlock the count path relies on (§9: a heap-skipping reader keeps the page pinned while it
    consults the visibility map). Filter every container with lion_container_remove_if, run
@@ -2769,13 +2769,15 @@ cannot have cleaned Z - it has to hold Z's cleanup lock to remove a TID from it,
 for the pin. If a split then moves C to a page right of Z, VACUUM reaches Z first, and is blocked
 there. The internal pages the descent reads on the way hold no TIDs.
 
-**A ROOT PUSH-DOWN is the one page transition VACUUM can meet** (§22): an insert turns a one-page
-posting set's root into an internal page and moves its containers to a brand new child. VACUUM,
+**A ROOT PUSH-DOWN is the one page transition VACUUM can meet** (§22): an insert that needs a 17th
+leaf in a set with no internal level turns the set's head into an internal page and moves its
+containers to a brand new child (the promotion). VACUUM,
 holding the cleanup lock on that page, finds it is no longer a leaf and descends again from the
 root, cleanup-locking the way down. That is safe for the reason above: the cleanup lock it holds
 waited for every pin on the page those containers came from, so no reader holds a stale copy of
 them, and the page they moved to did not exist a moment ago. The push-down VACUUM itself causes -
-its REGROW step (§18) re-placing a filtered container that no longer fits a one-page set - keeps
+its REGROW step (§18) re-placing a filtered container that no longer fits the head of a set of 16
+leaves - keeps
 the new child EXCLUSIVE from its allocation until the filtered container is on it
 (`lion_posting_root_pushdown()` returns it locked): the push-down has just copied the UNFILTERED
 container there, and a reader that could lock the child in between would copy the dead TIDs, keep
@@ -4848,12 +4850,19 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   lower bound on the block of every member.  `test/unit/positions_test.c` checks every operation
   against a brute-force reference and fuzzes damaged chunks.
 - **Position trees** (`lion_postree.c`): a posting tree (§22) whose pages carry
-  `LION_PAGE_POSITIONS` and are stamped with the position tree's own root, whose leaf items are
-  chunks, and whose keys are heap blocks.  Descent, root push-down, leaf and internal splits are
-  §22's code, reached through a `LionTreeRef` that carries no entry.
+  `LION_PAGE_POSITIONS` and are stamped with the position tree's own head, whose leaf items are
+  chunks, and whose keys are heap blocks.  Like a posting set it has no internal level while it has
+  at most 16 leaves - its head is its first leaf and the leaves are one chain - and the split that
+  would make a 17th promotes it (§22, "A small set has no internal level").  Descent, promotion,
+  root push-down, leaf and internal splits are §22's code, reached through a `LionTreeRef` that
+  carries no entry.
 - **Routing.** One block's members can fill several leaves, so separators repeat.  Readers and
   writers of block X descend to the last separator strictly *below* X
-  (`lion_posting_search_before()`) and walk right.  The invariants that make this complete are in
+  (`lion_posting_search_before()`) and walk right.  A tree with no internal level has nothing to
+  descend: a writer walks its chain from the head to the leaf the descent would have found - the
+  last one before the first whose last block is at or past X - and a reader's position cursor
+  walks right from the leaf it stands on, past the leaves whose last block is below X, however
+  far.  The invariants that make this complete are in
   the header of `lion_postree.c`: members ascend; a chunk's members reach at most the next chunk's
   header block; and a leaf's first chunk carries the leaf's separator.  VACUUM, when it removes
   positions, must keep a leaf's first chunk even when it empties it.  Blocks rather than container
@@ -4870,14 +4879,15 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   CHAIN entry points at its position tree (`pos_root`).  Reserved entries never store positions.
 - **Insert** writes a row's positions before its TID (W1): in the INLINE entry's one record, or
   into the position tree before the posting set.  An INLINE entry that outgrows itself spills
-  both, the new position root written in the spill's last record with the entry.
+  both, the new position head written in the spill's last record with the entry.
 - **VACUUM** takes a TID's positions out after the TID (V1), and asks the callback about every
   member (V2).  INLINE: the chunk is filtered in the same rewrite as the payload.  CHAIN: after
   the posting set's leaves, every leaf of the position tree is filtered under an EXCLUSIVE lock
   (no reader's correctness rests on a position page), and every page of the tree is marked
-  visited.  An entry that empties is deleted in one record with its position root; the rest of
-  the tree is freed afterwards whatever it holds, and the sweep (and verify) take an unreferenced
-  position page whose root is gone for a leak.
+  visited.  An entry that empties is deleted in one record with its position head; the rest of
+  the tree - for a tree with no internal level, the chain to the right of the head - is freed
+  afterwards whatever it holds, and the sweep (and verify) take an unreferenced position page
+  whose head is gone for a leak.
 - **Verify** walks every position tree (chunks, order, levels) and, on a primary, checks that
   every TID of the posting set has positions.
 - **Build**: the spool hands each row's positions for a key to a sink (`lion_posbuild.c`) that
@@ -4887,7 +4897,8 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   quarter of `maintenance_work_mem`; past that every stream is written to one temporary file, the
   key keeping where its parts went.  `lion_build.c` takes a key's positions (file parts in order,
   then memory) as it writes the key's entry, into the entry's chunk or into a position tree
-  written bottom up through the bulk writer.  A 225k-row build takes about 1.5x as long as one
+  written bottom up through the bulk writer - up to 16 leaves held back and written as a chain
+  whose first leaf is at the head's block, and a root over them only once a 17th is needed.  A 225k-row build takes about 1.5x as long as one
   without positions (it was 10x with a tuplesort, plus a quadratic append into the chunk).
   A parallel build gives each participant a sink of its own, writing to the build's shared
   fileset; at the end of its scan a participant writes everything out with a directory of its
@@ -6426,8 +6437,9 @@ its containers, the other sets are probed by ckey (descend, or step right from t
 Cost tracks the selective side. Inserts into the middle of a chain stop being a linear walk from the
 head (the churn tests' mid-chain inserts).
 
-Structure. The entry's `head` is the posting-tree ROOT (a container page when the tree is one page:
-no separate root format, exactly as GIN). Container pages keep their layout (items sorted by first
+Structure. The entry's `head` is the posting-tree ROOT - or, for a set of at most 16 leaves, its
+FIRST LEAF: such a set has no internal level at all, and its leaves are one rightlinked chain from
+the head (below, "A small set has no internal level"). No separate root format, as in GIN. Container pages keep their layout (items sorted by first
 ckey, minckey/maxckey, owner stamps, growth slack, DELETED marking) and use the `level` §21 had
 already put in the special area: leaves are level 0, internal posting pages level 1 and up. They
 carry LION_PAGE_CONTAINER like the leaves - the level is what tells the two apart - so the owner
@@ -6470,10 +6482,44 @@ Operations.
   LION_PAGE_INCOMPLETE_SPLIT in the split record and held EXCLUSIVE until its downlink is in and the
   flag cleared, so a P → M → N split flags both P and M and inserts M's downlink first - a descent
   cannot reach M before M has one. Records: (P, M, N, entry leaf) = 4 buffers for the split, one for
-  each downlink, one tiny one for each flag. Injection point `lion-posting-split-incomplete` fires
+  each downlink, one tiny one for each flag. In a set with no internal level there is no parent:
+  the split is its one record, and nothing is flagged. Injection point `lion-posting-split-incomplete` fires
   between the first record and the downlink; `test/recovery/run.sh` phase 1d crashes the server there
   and proves the next writer repairs it - an append as much as a descent since the 2026-09-25
   addendum below, which covers the two writers that reach a leaf WITHOUT descending.
+- **A small set has no internal level** (`LION_POSTING_FLAT_LEAVES` = 16). A root over a handful of
+  leaves is a page of a few dozen bytes, one per key that has more than one leaf, and on an index of
+  many mid-sized keys those pages were about a tenth of the index. So up to 16 leaves the head is
+  the first leaf and the rest follow it by right links, with nothing above them:
+  - a WRITER finds the leaf that owns a container key by walking the chain from the head - the last
+    non-empty leaf whose minckey is at or below the key - which is what a descent would have found
+    (`lion_posting_flat_route()`; writers of the key serialise, so the chain cannot change under
+    the walk). A split is one record and flags nothing: there is no downlink to post.
+  - the split that would make a 17th leaf first PROMOTES the set (`lion_posting_promote()`): the
+    push-down below, with a downlink to every leaf in the same record. The head's items go to a
+    new leaf that takes the head's place in the chain; the root gets that leaf with separator 0,
+    then each other leaf with its minckey as separator (an EMPTY leaf, which only VACUUM leaves,
+    one past the last key of the leaf before it, so that those keys still route there; never
+    below the separator before it). Then the split goes on as a split of a tree leaf. When the
+    page that overflowed is the head, the caller's items are placed on the new leaf exactly as
+    after a root push-down (injection point `lion-posting-pushdown-child` between the two);
+    otherwise the overflowing leaf stays where it is, the head is locked as well with that leaf
+    still held, and the leaf is split after the promotion (injection point
+    `lion-posting-promoted` between the two). A crash at either point leaves a
+    whole tree - a root over every leaf, nothing flagged - and the next writer splits the leaf;
+    `test/recovery/run.sh` phase 1g crashes the server at the second and checks that, and
+    `test/isolation/posting_split_repair.spec` (D and F) stops both with an ERROR.
+  - READERS walk right from wherever they stand, as they always could: a seek into a set with no
+    internal level never descends, however far it goes (below, "Cursors").
+  - VACUUM's descent is the head itself, and its walk is the chain's.
+  - the bulk build holds up to 16 finished leaves back and writes them as the chain (below,
+    "Bulk build"); a VACUUM spill of 2 to 16 leaves logs the head first as an internal page with
+    no downlink, which no sweep takes for a live root, writes the other leaves, and makes the
+    head the first leaf in the last record, with the entry (§18).
+  - verify accepts a level-0 head with right siblings, and refuses more than 16 of them, a
+    flagged leaf among them, and a right sibling of an internal root.
+  Position trees (§17) take the same shape, and the planner's posting height is 0 up to 16 leaves.
+  Measured below ("The sets without an internal level, measured").
 - **Root split is a PUSH-DOWN**, and this is the deviation that matters most from the first draft,
   which had it allocate a new root and rewrite the entry's `head`. The root block never moves: its
   items go to a brand new child and the root block itself becomes the level above, holding one
@@ -6482,7 +6528,9 @@ Operations.
   budget is never the binding constraint - the push-down is (root, child, entry leaf) = 3, and the
   entry is only there because `tail` moves. "A head block is never recycled as a head" (§18) stays
   true without any new rule, so owner_head remains the identity a reader holding nothing but a head
-  block can validate against. And the child is a verbatim copy of the old root, so the operation
+  block can validate against. The promotion of a set with no internal level (above) is this same
+  push-down with a downlink to every leaf of the chain. And the child is a verbatim copy of the old
+  root, so the operation
   that overflowed simply runs again at the same offset on the child - the root lock is dropped for
   that window, because the child's own split has to take the root to insert ITS downlink and buffer
   locks are not reentrant, which is safe precisely because writers of one key serialise.
@@ -6494,12 +6542,13 @@ Operations.
   and the descent takes a cleanup lock on every page it passes, the root first
   (`lion_vacuum_descend()`). *(Deviation from this section's first version, which walked straight
   to the leftmost leaf and said internal pages "are NOT cleanup-locked on the ordinary walk and need
-  not be". They hold no TIDs, but the root of a one-page set is a LEAF a reader may have copied
-  containers from, and the push-down below turns it into an internal page with those containers on
+  not be". They hold no TIDs, but the head of a set with no internal level is a LEAF a reader may
+  have copied containers from, and the promotion turns it into an internal page with those containers on
   a child VACUUM would then clean without ever asking for the reader's pin - §11 and
   `test/isolation/count_root_pushdown_race.spec`.)* Internal pages are never empty while the set
   lives, so the leak sweep leaves them alone. Freeing a whole set frees its internal pages too,
-  bottom up, under ConditionalLockBufferForCleanup like the leaves. Internal pages are never
+  bottom up, under ConditionalLockBufferForCleanup like the leaves; a set with no internal level is
+  its chain, freed from the head. Internal pages are never
   deleted while the set lives (documented limitation), and neither are empty leaves - both wait for
   the whole set to go, as §18 already said of mid-chain pages.
   A root that is pushed down while VACUUM is walking it: VACUUM finds a page that is no longer a
@@ -6513,7 +6562,9 @@ Operations.
 - **Cursors** (`LionSetCursor`) gain `seek(ckey)`: from the current leaf, step right while the leaf's
   maxckey is below the target and the walk is short (`LION_POSTING_SEEK_STEPS` = 2 pages, about
   where a descent's `height` reads and binary searches become cheaper), otherwise descend from the
-  root; then position at the first item that can hold the target. A sparse segment covers a RANGE of
+  root - in a tree: a set with no internal level is only ever walked right, however far, since a
+  descent would read the same chain from its start; then position at the first item that can hold
+  the target. A sparse segment covers a RANGE of
   container keys, so a seek into one skips its PAIRS rather than the item. A materialized set is an
   array and is binary-searched. *(Deviation: an INLINE set is NOT binary-searched, as the first draft
   said. An inline payload is a sequence of items packed without padding and carries no offsets to
@@ -6569,7 +6620,7 @@ Operations.
     changes level (the push-down), and the root is nobody's child or sibling, so this is exact.
     VACUUM's descent, `lion_posting_level_start()` and `lion_posting_scan_for_downlink()` had no
     level check at all. `lion_posting_search()` retries a mismatch as it retries the one real race,
-    a one-page root pushed down between its two locks, and COUNTS those restarts: more than
+    a head pushed down between its two locks, and COUNTS those restarts: more than
     LION_POSTING_MAX_HEIGHT - more push-downs than a set's root can have in its whole life - is the
     ERROR. Finishing an unfinished split is not counted, because each one clears a flag for good and
     writers of the key serialise. Before the bound, a downlink to the root or to the page itself
@@ -6602,10 +6653,28 @@ Operations.
   descent's own locks held, which is what lets a READER be cancelled.
 - **Bulk build**: leaves are written left to right as before, and the internal levels are built
   bottom-up in the same pass, one open page per level, through the bulk-write API (nbtree's
-  `_bt_buildadd` shape, which is what §21's directory build already does). A set that fits one page
-  has no internal level and its single leaf IS the head. The moment a second leaf is needed the
-  build reserves a block for the ROOT and re-stamps the first leaf with it - the first leaf's image
-  is still in memory, and every page of a set has to carry the root's block as its owner (§18).
+  `_bt_buildadd` shape, which is what §21's directory build already does). A set of up to 16
+  leaves has no internal level: the build holds its finished leaves back, and writes them as a
+  chain whose first leaf is the head once the set ends. The moment a 17th leaf is needed the build
+  reserves a block for the ROOT and re-stamps the held leaves with it - their images are still in
+  memory, and every page of a set has to carry the root's block as its owner (§18) - and writes
+  them with their downlinks.
+
+### The sets without an internal level, measured
+
+Bulk builds on the benchmark's synthetic tables (2026-10-11, PostgreSQL 18): `fact` (5M rows) on
+`c200`, 200 keys of about 25,000 rows, and `docs` (500k rows) on `tags` (text[]), `tsv` (tsvector)
+and `tsv` WITH (store_positions = true). No posting set of these indexes has more than 16
+leaves, so every root went; there are as many leaves as before.
+
+    index                  pages before -> after   posting roots   position roots   size
+    fact (c200)                    2015 -> 1815      200 -> 0             -           16 MB -> 14 MB
+    docs (tags)                    1179 ->  977      202 -> 0             -          9432 kB -> 7816 kB
+    docs (tsv)                     1712 -> 1508      204 -> 0             -           13 MB -> 12 MB
+    docs (tsv, positions)          3920 -> 3515      205 -> 0         203 -> 3        31 MB -> 27 MB
+
+The roots that went were 98-99% empty: a handful of downlinks each, 9 on `c200` and fewer than 3 on
+the docs columns. The three position trees left with a root have more than 16 leaves.
 
 ### Cost model (`lion_cost_count_rel()`)
 
@@ -6638,7 +6707,10 @@ pages). So
 where `walk` is the source's share of the index's container pages, what it cost before this section.
 `height` is not stored anywhere the planner can reach - the meta page carries the DIRECTORY's
 height, not a per-key posting tree's - so it is derived from the fanout the tree is built with (679
-pivots to a page), which is exact for a bulk-built tree. A probed source is charged at the
+pivots to a page), which is exact for a bulk-built tree, and is 0 for a set of up to 16 leaves,
+which has no internal level (`lion_posting_height()`). A probe into such a set walks its chain
+from where the cursor stands; an FK join's probe into one is priced as a walk of half the chain
+(`lion_plan_fkjoin_cost.c`). A probed source is charged at the
 interpolated page cost of `lion_heap_page_cost()` against its own index's size, as §15's IN list
 lookups are, so a probe into an index far larger than the cache is still random I/O.
 
@@ -6858,7 +6930,7 @@ VACUUM's pass 2 holds a container page's cleanup lock while it filters it, then 
 page for the counters. If an insert holds the entry page, VACUUM lets the container page go (waiting
 for a directory leaf while holding a container page would invert the lock order), takes the entry
 page blocking, and retries the cleanup lock. In that unlocked window the insert that held the entry
-page may have overflowed this one-page set and pushed its root down (§22), leaving an INTERNAL page
+page may have overflowed this set's head and pushed it down (§22), leaving an INTERNAL page
 at the block VACUUM is about to re-filter. The retry therefore re-checks `LionPageIsPostingLeaf`
 after reacquiring the cleanup lock and restarts the descent exactly as the first acquisition does;
 filtering an internal page as a leaf would read pivots as containers (an assertion on a cassert
@@ -13113,8 +13185,8 @@ posting-tree root of each CHAIN set, a directory leaf image with its right link,
    case 3. R itself splitting is found through R's own right link when the cursor reads R. This is
    §4/§22's rule that items only ever move right, onto a page linked immediately right of their
    source, and it holds whether the new page was extended or recycled (§18).
-5. *A root push-down* (§22) moves a one-page set's items to a brand new child: a cursor that copied
-   the old root as a leaf has its items; a cursor that has not started (or has a seek pending)
+5. *A root push-down* (§22) moves a head's items to a brand new child: a cursor that copied
+   the old head as a leaf has its items; a cursor that has not started (or has a seek pending)
    descends from the root, which `lion_posting_search()` handles at any level.
 6. *An INLINE entry spills to a CHAIN* (§4): the scan's payload copy is complete as of the copy;
    case 3 covers the rest.

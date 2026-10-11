@@ -17,8 +17,8 @@
  *	  hold no TIDs and a directory page never changes level, so no reader can
  *	  be holding a container copy that came from one (DESIGN.md §11, §21).
  *	  The pages of a posting tree's descent ARE, because a posting set's root
- *	  is a leaf while the set fits one page and stops being one when an insert
- *	  pushes it down (§22): a reader's pin on it must stop VACUUM before it
+ *	  is a leaf while the set has no internal level and stops being one when
+ *	  an insert pushes it down (§22): a reader's pin on it must stop VACUUM before it
  *	  reaches the child the containers moved to (lion_vacuum_descend()).
  *
  *	  A page VACUUM cleanup-locks and leaves unchanged writes no WAL, so on a
@@ -1658,9 +1658,9 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
  * interruptible (rule 2 of the file header).
  *
  * Why the internal pages, which hold no TIDs (DESIGN.md §11, §22): the ROOT
- * of a posting set is a leaf for as long as the set fits one page, and a
- * reader that copied containers out of it pins it until its visibility-map
- * checks are done.  An insert that overflows it pushes it down - the
+ * of a posting set is a leaf for as long as the set has no internal level,
+ * and a reader that copied containers out of it pins it until its
+ * visibility-map checks are done.  An insert that overflows it pushes it down - the
  * containers go to a brand new child and the root block becomes an internal
  * page - and only needs an exclusive content lock to do so, which the pin does
  * not stop.  A VACUUM that took no lock on the root would then clean those
@@ -2135,7 +2135,9 @@ lion_vac_cmp_del(const void *a, const void *b)
 /*
  * The leftmost page of every level of the position tree at root, below the
  * root itself, into pf.  The caller holds the key's directory leaf, so no
- * insert changes the tree's shape meanwhile.
+ * insert changes the tree's shape meanwhile.  A tree without an internal
+ * level (DESIGN.md §17) has its other leaves to the root's right: the first
+ * of them is the one level below the root that there is to free.
  */
 static void
 lion_vac_postree_shape(LionVacState *vs, BlockNumber root, LionVacPosFree *pf)
@@ -2163,6 +2165,13 @@ lion_vac_postree_shape(LionVacState *vs, BlockNumber root, LionVacPosFree *pf)
 
 			if (f <= PageGetMaxOffsetNumber(page))
 				child = lion_posting_pivot(page, f)->child;
+		}
+		else if (blk == root && !LionPageIsRightmost(page))
+		{
+			/* the root is the first leaf of a chain: free the rest of it */
+			pf->levelfirst[pf->nlevels++] = LionPageGetOpaque(page)->rightlink;
+			UnlockReleaseBuffer(buf);
+			break;
 		}
 		UnlockReleaseBuffer(buf);
 
@@ -2844,9 +2853,9 @@ lion_vacuum_sweep(LionVacState *vs)
 			 * did not know about, or one an interrupted spill left behind,
 			 * and its ROOT tells them apart.  The root is only locked
 			 * conditionally, with the leaf held; a busy root is taken for a
-			 * live one.  A leaf that is its own root is a one-page set, which
-			 * a spill writes in the same record as its entry, so it is never
-			 * an orphan.
+			 * live one.  A leaf that is its own root heads a set without an
+			 * internal level, which a spill writes in the same record as its
+			 * entry, so it is never an orphan.
 			 */
 			if (LionPageGetOpaque(page)->owner_head != blk &&
 				!lion_posting_root_live(vs->index,

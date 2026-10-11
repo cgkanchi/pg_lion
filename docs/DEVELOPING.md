@@ -72,7 +72,7 @@ replay, so turning it on for a primary that never replays proves nothing.
 - **The recovery harness** (`make recovery-check`) needs a whole installation to initdb clusters
   in, named by `RECOVERY_PREFIX`, which it builds and installs the extension into
   (`RECOVERY_SKIP_INSTALL=1` uses the one already installed there instead); as root it also
-  needs `RECOVERY_RUN_AS=<unprivileged user>` (`test/recovery/README.md`).  Its phases 1b-1e and 3
+  needs `RECOVERY_RUN_AS=<unprivileged user>` (`test/recovery/README.md`).  Its phases 1b-1e, 1g and 3
   need `injection_points`, and are skipped without it unless `INJECTION_POINTS=1` makes that an
   error.
 
