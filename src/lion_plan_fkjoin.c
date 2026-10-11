@@ -20,11 +20,14 @@ static double lion_join_batch_rows(double rowbytes);
  * Is the aggregate one the FK-side join can answer (DESIGN.md §27)?  Its
  * partial value per dimension row is that row's count of joined fact rows,
  * which is count(*) - and count(x) for any x that is non-NULL in every joined
- * row: a non-NULL constant (`count(1)`), or either side of the join key, which
- * a strict equality never matches when NULL.  A semi join's rows are the
+ * row: a non-NULL constant (`count(1)`), either side of the join key, which
+ * a strict equality never matches when NULL, or - where the rows are the
+ * join's pairs - a fact column declared NOT NULL (fj->factnotnull).  A semi join's rows are the
  * dimension rows with a match, so the same holds of their key; an anti join's
  * are the rows WITHOUT one, the NULL keys among them, so there only the
- * constant does.
+ * constant does.  So does it in the dimension LEFT JOIN the fact, whose rows
+ * hold a NULL fact key where a dimension row has no fact row, and the
+ * dimension's own key where it is NULL (lion_fkjoin_agg_kind()).
  */
 static bool
 lion_fkjoin_agg_is_count(Aggref *agg, const LionFkJoin *fj)
@@ -58,8 +61,13 @@ lion_fkjoin_agg_is_count(Aggref *agg, const LionFkJoin *fj)
 	{
 		Var		   *v = (Var *) arg;
 
-		if (v->varlevelsup != 0 || fj->jointype == JOIN_ANTI)
+		if (v->varlevelsup != 0 || fj->jointype == JOIN_ANTI ||
+			fj->jointype == JOIN_LEFT)
 			return false;
+		if (v->varno == fj->fkvar->varno &&
+			(fj->jointype == JOIN_INNER || fj->jointype == JOIN_UNIQUE_INNER) &&
+			v->varattno > 0 && bms_is_member(v->varattno, fj->factnotnull))
+			return true;
 		return (v->varno == fj->fkvar->varno &&
 				v->varattno == fj->fkvar->varattno) ||
 			(v->varno == fj->pkvar->varno &&
@@ -460,6 +468,19 @@ lion_fkjoin_per_row_groups(PlannerInfo *root, const LionFkJoin *fj,
  * arithmetic a row, against the 128-bit sum core does, to answer the same.
  * No other aggregate is taken, and none of these with DISTINCT (but count's),
  * ORDER BY or FILTER, or over a fact column but the key.
+ *
+ * The dimension LEFT JOIN the fact (DESIGN.md §27, "The dimension LEFT JOIN
+ * the fact") has the rows of an inner join, each with its count n, and the
+ * dimension rows with no fact row, each with n = 0 - which the join holds
+ * once, null-extended.  A dimension row is max(n, 1) of the join's rows, and
+ * COUNT, COUNTCOL and SUM are rewritten over that; a count of the key's
+ * dimension side is a COUNTCOL there, the key being NULL in some of them.  A
+ * fact column is NULL in a null-extended row and is not NULL in a joined one
+ * when it is the fact's key or declared NOT NULL, so a count of it is
+ *
+ *	COUNTFACT	count(f.x), x the fact's key or a NOT NULL column of the
+ *				fact: lion_join_count(n), which is 0 for a dimension row
+ *				without fact rows, as the join's count is.
  */
 typedef enum LionFkAgg
 {
@@ -468,8 +489,41 @@ typedef enum LionFkAgg
 	LION_FKAGG_DISTINCT,
 	LION_FKAGG_ROWS,
 	LION_FKAGG_COUNTCOL,
-	LION_FKAGG_SUM
+	LION_FKAGG_SUM,
+	LION_FKAGG_COUNTFACT
 } LionFkAgg;
+
+/*
+ * Is the aggregate count(f.x) of a fact column x that no joined row holds
+ * NULL - the fact's key, which a strict join operator never matches when
+ * NULL, or a column declared NOT NULL (fj->factnotnull)?  Plain: no DISTINCT,
+ * ORDER BY or FILTER.  Asked of the dimension LEFT JOIN the fact, whose
+ * null-extended rows hold it NULL.
+ */
+static bool
+lion_fkjoin_agg_is_factcount(Aggref *agg, const LionFkJoin *fj)
+{
+	TargetEntry *tle;
+	Var		   *v;
+
+	if (agg->aggfnoid != F_COUNT_ANY)
+		return false;
+	if (agg->aggdistinct != NIL || agg->aggorder != NIL ||
+		agg->aggfilter != NULL || agg->aggvariadic)
+		return false;
+	if (agg->agglevelsup != 0 || agg->aggsplit != AGGSPLIT_SIMPLE ||
+		agg->aggkind != AGGKIND_NORMAL || list_length(agg->args) != 1)
+		return false;
+	tle = (TargetEntry *) linitial(agg->args);
+	if (!IsA(tle, TargetEntry))
+		return false;
+	v = (Var *) lion_strip((Node *) tle->expr);
+	if (v == NULL || !IsA(v, Var) || v->varlevelsup != 0 ||
+		v->varno != fj->fkvar->varno || v->varattno <= 0)
+		return false;
+	return v->varattno == fj->fkvar->varattno ||
+		bms_is_member(v->varattno, fj->factnotnull);
+}
 
 static LionFkAgg
 lion_fkjoin_agg_kind(Aggref *agg, const LionFkJoin *fj)
@@ -484,6 +538,8 @@ lion_fkjoin_agg_kind(Aggref *agg, const LionFkJoin *fj)
 		return LION_FKAGG_COUNT;
 	if (lion_fkjoin_agg_is_distinct(agg, fj))
 		return LION_FKAGG_DISTINCT;
+	if (fj->jointype == JOIN_LEFT && lion_fkjoin_agg_is_factcount(agg, fj))
+		return LION_FKAGG_COUNTFACT;
 
 	if (agg->aggdistinct != NIL || agg->aggorder != NIL ||
 		agg->aggfilter != NULL || agg->aggvariadic ||
@@ -564,6 +620,8 @@ typedef struct LionFkAggRewrite
 {
 	const LionFkJoin *fj;
 	Aggref	   *n;				/* the rows' count: a partial count(*) */
+	Expr	   *m;				/* the join's rows a dimension row is: n, or
+								 * GREATEST(n, 1) over a LEFT JOIN */
 	Oid			countfn;		/* lion_join_count(int8) */
 	Oid			sumfn;			/* lion_join_sum(int8) */
 	Oid			mul2op;			/* int2 * int8 */
@@ -656,6 +714,26 @@ lion_fkjoin_rewrite_init(LionFkAggRewrite *cx, const LionFkJoin *fj,
 	n->location = -1;
 	mark_partial_aggref(n, AGGSPLIT_INITIAL_SERIAL);
 	cx->n = n;
+	cx->m = (Expr *) n;
+
+	/*
+	 * The dimension LEFT JOIN the fact: a dimension row with no fact row is
+	 * one null-extended row of the join, so it is max(n, 1) rows of it.
+	 */
+	if (fj->jointype == JOIN_LEFT)
+	{
+		MinMaxExpr *mm = makeNode(MinMaxExpr);
+
+		mm->minmaxtype = INT8OID;
+		mm->minmaxcollid = InvalidOid;
+		mm->inputcollid = InvalidOid;
+		mm->op = IS_GREATEST;
+		mm->args = list_make2(n, makeConst(INT8OID, -1, InvalidOid,
+										   sizeof(int64), Int64GetDatum(1),
+										   false, FLOAT8PASSBYVAL));
+		mm->location = -1;
+		cx->m = (Expr *) mm;
+	}
 	return true;
 }
 
@@ -708,6 +786,10 @@ lion_fkjoin_rewrite_mutator(Node *node, LionFkAggRewrite *cx)
 		{
 			case LION_FKAGG_COUNT:
 				return (Node *) lion_fkjoin_make_agg(cx->countfn,
+													 (Expr *) copyObject(cx->m),
+													 NULL, agg);
+			case LION_FKAGG_COUNTFACT:
+				return (Node *) lion_fkjoin_make_agg(cx->countfn,
 													 (Expr *) copyObject(cx->n),
 													 NULL, agg);
 			case LION_FKAGG_COUNTCOL:
@@ -722,14 +804,14 @@ lion_fkjoin_rewrite_mutator(Node *node, LionFkAggRewrite *cx)
 					filter = (Expr *) nt;
 				}
 				return (Node *) lion_fkjoin_make_agg(cx->countfn,
-													 (Expr *) copyObject(cx->n),
+													 (Expr *) copyObject(cx->m),
 													 filter, agg);
 			case LION_FKAGG_SUM:
 				x = (Expr *) copyObject(((TargetEntry *) linitial(agg->args))->expr);
 				product = (OpExpr *) make_opclause(agg->aggfnoid == F_SUM_INT2 ?
 												   cx->mul2op : cx->mul4op,
 												   INT8OID, false, x,
-												   (Expr *) copyObject(cx->n),
+												   (Expr *) copyObject(cx->m),
 												   InvalidOid, InvalidOid);
 				set_opfuncid(product);
 				return (Node *) lion_fkjoin_make_agg(cx->sumfn,
@@ -1138,7 +1220,8 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 		(walk ? LION_JOINFLAG_WALK : 0) |
 		(sum ? LION_JOINFLAG_SUM : 0) |
 		(counts ? LION_JOINFLAG_COUNTS : 0) |
-		(unite ? LION_JOINFLAG_UNITE : 0);
+		(unite ? LION_JOINFLAG_UNITE : 0) |
+		(fj->jointype == JOIN_LEFT ? LION_JOINFLAG_LEFT : 0);
 
 	/*
 	 * The node starts when its child does - or, when it sorts the child's
@@ -1556,7 +1639,9 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	double		found;
 	int			jointype;
 	bool		parallel;
-	int			nagg[LION_FKAGG_SUM + 1] = {0};
+	int			nagg[LION_FKAGG_COUNTFACT + 1] = {0};
+	bool		left = (fj->jointype == JOIN_LEFT);
+	LionFkJoin	fjnn;
 	LionFkJoinAgg rowaggdata;
 	LionFkJoinAgg *rowagg = NULL;
 	bool		fkkey;
@@ -1566,6 +1651,15 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	Var		   *fgvar;
 	LionDriveInfo fgdrive;
 	ListCell   *lc;
+
+	/*
+	 * A count of a fact column declared NOT NULL is a count of the join's
+	 * pairs (lion_fkjoin_agg_is_count()), and over the dimension LEFT JOIN
+	 * the fact, of its joined rows (lion_fkjoin_agg_is_factcount()).
+	 */
+	fjnn = *fj;
+	fjnn.factnotnull = lion_notnullattnums(root, fj->factrel);
+	fj = &fjnn;
 
 	/*
 	 * The fact's join column may stand in the rows as the dimension's key
@@ -1649,7 +1743,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	}
 	if (nagg[LION_FKAGG_COUNT] + nagg[LION_FKAGG_DISTINCT] +
 		nagg[LION_FKAGG_ROWS] + nagg[LION_FKAGG_COUNTCOL] +
-		nagg[LION_FKAGG_SUM] == 0)
+		nagg[LION_FKAGG_SUM] + nagg[LION_FKAGG_COUNTFACT] == 0)
 		return;
 
 	/*
@@ -1662,8 +1756,14 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	 * the rows carry their counts and the Agg is given the aggregates
 	 * rewritten over them.
 	 */
+	/*
+	 * The dimension LEFT JOIN the fact always does: a partial count of a
+	 * dimension row is its n, where count(*) wants max(n, 1) and a count of a
+	 * fact column n, and only the rows' counts give the Agg both.  Every
+	 * dimension row goes up, a count of 0 included (LION_JOINFLAG_LEFT).
+	 */
 	if (nagg[LION_FKAGG_DISTINCT] + nagg[LION_FKAGG_ROWS] +
-		nagg[LION_FKAGG_COUNTCOL] + nagg[LION_FKAGG_SUM] > 0)
+		nagg[LION_FKAGG_COUNTCOL] + nagg[LION_FKAGG_SUM] > 0 || left)
 	{
 		/*
 		 * The rows of a fact column's groups are partial counts; a dimension
@@ -1676,10 +1776,10 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 		rowagg->target = output_rel->reltarget;
 		rowagg->having = having;
 		rowagg->hashable = (nagg[LION_FKAGG_DISTINCT] == 0);
-		rowagg->counts = (fj->jointype == JOIN_INNER ||
-						  fj->jointype == JOIN_UNIQUE_INNER) &&
-			nagg[LION_FKAGG_COUNT] + nagg[LION_FKAGG_COUNTCOL] +
-			nagg[LION_FKAGG_SUM] > 0;
+		rowagg->counts = ((fj->jointype == JOIN_INNER ||
+						   fj->jointype == JOIN_UNIQUE_INNER) &&
+						  nagg[LION_FKAGG_COUNT] + nagg[LION_FKAGG_COUNTCOL] +
+						  nagg[LION_FKAGG_SUM] > 0) || left;
 	}
 
 	if (rowagg == NULL)
@@ -1718,6 +1818,39 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 		nodetarget = fj->joinrel->reltarget;
 		if (contain_volatile_functions((Node *) nodetarget->exprs))
 			return;
+
+		/*
+		 * A fact column but the key that is in it is one a count reads - of
+		 * a column declared NOT NULL, the only aggregate of a fact column
+		 * the query may have besides the key's (lion_fkjoin_agg_is_count(),
+		 * lion_fkjoin_agg_is_factcount()) - which is rewritten over the rows'
+		 * counts: the rows do not carry it.  Over a LEFT JOIN that is so of
+		 * the key as well, which no aggregate reads as a value there.
+		 */
+		{
+			PathTarget *rowtarget = create_empty_pathtarget();
+			bool		dropped = false;
+			int			i = 0;
+
+			foreach(lc, nodetarget->exprs)
+			{
+				Node	   *expr = (Node *) lfirst(lc);
+				Index		sgref = get_pathtarget_sortgroupref(nodetarget, i++);
+
+				if (IsA(expr, Var) && ((Var *) expr)->varno == fj->fkvar->varno &&
+					(left || ((Var *) expr)->varattno != fj->fkvar->varattno))
+				{
+					dropped = true;
+					continue;
+				}
+				add_column_to_pathtarget(rowtarget, (Expr *) expr, sgref);
+			}
+			if (dropped)
+			{
+				set_pathtarget_cost_width(root, rowtarget);
+				nodetarget = rowtarget;
+			}
+		}
 		items = pull_var_clause((Node *) nodetarget->exprs,
 								PVC_RECURSE_AGGREGATES |
 								PVC_RECURSE_WINDOWFUNCS |
@@ -1754,7 +1887,8 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 
 			if (!lion_fkjoin_rewrite_init(&cx, fj,
 										  nagg[LION_FKAGG_COUNT] +
-										  nagg[LION_FKAGG_COUNTCOL] > 0,
+										  nagg[LION_FKAGG_COUNTCOL] +
+										  nagg[LION_FKAGG_COUNTFACT] > 0,
 										  nagg[LION_FKAGG_SUM] > 0))
 				return;
 			nodetarget = copy_pathtarget(nodetarget);

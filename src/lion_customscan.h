@@ -283,6 +283,12 @@
 										 * each group counted against the
 										 * union ("Grouped by a fact column,
 										 * the keys united") */
+#define LION_JOINFLAG_LEFT		0x200	/* with ROWS and COUNTS, the dimension
+										 * LEFT JOIN the fact: every child
+										 * row goes up, a NULL key, a key
+										 * without an entry and a count of 0
+										 * included, its count 0 then ("The
+										 * dimension LEFT JOIN the fact") */
 
 /*
  * Where an FK-side join's time goes (DESIGN.md §27, "Where a key's time
@@ -1883,6 +1889,8 @@ typedef struct LionJoinState
 	bool		unite;			/* LION_JOINFLAG_UNITE: a fact column's
 								 * groups counted against the union of a
 								 * batch's keys */
+	bool		left;			/* LION_JOINFLAG_LEFT: every child row a
+								 * row, with a count of 0 too */
 	bool		collected;
 	bool		filtered;
 	LionPostingSet filter;

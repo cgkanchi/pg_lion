@@ -153,6 +153,14 @@ SELECT count(*) AS customers, sum(LEAST(n, 3)) AS capped FROM n;
 whose equal values are always spelled alike: integers, text under a deterministic collation, or
 uuid, for example, but not numeric, where 1.0 and 1.00 are equal.
 
+A `LEFT JOIN` from the dimension keeps every customer, one with no order counted 0: `SELECT
+cu.country, count(o.id) FROM customers cu LEFT JOIN orders o ON o.customer_id = cu.id AND o.status =
+'open' GROUP BY cu.country` is pushed down as the JOIN is, each customer emitted with its count
+whether or not it has orders (`Join Type: Left` in EXPLAIN; DESIGN.md §27, "The dimension LEFT JOIN
+the fact"). Conditions on the orders go in the `ON` clause; one on the customers goes in `WHERE`.
+`count(*)` counts a customer without orders once, as the join does, and `count(o.col)` counts the
+orders when `o.col` is the foreign key or declared `NOT NULL`.
+
 `count(DISTINCT o.customer_id)` or `count(DISTINCT cu.city)` in place of `count(*)` is pushed down
 too: the node emits the matching customers, and PostgreSQL's own aggregate counts their distinct
 values. So are, in place of `count(*)` or beside it, `min`, `max`,
