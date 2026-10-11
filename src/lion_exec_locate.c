@@ -518,6 +518,73 @@ lion_locate_leaf(LionCountScanState *st, LionClauseState *cl,
 			}
 			break;
 
+		case LION_CLAUSE_DISTINCT:
+
+			/*
+			 * `col IS DISTINCT FROM c` (DESIGN.md §35) rejects the rows of
+			 * c's entry alone - or, when c is a parameter that came out NULL,
+			 * those of the NULL entry, `IS NOT NULL`'s.
+			 */
+			*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));
+			if (cl->valisnull ?
+				lion_posting_set_lookup_null_col(cl->idx, cl->idxcol,
+												 &(*sets)[0]) :
+				lion_posting_set_lookup_col(cl->idx, cl->idxcol, cl->val,
+											cl->valtype, &(*sets)[0]))
+			{
+				n = 1;
+				tree = lion_key_node(0);
+			}
+			else
+				lion_posting_set_release(&(*sets)[0]);
+			break;
+
+		case LION_CLAUSE_NOTMULTI:
+			{
+				/*
+				 * `NOT (tags @> q)` (DESIGN.md §35) rejects the rows the
+				 * query's sets hold exactly - the planner took a literal
+				 * they answer exactly, and anything else now is an error,
+				 * as it is for the query itself (lion_locate_multikey()) -
+				 * and the NULL entry's, for which the operator is NULL.
+				 */
+				LionPostingSet *qsets;
+				LionKeyNode *qtree;
+				int			qn = lion_locate_multikey(st, cl, &qsets, &qtree);
+				LionPostingSet nullset;
+				LionKeyNode **args;
+				int			nargs = 0;
+
+				if (cl->qmode != LION_QMODE_KEYS &&
+					cl->qmode != LION_QMODE_NONE)
+					elog(ERROR, "roaring count: query for index \"%s\" is no longer exact",
+						 RelationGetRelationName(cl->idx));
+				if (qn == 0)
+					qtree = NULL;
+				*sets = (LionPostingSet *)
+					palloc0(sizeof(LionPostingSet) * (qn + 1));
+				if (qn > 0)
+					memcpy(*sets, qsets, sizeof(LionPostingSet) * qn);
+				n = qn;
+				args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * 2);
+				if (qtree != NULL)
+					args[nargs++] = qtree;
+				if (lion_posting_set_lookup_null_col(cl->idx, cl->idxcol,
+													 &nullset))
+				{
+					(*sets)[n] = nullset;
+					args[nargs++] = lion_key_node(n);
+					n++;
+				}
+				else
+					lion_posting_set_release(&nullset);
+				if (nargs == 1)
+					tree = args[0];
+				else if (nargs == 2)
+					tree = lion_bool_node(LION_KN_OR, args, 2);
+				break;
+			}
+
 		case LION_CLAUSE_NULL:
 		case LION_CLAUSE_NOTNULL:
 			*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));
@@ -684,10 +751,17 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 	int		   *leafn;
 	bool	   *absorbed;
 	bool	   *left;
+	bool	   *never;			/* a complement leaf true of no row */
 	LionKeyNode **arms;
+	LionKeyNode **marms;
+	LionCountSource *m = NULL;
 	int			narms = 0;
+	int			nmarms = 0;
+	bool		mempty = false;	/* a complement arm true of every row */
 	int			total = 0;
+	int			mtotal = 0;
 	int			off = 0;
+	int			moff = 0;
 	int			leaf = 0;
 	int			armfirst = 0;
 	int			arm = 0;
@@ -700,6 +774,7 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 	leafn = (int *) palloc0(sizeof(int) * orst->nleaves);
 	absorbed = (bool *) palloc0(sizeof(bool) * orst->nleaves);
 	left = (bool *) palloc0(sizeof(bool) * orst->nleaves);
+	never = (bool *) palloc0(sizeof(bool) * orst->nleaves);
 
 	for (i = 0; i < orst->nleaves; i++)
 	{
@@ -746,47 +821,82 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 											&walked);
 			Assert(!walked);
 		}
+		else if (cl->kind == LION_CLAUSE_NE && cl->valisnull)
+		{
+			/* `col <> NULL` is true of no row (DESIGN.md §35) */
+			never[i] = true;
+			continue;
+		}
 		else
 		{
+			/*
+			 * A complement leaf (DESIGN.md §35) locates the sets it rejects,
+			 * N; no set at all is a leaf true of every row.
+			 */
 			leaftree[i] = lion_locate_leaf(st, cl, &leafsets[i], &leafn[i]);
 			if (leaftree[i] != NULL && cl->kind == LION_CLAUSE_MULTI &&
 				cl->qmode == LION_QMODE_LOSSY)
 				leaftree[i] = lion_posfilter_node(cl, leaftree[i]);
 		}
-		total += leafn[i];
+		if (orst->armcompl != NULL && orst->armcompl[arm])
+			mtotal += leafn[i];
+		else
+			total += leafn[i];
 		CHECK_FOR_INTERRUPTS();
 	}
 
 	/*
-	 * One array for the whole source, with every leaf's tree moved onto it,
-	 * and each leaf's own array let go as it is copied: an IN list of a
-	 * parameter can be millions of sets long (DESIGN.md §15).
+	 * One array for the positive arms' sets and one for the complement arms',
+	 * with every leaf's tree moved onto its own, and each leaf's array let go
+	 * as it is copied: an IN list of a parameter can be millions of sets long
+	 * (DESIGN.md §15).
 	 */
 	src->sets = (LionPostingSet *)
 		palloc_extended(sizeof(LionPostingSet) * Max(total, 1),
 						MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
 	src->nsets = total;
 	src->nomaterialize = true;
+	if (orst->compl)
+	{
+		m = (LionCountSource *) palloc0(sizeof(LionCountSource));
+		m->sets = (LionPostingSet *)
+			palloc_extended(sizeof(LionPostingSet) * Max(mtotal, 1),
+							MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
+		m->nsets = mtotal;
+		m->nomaterialize = true;
+	}
+	armfirst = 0;
+	arm = 0;
 	for (i = 0; i < orst->nleaves; i++)
 	{
+		bool		incompl;
+
+		while (i >= armfirst + orst->armlen[arm])
+			armfirst += orst->armlen[arm++];
+		incompl = (orst->armcompl != NULL && orst->armcompl[arm]);
 		if (leafn[i] > 0)
 		{
-			memcpy(&src->sets[off], leafsets[i],
+			memcpy(incompl ? &m->sets[moff] : &src->sets[off], leafsets[i],
 				   sizeof(LionPostingSet) * leafn[i]);
 			pfree(leafsets[i]);
 			leafsets[i] = NULL;
 		}
-		lion_shift_keynos(leaftree[i], off);
-		off += leafn[i];
+		lion_shift_keynos(leaftree[i], incompl ? moff : off);
+		if (incompl)
+			moff += leafn[i];
+		else
+			off += leafn[i];
 	}
-	Assert(off == total);
+	Assert(off == total && moff == mtotal);
 
 	arms = (LionKeyNode **) palloc0(sizeof(LionKeyNode *) * orst->narms);
+	marms = (LionKeyNode **) palloc0(sizeof(LionKeyNode *) * orst->narms);
 	for (i = 0; i < orst->narms; i++)
 	{
 		LionKeyNode **conj = (LionKeyNode **)
 			palloc0(sizeof(LionKeyNode *) * orst->armlen[i]);
 		int			nconj = 0;
+		int			nkept = 0;
 		bool		empty = false;
 
 		for (j = 0; j < orst->armlen[i]; j++, leaf++)
@@ -795,29 +905,74 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 				continue;		/* a bound of a range an earlier leaf is */
 			if (left[leaf])
 				continue;		/* refuted with its arm, or implied */
-			if (leaftree[leaf] == NULL)
-				empty = true;	/* an AND with a leaf that selects nothing */
+			nkept++;
+			if (never[leaf])
+				empty = true;	/* a complement leaf true of no row */
+			else if (leaftree[leaf] == NULL)
+			{
+				/*
+				 * A positive leaf that selects nothing empties its AND; a
+				 * complement leaf with no set rejects nothing, and leaves
+				 * the union of its arm's sets as it was.
+				 */
+				if (orst->armcompl == NULL || !orst->armcompl[i])
+					empty = true;
+			}
 			else
 				conj[nconj++] = leaftree[leaf];
 		}
 
-		if (empty || nconj == 0)
+		if (empty || nkept == 0)
 			continue;			/* this arm contributes nothing to the union */
 
+		if (orst->armcompl != NULL && orst->armcompl[i])
+		{
+			/*
+			 * A complement arm is true of every row outside the union of its
+			 * leaves' sets, N; with none, of every row, and so is the OR.
+			 */
+			if (nconj == 0)
+				mempty = true;
+			else
+				marms[nmarms++] = (nconj == 1) ? conj[0] :
+					lion_bool_node(LION_KN_OR, conj, nconj);
+			continue;
+		}
 		arms[narms++] = lion_bool_node(LION_KN_AND, conj, nconj);
 	}
 
-	if (narms == 0)
-	{
+	src->tree = (narms > 0) ? lion_bool_node(LION_KN_OR, arms, narms) : NULL;
+	if (src->tree != NULL &&
+		!lion_sets_satisfiable(src->nsets, src->sets, src->tree))
 		src->tree = NULL;
-		st->wheremissing = true;
+
+	/*
+	 * The complement arms: the OR is P, the positive arms' union, together
+	 * with every row outside M, the intersection of the complement arms'
+	 * N (DESIGN.md §35, "Complements in an OR").  M of no row - an arm true
+	 * of every row, or arms whose sets no row is in - makes the OR every
+	 * row; no complement arm left - each was true of no row, or refuted by
+	 * the partition's bounds - leaves P alone, as an OR always was.
+	 */
+	if (m != NULL && (nmarms > 0 || mempty))
+	{
+		m->tree = mempty ? NULL :
+			(nmarms == 1) ? marms[0] :
+			lion_bool_node(LION_KN_AND, marms, nmarms);
+		if (m->tree != NULL &&
+			!lion_sets_satisfiable(m->nsets, m->sets, m->tree))
+			m->tree = NULL;
+		src->compl = m;
 		return;
 	}
-
-	src->tree = lion_bool_node(LION_KN_OR, arms, narms);
+	if (m != NULL)
+	{
+		for (i = 0; i < m->nsets; i++)
+			lion_posting_set_release(&m->sets[i]);
+	}
 
 	/* Every arm wants a key no entry holds: the union selects nothing. */
-	if (!lion_sets_satisfiable(src->nsets, src->sets, src->tree))
+	if (src->tree == NULL)
 		st->wheremissing = true;
 }
 
@@ -1065,6 +1220,7 @@ lion_locate_where(LionCountScanState *st)
 		src->nomaterialize = false;
 		src->disjoint = false;
 		src->rangewalk = NULL;
+		src->compl = NULL;
 
 		if (st->item[k].orno >= 0)
 		{
@@ -1308,6 +1464,12 @@ lion_release_where(LionCountScanState *st)
 
 		for (j = 0; j < src->nsets; j++)
 			lion_posting_set_release(&src->sets[j]);
+		if (src->compl != NULL)
+		{
+			for (j = 0; j < src->compl->nsets; j++)
+				lion_posting_set_release(&src->compl->sets[j]);
+			src->compl = NULL;
+		}
 		src->nsets = 0;
 		src->sets = NULL;
 		src->tree = NULL;		/* it lived in wherecxt, reset below */

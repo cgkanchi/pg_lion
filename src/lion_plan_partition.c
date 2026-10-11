@@ -362,7 +362,8 @@ lion_leaf_selects(List *clauseinfos, const bool *drop, const bool *orrange)
 		LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
 		int			r = ci->rinfono;
 
-		if ((r >= 0 && drop[r]) || !LION_CLAUSE_IS_POSITIVE(ci->kind))
+		if ((r >= 0 && drop[r]) || !LION_CLAUSE_IS_POSITIVE(ci->kind) ||
+			ci->incompl)
 			continue;
 		if (ci->inor ? (r < 0 || !orrange[r]) :
 			ci->kind != LION_CLAUSE_RANGESRC)
@@ -407,7 +408,8 @@ lion_pinned_not_implied(PlannerInfo *root, RelOptInfo *toprel,
 		ListCell   *l2;
 		bool		pinned = true;
 
-		if (!LION_CLAUSE_IS_POSITIVE(ci->kind) || ci->rinfono < 0)
+		if (!LION_CLAUSE_IS_POSITIVE(ci->kind) || ci->rinfono < 0 ||
+			ci->incompl)
 			continue;
 		if (ci->inor)
 		{

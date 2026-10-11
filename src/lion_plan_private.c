@@ -115,7 +115,7 @@ lion_priv_decode_relation(List *priv, LionCountPriv *out)
 		cl->idxoid = list_nth_oid(oids, 3 + i);
 		cl->attno = (AttrNumber) list_nth_int(ints, 4 + i);
 		cl->opno = list_nth_oid(ops, i);
-		if (cl->kind < LION_CLAUSE_EQ || cl->kind > LION_CLAUSE_NE)
+		if (cl->kind < LION_CLAUSE_EQ || cl->kind > LION_CLAUSE_NOTMULTI)
 			elog(ERROR, "LionCount: unknown clause kind %d", cl->kind);
 	}
 }
@@ -1165,6 +1165,36 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 		 p->distattno != 0 || p->coalconst != NULL || sumall ||
 		 !hasgroupidx || hasrange || p->npart > 0 || p->hasjoin))
 		elog(ERROR, "LionCount: malformed decoded walk");
+
+	/*
+	 * An arm of an OR selects (a positive clause in each leaf) or is a
+	 * complement (a negated clause in each, DESIGN.md §35), and an OR with a
+	 * complement arm makes every count two (lion_node_count()), which the
+	 * decoded walk, the FK-side join and a parallel GROUP BY never do.
+	 */
+	for (i = 0; i < p->nor; i++)
+	{
+		const LionOrState *o = &p->ors[i];
+		int			at = o->first;
+		int			a;
+		bool		compl = false;
+
+		for (a = 0; a < o->narms; a++)
+		{
+			bool		neg = LION_CLAUSE_IS_NEGATED(p->clause[at].kind);
+
+			for (j = at; j < at + o->armlen[a]; j++)
+			{
+				if (p->clause[j].kind == LION_CLAUSE_RANGE ||
+					LION_CLAUSE_IS_NEGATED(p->clause[j].kind) != neg)
+					elog(ERROR, "LionCount: malformed OR arm");
+			}
+			compl |= neg;
+			at += o->armlen[a];
+		}
+		if (compl && (decode || p->hasjoin || parallel_aware))
+			elog(ERROR, "LionCount: an OR with a complement arm in a shape that counts once");
+	}
 
 	/*
 	 * An expression column (DESIGN.md §41) is of one table counted with no

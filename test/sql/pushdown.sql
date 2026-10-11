@@ -855,7 +855,8 @@ SELECT count(*) FROM lion_pdo WHERE a = 17 OR b = 3;
 SELECT c, count(*) FROM lion_pdo WHERE a = 17 OR b = 3 GROUP BY c ORDER BY c;
 
 -- ---- ORs the node must decline -----------------------------------------
--- a negated arm
+-- an arm of negated clauses is not declined: it is a complement, counted by
+-- De Morgan (DESIGN.md §35, "Complements in an OR")
 SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR n IS NOT NULL');
 SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR NOT (b = 3)');
 SELECT lion_plans('SELECT count(*) FROM lion_pdo WHERE a = 17 OR n IS NOT NULL');
