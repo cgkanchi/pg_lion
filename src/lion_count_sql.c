@@ -23,19 +23,6 @@ PG_FUNCTION_INFO_V1(lion_index_count_any);
  * --------------------------------------------------------------------- */
 
 /*
- * Common argument validation for the lion_index_count* functions.
- * Everything is opened here and closed by lion_count_sql_close().
- */
-typedef struct LionCountCall
-{
-	int			nkeys;
-	Relation	heap;
-	Relation	index[2];
-	Datum		key[2];
-	Oid			keytype[2];
-} LionCountCall;
-
-/*
  * An index's expressions or predicate AS STORED in pg_index, NIL when it has
  * none.  RelationGetIndexExpressions()/RelationGetIndexPredicate() hand back
  * the planner's simplified form, in which an inlinable SQL function has
@@ -152,7 +139,7 @@ lion_check_function_acl(Oid funcid, void *context)
 	return false;
 }
 
-static bool
+bool
 lion_check_functions_walker(Node *node, void *context)
 {
 	if (node == NULL)
@@ -388,10 +375,11 @@ lion_count_check_collation(Relation heap, Relation index, AttrNumber col,
  * one up); keycoll[i] is the collation key i brings
  * (lion_count_arg_collation()).
  */
-static void
+void
 lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 					   const Oid *keytype, const Oid *keycoll,
-					   AttrNumber wantcol, LionCountCall *call)
+					   AttrNumber wantcol, bool multikey_ok,
+					   LionCountCall *call)
 {
 	Oid			heapoid = InvalidOid;
 	char	   *heapname;
@@ -523,15 +511,20 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 		 * keyed functions and the grouped one refuse such a column alike;
 		 * the LionCount planner refuses to drive a GROUP BY from one for the same
 		 * reason, and answers `@>` or `@@` through lion_extract_query().
+		 * lion_index_facets() (lion_facets.c) is the one caller that takes
+		 * such a column (multikey_ok): it counts the rows under each entry,
+		 * which is what an entry of an extracted key is.
 		 */
 		{
 			AttrNumber	col = (wantcol == 0) ? 1 : wantcol;
 
-			if (lion_index_column_state(index, col)->multikey)
+			if (!multikey_ok &&
+				lion_index_column_state(index, col)->multikey)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("key column %d of index \"%s\" has a multi-key operator class, whose entries are not column values",
-								col, RelationGetRelationName(index))));
+								col, RelationGetRelationName(index)),
+						 errhint("lion_index_facets() counts the rows under each key of such a column.")));
 
 			lion_count_check_collation(call->heap, index, col,
 									   (keycoll != NULL) ? keycoll[i] :
@@ -659,6 +652,23 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 		Oid			opcintype = index->rd_opcintype[col - 1];
 		Oid			eqop = InvalidOid;
 
+		/*
+		 * The keys of a multi-key column are the ELEMENTS a query unnests
+		 * (lion_index_facets()), and `GROUP BY element` compares them with
+		 * the element type's own equality, which is also the one the index
+		 * deduplicates them with (DESIGN.md §17, "Key type resolution").
+		 */
+		if (lion_index_column_state(index, col)->multikey)
+		{
+			Oid			typid = lion_index_column_state(index, col)->typid;
+			TypeCacheEntry *tce = lookup_type_cache(typid, TYPECACHE_EQ_OPR);
+
+			if (!OidIsValid(tce->eq_opr))
+				elog(ERROR, "missing equality operator for type %u", typid);
+			lion_check_execute(get_opcode(tce->eq_opr));
+			continue;
+		}
+
 		if (OidIsValid(call->keytype[i]))
 			eqop = get_opfamily_member(opfamily, opcintype,
 									   call->keytype[i], 1);
@@ -710,13 +720,13 @@ lion_count_sql_open(FunctionCallInfo fcinfo, int nkeys, Snapshot snapshot,
 	}
 
 	lion_count_open_indexes(snapshot, nkeys, idxoid, keytype, keycoll, 0,
-						   call);
+						   false, call);
 
 	for (i = 0; i < nkeys; i++)
 		call->key[i] = key[i];
 }
 
-static void
+void
 lion_count_sql_close(LionCountCall *call)
 {
 	int			i;
@@ -922,7 +932,7 @@ lion_index_count_any(PG_FUNCTION_ARGS)
 
 	keycoll = lion_count_arg_collation(fcinfo, 1);
 	lion_count_open_indexes(snapshot, 1, &idxoid, &elemtype, &keycoll, 0,
-						   &call);
+						   false, &call);
 
 	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
 	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
@@ -1033,7 +1043,8 @@ lion_index_count_group_stats(PG_FUNCTION_ARGS)
 						idxname, attno)));
 	}
 
-	lion_count_open_indexes(snapshot, 1, &idxoid, NULL, NULL, attno, &call);
+	lion_count_open_indexes(snapshot, 1, &idxoid, NULL, NULL, attno, false,
+						   &call);
 
 	memset(&stats, 0, sizeof(stats));
 	/* use_cache = false is the pre-cache behaviour, for an A/B in one query */
