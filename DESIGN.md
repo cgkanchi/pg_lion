@@ -6235,8 +6235,7 @@ Operations.
   - verify accepts a level-0 head with right siblings, and refuses more than 16 of them, a
     flagged leaf among them, and a right sibling of an internal root.
   Position trees (§17) take the same shape, and the planner's posting height is 0 up to 16 leaves.
-  Measured on the benchmark's synthetic `fact` (5M rows) and the docs table (500k rows): see
-  "Measured: the sets without an internal level" below.
+  Measured below ("The sets without an internal level, measured").
 - **Root split is a PUSH-DOWN**, and this is the deviation that matters most from the first draft,
   which had it allocate a new root and rewrite the entry's `head`. The root block never moves: its
   items go to a brand new child and the root block itself becomes the level above, holding one
@@ -6376,6 +6375,22 @@ Operations.
   reserves a block for the ROOT and re-stamps the held leaves with it - their images are still in
   memory, and every page of a set has to carry the root's block as its owner (§18) - and writes
   them with their downlinks.
+
+### The sets without an internal level, measured
+
+Bulk builds on the benchmark's synthetic tables (2026-10-11, PostgreSQL 18): `fact` (5M rows) on
+`c200`, 200 keys of about 25,000 rows, and `docs` (500k rows) on `tags` (text[]), `tsv` (tsvector)
+and `tsv` WITH (store_positions = true). No posting set of these indexes has more than 16
+leaves, so every root went; there are as many leaves as before.
+
+    index                  pages before -> after   posting roots   position roots   size
+    fact (c200)                    2015 -> 1815      200 -> 0             -           16 MB -> 14 MB
+    docs (tags)                    1179 ->  977      202 -> 0             -          9432 kB -> 7816 kB
+    docs (tsv)                     1712 -> 1508      204 -> 0             -           13 MB -> 12 MB
+    docs (tsv, positions)          3920 -> 3515      205 -> 0         203 -> 3        31 MB -> 27 MB
+
+The roots that went were 98-99% empty: a handful of downlinks each, 9 on `c200` and fewer than 3 on
+the docs columns. The three position trees left with a root have more than 16 leaves.
 
 ### Cost model (`lion_cost_count_rel()`)
 
