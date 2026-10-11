@@ -2815,7 +2815,14 @@ finest grouping's rows are few, which is what makes the node worth using. A set'
 `estimate_num_groups()` over the node's rows. The Agg claims no order, since its first rollup
 need not be the one core's `group_pathkeys` were made for, and an ORDER BY gets a Sort above the
 LionJoinAgg. The cost is core's `cost_sort()` and `cost_agg()` over the node's path, and
-`add_path()` chooses between the plan and core's own.
+`add_path()` chooses between the plan and core's own. The Agg's aggregate costs are the query's,
+computed for it (`get_agg_clause_costs()`, `AGGSPLIT_SIMPLE`, as core prices its own Agg over the
+table), not read from the `GroupPathExtraData`: core sets that struct's `agg_final_costs` only
+when it builds partially aggregated paths (`partial_costs_set`), which grouping sets and a
+DISTINCT aggregate never allow, and leaves it otherwise as its stack held it. Read there, the
+first version's Agg was priced at whatever a backend's stack held - its real cost in one session,
+1e108 in a fresh backend on PostgreSQL 16, where core's plan then won - and countgsets.sql checks
+the price in a fresh backend (`\c`).
 
 **Privileges.** The Agg below asks EXECUTE on what it runs - the extension's aggregates and those
 left as they stand - and the node on `count()`; the query's rewritten aggregates (`sum(int4)`,
@@ -2881,8 +2888,8 @@ grouping column and one distinct column keeps its plan, and a second form of the
 only compete with it. Where §26 declines - two or more grouping columns, two distinct columns, a
 DISTINCT aggregate other than `count`, a partitioned table (whose (g, k) groups the Finalize Agg
 under the node merges, so the distinct counts above it are exact) - or loses to core on price,
-the finer grouping is offered. The cost is core's sort and Agg over the node's path, and
-`add_path()` chooses.
+the finer grouping is offered. The cost is core's sort and Agg over the node's path, its
+aggregate costs computed as for grouping sets, above, and `add_path()` chooses.
 
 A column the finer grouping adds is grouped by its type's default equality, so one value of each
 equality class reaches the Agg; every column an aggregate reads must therefore have an equality

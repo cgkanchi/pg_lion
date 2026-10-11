@@ -331,5 +331,60 @@ SELECT gs_q('SELECT a, b, count(*), sum(b) FROM gsp GROUP BY CUBE (a, b)');
  counted, 54 rows
 (1 row)
 
+-- ---- the Agg's costs, in a backend that has planned nothing yet ----
+-- The Agg over the finer grouping's rows is priced with aggregate costs the
+-- node computes, not core's GroupPathExtraData.agg_final_costs: core fills
+-- those only when it builds partially aggregated paths, which grouping sets
+-- and a DISTINCT aggregate never allow, and leaves them as its stack held
+-- them otherwise - which in a fresh backend on PostgreSQL 16 priced the Agg
+-- at 1e108, and the plan was core's.  gs_cost() reports whether the plan's
+-- cost is the count's below it plus a little for the Agg over its rows.
+CREATE FUNCTION gs_cost(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	j json;
+	top float8;
+	cnt float8;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	top := (j -> 0 -> 'Plan' ->> 'Total Cost')::float8;
+	cnt := (jsonb_path_query_first(j::jsonb,
+		'$.** ? (@."Custom Plan Provider" == "LionCount")."Total Cost"'))::text::float8;
+	IF cnt IS NULL THEN
+		RETURN 'not counted';
+	END IF;
+	IF top >= cnt AND top < cnt + 1000 THEN
+		RETURN 'counted, at the count''s cost and the Agg''s';
+	END IF;
+	RETURN format('counted, at %s over a count at %s', top, cnt);
+END $$;
+\c -
+SET max_parallel_workers_per_gather = 0;
+SELECT gs_cost('SELECT a, b, sum(DISTINCT s) FROM gs WHERE t IN (''v1'', ''v2'') GROUP BY a, b');
+                  gs_cost                   
+--------------------------------------------
+ counted, at the count's cost and the Agg's
+(1 row)
+
+SELECT gs_cost('SELECT a, b, count(*), GROUPING(a, b) FROM gs GROUP BY ROLLUP (a, b)');
+                  gs_cost                   
+--------------------------------------------
+ counted, at the count's cost and the Agg's
+(1 row)
+
+SELECT gs_q('SELECT a, b, sum(DISTINCT s) FROM gs WHERE t IN (''v1'', ''v2'') GROUP BY a, b');
+       gs_q       
+------------------
+ counted, 40 rows
+(1 row)
+
 DROP TABLE gs, gsp;
-DROP FUNCTION gs_q(text), gs_plan(text);
+DROP FUNCTION gs_q(text), gs_plan(text), gs_cost(text);
