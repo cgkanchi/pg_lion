@@ -469,6 +469,32 @@ lion_plan_join_agg_path(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * The LION_TL_FCOUNT kind of agg, when it is one of priv's filtered counts
+ * (DESIGN.md §10, "Filtered counts"): its condition equal() to the one the
+ * planner numbered its filter by.  0 for any other aggregate.
+ */
+static int
+lion_fcount_kind(Aggref *agg, const LionCountPriv *priv)
+{
+	Node	   *fexpr;
+	Var		   *fcol;
+	int			form;
+	ListCell   *lc;
+	int			f = 0;
+
+	if (priv->nfilter == 0 || !lion_agg_filtered(agg, &fexpr, &form, &fcol))
+		return 0;
+	foreach(lc, priv->filterexprs)
+	{
+		f++;
+		if (equal(lfirst(lc), fexpr))
+			return LION_TL_FCOUNT(f, form);
+	}
+	elog(ERROR, "LionCount: a filtered count of no filter of the plan");
+	return 0;					/* keep the compiler quiet */
+}
+
+/*
  * Which of the decoded walk's GROUP BY columns (DESIGN.md §34) attno is, in
  * the order the walk takes them: 0 for the first, which is priv's group
  * column, 1 and on for the others, and -1 for a column that is not one of
@@ -712,7 +738,12 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			lion_wagg_add_target((Aggref *) sexpr, &priv, &ctlist, &kinds,
 								 &wargs))
 			continue;
-		if (IsA(sexpr, Aggref))
+		if (IsA(sexpr, Aggref) &&
+			(kind = lion_fcount_kind((Aggref *) sexpr, &priv)) != 0)
+		{
+			/* a filtered count (DESIGN.md §10), counted by its run */
+		}
+		else if (IsA(sexpr, Aggref))
 		{
 			Aggref	   *agg = (Aggref *) sexpr;
 			AttrNumber	attno = 0;
@@ -761,7 +792,7 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				{
 					for (i = 0; i < priv.nclause; i++)
 					{
-						if (!inor[i] &&
+						if (!inor[i] && priv.clause[i].filter == 0 &&
 							priv.clause[i].kind == LION_CLAUSE_NULL &&
 							priv.clause[i].attno == attno)
 						{
@@ -800,6 +831,8 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 
 					if (inor[i])
 						continue;	/* §19: an OR leaf pins nothing */
+					if (priv.clause[i].filter != 0)
+						continue;	/* §10: a filter pins its count's rows */
 					if (ckind != LION_CLAUSE_EQ && ckind != LION_CLAUSE_NULL)
 						continue;
 					if (priv.clause[i].attno == attno)
@@ -864,6 +897,9 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->custom_exprs = priv.consts;
 	priv.consts = NIL;
 	priv.having = NIL;
+
+	/* the filters' conditions numbered the target list, and are done */
+	priv.filterexprs = NIL;
 
 	/*
 	 * The aggregates over lion columns' entries (DESIGN.md §37): what each
