@@ -358,8 +358,8 @@ lion_fill_posting_set_entry(Relation index, LionState *state,
 	ps->attno = entry->attno;
 	ps->pinbuf = InvalidBuffer;
 	ps->found = true;
-	ps->ntids = entry->ntids;
-	ps->ncontainers = entry->ncontainers;
+	ps->ntids = lion_entry_ntids(entry);
+	ps->ncontainers = lion_entry_ncontainers(entry);
 	ps->entryblk = blkno;
 	ps->entryoff = offnum;
 	ps->cxt = CurrentMemoryContext;
@@ -401,7 +401,7 @@ lion_fill_posting_set_entry(Relation index, LionState *state,
 	{
 		Assert((entry->flags & LION_ENTRY_CHAIN) != 0);
 		ps->is_inline = false;
-		ps->head = entry->head;
+		ps->head = lion_entry_head(entry);
 		*keeppin = false;
 	}
 }
@@ -1353,11 +1353,11 @@ lion_lookup_walk_begin(LionLookupWalk *walk, Relation index, AttrNumber attno,
 
 	/* a high key is a pivot: a header and a key, never a payload */
 	walk->hikey = (LionEntryTuple *)
-		palloc(MAXALIGN(LION_ENTRY_HDRSZ + LION_MAX_KEY_SIZE));
+		palloc(LION_MAX_PIVOT_TUPLE);
 	walk->hikeylen = 0;
 	walk->parent.blk = InvalidBlockNumber;
 	walk->parent.hikey = (LionEntryTuple *)
-		palloc(MAXALIGN(LION_ENTRY_HDRSZ + LION_MAX_KEY_SIZE));
+		palloc(LION_MAX_PIVOT_TUPLE);
 
 	/*
 	 * Stepping right over s leaves reads s pages where a descent reads the
@@ -1753,9 +1753,9 @@ lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 			LionEntryTuple *hk = (LionEntryTuple *) PageGetItem(page, iid);
 			Size		len = ItemIdGetLength(iid);
 
-			if (len >= LION_ENTRY_HDRSZ &&
-				len <= MAXALIGN(LION_ENTRY_HDRSZ + LION_MAX_KEY_SIZE) &&
-				(Size) hk->keylen <= len - LION_ENTRY_HDRSZ)
+			if (len >= LION_ENTRY_SHORT_HDRSZ &&
+				len <= LION_MAX_PIVOT_TUPLE &&
+				LionEntryPayloadOffset(hk) <= len)
 			{
 				memcpy(walk->hikey, hk, len);
 				walk->hikeylen = len;

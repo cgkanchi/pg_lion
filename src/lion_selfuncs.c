@@ -400,7 +400,7 @@ lion_probe_entry_alive(LionProbeHeap *ph, Relation index,
 	LionSetStream *st;
 	const LionContainer *c;
 
-	if (entry->ntids == 0)
+	if (lion_entry_ntids(entry) == 0)
 		return false;
 
 	memset(&ps, 0, sizeof(ps));
@@ -408,8 +408,8 @@ lion_probe_entry_alive(LionProbeHeap *ph, Relation index,
 	ps.attno = entry->attno;
 	ps.found = true;
 	ps.pinbuf = InvalidBuffer;
-	ps.ntids = entry->ntids;
-	ps.ncontainers = entry->ncontainers;
+	ps.ntids = lion_entry_ntids(entry);
+	ps.ncontainers = lion_entry_ncontainers(entry);
 	ps.entryblk = InvalidBlockNumber;
 	ps.entryoff = InvalidOffsetNumber;
 	ps.cxt = CurrentMemoryContext;
@@ -421,7 +421,7 @@ lion_probe_entry_alive(LionProbeHeap *ph, Relation index,
 		ps.paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemsz);
 	}
 	else
-		ps.head = entry->head;
+		ps.head = lion_entry_head(entry);
 
 	ph->alive = false;
 	st = lion_stream_begin(1, &ps, NULL, false);
@@ -479,7 +479,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 	lion_rightwalk_init(&walk);
 
 	/* every item at least an entry header and a line pointer, as a batch */
-	maxitems = BLCKSZ / (MAXALIGN(LION_ENTRY_HDRSZ) + sizeof(ItemIdData)) + 1;
+	maxitems = BLCKSZ / (MAXALIGN(LION_ENTRY_SHORT_HDRSZ) + sizeof(ItemIdData)) + 1;
 	items = (LionEntryTuple **) palloc(sizeof(LionEntryTuple *) * maxitems);
 	sizes = (Size *) palloc(sizeof(Size) * maxitems);
 

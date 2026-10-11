@@ -202,7 +202,7 @@ lion_dir_downlink_block(Relation index, Page page, BlockNumber blk,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lion index \"%s\": internal page %u has no downlink",
 						RelationGetRelationName(index), blk)));
-	child = lion_page_item(page, off)->head;
+	child = lion_entry_head(lion_page_item(page, off));
 	if (unlikely(!BlockNumberIsValid(child)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -308,8 +308,21 @@ lion_cmp_prefix(const LionEntryTuple *item, const LionSearchKey *sk)
 			return c < 0 ? -1 : 1;
 	}
 
-	if (item->hash != sk->hash)
-		return item->hash < sk->hash ? -1 : 1;
+	/*
+	 * The hash term.  No entry stores its hash (DESIGN.md §21, "Entry
+	 * tuples"): it is recomputed from the stored key, which in an ordered
+	 * column happens only when proc 4 ties - once or twice a descent - and in
+	 * a column without one at every comparison, where it takes the place of
+	 * the call to proc 4 an ordered column makes.  ikind is VALUE or SUMMARY
+	 * here, and a summary's hash is 0 whatever its key.
+	 */
+	{
+		uint32		ihash = (ikind == LION_KIND_VALUE) ?
+			lion_hash_key(sk->col, lion_entry_key(sk->col, item)) : 0;
+
+		if (ihash != sk->hash)
+			return ihash < sk->hash ? -1 : 1;
+	}
 
 	return 0;
 }
@@ -393,7 +406,7 @@ lion_search_key_exact(LionIndexState *ix, LionSearchKey *sk,
 	if (entry->attno == 0 || kind == LION_KIND_MINF)
 	{
 		lion_search_key_init(lion_column(ix, 1), sk, LION_KIND_MINF, (Datum) 0,
-							 entry->hash);
+							 0);
 		sk->attno = 0;
 		sk->cmpproc = NULL;
 	}
@@ -418,7 +431,7 @@ lion_search_key_exact(LionIndexState *ix, LionSearchKey *sk,
 							 LION_KIND_HAS_KEY(kind) ?
 							 lion_entry_key(col, entry) :
 							 (Datum) 0,
-							 entry->hash);
+							 lion_entry_hash(col, entry));
 	}
 
 	sk->raw = LionEntryGetKey(entry);
@@ -637,9 +650,9 @@ lion_dir_note_parent(Page page, BlockNumber blk, LionDirParent *parent)
 		LionEntryTuple *hk = (LionEntryTuple *) PageGetItem(page, iid);
 		Size		len = ItemIdGetLength(iid);
 
-		if (len >= LION_ENTRY_HDRSZ &&
-			len <= MAXALIGN(LION_ENTRY_HDRSZ + LION_MAX_KEY_SIZE) &&
-			(Size) hk->keylen <= len - LION_ENTRY_HDRSZ)
+		if (len >= LION_ENTRY_SHORT_HDRSZ &&
+			len <= LION_MAX_PIVOT_TUPLE &&
+			LionEntryPayloadOffset(hk) <= len)
 		{
 			memcpy(parent->hikey, hk, len);
 			parent->hikeylen = len;
@@ -1324,41 +1337,6 @@ lion_dir_step_left(Relation index, Buffer buf, int maxsteps)
  * Placing items
  * --------------------------------------------------------------------- */
 
-/*
- * A pivot tuple - a high key or a downlink - carrying src's key and kind.
- * child is the downlink target, or InvalidBlockNumber for a high key; a NULL
- * src makes the minus-infinity downlink.  The open summary bucket's entry
- * gives a pivot of the SUMMARY kind with its key as it is now, never one of
- * its own kind (lion_pivot_kindflags(), DESIGN.md §32): an append split puts
- * the new SUMLAST entry alone on the right page, and when that bucket closed
- * in place a SUMLAST high key left of it sorted above it.
- */
-static LionEntryTuple *
-lion_make_pivot(const LionEntryTuple *src, uint16 pivotflag, BlockNumber child,
-				Size *size)
-{
-	Size		keylen = (src != NULL) ? src->keylen : 0;
-	Size		total = MAXALIGN(LION_ENTRY_HDRSZ + keylen);
-	LionEntryTuple *p = (LionEntryTuple *) palloc0(total);
-
-	p->hash = (src != NULL) ? src->hash : 0;
-	p->flags = pivotflag |
-		((src != NULL) ? lion_pivot_kindflags(src->flags) :
-		 (uint16) LION_ENTRY_MINUSINF);
-	p->keylen = (uint16) keylen;
-	p->head = child;
-	p->tail = InvalidBlockNumber;
-	p->ncontainers = 0;
-	/* A pivot routes to the column its source key belongs to (§24). */
-	p->attno = (src != NULL) ? src->attno : 0;
-	p->ntids = 0;
-	if (keylen > 0)
-		memcpy(LionEntryGetKey(p), LionEntryGetKey(src), keylen);
-
-	*size = total;
-	return p;
-}
-
 void
 lion_dir_delete(Relation index, Buffer buf, OffsetNumber *offs, int noffs)
 {
@@ -1679,7 +1657,7 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 			continue;
 		items[nitems].item = lion_page_item(cpage, o);
 		items[nitems].size = lion_page_itemsz(cpage, o);
-		if (unlikely(items[nitems].size < LION_ENTRY_HDRSZ ||
+		if (unlikely(items[nitems].size < LION_ENTRY_SHORT_HDRSZ ||
 					 items[nitems].size <
 					 LionEntryPayloadOffset(items[nitems].item)))
 			ereport(ERROR,
@@ -1693,7 +1671,7 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 	for (i = 0; i < nitems; i++)
 	{
 		items[i].need = MAXALIGN(items[i].size) + sizeof(ItemIdData);
-		items[i].pivot = MAXALIGN(LION_ENTRY_HDRSZ + items[i].item->keylen) +
+		items[i].pivot = MAXALIGN(lion_pivot_size(items[i].item)) +
 			sizeof(ItemIdData);
 	}
 
@@ -1751,7 +1729,7 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 	 */
 	rbuf = lion_alloc_page(index, heaprel, true);
 	rblk = BufferGetBlockNumber(rbuf);
-	sep->head = rblk;
+	lion_entry_set_head(sep, rblk);
 
 	if (isroot)
 		newroot = lion_alloc_page(index, heaprel, true);
@@ -1975,7 +1953,7 @@ lion_dir_downlink_present(Relation index, Buffer pbuf, OffsetNumber off,
 	bool		found;
 
 	if (off < maxoff)
-		return lion_page_item(page, OffsetNumberNext(off))->head == rblk;
+		return lion_entry_head(lion_page_item(page, OffsetNumberNext(off))) == rblk;
 
 	/* It would be the first item of the parent's right sibling. */
 	next = LionPageGetOpaque(page)->rightlink;
@@ -1996,7 +1974,7 @@ lion_dir_downlink_present(Relation index, Buffer pbuf, OffsetNumber off,
 		OffsetNumber nfirst = lion_page_first_data(np);
 
 		found = nfirst <= PageGetMaxOffsetNumber(np) &&
-			lion_page_item(np, nfirst)->head == rblk;
+			lion_entry_head(lion_page_item(np, nfirst)) == rblk;
 	}
 	UnlockReleaseBuffer(nbuf);
 
@@ -2181,7 +2159,7 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 		maxoff = PageGetMaxOffsetNumber(page);
 		for (off = lion_page_first_data(page); off <= maxoff; off++)
 		{
-			if (lion_page_item(page, off)->head == childblk)
+			if (lion_entry_head(lion_page_item(page, off)) == childblk)
 			{
 				*offp = off;
 				return buf;

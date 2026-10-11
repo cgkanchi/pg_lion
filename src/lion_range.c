@@ -505,7 +505,7 @@ lion_summary_shape(Relation index, LionState *col, LionSumShape *shape)
 				break;
 			}
 			shape->nsummaries += 1.0;
-			shape->rows += (double) e->ntids;
+			shape->rows += (double) lion_entry_ntids(e);
 		}
 		if (shape->complete || LionPageIsRightmost(page))
 		{
@@ -550,7 +550,7 @@ lion_value_leaf(Relation index, LionState *col, const char *raw)
  * a line pointer.  A batch is at most one leaf's worth (DESIGN.md §28).
  */
 #define LION_LEAF_MAX_ENTRIES \
-	((int) (BLCKSZ / (MAXALIGN(LION_ENTRY_HDRSZ) + sizeof(ItemIdData))) + 1)
+	((int) (BLCKSZ / (MAXALIGN(LION_ENTRY_SHORT_HDRSZ) + sizeof(ItemIdData))) + 1)
 
 /* Everything but where the walk starts. */
 static void
@@ -866,7 +866,7 @@ lion_entry_scan_plan_sum(LionEntryScan *es, Relation index, LionRange *range,
 		lion_scan_keycopy(es, ej, &es->clipmax, &es->clipmaxlen);
 		es->hassumprev = true;
 		lion_scan_keycopy(es, ej, &es->sumprev, &es->sumprevlen);
-		es->sumprevhash = ej->hash;
+		es->sumprevhash = lion_entry_hash(es->state, ej);
 		pfree(ej);
 		es->blkno = (part == LION_WALK_INSIDE) ?
 			lion_range_first_leaf(index, range) :
@@ -1058,7 +1058,7 @@ lion_entry_scan_remember(LionEntryScan *es, const LionEntryTuple *entry)
 {
 	MemoryContextReset(es->cxt);
 	es->lastkind = lion_entry_kind(entry);
-	es->lasthash = entry->hash;
+	es->lasthash = lion_entry_hash(es->state, entry);
 	es->lastkeylen = entry->keylen;
 	es->resumekind = -1;
 
@@ -1107,7 +1107,7 @@ lion_entry_scan_selects(LionEntryScan *es, const LionEntryTuple *entry,
 			return false;
 		}
 		lion_scan_keycopy(es, entry, &es->sumprev, &es->sumprevlen);
-		es->sumprevhash = entry->hash;
+		es->sumprevhash = lion_entry_hash(es->state, entry);
 		es->hassumprev = true;
 		return true;
 	}
@@ -1335,7 +1335,7 @@ lion_entry_scan_fill(LionEntryScan *es, bool copy)
 		 * between the moment its last TID was filtered out and the moment the
 		 * leaf's final step removes it.
 		 */
-		if (entry->ntids == 0)
+		if (lion_entry_ntids(entry) == 0)
 			continue;
 
 		ntaken++;
