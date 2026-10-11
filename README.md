@@ -23,8 +23,9 @@ bitmap. Many queries can then be answered by combining bitmaps instead of visiti
 On a vacuumed table these counts never touch the heap, so they can be one or two orders of magnitude
 faster than a B-tree or GIN index. They show up in `EXPLAIN` as `Custom Scan (LionCount)`.
 
-**Status: prototype.** It works on PostgreSQL 16 through 19 and master, and CI tests every one of
-them. The on-disk format may still change. Don't put data you can't rebuild behind it yet.
+**Status: beta.** It works on PostgreSQL 16 through 19 and master, and CI tests every one of them
+in both WAL modes, with crash recovery and standby replay. The on-disk format may still change
+before 1.0; a release that changes it will say so, and the indexes will need a `REINDEX`.
 
 ## When to use it
 

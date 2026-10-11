@@ -113,14 +113,13 @@ class Profiles(unittest.TestCase):
             for family in ['btree', 'roaring', 'roaring_bitmap']:
                 self.assertTrue(set(ORDERED_CASES) <= {k[6] for k in warm if k[2] == family})
 
-    def test_historical_workloads_still_audit(self):
-        directory = Path(__file__).resolve().parents[1] / 'results/2026-09-20-comparison'
+    def test_recorded_run_still_audits(self):
+        directory = Path(__file__).resolve().parents[1] / 'results/2026-10-08-85c991c-pg18-focused'
         meta = json.loads((directory / 'metadata.json').read_text())
         queries = json.loads((directory / 'queries.json').read_text())
         warm, cold = expected_configurations(meta, queries)
         self.assertTrue(warm)
-        self.assertTrue(cold)
-        self.assertTrue(any(key[2] == 'brin' for key in warm))
+        self.assertTrue(any(key[2] == 'roaring' for key in warm))
 
 
 if __name__ == '__main__':

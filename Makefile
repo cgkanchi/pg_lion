@@ -252,7 +252,7 @@ soak:
 # default_version, and the two map as DESIGN.md section 23 says.
 DIST_VERSION = $(shell sed -n 's/^   "version": "\(.*\)",$$/\1/p' META.json)
 DIST_NAME = pg_lion-$(DIST_VERSION)
-DIST_FILES = META.json README.md LICENSE DESIGN.md Makefile dev.sh \
+DIST_FILES = META.json README.md LICENSE DESIGN.md docs Makefile dev.sh \
              $(addsuffix .control,$(EXTENSION)) $(DATA) src \
              test/sql test/expected test/isolation test/unit test/recovery test/rmgr-check.sh \
              test/hook-check.sh test/modules
