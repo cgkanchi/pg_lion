@@ -52,6 +52,8 @@ INSERT INTO nc_nodes VALUES
 	 'SELECT count(*) FROM nc WHERE k = 3', 'int4eq(int4,int4)', ''),
 	('LionCount, its aggregate',
 	 'SELECT count(*) FROM nc WHERE k = 3', 'count()', ''),
+	('LionCount, an expression over its count',
+	 'SELECT k, round(100.0 * count(*) / 3000, 2) FROM nc GROUP BY k', 'round(numeric,int4)', ''),
 	('LionCount, an expression column filtered',
 	 'SELECT count(*) FROM nc WHERE nc_bucket(j) = 1', 'nc_bucket(int4)', ''),
 	('LionCount, an expression column grouped',
@@ -256,6 +258,13 @@ SELECT node, nc_check(node) FROM nc_nodes ORDER BY node;
  LionCount, an expression column grouped  | granted to the role: the answer
  LionCount, an expression column grouped  | a cached plan (planned, the answer) without it: ERROR: permission denied for function nc_bucket
  LionCount, an expression column grouped  | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function nc_bucket
+ LionCount, an expression over its count  | plan: planned
+ LionCount, an expression over its count  | every privilege: the ordinary plan's answer
+ LionCount, an expression over its count  | without EXECUTE on round(numeric,integer): ERROR: permission denied for function round, as the ordinary plan
+ LionCount, an expression over its count  | plain EXPLAIN: as the ordinary plan
+ LionCount, an expression over its count  | granted to the role: the answer
+ LionCount, an expression over its count  | a cached plan (planned, the answer) without it: ERROR: permission denied for function round
+ LionCount, an expression over its count  | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function round
  LionCount, its aggregate                 | plan: planned
  LionCount, its aggregate                 | every privilege: the ordinary plan's answer
  LionCount, its aggregate                 | without EXECUTE on count(): ERROR: permission denied for aggregate count, as the ordinary plan
@@ -284,7 +293,7 @@ SELECT node, nc_check(node) FROM nc_nodes ORDER BY node;
  LionSemiJoin                             | granted to the role: the answer
  LionSemiJoin                             | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
  LionSemiJoin                             | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
-(70 rows)
+(77 rows)
 
 -- nothing is left revoked from PUBLIC by this file
 SELECT fn FROM nc_nodes WHERE NOT has_function_privilege('public', fn, 'EXECUTE');

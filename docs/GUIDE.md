@@ -63,6 +63,12 @@ its group's count, so the largest entries are counted first and the rest never o
 catch up - ten groups of 3.4 million on ClickBench's `UserID`. Expressions of the grouping column
 (`GROUP BY ip, ip - 1`) split no group and are computed from it.
 
+These forms are answered as the counts they stand for (DESIGN.md §10, "Shapes rewritten to the
+node's counts"):
+
+- expressions over the counts and the grouping columns, such as `count(*)::int` or `g,
+  round(100.0 * count(*) / 5000000, 2) ... GROUP BY g`, computed once per output row.
+
 An expression index counts as a column of its expression (DESIGN.md §41). With `CREATE INDEX ON
 events USING lion ((payload->>'status'))`, `WHERE payload->>'status' = 'paid'`, `IN`, ranges,
 `<>`, `IS NULL`, `GROUP BY payload->>'status'` and `count(DISTINCT payload->>'status')` are

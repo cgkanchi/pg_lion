@@ -238,9 +238,11 @@ lion_group_coalesce(CoalesceExpr *ce, Index rti, Var **var, Const **con)
  * list with equal(), so an Aggref that differs in any field - the aggsplit
  * above all - would not be found.
  *
- * Our target only ever holds plain Vars and count Aggrefs at the top level
- * (the checks above refuse everything else), which is why lion_vcol_refs()
- * needs no SRF or window handling here.
+ * Our target holds columns, counts and expressions over them (DESIGN.md
+ * §10, "Expressions over the counts"), which the Finalize Agg computes from
+ * the partial row; never a set-returning or window function (the checks
+ * refuse a query with either), which is why lion_vcol_refs() needs no SRF or
+ * window handling here.
  */
 PathTarget *
 lion_make_partial_target(PlannerInfo *root, PathTarget *grouping_target,

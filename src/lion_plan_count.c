@@ -1188,6 +1188,42 @@ lion_count_path_having(LionCountPathBuild *cx)
 	 * HAVING's were replaced before its columns were taken out of it.
 	 */
 	cx->checkexprs = (List *) lion_vcol_subst((Node *) cx->checkexprs);
+
+	/*
+	 * An expression over what the node produces - `count(*)::int`, `100.0 *
+	 * count(*) / n`, `round(100.0 * count(*) / n, 2)` beside a GROUP BY, `g ||
+	 * '!'` of a group column - is computed by the plan's projection from the
+	 * counts and columns it reads, once per row the node emits, as the Agg's
+	 * projection computes it once per group (DESIGN.md §10, "Expressions over
+	 * the counts").  So what has to pass the tests below is what it reads:
+	 * its aggregates whole, and its columns.  A subquery in it would be a
+	 * SubPlan the node's projection runs, which it is not built to; a window
+	 * function is computed above the grouping, never in its target.
+	 */
+	{
+		List	   *expanded = NIL;
+		ListCell   *lc;
+
+		foreach(lc, cx->checkexprs)
+		{
+			Node	   *node = (Node *) lfirst(lc);
+
+			if (IsA(node, Var) || IsA(node, Aggref) ||
+				(cx->groupcoal != NULL && equal(node, cx->groupexpr)) ||
+				list_member(cx->groupdeps, node))
+			{
+				expanded = lappend(expanded, node);
+				continue;
+			}
+			if (contain_subplans(node) || contain_window_function(node))
+				return false;
+			expanded = list_concat(expanded,
+								   pull_var_clause(node,
+												   PVC_INCLUDE_AGGREGATES |
+												   PVC_INCLUDE_PLACEHOLDERS));
+		}
+		cx->checkexprs = expanded;
+	}
 	return true;
 }
 
