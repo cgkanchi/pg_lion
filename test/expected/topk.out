@@ -321,7 +321,7 @@ SELECT lion_tq('SELECT DISTINCT count(*) FROM tk GROUP BY g ORDER BY count(*) DE
 SELECT lion_tq('SELECT g, count(*), rank() OVER (ORDER BY count(*) DESC) FROM tk GROUP BY g ORDER BY count(*) DESC, g LIMIT 3');
        lion_tq       
 ---------------------
- no pushdown, 3 rows
+ every group, 3 rows
 (1 row)
 
 SELECT lion_tq('SELECT g, count(g) FROM tk GROUP BY g ORDER BY count(g) DESC, g LIMIT 3');

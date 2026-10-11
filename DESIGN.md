@@ -1590,12 +1590,13 @@ Planner integration
   - The relation's table AM is the heap, by routine (§2). ambuild already refuses any other, so
     this only declines an index that got past it; the executor checks again when it opens the
     relation.
-  - The query has no DISTINCT, window functions, grouping sets, ORDER BY inside aggregates,
+  - The query has no DISTINCT, grouping sets, ORDER BY inside aggregates,
     FILTER clauses, or aggregates other than `count(*)` (or `count(1)` of any non-NULL constant)
     and the `count(col)` cases of §14 - and, without a GROUP BY, `count(col)` of any one column
     whose index answers `col IS NOT NULL`.
     The target list holds those counts, the columns the rules below let it print, and any
-    expression over them ("Shapes rewritten to the node's counts" at the end of this section).
+    expression over them; window functions over them are computed above the node ("Shapes
+    rewritten to the node's counts" at the end of this section).
   - **HAVING** is accepted when it is a filter the node can apply itself. By the time the hook runs,
     `havingQual` is an implicit-AND list of only those clauses that mention an aggregate (or are
     volatile, or contain a subquery): `subquery_planner()` has moved every other clause into WHERE,
@@ -2558,6 +2559,16 @@ longer than §15's 1000. The conjuncts share the restriction's position, so a pa
 bounds imply the whole restriction leaves all of them out (§16). The FK-side join's and the semi
 join's fact filters go through the same code. 1M rows, `count(*) WHERE c20 NOT IN (3, 4, 5)`:
 91 ms to 1.1 ms.
+
+**Window functions over the counts.** A window function is evaluated by a WindowAgg above the
+grouping, over the grouped rel's rows. With windows in the query the grouped rel's target is
+`make_window_input_target()`'s: the grouping columns and every aggregate and column a window's
+arguments, PARTITION BY or ORDER BY read, flattened out of the window expressions. That target
+goes through the same checks as any other, so a window that reads something the node cannot
+produce - `sum(count(u)) OVER ()` of a count it cannot answer - declines through them, and the
+query-level refusal of window functions is gone. The top k (§36) still declines a query with
+windows, whose rows it would cut before the window saw them. 1M rows, `c20, round(100.0 *
+count(*) / sum(count(*)) OVER (), 2) ... GROUP BY c20`: 109 ms to 1.3 ms.
 
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 

@@ -322,6 +322,43 @@ SELECT q, cs_q(q) FROM (VALUES
  SELECT count(*) FROM cs WHERE u NOT IN (1, 2)        | no count, 1 rows
 (3 rows)
 
+-- ---- window functions over the grouped counts ----
+SELECT cs_plan('SELECT a, round(100.0 * count(*) / sum(count(*)) OVER (), 2) FROM cs GROUP BY a');
+            cs_plan             
+--------------------------------
+ WindowAgg
+   Window: w1 AS ()
+   ->  Custom Scan (LionCount)
+         Lion Indexes: cs_a (a)
+         Group Key: a
+(5 rows)
+
+SELECT q, cs_q(q) FROM (VALUES
+	('SELECT a, round(100.0 * count(*) / sum(count(*)) OVER (), 2) FROM cs GROUP BY a'),
+	('SELECT a, b, count(*), sum(count(*)) OVER (PARTITION BY b), rank() OVER (PARTITION BY a ORDER BY count(*) DESC, b) FROM cs GROUP BY a, b'),
+	('SELECT n, count(n), lag(n) OVER (ORDER BY n NULLS FIRST) FROM cs WHERE b = 1 GROUP BY n'),
+	('SELECT count(*), count(*) OVER () FROM cs WHERE a = 3'),
+	('SELECT t, count(*), row_number() OVER (ORDER BY t) FROM cs WHERE t <> ''v3'' GROUP BY t HAVING count(*) > 1300'),
+	('SELECT d.r, count(*), sum(count(*)) OVER () FROM cs JOIN csd d ON d.pk = cs.a GROUP BY d.r')
+) v(q);
+                                                                    q                                                                     |      cs_q      
+------------------------------------------------------------------------------------------------------------------------------------------+----------------
+ SELECT a, round(100.0 * count(*) / sum(count(*)) OVER (), 2) FROM cs GROUP BY a                                                          | count, 7 rows
+ SELECT a, b, count(*), sum(count(*)) OVER (PARTITION BY b), rank() OVER (PARTITION BY a ORDER BY count(*) DESC, b) FROM cs GROUP BY a, b | count, 35 rows
+ SELECT n, count(n), lag(n) OVER (ORDER BY n NULLS FIRST) FROM cs WHERE b = 1 GROUP BY n                                                  | count, 12 rows
+ SELECT count(*), count(*) OVER () FROM cs WHERE a = 3                                                                                    | count, 1 rows
+ SELECT t, count(*), row_number() OVER (ORDER BY t) FROM cs WHERE t <> 'v3' GROUP BY t HAVING count(*) > 1300                             | count, 12 rows
+ SELECT d.r, count(*), sum(count(*)) OVER () FROM cs JOIN csd d ON d.pk = cs.a GROUP BY d.r                                               | count, 3 rows
+(6 rows)
+
+-- a window over an aggregate the node cannot count (u is nullable and has no
+-- lion index) is the ordinary plan's
+SELECT cs_q('SELECT a, sum(count(u)) OVER () FROM cs GROUP BY a');
+       cs_q       
+------------------
+ no count, 7 rows
+(1 row)
+
 DROP FUNCTION cs_q(text);
 DROP FUNCTION cs_plan(text);
 DROP TABLE cs, csd;

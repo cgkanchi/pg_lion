@@ -73,6 +73,9 @@ node's counts"):
   count of that column: counted as `count(*) ... AND col IS NOT NULL`.
 - `col NOT IN (a, b, ...)` (or `col <> ALL (...)`) of a literal list without NULLs, counted as
   `col <> a AND col <> b ...`.
+- window functions over the counts, such as a share of the total, `g, round(100.0 * count(*) /
+  sum(count(*)) OVER (), 2) ... GROUP BY g`: the counts are pushed down and the window runs above
+  them.
 
 An expression index counts as a column of its expression (DESIGN.md §41). With `CREATE INDEX ON
 events USING lion ((payload->>'status'))`, `WHERE payload->>'status' = 'paid'`, `IN`, ranges,
