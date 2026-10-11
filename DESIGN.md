@@ -1621,7 +1621,8 @@ Planner integration
     integer opfamily contains it), and the compared value is not a literal NULL. §15 adds
     `Var = ANY (array)` and §14 the two null tests to the shapes accepted here. §19 adds a
     top-level `OR` of such clauses, whose leaves enter none of the per-column bookkeeping below,
-    because they constrain no column of the result. The "Const" is anything the node can evaluate
+    because they constrain no column of the result; §35 adds `<>`, and `NOT IN` of a literal list
+    is its `<>` clauses (end of this section). The "Const" is anything the node can evaluate
     once per scan - a literal, a Param, a stable expression over them - and a boolean column tested
     by itself is the equality it stands for (both below).
   - **Several clauses may constrain one column, and each is a source of its own** (2026-09-25
@@ -2545,6 +2546,18 @@ whose index cannot answer it declines as such a WHERE would. With a GROUP BY it 
 group whose rows all have `col` NULL is a row of 0 in the query and no row at all under the
 clause. Beside `count(*)` or a count of another column it is not taken either, since the clause
 would change those. 1M rows, `count(nullable) WHERE c20 = 3`: 23 ms to 0.3 ms.
+
+**NOT IN (list).** `col NOT IN (a, b)`, which the parser makes `col <> ALL ('{a,b}')`, is the
+conjunction `col <> a AND col <> b` (`lion_all_as_and()`), and each conjunct is a §35 `<>`
+clause - a negated source, the entry of its value and the NULL entry subtracted. Both forms are
+false or unknown where `col` is NULL, and agree element by element everywhere else, so the
+rewrite is exact. A NULL element makes the ALL unknown for every row and an empty array makes it
+true for every row; both are left to the ordinary plan, as is an array known only at run time (a
+generic plan's `NOT IN ($1, $2)`), whose elements cannot be taken apart at plan time, and a list
+longer than §15's 1000. The conjuncts share the restriction's position, so a partition whose
+bounds imply the whole restriction leaves all of them out (§16). The FK-side join's and the semi
+join's fact filters go through the same code. 1M rows, `count(*) WHERE c20 NOT IN (3, 4, 5)`:
+91 ms to 1.1 ms.
 
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 

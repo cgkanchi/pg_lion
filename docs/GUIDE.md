@@ -71,6 +71,8 @@ node's counts"):
 - `count(1)`, or `count` of any other non-NULL constant, which is `count(*)`.
 - `count(col)` of a nullable indexed column, without a `GROUP BY` and when every aggregate is a
   count of that column: counted as `count(*) ... AND col IS NOT NULL`.
+- `col NOT IN (a, b, ...)` (or `col <> ALL (...)`) of a literal list without NULLs, counted as
+  `col <> a AND col <> b ...`.
 
 An expression index counts as a column of its expression (DESIGN.md §41). With `CREATE INDEX ON
 events USING lion ((payload->>'status'))`, `WHERE payload->>'status' = 'paid'`, `IN`, ranges,
