@@ -8298,11 +8298,15 @@ distinct count - the decline the backlog item asked for, with the cost model as 
   to hold `s >= 1` rows over `D` containers stops after about `D/s + 1` of them, and one expected to
   be empty (`s < 1`) reads everything, as a count would. The recheck candidates are scaled the
   same way, in both shapes, because a test rechecks one container at a time and stops with them.
-  The pair terms of shape 2 are NOT discounted: a pair's time is its lookup and its merge setup
-  far more than its members - measured per pair, an existence test took 6.5 us against 7.7 for
-  §20's count of the same 200 x 50 pairs - and discounting them chose 200 x 50 pairs at 64.6 ms
-  against the sort's 43 (and, on the release build with §10's merge units, at 10,566 against the
-  sort's 10,694, for 45 ms of CPU against 27).
+  A pair test of shape 2 stops the same way, and its MERGE is discounted by the same share
+  (since 2026-10-11, below); what the early exit does not shrink is charged per pair on top: the
+  test's fixed cost and the lookup of the inner set, one descent of the inner index's directory
+  (`LION_DESCENT_COST` a level, as a single-key clause's lookup). Until then the pair terms were
+  not discounted at all, on the argument that a pair's time is its lookup and its merge setup far
+  more than its members - measured per pair, an existence test took 6.5 us against 7.7 for §20's
+  count of the same 200 x 50 pairs, and discounting the merge alone chose those pairs at 10,566
+  against the sort's 10,694, for 45 ms of CPU against 27. That holds on a table of a few container
+  keys and fails on a large one, where the full merge grows with the table and the test does not.
 - Tests that must COUNT (the mixed target lists above) are charged in full.
 
 Measured with the final model (100k rows, uncorrelated columns, warm cache, assert build - ratios,
@@ -8325,6 +8329,31 @@ not absolute numbers; `test/sql/distinct.sql` pins the rows marked *):
 Every choice in the table is the faster plan. The open item is the one §20 records: the model does
 not model correlation, so clustered data, where most pairs' merges end at once, is priced as if it
 were not.
+
+**The pair test's early exit (2026-10-11).** The optimization review of 2026-10-11 measured
+`SELECT c20, count(DISTINCT c200) FROM fact GROUP BY c20` over 5M rows (96,196 heap pages, 1,503
+container keys, uncorrelated columns, release build of PostgreSQL 18): the node ran in 19-24 ms and
+was priced 961,710, nearly all of it the 4,000 pairs' full merges at 240 each across every
+container key, against core's sort at 808,355, which took 2.6 s. The walk visited 18,132
+containers for its 4,020 tests, 4.5 a test. Priced with the merge discounted by
+`lion_exists_fraction()` and the per-pair lookup added, it costs 6,862 and is chosen (12 ms);
+`c200, count(DISTINCT c20)` 5,754 (16 ms against 2.7 s); with `WHERE c2 = 1`, which no lion plan
+had been chosen for even with sequential and bitmap scans off (it was built, at 1.22M, against an
+index scan and sort at 475k), 8,265 (18 ms against core's 1.8 s). What must still lose does:
+`c20, count(DISTINCT c20k)` (400,000 pairs of 12 rows) is priced 1.59M against 808k (it runs in
+2.7 s against 3.8: the model is conservative there), `c200, count(DISTINCT c20k)` 100M, and on the
+100k-row table above `g200, count(DISTINCT k50)` 16,003 against 10,694, `g2k, count(DISTINCT k1k)`
+3.6M. That table's columns are functions of `i` modulo their counts, so most of its pairs are
+empty and are read to the end, which the model, assuming independence, does not see: the per-pair
+lookup is what keeps 200 x 50 there with core. On 200k rows of hashed columns,
+`g200, count(DISTINCT k50)` (10,000 pairs) is now chosen, 20 ms against the sort's 79.
+`test/sql/distinct.sql` pins a 4,000-pair shape over 87 container keys (lion_dtw) that the full
+merge priced at 48,509 against 15,611.
+
+The grouped distinct does not take the decoded walk of §34: the walk decodes every row at every
+key the WHERE holds (88 ms for the same 4,000 pairs as `GROUP BY c20, c200`), where the existence
+tests read a few containers a pair; and its partial (g, k) counts would need core's
+`count(DISTINCT k)` above them to deduplicate.
 
 ### EXPLAIN
 

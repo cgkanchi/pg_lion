@@ -446,6 +446,36 @@ SELECT lion_dc('SELECT g8, count(DISTINCT k50) FROM lion_dtc GROUP BY g8', false
 DROP TABLE lion_dtc;
 
 /*
+ * A pair test stops at its first visible row, so on a table spread over many
+ * container keys it reads one container or two of a pair whose rows lie at
+ * nearly every key.  Charged as a full merge, `g20, count(DISTINCT k200)`
+ * over 5M rows was priced above core's sort (961,710 against 808,355) and
+ * ran in 19 ms against the sort's 2.6 s.  Here 100k rows at 18 a page
+ * (5,556 pages, 87 container keys), uncorrelated: 4,000 pairs of 25 rows,
+ * 8 ms against the sort's 40.  The full-merge price was 48,509 against
+ * 15,611.
+ */
+CREATE TABLE lion_dtw (
+	id		int		NOT NULL,
+	c2		int		NOT NULL,
+	g20		int		NOT NULL,
+	k200	int
+) WITH (fillfactor = 10);
+INSERT INTO lion_dtw
+SELECT i, (hashint4(i + 1) & 1), (hashint4(i + 2) & 2147483647) % 20,
+	   CASE WHEN i % 97 = 0 THEN NULL ELSE (hashint4(i + 3) & 2147483647) % 200 END
+  FROM generate_series(1, 100000) i;
+CREATE INDEX lion_dtw_c2 ON lion_dtw USING lion (c2);
+CREATE INDEX lion_dtw_g20 ON lion_dtw USING lion (g20);
+CREATE INDEX lion_dtw_k200 ON lion_dtw USING lion (k200);
+VACUUM (FREEZE, ANALYZE) lion_dtw;
+SELECT * FROM lion_explain_norm('SELECT g20, count(DISTINCT k200) FROM lion_dtw GROUP BY g20') AS p("QUERY PLAN");
+SELECT lion_dc('SELECT g20, count(DISTINCT k200) FROM lion_dtw GROUP BY g20', false);
+SELECT lion_dc('SELECT g20, count(DISTINCT k200) FROM lion_dtw WHERE c2 = 1 GROUP BY g20');
+SELECT lion_dc('SELECT g20, count(DISTINCT k200), count(k200), count(*) FROM lion_dtw GROUP BY g20');
+DROP TABLE lion_dtw;
+
+/*
  * The walk tests every entry of k, not only the values the WHERE leaves: here
  * 150,000 entries for the 7,500 values of a `c <> 0` that keeps 5% of 200k wide
  * rows.  Priced by the values it was chosen, 594 ms against the bitmap scan's

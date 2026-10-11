@@ -2755,6 +2755,8 @@ lion_count_rel_two_columns(LionCountRelCost *c, double *mem, double *keys,
 	double		oe = Max(c->outer_entries, 1.0);
 	double		ie = Max(c->inner_entries, 1.0);
 	double		per;
+	double		share = 1.0;
+	int			s;
 
 	mem[c->nsrc] = c->tuples / oe;
 	keys[c->nsrc] = lion_key_containers(c->root, c->rel, c->groupidx,
@@ -2762,18 +2764,38 @@ lion_count_rel_two_columns(LionCountRelCost *c, double *mem, double *keys,
 	mem[c->nsrc + 1] = c->tuples / ie;
 	keys[c->nsrc + 1] = lion_key_containers(c->root, c->rel, c->groupidx2,
 											c->groupcol2, c->tuples / ie);
+
 	/*
-	 * The early exit of a count(DISTINCT k)'s pair test is NOT
-	 * discounted: a pair's time is its lookup and its merge's set-up
-	 * far more than its members.  Discounted, 200 x 50 pairs over 100k
-	 * rows were chosen at 10,566 for 45 ms against the sorting
-	 * aggregate's 10,694 for 27.
+	 * The (g, k) pair test of a count(DISTINCT k) (DESIGN.md §26) stops at
+	 * its first visible row, exactly as shape 1's entry test does, so its
+	 * merge reads the share of the pair's intersection lion_exists_fraction()
+	 * expects: one container or two of a pair expected to hold rows, all of
+	 * one expected to be empty.  Charged in full, the member term grows with
+	 * the table where the test does not: `c20, count(DISTINCT c200)` over 5M
+	 * rows was priced 961,710 - the cost of 4,000 merges across all 1,503
+	 * container keys - for a walk that visited 4.5 containers a test and ran
+	 * in 19 ms, and core's sort, priced 808,355, took 2.6 s.  What does not
+	 * shrink with the share is charged per pair in lion_count_rel_pair_cost():
+	 * the test's set-up and the inner set's lookup, which are what decide on
+	 * a small table (200 x 50 pairs over 100k rows, 49 ms against the sorting
+	 * aggregate's 26).  Tests that must count (LION_DISTINCT_COUNT) read
+	 * everything.
 	 */
+	if (c->distinct == LION_DISTINCT_EXISTS)
+	{
+		double		drvkeys = Min(keys[c->nsrc], keys[c->nsrc + 1]);
+
+		/* the test walks the merge's driver: the smallest source */
+		for (s = 0; s < c->nsrc; s++)
+			if (mem[s] < Min(mem[c->nsrc], mem[c->nsrc + 1]))
+				drvkeys = Min(drvkeys, keys[s]);
+		share = lion_exists_fraction(drvkeys, c->matching / (oe * ie));
+	}
 	per = lion_merge_cpu_cost(c->nsrc + 2, mem, keys, inmem, c->tuples,
 							  1.0, c->srcprobes) +
 		unionsets * LION_UNION_SET_COST;
 	c->walked = oe * ie;
-	c->merge_cpu = c->walked * per;
+	c->merge_cpu = c->walked * per * share;
 }
 
 /*
@@ -3062,19 +3084,26 @@ lion_count_rel_pair_cost(LionCountRelCost *c)
 
 		/*
 		 * The (g, k) pairs of a count(DISTINCT k) per group (DESIGN.md §26)
-		 * are these same pairs and are charged exactly as above - that is
-		 * what makes a large |G| x |K| lose to the sorting aggregate core
-		 * builds for a distinct count - plus the fixed cost of a test on
-		 * each.  The early exit is NOT discounted from the pair terms: a
-		 * pair's time is its lookup and its merge's setup far more than its
-		 * members, and measured per pair an existence test was 6.5 us
-		 * against 7.7 for a count (100k rows, 200 x 50 pairs, assert build).
-		 * What it does save is heap rechecks, one container's worth per test
-		 * instead of all of them, and that is charged as such below.
+		 * are these same pairs - that is what makes a large |G| x |K| lose
+		 * to the sorting aggregate core builds for a distinct count - and
+		 * each is a test with a fixed cost of its own and a lookup of its
+		 * inner set: one descent of the inner index's directory
+		 * (LION_DESCENT_COST a level, as a single-key clause's lookup is
+		 * priced).  Neither shrinks with the early exit, which discounts
+		 * the pair's merge alone (lion_count_rel_two_columns()) and its
+		 * heap rechecks, one container's worth per test instead of all of
+		 * them, below.  On a small table the fixed terms are what decide:
+		 * 200 x 50 pairs over 100k rows (test/sql/distinct.sql's lion_dtc,
+		 * where most pairs are empty) took 49 ms against the sorting
+		 * aggregate's 26, 4.9 us a pair, and 8 x 1000 13 ms against 33.
 		 */
 		if (c->distinct != LION_DISTINCT_NONE)
 		{
-			c->pair_cost += oe * ie * LION_DISTINCT_TEST_COST;
+			double		height = 0;
+
+			(void) lion_index_dir_pages(c->groupidx2, &height);
+			c->pair_cost += oe * ie * (LION_DISTINCT_TEST_COST +
+									   (height + 1.0) * LION_DESCENT_COST);
 			c->recheckshare += (c->distinct == LION_DISTINCT_EXISTS) ?
 				lion_exists_fraction(Min(co, cinner),
 									 c->matching / (oe * ie)) :
