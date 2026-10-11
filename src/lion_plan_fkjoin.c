@@ -1220,6 +1220,7 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	AggClauseCosts agg_costs;
 	LionUnits	units;
 	double		reads;
+	ListCell   *lc;
 
 	/*
 	 * What a child row takes of a batch looked up in key order: its columns
@@ -1288,6 +1289,9 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	cpath->path.pathkeys = NIL;
 	cpath->flags = 0;
 	cpath->custom_paths = list_make1(child);
+	foreach(lc, fj->filters)
+		cpath->custom_paths = lappend(cpath->custom_paths,
+									  ((LionFkFilter *) lfirst(lc))->path);
 #if PG_VERSION_NUM >= 170000
 	cpath->custom_restrictinfo = NIL;
 #endif
@@ -1337,6 +1341,22 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 #if PG_VERSION_NUM >= 180000
 	cpath->path.disabled_nodes = child->disabled_nodes;
 #endif
+
+	/*
+	 * A dimension folded into a fact filter runs whole, core's path and
+	 * price, before the first key is counted ("A second dimension that only
+	 * filters").
+	 */
+	foreach(lc, fj->filters)
+	{
+		Path	   *fp = ((LionFkFilter *) lfirst(lc))->path;
+
+		cpath->path.startup_cost += fp->total_cost;
+		cpath->path.total_cost += fp->total_cost;
+#if PG_VERSION_NUM >= 180000
+		cpath->path.disabled_nodes += fp->disabled_nodes;
+#endif
+	}
 
 	input = &cpath->path;
 	inrows = rows;
@@ -1466,6 +1486,61 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * The clause the cost model is given for a dimension folded into a fact filter
+ * (DESIGN.md §27, "A second dimension that only filters"): `fk = ANY (array)`
+ * over an array of as many elements as the dimension's path is expected to
+ * return, all NULL - what estimate_array_length() reads for the number of
+ * keys, at a bit each - in a RestrictInfo of the fact alone whose cached
+ * selectivity is the share of the fact's rows the keys hold, which
+ * clause_selectivity() returns without looking at the array (ten million
+ * elements at most, a megabyte and a quarter of bits).  That share is
+ * the keys over the fk's distinct values or the dimension's rows, whichever
+ * is more: every key one value of the fk's, as many fact rows each as any
+ * other, where the dimension's keys are the fk's values - and where the fk
+ * holds values no key has, the keys' share of those.
+ */
+static Node *
+lion_fkjoin_filter_costclause(PlannerInfo *root, RelOptInfo *rel,
+							  const LionFkFilter *f)
+{
+	Oid			elemtype = exprType(f->pkexpr);
+	double		keys = clamp_row_est(f->path->rows);
+	int			nkeys = (int) Min(keys, 10000000.0);
+	Size		bytes = ARR_OVERHEAD_WITHNULLS(1, nkeys);
+	ArrayType  *arr = (ArrayType *) palloc0(bytes);
+	ScalarArrayOpExpr *saop = makeNode(ScalarArrayOpExpr);
+	RestrictInfo *ri = makeNode(RestrictInfo);
+	double		nd = lion_fkjoin_fk_ndistinct(root, rel, f->fkvar);
+
+	SET_VARSIZE(arr, bytes);
+	arr->ndim = 1;
+	arr->dataoffset = (int32) bytes;
+	arr->elemtype = elemtype;
+	ARR_DIMS(arr)[0] = nkeys;
+	ARR_LBOUND(arr)[0] = 1;
+
+	saop->opno = f->opno;
+	saop->opfuncid = get_opcode(f->opno);
+	saop->useOr = true;
+	saop->inputcollid = f->collation;
+	saop->args = list_make2(copyObject(f->fkvar),
+							makeConst(get_array_type(elemtype), -1,
+									  InvalidOid, -1, PointerGetDatum(arr),
+									  false, false));
+	saop->location = -1;
+
+	ri->clause = (Expr *) saop;
+	ri->is_pushed_down = true;
+	ri->clause_relids = bms_make_singleton(rel->relid);
+	ri->required_relids = ri->clause_relids;
+	ri->num_base_rels = 1;
+	ri->eval_cost.startup = -1;
+	ri->norm_selec = Min(keys / Max(nd, Max(f->rel->tuples, 1.0)), 1.0);
+	ri->outer_selec = -1;
+	return (Node *) ri;
+}
+
+/*
  * What every FK-side join path carries of the fact side (DESIGN.md §27), the
  * aggregate over the query's join and the semi or anti join path alike
  * ("The semi and anti join as a join path"): the join key appended to the
@@ -1506,8 +1581,14 @@ lion_fkjoin_setup(PlannerInfo *root, RelOptInfo *rel, const LionFkJoin *fj,
 	double		fkpages;
 	LionCountPriv *base = &out->base;
 	List	   *exec;
+	int			filterclause[LION_MAX_JOIN_FILTERS];
+	AttrNumber	filtercol[LION_MAX_JOIN_FILTERS];
+	int			nfilter = 0;
 	ListCell   *lc;
 	int			i;
+
+	if (list_length(fj->filters) > LION_MAX_JOIN_FILTERS)
+		return false;
 
 	/* ---- the join key: one more equality clause on the fact rel ---- */
 	memset(&leaf, 0, sizeof(leaf));
@@ -1523,6 +1604,38 @@ lion_fkjoin_setup(PlannerInfo *root, RelOptInfo *rel, const LionFkJoin *fj,
 	lion_append_clause(&leaf, fj->clause, false,
 					  &whereattnos, &clauseinfos, &whereclauses,
 					  &whereconsts, &wherekinds, &whereopnos, &whereinor);
+
+	/*
+	 * ---- each dimension that only filters: an IN list on its fk ----
+	 *
+	 * (DESIGN.md §27, "A second dimension that only filters".)  Its values are
+	 * the keys of the dimension's rows, which the node collects from a child
+	 * of its own at the start of each run; the clause's value expression is a
+	 * NULL placeholder of the key's type that nothing evaluates.  An index is
+	 * matched for it as for any IN list: the join operator's equality on the
+	 * fk column, a cross-type one for the key's type, the join's collation.
+	 */
+	foreach(lc, fj->filters)
+	{
+		LionFkFilter *f = (LionFkFilter *) lfirst(lc);
+
+		memset(&leaf, 0, sizeof(leaf));
+		leaf.var = f->fkvar;
+		leaf.val = (Node *) makeNullConst(exprType(f->pkexpr),
+										  exprTypmod(f->pkexpr),
+										  exprCollation(f->pkexpr));
+		leaf.costclause = lion_fkjoin_filter_costclause(root, rel, f);
+		leaf.opno = f->opno;
+		leaf.cmptype = exprType(f->pkexpr);
+		leaf.extractquery = InvalidOid;
+		leaf.collation = f->collation;
+		leaf.kind = LION_CLAUSE_ARRAY;
+		filtercol[nfilter] = f->pkvar->varattno;
+		filterclause[nfilter++] = list_length(whereattnos);
+		lion_append_clause(&leaf, f->clause, false,
+						  &whereattnos, &clauseinfos, &whereclauses,
+						  &whereconsts, &wherekinds, &whereopnos, &whereinor);
+	}
 
 	/*
 	 * ---- the fact rel and its indexes ----
@@ -1567,6 +1680,12 @@ lion_fkjoin_setup(PlannerInfo *root, RelOptInfo *rel, const LionFkJoin *fj,
 							  whereopnos, ors);
 	if (partitioned)
 		lion_count_priv_set_parts(base, targets, false);
+	base->join.nfilter = nfilter;
+	for (i = 0; i < nfilter; i++)
+	{
+		base->join.filterclause[i] = filterclause[i];
+		base->join.filtercol[i] = filtercol[i];
+	}
 
 	/* the dimension's GROUP BY is the Agg's, which checks it */
 	exec = lion_replaced_functions(rel, tlexprs, having, NIL, fj);
@@ -2032,6 +2151,14 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 				rel->consider_parallel &&
 				fj->dimchild->consider_parallel &&
 				is_parallel_safe(root, (Node *) consts));
+
+	/*
+	 * A dimension folded into a fact filter is run by the node itself, a
+	 * child of its own: not in a worker, as yet ("A second dimension that
+	 * only filters").
+	 */
+	if (fj->filters != NIL)
+		parallel = false;
 
 	/*
 	 * A GROUP BY of a key the rows never repeat makes each row its own group,

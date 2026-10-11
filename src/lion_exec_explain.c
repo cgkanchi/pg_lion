@@ -63,6 +63,8 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 				List	   *context;
 				char	   *opname = get_opname(cl->opno);
 				char	   *val;
+				int			filt = lion_join_filter_of(st,
+													   (int) (cl - st->clause));
 
 				if (opname == NULL)
 					elog(ERROR, "LionCount: cache lookup failed for operator %u",
@@ -75,8 +77,30 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 				/*
 				 * The FK-side join's key is a column of the OTHER table
 				 * (DESIGN.md §27), so it is printed qualified: `fk = d.pk`,
-				 * as core prints a join clause.
+				 * as core prints a join clause.  So is the key of a dimension
+				 * folded into a fact filter ("A second dimension that only
+				 * filters"): the column of its child the keys are read from,
+				 * `fk = d2.pk` - that clause - as that child prints it.
 				 */
+				if (filt >= 0)
+				{
+					Plan	   *fplan = st->join->filterps[filt]->plan;
+					TargetEntry *tle = (TargetEntry *)
+						list_nth(fplan->targetlist,
+								 st->join->filtercol[filt] - 1);
+
+					List	   *fancestors = lcons(st->css.ss.ps.plan,
+													   list_copy(ancestors));
+
+					context = set_deparse_context_plan(es->deparse_cxt, fplan,
+													   fancestors);
+					val = deparse_expression((Node *) tle->expr, context, true,
+											 false);
+					appendStringInfo(buf, "%s %s %s", attname, opname, val);
+					pfree(opname);
+					pfree(val);
+					break;
+				}
 				val = deparse_expression((Node *) cl->valexpr, context,
 										 st->join != NULL &&
 										 cl == &st->clause[st->join->clause],
@@ -1310,6 +1334,10 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 						   js->lookups + js->worker.lookups, es);
 	ExplainPropertyInteger("Join Keys Without Entry", NULL,
 						   js->missing + js->worker.missing, es);
+
+	/* ... and the keys of the dimensions folded into fact filters */
+	if (js->nfilter > 0)
+		ExplainPropertyInteger("Join Filter Keys", NULL, js->filterkeys, es);
 
 	/* ... and counted in each group of a fact column grouped by */
 	if (st->fg != NULL)

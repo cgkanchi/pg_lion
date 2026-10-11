@@ -50,6 +50,12 @@
  *		the others involves the fact, and that exactly one table of the
  *		dimension is outside every inner side.
  *
+ *		A table inner-joined to the fact on a unique key of its own, nothing of
+ *		it wanted above the join, only filters the fact's rows: it is folded
+ *		into a fact filter on the fk column (lion_fkjoin_filter_of()), and the
+ *		other tables are the dimension - DESIGN.md §27, "A second dimension
+ *		that only filters".
+ *
  *		The semi and anti joins are also offered as JOIN paths, whose rows
  *		are the outer side's - DESIGN.md §27, "The semi and anti join as a
  *		join path".  lion_fkjoin_recognize_join() decides, for one call of
@@ -66,11 +72,13 @@
 #include "catalog/pg_class.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
 
+#include "lion_count.h"
 #include "lion_fkjoin.h"
 
 /*
@@ -273,6 +281,144 @@ lion_fkjoin_target_has(PathTarget *target, Var *var)
 }
 
 /*
+ * May the table `xrelid` of joinrel be folded into a filter of the fact
+ * (DESIGN.md §27, "A second dimension that only filters")?  Fills *out when
+ * it may:
+ *
+ *	- a plain table or a materialized view, in no special join - no semi or
+ *	  anti join's side and no outer join's - so that it is inner-joined;
+ *	- nothing of it wanted above the join: no column of it in the join rel's
+ *	  target, which holds every column the query reads above the join (its
+ *	  target list, GROUP BY, HAVING, ORDER BY), so its columns are read by
+ *	  its own filters and the join clause alone;
+ *	- exactly one clause joins it to the rest of the join, and that clause is
+ *	  between it and the fact: the equivalence classes' clauses for it
+ *	  against everything else, and its joininfo clauses, are one, and the
+ *	  pair (fact, it) gives that same clause.  A table also joined to the
+ *	  dimension, or by two clauses, is a dimension's, not a filter;
+ *	- that clause is a strict operator between a plain column of each, and
+ *	  the table's column is provably unique under it
+ *	  (lion_column_is_unique()), so that no fact row is repeated: each has
+ *	  one fk value, and each value at most one row of the table;
+ *	- the table's cheapest path is unparameterized and carries the key, and
+ *	  the key's type has an array type for the keys to be collected into;
+ *	- the rows that path is expected to return are no more than a count
+ *	  locates of one IN list at once (lion_array_batch_size(), a work_mem of
+ *	  located sets): the node holds the list's sets whole, one a key, where
+ *	  the ordinary plan would hash them within its memory.
+ *
+ * Then the join keeps the fact rows whose fk equals the key of one of the
+ * table's rows that pass its filters, each once, and nothing else of the
+ * table reaches the result: `fk = ANY (<those keys>)`, a fact filter.
+ */
+static bool
+lion_fkjoin_filter_of(PlannerInfo *root, RelOptInfo *joinrel,
+					  RelOptInfo *fact, int xrelid, LionFkFilter *out)
+{
+	RelOptInfo *x = root->simple_rel_array[xrelid];
+	Relids		others;
+	List	   *clauses;
+	List	   *pair;
+	RestrictInfo *rinfo;
+	RestrictInfo *pri;
+	OpExpr	   *op;
+	Node	   *argexpr[2];
+	Var		   *argvar[2];
+	int			fi;
+	int			di;
+	int			i;
+	ListCell   *lc;
+
+	if (!lion_fkjoin_rel_ok(root, x) || lion_fkjoin_is_parent(root, x))
+		return false;
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+
+		if (bms_is_member(xrelid, sjinfo->min_lefthand) ||
+			bms_is_member(xrelid, sjinfo->min_righthand) ||
+			bms_is_member(xrelid, sjinfo->syn_lefthand) ||
+			bms_is_member(xrelid, sjinfo->syn_righthand))
+			return false;
+	}
+	foreach(lc, joinrel->reltarget->exprs)
+	{
+		if (bms_is_member(xrelid, pull_varnos(root, (Node *) lfirst(lc))))
+			return false;
+	}
+
+	/* ---- one clause joins it to the rest, and it is the fact's ---- */
+	others = bms_del_member(bms_copy(joinrel->relids), xrelid);
+	clauses = generate_join_implied_equalities(root, joinrel->relids, others,
+											   x, NULL);
+	foreach(lc, x->joininfo)
+	{
+		RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+
+		if (bms_is_subset(ri->required_relids, joinrel->relids))
+			clauses = lappend(clauses, ri);
+	}
+	if (list_length(clauses) != 1)
+		return false;
+	rinfo = (RestrictInfo *) linitial(clauses);
+	pair = (xrelid < (int) fact->relid) ?
+		lion_fkjoin_pair_clauses(root, x, fact) :
+		lion_fkjoin_pair_clauses(root, fact, x);
+	if (list_length(pair) != 1)
+		return false;
+	pri = (RestrictInfo *) linitial(pair);
+	if (!IsA(rinfo, RestrictInfo) || !IsA(pri, RestrictInfo))
+		return false;
+	if (rinfo->parent_ec != NULL ? pri->parent_ec != rinfo->parent_ec :
+		pri != rinfo)
+		return false;
+	if (pri->pseudoconstant || !IsA(pri->clause, OpExpr))
+		return false;
+	op = (OpExpr *) pri->clause;
+	if (list_length(op->args) != 2 || !op_strict(op->opno))
+		return false;
+	for (i = 0; i < 2; i++)
+	{
+		Node	   *arg = (Node *) list_nth(op->args, i);
+		Node	   *stripped = lion_fkjoin_strip(arg);
+
+		if (stripped == NULL || !IsA(stripped, Var))
+			return false;
+		argexpr[i] = arg;
+		argvar[i] = (Var *) stripped;
+		if (argvar[i]->varattno <= 0 || argvar[i]->varlevelsup != 0)
+			return false;
+	}
+	fi = (argvar[0]->varno == (int) fact->relid) ? 0 : 1;
+	di = 1 - fi;
+	if (argvar[fi]->varno != (int) fact->relid || argvar[di]->varno != xrelid)
+		return false;
+
+	/* ---- its key unique, its path one the node may run ---- */
+	if (!lion_column_is_unique(x, argvar[di]->varattno, op->opno,
+							   op->inputcollid))
+		return false;
+	if (!OidIsValid(get_array_type(exprType(argexpr[di]))))
+		return false;
+	if (x->cheapest_total_path == NULL ||
+		x->cheapest_total_path->param_info != NULL ||
+		!lion_fkjoin_target_has(x->reltarget, argvar[di]))
+		return false;
+	if (x->cheapest_total_path->rows > (double) lion_array_batch_size())
+		return false;
+
+	out->rel = x;
+	out->fkvar = argvar[fi];
+	out->pkvar = argvar[di];
+	out->pkexpr = argexpr[di];
+	out->opno = op->opno;
+	out->collation = op->inputcollid;
+	out->clause = (Node *) op;
+	out->path = x->cheapest_total_path;
+	return true;
+}
+
+/*
  * One way of taking `joinrel` apart: the relation `factrelid` as the fact,
  * everything else as the dimension (DESIGN.md §27, "A dimension that is a
  * join").  Fills *fj and returns true when it qualifies.
@@ -303,10 +449,15 @@ lion_fkjoin_target_has(PathTarget *target, Var *var)
  * is the one table of it that no special join has on its inner side, and
  * there has to be exactly one: two would be an inner join inside the
  * dimension, which may repeat a row.
+ *
+ * The tables of `folded` are dimensions that only filter, `filters` their
+ * LionFkFilters: not the dimension's, and taken only beside an inner join of
+ * the fact and the dimension.
  */
 static bool
 lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
-					 Index leftoj, LionFkJoin *fj)
+					 Index leftoj, Relids folded, List *filters,
+					 LionFkJoin *fj)
 {
 	RelOptInfo *fact = root->simple_rel_array[factrelid];
 	RelOptInfo *dim;
@@ -334,6 +485,9 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 	dimrels = bms_del_member(bms_copy(joinrel->relids), factrelid);
 	if (leftoj != 0)
 		dimrels = bms_del_member(dimrels, leftoj);
+	dimrels = bms_del_members(dimrels, folded);
+	if (bms_is_empty(dimrels))
+		return false;
 	joined = (bms_membership(dimrels) == BMS_MULTIPLE);
 
 	foreach(lc, root->join_info_list)
@@ -424,16 +578,17 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 		return false;
 	if (joined)
 	{
+		Relids		dimfact = bms_add_member(bms_copy(dimrels), factrelid);
 		List	   *whole;
 		RestrictInfo *wri;
 
-		whole = generate_join_implied_equalities(root, joinrel->relids,
-												 dimrels, fact, NULL);
+		whole = generate_join_implied_equalities(root, dimfact, dimrels, fact,
+												 NULL);
 		foreach(lc, fact->joininfo)
 		{
 			RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
 
-			if (bms_is_subset(ri->required_relids, joinrel->relids))
+			if (bms_is_subset(ri->required_relids, dimfact))
 				whole = lappend(whole, ri);
 		}
 		if (list_length(whole) != 1)
@@ -564,6 +719,10 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 	else
 		jointype = key->jointype;
 
+	/* a dimension that only filters is folded beside an inner join alone */
+	if (filters != NIL && jointype != JOIN_INNER)
+		return false;
+
 	/*
 	 * ---- the child: the dimension's cheapest path ----
 	 *
@@ -600,6 +759,7 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 	fj->jointype = jointype;
 	fj->joinrel = joinrel;
 	fj->uniqsortop = sortop;
+	fj->filters = filters;
 	return true;
 }
 
@@ -700,6 +860,13 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 	/*
 	 * ---- each table that may be the fact, the rest the dimension ----
 	 *
+	 * Less the tables that only filter that fact (lion_fkjoin_filter_of()),
+	 * which are folded into its filters - beside no LEFT JOIN, which is a
+	 * join of two tables.  Where every other table only filters, each of
+	 * them is tried as the dimension in turn, the others folded: a count of
+	 * the fact joined to two dimensions that each filter it is either one
+	 * looked up and the other folded.
+	 *
 	 * Equality commutes, so either side of the key may be either table's, and
 	 * a join of two tables is tried both ways round.  Over a joined dimension
 	 * each table that could be the fact is tried: a dimension with an EXISTS
@@ -709,13 +876,56 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 	 * clause), and the cost model chooses among what qualifies.
 	 */
 	fj = (LionFkJoin *) palloc0(sizeof(LionFkJoin) *
+								bms_num_members(joinrel->relids) *
 								bms_num_members(joinrel->relids));
 	i = -1;
 	while ((i = bms_next_member(joinrel->relids, i)) >= 0)
 	{
-		if (i != (int) leftoj &&
-			lion_fkjoin_try_fact(root, joinrel, i, leftoj, &fj[n]))
-			n++;
+		RelOptInfo *fact = root->simple_rel_array[i];
+		Relids		folded = NULL;
+		List	   *filters = NIL;
+		int			j;
+
+		if (i == (int) leftoj)
+			continue;
+		if (leftoj == 0 && lion_fkjoin_rel_ok(root, fact))
+		{
+			j = -1;
+			while ((j = bms_next_member(joinrel->relids, j)) >= 0)
+			{
+				LionFkFilter filt;
+
+				if (j == i ||
+					!lion_fkjoin_filter_of(root, joinrel, fact, j, &filt))
+					continue;
+				folded = bms_add_member(folded, j);
+				filters = lappend(filters, palloc(sizeof(LionFkFilter)));
+				memcpy(llast(filters), &filt, sizeof(LionFkFilter));
+			}
+		}
+
+		if (!bms_is_subset(joinrel->relids,
+						   bms_add_member(bms_copy(folded), i)))
+		{
+			/* a dimension besides them */
+			if (lion_fkjoin_try_fact(root, joinrel, i, leftoj, folded,
+									 filters, &fj[n]))
+				n++;
+			continue;
+		}
+
+		/* every other table only filters: each of them the dimension */
+		foreach(lc, filters)
+		{
+			LionFkFilter *dim = (LionFkFilter *) lfirst(lc);
+			List	   *rest = list_delete_ptr(list_copy(filters), dim);
+
+			if (lion_fkjoin_try_fact(root, joinrel, i, leftoj,
+									 bms_del_member(bms_copy(folded),
+													dim->rel->relid),
+									 rest, &fj[n]))
+				n++;
+		}
 	}
 	*out = fj;
 	return n;

@@ -674,6 +674,7 @@ void
 lion_rescan_custom_scan(CustomScanState *node)
 {
 	LionCountScanState *st = (LionCountScanState *) node;
+	int			i;
 
 	lion_reset_run(st);
 	st->done = false;
@@ -696,6 +697,17 @@ lion_rescan_custom_scan(CustomScanState *node)
 				ExecReScan(js->child);
 		}
 		js->childslot = NULL;
+
+		/* the dimensions folded into fact filters run whole again */
+		for (i = 0; i < js->nfilter; i++)
+		{
+			if (js->filterps[i] == NULL)
+				continue;
+			if (node->ss.ps.chgParam != NULL)
+				UpdateChangedParamSet(js->filterps[i], node->ss.ps.chgParam);
+			if (js->filterps[i]->chgParam == NULL)
+				ExecReScan(js->filterps[i]);
+		}
 	}
 }
 
@@ -1079,12 +1091,20 @@ lion_end_custom_scan(CustomScanState *node)
 	{
 		LionJoinState *js = st->join;
 
+		int			i;
+
 		if (js->child != NULL)
 		{
 			ExecEndNode(js->child);
 			js->child = NULL;
 		}
 		js->childslot = NULL;
+		for (i = 0; i < js->nfilter; i++)
+		{
+			if (js->filterps[i] != NULL)
+				ExecEndNode(js->filterps[i]);
+			js->filterps[i] = NULL;
+		}
 	}
 
 	/*
