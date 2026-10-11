@@ -18599,7 +18599,9 @@ is true for:
   the document.
 - **`chain == scalar`** is the `L` keys that start with the names, `0x00` and the value, at any array
   levels. jsonpath compares strings by their bytes and numbers by value, which is what the `L` key
-  stores. A cut chain only says something is under its names.
+  stores. A cut chain only says something is under its names. The scalar is a bare literal: with
+  an accessor after it (`$.a == "2".double()`) it stands for another value, and the chain is only
+  required to yield an item.
 - **A chain that must yield an item** (`exists (chain)`, either operand of `!=`, `<`, `<=`, `>`,
   `>=`, `starts with`, `like_regex`, and `@?`'s path) is the `L` and `C` keys that start with its
   names. The root (no names) is every document.
