@@ -668,36 +668,63 @@ lion_fkjoin_mul_op(Oid lefttype)
 						   ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
 }
 
-static bool
-lion_fkjoin_rewrite_init(LionFkAggRewrite *cx, const LionFkJoin *fj,
-						 bool needcount, bool needsum)
+/*
+ * The extension's lion_join_count(int8) and lion_join_sum(int8), and core's
+ * int2 * int8 and int4 * int8, for an Agg over rows that carry their counts;
+ * false, and the ordinary plan, when one is missing or the current user may
+ * not run it.  Each is asked for only when its pointer is not NULL.
+ */
+bool
+lion_join_aggs_lookup(Oid *countfn, Oid *sumfn, Oid *mul2op, Oid *mul4op)
 {
 	Oid			extoid = get_extension_oid("pg_lion", true);
 	Oid			nsp;
-	Aggref	   *n;
 
-	memset(cx, 0, sizeof(LionFkAggRewrite));
-	cx->fj = fj;
 	if (!OidIsValid(extoid))
 		return false;
 	nsp = get_extension_schema(extoid);
 	if (!OidIsValid(nsp))
 		return false;
-	if (needcount)
+	if (countfn != NULL)
 	{
-		cx->countfn = lion_fkjoin_ext_agg(extoid, nsp, "lion_join_count");
-		if (!OidIsValid(cx->countfn))
+		*countfn = lion_fkjoin_ext_agg(extoid, nsp, "lion_join_count");
+		if (!OidIsValid(*countfn))
 			return false;
 	}
-	if (needsum)
+	if (sumfn != NULL)
 	{
-		cx->sumfn = lion_fkjoin_ext_agg(extoid, nsp, "lion_join_sum");
-		cx->mul2op = lion_fkjoin_mul_op(INT2OID);
-		cx->mul4op = lion_fkjoin_mul_op(INT4OID);
-		if (!OidIsValid(cx->sumfn) || !OidIsValid(cx->mul2op) ||
-			!OidIsValid(cx->mul4op))
+		*sumfn = lion_fkjoin_ext_agg(extoid, nsp, "lion_join_sum");
+		if (!OidIsValid(*sumfn))
 			return false;
 	}
+	if (mul2op != NULL)
+	{
+		*mul2op = lion_fkjoin_mul_op(INT2OID);
+		if (!OidIsValid(*mul2op))
+			return false;
+	}
+	if (mul4op != NULL)
+	{
+		*mul4op = lion_fkjoin_mul_op(INT4OID);
+		if (!OidIsValid(*mul4op))
+			return false;
+	}
+	return true;
+}
+
+static bool
+lion_fkjoin_rewrite_init(LionFkAggRewrite *cx, const LionFkJoin *fj,
+						 bool needcount, bool needsum)
+{
+	Aggref	   *n;
+
+	memset(cx, 0, sizeof(LionFkAggRewrite));
+	cx->fj = fj;
+	if (!lion_join_aggs_lookup(needcount ? &cx->countfn : NULL,
+							   needsum ? &cx->sumfn : NULL,
+							   needsum ? &cx->mul2op : NULL,
+							   needsum ? &cx->mul4op : NULL))
+		return false;
 
 	/*
 	 * The count column: what the partial count(*) of a dimension row's join
@@ -936,13 +963,29 @@ static void
 lion_add_join_agg_path(PlannerInfo *root, RelOptInfo *output_rel,
 					   Path *aggpath, const LionFkJoinAgg *rowagg)
 {
-	CustomPath *cpath;
-
 	if (!rowagg->counts)
 	{
 		add_path(output_rel, aggpath);
 		return;
 	}
+	add_path(output_rel, (Path *) lion_join_agg_wrap(root, output_rel, aggpath,
+													 NIL));
+}
+
+/*
+ * The LionJoinAgg itself: aggpath, whose aggregates were rewritten over rows
+ * that carry their counts, below a node whose target is output_rel's own.
+ * The grouping sets of DESIGN.md §10 ("Grouping sets") put their Agg into the
+ * grouped rel the same way.  checkaggs are the query's aggregates that no
+ * node below asks EXECUTE on (DESIGN.md §9, "Privileges") - the FK-side
+ * join's LionCount asks it of the query's own, the grouping sets' counts
+ * only of the count(*) they are made of - which the node asks at startup.
+ */
+CustomPath *
+lion_join_agg_wrap(PlannerInfo *root, RelOptInfo *output_rel, Path *aggpath,
+				   List *checkaggs)
+{
+	CustomPath *cpath;
 
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
@@ -964,9 +1007,9 @@ lion_add_join_agg_path(PlannerInfo *root, RelOptInfo *output_rel,
 #if PG_VERSION_NUM >= 170000
 	cpath->custom_restrictinfo = NIL;
 #endif
-	cpath->custom_private = NIL;
+	cpath->custom_private = checkaggs;
 	cpath->methods = &lion_join_agg_path_methods;
-	add_path(output_rel, &cpath->path);
+	return cpath;
 }
 
 /*

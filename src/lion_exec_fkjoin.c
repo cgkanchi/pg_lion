@@ -44,9 +44,17 @@ lion_begin_join_agg(CustomScanState *node, EState *estate, int eflags)
 {
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 	PlanState  *child;
+	ListCell   *lc;
 
 	if (list_length(cscan->custom_plans) != 1)
 		elog(ERROR, "LionJoinAgg: needs exactly one child plan");
+
+	/*
+	 * The query's aggregates that the Agg below computes from counts, as
+	 * ExecInitAgg() would have checked them (lion_join_agg_wrap()).
+	 */
+	foreach(lc, cscan->custom_private)
+		lion_check_aggregate_execute(lfirst_oid(lc));
 	child = ExecInitNode((Plan *) linitial(cscan->custom_plans), estate,
 						 eflags);
 	node->custom_ps = list_make1(child);

@@ -1718,7 +1718,8 @@ Planner integration
     this only declines an index that got past it; the executor checks again when it opens the
     relation.
   - The query has no DISTINCT (but a SELECT DISTINCT over the table alone is a GROUP BY of its
-    keys, at end of this section), grouping sets, ORDER BY inside aggregates,
+    keys, at end of this section), grouping sets (but those are counted as their finest
+    grouping, "Grouping sets" at end of this section), ORDER BY inside aggregates,
     FILTER clauses, or aggregates other than `count(*)` (or `count(1)` of any non-NULL constant)
     and the `count(col)` cases of §14 - and, without a GROUP BY, `count(col)` of any one column
     whose index answers `col IS NOT NULL`.
@@ -2718,6 +2719,98 @@ order. PostgreSQL 18's B-tree skip scan does not compete here: core's DISTINCT o
 Unique over a full index-only scan, priced as such, and the cost model decides. 1M rows: `SELECT
 DISTINCT c200` 128 ms to 4.6 ms (51 ms with a B-tree on c200); `c20, c200 ... GROUP BY 1, 2`
 127 ms to 15 ms (decoded walk).
+
+### Grouping sets (2026-10-11)
+
+`GROUP BY ROLLUP (...)`, `CUBE (...)` and `GROUPING SETS (...)` over one table
+(`lion_plan_gsets.c`). Every grouping set is a subset of the union of the sets - the finest
+grouping, which is `parse->groupClause` - so each group of a set is the union of some groups of
+the finest grouping, and an aggregate of a set's group is an aggregate over theirs. The node
+counts the finest grouping as the plain GROUP BY it is, one row a group with its count `n`, and
+core's own grouping sets Agg forms every set's groups over those rows, with each aggregate
+rewritten over them as the FK-side join's rows mode rewrites it (§27, "Every aggregate over the
+node's rows"):
+
+| the query's aggregate | over the finest grouping's rows |
+|---|---|
+| `count(*)` | `lion_join_count(n)` |
+| `count(x)`, x of grouping columns | `lion_join_count(n) FILTER (WHERE x IS NOT NULL)` |
+| `sum(x)`, x an int2 or int4 of grouping columns | `lion_join_sum(x * n)` |
+| `min`, `max`, `bool_and`, `bool_or` of grouping columns | as it stands |
+| any aggregate over `DISTINCT` grouping columns | as it stands |
+| `GROUPING(...)` | as it stands |
+
+A FILTER over grouping columns is kept, ANDed with the `IS NOT NULL` of a `count(x)`. The
+aggregates left as they stand are the ones a group's repeated rows do not change: those with a
+sort operator in `pg_aggregate` (the aggregate is the first of its input in that order) and those
+over DISTINCT arguments, whose distinct inputs are the same over the finest grouping's rows as
+over the table's. `lion_join_count` is 0 over no rows, so the empty grouping set of an empty
+input is one row of count 0, as `count(*)` gives.
+
+The plan is a LionJoinAgg over a GroupAggregate over the node, sorted for the first rollup:
+
+```
+Custom Scan (LionJoinAgg)
+  ->  GroupAggregate                 core's, the aggregates rewritten
+        Group Key: a, b
+        Group Key: a
+        Group Key: ()
+        Sort Key: b                  a CUBE's second rollup, sorted by the Agg
+          Group Key: b
+        ->  Sort
+              Sort Key: a, b
+              ->  Custom Scan (LionCount)   GROUP BY a, b, each group with count(*)
+```
+
+The LionJoinAgg is §27's: the grouped rel's target is the query's own, which what core puts
+above (a Sort for `ORDER BY count(*)`, a window, a projection) finds its aggregates in by
+`equal()`, and the Agg below computes the rewritten ones.
+
+**The finest grouping.** `lion_try_gsets_path()` builds a rel of its own for it, a copy of the
+grouped rel with an empty path list and a target of the grouping columns - with their
+sortgrouprefs, as they are below the grouping step: from PostgreSQL 18 on, a grouping column
+above it is nulled by the grouping step's RT index, which `remove_nulling_relids()` takes off -
+and a count(*). `lion_try_count_path()` then plans the plain GROUP BY into that rel, with the
+query's `groupingSets` and `limitCount` cleared and `processed_tlist` below the grouping for the
+call: the top k (§36) would cut the finest grouping to the query's LIMIT, which is the sets'.
+Every form of the plain GROUP BY is open to it - the nested loop of §20, the decoded walk of §34,
+a partitioned table's Finalize Agg, the parallel GROUP BY - and its paths are priced in the units
+pinned for the grouped rel (§39, `lion_units_pin_move()`), whose competitor is core's grouping
+sets plan.
+
+**Rollups.** The sets are chained greedily from the largest down, each to the first chain whose
+last set holds it; a chain is one sorted pass of the Agg, its grouping clause the columns of its
+smallest set, then those its next set adds, so that every set of it is a prefix. The first chain
+holds the largest set and reads the node's rows sorted by its clause; core sorts them again for
+each other chain (`create_groupingsets_plan()`). Every rollup is sorted, never hashed: the
+finest grouping's rows are few, which is what makes the node worth using. A set's group count is
+`estimate_num_groups()` over the node's rows. The Agg claims no order, since its first rollup
+need not be the one core's `group_pathkeys` were made for, and an ORDER BY gets a Sort above the
+LionJoinAgg. The cost is core's `cost_sort()` and `cost_agg()` over the node's path, and
+`add_path()` chooses between the plan and core's own.
+
+**Privileges.** The Agg below asks EXECUTE on what it runs - the extension's aggregates and those
+left as they stand - and the node on `count()`; the query's rewritten aggregates (`sum(int4)`,
+`count("any")`) would be asked by no one, so the LionJoinAgg path carries them in its
+`custom_private` and the node asks EXECUTE on each when it starts, as ExecInitAgg would
+(§9, "Privileges"; `test/sql/node_contracts.sql` has the line). The plan asks one privilege more
+than the ordinary plan where the query has no `count(*)`: `count()`, of the node's own count, and
+the extension's `lion_join_count` and `lion_join_sum`, which are looked up at plan time.
+
+**Declined**, to the ordinary plan: an aggregate that reads a column outside the grouping, or one
+not in the table above (`avg`, `array_agg` without DISTINCT, `bit_xor`, a `sum` of a bigint);
+an aggregate with ORDER BY other than those left as they stand; a volatile function or a
+subquery inside an aggregate, which would run once a group of the finest grouping and not once a
+row; an ordered-set aggregate; a grouping expression that is not a plain column of the table; a
+set that names a column twice; DISTINCT, set-returning functions, joins; and a finest grouping
+the node does not count (a column without a lion index, a WHERE it cannot answer).
+
+5M rows (two columns of 20 and 2 values, one of 200): `ROLLUP (c20, c2)` 885 ms to 46 ms, `CUBE
+(c20, c2)` 1,237 ms to 46 ms, `GROUPING SETS ((c20), (c200), ()) WHERE c2 = 1` 577 ms to 52 ms.
+`ROLLUP (c20k, c200)` and `ROLLUP (c1m)`, whose finest groupings run to millions of groups, stay
+core's MixedAggregate, at 4.8 s and 2.4 s. `test/sql/countgsets.sql` compares every shape with
+the sequential plan, over NULL grouping keys and dead and updated rows VACUUM has not seen, and
+of a partitioned table, and checks that the declined shapes are declined.
 
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 

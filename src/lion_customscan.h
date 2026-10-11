@@ -2917,6 +2917,7 @@ extern Path *lion_competitor_path(RelOptInfo *rel);
 extern void lion_units_for(PlannerInfo *root, RelOptInfo *rel, LionUnits *u);
 extern void lion_units_pin(PlannerInfo *root, RelOptInfo *rel);
 extern void lion_units_unpin(void);
+extern RelOptInfo *lion_units_pin_move(RelOptInfo *rel);
 extern Cost lion_units_price(const LionUnits *u, Cost own);
 extern void lion_units_cold(LionUnits *u, Cost own, double reads);
 extern double lion_units_margin(void);
@@ -2996,6 +2997,11 @@ extern Cost lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 								  double *reads, bool *unite);
 
 /* lion_plan_fkjoin.c */
+extern bool lion_join_aggs_lookup(Oid *countfn, Oid *sumfn, Oid *mul2op,
+								  Oid *mul4op);
+extern CustomPath *lion_join_agg_wrap(PlannerInfo *root,
+									  RelOptInfo *output_rel, Path *aggpath,
+									  List *checkaggs);
 extern double lion_leaf_turn_share(PlannerInfo *root, RelOptInfo *rel);
 extern double lion_fact_groups(PlannerInfo *root, const LionCountTarget *t);
 extern void lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
@@ -3021,6 +3027,11 @@ extern void lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 								const LionFkJoin *fj);
 extern void lion_try_distinct_path(PlannerInfo *root, RelOptInfo *input_rel,
 								   RelOptInfo *output_rel);
+
+/* lion_plan_gsets.c */
+extern void lion_try_gsets_path(PlannerInfo *root, RelOptInfo *input_rel,
+								RelOptInfo *output_rel,
+								GroupPathExtraData *extra);
 
 /* lion_plan_hooks.c */
 extern Plan *lion_plan_join_agg_path(PlannerInfo *root, RelOptInfo *rel,
