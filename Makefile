@@ -51,6 +51,7 @@ ifeq ($(LION_NO_SIMD),1)
 PG_CFLAGS += -DLION_NO_SIMD
 endif
 EXTRA_CLEAN = test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
+              test/unit/entry_test \
               test/results test/isolation/results
 
 PG_CONFIG ?= $(if $(wildcard .local/pg/bin/pg_config),.local/pg/bin/pg_config,pg_config)
@@ -95,7 +96,8 @@ UNIT_LDFLAGS = -L$(shell $(PG_CONFIG) --pkglibdir) -L$(shell $(PG_CONFIG) --libd
 ifeq ($(SANITIZE),1)
 UNIT_CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
 UNIT_LDFLAGS += -fsanitize=address,undefined
-test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test: .lion-force-unit
+test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
+test/unit/entry_test: .lion-force-unit
 .PHONY: .lion-force-unit
 endif
 
@@ -120,12 +122,17 @@ test/unit/positions_test: test/unit/positions_test.c src/lion_positions.c \
                           src/lion_positions.h src/lion_container.h src/lion_tid.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/positions_test.c src/lion_positions.c $(UNIT_LDFLAGS)
 
+test/unit/entry_test: test/unit/entry_test.c src/lion_entryfmt.h
+	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/entry_test.c $(UNIT_LDFLAGS)
+
 .PHONY: unit
-unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test
+unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
+      test/unit/entry_test
 	./test/unit/container_test
 	./test/unit/container_test_nosimd
 	./test/unit/sparse_test
 	./test/unit/positions_test
+	./test/unit/entry_test
 
 # header deps (the PostgreSQL build we compile against was not configured with --enable-depend)
 # (every header lion.h includes, and each of the others' includers; a missing
