@@ -19,14 +19,17 @@ SET synchronous_commit = on;
 /*
  * Keys of about 1.9 kB put one or two entries on a leaf, so 3000 keys are
  * spread over some 1500 leaves; x is a second key column and a
- * second index for the merge and the GROUP BY driver.
+ * second index for the merge and the GROUP BY driver.  The fills are 80: at
+ * the default 90 a leaf takes a third such entry, the fill nearer the budget
+ * past it than short of it (DESIGN.md §21), and the list below would no
+ * longer be wider than the budget.
  */
 CREATE TABLE lion_pin (k text NOT NULL, x int NOT NULL, y int NOT NULL);
 INSERT INTO lion_pin SELECT repeat(md5(i::text), 59) || i, i % 2, i % 1000 FROM generate_series(1, 3000) i;
-CREATE INDEX lion_pin_k ON lion_pin USING lion (k);
+CREATE INDEX lion_pin_k ON lion_pin USING lion (k) WITH (fillfactor = 80);
 CREATE INDEX lion_pin_x ON lion_pin USING lion (x);
 CREATE INDEX lion_pin_y ON lion_pin USING lion (y);
-CREATE INDEX lion_pin_kx ON lion_pin USING lion (k, x);
+CREATE INDEX lion_pin_kx ON lion_pin USING lion (k, x) WITH (fillfactor = 80);
 VACUUM (FREEZE, ANALYZE) lion_pin;
 SELECT pg_relation_size('lion_pin_k') / current_setting('block_size')::int > 1200 AS many_leaves;
  many_leaves 

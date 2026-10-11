@@ -5911,7 +5911,8 @@ Pass 1 of the old build is GONE. It existed only to count distinct keys so that 
 could be sized; the one remaining pass counts them as it groups, so the build reads the sorted data
 once instead of twice and the tuplesort no longer needs TUPLESORT_RANDOMACCESS.
 
-Leaves are filled left to right at `fillfactor` (reloption, 10..100, default 90), and the internal
+Leaves are filled left to right at `fillfactor` (reloption, 10..100, default 90; to whichever side
+of it the last entry lands nearer, below), and the internal
 levels are built bottom-up in the same pass, nbtree's `_bt_buildadd` shape: one open page per level,
 written out when the item that does not fit arrives - that item's key is the page's high key, and the
 page's own first key is the downlink it hands to the level above. The first page of every level gets
@@ -5927,6 +5928,35 @@ every level is then as large as the one below it, and `lion_build_finish_dir()` 
 without reaching a root. It now also checks the invariant it relies on - each level strictly smaller
 than the one below - and errors out rather than looping. *(Not in the first draft, which applied the
 leaf budget to every level and said no floor was needed.)*
+
+**The leaf fill lands on the nearer side of the budget (2026-10-11).** A leaf is written out when the
+next entry would take it past `fillfactor` - unless taking the entry leaves the page over the budget
+by less than it would be short of the budget without it, and the page still holds the entry and a
+high key (`lion_build_leaf_crosses()`; the entry's own key stands for the next page's first, which
+becomes the high key, on both sides of the comparison). For entries small against a page this moves
+the fill by less than half an entry, so `fillfactor` keeps its meaning for them: a unique `int8`
+column of 500,000 keys builds leaves 10.2% free at the default 90. For large INLINE entries it is
+what decides the fill. On a 20,000-key column over 5M rows every entry is some 1.55 kB: four take
+76% of a page and a fifth 95%, and "never past 90%" stopped every leaf at four, 22.8% of every leaf
+empty. The fifth is nearer the budget (5% over it, against 14% short), so the leaf now takes it. The
+internal levels keep their own rule (`LION_NONLEAF_FILLFACTOR` and the downlink floor above). A leaf
+filled past the budget has less room for an insert that grows one of its entries; such an insert
+splits the leaf, as it does on any full leaf.
+
+Measured (freshly built, the review's free-space-by-page-kind query over pageinspect):
+
+| index | size before | size after | leaves before | leaves after | leaf free before | after |
+|---|---|---|---|---|---|---|
+| `c20k`, 5M rows, 20,000 keys | 39.3 MB | 32.1 MB | 4,988 | 4,075 | 22.8% | 5.6% |
+| `docs.tags` (`text[]`), 500k rows | 9.2 MB | 8.5 MB | 447 | 362 | 23.8% | 6.1% |
+| `docs.tsv` (`tsvector`), 500k rows | 13.4 MB | 12.6 MB | 951 | 853 | 17.7% | 8.3% |
+
+What it costs is the room inserts had. 4,000 rows inserted into the `c20k` table after the build
+grow the new index by 224 kB (some 28 leaves split) and leave the old one as it was; 40,000 - two
+for every key, so that nearly every leaf gets one - split nearly every leaf of the new index, which
+ends at 43.7 MB against the old one's unchanged 39.3 MB. An index of large entries that takes many
+inserts across its keys after the build is better built at a lower `fillfactor`, which this rule
+honours as it does 90.
 
 **The high key is accounted for with nbtree's "last item becomes the high key" rule.** A page's high
 key is a copy of the FIRST key of the page to its right, which is the item that did not fit; keys
