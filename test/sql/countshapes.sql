@@ -91,6 +91,8 @@ BEGIN
 	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		-- 18 prints each window's definition under a WindowAgg
+		CONTINUE WHEN ln ~ '^\s*Window: ';
 		RETURN NEXT ln;
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
@@ -133,7 +135,8 @@ DROP SEQUENCE cs_seq;
 
 -- a subquery over the counts is a SubPlan the node does not run: the grouping
 -- is the ordinary plan's (the subquery's own count is pushed down)
-SELECT btrim(p) FROM cs_plan('SELECT a, count(*) + (SELECT count(*) FROM cs c2 WHERE c2.a = cs.a) FROM cs GROUP BY a') p
+SELECT regexp_replace(btrim(p), '^(Hash|Group)Aggregate', 'Aggregate')
+  FROM cs_plan('SELECT a, count(*) + (SELECT count(*) FROM cs c2 WHERE c2.a = cs.a) FROM cs GROUP BY a') p
  WHERE p ~ '(Aggregate|LionCount|SubPlan)';
 SELECT cs_q('SELECT a, count(*) + (SELECT count(*) FROM cs c2 WHERE c2.a = cs.a) FROM cs GROUP BY a');
 

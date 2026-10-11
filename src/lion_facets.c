@@ -70,6 +70,7 @@
 #include "parser/parser.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/ruleutils.h"
+#include "utils/tuplestore.h"
 #include "utils/varlena.h"
 
 PG_FUNCTION_INFO_V1(lion_index_facets);
@@ -1105,7 +1106,9 @@ lion_facets_heap(LionFacetRun *run)
 	HASH_SEQ_STATUS seq;
 	LionFacetHashEnt *ent;
 	LionSetStream *stream;
+#if PG_VERSION_NUM < 200000
 	IndexFetchTableData *fetch;
+#endif
 	TupleTableSlot *slot;
 	const LionContainer *c;
 	uint16	   *los;
@@ -1124,7 +1127,17 @@ lion_facets_heap(LionFacetRun *run)
 
 	los = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
 	stream = lion_stream_begin(1, &run->copy, NULL, false);
+	/*
+	 * The heap side of an index scan, as lo_fetch_walk() has it: 19 gave
+	 * table_index_fetch_begin() scan options, and 20 moved the HOT chain
+	 * search into the table AM (table_fetch_tid(), then the version it found).
+	 */
+#if PG_VERSION_NUM >= 200000
+#elif PG_VERSION_NUM >= 190000
+	fetch = table_index_fetch_begin(run->heap, SO_NONE);
+#else
 	fetch = table_index_fetch_begin(run->heap);
+#endif
 	slot = table_slot_create(run->heap, NULL);
 
 	while ((c = lion_stream_next(stream)) != NULL)
@@ -1136,15 +1149,25 @@ lion_facets_heap(LionFacetRun *run)
 		for (i = 0; i < n; i++)
 		{
 			ItemPointerData tid;
-			bool		call_again = false;
 			bool		all_dead = false;
 			bool		isnull;
 			Datum		value;
 
 			lion_code_to_tid(lion_make_code(c->ckey, los[i]), &tid);
-			if (!table_index_fetch_tuple(fetch, &tid, run->snapshot, slot,
-										 &call_again, &all_dead))
+#if PG_VERSION_NUM >= 200000
+			if (!table_fetch_tid(run->heap, &tid, run->snapshot, &all_dead) ||
+				!table_tuple_fetch_row_version(run->heap, &tid, run->snapshot,
+												slot))
 				continue;
+#else
+			{
+				bool		call_again = false;
+
+				if (!table_index_fetch_tuple(fetch, &tid, run->snapshot, slot,
+											 &call_again, &all_dead))
+					continue;
+			}
+#endif
 			run->fetched++;
 
 			MemoryContextReset(run->percount);
@@ -1190,7 +1213,9 @@ lion_facets_heap(LionFacetRun *run)
 	}
 
 	ExecDropSingleTupleTableSlot(slot);
+#if PG_VERSION_NUM < 200000
 	table_index_fetch_end(fetch);
+#endif
 	lion_stream_end(stream);
 	pfree(los);
 
