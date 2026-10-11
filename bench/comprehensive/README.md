@@ -9,8 +9,8 @@ The default **focused** suite compares **B-tree, GIN, roaring, and roaring_bitma
 Both profiles create a private temporary database cluster; neither changes `pg_index.indisvalid` or connects to a user-supplied database endpoint. The quick benchmark remains unchanged for frequent progress checks; focused adds high-cardinality/skew cases, low-memory diagnostics, and a third timing round.
 
 The run the [benchmark page](../../docs/BENCHMARKS.md) summarises is kept in
-[results/2026-10-08-85c991c-pg18-focused](../results/2026-10-08-85c991c-pg18-focused/REPORT.md),
-as [searchable HTML](../results/2026-10-08-85c991c-pg18-focused/index.html) and raw records.
+[results/2026-10-11-3947945-pg18-focused](../results/2026-10-11-3947945-pg18-focused/REPORT.md),
+as [searchable HTML](../results/2026-10-11-3947945-pg18-focused/index.html) and raw records.
 
 ## Run
 
