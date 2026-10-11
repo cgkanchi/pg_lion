@@ -1,0 +1,300 @@
+-- Room a build leaves for the inserts that follow it: the posting_fillfactor
+-- reloption, which leaves part of every posting-tree leaf empty (DESIGN.md
+-- §22, "Bulk build"), and build_slack, which writes INLINE entries and
+-- posting items with the growth slack an insert would give them (§4, "Growth
+-- slack").  Both are read at build time only.
+--
+-- The heap is filled to 70%, so the new row versions of the UPDATEs below land
+-- on the pages the old ones are on, and their TIDs inside the containers the
+-- build wrote rather than after them: the first wave of scattered writes
+-- after a build, which is what a full leaf has to split for.  After every step
+-- the index is verified and every key is counted through a bitmap scan and
+-- the count pushdown and against the heap.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+SET synchronous_commit = on;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE TABLE br (id int, k int, s int, d int)
+  WITH (fillfactor = 70, autovacuum_enabled = off);
+INSERT INTO br
+SELECT i, i % 20, (i * 7) % 3000, i % 2 FROM generate_series(1, 200000) i;
+VACUUM (FREEZE) br;
+-- Keys of one column counted three ways - through a bitmap scan, through the
+-- count pushdown, and off the heap by one sequential GROUP BY - every step-th
+-- key from 0; the rows are those whose counts differ.
+CREATE FUNCTION br_counts(col text, step int DEFAULT 1, OUT key int,
+	OUT via_bitmap bigint, OUT via_count bigint, OUT via_heap bigint)
+RETURNS SETOF record LANGUAGE plpgsql AS $$
+DECLARE
+	n int;
+	heap bigint[];
+BEGIN
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('SELECT max(%I) FROM br', col) INTO n;
+	EXECUTE format('SELECT array_agg(coalesce(c, 0) ORDER BY v)
+					  FROM generate_series(0, $1) v
+					  LEFT JOIN (SELECT %I AS g, count(*) AS c FROM br GROUP BY 1) h
+					    ON h.g = v', col)
+		INTO heap USING n;
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	FOR key IN SELECT generate_series(0, n, step) LOOP
+		PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+		EXECUTE format('SELECT count(*) FROM br WHERE %I = $1', col)
+			INTO via_bitmap USING key;
+		PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+		EXECUTE format('SELECT count(*) FROM br WHERE %I = $1', col)
+			INTO via_count USING key;
+		via_heap := heap[key + 1];
+		IF via_bitmap <> via_heap OR via_count <> via_heap THEN
+			RETURN NEXT;
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+END
+$$;
+-- The shape of an index: its posting leaves and the bytes they hold, the
+-- slack in its items and INLINE entries, and verify(), which raises on
+-- anything wrong and returns nothing.
+CREATE FUNCTION br_shape(idx regclass, OUT leaves bigint, OUT internal bigint,
+	OUT fill numeric, OUT item_slack bool, OUT inline_slack bool,
+	OUT verified bool)
+LANGUAGE sql AS $$
+	SELECT s.container_pages, s.posting_internal_pages,
+		   round(1 - s.free_bytes::numeric /
+				 nullif(s.container_pages * (8192 - 24 - 32), 0), 2),
+		   s.slack_bytes > 0, s.inline_slack_bytes > 0,
+		   (SELECT true FROM lion_index_verify(idx, true))
+	  FROM lion_index_stats(idx) s
+$$;
+-- ---------------------------------------------------------------------
+-- 1. Validation: posting_fillfactor is 10 .. 100, build_slack auto, on or off
+-- ---------------------------------------------------------------------
+CREATE INDEX br_bad1 ON br USING lion (k) WITH (posting_fillfactor = 9);
+ERROR:  value 9 out of bounds for option "posting_fillfactor"
+CREATE INDEX br_bad2 ON br USING lion (k) WITH (posting_fillfactor = 101);
+ERROR:  value 101 out of bounds for option "posting_fillfactor"
+CREATE INDEX br_bad3 ON br USING lion (k) WITH (posting_fillfactor = 'full');
+ERROR:  invalid value for integer option "posting_fillfactor": full
+CREATE INDEX br_bad4 ON br USING lion (k) WITH (build_slack = 'sometimes');
+ERROR:  invalid value for enum option "build_slack": sometimes
+CREATE INDEX br_lo ON br USING lion (k)
+  WITH (posting_fillfactor = 10, build_slack = off);
+SELECT reloptions FROM pg_class WHERE relname = 'br_lo';
+               reloptions                
+-----------------------------------------
+ {posting_fillfactor=10,build_slack=off}
+(1 row)
+
+ALTER INDEX br_lo SET (posting_fillfactor = 100, build_slack = on);
+ALTER INDEX br_lo SET (posting_fillfactor = 0);
+ERROR:  value 0 out of bounds for option "posting_fillfactor"
+ALTER INDEX br_lo SET (build_slack = 'no');
+ERROR:  invalid value for enum option "build_slack": no
+SELECT reloptions FROM pg_class WHERE relname = 'br_lo';
+               reloptions                
+-----------------------------------------
+ {posting_fillfactor=100,build_slack=on}
+(1 row)
+
+ALTER INDEX br_lo RESET (posting_fillfactor, build_slack);
+SELECT reloptions FROM pg_class WHERE relname = 'br_lo';
+ reloptions 
+------------
+ 
+(1 row)
+
+DROP INDEX br_lo;
+-- ---------------------------------------------------------------------
+-- 2. The build.  100 is the default and what every build did before the
+--    option: the same index, page for page.  60 leaves two fifths of every
+--    leaf that takes more than one item empty, and these keys' sets of a few
+--    leaves - which have no internal level (§22) - take more leaves for it.
+-- ---------------------------------------------------------------------
+CREATE INDEX br_k_dflt ON br USING lion (k);
+CREATE INDEX br_k_100 ON br USING lion (k) WITH (posting_fillfactor = 100);
+CREATE INDEX br_k_60 ON br USING lion (k) WITH (posting_fillfactor = 60);
+SELECT 'default' AS idx, * FROM br_shape('br_k_dflt')
+UNION ALL SELECT '100', * FROM br_shape('br_k_100')
+UNION ALL SELECT '60', * FROM br_shape('br_k_60');
+   idx   | leaves | internal | fill | item_slack | inline_slack | verified 
+---------+--------+----------+------+------------+--------------+----------
+ default |     60 |        0 | 0.82 | f          | f            | t
+ 100     |     60 |        0 | 0.82 | f          | f            | t
+ 60      |    100 |        0 | 0.49 | f          | f            | t
+(3 rows)
+
+SELECT pg_relation_size('br_k_dflt') = pg_relation_size('br_k_100') AS same_size;
+ same_size 
+-----------
+ t
+(1 row)
+
+-- A set of more than 16 leaves gets its root as before: two values, and a
+-- fill so low that every container has a leaf to itself.
+CREATE INDEX br_d_15 ON br USING lion (d) WITH (posting_fillfactor = 15);
+SELECT * FROM br_shape('br_d_15');
+ leaves | internal | fill | item_slack | inline_slack | verified 
+--------+----------+------+------------+--------------+----------
+     50 |        2 | 0.13 | f          | f            | t
+(1 row)
+
+SELECT * FROM br_counts('d');
+ key | via_bitmap | via_count | via_heap 
+-----+------------+-----------+----------
+(0 rows)
+
+-- ---------------------------------------------------------------------
+-- 3. Scattered updates.  Every new TID lands inside a container the build
+--    wrote; at 100 the leaves have no room for the rewritten item and split,
+--    at 60 they take it where it is.
+-- ---------------------------------------------------------------------
+UPDATE br SET k = (k + 1) % 20 WHERE id % 50 = 0;
+SELECT '100' AS idx, * FROM br_shape('br_k_100')
+UNION ALL SELECT '60', * FROM br_shape('br_k_60');
+ idx | leaves | internal | fill | item_slack | inline_slack | verified 
+-----+--------+----------+------+------------+--------------+----------
+ 100 |     64 |        0 | 0.79 | t          | f            | t
+ 60  |    100 |        0 | 0.51 | t          | f            | t
+(2 rows)
+
+SELECT * FROM br_counts('k');
+ key | via_bitmap | via_count | via_heap 
+-----+------------+-----------+----------
+(0 rows)
+
+-- REINDEX takes the option it finds.
+ALTER INDEX br_k_100 SET (posting_fillfactor = 60);
+REINDEX INDEX br_k_100;
+SELECT (SELECT leaves FROM br_shape('br_k_100')) >
+	   (SELECT leaves FROM br_shape('br_k_dflt')) AS reindexed_with_room;
+ reindexed_with_room 
+---------------------
+ t
+(1 row)
+
+SELECT * FROM br_counts('k');
+ key | via_bitmap | via_count | via_heap 
+-----+------------+-----------+----------
+(0 rows)
+
+DROP INDEX br_k_dflt, br_k_100, br_k_60, br_d_15;
+-- ---------------------------------------------------------------------
+-- 4. build_slack.  INLINE entries (3000 keys of some 70 rows each) and
+--    posting items get an insert's slack, zeroed, which verify() accepts; an
+--    insert into an entry that still has room keeps its length, so the
+--    directory leaves keep theirs.  auto gives it to an index built for
+--    generic WAL and not to one built for the resource manager; off, the
+--    default, to none.
+-- ---------------------------------------------------------------------
+CREATE INDEX br_s_off ON br USING lion (s);
+CREATE INDEX br_s_on ON br USING lion (s) WITH (build_slack = on);
+CREATE INDEX br_s_auto ON br USING lion (s) WITH (build_slack = auto);
+CREATE INDEX br_k_on ON br USING lion (k)
+  WITH (posting_fillfactor = 80, build_slack = on);
+SELECT 'off' AS idx, entries, inline_entries, inline_slack_bytes > 0 AS has_slack
+  FROM lion_index_stats('br_s_off')
+UNION ALL
+SELECT 'on', entries, inline_entries, inline_slack_bytes > 0
+  FROM lion_index_stats('br_s_on');
+ idx | entries | inline_entries | has_slack 
+-----+---------+----------------+-----------
+ off |    3000 |           3000 | f
+ on  |    3000 |           3000 | t
+(2 rows)
+
+SELECT (inline_slack_bytes > 0) = (lion_index_wal_mode('br_s_auto') = 'generic')
+	   AS auto_follows_wal_mode
+  FROM lion_index_stats('br_s_auto');
+ auto_follows_wal_mode 
+-----------------------
+ t
+(1 row)
+
+SELECT * FROM br_shape('br_k_on');
+ leaves | internal | fill | item_slack | inline_slack | verified 
+--------+----------+------+------------+--------------+----------
+     80 |        0 | 0.66 | t          | f            | t
+(1 row)
+
+CREATE TEMP TABLE br_before AS
+SELECT 'off' AS idx, leaf_pages, inline_slack_bytes FROM lion_index_stats('br_s_off')
+UNION ALL
+SELECT 'on', leaf_pages, inline_slack_bytes FROM lion_index_stats('br_s_on');
+-- One new row for every key of s, and the k and s of a row in fifty moved.
+INSERT INTO br SELECT 200000 + i, i % 20, i, i % 2 FROM generate_series(0, 2999) i;
+UPDATE br SET k = (k + 1) % 20, s = (s + 1) % 3000 WHERE id % 50 = 1;
+-- The entries built with slack took their new members inside it.
+SELECT b.idx, s.leaf_pages = b.leaf_pages AS same_leaves,
+	   s.inline_slack_bytes < b.inline_slack_bytes AS slack_used
+  FROM br_before b, LATERAL lion_index_stats(('br_s_' || b.idx)::regclass) s
+ WHERE b.idx = 'on';
+ idx | same_leaves | slack_used 
+-----+-------------+------------
+ on  | t           | t
+(1 row)
+
+SELECT * FROM br_shape('br_s_off');
+ leaves | internal | fill | item_slack | inline_slack | verified 
+--------+----------+------+------------+--------------+----------
+      0 |        0 |      | f          | t            | t
+(1 row)
+
+SELECT * FROM br_shape('br_s_on');
+ leaves | internal | fill | item_slack | inline_slack | verified 
+--------+----------+------+------------+--------------+----------
+      0 |        0 |      | f          | t            | t
+(1 row)
+
+SELECT * FROM br_shape('br_s_auto');
+ leaves | internal | fill | item_slack | inline_slack | verified 
+--------+----------+------+------------+--------------+----------
+      0 |        0 |      | f          | t            | t
+(1 row)
+
+SELECT * FROM br_shape('br_k_on');
+ leaves | internal | fill | item_slack | inline_slack | verified 
+--------+----------+------+------------+--------------+----------
+     80 |        0 | 0.69 | t          | f            | t
+(1 row)
+
+SELECT * FROM br_counts('s', 7);
+ key | via_bitmap | via_count | via_heap 
+-----+------------+-----------+----------
+(0 rows)
+
+SELECT * FROM br_counts('k');
+ key | via_bitmap | via_count | via_heap 
+-----+------------+-----------+----------
+(0 rows)
+
+-- VACUUM keeps the lengths it finds and leaves everything verifiable.
+DELETE FROM br WHERE id % 7 = 3;
+VACUUM (FREEZE) br;
+SELECT verified FROM br_shape('br_s_on');
+ verified 
+----------
+ t
+(1 row)
+
+SELECT verified FROM br_shape('br_k_on');
+ verified 
+----------
+ t
+(1 row)
+
+SELECT * FROM br_counts('s', 7);
+ key | via_bitmap | via_count | via_heap 
+-----+------------+-----------+----------
+(0 rows)
+
+SELECT * FROM br_counts('k');
+ key | via_bitmap | via_count | via_heap 
+-----+------------+-----------+----------
+(0 rows)
+
+DROP TABLE br;
+DROP FUNCTION br_counts(text, int), br_shape(regclass);

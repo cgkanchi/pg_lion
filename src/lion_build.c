@@ -454,6 +454,16 @@ typedef struct LionBuildState
 	uint32		inline_limit;
 	int			fillfactor;
 	Size		leafbudget;		/* bytes of a page ambuild fills */
+	int			posting_fillfactor;
+	Size		postbudget;		/* ... of a posting-tree leaf (§22) */
+
+	/*
+	 * Write INLINE entries and posting items with an insert's growth slack
+	 * (the `build_slack` reloption, DESIGN.md §4), and the buffer an item is
+	 * zero-padded in for it.
+	 */
+	bool		slack;
+	LionContainer *slackbuf;	/* LION_CONTAINER_MAX_SIZE bytes */
 
 	Size		dirbudget;		/* ... and of an internal one (§21) */
 
@@ -1173,6 +1183,28 @@ lion_builder_finish_tree(LionBuildState *bs, LionBuilder *b)
 }
 
 /*
+ * Is the posting leaf under construction final, given the next item?  It is
+ * when the item does not fit, and when taking it would fill the page past
+ * `posting_fillfactor` (DESIGN.md §22, "Bulk build") - unless the page is
+ * still empty: a leaf always takes its first item, which every item fits.
+ * The budget counts what PageAddItem() spends, the MAXALIGNed item and its
+ * line pointer, so at 100 the second test is the first one again.
+ */
+static bool
+lion_builder_leaf_full(const LionBuildState *bs, Page img, Size csize)
+{
+	Size		used;
+
+	if (PageGetFreeSpace(img) < MAXALIGN(csize))
+		return true;
+	if (PageGetMaxOffsetNumber(img) == 0)
+		return false;
+
+	used = LION_PAGE_CAPACITY - PageGetExactFreeSpace(img);
+	return used + MAXALIGN(csize) + sizeof(ItemIdData) > bs->postbudget;
+}
+
+/*
  * Append one finished container to the posting set under construction.
  */
 static void
@@ -1193,7 +1225,29 @@ lion_builder_spill(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 
 	img = (Page) b->pagebuf->data;
 
-	if (PageGetFreeSpace(img) < MAXALIGN(csize))
+	/*
+	 * The growth slack an insert would give the item (DESIGN.md §4), when the
+	 * build gives it: the item goes onto the page at that length, zero-padded
+	 * in a buffer of the largest item size, and it is that length the leaf's
+	 * fill counts.  A BITSET or a NARROW gets none (lion_item_alloc_size()).
+	 */
+	if (bs->slack)
+	{
+		Size		alloc = lion_item_alloc_size(c, csize);
+
+		if (alloc > csize)
+		{
+			if (bs->slackbuf == NULL)
+				bs->slackbuf = (LionContainer *)
+					MemoryContextAlloc(bs->buildctx, LION_CONTAINER_MAX_SIZE);
+			memcpy(bs->slackbuf, c, csize);
+			lion_item_zero_slack(bs->slackbuf, csize, alloc);
+			c = bs->slackbuf;
+			csize = alloc;
+		}
+	}
+
+	if (lion_builder_leaf_full(bs, img, csize))
 	{
 		BlockNumber next;
 
@@ -1501,6 +1555,31 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 	entry->ncontainers = b->nitems;
 	entry->ntids = b->ntids;
 	entry->flags |= b->sumflags;
+
+	/*
+	 * An INLINE payload's growth slack (DESIGN.md §4), when the build gives
+	 * it: the zeroed bytes an insert's rewrite would have allotted the entry,
+	 * by the same rule and the same caps (inline_limit, the largest entry),
+	 * so that the first member an insert adds lands inside the entry and no
+	 * other entry on the leaf moves.  An entry that stores positions keeps
+	 * its exact size: its payload is followed by a positions chunk.
+	 */
+	if (bs->slack && !b->spilled && !b->haspos && b->inlineused > 0)
+	{
+		Size		payoff = LionEntryPayloadOffset(entry);
+		Size		alloc;
+
+		Assert(size == payoff + b->inlineused);
+		alloc = lion_entry_alloc_size(payoff, b->inlineused,
+									  (Size) bs->inline_limit,
+									  (Size) LION_MAX_ENTRY_SIZE);
+		if (alloc > size)
+		{
+			entry = (LionEntryTuple *) repalloc(entry, alloc);
+			memset((char *) entry + size, 0, alloc - size);
+			size = alloc;
+		}
+	}
 
 	if (b->haspos)
 		entry = lion_builder_add_positions(bs, b, entry, &size);
@@ -2484,6 +2563,29 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.index = index;
 	bs.indtuples = 0;
 	bs.fillfactor = opts ? opts->fillfactor : LION_DEFAULT_FILLFACTOR;
+	bs.posting_fillfactor = opts ? opts->posting_fillfactor :
+		LION_DEFAULT_POSTING_FILLFACTOR;
+	switch (opts ? opts->build_slack : LION_DEFAULT_BUILD_SLACK)
+	{
+		case LION_SLACKOPT_ON:
+			bs.slack = true;
+			break;
+		case LION_SLACKOPT_OFF:
+			bs.slack = false;
+			break;
+		default:
+
+			/*
+			 * AUTO: where a moved item costs the most.  A generic-WAL record
+			 * is a byte diff of the page, so the first insert into an item
+			 * written at its exact size - which moves every item stored
+			 * below it - logs all of them; a resource-manager record logs the
+			 * item's own change whether or not others move (DESIGN.md §4).
+			 */
+			bs.slack = (lion_wal_mode_for_build(index) == LION_WAL_MODE_GENERIC);
+			break;
+	}
+	bs.slackbuf = NULL;
 	bs.max_entries = lion_max_entries(index);
 	bs.root = InvalidBlockNumber;
 	bs.height = 0;
@@ -2505,6 +2607,13 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 */
 	bs.leafbudget = Max(LION_PAGE_CAPACITY * (Size) bs.fillfactor / 100, 1);
 	bs.dirbudget = LION_PAGE_CAPACITY * (Size) LION_NONLEAF_FILLFACTOR / 100;
+
+	/*
+	 * And a posting-tree leaf (DESIGN.md §22, "Bulk build").  At 100 this is
+	 * the whole page, and the test in lion_builder_spill() is then exactly
+	 * "the next item does not fit".
+	 */
+	bs.postbudget = LION_PAGE_CAPACITY * (Size) bs.posting_fillfactor / 100;
 
 	bs.buildctx = AllocSetContextCreate(CurrentMemoryContext,
 										"lion index build",

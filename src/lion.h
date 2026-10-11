@@ -896,6 +896,18 @@ lion_pivot_kindflags(uint16 flags)
 #define LION_MIN_FILLFACTOR		10
 
 /*
+ * How full ambuild packs a POSTING-TREE LEAF, the leaves of a set without an
+ * internal level included (DESIGN.md §22, "Bulk build").  100 packs a leaf
+ * until the next item does not fit, which is what every build did before the
+ * option existed; less leaves the room the first inserts after the build need
+ * to rewrite a container in place, where a full leaf has to split.  A leaf
+ * always takes its first item, so the fill is a target the build stays under,
+ * never a reason to leave a page empty.
+ */
+#define LION_DEFAULT_POSTING_FILLFACTOR	100
+#define LION_MIN_POSTING_FILLFACTOR		10
+
+/*
  * How full ambuild packs an INTERNAL directory page, and the fewest downlinks
  * one may carry (DESIGN.md §21).
  *
@@ -919,6 +931,8 @@ typedef struct LionOptions
 	int			inline_limit;
 	int			max_entries;	/* 0 = unlimited (DESIGN.md §17) */
 	int			fillfactor;		/* directory leaf fill at build time (§21) */
+	int			posting_fillfactor;	/* posting leaf fill at build time (§22) */
+	int			build_slack;	/* LION_SLACKOPT_*, DESIGN.md §4 */
 	int			wal_mode;		/* LION_WALOPT_*, DESIGN.md §25 */
 	int			summaries;		/* LION_SUMOPT_*, DESIGN.md §32 */
 	int			summary_tids;	/* TIDs a summary bucket takes (§32) */
@@ -971,6 +985,22 @@ typedef struct LionOptions
 #define LION_WALOPT_AUTO		0
 #define LION_WALOPT_GENERIC		1
 #define LION_WALOPT_RMGR		2
+
+/*
+ * The `build_slack` reloption (DESIGN.md §4, "Growth slack"): whether ambuild
+ * allots every INLINE entry and every posting-tree item the growth slack an
+ * INSERT would give it, so that the first member an insert adds lands inside
+ * the bytes the item already has and no other item on its page moves.  AUTO
+ * gives it to an index built for generic WAL, where a moved item makes the
+ * record a diff of everything that moved, and not to one built for the
+ * resource manager, whose record is the item's own change either way.  OFF,
+ * the default, writes every item at its exact size, as every build did before
+ * the option.  Read at build time only.
+ */
+#define LION_SLACKOPT_AUTO		0
+#define LION_SLACKOPT_ON		1
+#define LION_SLACKOPT_OFF		2
+#define LION_DEFAULT_BUILD_SLACK	LION_SLACKOPT_OFF
 
 #define LION_DEFAULT_MAX_ENTRIES		0
 
