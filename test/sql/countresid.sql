@@ -183,6 +183,24 @@ RESET plan_cache_mode;
 -- ---- a LATERAL rescan with a new value in the residual each time ----
 SELECT cr_q('SELECT v.x, (SELECT count(*) FROM cr WHERE a = 2 AND id % v.x = 0) FROM (VALUES (2), (3), (5)) v(x)');
 
+-- ---- beside filtered counts (DESIGN.md §10, "Filtered counts") ----
+-- the residual is the WHERE's, tested in every run: the WHERE's count and
+-- each filter's
+SELECT q, cr_q(q) FROM (VALUES
+	('SELECT count(*) FILTER (WHERE b = 1), count(*) FROM cr WHERE a = 2 AND p LIKE ''a%'''),
+	('SELECT count(*) FILTER (WHERE b = 1), count(*) FILTER (WHERE n IS NULL), count(*) FROM cr WHERE a = 2 AND id % 3 = 0'),
+	('SELECT sum(CASE WHEN b = 1 THEN 1 ELSE 0 END), sum(CASE WHEN t = ''v3'' THEN 1 END) FROM cr WHERE a = 2 AND 100 / w > 20'),
+	('SELECT count(*) FILTER (WHERE tags @> ''{t1}''), count(n) FILTER (WHERE n > 0), count(*) FROM cr WHERE a = 2 AND length(t) = 2'),
+	('SELECT count(*) FILTER (WHERE b = 1 OR t = ''v3'') FROM cr WHERE a = 2 AND p LIKE ''%e%'''),
+	('SELECT count(*) FILTER (WHERE n IS DISTINCT FROM 3), count(*) FROM cr WHERE a = 2 AND p LIKE ''a%'''),
+	('SELECT b, count(*) FILTER (WHERE t = ''v3''), count(*) FROM cr WHERE a = 2 AND p LIKE ''a%'' GROUP BY b'),
+	('SELECT b, sum(CASE WHEN n = 1 THEN 1 END), count(*) FROM cr WHERE a = 2 AND 100 / w > 20 GROUP BY b'),
+	('SELECT count(*) FILTER (WHERE b = 1) FROM cr WHERE a = 2 AND p LIKE ''zz%''')
+) v(q);
+SELECT cr_plan('SELECT count(*) FILTER (WHERE b = 1), count(*) FROM cr WHERE a = 2 AND p LIKE ''a%''');
+-- a filter's own condition is never residual: the ordinary plan
+SELECT cr_q('SELECT count(*) FILTER (WHERE p LIKE ''a%''), count(*) FROM cr WHERE a = 2');
+
 -- ---- a materialized view's rows are tested as a table's ----
 CREATE MATERIALIZED VIEW crm AS SELECT id, a, b, p FROM cr;
 CREATE INDEX crm_a ON crm USING lion (a);

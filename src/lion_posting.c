@@ -1009,6 +1009,7 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	BlockNumber cblk;
 	LionPostingPivot pivot;
 	int			nmoved;
+	int			i;
 	LionEntryTuple *logged = NULL;
 	Size		loggedsz = 0;
 	uint16		kind = LionPageGetOpaque(page)->flags & LION_PAGE_POSITIONS;
@@ -1130,9 +1131,9 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	lion_page_set_owner(pR, hash, head);
 	pivot.ckey = 0;				/* minus infinity: it owns everything */
 	pivot.child = cblk;
-	for (off = 0; off <= nsiblings; off++)
+	for (i = 0; i <= nsiblings; i++)
 	{
-		const LionPostingPivot *pv = (off == 0) ? &pivot : &siblings[off - 1];
+		const LionPostingPivot *pv = (i == 0) ? &pivot : &siblings[i - 1];
 		OffsetNumber noff = PageAddItemExtended(pR, (char *) pv,
 												LION_POSTING_PIVOT_SIZE,
 												InvalidOffsetNumber, 0);

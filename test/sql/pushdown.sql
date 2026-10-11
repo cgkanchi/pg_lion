@@ -293,7 +293,10 @@ SELECT lion_pd('SELECT a, count(*) FROM lion_pdt GROUP BY a HAVING a > 3');
 SELECT lion_pd('SELECT sum(id) FROM lion_pdt WHERE a = 3');
 -- ... while count(DISTINCT) is answered since DESIGN.md §26 (distinct.sql)
 SELECT lion_pd('SELECT count(DISTINCT b) FROM lion_pdt WHERE a = 3');
+-- a FILTER the index answers is one more set to count (countfilter.sql); one
+-- it cannot answer leaves the query to the ordinary plan
 SELECT lion_pd('SELECT count(*) FILTER (WHERE b = 2) FROM lion_pdt WHERE a = 3');
+SELECT lion_pd('SELECT count(*) FILTER (WHERE id < 500) FROM lion_pdt WHERE a = 3');
 -- a qual that is not an indexed equality to a constant: residual, tested on
 -- the heap rows a = 3 selects (DESIGN.md §10, "Residual clauses")
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND id < 500');

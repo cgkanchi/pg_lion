@@ -362,6 +362,9 @@ lion_leaf_selects(List *clauseinfos, const bool *drop, const bool *orrange)
 		LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
 		int			r = ci->rinfono;
 
+		/* a filtered count's clause selects only its own count's rows */
+		if (ci->filter != 0)
+			continue;
 		if ((r >= 0 && drop[r]) || !LION_CLAUSE_IS_POSITIVE(ci->kind) ||
 			ci->incompl)
 			continue;

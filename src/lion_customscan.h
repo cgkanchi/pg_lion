@@ -213,13 +213,33 @@
 #define LION_TL_WKEY_COL(kind)		((kind) - 0x20000000)
 
 /*
+ * A filtered count (DESIGN.md §10, "Filtered counts"): LION_TL_FCOUNT(f, form)
+ * is the count of the rows the WHERE and filter f select together, 1 <= f <=
+ * the plan's filters, reported as `form` reports it.  Far above any other
+ * kind, as the two above are.
+ */
+#define LION_TL_FCOUNT(f, form)		(0x30000000 + (f) * 4 + (form))
+#define LION_TL_IS_FCOUNT(kind)		((kind) >= 0x30000000 && (kind) < 0x40000000)
+#define LION_TL_FCOUNT_FILTER(kind)	(((kind) - 0x30000000) / 4)
+#define LION_TL_FCOUNT_FORM(kind)	(((kind) - 0x30000000) % 4)
+
+/* ... and how it reports the count */
+#define LION_FCOUNT_COUNT	0	/* count(*) FILTER (WHERE c), count(CASE WHEN c
+								 * THEN 1 END): the count, 0 for none */
+#define LION_FCOUNT_SUM		1	/* sum(CASE WHEN c THEN 1 ELSE 0 END): the
+								 * count, NULL over no row at all */
+#define LION_FCOUNT_SUMNULL	2	/* sum(CASE WHEN c THEN 1 END): the count, NULL
+								 * when it is 0 */
+
+/*
  * A heap column a residual clause reads (DESIGN.md §10, "Residual clauses"):
  * LION_TL_RESID(attno) is column attno of the relation counted, which the
- * node fills from the heap row it tests and no row it emits prints.
+ * node fills from the heap row it tests and no row it emits prints.  Above
+ * the filtered counts' range, so that neither encoding reaches the other.
  */
-#define LION_TL_RESID(attno)		(0x30000000 + (attno))
-#define LION_TL_IS_RESID(kind)		((kind) > 0x30000000 && (kind) < 0x30010000)
-#define LION_TL_RESID_ATTNO(kind)	((AttrNumber) ((kind) - 0x30000000))
+#define LION_TL_RESID(attno)		(0x40000000 + (attno))
+#define LION_TL_IS_RESID(kind)		((kind) > 0x40000000 && (kind) < 0x40010000)
+#define LION_TL_RESID_ATTNO(kind)	((AttrNumber) ((kind) - 0x40000000))
 
 /* ... and what each one computes */
 #define LION_WAGG_NONE		0
@@ -1098,7 +1118,13 @@ typedef struct LionVColScope
  *		expression of a lion index's key column as the scan's relation
  *		numbers its Vars; an attnum of LION_VCOL_ATTNO(i) anywhere above names
  *		the i'th.  Empty when no attnum does
- *	20	List of Expr, or empty: the WHERE clauses no posting set answers,
+ *	20	List, or empty: the filtered counts (DESIGN.md §10, "Filtered
+ *		counts"): an IntList of the number of filters and then each clause's
+ *		filter - 0 for a WHERE clause, f for a clause of filter f, the WHERE's
+ *		clauses first and each filter's together after them - and, in the
+ *		PATH's list only, a List of each filter's expression, by which
+ *		lion_plan_custom_path() numbers the target list's filtered counts
+ *	21	List of Expr, or empty: the WHERE clauses no posting set answers,
  *		as an implicit-AND list, which the node tests on the heap tuple of
  *		every row the others select (DESIGN.md §10, "Residual clauses";
  *		LION_FLAG_RESID).  The PATH carries them here;
@@ -1106,7 +1132,7 @@ typedef struct LionVColScope
  *		aggregates' arguments - where setrefs.c points their columns at
  *		LION_TL_RESID columns of custom_scan_tlist and SS_finalize_plan()
  *		sees their Params - and leaves this member empty
- *	21	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	22	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -1129,8 +1155,9 @@ typedef struct LionVColScope
 #define LION_PRIV_TOPK		17
 #define LION_PRIV_WAGG		18
 #define LION_PRIV_VCOLS		19
-#define LION_PRIV_RESID		20
-#define LION_PRIV_TLKINDS	21
+#define LION_PRIV_FILTERS	20
+#define LION_PRIV_RESID		21
+#define LION_PRIV_TLKINDS	22
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -1211,7 +1238,11 @@ typedef struct LionVColScope
  * (member 7): complements, counted by De Morgan (DESIGN.md §35, "Complements
  * in an OR"), which an older build would have taken for selections.
  *
- * Shape 24 added the RESID member (20) in front of the target-list kinds,
+ * Shape 24 added the FILTERS member (20) in front of the target-list kinds,
+ * and the target-list kinds of filtered counts (DESIGN.md §10, "Filtered
+ * counts"): clauses an older build would have ANDed into the WHERE.
+ *
+ * Shape 25 added the RESID member (21) in front of the target-list kinds,
  * the LION_FLAG_RESID bit and the LION_TL_RESID columns: residual clauses
  * tested on the heap (DESIGN.md §10, "Residual clauses"), which an older
  * build would have counted without.
@@ -1228,8 +1259,8 @@ typedef struct LionVColScope
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424918
-#define LION_PRIV_NMEMBERS	22
+#define LION_PRIV_MAGIC		0x52424919
+#define LION_PRIV_NMEMBERS	23
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -2014,6 +2045,7 @@ typedef struct LionCountPrivClause
 	Oid			idxoid;			/* InvalidOid for a partitioned table */
 	AttrNumber	attno;			/* the PARENT's */
 	Oid			opno;			/* InvalidOid for a null test */
+	int			filter;			/* FILTERS: 0, or its filtered count's */
 } LionCountPrivClause;
 
 /* One live leaf partition (DESIGN.md §16): an OidList of PARTS */
@@ -2119,6 +2151,9 @@ typedef struct LionCountPriv
 	LionCountPrivWAgg *wagg;
 
 	List	   *vcols;			/* VCOLS (§41): expressions, or NIL */
+
+	int			nfilter;		/* FILTERS (§10), or 0 */
+	List	   *filterexprs;	/* ... each one's expression: PATH stage only */
 
 	int			ntl;			/* TLKINDS: PLAN stage only */
 	int		   *tlkind;
@@ -2528,7 +2563,41 @@ typedef struct LionCountScanState
 	 * fact column"), or NULL for every other shape (lion_st_fg()).
 	 */
 	struct LionFactGroupState *fg;
+
+	/*
+	 * Filtered counts (DESIGN.md §10, "Filtered counts"): the plan's nfilter
+	 * filters, each counted as a RUN of its own after the WHERE's (run 0):
+	 * the count, or the groups, of the rows the WHERE and that filter select
+	 * together.  runitem[r] and nrunitem[r] are run r's items - the WHERE's,
+	 * then its filter's - which planitem and nplanitem are while it is
+	 * counted (lion_select_run()); runfirst[r] and runn[r] are the clauses
+	 * of its own filter as a window of the clause array (the WHERE's for run
+	 * 0); inrun[i] says whether clause i is one of the run being counted.
+	 * runcount[r] is run r's count in a node of one row, summed over the
+	 * partitions, and runsready says it holds the finished counts.  Without
+	 * filters nrun is 1, currun 0, and nothing else here is set.
+	 */
+	int			nfilter;
+	int			nrun;
+	int			currun;
+	LionSourceItem **runitem;
+	int		   *nrunitem;
+	int		   *runfirst;
+	int		   *runn;
+	bool	   *inrun;
+	int64	   *runcount;
+	bool		runsready;
 } LionCountScanState;
+
+/*
+ * Is clause i one of the run being counted (DESIGN.md §10, "Filtered
+ * counts")?  Every clause is, without filters.
+ */
+static inline bool
+lion_clause_in_run(const LionCountScanState *st, int i)
+{
+	return st->inrun == NULL || st->inrun[i];
+}
 
 /* Whether the plan sets one of the LION_FLAG_* bits */
 static inline bool
@@ -2774,7 +2843,10 @@ typedef struct LionClauseInfo
 								 * the index can decide (LionLeafInfo) */
 	int			rinfono;		/* the restriction it came from, its position
 								 * in the relation's baserestrictinfo; -1 for
-								 * the FK-side join's key, which is none */
+								 * the FK-side join's key, which is none, and
+								 * for a filter's clause */
+	int			filter;			/* 0, or the filtered count it is a clause of
+								 * (DESIGN.md §10, "Filtered counts") */
 } LionClauseInfo;
 
 /*
@@ -2938,6 +3010,8 @@ extern bool lion_agg_is_count(PlannerInfo *root, Aggref *agg, Index rti,
 							  RelOptInfo *rel, const AttrNumber *groupattno,
 							  int ngroup, const List *nonnullattnos,
 							  const List *nullattnos);
+extern bool lion_agg_filtered(Aggref *agg, Node **filter, int *form,
+							  Var **col);
 extern bool lion_agg_distinct_var(Aggref *agg, Index rti, Var **var, Oid *eqop,
 								  Oid *collation);
 extern bool lion_group_coalesce(CoalesceExpr *ce, Index rti, Var **var,
@@ -3124,6 +3198,9 @@ extern AttrNumber lion_index_col_for(Relation index, AttrNumber heapattno,
 extern AttrNumber lion_heap_attno_in(Relation heap, Oid parentoid,
 									 AttrNumber parentattno);
 extern void lion_open_relation(LionCountScanState *st, int p);
+extern void lion_select_run(LionCountScanState *st, int r);
+extern void lion_clause_window(LionCountScanState *st, int clauseno,
+							   int *first, int *n);
 extern void lion_close_relation(LionCountScanState *st);
 extern void lion_close_parts(LionCountScanState *st);
 extern void lion_begin_custom_scan(CustomScanState *node, EState *estate,
@@ -3162,6 +3239,7 @@ extern int64 lion_node_count(LionCountScanState *st, int nsource,
 							 LionCountSource *sources, bool exists);
 extern int64 lion_count_relation(LionCountScanState *st);
 extern int64 lion_sumall_relation(LionCountScanState *st);
+extern int64 lion_count_runs(LionCountScanState *st, bool sum);
 extern TupleTableSlot *lion_next_group_ranged(LionCountScanState *st,
 											  bool *exhausted);
 extern TupleTableSlot *lion_distinct_relation(LionCountScanState *st);
