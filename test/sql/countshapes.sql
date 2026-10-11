@@ -135,7 +135,8 @@ DROP SEQUENCE cs_seq;
 
 -- a subquery over the counts is a SubPlan the node does not run: the grouping
 -- is the ordinary plan's (the subquery's own count is pushed down)
-SELECT regexp_replace(btrim(p), '^(Hash|Group)Aggregate', 'Aggregate')
+SELECT regexp_replace(regexp_replace(btrim(p), '^(Hash|Group)Aggregate', 'Aggregate'),
+					  '^SubPlan .*$', 'SubPlan')
   FROM cs_plan('SELECT a, count(*) + (SELECT count(*) FROM cs c2 WHERE c2.a = cs.a) FROM cs GROUP BY a') p
  WHERE p ~ '(Aggregate|LionCount|SubPlan)';
 SELECT cs_q('SELECT a, count(*) + (SELECT count(*) FROM cs c2 WHERE c2.a = cs.a) FROM cs GROUP BY a');
