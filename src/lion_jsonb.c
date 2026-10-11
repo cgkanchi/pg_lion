@@ -771,7 +771,9 @@ lion_jp_scalar(JsonPathItem *jsp, JsonbValue *v)
  * one: its filters hold, and something is at its end (left out when a filter
  * narrows, as in lion_jp_exists_chain()).  `chain == scalar`,
  * which jsonpath answers with byte-equal strings and equal numbers - what the
- * leaf keys store - is the leaf keys of that value.
+ * leaf keys store - is the leaf keys of that value.  The scalar is a bare
+ * literal: one with an accessor after it, `"2".double()`, stands for some
+ * other value, and only says something is at the chain's end.
  */
 static LionKeyNode *
 lion_jp_compare(LionJpCxt *cx, LionJpPath path, JsonPathItem *jsp)
@@ -803,7 +805,7 @@ lion_jp_compare(LionJpCxt *cx, LionJpPath path, JsonPathItem *jsp)
 			continue;
 		lion_jp_chain(cx, path, &ops[i], &end, &nodes);
 		if (jsp->type == jpiEqual && other != NULL &&
-			jspIsScalar(other->type))
+			jspIsScalar(other->type) && !jspHasNext(other))
 		{
 			JsonbValue	v;
 
