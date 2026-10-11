@@ -6165,7 +6165,8 @@ Pass 1 of the old build is GONE. It existed only to count distinct keys so that 
 could be sized; the one remaining pass counts them as it groups, so the build reads the sorted data
 once instead of twice and the tuplesort no longer needs TUPLESORT_RANDOMACCESS.
 
-Leaves are filled left to right at `fillfactor` (reloption, 10..100, default 90), and the internal
+Leaves are filled left to right at `fillfactor` (reloption, 10..100, default 90; to whichever side
+of it the last entry lands nearer, below), and the internal
 levels are built bottom-up in the same pass, nbtree's `_bt_buildadd` shape: one open page per level,
 written out when the item that does not fit arrives - that item's key is the page's high key, and the
 page's own first key is the downlink it hands to the level above. The first page of every level gets
@@ -6181,6 +6182,35 @@ every level is then as large as the one below it, and `lion_build_finish_dir()` 
 without reaching a root. It now also checks the invariant it relies on - each level strictly smaller
 than the one below - and errors out rather than looping. *(Not in the first draft, which applied the
 leaf budget to every level and said no floor was needed.)*
+
+**The leaf fill lands on the nearer side of the budget (2026-10-11).** A leaf is written out when the
+next entry would take it past `fillfactor` - unless taking the entry leaves the page over the budget
+by less than it would be short of the budget without it, and the page still holds the entry and a
+high key (`lion_build_leaf_crosses()`; the entry's own key stands for the next page's first, which
+becomes the high key, on both sides of the comparison). For entries small against a page this moves
+the fill by less than half an entry, so `fillfactor` keeps its meaning for them: a unique `int8`
+column of 500,000 keys builds leaves 10.2% free at the default 90. For large INLINE entries it is
+what decides the fill. On a 20,000-key column over 5M rows every entry is some 1.55 kB: four take
+76% of a page and a fifth 95%, and "never past 90%" stopped every leaf at four, 22.8% of every leaf
+empty. The fifth is nearer the budget (5% over it, against 14% short), so the leaf now takes it. The
+internal levels keep their own rule (`LION_NONLEAF_FILLFACTOR` and the downlink floor above). A leaf
+filled past the budget has less room for an insert that grows one of its entries; such an insert
+splits the leaf, as it does on any full leaf.
+
+Measured (freshly built, the review's free-space-by-page-kind query over pageinspect):
+
+| index | size before | size after | leaves before | leaves after | leaf free before | after |
+|---|---|---|---|---|---|---|
+| `c20k`, 5M rows, 20,000 keys | 39.3 MB | 32.1 MB | 4,988 | 4,075 | 22.8% | 5.6% |
+| `docs.tags` (`text[]`), 500k rows | 9.2 MB | 8.5 MB | 447 | 362 | 23.8% | 6.1% |
+| `docs.tsv` (`tsvector`), 500k rows | 13.4 MB | 12.6 MB | 951 | 853 | 17.7% | 8.3% |
+
+What it costs is the room inserts had. 4,000 rows inserted into the `c20k` table after the build
+grow the new index by 224 kB (some 28 leaves split) and leave the old one as it was; 40,000 - two
+for every key, so that nearly every leaf gets one - split nearly every leaf of the new index, which
+ends at 43.7 MB against the old one's unchanged 39.3 MB. An index of large entries that takes many
+inserts across its keys after the build is better built at a lower `fillfactor`, which this rule
+honours as it does 90.
 
 **The high key is accounted for with nbtree's "last item becomes the high key" rule.** A page's high
 key is a copy of the FIRST key of the page to its right, which is the item that did not fit; keys
@@ -8561,11 +8591,15 @@ distinct count - the decline the backlog item asked for, with the cost model as 
   to hold `s >= 1` rows over `D` containers stops after about `D/s + 1` of them, and one expected to
   be empty (`s < 1`) reads everything, as a count would. The recheck candidates are scaled the
   same way, in both shapes, because a test rechecks one container at a time and stops with them.
-  The pair terms of shape 2 are NOT discounted: a pair's time is its lookup and its merge setup
-  far more than its members - measured per pair, an existence test took 6.5 us against 7.7 for
-  §20's count of the same 200 x 50 pairs - and discounting them chose 200 x 50 pairs at 64.6 ms
-  against the sort's 43 (and, on the release build with §10's merge units, at 10,566 against the
-  sort's 10,694, for 45 ms of CPU against 27).
+  A pair test of shape 2 stops the same way, and its MERGE is discounted by the same share
+  (since 2026-10-11, below); what the early exit does not shrink is charged per pair on top: the
+  test's fixed cost and the lookup of the inner set, one descent of the inner index's directory
+  (`LION_DESCENT_COST` a level, as a single-key clause's lookup). Until then the pair terms were
+  not discounted at all, on the argument that a pair's time is its lookup and its merge setup far
+  more than its members - measured per pair, an existence test took 6.5 us against 7.7 for §20's
+  count of the same 200 x 50 pairs, and discounting the merge alone chose those pairs at 10,566
+  against the sort's 10,694, for 45 ms of CPU against 27. That holds on a table of a few container
+  keys and fails on a large one, where the full merge grows with the table and the test does not.
 - Tests that must COUNT (the mixed target lists above) are charged in full.
 
 Measured with the final model (100k rows, uncorrelated columns, warm cache, assert build - ratios,
@@ -8588,6 +8622,31 @@ not absolute numbers; `test/sql/distinct.sql` pins the rows marked *):
 Every choice in the table is the faster plan. The open item is the one §20 records: the model does
 not model correlation, so clustered data, where most pairs' merges end at once, is priced as if it
 were not.
+
+**The pair test's early exit (2026-10-11).** The optimization review of 2026-10-11 measured
+`SELECT c20, count(DISTINCT c200) FROM fact GROUP BY c20` over 5M rows (96,196 heap pages, 1,503
+container keys, uncorrelated columns, release build of PostgreSQL 18): the node ran in 19-24 ms and
+was priced 961,710, nearly all of it the 4,000 pairs' full merges at 240 each across every
+container key, against core's sort at 808,355, which took 2.6 s. The walk visited 18,132
+containers for its 4,020 tests, 4.5 a test. Priced with the merge discounted by
+`lion_exists_fraction()` and the per-pair lookup added, it costs 6,862 and is chosen (12 ms);
+`c200, count(DISTINCT c20)` 5,754 (16 ms against 2.7 s); with `WHERE c2 = 1`, which no lion plan
+had been chosen for even with sequential and bitmap scans off (it was built, at 1.22M, against an
+index scan and sort at 475k), 8,265 (18 ms against core's 1.8 s). What must still lose does:
+`c20, count(DISTINCT c20k)` (400,000 pairs of 12 rows) is priced 1.59M against 808k (it runs in
+2.7 s against 3.8: the model is conservative there), `c200, count(DISTINCT c20k)` 100M, and on the
+100k-row table above `g200, count(DISTINCT k50)` 16,003 against 10,694, `g2k, count(DISTINCT k1k)`
+3.6M. That table's columns are functions of `i` modulo their counts, so most of its pairs are
+empty and are read to the end, which the model, assuming independence, does not see: the per-pair
+lookup is what keeps 200 x 50 there with core. On 200k rows of hashed columns,
+`g200, count(DISTINCT k50)` (10,000 pairs) is now chosen, 20 ms against the sort's 79.
+`test/sql/distinct.sql` pins a 4,000-pair shape over 87 container keys (lion_dtw) that the full
+merge priced at 48,509 against 15,611.
+
+The grouped distinct does not take the decoded walk of §34: the walk decodes every row at every
+key the WHERE holds (88 ms for the same 4,000 pairs as `GROUP BY c20, c200`), where the existence
+tests read a few containers a pair; and its partial (g, k) counts would need core's
+`count(DISTINCT k)` above them to deduplicate.
 
 ### EXPLAIN
 
@@ -11446,6 +11505,88 @@ partitions and in all; batches at a small work_mem; rescans and a dirty heap; th
 declines (an expression, two fact columns, a `count(DISTINCT)` beside, a numeric column, and a
 partition of several kinds without an index on kind - which declines only where a partition needs
 it).
+
+### Grouped by a fact column, the keys united (2026-10-11)
+
+`SELECT f.c20, count(*) FROM fact f WHERE f.c200 IN (SELECT id FROM dim200 WHERE region =
+'region3') GROUP BY f.c20` over 5M rows counted each of the 29 keys in each of the 20 groups: 580
+counts, every one of them reading its key's set again and seeking the group's set at each of its
+containers, 871,740 key containers in all, 393 to 600 ms. The same keys given as an array, `=
+ANY ((SELECT array_agg(id) ...))`, are an IN list - collected once, every group counted against it
+- in 12 ms. Nothing in the rows needed the keys apart: no dimension column is in them, and the
+Finalize Agg adds up a group's rows whatever key they came from.
+
+**What is counted.** When the target and the HAVING read no column of a dimension row - none of
+its own, nor the fact's join column standing for its key ("Grouped by the join key") - and the
+aggregates are counts alone, a batch's keys are united: their sets located once, each letting go of
+its pin as soon as it is located, made one union source of a collection with the fact filters - or
+their copy - ANDed in (`lion_sources_collect()`), and each group of the fact column counted once
+against that copy (`lion_join_unite_keys()`, `lion_join_count_united()`). A group's row then
+carries the count of all the batch's keys together, and the Finalize Agg adds up the rows of each
+group as before - one per batch and relation now, where it was one per key. EXPLAIN says `Fact
+Groups Counted Against: united join keys`, and `Fact Group Counts` is the groups (times the
+batches) rather than the keys times the groups.
+
+**Why it is exact.** The union's count in a group is the sum of the keys' counts there because the
+keys' fk sets are disjoint: a fact row has one fk value, and the keys are distinct under the
+join's equality - an inner join's by the dimension's unique key, the forward semi join's because
+they are its distinct keys - which is the fk index's, so no two keys locate one entry. And the copy
+is safe on exactly the terms the fact filters' copy is ("Why a stale copy is safe"): it is read
+after the query's snapshot was taken, so it misses no row the snapshot sees, and it is only ever
+counted beside a group's set, located from the index and pinned as an IN list's is, which carries
+the §9 interlock for any dead TID the copy still lists; the dimension rows are read by the child
+under the same snapshot as before. A key the same bytes as the one before it in the batch - which
+that proof says does not come - is left out of the union and counted key by key, so the rows would
+still add up to the join's.
+
+**Bounds and fall-backs.** The keys located at once are what work_mem holds of them
+(`lion_array_batch_size()` sets at most); past that they are united a share at a time, each share a
+copy of its own counted beside every group, which adds up the same. The copies take a hash table's
+memory (`get_hash_memory_limit()`) and spill past it as the filters' copy does. A turn that cannot
+be united - a hot standby, which makes no copy; a range the counts walk (§32), which is not a set
+to collect; a copy that fails - is counted key by key, every key. A partition whose bounds give
+the column its value has one group, and its turn counts each key as before. With dimension columns
+in the rows, nothing changes: each key is counted in each group.
+
+**Cost.** `lion_cost_fkjoin_path()` prices both ways and takes the cheaper (`*unite`). Per key,
+each key is counted once per group, and every count after the first reads the key's set again;
+every count also seeks the group's set at the key's containers (`lion_cost_fkjoin_group_counts()`).
+Both of those used to be left out - only the count's set-up and its filter probes were multiplied
+by the groups - which priced the 580 counts above at 77, against core's 125,094 for 345 ms; they
+were chosen, rightly against core, at a twentieth of the time they took. United, the found keys'
+sets are read once into the collection (a set's cursor, its containers, the union's image at each
+container key, the filters sought at the keys of the sparser side, the survivors copied), and each
+group is a count against the copy (`lion_cost_fkjoin_united_counts()`), once a batch. A plan that
+unites makes no copy of the fact filters of its own: the union is ANDed with the filters as it is
+made.
+
+Measured (2026-10-11, 5M rows, `max_parallel_workers_per_gather` 2, `work_mem` 64MB, best of 3):
+
+| query | before | after | core |
+|---|---|---|---|
+| `c20`, `c200 IN (29 keys of a region)` | 438 ms, 580 counts | 14 ms, 20 counts | 345 ms |
+| the same as an inner join | - | 22 ms | 311 ms |
+| ... and `f.c2 = 1` | - | 20 ms | 264 ms |
+| `c20`, every key (200) | - | 43 ms | 592 ms |
+| `c2`, `d.flag` (half the keys) | - | 15 ms | 503 ms |
+| `c20k`, 29 keys (20,000 groups) | - | 209 ms | 412 ms |
+| `c20, d.name`, 29 keys (per key, unchanged) | - | 391 ms | 351 ms |
+
+The last row is a per-key plan, chosen and slower than core's: priced at 44,649 against core's
+126,053 even with the key sets read again counted, the per-key counts remain underpriced against
+core's aggregate on this table, a calibration question this change leaves alone.
+
+`test/sql/fkjoin_unite.sql`: every answer against the pushdown off with sequential scans only - an
+inner join grouped by a fact column under a dimension filter, a fact filter, both, HAVING, ORDER BY
+and LIMIT; NULL dimension keys alone and among others; keys without fact rows; an empty dimension
+result and a fact filter that selects nothing, each a value the planner does not see; a dimension
+that selects every key, joined and as an IN; the forward semi join over a non-unique key - duplicated
+and NULL keys, one key three times, an EXISTS; a dimension column and the fact's join key in the
+rows, counted key by key; the counters (`Fact Group Counts` the groups, against the keys times the
+groups per key); batches at a work_mem of 64 kB; a correlated subquery that rescans the node; and a
+dirty heap before and after VACUUM. `test/sql/fkjoin_factgroup.sql`'s queries with no dimension
+column in the rows - partitioned, parallel, an OR of filters per kind with a range - now unite, with
+their answers unchanged.
 
 ### Declined in v1, and why
 

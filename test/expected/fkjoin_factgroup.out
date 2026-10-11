@@ -238,9 +238,10 @@ SELECT * FROM lion_xj_explain('SELECT f.kind, count(*) FROM lion_gf f JOIN lion_
                Lion Indexes: (fk = d.pk)
                Join Key Lookups: in index order
                Fact Group Key: kind
+               Fact Groups Counted Against: united join keys
                Fact Groups From Partition Bounds: 3 of 5 partitions
                ->  (the dimension's plan)
-(11 rows)
+(12 rows)
 
 -- a filter per kind, ORed, beside a range, over the keys of a dimension's
 -- filtered rows (an IN list of them), grouped by kind and ordered by count
@@ -259,8 +260,8 @@ SELECT * FROM lion_xj_explain('SELECT f.kind, count(*) FROM lion_gf f WHERE ((f.
                      Implied by Partition Bounds: (((kind = 'a'::text) AND (tags && '{t1}'::text[]) AND (tags && '{u2}'::text[])) OR ((kind = 'b'::text) AND (x = 3)) OR (kind = 'c'::text) OR (kind = 'd'::text)) in 1 of 4 partitions, (kind = 'a'::text) in 2 of 4 partitions, (kind = 'b'::text) in 1 of 4 partitions, (ts >= 'Sun Jun 01 00:00:00 2025 PDT'::timestamp with time zone) in 1 of 4 partitions
                      Refuted by Partition Bounds: ((kind = 'a'::text) AND (tags && '{t1}'::text[]) AND (tags && '{u2}'::text[])) in 1 of 4 partitions, ((kind = 'b'::text) AND (x = 3)) in 2 of 4 partitions, (kind = 'c'::text) in 3 of 4 partitions, (kind = 'd'::text) in 3 of 4 partitions
                      Join Key Lookups: in index order
-                     Fact Filters: collected once
                      Fact Group Key: kind
+                     Fact Groups Counted Against: united join keys
                      Fact Groups From Partition Bounds: 3 of 4 partitions
                      ->  (the dimension's plan)
 (16 rows)
@@ -279,8 +280,9 @@ SELECT * FROM lion_xj_explain('SELECT f.x, count(*) FROM lion_gf f JOIN lion_gd 
                Implied by Partition Bounds: (kind = ANY ('{a,b}'::text[]))
                Join Key Lookups: in index order
                Fact Group Key: x
+               Fact Groups Counted Against: united join keys
                ->  (the dimension's plan)
-(11 rows)
+(12 rows)
 
 SELECT * FROM lion_xj_explain('SELECT f.x, count(*) FROM lion_gp f JOIN lion_gd d ON f.fk = d.pk WHERE d.region = ''us'' AND f.tags && ''{t2}'' GROUP BY f.x');
                                          lion_xj_explain                                         
@@ -292,8 +294,8 @@ SELECT * FROM lion_xj_explain('SELECT f.x, count(*) FROM lion_gp f JOIN lion_gd 
          ->  Parallel Custom Scan (LionCount)
                Lion Indexes: lion_gp_fk.fk (fk = d.pk), lion_gp_fk.tags (tags && '{t2}'::text[])
                Join Key Lookups: in index order
-               Fact Filters: collected once
                Fact Group Key: x
+               Fact Groups Counted Against: united join keys
                ->  (the dimension's plan)
 (10 rows)
 
