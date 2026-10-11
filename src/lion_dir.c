@@ -319,9 +319,11 @@ lion_cmp_prefix(const LionEntryTuple *item, const LionSearchKey *sk)
 	{
 		uint32		ihash = (ikind == LION_KIND_VALUE) ?
 			lion_hash_key(sk->col, lion_entry_key(sk->col, item)) : 0;
+		uint32		skhash = sk->hashlazy ?
+			lion_hash_key(sk->col, sk->key) : sk->hash;
 
-		if (ihash != sk->hash)
-			return ihash < sk->hash ? -1 : 1;
+		if (ihash != skhash)
+			return ihash < skhash ? -1 : 1;
 	}
 
 	return 0;
@@ -385,6 +387,7 @@ lion_search_key_init(LionState *state, LionSearchKey *sk, int kind, Datum key,
 	sk->kind = kind;
 	sk->key = key;
 	sk->hash = hash;
+	sk->hashlazy = false;
 	sk->cmpproc = state->ordered ? &state->cmpproc : NULL;
 	sk->eqproc = &state->eqproc;
 	sk->collation = state->collation;
@@ -427,11 +430,17 @@ lion_search_key_exact(LionIndexState *ix, LionSearchKey *sk,
 							entry->attno, ix->ncolumns)));
 		col = lion_column(ix, (AttrNumber) entry->attno);
 
+		/*
+		 * A VALUE entry's hash is its key's (DESIGN.md §21, "Entry tuples"),
+		 * computed only if a comparison ties on proc 4; every other kind's is
+		 * 0.
+		 */
 		lion_search_key_init(col, sk, kind,
 							 LION_KIND_HAS_KEY(kind) ?
 							 lion_entry_key(col, entry) :
 							 (Datum) 0,
-							 lion_entry_hash(col, entry));
+							 0);
+		sk->hashlazy = (kind == LION_KIND_VALUE);
 	}
 
 	sk->raw = LionEntryGetKey(entry);
