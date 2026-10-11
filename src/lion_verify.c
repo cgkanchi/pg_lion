@@ -480,10 +480,10 @@ lion_verify_segment(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
 				   uint32 *prevckey)
 {
 	const char *detail = NULL;
-	const uint32 *ckeys;
+	LionSparseIter it;
 	uint32		n = c->cardinality;
-	uint32		run = 1;
-	uint32		i;
+	uint32		run = 0;
+	uint32		runckey = 0;
 
 	if (!lion_sparse_check(c, avail, &detail) ||
 		!lion_sparse_check_offsets(c, MaxHeapTuplesPerPage, &detail))
@@ -501,19 +501,21 @@ lion_verify_segment(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
 					RelationGetRelationName(vs->index), off, blk, c->ckey,
 					*prevckey);
 
-	ckeys = LION_SPARSE_CKEYS_CONST(c);
-	for (i = 1; i <= n; i++)
+	/* lion_sparse_check() has decoded the stream and found it sound */
+	lion_sparse_iter_init(&it, c);
+	while (lion_sparse_iter_next(&it))
 	{
-		if (i < n && ckeys[i] == ckeys[i - 1])
-		{
+		if (run > 0 && lion_sparse_iter_ckey(&it) == runckey)
 			run++;
-			continue;
+		else
+		{
+			runckey = lion_sparse_iter_ckey(&it);
+			run = 1;
 		}
 		if (run >= LION_SPARSE_THRESHOLD)
 			lion_corrupt("lion index \"%s\": sparse segment %u on block %u holds %u members of container key %u, which needs a container of its own",
 						RelationGetRelationName(vs->index), off, blk, run,
-						ckeys[i - 1]);
-		run = 1;
+						runckey);
 	}
 
 	*prevckey = lion_item_last_ckey(c);
@@ -543,17 +545,15 @@ lion_verify_container(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
 	}
 
 	/*
-	 * DESIGN.md §38: a NARROW only in an index of version 8.  A build writes
-	 * one only into such an index, VACUUM likewise, and inserts only widen
-	 * one that is there; and a build of pg_lion before §38 reads version 6
-	 * and 7 indexes, which have to stay what it can read.  Its width is
-	 * lion_container_check()'s.  The version is the one the meta page says
-	 * now, as lion_verify_meta() read it.
+	 * DESIGN.md §38: a NARROW only in an index whose build wrote one
+	 * (LION_META_NARROW).  VACUUM makes one only in such an index, and
+	 * inserts only widen one that is there.  Its width is
+	 * lion_container_check()'s.  The flag is the one the meta page has now,
+	 * as lion_verify_meta() read it.
 	 */
-	if (c->type == LION_CT_NARROW && vs->version < LION_VERSION_NARROW)
-		lion_corrupt("lion index \"%s\": container %u on block %u is a NARROW, which an index of version %u cannot hold",
-					RelationGetRelationName(vs->index), off, blk,
-					vs->version);
+	if (c->type == LION_CT_NARROW && !vs->allows_narrow)
+		lion_corrupt("lion index \"%s\": container %u on block %u is a NARROW, which an index whose meta page records none cannot hold",
+					RelationGetRelationName(vs->index), off, blk);
 
 	/*
 	 * Its structure, and then its members as heap TIDs (DESIGN.md §2): a

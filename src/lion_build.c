@@ -334,6 +334,7 @@ typedef struct LionBuilder
 	uint16		pend[LION_SPARSE_THRESHOLD];	/* members of a still-sparse ckey */
 	int			npend;
 	LionContainer *seg;			/* open sparse segment, empty when none */
+	uint64		seglast;		/* the code of its last pair */
 
 	char	   *inlinebuf;		/* buffered items, packed without padding */
 	Size		inlineused;
@@ -495,7 +496,7 @@ typedef struct LionBuildState
 	uint32		summary_cols;	/* the columns that got them */
 	int64		nsummaries;		/* summary entries written */
 
-	/* A NARROW item written, which makes the index version 8 (§38). */
+	/* A NARROW item written, which lets VACUUM make NARROWs too (§38). */
 	bool		wrote_narrow;
 	/* the positions of the columns that store them (lion_posbuild.c) */
 	LionPosBuild *posbuild;
@@ -1224,6 +1225,34 @@ lion_builder_close_segment(LionBuildState *bs, LionBuilder *b)
 }
 
 /*
+ * Would the pending members of the group fit the open segment?  They are
+ * appended above its last pair, each a varint of its code's delta from the
+ * one before.
+ */
+static bool
+lion_builder_group_fits(LionBuilder *b)
+{
+	uint64		prev;
+	uint32		bytes = lion_sparse_nbytes(b->seg);
+	int			i;
+
+	if (b->seg->cardinality == 0)
+		return true;			/* at most three pairs of one ckey always do */
+	if ((uint32) b->seg->cardinality + (uint32) b->npend > LION_SPARSE_MAX_PAIRS)
+		return false;
+
+	prev = b->seglast;
+	for (i = 0; i < b->npend; i++)
+	{
+		uint64		code = lion_make_code(b->curckey, b->pend[i]);
+
+		bytes += lion_sparse_varint_size(code - prev);
+		prev = code;
+	}
+	return bytes <= LION_SPARSE_MAX_BYTES;
+}
+
+/*
  * Close the ckey group that is being collected: a dense one has already
  * become a container in b->cur and is emitted here, a sparse one appends its
  * few members to the open segment.
@@ -1246,13 +1275,13 @@ lion_builder_finish_group(LionBuildState *bs, LionBuilder *b)
 		int			i;
 
 		/* A ckey lives in one item only, so never split a group in two. */
-		if ((uint32) b->seg->cardinality + (uint32) b->npend >
-			LION_SPARSE_MAX_PAIRS)
+		if (!lion_builder_group_fits(b))
 			lion_builder_close_segment(bs, b);
 
 		for (i = 0; i < b->npend; i++)
 		{
-			if (!lion_sparse_insert(b->seg, b->curckey, b->pend[i], NULL))
+			if (!lion_sparse_append(b->seg, &b->seglast, b->curckey,
+									b->pend[i]))
 				elog(ERROR, "lion index: sparse segment overflowed during build");
 		}
 	}
@@ -1974,7 +2003,7 @@ lion_build_index_state(Relation index, LionIndexState *ix, MemoryContext cxt)
 	/* The root is filled in once the tree has been built. */
 	memset(&meta, 0, sizeof(meta));
 	meta.magic = LION_MAGIC;
-	meta.version = LION_VERSION;
+	meta.version = LION_VERSION_V9;
 	meta.offset_bits = LION_OFFSET_BITS;
 	meta.container_bits = LION_CONTAINER_BITS;
 	meta.inline_limit = inline_limit;
@@ -2531,10 +2560,10 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 					  lion_wal_mode_for_build(index));
 	/* ... and the order the directory was just laid out in (§21). */
 	lion_meta_record_order(LionPageGetMeta((Page) metabuf->data), &bs.ix);
-	/* ... and which columns got summaries, which makes it version 7 (§32). */
+	/* ... and which columns got summaries (§32). */
 	lion_meta_record_summaries(LionPageGetMeta((Page) metabuf->data),
 							   bs.summary_cols, bs.sumtids);
-	/* ... and whether it has a NARROW item, which makes it version 8 (§38). */
+	/* ... and whether it has a NARROW item, which VACUUM may then add (§38). */
 	lion_meta_record_narrow(LionPageGetMeta((Page) metabuf->data),
 							bs.wrote_narrow);
 	/* ... and each column's distinct keys, for the planner (§33). */

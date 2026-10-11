@@ -4432,8 +4432,7 @@ struct LionOrderWalk
 /*
  * Unchecked on purpose: w->codes has room for Max(LION_CONTAINER_RANGE,
  * LION_SPARSE_MAX_PAIRS) codes, and lion_sparse_iterate() yields at most
- * lion_sparse_npairs() pairs, a damaged count clamped to
- * LION_SPARSE_MAX_PAIRS.  A caller that iterated anything not so bounded
+ * LION_SPARSE_MAX_PAIRS pairs, whatever a damaged header claims.  A caller that iterated anything not so bounded
  * would need a check here.
  */
 static bool
