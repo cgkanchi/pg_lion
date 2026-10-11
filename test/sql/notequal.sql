@@ -204,7 +204,7 @@ SELECT lion_nq($$SELECT k, count(*) FROM lion_ne WHERE k <> 3 GROUP BY k$$, 'cou
 SELECT lion_nq($$SELECT n, count(*) FROM lion_ne WHERE n <> 3 GROUP BY n$$, 'count');
 SELECT lion_nq($$SELECT count(DISTINCT k) FROM lion_ne WHERE k <> 3$$, 'count');
 SELECT lion_nq($$SELECT g, count(DISTINCT n) FROM lion_ne WHERE n <> 3 GROUP BY g$$, 'count');
--- under an OR `<>` would be a complement in a union: not taken
+-- under an OR `<>` is a complement arm, counted by De Morgan (DESIGN.md §35)
 SELECT lion_nq($$SELECT count(*) FROM lion_ne WHERE k <> 3 OR g = 1$$, 'count');
 SELECT * FROM lion_nplan($$SELECT count(*) FROM lion_ne$$);
 SELECT * FROM lion_nplan($$SELECT count(*) FROM lion_ne WHERE s <> ''$$);

@@ -332,7 +332,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 					LionEntryTuple *entry;
 					LionColStats *cs;
 
-					if (!lion_stats_item_readable(page, iid, LION_ENTRY_HDRSZ))
+					if (!lion_stats_item_readable(page, iid, LION_ENTRY_SHORT_HDRSZ))
 						continue;
 
 					/*
@@ -350,7 +350,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 					if (LionEntryIsSummary(entry))
 					{
 						cs->summary_entries++;
-						cs->summary_tids += (int64) entry->ntids;
+						cs->summary_tids += (int64) lion_entry_ntids(entry);
 						if ((entry->flags & LION_ENTRY_INLINE) != 0)
 						{
 							LionColStats tmp;
@@ -366,17 +366,17 @@ lion_index_stats(PG_FUNCTION_ARGS)
 							cs->summary_bytes += tmp.container_bytes;
 						}
 						else
-							lion_stats_claim(st, entry->head, entry->attno,
+							lion_stats_claim(st, lion_entry_head(entry), entry->attno,
 											 true);
 						continue;
 					}
 
 					cs->entries++;
-					cs->ntids += (int64) entry->ntids;
+					cs->ntids += (int64) lion_entry_ntids(entry);
 					if (LionEntryIsNullKey(entry))
-						cs->null_tids += (int64) entry->ntids;
+						cs->null_tids += (int64) lion_entry_ntids(entry);
 					if (LionEntryIsEmptyKey(entry))
-						cs->empty_tids += (int64) entry->ntids;
+						cs->empty_tids += (int64) lion_entry_ntids(entry);
 
 					if ((entry->flags & LION_ENTRY_INLINE) != 0)
 					{
@@ -402,7 +402,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 						cs->inline_slack_bytes += (int64) (paylen - cur);
 					}
 					else
-						lion_stats_claim(st, entry->head, entry->attno,
+						lion_stats_claim(st, lion_entry_head(entry), entry->attno,
 										 false);
 				}
 			}
@@ -680,7 +680,7 @@ lion_index_posting_root(PG_FUNCTION_ARGS)
 		LionEntryTuple *entry = lion_page_entry(BufferGetPage(buf), off);
 
 		if ((entry->flags & LION_ENTRY_CHAIN) != 0)
-			root = (int64) entry->head;
+			root = (int64) lion_entry_head(entry);
 	}
 	if (BufferIsValid(buf))
 		UnlockReleaseBuffer(buf);

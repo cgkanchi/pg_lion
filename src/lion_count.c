@@ -13,6 +13,10 @@
 
 #include "lion_count_int.h"
 
+#if PG_VERSION_NUM >= 170000
+#include "storage/read_stream.h"
+#endif
+
 static bool lion_exists_settled(LionCountCtx *cx);
 static bool lion_sources_collect_keys(Relation heap, Snapshot snapshot,
 									  int nsources, LionCountSource *sources,
@@ -861,6 +865,8 @@ lion_row_filter_test(LionRowFilter *filter, HeapTuple tuple)
 			pass = (!fcinfo->isnull && DatumGetBool(result));
 		}
 	}
+	if (pass && filter->rowtest != NULL)
+		pass = filter->rowtest(filter->rowtestarg, tuple);
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextReset(filter->tmpcxt);
@@ -885,6 +891,35 @@ lion_row_filter_test(LionRowFilter *filter, HeapTuple tuple)
  * The visibility cache is neither read nor filled: it knows which offsets
  * are visible, but the filter needs their tuples.
  */
+#if PG_VERSION_NUM >= 170000
+/*
+ * The blocks of a filtered recheck's candidates, in the order it visits them,
+ * for the read stream that reads them ahead (lion_recheck_heap_filtered()):
+ * each block once, the TIDs being sorted.
+ */
+typedef struct LionTidBlocks
+{
+	ItemPointerData *tids;
+	int			ntids;
+	int			next;
+} LionTidBlocks;
+
+static BlockNumber
+lion_tid_blocks_next(ReadStream *stream, void *arg, void *per_buffer_data)
+{
+	LionTidBlocks *tb = (LionTidBlocks *) arg;
+	BlockNumber blk;
+
+	if (tb->next >= tb->ntids)
+		return InvalidBlockNumber;
+	blk = ItemPointerGetBlockNumber(&tb->tids[tb->next]);
+	while (tb->next < tb->ntids &&
+		   ItemPointerGetBlockNumber(&tb->tids[tb->next]) == blk)
+		tb->next++;
+	return blk;
+}
+#endif
+
 static int64
 lion_recheck_heap_filtered(LionCountCtx *cx)
 {
@@ -893,6 +928,22 @@ lion_recheck_heap_filtered(LionCountCtx *cx)
 	int			visidx[MaxHeapTuplesPerPage];	/* ... and its place in tids */
 	int64		passed = 0;
 	int			i = 0;
+#if PG_VERSION_NUM >= 170000
+	LionTidBlocks tb;
+	ReadStream *stream;
+
+	/*
+	 * Every candidate's page is read, whatever the visibility map says, so
+	 * they are read ahead as a bitmap heap scan reads its pages: a read
+	 * stream over the candidates' blocks in order (PostgreSQL 17 on).
+	 */
+	tb.tids = cx->tids;
+	tb.ntids = cx->ntids;
+	tb.next = 0;
+	stream = read_stream_begin_relation(READ_STREAM_DEFAULT, NULL, cx->heap,
+										MAIN_FORKNUM, lion_tid_blocks_next,
+										&tb, 0);
+#endif
 
 	while (i < cx->ntids)
 	{
@@ -902,7 +953,13 @@ lion_recheck_heap_filtered(LionCountCtx *cx)
 		int			nvis = 0;
 		int			j;
 
+#if PG_VERSION_NUM >= 170000
+		buf = read_stream_next_buffer(stream, NULL);
+		if (!BufferIsValid(buf) || BufferGetBlockNumber(buf) != blk)
+			elog(ERROR, "lion index count: the read stream lost its place in the candidates");
+#else
 		buf = ReadBuffer(cx->heap, blk);
+#endif
 		lion_heap_page_prune_opt(cx->heap, buf, &cx->vmbuf, cx->rel_read_only);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		cx->stats.blocks_rechecked++;
@@ -951,6 +1008,9 @@ lion_recheck_heap_filtered(LionCountCtx *cx)
 		ReleaseBuffer(buf);
 		CHECK_FOR_INTERRUPTS();
 	}
+#if PG_VERSION_NUM >= 170000
+	read_stream_end(stream);
+#endif
 
 	return passed;
 }
@@ -2141,6 +2201,8 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	{
 		if (sources[i].rangewalk != NULL)
 			elog(ERROR, "lion index: a range source to be walked handed to a count");
+		if (sources[i].compl != NULL)
+			elog(ERROR, "lion index: an OR with a complement arm handed to a count");
 		trees[i] = lion_source_tree(&sources[i]);
 
 		if (sources[i].negated)

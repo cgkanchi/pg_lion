@@ -253,7 +253,7 @@ SET client_min_messages = warning;
 -- check used to hand to lion_column() before anything had checked it
 CREATE INDEX lion_vfy_bad_attno ON lion_vfy_bad USING lion (k);
 SELECT lion_vfy_poke('lion_vfy_bad_attno', 1,
-					 lion_vfy_item('lion_vfy_bad_attno', 1, 3) + 20, '\xffff');
+					 lion_vfy_item('lion_vfy_bad_attno', 1, 3) + 4, '\xffff');
 SET client_min_messages = error;
 SELECT lion_index_verify('lion_vfy_bad_attno');
 SELECT entries FROM lion_index_stats('lion_vfy_bad_attno');
@@ -263,7 +263,7 @@ SET client_min_messages = warning;
 -- to underflow, and lion_index_stats() walked the "payload" off the page
 CREATE INDEX lion_vfy_bad_keylen ON lion_vfy_bad USING lion (k);
 SELECT lion_vfy_poke('lion_vfy_bad_keylen', 1,
-					 lion_vfy_item('lion_vfy_bad_keylen', 1, 3) + 6, '\xffff');
+					 lion_vfy_item('lion_vfy_bad_keylen', 1, 3) + 2, '\xffff');
 SET client_min_messages = error;
 SELECT lion_index_verify('lion_vfy_bad_keylen');
 SELECT entries FROM lion_index_stats('lion_vfy_bad_keylen');

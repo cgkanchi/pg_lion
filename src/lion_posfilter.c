@@ -332,7 +332,7 @@ lion_poscursor_init(Relation index, LionState *col, Datum key,
 			ok = false;
 		else if ((e->flags & LION_ENTRY_CHAIN) != 0)
 		{
-			cur->hash = e->hash;
+			cur->hash = lion_entry_owner(e);
 			cur->root = x->pos_root;
 			if (!BlockNumberIsValid(cur->root))
 				cur->absent = true;

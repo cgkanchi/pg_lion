@@ -1136,8 +1136,8 @@ lion_posbuild_merge(LionPosTake *t, const LionPosKey *k)
 
 /*
  * The positions of key, which the build is writing the entry of (see the
- * file header).  hash is the entry's, which the pages of a tree are stamped
- * with.  Exactly one of *chunk (positions that fit one chunk, valid until
+ * file header).  hash is the entry's owner stamp (lion_entry_owner()),
+ * which the pages of a tree are stamped with.  Exactly one of *chunk (positions that fit one chunk, valid until
  * the next call) and *root (a tree, written) is set; *nmembers says how many
  * rows they cover.
  */

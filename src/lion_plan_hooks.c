@@ -18,6 +18,7 @@ bool		lion_enable_count_pushdown = true;
 bool		lion_enable_filter_switch = true;
 bool		lion_enable_decoded_walk = true;
 bool		lion_enable_topk = true;
+bool		lion_enable_count_residual = true;
 create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 bool		lion_enable_semijoin = true;
 set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook = NULL;
@@ -503,6 +504,32 @@ lion_plan_join_agg_path(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * The LION_TL_FCOUNT kind of agg, when it is one of priv's filtered counts
+ * (DESIGN.md §10, "Filtered counts"): its condition equal() to the one the
+ * planner numbered its filter by.  0 for any other aggregate.
+ */
+static int
+lion_fcount_kind(Aggref *agg, const LionCountPriv *priv)
+{
+	Node	   *fexpr;
+	Var		   *fcol;
+	int			form;
+	ListCell   *lc;
+	int			f = 0;
+
+	if (priv->nfilter == 0 || !lion_agg_filtered(agg, &fexpr, &form, &fcol))
+		return 0;
+	foreach(lc, priv->filterexprs)
+	{
+		f++;
+		if (equal(lfirst(lc), fexpr))
+			return LION_TL_FCOUNT(f, form);
+	}
+	elog(ERROR, "LionCount: a filtered count of no filter of the plan");
+	return 0;					/* keep the compiler quiet */
+}
+
+/*
  * Which of the decoded walk's GROUP BY columns (DESIGN.md §34) attno is, in
  * the order the walk takes them: 0 for the first, which is priv's group
  * column, 1 and on for the others, and -1 for a column that is not one of
@@ -746,7 +773,12 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			lion_wagg_add_target((Aggref *) sexpr, &priv, &ctlist, &kinds,
 								 &wargs))
 			continue;
-		if (IsA(sexpr, Aggref))
+		if (IsA(sexpr, Aggref) &&
+			(kind = lion_fcount_kind((Aggref *) sexpr, &priv)) != 0)
+		{
+			/* a filtered count (DESIGN.md §10), counted by its run */
+		}
+		else if (IsA(sexpr, Aggref))
 		{
 			Aggref	   *agg = (Aggref *) sexpr;
 			AttrNumber	attno = 0;
@@ -795,7 +827,7 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				{
 					for (i = 0; i < priv.nclause; i++)
 					{
-						if (!inor[i] &&
+						if (!inor[i] && priv.clause[i].filter == 0 &&
 							priv.clause[i].kind == LION_CLAUSE_NULL &&
 							priv.clause[i].attno == attno)
 						{
@@ -834,6 +866,8 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 
 					if (inor[i])
 						continue;	/* §19: an OR leaf pins nothing */
+					if (priv.clause[i].filter != 0)
+						continue;	/* §10: a filter pins its count's rows */
 					if (ckind != LION_CLAUSE_EQ && ckind != LION_CLAUSE_NULL)
 						continue;
 					if (priv.clause[i].attno == attno)
@@ -880,6 +914,49 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	}
 	pfree(inor);
 
+	/*
+	 * The columns the residual clauses read (DESIGN.md §10, "Residual
+	 * clauses"), each once: setrefs.c points the clauses' Vars at their
+	 * places in custom_scan_tlist - a column the target list prints already,
+	 * or a LION_TL_RESID one no row prints - and the node fills those places
+	 * from the heap row it tests.
+	 */
+	if (priv.resid != NIL)
+	{
+		List	   *vars = pull_var_clause((Node *) priv.resid,
+										   PVC_INCLUDE_PLACEHOLDERS);
+
+		foreach(lc, vars)
+		{
+			Var		   *var = (Var *) lfirst(lc);
+			ListCell   *l2;
+			bool		dup = false;
+
+			if (!IsA(var, Var) || var->varno != (int) priv.scanrelid ||
+				var->varattno <= 0)
+				elog(ERROR, "LionCount: a residual clause reads more than its table's columns");
+			foreach(l2, ctlist)
+			{
+				Node	   *e = (Node *) ((TargetEntry *) lfirst(l2))->expr;
+
+				if (IsA(e, Var) && ((Var *) e)->varno == var->varno &&
+					((Var *) e)->varattno == var->varattno)
+				{
+					dup = true;
+					break;
+				}
+			}
+			if (dup)
+				continue;
+			ctlist = lappend(ctlist,
+							 makeTargetEntry((Expr *) copyObject(var),
+											 list_length(ctlist) + 1,
+											 NULL, true));
+			kinds = lappend_int(kinds, LION_TL_RESID(var->varattno));
+		}
+		list_free(vars);
+	}
+
 	cscan->scan.plan.targetlist = tlist;
 	cscan->scan.plan.qual = having;
 	cscan->scan.scanrelid = 0;
@@ -899,6 +976,9 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	priv.consts = NIL;
 	priv.having = NIL;
 
+	/* the filters' conditions numbered the target list, and are done */
+	priv.filterexprs = NIL;
+
 	/*
 	 * The aggregates over lion columns' entries (DESIGN.md §37): what each
 	 * computes is in priv already, and its argument goes after the clause
@@ -908,6 +988,14 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	if (priv.nwcol > 0)
 		cscan->custom_exprs = list_concat(list_copy(cscan->custom_exprs),
 										  wargs);
+
+	/* ... and the residual clauses after them (DESIGN.md §10) */
+	if (priv.resid != NIL)
+	{
+		cscan->custom_exprs = list_concat(list_copy(cscan->custom_exprs),
+										  priv.resid);
+		priv.resid = NIL;
+	}
 	lion_priv_set_tlkinds(&priv, kinds);
 
 	/*

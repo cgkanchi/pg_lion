@@ -258,6 +258,14 @@ typedef struct LionRowFilter
 	int			nheap;
 	int			npos;
 	struct LionPosFilter **pos;
+
+	/*
+	 * A test of the whole row besides the clauses (the count pushdown's
+	 * residual clauses, DESIGN.md §10), or NULL: true when the row passes.
+	 * Counted among nheap.
+	 */
+	bool		(*rowtest) (void *arg, HeapTuple tuple);
+	void	   *rowtestarg;
 } LionRowFilter;
 
 /* Does a count with this filter have to test every candidate in the heap? */
@@ -450,6 +458,19 @@ typedef struct LionCountSource
 	 * them (lion_node_count()).
 	 */
 	struct LionRangeSource *rangewalk;
+
+	/*
+	 * An OR with a COMPLEMENT arm (DESIGN.md §35, "Complements in an OR"):
+	 * the source is the rows of this one's own sets - the union of the OR's
+	 * positive arms, P, or no row at all when tree is NULL - and every row
+	 * outside compl's, M, the intersection of the complement arms' sets.  The
+	 * count of an AND with it is two counts, one with M subtracted and one
+	 * with P and M both intersected, which the count pushdown that defines
+	 * the structure makes (lion_node_count()); the count functions below
+	 * never take one.  A compl with no tree is an M of no row: the source is
+	 * then every row.
+	 */
+	struct LionCountSource *compl;
 } LionCountSource;
 
 /*
@@ -1270,7 +1291,8 @@ extern void lion_summary_shape(Relation index, LionState *col,
  * from stays PINNED from the copy until that set is handed out, which then
  * takes the pin over (DESIGN.md §9).  batchbuf is that pin; it is dropped as
  * soon as the batch holds no INLINE copy still to come, so a batch of CHAIN
- * entries pins nothing.
+ * entries pins nothing.  A walk that takes whole batches keeps it for all of
+ * the batch instead (sharepin, lion_entry_scan_share_pin()).
  */
 typedef struct LionEntryScan
 {
@@ -1337,6 +1359,9 @@ typedef struct LionEntryScan
 	int			lastinline;		/* the last INLINE one, or -1 */
 	BlockNumber batchblk;		/* the leaf they came from */
 	Buffer		batchbuf;		/* its pin, while an INLINE copy is to come */
+	bool		sharepin;		/* batchbuf stays the INLINE copies' pin until
+								 * the next leaf is read: see
+								 * lion_entry_scan_share_pin() */
 	int64		nleaves;		/* leaves this walk has read */
 } LionEntryScan;
 
@@ -1425,6 +1450,7 @@ extern bool lion_entry_scan_begin_summed(LionEntryScan *es, Relation index,
  */
 extern bool lion_entry_scan_next(LionEntryScan *es, Datum *key,
 								LionPostingSet *ps);
+extern void lion_entry_scan_share_pin(LionEntryScan *es);
 
 /*
  * The next entry as the copy the leaf read made, valid until the next call:
@@ -1506,6 +1532,13 @@ extern PGDLLIMPORT bool lion_enable_filter_switch;
  * cheaper than the nested loop of §20.  A planner switch.
  */
 extern PGDLLIMPORT bool lion_enable_decoded_walk;
+
+/*
+ * Whether the count pushdown may test WHERE clauses no posting set answers
+ * on the heap rows the others select (DESIGN.md §10, "Residual clauses").
+ * A planner switch.
+ */
+extern PGDLLIMPORT bool lion_enable_count_residual;
 
 /*
  * Whether a GROUP BY ordered by its count under a LIMIT may count only the
