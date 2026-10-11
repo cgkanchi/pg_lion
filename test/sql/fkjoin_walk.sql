@@ -310,8 +310,9 @@ FROM lion_index_stats('lion_kof_fk');
 SELECT * FROM lion_wj_explain('SELECT d.attr, count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk GROUP BY d.attr');
 -- ... and the distinct keys of a forward semi join over a non-unique key
 SELECT * FROM lion_wj_explain('SELECT count(*) FROM lion_kof f WHERE EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)');
--- a few dozen keys over five hundred leaves: a descent each, as before
-SELECT * FROM lion_wj_explain('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2');
+-- a handful of keys, far apart over five hundred leaves: a descent each, as
+-- before
+SELECT * FROM lion_wj_explain('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2 AND d.pk < 3000');
 
 -- ---- 2. the answers ------------------------------------------------------------
 -- inner joins, grouped and not, with fact filters and dimension filters
@@ -351,8 +352,11 @@ SELECT lion_wj('SELECT count(*) FROM lion_kof f WHERE EXISTS (SELECT 1 FROM lion
 SELECT lion_wj('SELECT count(*) FROM lion_kof f WHERE f.x = 4 AND f.fk IN (SELECT d.k FROM lion_kodn d)');
 SELECT lion_wj('SELECT count(DISTINCT f.fk) FROM lion_kof f WHERE f.t = ''t1'' AND EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)');
 SELECT lion_wj('SELECT count(DISTINCT f.fk), count(*) FROM lion_kof f WHERE f.t = ''t1'' AND EXISTS (SELECT 1 FROM lion_kodn d WHERE d.k = f.fk)');
--- three filters keep too few keys to walk; the answer is the same
-SELECT lion_wj('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2');
+-- four filters keep too few keys to walk; the answer is the same
+SELECT lion_wj('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2 AND d.pk < 3000');
+-- some sixty keys, several leaves apart: walked, a descent each from the
+-- level-1 page above the last one
+SELECT lion_wj('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.attr = 2 AND d.grp IN (''g1'', ''g2'')');
 
 -- ---- 3. what the walk read -------------------------------------------------------
 -- every dimension key is looked up; 260 of them find no entry, the ten past
@@ -368,8 +372,13 @@ SELECT lion_wj_counter('SELECT count(*) FROM lion_kodn d WHERE NOT EXISTS (SELEC
 -- keys, where a descent per key reads three a key
 SELECT lion_wj_counter('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x = 3 AND f.t = ''t3'')', 'Directory Pages Read')
 	< lion_wj_counter('SELECT count(*) FROM lion_kod d WHERE EXISTS (SELECT 1 FROM lion_kof f WHERE f.fk = d.pk AND f.x = 3 AND f.t = ''t3'')', 'Join Keys Looked Up') AS fewer_pages_than_keys;
-SELECT lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2', 'Directory Pages Read')
-	>= 3 * lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2', 'Join Keys Looked Up') AS a_descent_a_key;
+SELECT lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2 AND d.pk < 3000', 'Directory Pages Read')
+	>= 3 * lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.grp = ''g1'' AND d.attr = 2 AND d.pk < 3000', 'Join Keys Looked Up') AS a_descent_a_key;
+-- ... where the keys several leaves apart descend from the level-1 page the
+-- last descent went through while they are under it: two pages a key, and
+-- three for the first under each level-1 page
+SELECT lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.attr = 2 AND d.grp IN (''g1'', ''g2'')', 'Directory Pages Read')
+	< 2.5 * lion_wj_counter('SELECT count(*) FROM lion_kof f JOIN lion_kod d ON f.fk = d.pk WHERE d.region = ''eu'' AND d.attr = 2 AND d.grp IN (''g1'', ''g2'')', 'Join Keys Looked Up') AS from_the_level_1_page;
 -- a fact filter that is one range, collected into memory on its own (§32),
 -- is what the join copies as its fact filters: one source of one set, which
 -- the collection used to refuse as a collected set counted on its own.  The

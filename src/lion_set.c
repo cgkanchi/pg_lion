@@ -11,10 +11,13 @@
  */
 #include "postgres.h"
 
+#include "access/nbtree.h"
+
 #include "lion_count_int.h"
 
 static uint32 lion_list_pin_budget(Relation index);
 static void lion_list_pin_charge(LionPostingSet *ps);
+static void lion_lookup_walk_sortsupport(LionLookupWalk *walk);
 
 /* ---------------------------------------------------------------------
  * Small helpers
@@ -1352,6 +1355,9 @@ lion_lookup_walk_begin(LionLookupWalk *walk, Relation index, AttrNumber attno,
 	walk->hikey = (LionEntryTuple *)
 		palloc(MAXALIGN(LION_ENTRY_HDRSZ + LION_MAX_KEY_SIZE));
 	walk->hikeylen = 0;
+	walk->parent.blk = InvalidBlockNumber;
+	walk->parent.hikey = (LionEntryTuple *)
+		palloc(MAXALIGN(LION_ENTRY_HDRSZ + LION_MAX_KEY_SIZE));
 
 	/*
 	 * Stepping right over s leaves reads s pages where a descent reads the
@@ -1368,6 +1374,123 @@ lion_lookup_walk_begin(LionLookupWalk *walk, Relation index, AttrNumber attno,
 	 */
 	walk->prefetch =
 		(get_tablespace_io_concurrency(index->rd_rel->reltablespace) > 0);
+
+	lion_lookup_walk_sortsupport(walk);
+}
+
+/*
+ * The sort of a batch of keys (lion_lookup_walk_cmp_abbrev()) through the
+ * key type's own btree sort support, where the probe sorts by that family's
+ * comparison: the same function, so the same order, as its btree contract
+ * makes the sort support's.  A batch of an FK-side join is compared some
+ * n log n times, each through fmgr and a pointer to each key, which for a
+ * pass-by-reference key is a sizeable share of the join; the type's own
+ * comparator is called directly instead, and with abbreviated keys, which
+ * sit in the batch's entries, most comparisons read no key at all.
+ * Without sort support, or for a sortproc of another family (a cross-type
+ * probe's, or an opclass's own), the sort calls sortproc as before.  The
+ * support's state is allocated in the current memory context, the walk's.
+ */
+static void
+lion_lookup_walk_sortsupport(LionLookupWalk *walk)
+{
+	Oid			sortfn = walk->probe.sortproc.fn_oid;
+	Oid		   *argtypes;
+	int			nargs;
+	TypeCacheEntry *tc;
+	Oid			ssfn;
+
+	walk->hasssup = false;
+	walk->abbrev = false;
+	if (!walk->probe.hassort || !OidIsValid(sortfn))
+		return;
+	(void) get_func_signature(sortfn, &argtypes, &nargs);
+	if (nargs != 2 || argtypes[0] != argtypes[1])
+		return;
+	tc = lookup_type_cache(argtypes[0], TYPECACHE_BTREE_OPFAMILY);
+	if (!OidIsValid(tc->btree_opf) ||
+		get_opfamily_proc(tc->btree_opf, tc->btree_opintype,
+						  tc->btree_opintype, BTORDER_PROC) != sortfn)
+		return;
+	ssfn = get_opfamily_proc(tc->btree_opf, tc->btree_opintype,
+							 tc->btree_opintype, BTSORTSUPPORT_PROC);
+	if (!OidIsValid(ssfn))
+		return;
+
+	memset(&walk->ssup, 0, sizeof(SortSupportData));
+	walk->ssup.ssup_cxt = CurrentMemoryContext;
+	walk->ssup.ssup_collation = walk->state->collation;
+	walk->ssup.ssup_reverse = false;
+	walk->ssup.ssup_nulls_first = false;
+	walk->ssup.ssup_attno = 0;
+	walk->ssup.abbreviate = true;
+	OidFunctionCall1(ssfn, PointerGetDatum(&walk->ssup));
+	if (walk->ssup.comparator == NULL)
+		return;
+
+	walk->hasssup = true;
+	if (walk->ssup.abbrev_converter != NULL)
+	{
+		walk->abbrev = true;
+		walk->fullcmp = walk->ssup.abbrev_full_comparator;
+		walk->nabbrev = 0;
+		walk->abbrevnext = 10;
+	}
+	else
+		walk->fullcmp = walk->ssup.comparator;
+}
+
+/*
+ * The abbreviated key of a key the caller will sort with
+ * lion_lookup_walk_cmp_abbrev(), or 0 when there is none.  Asks the support,
+ * as tuplesort does, whether abbreviating is still worth it - every time the
+ * keys abbreviated so far double - and stops for the rest of the walk if it
+ * is not: the keys of the batch in hand are then compared whole.
+ */
+Datum
+lion_lookup_walk_abbrev(LionLookupWalk *walk, Datum key)
+{
+	if (!walk->abbrev)
+		return (Datum) 0;
+	if (++walk->nabbrev >= walk->abbrevnext)
+	{
+		walk->abbrevnext *= 2;
+		if (walk->ssup.abbrev_abort(walk->nabbrev, &walk->ssup))
+		{
+			walk->abbrev = false;
+			return (Datum) 0;
+		}
+	}
+	return walk->ssup.abbrev_converter(key, &walk->ssup);
+}
+
+/*
+ * lion_lookup_walk_cmp() for keys whose abbreviated keys
+ * lion_lookup_walk_abbrev() made when the walk was abbreviating: those first,
+ * the whole keys where they tie.  The same order.
+ */
+int
+lion_lookup_walk_cmp_abbrev(LionLookupWalk *walk, Datum a, Datum aabbrev,
+							uint32 ahash, Datum b, Datum babbrev, uint32 bhash)
+{
+	int			c;
+
+	if (!walk->hasssup)
+		return lion_lookup_walk_cmp(walk, a, ahash, b, bhash);
+	if ((++walk->ncmp & 0xffff) == 0)
+		CHECK_FOR_INTERRUPTS();
+	if (walk->abbrev)
+	{
+		c = walk->ssup.comparator(aabbrev, babbrev, &walk->ssup);
+		if (c != 0)
+			return c < 0 ? -1 : 1;
+	}
+	c = walk->fullcmp(a, b, &walk->ssup);
+	if (c != 0)
+		return c < 0 ? -1 : 1;
+	if (ahash != bhash)
+		return ahash < bhash ? -1 : 1;
+	return 0;
 }
 
 /*
@@ -1457,6 +1580,7 @@ lion_lookup_walk_restart(LionLookupWalk *walk)
 	walk->rightlink = InvalidBlockNumber;
 	walk->hikeylen = 0;
 	walk->stepok = true;
+	walk->parent.blk = InvalidBlockNumber;
 }
 
 /*
@@ -1590,8 +1714,23 @@ lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 		off = lion_dir_binsrch(BufferGetPage(buf), &sk);
 	else
 	{
-		buf = lion_dir_search(index, NULL, walk->state->ix, &sk,
-							  BUFFER_LOCK_SHARE, false, &off);
+		/*
+		 * A descent: from the level-1 page the last one went through while
+		 * the key is below the high key that page had, and from the root
+		 * otherwise.  The keys of a sparse batch, a participant's share of a
+		 * parallel join's or a few among many fk values, are each a leaf or
+		 * more apart, and the root and the levels below it were read again
+		 * for every key: height + 1 directory pages a key, where this reads
+		 * 2 while the keys stay under one level-1 page.
+		 * The page's lower bound was at or below the last key, which this
+		 * one sorts after.
+		 */
+		if (BlockNumberIsValid(walk->parent.blk) &&
+			!walk->parent.rightmost &&
+			lion_cmp_entry(walk->parent.hikey, &sk) <= 0)
+			walk->parent.blk = InvalidBlockNumber;
+		buf = lion_dir_search_from(index, walk->state->ix, &sk,
+								   &walk->parent, &off);
 		if (had)
 			walk->stepok = (BufferGetBlockNumber(buf) == prevright);
 	}
