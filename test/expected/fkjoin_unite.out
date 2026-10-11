@@ -1,0 +1,412 @@
+-- FK-side join grouped by a fact column, the keys united (DESIGN.md §27,
+-- "Grouped by a fact column, the keys united").
+--
+-- With no dimension column in the rows, each batch of join keys is united
+-- once - with the fact filters ANDed in - and every group of the fact column
+-- is counted against the union, instead of every key in every group.  The
+-- rows a group gets add up to the same counts: an inner join's keys, and the
+-- forward semi join's distinct keys, have disjoint fk sets.  Every answer is
+-- checked against the same query with the pushdown off and sequential scans
+-- only; lion_uj() says whether the plan united the keys or counted them one
+-- by one.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+-- the upper node's plans are the ones pinned here (DESIGN.md §27)
+SET pg_lion.enable_semijoin = off;
+/*
+ * lion_uj() runs a query through the pushdown with every join method
+ * disabled, so that the node is exercised, and with the pushdown off and
+ * sequential scans only, compares the two as multisets both ways round and
+ * says how the node counted the groups.
+ */
+CREATE FUNCTION lion_uj(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			how := 'per key';
+		ELSIF ln LIKE '%Fact Groups Counted Against: united join keys%' THEN
+			how := 'united';
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_uj_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_uj_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_uj_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_uj_on EXCEPT ALL SELECT * FROM lion_uj_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_uj_off EXCEPT ALL SELECT * FROM lion_uj_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_uj_on, lion_uj_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows', how, nrows);
+END $$;
+/*
+ * The node and what is above it, joins disabled, with the dimension's own
+ * plan as one line: that plan is whatever each major makes of a small scan.
+ */
+CREATE FUNCTION lion_uj_explain(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	seen boolean := false;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		CONTINUE WHEN ln ~ '^\s*Disabled: true$';
+		IF seen AND ln ~ '^\s*->' THEN
+			RETURN NEXT regexp_replace(ln, '->.*$', '->  (the dimension''s plan)');
+			RETURN;
+		END IF;
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			seen := true;
+		END IF;
+		RETURN NEXT ln;
+	END LOOP;
+END $$;
+/* One counter of the node's EXPLAIN ANALYZE output, joins disabled. */
+CREATE FUNCTION lion_uj_counter(q text, counter text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	val bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF btrim(split_part(ln, ':', 1)) = counter THEN
+			val := btrim(split_part(ln, ':', 2))::bigint;
+		END IF;
+	END LOOP;
+	RETURN val;
+END $$;
+/*
+ * The dimension: 3,100 rows over a unique, nullable key - 1..3000, which the
+ * fact's fk covers, 100 keys past it, and NULL in every 31st row - and a
+ * region.  A second one over 400 keys, most of them two or three times, with
+ * NULL keys and no uniqueness: the inner side of a forward semi join.
+ */
+CREATE TABLE lion_ud (
+	k		int,
+	region	text	NOT NULL,
+	name	text	NOT NULL
+);
+INSERT INTO lion_ud
+SELECT CASE WHEN i % 31 = 0 THEN NULL ELSE i END,
+	   (ARRAY['eu', 'us', 'ap', 'af', 'sa'])[1 + (i % 7) % 5], 'n' || (i % 3)
+  FROM generate_series(1, 3100) i;
+CREATE UNIQUE INDEX lion_ud_k ON lion_ud (k);
+CREATE TABLE lion_un (
+	k		int,
+	region	text	NOT NULL
+);
+INSERT INTO lion_un
+SELECT CASE WHEN i % 50 = 0 THEN NULL ELSE 1 + (i * 7) % 400 END,
+	   (ARRAY['eu', 'us', 'ap'])[1 + i % 3]
+  FROM generate_series(1, 900) i;
+/*
+ * The fact: 30,000 rows, fk over 1..3000 in an order unrelated to the key's
+ * and NULL in every 97th row, g of 10 values and NULL, x a filter of 7.
+ */
+CREATE TABLE lion_uf (
+	id		int		NOT NULL,
+	fk		int,
+	g		int,
+	x		int		NOT NULL
+);
+INSERT INTO lion_uf
+SELECT i, CASE WHEN i % 97 = 0 THEN NULL ELSE 1 + (i * 7919) % 3000 END,
+	   CASE WHEN i % 53 = 0 THEN NULL ELSE i % 10 END, i % 7
+  FROM generate_series(1, 30000) i;
+CREATE INDEX lion_uf_fk ON lion_uf USING lion (fk);
+CREATE INDEX lion_uf_g ON lion_uf USING lion (g);
+CREATE INDEX lion_uf_x ON lion_uf USING lion (x);
+VACUUM (FREEZE, ANALYZE) lion_uf;
+ANALYZE lion_ud;
+ANALYZE lion_un;
+-- ---- the plans ----
+-- an inner join, grouped by the fact column alone: united
+SELECT * FROM lion_uj_explain('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.region = ''eu'' GROUP BY f.g');
+                    lion_uj_explain                    
+-------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: g
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_uf_fk (fk = d.k)
+         Join Key Lookups: in index order
+         Fact Group Key: g
+         Fact Groups Counted Against: united join keys
+         ->  (the dimension's plan)
+(8 rows)
+
+-- the forward semi join, over a non-unique key: its distinct keys united
+SELECT * FROM lion_uj_explain('SELECT f.g, count(*) FROM lion_uf f WHERE f.fk IN (SELECT k FROM lion_un WHERE region = ''us'') GROUP BY f.g');
+                    lion_uj_explain                    
+-------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: g
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_uf_fk (fk = lion_un.k)
+         Join Type: Semi
+         Join Keys: distinct, sorted
+         Join Key Lookups: in index order
+         Fact Group Key: g
+         Fact Groups Counted Against: united join keys
+         ->  (the dimension's plan)
+(10 rows)
+
+-- a dimension column in the rows: each key counted in each group, as before
+SELECT * FROM lion_uj_explain('SELECT f.g, d.name, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.region = ''eu'' GROUP BY f.g, d.name');
+               lion_uj_explain               
+---------------------------------------------
+ Finalize HashAggregate
+   Group Key: g, d.name
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lion_uf_fk (fk = d.k)
+         Join Key Lookups: in index order
+         Fact Group Key: g
+         ->  (the dimension's plan)
+(7 rows)
+
+-- ---- the answers, against the pushdown off ----
+-- the inner join, with a dimension filter, a fact filter, both, and HAVING
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.region = ''eu'' GROUP BY f.g');
+     lion_uj     
+-----------------
+ united, 11 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE f.x = 3 GROUP BY f.g');
+     lion_uj     
+-----------------
+ united, 11 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, count(*), count(1) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.region IN (''us'', ''ap'') AND f.x IN (1, 4) GROUP BY f.g');
+     lion_uj     
+-----------------
+ united, 11 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.region = ''af'' GROUP BY f.g HAVING count(*) > 300');
+     lion_uj     
+-----------------
+ united, 10 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE f.x IS NOT NULL GROUP BY f.g ORDER BY count(*) DESC, f.g LIMIT 3');
+    lion_uj     
+----------------
+ united, 3 rows
+(1 row)
+
+-- NULL dimension keys, which join nothing: the dimension's NULL rows alone,
+-- and among the others
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.k IS NULL GROUP BY f.g');
+    lion_uj     
+----------------
+ united, 0 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.k IS NULL OR d.k % 100 = 7 GROUP BY f.g');
+    lion_uj     
+----------------
+ united, 2 rows
+(1 row)
+
+-- keys with no fact rows (past the fact's range) beside keys with them
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.k > 2950 GROUP BY f.g');
+     lion_uj     
+-----------------
+ united, 11 rows
+(1 row)
+
+-- an empty dimension result, and a fact filter that selects nothing - each a
+-- value the planner does not see, so that the plan unites what it expects
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.region = (SELECT ''nowhere'') GROUP BY f.g');
+    lion_uj     
+----------------
+ united, 0 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE f.x = (SELECT 99) GROUP BY f.g');
+    lion_uj     
+----------------
+ united, 0 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f WHERE f.fk IN (SELECT k FROM lion_un WHERE region = (SELECT ''nowhere'')) GROUP BY f.g');
+    lion_uj     
+----------------
+ united, 0 rows
+(1 row)
+
+-- a dimension that selects every key: the union is every fk set
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k GROUP BY f.g');
+     lion_uj     
+-----------------
+ united, 11 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f WHERE f.fk IN (SELECT k FROM lion_ud) GROUP BY f.g');
+     lion_uj     
+-----------------
+ united, 11 rows
+(1 row)
+
+-- duplicates in the dimension: the forward semi join over its distinct keys,
+-- NULL keys among them, filtered and not, and a dimension of one key repeated
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f WHERE f.fk IN (SELECT k FROM lion_un WHERE region = ''us'') GROUP BY f.g');
+     lion_uj     
+-----------------
+ united, 11 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f WHERE f.fk IN (SELECT k FROM lion_un) AND f.x = 2 GROUP BY f.g');
+     lion_uj     
+-----------------
+ united, 11 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f WHERE EXISTS (SELECT 1 FROM lion_un n WHERE n.k = f.fk AND n.region = ''eu'') GROUP BY f.g');
+     lion_uj     
+-----------------
+ united, 11 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f WHERE f.fk IN (SELECT k FROM lion_un WHERE k % 400 = 8) GROUP BY f.g');
+    lion_uj     
+----------------
+ united, 1 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f WHERE f.fk IN (SELECT k FROM lion_un WHERE k IS NULL) GROUP BY f.g');
+    lion_uj     
+----------------
+ united, 0 rows
+(1 row)
+
+-- a dimension column in the rows, and the fact's key standing for the
+-- dimension's: counted key by key, with the same answers
+SELECT lion_uj('SELECT f.g, d.name, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.region = ''eu'' GROUP BY f.g, d.name');
+     lion_uj      
+------------------
+ per key, 33 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, f.fk, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.region = ''eu'' AND d.k < 200 GROUP BY f.g, f.fk');
+     lion_uj      
+------------------
+ per key, 62 rows
+(1 row)
+
+-- ---- the counters ----
+-- one count per group, of the 'eu' keys' union: the ten groups and NULL
+SELECT lion_uj_counter('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.region = ''eu'' GROUP BY f.g', 'Fact Group Counts');
+ lion_uj_counter 
+-----------------
+              11
+(1 row)
+
+SELECT lion_uj_counter('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.region = ''eu'' GROUP BY f.g', 'Join Keys Looked Up');
+ lion_uj_counter 
+-----------------
+             857
+(1 row)
+
+-- ... and per key with a dimension column: every key in every group
+SELECT lion_uj_counter('SELECT f.g, d.name, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.region = ''eu'' GROUP BY f.g, d.name', 'Fact Group Counts');
+ lion_uj_counter 
+-----------------
+            9119
+(1 row)
+
+-- batches at a small work_mem: a union of each, every group counted against
+-- each, the answers unchanged
+SET work_mem = '64kB';
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k GROUP BY f.g');
+     lion_uj     
+-----------------
+ united, 11 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f WHERE f.fk IN (SELECT k FROM lion_un) GROUP BY f.g');
+     lion_uj     
+-----------------
+ united, 11 rows
+(1 row)
+
+SELECT lion_uj_counter('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k GROUP BY f.g', 'Join Key Batches') > 1 AS batched;
+ batched 
+---------
+ t
+(1 row)
+
+RESET work_mem;
+-- a correlated subquery that rescans the node with a new dimension filter
+SELECT lion_uj('SELECT r.region, (SELECT sum(c) FROM (SELECT f.g, count(*) AS c FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.region = r.region GROUP BY f.g) s) FROM (VALUES (''eu''), (''us''), (''nowhere'')) r(region)');
+    lion_uj     
+----------------
+ united, 3 rows
+(1 row)
+
+-- a dirty heap: deletes and updates on both sides, before and after VACUUM
+DELETE FROM lion_uf WHERE id % 11 = 0;
+UPDATE lion_uf SET g = (g + 1) % 10 WHERE id % 13 = 0;
+UPDATE lion_uf SET fk = 1 + (fk * 3) % 3000 WHERE id % 17 = 0;
+DELETE FROM lion_ud WHERE k % 19 = 0;
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.region = ''eu'' GROUP BY f.g');
+     lion_uj     
+-----------------
+ united, 11 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f WHERE f.fk IN (SELECT k FROM lion_un) GROUP BY f.g');
+     lion_uj     
+-----------------
+ united, 11 rows
+(1 row)
+
+VACUUM lion_uf;
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f JOIN lion_ud d ON f.fk = d.k WHERE d.region = ''eu'' GROUP BY f.g');
+     lion_uj     
+-----------------
+ united, 11 rows
+(1 row)
+
+SELECT lion_uj('SELECT f.g, count(*) FROM lion_uf f WHERE f.fk IN (SELECT k FROM lion_un) GROUP BY f.g');
+     lion_uj     
+-----------------
+ united, 11 rows
+(1 row)
+
+DROP TABLE lion_uf, lion_ud, lion_un;
+DROP FUNCTION lion_uj(text), lion_uj_explain(text), lion_uj_counter(text, text);

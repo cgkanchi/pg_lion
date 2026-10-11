@@ -771,6 +771,34 @@ lion_build_level_flush(LionBuildState *bs, LionBuildLevel *lv,
 }
 
 /*
+ * Does a directory leaf take the item that crosses its fill budget?  The
+ * leaf's fill lands on whichever side of the budget is nearer: the item is
+ * added when the page would be over the budget by less than it is short of
+ * it without the item - its high key counted either way, as the item's own
+ * key stands for the next page's first - and the page still holds it.  An
+ * item small against the budget crosses it by less than half its own size,
+ * so the fill target keeps its meaning; a large INLINE entry, of which
+ * a page holds a handful, used to leave most of an entry's room empty on
+ * every leaf - four entries of 1.55 kB, 76% full, where a fifth makes 95% -
+ * and now fills the page past the budget instead when that is nearer
+ * (DESIGN.md §21).  The internal levels keep their own rule
+ * (lion_build_level_add()).
+ */
+static inline bool
+lion_build_leaf_crosses(const LionBuildLevel *lv, Size need, Size hkneed,
+						Size budget)
+{
+	double		over;
+	double		short_;
+
+	if (lv->level != 0 || lv->used + need + hkneed > LION_PAGE_CAPACITY)
+		return false;
+	over = (double) (lv->used + need + hkneed) - (double) budget;
+	short_ = (double) budget - (double) (lv->used + hkneed);
+	return over < short_;
+}
+
+/*
  * Add one item to a level, flushing the open page first when it no longer
  * fits.
  *
@@ -799,7 +827,8 @@ lion_build_level_add(LionBuildState *bs, LionBuildLevel *lv,
 	 */
 	while (lv->nitems > 0 && lv->used + need + hkneed > budget &&
 		   (lv->nitems >= minitems ||
-			lv->used + need + hkneed > LION_PAGE_CAPACITY))
+			lv->used + need + hkneed > LION_PAGE_CAPACITY) &&
+		   !lion_build_leaf_crosses(lv, need, hkneed, budget))
 		lion_build_level_flush(bs, lv, item, false);
 
 	Assert(lv->nitems == 0 || lv->used + need <= LION_PAGE_CAPACITY);

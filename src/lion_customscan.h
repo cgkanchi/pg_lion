@@ -277,6 +277,12 @@
 										 * rows then handed up in their own,
 										 * and the path claims the child's
 										 * pathkeys */
+#define LION_JOINFLAG_UNITE		0x100	/* grouped by a fact column with no
+										 * dimension column in the rows: a
+										 * batch's keys are united once and
+										 * each group counted against the
+										 * union ("Grouped by a fact column,
+										 * the keys united") */
 
 /*
  * Where an FK-side join's time goes (DESIGN.md §27, "Where a key's time
@@ -1655,6 +1661,19 @@ typedef struct LionFactGroupState
 	int			rowpos;
 	int64		groupcounts;
 	int64		workergroupcounts;
+
+	/*
+	 * The keys united (LION_JOINFLAG_UNITE): a turn's copies of the union of
+	 * its batch's keys ANDed with the fact filters, in unitecxt, each counted
+	 * beside every group; and the batch entries whose key repeats the one
+	 * before it, counted key by key.  nunited is -1 for a turn counted key by
+	 * key, every key.
+	 */
+	MemoryContext unitecxt;
+	LionPostingSet *united;
+	int			nunited;
+	int		   *dups;
+	int			ndups;
 } LionFactGroupState;
 
 /*
@@ -1861,6 +1880,9 @@ typedef struct LionJoinState
 								 * path, whose rows are the outer side's */
 	bool		ordered;		/* LION_JOINFLAG_ORDERED: ... handed up in
 								 * the child's order */
+	bool		unite;			/* LION_JOINFLAG_UNITE: a fact column's
+								 * groups counted against the union of a
+								 * batch's keys */
 	bool		collected;
 	bool		filtered;
 	LionPostingSet filter;
@@ -2963,7 +2985,7 @@ extern Cost lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 								  List *ors, double dimrows, double found,
 								  bool exists, double rowbytes, int workers,
 								  bool *collect, bool *walk, bool force,
-								  double *reads);
+								  double *reads, bool *unite);
 
 /* lion_plan_fkjoin.c */
 extern double lion_leaf_turn_share(PlannerInfo *root, RelOptInfo *rel);
@@ -3022,6 +3044,7 @@ extern void lion_rescan_join_agg(CustomScanState *node);
 extern void lion_join_locate_where(LionCountScanState *st);
 extern void lion_join_switch_reset(LionCountScanState *st);
 extern void lion_join_batch_reset(LionCountScanState *st);
+extern void lion_join_unite_release(LionCountScanState *st);
 extern TupleTableSlot *lion_next_join_row(LionCountScanState *st);
 
 /* lion_exec_locate.c */
