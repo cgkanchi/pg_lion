@@ -2,7 +2,8 @@
 --
 -- A container key with fewer than LION_SPARSE_THRESHOLD (4) members does not
 -- get a container of its own: its (ckey, lo) pairs live in a sparse segment,
--- an item of at most 682 pairs that shares the container header.  This file
+-- an item that shares the container header and holds up to 255 bytes of
+-- delta-coded TIDs (at most 255 pairs, about 85 at 3 bytes a pair).  This file
 -- checks the format end to end: what ambuild produces, what aminsert does
 -- when a key crosses the threshold or a segment overflows, what VACUUM leaves
 -- behind, and that scans, lion_index_count() and the count pushdown all
@@ -220,8 +221,9 @@ SELECT lion_sp_ccmp('sp_thr_k', 'sp_thr', 'k', '1');
  *
  * Key 1 takes three rows out of every 64 (three members per container key,
  * one below the threshold), so its posting set is nothing but segments, and
- * with 235 container keys it overflows the 682-pair maximum: the segment
- * being appended to is closed at 682 pairs and a new one is started.  Every
+ * with 235 container keys it overflows a segment's 255 bytes many times over:
+ * the segment being appended to is closed when the next pair does not fit,
+ * and a new one is started.  Every
  * sixteenth container key is left without a row of key 1, which is where the
  * inserts below will go.
  */
@@ -235,7 +237,7 @@ SELECT i,
   FROM generate_series(1, 16000) i;
 
 SELECT count(*) AS rows_of_key_1 FROM sp_wide WHERE k = 1;
-SELECT (SELECT count(*) FROM sp_wide WHERE k = 1) > 682 AS more_than_one_segment;
+SELECT (SELECT count(*) FROM sp_wide WHERE k = 1) > 255 AS more_than_one_segment;
 SELECT containers, sparse_segments > 1 AS several_segments,
 	   sparse_members = ntids AS every_tid_in_a_segment
   FROM lion_index_stats('sp_wide_k');
@@ -261,9 +263,9 @@ SELECT lion_index_verify('sp_wide_k', true);
 
 /*
  * Three rows, one container key, three members: below the threshold, so they
- * stay pairs -- but the segment that covers that container key is at its
- * 682-pair maximum, so it has to split in half at a container key boundary
- * first.  One more segment, still no container.
+ * stay pairs -- but the segment that covers that container key is full, so
+ * it has to split in half at a container key boundary first.  One more
+ * segment, still no container.
  */
 INSERT INTO sp_wide
 SELECT 20000 + i, 1, repeat('y', 7000) FROM generate_series(1, 3) i;
@@ -393,7 +395,82 @@ SELECT lion_sp_pd('SELECT few, count(*) FROM sp_hi GROUP BY few');
 SELECT lion_index_verify('sp_hi_k', true);
 SELECT lion_index_verify('sp_hi_few', true);
 
-DROP TABLE sp_hi, sp_mix, sp_thr, sp_wide;
+/* ------------------------------------------------------------------ *
+ * Appends and scattered inserts into delta-coded segments
+ * ------------------------------------------------------------------ */
+/*
+ * A segment is a stream of varints, each TID's distance from the one before
+ * (§13): an insert in heap-append order adds a varint at the tail and
+ * rewrites the header, and one into the middle of the heap rewrites the tail
+ * from where it goes in.  sp_vb's index is built empty, so every pair comes
+ * through aminsert: first in heap order, a key's rows from a few blocks to
+ * several hundred apart (deltas of two and three bytes), then into the room
+ * VACUUM leaves in the middle of the heap.
+ */
+CREATE TABLE sp_vb (i int NOT NULL, k int NOT NULL, pad text)
+	WITH (autovacuum_enabled = off);
+CREATE INDEX sp_vb_k ON sp_vb USING lion (k);
+-- k 0 .. 4999: a row in every 5000, some 30 heap blocks apart, two or three
+-- a container key; k 200000: three rows, hundreds of blocks apart
+INSERT INTO sp_vb
+SELECT i, CASE WHEN i IN (1, 75000, 150000) THEN 200000 ELSE i % 5000 END,
+	   repeat('x', 20)
+  FROM generate_series(1, 150000) i;
+SELECT sparse_segments > 100 AS has_segments, sparse_members > 100000 AS mostly_sparse,
+	   ntids
+  FROM lion_index_stats('sp_vb_k');
+SELECT lion_index_verify('sp_vb_k', true);
+SELECT lion_sp_ccmp('sp_vb_k', 'sp_vb', 'k', '7');
+SELECT lion_sp_ccmp('sp_vb_k', 'sp_vb', 'k', '4999');
+SELECT lion_sp_ccmp('sp_vb_k', 'sp_vb', 'k', '200000');
+SELECT lion_sp_cmp('sp_vb', 'k IN (0, 1, 2500, 4999, 200000)');
+SELECT lion_sp_pd('SELECT count(*) FROM sp_vb WHERE k BETWEEN 100 AND 199');
+
+-- room in the middle of the heap, and rows into it: each lands between two
+-- of its key's pairs, or before the first
+DELETE FROM sp_vb WHERE i < 100000 AND i % 50 < 20;
+VACUUM sp_vb;
+SELECT lion_index_verify('sp_vb_k', true);
+INSERT INTO sp_vb
+SELECT i, CASE WHEN i % 1000 = 0 THEN 200000 ELSE i % 5000 END, repeat('y', 20)
+  FROM generate_series(150001, 180000) i;
+SELECT count(*) FILTER (WHERE (ctid::text::point)[0] <
+						(SELECT max((ctid::text::point)[0]) FROM sp_vb WHERE i <= 150000))
+	   > 25000 AS landed_in_the_middle
+  FROM sp_vb WHERE i > 150000;
+SELECT sparse_segments > 100 AS has_segments, ntids = (SELECT count(*) FROM sp_vb)
+	   AS ntids_matches_heap
+  FROM lion_index_stats('sp_vb_k');
+SELECT lion_index_verify('sp_vb_k', true);
+SELECT lion_sp_ccmp('sp_vb_k', 'sp_vb', 'k', '7');
+SELECT lion_sp_ccmp('sp_vb_k', 'sp_vb', 'k', '4999');
+SELECT lion_sp_ccmp('sp_vb_k', 'sp_vb', 'k', '200000');
+SELECT lion_sp_cmp('sp_vb', 'k IN (0, 1, 2500, 4999, 200000)');
+SELECT lion_sp_cmp('sp_vb', 'k BETWEEN 3000 AND 3100');
+SELECT lion_sp_pd('SELECT count(*) FROM sp_vb WHERE k BETWEEN 100 AND 199');
+SELECT lion_sp_pd('SELECT k, count(*) FROM sp_vb WHERE k >= 4990 GROUP BY k');
+
+-- VACUUM takes pairs out of the front, the middle and the end of segments
+DELETE FROM sp_vb WHERE i % 7 = 3 OR i IN (1, 150000);
+VACUUM sp_vb;
+SELECT ntids = (SELECT count(*) FROM sp_vb) AS ntids_matches_heap
+  FROM lion_index_stats('sp_vb_k');
+SELECT lion_index_verify('sp_vb_k', true);
+SELECT lion_sp_ccmp('sp_vb_k', 'sp_vb', 'k', '7');
+SELECT lion_sp_ccmp('sp_vb_k', 'sp_vb', 'k', '200000');
+SELECT lion_sp_cmp('sp_vb', 'k IN (0, 1, 2500, 4999, 200000)');
+SELECT lion_sp_pd('SELECT count(*) FROM sp_vb WHERE k BETWEEN 100 AND 199');
+-- ... and a build from the heap counts what the inserts and VACUUM left
+CREATE TEMP TABLE sp_vb_before AS
+	SELECT k, count(*) AS n FROM sp_vb GROUP BY k;
+REINDEX INDEX sp_vb_k;
+SELECT lion_index_verify('sp_vb_k', true);
+SELECT count(*) AS keys_differing
+  FROM sp_vb_before b
+ WHERE lion_index_count('sp_vb_k', b.k) <> b.n;
+DROP TABLE sp_vb_before;
+
+DROP TABLE sp_hi, sp_mix, sp_thr, sp_wide, sp_vb;
 DROP FUNCTION lion_sp_cmp(text, text);
 DROP FUNCTION lion_sp_ccmp(text, text, text, text);
 DROP FUNCTION lion_sp_pd(text);

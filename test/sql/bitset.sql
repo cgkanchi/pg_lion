@@ -11,9 +11,9 @@
 --	lion_bs		136 rows to a page: its dense sets are NARROWs of width 3
 --	lion_bs4	226 rows to a page: NARROWs of width 4
 --	lion_bs6	226 rows to a page, its indexes built before its rows: they
---				hold no NARROW and are format version 6, and an insert makes
---				an ARRAY it fills a BITSET - BITSETs, which a build no longer
---				makes of any heap's rows
+--				hold no NARROW and their meta pages record none, and an
+--				insert makes an ARRAY it fills a BITSET - BITSETs, which a
+--				build no longer makes of any heap's rows
 --
 -- lion_bs also has two columns, and a row number, the others do not have
 -- room for.  lion_index_stats() shows each index's containers by kind.
@@ -282,7 +282,8 @@ SELECT lbs_check('SELECT id FROM lion_bs WHERE s = 0 AND a = 0', 'bitmap');
 -- The counts recheck the rows of the pages the map cannot vouch for.
 -- VACUUM takes the dead rows out of the bitmaps, and re-optimizes each it
 -- changed: a NARROW of the narrowest width, or an ARRAY again where that is
--- smaller, in the version 8 indexes, and never a NARROW in lion_bs6's.
+-- smaller, in the indexes whose build wrote a NARROW, and never a NARROW in
+-- lion_bs6's.
 UPDATE lion_bs SET z = 1 WHERE id % 7 = 0;
 DELETE FROM lion_bs WHERE id % 10 IN (1, 3, 5, 7);
 UPDATE lion_bs4 SET z = 1 WHERE (ctid::text::point)[1]::int % 7 = 0;

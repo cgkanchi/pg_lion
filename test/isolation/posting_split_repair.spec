@@ -56,10 +56,10 @@
 # Deleting the 2nd and 4th row of every run later turns a RUN into an ARRAY
 # half again as large (~2970 bytes), which is what sends VACUUM to regrow.
 # The other rows take 97 keys from 100 on, ARRAYs of some 120 members a
-# container key, so that the build writes no NARROW and the index is version
-# 6, whose VACUUM makes that ARRAY: in a version 8 index it would make a
-# NARROW of width 4 (DESIGN.md §38), 2056 bytes, which the leaf's spare bytes
-# hold.
+# container key, so that the build writes no NARROW and the meta page
+# records none, so its VACUUM makes that ARRAY: in an index whose build wrote
+# a NARROW it would make a NARROW of width 4 (DESIGN.md §38), 2056 bytes,
+# which the leaf's spare bytes hold.
 
 setup
 {
