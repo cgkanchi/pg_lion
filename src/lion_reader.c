@@ -142,6 +142,10 @@ lion_reader_open(Oid indexoid, LionReadPolicy policy, Snapshot snapshot,
 	Relation	table;
 	Relation	index;
 
+	if (get_rel_relkind(indexoid) == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("relation with OID %u does not exist", indexoid)));
 	if (get_rel_relkind(indexoid) != RELKIND_INDEX)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -176,7 +180,22 @@ lion_reader_open(Oid indexoid, LionReadPolicy policy, Snapshot snapshot,
 		lion_reader_vet(table, index, snapshot, action);
 	}
 	else
+	{
+		const char *why;
+
 		lion_reader_check_rls(table, index, action);
+
+		/*
+		 * Statistics of an index that is not valid, or not ready, describe
+		 * a corpus no query reads: a score from them is not the score
+		 * lion_bm25() would give the row.
+		 */
+		if (!lion_index_usable(index, snapshot, &why))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot %s through index \"%s\" because %s",
+							action, RelationGetRelationName(index), why)));
+	}
 
 	/* not given: still locked until the transaction ends, as the index is */
 	if (heap != NULL)

@@ -114,6 +114,54 @@ SELECT lion_index_count('lcc2_c', 'abc'::text);
 SELECT groups, count FROM lion_index_count_group_stats('lcc2_c');
 SELECT lion_index_count('lcc2_c', 'abc'::text COLLATE "C") AS lion,
 	   (SELECT count(*) FROM lcc2 WHERE t = 'abc' COLLATE "C") AS query;
+-- ---------- GROUP BY under a named collation ----------
+-- The groups are the grouping expression's collation's, not the column's:
+-- `GROUP BY t COLLATE c` may only be driven by an index built under c
+-- (lion_collect_targets()).  None of these is pushed down today - the group
+-- key counts as printed, and under a nondeterministic collation an entry's
+-- key is no spelling the rows need have; a relabelled grouping expression is
+-- not taken either - and every answer is checked against the same query with
+-- the pushdown off.  lcc's column is of the default collation and its one
+-- index on t is under lcc_ci; lcc2's column is under lcc_ci.
+CREATE FUNCTION lcc_groups(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+	lion text;
+	core text;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			how := 'LionCount';
+		END IF;
+	END LOOP;
+	EXECUTE format('SELECT string_agg(s::text, '' '') FROM (%s) s', q) INTO lion;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('SELECT string_agg(s::text, '' '') FROM (%s) s', q) INTO core;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	IF lion IS DISTINCT FROM core THEN
+		RETURN format('MISMATCH: %s got %s, the pushdown off %s', how, lion, core);
+	END IF;
+	RETURN format('%s: %s', how, lion);
+END $$;
+SET enable_hashagg = off;
+SET enable_seqscan = off;
+-- under the column's own collation: four groups; lcc_ci_i is not the index for it
+SELECT lcc_groups('SELECT count(*) FROM lcc GROUP BY t ORDER BY 1');
+-- under lcc_ci: two groups, from lcc_ci_i
+SELECT lcc_groups('SELECT count(*) FROM lcc GROUP BY t COLLATE lcc_ci ORDER BY 1');
+SELECT lcc_groups('SELECT count(*) FROM lcc GROUP BY t COLLATE lcc_ci HAVING count(*) > 100');
+SELECT lcc_groups('SELECT m, count(*) FROM lcc GROUP BY t COLLATE lcc_ci, m ORDER BY 1, 2');
+-- the column under lcc_ci: its own groups from lcc2_i, and four under "C",
+-- which lcc2_i cannot drive
+SELECT lcc_groups('SELECT count(*) FROM lcc2 GROUP BY t ORDER BY 1');
+SELECT lcc_groups('SELECT count(*) FROM lcc2 GROUP BY t COLLATE "C" ORDER BY 1');
+SELECT lcc_groups('SELECT count(*) FROM lcc2 GROUP BY t COLLATE "C" HAVING count(*) > 100');
+RESET enable_hashagg;
+RESET enable_seqscan;
+DROP FUNCTION lcc_groups(text);
 DROP TABLE lcc, lcc2;
 DROP COLLATION lcc_ci;
 \endif

@@ -910,7 +910,7 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 
 			if (!ItemIdIsUsed(iid))
 				continue;
-			entry = (LionEntryTuple *) PageGetItem(page, iid);
+			entry = lion_entry_at(page, iid);
 			if (entry->attno < 1 || entry->attno > ix->ncolumns)
 				continue;
 			/* a key with no row at all, whose entry VACUUM has not deleted */

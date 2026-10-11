@@ -129,8 +129,10 @@ lion_dir_check_page(Relation index, Page page, BlockNumber blk)
 	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
 		LionPageGetOpaque(page)->page_id != LION_PAGE_ID ||
 		(LionPageGetOpaque(page)->flags & (LION_PAGE_BUCKET | LION_PAGE_DIR)) == 0)
-		elog(ERROR, "lion index \"%s\": block %u is not a directory page",
-			 RelationGetRelationName(index), blk);
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": block %u is not a directory page",
+						RelationGetRelationName(index), blk)));
 
 	/*
 	 * Every reader of a non-rightmost page takes its first item as the high
@@ -495,8 +497,10 @@ lion_dir_root(Relation index, LionIndexState *ix, uint32 *height)
 		!LionPageIsMeta(page))
 	{
 		UnlockReleaseBuffer(buf);
-		elog(ERROR, "lion index \"%s\": block 0 is not the meta page",
-			 RelationGetRelationName(index));
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": block 0 is not the meta page",
+						RelationGetRelationName(index))));
 	}
 	meta = LionPageGetMeta(page);
 	root = meta->root;
@@ -504,8 +508,10 @@ lion_dir_root(Relation index, LionIndexState *ix, uint32 *height)
 	UnlockReleaseBuffer(buf);
 
 	if (!BlockNumberIsValid(root))
-		elog(ERROR, "lion index \"%s\": the meta page has no root",
-			 RelationGetRelationName(index));
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": the meta page has no root",
+						RelationGetRelationName(index))));
 
 	ix->meta.root = root;
 	ix->meta.height = h;
@@ -1629,8 +1635,10 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 
 	Assert(!LionPageIncompleteSplit(page));
 	if (isroot && BlockNumberIsValid(oldright))
-		elog(ERROR, "lion index \"%s\": root page %u has a right sibling",
-			 RelationGetRelationName(index), pblk);
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": root page %u has a right sibling",
+						RelationGetRelationName(index), pblk)));
 
 	/*
 	 * Both pages are rebuilt from the items as their line pointers give them,
@@ -2023,8 +2031,10 @@ lion_dir_finish_split(Relation index, Relation heaprel, LionIndexState *ix,
 	Assert(LionPageIncompleteSplit(ppage));
 
 	if (LionPageIsRoot(ppage) || !BlockNumberIsValid(rblk))
-		elog(ERROR, "lion index \"%s\": block %u is flagged as an incomplete split but has no right sibling to link",
-			 RelationGetRelationName(index), pblk);
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": block %u is flagged as an incomplete split but has no right sibling to link",
+						RelationGetRelationName(index), pblk)));
 
 	/* The separator is this page's high key, a copy of its sibling's first. */
 	sep = lion_make_pivot(lion_page_highkey(ppage), LION_ENTRY_DOWNLINK, rblk,
@@ -2084,8 +2094,10 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 	if (LionPageGetOpaque(BufferGetPage(buf))->level <= childlevel)
 	{
 		UnlockReleaseBuffer(buf);
-		elog(ERROR, "lion index \"%s\": no level above %u for block %u",
-			 RelationGetRelationName(index), childlevel, childblk);
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": no level above %u for block %u",
+						RelationGetRelationName(index), childlevel, childblk)));
 	}
 
 	lion_rightwalk_init(&walk);
@@ -2179,8 +2191,10 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 		next = LionPageGetOpaque(page)->rightlink;
 		UnlockReleaseBuffer(buf);
 		if (!BlockNumberIsValid(next))
-			elog(ERROR, "lion index \"%s\": no downlink for block %u at level %u",
-				 RelationGetRelationName(index), childblk, childlevel + 1);
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": no downlink for block %u at level %u",
+							RelationGetRelationName(index), childblk, childlevel + 1)));
 		lion_rightwalk_step(index, &walk, blk, next);
 		blk = next;
 		CHECK_FOR_INTERRUPTS();
