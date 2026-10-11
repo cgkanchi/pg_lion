@@ -78,9 +78,17 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	/* a competitor pinned by a hook an error left (§39) is never read */
 	lion_units_unpin();
 
-	if (stage != UPPERREL_GROUP_AGG)
+	if (stage != UPPERREL_GROUP_AGG && stage != UPPERREL_DISTINCT)
 		return;
 	if (!lion_enable_count_pushdown)
+		return;
+
+	/*
+	 * A DISTINCT is taken where it is the first upper stage over one base
+	 * relation (lion_try_distinct_path()): over a grouping, a window or a
+	 * join it is core's.
+	 */
+	if (stage == UPPERREL_DISTINCT && input_rel->reloptkind != RELOPT_BASEREL)
 		return;
 
 	/*
@@ -124,15 +132,21 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	 */
 	if (!lion_probe_begin(root, input_rel, input_rel->baserestrictinfo))
 	{
-		lion_try_count_path(root, input_rel, output_rel,
-						   (GroupPathExtraData *) extra, NULL);
+		if (stage == UPPERREL_DISTINCT)
+			lion_try_distinct_path(root, input_rel, output_rel);
+		else
+			lion_try_count_path(root, input_rel, output_rel,
+							   (GroupPathExtraData *) extra, NULL);
 		lion_units_unpin();
 		return;
 	}
 	PG_TRY();
 	{
-		lion_try_count_path(root, input_rel, output_rel,
-						   (GroupPathExtraData *) extra, NULL);
+		if (stage == UPPERREL_DISTINCT)
+			lion_try_distinct_path(root, input_rel, output_rel);
+		else
+			lion_try_count_path(root, input_rel, output_rel,
+							   (GroupPathExtraData *) extra, NULL);
 	}
 	PG_FINALLY();
 	{

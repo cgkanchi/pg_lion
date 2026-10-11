@@ -1579,7 +1579,7 @@ refuses the function (`make hookcheck`). A new node adds a line to both.
 
 Planner integration
 - Install `create_upper_paths_hook` (chaining to any previous hook) at `_PG_init`; act only for
-  stage UPPERREL_GROUP_AGG. GUC `pg_lion.enable_count_pushdown` (bool, default on).
+  stage UPPERREL_GROUP_AGG (and UPPERREL_DISTINCT over one base relation, end of this section). GUC `pg_lion.enable_count_pushdown` (bool, default on).
 - Applicability, all required (bail out silently otherwise):
   - input_rel is a single base relation (RELOPT_BASEREL, RTE_RELATION, relkind ordinary table or
     materialized view) — no joins, no subqueries, no old-style inheritance parents. §16 added
@@ -1590,7 +1590,8 @@ Planner integration
   - The relation's table AM is the heap, by routine (§2). ambuild already refuses any other, so
     this only declines an index that got past it; the executor checks again when it opens the
     relation.
-  - The query has no DISTINCT, grouping sets, ORDER BY inside aggregates,
+  - The query has no DISTINCT (but a SELECT DISTINCT over the table alone is a GROUP BY of its
+    keys, at end of this section), grouping sets, ORDER BY inside aggregates,
     FILTER clauses, or aggregates other than `count(*)` (or `count(1)` of any non-NULL constant)
     and the `count(col)` cases of §14 - and, without a GROUP BY, `count(col)` of any one column
     whose index answers `col IS NOT NULL`.
@@ -2569,6 +2570,27 @@ produce - `sum(count(u)) OVER ()` of a count it cannot answer - declines through
 query-level refusal of window functions is gone. The top k (§36) still declines a query with
 windows, whose rows it would cut before the window saw them. 1M rows, `c20, round(100.0 *
 count(*) / sum(count(*)) OVER (), 2) ... GROUP BY c20`: 109 ms to 1.3 ms.
+
+**GROUP BY or DISTINCT with no aggregate.** `SELECT c20, c200 FROM fact GROUP BY 1, 2` and `SELECT
+DISTINCT c200 FROM fact` ask for the keys that have a row, each once - which is what a GROUP BY
+walk emits already: a group is emitted only when its count of visible rows is not 0, under the
+same visibility rules as any count (§9, §11), so a key whose rows are all dead, or not yet visible
+to the snapshot, is not emitted, as a sequential scan would not see it. The checks used to require
+an aggregate; a GROUP BY with none is taken now, its target holding only grouping columns and
+expressions of them. A DISTINCT is planned at UPPERREL_DISTINCT, where the hook now acts too when
+the stage's input is one base relation - no GROUP BY, aggregate, window, set-returning function or
+DISTINCT ON below it (`lion_try_distinct_path()`). Its keys are the groups of a GROUP BY of the
+same columns: for the build, `processed_groupClause` and `parse->groupClause` are the DISTINCT's
+(core's `processed_distinctClause`, without the columns a WHERE equality pins, which makes the
+query one group as a GROUP BY's do), and the target is the input rel's - core leaves the distinct
+rel's own target empty and its paths carry their input's. The grouping extra is the one a
+partially aggregatable GROUP BY gets, so the parallel, decoded and partitioned forms work as for
+counts, with a Finalize HashAggregate of no aggregates above them. The claimed sort order is the
+GROUP BY's (§21): `SELECT DISTINCT ... ORDER BY` gets a Sort above the node when it is not that
+order. PostgreSQL 18's B-tree skip scan does not compete here: core's DISTINCT over a B-tree is a
+Unique over a full index-only scan, priced as such, and the cost model decides. 1M rows: `SELECT
+DISTINCT c200` 128 ms to 4.6 ms (51 ms with a B-tree on c200); `c20, c200 ... GROUP BY 1, 2`
+127 ms to 15 ms (decoded walk).
 
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 

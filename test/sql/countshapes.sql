@@ -207,6 +207,42 @@ SELECT q, cs_q(q) FROM (VALUES
 -- lion index) is the ordinary plan's
 SELECT cs_q('SELECT a, sum(count(u)) OVER () FROM cs GROUP BY a');
 
+-- ---- GROUP BY or DISTINCT with no aggregate: the keys with a visible row ----
+-- a key whose every row is deleted or updated away, never vacuumed
+INSERT INTO cs SELECT 900000 + i, 40, 4, 40, 'gone', 0 FROM generate_series(1, 50) i;
+UPDATE cs SET a = 41, t = 'moved' WHERE id = 900001;
+DELETE FROM cs WHERE id > 900000;
+INSERT INTO cs VALUES (900100, 42, 1, NULL, NULL, 0);
+SELECT cs_plan('SELECT DISTINCT a FROM cs');
+SELECT cs_plan('SELECT a, b FROM cs GROUP BY 1, 2');
+SELECT cs_plan('SELECT DISTINCT a FROM cs ORDER BY a DESC');
+SELECT q, cs_q(q) FROM (VALUES
+	('SELECT DISTINCT a FROM cs'),
+	('SELECT DISTINCT t FROM cs'),
+	('SELECT DISTINCT n FROM cs WHERE b = 1'),
+	('SELECT DISTINCT a, b FROM cs'),
+	('SELECT DISTINCT a, b, n FROM cs'),
+	('SELECT DISTINCT a FROM cs WHERE a = 3'),
+	('SELECT DISTINCT a FROM cs WHERE a = 40'),
+	('SELECT DISTINCT a + 1 FROM cs'),
+	('SELECT DISTINCT a FROM cs WHERE n NOT IN (1, 2) ORDER BY a DESC'),
+	('SELECT DISTINCT t FROM cs ORDER BY t LIMIT 3'),
+	('SELECT a FROM cs GROUP BY a'),
+	('SELECT a, b FROM cs GROUP BY 1, 2'),
+	('SELECT t || ''!'' FROM cs WHERE b = 2 GROUP BY t'),
+	('SELECT a FROM cs WHERE a = 3 GROUP BY a'),
+	('SELECT a FROM cs WHERE a = 40 GROUP BY a'),
+	('SELECT a, n FROM cs WHERE b IN (1, 2) GROUP BY a, n'),
+	('SELECT coalesce(n, -1) FROM cs GROUP BY 1')
+) v(q);
+-- DISTINCT ON, DISTINCT over a GROUP BY, and a column with no lion index are
+-- the ordinary plan's
+SELECT q, cs_q(q) FROM (VALUES
+	('SELECT DISTINCT ON (a) a, b FROM cs ORDER BY a, b'),
+	('SELECT DISTINCT count(*) FROM cs GROUP BY a'),
+	('SELECT DISTINCT u FROM cs')
+) v(q);
+
 DROP FUNCTION cs_q(text);
 DROP FUNCTION cs_plan(text);
 DROP TABLE cs, csd;
