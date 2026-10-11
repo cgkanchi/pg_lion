@@ -7,8 +7,9 @@
 # would invert the lock order), takes the entry page blocking, and retries the
 # cleanup lock.  While the container page was unlocked anything may have
 # happened to it: in particular the insert that held the entry page may have
-# overflowed this one-page set and pushed its root down, leaving an INTERNAL
-# page of downlinks at the block VACUUM is about to re-filter.  Filtering that
+# given this set its 17th leaf, and so pushed down its head - the first leaf of
+# a set without an internal level (DESIGN.md §22) - leaving an INTERNAL page
+# of downlinks at the block VACUUM is about to re-filter.  Filtering that
 # page as a leaf reads pivots as containers: an assertion on a cassert build,
 # skipped postings and dead TIDs left behind on a release build.  The rule that
 # closes it: after the retry, re-check the page type and restart the descent,
@@ -20,23 +21,30 @@
 #   lion-vacuum-entry-busy     the entry page was busy; VACUUM let go of the
 #                              container page and holds nothing but its pin
 #
-# Sequence: VACUUM parks at the first point on k = 1's page (the only entry
-# with dead TIDs).  s2's INSERT takes the directory leaf, descends to that same
-# page and blocks on VACUUM's cleanup lock.  s3 waits until s2 is waiting,
-# then wakes VACUUM: the entry page is busy (s2 holds it), so VACUUM unlocks
-# the container page and parks at the second point.  s2 now runs to completion
-# and pushes the root down (height 0 -> 1, root block kept).  s3 wakes VACUUM,
-# which retries the cleanup lock on the old root - now internal - and must
-# restart its descent.  Afterwards every dead TID is gone and verify() is
-# clean.
+# Sequence: VACUUM parks at the first point on k = 1's head (the only entry
+# with dead TIDs, all in its first container).  s2's INSERT appends through
+# the entry's tail until the tail is full; then it takes the directory leaf,
+# and its walk from the head blocks on VACUUM's cleanup lock.  s3 waits until
+# s2 is waiting, then wakes VACUUM: the entry page is busy (s2 holds it), so
+# VACUUM unlocks the container page and parks at the second point.  s2 now
+# runs to completion and pushes the head down (height 0 -> 1, head block
+# kept).  s3 wakes VACUUM, which retries the cleanup lock on the old head -
+# now internal - and must restart its descent.  Afterwards every dead TID is
+# gone and verify() is clean.
+#
+# k = 1 has 1000 rows in the first container key and 30,000 more interleaved
+# with k = 5's, wide rows, so that each container is a BITSET filling a leaf
+# of its own: about 14 leaves a key, and s2_grow's 20,000 more go past 16.
 setup
 {
 	SET synchronous_commit = on;
 	CREATE EXTENSION IF NOT EXISTS pg_lion;
 	CREATE EXTENSION IF NOT EXISTS injection_points;
-	CREATE TABLE vrp (id int, k int NOT NULL);
+	CREATE TABLE vrp (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x');
 	INSERT INTO vrp SELECT i, i % 4 FROM generate_series(1, 4000) i;
 	CREATE INDEX vrp_k ON vrp USING lion (k) WITH (inline_limit = 64);
+	INSERT INTO vrp SELECT 10000 + i, CASE WHEN i % 2 = 0 THEN 1 ELSE 5 END
+	  FROM generate_series(1, 60000) i;
 	CREATE FUNCTION vrp_wait_for_insert() RETURNS boolean
 	LANGUAGE plpgsql AS $fn$
 	DECLARE
@@ -94,8 +102,8 @@ step s1_check	{
 session s2
 setup			{ SET synchronous_commit = on; }
 step s2_predel	{ DELETE FROM vrp WHERE k = 1 AND id <= 2000; }
-# Every other row, so the new members are ARRAY and BITSET containers that
-# overflow the page (consecutive offsets would compress into a short RUN).
+# Every other row, so the new members are BITSET containers that fill leaves
+# (consecutive offsets would compress into a short RUN).
 step s2_grow	{
 	INSERT INTO vrp SELECT 100000 + i, CASE WHEN i % 2 = 0 THEN 1 ELSE 5 END
 	  FROM generate_series(1, 40000) i;
@@ -130,12 +138,12 @@ step s3_wake2	{
 
 permutation
 	s3_prep					# all-visible heap
-	s3_root					# the root's block number
+	s3_root					# the head's block number
 	s2_predel				# 500 dead rows under k = 1, heap not vacuumed
-	s3_before				# a one-page set: the root is the leaf
-	s1_vacuum(s3_wake2)	# parks holding the cleanup lock on that page
+	s3_before				# no internal level: the head is the first leaf
+	s1_vacuum(s3_wake2)	# parks holding the cleanup lock on the head
 	s2_grow(*, s3_wake1)	# takes the entry page, blocks on the cleanup lock
 	s3_wake1				# VACUUM finds the entry page busy, parks unlocked
-	s3_after				# s2 has pushed the root down: internal, same block
-	s3_wake2				# VACUUM retries on the old root
+	s3_after				# s2 has pushed the head down: internal, same block
+	s3_wake2				# VACUUM retries on the old head
 	s1_check

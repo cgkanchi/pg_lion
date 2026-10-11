@@ -15,7 +15,7 @@ step s3_leaves:
 
 several_leaves|height
 --------------+------
-t             |     1
+t             |     0
 (1 row)
 
 s3: NOTICE:  table "psr_leaves" does not exist, skipping

@@ -33,14 +33,18 @@
 #    old root is a page without the root flag at the height the check expects:
 #    settled by reading the meta page again.
 # Posting trees:
-#  * posting_split (vp: two keys on alternate rows, bitset leaves under a
-#    root): parked after one set's leaves are walked, an insert splits its last
-#    leaf.  The level above holds a downlink the leaf walk never saw, and the
-#    entry's counters moved: the set is walked again.
-#  * pushdown (vq: four one-page sets): parked after one of them is walked, an
-#    insert pushes its root down (the root keeps its block) and adds a key
-#    whose set spills and grows at once.  The first set is walked again; the
-#    new key's pages are candidates, and its root is found through its entry.
+#  * posting_split (vp: two keys on alternate wide rows, each set more than
+#    the 16 bitset leaves a set without an internal level may have, so a tree
+#    with a root): parked after one set's leaves are walked, an insert splits
+#    its last leaf.  The level above holds a downlink the leaf walk never saw,
+#    and the entry's counters moved: the set is walked again.
+#  * pushdown (vq: three one-page sets, and one of 14 leaves and no level
+#    above them, DESIGN.md §22): parked after one of them is walked, an insert
+#    splits the leaves of the 14-leaf set until the next split would make a
+#    17th, which pushes its head down under a new root (the head keeps its
+#    block), and adds a key whose set spills and grows at once.  The first set
+#    is walked again; the new key's pages are candidates, and its head is
+#    found through its entry.
 #  * spill: parked after the leaves of vc, an existing INLINE entry spills to
 #    a posting tree.  The new root is a candidate, found through the entry.
 #  * held: a set a writer changes under every walk is walked
@@ -98,14 +102,21 @@ setup
 
 	/* Made before the rows, so that the inserts make its sets, as BITSETs,
 	 * a leaf each: a build would make NARROWs of width 4 (DESIGN.md §38),
-	 * three to a leaf, whose last leaf the writers below do not split. */
-	CREATE TABLE vp (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
+	 * three to a leaf, whose last leaf the writers below do not split.  Wide
+	 * rows, about 75 to a heap page, give each set some 21 leaves. */
+	CREATE TABLE vp (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x')
+	  WITH (autovacuum_enabled = off);
 	CREATE INDEX vp_k ON vp USING lion (k) WITH (inline_limit = 64);
-	INSERT INTO vp SELECT i, i % 2 FROM generate_series(1, 60000) i;
+	INSERT INTO vp SELECT i, i % 2 FROM generate_series(1, 90000) i;
 
-	CREATE TABLE vq (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
+	/* Keys 0 to 3 one page each from the build; then keys 0 and 7 on
+	 * alternate wide rows, 14 bitset leaves each. */
+	CREATE TABLE vq (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x')
+	  WITH (autovacuum_enabled = off);
 	INSERT INTO vq SELECT i, i % 4 FROM generate_series(1, 4000) i;
 	CREATE INDEX vq_k ON vq USING lion (k) WITH (inline_limit = 64);
+	INSERT INTO vq SELECT 10000 + i, CASE WHEN i % 2 = 0 THEN 0 ELSE 7 END
+	  FROM generate_series(1, 60000) i;
 
 	CREATE TABLE v_before AS
 	SELECT (SELECT leaf_pages FROM lion_index_stats('vc_k')) AS vc_leaves,
@@ -211,7 +222,9 @@ step s2_split_root	{
 step s2_spill		{
 	INSERT INTO vc SELECT 'key1' || repeat('x', 100) FROM generate_series(1, 200);
 }
-step s2_grow_p		{ INSERT INTO vp SELECT 100000 + i, 0 FROM generate_series(1, 30000) i; }
+# After s2_free_p and VACUUM the first 45000 rows take the heap slots k = 1
+# left, and set bits in leaves that are there; the rest split leaves.
+step s2_grow_p		{ INSERT INTO vp SELECT 100000 + i, 0 FROM generate_series(1, 60000) i; }
 step s2_touch_p		{ INSERT INTO vp SELECT 200000 + i, 0 FROM generate_series(1, 100) i; }
 step s2_grow_new	{ INSERT INTO vp SELECT 100000 + i, 2 FROM generate_series(1, 30000) i; }
 step s2_push_q		{
@@ -365,7 +378,7 @@ permutation
 	s1_park_set
 	s1_verify_q(s3_wake_set)	# parks with a one-page set walked
 	s3_at_set				# ... and it really is parked there
-	s2_push_q					# pushes its root down; a new key spills
+	s2_push_q					# pushes its head down; a new key spills
 	s3_wake_set
 	s1_done						# the check has ended
 	s3_pushdown
