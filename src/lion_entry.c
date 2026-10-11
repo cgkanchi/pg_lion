@@ -428,6 +428,11 @@ lion_entry_add_posext(const LionEntryTuple *shape, Size *size)
 	(void) lion_entry_copy_reshaped(copy, shape, flags);
 	lion_entry_set_ntids(copy, lion_entry_ntids(shape));
 	lion_entry_set_ncontainers(copy, lion_entry_ncontainers(shape));
+	if (lion_entry_is_chain(shape))
+	{
+		lion_entry_set_head(copy, lion_entry_head(shape));
+		lion_entry_set_tail(copy, lion_entry_tail(shape));
+	}
 	*size = payoff;
 	return copy;
 }
