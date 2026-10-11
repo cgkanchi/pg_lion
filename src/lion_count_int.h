@@ -489,13 +489,15 @@ typedef struct LionSetCursor
 	uint32		mintarget;
 
 	/*
-	 * The sparse segment being expanded, and how far into its pairs.  segbuf
+	 * The sparse segment being expanded, and a reader of its pairs standing
+	 * on the next one to present (seghave says there is one).  segbuf
 	 * receives one container key's members at a time, which a well-formed
 	 * segment keeps below LION_SPARSE_THRESHOLD; it is sized for that and
 	 * grown only if a segment ever holds more (segcap is its capacity).
 	 */
 	const LionContainer *seg;
-	uint32		segpos;
+	LionSparseIter segit;
+	bool		seghave;
 	LionContainer *segbuf;
 	Size		segcap;
 

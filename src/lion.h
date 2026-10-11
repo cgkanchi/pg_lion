@@ -425,13 +425,28 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * makes one only of a NARROW, which it widens, so that an index of version 6
  * or 7 stays one, readable by the builds before this one, until it is
  * rebuilt.
+ *
+ * Version 9 (DESIGN.md §13) stores a sparse segment's pairs as a stream of
+ * delta varints instead of uint32 ckeys[] and uint16 los[], which
+ * reinterprets every segment of every older index, so versions 6, 7 and 8
+ * are no longer read: opening one is an ERROR whose hint asks for REINDEX.
+ * Every index this build writes is version 9, whatever it holds: whether a
+ * key column has summaries is what summary_cols says (§32), and whether the
+ * index may hold NARROW items (§38) is the LION_META_NARROW bit of
+ * order_flags, set when its build wrote one - the rule version 8 was, kept:
+ * VACUUM makes a NARROW only in such an index, and inserts make none.  The
+ * leaf-root posting trees share the number.
  */
-#define LION_VERSION			6	/* the base format every index has */
+#define LION_VERSION			6	/* the base format of versions 6 .. 8 */
 #define LION_VERSION_SUMMARIES	7	/* ... plus the summaries of §32 */
 #define LION_VERSION_NARROW		8	/* ... plus the NARROW items of §38 */
+#define LION_VERSION_V9			9	/* varbyte sparse segments; another
+									 * worker's leaf-root posting trees will
+									 * share this version */
 
-/* May an index of this meta page's version hold NARROW items (§38)? */
-#define LION_META_ALLOWS_NARROW(meta)	((meta)->version >= LION_VERSION_NARROW)
+/* May the index of this meta page hold NARROW items (§38)? */
+#define LION_META_ALLOWS_NARROW(meta) \
+	(((meta)->order_flags & LION_META_NARROW) != 0)
 
 typedef struct LionMetaPageData
 {
@@ -511,6 +526,14 @@ typedef struct LionMetaPageData
  * REINDEX.
  */
 #define LION_META_POSITIONS			0x0002
+
+/*
+ * The build wrote a NARROW item (DESIGN.md §38), so VACUUM may make NARROWs
+ * of the items it rewrites; an index without it has none, and gets none
+ * until it is rebuilt.  Version 8 said this with its number; version 9
+ * (§13) says it here, as LION_META_POSITIONS does for positions.
+ */
+#define LION_META_NARROW			0x0004
 
 /* ordered_cols has one bit per key column. */
 StaticAssertDecl(INDEX_MAX_KEYS <= 32,
@@ -1996,14 +2019,14 @@ extern void lion_meta_record_order(LionMetaPageData *meta, LionIndexState *ix);
 
 /*
  * ... and which key columns got summary posting sets, with their bucket size
- * (DESIGN.md §32).  None leaves the meta page at version 6; any makes it 7.
+ * (DESIGN.md §32).
  */
 extern void lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
 									   uint32 bucket_tids);
 
 /*
- * ... and whether the build wrote a NARROW item (DESIGN.md §38), which makes
- * the meta page version 8; after lion_meta_record_summaries().
+ * ... and whether the build wrote a NARROW item (DESIGN.md §38), which sets
+ * LION_META_NARROW.
  */
 extern void lion_meta_record_narrow(LionMetaPageData *meta, bool narrow);
 

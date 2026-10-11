@@ -259,7 +259,7 @@ SELECT lion_index_verify('lion_sm_k', true);
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE k >= 0');
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE k > 41');
 
--- ---------- 7. old format: an index without summaries, and REINDEX ----------
+-- ---------- 7. an index without summaries, and REINDEX ----------
 -- The format version, read off the meta page (block 0: LionMetaPageData
 -- follows the 24-byte page header, with its version at +4), and how many key
 -- columns have summaries.
@@ -271,7 +271,7 @@ LANGUAGE sql AS $$
 $$;
 CREATE TABLE lion_sm_old (u int NOT NULL, g int NOT NULL);
 INSERT INTO lion_sm_old SELECT i, i % 5 FROM generate_series(1, 5000) i;
--- summaries = off is the default, and writes format 6, as every index before
+-- summaries = off is the default; the format version is 9 either way
 CREATE INDEX lion_sm_old_u ON lion_sm_old USING lion (u, g);
 VACUUM (FREEZE, ANALYZE) lion_sm_old;
 SELECT * FROM lion_sm_meta('lion_sm_old_u');
