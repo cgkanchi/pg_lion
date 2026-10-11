@@ -11213,6 +11213,88 @@ declines (an expression, two fact columns, a `count(DISTINCT)` beside, a numeric
 partition of several kinds without an index on kind - which declines only where a partition needs
 it).
 
+### Grouped by a fact column, the keys united (2026-10-11)
+
+`SELECT f.c20, count(*) FROM fact f WHERE f.c200 IN (SELECT id FROM dim200 WHERE region =
+'region3') GROUP BY f.c20` over 5M rows counted each of the 29 keys in each of the 20 groups: 580
+counts, every one of them reading its key's set again and seeking the group's set at each of its
+containers, 871,740 key containers in all, 393 to 600 ms. The same keys given as an array, `=
+ANY ((SELECT array_agg(id) ...))`, are an IN list - collected once, every group counted against it
+- in 12 ms. Nothing in the rows needed the keys apart: no dimension column is in them, and the
+Finalize Agg adds up a group's rows whatever key they came from.
+
+**What is counted.** When the target and the HAVING read no column of a dimension row - none of
+its own, nor the fact's join column standing for its key ("Grouped by the join key") - and the
+aggregates are counts alone, a batch's keys are united: their sets located once, each letting go of
+its pin as soon as it is located, made one union source of a collection with the fact filters - or
+their copy - ANDed in (`lion_sources_collect()`), and each group of the fact column counted once
+against that copy (`lion_join_unite_keys()`, `lion_join_count_united()`). A group's row then
+carries the count of all the batch's keys together, and the Finalize Agg adds up the rows of each
+group as before - one per batch and relation now, where it was one per key. EXPLAIN says `Fact
+Groups Counted Against: united join keys`, and `Fact Group Counts` is the groups (times the
+batches) rather than the keys times the groups.
+
+**Why it is exact.** The union's count in a group is the sum of the keys' counts there because the
+keys' fk sets are disjoint: a fact row has one fk value, and the keys are distinct under the
+join's equality - an inner join's by the dimension's unique key, the forward semi join's because
+they are its distinct keys - which is the fk index's, so no two keys locate one entry. And the copy
+is safe on exactly the terms the fact filters' copy is ("Why a stale copy is safe"): it is read
+after the query's snapshot was taken, so it misses no row the snapshot sees, and it is only ever
+counted beside a group's set, located from the index and pinned as an IN list's is, which carries
+the §9 interlock for any dead TID the copy still lists; the dimension rows are read by the child
+under the same snapshot as before. A key the same bytes as the one before it in the batch - which
+that proof says does not come - is left out of the union and counted key by key, so the rows would
+still add up to the join's.
+
+**Bounds and fall-backs.** The keys located at once are what work_mem holds of them
+(`lion_array_batch_size()` sets at most); past that they are united a share at a time, each share a
+copy of its own counted beside every group, which adds up the same. The copies take a hash table's
+memory (`get_hash_memory_limit()`) and spill past it as the filters' copy does. A turn that cannot
+be united - a hot standby, which makes no copy; a range the counts walk (§32), which is not a set
+to collect; a copy that fails - is counted key by key, every key. A partition whose bounds give
+the column its value has one group, and its turn counts each key as before. With dimension columns
+in the rows, nothing changes: each key is counted in each group.
+
+**Cost.** `lion_cost_fkjoin_path()` prices both ways and takes the cheaper (`*unite`). Per key,
+each key is counted once per group, and every count after the first reads the key's set again;
+every count also seeks the group's set at the key's containers (`lion_cost_fkjoin_group_counts()`).
+Both of those used to be left out - only the count's set-up and its filter probes were multiplied
+by the groups - which priced the 580 counts above at 77, against core's 125,094 for 345 ms; they
+were chosen, rightly against core, at a twentieth of the time they took. United, the found keys'
+sets are read once into the collection (a set's cursor, its containers, the union's image at each
+container key, the filters sought at the keys of the sparser side, the survivors copied), and each
+group is a count against the copy (`lion_cost_fkjoin_united_counts()`), once a batch. A plan that
+unites makes no copy of the fact filters of its own: the union is ANDed with the filters as it is
+made.
+
+Measured (2026-10-11, 5M rows, `max_parallel_workers_per_gather` 2, `work_mem` 64MB, best of 3):
+
+| query | before | after | core |
+|---|---|---|---|
+| `c20`, `c200 IN (29 keys of a region)` | 438 ms, 580 counts | 14 ms, 20 counts | 345 ms |
+| the same as an inner join | - | 22 ms | 311 ms |
+| ... and `f.c2 = 1` | - | 20 ms | 264 ms |
+| `c20`, every key (200) | - | 43 ms | 592 ms |
+| `c2`, `d.flag` (half the keys) | - | 15 ms | 503 ms |
+| `c20k`, 29 keys (20,000 groups) | - | 209 ms | 412 ms |
+| `c20, d.name`, 29 keys (per key, unchanged) | - | 391 ms | 351 ms |
+
+The last row is a per-key plan, chosen and slower than core's: priced at 44,649 against core's
+126,053 even with the key sets read again counted, the per-key counts remain underpriced against
+core's aggregate on this table, a calibration question this change leaves alone.
+
+`test/sql/fkjoin_unite.sql`: every answer against the pushdown off with sequential scans only - an
+inner join grouped by a fact column under a dimension filter, a fact filter, both, HAVING, ORDER BY
+and LIMIT; NULL dimension keys alone and among others; keys without fact rows; an empty dimension
+result and a fact filter that selects nothing, each a value the planner does not see; a dimension
+that selects every key, joined and as an IN; the forward semi join over a non-unique key - duplicated
+and NULL keys, one key three times, an EXISTS; a dimension column and the fact's join key in the
+rows, counted key by key; the counters (`Fact Group Counts` the groups, against the keys times the
+groups per key); batches at a work_mem of 64 kB; a correlated subquery that rescans the node; and a
+dirty heap before and after VACUUM. `test/sql/fkjoin_factgroup.sql`'s queries with no dimension
+column in the rows - partitioned, parallel, an OR of filters per kind with a range - now unite, with
+their answers unchanged.
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a

@@ -14,6 +14,8 @@
 #include "lion_customscan.h"
 #include "lion_plan_private.h"
 
+static double lion_join_batch_rows(double rowbytes);
+
 /*
  * Is the aggregate one the FK-side join can answer (DESIGN.md §27)?  Its
  * partial value per dimension row is that row's count of joined fact rows,
@@ -1061,7 +1063,8 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 					  const LionCountPriv *base, int joinclause, int jointype,
 					  const LionFkJoinAgg *rowagg, bool perrow,
 					  List *whereclauses, List *wherekinds, List *ors,
-					  double dimrows, double found, bool parallel_safe)
+					  double dimrows, double found, bool mayunite,
+					  bool parallel_safe)
 {
 	Query	   *parse = root->parse;
 	CustomPath *cpath;
@@ -1082,6 +1085,7 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	double		rowbytes;
 	bool		collect;
 	bool		walk;
+	bool		unite = false;
 	bool		sum;
 	Cost		run;
 	Cost		sortcost = 0;
@@ -1114,7 +1118,7 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 								jointype != LION_JOIN_INNER ||
 								(emitrows && !counts),
 								rowbytes, workers, &collect, &walk, false,
-								&reads);
+								&reads, mayunite ? &unite : NULL);
 	lion_units_cold(&units, run, reads);
 	if (unique)
 		sortcost = lion_fkjoin_sort_cost(child->rows,
@@ -1133,7 +1137,8 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 		(unique ? LION_JOINFLAG_UNIQUE : 0) |
 		(walk ? LION_JOINFLAG_WALK : 0) |
 		(sum ? LION_JOINFLAG_SUM : 0) |
-		(counts ? LION_JOINFLAG_COUNTS : 0);
+		(counts ? LION_JOINFLAG_COUNTS : 0) |
+		(unite ? LION_JOINFLAG_UNITE : 0);
 
 	/*
 	 * The node starts when its child does - or, when it sorts the child's
@@ -1184,6 +1189,17 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	if (base->fgattno != 0)
 		rows = clamp_row_est(Min(rows * lion_fact_groups_all(root, targets),
 								 fj->joinrel->rows * share));
+
+	/*
+	 * ... and with the keys united, one per group and batch: a relation's
+	 * group has one row, of all the keys of the batch together
+	 */
+	if (unite)
+		rows = clamp_row_est(Min(rows,
+								 lion_fact_groups_all(root, targets) *
+								 ceil(childrows /
+									  Max(lion_join_batch_rows(rowbytes),
+										  1.0))));
 
 	/* ... or one, their sum, when that is all the target wants */
 	if (sum)
@@ -1545,6 +1561,8 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	LionFkJoinAgg *rowagg = NULL;
 	bool		fkkey;
 	bool		perrow;
+	bool		keyrows = false;	/* a dimension row's own column is wanted */
+	bool		mayunite;
 	Var		   *fgvar;
 	LionDriveInfo fgdrive;
 	ListCell   *lc;
@@ -1604,11 +1622,15 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 			{
 				if (!lion_fkjoin_child_has(fj, v))
 					return;
+				keyrows = true;
 				continue;
 			}
 			if (fkkey && v->varno == fj->fkvar->varno &&
 				v->varattno == fj->fkvar->varattno)
+			{
+				keyrows = true;
 				continue;
+			}
 			if (fgvar != NULL && v->varno == fgvar->varno &&
 				v->varattno == fgvar->varattno)
 				continue;
@@ -1842,10 +1864,24 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	perrow = (fgvar == NULL) && lion_fkjoin_groups_per_row(root, fj, fkkey);
 
+	/*
+	 * Grouped by a fact column with nothing of a dimension row in the rows -
+	 * no column of it, nor the fact's key standing for it, in the target or
+	 * the HAVING, and counts alone - the rows of the batch's keys in one
+	 * group are one row's worth to the Finalize Agg, which adds them up: so
+	 * the keys may be united once, and each group counted against the union
+	 * ("Grouped by a fact column, the keys united").  An inner join's - or
+	 * the forward semi join's distinct keys' - fk sets are disjoint, a fact
+	 * row having one fk value, so the union's count in a group is their
+	 * counts' sum there.
+	 */
+	mayunite = (fgvar != NULL && rowagg == NULL && !keyrows &&
+				jointype == LION_JOIN_INNER);
+
 	lion_add_fkjoin_paths(root, rel, output_rel, fj, having, targets,
 						  fj->dimpath, 0, nodetarget, base, joinclause,
 						  jointype, rowagg, perrow, whereclauses, wherekinds,
-						  ors, dimrows, found,
+						  ors, dimrows, found, mayunite,
 						  parallel && fj->dimpath->parallel_safe);
 	if (parallel && fj->jointype == JOIN_UNIQUE_INNER)
 	{
@@ -1888,7 +1924,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 								  whole, workers, nodetarget, base,
 								  joinclause, jointype, rowagg, perrow,
 								  whereclauses, wherekinds, ors, dimrows,
-								  found, true);
+								  found, mayunite, true);
 	}
 	else if (parallel && fj->dimchild->partial_pathlist != NIL)
 	{
@@ -1922,7 +1958,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 								  partial, workers, nodetarget, base,
 								  joinclause, jointype, rowagg, perrow,
 								  whereclauses, wherekinds, ors, dimrows,
-								  dimrows, true);
+								  dimrows, mayunite, true);
 	}
 }
 
@@ -2213,7 +2249,8 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 	run = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar,
 								setup.joinclause, setup.whereclauses,
 								setup.wherekinds, ors, dimrows, dimrows, true,
-								rowbytes, 0, &collect, &walk, false, &reads);
+								rowbytes, 0, &collect, &walk, false, &reads,
+								NULL);
 	lion_units_cold(&units, run, reads);
 
 	/*
@@ -2231,7 +2268,7 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 									 setup.joinclause, setup.whereclauses,
 									 setup.wherekinds, ors, firstrows,
 									 firstrows, true, rowbytes, 0, &collect,
-									 &walk, true, NULL);
+									 &walk, true, NULL, NULL);
 	run = lion_units_price(&units, run);
 	startrun = lion_units_price(&units, startrun);
 	foreach(lc, outerrel->pathlist)
@@ -2279,7 +2316,7 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 										setup.joinclause, setup.whereclauses,
 										setup.wherekinds, ors, childrows,
 										childrows, true, rowbytes, workers,
-										&collect, &walk, false, NULL);
+										&collect, &walk, false, NULL, NULL);
 			/* a participant's first batch, of its share of the child */
 			firstrows = (walk || partitioned) ? Min(perbatch, childrows) : 1.0;
 			startrun = lion_cost_fkjoin_path(root, rel, setup.targets,
@@ -2288,7 +2325,7 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 											 setup.wherekinds, ors, firstrows,
 											 firstrows, true, rowbytes,
 											 workers, &collect, &walk, true,
-											 NULL);
+											 NULL, NULL);
 			run = lion_units_price(&units, run);
 			startrun = lion_units_price(&units, startrun);
 			foreach(lc, outerrel->partial_pathlist)
