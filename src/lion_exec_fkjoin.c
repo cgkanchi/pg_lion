@@ -967,7 +967,7 @@ lion_join_batch_reset(LionCountScanState *st)
 /*
  * Read the next batch: child rows (or distinct keys) until work_mem is full or
  * the child has no more, the rows whose NULL key joins nothing left out but
- * for an anti join, whose rows they are.  Then sort it into the directory's
+ * for an anti join and a LEFT JOIN, whose rows they are.  Then sort it into the directory's
  * order.  False when the child had no row left at all.
  */
 static bool
@@ -1005,7 +1005,7 @@ lion_join_fill_batch(LionCountScanState *st)
 			break;
 		}
 		key = slot_getattr(slot, js->keyresno, &isnull);
-		if (isnull && !anti)
+		if (isnull && !anti && !js->left)
 			continue;
 
 		oldcxt = MemoryContextSwitchTo(js->batch.cxt);
@@ -1159,7 +1159,7 @@ lion_join_next_walked(LionCountScanState *st, int64 *countp)
 		 * found them to select nothing (lion_join_maybe_switch()), no row
 		 * after joins a fact row: only an anti join has rows left.
 		 */
-		if (st->wheremissing && !anti)
+		if (st->wheremissing && !anti && !js->left)
 		{
 			lion_join_batch_reset(st);
 			return false;
@@ -1178,13 +1178,14 @@ lion_join_next_walked(LionCountScanState *st, int64 *countp)
 			/*
 			 * Joins nothing: an anti join's row, which only it batched - or,
 			 * once that copy has been made, any row of it, the rest of the
-			 * batch and the batches after, looked up no more.
+			 * batch and the batches after, looked up no more.  A LEFT JOIN's
+			 * row too, with no fact row.
 			 */
-			if (!anti)
+			if (!anti && !js->left)
 				continue;
 			if (!js->sum)
 				lion_join_batch_row(st, ent);
-			*countp = 1;
+			*countp = anti ? 1 : 0;
 			return true;
 		}
 		js->lookups++;
@@ -1194,7 +1195,7 @@ lion_join_next_walked(LionCountScanState *st, int64 *countp)
 			js->missing++;
 		if (anti)
 			count = 1 - count;	/* no entry, or a test that found nothing */
-		if (count == 0)
+		if (count == 0 && !js->left)
 			continue;
 
 		if (!js->sum)
@@ -1270,7 +1271,7 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
 		 * A copy made part way through that selects nothing ends a semi or
 		 * inner join's run, as walked (lion_join_next_walked()).
 		 */
-		if (st->wheremissing && !anti)
+		if (st->wheremissing && !anti && !js->left)
 		{
 			js->childslot = NULL;
 			return false;
@@ -1290,11 +1291,11 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
 		key = slot_getattr(childslot, js->keyresno, &isnull);
 		if (isnull || st->wheremissing)
 		{
-			/* joins nothing: a row only of an anti join */
-			if (!anti)
+			/* joins nothing: a row only of an anti join, or a LEFT JOIN */
+			if (!anti && !js->left)
 				continue;
 			js->childslot = childslot;
-			*countp = 1;
+			*countp = anti ? 1 : 0;
 			return true;
 		}
 		js->lookups++;
@@ -1313,10 +1314,10 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
 			lion_posting_set_release(&st->groupset);
 			MemoryContextSwitchTo(oldcxt);
 			js->missing++;
-			if (!anti)
+			if (!anti && !js->left)
 				continue;
 			js->childslot = childslot;
-			*countp = 1;
+			*countp = anti ? 1 : 0;
 			return true;
 		}
 
@@ -1330,7 +1331,7 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
 
 		if (anti)
 			count = 1 - count;
-		if (count == 0)
+		if (count == 0 && !js->left)
 			continue;
 
 		js->childslot = childslot;
@@ -1675,7 +1676,8 @@ lion_join_next_parts(LionCountScanState *st, int64 *countp)
 			 * rows left.  (A leaf partition's empty copy leaves only that
 			 * leaf out, and not past its turn: lion_join_count_parts().)
 			 */
-			if ((st->wheremissing && !anti) || !lion_join_fill_batch(st))
+			if ((st->wheremissing && !anti && !js->left) ||
+				!lion_join_fill_batch(st))
 			{
 				lion_join_batch_reset(st);
 				return false;
@@ -1700,7 +1702,7 @@ lion_join_next_parts(LionCountScanState *st, int64 *countp)
 			count = (ent->acc > 0) ? 1 : 0;
 		else
 			count = ent->acc;
-		if (count == 0)
+		if (count == 0 && !js->left)
 			continue;
 
 		if (!js->sum)
@@ -2428,7 +2430,7 @@ lion_next_join_row(LionCountScanState *st)
 		 * - and makes every one of them a row of an anti join, which the
 		 * loop a row at a time emits without a lookup.
 		 */
-		if (st->wheremissing && !anti)
+		if (st->wheremissing && !anti && !js->left)
 		{
 			st->done = true;
 			return NULL;

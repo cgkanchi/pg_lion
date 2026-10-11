@@ -21,7 +21,8 @@
 #define LION_JOINFLAG_ALL \
 	(LION_JOINFLAG_COLLECT | LION_JOINFLAG_ROWS | LION_JOINFLAG_UNIQUE | \
 	 LION_JOINFLAG_WALK | LION_JOINFLAG_SUM | LION_JOINFLAG_COUNTS | \
-	 LION_JOINFLAG_OUTER | LION_JOINFLAG_ORDERED | LION_JOINFLAG_UNITE)
+	 LION_JOINFLAG_OUTER | LION_JOINFLAG_ORDERED | LION_JOINFLAG_UNITE | \
+	 LION_JOINFLAG_LEFT)
 
 /*
  * Each member's name, for the messages, and the node it is when it is not
@@ -1008,6 +1009,7 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	bool		joinouter = (jflags & LION_JOINFLAG_OUTER) != 0;
 	bool		joinordered = (jflags & LION_JOINFLAG_ORDERED) != 0;
 	bool		joinunite = (jflags & LION_JOINFLAG_UNITE) != 0;
+	bool		joinleft = (jflags & LION_JOINFLAG_LEFT) != 0;
 	AttrNumber	driveattno;
 	int			i;
 	int			j;
@@ -1039,7 +1041,9 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	 * The FK-side join (DESIGN.md §27): one child, and flags that go
 	 * together - distinct keys only for an inner join with their operator;
 	 * a sum is not rows, counts are an inner join's rows, and the outer
-	 * side's rows (a join path) are a semi or anti join's rows alone.
+	 * side's rows (a join path) are a semi or anti join's rows alone.  A
+	 * LEFT JOIN's rows are counted rows of a plain inner join's lookups, the
+	 * dimension's rows, with no fact column grouped by.
 	 */
 	if (p->hasjoin &&
 		(ncustom_plans != 1 ||
@@ -1050,7 +1054,9 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 		 (joinouter &&
 		  (!joinrows || p->join.type == LION_JOIN_INNER ||
 		   joinunique || joincounts)) ||
-		 (joinordered && !joinouter)))
+		 (joinordered && !joinouter) ||
+		 (joinleft &&
+		  (!joincounts || joinunique || joinouter || p->fgattno != 0))))
 		elog(ERROR, "LionCount: malformed join");
 
 	/* a column of the child's rows needs a child */

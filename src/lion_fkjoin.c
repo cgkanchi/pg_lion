@@ -306,7 +306,7 @@ lion_fkjoin_target_has(PathTarget *target, Var *var)
  */
 static bool
 lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
-					 LionFkJoin *fj)
+					 Index leftoj, LionFkJoin *fj)
 {
 	RelOptInfo *fact = root->simple_rel_array[factrelid];
 	RelOptInfo *dim;
@@ -332,12 +332,32 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 	if (!lion_fkjoin_rel_ok(root, fact))
 		return false;
 	dimrels = bms_del_member(bms_copy(joinrel->relids), factrelid);
+	if (leftoj != 0)
+		dimrels = bms_del_member(dimrels, leftoj);
 	joined = (bms_membership(dimrels) == BMS_MULTIPLE);
 
 	foreach(lc, root->join_info_list)
 	{
 		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
 
+		if (sjinfo->jointype == JOIN_LEFT)
+		{
+			/*
+			 * The dimension LEFT JOIN the fact, the one special join there
+			 * is (lion_fkjoin_recognize()): the fact has to be its whole
+			 * nullable side, and the dimension, one table, its whole other
+			 * side.  The fact on the other side keeps fact rows with no
+			 * dimension row, which no lookup per dimension row counts.
+			 */
+			if (joined ||
+				!bms_equal(sjinfo->min_righthand, fact->relids) ||
+				!bms_equal(sjinfo->syn_righthand, fact->relids) ||
+				!bms_equal(sjinfo->min_lefthand, dimrels) ||
+				!bms_equal(sjinfo->syn_lefthand, dimrels))
+				return false;
+			key = sjinfo;
+			continue;
+		}
 		if (bms_equal(sjinfo->min_righthand, fact->relids) &&
 			bms_equal(sjinfo->syn_righthand, fact->relids))
 		{
@@ -430,6 +450,33 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 		return false;
 	if (!IsA(rinfo->clause, OpExpr))
 		return false;
+
+	/*
+	 * A LEFT JOIN's other clauses are no restrictions of either table the
+	 * node could apply: a condition of its ON clause on the dimension alone
+	 * decides which dimension rows are null-extended, and a WHERE condition
+	 * on the fact that is not strict (`f.x IS NULL`, `coalesce(f.x, 0) = 0`)
+	 * is evaluated above the join, over the null-extended rows too.  Both are
+	 * join clauses of the two tables - the second with the outer join's own
+	 * relid among the relations it needs, which the pair's clauses above do
+	 * not look at - so the one join clause must be every join clause either
+	 * table has.  A condition of the ON clause on the fact alone is pushed
+	 * down to the fact's scan, where it is a fact filter like any other: it
+	 * only decides which fact rows match.
+	 */
+	if (key != NULL && key->jointype == JOIN_LEFT)
+	{
+		foreach(lc, fact->joininfo)
+		{
+			if (lfirst(lc) != rinfo)
+				return false;
+		}
+		foreach(lc, dim->joininfo)
+		{
+			if (lfirst(lc) != rinfo)
+				return false;
+		}
+	}
 	op = (OpExpr *) rinfo->clause;
 	if (list_length(op->args) != 2 || !op_strict(op->opno))
 		return false;
@@ -477,12 +524,17 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 	 * needs the proof.  A joined dimension's rows are its own table's, each at
 	 * most once (above), so a key unique in the table is unique in them.
 	 */
-	if (key == NULL)
+	if (key == NULL || key->jointype == JOIN_LEFT)
 	{
+		/*
+		 * A LEFT JOIN's count is a sum over the dimension rows as an inner
+		 * join's is, each row's own count or - with no fact row - its one
+		 * null-extended row; the proof is the inner join's scope guard.
+		 */
 		if (!lion_column_is_unique(dim, argvar[di]->varattno, op->opno,
 								   op->inputcollid))
 			return false;
-		jointype = JOIN_INNER;
+		jointype = (key == NULL) ? JOIN_INNER : JOIN_LEFT;
 	}
 	else if (forward)
 	{
@@ -557,6 +609,7 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 	LionFkJoin *fj;
 	int			n = 0;
 	int			i;
+	Index		leftoj = 0;		/* a LEFT JOIN's own relid, or 0 */
 	ListCell   *lc;
 
 	*out = NULL;
@@ -579,8 +632,13 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 
 	/*
 	 * An outer join makes a SpecialJoinInfo, and a count over it is not the
-	 * inner join's (a LEFT JOIN keeps the fact rows with no dimension row).
-	 * So does a semi or an anti join - EXISTS, IN, NOT EXISTS pulled up into
+	 * inner join's: a fact LEFT JOIN its dimension keeps the fact rows with
+	 * no dimension row, which no lookup per dimension row finds.  The other
+	 * way round, the dimension LEFT JOIN the fact keeps the dimension rows
+	 * with no fact row, each null-extended once, and that is the lookup per
+	 * dimension row with a row emitted for a count of 0 too (DESIGN.md §27,
+	 * "The dimension LEFT JOIN the fact"); it is taken when it is the only
+	 * special join.  So does a semi or an anti join - EXISTS, IN, NOT EXISTS pulled up into
 	 * the join tree - and that one IS a shape the node answers: its rows are
 	 * the outer side's, each once, that have (or have not) a match on the
 	 * inner side, so with the outer side as the dimension and the inner one
@@ -596,7 +654,8 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 	 * dimension is what lets the dimension be a join (DESIGN.md §27, "A
 	 * dimension that is a join"): it never repeats a row of its outer side.
 	 *
-	 * So semi and anti joins only, within the join: an anti join made from
+	 * So semi and anti joins, within the join, or that one LEFT JOIN: an
+	 * anti join made from
 	 * `LEFT JOIN ... WHERE f.fk IS NULL` has a range table entry of its own
 	 * (ojrelid), which the NOT EXISTS form does not, and is left alone.
 	 */
@@ -604,6 +663,22 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 	{
 		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
 
+		/*
+		 * ... or one LEFT JOIN of a dimension table and the fact, the only
+		 * special join of the query, whose rows are every dimension row with
+		 * its fact rows, or with none (DESIGN.md §27, "The dimension LEFT
+		 * JOIN the fact").  Its relid is one of the join rel's.
+		 */
+		if (sjinfo->jointype == JOIN_LEFT && sjinfo->ojrelid != 0 &&
+			list_length(root->join_info_list) == 1 &&
+			bms_membership(sjinfo->min_lefthand) == BMS_SINGLETON &&
+			bms_membership(sjinfo->min_righthand) == BMS_SINGLETON &&
+			bms_is_member(sjinfo->ojrelid, joinrel->relids) &&
+			bms_num_members(joinrel->relids) == 3)
+		{
+			leftoj = sjinfo->ojrelid;
+			continue;
+		}
 		if (sjinfo->jointype != JOIN_SEMI && sjinfo->jointype != JOIN_ANTI)
 			return 0;
 		if (sjinfo->ojrelid != 0)
@@ -618,7 +693,7 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 	i = -1;
 	while ((i = bms_next_member(joinrel->relids, i)) >= 0)
 	{
-		if (!lion_fkjoin_member_ok(root, i))
+		if (i != (int) leftoj && !lion_fkjoin_member_ok(root, i))
 			return 0;
 	}
 
@@ -638,7 +713,8 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 	i = -1;
 	while ((i = bms_next_member(joinrel->relids, i)) >= 0)
 	{
-		if (lion_fkjoin_try_fact(root, joinrel, i, &fj[n]))
+		if (i != (int) leftoj &&
+			lion_fkjoin_try_fact(root, joinrel, i, leftoj, &fj[n]))
 			n++;
 	}
 	*out = fj;

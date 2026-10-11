@@ -854,6 +854,7 @@ lion_begin_join(LionCountScanState *st, const LionCountPriv *priv,
 	js->outer = (flags & LION_JOINFLAG_OUTER) != 0;
 	js->ordered = (flags & LION_JOINFLAG_ORDERED) != 0;
 	js->unite = (flags & LION_JOINFLAG_UNITE) != 0;
+	js->left = (flags & LION_JOINFLAG_LEFT) != 0;
 	js->sort.unique = (flags & LION_JOINFLAG_UNIQUE) != 0;
 	js->sort.op = priv->join.sortop;
 	js->sort.coll = priv->join.sortcoll;

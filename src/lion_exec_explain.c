@@ -687,6 +687,8 @@ lion_explain_join(LionCountScanState *st, ExplainState *es)
 		ExplainPropertyText("Join Type", "Semi", es);
 	else if (!js->outer && js->type == LION_JOIN_ANTI)
 		ExplainPropertyText("Join Type", "Anti", es);
+	else if (js->left)
+		ExplainPropertyText("Join Type", "Left", es);
 	if (js->sort.unique)
 		ExplainPropertyText("Join Keys", "distinct, sorted", es);
 
@@ -710,6 +712,9 @@ lion_explain_join(LionCountScanState *st, ExplainState *es)
 							(js->ordered ?
 							 "the outer rows with a match, in their order" :
 							 "the outer rows with a match"), es);
+	else if (js->left)
+		ExplainPropertyText("Join Rows",
+							"every dimension row, each with its count", es);
 	else if (js->rows)
 		ExplainPropertyText("Join Rows",
 							js->type == LION_JOIN_ANTI ?

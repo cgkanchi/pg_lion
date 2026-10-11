@@ -8874,8 +8874,9 @@ lookup answers that clause exactly when the clause is one the pushdown already a
 - the join is the ONLY join clause: one equality between a plain column of the fact rel and a plain
   column of the dimension rel, from an equivalence class or from `joininfo`. A second join clause
   (`AND f.a < d.b`, a composite key), a pseudoconstant qual anywhere in the query, an outer join
-  (any `join_info_list` entry but the one semi or anti join of "Semi and anti joins" below and
-  those inside a dimension that is a join), a LATERAL reference or a PlaceHolderVar all decline.
+  (any `join_info_list` entry but the one semi or anti join of "Semi and anti joins" below,
+  those inside a dimension that is a join, and the one LEFT JOIN of "The dimension LEFT JOIN the
+  fact"), a LATERAL reference or a PlaceHolderVar all decline.
   An equivalence class with a constant (`d.pk = 5`) generates no join clause at all - both sides
   are restricted to the constant - and is left to the ordinary plan.
 
@@ -11660,6 +11661,74 @@ dirty heap before and after VACUUM. `test/sql/fkjoin_factgroup.sql`'s queries wi
 column in the rows - partitioned, parallel, an OR of filters per kind with a range - now unite, with
 their answers unchanged.
 
+### The dimension LEFT JOIN the fact (2026-10-11)
+
+`SELECT d.name, count(f.id) FROM dim d LEFT JOIN fact f ON f.fk = d.pk GROUP BY d.name` - the count
+of each dimension row's fact rows, a dimension row with none counted 0 - was declined: an outer
+join was refused whatever its direction, and the plan was a hash join over the whole fact table
+(1,144 ms on the 5M-row synthetic table below, against 18 ms for the inner join through the node).
+
+**What is computed.** The join's rows are an inner join's pairs, and each dimension row with no
+pair once more, null-extended. A dimension row `d` with `n = |F(d)|` fact rows under the fact
+filters is therefore `max(n, 1)` of the join's rows: `n` holding a fact row, or one holding NULL in
+every fact column. The node looks the keys up exactly as for an inner join and hands up every
+dimension row with its `n` - a NULL key, a key with no entry, a count of 0 and a fact filter that
+selects nothing included, each a row with `n = 0` (`LION_JOINFLAG_LEFT`, which goes with the
+counted rows of "Every aggregate over the node's rows" and nothing else). The Agg above aggregates
+them as it does counted rows, over `m = GREATEST(n, 1)` where an aggregate counts the join's rows:
+
+| the query's | over the dimension rows | why it is the join's |
+|---|---|---|
+| `count(*)`, `count(1)` | `lion_join_count(m)` | a dimension row is m of the join's rows |
+| `count(f.x)`, x the fact's key or a column declared NOT NULL | `lion_join_count(n)` | x is NULL in the null-extended row, and not NULL in a joined one |
+| `count(x)`, x an expression of dimension columns (the dimension's key among them) | `lion_join_count(m) FILTER (WHERE x IS NOT NULL)` | each of the row's m join rows holds its x |
+| `sum(x)`, x such an int2 or int4 expression | `lion_join_sum(x * m)` | as for an inner join, over m |
+| `count(DISTINCT x)`, `min`, `max` and the others of "Every aggregate over the node's rows", of dimension columns | as they stand | each dimension row is in the join at least once |
+
+A group whose dimension rows have no fact row gets `count(f.x)` 0 from `lion_join_count`'s 0 over
+rows of `n = 0`, as the ordinary plan's count of NULLs is; an empty dimension gives no group, or 0
+and NULL without a GROUP BY. A NOT NULL fact column is the planner's `notnullattnums`, which leaves
+out a constraint that is not valid. An inner join counts such a column as `count(*)` now too
+(`lion_fkjoin_agg_is_count()`), which `WHERE f.x = 3` over a LEFT JOIN - strict, so core makes it
+an inner join - needs.
+
+**What is taken.** Recognising it (`lion_fkjoin_recognize()`) takes one LEFT JOIN as the only
+special join of the query, its outer side one dimension table and its nullable side the fact, both
+minimal and syntactic, its own relid the join rel's third member; the RIGHT JOIN spelling is the
+same join. The dimension's key is proved unique as for an inner join, the same scope guard. The join
+clause is the one clause between the two, and it has to be every join clause either table has:
+
+- a condition of the ON clause on the fact alone is pushed down to the fact's scan by core, where
+  it is a fact filter like any other - it decides which fact rows match, which is what the count
+  is of;
+- a condition of the ON clause on the dimension alone decides which dimension rows are
+  null-extended, and stays a join clause, which declines;
+- a WHERE condition on the fact that is strict makes the join an inner join before the hook runs;
+  one that is not (`f.y IS NULL`, `coalesce(f.x, 0) = 0`) is evaluated above the join over the
+  null-extended rows too, and is a join clause of the fact that needs the outer join's relid -
+  which a pair's clauses do not include, so the join clauses are checked whole, and it declines.
+
+The aggregates over a fact column are the counts above; `count` of a nullable fact column, `sum` or
+`min` of one, a DISTINCT of the fact's key, a GROUP BY of a fact column and a key pinned to a
+constant (core then joins the two on no clause at all) decline. The partitioned fact, parallel
+plans, batches and the walk in key order are the inner join's.
+
+**Cost.** The inner join's counted rows (`lion_add_fkjoin_paths()`), every child row a row: the
+same lookups, and `LION_FKJOIN_ROW_COST` per dimension row rather than per one that joins.
+
+Measured (2026-10-11, 5M rows, a 220-row dimension of which 20 keys have no fact row, `work_mem`
+64MB, best of 5): `d.name, count(f.id) ... GROUP BY d.name` 1,144 ms to 16 ms; `d.region,
+count(*)` 888 ms to 18 ms; with `AND f.c20 = 3` in the ON clause 168 ms to 106 ms.
+
+`test/sql/fkjoin_left.sql`: every answer against the pushdown off with sequential scans only -
+counts of the join's rows, of the fact's key and its NOT NULL id, of dimension columns, sums, min,
+max, `bool_or` and a DISTINCT over a 400-row dimension with NULL keys and 100 keys past the fact's
+range; grouped by a dimension column, by the key (the NULL keys one group), and not at all, folded
+to constants, empty; fact filters in the ON clause, one that selects nothing at run time, a
+subquery's; a dimension filter; HAVING `count(f.id) = 0`, ORDER BY and LIMIT; the RIGHT JOIN
+spelling; the declines; the counters; batches at 64 kB; a rescan; a parallel plan; a partitioned
+fact; and a dirty heap on both sides before and after VACUUM.
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
@@ -11694,6 +11763,10 @@ their answers unchanged.
   A count of rows beside a `count(DISTINCT)` used to be declined here ("Every aggregate over the
   node's rows").
 - **An anti join from `LEFT JOIN ... IS NULL`, and `NOT IN`** (above).
+- **Outer joins but the dimension LEFT JOIN the fact**: the fact LEFT JOIN its dimension and a FULL
+  JOIN keep fact rows with no dimension row, which no lookup per dimension row finds; a LEFT JOIN
+  beside other special joins, or with another join clause, is not taken apart ("The dimension LEFT
+  JOIN the fact").
 - **Driving the count from the collected copy of the fact filters** when it is small against the
   keys: that is core's plan ("The cost of a key, after the per-key path").
 - **Partial aggregation of a GROUP BY's rows inside the node.** A summed join adds its counts up

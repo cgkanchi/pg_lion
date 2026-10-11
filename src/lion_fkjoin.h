@@ -46,6 +46,10 @@
  * disjoint posting sets, so the counts add up to the fact rows that have a
  * match, each once.
  *
+ * A LEFT JOIN qualifies with the dimension its outer side and the fact its
+ * nullable side, as JOIN_LEFT: an inner join's lookups, every dimension row
+ * a row of the result whatever its count.
+ *
  * The dimension is `dimrel` alone, or - when the query joins more tables -
  * the join rel `dimchild` of dimrel and the tables semi or anti joined to it
  * (DESIGN.md §27, "A dimension that is a join"): its rows are dimrel's rows,
@@ -75,12 +79,18 @@ typedef struct LionFkJoin
 	JoinType	jointype;		/* JOIN_INNER; or JOIN_SEMI or JOIN_ANTI, the
 								 * dimension the outer side and the fact the
 								 * inner one; or JOIN_UNIQUE_INNER, a semi
-								 * join the other way round */
+								 * join the other way round; or JOIN_LEFT,
+								 * the dimension LEFT JOIN the fact, whose
+								 * dimension rows with no fact row are rows
+								 * too */
 	RelOptInfo *joinrel;		/* the join rel: a semi or anti join's rows */
 	Oid			uniqsortop;		/* JOIN_UNIQUE_INNER: the `<` of the join
 								 * operator's btree family for the dimension
 								 * key's type, which the keys are sorted by
 								 * to make them distinct; else InvalidOid */
+	Bitmapset  *factnotnull;	/* the fact's columns declared NOT NULL, for
+								 * a count of one over a LEFT JOIN; set by
+								 * the path's planner, not here */
 	bool		joinpath;		/* the semi or anti join as a JOIN path of
 								 * joinrel, which emits the outer side's rows
 								 * (lion_fkjoin_recognize_join()), and not an
