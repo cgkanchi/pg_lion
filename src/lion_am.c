@@ -87,6 +87,8 @@ static const relopt_parse_elt lion_relopt_tab[] = {
 	{"inline_limit", RELOPT_TYPE_INT, offsetof(LionOptions, inline_limit)},
 	{"max_entries", RELOPT_TYPE_INT, offsetof(LionOptions, max_entries)},
 	{"fillfactor", RELOPT_TYPE_INT, offsetof(LionOptions, fillfactor)},
+	{"posting_fillfactor", RELOPT_TYPE_INT, offsetof(LionOptions, posting_fillfactor)},
+	{"build_slack", RELOPT_TYPE_ENUM, offsetof(LionOptions, build_slack)},
 	{"wal_mode", RELOPT_TYPE_ENUM, offsetof(LionOptions, wal_mode)},
 	{"summaries", RELOPT_TYPE_ENUM, offsetof(LionOptions, summaries)},
 	{"summary_tids", RELOPT_TYPE_INT, offsetof(LionOptions, summary_tids)},
@@ -106,6 +108,14 @@ static relopt_enum_elt_def lion_wal_mode_options[] = {
 	{"auto", LION_WALOPT_AUTO},
 	{"generic", LION_WALOPT_GENERIC},
 	{"rmgr", LION_WALOPT_RMGR},
+	{(const char *) NULL}
+};
+
+/* DESIGN.md §4: whether a build leaves growth slack in what it writes. */
+static relopt_enum_elt_def lion_build_slack_options[] = {
+	{"auto", LION_SLACKOPT_AUTO},
+	{"on", LION_SLACKOPT_ON},
+	{"off", LION_SLACKOPT_OFF},
 	{(const char *) NULL}
 };
 
@@ -138,6 +148,26 @@ _PG_init(void)
 					  "Percentage of a directory leaf ambuild fills",
 					  LION_DEFAULT_FILLFACTOR, LION_MIN_FILLFACTOR, 100,
 					  AccessExclusiveLock);
+	/*
+	 * DESIGN.md §22, "Bulk build".  Read at build time only, like fillfactor:
+	 * it decides how much room the build leaves on the posting-tree leaves it
+	 * writes, and nothing after the build looks at it.
+	 */
+	add_int_reloption(lion_relopt_kind, "posting_fillfactor",
+					  "Percentage of a posting-tree leaf ambuild fills",
+					  LION_DEFAULT_POSTING_FILLFACTOR,
+					  LION_MIN_POSTING_FILLFACTOR, 100,
+					  AccessExclusiveLock);
+	/*
+	 * DESIGN.md §4, "Growth slack".  Read at build time only: it decides the
+	 * lengths the build writes items at, and an INSERT keeps whatever length
+	 * it finds when the new member fits it.
+	 */
+	add_enum_reloption(lion_relopt_kind, "build_slack",
+					   "Whether ambuild leaves insert growth room in INLINE entries and posting items",
+					   lion_build_slack_options, LION_DEFAULT_BUILD_SLACK,
+					   "Valid values are \"auto\", \"on\" and \"off\".",
+					   AccessExclusiveLock);
 	add_int_reloption(lion_relopt_kind, "inline_limit",
 					  "Maximum size in bytes of a posting set kept inside its entry tuple",
 					  LION_DEFAULT_INLINE_LIMIT, LION_MIN_INLINE_LIMIT,
