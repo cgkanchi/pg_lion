@@ -10881,7 +10881,8 @@ not from the shape of the join tree:
   outer side, which only says where the `EXISTS` was written;
 - the dimension's own table `d` is the one table of `D` in no inner side of those special joins,
   and there has to be exactly one: a second (`d JOIN x ON ...`) is an inner join inside the
-  dimension, which may repeat a row of `d`, and declines. `d` is a plain table or a materialized
+  dimension, which may repeat a row of `d`, and declines - unless it only filters the fact, which
+  folds it before `D` is formed ("A second dimension that only filters"). `d` is a plain table or a materialized
   view, as a dimension of one table is;
 - exactly one join clause between `F` and all of `D` - the equivalence classes' clauses between
   them and `F`'s joininfo, as before - and it is taken between `F` and `d`. A dimension that is a
@@ -11881,6 +11882,110 @@ subquery's; a dimension filter; HAVING `count(f.id) = 0`, ORDER BY and LIMIT; th
 spelling; the declines; the counters; batches at 64 kB; a rescan; a parallel plan; a partitioned
 fact; and a dirty heap on both sides before and after VACUUM.
 
+### A second dimension that only filters (2026-10-11)
+
+`SELECT d.region, count(*) FROM fact f JOIN dim d ON f.fk = d.pk JOIN e ON f.e_id = e.id WHERE
+e.flag GROUP BY d.region` - a fact counted per dimension row, a second table joined to it only to
+filter its rows - was declined: three tables with no special join are an inner join inside the
+dimension ("A dimension that is a join"), and the plan was core's hash joins over the whole fact
+table.
+
+**What is computed.** A table `X` inner-joined to the fact `F` by `F.x = X.k` alone, `X.k` unique
+under the join operator, and nothing of `X` wanted above the join. Each fact row has one `x`, and
+each value of it at most one row of `X`, so the join with `X` keeps the fact rows whose `x` is the
+key of one of `X`'s rows that pass `X`'s own filters, each once, and adds nothing the rest of the
+query reads. It is a fact filter:
+
+    F.x = ANY (K),    K = { X.k of the rows of X under its filters, X.k NOT NULL }
+
+the operator strict, so a NULL key joins no fact row and a NULL `F.x` none of the keys. The query
+left is the join of `F` with the rest of its tables, with one more fact filter, which the node
+answers as it answers any: the keys of the remaining dimension looked up under the fact filters,
+the IN list among them.
+
+**Recognition** (`lion_fkjoin_filter_of()`, for each table of the join tried as the fact):
+
+- `X` is a plain table or a materialized view (not a partitioned or inheritance parent), in no
+  special join - no semi or anti join's side and no outer join's - so that it is inner-joined;
+- no column of `X` is in the join rel's target, which holds every column the query reads above
+  the join (target list, GROUP BY, HAVING, ORDER BY): `X`'s columns are read by its own filters and
+  the join clause alone;
+- exactly one clause joins `X` to the rest of the join - the equivalence classes' clauses between
+  `X` and every other table, and `X`'s joininfo clauses within the join - and it is the clause the
+  pair `(F, X)` gives (same class, or the same joininfo clause). A table also joined to the
+  dimension, by a second clause, or by a condition over it and the fact together (`e.flag OR f.x =
+  1`), is not only a filter;
+- that clause is a strict operator between a plain column of each, and `X.k` is unique under it
+  (`lion_column_is_unique()`, as a dimension's key is proved);
+- `X`'s cheapest path is unparameterized and carries the key, the key's type has an array type,
+  and the rows the path is expected to return are no more than a count locates of one IN list at
+  once (`lion_array_batch_size()`: a work_mem of 256-byte located sets, never fewer than a
+  thousand), since the node holds the list's sets whole where the ordinary plan would hash `X`'s
+  keys within its memory.
+
+`lion_fkjoin_recognize()` folds every table that qualifies; the tables left are the dimension, taken
+apart as ever (`lion_fkjoin_try_fact()`). When every table but the fact qualifies, each is tried as
+the dimension with the others folded, and the cost model chooses - an ungrouped count with a filter
+on each of two dimensions is either one's count against the other folded. Folded tables go only
+with an inner join of the fact and the dimension (a LEFT JOIN, a semi or an anti join with the
+dimension declines), at most `LION_MAX_JOIN_FILTERS` (8) of them.
+
+**Execution.** Each folded table is a child of the node's, `custom_plans[1 + i]`, core's cheapest
+path of `X`. Its clause is an ARRAY clause of the fact filters like any IN list - the lion index on
+`F.x` matched for it by the join operator, a cross-type one (`int4` against `int8`) included - whose
+value the node makes at the start of each run (`lion_eval_clause_values()`,
+`lion_join_filter_values()`): the child is run whole, in the query's memory as every node is (its
+scan descriptor outlives the values' context), the key read from its column of each row, NULLs left
+out, the keys accumulated into an array in the values' context. From there it is an IN list among
+the fact filters: located, collected into the copy or probed, counted. A rescan rescans the children
+and collects the keys again, so a filter of `X`'s on an outer query's column is applied per outer
+row. The clause's expression in `custom_exprs` is a NULL constant of the key's type that nothing
+evaluates: a Param there would need an initplan to set it (`SS_finalize_plan()`). EXPLAIN prints it
+among the `Lion Indexes` as `x = X.k`, deparsed from the child's column, and EXPLAIN ANALYZE counts
+the keys collected (`Join Filter Keys`). The join operator's function is checked at executor startup
+as the key's is (`lion_replaced_functions()`).
+
+`custom_private`'s join member grows (shape 23) a `(clause, column)` pair a folded table, the
+column its attnum at the PATH stage and its position in the child's target list at the PLAN stage
+(`lion_plan_fkjoin_path()`, `lion_child_resno()`); the decoder checks the clause is in range, not
+the key's own, and an ARRAY clause, and the plan check that there is a child each and that the join
+is an inner one with none of the distinct-key, outer, LEFT or parallel flags.
+
+**Cost.** The children run whole before the first key: their total cost is added to the node's
+startup and total. The IN list is priced through a cost clause (`lion_fkjoin_filter_costclause()`):
+`F.x = ANY (<n NULLs>)`, `n` the child's estimated rows, which `estimate_array_length()` counts, in a
+RestrictInfo of the fact alone whose cached selectivity - `clause_selectivity()` returns it without
+reading the array - is `n / max(nd(F.x), X's rows)`: each key one value of `F.x` with as many fact
+rows as any other, and where `F.x` has values no key has, the keys' share of those. The same share
+multiplies the fact filters' selectivity in the fact-side model (`lion_fkjoin_filters_sel()`), which
+the fact rel's own estimate does not include. The uniform fk is an assumption: keys chosen by `X`'s
+filters that hold most of the fact's rows make the plan cheaper than priced, never wrong.
+
+**Not taken**, as yet: parallel plans (a participant would run each folded table whole; with one
+the node is offered serial only); a folded table whose key set is a parameter's size past the cap
+by a misestimate is held whole, as a parameter's IN list in an FK-side join is ("A list too long to
+locate at once").
+
+Measured (2026-10-11, 5M fact rows, a 220-row dimension of 10 groups, a 1,000-row filter table of
+which a third is flagged, best of 5, PostgreSQL's own plan with its parallel workers): the flagged
+rows' `GROUP BY` 776 ms to 54 ms; a filter leaving 19 keys 343 ms to 51 ms; one leaving 899 keys
+1,294 ms to 131 ms.
+
+`test/sql/fkjoin_star.sql`: every answer against the pushdown off with sequential scans only, over a
+fact with NULL fks and a 400-row dimension with NULL keys and keys past the fact's range, and a
+folded table with NULL keys and fact values it has no row for - grouped
+by dimension columns and by its key, the folded table's own filters applied and none; two folded,
+one compared across types (`int4` against an `int8` primary key); the fact's own filters beside
+them; no GROUP BY, with every other table only filtering; the IN spelling; a folded table no row
+of which passes its filter; HAVING, ORDER BY and LIMIT; the declines (a column of it grouped by or
+counted, a non-unique key, a clause to the dimension or a second one to the fact, a condition over
+it and the fact, an outer join of it and beside it, more keys than one list locates at 64 kB); the
+`Join Filter Keys` counter; batches at 64 kB; a correlated subquery that rescans the node with a
+new filter of the folded table's; parallel settings; a partitioned fact; and a dirty heap without
+VACUUM - deletes and updates in the fact, the dimension and the folded table, whose rows move in
+and out of its filter, and new rows with NULL and new keys. `node_contracts.sql` and
+`exec_hook.sql` check the folded join's operator, `int48eq`, refused as the ordinary plan refuses it.
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
@@ -11895,7 +12000,9 @@ fact; and a dirty heap on both sides before and after VACUUM.
 - **An inner or outer join inside the dimension**, composite keys, snowflake chains: a dimension
   that is a join is taken only as one table with others semi- or anti-joined to it ("A dimension
   that is a join"), whose rows are that table's, each once; an inner join to a unique key would
-  keep that too (core's `innerrel_is_unique()` proves it) and is the natural next step.
+  keep that too (core's `innerrel_is_unique()` proves it) and is the natural next step. A table
+  inner-joined to the FACT on a unique key, nothing of it wanted above, is folded into a fact filter
+  ("A second dimension that only filters"); one joined to the dimension is not.
 - **Fact columns in the output** but for one fact column grouped by ("Grouped by a fact column")
   and the fact's join column, which stands for the dimension's key ("Grouped by the join key"): two
   fact columns, an expression of one as a grouping column, a fact column beside aggregates other
@@ -11941,7 +12048,8 @@ column, generic plans with Param fact and dimension filters (a NULL one included
 subquery whose dimension filter is an exec Param, so that the node and its child are rescanned per
 outer row; the declines - a non-unique dimension key, a key unique only under another collation
 than the join's (and accepted once a unique index under the join's own exists), a second join
-clause, an outer join, three relations, a fact filter the posting sets cannot answer, a dimension
+clause, an outer join, three relations whose third is grouped by (a third that only filters is
+folded, "A second dimension that only filters"), a fact filter the posting sets cannot answer, a dimension
 key pinned to a constant, fact RLS, a fact column in the output, a volatile grouping expression,
 another aggregate, `count` of a nullable fact column, a partitioned fact one of whose partitions
 has no lion index on fk (the same table with one on every partition is pushed down) and a

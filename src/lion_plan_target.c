@@ -414,10 +414,12 @@ lion_replaced_aggs_walker(Node *node, List **aggs)
  *	  (ExecBuildGroupingEqual(), hashed or sorted), but not the hash or sort
  *	  support functions;
  *	- a hash or nested-loop join initialises its join clause, so an FK-side
- *	  join (fj) adds the join operator's function.  A merge join compares
- *	  through the btree support function unchecked, so a query the planner
- *	  would have merge-joined asks one privilege more of the node; the SQL
- *	  meaning of the query - it calls `=` - is the one kept.
+ *	  join (fj) adds the join operator's function - and so does each join
+ *	  of a dimension folded into a fact filter (DESIGN.md §27, "A second
+ *	  dimension that only filters").  A merge join compares through the
+ *	  btree support function unchecked, so a query the planner would have
+ *	  merge-joined asks one privilege more of the node; the SQL meaning of
+ *	  the query - it calls `=` - is the one kept.
  *
  * Not included: count(DISTINCT k)'s equality, which nodeAgg calls through an
  * unchecked FmgrInfo for a single column, so core runs the query with that
@@ -443,7 +445,15 @@ lion_replaced_functions(RelOptInfo *rel, List *tlexprs, List *having,
 		(void) lion_replaced_funcs_walker((Node *) ((RestrictInfo *) lfirst(lc))->clause,
 										  &funcs);
 	if (fj != NULL)
+	{
 		funcs = list_append_unique_oid(funcs, get_opcode(fj->opno));
+		foreach(lc, fj->filters)
+		{
+			LionFkFilter *f = (LionFkFilter *) lfirst(lc);
+
+			funcs = list_append_unique_oid(funcs, get_opcode(f->opno));
+		}
+	}
 	foreach(lc, groupclause)
 		groupfuncs = list_append_unique_oid(groupfuncs,
 											get_opcode(((SortGroupClause *) lfirst(lc))->eqop));

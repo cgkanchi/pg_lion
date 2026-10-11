@@ -146,6 +146,81 @@ lion_join_locate_where(LionCountScanState *st)
 	lion_join_clock(st, LION_JT_LOCATE, &t);
 }
 
+/*
+ * Which dimension folded into a fact filter clause `clauseno` is the keys of
+ * (DESIGN.md §27, "A second dimension that only filters"), or -1.
+ */
+int
+lion_join_filter_of(const LionCountScanState *st, int clauseno)
+{
+	int			f;
+
+	if (st->join == NULL)
+		return -1;
+	for (f = 0; f < st->join->nfilter; f++)
+	{
+		if (st->join->filterclause[f] == clauseno)
+			return f;
+	}
+	return -1;
+}
+
+/*
+ * The values of the fact filters the dimensions that only filter were folded
+ * into (DESIGN.md §27, "A second dimension that only filters"): each one's
+ * child run whole, and the keys of its rows made the array of its IN list, in
+ * the current memory context - the clause values' (lion_eval_clause_values()),
+ * once a run.  A NULL key joins no fact row and is left out.  The keys are
+ * of the type the clause compares them as - a binary-compatible relabel of
+ * the column's, the same Datum - and distinct, the column being unique; the
+ * list's lookup drops a duplicate anyway (lion_locate_array()).
+ *
+ * The child runs under the query's snapshot, as the dimension's child does,
+ * so its rows are the ones the join would have read.  It is a child of the
+ * node's, initialised and ended with it and rescanned with it - and it runs
+ * in the query's memory, as every node does: what a scan allocates the first
+ * time it is asked for a row (its scan descriptor) lives until the node is
+ * ended, past any reset of the values' context.
+ */
+void
+lion_join_filter_values(LionCountScanState *st)
+{
+	LionJoinState *js = st->join;
+	MemoryContext valcxt = CurrentMemoryContext;
+	MemoryContext querycxt = st->css.ss.ps.state->es_query_cxt;
+	int			f;
+
+	for (f = 0; f < js->nfilter; f++)
+	{
+		LionClauseState *cl = &st->clause[js->filterclause[f]];
+		PlanState  *ps = js->filterps[f];
+		ArrayBuildState *astate;
+
+		astate = initArrayResult(cl->valtype, valcxt, false);
+		for (;;)
+		{
+			TupleTableSlot *slot;
+			Datum		key;
+			bool		isnull;
+
+			CHECK_FOR_INTERRUPTS();
+			MemoryContextSwitchTo(querycxt);
+			slot = ExecProcNode(ps);
+			MemoryContextSwitchTo(valcxt);
+			if (TupIsNull(slot))
+				break;
+			key = slot_getattr(slot, js->filtercol[f], &isnull);
+			if (isnull)
+				continue;
+			/* copied into valcxt, a by-reference key too */
+			astate = accumArrayResult(astate, key, false, cl->valtype, valcxt);
+			js->filterkeys++;
+		}
+		cl->val = makeArrayResult(astate, valcxt);
+		cl->valisnull = false;
+	}
+}
+
 /* The child's next row, counted, and timed when the node is. */
 static TupleTableSlot *
 lion_join_child_next(LionCountScanState *st)

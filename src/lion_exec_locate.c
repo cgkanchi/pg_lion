@@ -65,6 +65,13 @@ lion_eval_clause_values(LionCountScanState *st)
 		cl->val = datumCopy(val, typbyval, typlen);
 	}
 
+	/*
+	 * The keys of the dimensions folded into fact filters (DESIGN.md §27, "A
+	 * second dimension that only filters"), as arrays in the same context.
+	 */
+	if (st->join != NULL && st->join->nfilter > 0)
+		lion_join_filter_values(st);
+
 	MemoryContextSwitchTo(oldcxt);
 }
 

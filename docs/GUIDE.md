@@ -221,6 +221,21 @@ d.pk FROM dim d WHERE ... AND EXISTS (SELECT 1 FROM f1 WHERE f1.fk = d.pk AND ..
 against the dimension rows that pass. The node's child is PostgreSQL's own plan of that join. An
 inner or outer join inside the dimension, which could repeat a row, keeps the ordinary plan.
 
+A second table joined to the fact table only to filter it is folded into a fact filter (DESIGN.md
+§27, "A second dimension that only filters"). In `SELECT cu.country, count(*) FROM orders o JOIN
+customers cu ON o.customer_id = cu.id JOIN products p ON o.product_id = p.id WHERE p.discontinued
+GROUP BY cu.country` nothing of `products` is wanted above the join and its key is unique, so the
+join keeps the orders whose `product_id` is the id of a discontinued product, each once. The node
+runs the plan of `products` itself, as a second child, at the start of each scan, and counts with
+`o.product_id = ANY (<those ids>)` among the fact filters, which needs a Lion index on
+`o.product_id`: EXPLAIN lists it among the `Lion Indexes` as `(product_id = p.id)`, and EXPLAIN
+ANALYZE counts its keys (`Join Filter Keys`). Up to eight such tables are folded, each inner-joined
+to the fact table alone by one equality on a unique key of its own and expected to return no more
+rows than the node locates of one `IN` list at once (`work_mem` of them at 256 bytes each, at least
+1,000). A table whose column is selected or grouped by, that is joined to another table too, or
+that is outer-joined keeps the ordinary plan; with a folded table the node does not run in
+parallel.
+
 The rows of such a semi or anti join themselves - `d` semi-joined to `f1`, where a sort, another
 join, an aggregate the node does not answer, or the node above as its joined dimension needs them -
 can come from the same lookups: `Custom Scan (LionSemiJoin)` emits each row of its outer side whose

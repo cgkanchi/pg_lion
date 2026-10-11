@@ -859,6 +859,11 @@ lion_begin_join(LionCountScanState *st, const LionCountPriv *priv,
 	js->sort.op = priv->join.sortop;
 	js->sort.coll = priv->join.sortcoll;
 	js->batch.walk = (flags & LION_JOINFLAG_WALK) != 0;
+	js->nfilter = priv->join.nfilter;
+	memcpy(js->filterclause, priv->join.filterclause,
+		   sizeof(int) * js->nfilter);
+	memcpy(js->filtercol, priv->join.filtercol,
+		   sizeof(AttrNumber) * js->nfilter);
 	st->join = js;
 }
 
@@ -1052,6 +1057,19 @@ lion_begin_clauses(LionCountScanState *st, CustomScanState *node,
 		 * column it references.
 		 */
 		if (st->join != NULL && i == st->join->clause)
+		{
+			cl->con = NULL;
+			cl->valstate = NULL;
+			continue;
+		}
+
+		/*
+		 * Nor is a dimension folded into a fact filter's (DESIGN.md §27, "A
+		 * second dimension that only filters"): its values are the keys of
+		 * its child's rows, collected at the start of each run
+		 * (lion_join_filter_values()), and its expression a placeholder.
+		 */
+		if (lion_join_filter_of(st, i) >= 0)
 		{
 			cl->con = NULL;
 			cl->valstate = NULL;
@@ -1341,6 +1359,15 @@ lion_begin_join_child(LionCountScanState *st, CustomScanState *node,
 	js->child = ExecInitNode((Plan *) linitial(cscan->custom_plans),
 							 estate, eflags);
 	node->custom_ps = list_make1(js->child);
+
+	/* ... and each dimension folded into a fact filter, a child of its own */
+	for (i = 0; i < js->nfilter; i++)
+	{
+		js->filterps[i] = ExecInitNode((Plan *) list_nth(cscan->custom_plans,
+														 i + 1),
+									   estate, eflags);
+		node->custom_ps = lappend(node->custom_ps, js->filterps[i]);
+	}
 }
 
 /*

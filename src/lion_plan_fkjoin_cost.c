@@ -240,6 +240,29 @@ typedef struct LionFkJoinCost
 	double		cfk;			/* ... one key's */
 } LionFkJoinCost;
 
+/*
+ * The share of the fact's rows the dimensions folded into fact filters leave
+ * (DESIGN.md §27, "A second dimension that only filters"), which the fact
+ * rel's own estimate knows nothing of: their clauses are the RestrictInfos
+ * among the fact filters, each with its share cached
+ * (lion_fkjoin_filter_costclause()), the other filters bare clauses.
+ */
+static double
+lion_fkjoin_filters_sel(List *whereclauses)
+{
+	double		sel = 1.0;
+	ListCell   *lc;
+
+	foreach(lc, whereclauses)
+	{
+		RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+
+		if (IsA(ri, RestrictInfo) && ri->norm_selec >= 0)
+			sel *= ri->norm_selec;
+	}
+	return sel;
+}
+
 static Cost
 lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 					 List *wherecol, Var *fkvar, int joinclause,
@@ -253,7 +276,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		dirtyfrac = 1.0 - rel->allvisfrac;
 	double		tuples = Max(rel->tuples, 1.0);
-	double		wheresel = Min(Max(rel->rows, 1.0) / tuples, 1.0);
+	double		wheresel = Min(Max(rel->rows, 1.0) / tuples, 1.0) *
+		lion_fkjoin_filters_sel(whereclauses);
 	IndexOptInfo *fkidx = (IndexOptInfo *) list_nth(whereidx, joinclause);
 	AttrNumber	fkcol = (AttrNumber) list_nth_int(wherecol, joinclause);
 	int			nclause = list_length(whereclauses);
@@ -407,6 +431,8 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 
 		sel = clause_selectivity(root, clause, 0, JOIN_INNER, NULL);
 		probesets = 0.0;
+		if (IsA(clause, RestrictInfo))
+			clause = (Node *) ((RestrictInfo *) clause)->clause;
 		if (IsA(clause, ScalarArrayOpExpr))
 		{
 			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;

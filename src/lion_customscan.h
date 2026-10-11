@@ -240,6 +240,12 @@
 #define LION_JOIN_SEMI		1
 #define LION_JOIN_ANTI		2
 
+/*
+ * The dimensions an FK-side join folds into fact filters, at most (DESIGN.md
+ * §27, "A second dimension that only filters").
+ */
+#define LION_MAX_JOIN_FILTERS	8
+
 /* Flag bits of the join member of custom_private (LION_PRIV_JOIN). */
 #define LION_JOINFLAG_COLLECT	0x01	/* the fact filters are collected once */
 #define LION_JOINFLAG_ROWS		0x02	/* one row per dimension row that joins
@@ -1013,7 +1019,12 @@ typedef struct LionVColScope
  *		otherwise), and, added at plan time once the child plan exists, the
  *		position of that column in the child's target list.  The join key
  *		clause is not a source: the node looks it up once per child row (per
- *		distinct key), in source slot 0
+ *		distinct key), in source slot 0.  Then the dimensions folded into fact
+ *		filters (DESIGN.md §27, "A second dimension that only filters"), each
+ *		the number of its clause - an IN list on the fact's fk, whose values
+ *		are the keys of a child plan's rows - and the key's column: its attnum
+ *		in its table in the path's list, its position in that child's target
+ *		list in the plan's.  Filter i's child is custom_plans' i + 1
  *	11	List of three OidLists: the functions whose evaluation the node
  *		replaces, for the EXECUTE checks the executor would have made on the
  *		plan it stands for (DESIGN.md §9, "Privileges"; checked at executor
@@ -1168,6 +1179,11 @@ typedef struct LionVColScope
  * expression columns (DESIGN.md §41), whose attnums an older build would have
  * looked up as heap columns.
  *
+ * Shape 23 gave the JOIN member (10) the dimensions folded into fact filters
+ * after the child's column (DESIGN.md §27, "A second dimension that only
+ * filters"), whose clauses an older build would have evaluated as the NULL
+ * placeholders they carry, and counted nothing.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1180,7 +1196,7 @@ typedef struct LionVColScope
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424916
+#define LION_PRIV_MAGIC		0x52424917
 #define LION_PRIV_NMEMBERS	21
 
 /*
@@ -1858,6 +1874,13 @@ typedef struct LionJoinWorkerSums
  * (LION_JT_*).  The count's own counters are in the scan's stats
  * (LionCountStats: key_containers, copy_containers, ...).
  *
+ * The dimensions folded into fact filters (DESIGN.md §27, "A second
+ * dimension that only filters"): nfilter of them, each an IN list, clause
+ * filterclause[i], whose values are column filtercol[i] of the rows of child
+ * filterps[i] - run whole at the start of each run, its NULL keys left out
+ * (lion_join_filter_values()); filterkeys counts the keys, for EXPLAIN
+ * ANALYZE.
+ *
  * A partitioned fact table's turns (part), the parallel plan's shared copy of
  * the fact filters (pcopy) and the workers' sums of these counters (worker)
  * are groups of their own.  What every participant of a parallel plan adds
@@ -1911,6 +1934,12 @@ typedef struct LionJoinState
 	int64		posting;
 	bool		timing;
 	instr_time	time[LION_JT_N];
+
+	int			nfilter;
+	int			filterclause[LION_MAX_JOIN_FILTERS];
+	AttrNumber	filtercol[LION_MAX_JOIN_FILTERS];
+	PlanState  *filterps[LION_MAX_JOIN_FILTERS];
+	int64		filterkeys;
 
 	LionJoinSort sort;
 	LionJoinBatch batch;
@@ -1980,6 +2009,13 @@ typedef struct LionCountPrivJoin
 	Oid			sortcoll;
 	AttrNumber	keyresno;		/* the key's column of the child: PLAN
 								 * stage only, 0 at the PATH stage */
+	int			nfilter;		/* the dimensions folded into fact filters */
+	int			filterclause[LION_MAX_JOIN_FILTERS];	/* ... their clauses */
+	AttrNumber	filtercol[LION_MAX_JOIN_FILTERS];	/* ... and the key's
+													 * column: its attnum at
+													 * the PATH stage, its
+													 * child's resno at the
+													 * PLAN stage */
 } LionCountPrivJoin;
 
 /* A column the aggregates of DESIGN.md §37 are taken over: WAGG's lists */
@@ -3074,6 +3110,8 @@ extern TupleTableSlot *lion_exec_join_agg(CustomScanState *node);
 extern void lion_end_join_agg(CustomScanState *node);
 extern void lion_rescan_join_agg(CustomScanState *node);
 extern void lion_join_locate_where(LionCountScanState *st);
+extern void lion_join_filter_values(LionCountScanState *st);
+extern int	lion_join_filter_of(const LionCountScanState *st, int clauseno);
 extern void lion_join_switch_reset(LionCountScanState *st);
 extern void lion_join_batch_reset(LionCountScanState *st);
 extern void lion_join_unite_release(LionCountScanState *st);

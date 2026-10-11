@@ -289,11 +289,29 @@ lion_plan_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	AttrNumber	fkattno;
 	AttrNumber	fgattno;
 	AttrNumber	keyresno;
+	int			i;
 	ListCell   *lc;
 
-	if (list_length(custom_plans) != 1)
-		elog(ERROR, "LionCount: a join needs exactly one child plan");
+	if (list_length(custom_plans) != 1 + priv->join.nfilter ||
+		list_length(best_path->custom_paths) != 1 + priv->join.nfilter)
+		elog(ERROR, "LionCount: a join needs one child plan, and one a filter");
 	child = (Plan *) linitial(custom_plans);
+
+	/*
+	 * Each dimension folded into a fact filter (DESIGN.md §27, "A second
+	 * dimension that only filters"): its key's column, of its own child,
+	 * which the node reads the keys from.
+	 */
+	for (i = 0; i < priv->join.nfilter; i++)
+	{
+		Path	   *fpath = (Path *) list_nth(best_path->custom_paths, i + 1);
+		Var		   *fvar = makeVar(fpath->parent->relid,
+								   priv->join.filtercol[i],
+								   InvalidOid, -1, InvalidOid, 0);
+
+		priv->join.filtercol[i] =
+			lion_child_resno((Plan *) list_nth(custom_plans, i + 1), fvar);
+	}
 
 	joinclause = priv->join.clause;
 	keyexpr = (Node *) list_nth(priv->consts, joinclause);

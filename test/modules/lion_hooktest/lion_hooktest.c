@@ -330,6 +330,15 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 	else if (strcmp(variant, "path join at plan") == 0)
 		lfirst(list_nth_cell(priv, LION_PRIV_JOIN)) =
 			list_make5_int(0, LION_JOIN_INNER, 0, 0, 0);
+	else if (strcmp(variant, "join filter on its key") == 0)
+	{
+		List	   *join = list_make5_int(0, LION_JOIN_INNER, 0, 0, 0);
+
+		join = lappend_int(join, 1);	/* the key's column of the child */
+		join = lappend_int(join, 0);	/* a filter on the key's clause */
+		join = lappend_int(join, 1);
+		lfirst(list_nth_cell(priv, LION_PRIV_JOIN)) = join;
+	}
 	else if (strcmp(variant, "or length") == 0)
 		lfirst(list_nth_cell(priv, LION_PRIV_ORS)) =
 			list_make1(list_make3_int(0, 2, 1));

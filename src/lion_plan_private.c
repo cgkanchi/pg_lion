@@ -200,15 +200,22 @@ lion_priv_decode_ors(List *priv, LionCountPriv *out)
  * The FK-side join (DESIGN.md §27): the key's clause, the kind of join, its
  * flags, the sort operator and collation of distinct keys, and - added at
  * plan time, once the child plan exists - the key's column of the child.
+ * Then the dimensions folded into fact filters ("A second dimension that only
+ * filters"): each one's clause, an IN list, and the key's column - its attnum,
+ * and at plan time its position in the target list of its own child.
  */
 static void
 lion_priv_decode_join(List *priv, LionPrivStage stage, LionCountPriv *out)
 {
 	List	   *join = (List *) list_nth(priv, LION_PRIV_JOIN);
+	int			head = (stage == LION_PRIV_STAGE_PLAN) ? 6 : 5;
+	int			per = 2;
+	int			f;
 
 	if (join == NIL)
 		return;
-	if (list_length(join) != (stage == LION_PRIV_STAGE_PLAN ? 6 : 5))
+	if (list_length(join) < head || (list_length(join) - head) % per != 0 ||
+		(list_length(join) - head) / per > LION_MAX_JOIN_FILTERS)
 		elog(ERROR, "LionCount: malformed join");
 	out->hasjoin = true;
 	out->join.clause = linitial_int(join);
@@ -218,6 +225,19 @@ lion_priv_decode_join(List *priv, LionPrivStage stage, LionCountPriv *out)
 	out->join.sortcoll = (Oid) list_nth_int(join, 4);
 	out->join.keyresno = (stage == LION_PRIV_STAGE_PLAN) ?
 		(AttrNumber) list_nth_int(join, 5) : 0;
+	out->join.nfilter = (list_length(join) - head) / per;
+	for (f = 0; f < out->join.nfilter; f++)
+	{
+		int			c = list_nth_int(join, head + f * per);
+
+		out->join.filterclause[f] = c;
+		out->join.filtercol[f] = (AttrNumber) list_nth_int(join,
+														  head + f * per + 1);
+		if (c < 0 || c >= out->nclause || c == out->join.clause ||
+			out->clause[c].kind != LION_CLAUSE_ARRAY ||
+			out->join.filtercol[f] <= 0)
+			elog(ERROR, "LionCount: malformed join");
+	}
 	if (out->join.clause < 0 || out->join.clause >= out->nclause ||
 		(out->join.type != LION_JOIN_INNER &&
 		 out->join.type != LION_JOIN_SEMI &&
@@ -667,10 +687,15 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 	m = NIL;
 	if (p->hasjoin)
 	{
+		int			f;
+
 		m = list_make5_int(p->join.clause, p->join.type, p->join.flags,
 						   (int) p->join.sortop, (int) p->join.sortcoll);
 		if (stage == LION_PRIV_STAGE_PLAN)
 			m = lappend_int(m, (int) p->join.keyresno);
+		for (f = 0; f < p->join.nfilter; f++)
+			m = lappend_int(lappend_int(m, p->join.filterclause[f]),
+							(int) p->join.filtercol[f]);
 	}
 	priv = lappend(priv, m);
 
@@ -1038,7 +1063,9 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 		elog(ERROR, "LionCount: malformed coalesce group");
 
 	/*
-	 * The FK-side join (DESIGN.md §27): one child, and flags that go
+	 * The FK-side join (DESIGN.md §27): one child - and one more for each
+	 * dimension folded into a fact filter, beside a plain inner join and not
+	 * in parallel ("A second dimension that only filters") - and flags that go
 	 * together - distinct keys only for an inner join with their operator;
 	 * a sum is not rows, counts are an inner join's rows, and the outer
 	 * side's rows (a join path) are a semi or anti join's rows alone.  A
@@ -1046,7 +1073,10 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	 * dimension's rows, with no fact column grouped by.
 	 */
 	if (p->hasjoin &&
-		(ncustom_plans != 1 ||
+		(ncustom_plans != 1 + p->join.nfilter ||
+		 (p->join.nfilter > 0 &&
+		  (p->join.type != LION_JOIN_INNER || joinunique || joinouter ||
+		   joinleft || parallel_aware)) ||
 		 (joinunique &&
 		  (p->join.type != LION_JOIN_INNER || !OidIsValid(p->join.sortop))) ||
 		 (joinsum && joinrows) ||
