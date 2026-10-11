@@ -10199,7 +10199,11 @@ sections above ask of the fact side.
   filters, a leaf's are located and copied at its first turn into a copy of its own
   (`LionJoinPart`), which its later turns count beside the fk sets they locate; the copy was made
   after the snapshot was taken and is only ever counted beside that leaf's own located fk sets,
-  which is all "Why a stale copy is safe" asks of it. The copies are all held for the run, within
+  which is all "Why a stale copy is safe" asks of it. The copy keeps, per multi-key clause, how
+  the clause came out and the query it was located with - a tsquery's prefixes expanded into THAT
+  leaf's index's lexemes (§17), held for the run in the values' memory, not the turn's - because
+  a later batch builds the leaf's row filter from them without locating the clause again
+  (`test/sql/fkjoin_partition.sql`, "a prefix phrase, expanded per partition"). The copies are all held for the run, within
   one hash table's memory between them - each leaf's collection has what the ones before it left,
   and spills past it (`lion_sources_collect()`'s spill) - and are freed by a rescan. A plan that
   probes the filters instead locates a leaf's again at each turn, since the leaf keeps nothing
@@ -14489,7 +14493,12 @@ than overruns (§30.4).
   0.63 ms where building at 40,000 took 1.40. A leaf key that selects nothing makes an AND of it
   empty, as before (`lo_lazy_empty()`). Exactness is the lion quals' own (every lazy key is an
   exact set). A rescan keeps the memo unless a Param of the lion quals changed, as it keeps a
-  built set; the members met are the scan's and go with it. EXPLAIN ANALYZE says `Lion Set:
+  built set; the members met are the scan's and go with it. When a rule above builds the set
+  mid-walk, the members met are counted again against the built set rather than carried over:
+  the probes answered from the index as it was, and a VACUUM in between may have taken out the
+  dead TIDs the walk met and marked, which the built set no longer has; carried over, they would
+  let the count reach the set's members while live members were still ahead, and the early stop
+  would end the scan before them (`test/isolation/specs/ordered_lazy_vacuum.spec`). EXPLAIN ANALYZE says `Lion Set:
   lazy, K keys probed, exact`, or `N containers, exact, after K keys probed (why)` when it was
   built, `why` naming the rule that built it - `heap order`, `probe budget`, `switch due`,
   `long walk` (`LO_LAZY_WALK_WORK` entries a unit of the budget) or `memo size` (the memo past

@@ -1225,9 +1225,14 @@ typedef struct LionClauseState
 	 * LION_CLAUSE_MULTI: the query as this scan answers it, val with each
 	 * prefix lexeme expanded into the index's lexemes that have it
 	 * (lion_tsquery_expand_prefixes()); val itself otherwise.  Set by
-	 * lion_locate_multikey(), in wherecxt.
+	 * lion_locate_multikey().  An expansion is a copy in valcxt, which
+	 * outlives wherecxt: a partition's copy of its filters (LionJoinPart)
+	 * builds the row filter of a later batch from it after the locate's
+	 * memory is gone.  xvalown says the clause still owns that copy and frees
+	 * it when it locates again; a partition that keeps it takes it over.
 	 */
 	Datum		xval;
+	bool		xvalown;
 	Relation	idx;
 	Datum		storedkey;
 	bool		hasstoredkey;
@@ -1349,10 +1354,11 @@ typedef struct LionJoinEnt
  * after one of the partition's indexes (filterindex), whose Relation the copy
  * is pointed at again at each turn - or, in a parallel plan whose workers
  * started, a view of the copy the participants made together (`shared`,
- * viewshared).  qmode is what the run's values made of its multi-key clauses
- * (lion_locate_multikey()), which the row filter of a later batch is built
- * from without locating them again.  missing says the filters select no row
- * of it at all.
+ * viewshared).  qmode and xval are what the run's values made of its multi-key
+ * clauses (lion_locate_multikey()) - how each came out, and the query with
+ * its prefixes expanded into this partition's index's lexemes - which the row
+ * filter of a later batch is built from without locating them again.
+ * missing says the filters select no row of it at all.
  */
 typedef struct LionJoinPart
 {
@@ -1364,6 +1370,7 @@ typedef struct LionJoinPart
 	Oid			filterindex;
 	LionPostingSet filter;
 	LionQueryMode *qmode;		/* one per clause */
+	Datum	   *xval;			/* ... and the query each was located with */
 	MemoryContext cxt;
 	struct LionSharedCopy *shared;
 

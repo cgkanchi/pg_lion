@@ -168,6 +168,7 @@ typedef struct LionCountPathBuild
 	Var		   *groupvar[LION_MAX_GROUPCOLS];
 	AttrNumber	groupattno[LION_MAX_GROUPCOLS];
 	Oid			groupeqop[LION_MAX_GROUPCOLS];
+	Oid			groupcoll[LION_MAX_GROUPCOLS];	/* the grouping's collation */
 	bool		groupvalueout[LION_MAX_GROUPCOLS];
 	double		groupest[LION_MAX_GROUPCOLS];
 	int			ngroup;
@@ -267,6 +268,8 @@ lion_count_path_init(LionCountPathBuild *cx, PlannerInfo *root,
 	cx->groupattno[1] = 0;
 	cx->groupeqop[0] = InvalidOid;
 	cx->groupeqop[1] = InvalidOid;
+	cx->groupcoll[0] = InvalidOid;
+	cx->groupcoll[1] = InvalidOid;
 	cx->groupvalueout[0] = false;
 	cx->groupvalueout[1] = false;
 	cx->groupest[0] = 1.0;
@@ -602,6 +605,15 @@ lion_count_path_group_by(LionCountPathBuild *cx)
 			 * (DESIGN.md §14).
 			 */
 			cx->groupattno[cx->ngroup] = cx->groupvar[cx->ngroup]->varattno;
+
+			/*
+			 * The collation the groups are under is the grouping
+			 * expression's, not the column's: `GROUP BY s COLLATE c` groups
+			 * under c, which lion_strip() took off with the RelabelType.
+			 * The index that drives the groups has to be built under it
+			 * (lion_collect_targets()).
+			 */
+			cx->groupcoll[cx->ngroup] = exprCollation(gexpr);
 
 			/* The same column twice is not a grouping this node can drive. */
 			for (i = 0; i < cx->ngroup; i++)
@@ -1837,17 +1849,20 @@ lion_count_path_targets(LionCountPathBuild *cx)
 			Var		   *tv = cx->groupvar[h - 1];
 			AttrNumber	ta = cx->groupattno[h - 1];
 			Oid			te = cx->groupeqop[h - 1];
+			Oid			tc = cx->groupcoll[h - 1];
 			bool		tvo = cx->groupvalueout[h - 1];
 			double		tn = cx->groupest[h - 1];
 
 			cx->groupvar[h - 1] = cx->groupvar[h];
 			cx->groupattno[h - 1] = cx->groupattno[h];
 			cx->groupeqop[h - 1] = cx->groupeqop[h];
+			cx->groupcoll[h - 1] = cx->groupcoll[h];
 			cx->groupvalueout[h - 1] = cx->groupvalueout[h];
 			cx->groupest[h - 1] = cx->groupest[h];
 			cx->groupvar[h] = tv;
 			cx->groupattno[h] = ta;
 			cx->groupeqop[h] = te;
+			cx->groupcoll[h] = tc;
 			cx->groupvalueout[h] = tvo;
 			cx->groupest[h] = tn;
 		}
@@ -1862,7 +1877,7 @@ lion_count_path_targets(LionCountPathBuild *cx)
 		{
 			drive[g].attno = cx->groupattno[g];
 			drive[g].var = cx->groupvar[g];
-			drive[g].collation = cx->groupvar[g]->varcollid;
+			drive[g].collation = cx->groupcoll[g];
 			drive[g].eqop = cx->groupeqop[g];
 			drive[g].valueout = cx->groupvalueout[g];
 		}

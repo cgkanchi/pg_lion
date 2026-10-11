@@ -47,6 +47,9 @@ lion_eval_clause_values(LionCountScanState *st)
 		Datum		val;
 		bool		isnull;
 
+		/* the reset took every expansion (lion_locate_multikey()) */
+		cl->xval = (Datum) 0;
+		cl->xvalown = false;
 		if (cl->valstate == NULL)
 			continue;			/* a literal: cl->val is already right */
 
@@ -300,8 +303,8 @@ lion_array_batch_prepare(LionCountScanState *st, int k, LionClauseState *cl)
  * rechecks LOSSY and ALL in the heap (lion_build_filter()).
  */
 static int
-lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
-					LionKeyNode **tree)
+lion_locate_multikey(LionCountScanState *st, LionClauseState *cl,
+					LionPostingSet **sets, LionKeyNode **tree)
 {
 	LionState   *istate = lion_index_column_state(cl->idx, cl->idxcol);
 	StrategyNumber strategy;
@@ -334,10 +337,32 @@ lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
 	 * a recheck is allowed (lion_analyze_leaf()).
 	 */
 	expanded = true;
+	if (cl->xvalown)
+	{
+		pfree(DatumGetPointer(cl->xval));
+		cl->xvalown = false;
+	}
 	cl->xval = cl->val;
 	if (strategy == LION_STRAT_MATCH)
-		cl->xval = lion_tsquery_expand_prefixes(cl->idx, istate, cl->val,
-												&expanded);
+	{
+		Datum		x = lion_tsquery_expand_prefixes(cl->idx, istate, cl->val,
+													 &expanded);
+
+		/*
+		 * The expansion is in wherecxt, which the turn's end resets, and a
+		 * partition keeps the query its filters were located with for the
+		 * row filters of its later batches (lion_join_part_open()): a copy
+		 * in valcxt, which lives as long as the values do.
+		 */
+		if (x != cl->val)
+		{
+			MemoryContext oldcxt = MemoryContextSwitchTo(st->valcxt);
+
+			cl->xval = datumCopy(x, false, -1);
+			cl->xvalown = true;
+			MemoryContextSwitchTo(oldcxt);
+		}
+	}
 
 	/*
 	 * A jsonpath is only ever a superset, over key prefixes the extraction
@@ -410,7 +435,8 @@ lion_locate_multikey(LionClauseState *cl, LionPostingSet **sets,
  * §19).
  */
 static LionKeyNode *
-lion_locate_leaf(LionClauseState *cl, LionPostingSet **sets, int *nsets)
+lion_locate_leaf(LionCountScanState *st, LionClauseState *cl,
+				 LionPostingSet **sets, int *nsets)
 {
 	LionKeyNode *tree = NULL;
 	int			n = 0;
@@ -454,7 +480,7 @@ lion_locate_leaf(LionClauseState *cl, LionPostingSet **sets, int *nsets)
 			break;
 
 		case LION_CLAUSE_MULTI:
-			n = lion_locate_multikey(cl, sets, &tree);
+			n = lion_locate_multikey(st, cl, sets, &tree);
 			if (n == 0)
 				tree = NULL;
 			break;
@@ -722,7 +748,7 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 		}
 		else
 		{
-			leaftree[i] = lion_locate_leaf(cl, &leafsets[i], &leafn[i]);
+			leaftree[i] = lion_locate_leaf(st, cl, &leafsets[i], &leafn[i]);
 			if (leaftree[i] != NULL && cl->kind == LION_CLAUSE_MULTI &&
 				cl->qmode == LION_QMODE_LOSSY)
 				leaftree[i] = lion_posfilter_node(cl, leaftree[i]);
@@ -1083,7 +1109,7 @@ lion_locate_where(LionCountScanState *st)
 		}
 
 		src->negated = LION_CLAUSE_IS_NEGATED(cl->kind);
-		src->tree = lion_locate_leaf(cl, &src->sets, &src->nsets);
+		src->tree = lion_locate_leaf(st, cl, &src->sets, &src->nsets);
 
 		/*
 		 * A multi-key query no key narrows (DESIGN.md §17, "A query known

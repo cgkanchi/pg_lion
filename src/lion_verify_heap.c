@@ -199,7 +199,11 @@ lion_verify_read_unreached(LionVerifyState *vs, BlockNumber blk,
 		!LionPageIsDeleted(page))
 	{
 		LionPageOpaque opaque = LionPageGetOpaque(page);
-		OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+		OffsetNumber maxoff;
+
+		/* a page nothing has checked yet: its header before its items */
+		lion_verify_page_bounds(vs, blk, page);
+		maxoff = PageGetMaxOffsetNumber(page);
 
 		u->level = opaque->level;
 		if (LionPageIsBucket(page) || LionPageIsDir(page))

@@ -168,13 +168,33 @@ lion_verify_has_block(const BlockNumber *sorted, int n, BlockNumber blk)
 /*
  * Read blk with a SHARE lock and check its page header and kind.
  */
+/*
+ * The header bounds everything else on the page: the line pointer array ends
+ * at pd_lower, the items live in [pd_upper, pd_special).  A page read from
+ * disk had this checked by PageIsVerified(); one that was damaged in shared
+ * buffers did not.  Every reader of a page nothing has checked yet asks this
+ * before it counts the page's line pointers.
+ */
+void
+lion_verify_page_bounds(LionVerifyState *vs, BlockNumber blk, Page page)
+{
+	PageHeader	phdr = (PageHeader) page;
+
+	if (phdr->pd_lower < SizeOfPageHeaderData ||
+		phdr->pd_lower > phdr->pd_upper ||
+		phdr->pd_upper > phdr->pd_special ||
+		phdr->pd_special > BLCKSZ)
+		lion_corrupt("lion index \"%s\": block %u has a page header with lower %u, upper %u and special %u",
+					RelationGetRelationName(vs->index), blk,
+					phdr->pd_lower, phdr->pd_upper, phdr->pd_special);
+}
+
 Page
 lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
 					 Buffer *bufp)
 {
 	Buffer		buf;
 	Page		page;
-	PageHeader	phdr;
 	LionPageOpaque opaque;
 	uint16		flags;
 
@@ -197,20 +217,7 @@ lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
 		lion_corrupt("lion index \"%s\": block %u has never been initialised",
 					RelationGetRelationName(vs->index), blk);
 
-	/*
-	 * The header bounds everything else on the page: the line pointer array
-	 * ends at pd_lower, the items live in [pd_upper, pd_special).  A page read
-	 * from disk had this checked by PageIsVerified(); one that was damaged in
-	 * shared buffers did not.
-	 */
-	phdr = (PageHeader) page;
-	if (phdr->pd_lower < SizeOfPageHeaderData ||
-		phdr->pd_lower > phdr->pd_upper ||
-		phdr->pd_upper > phdr->pd_special ||
-		phdr->pd_special > BLCKSZ)
-		lion_corrupt("lion index \"%s\": block %u has a page header with lower %u, upper %u and special %u",
-					RelationGetRelationName(vs->index), blk,
-					phdr->pd_lower, phdr->pd_upper, phdr->pd_special);
+	lion_verify_page_bounds(vs, blk, page);
 
 	if (PageGetSpecialSize(page) != LION_SPECIAL_SIZE)
 		lion_corrupt("lion index \"%s\": block %u has a special area of %u bytes, expected %zu",
@@ -1598,6 +1605,7 @@ lion_verify_pos_covers(LionVerifyState *vs, const LionEntryTuple *entry,
 {
 	LionVerifyCover cv;
 	Buffer		buf;
+	BlockNumber steps = 0;
 
 	cv.codes = codes;
 	cv.ncodes = ncodes;
@@ -1614,6 +1622,14 @@ lion_verify_pos_covers(LionVerifyState *vs, const LionEntryTuple *entry,
 		OffsetNumber o;
 		BlockNumber next;
 
+		/*
+		 * The set's own walk (lion_verify_set()) checked this chain just
+		 * before, so a cycle here would be a page changed in between; the
+		 * walk is bounded all the same, as every walk of this file is.
+		 */
+		if (++steps > vs->nblocks)
+			lion_corrupt("lion index \"%s\": the leaves of the posting set at %u form a cycle",
+						RelationGetRelationName(vs->index), entry->head);
 		if (!lion_page_owns_entry(page, entry->hash, entry->head) ||
 			!LionPageIsPostingLeaf(page))
 			lion_corrupt("lion index \"%s\": block %u is not a leaf of the posting set at %u",
@@ -1636,6 +1652,10 @@ lion_verify_pos_covers(LionVerifyState *vs, const LionEntryTuple *entry,
 		buf = InvalidBuffer;
 		if (BlockNumberIsValid(next))
 		{
+			if (!lion_verify_block_exists(vs, next))
+				lion_corrupt("lion index \"%s\": the right link of block %u points at block %u, but the index has only %u blocks",
+							RelationGetRelationName(vs->index), blk, next,
+							vs->nblocks);
 			buf = ReadBuffer(vs->index, next);
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 		}
