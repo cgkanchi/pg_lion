@@ -150,11 +150,11 @@ CREATE INDEX lpr_bt ON lpr (ts);
 SELECT lpr_note('vacuumed, btree', NULL);
 DROP INDEX lpr_bt;
 SELECT lpr_note('vacuumed, lion', 'lpr_lion');
--- 9,000 more, and their leaves - some 300 of this column's, an index that
--- grew by inserts holding about 34 of its keys to a leaf - are more than the
--- probe reads (LION_PROBE_LEAVES): it gives up, and the histogram's own end
--- stands, as it does for core's probe when that gives up.
-DELETE FROM lpr WHERE id > 20000;
+-- 15,000 more, and their leaves - an index that grew by inserts holds a few
+-- dozen of its keys to a leaf - are more than the probe reads
+-- (LION_PROBE_LEAVES): it gives up, and the histogram's own end stands, as
+-- it does for core's probe when that gives up.
+DELETE FROM lpr WHERE id > 14000;
 VACUUM lpr;
 SELECT lpr_note('too many, lion', 'lpr_lion');
 SELECT lpr_note('too many, core', NULL);

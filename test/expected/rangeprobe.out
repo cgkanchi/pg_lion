@@ -229,11 +229,11 @@ SELECT lpr_note('vacuumed, lion', 'lpr_lion');
  
 (1 row)
 
--- 9,000 more, and their leaves - some 300 of this column's, an index that
--- grew by inserts holding about 34 of its keys to a leaf - are more than the
--- probe reads (LION_PROBE_LEAVES): it gives up, and the histogram's own end
--- stands, as it does for core's probe when that gives up.
-DELETE FROM lpr WHERE id > 20000;
+-- 15,000 more, and their leaves - an index that grew by inserts holds a few
+-- dozen of its keys to a leaf - are more than the probe reads
+-- (LION_PROBE_LEAVES): it gives up, and the histogram's own end stands, as
+-- it does for core's probe when that gives up.
+DELETE FROM lpr WHERE id > 14000;
 VACUUM lpr;
 SELECT lpr_note('too many, lion', 'lpr_lion');
  lpr_note 
@@ -263,7 +263,7 @@ SELECT (SELECT est FROM lpr_est WHERE step = 'deleted, lion') =
 SELECT count(*) FROM lpr WHERE ts >= '2026-01-10';
  count 
 -------
-  7041
+  1041
 (1 row)
 
 -- ---------- 4. what is not probed ----------
@@ -285,7 +285,7 @@ SET plan_cache_mode = force_generic_plan;
 EXECUTE lpr_p('2026-01-02 02:00');
  count 
 -------
- 18441
+ 12441
 (1 row)
 
 RESET plan_cache_mode;
