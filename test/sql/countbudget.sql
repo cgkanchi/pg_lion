@@ -220,7 +220,8 @@ RESET work_mem;
  * mark nothing earlier has raised.
  */
 CREATE TABLE lion_cbm (k int, ki int, x int);
-INSERT INTO lion_cbm SELECT g % 5000, g % 30000, g % 7 FROM generate_series(1, 100000) g;
+-- 40 rows a key of k: too many for 64 bytes of sparse segment, so CHAIN
+INSERT INTO lion_cbm SELECT g % 5000, g % 30000, g % 7 FROM generate_series(1, 200000) g;
 CREATE INDEX lion_cbm_k ON lion_cbm USING lion (k) WITH (inline_limit = 64);
 CREATE INDEX lion_cbm_ki ON lion_cbm USING lion (ki);
 CREATE INDEX lion_cbm_x ON lion_cbm USING lion (x);

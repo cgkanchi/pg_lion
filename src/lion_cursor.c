@@ -328,13 +328,9 @@ lion_cursor_counted(LionSetCursor *cur)
 static bool
 lion_cursor_emit_segment(LionSetCursor *cur)
 {
-	const LionContainer *seg = cur->seg;
-	const uint32 *ckeys = LION_SPARSE_CKEYS_CONST(seg);
-	/* the pairs a reader may look at, and los[] where that many ckeys end */
-	uint32		n = lion_sparse_npairs(seg);
-	const uint16 *los = LION_SPARSE_LOS_CONST_AT(seg, n);
+	LionSparseIter *it = &cur->segit;
 	uint32		ckey;
-	uint32		end;
+	uint32		nmembers;
 	Size		need;
 
 	/*
@@ -342,15 +338,23 @@ lion_cursor_emit_segment(LionSetCursor *cur)
 	 * (DESIGN.md §22).  Its pairs are sorted, so the ones below the target are
 	 * skipped here rather than presented and thrown away by the merge; when no
 	 * seek has happened mintarget is 0 or already behind us and this is a
-	 * no-op.
+	 * no-op.  A segment is at most 255 bytes, so the skip is a short decode.
 	 */
-	while (cur->segpos < n && ckeys[cur->segpos] < cur->mintarget)
-		cur->segpos++;
+	while (cur->seghave && lion_sparse_iter_ckey(it) < cur->mintarget)
+		cur->seghave = lion_sparse_iter_next(it);
 
-	if (cur->segpos >= n)
+	if (!cur->seghave)
 		return false;
 
-	ckey = ckeys[cur->segpos];
+	ckey = lion_sparse_iter_ckey(it);
+	{
+		LionSparseIter peek = *it;
+
+		nmembers = 1;
+		while (lion_sparse_iter_next(&peek) &&
+			   lion_sparse_iter_ckey(&peek) == ckey)
+			nmembers++;
+	}
 
 	/*
 	 * Allocated on first use, not per cursor: an IN list of a thousand values
@@ -364,13 +368,11 @@ lion_cursor_emit_segment(LionSetCursor *cur)
 	 * LION_CONTAINER_MAX_SIZE beyond that (lion_container_append_sorted()
 	 * turns it into a BITSET) always covers.
 	 */
-	for (end = cur->segpos; end < n && ckeys[end] == ckey; end++)
-		;
-	if (end - cur->segpos > LION_ARRAY_MAX_CARD)
+	if (nmembers > LION_ARRAY_MAX_CARD)
 		need = LION_CONTAINER_MAX_SIZE;
 	else
 		need = LION_CONTAINER_HDRSZ +
-			Max(end - cur->segpos, LION_SPARSE_THRESHOLD) * sizeof(uint16);
+			Max(nmembers, LION_SPARSE_THRESHOLD) * sizeof(uint16);
 	if (cur->segbuf == NULL || cur->segcap < need)
 	{
 		/* (the old one, if any, goes with the context: only a malformed
@@ -380,17 +382,16 @@ lion_cursor_emit_segment(LionSetCursor *cur)
 	}
 
 	/*
-	 * A segment's pairs are data (DESIGN.md §3): a lo is masked into range
-	 * before the builder sees it, and the builder copes with pairs that are
-	 * out of order or repeated.
+	 * A segment's pairs are data (DESIGN.md §3): a lo is the low bits of a
+	 * code and so in range, and the builder copes with pairs that are out of
+	 * order or repeated, which a damaged stream's wrapping deltas can make.
 	 */
 	lion_container_init(cur->segbuf, ckey);
 	do
 	{
-		lion_container_append_sorted(cur->segbuf,
-									 (uint16) (los[cur->segpos] & LION_LO_MASK));
-		cur->segpos++;
-	} while (cur->segpos < n && ckeys[cur->segpos] == ckey);
+		lion_container_append_sorted(cur->segbuf, lion_sparse_iter_lo(it));
+		cur->seghave = lion_sparse_iter_next(it);
+	} while (cur->seghave && lion_sparse_iter_ckey(it) == ckey);
 
 	cur->cur = cur->segbuf;
 	cur->valid = true;
@@ -418,7 +419,8 @@ lion_cursor_advance(LionSetCursor *cur)
 		}
 
 		cur->seg = item;
-		cur->segpos = 0;
+		lion_sparse_iter_init(&cur->segit, item);
+		cur->seghave = lion_sparse_iter_next(&cur->segit);
 		if (lion_cursor_emit_segment(cur))
 			return;
 		cur->seg = NULL;		/* an empty segment: nothing to present */

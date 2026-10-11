@@ -12,12 +12,13 @@
 --    that compared against it crashed in detoast (lion_check_key()).
 -- 4. A member at heap offset 0, which lion_index_verify() passed.
 -- 5. A NARROW (DESIGN.md §38) whose cardinality is not its payload's.
--- 6. A NARROW in an index whose meta page says version 6.
+-- 6. A NARROW in an index whose meta page records none.
 -- 7. A NARROW of a width the build does not have, which sizes it.
 -- 8. A directory entry whose key length claims more than its item holds.
 -- 9. An entry whose TID count is less than what VACUUM removes from it.
 -- 10. An INLINE entry whose item ends between its key and the aligned start
 --     of its payload, where the payload length wrapped around zero.
+-- 11. An index whose meta page says a format version before this build's.
 --
 -- The pages are damaged on disk, as corrupt.sql does it (pg_buffercache_evict(),
 -- PostgreSQL 17 and later - on 16 the test is skipped,
@@ -212,14 +213,15 @@ SELECT count(*) FROM lion_di_n WHERE k = 1;
 RESET pg_lion.enable_count_pushdown;
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_n_i')$$);
 DROP INDEX lion_di_n_i;
--- ---------- 6. a NARROW in an index of version 6 ----------
--- The same index with its meta page's version (at byte 28) made 6: a build
--- before §38 would read it and not know the items, which is what version 8
--- is there to prevent, so lion_index_verify() reports it.
+-- ---------- 6. a NARROW in an index whose meta page records none ----------
+-- The same index with LION_META_NARROW (4) cleared in its meta page's
+-- order_flags (at byte 60): VACUUM makes a NARROW only in an index whose
+-- build wrote one, and inserts make none, so lion_index_verify() reports it.
 CREATE INDEX lion_di_n_i ON lion_di_n USING lion (k) WITH (inline_limit = 64);
 SELECT lion_di_evict('lion_di_n_i');
-SELECT lion_di_u32(lion_di_block('lion_di_n_i', 0), 28) AS version;
-SELECT lion_di_poke('lion_di_n_i', 0, 28, lion_di_le32(6));
+SELECT lion_di_u32(lion_di_block('lion_di_n_i', 0), 60) & 4 AS narrow_flag;
+SELECT lion_di_poke('lion_di_n_i', 0, 60,
+					lion_di_le32(lion_di_u32(lion_di_block('lion_di_n_i', 0), 60) & ~4));
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_n_i')$$);
 DROP INDEX lion_di_n_i;
 -- ---------- 7. a NARROW of a width the build does not have ----------
@@ -325,6 +327,30 @@ SELECT lion_di_try($$SELECT t, count(*) FROM lion_di_s GROUP BY t ORDER BY t$$);
 SELECT lion_di_try($$SELECT lion_index_count('lion_di_s_i', $$ || quote_literal(:'lion_di_key') || '::text)');
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_s_i')$$);
 DROP TABLE lion_di_s;
+-- ---------- 11. an index of an older format version ----------
+-- An index with its meta page's version (at byte 28) made 8, the format
+-- before the varbyte sparse segments of DESIGN.md §13: its segments would be
+-- read as the wrong bytes, so lion_index_verify() reports it and a reader
+-- refuses it, asking for a REINDEX - which makes it whole again.
+CREATE INDEX lion_di_old_i ON lion_di USING lion (k);
+SELECT lion_di_evict('lion_di_old_i');
+SELECT lion_di_u32(lion_di_block('lion_di_old_i', 0), 28) AS version;
+SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(8));
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
+DO $$
+DECLARE
+	h text;
+BEGIN
+	PERFORM lion_index_count('lion_di_old_i', 1);
+	RAISE NOTICE 'read an index of version 8';
+EXCEPTION WHEN OTHERS THEN
+	GET STACKED DIAGNOSTICS h = PG_EXCEPTION_HINT;
+	RAISE NOTICE '%: %', SQLSTATE, h;
+END $$;
+REINDEX INDEX lion_di_old_i;
+SELECT lion_di_u32(lion_di_block('lion_di_old_i', 0), 28) AS version;
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
+DROP INDEX lion_di_old_i;
 -- ---------- an undamaged index still works ----------
 CREATE INDEX lion_di_i ON lion_di USING lion (k);
 SELECT count(*) FROM lion_di WHERE k = 7;
