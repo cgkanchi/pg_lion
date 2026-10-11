@@ -121,11 +121,12 @@ VACUUM (FREEZE, ANALYZE) lion_sc_t;
 -- one entry for the two spellings, which is what the opclass says
 SELECT entries FROM lion_index_stats('lion_sc_v');
 
--- ---- a second clause no index answers: declined ------------------------
+-- ---- a second clause no index answers: residual -----------------------
 /*
- * `v = 'A'` is the type's equality, which lion_sc_ops does not have, so
- * nothing can answer it and the query is the ordinary plan's: 5000 rows.  The
- * pushdown used to count the entry of `===` alone - 10000.
+ * `v = 'A'` is the type's equality, which lion_sc_ops does not have, so no
+ * posting set answers it: it is a residual clause (DESIGN.md §10), tested on
+ * the heap row of each row `===` selects, and the count is 5000.  The
+ * pushdown once counted the entry of `===` alone - 10000.
  */
 SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v = 'A'$$);
 SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v = 'A' AND v === 'A'$$);
@@ -149,7 +150,8 @@ RESET enable_indexscan;
  * collation makes a wrong answer of.  Both collations here are deterministic,
  * so the answer is the same either way; what is checked is that the clause
  * under "C" is not taken for the other one's duplicate, since w's index was
- * built under the column's own collation and cannot answer it.
+ * built under the column's own collation and cannot answer it: it is
+ * residual, tested on the heap rows the other selects.
  */
 SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE w = 'A' AND w COLLATE "C" = 'A'$$);
 SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE w COLLATE "C" = 'A' AND w = 'A'$$);

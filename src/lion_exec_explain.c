@@ -1413,6 +1413,23 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 	lion_explain_indexes(st, ancestors, es);
 
 	/*
+	 * The residual clauses (DESIGN.md §10, "Residual clauses"), tested on the
+	 * heap row of each row the others select, as core prints a scan's Filter.
+	 */
+	if (st->residexprs != NIL)
+	{
+		List	   *context = set_deparse_context_plan(es->deparse_cxt,
+													   st->css.ss.ps.plan,
+													   ancestors);
+
+		ExplainPropertyText("Residual Filter",
+							deparse_expression((Node *)
+											   make_ands_explicit(st->residexprs),
+											   context, false, false),
+							es);
+	}
+
+	/*
 	 * The clauses partitions leave out because their bounds imply them
 	 * (DESIGN.md §16), each followed by how many of the partitions do when it
 	 * is not all of them.  A range taken as a source is a restriction per

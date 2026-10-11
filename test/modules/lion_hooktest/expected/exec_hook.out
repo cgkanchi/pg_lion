@@ -43,6 +43,8 @@ INSERT INTO nc_nodes VALUES
 	 'SELECT count(*) FROM nc WHERE j = 2 OR k <> 3', 'int4ne(int4,int4)', ''),
 	('LionCount, a NOT of a multi-key query',
 	 'SELECT count(*) FROM nc WHERE NOT (d @@ ''w1 & w3'')', 'ts_match_vq(tsvector,tsquery)', ''),
+	('LionCount, a residual clause',
+	 'SELECT count(*) FROM nc WHERE k = 3 AND o % 7 = 1', 'int4mod(int4,int4)', ''),
 	('LionCount, an expression column filtered',
 	 'SELECT count(*) FROM nc WHERE nc_bucket(j) = 1', 'nc_bucket(int4)', ''),
 	('LionCount, an expression column grouped',
@@ -183,6 +185,11 @@ SELECT node, nc_hook(node) FROM nc_nodes ORDER BY node;
  LionCount, a complement in an OR         | plain EXPLAIN: as the ordinary plan
  LionCount, a complement in an OR         | a cached plan: ERROR: lion_hooktest: execution of int4ne(integer,integer) denied
  LionCount, a complement in an OR         | allowed again: the answer
+ LionCount, a residual clause             | plan: planned
+ LionCount, a residual clause             | refused: ERROR: lion_hooktest: execution of int4mod(integer,integer) denied, as the ordinary plan
+ LionCount, a residual clause             | plain EXPLAIN: as the ordinary plan
+ LionCount, a residual clause             | a cached plan: ERROR: lion_hooktest: execution of int4mod(integer,integer) denied
+ LionCount, a residual clause             | allowed again: the answer
  LionCount, an IS DISTINCT FROM           | plan: planned
  LionCount, an IS DISTINCT FROM           | refused: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied, as the ordinary plan
  LionCount, an IS DISTINCT FROM           | plain EXPLAIN: as the ordinary plan
@@ -218,7 +225,7 @@ SELECT node, nc_hook(node) FROM nc_nodes ORDER BY node;
  LionSemiJoin                             | plain EXPLAIN: as the ordinary plan
  LionSemiJoin                             | a cached plan: ERROR: lion_hooktest: execution of int4eq(integer,integer) denied
  LionSemiJoin                             | allowed again: the answer
-(65 rows)
+(70 rows)
 
 SHOW lion_hooktest.deny_execute;
  lion_hooktest.deny_execute 

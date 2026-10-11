@@ -91,6 +91,15 @@ is a `NOT` of a query whose index sets only bound its rows (an empty array, a NU
 phrase). On five million rows `count(*) WHERE n IS DISTINCT FROM 17` took 1.6 ms against 380 for
 the sequential scan.
 
+A `WHERE` clause no Lion index answers - `payload LIKE 'ab%'`, `id > 1000` on a column without
+one, `length(name) = 3` - no longer sends the count to the ordinary plan when the other clauses do
+select rows: the node counts those rows and tests the clause on each of them in the heap
+(`Residual Filter` in EXPLAIN; DESIGN.md §10, "Residual clauses"). It does the work of a bitmap
+heap scan over the same rows, so it is taken when the other clauses select at most half the table,
+and the planner compares its price with the ordinary plan's; a volatile function, a subquery, a
+partitioned table or a join's count keeps the ordinary plan. `pg_lion.enable_count_residual = off`
+turns it off.
+
 An expression index counts as a column of its expression (DESIGN.md §41). With `CREATE INDEX ON
 events USING lion ((payload->>'status'))`, `WHERE payload->>'status' = 'paid'`, `IN`, ranges,
 `<>`, `IS NULL`, `GROUP BY payload->>'status'` and `count(DISTINCT payload->>'status')` are

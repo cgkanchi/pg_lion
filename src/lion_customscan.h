@@ -212,6 +212,15 @@
 #define LION_TL_IS_WKEY(kind)		((kind) >= 0x20000000 && (kind) < 0x30000000)
 #define LION_TL_WKEY_COL(kind)		((kind) - 0x20000000)
 
+/*
+ * A heap column a residual clause reads (DESIGN.md §10, "Residual clauses"):
+ * LION_TL_RESID(attno) is column attno of the relation counted, which the
+ * node fills from the heap row it tests and no row it emits prints.
+ */
+#define LION_TL_RESID(attno)		(0x30000000 + (attno))
+#define LION_TL_IS_RESID(kind)		((kind) > 0x30000000 && (kind) < 0x30010000)
+#define LION_TL_RESID_ATTNO(kind)	((AttrNumber) ((kind) - 0x30000000))
+
 /* ... and what each one computes */
 #define LION_WAGG_NONE		0
 #define LION_WAGG_SUM		1	/* sum(int2), sum(int4): an int8 */
@@ -954,6 +963,11 @@ typedef struct LionVColScope
 #define LION_FLAG_DECODE			0x10	/* the GROUP BY columns are counted by
 										 * the decoded walk (DESIGN.md §34),
 										 * named in LION_PRIV_GROUPN */
+#define LION_FLAG_RESID			0x20	/* WHERE clauses no posting set
+										 * answers, tested on each row's heap
+										 * tuple (DESIGN.md §10, "Residual
+										 * clauses"), in custom_exprs after
+										 * the aggregates' arguments */
 
 /*
  * What the planner decided, in a form the executor can be handed through
@@ -1084,7 +1098,15 @@ typedef struct LionVColScope
  *		expression of a lion index's key column as the scan's relation
  *		numbers its Vars; an attnum of LION_VCOL_ATTNO(i) anywhere above names
  *		the i'th.  Empty when no attnum does
- *	20	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	20	List of Expr, or empty: the WHERE clauses no posting set answers,
+ *		as an implicit-AND list, which the node tests on the heap tuple of
+ *		every row the others select (DESIGN.md §10, "Residual clauses";
+ *		LION_FLAG_RESID).  The PATH carries them here;
+ *		lion_plan_custom_path() appends them to custom_exprs after the
+ *		aggregates' arguments - where setrefs.c points their columns at
+ *		LION_TL_RESID columns of custom_scan_tlist and SS_finalize_plan()
+ *		sees their Params - and leaves this member empty
+ *	21	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -1107,7 +1129,8 @@ typedef struct LionVColScope
 #define LION_PRIV_TOPK		17
 #define LION_PRIV_WAGG		18
 #define LION_PRIV_VCOLS		19
-#define LION_PRIV_TLKINDS	20
+#define LION_PRIV_RESID		20
+#define LION_PRIV_TLKINDS	21
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -1188,6 +1211,11 @@ typedef struct LionVColScope
  * (member 7): complements, counted by De Morgan (DESIGN.md §35, "Complements
  * in an OR"), which an older build would have taken for selections.
  *
+ * Shape 24 added the RESID member (20) in front of the target-list kinds,
+ * the LION_FLAG_RESID bit and the LION_TL_RESID columns: residual clauses
+ * tested on the heap (DESIGN.md §10, "Residual clauses"), which an older
+ * build would have counted without.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1200,8 +1228,8 @@ typedef struct LionVColScope
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424917
-#define LION_PRIV_NMEMBERS	21
+#define LION_PRIV_MAGIC		0x52424918
+#define LION_PRIV_NMEMBERS	22
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -2097,6 +2125,7 @@ typedef struct LionCountPriv
 
 	List	   *consts;			/* CONSTS: PATH stage only */
 	List	   *having;			/* HAVING: PATH stage only */
+	List	   *resid;			/* RESID: PATH stage only */
 } LionCountPriv;
 
 typedef struct LionCountScanState
@@ -2434,6 +2463,21 @@ typedef struct LionCountScanState
 	 * away again.
 	 */
 	LionRowFilter *filter;
+
+	/*
+	 * The residual clauses (DESIGN.md §10, "Residual clauses"), or resid
+	 * NULL: their ExprState over residslot, which has custom_scan_tlist's
+	 * columns and is filled from each heap row tested at the nresidcol
+	 * LION_TL_RESID columns residslotcol[], heap columns residattno[] of the
+	 * relation counted.  Evaluated in residecxt, reset after each row.
+	 */
+	ExprState  *resid;
+	List	   *residexprs;		/* ... the clauses, for EXPLAIN */
+	TupleTableSlot *residslot;
+	ExprContext *residecxt;
+	int			nresidcol;
+	int		   *residslotcol;
+	AttrNumber *residattno;
 
 	/*
 	 * Whether the statement leaves the relation being counted alone
@@ -3014,6 +3058,17 @@ extern Cost lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel,
 							  List *whereidx, List *wherecol,
 							  List *whereclauses, List *wherekinds, List *ors,
 							  double matched, double counts, double ceiling);
+extern double lion_residual_rows(PlannerInfo *root, RelOptInfo *rel,
+								 List *residual);
+extern Cost lion_cost_residual(PlannerInfo *root, RelOptInfo *rel,
+							   List *residual, double counts);
+
+/*
+ * The largest share of a table the rows that residual clauses are tested on
+ * may be (DESIGN.md §10, "Residual clauses"): past it, fetching them one by
+ * one is no cheaper than the sequential scan that reads them all.
+ */
+#define LION_RESID_MAX_SHARE	0.5
 
 /* lion_plan_fkjoin_cost.c */
 extern double lion_fkjoin_fk_ndistinct(PlannerInfo *root, RelOptInfo *rel,

@@ -248,6 +248,8 @@ typedef struct LionCountPathBuild
 								 * query is known only at run time (§17) */
 	bool		newnegated;		/* an `IS DISTINCT FROM` or `NOT (multi-key)`
 								 * clause outside the ORs (§35) */
+	List	   *residual;		/* clauses no posting set answers, tested on
+								 * the heap (§10, "Residual clauses") */
 } LionCountPathBuild;
 
 static void lion_try_count_path_scoped(LionCountPathBuild *cxp);
@@ -1117,6 +1119,102 @@ lion_all_as_and(Node *clause)
  * whereopnos and whereinor, in step - with ors, the ranges per column
  * (rangevars, rangecls, rangepos) and what the clauses say of each column.
  */
+/*
+ * May a WHERE clause no posting set answers be tested on the heap tuple of
+ * each row the others select (DESIGN.md §10, "Residual clauses")?  Of one
+ * plain table's count, not an FK-side join's: an expression over the
+ * table's own user columns, Params and constants that calls nothing
+ * volatile and holds no subplan, which the node evaluates as the ordinary
+ * plan's scan would - with ExecInitQual() - on the rows the snapshot sees.
+ */
+static bool
+lion_residual_ok(LionCountPathBuild *cx, RestrictInfo *rinfo)
+{
+	Node	   *clause = (Node *) rinfo->clause;
+	List	   *vars;
+	ListCell   *lc;
+	bool		ok = true;
+
+	if (!lion_enable_count_residual || cx->partitioned || cx->fj != NULL)
+		return false;
+	if (contain_subplans(clause) || contain_volatile_functions(clause) ||
+		contain_agg_clause(clause) || contain_window_function(clause))
+		return false;
+	vars = pull_var_clause(clause, PVC_INCLUDE_PLACEHOLDERS);
+	foreach(lc, vars)
+	{
+		Var		   *var = (Var *) lfirst(lc);
+
+		if (!IsA(var, Var) || var->varno != (int) cx->rti ||
+			var->varlevelsup != 0 || var->varattno <= 0)
+		{
+			ok = false;
+			break;
+		}
+	}
+	list_free(vars);
+	return ok;
+}
+
+/*
+ * Has every clause the analysis of one restriction appended, from position
+ * `from` on, an index of this (plain) table to answer it?  A clause of the
+ * right shape on a column no lion index covers - `id > 10` - is only found
+ * out when the relation's indexes are matched (lion_collect_targets()),
+ * which declines the whole query; asked here, it can be residual instead.
+ */
+static bool
+lion_where_indexed(LionCountPathBuild *cx, int from)
+{
+	ListCell   *l1;
+	ListCell   *l2;
+	int			i = 0;
+
+	forboth(l1, cx->whereattnos, l2, cx->clauseinfos)
+	{
+		LionClauseInfo *ci = (LionClauseInfo *) lfirst(l2);
+		AttrNumber	col = 1;
+
+		if (i++ < from)
+			continue;
+		if (lion_match_index(cx->input_rel, (AttrNumber) lfirst_int(l1),
+							 ci->kind, ci->opno, ci->cmptype, ci->strategy,
+							 ci->extractquery, ci->collation, ci->positions,
+							 &col) == NULL)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * What the analysis of one restriction may have added to cx, kept so that a
+ * restriction that turns out to be residual leaves no trace of the leaves it
+ * had appended: the struct, with its own copy of every list the analysis
+ * appends to.
+ */
+static void
+lion_count_path_snapshot(const LionCountPathBuild *cx,
+						 LionCountPathBuild *snap)
+{
+	*snap = *cx;
+	snap->whereattnos = list_copy(cx->whereattnos);
+	snap->clauseinfos = list_copy(cx->clauseinfos);
+	snap->whereclauses = list_copy(cx->whereclauses);
+	snap->whereconsts = list_copy(cx->whereconsts);
+	snap->wherekinds = list_copy(cx->wherekinds);
+	snap->whereopnos = list_copy(cx->whereopnos);
+	snap->whereinor = list_copy(cx->whereinor);
+	snap->ors = list_copy(cx->ors);
+	snap->posattnos = list_copy(cx->posattnos);
+	snap->eqattnos = list_copy(cx->eqattnos);
+	snap->nonnullattnos = list_copy(cx->nonnullattnos);
+	snap->nullattnos = list_copy(cx->nullattnos);
+	snap->valueattnos = list_copy(cx->valueattnos);
+	snap->rangevars = list_copy(cx->rangevars);
+	snap->rangecls = list_copy(cx->rangecls);
+	snap->rangepos = list_copy(cx->rangepos);
+}
+
 static bool
 lion_count_path_where(LionCountPathBuild *cx)
 {
@@ -1124,6 +1222,7 @@ lion_count_path_where(LionCountPathBuild *cx)
 	RelOptInfo *input_rel = cx->input_rel;
 	Index		rti = cx->rti;
 	ListCell   *lc;
+	LionCountPathBuild snap;
 
 	/*
 	 * ---- every WHERE clause must be one the posting sets can answer ----
@@ -1149,6 +1248,8 @@ lion_count_path_where(LionCountPathBuild *cx)
 
 		cx->rinfono++;
 		cx->rinfoclauses = lappend(cx->rinfoclauses, rinfo->clause);
+		if (lion_enable_count_residual && !cx->partitioned && cx->fj == NULL)
+			lion_count_path_snapshot(cx, &snap);
 
 		/* a clause of an expression column is one of a column (§41) */
 		clause = lion_vcol_subst((Node *) rinfo->clause);
@@ -1221,14 +1322,34 @@ lion_count_path_where(LionCountPathBuild *cx)
 		}
 		else
 			answered = lion_count_path_where_leaf(cx, rinfo, clause);
+		if (answered && lion_enable_count_residual && !cx->partitioned &&
+			cx->fj == NULL && !lion_where_indexed(cx, startlen))
+			answered = false;
 		if (answered)
 			continue;
 
 		/*
-		 * No posting set answers the clause.  That declines the query - unless
-		 * every partition it counts has bounds that imply the clause, when no
-		 * row it counts can fail it, and it is left out.  Whatever of it was
-		 * taken already (the first arms of an OR) goes too.
+		 * No posting set answers the clause.  On a plain table it may be
+		 * RESIDUAL (DESIGN.md §10, "Residual clauses"): tested on the heap
+		 * tuple of each row the other clauses select, whatever of it was
+		 * taken already (the first arms of an OR) undone.  Whether the
+		 * query may then be counted at all is lion_count_path_strategy()'s
+		 * to say, and whether it should, the price's.
+		 */
+		if (lion_residual_ok(cx, rinfo))
+		{
+			List	   *residual = lappend(cx->residual, rinfo->clause);
+
+			*cx = snap;
+			cx->residual = residual;
+			continue;
+		}
+
+		/*
+		 * Otherwise that declines the query - unless every partition it
+		 * counts has bounds that imply the clause, when no row it counts can
+		 * fail it, and it is left out.  Whatever of it was taken already (the
+		 * first arms of an OR) goes too.
 		 */
 		if (!cx->partitioned ||
 			!lion_implied_everywhere(root, input_rel, input_rel,
@@ -2041,6 +2162,29 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 		return false;
 
 	/*
+	 * Residual clauses (DESIGN.md §10) are tested on the rows the others
+	 * select, which have to be fewer than the table's: a positive clause, an
+	 * OR of them or a range taken as a source, and not a sum over entries -
+	 * every row's, or a range's on the column it walks - that reads no row.
+	 * Nor a multi-key query known only at run time, whose candidates may be
+	 * every row.
+	 */
+	if (cx->residual != NIL &&
+		(!cx->havepositive || cx->sumall || cx->runtimemulti ||
+		 cx->wattnos != NIL))
+		return false;
+
+	/*
+	 * ... and they have to be few enough that fetching them one at a time
+	 * beats reading the table in order (LION_RESID_MAX_SHARE), whatever the
+	 * price of each says: a sequential scan reads a page's rows together.
+	 */
+	if (cx->residual != NIL &&
+		lion_residual_rows(root, input_rel, cx->residual) >
+		LION_RESID_MAX_SHARE * Max(input_rel->tuples, 1.0))
+		return false;
+
+	/*
 	 * A range taken as a source (DESIGN.md §32) is collected into memory and
 	 * holds no pin, so every count it takes part in needs another source that
 	 * carries the §9 interlock, or it would recheck every row in the heap: the
@@ -2585,7 +2729,9 @@ lion_count_path_fill(LionCountPathBuild *cx)
 		(cx->sumall ? LION_FLAG_SUMALL : 0) |
 		(cx->driveattno != 0 ? LION_FLAG_GROUPIDX : 0) |
 		(cx->rangevar != NULL ? LION_FLAG_RANGE : 0) |
-		(cx->decode ? LION_FLAG_DECODE : 0);
+		(cx->decode ? LION_FLAG_DECODE : 0) |
+		(cx->residual != NIL ? LION_FLAG_RESID : 0);
+	p->resid = cx->residual;
 
 	/*
 	 * The strategy of a multi-key clause travels with its operator: the
@@ -2887,6 +3033,19 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 		lion_cost_wagg_path(root, cpath, input_rel, cx->widx, cx->wcols,
 							cx->wnaggs, cx->wcounts);
 
+	/* the residual clauses' test of each row the others select (§10) */
+	if (cx->residual != NIL)
+	{
+		Cost		resid = lion_cost_residual(root, input_rel, cx->residual,
+											   (cx->topkn > 0) ?
+											   (double) cx->topkcand :
+											   cx->numgroups);
+
+		cpath->path.total_cost += resid;
+		if (cpath->path.startup_cost > 0)
+			cpath->path.startup_cost += resid;
+	}
+
 	cpath->path.startup_cost = lion_units_price(&units,
 												cpath->path.startup_cost);
 	cpath->path.total_cost = lion_units_price(&units, cpath->path.total_cost);
@@ -2954,7 +3113,7 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 		cx->groupcoal == NULL &&
 		cx->distvar == NULL && cx->rangevar == NULL && !cx->hasrangesrc &&
 		cx->plainpositive && rangeprice.batched && cx->topkn == 0 &&
-		cx->groupdeps == NIL && cx->ncompl == 0 &&
+		cx->groupdeps == NIL && cx->ncompl == 0 && cx->residual == NIL &&
 		first->driveidx[0] != NULL &&
 		input_rel->consider_parallel && output_rel->consider_parallel &&
 		is_parallel_safe(root, (Node *) cx->priv.consts) &&
@@ -2983,7 +3142,7 @@ lion_count_path_decodable(LionCountPathBuild *cx)
 		cx->ngroup == 2 && !cx->decode && cx->fj == NULL &&
 		!cx->partitioned && cx->distvar == NULL && cx->groupcoal == NULL &&
 		cx->groupdeps == NIL && !cx->sumall && !cx->singlegroup &&
-		cx->ncompl == 0 &&
+		cx->ncompl == 0 && cx->residual == NIL &&
 		!cx->hasrangesrc && cx->rangevars == NIL &&
 		(cx->wherekinds == NIL || cx->havepositive) &&
 		cx->first != NULL && cx->first->driveidx[0] != NULL &&

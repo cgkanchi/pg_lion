@@ -294,7 +294,8 @@ SELECT lion_pd('SELECT sum(id) FROM lion_pdt WHERE a = 3');
 -- ... while count(DISTINCT) is answered since DESIGN.md §26 (distinct.sql)
 SELECT lion_pd('SELECT count(DISTINCT b) FROM lion_pdt WHERE a = 3');
 SELECT lion_pd('SELECT count(*) FILTER (WHERE b = 2) FROM lion_pdt WHERE a = 3');
--- a qual that is not an indexed equality to a constant
+-- a qual that is not an indexed equality to a constant: residual, tested on
+-- the heap rows a = 3 selects (DESIGN.md §10, "Residual clauses")
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND id < 500');
 -- ... which a range on an indexed column is, since DESIGN.md §28
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a > 3');
