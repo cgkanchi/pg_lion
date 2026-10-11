@@ -359,6 +359,95 @@ SELECT cs_q('SELECT a, sum(count(u)) OVER () FROM cs GROUP BY a');
  no count, 7 rows
 (1 row)
 
+-- ---- GROUP BY or DISTINCT with no aggregate: the keys with a visible row ----
+-- a key whose every row is deleted or updated away, never vacuumed
+INSERT INTO cs SELECT 900000 + i, 40, 4, 40, 'gone', 0 FROM generate_series(1, 50) i;
+UPDATE cs SET a = 41, t = 'moved' WHERE id = 900001;
+DELETE FROM cs WHERE id > 900000;
+INSERT INTO cs VALUES (900100, 42, 1, NULL, NULL, 0);
+SELECT cs_plan('SELECT DISTINCT a FROM cs');
+         cs_plan          
+--------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: cs_a (a)
+   Group Key: a
+(3 rows)
+
+SELECT cs_plan('SELECT a, b FROM cs GROUP BY 1, 2');
+                 cs_plan                  
+------------------------------------------
+ Finalize HashAggregate
+   Group Key: a, b
+   ->  Custom Scan (LionCount)
+         Lion Indexes: cs_b (b), cs_a (a)
+         Group Key: b, a
+         Group Strategy: Decoded
+(6 rows)
+
+SELECT cs_plan('SELECT DISTINCT a FROM cs ORDER BY a DESC');
+            cs_plan             
+--------------------------------
+ Sort
+   Sort Key: a DESC
+   ->  Custom Scan (LionCount)
+         Lion Indexes: cs_a (a)
+         Group Key: a
+(5 rows)
+
+SELECT q, cs_q(q) FROM (VALUES
+	('SELECT DISTINCT a FROM cs'),
+	('SELECT DISTINCT t FROM cs'),
+	('SELECT DISTINCT n FROM cs WHERE b = 1'),
+	('SELECT DISTINCT a, b FROM cs'),
+	('SELECT DISTINCT a, b, n FROM cs'),
+	('SELECT DISTINCT a FROM cs WHERE a = 3'),
+	('SELECT DISTINCT a FROM cs WHERE a = 40'),
+	('SELECT DISTINCT a + 1 FROM cs'),
+	('SELECT DISTINCT a FROM cs WHERE n NOT IN (1, 2) ORDER BY a DESC'),
+	('SELECT DISTINCT t FROM cs ORDER BY t LIMIT 3'),
+	('SELECT a FROM cs GROUP BY a'),
+	('SELECT a, b FROM cs GROUP BY 1, 2'),
+	('SELECT t || ''!'' FROM cs WHERE b = 2 GROUP BY t'),
+	('SELECT a FROM cs WHERE a = 3 GROUP BY a'),
+	('SELECT a FROM cs WHERE a = 40 GROUP BY a'),
+	('SELECT a, n FROM cs WHERE b IN (1, 2) GROUP BY a, n'),
+	('SELECT coalesce(n, -1) FROM cs GROUP BY 1')
+) v(q);
+                                q                                |       cs_q       
+-----------------------------------------------------------------+------------------
+ SELECT DISTINCT a FROM cs                                       | count, 8 rows
+ SELECT DISTINCT t FROM cs                                       | count, 14 rows
+ SELECT DISTINCT n FROM cs WHERE b = 1                           | count, 12 rows
+ SELECT DISTINCT a, b FROM cs                                    | count, 36 rows
+ SELECT DISTINCT a, b, n FROM cs                                 | count, 421 rows
+ SELECT DISTINCT a FROM cs WHERE a = 3                           | count, 1 rows
+ SELECT DISTINCT a FROM cs WHERE a = 40                          | count, 0 rows
+ SELECT DISTINCT a + 1 FROM cs                                   | no count, 8 rows
+ SELECT DISTINCT a FROM cs WHERE n NOT IN (1, 2) ORDER BY a DESC | count, 7 rows
+ SELECT DISTINCT t FROM cs ORDER BY t LIMIT 3                    | count, 3 rows
+ SELECT a FROM cs GROUP BY a                                     | count, 8 rows
+ SELECT a, b FROM cs GROUP BY 1, 2                               | count, 36 rows
+ SELECT t || '!' FROM cs WHERE b = 2 GROUP BY t                  | count, 14 rows
+ SELECT a FROM cs WHERE a = 3 GROUP BY a                         | count, 1 rows
+ SELECT a FROM cs WHERE a = 40 GROUP BY a                        | count, 0 rows
+ SELECT a, n FROM cs WHERE b IN (1, 2) GROUP BY a, n             | count, 85 rows
+ SELECT coalesce(n, -1) FROM cs GROUP BY 1                       | count, 12 rows
+(17 rows)
+
+-- DISTINCT ON, DISTINCT over a GROUP BY, and a column with no lion index are
+-- the ordinary plan's
+SELECT q, cs_q(q) FROM (VALUES
+	('SELECT DISTINCT ON (a) a, b FROM cs ORDER BY a, b'),
+	('SELECT DISTINCT count(*) FROM cs GROUP BY a'),
+	('SELECT DISTINCT u FROM cs')
+) v(q);
+                         q                         |       cs_q       
+---------------------------------------------------+------------------
+ SELECT DISTINCT ON (a) a, b FROM cs ORDER BY a, b | no count, 8 rows
+ SELECT DISTINCT count(*) FROM cs GROUP BY a       | no count, 5 rows
+ SELECT DISTINCT u FROM cs                         | no count, 3 rows
+(3 rows)
+
 DROP FUNCTION cs_q(text);
 DROP FUNCTION cs_plan(text);
 DROP TABLE cs, csd;

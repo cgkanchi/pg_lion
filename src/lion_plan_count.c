@@ -242,6 +242,7 @@ typedef struct LionCountPathBuild
 	double		topkrows;		/* ... and the rows of their entries */
 	bool		topkstrict;		/* ... every group tied with the k-th */
 	List	   *vcols;			/* the expression columns (DESIGN.md §41) */
+	bool		distinctstage;	/* a SELECT DISTINCT's keys as the groups */
 } LionCountPathBuild;
 
 static void lion_try_count_path_scoped(LionCountPathBuild *cxp);
@@ -345,9 +346,18 @@ lion_count_path_query(LionCountPathBuild *cx)
 		return false;
 	if (parse->rowMarks != NIL || root->rowMarks != NIL)
 		return false;
-	if (fj == NULL || !fj->joinpath)
+	if (cx->distinctstage)
 	{
-		if (!parse->hasAggs)
+		/* lion_try_distinct_path() has checked the query */
+	}
+	else if (fj == NULL || !fj->joinpath)
+	{
+		/*
+		 * A GROUP BY with no aggregate at all is the groups' keys, each once:
+		 * the groups the walk emits, which are only those with a visible row
+		 * (DESIGN.md §10, "Shapes rewritten to the node's counts").
+		 */
+		if (!parse->hasAggs && parse->groupClause == NIL)
 			return false;
 		if (parse->groupingSets != NIL)
 			return false;
@@ -1680,7 +1690,12 @@ lion_count_path_outputs(LionCountPathBuild *cx)
 		else
 			return false;
 	}
-	if (!haveagg)
+	/*
+	 * No aggregate at all is a GROUP BY's or a DISTINCT's keys alone, which
+	 * need a group to emit (lion_count_path_query()).
+	 */
+	if (!haveagg &&
+		(cx->parse->hasAggs || (cx->ngroup == 0 && !cx->singlegroup)))
 		return false;
 	return true;
 }
@@ -2915,15 +2930,16 @@ lion_count_path_decodable(LionCountPathBuild *cx)
  * or returns false to end it there: a check that failed, or the FK-side join
  * taking over.
  */
-void
-lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
-				   RelOptInfo *output_rel, GroupPathExtraData *extra,
-				   const LionFkJoin *fj)
+static void
+lion_try_count_path_ext(PlannerInfo *root, RelOptInfo *input_rel,
+						RelOptInfo *output_rel, GroupPathExtraData *extra,
+						const LionFkJoin *fj, bool distinctstage)
 {
 	LionCountPathBuild cx;
 	LionVColScope saved;
 
 	lion_count_path_init(&cx, root, input_rel, output_rel, extra, fj);
+	cx.distinctstage = distinctstage;
 
 	if (!lion_count_path_query(&cx))
 		return;
@@ -2946,6 +2962,67 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	PG_FINALLY();
 	{
 		lion_vcol_leave(saved);
+	}
+	PG_END_TRY();
+}
+
+void
+lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
+				   RelOptInfo *output_rel, GroupPathExtraData *extra,
+				   const LionFkJoin *fj)
+{
+	lion_try_count_path_ext(root, input_rel, output_rel, extra, fj, false);
+}
+
+/*
+ * SELECT DISTINCT over one relation, with no GROUP BY, aggregate, window or
+ * set-returning function (DESIGN.md §10, "Shapes rewritten to the node's
+ * counts"): the distinct keys are the groups of a GROUP BY of the same
+ * columns with no aggregate, and the path is that GROUP BY's, added to the
+ * DISTINCT's upper rel.  The build reads the grouping from
+ * root->processed_groupClause, parse->groupClause and output_rel's target,
+ * so for its duration those are the DISTINCT's: its clauses as core kept
+ * them (processed_distinctClause, columns a WHERE equality pins left out,
+ * as a GROUP BY's are), and the target of the rows below, which the upper
+ * rel does not set - core's own DISTINCT paths carry their input's target.
+ * The grouping extra is what core would hand a GROUP BY that may be
+ * partially aggregated: there is nothing to aggregate.
+ */
+void
+lion_try_distinct_path(PlannerInfo *root, RelOptInfo *input_rel,
+					   RelOptInfo *output_rel)
+{
+	Query	   *parse = root->parse;
+	GroupPathExtraData extra;
+	List	   *savedprocessed = root->processed_groupClause;
+	List	   *savedgroup = parse->groupClause;
+	PathTarget *savedtarget = output_rel->reltarget;
+
+	if (parse->distinctClause == NIL || parse->hasDistinctOn ||
+		parse->groupClause != NIL || parse->groupingSets != NIL ||
+		parse->hasAggs || parse->hasWindowFuncs || parse->hasTargetSRFs ||
+		root->hasHavingQual)
+		return;
+
+	memset(&extra, 0, sizeof(extra));
+	extra.flags = GROUPING_CAN_PARTIAL_AGG;
+	extra.patype = PARTITIONWISE_AGGREGATE_NONE;
+	extra.havingQual = NULL;
+	extra.targetList = root->processed_tlist;
+
+	root->processed_groupClause = root->processed_distinctClause;
+	parse->groupClause = parse->distinctClause;
+	output_rel->reltarget = input_rel->reltarget;
+	PG_TRY();
+	{
+		lion_try_count_path_ext(root, input_rel, output_rel, &extra, NULL,
+								true);
+	}
+	PG_FINALLY();
+	{
+		root->processed_groupClause = savedprocessed;
+		parse->groupClause = savedgroup;
+		output_rel->reltarget = savedtarget;
 	}
 	PG_END_TRY();
 }
