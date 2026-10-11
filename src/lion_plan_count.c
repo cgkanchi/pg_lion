@@ -978,6 +978,69 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 }
 
 /*
+ * `col <> ALL (array)` - `col NOT IN (a, b, ...)` - as the conjunction it
+ * stands for, `col <> a AND col <> b AND ...` (DESIGN.md §10, "Shapes
+ * rewritten to the node's counts"): one OpExpr a literal element, or NIL
+ * where the rewrite is not made.  Both forms are false or unknown for a NULL
+ * col, and for every other row they agree element by element, so the rewrite
+ * is exact - provided no element is NULL: one makes the ALL unknown for
+ * every row, and is left to the ordinary plan.  An empty list, true of every
+ * row, is left there too, and so is an array known only at run time, whose
+ * elements are not there to be taken apart.  Each conjunct has the array's
+ * operator and input collation; whether a posting set answers it is the
+ * caller's question.
+ */
+static List *
+lion_all_as_and(Node *clause)
+{
+	ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+	Node	   *right;
+	Const	   *arr;
+	ArrayType  *a;
+	Oid			elemtype;
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			n;
+	int			i;
+	List	   *out = NIL;
+
+	if (!IsA(clause, ScalarArrayOpExpr) || saop->useOr ||
+		list_length(saop->args) != 2)
+		return NIL;
+	right = lion_strip((Node *) lsecond(saop->args));
+	if (right == NULL || !IsA(right, Const) || ((Const *) right)->constisnull)
+		return NIL;
+	arr = (Const *) right;
+	a = DatumGetArrayTypeP(arr->constvalue);
+	elemtype = ARR_ELEMTYPE(a);
+	get_typlenbyvalalign(elemtype, &typlen, &typbyval, &typalign);
+	deconstruct_array(a, elemtype, typlen, typbyval, typalign,
+					  &elems, &nulls, &n);
+	if (n == 0 || n > LION_MAX_ARRAY_ELEMS)
+		return NIL;
+	for (i = 0; i < n; i++)
+	{
+		Const	   *c;
+		OpExpr	   *op;
+
+		if (nulls[i])
+			return NIL;
+		c = makeConst(elemtype, -1, arr->constcollid, typlen,
+					  datumCopy(elems[i], typbyval, typlen), false, typbyval);
+		op = (OpExpr *) make_opclause(saop->opno, BOOLOID, false,
+									  (Expr *) copyObject(linitial(saop->args)),
+									  (Expr *) c, InvalidOid,
+									  saop->inputcollid);
+		op->opfuncid = saop->opfuncid;
+		out = lappend(out, op);
+	}
+	return out;
+}
+
+/*
  * Every WHERE clause must be one the posting sets can answer, or, over a
  * partitioned table, one every partition's bounds imply.  Builds the clause
  * lists - whereattnos, clauseinfos, whereclauses, whereconsts, wherekinds,
@@ -1009,6 +1072,7 @@ lion_count_path_where(LionCountPathBuild *cx)
 		LionLeafInfo leaf;
 		int			startlen = list_length(cx->whereattnos);
 		bool		answered;
+		List	   *ands;
 
 		if (!IsA(rinfo, RestrictInfo) || rinfo->pseudoconstant)
 			return false;
@@ -1060,11 +1124,31 @@ lion_count_path_where(LionCountPathBuild *cx)
 		}
 
 		/*
-		 * An OR across columns (lion_count_path_where_or()), or a clause of
-		 * one column (lion_count_path_where_leaf()).
+		 * An OR across columns (lion_count_path_where_or()), `col NOT IN
+		 * (...)` as its `<>` clauses (lion_all_as_and()), or a clause of one
+		 * column (lion_count_path_where_leaf()).
 		 */
 		if (IsA(clause, BoolExpr) && ((BoolExpr *) clause)->boolop == OR_EXPR)
 			answered = lion_count_path_where_or(cx, clause);
+		else if ((ands = lion_all_as_and(clause)) != NIL)
+		{
+			ListCell   *la;
+
+			answered = true;
+			foreach(la, ands)
+			{
+				Node	   *conj = (Node *) lfirst(la);
+
+				if (!lion_analyze_leaf(root, conj, rti, true, true, true,
+									   &leaf) ||
+					leaf.kind != LION_CLAUSE_NE ||
+					!lion_count_path_where_leaf(cx, rinfo, conj))
+				{
+					answered = false;
+					break;
+				}
+			}
+		}
 		else
 			answered = lion_count_path_where_leaf(cx, rinfo, clause);
 		if (answered)

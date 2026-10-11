@@ -56,6 +56,8 @@ INSERT INTO nc_nodes VALUES
 	 'SELECT count(*) FROM nc WHERE k = 3', 'count()', ''),
 	('LionCount, an expression over its count',
 	 'SELECT k, round(100.0 * count(*) / 3000, 2) FROM nc GROUP BY k', 'round(numeric,int4)', ''),
+	('LionCount, a NOT IN list',
+	 'SELECT count(*) FROM nc WHERE k NOT IN (3, 4)', 'int4ne(int4,int4)', ''),
 	('LionCount, an expression column filtered',
 	 'SELECT count(*) FROM nc WHERE nc_bucket(j) = 1', 'nc_bucket(int4)', ''),
 	('LionCount, an expression column grouped',

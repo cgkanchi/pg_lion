@@ -173,6 +173,26 @@ SELECT q, cs_q(q) FROM (VALUES
 	('SELECT count(u) FROM cs')
 ) v(q);
 
+-- ---- NOT IN (list): its <> clauses, ANDed ----
+SELECT cs_plan('SELECT count(*) FROM cs WHERE a NOT IN (3, 4, 5)');
+SELECT q, cs_q(q) FROM (VALUES
+	('SELECT count(*) FROM cs WHERE a NOT IN (3, 4, 5)'),
+	('SELECT count(*) FROM cs WHERE n NOT IN (1, 2)'),
+	('SELECT count(*) FROM cs WHERE n <> ALL (ARRAY[1, 2, 2])'),
+	('SELECT count(*) FROM cs WHERE t NOT IN (''v1'', ''v2'') AND b = 3'),
+	('SELECT b, count(*) FROM cs WHERE a NOT IN (0, 6) GROUP BY b'),
+	('SELECT n, count(*) FROM cs WHERE n NOT IN (1, 2) GROUP BY n'),
+	('SELECT count(*) FROM cs WHERE a NOT IN (3) AND n NOT IN (3, 5)'),
+	('SELECT d.r, count(*) FROM cs JOIN csd d ON d.pk = cs.a WHERE cs.n NOT IN (1, 2) GROUP BY d.r')
+) v(q);
+-- a NULL in the list makes it unknown for every row, and an empty one true
+-- for every row: both are the ordinary plan's
+SELECT q, cs_q(q) FROM (VALUES
+	('SELECT count(*) FROM cs WHERE a NOT IN (3, NULL)'),
+	('SELECT count(*) FROM cs WHERE n <> ALL (''{}''::int[])'),
+	('SELECT count(*) FROM cs WHERE u NOT IN (1, 2)')
+) v(q);
+
 DROP FUNCTION cs_q(text);
 DROP FUNCTION cs_plan(text);
 DROP TABLE cs, csd;
