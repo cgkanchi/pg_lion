@@ -181,15 +181,15 @@ SET max_parallel_maintenance_workers = 2;
 SET client_min_messages = debug1;
 REINDEX INDEX lion_build_tv;
 DEBUG:  building index "lion_build_tv" on table "lion_build" serially
-DEBUG:  lion index "lion_build_tv": 1 key columns, 332 entries, 41 blocks, 34 directory pages, height 1, fillfactor 90, built in memory
+DEBUG:  lion index "lion_build_tv": 1 key columns, 332 entries, 37 blocks, 30 directory pages, height 1, fillfactor 90, built in memory
 SET max_parallel_maintenance_workers = 0;
 REINDEX INDEX lion_build_tv;
 DEBUG:  building index "lion_build_tv" on table "lion_build" serially
-DEBUG:  lion index "lion_build_tv": 1 key columns, 332 entries, 41 blocks, 34 directory pages, height 1, fillfactor 90, built in memory
+DEBUG:  lion index "lion_build_tv": 1 key columns, 332 entries, 37 blocks, 30 directory pages, height 1, fillfactor 90, built in memory
 SET maintenance_work_mem = :'lion_build_least_mem';
 REINDEX INDEX lion_build_tv;
 DEBUG:  building index "lion_build_tv" on table "lion_build" serially
-DEBUG:  lion index "lion_build_tv": 1 key columns, 332 entries, 41 blocks, 34 directory pages, height 1, fillfactor 90, built in memory
+DEBUG:  lion index "lion_build_tv": 1 key columns, 332 entries, 37 blocks, 30 directory pages, height 1, fillfactor 90, built in memory
 SET client_min_messages = warning;
 RESET maintenance_work_mem;
 RESET max_parallel_maintenance_workers;
