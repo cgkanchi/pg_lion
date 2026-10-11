@@ -66,6 +66,24 @@ static const CustomScanMethods lion_join_agg_scan_methods = {
 	.CreateCustomScanState = lion_create_join_agg_state,
 };
 
+/*
+ * The upper paths of one base relation: a DISTINCT, a GROUP BY, or grouping
+ * sets (lion_try_gsets_path(), DESIGN.md §10, "Grouping sets").
+ */
+static void
+lion_try_upper_path(PlannerInfo *root, UpperRelationKind stage,
+					RelOptInfo *input_rel, RelOptInfo *output_rel, void *extra)
+{
+	if (stage == UPPERREL_DISTINCT)
+		lion_try_distinct_path(root, input_rel, output_rel);
+	else if (root->parse->groupingSets != NIL)
+		lion_try_gsets_path(root, input_rel, output_rel,
+							(GroupPathExtraData *) extra);
+	else
+		lion_try_count_path(root, input_rel, output_rel,
+						   (GroupPathExtraData *) extra, NULL);
+}
+
 void
 lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 					   RelOptInfo *input_rel, RelOptInfo *output_rel,
@@ -132,21 +150,13 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	 */
 	if (!lion_probe_begin(root, input_rel, input_rel->baserestrictinfo))
 	{
-		if (stage == UPPERREL_DISTINCT)
-			lion_try_distinct_path(root, input_rel, output_rel);
-		else
-			lion_try_count_path(root, input_rel, output_rel,
-							   (GroupPathExtraData *) extra, NULL);
+		lion_try_upper_path(root, stage, input_rel, output_rel, extra);
 		lion_units_unpin();
 		return;
 	}
 	PG_TRY();
 	{
-		if (stage == UPPERREL_DISTINCT)
-			lion_try_distinct_path(root, input_rel, output_rel);
-		else
-			lion_try_count_path(root, input_rel, output_rel,
-							   (GroupPathExtraData *) extra, NULL);
+		lion_try_upper_path(root, stage, input_rel, output_rel, extra);
 	}
 	PG_FINALLY();
 	{
@@ -460,7 +470,7 @@ lion_plan_join_agg_path(PlannerInfo *root, RelOptInfo *rel,
 	cscan->flags = best_path->flags;
 	cscan->custom_plans = custom_plans;
 	cscan->custom_exprs = NIL;
-	cscan->custom_private = NIL;
+	cscan->custom_private = best_path->custom_private;
 	cscan->custom_scan_tlist = ctlist;
 	cscan->custom_relids = rel->relids;
 	cscan->methods = &lion_join_agg_scan_methods;

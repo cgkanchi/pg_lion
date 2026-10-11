@@ -78,6 +78,15 @@ node's counts"):
   them.
 - `GROUP BY` with no aggregate and `SELECT DISTINCT` of indexed columns over one table (`SELECT
   DISTINCT country FROM events`): the keys that have a visible row, each once.
+- `GROUP BY ROLLUP (...)`, `CUBE (...)` and `GROUPING SETS (...)` of indexed columns over one
+  table, `GROUPING()` included: the node counts the plain `GROUP BY` of every column the sets
+  name, and PostgreSQL's own grouping sets aggregate adds those counts up into each set's
+  groups (`LionJoinAgg` above a `GroupAggregate` in EXPLAIN; DESIGN.md §10, "Grouping sets").
+  The aggregates may be `count(*)`, `count` and `sum` (of `smallint` or `integer`) of grouping
+  columns, `min`, `max`, `bool_and` and `bool_or` of them, and any `DISTINCT` aggregate of them,
+  with `FILTER` clauses over the grouping columns; any other aggregate leaves the query to the
+  ordinary plan. On 5M rows a `ROLLUP` of two columns of 20 and 2 values took 46 ms where the
+  ordinary plan took 885 ms.
 
 An expression index counts as a column of its expression (DESIGN.md §41). With `CREATE INDEX ON
 events USING lion ((payload->>'status'))`, `WHERE payload->>'status' = 'paid'`, `IN`, ranges,

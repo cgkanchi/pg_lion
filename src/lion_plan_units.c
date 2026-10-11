@@ -823,6 +823,23 @@ lion_units_unpin(void)
 }
 
 /*
+ * Price the paths of rel in the units pinned for another rel: a grouping
+ * sets query's finest grouping, counted into a rel of its own whose paths are
+ * the input of the grouped rel's Agg (DESIGN.md §10, "Grouping sets"), meets
+ * the grouped rel's competitor.  Returns the rel the pin was for, which
+ * lion_units_pin_move() of it puts back.
+ */
+RelOptInfo *
+lion_units_pin_move(RelOptInfo *rel)
+{
+	RelOptInfo *was = lion_units_pinned_rel;
+
+	if (was != NULL)
+		lion_units_pinned_rel = rel;
+	return was;
+}
+
+/*
  * THE MARGIN (DESIGN.md §39): the share of the best core plan's cost a lion
  * path's own price must come to, pg_lion.pushdown_margin.  The price is
  * divided by it rather than the path declined: a join rel gets paths of

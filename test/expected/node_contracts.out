@@ -66,6 +66,9 @@ INSERT INTO nc_nodes VALUES
 	('LionJoinAgg, a LEFT JOIN',
 	 'SELECT d.name, count(*) FROM ncd d LEFT JOIN nc ON nc.k = d.pk AND nc.j = 3 GROUP BY d.name',
 	 'int4eq(int4,int4)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
+	('LionJoinAgg, grouping sets',
+	 'SELECT k, j, sum(j), count(*) FROM nc GROUP BY ROLLUP (k, j)', 'sum(int4)',
+	 'enable_seqscan enable_bitmapscan enable_indexscan enable_indexonlyscan'),
 	('LionSemiJoin',
 	 'SELECT d.pk FROM ncd d WHERE EXISTS (SELECT 1 FROM nc WHERE nc.k = d.pk AND nc.j = 3)',
 	 'int4eq(int4,int4)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
@@ -298,6 +301,13 @@ SELECT node, nc_check(node) FROM nc_nodes ORDER BY node;
  LionJoinAgg, a LEFT JOIN                 | granted to the role: the answer
  LionJoinAgg, a LEFT JOIN                 | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
  LionJoinAgg, a LEFT JOIN                 | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
+ LionJoinAgg, grouping sets               | plan: planned
+ LionJoinAgg, grouping sets               | every privilege: the ordinary plan's answer
+ LionJoinAgg, grouping sets               | without EXECUTE on sum(integer): ERROR: permission denied for aggregate sum, as the ordinary plan
+ LionJoinAgg, grouping sets               | plain EXPLAIN: as the ordinary plan
+ LionJoinAgg, grouping sets               | granted to the role: the answer
+ LionJoinAgg, grouping sets               | a cached plan (planned, the answer) without it: ERROR: permission denied for aggregate sum
+ LionJoinAgg, grouping sets               | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for aggregate sum
  LionOrdered                              | plan: planned
  LionOrdered                              | every privilege: the ordinary plan's answer
  LionOrdered                              | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
@@ -312,7 +322,7 @@ SELECT node, nc_check(node) FROM nc_nodes ORDER BY node;
  LionSemiJoin                             | granted to the role: the answer
  LionSemiJoin                             | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
  LionSemiJoin                             | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
-(91 rows)
+(98 rows)
 
 -- nothing is left revoked from PUBLIC by this file
 SELECT fn FROM nc_nodes WHERE NOT has_function_privilege('public', fn, 'EXECUTE');
