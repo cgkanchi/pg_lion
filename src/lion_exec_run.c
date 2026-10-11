@@ -76,6 +76,28 @@ lion_run_partition(LionCountScanState *st, int p)
 }
 
 /*
+ * The entry walk of a partition's turn, begun once its WHERE is located.  A
+ * positive clause with no entry in THIS partition selects nothing here,
+ * whatever the others hold, so its entry scan is skipped and no group of it
+ * is emitted.
+ */
+static void
+lion_partial_walk_begin(LionCountScanState *st)
+{
+	if (!st->wheremissing)
+	{
+		bool		bounded = lion_plan_flag(st, LION_FLAG_RANGE);
+
+		lion_entry_scan_begin_range(&st->escan, st->groupidx,
+									st->groupidxcol,
+									bounded ? &st->range : NULL);
+		st->scanning = true;
+		/* each partition's group of c is its own partial row */
+		lion_coal_reset(st);
+	}
+}
+
+/*
  * GROUP BY over a partitioned table: one PARTIAL aggregate per group per
  * partition (DESIGN.md §16).
  *
@@ -105,23 +127,7 @@ lion_next_partial_group(LionCountScanState *st)
 			lion_open_relation(st, st->curpart);
 			lion_locate_where(st);
 			st->partopen = true;
-
-			/*
-			 * A positive clause with no entry in THIS partition selects
-			 * nothing here, whatever the others hold, so its entry scan is
-			 * skipped and no group of it is emitted.
-			 */
-			if (!st->wheremissing)
-			{
-				bool		bounded = lion_plan_flag(st, LION_FLAG_RANGE);
-
-				lion_entry_scan_begin_range(&st->escan, st->groupidx,
-											st->groupidxcol,
-											bounded ? &st->range : NULL);
-				st->scanning = true;
-				/* each partition's group of c is its own partial row */
-				lion_coal_reset(st);
-			}
+			lion_partial_walk_begin(st);
 		}
 
 		if (st->scanning)
@@ -136,8 +142,22 @@ lion_next_partial_group(LionCountScanState *st)
 			st->scanning = false;
 		}
 
-		/* This partition is done: release its sets, then end its turn. */
+		/*
+		 * This run is done: release its sets.  Beside filtered counts
+		 * (DESIGN.md §10, "Filtered counts") the next run walks the partition
+		 * again, its partial rows those of the WHERE and its filter.
+		 */
 		lion_release_where(st);
+		if (st->currun + 1 < st->nrun)
+		{
+			lion_select_run(st, st->currun + 1);
+			lion_locate_where(st);
+			lion_partial_walk_begin(st);
+			continue;
+		}
+
+		/* ... and the last one ends the partition's turn */
+		lion_select_run(st, 0);
 		lion_close_relation(st);
 		st->partopen = false;
 		st->curpart++;
@@ -158,8 +178,14 @@ lion_exec_partitioned(LionCountScanState *st)
 	if (lion_plan_flag(st, LION_FLAG_GROUPIDX) && st->plan.groupattno != 0)
 		return lion_next_partial_group(st);
 
-	for (p = 0; p < st->npart; p++)
-		total += lion_run_partition(st, p);
+	/* every run's count, over every partition (DESIGN.md §10) */
+	if (st->nrun > 1)
+		total = lion_count_runs(st, lion_plan_flag(st, LION_FLAG_GROUPIDX));
+	else
+	{
+		for (p = 0; p < st->npart; p++)
+			total += lion_run_partition(st, p);
+	}
 
 	st->done = true;
 
@@ -320,6 +346,70 @@ lion_exec_custom_scan(CustomScanState *node)
 	return slot;
 }
 
+/*
+ * The walk of the run being counted ended, and its group sets let go of, for
+ * the next run to walk again (DESIGN.md §10, "Filtered counts").
+ */
+static void
+lion_end_run_walk(LionCountScanState *st)
+{
+	if (st->scanning)
+	{
+		lion_entry_scan_end(&st->escan);
+		st->scanning = false;
+	}
+	lion_inner_reset(st);
+	if (st->inner != NULL)
+		st->inner->next = 0;
+	lion_posting_set_release(&st->groupset);
+	lion_posting_set_release(&st->groupset2);
+	lion_decode_reset(st);
+}
+
+/*
+ * The groups of a plain table's walk with filtered counts (DESIGN.md §10,
+ * "Filtered counts"): the walk of run 0, the WHERE's, and then of each
+ * filter's run, the groups of the rows the WHERE and the filter select
+ * together - each a walk as the plan's GROUP BY walks its WHERE alone, its
+ * sets located for it and released after it.  Every row is a partial one,
+ * and the Finalize Agg above adds a group's rows up.
+ */
+static TupleTableSlot *
+lion_next_run_group(LionCountScanState *st)
+{
+	Assert(st->mode == LION_MODE_GROUP || st->mode == LION_MODE_GROUP2 ||
+		   st->mode == LION_MODE_DECODE);
+	for (;;)
+	{
+		if (!st->wheremissing)
+		{
+			bool		exhausted;
+			TupleTableSlot *slot;
+
+			if (!st->scanning && st->ingroupitem < 0 && st->decode == NULL)
+			{
+				lion_entry_scan_begin_range(&st->escan, st->groupidx,
+											st->groupidxcol,
+											lion_plan_flag(st, LION_FLAG_RANGE) ?
+											&st->range : NULL);
+				st->scanning = true;
+			}
+			slot = lion_next_group_any(st, &exhausted);
+			if (!exhausted)
+				return slot;
+		}
+		if (st->currun + 1 >= st->nrun)
+		{
+			st->done = true;
+			return NULL;
+		}
+		lion_end_run_walk(st);
+		lion_release_where(st);
+		lion_select_run(st, st->currun + 1);
+		lion_locate_where(st);
+	}
+}
+
 static TupleTableSlot *
 lion_exec_custom_scan_internal(CustomScanState *node)
 {
@@ -357,8 +447,28 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 	if (st->npart > 0)
 		return lion_exec_partitioned(st);
 
+	/*
+	 * ---- filtered counts (DESIGN.md §10, "Filtered counts") ----
+	 *
+	 * A node of one row counts every run before its row; the groups of a
+	 * walk come out run after run, as partial rows a Finalize Agg adds up.
+	 */
+	if (st->nrun > 1 &&
+		(st->mode == LION_MODE_COUNT || st->mode == LION_MODE_SUM))
+	{
+		int64		total;
+
+		st->done = true;
+		total = lion_count_runs(st, st->mode == LION_MODE_SUM);
+		if (total == 0 && lion_plan_flag(st, LION_FLAG_SINGLEGROUP))
+			return NULL;
+		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, total);
+	}
+
 	if (!st->located)
 		lion_locate_where(st);
+	if (st->nrun > 1)
+		return lion_next_run_group(st);
 
 	/* ---- no index to iterate: exactly one row ---- */
 	Assert((st->mode == LION_MODE_COUNT) ==
@@ -668,6 +778,10 @@ lion_reset_run(LionCountScanState *st)
 
 	st->curpart = 0;
 	st->partopen = false;
+
+	/* ... and the filtered counts start again from run 0 (DESIGN.md §10) */
+	lion_select_run(st, 0);
+	st->runsready = false;
 }
 
 void
