@@ -1,0 +1,506 @@
+-- Posting sets and position trees without an internal level (DESIGN.md §22,
+-- §17 "Stored positions").
+--
+-- A set of at most 16 leaves has no page above them: its head - the block the
+-- entry names and every page of the set is stamped with - is its FIRST leaf,
+-- and the leaves are one chain of right links.  The split that would make a
+-- 17th leaf first promotes the set: the head's items move to a new leaf and
+-- the head becomes the root, an internal page with a downlink to every leaf.
+-- This file takes keys of every size - INLINE, one leaf, a few leaves, 16
+-- leaves, a tree - through inserts until each one changes shape, then
+-- deletes and VACUUM, then a rebuild.  After every step each key's shape is
+-- read off the pages, the page counts lion_index_stats() reports are checked
+-- against them, lion_index_verify() is run, and every key is counted through
+-- the index and against the heap.  Position trees get the same, through a
+-- tsvector column WITH (store_positions = true).
+\set VERBOSITY terse
+SET client_min_messages = warning;
+SET synchronous_commit = on;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+-- Every live container page of an index, from its special area: its right
+-- link, the set it belongs to (owner_head), its level and its flags.
+CREATE FUNCTION ft_pages(idx regclass,
+	OUT blk int, OUT rightlink bigint, OUT owner bigint, OUT level int, OUT flags int)
+RETURNS SETOF record LANGUAGE sql AS $$
+	SELECT b,
+		   get_byte(r, s) + 256 * get_byte(r, s + 1) + 65536 * get_byte(r, s + 2)
+			 + 16777216::bigint * get_byte(r, s + 3),
+		   get_byte(r, s + 20) + 256 * get_byte(r, s + 21) + 65536 * get_byte(r, s + 22)
+			 + 16777216::bigint * get_byte(r, s + 23),
+		   get_byte(r, s + 24) + 256 * get_byte(r, s + 25),
+		   get_byte(r, s + 26) + 256 * get_byte(r, s + 27)
+	  FROM generate_series(1, (pg_relation_size(idx) / 8192)::int - 1) b,
+		   LATERAL get_raw_page(idx::text, b) r,
+		   LATERAL (SELECT special AS s FROM page_header(r)) h
+	 -- CONTAINER and not DELETED
+	 WHERE (get_byte(r, s + 26) + 256 * get_byte(r, s + 27)) & 12 = 4
+$$;
+-- One set's shape: its leaves and internal pages, whether its head is a leaf
+-- (the set has no internal level), how many leaves the chain from the head
+-- reaches by right links, and how many pages are flagged as an unfinished
+-- split.  An INLINE set has no pages.
+CREATE FUNCTION ft_set(idx regclass, head bigint,
+	OUT leaves int, OUT internal int, OUT head_is_leaf bool, OUT chained int,
+	OUT flagged int)
+LANGUAGE sql AS $$
+	WITH RECURSIVE p AS MATERIALIZED (SELECT * FROM ft_pages(idx) WHERE owner = head),
+	chain(blk, rightlink, n) AS (
+		SELECT p.blk, p.rightlink, 1 FROM p WHERE p.blk = head AND p.level = 0
+		UNION ALL
+		SELECT p.blk, p.rightlink, c.n + 1
+		  FROM chain c JOIN p ON p.blk = c.rightlink
+		 WHERE c.n < 1000)
+	SELECT count(*) FILTER (WHERE level = 0)::int,
+		   count(*) FILTER (WHERE level > 0)::int,
+		   coalesce(bool_or(blk = head AND level = 0), false),
+		   (SELECT count(*) FROM chain)::int,
+		   count(*) FILTER (WHERE flags & 64 <> 0)::int
+	  FROM p
+$$;
+-- An index's page counts as lion_index_stats() reports them, against the
+-- pages themselves, and lion_index_verify(), which raises on corruption and
+-- returns nothing.
+CREATE FUNCTION ft_check(idx regclass, OUT stats_agree bool, OUT height int,
+	OUT verified bool)
+LANGUAGE sql AS $$
+	SELECT s.container_pages = (SELECT count(*) FROM ft_pages(idx) WHERE level = 0)
+		   AND s.posting_internal_pages = (SELECT count(*) FROM ft_pages(idx) WHERE level > 0),
+		   s.max_posting_height,
+		   (SELECT true FROM lion_index_verify(idx, true))
+	  FROM lion_index_stats(idx) s
+$$;
+-- ---------------------------------------------------------------------
+-- 1. Posting sets of every size, grown by inserts
+-- ---------------------------------------------------------------------
+-- Wide rows, about 75 to a heap page, and the big keys on alternate rows:
+-- each of their containers is a BITSET that fills a leaf by itself, so such
+-- a set has a leaf for every 64 heap blocks it has rows in.  The index is
+-- created empty: every page comes from aminsert.  k = 6 fills in between.
+CREATE TABLE ft (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x')
+	WITH (autovacuum_enabled = off);
+CREATE INDEX ft_k ON ft USING lion (k) WITH (inline_limit = 64);
+-- the size classes: k = 1 INLINE, k = 2 one leaf, k = 3 a few leaves, k = 4
+-- exactly 16 leaves, k = 5 a tree
+CREATE FUNCTION ft_report(OUT k int, OUT spilled bool, OUT leaves int,
+	OUT internal int, OUT head_is_leaf bool, OUT chained int, OUT flagged int)
+RETURNS SETOF record LANGUAGE sql AS $$
+	SELECT k, h IS NOT NULL, s.leaves, s.internal, s.head_is_leaf, s.chained, s.flagged
+	  FROM generate_series(1, 5) k,
+		   LATERAL (SELECT lion_index_posting_root('ft_k', k) AS h) r,
+		   LATERAL ft_set('ft_k', coalesce(h, -1)) s
+	 ORDER BY k
+$$;
+-- Every key counted through a bitmap scan, through the count pushdown, and
+-- through the heap alone.
+CREATE FUNCTION ft_counts(OUT k int, OUT via_bitmap bigint, OUT via_count bigint,
+	OUT via_heap bigint)
+RETURNS SETOF record LANGUAGE plpgsql AS $$
+BEGIN
+	FOR key IN 1 .. 6 LOOP
+		k := key;
+		PERFORM set_config('enable_seqscan', 'off', true);
+		PERFORM set_config('enable_indexscan', 'off', true);
+		PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+		SELECT count(*) INTO via_bitmap FROM ft WHERE ft.k = key;
+		PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+		SELECT count(*) INTO via_count FROM ft WHERE ft.k = key;
+		PERFORM set_config('enable_seqscan', 'on', true);
+		PERFORM set_config('enable_bitmapscan', 'off', true);
+		PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+		SELECT count(*) INTO via_heap FROM ft WHERE ft.k = key;
+		PERFORM set_config('enable_bitmapscan', 'on', true);
+		PERFORM set_config('enable_indexscan', 'on', true);
+		PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+		RETURN NEXT;
+	END LOOP;
+END $$;
+-- Rows of `key` and of k = 6 on alternate rows, `n` at a time, at the end of
+-- the heap, until the set of `key` has `leaves` leaves - or, with leaves
+-- NULL, until its shape changes at all.
+CREATE PROCEDURE ft_grow(key int, n int, leaves int DEFAULT NULL)
+LANGUAGE plpgsql AS $$
+DECLARE
+	before text := (SELECT f::text FROM ft_report() f WHERE f.k = key);
+	next int := (SELECT coalesce(max(id), 0) + 1 FROM ft);
+BEGIN
+	FOR i IN 1 .. 2000 LOOP
+		INSERT INTO ft SELECT next + j, CASE WHEN j % 2 = 0 THEN key ELSE 6 END
+		  FROM generate_series(0, n - 1) j;
+		next := next + n;
+		IF leaves IS NOT NULL THEN
+			EXIT WHEN (SELECT f.leaves FROM ft_report() f WHERE f.k = key) >= leaves;
+		ELSE
+			EXIT WHEN (SELECT f::text FROM ft_report() f WHERE f.k = key) <> before;
+		END IF;
+	END LOOP;
+END $$;
+INSERT INTO ft SELECT i, 1 FROM generate_series(1, 3) i;
+INSERT INTO ft SELECT 100 + i, 2 FROM generate_series(1, 5000, 10) i;
+CALL ft_grow(3, 1000, 4);
+CALL ft_grow(4, 1000, 16);
+CALL ft_grow(5, 1000, 20);
+SELECT * FROM ft_report();
+ k | spilled | leaves | internal | head_is_leaf | chained | flagged 
+---+---------+--------+----------+--------------+---------+---------
+ 1 | f       |      0 |        0 | f            |       0 |       0
+ 2 | f       |      0 |        0 | f            |       0 |       0
+ 3 | t       |      4 |        0 | t            |       4 |       0
+ 4 | t       |     16 |        0 | t            |      16 |       0
+ 5 | t       |     20 |        1 | f            |       0 |       0
+(5 rows)
+
+SELECT * FROM ft_check('ft_k');
+ stats_agree | height | verified 
+-------------+--------+----------
+ t           |      1 | t
+(1 row)
+
+SELECT * FROM ft_counts();
+ k | via_bitmap | via_count | via_heap 
+---+------------+-----------+----------
+ 1 |          3 |         3 |        3
+ 2 |        500 |       500 |      500
+ 3 |      10500 |     10500 |    10500
+ 4 |      35000 |     35000 |    35000
+ 5 |      42000 |     42000 |    42000
+ 6 |      87500 |     87500 |    87500
+(6 rows)
+
+-- Each key grown until its shape changes: the INLINE set spills to one leaf,
+-- the one leaf splits, the chains grow by a leaf, the set of 16 is promoted -
+-- its head is now an internal page over 17 leaves, at the same block - and
+-- the tree grows by a leaf.
+SELECT lion_index_posting_root('ft_k', 4) AS head4 \gset
+CALL ft_grow(1, 50);
+CALL ft_grow(2, 50);
+CALL ft_grow(3, 50);
+CALL ft_grow(4, 50);
+CALL ft_grow(5, 50);
+SELECT * FROM ft_report();
+ k | spilled | leaves | internal | head_is_leaf | chained | flagged 
+---+---------+--------+----------+--------------+---------+---------
+ 1 | t       |      1 |        0 | t            |       1 |       0
+ 2 | t       |      1 |        0 | t            |       1 |       0
+ 3 | t       |      5 |        0 | t            |       5 |       0
+ 4 | t       |     17 |        1 | f            |       0 |       0
+ 5 | t       |     21 |        1 | f            |       0 |       0
+(5 rows)
+
+SELECT lion_index_posting_root('ft_k', 4) = :head4 AS promoted_head_kept_its_block;
+ promoted_head_kept_its_block 
+------------------------------
+ t
+(1 row)
+
+SELECT * FROM ft_check('ft_k');
+ stats_agree | height | verified 
+-------------+--------+----------
+ t           |      1 | t
+(1 row)
+
+SELECT * FROM ft_counts();
+ k | via_bitmap | via_count | via_heap 
+---+------------+-----------+----------
+ 1 |         28 |        28 |       28
+ 2 |        525 |       525 |      525
+ 3 |      12150 |     12150 |    12150
+ 4 |      37025 |     37025 |    37025
+ 5 |      43600 |     43600 |    43600
+ 6 |      92825 |     92825 |    92825
+(6 rows)
+
+-- ---------------------------------------------------------------------
+-- 2. Delete and VACUUM
+-- ---------------------------------------------------------------------
+-- The first half of every big key's rows, and all of k = 2's but one: the
+-- leaves at the front of each chain, the head among them, are left empty,
+-- and stay in the chain.
+WITH m AS (SELECT k, percentile_disc(0.5) WITHIN GROUP (ORDER BY id) AS mid
+			 FROM ft WHERE k IN (3, 4, 5) GROUP BY k)
+DELETE FROM ft USING m WHERE ft.k = m.k AND ft.id < m.mid;
+DELETE FROM ft WHERE k = 2 AND id > 101;
+VACUUM ft;
+SELECT * FROM ft_report();
+ k | spilled | leaves | internal | head_is_leaf | chained | flagged 
+---+---------+--------+----------+--------------+---------+---------
+ 1 | t       |      1 |        0 | t            |       1 |       0
+ 2 | t       |      1 |        0 | t            |       1 |       0
+ 3 | t       |      5 |        0 | t            |       5 |       0
+ 4 | t       |     17 |        1 | f            |       0 |       0
+ 5 | t       |     21 |        1 | f            |       0 |       0
+(5 rows)
+
+SELECT * FROM ft_check('ft_k');
+ stats_agree | height | verified 
+-------------+--------+----------
+ t           |      1 | t
+(1 row)
+
+SELECT * FROM ft_counts();
+ k | via_bitmap | via_count | via_heap 
+---+------------+-----------+----------
+ 1 |         28 |        28 |       28
+ 2 |          1 |         1 |        1
+ 3 |       6076 |      6076 |     6076
+ 4 |      18513 |     18513 |    18513
+ 5 |      21801 |     21801 |    21801
+ 6 |      92825 |     92825 |    92825
+(6 rows)
+
+-- and the next inserts go on from there
+CALL ft_grow(3, 50);
+CALL ft_grow(4, 50);
+SELECT * FROM ft_check('ft_k');
+ stats_agree | height | verified 
+-------------+--------+----------
+ t           |      1 | t
+(1 row)
+
+SELECT * FROM ft_counts();
+ k | via_bitmap | via_count | via_heap 
+---+------------+-----------+----------
+ 1 |         28 |        28 |       28
+ 2 |          1 |         1 |        1
+ 3 |      11001 |     11001 |    11001
+ 4 |      28138 |     28138 |    28138
+ 5 |      21801 |     21801 |    21801
+ 6 |     107375 |    107375 |   107375
+(6 rows)
+
+-- every row of k = 3 and k = 4 gone: their sets are freed
+DELETE FROM ft WHERE k IN (3, 4);
+VACUUM ft;
+SELECT * FROM ft_report();
+ k | spilled | leaves | internal | head_is_leaf | chained | flagged 
+---+---------+--------+----------+--------------+---------+---------
+ 1 | t       |      1 |        0 | t            |       1 |       0
+ 2 | t       |      1 |        0 | t            |       1 |       0
+ 3 | f       |      0 |        0 | f            |       0 |       0
+ 4 | f       |      0 |        0 | f            |       0 |       0
+ 5 | t       |     21 |        1 | f            |       0 |       0
+(5 rows)
+
+SELECT * FROM ft_check('ft_k');
+ stats_agree | height | verified 
+-------------+--------+----------
+ t           |      1 | t
+(1 row)
+
+SELECT * FROM ft_counts();
+ k | via_bitmap | via_count | via_heap 
+---+------------+-----------+----------
+ 1 |         28 |        28 |       28
+ 2 |          1 |         1 |        1
+ 3 |          0 |         0 |        0
+ 4 |          0 |         0 |        0
+ 5 |      21801 |     21801 |    21801
+ 6 |     107375 |    107375 |   107375
+(6 rows)
+
+-- ---------------------------------------------------------------------
+-- 3. A build
+-- ---------------------------------------------------------------------
+-- The build writes the leaves of a set of up to 16 as a chain from its head
+-- and no root (it packs dense containers tighter than inserts do, as NARROWs,
+-- DESIGN.md §38, so k = 5 is no longer a tree; verify.sql builds one).
+INSERT INTO ft SELECT 900000 + i, CASE WHEN i % 2 = 0 THEN 3 ELSE 4 END
+  FROM generate_series(1, 30000) i;
+REINDEX INDEX ft_k;
+SELECT * FROM ft_report();
+ k | spilled | leaves | internal | head_is_leaf | chained | flagged 
+---+---------+--------+----------+--------------+---------+---------
+ 1 | t       |      1 |        0 | t            |       1 |       0
+ 2 | f       |      0 |        0 | f            |       0 |       0
+ 3 | t       |      3 |        0 | t            |       3 |       0
+ 4 | t       |      3 |        0 | t            |       3 |       0
+ 5 | t       |      2 |        0 | t            |       2 |       0
+(5 rows)
+
+SELECT * FROM ft_check('ft_k');
+ stats_agree | height | verified 
+-------------+--------+----------
+ t           |      0 | t
+(1 row)
+
+SELECT * FROM ft_counts();
+ k | via_bitmap | via_count | via_heap 
+---+------------+-----------+----------
+ 1 |         28 |        28 |       28
+ 2 |          1 |         1 |        1
+ 3 |      15000 |     15000 |    15000
+ 4 |      15000 |     15000 |    15000
+ 5 |      21801 |     21801 |    21801
+ 6 |     107375 |    107375 |   107375
+(6 rows)
+
+-- ---------------------------------------------------------------------
+-- 4. Position trees
+-- ---------------------------------------------------------------------
+-- A key of an index WITH (store_positions = true) keeps its rows' positions
+-- in its entry while it is INLINE, and in a position tree of its own once it
+-- spills - with no internal level up to 16 leaves, as a posting set.  Here
+-- 'rare' stays INLINE, 'some' - 100 positions in every other row - has a few
+-- position leaves, and 'many' - 255 in every row, about fifteen rows to a
+-- leaf - grows past 16.
+CREATE TABLE ftp (id int, d tsvector) WITH (autovacuum_enabled = off);
+CREATE INDEX ftp_d ON ftp USING lion (d) WITH (store_positions = true);
+-- The position trees of an index, by size: leaves, internal pages, whether
+-- the head is a leaf, the chain from it.
+CREATE FUNCTION ftp_report(OUT leaves int, OUT internal int,
+	OUT head_is_leaf bool, OUT chained int, OUT flagged int)
+RETURNS SETOF record LANGUAGE sql AS $$
+	SELECT s.*
+	  FROM (SELECT DISTINCT owner FROM ft_pages('ftp_d') WHERE flags & 128 <> 0) o,
+		   LATERAL ft_set('ftp_d', o.owner) s
+	 ORDER BY 1, 2
+$$;
+-- phrase queries through the positions, against the heap
+CREATE FUNCTION ftp_counts(OUT q text, OUT via_index bigint, OUT via_heap bigint)
+RETURNS SETOF record LANGUAGE plpgsql AS $$
+BEGIN
+	FOR q IN SELECT unnest(ARRAY['many <-> many', 'many <-> some', 'some <-> many',
+								 'some <2> some', 'some <-> some', 'rare <-> many',
+								 'some <146> rare', 'many & !some', 'rare'])
+	LOOP
+		PERFORM set_config('enable_seqscan', 'off', true);
+		EXECUTE format('SELECT count(*) FROM ftp WHERE d @@ %L::tsquery', q) INTO via_index;
+		PERFORM set_config('enable_seqscan', 'on', true);
+		PERFORM set_config('enable_bitmapscan', 'off', true);
+		PERFORM set_config('enable_indexscan', 'off', true);
+		EXECUTE format('SELECT count(*) FROM ftp WHERE d @@ %L::tsquery', q) INTO via_heap;
+		PERFORM set_config('enable_bitmapscan', 'on', true);
+		PERFORM set_config('enable_indexscan', 'on', true);
+		RETURN NEXT;
+	END LOOP;
+END $$;
+-- a document: 'many' at positions 1 to 255, then 'some' at every other
+-- position of the next 200 and 'rare' after them, when asked (one cast:
+-- tsvector || tsvector would shift the right one's positions)
+CREATE FUNCTION ftp_doc(with_some bool, with_rare bool) RETURNS tsvector
+LANGUAGE sql AS $$
+	SELECT ((SELECT string_agg('many:' || p, ' ') FROM generate_series(1, 255) p)
+			|| CASE WHEN with_some
+					THEN (SELECT ' ' || string_agg('some:' || p, ' ')
+							FROM generate_series(256, 455, 2) p)
+					ELSE '' END
+			|| CASE WHEN with_rare THEN ' rare:600' ELSE '' END)::tsvector
+$$;
+INSERT INTO ftp SELECT i, ftp_doc(i % 2 = 0, i % 50 = 0) FROM generate_series(1, 150) i;
+SELECT * FROM ftp_report();
+ leaves | internal | head_is_leaf | chained | flagged 
+--------+----------+--------------+---------+---------
+      1 |        0 | t            |       1 |       0
+      9 |        0 | t            |       9 |       0
+(2 rows)
+
+SELECT * FROM ft_check('ftp_d');
+ stats_agree | height | verified 
+-------------+--------+----------
+ t           |      0 | t
+(1 row)
+
+SELECT * FROM ftp_counts();
+        q        | via_index | via_heap 
+-----------------+-----------+----------
+ many <-> many   |       150 |      150
+ many <-> some   |        75 |       75
+ some <-> many   |         0 |        0
+ some <2> some   |        75 |       75
+ some <-> some   |         0 |        0
+ rare <-> many   |         0 |        0
+ some <146> rare |         3 |        3
+ many & !some    |        75 |       75
+ rare            |         3 |        3
+(9 rows)
+
+-- 'many' grown until its position tree is promoted
+DO $$
+BEGIN
+	FOR i IN 151 .. 1000 LOOP
+		INSERT INTO ftp VALUES (i, ftp_doc(i % 2 = 0, false));
+		EXIT WHEN (SELECT max(internal) FROM ftp_report()) > 0;
+	END LOOP;
+END $$;
+SELECT * FROM ftp_report();
+ leaves | internal | head_is_leaf | chained | flagged 
+--------+----------+--------------+---------+---------
+      3 |        0 | t            |       3 |       0
+     17 |        1 | f            |       0 |       0
+(2 rows)
+
+SELECT * FROM ft_check('ftp_d');
+ stats_agree | height | verified 
+-------------+--------+----------
+ t           |      1 | t
+(1 row)
+
+SELECT * FROM ftp_counts();
+        q        | via_index | via_heap 
+-----------------+-----------+----------
+ many <-> many   |       260 |      260
+ many <-> some   |       130 |      130
+ some <-> many   |         0 |        0
+ some <2> some   |       130 |      130
+ some <-> some   |         0 |        0
+ rare <-> many   |         0 |        0
+ some <146> rare |         3 |        3
+ many & !some    |       130 |      130
+ rare            |         3 |        3
+(9 rows)
+
+-- deletes, VACUUM, and a build
+DELETE FROM ftp WHERE id % 3 = 0;
+VACUUM ftp;
+SELECT * FROM ft_check('ftp_d');
+ stats_agree | height | verified 
+-------------+--------+----------
+ t           |      1 | t
+(1 row)
+
+SELECT * FROM ftp_counts();
+        q        | via_index | via_heap 
+-----------------+-----------+----------
+ many <-> many   |       174 |      174
+ many <-> some   |        87 |       87
+ some <-> many   |         0 |        0
+ some <2> some   |        87 |       87
+ some <-> some   |         0 |        0
+ rare <-> many   |         0 |        0
+ some <146> rare |         2 |        2
+ many & !some    |        87 |       87
+ rare            |         2 |        2
+(9 rows)
+
+REINDEX INDEX ftp_d;
+SELECT * FROM ftp_report();
+ leaves | internal | head_is_leaf | chained | flagged 
+--------+----------+--------------+---------+---------
+      2 |        0 | t            |       2 |       0
+      6 |        0 | t            |       6 |       0
+(2 rows)
+
+SELECT * FROM ft_check('ftp_d');
+ stats_agree | height | verified 
+-------------+--------+----------
+ t           |      0 | t
+(1 row)
+
+SELECT * FROM ftp_counts();
+        q        | via_index | via_heap 
+-----------------+-----------+----------
+ many <-> many   |       174 |      174
+ many <-> some   |        87 |       87
+ some <-> many   |         0 |        0
+ some <2> some   |        87 |       87
+ some <-> some   |         0 |        0
+ rare <-> many   |         0 |        0
+ some <146> rare |         2 |        2
+ many & !some    |        87 |       87
+ rare            |         2 |        2
+(9 rows)
+
+DROP TABLE ft, ftp;
+DROP FUNCTION ft_pages, ft_set, ft_check, ft_report, ft_counts,
+	ftp_report, ftp_counts, ftp_doc;
+DROP PROCEDURE ft_grow;

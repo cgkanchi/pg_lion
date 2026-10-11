@@ -17,7 +17,7 @@ and these functions are for testing, diagnostics and the occasional direct count
     lion_index_stats(idx)                           the index's shape, one row per key column
     lion_index_verify(idx [, heapallindexed])       structural check, optionally against the heap
     lion_index_wal_mode(idx)                        'generic' or 'rmgr' (DESIGN.md §25)
-    lion_index_posting_root(idx, key)               a key's posting-tree root block, for tests
+    lion_index_posting_root(idx, key)               a key's posting-set head block (the root, or the first leaf), for tests
 
 The counts answer exactly what the equivalent `SELECT count(*)` answers under the same snapshot,
 and ask for what it would: SELECT on the table or its indexed columns, and no row-level security in
@@ -221,8 +221,9 @@ may still be replayed - the rule core states for every custom resource manager.
 `lion_index_stats()` reports ONE ROW PER KEY COLUMN (DESIGN.md §24), with a leading `attno`: the
 directory's height, its leaf and internal pages and whether that column is `ordered` (false for a
 key type with no btree opclass, whose entries are then in a complete but arbitrary order), the
-column's entries, its containers by kind, its sparse segments, its posting trees' internal pages and
-tallest height, `null_tids`, the number of rows whose key in that column is NULL, and `empty_tids`,
+column's entries, its containers by kind, its sparse segments, its posting trees' internal pages
+and tallest height (a set of up to 16 leaves has no internal level, DESIGN.md §22), `null_tids`,
+the number of rows whose key in that column is NULL, and `empty_tids`,
 the number of rows a multi-key opclass extracted no key from, `ndistinct`, the distinct keys
 the planner is given for the column (DESIGN.md §33; NULL where none is recorded), and, last,
 `narrow_containers`, the column's NARROW containers (DESIGN.md §38).  `slack_bytes` and

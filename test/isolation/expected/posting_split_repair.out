@@ -1,12 +1,12 @@
 Parsed test spec with 1 sessions
 
-starting permutation: a_fill split_breaks a_cut split_works a_append a_check b_holes b_vacuum_holes b_before split_breaks b_cut split_works b_after_cut b_delete b_vacuum b_check c_holes c_vacuum_holes c_before split_breaks c_cut split_works c_after_cut c_delete c_vacuum c_check push_breaks d_cut push_works d_after_cut d_more d_check e_delete push_breaks e_cut push_works e_after_cut e_vacuum e_check
+starting permutation: a_fill split_breaks a_cut split_works a_append a_check b_holes b_vacuum_holes b_before split_breaks b_cut split_works b_after_cut b_delete b_vacuum b_check c_holes c_vacuum_holes c_before split_breaks c_cut split_works c_after_cut c_delete c_vacuum c_check d_holes d_vacuum_holes push_breaks d_cut push_works d_after_cut d_more d_check e_delete push_breaks e_cut push_works e_after_cut e_vacuum e_check f_fill promote_breaks f_cut promote_works f_after_cut f_more f_check
 injection_points_set_local
 --------------------------
                           
 (1 row)
 
-step a_fill: INSERT INTO psr_app SELECT i, i % 2 FROM generate_series(1, 60000) i;
+step a_fill: INSERT INTO psr_app SELECT i, i % 2 FROM generate_series(1, 90000) i;
 step split_breaks: SELECT injection_points_attach('lion-posting-split-incomplete', 'error');
 injection_points_attach
 -----------------------
@@ -37,12 +37,12 @@ lion_index_verify
 
 via_index|via_heap
 ---------+--------
-    50000|   50000
+    65000|   65000
 (1 row)
 
 via_index|via_heap
 ---------+--------
-    50000|   50000
+    65000|   65000
 (1 row)
 
 step b_holes: DELETE FROM psr_right WHERE k = 3 AND id <= 14464;
@@ -50,7 +50,7 @@ step b_vacuum_holes: VACUUM (INDEX_CLEANUP ON) psr_right;
 step b_before: SELECT container_pages FROM lion_index_stats('psr_right_k');
 container_pages
 ---------------
-              3
+             35
 (1 row)
 
 step split_breaks: SELECT injection_points_attach('lion-posting-split-incomplete', 'error');
@@ -82,7 +82,7 @@ lo|hi
 
 container_pages
 ---------------
-              4
+             36
 (1 row)
 
 step b_delete: 
@@ -98,7 +98,7 @@ step b_check:
 
 container_pages
 ---------------
-              5
+             37
 (1 row)
 
 lion_index_verify
@@ -108,7 +108,7 @@ lion_index_verify
 
 via_index|via_heap
 ---------+--------
-    16448|   16448
+   132160|  132160
 (1 row)
 
 via_index|via_heap
@@ -121,7 +121,7 @@ step c_vacuum_holes: VACUUM (INDEX_CLEANUP ON) psr_left;
 step c_before: SELECT container_pages FROM lion_index_stats('psr_left_k');
 container_pages
 ---------------
-              3
+             35
 (1 row)
 
 step split_breaks: SELECT injection_points_attach('lion-posting-split-incomplete', 'error');
@@ -153,7 +153,7 @@ lo|hi
 
 container_pages
 ---------------
-              4
+             36
 (1 row)
 
 step c_delete: DELETE FROM psr_left WHERE k = 1 AND id % 30 IN (1, 3) AND id <= 14464 * 3;
@@ -166,7 +166,7 @@ step c_check:
 
 container_pages
 ---------------
-              5
+             37
 (1 row)
 
 lion_index_verify
@@ -176,7 +176,7 @@ lion_index_verify
 
 via_index|via_heap
 ---------+--------
-    16445|   16445
+   132157|  132157
 (1 row)
 
 via_index|via_heap
@@ -184,14 +184,20 @@ via_index|via_heap
       954|     954
 (1 row)
 
+step d_holes: DELETE FROM psr_push WHERE k = 3 AND id <= 14464;
+step d_vacuum_holes: VACUUM (INDEX_CLEANUP ON) psr_push;
 step push_breaks: SELECT injection_points_attach('lion-posting-pushdown-child', 'error');
 injection_points_attach
 -----------------------
                        
 (1 row)
 
-step d_cut: INSERT INTO psr_push SELECT i, i % 2 FROM generate_series(1, 20000) i;
-ERROR:  error triggered for injection point lion-posting-pushdown-child
+step d_cut: SELECT psr_insert_until_error('psr_push');
+psr_insert_until_error                                         
+---------------------------------------------------------------
+error triggered for injection point lion-posting-pushdown-child
+(1 row)
+
 step push_works: SELECT injection_points_detach('lion-posting-pushdown-child');
 injection_points_detach
 -----------------------
@@ -199,8 +205,14 @@ injection_points_detach
 (1 row)
 
 step d_after_cut: 
+	SELECT * FROM psr_landed('psr_push');
 	SELECT posting_internal_pages FROM lion_index_stats('psr_push_k');
 	SELECT lion_index_verify('psr_push_k');
+
+lo|hi
+--+--
+ 0| 0
+(1 row)
 
 posting_internal_pages
 ----------------------
@@ -212,11 +224,11 @@ lion_index_verify
                  
 (1 row)
 
-step d_more: INSERT INTO psr_push SELECT i, i % 2 FROM generate_series(1, 20000) i;
+step d_more: INSERT INTO psr_push SELECT 2000000 + i, 1 FROM generate_series(1, 200) i;
 step d_check: 
 	SELECT lion_index_verify('psr_push_k', true);
-	SELECT * FROM psr_counts('psr_push', 0);
 	SELECT * FROM psr_counts('psr_push', 1);
+	SELECT * FROM psr_counts('psr_push', 3);
 
 lion_index_verify
 -----------------
@@ -225,12 +237,12 @@ lion_index_verify
 
 via_index|via_heap
 ---------+--------
-    10000|   10000
+   120788|  120788
 (1 row)
 
 via_index|via_heap
 ---------+--------
-    10000|   10000
+     3375|    3375
 (1 row)
 
 step e_delete: DELETE FROM psr_vpush WHERE k = 1 AND id <= 14464 AND id % 30 IN (1, 3);
@@ -281,6 +293,56 @@ t
 
 via_index|via_heap
 ---------+--------
-     4341|    4341
+    42341|   42341
+(1 row)
+
+step f_fill: INSERT INTO psr_prom SELECT i, i % 2 FROM generate_series(1, 60000) i;
+step promote_breaks: SELECT injection_points_attach('lion-posting-promoted', 'error');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step f_cut: INSERT INTO psr_prom SELECT 100000 + i, i % 2 FROM generate_series(1, 20000) i;
+ERROR:  error triggered for injection point lion-posting-promoted
+step promote_works: SELECT injection_points_detach('lion-posting-promoted');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step f_after_cut: 
+	SELECT posting_internal_pages FROM lion_index_stats('psr_prom_k');
+	SELECT lion_index_verify('psr_prom_k');
+
+posting_internal_pages
+----------------------
+                     1
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step f_more: INSERT INTO psr_prom SELECT 200000 + i, i % 2 FROM generate_series(1, 20000) i;
+step f_check: 
+	SELECT lion_index_verify('psr_prom_k', true);
+	SELECT * FROM psr_counts('psr_prom', 0);
+	SELECT * FROM psr_counts('psr_prom', 1);
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+via_index|via_heap
+---------+--------
+    40000|   40000
+(1 row)
+
+via_index|via_heap
+---------+--------
+    40000|   40000
 (1 row)
 
