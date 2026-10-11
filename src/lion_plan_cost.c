@@ -221,7 +221,7 @@ lion_index_column_posting_share(PlannerInfo *root, RelOptInfo *rel,
 		rows = tuples / nd;
 		conts = Min(ckeys, rows);
 		if (rows / conts <= 2.0)
-			bytes = nd * rows * 6.0;
+			bytes = nd * rows * 3.0;
 		else
 			bytes = nd * (conts * 16.0 +
 						  Min(2.0 * rows, conts * (double) LION_BITSET_BYTES));

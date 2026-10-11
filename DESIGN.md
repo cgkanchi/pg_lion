@@ -2023,7 +2023,7 @@ Planner integration
     split applies to the DIRECTORY only. A column's CONTAINER pages follow its rows - every row is
     under one entry of each scalar column - so they are split by what each column's sets take to
     store: n_distinct entries of N / n_distinct rows, a header a container and two bytes a member
-    up to a bitset's 4 kB, six bytes a row where the rows are too few a container for one
+    up to a bitset's 4 kB, three bytes a row where the rows are too few a container for one
     (`lion_index_column_posting_share()`). Split by entries, the three values of a status column
     beside a 2,000-value column got 0.14% of a 110 MB index's pages where they hold a tenth of it,
     and `status = 'val2'` - a million rows at every container key - was priced at 16 for 1 ms.)*
