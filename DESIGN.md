@@ -463,10 +463,17 @@ tail, at most 11 bytes anywhere, nothing once its stream would pass 255 bytes) a
 that stays below LION_SPARSE_THRESHOLD members (else the key is promoted, which is not an in-place
 change). Otherwise the general path runs - copy out,
 mutate, write back, split if needed - and leaves fresh slack behind, which is where the slack of a
-growing key comes from in the first place. **Only inserts add slack**: ambuild writes items at
-their exact size, because a bulk-built index is read-mostly and the space would be pure loss, and
-so does VACUUM (`lion_chain_put_items_locked()` is the no-slack form of
-`lion_chain_put_items_locked_ext()`).
+growing key comes from in the first place. **Inserts add slack, and the build only when asked**:
+VACUUM writes items at their exact size (`lion_chain_put_items_locked()` is the no-slack form of
+`lion_chain_put_items_locked_ext()`), and so does ambuild by default, because a bulk-built index
+is read-mostly and the space would be pure loss. The `build_slack` reloption (`auto` | `on` |
+`off`, default `off`) has the build allot every posting item `lion_item_alloc_size()`, the slack an
+insert would leave, zeroed past the container (`lion_builder_spill()`), and every INLINE entry
+`lion_entry_alloc_size()` (below; `lion_builder_flush()`). `auto` is `on` for an index built for
+generic WAL and `off` for one built for the resource manager; what it buys in each mode is measured
+below ("Slack at build time, measured"). Nothing reads the option after the build: a bulk-built
+item with slack is the item an insert would have written, and every reader, VACUUM and verify()
+already take it.
 
 Slack is bounded by `LION_ITEM_SLACK_LIMIT` so that it can never be mistaken for corruption:
 verify() accepts an item whose allocated length is up to that much above its logical size, and
@@ -498,15 +505,44 @@ page already has (`PageGetExactFreeSpace()`), else it is written at its exact si
 `lion_dir_place()` splits as it always did. And the SPILL decision is made on the payload the key
 really uses, before the allocation is chosen, so slack can never make a posting set spill early -
 the test in `lion_insert_inline()` is on `newlen`, not on what the entry is allotted. As for items,
-only inserts add it: ambuild writes entries at their exact size and VACUUM keeps the length it
-finds. lion_index_stats() reports it as `inline_slack_bytes`, apart from `slack_bytes`, because it
-is an entry's and not an item's.
+inserts add it, ambuild only under `build_slack` (with the same `inline_limit` cap, and only to an
+entry that keeps its set inline), and VACUUM keeps the length it finds. lion_index_stats() reports
+it as `inline_slack_bytes`, apart from `slack_bytes`, because it is an entry's and not an item's.
 
 Measured (release, 1M rows, 10,000 single-row inserts into one index, §25's harness): the c20k
 column falls from 2918.7 to 173.0 bytes of WAL per insert in generic mode and from 422.4 to 180.5
 in rmgr mode, and c1m from 1682.2 to 106.8 and from 124.1 to 82.0. The 8-index portfolio insert
 falls from 53.53 to 9.48 MiB (generic) and from 29.21 to 9.08 MiB (rmgr) in steady state, and the
 index is the same size afterwards to the byte - the slack lands in space the leaves already had.
+
+**Slack at build time, measured.** PostgreSQL 18.6 release build, `wal_consistency_checking`
+off, the synthetic 5M-row table and update wave of §22 ("Posting leaves with room, measured"): six
+indexes on columns of 2 to 1M keys, one row in a hundred moved to the next key of the 20-key
+column, which inserts into every index inside a container or entry the build wrote. Bytes of index
+WAL per updated row without full-page images, and index size at build -> after the wave:
+
+    generic WAL       build_slack = off              build_slack = on
+    20 keys           1167.7 B  10.8 -> 18.8 MB      434.6 B   12.0 -> 12.0 MB
+    200 keys          2402.2 B  13.1 -> 25.2 MB      104.7 B   14.8 -> 14.8 MB
+    2,000 keys        2401.0 B  32.9 -> 50.0 MB      335.5 B   47.9 -> 59.4 MB
+    20,000 keys       1493.1 B  18.1 -> 19.3 MB      402.6 B   18.9 -> 18.9 MB
+    1M keys           2289.7 B  81.6 -> 81.6 MB       65.0 B   90.6 -> 90.6 MB
+    six indexes                 158.1 -> 196.4 MB              185.7 -> 197.1 MB
+
+In generic mode the record is a diff of the page, and without slack the first member added inside a
+bulk-built entry or container moves everything stored after it on the page; with slack the change
+stays inside the item. The WAL of the wave falls 2.7-fold on the 20-key column and up to 35-fold on the 1M-key one. What it costs is space, at
+build: 11% on the 1M-key column, whose entries are small and each get the 8-byte floor, and 46% on
+the 2,000-key column, whose sets fill their leaves almost exactly, so that the slack pushes many
+of them onto another leaf - and which still splits under the wave. The 20-key column's in-place insert into an ARRAY still diffs
+the members it shifts, hence 434.6 B. `posting_fillfactor` alone does not help generic mode: at 90
+the leaves stop splitting (six indexes 160.9 -> 162.1 MB) but a rewritten item that moves the rest
+of its leaf diffs as much as before, 1102.6 / 2857.4 / 2810.2 B on the 20-, 200- and 2,000-key
+columns. Under the resource manager, where the record is the item's own change either way (§25's
+DELTA and SPLICE), slack at build changes little - the 20,000-key column's entry records stay at
+about 166 B - and costs the same space, which is why `auto` leaves it off there. It stays `off` by
+default in both modes so that an index is built the same whatever its WAL mode, and an
+append-only or read-mostly index does not pay for room it never uses.
 
 Page allocation: `lion_alloc_page()` takes a page - a recycled one from the free space map when one
 is safe to take, else a fresh block from ExtendBufferedRel - and `lion_wal_init_buffer()`
@@ -6659,6 +6695,20 @@ Operations.
   reserves a block for the ROOT and re-stamps the held leaves with it - their images are still in
   memory, and every page of a set has to carry the root's block as its owner (§18) - and writes
   them with their downlinks.
+  **A leaf is filled to `posting_fillfactor`** (reloption, 10 .. 100, default 100), the chain of a
+  set without an internal level and the leaves of a tree alike: the build closes a leaf when the
+  next item would take it past that share of the page (`lion_builder_leaf_full()`), counted as
+  PageAddItem() spends it, the MAXALIGNed item and its line pointer, and a leaf always takes its
+  first item. At 100 that is exactly "the next item does not fit", the rule every build had
+  before, and the default keeps it, so an index built without the option is the same index page
+  for page. Below 100 it leaves the room the first wave of writes after a build needs: a
+  bulk-built container has no slack (§4), so the first member an insert adds INSIDE it - the new
+  row versions of an UPDATE on a heap with free space, rows placed in space VACUUM freed - rewrites
+  the item longer, and on a packed leaf that is a split, of nearly every leaf by the time the wave
+  has touched every container. Rows the heap appends land in new containers at the end of their
+  sets and need no room in the leaves before them, which is why the default stays at 100: an
+  append-only or read-mostly table pays for the room and never uses it. Measured below
+  ("Posting leaves with room, measured").
 
 ### The sets without an internal level, measured
 
@@ -6675,6 +6725,33 @@ leaves, so every root went; there are as many leaves as before.
 
 The roots that went were 98-99% empty: a handful of downlinks each, 9 on `c200` and fewer than 3 on
 the docs columns. The three position trees left with a root have more than 16 leaves.
+
+### Posting leaves with room, measured
+
+PostgreSQL 18.6 release build, rmgr mode, `wal_consistency_checking` off; a synthetic 5M-row
+table on a heap at fillfactor 90 with six lion indexes on columns of 2, 20, 200, 2,000, 20,000 and
+1M keys spread by a hash of the row number. One wave updates one row in a hundred, spread evenly,
+to the next key of the 20-key column, which inserts into every index (the update is not HOT) at a
+TID inside a container the build wrote. WAL is the index records' bytes per updated row, with and
+without full-page images (the wave starts after a CHECKPOINT); "after" is after the wave. The
+SPLICE operation of §25 is in every arm.
+
+    posting_fillfactor          100                  90                   80
+    20 keys   size        10.8 -> 18.8 MB       12.0 -> 12.0 MB      13.5 -> 13.5 MB
+              leaf splits      969                    0                    0
+              WAL/row     370.8 B (163.8 B)     290.5 B (83.1 B)     290.9 B (83.1 B)
+    200 keys  size        13.1 -> 25.2 MB       14.8 -> 14.8 MB      16.4 -> 16.4 MB
+              WAL/row     514.1 B (278.1 B)     335.3 B (94.0 B)     335.5 B (93.9 B)
+    2,000     size        32.9 -> 50.0 MB       32.9 -> 32.9 MB      35.2 -> 35.2 MB
+              WAL/row     863.7 B (393.5 B)     620.5 B (104.3 B)    620.0 B (104.3 B)
+    six indexes           158.1 -> 196.4 MB     160.9 -> 162.1 MB    166.7 -> 167.9 MB
+
+At 100 the wave split 969 of the 20-key column's some 1,300 leaves (3,854 B a SPLIT record, plus
+a downlink and a flag record each) and grew the index by three quarters; at 90 nothing split
+anywhere and the six indexes end 17% smaller, for 1.8% more at build. The 2,000-key column builds to the same size at 90, because its
+sets are two leaves each whatever the fill; the room moves to the first leaf. 80 buys nothing more
+for a wave of this size. The 20,000- and 1M-key columns keep their sets INLINE and are not
+affected; the INLINE growth is §4's.
 
 ### Cost model (`lion_cost_count_rel()`)
 
@@ -7782,11 +7859,13 @@ image.
                                    hot-key insert record: ~64 bytes.
     ITEM_REPLACE    0x10  2        DELTA (the ranges of the item at its allotted
                                    length that differ from what the page holds)
-                                   + MINMAX + the entry.  98 B for the dense
-                                   container that used to cost 1658; a rewrite
-                                   that changes more than half the item falls
-                                   back to REPLACE, which is the whole item at
-                                   its allotted length with its slack zeroed.
+                                   or SPLICE (the same with the bytes an insert
+                                   moved up said once) + MINMAX + the entry.
+                                   98 B for the dense container that used to
+                                   cost 1658; a rewrite that changes more than
+                                   half the item falls back to REPLACE, which is
+                                   the whole item at its allotted length with
+                                   its slack zeroed.
     ITEM_ADD        0x20  1-2      DELETE (when replacing) + ADD per item +
                                    MINMAX + the entry.  Also every record of an
                                    INLINE spill.
@@ -7829,8 +7908,8 @@ image.
                                    them.
 
 The operations are: INIT, SPECIAL (the whole 32-byte page special area), ADD,
-ADDMANY, REPLACE, DELTA, SETBYTES, MULTIDEL, DELETE_NC, DELETE, MINMAX, FLAGS,
-META, DELETED, CONTAINER_ADD, SPARSE_INS, NDISTINCT (§33).
+ADDMANY, REPLACE, DELTA, SPLICE, SETBYTES, MULTIDEL, DELETE_NC, DELETE, MINMAX,
+FLAGS, META, DELETED, CONTAINER_ADD, SPARSE_INS, NDISTINCT (§33).
 
 **DELTA is what a rewrite of one item costs now**, and it is the one operation
 whose payload is a function of the page as well as of the record. It says: the
@@ -7855,6 +7934,49 @@ is automatic: when the ranges would come to more than half the item, the
 operation is dropped and a plain REPLACE takes its place, so an ARRAY that turns
 into a BITSET still goes in whole. Nothing about masking changes, because the
 bytes outside the named ranges are the bytes the page already had.
+
+**SPLICE is a DELTA with bytes inserted** (`lion_waldelta.[ch]`). A member added
+in the MIDDLE of an ARRAY moves every member above it up by two bytes, and a
+DELTA can only say that by repeating every byte that moved: half the item on
+average, which is what the first insert into a bulk-built container cost, since
+such a container has no slack and takes the general path (§4). SPLICE's payload
+starts with `{uint16 at, uint16 inslen, inslen bytes}`, which are inserted into
+the base image at byte `at` before it is cut or zero-extended to `aux` bytes,
+and the DELTA ranges follow, applied to that. One member added to an ARRAY is
+then the two bytes, where they go and the new count: 12 bytes of payload where
+the DELTA carried every member above the new one. The same shape is a run added to a RUN (4 bytes), a
+pair added inside a sparse segment (a varint and the re-encoded one after it),
+and any of those inside an INLINE payload, where everything after the item
+moves up too. The writer does not say which it did: `lion_wal_op_replace()`
+hands the old image and the new item to `lion_delta_encode_item()`, which
+computes the DELTA and, unless that is already as small as a SPLICE can be,
+looks for an insertion of 1 to 8 bytes - the smallest `at` from which the new
+item is the old one moved up - and keeps whichever is smaller, DELTA on a tie,
+or neither when both exceed half the item. Redo decodes either with
+`lion_delta_decode_item()` into its scratch buffer and puts the item back as
+for a DELTA; a payload that does not fit the item the page holds (a splice
+point past it, a range past the new length) is a PANIC, because the record
+was not written against that page. The encoder and the decoder are pure
+functions of their bytes, which `test/unit/waldelta_test.c` round-trips over
+every container shape, random images and malformed payloads, and
+`wal_consistency_checking` checks on every record of the suite.
+
+Measured (PostgreSQL 18.6 release build, rmgr mode, 5M rows, six lion indexes
+on synthetic columns of 2 to 1M keys, one wave of 50,000 updates that move one
+row in a hundred to the next key of a 20-key column, on a heap at fillfactor
+90 so that the new versions land on the pages the old ones were on; bytes of
+index WAL without full-page images):
+
+| index | record | before | after |
+|---|---|---|---|
+| 20 keys | ITEM_REPLACE | 629.8 B | 96.9 B |
+| 20 keys | all records, per updated row | 439.8 B | 163.8 B |
+| 200 keys | ITEM_REPLACE | 152.1 B | 97.2 B |
+| 20,000 keys | ENTRY (INLINE) | 523.1 B | 165.7 B |
+| 1M keys | ENTRY (INLINE) | 77.9 B | 74.8 B |
+
+What is left on the 20-key column is the splits of its full leaves, which the
+`posting_fillfactor` reloption of §22 is for.
 
 **Two operations log the writer's CALL rather than its bytes**, and that is
 where the hot record's size comes from. Adding a member to a sorted ARRAY shifts
@@ -8349,6 +8471,13 @@ the first batch after a CHECKPOINT writes 2.7 MiB MORE in generic mode
 (88.10 -> 90.82), which is full-page images: entries that carry slack fill a leaf
 a little sooner, so a batch touches a few more pages the first time round. The
 index itself is the same size, to the byte, after the same inserts.
+
+Slack is written by an insert, so in generic mode the FIRST insert into each
+entry or container of a bulk-built index still moves everything after it on its
+page. The `build_slack` reloption has the build write the slack an insert would
+(§4, "Slack at build time, measured"): on a wave of scattered updates after a
+build it takes generic-mode WAL from 1.1-2.4 KB to 65-435 bytes a row, at 4-46%
+more index at build. It is off by default in both modes.
 
 Also in this wave (§23 items that need the same lock-window work):
 
