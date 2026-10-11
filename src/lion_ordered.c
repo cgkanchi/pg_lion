@@ -3404,9 +3404,14 @@ lo_set_key_index(const LionTidSet *set, uint32 ckey)
 /*
  * The probes have cost what the build would, or the walk has gone far: build
  * the set, and hand it what the walk met so far, so that the early stop and
- * the switch count those members as met.  A member the build does not have
- * cannot be - it is the same answer - but should one be missing, the scan
- * stops counting (novisit) rather than let the switch fetch it again.
+ * the switch count those members as met.  The members met are counted again
+ * against the built set, not carried over: the probes answered from the index
+ * as it was, and a VACUUM in between may have taken out of it the dead TIDs
+ * the walk met and marked, which the built set no longer has.  Carried over,
+ * those would let the count of members met reach the set's members while
+ * live members were still ahead, and the early stop would end the scan before
+ * them.  Should a whole container key be missing, the scan stops counting
+ * (novisit) rather than let the switch fetch it again.
  *
  * The lazy set goes first: the build evaluates the leaves' run-time keys
  * again, and the values the lazy sets were located from go with them.  What
@@ -3421,6 +3426,7 @@ lo_lazy_convert(LionOrderedState *st)
 	uint64	  **mvisited;
 	int			nmet = 0;
 	uint64	  **visited = NULL;
+	uint64	   *img = NULL;
 	bool		lost = false;
 	int			i;
 
@@ -3440,12 +3446,17 @@ lo_lazy_convert(LionOrderedState *st)
 
 	lo_build_set(st);
 	if (!st->degraded && st->set->n > 0)
+	{
 		visited = (uint64 **) MemoryContextAllocZero(st->scancxt,
 													 sizeof(uint64 *) * st->set->n);
+		img = (uint64 *) palloc(LION_BITSET_BYTES);
+	}
+	st->distinct = 0;
 	for (i = 0; i < nmet; i++)
 	{
 		int			idx = (visited != NULL) ?
 			lo_set_key_index(st->set, mkeys[i]) : -1;
+		int			w;
 
 		if (idx < 0)
 		{
@@ -3454,8 +3465,17 @@ lo_lazy_convert(LionOrderedState *st)
 		}
 		visited[idx] = mvisited[i];
 		st->visitedbytes += LION_BITSET_BYTES;
+
+		/* the members met at this key that the built set still has */
+		memset(img, 0, LION_BITSET_BYTES);
+		lion_container_or_into_bitset(st->set->conts[idx], img);
+		for (w = 0; w < LION_BITSET_WORDS; w++)
+			img[w] &= mvisited[i][w];
+		st->distinct += lion_container_image_cardinality(img);
 	}
 	st->visited = visited;
+	if (img != NULL)
+		pfree(img);
 	if (lost && !st->novisit)
 	{
 		st->novisit = true;
@@ -4631,10 +4651,12 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	LionOrderedState *st = (LionOrderedState *) node;
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 	StringInfoData buf;
+	const char *name;
 	int			i;
 
 	initStringInfo(&buf);
-	appendStringInfoString(&buf, get_rel_name(st->ordoid));
+	name = get_rel_name(st->ordoid);
+	appendStringInfoString(&buf, name != NULL ? name : "???");
 	if (st->lionwalk)
 	{
 		/* the column walked, as the index names it (§30.11) */
@@ -4668,9 +4690,11 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	resetStringInfo(&buf);
 	for (i = 0; i < st->nleaves; i++)
 	{
-		const char *name = get_rel_name(st->leaves[i].indexoid);
 		int			j;
 
+		name = get_rel_name(st->leaves[i].indexoid);
+		if (name == NULL)
+			name = "???";
 		/* each index once, in the order the tree first names it */
 		for (j = 0; j < i; j++)
 			if (st->leaves[j].indexoid == st->leaves[i].indexoid)

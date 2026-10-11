@@ -589,10 +589,15 @@ lion_entry_size_error(Page page, ItemId iid)
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lion index entry of %zu bytes at page offset %u does not hold an entry header",
 						len, ItemIdGetOffset(iid))));
+	if (len - LION_ENTRY_HDRSZ < (Size) ((LionEntryTuple *) PageGetItem(page, iid))->keylen)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index entry of %zu bytes claims a key of %u bytes",
+						len, ((LionEntryTuple *) PageGetItem(page, iid))->keylen)));
 	ereport(ERROR,
 			(errcode(ERRCODE_INDEX_CORRUPTED),
-			 errmsg("lion index entry of %zu bytes claims a key of %u bytes",
-					len, ((LionEntryTuple *) PageGetItem(page, iid))->keylen)));
+			 errmsg("lion index entry of %zu bytes at page offset %u is too small for its header, key and positions extension",
+					len, ItemIdGetOffset(iid))));
 }
 
 LionEntryTuple *

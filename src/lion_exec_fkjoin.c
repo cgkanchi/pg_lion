@@ -1414,7 +1414,15 @@ lion_join_part_open(LionCountScanState *st, int p)
 			elog(ERROR, "LionCount: a partition's copy of its fact filters has no index");
 
 		for (i = 0; i < st->nclause; i++)
+		{
 			st->clause[i].qmode = jp->qmode[i];
+			if (st->clause[i].xvalown)
+			{
+				pfree(DatumGetPointer(st->clause[i].xval));
+				st->clause[i].xvalown = false;
+			}
+			st->clause[i].xval = jp->xval[i];
+		}
 		lion_build_filter(st);
 		st->located = true;
 		st->wheremissing = jp->missing;
@@ -1449,7 +1457,12 @@ lion_join_part_open(LionCountScanState *st, int p)
 
 	jp->collected = true;
 	for (i = 0; i < st->nclause; i++)
+	{
+		/* the partition's from here on: freed with valcxt, at the rescan */
 		jp->qmode[i] = st->clause[i].qmode;
+		jp->xval[i] = st->clause[i].xval;
+		st->clause[i].xvalown = false;
+	}
 	if (js->collect)
 	{
 		Size		limit = get_hash_memory_limit();

@@ -255,7 +255,7 @@ lion_bm25_stats(Relation index, LionState *col, Datum lenkey,
 											HASH_ELEM | HASH_BLOBS);
 	}
 	st = (LionBm25Stats *) hash_search(lion_bm25_stats_cache,
-									   &RelationGetRelid(index), HASH_ENTER,
+									   &RelationGetRelid(index), HASH_FIND,
 									   &found);
 	if (!found || st->relnumber != index->rd_locator.relNumber ||
 		(ntids > st->ntids ? ntids - st->ntids : st->ntids - ntids) >
@@ -276,6 +276,15 @@ lion_bm25_stats(Relation index, LionState *col, Datum lenkey,
 				CHECK_FOR_INTERRUPTS();
 		}
 		lion_poscursor_close(cur);
+
+		/*
+		 * The entry is made once the walk is done: made before it, a walk
+		 * that errors out (a cancel, a corrupt page) would leave an entry
+		 * never filled in, which the next call would read as statistics.
+		 */
+		st = (LionBm25Stats *) hash_search(lion_bm25_stats_cache,
+										   &RelationGetRelid(index),
+										   HASH_ENTER, NULL);
 		st->relnumber = index->rd_locator.relNumber;
 		st->ntids = ntids;
 		st->nrows = n;

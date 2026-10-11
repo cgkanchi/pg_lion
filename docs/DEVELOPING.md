@@ -14,8 +14,7 @@ test/isolation/*.spec`), which are the race tests of the VACUUM/count/split inte
 configured with `--enable-injection-points` and the `injection_points` test module.  PostgreSQL 16
 has no injection points, and the PGDG packages of 17 and 18 ship without the module, so CI runs those
 specs only on its 19 and master source builds; on 16-18 the interlocks are covered by the same code
-and by those specs on the newer majors, not by a test on that major.  See the
-[latest review](../FOLLOWUP_REVIEW.md) for evidence and remaining limitations.
+and by those specs on the newer majors, not by a test on that major.
 
 ## Build and test
 

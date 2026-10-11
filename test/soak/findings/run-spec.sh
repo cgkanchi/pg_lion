@@ -15,16 +15,16 @@ PG_CONFIG=${PG_CONFIG:-$D/../../../.local/pg/bin/pg_config}
 PGXS_DIR=$(dirname "$("$PG_CONFIG" --pgxs)")
 OUT=${FINDINGS_OUT:-$(mktemp -d)}
 rc=0
-[ $# -gt 0 ] || set -- $(cd "$D" && ls *.spec *.sql 2>/dev/null | sed 's/\.\(spec\|sql\)$//' | sort -u)
+[ $# -gt 0 ] || set -- $(cd "$D" && ls specs/*.spec *.sql 2>/dev/null | sed 's|^specs/||; s/\.\(spec\|sql\)$//' | sort -u)
 for t in "$@"; do
-	if [ -f "$D/$t.spec" ]; then
+	if [ -f "$D/specs/$t.spec" ]; then
 		"$PGXS_DIR/../../src/test/isolation/pg_isolation_regress" \
 			--inputdir="$D" --outputdir="$OUT" --use-existing \
 			--dbname=lion_findings "$t" || { rc=1; cat "$OUT/regression.diffs" 2>/dev/null; }
 	elif [ -f "$D/$t.sql" ]; then
 		psql -X -v ON_ERROR_STOP=1 -f "$D/$t.sql" || rc=1
 	else
-		echo "no $t.spec or $t.sql in $D" >&2; rc=2
+		echo "no specs/$t.spec or $t.sql in $D" >&2; rc=2
 	fi
 done
 echo "outputs in $OUT"

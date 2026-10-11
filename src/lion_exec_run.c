@@ -660,6 +660,8 @@ lion_reset_run(LionCountScanState *st)
 			cl->val = (Datum) 0;
 			cl->valisnull = false;
 		}
+		cl->xval = (Datum) 0;
+		cl->xvalown = false;
 	}
 	if (st->valcxt != NULL)
 		MemoryContextReset(st->valcxt);

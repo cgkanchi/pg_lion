@@ -2147,7 +2147,10 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 			continue;
 		npositive++;
 		if (!lion_source_satisfiable(trees[i], sources[i].sets))
+		{
+			pfree(trees);
 			return 0;
+		}
 	}
 	if (npositive == 0)
 		elog(ERROR, "lion index count needs at least one positive source");

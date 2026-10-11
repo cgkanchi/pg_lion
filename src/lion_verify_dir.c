@@ -840,6 +840,8 @@ lion_verify_classify(LionVerifyState *vs, BlockNumber blk)
 		UnlockReleaseBuffer(buf);
 		return LION_UNREF_FOREIGN;
 	}
+	/* a lion page nothing has checked yet: its header before its items */
+	lion_verify_page_bounds(vs, blk, page);
 
 	/*
 	 * A DELETED page is the normal state of a freed one (DESIGN.md §18): it

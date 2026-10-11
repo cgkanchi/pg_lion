@@ -3,15 +3,14 @@
 For routine development, use the [quick progress benchmark](../QUICK.md). It keeps B-tree,
 GIN, roaring, and roaring_bitmap at 1M and 5M rows, uses two timing rounds and a reduced
 query/index matrix, and generates baseline query deltas automatically.
-The latest default run at `481f876` finished in 3 minutes 51 seconds on the benchmark host.
 
 The default **focused** suite compares **B-tree, GIN, roaring, and roaring_bitmap**. It keeps the 1M/5M scales and representative wins, parity cases, and losses, while dropping repetitive query variants and irrelevant competitors. Sequential execution remains the untimed correctness reference. `roaring_bitmap` reuses the Lion indexes with count pushdown disabled. The old exhaustive suite is available with `--profile full`.
 
 Both profiles create a private temporary database cluster; neither changes `pg_index.indisvalid` or connects to a user-supplied database endpoint. The quick benchmark remains unchanged for frequent progress checks; focused adds high-cardinality/skew cases, low-memory diagnostics, and a third timing round.
 
-Start with the [results and interpretation](../COMPARISON.md). The full measured report is [searchable HTML](../results/2026-09-20-comparison/index.html) or [complete Markdown](../results/2026-09-20-comparison/REPORT.md). The [follow-up review](../../FOLLOWUP_REVIEW.md) tracks the remaining code findings. Historical measurements in the root README use different datasets/builds and should not be merged into this run.
-
-The [growth/churn/write supplement](../results/2026-09-21-stress/REPORT.md) additionally compares empty-index ingestion, five changing-key/VACUUM cycles at constant live cardinality, fully dirty low-memory counts, custom/generic prepared plans, and 1/4/8-client insert bursts with indexed result checks. Its [HTML tables and plots](../results/2026-09-21-stress/index.html) and raw records are separate from the main eight-index portfolio.
+The run the [benchmark page](../../docs/BENCHMARKS.md) summarises is kept in
+[results/2026-10-08-85c991c-pg18-focused](../results/2026-10-08-85c991c-pg18-focused/REPORT.md),
+as [searchable HTML](../results/2026-10-08-85c991c-pg18-focused/index.html) and raw records.
 
 ## Run
 

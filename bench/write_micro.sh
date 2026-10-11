@@ -50,9 +50,8 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # The PostgreSQL install to measure with.  The default is the dev tree's
 # assert-enabled one, which is NOT what a headline number should come from;
-# point LION_WM_PGBIN at a release prefix (bench/lib.sh's
-# bench_build_extension installs the extension into one) for anything that
-# goes into DESIGN.md.
+# point LION_WM_PGBIN at a release prefix with the extension installed for
+# anything that goes into DESIGN.md.
 PGBIN=${LION_WM_PGBIN:-$ROOT/.local/pg/bin}
 DATA=${LION_WM_DATA:-$ROOT/.local/data-wm}
 PORT=${LION_WM_PORT:-54330}

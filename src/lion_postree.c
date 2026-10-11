@@ -137,6 +137,7 @@ lion_postree_put(Relation index, Relation heaprel, uint32 hash,
 	bool		insert_new = false;
 	LionContainer *work;
 	bool		replaced = false;
+	LionRightWalk walk;
 
 	tree.hash = hash;
 	tree.root = root;
@@ -148,16 +149,23 @@ lion_postree_put(Relation index, Relation heaprel, uint32 hash,
 	buf = lion_posting_search_before(index, heaprel, hash, root, block,
 									 BUFFER_LOCK_EXCLUSIVE, true);
 	if (!BufferIsValid(buf))
-		elog(ERROR, "lion index \"%s\": the position tree at %u is gone",
-			 RelationGetRelationName(index), root);
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": the position tree at %u is gone",
+						RelationGetRelationName(index), root)));
 
 	/*
 	 * Find the target: the candidates are the last chunk whose header is
 	 * below block (on this leaf, by P3) and then the chunks whose header is
 	 * block, which may run on over the leaves to the right.  The walk keeps
 	 * the leaf the target is on and lets go of every other one; nobody else
-	 * writes to the tree meanwhile.
+	 * writes to the tree meanwhile.  The walk is bounded and interruptible as
+	 * every right walk is (LionRightWalk), and it never takes a lock on the
+	 * leaf it keeps: a right link pointing back at it would otherwise wait
+	 * forever on the lock this backend holds, with the key's directory leaf
+	 * locked too.
 	 */
+	lion_rightwalk_init(&walk);
 	for (;;)
 	{
 		Page		page;
@@ -223,11 +231,13 @@ lion_postree_put(Relation index, Relation heaprel, uint32 hash,
 
 		if (done)
 			break;
-		if (!BlockNumberIsValid(next) || next == root)
+		if (!BlockNumberIsValid(next) || next == root || next == tblk)
 			ereport(ERROR,
 					(errcode(ERRCODE_INDEX_CORRUPTED),
 					 errmsg("lion index \"%s\": leaf %u of the position tree at %u links to block %u",
 							RelationGetRelationName(index), blk, root, next)));
+		lion_rightwalk_step(index, &walk, blk, next);
+		CHECK_FOR_INTERRUPTS();
 		buf = ReadBuffer(index, next);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	}
@@ -249,8 +259,10 @@ lion_postree_put(Relation index, Relation heaprel, uint32 hash,
 										 BUFFER_LOCK_EXCLUSIVE, true);
 		lion_postree_check_leaf(index, buf, root);
 		if (PageGetMaxOffsetNumber(BufferGetPage(buf)) != InvalidOffsetNumber)
-			elog(ERROR, "lion index \"%s\": position tree at %u has a chunk the walk did not see",
-				 RelationGetRelationName(index), root);
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": position tree at %u has a chunk the walk did not see",
+							RelationGetRelationName(index), root)));
 		tbuf = buf;
 		toff = FirstOffsetNumber;
 		insert_new = true;
@@ -322,7 +334,9 @@ lion_postree_fetch(Relation index, uint32 hash, BlockNumber root,
 {
 	uint32		block = lion_pos_block(code);
 	Buffer		buf;
+	LionRightWalk walk;
 
+	lion_rightwalk_init(&walk);
 	buf = lion_posting_search_before(index, NULL, hash, root, block,
 									 BUFFER_LOCK_SHARE, false);
 	while (BufferIsValid(buf))
@@ -365,6 +379,9 @@ lion_postree_fetch(Relation index, uint32 hash, BlockNumber root,
 			break;
 		next = LionPageGetOpaque(page)->rightlink;
 		UnlockReleaseBuffer(buf);
+		if (!BlockNumberIsValid(next))
+			lion_rightwalk_badlink(index, blk, next);
+		lion_rightwalk_step(index, &walk, blk, next);
 		CHECK_FOR_INTERRUPTS();
 		buf = ReadBuffer(index, next);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -476,6 +493,7 @@ pos_stress_check(Relation index, uint32 hash, BlockNumber root,
 	LionPosMember *got = palloc(sizeof(LionPosMember));
 	LionPosMember *want = palloc(sizeof(LionPosMember));
 	Buffer		buf;
+	LionRightWalk walk;
 
 	/* the reference: the last version of every code */
 	memcpy(ref, ops, sizeof(PosStressOp) * nops);
@@ -489,6 +507,7 @@ pos_stress_check(Relation index, uint32 hash, BlockNumber root,
 	}
 
 	/* the walk: every leaf from the leftmost, where a descent for 0 ends */
+	lion_rightwalk_init(&walk);
 	buf = lion_posting_search_before(index, NULL, hash, root, 0,
 									 BUFFER_LOCK_SHARE, false);
 	while (BufferIsValid(buf))
@@ -552,6 +571,10 @@ pos_stress_check(Relation index, uint32 hash, BlockNumber root,
 			break;
 		}
 		UnlockReleaseBuffer(buf);
+		if (!BlockNumberIsValid(next))
+			lion_rightwalk_badlink(index, blk, next);
+		lion_rightwalk_step(index, &walk, blk, next);
+		CHECK_FOR_INTERRUPTS();
 		buf = ReadBuffer(index, next);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 	}
@@ -788,6 +811,9 @@ lion_debug_key_positions(PG_FUNCTION_ARGS)
 	}
 	else if (BlockNumberIsValid(root))
 	{
+		LionRightWalk walk;
+
+		lion_rightwalk_init(&walk);
 		buf = lion_posting_search_before(index, NULL, hash, root, 0,
 										 BUFFER_LOCK_SHARE, false);
 		while (BufferIsValid(buf))
@@ -817,6 +843,10 @@ lion_debug_key_positions(PG_FUNCTION_ARGS)
 				break;
 			}
 			UnlockReleaseBuffer(buf);
+			if (!BlockNumberIsValid(next))
+				lion_rightwalk_badlink(index, blk, next);
+			lion_rightwalk_step(index, &walk, blk, next);
+			CHECK_FOR_INTERRUPTS();
 			buf = ReadBuffer(index, next);
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 		}

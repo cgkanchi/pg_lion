@@ -1,7 +1,0 @@
-{
-  "status": "pass",
-  "samples": 360,
-  "correctness_checks": 120,
-  "configurations": 120,
-  "cross_portfolio_result_groups": 31
-}
