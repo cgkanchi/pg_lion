@@ -614,32 +614,78 @@ lion_dir_leftmost_leaf(Relation index, LionIndexState *ix)
  * Descent
  * --------------------------------------------------------------------- */
 
-Buffer
-lion_dir_search(Relation index, Relation heaprel, LionIndexState *ix,
-				const LionSearchKey *sk, int lockmode, bool forwrite,
-				OffsetNumber *offp)
+/*
+ * Remember the level-1 page blk, locked, as the one a descent took its leaf's
+ * downlink from (LionDirParent).  A high key longer than a pivot can be is
+ * damage the next read of the page reports; it is just not remembered.
+ */
+static void
+lion_dir_note_parent(Page page, BlockNumber blk, LionDirParent *parent)
+{
+	parent->blk = blk;
+	parent->rightmost = LionPageIsRightmost(page);
+	parent->hikeylen = 0;
+	if (!parent->rightmost)
+	{
+		ItemId		iid = PageGetItemId(page, FirstOffsetNumber);
+		LionEntryTuple *hk = (LionEntryTuple *) PageGetItem(page, iid);
+		Size		len = ItemIdGetLength(iid);
+
+		if (len >= LION_ENTRY_HDRSZ &&
+			len <= MAXALIGN(LION_ENTRY_HDRSZ + LION_MAX_KEY_SIZE) &&
+			(Size) hk->keylen <= len - LION_ENTRY_HDRSZ)
+		{
+			memcpy(parent->hikey, hk, len);
+			parent->hikeylen = len;
+		}
+		else
+			parent->blk = InvalidBlockNumber;
+	}
+}
+
+static Buffer
+lion_dir_search_ext(Relation index, Relation heaprel, LionIndexState *ix,
+					const LionSearchKey *sk, int lockmode, bool forwrite,
+					OffsetNumber *offp, LionDirParent *parent)
 {
 	Buffer		buf;
 
 	Assert(!forwrite || lockmode == BUFFER_LOCK_EXCLUSIVE);
+	Assert(parent == NULL || lockmode == BUFFER_LOCK_SHARE);
 
-restart:
-	buf = lion_dir_get_root(index, ix);
-
-	if (LionPageIsLeaf(BufferGetPage(buf)) && lockmode != BUFFER_LOCK_SHARE)
+	if (parent != NULL && BlockNumberIsValid(parent->blk))
 	{
-		/*
-		 * A one-page tree: the root is the leaf and has to be relocked in the
-		 * caller's mode.  Anything may have happened in between, so start over
-		 * if it is no longer both.
-		 */
-		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-		LockBuffer(buf, lockmode);
-		if (!LionPageIsRoot(BufferGetPage(buf)) ||
-			!LionPageIsLeaf(BufferGetPage(buf)))
+		/* below the root: a level-1 page, which no page ever stops being */
+		BlockNumber start = parent->blk;
+
+		buf = lion_dir_readbuf(index, start);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		lion_dir_check_page(index, BufferGetPage(buf), start);
+		lion_dir_check_level(index, BufferGetPage(buf), start, 1);
+		parent->blk = InvalidBlockNumber;
+	}
+	else
+	{
+		if (parent != NULL)
+			parent->blk = InvalidBlockNumber;
+restart:
+		buf = lion_dir_get_root(index, ix);
+
+		if (LionPageIsLeaf(BufferGetPage(buf)) && lockmode != BUFFER_LOCK_SHARE)
 		{
-			UnlockReleaseBuffer(buf);
-			goto restart;
+			/*
+			 * A one-page tree: the root is the leaf and has to be relocked in
+			 * the caller's mode.  Anything may have happened in between, so
+			 * start over if it is no longer both.
+			 */
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			LockBuffer(buf, lockmode);
+			if (!LionPageIsRoot(BufferGetPage(buf)) ||
+				!LionPageIsLeaf(BufferGetPage(buf)))
+			{
+				UnlockReleaseBuffer(buf);
+				goto restart;
+			}
 		}
 	}
 
@@ -705,6 +751,8 @@ restart:
 		child = lion_dir_downlink_block(index, page, BufferGetBlockNumber(buf), off);
 		level = LionPageGetOpaque(page)->level;
 		childlock = (level == 1) ? lockmode : BUFFER_LOCK_SHARE;
+		if (parent != NULL && level == 1)
+			lion_dir_note_parent(page, BufferGetBlockNumber(buf), parent);
 
 		/* Release the parent BEFORE locking the child; see the file header. */
 		UnlockReleaseBuffer(buf);
@@ -721,6 +769,24 @@ restart:
 		lion_dir_check_page(index, BufferGetPage(buf), child);
 		lion_dir_check_level(index, BufferGetPage(buf), child, level - 1);
 	}
+}
+
+Buffer
+lion_dir_search(Relation index, Relation heaprel, LionIndexState *ix,
+				const LionSearchKey *sk, int lockmode, bool forwrite,
+				OffsetNumber *offp)
+{
+	return lion_dir_search_ext(index, heaprel, ix, sk, lockmode, forwrite,
+							   offp, NULL);
+}
+
+Buffer
+lion_dir_search_from(Relation index, LionIndexState *ix,
+					 const LionSearchKey *sk, LionDirParent *parent,
+					 OffsetNumber *offp)
+{
+	return lion_dir_search_ext(index, NULL, ix, sk, BUFFER_LOCK_SHARE, false,
+							   offp, parent);
 }
 
 /*

@@ -916,6 +916,27 @@ lion_join_ent_cmp(const void *a, const void *b, void *arg)
 	return (x->seq > y->seq) - (x->seq < y->seq);
 }
 
+/* ... with the abbreviated keys a plain fact's batch carries. */
+static int
+lion_join_ent_cmp_abbrev(const void *a, const void *b, void *arg)
+{
+	const LionJoinEnt *x = (const LionJoinEnt *) a;
+	const LionJoinEnt *y = (const LionJoinEnt *) b;
+
+	if (x->isnull != y->isnull)
+		return x->isnull ? -1 : 1;
+	if (!x->isnull)
+	{
+		int			c = lion_lookup_walk_cmp_abbrev((LionLookupWalk *) arg,
+													x->key, x->abbrev, x->hash,
+													y->key, y->abbrev, y->hash);
+
+		if (c != 0)
+			return c;
+	}
+	return (x->seq > y->seq) - (x->seq < y->seq);
+}
+
 /*
  * Empty the batch: what it held, the slots that point into it, and the walk's
  * place, which the next batch's first key may be left of.  Nothing for a
@@ -1006,6 +1027,7 @@ lion_join_fill_batch(LionCountScanState *st)
 		ent->seq = n;
 		ent->isnull = isnull;
 		ent->key = (Datum) 0;
+		ent->abbrev = (Datum) 0;
 		ent->hash = 0;
 		ent->acc = 0;
 		if (!isnull)
@@ -1014,7 +1036,11 @@ lion_join_fill_batch(LionCountScanState *st)
 
 			/* a partitioned fact table sorts it for each partition's walk */
 			if (js->part.leaf == NULL)
+			{
 				ent->hash = lion_lookup_walk_hash(&js->batch.walker, ent->key);
+				ent->abbrev = lion_lookup_walk_abbrev(&js->batch.walker,
+													  ent->key);
+			}
 		}
 		ent->tuple = js->sort.unique ? NULL : ExecCopySlotMinimalTuple(slot);
 		MemoryContextSwitchTo(oldcxt);
@@ -1026,8 +1052,8 @@ lion_join_fill_batch(LionCountScanState *st)
 		return false;
 	js->batch.batches++;
 	if (n > 1 && js->part.leaf == NULL)
-		qsort_arg(js->batch.ent, n, sizeof(LionJoinEnt), lion_join_ent_cmp,
-				  &js->batch.walker);
+		qsort_arg(js->batch.ent, n, sizeof(LionJoinEnt),
+				  lion_join_ent_cmp_abbrev, &js->batch.walker);
 	return true;
 }
 

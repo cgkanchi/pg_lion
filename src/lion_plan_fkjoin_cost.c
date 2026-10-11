@@ -67,8 +67,13 @@ lion_parallel_divisor(int workers)
  *	  batch, LION_FKJOIN_BATCH_ROW_COST;
  *	- the keys of a batch lie `leaves / keys` leaves apart on average.  While
  *	  that is at most the height, the walk steps over them, a page each; past
- *	  it a key descends, which costs the height of the directory over and
- *	  above its leaf.
+ *	  it a key descends - from the level-1 page the last descent went through
+ *	  while the key is under it, one page over and above its leaf, and from
+ *	  the root, the height of the directory, for the first key under each
+ *	  level-1 page.  A level-1 page has some `fanout` leaves under it, taken
+ *	  as the directory's mean fanout, dirpages to the 1/height: of the keys
+ *	  `apart` leaves apart, one in fanout / apart is the first under its
+ *	  level-1 page.
  *
  * Against a descent per row, height + 1 pages, the walk is cheaper only where
  * the height is at least two and a batch holds more keys than there are
@@ -84,9 +89,17 @@ lion_cost_fkjoin_walk(double rows, double leaves, double height,
 	double		batches = ceil(rows / perbatch);
 	double		keys = rows / Max(batches, 1.0);
 	double		apart = leaves / Max(keys, 1.0);
+	double		fanout = (height >= 1.0) ?
+		Max(pow(Max(leaves, 1.0), 1.0 / height), 2.0) : 1.0;
+	double		perkey;
+
+	if (apart <= height || height < 1.0)
+		perkey = Min(apart, height);
+	else
+		perkey = 1.0 + (height - 1.0) * Min(apart / fanout, 1.0);
 
 	return batches * (height + 1.0) * LION_DESCENT_COST +
-		rows * (Min(apart, height) * LION_DESCENT_COST +
+		rows * (perkey * LION_DESCENT_COST +
 				LION_FKJOIN_LOOKUP_COST + LION_FKJOIN_BATCH_ROW_COST);
 }
 
