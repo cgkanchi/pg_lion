@@ -330,6 +330,18 @@ lion_rel_read_only(LionCountScanState *st, Relation heap)
  * The inner group of a two-column GROUP BY follows the items, so its slot
  * moves with their number.
  */
+/* The most items any run has (DESIGN.md §10, "Filtered counts"). */
+static int
+lion_max_items(LionCountScanState *st)
+{
+	int			n = st->nplanitem;
+	int			r;
+
+	for (r = 0; r < st->nrun && st->nrunitem != NULL; r++)
+		n = Max(n, st->nrunitem[r]);
+	return n;
+}
+
 static void
 lion_relation_items(LionCountScanState *st)
 {
@@ -356,16 +368,19 @@ lion_relation_items(LionCountScanState *st)
 		else if (it.rangesrc)
 		{
 			AttrNumber	attno = st->clause[it.clauseno].attno;
+			int			first;
+			int			wn;
 			int			j;
 
-			for (j = 0; j < st->nclause; j++)
+			lion_clause_window(st, it.clauseno, &first, &wn);
+			for (j = first; j < first + wn; j++)
 			{
 				if (st->clause[j].kind == LION_CLAUSE_RANGESRC &&
 					!st->inor[j] && st->clause[j].attno == attno &&
 					st->clause[j].idx != NULL)
 					break;
 			}
-			if (j == st->nclause)
+			if (j == first + wn)
 				continue;
 			it.clauseno = j;
 		}
@@ -376,8 +391,7 @@ lion_relation_items(LionCountScanState *st)
 	st->nitem = n;
 
 	st->nsource = n + 1 + (st->innerattno != 0 ? 1 : 0);
-	memset(st->sources, 0, sizeof(LionCountSource) * (st->nplanitem + 1 +
-													  (st->innerattno != 0 ? 1 : 0)));
+	memset(st->sources, 0, sizeof(LionCountSource) * st->nsource);
 	st->sources[0].nsets = 1;
 	st->sources[0].sets = &st->groupset;
 	if (st->innerattno != 0)
@@ -1156,11 +1170,91 @@ lion_begin_driving_column(LionCountScanState *st, const LionCountPriv *priv)
  * union of the arms - and that is the only thing that tells the two apart
  * anywhere below.
  */
+static int
+lion_run_items(LionCountScanState *st, int r, LionSourceItem *item)
+{
+	int			nitem = 0;
+	int			i;
+	int			k;
+
+	for (i = 0; i < st->nclause; i++)
+	{
+		int			orno = -1;
+		int			f = st->plan.clause[i].filter;
+
+		/* Only the WHERE's clauses and the run's own filter's. */
+		if (f != 0 && f != r)
+			continue;
+
+		/* The join key is looked up per child row, into slot 0, not here. */
+		if (st->join != NULL && i == st->join->clause)
+			continue;
+
+		/* A range bounds the driving walk and is no source (DESIGN.md §28). */
+		if (st->clause[i].kind == LION_CLAUSE_RANGE)
+			continue;
+
+		/*
+		 * A range taken as a source (DESIGN.md §32) is ONE source however many
+		 * bounds it has: the first bound on its column opens it, for all of
+		 * them.  Under an OR the same goes per arm (lion_locate_or()), and
+		 * beside filtered counts per filter: the WHERE's bounds are one
+		 * range, a filter's another (lion_clause_window()).
+		 */
+		item[nitem].rangesrc = false;
+		if (st->clause[i].kind == LION_CLAUSE_RANGESRC && !st->inor[i])
+		{
+			for (k = 0; k < i; k++)
+			{
+				if (st->clause[k].kind == LION_CLAUSE_RANGESRC &&
+					!st->inor[k] && st->clause[k].attno == st->clause[i].attno &&
+					st->plan.clause[k].filter == f)
+					break;
+			}
+			if (k < i)
+				continue;
+			item[nitem].rangesrc = true;
+		}
+
+		if (st->inor[i])
+		{
+			/* Only the FIRST leaf of an OR opens a source, for the whole OR. */
+			for (k = 0; k < st->nor; k++)
+			{
+				if (st->ors[k].first == i)
+				{
+					orno = k;
+					break;
+				}
+			}
+			if (orno < 0)
+				continue;
+		}
+
+		item[nitem].clauseno = i;
+		item[nitem].orno = orno;
+		nitem++;
+	}
+	return nitem;
+}
+
+/*
+ * The OR restrictions (DESIGN.md §19) and the sources the clauses make
+ * up: one per plain clause, one per OR.  A clause that is an OR leaf has
+ * no source of its own - its posting sets go into the OR's, which is the
+ * union of the arms - and that is the only thing that tells the two apart
+ * anywhere below.
+ *
+ * Beside filtered counts (DESIGN.md §10, "Filtered counts") each run has
+ * items of its own - the WHERE's, then its filter's - and the node starts
+ * with run 0's, the WHERE's alone (lion_select_run()).
+ */
 static void
 lion_begin_ors_and_items(LionCountScanState *st, const LionCountPriv *priv)
 {
 	int			i;
 	int			k;
+	int			r;
 
 	st->nor = priv->nor;
 	st->ors = priv->ors;
@@ -1188,61 +1282,112 @@ lion_begin_ors_and_items(LionCountScanState *st, const LionCountPriv *priv)
 		}
 	}
 
-	st->item = (LionSourceItem *)
-		palloc0(sizeof(LionSourceItem) * Max(st->nclause + 1, 1));
-	st->nitem = 0;
-	for (i = 0; i < st->nclause; i++)
+	st->nfilter = priv->nfilter;
+	st->nrun = 1 + priv->nfilter;
+	st->currun = 0;
+	if (st->nfilter == 0)
 	{
-		int			orno = -1;
-
-		/* The join key is looked up per child row, into slot 0, not here. */
-		if (st->join != NULL && i == st->join->clause)
-			continue;
-
-		/* A range bounds the driving walk and is no source (DESIGN.md §28). */
-		if (st->clause[i].kind == LION_CLAUSE_RANGE)
-			continue;
-
-		/*
-		 * A range taken as a source (DESIGN.md §32) is ONE source however many
-		 * bounds it has: the first bound on its column opens it, for all of
-		 * them.  Under an OR the same goes per arm (lion_locate_or()).
-		 */
-		st->item[st->nitem].rangesrc = false;
-		if (st->clause[i].kind == LION_CLAUSE_RANGESRC && !st->inor[i])
-		{
-			for (k = 0; k < i; k++)
-			{
-				if (st->clause[k].kind == LION_CLAUSE_RANGESRC &&
-					!st->inor[k] && st->clause[k].attno == st->clause[i].attno)
-					break;
-			}
-			if (k < i)
-				continue;
-			st->item[st->nitem].rangesrc = true;
-		}
-
-		if (st->inor[i])
-		{
-			/* Only the FIRST leaf of an OR opens a source, for the whole OR. */
-			for (k = 0; k < st->nor; k++)
-			{
-				if (st->ors[k].first == i)
-				{
-					orno = k;
-					break;
-				}
-			}
-			if (orno < 0)
-				continue;
-		}
-
-		st->item[st->nitem].clauseno = i;
-		st->item[st->nitem].orno = orno;
-		st->nitem++;
+		st->item = (LionSourceItem *)
+			palloc0(sizeof(LionSourceItem) * Max(st->nclause + 1, 1));
+		st->nitem = lion_run_items(st, 0, st->item);
+		st->planitem = st->item;
+		st->nplanitem = st->nitem;
+		return;
 	}
+
+	st->runitem = (LionSourceItem **) palloc0(sizeof(LionSourceItem *) *
+											  st->nrun);
+	st->nrunitem = (int *) palloc0(sizeof(int) * st->nrun);
+	st->runfirst = (int *) palloc0(sizeof(int) * st->nrun);
+	st->runn = (int *) palloc0(sizeof(int) * st->nrun);
+	st->runcount = (int64 *) palloc0(sizeof(int64) * st->nrun);
+	st->inrun = (bool *) palloc0(sizeof(bool) * Max(st->nclause, 1));
+	for (r = 0; r < st->nrun; r++)
+	{
+		st->runitem[r] = (LionSourceItem *)
+			palloc0(sizeof(LionSourceItem) * Max(st->nclause + 1, 1));
+		st->nrunitem[r] = lion_run_items(st, r, st->runitem[r]);
+		st->runfirst[r] = st->nclause;
+	}
+	for (i = st->nclause - 1; i >= 0; i--)
+	{
+		r = st->plan.clause[i].filter;
+		st->runfirst[r] = i;
+		st->runn[r]++;
+	}
+	if (st->runn[0] == 0)
+		st->runfirst[0] = 0;
+
+	st->item = st->runitem[0];
+	st->nitem = st->nrunitem[0];
 	st->planitem = st->item;
 	st->nplanitem = st->nitem;
+	for (i = 0; i < st->nclause; i++)
+		st->inrun[i] = (st->plan.clause[i].filter == 0);
+}
+
+/*
+ * The clauses a clause's range taken as a source gathers its bounds from
+ * (DESIGN.md §32), as the window *first, *n of the clause array: every
+ * clause, or beside filtered counts (DESIGN.md §10) those of its own filter
+ * - the WHERE's for a WHERE clause - which are together in the array.
+ */
+void
+lion_clause_window(LionCountScanState *st, int clauseno, int *first, int *n)
+{
+	int			f;
+
+	if (st->nfilter == 0)
+	{
+		*first = 0;
+		*n = st->nclause;
+		return;
+	}
+	f = st->plan.clause[clauseno].filter;
+	*first = st->runfirst[f];
+	*n = st->runn[f];
+}
+
+/*
+ * Make run r the one counted (DESIGN.md §10, "Filtered counts"): its items
+ * the plan's, and for the relation counted - a partition's leave out what
+ * its bounds imply - with the source slots after them.  Between two runs,
+ * nothing located: the caller has released the WHERE of the last one.
+ */
+void
+lion_select_run(LionCountScanState *st, int r)
+{
+	int			i;
+
+	if (st->nrun <= 1)
+		return;
+	Assert(r >= 0 && r < st->nrun && !st->located);
+	st->currun = r;
+	st->planitem = st->runitem[r];
+	st->nplanitem = st->nrunitem[r];
+	for (i = 0; i < st->nclause; i++)
+		st->inrun[i] = (st->plan.clause[i].filter == 0 ||
+						st->plan.clause[i].filter == r);
+	if (st->npart > 0)
+	{
+		/* a partition's own items, when one is open (lion_open_relation()) */
+		if (st->heap != NULL && st->sources != NULL)
+			lion_relation_items(st);
+		return;
+	}
+	st->item = st->planitem;
+	st->nitem = st->nplanitem;
+	if (st->sources == NULL)
+		return;
+	st->nsource = st->nitem + 1 + (st->innerattno != 0 ? 1 : 0);
+	memset(st->sources, 0, sizeof(LionCountSource) * st->nsource);
+	st->sources[0].nsets = 1;
+	st->sources[0].sets = &st->groupset;
+	if (st->innerattno != 0)
+	{
+		st->sources[st->nitem + 1].nsets = 1;
+		st->sources[st->nitem + 1].sets = &st->groupset2;
+	}
 }
 
 /* One target per live leaf partition, in the planner's order. */
@@ -1264,9 +1409,12 @@ lion_begin_partitions(LionCountScanState *st, const LionCountPriv *priv)
 			st->part[i].clauseidxoid = priv->part[i].clauseidxoid;
 		}
 
-		/* ... whose items are the plan's, less what each leaves out */
+		/*
+		 * ... whose items are the plan's, less what each leaves out: room for
+		 * the most any run has (lion_select_run())
+		 */
 		st->item = (LionSourceItem *)
-			palloc0(sizeof(LionSourceItem) * Max(st->nplanitem, 1));
+			palloc0(sizeof(LionSourceItem) * Max(lion_max_items(st), 1));
 		memcpy(st->item, st->planitem,
 			   sizeof(LionSourceItem) * st->nplanitem);
 	}
@@ -1600,9 +1748,11 @@ lion_begin_sources(LionCountScanState *st)
 	 * and - for a two-column GROUP BY (DESIGN.md §20), or the (g, k) pairs of
 	 * a count(DISTINCT k) per group (§26) - slot nitem + 1 the inner one's.
 	 */
+	int			nmax = lion_max_items(st) + 1 + (st->innerattno != 0 ? 1 : 0);
+
 	st->nsource = st->nitem + 1 + (st->innerattno != 0 ? 1 : 0);
 	st->sources = (LionCountSource *)
-		palloc0(sizeof(LionCountSource) * st->nsource);
+		palloc0(sizeof(LionCountSource) * nmax);
 	st->sources[0].nsets = 1;
 	st->sources[0].sets = &st->groupset;
 	st->sources[0].negated = false;
@@ -1622,14 +1772,14 @@ lion_begin_sources(LionCountScanState *st)
 	st->ingroupitem = -1;
 	st->sumallitem = -1;
 	st->dsources = (LionCountSource *)
-		palloc0(sizeof(LionCountSource) * st->nsource);
+		palloc0(sizeof(LionCountSource) * nmax);
 
 	/*
 	 * A count against the collected WHERE (lion_group_count()) takes one slot
 	 * for the collected set on top of what it keeps of st->sources.
 	 */
 	st->wsources = (LionCountSource *)
-		palloc0(sizeof(LionCountSource) * (st->nsource + 1));
+		palloc0(sizeof(LionCountSource) * (nmax + 1));
 }
 
 /*

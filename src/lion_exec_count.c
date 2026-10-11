@@ -995,6 +995,103 @@ lion_sumall_relation(LionCountScanState *st)
 	return total;
 }
 
+/*
+ * Does an item of the run being counted select rows and carry the §9
+ * interlock whatever its value: a clause of an equality, a list or `IS
+ * NULL`, or an OR none of whose leaves is a range taken as a source
+ * (DESIGN.md §32)?  A multi-key clause is not counted on: its query may turn
+ * out to narrow nothing (§17).
+ */
+static bool
+lion_run_has_plain_source(LionCountScanState *st)
+{
+	int			k;
+
+	for (k = 0; k < st->nitem; k++)
+	{
+		const LionSourceItem *it = &st->item[k];
+
+		if (it->orno >= 0)
+		{
+			const LionOrState *o = &st->ors[it->orno];
+			int			j;
+
+			for (j = 0; j < o->nleaves; j++)
+			{
+				if (st->clause[o->first + j].kind == LION_CLAUSE_RANGESRC)
+					break;
+			}
+			if (j == o->nleaves)
+				return true;
+			continue;
+		}
+		if (it->rangesrc)
+			continue;
+		switch (st->clause[it->clauseno].kind)
+		{
+			case LION_CLAUSE_EQ:
+			case LION_CLAUSE_ARRAY:
+			case LION_CLAUSE_NULL:
+				return true;
+			default:
+				break;
+		}
+	}
+	return false;
+}
+
+/*
+ * The counts of the runs of a node of one row with filtered counts
+ * (DESIGN.md §10, "Filtered counts"): run 0's - the WHERE's - and each
+ * filter's, the rows the WHERE and that filter select together, each
+ * counted as the plan counts its WHERE alone, over the plain table or every
+ * partition in turn.  Into st->runcount; returns run 0's.
+ *
+ * Each run is a count of its own: its sets located, counted and released
+ * before the next run's are located, so no pin of one outlives it (§9).  A
+ * sum over every entry (`sum`, LION_FLAG_SUMALL) is how run 0 is counted;
+ * a filter's run that has a source that selects rows and holds the
+ * interlock, and no range bounding the driving walk, is that source's
+ * intersection with the others instead, which reads only the sets that
+ * select rows.  Where none has, it is the sum, the driving walk carrying
+ * the interlock (§32).
+ */
+int64
+lion_count_runs(LionCountScanState *st, bool sum)
+{
+	int			p;
+	int			r;
+
+	for (r = 0; r < st->nrun; r++)
+		st->runcount[r] = 0;
+	if (st->located)
+		lion_release_where(st);
+
+	for (p = (st->npart > 0) ? 0 : -1; p < st->npart; p++)
+	{
+		if (p >= 0)
+			lion_open_relation(st, p);
+		for (r = 0; r < st->nrun; r++)
+		{
+			lion_select_run(st, r);
+			lion_locate_where(st);
+			if (!sum ||
+				(r > 0 && !lion_plan_flag(st, LION_FLAG_RANGE) &&
+				 lion_run_has_plain_source(st)))
+				st->runcount[r] += lion_count_relation(st);
+			else
+				st->runcount[r] += lion_sumall_relation(st);
+			lion_release_where(st);
+		}
+		lion_select_run(st, 0);
+		if (p >= 0)
+			lion_close_relation(st);
+		CHECK_FOR_INTERRUPTS();
+	}
+	st->runsready = true;
+	return st->runcount[0];
+}
+
 /* ---------------------------------------------------------------------
  * The WHERE sets of a GROUP BY, collected once (DESIGN.md §10)
  * --------------------------------------------------------------------- */

@@ -203,6 +203,21 @@ RESET plan_cache_mode;
 SELECT cc_q('SELECT v.x, (SELECT count(*) FROM cc WHERE a = v.x OR n <> v.x) FROM (VALUES (1), (2), (3)) v(x)');
 
 -- ---- a partitioned table: arms the bounds refute or imply ----
+-- ---- complements beside filtered counts (DESIGN.md §10, "Filtered counts") ----
+-- in the WHERE, which every run counts, and in a filter's condition, which
+-- only its own run does
+SELECT q, cc_q(q) FROM (VALUES
+	('SELECT count(*) FILTER (WHERE b = 1), count(*) FROM cc WHERE n IS DISTINCT FROM 3'),
+	('SELECT count(*) FILTER (WHERE b = 1), count(*) FROM cc WHERE a = 2 AND (b = 3 OR n <> 3)'),
+	('SELECT count(*) FILTER (WHERE n IS DISTINCT FROM 3), count(*) FROM cc WHERE a = 2'),
+	('SELECT count(*) FILTER (WHERE b = 1 OR n <> 3), count(*) FILTER (WHERE t = ''v1''), count(*) FROM cc WHERE a = 2'),
+	('SELECT sum(CASE WHEN NOT (tags @> ''{t1}'') THEN 1 ELSE 0 END), count(*) FROM cc WHERE a = 2'),
+	('SELECT b, count(*) FILTER (WHERE n IS DISTINCT FROM 3), count(*) FROM cc WHERE a = 2 GROUP BY b'),
+	('SELECT b, count(*) FILTER (WHERE t = ''v1'' OR n <> 3), count(*) FROM cc WHERE a = 2 OR n IS NOT NULL GROUP BY b'),
+	('SELECT a, b, count(*) FILTER (WHERE n IS DISTINCT FROM 3 OR t = ''v1''), count(*) FROM cc WHERE t IS NOT NULL GROUP BY a, b'),
+	('SELECT a, b, t, count(*) FILTER (WHERE b = 1 OR n <> 3), count(*) FROM cc GROUP BY a, b, t')
+) v(q);
+
 CREATE TABLE ccp (a int, n int, t text) PARTITION BY RANGE (a);
 CREATE TABLE ccp1 PARTITION OF ccp FOR VALUES FROM (0) TO (3);
 CREATE TABLE ccp2 PARTITION OF ccp FOR VALUES FROM (3) TO (7);

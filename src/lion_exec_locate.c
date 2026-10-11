@@ -1120,6 +1120,7 @@ lion_build_filter(LionCountScanState *st)
 		LionClauseState *cl = &st->clause[i];
 
 		if (cl->kind == LION_CLAUSE_MULTI && !st->inor[i] && cl->idx != NULL &&
+			lion_clause_in_run(st, i) &&
 			(cl->qmode == LION_QMODE_LOSSY || cl->qmode == LION_QMODE_ALL))
 			n++;
 	}
@@ -1149,7 +1150,7 @@ lion_build_filter(LionCountScanState *st)
 		bool		typbyval;
 
 		if (!(cl->kind == LION_CLAUSE_MULTI && !st->inor[i] &&
-			  cl->idx != NULL &&
+			  cl->idx != NULL && lion_clause_in_run(st, i) &&
 			  (cl->qmode == LION_QMODE_LOSSY || cl->qmode == LION_QMODE_ALL)))
 			continue;
 
@@ -1279,9 +1280,14 @@ lion_locate_where(LionCountScanState *st)
 		/* A range as a source (DESIGN.md §32): collected, or walked. */
 		if (st->item[k].rangesrc)
 		{
-			LionRangeSource *rs = lion_rangesrc_range(st, 0, st->nclause, true,
-													  cl->attno);
+			LionRangeSource *rs;
 			bool		walked;
+			int			first;
+			int			n;
+
+			/* the bounds of its own filter, or the WHERE's (§10) */
+			lion_clause_window(st, st->item[k].clauseno, &first, &n);
+			rs = lion_rangesrc_range(st, first, n, true, cl->attno);
 
 			src->tree = lion_locate_range(st, rs, true, &src->sets,
 										  &src->nsets, &walked);
@@ -1598,9 +1604,54 @@ lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull,
 }
 
 /*
+ * A filtered count of the row (DESIGN.md §10, "Filtered counts"), of target
+ * list kind `kind`, into *value and *isnull.  A node of one row has every
+ * run's count (runsready); a walk's row is a partial one of the run being
+ * counted, whose `count` is the group's under its own filter only, and every
+ * other filtered count of the row adds nothing to the group's - a count 0,
+ * a sum a NULL, which the sum skips - except that run 0's row, which every
+ * group has, gives a sum of no row its 0.  A sum is NULL over no row at all
+ * (the form SUM: no row of the WHERE), or over no row with the condition
+ * true (SUMNULL: every other row adds a NULL).
+ */
+static void
+lion_fcount_value(LionCountScanState *st, int kind, int64 count,
+				  Datum *value, bool *isnull)
+{
+	int			f = LION_TL_FCOUNT_FILTER(kind);
+	int			form = LION_TL_FCOUNT_FORM(kind);
+	int64		n;
+	bool		null;
+
+	if (st->runsready)
+	{
+		n = st->runcount[f];
+		null = (form == LION_FCOUNT_SUM) ? (st->runcount[0] == 0) :
+			(form == LION_FCOUNT_SUMNULL) ? (n == 0) : false;
+	}
+	else if (st->currun == f)
+	{
+		n = count;
+		null = (form != LION_FCOUNT_COUNT && n == 0);
+	}
+	else
+	{
+		n = 0;
+		null = (form == LION_FCOUNT_SUMNULL ||
+				(form == LION_FCOUNT_SUM && st->currun != 0));
+	}
+	*value = Int64GetDatum(n);
+	*isnull = null;
+}
+
+/*
  * The row of a group: the key of each of its nkeys GROUP BY columns, in the
  * plan's order, and its count - the target list's columns made of them, the
  * HAVING applied and the projection done.  NULL when the HAVING rejects it.
+ *
+ * Beside filtered counts (DESIGN.md §10), a walk's row out of a filter's run
+ * is a partial one that adds its filter's count alone to the group's: every
+ * count of the group's rows in it is 0, lion_fcount_value() says the rest.
  */
 TupleTableSlot *
 lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
@@ -1622,6 +1673,23 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 	for (i = 0; i < st->ntlist; i++)
 	{
 		int			kind = st->tlkind[i];
+
+		/* a filtered count, and a filter's run's partial counts (§10) */
+		if (LION_TL_IS_FCOUNT(kind))
+		{
+			lion_fcount_value(st, kind, count, &slot->tts_values[i],
+							  &slot->tts_isnull[i]);
+			continue;
+		}
+		if (st->currun > 0 && !st->runsready &&
+			(kind == LION_TL_COUNT || kind == LION_TL_COUNT_GROUPCOL ||
+			 kind == LION_TL_COUNT_GROUPCOL2 || kind == LION_TL_COUNT_ZERO ||
+			 LION_TL_IS_COUNT_GROUPCOLN(kind)))
+		{
+			slot->tts_values[i] = Int64GetDatum(0);
+			slot->tts_isnull[i] = false;
+			continue;
+		}
 
 		/*
 		 * A dimension column of the FK-side join, from the child's row - of

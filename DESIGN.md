@@ -463,10 +463,17 @@ tail, at most 11 bytes anywhere, nothing once its stream would pass 255 bytes) a
 that stays below LION_SPARSE_THRESHOLD members (else the key is promoted, which is not an in-place
 change). Otherwise the general path runs - copy out,
 mutate, write back, split if needed - and leaves fresh slack behind, which is where the slack of a
-growing key comes from in the first place. **Only inserts add slack**: ambuild writes items at
-their exact size, because a bulk-built index is read-mostly and the space would be pure loss, and
-so does VACUUM (`lion_chain_put_items_locked()` is the no-slack form of
-`lion_chain_put_items_locked_ext()`).
+growing key comes from in the first place. **Inserts add slack, and the build only when asked**:
+VACUUM writes items at their exact size (`lion_chain_put_items_locked()` is the no-slack form of
+`lion_chain_put_items_locked_ext()`), and so does ambuild by default, because a bulk-built index
+is read-mostly and the space would be pure loss. The `build_slack` reloption (`auto` | `on` |
+`off`, default `off`) has the build allot every posting item `lion_item_alloc_size()`, the slack an
+insert would leave, zeroed past the container (`lion_builder_spill()`), and every INLINE entry
+`lion_entry_alloc_size()` (below; `lion_builder_flush()`). `auto` is `on` for an index built for
+generic WAL and `off` for one built for the resource manager; what it buys in each mode is measured
+below ("Slack at build time, measured"). Nothing reads the option after the build: a bulk-built
+item with slack is the item an insert would have written, and every reader, VACUUM and verify()
+already take it.
 
 Slack is bounded by `LION_ITEM_SLACK_LIMIT` so that it can never be mistaken for corruption:
 verify() accepts an item whose allocated length is up to that much above its logical size, and
@@ -498,15 +505,44 @@ page already has (`PageGetExactFreeSpace()`), else it is written at its exact si
 `lion_dir_place()` splits as it always did. And the SPILL decision is made on the payload the key
 really uses, before the allocation is chosen, so slack can never make a posting set spill early -
 the test in `lion_insert_inline()` is on `newlen`, not on what the entry is allotted. As for items,
-only inserts add it: ambuild writes entries at their exact size and VACUUM keeps the length it
-finds. lion_index_stats() reports it as `inline_slack_bytes`, apart from `slack_bytes`, because it
-is an entry's and not an item's.
+inserts add it, ambuild only under `build_slack` (with the same `inline_limit` cap, and only to an
+entry that keeps its set inline), and VACUUM keeps the length it finds. lion_index_stats() reports
+it as `inline_slack_bytes`, apart from `slack_bytes`, because it is an entry's and not an item's.
 
 Measured (release, 1M rows, 10,000 single-row inserts into one index, §25's harness): the c20k
 column falls from 2918.7 to 173.0 bytes of WAL per insert in generic mode and from 422.4 to 180.5
 in rmgr mode, and c1m from 1682.2 to 106.8 and from 124.1 to 82.0. The 8-index portfolio insert
 falls from 53.53 to 9.48 MiB (generic) and from 29.21 to 9.08 MiB (rmgr) in steady state, and the
 index is the same size afterwards to the byte - the slack lands in space the leaves already had.
+
+**Slack at build time, measured.** PostgreSQL 18.6 release build, `wal_consistency_checking`
+off, the synthetic 5M-row table and update wave of §22 ("Posting leaves with room, measured"): six
+indexes on columns of 2 to 1M keys, one row in a hundred moved to the next key of the 20-key
+column, which inserts into every index inside a container or entry the build wrote. Bytes of index
+WAL per updated row without full-page images, and index size at build -> after the wave:
+
+    generic WAL       build_slack = off              build_slack = on
+    20 keys           1167.7 B  10.8 -> 18.8 MB      434.6 B   12.0 -> 12.0 MB
+    200 keys          2402.2 B  13.1 -> 25.2 MB      104.7 B   14.8 -> 14.8 MB
+    2,000 keys        2401.0 B  32.9 -> 50.0 MB      335.5 B   47.9 -> 59.4 MB
+    20,000 keys       1493.1 B  18.1 -> 19.3 MB      402.6 B   18.9 -> 18.9 MB
+    1M keys           2289.7 B  81.6 -> 81.6 MB       65.0 B   90.6 -> 90.6 MB
+    six indexes                 158.1 -> 196.4 MB              185.7 -> 197.1 MB
+
+In generic mode the record is a diff of the page, and without slack the first member added inside a
+bulk-built entry or container moves everything stored after it on the page; with slack the change
+stays inside the item. The WAL of the wave falls 2.7-fold on the 20-key column and up to 35-fold on the 1M-key one. What it costs is space, at
+build: 11% on the 1M-key column, whose entries are small and each get the 8-byte floor, and 46% on
+the 2,000-key column, whose sets fill their leaves almost exactly, so that the slack pushes many
+of them onto another leaf - and which still splits under the wave. The 20-key column's in-place insert into an ARRAY still diffs
+the members it shifts, hence 434.6 B. `posting_fillfactor` alone does not help generic mode: at 90
+the leaves stop splitting (six indexes 160.9 -> 162.1 MB) but a rewritten item that moves the rest
+of its leaf diffs as much as before, 1102.6 / 2857.4 / 2810.2 B on the 20-, 200- and 2,000-key
+columns. Under the resource manager, where the record is the item's own change either way (§25's
+DELTA and SPLICE), slack at build changes little - the 20,000-key column's entry records stay at
+about 166 B - and costs the same space, which is why `auto` leaves it off there. It stays `off` by
+default in both modes so that an index is built the same whatever its WAL mode, and an
+append-only or read-mostly index does not pay for room it never uses.
 
 Page allocation: `lion_alloc_page()` takes a page - a recycled one from the free space map when one
 is safe to take, else a fresh block from ExtendBufferedRel - and `lion_wal_init_buffer()`
@@ -1719,9 +1755,10 @@ Planner integration
     relation.
   - The query has no DISTINCT (but a SELECT DISTINCT over the table alone is a GROUP BY of its
     keys, at end of this section), grouping sets, ORDER BY inside aggregates,
-    FILTER clauses, or aggregates other than `count(*)` (or `count(1)` of any non-NULL constant)
+    or aggregates other than `count(*)` (or `count(1)` of any non-NULL constant)
     and the `count(col)` cases of §14 - and, without a GROUP BY, `count(col)` of any one column
-    whose index answers `col IS NOT NULL`.
+    whose index answers `col IS NOT NULL`. A FILTER, and a `sum` or `count` of a one-armed CASE,
+    is taken when it is a filtered count ("Filtered counts" at the end of this section).
     The target list holds those counts, the columns the rules below let it print, and any
     expression over them; window functions over them are computed above the node ("Shapes
     rewritten to the node's counts" at the end of this section).
@@ -2719,6 +2756,106 @@ Unique over a full index-only scan, priced as such, and the cost model decides. 
 DISTINCT c200` 128 ms to 4.6 ms (51 ms with a B-tree on c200); `c20, c200 ... GROUP BY 1, 2`
 127 ms to 15 ms (decoded walk).
 
+### Filtered counts
+
+`count(*) FILTER (WHERE c)`, `count(CASE WHEN c THEN 1 END)`, `sum(CASE WHEN c THEN 1 ELSE 0
+END)` and `sum(CASE WHEN c THEN 1 END)` each count the rows the WHERE selects - or the group
+holds - for which `c` is true. A row where `c` is NULL is one where it is not true, in a FILTER
+and in a CASE alike, and a clause the posting sets answer selects exactly the rows where it is
+true, so a condition the WHERE could take is one more set to intersect with the WHERE's.
+`lion_agg_filtered()` (`lion_plan_target.c`) recognises the forms and the way each reports an
+empty answer:
+
+| form | `LION_FCOUNT_*` | no row has `c` true | no row at all |
+|---|---|---|---|
+| `count(*) FILTER (WHERE c)`, `count(k) FILTER (WHERE c)` of a non-NULL constant, `count(CASE WHEN c THEN k END)` | COUNT | 0 | 0 |
+| `sum(CASE WHEN c THEN 1 ELSE 0 END)` of int4 or int2 | SUM | 0 | NULL |
+| `sum(CASE WHEN c THEN 1 END)`, `sum(1) FILTER (WHERE c)` | SUMNULL | NULL | NULL |
+
+`count(col) FILTER (WHERE c)` is the COUNT form where every row it counts has `col` non-NULL:
+proved by a clause of the WHERE or of `c` itself that implies it, or by a NOT NULL column (§14);
+otherwise it declines. Anything else - another constant, a second arm, an ELSE but 0, a CASE
+inside a FILTER, DISTINCT or ORDER BY - is not a filtered count, and with the generic checks of
+this section it leaves the query to the ordinary plan.
+
+**The planner.** Each distinct condition (by `equal()`) is a filter, numbered from 1 in the order
+the target list and HAVING meet it; two forms of one condition share it. After the strategy is
+settled, `lion_count_path_filters()` takes each condition through `canonicalize_qual()` and
+analyses each conjunct as a WHERE restriction is (`lion_count_path_filter_clause()`): the same
+rewrites, an OR as one source (§19), `NOT IN` as its `<>` clauses, `IS NOT TRUE`, a multi-key
+clause (§17), a range. A conjunct no posting set answers, or a condition that is a constant,
+declines the whole query: what the node would count without it is not the query's answer. The
+clauses are appended to the clause lists after the WHERE's, a filter's together, each
+`LionClauseInfo` with its filter's number; they constrain no column of the result, so what they say
+of their columns (positive, pinned, non-NULL) is the filter's alone and is restored for the WHERE
+after each filter. A duplicate is dropped only within one filter. A filter's clause is no
+restriction of the relation, so a partition's bounds never imply it away (§16), and a range in a
+filter bounds no walk: it is a range taken as a source (§32), which needs a pinned source in the
+same run - the walk, or a positive clause of the WHERE or of the filter - as the WHERE alone does.
+
+**Runs.** The node counts the WHERE alone (run 0) and then the WHERE with each filter (run f):
+run f's clauses are the WHERE's followed by filter f's, and each run is an ordinary count with its
+own sets, located, counted and released before the next run's are located
+(`lion_select_run()`, `lion_count_runs()`). Every rule of §9 holds within a run; the runs share
+the executor's snapshot, so each counts what that snapshot sees whatever happens to the table
+between them. A run touches only its own clauses: `lion_clause_in_run()` keeps the others out of
+the row filter, and a range source's other bounds are looked for in its own filter's clauses only
+(`lion_clause_window()`). EXPLAIN prints run 0's clauses as `Lion Indexes` and each filter as
+`Count Filter N: index (clauses)`.
+
+- **Without a GROUP BY** (the count of the WHERE, its sum over every row of §35, a partitioned
+  table's sum over its partitions) the runs' totals make the one row: a COUNT form prints run f's
+  total, SUM prints NULL when run 0's is 0, SUMNULL when run f's is. Where the WHERE alone is
+  summed over every row (§35), a filter's run with a pinned source of its own - an equality, a
+  list, a null test, or an OR with no range - is counted as a plain count instead.
+- **With a GROUP BY** - one column, two (§20), the decoded walk (§34), on a table or a
+  partitioned one - every run emits its groups as partial rows below core's Finalize HashAggregate:
+  a row of run r holds run r's count in the columns of filter r, and in the others what adds
+  nothing, 0 for a COUNT form or the base `count(*)`, NULL for SUMNULL, and for SUM 0 in run 0's
+  rows and NULL in the rest, so the Finalize Agg's sum of a group is NULL only when run 0 had no
+  such group. A group is emitted only when its count is not 0, as without filters. The query must
+  allow partial aggregation (`GROUPING_CAN_PARTIAL_AGG`) with a hashable grouping, and the path
+  claims no sort order. The decoded walk is taken only when every filter's run has a source
+  positive whatever its value, in the WHERE or in the filter - an equality, a list, a null test, a
+  literal multi-key clause, or an OR of those - and no range source.
+
+**Declined with filters**: the FK-side join (§27), `count(DISTINCT)` (§26), the aggregates over
+keys (§37), a `coalesce` group, expressions of the grouping columns that are not grouping columns,
+the top k (§36) and the parallel GROUP BY ("A GROUP BY in parallel" above). They leave the query
+to the ordinary plan.
+
+**Price.** The runs' prices added up: each run is priced by the cost functions of its strategy
+with the other filters' clauses left out (`lion_count_run_targets()`), and a grouped path's rows
+are its groups once per run. Where the WHERE selects most of a small table one pass over the rows
+can be cheaper than a count per filter, and the cost model then keeps the ordinary plan.
+
+**custom_private.** `LION_PRIV_FILTERS` (member 20, shape 24): an IntList of the number of filters
+and each clause's filter, and at the path stage the conditions themselves; the residual clauses
+("Residual clauses" below, member 21) and the target-list kinds (member 22) follow it. `LION_TL_FCOUNT(f, form)` is a filtered count's target-list kind.
+`lion_count_priv_check()` requires the clauses' filter numbers to rise by at most one and end at
+the number of filters, no RANGE clause in a filter, an OR's leaves inside one filter, and no join,
+DISTINCT, aggregate over keys, top k, parallel walk or coalesce group beside filters.
+
+**Privileges.** A filter's operators are clauses of the node like the WHERE's, and the operators
+of every aggregate argument and FILTER the node stands in for are recorded for the EXECUTE check
+(§9, "Privileges"): revoking EXECUTE on a filter's operator refuses the query as it refuses one
+on a WHERE operator. `test/sql/countfilter.sql` checks every form against a sequential scan, on a
+table with NULLs and with deleted and updated rows not vacuumed, through a generic plan with a
+multi-key condition only the run knows, and through a cursor whose rows are read one at a time
+with rows deleted between them; `test/sql/node_contracts.sql` checks the privilege.
+
+Measured on a synthetic table of 5M rows (columns of 100, 10, 5 and 13 values, a lion index on
+each), with the ordinary plan against the node:
+
+| query | ordinary plan | LionCount |
+|---|---|---|
+| `count(*) FILTER (WHERE b = 1), count(*) FILTER (WHERE c = 3), count(*) ... WHERE a = 2` | 94 ms | 7.6 ms |
+| `sum(CASE WHEN b = 1 THEN 1 ELSE 0 END), sum(CASE WHEN c = 3 THEN 1 END), count(*)` | 373 ms | 28 ms |
+| `count(*) FILTER (WHERE b = 1), count(*) ... WHERE a = 2 AND g = 7` | 15 ms | 0.7 ms |
+| `g, sum(CASE WHEN b = 1 THEN 1 ELSE 0 END), count(*) ... GROUP BY g` | 692 ms | 68 ms |
+| `a, b, count(*) FILTER (WHERE c = 3), count(*) ... GROUP BY a, b` (decoded) | 628 ms | 100 ms |
+| `g, a, b, count(*) FILTER (WHERE c = 3) ... GROUP BY g, a, b` (decoded) | 636 ms | 158 ms |
+
 ### Residual clauses (2026-10-11)
 
 A WHERE clause no posting set answers - `payload LIKE 'ab%'`, `id > 2500000` on a column with no
@@ -2742,9 +2879,10 @@ rows the other clauses select must be at most half the table (`LION_RESID_MAX_SH
 fetching them one by one loses to the sequential scan that reads them page by page whatever the
 prices say (5M rows, `c2 IN (0, 1)` with a residual: 2.2 s against 1.1).
 
-**How it is carried.** The clauses travel in custom_private's RESID member at the path stage, and
-`lion_plan_custom_path()` appends them to custom_exprs after the aggregates' arguments
-(`LION_FLAG_RESID`, shape 24). Every column they read is a column of `custom_scan_tlist` - one the
+**How it is carried.** The clauses travel in custom_private's RESID member (21) at the path stage,
+and `lion_plan_custom_path()` appends them to custom_exprs after the aggregates' arguments
+(`LION_FLAG_RESID`, shape 25). `LION_TL_RESID` kinds lie above the filtered counts'
+`LION_TL_FCOUNT` range, so neither encoding can be read as the other. Every column they read is a column of `custom_scan_tlist` - one the
 target list prints already, or a resjunk `LION_TL_RESID` one no row prints (it is emitted NULL) -
 so setrefs.c rewrites their Vars into references to it, records their functions as plan
 dependencies, and SS_finalize_plan() sees their Params: a LATERAL value in a residual rescans the
@@ -2765,6 +2903,14 @@ the visible row only when it passes. A row the snapshot does not see is never te
 residual `100 / w > 20` raises nothing over a deleted row whose w is 0, as the ordinary plan
 raises nothing. From PostgreSQL 17 the candidates' pages are read through a read stream over their
 blocks in order, as a bitmap heap scan reads its pages.
+
+**Beside filtered counts** ("Filtered counts" above) the two are taken together. A residual clause
+is a clause of the WHERE, and the row filter that tests it is built again for every run's located
+WHERE (`lion_locate_where()`), so the WHERE's run and each filter's count only the rows that pass
+it: `count(*) FILTER (WHERE b = 1), count(*) WHERE a = 2 AND p LIKE 'a%'` counts `a = 2` and
+`a = 2 AND b = 1`, each testing `p LIKE 'a%'` on its candidates. A filter's own condition is never
+residual - a clause of one that no posting set answers leaves the query to the ordinary plan - and
+the residual's price is paid once per run.
 
 **The price** (`lion_cost_residual()`) is that bitmap heap scan's: the rows the other clauses
 select (`lion_residual_rows()`), the distinct pages index_pages_fetched() expects them on, each at
@@ -6722,6 +6868,20 @@ Operations.
   reserves a block for the ROOT and re-stamps the held leaves with it - their images are still in
   memory, and every page of a set has to carry the root's block as its owner (§18) - and writes
   them with their downlinks.
+  **A leaf is filled to `posting_fillfactor`** (reloption, 10 .. 100, default 100), the chain of a
+  set without an internal level and the leaves of a tree alike: the build closes a leaf when the
+  next item would take it past that share of the page (`lion_builder_leaf_full()`), counted as
+  PageAddItem() spends it, the MAXALIGNed item and its line pointer, and a leaf always takes its
+  first item. At 100 that is exactly "the next item does not fit", the rule every build had
+  before, and the default keeps it, so an index built without the option is the same index page
+  for page. Below 100 it leaves the room the first wave of writes after a build needs: a
+  bulk-built container has no slack (§4), so the first member an insert adds INSIDE it - the new
+  row versions of an UPDATE on a heap with free space, rows placed in space VACUUM freed - rewrites
+  the item longer, and on a packed leaf that is a split, of nearly every leaf by the time the wave
+  has touched every container. Rows the heap appends land in new containers at the end of their
+  sets and need no room in the leaves before them, which is why the default stays at 100: an
+  append-only or read-mostly table pays for the room and never uses it. Measured below
+  ("Posting leaves with room, measured").
 
 ### The sets without an internal level, measured
 
@@ -6738,6 +6898,33 @@ leaves, so every root went; there are as many leaves as before.
 
 The roots that went were 98-99% empty: a handful of downlinks each, 9 on `c200` and fewer than 3 on
 the docs columns. The three position trees left with a root have more than 16 leaves.
+
+### Posting leaves with room, measured
+
+PostgreSQL 18.6 release build, rmgr mode, `wal_consistency_checking` off; a synthetic 5M-row
+table on a heap at fillfactor 90 with six lion indexes on columns of 2, 20, 200, 2,000, 20,000 and
+1M keys spread by a hash of the row number. One wave updates one row in a hundred, spread evenly,
+to the next key of the 20-key column, which inserts into every index (the update is not HOT) at a
+TID inside a container the build wrote. WAL is the index records' bytes per updated row, with and
+without full-page images (the wave starts after a CHECKPOINT); "after" is after the wave. The
+SPLICE operation of §25 is in every arm.
+
+    posting_fillfactor          100                  90                   80
+    20 keys   size        10.8 -> 18.8 MB       12.0 -> 12.0 MB      13.5 -> 13.5 MB
+              leaf splits      969                    0                    0
+              WAL/row     370.8 B (163.8 B)     290.5 B (83.1 B)     290.9 B (83.1 B)
+    200 keys  size        13.1 -> 25.2 MB       14.8 -> 14.8 MB      16.4 -> 16.4 MB
+              WAL/row     514.1 B (278.1 B)     335.3 B (94.0 B)     335.5 B (93.9 B)
+    2,000     size        32.9 -> 50.0 MB       32.9 -> 32.9 MB      35.2 -> 35.2 MB
+              WAL/row     863.7 B (393.5 B)     620.5 B (104.3 B)    620.0 B (104.3 B)
+    six indexes           158.1 -> 196.4 MB     160.9 -> 162.1 MB    166.7 -> 167.9 MB
+
+At 100 the wave split 969 of the 20-key column's some 1,300 leaves (3,854 B a SPLIT record, plus
+a downlink and a flag record each) and grew the index by three quarters; at 90 nothing split
+anywhere and the six indexes end 17% smaller, for 1.8% more at build. The 2,000-key column builds to the same size at 90, because its
+sets are two leaves each whatever the fill; the room moves to the first leaf. 80 buys nothing more
+for a wave of this size. The 20,000- and 1M-key columns keep their sets INLINE and are not
+affected; the INLINE growth is §4's.
 
 ### Cost model (`lion_cost_count_rel()`)
 
@@ -7845,11 +8032,13 @@ image.
                                    hot-key insert record: ~64 bytes.
     ITEM_REPLACE    0x10  2        DELTA (the ranges of the item at its allotted
                                    length that differ from what the page holds)
-                                   + MINMAX + the entry.  98 B for the dense
-                                   container that used to cost 1658; a rewrite
-                                   that changes more than half the item falls
-                                   back to REPLACE, which is the whole item at
-                                   its allotted length with its slack zeroed.
+                                   or SPLICE (the same with the bytes an insert
+                                   moved up said once) + MINMAX + the entry.
+                                   98 B for the dense container that used to
+                                   cost 1658; a rewrite that changes more than
+                                   half the item falls back to REPLACE, which is
+                                   the whole item at its allotted length with
+                                   its slack zeroed.
     ITEM_ADD        0x20  1-2      DELETE (when replacing) + ADD per item +
                                    MINMAX + the entry.  Also every record of an
                                    INLINE spill.
@@ -7892,8 +8081,8 @@ image.
                                    them.
 
 The operations are: INIT, SPECIAL (the whole 32-byte page special area), ADD,
-ADDMANY, REPLACE, DELTA, SETBYTES, MULTIDEL, DELETE_NC, DELETE, MINMAX, FLAGS,
-META, DELETED, CONTAINER_ADD, SPARSE_INS, NDISTINCT (§33).
+ADDMANY, REPLACE, DELTA, SPLICE, SETBYTES, MULTIDEL, DELETE_NC, DELETE, MINMAX,
+FLAGS, META, DELETED, CONTAINER_ADD, SPARSE_INS, NDISTINCT (§33).
 
 **DELTA is what a rewrite of one item costs now**, and it is the one operation
 whose payload is a function of the page as well as of the record. It says: the
@@ -7918,6 +8107,49 @@ is automatic: when the ranges would come to more than half the item, the
 operation is dropped and a plain REPLACE takes its place, so an ARRAY that turns
 into a BITSET still goes in whole. Nothing about masking changes, because the
 bytes outside the named ranges are the bytes the page already had.
+
+**SPLICE is a DELTA with bytes inserted** (`lion_waldelta.[ch]`). A member added
+in the MIDDLE of an ARRAY moves every member above it up by two bytes, and a
+DELTA can only say that by repeating every byte that moved: half the item on
+average, which is what the first insert into a bulk-built container cost, since
+such a container has no slack and takes the general path (§4). SPLICE's payload
+starts with `{uint16 at, uint16 inslen, inslen bytes}`, which are inserted into
+the base image at byte `at` before it is cut or zero-extended to `aux` bytes,
+and the DELTA ranges follow, applied to that. One member added to an ARRAY is
+then the two bytes, where they go and the new count: 12 bytes of payload where
+the DELTA carried every member above the new one. The same shape is a run added to a RUN (4 bytes), a
+pair added inside a sparse segment (a varint and the re-encoded one after it),
+and any of those inside an INLINE payload, where everything after the item
+moves up too. The writer does not say which it did: `lion_wal_op_replace()`
+hands the old image and the new item to `lion_delta_encode_item()`, which
+computes the DELTA and, unless that is already as small as a SPLICE can be,
+looks for an insertion of 1 to 8 bytes - the smallest `at` from which the new
+item is the old one moved up - and keeps whichever is smaller, DELTA on a tie,
+or neither when both exceed half the item. Redo decodes either with
+`lion_delta_decode_item()` into its scratch buffer and puts the item back as
+for a DELTA; a payload that does not fit the item the page holds (a splice
+point past it, a range past the new length) is a PANIC, because the record
+was not written against that page. The encoder and the decoder are pure
+functions of their bytes, which `test/unit/waldelta_test.c` round-trips over
+every container shape, random images and malformed payloads, and
+`wal_consistency_checking` checks on every record of the suite.
+
+Measured (PostgreSQL 18.6 release build, rmgr mode, 5M rows, six lion indexes
+on synthetic columns of 2 to 1M keys, one wave of 50,000 updates that move one
+row in a hundred to the next key of a 20-key column, on a heap at fillfactor
+90 so that the new versions land on the pages the old ones were on; bytes of
+index WAL without full-page images):
+
+| index | record | before | after |
+|---|---|---|---|
+| 20 keys | ITEM_REPLACE | 629.8 B | 96.9 B |
+| 20 keys | all records, per updated row | 439.8 B | 163.8 B |
+| 200 keys | ITEM_REPLACE | 152.1 B | 97.2 B |
+| 20,000 keys | ENTRY (INLINE) | 523.1 B | 165.7 B |
+| 1M keys | ENTRY (INLINE) | 77.9 B | 74.8 B |
+
+What is left on the 20-key column is the splits of its full leaves, which the
+`posting_fillfactor` reloption of §22 is for.
 
 **Two operations log the writer's CALL rather than its bytes**, and that is
 where the hot record's size comes from. Adding a member to a sorted ARRAY shifts
@@ -8412,6 +8644,13 @@ the first batch after a CHECKPOINT writes 2.7 MiB MORE in generic mode
 (88.10 -> 90.82), which is full-page images: entries that carry slack fill a leaf
 a little sooner, so a batch touches a few more pages the first time round. The
 index itself is the same size, to the byte, after the same inserts.
+
+Slack is written by an insert, so in generic mode the FIRST insert into each
+entry or container of a bulk-built index still moves everything after it on its
+page. The `build_slack` reloption has the build write the slack an insert would
+(§4, "Slack at build time, measured"): on a wave of scattered updates after a
+build it takes generic-mode WAL from 1.1-2.4 KB to 65-435 bytes a row, at 4-46%
+more index at build. It is off by default in both modes.
 
 Also in this wave (§23 items that need the same lock-window work):
 
@@ -17378,7 +17617,9 @@ leaf is no selecting clause of a partition's bounds (`lion_leaf_drops()`). At mo
 (`LION_MAX_COMPL_ORS`): each doubles the counts in the worst case. A complement OR, an `IS DISTINCT
 FROM` or a `NOT` beside a multi-key query whose value is known only at run time is declined: that
 query may narrow nothing and leave the heap scan of `lion_count_scan_filtered()` as the count, and
-that scan tests none of them.
+that scan tests none of them. A complement in a filtered count's condition (§10, "Filtered counts")
+is counted by that filter's run alone, which carries the OR among its items, and answers to the same
+terms, checked again once the filters are analysed (`lion_count_path_filters()`).
 
 The price (`lion_cost_count_rel()`) is the sum of the two counts': the WHERE with the complement ORs
 left out, as negated clauses are free in the model, and the WHERE with only their positive arms kept,

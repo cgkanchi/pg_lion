@@ -30,7 +30,8 @@
 static const char *const lion_priv_name[LION_PRIV_NMEMBERS] = {
 	"VERSION", "OIDS", "INTS", "CONSTS", "CLAUSEKINDS", "PARTS", "CLAUSEOPS",
 	"ORS", "HAVING", "DISTINCT", "JOIN", "EXECUTE", "COALESCE", "IMPLIED",
-	"FACTGROUP", "GROUPN", "ALLROWS", "TOPK", "WAGG", "VCOLS", "RESID",
+	"FACTGROUP", "GROUPN", "ALLROWS", "TOPK", "WAGG", "VCOLS", "FILTERS",
+	"RESID",
 	"TLKINDS"
 };
 
@@ -55,6 +56,7 @@ static const NodeTag lion_priv_tag[LION_PRIV_NMEMBERS] = {
 	T_IntList,					/* TOPK */
 	T_List,						/* WAGG */
 	T_List,						/* VCOLS */
+	T_List,						/* FILTERS */
 	T_List,						/* RESID */
 	T_IntList					/* TLKINDS */
 };
@@ -430,10 +432,50 @@ lion_priv_decode_tlkinds(List *priv, LionCountPriv *out)
 		if (!LION_TL_IS_CHILDCOL(kind) &&
 			!(kind >= 0 && kind < LION_TL_WHEREKEY + out->nclause) &&
 			!LION_TL_IS_WAGG(kind) && !LION_TL_IS_WKEY(kind) &&
-			!LION_TL_IS_RESID(kind))
+			!LION_TL_IS_RESID(kind) &&
+			!(LION_TL_IS_FCOUNT(kind) &&
+			  LION_TL_FCOUNT_FILTER(kind) >= 1 &&
+			  LION_TL_FCOUNT_FILTER(kind) <= out->nfilter &&
+			  LION_TL_FCOUNT_FORM(kind) <= LION_FCOUNT_SUMNULL))
 			elog(ERROR, "LionCount: unknown target list kind %d", kind);
 		out->tlkind[i] = kind;
 	}
+}
+
+/*
+ * The filtered counts (DESIGN.md §10, "Filtered counts"): the number of
+ * filters and each clause's filter, and at the PATH stage each filter's
+ * expression.  That the clauses come in order is lion_count_priv_check()'s.
+ */
+static void
+lion_priv_decode_filters(List *priv, LionPrivStage stage, LionCountPriv *out)
+{
+	List	   *m = (List *) list_nth(priv, LION_PRIV_FILTERS);
+	List	   *ints;
+	int			i;
+
+	if (m == NIL)
+		return;
+	lion_priv_expect_length(m, LION_PRIV_FILTERS,
+							(stage == LION_PRIV_STAGE_PLAN) ? 1 : 2);
+	ints = (List *) linitial(m);
+	if (ints == NIL || !IsA(ints, IntList) ||
+		list_length(ints) != 1 + out->nclause || linitial_int(ints) <= 0)
+		elog(ERROR, "LionCount: malformed FILTERS member of custom_private");
+	out->nfilter = linitial_int(ints);
+	for (i = 0; i < out->nclause; i++)
+	{
+		out->clause[i].filter = list_nth_int(ints, 1 + i);
+		if (out->clause[i].filter < 0 ||
+			out->clause[i].filter > out->nfilter)
+			elog(ERROR, "LionCount: malformed FILTERS member of custom_private");
+	}
+	if (stage == LION_PRIV_STAGE_PLAN)
+		return;
+	out->filterexprs = (List *) lsecond(m);
+	if (!lion_priv_is(out->filterexprs, T_List) ||
+		list_length(out->filterexprs) != out->nfilter)
+		elog(ERROR, "LionCount: malformed FILTERS member of custom_private");
 }
 
 /*
@@ -608,6 +650,8 @@ lion_count_priv_decode(List *priv, LionPrivStage stage, LionCountPriv *out)
 #undef LION_CHECK_VCOL
 	}
 
+	lion_priv_decode_filters(priv, stage, out);
+
 	if (stage == LION_PRIV_STAGE_PLAN)
 		lion_priv_decode_tlkinds(priv, out);
 }
@@ -635,7 +679,8 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 	Assert(stage == LION_PRIV_STAGE_PLAN ||
 		   (p->join.keyresno == 0 && p->nwagg == 0 && p->ntl == 0));
 	Assert(stage == LION_PRIV_STAGE_PATH ||
-		   (p->consts == NIL && p->having == NIL && p->resid == NIL));
+		   (p->consts == NIL && p->having == NIL && p->resid == NIL &&
+			p->filterexprs == NIL));
 
 	oids = list_make3_oid(p->heapoid, p->groupidxoid, p->groupidxoid2);
 	ints = list_make4_int((int) p->scanrelid, (int) p->groupattno,
@@ -767,6 +812,20 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 	}
 	priv = lappend(priv, m);
 	priv = lappend(priv, p->vcols);
+
+	/* the filters' expressions are the PATH's, by which the plan's are told */
+	m = NIL;
+	if (p->nfilter > 0)
+	{
+		List	   *fints = list_make1_int(p->nfilter);
+
+		for (i = 0; i < p->nclause; i++)
+			fints = lappend_int(fints, p->clause[i].filter);
+		m = list_make1(fints);
+		if (stage == LION_PRIV_STAGE_PATH)
+			m = lappend(m, p->filterexprs);
+	}
+	priv = lappend(priv, m);
 	priv = lappend(priv, p->resid);
 
 	if (stage == LION_PRIV_STAGE_PLAN)
@@ -1250,6 +1309,50 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 			(!any || p->npart > 0 || p->hasjoin || p->fgattno != 0 ||
 			 (p->coalconst != NULL && LION_ATTNO_IS_VCOL(p->groupattno))))
 			elog(ERROR, "LionCount: malformed expression columns");
+	}
+
+	/*
+	 * Filtered counts (DESIGN.md §10, "Filtered counts") are counted one
+	 * filter at a time, each as a count of its own: the WHERE's clauses
+	 * first and then each filter's together, every filter with one at least,
+	 * an OR inside one of them, and no range among a filter's clauses, which
+	 * would bound the driving walk.  They are a count, a sum, or the groups
+	 * of a serial walk: no join, no count(DISTINCT), no aggregate over keys,
+	 * no top k, no ranges of a parallel GROUP BY, no coalesce group.
+	 */
+	{
+		int			last = 0;
+
+		for (i = 0; i < p->nclause; i++)
+		{
+			int			f = p->clause[i].filter;
+
+			if (f < last || f > last + 1 ||
+				(f > 0 && p->clause[i].kind == LION_CLAUSE_RANGE))
+				elog(ERROR, "LionCount: malformed filtered counts");
+			last = f;
+		}
+		if (last != p->nfilter)
+			elog(ERROR, "LionCount: malformed filtered counts");
+		for (i = 0; i < p->nor; i++)
+		{
+			const LionOrState *o = &p->ors[i];
+
+			if (o->nleaves > 0 &&
+				p->clause[o->first].filter !=
+				p->clause[o->first + o->nleaves - 1].filter)
+				elog(ERROR, "LionCount: malformed filtered counts");
+		}
+		if (p->nfilter > 0 &&
+			(p->hasjoin || p->distattno != 0 || p->nwcol > 0 ||
+			 p->topkn > 0 || parallel_aware || p->coalconst != NULL))
+			elog(ERROR, "LionCount: malformed filtered counts");
+		for (i = 0; i < p->ntl; i++)
+		{
+			if (LION_TL_IS_FCOUNT(p->tlkind[i]) &&
+				LION_TL_FCOUNT_FILTER(p->tlkind[i]) > p->nfilter)
+				elog(ERROR, "LionCount: malformed filtered counts");
+		}
 	}
 
 	/*
