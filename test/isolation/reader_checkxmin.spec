@@ -35,6 +35,8 @@ step s2_any	{ SELECT lion_index_count_any('rx_k', ARRAY[1]); }
 step s2_stats	{ SELECT count FROM lion_index_count_stats('rx_k', 1); }
 step s2_groups	{ SELECT count(*) FROM lion_index_count_group_stats('rx_k'); }
 step s2_bm25	{ SELECT count(*) FROM lion_bm25('rx_d', 'old', 10); }
+step s2_facets	{ SELECT * FROM lion_index_facets('rx_d', 5); }
+step s2_facetsf	{ SELECT * FROM lion_index_facets('rx_k', NULL, $$d @@ 'old'$$); }
 step s2_commit	{ COMMIT; }
 
 session s3
@@ -44,7 +46,10 @@ step s3_any	{ SELECT lion_index_count_any('rx_k', ARRAY[2]); }
 step s3_stats	{ SELECT count FROM lion_index_count_stats('rx_k', 2); }
 step s3_groups	{ SELECT count(*) FROM lion_index_count_group_stats('rx_k'); }
 step s3_bm25	{ SELECT count(*) FROM lion_bm25('rx_d', 'new', 10); }
+step s3_facets	{ SELECT * FROM lion_index_facets('rx_d', 5); }
+step s3_facetsf	{ SELECT * FROM lion_index_facets('rx_k', NULL, $$d @@ 'new'$$); }
 
 permutation s2_begin s2_snap s1_update s1_index s1_check
 			s2_sp s2_count s2_back s2_sp s2_count2 s2_back s2_sp s2_any s2_back s2_sp s2_stats s2_back s2_sp s2_groups s2_back s2_sp s2_bm25 s2_back
-			s2_commit s3_count s3_count2 s3_any s3_stats s3_groups s3_bm25
+			s2_sp s2_facets s2_back s2_sp s2_facetsf s2_back
+			s2_commit s3_count s3_count2 s3_any s3_stats s3_groups s3_bm25 s3_facets s3_facetsf
