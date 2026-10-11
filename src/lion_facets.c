@@ -25,10 +25,9 @@
  * (array)` and `col IS NULL` on a column some lion index has as a scalar key
  * column, and of the multi-key operators (`@>`, `&&`, `@@`, `?`, ...) on one
  * a lion index has as a multi-key column, each answered exactly by its keys.
- * Anything else - a range, `<>`, NOT, a phrase or prefix-free tsquery the
- * keys cannot answer, a clause on a column with no lion index - is an ERROR:
- * the filter is never evaluated against the rows.  The values are evaluated
- * once, as constants, and may not refer to the table.  The filter's sets are
+ * Anything else - a range, `<>`, NOT, a tsquery with a phrase or a negation,
+ * a clause on a column with no lion index - is an ERROR: the filter is never
+ * evaluated against the rows.  The values are evaluated once, as constants, and may not refer to the table.  The filter's sets are
  * collected ONCE into a private copy (lion_sources_collect()), which every
  * key's count is ANDed with, as the GROUP BY pushdown does with its WHERE.
  *
@@ -42,6 +41,12 @@
  * so every key tied with the k-th must have been counted.  When the
  * candidates run out first, the column is walked again and every entry
  * counted whose bound is not below the k-th count so far.
+ *
+ * A SELECTIVE FILTER keeps fewer rows than counting the keys would cost:
+ * then the rows are fetched from the heap by their TIDs in the filter's copy,
+ * under the snapshot, and their keys extracted and counted in a hash table -
+ * the same rows, so the same counts.  Only for a plain column of a
+ * non-partial index, whose rows' values are the index's keys.
  *
  * Nothing here is reached by the planner: the function is called by name,
  * and goes through the reader contract of every such function
@@ -1038,8 +1043,9 @@ lion_facets_walk(LionFacetRun *run)
 /*
  * What one key costs to count against the filter's copy, against what one of
  * the copy's rows costs to fetch from the heap and take apart, as measured
- * on the synthetic docs table of the 2026-10-11 review (DESIGN.md §7, "Facet
- * counts"): some 5 us a key in a batch, 1 us a row.
+ * on a synthetic table of 500,000 rows of three-tag arrays and five-lexeme
+ * tsvectors (DESIGN.md §7, "Facet counts"): some 5 us a key in a batch,
+ * 1 us a row.
  */
 #define LION_FACET_KEY_ROWS		5
 

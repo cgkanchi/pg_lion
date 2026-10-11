@@ -14,6 +14,7 @@ and these functions are for testing, diagnostics and the occasional direct count
     lion_index_count_any(idx, keys)                 count(*) WHERE col = ANY (keys)
     lion_index_count_stats(idx, key)                lion_index_count() plus the heap it visited
     lion_index_count_group_stats(idx [, use_cache, attno])   every group's count, as GROUP BY does
+    lion_index_facets(idx [, k, filter, attno])     the k keys with the most rows under a filter (below)
     lion_index_stats(idx)                           the index's shape, one row per key column
     lion_index_verify(idx [, heapallindexed])       structural check, optionally against the heap
     lion_index_wal_mode(idx)                        'generic' or 'rmgr' (DESIGN.md §25)
@@ -44,6 +45,62 @@ no page while it waits for another that replay may hold, and is exact only while
 index alone; a posting set that replay keeps changing is checked page by page, with a WARNING that
 its totals were not compared.  With `heapallindexed` it evaluates the index's expressions as the
 table's owner (DESIGN.md §7).
+
+### Facet counts (DESIGN.md §7, "Facet counts")
+
+    lion_index_facets(idx regclass, k integer DEFAULT NULL, filter text DEFAULT NULL,
+                      attno int2 DEFAULT 1, OUT key text, OUT count bigint) RETURNS SETOF record
+
+The k keys of key column `attno` of `idx` with the most rows, largest count first - every key with
+a row when `k` is NULL, none when it is 0 - under the rows `filter` keeps. For a multi-key column
+(`array_ops`, `tsvector_ops`, `jsonb_contains_ops`) a key is an element, a lexeme or a jsonb path
+key, and its count the rows whose value holds it, each row ONCE however many times its value holds
+the key. With the filter as a WHERE clause, the answer is exactly
+
+```sql
+SELECT e::text, count(DISTINCT t.ctid) FROM t, unnest(t.col) e
+ WHERE <filter> AND e IS NOT NULL GROUP BY e ORDER BY 2 DESC, e LIMIT k;
+```
+
+for an array, the `ndoc` of `ts_stat('SELECT col FROM t WHERE <filter>')` for a tsvector, and
+`SELECT col, count(*) FROM t WHERE <filter> GROUP BY col ORDER BY 2 DESC, col LIMIT k` for a
+scalar column, whose NULL group is a row with a NULL key. It is not `count(*)` over `unnest(col)`,
+which counts an element twice in an array that repeats it. NULL elements, NULL and empty arrays and
+tsvectors are under no key. The counts are of the rows the caller's snapshot sees, exact as the
+count functions' are, after deletes and updates VACUUM has not yet cleaned up included.
+
+- **Ties** at the cut are broken by the key, in the order the index keeps the column's keys in:
+  the type's btree order under the column's collation (`C` for lexemes), byte order for a type
+  with none and for jsonb path keys (their stored form, not the text shown); a NULL scalar key
+  last. Every key tied with the k-th is counted, so the cut is deterministic.
+- **The key** is the value's text output. A jsonb path key is shown as the condition it stands
+  for: `$."a"."b" == "x"` (a scalar at a path; `[*]` marks a step into an array),
+  `$."a".type() == "array"` or `"object"` (a container at a path), `? "k"` (what `?` finds: a
+  top-level object key, a string element of a top-level array, a raw scalar string),
+  `$.type() == "object"` or `"array"` (the document's own kind), and `sha256:<hex>` for a key too
+  long to store, which was hashed.
+- **The filter** is a WHERE condition over the index's table, written as in a query and analysed
+  like one, made only of what Lion indexes answer exactly as posting sets: `AND` and `OR` of
+  `col = value`, `col IN (...)` or `= ANY (array)`, and `col IS NULL` on a column some valid,
+  non-partial Lion index has as a scalar key column, and the operators its keys answer exactly on
+  one it has as a multi-key column: an array's `@>` and `&&`; `@@` with a tsquery that has no
+  phrase, weight or `!` (prefixes `:*` included); jsonb `?`, `?|`, `?&`, and `@>` unless an array
+  element of the query holds two or more keys. Not `<@`, an empty containment, or jsonpath's `@?`
+  and `@@`, which the keys only narrow. The values are evaluated once, and may not read the table,
+  call a volatile function or hold a subquery. Anything else - a range, `<>`, `NOT`,
+  `IS NOT NULL`, a column no Lion index answers - is an ERROR naming the condition, never a scan.
+  `NULL` (the default) and `'true'` keep every row.
+- **Privileges** are those of the query it stands for: SELECT on the key column and on every column
+  the filter reads, EXECUTE on the filter's operators and on the key type's equality, no row-level
+  security in force for the caller; an index that is not valid, or that the caller's snapshot may
+  not use, is refused, and a SERIALIZABLE caller takes the predicate locks an index scan would.
+- **Costs**: with a k, each entry's TID count bounds its key's count under any filter, so the keys
+  with the largest bounds are counted first and the rest only while one could still reach the
+  k-th; the filter's sets are collected once and ANDed with each key's. When the filter keeps fewer
+  rows than counting the keys would cost, the rows are read from the heap instead (a plain column of
+  a non-partial index only). `SET client_min_messages = debug1` shows the entries read, the keys
+  counted and the rows read.
+- A partial index counts the rows it holds. An expression index's keys are the expression's.
 
 
 ## Key types
