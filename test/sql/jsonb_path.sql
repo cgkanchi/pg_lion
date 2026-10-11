@@ -36,10 +36,19 @@ BEGIN
 	END IF;
 END $$;
 
-CREATE FUNCTION jp_scalar() RETURNS text LANGUAGE sql AS $$
-	SELECT (ARRAY['0','1','2','1.0','1e0','10','"s0"','"s1"','"s2"','"k0"','true','false','null',
-				  '"object"','"array"','"number"','"string"'])[1 + (random()*16)::int]
-$$;
+-- a literal, a quarter of them with accessors after it, which make it another
+-- value: `"2".double()` is the number 2
+CREATE FUNCTION jp_scalar() RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	IF random() < 0.25 THEN
+		RETURN (ARRAY['"0".double()','"1".double()','"2".double()','"1e0".double()','"10".double()',
+					  '(-2).abs()','(1.5).floor()','(1.5).ceiling()','(0).size()','"s0".size()',
+					  '"2".double().floor()','(2).double()','"x".type()','(-0).abs()',
+					  '("s0" ? (@ starts with "s")).size()'])[1 + (random()*14)::int];
+	END IF;
+	RETURN (ARRAY['0','1','2','1.0','1e0','10','"s0"','"s1"','"s2"','"k0"','true','false','null',
+				  '"object"','"array"','"number"','"string"'])[1 + (random()*16)::int];
+END $$;
 
 -- an accessor chain from $, or from @ inside a filter
 CREATE FUNCTION jp_chain(depth int, cur boolean) RETURNS text LANGUAGE plpgsql AS $$
@@ -107,6 +116,9 @@ BEGIN
 	END LOOP;
 	IF jsonb_typeof(d) IN ('object', 'array') THEN
 		RETURN s;
+	END IF;
+	IF jsonb_typeof(d) = 'number' AND random() < 0.3 THEN
+		RETURN s || ' == ' || to_json(d::text)::text || '.double()';
 	END IF;
 	RETURN s || ' == ' || d::text;
 END $$;
@@ -216,8 +228,24 @@ SELECT x.* FROM (VALUES
 	('@?', 'exists ($.k0)'), ('@?', '$.k0 == 1'), ('@@', '$.k0.type() == "object"'), ('@@', '$.k0.size() == 0'),
 	('@@', '$.* == 2'), ('@@', '$.** == 2'), ('@@', '$.k0 > 1'), ('@@', '!($.k0 == 2)'), ('@@', '$.k0 != 2'),
 	('@@', '!(!($.k0 == 1) && $.k0 == 3)'), ('@@', '!(!($.k0 == 2))'), ('@@', '($.k0 == 2) is unknown'),
-	('@@', '$.k0 == $.k0'), ('@@', '$.k0 + 0 == 2'), ('@@', '1 == 1'), ('@?', '1'), ('@?', '$.k0 ? (@.k1 == null).k1')) e(op, q),
+	('@@', '$.k0 == $.k0'), ('@@', '$.k0 + 0 == 2'), ('@@', '1 == 1'), ('@?', '1'), ('@?', '$.k0 ? (@.k1 == null).k1'),
+	('@@', '$.k0 == "2".double()'), ('@@', '"2".double() == $.k0'), ('@@', '$ ? (@.k0 == "2".double())'),
+	('@?', '$.k0 ? (@ == "2".double())'), ('@?', '$ ? (@.k0 == "2".double())'), ('@@', '$.k0 == "2".double().floor()'),
+	('@@', '$.k0 == (-2).abs()'), ('@@', '$.k0 == "1e2".double()'), ('@@', '$.k0[*].k1 == "1".double()'),
+	('@@', '$.k0 == "2".double() && $.k0 == 2'), ('@@', '$.k0 == "2".double() || $.k0 == "s0"'),
+	('@@', '$.k0 == ("s0" ? (@ == "s0"))'), ('@@', '$.k0 == "x".size() * 2')) e(op, q),
 	LATERAL jp_check(e.op, e.q) x;
+
+-- a generic plan, the jsonpath a parameter
+SET plan_cache_mode = force_generic_plan;
+SET enable_seqscan = off;
+PREPARE jp_gen(jsonpath) AS SELECT count(*) FROM jp_l WHERE doc @@ $1;
+SELECT count(*) FROM jp WHERE doc @@ '$.k0 == "2".double()';
+EXPLAIN (COSTS OFF) EXECUTE jp_gen('$.k0 == "2".double()');
+EXECUTE jp_gen('$.k0 == "2".double()');
+DEALLOCATE jp_gen;
+RESET enable_seqscan;
+RESET plan_cache_mode;
 
 -- keys too long to be keys are hashed, and a prefix keeps nothing of a hash:
 -- a query that could need one looks at every hashed key too
