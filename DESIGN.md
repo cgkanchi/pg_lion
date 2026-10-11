@@ -1755,9 +1755,10 @@ Planner integration
     relation.
   - The query has no DISTINCT (but a SELECT DISTINCT over the table alone is a GROUP BY of its
     keys, at end of this section), grouping sets, ORDER BY inside aggregates,
-    FILTER clauses, or aggregates other than `count(*)` (or `count(1)` of any non-NULL constant)
+    or aggregates other than `count(*)` (or `count(1)` of any non-NULL constant)
     and the `count(col)` cases of §14 - and, without a GROUP BY, `count(col)` of any one column
-    whose index answers `col IS NOT NULL`.
+    whose index answers `col IS NOT NULL`. A FILTER, and a `sum` or `count` of a one-armed CASE,
+    is taken when it is a filtered count ("Filtered counts" at the end of this section).
     The target list holds those counts, the columns the rules below let it print, and any
     expression over them; window functions over them are computed above the node ("Shapes
     rewritten to the node's counts" at the end of this section).
@@ -2754,6 +2755,106 @@ order. PostgreSQL 18's B-tree skip scan does not compete here: core's DISTINCT o
 Unique over a full index-only scan, priced as such, and the cost model decides. 1M rows: `SELECT
 DISTINCT c200` 128 ms to 4.6 ms (51 ms with a B-tree on c200); `c20, c200 ... GROUP BY 1, 2`
 127 ms to 15 ms (decoded walk).
+
+### Filtered counts
+
+`count(*) FILTER (WHERE c)`, `count(CASE WHEN c THEN 1 END)`, `sum(CASE WHEN c THEN 1 ELSE 0
+END)` and `sum(CASE WHEN c THEN 1 END)` each count the rows the WHERE selects - or the group
+holds - for which `c` is true. A row where `c` is NULL is one where it is not true, in a FILTER
+and in a CASE alike, and a clause the posting sets answer selects exactly the rows where it is
+true, so a condition the WHERE could take is one more set to intersect with the WHERE's.
+`lion_agg_filtered()` (`lion_plan_target.c`) recognises the forms and the way each reports an
+empty answer:
+
+| form | `LION_FCOUNT_*` | no row has `c` true | no row at all |
+|---|---|---|---|
+| `count(*) FILTER (WHERE c)`, `count(k) FILTER (WHERE c)` of a non-NULL constant, `count(CASE WHEN c THEN k END)` | COUNT | 0 | 0 |
+| `sum(CASE WHEN c THEN 1 ELSE 0 END)` of int4 or int2 | SUM | 0 | NULL |
+| `sum(CASE WHEN c THEN 1 END)`, `sum(1) FILTER (WHERE c)` | SUMNULL | NULL | NULL |
+
+`count(col) FILTER (WHERE c)` is the COUNT form where every row it counts has `col` non-NULL:
+proved by a clause of the WHERE or of `c` itself that implies it, or by a NOT NULL column (§14);
+otherwise it declines. Anything else - another constant, a second arm, an ELSE but 0, a CASE
+inside a FILTER, DISTINCT or ORDER BY - is not a filtered count, and with the generic checks of
+this section it leaves the query to the ordinary plan.
+
+**The planner.** Each distinct condition (by `equal()`) is a filter, numbered from 1 in the order
+the target list and HAVING meet it; two forms of one condition share it. After the strategy is
+settled, `lion_count_path_filters()` takes each condition through `canonicalize_qual()` and
+analyses each conjunct as a WHERE restriction is (`lion_count_path_filter_clause()`): the same
+rewrites, an OR as one source (§19), `NOT IN` as its `<>` clauses, `IS NOT TRUE`, a multi-key
+clause (§17), a range. A conjunct no posting set answers, or a condition that is a constant,
+declines the whole query: what the node would count without it is not the query's answer. The
+clauses are appended to the clause lists after the WHERE's, a filter's together, each
+`LionClauseInfo` with its filter's number; they constrain no column of the result, so what they say
+of their columns (positive, pinned, non-NULL) is the filter's alone and is restored for the WHERE
+after each filter. A duplicate is dropped only within one filter. A filter's clause is no
+restriction of the relation, so a partition's bounds never imply it away (§16), and a range in a
+filter bounds no walk: it is a range taken as a source (§32), which needs a pinned source in the
+same run - the walk, or a positive clause of the WHERE or of the filter - as the WHERE alone does.
+
+**Runs.** The node counts the WHERE alone (run 0) and then the WHERE with each filter (run f):
+run f's clauses are the WHERE's followed by filter f's, and each run is an ordinary count with its
+own sets, located, counted and released before the next run's are located
+(`lion_select_run()`, `lion_count_runs()`). Every rule of §9 holds within a run; the runs share
+the executor's snapshot, so each counts what that snapshot sees whatever happens to the table
+between them. A run touches only its own clauses: `lion_clause_in_run()` keeps the others out of
+the row filter, and a range source's other bounds are looked for in its own filter's clauses only
+(`lion_clause_window()`). EXPLAIN prints run 0's clauses as `Lion Indexes` and each filter as
+`Count Filter N: index (clauses)`.
+
+- **Without a GROUP BY** (the count of the WHERE, its sum over every row of §35, a partitioned
+  table's sum over its partitions) the runs' totals make the one row: a COUNT form prints run f's
+  total, SUM prints NULL when run 0's is 0, SUMNULL when run f's is. Where the WHERE alone is
+  summed over every row (§35), a filter's run with a pinned source of its own - an equality, a
+  list, a null test, or an OR with no range - is counted as a plain count instead.
+- **With a GROUP BY** - one column, two (§20), the decoded walk (§34), on a table or a
+  partitioned one - every run emits its groups as partial rows below core's Finalize HashAggregate:
+  a row of run r holds run r's count in the columns of filter r, and in the others what adds
+  nothing, 0 for a COUNT form or the base `count(*)`, NULL for SUMNULL, and for SUM 0 in run 0's
+  rows and NULL in the rest, so the Finalize Agg's sum of a group is NULL only when run 0 had no
+  such group. A group is emitted only when its count is not 0, as without filters. The query must
+  allow partial aggregation (`GROUPING_CAN_PARTIAL_AGG`) with a hashable grouping, and the path
+  claims no sort order. The decoded walk is taken only when every filter's run has a source
+  positive whatever its value, in the WHERE or in the filter - an equality, a list, a null test, a
+  literal multi-key clause, or an OR of those - and no range source.
+
+**Declined with filters**: the FK-side join (§27), `count(DISTINCT)` (§26), the aggregates over
+keys (§37), a `coalesce` group, expressions of the grouping columns that are not grouping columns,
+the top k (§36) and the parallel GROUP BY ("A GROUP BY in parallel" above). They leave the query
+to the ordinary plan.
+
+**Price.** The runs' prices added up: each run is priced by the cost functions of its strategy
+with the other filters' clauses left out (`lion_count_run_targets()`), and a grouped path's rows
+are its groups once per run. Where the WHERE selects most of a small table one pass over the rows
+can be cheaper than a count per filter, and the cost model then keeps the ordinary plan.
+
+**custom_private.** `LION_PRIV_FILTERS` (member 20, shape 23): an IntList of the number of filters
+and each clause's filter, and at the path stage the conditions themselves; the target-list kinds
+move to member 21. `LION_TL_FCOUNT(f, form)` is a filtered count's target-list kind.
+`lion_count_priv_check()` requires the clauses' filter numbers to rise by at most one and end at
+the number of filters, no RANGE clause in a filter, an OR's leaves inside one filter, and no join,
+DISTINCT, aggregate over keys, top k, parallel walk or coalesce group beside filters.
+
+**Privileges.** A filter's operators are clauses of the node like the WHERE's, and the operators
+of every aggregate argument and FILTER the node stands in for are recorded for the EXECUTE check
+(§9, "Privileges"): revoking EXECUTE on a filter's operator refuses the query as it refuses one
+on a WHERE operator. `test/sql/countfilter.sql` checks every form against a sequential scan, on a
+table with NULLs and with deleted and updated rows not vacuumed, through a generic plan with a
+multi-key condition only the run knows, and through a cursor whose rows are read one at a time
+with rows deleted between them; `test/sql/node_contracts.sql` checks the privilege.
+
+Measured on a synthetic table of 5M rows (columns of 100, 10, 5 and 13 values, a lion index on
+each), with the ordinary plan against the node:
+
+| query | ordinary plan | LionCount |
+|---|---|---|
+| `count(*) FILTER (WHERE b = 1), count(*) FILTER (WHERE c = 3), count(*) ... WHERE a = 2` | 94 ms | 7.6 ms |
+| `sum(CASE WHEN b = 1 THEN 1 ELSE 0 END), sum(CASE WHEN c = 3 THEN 1 END), count(*)` | 373 ms | 28 ms |
+| `count(*) FILTER (WHERE b = 1), count(*) ... WHERE a = 2 AND g = 7` | 15 ms | 0.7 ms |
+| `g, sum(CASE WHEN b = 1 THEN 1 ELSE 0 END), count(*) ... GROUP BY g` | 692 ms | 68 ms |
+| `a, b, count(*) FILTER (WHERE c = 3), count(*) ... GROUP BY a, b` (decoded) | 628 ms | 100 ms |
+| `g, a, b, count(*) FILTER (WHERE c = 3) ... GROUP BY g, a, b` (decoded) | 636 ms | 158 ms |
 
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 

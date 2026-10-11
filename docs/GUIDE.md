@@ -73,6 +73,14 @@ node's counts"):
   count of that column: counted as `count(*) ... AND col IS NOT NULL`.
 - `col NOT IN (a, b, ...)` (or `col <> ALL (...)`) of a literal list without NULLs, counted as
   `col <> a AND col <> b ...`.
+- filtered and conditional counts: `count(*) FILTER (WHERE c)`, `count(CASE WHEN c THEN 1 END)`,
+  `sum(CASE WHEN c THEN 1 ELSE 0 END)` and `sum(CASE WHEN c THEN 1 END)`, where `c` is a condition
+  the `WHERE` could have (`SELECT count(*) FILTER (WHERE event_type = 'purchase'), count(*) FROM
+  events WHERE country = 'Japan'`): each condition is one more count of the `WHERE` with `c`
+  added (`Count Filter 1: ...` in EXPLAIN), and each form gives the answer it gives over a table
+  scan, NULL included. With a `GROUP BY` the counts come out as partial rows a `Finalize
+  HashAggregate` adds up. A condition no Lion index answers leaves the whole query to the ordinary
+  plan (DESIGN.md §10, "Filtered counts").
 - window functions over the counts, such as a share of the total, `g, round(100.0 * count(*) /
   sum(count(*)) OVER (), 2) ... GROUP BY g`: the counts are pushed down and the window runs above
   them.
