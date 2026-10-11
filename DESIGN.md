@@ -16256,8 +16256,9 @@ range on any column is cheap to turn into the set of its rows, so the count push
 range on a column that does not drive the count as an ordinary positive SOURCE
 (`LION_CLAUSE_RANGESRC`):
 
-- `g, count(*) ... WHERE <range on k> GROUP BY g`, beside a two-column GROUP BY, and beside a
-  count(DISTINCT) walk of another column;
+- `g, count(*) ... WHERE <range on k> GROUP BY g`, beside a two-column GROUP BY, beside the
+  decoded walk of three or more (§34, "A range in the WHERE"), and beside a count(DISTINCT) walk of
+  another column;
 - two range columns without a GROUP BY: the WIDEST range drives the sum (the complement and the
   summaries make a wide walk short) and the others are sources;
 - a range and an equality on one column (`k > 100 AND k = 257`): two sources;
@@ -16306,7 +16307,8 @@ the final copy was built. Both are gone (2026-09-28 review):
   up to 8 kB; and what the union holds is counted as the allocator hands it out
   (`GetMemoryChunkSpace()`), where it used to be counted at the containers' own sizes.
 - **An OR's leaf is collected in WINDOWS past the memory**, into a temporary file (`LionSpill`, the
-  same the FK-side join's copy spills into, §27). It gets what every range of the relation gets -
+  same the FK-side join's copy spills into, §27), and so is every range beside the decoded walk
+  (§34), whose WHERE is one collected copy. It gets what every range of the relation gets -
   what is left of the hash table's memory, and never less than `LION_RANGE_WINDOW_MIN` (32 kB,
   several bitsets, so that a window always gets on).
   A window keeps the container keys from where the last one ended; when its memory runs out it
@@ -17406,17 +17408,42 @@ table for its 100,000 combinations; as an array, 179.
 
 `test/sql/group_decode.sql` checks three to five columns - the NULL group and `count(col)` in it,
 another index's column, a text column - against a sequential scan with the pushdown off: WHEREs of
-an equality, an IN list, a NOT, an OR across columns, an IS NULL and one that selects nothing; a
+an equality, an IN list, a NOT, an OR across columns, an IS NULL, a range and one that selects
+nothing; a
 HAVING and an ORDER BY above the Finalize Agg; a work_mem of 64 kB (fourteen passes); a generic plan;
 a rescan per outer row; a cursor; SERIALIZABLE; a heap the map no longer vouches for; and the shapes
 it declines.
+
+### A range in the WHERE (2026-10-11)
+
+`SELECT a, b, c, count(*) FROM t WHERE k < 5000 GROUP BY a, b, c`: with two grouping columns or
+more no range bounds a walk (§28), so every range of the WHERE is a source (§32), and the walk
+reads it as part of the WHERE's collected copy. A source of that copy is never WALKED: a range too
+large for the memory is collected in windows into a temporary file, as an OR's leaf is
+(`lion_locate_where()` asks `lion_locate_range()` for a walkable range only where there is no
+decoded walk), and the copy is then made of it with the WHERE's other sources, spilling past the
+memory itself. It is exact on the copy's terms above: the range is pinless and only narrows the
+rows of column 0's pinned sets. The price is the range's walk and union once, as §32 prices a range
+that fits, and past the memory a walk for each window - two for each hash table's memory the union
+takes - and the file written and read once (`lion_cost_range_source()`,
+`LION_RANGESRC_SPILL`), where a count beside no decoded walk would walk the range at every count.
+A range on a grouping column is the same: a source, which leaves that column's NULL group out of
+the copy.
+
+5M rows, three grouping columns of 2, 20 and 200 values, a range on a fourth column of 20,000
+values, against the plan with the pushdown off (a HashAggregate over a bitmap scan): 25% of the
+rows, 361 ms to 153 ms, and 167 ms with work_mem at 4 MB; 75%, 606 ms to 307 ms; 2.5%, 95 ms to 84
+ms; and 0.1%, which the bitmap scan wins, stays core's. Two grouping columns of 20 and 200 under
+the 25% range, which §20's nested loop took at 344 ms, take the walk in 134.
+`test/sql/group_decode.sql` compares ranges against the sequential plan on a heap with rows
+updated across a range's bounds, deleted and inserted since its VACUUM - a range outside the
+grouping and on a grouping column with NULLs, beside another clause and another range, as an OR's
+leaf, empty and contradicted, under a work_mem of 64 kB - and a range collected into a file.
 
 ### Not done in this version
 
 - **A partitioned table**: each partition would be a relation of its own, as §16's partial rows
   already are; the planner declines it.
-- **A range in the WHERE**, which is walked rather than collected once it is too large to collect
-  (§32): declined. A range the walk could take as another pinless stream is the natural next step.
 - **Parallel**: the walk is container-major, so it divides by ranges of container keys exactly as
   §10's parallel GROUP BY does, under the Finalize Agg it already has.
 - **A hot standby**, where no WHERE is collected (§10): the planner declines it there.

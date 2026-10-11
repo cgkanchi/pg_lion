@@ -2025,14 +2025,20 @@ lion_range_sides(IndexOptInfo *idx, AttrNumber col, List *bounds)
  * correlation interpolates - and each container's entry in the union's hash
  * table.  One that would not fit in a hash table's memory
  * (get_hash_memory_limit(), which the executor shares among the relation's
- * ranges) is walked instead, at every count it is part of - `counts` of them -
- * and an OR's leaf, which cannot be walked, is priced out of the plan.
+ * ranges) is walked instead, at every count it is part of - `counts` of them
+ * (LION_RANGESRC_WALK) - an OR's leaf, which cannot be walked, is priced out
+ * of the plan (LION_RANGESRC_ORLEAF), and a source of the decoded walk's WHERE
+ * (DESIGN.md §34) is collected a window of container keys at a time into a
+ * temporary file (LION_RANGESRC_SPILL): each window a walk of the range, about
+ * two of them for each hash table's memory the union takes
+ * (lion_range_collect()), and the file written once and read once.
  */
 Cost
 lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 					   AttrNumber col, List *bounds, Selectivity sel,
-					   double counts, bool inor)
+					   double counts, int large)
 {
+	double		limit = (double) get_hash_memory_limit();
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		tuples = Max(rel->tuples, 1.0);
 	double		rows = tuples * sel;
@@ -2055,10 +2061,14 @@ lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	c2 = w.corr * w.corr;
 	bytes += (runs * LION_RANGE_RUN_BYTES - bytes) * c2;
 	bytes += (conts + (runs - conts) * c2) * LION_RANGE_UNION_ENTRY_BYTES;
-	if (bytes <= (double) get_hash_memory_limit())
+	if (bytes <= limit)
 		return walk + lion_cost_range_union(heap_pages, tuples, rows, &w);
-	if (inor)
+	if (large == LION_RANGESRC_ORLEAF)
 		return disable_cost;
+	if (large == LION_RANGESRC_SPILL)
+		return walk * 2.0 * ceil(bytes / Max(limit, 1.0)) +
+			lion_cost_range_union(heap_pages, tuples, rows, &w) +
+			2.0 * ceil(bytes / BLCKSZ) * seq_page_cost;
 	return walk * Max(counts, 1.0);
 }
 
@@ -2163,6 +2173,8 @@ typedef struct LionCountRelCost
 	Var		   *rangevar;
 	bool		rangesum;
 	LionRangeCost *rc;
+	int			rangelarge;		/* a range source too large to collect:
+								 * LION_RANGESRC_WALK or _SPILL */
 
 	/* the relation */
 	double		heap_pages;
@@ -2282,7 +2294,9 @@ lion_count_rel_range_source(LionCountRelCost *c, IndexOptInfo *idx,
 	c->rangesrc_cost += lion_cost_range_source(c->root, c->rel, idx, col,
 											   bounds, sel,
 											   Max(c->ingroups, 1.0),
-											   c->orgrp[c->ci - 1] >= 0);
+											   (c->orgrp[c->ci - 1] >= 0) ?
+											   LION_RANGESRC_ORLEAF :
+											   c->rangelarge);
 	list_free(bounds);
 	sc->nkeys = 1.0;
 	sc->leaves = 1.0;
@@ -3250,18 +3264,21 @@ lion_count_rel_recheck(LionCountRelCost *c)
  * What a LionCount path costs over one relation, phase by phase: the WHERE
  * clauses' lookups and the sources of their AND, the merges that count them,
  * the pages they read, the entry scans and pairs of the GROUP BY, and the
- * heap recheck.
+ * heap recheck.  A range source too large to collect is walked at every count
+ * (lion_cost_count_rel()), or collected into a file (rangelarge
+ * LION_RANGESRC_SPILL, the decoded walk's WHERE).
  */
 static Cost
-lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
-				   IndexOptInfo *groupidx, AttrNumber groupcol,
-				   IndexOptInfo *groupidx2, AttrNumber groupcol2,
-				   List *whereidx, List *wherecol, List *whereclauses,
-				   List *wherekinds,
-				   List *ors, double numgroups,
-				   double outer_entries, double inner_entries, int distinct,
-				   double drivefrac, Var *rangevar, bool rangesum,
-				   LionRangeCost *rc, double topk, double topkrows)
+lion_cost_count_rel_ext(PlannerInfo *root, RelOptInfo *rel,
+						IndexOptInfo *groupidx, AttrNumber groupcol,
+						IndexOptInfo *groupidx2, AttrNumber groupcol2,
+						List *whereidx, List *wherecol, List *whereclauses,
+						List *wherekinds,
+						List *ors, double numgroups,
+						double outer_entries, double inner_entries,
+						int distinct, double drivefrac, Var *rangevar,
+						bool rangesum, LionRangeCost *rc, double topk,
+						double topkrows, int rangelarge)
 {
 	LionCountRelCost c;
 	bool		sumshort;		/* §15: the IN list is summed, not merged */
@@ -3287,6 +3304,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	c.rangevar = rangevar;
 	c.rangesum = rangesum;
 	c.rc = rc;
+	c.rangelarge = rangelarge;
 	c.heap_pages = Max((double) rel->pages, 1.0);
 	c.dirtyfrac = 1.0 - rel->allvisfrac;
 	c.matching = Max(lion_probe_rel_rows(root, rel), 1.0);
@@ -3360,6 +3378,25 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	run += c.rangesrc_cost;
 
 	return run;
+}
+
+static Cost
+lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
+					IndexOptInfo *groupidx, AttrNumber groupcol,
+					IndexOptInfo *groupidx2, AttrNumber groupcol2,
+					List *whereidx, List *wherecol, List *whereclauses,
+					List *wherekinds,
+					List *ors, double numgroups,
+					double outer_entries, double inner_entries, int distinct,
+					double drivefrac, Var *rangevar, bool rangesum,
+					LionRangeCost *rc, double topk, double topkrows)
+{
+	return lion_cost_count_rel_ext(root, rel, groupidx, groupcol, groupidx2,
+								   groupcol2, whereidx, wherecol, whereclauses,
+								   wherekinds, ors, numgroups, outer_entries,
+								   inner_entries, distinct, drivefrac,
+								   rangevar, rangesum, rc, topk, topkrows,
+								   LION_RANGESRC_WALK);
 }
 
 /*
@@ -3708,12 +3745,15 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	lion_target_lists(t, whereclauses, wherekinds, ors, &tidx, &tcol,
 					  &tclauses, &tkinds, &tors, NULL);
 
-	/* column 0 against the WHERE, as its own grouped count walks it */
-	run = lion_cost_count_rel(root, rel, t->driveidx[0], t->drivecol[0],
-							  NULL, 0, tidx, tcol, tclauses, tkinds, tors,
-							  groupest[0], groupest[0], 0,
-							  LION_DISTINCT_NONE, 1.0, NULL, false, NULL,
-							  0.0, 0.0);
+	/*
+	 * column 0 against the WHERE, as its own grouped count walks it - each
+	 * range of the WHERE collected, past the memory into a file
+	 */
+	run = lion_cost_count_rel_ext(root, rel, t->driveidx[0], t->drivecol[0],
+								  NULL, 0, tidx, tcol, tclauses, tkinds, tors,
+								  groupest[0], groupest[0], 0,
+								  LION_DISTINCT_NONE, 1.0, NULL, false, NULL,
+								  0.0, 0.0, LION_RANGESRC_SPILL);
 	run += lion_cost_recheck(root, rel, tidx, tcol, tclauses, tkinds, tors,
 							 lion_probe_rel_rows(root, rel), groupest[0],
 							 rel->tuples);

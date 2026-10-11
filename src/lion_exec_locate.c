@@ -597,8 +597,10 @@ lion_rangesrc_range(LionCountScanState *st, int first, int n, bool toplevel,
  * range of the relation), which the counts then read like any other set.
  * One that does not fit is left to be walked at every count instead
  * (src->rangewalk, lion_node_count()) - unless it is an OR's leaf, which
- * cannot be taken apart that way (`walkable` false; the planner declines one
- * it expects to be large).  That one used to be collected whatever it took,
+ * cannot be taken apart that way, or a source of the decoded walk's WHERE
+ * (DESIGN.md §34), which is read as one collected copy (`walkable` false; the
+ * planner declines an OR's leaf it expects to be large, and prices the
+ * decoded walk's as collected in windows, lion_cost_range_source()).  That one used to be collected whatever it took,
  * in memory; it gets the same memory as the others now, and past it is
  * collected a window of container keys at a time into a temporary file
  * (lion_range_collect(), 2026-09-28 review).
@@ -1072,15 +1074,21 @@ lion_locate_where(LionCountScanState *st)
 			continue;
 		}
 
-		/* A range as a source (DESIGN.md §32): collected, or walked. */
+		/*
+		 * A range as a source (DESIGN.md §32): collected, or walked - but
+		 * never walked beside the decoded walk (§34), which reads the WHERE
+		 * as one collected copy: collected there, past the memory into a
+		 * file.
+		 */
 		if (st->item[k].rangesrc)
 		{
 			LionRangeSource *rs = lion_rangesrc_range(st, 0, st->nclause, true,
 													  cl->attno);
 			bool		walked;
 
-			src->tree = lion_locate_range(st, rs, true, &src->sets,
-										  &src->nsets, &walked);
+			src->tree = lion_locate_range(st, rs, st->decode == NULL,
+										  &src->sets, &src->nsets, &walked);
+			Assert(!walked || st->decode == NULL);
 			if (walked)
 				src->rangewalk = rs;
 			else if (src->tree == NULL)

@@ -397,7 +397,9 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 			located += lion_cost_range_source(root, rel, idx,
 											  (AttrNumber) lfirst_int(lc4),
 											  bounds, sel, dimrows,
-											  orgrp[ci] >= 0);
+											  (orgrp[ci] >= 0) ?
+											  LION_RANGESRC_ORLEAF :
+											  LION_RANGESRC_WALK);
 			list_free(bounds);
 			ci++;
 			continue;

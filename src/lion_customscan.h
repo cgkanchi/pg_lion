@@ -2950,10 +2950,19 @@ extern Selectivity lion_probed_selectivity(PlannerInfo *root, RelOptInfo *rel,
 extern Selectivity lion_rel_clauses_selectivity(PlannerInfo *root,
 												RelOptInfo *rel,
 												List *clauses);
+/*
+ * What becomes of a range taken as a source that does not fit in memory
+ * (lion_cost_range_source()): walked at every count, priced out (an OR's
+ * leaf), or collected in windows into a temporary file (the decoded walk's
+ * WHERE, DESIGN.md §34).
+ */
+#define LION_RANGESRC_WALK		0
+#define LION_RANGESRC_ORLEAF	1
+#define LION_RANGESRC_SPILL		2
 extern Cost lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel,
 								   IndexOptInfo *idx, AttrNumber col,
 								   List *bounds, Selectivity sel,
-								   double counts, bool inor);
+								   double counts, int large);
 extern void lion_target_lists(const LionCountTarget *t, List *whereclauses,
 							  List *wherekinds, List *ors, List **idx,
 							  List **col, List **clauses, List **kinds,
