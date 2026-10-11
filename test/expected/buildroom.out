@@ -258,7 +258,7 @@ SELECT * FROM br_shape('br_s_auto');
 SELECT * FROM br_shape('br_k_on');
  leaves | internal | fill | item_slack | inline_slack | verified 
 --------+----------+------+------------+--------------+----------
-     80 |        0 | 0.69 | t          | f            | t
+     80 |        0 | 0.68 | t          | f            | t
 (1 row)
 
 SELECT * FROM br_counts('s', 7);
