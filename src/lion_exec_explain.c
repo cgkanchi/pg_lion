@@ -1030,7 +1030,10 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 	if (st->rangesrc_walked > 0)
 		ExplainPropertyInteger("Range Sources Walked", NULL,
 							   st->rangesrc_walked, es);
-	/* ... and of the collected, those an OR's leaf spilled to a file */
+	/*
+	 * ... and of the collected, those spilled to a file: an OR's leaf, or a
+	 * range beside the decoded walk
+	 */
 	if (st->rangesrc_spilled > 0)
 		ExplainPropertyInteger("Range Sources Spilled", NULL,
 							   st->rangesrc_spilled, es);

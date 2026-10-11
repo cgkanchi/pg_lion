@@ -55,7 +55,10 @@ FROM events GROUP BY country, event_type, device`), or of two with more than a f
 is counted in one walk of the index whatever the number of combinations: at each range of 64 heap blocks it reads which value of each column
 every row has, and counts each row under its combination (`Group Strategy: Decoded` in EXPLAIN,
 under a `Finalize HashAggregate`; DESIGN.md §34). On 5M rows it took 77 ms for 1,000 combinations
-and 179 ms for 100,000, where a HashAggregate over the table took 900 ms and 1.9 s.
+and 179 ms for 100,000, where a HashAggregate over the table took 900 ms and 1.9 s. A range in the
+`WHERE` (`... WHERE amount < 500 GROUP BY a, b, c`) is collected with the rest of the filter, into
+a temporary file when it is larger than the memory: a quarter of 5M rows grouped by three columns
+took 153 ms against 361.
 
 `GROUP BY g ORDER BY count(*) DESC LIMIT k` counts only the groups that can be among the first `k`
 (`Top K` in EXPLAIN; DESIGN.md §36): each key's entry records how many rows it holds, which bounds

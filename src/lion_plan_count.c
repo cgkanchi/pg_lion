@@ -1824,17 +1824,6 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 	Index		rti = cx->rti;
 	ListCell   *lc;
 
-	/*
-	 * The decoded walk (DESIGN.md §34) reads the WHERE as one collected copy,
-	 * and a range is walked rather than collected once it is too large to
-	 * collect: not beside it, as yet.  Nor a WHERE of negated clauses alone
-	 * (`c IS NOT NULL`), whose copy - the positive clauses' intersection,
-	 * less the others - has nothing to begin from.
-	 */
-	if (cx->decode && (cx->hasrangesrc || cx->rangevars != NIL ||
-					   (cx->wherekinds != NIL && !cx->havepositive)))
-		return false;
-
 	/* Something has to drive the count. */
 	cx->driveattno = cx->groupattno[0];
 	if (cx->distvar != NULL && cx->ngroup == 0)
@@ -1920,6 +1909,17 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 			cx->havepositive = true;
 		}
 	}
+
+	/*
+	 * The decoded walk (DESIGN.md §34) reads the WHERE as one collected copy,
+	 * every range in it a source - two grouping columns or more let no range
+	 * bound a walk, above - collected into it however large
+	 * (lion_locate_where()).  Not a WHERE of negated clauses alone (`c IS
+	 * NOT NULL`), whose copy - the positive clauses' intersection, less the
+	 * others - has nothing to begin from.
+	 */
+	if (cx->decode && cx->wherekinds != NIL && !cx->havepositive)
+		return false;
 
 	if (cx->distvar != NULL && cx->ngroup == 0)
 	{
@@ -2896,8 +2896,9 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
  * May a GROUP BY of two columns, made the nested loop of DESIGN.md §20, be
  * the decoded walk of §34 as well?  On the terms of three columns
  * (lion_count_path_group_by(), lion_count_path_strategy()): one table, not a
- * partitioned one, partial counts core can add up, no range in the WHERE, no
- * count(DISTINCT) or coalesce group, and not on a hot standby.
+ * partitioned one, partial counts core can add up, no count(DISTINCT) or
+ * coalesce group, and not on a hot standby.  A range in the WHERE is a source
+ * already, as every range beside two grouping columns is.
  */
 static bool
 lion_count_path_decodable(LionCountPathBuild *cx)
@@ -2906,7 +2907,7 @@ lion_count_path_decodable(LionCountPathBuild *cx)
 		cx->ngroup == 2 && !cx->decode && cx->fj == NULL &&
 		!cx->partitioned && cx->distvar == NULL && cx->groupcoal == NULL &&
 		cx->groupdeps == NIL && !cx->sumall && !cx->singlegroup &&
-		!cx->hasrangesrc && cx->rangevars == NIL &&
+		cx->rangevar == NULL &&
 		(cx->wherekinds == NIL || cx->havepositive) &&
 		cx->first != NULL && cx->first->driveidx[0] != NULL &&
 		cx->first->driveidx[1] != NULL &&
