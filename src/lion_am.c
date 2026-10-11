@@ -357,6 +357,20 @@ _PG_init(void)
 	 * cheaper than §20's nested loop.  Off, three or more go to the ordinary
 	 * plan and two to the nested loop, as before §34.
 	 */
+	/*
+	 * DESIGN.md §10, "Residual clauses": whether the count pushdown may test
+	 * a WHERE clause no posting set answers on the heap rows the others
+	 * select.  Off, such a clause leaves the query to the ordinary plan.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_count_residual",
+							 "Lets the count pushdown test WHERE clauses no lion index answers on the rows the others select.",
+							 "Off, a count with such a clause goes to the ordinary plan.",
+							 &lion_enable_count_residual,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("pg_lion.enable_decoded_walk",
 							 "Lets the count pushdown count a GROUP BY of several lion-indexed columns by decoding each column's values key by key.",
 							 "Off, a GROUP BY of three or more columns goes to the ordinary plan and one of two to the nested loop of their entries.",

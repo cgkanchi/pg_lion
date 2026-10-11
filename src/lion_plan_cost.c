@@ -4064,6 +4064,72 @@ lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
 }
 
 /*
+ * The rows a count's residual clauses are tested on: those the restriction
+ * selects without them, which is what the node fetches.
+ */
+double
+lion_residual_rows(PlannerInfo *root, RelOptInfo *rel, List *residual)
+{
+	List	   *others = NIL;
+	ListCell   *lc;
+	double		rows;
+
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+		if (!list_member_ptr(residual, rinfo->clause))
+			others = lappend(others, rinfo);
+	}
+	rows = clamp_row_est(Max(rel->tuples, 1.0) *
+						 clauselist_selectivity(root, others, rel->relid,
+												JOIN_INNER, NULL));
+	list_free(others);
+	return rows;
+}
+
+/*
+ * The residual clauses of a count (DESIGN.md §10, "Residual clauses"): every
+ * row the other clauses select is fetched from the heap, whatever the
+ * visibility map says, and the clauses evaluated on it.  That is the work of
+ * a bitmap heap scan over those rows, and it is priced as
+ * cost_bitmap_heap_scan() prices it: the distinct pages index_pages_fetched()
+ * expects the rows to touch, each at a cost between random_page_cost and
+ * seq_page_cost by the share of the relation they are, and per row a tuple's
+ * CPU, the clauses' evaluation and the candidate's own handling - its TID
+ * taken from the set and its HOT chain searched - at cpu_index_tuple_cost,
+ * which is what a sequential scan does not pay.  The rows are
+ * lion_residual_rows().
+ *
+ * Each count fetches its own rows - a group's, a count(DISTINCT) key's - and
+ * the rows of different groups share pages, which every count of them reads
+ * again: `counts` counts of rows/counts rows each.
+ */
+Cost
+lion_cost_residual(PlannerInfo *root, RelOptInfo *rel, List *residual,
+				   double counts)
+{
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		rows = lion_residual_rows(root, rel, residual);
+	double		pages;
+	double		spc_random;
+	double		spc_seq;
+	Cost		perpage;
+	QualCost	qual;
+
+	counts = Min(Max(counts, 1.0), rows);
+	pages = index_pages_fetched(rows / counts, (BlockNumber) heap_pages, 0.0,
+								root);
+	pages = Min(pages, heap_pages);
+	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
+	perpage = spc_random - (spc_random - spc_seq) * sqrt(pages / heap_pages);
+
+	cost_qual_eval(&qual, residual, root);
+	return counts * pages * perpage + qual.startup +
+		rows * (cpu_tuple_cost + cpu_index_tuple_cost + qual.per_tuple);
+}
+
+/*
  * The heap recheck of the multi-key clauses whose query the node only has at
  * run time (DESIGN.md §17, "A query known only at run time"), over `matched`
  * rows of `rel` - the rows every clause selects - counted `counts` times over

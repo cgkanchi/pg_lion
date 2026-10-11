@@ -2719,6 +2719,69 @@ Unique over a full index-only scan, priced as such, and the cost model decides. 
 DISTINCT c200` 128 ms to 4.6 ms (51 ms with a B-tree on c200); `c20, c200 ... GROUP BY 1, 2`
 127 ms to 15 ms (decoded walk).
 
+### Residual clauses (2026-10-11)
+
+A WHERE clause no posting set answers - `payload LIKE 'ab%'`, `id > 2500000` on a column with no
+lion index, `length(t) = 3`, `n % 2 = 0` on one with - used to leave the whole count to the ordinary
+plan, which then fetched every row the other clauses select from the heap anyway, through a bitmap
+heap scan. Now such a clause is RESIDUAL: the node counts as before, and every row its counts are
+handed is fetched and tested.
+
+**Which clauses.** `lion_count_path_where()` tries each restriction as it always did; one the
+posting sets do not answer - or that only an index the table does not have would answer
+(`lion_where_indexed()`, asked here rather than when the indexes are matched, which declined the
+whole query) - is residual when `lion_residual_ok()` takes it: a plain table's count, not a
+partition's or an FK-side join's; Vars of the table's own user columns only (no system column, no
+whole row); nothing volatile, no subplan. Whatever the analysis had appended for it (the first
+arms of an OR) is undone from a snapshot of the build. The query is then taken only when the other
+clauses SELECT rows - a positive clause, an OR of them or a range taken as a source (§32) - and the
+shape counts rows rather than entries: not a sum over every row's entries or a range's on the
+column it walks (§28, §35), §37's aggregates over keys, the decoded walk, the parallel GROUP BY, or
+beside a multi-key query known only at run time (§17), whose candidates may be every row. And the
+rows the other clauses select must be at most half the table (`LION_RESID_MAX_SHARE`): past that,
+fetching them one by one loses to the sequential scan that reads them page by page whatever the
+prices say (5M rows, `c2 IN (0, 1)` with a residual: 2.2 s against 1.1).
+
+**How it is carried.** The clauses travel in custom_private's RESID member at the path stage, and
+`lion_plan_custom_path()` appends them to custom_exprs after the aggregates' arguments
+(`LION_FLAG_RESID`, shape 24). Every column they read is a column of `custom_scan_tlist` - one the
+target list prints already, or a resjunk `LION_TL_RESID` one no row prints (it is emitted NULL) -
+so setrefs.c rewrites their Vars into references to it, records their functions as plan
+dependencies, and SS_finalize_plan() sees their Params: a LATERAL value in a residual rescans the
+node.
+
+**How it is evaluated.** `lion_begin_residual()` initialises the clauses with ExecInitQual() over a
+virtual slot of the node's scan tuple, as the ordinary plan's scan initialises its quals, which
+checks EXECUTE on every function they call and calls the object access hook - at executor start,
+plain EXPLAIN included, and as the role that runs the plan. The test of a row
+(`lion_resid_test()`) copies the columns they read from the heap tuple into their places in that
+slot and evaluates the qual: a NULL result rejects the row, as a qual's does. It is the row
+filter's `rowtest` (`LionRowFilter`, §17), set on the visibility cache every count of the
+execution is handed (`lion_build_filter()`), so every count the node makes - a plain count, each
+group of a walk or a batch, each test of a count(DISTINCT), the top k's candidates, both counts of
+an OR with a complement arm (§35) - sends every candidate to the heap whatever the visibility map
+says, resolves its HOT chain under the snapshot there (`lion_recheck_heap_filtered()`), and counts
+the visible row only when it passes. A row the snapshot does not see is never tested, so a
+residual `100 / w > 20` raises nothing over a deleted row whose w is 0, as the ordinary plan
+raises nothing. From PostgreSQL 17 the candidates' pages are read through a read stream over their
+blocks in order, as a bitmap heap scan reads its pages.
+
+**The price** (`lion_cost_residual()`) is that bitmap heap scan's: the rows the other clauses
+select (`lion_residual_rows()`), the distinct pages index_pages_fetched() expects them on, each at
+a cost between random_page_cost and seq_page_cost by the share of the table they are, and per row
+cpu_tuple_cost, the clauses' evaluation and cpu_index_tuple_cost for the candidate's own handling.
+Each count fetches its own rows, and the rows of different groups share pages, so a GROUP BY pays
+the pages of each group's rows: `c2, count(*) WHERE c20 = 3 AND length(payload) = 64 GROUP BY c2`
+visits most pages twice (419 ms against the ordinary plan's 371), and is left to it.
+
+EXPLAIN prints the clauses as `Residual Filter`, and the ANALYZE of a count that is not grouped
+prints the rows they turned away as `Rows Removed by Recheck`. Measured on 5M rows (assert-enabled PostgreSQL 18.6, four shared cores,
+the table larger than shared_buffers): `count(*) WHERE c20 = 3 AND payload LIKE 'ab%'` 296 ms to
+241, `... AND length(payload) = 64` 334 to 278, `... AND id > 2.5e6` 297 to 264, all against a
+bitmap heap scan; `c200 = 17 AND payload LIKE 'ab%'` 9.3 to 8.7 against a plain lion index scan.
+`test/sql/countresid.sql` checks the shapes against the sequential plan, with dead versions the
+residual must not see; `node_contracts.sql` revokes `int4mod` under a residual.
+
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 
 ambulkdelete acquires a cleanup lock (an exclusive content lock that also waits for all other pins

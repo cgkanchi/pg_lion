@@ -677,11 +677,12 @@ SELECT lion_pd('SELECT count(*) FILTER (WHERE b = 2) FROM lion_pdt WHERE a = 3')
  not pushed down, 1 rows
 (1 row)
 
--- a qual that is not an indexed equality to a constant
+-- a qual that is not an indexed equality to a constant: residual, tested on
+-- the heap rows a = 3 selects (DESIGN.md §10, "Residual clauses")
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND id < 500');
-         lion_pd         
--------------------------
- not pushed down, 1 rows
+       lion_pd       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- ... which a range on an indexed column is, since DESIGN.md §28
@@ -692,9 +693,9 @@ SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a > 3');
 (1 row)
 
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND id = 5');
-         lion_pd         
--------------------------
- not pushed down, 1 rows
+       lion_pd       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- two different constants on one column

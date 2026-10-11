@@ -258,6 +258,14 @@ typedef struct LionRowFilter
 	int			nheap;
 	int			npos;
 	struct LionPosFilter **pos;
+
+	/*
+	 * A test of the whole row besides the clauses (the count pushdown's
+	 * residual clauses, DESIGN.md §10), or NULL: true when the row passes.
+	 * Counted among nheap.
+	 */
+	bool		(*rowtest) (void *arg, HeapTuple tuple);
+	void	   *rowtestarg;
 } LionRowFilter;
 
 /* Does a count with this filter have to test every candidate in the heap? */
@@ -1519,6 +1527,13 @@ extern PGDLLIMPORT bool lion_enable_filter_switch;
  * cheaper than the nested loop of §20.  A planner switch.
  */
 extern PGDLLIMPORT bool lion_enable_decoded_walk;
+
+/*
+ * Whether the count pushdown may test WHERE clauses no posting set answers
+ * on the heap rows the others select (DESIGN.md §10, "Residual clauses").
+ * A planner switch.
+ */
+extern PGDLLIMPORT bool lion_enable_count_residual;
 
 /*
  * Whether a GROUP BY ordered by its count under a LIMIT may count only the

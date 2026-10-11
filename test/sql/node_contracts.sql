@@ -64,6 +64,8 @@ INSERT INTO nc_nodes VALUES
 	 'SELECT count(*) FROM nc WHERE j = 2 OR k <> 3', 'int4ne(int4,int4)', ''),
 	('LionCount, a NOT of a multi-key query',
 	 'SELECT count(*) FROM nc WHERE NOT (d @@ ''w1 & w3'')', 'ts_match_vq(tsvector,tsquery)', ''),
+	('LionCount, a residual clause',
+	 'SELECT count(*) FROM nc WHERE k = 3 AND o % 7 = 1', 'int4mod(int4,int4)', ''),
 	('LionCount, an expression column filtered',
 	 'SELECT count(*) FROM nc WHERE nc_bucket(j) = 1', 'nc_bucket(int4)', ''),
 	('LionCount, an expression column grouped',

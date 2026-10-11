@@ -929,6 +929,71 @@ lion_begin_target_list(LionCountScanState *st, CustomScan *cscan,
 }
 
 /*
+ * The residual clauses (DESIGN.md §10, "Residual clauses"): custom_exprs
+ * past the clause values and the aggregates' arguments, initialised as the
+ * ordinary plan's scan initialises its quals (ExecInitQual(), which checks
+ * EXECUTE on every function they call and calls the object access hook), over
+ * a slot of the node's own scan tuple, whose columns setrefs.c pointed their
+ * Vars at.  The heap column of each such place is the custom_scan_tlist
+ * entry's: the residual clauses read only plain columns of the one table
+ * counted (lion_residual_ok()).
+ */
+static void
+lion_begin_residual(LionCountScanState *st, CustomScanState *node,
+					const LionCountPriv *priv, List *exprs, EState *estate)
+{
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	List	   *resid;
+	List	   *vars;
+	ListCell   *lc;
+	int			n = 0;
+
+	st->resid = NULL;
+	st->residexprs = NIL;
+	st->nresidcol = 0;
+	if ((priv->flags & LION_FLAG_RESID) == 0)
+		return;
+
+	resid = list_copy_tail(exprs, priv->nclause + priv->nwagg);
+	st->residexprs = resid;
+	st->resid = ExecInitQual(resid, &node->ss.ps);
+	st->residslot = ExecInitExtraTupleSlot(estate,
+										   node->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
+										   &TTSOpsVirtual);
+	st->residecxt = CreateExprContext(estate);
+
+	vars = pull_var_clause((Node *) resid, 0);
+	st->residslotcol = (int *) palloc(sizeof(int) * Max(list_length(vars), 1));
+	st->residattno = (AttrNumber *)
+		palloc(sizeof(AttrNumber) * Max(list_length(vars), 1));
+	foreach(lc, vars)
+	{
+		Var		   *var = (Var *) lfirst(lc);
+		TargetEntry *tle;
+		int			j;
+		bool		dup = false;
+
+		if (var->varno != INDEX_VAR || var->varattno < 1 ||
+			var->varattno > list_length(cscan->custom_scan_tlist))
+			elog(ERROR, "LionCount: a residual clause reads no column of the scan");
+		tle = (TargetEntry *) list_nth(cscan->custom_scan_tlist,
+									   var->varattno - 1);
+		if (!IsA(tle->expr, Var) || ((Var *) tle->expr)->varattno <= 0)
+			elog(ERROR, "LionCount: a residual clause reads no column of the table");
+		for (j = 0; j < n; j++)
+			if (st->residslotcol[j] == var->varattno - 1)
+				dup = true;
+		if (dup)
+			continue;
+		st->residslotcol[n] = var->varattno - 1;
+		st->residattno[n] = ((Var *) tle->expr)->varattno;
+		n++;
+	}
+	list_free(vars);
+	st->nresidcol = n;
+}
+
+/*
  * The aggregates over lion columns' entries (DESIGN.md §37), from the plan's
  * WAGG member and the argument expressions after the clause values: the
  * columns, each aggregate's kind, argument and - for a minimum or a maximum -
@@ -1633,7 +1698,9 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	 * drift, exactly like a wrong shape marker, and is said rather than
 	 * decoded.
 	 */
-	if (list_length(exprs) != priv->nclause + priv->nwagg)
+	if (list_length(exprs) < priv->nclause + priv->nwagg ||
+		((priv->flags & LION_FLAG_RESID) == 0) !=
+		(list_length(exprs) == priv->nclause + priv->nwagg))
 		elog(ERROR, "LionCount: %d clauses but %d value expressions",
 			 priv->nclause, list_length(exprs) - priv->nwagg);
 	st->nclause = priv->nclause;
@@ -1646,6 +1713,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_join(st, priv, estate);
 	lion_begin_target_list(st, cscan, priv);
 	lion_begin_wagg(st, node, priv, exprs, estate);
+	lion_begin_residual(st, node, priv, exprs, estate);
 	lion_begin_clauses(st, node, priv, exprs);
 	lion_begin_driving_column(st, priv);
 	lion_begin_ors_and_items(st, priv);

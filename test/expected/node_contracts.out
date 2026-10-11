@@ -62,6 +62,8 @@ INSERT INTO nc_nodes VALUES
 	 'SELECT count(*) FROM nc WHERE j = 2 OR k <> 3', 'int4ne(int4,int4)', ''),
 	('LionCount, a NOT of a multi-key query',
 	 'SELECT count(*) FROM nc WHERE NOT (d @@ ''w1 & w3'')', 'ts_match_vq(tsvector,tsquery)', ''),
+	('LionCount, a residual clause',
+	 'SELECT count(*) FROM nc WHERE k = 3 AND o % 7 = 1', 'int4mod(int4,int4)', ''),
 	('LionCount, an expression column filtered',
 	 'SELECT count(*) FROM nc WHERE nc_bucket(j) = 1', 'nc_bucket(int4)', ''),
 	('LionCount, an expression column grouped',
@@ -273,6 +275,13 @@ SELECT node, nc_check(node) FROM nc_nodes ORDER BY node;
  LionCount, a complement in an OR         | granted to the role: the answer
  LionCount, a complement in an OR         | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4ne
  LionCount, a complement in an OR         | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4ne
+ LionCount, a residual clause             | plan: planned
+ LionCount, a residual clause             | every privilege: the ordinary plan's answer
+ LionCount, a residual clause             | without EXECUTE on int4mod(integer,integer): ERROR: permission denied for function int4mod, as the ordinary plan
+ LionCount, a residual clause             | plain EXPLAIN: as the ordinary plan
+ LionCount, a residual clause             | granted to the role: the answer
+ LionCount, a residual clause             | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4mod
+ LionCount, a residual clause             | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4mod
  LionCount, an IS DISTINCT FROM           | plan: planned
  LionCount, an IS DISTINCT FROM           | every privilege: the ordinary plan's answer
  LionCount, an IS DISTINCT FROM           | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
@@ -329,7 +338,7 @@ SELECT node, nc_check(node) FROM nc_nodes ORDER BY node;
  LionSemiJoin                             | granted to the role: the answer
  LionSemiJoin                             | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
  LionSemiJoin                             | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
-(105 rows)
+(112 rows)
 
 -- nothing is left revoked from PUBLIC by this file
 SELECT fn FROM nc_nodes WHERE NOT has_function_privilege('public', fn, 'EXECUTE');

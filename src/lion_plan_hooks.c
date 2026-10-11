@@ -18,6 +18,7 @@ bool		lion_enable_count_pushdown = true;
 bool		lion_enable_filter_switch = true;
 bool		lion_enable_decoded_walk = true;
 bool		lion_enable_topk = true;
+bool		lion_enable_count_residual = true;
 create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 bool		lion_enable_semijoin = true;
 set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook = NULL;
@@ -846,6 +847,49 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	}
 	pfree(inor);
 
+	/*
+	 * The columns the residual clauses read (DESIGN.md §10, "Residual
+	 * clauses"), each once: setrefs.c points the clauses' Vars at their
+	 * places in custom_scan_tlist - a column the target list prints already,
+	 * or a LION_TL_RESID one no row prints - and the node fills those places
+	 * from the heap row it tests.
+	 */
+	if (priv.resid != NIL)
+	{
+		List	   *vars = pull_var_clause((Node *) priv.resid,
+										   PVC_INCLUDE_PLACEHOLDERS);
+
+		foreach(lc, vars)
+		{
+			Var		   *var = (Var *) lfirst(lc);
+			ListCell   *l2;
+			bool		dup = false;
+
+			if (!IsA(var, Var) || var->varno != (int) priv.scanrelid ||
+				var->varattno <= 0)
+				elog(ERROR, "LionCount: a residual clause reads more than its table's columns");
+			foreach(l2, ctlist)
+			{
+				Node	   *e = (Node *) ((TargetEntry *) lfirst(l2))->expr;
+
+				if (IsA(e, Var) && ((Var *) e)->varno == var->varno &&
+					((Var *) e)->varattno == var->varattno)
+				{
+					dup = true;
+					break;
+				}
+			}
+			if (dup)
+				continue;
+			ctlist = lappend(ctlist,
+							 makeTargetEntry((Expr *) copyObject(var),
+											 list_length(ctlist) + 1,
+											 NULL, true));
+			kinds = lappend_int(kinds, LION_TL_RESID(var->varattno));
+		}
+		list_free(vars);
+	}
+
 	cscan->scan.plan.targetlist = tlist;
 	cscan->scan.plan.qual = having;
 	cscan->scan.scanrelid = 0;
@@ -874,6 +918,14 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	if (priv.nwcol > 0)
 		cscan->custom_exprs = list_concat(list_copy(cscan->custom_exprs),
 										  wargs);
+
+	/* ... and the residual clauses after them (DESIGN.md §10) */
+	if (priv.resid != NIL)
+	{
+		cscan->custom_exprs = list_concat(list_copy(cscan->custom_exprs),
+										  priv.resid);
+		priv.resid = NIL;
+	}
 	lion_priv_set_tlkinds(&priv, kinds);
 
 	/*

@@ -17,7 +17,7 @@
 /* Every LION_FLAG_* and LION_JOINFLAG_* bit this build knows. */
 #define LION_FLAG_ALL \
 	(LION_FLAG_SINGLEGROUP | LION_FLAG_SUMALL | LION_FLAG_GROUPIDX | \
-	 LION_FLAG_RANGE | LION_FLAG_DECODE)
+	 LION_FLAG_RANGE | LION_FLAG_DECODE | LION_FLAG_RESID)
 #define LION_JOINFLAG_ALL \
 	(LION_JOINFLAG_COLLECT | LION_JOINFLAG_ROWS | LION_JOINFLAG_UNIQUE | \
 	 LION_JOINFLAG_WALK | LION_JOINFLAG_SUM | LION_JOINFLAG_COUNTS | \
@@ -30,7 +30,8 @@
 static const char *const lion_priv_name[LION_PRIV_NMEMBERS] = {
 	"VERSION", "OIDS", "INTS", "CONSTS", "CLAUSEKINDS", "PARTS", "CLAUSEOPS",
 	"ORS", "HAVING", "DISTINCT", "JOIN", "EXECUTE", "COALESCE", "IMPLIED",
-	"FACTGROUP", "GROUPN", "ALLROWS", "TOPK", "WAGG", "VCOLS", "TLKINDS"
+	"FACTGROUP", "GROUPN", "ALLROWS", "TOPK", "WAGG", "VCOLS", "RESID",
+	"TLKINDS"
 };
 
 static const NodeTag lion_priv_tag[LION_PRIV_NMEMBERS] = {
@@ -54,6 +55,7 @@ static const NodeTag lion_priv_tag[LION_PRIV_NMEMBERS] = {
 	T_IntList,					/* TOPK */
 	T_List,						/* WAGG */
 	T_List,						/* VCOLS */
+	T_List,						/* RESID */
 	T_IntList					/* TLKINDS */
 };
 
@@ -427,7 +429,8 @@ lion_priv_decode_tlkinds(List *priv, LionCountPriv *out)
 
 		if (!LION_TL_IS_CHILDCOL(kind) &&
 			!(kind >= 0 && kind < LION_TL_WHEREKEY + out->nclause) &&
-			!LION_TL_IS_WAGG(kind) && !LION_TL_IS_WKEY(kind))
+			!LION_TL_IS_WAGG(kind) && !LION_TL_IS_WKEY(kind) &&
+			!LION_TL_IS_RESID(kind))
 			elog(ERROR, "LionCount: unknown target list kind %d", kind);
 		out->tlkind[i] = kind;
 	}
@@ -498,6 +501,20 @@ lion_count_priv_decode(List *priv, LionPrivStage stage, LionCountPriv *out)
 		lion_priv_expect_length(m, LION_PRIV_HAVING, 0);
 	else
 		out->having = m;
+
+	/*
+	 * ... and so are the residual clauses (DESIGN.md §10): the plan has them
+	 * in custom_exprs, and the path has some exactly when the flag says so.
+	 */
+	m = (List *) list_nth(priv, LION_PRIV_RESID);
+	if (stage == LION_PRIV_STAGE_PLAN)
+		lion_priv_expect_length(m, LION_PRIV_RESID, 0);
+	else
+	{
+		if ((m != NIL) != ((out->flags & LION_FLAG_RESID) != 0))
+			elog(ERROR, "LionCount: malformed RESID member of custom_private");
+		out->resid = m;
+	}
 
 	lion_priv_decode_parts(priv, out);
 	lion_priv_decode_ors(priv, out);
@@ -618,7 +635,7 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 	Assert(stage == LION_PRIV_STAGE_PLAN ||
 		   (p->join.keyresno == 0 && p->nwagg == 0 && p->ntl == 0));
 	Assert(stage == LION_PRIV_STAGE_PATH ||
-		   (p->consts == NIL && p->having == NIL));
+		   (p->consts == NIL && p->having == NIL && p->resid == NIL));
 
 	oids = list_make3_oid(p->heapoid, p->groupidxoid, p->groupidxoid2);
 	ints = list_make4_int((int) p->scanrelid, (int) p->groupattno,
@@ -750,6 +767,7 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 	}
 	priv = lappend(priv, m);
 	priv = lappend(priv, p->vcols);
+	priv = lappend(priv, p->resid);
 
 	if (stage == LION_PRIV_STAGE_PLAN)
 	{
@@ -1015,6 +1033,17 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	/* a sum over every row (DESIGN.md §35) is a sum */
 	if (p->allattno != 0 && !sumall)
 		elog(ERROR, "LionCount: a column for every row without a sum");
+
+	/*
+	 * Residual clauses (DESIGN.md §10) are tested on the rows of one plain
+	 * table's counts: never beside a sum over entries that reads no row, the
+	 * decoded walk, a join, partitions or the ranges of a parallel GROUP BY,
+	 * none of which the planner offers with them.
+	 */
+	if ((p->flags & LION_FLAG_RESID) != 0 &&
+		(sumall || decode || p->hasjoin || p->npart > 0 || p->nwcol > 0 ||
+		 parallel_aware))
+		elog(ERROR, "LionCount: residual clauses in a shape that tests no row");
 
 	/*
 	 * The top k by count (DESIGN.md §36) is made of one grouping column

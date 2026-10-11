@@ -1055,6 +1055,41 @@ lion_arg_type_passed(Oid type, Oid declared)
 }
 
 /*
+ * The residual clauses' test of one heap row (DESIGN.md §10, "Residual
+ * clauses"): the columns they read copied into the node's residual slot -
+ * pointers into the tuple, which the caller's pin keeps in place - and the
+ * clauses evaluated over it, as the ordinary plan's scan evaluates its quals.
+ */
+static bool
+lion_resid_test(void *arg, HeapTuple tuple)
+{
+	LionCountScanState *st = (LionCountScanState *) arg;
+	TupleTableSlot *slot = st->residslot;
+	TupleDesc	hdesc = RelationGetDescr(st->heap);
+	ExprContext *econtext = st->residecxt;
+	bool		pass;
+	int			i;
+
+	ExecClearTuple(slot);
+	for (i = 0; i < slot->tts_tupleDescriptor->natts; i++)
+	{
+		slot->tts_values[i] = (Datum) 0;
+		slot->tts_isnull[i] = true;
+	}
+	for (i = 0; i < st->nresidcol; i++)
+		slot->tts_values[st->residslotcol[i]] =
+			heap_getattr(tuple, st->residattno[i], hdesc,
+						 &slot->tts_isnull[st->residslotcol[i]]);
+	ExecStoreVirtualTuple(slot);
+
+	econtext->ecxt_scantuple = slot;
+	pass = ExecQual(st->resid, econtext);
+	ResetExprContext(econtext);
+	ExecClearTuple(slot);
+	return pass;
+}
+
+/*
  * The heap recheck this scan's multi-key queries need (DESIGN.md §17, "A
  * query known only at run time"), as a row filter over the relation being
  * counted, set on the visibility cache every count of this execution is
@@ -1088,14 +1123,14 @@ lion_build_filter(LionCountScanState *st)
 			(cl->qmode == LION_QMODE_LOSSY || cl->qmode == LION_QMODE_ALL))
 			n++;
 	}
-	if (n == 0)
+	if (n == 0 && st->resid == NULL)
 		return;
 
 	oldcxt = MemoryContextSwitchTo(st->wherecxt);
 	filter = (LionRowFilter *) palloc0(sizeof(LionRowFilter));
 	filter->heap = st->heap;
 	filter->clauses = (LionRowFilterClause *)
-		palloc0(sizeof(LionRowFilterClause) * n);
+		palloc0(sizeof(LionRowFilterClause) * Max(n, 1));
 	filter->tmpcxt = AllocSetContextCreate(st->wherecxt,
 										   "LionCount row filter",
 										   ALLOCSET_SMALL_SIZES);
@@ -1179,6 +1214,19 @@ lion_build_filter(LionCountScanState *st)
 															false, typbyval),
 										 InvalidOid, c->collation),
 						   &c->flinfo);
+	}
+
+	/*
+	 * ... and the residual clauses (DESIGN.md §10, "Residual clauses"), which
+	 * only the heap can decide.
+	 */
+	if (st->resid != NULL)
+	{
+		if (RelationGetRelid(st->heap) != st->plan.heapoid)
+			elog(ERROR, "LionCount: residual clauses over another relation");
+		filter->rowtest = lion_resid_test;
+		filter->rowtestarg = st;
+		filter->nheap++;
 	}
 	MemoryContextSwitchTo(oldcxt);
 
@@ -1662,9 +1710,12 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 					slot->tts_isnull[i] = a->resnull;
 					break;
 				}
-				if (LION_TL_IS_WKEY(kind))
+				if (LION_TL_IS_WKEY(kind) || LION_TL_IS_RESID(kind))
 				{
-					/* ... and the key its argument read, which nothing prints */
+					/*
+					 * ... and the key its argument read, or a column a
+					 * residual clause read (§10), which nothing prints
+					 */
 					slot->tts_values[i] = (Datum) 0;
 					slot->tts_isnull[i] = true;
 					break;
