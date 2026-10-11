@@ -351,7 +351,16 @@ lion_count_path_query(LionCountPathBuild *cx)
 			return false;
 		if (parse->groupingSets != NIL)
 			return false;
-		if (parse->hasWindowFuncs || parse->hasTargetSRFs ||
+		/*
+		 * A window function is computed above the grouping, over the rows of
+		 * the grouped rel, whose target (make_window_input_target()) holds
+		 * every grouping column and aggregate the windows read - their
+		 * arguments, PARTITION BY and ORDER BY keys - and is checked below
+		 * like any other.  So a window over grouped counts needs nothing of
+		 * the node beyond those (DESIGN.md §10, "Shapes rewritten to the
+		 * node's counts").
+		 */
+		if (parse->hasTargetSRFs ||
 			parse->hasDistinctOn || parse->distinctClause != NIL)
 			return false;
 	}
