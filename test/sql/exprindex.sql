@@ -53,9 +53,14 @@ INSERT INTO xq VALUES
 	($$SELECT doc->>'s', doc->'o'->>'t', c, count(*) FROM xd GROUP BY 1, 2, 3$$),
 	($$SELECT doc->>'s', count(*) FROM xd GROUP BY 1 HAVING count(*) > 1000$$),
 	($$SELECT doc->>'s', count(*) FROM xd GROUP BY 1 HAVING count(*) > 1100 OR doc->>'s' = 'a'$$),
+	($$SELECT doc->>'s', c, count(*) FROM xd GROUP BY 1, 2 HAVING count(*) > 160 OR doc->>'s' = 'b'$$),
+	($$SELECT doc->>'s', c, count(*) FROM xd WHERE doc->>'s' = 'b' GROUP BY 1, 2$$),
+	($$SELECT doc->>'s', doc->'o'->>'t', c, count(*) FROM xd WHERE doc->>'s' = 'b' GROUP BY 1, 2, 3$$),
+	($$SELECT doc->>'s', doc->'o'->>'t', c, count(*) FROM xd GROUP BY 1, 2, 3 HAVING count(*) > 50 OR doc->>'s' = 'c'$$),
 	($$SELECT doc->>'s' FROM xd GROUP BY 1 HAVING count(doc->>'s') > 1100 OR upper(doc->>'s') = 'B'$$),
 	($$SELECT doc->>'s', upper(doc->>'s'), count(*) FROM xd GROUP BY 1, 2$$),
 	($$SELECT c, count(*) FROM xd WHERE doc->>'s' = 'c' GROUP BY c$$),
+	($$SELECT coalesce(c, 3), count(*) FROM xd WHERE doc->>'s' = 'a' GROUP BY 1$$),
 	($$SELECT count(DISTINCT doc->>'s') FROM xd$$),
 	($$SELECT count(DISTINCT (doc->>'n')::int) FROM xd WHERE doc->>'s' IN ('a', 'b')$$),
 	($$SELECT count(DISTINCT c) FROM xd WHERE doc->>'s' = 'd'$$);
@@ -149,6 +154,35 @@ VACUUM ANALYZE xpt;
 SELECT xq_planned($$SELECT doc->>'s', count(*) FROM xpt GROUP BY 1$$) AS partitioned;
 SELECT xq_rows($$SELECT doc->>'s', count(*) FROM xpt GROUP BY 1$$, true) =
 	   xq_rows($$SELECT doc->>'s', count(*) FROM xpt GROUP BY 1$$, false) AS partitioned_same;
+
+-- a binary-coercible cast of a column, `(v::text)` of a varchar, is that
+-- column, not an expression column: an index on one leaves the expression
+-- columns of every other query as they were.  And a coalesce of a column
+-- groups beside a clause on an expression column, as beside one on a column.
+CREATE TABLE xn (id int, c int, v varchar, doc jsonb);
+INSERT INTO xn
+SELECT i, CASE WHEN i % 5 = 0 THEN NULL ELSE i % 4 END, 'v' || (i % 9),
+	   jsonb_build_object('a', (i % 6)::text)
+  FROM generate_series(1, 6000) i;
+CREATE INDEX xn_a ON xn USING lion ((doc->>'a'));
+CREATE INDEX xn_c ON xn USING lion (c);
+CREATE INDEX xn_v ON xn USING lion ((v::text));
+VACUUM (FREEZE, ANALYZE) xn;
+CREATE TABLE xnq (q text);
+INSERT INTO xnq VALUES
+	($$SELECT count(*) FROM xn WHERE doc->>'a' = '1'$$),
+	($$SELECT doc->>'a', count(*) FROM xn GROUP BY 1$$),
+	($$SELECT coalesce(c, 0), count(*) FROM xn WHERE doc->>'a' = '1' GROUP BY 1$$),
+	($$SELECT coalesce(c, 3), count(*) FROM xn WHERE doc->>'a' IN ('0', '3') GROUP BY 1$$);
+SELECT q FROM xnq WHERE NOT xq_planned(q);
+SELECT q, xq_rows(q, true) AS lion, xq_rows(q, false) AS ordinary
+  FROM xnq WHERE xq_rows(q, true) IS DISTINCT FROM xq_rows(q, false);
+EXPLAIN (COSTS OFF) SELECT coalesce(c, 0), count(*) FROM xn WHERE doc->>'a' = '1' GROUP BY 1;
+-- the cast index does not answer v itself, as before: the count declines
+SELECT xq_planned($$SELECT count(*) FROM xn WHERE doc->>'a' = '1' AND v::text = 'v3'$$) AS cast_column,
+	   xq_rows($$SELECT count(*) FROM xn WHERE doc->>'a' = '1' AND v::text = 'v3'$$, true) =
+	   xq_rows($$SELECT count(*) FROM xn WHERE doc->>'a' = '1' AND v::text = 'v3'$$, false) AS cast_column_same;
+DROP TABLE xn, xnq;
 
 -- EXECUTE on a function of the expression (DESIGN.md §9, "Privileges"): the
 -- ordinary plan calls it in its scan, for the WHERE clause and for a grouped

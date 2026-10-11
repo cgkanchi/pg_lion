@@ -18373,7 +18373,10 @@ expression such an index holds as a column of its own, an **expression column**,
 - **Which expressions**: those of the table's valid, non-partial lion indexes, under a scalar
   opclass, deduplicated, at most `LION_MAX_VCOLS` (64), collected when the pushdown is tried on one
   table that is not partitioned. A multi-key opclass over an expression (`to_tsvector(...)`) is not
-  one: its entries are keys, not row values.
+  one: its entries are keys, not row values. Nor is a binary-coercible cast of a column, `(v::text)`
+  of a varchar: stripped of its relabel it is the bare column, which the plan cannot carry as an
+  expression column, and which an index on the cast does not answer as a column either (a clause on
+  it declines, as before).
 - **The query's expressions**: the GROUP BY items, the WHERE clauses, the HAVING and the target
   list are rewritten with every subexpression equal to an expression column - as core's
   `match_index_to_operand()` compares them, relabels stripped - replaced by a Var of that column's
@@ -18398,11 +18401,17 @@ a partitioned index has no pages to read a count from.
   to varno 1 when the plan is made (`lion_plan_custom_path()`); setrefs.c does not look into
   custom_private. The codec checks each is an expression of the table's columns, and
   `lion_count_priv_check()` that every expression column a member names is one of them, and that
-  there are none with partitions, a join or `coalesce`.
+  there are none with partitions or a join, and that a `coalesce` group is not one. A `coalesce` of
+  a column beside a clause on an expression column (`GROUP BY coalesce(c, 0) ... WHERE doc->>'a' =
+  '1'`) is planned: the clause is a posting set like any column's.
 - **custom_scan_tlist** holds the expressions themselves, not the virtual Vars: setrefs.c matches
   the plan's target list and HAVING against it by `equal()`, and finds `doc->>'s'` there as it
   would a column. A HAVING that names an expression column is wanted as that expression, not as
-  the columns inside it (`lion_having_refs()`).
+  the columns inside it (`lion_vcol_refs()`), and so is the partial target of the decoded walk, a
+  parallel GROUP BY or a partitioned one (`lion_make_partial_target()`): core's
+  `make_partial_grouping_target()` would pull the columns out of a HAVING like `count(*) > 100 OR
+  doc->>'a' = '2'`, or out of a printed expression that a WHERE equality took out of
+  `processed_groupClause`, and the node cannot emit `doc`.
 - **The executor** finds each key column the same way (`lion_index_col_for()` with VCOLS,
   `lion_index_col_is_vcol()`), comparing with the index's own expressions, which are of varno 1.
 - **EXPLAIN** prints the expression, deparsed against the table, where it prints a column name.
@@ -18425,7 +18434,9 @@ expression column against the ordinary plan.
 ### Tests
 
 `test/sql/exprindex.sql`: jsonb fields and a cast, filtered (`=`, `IN`, `<>`, ranges, `IS NULL`,
-OR), grouped by one, two and three columns, `count(DISTINCT)`, HAVING, a generic plan's parameter,
+OR), grouped by one, two and three columns (with a HAVING on a grouped expression, and with one
+pinned by the WHERE), `count(DISTINCT)`, HAVING, a `coalesce` group beside an expression clause, an
+index on a binary-coercible cast of a column next to the expression indexes, a generic plan's parameter,
 through LionCount and through the ordinary plan before and after updates and deletes, only
 differences printed; what declines; and EXECUTE on a function an expression calls.
 
