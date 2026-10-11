@@ -148,7 +148,7 @@ SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
              name             |                              rcon_try                              
 ------------------------------+--------------------------------------------------------------------
  lion_bm25                    | cannot rank through index "rcon_d" because the index is not valid
- lion_bm25_score              | true
+ lion_bm25_score              | cannot score through index "rcon_d" because the index is not valid
  lion_index_count             | cannot count through index "rcon_k" because the index is not valid
  lion_index_count, two keys   | cannot count through index "rcon_k" because the index is not valid
  lion_index_count_any         | cannot count through index "rcon_k" because the index is not valid
