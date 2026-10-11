@@ -1009,6 +1009,7 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	BlockNumber cblk;
 	LionPostingPivot pivot;
 	int			nmoved;
+	int			i;
 	LionEntryTuple *logged = NULL;
 	Size		loggedsz = 0;
 	uint16		kind = LionPageGetOpaque(page)->flags & LION_PAGE_POSITIONS;
@@ -1073,11 +1074,11 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 		loggedsz = ItemIdGetLength(PageGetItemId(epage, entryoff));
 		logged = (LionEntryTuple *) palloc(loggedsz);
 		memcpy(logged, onpage, loggedsz);
-		if ((logged->flags & LION_ENTRY_CHAIN) == 0 || logged->head != head)
+		if ((logged->flags & LION_ENTRY_CHAIN) == 0 || lion_entry_head(logged) != head)
 			elog(ERROR, "lion index \"%s\": entry %u on block %u does not own the posting set at %u",
 				 RelationGetRelationName(index), entryoff,
 				 BufferGetBlockNumber(entrybuf), head);
-		logged->tail = cblk;
+		lion_entry_set_tail(logged, cblk);
 	}
 
 	xstate = lion_wal_begin(index);
@@ -1130,9 +1131,9 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	lion_page_set_owner(pR, hash, head);
 	pivot.ckey = 0;				/* minus infinity: it owns everything */
 	pivot.child = cblk;
-	for (off = 0; off <= nsiblings; off++)
+	for (i = 0; i <= nsiblings; i++)
 	{
-		const LionPostingPivot *pv = (off == 0) ? &pivot : &siblings[off - 1];
+		const LionPostingPivot *pv = (i == 0) ? &pivot : &siblings[i - 1];
 		OffsetNumber noff = PageAddItemExtended(pR, (char *) pv,
 												LION_POSTING_PIVOT_SIZE,
 												InvalidOffsetNumber, 0);
@@ -1151,7 +1152,7 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 								loggedsz))
 			elog(ERROR, "lion index: could not update entry tuple at %u/%u",
 				 BufferGetBlockNumber(entrybuf), entryoff);
-		entry->tail = cblk;
+		lion_entry_set_tail(entry, cblk);
 	}
 
 	lion_wal_finish(xstate, LION_XLOG_SPLIT);
@@ -1279,7 +1280,7 @@ lion_posting_promote(Relation index, Relation heaprel, Buffer headbuf,
 	Assert(LionPageIsPostingLeaf(hpage));
 	Assert(entry == NULL ?
 		   (LionPageGetOpaque(hpage)->flags & LION_PAGE_POSITIONS) != 0 :
-		   root == entry->head);
+		   root == lion_entry_head(entry));
 
 	if (LionPageIncompleteSplit(hpage))
 		ereport(ERROR,

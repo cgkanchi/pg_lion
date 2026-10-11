@@ -239,6 +239,26 @@ under an OR.
 positions and weights, so phrase, weight and NOT queries are answered from the index and BM25
 ranking works (see "Multi-key columns" above). Read at build time, like `summaries`.
 `fillfactor` (10 .. 100, default 90): how full the build packs a directory leaf.
+`posting_fillfactor` (10 .. 100, default 100): how full the build packs a posting-tree leaf, the
+container pages a key's posting set lives on once it outgrows its entry (DESIGN.md §22). At 100 a
+leaf is packed until the next container does not fit, so the first insert after the build that has
+to rewrite a container on it - one whose new member lands inside the container, as the new row
+versions of an UPDATE on a heap with free space do - splits the leaf. A lower value leaves that room
+at the cost of more leaves: an index that takes scattered writes soon after it is built is better
+built at 80 or 90, one that is mostly read keeps the default. A leaf always takes its first
+container, so a low value never leaves a page empty.
+`build_slack` (`auto` | `on` | `off`, default `off`): whether the build writes each entry that
+keeps its posting set inline, and each container on a posting-tree leaf, with the growth slack an
+insert would give it (DESIGN.md §4), so that the first rows an insert adds to it land inside the
+bytes it already has and nothing else on its page moves. That matters with `wal_mode = generic`,
+where the WAL record of a change is a diff of the page and moving the entries stored after a grown
+one makes it most of the page: on scattered updates soon after a build, `on` cut generic-mode WAL
+from 1.1-2.4 KB to 65-435 bytes a row in DESIGN.md's measurement. Under Lion's resource manager the
+record is the entry's own change either way and the option buys little. `auto` is `on` for an index
+built for generic WAL and `off` for one built for the resource manager. The slack costs space:
+about an eighth of each entry or container, 8 to 64 bytes, which came to 4-46% more index
+at build in the same measurement. Both options are read at build time; `ALTER INDEX ... SET` takes
+effect at the next REINDEX.
 `max_entries` (default 0 = unlimited): an advisory cardinality guard.  The index warns once per
 backend when it has grown past that many distinct keys - counted exactly by a build, estimated by an
 insert that adds a key as the entries on its directory leaf times the number of leaves - and never
@@ -258,9 +278,9 @@ g`, a range in an OR, a join's fact filter) is answered too, collected once from
 logged through (DESIGN.md §25).  Measured on a release build: the 8-client hot-key insert burst goes
 from 765 to 1275 tps (p95 14.8 to 9.9 ms, against btree's 1632 / 7.8), 10,000 inserts into the
 1M-row eight-index portfolio from 922 ms / 88 MiB to 254 ms / 65 MiB, and an insert into a key whose
-posting set is still inside its entry tuple from 2919 to 422 bytes of WAL.  One case is worse: a
-dense key whose container has to be rewritten whole costs ~1.6 KB where a generic page diff cost
-~122 B, which is +40% of WAL on that path and is the first thing §25 lists to fix.  `auto` is `rmgr` when the server registered Lion's own resource
+posting set is still inside its entry tuple from 2919 to 422 bytes of WAL.  A container or entry
+that has to be rewritten is logged as the bytes that changed, or as the bytes an insert put in the
+middle of it and where, not as the whole item.  `auto` is `rmgr` when the server registered Lion's own resource
 manager and `generic` otherwise, so one CREATE INDEX script works on a cluster that preloads the
 library and on one that does not.  The mode is fixed at build time and recorded on the meta page;
 `SELECT lion_index_wal_mode(idx)` reports it and REINDEX is what changes it.  An rmgr-mode index can
@@ -286,7 +306,7 @@ the planner is given for the column (DESIGN.md §33; NULL where none is recorded
 `narrow_containers`, the column's NARROW containers (DESIGN.md §38).  `slack_bytes` and
 `inline_slack_bytes` are the growth slack inserts leave inside items and inside INLINE entry
 payloads (DESIGN.md §4), which is space a later insert into the same key grows into for free; a
-bulk-built index has none of either.  The counters that describe the
+bulk-built index has none of either unless it was built with `build_slack`.  The counters that describe the
 relation rather than a column - the directory's shape, free and deleted pages - are repeated on
 every row.
 
@@ -324,6 +344,10 @@ working around a bad choice:
   at each range of 64 heap blocks, which value of each column every row has (DESIGN.md §34): three
   or more columns, and two where that is cheaper than the nested loop over their entries. Off, a
   `GROUP BY` of three or more columns goes to the ordinary plan and one of two to the nested loop.
+- `pg_lion.enable_count_residual`: let the count pushdown take a `WHERE` clause no Lion index
+  answers - `payload LIKE 'ab%'`, `id > 1000`, `length(s) = 64` - beside ones that do, testing it on
+  the heap row of each row the others select (DESIGN.md §10, "Residual clauses"). Off, such a count
+  goes to the ordinary plan.
 - `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot

@@ -410,7 +410,7 @@ lion_emit_entry(Relation index, Buffer entrybuf,
 	char	   *payload = NULL;
 	Size		paylen = 0;
 	BlockNumber blkno = InvalidBlockNumber;
-	uint32		hash = entry->hash;
+	uint32		hash = lion_entry_owner(entry);
 	int64		ntids;
 
 	if (entry->flags & LION_ENTRY_INLINE)
@@ -425,7 +425,7 @@ lion_emit_entry(Relation index, Buffer entrybuf,
 	else
 	{
 		Assert(entry->flags & LION_ENTRY_CHAIN);
-		blkno = entry->head;
+		blkno = lion_entry_head(entry);
 	}
 
 	UnlockReleaseBuffer(entrybuf);
@@ -857,7 +857,7 @@ lion_emit_all_keys_ext(Relation index, LionState *col, TIDBitmap *tbm,
 									 LION_ENTRY_PAYLOAD_LEN(entry, itemlen),
 									 tbm, recheck);
 		else
-			ntids += lion_emit_chain(index, entry->hash, entry->head,
+			ntids += lion_emit_chain(index, lion_entry_owner(entry), lion_entry_head(entry),
 									tbm, recheck);
 
 		CHECK_FOR_INTERRUPTS();
@@ -3150,7 +3150,7 @@ lion_source_walk_is_long(LionSource *src, LionState *col)
 	lion_walk_begin(&w, src->index, col, false, src->ranges, src->nranges,
 					false);
 	while (restarts <= limit && (entry = lion_walk_next(&w, &itemlen)) != NULL)
-		restarts += lion_source_restart_pages(src, (double) entry->ntids);
+		restarts += lion_source_restart_pages(src, (double) lion_entry_ntids(entry));
 	lion_walk_end(&w);
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextReset(src->entrycxt);
@@ -3539,8 +3539,8 @@ lion_source_entry_set(Relation index, LionEntryTuple *entry, Size itemlen,
 	ps->attno = entry->attno;
 	ps->found = true;
 	ps->pinbuf = InvalidBuffer;
-	ps->ntids = entry->ntids;
-	ps->ncontainers = entry->ncontainers;
+	ps->ntids = lion_entry_ntids(entry);
+	ps->ncontainers = lion_entry_ncontainers(entry);
 	ps->entryblk = InvalidBlockNumber;
 	ps->entryoff = InvalidOffsetNumber;
 	ps->keyisnull = LionEntryIsNullKey(entry);
@@ -3553,7 +3553,7 @@ lion_source_entry_set(Relation index, LionEntryTuple *entry, Size itemlen,
 		ps->paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemlen);
 	}
 	else
-		ps->head = entry->head;
+		ps->head = lion_entry_head(entry);
 }
 
 /* Let go of a LIST batch's sets: their pins, then their memory. */
@@ -4911,10 +4911,10 @@ lion_order_next_item(LionOrderWalk *w)
 			if (!w->chainstarted)
 			{
 				w->chainstarted = true;
-				if (!BlockNumberIsValid(entry->head))
+				if (!BlockNumberIsValid(lion_entry_head(entry)))
 					return false;
-				buf = lion_posting_search(w->index, NULL, entry->hash,
-										  entry->head, 0, BUFFER_LOCK_SHARE,
+				buf = lion_posting_search(w->index, NULL, lion_entry_owner(entry),
+										  lion_entry_head(entry), 0, BUFFER_LOCK_SHARE,
 										  false);
 				if (!BufferIsValid(buf))
 					return false;
@@ -4928,7 +4928,7 @@ lion_order_next_item(LionOrderWalk *w)
 				buf = ReadBuffer(w->index, w->postnext);
 				LockBuffer(buf, BUFFER_LOCK_SHARE);
 				page = BufferGetPage(buf);
-				if (!lion_page_owns_entry(page, entry->hash, entry->head) ||
+				if (!lion_page_owns_entry(page, lion_entry_owner(entry), lion_entry_head(entry)) ||
 					!LionPageIsPostingLeaf(page))
 				{
 					UnlockReleaseBuffer(buf);

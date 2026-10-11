@@ -108,6 +108,12 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 				if (cl->kind == LION_CLAUSE_ARRAY)
 					appendStringInfo(buf, "%s %s ANY (%s)", attname, opname,
 									 val);
+				else if (cl->kind == LION_CLAUSE_DISTINCT)
+					appendStringInfo(buf, "%s IS DISTINCT FROM %s", attname,
+									 val);
+				else if (cl->kind == LION_CLAUSE_NOTMULTI)
+					appendStringInfo(buf, "NOT (%s %s %s)", attname, opname,
+									 val);
 				else
 					appendStringInfo(buf, "%s %s %s", attname, opname, val);
 				pfree(opname);
@@ -161,7 +167,7 @@ static const char *
 lion_explain_clause_col(LionCountScanState *st, const LionClauseState *cl)
 {
 	return lion_explain_col(cl->idxoid, cl->attno,
-							cl->kind == LION_CLAUSE_MULTI, st->plan.vcols);
+							LION_CLAUSE_IS_MULTI(cl->kind), st->plan.vcols);
 }
 
 /* One arm of an OR, `len` leaves from leaf `at`: `((b = 2) AND (c = 3))`. */
@@ -442,7 +448,8 @@ lion_explain_group_index(LionCountScanState *st, List *ancestors,
 		 */
 		for (i = 0; i < st->nclause && !keys; i++)
 			keys = (st->clause[i].kind == LION_CLAUSE_NOTNULL &&
-					!st->inor[i] && st->clause[i].attno == st->driveattno);
+					!st->inor[i] && st->clause[i].attno == st->driveattno &&
+					st->plan.clause[i].filter == 0);
 		appendStringInfoString(buf, keys ? "(all keys)" : "(all rows)");
 	}
 
@@ -487,16 +494,20 @@ lion_explain_range_item(LionCountScanState *st, LionSourceItem *it,
 {
 	LionClauseState *first = &st->clause[it->clauseno];
 	bool		firstbound = true;
+	int			wfirst;
+	int			wn;
 	int			j;
 
-	for (j = 0; j < st->nclause; j++)
+	/* its own filter's bounds, or the WHERE's (DESIGN.md §10) */
+	lion_clause_window(st, it->clauseno, &wfirst, &wn);
+	for (j = wfirst; j < wfirst + wn; j++)
 	{
 		if (st->clause[j].kind == LION_CLAUSE_RANGESRC &&
 			!st->inor[j] && st->clause[j].attno == first->attno &&
 			!lion_explain_dropped_all(st, j))
 			break;
 	}
-	if (j == st->nclause)
+	if (j == wfirst + wn)
 		return;
 
 	if (buf->len > 0)
@@ -505,7 +516,7 @@ lion_explain_range_item(LionCountScanState *st, LionSourceItem *it,
 		appendStringInfo(buf, "%s%s ", get_rel_name(first->idxoid),
 						 lion_explain_clause_col(st, first));
 	appendStringInfoChar(buf, '(');
-	for (j = 0; j < st->nclause; j++)
+	for (j = wfirst; j < wfirst + wn; j++)
 	{
 		if (st->clause[j].kind != LION_CLAUSE_RANGESRC || st->inor[j] ||
 			st->clause[j].attno != first->attno ||
@@ -585,8 +596,25 @@ lion_explain_item(LionCountScanState *st, LionSourceItem *it,
 }
 
 /*
+ * The plan's WHERE items: its items, or beside filtered counts (DESIGN.md
+ * §10) run 0's, whichever run the node stands at.
+ */
+static LionSourceItem *
+lion_explain_where(LionCountScanState *st)
+{
+	return (st->nrun > 1) ? st->runitem[0] : st->planitem;
+}
+
+static int
+lion_explain_nwhere(LionCountScanState *st)
+{
+	return (st->nrun > 1) ? st->nrunitem[0] : st->nplanitem;
+}
+
+/*
  * The "Lion Indexes" line: the index whose entries drive the count, the
- * FK-side join's key and the plan's items, each with what it answers.
+ * FK-side join's key and the plan's items, each with what it answers; and a
+ * line of its own for each filtered count's.
  */
 static void
 lion_explain_indexes(LionCountScanState *st, List *ancestors,
@@ -594,6 +622,7 @@ lion_explain_indexes(LionCountScanState *st, List *ancestors,
 {
 	StringInfoData buf;
 	int			i;
+	int			r;
 
 	initStringInfo(&buf);
 
@@ -621,13 +650,30 @@ lion_explain_indexes(LionCountScanState *st, List *ancestors,
 	 * The plan's items (a partition's own may leave some out).  One that
 	 * every partition leaves out, because their bounds imply it, reads no
 	 * index at all, and is printed on a line of its own below (DESIGN.md §16,
-	 * "Clauses the partition bounds imply").
+	 * "Clauses the partition bounds imply").  Beside filtered counts they
+	 * are the WHERE's, run 0's.
 	 */
-	for (i = 0; i < st->nplanitem; i++)
-		lion_explain_item(st, &st->planitem[i], ancestors, es, &buf);
+	for (i = 0; i < lion_explain_nwhere(st); i++)
+		lion_explain_item(st, &lion_explain_where(st)[i], ancestors, es, &buf);
 
 	ExplainPropertyText("Lion Indexes", buf.data, es);
 	pfree(buf.data);
+
+	/*
+	 * ... and each filtered count (DESIGN.md §10, "Filtered counts"): the
+	 * items its filter adds to the WHERE's, which are its run's after them.
+	 */
+	for (r = 1; r < st->nrun; r++)
+	{
+		char		label[64];
+
+		initStringInfo(&buf);
+		for (i = st->nrunitem[0]; i < st->nrunitem[r]; i++)
+			lion_explain_item(st, &st->runitem[r][i], ancestors, es, &buf);
+		snprintf(label, sizeof(label), "Count Filter %d", r);
+		ExplainPropertyText(label, buf.data, es);
+		pfree(buf.data);
+	}
 }
 
 /*
@@ -648,9 +694,9 @@ lion_explain_bounds(LionCountScanState *st, List *ancestors, ExplainState *es)
 			appendStringInfoString(&buf, ", ");
 		appendStringInfoString(&buf, strVal(lfirst(lc)));
 	}
-	for (i = 0; i < st->nplanitem; i++)
+	for (i = 0; i < lion_explain_nwhere(st); i++)
 	{
-		LionSourceItem *it = &st->planitem[i];
+		LionSourceItem *it = &lion_explain_where(st)[i];
 		int			j;
 
 		if (it->orno < 0 && it->rangesrc)
@@ -677,9 +723,9 @@ lion_explain_bounds(LionCountScanState *st, List *ancestors, ExplainState *es)
 
 	/* ... and the arms of an OR a partition's bounds refute */
 	initStringInfo(&buf);
-	for (i = 0; i < st->nplanitem; i++)
+	for (i = 0; i < lion_explain_nwhere(st); i++)
 	{
-		LionSourceItem *it = &st->planitem[i];
+		LionSourceItem *it = &lion_explain_where(st)[i];
 
 		if (it->orno >= 0)
 			lion_explain_refuted(st, &st->ors[it->orno], ancestors, es,
@@ -1441,6 +1487,23 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		lion_explain_partitions(st, es);
 
 	lion_explain_indexes(st, ancestors, es);
+
+	/*
+	 * The residual clauses (DESIGN.md §10, "Residual clauses"), tested on the
+	 * heap row of each row the others select, as core prints a scan's Filter.
+	 */
+	if (st->residexprs != NIL)
+	{
+		List	   *context = set_deparse_context_plan(es->deparse_cxt,
+													   st->css.ss.ps.plan,
+													   ancestors);
+
+		ExplainPropertyText("Residual Filter",
+							deparse_expression((Node *)
+											   make_ands_explicit(st->residexprs),
+											   context, false, false),
+							es);
+	}
 
 	/*
 	 * The clauses partitions leave out because their bounds imply them

@@ -22,7 +22,7 @@ CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_
 # share the private header src/lion_funcs.h.
 FUNCS_OBJS = src/lion_funcs.o src/lion_verify.o src/lion_verify_dir.o src/lion_verify_heap.o \
        src/lion_verify_summary.o
-OBJS = src/lion_container.o src/lion_sparse.o src/lion_positions.o src/lion_wal.o $(PAGES_OBJS) src/lion_dir.o src/lion_posting.o src/lion_postree.o src/lion_posbuild.o src/lion_posfilter.o src/lion_bm25.o src/lion_bm25_scan.o src/lion_reader.o \
+OBJS = src/lion_container.o src/lion_sparse.o src/lion_positions.o src/lion_wal.o src/lion_waldelta.o $(PAGES_OBJS) src/lion_dir.o src/lion_posting.o src/lion_postree.o src/lion_posbuild.o src/lion_posfilter.o src/lion_bm25.o src/lion_bm25_scan.o src/lion_reader.o \
        src/lion_am.o src/lion_amcost.o src/lion_build.o src/lion_spool.o src/lion_scan.o \
        src/lion_insert.o src/lion_vacuum.o $(FUNCS_OBJS) $(COUNT_OBJS) $(CUSTOMSCAN_OBJS) \
        src/lion_multikey.o src/lion_jsonb.o src/lion_fkjoin.o src/lion_ordered.o src/lion_selfuncs.o \
@@ -52,6 +52,7 @@ ifeq ($(LION_NO_SIMD),1)
 PG_CFLAGS += -DLION_NO_SIMD
 endif
 EXTRA_CLEAN = test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
+              test/unit/waldelta_test test/unit/entry_test \
               test/results test/isolation/results
 
 PG_CONFIG ?= $(if $(wildcard .local/pg/bin/pg_config),.local/pg/bin/pg_config,pg_config)
@@ -96,7 +97,8 @@ UNIT_LDFLAGS = -L$(shell $(PG_CONFIG) --pkglibdir) -L$(shell $(PG_CONFIG) --libd
 ifeq ($(SANITIZE),1)
 UNIT_CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
 UNIT_LDFLAGS += -fsanitize=address,undefined
-test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test: .lion-force-unit
+test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
+    test/unit/waldelta_test test/unit/entry_test: .lion-force-unit
 .PHONY: .lion-force-unit
 endif
 
@@ -121,12 +123,23 @@ test/unit/positions_test: test/unit/positions_test.c src/lion_positions.c \
                           src/lion_positions.h src/lion_container.h src/lion_tid.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/positions_test.c src/lion_positions.c $(UNIT_LDFLAGS)
 
+# The WAL's item encoding (DESIGN.md §25, LION_OP_DELTA and LION_OP_SPLICE):
+# what the writer logs and what the redo rebuilds from it, round-tripped.
+test/unit/waldelta_test: test/unit/waldelta_test.c src/lion_waldelta.c src/lion_waldelta.h
+	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/waldelta_test.c src/lion_waldelta.c $(UNIT_LDFLAGS)
+
+test/unit/entry_test: test/unit/entry_test.c src/lion_entryfmt.h
+	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/entry_test.c $(UNIT_LDFLAGS)
+
 .PHONY: unit
-unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test
+unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
+      test/unit/waldelta_test test/unit/entry_test
 	./test/unit/container_test
 	./test/unit/container_test_nosimd
 	./test/unit/sparse_test
 	./test/unit/positions_test
+	./test/unit/waldelta_test
+	./test/unit/entry_test
 
 # header deps (the PostgreSQL build we compile against was not configured with --enable-depend)
 # (every header lion.h includes, and each of the others' includers; a missing
@@ -143,6 +156,7 @@ src/lion_plan_private.o src/lion_exec_begin.o src/lion_plan_hooks.o \
           src/lion_plan_fkjoin.o: src/lion_plan_private.h
 $(FUNCS_OBJS): src/lion_funcs.h
 src/lion_build.o src/lion_spool.o: src/lion_spool.h
+src/lion_wal.o src/lion_waldelta.o: src/lion_waldelta.h
 
 # Crash-recovery and hot-standby tests (test/recovery/README.md).  These need a
 # whole PostgreSQL *installation* to initdb their own private clusters into,

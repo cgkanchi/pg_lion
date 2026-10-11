@@ -976,7 +976,7 @@ SELECT entries FROM lion_index_stats('lion_dup_v');
 (1 row)
 
 SELECT lion_index_verify('lion_dup_v');
-ERROR:  lion index "lion_dup_v": item 99 of directory page 5 does not sort after the one before it
+ERROR:  lion index "lion_dup_v": item 55 of directory page 4 does not sort after the one before it
 DROP TABLE lion_dup;
 DROP OPERATOR CLASS lion_dup_ops USING lion;
 DROP OPERATOR ##= (text, text);
@@ -1486,20 +1486,29 @@ DROP FUNCTION lion_bpx_eq_text(bpchar, text);
 -- 19. A long key whose posting set is just under inline_limit.
 --
 -- An entry is its header, its key and its INLINE payload, and must fit in
--- LION_MAX_ENTRY_SIZE.  With a ~2000-byte key, a payload inside inline_limit
+-- LION_MAX_ENTRY_SIZE.  With a 2000-byte key, a payload inside inline_limit
 -- does not always fit next to it: the insert path spilled such a set onto a
 -- container page, but ambuild kept it INLINE and then failed to make the
 -- entry.  Any role that could INSERT could so make REINDEX, VACUUM FULL,
--- CLUSTER and a restore of the index fail for good.  3900 rows of one
--- 1990-byte key produced a 4060-byte payload and a 6092-byte entry.
+-- CLUSTER and a restore of the index fail for good.  The key below is the
+-- largest a text key can be, and rows of it go in one at a time until the
+-- insert path spills the set, which happens a few bytes short of
+-- inline_limit.
 -- ---------------------------------------------------------------------
 CREATE TABLE lion_bigset (id int NOT NULL, g int NOT NULL, k text NOT NULL);
 CREATE INDEX lion_bigset_k ON lion_bigset USING lion (k);
 CREATE INDEX lion_bigset_gk ON lion_bigset USING lion (g, k);
-INSERT INTO lion_bigset SELECT i, 0, repeat('y', 1990)
-	FROM generate_series(1, 3900) i;
+INSERT INTO lion_bigset SELECT i, 0, repeat('y', 1996)
+	FROM generate_series(1, 3800) i;
+DO $$
+BEGIN
+	FOR n IN 3801 .. 4400 LOOP
+		INSERT INTO lion_bigset VALUES (n, 0, repeat('y', 1996));
+		EXIT WHEN lion_index_posting_root('lion_bigset_k', repeat('y', 1996)) IS NOT NULL;
+	END LOOP;
+END $$;
 -- the inserts spilled it ...
-SELECT lion_index_posting_root('lion_bigset_k', repeat('y', 1990)) IS NOT NULL
+SELECT lion_index_posting_root('lion_bigset_k', repeat('y', 1996)) IS NOT NULL
 	AS spilled_by_insert;
  spilled_by_insert 
 -------------------
@@ -1514,7 +1523,7 @@ SELECT lion_index_verify('lion_bigset_k', true);
  
 (1 row)
 
-SELECT lion_index_posting_root('lion_bigset_k', repeat('y', 1990)) IS NOT NULL
+SELECT lion_index_posting_root('lion_bigset_k', repeat('y', 1996)) IS NOT NULL
 	AS spilled_by_build;
  spilled_by_build 
 ------------------
@@ -1541,16 +1550,17 @@ SELECT lion_index_verify('lion_bigset_gk', true);
  
 (1 row)
 
-SELECT lion_index_count('lion_bigset_k', repeat('y', 1990)) AS n;
-  n   
-------
- 3900
+SELECT lion_index_count('lion_bigset_k', repeat('y', 1996)) = count(*) AS n_exact
+  FROM lion_bigset;
+ n_exact 
+---------
+ t
 (1 row)
 
 -- the sizes around the one above, each built from scratch
 DO $$
 BEGIN
-	FOR n IN 3850 .. 3950 BY 2 LOOP
+	FOR n IN 3800 .. 4000 BY 2 LOOP
 		EXECUTE format('CREATE INDEX lion_bigset_p ON lion_bigset USING lion (k) WHERE id <= %s', n);
 		PERFORM lion_index_verify('lion_bigset_p', true);
 		DROP INDEX lion_bigset_p;

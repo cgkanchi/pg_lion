@@ -387,6 +387,16 @@ lion_gsets_rollups(PlannerInfo *root, List *tlist, double inrows)
  * GROUP BY of groupclause, for which the query has that GROUP BY, no grouping
  * sets, no LIMIT - which is the query's, and which the top k (§36) would cut
  * the finer grouping to - and tlist, the target list below the grouping.
+ *
+ * What that count takes of the WHERE is its own: a complement OR (§35) and a
+ * residual clause (§10, "Residual clauses") are taken or declined as for any
+ * plain GROUP BY of those columns, and its rows are the WHERE's rows either
+ * way.  It makes no filtered count (§10, "Filtered counts"): tlist's
+ * aggregates are counts alone, and a FILTER of the query's is the grouping
+ * Agg's, over the finer groups, when it reads grouping columns only
+ * (lion_gsets_mutator(); the finer grain of a count(DISTINCT) groups by the
+ * columns its FILTER reads as well).  countcombos.sql compares each with the
+ * sequential plan.
  */
 static void
 lion_gsets_count_finer(PlannerInfo *root, RelOptInfo *input_rel,

@@ -76,6 +76,14 @@ node's counts"):
   count of that column: counted as `count(*) ... AND col IS NOT NULL`.
 - `col NOT IN (a, b, ...)` (or `col <> ALL (...)`) of a literal list without NULLs, counted as
   `col <> a AND col <> b ...`.
+- filtered and conditional counts: `count(*) FILTER (WHERE c)`, `count(CASE WHEN c THEN 1 END)`,
+  `sum(CASE WHEN c THEN 1 ELSE 0 END)` and `sum(CASE WHEN c THEN 1 END)`, where `c` is a condition
+  the `WHERE` could have (`SELECT count(*) FILTER (WHERE event_type = 'purchase'), count(*) FROM
+  events WHERE country = 'Japan'`): each condition is one more count of the `WHERE` with `c`
+  added (`Count Filter 1: ...` in EXPLAIN), and each form gives the answer it gives over a table
+  scan, NULL included. With a `GROUP BY` the counts come out as partial rows a `Finalize
+  HashAggregate` adds up. A condition no Lion index answers leaves the whole query to the ordinary
+  plan (DESIGN.md §10, "Filtered counts").
 - window functions over the counts, such as a share of the total, `g, round(100.0 * count(*) /
   sum(count(*)) OVER (), 2) ... GROUP BY g`: the counts are pushed down and the window runs above
   them.
@@ -96,6 +104,27 @@ node's counts"):
   aggregate counts each group's distinct values over those combinations (DESIGN.md §10,
   "DISTINCT aggregates over a finer grouping"). On 5M rows, two grouping columns of 20 and 2
   values and a distinct column of 200 took 92 ms where the ordinary plan took 3.3 s.
+
+Clauses that exclude rows are counted by subtracting what they reject: `col <> v`, `col IS NOT
+NULL`, `col IS DISTINCT FROM v` (which, unlike `<>`, keeps the rows where `col` is NULL), and `NOT
+(tags @> '{x}')` or `NOT (doc @@ 'a & b')` of a literal multi-key query (which drops the NULL
+arrays or documents, as the query does). With nothing else in the `WHERE`, the count of every row
+is taken from one of the table's Lion columns (`(all rows)` in EXPLAIN). They may also stand alone
+in an arm of an `OR` - `n <> 17 OR n IS NULL`, `status = 'open' OR region <> 'eu'` - which is
+counted as two counts by De Morgan's rule (DESIGN.md §35, "Complements in an OR"); an arm that
+mixes them with an equality, such as `(a = 1 AND n <> 3) OR ...`, is left to the ordinary plan, as
+is a `NOT` of a query whose index sets only bound its rows (an empty array, a NULL element, a
+phrase). On five million rows `count(*) WHERE n IS DISTINCT FROM 17` took 1.6 ms against 380 for
+the sequential scan.
+
+A `WHERE` clause no Lion index answers - `payload LIKE 'ab%'`, `id > 1000` on a column without
+one, `length(name) = 3` - no longer sends the count to the ordinary plan when the other clauses do
+select rows: the node counts those rows and tests the clause on each of them in the heap
+(`Residual Filter` in EXPLAIN; DESIGN.md §10, "Residual clauses"). It does the work of a bitmap
+heap scan over the same rows, so it is taken when the other clauses select at most half the table,
+and the planner compares its price with the ordinary plan's; a volatile function, a subquery, a
+partitioned table or a join's count keeps the ordinary plan. `pg_lion.enable_count_residual = off`
+turns it off.
 
 An expression index counts as a column of its expression (DESIGN.md §41). With `CREATE INDEX ON
 events USING lion ((payload->>'status'))`, `WHERE payload->>'status' = 'paid'`, `IN`, ranges,
