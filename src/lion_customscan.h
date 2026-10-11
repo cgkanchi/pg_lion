@@ -2989,6 +2989,8 @@ extern void lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 								RelOptInfo *output_rel,
 								GroupPathExtraData *extra,
 								const LionFkJoin *fj);
+extern void lion_try_distinct_path(PlannerInfo *root, RelOptInfo *input_rel,
+								   RelOptInfo *output_rel);
 
 /* lion_plan_hooks.c */
 extern Plan *lion_plan_join_agg_path(PlannerInfo *root, RelOptInfo *rel,

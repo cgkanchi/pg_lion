@@ -277,7 +277,10 @@ RESET plan_cache_mode;
 DEALLOCATE lion_ph;
 
 -- ---- shapes that must NOT push down ------------------------------------
--- count() of a column that neither the GROUP BY nor a WHERE clause constrains
+-- count() of a column that neither the GROUP BY nor a WHERE clause
+-- constrains, under a GROUP BY; without one it is pushed down as count(*)
+-- AND n IS NOT NULL (DESIGN.md §10, "Shapes rewritten to the node's counts")
+SELECT lion_pd('SELECT a, count(n) FROM lion_pdt WHERE a IN (3, 4) GROUP BY a');
 SELECT lion_pd('SELECT count(n) FROM lion_pdt WHERE a = 3');
 -- a HAVING that needs a subquery per group (a correlated SubPlan): the
 -- grouping stays with core, though the subquery's own count is ours
@@ -867,7 +870,9 @@ SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE (a = 17 AND id = 5) OR b = 3
  * result: the other arm selects rows it says nothing about.  So it makes no
  * count(col) answerable, which is what these two check - the first would come
  * out as count(*) and the second as 0 if an OR leaf were treated like a
- * top-level clause.
+ * top-level clause.  Both are answered as count(*) AND n IS NOT NULL
+ * (DESIGN.md §10, "Shapes rewritten to the node's counts"), which the
+ * comparison with the ordinary plan checks.
  */
 SELECT lion_pd('SELECT count(n) FROM lion_pdo WHERE n = 2 OR a = 17');
 SELECT lion_pd('SELECT count(n) FROM lion_pdo WHERE n IS NULL OR a = 17');
