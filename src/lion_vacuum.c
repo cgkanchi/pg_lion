@@ -318,7 +318,7 @@ typedef struct LionVacEntry
 	OffsetNumber off;
 	bool		ischain;
 	bool		maydelete;		/* its posting set was emptied by pass 1/2 */
-	uint32		hash;
+	uint32		owner;			/* lion_entry_owner(): its pages' stamp */
 	BlockNumber head;
 	uint16		attno;			/* its key column (DESIGN.md §24) */
 	int			kind;			/* LION_KIND_* */
@@ -914,10 +914,10 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 			if (entry->attno < 1 || entry->attno > ix->ncolumns)
 				continue;
 			/* a key with no row at all, whose entry VACUUM has not deleted */
-			if (lion_entry_kind(entry) == LION_KIND_VALUE && entry->ntids > 0)
+			if (lion_entry_kind(entry) == LION_KIND_VALUE && lion_entry_ntids(entry) > 0)
 				nvalues[entry->attno - 1]++;
 			if (entry->attno == rowcol && !LionEntryIsSummary(entry))
-				rows += entry->ntids;
+				rows += lion_entry_ntids(entry);
 		}
 
 		next = LionPageIsRightmost(page) ? InvalidBlockNumber :
@@ -1105,7 +1105,7 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, BlockNumber blkno,
 
 	if (removed == 0)
 	{
-		lion_vac_count(vs, entry, entry->ntids);
+		lion_vac_count(vs, entry, lion_entry_ntids(entry));
 		return false;
 	}
 
@@ -1126,8 +1126,8 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, BlockNumber blkno,
 	{
 		lion_vacuum_inline_positions(vs, blkno, off, entry, itemsz, ntids,
 									 inlinemax, res);
-		res->tuple->ncontainers = ncontainers;
-		res->tuple->ntids = ntids;
+		lion_entry_set_ncontainers(res->tuple, ncontainers);
+		lion_entry_set_ntids(res->tuple, ntids);
 		return true;
 	}
 
@@ -1149,8 +1149,8 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, BlockNumber blkno,
 		memcpy(res->tuple, entry, payoff);
 		if (res->paylen > 0)
 			memcpy(((char *) res->tuple) + payoff, res->payload, res->paylen);
-		res->tuple->ncontainers = ncontainers;
-		res->tuple->ntids = ntids;
+		lion_entry_set_ncontainers(res->tuple, ncontainers);
+		lion_entry_set_ntids(res->tuple, ntids);
 		return true;
 	}
 
@@ -1168,15 +1168,15 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, BlockNumber blkno,
 	{
 		res->tuple = lion_entry_rebuild(entry, res->payload, res->paylen,
 									   &res->writesz);
-		res->tuple->ncontainers = ncontainers;
-		res->tuple->ntids = ntids;
+		lion_entry_set_ncontainers(res->tuple, ncontainers);
+		lion_entry_set_ntids(res->tuple, ntids);
 		return true;
 	}
 
 	res->spill = true;
 	res->tuple = lion_entry_rebuild(entry, NULL, 0, &res->writesz);
-	res->tuple->ncontainers = ncontainers;
-	res->tuple->ntids = ntids;
+	lion_entry_set_ncontainers(res->tuple, ncontainers);
+	lion_entry_set_ntids(res->tuple, ntids);
 	return true;
 }
 
@@ -1207,7 +1207,7 @@ lion_vac_entry_matches(Page page, OffsetNumber off, const LionVacEntry *ent)
 	if (ent->ischain && (ent->kind == LION_KIND_SUMMARY ||
 						 ent->kind == LION_KIND_SUMLAST))
 		return LionEntryIsSummary(e) && (e->flags & LION_ENTRY_CHAIN) != 0 &&
-			e->head == ent->head;
+			lion_entry_head(e) == ent->head;
 
 	if (lion_entry_kind(e) != ent->kind || e->keylen != ent->keylen)
 		return false;
@@ -1260,7 +1260,7 @@ lion_vac_ref_relocate(LionVacState *vs, LionVacEntryRef *ref,
 {
 	LionSearchKey sk;
 	LionEntryTuple *probe;
-	Size		probesz = MAXALIGN(LION_ENTRY_HDRSZ + ent->keylen);
+	Size		probesz;
 	Buffer		buf;
 	OffsetNumber off;
 	LionRightWalk walk;
@@ -1329,13 +1329,19 @@ summary_gone:
 			 RelationGetRelationName(vs->index));
 	}
 
-	probe = (LionEntryTuple *) palloc0(probesz);
-	probe->hash = ent->hash;
-	probe->flags = (uint16) ((ent->kind == LION_KIND_NULL) ? LION_ENTRY_NULLKEY :
-							 (ent->kind == LION_KIND_EMPTY) ? LION_ENTRY_EMPTYKEY :
-							 0);
-	probe->keylen = ent->keylen;
-	probe->attno = ent->attno;
+	{
+		uint16		pflags = (uint16) ((ent->kind == LION_KIND_NULL) ? LION_ENTRY_NULLKEY :
+									   (ent->kind == LION_KIND_EMPTY) ? LION_ENTRY_EMPTYKEY :
+									   0);
+
+		/* the key where an entry of its column has it (lion_entryfmt.h) */
+		if (ent->attno >= 1 && ent->attno <= vs->ix->ncolumns)
+			pflags |= lion_key_layout_flags(lion_column(vs->ix,
+														(AttrNumber) ent->attno));
+		probesz = lion_entry_payoff_for(pflags, ent->keylen);
+		probe = (LionEntryTuple *) palloc0(MAXALIGN(probesz));
+		lion_entry_init(probe, pflags, ent->attno, ent->keylen);
+	}
 	if (ent->keylen > 0)
 		memcpy(LionEntryGetKey(probe), ent->keydata, ent->keylen);
 	lion_search_key_exact(vs->ix, &sk, probe);
@@ -1442,8 +1448,8 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		entry = lion_page_entry_fetch(vs->index, page, blk, off);
 		ent = &ents[nents++];
 		ent->off = off;
-		ent->hash = entry->hash;
-		ent->head = entry->head;
+		ent->owner = lion_entry_owner(entry);
+		ent->head = lion_entry_head(entry);
 		ent->maydelete = false;
 		ent->attno = entry->attno;
 		ent->kind = lion_entry_kind(entry);
@@ -1456,11 +1462,11 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 			ent->ischain = false;
 			if (lion_vacuum_inline_filter(vs, page, blk, off, &inl[ninl]))
 			{
-				ent->maydelete = (inl[ninl].tuple->ntids == 0);
+				ent->maydelete = (lion_entry_ntids(inl[ninl].tuple) == 0);
 				ninl++;
 			}
 			else
-				ent->maydelete = (entry->ntids == 0);
+				ent->maydelete = (lion_entry_ntids(entry) == 0);
 
 			/*
 			 * An INLINE entry that is not about to be deleted is finished
@@ -1479,8 +1485,8 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		else if ((entry->flags & LION_ENTRY_CHAIN) != 0)
 		{
 			ent->ischain = true;
-			if (!BlockNumberIsValid(entry->head) ||
-				!BlockNumberIsValid(entry->tail))
+			if (!BlockNumberIsValid(lion_entry_head(entry)) ||
+				!BlockNumberIsValid(lion_entry_tail(entry)))
 			{
 				UnlockReleaseBuffer(buf);
 				elog(ERROR, "lion index: chain entry %u on block %u has no container pages",
@@ -1575,29 +1581,28 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		 */
 		for (i = 0; i < ninl; i++)
 		{
+			LionEntryTuple *chain;
+			Size		chainsz;
+
 			if (!inl[i].spill)
 				continue;
 			lion_wal_removal_begin(buf);
-			if ((inl[i].tuple->flags & LION_ENTRY_POSITIONS) != 0)
-			{
-				/*
-				 * The spill writes the entry in CHAIN shape, and the tuple
-				 * may be the INLINE one the overwrite above had no room for:
-				 * its positions go with the chunk, not with the entry.
-				 */
-				Size		chainsz;
-				LionEntryTuple *chain = lion_entry_rebuild_pos(inl[i].tuple,
-															   NULL, 0, 0,
-															   NULL, 0,
-															   &chainsz);
 
+			/*
+			 * The spill writes the entry in CHAIN shape, with the CHAIN
+			 * header form, and the tuple may be the INLINE one the overwrite
+			 * above had no room for: its positions go with the chunk, not
+			 * with the entry.
+			 */
+			chain = lion_entry_chain_shape(inl[i].tuple, &chainsz);
+			if ((chain->flags & LION_ENTRY_POSITIONS) != 0)
 				lion_entry_spill_pos(vs->index, vs->heaprel, buf, inl[i].off,
 									 chain, inl[i].payload, inl[i].paylen,
 									 inl[i].poschunk);
-			}
 			else
 				lion_entry_spill(vs->index, vs->heaprel, buf, inl[i].off,
-								inl[i].tuple, inl[i].payload, inl[i].paylen);
+								chain, inl[i].payload, inl[i].paylen);
+			pfree(chain);
 			lion_wal_removal_end();
 			nspill++;
 			vs->prof.records++;
@@ -1704,7 +1709,7 @@ lion_vacuum_descend(LionVacState *vs, const LionVacEntry *ent)
 		 * free the one it is walking, so a page that no longer claims the set
 		 * is corruption rather than a race (as in lion_vacuum_filter_page()).
 		 */
-		if (!lion_page_owns_entry(page, ent->hash, ent->head))
+		if (!lion_page_owns_entry(page, ent->owner, ent->head))
 		{
 			UnlockReleaseBuffer(buf);
 			elog(ERROR, "lion index \"%s\": block %u is not a page of the posting set at %u",
@@ -1815,8 +1820,8 @@ lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 	/* Report what the entry holds now that every page has been visited. */
 	lion_vac_ref_lock(vs, &ref, ent, BUFFER_LOCK_SHARE);
 	entry = lion_page_entry(BufferGetPage(ref.buf), ref.off);
-	lion_vac_count(vs, entry, entry->ntids);
-	ent->maydelete = (entry->ntids == 0 && entry->ncontainers == 0);
+	lion_vac_count(vs, entry, lion_entry_ntids(entry));
+	ent->maydelete = (lion_entry_ntids(entry) == 0 && lion_entry_ncontainers(entry) == 0);
 	if ((entry->flags & LION_ENTRY_POSITIONS) != 0)
 		ent->posroot = lion_entry_posext(entry)->pos_root;
 	LockBuffer(ref.buf, BUFFER_LOCK_UNLOCK);
@@ -2365,7 +2370,7 @@ lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
 			continue;
 
 		entry = lion_page_entry(page, ref.off);
-		if (entry->ntids != 0 || entry->ncontainers != 0)
+		if (lion_entry_ntids(entry) != 0 || lion_entry_ncontainers(entry) != 0)
 			continue;
 
 		/*
@@ -2389,8 +2394,8 @@ lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
 
 		if ((entry->flags & LION_ENTRY_CHAIN) != 0)
 		{
-			heads[nfree] = entry->head;
-			hashes[nfree] = entry->hash;
+			heads[nfree] = lion_entry_head(entry);
+			hashes[nfree] = lion_entry_owner(entry);
 			nfree++;
 		}
 	}
@@ -3129,7 +3134,7 @@ lion_vacuum_filter_page(LionVacState *vs, Buffer buf, LionVacWork *w,
 	 * thing that frees a chain and it does not free the one it is walking, so
 	 * a mismatch here is corruption rather than a race.
 	 */
-	if (!lion_page_owns_entry(page, ent->hash, ent->head))
+	if (!lion_page_owns_entry(page, ent->owner, ent->head))
 		elog(ERROR, "lion index: block %u is not a container page of the chain at %u",
 			 blk, ent->head);
 
@@ -3218,13 +3223,13 @@ static void
 lion_vac_check_counts(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 					  const LionEntryTuple *e, uint64 ntids, uint32 ncontainers)
 {
-	if (unlikely(e->ntids < ntids || e->ncontainers < ncontainers))
+	if (unlikely(lion_entry_ntids(e) < ntids || lion_entry_ncontainers(e) < ncontainers))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lion index \"%s\": entry %u on block %u counts " UINT64_FORMAT " TIDs in %u containers, fewer than VACUUM removes (" UINT64_FORMAT " TIDs, %u containers)",
 						RelationGetRelationName(index), entryoff,
-						BufferGetBlockNumber(entrybuf), e->ntids,
-						e->ncontainers, ntids, ncontainers)));
+						BufferGetBlockNumber(entrybuf), lion_entry_ntids(e),
+						lion_entry_ncontainers(e), ntids, ncontainers)));
 }
 
 /*
@@ -3346,8 +3351,8 @@ lion_vacuum_apply_page(LionVacState *vs, LionVacEntryRef *ref, Buffer buf,
 	lion_page_update_minmax(p);
 	lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
 
-	ecopy->ntids -= removed;	/* checked above */
-	ecopy->ncontainers -= (uint32) w->ndel;
+	lion_entry_set_ntids(ecopy, lion_entry_ntids(ecopy) - removed);	/* checked above */
+	lion_entry_set_ncontainers(ecopy, lion_entry_ncontainers(ecopy) - (uint32) w->ndel);
 
 	if (!lion_replace_entry(index, xstate, entrybuf, entryoff, ecopy, esize))
 		elog(ERROR, "lion index: could not update entry %u on block %u",
@@ -3407,7 +3412,7 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 		LockBufferForCleanup(buf);
 		lion_vac_visit(vs, blk);
 		page = BufferGetPage(buf);
-		if (!lion_page_owns_entry(page, ent->hash, ent->head))
+		if (!lion_page_owns_entry(page, ent->owner, ent->head))
 		{
 			UnlockReleaseBuffer(buf);
 			elog(ERROR, "lion index: block %u is not a container page of the chain at %u",
@@ -3509,7 +3514,7 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 		{
 			lion_vac_check_counts(index, entrybuf, entryoff, ecopy, nremoved,
 								  vs->cbuf->cardinality == 0 ? 1 : 0);
-			ecopy->ntids -= nremoved;
+			lion_entry_set_ntids(ecopy, lion_entry_ntids(ecopy) - nremoved);
 
 			if (vs->cbuf->cardinality == 0)
 			{
@@ -3529,7 +3534,7 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 				lion_page_update_minmax(p);
 				lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
 
-				ecopy->ncontainers -= 1;	/* checked above */
+				lion_entry_set_ncontainers(ecopy, lion_entry_ncontainers(ecopy) - 1);	/* checked above */
 
 				if (!lion_replace_entry(index, xstate, entrybuf, entryoff,
 									   ecopy, esize))

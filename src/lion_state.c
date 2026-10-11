@@ -983,17 +983,16 @@ lion_hash_key(LionState *state, Datum key)
 }
 
 /*
- * Number of bytes needed to store key, with datumCopy semantics
- * (DESIGN.md section 4).
+ * Number of bytes needed to store key (DESIGN.md §21, "Entry tuples"): a
+ * by-value key at its type's width, a by-reference one with datumCopy
+ * semantics.
  */
 Size
 lion_key_datum_size(LionState *state, Datum key)
 {
 	Size		size;
 
-	if (state->typbyval)
-		size = sizeof(Datum);
-	else if (state->typlen > 0)
+	if (state->typlen > 0)
 		size = (Size) state->typlen;
 	else if (state->typlen == -1)
 	{
@@ -1025,7 +1024,7 @@ void
 lion_store_key(LionState *state, Datum key, char *dest)
 {
 	if (state->typbyval)
-		memcpy(dest, &key, sizeof(Datum));
+		lion_key_store_byval(dest, (uint64) key, state->typlen);
 	else if (state->typlen > 0)
 		memcpy(dest, DatumGetPointer(key), (Size) state->typlen);
 	else if (state->typlen == -1)
@@ -1054,12 +1053,7 @@ Datum
 lion_fetch_key(LionState *state, const char *src)
 {
 	if (state->typbyval)
-	{
-		Datum		d;
-
-		memcpy(&d, src, sizeof(Datum));
-		return d;
-	}
+		return (Datum) lion_key_fetch_byval(src, state->typlen);
 
 	return PointerGetDatum(src);
 }
@@ -1076,7 +1070,7 @@ lion_fetch_key(LionState *state, const char *src)
  * checked for exactly the form lion_store_key() gives it, which is also what
  * lion_index_verify() checks (lion_verify_keylen()):
  *
- *	by value		sizeof(Datum) bytes;
+ *	by value		typlen bytes: 1, 2, 4 or 8;
  *	fixed length	typlen bytes;
  *	varlena			a plain 4-byte header whose length is the key's -
  *					PG_DETOAST_DATUM() gives every stored key one, never a
@@ -1091,8 +1085,6 @@ lion_key_is_valid(LionState *state, const char *key, Size keylen)
 {
 	if (keylen == 0 || keylen > LION_MAX_KEY_SIZE)
 		return false;
-	if (state->typbyval)
-		return keylen == sizeof(Datum);
 	if (state->typlen > 0)
 		return keylen == (Size) state->typlen;
 	if (state->typlen == -1)

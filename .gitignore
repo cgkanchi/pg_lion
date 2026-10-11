@@ -12,6 +12,7 @@ log/
 test/unit/sparse_test
 test/unit/positions_test
 test/unit/waldelta_test
+test/unit/entry_test
 __pycache__/
 *.pyc
 .deps/

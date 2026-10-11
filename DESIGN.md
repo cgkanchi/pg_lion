@@ -324,7 +324,7 @@ All pages are standard PG pages (PageInit) with a special area:
         BlockNumber rightlink;     /* next page in this chain, or InvalidBlockNumber */
         uint32      minckey;       /* container pages: smallest ckey on page (0 if empty) */
         uint32      maxckey;       /* container pages: largest ckey on page (0 if empty) */
-        uint32      owner_hash;    /* container pages: hash of the entry that owns the chain (§18) */
+        uint32      owner_hash;    /* container pages: owner stamp of the entry that owns the chain (§18, §21) */
         BlockNumber owner_head;    /* container pages: head block of that chain (§18) */
         uint16      flags;         /* LION_PAGE_META | LION_PAGE_BUCKET | LION_PAGE_CONTAINER,
                                     * plus LION_PAGE_DELETED for a freed page (§18) */
@@ -332,8 +332,7 @@ All pages are standard PG pages (PageInit) with a special area:
     } LionPageOpaqueData;          /* 24 bytes */
 
 **Superseded in part by §24 (format version 6).** An entry tuple carries the KEY COLUMN it belongs
-to in a `uint16 attno` at offset 20, where the 32-byte header had four bytes of alignment padding, so
-the header and every item on every page stay exactly where they were. A `attno` of 0 belongs to the
+to in a `uint16 attno` of its header (§21, "Entry tuples"). An `attno` of 0 belongs to the
 minus-infinity downlink alone.
 
 Block 0: meta page. Payload struct `LionMetaPageData` { magic 0x52424931, version 6, offset_bits,
@@ -341,9 +340,9 @@ container_bits, nbuckets, inline_limit, unused padding to 64 bytes }. *(Version 
 with summary posting sets, which records them in `summary_cols` and `summary_tids`, two words that
 were reserved; an index without them is still version 6, byte for byte. Version 8, §38: an index
 with NARROW items, with or without summaries, which builds before it refuse. Version 9, §13: sparse
-segments of delta varints, which every index this build writes is and the only one it reads;
-whether there are summaries is `summary_cols`, and whether the build wrote a NARROW is the
-`LION_META_NARROW` bit of `order_flags`.)* Version 2 was the first that
+segments of delta varints. Version 10, §21: compact entry tuples, which every index this build
+writes is and the only one it reads; whether there are summaries is `summary_cols`, and whether the
+build wrote a NARROW is the `LION_META_NARROW` bit of `order_flags`.)* Version 2 was the first that
 indexes NULL keys (§14); version 3 (§18) added owner_hash/owner_head, which grows the special area
 from 16 to 24 bytes and therefore moves every item on every page. An index of an older version is
 structurally readable by nothing in this code, so opening one is an ERROR that asks for a REINDEX
@@ -352,8 +351,8 @@ rather than a wrong answer.
 **Superseded by §21 (format version 4).** Everything in the next two paragraphs - the bucket
 directory, `nbuckets`, `lion_bucket_of()` - is gone: the entry directory is a B-tree keyed by the
 index key, entry tuples live on its LEAVES (which keep the flag name LION_PAGE_BUCKET), and the meta
-page holds `root`/`height`/`dirpages` where it held `nbuckets`. What is unchanged is the entry tuple
-itself and everything below it, so the paragraphs are kept for the entry layout they describe.
+page holds `root`/`height`/`dirpages` where it held `nbuckets`. The entry tuple and everything below
+it are described below and in §21 ("Entry tuples").
 
 Blocks 1 .. nbuckets: bucket head pages. Bucket b for a key with 32-bit hash h is `h % nbuckets`
 (`lion_bucket_of()` in lion.h, the single place that mapping lives); its head page is block `1 + b`.
@@ -361,27 +360,19 @@ A bucket is a rightlink chain of bucket pages holding entry tuples. nbuckets is 
 ambuild sizes it from the bytes the entries need (§5), and the `buckets` reloption means an exact
 count.
 
-Entry tuple (an item on a bucket page):
+Entry tuple (an item on a directory leaf): a header - flags (LION_ENTRY_INLINE or
+LION_ENTRY_CHAIN, plus LION_ENTRY_NULLKEY for the NULL entry, §14), the key length, the key column,
+and the posting set's container and TID counts, with the head and tail of its container pages for a
+CHAIN entry - then the key, then for an INLINE entry its containers back to back in ascending ckey,
+their total bytes the item's size less the payload offset. §21 ("Entry tuples") gives the byte
+layout, which has a short header for INLINE entries and a longer one for CHAIN entries.
 
-    typedef struct LionEntryTuple
-    {
-        uint32      hash;
-        uint16      flags;          /* LION_ENTRY_INLINE or LION_ENTRY_CHAIN, plus
-                                     * LION_ENTRY_NULLKEY for the NULL entry (§14) */
-        uint16      keylen;         /* bytes of key data stored (0 for the NULL entry) */
-        BlockNumber head;           /* CHAIN: first container page; INLINE: InvalidBlockNumber */
-        BlockNumber tail;           /* CHAIN: last container page (append hint) */
-        uint32      ncontainers;    /* containers in this key's posting set */
-        uint64      ntids;          /* members in this key's posting set */
-        /* key data: keylen bytes, then MAXALIGN padding */
-        /* INLINE only: containers back to back, ascending ckey, total bytes = item size - offset */
-    } LionEntryTuple;                /* header is 32 bytes (LION_ENTRY_HDRSZ; ntids forces padding) */
-
-Key data is stored with datumCopy semantics: by-value types as a full `Datum` (8 bytes);
-fixed-length by-reference types as typlen bytes; varlena as a detoasted, 4-byte-header varlena;
-cstring as strlen+1 bytes. Keys larger than LION_MAX_KEY_SIZE = 2000 bytes are an ERROR.
-Entry lookup compares `hash`, then calls the opclass equality operator's function (strategy 1 of the
-opfamily, looked up once per relation and cached in `rd_amcache`) with the index collation.
+Key data is stored with datumCopy semantics, except that a by-value type is stored at its own width
+(`typlen` bytes); fixed-length by-reference types as typlen bytes; varlena as a detoasted,
+4-byte-header varlena; cstring as strlen+1 bytes. Keys larger than LION_MAX_KEY_SIZE = 2000 bytes
+are an ERROR. Entry lookup compares the key's hash, computed from the key and never stored, then
+calls the opclass equality operator's function (strategy 1 of the opfamily, looked up once per
+relation and cached in `rd_amcache`) with the index collation.
 
 INLINE entries hold their containers in the entry tuple while the payload is ≤ `inline_limit`
 bytes (reloption, default 4096 = LION_MAX_INLINE_LIMIT). When an insert would exceed that, the entry
@@ -3450,7 +3441,7 @@ column's reserved NULL entry directly.)* Insert: NULL → the null entry (create
 `amsearchnulls = true`; SK_SEARCHNULL returns the null entry's set; SK_SEARCHNOTNULL returns every
 other entry (a full walk of the index, correct but expensive; the cost model prices it as the whole
 index). Stats gain `null_tids`. verify checks there is at most one null entry, that it is in bucket
-0 with keylen 0 and hash 0, and that no entry carries unknown flag bits.
+0 with keylen 0, and that no entry carries unknown flag bits.
 
 Count pushdown as built. The second and third bullets deviate from the sketch this section started
 as, both to keep the buffer-pin budget of §9 bounded:
@@ -5548,7 +5539,7 @@ validate it:
 
     typedef struct LionPageOpaqueData {       /* version 3: 24 bytes */
         BlockNumber rightlink; uint32 minckey; uint32 maxckey;
-        uint32      owner_hash;   /* hash of the entry this chain belongs to (0 for reserved entries) */
+        uint32      owner_hash;   /* owner stamp of the entry this chain belongs to (§21; 0 but for a value entry) */
         BlockNumber owner_head;   /* head block of that chain, fixed for the life of the chain */
         uint16 flags; uint16 page_id; }
 
@@ -5931,7 +5922,7 @@ LION_PAGE_INCOMPLETE_SPLIT on a page whose split has not finished. The special a
 and a `leftlink` (24 → 32 bytes after MAXALIGN, which is why every item on every page moves and the
 version has to be bumped). Leaf pages hold LionEntryTuple items in key order, exactly as bucket
 pages did; internal pages hold downlink pivots, LionEntryTuple-shaped with LION_ENTRY_DOWNLINK and
-`head` = the child block, so the key helpers apply unchanged. Every non-rightmost page's FIRST item
+the child block in the header's last word, so the key helpers apply unchanged. Every non-rightmost page's FIRST item
 is its high key (LION_ENTRY_HIGHKEY, key only), and the leftmost page of every level begins with a
 LION_ENTRY_MINUSINF downlink that compares below everything. Reserved NULL and EMPTY entries sort
 first (NULL < EMPTY < value) via a kind prefix in the comparison, not in the stored key, so they
@@ -5939,7 +5930,8 @@ live on the leftmost leaf and are reached by the ordinary descent. Multi-key cla
 is the STORAGE type (§17), which is what is compared.
 
 **An entry tuple is capped at LION_MAX_ENTRY_SIZE**, which is the largest item a page can hold minus
-the largest pivot (`MAXALIGN(LION_ENTRY_HDRSZ + LION_MAX_KEY_SIZE) + sizeof(ItemIdData)`), because a
+the largest pivot (`LION_MAX_PIVOT_SIZE`, `MAXALIGN(DOUBLEALIGN(LION_ENTRY_SHORT_HDRSZ) +
+LION_MAX_KEY_SIZE) + sizeof(ItemIdData)`), because a
 leaf that holds ONE entry must still have room for the high key a split would give it. A payload
 that would exceed it spills onto container pages exactly as one that exceeds `inline_limit` does.
 *(Not in the first draft of this section, which did not notice that a 2000-byte key with a
@@ -5949,10 +5941,80 @@ posting set that INSERT had spilled but REINDEX, VACUUM FULL or a restore kept I
 write - 3900 rows of one 1990-byte key made a 6092-byte entry. Build and INSERT now take the bound
 from one function, lion_inline_max(); the 2026-09-23 review found it.)*
 
+### Entry tuples (format version 10)
+
+Every item of the directory - a leaf entry, a high key, a downlink - is a LionEntryTuple
+(`lion_entryfmt.h`, which needs nothing but `c.h` so that `test/unit/entry_test.c` checks it
+against the offsets given here). There are two header forms, chosen by the flags:
+
+    short header, 12 bytes: INLINE entries, high keys and downlinks
+        0   uint16  flags
+        2   uint16  keylen          bytes of key data (0 for a key-less entry)
+        4   uint16  attno           key column (§24); 0 on the minus-infinity downlink
+        6   uint16  ncontainers     INLINE: containers in the payload; 0 on a pivot
+        8   uint32  ntids / child   INLINE: TIDs in the payload; downlink: the child block;
+                                    high key: InvalidBlockNumber
+
+    CHAIN header, 28 bytes
+        0   uint16  flags
+        2   uint16  keylen
+        4   uint16  attno
+        6   uint16  zero
+        8   BlockNumber head        root of the posting tree (§22)
+        12  BlockNumber tail        its last leaf (the append hint)
+        16  uint64  ntids
+        24  uint32  ncontainers
+
+then the key, at the end of the header - or at the next 8-byte boundary with `LION_ENTRY_ALIGNKEY`
+- then, with `LION_ENTRY_POSITIONS`, the 8-byte positions extension (`LionEntryPosExt`: `pos_root`,
+`pos_len`, §17) at the next 4-byte boundary, then the INLINE payload, unaligned, to the end of the
+item. A CHAIN entry ends where its payload would begin, and its item length is exactly that
+(`lion_page_entry_fetch()` and verify() check it). An item is placed on a MAXALIGNed page offset,
+so the header's fields are aligned; nothing after them is padded beyond what is said here.
+`LionEntryHdrSize()`, `LionEntryKeyOffset()`, `LionEntryExtOffset()` and `LionEntryPayloadOffset()`
+compute the offsets from the flags and the key length, and the counts and links are read and
+written only through `lion_entry_ntids()`, `lion_entry_ncontainers()`, `lion_entry_head()`,
+`lion_entry_tail()` and their setters, since they live in different places in the two forms.
+
+So an INLINE entry of an `int4` key costs 16 bytes before its payload, of an `int8` key 20, and a
+CHAIN entry of an `int4` key is 32 bytes in all.
+
+**The key is stored at its type's width.** A by-value key is `typlen` bytes (1, 2, 4 or 8), written
+from the Datum's low bytes and read back as `fetch_att()` would, sign-extending 2- and 4-byte values;
+a by-reference key is as `lion_store_key()` describes (§4). A by-reference key of a type whose
+alignment is 'd' - `interval`, `timetz`, a composite or range of such - is placed at an 8-byte
+boundary, which the flag `LION_ENTRY_ALIGNKEY` records: the opclass functions read the key in place
+and may rely on the type's alignment. Every other key is at most 4-byte aligned, which the 12- and
+28-byte headers give, and a by-value key is read with `memcpy()`. The flag is a function of the
+column (`lion_key_layout_flags()`), every entry and pivot of a column carries it or none does, and
+verify() checks that; a pivot copies it from the entry it was made from.
+
+**The short form's counts are enough.** An INLINE payload is at most LION_MAX_ENTRY_SIZE bytes, so it
+holds fewer than 65536 containers of at least 8 bytes, and fewer than 2^32 TIDs since each holds at
+most 32768. Both are static assertions next to `lion_entry_set_ntids()`, which refuses a count that
+does not fit its field as corruption rather than truncating it. A CHAIN entry's counts are 64 and
+32 bits wide. Turning an INLINE entry into a CHAIN one (`lion_entry_chain_shape()`) rebuilds the
+header in the other form and moves the key and the extension with it.
+
+**No entry stores its hash.** The order of §21 has the hash as its fourth term, and it is a
+function of the key, so the comparison computes it from the stored key with the column's hash
+function when it needs it: when proc 4 ties, which in an ordered column is a run of equal keys and
+happens once or twice a descent; and at every step in an unordered column, where it stands in for
+the proc-4 call an ordered column makes. Reserved entries and summaries take 0 for it.
+The owner stamp of §18 on posting and position tree pages is `hash_bytes()` of the stored key
+bytes for a value entry and 0 for any other (`lion_owner_stamp()`), which needs no opclass and
+lets verify() and every reader check a page's owner from the entry in hand. Storing either would
+cost four bytes on every entry to save a hash function call that the ordered descent almost never
+makes.
+
+The format is version 10 (`LION_VERSION_V10`). An index of an older version is refused with the
+REINDEX hint: its entries would be read at the wrong offsets.
+
 ### The order
 
     KEY COLUMN (§24), then kind (MINF < NULL < EMPTY < VALUE), then proc 4 under the column's
-    collation, then the hash, then a bytewise comparison of the stored datum
+    collation, then the hash (computed from the key, "Entry tuples" above), then a bytewise
+    comparison of the stored datum
 
 The leading key-column term is §24's; a single-column index has one value for it and everything
 below reads as it was written. It comes FIRST so that each column's entries are one contiguous run:
@@ -6526,8 +6588,8 @@ A block number past the end is not caught here: it fails in `ReadBuffer()`. A da
 used to be let through as well, as "the same risk every index AM takes with its own keys", until
 two damaged bytes of a text key, `01 01` - the header of an INDIRECT TOAST pointer - had the first
 descent that compared against it detoast through whatever the page held, a SIGSEGV (2026-09-29
-review). A stored key has exactly one form, the one `lion_store_key()` writes: `sizeof(Datum)` bytes
-for a by-value type, `typlen` for a fixed-length one, a plain 4-byte varlena header whose length is
+review). A stored key has exactly one form, the one `lion_store_key()` writes: `typlen` bytes
+for a by-value type and for a fixed-length one, a plain 4-byte varlena header whose length is
 the key's (`PG_DETOAST_DATUM()` gives every stored key one), a cstring whose only NUL is its last
 byte, and at most `LION_MAX_KEY_SIZE` bytes in any case. So every key that comes off a page is
 checked for that form before any opclass function sees it (`lion_entry_key()`, `lion_check_key()`,
@@ -7113,7 +7175,7 @@ root push-down and the bulk build's second internal level, all three.
   resource manager. Posting pages keep no `leftlink`, which is what buys the fourth buffer for the
   entry leaf.
 - **`lion_chain_find_page()` is already the only place a ckey is turned into a block**, and its two
-  callers (`lion_insert_lock_chain_page()` and the verifier) pass the entry's `hash`/`head`/`tail`,
+  callers (`lion_insert_lock_chain_page()` and the verifier) pass the entry's owner stamp/`head`/`tail`,
   so replacing the walk with a descent changed one function.
 - **Container pages have a free `level` field** in the special area since §21 (the directory needed
   one and the special area grew to 32 bytes either way), so §22 needed no further format change to
@@ -7627,8 +7689,8 @@ inputs from one scan), one VACUUM pass, one relcache entry and one planner Index
 home for the count pushdown to find every column's posting sets without matching n indexes.
 
 **Directory.** The directory key is (column number, key): the directory comparator compares attno
-first, and every entry tuple carries its attno in a `uint16` at offset 20 of the header, where the
-32 bytes had four of alignment padding - so the header did not grow and no item on any page moved.
+first, and every entry tuple carries its attno in a `uint16` of its header (§21, "Entry
+tuples").
 Reserved NULL and EMPTY entries exist per column. The leading attno term is compared before any
 opclass function is called, which is what lets one descent walk past the entries of columns whose
 key type it knows nothing about; the minus-infinity downlink of an internal page carries attno 0 and
@@ -8314,8 +8376,8 @@ first run and nothing else would have. PageAddItemExtended() reserves
 MAXALIGN(size) bytes and copies `size` of them; the bytes in between keep
 whatever the page held there before. Core's own access methods do not care,
 because a core index tuple is MAXALIGNed by index_form_tuple() and there is no
-padding - but a lion entry tuple is MAXALIGN(header + key) plus a payload BYTE
-COUNT, and a container item's size comes out of its header, so both routinely
+padding - but a lion entry tuple is a header, a key and a payload BYTE COUNT,
+none of them padded to MAXALIGN, and a container item's size comes out of its header, so both routinely
 end on an odd boundary. On the primary the padding holds whatever the page held;
 on a standby the page may have arrived as a full-page image, whose HOLE is
 restored as ZEROES, and the two pages then differ in bytes no record ever
@@ -12526,8 +12588,12 @@ Why the copies may outlive the lock is §21's argument, applied per leaf instead
 - **An INLINE copy** is counted against the visibility map, so §9 wants the leaf it came from pinned
   from the copy until the count. The scan keeps that pin (`batchbuf`) while the batch holds an INLINE
   copy still to be handed out. Every INLINE set handed out takes a pin of its own, and the last one
-  takes the scan's. VACUUM's cleanup lock on that leaf therefore waits as it waited for the one set's
-  pin before, only for a batch's length. A batch of CHAIN copies pins nothing, which
+  takes the scan's - except in the sums over a range (`lion_sum_walk()` and the range taken as a
+  source), which take a whole batch, count it and release every set of it before the next leaf is
+  read: there the scan's one pin covers all of the batch's INLINE sets and is dropped at that read
+  (`lion_entry_scan_share_pin()`), because a few hundred pins of one buffer cost the resource owner
+  a search each when they are released. VACUUM's cleanup lock on that leaf therefore waits as it
+  waited for the one set's pin before, only for a batch's length. A batch of CHAIN copies pins nothing, which
   `vacuum_entry_delete.spec` relies on: it parks a walk and needs VACUUM to get through.
 
 **A walk that returns rows pauses.** A GROUP BY hands a row to the executor per group, and a cursor

@@ -505,7 +505,7 @@ lion_summary_shape(Relation index, LionState *col, LionSumShape *shape)
 				break;
 			}
 			shape->nsummaries += 1.0;
-			shape->rows += (double) e->ntids;
+			shape->rows += (double) lion_entry_ntids(e);
 		}
 		if (shape->complete || LionPageIsRightmost(page))
 		{
@@ -550,7 +550,7 @@ lion_value_leaf(Relation index, LionState *col, const char *raw)
  * a line pointer.  A batch is at most one leaf's worth (DESIGN.md §28).
  */
 #define LION_LEAF_MAX_ENTRIES \
-	((int) (BLCKSZ / (MAXALIGN(LION_ENTRY_HDRSZ) + sizeof(ItemIdData))) + 1)
+	((int) (BLCKSZ / (MAXALIGN(LION_ENTRY_SHORT_HDRSZ) + sizeof(ItemIdData))) + 1)
 
 /* Everything but where the walk starts. */
 static void
@@ -618,6 +618,7 @@ lion_entry_scan_init(LionEntryScan *es, Relation index, AttrNumber attno)
 	es->lastinline = -1;
 	es->batchblk = InvalidBlockNumber;
 	es->batchbuf = InvalidBuffer;
+	es->sharepin = false;
 	es->nleaves = 0;
 }
 
@@ -866,7 +867,7 @@ lion_entry_scan_plan_sum(LionEntryScan *es, Relation index, LionRange *range,
 		lion_scan_keycopy(es, ej, &es->clipmax, &es->clipmaxlen);
 		es->hassumprev = true;
 		lion_scan_keycopy(es, ej, &es->sumprev, &es->sumprevlen);
-		es->sumprevhash = ej->hash;
+		es->sumprevhash = lion_entry_hash(es->state, ej);
 		pfree(ej);
 		es->blkno = (part == LION_WALK_INSIDE) ?
 			lion_range_first_leaf(index, range) :
@@ -1058,7 +1059,7 @@ lion_entry_scan_remember(LionEntryScan *es, const LionEntryTuple *entry)
 {
 	MemoryContextReset(es->cxt);
 	es->lastkind = lion_entry_kind(entry);
-	es->lasthash = entry->hash;
+	es->lasthash = 0;			/* recomputed from the key (§21) */
 	es->lastkeylen = entry->keylen;
 	es->resumekind = -1;
 
@@ -1107,7 +1108,7 @@ lion_entry_scan_selects(LionEntryScan *es, const LionEntryTuple *entry,
 			return false;
 		}
 		lion_scan_keycopy(es, entry, &es->sumprev, &es->sumprevlen);
-		es->sumprevhash = entry->hash;
+		es->sumprevhash = lion_entry_hash(es->state, entry);
 		es->hassumprev = true;
 		return true;
 	}
@@ -1259,6 +1260,7 @@ lion_entry_scan_fill(LionEntryScan *es, bool copy)
 		sk.key = LION_KIND_HAS_KEY(es->lastkind) ?
 			lion_fetch_key(state, es->lastkey) : (Datum) 0;
 		sk.hash = es->lasthash;
+		sk.hashlazy = (es->lastkind == LION_KIND_VALUE);
 		sk.cmpproc = state->ordered ? &state->cmpproc : NULL;
 		sk.eqproc = &state->eqproc;
 		sk.collation = state->collation;
@@ -1335,7 +1337,7 @@ lion_entry_scan_fill(LionEntryScan *es, bool copy)
 		 * between the moment its last TID was filtered out and the moment the
 		 * leaf's final step removes it.
 		 */
-		if (entry->ntids == 0)
+		if (lion_entry_ntids(entry) == 0)
 			continue;
 
 		ntaken++;
@@ -1446,6 +1448,12 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 
 	while (es->nextbatch >= es->nbatch)
 	{
+		/* the sets of the batch before have all been released (see below) */
+		if (es->sharepin && BufferIsValid(es->batchbuf))
+		{
+			ReleaseBuffer(es->batchbuf);
+			es->batchbuf = InvalidBuffer;
+		}
 		/* a phase that has ended hands over at the next read (§32) */
 		if (es->done ||
 			(!BlockNumberIsValid(es->blkno) && es->nextphase == es->phase))
@@ -1483,7 +1491,9 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 		 * scan's pin over.
 		 */
 		Assert(BufferIsValid(es->batchbuf));
-		if (i == es->lastinline)
+		if (es->sharepin)
+			ps->pinbuf = InvalidBuffer; /* the scan's pin covers it */
+		else if (i == es->lastinline)
 		{
 			ps->pinbuf = es->batchbuf;
 			es->batchbuf = InvalidBuffer;
@@ -1496,6 +1506,23 @@ lion_entry_scan_next(LionEntryScan *es, Datum *key, LionPostingSet *ps)
 	}
 
 	return true;
+}
+
+/*
+ * For a caller that takes a whole batch - lion_entry_scan_next() until
+ * lion_entry_scan_batch_left() says 0 - and releases every set of it before
+ * it asks for the next entry: the sums of lion_exec_count.c.  The scan then
+ * keeps ONE pin on the leaf for all of the batch's INLINE copies, which is
+ * what DESIGN.md §9 asks of each, and drops it when it reads the next leaf,
+ * instead of handing each copy a pin of its own.  A leaf holds a few hundred
+ * entries, and as many pins of one buffer cost the resource owner a search
+ * each when they are let go of.
+ */
+void
+lion_entry_scan_share_pin(LionEntryScan *es)
+{
+	Assert(es->nextbatch == 0 && es->nbatch == 0);
+	es->sharepin = true;
 }
 
 /*

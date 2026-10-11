@@ -2922,9 +2922,9 @@ SELECT lion_pd('SELECT count(*) FROM lion_pd2 WHERE id = 77 AND c200 = 17 AND c2
 (1 row)
 
 SELECT lion_pd('SELECT count(*) FROM lion_pd2 WHERE c20k = 77 AND c200 = 17 AND c2 = 1');
-         lion_pd         
--------------------------
- not pushed down, 1 rows
+       lion_pd       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- ---- the early exit in the AND merge (§25) ------------------------------
