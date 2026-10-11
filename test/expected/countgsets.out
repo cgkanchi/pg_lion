@@ -1,7 +1,9 @@
 -- GROUP BY ROLLUP, CUBE and GROUPING SETS over one table (DESIGN.md §10,
 -- "Grouping sets"): the finest grouping counted by the LionCount node, and
 -- core's grouping sets Agg over its rows below a LionJoinAgg, with every
--- aggregate rewritten over the counts.  Each query is run with every other
+-- aggregate rewritten over the counts; and the same for a GROUP BY whose
+-- DISTINCT aggregates read columns outside it, counted with those columns
+-- added ("DISTINCT aggregates over a finer grouping").  Each query is run with every other
 -- scan disabled, so that a node that is built at all is the plan, and again
 -- as a sequential scan with the pushdown off; the two answers are compared as
 -- multisets in both directions.  The table has NULLs in the grouping columns,
@@ -13,7 +15,8 @@ RESET client_min_messages;
 -- VACUUM can only set all-visible once the commit record is on disk
 SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
-CREATE TABLE gs (id int, a int, b int NOT NULL, c int, s smallint, t text, u int)
+CREATE TABLE gs (id int, a int, b int NOT NULL, c int, s smallint, t text, u int,
+				 m numeric)
 	WITH (autovacuum_enabled = off);
 INSERT INTO gs SELECT i,
 	   CASE WHEN i % 13 = 0 THEN NULL ELSE i % 7 END,
@@ -21,13 +24,16 @@ INSERT INTO gs SELECT i,
 	   CASE WHEN i % 4 = 0 THEN NULL ELSE i % 3 END,
 	   (i % 9)::smallint,
 	   CASE WHEN i % 11 = 0 THEN NULL ELSE 'v' || (i % 6) END,
-	   i % 17
+	   i % 17,
+	   -- 1.0 and 1.00 are one value to numeric's equality, two to its output
+	   CASE i % 3 WHEN 0 THEN 1.0 WHEN 1 THEN 1.00 ELSE 2 END
   FROM generate_series(1, 20000) i;
 CREATE INDEX gs_a ON gs USING lion (a);
 CREATE INDEX gs_b ON gs USING lion (b);
 CREATE INDEX gs_c ON gs USING lion (c);
 CREATE INDEX gs_s ON gs USING lion (s);
 CREATE INDEX gs_t ON gs USING lion (t);
+CREATE INDEX gs_m ON gs USING lion (m);
 VACUUM (FREEZE, ANALYZE) gs;
 -- dead and updated rows the visibility map no longer covers
 DELETE FROM gs WHERE id % 97 = 0;
@@ -215,7 +221,9 @@ SELECT q, gs_q(q) FROM (VALUES
 	('SELECT a, count(*) FILTER (WHERE random() < 2) FROM gs GROUP BY ROLLUP (a, b)'),
 	('SELECT a + 1, count(*) FROM gs GROUP BY ROLLUP (a + 1)'),
 	('SELECT a, u, count(*) FROM gs GROUP BY ROLLUP (a, u)'),
-	('SELECT DISTINCT a, count(*) FROM gs GROUP BY ROLLUP (a, b)')
+	('SELECT DISTINCT a, count(*) FROM gs GROUP BY ROLLUP (a, b)'),
+	-- an expression of a column whose equal values print differently
+	('SELECT a, count(DISTINCT m::text) FROM gs GROUP BY ROLLUP (a, m)')
 ) v(q);
                                        q                                       |         gs_q          
 -------------------------------------------------------------------------------+-----------------------
@@ -228,7 +236,74 @@ SELECT q, gs_q(q) FROM (VALUES
  SELECT a + 1, count(*) FROM gs GROUP BY ROLLUP (a + 1)                        | not counted, 9 rows
  SELECT a, u, count(*) FROM gs GROUP BY ROLLUP (a, u)                          | not counted, 145 rows
  SELECT DISTINCT a, count(*) FROM gs GROUP BY ROLLUP (a, b)                    | not counted, 38 rows
-(9 rows)
+ SELECT a, count(DISTINCT m::text) FROM gs GROUP BY ROLLUP (a, m)              | not counted, 25 rows
+(10 rows)
+
+-- ---- DISTINCT aggregates over a finer grouping ----
+-- count(DISTINCT c) GROUP BY a, b: GROUP BY a, b, c counted, and the Agg
+-- reads its rows sorted by a, b and c
+SELECT gs_plan('SELECT a, b, count(DISTINCT c) FROM gs GROUP BY a, b');
+                               gs_plan                                
+----------------------------------------------------------------------
+ Custom Scan (LionJoinAgg)
+   ->  GroupAggregate
+         Group Key: a, b
+         ->  Sort
+               Sort Key: a, b, c
+               ->  Finalize HashAggregate
+                     Group Key: a, b, c
+                     ->  Custom Scan (LionCount)
+                           Lion Indexes: gs_c (c), gs_b (b), gs_a (a)
+                           Group Key: c, b, a
+                           Group Strategy: Decoded
+(11 rows)
+
+SELECT q, gs_q(q) FROM (VALUES
+	('SELECT a, b, count(DISTINCT c) FROM gs GROUP BY a, b'),
+	('SELECT a, b, count(*), count(DISTINCT c), count(c), sum(c), min(c) FROM gs GROUP BY a, b'),
+	('SELECT a, count(DISTINCT c), count(DISTINCT t) FROM gs GROUP BY a'),
+	('SELECT a, b, count(DISTINCT c) FROM gs WHERE s IN (1, 3, 4) GROUP BY a, b HAVING count(DISTINCT c) > 1'),
+	('SELECT a, b, string_agg(DISTINCT t, '','' ORDER BY t) FROM gs GROUP BY a, b'),
+	('SELECT b, count(DISTINCT c) FILTER (WHERE a > 2), count(DISTINCT c % 2) FROM gs GROUP BY b'),
+	('SELECT a, b, count(DISTINCT c) FROM gs GROUP BY a, b ORDER BY 3 DESC, 1, 2 LIMIT 5'),
+	('SELECT a, b, sum(DISTINCT s) FROM gs WHERE t IN (''v1'', ''v2'') GROUP BY a, b')
+) v(q);
+                                                   q                                                    |       gs_q       
+--------------------------------------------------------------------------------------------------------+------------------
+ SELECT a, b, count(DISTINCT c) FROM gs GROUP BY a, b                                                   | counted, 40 rows
+ SELECT a, b, count(*), count(DISTINCT c), count(c), sum(c), min(c) FROM gs GROUP BY a, b               | counted, 40 rows
+ SELECT a, count(DISTINCT c), count(DISTINCT t) FROM gs GROUP BY a                                      | counted, 8 rows
+ SELECT a, b, count(DISTINCT c) FROM gs WHERE s IN (1, 3, 4) GROUP BY a, b HAVING count(DISTINCT c) > 1 | counted, 40 rows
+ SELECT a, b, string_agg(DISTINCT t, ',' ORDER BY t) FROM gs GROUP BY a, b                              | counted, 40 rows
+ SELECT b, count(DISTINCT c) FILTER (WHERE a > 2), count(DISTINCT c % 2) FROM gs GROUP BY b             | counted, 5 rows
+ SELECT a, b, count(DISTINCT c) FROM gs GROUP BY a, b ORDER BY 3 DESC, 1, 2 LIMIT 5                     | counted, 5 rows
+ SELECT a, b, sum(DISTINCT s) FROM gs WHERE t IN ('v1', 'v2') GROUP BY a, b                             | counted, 40 rows
+(8 rows)
+
+-- without the presorted DISTINCT the Agg sorts each group's values itself
+SET enable_presorted_aggregate = off;
+SELECT gs_q('SELECT a, b, count(DISTINCT c), string_agg(DISTINCT t, '','' ORDER BY t) FROM gs GROUP BY a, b');
+       gs_q       
+------------------
+ counted, 40 rows
+(1 row)
+
+RESET enable_presorted_aggregate;
+-- declined: a column without a lion index, an aggregate the counts do not
+-- answer, an expression of a column whose equal values print differently
+SELECT q, gs_q(q) FROM (VALUES
+	('SELECT a, b, count(DISTINCT u) FROM gs GROUP BY a, b'),
+	('SELECT a, b, count(DISTINCT c), avg(c) FROM gs GROUP BY a, b'),
+	('SELECT a, b, count(DISTINCT c), max(u) FROM gs GROUP BY a, b'),
+	('SELECT a, b, count(DISTINCT m::text) FROM gs GROUP BY a, b')
+) v(q);
+                              q                               |         gs_q         
+--------------------------------------------------------------+----------------------
+ SELECT a, b, count(DISTINCT u) FROM gs GROUP BY a, b         | not counted, 40 rows
+ SELECT a, b, count(DISTINCT c), avg(c) FROM gs GROUP BY a, b | not counted, 40 rows
+ SELECT a, b, count(DISTINCT c), max(u) FROM gs GROUP BY a, b | not counted, 40 rows
+ SELECT a, b, count(DISTINCT m::text) FROM gs GROUP BY a, b   | not counted, 40 rows
+(4 rows)
 
 -- ---- the finest grouping of a partitioned table, below a Finalize Agg ----
 CREATE TABLE gsp (id int, a int, b int) PARTITION BY RANGE (id);

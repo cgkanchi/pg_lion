@@ -3032,6 +3032,10 @@ extern void lion_try_distinct_path(PlannerInfo *root, RelOptInfo *input_rel,
 extern void lion_try_gsets_path(PlannerInfo *root, RelOptInfo *input_rel,
 								RelOptInfo *output_rel,
 								GroupPathExtraData *extra);
+extern void lion_try_distinct_agg_path(PlannerInfo *root,
+									   RelOptInfo *input_rel,
+									   RelOptInfo *output_rel,
+									   GroupPathExtraData *extra);
 
 /* lion_plan_hooks.c */
 extern Plan *lion_plan_join_agg_path(PlannerInfo *root, RelOptInfo *rel,

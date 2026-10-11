@@ -337,7 +337,9 @@ DROP TABLE lion_dtm;
 -- a column with no lion index, and a column that is not the only DISTINCT
 SELECT lion_dc('SELECT count(DISTINCT u) FROM lion_dt WHERE a = 3');
 SELECT lion_dc('SELECT count(DISTINCT k), count(DISTINCT t) FROM lion_dt');
--- DISTINCT on the grouping column, and two grouping columns
+-- DISTINCT on the grouping column, and two grouping columns, which are
+-- counted as GROUP BY g, a, k instead (DESIGN.md §10, "DISTINCT aggregates
+-- over a finer grouping")
 SELECT lion_dc('SELECT k, count(DISTINCT k) FROM lion_dt GROUP BY k');
 SELECT lion_dc('SELECT g, a, count(DISTINCT k) FROM lion_dt GROUP BY g, a');
 -- not a plain column, a FILTER, another aggregate, a count(col) we cannot answer
@@ -396,7 +398,8 @@ SELECT lion_dc('SELECT b, count(DISTINCT tags) FROM lion_dta GROUP BY b');
 SELECT lion_dc('SELECT count(DISTINCT b) FROM lion_dta WHERE tags @> ''{3}''');
 DROP TABLE lion_dta;
 
--- a partitioned table: distinct counts do not add up across partitions
+-- a partitioned table: distinct counts do not add up across partitions, but
+-- with a GROUP BY the counts of GROUP BY a, k do, and are counted so
 CREATE TABLE lion_dtp (id int, k int, a int) PARTITION BY RANGE (id);
 CREATE TABLE lion_dtp1 PARTITION OF lion_dtp FOR VALUES FROM (0) TO (1000);
 CREATE TABLE lion_dtp2 PARTITION OF lion_dtp FOR VALUES FROM (1000) TO (2000);
@@ -417,7 +420,10 @@ DROP TABLE lion_dtp;
  * 50 existence tests against a scan and a sort of every row (0.7 ms against
  * 18 ms on the assert build).  Per group, the (g, k) pairs are what is
  * charged: 8 x 50 of them win (5.4 ms against 52), while 200 x 50 lose (58 ms
- * against 38) and 2000 x 1000 lose by two orders of magnitude.
+ * against 38) and 2000 x 1000 lose by two orders of magnitude.  200 x 50 is
+ * then counted as GROUP BY g200, k50 (DESIGN.md §10, "DISTINCT aggregates
+ * over a finer grouping"), 2.2 ms against 19 on a release build; 2000 x 1000
+ * stays core's.
  */
 CREATE TABLE lion_dtc (
 	id		int		NOT NULL,

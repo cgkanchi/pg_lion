@@ -87,6 +87,12 @@ node's counts"):
   with `FILTER` clauses over the grouping columns; any other aggregate leaves the query to the
   ordinary plan. On 5M rows a `ROLLUP` of two columns of 20 and 2 values took 46 ms where the
   ordinary plan took 885 ms.
+- `count(DISTINCT col)` (or another `DISTINCT` aggregate of indexed columns) beside a `GROUP BY`
+  of two or more columns, `SELECT country, device, count(DISTINCT event_type) ... GROUP BY
+  country, device`: the node counts the `GROUP BY` with `event_type` added, and PostgreSQL's
+  aggregate counts each group's distinct values over those combinations (DESIGN.md §10,
+  "DISTINCT aggregates over a finer grouping"). On 5M rows, two grouping columns of 20 and 2
+  values and a distinct column of 200 took 92 ms where the ordinary plan took 3.3 s.
 
 An expression index counts as a column of its expression (DESIGN.md §41). With `CREATE INDEX ON
 events USING lion ((payload->>'status'))`, `WHERE payload->>'status' = 'paid'`, `IN`, ranges,
