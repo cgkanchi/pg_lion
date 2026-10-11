@@ -1090,6 +1090,7 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	AggStrategy aggstrategy;
 	AggClauseCosts agg_costs;
 	LionUnits	units;
+	double		reads;
 
 	/*
 	 * What a child row takes of a batch looked up in key order: its columns
@@ -1106,13 +1107,15 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	 * join's keys, are its own price, in the units of the cheapest core path
 	 * of the grouped rel (DESIGN.md §39); the child is core's, priced by core.
 	 */
-	lion_units_for(output_rel, &units);
+	lion_units_for(root, output_rel, &units);
 	run = lion_cost_fkjoin_path(root, rel, targets, fj->fkvar, joinclause,
 								whereclauses, wherekinds, ors, childrows,
 								childfound,
 								jointype != LION_JOIN_INNER ||
 								(emitrows && !counts),
-								rowbytes, workers, &collect, &walk, false);
+								rowbytes, workers, &collect, &walk, false,
+								&reads);
+	lion_units_cold(&units, run, reads);
 	if (unique)
 		sortcost = lion_fkjoin_sort_cost(child->rows,
 										 child->pathtarget->width);
@@ -2135,6 +2138,7 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 	Cost		run;
 	Cost		startrun;
 	LionUnits	units;
+	double		reads;
 	ListCell   *lc;
 
 	/*
@@ -2200,14 +2204,17 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 
 	/*
 	 * Priced in the units of the cheapest of core's joins the join rel has
-	 * (DESIGN.md §39): the node's own work over the fact side, `run` and
-	 * `startrun`; the child and the rows it emits are core's prices.
+	 * (DESIGN.md §39), with a nested loop's cold reads against the node's
+	 * own (lion_units_cold()), from the serial run's, for the parallel paths
+	 * too: the node's own work over the fact side, `run` and `startrun`; the
+	 * child and the rows it emits are core's prices.
 	 */
-	lion_units_for(joinrel, &units);
+	lion_units_for(root, joinrel, &units);
 	run = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar,
 								setup.joinclause, setup.whereclauses,
 								setup.wherekinds, ors, dimrows, dimrows, true,
-								rowbytes, 0, &collect, &walk, false);
+								rowbytes, 0, &collect, &walk, false, &reads);
+	lion_units_cold(&units, run, reads);
 
 	/*
 	 * The first batch, which is all tested before a row goes up (the startup
@@ -2224,7 +2231,7 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 									 setup.joinclause, setup.whereclauses,
 									 setup.wherekinds, ors, firstrows,
 									 firstrows, true, rowbytes, 0, &collect,
-									 &walk, true);
+									 &walk, true, NULL);
 	run = lion_units_price(&units, run);
 	startrun = lion_units_price(&units, startrun);
 	foreach(lc, outerrel->pathlist)
@@ -2272,7 +2279,7 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 										setup.joinclause, setup.whereclauses,
 										setup.wherekinds, ors, childrows,
 										childrows, true, rowbytes, workers,
-										&collect, &walk, false);
+										&collect, &walk, false, NULL);
 			/* a participant's first batch, of its share of the child */
 			firstrows = (walk || partitioned) ? Min(perbatch, childrows) : 1.0;
 			startrun = lion_cost_fkjoin_path(root, rel, setup.targets,
@@ -2280,7 +2287,8 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 											 setup.whereclauses,
 											 setup.wherekinds, ors, firstrows,
 											 firstrows, true, rowbytes,
-											 workers, &collect, &walk, true);
+											 workers, &collect, &walk, true,
+											 NULL);
 			run = lion_units_price(&units, run);
 			startrun = lion_units_price(&units, startrun);
 			foreach(lc, outerrel->partial_pathlist)

@@ -2526,7 +2526,7 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	Cost		serialrun;		/* the serial node's price, without HAVING */
 	LionUnits	units;			/* the competitor's (§39) */
 
-	lion_units_for(output_rel, &units);
+	lion_units_for(root, output_rel, &units);
 	if (lion_where_query_unknown(cx->whereclauses, cx->wherekinds,
 								 cx->whereinor))
 		units.margin = 1.0;
