@@ -1055,7 +1055,12 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 				lion_corrupt("lion index \"%s\": posting page %u is at level %u, but its parent is at level %u",
 							RelationGetRelationName(vs->index), blk, level,
 							expect + 1);
-			if (!LionPageIsRightmost(page) && blk == entry->head)
+			/*
+			 * A head at level 0 is the first leaf of a set without an internal
+			 * level, and its right siblings are the set's other leaves; one
+			 * above level 0 is the root of a tree, which has none.
+			 */
+			if (!LionPageIsRightmost(page) && blk == entry->head && level > 0)
 				lion_corrupt("lion index \"%s\": the root %u of chain entry %u on block %u has a right sibling",
 							RelationGetRelationName(vs->index), blk, eoff, eblk);
 			leftmost[level] = blk;
@@ -1090,6 +1095,36 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 	if (!lion_verify_posting_leaves(vs, eblk, eoff, entry, leftmost[0], &lvl[0],
 									exact, res))
 		return false;
+
+	/*
+	 * A set without an internal level (DESIGN.md §22) has at most
+	 * LION_POSTING_FLAT_LEAVES leaves, and none of them flagged: its splits
+	 * post no downlink, and the one that would make it longer pushes the
+	 * head down first.  A walk that may be repeated can have seen that
+	 * push-down happen behind it, and the leaves and the split that came
+	 * after it, so it walks again instead.
+	 */
+	if (height == 0)
+	{
+		if (lvl[0].npages > LION_POSTING_FLAT_LEAVES)
+		{
+			if (!exact)
+				return false;
+			lion_corrupt("lion index \"%s\": the posting set of chain entry %u on block %u has %d leaves and no internal level, more than %d",
+						RelationGetRelationName(vs->index), eoff, eblk,
+						lvl[0].npages, LION_POSTING_FLAT_LEAVES);
+		}
+		for (j = 0; j < lvl[0].npages; j++)
+		{
+			if (!lvl[0].incomplete[j])
+				continue;
+			if (!exact)
+				return false;
+			lion_corrupt("lion index \"%s\": leaf %u of the posting set of chain entry %u on block %u, which has no internal level, is flagged as an unfinished split",
+						RelationGetRelationName(vs->index), lvl[0].blocks[j],
+						eoff, eblk);
+		}
+	}
 
 	/*
 	 * Test hook: the leaves are walked, the levels above are not, and nothing
@@ -1687,6 +1722,8 @@ lion_verify_postree(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 	Buffer		leaf = InvalidBuffer;
 	BlockNumber levelstart = root;
 	int			level = -1;
+	int			rootlevel = -1;
+	int			nleaves = 0;
 	uint64		nmembers = 0;
 	bool		any = false;
 	uint64		lastcode = 0;
@@ -1728,11 +1765,32 @@ lion_verify_postree(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 							off, blk);
 			plevel = LionPageGetOpaque(page)->level;
 			if (level < 0)
-				level = plevel;
+				level = rootlevel = plevel;
 			if (plevel != level || plevel >= LION_POSTING_MAX_HEIGHT)
 				lion_corrupt("lion index \"%s\": position page %u is at level %d, expected %d",
 							RelationGetRelationName(vs->index), pblk, plevel,
 							level);
+
+			/*
+			 * A root at level 0 is the first leaf of a tree without an
+			 * internal level (DESIGN.md §17): at most LION_POSTING_FLAT_LEAVES
+			 * leaves, none flagged, since such a tree's splits post no
+			 * downlink.  A root above level 0 has no right sibling.
+			 */
+			if (pblk == root && plevel > 0 && !LionPageIsRightmost(page))
+				lion_corrupt("lion index \"%s\": the root %u of the position tree of entry %u on block %u has a right sibling",
+							RelationGetRelationName(vs->index), root, off,
+							blk);
+			if (rootlevel == 0)
+			{
+				if (++nleaves > LION_POSTING_FLAT_LEAVES)
+					lion_corrupt("lion index \"%s\": the position tree at %u of entry %u on block %u has more than %d leaves and no internal level",
+								RelationGetRelationName(vs->index), root, off,
+								blk, LION_POSTING_FLAT_LEAVES);
+				if (LionPageIncompleteSplit(page))
+					lion_corrupt("lion index \"%s\": leaf %u of the position tree at %u, which has no internal level, is flagged as an unfinished split",
+								RelationGetRelationName(vs->index), pblk, root);
+			}
 
 			if (plevel > 0)
 			{

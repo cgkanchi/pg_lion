@@ -478,7 +478,7 @@ typedef struct LionSetCursor
 	 * descent of the posting tree for `seekckey` rather than from a rightlink;
 	 * it is how a cursor jumps forward instead of streaming, and it is also
 	 * how the FIRST leaf is found, because the entry's head block is the tree's
-	 * ROOT and is only a leaf while the set fits one page.
+	 * ROOT and is the first leaf only while the set has no internal level.
 	 *
 	 * `mintarget` is the container key a seek asked for.  It only ever moves
 	 * forward, and it is what makes a sparse segment that STARTS below the
@@ -487,6 +487,15 @@ typedef struct LionSetCursor
 	bool		descend;
 	uint32		seekckey;
 	uint32		mintarget;
+
+	/*
+	 * The first descent found the set FLAT - its head a leaf, the first of at
+	 * most LION_POSTING_FLAT_LEAVES (DESIGN.md §22) - so a seek steps right
+	 * however far the target is: a descent would start at the head and walk
+	 * right from there.  A push-down after that leaves the chain as it was,
+	 * so stepping right stays correct.
+	 */
+	bool		flat;
 
 	/*
 	 * The sparse segment being expanded, and a reader of its pairs standing

@@ -330,7 +330,7 @@ lion_emit_chain(Relation index, uint32 hash, BlockNumber head, TIDBitmap *tbm,
 
 	/*
 	 * DESIGN.md §22: `head` is the ROOT of the posting tree, which is the
-	 * single leaf only while the set fits one page.  The leaves are still one
+	 * first leaf while the set has no internal level.  The leaves are one
 	 * rightlinked list in ckey order, so the walk below is unchanged once it
 	 * has descended to the leftmost one - and the descent hands that leaf back
 	 * LOCKED, which is what keeps a root push-down from slipping in between

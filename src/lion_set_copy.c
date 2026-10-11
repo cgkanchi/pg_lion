@@ -93,7 +93,7 @@ lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 	/*
 	 * DESIGN.md §22: the walk starts at the leftmost LEAF, which the descent
 	 * hands back locked - the entry's head block is the tree's root and is
-	 * only a leaf while the set fits one page.
+	 * the first leaf only while the set has no internal level.
 	 */
 	{
 		Buffer		firstbuf = lion_posting_search(ps->index, NULL, 0, ps->head,

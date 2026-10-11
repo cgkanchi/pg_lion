@@ -59,7 +59,7 @@ injection_points_wakeup
 step s1_count: <... completed>
 lion_index_count
 ----------------
-             500
+           30500
 (1 row)
 
 step s3_vacuum: <... completed>
@@ -69,7 +69,7 @@ step s3_count:
 
 count
 -----
-20500
+50500
 (1 row)
 
 step s3_verify: SELECT lion_index_verify('rpd_k', true); DROP TABLE rpd_root;

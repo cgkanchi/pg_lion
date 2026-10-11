@@ -114,7 +114,9 @@ lion_cost_fkjoin_walk(double rows, double leaves, double height,
  * where a NOPIN set's cursor starts, and a probe after it steps right while
  * the key's containers are close together - height + 2 pages a probe where
  * they lie eight container keys apart or more, a share of that where they are
- * closer.  That is what the counters of the refit's probing counts come to:
+ * closer.  A set without an internal level (DESIGN.md §22) has no descent:
+ * the first probe walks its chain from the head, half of it on average, and
+ * that walk takes the descent's place.  That is what the counters of the refit's probing counts come to:
  * 2.9 to 3.7 posting pages a probe over one to ten containers a key, 0.34 to
  * 0.68 over 100 or all of the heap's 169 container keys.
  */
@@ -132,7 +134,8 @@ lion_fkjoin_probe_one(double heap_pages, double members, double cfk)
 		bytes <= (double) work_mem * 1024.0)
 		return LION_MEMORY_PROBE_COST;
 	return LION_FKJOIN_PROBE_COST +
-		(lion_posting_height(leaves) + 2.0) *
+		(leaves <= (double) LION_POSTING_FLAT_LEAVES ?
+		 (leaves + 1.0) / 2.0 + 1.0 : lion_posting_height(leaves) + 2.0) *
 		Min(1.0, ckeys / (8.0 * Max(cfk, 1.0))) * LION_FKJOIN_PROBE_PAGE_COST;
 }
 
