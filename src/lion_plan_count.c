@@ -242,6 +242,7 @@ typedef struct LionCountPathBuild
 	double		topkrows;		/* ... and the rows of their entries */
 	bool		topkstrict;		/* ... every group tied with the k-th */
 	List	   *vcols;			/* the expression columns (DESIGN.md §41) */
+	bool		distinctstage;	/* a SELECT DISTINCT's keys as the groups */
 } LionCountPathBuild;
 
 static void lion_try_count_path_scoped(LionCountPathBuild *cxp);
@@ -345,13 +346,31 @@ lion_count_path_query(LionCountPathBuild *cx)
 		return false;
 	if (parse->rowMarks != NIL || root->rowMarks != NIL)
 		return false;
-	if (fj == NULL || !fj->joinpath)
+	if (cx->distinctstage)
 	{
-		if (!parse->hasAggs)
+		/* lion_try_distinct_path() has checked the query */
+	}
+	else if (fj == NULL || !fj->joinpath)
+	{
+		/*
+		 * A GROUP BY with no aggregate at all is the groups' keys, each once:
+		 * the groups the walk emits, which are only those with a visible row
+		 * (DESIGN.md §10, "Shapes rewritten to the node's counts").
+		 */
+		if (!parse->hasAggs && parse->groupClause == NIL)
 			return false;
 		if (parse->groupingSets != NIL)
 			return false;
-		if (parse->hasWindowFuncs || parse->hasTargetSRFs ||
+		/*
+		 * A window function is computed above the grouping, over the rows of
+		 * the grouped rel, whose target (make_window_input_target()) holds
+		 * every grouping column and aggregate the windows read - their
+		 * arguments, PARTITION BY and ORDER BY keys - and is checked below
+		 * like any other.  So a window over grouped counts needs nothing of
+		 * the node beyond those (DESIGN.md §10, "Shapes rewritten to the
+		 * node's counts").
+		 */
+		if (parse->hasTargetSRFs ||
 			parse->hasDistinctOn || parse->distinctClause != NIL)
 			return false;
 	}
@@ -978,6 +997,69 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 }
 
 /*
+ * `col <> ALL (array)` - `col NOT IN (a, b, ...)` - as the conjunction it
+ * stands for, `col <> a AND col <> b AND ...` (DESIGN.md §10, "Shapes
+ * rewritten to the node's counts"): one OpExpr a literal element, or NIL
+ * where the rewrite is not made.  Both forms are false or unknown for a NULL
+ * col, and for every other row they agree element by element, so the rewrite
+ * is exact - provided no element is NULL: one makes the ALL unknown for
+ * every row, and is left to the ordinary plan.  An empty list, true of every
+ * row, is left there too, and so is an array known only at run time, whose
+ * elements are not there to be taken apart.  Each conjunct has the array's
+ * operator and input collation; whether a posting set answers it is the
+ * caller's question.
+ */
+static List *
+lion_all_as_and(Node *clause)
+{
+	ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+	Node	   *right;
+	Const	   *arr;
+	ArrayType  *a;
+	Oid			elemtype;
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			n;
+	int			i;
+	List	   *out = NIL;
+
+	if (!IsA(clause, ScalarArrayOpExpr) || saop->useOr ||
+		list_length(saop->args) != 2)
+		return NIL;
+	right = lion_strip((Node *) lsecond(saop->args));
+	if (right == NULL || !IsA(right, Const) || ((Const *) right)->constisnull)
+		return NIL;
+	arr = (Const *) right;
+	a = DatumGetArrayTypeP(arr->constvalue);
+	elemtype = ARR_ELEMTYPE(a);
+	get_typlenbyvalalign(elemtype, &typlen, &typbyval, &typalign);
+	deconstruct_array(a, elemtype, typlen, typbyval, typalign,
+					  &elems, &nulls, &n);
+	if (n == 0 || n > LION_MAX_ARRAY_ELEMS)
+		return NIL;
+	for (i = 0; i < n; i++)
+	{
+		Const	   *c;
+		OpExpr	   *op;
+
+		if (nulls[i])
+			return NIL;
+		c = makeConst(elemtype, -1, arr->constcollid, typlen,
+					  datumCopy(elems[i], typbyval, typlen), false, typbyval);
+		op = (OpExpr *) make_opclause(saop->opno, BOOLOID, false,
+									  (Expr *) copyObject(linitial(saop->args)),
+									  (Expr *) c, InvalidOid,
+									  saop->inputcollid);
+		op->opfuncid = saop->opfuncid;
+		out = lappend(out, op);
+	}
+	return out;
+}
+
+/*
  * Every WHERE clause must be one the posting sets can answer, or, over a
  * partitioned table, one every partition's bounds imply.  Builds the clause
  * lists - whereattnos, clauseinfos, whereclauses, whereconsts, wherekinds,
@@ -1009,6 +1091,7 @@ lion_count_path_where(LionCountPathBuild *cx)
 		LionLeafInfo leaf;
 		int			startlen = list_length(cx->whereattnos);
 		bool		answered;
+		List	   *ands;
 
 		if (!IsA(rinfo, RestrictInfo) || rinfo->pseudoconstant)
 			return false;
@@ -1060,11 +1143,31 @@ lion_count_path_where(LionCountPathBuild *cx)
 		}
 
 		/*
-		 * An OR across columns (lion_count_path_where_or()), or a clause of
-		 * one column (lion_count_path_where_leaf()).
+		 * An OR across columns (lion_count_path_where_or()), `col NOT IN
+		 * (...)` as its `<>` clauses (lion_all_as_and()), or a clause of one
+		 * column (lion_count_path_where_leaf()).
 		 */
 		if (IsA(clause, BoolExpr) && ((BoolExpr *) clause)->boolop == OR_EXPR)
 			answered = lion_count_path_where_or(cx, clause);
+		else if ((ands = lion_all_as_and(clause)) != NIL)
+		{
+			ListCell   *la;
+
+			answered = true;
+			foreach(la, ands)
+			{
+				Node	   *conj = (Node *) lfirst(la);
+
+				if (!lion_analyze_leaf(root, conj, rti, true, true, true,
+									   &leaf) ||
+					leaf.kind != LION_CLAUSE_NE ||
+					!lion_count_path_where_leaf(cx, rinfo, conj))
+				{
+					answered = false;
+					break;
+				}
+			}
+		}
 		else
 			answered = lion_count_path_where_leaf(cx, rinfo, clause);
 		if (answered)
@@ -1188,6 +1291,42 @@ lion_count_path_having(LionCountPathBuild *cx)
 	 * HAVING's were replaced before its columns were taken out of it.
 	 */
 	cx->checkexprs = (List *) lion_vcol_subst((Node *) cx->checkexprs);
+
+	/*
+	 * An expression over what the node produces - `count(*)::int`, `100.0 *
+	 * count(*) / n`, `round(100.0 * count(*) / n, 2)` beside a GROUP BY, `g ||
+	 * '!'` of a group column - is computed by the plan's projection from the
+	 * counts and columns it reads, once per row the node emits, as the Agg's
+	 * projection computes it once per group (DESIGN.md §10, "Expressions over
+	 * the counts").  So what has to pass the tests below is what it reads:
+	 * its aggregates whole, and its columns.  A subquery in it would be a
+	 * SubPlan the node's projection runs, which it is not built to; a window
+	 * function is computed above the grouping, never in its target.
+	 */
+	{
+		List	   *expanded = NIL;
+		ListCell   *lc;
+
+		foreach(lc, cx->checkexprs)
+		{
+			Node	   *node = (Node *) lfirst(lc);
+
+			if (IsA(node, Var) || IsA(node, Aggref) ||
+				(cx->groupcoal != NULL && equal(node, cx->groupexpr)) ||
+				list_member(cx->groupdeps, node))
+			{
+				expanded = lappend(expanded, node);
+				continue;
+			}
+			if (contain_subplans(node) || contain_window_function(node))
+				return false;
+			expanded = list_concat(expanded,
+								   pull_var_clause(node,
+												   PVC_INCLUDE_AGGREGATES |
+												   PVC_INCLUDE_PLACEHOLDERS));
+		}
+		cx->checkexprs = expanded;
+	}
 	return true;
 }
 
@@ -1280,6 +1419,68 @@ lion_count_path_distinct(LionCountPathBuild *cx)
 		}
 	}
 	return true;
+}
+
+/*
+ * count(col) of a nullable column (DESIGN.md §10, "Shapes rewritten to the
+ * node's counts"): without a GROUP BY, where every aggregate is count(col)
+ * of that one column, it is count(*) of the rows the WHERE selects AND `col
+ * IS NOT NULL` - a clause the posting sets answer (§14, §35), added here as
+ * if the query had written it.  A GROUP BY is not taken: a group whose rows
+ * all have col NULL is a row of 0 in the query and no row at all once the
+ * clause is added.  Nothing is done, and the checks after this decide, when
+ * the count is one lion_agg_is_count() already answers or the target holds
+ * anything else.
+ */
+static bool
+lion_count_path_countcol(LionCountPathBuild *cx)
+{
+	Var		   *col = NULL;
+	NullTest   *nt;
+	ListCell   *lc;
+
+	if (cx->fj != NULL || cx->ngroup != 0 || cx->singlegroup ||
+		cx->groupcoal != NULL || cx->distvar != NULL)
+		return true;
+	foreach(lc, cx->checkexprs)
+	{
+		Aggref	   *agg = (Aggref *) lfirst(lc);
+		Node	   *arg;
+
+		if (!IsA(agg, Aggref))
+			continue;
+		if (agg->aggfnoid != F_COUNT_ANY || agg->aggdistinct != NIL ||
+			agg->aggorder != NIL || agg->aggfilter != NULL ||
+			agg->aggvariadic || agg->agglevelsup != 0 ||
+			agg->aggsplit != AGGSPLIT_SIMPLE ||
+			agg->aggkind != AGGKIND_NORMAL || list_length(agg->args) != 1)
+			return true;
+		arg = lion_strip((Node *) ((TargetEntry *) linitial(agg->args))->expr);
+		if (arg == NULL || !IsA(arg, Var) ||
+			((Var *) arg)->varno != (int) cx->rti ||
+			((Var *) arg)->varattno <= 0 || ((Var *) arg)->varlevelsup != 0)
+			return true;
+		if (col == NULL)
+			col = (Var *) arg;
+		else if (col->varattno != ((Var *) arg)->varattno)
+			return true;
+		if (lion_agg_is_count(cx->root, agg, cx->rti, cx->input_rel,
+							  cx->groupattno, cx->ngroup, cx->nonnullattnos,
+							  cx->nullattnos))
+			return true;
+	}
+	if (col == NULL)
+		return true;
+
+	nt = makeNode(NullTest);
+	nt->arg = (Expr *) copyObject(col);
+	nt->nulltesttype = IS_NOT_NULL;
+	nt->argisrow = false;
+	nt->location = -1;
+	cx->rinfono++;
+	cx->rinfoclauses = lappend(cx->rinfoclauses,
+							   lion_vcol_unvar((Node *) nt));
+	return lion_count_path_where_leaf(cx, NULL, (Node *) nt);
 }
 
 /*
@@ -1489,7 +1690,12 @@ lion_count_path_outputs(LionCountPathBuild *cx)
 		else
 			return false;
 	}
-	if (!haveagg)
+	/*
+	 * No aggregate at all is a GROUP BY's or a DISTINCT's keys alone, which
+	 * need a group to emit (lion_count_path_query()).
+	 */
+	if (!haveagg &&
+		(cx->parse->hasAggs || (cx->ngroup == 0 && !cx->singlegroup)))
 		return false;
 	return true;
 }
@@ -2197,11 +2403,15 @@ lion_count_path_topk(LionCountPathBuild *cx)
 	{
 		Node	   *arg = lion_strip((Node *)
 									 ((TargetEntry *) linitial(agg->args))->expr);
-		AttrNumber	attno;
+		AttrNumber	attno = 0;
 
-		if (arg == NULL || !IsA(arg, Var))
+		/* count(1) of a non-NULL constant is count(*) */
+		if (arg != NULL && IsA(arg, Const) && !((Const *) arg)->constisnull)
+			attno = 0;
+		else if (arg == NULL || !IsA(arg, Var))
 			return;
-		attno = ((Var *) arg)->varattno;
+		else
+			attno = ((Var *) arg)->varattno;
 
 		/*
 		 * count(col) of a column a clause pins to NULL is 0, and of the group
@@ -2720,15 +2930,16 @@ lion_count_path_decodable(LionCountPathBuild *cx)
  * or returns false to end it there: a check that failed, or the FK-side join
  * taking over.
  */
-void
-lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
-				   RelOptInfo *output_rel, GroupPathExtraData *extra,
-				   const LionFkJoin *fj)
+static void
+lion_try_count_path_ext(PlannerInfo *root, RelOptInfo *input_rel,
+						RelOptInfo *output_rel, GroupPathExtraData *extra,
+						const LionFkJoin *fj, bool distinctstage)
 {
 	LionCountPathBuild cx;
 	LionVColScope saved;
 
 	lion_count_path_init(&cx, root, input_rel, output_rel, extra, fj);
+	cx.distinctstage = distinctstage;
 
 	if (!lion_count_path_query(&cx))
 		return;
@@ -2755,6 +2966,67 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 	PG_END_TRY();
 }
 
+void
+lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
+				   RelOptInfo *output_rel, GroupPathExtraData *extra,
+				   const LionFkJoin *fj)
+{
+	lion_try_count_path_ext(root, input_rel, output_rel, extra, fj, false);
+}
+
+/*
+ * SELECT DISTINCT over one relation, with no GROUP BY, aggregate, window or
+ * set-returning function (DESIGN.md §10, "Shapes rewritten to the node's
+ * counts"): the distinct keys are the groups of a GROUP BY of the same
+ * columns with no aggregate, and the path is that GROUP BY's, added to the
+ * DISTINCT's upper rel.  The build reads the grouping from
+ * root->processed_groupClause, parse->groupClause and output_rel's target,
+ * so for its duration those are the DISTINCT's: its clauses as core kept
+ * them (processed_distinctClause, columns a WHERE equality pins left out,
+ * as a GROUP BY's are), and the target of the rows below, which the upper
+ * rel does not set - core's own DISTINCT paths carry their input's target.
+ * The grouping extra is what core would hand a GROUP BY that may be
+ * partially aggregated: there is nothing to aggregate.
+ */
+void
+lion_try_distinct_path(PlannerInfo *root, RelOptInfo *input_rel,
+					   RelOptInfo *output_rel)
+{
+	Query	   *parse = root->parse;
+	GroupPathExtraData extra;
+	List	   *savedprocessed = root->processed_groupClause;
+	List	   *savedgroup = parse->groupClause;
+	PathTarget *savedtarget = output_rel->reltarget;
+
+	if (parse->distinctClause == NIL || parse->hasDistinctOn ||
+		parse->groupClause != NIL || parse->groupingSets != NIL ||
+		parse->hasAggs || parse->hasWindowFuncs || parse->hasTargetSRFs ||
+		root->hasHavingQual)
+		return;
+
+	memset(&extra, 0, sizeof(extra));
+	extra.flags = GROUPING_CAN_PARTIAL_AGG;
+	extra.patype = PARTITIONWISE_AGGREGATE_NONE;
+	extra.havingQual = NULL;
+	extra.targetList = root->processed_tlist;
+
+	root->processed_groupClause = root->processed_distinctClause;
+	parse->groupClause = parse->distinctClause;
+	output_rel->reltarget = input_rel->reltarget;
+	PG_TRY();
+	{
+		lion_try_count_path_ext(root, input_rel, output_rel, &extra, NULL,
+								true);
+	}
+	PG_FINALLY();
+	{
+		root->processed_groupClause = savedprocessed;
+		parse->groupClause = savedgroup;
+		output_rel->reltarget = savedtarget;
+	}
+	PG_END_TRY();
+}
+
 /*
  * The rest of lion_try_count_path(), inside the scope of the relation's
  * expression columns.
@@ -2774,6 +3046,8 @@ lion_try_count_path_scoped(LionCountPathBuild *cxp)
 	if (!lion_count_path_having(&cx))
 		return;
 	if (!lion_count_path_distinct(&cx))
+		return;
+	if (!lion_count_path_countcol(&cx))
 		return;
 	if (!lion_count_path_outputs(&cx))
 		return;

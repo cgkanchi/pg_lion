@@ -1579,7 +1579,7 @@ refuses the function (`make hookcheck`). A new node adds a line to both.
 
 Planner integration
 - Install `create_upper_paths_hook` (chaining to any previous hook) at `_PG_init`; act only for
-  stage UPPERREL_GROUP_AGG. GUC `pg_lion.enable_count_pushdown` (bool, default on).
+  stage UPPERREL_GROUP_AGG (and UPPERREL_DISTINCT over one base relation, end of this section). GUC `pg_lion.enable_count_pushdown` (bool, default on).
 - Applicability, all required (bail out silently otherwise):
   - input_rel is a single base relation (RELOPT_BASEREL, RTE_RELATION, relkind ordinary table or
     materialized view) — no joins, no subqueries, no old-style inheritance parents. §16 added
@@ -1590,8 +1590,14 @@ Planner integration
   - The relation's table AM is the heap, by routine (§2). ambuild already refuses any other, so
     this only declines an index that got past it; the executor checks again when it opens the
     relation.
-  - The query has no DISTINCT, window functions, grouping sets, ORDER BY inside aggregates,
-    FILTER clauses, or aggregates other than `count(*)` and the `count(col)` cases of §14.
+  - The query has no DISTINCT (but a SELECT DISTINCT over the table alone is a GROUP BY of its
+    keys, at end of this section), grouping sets, ORDER BY inside aggregates,
+    FILTER clauses, or aggregates other than `count(*)` (or `count(1)` of any non-NULL constant)
+    and the `count(col)` cases of §14 - and, without a GROUP BY, `count(col)` of any one column
+    whose index answers `col IS NOT NULL`.
+    The target list holds those counts, the columns the rules below let it print, and any
+    expression over them; window functions over them are computed above the node ("Shapes
+    rewritten to the node's counts" at the end of this section).
   - **HAVING** is accepted when it is a filter the node can apply itself. By the time the hook runs,
     `havingQual` is an implicit-AND list of only those clauses that mention an aggregate (or are
     volatile, or contain a subquery): `subquery_planner()` has moved every other clause into WHERE,
@@ -1617,7 +1623,8 @@ Planner integration
     integer opfamily contains it), and the compared value is not a literal NULL. §15 adds
     `Var = ANY (array)` and §14 the two null tests to the shapes accepted here. §19 adds a
     top-level `OR` of such clauses, whose leaves enter none of the per-column bookkeeping below,
-    because they constrain no column of the result. The "Const" is anything the node can evaluate
+    because they constrain no column of the result; §35 adds `<>`, and `NOT IN` of a literal list
+    is its `<>` clauses (end of this section). The "Const" is anything the node can evaluate
     once per scan - a literal, a Param, a stable expression over them - and a boolean column tested
     by itself is the equality it stands for (both below).
   - **Several clauses may constrain one column, and each is a source of its own** (2026-09-25
@@ -2503,6 +2510,87 @@ correlation (`lion_key_containers()`: one a row when scattered, their share of t
 stored in value order, interpolated by the correlation's square): a GROUP BY over 365 days of a
 table loaded in date order cost 4,650 for 0.6 ms when every day was taken to be scattered, and
 costs 317.
+
+### Shapes rewritten to the node's counts (2026-10-11)
+
+Each of these is a query the node answers with the counts it already makes; nothing in the count
+engine or its visibility rules (§9, §11) changes, so every one is exact wherever the plain count
+is. `test/sql/countshapes.sql` checks each against a sequential scan, over NULLs and over dead
+and updated rows the visibility map no longer covers.
+
+**Expressions over the counts.** `SELECT count(*)::int`, `100.0 * count(*) / n`, `g, round(100.0 *
+count(*) / n, 2) ... GROUP BY g` or `g || '!'` of a group column: the grouped target holds the
+expression, and the checks used to refuse anything in it but a column or an aggregate. Now an
+expression is taken apart into what it reads - its aggregates whole and its columns, an expression
+column (§41) as one - and each must pass the rules of a target entry of its own
+(`lion_count_path_having()`); a SubPlan or a window function in it declines. The plan keeps the
+expression in the CustomScan's target list and puts only what it reads in `custom_scan_tlist`, so
+setrefs.c makes it the node's projection, evaluated once per row the node emits - once a group, as
+the Agg's projection would; a volatile function in it is called as often. Under a Finalize Agg (a
+partitioned table, a parallel or decoded GROUP BY, the FK-side join and the semi join) the partial
+target already held only the aggregates and columns, and the Finalize Agg computes the expression.
+The grouping `coalesce(col, c)` is still the one expression the node emits itself, and only that
+exact expression: `coalesce(count(*), 0)` is an expression over a count. 1M rows: `count(*)::int`
+with two filters 23 ms to 0.3 ms; the grouped `round(...)` 97 ms to 3 ms.
+
+**count(1).** `count(c)` of a constant that is not NULL counts every row, which is `count(*)`
+(`lion_agg_is_count()`), as the FK-side join already took it: `count(1)`, `count('x')`, and a
+constant expression `eval_const_expressions()` has folded. `count(NULL)` and a Param or stable
+argument are not taken. The plan classifies it as `count(*)`, and the top k accepts it as one.
+1M rows: 23 ms to 0.2 ms.
+
+**count(col) of a nullable column.** Without a GROUP BY, where every aggregate is `count(col)` of
+one column that nothing proves non-NULL (§14), the count is `count(*)` of the rows the WHERE
+selects AND `col IS NOT NULL`, which the posting sets answer (§14, §35: the NULL entry subtracted,
+or skipped when the column drives a count of every row). `lion_count_path_countcol()` adds the
+clause as if the query had written it, and EXPLAIN lists it (`cs_n (n IS NOT NULL)`); a column
+whose index cannot answer it declines as such a WHERE would. With a GROUP BY it is not taken: a
+group whose rows all have `col` NULL is a row of 0 in the query and no row at all under the
+clause. Beside `count(*)` or a count of another column it is not taken either, since the clause
+would change those. 1M rows, `count(nullable) WHERE c20 = 3`: 23 ms to 0.3 ms.
+
+**NOT IN (list).** `col NOT IN (a, b)`, which the parser makes `col <> ALL ('{a,b}')`, is the
+conjunction `col <> a AND col <> b` (`lion_all_as_and()`), and each conjunct is a §35 `<>`
+clause - a negated source, the entry of its value and the NULL entry subtracted. Both forms are
+false or unknown where `col` is NULL, and agree element by element everywhere else, so the
+rewrite is exact. A NULL element makes the ALL unknown for every row and an empty array makes it
+true for every row; both are left to the ordinary plan, as is an array known only at run time (a
+generic plan's `NOT IN ($1, $2)`), whose elements cannot be taken apart at plan time, and a list
+longer than §15's 1000. The conjuncts share the restriction's position, so a partition whose
+bounds imply the whole restriction leaves all of them out (§16). The FK-side join's and the semi
+join's fact filters go through the same code. 1M rows, `count(*) WHERE c20 NOT IN (3, 4, 5)`:
+91 ms to 1.1 ms.
+
+**Window functions over the counts.** A window function is evaluated by a WindowAgg above the
+grouping, over the grouped rel's rows. With windows in the query the grouped rel's target is
+`make_window_input_target()`'s: the grouping columns and every aggregate and column a window's
+arguments, PARTITION BY or ORDER BY read, flattened out of the window expressions. That target
+goes through the same checks as any other, so a window that reads something the node cannot
+produce - `sum(count(u)) OVER ()` of a count it cannot answer - declines through them, and the
+query-level refusal of window functions is gone. The top k (§36) still declines a query with
+windows, whose rows it would cut before the window saw them. 1M rows, `c20, round(100.0 *
+count(*) / sum(count(*)) OVER (), 2) ... GROUP BY c20`: 109 ms to 1.3 ms.
+
+**GROUP BY or DISTINCT with no aggregate.** `SELECT c20, c200 FROM fact GROUP BY 1, 2` and `SELECT
+DISTINCT c200 FROM fact` ask for the keys that have a row, each once - which is what a GROUP BY
+walk emits already: a group is emitted only when its count of visible rows is not 0, under the
+same visibility rules as any count (§9, §11), so a key whose rows are all dead, or not yet visible
+to the snapshot, is not emitted, as a sequential scan would not see it. The checks used to require
+an aggregate; a GROUP BY with none is taken now, its target holding only grouping columns and
+expressions of them. A DISTINCT is planned at UPPERREL_DISTINCT, where the hook now acts too when
+the stage's input is one base relation - no GROUP BY, aggregate, window, set-returning function or
+DISTINCT ON below it (`lion_try_distinct_path()`). Its keys are the groups of a GROUP BY of the
+same columns: for the build, `processed_groupClause` and `parse->groupClause` are the DISTINCT's
+(core's `processed_distinctClause`, without the columns a WHERE equality pins, which makes the
+query one group as a GROUP BY's do), and the target is the input rel's - core leaves the distinct
+rel's own target empty and its paths carry their input's. The grouping extra is the one a
+partially aggregatable GROUP BY gets, so the parallel, decoded and partitioned forms work as for
+counts, with a Finalize HashAggregate of no aggregates above them. The claimed sort order is the
+GROUP BY's (§21): `SELECT DISTINCT ... ORDER BY` gets a Sort above the node when it is not that
+order. PostgreSQL 18's B-tree skip scan does not compete here: core's DISTINCT over a B-tree is a
+Unique over a full index-only scan, priced as such, and the cost model decides. 1M rows: `SELECT
+DISTINCT c200` 128 ms to 4.6 ms (51 ms with a B-tree on c200); `c20, c200 ... GROUP BY 1, 2`
+127 ms to 15 ms (decoded walk).
 
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 

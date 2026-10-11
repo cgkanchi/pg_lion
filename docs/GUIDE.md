@@ -63,6 +63,22 @@ its group's count, so the largest entries are counted first and the rest never o
 catch up - ten groups of 3.4 million on ClickBench's `UserID`. Expressions of the grouping column
 (`GROUP BY ip, ip - 1`) split no group and are computed from it.
 
+These forms are answered as the counts they stand for (DESIGN.md §10, "Shapes rewritten to the
+node's counts"):
+
+- expressions over the counts and the grouping columns, such as `count(*)::int` or `g,
+  round(100.0 * count(*) / 5000000, 2) ... GROUP BY g`, computed once per output row.
+- `count(1)`, or `count` of any other non-NULL constant, which is `count(*)`.
+- `count(col)` of a nullable indexed column, without a `GROUP BY` and when every aggregate is a
+  count of that column: counted as `count(*) ... AND col IS NOT NULL`.
+- `col NOT IN (a, b, ...)` (or `col <> ALL (...)`) of a literal list without NULLs, counted as
+  `col <> a AND col <> b ...`.
+- window functions over the counts, such as a share of the total, `g, round(100.0 * count(*) /
+  sum(count(*)) OVER (), 2) ... GROUP BY g`: the counts are pushed down and the window runs above
+  them.
+- `GROUP BY` with no aggregate and `SELECT DISTINCT` of indexed columns over one table (`SELECT
+  DISTINCT country FROM events`): the keys that have a visible row, each once.
+
 An expression index counts as a column of its expression (DESIGN.md §41). With `CREATE INDEX ON
 events USING lion ((payload->>'status'))`, `WHERE payload->>'status' = 'paid'`, `IN`, ranges,
 `<>`, `IS NULL`, `GROUP BY payload->>'status'` and `count(DISTINCT payload->>'status')` are
