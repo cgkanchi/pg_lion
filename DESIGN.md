@@ -7782,11 +7782,13 @@ image.
                                    hot-key insert record: ~64 bytes.
     ITEM_REPLACE    0x10  2        DELTA (the ranges of the item at its allotted
                                    length that differ from what the page holds)
-                                   + MINMAX + the entry.  98 B for the dense
-                                   container that used to cost 1658; a rewrite
-                                   that changes more than half the item falls
-                                   back to REPLACE, which is the whole item at
-                                   its allotted length with its slack zeroed.
+                                   or SPLICE (the same with the bytes an insert
+                                   moved up said once) + MINMAX + the entry.
+                                   98 B for the dense container that used to
+                                   cost 1658; a rewrite that changes more than
+                                   half the item falls back to REPLACE, which is
+                                   the whole item at its allotted length with
+                                   its slack zeroed.
     ITEM_ADD        0x20  1-2      DELETE (when replacing) + ADD per item +
                                    MINMAX + the entry.  Also every record of an
                                    INLINE spill.
@@ -7829,8 +7831,8 @@ image.
                                    them.
 
 The operations are: INIT, SPECIAL (the whole 32-byte page special area), ADD,
-ADDMANY, REPLACE, DELTA, SETBYTES, MULTIDEL, DELETE_NC, DELETE, MINMAX, FLAGS,
-META, DELETED, CONTAINER_ADD, SPARSE_INS, NDISTINCT (§33).
+ADDMANY, REPLACE, DELTA, SPLICE, SETBYTES, MULTIDEL, DELETE_NC, DELETE, MINMAX,
+FLAGS, META, DELETED, CONTAINER_ADD, SPARSE_INS, NDISTINCT (§33).
 
 **DELTA is what a rewrite of one item costs now**, and it is the one operation
 whose payload is a function of the page as well as of the record. It says: the
@@ -7855,6 +7857,49 @@ is automatic: when the ranges would come to more than half the item, the
 operation is dropped and a plain REPLACE takes its place, so an ARRAY that turns
 into a BITSET still goes in whole. Nothing about masking changes, because the
 bytes outside the named ranges are the bytes the page already had.
+
+**SPLICE is a DELTA with bytes inserted** (`lion_waldelta.[ch]`). A member added
+in the MIDDLE of an ARRAY moves every member above it up by two bytes, and a
+DELTA can only say that by repeating every byte that moved: half the item on
+average, which is what the first insert into a bulk-built container cost, since
+such a container has no slack and takes the general path (§4). SPLICE's payload
+starts with `{uint16 at, uint16 inslen, inslen bytes}`, which are inserted into
+the base image at byte `at` before it is cut or zero-extended to `aux` bytes,
+and the DELTA ranges follow, applied to that. One member added to an ARRAY is
+then the two bytes, where they go and the new count: 12 bytes of payload where
+the DELTA carried every member above the new one. The same shape is a run added to a RUN (4 bytes), a
+pair added inside a sparse segment (a varint and the re-encoded one after it),
+and any of those inside an INLINE payload, where everything after the item
+moves up too. The writer does not say which it did: `lion_wal_op_replace()`
+hands the old image and the new item to `lion_delta_encode_item()`, which
+computes the DELTA and, unless that is already as small as a SPLICE can be,
+looks for an insertion of 1 to 8 bytes - the smallest `at` from which the new
+item is the old one moved up - and keeps whichever is smaller, DELTA on a tie,
+or neither when both exceed half the item. Redo decodes either with
+`lion_delta_decode_item()` into its scratch buffer and puts the item back as
+for a DELTA; a payload that does not fit the item the page holds (a splice
+point past it, a range past the new length) is a PANIC, because the record
+was not written against that page. The encoder and the decoder are pure
+functions of their bytes, which `test/unit/waldelta_test.c` round-trips over
+every container shape, random images and malformed payloads, and
+`wal_consistency_checking` checks on every record of the suite.
+
+Measured (PostgreSQL 18.6 release build, rmgr mode, 5M rows, six lion indexes
+on synthetic columns of 2 to 1M keys, one wave of 50,000 updates that move one
+row in a hundred to the next key of a 20-key column, on a heap at fillfactor
+90 so that the new versions land on the pages the old ones were on; bytes of
+index WAL without full-page images):
+
+| index | record | before | after |
+|---|---|---|---|
+| 20 keys | ITEM_REPLACE | 629.8 B | 96.9 B |
+| 20 keys | all records, per updated row | 439.8 B | 163.8 B |
+| 200 keys | ITEM_REPLACE | 152.1 B | 97.2 B |
+| 20,000 keys | ENTRY (INLINE) | 523.1 B | 165.7 B |
+| 1M keys | ENTRY (INLINE) | 77.9 B | 74.8 B |
+
+What is left on the 20-key column is the splits of its full leaves, which the
+`posting_fillfactor` reloption of §22 is for.
 
 **Two operations log the writer's CALL rather than its bytes**, and that is
 where the hot record's size comes from. Adding a member to a sorted ARRAY shifts

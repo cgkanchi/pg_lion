@@ -53,6 +53,7 @@
 
 #include "lion.h"
 #include "lion_wal.h"
+#include "lion_waldelta.h"
 
 /*
  * The rmid of pg_lion.rmgr_id, which is what this server registered us under
@@ -95,11 +96,17 @@ struct LionWalState
 	StringInfoData main;		/* record-level payload after the header */
 	LionWalBlock blk[LION_WAL_MAX_BLOCKS];
 
-	/* The item image a DELTA is computed against (lion_wal_save_item()). */
+	/*
+	 * The item image a DELTA or SPLICE is computed against
+	 * (lion_wal_save_item()), and the encoder's output and work space
+	 * (lion_wal_op_replace()), BLCKSZ bytes each, allocated once.
+	 */
 	Page		savepage;		/* NULL when nothing is saved */
 	OffsetNumber saveoff;
 	Size		savelen;
-	char	   *savebuf;		/* BLCKSZ bytes, allocated once */
+	char	   *savebuf;
+	char	   *deltabuf;
+	char	   *deltascratch;
 };
 
 /*
@@ -208,6 +215,8 @@ lion_wal_setup_buffers(void)
 			enlargeStringInfo(&lion_wal_cur.blk[i].ops, LION_WAL_OPS_INITSZ);
 		}
 		lion_wal_cur.savebuf = (char *) palloc(BLCKSZ);
+		lion_wal_cur.deltabuf = (char *) palloc(BLCKSZ);
+		lion_wal_cur.deltascratch = (char *) palloc(BLCKSZ);
 		lion_wal_visits = (xl_lion_visit *)
 			palloc(sizeof(xl_lion_visit) * LION_WAL_VISIT_FLUSH);
 		MemoryContextSwitchTo(old);
@@ -578,15 +587,6 @@ lion_wal_op_count(LionWalState *state, Page page, uint16 aux)
 	memcpy(b->ops.data + b->lastop, &hdr, SizeOfLionOp);
 }
 
-/*
- * How many equal bytes it takes to close a delta range.
- *
- * A range costs four bytes of header, so a handful of bytes that happen to be
- * equal are cheaper to carry along than to skip: the scan only ends a range
- * once it has seen this many in a row.
- */
-#define LION_WAL_DELTA_GAP		5
-
 void
 lion_wal_save_item(LionWalState *state, Page page, OffsetNumber off)
 {
@@ -622,13 +622,8 @@ void
 lion_wal_op_replace(LionWalState *state, Page page, OffsetNumber off,
 					const void *item, Size len)
 {
-	LionWalBlock *b;
-	const char *newitem = (const char *) item;
-	const char *old;
-	Size		oldlen;
-	Size		startpos;
-	Size		budget;
-	Size		i;
+	Size		plen;
+	int			kind;
 
 	Assert(lion_wal_open && state == &lion_wal_cur);
 
@@ -642,89 +637,27 @@ lion_wal_op_replace(LionWalState *state, Page page, OffsetNumber off,
 		state->savepage = NULL;
 		return;
 	}
-
-	old = state->savebuf;
-	oldlen = state->savelen;
-	state->savepage = NULL;		/* one image, one delta */
+	state->savepage = NULL;		/* one image, one record of it */
 
 	/*
-	 * Redo's base image is the old item zero-extended to the new length, so
-	 * make the saved copy exactly that: the comparison below is then between
-	 * two flat buffers and can run a word at a time, which matters because it
-	 * runs inside the critical section on every insert.
+	 * What the alternative costs is every byte of the item.  A description
+	 * that saves less than half of that is not worth having - it is more
+	 * bytes of WAL for a replay that does more work - so the encoder is given
+	 * half the item as its budget and the item goes in whole when neither
+	 * form fits it.  Of the two forms, RANGES says which bytes changed and
+	 * SPLICE that a few bytes were inserted and the rest moved up, which is
+	 * what one member added to an ARRAY is (lion_waldelta.h).
 	 */
-	if (len > oldlen)
-		memset(state->savebuf + oldlen, 0, len - oldlen);
-
-	b = lion_wal_find_block(state, page);
-	startpos = (Size) b->ops.len;
-
-	/*
-	 * What the alternative costs: one operation header and every byte of the
-	 * item.  A delta that saves less than half of that is not worth having -
-	 * it is more bytes of WAL for a replay that does more work - and the item
-	 * goes in whole instead.
-	 */
-	budget = SizeOfLionOp + len / 2;
-
-	lion_wal_op(state, page, LION_OP_DELTA, off, (uint16) len, NULL, 0);
-
-	i = 0;
-	while (i < len)
-	{
-		Size		start;
-		Size		end;
-		Size		equal;
-		xl_lion_range r;
-
-		/* Skip what did not change, eight bytes at a time. */
-		while (i + sizeof(uint64) <= len &&
-			   memcmp(newitem + i, old + i, sizeof(uint64)) == 0)
-			i += sizeof(uint64);
-		while (i < len && newitem[i] == old[i])
-			i++;
-		if (i >= len)
-			break;
-
-		/*
-		 * A run of changed bytes, swallowing short runs of equal ones: the
-		 * base image is the item as the page holds it, zero-extended when the
-		 * item grew (which is exactly what redo reconstructs).
-		 */
-		start = i;
-		end = i + 1;
-		equal = 0;
-		for (i = start + 1; i < len; i++)
-		{
-			if (newitem[i] != old[i])
-			{
-				end = i + 1;
-				equal = 0;
-			}
-			else if (++equal >= LION_WAL_DELTA_GAP)
-				break;
-		}
-
-		r.at = (uint16) start;
-		r.len = (uint16) (end - start);
-		lion_wal_op_append(state, page, &r, SizeOfLionRange);
-		lion_wal_op_append(state, page, newitem + start, end - start);
-		i = end;
-
-		if ((Size) b->ops.len - startpos > budget)
-		{
-			/*
-			 * Too much of the item changed.  Nothing but this operation has
-			 * been appended since startpos, so dropping it leaves the stream
-			 * exactly as it was and the item is logged whole.
-			 */
-			b->ops.len = (int) startpos;
-			b->ops.data[startpos] = '\0';
-			b->lastop = startpos;
-			lion_wal_op(state, page, LION_OP_REPLACE, off, 0, item, len);
-			return;
-		}
-	}
+	plen = lion_delta_encode_item(state->savebuf, state->savelen,
+								  (const char *) item, len,
+								  state->deltabuf, len / 2,
+								  state->deltascratch, &kind);
+	if (kind == LION_DELTA_KIND_NONE)
+		lion_wal_op(state, page, LION_OP_REPLACE, off, 0, item, len);
+	else
+		lion_wal_op(state, page,
+					(kind == LION_DELTA_KIND_SPLICE) ? LION_OP_SPLICE : LION_OP_DELTA,
+					off, (uint16) len, state->deltabuf, plen);
 }
 
 void
@@ -903,13 +836,19 @@ lion_wal_abort(LionWalState *state)
  * ARRAY shifts every element above it, so logging the bytes would cost up to
  * 4 KB where the call costs twelve.  They are deterministic for the same
  * reason every other operation is - same input item, same library function.
+ * The rewrite of an item that has no room left for that call takes the
+ * general path, and is logged as the bytes that changed (LION_OP_DELTA) or as
+ * the bytes inserted and the bytes that changed below them (LION_OP_SPLICE),
+ * which for one member added to an ARRAY is about as small.
  */
 /*
- * Where LION_OP_DELTA rebuilds an item whose length changed.  One buffer for
+ * Where LION_OP_DELTA and LION_OP_SPLICE rebuild an item.  One buffer for
  * the whole startup process: redo is single-threaded and the buffer is used
  * and finished with inside one operation.
  */
 static PGAlignedBlock lion_redo_scratch;
+
+static const char *lion_op_name(uint8 op);
 
 /*
  * The item a replayed call (LION_OP_CONTAINER_ADD, LION_OP_SPARSE_INS) works
@@ -1055,64 +994,48 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 				break;
 
 			case LION_OP_DELTA:
+			case LION_OP_SPLICE:
 				{
 					ItemId		iid;
 					Size		oldlen;
 					Size		newlen = (Size) op.aux;
-					Size		p = 0;
-					char	   *target;
+					char	   *target = lion_redo_scratch.data;
 
 					if (op.off < FirstOffsetNumber ||
 						op.off > PageGetMaxOffsetNumber(page))
-						elog(PANIC, "pg_lion: DELTA for item %u past the end of block %u",
-							 op.off, blkno);
+						elog(PANIC, "pg_lion: %s for item %u past the end of block %u",
+							 lion_op_name(op.op), op.off, blkno);
 					iid = PageGetItemId(page, op.off);
 					if (!ItemIdHasStorage(iid))
-						elog(PANIC, "pg_lion: DELTA for unused item %u on block %u",
-							 op.off, blkno);
+						elog(PANIC, "pg_lion: %s for unused item %u on block %u",
+							 lion_op_name(op.op), op.off, blkno);
 					oldlen = ItemIdGetLength(iid);
 					if (newlen == 0 || newlen > BLCKSZ || oldlen > BLCKSZ)
-						elog(PANIC, "pg_lion: DELTA of %zu bytes for item %u on block %u",
-							 newlen, op.off, blkno);
+						elog(PANIC, "pg_lion: %s of %zu bytes for item %u on block %u",
+							 lion_op_name(op.op), newlen, op.off, blkno);
 
 					/*
-					 * The base image is the item as this page holds it, cut to
-					 * the new length or zero-extended to it - the very bytes
-					 * the writer compared against.  A length that does not
-					 * change is patched where it lies, which moves nothing;
-					 * otherwise the patched image goes back through
+					 * The base image is the item as this page holds it - with
+					 * the bytes a SPLICE inserts inserted - cut to the new
+					 * length or zero-extended to it: the very bytes the writer
+					 * compared against (lion_waldelta.h).  A length that does
+					 * not change is copied back where the item lies, which
+					 * moves nothing; otherwise the image goes back through
 					 * PageIndexTupleOverwrite(), exactly as on the primary.
 					 */
+					if (!lion_delta_decode_item((const char *) PageGetItem(page, iid),
+												oldlen,
+												(op.op == LION_OP_SPLICE) ?
+												LION_DELTA_KIND_SPLICE :
+												LION_DELTA_KIND_RANGES,
+												payload, op.len,
+												target, newlen))
+						elog(PANIC, "pg_lion: malformed %s for item %u on block %u",
+							 lion_op_name(op.op), op.off, blkno);
+
 					if (newlen == oldlen)
-						target = (char *) PageGetItem(page, iid);
-					else
-					{
-						target = lion_redo_scratch.data;
-						memcpy(target, PageGetItem(page, iid),
-							   Min(oldlen, newlen));
-						if (newlen > oldlen)
-							memset(target + oldlen, 0, newlen - oldlen);
-					}
-
-					while (p < op.len)
-					{
-						xl_lion_range r;
-
-						if (p + SizeOfLionRange > op.len)
-							elog(PANIC, "pg_lion: truncated DELTA on block %u",
-								 blkno);
-						memcpy(&r, payload + p, SizeOfLionRange);
-						p += SizeOfLionRange;
-						if (p + r.len > op.len ||
-							(Size) r.at + r.len > newlen)
-							elog(PANIC, "pg_lion: DELTA range %u+%u past item %u on block %u",
-								 r.at, r.len, op.off, blkno);
-						memcpy(target + r.at, payload + p, r.len);
-						p += r.len;
-					}
-
-					if (newlen != oldlen &&
-						!PageIndexTupleOverwrite(page, op.off, target, newlen))
+						memcpy(PageGetItem(page, iid), target, newlen);
+					else if (!PageIndexTupleOverwrite(page, op.off, target, newlen))
 						elog(PANIC, "pg_lion: could not resize item %u to %zu bytes on block %u",
 							 op.off, newlen, blkno);
 				}
@@ -1503,6 +1426,8 @@ lion_op_name(uint8 op)
 			return "sparse_ins";
 		case LION_OP_DELTA:
 			return "delta";
+		case LION_OP_SPLICE:
+			return "splice";
 		case LION_OP_NDISTINCT:
 			return "ndistinct";
 		default:

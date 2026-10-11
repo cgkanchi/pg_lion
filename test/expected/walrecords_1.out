@@ -235,5 +235,55 @@ SELECT lion_index_verify('lion_wl_k', true);
  
 (1 row)
 
-DROP TABLE lion_wr, lion_wd, lion_wi, lion_wl;
+/*
+ * ITEM_REPLACE AS A SPLICE (DESIGN.md §25).
+ *
+ * A bulk-built container has no growth slack, so the first member an insert
+ * adds to it takes the general path and rewrites the item.  When the member
+ * lands in the MIDDLE of an ARRAY, every member above it moves up by two
+ * bytes, which a DELTA can only say by repeating them; the SPLICE operation
+ * says it with the two bytes, where they go and the new count.  Updates on a
+ * heap with free space put the new row versions on the pages the old ones
+ * are on, so their TIDs land inside the containers rather than after them.
+ * Thirty-two keys keep every container an ARRAY (fewer and denser ones would
+ * be NARROWs, which grow in place), and there is no CHECKPOINT between the
+ * build and the updates: the build's own pages need no full-page image, and
+ * a block that carries one does not show its operations.
+ */
+CREATE TABLE lion_ws (id int, k int) WITH (fillfactor = 70);
+INSERT INTO lion_ws SELECT i, i % 32 FROM generate_series(1, 20000) i;
+CREATE INDEX lion_ws_k ON lion_ws USING lion (k) WITH (inline_limit = 64);
+SELECT containers = array_containers AS all_arrays
+  FROM lion_index_stats('lion_ws_k');
+ all_arrays 
+------------
+ t
+(1 row)
+
+SELECT pg_current_wal_lsn() AS lsn8 \gset
+UPDATE lion_ws SET k = (k + 1) % 32 WHERE id % 97 = 0;
+SELECT pg_switch_wal() IS NOT NULL AS wal_switched_five_times;
+ wal_switched_five_times 
+-------------------------
+ t
+(1 row)
+
+SELECT pg_current_wal_lsn() AS lsn9 \gset
+SELECT count(*) > 0 AS wrote_splices,
+	   coalesce(max(record_length - fpi_length), 0) <= 160 AS splices_are_small
+  FROM pg_get_wal_records_info(:'lsn8', :'lsn9')
+ WHERE resource_manager = 'pg_lion' AND record_type = 'ITEM_REPLACE'
+   AND description LIKE '%splice off%';
+ wrote_splices | splices_are_small 
+---------------+-------------------
+ t             | t
+(1 row)
+
+SELECT lion_index_verify('lion_ws_k', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+DROP TABLE lion_wr, lion_wd, lion_wi, lion_wl, lion_ws;
 DROP EXTENSION pg_walinspect;
