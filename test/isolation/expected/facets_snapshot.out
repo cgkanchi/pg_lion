@@ -1,0 +1,79 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_begin s1_facets s2_begin s2_write s2_facets s1_facets s3_facets s2_commit s1_facets s3_facets s1_commit s1_facets
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_facets: SELECT tags = query AS tags_same, lexemes = ts_stat AS lexemes_same, tags, lexemes FROM fsnap_both();
+tags_same|lexemes_same|tags                   |lexemes                                                          
+---------+------------+-----------------------+-----------------------------------------------------------------
+t        |t           |u0:67 u1:67 u2:66 t0:40|w0:20 w1:20 w2:20 w3:20 v1:12 v4:12 v6:12 v0:11 v2:11 v3:11 v5:11
+(1 row)
+
+step s2_begin: BEGIN;
+step s2_write: INSERT INTO fsnap SELECT 1000 + i, 1, ARRAY['t1', 'hot'], 'w9 v9'
+					FROM generate_series(1, 60) i;
+				  UPDATE fsnap SET tags = ARRAY['t1', 'moved'], tsv = 'w8', grp = 1 WHERE id % 10 = 0;
+				  DELETE FROM fsnap WHERE id % 5 = 3;
+step s2_facets: SELECT tags = query AS tags_same, lexemes = ts_stat AS lexemes_same, tags, lexemes FROM fsnap_both();
+tags_same|lexemes_same|tags                    |lexemes                                                                            
+---------+------------+------------------------+-----------------------------------------------------------------------------------
+t        |t           |t1:128 u1:54 u0:53 u2:53|w8:46 v9:42 w9:42 w0:20 w1:20 w2:20 w3:20 v1:12 v4:12 v6:12 v0:11 v2:11 v3:11 v5:11
+(1 row)
+
+step s1_facets: SELECT tags = query AS tags_same, lexemes = ts_stat AS lexemes_same, tags, lexemes FROM fsnap_both();
+tags_same|lexemes_same|tags                   |lexemes                                                          
+---------+------------+-----------------------+-----------------------------------------------------------------
+t        |t           |u0:67 u1:67 u2:66 t0:40|w0:20 w1:20 w2:20 w3:20 v1:12 v4:12 v6:12 v0:11 v2:11 v3:11 v5:11
+(1 row)
+
+step s3_facets: SELECT tags = query AS tags_same, lexemes = ts_stat AS lexemes_same, tags, lexemes FROM fsnap_both();
+tags_same|lexemes_same|tags                   |lexemes                                                          
+---------+------------+-----------------------+-----------------------------------------------------------------
+t        |t           |u0:67 u1:67 u2:66 t0:40|w0:20 w1:20 w2:20 w3:20 v1:12 v4:12 v6:12 v0:11 v2:11 v3:11 v5:11
+(1 row)
+
+step s2_commit: COMMIT;
+step s1_facets: SELECT tags = query AS tags_same, lexemes = ts_stat AS lexemes_same, tags, lexemes FROM fsnap_both();
+tags_same|lexemes_same|tags                   |lexemes                                                          
+---------+------------+-----------------------+-----------------------------------------------------------------
+t        |t           |u0:67 u1:67 u2:66 t0:40|w0:20 w1:20 w2:20 w3:20 v1:12 v4:12 v6:12 v0:11 v2:11 v3:11 v5:11
+(1 row)
+
+step s3_facets: SELECT tags = query AS tags_same, lexemes = ts_stat AS lexemes_same, tags, lexemes FROM fsnap_both();
+tags_same|lexemes_same|tags                    |lexemes                                                                            
+---------+------------+------------------------+-----------------------------------------------------------------------------------
+t        |t           |t1:128 u1:54 u0:53 u2:53|w8:46 v9:42 w9:42 w0:20 w1:20 w2:20 w3:20 v1:12 v4:12 v6:12 v0:11 v2:11 v3:11 v5:11
+(1 row)
+
+step s1_commit: COMMIT;
+step s1_facets: SELECT tags = query AS tags_same, lexemes = ts_stat AS lexemes_same, tags, lexemes FROM fsnap_both();
+tags_same|lexemes_same|tags                    |lexemes                                                                            
+---------+------------+------------------------+-----------------------------------------------------------------------------------
+t        |t           |t1:128 u1:54 u0:53 u2:53|w8:46 v9:42 w9:42 w0:20 w1:20 w2:20 w3:20 v1:12 v4:12 v6:12 v0:11 v2:11 v3:11 v5:11
+(1 row)
+
+
+starting permutation: s2_begin s2_write s2_facets s3_facets s2_rollback s3_facets
+step s2_begin: BEGIN;
+step s2_write: INSERT INTO fsnap SELECT 1000 + i, 1, ARRAY['t1', 'hot'], 'w9 v9'
+					FROM generate_series(1, 60) i;
+				  UPDATE fsnap SET tags = ARRAY['t1', 'moved'], tsv = 'w8', grp = 1 WHERE id % 10 = 0;
+				  DELETE FROM fsnap WHERE id % 5 = 3;
+step s2_facets: SELECT tags = query AS tags_same, lexemes = ts_stat AS lexemes_same, tags, lexemes FROM fsnap_both();
+tags_same|lexemes_same|tags                    |lexemes                                                                            
+---------+------------+------------------------+-----------------------------------------------------------------------------------
+t        |t           |t1:128 u1:54 u0:53 u2:53|w8:46 v9:42 w9:42 w0:20 w1:20 w2:20 w3:20 v1:12 v4:12 v6:12 v0:11 v2:11 v3:11 v5:11
+(1 row)
+
+step s3_facets: SELECT tags = query AS tags_same, lexemes = ts_stat AS lexemes_same, tags, lexemes FROM fsnap_both();
+tags_same|lexemes_same|tags                   |lexemes                                                          
+---------+------------+-----------------------+-----------------------------------------------------------------
+t        |t           |u0:67 u1:67 u2:66 t0:40|w0:20 w1:20 w2:20 w3:20 v1:12 v4:12 v6:12 v0:11 v2:11 v3:11 v5:11
+(1 row)
+
+step s2_rollback: ROLLBACK;
+step s3_facets: SELECT tags = query AS tags_same, lexemes = ts_stat AS lexemes_same, tags, lexemes FROM fsnap_both();
+tags_same|lexemes_same|tags                   |lexemes                                                          
+---------+------------+-----------------------+-----------------------------------------------------------------
+t        |t           |u0:67 u1:67 u2:66 t0:40|w0:20 w1:20 w2:20 w3:20 v1:12 v4:12 v6:12 v0:11 v2:11 v3:11 v5:11
+(1 row)
+
