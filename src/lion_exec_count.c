@@ -418,6 +418,7 @@ lion_sum_walk(LionCountScanState *st, LionCountSource *sources, int nsource,
 							  lion_plan_flag(st, LION_FLAG_RANGE) ?
 							  &st->range : NULL, part);
 	st->scanning = true;
+	lion_entry_scan_share_pin(&st->escan);
 
 	/* One leaf's entries, which is at most what lion_range.c copies of one. */
 	sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) *
@@ -694,6 +695,7 @@ lion_walk_range_part(LionCountScanState *st, LionRangeSource *rs, int part,
 	bool		found = false;
 
 	lion_entry_scan_begin_sum(&es, rs->index, rs->col, &rs->range, part);
+	lion_entry_scan_share_pin(&es);
 	sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) * es.maxbatch);
 
 	/* A count may be probed (lion_sum_walk()); an existence test stops early. */

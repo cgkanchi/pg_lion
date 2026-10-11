@@ -1270,7 +1270,8 @@ extern void lion_summary_shape(Relation index, LionState *col,
  * from stays PINNED from the copy until that set is handed out, which then
  * takes the pin over (DESIGN.md §9).  batchbuf is that pin; it is dropped as
  * soon as the batch holds no INLINE copy still to come, so a batch of CHAIN
- * entries pins nothing.
+ * entries pins nothing.  A walk that takes whole batches keeps it for all of
+ * the batch instead (sharepin, lion_entry_scan_share_pin()).
  */
 typedef struct LionEntryScan
 {
@@ -1337,6 +1338,9 @@ typedef struct LionEntryScan
 	int			lastinline;		/* the last INLINE one, or -1 */
 	BlockNumber batchblk;		/* the leaf they came from */
 	Buffer		batchbuf;		/* its pin, while an INLINE copy is to come */
+	bool		sharepin;		/* batchbuf stays the INLINE copies' pin until
+								 * the next leaf is read: see
+								 * lion_entry_scan_share_pin() */
 	int64		nleaves;		/* leaves this walk has read */
 } LionEntryScan;
 
@@ -1425,6 +1429,7 @@ extern bool lion_entry_scan_begin_summed(LionEntryScan *es, Relation index,
  */
 extern bool lion_entry_scan_next(LionEntryScan *es, Datum *key,
 								LionPostingSet *ps);
+extern void lion_entry_scan_share_pin(LionEntryScan *es);
 
 /*
  * The next entry as the copy the leaf read made, valid until the next call:

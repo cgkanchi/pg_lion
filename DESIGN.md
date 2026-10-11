@@ -12286,8 +12286,12 @@ Why the copies may outlive the lock is §21's argument, applied per leaf instead
 - **An INLINE copy** is counted against the visibility map, so §9 wants the leaf it came from pinned
   from the copy until the count. The scan keeps that pin (`batchbuf`) while the batch holds an INLINE
   copy still to be handed out. Every INLINE set handed out takes a pin of its own, and the last one
-  takes the scan's. VACUUM's cleanup lock on that leaf therefore waits as it waited for the one set's
-  pin before, only for a batch's length. A batch of CHAIN copies pins nothing, which
+  takes the scan's - except in the sums over a range (`lion_sum_walk()` and the range taken as a
+  source), which take a whole batch, count it and release every set of it before the next leaf is
+  read: there the scan's one pin covers all of the batch's INLINE sets and is dropped at that read
+  (`lion_entry_scan_share_pin()`), because a few hundred pins of one buffer cost the resource owner
+  a search each when they are released. VACUUM's cleanup lock on that leaf therefore waits as it
+  waited for the one set's pin before, only for a batch's length. A batch of CHAIN copies pins nothing, which
   `vacuum_entry_delete.spec` relies on: it parks a walk and needs VACUUM to get through.
 
 **A walk that returns rows pauses.** A GROUP BY hands a row to the executor per group, and a cursor
