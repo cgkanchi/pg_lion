@@ -1172,6 +1172,12 @@ lion_end_custom_scan(CustomScanState *node)
 			MemoryContextDelete(fg->rowcxt);
 			fg->rowcxt = NULL;
 		}
+		if (fg->unitecxt != NULL)
+		{
+			lion_join_unite_release(st);
+			MemoryContextDelete(fg->unitecxt);
+			fg->unitecxt = NULL;
+		}
 	}
 	if (st->viscache != NULL)
 	{

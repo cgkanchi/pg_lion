@@ -41,24 +41,23 @@ lion_where_has_positive(LionCountScanState *st)
 }
 
 /*
- * A count with nothing to take its candidates from: every WHERE clause that
- * selects rows was a multi-key query no key narrows, so the candidates are
- * every row of the relation, and the heap is read once, sequentially, with
- * the row filter - those queries - and the `IS NOT NULL` and `<>` clauses
- * tested on each row the snapshot sees.  It is the ordinary plan's work, which the
- * cost model charged for a value it could not estimate (lion_cost_recheck()).
+ * The row filter of a WHERE with nothing to take its candidates from: every
+ * WHERE clause that selects rows was a multi-key query no key narrows, so the
+ * candidates are every row the count reads, and st->filter - those queries -
+ * is extended with the `IS NOT NULL` and `<>` clauses, which there is no
+ * positive source to subtract from, to be tested on each row the snapshot
+ * sees.  In the current memory context.
  */
-static int64
-lion_count_scan_filtered(LionCountScanState *st)
+static LionRowFilter *
+lion_filter_with_negated(LionCountScanState *st)
 {
-	EState	   *estate = st->css.ss.ps.state;
-	LionRowFilter scan;
+	LionRowFilter *scan = (LionRowFilter *) palloc(sizeof(LionRowFilter));
 	int			k;
 
-	scan = *st->filter;
-	scan.clauses = (LionRowFilterClause *)
+	*scan = *st->filter;
+	scan->clauses = (LionRowFilterClause *)
 		palloc0(sizeof(LionRowFilterClause) * (st->filter->nclauses + st->nitem));
-	memcpy(scan.clauses, st->filter->clauses,
+	memcpy(scan->clauses, st->filter->clauses,
 		   sizeof(LionRowFilterClause) * st->filter->nclauses);
 	for (k = 0; k < st->nitem; k++)
 	{
@@ -67,7 +66,8 @@ lion_count_scan_filtered(LionCountScanState *st)
 
 		if (st->item[k].orno >= 0 || !LION_CLAUSE_IS_NEGATED(cl->kind))
 			continue;
-		c = &scan.clauses[scan.nclauses++];
+		c = &scan->clauses[scan->nclauses++];
+		scan->nheap++;
 		c->attno = cl->idx->rd_index->indkey.values[cl->idxcol - 1];
 		c->notnull = (cl->kind == LION_CLAUSE_NOTNULL);
 		if (!c->notnull)
@@ -78,8 +78,22 @@ lion_count_scan_filtered(LionCountScanState *st)
 			fmgr_info(get_opcode(cl->opno), &c->flinfo);
 		}
 	}
+	return scan;
+}
 
-	return lion_count_heap_filtered(st->heap, estate->es_snapshot, &scan,
+/*
+ * A count with nothing to take its candidates from (lion_filter_with_negated()):
+ * the heap is read once, sequentially, with the row filter tested on each row
+ * the snapshot sees.  It is the ordinary plan's work, which the cost model
+ * charged for a value it could not estimate (lion_cost_recheck()).
+ */
+static int64
+lion_count_scan_filtered(LionCountScanState *st)
+{
+	EState	   *estate = st->css.ss.ps.state;
+
+	return lion_count_heap_filtered(st->heap, estate->es_snapshot,
+									lion_filter_with_negated(st),
 									&st->stats);
 }
 
@@ -2663,8 +2677,28 @@ lion_decode_start(LionCountScanState *st)
 	 * The WHERE, as one copy, read before any column is (DESIGN.md §10, "The
 	 * WHERE sets, collected once"), and pinless.  A WHERE whose sources hold
 	 * no entry is no copy at all: nothing is counted.
+	 *
+	 * A WHERE left with no positive source - every clause that selects rows a
+	 * multi-key query no key narrows (DESIGN.md §17, "A query known only at
+	 * run time"): a generic plan's `tags @> $1` run with '{}', a prefix too
+	 * common to expand - has no copy to make either, and selects rows all the
+	 * same: the walk reads every row, and the row filter, with the negated
+	 * clauses added, tests each in the heap.
 	 */
-	if (st->nitem > 0)
+	if (st->nitem > 0 && !lion_where_has_positive(st))
+	{
+		MemoryContext oldcxt;
+
+		if (st->wheremissing)
+			return false;
+		if (st->filter == NULL)
+			elog(ERROR, "LionCount: a decoded GROUP BY whose WHERE selects no rows by itself");
+		oldcxt = MemoryContextSwitchTo(st->wherecxt);
+		st->filter = lion_filter_with_negated(st);
+		MemoryContextSwitchTo(oldcxt);
+		lion_vis_cache_set_filter(st->viscache, st->filter);
+	}
+	else if (st->nitem > 0)
 	{
 		if (!st->wtried)
 			lion_where_collect(st, st->sources, st->nitem);

@@ -114,7 +114,9 @@ lion_cost_fkjoin_walk(double rows, double leaves, double height,
  * where a NOPIN set's cursor starts, and a probe after it steps right while
  * the key's containers are close together - height + 2 pages a probe where
  * they lie eight container keys apart or more, a share of that where they are
- * closer.  That is what the counters of the refit's probing counts come to:
+ * closer.  A set without an internal level (DESIGN.md §22) has no descent:
+ * the first probe walks its chain from the head, half of it on average, and
+ * that walk takes the descent's place.  That is what the counters of the refit's probing counts come to:
  * 2.9 to 3.7 posting pages a probe over one to ten containers a key, 0.34 to
  * 0.68 over 100 or all of the heap's 169 container keys.
  */
@@ -132,7 +134,8 @@ lion_fkjoin_probe_one(double heap_pages, double members, double cfk)
 		bytes <= (double) work_mem * 1024.0)
 		return LION_MEMORY_PROBE_COST;
 	return LION_FKJOIN_PROBE_COST +
-		(lion_posting_height(leaves) + 2.0) *
+		(leaves <= (double) LION_POSTING_FLAT_LEAVES ?
+		 (leaves + 1.0) / 2.0 + 1.0 : lion_posting_height(leaves) + 2.0) *
 		Min(1.0, ckeys / (8.0 * Max(cfk, 1.0))) * LION_FKJOIN_PROBE_PAGE_COST;
 }
 
@@ -220,6 +223,21 @@ typedef struct LionFkJoinCost
 	double		copybytes;		/* what the collected copy is expected to take */
 	bool		cancollect;		/* there is anything to collect at all */
 	double		reads;			/* the pages it reads (lion_units_cold()) */
+
+	/*
+	 * The keys united (LION_JOINFLAG_UNITE, "Grouped by a fact column, the
+	 * keys united"): the fk sets' containers that every count reads
+	 * (included in `other`), what uniting the found keys' sets with the
+	 * filters once costs instead of their counts, and how many rows and
+	 * containers the union keeps.
+	 */
+	Cost		fkread;
+	Cost		united;
+	double		unitedrows;
+	double		unitedckeys;
+	double		heap_pages;
+	double		fkcontainers;	/* the found keys' containers a count reads */
+	double		cfk;			/* ... one key's */
 } LionFkJoinCost;
 
 static Cost
@@ -594,11 +612,77 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 
 	if (parts != NULL)
 	{
+		double		reach = Min(found * perkey, tuples);
+		double		ucall = lion_containers_for(heap_pages, Max(reach, 1.0));
+
 		parts->other = run - (*walk ? walked : descents) -
 			(*collect ? collected : probed);
 		parts->reads = reads;
+
+		/*
+		 * United, the found keys' sets are one union source of a single
+		 * collection, the fact filters ANDed in as a copy of them would be
+		 * made: each set's cursor and containers read once, the union's
+		 * image built at each of its keys, the filters sought at the keys of
+		 * the sparser side, and the survivors copied.
+		 */
+		parts->fkread = found * cfk * readshare *
+			(LION_CONTAINER_COST + LION_MEMBER_COST * Min(perkey / cfk,
+														   LION_MEMBER_CAP));
+		parts->unitedrows = Max(reach * wheresel, 1.0);
+		parts->unitedckeys = lion_containers_for(heap_pages,
+												 parts->unitedrows);
+		parts->united = found * (LION_FKJOIN_SET_COST +
+								 cfk * LION_FKJOIN_COLLECT_CONTAINER_COST) +
+			ucall * LION_UNION_KEY_COST + reach * LION_UNION_MEMBER_COST +
+			Min(ucall, drive > 0.0 ? drive : ucall) * npositive *
+			LION_FKJOIN_PROBE_COST +
+			parts->unitedckeys * LION_FKJOIN_COPY_CONTAINER_COST;
+		parts->heap_pages = heap_pages;
+		parts->fkcontainers = found * cfk * readshare;
+		parts->cfk = cfk;
 	}
 	return run;
+}
+
+/*
+ * What counting each key once in each of `groups` groups of a fact column
+ * adds to a single count per key ("Grouped by a fact column"): every count
+ * after the first is a count of its own, against the filters or their copy
+ * (`percount`), and reads the key's set again; and every count seeks the
+ * group's set at the key's containers, a probe of a posting set of the
+ * group's rows each.  The sets read again used to be left out, which priced
+ * 29 keys in 20 groups over 5M rows - 871,740 key containers read, and as
+ * many of the groups' sought, in 437 ms - at 77.
+ */
+static Cost
+lion_cost_fkjoin_group_counts(const LionFkJoinCost *parts, double tuples,
+							  double groups, Cost percount)
+{
+	if (groups <= 1.0)
+		return 0;
+	return (groups - 1.0) * (percount + parts->fkread) +
+		groups * parts->fkcontainers *
+		lion_fkjoin_probe_one(parts->heap_pages, tuples / groups, parts->cfk);
+}
+
+/*
+ * The counts of `groups` groups of a fact column against a batch's united
+ * keys, each group's set ANDed with the union's copy as a key's set is with
+ * the filters' (LION_FKJOIN_COPY_COUNT_COST, a copy probe at the containers
+ * the sparser side has, and the members met), once a batch.
+ */
+static Cost
+lion_cost_fkjoin_united_counts(const LionFkJoinCost *parts, double tuples,
+							   double groups, double batches)
+{
+	double		cg = lion_containers_for(parts->heap_pages,
+										 Max(tuples / Max(groups, 1.0), 1.0));
+
+	return batches * (groups * (LION_FKJOIN_COPY_COUNT_COST +
+								Min(cg, parts->unitedckeys) *
+								LION_FKJOIN_COPY_PROBE_COST) +
+					  parts->unitedrows * LION_FKJOIN_COPY_MEMBER_COST);
 }
 
 /*
@@ -645,7 +729,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 					  Var *fkvar, int joinclause, List *whereclauses,
 					  List *wherekinds, List *ors, double dimrows, double found,
 					  bool exists, double rowbytes, int workers, bool *collect,
-					  bool *walk, bool force, double *reads)
+					  bool *walk, bool force, double *reads, bool *unite)
 {
 	LionCountTarget *first = (LionCountTarget *) linitial(targets);
 	bool		wantcollect = force && *collect;
@@ -662,8 +746,21 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 	double		unmatched = 1.0;
 	double		looked = 0.0;
 	double		allreads = 0.0;
+	Cost		united = 0;
+	bool		mayunite = (unite != NULL && !force && !RecoveryInProgress());
 	Cost		run;
 	ListCell   *lc;
+
+	if (unite != NULL)
+		*unite = false;
+
+	/*
+	 * The batches the keys are read in, each looked up - and, united, made
+	 * a union of its own - in every relation in turn.
+	 */
+	batches = ceil(Max(dimrows, 1.0) /
+				   Max(floor((double) work_mem * 1024.0 / Max(rowbytes, 1.0)),
+					   1.0));
 
 	if (list_length(targets) == 1 && first->rel == rel)
 	{
@@ -685,10 +782,33 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 		/*
 		 * A fact column grouped by counts each key once per group
 		 * ("Grouped by a fact column"): the counts, against the filters or
-		 * their copy, that many times over - the key looked up once.
+		 * their copy, that many times over - the key looked up once.  Or,
+		 * where no dimension column is in the rows, the keys united once a
+		 * batch with the filters, and each group counted against the union
+		 * instead ("Grouped by a fact column, the keys united"): no count
+		 * per key at all, and no copy of the filters of their own.
 		 */
 		if (groups > 1.0)
-			run += (groups - 1.0) * (*collect ? parts.collected : parts.probed);
+		{
+			Cost		perkey =
+				lion_cost_fkjoin_group_counts(&parts, tuples, groups,
+											  *collect ? parts.collected :
+											  parts.probed);
+
+			if (mayunite)
+				united = parts.united - parts.fkread -
+					(*collect ? parts.collected : parts.probed) +
+					lion_cost_fkjoin_united_counts(&parts, tuples, groups,
+												   batches);
+			if (mayunite && united < perkey)
+			{
+				*unite = true;
+				*collect = false;
+				run += united;
+			}
+			else
+				run += perkey;
+		}
 		run += lion_cost_recheck(root, rel, first->whereidx, first->wherecol,
 								 whereclauses, wherekinds, ors,
 								 reach * Min(Max(rel->rows, 1.0) / tuples, 1.0),
@@ -743,19 +863,37 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 
 		/* ... and a fact column's groups count each key once per group */
 		tgroups = lion_fact_groups(root, t);
+
+		/*
+		 * ... or, united, against the leaf's union of a batch's keys - where
+		 * the leaf has groups of its own; a leaf whose bounds give the column
+		 * its value counts each key there, probing its filters.  Its fk sets
+		 * are read by the union and not by counts.
+		 */
+		if (tgroups > 1.0)
+			united += parts.united - parts.fkread +
+				lion_cost_fkjoin_united_counts(&parts, tuples, tgroups,
+											   batches);
+		else
+			united += parts.probed;
 		other += parts.other;
 		allreads += parts.reads;
 		descents += parts.descents;
 		walked += parts.walked;
-		probed += parts.probed * tgroups;
+		probed += parts.probed +
+			lion_cost_fkjoin_group_counts(&parts, tuples, tgroups, parts.probed);
 		located += parts.located;
 		if (parts.cancollect)
 		{
-			collected += parts.collected * tgroups;
+			collected += parts.collected +
+				lion_cost_fkjoin_group_counts(&parts, tuples, tgroups,
+											  parts.collected);
 			copybytes += parts.copybytes;
 		}
 		else
-			collected += parts.probed * tgroups;
+			collected += parts.probed +
+				lion_cost_fkjoin_group_counts(&parts, tuples, tgroups,
+											  parts.probed);
 
 		reach = Min(tfound * tuples / nd, tuples);
 		other += lion_cost_recheck(root, t->rel, tidx, tcol, tclauses, tkinds,
@@ -773,10 +911,8 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 	descents += dimrows * LION_FKJOIN_BATCH_ROW_COST;
 
 	/* each batch after the first locates every leaf's filters again */
-	batches = ceil(Max(dimrows, 1.0) /
-				   Max(floor((double) work_mem * 1024.0 / Max(rowbytes, 1.0)),
-					   1.0));
 	probed += (batches - 1.0) * located;
+	united += (batches - 1.0) * located;
 
 	if (reads != NULL)
 		*reads = allreads;
@@ -791,6 +927,12 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 		*collect = (copybytes > 0 &&
 					copybytes <= (double) get_hash_memory_limit() * (workers + 1) &&
 					collected < probed && !RecoveryInProgress());
+	}
+	if (mayunite && united < (*collect ? collected : probed))
+	{
+		*unite = true;
+		*collect = false;
+		return other + (*walk ? walked : descents) + united;
 	}
 	return other + (*walk ? walked : descents) +
 		(*collect ? collected : probed);

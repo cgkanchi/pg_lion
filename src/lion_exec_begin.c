@@ -853,6 +853,7 @@ lion_begin_join(LionCountScanState *st, const LionCountPriv *priv,
 	js->counts = (flags & LION_JOINFLAG_COUNTS) != 0;
 	js->outer = (flags & LION_JOINFLAG_OUTER) != 0;
 	js->ordered = (flags & LION_JOINFLAG_ORDERED) != 0;
+	js->unite = (flags & LION_JOINFLAG_UNITE) != 0;
 	js->sort.unique = (flags & LION_JOINFLAG_UNIQUE) != 0;
 	js->sort.op = priv->join.sortop;
 	js->sort.coll = priv->join.sortcoll;
@@ -1295,6 +1296,10 @@ lion_begin_contexts(LionCountScanState *st, EState *estate)
 		fg->rowcxt = AllocSetContextCreate(estate->es_query_cxt,
 										   "LionCount fact group rows",
 										   ALLOCSET_DEFAULT_SIZES);
+		fg->unitecxt = AllocSetContextCreate(estate->es_query_cxt,
+											 "LionCount united join keys",
+											 ALLOCSET_DEFAULT_SIZES);
+		fg->nunited = -1;
 		fg->nsrc = Max(st->nplanitem + 1, 2) + 1;
 		fg->src = (LionCountSource *)
 			palloc0(sizeof(LionCountSource) * fg->nsrc);

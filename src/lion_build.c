@@ -334,23 +334,30 @@ typedef struct LionBuilder
 	uint16		pend[LION_SPARSE_THRESHOLD];	/* members of a still-sparse ckey */
 	int			npend;
 	LionContainer *seg;			/* open sparse segment, empty when none */
+	uint64		seglast;		/* the code of its last pair */
 
 	char	   *inlinebuf;		/* buffered items, packed without padding */
 	Size		inlineused;
 	Size		inlinemax;		/* lion_inline_max() for this key */
 
 	bool		spilled;		/* posting set lives on container pages */
-	BlockNumber head;			/* the set's ROOT block (DESIGN.md §22) */
+	BlockNumber head;			/* the set's head block (DESIGN.md §22) */
 	BlockNumber curblk;			/* block pagebuf will be written to */
 	BulkWriteBuffer pagebuf;	/* container page under construction */
 	bool		haspage;
 
 	/*
-	 * The posting tree above the leaves (DESIGN.md §22).  A set that fits one
-	 * leaf has none at all and `head` is that leaf; the moment a second leaf
-	 * is needed, a block is reserved for the ROOT, the first leaf is re-stamped
-	 * with it, and the internal levels are filled bottom-up.
+	 * The posting tree above the leaves (DESIGN.md §22).  A set of at most
+	 * LION_POSTING_FLAT_LEAVES leaves has none at all: `head` is its first
+	 * leaf and the leaves are one chain.  Their finished images wait in
+	 * `held` until the set is known to stay that small; the moment one leaf
+	 * more is needed, a block is reserved for the ROOT, the held leaves are
+	 * re-stamped with it and written, and the internal levels are filled
+	 * bottom-up.
 	 */
+	BulkWriteBuffer held[LION_POSTING_FLAT_LEAVES];
+	BlockNumber heldblk[LION_POSTING_FLAT_LEAVES];
+	int			nheld;
 	bool		hastree;
 	BlockNumber rootblk;
 	LionPostLevel *plevel;		/* the level just above the leaves */
@@ -495,7 +502,7 @@ typedef struct LionBuildState
 	uint32		summary_cols;	/* the columns that got them */
 	int64		nsummaries;		/* summary entries written */
 
-	/* A NARROW item written, which makes the index version 8 (§38). */
+	/* A NARROW item written, which lets VACUUM make NARROWs too (§38). */
 	bool		wrote_narrow;
 	/* the positions of the columns that store them (lion_posbuild.c) */
 	LionPosBuild *posbuild;
@@ -770,6 +777,34 @@ lion_build_level_flush(LionBuildState *bs, LionBuildLevel *lv,
 }
 
 /*
+ * Does a directory leaf take the item that crosses its fill budget?  The
+ * leaf's fill lands on whichever side of the budget is nearer: the item is
+ * added when the page would be over the budget by less than it is short of
+ * it without the item - its high key counted either way, as the item's own
+ * key stands for the next page's first - and the page still holds it.  An
+ * item small against the budget crosses it by less than half its own size,
+ * so the fill target keeps its meaning; a large INLINE entry, of which
+ * a page holds a handful, used to leave most of an entry's room empty on
+ * every leaf - four entries of 1.55 kB, 76% full, where a fifth makes 95% -
+ * and now fills the page past the budget instead when that is nearer
+ * (DESIGN.md §21).  The internal levels keep their own rule
+ * (lion_build_level_add()).
+ */
+static inline bool
+lion_build_leaf_crosses(const LionBuildLevel *lv, Size need, Size hkneed,
+						Size budget)
+{
+	double		over;
+	double		short_;
+
+	if (lv->level != 0 || lv->used + need + hkneed > LION_PAGE_CAPACITY)
+		return false;
+	over = (double) (lv->used + need + hkneed) - (double) budget;
+	short_ = (double) budget - (double) (lv->used + hkneed);
+	return over < short_;
+}
+
+/*
  * Add one item to a level, flushing the open page first when it no longer
  * fits.
  *
@@ -798,7 +833,8 @@ lion_build_level_add(LionBuildState *bs, LionBuildLevel *lv,
 	 */
 	while (lv->nitems > 0 && lv->used + need + hkneed > budget &&
 		   (lv->nitems >= minitems ||
-			lv->used + need + hkneed > LION_PAGE_CAPACITY))
+			lv->used + need + hkneed > LION_PAGE_CAPACITY) &&
+		   !lion_build_leaf_crosses(lv, need, hkneed, budget))
 		lion_build_level_flush(bs, lv, item, false);
 
 	Assert(lv->nitems == 0 || lv->used + need <= LION_PAGE_CAPACITY);
@@ -1064,19 +1100,43 @@ lion_post_level_add(LionBuildState *bs, LionBuilder *b, LionPostLevel *lv,
 }
 
 /*
- * The set needs a second leaf, so it needs a ROOT above them.  Reserve its
- * block and re-stamp the first leaf, whose image has not been written yet.
+ * The set needs one leaf more than a set without an internal level may have
+ * (LION_POSTING_FLAT_LEAVES), so it needs a ROOT above them.  Reserve its
+ * block, re-stamp the held leaves, whose images have not been written yet,
+ * and write them with their downlinks.
  */
 static void
-lion_builder_start_tree(LionBuildState *bs, LionBuilder *b, Page firstleaf)
+lion_builder_start_tree(LionBuildState *bs, LionBuilder *b)
 {
+	int			i;
+
 	Assert(!b->hastree);
 
 	b->rootblk = lion_build_alloc_block(bs);
 	b->head = b->rootblk;
 	b->hastree = true;
 	b->plevel = lion_post_level(bs, 1);
-	lion_page_set_owner(firstleaf, b->hash, b->head);
+	for (i = 0; i < b->nheld; i++)
+	{
+		Page		leaf = (Page) b->held[i]->data;
+
+		lion_page_set_owner(leaf, b->hash, b->head);
+		lion_post_level_add(bs, b, b->plevel, LionPageGetOpaque(leaf)->minckey,
+							b->heldblk[i]);
+		smgr_bulk_write(bs->bulk, b->heldblk[i], b->held[i], true);
+	}
+	b->nheld = 0;
+}
+
+/* Write the leaves of a set that stays without an internal level. */
+static void
+lion_builder_write_held(LionBuildState *bs, LionBuilder *b)
+{
+	int			i;
+
+	for (i = 0; i < b->nheld; i++)
+		smgr_bulk_write(bs->bulk, b->heldblk[i], b->held[i], true);
+	b->nheld = 0;
 }
 
 /*
@@ -1137,22 +1197,36 @@ lion_builder_spill(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 	{
 		BlockNumber next;
 
-		/*
-		 * The page is final, and a second leaf means the set is a TREE: the
-		 * root block is reserved now and this first leaf is re-stamped with
-		 * it before it goes out, because every page of a set carries its root
-		 * block as the owner stamp (DESIGN.md §18, §22).
-		 */
-		if (!b->hastree)
-			lion_builder_start_tree(bs, b, img);
-
 		next = lion_build_alloc_block(bs);
 		lion_page_update_minmax(img);
 		LionPageGetOpaque(img)->rightlink = next;
-		lion_post_level_add(bs, b, b->plevel,
-							LionPageGetOpaque(img)->minckey, b->curblk);
-		/* the page is final: hand the image itself to the bulk writer */
-		smgr_bulk_write(bs->bulk, b->curblk, b->pagebuf, true);
+
+		/*
+		 * The page is final.  Up to LION_POSTING_FLAT_LEAVES leaves make a
+		 * set without an internal level, headed by its first leaf, and they
+		 * are held back until that is certain; the leaf after that makes the
+		 * set a TREE: the root block is reserved now and every held leaf is
+		 * re-stamped with it before it goes out, because every page of a set
+		 * carries its root block as the owner stamp (DESIGN.md §18, §22).
+		 */
+		if (!b->hastree && b->nheld + 2 <= LION_POSTING_FLAT_LEAVES)
+		{
+			b->held[b->nheld] = b->pagebuf;
+			b->heldblk[b->nheld] = b->curblk;
+			b->nheld++;
+		}
+		else
+		{
+			if (!b->hastree)
+			{
+				lion_builder_start_tree(bs, b);
+				lion_page_set_owner(img, b->hash, b->head);
+			}
+			lion_post_level_add(bs, b, b->plevel,
+								LionPageGetOpaque(img)->minckey, b->curblk);
+			/* the page is final: hand the image itself to the bulk writer */
+			smgr_bulk_write(bs->bulk, b->curblk, b->pagebuf, true);
+		}
 
 		b->curblk = next;
 		b->pagebuf = lion_build_get_page(bs, LION_PAGE_CONTAINER);
@@ -1224,6 +1298,34 @@ lion_builder_close_segment(LionBuildState *bs, LionBuilder *b)
 }
 
 /*
+ * Would the pending members of the group fit the open segment?  They are
+ * appended above its last pair, each a varint of its code's delta from the
+ * one before.
+ */
+static bool
+lion_builder_group_fits(LionBuilder *b)
+{
+	uint64		prev;
+	uint32		bytes = lion_sparse_nbytes(b->seg);
+	int			i;
+
+	if (b->seg->cardinality == 0)
+		return true;			/* at most three pairs of one ckey always do */
+	if ((uint32) b->seg->cardinality + (uint32) b->npend > LION_SPARSE_MAX_PAIRS)
+		return false;
+
+	prev = b->seglast;
+	for (i = 0; i < b->npend; i++)
+	{
+		uint64		code = lion_make_code(b->curckey, b->pend[i]);
+
+		bytes += lion_sparse_varint_size(code - prev);
+		prev = code;
+	}
+	return bytes <= LION_SPARSE_MAX_BYTES;
+}
+
+/*
  * Close the ckey group that is being collected: a dense one has already
  * become a container in b->cur and is emitted here, a sparse one appends its
  * few members to the open segment.
@@ -1246,13 +1348,13 @@ lion_builder_finish_group(LionBuildState *bs, LionBuilder *b)
 		int			i;
 
 		/* A ckey lives in one item only, so never split a group in two. */
-		if ((uint32) b->seg->cardinality + (uint32) b->npend >
-			LION_SPARSE_MAX_PAIRS)
+		if (!lion_builder_group_fits(b))
 			lion_builder_close_segment(bs, b);
 
 		for (i = 0; i < b->npend; i++)
 		{
-			if (!lion_sparse_insert(b->seg, b->curckey, b->pend[i], NULL))
+			if (!lion_sparse_append(b->seg, &b->seglast, b->curckey,
+									b->pend[i]))
 				elog(ERROR, "lion index: sparse segment overflowed during build");
 		}
 	}
@@ -1366,6 +1468,8 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 		if (b->hastree)
 			lion_post_level_add(bs, b, b->plevel,
 								LionPageGetOpaque(img)->minckey, b->curblk);
+		else
+			lion_builder_write_held(bs, b);
 		smgr_bulk_write(bs->bulk, b->curblk, b->pagebuf, true);
 		b->pagebuf = NULL;
 		b->haspage = false;
@@ -1974,7 +2078,7 @@ lion_build_index_state(Relation index, LionIndexState *ix, MemoryContext cxt)
 	/* The root is filled in once the tree has been built. */
 	memset(&meta, 0, sizeof(meta));
 	meta.magic = LION_MAGIC;
-	meta.version = LION_VERSION;
+	meta.version = LION_VERSION_V9;
 	meta.offset_bits = LION_OFFSET_BITS;
 	meta.container_bits = LION_CONTAINER_BITS;
 	meta.inline_limit = inline_limit;
@@ -2531,10 +2635,10 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 					  lion_wal_mode_for_build(index));
 	/* ... and the order the directory was just laid out in (§21). */
 	lion_meta_record_order(LionPageGetMeta((Page) metabuf->data), &bs.ix);
-	/* ... and which columns got summaries, which makes it version 7 (§32). */
+	/* ... and which columns got summaries (§32). */
 	lion_meta_record_summaries(LionPageGetMeta((Page) metabuf->data),
 							   bs.summary_cols, bs.sumtids);
-	/* ... and whether it has a NARROW item, which makes it version 8 (§38). */
+	/* ... and whether it has a NARROW item, which VACUUM may then add (§38). */
 	lion_meta_record_narrow(LionPageGetMeta((Page) metabuf->data),
 							bs.wrote_narrow);
 	/* ... and each column's distinct keys, for the planner (§33). */

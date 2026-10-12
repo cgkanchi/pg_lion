@@ -7,11 +7,13 @@
  *	  library.
  *
  *	  Every segment under test is shadowed by a brute-force reference: a
- *	  plain sorted array of (ckey, lo) pairs maintained by insertion sort.
- *	  After each operation the segment is compared against the reference pair
- *	  by pair, for cardinality, for the header ckey, for iteration order and
- *	  for the answers of find/count/contains, and lion_sparse_check() must
- *	  accept it.
+ *	  plain sorted array of (ckey, lo) pairs maintained by insertion sort,
+ *	  and an encoder of its own that writes the bytes the format says those
+ *	  pairs are (lion_sparse.h).  After each operation the segment is
+ *	  compared against the reference byte for byte - the WAL redo of an
+ *	  in-place insert depends on there being one encoding - and for the
+ *	  answers of find/count/contains/iterate and the first and last ckey,
+ *	  and lion_sparse_check() must accept it.
  *
  *	  Exit status is 0 only if every check passed.
  *-------------------------------------------------------------------------
@@ -111,10 +113,19 @@ typedef struct Ref
 	uint32		n;
 } Ref;
 
+/* The largest container key a heap TID makes. */
+#define MAX_CKEY	((uint32) (LION_SPARSE_MAX_CODE >> LION_CONTAINER_BITS))
+
 static void
 ref_init(Ref *r)
 {
 	r->n = 0;
+}
+
+static uint64
+pair_code(const Pair *p)
+{
+	return (((uint64) p->ckey) << LION_CONTAINER_BITS) | p->lo;
 }
 
 static int
@@ -125,6 +136,69 @@ pair_cmp(uint32 ak, uint16 al, uint32 bk, uint16 bl)
 	if (al != bl)
 		return al < bl ? -1 : 1;
 	return 0;
+}
+
+/* The reference's own varint: written out longhand, not the library's. */
+static uint32
+ref_varint(uint8 *out, uint64 v)
+{
+	uint32		n = 0;
+
+	do
+	{
+		uint8		b = (uint8) (v & 0x7F);
+
+		v >>= 7;
+		if (v != 0)
+			b |= 0x80;
+		if (out != NULL)
+			out[n] = b;
+		n++;
+	} while (v != 0);
+	return n;
+}
+
+/*
+ * The bytes the format says r's pairs are, into out (when not NULL);
+ * returns the stream's length.
+ */
+static uint32
+ref_encode(const Ref *r, SBuf *out)
+{
+	uint8		stream[LION_SPARSE_MAX_PAIRS * 10];
+	uint32		len = 0;
+	uint64		prev;
+	uint32		i;
+
+	if (r->n == 0)
+	{
+		if (out != NULL)
+		{
+			memset(out, 0, sizeof(*out));
+			out->c.type = LION_CT_SPARSE;
+		}
+		return 0;
+	}
+
+	prev = ((uint64) r->p[0].ckey) << LION_CONTAINER_BITS;
+	for (i = 0; i < r->n; i++)
+	{
+		uint64		code = pair_code(&r->p[i]);
+
+		len += ref_varint(stream + len, code - prev);
+		prev = code;
+	}
+
+	if (out != NULL)
+	{
+		memset(out, 0, sizeof(*out));
+		out->c.ckey = r->p[0].ckey;
+		out->c.cardinality = (uint16) r->n;
+		out->c.type = LION_CT_SPARSE;
+		out->c.flags = (uint8) len;
+		memcpy(out->data + LION_CONTAINER_HDRSZ, stream, Min(len, 255));
+	}
+	return len;
 }
 
 /* Insertion position of (ckey, lo) in the reference. */
@@ -149,6 +223,7 @@ ref_contains(const Ref *r, uint32 ckey, uint16 lo)
 	return i < r->n && r->p[i].ckey == ckey && r->p[i].lo == lo;
 }
 
+/* Insert; false for a duplicate and for a pair that does not fit. */
 static bool
 ref_insert(Ref *r, uint32 ckey, uint16 lo)
 {
@@ -165,6 +240,15 @@ ref_insert(Ref *r, uint32 ckey, uint16 lo)
 	r->p[i].ckey = ckey;
 	r->p[i].lo = lo;
 	r->n++;
+
+	if (ref_encode(r, NULL) > LION_SPARSE_MAX_BYTES)
+	{
+		/* full by bytes: take it out again */
+		for (j = i; j + 1 < r->n; j++)
+			r->p[j] = r->p[j + 1];
+		r->n--;
+		return false;
+	}
 	return true;
 }
 
@@ -228,24 +312,31 @@ compare(const LionContainer *s, const Ref *r, int line)
 {
 	const char *err = NULL;
 	IterState	it;
+	SBuf		expect;
+	uint32		nbytes = ref_encode(r, &expect);
 	uint32		i;
 
 	/* an empty segment is a work state only: it is never stored */
 	if (r->n > 0)
-		check_impl(lion_sparse_check(s, lion_sparse_size_for(r->n), &err), line,
+		check_impl(lion_sparse_check(s, lion_sparse_size_for(nbytes), &err), line,
 				   err ? err : "check() rejected a good segment");
 	else
-		check_impl(!lion_sparse_check(s, lion_sparse_size_for(r->n), &err) &&
+		check_impl(!lion_sparse_check(s, lion_sparse_size_for(nbytes), &err) &&
 				   err != NULL, line, "check() refuses an empty segment");
 	check_impl(s->cardinality == r->n, line, "cardinality matches");
-	check_impl(lion_sparse_size(s) == lion_sparse_size_for(r->n), line,
-			   "size matches the pair count");
+	check_impl(lion_sparse_nbytes(s) == nbytes, line,
+			   "the stream has the reference's length");
+	check_impl(lion_sparse_size(s) == lion_sparse_size_for(nbytes), line,
+			   "size matches the stream");
 	check_impl(s->type == LION_CT_SPARSE, line, "type is LION_CT_SPARSE");
 	check_impl(lion_item_size(s) == lion_sparse_size(s), line,
 			   "lion_item_size() dispatches to the segment size");
 
 	if (r->n > 0)
 	{
+		npair_cmps += r->n;
+		check_impl(memcmp(s, &expect, lion_sparse_size_for(nbytes)) == 0, line,
+				   "the bytes are the reference's encoding of the pairs");
 		check_impl(lion_item_first_ckey(s) == r->p[0].ckey, line,
 				   "first ckey matches");
 		check_impl(lion_item_last_ckey(s) == r->p[r->n - 1].ckey, line,
@@ -257,18 +348,7 @@ compare(const LionContainer *s, const Ref *r, int line)
 	}
 
 	if (s->cardinality != r->n)
-		return;					/* the payload comparison would be nonsense */
-
-	for (i = 0; i < r->n; i++)
-	{
-		npair_cmps++;
-		if (LION_SPARSE_CKEYS_CONST(s)[i] != r->p[i].ckey ||
-			LION_SPARSE_LOS_CONST(s)[i] != r->p[i].lo)
-		{
-			check_impl(false, line, "pair matches the reference");
-			break;
-		}
-	}
+		return;					/* the answers below would be nonsense */
 
 	/* contains() and count() for every ckey present, and for its neighbours */
 	for (i = 0; i < r->n; i++)
@@ -290,7 +370,8 @@ compare(const LionContainer *s, const Ref *r, int line)
 		}
 		lion_sparse_find(s, r->p[i].ckey, &first, &count);
 		if (count != ref_count(r, r->p[i].ckey) ||
-			LION_SPARSE_CKEYS_CONST(s)[first] != r->p[i].ckey)
+			first >= r->n || r->p[first].ckey != r->p[i].ckey ||
+			(first > 0 && r->p[first - 1].ckey == r->p[i].ckey))
 		{
 			check_impl(false, line, "find() returns the right range");
 			break;
@@ -312,6 +393,24 @@ compare(const LionContainer *s, const Ref *r, int line)
 
 #define COMPARE(s, r)	compare(&(s)->c, (r), __LINE__)
 
+/* Fill a segment and its reference with the pairs of codes[0 .. n). */
+static void
+fill_codes(SBuf *b, Ref *r, const uint64 *codes, uint32 n)
+{
+	uint32		i;
+
+	ref_init(r);
+	lion_sparse_init(&b->c, 0);
+	for (i = 0; i < n; i++)
+	{
+		uint32		ckey = (uint32) (codes[i] >> LION_CONTAINER_BITS);
+		uint16		lo = (uint16) (codes[i] & LION_LO_MASK);
+
+		CHECK(lion_sparse_insert(&b->c, ckey, lo, NULL), "a fixture pair goes in");
+		ref_insert(r, ckey, lo);
+	}
+}
+
 /* ----------------------------------------------------------------
  *								tests
  * ----------------------------------------------------------------
@@ -330,15 +429,17 @@ test_empty(void)
 
 	CHECK(b.c.cardinality == 0, "a fresh segment is empty");
 	CHECK(b.c.type == LION_CT_SPARSE, "a fresh segment is a segment");
-	CHECK(b.c.flags == 0, "a fresh segment has no flags");
+	CHECK(b.c.flags == 0, "a fresh segment has no stream");
 	CHECK(lion_sparse_size(&b.c) == LION_CONTAINER_HDRSZ, "an empty segment is a header");
 	CHECK(!lion_sparse_check(&b.c, LION_CONTAINER_HDRSZ, &err) && err != NULL,
 		  "check() refuses an empty segment, which is never stored");
 	CHECK(lion_item_last_ckey(&b.c) == 0,
-		  "an empty segment's last ckey is its header's, not a pair before the first");
+		  "an empty segment's last ckey is its header's");
 	CHECK(!lion_sparse_contains(&b.c, 0, 0), "an empty segment contains nothing");
 	CHECK(lion_sparse_count(&b.c, 17) == 0, "count() of an empty segment is 0");
 	CHECK(!lion_sparse_remove(&b.c, 1, 1), "remove() from an empty segment says no");
+	CHECK(lion_sparse_insert_size(&b.c, 5, 3) == LION_CONTAINER_HDRSZ + 1,
+		  "insert_size() of a first pair is a header and its lo");
 	COMPARE(&b, &r);
 }
 
@@ -359,53 +460,68 @@ test_one_pair(void)
 	COMPARE(&b, &r);
 
 	CHECK(b.c.ckey == 12345, "the header carries the first ckey");
-	CHECK(lion_sparse_size(&b.c) == LION_CONTAINER_HDRSZ + 6, "one pair costs 6 bytes");
+	CHECK(lion_sparse_size(&b.c) == LION_CONTAINER_HDRSZ + 2,
+		  "a lo of 777 is a two-byte varint");
+	CHECK(lion_sparse_size(&b.c) <= LION_SPARSE_SINGLETON_MAX,
+		  "a one-pair segment fits LION_SPARSE_SINGLETON_MAX");
 
 	CHECK(lion_sparse_insert(&b.c, 12345, 777, &dup), "re-inserting is not an error");
 	CHECK(dup, "re-inserting reports a duplicate");
+	CHECK(lion_sparse_insert_size(&b.c, 12345, 777) == lion_sparse_size(&b.c),
+		  "insert_size() of a pair already there is the size");
 	COMPARE(&b, &r);
 
 	CHECK(lion_sparse_remove(&b.c, 12345, 777), "remove finds the pair");
 	ref_remove(&r, 12345, 777);
 	COMPARE(&b, &r);
 	CHECK(b.c.cardinality == 0, "the segment is empty again");
+
+	/* the first lo's varint is one, two or three bytes, never more */
+	{
+		static const uint16 los[] = {0, 127, 128, 16383, 16384, 32767};
+		static const Size sizes[] = {1, 1, 2, 2, 3, 3};
+		int			i;
+
+		for (i = 0; i < (int) lengthof(los); i++)
+		{
+			ref_init(&r);
+			lion_sparse_init(&b.c, 0);
+			CHECK(lion_sparse_insert(&b.c, 9, los[i], NULL), "insert of a single lo");
+			ref_insert(&r, 9, los[i]);
+			COMPARE(&b, &r);
+			CHECK(lion_sparse_size(&b.c) == LION_CONTAINER_HDRSZ + sizes[i],
+				  "the first pair's varint is as long as its lo needs");
+			CHECK(lion_sparse_size(&b.c) <= LION_SPARSE_SINGLETON_MAX,
+				  "and within LION_SPARSE_SINGLETON_MAX");
+		}
+	}
 }
 
 /*
- * n = 1, n = LION_SPARSE_MAX_PAIRS and the 683rd pair that must be refused.
+ * The cap: 255 bytes of stream, so at most 255 pairs (deltas of one byte),
+ * and fewer when the deltas are long; the codes at either end of what a heap
+ * TID makes; and deltas of every varint length.
  */
 static void
 test_boundaries(void)
 {
 	SBuf		b;
 	Ref			r;
+	uint64		codes[LION_SPARSE_MAX_PAIRS];
 	uint32		i;
 
-	phase("boundaries: 1, 682, 683");
-	ref_init(&r);
-	lion_sparse_init(&b.c, 0);
-
+	phase("boundaries: 255 one-byte pairs, and the 256th");
 	for (i = 0; i < LION_SPARSE_MAX_PAIRS; i++)
-	{
-		bool		ok = lion_sparse_insert(&b.c, 1000 + i, (uint16) (i % 32768), NULL);
-
-		if (!ok)
-		{
-			CHECK(false, "insert below the limit succeeds");
-			break;
-		}
-		ref_insert(&r, 1000 + i, (uint16) (i % 32768));
-	}
+		codes[i] = (((uint64) 1000) << LION_CONTAINER_BITS) + i;	/* lo 0 .. 254 */
+	fill_codes(&b, &r, codes, LION_SPARSE_MAX_PAIRS);
 	COMPARE(&b, &r);
-	CHECK(b.c.cardinality == LION_SPARSE_MAX_PAIRS, "the segment holds 682 pairs");
-	CHECK(lion_sparse_size(&b.c) == 4100, "682 pairs occupy 4100 bytes");
-	CHECK(lion_sparse_size(&b.c) <= LION_CONTAINER_MAX_SIZE, "a full segment fits the item bound");
-	CHECK(lion_sparse_size_for(LION_SPARSE_MAX_PAIRS + 1) > LION_CONTAINER_MAX_SIZE,
-		  "683 pairs would not fit");
+	CHECK(b.c.cardinality == LION_SPARSE_MAX_PAIRS, "the segment holds 255 pairs");
+	CHECK(lion_sparse_size(&b.c) == LION_SPARSE_MAX_SIZE, "255 pairs of one byte fill 263 bytes");
 
-	CHECK(!lion_sparse_insert(&b.c, 999, 1, NULL), "the 683rd pair is refused (before)");
-	CHECK(!lion_sparse_insert(&b.c, 500000, 1, NULL), "the 683rd pair is refused (after)");
-	CHECK(!lion_sparse_insert(&b.c, 1000, 9999, NULL), "the 683rd pair is refused (inside)");
+	CHECK(lion_sparse_insert_size(&b.c, 999, 1) == 0, "insert_size() says full (before)");
+	CHECK(!lion_sparse_insert(&b.c, 999, 1, NULL), "the 256th pair is refused (before)");
+	CHECK(!lion_sparse_insert(&b.c, 500000, 1, NULL), "the 256th pair is refused (after)");
+	CHECK(!lion_sparse_insert(&b.c, 1000, 9999, NULL), "the 256th pair is refused (inside)");
 	COMPARE(&b, &r);
 
 	/* a duplicate is still reported as such, and does not count as full */
@@ -417,12 +533,96 @@ test_boundaries(void)
 	}
 
 	/* one out, one in */
-	CHECK(lion_sparse_remove(&b.c, 1000, 0), "removing from a full segment");
-	ref_remove(&r, 1000, 0);
-	CHECK(lion_sparse_insert(&b.c, 77, 3, NULL), "and there is room again");
-	ref_insert(&r, 77, 3);
+	CHECK(lion_sparse_remove(&b.c, 1000, 7), "removing from a full segment");
+	ref_remove(&r, 1000, 7);
+	CHECK(lion_sparse_insert(&b.c, 1000, 7, NULL), "and there is room again");
+	ref_insert(&r, 1000, 7);
 	COMPARE(&b, &r);
-	CHECK(b.c.ckey == 77, "the header follows the new first pair");
+
+	phase("boundaries: full by bytes");
+	{
+		/* six-byte deltas (2^35 and more apart): 1 + 6k bytes */
+		uint64		step = UINT64CONST(1) << 35;
+		uint32		n = 0;
+
+		ref_init(&r);
+		lion_sparse_init(&b.c, 0);
+		while (ref_insert(&r, (uint32) ((n * step) >> LION_CONTAINER_BITS), 3))
+		{
+			CHECK(lion_sparse_insert(&b.c, (uint32) ((n * step) >> LION_CONTAINER_BITS), 3, NULL),
+				  "a long delta goes in while the reference says it fits");
+			n++;
+		}
+		COMPARE(&b, &r);
+		CHECK(n == 1 + (LION_SPARSE_MAX_BYTES - 1) / 6, "43 pairs of six-byte deltas fit");
+		CHECK(!lion_sparse_insert(&b.c, (uint32) ((n * step) >> LION_CONTAINER_BITS), 3, NULL),
+			  "and the next one is refused, though the pair count is far from the cap");
+		CHECK(lion_sparse_insert_size(&b.c, (uint32) ((n * step) >> LION_CONTAINER_BITS), 3) == 0,
+			  "insert_size() agrees");
+		/* a pair inside the range may still fit: it splits a delta */
+		CHECK(lion_sparse_insert_size(&b.c, 0, 4) != 0,
+			  "a pair right after the first still fits");
+		COMPARE(&b, &r);
+	}
+
+	phase("boundaries: the codes a heap TID can make");
+	{
+		uint64		maxcode = LION_SPARSE_MAX_CODE;
+		const char *err = NULL;
+
+		codes[0] = 0;
+		codes[1] = maxcode;
+		fill_codes(&b, &r, codes, 2);
+		COMPARE(&b, &r);
+		CHECK(lion_item_last_ckey(&b.c) == MAX_CKEY, "the last ckey is the largest there is");
+		CHECK(lion_sparse_size(&b.c) == LION_CONTAINER_HDRSZ + 1 + LION_SPARSE_VARINT_MAX,
+			  "the largest delta takes LION_SPARSE_VARINT_MAX bytes");
+		CHECK(lion_sparse_contains(&b.c, MAX_CKEY, (uint16) (maxcode & LION_LO_MASK)),
+			  "the largest code is found");
+
+		/* a code past it is refused by check() */
+		{
+			SBuf		x = b;
+			uint8	   *st = LION_SPARSE_STREAM(&x.c);
+
+			/* add one to the second delta: its first byte is 0x7F | 0x80 */
+			CHECK(st[1] == 0xFF, "the fixture's delta is all ones");
+			st[1] = 0x80;
+			st[2] = (uint8) (st[2] + 1);
+			err = NULL;
+			CHECK(!lion_sparse_check(&x.c, lion_sparse_size(&x.c), &err) && err != NULL,
+				  "a code past the largest heap TID is rejected");
+		}
+
+		/* the largest ckey as a segment's first: its base is still a code */
+		codes[0] = maxcode;
+		fill_codes(&b, &r, codes, 1);
+		COMPARE(&b, &r);
+		CHECK(b.c.ckey == MAX_CKEY, "a segment can start at the largest ckey");
+	}
+
+	phase("boundaries: deltas of every varint length");
+	{
+		uint32		len;
+
+		for (len = 1; len <= LION_SPARSE_VARINT_MAX; len++)
+		{
+			uint64		lo_delta = (len == 1) ? 1 : (UINT64CONST(1) << (7 * (len - 1)));
+			uint64		hi_delta = (UINT64CONST(1) << (7 * len)) - 1;
+
+			if (hi_delta > LION_SPARSE_MAX_CODE)
+				hi_delta = LION_SPARSE_MAX_CODE;
+			codes[0] = 0;
+			codes[1] = lo_delta;
+			codes[2] = lo_delta + hi_delta;
+			if (codes[2] > LION_SPARSE_MAX_CODE)
+				continue;
+			fill_codes(&b, &r, codes, 3);
+			COMPARE(&b, &r);
+			CHECK(lion_sparse_size(&b.c) == LION_CONTAINER_HDRSZ + 1 + 2 * len,
+				  "the shortest and the longest delta of a length take that length");
+		}
+	}
 }
 
 /* Inserting at the front, in the middle and at the back, in every order. */
@@ -457,6 +657,115 @@ test_insert_positions(void)
 		COMPARE(&b, &r);
 	}
 	CHECK(lion_sparse_count(&b.c, 55) == 3, "three members of one ckey");
+
+	/* a new first pair below the header's ckey, and one inside it */
+	lion_sparse_insert(&b.c, 3, 32767, NULL);
+	ref_insert(&r, 3, 32767);
+	COMPARE(&b, &r);
+	CHECK(b.c.ckey == 3, "the header follows a new first pair");
+	lion_sparse_insert(&b.c, 3, 0, NULL);
+	ref_insert(&r, 3, 0);
+	COMPARE(&b, &r);
+}
+
+/*
+ * The property the WAL delta of an INLINE insert depends on (DESIGN.md §25):
+ * a pair appended above every other changes the header's count and length
+ * and adds bytes at the end, and nothing else.
+ */
+static void
+test_append_tail(void)
+{
+	SBuf		b;
+	SBuf		before;
+	Ref			r;
+	uint32		i;
+	uint64		code = ((uint64) 70000) << LION_CONTAINER_BITS;
+
+	phase("an append changes only the header and the tail");
+	ref_init(&r);
+	lion_sparse_init(&b.c, 0);
+	rng_seed(UINT64CONST(0x5EED2400));
+	for (i = 0; i < 200; i++)
+	{
+		Size		oldsize = lion_sparse_size(&b.c);
+		bool		ok;
+
+		code += 1 + rng_below(i % 3 == 0 ? 400000 : 3000);
+		before = b;
+		ok = lion_sparse_insert(&b.c, (uint32) (code >> LION_CONTAINER_BITS),
+								(uint16) (code & LION_LO_MASK), NULL);
+		CHECK(ok == ref_insert(&r, (uint32) (code >> LION_CONTAINER_BITS),
+							   (uint16) (code & LION_LO_MASK)),
+			  "an append agrees with the reference");
+		if (!ok)
+			break;
+		/* the first pair sets the header ckey of the empty segment */
+		if (i > 0)
+			CHECK(memcmp(&before, &b, offsetof(LionContainer, cardinality)) == 0,
+				  "an append leaves the header ckey alone");
+		CHECK(before.c.type == b.c.type, "an append leaves the type alone");
+		CHECK(memcmp(before.data + LION_CONTAINER_HDRSZ, b.data + LION_CONTAINER_HDRSZ,
+					 oldsize - LION_CONTAINER_HDRSZ) == 0,
+			  "an append leaves every byte of the old stream where it was");
+		CHECK(lion_sparse_size(&b.c) - oldsize <= LION_SPARSE_VARINT_MAX,
+			  "an append adds one varint");
+	}
+	COMPARE(&b, &r);
+	CHECK(r.n > 50, "the fixture appended a fair number of pairs");
+}
+
+/* lion_sparse_append(), the bulk build's way, against insert(). */
+static void
+test_append(void)
+{
+	SBuf		a;
+	SBuf		b;
+	uint64		last = 0;
+	uint64		code = 0;
+	uint32		i;
+
+	phase("append() builds what insert() builds");
+	rng_seed(UINT64CONST(0x5EED2500));
+	lion_sparse_init(&a.c, 0);
+	lion_sparse_init(&b.c, 0);
+	for (i = 0; i < 1000; i++)
+	{
+		bool		r1;
+		bool		r2;
+
+		code += 1 + rng_below(i % 5 == 0 ? 3000000 : 20000);
+		r1 = lion_sparse_append(&a.c, &last, (uint32) (code >> LION_CONTAINER_BITS),
+								(uint16) (code & LION_LO_MASK));
+		r2 = lion_sparse_insert(&b.c, (uint32) (code >> LION_CONTAINER_BITS),
+								(uint16) (code & LION_LO_MASK), NULL);
+		CHECK(r1 == r2, "append() and insert() agree on what fits");
+		CHECK(memcmp(&a, &b, lion_sparse_size(&b.c)) == 0,
+			  "append() and insert() write the same bytes");
+		if (!r1)
+		{
+			/* start a new segment, as the build does */
+			lion_sparse_init(&a.c, 0);
+			lion_sparse_init(&b.c, 0);
+			CHECK(lion_sparse_append(&a.c, &last, (uint32) (code >> LION_CONTAINER_BITS),
+									 (uint16) (code & LION_LO_MASK)),
+				  "a pair always fits an empty segment");
+			(void) lion_sparse_insert(&b.c, (uint32) (code >> LION_CONTAINER_BITS),
+									  (uint16) (code & LION_LO_MASK), NULL);
+		}
+		CHECK(last == code, "append() keeps the last code");
+	}
+
+	/* a repeat or a pair out of order is still handled */
+	{
+		uint64		save = last;
+
+		CHECK(lion_sparse_append(&a.c, &last, (uint32) (code >> LION_CONTAINER_BITS),
+								 (uint16) (code & LION_LO_MASK)),
+			  "appending the last pair again is a no-op");
+		CHECK(last == save, "and leaves the last code");
+		CHECK(memcmp(&a, &b, lion_sparse_size(&b.c)) == 0, "and the bytes");
+	}
 }
 
 static void
@@ -488,8 +797,11 @@ test_remove(void)
 									   (rng_below(2) ? r.n / 2 : r.n - 1)) : 0;
 		uint32		ckey = r.p[idx].ckey;
 		uint16		lo = r.p[idx].lo;
+		Size		before = lion_sparse_size(&b.c);
 
 		CHECK(lion_sparse_remove(&b.c, ckey, lo), "remove finds the pair");
+		/* two deltas become one, which may be as long: 127 + 1 is 128 */
+		CHECK(lion_sparse_size(&b.c) <= before, "a removal never grows the segment");
 		ref_remove(&r, ckey, lo);
 		if ((r.n % 7) == 0)
 			COMPARE(&b, &r);
@@ -539,9 +851,10 @@ test_remove_if(void)
 			uint32		ckey = 5 + i / 2;
 			uint16		lo = (uint16) (i * 13 + mod);
 
-			lion_sparse_insert(&b.c, ckey, lo, NULL);
-			ref_insert(&r, ckey, lo);
+			if (lion_sparse_insert(&b.c, ckey, lo, NULL))
+				ref_insert(&r, ckey, lo);
 		}
+		COMPARE(&b, &r);
 
 		pa.mod = mod;
 		pa.rem = 0;
@@ -688,27 +1001,26 @@ test_split_half(void)
 	/* the normal case: a full segment with three members per ckey */
 	ref_init(&r);
 	lion_sparse_init(&b.c, 0);
-	for (i = 0; i < LION_SPARSE_MAX_PAIRS; i++)
+	for (i = 0; i < 2 * LION_SPARSE_MAX_PAIRS; i++)
 	{
 		uint32		ckey = 1000 + i / 3;
 		uint16		lo = (uint16) (i % 3 + 1);
 
-		lion_sparse_insert(&b.c, ckey, lo, NULL);
+		if (!lion_sparse_insert(&b.c, ckey, lo, NULL))
+			break;
 		ref_insert(&r, ckey, lo);
 	}
 	COMPARE(&b, &r);
-
+	CHECK(lion_sparse_insert_size(&b.c, 1000 + i / 3, (uint16) (i % 3 + 1)) == 0,
+		  "the fixture is full");
 	CHECK(lion_sparse_split_half(&b.c, &l.c, &rr.c), "a full segment splits");
 	CHECK(l.c.cardinality + rr.c.cardinality == r.n, "the halves hold every pair");
 	CHECK(l.c.cardinality > 0 && rr.c.cardinality > 0, "neither half is empty");
 	CHECK(lion_item_last_ckey(&l.c) < lion_item_first_ckey(&rr.c),
 		  "the halves do not overlap");
-	CHECK(lion_sparse_count(&l.c, lion_item_last_ckey(&l.c)) +
-		  lion_sparse_count(&rr.c, lion_item_last_ckey(&l.c)) ==
-		  lion_sparse_count(&l.c, lion_item_last_ckey(&l.c)),
-		  "no ckey ends up in both halves");
-	CHECK(l.c.cardinality < LION_SPARSE_MAX_PAIRS &&
-		  rr.c.cardinality < LION_SPARSE_MAX_PAIRS, "both halves have room");
+	CHECK(lion_sparse_nbytes(&l.c) < LION_SPARSE_MAX_BYTES - 2 * LION_SPARSE_VARINT_MAX &&
+		  lion_sparse_nbytes(&rr.c) < LION_SPARSE_MAX_BYTES - 2 * LION_SPARSE_VARINT_MAX,
+		  "both halves have room");
 
 	{
 		Ref			lref;
@@ -834,15 +1146,23 @@ test_merge(void)
 
 		lion_sparse_init(&x.c, 0);
 		lion_sparse_init(&y.c, 0);
-		for (i = 0; i < 400; i++)
-			lion_sparse_insert(&x.c, 1 + i, (uint16) i, NULL);
-		for (i = 0; i < 400; i++)
-			lion_sparse_insert(&y.c, 1000 + i, (uint16) i, NULL);
-		CHECK(!lion_sparse_merge(&x.c, &y.c, &out.c), "800 pairs do not fit one segment");
-		for (i = 0; i < 118; i++)
-			lion_sparse_remove(&y.c, 1000 + i, (uint16) i);
-		CHECK(lion_sparse_merge(&x.c, &y.c, &out.c), "682 pairs do");
-		CHECK(out.c.cardinality == LION_SPARSE_MAX_PAIRS, "and fill the segment exactly");
+		for (i = 0; i < 200; i++)
+			lion_sparse_insert(&x.c, 1, (uint16) i, NULL);
+		for (i = 0; i < 200; i++)
+			lion_sparse_insert(&y.c, 2, (uint16) i, NULL);
+		CHECK(!lion_sparse_merge(&x.c, &y.c, &out.c), "400 pairs do not fit one segment");
+		/*
+		 * x is 200 bytes; y's first pair is 32569 past x's last, three
+		 * bytes, and each later one a byte: 53 pairs of y make 255.
+		 */
+		for (i = 0; i < 147; i++)
+			lion_sparse_remove(&y.c, 2, (uint16) (199 - i));
+		CHECK(lion_sparse_merge(&x.c, &y.c, &out.c), "253 pairs in 255 bytes do");
+		CHECK(out.c.cardinality == 253 &&
+			  lion_sparse_nbytes(&out.c) == LION_SPARSE_MAX_BYTES,
+			  "and fill the segment exactly");
+		lion_sparse_insert(&y.c, 2, 53, NULL);
+		CHECK(!lion_sparse_merge(&x.c, &y.c, &out.c), "a byte more does not");
 	}
 
 	/* merging with an empty segment */
@@ -896,10 +1216,15 @@ test_check_rejects(void)
 	phase("check rejects");
 	lion_sparse_init(&b.c, 0);
 	for (i = 0; i < 10; i++)
-		lion_sparse_insert(&b.c, 100 + i / 2, (uint16) (i * 3), NULL);
+		lion_sparse_insert(&b.c, 100 + i / 2, (uint16) (i * 3 + 200), NULL);
 
 	err = NULL;
 	CHECK(lion_sparse_check(&b.c, lion_sparse_size(&b.c), &err), "the good image passes");
+	/* the fixture: pair 0 is (100, 200), a two-byte varint; pair 1 a one-byte delta 3 */
+	CHECK(LION_SPARSE_STREAM(&b.c)[0] == (uint8) (0x80 | (200 & 0x7F)) &&
+		  LION_SPARSE_STREAM(&b.c)[1] == (uint8) (200 >> 7) &&
+		  LION_SPARSE_STREAM(&b.c)[2] == 3,
+		  "the fixture's first pairs are what the format says");
 
 	{
 		SBuf		x = b;
@@ -912,18 +1237,42 @@ test_check_rejects(void)
 	{
 		SBuf		x = b;
 
-		x.c.flags = 3;
-		err = NULL;
-		CHECK(!lion_sparse_check(&x.c, lion_sparse_size(&b.c), &err) && err != NULL,
-			  "non-zero flags are rejected");
-	}
-	{
-		SBuf		x = b;
-
 		x.c.cardinality = (uint16) (LION_SPARSE_MAX_PAIRS + 1);
 		err = NULL;
 		CHECK(!lion_sparse_check(&x.c, LION_CONTAINER_MAX_SIZE, &err) && err != NULL,
 			  "too many pairs are rejected");
+	}
+	{
+		SBuf		x = b;
+
+		x.c.cardinality = (uint16) (lion_sparse_nbytes(&x.c) + 1);
+		err = NULL;
+		CHECK(!lion_sparse_check(&x.c, LION_CONTAINER_MAX_SIZE, &err) && err != NULL,
+			  "more pairs than bytes are rejected");
+	}
+	{
+		SBuf		x = b;
+
+		x.c.cardinality--;
+		err = NULL;
+		CHECK(!lion_sparse_check(&x.c, lion_sparse_size(&b.c), &err) && err != NULL,
+			  "a stream with bytes after the last pair the header counts is rejected");
+	}
+	{
+		SBuf		x = b;
+
+		x.c.cardinality++;
+		err = NULL;
+		CHECK(!lion_sparse_check(&x.c, lion_sparse_size(&b.c), &err) && err != NULL,
+			  "a header counting more pairs than the stream holds is rejected");
+	}
+	{
+		SBuf		x = b;
+
+		x.c.flags--;
+		err = NULL;
+		CHECK(!lion_sparse_check(&x.c, lion_sparse_size(&b.c), &err) && err != NULL,
+			  "a stream cut inside its last varint is rejected");
 	}
 	{
 		SBuf		x = b;
@@ -938,46 +1287,61 @@ test_check_rejects(void)
 	{
 		SBuf		x = b;
 
-		x.c.ckey = 0;
+		uint8	   *st = LION_SPARSE_STREAM(&x.c);
+		uint32		v = LION_CONTAINER_RANGE + 200;
+
+		/*
+		 * The same codes from a header ckey one lower: the first delta is
+		 * then 32768 + 200, three bytes, and no lo.  (Changing the header
+		 * ckey alone would shift every code and make another valid segment.)
+		 */
+		x.c.ckey = 99;
+		memmove(st + 3, st + 2, lion_sparse_nbytes(&x.c) - 2);
+		st[0] = (uint8) (0x80 | (v & 0x7F));
+		st[1] = (uint8) (0x80 | ((v >> 7) & 0x7F));
+		st[2] = (uint8) (v >> 14);
+		x.c.flags++;
 		err = NULL;
-		CHECK(!lion_sparse_check(&x.c, lion_sparse_size(&b.c), &err) && err != NULL,
+		CHECK(!lion_sparse_check(&x.c, lion_sparse_size(&x.c), &err) && err != NULL,
 			  "a header key that is not the first ckey is rejected");
 	}
 	{
 		SBuf		x = b;
-		uint32	   *ckeys = LION_SPARSE_CKEYS(&x.c);
-		uint32		t = ckeys[0];
 
-		ckeys[0] = ckeys[3];
-		ckeys[3] = t;
-		x.c.ckey = ckeys[0];
+		/* a delta of 0: a duplicate pair, which unique codes never make */
+		LION_SPARSE_STREAM(&x.c)[2] = 0;
 		err = NULL;
 		CHECK(!lion_sparse_check(&x.c, lion_sparse_size(&b.c), &err) && err != NULL,
-			  "unsorted ckeys are rejected");
+			  "a zero delta (a duplicate pair) is rejected");
 	}
 	{
 		SBuf		x = b;
-		uint16	   *los = LION_SPARSE_LOS(&x.c);
+		uint8	   *st = LION_SPARSE_STREAM(&x.c);
 
-		los[1] = los[0];
+		/* the one-byte delta 3 written long, as 0x83 0x00: one byte more */
+		memmove(st + 4, st + 3, lion_sparse_nbytes(&x.c) - 3);
+		st[2] = 0x83;
+		st[3] = 0x00;
+		x.c.flags++;
 		err = NULL;
-		CHECK(!lion_sparse_check(&x.c, lion_sparse_size(&b.c), &err) && err != NULL,
-			  "a duplicate pair is rejected");
+		CHECK(!lion_sparse_check(&x.c, lion_sparse_size(&x.c), &err) && err != NULL,
+			  "a delta not in its shortest form is rejected");
 	}
 	{
 		SBuf		x = b;
-		uint16	   *los = LION_SPARSE_LOS(&x.c);
-		uint16		t;
+		uint8	   *st = LION_SPARSE_STREAM(&x.c);
+		uint32		k;
 
-		/* pairs 0 and 1 share a ckey, so swapping their los is a violation */
-		CHECK(LION_SPARSE_CKEYS_CONST(&x.c)[0] == LION_SPARSE_CKEYS_CONST(&x.c)[1],
-			  "the fixture really has two members of one ckey");
-		t = los[0];
-		los[0] = los[1];
-		los[1] = t;
+		/* a delta of more bytes than any code needs */
+		x.c.cardinality = 2;
+		st[2] = 0x81;
+		for (k = 3; k < 2 + LION_SPARSE_VARINT_MAX; k++)
+			st[k] = 0x80;
+		st[k] = 0x01;
+		x.c.flags = (uint8) (k + 1);
 		err = NULL;
-		CHECK(!lion_sparse_check(&x.c, lion_sparse_size(&b.c), &err) && err != NULL,
-			  "descending los within a ckey are rejected");
+		CHECK(!lion_sparse_check(&x.c, lion_sparse_size(&x.c), &err) && err != NULL,
+			  "a delta longer than LION_SPARSE_VARINT_MAX bytes is rejected");
 	}
 
 	/* the container check must refuse a segment, and say so */
@@ -1178,18 +1542,18 @@ damage_lo_cb(uint16 lo, void *arg)
 }
 
 /*
- * Every function of the segment library over s, in exact
- * LION_CONTAINER_MAX_SIZE buffers, checking what is promised for any bytes:
- * no access outside a buffer, at most LION_SPARSE_MAX_PAIRS pairs looked at,
- * and a segment a mutator leaves behind no larger than
- * LION_CONTAINER_MAX_SIZE.  s is left unchanged.
+ * Every function of the segment library over s, which has
+ * LION_SPARSE_MAX_SIZE bytes, with work buffers of exactly that size,
+ * checking what is promised for any bytes: no access outside a buffer, at
+ * most LION_SPARSE_MAX_PAIRS pairs looked at, and a segment a mutator leaves
+ * behind no larger than LION_SPARSE_MAX_SIZE.  s is left unchanged.
  */
 static void
 damage_exercise_segment(const LionContainer *s, LionContainer *work,
 						LionContainer *left, LionContainer *right,
-						LionContainer *cont)
+						LionContainer *merged, LionContainer *cont)
 {
-	uint32		ckey = LION_SPARSE_CKEYS_CONST(s)[rng_below(LION_SPARSE_MAX_PAIRS)];
+	uint32		ckey = s->ckey + rng_below(64);
 	uint16		lo = (uint16) rng_below(LION_CONTAINER_RANGE);
 	uint32		first;
 	uint32		count;
@@ -1199,10 +1563,11 @@ damage_exercise_segment(const LionContainer *s, LionContainer *work,
 	lion_sparse_find(s, ckey, &first, &count);
 	CHECK(first + count <= LION_SPARSE_MAX_PAIRS, "damaged: find() stays within the pairs");
 	(void) lion_sparse_count(s, ckey + 1);
+	(void) lion_sparse_insert_size(s, ckey, lo);
 	damage_pairs = 0;
 	damage_bad_lo = 0;
 	lion_sparse_iterate(s, damage_count_cb, NULL);
-	CHECK(damage_pairs <= LION_SPARSE_MAX_PAIRS, "damaged: iterate() visits at most 682 pairs");
+	CHECK(damage_pairs <= LION_SPARSE_MAX_PAIRS, "damaged: iterate() visits at most 255 pairs");
 	CHECK(damage_bad_lo == 0, "damaged: iterate() hands out only lo values in range");
 	memset(damage_img, 0, LION_BITSET_BYTES);
 	lion_sparse_iterate(s, damage_img_cb, NULL);
@@ -1220,45 +1585,53 @@ damage_exercise_segment(const LionContainer *s, LionContainer *work,
 		const char *err = NULL;
 
 		if (s->cardinality == 0)
-			CHECK(!lion_sparse_check(s, LION_CONTAINER_MAX_SIZE, &err) && err != NULL,
+			CHECK(!lion_sparse_check(s, LION_SPARSE_MAX_SIZE, &err) && err != NULL,
 				  "damaged: check() refuses an empty segment");
 		else
-			(void) lion_sparse_check(s, LION_CONTAINER_MAX_SIZE, &err);
+			(void) lion_sparse_check(s, LION_SPARSE_MAX_SIZE, &err);
 	}
 
 	if (lion_sparse_split_half(s, left, right))
-		CHECK(lion_sparse_size(left) <= LION_CONTAINER_MAX_SIZE &&
-			  lion_sparse_size(right) <= LION_CONTAINER_MAX_SIZE,
+		CHECK(lion_sparse_size(left) <= LION_SPARSE_MAX_SIZE &&
+			  lion_sparse_size(right) <= LION_SPARSE_MAX_SIZE,
 			  "damaged: split_half() halves fit a work buffer");
-	CHECK(guard_ok(left, LION_CONTAINER_MAX_SIZE) && guard_ok(right, LION_CONTAINER_MAX_SIZE),
+	CHECK(guard_ok(left, LION_SPARSE_MAX_SIZE) && guard_ok(right, LION_SPARSE_MAX_SIZE),
 		  "damaged: split_half() stays inside its buffers");
 	lion_sparse_split_at(s, ckey, left, right);
-	CHECK(lion_sparse_size(left) <= LION_CONTAINER_MAX_SIZE &&
-		  lion_sparse_size(right) <= LION_CONTAINER_MAX_SIZE,
-		  "damaged: split_at() parts fit a work buffer");
-	CHECK(guard_ok(left, LION_CONTAINER_MAX_SIZE) && guard_ok(right, LION_CONTAINER_MAX_SIZE),
+	CHECK(guard_ok(left, LION_SPARSE_MAX_SIZE) && guard_ok(right, LION_SPARSE_MAX_SIZE),
 		  "damaged: split_at() stays inside its buffers");
-	(void) lion_sparse_merge(s, s, work);
-	CHECK(guard_ok(work, LION_CONTAINER_MAX_SIZE), "damaged: merge() stays inside its buffer");
+	(void) lion_sparse_merge(left, right, merged);
+	CHECK(guard_ok(merged, LION_SPARSE_MAX_SIZE), "damaged: merge() stays inside its buffer");
+	(void) lion_sparse_merge(s, s, merged);
+	CHECK(guard_ok(merged, LION_SPARSE_MAX_SIZE), "damaged: merge() stays inside its buffer");
 
 #define DAMAGE_MUTATE(what, stmt) \
 	do { \
-		memcpy(work, s, LION_CONTAINER_MAX_SIZE); \
+		memcpy(work, s, LION_SPARSE_MAX_SIZE); \
 		stmt; \
-		CHECK(lion_sparse_size(work) <= LION_CONTAINER_MAX_SIZE, \
-			  "damaged: " what " leaves a segment of at most 4104 bytes"); \
-		CHECK(guard_ok(work, LION_CONTAINER_MAX_SIZE), \
+		CHECK(lion_sparse_size(work) <= LION_SPARSE_MAX_SIZE, \
+			  "damaged: " what " leaves a segment of at most 263 bytes"); \
+		CHECK(guard_ok(work, LION_SPARSE_MAX_SIZE), \
 			  "damaged: " what " stays inside its buffer"); \
 	} while (0)
 
 	DAMAGE_MUTATE("insert()", (void) lion_sparse_insert(work, ckey, lo, NULL));
+	{
+		Size		need = lion_sparse_insert_size(s, ckey, lo);
+
+		memcpy(work, s, LION_SPARSE_MAX_SIZE);
+		if (need != 0 && lion_sparse_insert(work, ckey, lo, NULL))
+			CHECK(lion_sparse_size(work) == need ||
+				  lion_sparse_size(work) == lion_sparse_size(s),
+				  "damaged: insert() writes what insert_size() said");
+	}
 	DAMAGE_MUTATE("remove()", (void) lion_sparse_remove(work, ckey, lo));
 	damage_seed = rng_next();
 	damage_pairs = 0;
 	damage_bad_lo = 0;
 	DAMAGE_MUTATE("remove_if()", (void) lion_sparse_remove_if(work, damage_pair_pred, NULL));
 	CHECK(damage_pairs <= LION_SPARSE_MAX_PAIRS,
-		  "damaged: remove_if() asks about at most 682 pairs");
+		  "damaged: remove_if() asks about at most 255 pairs");
 	CHECK(damage_bad_lo == 0,
 		  "damaged: remove_if() asks only about lo values in range");
 	DAMAGE_MUTATE("extract()", (void) lion_sparse_extract(work, ckey, cont));
@@ -1273,10 +1646,11 @@ damage_exercise_segment(const LionContainer *s, LionContainer *work,
 static void
 test_damaged(uint32 iters, uint64 seed)
 {
-	LionContainer *s = exact_alloc(LION_CONTAINER_MAX_SIZE);
-	LionContainer *work = exact_alloc(LION_CONTAINER_MAX_SIZE);
-	LionContainer *left = exact_alloc(LION_CONTAINER_MAX_SIZE);
-	LionContainer *right = exact_alloc(LION_CONTAINER_MAX_SIZE);
+	LionContainer *s = exact_alloc(LION_SPARSE_MAX_SIZE);
+	LionContainer *work = exact_alloc(LION_SPARSE_MAX_SIZE);
+	LionContainer *left = exact_alloc(LION_SPARSE_MAX_SIZE);
+	LionContainer *right = exact_alloc(LION_SPARSE_MAX_SIZE);
+	LionContainer *merged = exact_alloc(LION_SPARSE_MAX_SIZE);
 	LionContainer *cont = exact_alloc(LION_CONTAINER_MAX_SIZE);
 	uint32		it;
 	uint32		i;
@@ -1284,66 +1658,61 @@ test_damaged(uint32 iters, uint64 seed)
 	damage_img = exact_alloc(LION_BITSET_BYTES);
 
 	/*
-	 * The case a 2026-09 review found: VACUUM copies a page item into a
-	 * LION_CONTAINER_MAX_SIZE buffer by its line pointer's length, and
-	 * lion_sparse_remove_if() indexed its keep[682] by the header's count.
+	 * The case a 2026-09 review found for the old fixed-width format:
+	 * VACUUM copies a page item into a work buffer by its line pointer's
+	 * length, and a header claiming more pairs than there are must not walk
+	 * any function past the stream.
 	 */
 	phase("damaged: a segment claiming 1000 pairs, filtered");
 	rng_seed(seed);
 	lion_sparse_init(s, 0);
-	for (i = 0; i < LION_SPARSE_MAX_PAIRS; i++)
+	for (i = 0; i < 2 * LION_SPARSE_MAX_PAIRS; i++)
 		(void) lion_sparse_insert(s, i / 2, (uint16) (i * 7), NULL);
 	s->cardinality = 1000;
-	memcpy(work, s, LION_CONTAINER_MAX_SIZE);
+	memcpy(work, s, LION_SPARSE_MAX_SIZE);
 	damage_seed = 0;
 	(void) lion_sparse_remove_if(work, damage_pair_pred, NULL);
-	CHECK(work->cardinality <= LION_SPARSE_MAX_PAIRS, "remove_if() leaves at most 682 pairs");
-	CHECK(guard_ok(work, LION_CONTAINER_MAX_SIZE), "remove_if() stays inside its buffer");
-	damage_exercise_segment(s, work, left, right, cont);
+	CHECK(work->cardinality <= LION_SPARSE_MAX_PAIRS, "remove_if() leaves at most 255 pairs");
+	CHECK(guard_ok(work, LION_SPARSE_MAX_SIZE), "remove_if() stays inside its buffer");
+	damage_exercise_segment(s, work, left, right, merged, cont);
 	s->cardinality = 65535;
-	damage_exercise_segment(s, work, left, right, cont);
-
-	/* pairs out of order, duplicated, and lo values past the range */
-	phase("damaged: a segment of unordered pairs");
-	lion_sparse_init(s, 0);
-	s->cardinality = LION_SPARSE_MAX_PAIRS;
-	for (i = 0; i < LION_SPARSE_MAX_PAIRS; i++)
-	{
-		LION_SPARSE_CKEYS(s)[i] = (i % 3 == 0) ? 5 : 1000 - i;
-		LION_SPARSE_LOS(s)[i] = (uint16) (65535 - 13 * i);
-	}
-	s->ckey = LION_SPARSE_CKEYS(s)[0];
-	damage_exercise_segment(s, work, left, right, cont);
+	damage_exercise_segment(s, work, left, right, merged, cont);
 
 	/*
-	 * The two a 2026-09-27 review found: a lo past the range, which the
-	 * window scan's callback indexed its bitset image with, and an empty
-	 * segment, whose last ckey was read 16 GiB past it.
+	 * Deltas that wrap the code around: pairs out of order and repeated, as
+	 * the damaged fixed-width segments had them.
 	 */
-	phase("damaged: a segment whose lo values are past 32767");
-	lion_sparse_init(s, 7);
-	s->cardinality = 3;
-	LION_SPARSE_CKEYS(s)[0] = 7;
-	LION_SPARSE_CKEYS(s)[1] = 7;
-	LION_SPARSE_CKEYS(s)[2] = 9;
-	LION_SPARSE_LOS(s)[0] = 32768;
-	LION_SPARSE_LOS(s)[1] = 40000;
-	LION_SPARSE_LOS(s)[2] = 65535;
-	memset(damage_img, 0, LION_BITSET_BYTES);
-	lion_sparse_iterate(s, damage_img_cb, NULL);
-	CHECK(guard_ok(damage_img, LION_BITSET_BYTES) &&
-		  (damage_img[0] & 1) != 0 &&
-		  (damage_img[(40000 - 32768) >> 6] & (UINT64CONST(1) << (40000 & 63))) != 0 &&
-		  (damage_img[LION_BITSET_WORDS - 1] >> 63) != 0,
-		  "iterate() hands out lo values masked into range");
-	memcpy(work, s, LION_CONTAINER_MAX_SIZE);
-	CHECK(lion_sparse_extract(work, 7, cont) == 2 &&
-		  lion_container_contains(cont, 0) && lion_container_contains(cont, 40000 - 32768),
-		  "extract() builds a container of the masked values");
-	damage_exercise_segment(s, work, left, right, cont);
+	phase("damaged: a stream of wrapping deltas");
+	lion_sparse_init(s, 5);
+	{
+		uint8	   *st = LION_SPARSE_STREAM(s);
+		uint32		k = 0;
 
+		while (k + 10 <= LION_SPARSE_MAX_BYTES)
+		{
+			uint32		j;
+
+			/* ten-byte varints of 2^64 - 1 - rng: a step backwards */
+			uint64		v = ~((uint64) rng_below(1 << 20));
+
+			for (j = 0; j < 9; j++)
+			{
+				st[k++] = (uint8) (v | 0x80);
+				v >>= 7;
+			}
+			st[k++] = (uint8) v;
+			s->cardinality++;
+		}
+		s->flags = (uint8) k;
+	}
+	damage_exercise_segment(s, work, left, right, merged, cont);
+
+	/*
+	 * An empty segment, whose last ckey was read 16 GiB past it in the old
+	 * format (2026-09-27 review).
+	 */
 	phase("damaged: an empty segment");
-	for (i = 0; i < LION_CONTAINER_MAX_SIZE; i++)
+	for (i = 0; i < LION_SPARSE_MAX_SIZE; i++)
 		((char *) s)[i] = (char) 0xFF;
 	lion_sparse_init(s, 12345);
 	CHECK(lion_item_last_ckey(s) == 12345 && lion_item_covers(s, 12345) &&
@@ -1352,39 +1721,51 @@ test_damaged(uint32 iters, uint64 seed)
 	damage_pairs = 0;
 	lion_sparse_iterate(s, damage_count_cb, NULL);
 	CHECK(damage_pairs == 0, "iterate() of an empty segment visits nothing");
-	damage_exercise_segment(s, work, left, right, cont);
+	damage_exercise_segment(s, work, left, right, merged, cont);
+
+	/* a stream that ends inside a varint: every byte has the high bit */
+	phase("damaged: a stream of continuation bytes");
+	lion_sparse_init(s, 77);
+	memset(LION_SPARSE_STREAM(s), 0xFF, LION_SPARSE_MAX_BYTES);
+	s->flags = LION_SPARSE_MAX_BYTES;
+	s->cardinality = 3;
+	damage_pairs = 0;
+	lion_sparse_iterate(s, damage_count_cb, NULL);
+	CHECK(damage_pairs == 0, "iterate() of a stream with no last byte visits nothing");
+	damage_exercise_segment(s, work, left, right, merged, cont);
 
 	phase("damaged: random segments");
 	for (it = 0; it < iters; it++)
 	{
-		for (i = 0; i < LION_CONTAINER_MAX_SIZE; i++)
+		for (i = 0; i < LION_SPARSE_MAX_SIZE; i++)
 			((char *) s)[i] = (char) rng_next();
 		s->type = LION_CT_SPARSE;
-		s->flags = 0;
 		s->cardinality = (uint16) ((it % 3 == 0) ? rng_below(LION_SPARSE_MAX_PAIRS + 1) : rng_next());
 		if (it % 3 == 1)
 		{
-			/* plausible: ascending ckeys over a few values */
-			for (i = 0; i < LION_SPARSE_MAX_PAIRS; i++)
-				LION_SPARSE_CKEYS(s)[i] = 100 + i / (1 + rng_below(4));
+			/* plausible: short deltas, most of them one byte */
+			for (i = 0; i < LION_SPARSE_MAX_BYTES; i++)
+				LION_SPARSE_STREAM(s)[i] = (uint8) (rng_below(8) == 0 ?
+													0x80 | rng_next() : rng_below(128));
 		}
-		damage_exercise_segment(s, work, left, right, cont);
+		damage_exercise_segment(s, work, left, right, merged, cont);
 	}
 
 	free(s);
 	free(work);
 	free(left);
 	free(right);
+	free(merged);
 	free(cont);
 	free(damage_img);
 }
 
 /*
  * lion_sparse.h's contract for the in-place insert and its WAL redo
- * (lion_insert_segment_inplace(), LION_OP_SPARSE_INS): insert() into a segment
- * below LION_SPARSE_MAX_PAIRS pairs needs LION_SPARSE_PAIR_SIZE bytes past
- * its size.  Each insert runs on an allocation of exactly that, and must
- * leave the bytes an insert into a full-size buffer does.
+ * (lion_insert_segment_inplace(), LION_OP_SPARSE_INS): insert() writes
+ * exactly lion_sparse_insert_size() bytes and nothing past them.  Each
+ * insert runs on an allocation of exactly that, and must leave the bytes an
+ * insert into a full-size buffer does.
  */
 static void
 test_inplace_growth(void)
@@ -1396,37 +1777,45 @@ test_inplace_growth(void)
 
 	phase("insert() within the in-place growth contract");
 	rng_seed(UINT64CONST(0x5EED2100));
-	for (k = 0; k < 200; k++)
+	for (k = 0; k < 400; k++)
 	{
-		uint32		n = (k < 4) ? LION_SPARSE_MAX_PAIRS - 1 - k : rng_below(LION_SPARSE_MAX_PAIRS);
-		Size		alloc;
+		uint32		n = rng_below(LION_SPARSE_MAX_PAIRS);
+		uint32		spread = (k % 2) ? 2 * n + 1 : 50000;
 		LionContainer *p;
 		uint32		ckey;
 		uint16		lo;
-		bool		dup1 = false;
-		bool		dup2 = false;
-		bool		r1;
-		bool		r2;
 
 		lion_sparse_init(&ref.c, 0);
-		while (ref.c.cardinality < n)
-			(void) lion_sparse_insert(&ref.c, 1000 + rng_below(2 * n + 1),
+		for (i = 0; i < n; i++)
+			(void) lion_sparse_insert(&ref.c, 1000 + rng_below(spread),
 									  (uint16) rng_below(LION_CONTAINER_RANGE), NULL);
-		alloc = lion_sparse_size(&ref.c) + LION_SPARSE_PAIR_SIZE;
 
 		for (i = 0; i < 4; i++)
 		{
+			Size		alloc;
+			bool		dup1 = false;
+			bool		dup2 = false;
+			bool		r1;
+			bool		r2;
+
 			/* before, among and after the ckeys there are */
-			ckey = (i == 0) ? 999 : ((i == 3) ? 1000 + 2 * n + 1 : 1000 + rng_below(2 * n + 1));
+			ckey = (i == 0) ? 999 : ((i == 3) ? 1000 + spread : 1000 + rng_below(spread));
 			lo = (uint16) rng_below(LION_CONTAINER_RANGE);
+			alloc = lion_sparse_insert_size(&ref.c, ckey, lo);
+
+			memcpy(&full, &ref, sizeof(full));
+			r2 = lion_sparse_insert(&full.c, ckey, lo, &dup2);
+			if (alloc == 0)
+			{
+				CHECK(!r2, "insert() refuses what insert_size() says does not fit");
+				continue;
+			}
 
 			p = exact_alloc(alloc);
-			memcpy(p, &ref.c, lion_sparse_size(&ref.c));
-			memcpy(&full, &ref, sizeof(full));
+			memcpy(p, &ref.c, Min(alloc, lion_sparse_size(&ref.c)));
 			r1 = lion_sparse_insert(p, ckey, lo, &dup1);
-			r2 = lion_sparse_insert(&full.c, ckey, lo, &dup2);
 			CHECK(r1 && r2 && dup1 == dup2, "insert() in place succeeds as it does in a full buffer");
-			CHECK(lion_sparse_size(p) <= alloc, "insert() in place stays inside the item");
+			CHECK(lion_sparse_size(p) == alloc, "insert() in place fills what insert_size() said");
 			CHECK(guard_ok(p, alloc), "insert() in place writes nothing past the item");
 			CHECK(memcmp(p, &full, lion_sparse_size(p)) == 0,
 				  "insert() in place leaves the bytes it leaves in a full buffer");
@@ -1460,16 +1849,18 @@ test_random_ops(const char *name, uint32 nckeys, uint32 nops, uint64 seed)
 		if (what < 55)
 		{
 			bool		dup = false;
+			Size		need = lion_sparse_insert_size(&b.c, ckey, lo);
 			bool		ok = lion_sparse_insert(&b.c, ckey, lo, &dup);
 			bool		refok = ref_insert(&r, ckey, lo);
 
 			if (ok && !dup)
-				CHECK(refok, "insert agrees with the reference");
+				CHECK(refok && need == lion_sparse_size(&b.c),
+					  "insert agrees with the reference and with insert_size()");
 			else if (dup)
 				CHECK(!refok && ref_contains(&r, ckey, lo),
 					  "a duplicate is a duplicate for the reference too");
 			else
-				CHECK(r.n == LION_SPARSE_MAX_PAIRS, "insert only fails when full");
+				CHECK(!refok && need == 0, "insert only fails when full");
 		}
 		else if (what < 80)
 		{
@@ -1596,38 +1987,53 @@ test_random_ops(const char *name, uint32 nckeys, uint32 nops, uint64 seed)
 static void
 report_sizes(void)
 {
+	SBuf		b;
+	uint32		i;
+	uint64		code;
+
 	printf("\nsizes (bytes):\n");
-	printf("  %-44s %6zu\n", "segment header", (size_t) LION_CONTAINER_HDRSZ);
-	printf("  %-44s %6zu\n", "one pair", (size_t) LION_SPARSE_PAIR_SIZE);
-	printf("  %-44s %6zu\n", "1 pair", (size_t) lion_sparse_size_for(1));
-	printf("  %-44s %6zu\n", "3 pairs (one ckey at the threshold - 1)",
-		   (size_t) lion_sparse_size_for(3));
-	printf("  %-44s %6zu\n", "682 pairs (full)",
-		   (size_t) lion_sparse_size_for(LION_SPARSE_MAX_PAIRS));
-	printf("  %-44s %6zu\n", "3 one-member ARRAY containers instead",
+	printf("  %-52s %6zu\n", "segment header", (size_t) LION_CONTAINER_HDRSZ);
+	printf("  %-52s %6zu\n", "largest segment (255 bytes of stream)",
+		   (size_t) LION_SPARSE_MAX_SIZE);
+	printf("  %-52s %6zu\n", "one pair, largest", (size_t) LION_SPARSE_SINGLETON_MAX);
+	printf("  %-52s %6u\n", "longest delta", (unsigned) LION_SPARSE_VARINT_MAX);
+
+	/* pairs 512 heap blocks apart (a key of ~1 row in 25,000) */
+	lion_sparse_init(&b.c, 0);
+	code = 0;
+	for (i = 0; lion_sparse_insert(&b.c, (uint32) (code >> LION_CONTAINER_BITS),
+								   (uint16) (code & LION_LO_MASK), NULL); i++)
+		code += ((uint64) 512) << LION_OFFSET_BITS;
+	printf("  %-52s %6zu (%u pairs)\n", "full segment, rows 512 heap blocks apart",
+		   (size_t) lion_sparse_size(&b.c), (unsigned) b.c.cardinality);
+	printf("  %-52s %6zu\n", "the same pairs as uint32 ckey + uint16 lo",
+		   (size_t) (LION_CONTAINER_HDRSZ + 6 * b.c.cardinality));
+	printf("  %-52s %6zu\n", "3 one-member ARRAY containers instead of 3 pairs",
 		   (size_t) (3 * MAXALIGN(LION_CONTAINER_HDRSZ + sizeof(uint16)) + 3 * 4));
-	printf("  %-44s %6zu\n", "682 one-member ARRAY containers instead",
-		   (size_t) (682 * MAXALIGN(LION_CONTAINER_HDRSZ + sizeof(uint16)) + 682 * 4));
 }
 
 int
 main(void)
 {
 	printf("pg_lion sparse segment unit tests\n");
-	printf("  LION_SPARSE_MAX_PAIRS=%u LION_SPARSE_THRESHOLD=%d "
-		   "LION_SPARSE_PAIR_SIZE=%zu\n",
-		   LION_SPARSE_MAX_PAIRS, LION_SPARSE_THRESHOLD,
-		   (size_t) LION_SPARSE_PAIR_SIZE);
+	printf("  LION_SPARSE_MAX_PAIRS=%u LION_SPARSE_MAX_BYTES=%d "
+		   "LION_SPARSE_THRESHOLD=%d LION_SPARSE_VARINT_MAX=%d\n",
+		   LION_SPARSE_MAX_PAIRS, LION_SPARSE_MAX_BYTES, LION_SPARSE_THRESHOLD,
+		   (int) LION_SPARSE_VARINT_MAX);
 
 	CHECK(sizeof(LionContainer) == 8, "LionContainer header is 8 bytes");
-	CHECK(LION_SPARSE_MAX_PAIRS == 682, "LION_SPARSE_MAX_PAIRS is 682");
-	CHECK(lion_sparse_size_for(LION_SPARSE_MAX_PAIRS) <= LION_CONTAINER_MAX_SIZE,
-		  "a full segment fits the common item bound");
+	CHECK(LION_SPARSE_MAX_PAIRS == 255, "LION_SPARSE_MAX_PAIRS is 255");
+	CHECK(LION_SPARSE_MAX_SIZE <= LION_CONTAINER_MAX_SIZE,
+		  "a full segment fits a container work buffer");
+	CHECK(lion_sparse_varint_size(LION_SPARSE_MAX_CODE) == LION_SPARSE_VARINT_MAX,
+		  "LION_SPARSE_VARINT_MAX is the varint of the largest code");
 
 	test_empty();
 	test_one_pair();
 	test_boundaries();
 	test_insert_positions();
+	test_append_tail();
+	test_append();
 
 	rng_seed(UINT64CONST(0x5EED2000));
 	test_remove();
@@ -1648,6 +2054,8 @@ main(void)
 					UINT64CONST(0x5EED2002));
 	test_random_ops("random ops, 5000 ckeys (sparse)", 5000, 20000,
 					UINT64CONST(0x5EED2003));
+	test_random_ops("random ops, 4M ckeys (far apart)", 4000000, 20000,
+					UINT64CONST(0x5EED2005));
 	test_random_ops("random ops, 1 ckey", 1, 5000,
 					UINT64CONST(0x5EED2004));
 

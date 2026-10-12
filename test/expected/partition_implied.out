@@ -561,11 +561,11 @@ SELECT lion_ip($q$SELECT count(*) FROM ip WHERE (kind IS NULL OR kind = 'n') AND
 /*
  * The default partition's bound is the negation of every other one's, and
  * implies no equality: 'e' could share it with anything no partition lists.
- * It does imply the NOT IN of every listed value - no posting set answers
- * that, and it is left out altogether.  `kind IS NOT NULL` is implied by
- * every partition but ip_n, which holds the NULLs (the default partition
- * would, if no other partition took them) and has no index on kind:
- * declined.
+ * It does imply the NOT IN of every listed value - the `<>` clauses it
+ * stands for (DESIGN.md §10), each implied and left out.  `kind IS NOT
+ * NULL` is implied by every partition but ip_n, which holds the NULLs (the
+ * default partition would, if no other partition took them) and has no
+ * index on kind: declined.
  */
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind = 'e' AND tags && '{x1}'$q$);
          lion_ip         
@@ -574,9 +574,9 @@ SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind = 'e' AND tags && '{x1}'$q$
 (1 row)
 
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind NOT IN ('a', 'b', 'c', 'd', 'n') AND tags && '{x1}'$q$);
-                               lion_ip                               
----------------------------------------------------------------------
- pushed down, 1 rows; implied: (kind <> ALL ('{a,b,c,d,n}'::text[]))
+                                                                lion_ip                                                                
+---------------------------------------------------------------------------------------------------------------------------------------
+ pushed down, 1 rows; implied: (kind <> 'a'::text), (kind <> 'b'::text), (kind <> 'c'::text), (kind <> 'd'::text), (kind <> 'n'::text)
 (1 row)
 
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind IS NOT NULL AND tags && '{x1}'$q$);

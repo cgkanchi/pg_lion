@@ -430,7 +430,8 @@ lion_index_stats(PG_FUNCTION_ARGS)
 				 * not containers.  It is counted on its own so that
 				 * container_pages still means "pages that hold a posting
 				 * set's items", and the tallest tree is the largest level any
-				 * page claims - a set that fits one page has height 0.
+				 * page claims - a set of at most LION_POSTING_FLAT_LEAVES
+				 * leaves has height 0.
 				 */
 				if (LionPageIsPostingInternal(page))
 				{

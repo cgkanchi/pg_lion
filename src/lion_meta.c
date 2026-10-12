@@ -61,7 +61,7 @@ lion_init_metapage(Page page, uint32 inline_limit, BlockNumber root,
 	meta = LionPageGetMeta(page);
 	memset(meta, 0, sizeof(LionMetaPageData));
 	meta->magic = LION_MAGIC;
-	meta->version = LION_VERSION;
+	meta->version = LION_VERSION_V9;
 	meta->offset_bits = LION_OFFSET_BITS;
 	meta->container_bits = LION_CONTAINER_BITS;
 	meta->unused_nbuckets = 0;
@@ -286,13 +286,11 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 	UnlockReleaseBuffer(buf);
 
 	/*
-	 * Version 6 is the base format, version 7 the same with summary posting
-	 * sets (DESIGN.md §32) and version 8 either with NARROW items (§38): all
-	 * three are read, and a version 6 index is one whose columns have no
-	 * summaries.  Anything older predates a format change that moved or
-	 * reinterpreted items, and anything newer is a format this build does
-	 * not know - and the hint says which of the two it is, since REINDEX
-	 * with this build is the way out of either, but the reason differs.
+	 * Version 9 is the only one read.  Anything older predates a format
+	 * change that moved or reinterpreted items - for versions 6 to 8 the
+	 * sparse segments of §13 - and anything newer is a format this build
+	 * does not know; the hint says which of the two it is, since REINDEX with
+	 * this build is the way out of either, but the reason differs.
 	 */
 	if (meta->magic != LION_MAGIC)
 		ereport(ERROR,
@@ -301,17 +299,15 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 						RelationGetRelationName(index)),
 				 errdetail("Meta page magic %08X, expected %08X.",
 						   meta->magic, LION_MAGIC)));
-	if (meta->version != LION_VERSION &&
-		meta->version != LION_VERSION_SUMMARIES &&
-		meta->version != LION_VERSION_NARROW)
+	if (meta->version != LION_VERSION_V9)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a valid lion index",
 						RelationGetRelationName(index)),
-				 errdetail("Meta page magic %08X version %u, expected %08X version %u, %u or %u.",
-						   meta->magic, meta->version, LION_MAGIC, LION_VERSION,
-						   LION_VERSION_SUMMARIES, LION_VERSION_NARROW),
-				 meta->version < LION_VERSION ?
+				 errdetail("Meta page magic %08X version %u, expected %08X version %u.",
+						   meta->magic, meta->version, LION_MAGIC,
+						   LION_VERSION_V9),
+				 meta->version < LION_VERSION_V9 ?
 				 errhint("REINDEX the index: its on-disk format predates this build of pg_lion.") :
 				 errhint("The index was written by a newer build of pg_lion than this one: use that build, or REINDEX the index with this one.")));
 
@@ -325,16 +321,12 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 						   (unsigned) special, (unsigned) LION_SPECIAL_SIZE)));
 
 	/*
-	 * The summary words (§32) must agree with the version: a version 6 meta
-	 * page has zeros there, a version 7 one names at least one column, and
-	 * either way a version 8 one (§38); one that names a column, a bucket
-	 * size a build could have chosen.
+	 * The summary words (§32): a meta page that names a column names a
+	 * bucket size a build could have chosen.
 	 */
-	if ((meta->version == LION_VERSION && meta->summary_cols != 0) ||
-		(meta->version == LION_VERSION_SUMMARIES && meta->summary_cols == 0) ||
-		(meta->summary_cols != 0 &&
-		 (meta->summary_tids < LION_MIN_SUMMARY_TIDS ||
-		  meta->summary_tids > LION_MAX_SUMMARY_TIDS)))
+	if (meta->summary_cols != 0 &&
+		(meta->summary_tids < LION_MIN_SUMMARY_TIDS ||
+		 meta->summary_tids > LION_MAX_SUMMARY_TIDS))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a valid lion index",
@@ -403,27 +395,30 @@ lion_meta_record_order(LionMetaPageData *meta, LionIndexState *ix)
 	meta->order_ident = lion_order_ident(ix);
 }
 
+/*
+ * Record on a meta page image whether the build wrote a NARROW item, which is
+ * what lets VACUUM make NARROWs of the items it rewrites (§38).
+ */
+void
+lion_meta_record_narrow(LionMetaPageData *meta, bool narrow)
+{
+	if (narrow)
+		meta->order_flags |= LION_META_NARROW;
+}
+
 void
 lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
 						   uint32 bucket_tids)
 {
+	meta->version = LION_VERSION_V9;
 	if (cols == 0)
 	{
-		meta->version = LION_VERSION;
 		meta->summary_cols = 0;
 		meta->summary_tids = 0;
 	}
 	else
 	{
-		meta->version = LION_VERSION_SUMMARIES;
 		meta->summary_cols = cols;
 		meta->summary_tids = bucket_tids;
 	}
-}
-
-void
-lion_meta_record_narrow(LionMetaPageData *meta, bool narrow)
-{
-	if (narrow)
-		meta->version = LION_VERSION_NARROW;
 }

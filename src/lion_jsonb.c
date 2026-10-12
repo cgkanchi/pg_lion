@@ -61,6 +61,7 @@
 #include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/jsonpath.h"
 #include "utils/numeric.h"
@@ -1066,4 +1067,225 @@ lion_jsonb_extract_query(PG_FUNCTION_ARGS)
 
 	*nentries = out.nkeys;
 	PG_RETURN_POINTER(out.keys);
+}
+
+/* ---------------------------------------------------------------------
+ * A key as text, for lion_index_facets() (lion_facets.c)
+ * --------------------------------------------------------------------- */
+
+/* Read an unsigned LEB128 from [*p, end): false when it does not fit. */
+static bool
+lion_jsonb_get_uvarint(const unsigned char **p, const unsigned char *end,
+					   uint32 *v)
+{
+	uint32		r = 0;
+	int			shift = 0;
+
+	while (*p < end && shift < 32)
+	{
+		unsigned char b = *(*p)++;
+
+		r |= (uint32) (b & 0x7f) << shift;
+		if ((b & 0x80) == 0)
+		{
+			*v = r;
+			return true;
+		}
+		shift += 7;
+	}
+	return false;
+}
+
+/* A length-prefixed string at *p, JSON-quoted into out. */
+static bool
+lion_jsonb_get_string(const unsigned char **p, const unsigned char *end,
+					  StringInfo out)
+{
+	uint32		len;
+	char	   *s;
+
+	if (!lion_jsonb_get_uvarint(p, end, &len) || len > (uint32) (end - *p))
+		return false;
+	s = pnstrdup((const char *) *p, len);
+	escape_json(out, s);
+	pfree(s);
+	*p += len;
+	return true;
+}
+
+/*
+ * The path of an 'L' or 'C' key and what follows its names, rendered as a
+ * jsonpath: `$."a"[*]."b"` with `[*]` for each array level between the
+ * names.  *p is at the names; on return, the type or value byte follows the
+ * names and is handed to the caller through tail, and *p is past the marks.
+ */
+static bool
+lion_jsonb_out_path(const unsigned char **p, const unsigned char *end,
+					StringInfo out, StringInfo tail, char *tag)
+{
+	StringInfoData names;
+	List	   *offs = NIL;
+	const unsigned char *q;
+	uint32		nnames = 0;
+	uint32		i;
+	ListCell   *lc;
+
+	initStringInfo(&names);
+	while (*p < end && **p == LION_JK_STEP)
+	{
+		(*p)++;
+		offs = lappend_int(offs, names.len);
+		if (!lion_jsonb_get_string(p, end, &names))
+			return false;
+		nnames++;
+	}
+	if (*p >= end || **p != LION_JK_ENDPATH)
+		return false;
+	(*p)++;
+
+	/* the value, or the container's type */
+	if (*p >= end)
+		return false;
+	*tag = (char) *(*p)++;
+	switch (*tag)
+	{
+		case 'z':
+			appendStringInfoString(tail, "null");
+			break;
+		case 't':
+			appendStringInfoString(tail, "true");
+			break;
+		case 'f':
+			appendStringInfoString(tail, "false");
+			break;
+		case 'n':
+			{
+				uint32		len;
+
+				if (!lion_jsonb_get_uvarint(p, end, &len) ||
+					len > (uint32) (end - *p))
+					return false;
+				appendBinaryStringInfo(tail, (const char *) *p, (int) len);
+				*p += len;
+				break;
+			}
+		case 's':
+			if (!lion_jsonb_get_string(p, end, tail))
+				return false;
+			break;
+		case 'o':
+			appendStringInfoString(tail, "\"object\"");
+			break;
+		case 'a':
+			appendStringInfoString(tail, "\"array\"");
+			break;
+		default:
+			return false;
+	}
+
+	/* the marks: array levels before each name and after the last */
+	appendStringInfoChar(out, '$');
+	q = (const unsigned char *) names.data;
+	lc = list_head(offs);
+	for (i = 0; i <= nnames; i++)
+	{
+		uint32		marks;
+
+		if (!lion_jsonb_get_uvarint(p, end, &marks) || marks > 1000)
+			return false;
+		while (marks-- > 0)
+			appendStringInfoString(out, "[*]");
+		if (i < nnames)
+		{
+			int			from = lfirst_int(lc);
+			int			to;
+
+			lc = lnext(offs, lc);
+			to = (lc != NULL) ? lfirst_int(lc) : names.len;
+			appendStringInfoChar(out, '.');
+			appendBinaryStringInfo(out, (const char *) q + from, to - from);
+		}
+	}
+	return *p == end;
+}
+
+/*
+ * A jsonb_contains_ops key as text (DESIGN.md §42.1), in jsonpath's terms:
+ *
+ *	R	`$.type() == "object"`, `$.type() == "array"`
+ *	L	`$."a"[*]."b" == "x"`: a scalar at a path, `[*]` for an array level
+ *	C	`$."a".type() == "array"`: a container at a path
+ *	E	`? "k"`: what the `?` operator tests
+ *	H	`sha256:` and the digest in hex: a key too long to keep
+ *
+ * A key that is none of these - which verify() would report - is its bytes,
+ * as bytea writes them.
+ */
+char *
+lion_jsonb_key_out(const bytea *key)
+{
+	const unsigned char *p = (const unsigned char *) VARDATA_ANY(key);
+	const unsigned char *end = p + VARSIZE_ANY_EXHDR(key);
+	StringInfoData out;
+	StringInfoData tail;
+	bool		ok = false;
+	char		tag;
+
+	initStringInfo(&out);
+	initStringInfo(&tail);
+	if (p < end)
+	{
+		switch (*p++)
+		{
+			case LION_JK_ROOT:
+				if (end - p == 1 && (*p == 'o' || *p == 'a'))
+				{
+					appendStringInfo(&out, "$.type() == \"%s\"",
+									 (*p == 'o') ? "object" : "array");
+					ok = true;
+				}
+				break;
+			case LION_JK_LEAF:
+				ok = lion_jsonb_out_path(&p, end, &out, &tail, &tag) &&
+					tag != 'o' && tag != 'a';
+				if (ok)
+					appendStringInfo(&out, " == %s", tail.data);
+				break;
+			case LION_JK_CONTAINER:
+				ok = lion_jsonb_out_path(&p, end, &out, &tail, &tag) &&
+					(tag == 'o' || tag == 'a');
+				if (ok)
+					appendStringInfo(&out, ".type() == %s", tail.data);
+				break;
+			case LION_JK_EXISTS:
+				{
+					char	   *s = pnstrdup((const char *) p, end - p);
+
+					appendStringInfoString(&out, "? ");
+					escape_json(&out, s);
+					pfree(s);
+					ok = true;
+					break;
+				}
+			case LION_JK_HASHED:
+				if (end - p == PG_SHA256_DIGEST_LENGTH)
+				{
+					appendStringInfoString(&out, "sha256:");
+					while (p < end)
+						appendStringInfo(&out, "%02x", *p++);
+					ok = true;
+				}
+				break;
+			default:
+				break;
+		}
+	}
+	pfree(tail.data);
+	if (!ok)
+	{
+		pfree(out.data);
+		return DatumGetCString(DirectFunctionCall1(byteaout,
+												   PointerGetDatum(key)));
+	}
+	return out.data;
 }

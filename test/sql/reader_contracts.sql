@@ -4,6 +4,9 @@
 --     security applies to the caller, and an unpopulated materialized view
 --     (lion_reader_vet()); one that reads only statistics refuses row-level
 --     security too, since they count the hidden rows;
+--   - it refuses an index that is not valid, and checks EXECUTE on the
+--     functions its answer stands for (the key type's equality, a
+--     filter's operators);
 --   - the planner's paths answer under a policy exactly what seq scan does.
 -- Snapshot eligibility and predicate locks need two sessions:
 -- test/isolation/reader_checkxmin.spec and reader_serializable.spec.
@@ -32,7 +35,9 @@ INSERT INTO rcon_readers VALUES
 	('lion_index_count_stats',       $$SELECT count FROM lion_index_count_stats('%1$s_k', 3)$$),
 	('lion_index_count_group_stats', $$SELECT count(*) FROM lion_index_count_group_stats('%1$s_k')$$),
 	('lion_bm25',                    $$SELECT count(*) FROM lion_bm25('%1$s_d', 'secret', 10)$$),
-	('lion_bm25_score',              $$SELECT lion_bm25_score('secret'::tsvector, 'secret', '%1$s_d') > 0$$);
+	('lion_bm25_score',              $$SELECT lion_bm25_score('secret'::tsvector, 'secret', '%1$s_d') > 0$$),
+	('lion_index_facets',            $$SELECT string_agg(key || ':' || count, ' ') FROM lion_index_facets('%1$s_d', 3)$$),
+	('lion_index_facets, filtered',  $$SELECT string_agg(key || ':' || count, ' ') FROM lion_index_facets('%1$s_j', 3, 'k = 3 AND d @@ $q$secret$q$')$$);
 
 -- what each reader says for the relation rel: its answer, or its error
 CREATE FUNCTION rcon_try(stmt text, rel text) RETURNS text LANGUAGE plpgsql AS $$
@@ -79,6 +84,21 @@ SELECT rcon_try($$SELECT string_agg(id::text, ',') FROM (SELECT id FROM %1$s
 RESET ROLE;
 DROP POLICY rcon_hide ON rcon;
 ALTER TABLE rcon DISABLE ROW LEVEL SECURITY;
+
+-- EXECUTE revoked on the key types' equality: refused by what stands for it
+REVOKE EXECUTE ON FUNCTION int4eq(int4, int4), texteq(text, text) FROM PUBLIC;
+SET ROLE rcon_reader;
+SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION int4eq(int4, int4), texteq(text, text) TO PUBLIC;
+
+-- an index that is not valid, as a failed CREATE INDEX CONCURRENTLY leaves
+-- one: refused
+UPDATE pg_index SET indisvalid = false
+ WHERE indexrelid IN ('rcon_k'::regclass, 'rcon_j'::regclass, 'rcon_d'::regclass);
+SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
+UPDATE pg_index SET indisvalid = true
+ WHERE indexrelid IN ('rcon_k'::regclass, 'rcon_j'::regclass, 'rcon_d'::regclass);
 
 -- an unpopulated materialized view: refused, as querying it is
 CREATE MATERIALIZED VIEW rcon_mv AS SELECT * FROM rcon WITH NO DATA;

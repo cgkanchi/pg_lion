@@ -70,6 +70,8 @@ typedef struct LionPosCursor
 	LionContainer *inl;
 	uint32		hash;
 	BlockNumber root;
+	bool		flat;			/* the tree had no internal level when first
+								 * descended: never descend it again */
 
 	/* the leaf being read, a private copy, and its chunks */
 	char	   *leaf;			/* BLCKSZ bytes, position trees only */
@@ -153,8 +155,11 @@ lion_poscursor_descend(Relation index, LionPosCursor *cur, uint32 block)
 {
 	Buffer		buf;
 
-	buf = lion_posting_search_before(index, NULL, cur->hash, cur->root, block,
-									 BUFFER_LOCK_SHARE, false);
+	bool		flat = false;
+
+	buf = lion_posting_search_ext(index, NULL, cur->hash, cur->root, block,
+								  BUFFER_LOCK_SHARE, false, true, &flat);
+	cur->flat = cur->flat || flat;
 	if (!BufferIsValid(buf))
 		return false;
 	if (BufferGetBlockNumber(buf) == cur->leafblk)
@@ -169,23 +174,36 @@ lion_poscursor_descend(Relation index, LionPosCursor *cur, uint32 block)
 /*
  * The leaf after the one the cursor ran off.  The right link, unless that
  * leaf ends below block too and is not the last - then the candidate is
- * further right than one step, and a descent goes straight to it.
+ * further right than one step, and a descent goes straight to it.  A tree
+ * without an internal level (cur->flat, DESIGN.md §17) has nothing to
+ * descend through: its leaves are stepped over instead, each one whose
+ * members all lie below block (maxckey) skipped undecoded.
  */
 static bool
 lion_poscursor_next_leaf(Relation index, LionPosCursor *cur, uint32 block)
 {
 	Buffer		buf;
+	LionRightWalk walk;
 
-	if (cur->rightmost || !BlockNumberIsValid(cur->rightlink))
-		return false;
-	buf = ReadBuffer(index, cur->rightlink);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	if (!lion_poscursor_take_leaf(index, cur, buf))
-		return false;
-	if (!cur->rightmost && cur->nchunks > 0 &&
-		cur->chunks[cur->nchunks - 1]->ckey < block)
-		return lion_poscursor_descend(index, cur, block);
-	return true;
+	lion_rightwalk_init(&walk);
+	for (;;)
+	{
+		if (cur->rightmost || !BlockNumberIsValid(cur->rightlink))
+			return false;
+		lion_rightwalk_step(index, &walk, cur->leafblk, cur->rightlink);
+		buf = ReadBuffer(index, cur->rightlink);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		if (!lion_poscursor_take_leaf(index, cur, buf))
+			return false;
+		if (cur->rightmost || cur->nchunks == 0 ||
+			cur->chunks[cur->nchunks - 1]->ckey >= block)
+			return true;
+		if (!cur->flat)
+			return lion_poscursor_descend(index, cur, block);
+		if (LionPageGetOpaque((Page) cur->leaf)->maxckey >= block)
+			return true;
+		CHECK_FOR_INTERRUPTS();
+	}
 }
 
 /* Back to the key's first member, for a walk that starts again. */

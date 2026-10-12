@@ -153,12 +153,12 @@ lion_segwork_buf(LionContainer **p)
 	return *p;
 }
 
-/* Does this item accept one more pair? */
+/* Is this item a segment that has room for (ckey, lo)? */
 static bool
-lion_segment_has_room(const LionContainer *item)
+lion_segment_has_room(const LionContainer *item, uint32 ckey, uint16 lo)
 {
 	return item->type == LION_CT_SPARSE &&
-		item->cardinality < LION_SPARSE_MAX_PAIRS;
+		lion_sparse_insert_size(item, ckey, lo) != 0;
 }
 
 /*
@@ -324,7 +324,7 @@ lion_put_singleton(char *dst, uint32 ckey, uint16 lo)
 	{
 		LionContainer c;
 		uint64		force_align;
-		char		data[LION_CONTAINER_HDRSZ + sizeof(uint32) + sizeof(uint16)];
+		char		data[LION_SPARSE_SINGLETON_MAX];
 	}			buf;
 	Size		csize;
 
@@ -342,8 +342,9 @@ lion_put_singleton(char *dst, uint32 ckey, uint16 lo)
 /*
  * Rebuild an INLINE payload with (ckey, lo) added, writing it to out, which
  * must have room for paylen + LION_CONTAINER_MAX_SIZE bytes (a container grows
- * by at most that much; splitting a segment into three items grows the
- * payload by at most 26 bytes, and a new segment adds 14).
+ * by at most that much; a segment that takes the pair grows by at most two
+ * varints, splitting one into three items adds two headers and a container,
+ * and a new segment adds at most LION_SPARSE_SINGLETON_MAX bytes).
  *
  * Returns the length of the new payload, or 0 if the member was already
  * there, in which case out is undefined.  *ndelta receives the change in the
@@ -385,13 +386,13 @@ lion_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
 			/* In the gap: the segment before it, else the one after it. */
 			if (prev_ok)
 				target = previdx;
-			else if (lion_segment_has_room(cbuf))
+			else if (lion_segment_has_room(cbuf, ckey, lo))
 				target = n;
 			else
 				insertpos = n;
 			break;
 		}
-		prev_ok = lion_segment_has_room(cbuf);
+		prev_ok = lion_segment_has_room(cbuf, ckey, lo);
 		previdx = n;
 		n++;
 	}
@@ -482,7 +483,7 @@ lion_insert_new_entry(Relation index, Relation heaprel, LionState *state,
 					 Datum key, uint16 reservedflag, uint32 hash, uint32 ckey,
 					 uint16 lo, const LionPosMember *pm)
 {
-	char		payload[LION_CONTAINER_HDRSZ + sizeof(uint32) + sizeof(uint16)];
+	char		payload[LION_SPARSE_SINGLETON_MAX];
 	LionEntryTuple *entry;
 	Size		paylen;
 	Size		size;
@@ -911,8 +912,9 @@ lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 
 /*
  * The same for a sparse segment that is already on a page: insert the pair in
- * its sorted place inside the item, which is one memmove of at most 4 KB
- * (ckeys[] and los[] both shift) and leaves the item's allocated length and
+ * its sorted place inside the item, which rewrites the stream from the
+ * insertion point on (nothing but the header and the new bytes at the end,
+ * for a pair above every other) and leaves the item's allocated length and
  * offset untouched.
  *
  * Only for a pair that really stays in the segment: a container key that
@@ -932,6 +934,7 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 	ItemId		iid = PageGetItemId(page, off);
 	LionContainer *onpage = (LionContainer *) PageGetItem(page, iid);
 	Size		alloc = ItemIdGetLength(iid);
+	Size		need;
 	LionWalState *xstate;
 	Page		p;
 	LionContainer *s;
@@ -939,11 +942,12 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 
 	Assert(onpage->type == LION_CT_SPARSE);
 
-	if (onpage->cardinality >= LION_SPARSE_MAX_PAIRS)
+	need = lion_sparse_insert_size(onpage, ckey, lo);
+	if (need == 0)
 		return false;			/* would have to split */
 	if (lion_sparse_count(onpage, ckey) + 1 >= LION_SPARSE_THRESHOLD)
 		return false;			/* would have to promote the container key */
-	if (alloc < lion_sparse_size(onpage) + LION_SPARSE_PAIR_SIZE)
+	if (alloc < need)
 		return false;			/* no slack inside the item */
 
 	*done = true;
@@ -964,7 +968,10 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 
 	Assert(lion_sparse_size(s) <= alloc);
 
-	/* The call, not the bytes: a pair shifts both halves of the segment. */
+	/*
+	 * The call, not the bytes: a pair inside the segment rewrites the stream
+	 * from where it goes in.
+	 */
 	lion_wal_op(xstate, p, LION_OP_SPARSE_INS, off, lo, &ckey, sizeof(uint32));
 
 	/* A segment's range can grow in either direction. */
@@ -1127,11 +1134,13 @@ lion_insert_chain_leaf(Relation index, Relation heaprel, Buffer buf,
 
 		if (off > FirstOffsetNumber &&
 			lion_segment_has_room(lion_page_item_fetch(index, cpage, blk,
-													   OffsetNumberPrev(off))))
+													   OffsetNumberPrev(off)),
+								  ckey, lo))
 			target = OffsetNumberPrev(off);
 		else if (off <= maxoff &&
 				 lion_segment_has_room(lion_page_item_fetch(index, cpage, blk,
-															off)))
+															off),
+									   ckey, lo))
 			target = off;
 
 		if (target != InvalidOffsetNumber)
