@@ -1557,7 +1557,7 @@ lion_index_facets(PG_FUNCTION_ARGS)
 			 */
 			cap = Min(2.0 * run.k / run.share, (double) LION_FACET_CAND_MAX);
 			cap = Max(cap, (double) run.k + 64);
-			cap = Min(cap, (double) (MaxAllocSize / sizeof(LionFacetKey) / 4));
+			cap = Min(cap, (double) MaxAllocSize / sizeof(LionFacetKey) / 4);
 			if (!lion_facets_topk(&run, (int) cap))
 			{
 				/* not settled: every key whose bound may still pass */
