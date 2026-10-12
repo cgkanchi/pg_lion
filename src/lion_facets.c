@@ -104,7 +104,14 @@ typedef struct LionFacetFilter
 	LionPostingSet *sets;
 } LionFacetFilter;
 
-/* A key counted, or a candidate to count. */
+/*
+ * A key counted, or a candidate to count.  A key that is not NULL nor of a
+ * by-value type is its own copy in keycxt (lion_facets_next_entry(),
+ * lion_facets_heap()), owned by the one array that holds the key - the
+ * candidates, a batch, the result - and freed by whoever drops it
+ * (lion_facets_key_free()), so that keycxt holds the keys kept, not every
+ * key walked.
+ */
 typedef struct LionFacetKey
 {
 	uint64		ntids;			/* the entry's bound */
@@ -740,6 +747,14 @@ lion_facets_keycmp(LionState *state, const LionFacetKey *a,
 	return strcmp(DatumGetCString(a->key), DatumGetCString(b->key));
 }
 
+/* Free a key's copy in keycxt, when it has one. */
+static void
+lion_facets_key_free(LionFacetRun *run, LionFacetKey *k)
+{
+	if (!k->isnull && !run->state->typbyval)
+		pfree(DatumGetPointer(k->key));
+}
+
 static LionState *lion_facets_sort_state;
 
 /* larger counts first, then the keys in the column's order */
@@ -872,21 +887,33 @@ lion_facets_count(LionFacetRun *run, const LionFacetKey *k)
 	return count;
 }
 
-/* Keep a key counted, and keep no more of them than the top k needs. */
+/*
+ * Keep a key counted, and keep no more of them than the top k needs.  The
+ * key's copy passes to the result, or is freed: the caller holds it no more.
+ */
 static void
-lion_facets_keep(LionFacetRun *run, const LionFacetKey *k, int64 count)
+lion_facets_keep(LionFacetRun *run, LionFacetKey *k, int64 count)
 {
 	if (count <= 0)
-		return;					/* a group exists only with a visible row */
+	{
+		/* a group exists only with a visible row */
+		lion_facets_key_free(run, k);
+		return;
+	}
 	if (run->nres >= run->maxres)
 	{
 		/*
 		 * Past twice k, the keys after the k-th in the final order cannot be
-		 * in it: cut back to k.
+		 * in it: cut back to k, and free the rest.  The heap of the k largest
+		 * counts holds counts, not places in res, and is not touched.
 		 */
 		if (run->k >= 0 && run->nres >= 2 * run->k)
 		{
+			int			i;
+
 			lion_facets_sort(run);
+			for (i = (int) run->k; i < run->nres; i++)
+				lion_facets_key_free(run, &run->res[i]);
 			run->nres = (int) run->k;
 		}
 		else
@@ -904,12 +931,13 @@ lion_facets_keep(LionFacetRun *run, const LionFacetKey *k, int64 count)
 }
 
 /*
- * Count n keys and keep them.  Against a collected filter they are counted
- * together, a batch at a time (lion_count_groups_copy(); DESIGN.md §10, "The
- * groups of a walk, counted together"): each key's set located afresh, with
- * the pin that carries its count's §9 interlock, and the copy read once for
- * all of them.  A key whose entry VACUUM has deleted since its header was
- * read has no row the snapshot sees.
+ * Count n keys and keep them, each passed to lion_facets_keep() or freed.
+ * Against a collected filter they are counted together, a batch at a time
+ * (lion_count_groups_copy(); DESIGN.md §10, "The groups of a walk, counted
+ * together"): each key's set located afresh, with the pin that carries its
+ * count's §9 interlock, and the copy read once for all of them.  A key whose
+ * entry VACUUM has deleted since its header was read has no row the snapshot
+ * sees.
  */
 static void
 lion_facets_count_keep(LionFacetRun *run, LionFacetKey *keys, int n)
@@ -949,7 +977,10 @@ lion_facets_count_keep(LionFacetRun *run, LionFacetKey *keys, int n)
 		if (found)
 			which[nfound++] = i;
 		else
+		{
 			lion_posting_set_release(&sets[nfound]);
+			lion_facets_key_free(run, &keys[i]);
+		}
 	}
 	if (nfound > 0)
 		lion_count_groups_copy(run->heap, run->snapshot, nfound, sets,
@@ -1021,8 +1052,7 @@ lion_facets_walk(LionFacetRun *run)
 		if (run->k >= 0 && run->nheap >= run->k &&
 			k->ntids < (uint64) run->heap_counts[0])
 		{
-			if (!k->isnull && !run->state->typbyval)
-				pfree(DatumGetPointer(k->key));
+			lion_facets_key_free(run, k);
 			continue;
 		}
 		if (++npending == run->batch)
@@ -1219,6 +1249,10 @@ lion_facets_heap(LionFacetRun *run)
 	lion_stream_end(stream);
 	pfree(los);
 
+	/*
+	 * Each entry's key passes to lion_facets_keep(), which may free it; the
+	 * table is only walked and destroyed after that, never searched.
+	 */
 	hash_seq_init(&seq, htab);
 	while ((ent = (LionFacetHashEnt *) hash_seq_search(&seq)) != NULL)
 	{
@@ -1290,8 +1324,7 @@ lion_facets_topk(LionFacetRun *run, int cap)
 		if (trimmed && k.ntids <= floor)
 		{
 			maxout = Max(maxout, k.ntids);
-			if (!k.isnull && !run->state->typbyval)
-				pfree(DatumGetPointer(k.key));
+			lion_facets_key_free(run, &k);
 			continue;
 		}
 		if (n == maxcand && maxcand < 2 * cap)
@@ -1306,10 +1339,7 @@ lion_facets_topk(LionFacetRun *run, int cap)
 			qsort(cand, n, sizeof(LionFacetKey), lion_facets_cand_cmp);
 			maxout = Max(maxout, cand[cap].ntids);
 			for (i = cap; i < n; i++)
-			{
-				if (!cand[i].isnull && !run->state->typbyval)
-					pfree(DatumGetPointer(cand[i].key));
-			}
+				lion_facets_key_free(run, &cand[i]);
 			n = cap;
 			floor = cand[n - 1].ntids;
 			trimmed = true;
@@ -1321,6 +1351,8 @@ lion_facets_topk(LionFacetRun *run, int cap)
 	if (n > cap)
 	{
 		maxout = Max(maxout, cand[cap].ntids);
+		for (i = cap; i < n; i++)
+			lion_facets_key_free(run, &cand[i]);
 		n = cap;
 	}
 
@@ -1342,6 +1374,9 @@ lion_facets_topk(LionFacetRun *run, int cap)
 			tocount = Max(tocount, (double) run->walked);
 		if ((double) run->copy.ntids < tocount * LION_FACET_KEY_ROWS)
 		{
+			for (i = 0; i < n; i++)
+				lion_facets_key_free(run, &cand[i]);
+			pfree(cand);
 			run->heapread = true;
 			lion_facets_heap(run);
 			return true;
@@ -1373,8 +1408,15 @@ lion_facets_topk(LionFacetRun *run, int cap)
 
 		next = (i < n) ? cand[i].ntids : maxout;
 		if (next == 0 || lion_facets_settled(run, next))
+		{
+			/* the candidates not counted */
+			for (; i < n; i++)
+				lion_facets_key_free(run, &cand[i]);
+			pfree(cand);
 			return true;
+		}
 	}
+	pfree(cand);
 	return maxout == 0;
 }
 
@@ -1513,6 +1555,8 @@ lion_index_facets(PG_FUNCTION_ARGS)
 			{
 				/* not settled: every key whose bound may still pass */
 				run.whole = true;
+				for (i = 0; i < run.nres; i++)
+					lion_facets_key_free(&run, &run.res[i]);
 				run.nres = 0;
 				run.nheap = 0;
 				lion_facets_walk(&run);
