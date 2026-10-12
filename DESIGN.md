@@ -7647,7 +7647,7 @@ every scan shape against a sequential scan on an enum column, a list longer than
   Distribution through the PostgreSQL Extension Network is how the two environments below will
   install it, so it comes first. Done:
   - `META.json` (PGXN Meta Spec 1.0.0; `validate_pgxn_meta` from PGXN::Meta::Validator 0.16 says
-    OK, and CI runs it): distribution `pg_lion` 0.1.0, `release_status` unstable (prototype),
+    OK, and CI runs it): distribution `pg_lion` 0.1.0, `release_status` testing (beta),
     license `postgresql`, `provides` pg_lion and pg_lion_citext, PostgreSQL >= 16.0.0 as a build
     and runtime prerequisite (the minimum since eb1579e, `src/lion_compat.h`), `citext` runtime-
     recommended and test-required (only the companion needs it, and its control file's
@@ -7673,19 +7673,20 @@ every scan shape against a sequential scan on an enum column, a list longer than
     if any spec is skipped, rmgr run with `wal_consistency_checking`; and a dist job (validate,
     `make dist`, build and test from the zip). Each server job runs unit, installcheck and
     installcheck-rmgr through `./dev.sh` with `LION_SOCK`/`LION_PORT`. Checked with actionlint
-    1.7.7 and shellcheck 0.10 and the steps dry-run locally; not yet run on GitHub.
+    1.7.7 and shellcheck 0.10; it runs on every push and pull request.
   - `pg_upgrade`: works across majors, and found a preload bug (§23 addendum below).
   Remaining:
   - The WAL resource manager id, before any release. `pg_lion.rmgr_id` (`lion_wal_init()`,
     `src/lion_wal.c`) defaults to `RM_EXPERIMENTAL_ID` (128), the id core sets aside for
     development: two extensions that both use it cannot be preloaded together. A release must
     reserve an id on https://wiki.postgresql.org/wiki/CustomWALResourceManagers, make it the
-    default, and keep the GUC so a site can move out of a collision. Document the rule for
-    changing it: WAL written under one id replays only under that id, so change it only after a
-    clean shutdown with every standby and archive consumer caught up (pg_upgrade carries no WAL,
-    so an upgrade may change it freely).
-  - Publishing: a PGXN account and upload of the zip, `release_status` raised when the prototype
-    label goes, the first CI run on GitHub, and a README install section (`pgxn install pg_lion`).
+    default, and keep the GUC so a site can move out of a collision. The rule for changing it
+    (WAL written under one id replays only under that id, so only after a clean shutdown with
+    every standby and archive consumer caught up; pg_upgrade carries no WAL, so an upgrade may
+    change it freely) is in docs/REFERENCE.md under `wal_mode`.
+  - Publishing: a PGXN account and upload of the zip, and a README install section (`pgxn
+    install pg_lion --testing` while `release_status` is testing, which is what the client needs
+    to see a release that is not stable).
   - Version scripts: from 0.2, `pg_lion--0.1--0.2.sql` upgrade paths and `ALTER EXTENSION
     UPDATE`; format-version bumps that need REINDEX must say so in the upgrade script's NOTICE and
     in the release notes. (The seven pre-18 opclasses of the addendum below need no repair
