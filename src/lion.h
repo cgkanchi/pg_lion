@@ -2003,6 +2003,8 @@ extern int	lion_walk_window(void);
 extern int	lion_scan_list_batch(void);
 extern bytea *lionoptions(Datum reloptions, bool validate);
 extern bool lionvalidate(Oid opclassoid);
+/* a parent queried without its children: no lion path of its own (lion_plan_hooks.c) */
+extern bool lion_rel_is_unexpanded_parent(struct RangeTblEntry *rte);
 extern void lioncostestimate(struct PlannerInfo *root, struct IndexPath *path, double loop_count,
 							Cost *indexStartupCost, Cost *indexTotalCost, Selectivity *indexSelectivity,
 							double *indexCorrelation, double *indexPages);

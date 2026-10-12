@@ -395,6 +395,7 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	if (rel->reloptkind != RELOPT_BASEREL || rte->rtekind != RTE_RELATION ||
 		rte->inh || rte->tablesample != NULL ||
 		(rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW) ||
+		lion_rel_is_unexpanded_parent(rte) ||
 		rte->securityQuals != NIL || IS_DUMMY_REL(rel) ||
 		rel->indexlist == NIL)
 		return;

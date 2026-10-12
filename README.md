@@ -221,6 +221,29 @@ columns and can be built in parallel on PostgreSQL 17 and later.
 
 The [full list](docs/REFERENCE.md#known-limitations) has the details.
 
+## Citus and TimescaleDB
+
+Both were run through a compatibility matrix with pg_lion on PostgreSQL 18 (Citus 14.2, TimescaleDB
+2.30): every answer matched the ordinary plans, index DDL reaches every shard and chunk, and shard
+moves, rebalances, chunk compression, continuous aggregates and retention leave valid lion indexes.
+What to know:
+
+- **Citus:** list `citus` before `pg_lion` in `shared_preload_libraries`. Loaded after lion, Citus
+  replaces two planner hooks without chaining them, and lion's ordered, BM25 and join nodes vanish
+  (counts stay, and answers are right either way). The count pushdown runs inside each shard query
+  on the workers. The SQL functions that take an index name (`lion_index_count`,
+  `lion_index_facets`, `lion_bm25`, `lion_bm25_score`) read the one index they are given, which on
+  the coordinator and inside a distributed query is the empty shell of the distributed table's
+  index: `lion_bm25_score` then scores every row 0. Call them on the shards through
+  `run_command_on_shards`. After a shard move or rebalance, `VACUUM` the table so counts can use
+  the visibility map again.
+- **TimescaleDB:** `CREATE INDEX ... USING lion` on a hypertable creates one lion index per
+  chunk, new chunks included. The count pushdown does not run on a hypertable as a whole (it is an
+  inheritance parent, which the pushdown declines): a count uses lion scans per chunk under
+  TimescaleDB's chunk-wise aggregation, and a count on one chunk by name uses `LionCount`.
+  Compressed chunks keep their lion indexes, which lion then plans nothing on. An index on
+  `time_bucket('1 hour', ts)` is not used for counts; a stored bucket column is.
+
 ## Performance
 
 Query execution times on a synthetic benchmark (5M rows unless noted, vacuumed, warm cache, 4 vCPUs,

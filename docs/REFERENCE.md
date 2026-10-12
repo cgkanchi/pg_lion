@@ -533,3 +533,25 @@ the setting) does not read lion indexes at all: lion does not detect "snapshot t
 planner prices them out and declines the count pushdown and `LionOrdered`, and a scan or SQL count
 that reaches one anyway fails with an error rather than return a different answer than the
 snapshot's (DESIGN.md §9).  Inserts and VACUUM work as usual.
+
+With Citus, list `citus` before `pg_lion` in `shared_preload_libraries`: Citus installs
+`set_rel_pathlist_hook` and `set_join_pathlist_hook` without chaining the previous hook, so loaded
+after lion it drops `LionOrdered`, `LionBtreeScan`, `LionBm25`, `LionSemiJoin`, `LionAntiJoin` and
+lion's plain-scan repricing (the count pushdown, on `create_upper_paths_hook`, survives, and answers
+are right either way).  The SQL functions that take an index (`lion_index_count()`,
+`lion_index_facets()`, `lion_bm25()`, `lion_bm25_score()`) read the one index they are given: on
+the coordinator, and on every worker inside a distributed query, that is the empty shell of the
+distributed table's index, so `lion_index_count()` returns 0, `lion_index_facets()` no rows and
+`lion_bm25_score()` 0 for every row; run them on the shards through `run_command_on_shards()`.
+Citus rewrites `avg()` into `sum()` and `count(col)` per shard, a pair the aggregates over keys do
+not answer (DESIGN.md §37).  A shard a move or rebalance has copied has no visibility-map bits
+until it is vacuumed, and counts recheck every row there until then.  With TimescaleDB, a
+hypertable is planned as an inheritance parent, which the count pushdown declines: a count over
+the hypertable uses lion scans per chunk under TimescaleDB's chunk-wise aggregation, and a count
+over one chunk by name uses the pushdown.  A compressed chunk keeps its lion indexes, and lion
+plans nothing on it; a chunk in a table access method other than heap makes `CREATE INDEX ...
+USING lion` fail for the whole hypertable (DESIGN.md §2) rather than skip it, and a build that
+fails under `timescaledb.transaction_per_chunk` leaves an invalid parent index to drop.  A table
+queried without its inheritance children - `FROM ONLY parent`, or a hypertable TimescaleDB plans
+that way for a `LIMIT` query - gets no lion custom scan of its own, only core's scans of its
+indexes.

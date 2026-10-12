@@ -1,0 +1,195 @@
+-- A parent queried without its children gets no lion path of its own.  Core
+-- writes FROM ONLY that way, and an extension that plans a parent it expands
+-- itself may do the same (TimescaleDB clears the hypertable's inh and appends
+-- the chunks in its own node): a lion scan added to that rel would read the
+-- parent's rows alone, kept out by its cost and nothing else.  So the count
+-- pushdown, LionOrdered, LionBm25 and the semi join decline a parent whose
+-- children are not in the query, and keep the child and the plain table as
+-- they were (DESIGN.md §23, the TimescaleDB addendum).
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+CREATE TABLE op_parent (k int, b int, d tsvector);
+CREATE TABLE op_child () INHERITS (op_parent);
+CREATE TABLE op_dim (pk int PRIMARY KEY, attr int);
+INSERT INTO op_parent
+	SELECT i % 7, i, to_tsvector('simple', 'w' || (i % 5) || ' w' || (i % 3))
+	FROM generate_series(1, 3000) i;
+INSERT INTO op_child
+	SELECT i % 7, i, to_tsvector('simple', 'w' || (i % 5) || ' w' || (i % 3))
+	FROM generate_series(3001, 6000) i;
+INSERT INTO op_dim SELECT i, i * 10 FROM generate_series(0, 6) i;
+CREATE INDEX op_parent_k ON op_parent USING lion (k);
+CREATE INDEX op_child_k ON op_child USING lion (k);
+CREATE INDEX op_parent_d ON op_parent USING lion (d) WITH (store_positions = true);
+CREATE INDEX op_child_d ON op_child USING lion (d) WITH (store_positions = true);
+CREATE INDEX op_parent_b ON op_parent (b);
+CREATE INDEX op_child_b ON op_child (b);
+VACUUM (FREEZE, ANALYZE) op_parent;
+VACUUM (FREEZE, ANALYZE) op_child;
+VACUUM (FREEZE, ANALYZE) op_dim;
+/*
+ * The lion nodes of a query's plan with core's scans and joins disabled, so
+ * that lion's paths are taken wherever they are offered, and whether the rows
+ * equal those of the ordinary plan with every lion path off.
+ */
+CREATE FUNCTION op_lion(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	nodes text := '';
+	same boolean;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (Lion%' THEN
+			nodes := nodes || ' ' || substring(ln from 'Custom Scan \((Lion[A-Za-z0-9]+)\)');
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE op_a AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_btree_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_bm25_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_semijoin', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE op_b AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_btree_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_bm25_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_semijoin', 'on', true);
+	SELECT count(*) = 0 INTO same
+	FROM ((TABLE op_a EXCEPT ALL TABLE op_b) UNION ALL (TABLE op_b EXCEPT ALL TABLE op_a)) x;
+	DROP TABLE op_a;
+	DROP TABLE op_b;
+	RETURN coalesce(nullif(trim(nodes), ''), 'no lion node') ||
+		CASE WHEN same THEN ', same rows' ELSE ', DIFFERENT ROWS' END;
+END $$;
+-- the count pushdown: the child, the parent alone, the parent with its children
+SELECT op_lion('SELECT count(*) FROM op_child WHERE k = 1');
+       op_lion        
+----------------------
+ LionCount, same rows
+(1 row)
+
+SELECT op_lion('SELECT count(*) FROM ONLY op_parent WHERE k = 1');
+         op_lion         
+-------------------------
+ no lion node, same rows
+(1 row)
+
+SELECT op_lion('SELECT count(*) FROM op_parent WHERE k = 1');
+         op_lion         
+-------------------------
+ no lion node, same rows
+(1 row)
+
+SELECT count(*) FROM ONLY op_parent WHERE k = 1;
+ count 
+-------
+   429
+(1 row)
+
+SELECT count(*) FROM op_parent WHERE k = 1;
+ count 
+-------
+   858
+(1 row)
+
+-- LionOrdered: a B-tree walked with a lion filter
+SELECT op_lion('SELECT b FROM op_child WHERE k = 1 ORDER BY b LIMIT 3');
+        op_lion         
+------------------------
+ LionOrdered, same rows
+(1 row)
+
+SELECT op_lion('SELECT b FROM ONLY op_parent WHERE k = 1 ORDER BY b LIMIT 3');
+         op_lion         
+-------------------------
+ no lion node, same rows
+(1 row)
+
+SELECT b FROM ONLY op_parent WHERE k = 1 ORDER BY b LIMIT 3;
+ b  
+----
+  1
+  8
+ 15
+(3 rows)
+
+-- LionBm25
+SELECT op_lion('SELECT count(*) FROM (SELECT b FROM op_child WHERE d @@ ''w1''
+	ORDER BY lion_bm25_score(d, ''w1'', ''op_child_d'') DESC LIMIT 3) s');
+       op_lion       
+---------------------
+ LionBm25, same rows
+(1 row)
+
+SELECT op_lion('SELECT count(*) FROM (SELECT b FROM ONLY op_parent WHERE d @@ ''w1''
+	ORDER BY lion_bm25_score(d, ''w1'', ''op_parent_d'') DESC LIMIT 3) s');
+         op_lion         
+-------------------------
+ no lion node, same rows
+(1 row)
+
+-- the semi join over the fact's fk index
+SELECT op_lion('SELECT d.pk FROM op_dim d WHERE EXISTS
+	(SELECT 1 FROM op_child f WHERE f.k = d.pk AND f.d @@ ''w1'')');
+         op_lion         
+-------------------------
+ LionSemiJoin, same rows
+(1 row)
+
+SELECT op_lion('SELECT d.pk FROM op_dim d WHERE EXISTS
+	(SELECT 1 FROM ONLY op_parent f WHERE f.k = d.pk AND f.d @@ ''w1'')');
+         op_lion         
+-------------------------
+ no lion node, same rows
+(1 row)
+
+SELECT d.pk FROM op_dim d WHERE EXISTS
+	(SELECT 1 FROM ONLY op_parent f WHERE f.k = d.pk AND f.d @@ 'w1') ORDER BY 1;
+ pk 
+----
+  0
+  1
+  2
+  3
+  4
+  5
+  6
+(7 rows)
+
+-- a table that once had a child keeps relhassubclass until it is reset, and
+-- declines the same way; the table itself is unchanged by it
+DROP TABLE op_child;
+SELECT op_lion('SELECT count(*) FROM op_parent WHERE k = 1');
+         op_lion         
+-------------------------
+ no lion node, same rows
+(1 row)
+
+SELECT count(*) FROM op_parent WHERE k = 1;
+ count 
+-------
+   429
+(1 row)
+
+DROP FUNCTION op_lion(text);
+DROP TABLE op_parent;
+DROP TABLE op_dim;
