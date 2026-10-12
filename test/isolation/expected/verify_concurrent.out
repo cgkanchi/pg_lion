@@ -20,7 +20,7 @@ v_parked
 (1 row)
 
 step s2_split_right: 
-	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 120)
+	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 200)
 	  FROM generate_series(1, 1000) g;
 
 step s3_park_page: SELECT injection_points_attach('lion-verify-dir-page-read', 'wait');
@@ -62,7 +62,7 @@ v_parked
 (1 row)
 
 step s2_split_right2: 
-	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 120)
+	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 200)
 	  FROM generate_series(1001, 2000) g;
 
 step s3_wake_level: 
@@ -822,7 +822,7 @@ v_parked
 (1 row)
 
 step s2_split_right: 
-	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 120)
+	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 200)
 	  FROM generate_series(1, 1000) g;
 
 step s2_late: 
@@ -896,7 +896,7 @@ injection_points_attach
 
 step s1_verify_c: SELECT lion_index_verify('vc_k', true); <waiting ...>
 step s2_split_right: 
-	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 120)
+	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 200)
 	  FROM generate_series(1, 1000) g;
 
 step s3_wake_level: 
