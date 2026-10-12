@@ -61,7 +61,7 @@ lion_init_metapage(Page page, uint32 inline_limit, BlockNumber root,
 	meta = LionPageGetMeta(page);
 	memset(meta, 0, sizeof(LionMetaPageData));
 	meta->magic = LION_MAGIC;
-	meta->version = LION_VERSION_V9;
+	meta->version = LION_VERSION_V10;
 	meta->offset_bits = LION_OFFSET_BITS;
 	meta->container_bits = LION_CONTAINER_BITS;
 	meta->unused_nbuckets = 0;
@@ -286,9 +286,10 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 	UnlockReleaseBuffer(buf);
 
 	/*
-	 * Version 9 is the only one read.  Anything older predates a format
+	 * Version 10 is the only one read.  Anything older predates a format
 	 * change that moved or reinterpreted items - for versions 6 to 8 the
-	 * sparse segments of §13 - and anything newer is a format this build
+	 * sparse segments of §13, for version 9 the entry tuples of §21 - and
+	 * anything newer is a format this build
 	 * does not know; the hint says which of the two it is, since REINDEX with
 	 * this build is the way out of either, but the reason differs.
 	 */
@@ -299,15 +300,15 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 						RelationGetRelationName(index)),
 				 errdetail("Meta page magic %08X, expected %08X.",
 						   meta->magic, LION_MAGIC)));
-	if (meta->version != LION_VERSION_V9)
+	if (meta->version != LION_VERSION_V10)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a valid lion index",
 						RelationGetRelationName(index)),
 				 errdetail("Meta page magic %08X version %u, expected %08X version %u.",
 						   meta->magic, meta->version, LION_MAGIC,
-						   LION_VERSION_V9),
-				 meta->version < LION_VERSION_V9 ?
+						   LION_VERSION_V10),
+				 meta->version < LION_VERSION_V10 ?
 				 errhint("REINDEX the index: its on-disk format predates this build of pg_lion.") :
 				 errhint("The index was written by a newer build of pg_lion than this one: use that build, or REINDEX the index with this one.")));
 
@@ -410,7 +411,7 @@ void
 lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
 						   uint32 bucket_tids)
 {
-	meta->version = LION_VERSION_V9;
+	meta->version = LION_VERSION_V10;
 	if (cols == 0)
 	{
 		meta->summary_cols = 0;

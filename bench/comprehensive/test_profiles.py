@@ -114,7 +114,7 @@ class Profiles(unittest.TestCase):
                 self.assertTrue(set(ORDERED_CASES) <= {k[6] for k in warm if k[2] == family})
 
     def test_recorded_run_still_audits(self):
-        directory = Path(__file__).resolve().parents[1] / 'results/2026-10-08-85c991c-pg18-focused'
+        directory = Path(__file__).resolve().parents[1] / 'results/2026-10-11-3947945-pg18-focused'
         meta = json.loads((directory / 'metadata.json').read_text())
         queries = json.loads((directory / 'queries.json').read_text())
         warm, cold = expected_configurations(meta, queries)

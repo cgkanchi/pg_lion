@@ -983,14 +983,14 @@ lion_facets_next_entry(LionFacetRun *run, LionEntryScan *es,
 		if (entry == NULL)
 			return false;
 		run->walked++;
-		if (LionEntryIsEmptyKey(entry) || entry->ntids == 0 ||
+		if (LionEntryIsEmptyKey(entry) || lion_entry_ntids(entry) == 0 ||
 			(LionEntryIsNullKey(entry) && run->state->multikey))
 			continue;
 		k->isnull = LionEntryIsNullKey(entry);
 		k->key = k->isnull ? (Datum) 0 : lion_entry_key(es->state, entry);
 		if (!k->isnull && lion_is_length_key(run->state, k->key))
 			continue;
-		k->ntids = entry->ntids;
+		k->ntids = lion_entry_ntids(entry);
 		k->count = 0;
 		oldcxt = MemoryContextSwitchTo(run->keycxt);
 		if (!k->isnull)
@@ -1255,7 +1255,7 @@ lion_facets_nentries(LionFacetRun *run)
 	while ((entry = lion_entry_scan_next_copy(&es, &itemlen)) != NULL)
 	{
 		run->walked++;
-		if (!LionEntryIsEmptyKey(entry) && entry->ntids > 0 &&
+		if (!LionEntryIsEmptyKey(entry) && lion_entry_ntids(entry) > 0 &&
 			!(LionEntryIsNullKey(entry) && run->state->multikey))
 			n++;
 	}

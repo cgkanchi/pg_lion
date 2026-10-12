@@ -65,6 +65,13 @@ lion_eval_clause_values(LionCountScanState *st)
 		cl->val = datumCopy(val, typbyval, typlen);
 	}
 
+	/*
+	 * The keys of the dimensions folded into fact filters (DESIGN.md §27, "A
+	 * second dimension that only filters"), as arrays in the same context.
+	 */
+	if (st->join != NULL && st->join->nfilter > 0)
+		lion_join_filter_values(st);
+
 	MemoryContextSwitchTo(oldcxt);
 }
 
@@ -518,6 +525,73 @@ lion_locate_leaf(LionCountScanState *st, LionClauseState *cl,
 			}
 			break;
 
+		case LION_CLAUSE_DISTINCT:
+
+			/*
+			 * `col IS DISTINCT FROM c` (DESIGN.md §35) rejects the rows of
+			 * c's entry alone - or, when c is a parameter that came out NULL,
+			 * those of the NULL entry, `IS NOT NULL`'s.
+			 */
+			*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));
+			if (cl->valisnull ?
+				lion_posting_set_lookup_null_col(cl->idx, cl->idxcol,
+												 &(*sets)[0]) :
+				lion_posting_set_lookup_col(cl->idx, cl->idxcol, cl->val,
+											cl->valtype, &(*sets)[0]))
+			{
+				n = 1;
+				tree = lion_key_node(0);
+			}
+			else
+				lion_posting_set_release(&(*sets)[0]);
+			break;
+
+		case LION_CLAUSE_NOTMULTI:
+			{
+				/*
+				 * `NOT (tags @> q)` (DESIGN.md §35) rejects the rows the
+				 * query's sets hold exactly - the planner took a literal
+				 * they answer exactly, and anything else now is an error,
+				 * as it is for the query itself (lion_locate_multikey()) -
+				 * and the NULL entry's, for which the operator is NULL.
+				 */
+				LionPostingSet *qsets;
+				LionKeyNode *qtree;
+				int			qn = lion_locate_multikey(st, cl, &qsets, &qtree);
+				LionPostingSet nullset;
+				LionKeyNode **args;
+				int			nargs = 0;
+
+				if (cl->qmode != LION_QMODE_KEYS &&
+					cl->qmode != LION_QMODE_NONE)
+					elog(ERROR, "roaring count: query for index \"%s\" is no longer exact",
+						 RelationGetRelationName(cl->idx));
+				if (qn == 0)
+					qtree = NULL;
+				*sets = (LionPostingSet *)
+					palloc0(sizeof(LionPostingSet) * (qn + 1));
+				if (qn > 0)
+					memcpy(*sets, qsets, sizeof(LionPostingSet) * qn);
+				n = qn;
+				args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * 2);
+				if (qtree != NULL)
+					args[nargs++] = qtree;
+				if (lion_posting_set_lookup_null_col(cl->idx, cl->idxcol,
+													 &nullset))
+				{
+					(*sets)[n] = nullset;
+					args[nargs++] = lion_key_node(n);
+					n++;
+				}
+				else
+					lion_posting_set_release(&nullset);
+				if (nargs == 1)
+					tree = args[0];
+				else if (nargs == 2)
+					tree = lion_bool_node(LION_KN_OR, args, 2);
+				break;
+			}
+
 		case LION_CLAUSE_NULL:
 		case LION_CLAUSE_NOTNULL:
 			*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));
@@ -597,8 +671,10 @@ lion_rangesrc_range(LionCountScanState *st, int first, int n, bool toplevel,
  * range of the relation), which the counts then read like any other set.
  * One that does not fit is left to be walked at every count instead
  * (src->rangewalk, lion_node_count()) - unless it is an OR's leaf, which
- * cannot be taken apart that way (`walkable` false; the planner declines one
- * it expects to be large).  That one used to be collected whatever it took,
+ * cannot be taken apart that way, or a source of the decoded walk's WHERE
+ * (DESIGN.md §34), which is read as one collected copy (`walkable` false; the
+ * planner declines an OR's leaf it expects to be large, and prices the
+ * decoded walk's as collected in windows, lion_cost_range_source()).  That one used to be collected whatever it took,
  * in memory; it gets the same memory as the others now, and past it is
  * collected a window of container keys at a time into a temporary file
  * (lion_range_collect(), 2026-09-28 review).
@@ -684,10 +760,17 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 	int		   *leafn;
 	bool	   *absorbed;
 	bool	   *left;
+	bool	   *never;			/* a complement leaf true of no row */
 	LionKeyNode **arms;
+	LionKeyNode **marms;
+	LionCountSource *m = NULL;
 	int			narms = 0;
+	int			nmarms = 0;
+	bool		mempty = false;	/* a complement arm true of every row */
 	int			total = 0;
+	int			mtotal = 0;
 	int			off = 0;
+	int			moff = 0;
 	int			leaf = 0;
 	int			armfirst = 0;
 	int			arm = 0;
@@ -700,6 +783,7 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 	leafn = (int *) palloc0(sizeof(int) * orst->nleaves);
 	absorbed = (bool *) palloc0(sizeof(bool) * orst->nleaves);
 	left = (bool *) palloc0(sizeof(bool) * orst->nleaves);
+	never = (bool *) palloc0(sizeof(bool) * orst->nleaves);
 
 	for (i = 0; i < orst->nleaves; i++)
 	{
@@ -746,47 +830,82 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 											&walked);
 			Assert(!walked);
 		}
+		else if (cl->kind == LION_CLAUSE_NE && cl->valisnull)
+		{
+			/* `col <> NULL` is true of no row (DESIGN.md §35) */
+			never[i] = true;
+			continue;
+		}
 		else
 		{
+			/*
+			 * A complement leaf (DESIGN.md §35) locates the sets it rejects,
+			 * N; no set at all is a leaf true of every row.
+			 */
 			leaftree[i] = lion_locate_leaf(st, cl, &leafsets[i], &leafn[i]);
 			if (leaftree[i] != NULL && cl->kind == LION_CLAUSE_MULTI &&
 				cl->qmode == LION_QMODE_LOSSY)
 				leaftree[i] = lion_posfilter_node(cl, leaftree[i]);
 		}
-		total += leafn[i];
+		if (orst->armcompl != NULL && orst->armcompl[arm])
+			mtotal += leafn[i];
+		else
+			total += leafn[i];
 		CHECK_FOR_INTERRUPTS();
 	}
 
 	/*
-	 * One array for the whole source, with every leaf's tree moved onto it,
-	 * and each leaf's own array let go as it is copied: an IN list of a
-	 * parameter can be millions of sets long (DESIGN.md §15).
+	 * One array for the positive arms' sets and one for the complement arms',
+	 * with every leaf's tree moved onto its own, and each leaf's array let go
+	 * as it is copied: an IN list of a parameter can be millions of sets long
+	 * (DESIGN.md §15).
 	 */
 	src->sets = (LionPostingSet *)
 		palloc_extended(sizeof(LionPostingSet) * Max(total, 1),
 						MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
 	src->nsets = total;
 	src->nomaterialize = true;
+	if (orst->compl)
+	{
+		m = (LionCountSource *) palloc0(sizeof(LionCountSource));
+		m->sets = (LionPostingSet *)
+			palloc_extended(sizeof(LionPostingSet) * Max(mtotal, 1),
+							MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
+		m->nsets = mtotal;
+		m->nomaterialize = true;
+	}
+	armfirst = 0;
+	arm = 0;
 	for (i = 0; i < orst->nleaves; i++)
 	{
+		bool		incompl;
+
+		while (i >= armfirst + orst->armlen[arm])
+			armfirst += orst->armlen[arm++];
+		incompl = (orst->armcompl != NULL && orst->armcompl[arm]);
 		if (leafn[i] > 0)
 		{
-			memcpy(&src->sets[off], leafsets[i],
+			memcpy(incompl ? &m->sets[moff] : &src->sets[off], leafsets[i],
 				   sizeof(LionPostingSet) * leafn[i]);
 			pfree(leafsets[i]);
 			leafsets[i] = NULL;
 		}
-		lion_shift_keynos(leaftree[i], off);
-		off += leafn[i];
+		lion_shift_keynos(leaftree[i], incompl ? moff : off);
+		if (incompl)
+			moff += leafn[i];
+		else
+			off += leafn[i];
 	}
-	Assert(off == total);
+	Assert(off == total && moff == mtotal);
 
 	arms = (LionKeyNode **) palloc0(sizeof(LionKeyNode *) * orst->narms);
+	marms = (LionKeyNode **) palloc0(sizeof(LionKeyNode *) * orst->narms);
 	for (i = 0; i < orst->narms; i++)
 	{
 		LionKeyNode **conj = (LionKeyNode **)
 			palloc0(sizeof(LionKeyNode *) * orst->armlen[i]);
 		int			nconj = 0;
+		int			nkept = 0;
 		bool		empty = false;
 
 		for (j = 0; j < orst->armlen[i]; j++, leaf++)
@@ -795,29 +914,74 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 				continue;		/* a bound of a range an earlier leaf is */
 			if (left[leaf])
 				continue;		/* refuted with its arm, or implied */
-			if (leaftree[leaf] == NULL)
-				empty = true;	/* an AND with a leaf that selects nothing */
+			nkept++;
+			if (never[leaf])
+				empty = true;	/* a complement leaf true of no row */
+			else if (leaftree[leaf] == NULL)
+			{
+				/*
+				 * A positive leaf that selects nothing empties its AND; a
+				 * complement leaf with no set rejects nothing, and leaves
+				 * the union of its arm's sets as it was.
+				 */
+				if (orst->armcompl == NULL || !orst->armcompl[i])
+					empty = true;
+			}
 			else
 				conj[nconj++] = leaftree[leaf];
 		}
 
-		if (empty || nconj == 0)
+		if (empty || nkept == 0)
 			continue;			/* this arm contributes nothing to the union */
 
+		if (orst->armcompl != NULL && orst->armcompl[i])
+		{
+			/*
+			 * A complement arm is true of every row outside the union of its
+			 * leaves' sets, N; with none, of every row, and so is the OR.
+			 */
+			if (nconj == 0)
+				mempty = true;
+			else
+				marms[nmarms++] = (nconj == 1) ? conj[0] :
+					lion_bool_node(LION_KN_OR, conj, nconj);
+			continue;
+		}
 		arms[narms++] = lion_bool_node(LION_KN_AND, conj, nconj);
 	}
 
-	if (narms == 0)
-	{
+	src->tree = (narms > 0) ? lion_bool_node(LION_KN_OR, arms, narms) : NULL;
+	if (src->tree != NULL &&
+		!lion_sets_satisfiable(src->nsets, src->sets, src->tree))
 		src->tree = NULL;
-		st->wheremissing = true;
+
+	/*
+	 * The complement arms: the OR is P, the positive arms' union, together
+	 * with every row outside M, the intersection of the complement arms'
+	 * N (DESIGN.md §35, "Complements in an OR").  M of no row - an arm true
+	 * of every row, or arms whose sets no row is in - makes the OR every
+	 * row; no complement arm left - each was true of no row, or refuted by
+	 * the partition's bounds - leaves P alone, as an OR always was.
+	 */
+	if (m != NULL && (nmarms > 0 || mempty))
+	{
+		m->tree = mempty ? NULL :
+			(nmarms == 1) ? marms[0] :
+			lion_bool_node(LION_KN_AND, marms, nmarms);
+		if (m->tree != NULL &&
+			!lion_sets_satisfiable(m->nsets, m->sets, m->tree))
+			m->tree = NULL;
+		src->compl = m;
 		return;
 	}
-
-	src->tree = lion_bool_node(LION_KN_OR, arms, narms);
+	if (m != NULL)
+	{
+		for (i = 0; i < m->nsets; i++)
+			lion_posting_set_release(&m->sets[i]);
+	}
 
 	/* Every arm wants a key no entry holds: the union selects nothing. */
-	if (!lion_sets_satisfiable(src->nsets, src->sets, src->tree))
+	if (src->tree == NULL)
 		st->wheremissing = true;
 }
 
@@ -900,6 +1064,41 @@ lion_arg_type_passed(Oid type, Oid declared)
 }
 
 /*
+ * The residual clauses' test of one heap row (DESIGN.md §10, "Residual
+ * clauses"): the columns they read copied into the node's residual slot -
+ * pointers into the tuple, which the caller's pin keeps in place - and the
+ * clauses evaluated over it, as the ordinary plan's scan evaluates its quals.
+ */
+static bool
+lion_resid_test(void *arg, HeapTuple tuple)
+{
+	LionCountScanState *st = (LionCountScanState *) arg;
+	TupleTableSlot *slot = st->residslot;
+	TupleDesc	hdesc = RelationGetDescr(st->heap);
+	ExprContext *econtext = st->residecxt;
+	bool		pass;
+	int			i;
+
+	ExecClearTuple(slot);
+	for (i = 0; i < slot->tts_tupleDescriptor->natts; i++)
+	{
+		slot->tts_values[i] = (Datum) 0;
+		slot->tts_isnull[i] = true;
+	}
+	for (i = 0; i < st->nresidcol; i++)
+		slot->tts_values[st->residslotcol[i]] =
+			heap_getattr(tuple, st->residattno[i], hdesc,
+						 &slot->tts_isnull[st->residslotcol[i]]);
+	ExecStoreVirtualTuple(slot);
+
+	econtext->ecxt_scantuple = slot;
+	pass = ExecQual(st->resid, econtext);
+	ResetExprContext(econtext);
+	ExecClearTuple(slot);
+	return pass;
+}
+
+/*
  * The heap recheck this scan's multi-key queries need (DESIGN.md §17, "A
  * query known only at run time"), as a row filter over the relation being
  * counted, set on the visibility cache every count of this execution is
@@ -930,17 +1129,18 @@ lion_build_filter(LionCountScanState *st)
 		LionClauseState *cl = &st->clause[i];
 
 		if (cl->kind == LION_CLAUSE_MULTI && !st->inor[i] && cl->idx != NULL &&
+			lion_clause_in_run(st, i) &&
 			(cl->qmode == LION_QMODE_LOSSY || cl->qmode == LION_QMODE_ALL))
 			n++;
 	}
-	if (n == 0)
+	if (n == 0 && st->resid == NULL)
 		return;
 
 	oldcxt = MemoryContextSwitchTo(st->wherecxt);
 	filter = (LionRowFilter *) palloc0(sizeof(LionRowFilter));
 	filter->heap = st->heap;
 	filter->clauses = (LionRowFilterClause *)
-		palloc0(sizeof(LionRowFilterClause) * n);
+		palloc0(sizeof(LionRowFilterClause) * Max(n, 1));
 	filter->tmpcxt = AllocSetContextCreate(st->wherecxt,
 										   "LionCount row filter",
 										   ALLOCSET_SMALL_SIZES);
@@ -959,7 +1159,7 @@ lion_build_filter(LionCountScanState *st)
 		bool		typbyval;
 
 		if (!(cl->kind == LION_CLAUSE_MULTI && !st->inor[i] &&
-			  cl->idx != NULL &&
+			  cl->idx != NULL && lion_clause_in_run(st, i) &&
 			  (cl->qmode == LION_QMODE_LOSSY || cl->qmode == LION_QMODE_ALL)))
 			continue;
 
@@ -1025,6 +1225,19 @@ lion_build_filter(LionCountScanState *st)
 										 InvalidOid, c->collation),
 						   &c->flinfo);
 	}
+
+	/*
+	 * ... and the residual clauses (DESIGN.md §10, "Residual clauses"), which
+	 * only the heap can decide.
+	 */
+	if (st->resid != NULL)
+	{
+		if (RelationGetRelid(st->heap) != st->plan.heapoid)
+			elog(ERROR, "LionCount: residual clauses over another relation");
+		filter->rowtest = lion_resid_test;
+		filter->rowtestarg = st;
+		filter->nheap++;
+	}
 	MemoryContextSwitchTo(oldcxt);
 
 	st->filter = filter;
@@ -1065,6 +1278,7 @@ lion_locate_where(LionCountScanState *st)
 		src->nomaterialize = false;
 		src->disjoint = false;
 		src->rangewalk = NULL;
+		src->compl = NULL;
 
 		if (st->item[k].orno >= 0)
 		{
@@ -1072,15 +1286,26 @@ lion_locate_where(LionCountScanState *st)
 			continue;
 		}
 
-		/* A range as a source (DESIGN.md §32): collected, or walked. */
+		/*
+		 * A range as a source (DESIGN.md §32): collected, or walked - but
+		 * never walked beside the decoded walk (§34), which reads the WHERE
+		 * as one collected copy: collected there, past the memory into a
+		 * file.
+		 */
 		if (st->item[k].rangesrc)
 		{
-			LionRangeSource *rs = lion_rangesrc_range(st, 0, st->nclause, true,
-													  cl->attno);
+			LionRangeSource *rs;
 			bool		walked;
+			int			first;
+			int			n;
 
-			src->tree = lion_locate_range(st, rs, true, &src->sets,
-										  &src->nsets, &walked);
+			/* the bounds of its own filter, or the WHERE's (§10) */
+			lion_clause_window(st, st->item[k].clauseno, &first, &n);
+			rs = lion_rangesrc_range(st, first, n, true, cl->attno);
+
+			src->tree = lion_locate_range(st, rs, st->decode == NULL,
+										  &src->sets, &src->nsets, &walked);
+			Assert(!walked || st->decode == NULL);
 			if (walked)
 				src->rangewalk = rs;
 			else if (src->tree == NULL)
@@ -1308,6 +1533,12 @@ lion_release_where(LionCountScanState *st)
 
 		for (j = 0; j < src->nsets; j++)
 			lion_posting_set_release(&src->sets[j]);
+		if (src->compl != NULL)
+		{
+			for (j = 0; j < src->compl->nsets; j++)
+				lion_posting_set_release(&src->compl->sets[j]);
+			src->compl = NULL;
+		}
 		src->nsets = 0;
 		src->sets = NULL;
 		src->tree = NULL;		/* it lived in wherecxt, reset below */
@@ -1388,9 +1619,54 @@ lion_emit_tuple(LionCountScanState *st, Datum key, bool keyisnull,
 }
 
 /*
+ * A filtered count of the row (DESIGN.md §10, "Filtered counts"), of target
+ * list kind `kind`, into *value and *isnull.  A node of one row has every
+ * run's count (runsready); a walk's row is a partial one of the run being
+ * counted, whose `count` is the group's under its own filter only, and every
+ * other filtered count of the row adds nothing to the group's - a count 0,
+ * a sum a NULL, which the sum skips - except that run 0's row, which every
+ * group has, gives a sum of no row its 0.  A sum is NULL over no row at all
+ * (the form SUM: no row of the WHERE), or over no row with the condition
+ * true (SUMNULL: every other row adds a NULL).
+ */
+static void
+lion_fcount_value(LionCountScanState *st, int kind, int64 count,
+				  Datum *value, bool *isnull)
+{
+	int			f = LION_TL_FCOUNT_FILTER(kind);
+	int			form = LION_TL_FCOUNT_FORM(kind);
+	int64		n;
+	bool		null;
+
+	if (st->runsready)
+	{
+		n = st->runcount[f];
+		null = (form == LION_FCOUNT_SUM) ? (st->runcount[0] == 0) :
+			(form == LION_FCOUNT_SUMNULL) ? (n == 0) : false;
+	}
+	else if (st->currun == f)
+	{
+		n = count;
+		null = (form != LION_FCOUNT_COUNT && n == 0);
+	}
+	else
+	{
+		n = 0;
+		null = (form == LION_FCOUNT_SUMNULL ||
+				(form == LION_FCOUNT_SUM && st->currun != 0));
+	}
+	*value = Int64GetDatum(n);
+	*isnull = null;
+}
+
+/*
  * The row of a group: the key of each of its nkeys GROUP BY columns, in the
  * plan's order, and its count - the target list's columns made of them, the
  * HAVING applied and the projection done.  NULL when the HAVING rejects it.
+ *
+ * Beside filtered counts (DESIGN.md §10), a walk's row out of a filter's run
+ * is a partial one that adds its filter's count alone to the group's: every
+ * count of the group's rows in it is 0, lion_fcount_value() says the rest.
  */
 TupleTableSlot *
 lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
@@ -1412,6 +1688,23 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 	for (i = 0; i < st->ntlist; i++)
 	{
 		int			kind = st->tlkind[i];
+
+		/* a filtered count, and a filter's run's partial counts (§10) */
+		if (LION_TL_IS_FCOUNT(kind))
+		{
+			lion_fcount_value(st, kind, count, &slot->tts_values[i],
+							  &slot->tts_isnull[i]);
+			continue;
+		}
+		if (st->currun > 0 && !st->runsready &&
+			(kind == LION_TL_COUNT || kind == LION_TL_COUNT_GROUPCOL ||
+			 kind == LION_TL_COUNT_GROUPCOL2 || kind == LION_TL_COUNT_ZERO ||
+			 LION_TL_IS_COUNT_GROUPCOLN(kind)))
+		{
+			slot->tts_values[i] = Int64GetDatum(0);
+			slot->tts_isnull[i] = false;
+			continue;
+		}
 
 		/*
 		 * A dimension column of the FK-side join, from the child's row - of
@@ -1500,9 +1793,12 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 					slot->tts_isnull[i] = a->resnull;
 					break;
 				}
-				if (LION_TL_IS_WKEY(kind))
+				if (LION_TL_IS_WKEY(kind) || LION_TL_IS_RESID(kind))
 				{
-					/* ... and the key its argument read, which nothing prints */
+					/*
+					 * ... and the key its argument read, or a column a
+					 * residual clause read (§10), which nothing prints
+					 */
 					slot->tts_values[i] = (Datum) 0;
 					slot->tts_isnull[i] = true;
 					break;

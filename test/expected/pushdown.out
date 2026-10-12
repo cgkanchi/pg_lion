@@ -671,17 +671,26 @@ SELECT lion_pd('SELECT count(DISTINCT b) FROM lion_pdt WHERE a = 3');
  pushed down, 1 rows
 (1 row)
 
+-- a FILTER the index answers is one more set to count (countfilter.sql); one
+-- it cannot answer leaves the query to the ordinary plan
 SELECT lion_pd('SELECT count(*) FILTER (WHERE b = 2) FROM lion_pdt WHERE a = 3');
+       lion_pd       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lion_pd('SELECT count(*) FILTER (WHERE id < 500) FROM lion_pdt WHERE a = 3');
          lion_pd         
 -------------------------
  not pushed down, 1 rows
 (1 row)
 
--- a qual that is not an indexed equality to a constant
+-- a qual that is not an indexed equality to a constant: residual, tested on
+-- the heap rows a = 3 selects (DESIGN.md §10, "Residual clauses")
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND id < 500');
-         lion_pd         
--------------------------
- not pushed down, 1 rows
+       lion_pd       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- ... which a range on an indexed column is, since DESIGN.md §28
@@ -692,9 +701,9 @@ SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a > 3');
 (1 row)
 
 SELECT lion_pd('SELECT count(*) FROM lion_pdt WHERE a = 3 AND id = 5');
-         lion_pd         
--------------------------
- not pushed down, 1 rows
+       lion_pd       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- two different constants on one column
@@ -2061,31 +2070,31 @@ SELECT c, count(*) FROM lion_pdo WHERE a = 17 OR b = 3 GROUP BY c ORDER BY c;
 (2 rows)
 
 -- ---- ORs the node must decline -----------------------------------------
--- a negated arm
+-- an arm of negated clauses is not declined: it is a complement, counted by
+-- De Morgan (DESIGN.md §35, "Complements in an OR")
 SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR n IS NOT NULL');
-         lion_pd         
--------------------------
- not pushed down, 1 rows
+       lion_pd       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR NOT (b = 3)');
-         lion_pd         
--------------------------
- not pushed down, 1 rows
+       lion_pd       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_plans('SELECT count(*) FROM lion_pdo WHERE a = 17 OR n IS NOT NULL');
-                  lion_plans                   
------------------------------------------------
+                                         lion_plans                                          
+---------------------------------------------------------------------------------------------
  -- on:
- Aggregate
-   ->  Seq Scan on lion_pdo
-         Filter: ((a = 17) OR (n IS NOT NULL))
+ Custom Scan (LionCount)
+   Lion Indexes: lion_pdo_c (all rows), lion_pdo_a, lion_pdo_n ((a = 17) OR (n IS NOT NULL))
  -- off:
  Aggregate
    ->  Seq Scan on lion_pdo
          Filter: ((a = 17) OR (n IS NOT NULL))
-(8 rows)
+(7 rows)
 
 -- an arm on a column with no lion index
 SELECT lion_pd('SELECT count(*) FROM lion_pdo WHERE a = 17 OR id = 5');
@@ -2913,9 +2922,9 @@ SELECT lion_pd('SELECT count(*) FROM lion_pd2 WHERE id = 77 AND c200 = 17 AND c2
 (1 row)
 
 SELECT lion_pd('SELECT count(*) FROM lion_pd2 WHERE c20k = 77 AND c200 = 17 AND c2 = 1');
-         lion_pd         
--------------------------
- not pushed down, 1 rows
+       lion_pd       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- ---- the early exit in the AND merge (§25) ------------------------------

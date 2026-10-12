@@ -63,6 +63,8 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 				List	   *context;
 				char	   *opname = get_opname(cl->opno);
 				char	   *val;
+				int			filt = lion_join_filter_of(st,
+													   (int) (cl - st->clause));
 
 				if (opname == NULL)
 					elog(ERROR, "LionCount: cache lookup failed for operator %u",
@@ -75,14 +77,42 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 				/*
 				 * The FK-side join's key is a column of the OTHER table
 				 * (DESIGN.md §27), so it is printed qualified: `fk = d.pk`,
-				 * as core prints a join clause.
+				 * as core prints a join clause.  So is the key of a dimension
+				 * folded into a fact filter ("A second dimension that only
+				 * filters"): the column of its child the keys are read from,
+				 * `fk = d2.pk` - that clause - as that child prints it.
 				 */
+				if (filt >= 0)
+				{
+					Plan	   *fplan = st->join->filterps[filt]->plan;
+					TargetEntry *tle = (TargetEntry *)
+						list_nth(fplan->targetlist,
+								 st->join->filtercol[filt] - 1);
+
+					List	   *fancestors = lcons(st->css.ss.ps.plan,
+													   list_copy(ancestors));
+
+					context = set_deparse_context_plan(es->deparse_cxt, fplan,
+													   fancestors);
+					val = deparse_expression((Node *) tle->expr, context, true,
+											 false);
+					appendStringInfo(buf, "%s %s %s", attname, opname, val);
+					pfree(opname);
+					pfree(val);
+					break;
+				}
 				val = deparse_expression((Node *) cl->valexpr, context,
 										 st->join != NULL &&
 										 cl == &st->clause[st->join->clause],
 										 false);
 				if (cl->kind == LION_CLAUSE_ARRAY)
 					appendStringInfo(buf, "%s %s ANY (%s)", attname, opname,
+									 val);
+				else if (cl->kind == LION_CLAUSE_DISTINCT)
+					appendStringInfo(buf, "%s IS DISTINCT FROM %s", attname,
+									 val);
+				else if (cl->kind == LION_CLAUSE_NOTMULTI)
+					appendStringInfo(buf, "NOT (%s %s %s)", attname, opname,
 									 val);
 				else
 					appendStringInfo(buf, "%s %s %s", attname, opname, val);
@@ -137,7 +167,7 @@ static const char *
 lion_explain_clause_col(LionCountScanState *st, const LionClauseState *cl)
 {
 	return lion_explain_col(cl->idxoid, cl->attno,
-							cl->kind == LION_CLAUSE_MULTI, st->plan.vcols);
+							LION_CLAUSE_IS_MULTI(cl->kind), st->plan.vcols);
 }
 
 /* One arm of an OR, `len` leaves from leaf `at`: `((b = 2) AND (c = 3))`. */
@@ -418,7 +448,8 @@ lion_explain_group_index(LionCountScanState *st, List *ancestors,
 		 */
 		for (i = 0; i < st->nclause && !keys; i++)
 			keys = (st->clause[i].kind == LION_CLAUSE_NOTNULL &&
-					!st->inor[i] && st->clause[i].attno == st->driveattno);
+					!st->inor[i] && st->clause[i].attno == st->driveattno &&
+					st->plan.clause[i].filter == 0);
 		appendStringInfoString(buf, keys ? "(all keys)" : "(all rows)");
 	}
 
@@ -463,16 +494,20 @@ lion_explain_range_item(LionCountScanState *st, LionSourceItem *it,
 {
 	LionClauseState *first = &st->clause[it->clauseno];
 	bool		firstbound = true;
+	int			wfirst;
+	int			wn;
 	int			j;
 
-	for (j = 0; j < st->nclause; j++)
+	/* its own filter's bounds, or the WHERE's (DESIGN.md §10) */
+	lion_clause_window(st, it->clauseno, &wfirst, &wn);
+	for (j = wfirst; j < wfirst + wn; j++)
 	{
 		if (st->clause[j].kind == LION_CLAUSE_RANGESRC &&
 			!st->inor[j] && st->clause[j].attno == first->attno &&
 			!lion_explain_dropped_all(st, j))
 			break;
 	}
-	if (j == st->nclause)
+	if (j == wfirst + wn)
 		return;
 
 	if (buf->len > 0)
@@ -481,7 +516,7 @@ lion_explain_range_item(LionCountScanState *st, LionSourceItem *it,
 		appendStringInfo(buf, "%s%s ", get_rel_name(first->idxoid),
 						 lion_explain_clause_col(st, first));
 	appendStringInfoChar(buf, '(');
-	for (j = 0; j < st->nclause; j++)
+	for (j = wfirst; j < wfirst + wn; j++)
 	{
 		if (st->clause[j].kind != LION_CLAUSE_RANGESRC || st->inor[j] ||
 			st->clause[j].attno != first->attno ||
@@ -561,8 +596,25 @@ lion_explain_item(LionCountScanState *st, LionSourceItem *it,
 }
 
 /*
+ * The plan's WHERE items: its items, or beside filtered counts (DESIGN.md
+ * §10) run 0's, whichever run the node stands at.
+ */
+static LionSourceItem *
+lion_explain_where(LionCountScanState *st)
+{
+	return (st->nrun > 1) ? st->runitem[0] : st->planitem;
+}
+
+static int
+lion_explain_nwhere(LionCountScanState *st)
+{
+	return (st->nrun > 1) ? st->nrunitem[0] : st->nplanitem;
+}
+
+/*
  * The "Lion Indexes" line: the index whose entries drive the count, the
- * FK-side join's key and the plan's items, each with what it answers.
+ * FK-side join's key and the plan's items, each with what it answers; and a
+ * line of its own for each filtered count's.
  */
 static void
 lion_explain_indexes(LionCountScanState *st, List *ancestors,
@@ -570,6 +622,7 @@ lion_explain_indexes(LionCountScanState *st, List *ancestors,
 {
 	StringInfoData buf;
 	int			i;
+	int			r;
 
 	initStringInfo(&buf);
 
@@ -597,13 +650,30 @@ lion_explain_indexes(LionCountScanState *st, List *ancestors,
 	 * The plan's items (a partition's own may leave some out).  One that
 	 * every partition leaves out, because their bounds imply it, reads no
 	 * index at all, and is printed on a line of its own below (DESIGN.md §16,
-	 * "Clauses the partition bounds imply").
+	 * "Clauses the partition bounds imply").  Beside filtered counts they
+	 * are the WHERE's, run 0's.
 	 */
-	for (i = 0; i < st->nplanitem; i++)
-		lion_explain_item(st, &st->planitem[i], ancestors, es, &buf);
+	for (i = 0; i < lion_explain_nwhere(st); i++)
+		lion_explain_item(st, &lion_explain_where(st)[i], ancestors, es, &buf);
 
 	ExplainPropertyText("Lion Indexes", buf.data, es);
 	pfree(buf.data);
+
+	/*
+	 * ... and each filtered count (DESIGN.md §10, "Filtered counts"): the
+	 * items its filter adds to the WHERE's, which are its run's after them.
+	 */
+	for (r = 1; r < st->nrun; r++)
+	{
+		char		label[64];
+
+		initStringInfo(&buf);
+		for (i = st->nrunitem[0]; i < st->nrunitem[r]; i++)
+			lion_explain_item(st, &st->runitem[r][i], ancestors, es, &buf);
+		snprintf(label, sizeof(label), "Count Filter %d", r);
+		ExplainPropertyText(label, buf.data, es);
+		pfree(buf.data);
+	}
 }
 
 /*
@@ -624,9 +694,9 @@ lion_explain_bounds(LionCountScanState *st, List *ancestors, ExplainState *es)
 			appendStringInfoString(&buf, ", ");
 		appendStringInfoString(&buf, strVal(lfirst(lc)));
 	}
-	for (i = 0; i < st->nplanitem; i++)
+	for (i = 0; i < lion_explain_nwhere(st); i++)
 	{
-		LionSourceItem *it = &st->planitem[i];
+		LionSourceItem *it = &lion_explain_where(st)[i];
 		int			j;
 
 		if (it->orno < 0 && it->rangesrc)
@@ -653,9 +723,9 @@ lion_explain_bounds(LionCountScanState *st, List *ancestors, ExplainState *es)
 
 	/* ... and the arms of an OR a partition's bounds refute */
 	initStringInfo(&buf);
-	for (i = 0; i < st->nplanitem; i++)
+	for (i = 0; i < lion_explain_nwhere(st); i++)
 	{
-		LionSourceItem *it = &st->planitem[i];
+		LionSourceItem *it = &lion_explain_where(st)[i];
 
 		if (it->orno >= 0)
 			lion_explain_refuted(st, &st->ors[it->orno], ancestors, es,
@@ -687,6 +757,8 @@ lion_explain_join(LionCountScanState *st, ExplainState *es)
 		ExplainPropertyText("Join Type", "Semi", es);
 	else if (!js->outer && js->type == LION_JOIN_ANTI)
 		ExplainPropertyText("Join Type", "Anti", es);
+	else if (js->left)
+		ExplainPropertyText("Join Type", "Left", es);
 	if (js->sort.unique)
 		ExplainPropertyText("Join Keys", "distinct, sorted", es);
 
@@ -710,6 +782,9 @@ lion_explain_join(LionCountScanState *st, ExplainState *es)
 							(js->ordered ?
 							 "the outer rows with a match, in their order" :
 							 "the outer rows with a match"), es);
+	else if (js->left)
+		ExplainPropertyText("Join Rows",
+							"every dimension row, each with its count", es);
 	else if (js->rows)
 		ExplainPropertyText("Join Rows",
 							js->type == LION_JOIN_ANTI ?
@@ -1025,7 +1100,10 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 	if (st->rangesrc_walked > 0)
 		ExplainPropertyInteger("Range Sources Walked", NULL,
 							   st->rangesrc_walked, es);
-	/* ... and of the collected, those an OR's leaf spilled to a file */
+	/*
+	 * ... and of the collected, those spilled to a file: an OR's leaf, or a
+	 * range beside the decoded walk
+	 */
 	if (st->rangesrc_spilled > 0)
 		ExplainPropertyInteger("Range Sources Spilled", NULL,
 							   st->rangesrc_spilled, es);
@@ -1303,6 +1381,10 @@ lion_explain_join_counters(LionCountScanState *st, const LionCountStats *tot,
 	ExplainPropertyInteger("Join Keys Without Entry", NULL,
 						   js->missing + js->worker.missing, es);
 
+	/* ... and the keys of the dimensions folded into fact filters */
+	if (js->nfilter > 0)
+		ExplainPropertyInteger("Join Filter Keys", NULL, js->filterkeys, es);
+
 	/* ... and counted in each group of a fact column grouped by */
 	if (st->fg != NULL)
 		ExplainPropertyInteger("Fact Group Counts", NULL,
@@ -1405,6 +1487,23 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		lion_explain_partitions(st, es);
 
 	lion_explain_indexes(st, ancestors, es);
+
+	/*
+	 * The residual clauses (DESIGN.md §10, "Residual clauses"), tested on the
+	 * heap row of each row the others select, as core prints a scan's Filter.
+	 */
+	if (st->residexprs != NIL)
+	{
+		List	   *context = set_deparse_context_plan(es->deparse_cxt,
+													   st->css.ss.ps.plan,
+													   ancestors);
+
+		ExplainPropertyText("Residual Filter",
+							deparse_expression((Node *)
+											   make_ands_explicit(st->residexprs),
+											   context, false, false),
+							es);
+	}
 
 	/*
 	 * The clauses partitions leave out because their bounds imply them

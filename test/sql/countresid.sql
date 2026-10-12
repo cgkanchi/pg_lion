@@ -1,0 +1,225 @@
+-- Residual clauses in the count pushdown (DESIGN.md §10, "Residual
+-- clauses"): WHERE clauses no lion index answers, beside ones that do, tested
+-- on the heap row of each row the others select.  Each query is run through
+-- the LionCount node, with every other scan disabled so that a node that is
+-- built at all is the plan, and again as a sequential scan with the pushdown
+-- off; the two answers are compared as multisets both ways round.  The table
+-- has NULLs, negative values, and rows deleted and updated after its VACUUM,
+-- among them dead versions whose w is 0, which a residual dividing by w must
+-- never see.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+
+CREATE TABLE cr (id int, a int, b int NOT NULL, n int, t text, w int,
+				 tags text[], p text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO cr SELECT i, i % 7, i % 5,
+	   CASE WHEN i % 4 = 0 THEN NULL ELSE i % 11 - 5 END,
+	   CASE WHEN i % 9 = 0 THEN NULL ELSE 'v' || (i % 13) END,
+	   i % 9 + 1,
+	   CASE WHEN i % 10 = 0 THEN NULL ELSE ARRAY['t' || (i % 6), 't' || (i % 17)] END,
+	   md5(i::text)
+  FROM generate_series(1, 20000) i;
+CREATE INDEX cr_a ON cr USING lion (a);
+CREATE INDEX cr_b ON cr USING lion (b);
+CREATE INDEX cr_n ON cr USING lion (n);
+CREATE INDEX cr_t ON cr USING lion (t);
+CREATE INDEX cr_tags ON cr USING lion (tags);
+VACUUM (FREEZE, ANALYZE) cr;
+-- dead and updated rows the visibility map no longer covers, and dead
+-- versions with w = 0
+DELETE FROM cr WHERE id % 97 = 0;
+UPDATE cr SET a = (a + 1) % 7, n = NULL WHERE id % 89 = 0;
+UPDATE cr SET w = 0 WHERE id % 61 = 0;
+UPDATE cr SET w = 5, p = 'x' || p WHERE id % 61 = 0;
+UPDATE cr SET w = 0 WHERE id % 53 = 0;
+DELETE FROM cr WHERE id % 53 = 0;
+
+CREATE FUNCTION cr_q(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	used boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionCount\)' THEN
+			used := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE cr_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE cr_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM cr_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM cr_on EXCEPT ALL SELECT * FROM cr_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM cr_off EXCEPT ALL SELECT * FROM cr_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE cr_on, cr_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows', CASE WHEN used THEN 'count' ELSE 'no count' END,
+				  nrows);
+END $$;
+
+CREATE FUNCTION cr_plan(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		RETURN NEXT ln;
+	END LOOP;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+END $$;
+
+-- ---- the plans ----
+SELECT cr_plan('SELECT count(*) FROM cr WHERE a = 2 AND p LIKE ''a%''');
+SELECT cr_plan('SELECT b, count(*) FROM cr WHERE a = 2 AND id % 3 = 0 AND length(t) = 2 GROUP BY b');
+
+-- ---- residual clauses beside ones the posting sets answer ----
+SELECT q, cr_q(q) FROM (VALUES
+	('SELECT count(*) FROM cr WHERE a = 2 AND p LIKE ''a%'''),
+	('SELECT count(*) FROM cr WHERE a = 2 AND id > 10000'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND length(t) = 3'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND n + 1 > 0'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND coalesce(n, 0) >= 0'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND n % 2 = 0'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND 100 / w > 20'),
+	('SELECT count(*) FROM cr WHERE b = 3 AND 100 / w > 20 AND p LIKE ''%e%'''),
+	('SELECT count(*) FROM cr WHERE a = 2 AND (n > 3 OR t ~ ''^v1'')'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND b IN (1, 3) AND p LIKE ''%f%'''),
+	('SELECT count(*) FROM cr WHERE (a = 2 OR b = 1) AND p LIKE ''a%'''),
+	('SELECT count(*) FROM cr WHERE b = 1 AND (a = 2 OR n <> 3) AND id % 3 = 0'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND n IS NOT NULL AND id % 2 = 0'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND n <> 3 AND id % 2 = 0'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND n IS DISTINCT FROM 3 AND id % 2 = 0'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND n IS NULL AND id % 2 = 0'),
+	('SELECT count(*) FROM cr WHERE tags @> ''{t3}'' AND id % 2 = 0'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND NOT (tags @> ''{t3}'') AND id % 2 = 0'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND b = 1 AND t = ''v4'' AND id % 2 = 0'),
+	('SELECT count(*) FROM cr WHERE a = 99 AND id % 2 = 0'),
+	('SELECT count(n), count(t) FROM cr WHERE a = 2 AND id % 2 = 0'),
+	('SELECT count(n) FROM cr WHERE a = 2 AND id % 2 = 0'),
+	('SELECT b, count(*) FROM cr WHERE a = 2 AND p LIKE ''a%'' GROUP BY b'),
+	('SELECT a, b, count(*) FROM cr WHERE n = 1 AND id % 3 = 0 GROUP BY a, b'),
+	('SELECT b, count(*) FROM cr WHERE a = 2 AND b * 2 > 3 GROUP BY b'),
+	('SELECT n, count(*) FROM cr WHERE a = 2 AND id % 3 = 0 GROUP BY n'),
+	('SELECT b, count(*) FROM cr WHERE a = 2 AND id % 3 = 0 GROUP BY b HAVING count(*) > 90'),
+	('SELECT b, count(*) FROM cr WHERE a = 2 AND id % 3 = 0 GROUP BY b ORDER BY count(*) DESC LIMIT 2'),
+	('SELECT count(DISTINCT n) FROM cr WHERE a = 2 AND id % 3 = 0'),
+	('SELECT b, count(DISTINCT n) FROM cr WHERE a = 2 AND id % 3 = 0 GROUP BY b'),
+	('SELECT a, count(*) FROM cr WHERE a IN (1, 2) AND p LIKE ''%0%'' GROUP BY a'),
+	('SELECT a, count(*) FROM cr WHERE a = 2 AND id % 3 = 0 GROUP BY a'),
+	('SELECT coalesce(n, 0), count(*) FROM cr WHERE a = 2 AND id % 3 = 0 GROUP BY 1'),
+	('SELECT DISTINCT b FROM cr WHERE a = 2 AND id % 3 = 0 AND w = 2'),
+	('SELECT b, count(*) FROM cr WHERE a = 2 AND n >= -1 AND n < 3 AND id % 3 = 0 GROUP BY b')
+) v(q);
+
+-- ---- what is declined: nothing else to select the rows, a range summed
+-- over its entries, a volatile function, a subplan, a whole-row or system
+-- column, a partitioned table, and the switch ----
+SELECT q, cr_q(q) FROM (VALUES
+	('SELECT count(*) FROM cr WHERE id % 2 = 0'),
+	('SELECT a, count(*) FROM cr WHERE id % 2 = 0 GROUP BY a'),
+	('SELECT count(*) FROM cr WHERE n <> 3 AND id % 2 = 0'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND n BETWEEN -2 AND 2 AND id % 2 = 0'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND random() < 2'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND (SELECT count(*) FROM cr c2 WHERE c2.id = cr.id + 1) > 0'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND cr IS NOT NULL'),
+	('SELECT count(*) FROM cr WHERE a = 2 AND ctid > ''(5,0)''')
+) v(q);
+SET pg_lion.enable_count_residual = off;
+SELECT cr_q('SELECT count(*) FROM cr WHERE a = 2 AND p LIKE ''a%''');
+RESET pg_lion.enable_count_residual;
+
+-- ... and a set as large as the table is left to the sequential scan
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM cr WHERE a IN (0, 1, 2, 3, 4, 5, 6) AND p LIKE 'a%';
+
+-- ---- parameters: a generic plan, and a NULL value ----
+SET plan_cache_mode = force_generic_plan;
+PREPARE cr_p(int, int) AS SELECT count(*) FROM cr WHERE a = $1 AND id % $2 = 0;
+PREPARE cr_g(int, text) AS SELECT b, count(*) FROM cr WHERE a = $1 AND p LIKE $2 GROUP BY b ORDER BY b;
+SELECT cr_plan('EXECUTE cr_p(2, 3)');
+EXECUTE cr_p(2, 3);
+EXECUTE cr_p(2, NULL);
+EXECUTE cr_g(3, 'a%');
+EXECUTE cr_g(3, NULL);
+SET pg_lion.enable_count_pushdown = off;
+EXECUTE cr_p(2, 3);
+EXECUTE cr_p(2, NULL);
+EXECUTE cr_g(3, 'a%');
+EXECUTE cr_g(3, NULL);
+RESET pg_lion.enable_count_pushdown;
+DEALLOCATE cr_p;
+DEALLOCATE cr_g;
+RESET plan_cache_mode;
+
+-- ---- a LATERAL rescan with a new value in the residual each time ----
+SELECT cr_q('SELECT v.x, (SELECT count(*) FROM cr WHERE a = 2 AND id % v.x = 0) FROM (VALUES (2), (3), (5)) v(x)');
+
+-- ---- beside filtered counts (DESIGN.md §10, "Filtered counts") ----
+-- the residual is the WHERE's, tested in every run: the WHERE's count and
+-- each filter's
+SELECT q, cr_q(q) FROM (VALUES
+	('SELECT count(*) FILTER (WHERE b = 1), count(*) FROM cr WHERE a = 2 AND p LIKE ''a%'''),
+	('SELECT count(*) FILTER (WHERE b = 1), count(*) FILTER (WHERE n IS NULL), count(*) FROM cr WHERE a = 2 AND id % 3 = 0'),
+	('SELECT sum(CASE WHEN b = 1 THEN 1 ELSE 0 END), sum(CASE WHEN t = ''v3'' THEN 1 END) FROM cr WHERE a = 2 AND 100 / w > 20'),
+	('SELECT count(*) FILTER (WHERE tags @> ''{t1}''), count(n) FILTER (WHERE n > 0), count(*) FROM cr WHERE a = 2 AND length(t) = 2'),
+	('SELECT count(*) FILTER (WHERE b = 1 OR t = ''v3'') FROM cr WHERE a = 2 AND p LIKE ''%e%'''),
+	('SELECT count(*) FILTER (WHERE n IS DISTINCT FROM 3), count(*) FROM cr WHERE a = 2 AND p LIKE ''a%'''),
+	('SELECT b, count(*) FILTER (WHERE t = ''v3''), count(*) FROM cr WHERE a = 2 AND p LIKE ''a%'' GROUP BY b'),
+	('SELECT b, sum(CASE WHEN n = 1 THEN 1 END), count(*) FROM cr WHERE a = 2 AND 100 / w > 20 GROUP BY b'),
+	('SELECT count(*) FILTER (WHERE b = 1) FROM cr WHERE a = 2 AND p LIKE ''zz%''')
+) v(q);
+SELECT cr_plan('SELECT count(*) FILTER (WHERE b = 1), count(*) FROM cr WHERE a = 2 AND p LIKE ''a%''');
+-- a filter's own condition is never residual: the ordinary plan
+SELECT cr_q('SELECT count(*) FILTER (WHERE p LIKE ''a%''), count(*) FROM cr WHERE a = 2');
+
+-- ---- a materialized view's rows are tested as a table's ----
+CREATE MATERIALIZED VIEW crm AS SELECT id, a, b, p FROM cr;
+CREATE INDEX crm_a ON crm USING lion (a);
+CREATE INDEX crm_b ON crm USING lion (b);
+VACUUM ANALYZE crm;
+SELECT cr_q('SELECT count(*) FROM crm WHERE a = 2 AND p LIKE ''a%''');
+SELECT cr_q('SELECT b, count(*) FROM crm WHERE a = 2 AND id % 3 = 0 GROUP BY b');
+DROP MATERIALIZED VIEW crm;
+
+-- ---- a partitioned table is declined ----
+CREATE TABLE crp (a int, p text) PARTITION BY RANGE (a);
+CREATE TABLE crp1 PARTITION OF crp FOR VALUES FROM (0) TO (3);
+CREATE TABLE crp2 PARTITION OF crp FOR VALUES FROM (3) TO (7);
+INSERT INTO crp SELECT a, p FROM cr;
+CREATE INDEX crp_a ON crp USING lion (a);
+VACUUM ANALYZE crp;
+SELECT cr_q('SELECT count(*) FROM crp WHERE a = 2 AND p LIKE ''a%''');
+DROP TABLE crp;
+
+DROP FUNCTION cr_q(text);
+DROP FUNCTION cr_plan(text);
+DROP TABLE cr;

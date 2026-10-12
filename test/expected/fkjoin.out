@@ -704,11 +704,19 @@ SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = 
  not pushed down, 1 rows
 (1 row)
 
--- three relations
+-- three relations: a third that only filters is folded into an IN list on
+-- the fact (DESIGN.md §27, "A second dimension that only filters", and
+-- fkjoin_star); one whose column is grouped by is not
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk JOIN lion_fd4 e ON e.k = f.x GROUP BY d.attr');
-         lion_fj         
--------------------------
- not pushed down, 8 rows
+       lion_fj       
+---------------------
+ pushed down, 8 rows
+(1 row)
+
+SELECT lion_fj('SELECT d.attr, e.grp, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk JOIN lion_fd4 e ON e.k = f.x GROUP BY d.attr, e.grp');
+         lion_fj          
+--------------------------
+ not pushed down, 32 rows
 (1 row)
 
 -- a partitioned fact table is counted partition by partition (DESIGN.md §27,

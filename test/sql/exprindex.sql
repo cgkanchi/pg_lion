@@ -178,7 +178,8 @@ SELECT q FROM xnq WHERE NOT xq_planned(q);
 SELECT q, xq_rows(q, true) AS lion, xq_rows(q, false) AS ordinary
   FROM xnq WHERE xq_rows(q, true) IS DISTINCT FROM xq_rows(q, false);
 EXPLAIN (COSTS OFF) SELECT coalesce(c, 0), count(*) FROM xn WHERE doc->>'a' = '1' GROUP BY 1;
--- the cast index does not answer v itself, as before: the count declines
+-- the cast index does not answer v itself, as before: the clause is residual,
+-- tested on the heap rows doc->>'a' = '1' selects (DESIGN.md §10)
 SELECT xq_planned($$SELECT count(*) FROM xn WHERE doc->>'a' = '1' AND v::text = 'v3'$$) AS cast_column,
 	   xq_rows($$SELECT count(*) FROM xn WHERE doc->>'a' = '1' AND v::text = 'v3'$$, true) =
 	   xq_rows($$SELECT count(*) FROM xn WHERE doc->>'a' = '1' AND v::text = 'v3'$$, false) AS cast_column_same;

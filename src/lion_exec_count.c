@@ -20,6 +20,8 @@
 
 static int64 lion_walk_count(LionCountScanState *st, LionCountSource *sources,
 							 int nsource, int w, bool exists);
+static int64 lion_compl_count(LionCountScanState *st, LionCountSource *sources,
+							  int nsource, int w, bool exists);
 
 /*
  * Is any WHERE item of the relation being counted a source that SELECTS
@@ -112,7 +114,7 @@ lion_count_scan_filtered(LionCountScanState *st)
 static bool
 lion_source_drives(const LionCountSource *src)
 {
-	if (src->negated)
+	if (src->negated || src->compl != NULL)
 		return false;
 	if (src->rangewalk != NULL)
 		return true;
@@ -122,6 +124,72 @@ lion_source_drives(const LionCountSource *src)
 	return true;
 }
 
+
+/*
+ * The count of the AND of sources, sources[w] an OR with a complement arm
+ * (LionCountSource.compl; DESIGN.md §35, "Complements in an OR"): every row
+ * outside M, the intersection of the complement arms' sets, and the rows of
+ * P, the union of the positive arms, inside it.  The two are disjoint, so the
+ * count is the sum of two counts of the other sources F:
+ *
+ *		|F AND (P OR NOT M)| = |F AND NOT M| + |F AND M AND P|
+ *
+ * the first with M subtracted as a negated source is, the second with M and
+ * P intersected as positive ones.  Both come back through lion_node_count(),
+ * which expands the next such OR, or a range to be walked, in each.  An M of
+ * no row makes the OR every row, and the count F's alone; a P of no row
+ * leaves the first count alone.  Every count is made under the one snapshot,
+ * with the §9 interlock its sources carry as any count's: F holds a pinned
+ * positive source or the walk's own set (the planner made it so), M's sets
+ * are located sets, and P's leaves are pinned as any union's (§19).
+ */
+static int64
+lion_compl_count(LionCountScanState *st, LionCountSource *sources,
+				 int nsource, int w, bool exists)
+{
+	LionCountSource *m = sources[w].compl;
+	LionCountSource *srcs;
+	int64		total = 0;
+	int			n = 0;
+	int			i;
+
+	srcs = (LionCountSource *) palloc(sizeof(LionCountSource) *
+									  (nsource + 1));
+	for (i = 0; i < nsource; i++)
+	{
+		if (i != w)
+			srcs[n++] = sources[i];
+	}
+
+	/* M of no row: the OR is every row */
+	if (m->tree == NULL)
+	{
+		if (n == 0)
+			elog(ERROR, "LionCount: an OR with a complement arm and nothing to count it in");
+		total = lion_node_count(st, n, srcs, exists);
+		pfree(srcs);
+		return total;
+	}
+
+	/* F AND NOT M */
+	srcs[n] = *m;
+	srcs[n].negated = true;
+	srcs[n].compl = NULL;
+	total = lion_node_count(st, n + 1, srcs, exists);
+
+	/* F AND M AND P */
+	if (sources[w].tree != NULL && !(exists && total > 0))
+	{
+		srcs[n].negated = false;
+		srcs[n + 1] = sources[w];
+		srcs[n + 1].compl = NULL;
+		total += lion_node_count(st, n + 2, srcs, exists);
+		if (exists)
+			total = (total > 0) ? 1 : 0;
+	}
+	pfree(srcs);
+	return total;
+}
 
 /*
  * Every count the node makes, and every existence test (`exists`: 1 or 0),
@@ -140,6 +208,11 @@ lion_node_count(LionCountScanState *st, int nsource, LionCountSource *sources,
 	EState	   *estate = st->css.ss.ps.state;
 	int			w;
 
+	for (w = 0; w < nsource; w++)
+	{
+		if (sources[w].compl != NULL)
+			return lion_compl_count(st, sources, nsource, w, exists);
+	}
 	for (w = 0; w < nsource; w++)
 	{
 		if (sources[w].rangewalk != NULL)
@@ -318,7 +391,7 @@ lion_sum_probe_init(LionSumProbe *sp, const LionEntryScan *walk,
 
 		if (i == slot)
 			continue;
-		if (sources[i].rangewalk != NULL)
+		if (sources[i].rangewalk != NULL || sources[i].compl != NULL)
 		{
 			sp->frows = -1.0;
 			return;
@@ -432,6 +505,7 @@ lion_sum_walk(LionCountScanState *st, LionCountSource *sources, int nsource,
 							  lion_plan_flag(st, LION_FLAG_RANGE) ?
 							  &st->range : NULL, part);
 	st->scanning = true;
+	lion_entry_scan_share_pin(&st->escan);
 
 	/* One leaf's entries, which is at most what lion_range.c copies of one. */
 	sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) *
@@ -708,6 +782,7 @@ lion_walk_range_part(LionCountScanState *st, LionRangeSource *rs, int part,
 	bool		found = false;
 
 	lion_entry_scan_begin_sum(&es, rs->index, rs->col, &rs->range, part);
+	lion_entry_scan_share_pin(&es);
 	sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) * es.maxbatch);
 
 	/* A count may be probed (lion_sum_walk()); an existence test stops early. */
@@ -936,6 +1011,103 @@ lion_sumall_relation(LionCountScanState *st)
 	return total;
 }
 
+/*
+ * Does an item of the run being counted select rows and carry the §9
+ * interlock whatever its value: a clause of an equality, a list or `IS
+ * NULL`, or an OR none of whose leaves is a range taken as a source
+ * (DESIGN.md §32)?  A multi-key clause is not counted on: its query may turn
+ * out to narrow nothing (§17).
+ */
+static bool
+lion_run_has_plain_source(LionCountScanState *st)
+{
+	int			k;
+
+	for (k = 0; k < st->nitem; k++)
+	{
+		const LionSourceItem *it = &st->item[k];
+
+		if (it->orno >= 0)
+		{
+			const LionOrState *o = &st->ors[it->orno];
+			int			j;
+
+			for (j = 0; j < o->nleaves; j++)
+			{
+				if (st->clause[o->first + j].kind == LION_CLAUSE_RANGESRC)
+					break;
+			}
+			if (j == o->nleaves)
+				return true;
+			continue;
+		}
+		if (it->rangesrc)
+			continue;
+		switch (st->clause[it->clauseno].kind)
+		{
+			case LION_CLAUSE_EQ:
+			case LION_CLAUSE_ARRAY:
+			case LION_CLAUSE_NULL:
+				return true;
+			default:
+				break;
+		}
+	}
+	return false;
+}
+
+/*
+ * The counts of the runs of a node of one row with filtered counts
+ * (DESIGN.md §10, "Filtered counts"): run 0's - the WHERE's - and each
+ * filter's, the rows the WHERE and that filter select together, each
+ * counted as the plan counts its WHERE alone, over the plain table or every
+ * partition in turn.  Into st->runcount; returns run 0's.
+ *
+ * Each run is a count of its own: its sets located, counted and released
+ * before the next run's are located, so no pin of one outlives it (§9).  A
+ * sum over every entry (`sum`, LION_FLAG_SUMALL) is how run 0 is counted;
+ * a filter's run that has a source that selects rows and holds the
+ * interlock, and no range bounding the driving walk, is that source's
+ * intersection with the others instead, which reads only the sets that
+ * select rows.  Where none has, it is the sum, the driving walk carrying
+ * the interlock (§32).
+ */
+int64
+lion_count_runs(LionCountScanState *st, bool sum)
+{
+	int			p;
+	int			r;
+
+	for (r = 0; r < st->nrun; r++)
+		st->runcount[r] = 0;
+	if (st->located)
+		lion_release_where(st);
+
+	for (p = (st->npart > 0) ? 0 : -1; p < st->npart; p++)
+	{
+		if (p >= 0)
+			lion_open_relation(st, p);
+		for (r = 0; r < st->nrun; r++)
+		{
+			lion_select_run(st, r);
+			lion_locate_where(st);
+			if (!sum ||
+				(r > 0 && !lion_plan_flag(st, LION_FLAG_RANGE) &&
+				 lion_run_has_plain_source(st)))
+				st->runcount[r] += lion_count_relation(st);
+			else
+				st->runcount[r] += lion_sumall_relation(st);
+			lion_release_where(st);
+		}
+		lion_select_run(st, 0);
+		if (p >= 0)
+			lion_close_relation(st);
+		CHECK_FOR_INTERRUPTS();
+	}
+	st->runsready = true;
+	return st->runcount[0];
+}
+
 /* ---------------------------------------------------------------------
  * The WHERE sets of a GROUP BY, collected once (DESIGN.md §10)
  * --------------------------------------------------------------------- */
@@ -982,6 +1154,15 @@ lion_where_describe(LionCountScanState *st, LionCountSource *sources,
 		double		rows = 0;
 		bool		any = false;
 
+		/*
+		 * An OR with a complement arm is two counts (lion_compl_count()), and
+		 * a collection is one set: the WHERE is read count by count.
+		 */
+		if (src->compl != NULL)
+		{
+			st->wtried = true;
+			return;
+		}
 		if (src->rangewalk != NULL)
 			continue;
 		for (j = 0; j < src->nsets; j++)
@@ -1617,7 +1798,8 @@ lion_topk_run(LionCountScanState *st)
 		if (it->orno >= 0 || it->rangesrc || !src->negated)
 			continue;
 		cl = &st->clause[it->clauseno];
-		if ((cl->kind != LION_CLAUSE_NE && cl->kind != LION_CLAUSE_NOTNULL) ||
+		if ((cl->kind != LION_CLAUSE_NE && cl->kind != LION_CLAUSE_NOTNULL &&
+			 cl->kind != LION_CLAUSE_DISTINCT) ||
 			cl->idx == NULL ||
 			RelationGetRelid(cl->idx) != RelationGetRelid(st->groupidx) ||
 			cl->idxcol != st->groupidxcol)
@@ -1655,12 +1837,12 @@ lion_topk_run(LionCountScanState *st)
 			continue;
 
 		/* smaller than every one kept, once there are enough */
-		if (trimmed && entry->ntids <= floor)
+		if (trimmed && lion_entry_ntids(entry) <= floor)
 		{
-			maxout = Max(maxout, entry->ntids);
+			maxout = Max(maxout, lion_entry_ntids(entry));
 			continue;
 		}
-		cand[n].ntids = entry->ntids;
+		cand[n].ntids = lion_entry_ntids(entry);
 		cand[n].isnull = LionEntryIsNullKey(entry);
 		cand[n].key = cand[n].isnull ? (Datum) 0 :
 			datumCopy(lion_entry_key(es.state, entry), byval, typlen);
@@ -3128,10 +3310,10 @@ lion_wagg_walk(LionCountScanState *st, int c, LionWBatch *batch)
 			isnull = LionEntryIsNullKey(entry);
 			key = isnull ? (Datum) 0 : lion_entry_key(es.state, entry);
 			if (!defer)
-				lion_wagg_add(st, c, key, isnull, (int64) entry->ntids);
-			else if (entry->ntids > 0 &&
+				lion_wagg_add(st, c, key, isnull, (int64) lion_entry_ntids(entry));
+			else if (lion_entry_ntids(entry) > 0 &&
 					 !lion_wagg_defer(st, batch, c, es.state, key, isnull,
-									  (int64) entry->ntids))
+									  (int64) lion_entry_ntids(entry)))
 			{
 				MemoryContextSwitchTo(oldcxt);
 				ok = false;

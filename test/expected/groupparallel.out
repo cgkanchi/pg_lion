@@ -464,9 +464,9 @@ SELECT lgp_check('SELECT coalesce(g, -1), count(*) FROM lgp WHERE a = 1 AND b GR
 (1 row)
 
 SELECT lgp_check('SELECT g, count(DISTINCT k) FROM lgp WHERE a = 1 AND b GROUP BY g');
-        lgp_check         
---------------------------
- not pushed down, 31 rows
+    lgp_check    
+-----------------
+ serial, 31 rows
 (1 row)
 
 SELECT lgp_check('SELECT g, count(*) FROM lgp WHERE g IN (1, 2, 3) AND a = 1 AND b GROUP BY g');
