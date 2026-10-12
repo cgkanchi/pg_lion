@@ -253,6 +253,20 @@ typedef struct LionPostingPivot
  * themselves by it so that a corrupt `level` cannot loop for ever. */
 #define LION_POSTING_MAX_HEIGHT		16
 
+/*
+ * The most leaves a posting or position tree has with no internal level
+ * (DESIGN.md §22, "Small sets have no root page").  Up to this many, the
+ * entry's head is the FIRST leaf and the leaves are only a rightlinked chain:
+ * a reader walks right from the head, a writer walks right to the leaf that
+ * owns its key, and a split links its new pages in without a downlink.  The
+ * split that would make the set one leaf longer than this pushes the head
+ * down first: its items go to a brand new leaf and the head becomes a level-1
+ * page with a downlink to every leaf, so the head block still never moves.
+ * A root page of a set this small is a page that is 99% empty; a walk of
+ * sixteen leaves is what a descent saves only once the set is larger.
+ */
+#define LION_POSTING_FLAT_LEAVES	16
+
 static inline bool
 LionPageIsPostingLeaf(Page page)
 {
@@ -425,13 +439,28 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * makes one only of a NARROW, which it widens, so that an index of version 6
  * or 7 stays one, readable by the builds before this one, until it is
  * rebuilt.
+ *
+ * Version 9 (DESIGN.md §13) stores a sparse segment's pairs as a stream of
+ * delta varints instead of uint32 ckeys[] and uint16 los[], which
+ * reinterprets every segment of every older index, so versions 6, 7 and 8
+ * are no longer read: opening one is an ERROR whose hint asks for REINDEX.
+ * Every index this build writes is version 9, whatever it holds: whether a
+ * key column has summaries is what summary_cols says (§32), and whether the
+ * index may hold NARROW items (§38) is the LION_META_NARROW bit of
+ * order_flags, set when its build wrote one - the rule version 8 was, kept:
+ * VACUUM makes a NARROW only in such an index, and inserts make none.  The
+ * leaf-root posting trees share the number.
  */
-#define LION_VERSION			6	/* the base format every index has */
+#define LION_VERSION			6	/* the base format of versions 6 .. 8 */
 #define LION_VERSION_SUMMARIES	7	/* ... plus the summaries of §32 */
 #define LION_VERSION_NARROW		8	/* ... plus the NARROW items of §38 */
+#define LION_VERSION_V9			9	/* varbyte sparse segments; another
+									 * worker's leaf-root posting trees will
+									 * share this version */
 
-/* May an index of this meta page's version hold NARROW items (§38)? */
-#define LION_META_ALLOWS_NARROW(meta)	((meta)->version >= LION_VERSION_NARROW)
+/* May the index of this meta page hold NARROW items (§38)? */
+#define LION_META_ALLOWS_NARROW(meta) \
+	(((meta)->order_flags & LION_META_NARROW) != 0)
 
 typedef struct LionMetaPageData
 {
@@ -511,6 +540,14 @@ typedef struct LionMetaPageData
  * REINDEX.
  */
 #define LION_META_POSITIONS			0x0002
+
+/*
+ * The build wrote a NARROW item (DESIGN.md §38), so VACUUM may make NARROWs
+ * of the items it rewrites; an index without it has none, and gets none
+ * until it is rebuilt.  Version 8 said this with its number; version 9
+ * (§13) says it here, as LION_META_POSITIONS does for positions.
+ */
+#define LION_META_NARROW			0x0004
 
 /* ordered_cols has one bit per key column. */
 StaticAssertDecl(INDEX_MAX_KEYS <= 32,
@@ -1284,6 +1321,9 @@ extern LionKeyNode *lion_keynode_op(LionKeyNodeKind kind, LionKeyNode **args,
 
 /* jsonb_contains_ops' extractQuery (lion_jsonb.c), which hands over a tree */
 extern Datum lion_jsonb_extract_query(PG_FUNCTION_ARGS);
+/* ... its extractValue, and one of its keys as text (lion_index_facets()) */
+extern Datum lion_jsonb_extract_value(PG_FUNCTION_ARGS);
+extern char *lion_jsonb_key_out(const bytea *key);
 extern bool lion_tsquery_item_keys(LionState *state, Datum query,
 								   StrategyNumber strategy, Datum **itemkeys);
 
@@ -1723,6 +1763,20 @@ extern Buffer lion_posting_search(Relation index, Relation heaprel,
 								  int lockmode, bool forwrite);
 
 /*
+ * lion_posting_search() that also says whether the head was a LEAF when the
+ * descent read it: a set of at most LION_POSTING_FLAT_LEAVES leaves and no
+ * internal level (DESIGN.md §22).  A cursor over such a set never descends
+ * again to seek: a descent would start at the head and walk right from
+ * there, and stepping right from where the cursor stands reads less.  The
+ * answer stays usable after a push-down: the leaves are still the chain they
+ * were, and stepping right along it is still correct.
+ */
+extern Buffer lion_posting_search_ext(Relation index, Relation heaprel,
+									  uint32 hash, BlockNumber head,
+									  uint32 ckey, int lockmode, bool forwrite,
+									  bool before, bool *flat);
+
+/*
  * lion_posting_search() routed by the last separator strictly below ckey
  * rather than at or below it: the leaf that holds what sorts just before
  * ckey (the leftmost leaf for ckey 0).  A position tree's separators repeat
@@ -1763,27 +1817,51 @@ extern BlockNumber lion_posting_downlink(Relation index, Page page,
 										 BlockNumber blk, OffsetNumber off);
 
 /*
- * Turn the one-page posting set whose root is `buf` into a two-level tree
- * WITHOUT moving the root: its items go to a brand new child, and the root
- * block - which is the entry's `head` and the owner stamp of every page of
- * the set - becomes an internal page with one downlink.  The child comes back
- * pinned and still EXCLUSIVE-locked - it has never been unlocked since it was
- * allocated, so no reader can have copied the items it now holds before the
- * caller has finished with them (DESIGN.md §11, §22) - and the entry's `tail`
- * is updated in the same record.  Only `tail`: the record logs the entry as
- * it is on entrybuf, because the counters in the caller's copy describe items
- * that a LATER record places, and that record may never be written.  The
- * caller's copy gets the new `tail` as well.
+ * Push the head of a FLAT tree - a set of at most LION_POSTING_FLAT_LEAVES
+ * leaves and no internal level, whose head is its first leaf (DESIGN.md §22)
+ * - down WITHOUT moving it: its items go to a brand new leaf linked where the
+ * head was in the chain, and the head block - the entry's `head` and the
+ * owner stamp of every page of the set - becomes a level-1 page with a
+ * downlink to that leaf and to every other leaf of the chain, in one record.
+ * headbuf is the head, held EXCLUSIVE; held is another leaf of the set the
+ * caller holds locked (it is read from the buffer, not locked again), or
+ * InvalidBuffer.  The new leaf comes back pinned and still EXCLUSIVE-locked -
+ * it has never been unlocked since it was allocated, so no reader can have
+ * copied the items it now holds before the caller has finished with them
+ * (DESIGN.md §11, §22).
+ *
+ * When the head was the only leaf the set's last leaf changes, and the
+ * entry's `tail` is updated in the same record - only `tail`: the record logs
+ * the entry as it is on entrybuf, because the counters in the caller's copy
+ * describe items that a LATER record places, and that record may never be
+ * written.  The caller's copy gets the new `tail` as well.  A position tree
+ * has no entry and passes InvalidBuffer and NULL.
  *
  * nbtree and GIN both keep the root in place on a root split, and §22 needs
  * it for a second reason: `head` is the set's identity, so an entry never has
  * to be rewritten for a root split and the four-buffer budget of a
  * GenericXLog record is never the binding constraint.
  */
-extern Buffer lion_posting_root_pushdown(Relation index, Relation heaprel,
-										 Buffer buf, Buffer entrybuf,
-										 OffsetNumber entryoff,
-										 LionEntryTuple *entry);
+extern Buffer lion_posting_promote(Relation index, Relation heaprel,
+								   Buffer headbuf, Buffer held,
+								   Buffer entrybuf, OffsetNumber entryoff,
+								   LionEntryTuple *entry);
+
+/*
+ * Is the head of the tree rooted at root a LEAF, i.e. is the tree flat?  For
+ * a writer of the tree, which holds a leaf of it (held, not locked again when
+ * it is the head) - and whose key's writers serialise, so the answer holds
+ * for as long as it keeps writing.
+ */
+extern bool lion_posting_root_is_leaf(Relation index, BlockNumber root,
+									  Buffer held);
+
+/*
+ * How many leaves the flat tree rooted at root has, counted along its right
+ * links and no further than limit + 1.  held as above.
+ */
+extern int	lion_posting_flat_count(Relation index, BlockNumber root,
+									Buffer held, int limit);
 
 /*
  * Finish the split of the posting page pbuf, which the caller holds EXCLUSIVE
@@ -1993,14 +2071,14 @@ extern void lion_meta_record_order(LionMetaPageData *meta, LionIndexState *ix);
 
 /*
  * ... and which key columns got summary posting sets, with their bucket size
- * (DESIGN.md §32).  None leaves the meta page at version 6; any makes it 7.
+ * (DESIGN.md §32).
  */
 extern void lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
 									   uint32 bucket_tids);
 
 /*
- * ... and whether the build wrote a NARROW item (DESIGN.md §38), which makes
- * the meta page version 8; after lion_meta_record_summaries().
+ * ... and whether the build wrote a NARROW item (DESIGN.md §38), which sets
+ * LION_META_NARROW.
  */
 extern void lion_meta_record_narrow(LionMetaPageData *meta, bool narrow);
 

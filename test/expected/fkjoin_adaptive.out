@@ -214,7 +214,7 @@ SELECT lion_aj($$
 					AND f.doc @@ 'da & dd' AND f.x = 4)$$);
                     lion_aj                    
 -----------------------------------------------
- pushed down, switched 1 after 21 keys, 1 rows
+ pushed down, switched 1 after 22 keys, 1 rows
 (1 row)
 
 -- 2. Every dimension row, walked in key order: the heavy keys come first.

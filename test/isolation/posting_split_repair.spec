@@ -26,18 +26,25 @@
 #     half was waiting for, orphaning that half - and the containers on it,
 #     for every reader that seeks by container key.
 #
-# And a root push-down cut short:
+# And a push-down cut short.  A set of up to 16 leaves has no internal level
+# (DESIGN.md §22); the split that would make a 17th leaf first PROMOTES the
+# set - pushes its head down under a new root that links every leaf, in a
+# record of its own - and then places its member in the next:
 #
-#  D. an insert that overflows a one-page set's root pushes the root down in a
-#     record of its own, and places its member on the new child in the next -
-#     which is the child's own split, and can fail.  The push-down logged the
-#     entry with the counters the insert had already bumped, so an ERROR in
-#     between (injection point lion-posting-pushdown-child) left ntids one
-#     above what the containers hold: "claims 9241 TIDs, but its containers
-#     hold 9240".
+#  D. when the head is the page that overflows, the head's items go to the new
+#     child and the member is placed on that child, which is the child's own
+#     split, and can fail.  The push-down logged the entry with the counters
+#     the insert had already bumped, so an ERROR in between (injection point
+#     lion-posting-pushdown-child) left ntids one above what the containers
+#     hold: "claims 9241 TIDs, but its containers hold 9240".
 #  E. the same in VACUUM's regrow, with counters LOWERED by TIDs filtered out
 #     of a container that had not been written yet: 966 too few, and every
 #     later VACUUM subtracted them again.
+#  F. when another leaf of the chain overflows - an append to the last one -
+#     the promotion leaves that leaf where it is, and its split follows as a
+#     split of a tree leaf.  An ERROR in between (lion-posting-promoted)
+#     leaves a root that links every leaf and the leaf full, which the next
+#     insert splits (test/recovery/run.sh phase 1e does it with a crash).
 #
 # The splits are cut short with lion-posting-split-incomplete set to 'error'
 # inside a subtransaction, which leaves on disk exactly what a crash between
@@ -46,8 +53,8 @@
 # unfinished, counters equal to the containers - and the index must answer
 # what the heap answers.
 #
-# The fixture of B and C: key 1 holds a RUN of five rows in every thirty, so each
-# container key (64 heap blocks of 226 rows) is a ~1980-byte RUN and a
+# The fixture of B, C and D: key 1 holds a RUN of five rows in every thirty, so
+# each container key (64 heap blocks of 226 rows) is a ~1980-byte RUN and a
 # bulk-built leaf holds four of them with 208 bytes to spare; key 3 is the row
 # in the middle of each gap.  Deleting key 3's rows in ONE container key's heap
 # blocks and vacuuming leaves free line pointers there and nowhere else, so
@@ -56,10 +63,14 @@
 # Deleting the 2nd and 4th row of every run later turns a RUN into an ARRAY
 # half again as large (~2970 bytes), which is what sends VACUUM to regrow.
 # The other rows take 97 keys from 100 on, ARRAYs of some 120 members a
-# container key, so that the build writes no NARROW and the index is version
-# 6, whose VACUUM makes that ARRAY: in a version 8 index it would make a
-# NARROW of width 4 (DESIGN.md §38), 2056 bytes, which the leaf's spare bytes
-# hold.
+# container key, so that the build writes no NARROW and the meta page
+# records none, so its VACUUM makes that ARRAY: in an index whose build wrote
+# a NARROW it would make a NARROW of width 4 (DESIGN.md §38), 2056 bytes,
+# which the leaf's spare bytes hold.  Rows inserted after the build, keys 1
+# and 2 on alternate rows, give key 1 a BITSET a container key, a leaf each
+# (an insert writes no NARROW, and the meta page keeps recording none): 16 of
+# them in B and C, a tree of 18 leaves, and 14 in D, a set of 16 leaves whose
+# head is the first leaf of RUNs.
 
 setup
 {
@@ -67,35 +78,57 @@ setup
 	CREATE EXTENSION IF NOT EXISTS pg_lion;
 	CREATE EXTENSION IF NOT EXISTS injection_points;
 
-	-- A: created empty, so every split comes from aminsert.
-	CREATE TABLE psr_app (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
+	-- A: created empty, so every split comes from aminsert.  Wide rows,
+	-- about 75 to a heap page, make each container a BITSET a leaf long.
+	CREATE TABLE psr_app (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x')
+	  WITH (autovacuum_enabled = off);
 	CREATE INDEX psr_app_k ON psr_app USING lion (k);
 
-	-- B and C: eight container keys, two leaves of four RUNs for key 1.
+	-- B and C: eight container keys, two leaves of four RUNs for key 1, and
+	-- sixteen leaves after them.
 	CREATE TABLE psr_right (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
 	INSERT INTO psr_right SELECT i,
 		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 100 + i % 97 END
 	  FROM generate_series(1, 14464 * 8) i;
 	CREATE INDEX psr_right_k ON psr_right USING lion (k);
+	INSERT INTO psr_right SELECT i, 1 + i % 2
+	  FROM generate_series(14464 * 8 + 1, 14464 * 24) i;
 	CREATE TABLE psr_left (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
 	INSERT INTO psr_left SELECT i,
 		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 100 + i % 97 END
 	  FROM generate_series(1, 14464 * 8) i;
 	CREATE INDEX psr_left_k ON psr_left USING lion (k);
+	INSERT INTO psr_left SELECT i, 1 + i % 2
+	  FROM generate_series(14464 * 8 + 1, 14464 * 24) i;
 
-	-- D: created empty; the first root that overflows is pushed down.
+	-- D: the same with fourteen leaves after them: key 1 has 16 leaves and
+	-- no internal level, and its head is the first leaf of RUNs.
 	CREATE TABLE psr_push (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
+	INSERT INTO psr_push SELECT i,
+		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 100 + i % 97 END
+	  FROM generate_series(1, 14464 * 8) i;
 	CREATE INDEX psr_push_k ON psr_push USING lion (k);
+	INSERT INTO psr_push SELECT i, 1 + i % 2
+	  FROM generate_series(14464 * 8 + 1, 14464 * 22) i;
 
-	-- E: test/isolation/vacuum_regrow_pushdown.spec's fixture.  k = 1 is ONE
-	-- posting page: a RUN in heap blocks 0..63 and two ~2.9 KB arrays.
-	CREATE TABLE psr_vpush (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
+	-- E: test/isolation/vacuum_regrow_pushdown.spec's fixture.  k = 1's
+	-- head holds a RUN in heap blocks 0..63 and two ~2.9 KB arrays, and 15
+	-- more leaves follow it.
+	CREATE TABLE psr_vpush (id int, k int NOT NULL, pad text)
+	  WITH (autovacuum_enabled = off);
 	CREATE INDEX psr_vpush_k ON psr_vpush USING lion (k) WITH (inline_limit = 64);
 	INSERT INTO psr_vpush SELECT i, CASE
 		WHEN i <= 14464 AND i % 30 < 5 THEN 1
 		WHEN i > 14464 AND i % 10 = 0 THEN 1
 		ELSE 2 END
 	  FROM generate_series(1, 43392) i;
+	INSERT INTO psr_vpush SELECT i, 1 + i % 2, repeat('x', 70)
+	  FROM generate_series(43393, 119392) i;
+
+	-- F: created empty, wide rows; the fill gives each key 14 leaves.
+	CREATE TABLE psr_prom (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x')
+	  WITH (autovacuum_enabled = off);
+	CREATE INDEX psr_prom_k ON psr_prom USING lion (k);
 
 	/*
 	 * Insert key-1 rows one at a time, each in a subtransaction, until one of
@@ -154,7 +187,7 @@ setup
 
 teardown
 {
-	DROP TABLE psr_app, psr_right, psr_left, psr_push, psr_vpush;
+	DROP TABLE psr_app, psr_right, psr_left, psr_push, psr_vpush, psr_prom;
 	DROP FUNCTION psr_insert_until_error(text);
 	DROP FUNCTION psr_landed(text);
 	DROP FUNCTION psr_counts(text, int);
@@ -162,6 +195,8 @@ teardown
 	DO $$ BEGIN PERFORM injection_points_detach('lion-posting-split-incomplete');
 	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
 	DO $$ BEGIN PERFORM injection_points_detach('lion-posting-pushdown-child');
+	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
+	DO $$ BEGIN PERFORM injection_points_detach('lion-posting-promoted');
 	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
 }
 
@@ -176,9 +211,11 @@ step split_breaks	{ SELECT injection_points_attach('lion-posting-split-incomplet
 step split_works	{ SELECT injection_points_detach('lion-posting-split-incomplete'); }
 step push_breaks	{ SELECT injection_points_attach('lion-posting-pushdown-child', 'error'); }
 step push_works		{ SELECT injection_points_detach('lion-posting-pushdown-child'); }
+step promote_breaks	{ SELECT injection_points_attach('lion-posting-promoted', 'error'); }
+step promote_works	{ SELECT injection_points_detach('lion-posting-promoted'); }
 
 # A. Appends after an unfinished split.
-step a_fill		{ INSERT INTO psr_app SELECT i, i % 2 FROM generate_series(1, 60000) i; }
+step a_fill		{ INSERT INTO psr_app SELECT i, i % 2 FROM generate_series(1, 90000) i; }
 step a_cut		{ INSERT INTO psr_app SELECT 100000 + i, i % 2 FROM generate_series(1, 30000) i; }
 step a_append	{
 	INSERT INTO psr_app SELECT 200000 + i, i % 2 FROM generate_series(1, 20000) i;
@@ -234,19 +271,23 @@ step c_check	{
 	SELECT * FROM psr_counts('psr_left', 100);
 }
 
-# D. An insert's root push-down cut short.  Right after it the root is an
-# internal page over one child that holds what the root held, and the entry
-# must count exactly that.
-step d_cut		{ INSERT INTO psr_push SELECT i, i % 2 FROM generate_series(1, 20000) i; }
+# D. An insert's push-down of the head cut short.  The rows go to container
+# key 0, the first RUN of the head, until the head splits - a 17th leaf.
+# Right after it the head is the root, over a new child that holds what the
+# head held and the 15 other leaves, and the entry must count exactly that.
+step d_holes	{ DELETE FROM psr_push WHERE k = 3 AND id <= 14464; }
+step d_vacuum_holes	{ VACUUM (INDEX_CLEANUP ON) psr_push; }
+step d_cut		{ SELECT psr_insert_until_error('psr_push'); }
 step d_after_cut {
+	SELECT * FROM psr_landed('psr_push');
 	SELECT posting_internal_pages FROM lion_index_stats('psr_push_k');
 	SELECT lion_index_verify('psr_push_k');
 }
-step d_more		{ INSERT INTO psr_push SELECT i, i % 2 FROM generate_series(1, 20000) i; }
+step d_more		{ INSERT INTO psr_push SELECT 2000000 + i, 1 FROM generate_series(1, 200) i; }
 step d_check	{
 	SELECT lion_index_verify('psr_push_k', true);
-	SELECT * FROM psr_counts('psr_push', 0);
 	SELECT * FROM psr_counts('psr_push', 1);
+	SELECT * FROM psr_counts('psr_push', 3);
 }
 
 # E. VACUUM's regrow push-down cut short: the child still holds the RUN with
@@ -266,11 +307,28 @@ step e_check	{
 	SELECT * FROM psr_counts('psr_vpush', 1);
 }
 
+# F. A promotion cut short before the leaf that needed it is split.  Right
+# after it the head is a root over all 16 leaves, the last of them is full,
+# and nothing is flagged: the next insert splits that leaf as a tree's.
+step f_fill		{ INSERT INTO psr_prom SELECT i, i % 2 FROM generate_series(1, 60000) i; }
+step f_cut		{ INSERT INTO psr_prom SELECT 100000 + i, i % 2 FROM generate_series(1, 20000) i; }
+step f_after_cut {
+	SELECT posting_internal_pages FROM lion_index_stats('psr_prom_k');
+	SELECT lion_index_verify('psr_prom_k');
+}
+step f_more		{ INSERT INTO psr_prom SELECT 200000 + i, i % 2 FROM generate_series(1, 20000) i; }
+step f_check	{
+	SELECT lion_index_verify('psr_prom_k', true);
+	SELECT * FROM psr_counts('psr_prom', 0);
+	SELECT * FROM psr_counts('psr_prom', 1);
+}
+
 permutation
 	a_fill split_breaks a_cut split_works a_append a_check
 	b_holes b_vacuum_holes b_before split_breaks b_cut split_works b_after_cut
 	b_delete b_vacuum b_check
 	c_holes c_vacuum_holes c_before split_breaks c_cut split_works c_after_cut
 	c_delete c_vacuum c_check
-	push_breaks d_cut push_works d_after_cut d_more d_check
+	d_holes d_vacuum_holes push_breaks d_cut push_works d_after_cut d_more d_check
 	e_delete push_breaks e_cut push_works e_after_cut e_vacuum e_check
+	f_fill promote_breaks f_cut promote_works f_after_cut f_more f_check

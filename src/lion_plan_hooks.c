@@ -78,9 +78,17 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	/* a competitor pinned by a hook an error left (§39) is never read */
 	lion_units_unpin();
 
-	if (stage != UPPERREL_GROUP_AGG)
+	if (stage != UPPERREL_GROUP_AGG && stage != UPPERREL_DISTINCT)
 		return;
 	if (!lion_enable_count_pushdown)
+		return;
+
+	/*
+	 * A DISTINCT is taken where it is the first upper stage over one base
+	 * relation (lion_try_distinct_path()): over a grouping, a window or a
+	 * join it is core's.
+	 */
+	if (stage == UPPERREL_DISTINCT && input_rel->reloptkind != RELOPT_BASEREL)
 		return;
 
 	/*
@@ -124,15 +132,21 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	 */
 	if (!lion_probe_begin(root, input_rel, input_rel->baserestrictinfo))
 	{
-		lion_try_count_path(root, input_rel, output_rel,
-						   (GroupPathExtraData *) extra, NULL);
+		if (stage == UPPERREL_DISTINCT)
+			lion_try_distinct_path(root, input_rel, output_rel);
+		else
+			lion_try_count_path(root, input_rel, output_rel,
+							   (GroupPathExtraData *) extra, NULL);
 		lion_units_unpin();
 		return;
 	}
 	PG_TRY();
 	{
-		lion_try_count_path(root, input_rel, output_rel,
-						   (GroupPathExtraData *) extra, NULL);
+		if (stage == UPPERREL_DISTINCT)
+			lion_try_distinct_path(root, input_rel, output_rel);
+		else
+			lion_try_count_path(root, input_rel, output_rel,
+							   (GroupPathExtraData *) extra, NULL);
 	}
 	PG_FINALLY();
 	{
@@ -546,6 +560,25 @@ lion_wagg_add_target(Aggref *agg, LionCountPriv *priv,
  * to describe the tuple the node produces and setrefs.c rewrites the plan's
  * targetlist into INDEX_VAR references against it (set_customscan_references).
  */
+/*
+ * Is expr the GROUP BY coalesce(col, c) of the plan (DESIGN.md §10): the
+ * grouping column and the plan's c?  Any other coalesce - of a count, say -
+ * is an expression over what the node emits.
+ */
+static bool
+lion_plan_is_group_coalesce(Node *expr, const LionCountPriv *priv)
+{
+	CoalesceExpr *ce = (CoalesceExpr *) expr;
+	Node	   *a0;
+
+	if (!IsA(expr, CoalesceExpr) || priv->coalconst == NULL ||
+		list_length(ce->args) != 2)
+		return false;
+	a0 = (Node *) linitial(ce->args);
+	return IsA(a0, Var) && ((Var *) a0)->varattno == priv->groupattno &&
+		equal(lsecond(ce->args), priv->coalconst);
+}
+
 Plan *
 lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 					 List *tlist, List *clauses, List *custom_plans)
@@ -605,7 +638,38 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	 * a column the projection above simply does not print.
 	 */
 	having = priv.having;
-	want = list_copy(tlist);
+
+	/*
+	 * An expression over the counts and columns (DESIGN.md §10, "Expressions
+	 * over the counts") stays in the plan's target list, which setrefs.c
+	 * makes the node's projection over custom_scan_tlist; what goes into
+	 * custom_scan_tlist is what it reads - its aggregates whole, its columns,
+	 * and an expression column as its expression - each classified below as
+	 * it would be standing alone.  The grouping coalesce(col, c) is the one
+	 * expression the node emits itself.
+	 */
+	want = NIL;
+	foreach(lc, tlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		Node	   *sexpr = (priv.vcols != NIL) ?
+			lion_vcol_subst_with((Node *) tle->expr, priv.vcols,
+								 priv.scanrelid) : (Node *) tle->expr;
+		List	   *refs;
+		ListCell   *l2;
+
+		if (IsA(sexpr, Var) || IsA(sexpr, Aggref) ||
+			lion_plan_is_group_coalesce(sexpr, &priv))
+		{
+			want = lappend(want, tle);
+			continue;
+		}
+		refs = lion_vcol_refs_with((Node *) tle->expr, priv.vcols);
+		foreach(l2, refs)
+			want = lappend(want,
+						   makeTargetEntry((Expr *) lion_strip((Node *) lfirst(l2)),
+										   list_length(want) + 1, NULL, true));
+	}
 	if (having != NIL)
 	{
 		List	   *refs = lion_vcol_refs_with((Node *) having,
@@ -658,8 +722,10 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				Node	   *arg = lion_strip((Node *)
 											((TargetEntry *) linitial(agg->args))->expr);
 
-				Assert(arg != NULL && IsA(arg, Var));
-				attno = ((Var *) arg)->varattno;
+				/* count(1) of a non-NULL constant is count(*) */
+				Assert(arg != NULL && (IsA(arg, Var) || IsA(arg, Const)));
+				if (IsA(arg, Var))
+					attno = ((Var *) arg)->varattno;
 			}
 
 			/*
@@ -747,7 +813,7 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 						 attno);
 			}
 		}
-		else if (IsA(sexpr, CoalesceExpr) && priv.coalconst != NULL)
+		else if (lion_plan_is_group_coalesce(sexpr, &priv))
 		{
 			/*
 			 * GROUP BY coalesce(col, c) (DESIGN.md §10): the only expression
@@ -756,55 +822,6 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			 * NULL entry and c's own.
 			 */
 			kind = LION_TL_GROUPKEY;
-		}
-		else if (!contain_agg_clause(sexpr) &&
-				 pull_var_clause(sexpr, 0) != NIL)
-		{
-			/*
-			 * An expression of the grouping columns (DESIGN.md §36): the node
-			 * emits the columns, and setrefs.c makes the expression over them
-			 * part of the plan's projection.  The planner let through no
-			 * other.  An expression column is emitted as its expression.
-			 */
-			List	   *vars = pull_var_clause(sexpr, 0);
-			ListCell   *l3;
-
-			foreach(l3, vars)
-			{
-				AttrNumber	attno = ((Var *) lfirst(l3))->varattno;
-				Node	   *col = (Node *) lfirst(l3);
-				int			i;
-
-				if (groupattno != 0 && attno == groupattno)
-					kind = LION_TL_GROUPKEY;
-				else if (groupattno2 != 0 && attno == groupattno2)
-					kind = LION_TL_GROUPKEY2;
-				else if ((i = lion_groupn_col(&priv, attno)) > 0)
-					kind = (i == 1) ? LION_TL_GROUPKEY2 : LION_TL_GROUPKEYN(i);
-				else
-					elog(ERROR, "LionCount: an expression of column %d, which is not grouped",
-						 attno);
-
-				if (LION_ATTNO_IS_VCOL(attno))
-					col = (Node *) list_nth(priv.vcols, LION_VCOL_INDEX(attno));
-				dup = false;
-				foreach(l2, ctlist)
-				{
-					if (equal(((TargetEntry *) lfirst(l2))->expr, col))
-					{
-						dup = true;
-						break;
-					}
-				}
-				if (dup)
-					continue;
-				ctlist = lappend(ctlist,
-								 makeTargetEntry((Expr *) copyObject(col),
-												 list_length(ctlist) + 1,
-												 NULL, false));
-				kinds = lappend_int(kinds, kind);
-			}
-			continue;
 		}
 		else
 			elog(ERROR, "unexpected expression in LionCount target list");

@@ -23,7 +23,8 @@
 #
 # The fixture makes the split land on the very page the reader is parked on:
 # the count stops at the FIRST container of the set, which is on the leftmost
-# leaf of that key's posting tree.  The DELETE takes the OTHER key's rows out
+# leaf of that key's posting set - its head, as the set has no internal level
+# yet (DESIGN.md §22).  The DELETE takes the OTHER key's rows out
 # of the front of the heap, which leaves free line pointers on those pages
 # without touching k = 1's containers at all; the INSERT then puts k = 1 rows
 # into them, so exactly the container keys that leaf owns grow - here from 480
@@ -31,8 +32,10 @@
 #
 # k = 1 has 50,000 rows and loses none of them, so s1 must answer 50,000
 # however the pages move under it; `container_pages` before and after shows
-# that they really did move (26 leaves become 34), and the unpushed count
-# afterwards is 60,000, which is those 50,000 plus the inserter's 10,000.
+# that they really did move (30 leaves become 37, and k = 1's set, past 16
+# leaves, is promoted on the way: its head is pushed down under the parked
+# reader too), and the unpushed count afterwards is 60,000, which is those
+# 50,000 plus the inserter's 10,000.
 
 setup
 {

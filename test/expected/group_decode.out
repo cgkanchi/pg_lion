@@ -292,6 +292,97 @@ SELECT (SELECT count(*) FROM (TABLE lgd_p1 EXCEPT ALL SELECT a, b, c, count(*) F
 RESET pg_lion.enable_count_pushdown;
 RESET plan_cache_mode;
 DEALLOCATE lgd_p;
+-- A WHERE whose only clause that selects rows is a multi-key query no key
+-- narrows (DESIGN.md §17, "A query known only at run time"): a generic plan's
+-- `tags @> $1` run with '{}', which every array but a NULL one contains, and
+-- a prefix that matches more lexemes than a query may expand to.  There is
+-- no WHERE copy to collect: the walk reads every row and the heap tests the
+-- query, and a `<>` beside it.  A narrowing array is the copy as before.
+CREATE TABLE lgdm (id int, a int, b int, c int, tags int[], d tsvector);
+INSERT INTO lgdm
+SELECT i, i % 4, (i / 4) % 5, i % 7,
+	   CASE WHEN i % 17 = 0 THEN NULL ELSE ARRAY[i % 10, 10 + i % 7] END,
+	   to_tsvector('simple', 'w' || i || ' x' || (i % 7))
+  FROM generate_series(1, 6000) i;
+CREATE INDEX lgdm_a ON lgdm USING lion (a);
+CREATE INDEX lgdm_b ON lgdm USING lion (b);
+CREATE INDEX lgdm_c ON lgdm USING lion (c);
+CREATE INDEX lgdm_tags ON lgdm USING lion (tags);
+CREATE INDEX lgdm_d ON lgdm USING lion (d);
+VACUUM (FREEZE, ANALYZE) lgdm;
+DELETE FROM lgdm WHERE id % 10 = 3;
+SET plan_cache_mode = force_generic_plan;
+PREPARE lgdm_p(int[]) AS SELECT a, b, c, count(*) AS n FROM lgdm WHERE tags @> $1 GROUP BY a, b, c;
+PREPARE lgdm_q(int[]) AS SELECT a, b, c, count(*) AS n FROM lgdm WHERE tags @> $1 AND c <> 2 GROUP BY a, b, c;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+EXPLAIN (COSTS OFF) EXECUTE lgdm_p('{}');
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: a, b, c
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lgdm_a (a), lgdm_b (b), lgdm_c (c), lgdm_tags (tags @> $1)
+         Group Key: a, b, c
+         Group Strategy: Decoded
+(6 rows)
+
+CREATE TEMP TABLE lgdm_p1 AS EXECUTE lgdm_p('{}');
+CREATE TEMP TABLE lgdm_p2 AS EXECUTE lgdm_p('{4, 12}');
+CREATE TEMP TABLE lgdm_q1 AS EXECUTE lgdm_q('{}');
+CREATE TEMP TABLE lgdm_q2 AS EXECUTE lgdm_q('{4, 12}');
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+RESET enable_indexonlyscan;
+SET pg_lion.enable_count_pushdown = off;
+CREATE TEMP TABLE lgdm_s1 AS SELECT a, b, c, count(*) AS n FROM lgdm WHERE tags @> '{}' GROUP BY a, b, c;
+CREATE TEMP TABLE lgdm_s2 AS SELECT a, b, c, count(*) AS n FROM lgdm WHERE tags @> '{4, 12}' GROUP BY a, b, c;
+CREATE TEMP TABLE lgdm_t1 AS SELECT a, b, c, count(*) AS n FROM lgdm WHERE tags @> '{}' AND c <> 2 GROUP BY a, b, c;
+CREATE TEMP TABLE lgdm_t2 AS SELECT a, b, c, count(*) AS n FROM lgdm WHERE tags @> '{4, 12}' AND c <> 2 GROUP BY a, b, c;
+RESET pg_lion.enable_count_pushdown;
+SELECT x.q, x.rows, x.n,
+	   (SELECT count(*) FROM ((SELECT * FROM lgdm_p1 WHERE x.q = 'empty') EXCEPT ALL (SELECT * FROM lgdm_s1 WHERE x.q = 'empty')) d) +
+	   (SELECT count(*) FROM ((SELECT * FROM lgdm_s1 WHERE x.q = 'empty') EXCEPT ALL (SELECT * FROM lgdm_p1 WHERE x.q = 'empty')) d) +
+	   (SELECT count(*) FROM ((SELECT * FROM lgdm_p2 WHERE x.q = 'narrowing') EXCEPT ALL (SELECT * FROM lgdm_s2 WHERE x.q = 'narrowing')) d) +
+	   (SELECT count(*) FROM ((SELECT * FROM lgdm_s2 WHERE x.q = 'narrowing') EXCEPT ALL (SELECT * FROM lgdm_p2 WHERE x.q = 'narrowing')) d) +
+	   (SELECT count(*) FROM ((SELECT * FROM lgdm_q1 WHERE x.q = 'empty, c <> 2') EXCEPT ALL (SELECT * FROM lgdm_t1 WHERE x.q = 'empty, c <> 2')) d) +
+	   (SELECT count(*) FROM ((SELECT * FROM lgdm_t1 WHERE x.q = 'empty, c <> 2') EXCEPT ALL (SELECT * FROM lgdm_q1 WHERE x.q = 'empty, c <> 2')) d) +
+	   (SELECT count(*) FROM ((SELECT * FROM lgdm_q2 WHERE x.q = 'narrowing, c <> 2') EXCEPT ALL (SELECT * FROM lgdm_t2 WHERE x.q = 'narrowing, c <> 2')) d) +
+	   (SELECT count(*) FROM ((SELECT * FROM lgdm_t2 WHERE x.q = 'narrowing, c <> 2') EXCEPT ALL (SELECT * FROM lgdm_q2 WHERE x.q = 'narrowing, c <> 2')) d)
+		 AS differ
+  FROM (SELECT 'empty' AS q, count(*) AS rows, sum(n) AS n FROM lgdm_p1
+		UNION ALL SELECT 'narrowing', count(*), sum(n) FROM lgdm_p2
+		UNION ALL SELECT 'empty, c <> 2', count(*), sum(n) FROM lgdm_q1
+		UNION ALL SELECT 'narrowing, c <> 2', count(*), sum(n) FROM lgdm_q2) x
+ ORDER BY x.q;
+         q         | rows |  n   | differ 
+-------------------+------+------+--------
+ empty             |  126 | 5083 |      0
+ empty, c <> 2     |  108 | 4357 |      0
+ narrowing         |    2 |   81 |      0
+ narrowing, c <> 2 |    0 |      |      0
+(4 rows)
+
+DROP TABLE lgdm_p1, lgdm_p2, lgdm_q1, lgdm_q2, lgdm_s1, lgdm_s2, lgdm_t1, lgdm_t2;
+RESET plan_cache_mode;
+DEALLOCATE lgdm_p;
+DEALLOCATE lgdm_q;
+SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgdm WHERE d @@ ''w:*'' GROUP BY a, b, c');
+                                     lgd_check                                      
+------------------------------------------------------------------------------------
+ decoded, 1 pass, rows rechecked in the heap, 126 rows, same as the sequential scan
+(1 row)
+
+SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgdm WHERE d @@ ''w:*'' AND c <> 2 GROUP BY a, b, c');
+                                     lgd_check                                      
+------------------------------------------------------------------------------------
+ decoded, 1 pass, rows rechecked in the heap, 108 rows, same as the sequential scan
+(1 row)
+
+DROP TABLE lgdm;
 -- Rescanned, once per outer row of a nested loop.
 SELECT lgd_check('SELECT v.x, s.* FROM (VALUES (1), (4), (9)) v(x), LATERAL (SELECT a, b, c, count(*) AS n FROM lgd WHERE d = v.x GROUP BY a, b, c) s');
                         lgd_check                        

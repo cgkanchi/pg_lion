@@ -149,5 +149,29 @@ SELECT count(*) > 0 AS wrote_entry_deltas,
 SELECT lion_index_verify('lion_wd_k', true);
 SELECT lion_index_verify('lion_wi_k', true);
 
-DROP TABLE lion_wr, lion_wd, lion_wi;
+/*
+ * DOWNLINK (DESIGN.md §22).  A posting set has no internal level while it has
+ * at most 16 leaves, and the sets above have fewer.  The split that makes a
+ * 17th pushes the head down into a root over all of them, and every split
+ * after that posts its new leaf's downlink there.  Wide rows put fewer rows
+ * on a heap page, so that a leaf holds one dense container; the rows that
+ * grow the sets past 16 leaves go in before the WAL is read, which is kept to
+ * the splits after that.
+ */
+CREATE TABLE lion_wl (id int, k int, pad char(80));
+CREATE INDEX lion_wl_k ON lion_wl USING lion (k);
+INSERT INTO lion_wl SELECT i, i % 2, 'x' FROM generate_series(1, 80000) i;
+SELECT max_posting_height, posting_internal_pages
+  FROM lion_index_stats('lion_wl_k');
+SELECT pg_current_wal_lsn() AS lsn6 \gset
+INSERT INTO lion_wl SELECT i, i % 2, 'x' FROM generate_series(80001, 90000) i;
+SELECT pg_switch_wal() IS NOT NULL AS wal_switched_four_times;
+SELECT pg_current_wal_lsn() AS lsn7 \gset
+
+SELECT count(*) > 0 AS posted_downlinks
+  FROM pg_get_wal_records_info(:'lsn6', :'lsn7')
+ WHERE resource_manager = 'pg_lion' AND record_type = 'DOWNLINK';
+SELECT lion_index_verify('lion_wl_k', true);
+
+DROP TABLE lion_wr, lion_wd, lion_wi, lion_wl;
 DROP EXTENSION pg_walinspect;

@@ -21,7 +21,7 @@
 #define LION_JOINFLAG_ALL \
 	(LION_JOINFLAG_COLLECT | LION_JOINFLAG_ROWS | LION_JOINFLAG_UNIQUE | \
 	 LION_JOINFLAG_WALK | LION_JOINFLAG_SUM | LION_JOINFLAG_COUNTS | \
-	 LION_JOINFLAG_OUTER | LION_JOINFLAG_ORDERED)
+	 LION_JOINFLAG_OUTER | LION_JOINFLAG_ORDERED | LION_JOINFLAG_UNITE)
 
 /*
  * Each member's name, for the messages, and the node it is when it is not
@@ -1007,6 +1007,7 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	bool		joincounts = (jflags & LION_JOINFLAG_COUNTS) != 0;
 	bool		joinouter = (jflags & LION_JOINFLAG_OUTER) != 0;
 	bool		joinordered = (jflags & LION_JOINFLAG_ORDERED) != 0;
+	bool		joinunite = (jflags & LION_JOINFLAG_UNITE) != 0;
 	AttrNumber	driveattno;
 	int			i;
 	int			j;
@@ -1057,7 +1058,23 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	{
 		if (LION_TL_IS_CHILDCOL(p->tlkind[i]) && !p->hasjoin)
 			elog(ERROR, "LionCount: a child column without a join");
+
+		/*
+		 * ... and a row counted against the union of a batch's keys stands
+		 * for no dimension row, whose columns it could carry (DESIGN.md §27,
+		 * "Grouped by a fact column, the keys united"): the key the node
+		 * reads is the only one, and nothing above reads it
+		 */
+		if (LION_TL_IS_CHILDCOL(p->tlkind[i]) && joinunite &&
+			LION_TL_CHILDRESNO(p->tlkind[i]) != p->join.keyresno)
+			elog(ERROR, "LionCount: a child column of united keys");
 	}
+
+	/* the keys are united for an inner join's partial counts per fact group */
+	if (joinunite &&
+		(p->fgattno == 0 || p->join.type != LION_JOIN_INNER || joinrows ||
+		 joinsum))
+		elog(ERROR, "LionCount: malformed united join");
 
 	/*
 	 * The aggregates over keys (DESIGN.md §37) are a sum over the entries

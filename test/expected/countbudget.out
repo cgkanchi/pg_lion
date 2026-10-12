@@ -406,7 +406,8 @@ RESET work_mem;
  * mark nothing earlier has raised.
  */
 CREATE TABLE lion_cbm (k int, ki int, x int);
-INSERT INTO lion_cbm SELECT g % 5000, g % 30000, g % 7 FROM generate_series(1, 100000) g;
+-- 40 rows a key of k: too many for 64 bytes of sparse segment, so CHAIN
+INSERT INTO lion_cbm SELECT g % 5000, g % 30000, g % 7 FROM generate_series(1, 200000) g;
 CREATE INDEX lion_cbm_k ON lion_cbm USING lion (k) WITH (inline_limit = 64);
 CREATE INDEX lion_cbm_ki ON lion_cbm USING lion (ki);
 CREATE INDEX lion_cbm_x ON lion_cbm USING lion (x);
@@ -427,22 +428,22 @@ $$;
 \connect -
 SET work_mem = '4MB';
 SELECT count(*) FROM lion_cbm WHERE k = ANY (array(SELECT generate_series(1, 5000)));
- count 
--------
- 99980
+ count  
+--------
+ 199960
 (1 row)
 
 SELECT count(*) FROM lion_cbm WHERE k = ANY (array(SELECT generate_series(1, 10))) AND x = 1;
  count 
 -------
-    28
+    57
 (1 row)
 
 SELECT lion_cb_hwm() AS lion_cb_h0 \gset
 SELECT count(*) FROM lion_cbm WHERE k = ANY (array(SELECT generate_series(1, 5000))) AND x = 1;
  count 
 -------
- 14283
+ 28566
 (1 row)
 
 SELECT lion_cb_hwm() - :lion_cb_h0 < 16 * 1024 AS chain_list_within_16mb;
@@ -455,22 +456,22 @@ SELECT lion_cb_hwm() - :lion_cb_h0 < 16 * 1024 AS chain_list_within_16mb;
 \connect -
 SET work_mem = '4MB';
 SELECT count(*) FROM lion_cbm WHERE ki = ANY (array(SELECT generate_series(1, 30000)));
- count 
--------
- 99997
+ count  
+--------
+ 199994
 (1 row)
 
 SELECT count(*) FROM lion_cbm WHERE ki = ANY (array(SELECT generate_series(1, 10))) AND x = 1;
  count 
 -------
-     6
+    10
 (1 row)
 
 SELECT lion_cb_hwm() AS lion_cb_h0 \gset
 SELECT count(*) FROM lion_cbm WHERE ki = ANY (array(SELECT generate_series(1, 30000))) AND x = 1;
  count 
 -------
- 14285
+ 28571
 (1 row)
 
 SELECT lion_cb_hwm() - :lion_cb_h0 < 48 * 1024 AS inline_list_within_48mb;
@@ -505,21 +506,21 @@ RESET enable_seqscan;
 SELECT count(*) FROM lion_cbm;
  count  
 --------
- 100000
+ 200000
 (1 row)
 
 SET enable_seqscan = off;
 SELECT count(*) FROM lion_cbm WHERE k = ANY (array(SELECT generate_series(1, 10))) AND x = 1;
  count 
 -------
-    28
+    57
 (1 row)
 
 SELECT lion_cb_hwm() AS lion_cb_h0 \gset
 SELECT count(*) FROM lion_cbm WHERE k = ANY (array(SELECT generate_series(1, 5000))) AND x = 1;
  count 
 -------
- 14283
+ 28566
 (1 row)
 
 SELECT lion_cb_hwm() - :lion_cb_h0 < 16 * 1024 AS bitmap_within_16mb;

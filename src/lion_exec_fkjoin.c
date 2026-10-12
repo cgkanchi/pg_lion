@@ -1825,6 +1825,277 @@ lion_join_count_groups(LionCountScanState *st, int k, bool walked)
 }
 
 /*
+ * Let go of a turn's united keys (LION_JOINFLAG_UNITE): the copies' files,
+ * and their memory.
+ */
+void
+lion_join_unite_release(LionCountScanState *st)
+{
+	LionFactGroupState *fg = lion_st_fg(st);
+	int			u;
+
+	for (u = 0; u < fg->nunited; u++)
+		lion_posting_set_release(&fg->united[u]);
+	fg->united = NULL;
+	fg->nunited = -1;
+	fg->dups = NULL;
+	fg->ndups = 0;
+	if (fg->unitecxt != NULL)
+		MemoryContextReset(fg->unitecxt);
+}
+
+/*
+ * GROUPED BY A FACT COLUMN, THE KEYS UNITED (DESIGN.md §27).  With no column
+ * of a dimension row in the rows, the rows of one group are one row's worth
+ * to the Finalize Agg above, which adds them up; and the fk sets of the
+ * batch's keys are disjoint - a fact row has one fk value, and an inner
+ * join's keys, or the forward semi join's distinct keys, are distinct under
+ * the join's equality, which is the fk index's - so a group's count over
+ * their union is the sum of its counts over each.  So instead of a count per
+ * key and group (lion_join_count_groups()), the batch's keys are located
+ * once, their sets made one union source of a collection with the fact
+ * filters - or their copy - ANDed in (lion_sources_collect()), and each
+ * group is counted once, against that copy.
+ *
+ * The copy is a stale copy by the time it is counted, exactly as the fact
+ * filters' copy is, and safe on the same terms: it is read after the query's
+ * snapshot was taken, so it cannot miss a row the snapshot sees, and it is
+ * only ever counted beside a group's set, located from the index and pinned
+ * as an IN list's are, which carries the DESIGN.md §9 interlock for the dead
+ * TIDs it may still list.  Making it needs no interlock, so each key's set
+ * lets go of its pin as soon as it is located; what a turn holds of them is
+ * bounded by work_mem - past it the keys are located and united a share at
+ * a time, each share a copy of its own counted beside every group, which
+ * still adds up to the batch's counts - and the copies by a hash table's
+ * memory, spilling past it as the filters' copy does.
+ *
+ * A key the same bytes as the one before it - which the planner's proof of
+ * the keys' distinctness says does not come - is left out of the union and
+ * counted key by key, as before, so that the rows still add up to the
+ * join's.  A turn that cannot be united - a hot standby makes no copy, a
+ * range walked by the counts (DESIGN.md §32) is not a set to collect, or a
+ * copy failed - is counted key by key, every key: fg->nunited stays -1.
+ */
+static void
+lion_join_unite_keys(LionCountScanState *st, bool walked)
+{
+	LionJoinState *js = lion_st_join(st);
+	LionFactGroupState *fg = lion_st_fg(st);
+	EState	   *estate = st->css.ss.ps.state;
+	LionCountSource *filt;
+	int			nfilt;
+	int			cap;
+	int			ucap = 0;
+	int			dcap = 0;
+	int			k = 0;
+	int64		lookups = js->lookups;
+	int64		missing = js->missing;
+	Size		setlimit = (Size) work_mem * 1024;
+	Size		copylimit = get_hash_memory_limit();
+	MemoryContext setcxt;
+	MemoryContext oldcxt;
+	Datum		prevkey = (Datum) 0;
+	bool		haveprev = false;
+	instr_time	t;
+	int			i;
+
+	lion_join_unite_release(st);
+	if (RecoveryInProgress())
+		return;
+	if (js->filtered)
+	{
+		filt = &js->sources[1];
+		nfilt = 1;
+	}
+	else
+	{
+		filt = &st->sources[1];
+		nfilt = st->nitem;
+		for (i = 0; i < nfilt; i++)
+		{
+			if (filt[i].rangewalk != NULL)
+				return;
+		}
+	}
+
+	setcxt = AllocSetContextCreate(fg->unitecxt, "LionCount united key sets",
+								   ALLOCSET_DEFAULT_SIZES);
+	cap = Max(Min(js->batch.n, lion_array_batch_size()), 1);
+	fg->nunited = 0;
+
+	while (k < js->batch.n)
+	{
+		LionPostingSet *sets;
+		LionCountSource *src;
+		LionPostingSet copy;
+		LionCountStats cstats;
+		Size		held;
+		bool		spilled;
+		bool		ok;
+		int			nsets = 0;
+
+		MemoryContextReset(setcxt);
+		oldcxt = MemoryContextSwitchTo(setcxt);
+		sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) * cap);
+		INSTR_TIME_SET_ZERO(t);
+		lion_join_clock(st, -1, &t);
+		while (k < js->batch.n && nsets < cap &&
+			   MemoryContextMemAllocated(setcxt, true) < setlimit)
+		{
+			LionJoinEnt *ent = &js->batch.ent[k++];
+			bool		found;
+
+			if (ent->isnull)
+				continue;
+			CHECK_FOR_INTERRUPTS();
+			if (haveprev &&
+				datumIsEqual(ent->key, prevkey, js->keybyval, js->keylen))
+			{
+				MemoryContextSwitchTo(fg->unitecxt);
+				if (fg->ndups >= dcap)
+				{
+					dcap = (dcap == 0) ? 16 : dcap * 2;
+					fg->dups = (fg->dups == NULL) ?
+						(int *) palloc(sizeof(int) * dcap) :
+						(int *) repalloc(fg->dups, sizeof(int) * dcap);
+				}
+				fg->dups[fg->ndups++] = k - 1;
+				MemoryContextSwitchTo(setcxt);
+				continue;
+			}
+			prevkey = ent->key;
+			haveprev = true;
+			js->lookups++;
+			found = walked ?
+				lion_lookup_walk_find(&js->batch.walker, ent->key, ent->hash,
+									  &sets[nsets]) :
+				lion_lookup_walk_descend(&js->batch.walker, ent->key,
+										 &sets[nsets]);
+			if (!found)
+			{
+				js->missing++;
+				lion_posting_set_release(&sets[nsets]);
+				continue;
+			}
+			lion_posting_set_unpin(&sets[nsets]);
+			nsets++;
+		}
+		lion_join_clock(st, LION_JT_LOOKUP, &t);
+		MemoryContextSwitchTo(oldcxt);
+		if (nsets == 0)
+			continue;
+
+		/* the walk lets go of its leaf while the copy is made */
+		if (js->batch.walkbegun)
+			lion_lookup_walk_pause(&js->batch.walker);
+
+		src = (LionCountSource *)
+			MemoryContextAllocZero(setcxt,
+								   sizeof(LionCountSource) * (nfilt + 1));
+		src[0].nsets = nsets;
+		src[0].sets = sets;
+		if (nfilt > 0)
+			memcpy(&src[1], filt, sizeof(LionCountSource) * nfilt);
+
+		held = MemoryContextMemAllocated(fg->unitecxt, false);
+		memset(&cstats, 0, sizeof(cstats));
+		oldcxt = MemoryContextSwitchTo(fg->unitecxt);
+		ok = lion_sources_collect(st->heap, estate->es_snapshot, nfilt + 1,
+								  src, held < copylimit ? copylimit - held : 0,
+								  true, &copy, &spilled, &cstats);
+		MemoryContextSwitchTo(oldcxt);
+		lion_join_clock(st, LION_JT_COLLECT, &t);
+		cstats.copy_containers = 0;
+		cstats.copy_seeks = 0;
+		cstats.copy_file_reads = 0;
+		lion_count_stats_add(&st->stats, &cstats);
+		for (i = 0; i < nsets; i++)
+			lion_posting_set_release(&sets[i]);
+
+		if (!ok)
+		{
+			/* counted key by key after all: every key looked up again */
+			MemoryContextDelete(setcxt);
+			lion_join_unite_release(st);
+			js->lookups = lookups;
+			js->missing = missing;
+			if (js->batch.walkbegun)
+				lion_lookup_walk_restart(&js->batch.walker);
+			return;
+		}
+		if (spilled)
+			js->spilled++;
+		if (!copy.found)
+			continue;			/* the keys' rows pass no filter */
+
+		oldcxt = MemoryContextSwitchTo(fg->unitecxt);
+		if (fg->nunited >= ucap)
+		{
+			ucap = (ucap == 0) ? 4 : ucap * 2;
+			fg->united = (fg->united == NULL) ?
+				(LionPostingSet *) palloc(sizeof(LionPostingSet) * ucap) :
+				(LionPostingSet *) repalloc(fg->united,
+											sizeof(LionPostingSet) * ucap);
+		}
+		fg->united[fg->nunited++] = copy;
+		MemoryContextSwitchTo(oldcxt);
+	}
+	MemoryContextDelete(setcxt);
+
+	/* what is counted key by key descends to its key; the walk is done */
+	if (js->batch.walkbegun)
+		lion_lookup_walk_restart(&js->batch.walker);
+}
+
+/*
+ * Each group of the chunk located (fg->sets) counted against each copy of
+ * the turn's united keys, and the counts that are not 0 put by - as the
+ * batch's first entry's, whose columns the rows do not carry - then the
+ * keys that repeat counted key by key.
+ */
+static void
+lion_join_count_united(LionCountScanState *st)
+{
+	LionJoinState *js = lion_st_join(st);
+	LionFactGroupState *fg = lion_st_fg(st);
+	int64		pages = lion_posting_pages_read;
+	instr_time	t;
+	int			u;
+	int			j;
+	int			d;
+
+	INSTR_TIME_SET_ZERO(t);
+	lion_join_clock(st, -1, &t);
+	for (u = 0; u < fg->nunited; u++)
+	{
+		for (j = 0; j < fg->n; j++)
+		{
+			int64		count;
+
+			CHECK_FOR_INTERRUPTS();
+			memset(fg->src, 0, sizeof(LionCountSource) * 2);
+			fg->src[0].nsets = 1;
+			fg->src[0].sets = &fg->united[u];
+			fg->src[1].nsets = 1;
+			fg->src[1].sets = &fg->sets[j];
+			count = lion_node_count(st, 2, fg->src, false);
+			fg->groupcounts++;
+			if (count > 0)
+				lion_join_group_row(st, 0, fg->key[j], fg->isnull[j], count);
+		}
+	}
+	js->posting += lion_posting_pages_read - pages;
+	lion_join_clock(st, LION_JT_COUNT, &t);
+
+	for (d = 0; d < fg->ndups; d++)
+	{
+		CHECK_FOR_INTERRUPTS();
+		js->lookups++;
+		lion_join_count_groups(st, fg->dups[d], false);
+	}
+}
+
+/*
  * Relation p's turn with the batch - leaf partition p, or the plain table for
  * p < 0: every key counted in every group of the fact column there, and the
  * counts that are not 0 put by to go up.
@@ -1899,6 +2170,11 @@ lion_join_group_turn(LionCountScanState *st, int p)
 	 * partition), and stays open after the turn.
 	 */
 	Assert(fgidx != NULL);
+
+	/* the keys united, once for the turn, where the plan says */
+	if (js->unite)
+		lion_join_unite_keys(st, walked);
+
 	lion_reader_lock(fgidx, st->css.ss.ps.state->es_snapshot);
 	fgidxcol = lion_index_col_for(fgidx,
 								  lion_heap_attno_in(st->heap,
@@ -1954,13 +2230,18 @@ lion_join_group_turn(LionCountScanState *st, int p)
 			lion_lookup_walk_restart(&js->batch.walker);
 		first = false;
 
-		for (k = 0; k < js->batch.n; k++)
+		if (fg->nunited >= 0)
+			lion_join_count_united(st);
+		else
 		{
-			if (js->batch.ent[k].isnull)
-				continue;
-			CHECK_FOR_INTERRUPTS();
-			js->lookups++;
-			lion_join_count_groups(st, k, walked);
+			for (k = 0; k < js->batch.n; k++)
+			{
+				if (js->batch.ent[k].isnull)
+					continue;
+				CHECK_FOR_INTERRUPTS();
+				js->lookups++;
+				lion_join_count_groups(st, k, walked);
+			}
 		}
 
 		for (j = 0; j < n; j++)
@@ -1972,6 +2253,7 @@ lion_join_group_turn(LionCountScanState *st, int p)
 	fg->sets = NULL;
 	fg->key = NULL;
 	fg->isnull = NULL;
+	lion_join_unite_release(st);
 
 	if (p >= 0)
 		lion_join_part_close(st);

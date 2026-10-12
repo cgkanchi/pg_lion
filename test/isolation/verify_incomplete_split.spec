@@ -15,9 +15,10 @@
 # and 1d): the pages stay as the first record left them, since an aborted
 # transaction does not undo index writes.  verify() must warn, and pass.
 #
-#  * the posting tree: two keys taking alternate TIDs, so each one's set is a
-#    tree of dense bitset leaves after a few thousand rows, and the next leaf
-#    split is not a root push-down;
+#  * the posting tree: two keys taking alternate TIDs of wide rows, so that
+#    each container is a dense bitset filling a leaf, and each set has more
+#    than the 16 leaves a set without an internal level may have (DESIGN.md
+#    §22): a tree, whose next leaf split posts a downlink;
 #  * the directory: 200 keys of about a hundred bytes are a few leaves under
 #    a root, and new keys among them split a leaf that is not the root (a
 #    root split is atomic and never flagged).
@@ -26,9 +27,10 @@ setup
 {
 	CREATE EXTENSION IF NOT EXISTS pg_lion;
 	CREATE EXTENSION IF NOT EXISTS injection_points;
-	CREATE TABLE vis_p (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
+	CREATE TABLE vis_p (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x')
+	  WITH (autovacuum_enabled = off);
 	CREATE INDEX vis_p_k ON vis_p USING lion (k);
-	INSERT INTO vis_p SELECT i, i % 2 FROM generate_series(1, 60000) i;
+	INSERT INTO vis_p SELECT i, i % 2 FROM generate_series(1, 90000) i;
 	CREATE TABLE vis_d (k text NOT NULL) WITH (autovacuum_enabled = off);
 	INSERT INTO vis_d SELECT 'key-' || lpad((2 * i)::text, 90, '0')
 	  FROM generate_series(1, 200) i;
@@ -73,8 +75,8 @@ step s1_verify_dir	{
 # Every row is still found through the index, the aborted ones excepted.
 step s1_answers	{
 	SET enable_seqscan = off;
-	SELECT (SELECT count(*) FROM vis_p WHERE k = 0) = 30000 AS k0_exact,
-		   (SELECT count(*) FROM vis_p WHERE k = 1) = 30000 AS k1_exact,
+	SELECT (SELECT count(*) FROM vis_p WHERE k = 0) = 45000 AS k0_exact,
+		   (SELECT count(*) FROM vis_p WHERE k = 1) = 45000 AS k1_exact,
 		   (SELECT bool_and((SELECT count(*) FROM vis_d d2 WHERE d2.k = d1.k) = 1)
 			  FROM vis_d d1) AS every_key_is_found;
 	RESET enable_seqscan;

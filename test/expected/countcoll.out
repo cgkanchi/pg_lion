@@ -171,12 +171,12 @@ SELECT lion_index_count('lcc2_c', 'abc'::text COLLATE "C") AS lion,
 -- ---------- GROUP BY under a named collation ----------
 -- The groups are the grouping expression's collation's, not the column's:
 -- `GROUP BY t COLLATE c` may only be driven by an index built under c
--- (lion_collect_targets()).  None of these is pushed down today - the group
--- key counts as printed, and under a nondeterministic collation an entry's
--- key is no spelling the rows need have; a relabelled grouping expression is
--- not taken either - and every answer is checked against the same query with
--- the pushdown off.  lcc's column is of the default collation and its one
--- index on t is under lcc_ci; lcc2's column is under lcc_ci.
+-- (lion_collect_targets()).  Under a nondeterministic collation none is
+-- pushed down - the group key counts as printed, and an entry's key is no
+-- spelling the rows need have; under "C" lcc2_c drives them - and every answer
+-- is checked against the same query with the pushdown off.  lcc's column is
+-- of the default collation and its one index on t is under lcc_ci; lcc2's
+-- column is under lcc_ci.
 CREATE FUNCTION lcc_groups(q text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -229,7 +229,7 @@ SELECT lcc_groups('SELECT m, count(*) FROM lcc GROUP BY t COLLATE lcc_ci, m ORDE
 (1 row)
 
 -- the column under lcc_ci: its own groups from lcc2_i, and four under "C",
--- which lcc2_i cannot drive
+-- which lcc2_i cannot drive and lcc2_c does
 SELECT lcc_groups('SELECT count(*) FROM lcc2 GROUP BY t ORDER BY 1');
           lcc_groups          
 ------------------------------
@@ -237,15 +237,21 @@ SELECT lcc_groups('SELECT count(*) FROM lcc2 GROUP BY t ORDER BY 1');
 (1 row)
 
 SELECT lcc_groups('SELECT count(*) FROM lcc2 GROUP BY t COLLATE "C" ORDER BY 1');
-                lcc_groups                
-------------------------------------------
- not pushed down: (100) (100) (100) (100)
+             lcc_groups             
+------------------------------------
+ LionCount: (100) (100) (100) (100)
 (1 row)
 
 SELECT lcc_groups('SELECT count(*) FROM lcc2 GROUP BY t COLLATE "C" HAVING count(*) > 100');
-    lcc_groups     
--------------------
- not pushed down: 
+ lcc_groups  
+-------------
+ LionCount: 
+(1 row)
+
+SELECT lcc_groups('SELECT t COLLATE "C", count(*) FROM lcc2 GROUP BY 1 ORDER BY 1');
+                     lcc_groups                     
+----------------------------------------------------
+ LionCount: (ABC,100) (Abc,100) (abc,100) (xyz,100)
 (1 row)
 
 RESET enable_hashagg;

@@ -480,10 +480,10 @@ lion_verify_segment(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
 				   uint32 *prevckey)
 {
 	const char *detail = NULL;
-	const uint32 *ckeys;
+	LionSparseIter it;
 	uint32		n = c->cardinality;
-	uint32		run = 1;
-	uint32		i;
+	uint32		run = 0;
+	uint32		runckey = 0;
 
 	if (!lion_sparse_check(c, avail, &detail) ||
 		!lion_sparse_check_offsets(c, MaxHeapTuplesPerPage, &detail))
@@ -501,19 +501,21 @@ lion_verify_segment(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
 					RelationGetRelationName(vs->index), off, blk, c->ckey,
 					*prevckey);
 
-	ckeys = LION_SPARSE_CKEYS_CONST(c);
-	for (i = 1; i <= n; i++)
+	/* lion_sparse_check() has decoded the stream and found it sound */
+	lion_sparse_iter_init(&it, c);
+	while (lion_sparse_iter_next(&it))
 	{
-		if (i < n && ckeys[i] == ckeys[i - 1])
-		{
+		if (run > 0 && lion_sparse_iter_ckey(&it) == runckey)
 			run++;
-			continue;
+		else
+		{
+			runckey = lion_sparse_iter_ckey(&it);
+			run = 1;
 		}
 		if (run >= LION_SPARSE_THRESHOLD)
 			lion_corrupt("lion index \"%s\": sparse segment %u on block %u holds %u members of container key %u, which needs a container of its own",
 						RelationGetRelationName(vs->index), off, blk, run,
-						ckeys[i - 1]);
-		run = 1;
+						runckey);
 	}
 
 	*prevckey = lion_item_last_ckey(c);
@@ -543,17 +545,15 @@ lion_verify_container(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
 	}
 
 	/*
-	 * DESIGN.md §38: a NARROW only in an index of version 8.  A build writes
-	 * one only into such an index, VACUUM likewise, and inserts only widen
-	 * one that is there; and a build of pg_lion before §38 reads version 6
-	 * and 7 indexes, which have to stay what it can read.  Its width is
-	 * lion_container_check()'s.  The version is the one the meta page says
-	 * now, as lion_verify_meta() read it.
+	 * DESIGN.md §38: a NARROW only in an index whose build wrote one
+	 * (LION_META_NARROW).  VACUUM makes one only in such an index, and
+	 * inserts only widen one that is there.  Its width is
+	 * lion_container_check()'s.  The flag is the one the meta page has now,
+	 * as lion_verify_meta() read it.
 	 */
-	if (c->type == LION_CT_NARROW && vs->version < LION_VERSION_NARROW)
-		lion_corrupt("lion index \"%s\": container %u on block %u is a NARROW, which an index of version %u cannot hold",
-					RelationGetRelationName(vs->index), off, blk,
-					vs->version);
+	if (c->type == LION_CT_NARROW && !vs->allows_narrow)
+		lion_corrupt("lion index \"%s\": container %u on block %u is a NARROW, which an index whose meta page records none cannot hold",
+					RelationGetRelationName(vs->index), off, blk);
 
 	/*
 	 * Its structure, and then its members as heap TIDs (DESIGN.md §2): a
@@ -1055,7 +1055,12 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 				lion_corrupt("lion index \"%s\": posting page %u is at level %u, but its parent is at level %u",
 							RelationGetRelationName(vs->index), blk, level,
 							expect + 1);
-			if (!LionPageIsRightmost(page) && blk == entry->head)
+			/*
+			 * A head at level 0 is the first leaf of a set without an internal
+			 * level, and its right siblings are the set's other leaves; one
+			 * above level 0 is the root of a tree, which has none.
+			 */
+			if (!LionPageIsRightmost(page) && blk == entry->head && level > 0)
 				lion_corrupt("lion index \"%s\": the root %u of chain entry %u on block %u has a right sibling",
 							RelationGetRelationName(vs->index), blk, eoff, eblk);
 			leftmost[level] = blk;
@@ -1090,6 +1095,36 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 	if (!lion_verify_posting_leaves(vs, eblk, eoff, entry, leftmost[0], &lvl[0],
 									exact, res))
 		return false;
+
+	/*
+	 * A set without an internal level (DESIGN.md §22) has at most
+	 * LION_POSTING_FLAT_LEAVES leaves, and none of them flagged: its splits
+	 * post no downlink, and the one that would make it longer pushes the
+	 * head down first.  A walk that may be repeated can have seen that
+	 * push-down happen behind it, and the leaves and the split that came
+	 * after it, so it walks again instead.
+	 */
+	if (height == 0)
+	{
+		if (lvl[0].npages > LION_POSTING_FLAT_LEAVES)
+		{
+			if (!exact)
+				return false;
+			lion_corrupt("lion index \"%s\": the posting set of chain entry %u on block %u has %d leaves and no internal level, more than %d",
+						RelationGetRelationName(vs->index), eoff, eblk,
+						lvl[0].npages, LION_POSTING_FLAT_LEAVES);
+		}
+		for (j = 0; j < lvl[0].npages; j++)
+		{
+			if (!lvl[0].incomplete[j])
+				continue;
+			if (!exact)
+				return false;
+			lion_corrupt("lion index \"%s\": leaf %u of the posting set of chain entry %u on block %u, which has no internal level, is flagged as an unfinished split",
+						RelationGetRelationName(vs->index), lvl[0].blocks[j],
+						eoff, eblk);
+		}
+	}
 
 	/*
 	 * Test hook: the leaves are walked, the levels above are not, and nothing
@@ -1687,6 +1722,8 @@ lion_verify_postree(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 	Buffer		leaf = InvalidBuffer;
 	BlockNumber levelstart = root;
 	int			level = -1;
+	int			rootlevel = -1;
+	int			nleaves = 0;
 	uint64		nmembers = 0;
 	bool		any = false;
 	uint64		lastcode = 0;
@@ -1728,11 +1765,32 @@ lion_verify_postree(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 							off, blk);
 			plevel = LionPageGetOpaque(page)->level;
 			if (level < 0)
-				level = plevel;
+				level = rootlevel = plevel;
 			if (plevel != level || plevel >= LION_POSTING_MAX_HEIGHT)
 				lion_corrupt("lion index \"%s\": position page %u is at level %d, expected %d",
 							RelationGetRelationName(vs->index), pblk, plevel,
 							level);
+
+			/*
+			 * A root at level 0 is the first leaf of a tree without an
+			 * internal level (DESIGN.md §17): at most LION_POSTING_FLAT_LEAVES
+			 * leaves, none flagged, since such a tree's splits post no
+			 * downlink.  A root above level 0 has no right sibling.
+			 */
+			if (pblk == root && plevel > 0 && !LionPageIsRightmost(page))
+				lion_corrupt("lion index \"%s\": the root %u of the position tree of entry %u on block %u has a right sibling",
+							RelationGetRelationName(vs->index), root, off,
+							blk);
+			if (rootlevel == 0)
+			{
+				if (++nleaves > LION_POSTING_FLAT_LEAVES)
+					lion_corrupt("lion index \"%s\": the position tree at %u of entry %u on block %u has more than %d leaves and no internal level",
+								RelationGetRelationName(vs->index), root, off,
+								blk, LION_POSTING_FLAT_LEAVES);
+				if (LionPageIncompleteSplit(page))
+					lion_corrupt("lion index \"%s\": leaf %u of the position tree at %u, which has no internal level, is flagged as an unfinished split",
+								RelationGetRelationName(vs->index), pblk, root);
+			}
 
 			if (plevel > 0)
 			{

@@ -920,10 +920,13 @@ static PGAlignedBlock lion_redo_scratch;
  * in place"), and a member in range.  The operations that patch an item's
  * bytes check their item as well (LION_OP_DELTA, LION_OP_SETBYTES); a record
  * that fails this was not written against this page, and replaying it would
- * write past the item.
+ * write past the item.  ckey is SPARSE_INS's container key (unused for
+ * CONTAINER_ADD): what a segment needs to take a pair depends on where in
+ * its stream the pair goes.
  */
 static LionContainer *
-lion_redo_inplace_item(Page page, const xl_lion_op *op, BlockNumber blkno)
+lion_redo_inplace_item(Page page, const xl_lion_op *op, BlockNumber blkno,
+					   uint32 ckey)
 {
 	ItemId		iid;
 	LionContainer *item;
@@ -947,9 +950,9 @@ lion_redo_inplace_item(Page page, const xl_lion_op *op, BlockNumber blkno)
 	item = (LionContainer *) PageGetItem(page, iid);
 	if (op->op == LION_OP_SPARSE_INS)
 	{
-		if (item->type == LION_CT_SPARSE &&
-			item->cardinality < LION_SPARSE_MAX_PAIRS)
-			need = lion_sparse_size(item) + LION_SPARSE_PAIR_SIZE;
+		/* the stream is decoded only once it is known to be inside the item */
+		if (item->type == LION_CT_SPARSE && lion_sparse_size(item) <= alloc)
+			need = lion_sparse_insert_size(item, ckey, (uint16) op->aux);
 	}
 	else
 	{
@@ -1215,7 +1218,8 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 
 			case LION_OP_CONTAINER_ADD:
 				{
-					LionContainer *c = lion_redo_inplace_item(page, &op, blkno);
+					LionContainer *c = lion_redo_inplace_item(page, &op, blkno,
+															  0);
 
 					if (!lion_container_add(c, op.aux))
 						elog(PANIC, "pg_lion: could not add member %u to the item at %u on block %u",
@@ -1225,7 +1229,7 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 
 			case LION_OP_SPARSE_INS:
 				{
-					LionContainer *s = lion_redo_inplace_item(page, &op, blkno);
+					LionContainer *s;
 					uint32		ckey;
 					bool		dup = false;
 
@@ -1233,6 +1237,7 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 						elog(PANIC, "pg_lion: bad SPARSE_INS payload on block %u",
 							 blkno);
 					memcpy(&ckey, payload, sizeof(uint32));
+					s = lion_redo_inplace_item(page, &op, blkno, ckey);
 					if (!lion_sparse_insert(s, ckey, op.aux, &dup) || dup)
 						elog(PANIC, "pg_lion: could not insert (%u,%u) into the segment at %u on block %u",
 							 ckey, op.aux, op.off, blkno);

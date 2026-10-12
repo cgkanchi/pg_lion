@@ -260,7 +260,7 @@ INSERT INTO lion_cc_q VALUES
 (116, $$SELECT count(*) FROM lion_cc_t WHERE dstatus::lion_cc_ws = 'val1'$$),
 (117, $$SELECT count(*) FROM lion_cc_t WHERE dstatus::lion_cc_ws IN ('val1', 'val2')$$),
 (118, $$SELECT dstatus, count(*) FROM lion_cc_t GROUP BY dstatus$$),
--- `<>` and NOT IN are no strategy of the index: the ordinary plan
+-- `<>` (DESIGN.md §35), and NOT IN as its `<>` clauses (§10)
 (119, $$SELECT count(*) FROM lion_cc_t WHERE status <> 'val1'$$),
 (120, $$SELECT count(*) FROM lion_cc_t WHERE status NOT IN ('val1', 'val3')$$),
 -- the FK-side join (DESIGN.md §27) on an enum key

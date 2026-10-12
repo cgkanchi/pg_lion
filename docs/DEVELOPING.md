@@ -72,7 +72,7 @@ replay, so turning it on for a primary that never replays proves nothing.
 - **The recovery harness** (`make recovery-check`) needs a whole installation to initdb clusters
   in, named by `RECOVERY_PREFIX`, which it builds and installs the extension into
   (`RECOVERY_SKIP_INSTALL=1` uses the one already installed there instead); as root it also
-  needs `RECOVERY_RUN_AS=<unprivileged user>` (`test/recovery/README.md`).  Its phases 1b-1e and 3
+  needs `RECOVERY_RUN_AS=<unprivileged user>` (`test/recovery/README.md`).  Its phases 1b-1e, 1g and 3
   need `injection_points`, and are skipped without it unless `INJECTION_POINTS=1` makes that an
   error.
 
@@ -140,6 +140,7 @@ the suite as they are in production.
     src/lion_rangesrc.c     a range as a source: collected, or probed at the other sources' rows
     src/lion_range.c        range restrictions, and iterating every entry of an index
     src/lion_count_sql.c    the SQL count functions (lion_index_count() and the others)
+    src/lion_facets.c       lion_index_facets(): the rows under each key of a column, under a filter
     src/lion_customscan.h   the LionCount custom scan's private header, shared by its planner half:
     src/lion_plan_*.c       create_upper_paths_hook -> CustomPath/CustomScan "LionCount"; set_join_pathlist_hook
                             -> "LionSemiJoin"/"LionAntiJoin"; index matching, partitions, the cost model

@@ -79,9 +79,9 @@ step s1_check:
 	SELECT lion_index_verify('vrp_k', true);
 	DROP TABLE vrp_root;
 
-ntids| rows|k1_seq|k1_index
------+-----+------+--------
-43500|43500| 20500|   20500
+ ntids|  rows|k1_seq|k1_index
+------+------+------+--------
+103500|103500| 50500|   50500
 (1 row)
 
 lion_index_verify

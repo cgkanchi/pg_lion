@@ -739,6 +739,11 @@ lion_explain_join(LionCountScanState *st, ExplainState *es)
 		ExplainPropertyText("Fact Group Key",
 							lion_explain_attname(st, st->fg->attno),
 							es);
+
+		/* ... or counted once against the union of a batch's keys */
+		if (js->unite)
+			ExplainPropertyText("Fact Groups Counted Against",
+								"united join keys", es);
 		for (i = 0; i < st->npart; i++)
 			bound += (st->part[i].fgconst != NULL) ? 1 : 0;
 		if (bound > 0)

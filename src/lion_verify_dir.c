@@ -719,24 +719,10 @@ lion_verify_meta(LionVerifyState *vs)
 	page = lion_verify_read_page(vs, LION_METAPAGE_BLKNO, LION_PAGE_META, &buf);
 	meta = LionPageGetMeta(page);
 
-	if (meta->magic != LION_MAGIC ||
-		(meta->version != LION_VERSION &&
-		 meta->version != LION_VERSION_SUMMARIES &&
-		 meta->version != LION_VERSION_NARROW))
-		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u, %u or %u",
+	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION_V9)
+		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u",
 					RelationGetRelationName(vs->index), meta->magic,
-					meta->version, LION_MAGIC, LION_VERSION,
-					LION_VERSION_SUMMARIES, LION_VERSION_NARROW);
-
-	/*
-	 * DESIGN.md §32: version 7 is version 6 with summaries, and only that;
-	 * version 8 is either with NARROW items (§38).
-	 */
-	if ((meta->version == LION_VERSION && meta->summary_cols != 0) ||
-		(meta->version == LION_VERSION_SUMMARIES && meta->summary_cols == 0))
-		lion_corrupt("lion index \"%s\": meta page version %u names summarized key columns %08X",
-					RelationGetRelationName(vs->index), meta->version,
-					meta->summary_cols);
+					meta->version, LION_MAGIC, LION_VERSION_V9);
 	if (meta->summary_cols != 0 &&
 		(meta->summary_tids < LION_MIN_SUMMARY_TIDS ||
 		 meta->summary_tids > LION_MAX_SUMMARY_TIDS))
@@ -788,7 +774,7 @@ lion_verify_meta(LionVerifyState *vs)
 
 	vs->root = meta->root;
 	vs->height = meta->height;
-	vs->version = meta->version;
+	vs->allows_narrow = LION_META_ALLOWS_NARROW(meta);
 
 	UnlockReleaseBuffer(buf);
 }
@@ -901,8 +887,8 @@ lion_verify_classify(LionVerifyState *vs, BlockNumber blk)
 	 * multi-leaf spill that an ERROR or a crash stopped before its last record
 	 * writes the leaves and never the root (lion_entry_spill(), DESIGN.md
 	 * §18).  The root is looked at with nothing held.  A leaf that is its own
-	 * root is a one-page set, which a spill writes in the same record as its
-	 * entry.
+	 * root heads a set without an internal level, which a spill writes in the
+	 * same record as its entry.
 	 */
 	ohead = LionPageGetOpaque(page)->owner_head;
 	ohash = LionPageGetOpaque(page)->owner_hash;

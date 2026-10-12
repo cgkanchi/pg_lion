@@ -67,14 +67,29 @@ LANGUAGE sql AS $$
 	  FROM lion_rw_block(idx, lion_rw_u32(lion_rw_block(idx, 0), 44)) r
 $$;
 
--- The n-th leaf of the posting set of key: the root lion_index_posting_root()
--- names is an internal page of LionPostingPivot downlinks (ckey, then the
--- child at +4), and the only page of its level, so every item is a downlink.
+-- The n-th leaf of the posting set of key.  The head lion_index_posting_root()
+-- names is either an internal page of LionPostingPivot downlinks (ckey, then
+-- the child at +4), the only page of its level, so that every item is a
+-- downlink - or, in a set of at most 16 leaves, the first leaf, and the others
+-- follow its right link (DESIGN.md §22).  The special area starts at
+-- pd_special, the uint16 at byte 16: the right link first, the level at +24.
 CREATE FUNCTION lion_rw_posting_leaf(idx regclass, key int, n int) RETURNS bigint
-LANGUAGE sql AS $$
-	SELECT lion_rw_u32(r, lion_rw_item(r, n) + 4)
-	  FROM lion_rw_block(idx, lion_index_posting_root(idx, key)) r
-$$;
+LANGUAGE plpgsql AS $$
+DECLARE
+	blk bigint := lion_index_posting_root(idx, key);
+	r bytea := lion_rw_block(idx, blk);
+	sp int := get_byte(r, 16) | (get_byte(r, 17) << 8);
+BEGIN
+	IF (get_byte(r, sp + 24) | (get_byte(r, sp + 25) << 8)) > 0 THEN
+		RETURN lion_rw_u32(r, lion_rw_item(r, n) + 4);
+	END IF;
+	FOR i IN 2 .. n LOOP
+		blk := lion_rw_u32(r, sp);
+		r := lion_rw_block(idx, blk);
+		sp := get_byte(r, 16) | (get_byte(r, 17) << 8);
+	END LOOP;
+	RETURN blk;
+END $$;
 
 -- Write an index out and drop its pages from the buffer pool, so that the
 -- file is what the next read sees.
@@ -205,7 +220,7 @@ DROP TABLE lion_rw_s;
 
 -- ---------- 3. the leaves of a posting set in a cycle ----------
 -- Two keys taking alternate rows, so that each key's containers are dense
--- bitmaps, NARROWs of width 4 (DESIGN.md §38), and its posting set a tree of
+-- bitmaps, NARROWs of width 4 (DESIGN.md §38), and its posting set a chain of
 -- several leaves (as in test/sql/posting_tree.sql).  Key 1's second leaf's
 -- right link goes back to its first.  Every read of the key went round it:
 -- the count, the bitmap and plain scans, LionOrdered and the SQL count, and
