@@ -809,11 +809,14 @@ lion_pivot_kindflags(uint16 flags)
  * internal level included (DESIGN.md §22, "Bulk build").  100 packs a leaf
  * until the next item does not fit, which is what every build did before the
  * option existed; less leaves the room the first inserts after the build need
- * to rewrite a container in place, where a full leaf has to split.  A leaf
- * always takes its first item, so the fill is a target the build stays under,
- * never a reason to leave a page empty.
+ * to rewrite a container in place, where a full leaf has to split: an UPDATE
+ * whose new version stays on the old row's page - a heap below fillfactor
+ * 100, or a page VACUUM made room on - inserts inside a container the build
+ * wrote.  The default is nbtree's leaf default, 90, and the directory's.  A
+ * leaf always takes its first item, so the fill is a target the build stays
+ * under, never a reason to leave a page empty.
  */
-#define LION_DEFAULT_POSTING_FILLFACTOR	100
+#define LION_DEFAULT_POSTING_FILLFACTOR	90
 #define LION_MIN_POSTING_FILLFACTOR		10
 
 /*

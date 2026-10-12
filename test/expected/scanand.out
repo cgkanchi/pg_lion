@@ -436,10 +436,10 @@ SELECT attno, containers, bitset_containers, container_pages
   FROM lion_index_stats('scb_l') ORDER BY attno;
  attno | containers | bitset_containers | container_pages 
 -------+------------+-------------------+-----------------
-     1 |         40 |                 0 |               8
-     2 |         40 |                 0 |               8
+     1 |         40 |                 0 |              10
+     2 |         40 |                 0 |              10
      3 |         40 |                 0 |               6
-     4 |         40 |                 0 |               5
+     4 |         40 |                 0 |               6
 (4 rows)
 
 /*
@@ -488,7 +488,7 @@ SELECT scb_buffers(q, 'count') AS count_buffers,
   FROM (VALUES ('d0 = 1 AND d1 = 1 AND b = 1 AND c = 1')) v(q);
  count_buffers | bitmap_reads_less | plain_reads_less | both_read_alike 
 ---------------+-------------------+------------------+-----------------
-            17 | t                 | t                | t
+            19 | t                 | t                | t
 (1 row)
 
 DROP TABLE scb;
