@@ -306,8 +306,8 @@ lion_insert_segment(Relation index, Relation heaprel, Buffer buf,
 		w.nitems = 1;
 	}
 
-	entry->ntids += 1;
-	entry->ncontainers += (uint32) (w.nitems - (replace ? 1 : 0));
+	lion_entry_set_ntids(entry, lion_entry_ntids(entry) + 1);
+	lion_entry_set_ncontainers(entry, lion_entry_ncontainers(entry) + (uint32) (w.nitems - (replace ? 1 : 0)));
 
 	lion_chain_put_items_locked_ext(index, heaprel, buf, entrybuf, entryoff,
 								   entry, off, replace, w.items, w.nitems, true);
@@ -504,7 +504,7 @@ lion_insert_new_entry(Relation index, Relation heaprel, LionState *state,
 		if (!lion_poschunk_append(chunk, LION_CONTAINER_MAX_SIZE, pm))
 			elog(ERROR, "lion index \"%s\": a row's positions do not make a position chunk",
 				 RelationGetRelationName(index));
-		shape = lion_make_entry(state, key, hash, LION_ENTRY_INLINE, NULL, 0,
+		shape = lion_make_entry(state, key, LION_ENTRY_INLINE, NULL, 0,
 								&ssize);
 		px = lion_entry_add_posext(shape, &ssize);
 		entry = lion_entry_rebuild_pos(px, payload, paylen, paylen,
@@ -518,10 +518,10 @@ lion_insert_new_entry(Relation index, Relation heaprel, LionState *state,
 		entry = (reservedflag != 0) ?
 			lion_make_reserved_entry((AttrNumber) state->attno, reservedflag,
 									LION_ENTRY_INLINE, payload, paylen, &size) :
-			lion_make_entry(state, key, hash, LION_ENTRY_INLINE,
-						   payload, paylen, &size);
-	entry->ncontainers = 1;
-	entry->ntids = 1;
+			lion_make_entry(state, key, LION_ENTRY_INLINE,
+							payload, paylen, &size);
+	lion_entry_set_ncontainers(entry, 1);
+	lion_entry_set_ntids(entry, 1);
 
 	/*
 	 * Cardinality guard (DESIGN.md §17), on the one path that can make the
@@ -575,8 +575,8 @@ lion_insert_inline_pos(Relation index, Relation heaprel, LionState *state,
 	Size		payoff = LionEntryPayloadOffset(entry);
 	Size		limit = lion_inline_max(payoff,
 										(Size) state->ix->meta.inline_limit);
-	uint32		ncontainers = entry->ncontainers;
-	uint64		ntids = entry->ntids;
+	uint32		ncontainers = lion_entry_ncontainers(entry);
+	uint64		ntids = lion_entry_ntids(entry);
 	LionContainer *oldchunk = (LionContainer *) palloc0(LION_CONTAINER_MAX_SIZE);
 	LionContainer *chunk = (LionContainer *) palloc0(LION_CONTAINER_MAX_SIZE);
 	bool		hadchunk;
@@ -628,8 +628,8 @@ lion_insert_inline_pos(Relation index, Relation heaprel, LionState *state,
 		newentry = lion_entry_rebuild_pos(entry, newpay, newlen, payarea,
 										  (const char *) chunk, poslen,
 										  &newsize);
-		newentry->ncontainers = (uint32) ((int) ncontainers + ndelta);
-		newentry->ntids = ntids + 1;
+		lion_entry_set_ncontainers(newentry, (uint32) ((int) ncontainers + ndelta));
+		lion_entry_set_ntids(newentry, ntids + 1);
 		lion_dir_place(index, heaprel, state->ix, entrybuf, entryoff, true,
 					  newentry, newsize);
 		pfree(newentry);
@@ -639,9 +639,7 @@ lion_insert_inline_pos(Relation index, Relation heaprel, LionState *state,
 		LionEntryTuple *chain;
 		Size		chainsize;
 
-		chain = lion_entry_rebuild_pos(entry, NULL, 0, 0, NULL, 0, &chainsize);
-		chain->ncontainers = ncontainers;
-		chain->ntids = ntids;
+		chain = lion_entry_chain_shape(entry, &chainsize);
 		lion_entry_spill_pos(index, heaprel, entrybuf, entryoff, chain, oldpay,
 							 paylen, hadchunk ? oldchunk : NULL);
 		pfree(chain);
@@ -673,8 +671,8 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 	Size		itemsz = ItemIdGetLength(iid);
 	Size		payoff = LionEntryPayloadOffset(entry);
 	Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemsz);
-	uint32		ncontainers = entry->ncontainers;
-	uint64		ntids = entry->ntids;
+	uint32		ncontainers = lion_entry_ncontainers(entry);
+	uint64		ntids = lion_entry_ntids(entry);
 	char	   *oldpay;
 	char	   *newpay;
 	Size		newlen;
@@ -746,8 +744,8 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 
 		newentry = lion_entry_rebuild_slack(entry, newpay, newlen, writesz,
 											&newsize);
-		newentry->ncontainers = (uint32) ((int) ncontainers + ndelta);
-		newentry->ntids = ntids + 1;
+		lion_entry_set_ncontainers(newentry, (uint32) ((int) ncontainers + ndelta));
+		lion_entry_set_ntids(newentry, ntids + 1);
 
 		/*
 		 * DESIGN.md §21: a grown entry that no longer fits its leaf splits the
@@ -772,9 +770,7 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 		LionEntryTuple *chain;
 		Size		chainsize;
 
-		chain = lion_entry_rebuild(entry, NULL, 0, &chainsize);
-		chain->ncontainers = ncontainers;
-		chain->ntids = ntids;
+		chain = lion_entry_chain_shape(entry, &chainsize);
 
 		lion_entry_spill(index, heaprel, entrybuf, entryoff, chain, oldpay,
 						paylen);
@@ -898,7 +894,7 @@ lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 	 */
 	lion_wal_op(xstate, p, LION_OP_CONTAINER_ADD, off, lo, NULL, 0);
 
-	entry->ntids += 1;
+	lion_entry_set_ntids(entry, lion_entry_ntids(entry) + 1);
 
 	/* The entry always travels with the container change. */
 	if (!lion_replace_entry(index, xstate, entrybuf, entryoff, entry, entrysize))
@@ -978,7 +974,7 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 	lion_page_update_minmax(p);
 	lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
 
-	entry->ntids += 1;
+	lion_entry_set_ntids(entry, lion_entry_ntids(entry) + 1);
 
 	if (!lion_replace_entry(index, xstate, entrybuf, entryoff, entry, entrysize))
 		elog(ERROR, "lion index: could not update entry %u on block %u",
@@ -1195,7 +1191,7 @@ lion_insert_chain_leaf(Relation index, Relation heaprel, Buffer buf,
 			return true;		/* already indexed */
 	}
 
-	ecopy->ntids += 1;
+	lion_entry_set_ntids(ecopy, lion_entry_ntids(ecopy) + 1);
 
 	lion_chain_put_container_locked_ext(index, heaprel, buf, entrybuf, entryoff,
 									   ecopy, cbuf, &delta, true);
@@ -1265,7 +1261,7 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 					 errmsg("lion index \"%s\": chain entry %u on block %u stores no position tree",
 							RelationGetRelationName(index), entryoff,
 							BufferGetBlockNumber(entrybuf))));
-		(void) lion_postree_put(index, heaprel, entry->hash, x->pos_root, pm);
+		(void) lion_postree_put(index, heaprel, lion_entry_owner(entry), x->pos_root, pm);
 		entry = lion_page_entry_fetch(index, page,
 									  BufferGetBlockNumber(entrybuf), entryoff);
 	}
@@ -1277,7 +1273,8 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 
 	buf = lion_insert_lock_chain_page(index, heaprel,
 									 BufferGetBlockNumber(entrybuf),
-									 ecopy->hash, ecopy->head, ecopy->tail,
+									 lion_entry_owner(ecopy), lion_entry_head(ecopy),
+									 lion_entry_tail(ecopy),
 									 ckey, &ontail);
 
 	if (!lion_insert_chain_leaf(index, heaprel, buf, entrybuf, entryoff, ecopy,
@@ -1287,7 +1284,8 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 
 		Assert(ontail);
 		UnlockReleaseBuffer(buf);
-		buf = lion_posting_search(index, heaprel, ecopy->hash, ecopy->head,
+		buf = lion_posting_search(index, heaprel, lion_entry_owner(ecopy),
+								  lion_entry_head(ecopy),
 								  ckey, BUFFER_LOCK_EXCLUSIVE, true);
 		done = lion_insert_chain_leaf(index, heaprel, buf, entrybuf, entryoff,
 									  ecopy, esize, cbuf, ckey, lo, true);
@@ -1313,12 +1311,12 @@ lion_summary_make_last(LionState *state, Datum key, uint32 hash, uint32 ckey,
 	Size		paylen = lion_put_singleton(payload, ckey, lo);
 	LionEntryTuple *entry;
 
-	entry = lion_make_entry(state, key, hash,
+	entry = lion_make_entry(state, key,
 							LION_ENTRY_INLINE | LION_ENTRY_SUMMARY |
 							LION_ENTRY_SUMLAST,
 							payload, paylen, size);
-	entry->ncontainers = 1;
-	entry->ntids = 1;
+	lion_entry_set_ncontainers(entry, 1);
+	lion_entry_set_ntids(entry, 1);
 	return entry;
 }
 
@@ -1358,8 +1356,8 @@ lion_summary_rekey_insert(Relation index, Relation heaprel, LionState *state,
 											  BufferGetBlockNumber(buf), off);
 	LionEntryTuple *newentry;
 	Size		newsize;
-	Size		newpayoff = MAXALIGN(LION_ENTRY_HDRSZ +
-									 lion_key_datum_size(state, key));
+	Size		newpayoff = lion_entry_payoff_for(e->flags,
+												  lion_key_datum_size(state, key));
 	Size		inline_limit = (Size) state->ix->meta.inline_limit;
 
 	if ((e->flags & LION_ENTRY_INLINE) != 0)
@@ -1390,9 +1388,7 @@ lion_summary_rekey_insert(Relation index, Relation heaprel, LionState *state,
 			LionEntryTuple *chain;
 			Size		chainsize;
 
-			chain = lion_entry_rebuild(e, NULL, 0, &chainsize);
-			chain->ncontainers = e->ncontainers;
-			chain->ntids = e->ntids;
+			chain = lion_entry_chain_shape(e, &chainsize);
 			lion_entry_spill(index, heaprel, buf, off, chain, oldpay, paylen);
 			pfree(chain);
 			pfree(newpay);
@@ -1425,12 +1421,12 @@ lion_summary_rekey_insert(Relation index, Relation heaprel, LionState *state,
 												Max(maxsize, need));
 			}
 
-			shape = lion_make_entry(state, key, hash, e->flags, NULL, 0,
+			shape = lion_make_entry(state, key, e->flags, NULL, 0,
 									&shapesize);
 			newentry = lion_entry_rebuild_slack(shape, newpay, newlen, writesz,
 												&newsize);
-			newentry->ncontainers = (uint32) ((int) e->ncontainers + ndelta);
-			newentry->ntids = e->ntids + added;
+			lion_entry_set_ncontainers(newentry, (uint32) ((int) lion_entry_ncontainers(e) + ndelta));
+			lion_entry_set_ntids(newentry, lion_entry_ntids(e) + added);
 			pfree(shape);
 			pfree(newpay);
 			pfree(oldpay);
@@ -1444,11 +1440,11 @@ lion_summary_rekey_insert(Relation index, Relation heaprel, LionState *state,
 	}
 
 	/* A CHAIN entry: its key, then the row. */
-	newentry = lion_make_entry(state, key, hash, e->flags, NULL, 0, &newsize);
-	newentry->head = e->head;
-	newentry->tail = e->tail;
-	newentry->ncontainers = e->ncontainers;
-	newentry->ntids = e->ntids;
+	newentry = lion_make_entry(state, key, e->flags, NULL, 0, &newsize);
+	lion_entry_set_head(newentry, lion_entry_head(e));
+	lion_entry_set_tail(newentry, lion_entry_tail(e));
+	lion_entry_set_ncontainers(newentry, lion_entry_ncontainers(e));
+	lion_entry_set_ntids(newentry, lion_entry_ntids(e));
 	lion_dir_place(index, heaprel, state->ix, buf, off, true, newentry,
 				   newsize);
 	pfree(newentry);
@@ -1625,7 +1621,7 @@ lion_summary_insert(Relation index, Relation heaprel, LionState *state,
 				else
 					lion_insert_chain(index, heaprel, buf, off, ckey, lo, NULL);
 			}
-			else if (e->ntids >= (uint64) bucket_tids)
+			else if (lion_entry_ntids(e) >= (uint64) bucket_tids)
 				lion_summary_close_last(index, heaprel, state, buf, off, key,
 										hash, ckey, lo);
 			else

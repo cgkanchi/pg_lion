@@ -782,7 +782,7 @@ lion_debug_key_positions(PG_FUNCTION_ARGS)
 
 		if (x == NULL)
 			elog(ERROR, "postree debug: the entry has no positions extension");
-		hash = e->hash;
+		hash = lion_entry_owner(e);
 		if ((e->flags & LION_ENTRY_CHAIN) != 0)
 			root = x->pos_root;
 		else

@@ -643,7 +643,7 @@ lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 				Oid cmptype, StrategyNumber strategy, Oid extractquery,
 				Oid exprcoll, bool positions, AttrNumber *colp)
 {
-	bool		multikey = (kind == LION_CLAUSE_MULTI);
+	bool		multikey = LION_CLAUSE_IS_MULTI(kind);
 	AttrNumber	col = 1;
 	IndexOptInfo *idx = lion_find_roaring_index(rel, attno, multikey, &col);
 	int			i;
@@ -1225,6 +1225,7 @@ lion_or_dnf(Node *node, int *nleaves)
 {
 	BoolExpr   *orform = lion_boolean_not_test(node);
 	Node	   *anyform = lion_multikey_any_as_or(node);
+	List	   *allform;
 	List	   *result;
 	double		total;
 	ListCell   *lc;
@@ -1235,6 +1236,13 @@ lion_or_dnf(Node *node, int *nleaves)
 		node = (Node *) orform;
 	else if (anyform != NULL)
 		node = anyform;
+
+	/*
+	 * `col NOT IN (a, b)` is `col <> a AND col <> b` (lion_all_as_and()): in
+	 * an arm, a complement of the union of their sets (DESIGN.md §35).
+	 */
+	else if ((allform = lion_all_as_and(node)) != NIL)
+		node = (Node *) makeBoolExpr(AND_EXPR, allform, -1);
 
 	if (IsA(node, BoolExpr) && ((BoolExpr *) node)->boolop == OR_EXPR)
 	{
@@ -1732,6 +1740,88 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 			return false;
 		out->kind = LION_CLAUSE_ARRAY;
 		out->collation = saop->inputcollid;
+	}
+	else if (IsA(clause, DistinctExpr))
+	{
+		/*
+		 * `col IS DISTINCT FROM c` (DESIGN.md §35, "Complements in an OR"):
+		 * true of every row but c's, NULLs included - the complement of c's
+		 * entry alone, a negated source as `<>` is, without the NULL entry
+		 * `<>` rejects with it.  Its operator is the equality the row is
+		 * compared with, which the index has to answer as strategy 1, and
+		 * either side may hold the column.  `col IS DISTINCT FROM NULL` is
+		 * `col IS NOT NULL`, and is that clause; a parameter that turns out
+		 * NULL is taken as one by the executor.
+		 */
+		DistinctExpr *de = (DistinctExpr *) clause;
+		Node	   *left;
+		Node	   *right;
+		Oid			opfamily;
+		Oid			lefttype;
+
+		if (!allow_negated || list_length(de->args) != 2)
+			return false;
+		left = lion_strip((Node *) linitial(de->args));
+		right = lion_strip((Node *) lsecond(de->args));
+		if (left == NULL || right == NULL)
+			return false;
+		if (lion_op_roaring_strategy(de->opno, &opfamily,
+									 &lefttype) != LION_STRAT_EQUAL)
+			return false;
+		if (IsA(left, Var) && lion_is_value_expr(right, false))
+		{
+			out->var = (Var *) left;
+			out->val = right;
+		}
+		else if (lion_is_value_expr(left, false) && IsA(right, Var))
+		{
+			out->var = (Var *) right;
+			out->val = left;
+		}
+		else
+			return false;
+
+		if (IsA(out->val, Const) && ((Const *) out->val)->constisnull)
+		{
+			out->kind = LION_CLAUSE_NOTNULL;
+			out->val = (Node *) makeNullConst(out->var->vartype,
+											  out->var->vartypmod,
+											  out->var->varcollid);
+		}
+		else
+		{
+			out->opno = de->opno;
+			out->cmptype = exprType(out->val);
+			out->strategy = LION_STRAT_EQUAL;
+			out->kind = LION_CLAUSE_DISTINCT;
+			out->collation = de->inputcollid;
+		}
+	}
+	else if (IsA(clause, BoolExpr) &&
+			 ((BoolExpr *) clause)->boolop == NOT_EXPR &&
+			 list_length(((BoolExpr *) clause)->args) == 1)
+	{
+		/*
+		 * `NOT (tags @> '{a}')` (DESIGN.md §35, "Complements in an OR"): the
+		 * complement of an exact multi-key query, less the rows whose column
+		 * is NULL, for which the operator - strict, and never NULL of two
+		 * values - is NULL.  The query has to be a literal the posting sets
+		 * answer exactly: the complement of a superset is not the
+		 * complement.  Anything else under a NOT is the ordinary plan's;
+		 * the planner has already folded `NOT (a = 1)` into `a <> 1` and
+		 * `NOT (a IS NULL)` into `a IS NOT NULL`.
+		 */
+		Node	   *arg = (Node *) linitial(((BoolExpr *) clause)->args);
+
+		if (!allow_negated)
+			return false;
+		if (!lion_analyze_leaf(root, arg, rti, false, false, false, out))
+			return false;
+		if (out->kind != LION_CLAUSE_MULTI || out->positions ||
+			out->val == NULL || !IsA(out->val, Const) ||
+			out->costclause != NULL)
+			return false;
+		out->kind = LION_CLAUSE_NOTMULTI;
 	}
 	else if (IsA(clause, NullTest) ||
 			 (IsA(clause, BooleanTest) &&

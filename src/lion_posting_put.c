@@ -141,10 +141,10 @@ lion_chain_put_items_locked_ext(Relation index, Relation heaprel, Buffer buf,
 	LionTreeRef tree;
 
 	Assert((entry->flags & LION_ENTRY_CHAIN) != 0);
-	Assert(BlockNumberIsValid(entry->head) && BlockNumberIsValid(entry->tail));
+	Assert(BlockNumberIsValid(lion_entry_head(entry)) && BlockNumberIsValid(lion_entry_tail(entry)));
 
-	tree.hash = entry->hash;
-	tree.root = entry->head;
+	tree.hash = lion_entry_owner(entry);
+	tree.root = lion_entry_head(entry);
 	tree.kind = 0;
 	tree.entrybuf = entrybuf;
 	tree.entryoff = entryoff;
@@ -338,13 +338,13 @@ lion_chain_put_container(Relation index, Relation heaprel, Buffer entrybuf,
 	Buffer		buf;
 
 	Assert((entry->flags & LION_ENTRY_CHAIN) != 0);
-	Assert(BlockNumberIsValid(entry->head) && BlockNumberIsValid(entry->tail));
+	Assert(BlockNumberIsValid(lion_entry_head(entry)) && BlockNumberIsValid(lion_entry_tail(entry)));
 
 	/*
 	 * A write descent, which takes the leaf EXCLUSIVE straight away and
 	 * repairs any unfinished split on the way (DESIGN.md §22).
 	 */
-	buf = lion_posting_search(index, heaprel, entry->hash, entry->head,
+	buf = lion_posting_search(index, heaprel, lion_entry_owner(entry), lion_entry_head(entry),
 							  c->ckey, BUFFER_LOCK_EXCLUSIVE, true);
 
 	lion_chain_put_container_locked(index, heaprel, buf, entrybuf, entryoff,
@@ -520,18 +520,21 @@ lion_spill_fill_leaf(LionWalState *xstate, Page page, const char *payload,
 static void
 lion_spill_set_chain(LionEntryTuple *entry, BlockNumber root, BlockNumber tail)
 {
-	entry->flags = (entry->flags & (LION_ENTRY_KINDFLAGS | LION_ENTRY_POSITIONS)) |
-		LION_ENTRY_CHAIN;
-	entry->head = root;
-	entry->tail = tail;
+	/* lion_entry_chain_shape() made it, with the CHAIN header form */
+	Assert(entry->flags ==
+		   ((entry->flags & (LION_ENTRY_KINDFLAGS | LION_ENTRY_POSITIONS |
+							 LION_ENTRY_ALIGNKEY)) | LION_ENTRY_CHAIN));
+	lion_entry_set_head(entry, root);
+	lion_entry_set_tail(entry, tail);
 }
 
 /*
  * Move an INLINE entry's payload onto container pages and turn it into a
  * CHAIN entry (see the comment above LION_SPILL_MAX_LEAVES).
  *
- * entry is a private copy of the entry tuple in its CHAIN shape (no payload,
- * with ncontainers and ntids already set by the caller); payload holds the
+ * entry is a private copy of the entry tuple in its CHAIN shape
+ * (lion_entry_chain_shape(): the CHAIN header form, no payload, its
+ * ncontainers and ntids); payload holds the
  * containers to write out, packed as in an INLINE payload.  The entry page is
  * held EXCLUSIVE by the caller (a cleanup lock, when VACUUM calls) and is
  * rewritten here, in the last record.
@@ -611,7 +614,7 @@ lion_spill_flat(Relation index, Relation heaprel, Buffer entrybuf,
 	xstate = lion_wal_begin(index);
 	rootpage = lion_wal_init_buffer(xstate, rootbuf, LION_PAGE_CONTAINER);
 	LionPageGetOpaque(rootpage)->level = 1;
-	lion_page_set_owner(rootpage, entry->hash, root);
+	lion_page_set_owner(rootpage, lion_entry_owner(entry), root);
 	lion_wal_log_special(xstate, rootpage);
 	lion_wal_finish(xstate, LION_XLOG_PAGE_INIT);
 
@@ -640,7 +643,7 @@ lion_spill_flat(Relation index, Relation heaprel, Buffer entrybuf,
 
 		xstate = lion_wal_begin(index);
 		leafpage = lion_wal_init_buffer(xstate, leafbuf, LION_PAGE_CONTAINER);
-		lion_page_set_owner(leafpage, entry->hash, root);
+		lion_page_set_owner(leafpage, lion_entry_owner(entry), root);
 		lion_spill_fill_leaf(xstate, leafpage, payload, off, end, cbuf);
 		if (more)
 			LionPageGetOpaque(leafpage)->rightlink = BufferGetBlockNumber(nextbuf);
@@ -661,12 +664,12 @@ lion_spill_flat(Relation index, Relation heaprel, Buffer entrybuf,
 	lion_spill_set_chain(entry, root, tail);
 	xstate = lion_wal_begin(index);
 	rootpage = lion_wal_init_buffer(xstate, rootbuf, LION_PAGE_CONTAINER);
-	lion_page_set_owner(rootpage, entry->hash, root);
+	lion_page_set_owner(rootpage, lion_entry_owner(entry), root);
 	lion_spill_fill_leaf(xstate, rootpage, payload, 0, end0, cbuf);
 	LionPageGetOpaque(rootpage)->rightlink = second;
 	lion_wal_log_special(xstate, rootpage);
 	if (BufferIsValid(posbuf))
-		lion_spill_posroot(xstate, posbuf, entry->hash, poschunk, entry);
+		lion_spill_posroot(xstate, posbuf, lion_entry_owner(entry), poschunk, entry);
 	lion_put_entry(index, xstate, entrybuf, entryoff, entry);
 	lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
 	UnlockReleaseBuffer(rootbuf);
@@ -752,13 +755,13 @@ lion_entry_spill_pos(Relation index, Relation heaprel, Buffer entrybuf,
 		 */
 		xstate = lion_wal_begin(index);
 		rootpage = lion_wal_init_buffer(xstate, rootbuf, LION_PAGE_CONTAINER);
-		lion_page_set_owner(rootpage, entry->hash, root);
+		lion_page_set_owner(rootpage, lion_entry_owner(entry), root);
 		lion_spill_fill_leaf(xstate, rootpage, payload, 0, paylen, cbuf);
 		lion_wal_log_special(xstate, rootpage);
 
 		lion_spill_set_chain(entry, root, root);
 		if (BufferIsValid(posbuf))
-			lion_spill_posroot(xstate, posbuf, entry->hash, poschunk, entry);
+			lion_spill_posroot(xstate, posbuf, lion_entry_owner(entry), poschunk, entry);
 		lion_put_entry(index, xstate, entrybuf, entryoff, entry);
 		lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
 
@@ -797,7 +800,7 @@ lion_entry_spill_pos(Relation index, Relation heaprel, Buffer entrybuf,
 	xstate = lion_wal_begin(index);
 	rootpage = lion_wal_init_buffer(xstate, rootbuf, LION_PAGE_CONTAINER);
 	LionPageGetOpaque(rootpage)->level = 1;
-	lion_page_set_owner(rootpage, entry->hash, root);
+	lion_page_set_owner(rootpage, lion_entry_owner(entry), root);
 	lion_wal_log_special(xstate, rootpage);
 	lion_wal_finish(xstate, LION_XLOG_PAGE_INIT);
 
@@ -827,7 +830,7 @@ lion_entry_spill_pos(Relation index, Relation heaprel, Buffer entrybuf,
 
 		xstate = lion_wal_begin(index);
 		leafpage = lion_wal_init_buffer(xstate, leafbuf, LION_PAGE_CONTAINER);
-		lion_page_set_owner(leafpage, entry->hash, root);
+		lion_page_set_owner(leafpage, lion_entry_owner(entry), root);
 		lion_spill_fill_leaf(xstate, leafpage, payload, off, end, cbuf);
 		if (more)
 			LionPageGetOpaque(leafpage)->rightlink = BufferGetBlockNumber(nextbuf);
@@ -860,7 +863,7 @@ lion_entry_spill_pos(Relation index, Relation heaprel, Buffer entrybuf,
 	xstate = lion_wal_begin(index);
 	rootpage = lion_wal_init_buffer(xstate, rootbuf, LION_PAGE_CONTAINER);
 	LionPageGetOpaque(rootpage)->level = 1;
-	lion_page_set_owner(rootpage, entry->hash, root);
+	lion_page_set_owner(rootpage, lion_entry_owner(entry), root);
 	for (i = 0; i < nleaves; i++)
 	{
 		OffsetNumber noff = PageAddItemExtended(rootpage, &pivots[i],
@@ -874,7 +877,7 @@ lion_entry_spill_pos(Relation index, Relation heaprel, Buffer entrybuf,
 	}
 	lion_wal_log_special(xstate, rootpage);
 	if (BufferIsValid(posbuf))
-		lion_spill_posroot(xstate, posbuf, entry->hash, poschunk, entry);
+		lion_spill_posroot(xstate, posbuf, lion_entry_owner(entry), poschunk, entry);
 	lion_put_entry(index, xstate, entrybuf, entryoff, entry);
 	lion_wal_finish(xstate, LION_XLOG_ITEM_ADD);
 	UnlockReleaseBuffer(rootbuf);
@@ -1375,13 +1378,13 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 		lion_wal_log_special(xstate, pM);
 
 	/* If P was the tail, the chain has a new last page. */
-	if (tree->entry != NULL && tree->entry->tail == blk)
+	if (tree->entry != NULL && lion_entry_tail(tree->entry) == blk)
 	{
 		BlockNumber newtail = BlockNumberIsValid(nblk) ? nblk : mblk;
 
 		Assert(!BlockNumberIsValid(oldright));
 		if (BlockNumberIsValid(newtail))
-			tree->entry->tail = newtail;
+			lion_entry_set_tail(tree->entry, newtail);
 	}
 
 	/* The entry always travels with the container change. */

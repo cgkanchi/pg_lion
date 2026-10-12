@@ -31,3 +31,5 @@ SELECT lion_hooktest_priv_decode('bare expression column');
 -- the members that grow at plan time, still the path's
 SELECT lion_hooktest_priv_decode('path join at plan');
 SELECT lion_hooktest_priv_decode('path wagg at plan');
+-- a dimension folded into a fact filter whose IN list is the join key's
+SELECT lion_hooktest_priv_decode('join filter on its key');

@@ -775,7 +775,7 @@ lion_range_probe_begin(Relation heap, Snapshot snapshot, int nsources,
 
 	for (i = 0; i < nsources; i++)
 	{
-		if (sources[i].rangewalk != NULL)
+		if (sources[i].rangewalk != NULL || sources[i].compl != NULL)
 			return NULL;
 		if (!sources[i].negated)
 			positive = true;

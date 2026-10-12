@@ -117,6 +117,7 @@ StaticAssertDecl(sizeof(xl_lion_op) == 8, "xl_lion_op must be 8 bytes");
 #define LION_OP_SPARSE_INS	15	/* lion_sparse_insert(off, payload ckey, aux) */
 #define LION_OP_DELTA		16	/* REPLACE at off by aux bytes, as a diff */
 #define LION_OP_NDISTINCT	17	/* payload = LionMetaNdistinct (§33) */
+#define LION_OP_SPLICE		18	/* DELTA with bytes inserted, as a diff */
 
 /*
  * LION_OP_DELTA: the item at `off` becomes `aux` bytes long, and the bytes
@@ -134,6 +135,14 @@ StaticAssertDecl(sizeof(xl_lion_op) == 8, "xl_lion_op must be 8 bytes");
  * two-byte cardinality and the bytes from the insertion point up, which for
  * an ascending TID stream is two more.  A rewrite that changes more than half
  * of the item is logged as a plain LION_OP_REPLACE instead (DESIGN.md §25).
+ *
+ * LION_OP_SPLICE is the same with an insertion: the payload starts with
+ * {uint16 at, uint16 inslen, inslen bytes}, which are inserted into the base
+ * image at byte `at` before it is cut or zero-extended to `aux` bytes, and
+ * the ranges follow.  A member added to an ARRAY in the MIDDLE moves every
+ * member above it up by two bytes, which DELTA can only say by repeating
+ * them; SPLICE says it with the two bytes and the new count.  The encoder
+ * (lion_waldelta.c) works out both and logs the smaller; RANGES wins a tie.
  */
 typedef struct xl_lion_range
 {

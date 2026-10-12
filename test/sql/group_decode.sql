@@ -8,8 +8,9 @@
 -- combinations - one pass over the rows however many combinations there are.
 -- Its rows are partial counts under a Finalize Agg.  Every query below is
 -- checked against a sequential scan with the pushdown off; lgd_check() says
--- whether the walk ran, in how many passes, whether its tally spilled and
--- whether rows went to the heap.
+-- whether the walk ran, in how many passes, whether its tally spilled, whether
+-- a range of the WHERE was collected into a file and whether rows went to the
+-- heap.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -32,6 +33,7 @@ DECLARE
 	decoded boolean := false;
 	passes int := 0;
 	spills int := 0;
+	rspill boolean := false;
 	rechecked bigint := 0;
 	nrows bigint;
 	ndiff bigint;
@@ -48,6 +50,8 @@ BEGIN
 			passes := substring(ln FROM 'Decoded Passes: (\d+)')::int;
 		ELSIF ln ~ 'Tally Spills: ' THEN
 			spills := substring(ln FROM 'Tally Spills: (\d+)')::int;
+		ELSIF ln ~ 'Range Sources Spilled: ' THEN
+			rspill := true;
 		ELSIF ln ~ 'Decoded Rows Rechecked: ' THEN
 			rechecked := substring(ln FROM 'Decoded Rows Rechecked: (\d+)')::bigint;
 		END IF;
@@ -66,10 +70,11 @@ BEGIN
 	DROP TABLE lgd_on;
 	DROP TABLE lgd_off;
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
-	RETURN format('%s, %s pass%s%s%s, %s rows, %s',
+	RETURN format('%s, %s pass%s%s%s%s, %s rows, %s',
 				  CASE WHEN decoded THEN 'decoded' ELSE 'not decoded' END,
 				  passes, CASE WHEN passes = 1 THEN '' ELSE 'es' END,
 				  CASE WHEN spills > 0 THEN ', tally spilled' ELSE '' END,
+				  CASE WHEN rspill THEN ', range spilled' ELSE '' END,
 				  CASE WHEN rechecked > 0 THEN ', rows rechecked in the heap' ELSE '' END,
 				  nrows,
 				  CASE WHEN ndiff = 0 THEN 'same as the sequential scan' ELSE 'DIFFERENT' END);
@@ -96,6 +101,7 @@ SET enable_indexscan = off;
 SET enable_indexonlyscan = off;
 EXPLAIN (COSTS OFF) SELECT a, b, c, count(*) FROM lgd GROUP BY a, b, c;
 EXPLAIN (COSTS OFF) SELECT a, g, f, count(*) FROM lgd GROUP BY a, g, f;
+EXPLAIN (COSTS OFF) SELECT a, b, c, count(*) FROM lgd WHERE d > 50 GROUP BY a, b, c;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
@@ -258,13 +264,55 @@ DELETE FROM lgd WHERE d = 50;
 INSERT INTO lgd SELECT 1, 2, NULL, 3, true, 4, 'new' FROM generate_series(1, 300);
 SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgd GROUP BY a, b, c');
 SELECT lgd_check('SELECT a, b, c, d, count(*) AS n FROM lgd WHERE e GROUP BY a, b, c, d');
+
+-- A range in the WHERE (DESIGN.md §34, "A range in the WHERE"): a source of
+-- the collected copy, on a column outside the grouping or on one of its own -
+-- whose NULL group it leaves out - with another clause, with a second range,
+-- as an OR's leaf, empty, and contradicted; on the heap above, with rows
+-- updated across the range's bounds, deleted and inserted since the VACUUM.
+UPDATE lgd SET d = d + 1 WHERE d BETWEEN 48 AND 52;
+INSERT INTO lgd SELECT 1, NULL, 3, NULL, NULL, NULL, NULL FROM generate_series(1, 50);
+SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgd WHERE d > 50 GROUP BY a, b, c');
+SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgd WHERE d >= 10 AND d <= 20 AND e GROUP BY a, b, c');
+SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgd WHERE c < 10 GROUP BY a, b, c');
+SELECT lgd_check('SELECT a, b, e, count(*) AS n FROM lgd WHERE d > 90 AND g < 3 GROUP BY a, b, e');
+SELECT lgd_check('SELECT a, b, e, count(*) AS n FROM lgd WHERE d < 5 OR g = 1 GROUP BY a, b, e');
+SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgd WHERE f > ''r3'' GROUP BY a, b, c');
+SELECT lgd_check('SELECT c, d, count(*) AS n FROM lgd WHERE g > 2 GROUP BY c, d');
+SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgd WHERE d < 0 GROUP BY a, b, c');
+SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgd WHERE d > 50 AND d < 40 GROUP BY a, b, c');
+SET work_mem = '64kB';
+SELECT lgd_check('SELECT a, b, c, d, count(*) AS n FROM lgd WHERE g >= 1 AND d > 3 GROUP BY a, b, c, d');
+RESET work_mem;
 VACUUM (FREEZE, ANALYZE) lgd;
 SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgd GROUP BY a, b, c');
 
--- Not the decoded walk: a range in the WHERE, a WHERE of a negated clause
--- alone (its copy has no positive clause to begin from), a grouping
--- expression, a column no lion index has, and a partitioned table.
-SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgd WHERE d > 50 GROUP BY a, b, c');
+-- A range too large for the memory, which a count beside no decoded walk
+-- walks at every count instead (DESIGN.md §32), is collected into a file:
+-- 400,000 rows, half of them in the range and spread over every container
+-- key, against 64 kB, on a heap with rows updated, deleted and inserted since
+-- its VACUUM.
+CREATE TABLE lgr (a int, b int, c int, d int);
+INSERT INTO lgr
+SELECT i % 3, (i / 3) % 5, CASE WHEN i % 11 = 0 THEN NULL ELSE i % 7 END,
+	   (i * 37) % 1000
+  FROM generate_series(1, 400000) i;
+CREATE INDEX lgr_l ON lgr USING lion (a, b, c, d);
+VACUUM (FREEZE, ANALYZE) lgr;
+UPDATE lgr SET d = d + 1 WHERE d % 50 = 0;
+DELETE FROM lgr WHERE d % 97 = 0;
+INSERT INTO lgr SELECT 2, NULL, 4, 300 FROM generate_series(1, 100);
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgr WHERE d < 500 GROUP BY a, b, c');
+SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgr WHERE d > 5 AND d < 990 AND b > 0 GROUP BY a, b, c');
+RESET work_mem;
+RESET hash_mem_multiplier;
+DROP TABLE lgr;
+
+-- Not the decoded walk: a WHERE of a negated clause alone (its copy has no
+-- positive clause to begin from), a grouping expression, a column no lion
+-- index has, and a partitioned table.
 SELECT lgd_check('SELECT a, b, d, count(*) AS n FROM lgd WHERE c IS NOT NULL GROUP BY a, b, d');
 SELECT lgd_check('SELECT a, b, c + 1 AS c1, count(*) AS n FROM lgd GROUP BY a, b, c + 1');
 ALTER TABLE lgd ADD COLUMN h int;

@@ -6,7 +6,7 @@ Building, testing and finding your way around the source. Section numbers (§) r
 
 Builds against PostgreSQL 16, 17, 18, 19 and master (20devel); the version differences live in
 `src/lion_compat.h`.  CI (`.github/workflows/ci.yml`) builds and tests every
-one of those majors on each push: the container and sparse unit tests, every SQL regression file in
+one of those majors on each push: the unit tests, every SQL regression file in
 `test/sql` and every isolation spec in `test/isolation` in both WAL modes, and, on the 19 and master
 source builds, the crash-recovery/hot-standby harness in both modes.  One gap is deliberate and worth
 knowing: the isolation specs that park a backend on an injection point (`grep -l injection_points
@@ -22,7 +22,7 @@ and by those specs on the newer majors, not by a test on that major.
     make PG_CONFIG=.local/pg/bin/pg_config && make PG_CONFIG=.local/pg/bin/pg_config install
     eval "$(./dev.sh env)"
     make PG_CONFIG=.local/pg/bin/pg_config installcheck   # regress files + isolation specs
-    make unit PG_CONFIG=.local/pg/bin/pg_config           # container and sparse libraries, no server needed
+    make unit PG_CONFIG=.local/pg/bin/pg_config           # containers, segments, positions, entry layout; no server
 
 No `-march` is needed for speed: on x86-64, GCC and clang builds carry AVX2 and POPCNT versions of
 the container library's passes over whole bitsets, compiled with target attributes, and pick one at
@@ -109,6 +109,7 @@ the suite as they are in production.
                             picked at run time, unit-tested standalone
     src/lion_sparse.[ch]    sparse (container key, offset) segments, unit-tested standalone
     src/lion.h              on-disk structs, the relation state, and the page layer's and the AM's functions
+    src/lion_entryfmt.h     the directory entry tuple's byte layout and accessors, unit-tested standalone
     src/lion_pages.c        index pages: initializing, deleting, recycling; the items of container pages
     src/lion_meta.c         the meta page
     src/lion_state.c        per-relation state: columns, opclass procedures and order; usability checks; keys

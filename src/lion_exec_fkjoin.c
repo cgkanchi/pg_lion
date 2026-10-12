@@ -44,9 +44,17 @@ lion_begin_join_agg(CustomScanState *node, EState *estate, int eflags)
 {
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 	PlanState  *child;
+	ListCell   *lc;
 
 	if (list_length(cscan->custom_plans) != 1)
 		elog(ERROR, "LionJoinAgg: needs exactly one child plan");
+
+	/*
+	 * The query's aggregates that the Agg below computes from counts, as
+	 * ExecInitAgg() would have checked them (lion_join_agg_wrap()).
+	 */
+	foreach(lc, cscan->custom_private)
+		lion_check_aggregate_execute(lfirst_oid(lc));
 	child = ExecInitNode((Plan *) linitial(cscan->custom_plans), estate,
 						 eflags);
 	node->custom_ps = list_make1(child);
@@ -136,6 +144,81 @@ lion_join_locate_where(LionCountScanState *st)
 	lion_join_clock(st, -1, &t);
 	lion_locate_where(st);
 	lion_join_clock(st, LION_JT_LOCATE, &t);
+}
+
+/*
+ * Which dimension folded into a fact filter clause `clauseno` is the keys of
+ * (DESIGN.md §27, "A second dimension that only filters"), or -1.
+ */
+int
+lion_join_filter_of(const LionCountScanState *st, int clauseno)
+{
+	int			f;
+
+	if (st->join == NULL)
+		return -1;
+	for (f = 0; f < st->join->nfilter; f++)
+	{
+		if (st->join->filterclause[f] == clauseno)
+			return f;
+	}
+	return -1;
+}
+
+/*
+ * The values of the fact filters the dimensions that only filter were folded
+ * into (DESIGN.md §27, "A second dimension that only filters"): each one's
+ * child run whole, and the keys of its rows made the array of its IN list, in
+ * the current memory context - the clause values' (lion_eval_clause_values()),
+ * once a run.  A NULL key joins no fact row and is left out.  The keys are
+ * of the type the clause compares them as - a binary-compatible relabel of
+ * the column's, the same Datum - and distinct, the column being unique; the
+ * list's lookup drops a duplicate anyway (lion_locate_array()).
+ *
+ * The child runs under the query's snapshot, as the dimension's child does,
+ * so its rows are the ones the join would have read.  It is a child of the
+ * node's, initialised and ended with it and rescanned with it - and it runs
+ * in the query's memory, as every node does: what a scan allocates the first
+ * time it is asked for a row (its scan descriptor) lives until the node is
+ * ended, past any reset of the values' context.
+ */
+void
+lion_join_filter_values(LionCountScanState *st)
+{
+	LionJoinState *js = st->join;
+	MemoryContext valcxt = CurrentMemoryContext;
+	MemoryContext querycxt = st->css.ss.ps.state->es_query_cxt;
+	int			f;
+
+	for (f = 0; f < js->nfilter; f++)
+	{
+		LionClauseState *cl = &st->clause[js->filterclause[f]];
+		PlanState  *ps = js->filterps[f];
+		ArrayBuildState *astate;
+
+		astate = initArrayResult(cl->valtype, valcxt, false);
+		for (;;)
+		{
+			TupleTableSlot *slot;
+			Datum		key;
+			bool		isnull;
+
+			CHECK_FOR_INTERRUPTS();
+			MemoryContextSwitchTo(querycxt);
+			slot = ExecProcNode(ps);
+			MemoryContextSwitchTo(valcxt);
+			if (TupIsNull(slot))
+				break;
+			key = slot_getattr(slot, js->filtercol[f], &isnull);
+			if (isnull)
+				continue;
+			/* copied into valcxt, a by-reference key too */
+			astate = accumArrayResult(astate, key, false, cl->valtype, valcxt);
+			js->filterkeys++;
+		}
+		cl->val = makeArrayResult(astate, valcxt);
+		cl->valisnull = false;
+	}
 }
 
 /* The child's next row, counted, and timed when the node is. */
@@ -967,7 +1050,7 @@ lion_join_batch_reset(LionCountScanState *st)
 /*
  * Read the next batch: child rows (or distinct keys) until work_mem is full or
  * the child has no more, the rows whose NULL key joins nothing left out but
- * for an anti join, whose rows they are.  Then sort it into the directory's
+ * for an anti join and a LEFT JOIN, whose rows they are.  Then sort it into the directory's
  * order.  False when the child had no row left at all.
  */
 static bool
@@ -1005,7 +1088,7 @@ lion_join_fill_batch(LionCountScanState *st)
 			break;
 		}
 		key = slot_getattr(slot, js->keyresno, &isnull);
-		if (isnull && !anti)
+		if (isnull && !anti && !js->left)
 			continue;
 
 		oldcxt = MemoryContextSwitchTo(js->batch.cxt);
@@ -1159,7 +1242,7 @@ lion_join_next_walked(LionCountScanState *st, int64 *countp)
 		 * found them to select nothing (lion_join_maybe_switch()), no row
 		 * after joins a fact row: only an anti join has rows left.
 		 */
-		if (st->wheremissing && !anti)
+		if (st->wheremissing && !anti && !js->left)
 		{
 			lion_join_batch_reset(st);
 			return false;
@@ -1178,13 +1261,14 @@ lion_join_next_walked(LionCountScanState *st, int64 *countp)
 			/*
 			 * Joins nothing: an anti join's row, which only it batched - or,
 			 * once that copy has been made, any row of it, the rest of the
-			 * batch and the batches after, looked up no more.
+			 * batch and the batches after, looked up no more.  A LEFT JOIN's
+			 * row too, with no fact row.
 			 */
-			if (!anti)
+			if (!anti && !js->left)
 				continue;
 			if (!js->sum)
 				lion_join_batch_row(st, ent);
-			*countp = 1;
+			*countp = anti ? 1 : 0;
 			return true;
 		}
 		js->lookups++;
@@ -1194,7 +1278,7 @@ lion_join_next_walked(LionCountScanState *st, int64 *countp)
 			js->missing++;
 		if (anti)
 			count = 1 - count;	/* no entry, or a test that found nothing */
-		if (count == 0)
+		if (count == 0 && !js->left)
 			continue;
 
 		if (!js->sum)
@@ -1270,7 +1354,7 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
 		 * A copy made part way through that selects nothing ends a semi or
 		 * inner join's run, as walked (lion_join_next_walked()).
 		 */
-		if (st->wheremissing && !anti)
+		if (st->wheremissing && !anti && !js->left)
 		{
 			js->childslot = NULL;
 			return false;
@@ -1290,11 +1374,11 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
 		key = slot_getattr(childslot, js->keyresno, &isnull);
 		if (isnull || st->wheremissing)
 		{
-			/* joins nothing: a row only of an anti join */
-			if (!anti)
+			/* joins nothing: a row only of an anti join, or a LEFT JOIN */
+			if (!anti && !js->left)
 				continue;
 			js->childslot = childslot;
-			*countp = 1;
+			*countp = anti ? 1 : 0;
 			return true;
 		}
 		js->lookups++;
@@ -1313,10 +1397,10 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
 			lion_posting_set_release(&st->groupset);
 			MemoryContextSwitchTo(oldcxt);
 			js->missing++;
-			if (!anti)
+			if (!anti && !js->left)
 				continue;
 			js->childslot = childslot;
-			*countp = 1;
+			*countp = anti ? 1 : 0;
 			return true;
 		}
 
@@ -1330,7 +1414,7 @@ lion_join_next_row(LionCountScanState *st, int64 *countp)
 
 		if (anti)
 			count = 1 - count;
-		if (count == 0)
+		if (count == 0 && !js->left)
 			continue;
 
 		js->childslot = childslot;
@@ -1675,7 +1759,8 @@ lion_join_next_parts(LionCountScanState *st, int64 *countp)
 			 * rows left.  (A leaf partition's empty copy leaves only that
 			 * leaf out, and not past its turn: lion_join_count_parts().)
 			 */
-			if ((st->wheremissing && !anti) || !lion_join_fill_batch(st))
+			if ((st->wheremissing && !anti && !js->left) ||
+				!lion_join_fill_batch(st))
 			{
 				lion_join_batch_reset(st);
 				return false;
@@ -1700,7 +1785,7 @@ lion_join_next_parts(LionCountScanState *st, int64 *countp)
 			count = (ent->acc > 0) ? 1 : 0;
 		else
 			count = ent->acc;
-		if (count == 0)
+		if (count == 0 && !js->left)
 			continue;
 
 		if (!js->sum)
@@ -2428,7 +2513,7 @@ lion_next_join_row(LionCountScanState *st)
 		 * - and makes every one of them a row of an anti join, which the
 		 * loop a row at a time emits without a lookup.
 		 */
-		if (st->wheremissing && !anti)
+		if (st->wheremissing && !anti && !js->left)
 		{
 			st->done = true;
 			return NULL;

@@ -55,7 +55,10 @@ FROM events GROUP BY country, event_type, device`), or of two with more than a f
 is counted in one walk of the index whatever the number of combinations: at each range of 64 heap blocks it reads which value of each column
 every row has, and counts each row under its combination (`Group Strategy: Decoded` in EXPLAIN,
 under a `Finalize HashAggregate`; DESIGN.md §34). On 5M rows it took 77 ms for 1,000 combinations
-and 179 ms for 100,000, where a HashAggregate over the table took 900 ms and 1.9 s.
+and 179 ms for 100,000, where a HashAggregate over the table took 900 ms and 1.9 s. A range in the
+`WHERE` (`... WHERE amount < 500 GROUP BY a, b, c`) is collected with the rest of the filter, into
+a temporary file when it is larger than the memory: a quarter of 5M rows grouped by three columns
+took 153 ms against 361.
 
 `GROUP BY g ORDER BY count(*) DESC LIMIT k` counts only the groups that can be among the first `k`
 (`Top K` in EXPLAIN; DESIGN.md §36): each key's entry records how many rows it holds, which bounds
@@ -73,11 +76,55 @@ node's counts"):
   count of that column: counted as `count(*) ... AND col IS NOT NULL`.
 - `col NOT IN (a, b, ...)` (or `col <> ALL (...)`) of a literal list without NULLs, counted as
   `col <> a AND col <> b ...`.
+- filtered and conditional counts: `count(*) FILTER (WHERE c)`, `count(CASE WHEN c THEN 1 END)`,
+  `sum(CASE WHEN c THEN 1 ELSE 0 END)` and `sum(CASE WHEN c THEN 1 END)`, where `c` is a condition
+  the `WHERE` could have (`SELECT count(*) FILTER (WHERE event_type = 'purchase'), count(*) FROM
+  events WHERE country = 'Japan'`): each condition is one more count of the `WHERE` with `c`
+  added (`Count Filter 1: ...` in EXPLAIN), and each form gives the answer it gives over a table
+  scan, NULL included. With a `GROUP BY` the counts come out as partial rows a `Finalize
+  HashAggregate` adds up. A condition no Lion index answers leaves the whole query to the ordinary
+  plan (DESIGN.md §10, "Filtered counts").
 - window functions over the counts, such as a share of the total, `g, round(100.0 * count(*) /
   sum(count(*)) OVER (), 2) ... GROUP BY g`: the counts are pushed down and the window runs above
   them.
 - `GROUP BY` with no aggregate and `SELECT DISTINCT` of indexed columns over one table (`SELECT
   DISTINCT country FROM events`): the keys that have a visible row, each once.
+- `GROUP BY ROLLUP (...)`, `CUBE (...)` and `GROUPING SETS (...)` of indexed columns over one
+  table, `GROUPING()` included: the node counts the plain `GROUP BY` of every column the sets
+  name, and PostgreSQL's own grouping sets aggregate adds those counts up into each set's
+  groups (`LionJoinAgg` above a `GroupAggregate` in EXPLAIN; DESIGN.md §10, "Grouping sets").
+  The aggregates may be `count(*)`, `count` and `sum` (of `smallint` or `integer`) of grouping
+  columns, `min`, `max`, `bool_and` and `bool_or` of them, and any `DISTINCT` aggregate of them,
+  with `FILTER` clauses over the grouping columns; any other aggregate leaves the query to the
+  ordinary plan. On 5M rows a `ROLLUP` of two columns of 20 and 2 values took 46 ms where the
+  ordinary plan took 885 ms.
+- `count(DISTINCT col)` (or another `DISTINCT` aggregate of indexed columns) beside a `GROUP BY`
+  of two or more columns, `SELECT country, device, count(DISTINCT event_type) ... GROUP BY
+  country, device`: the node counts the `GROUP BY` with `event_type` added, and PostgreSQL's
+  aggregate counts each group's distinct values over those combinations (DESIGN.md §10,
+  "DISTINCT aggregates over a finer grouping"). On 5M rows, two grouping columns of 20 and 2
+  values and a distinct column of 200 took 92 ms where the ordinary plan took 3.3 s.
+
+Clauses that exclude rows are counted by subtracting what they reject: `col <> v`, `col IS NOT
+NULL`, `col IS DISTINCT FROM v` (which, unlike `<>`, keeps the rows where `col` is NULL), and `NOT
+(tags @> '{x}')` or `NOT (doc @@ 'a & b')` of a literal multi-key query (which drops the NULL
+arrays or documents, as the query does). With nothing else in the `WHERE`, the count of every row
+is taken from one of the table's Lion columns (`(all rows)` in EXPLAIN). They may also stand alone
+in an arm of an `OR` - `n <> 17 OR n IS NULL`, `status = 'open' OR region <> 'eu'` - which is
+counted as two counts by De Morgan's rule (DESIGN.md §35, "Complements in an OR"); an arm that
+mixes them with an equality, such as `(a = 1 AND n <> 3) OR ...`, is left to the ordinary plan, as
+is a `NOT` of a query whose index sets only bound its rows (an empty array, a NULL element, a
+phrase). On five million rows `count(*) WHERE n IS DISTINCT FROM 17` took 1.6 ms against 380 for
+the sequential scan.
+
+A `WHERE` clause no Lion index answers - `payload LIKE 'ab%'`, `id > 1000` on a column without
+one, `length(name) = 3` - no longer sends the count to the ordinary plan when the other clauses do
+select rows: the node counts those rows and tests the clause on each of them in the heap
+(`Residual Filter` in EXPLAIN; DESIGN.md §10, "Residual clauses"). It does the work of a bitmap
+heap scan over the same rows, so it is taken when the other clauses select at most half the table,
+and the planner compares its price with the ordinary plan's; a volatile function, a subquery, a
+partitioned table or a join's count keeps the ordinary plan. `pg_lion.enable_count_residual = off`
+turns it off.
 
 An expression index counts as a column of its expression (DESIGN.md §41). With `CREATE INDEX ON
 events USING lion ((payload->>'status'))`, `WHERE payload->>'status' = 'paid'`, `IN`, ranges,
@@ -153,6 +200,14 @@ SELECT count(*) AS customers, sum(LEAST(n, 3)) AS capped FROM n;
 whose equal values are always spelled alike: integers, text under a deterministic collation, or
 uuid, for example, but not numeric, where 1.0 and 1.00 are equal.
 
+A `LEFT JOIN` from the dimension keeps every customer, one with no order counted 0: `SELECT
+cu.country, count(o.id) FROM customers cu LEFT JOIN orders o ON o.customer_id = cu.id AND o.status =
+'open' GROUP BY cu.country` is pushed down as the JOIN is, each customer emitted with its count
+whether or not it has orders (`Join Type: Left` in EXPLAIN; DESIGN.md §27, "The dimension LEFT JOIN
+the fact"). Conditions on the orders go in the `ON` clause; one on the customers goes in `WHERE`.
+`count(*)` counts a customer without orders once, as the join does, and `count(o.col)` counts the
+orders when `o.col` is the foreign key or declared `NOT NULL`.
+
 `count(DISTINCT o.customer_id)` or `count(DISTINCT cu.city)` in place of `count(*)` is pushed down
 too: the node emits the matching customers, and PostgreSQL's own aggregate counts their distinct
 values. So are, in place of `count(*)` or beside it, `min`, `max`,
@@ -194,6 +249,21 @@ whichever the cost model prices lower; and `SELECT count(*) FROM f2 WHERE ... AN
 d.pk FROM dim d WHERE ... AND EXISTS (SELECT 1 FROM f1 WHERE f1.fk = d.pk AND ...))` counts `f2`
 against the dimension rows that pass. The node's child is PostgreSQL's own plan of that join. An
 inner or outer join inside the dimension, which could repeat a row, keeps the ordinary plan.
+
+A second table joined to the fact table only to filter it is folded into a fact filter (DESIGN.md
+§27, "A second dimension that only filters"). In `SELECT cu.country, count(*) FROM orders o JOIN
+customers cu ON o.customer_id = cu.id JOIN products p ON o.product_id = p.id WHERE p.discontinued
+GROUP BY cu.country` nothing of `products` is wanted above the join and its key is unique, so the
+join keeps the orders whose `product_id` is the id of a discontinued product, each once. The node
+runs the plan of `products` itself, as a second child, at the start of each scan, and counts with
+`o.product_id = ANY (<those ids>)` among the fact filters, which needs a Lion index on
+`o.product_id`: EXPLAIN lists it among the `Lion Indexes` as `(product_id = p.id)`, and EXPLAIN
+ANALYZE counts its keys (`Join Filter Keys`). Up to eight such tables are folded, each inner-joined
+to the fact table alone by one equality on a unique key of its own and expected to return no more
+rows than the node locates of one `IN` list at once (`work_mem` of them at 256 bytes each, at least
+1,000). A table whose column is selected or grouped by, that is joined to another table too, or
+that is outer-joined keeps the ordinary plan; with a folded table the node does not run in
+parallel.
 
 The rows of such a semi or anti join themselves - `d` semi-joined to `f1`, where a sort, another
 join, an aggregate the node does not answer, or the node above as its joined dimension needs them -

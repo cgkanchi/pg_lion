@@ -448,11 +448,11 @@ SELECT lion_nq($$SELECT g, count(DISTINCT n) FROM lion_ne WHERE n <> 3 GROUP BY 
  count, 3 rows
 (1 row)
 
--- under an OR `<>` would be a complement in a union: not taken
+-- under an OR `<>` is a complement arm, counted by De Morgan (DESIGN.md §35)
 SELECT lion_nq($$SELECT count(*) FROM lion_ne WHERE k <> 3 OR g = 1$$, 'count');
-     lion_nq      
-------------------
- no count, 1 rows
+    lion_nq    
+---------------
+ count, 1 rows
 (1 row)
 
 SELECT * FROM lion_nplan($$SELECT count(*) FROM lion_ne$$);

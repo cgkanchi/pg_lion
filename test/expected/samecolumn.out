@@ -119,46 +119,47 @@ SELECT entries FROM lion_index_stats('lion_sc_v');
        2
 (1 row)
 
--- ---- a second clause no index answers: declined ------------------------
+-- ---- a second clause no index answers: residual -----------------------
 /*
- * `v = 'A'` is the type's equality, which lion_sc_ops does not have, so
- * nothing can answer it and the query is the ordinary plan's: 5000 rows.  The
- * pushdown used to count the entry of `===` alone - 10000.
+ * `v = 'A'` is the type's equality, which lion_sc_ops does not have, so no
+ * posting set answers it: it is a residual clause (DESIGN.md §10), tested on
+ * the heap row of each row `===` selects, and the count is 5000.  The
+ * pushdown once counted the entry of `===` alone - 10000.
  */
 SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v = 'A'$$);
-         lion_sc         
--------------------------
- not pushed down, 1 rows
+       lion_sc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v = 'A' AND v === 'A'$$);
-         lion_sc         
--------------------------
- not pushed down, 1 rows
+       lion_sc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v = ANY ('{A}')$$);
-         lion_sc         
--------------------------
- not pushed down, 1 rows
+       lion_sc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === ANY ('{A}') AND v = ANY ('{A}')$$);
-         lion_sc         
--------------------------
- not pushed down, 1 rows
+       lion_sc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_sc($$SELECT g, count(*) FROM lion_sc_t WHERE v === 'A' AND v = 'A' GROUP BY g$$);
-         lion_sc         
--------------------------
- not pushed down, 4 rows
+       lion_sc       
+---------------------
+ pushed down, 4 rows
 (1 row)
 
 SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v = 'A' AND g = 1$$);
-         lion_sc         
--------------------------
- not pushed down, 1 rows
+       lion_sc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- the counts themselves, through the same forced plans
@@ -189,18 +190,19 @@ RESET enable_indexscan;
  * collation makes a wrong answer of.  Both collations here are deterministic,
  * so the answer is the same either way; what is checked is that the clause
  * under "C" is not taken for the other one's duplicate, since w's index was
- * built under the column's own collation and cannot answer it.
+ * built under the column's own collation and cannot answer it: it is
+ * residual, tested on the heap rows the other selects.
  */
 SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE w = 'A' AND w COLLATE "C" = 'A'$$);
-         lion_sc         
--------------------------
- not pushed down, 1 rows
+       lion_sc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE w COLLATE "C" = 'A' AND w = 'A'$$);
-         lion_sc         
--------------------------
- not pushed down, 1 rows
+       lion_sc       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- ---- the FK-side join's fact filters are the same clauses (§27) ----------
@@ -231,7 +233,7 @@ PREPARE lion_sc_p(text) AS SELECT count(*) FROM lion_sc_t WHERE v === $1 AND v =
 SELECT lion_sc_pushed($$EXECUTE lion_sc_p('A')$$);
  lion_sc_pushed 
 ----------------
- f
+ t
 (1 row)
 
 EXECUTE lion_sc_p('A');
