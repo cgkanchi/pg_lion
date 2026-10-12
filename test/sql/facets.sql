@@ -263,6 +263,53 @@ RESET ROLE;
 REVOKE ALL ON lfac FROM lfac_user;
 DROP ROLE lfac_user;
 
+/*
+ * Many distinct keys tied at a row each: a top k cannot settle on its
+ * candidates, walks every key and keeps only what the top k needs, the keys
+ * it drops - past twice k, counted as zero, or never counted - freed as it
+ * goes.  Long keys, ties broken by the key, a few keys with two rows, and
+ * deleted rows (no VACUUM) that leave keys with a bound but no row.
+ */
+CREATE TABLE lfac_wide (id int, k text, g int) WITH (autovacuum_enabled = off);
+INSERT INTO lfac_wide
+SELECT i, repeat(md5(i::text), 8) || i, i % 4 FROM generate_series(1, 5000) i;
+INSERT INTO lfac_wide
+SELECT 5000 + i, repeat(md5(i::text), 8) || i, i % 4 FROM generate_series(1, 5000, 1250) i;
+CREATE INDEX lfac_wide_k ON lfac_wide USING lion (k);
+CREATE INDEX lfac_wide_kx ON lfac_wide USING lion ((k || ''));
+CREATE INDEX lfac_wide_g ON lfac_wide USING lion (g);
+VACUUM ANALYZE lfac_wide;
+CREATE FUNCTION lfac_wide_all() RETURNS TABLE (filter text, idx text, k int, result text)
+LANGUAGE plpgsql AS $$
+DECLARE
+	f text;
+	kk int;
+BEGIN
+	FOREACH f IN ARRAY ARRAY['true', 'g = 1', 'g IN (1, 2)'] LOOP
+		FOREACH kk IN ARRAY ARRAY[1, 3, 70, 200]::int[] LOOP
+			filter := f; k := kk;
+			FOREACH idx IN ARRAY ARRAY['lfac_wide_k', 'lfac_wide_kx'] LOOP
+				result := lfac_check(idx, kk, f,
+					format('SELECT k, count(*) AS n FROM lfac_wide WHERE (%s) GROUP BY k', f));
+				RETURN NEXT;
+			END LOOP;
+		END LOOP;
+	END LOOP;
+END $$;
+SELECT count(*) AS checks, count(*) FILTER (WHERE result LIKE 'same%') AS same
+  FROM lfac_wide_all();
+SELECT * FROM lfac_wide_all() WHERE result NOT LIKE 'same%';
+SELECT left(key, 12) AS key, length(key), count FROM lion_index_facets('lfac_wide_k', 6);
+SELECT left(key, 12) AS key, length(key), count FROM lion_index_facets('lfac_wide_k', 3, 'g = 2');
+-- a two-row key with no row left, and a seventh of the rows gone
+DELETE FROM lfac_wide WHERE id IN (1251, 6251) OR id % 7 = 0;
+SELECT count(*) AS checks, count(*) FILTER (WHERE result LIKE 'same%') AS same
+  FROM lfac_wide_all();
+SELECT * FROM lfac_wide_all() WHERE result NOT LIKE 'same%';
+SELECT left(key, 12) AS key, length(key), count FROM lion_index_facets('lfac_wide_kx', 4);
+DROP FUNCTION lfac_wide_all();
+DROP TABLE lfac_wide;
+
 DROP TABLE lfac, lfac_filters;
 DROP FUNCTION lfac_all(text);
 DROP FUNCTION lfac_check(text, int, text, text);
