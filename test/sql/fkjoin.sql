@@ -361,8 +361,11 @@ SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = 
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE f.x % 2 = 1 GROUP BY d.attr');
 -- the dimension key pinned to a constant: no join clause is left at all
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE d.pk = 5 GROUP BY d.attr');
--- three relations
+-- three relations: a third that only filters is folded into an IN list on
+-- the fact (DESIGN.md §27, "A second dimension that only filters", and
+-- fkjoin_star); one whose column is grouped by is not
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk JOIN lion_fd4 e ON e.k = f.x GROUP BY d.attr');
+SELECT lion_fj('SELECT d.attr, e.grp, count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk JOIN lion_fd4 e ON e.k = f.x GROUP BY d.attr, e.grp');
 -- a partitioned fact table is counted partition by partition (DESIGN.md §27,
 -- and fkjoin_partition), but not when a partition has no lion index on fk
 CREATE TABLE lion_ffp (fk int4, x int NOT NULL) PARTITION BY RANGE (x);

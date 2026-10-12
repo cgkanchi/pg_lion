@@ -16,8 +16,8 @@
 -- 7. A NARROW of a width the build does not have, which sizes it.
 -- 8. A directory entry whose key length claims more than its item holds.
 -- 9. An entry whose TID count is less than what VACUUM removes from it.
--- 10. An INLINE entry whose item ends between its key and the aligned start
---     of its payload, where the payload length wrapped around zero.
+-- 10. An INLINE entry whose item ends between its key and the end of its
+--     positions extension, where the payload length wrapped around zero.
 -- 11. An index whose meta page says a format version before this build's.
 --
 -- The pages are damaged on disk, as corrupt.sql does it (pg_buffercache_evict(),
@@ -222,7 +222,7 @@ SELECT lion_di_try($$SELECT lion_index_verify('lion_di_i')$$);
 DROP INDEX lion_di_i;
 -- ---------- 3. a stored key whose header is an INDIRECT TOAST pointer's ----------
 -- The two bytes 01 01 at the key of the entry the first probe of leaf 1
--- compares against.
+-- compares against, right after its 12-byte header.
 CREATE TABLE lion_di_t (t text NOT NULL);
 INSERT INTO lion_di_t SELECT md5((i % 50)::text) FROM generate_series(1, 5000) i;
 CREATE INDEX lion_di_t_i ON lion_di_t USING lion (t);
@@ -232,7 +232,7 @@ SELECT lion_di_evict('lion_di_t_i');
  
 (1 row)
 
-SELECT lion_di_poke('lion_di_t_i', 1, lion_di_item(p, (2 + (n - 1) / 2)::int) + 32, '\x0101'::bytea)
+SELECT lion_di_poke('lion_di_t_i', 1, lion_di_item(p, (2 + (n - 1) / 2)::int) + 12, '\x0101'::bytea)
   FROM lion_di_block('lion_di_t_i', 1) p,
 	   LATERAL (SELECT ((lion_di_u32(p, 12) & 65535) - 24) / 4 AS n) s;
  lion_di_poke 
@@ -547,7 +547,7 @@ SELECT lion_di_try($$SELECT lion_index_verify('lion_di_n_i')$$);
 DROP TABLE lion_di_n;
 -- ---------- 8. a directory entry whose key length runs past its item ----------
 -- The entry the first probe of leaf 1 compares against claims a key of 65535
--- bytes (keylen, bytes 6 and 7 of the entry).  Every comparison and key
+-- bytes (keylen, bytes 2 and 3 of the entry).  Every comparison and key
 -- decode reads keylen bytes after the header, so readers check it against
 -- the item's length before looking (lion_entry_at()).
 CREATE TABLE lion_di_t (t text NOT NULL);
@@ -559,7 +559,7 @@ SELECT lion_di_evict('lion_di_t_i');
  
 (1 row)
 
-SELECT lion_di_poke('lion_di_t_i', 1, lion_di_item(p, (2 + (n - 1) / 2)::int) + 6, '\xffff'::bytea)
+SELECT lion_di_poke('lion_di_t_i', 1, lion_di_item(p, (2 + (n - 1) / 2)::int) + 2, '\xffff'::bytea)
   FROM lion_di_block('lion_di_t_i', 1) p,
 	   LATERAL (SELECT ((lion_di_u32(p, 12) & 65535) - 24) / 4 AS n) s;
  lion_di_poke 
@@ -599,8 +599,9 @@ SELECT lion_di_try($$SELECT lion_index_verify('lion_di_t_i')$$);
 
 DROP TABLE lion_di_t;
 -- ---------- 9. an entry that counts fewer TIDs than VACUUM removes ----------
--- Key 7's CHAIN entry on its leaf says it has one TID (ntids, bytes 24 to 31 of
--- the entry; its key, a by-value int4, is the 8 bytes after the header).
+-- Key 7's CHAIN entry on its leaf says it has one TID (ntids, bytes 16 to 23 of
+-- the entry; its key, a by-value int4, is the 4 bytes after its 28-byte
+-- header).
 -- VACUUM subtracting the hundreds it removes wrapped the count and wrote it
 -- (an assertion only); now it refuses before its record begins.
 CREATE TABLE lion_di_v (k int NOT NULL) WITH (autovacuum_enabled = off);
@@ -613,15 +614,16 @@ SELECT lion_di_evict('lion_di_v_i');
  
 (1 row)
 
--- the entry: the one item of the index with an 8-byte key reading 7
+-- the entry: the one CHAIN item of the index with a 4-byte key reading 7
 SELECT blk AS lion_di_blk, it AS lion_di_at
   FROM generate_series(0, (pg_relation_size('lion_di_v_i') / 8192 - 1)::int) blk,
 	   LATERAL lion_di_block('lion_di_v_i', blk) p,
 	   LATERAL generate_series(1, GREATEST(0, LEAST(200, (((lion_di_u32(p, 12) & 65535) - 24) / 4)::int))) o,
 	   LATERAL (SELECT lion_di_item(p, o) AS it) y
- WHERE it BETWEEN 24 AND 8100 AND get_byte(p, it + 6) = 8
-   AND substring(p FROM it + 33 FOR 8) = '\x0700000000000000'::bytea \gset
-SELECT lion_di_poke('lion_di_v_i', :lion_di_blk, :lion_di_at + 24, '\x0100000000000000'::bytea);
+ WHERE it BETWEEN 24 AND 8100 AND get_byte(p, it) & 2 = 2
+   AND get_byte(p, it + 2) = 4 AND get_byte(p, it + 3) = 0
+   AND substring(p FROM it + 29 FOR 4) = '\x07000000'::bytea \gset
+SELECT lion_di_poke('lion_di_v_i', :lion_di_blk, :lion_di_at + 16, '\x0100000000000000'::bytea);
  lion_di_poke 
 --------------
  
@@ -633,54 +635,50 @@ VACUUM lion_di_v;
 ERROR:  lion index "lion_di_v_i": entry 2 on block 3 counts 1 TIDs in 4 containers, fewer than VACUUM removes (3616 TIDs, 4 containers)
 \set VERBOSITY default
 DROP TABLE lion_di_v;
--- ---------- 10. an entry too short for its aligned payload offset ----------
--- An INLINE entry of a 36-byte text key: 68 bytes of header and key, and its
--- payload at byte 72, after the alignment padding.  Its line pointer is cut
--- to 68: long enough for the header and the key, which is all readers used
--- to check, but the payload length computed from it wrapped around zero, and
--- a scan asked for that many bytes.  Now the entry is refused as corrupt.
-CREATE TABLE lion_di_s (t text NOT NULL);
-INSERT INTO lion_di_s SELECT md5((i % 50)::text) FROM generate_series(1, 5000) i;
-CREATE INDEX lion_di_s_i ON lion_di_s USING lion (t);
+-- ---------- 10. an entry too short for its positions extension ----------
+-- An INLINE entry of an index that stores positions (DESIGN.md §17): its
+-- 12-byte header, its key, the 8-byte positions extension at the next 4-byte
+-- boundary, and then its payload.  Its line pointer is cut to the end of its
+-- key: long enough for the header and the key, which is all a check of the
+-- key length sees, but the extension would be read past the item and the
+-- payload length computed from it wraps around zero.  The entry is refused
+-- as corrupt.
+CREATE TABLE lion_di_s (d tsvector NOT NULL);
+INSERT INTO lion_di_s
+	SELECT to_tsvector('simple', 'k' || lpad((i % 50)::text, 3, '0'))
+	  FROM generate_series(1, 5000) i;
+CREATE INDEX lion_di_s_i ON lion_di_s USING lion (d) WITH (store_positions = true);
 SELECT lion_di_evict('lion_di_s_i');
  lion_di_evict 
 ---------------
  
 (1 row)
 
--- the first INLINE entry of leaf 1, and its key
-SELECT o AS lion_di_off, lion_di_lplen(p, o) AS lion_di_len,
-	   encode(substring(p FROM it + 37 FOR 32), 'escape') AS lion_di_key
-  FROM lion_di_block('lion_di_s_i', 1) p,
-	   LATERAL generate_series(1, (((lion_di_u32(p, 12) & 65535) - 24) / 4)::int) o,
+-- the INLINE entry of the lexeme k007 (INLINE is bit 0 of byte 0, POSITIONS
+-- bit 1 of byte 1, the column bytes 4 and 5), and the end of its key
+SELECT blk AS lion_di_blk, o AS lion_di_off, lion_di_lplen(p, o) AS lion_di_len,
+	   12 + get_byte(p, it + 2) AS lion_di_keyend
+  FROM generate_series(0, (pg_relation_size('lion_di_s_i') / 8192 - 1)::int) blk,
+	   LATERAL lion_di_block('lion_di_s_i', blk) p,
+	   LATERAL generate_series(1, GREATEST(0, LEAST(200, (((lion_di_u32(p, 12) & 65535) - 24) / 4)::int))) o,
 	   LATERAL (SELECT lion_di_item(p, o) AS it) y
- WHERE get_byte(p, it + 4) & 1 = 1 AND get_byte(p, it + 6) = 36
- ORDER BY o LIMIT 1 \gset
-SELECT :lion_di_len > 72 AS payload_after_byte_72, length(:'lion_di_key') AS keylen;
- payload_after_byte_72 | keylen 
------------------------+--------
- t                     |     32
+ WHERE it BETWEEN 24 AND 8100 AND get_byte(p, it) & 1 = 1
+   AND get_byte(p, it + 1) & 2 = 2 AND get_byte(p, it + 3) = 0
+   AND get_byte(p, it + 4) = 1 AND get_byte(p, it + 5) = 0
+   AND position('\x6b303037'::bytea IN substring(p FROM it + 13 FOR get_byte(p, it + 2))) > 0 \gset
+SELECT :lion_di_len >= :lion_di_keyend + 8 AS holds_its_extension;
+ holds_its_extension 
+---------------------
+ t
 (1 row)
 
-SELECT lion_di_set_lplen('lion_di_s_i', 1, :lion_di_off, 68);
+SELECT lion_di_set_lplen('lion_di_s_i', :lion_di_blk, :lion_di_off, :lion_di_keyend);
  lion_di_set_lplen 
 -------------------
  
 (1 row)
 
-SELECT lion_di_try($$SELECT count(*) FROM lion_di_s WHERE t = $$ || quote_literal(:'lion_di_key'));
-                                                 lion_di_try                                                  
---------------------------------------------------------------------------------------------------------------
- XX002: lion index entry of N bytes at page offset N is too small for its header, key and positions extension
-(1 row)
-
-SELECT lion_di_try($$SELECT t, count(*) FROM lion_di_s GROUP BY t ORDER BY t$$);
-                                                 lion_di_try                                                  
---------------------------------------------------------------------------------------------------------------
- XX002: lion index entry of N bytes at page offset N is too small for its header, key and positions extension
-(1 row)
-
-SELECT lion_di_try($$SELECT lion_index_count('lion_di_s_i', $$ || quote_literal(:'lion_di_key') || '::text)');
+SELECT lion_di_try($$SELECT count(*) FROM lion_di_s WHERE d @@ 'k007'$$);
                                                  lion_di_try                                                  
 --------------------------------------------------------------------------------------------------------------
  XX002: lion index entry of N bytes at page offset N is too small for its header, key and positions extension
@@ -694,10 +692,22 @@ SELECT lion_di_try($$SELECT lion_index_verify('lion_di_s_i')$$);
 
 DROP TABLE lion_di_s;
 -- ---------- 11. an index of an older format version ----------
--- An index with its meta page's version (at byte 28) made 8, the format
--- before the varbyte sparse segments of DESIGN.md §13: its segments would be
--- read as the wrong bytes, so lion_index_verify() reports it and a reader
--- refuses it, asking for a REINDEX - which makes it whole again.
+-- An index with its meta page's version (at byte 28) made 9, the format
+-- before the compact entry tuples of DESIGN.md §21, and then 8, the one
+-- before the varbyte sparse segments of §13: its entries or its segments
+-- would be read as the wrong bytes, so lion_index_verify() reports it and a
+-- reader refuses it, asking for a REINDEX - which makes it whole again.
+CREATE FUNCTION lion_di_hint(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	h text;
+BEGIN
+	EXECUTE q;
+	RETURN 'read it';
+EXCEPTION WHEN OTHERS THEN
+	GET STACKED DIAGNOSTICS h = PG_EXCEPTION_HINT;
+	RETURN SQLSTATE || ': ' || h;
+END $$;
 CREATE INDEX lion_di_old_i ON lion_di USING lion (k);
 SELECT lion_di_evict('lion_di_old_i');
  lion_di_evict 
@@ -708,7 +718,31 @@ SELECT lion_di_evict('lion_di_old_i');
 SELECT lion_di_u32(lion_di_block('lion_di_old_i', 0), 28) AS version;
  version 
 ---------
-       9
+      10
+(1 row)
+
+SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(9));
+ lion_di_poke 
+--------------
+ 
+(1 row)
+
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
+                      lion_di_try                       
+--------------------------------------------------------
+ XX002: index "lion_di_old_i" is not a valid lion index
+(1 row)
+
+SELECT lion_di_hint($$SELECT lion_index_count('lion_di_old_i', 1)$$);
+                                 lion_di_hint                                 
+------------------------------------------------------------------------------
+ XX002: REINDEX the index: its on-disk format predates this build of pg_lion.
+(1 row)
+
+SELECT lion_di_evict('lion_di_old_i');
+ lion_di_evict 
+---------------
+ 
 (1 row)
 
 SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(8));
@@ -723,22 +757,17 @@ SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
  XX002: index "lion_di_old_i" is not a valid lion index
 (1 row)
 
-DO $$
-DECLARE
-	h text;
-BEGIN
-	PERFORM lion_index_count('lion_di_old_i', 1);
-	RAISE NOTICE 'read an index of version 8';
-EXCEPTION WHEN OTHERS THEN
-	GET STACKED DIAGNOSTICS h = PG_EXCEPTION_HINT;
-	RAISE NOTICE '%: %', SQLSTATE, h;
-END $$;
-NOTICE:  XX002: REINDEX the index: its on-disk format predates this build of pg_lion.
+SELECT lion_di_hint($$SELECT lion_index_count('lion_di_old_i', 1)$$);
+                                 lion_di_hint                                 
+------------------------------------------------------------------------------
+ XX002: REINDEX the index: its on-disk format predates this build of pg_lion.
+(1 row)
+
 REINDEX INDEX lion_di_old_i;
 SELECT lion_di_u32(lion_di_block('lion_di_old_i', 0), 28) AS version;
  version 
 ---------
-       9
+      10
 (1 row)
 
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
@@ -748,6 +777,7 @@ SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
 (1 row)
 
 DROP INDEX lion_di_old_i;
+DROP FUNCTION lion_di_hint(text);
 -- ---------- an undamaged index still works ----------
 CREATE INDEX lion_di_i ON lion_di USING lion (k);
 SELECT count(*) FROM lion_di WHERE k = 7;

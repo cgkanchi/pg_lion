@@ -109,39 +109,65 @@ lion_inline_fetch(const char *payload, Size paylen, Size *off, LionContainer *bu
 }
 
 /*
+ * The owner stamp of a posting tree's pages (lion.h, DESIGN.md §18).
+ */
+uint32
+lion_owner_stamp(int kind, const char *key, Size keylen)
+{
+	if (kind != LION_KIND_VALUE)
+		return 0;
+	return hash_bytes((const unsigned char *) key, (int) keylen);
+}
+
+/* lion_entry_set_ntids() and lion_entry_set_ncontainers()'s ERROR */
+void
+lion_entry_count_error(const LionEntryTuple *e, const char *what, uint64 n)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_INDEX_CORRUPTED),
+			 errmsg("lion index entry of key column %u cannot hold " UINT64_FORMAT " %s in its %s header",
+					e->attno, n, what,
+					lion_entry_is_chain(e) ? "CHAIN" : "short")));
+}
+
+static void
+lion_entry_too_large(Size total)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+			 errmsg("lion index entry of %zu bytes is too large for a directory leaf",
+					total)));
+}
+
+/*
  * Build an entry tuple in palloc'd memory.
  *
- * The layout is: header, key bytes, MAXALIGN padding, payload.  For INLINE
- * entries the payload is a sequence of containers in ascending ckey order,
- * packed back to back with no padding, so a container inside it is generally
- * unaligned; read them with lion_inline_fetch().  head/tail/ncontainers/ntids
- * are left at their empty values; the caller fills them in.
+ * The layout is lion_entryfmt.h's: the header of the form `flags` selects,
+ * the key - at its type's width for a by-value type, at a double-aligned
+ * offset for a by-reference type that needs one (lion_key_layout_flags(),
+ * which this adds to flags) - then the payload, packed right after it.
+ * For INLINE entries the payload is a sequence of containers in ascending
+ * ckey order, packed back to back with no padding, so a container inside it
+ * is generally unaligned; read them with lion_inline_fetch().  The counts
+ * and links are left at their empty values; the caller fills them in.
  */
 LionEntryTuple *
-lion_make_entry(LionState *state, Datum key, uint32 hash, uint16 flags,
-			   const char *payload, Size payloadlen, Size *size)
+lion_make_entry(LionState *state, Datum key, uint16 flags,
+				const char *payload, Size payloadlen, Size *size)
 {
 	LionEntryTuple *entry;
 	Size		keylen = lion_key_datum_size(state, key);
-	Size		payoff = MAXALIGN((LION_ENTRY_HDRSZ) + keylen);
-	Size		total = payoff + payloadlen;
+	Size		payoff;
+	Size		total;
 
+	flags |= lion_key_layout_flags(state);
+	payoff = lion_entry_payoff_for(flags, keylen);
+	total = payoff + payloadlen;
 	if (total > LION_MAX_ENTRY_SIZE)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("lion index entry of %zu bytes is too large for a directory leaf",
-						total)));
+		lion_entry_too_large(total);
 
 	entry = (LionEntryTuple *) palloc0(total);
-	entry->hash = hash;
-	entry->flags = flags;
-	entry->keylen = (uint16) keylen;
-	entry->head = InvalidBlockNumber;
-	entry->tail = InvalidBlockNumber;
-	entry->ncontainers = 0;
-	entry->attno = state->attno;
-	entry->ntids = 0;
-
+	lion_entry_init(entry, flags, state->attno, (uint16) keylen);
 	lion_store_key(state, key, LionEntryGetKey(entry));
 
 	if (payloadlen > 0)
@@ -169,28 +195,21 @@ lion_make_reserved_entry(AttrNumber attno, uint16 reservedflag, uint16 flags,
 						const char *payload, Size payloadlen, Size *size)
 {
 	LionEntryTuple *entry;
-	Size		payoff = MAXALIGN(LION_ENTRY_HDRSZ);
-	Size		total = payoff + payloadlen;
+	Size		payoff;
+	Size		total;
 
 	Assert(reservedflag == LION_ENTRY_NULLKEY ||
 		   reservedflag == LION_ENTRY_EMPTYKEY);
 	Assert(attno >= 1);
 
+	flags |= reservedflag;
+	payoff = lion_entry_payoff_for(flags, 0);
+	total = payoff + payloadlen;
 	if (total > LION_MAX_ENTRY_SIZE)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("lion index entry of %zu bytes is too large for a directory leaf",
-						total)));
+		lion_entry_too_large(total);
 
 	entry = (LionEntryTuple *) palloc0(total);
-	entry->hash = LION_NULLKEY_HASH;
-	entry->flags = flags | reservedflag;
-	entry->keylen = 0;
-	entry->head = InvalidBlockNumber;
-	entry->tail = InvalidBlockNumber;
-	entry->ncontainers = 0;
-	entry->attno = (uint16) attno;
-	entry->ntids = 0;
+	lion_entry_init(entry, flags, (uint16) attno, 0);
 
 	if (payloadlen > 0)
 	{
@@ -203,13 +222,81 @@ lion_make_reserved_entry(AttrNumber attno, uint16 reservedflag, uint16 flags,
 }
 
 /*
+ * A private copy of entry - an INLINE one, usually on a page - in the shape
+ * of a CHAIN entry: the CHAIN header form (lion_entryfmt.h), the same key,
+ * kind and positions extension (with no inline positions), no payload, and
+ * the counts entry has.  Its head and tail are InvalidBlockNumber until the
+ * spill that it is made for links them (lion_entry_spill()), and so is its
+ * position tree's root.  A CHAIN entry gives an exact copy.
+ */
+LionEntryTuple *
+lion_entry_chain_shape(const LionEntryTuple *entry, Size *size)
+{
+	uint16		flags = (entry->flags & (LION_ENTRY_KINDFLAGS |
+										 LION_ENTRY_POSITIONS |
+										 LION_ENTRY_ALIGNKEY)) |
+		LION_ENTRY_CHAIN;
+	Size		payoff = lion_entry_payoff_for(flags, entry->keylen);
+	LionEntryTuple *copy = (LionEntryTuple *) palloc(payoff);
+
+	Assert(!LionEntryIsPivot(entry));
+	(void) lion_entry_copy_reshaped(copy, entry, flags);
+	lion_entry_set_ntids(copy, lion_entry_ntids(entry));
+	lion_entry_set_ncontainers(copy, lion_entry_ncontainers(entry));
+	if (lion_entry_is_chain(entry))
+	{
+		lion_entry_set_head(copy, lion_entry_head(entry));
+		lion_entry_set_tail(copy, lion_entry_tail(entry));
+	}
+	/* a CHAIN entry keeps its positions in a tree, none inline */
+	if ((flags & LION_ENTRY_POSITIONS) != 0)
+		lion_entry_posext(copy)->pos_len = 0;
+
+	*size = payoff;
+	return copy;
+}
+
+/*
+ * A pivot tuple - a high key or a downlink - carrying src's key and kind.
+ * child is the downlink target, or InvalidBlockNumber for a high key; a NULL
+ * src makes the minus-infinity downlink.  The open summary bucket's entry
+ * gives a pivot of the SUMMARY kind with its key as it is now, never one of
+ * its own kind (lion_pivot_kindflags(), DESIGN.md §32): an append split puts
+ * the new SUMLAST entry alone on the right page, and when that bucket closed
+ * in place a SUMLAST high key left of it sorted above it.  A pivot has the
+ * short header (lion_entryfmt.h), with the child in it, and its key where
+ * src has it relative to the header: double-aligned if src's is.
+ */
+LionEntryTuple *
+lion_make_pivot(const LionEntryTuple *src, uint16 pivotflag, BlockNumber child,
+				Size *size)
+{
+	uint16		flags = pivotflag |
+		((src != NULL) ? lion_pivot_kindflags(src->flags) :
+		 (uint16) LION_ENTRY_MINUSINF);
+	Size		keylen = (src != NULL) ? src->keylen : 0;
+	Size		total = lion_entry_payoff_for(flags, keylen);
+	LionEntryTuple *p = (LionEntryTuple *) palloc0(total);
+
+	Assert((pivotflag & ~LION_ENTRY_PIVOT) == 0 && pivotflag != 0);
+	/* A pivot routes to the column its source key belongs to (§24). */
+	lion_entry_init(p, flags, (src != NULL) ? src->attno : 0, (uint16) keylen);
+	lion_entry_set_head(p, child);
+	if (keylen > 0)
+		memcpy(LionEntryGetKey(p), LionEntryGetKey(src), keylen);
+
+	*size = total;
+	return p;
+}
+
+/*
  * Private copy of an entry tuple with a new payload.
  *
- * The header, the key bytes and their alignment padding are taken from entry
- * (which usually points into a page); payload replaces whatever payload the
- * original had.  A zero-length payload produces the shape of a CHAIN entry.
- * The caller owns the result and fills in flags, head, tail, ncontainers and
- * ntids as needed.
+ * The header, the key bytes and the positions extension are taken from
+ * entry (which usually points into a page), in its own header form; payload
+ * replaces whatever payload the original had.  The caller owns the result
+ * and updates its counts as needed.  An INLINE entry that spills takes
+ * lion_entry_chain_shape() instead, which changes the header form.
  */
 /*
  * These two keep an entry's positions extension as it is, and so cannot
@@ -236,10 +323,7 @@ lion_entry_rebuild(const LionEntryTuple *entry, const char *payload,
 	lion_entry_rebuild_check(entry);
 
 	if (total > LION_MAX_ENTRY_SIZE)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("lion index entry of %zu bytes is too large for a directory leaf",
-						total)));
+		lion_entry_too_large(total);
 
 	copy = (LionEntryTuple *) palloc(total);
 	memcpy(copy, entry, payoff);
@@ -275,10 +359,7 @@ lion_entry_rebuild_slack(const LionEntryTuple *entry, const char *payload,
 	Assert(allocsz >= payoff + payloadlen);
 
 	if (allocsz > LION_MAX_ENTRY_SIZE)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("lion index entry of %zu bytes is too large for a directory leaf",
-						allocsz)));
+		lion_entry_too_large(allocsz);
 
 	copy = (LionEntryTuple *) palloc0(allocsz);
 	memcpy(copy, entry, payoff);
@@ -316,10 +397,7 @@ lion_entry_rebuild_pos(const LionEntryTuple *entry, const char *payload,
 	Assert(payarea >= payloadlen);
 
 	if (total > LION_MAX_ENTRY_SIZE)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("lion index entry of %zu bytes is too large for a directory leaf",
-						total)));
+		lion_entry_too_large(total);
 
 	copy = (LionEntryTuple *) palloc0(total);
 	memcpy(copy, entry, payoff);
@@ -341,18 +419,21 @@ lion_entry_rebuild_pos(const LionEntryTuple *entry, const char *payload,
 LionEntryTuple *
 lion_entry_add_posext(const LionEntryTuple *shape, Size *size)
 {
-	Size		keyend = LionEntryExtOffset(shape);
+	uint16		flags = shape->flags | LION_ENTRY_POSITIONS;
+	Size		payoff = lion_entry_payoff_for(flags, shape->keylen);
 	LionEntryTuple *copy;
-	LionEntryPosExt *x;
 
 	Assert((shape->flags & LION_ENTRY_POSITIONS) == 0);
-	copy = (LionEntryTuple *) palloc0(keyend + LION_ENTRY_POSEXT_SIZE);
-	memcpy(copy, shape, keyend);
-	copy->flags |= LION_ENTRY_POSITIONS;
-	x = lion_entry_posext(copy);
-	x->pos_root = InvalidBlockNumber;
-	x->pos_len = 0;
-	*size = LionEntryPayloadOffset(copy);
+	copy = (LionEntryTuple *) palloc0(payoff);
+	(void) lion_entry_copy_reshaped(copy, shape, flags);
+	lion_entry_set_ntids(copy, lion_entry_ntids(shape));
+	lion_entry_set_ncontainers(copy, lion_entry_ncontainers(shape));
+	if (lion_entry_is_chain(shape))
+	{
+		lion_entry_set_head(copy, lion_entry_head(shape));
+		lion_entry_set_tail(copy, lion_entry_tail(shape));
+	}
+	*size = payoff;
 	return copy;
 }
 

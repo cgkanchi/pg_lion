@@ -2025,14 +2025,20 @@ lion_range_sides(IndexOptInfo *idx, AttrNumber col, List *bounds)
  * correlation interpolates - and each container's entry in the union's hash
  * table.  One that would not fit in a hash table's memory
  * (get_hash_memory_limit(), which the executor shares among the relation's
- * ranges) is walked instead, at every count it is part of - `counts` of them -
- * and an OR's leaf, which cannot be walked, is priced out of the plan.
+ * ranges) is walked instead, at every count it is part of - `counts` of them
+ * (LION_RANGESRC_WALK) - an OR's leaf, which cannot be walked, is priced out
+ * of the plan (LION_RANGESRC_ORLEAF), and a source of the decoded walk's WHERE
+ * (DESIGN.md §34) is collected a window of container keys at a time into a
+ * temporary file (LION_RANGESRC_SPILL): each window a walk of the range, about
+ * two of them for each hash table's memory the union takes
+ * (lion_range_collect()), and the file written once and read once.
  */
 Cost
 lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 					   AttrNumber col, List *bounds, Selectivity sel,
-					   double counts, bool inor)
+					   double counts, int large)
 {
+	double		limit = (double) get_hash_memory_limit();
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		tuples = Max(rel->tuples, 1.0);
 	double		rows = tuples * sel;
@@ -2055,10 +2061,14 @@ lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	c2 = w.corr * w.corr;
 	bytes += (runs * LION_RANGE_RUN_BYTES - bytes) * c2;
 	bytes += (conts + (runs - conts) * c2) * LION_RANGE_UNION_ENTRY_BYTES;
-	if (bytes <= (double) get_hash_memory_limit())
+	if (bytes <= limit)
 		return walk + lion_cost_range_union(heap_pages, tuples, rows, &w);
-	if (inor)
+	if (large == LION_RANGESRC_ORLEAF)
 		return disable_cost;
+	if (large == LION_RANGESRC_SPILL)
+		return walk * 2.0 * ceil(bytes / Max(limit, 1.0)) +
+			lion_cost_range_union(heap_pages, tuples, rows, &w) +
+			2.0 * ceil(bytes / BLCKSZ) * seq_page_cost;
 	return walk * Max(counts, 1.0);
 }
 
@@ -2163,6 +2173,8 @@ typedef struct LionCountRelCost
 	Var		   *rangevar;
 	bool		rangesum;
 	LionRangeCost *rc;
+	int			rangelarge;		/* a range source too large to collect:
+								 * LION_RANGESRC_WALK or _SPILL */
 
 	/* the relation */
 	double		heap_pages;
@@ -2220,6 +2232,8 @@ typedef struct LionCountRelCost
 	double		recheckshare;	/* §26: what the existence tests recheck */
 	double		listrows;		/* rows of one entry of a group-driving list */
 	double		walked;			/* counts the merge runs: groups, pairs */
+	bool		nocollect;		/* ... never: an OR with a complement arm
+								 * makes two counts of each (§35) */
 	bool		whereonce;		/* the WHERE is collected once and the
 								 * groups counted in batches (§10) */
 	double		topk;			/* §36: the candidates counted, or 0 */
@@ -2282,7 +2296,9 @@ lion_count_rel_range_source(LionCountRelCost *c, IndexOptInfo *idx,
 	c->rangesrc_cost += lion_cost_range_source(c->root, c->rel, idx, col,
 											   bounds, sel,
 											   Max(c->ingroups, 1.0),
-											   c->orgrp[c->ci - 1] >= 0);
+											   (c->orgrp[c->ci - 1] >= 0) ?
+											   LION_RANGESRC_ORLEAF :
+											   c->rangelarge);
 	list_free(bounds);
 	sc->nkeys = 1.0;
 	sc->leaves = 1.0;
@@ -2714,7 +2730,7 @@ lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
 		c->recheckshare = share;
 	}
 	if (c->distinct == LION_DISTINCT_NONE && !c->groupdrive &&
-		c->walked >= 2.0 &&
+		c->walked >= 2.0 && !c->nocollect &&
 		lion_cost_where_collected(c->nsrc, c->srcmembers, c->srccontainers,
 								  c->srcunion))
 	{
@@ -3250,18 +3266,21 @@ lion_count_rel_recheck(LionCountRelCost *c)
  * What a LionCount path costs over one relation, phase by phase: the WHERE
  * clauses' lookups and the sources of their AND, the merges that count them,
  * the pages they read, the entry scans and pairs of the GROUP BY, and the
- * heap recheck.
+ * heap recheck.  A range source too large to collect is walked at every count
+ * (lion_cost_count_rel()), or collected into a file (rangelarge
+ * LION_RANGESRC_SPILL, the decoded walk's WHERE).
  */
 static Cost
-lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
-				   IndexOptInfo *groupidx, AttrNumber groupcol,
-				   IndexOptInfo *groupidx2, AttrNumber groupcol2,
-				   List *whereidx, List *wherecol, List *whereclauses,
-				   List *wherekinds,
-				   List *ors, double numgroups,
-				   double outer_entries, double inner_entries, int distinct,
-				   double drivefrac, Var *rangevar, bool rangesum,
-				   LionRangeCost *rc, double topk, double topkrows)
+lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
+						IndexOptInfo *groupidx, AttrNumber groupcol,
+						IndexOptInfo *groupidx2, AttrNumber groupcol2,
+						List *whereidx, List *wherecol, List *whereclauses,
+						List *wherekinds,
+						List *ors, double numgroups,
+						double outer_entries, double inner_entries,
+						int distinct, double drivefrac, Var *rangevar,
+						bool rangesum, LionRangeCost *rc, double topk,
+						double topkrows, bool nocollect, int rangelarge)
 {
 	LionCountRelCost c;
 	bool		sumshort;		/* §15: the IN list is summed, not merged */
@@ -3287,6 +3306,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	c.rangevar = rangevar;
 	c.rangesum = rangesum;
 	c.rc = rc;
+	c.rangelarge = rangelarge;
 	c.heap_pages = Max((double) rel->pages, 1.0);
 	c.dirtyfrac = 1.0 - rel->allvisfrac;
 	c.matching = Max(lion_probe_rel_rows(root, rel), 1.0);
@@ -3296,6 +3316,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	c.ingroups = numgroups;
 	c.recheckshare = 1.0;
 	c.walked = 1.0;
+	c.nocollect = nocollect;
 
 	/*
 	 * The top k (DESIGN.md §36) counts its candidates' sets alone, and
@@ -3360,6 +3381,144 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 	run += c.rangesrc_cost;
 
 	return run;
+}
+
+/*
+ * The count of one relation, priced.  An OR with a complement arm (DESIGN.md
+ * §35, "Complements in an OR") makes every count two: the rows outside M, the
+ * intersection of the complement arms' sets, and the rows inside it that a
+ * positive arm selects (lion_node_count()).  The first is priced as the count
+ * without the OR - a negated clause, which subtracts what the other sources
+ * select and is left out of the estimate like `<>` - and the second as the
+ * count with the OR's positive arms alone, as an OR of them (an upper bound:
+ * the count ANDs M besides).  Each is the whole of a count, so the two are
+ * added up, groups and all, as the executor makes them.  `rangelarge` says
+ * what becomes of a range source too large to collect (LION_RANGESRC_*).
+ */
+static Cost
+lion_cost_count_rel_ext(PlannerInfo *root, RelOptInfo *rel,
+						IndexOptInfo *groupidx, AttrNumber groupcol,
+						IndexOptInfo *groupidx2, AttrNumber groupcol2,
+						List *whereidx, List *wherecol, List *whereclauses,
+						List *wherekinds,
+						List *ors, double numgroups,
+						double outer_entries, double inner_entries,
+						int distinct, double drivefrac, Var *rangevar,
+						bool rangesum, LionRangeCost *rc, double topk,
+						double topkrows, int rangelarge)
+{
+	int			nclause = list_length(whereclauses);
+	bool	   *outside;		/* leaves of a complement OR: variant A */
+	bool	   *arms;			/* its complement arms' leaves: variant B */
+	bool		anycompl = false;
+	bool		anypositive = false;
+	LionCountTarget t;
+	List	   *idx;
+	List	   *col;
+	List	   *clauses;
+	List	   *kinds;
+	List	   *tors;
+	Cost		run;
+	ListCell   *lc;
+
+	outside = (bool *) palloc0(sizeof(bool) * Max(nclause, 1));
+	arms = (bool *) palloc0(sizeof(bool) * Max(nclause, 1));
+	foreach(lc, ors)
+	{
+		List	   *one = (List *) lfirst(lc);
+		int			first = linitial_int(one);
+		int			narms = lsecond_int(one);
+		int			at = first;
+		bool		compl = false;
+		bool		positive = false;
+		int			a;
+		int			j;
+
+		for (a = 0; a < narms; a++)
+		{
+			int			len = list_nth_int(one, 2 + a);
+
+			if (len > 0 && at < nclause &&
+				LION_CLAUSE_IS_NEGATED(list_nth_int(wherekinds, at)))
+			{
+				compl = true;
+				for (j = at; j < at + len && j < nclause; j++)
+					arms[j] = true;
+			}
+			else
+				positive = true;
+			at += len;
+		}
+		if (!compl)
+			continue;
+		anycompl = true;
+		if (positive)
+			anypositive = true;
+		for (j = first; j < at && j < nclause; j++)
+			outside[j] = true;
+	}
+
+	if (!anycompl)
+	{
+		pfree(outside);
+		pfree(arms);
+		return lion_cost_count_rel_one(root, rel, groupidx, groupcol,
+									   groupidx2, groupcol2, whereidx,
+									   wherecol, whereclauses, wherekinds,
+									   ors, numgroups, outer_entries,
+									   inner_entries, distinct, drivefrac,
+									   rangevar, rangesum, rc, topk,
+									   topkrows, false, rangelarge);
+	}
+
+	memset(&t, 0, sizeof(t));
+	t.whereidx = whereidx;
+	t.wherecol = wherecol;
+	t.dropped = outside;
+	t.ndropped = 1;
+	lion_target_lists(&t, whereclauses, wherekinds, ors, &idx, &col,
+					  &clauses, &kinds, &tors, NULL);
+	run = lion_cost_count_rel_one(root, rel, groupidx, groupcol, groupidx2,
+								  groupcol2, idx, col, clauses, kinds, tors,
+								  numgroups, outer_entries, inner_entries,
+								  distinct, drivefrac, rangevar, rangesum, rc,
+								  topk, topkrows, true, rangelarge);
+	if (anypositive)
+	{
+		t.dropped = arms;
+		lion_target_lists(&t, whereclauses, wherekinds, ors, &idx, &col,
+						  &clauses, &kinds, &tors, NULL);
+		run += lion_cost_count_rel_one(root, rel, groupidx, groupcol,
+									   groupidx2, groupcol2, idx, col,
+									   clauses, kinds, tors, numgroups,
+									   outer_entries, inner_entries,
+									   distinct, drivefrac, rangevar,
+									   rangesum, NULL, topk, topkrows, true,
+									   rangelarge);
+	}
+	pfree(outside);
+	pfree(arms);
+	return run;
+}
+
+/* ... a range source too large to collect walked at every count */
+static Cost
+lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
+					IndexOptInfo *groupidx, AttrNumber groupcol,
+					IndexOptInfo *groupidx2, AttrNumber groupcol2,
+					List *whereidx, List *wherecol, List *whereclauses,
+					List *wherekinds,
+					List *ors, double numgroups,
+					double outer_entries, double inner_entries, int distinct,
+					double drivefrac, Var *rangevar, bool rangesum,
+					LionRangeCost *rc, double topk, double topkrows)
+{
+	return lion_cost_count_rel_ext(root, rel, groupidx, groupcol, groupidx2,
+								   groupcol2, whereidx, wherecol, whereclauses,
+								   wherekinds, ors, numgroups, outer_entries,
+								   inner_entries, distinct, drivefrac,
+								   rangevar, rangesum, rc, topk, topkrows,
+								   LION_RANGESRC_WALK);
 }
 
 /*
@@ -3708,12 +3867,15 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	lion_target_lists(t, whereclauses, wherekinds, ors, &tidx, &tcol,
 					  &tclauses, &tkinds, &tors, NULL);
 
-	/* column 0 against the WHERE, as its own grouped count walks it */
-	run = lion_cost_count_rel(root, rel, t->driveidx[0], t->drivecol[0],
-							  NULL, 0, tidx, tcol, tclauses, tkinds, tors,
-							  groupest[0], groupest[0], 0,
-							  LION_DISTINCT_NONE, 1.0, NULL, false, NULL,
-							  0.0, 0.0);
+	/*
+	 * column 0 against the WHERE, as its own grouped count walks it - each
+	 * range of the WHERE collected, past the memory into a file
+	 */
+	run = lion_cost_count_rel_ext(root, rel, t->driveidx[0], t->drivecol[0],
+								  NULL, 0, tidx, tcol, tclauses, tkinds, tors,
+								  groupest[0], groupest[0], 0,
+								  LION_DISTINCT_NONE, 1.0, NULL, false, NULL,
+								  0.0, 0.0, LION_RANGESRC_SPILL);
 	run += lion_cost_recheck(root, rel, tidx, tcol, tclauses, tkinds, tors,
 							 lion_probe_rel_rows(root, rel), groupest[0],
 							 rel->tuples);
@@ -3942,6 +4104,72 @@ lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
 
 	(void) lion_multikey_cost_mode(idx, col, clause, &nkeys);
 	return nkeys;
+}
+
+/*
+ * The rows a count's residual clauses are tested on: those the restriction
+ * selects without them, which is what the node fetches.
+ */
+double
+lion_residual_rows(PlannerInfo *root, RelOptInfo *rel, List *residual)
+{
+	List	   *others = NIL;
+	ListCell   *lc;
+	double		rows;
+
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+		if (!list_member_ptr(residual, rinfo->clause))
+			others = lappend(others, rinfo);
+	}
+	rows = clamp_row_est(Max(rel->tuples, 1.0) *
+						 clauselist_selectivity(root, others, rel->relid,
+												JOIN_INNER, NULL));
+	list_free(others);
+	return rows;
+}
+
+/*
+ * The residual clauses of a count (DESIGN.md §10, "Residual clauses"): every
+ * row the other clauses select is fetched from the heap, whatever the
+ * visibility map says, and the clauses evaluated on it.  That is the work of
+ * a bitmap heap scan over those rows, and it is priced as
+ * cost_bitmap_heap_scan() prices it: the distinct pages index_pages_fetched()
+ * expects the rows to touch, each at a cost between random_page_cost and
+ * seq_page_cost by the share of the relation they are, and per row a tuple's
+ * CPU, the clauses' evaluation and the candidate's own handling - its TID
+ * taken from the set and its HOT chain searched - at cpu_index_tuple_cost,
+ * which is what a sequential scan does not pay.  The rows are
+ * lion_residual_rows().
+ *
+ * Each count fetches its own rows - a group's, a count(DISTINCT) key's - and
+ * the rows of different groups share pages, which every count of them reads
+ * again: `counts` counts of rows/counts rows each.
+ */
+Cost
+lion_cost_residual(PlannerInfo *root, RelOptInfo *rel, List *residual,
+				   double counts)
+{
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		rows = lion_residual_rows(root, rel, residual);
+	double		pages;
+	double		spc_random;
+	double		spc_seq;
+	Cost		perpage;
+	QualCost	qual;
+
+	counts = Min(Max(counts, 1.0), rows);
+	pages = index_pages_fetched(rows / counts, (BlockNumber) heap_pages, 0.0,
+								root);
+	pages = Min(pages, heap_pages);
+	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
+	perpage = spc_random - (spc_random - spc_seq) * sqrt(pages / heap_pages);
+
+	cost_qual_eval(&qual, residual, root);
+	return counts * pages * perpage + qual.startup +
+		rows * (cpu_tuple_cost + cpu_index_tuple_cost + qual.per_tuple);
 }
 
 /*

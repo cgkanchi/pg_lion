@@ -213,8 +213,9 @@ lion_bm25_ntids(Relation index, LionState *col, Datum key)
 	{
 		Page		page = BufferGetPage(buf);
 
-		ntids = lion_page_entry_fetch(index, page, BufferGetBlockNumber(buf),
-									  off)->ntids;
+		ntids = lion_entry_ntids(lion_page_entry_fetch(index, page,
+													   BufferGetBlockNumber(buf),
+													   off));
 	}
 	if (BufferIsValid(buf))
 		UnlockReleaseBuffer(buf);

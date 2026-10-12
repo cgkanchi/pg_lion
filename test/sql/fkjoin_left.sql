@@ -1,0 +1,271 @@
+-- FK-side join pushdown, the dimension LEFT JOIN the fact (DESIGN.md §27,
+-- "The dimension LEFT JOIN the fact").
+--
+-- Every dimension row is a row of the join: with each of its fact rows, or,
+-- with none, once, null-extended.  The node looks each key up as for an inner
+-- join and hands up every dimension row with its count - 0 included - and the
+-- Agg above it counts max(n, 1) rows of the join for a dimension row, n for a
+-- count of a fact column no joined row holds NULL.  Every answer is checked
+-- against the same query with the pushdown off and sequential scans only;
+-- lion_lj() says whether the node answered it.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+
+/*
+ * lion_lj() runs a query through the pushdown with every join method
+ * disabled, so that the node is exercised, and with the pushdown off and
+ * sequential scans only, compares the two as multisets both ways round and
+ * says whether the node answered the first, and as which join.
+ */
+CREATE FUNCTION lion_lj(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Join Type: Left%' THEN
+			how := 'left join';
+		ELSIF ln LIKE '%Custom Scan (LionCount)%' AND how <> 'left join' THEN
+			how := 'inner join';
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lion_lj_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_lj_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_lj_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_lj_on EXCEPT ALL SELECT * FROM lion_lj_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_lj_off EXCEPT ALL SELECT * FROM lion_lj_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_lj_on, lion_lj_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows', how, nrows);
+END $$;
+
+/*
+ * The plan, joins disabled, with the dimension's own plan as one line: that
+ * plan is whatever each major makes of a small scan.
+ */
+CREATE FUNCTION lion_lj_explain(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	seen boolean := false;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF, VERBOSE) ' || q LOOP
+		CONTINUE WHEN ln ~ '^\s*Disabled: true$';
+		IF seen AND ln ~ '^\s*->' THEN
+			RETURN NEXT regexp_replace(ln, '->.*$', '->  (the dimension''s plan)');
+			RETURN;
+		END IF;
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			seen := true;
+		END IF;
+		RETURN NEXT ln;
+	END LOOP;
+END $$;
+
+/* One counter of the node's EXPLAIN ANALYZE output, joins disabled. */
+CREATE FUNCTION lion_lj_counter(q text, counter text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	val bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF btrim(split_part(ln, ':', 1)) = counter THEN
+			val := btrim(split_part(ln, ':', 2))::bigint;
+		END IF;
+	END LOOP;
+	RETURN val;
+END $$;
+
+/*
+ * The dimension: 400 rows over a unique, nullable key - 1..300, which the
+ * fact's fk covers, 100 keys past it with no fact row, and NULL in every 31st
+ * row - with a region, a name and a small int.
+ */
+CREATE TABLE lion_ld (
+	k		int,
+	region	text	NOT NULL,
+	name	text	NOT NULL,
+	small	int
+);
+INSERT INTO lion_ld
+SELECT CASE WHEN i % 31 = 0 THEN NULL ELSE i END,
+	   (ARRAY['eu', 'us', 'ap'])[1 + i % 3], 'n' || (i % 7),
+	   CASE WHEN i % 11 = 0 THEN NULL ELSE i % 5 END
+  FROM generate_series(1, 400) i;
+CREATE UNIQUE INDEX lion_ld_k ON lion_ld (k);
+
+/*
+ * The fact: 30,000 rows, fk over 1..300 in an order unrelated to the key's
+ * and NULL in every 97th row, x a filter of 7, y nullable, id NOT NULL.
+ */
+CREATE TABLE lion_lf (
+	id		int		NOT NULL,
+	fk		int,
+	x		int,
+	y		int
+);
+INSERT INTO lion_lf
+SELECT i, CASE WHEN i % 97 = 0 THEN NULL ELSE 1 + (i * 7919) % 300 END,
+	   i % 7, CASE WHEN i % 5 = 0 THEN NULL ELSE i END
+  FROM generate_series(1, 30000) i;
+CREATE INDEX lion_lf_fk ON lion_lf USING lion (fk);
+CREATE INDEX lion_lf_x ON lion_lf USING lion (x);
+VACUUM (FREEZE, ANALYZE) lion_lf;
+ANALYZE lion_ld;
+
+-- ---- the plans ----
+
+-- every dimension row with its count, and the Agg's counts over them
+SELECT * FROM lion_lj_explain('SELECT d.name, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k GROUP BY d.name');
+SELECT * FROM lion_lj_explain('SELECT d.name, count(*), count(d.k), sum(d.small) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k AND f.x = 3 GROUP BY d.name');
+
+-- ---- the answers, against the pushdown off ----
+
+-- counts of the join's rows, of fact columns no joined row holds NULL, of
+-- dimension columns, and the other aggregates over the dimension's rows
+SELECT lion_lj('SELECT d.name, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k GROUP BY d.name');
+SELECT lion_lj('SELECT d.name, count(*), count(1), count(f.fk), count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k GROUP BY d.name');
+SELECT lion_lj('SELECT d.region, count(d.k), count(d.small), sum(d.small), min(d.small), max(d.name), bool_or(d.small > 3), count(DISTINCT d.name) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k GROUP BY d.region');
+
+-- grouped by the dimension's key: one group per key, and one of the NULL keys
+SELECT lion_lj('SELECT d.k, count(f.id), count(*) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k GROUP BY d.k');
+
+-- no GROUP BY, and a GROUP BY the planner folds to constants
+SELECT lion_lj('SELECT count(*), count(f.id), sum(d.small) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k');
+SELECT lion_lj('SELECT d.name, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k WHERE d.name = ''n3'' GROUP BY d.name');
+SELECT lion_lj('SELECT d.name, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k WHERE d.name = ''nowhere'' GROUP BY d.name');
+SELECT lion_lj('SELECT count(*), count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k WHERE d.name = ''nowhere''');
+
+-- fact filters in the ON clause: the count is of the matching fact rows, and
+-- a dimension row with none is still a row
+SELECT lion_lj('SELECT d.name, count(f.id), count(*) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k AND f.x = 3 GROUP BY d.name');
+SELECT lion_lj('SELECT d.region, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k AND f.x IN (1, 4) GROUP BY d.region');
+SELECT lion_lj('SELECT d.k, count(f.fk) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k AND f.x = (SELECT 99) GROUP BY d.k');
+SELECT lion_lj('SELECT d.name, count(f.id) FROM lion_ld d LEFT JOIN (SELECT * FROM lion_lf WHERE x = 2) f ON f.fk = d.k GROUP BY d.name');
+
+-- dimension filters in the WHERE clause, and keys past the fact's range
+SELECT lion_lj('SELECT d.name, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k WHERE d.region = ''eu'' GROUP BY d.name');
+SELECT lion_lj('SELECT d.k, count(f.id), count(*) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k WHERE d.k > 290 OR d.k IS NULL GROUP BY d.k');
+
+-- HAVING over the counts, and ORDER BY and LIMIT above them
+SELECT lion_lj('SELECT d.k, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k GROUP BY d.k HAVING count(f.id) = 0');
+SELECT lion_lj('SELECT d.name, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k AND f.x = 5 GROUP BY d.name ORDER BY count(f.id) DESC, d.name LIMIT 3');
+
+-- the RIGHT JOIN spelling is the same join
+SELECT lion_lj('SELECT d.name, count(f.id) FROM lion_lf f RIGHT JOIN lion_ld d ON f.fk = d.k GROUP BY d.name');
+
+-- ---- declined: what the join's rows are not made of ----
+
+-- a condition of the ON clause on the dimension, which decides what is
+-- null-extended
+SELECT lion_lj('SELECT d.name, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k AND d.region = ''eu'' GROUP BY d.name');
+-- a WHERE condition on the fact that is not strict, over the null-extended rows
+SELECT lion_lj('SELECT d.name, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k WHERE f.y IS NULL GROUP BY d.name');
+SELECT lion_lj('SELECT d.name, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k WHERE coalesce(f.x, 0) = 0 GROUP BY d.name');
+-- a nullable fact column counted, a DISTINCT of the fact's key, a fact column
+-- grouped by or summed
+SELECT lion_lj('SELECT d.name, count(f.y) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k GROUP BY d.name');
+SELECT lion_lj('SELECT d.name, count(DISTINCT f.fk) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k GROUP BY d.name');
+SELECT lion_lj('SELECT f.fk, count(*) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k GROUP BY f.fk');
+SELECT lion_lj('SELECT d.name, sum(f.x) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k GROUP BY d.name');
+-- the fact the outer side, and a FULL JOIN: fact rows with no dimension row
+SELECT lion_lj('SELECT d.name, count(*) FROM lion_lf f LEFT JOIN lion_ld d ON f.fk = d.k GROUP BY d.name');
+SELECT lion_lj('SELECT d.name, count(*) FROM lion_ld d FULL JOIN lion_lf f ON f.fk = d.k GROUP BY d.name');
+-- a key pinned to a constant: core joins the two on no clause at all
+SELECT lion_lj('SELECT d.k, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k WHERE d.k = 17 GROUP BY d.k');
+
+-- a WHERE condition on the fact that is strict makes it an inner join, whose
+-- count of a NOT NULL fact column is a count of its pairs
+SELECT lion_lj('SELECT d.name, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k WHERE f.x = 3 GROUP BY d.name');
+SELECT * FROM lion_lj_explain('SELECT d.name, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k WHERE f.x = 3 GROUP BY d.name');
+SELECT lion_lj('SELECT d.name, count(f.id), max(d.small) FROM lion_ld d JOIN lion_lf f ON f.fk = d.k GROUP BY d.name');
+
+-- ---- the counters ----
+
+-- every dimension row with a key is looked up; the 100 past the fact's range
+-- have no entry
+SELECT lion_lj_counter('SELECT d.name, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k GROUP BY d.name', 'Join Keys Looked Up');
+SELECT lion_lj_counter('SELECT d.name, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k GROUP BY d.name', 'Join Keys Without Entry');
+
+-- batches at a small work_mem, and a key at a time
+SET work_mem = '64kB';
+SELECT lion_lj('SELECT d.name, count(f.id), count(*) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k AND f.x = 1 GROUP BY d.name');
+RESET work_mem;
+
+-- a correlated subquery that rescans the node with a new dimension filter
+SELECT lion_lj('SELECT r.region, (SELECT sum(c) FROM (SELECT d.name, count(f.id) AS c FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k WHERE d.region = r.region GROUP BY d.name) s) FROM (VALUES (''eu''), (''us''), (''nowhere'')) r(region)');
+
+-- in parallel: each participant's share of the dimension rows, each with its
+-- count
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SELECT lion_lj('SELECT d.name, count(f.id), count(*) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k AND f.x = 6 GROUP BY d.name');
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+
+-- a partitioned fact: every key looked up in every leaf, a key with no fact
+-- row in any of them still a row
+CREATE TABLE lion_lp (id int NOT NULL, fk int, x int) PARTITION BY RANGE (id);
+CREATE TABLE lion_lp1 PARTITION OF lion_lp FOR VALUES FROM (MINVALUE) TO (10000);
+CREATE TABLE lion_lp2 PARTITION OF lion_lp FOR VALUES FROM (10000) TO (MAXVALUE);
+INSERT INTO lion_lp SELECT id, fk, x FROM lion_lf;
+CREATE INDEX lion_lp_fk ON lion_lp USING lion (fk);
+CREATE INDEX lion_lp_x ON lion_lp USING lion (x);
+VACUUM (FREEZE, ANALYZE) lion_lp;
+SELECT lion_lj('SELECT d.name, count(f.id), count(*) FROM lion_ld d LEFT JOIN lion_lp f ON f.fk = d.k GROUP BY d.name');
+SELECT lion_lj('SELECT d.k, count(f.id) FROM lion_ld d LEFT JOIN lion_lp f ON f.fk = d.k AND f.x = 3 GROUP BY d.k');
+
+-- a dirty heap: deletes and updates on both sides, before and after VACUUM
+DELETE FROM lion_lf WHERE id % 11 = 0;
+UPDATE lion_lf SET x = (x + 1) % 7 WHERE id % 13 = 0;
+UPDATE lion_lf SET fk = 1 + (fk * 3) % 300 WHERE id % 17 = 0;
+DELETE FROM lion_lf WHERE fk = 42;
+DELETE FROM lion_ld WHERE k % 19 = 0;
+UPDATE lion_ld SET name = 'n9' WHERE k % 23 = 0;
+SELECT lion_lj('SELECT d.name, count(f.id), count(*) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k GROUP BY d.name');
+SELECT lion_lj('SELECT d.k, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k AND f.x = 3 GROUP BY d.k');
+VACUUM lion_lf;
+SELECT lion_lj('SELECT d.name, count(f.id), count(*) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k GROUP BY d.name');
+SELECT lion_lj('SELECT d.k, count(f.id) FROM lion_ld d LEFT JOIN lion_lf f ON f.fk = d.k AND f.x = 3 GROUP BY d.k');
+
+DROP TABLE lion_lf, lion_ld, lion_lp;
+DROP FUNCTION lion_lj(text), lion_lj_explain(text), lion_lj_counter(text, text);

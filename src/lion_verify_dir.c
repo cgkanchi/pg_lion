@@ -155,10 +155,10 @@ lion_verify_run_add(LionVerifyState *vs, LionVerifyRun *run,
 		}
 	}
 	{
-		Size		sz = MAXALIGN(LION_ENTRY_HDRSZ + item->keylen);
-		LionEntryTuple *c = (LionEntryTuple *) palloc(sz);
+		Size		len = LionEntryKeyOffset(item) + item->keylen;
+		LionEntryTuple *c = (LionEntryTuple *) palloc(MAXALIGN(len));
 
-		memcpy(c, item, LION_ENTRY_HDRSZ + item->keylen);
+		memcpy(c, item, len);
 		run->items[run->n] = c;
 		run->blocks[run->n] = blk;
 		run->n++;
@@ -428,7 +428,7 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 			else
 			{
 				if (children != NULL)
-					lion_verify_level_add(children, item->head,
+					lion_verify_level_add(children, lion_entry_head(item),
 										  lion_verify_copy_item(page, off),
 										  NULL, false);
 			}
@@ -600,7 +600,7 @@ lion_verify_directory(LionVerifyState *vs)
 					lion_corrupt("lion index \"%s\": the leftmost downlink of page %u is not minus infinity",
 								RelationGetRelationName(vs->index), blk);
 				/* checked against the index's length when it is read */
-				blk = down->head;
+				blk = lion_entry_head(down);
 			}
 			UnlockReleaseBuffer(buf);
 		}
@@ -719,10 +719,10 @@ lion_verify_meta(LionVerifyState *vs)
 	page = lion_verify_read_page(vs, LION_METAPAGE_BLKNO, LION_PAGE_META, &buf);
 	meta = LionPageGetMeta(page);
 
-	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION_V9)
+	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION_V10)
 		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u",
 					RelationGetRelationName(vs->index), meta->magic,
-					meta->version, LION_MAGIC, LION_VERSION_V9);
+					meta->version, LION_MAGIC, LION_VERSION_V10);
 	if (meta->summary_cols != 0 &&
 		(meta->summary_tids < LION_MIN_SUMMARY_TIDS ||
 		 meta->summary_tids > LION_MAX_SUMMARY_TIDS))

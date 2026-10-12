@@ -212,6 +212,35 @@
 #define LION_TL_IS_WKEY(kind)		((kind) >= 0x20000000 && (kind) < 0x30000000)
 #define LION_TL_WKEY_COL(kind)		((kind) - 0x20000000)
 
+/*
+ * A filtered count (DESIGN.md §10, "Filtered counts"): LION_TL_FCOUNT(f, form)
+ * is the count of the rows the WHERE and filter f select together, 1 <= f <=
+ * the plan's filters, reported as `form` reports it.  Far above any other
+ * kind, as the two above are.
+ */
+#define LION_TL_FCOUNT(f, form)		(0x30000000 + (f) * 4 + (form))
+#define LION_TL_IS_FCOUNT(kind)		((kind) >= 0x30000000 && (kind) < 0x40000000)
+#define LION_TL_FCOUNT_FILTER(kind)	(((kind) - 0x30000000) / 4)
+#define LION_TL_FCOUNT_FORM(kind)	(((kind) - 0x30000000) % 4)
+
+/* ... and how it reports the count */
+#define LION_FCOUNT_COUNT	0	/* count(*) FILTER (WHERE c), count(CASE WHEN c
+								 * THEN 1 END): the count, 0 for none */
+#define LION_FCOUNT_SUM		1	/* sum(CASE WHEN c THEN 1 ELSE 0 END): the
+								 * count, NULL over no row at all */
+#define LION_FCOUNT_SUMNULL	2	/* sum(CASE WHEN c THEN 1 END): the count, NULL
+								 * when it is 0 */
+
+/*
+ * A heap column a residual clause reads (DESIGN.md §10, "Residual clauses"):
+ * LION_TL_RESID(attno) is column attno of the relation counted, which the
+ * node fills from the heap row it tests and no row it emits prints.  Above
+ * the filtered counts' range, so that neither encoding reaches the other.
+ */
+#define LION_TL_RESID(attno)		(0x40000000 + (attno))
+#define LION_TL_IS_RESID(kind)		((kind) > 0x40000000 && (kind) < 0x40010000)
+#define LION_TL_RESID_ATTNO(kind)	((AttrNumber) ((kind) - 0x40000000))
+
 /* ... and what each one computes */
 #define LION_WAGG_NONE		0
 #define LION_WAGG_SUM		1	/* sum(int2), sum(int4): an int8 */
@@ -239,6 +268,12 @@
 #define LION_JOIN_INNER		0
 #define LION_JOIN_SEMI		1
 #define LION_JOIN_ANTI		2
+
+/*
+ * The dimensions an FK-side join folds into fact filters, at most (DESIGN.md
+ * §27, "A second dimension that only filters").
+ */
+#define LION_MAX_JOIN_FILTERS	8
 
 /* Flag bits of the join member of custom_private (LION_PRIV_JOIN). */
 #define LION_JOINFLAG_COLLECT	0x01	/* the fact filters are collected once */
@@ -283,6 +318,12 @@
 										 * each group counted against the
 										 * union ("Grouped by a fact column,
 										 * the keys united") */
+#define LION_JOINFLAG_LEFT		0x200	/* with ROWS and COUNTS, the dimension
+										 * LEFT JOIN the fact: every child
+										 * row goes up, a NULL key, a key
+										 * without an entry and a count of 0
+										 * included, its count 0 then ("The
+										 * dimension LEFT JOIN the fact") */
 
 /*
  * Where an FK-side join's time goes (DESIGN.md §27, "Where a key's time
@@ -560,6 +601,8 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_CLAUSE_RANGESRC	6	/* the same on a column that does not drive
 									 * the count: a source, DESIGN.md §32 */
 #define LION_CLAUSE_NE		7	/* col <> const, DESIGN.md §35 */
+#define LION_CLAUSE_DISTINCT	8	/* col IS DISTINCT FROM const, §35 */
+#define LION_CLAUSE_NOTMULTI	9	/* NOT (col @> / && / @@ const), §35 */
 
 /*
  * A RANGE clause is neither: it is not a source of the count at all, but a
@@ -570,11 +613,30 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  */
 #define LION_CLAUSE_IS_POSITIVE(k) \
 	((k) != LION_CLAUSE_NOTNULL && (k) != LION_CLAUSE_RANGE && \
-	 (k) != LION_CLAUSE_NE)
+	 !LION_CLAUSE_IS_NEGATED(k))
 
-/* ... and which are subtracted: a negated source (DESIGN.md §14, §35) */
+/*
+ * ... and which are subtracted: a negated source (DESIGN.md §14, §35).  Each
+ * is the complement of the sets it locates, which lion_locate_leaf() returns
+ * as they are: `IS NOT NULL` the NULL entry's, `<>` c's entry and the NULL
+ * one, `IS DISTINCT FROM c` c's entry alone (the NULL entry for a NULL c),
+ * and `NOT (multi-key query)` the query's exact sets and the NULL entry.  As
+ * a leaf of an OR such a clause is a complement arm's (§35, "Complements in
+ * an OR").
+ */
 #define LION_CLAUSE_IS_NEGATED(k) \
-	((k) == LION_CLAUSE_NOTNULL || (k) == LION_CLAUSE_NE)
+	((k) == LION_CLAUSE_NOTNULL || (k) == LION_CLAUSE_NE || \
+	 (k) == LION_CLAUSE_DISTINCT || (k) == LION_CLAUSE_NOTMULTI)
+
+/*
+ * The ORs with a complement arm one query may have (DESIGN.md §35,
+ * "Complements in an OR"): each turns every count into two.
+ */
+#define LION_MAX_COMPL_ORS	3
+
+/* Is the clause answered by a multi-key column (DESIGN.md §17)? */
+#define LION_CLAUSE_IS_MULTI(k) \
+	((k) == LION_CLAUSE_MULTI || (k) == LION_CLAUSE_NOTMULTI)
 
 /*
  * Which clause kinds pin their column to ONE value, so that a target list
@@ -933,6 +995,11 @@ typedef struct LionVColScope
 #define LION_FLAG_DECODE			0x10	/* the GROUP BY columns are counted by
 										 * the decoded walk (DESIGN.md §34),
 										 * named in LION_PRIV_GROUPN */
+#define LION_FLAG_RESID			0x20	/* WHERE clauses no posting set
+										 * answers, tested on each row's heap
+										 * tuple (DESIGN.md §10, "Residual
+										 * clauses"), in custom_exprs after
+										 * the aggregates' arguments */
 
 /*
  * What the planner decided, in a form the executor can be handed through
@@ -1007,7 +1074,12 @@ typedef struct LionVColScope
  *		otherwise), and, added at plan time once the child plan exists, the
  *		position of that column in the child's target list.  The join key
  *		clause is not a source: the node looks it up once per child row (per
- *		distinct key), in source slot 0
+ *		distinct key), in source slot 0.  Then the dimensions folded into fact
+ *		filters (DESIGN.md §27, "A second dimension that only filters"), each
+ *		the number of its clause - an IN list on the fact's fk, whose values
+ *		are the keys of a child plan's rows - and the key's column: its attnum
+ *		in its table in the path's list, its position in that child's target
+ *		list in the plan's.  Filter i's child is custom_plans' i + 1
  *	11	List of three OidLists: the functions whose evaluation the node
  *		replaces, for the EXECUTE checks the executor would have made on the
  *		plan it stands for (DESIGN.md §9, "Privileges"; checked at executor
@@ -1063,7 +1135,21 @@ typedef struct LionVColScope
  *		expression of a lion index's key column as the scan's relation
  *		numbers its Vars; an attnum of LION_VCOL_ATTNO(i) anywhere above names
  *		the i'th.  Empty when no attnum does
- *	20	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	20	List, or empty: the filtered counts (DESIGN.md §10, "Filtered
+ *		counts"): an IntList of the number of filters and then each clause's
+ *		filter - 0 for a WHERE clause, f for a clause of filter f, the WHERE's
+ *		clauses first and each filter's together after them - and, in the
+ *		PATH's list only, a List of each filter's expression, by which
+ *		lion_plan_custom_path() numbers the target list's filtered counts
+ *	21	List of Expr, or empty: the WHERE clauses no posting set answers,
+ *		as an implicit-AND list, which the node tests on the heap tuple of
+ *		every row the others select (DESIGN.md §10, "Residual clauses";
+ *		LION_FLAG_RESID).  The PATH carries them here;
+ *		lion_plan_custom_path() appends them to custom_exprs after the
+ *		aggregates' arguments - where setrefs.c points their columns at
+ *		LION_TL_RESID columns of custom_scan_tlist and SS_finalize_plan()
+ *		sees their Params - and leaves this member empty
+ *	22	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -1086,7 +1172,9 @@ typedef struct LionVColScope
 #define LION_PRIV_TOPK		17
 #define LION_PRIV_WAGG		18
 #define LION_PRIV_VCOLS		19
-#define LION_PRIV_TLKINDS	20
+#define LION_PRIV_FILTERS	20
+#define LION_PRIV_RESID		21
+#define LION_PRIV_TLKINDS	22
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -1162,6 +1250,27 @@ typedef struct LionVColScope
  * expression columns (DESIGN.md §41), whose attnums an older build would have
  * looked up as heap columns.
  *
+ * Shape 23 moved no member but added two clause kinds, `IS DISTINCT FROM`
+ * and `NOT (multi-key query)`, and negated leaves in the arms of an OR
+ * (member 7): complements, counted by De Morgan (DESIGN.md §35, "Complements
+ * in an OR"), which an older build would have taken for selections.
+ *
+ * Shape 24 added the FILTERS member (20) in front of the target-list kinds,
+ * and the target-list kinds of filtered counts (DESIGN.md §10, "Filtered
+ * counts"): clauses an older build would have ANDed into the WHERE.
+ *
+ * Shape 25 added the RESID member (21) in front of the target-list kinds,
+ * the LION_FLAG_RESID bit and the LION_TL_RESID columns: residual clauses
+ * tested on the heap (DESIGN.md §10, "Residual clauses"), which an older
+ * build would have counted without.
+ *
+ * Shape 26 moved no member but gave the JOIN member (10) the dimensions
+ * folded into fact filters after the child's column (DESIGN.md §27, "A
+ * second dimension that only filters"), whose clauses an older build would
+ * have evaluated as the NULL placeholders they carry, and counted nothing;
+ * and the LION_JOINFLAG_LEFT flag ("The dimension LEFT JOIN the fact"), whose
+ * rows of count 0 an older build would have dropped.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1174,8 +1283,8 @@ typedef struct LionVColScope
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x52424916
-#define LION_PRIV_NMEMBERS	21
+#define LION_PRIV_MAGIC		0x5242491a
+#define LION_PRIV_NMEMBERS	23
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -1257,6 +1366,16 @@ typedef struct LionOrState
 	int			nleaves;
 	int			narms;
 	int		   *armlen;
+
+	/*
+	 * Which arms are COMPLEMENTS (DESIGN.md §35, "Complements in an OR"):
+	 * their leaves are negated clauses, and the arm is true of every row
+	 * outside the union of the sets they locate.  Derived from the leaves'
+	 * kinds when the node begins; NULL until then, and compl says whether
+	 * any arm is one.
+	 */
+	bool	   *armcompl;
+	bool		compl;
 } LionOrState;
 
 /*
@@ -1852,6 +1971,13 @@ typedef struct LionJoinWorkerSums
  * (LION_JT_*).  The count's own counters are in the scan's stats
  * (LionCountStats: key_containers, copy_containers, ...).
  *
+ * The dimensions folded into fact filters (DESIGN.md §27, "A second
+ * dimension that only filters"): nfilter of them, each an IN list, clause
+ * filterclause[i], whose values are column filtercol[i] of the rows of child
+ * filterps[i] - run whole at the start of each run, its NULL keys left out
+ * (lion_join_filter_values()); filterkeys counts the keys, for EXPLAIN
+ * ANALYZE.
+ *
  * A partitioned fact table's turns (part), the parallel plan's shared copy of
  * the fact filters (pcopy) and the workers' sums of these counters (worker)
  * are groups of their own.  What every participant of a parallel plan adds
@@ -1883,6 +2009,8 @@ typedef struct LionJoinState
 	bool		unite;			/* LION_JOINFLAG_UNITE: a fact column's
 								 * groups counted against the union of a
 								 * batch's keys */
+	bool		left;			/* LION_JOINFLAG_LEFT: every child row a
+								 * row, with a count of 0 too */
 	bool		collected;
 	bool		filtered;
 	LionPostingSet filter;
@@ -1903,6 +2031,12 @@ typedef struct LionJoinState
 	int64		posting;
 	bool		timing;
 	instr_time	time[LION_JT_N];
+
+	int			nfilter;
+	int			filterclause[LION_MAX_JOIN_FILTERS];
+	AttrNumber	filtercol[LION_MAX_JOIN_FILTERS];
+	PlanState  *filterps[LION_MAX_JOIN_FILTERS];
+	int64		filterkeys;
 
 	LionJoinSort sort;
 	LionJoinBatch batch;
@@ -1950,6 +2084,7 @@ typedef struct LionCountPrivClause
 	Oid			idxoid;			/* InvalidOid for a partitioned table */
 	AttrNumber	attno;			/* the PARENT's */
 	Oid			opno;			/* InvalidOid for a null test */
+	int			filter;			/* FILTERS: 0, or its filtered count's */
 } LionCountPrivClause;
 
 /* One live leaf partition (DESIGN.md §16): an OidList of PARTS */
@@ -1972,6 +2107,13 @@ typedef struct LionCountPrivJoin
 	Oid			sortcoll;
 	AttrNumber	keyresno;		/* the key's column of the child: PLAN
 								 * stage only, 0 at the PATH stage */
+	int			nfilter;		/* the dimensions folded into fact filters */
+	int			filterclause[LION_MAX_JOIN_FILTERS];	/* ... their clauses */
+	AttrNumber	filtercol[LION_MAX_JOIN_FILTERS];	/* ... and the key's
+													 * column: its attnum at
+													 * the PATH stage, its
+													 * child's resno at the
+													 * PLAN stage */
 } LionCountPrivJoin;
 
 /* A column the aggregates of DESIGN.md §37 are taken over: WAGG's lists */
@@ -2056,11 +2198,15 @@ typedef struct LionCountPriv
 
 	List	   *vcols;			/* VCOLS (§41): expressions, or NIL */
 
+	int			nfilter;		/* FILTERS (§10), or 0 */
+	List	   *filterexprs;	/* ... each one's expression: PATH stage only */
+
 	int			ntl;			/* TLKINDS: PLAN stage only */
 	int		   *tlkind;
 
 	List	   *consts;			/* CONSTS: PATH stage only */
 	List	   *having;			/* HAVING: PATH stage only */
+	List	   *resid;			/* RESID: PATH stage only */
 } LionCountPriv;
 
 typedef struct LionCountScanState
@@ -2400,6 +2546,21 @@ typedef struct LionCountScanState
 	LionRowFilter *filter;
 
 	/*
+	 * The residual clauses (DESIGN.md §10, "Residual clauses"), or resid
+	 * NULL: their ExprState over residslot, which has custom_scan_tlist's
+	 * columns and is filled from each heap row tested at the nresidcol
+	 * LION_TL_RESID columns residslotcol[], heap columns residattno[] of the
+	 * relation counted.  Evaluated in residecxt, reset after each row.
+	 */
+	ExprState  *resid;
+	List	   *residexprs;		/* ... the clauses, for EXPLAIN */
+	TupleTableSlot *residslot;
+	ExprContext *residecxt;
+	int			nresidcol;
+	int		   *residslotcol;
+	AttrNumber *residattno;
+
+	/*
 	 * Whether the statement leaves the relation being counted alone
 	 * (DESIGN.md §11, "On-access pruning sets the visibility map too").  On
 	 * PostgreSQL 19 and later that is what lets the heap recheck's on-access
@@ -2448,7 +2609,41 @@ typedef struct LionCountScanState
 	 * fact column"), or NULL for every other shape (lion_st_fg()).
 	 */
 	struct LionFactGroupState *fg;
+
+	/*
+	 * Filtered counts (DESIGN.md §10, "Filtered counts"): the plan's nfilter
+	 * filters, each counted as a RUN of its own after the WHERE's (run 0):
+	 * the count, or the groups, of the rows the WHERE and that filter select
+	 * together.  runitem[r] and nrunitem[r] are run r's items - the WHERE's,
+	 * then its filter's - which planitem and nplanitem are while it is
+	 * counted (lion_select_run()); runfirst[r] and runn[r] are the clauses
+	 * of its own filter as a window of the clause array (the WHERE's for run
+	 * 0); inrun[i] says whether clause i is one of the run being counted.
+	 * runcount[r] is run r's count in a node of one row, summed over the
+	 * partitions, and runsready says it holds the finished counts.  Without
+	 * filters nrun is 1, currun 0, and nothing else here is set.
+	 */
+	int			nfilter;
+	int			nrun;
+	int			currun;
+	LionSourceItem **runitem;
+	int		   *nrunitem;
+	int		   *runfirst;
+	int		   *runn;
+	bool	   *inrun;
+	int64	   *runcount;
+	bool		runsready;
 } LionCountScanState;
+
+/*
+ * Is clause i one of the run being counted (DESIGN.md §10, "Filtered
+ * counts")?  Every clause is, without filters.
+ */
+static inline bool
+lion_clause_in_run(const LionCountScanState *st, int i)
+{
+	return st->inrun == NULL || st->inrun[i];
+}
 
 /* Whether the plan sets one of the LION_FLAG_* bits */
 static inline bool
@@ -2687,11 +2882,17 @@ typedef struct LionClauseInfo
 								 * so the index has to be able to produce it
 								 * (lion_index_can_emit_value()) */
 	bool		inor;			/* a leaf of an OR restriction (§19) */
+	bool		incompl;		/* ... of one with a complement arm, which
+								 * selects nothing and pins nothing by itself
+								 * (§35, "Complements in an OR") */
 	bool		positions;		/* a superset only the stored positions of
 								 * the index can decide (LionLeafInfo) */
 	int			rinfono;		/* the restriction it came from, its position
 								 * in the relation's baserestrictinfo; -1 for
-								 * the FK-side join's key, which is none */
+								 * the FK-side join's key, which is none, and
+								 * for a filter's clause */
+	int			filter;			/* 0, or the filtered count it is a clause of
+								 * (DESIGN.md §10, "Filtered counts") */
 } LionClauseInfo;
 
 /*
@@ -2806,6 +3007,7 @@ extern IndexOptInfo *lion_match_index(RelOptInfo *rel, AttrNumber attno,
 extern bool lion_index_stores_positions(IndexOptInfo *idx, AttrNumber col);
 extern BoolExpr *lion_boolean_not_test(Node *clause);
 extern List *lion_or_arms(Node *clause);
+extern List *lion_all_as_and(Node *clause);
 extern Node *lion_multikey_any_as_or(Node *clause);
 extern bool lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 							  bool allow_negated, bool allow_range,
@@ -2854,6 +3056,8 @@ extern bool lion_agg_is_count(PlannerInfo *root, Aggref *agg, Index rti,
 							  RelOptInfo *rel, const AttrNumber *groupattno,
 							  int ngroup, const List *nonnullattnos,
 							  const List *nullattnos);
+extern bool lion_agg_filtered(Aggref *agg, Node **filter, int *form,
+							  Var **col);
 extern bool lion_agg_distinct_var(Aggref *agg, Index rti, Var **var, Oid *eqop,
 								  Oid *collation);
 extern bool lion_group_coalesce(CoalesceExpr *ce, Index rti, Var **var,
@@ -2909,6 +3113,7 @@ extern Path *lion_competitor_path(RelOptInfo *rel);
 extern void lion_units_for(PlannerInfo *root, RelOptInfo *rel, LionUnits *u);
 extern void lion_units_pin(PlannerInfo *root, RelOptInfo *rel);
 extern void lion_units_unpin(void);
+extern RelOptInfo *lion_units_pin_move(RelOptInfo *rel);
 extern Cost lion_units_price(const LionUnits *u, Cost own);
 extern void lion_units_cold(LionUnits *u, Cost own, double reads);
 extern double lion_units_margin(void);
@@ -2941,10 +3146,19 @@ extern Selectivity lion_probed_selectivity(PlannerInfo *root, RelOptInfo *rel,
 extern Selectivity lion_rel_clauses_selectivity(PlannerInfo *root,
 												RelOptInfo *rel,
 												List *clauses);
+/*
+ * What becomes of a range taken as a source that does not fit in memory
+ * (lion_cost_range_source()): walked at every count, priced out (an OR's
+ * leaf), or collected in windows into a temporary file (the decoded walk's
+ * WHERE, DESIGN.md §34).
+ */
+#define LION_RANGESRC_WALK		0
+#define LION_RANGESRC_ORLEAF	1
+#define LION_RANGESRC_SPILL		2
 extern Cost lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel,
 								   IndexOptInfo *idx, AttrNumber col,
 								   List *bounds, Selectivity sel,
-								   double counts, bool inor);
+								   double counts, int large);
 extern void lion_target_lists(const LionCountTarget *t, List *whereclauses,
 							  List *wherekinds, List *ors, List **idx,
 							  List **col, List **clauses, List **kinds,
@@ -2974,6 +3188,17 @@ extern Cost lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel,
 							  List *whereidx, List *wherecol,
 							  List *whereclauses, List *wherekinds, List *ors,
 							  double matched, double counts, double ceiling);
+extern double lion_residual_rows(PlannerInfo *root, RelOptInfo *rel,
+								 List *residual);
+extern Cost lion_cost_residual(PlannerInfo *root, RelOptInfo *rel,
+							   List *residual, double counts);
+
+/*
+ * The largest share of a table the rows that residual clauses are tested on
+ * may be (DESIGN.md §10, "Residual clauses"): past it, fetching them one by
+ * one is no cheaper than the sequential scan that reads them all.
+ */
+#define LION_RESID_MAX_SHARE	0.5
 
 /* lion_plan_fkjoin_cost.c */
 extern double lion_fkjoin_fk_ndistinct(PlannerInfo *root, RelOptInfo *rel,
@@ -2988,6 +3213,11 @@ extern Cost lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 								  double *reads, bool *unite);
 
 /* lion_plan_fkjoin.c */
+extern bool lion_join_aggs_lookup(Oid *countfn, Oid *sumfn, Oid *mul2op,
+								  Oid *mul4op);
+extern CustomPath *lion_join_agg_wrap(PlannerInfo *root,
+									  RelOptInfo *output_rel, Path *aggpath,
+									  List *checkaggs);
 extern double lion_leaf_turn_share(PlannerInfo *root, RelOptInfo *rel);
 extern double lion_fact_groups(PlannerInfo *root, const LionCountTarget *t);
 extern void lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
@@ -3014,6 +3244,15 @@ extern void lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 extern void lion_try_distinct_path(PlannerInfo *root, RelOptInfo *input_rel,
 								   RelOptInfo *output_rel);
 
+/* lion_plan_gsets.c */
+extern void lion_try_gsets_path(PlannerInfo *root, RelOptInfo *input_rel,
+								RelOptInfo *output_rel,
+								GroupPathExtraData *extra);
+extern void lion_try_distinct_agg_path(PlannerInfo *root,
+									   RelOptInfo *input_rel,
+									   RelOptInfo *output_rel,
+									   GroupPathExtraData *extra);
+
 /* lion_plan_hooks.c */
 extern Plan *lion_plan_join_agg_path(PlannerInfo *root, RelOptInfo *rel,
 									 CustomPath *best_path, List *tlist,
@@ -3029,6 +3268,9 @@ extern AttrNumber lion_index_col_for(Relation index, AttrNumber heapattno,
 extern AttrNumber lion_heap_attno_in(Relation heap, Oid parentoid,
 									 AttrNumber parentattno);
 extern void lion_open_relation(LionCountScanState *st, int p);
+extern void lion_select_run(LionCountScanState *st, int r);
+extern void lion_clause_window(LionCountScanState *st, int clauseno,
+							   int *first, int *n);
 extern void lion_close_relation(LionCountScanState *st);
 extern void lion_close_parts(LionCountScanState *st);
 extern void lion_begin_custom_scan(CustomScanState *node, EState *estate,
@@ -3042,6 +3284,8 @@ extern TupleTableSlot *lion_exec_join_agg(CustomScanState *node);
 extern void lion_end_join_agg(CustomScanState *node);
 extern void lion_rescan_join_agg(CustomScanState *node);
 extern void lion_join_locate_where(LionCountScanState *st);
+extern void lion_join_filter_values(LionCountScanState *st);
+extern int	lion_join_filter_of(const LionCountScanState *st, int clauseno);
 extern void lion_join_switch_reset(LionCountScanState *st);
 extern void lion_join_batch_reset(LionCountScanState *st);
 extern void lion_join_unite_release(LionCountScanState *st);
@@ -3067,6 +3311,7 @@ extern int64 lion_node_count(LionCountScanState *st, int nsource,
 							 LionCountSource *sources, bool exists);
 extern int64 lion_count_relation(LionCountScanState *st);
 extern int64 lion_sumall_relation(LionCountScanState *st);
+extern int64 lion_count_runs(LionCountScanState *st, bool sum);
 extern TupleTableSlot *lion_next_group_ranged(LionCountScanState *st,
 											  bool *exhausted);
 extern TupleTableSlot *lion_distinct_relation(LionCountScanState *st);

@@ -19,12 +19,40 @@
  *		dimension that is a join").  Its rows are then the rows of that join
  *		rel's cheapest path, which the node runs as its child.
  *
+ *		A second dimension that only filters - inner-joined to the fact on a
+ *		key of its own that is provably unique, nothing of it wanted above
+ *		the join - is folded into a fact filter on its fk column: the fact
+ *		rows whose fk is one of the keys of its rows (DESIGN.md §27, "A
+ *		second dimension that only filters").
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef LION_FKJOIN_H
 #define LION_FKJOIN_H
 
 #include "nodes/pathnodes.h"
+
+/*
+ * A dimension folded into a fact filter (DESIGN.md §27, "A second dimension
+ * that only filters"): `rel`, inner-joined to the fact by `fkvar op pkvar`
+ * alone, its key unique under op, none of its columns wanted above the join.
+ * Each fact row has one fk value and each key at most one row of rel, so the
+ * fact rows the join keeps are those whose fk is a key of one of rel's rows,
+ * each once: `fkvar = ANY (<the keys of path's rows>)`, which the node
+ * evaluates by running `path` - rel's cheapest path, its own filters
+ * applied - as a child of its own.
+ */
+typedef struct LionFkFilter
+{
+	RelOptInfo *rel;
+	Var		   *fkvar;			/* the fact's column */
+	Var		   *pkvar;			/* rel's key */
+	Node	   *pkexpr;			/* ... as the clause compares it */
+	Oid			opno;
+	Oid			collation;
+	Node	   *clause;			/* the join clause */
+	Path	   *path;			/* rel's cheapest total path */
+} LionFkFilter;
 
 /*
  * One way round of a recognised join.  A join of two tables may qualify both
@@ -45,6 +73,10 @@
  * then counted as an inner join counts a dimension row: distinct keys have
  * disjoint posting sets, so the counts add up to the fact rows that have a
  * match, each once.
+ *
+ * A LEFT JOIN qualifies with the dimension its outer side and the fact its
+ * nullable side, as JOIN_LEFT: an inner join's lookups, every dimension row
+ * a row of the result whatever its count.
  *
  * The dimension is `dimrel` alone, or - when the query joins more tables -
  * the join rel `dimchild` of dimrel and the tables semi or anti joined to it
@@ -75,25 +107,35 @@ typedef struct LionFkJoin
 	JoinType	jointype;		/* JOIN_INNER; or JOIN_SEMI or JOIN_ANTI, the
 								 * dimension the outer side and the fact the
 								 * inner one; or JOIN_UNIQUE_INNER, a semi
-								 * join the other way round */
+								 * join the other way round; or JOIN_LEFT,
+								 * the dimension LEFT JOIN the fact, whose
+								 * dimension rows with no fact row are rows
+								 * too */
 	RelOptInfo *joinrel;		/* the join rel: a semi or anti join's rows */
 	Oid			uniqsortop;		/* JOIN_UNIQUE_INNER: the `<` of the join
 								 * operator's btree family for the dimension
 								 * key's type, which the keys are sorted by
 								 * to make them distinct; else InvalidOid */
+	Bitmapset  *factnotnull;	/* the fact's columns declared NOT NULL, for
+								 * a count of one over a LEFT JOIN; set by
+								 * the path's planner, not here */
 	bool		joinpath;		/* the semi or anti join as a JOIN path of
 								 * joinrel, which emits the outer side's rows
 								 * (lion_fkjoin_recognize_join()), and not an
 								 * aggregate over the query's join */
+	List	   *filters;		/* LionFkFilter: the dimensions folded into
+								 * fact filters, an inner join's only */
 } LionFkJoin;
 
 /*
  * How many ways of taking joinrel apart qualify, one per table that may be the
  * fact - each way round of a join of two tables, and every fact of a joined
- * dimension - in a palloc'd array set into *out.  Everything returned has
- * passed every check that is about the JOIN and the DIMENSION; whether the
- * fact side has a lion index that can answer the join operator, and whether
- * its own quals can be pushed down, is for the caller to decide.
+ * dimension, and with dimensions that only filter, each of them as the
+ * dimension where no other table is - in a palloc'd array set into *out.
+ * Everything returned has passed every check that is about the JOIN and the
+ * DIMENSION; whether the fact side has a lion index that can answer the join
+ * operator, and whether its own quals can be pushed down, is for the caller
+ * to decide.
  */
 extern int	lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel,
 								  LionFkJoin **out);

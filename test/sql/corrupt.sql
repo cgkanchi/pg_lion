@@ -149,7 +149,7 @@ DROP INDEX lion_dc_i;
 -- ---------- 4. a summary whose key is not its bucket's (DESIGN.md §32) ----------
 -- Buckets of 16 keys: the second summary is keyed 32 and holds the rows of
 -- keys 17 to 32.  Its key is rewritten to 24, which still sorts between its
--- neighbours (a summary's hash is a constant, so nothing else changes), so
+-- neighbours (a summary has no hash in the order, so nothing else changes), so
 -- the directory is in order and every entry is sound on its own - but the
 -- rows of keys 25 to 32 are now in the summary of a bucket that ends at 24,
 -- and missing from the next one.
@@ -168,9 +168,11 @@ LANGUAGE sql IMMUTABLE AS $$
 		2, ((v >> 16) & 255)::int), 3, ((v >> 24) & 255)::int)
 $$;
 
--- The block and byte offset of the summary of an int4 column keyed k: an
--- item whose header (hash, flags, keylen at +0, +4, +6) is a SUMMARY entry's
--- (flag 0x0080, hash 0) with an 8-byte key equal to k at +32.
+-- The block and byte offset of the key of the summary of an int4 column
+-- keyed k: an item whose header (flags and keylen at +0 and +2) is a SUMMARY
+-- entry's (flag 0x0080 with INLINE 0x0001 or CHAIN 0x0002, not a pivot's
+-- 0x0030) with a 4-byte key equal to k after the header, at +12 for INLINE
+-- and +28 for CHAIN.
 CREATE FUNCTION lion_dc_summary(idx regclass, k int, OUT blk bigint, OUT pos int)
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -184,12 +186,14 @@ BEGIN
 		FOR off IN 1 .. ((lion_dc_u32(page, 12) & 65535) - 24) / 4 LOOP
 			p := lion_dc_item(page, off);
 			CONTINUE WHEN p < 24 OR p + 40 > length(page);
-			IF lion_dc_u32(page, p) = 0
-			   AND (lion_dc_u32(page, p + 4) & 128) <> 0
-			   AND (lion_dc_u32(page, p + 4) >> 16) = 8
-			   AND lion_dc_u32(page, p + 32) = k THEN
+			IF (lion_dc_u32(page, p) & 128) <> 0
+			   AND (lion_dc_u32(page, p) & 48) = 0
+			   AND (lion_dc_u32(page, p) & 3) <> 0
+			   AND (lion_dc_u32(page, p) >> 16) = 4
+			   AND lion_dc_u32(page, p + CASE WHEN lion_dc_u32(page, p) & 2 <> 0
+											THEN 28 ELSE 12 END) = k THEN
 				blk := b;
-				pos := p;
+				pos := p + CASE WHEN lion_dc_u32(page, p) & 2 <> 0 THEN 28 ELSE 12 END;
 				RETURN;
 			END IF;
 		END LOOP;
@@ -197,7 +201,7 @@ BEGIN
 END $$;
 
 SELECT blk IS NOT NULL AS found FROM lion_dc_summary('lion_dc_s_i', 32);
-SELECT lion_dc_poke('lion_dc_s_i', s.blk, s.pos + 32, lion_dc_le32(24))
+SELECT lion_dc_poke('lion_dc_s_i', s.blk, s.pos, lion_dc_le32(24))
   FROM lion_dc_summary('lion_dc_s_i', 32) s;
 SELECT lion_dc_try($$SELECT lion_index_verify('lion_dc_s_i', false)$$);
 DROP TABLE lion_dc_s;
