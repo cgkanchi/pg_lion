@@ -1116,6 +1116,26 @@ lion_facets_heap_ok(LionFacetRun *run)
 					   NULL);
 }
 
+/* One row under key: its entry in htab, made with a copy of the key if new. */
+static void
+lion_facets_heap_add(LionFacetRun *run, HTAB *htab, Datum key)
+{
+	LionFacetHashEnt *ent;
+	bool		found;
+
+	lion_facets_hash_state = run->state;
+	ent = (LionFacetHashEnt *) hash_search(htab, &key, HASH_ENTER, &found);
+	if (!found)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(run->keycxt);
+
+		ent->key = datumCopy(key, run->state->typbyval, run->state->typlen);
+		ent->count = 0;
+		MemoryContextSwitchTo(oldcxt);
+	}
+	ent->count++;
+}
+
 /*
  * The keys of every row of the filter's copy that the snapshot sees, counted:
  * what `SELECT e, count(*) ... GROUP BY e` does over the rows the filter
@@ -1209,35 +1229,20 @@ lion_facets_heap(LionFacetRun *run)
 				if (!run->state->multikey)
 					nullcount++;
 			}
-			else
+			else if (run->state->multikey)
 			{
-				Datum	   *keys = &value;
-				int			nkeys = 1;
+				Datum	   *keys;
+				int			nkeys = lion_extract_value(run->state, value, &keys);
 				int			j;
 
-				if (run->state->multikey)
-					nkeys = lion_extract_value(run->state, value, &keys);
 				for (j = 0; j < nkeys; j++)
 				{
-					bool		found;
-
-					if (lion_is_length_key(run->state, keys[j]))
-						continue;
-
-					lion_facets_hash_state = run->state;
-					ent = (LionFacetHashEnt *) hash_search(htab, &keys[j],
-														   HASH_ENTER, &found);
-					if (!found)
-					{
-						MemoryContextSwitchTo(run->keycxt);
-						ent->key = datumCopy(keys[j], run->state->typbyval,
-											 run->state->typlen);
-						ent->count = 0;
-						MemoryContextSwitchTo(run->percount);
-					}
-					ent->count++;
+					if (!lion_is_length_key(run->state, keys[j]))
+						lion_facets_heap_add(run, htab, keys[j]);
 				}
 			}
+			else
+				lion_facets_heap_add(run, htab, value);
 			MemoryContextSwitchTo(oldcxt);
 		}
 	}
@@ -1259,6 +1264,7 @@ lion_facets_heap(LionFacetRun *run)
 		LionFacetKey k;
 
 		k.ntids = 0;
+		k.count = ent->count;
 		k.key = ent->key;
 		k.isnull = false;
 		lion_facets_keep(run, &k, ent->count);
@@ -1268,6 +1274,7 @@ lion_facets_heap(LionFacetRun *run)
 		LionFacetKey k;
 
 		k.ntids = 0;
+		k.count = nullcount;
 		k.key = (Datum) 0;
 		k.isnull = true;
 		lion_facets_keep(run, &k, nullcount);
