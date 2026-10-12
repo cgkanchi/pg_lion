@@ -1332,6 +1332,8 @@ lo_rel_ok(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 		return false;
 	if (rte->inh || rte->tablesample != NULL)
 		return false;
+	if (lion_rel_is_unexpanded_parent(rte))
+		return false;
 	if (rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW)
 		return false;
 	if (rte->securityQuals != NIL)

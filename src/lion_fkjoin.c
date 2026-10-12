@@ -120,6 +120,8 @@ lion_fkjoin_rel_ok(PlannerInfo *root, RelOptInfo *rel)
 			!IS_PARTITIONED_REL(rel))
 			return false;
 	}
+	else if (lion_rel_is_unexpanded_parent(rte))
+		return false;
 	else if (rte->relkind != RELKIND_RELATION &&
 			 rte->relkind != RELKIND_MATVIEW)
 		return false;
