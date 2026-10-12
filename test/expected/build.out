@@ -281,7 +281,7 @@ SET max_parallel_maintenance_workers = 2;
 SET client_min_messages = debug1;
 REINDEX INDEX lion_build_unsafe_i;
 DEBUG:  building index "lion_build_unsafe_i" on table "lion_build" serially
-DEBUG:  lion index "lion_build_unsafe_i": 1 key columns, 11 entries, 13 blocks, 1 directory pages, height 0, fillfactor 90, built in memory
+DEBUG:  lion index "lion_build_unsafe_i": 1 key columns, 11 entries, 23 blocks, 1 directory pages, height 0, fillfactor 90, built in memory
 SET client_min_messages = warning;
 RESET max_parallel_maintenance_workers;
 SELECT lion_index_verify('lion_build_unsafe_i', true);

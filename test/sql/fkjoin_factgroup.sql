@@ -293,6 +293,25 @@ SET max_parallel_workers_per_gather = 2;
 SELECT lion_xj('SELECT f.kind, count(*) FROM lion_gf f JOIN lion_gd d ON f.fk = d.pk GROUP BY f.kind');
 SELECT lion_xj('SELECT f.lvl, count(*) FROM lion_gp f JOIN lion_gd d ON f.fk = d.pk WHERE d.region = ''eu'' GROUP BY f.lvl');
 RESET work_mem;
+/*
+ * Shares: from 88 kB to 120 kB of work_mem the plan unites each batch's
+ * keys, a share of them at a time, and the array of one share's sets - sized
+ * for 1000 keys whatever work_mem was - alone outgrew work_mem: the turn
+ * located no key and began again, without end and deaf to a cancel.  A
+ * share's array takes half of work_mem at most now, and a share one key at
+ * least.
+ */
+SET max_parallel_workers_per_gather = 0;
+SET work_mem = '96kB';
+SELECT lion_xj_counter('SELECT f.kind, count(*) FROM lion_gf f JOIN lion_gd d ON f.fk = d.pk GROUP BY f.kind', 'Unions Built') > 0 AS united;
+SET max_parallel_workers_per_gather = 2;
+SELECT lion_xj('SELECT f.kind, count(*) FROM lion_gf f JOIN lion_gd d ON f.fk = d.pk GROUP BY f.kind');
+SELECT lion_xj('SELECT f.lvl, count(*) FROM lion_gp f JOIN lion_gd d ON f.fk = d.pk WHERE d.region = ''eu'' GROUP BY f.lvl');
+SET work_mem = '88kB';
+SELECT lion_xj('SELECT f.kind, count(*) FROM lion_gf f JOIN lion_gd d ON f.fk = d.pk GROUP BY f.kind');
+SET work_mem = '120kB';
+SELECT lion_xj('SELECT f.kind, count(*) FROM lion_gf f JOIN lion_gd d ON f.fk = d.pk GROUP BY f.kind');
+RESET work_mem;
 
 -- ---- 4. rescans and a dirty heap -----------------------------------------------
 -- a correlated subquery that rescans the node with a new fact filter

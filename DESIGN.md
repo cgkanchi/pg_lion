@@ -871,7 +871,8 @@ the last key had been hashed; the sorted build keeps one open page per level.
     amgettuple = liongettuple (§29)  amgetbitmap = liongetbitmap    amcanreturn = NULL
     ammarkpos/amrestrpos = NULL      parallel scan callbacks = NULL
     amcostestimate: genericcostestimate() then indexCorrelation = 0 (as contrib/bloom)
-    amoptions: reloptions `fillfactor` (int, 10..100, default 90, §21), `inline_limit` (int bytes,
+    amoptions: reloptions `fillfactor` (int, 10..100, default 90, §21), `posting_fillfactor`
+    (int, 10..100, default 90, §22), `inline_limit` (int bytes,
     64..4096, default 4096), `max_entries` (int, 0 = unlimited, §17), `buckets`, which is
     accepted and ignored with a NOTICE since format 4 (§21), `summaries` (enum off | on | auto,
     default off, §32) and `summary_tids` (int, 16..2^24, default 4096, §32), via
@@ -7110,20 +7111,22 @@ Operations.
   reserves a block for the ROOT and re-stamps the held leaves with it - their images are still in
   memory, and every page of a set has to carry the root's block as its owner (§18) - and writes
   them with their downlinks.
-  **A leaf is filled to `posting_fillfactor`** (reloption, 10 .. 100, default 100), the chain of a
-  set without an internal level and the leaves of a tree alike: the build closes a leaf when the
-  next item would take it past that share of the page (`lion_builder_leaf_full()`), counted as
-  PageAddItem() spends it, the MAXALIGNed item and its line pointer, and a leaf always takes its
-  first item. At 100 that is exactly "the next item does not fit", the rule every build had
-  before, and the default keeps it, so an index built without the option is the same index page
-  for page. Below 100 it leaves the room the first wave of writes after a build needs: a
-  bulk-built container has no slack (§4), so the first member an insert adds INSIDE it - the new
-  row versions of an UPDATE on a heap with free space, rows placed in space VACUUM freed - rewrites
-  the item longer, and on a packed leaf that is a split, of nearly every leaf by the time the wave
-  has touched every container. Rows the heap appends land in new containers at the end of their
-  sets and need no room in the leaves before them, which is why the default stays at 100: an
-  append-only or read-mostly table pays for the room and never uses it. Measured below
-  ("Posting leaves with room, measured").
+  **A leaf is filled to `posting_fillfactor`** (reloption, 10 .. 100, default 90, nbtree's leaf
+  default and the directory's `fillfactor`), the chain of a set without an internal level and the
+  leaves of a tree alike: the build closes a leaf when the next item would take it past that share
+  of the page (`lion_builder_leaf_full()`), counted as PageAddItem() spends it, the MAXALIGNed
+  item and its line pointer, and a leaf always takes its first item. At 100 that is exactly "the
+  next item does not fit", the rule every build had before the option existed. Below 100 it
+  leaves the room the first wave of writes after a build needs: a bulk-built container has no
+  slack (§4), so the first member an insert adds INSIDE it - the new row version of an UPDATE
+  that stays on the old row's page, as it does on a heap below fillfactor 100 or on a page VACUUM
+  made room on - rewrites the item longer, and on a packed leaf that is a split, of nearly every
+  leaf by the time the wave has touched every container. Only rows the heap appends land in new
+  containers at the end of their sets and need no room in the leaves before them, so an index on
+  an append-only or read-only table can be built at 100 and save the room. The default is 90
+  because a table that is updated at all writes inside its containers sooner or later, and the
+  room costs about a tenth more posting pages at build where its absence costs a split of nearly
+  every leaf under the first wave. Measured below ("Posting leaves with room, measured").
 
 ### The sets without an internal level, measured
 
@@ -12160,8 +12163,12 @@ that proof says does not come - is left out of the union and counted key by key,
 still add up to the join's.
 
 **Bounds and fall-backs.** The keys located at once are what work_mem holds of them
-(`lion_array_batch_size()` sets at most); past that they are united a share at a time, each share a
-copy of its own counted beside every group, which adds up the same. The copies take a hash table's
+(`lion_array_batch_size()` sets at most, and no more than half of work_mem's worth of
+`LionPostingSet`s, so the array of sets leaves room for the sets' copies); past that they are
+united a share at a time, each share a copy of its own counted beside every group, which adds up
+the same. A share takes one key at least whatever work_mem is left - `lion_array_batch_size()`
+alone never falls below 1000 sets, whose array outgrows a work_mem of 96 kB before a key is
+located - and the turn checks for interrupts before each. The copies take a hash table's
 memory (`get_hash_memory_limit()`) and spill past it as the filters' copy does. A turn that cannot
 be united - a hot standby, which makes no copy; a range the counts walk (§32), which is not a set
 to collect; a copy that fails - is counted key by key, every key. A partition whose bounds give

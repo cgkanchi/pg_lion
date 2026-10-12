@@ -55,7 +55,8 @@
 #
 # The fixture of B, C and D: key 1 holds a RUN of five rows in every thirty, so
 # each container key (64 heap blocks of 226 rows) is a ~1980-byte RUN and a
-# bulk-built leaf holds four of them with 208 bytes to spare; key 3 is the row
+# leaf bulk-built at posting_fillfactor 100 - set on the indexes, since the
+# default leaves room - holds four of them with 208 bytes to spare; key 3 is the row
 # in the middle of each gap.  Deleting key 3's rows in ONE container key's heap
 # blocks and vacuuming leaves free line pointers there and nowhere else, so
 # the rows inserted next all land in that container key and grow exactly the
@@ -90,14 +91,14 @@ setup
 	INSERT INTO psr_right SELECT i,
 		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 100 + i % 97 END
 	  FROM generate_series(1, 14464 * 8) i;
-	CREATE INDEX psr_right_k ON psr_right USING lion (k);
+	CREATE INDEX psr_right_k ON psr_right USING lion (k) WITH (posting_fillfactor = 100);
 	INSERT INTO psr_right SELECT i, 1 + i % 2
 	  FROM generate_series(14464 * 8 + 1, 14464 * 24) i;
 	CREATE TABLE psr_left (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
 	INSERT INTO psr_left SELECT i,
 		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 100 + i % 97 END
 	  FROM generate_series(1, 14464 * 8) i;
-	CREATE INDEX psr_left_k ON psr_left USING lion (k);
+	CREATE INDEX psr_left_k ON psr_left USING lion (k) WITH (posting_fillfactor = 100);
 	INSERT INTO psr_left SELECT i, 1 + i % 2
 	  FROM generate_series(14464 * 8 + 1, 14464 * 24) i;
 
@@ -107,7 +108,7 @@ setup
 	INSERT INTO psr_push SELECT i,
 		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 100 + i % 97 END
 	  FROM generate_series(1, 14464 * 8) i;
-	CREATE INDEX psr_push_k ON psr_push USING lion (k);
+	CREATE INDEX psr_push_k ON psr_push USING lion (k) WITH (posting_fillfactor = 100);
 	INSERT INTO psr_push SELECT i, 1 + i % 2
 	  FROM generate_series(14464 * 8 + 1, 14464 * 22) i;
 
