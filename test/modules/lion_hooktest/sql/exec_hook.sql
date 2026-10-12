@@ -30,8 +30,11 @@ CREATE FUNCTION nc_bucket(int) RETURNS int IMMUTABLE LANGUAGE plpgsql
 CREATE INDEX nc_b ON nc USING lion (nc_bucket(j));
 CREATE TABLE ncd (pk int PRIMARY KEY, name text NOT NULL);
 INSERT INTO ncd SELECT i, 'n' || (i % 2) FROM generate_series(0, 12) i;
+CREATE TABLE ncx (pk int8 PRIMARY KEY, flag bool NOT NULL);
+INSERT INTO ncx SELECT i, i % 3 = 0 FROM generate_series(0, 6) i;
 VACUUM (FREEZE, ANALYZE) nc;
 VACUUM (FREEZE, ANALYZE) ncd;
+VACUUM (FREEZE, ANALYZE) ncx;
 
 CREATE TABLE nc_nodes (node text PRIMARY KEY, q text, fn regprocedure, force text);
 INSERT INTO nc_nodes VALUES
@@ -39,13 +42,33 @@ INSERT INTO nc_nodes VALUES
 	 'SELECT count(*) FROM nc WHERE k = 3', 'int4eq(int4,int4)', ''),
 	('LionCount, its aggregate',
 	 'SELECT count(*) FROM nc WHERE k = 3', 'count()', ''),
+	('LionCount, an IS DISTINCT FROM',
+	 'SELECT count(*) FROM nc WHERE k IS DISTINCT FROM 3', 'int4eq(int4,int4)', ''),
+	('LionCount, a complement in an OR',
+	 'SELECT count(*) FROM nc WHERE j = 2 OR k <> 3', 'int4ne(int4,int4)', ''),
+	('LionCount, a NOT of a multi-key query',
+	 'SELECT count(*) FROM nc WHERE NOT (d @@ ''w1 & w3'')', 'ts_match_vq(tsvector,tsquery)', ''),
+	('LionCount, a residual clause',
+	 'SELECT count(*) FROM nc WHERE k = 3 AND o % 7 = 1', 'int4mod(int4,int4)', ''),
+	('LionCount, a residual clause beside a FILTER',
+	 'SELECT count(*) FILTER (WHERE j = 2), count(*) FROM nc WHERE k = 3 AND o % 7 = 1', 'int4mod(int4,int4)',
+	 'enable_seqscan enable_bitmapscan enable_indexscan'),
 	('LionCount, an expression column filtered',
 	 'SELECT count(*) FROM nc WHERE nc_bucket(j) = 1', 'nc_bucket(int4)', ''),
 	('LionCount, an expression column grouped',
 	 'SELECT nc_bucket(j), count(*) FROM nc GROUP BY 1', 'nc_bucket(int4)', ''),
+	('LionCount, a dimension folded into a fact filter',
+	 'SELECT d.name, count(*) FROM nc JOIN ncd d ON d.pk = nc.k JOIN ncx x ON x.pk = nc.j WHERE x.flag GROUP BY d.name',
+	 'int48eq(int4,int8)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
 	('LionJoinAgg',
 	 'SELECT count(DISTINCT d.name), count(*) FROM nc JOIN ncd d ON d.pk = nc.k WHERE nc.j = 3',
 	 'int4eq(int4,int4)', ''),
+	('LionJoinAgg, a LEFT JOIN',
+	 'SELECT d.name, count(*) FROM ncd d LEFT JOIN nc ON nc.k = d.pk AND nc.j = 3 GROUP BY d.name',
+	 'int4eq(int4,int4)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
+	('LionJoinAgg, grouping sets',
+	 'SELECT k, j, sum(j), count(*) FROM nc GROUP BY ROLLUP (k, j)', 'sum(int4)',
+	 'enable_seqscan enable_bitmapscan enable_indexscan enable_indexonlyscan'),
 	('LionSemiJoin',
 	 'SELECT d.pk FROM ncd d WHERE EXISTS (SELECT 1 FROM nc WHERE nc.k = d.pk AND nc.j = 3)',
 	 'int4eq(int4,int4)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
@@ -162,5 +185,5 @@ DROP FUNCTION nc_explain(text, text);
 DROP FUNCTION nc_try(text);
 DROP FUNCTION nc_rows(text);
 DROP FUNCTION nc_paths(text, boolean);
-DROP TABLE nc_nodes, nc, ncd;
+DROP TABLE nc_nodes, nc, ncd, ncx;
 DROP FUNCTION nc_bucket(int);

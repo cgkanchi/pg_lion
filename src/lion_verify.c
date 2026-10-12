@@ -316,14 +316,8 @@ lion_verify_keylen(LionVerifyState *vs, LionState *state, BlockNumber blk,
 					RelationGetRelationName(vs->index), off, blk, keylen,
 					LION_MAX_KEY_SIZE);
 
-	if (state->typbyval)
-	{
-		if (keylen != sizeof(Datum))
-			lion_corrupt("lion index \"%s\": entry %u on block %u has key length %zu, expected %zu for a by-value type",
-						RelationGetRelationName(vs->index), off, blk, keylen,
-						sizeof(Datum));
-	}
-	else if (state->typlen > 0)
+	/* a by-value key too: at its type's width (lion_entryfmt.h) */
+	if (state->typlen > 0)
 	{
 		if (keylen != (Size) state->typlen)
 			lion_corrupt("lion index \"%s\": entry %u on block %u has key length %zu, expected %d",
@@ -377,7 +371,7 @@ lion_verify_dir_item(LionVerifyState *vs, BlockNumber blk, Page page,
 		return NULL;
 
 	itemsz = ItemIdGetLength(iid);
-	if (itemsz < LION_ENTRY_HDRSZ)
+	if (itemsz < LION_ENTRY_SHORT_HDRSZ)
 		lion_corrupt("lion index \"%s\": item %u on block %u is only %zu bytes, less than an entry header",
 					RelationGetRelationName(vs->index), off, blk, itemsz);
 
@@ -427,6 +421,30 @@ lion_verify_dir_item(LionVerifyState *vs, BlockNumber blk, Page page,
 						kind == LION_KIND_NULL ? "null" : "empty", off, blk,
 						item->keylen);
 		return item;
+	}
+
+	/*
+	 * A pivot (lion_entryfmt.h): the short header, no counts, and the key
+	 * where the key column keeps it.  Leaf entries are checked in full by
+	 * lion_verify_entry().
+	 */
+	if (LionEntryIsPivot(item))
+	{
+		LionState  *col = lion_column(vs->ix, (AttrNumber) item->attno);
+
+		if ((item->flags & (LION_ENTRY_INLINE | LION_ENTRY_CHAIN |
+							LION_ENTRY_POSITIONS)) != 0 ||
+			(item->flags & ~(uint16) LION_ENTRY_ALLFLAGS) != 0 ||
+			(item->flags & LION_ENTRY_ALIGNKEY) != lion_key_layout_flags(col))
+			lion_corrupt("lion index \"%s\": %s %u on block %u has flags 0x%04X, which no pivot of key column %u has",
+						RelationGetRelationName(vs->index),
+						LionEntryIsHighKey(item) ? "high key" : "downlink",
+						off, blk, item->flags, item->attno);
+		if (item->sh_ncontainers != 0)
+			lion_corrupt("lion index \"%s\": %s %u on block %u has a non-zero reserved header field",
+						RelationGetRelationName(vs->index),
+						LionEntryIsHighKey(item) ? "high key" : "downlink",
+						off, blk);
 	}
 
 	lion_verify_keylen(vs, lion_column(vs->ix, (AttrNumber) item->attno),
@@ -687,16 +705,16 @@ lion_verify_posting_page(LionVerifyState *vs, BlockNumber blk,
 		lion_corrupt("lion index \"%s\": block %u is reachable from chain entry %u on block %u but is marked deleted",
 					RelationGetRelationName(vs->index), blk, eoff, eblk);
 
-	if (opaque->owner_head != entry->head ||
-		opaque->owner_hash != entry->hash)
-		lion_corrupt("lion index \"%s\": block %u of chain entry %u on block %u is owned by hash %u at head %u, expected hash %u at head %u",
+	if (opaque->owner_head != lion_entry_head(entry) ||
+		opaque->owner_hash != lion_entry_owner(entry))
+		lion_corrupt("lion index \"%s\": block %u of chain entry %u on block %u is owned by stamp %u at head %u, expected stamp %u at head %u",
 					RelationGetRelationName(vs->index), blk, eoff, eblk,
 					opaque->owner_hash, opaque->owner_head,
-					entry->hash, entry->head);
+					lion_entry_owner(entry), lion_entry_head(entry));
 
 	if (opaque->level != level)
 	{
-		if (!exact && blk == entry->head)
+		if (!exact && blk == lion_entry_head(entry))
 		{
 			UnlockReleaseBuffer(*bufp);
 			*bufp = InvalidBuffer;
@@ -844,10 +862,10 @@ lion_verify_posting_leaves(LionVerifyState *vs, BlockNumber eblk,
 	}
 
 	res->last = last;
-	if (exact && last != entry->tail)
+	if (exact && last != lion_entry_tail(entry))
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u ends at block %u, but its tail is block %u",
 					RelationGetRelationName(vs->index), eoff, eblk, last,
-					entry->tail);
+					lion_entry_tail(entry));
 	return true;
 }
 
@@ -1010,10 +1028,10 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 	uint32		i;
 	int			j;
 
-	if (!BlockNumberIsValid(entry->head) || !BlockNumberIsValid(entry->tail))
+	if (!BlockNumberIsValid(lion_entry_head(entry)) || !BlockNumberIsValid(lion_entry_tail(entry)))
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u has head %u and tail %u",
 					RelationGetRelationName(vs->index), eoff, eblk,
-					entry->head, entry->tail);
+					lion_entry_head(entry), lion_entry_tail(entry));
 
 	/*
 	 * The leftmost page of every level, from the root down.  The pages are
@@ -1022,7 +1040,7 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 	 * this file.
 	 */
 	{
-		BlockNumber blk = entry->head;
+		BlockNumber blk = lion_entry_head(entry);
 		int			steps = 0;
 		uint16		expect = 0;
 
@@ -1049,7 +1067,7 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 			if (level > LION_POSTING_MAX_HEIGHT)
 				lion_corrupt("lion index \"%s\": posting page %u claims level %u",
 							RelationGetRelationName(vs->index), blk, level);
-			if (blk == entry->head)
+			if (blk == lion_entry_head(entry))
 				height = level;
 			else if (level != expect)
 				lion_corrupt("lion index \"%s\": posting page %u is at level %u, but its parent is at level %u",
@@ -1060,7 +1078,7 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 			 * level, and its right siblings are the set's other leaves; one
 			 * above level 0 is the root of a tree, which has none.
 			 */
-			if (!LionPageIsRightmost(page) && blk == entry->head && level > 0)
+			if (!LionPageIsRightmost(page) && blk == lion_entry_head(entry) && level > 0)
 				lion_corrupt("lion index \"%s\": the root %u of chain entry %u on block %u has a right sibling",
 							RelationGetRelationName(vs->index), blk, eoff, eblk);
 			leftmost[level] = blk;
@@ -1274,28 +1292,28 @@ lion_verify_chain_totals(LionVerifyState *vs, BlockNumber eblk,
 	if (!compare)
 		return;
 
-	if (res->last != entry->tail)
+	if (res->last != lion_entry_tail(entry))
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u ends at block %u, but its tail is block %u",
 					RelationGetRelationName(vs->index), eoff, eblk, res->last,
-					entry->tail);
+					lion_entry_tail(entry));
 
-	if (res->card != entry->ntids)
+	if (res->card != lion_entry_ntids(entry))
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u claims " UINT64_FORMAT " TIDs, but its containers hold " UINT64_FORMAT,
 					RelationGetRelationName(vs->index), eoff, eblk,
-					entry->ntids, res->card);
+					lion_entry_ntids(entry), res->card);
 
-	if (res->ncontainers != entry->ncontainers)
+	if (res->ncontainers != lion_entry_ncontainers(entry))
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u claims %u containers, but its posting tree holds %u",
 					RelationGetRelationName(vs->index), eoff, eblk,
-					entry->ncontainers, res->ncontainers);
+					lion_entry_ncontainers(entry), res->ncontainers);
 }
 
 /* Does the entry header read now say what the one read before said? */
 static bool
 lion_verify_same_entry(const LionEntryTuple *a, const LionEntryTuple *b)
 {
-	return a->flags == b->flags && a->head == b->head && a->tail == b->tail &&
-		a->ntids == b->ntids && a->ncontainers == b->ncontainers;
+	return a->flags == b->flags && lion_entry_head(a) == lion_entry_head(b) && lion_entry_tail(a) == lion_entry_tail(b) &&
+		lion_entry_ntids(a) == lion_entry_ntids(b) && lion_entry_ncontainers(a) == lion_entry_ncontainers(b);
 }
 
 /*
@@ -1374,11 +1392,17 @@ lion_verify_refind(LionVerifyState *vs, LionEntryTuple *cur, BlockNumber *blkp,
 						(Size) ItemIdGetLength(iid),
 						LionEntryPayloadOffset(item));
 
-		cur->flags = item->flags;
-		cur->head = item->head;
-		cur->tail = item->tail;
-		cur->ntids = item->ntids;
-		cur->ncontainers = item->ncontainers;
+		/*
+		 * A CHAIN entry never goes back to INLINE, and its key and column are
+		 * its own, so the header it has now has the form cur has: anything
+		 * else is not the entry cur was copied from.
+		 */
+		if (((item->flags ^ cur->flags) &
+			 (LION_ENTRY_CHAIN | LION_ENTRY_ALIGNKEY | LION_ENTRY_POSITIONS)) != 0)
+			lion_corrupt("lion index \"%s\": entry %u on block %u changed its header form from flags 0x%04X to 0x%04X",
+						RelationGetRelationName(vs->index), off, blk,
+						cur->flags, item->flags);
+		memcpy(cur, item, LionEntryHdrSize(item));
 
 		*blkp = blk;
 		*offp = off;
@@ -1457,7 +1481,11 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 
 	for (attempt = 0;; attempt++)
 	{
-		LionEntryTuple before = *cur;
+		union
+		{
+			LionEntryTuple e;
+			LionEntryChainHdr c;	/* room for either header form */
+		}			before;
 		bool		ok;
 
 		/*
@@ -1468,6 +1496,7 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		 * from one still to wake from the point, but it can tell two points
 		 * apart.
 		 */
+		memcpy(&before, cur, LionEntryHdrSize(cur));
 		if (attempt > 0)
 			LION_INJECTION_POINT("lion-verify-set-rewalk");
 
@@ -1477,7 +1506,7 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		ok = lion_verify_chain(vs, blk, off, cur, false, &res);
 		(void) lion_verify_refind(vs, cur, &blk, &off, false);
 
-		if (ok && lion_verify_same_entry(&before, cur))
+		if (ok && lion_verify_same_entry(&before.e, cur))
 		{
 			lion_verify_track_end(vs, true);
 			lion_verify_chain_totals(vs, blk, off, cur, &res, true);
@@ -1647,7 +1676,7 @@ lion_verify_pos_covers(LionVerifyState *vs, const LionEntryTuple *entry,
 	cv.missing = 0;
 	cv.first_missing = 0;
 
-	buf = lion_posting_search(vs->index, NULL, entry->hash, entry->head, 0,
+	buf = lion_posting_search(vs->index, NULL, lion_entry_owner(entry), lion_entry_head(entry), 0,
 							  BUFFER_LOCK_SHARE, false);
 	while (BufferIsValid(buf))
 	{
@@ -1664,11 +1693,11 @@ lion_verify_pos_covers(LionVerifyState *vs, const LionEntryTuple *entry,
 		 */
 		if (++steps > vs->nblocks)
 			lion_corrupt("lion index \"%s\": the leaves of the posting set at %u form a cycle",
-						RelationGetRelationName(vs->index), entry->head);
-		if (!lion_page_owns_entry(page, entry->hash, entry->head) ||
+						RelationGetRelationName(vs->index), lion_entry_head(entry));
+		if (!lion_page_owns_entry(page, lion_entry_owner(entry), lion_entry_head(entry)) ||
 			!LionPageIsPostingLeaf(page))
 			lion_corrupt("lion index \"%s\": block %u is not a leaf of the posting set at %u",
-						RelationGetRelationName(vs->index), blk, entry->head);
+						RelationGetRelationName(vs->index), blk, lion_entry_head(entry));
 		for (o = FirstOffsetNumber; o <= maxoff; o++)
 		{
 			LionContainer *c = lion_page_item_fetch(vs->index, page, blk, o);
@@ -1868,10 +1897,10 @@ lion_verify_postree(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 
 	if (BufferIsValid(leaf))
 	{
-		if (nmembers < cur->ntids)
+		if (nmembers < lion_entry_ntids(cur))
 			lion_corrupt("lion index \"%s\": chain entry %u on block %u has " UINT64_FORMAT " TIDs but positions for " UINT64_FORMAT " rows",
 						RelationGetRelationName(vs->index), off, blk,
-						cur->ntids, nmembers);
+						lion_entry_ntids(cur), nmembers);
 		lion_verify_pos_covers(vs, cur, codes, nmembers, blk, off);
 		UnlockReleaseBuffer(leaf);
 	}
@@ -1897,7 +1926,7 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 	uint16		kind;
 	LionState  *state;
 
-	if (itemsz < LION_ENTRY_HDRSZ)
+	if (itemsz < LION_ENTRY_SHORT_HDRSZ)
 		lion_corrupt("lion index \"%s\": entry %u on block %u is only %zu bytes",
 					RelationGetRelationName(vs->index), off, blk, itemsz);
 
@@ -1926,7 +1955,7 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 	vs->lastattno = entry->attno;
 	state = lion_column(vs->ix, (AttrNumber) entry->attno);
 
-	if (entry->unused != 0)
+	if (kind == LION_ENTRY_CHAIN && LionEntryChainHeader(entry)->unused != 0)
 		lion_corrupt("lion index \"%s\": entry %u on block %u has a non-zero reserved header field",
 					RelationGetRelationName(vs->index), off, blk);
 
@@ -1937,9 +1966,20 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 	if ((entry->flags & ~(uint16) (LION_ENTRY_INLINE | LION_ENTRY_CHAIN |
 								   LION_ENTRY_RESERVED |
 								   LION_ENTRY_SUMKINDS |
-								   LION_ENTRY_POSITIONS)) != 0)
+								   LION_ENTRY_POSITIONS |
+								   LION_ENTRY_ALIGNKEY)) != 0)
 		lion_corrupt("lion index \"%s\": entry %u on block %u has unknown flag bits in 0x%04X",
 					RelationGetRelationName(vs->index), off, blk, entry->flags);
+
+	/*
+	 * Where the key is (lion_entryfmt.h): double-aligned exactly when the key
+	 * column's type needs it.  A reserved entry has no key, and no flag.
+	 */
+	if ((entry->flags & LION_ENTRY_ALIGNKEY) !=
+		(LionEntryIsReserved(entry) ? 0 : lion_key_layout_flags(state)))
+		lion_corrupt("lion index \"%s\": entry %u on block %u has flags 0x%04X, which place its key where key column %u does not keep it",
+					RelationGetRelationName(vs->index), off, blk, entry->flags,
+					entry->attno);
 
 	/*
 	 * A SUMMARY entry (DESIGN.md §32): only in a column the meta page says has
@@ -1972,8 +2012,8 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 	if (LionEntryIsReserved(entry))
 	{
 		/*
-		 * A reserved entry (DESIGN.md §14 and §17): no key bytes, hash 0,
-		 * bucket 0, and one of each per index at most - a second one would
+		 * A reserved entry (DESIGN.md §14 and §17): no key bytes, and one of
+		 * each per key column at most - a second one would
 		 * split its rows between two entries that no reader looks for twice.
 		 */
 		const char *what = LionEntryIsNullKey(entry) ? "null" : "empty";
@@ -1982,10 +2022,6 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 			lion_corrupt("lion index \"%s\": %s entry %u on block %u has a key of %u bytes",
 						RelationGetRelationName(vs->index), what, off, blk,
 						entry->keylen);
-		if (entry->hash != LION_NULLKEY_HASH)
-			lion_corrupt("lion index \"%s\": %s entry %u on block %u stores hash %u, expected %d",
-						RelationGetRelationName(vs->index), what, off, blk,
-						entry->hash, LION_NULLKEY_HASH);
 		if (LionEntryIsNullKey(entry) ?
 			(++vs->nnullentries[entry->attno - 1] > 1) :
 			(++vs->nemptyentries[entry->attno - 1] > 1))
@@ -2004,20 +2040,7 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 						entry->attno);
 	}
 	else
-	{
-		uint32		hash;
-
 		lion_verify_keylen(vs, state, blk, off, entry);
-
-		/* A summary's hash is a constant, not its key's (DESIGN.md §32). */
-		hash = LionEntryIsSummary(entry) ? LION_SUMMARY_HASH :
-			lion_hash_key(state,
-						  lion_entry_key(state, entry));
-		if (hash != entry->hash)
-			lion_corrupt("lion index \"%s\": entry %u on block %u stores hash %u, but its key hashes to %u",
-						RelationGetRelationName(vs->index), off, blk,
-						entry->hash, hash);
-	}
 
 	/*
 	 * Stored positions (DESIGN.md §17): every key entry of a column that
@@ -2040,7 +2063,7 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 			(BlockNumberIsValid(x->pos_root) ||
 			 x->pos_len > itemsz - LionEntryPayloadOffset(entry) ||
 			 (itemsz - x->pos_len) != MAXALIGN(itemsz - x->pos_len) ||
-			 (x->pos_len == 0) != (entry->ntids == 0)))
+			 (x->pos_len == 0) != (lion_entry_ntids(entry) == 0)))
 			lion_corrupt("lion index \"%s\": %s entry %u on block %u has position root %u and %u bytes of inline positions",
 						RelationGetRelationName(vs->index),
 						kind == LION_ENTRY_CHAIN ? "chain" : "inline", off, blk,
@@ -2051,10 +2074,10 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 
 			(void) lion_entry_inline_poschunk(vs->index, entry, itemsz, blk,
 											  off, pc);
-			if (pc->cardinality != entry->ntids)
+			if (pc->cardinality != lion_entry_ntids(entry))
 				lion_corrupt("lion index \"%s\": inline entry %u on block %u holds positions for %u rows, but " UINT64_FORMAT " TIDs",
 							RelationGetRelationName(vs->index), off, blk,
-							(unsigned) pc->cardinality, entry->ntids);
+							(unsigned) pc->cardinality, lion_entry_ntids(entry));
 			pfree(pc);
 		}
 	}
@@ -2069,10 +2092,10 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 		uint64		card = 0;
 		uint32		ncontainers = 0;
 
-		if (BlockNumberIsValid(entry->head) || BlockNumberIsValid(entry->tail))
+		if (BlockNumberIsValid(lion_entry_head(entry)) || BlockNumberIsValid(lion_entry_tail(entry)))
 			lion_corrupt("lion index \"%s\": inline entry %u on block %u has head %u and tail %u, expected none",
 						RelationGetRelationName(vs->index), off, blk,
-						entry->head, entry->tail);
+						lion_entry_head(entry), lion_entry_tail(entry));
 
 		while ((csize = lion_inline_fetch(LionEntryGetPayload(entry), paylen,
 										 &cur, vs->cbuf)) > 0)
@@ -2108,15 +2131,15 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 			}
 		}
 
-		if (card != entry->ntids)
+		if (card != lion_entry_ntids(entry))
 			lion_corrupt("lion index \"%s\": inline entry %u on block %u claims " UINT64_FORMAT " TIDs, but its payload holds " UINT64_FORMAT,
 						RelationGetRelationName(vs->index), off, blk,
-						entry->ntids, card);
+						lion_entry_ntids(entry), card);
 
-		if (ncontainers != entry->ncontainers)
+		if (ncontainers != lion_entry_ncontainers(entry))
 			lion_corrupt("lion index \"%s\": inline entry %u on block %u claims %u containers, but its payload holds %u",
 						RelationGetRelationName(vs->index), off, blk,
-						entry->ncontainers, ncontainers);
+						lion_entry_ncontainers(entry), ncontainers);
 	}
 	else
 	{
@@ -2125,10 +2148,10 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 						RelationGetRelationName(vs->index), off, blk, itemsz,
 						LionEntryPayloadOffset(entry));
 
-		if (!BlockNumberIsValid(entry->head) || !BlockNumberIsValid(entry->tail))
+		if (!BlockNumberIsValid(lion_entry_head(entry)) || !BlockNumberIsValid(lion_entry_tail(entry)))
 			lion_corrupt("lion index \"%s\": chain entry %u on block %u has head %u and tail %u",
 						RelationGetRelationName(vs->index), off, blk,
-						entry->head, entry->tail);
+						lion_entry_head(entry), lion_entry_tail(entry));
 
 		lion_verify_set(vs, blk, off, entry);
 		if ((entry->flags & LION_ENTRY_POSITIONS) != 0)

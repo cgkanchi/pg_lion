@@ -145,13 +145,16 @@ lion_verify_find_heads(LionVerifyState *vs, const BlockNumber *roots, int n,
 			ItemId		iid = lion_verify_itemid(vs, blk, page, off);
 			LionEntryTuple *e;
 			BlockNumber *hit;
+			BlockNumber ehead;
 
-			if (!ItemIdIsUsed(iid) || ItemIdGetLength(iid) < LION_ENTRY_HDRSZ)
+			if (!ItemIdIsUsed(iid) || ItemIdGetLength(iid) < LION_ENTRY_SHORT_HDRSZ)
 				continue;
 			e = (LionEntryTuple *) PageGetItem(page, iid);
-			if ((e->flags & LION_ENTRY_CHAIN) == 0)
+			if ((e->flags & LION_ENTRY_CHAIN) == 0 ||
+				ItemIdGetLength(iid) < LION_ENTRY_CHAIN_HDRSZ)
 				continue;
-			hit = (BlockNumber *) bsearch(&e->head, roots, n, sizeof(BlockNumber),
+			ehead = lion_entry_head(e);
+			hit = (BlockNumber *) bsearch(&ehead, roots, n, sizeof(BlockNumber),
 										  lion_verify_blkcmp);
 			if (hit != NULL)
 				found[hit - roots] = true;
@@ -490,8 +493,8 @@ lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
 		}
 		else
 		{
-			head = entry->head;
-			ehash = entry->hash;
+			head = lion_entry_head(entry);
+			ehash = lion_entry_owner(entry);
 		}
 
 		UnlockReleaseBuffer(entrybuf);

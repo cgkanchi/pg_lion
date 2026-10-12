@@ -321,7 +321,8 @@ typedef struct LionBuilder
 {
 	Datum		key;			/* private copy of the key */
 	int			keykind;		/* LION_KEY_* */
-	uint32		hash;
+	uint32		hash;			/* the key's hash, for the order (§21) */
+	uint32		owner;			/* the owner stamp of its pages (§18) */
 	char	   *rawkey;			/* the key as the entry tuple stores it */
 	Size		rawlen;			/* ... which is the tail of the directory order */
 
@@ -454,6 +455,16 @@ typedef struct LionBuildState
 	uint32		inline_limit;
 	int			fillfactor;
 	Size		leafbudget;		/* bytes of a page ambuild fills */
+	int			posting_fillfactor;
+	Size		postbudget;		/* ... of a posting-tree leaf (§22) */
+
+	/*
+	 * Write INLINE entries and posting items with an insert's growth slack
+	 * (the `build_slack` reloption, DESIGN.md §4), and the buffer an item is
+	 * zero-padded in for it.
+	 */
+	bool		slack;
+	LionContainer *slackbuf;	/* LION_CONTAINER_MAX_SIZE bytes */
 
 	Size		dirbudget;		/* ... and of an internal one (§21) */
 
@@ -607,40 +618,11 @@ lion_build_parent(LionBuildState *bs, LionBuildLevel *lv)
 	return lv->parent;
 }
 
-/*
- * A pivot tuple carrying src's key: a high key, or a downlink to child.  A
- * column's SUMLAST entry gives a SUMMARY-kind pivot (lion_pivot_kindflags(),
- * DESIGN.md §32), as a split's does.
- */
-static LionEntryTuple *
-lion_build_pivot(const LionEntryTuple *src, uint16 pivotflag, BlockNumber child,
-				Size *size)
-{
-	Size		keylen = (src != NULL) ? src->keylen : 0;
-	Size		total = MAXALIGN(LION_ENTRY_HDRSZ + keylen);
-	LionEntryTuple *p = (LionEntryTuple *) palloc0(total);
-
-	p->hash = (src != NULL) ? src->hash : 0;
-	p->flags = pivotflag |
-		((src != NULL) ? lion_pivot_kindflags(src->flags) :
-		 (uint16) LION_ENTRY_MINUSINF);
-	p->keylen = (uint16) keylen;
-	p->head = child;
-	p->tail = InvalidBlockNumber;
-	/* A pivot routes to the column its source key belongs to (§24). */
-	p->attno = (src != NULL) ? src->attno : 0;
-	if (keylen > 0)
-		memcpy(LionEntryGetKey(p), LionEntryGetKey(src), keylen);
-
-	*size = total;
-	return p;
-}
-
 /* What a pivot copy of this item's key costs on a page. */
 static inline Size
 lion_build_pivot_need(const LionEntryTuple *item)
 {
-	return MAXALIGN(LION_ENTRY_HDRSZ + item->keylen) + sizeof(ItemIdData);
+	return MAXALIGN(lion_pivot_size(item)) + sizeof(ItemIdData);
 }
 
 /* What this item costs on a page, line pointer in. */
@@ -724,7 +706,7 @@ lion_build_level_flush(LionBuildState *bs, LionBuildLevel *lv,
 
 	if (hksrc != NULL)
 	{
-		pivot = lion_build_pivot(hksrc, LION_ENTRY_HIGHKEY, InvalidBlockNumber,
+		pivot = lion_make_pivot(hksrc, LION_ENTRY_HIGHKEY, InvalidBlockNumber,
 								 &pivotsz);
 		if (PageAddItemExtended(page, (char *) pivot, pivotsz,
 								FirstOffsetNumber, 0) == InvalidOffsetNumber)
@@ -749,7 +731,7 @@ lion_build_level_flush(LionBuildState *bs, LionBuildLevel *lv,
 	 */
 	if (!isroot)
 	{
-		pivot = lion_build_pivot(lv->npages == 0 ? NULL :
+		pivot = lion_make_pivot(lv->npages == 0 ? NULL :
 								 (const LionEntryTuple *) lv->items[0],
 								 LION_ENTRY_DOWNLINK, thisblk, &pivotsz);
 		lion_build_level_add(bs, lion_build_parent(bs, lv), pivot, pivotsz);
@@ -874,7 +856,7 @@ lion_build_add_entry(LionBuildState *bs, LionEntryTuple *entry, Size size)
 	if (lion_entry_kind(entry) == LION_KIND_VALUE)
 		bs->nvalues[entry->attno - 1]++;
 	if (entry->attno == bs->rowcol && !LionEntryIsSummary(entry))
-		bs->rows += entry->ntids;
+		bs->rows += lion_entry_ntids(entry);
 }
 
 /*
@@ -917,15 +899,16 @@ lion_build_finish_dir(LionBuildState *bs)
  * --------------------------------------------------------------------- */
 
 static LionBuilder *
-lion_builder_create(LionBuildState *bs, Datum key, int keykind, uint32 hash)
+lion_builder_create(LionBuildState *bs, Datum key, int keykind, uint32 hash,
+					bool summary)
 {
 	LionBuilder *b = (LionBuilder *) palloc0(sizeof(LionBuilder));
 	LionState  *cs = bs->cur;
 
 	b->keykind = keykind;
+	b->hash = hash;
 	b->key = (keykind != LION_KEY_REAL) ? (Datum) 0 :
 		datumCopy(key, cs->typbyval, cs->typlen);
-	b->hash = hash;
 	/*
 	 * The stored bytes, which are the tail of the directory order
 	 * (DESIGN.md §21): two keys whose prefixes tie - which for an unordered
@@ -938,6 +921,8 @@ lion_builder_create(LionBuildState *bs, Datum key, int keykind, uint32 hash)
 		b->rawkey = (char *) palloc(b->rawlen);
 		lion_store_key(cs, b->key, b->rawkey);
 	}
+	b->owner = lion_owner_stamp(summary ? LION_KIND_SUMMARY : keykind,
+								b->rawkey, b->rawlen);
 	b->cur = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	b->cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	b->seg = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
@@ -948,8 +933,10 @@ lion_builder_create(LionBuildState *bs, Datum key, int keykind, uint32 hash)
 	b->inlineused = 0;
 	/* the bound lion_insert.c spills at, so that a rebuild can write it too */
 	b->inlinemax = lion_inline_max((keykind == LION_KEY_REAL) ?
-								   MAXALIGN(LION_ENTRY_HDRSZ + b->rawlen) :
-								   MAXALIGN(LION_ENTRY_HDRSZ),
+								   lion_entry_payoff_for(LION_ENTRY_INLINE |
+														 lion_key_layout_flags(cs),
+														 b->rawlen) :
+								   lion_entry_payoff_for(LION_ENTRY_INLINE, 0),
 								   (Size) bs->inline_limit);
 	b->spilled = false;
 	b->head = InvalidBlockNumber;
@@ -1040,7 +1027,7 @@ lion_post_level_flush(LionBuildState *bs, LionBuilder *b, LionPostLevel *lv,
 	page = (Page) buf->data;
 	LionPageGetOpaque(page)->level = lv->level;
 	LionPageGetOpaque(page)->rightlink = nextblk;
-	lion_page_set_owner(page, b->hash, b->head);
+	lion_page_set_owner(page, b->owner, b->head);
 
 	if (hk != NULL)
 	{
@@ -1120,7 +1107,7 @@ lion_builder_start_tree(LionBuildState *bs, LionBuilder *b)
 	{
 		Page		leaf = (Page) b->held[i]->data;
 
-		lion_page_set_owner(leaf, b->hash, b->head);
+		lion_page_set_owner(leaf, b->owner, b->head);
 		lion_post_level_add(bs, b, b->plevel, LionPageGetOpaque(leaf)->minckey,
 							b->heldblk[i]);
 		smgr_bulk_write(bs->bulk, b->heldblk[i], b->held[i], true);
@@ -1173,6 +1160,28 @@ lion_builder_finish_tree(LionBuildState *bs, LionBuilder *b)
 }
 
 /*
+ * Is the posting leaf under construction final, given the next item?  It is
+ * when the item does not fit, and when taking it would fill the page past
+ * `posting_fillfactor` (DESIGN.md §22, "Bulk build") - unless the page is
+ * still empty: a leaf always takes its first item, which every item fits.
+ * The budget counts what PageAddItem() spends, the MAXALIGNed item and its
+ * line pointer, so at 100 the second test is the first one again.
+ */
+static bool
+lion_builder_leaf_full(const LionBuildState *bs, Page img, Size csize)
+{
+	Size		used;
+
+	if (PageGetFreeSpace(img) < MAXALIGN(csize))
+		return true;
+	if (PageGetMaxOffsetNumber(img) == 0)
+		return false;
+
+	used = LION_PAGE_CAPACITY - PageGetExactFreeSpace(img);
+	return used + MAXALIGN(csize) + sizeof(ItemIdData) > bs->postbudget;
+}
+
+/*
  * Append one finished container to the posting set under construction.
  */
 static void
@@ -1188,12 +1197,34 @@ lion_builder_spill(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 		b->head = b->curblk;
 		b->haspage = true;
 		/* DESIGN.md §18: every container page names the set it belongs to. */
-		lion_page_set_owner((Page) b->pagebuf->data, b->hash, b->head);
+		lion_page_set_owner((Page) b->pagebuf->data, b->owner, b->head);
 	}
 
 	img = (Page) b->pagebuf->data;
 
-	if (PageGetFreeSpace(img) < MAXALIGN(csize))
+	/*
+	 * The growth slack an insert would give the item (DESIGN.md §4), when the
+	 * build gives it: the item goes onto the page at that length, zero-padded
+	 * in a buffer of the largest item size, and it is that length the leaf's
+	 * fill counts.  A BITSET or a NARROW gets none (lion_item_alloc_size()).
+	 */
+	if (bs->slack)
+	{
+		Size		alloc = lion_item_alloc_size(c, csize);
+
+		if (alloc > csize)
+		{
+			if (bs->slackbuf == NULL)
+				bs->slackbuf = (LionContainer *)
+					MemoryContextAlloc(bs->buildctx, LION_CONTAINER_MAX_SIZE);
+			memcpy(bs->slackbuf, c, csize);
+			lion_item_zero_slack(bs->slackbuf, csize, alloc);
+			c = bs->slackbuf;
+			csize = alloc;
+		}
+	}
+
+	if (lion_builder_leaf_full(bs, img, csize))
 	{
 		BlockNumber next;
 
@@ -1220,7 +1251,7 @@ lion_builder_spill(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 			if (!b->hastree)
 			{
 				lion_builder_start_tree(bs, b);
-				lion_page_set_owner(img, b->hash, b->head);
+				lion_page_set_owner(img, b->owner, b->head);
 			}
 			lion_post_level_add(bs, b, b->plevel,
 								LionPageGetOpaque(img)->minckey, b->curblk);
@@ -1231,7 +1262,7 @@ lion_builder_spill(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 		b->curblk = next;
 		b->pagebuf = lion_build_get_page(bs, LION_PAGE_CONTAINER);
 		img = (Page) b->pagebuf->data;
-		lion_page_set_owner(img, b->hash, b->head);
+		lion_page_set_owner(img, b->owner, b->head);
 	}
 
 	if (PageAddItemExtended(img, c, csize, InvalidOffsetNumber, 0) ==
@@ -1440,7 +1471,7 @@ lion_builder_add_positions(LionBuildState *bs, LionBuilder *b,
 	}
 
 	lion_entry_posext(ext)->pos_root = BlockNumberIsValid(b->posroot) ?
-		b->posroot : lion_posbuild_chunk_tree(&bs->pw, b->hash, b->poschunk);
+		b->posroot : lion_posbuild_chunk_tree(&bs->pw, b->owner, b->poschunk);
 	*size = extsz;
 	return ext;
 }
@@ -1482,10 +1513,9 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 			lion_make_reserved_entry((AttrNumber) bs->cur->attno,
 									lion_reserved_flag(b->keykind),
 									LION_ENTRY_CHAIN, NULL, 0, &size) :
-			lion_make_entry(bs->cur, b->key, b->hash, LION_ENTRY_CHAIN,
-						   NULL, 0, &size);
-		entry->head = b->head;
-		entry->tail = b->curblk;
+			lion_make_entry(bs->cur, b->key, LION_ENTRY_CHAIN, NULL, 0, &size);
+		lion_entry_set_head(entry, b->head);
+		lion_entry_set_tail(entry, b->curblk);
 	}
 	else
 	{
@@ -1494,13 +1524,38 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 									lion_reserved_flag(b->keykind),
 									LION_ENTRY_INLINE, b->inlinebuf,
 									b->inlineused, &size) :
-			lion_make_entry(bs->cur, b->key, b->hash, LION_ENTRY_INLINE,
-						   b->inlinebuf, b->inlineused, &size);
+			lion_make_entry(bs->cur, b->key, LION_ENTRY_INLINE,
+							b->inlinebuf, b->inlineused, &size);
 	}
 
-	entry->ncontainers = b->nitems;
-	entry->ntids = b->ntids;
+	lion_entry_set_ncontainers(entry, b->nitems);
+	lion_entry_set_ntids(entry, b->ntids);
 	entry->flags |= b->sumflags;
+
+	/*
+	 * An INLINE payload's growth slack (DESIGN.md §4), when the build gives
+	 * it: the zeroed bytes an insert's rewrite would have allotted the entry,
+	 * by the same rule and the same caps (inline_limit, the largest entry),
+	 * so that the first member an insert adds lands inside the entry and no
+	 * other entry on the leaf moves.  An entry that stores positions keeps
+	 * its exact size: its payload is followed by a positions chunk.
+	 */
+	if (bs->slack && !b->spilled && !b->haspos && b->inlineused > 0)
+	{
+		Size		payoff = LionEntryPayloadOffset(entry);
+		Size		alloc;
+
+		Assert(size == payoff + b->inlineused);
+		alloc = lion_entry_alloc_size(payoff, b->inlineused,
+									  (Size) bs->inline_limit,
+									  (Size) LION_MAX_ENTRY_SIZE);
+		if (alloc > size)
+		{
+			entry = (LionEntryTuple *) repalloc(entry, alloc);
+			memset((char *) entry + size, 0, alloc - size);
+			size = alloc;
+		}
+	}
 
 	if (b->haspos)
 		entry = lion_builder_add_positions(bs, b, entry, &size);
@@ -1904,7 +1959,7 @@ lion_sum_finish(LionBuildState *bs, LionSumBuild *sum)
 
 			Assert(bs->nbuilders == 0);
 			b = lion_builder_create(bs, key, LION_KEY_REAL,
-									LION_SUMMARY_HASH);
+									LION_SUMMARY_HASH, true);
 			bs->nbuilders = 0;	/* written here, not by lion_flush_builders() */
 			b->sumflags = hdr.sumflags;
 
@@ -1992,7 +2047,7 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 	{
 		const LionSpoolEntry *e = lion_spool_group_entry(group, i);
 
-		b[i] = lion_builder_create(bs, e->key, e->kind, e->hash);
+		b[i] = lion_builder_create(bs, e->key, e->kind, e->hash, false);
 	}
 
 	/*
@@ -2012,13 +2067,15 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 					 errmsg("lion index \"%s\": keys that compare equal but differ cannot store positions",
 							RelationGetRelationName(bs->index))));
 		b[0]->haspos = true;
-		lion_posbuild_take(bs->posbuild, e->key, e->hash, &bs->pw, &chunk,
+		lion_posbuild_take(bs->posbuild, e->key, b[0]->owner, &bs->pw, &chunk,
 						   &b[0]->posroot, &b[0]->posmembers);
 		if (chunk != NULL)
 		{
 			Size		poslen = lion_poschunk_size(chunk);
-			Size		payoff = MAXALIGN(LION_ENTRY_HDRSZ + b[0]->rawlen) +
-				LION_ENTRY_POSEXT_SIZE;
+			Size		payoff =
+				lion_entry_payoff_for(LION_ENTRY_INLINE | LION_ENTRY_POSITIONS |
+									  lion_key_layout_flags(bs->cur),
+									  b[0]->rawlen);
 			Size		limit = lion_inline_max(payoff, (Size) bs->inline_limit);
 
 			b[0]->poschunk = (LionContainer *) palloc(poslen);
@@ -2078,7 +2135,7 @@ lion_build_index_state(Relation index, LionIndexState *ix, MemoryContext cxt)
 	/* The root is filled in once the tree has been built. */
 	memset(&meta, 0, sizeof(meta));
 	meta.magic = LION_MAGIC;
-	meta.version = LION_VERSION_V9;
+	meta.version = LION_VERSION_V10;
 	meta.offset_bits = LION_OFFSET_BITS;
 	meta.container_bits = LION_CONTAINER_BITS;
 	meta.inline_limit = inline_limit;
@@ -2484,6 +2541,29 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.index = index;
 	bs.indtuples = 0;
 	bs.fillfactor = opts ? opts->fillfactor : LION_DEFAULT_FILLFACTOR;
+	bs.posting_fillfactor = opts ? opts->posting_fillfactor :
+		LION_DEFAULT_POSTING_FILLFACTOR;
+	switch (opts ? opts->build_slack : LION_DEFAULT_BUILD_SLACK)
+	{
+		case LION_SLACKOPT_ON:
+			bs.slack = true;
+			break;
+		case LION_SLACKOPT_OFF:
+			bs.slack = false;
+			break;
+		default:
+
+			/*
+			 * AUTO: where a moved item costs the most.  A generic-WAL record
+			 * is a byte diff of the page, so the first insert into an item
+			 * written at its exact size - which moves every item stored
+			 * below it - logs all of them; a resource-manager record logs the
+			 * item's own change whether or not others move (DESIGN.md §4).
+			 */
+			bs.slack = (lion_wal_mode_for_build(index) == LION_WAL_MODE_GENERIC);
+			break;
+	}
+	bs.slackbuf = NULL;
 	bs.max_entries = lion_max_entries(index);
 	bs.root = InvalidBlockNumber;
 	bs.height = 0;
@@ -2505,6 +2585,13 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 */
 	bs.leafbudget = Max(LION_PAGE_CAPACITY * (Size) bs.fillfactor / 100, 1);
 	bs.dirbudget = LION_PAGE_CAPACITY * (Size) LION_NONLEAF_FILLFACTOR / 100;
+
+	/*
+	 * And a posting-tree leaf (DESIGN.md §22, "Bulk build").  At 100 this is
+	 * the whole page, and the test in lion_builder_spill() is then exactly
+	 * "the next item does not fit".
+	 */
+	bs.postbudget = LION_PAGE_CAPACITY * (Size) bs.posting_fillfactor / 100;
 
 	bs.buildctx = AllocSetContextCreate(CurrentMemoryContext,
 										"lion index build",

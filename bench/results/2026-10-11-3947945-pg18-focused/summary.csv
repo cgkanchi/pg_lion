@@ -1,0 +1,395 @@
+Suite,Rows,State,Planner,work_mem,Query,Variant,n,Execution median ms,95% CI ms,p95 ms,CV,Speedup vs seq,Access,Planning median ms,Plan+execution median ms
+documents,200000,clean,default,64MB,array_and,gin,3,1.257,0.904–1.426,1.409,22.3%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.139,1.387
+documents,200000,clean,default,64MB,array_and,roaring,3,0.117,0.089–0.118,0.118,15.2%,—,LionCount,0.156,0.273
+documents,200000,clean,default,64MB,array_and,roaring_bitmap,3,0.317,0.129–0.409,0.400,50.1%,—,Index Scan,0.194,0.512
+documents,200000,clean,default,64MB,array_common,gin,3,8.964,8.168–9.078,9.067,5.7%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.110,9.074
+documents,200000,clean,default,64MB,array_common,roaring,3,0.047,0.039–0.075,0.072,35.2%,—,LionCount,0.165,0.240
+documents,200000,clean,default,64MB,array_common,roaring_bitmap,3,2.775,2.405–6.305,5.952,56.2%,—,Index Scan,0.097,2.863
+documents,200000,clean,default,64MB,array_or,gin,3,13.607,11.830–13.666,13.660,8.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.112,13.719
+documents,200000,clean,default,64MB,array_or,roaring,3,0.144,0.138–0.195,0.190,19.7%,—,LionCount,0.126,0.270
+documents,200000,clean,default,64MB,array_or,roaring_bitmap,3,7.050,5.810–9.059,8.858,22.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.094,7.144
+documents,200000,clean,default,64MB,ts_and,gin,3,1.366,0.985–1.525,1.509,21.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.113,1.450
+documents,200000,clean,default,64MB,ts_and,roaring,3,0.111,0.084–0.120,0.119,17.8%,—,LionCount,0.142,0.238
+documents,200000,clean,default,64MB,ts_and,roaring_bitmap,3,0.165,0.104–0.256,0.247,43.7%,—,Index Scan,0.065,0.230
+documents,200000,clean,default,64MB,ts_common,gin,3,41.415,37.400–58.474,56.768,24.5%,—,Seq Scan (fallback),0.079,41.497
+documents,200000,clean,default,64MB,ts_common,roaring,3,0.125,0.078–0.130,0.130,25.8%,—,LionCount,0.134,0.231
+documents,200000,clean,default,64MB,ts_common,roaring_bitmap,3,58.480,34.761–61.668,61.349,28.5%,—,Seq Scan (fallback),0.149,58.655
+documents,200000,clean,default,64MB,ts_fetch,gin,3,9.787,8.090–11.559,11.382,17.7%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.090,9.868
+documents,200000,clean,default,64MB,ts_fetch,roaring,3,8.960,7.089–9.087,9.074,13.4%,—,Index Scan,0.091,9.051
+documents,200000,clean,default,64MB,ts_fetch,roaring_bitmap,3,8.134,4.858–9.258,9.146,30.8%,—,Index Scan,0.104,8.238
+documents,200000,clean,default,64MB,ts_not,gin,3,48.621,45.093–68.385,66.409,23.2%,—,Seq Scan (fallback),0.095,48.719
+documents,200000,clean,default,64MB,ts_not,roaring,3,13.250,12.844–13.399,13.384,2.2%,—,LionCount,0.141,13.373
+documents,200000,clean,default,64MB,ts_not,roaring_bitmap,3,51.823,41.651–71.762,69.768,27.8%,—,Seq Scan (fallback),0.067,51.880
+documents,200000,clean,default,64MB,ts_phrase,gin,3,16.106,10.196–16.388,16.360,24.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.104,16.210
+documents,200000,clean,default,64MB,ts_phrase,roaring,3,4.575,4.432–4.686,4.675,2.8%,—,LionCount,0.128,4.708
+documents,200000,clean,default,64MB,ts_phrase,roaring_bitmap,3,6.003,5.140–6.087,6.079,9.1%,—,Index Scan,0.095,6.081
+documents,200000,clean,default,64MB,ts_prefix,gin,3,3.231,2.797–3.883,3.818,16.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.088,3.319
+documents,200000,clean,default,64MB,ts_prefix,roaring,3,0.973,0.913–1.026,1.021,5.8%,—,LionCount,0.140,1.107
+documents,200000,clean,default,64MB,ts_prefix,roaring_bitmap,3,3.170,1.530–3.467,3.437,38.3%,—,Index Scan,0.096,3.266
+documents,200000,clean,default,64MB,ts_rare,gin,3,0.073,0.062–0.131,0.125,41.8%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.089,0.162
+documents,200000,clean,default,64MB,ts_rare,roaring,3,0.030,0.030–0.030,0.030,0.0%,—,LionCount,0.161,0.191
+documents,200000,clean,default,64MB,ts_rare,roaring_bitmap,3,0.064,0.029–0.064,0.064,38.6%,—,Index Scan,0.089,0.153
+documents,200000,clean,default,64MB,ts_tree,gin,3,5.315,4.061–5.688,5.651,17.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.091,5.397
+documents,200000,clean,default,64MB,ts_tree,roaring,3,0.367,0.340–0.374,0.373,5.0%,—,LionCount,0.129,0.496
+documents,200000,clean,default,64MB,ts_tree,roaring_bitmap,3,0.668,0.567–1.018,0.983,31.5%,—,Index Scan,0.086,0.765
+documents,200000,clean,default,64MB,ts_weight,gin,3,12.109,8.680–12.984,12.896,20.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.097,12.194
+documents,200000,clean,default,64MB,ts_weight,roaring,3,0.625,0.507–0.640,0.638,12.3%,—,LionCount,0.121,0.746
+documents,200000,clean,default,64MB,ts_weight,roaring_bitmap,3,3.743,3.045–4.768,4.665,22.5%,—,Index Scan,0.091,3.834
+scalar,1000000,after_maintenance,default,64MB,and2,btree,3,6.383,6.048–6.474,6.465,3.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.092,6.447
+scalar,1000000,after_maintenance,default,64MB,and2,gin,3,29.884,25.803–36.347,35.701,17.3%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.146,30.063
+scalar,1000000,after_maintenance,default,64MB,and2,roaring,3,0.118,0.113–0.120,0.120,3.1%,—,LionCount,0.105,0.219
+scalar,1000000,after_maintenance,default,64MB,and2,roaring_bitmap,3,7.610,6.010–8.280,8.213,16.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.099,7.709
+scalar,1000000,after_maintenance,default,64MB,eq_c200_17,btree,3,0.359,0.358–0.367,0.366,1.4%,—,Index Only Scan,0.101,0.460
+scalar,1000000,after_maintenance,default,64MB,eq_c200_17,gin,3,6.294,5.605–7.778,7.630,16.9%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.106,6.397
+scalar,1000000,after_maintenance,default,64MB,eq_c200_17,roaring,3,0.045,0.030–0.048,0.048,23.5%,—,LionCount,0.069,0.117
+scalar,1000000,after_maintenance,default,64MB,eq_c200_17,roaring_bitmap,3,4.291,2.210–4.323,4.320,33.6%,—,Index Scan,0.105,4.396
+scalar,1000000,after_maintenance,default,64MB,group_c200,btree,3,68.773,67.915–72.471,72.101,3.5%,—,Index Only Scan,0.058,68.831
+scalar,1000000,after_maintenance,default,64MB,group_c200,gin,3,200.295,122.251–206.066,205.489,26.6%,—,Seq Scan (fallback),0.110,200.395
+scalar,1000000,after_maintenance,default,64MB,group_c200,roaring,3,4.241,4.196–4.628,4.589,5.5%,—,LionCount,0.050,4.313
+scalar,1000000,after_maintenance,default,64MB,group_c200,roaring_bitmap,3,137.726,124.588–153.773,152.168,10.5%,—,Seq Scan (fallback),0.073,137.828
+scalar,1000000,after_maintenance,default,64MB,is_null,btree,3,5.608,5.442–7.059,6.914,14.7%,—,Index Only Scan,0.052,5.668
+scalar,1000000,after_maintenance,default,64MB,is_null,gin,3,66.907,66.465–90.271,87.935,18.3%,—,Seq Scan (fallback),0.063,66.962
+scalar,1000000,after_maintenance,default,64MB,is_null,roaring,3,0.069,0.058–0.086,0.084,19.9%,—,LionCount,0.058,0.139
+scalar,1000000,after_maintenance,default,64MB,is_null,roaring_bitmap,3,31.833,27.418–34.314,34.066,11.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.066,31.916
+scalar,1000000,clean,default,64MB,and2,btree,3,6.387,5.351–7.156,7.079,14.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.129,6.516
+scalar,1000000,clean,default,64MB,and2,gin,3,30.888,28.156–40.393,39.443,19.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.119,30.986
+scalar,1000000,clean,default,64MB,and2,roaring,3,0.133,0.109–0.192,0.186,29.5%,—,LionCount,0.086,0.240
+scalar,1000000,clean,default,64MB,and2,roaring_bitmap,3,7.508,6.979–7.872,7.836,6.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.076,7.586
+scalar,1000000,clean,default,64MB,and3_selective,btree,3,0.473,0.388–0.500,0.497,12.9%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.083,0.556
+scalar,1000000,clean,default,64MB,and3_selective,gin,3,0.596,0.561–0.625,0.622,5.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.127,0.723
+scalar,1000000,clean,default,64MB,and3_selective,roaring,3,0.042,0.040–0.043,0.043,3.7%,—,LionCount,0.109,0.151
+scalar,1000000,clean,default,64MB,and3_selective,roaring_bitmap,3,0.440,0.391–0.450,0.449,7.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.109,0.559
+scalar,1000000,clean,default,64MB,eq_c1m_12345,btree,3,0.024,0.017–0.032,0.031,30.8%,—,Index Only Scan,0.039,0.063
+scalar,1000000,clean,default,64MB,eq_c1m_12345,gin,3,0.038,0.019–0.041,0.041,36.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.071,0.109
+scalar,1000000,clean,default,64MB,eq_c1m_12345,roaring,3,0.025,0.015–0.028,0.028,30.0%,—,LionCount,0.077,0.102
+scalar,1000000,clean,default,64MB,eq_c1m_12345,roaring_bitmap,3,0.040,0.032–0.044,0.044,15.8%,—,Index Scan,0.081,0.121
+scalar,1000000,clean,default,64MB,eq_c200_17,btree,3,0.295,0.286–0.322,0.319,6.2%,—,Index Only Scan,0.055,0.361
+scalar,1000000,clean,default,64MB,eq_c200_17,gin,3,5.932,5.918–6.415,6.367,4.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.109,6.046
+scalar,1000000,clean,default,64MB,eq_c200_17,roaring,3,0.041,0.038–0.047,0.046,10.9%,—,LionCount,0.069,0.107
+scalar,1000000,clean,default,64MB,eq_c200_17,roaring_bitmap,3,4.240,4.197–4.464,4.442,3.3%,—,Index Scan,0.071,4.335
+scalar,1000000,clean,default,64MB,eq_c20k_123,btree,3,0.029,0.021–0.045,0.043,38.6%,—,Index Only Scan,0.062,0.091
+scalar,1000000,clean,default,64MB,eq_c20k_123,gin,3,0.087,0.042–0.101,0.100,40.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.065,0.152
+scalar,1000000,clean,default,64MB,eq_c20k_123,roaring,3,0.024,0.023–0.025,0.025,4.2%,—,LionCount,0.077,0.102
+scalar,1000000,clean,default,64MB,eq_c20k_123,roaring_bitmap,3,0.104,0.101–0.113,0.112,5.9%,—,Index Scan,0.115,0.216
+scalar,1000000,clean,default,64MB,eq_c2_0,btree,3,26.916,25.606–31.386,30.939,10.8%,—,Index Only Scan,0.051,26.952
+scalar,1000000,clean,default,64MB,eq_c2_0,gin,3,103.464,96.869–136.008,132.754,18.7%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.102,103.597
+scalar,1000000,clean,default,64MB,eq_c2_0,roaring,3,0.072,0.069–0.092,0.090,16.1%,—,LionCount,0.071,0.163
+scalar,1000000,clean,default,64MB,eq_c2_0,roaring_bitmap,3,72.493,65.213–101.971,99.023,24.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.049,72.544
+scalar,1000000,clean,default,64MB,eq_skew_0,btree,3,50.750,48.173–77.555,74.875,27.7%,—,Index Only Scan,0.050,50.800
+scalar,1000000,clean,default,64MB,eq_skew_0,gin,3,89.170,87.160–128.644,124.697,23.0%,—,Seq Scan (fallback),0.106,89.251
+scalar,1000000,clean,default,64MB,eq_skew_0,roaring,3,0.075,0.074–0.080,0.080,4.2%,—,LionCount,0.082,0.162
+scalar,1000000,clean,default,64MB,eq_skew_0,roaring_bitmap,3,103.309,78.973–131.774,128.928,25.2%,—,Seq Scan (fallback),0.077,103.386
+scalar,1000000,clean,default,64MB,eq_skew_17,btree,3,0.029,0.027–0.030,0.030,5.3%,—,Index Only Scan,0.038,0.068
+scalar,1000000,clean,default,64MB,eq_skew_17,gin,3,0.220,0.176–0.229,0.228,13.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.106,0.326
+scalar,1000000,clean,default,64MB,eq_skew_17,roaring,3,0.022,0.020–0.026,0.026,13.5%,—,LionCount,0.061,0.083
+scalar,1000000,clean,default,64MB,eq_skew_17,roaring_bitmap,3,0.171,0.157–0.239,0.232,23.2%,—,Index Scan,0.083,0.252
+scalar,1000000,clean,default,64MB,fetch_and2,btree,3,3.124,3.022–3.369,3.345,5.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.086,3.210
+scalar,1000000,clean,default,64MB,fetch_and2,gin,3,5.035,4.414–5.290,5.264,9.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.087,5.172
+scalar,1000000,clean,default,64MB,fetch_and2,roaring,3,2.798,2.528–2.877,2.869,6.7%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.059,2.857
+scalar,1000000,clean,default,64MB,fetch_and2,roaring_bitmap,3,2.908,2.636–3.904,3.804,21.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.100,2.999
+scalar,1000000,clean,default,64MB,fetch_and3,btree,3,3.481,3.185–3.664,3.646,7.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.090,3.559
+scalar,1000000,clean,default,64MB,fetch_and3,gin,3,5.330,5.157–5.541,5.520,3.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.151,5.484
+scalar,1000000,clean,default,64MB,fetch_and3,roaring,3,2.733,2.469–2.781,2.776,6.3%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.081,2.814
+scalar,1000000,clean,default,64MB,fetch_and3,roaring_bitmap,3,2.509,2.386–3.765,3.639,26.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.093,2.602
+scalar,1000000,clean,default,64MB,fetch_broad,btree,3,28.231,26.753–37.267,36.363,18.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.067,28.298
+scalar,1000000,clean,default,64MB,fetch_broad,gin,3,29.521,27.069–35.950,35.307,14.9%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.098,29.600
+scalar,1000000,clean,default,64MB,fetch_broad,roaring,3,22.357,22.081–31.590,30.667,21.4%,—,Index Scan,0.050,22.406
+scalar,1000000,clean,default,64MB,fetch_broad,roaring_bitmap,3,23.064,20.730–24.882,24.700,9.1%,—,Index Scan,0.072,23.136
+scalar,1000000,clean,default,64MB,fetch_c1m,btree,3,0.029,0.027–0.046,0.044,30.7%,—,Index Scan,0.050,0.079
+scalar,1000000,clean,default,64MB,fetch_c1m,gin,3,0.023,0.022–0.043,0.041,40.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.060,0.082
+scalar,1000000,clean,default,64MB,fetch_c1m,roaring,3,0.049,0.034–0.063,0.062,29.8%,—,Index Scan,0.068,0.131
+scalar,1000000,clean,default,64MB,fetch_c1m,roaring_bitmap,3,0.057,0.042–0.078,0.076,30.6%,—,Index Scan,0.087,0.165
+scalar,1000000,clean,default,64MB,fetch_in_and,btree,3,8.387,7.365–11.902,11.550,25.8%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.077,8.455
+scalar,1000000,clean,default,64MB,fetch_in_and,gin,3,16.239,16.000–16.317,16.309,1.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.086,16.316
+scalar,1000000,clean,default,64MB,fetch_in_and,roaring,3,7.303,7.206–10.298,9.998,21.3%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.064,7.367
+scalar,1000000,clean,default,64MB,fetch_in_and,roaring_bitmap,3,12.018,10.461–18.249,17.626,30.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.142,12.136
+scalar,1000000,clean,default,64MB,fetch_medium,btree,3,5.800,4.603–6.233,6.190,15.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.075,5.875
+scalar,1000000,clean,default,64MB,fetch_medium,gin,3,6.282,5.712–6.293,6.292,5.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.085,6.350
+scalar,1000000,clean,default,64MB,fetch_medium,roaring,3,4.541,4.273–4.681,4.667,4.6%,—,Index Scan,0.057,4.598
+scalar,1000000,clean,default,64MB,fetch_medium,roaring_bitmap,3,4.960,2.846–6.037,5.929,35.2%,—,Index Scan,0.078,5.038
+scalar,1000000,clean,default,64MB,fetch_rare,btree,3,0.124,0.100–0.128,0.128,12.9%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.070,0.183
+scalar,1000000,clean,default,64MB,fetch_rare,gin,3,0.107,0.107–0.145,0.141,18.3%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.100,0.207
+scalar,1000000,clean,default,64MB,fetch_rare,roaring,3,0.076,0.072–0.112,0.108,25.4%,—,Index Scan,0.048,0.136
+scalar,1000000,clean,default,64MB,fetch_rare,roaring_bitmap,3,0.092,0.088–0.113,0.111,13.7%,—,Index Scan,0.065,0.162
+scalar,1000000,clean,default,64MB,group_c2,btree,3,71.116,65.912–74.181,73.874,5.9%,—,Index Only Scan,0.054,71.172
+scalar,1000000,clean,default,64MB,group_c2,gin,3,120.750,103.018–163.024,158.797,23.9%,—,Seq Scan (fallback),0.109,120.859
+scalar,1000000,clean,default,64MB,group_c2,roaring,3,0.138,0.114–0.141,0.141,11.3%,—,LionCount,0.042,0.183
+scalar,1000000,clean,default,64MB,group_c2,roaring_bitmap,3,143.327,101.513–172.488,169.572,25.6%,—,Seq Scan (fallback),0.061,143.388
+scalar,1000000,clean,default,64MB,group_c200,btree,3,68.057,66.359–68.853,68.773,1.9%,—,Index Only Scan,0.050,68.105
+scalar,1000000,clean,default,64MB,group_c200,gin,3,127.713,126.612–130.888,130.571,1.7%,—,Seq Scan (fallback),0.062,127.772
+scalar,1000000,clean,default,64MB,group_c200,roaring,3,4.957,4.233–6.829,6.642,25.1%,—,LionCount,0.054,4.997
+scalar,1000000,clean,default,64MB,group_c200,roaring_bitmap,3,197.883,147.451–204.637,203.962,17.0%,—,Seq Scan (fallback),0.066,197.972
+scalar,1000000,clean,default,64MB,group_filtered,btree,3,6.292,4.738–7.461,7.344,22.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.082,6.408
+scalar,1000000,clean,default,64MB,group_filtered,gin,3,6.207,5.338–7.478,7.351,17.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.078,6.272
+scalar,1000000,clean,default,64MB,group_filtered,roaring,3,3.421,3.396–3.470,3.465,1.1%,—,LionCount,0.070,3.515
+scalar,1000000,clean,default,64MB,group_filtered,roaring_bitmap,3,5.442,4.114–7.163,6.991,27.4%,—,Index Scan,0.116,5.629
+scalar,1000000,clean,default,64MB,in_and,btree,3,10.823,8.076–11.728,11.637,18.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.084,10.903
+scalar,1000000,clean,default,64MB,in_and,gin,3,13.334,13.001–19.232,18.642,23.1%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.085,13.424
+scalar,1000000,clean,default,64MB,in_and,roaring,3,0.583,0.501–0.850,0.823,28.3%,—,LionCount,0.119,0.659
+scalar,1000000,clean,default,64MB,in_and,roaring_bitmap,3,7.724,6.518–9.767,9.563,20.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.105,7.892
+scalar,1000000,clean,default,64MB,in_c20k_10,btree,3,0.058,0.054–0.082,0.080,23.4%,—,Index Only Scan,0.077,0.139
+scalar,1000000,clean,default,64MB,in_c20k_10,gin,3,0.767,0.715–0.768,0.768,4.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.116,0.883
+scalar,1000000,clean,default,64MB,in_c20k_10,roaring,3,0.040,0.040–0.112,0.105,65.0%,—,LionCount,0.074,0.114
+scalar,1000000,clean,default,64MB,in_c20k_10,roaring_bitmap,3,0.631,0.597–0.746,0.734,11.9%,—,Index Scan,0.058,0.689
+scalar,1000000,clean,default,64MB,in_c20k_1000,btree,3,3.470,3.389–4.730,4.604,19.5%,—,Index Only Scan,0.681,4.070
+scalar,1000000,clean,default,64MB,in_c20k_1000,gin,3,25.843,25.106–37.363,36.211,23.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.759,26.602
+scalar,1000000,clean,default,64MB,in_c20k_1000,roaring,3,2.211,1.966–2.431,2.409,10.6%,—,LionCount,1.156,3.367
+scalar,1000000,clean,default,64MB,in_c20k_1000,roaring_bitmap,3,23.348,22.031–29.067,28.495,15.1%,—,Index Scan,0.631,23.979
+scalar,1000000,clean,default,64MB,is_null,btree,3,5.541,5.255–6.328,6.249,9.7%,—,Index Only Scan,0.076,5.627
+scalar,1000000,clean,default,64MB,is_null,gin,3,62.508,61.988–68.269,67.693,5.4%,—,Seq Scan (fallback),0.060,62.568
+scalar,1000000,clean,default,64MB,is_null,roaring,3,0.073,0.069–0.075,0.075,4.2%,—,LionCount,0.056,0.129
+scalar,1000000,clean,default,64MB,is_null,roaring_bitmap,3,34.947,26.304–38.192,37.867,18.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.103,35.092
+scalar,1000000,clean,default,64MB,or_columns,btree,3,23.747,22.399–30.756,30.055,17.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.106,23.855
+scalar,1000000,clean,default,64MB,or_columns,gin,3,29.400,24.043–32.266,31.979,14.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.070,29.462
+scalar,1000000,clean,default,64MB,or_columns,roaring,3,0.216,0.216–0.283,0.276,16.2%,—,LionCount,0.090,0.373
+scalar,1000000,clean,default,64MB,or_columns,roaring_bitmap,3,29.927,21.504–30.756,30.673,18.7%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.096,30.115
+scalar,1000000,clean,default,64MB,ordered_broad,btree,3,0.068,0.063–0.068,0.068,4.4%,—,Index Scan,0.074,0.137
+scalar,1000000,clean,default,64MB,ordered_broad,gin,3,154.710,150.626–221.005,214.375,22.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.088,154.825
+scalar,1000000,clean,default,64MB,ordered_broad,roaring,3,0.061,0.053–0.081,0.079,22.2%,—,LionOrdered,0.099,0.152
+scalar,1000000,clean,default,64MB,ordered_broad,roaring_bitmap,3,0.105,0.068–0.123,0.121,28.4%,—,LionOrdered,0.164,0.269
+scalar,1000000,clean,default,64MB,ordered_broad,roaring_btree,3,0.065,0.063–0.066,0.066,2.4%,—,Index Scan,0.134,0.199
+scalar,1000000,clean,default,64MB,ordered_filter,btree,3,4.507,3.842–4.591,4.583,9.5%,—,Index Scan,0.058,4.563
+scalar,1000000,clean,default,64MB,ordered_filter,gin,3,32.565,28.263–50.174,48.413,31.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.137,32.702
+scalar,1000000,clean,default,64MB,ordered_filter,roaring,3,0.907,0.816–1.022,1.010,11.3%,—,LionOrdered,0.102,1.009
+scalar,1000000,clean,default,64MB,ordered_filter,roaring_bitmap,3,0.845,0.824–1.092,1.067,16.2%,—,LionOrdered,0.116,0.961
+scalar,1000000,clean,default,64MB,ordered_filter,roaring_btree,3,0.912,0.898–0.912,0.912,0.9%,—,LionOrdered,0.159,1.071
+scalar,1000000,clean,default,64MB,ordered_filter_desc,btree,3,4.294,4.042–6.192,6.002,24.3%,—,Index Scan,0.110,4.404
+scalar,1000000,clean,default,64MB,ordered_filter_desc,gin,3,28.659,27.843–44.526,42.939,27.9%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.071,28.730
+scalar,1000000,clean,default,64MB,ordered_filter_desc,roaring,3,0.908,0.817–0.976,0.969,8.9%,—,LionOrdered,0.099,1.019
+scalar,1000000,clean,default,64MB,ordered_filter_desc,roaring_bitmap,3,0.929,0.928–0.939,0.938,0.7%,—,LionOrdered,0.154,1.082
+scalar,1000000,clean,default,64MB,ordered_filter_desc,roaring_btree,3,0.899,0.896–0.907,0.906,0.6%,—,LionOrdered,0.169,1.076
+scalar,1000000,clean,default,64MB,ordered_limit,btree,3,0.040,0.033–0.045,0.044,15.3%,—,Index Only Scan,0.119,0.156
+scalar,1000000,clean,default,64MB,ordered_limit,gin,3,79.186,76.894–91.907,90.635,9.8%,—,Seq Scan (fallback),0.117,79.303
+scalar,1000000,clean,default,64MB,ordered_limit,roaring,3,0.132,0.123–0.374,0.350,67.9%,—,LionOrdered,0.104,0.236
+scalar,1000000,clean,default,64MB,ordered_limit,roaring_bitmap,3,0.153,0.144–0.191,0.187,15.3%,—,LionOrdered,0.197,0.341
+scalar,1000000,clean,default,64MB,range_random,btree,3,0.326,0.291–0.337,0.336,7.6%,—,Index Only Scan,0.091,0.413
+scalar,1000000,clean,default,64MB,range_random,gin,3,44.437,42.655–55.026,53.967,14.1%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.085,44.508
+scalar,1000000,clean,default,64MB,range_random,roaring,3,0.203,0.199–0.230,0.227,8.0%,—,LionCount,0.122,0.346
+scalar,1000000,clean,default,64MB,range_random,roaring_bitmap,3,5.815,4.628–6.487,6.420,16.7%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.118,5.933
+scalar,1000000,dirty_scattered,default,64MB,and2,btree,3,6.638,5.071–6.846,6.825,15.7%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.094,6.732
+scalar,1000000,dirty_scattered,default,64MB,and2,gin,3,28.588,27.562–31.047,30.801,6.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.117,28.705
+scalar,1000000,dirty_scattered,default,64MB,and2,roaring,3,1.501,1.277–1.729,1.706,15.0%,—,LionCount,0.220,1.721
+scalar,1000000,dirty_scattered,default,64MB,and2,roaring_bitmap,3,7.858,7.794–9.575,9.403,12.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.131,7.993
+scalar,1000000,dirty_scattered,default,64MB,eq_c200_17,btree,3,2.582,2.519–2.767,2.748,4.9%,—,Index Only Scan,0.105,2.687
+scalar,1000000,dirty_scattered,default,64MB,eq_c200_17,gin,3,7.321,5.891–7.381,7.375,12.3%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.126,7.447
+scalar,1000000,dirty_scattered,default,64MB,eq_c200_17,roaring,3,2.337,1.888–2.602,2.575,15.9%,—,LionCount,0.135,2.463
+scalar,1000000,dirty_scattered,default,64MB,eq_c200_17,roaring_bitmap,3,4.402,3.802–4.563,4.547,9.4%,—,Index Scan,0.116,4.518
+scalar,1000000,dirty_scattered,default,64MB,eq_c2_0,btree,3,78.366,73.950–83.451,82.942,6.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.085,78.471
+scalar,1000000,dirty_scattered,default,64MB,eq_c2_0,gin,3,107.319,88.937–128.369,126.264,18.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.099,107.410
+scalar,1000000,dirty_scattered,default,64MB,eq_c2_0,roaring,3,23.949,23.464–24.082,24.069,1.4%,—,LionCount,0.090,24.039
+scalar,1000000,dirty_scattered,default,64MB,eq_c2_0,roaring_bitmap,3,76.643,70.424–82.755,82.144,8.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.123,76.821
+scalar,1000000,dirty_scattered,default,64MB,group_c200,btree,3,154.898,152.978–155.538,155.474,0.9%,—,Seq Scan (fallback),0.078,154.958
+scalar,1000000,dirty_scattered,default,64MB,group_c200,gin,3,138.255,133.761–194.963,189.292,21.9%,—,Seq Scan (fallback),0.086,138.341
+scalar,1000000,dirty_scattered,default,64MB,group_c200,roaring,3,80.672,74.714–89.557,88.668,9.1%,—,LionCount,0.087,80.759
+scalar,1000000,dirty_scattered,default,64MB,group_c200,roaring_bitmap,3,137.594,136.935–187.854,182.828,19.0%,—,Seq Scan (fallback),0.065,137.686
+scalar,1000000,dirty_scattered,prefer_index,64MB,group_c200,btree,3,302.968,284.249–314.923,313.728,5.1%,—,Index Only Scan,0.101,303.069
+scalar,1000000,dirty_scattered,prefer_index,64MB,group_c200,gin,3,140.310,138.828–147.430,146.718,3.2%,—,Seq Scan (fallback),0.091,140.401
+scalar,1000000,dirty_scattered,prefer_index,64MB,group_c200,roaring,3,83.787,81.598–91.325,90.571,6.0%,—,LionCount,0.135,83.922
+scalar,1000000,dirty_scattered,prefer_index,64MB,group_c200,roaring_bitmap,3,161.932,155.619–194.907,191.609,12.4%,—,Seq Scan (fallback),0.123,162.055
+scalar,1000000,low_work_mem,prefer_index,64kB,eq_c2_0,btree,3,31.150,26.343–39.041,38.252,19.9%,—,Index Only Scan,0.067,31.217
+scalar,1000000,low_work_mem,prefer_index,64kB,eq_c2_0,gin,3,142.946,126.432–190.657,185.886,21.7%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.127,143.092
+scalar,1000000,low_work_mem,prefer_index,64kB,eq_c2_0,roaring,3,0.073,0.072–0.074,0.074,1.4%,—,LionCount,0.079,0.151
+scalar,1000000,low_work_mem,prefer_index,64kB,eq_c2_0,roaring_bitmap,3,74.527,73.956–88.952,87.510,10.7%,—,Index Scan,0.081,74.597
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_and3,btree,3,28.057,22.901–30.161,29.951,13.8%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.095,28.247
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_and3,gin,3,24.843,22.374–31.660,30.978,18.3%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.102,24.934
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_and3,roaring,3,18.643,17.254–19.465,19.383,6.1%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.099,18.734
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_and3,roaring_bitmap,3,22.220,20.717–23.046,22.963,5.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.119,22.370
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_c1m,btree,3,0.057,0.037–0.060,0.060,24.4%,—,Index Scan,0.119,0.176
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_c1m,gin,3,0.047,0.045–0.066,0.064,22.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.079,0.126
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_c1m,roaring,3,0.031,0.025–0.051,0.049,38.2%,—,Index Scan,0.060,0.091
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_c1m,roaring_bitmap,3,0.056,0.056–0.103,0.098,37.9%,—,Index Scan,0.133,0.189
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_medium,btree,3,6.016,4.658–6.307,6.278,15.5%,—,Index Scan,0.107,6.115
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_medium,gin,3,21.003,20.046–22.490,22.341,5.8%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.094,21.097
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_medium,roaring,3,3.669,3.028–3.853,3.835,12.3%,—,Index Scan,0.070,3.752
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_medium,roaring_bitmap,3,5.189,4.994–5.381,5.362,3.7%,—,Index Scan,0.125,5.239
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_rare,btree,3,0.114,0.103–0.142,0.139,16.8%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.081,0.189
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_rare,gin,3,0.139,0.122–0.168,0.165,16.3%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.112,0.248
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_rare,roaring,3,0.079,0.073–0.115,0.111,25.5%,—,Index Scan,0.065,0.138
+scalar,1000000,low_work_mem,prefer_index,64kB,fetch_rare,roaring_bitmap,3,0.145,0.134–0.198,0.193,21.5%,—,Index Scan,0.101,0.246
+scalar,1000000,low_work_mem,prefer_index,64kB,group_c200,btree,3,94.516,73.711–101.432,100.740,16.1%,—,Index Only Scan,0.112,94.655
+scalar,1000000,low_work_mem,prefer_index,64kB,group_c200,gin,3,145.418,133.945–162.881,161.135,9.9%,—,Seq Scan (fallback),0.089,145.507
+scalar,1000000,low_work_mem,prefer_index,64kB,group_c200,roaring,3,4.566,4.392–5.542,5.444,12.8%,—,LionCount,0.067,4.633
+scalar,1000000,low_work_mem,prefer_index,64kB,group_c200,roaring_bitmap,3,143.312,126.797–156.134,154.852,10.4%,—,Seq Scan (fallback),0.050,143.355
+scalar,1000000,low_work_mem,prefer_index,64kB,in_c20k_1000,btree,3,3.432,2.803–4.100,4.033,18.8%,—,Index Only Scan,0.798,4.230
+scalar,1000000,low_work_mem,prefer_index,64kB,in_c20k_1000,gin,3,119.376,116.216–129.771,128.731,5.8%,—,"Bitmap Heap Scan, Bitmap Index Scan",1.245,120.299
+scalar,1000000,low_work_mem,prefer_index,64kB,in_c20k_1000,roaring,3,2.341,2.179–2.909,2.852,15.5%,—,LionCount,1.132,3.473
+scalar,1000000,low_work_mem,prefer_index,64kB,in_c20k_1000,roaring_bitmap,3,121.330,106.789–126.602,126.075,8.7%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.818,122.151
+scalar,5000000,after_maintenance,default,64MB,and2,btree,3,38.234,28.932–40.004,39.827,16.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.100,38.334
+scalar,5000000,after_maintenance,default,64MB,and2,gin,3,138.464,138.186–142.695,142.272,1.8%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.120,138.641
+scalar,5000000,after_maintenance,default,64MB,and2,roaring,3,0.505,0.479–0.707,0.687,22.1%,—,LionCount,0.108,0.613
+scalar,5000000,after_maintenance,default,64MB,and2,roaring_bitmap,3,43.020,39.258–46.522,46.172,8.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.146,43.166
+scalar,5000000,after_maintenance,default,64MB,eq_c200_17,btree,3,1.484,1.384–2.085,2.025,23.0%,—,Index Only Scan,0.107,1.591
+scalar,5000000,after_maintenance,default,64MB,eq_c200_17,gin,3,27.749,26.446–32.646,32.156,11.3%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.126,27.875
+scalar,5000000,after_maintenance,default,64MB,eq_c200_17,roaring,3,0.134,0.127–0.140,0.139,4.9%,—,LionCount,0.065,0.193
+scalar,5000000,after_maintenance,default,64MB,eq_c200_17,roaring_bitmap,3,60.028,19.453–71.347,70.215,54.3%,—,Index Scan,0.134,60.162
+scalar,5000000,after_maintenance,default,64MB,group_c200,btree,3,355.493,318.923–372.206,370.535,7.8%,—,Index Only Scan,0.120,355.627
+scalar,5000000,after_maintenance,default,64MB,group_c200,gin,3,892.190,838.057–892.876,892.807,3.6%,—,Seq Scan (fallback),0.096,892.286
+scalar,5000000,after_maintenance,default,64MB,group_c200,roaring,3,23.743,22.185–25.626,25.438,7.2%,—,LionCount,0.070,23.813
+scalar,5000000,after_maintenance,default,64MB,group_c200,roaring_bitmap,3,897.547,877.951–919.036,916.887,2.3%,—,Seq Scan (fallback),0.110,897.679
+scalar,5000000,after_maintenance,default,64MB,is_null,btree,3,26.835,26.129–27.234,27.194,2.1%,—,Index Only Scan,0.091,26.919
+scalar,5000000,after_maintenance,default,64MB,is_null,gin,3,510.029,476.947–512.190,511.974,4.0%,—,Seq Scan (fallback),0.085,510.113
+scalar,5000000,after_maintenance,default,64MB,is_null,roaring,3,0.295,0.241–0.331,0.327,15.7%,—,LionCount,0.076,0.380
+scalar,5000000,after_maintenance,default,64MB,is_null,roaring_bitmap,3,377.384,303.889–421.347,416.951,16.1%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.131,377.497
+scalar,5000000,clean,default,64MB,and2,btree,3,27.601,26.915–28.219,28.157,2.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.111,27.772
+scalar,5000000,clean,default,64MB,and2,gin,3,194.921,162.236–233.653,229.780,18.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.136,195.101
+scalar,5000000,clean,default,64MB,and2,roaring,3,0.869,0.528–1.293,1.251,42.7%,—,LionCount,0.161,0.990
+scalar,5000000,clean,default,64MB,and2,roaring_bitmap,3,81.870,51.054–106.014,103.600,34.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.100,81.950
+scalar,5000000,clean,default,64MB,and3_selective,btree,3,1.956,1.924–1.994,1.990,1.8%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.118,2.074
+scalar,5000000,clean,default,64MB,and3_selective,gin,3,2.853,2.598–5.054,4.834,38.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.142,2.995
+scalar,5000000,clean,default,64MB,and3_selective,roaring,3,0.098,0.090–0.099,0.099,5.2%,—,LionCount,0.144,0.234
+scalar,5000000,clean,default,64MB,and3_selective,roaring_bitmap,3,2.468,2.091–2.516,2.511,9.9%,—,"Bitmap Heap Scan, Bitmap Index Scan",1.152,3.627
+scalar,5000000,clean,default,64MB,eq_c1m_12345,btree,3,0.066,0.031–0.097,0.094,51.1%,—,Index Only Scan,0.069,0.127
+scalar,5000000,clean,default,64MB,eq_c1m_12345,gin,3,0.385,0.301–0.391,0.390,14.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.157,0.542
+scalar,5000000,clean,default,64MB,eq_c1m_12345,roaring,3,0.025,0.024–0.033,0.032,18.0%,—,LionCount,0.100,0.125
+scalar,5000000,clean,default,64MB,eq_c1m_12345,roaring_bitmap,3,0.107,0.073–1.648,1.494,147.6%,—,Index Scan,0.124,0.249
+scalar,5000000,clean,default,64MB,eq_c200_17,btree,3,1.349,1.216–1.626,1.598,15.0%,—,Index Only Scan,0.075,1.388
+scalar,5000000,clean,default,64MB,eq_c200_17,gin,3,62.932,30.456–124.024,117.915,65.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.108,63.037
+scalar,5000000,clean,default,64MB,eq_c200_17,roaring,3,0.139,0.135–0.141,0.141,2.2%,—,LionCount,0.097,0.238
+scalar,5000000,clean,default,64MB,eq_c200_17,roaring_bitmap,3,38.934,25.552–65.319,62.680,46.8%,—,Index Scan,0.073,39.001
+scalar,5000000,clean,default,64MB,eq_c20k_123,btree,3,0.044,0.042–0.055,0.054,14.9%,—,Index Only Scan,0.057,0.099
+scalar,5000000,clean,default,64MB,eq_c20k_123,gin,3,0.896,0.424–1.010,0.999,40.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.110,1.006
+scalar,5000000,clean,default,64MB,eq_c20k_123,roaring,3,0.043,0.035–0.047,0.047,14.7%,—,LionCount,0.089,0.124
+scalar,5000000,clean,default,64MB,eq_c20k_123,roaring_bitmap,3,0.637,0.608–0.755,0.743,11.7%,—,Index Scan,0.100,0.750
+scalar,5000000,clean,default,64MB,eq_c2_0,btree,3,132.773,132.422–155.142,152.905,9.3%,—,Index Only Scan,0.097,132.822
+scalar,5000000,clean,default,64MB,eq_c2_0,gin,3,702.606,607.764–717.237,715.774,8.8%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.104,702.759
+scalar,5000000,clean,default,64MB,eq_c2_0,roaring,3,0.339,0.277–0.739,0.699,55.5%,—,LionCount,0.089,0.462
+scalar,5000000,clean,default,64MB,eq_c2_0,roaring_bitmap,3,696.019,618.630–771.869,764.284,11.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.104,696.127
+scalar,5000000,clean,default,64MB,eq_skew_0,btree,3,245.239,242.840–250.454,249.933,1.6%,—,Index Only Scan,0.064,245.276
+scalar,5000000,clean,default,64MB,eq_skew_0,gin,3,643.392,597.888–655.483,654.274,4.8%,—,Seq Scan (fallback),0.113,643.513
+scalar,5000000,clean,default,64MB,eq_skew_0,roaring,3,0.656,0.643–0.881,0.859,18.4%,—,LionCount,0.085,0.736
+scalar,5000000,clean,default,64MB,eq_skew_0,roaring_bitmap,3,634.262,591.282–654.427,652.410,5.1%,—,Seq Scan (fallback),0.079,634.341
+scalar,5000000,clean,default,64MB,eq_skew_17,btree,3,0.090,0.077–0.108,0.106,17.0%,—,Index Only Scan,0.083,0.190
+scalar,5000000,clean,default,64MB,eq_skew_17,gin,3,2.441,2.229–3.553,3.442,25.9%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.398,3.875
+scalar,5000000,clean,default,64MB,eq_skew_17,roaring,3,0.068,0.050–0.096,0.093,32.5%,—,LionCount,0.118,0.168
+scalar,5000000,clean,default,64MB,eq_skew_17,roaring_bitmap,3,1.263,1.184–1.513,1.488,13.0%,—,Index Scan,0.103,1.347
+scalar,5000000,clean,default,64MB,fetch_and2,btree,3,17.678,15.425–17.907,17.884,8.1%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.079,17.757
+scalar,5000000,clean,default,64MB,fetch_and2,gin,3,29.309,26.293–32.027,31.755,9.8%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.137,29.450
+scalar,5000000,clean,default,64MB,fetch_and2,roaring,3,16.427,13.844–20.354,19.961,19.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.071,16.493
+scalar,5000000,clean,default,64MB,fetch_and2,roaring_bitmap,3,17.930,16.759–19.120,19.001,6.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.081,18.083
+scalar,5000000,clean,default,64MB,fetch_and3,btree,3,19.612,17.618–21.949,21.715,11.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.066,19.743
+scalar,5000000,clean,default,64MB,fetch_and3,gin,3,27.288,26.355–30.319,30.016,7.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.141,27.429
+scalar,5000000,clean,default,64MB,fetch_and3,roaring,3,16.101,14.462–16.311,16.290,6.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.148,16.207
+scalar,5000000,clean,default,64MB,fetch_and3,roaring_bitmap,3,19.113,15.970–24.704,24.145,22.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.156,19.203
+scalar,5000000,clean,default,64MB,fetch_broad,btree,3,518.334,289.873–534.244,532.653,30.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.056,518.379
+scalar,5000000,clean,default,64MB,fetch_broad,gin,3,430.074,369.712–510.409,502.375,16.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.073,430.140
+scalar,5000000,clean,default,64MB,fetch_broad,roaring,3,385.241,356.243–429.619,425.181,9.5%,—,Index Scan,0.078,385.321
+scalar,5000000,clean,default,64MB,fetch_broad,roaring_bitmap,3,386.062,381.834–435.029,430.132,7.4%,—,Index Scan,0.122,386.132
+scalar,5000000,clean,default,64MB,fetch_c1m,btree,3,0.070,0.050–0.140,0.133,54.5%,—,Index Scan,0.095,0.145
+scalar,5000000,clean,default,64MB,fetch_c1m,gin,3,0.226,0.193–0.277,0.272,18.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.143,0.370
+scalar,5000000,clean,default,64MB,fetch_c1m,roaring,3,0.091,0.049–0.098,0.097,33.4%,—,Index Scan,0.090,0.168
+scalar,5000000,clean,default,64MB,fetch_c1m,roaring_bitmap,3,0.093,0.049–0.095,0.095,32.9%,—,Index Scan,0.135,0.228
+scalar,5000000,clean,default,64MB,fetch_in_and,btree,3,52.151,49.424–56.929,56.451,7.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.125,52.241
+scalar,5000000,clean,default,64MB,fetch_in_and,gin,3,103.137,101.691–122.023,120.134,10.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.134,103.271
+scalar,5000000,clean,default,64MB,fetch_in_and,roaring,3,50.323,44.499–71.965,69.801,26.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.096,50.437
+scalar,5000000,clean,default,64MB,fetch_in_and,roaring_bitmap,3,72.366,66.624–87.661,86.132,14.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.104,72.464
+scalar,5000000,clean,default,64MB,fetch_medium,btree,3,28.040,27.919–52.415,49.977,39.1%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.142,28.157
+scalar,5000000,clean,default,64MB,fetch_medium,gin,3,72.861,32.995–103.116,100.090,50.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.058,72.919
+scalar,5000000,clean,default,64MB,fetch_medium,roaring,3,32.840,22.432–58.675,56.091,49.1%,—,Index Scan,0.069,32.898
+scalar,5000000,clean,default,64MB,fetch_medium,roaring_bitmap,3,50.555,29.738–51.952,51.812,28.2%,—,Index Scan,0.134,50.642
+scalar,5000000,clean,default,64MB,fetch_rare,btree,3,0.995,0.707–1.038,1.034,19.7%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.093,1.102
+scalar,5000000,clean,default,64MB,fetch_rare,gin,3,0.775,0.446–1.099,1.067,42.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.114,0.895
+scalar,5000000,clean,default,64MB,fetch_rare,roaring,3,0.661,0.357–0.821,0.805,38.4%,—,Index Scan,0.075,0.736
+scalar,5000000,clean,default,64MB,fetch_rare,roaring_bitmap,3,0.635,0.357–1.001,0.964,48.6%,—,Index Scan,0.121,0.703
+scalar,5000000,clean,default,64MB,group_c2,btree,3,327.931,308.438–341.037,339.726,5.0%,—,Index Only Scan,0.040,327.971
+scalar,5000000,clean,default,64MB,group_c2,gin,3,812.963,788.307–939.167,926.547,9.6%,—,Seq Scan (fallback),0.101,813.064
+scalar,5000000,clean,default,64MB,group_c2,roaring,3,1.260,1.255–1.297,1.293,1.8%,—,LionCount,0.078,1.348
+scalar,5000000,clean,default,64MB,group_c2,roaring_bitmap,3,791.675,669.190–1017.355,994.787,21.4%,—,Seq Scan (fallback),0.099,791.774
+scalar,5000000,clean,default,64MB,group_c200,btree,3,330.397,328.553–409.673,401.745,13.0%,—,Index Only Scan,0.079,330.454
+scalar,5000000,clean,default,64MB,group_c200,gin,3,939.672,896.614–970.189,967.137,4.0%,—,Seq Scan (fallback),0.115,939.820
+scalar,5000000,clean,default,64MB,group_c200,roaring,3,25.144,22.096–30.996,30.411,17.3%,—,LionCount,0.072,25.221
+scalar,5000000,clean,default,64MB,group_c200,roaring_bitmap,3,911.552,848.620–941.295,938.321,5.3%,—,Seq Scan (fallback),0.111,911.672
+scalar,5000000,clean,default,64MB,group_filtered,btree,3,36.736,32.685–112.940,105.320,74.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.085,36.933
+scalar,5000000,clean,default,64MB,group_filtered,gin,3,88.900,70.431–138.835,133.841,35.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.105,88.986
+scalar,5000000,clean,default,64MB,group_filtered,roaring,3,20.132,16.358–21.652,21.500,14.1%,—,LionCount,0.098,20.226
+scalar,5000000,clean,default,64MB,group_filtered,roaring_bitmap,3,58.114,23.144–61.505,61.166,44.6%,—,Index Scan,0.110,58.268
+scalar,5000000,clean,default,64MB,in_and,btree,3,84.391,56.009–95.896,94.745,26.1%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.069,84.449
+scalar,5000000,clean,default,64MB,in_and,gin,3,125.002,106.305–179.503,174.053,27.8%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.163,125.165
+scalar,5000000,clean,default,64MB,in_and,roaring,3,2.841,2.696–3.302,3.256,10.7%,—,LionCount,0.115,2.954
+scalar,5000000,clean,default,64MB,in_and,roaring_bitmap,3,91.430,43.838–100.745,99.814,38.8%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.125,91.555
+scalar,5000000,clean,default,64MB,in_c20k_10,btree,3,0.189,0.167–0.358,0.341,43.9%,—,Index Only Scan,0.125,0.314
+scalar,5000000,clean,default,64MB,in_c20k_10,gin,3,8.934,3.569–11.036,10.826,49.1%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.126,9.053
+scalar,5000000,clean,default,64MB,in_c20k_10,roaring,3,0.110,0.103–0.143,0.140,18.0%,—,LionCount,0.105,0.208
+scalar,5000000,clean,default,64MB,in_c20k_10,roaring_bitmap,3,6.057,5.537–6.093,6.089,5.3%,—,Index Scan,0.134,6.143
+scalar,5000000,clean,default,64MB,in_c20k_1000,btree,3,14.439,13.793–17.869,17.526,14.3%,—,Index Only Scan,0.585,15.024
+scalar,5000000,clean,default,64MB,in_c20k_1000,gin,3,362.757,332.537–451.718,442.822,16.2%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.728,363.485
+scalar,5000000,clean,default,64MB,in_c20k_1000,roaring,3,10.618,8.869–14.009,13.670,23.4%,—,LionCount,1.268,11.886
+scalar,5000000,clean,default,64MB,in_c20k_1000,roaring_bitmap,3,447.287,405.820–464.674,462.935,6.9%,—,Index Scan,0.746,448.519
+scalar,5000000,clean,default,64MB,is_null,btree,3,34.802,29.504–39.790,39.291,14.8%,—,Index Only Scan,0.111,34.952
+scalar,5000000,clean,default,64MB,is_null,gin,3,478.704,405.954–560.546,552.362,16.1%,—,Seq Scan (fallback),0.058,478.749
+scalar,5000000,clean,default,64MB,is_null,roaring,3,0.583,0.285–0.717,0.704,41.9%,—,LionCount,0.085,0.680
+scalar,5000000,clean,default,64MB,is_null,roaring_bitmap,3,387.349,326.369–422.090,418.616,12.8%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.160,387.509
+scalar,5000000,clean,default,64MB,or_columns,btree,3,302.186,262.193–393.690,384.540,21.1%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.100,302.286
+scalar,5000000,clean,default,64MB,or_columns,gin,3,410.751,311.754–413.218,412.971,15.3%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.113,410.932
+scalar,5000000,clean,default,64MB,or_columns,roaring,3,1.120,1.039–1.182,1.176,6.4%,—,LionCount,0.099,1.223
+scalar,5000000,clean,default,64MB,or_columns,roaring_bitmap,3,344.671,294.050–378.295,374.933,12.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.179,344.850
+scalar,5000000,clean,default,64MB,ordered_broad,btree,3,0.105,0.050–0.106,0.106,36.8%,—,Index Scan,0.091,0.196
+scalar,5000000,clean,default,64MB,ordered_broad,gin,3,1095.917,981.417–1286.075,1267.059,13.7%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.123,1096.048
+scalar,5000000,clean,default,64MB,ordered_broad,roaring,3,0.102,0.066–0.104,0.104,23.6%,—,LionOrdered,0.104,0.179
+scalar,5000000,clean,default,64MB,ordered_broad,roaring_bitmap,3,0.087,0.086–0.093,0.092,4.3%,—,LionOrdered,0.134,0.227
+scalar,5000000,clean,default,64MB,ordered_broad,roaring_btree,3,0.047,0.047–0.081,0.078,33.7%,—,Index Scan,0.121,0.168
+scalar,5000000,clean,default,64MB,ordered_filter,btree,3,15.435,7.177–17.003,16.846,40.0%,—,Index Scan,0.126,15.561
+scalar,5000000,clean,default,64MB,ordered_filter,gin,3,200.997,174.689–204.263,203.936,8.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.154,201.191
+scalar,5000000,clean,default,64MB,ordered_filter,roaring,3,1.670,1.632–2.078,2.037,13.8%,—,LionOrdered,0.116,1.781
+scalar,5000000,clean,default,64MB,ordered_filter,roaring_bitmap,3,1.938,1.641–3.376,3.232,40.0%,—,LionOrdered,0.182,2.136
+scalar,5000000,clean,default,64MB,ordered_filter,roaring_btree,3,2.345,2.299–2.383,2.379,1.8%,—,LionOrdered,0.154,2.499
+scalar,5000000,clean,default,64MB,ordered_filter_desc,btree,3,12.368,8.980–13.458,13.349,20.1%,—,Index Scan,0.120,12.510
+scalar,5000000,clean,default,64MB,ordered_filter_desc,gin,3,176.266,149.316–183.808,183.054,10.7%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.097,176.401
+scalar,5000000,clean,default,64MB,ordered_filter_desc,roaring,3,1.630,1.252–1.718,1.709,16.1%,—,LionOrdered,0.110,1.786
+scalar,5000000,clean,default,64MB,ordered_filter_desc,roaring_bitmap,3,1.426,1.385–2.264,2.180,29.3%,—,LionOrdered,0.158,1.584
+scalar,5000000,clean,default,64MB,ordered_filter_desc,roaring_btree,3,1.978,1.914–2.049,2.042,3.4%,—,LionOrdered,0.155,2.112
+scalar,5000000,clean,default,64MB,ordered_limit,btree,3,0.028,0.021–0.029,0.029,16.8%,—,Index Only Scan,0.124,0.152
+scalar,5000000,clean,default,64MB,ordered_limit,gin,3,653.706,610.530–656.485,656.207,4.0%,—,Seq Scan (fallback),0.117,653.840
+scalar,5000000,clean,default,64MB,ordered_limit,roaring,3,0.422,0.202–0.456,0.453,38.3%,—,LionOrdered,0.143,0.526
+scalar,5000000,clean,default,64MB,ordered_limit,roaring_bitmap,3,0.441,0.412–0.532,0.523,13.6%,—,LionOrdered,0.177,0.618
+scalar,5000000,clean,default,64MB,range_random,btree,3,1.460,1.402–1.504,1.500,3.5%,—,Index Only Scan,0.112,1.600
+scalar,5000000,clean,default,64MB,range_random,gin,3,512.080,419.571–545.739,542.373,13.3%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.124,512.220
+scalar,5000000,clean,default,64MB,range_random,roaring,3,1.053,0.872–1.352,1.322,22.2%,—,LionCount,0.162,1.215
+scalar,5000000,clean,default,64MB,range_random,roaring_bitmap,3,78.842,55.084–86.145,85.415,22.1%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.175,78.978
+scalar,5000000,dirty_scattered,default,64MB,and2,btree,3,79.916,72.842–84.810,84.321,7.6%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.137,80.053
+scalar,5000000,dirty_scattered,default,64MB,and2,gin,3,157.209,154.754–174.135,172.442,6.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.124,157.344
+scalar,5000000,dirty_scattered,default,64MB,and2,roaring,3,6.554,5.574–8.208,8.043,19.6%,—,LionCount,0.179,6.733
+scalar,5000000,dirty_scattered,default,64MB,and2,roaring_bitmap,3,40.044,39.979–79.059,75.157,42.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.138,40.165
+scalar,5000000,dirty_scattered,default,64MB,eq_c200_17,btree,3,12.834,10.769–13.716,13.628,12.2%,—,Index Only Scan,0.122,12.941
+scalar,5000000,dirty_scattered,default,64MB,eq_c200_17,gin,3,29.861,29.005–107.474,99.713,81.3%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.133,29.994
+scalar,5000000,dirty_scattered,default,64MB,eq_c200_17,roaring,3,11.701,10.459–14.360,14.094,16.4%,—,LionCount,0.155,11.856
+scalar,5000000,dirty_scattered,default,64MB,eq_c200_17,roaring_bitmap,3,26.494,20.000–45.933,43.989,43.8%,—,Index Scan,0.152,26.646
+scalar,5000000,dirty_scattered,default,64MB,eq_c2_0,btree,3,615.770,610.584–673.405,667.641,5.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.090,615.879
+scalar,5000000,dirty_scattered,default,64MB,eq_c2_0,gin,3,819.564,776.074–890.826,883.700,7.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.144,819.675
+scalar,5000000,dirty_scattered,default,64MB,eq_c2_0,roaring,3,115.988,114.623–172.209,166.587,24.5%,—,LionCount,0.114,116.166
+scalar,5000000,dirty_scattered,default,64MB,eq_c2_0,roaring_bitmap,3,612.370,561.011–759.635,744.909,16.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.110,612.486
+scalar,5000000,dirty_scattered,default,64MB,group_c200,btree,3,907.795,874.946–945.713,941.921,3.9%,—,Seq Scan (fallback),0.102,907.897
+scalar,5000000,dirty_scattered,default,64MB,group_c200,gin,3,1015.265,1006.558–1108.365,1099.055,5.4%,—,Seq Scan (fallback),0.094,1015.352
+scalar,5000000,dirty_scattered,default,64MB,group_c200,roaring,3,479.749,447.413–507.137,504.398,6.3%,—,LionCount,0.105,479.854
+scalar,5000000,dirty_scattered,default,64MB,group_c200,roaring_bitmap,3,888.601,855.692–1064.588,1046.989,12.0%,—,Seq Scan (fallback),0.104,888.716
+scalar,5000000,dirty_scattered,prefer_index,64MB,group_c200,btree,3,2600.066,2388.007–2773.062,2755.762,7.5%,—,Index Only Scan,0.106,2600.190
+scalar,5000000,dirty_scattered,prefer_index,64MB,group_c200,gin,3,860.172,779.233–904.373,899.953,7.5%,—,Seq Scan (fallback),0.112,860.286
+scalar,5000000,dirty_scattered,prefer_index,64MB,group_c200,roaring,3,500.087,490.579–504.861,504.384,1.5%,—,LionCount,0.146,500.240
+scalar,5000000,dirty_scattered,prefer_index,64MB,group_c200,roaring_bitmap,3,941.036,861.695–949.826,948.947,5.3%,—,Seq Scan (fallback),0.101,941.134
+scalar,5000000,low_work_mem,prefer_index,64kB,eq_c2_0,btree,3,131.297,131.241–149.204,147.413,7.5%,—,Index Only Scan,0.107,131.424
+scalar,5000000,low_work_mem,prefer_index,64kB,eq_c2_0,gin,3,893.959,848.152–1019.952,1007.353,9.7%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.074,894.096
+scalar,5000000,low_work_mem,prefer_index,64kB,eq_c2_0,roaring,3,0.325,0.316–0.417,0.408,15.8%,—,LionCount,0.095,0.420
+scalar,5000000,low_work_mem,prefer_index,64kB,eq_c2_0,roaring_bitmap,3,590.442,559.304–600.186,599.212,3.7%,—,Index Scan,0.130,590.536
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_and3,btree,3,162.871,149.623–185.322,183.077,10.9%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.121,162.992
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_and3,gin,3,364.168,325.973–425.072,418.982,13.4%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.134,364.261
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_and3,roaring,3,143.514,129.223–158.841,157.308,10.3%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.091,143.601
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_and3,roaring_bitmap,3,180.333,176.142–208.973,206.109,9.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.181,180.514
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_c1m,btree,3,0.041,0.040–0.047,0.046,8.9%,—,Index Scan,0.078,0.119
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_c1m,gin,3,0.190,0.080–0.255,0.248,50.5%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.144,0.254
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_c1m,roaring,3,0.045,0.039–0.066,0.064,28.4%,—,Index Scan,0.077,0.122
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_c1m,roaring_bitmap,3,0.091,0.088–0.095,0.095,3.8%,—,Index Scan,0.139,0.234
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_medium,btree,3,27.366,24.149–28.298,28.205,8.2%,—,Index Scan,0.114,27.480
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_medium,gin,3,220.992,213.735–252.615,249.453,9.0%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.142,221.107
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_medium,roaring,3,26.381,24.059–27.133,27.058,6.2%,—,Index Scan,0.103,26.481
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_medium,roaring_bitmap,3,36.987,22.470–37.523,37.469,26.4%,—,Index Scan,0.124,37.125
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_rare,btree,3,0.487,0.415–0.515,0.512,10.9%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.130,0.617
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_rare,gin,3,0.924,0.848–0.955,0.952,6.1%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.115,1.039
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_rare,roaring,3,0.342,0.332–0.360,0.358,4.1%,—,Index Scan,0.109,0.443
+scalar,5000000,low_work_mem,prefer_index,64kB,fetch_rare,roaring_bitmap,3,0.599,0.587–0.775,0.757,16.1%,—,Index Scan,0.123,0.722
+scalar,5000000,low_work_mem,prefer_index,64kB,group_c200,btree,3,325.487,324.643–337.206,336.034,2.1%,—,Index Only Scan,0.100,325.590
+scalar,5000000,low_work_mem,prefer_index,64kB,group_c200,gin,3,845.703,820.793–849.062,848.726,1.8%,—,Seq Scan (fallback),0.089,845.798
+scalar,5000000,low_work_mem,prefer_index,64kB,group_c200,roaring,3,24.971,23.528–30.561,30.002,14.1%,—,LionCount,0.077,25.095
+scalar,5000000,low_work_mem,prefer_index,64kB,group_c200,roaring_bitmap,3,862.246,819.146–969.735,958.986,8.8%,—,Seq Scan (fallback),0.069,862.315
+scalar,5000000,low_work_mem,prefer_index,64kB,in_c20k_1000,btree,3,14.087,13.801–17.596,17.245,13.9%,—,Index Only Scan,0.642,14.705
+scalar,5000000,low_work_mem,prefer_index,64kB,in_c20k_1000,gin,3,883.845,845.717–929.585,925.011,4.7%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.746,884.568
+scalar,5000000,low_work_mem,prefer_index,64kB,in_c20k_1000,roaring,3,9.505,8.967–9.594,9.585,3.6%,—,LionCount,1.272,10.756
+scalar,5000000,low_work_mem,prefer_index,64kB,in_c20k_1000,roaring_bitmap,3,795.664,790.466–844.240,839.382,3.7%,—,"Bitmap Heap Scan, Bitmap Index Scan",0.809,796.368

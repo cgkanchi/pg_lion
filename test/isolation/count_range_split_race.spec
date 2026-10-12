@@ -12,7 +12,8 @@
 #
 # The test:
 #
-#  * 2000 even keys, three rows each, INLINE and small: some twenty leaves.
+#  * 2000 even keys, three rows each, INLINE and small: some ten leaves
+#    (format version 10's compact entries; rsr_before records how many).
 #  * s1 counts a range that is best walked from the inside, and parks at
 #    'lion-entry-scan-resumed', between the first and second entry of the
 #    first leaf it read - holding that leaf's copies, and its pin, since the
@@ -22,10 +23,11 @@
 #    (lion_range_choose()): the walks inside and below the range are stepped a
 #    leaf at a time in turn.
 #  * s2 inserts 2000 odd keys - one between every two existing ones, so every
-#    leaf splits - and ROLLS BACK.  The rollback is the point: the ENTRIES stay
-#    (an aborted transaction does not undo index insertions), so the leaves
-#    really split, while not one row becomes visible - so the counts stay
-#    comparable with the reference computed afterwards.
+#    leaf splits and the leaves at least double - and ROLLS BACK.  The
+#    rollback is the point: the ENTRIES stay (an aborted transaction does not
+#    undo index insertions), so the leaves really split, while not one row
+#    becomes visible - so the counts stay comparable with the reference
+#    computed afterwards.
 #  * s2 releases the parked session, whose count must be exact.
 
 setup
@@ -38,11 +40,12 @@ setup
 	CREATE INDEX rsr_k ON rsr USING lion (k);
 	CREATE INDEX rsr_g ON rsr USING lion (g);
 	ANALYZE rsr;
+	CREATE TABLE rsr_before AS SELECT leaf_pages FROM lion_index_stats('rsr_k');
 }
 
 teardown
 {
-	DROP TABLE rsr;
+	DROP TABLE rsr, rsr_before;
 	/* Injection points are cluster-wide: never leave one attached, and
 	 * never fail the teardown because the permutation already did. */
 	DO $$ BEGIN PERFORM injection_points_detach('lion-entry-scan-resumed');
@@ -165,10 +168,14 @@ step s3_plain	{
 	SET pg_lion.enable_count_pushdown = on;
 	SET enable_seqscan = off;
 }
+# An odd key went in between every two even ones, so every leaf the build
+# filled (to the default fillfactor, 90) was given as many entries again as it
+# held, more than a page takes: the leaves must at least double, against the
+# count the build left in rsr_before, whatever size an entry is.
 step s3_shape	{
-	SELECT leaf_pages > 30 AS the_leaves_really_split,
-		   entries = 4000 AS aborted_entries_are_still_there
-	  FROM lion_index_stats('rsr_k');
+	SELECT s.leaf_pages >= 2 * b.leaf_pages AS the_leaves_really_split,
+		   s.entries = 4000 AS aborted_entries_are_still_there
+	  FROM lion_index_stats('rsr_k') s, rsr_before b;
 }
 step s3_verify	{ SELECT lion_index_verify('rsr_k', true); }
 # Is s1, or s4, waiting at its injection point right now?
@@ -186,7 +193,7 @@ step s3_parked_leaf	{ SELECT count(*) = 1 AS parked FROM pg_stat_activity WHERE 
 # step, is what shows the session really is parked there.
 permutation
 	s3_prep					# make the heap all-visible
-	s3_how					# inside and complement, some twenty leaves
+	s3_how					# inside and complement, some ten leaves
 	s1_inside(s2_wakeup_resumed)	# parks between two entries of a leaf
 	s3_parked_resumed		# ... and it really is parked there
 	s2_split				# splits every leaf, the one it stands on too

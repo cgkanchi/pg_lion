@@ -1,0 +1,256 @@
+-- The count pushdown's shapes side by side: grouping sets and the finer
+-- grain of a grouped count(DISTINCT) (DESIGN.md §10), the decoded walk with
+-- a range in its WHERE (§34), and the FK-side join's LEFT JOIN and folded
+-- dimensions (§27), each beside filtered counts, residual clauses (§10) and
+-- complements in an OR (§35).  Each combination is either answered - and
+-- then compared, as a multiset both ways round, with a sequential scan with
+-- the pushdown off - or declined, which the same comparison shows as the
+-- ordinary plan's answer.  cc_q() names the custom scans the plan used.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+-- a, b, n and t lion-indexed, w and id not; NULLs in n and t; dead and
+-- updated rows since the VACUUM
+CREATE TABLE cc (id int NOT NULL, a int, b int NOT NULL, n int, t text, w int)
+	WITH (autovacuum_enabled = off);
+INSERT INTO cc SELECT i, i % 7, i % 5,
+	   CASE WHEN i % 4 = 0 THEN NULL ELSE i % 11 - 5 END,
+	   CASE WHEN i % 9 = 0 THEN NULL ELSE 'v' || (i % 13) END,
+	   i % 9 + 1
+  FROM generate_series(1, 20000) i;
+CREATE INDEX cc_a ON cc USING lion (a);
+CREATE INDEX cc_b ON cc USING lion (b);
+CREATE INDEX cc_n ON cc USING lion (n);
+CREATE INDEX cc_t ON cc USING lion (t);
+VACUUM (FREEZE, ANALYZE) cc;
+DELETE FROM cc WHERE id % 97 = 0;
+UPDATE cc SET a = (a + 1) % 7, n = NULL WHERE id % 89 = 0;
+UPDATE cc SET w = 0, b = (b + 2) % 5 WHERE id % 61 = 0;
+-- a dimension on a, NULL keys and a key with no row among them, and one on b
+-- that only filters
+CREATE TABLE ccd (k int UNIQUE, region text NOT NULL);
+INSERT INTO ccd SELECT CASE WHEN i = 9 THEN NULL ELSE i END, 'r' || (i % 3)
+  FROM generate_series(0, 9) i;
+CREATE TABLE cce (k int UNIQUE, flag bool NOT NULL);
+INSERT INTO cce SELECT CASE WHEN i = 6 THEN NULL ELSE i END, i % 2 = 0
+  FROM generate_series(0, 6) i;
+ANALYZE ccd, cce;
+CREATE FUNCTION cc_q(q text, nojoins boolean DEFAULT false) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	nodes text[] := '{}';
+	node text;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	IF nojoins THEN
+		PERFORM set_config('enable_hashjoin', 'off', true);
+		PERFORM set_config('enable_mergejoin', 'off', true);
+		PERFORM set_config('enable_nestloop', 'off', true);
+	END IF;
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		node := substring(ln from 'Custom Scan \((\w+)\)');
+		IF node IS NOT NULL AND NOT node = ANY (nodes) THEN
+			nodes := nodes || node;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE cc_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE cc_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM cc_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM cc_on EXCEPT ALL SELECT * FROM cc_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM cc_off EXCEPT ALL SELECT * FROM cc_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE cc_on, cc_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN cardinality(nodes) = 0 THEN 'no lion node'
+					   ELSE array_to_string(nodes, ' + ') END,
+				  nrows);
+END $$;
+-- ---- grouping sets: the finest grouping counted by the node ----
+-- a residual clause and a complement OR in the WHERE are the finest
+-- grouping's count's own: taken or declined as for a plain GROUP BY of its
+-- columns (a residual clause beside one grouping column only)
+SELECT cc_q('SELECT a, b, count(*) FROM cc WHERE w > 3 GROUP BY ROLLUP (a, b)');
+         cc_q          
+-----------------------
+ no lion node, 43 rows
+(1 row)
+
+SELECT cc_q('SELECT a, count(*), sum(a) FROM cc WHERE w > 3 AND b = 2 GROUP BY ROLLUP (a)');
+              cc_q               
+---------------------------------
+ LionJoinAgg + LionCount, 8 rows
+(1 row)
+
+SELECT cc_q('SELECT a, count(*) FROM cc WHERE b = 2 AND t IS DISTINCT FROM ''v3'' GROUP BY ROLLUP (a)');
+              cc_q               
+---------------------------------
+ LionJoinAgg + LionCount, 8 rows
+(1 row)
+
+SELECT cc_q('SELECT a, b, count(*) FROM cc WHERE a IS DISTINCT FROM 3 OR b = 1 GROUP BY CUBE (a, b)');
+               cc_q               
+----------------------------------
+ LionJoinAgg + LionCount, 44 rows
+(1 row)
+
+-- a FILTER over grouping columns is the Agg's, over the finest groups
+SELECT cc_q('SELECT a, b, count(*) FILTER (WHERE a = 1), count(*) FROM cc GROUP BY CUBE (a, b)');
+               cc_q               
+----------------------------------
+ LionJoinAgg + LionCount, 48 rows
+(1 row)
+
+-- a FILTER over another column: declined
+SELECT cc_q('SELECT a, b, count(*) FILTER (WHERE n = 2) FROM cc GROUP BY ROLLUP (a, b)');
+         cc_q          
+-----------------------
+ no lion node, 43 rows
+(1 row)
+
+-- ---- count(DISTINCT) at a finer grain ----
+SELECT cc_q('SELECT a, b, count(DISTINCT n) FROM cc WHERE w > 3 GROUP BY a, b');
+         cc_q          
+-----------------------
+ no lion node, 35 rows
+(1 row)
+
+SELECT cc_q('SELECT a, b, count(DISTINCT n) FROM cc WHERE a IS DISTINCT FROM 2 OR b = 1 GROUP BY a, b');
+         cc_q          
+-----------------------
+ no lion node, 31 rows
+(1 row)
+
+SELECT cc_q('SELECT a, b, count(DISTINCT n) FILTER (WHERE a = 1), count(*) FROM cc GROUP BY a, b');
+               cc_q               
+----------------------------------
+ LionJoinAgg + LionCount, 35 rows
+(1 row)
+
+SELECT cc_q('SELECT a, b, count(DISTINCT n) FILTER (WHERE t = ''v1'') FROM cc GROUP BY a, b');
+               cc_q               
+----------------------------------
+ LionJoinAgg + LionCount, 35 rows
+(1 row)
+
+-- ---- the decoded walk, a range in its WHERE ----
+-- a range beside a residual clause, and beside a complement OR: declined,
+-- the decoded walk taking neither; with filtered counts, each counted
+-- against the WHERE's copy, its range collected; and two grouping columns,
+-- the walk the planner may decode
+SELECT cc_q('SELECT a, b, n, count(*) FROM cc WHERE b > 1 AND w > 3 GROUP BY a, b, n');
+          cc_q          
+------------------------
+ no lion node, 252 rows
+(1 row)
+
+SELECT cc_q('SELECT a, b, n, count(*) FROM cc WHERE b > 1 AND (a IS DISTINCT FROM 2 OR t = ''v1'') GROUP BY a, b, n');
+          cc_q          
+------------------------
+ no lion node, 252 rows
+(1 row)
+
+SELECT cc_q('SELECT a, b, n, count(*), count(*) FILTER (WHERE t = ''v1'') FROM cc WHERE b > 1 GROUP BY a, b, n');
+        cc_q         
+---------------------
+ LionCount, 252 rows
+(1 row)
+
+SELECT cc_q('SELECT a, n, count(*) FROM cc WHERE b > 1 AND w > 3 GROUP BY a, n');
+         cc_q          
+-----------------------
+ no lion node, 84 rows
+(1 row)
+
+SELECT cc_q('SELECT a, n, count(*), count(*) FILTER (WHERE t = ''v1'') FROM cc WHERE b > 1 GROUP BY a, n');
+        cc_q        
+--------------------
+ LionCount, 84 rows
+(1 row)
+
+-- ... and at a small work_mem, two filters' runs besides the WHERE's
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT cc_q('SELECT a, b, n, count(*), count(*) FILTER (WHERE t = ''v1''), count(*) FILTER (WHERE a IN (1, 2)) FROM cc WHERE b > 0 GROUP BY a, b, n');
+        cc_q         
+---------------------
+ LionCount, 336 rows
+(1 row)
+
+RESET work_mem;
+RESET hash_mem_multiplier;
+-- ---- the FK-side join: the LEFT JOIN and a folded dimension ----
+-- none of the three is taken beside a join: each declines it
+SELECT cc_q('SELECT d.region, count(f.id) FROM ccd d LEFT JOIN cc f ON f.a = d.k AND f.w > 3 GROUP BY d.region', true);
+         cc_q         
+----------------------
+ no lion node, 3 rows
+(1 row)
+
+SELECT cc_q('SELECT d.region, count(f.id) FILTER (WHERE f.n = 1) FROM ccd d LEFT JOIN cc f ON f.a = d.k GROUP BY d.region', true);
+         cc_q         
+----------------------
+ no lion node, 3 rows
+(1 row)
+
+SELECT cc_q('SELECT d.region, count(f.id) FROM ccd d LEFT JOIN cc f ON f.a = d.k AND (f.n IS DISTINCT FROM 1 OR f.t = ''v2'') GROUP BY d.region', true);
+         cc_q         
+----------------------
+ no lion node, 3 rows
+(1 row)
+
+SELECT cc_q('SELECT d.region, count(*) FROM cc f JOIN ccd d ON f.a = d.k JOIN cce e ON f.b = e.k WHERE e.flag AND f.w > 3 GROUP BY d.region', true);
+         cc_q         
+----------------------
+ no lion node, 3 rows
+(1 row)
+
+SELECT cc_q('SELECT d.region, count(*) FILTER (WHERE f.n = 1) FROM cc f JOIN ccd d ON f.a = d.k JOIN cce e ON f.b = e.k WHERE e.flag GROUP BY d.region', true);
+         cc_q         
+----------------------
+ no lion node, 3 rows
+(1 row)
+
+SELECT cc_q('SELECT d.region, count(*) FROM cc f JOIN ccd d ON f.a = d.k JOIN cce e ON f.b = e.k WHERE e.flag AND (f.n IS DISTINCT FROM 1 OR f.t = ''v2'') GROUP BY d.region', true);
+         cc_q         
+----------------------
+ no lion node, 3 rows
+(1 row)
+
+-- ... and each answered without them
+SELECT cc_q('SELECT d.region, count(f.id) FROM ccd d LEFT JOIN cc f ON f.a = d.k AND f.n = 1 GROUP BY d.region', true);
+              cc_q               
+---------------------------------
+ LionJoinAgg + LionCount, 3 rows
+(1 row)
+
+SELECT cc_q('SELECT d.region, count(*) FROM cc f JOIN ccd d ON f.a = d.k JOIN cce e ON f.b = e.k WHERE e.flag AND f.n = 1 GROUP BY d.region', true);
+       cc_q        
+-------------------
+ LionCount, 3 rows
+(1 row)
+
+DROP TABLE cc, ccd, cce;
+DROP FUNCTION cc_q(text, boolean);

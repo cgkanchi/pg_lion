@@ -37,7 +37,7 @@ before 1.0; a release that changes it will say so, and the indexes will need a `
 | jsonb `@>`, `?` and jsonpath filters, especially counts | Lion with `jsonb_contains_ops` |
 | Unique constraints, or `ORDER BY col LIMIT n` on a single column | B-tree |
 | Returning many filtered rows in order | A covering B-tree, which lion can filter as it walks it (see below) |
-| Write-heavy tables | Measure first. Lion inserts are slower and write more WAL than B-tree. |
+| Write-heavy tables | Measure first. Lion inserts are slower than B-tree. |
 
 Lion, B-tree and GIN indexes coexist happily. A typical setup keeps B-tree for primary keys and
 ordering and adds lion indexes on the columns your counts and filters use.
@@ -200,7 +200,7 @@ columns and can be built in parallel on PostgreSQL 17 and later.
 
 - No `ORDER BY` from the index itself, no unique indexes, no `INCLUDE` columns, no parallel scans.
   Use a covering B-tree for ordered or row-returning queries, as shown above.
-- Inserts are about 1.3× slower than B-tree and write about 1.5× the WAL.
+- Inserts are about 1.5× slower than B-tree.
 - A plain `ORDER BY col LIMIT n` on one column is faster with a B-tree.
 - A full-text prefix (`foo:*`) matching more than 1000 distinct words is rechecked row by row, and
   is slower than GIN.
@@ -228,25 +228,25 @@ PostgreSQL 18), with how lion compares. "lion 10× faster" means the other index
 
 | Query | Lion | B-tree | GIN |
 | --- | --- | --- | --- |
-| Count a value in 50% of rows | 0.41 ms | 189 ms (lion 464× faster) | 933 ms (lion 2,287× faster) |
-| Count a value in 0.5% of rows | 0.18 ms | 1.86 ms (lion 10× faster) | 89.2 ms (lion 485× faster) |
-| Count a value in 0.005% of rows | 0.039 ms | 0.069 ms (lion 1.8× faster) | 1.24 ms (lion 32× faster) |
-| Two equality filters ANDed | 1.21 ms | 34.9 ms (lion 29× faster) | 296 ms (lion 245× faster) |
-| Count per group, 200 groups | 31.8 ms | 493 ms (lion 15× faster) | 1,275 ms (lion 40× faster) |
-| Count a small range | 1.02 ms | 1.91 ms (lion 1.9× faster) | 666 ms (lion 653× faster) |
-| Count a value in 50% of rows, 1% of rows updated, no VACUUM | 183 ms | 882 ms (lion 4.8× faster) | 1,021 ms (lion 5.6× faster) |
-| Fetch the rows matching two filters | 20.8 ms | 22.1 ms (lion 1.1× faster) | 39.9 ms (lion 1.9× faster) |
-| Two filters, `ORDER BY` another column, `LIMIT 10` | 1.88 ms | 20.7 ms (lion 11× faster) |  |
-| `WHERE c >= .. ORDER BY c LIMIT 100` | 0.45 ms | 0.030 ms (lion **15× slower**) |  |
-| Full-text count, `'w1 & w17'` (200k docs) | 0.16 ms |  | 1.33 ms (lion 8.4× faster) |
-| Full-text count, phrase `'common <-> w1'` | 3.90 ms |  | 14.7 ms (lion 3.8× faster) |
-| Full-text count, prefix `'rare12:*'` | 1.20 ms |  | 2.57 ms (lion 2.1× faster) |
-| Top 10 by BM25 vs `ts_rank`, 33k matches (500k docs) | 9.9 ms | | 121 ms (lion 12× faster) |
-| Top 10 by BM25 vs `ts_rank`, 584 matches | 7.1 ms | | 3.7 ms (lion **1.9× slower**) |
+| Count a value in 50% of rows | 0.34 ms | 133 ms (lion 392× faster) | 703 ms (lion 2,073× faster) |
+| Count a value in 0.5% of rows | 0.14 ms | 1.35 ms (lion 9.7× faster) | 62.9 ms (lion 453× faster) |
+| Count a value in 0.005% of rows | 0.043 ms | 0.044 ms (same) | 0.90 ms (lion 21× faster) |
+| Two equality filters ANDed | 0.87 ms | 27.6 ms (lion 32× faster) | 195 ms (lion 224× faster) |
+| Count per group, 200 groups | 25.1 ms | 330 ms (lion 13× faster) | 940 ms (lion 37× faster) |
+| Count a small range | 1.05 ms | 1.46 ms (lion 1.4× faster) | 512 ms (lion 486× faster) |
+| Count a value in 50% of rows, 1% of rows updated, no VACUUM | 116 ms | 616 ms (lion 5.3× faster) | 820 ms (lion 7.1× faster) |
+| Fetch the rows matching two filters | 16.4 ms | 17.7 ms (lion 1.1× faster) | 29.3 ms (lion 1.8× faster) |
+| Two filters, `ORDER BY` another column, `LIMIT 10` | 1.67 ms | 15.4 ms (lion 9.2× faster) |  |
+| `WHERE c >= .. ORDER BY c LIMIT 100` | 0.42 ms | 0.028 ms (lion **15× slower**) |  |
+| Full-text count, `'w1 & w17'` (200k docs) | 0.11 ms |  | 1.37 ms (lion 12× faster) |
+| Full-text count, phrase `'common <-> w1'` | 4.58 ms |  | 16.1 ms (lion 3.5× faster) |
+| Full-text count, prefix `'rare12:*'` | 0.97 ms |  | 3.23 ms (lion 3.3× faster) |
+| Top 10 by BM25 vs `ts_rank`, 33k matches (500k docs) | 6.82 ms | | 112 ms (lion 16× faster) |
+| Top 10 by BM25 vs `ts_rank`, 584 matches | 4.83 ms | | 2.06 ms (lion **2.3× slower**) |
 
-Index size sits between GIN and B-tree, builds are about twice as fast as B-tree (lion builds in
-parallel), and inserts are about 1.3× slower than B-tree with 1.5× the WAL. The [benchmark page](docs/BENCHMARKS.md) has every query, the
-setup and how to reproduce it.
+The lion indexes are smaller than both the B-tree and the GIN ones, build in a little over half
+B-tree's time, and inserts are about 1.5× slower than B-tree while writing a little less WAL. The
+[benchmark page](docs/BENCHMARKS.md) has every query, the setup and how to reproduce it.
 
 ## Documentation
 

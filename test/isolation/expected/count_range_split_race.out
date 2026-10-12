@@ -98,9 +98,9 @@ complement
 (1 row)
 
 step s3_shape: 
-	SELECT leaf_pages > 30 AS the_leaves_really_split,
-		   entries = 4000 AS aborted_entries_are_still_there
-	  FROM lion_index_stats('rsr_k');
+	SELECT s.leaf_pages >= 2 * b.leaf_pages AS the_leaves_really_split,
+		   s.entries = 4000 AS aborted_entries_are_still_there
+	  FROM lion_index_stats('rsr_k') s, rsr_before b;
 
 the_leaves_really_split|aborted_entries_are_still_there
 -----------------------+-------------------------------
@@ -208,9 +208,9 @@ complement
 (1 row)
 
 step s3_shape: 
-	SELECT leaf_pages > 30 AS the_leaves_really_split,
-		   entries = 4000 AS aborted_entries_are_still_there
-	  FROM lion_index_stats('rsr_k');
+	SELECT s.leaf_pages >= 2 * b.leaf_pages AS the_leaves_really_split,
+		   s.entries = 4000 AS aborted_entries_are_still_there
+	  FROM lion_index_stats('rsr_k') s, rsr_before b;
 
 the_leaves_really_split|aborted_entries_are_still_there
 -----------------------+-------------------------------

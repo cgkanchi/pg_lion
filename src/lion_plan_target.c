@@ -120,6 +120,138 @@ lion_agg_is_count(PlannerInfo *root, Aggref *agg, Index rti, RelOptInfo *rel,
 }
 
 /*
+ * `CASE WHEN cond THEN a [ELSE b] END` with one arm, no test expression and
+ * constants for its results: the condition and the two constants (a NULL
+ * Const for the missing ELSE, which the parser supplies).
+ */
+static bool
+lion_case_one_arm(Node *node, Node **cond, Const **thenval, Const **elseval)
+{
+	CaseExpr   *ce = (CaseExpr *) node;
+	CaseWhen   *w;
+
+	if (node == NULL || !IsA(node, CaseExpr) || ce->arg != NULL ||
+		list_length(ce->args) != 1)
+		return false;
+	w = (CaseWhen *) linitial(ce->args);
+	if (!IsA(w, CaseWhen) || w->result == NULL || !IsA(w->result, Const) ||
+		ce->defresult == NULL || !IsA(ce->defresult, Const))
+		return false;
+	*cond = (Node *) w->expr;
+	*thenval = (Const *) w->result;
+	*elseval = (Const *) ce->defresult;
+	return true;
+}
+
+/* Is c the integer constant v, of int2 or int4? */
+static bool
+lion_const_is_int(const Const *c, int v)
+{
+	if (c->constisnull)
+		return false;
+	if (c->consttype == INT4OID)
+		return DatumGetInt32(c->constvalue) == v;
+	if (c->consttype == INT2OID)
+		return DatumGetInt16(c->constvalue) == v;
+	return false;
+}
+
+/*
+ * Is the aggregate a FILTERED COUNT (DESIGN.md §10, "Filtered counts"): the
+ * rows of the group for which a condition is true, reported as one of the
+ * LION_FCOUNT_* forms?  *filter is the condition and *form the form:
+ *
+ *	- count(*) FILTER (WHERE c), count(k) FILTER (WHERE c) of a non-NULL
+ *	  constant k, and count(CASE WHEN c THEN k END): COUNT.  A CASE without
+ *	  ELSE is NULL where c is not true, and count() skips NULLs;
+ *	- count(col) FILTER (WHERE c): COUNT as well, with *col set - it is the
+ *	  count only where every row counted has col non-NULL, which is the
+ *	  caller's to prove;
+ *	- sum(CASE WHEN c THEN 1 ELSE 0 END) of int4 or int2: SUM, which is NULL
+ *	  where the sum has no row at all to add up;
+ *	- sum(CASE WHEN c THEN 1 END), and sum(1) FILTER (WHERE c): SUMNULL, NULL
+ *	  where no row has c true, since every other row adds a NULL the sum
+ *	  skips.
+ *
+ * A row where c is NULL is one where it is not true, in a FILTER and in a
+ * CASE alike: each form counts the rows where c is TRUE, which is what a
+ * clause the posting sets answer selects.  Nothing else - another constant,
+ * a second arm, a CASE beside a FILTER, DISTINCT or ORDER BY - is taken.
+ * The aggregate's split is not looked at: a partial aggregate (DESIGN.md
+ * §16) is the same count.
+ */
+bool
+lion_agg_filtered(Aggref *agg, Node **filter, int *form, Var **col)
+{
+	Node	   *arg;
+	Node	   *cond;
+	Const	   *thenval;
+	Const	   *elseval;
+
+	*col = NULL;
+	if (agg->aggorder != NIL || agg->aggdistinct != NIL || agg->aggvariadic ||
+		agg->agglevelsup != 0 || agg->aggkind != AGGKIND_NORMAL)
+		return false;
+
+	if (agg->aggfnoid == F_COUNT_)
+	{
+		if (agg->aggfilter == NULL || !agg->aggstar || agg->args != NIL)
+			return false;
+		*filter = (Node *) agg->aggfilter;
+		*form = LION_FCOUNT_COUNT;
+		return true;
+	}
+	if (agg->aggfnoid != F_COUNT_ANY && agg->aggfnoid != F_SUM_INT4 &&
+		agg->aggfnoid != F_SUM_INT2)
+		return false;
+	if (list_length(agg->args) != 1 ||
+		!IsA(linitial(agg->args), TargetEntry))
+		return false;
+	arg = (Node *) ((TargetEntry *) linitial(agg->args))->expr;
+
+	if (agg->aggfilter != NULL)
+	{
+		Node	   *sarg = lion_strip(arg);
+
+		*filter = (Node *) agg->aggfilter;
+		if (sarg == NULL)
+			return false;
+		if (agg->aggfnoid == F_COUNT_ANY)
+		{
+			*form = LION_FCOUNT_COUNT;
+			if (IsA(sarg, Const))
+				return !((Const *) sarg)->constisnull;
+			if (IsA(sarg, Var))
+			{
+				*col = (Var *) sarg;
+				return true;
+			}
+			return false;
+		}
+		*form = LION_FCOUNT_SUMNULL;
+		return IsA(arg, Const) && lion_const_is_int((Const *) arg, 1);
+	}
+
+	if (!lion_case_one_arm(arg, &cond, &thenval, &elseval))
+		return false;
+	*filter = cond;
+	if (agg->aggfnoid == F_COUNT_ANY)
+	{
+		*form = LION_FCOUNT_COUNT;
+		return !thenval->constisnull && elseval->constisnull;
+	}
+	if (!lion_const_is_int(thenval, 1))
+		return false;
+	if (elseval->constisnull)
+		*form = LION_FCOUNT_SUMNULL;
+	else if (lion_const_is_int(elseval, 0))
+		*form = LION_FCOUNT_SUM;
+	else
+		return false;
+	return true;
+}
+
+/*
  * Is the aggregate a count(DISTINCT col) of a plain column of rti (DESIGN.md
  * §26)?  Then *var is the column, *eqop the equality the DISTINCT compares
  * with and *collation the collation it compares under, which is what the
@@ -398,6 +530,30 @@ lion_replaced_aggs_walker(Node *node, List **aggs)
 }
 
 /*
+ * The functions of the aggregates' arguments and FILTER clauses, which the
+ * Agg initialises and so checks: the condition of a filtered count
+ * (DESIGN.md §10, "Filtered counts") - its FILTER, or the CASE it is the
+ * test of - is a clause the node answers from posting sets in place of
+ * evaluating it.
+ */
+static bool
+lion_replaced_aggargs_walker(Node *node, List **funcs)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		Aggref	   *agg = (Aggref *) node;
+
+		(void) lion_replaced_funcs_walker((Node *) agg->args, funcs);
+		(void) lion_replaced_funcs_walker((Node *) agg->aggfilter, funcs);
+		return false;
+	}
+	return expression_tree_walker(node, lion_replaced_aggargs_walker,
+								  (void *) funcs);
+}
+
+/*
  * What the node stands in for, as custom_private member LION_PRIV_EXECUTE:
  * the functions the executor would have asked EXECUTE on for the plan the
  * node replaces, so that lion_check_replaced_execute() can ask the same of
@@ -406,7 +562,9 @@ lion_replaced_aggs_walker(Node *node, List **aggs)
  * Verified against core on every supported release:
  *
  *	- the Agg checks each aggregate (tlexprs, having) for the current user,
- *	  and its transition and final functions for the aggregate's owner;
+ *	  and its transition and final functions for the aggregate's owner, and
+ *	  initialises the aggregates' arguments and FILTER clauses - a filtered
+ *	  count's condition among them (lion_replaced_aggargs_walker());
  *	- the scan initialises its quals, rel's baserestrictinfo - every one of
  *	  which the node answers, OR trees and IN lists included - and so checks
  *	  each operator's function (and a hashed IN list's hash function);
@@ -414,10 +572,12 @@ lion_replaced_aggs_walker(Node *node, List **aggs)
  *	  (ExecBuildGroupingEqual(), hashed or sorted), but not the hash or sort
  *	  support functions;
  *	- a hash or nested-loop join initialises its join clause, so an FK-side
- *	  join (fj) adds the join operator's function.  A merge join compares
- *	  through the btree support function unchecked, so a query the planner
- *	  would have merge-joined asks one privilege more of the node; the SQL
- *	  meaning of the query - it calls `=` - is the one kept.
+ *	  join (fj) adds the join operator's function - and so does each join
+ *	  of a dimension folded into a fact filter (DESIGN.md §27, "A second
+ *	  dimension that only filters").  A merge join compares through the
+ *	  btree support function unchecked, so a query the planner would have
+ *	  merge-joined asks one privilege more of the node; the SQL meaning of
+ *	  the query - it calls `=` - is the one kept.
  *
  * Not included: count(DISTINCT k)'s equality, which nodeAgg calls through an
  * unchecked FmgrInfo for a single column, so core runs the query with that
@@ -443,12 +603,22 @@ lion_replaced_functions(RelOptInfo *rel, List *tlexprs, List *having,
 		(void) lion_replaced_funcs_walker((Node *) ((RestrictInfo *) lfirst(lc))->clause,
 										  &funcs);
 	if (fj != NULL)
+	{
 		funcs = list_append_unique_oid(funcs, get_opcode(fj->opno));
+		foreach(lc, fj->filters)
+		{
+			LionFkFilter *f = (LionFkFilter *) lfirst(lc);
+
+			funcs = list_append_unique_oid(funcs, get_opcode(f->opno));
+		}
+	}
 	foreach(lc, groupclause)
 		groupfuncs = list_append_unique_oid(groupfuncs,
 											get_opcode(((SortGroupClause *) lfirst(lc))->eqop));
 	(void) lion_replaced_aggs_walker((Node *) tlexprs, &aggs);
 	(void) lion_replaced_aggs_walker((Node *) having, &aggs);
+	(void) lion_replaced_aggargs_walker((Node *) tlexprs, &funcs);
+	(void) lion_replaced_aggargs_walker((Node *) having, &funcs);
 
 	return list_make3(aggs, funcs, groupfuncs);
 }
