@@ -239,14 +239,15 @@ under an OR.
 positions and weights, so phrase, weight and NOT queries are answered from the index and BM25
 ranking works (see "Multi-key columns" above). Read at build time, like `summaries`.
 `fillfactor` (10 .. 100, default 90): how full the build packs a directory leaf.
-`posting_fillfactor` (10 .. 100, default 100): how full the build packs a posting-tree leaf, the
+`posting_fillfactor` (10 .. 100, default 90): how full the build packs a posting-tree leaf, the
 container pages a key's posting set lives on once it outgrows its entry (DESIGN.md §22). At 100 a
 leaf is packed until the next container does not fit, so the first insert after the build that has
 to rewrite a container on it - one whose new member lands inside the container, as the new row
-versions of an UPDATE on a heap with free space do - splits the leaf. A lower value leaves that room
-at the cost of more leaves: an index that takes scattered writes soon after it is built is better
-built at 80 or 90, one that is mostly read keeps the default. A leaf always takes its first
-container, so a low value never leaves a page empty.
+version of an UPDATE that stays on the old row's page does - splits the leaf. The default leaves a
+tenth of each leaf for that, as a B-tree leaf's fillfactor does, for about a tenth more posting
+pages; an index on an append-only or read-only table can be built at 100 and save them, and one
+that takes a heavy wave of scattered writes soon after its build may want 80. A leaf always takes
+its first container, so a low value never leaves a page empty.
 `build_slack` (`auto` | `on` | `off`, default `off`): whether the build writes each entry that
 keeps its posting set inline, and each container on a posting-tree leaf, with the growth slack an
 insert would give it (DESIGN.md §4), so that the first rows an insert adds to it land inside the
