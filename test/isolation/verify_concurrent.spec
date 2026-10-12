@@ -197,12 +197,15 @@ step s1_done		{ SELECT 'checked' AS s1; }
 session s2
 step s2_begin		{ BEGIN; }
 step s2_commit		{ COMMIT; }
+# Keys of about 210 bytes, so that each thousand of them splits the last page
+# of level 1 as well as leaves (with format version 10's compact entries, a
+# thousand keys of 130 bytes split only leaves).
 step s2_split_right	{
-	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 120)
+	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 200)
 	  FROM generate_series(1, 1000) g;
 }
 step s2_split_right2	{
-	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 120)
+	INSERT INTO vc SELECT 'new' || g || '-' || repeat('y', 200)
 	  FROM generate_series(1001, 2000) g;
 }
 # Inserts one row, and waits for s3's advisory lock before the second.
