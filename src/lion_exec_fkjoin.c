@@ -1952,7 +1952,10 @@ lion_join_unite_release(LionCountScanState *st)
  * bounded by work_mem - past it the keys are located and united a share at
  * a time, each share a copy of its own counted beside every group, which
  * still adds up to the batch's counts - and the copies by a hash table's
- * memory, spilling past it as the filters' copy does.
+ * memory, spilling past it as the filters' copy does.  A share's array of
+ * sets is sized to half of work_mem at most, and a share takes one key at
+ * least however little is left, so that a small work_mem still moves on
+ * through the keys.
  *
  * A key the same bytes as the one before it - which the planner's proof of
  * the keys' distinctness says does not come - is left out of the union and
@@ -2005,7 +2008,16 @@ lion_join_unite_keys(LionCountScanState *st, bool walked)
 
 	setcxt = AllocSetContextCreate(fg->unitecxt, "LionCount united key sets",
 								   ALLOCSET_DEFAULT_SIZES);
-	cap = Max(Min(js->batch.n, lion_array_batch_size()), 1);
+
+	/*
+	 * A share's array of sets takes at most half of work_mem, so that the
+	 * sets' own copies fit beside it: lion_array_batch_size() alone never
+	 * falls below LION_MAX_ARRAY_ELEMS, whose array outgrows a small work_mem
+	 * before one key is located.
+	 */
+	cap = Min(js->batch.n, lion_array_batch_size());
+	cap = (int) Min((Size) cap, setlimit / 2 / sizeof(LionPostingSet));
+	cap = Max(cap, 1);
 	fg->nunited = 0;
 
 	while (k < js->batch.n)
@@ -2019,13 +2031,17 @@ lion_join_unite_keys(LionCountScanState *st, bool walked)
 		bool		ok;
 		int			nsets = 0;
 
+		CHECK_FOR_INTERRUPTS();
 		MemoryContextReset(setcxt);
 		oldcxt = MemoryContextSwitchTo(setcxt);
 		sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) * cap);
 		INSTR_TIME_SET_ZERO(t);
 		lion_join_clock(st, -1, &t);
+
+		/* a share takes one key's set at least, whatever it holds */
 		while (k < js->batch.n && nsets < cap &&
-			   MemoryContextMemAllocated(setcxt, true) < setlimit)
+			   (nsets == 0 ||
+				MemoryContextMemAllocated(setcxt, true) < setlimit))
 		{
 			LionJoinEnt *ent = &js->batch.ent[k++];
 			bool		found;
