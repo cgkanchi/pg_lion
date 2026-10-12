@@ -12163,8 +12163,12 @@ that proof says does not come - is left out of the union and counted key by key,
 still add up to the join's.
 
 **Bounds and fall-backs.** The keys located at once are what work_mem holds of them
-(`lion_array_batch_size()` sets at most); past that they are united a share at a time, each share a
-copy of its own counted beside every group, which adds up the same. The copies take a hash table's
+(`lion_array_batch_size()` sets at most, and no more than half of work_mem's worth of
+`LionPostingSet`s, so the array of sets leaves room for the sets' copies); past that they are
+united a share at a time, each share a copy of its own counted beside every group, which adds up
+the same. A share takes one key at least whatever work_mem is left - `lion_array_batch_size()`
+alone never falls below 1000 sets, whose array outgrows a work_mem of 96 kB before a key is
+located - and the turn checks for interrupts before each. The copies take a hash table's
 memory (`get_hash_memory_limit()`) and spill past it as the filters' copy does. A turn that cannot
 be united - a hot standby, which makes no copy; a range the counts walk (§32), which is not a set
 to collect; a copy that fails - is counted key by key, every key. A partition whose bounds give
