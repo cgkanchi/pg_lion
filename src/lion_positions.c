@@ -540,16 +540,23 @@ posout_add(PosOut *o, const LionPosMember *m)
 	o->n++;
 }
 
+/*
+ * A copy of a chunk, aligned as a container is.  It is read through the
+ * pointer pos_copy() returns, the whole buffer, not as &copy.hdr: a static
+ * analyser sizes a pointer by the member it was taken of, and hdr is only the
+ * 8-byte header.
+ */
 typedef union PosCopy
 {
 	LionContainer hdr;
 	char		data[LION_CONTAINER_MAX_SIZE];
 } PosCopy;
 
-static void
+static const LionContainer *
 pos_copy(PosCopy *copy, const LionContainer *c)
 {
 	memcpy(copy->data, c, lion_poschunk_size(c));
+	return (const LionContainer *) copy->data;
 }
 
 /* Emit the members of src merged with m (replacing a member of m's code). */
@@ -596,6 +603,7 @@ lion_poschunk_insert(LionContainer *c, Size cap, const LionPosMember *m,
 					 bool *replaced)
 {
 	PosCopy		copy;
+	const LionContainer *old;
 	PosOut		o;
 	uint32		block;
 
@@ -610,16 +618,16 @@ lion_poschunk_insert(LionContainer *c, Size cap, const LionPosMember *m,
 	if (o.bytes > LION_POS_MAX_BYTES || LION_POS_HDRSZ + o.bytes > cap)
 		return false;
 
-	pos_copy(&copy, c);
+	old = pos_copy(&copy, c);
 	posout_init(&o, pos_members(c), block);
-	pos_merge(&o, &copy.hdr, m, replaced);
+	pos_merge(&o, old, m, replaced);
 	c->ckey = block;
 	c->cardinality = (uint16) o.n;
 	pos_set_used(c, (uint32) o.bytes);
 	/* a replaced member can be shorter: keep the bytes it freed zero */
-	if (LION_POS_HDRSZ + o.bytes < lion_poschunk_size(&copy.hdr))
+	if (LION_POS_HDRSZ + o.bytes < lion_poschunk_size(old))
 		memset((char *) c + LION_POS_HDRSZ + o.bytes, 0,
-			   lion_poschunk_size(&copy.hdr) - (LION_POS_HDRSZ + o.bytes));
+			   lion_poschunk_size(old) - (LION_POS_HDRSZ + o.bytes));
 	return true;
 }
 
@@ -640,9 +648,8 @@ lion_poschunk_remove(LionContainer *c, LionPosRemoveCallback cb, void *arg)
 	uint32		removed = 0;
 	Size		old = lion_poschunk_size(c);
 
-	pos_copy(&copy, c);
 	posout_init(&o, pos_members(c), c->ckey);
-	lion_poschunk_iter_init(&it, &copy.hdr);
+	lion_poschunk_iter_init(&it, pos_copy(&copy, c));
 	while (lion_poschunk_iter_next(&it, &cur))
 	{
 		if (cb(cur.code, arg))

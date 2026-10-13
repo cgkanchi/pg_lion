@@ -883,6 +883,9 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 		while (i >= armfirst + orst->armlen[arm])
 			armfirst += orst->armlen[arm++];
 		incompl = (orst->armcompl != NULL && orst->armcompl[arm]);
+		/* orst->compl says there is a complement arm (lion_exec_begin.c) */
+		if (incompl && m == NULL)
+			elog(ERROR, "LionCount: a complement arm in an OR without complements");
 		if (leafn[i] > 0)
 		{
 			memcpy(incompl ? &m->sets[moff] : &src->sets[off], leafsets[i],

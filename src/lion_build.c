@@ -1342,6 +1342,10 @@ lion_builder_group_fits(LionBuilder *b)
 
 	if (b->seg->cardinality == 0)
 		return true;			/* at most three pairs of one ckey always do */
+	/* a group of more becomes a container (lion_builder_add()) */
+	if (b->npend >= LION_SPARSE_THRESHOLD)
+		elog(ERROR, "lion index: %d pending members of a sparse group",
+			 b->npend);
 	if ((uint32) b->seg->cardinality + (uint32) b->npend > LION_SPARSE_MAX_PAIRS)
 		return false;
 
