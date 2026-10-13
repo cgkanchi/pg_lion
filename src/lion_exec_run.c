@@ -503,11 +503,13 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		 * A sum over all entries still has to report its one row, and so does
 		 * a count(DISTINCT k) without a GROUP BY (DESIGN.md §26) - unless the
 		 * planner folded a GROUP BY to one group, which does not exist then.
+		 * A count(DISTINCT k)'s state is there exactly when the plan has a k
+		 * (lion_begin_distinct()), and its row reads it.
 		 */
-		if (st->dist != NULL)
+		if (st->plan.distattno != 0)
 		{
-			st->dist->count = 0;
-			st->dist->colcount = 0;
+			lion_st_dist(st)->count = 0;
+			lion_st_dist(st)->colcount = 0;
 		}
 		Assert((st->mode == LION_MODE_SUM || st->mode == LION_MODE_DISTINCT) ==
 			   (lion_plan_flag(st, LION_FLAG_SUMALL) ||
