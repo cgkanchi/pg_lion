@@ -7692,7 +7692,8 @@ every scan shape against a sequential scan on an enum column, a list longer than
     in the release notes. (The seven pre-18 opclasses of the addendum below need no repair
     there: lionvalidate() accepts their hash functions on every major.)
   - ~~Hook coexistence in the matrix~~ - done 2026-09-23, see "Hook coexistence" below.
-- **Citus and TimescaleDB compatibility (last, before any release).** These are the environments the
+- **Citus and TimescaleDB compatibility - verified 2026-10-12 against Citus 14.2 and TimescaleDB
+  2.30.2 on PostgreSQL 18.6; the findings are in the addendum "Citus and TimescaleDB" below.** These are the environments the
   extension is most likely to run in. Verify, with a test matrix run against each:
   - Citus: distributed and reference tables with lion indexes (CREATE INDEX propagation via the
     normal DDL path; the opclasses, reloptions and the citext companion must be creatable on
@@ -7784,15 +7785,20 @@ every scan shape against a sequential scan on an enum column, a list longer than
 
 ### §23 addendum: hook coexistence (verified 2026-09-23)
 
-What pg_lion installs into the server, all of it from `_PG_init()` (lion_am.c, lion_wal.c):
-`create_upper_paths_hook` and, since §30, `set_rel_pathlist_hook`, chained the same way (the
-previous hook first), and nothing else among the hooks - no planner, executor, ProcessUtility or
-object-access hook -; a custom WAL resource manager, only
-while `shared_preload_libraries` is processed; its GUCs, with the `pg_lion` prefix reserved by
-`MarkGUCPrefixReserved()`. Each hook saves the previous value and calls it FIRST, then adds its own
-path (`lion_create_upper_paths()`, `lion_ordered_set_rel_pathlist()`), so whichever extension was loaded before pg_lion has already
-added its paths when pg_lion adds its own, and an extension loaded after pg_lion reaches pg_lion
-through its own chaining. Nothing is ever uninstalled: core has not unloaded a library since
+What pg_lion installs into the server, all of it from `_PG_init()` (lion_am.c, lion_plan_hooks.c,
+lion_ordered.c, lion_bm25_scan.c, lion_selfuncs.c, lion_wal.c): `create_upper_paths_hook` and
+`set_join_pathlist_hook`; `set_rel_pathlist_hook` three times over - `LionOrdered` (§30), `LionBm25`
+(§39) and the plain-scan repricing with the row correction (§33, §40), installed in that order, so
+the repricing runs first -; `get_relation_stats_hook` and `get_index_stats_hook` (§33, §41); and
+nothing else among the hooks - no planner, executor, ProcessUtility or object-access hook -; a
+custom WAL resource manager, only while `shared_preload_libraries` is processed; its GUCs, with the
+`pg_lion` prefix reserved by `MarkGUCPrefixReserved()`. Every hook saves the previous value and
+calls it: all but one FIRST, adding their own path after (`lion_create_upper_paths()`,
+`lion_ordered_set_rel_pathlist()`), so whichever extension was loaded before pg_lion has already
+added its paths when pg_lion adds its own; the plain-scan repricing calls it LAST, so that the plain
+paths are repriced before anything compares against them. An extension loaded after pg_lion reaches
+pg_lion through its own chaining, when it chains: Citus does not, for two of these hooks (the
+addendum "Citus and TimescaleDB" below). Nothing is ever uninstalled: core has not unloaded a library since
 PostgreSQL 15 (no `_PG_fini`), and `_PG_init()` runs once per process, so there is no reload-order
 case beyond the two load orders. No chaining bug was found.
 
@@ -7825,6 +7831,79 @@ Against the dev cluster, restarted with the options on pg_ctl's command line:
 Green on 16, 17, 18, 19 and master. What this does not show is how Citus or TimescaleDB use the
 hook - whether either replaces paths, or plans the query elsewhere, before pg_lion sees it; that
 is still the Citus and TimescaleDB item's to test.
+
+### §23 addendum: Citus and TimescaleDB (verified 2026-10-12)
+
+Run against Citus 14.2.0 (the first release that accepts PostgreSQL 18; 13.4 refuses it) with
+citus_columnar, and against TimescaleDB 2.30.2, both on PostgreSQL 18.6 with lion at 87c0404; the
+scripts, outputs and full reports are kept outside the repository. Every answer - more than 2,000
+query runs under Citus over distributed, reference, partitioned and co-located tables in every
+planner mode and all three preload orders, 186 query-and-variant runs under TimescaleDB in three
+load arrangements - equalled the same query with the pushdown off and with sequential scans only,
+and `lion_index_verify(idx, true)` passed on every shard and chunk index after every operation:
+index DDL (reloptions, CONCURRENTLY, REINDEX, `timescaledb.transaction_per_chunk`), shard moves
+(logical under concurrent writes, and `block_writes`), rebalance, splits,
+`create_distributed_table_concurrently`, `undistribute_table`, repartition joins, chunk compression,
+decompression and recompression, `reorder_chunk`, `merge_chunks`, `split_chunk`, continuous
+aggregate refresh, retention, and a worker crash replayed under the resource manager. pg_lion's own
+regression and isolation suites pass against a Citus coordinator and against a server preloading
+TimescaleDB. What the matrix found:
+
+- **Citus does not chain two hooks.** Its `shared_library_init.c` assigns `set_rel_pathlist_hook`
+  and `set_join_pathlist_hook` without saving the previous value, so under
+  `shared_preload_libraries = 'pg_lion,citus'` lion's `LionOrdered`, `LionBtreeScan`, `LionBm25`,
+  `LionSemiJoin`/`LionAntiJoin` and plain-scan repricing never run; the count pushdown, on
+  `create_upper_paths_hook`, does, and answers are right. `'citus,pg_lion'`, and lion loaded on
+  first use next to a preloaded Citus, work in full. Documented as "list citus first" (README,
+  REFERENCE); the fix belongs in Citus.
+- **The index-name SQL functions are node-local.** `lion_index_count()`, `lion_index_facets()`,
+  `lion_bm25()` and `lion_bm25_score()` open the index they are named, and Citus rewrites the
+  table of a distributed query to its shard but not a `regclass` literal, so on the coordinator
+  and on every worker they read the distributed table's empty shell index: 0, no rows, and a BM25
+  score of 0 for every row. The `ORDER BY lion_bm25_score(...) LIMIT n` path (§39) plans on a
+  shard's own index only when the shard index is named. Documented; `run_command_on_shards()` is
+  the way to call them.
+- **Citus rewrites `avg(col)` to `sum(col), count(col)` per shard**, and §37's aggregates over keys
+  decline that pair, because `count(col)` is answered as a count with `col IS NOT NULL`, a WHERE.
+  An extension of §37 that returns a column's non-NULL weight sum beside its sum would answer it;
+  not built.
+- A shard copied by a move, rebalance or split has no visibility-map bits until VACUUM, so the
+  pushdown rechecks every row there and the planner prefers a sequential scan of that shard.
+- **TimescaleDB plans a hypertable as an old-style inheritance parent**, which
+  `lion_count_path_rel()` declines (§16 takes declarative partitions only), so no count over a
+  hypertable uses the pushdown: TimescaleDB's chunk-wise partial aggregation runs over per-chunk
+  lion bitmap scans instead, 2 to 9 times slower than the same count written as a UNION ALL of
+  one `LionCount` per chunk. Extending §16 to inheritance children is the follow-up with the most
+  value under TimescaleDB. Its obstacles: the parent may hold rows of its own (core's expansion
+  lists it as a child, TimescaleDB's does not), a child may be a foreign table (tiered chunks), and
+  a partially compressed chunk keeps its lion indexes while its heap holds only the uncompressed
+  rows, so the path must decline unless every live child is a plain heap with scan paths of its own,
+  and it has to compete on cost with the chunk-wise paths TimescaleDB adds to the same upper rel.
+- **TimescaleDB 2.30 plans a `SELECT ... LIMIT n` over a hypertable through its DeferredChunkAppend
+  with the root's `rte->inh` cleared**: it builds the root's index list, replaces the root's
+  pathlist with that node, and only then calls the previous `set_rel_pathlist_hook`. Lion's base-rel
+  paths saw a plain table with lion indexes and added `LionOrdered` paths over the empty root; they
+  lost on cost at every setting tried, so no wrong rows were returned, but nothing but cost kept
+  them out. `lion_rel_is_unexpanded_parent()` (lion_plan_hooks.c) now declines a relation that has
+  inheritance children but is planned without them - in the count pushdown, `LionOrdered`,
+  `LionBtreeScan`, `LionBm25` and the FK-side joins -; `FROM ONLY parent` of a plain inheritance
+  tree loses lion's custom scans for it, which core's scans of the same indexes replace
+  (test/sql/only_parent.sql).
+- Compressed chunks keep their lion indexes, and lion plans nothing on them; a mix of compressed
+  and uncompressed chunks counts right. A chunk in a non-heap table access method makes the
+  hypertable's `CREATE INDEX ... USING lion` fail with §2's error rather than skip the chunk, which
+  is the right outcome: a skipped chunk would be an index that silently misses rows. (The hypercore
+  access method is gone from 2.30; the case was run with lion_hooktest's copied-heap AM.)
+- The expression index on `time_bucket()` builds on every chunk and is not used for counts on the
+  hypertable (§41's rule for partitioned and inheritance parents); a stored bucket column is.
+- TimescaleDB-side: it does not reserve its `timescaledb.` GUC prefix; its SkipScan ignores
+  PostgreSQL 18's `disabled_nodes` (one plan diff in the `distinct_unique` test inside a TimescaleDB
+  database, same answer); a build that fails under `transaction_per_chunk` leaves an invalid parent
+  index whose chunk indexes keep being created.
+- Not covered: majors other than 18 (Citus 14.2 and TimescaleDB 2.30 support 15 to 18); level (2)
+  of the citus_columnar item above; Citus HLL distinct counts, MERGE, CDC, tenant schemas, a
+  replication factor above 1; TimescaleDB space partitioning, tiered chunks, hierarchical continuous
+  aggregates; the injection-point specs, the recovery harness and the soak under either.
 
 ### §23 addendum: pg_upgrade with lion indexes (verified 2026-09-23)
 
