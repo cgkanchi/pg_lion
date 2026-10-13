@@ -446,8 +446,10 @@ lion_count_path_rel(LionCountPathBuild *cx)
 		 * A partitioned parent (DESIGN.md §16).  The parent itself has no
 		 * storage and no index list; every live leaf partition is counted in
 		 * turn, with its own heap and its own indexes.  Old-style inheritance
-		 * parents are not handled: their children are not required to have
-		 * the parent's columns at all.
+		 * parents are not handled: the parent may hold rows of its own, a
+		 * child may be a foreign table, and an extension may keep part of a
+		 * child's rows outside its heap (TimescaleDB's compressed chunks), so
+		 * the sum over the children has no footing there.
 		 */
 		if (cx->rte->relkind != RELKIND_PARTITIONED_TABLE)
 			return false;
@@ -470,6 +472,9 @@ lion_count_path_rel(LionCountPathBuild *cx)
 	{
 		if (cx->rte->relkind != RELKIND_RELATION &&
 			cx->rte->relkind != RELKIND_MATVIEW)
+			return false;
+		/* a parent planned without its children holds part of the rows */
+		if (lion_rel_is_unexpanded_parent(cx->rte))
 			return false;
 		if (input_rel->indexlist == NIL)
 			return false;

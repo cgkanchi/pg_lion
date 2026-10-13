@@ -11,6 +11,8 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_inherits.h"
+
 #include "lion_customscan.h"
 #include "lion_plan_private.h"
 
@@ -1016,4 +1018,27 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->methods = &lion_count_scan_methods;
 
 	return &cscan->scan.plan;
+}
+
+/*
+ * Is rte a table queried without its inheritance children, so that a path
+ * over its own heap and indexes would be a path over part of the rows?
+ *
+ * Core writes `FROM ONLY parent` that way, and there a path over the parent
+ * alone is right.  But an extension's planner hook may do the same to a
+ * parent it expands itself: TimescaleDB 2.30 clears rte->inh on a hypertable
+ * it plans as its DeferredChunkAppend, replaces the pathlist, and only then
+ * calls the hooks installed before it, so a path lion added there would read
+ * the empty root alone and would be kept out only by its cost (DESIGN.md §23,
+ * the TimescaleDB addendum).  The two cases cannot be told apart, so lion
+ * offers no path of its own on a parent whose children are not in the query:
+ * `FROM ONLY` of an inheritance parent loses lion's custom scans and keeps
+ * core's plans over the same indexes.  relhassubclass is a hint that may stay
+ * set after the last child is dropped, which costs the same and nothing more.
+ */
+bool
+lion_rel_is_unexpanded_parent(RangeTblEntry *rte)
+{
+	return rte->rtekind == RTE_RELATION && !rte->inh &&
+		rte->relkind == RELKIND_RELATION && has_subclass(rte->relid);
 }
