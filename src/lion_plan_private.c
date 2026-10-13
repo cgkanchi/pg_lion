@@ -1205,7 +1205,7 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	/*
 	 * The aggregates over keys (DESIGN.md §37) are a sum over the entries
 	 * with no GROUP BY, and the target list's keys and aggregates are among
-	 * the plan's.
+	 * the plan's: none, when it has none.
 	 */
 	if (p->nwcol > 0)
 	{
@@ -1218,14 +1218,22 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 				elog(ERROR, "LionCount: a sum over keys without 128-bit integers");
 		}
 #endif
-		for (i = 0; i < p->ntl; i++)
-		{
-			if ((LION_TL_IS_WKEY(p->tlkind[i]) &&
-				 LION_TL_WKEY_COL(p->tlkind[i]) >= p->nwcol) ||
-				(LION_TL_IS_WAGG(p->tlkind[i]) &&
-				 LION_TL_WAGG_NO(p->tlkind[i]) >= p->nwagg))
-				elog(ERROR, "LionCount: malformed aggregates over keys");
-		}
+	}
+	for (i = 0; i < p->ntl; i++)
+	{
+		if ((LION_TL_IS_WKEY(p->tlkind[i]) &&
+			 LION_TL_WKEY_COL(p->tlkind[i]) >= p->nwcol) ||
+			(LION_TL_IS_WAGG(p->tlkind[i]) &&
+			 LION_TL_WAGG_NO(p->tlkind[i]) >= p->nwagg))
+			elog(ERROR, "LionCount: malformed aggregates over keys");
+	}
+
+	/* count(DISTINCT k) and count(k) of that k read the k's state (§26) */
+	for (i = 0; i < p->ntl; i++)
+	{
+		if ((p->tlkind[i] == LION_TL_COUNT_DISTINCT ||
+			 p->tlkind[i] == LION_TL_COUNT_DISTCOL) && p->distattno == 0)
+			elog(ERROR, "LionCount: a distinct count without its column");
 	}
 
 	/* a sum has a driver (lion_count_priv_drive_attno() says so) ... */

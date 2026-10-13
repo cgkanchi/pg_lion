@@ -46,15 +46,17 @@ typedef enum LionPrivStage
  */
 
 /*
- * Exported, unlike the rest of the library's internals, for the decoder's
- * own test: test/modules/lion_hooktest feeds it malformed lists.
+ * The decoder and the check are exported, unlike the rest of the library's
+ * internals, for their own test: test/modules/lion_hooktest feeds them
+ * malformed lists.
  */
 extern PGDLLEXPORT void lion_count_priv_decode(List *priv, LionPrivStage stage,
 											   LionCountPriv *out);
 extern List *lion_count_priv_encode(const LionCountPriv *p,
 								   LionPrivStage stage);
-extern void lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
-								  int ncustom_plans);
+extern PGDLLEXPORT void lion_count_priv_check(const LionCountPriv *p,
+											  bool parallel_aware,
+											  int ncustom_plans);
 extern AttrNumber lion_count_priv_drive_attno(const LionCountPriv *p);
 extern AttrNumber lion_count_priv_inner_attno(const LionCountPriv *p);
 extern LionCountMode lion_count_mode_of(const LionCountPriv *p,

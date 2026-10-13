@@ -319,6 +319,11 @@ lion_extract_internal(LionState *state, Datum value, Datum **keys,
 	*keys = NULL;
 	if (pos != NULL)
 		*pos = NULL;
+	/*
+	 * extractValue set nraw through the pointer in a Datum, which a static
+	 * analyser does not follow: to it nraw is still 0 here.
+	 */
+	/* coverity[dead_error_line] */
 	if (nraw <= 0 || raw == NULL)
 		return 0;
 
@@ -1524,6 +1529,11 @@ lion_qtn_lexeme(const char *word, int len, uint8 weight)
 	n->valnode->qoperand.prefix = false;
 	n->valnode->qoperand.length = len;
 	INIT_LEGACY_CRC32(crc);
+	/*
+	 * The CRC's shifts drop its high bits by design: pg_crc32 is unsigned,
+	 * and this is core's own macro, as its tsquery parser computes it.
+	 */
+	/* coverity[overflow_const] */
 	COMP_LEGACY_CRC32(crc, word, len);
 	FIN_LEGACY_CRC32(crc);
 	n->valnode->qoperand.valcrc = (int32) crc;

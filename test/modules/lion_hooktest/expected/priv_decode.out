@@ -1,7 +1,7 @@
--- The decoder of a LionCount plan's custom_private (src/lion_plan_private.c)
--- handed lists no planner makes: each one a plan of one equality clause with
--- one thing changed, which it must refuse rather than read at the wrong
--- offsets.  The first two are the lists a planner does make, at the plan
+-- The decoder of a LionCount plan's custom_private (src/lion_plan_private.c),
+-- and its check of the rules between members, handed lists no planner makes:
+-- each one a plan of one equality clause with one thing changed, which they
+-- must refuse rather than read at the wrong offsets.  The first two are the lists a planner does make, at the plan
 -- and the path stage.
 \set VERBOSITY terse
 SET client_min_messages = warning;
@@ -46,6 +46,11 @@ SELECT lion_hooktest_priv_decode('path join at plan');
 ERROR:  LionCount: malformed join
 SELECT lion_hooktest_priv_decode('path wagg at plan');
 ERROR:  LionCount: malformed aggregates over keys
+-- a target list that reads state the plan has none of
+SELECT lion_hooktest_priv_decode('aggregate without aggregates');
+ERROR:  LionCount: malformed aggregates over keys
+SELECT lion_hooktest_priv_decode('distinct count without its column');
+ERROR:  LionCount: a distinct count without its column
 -- a dimension folded into a fact filter whose IN list is the join key's
 SELECT lion_hooktest_priv_decode('join filter on its key');
 ERROR:  LionCount: malformed join

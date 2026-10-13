@@ -29,7 +29,7 @@
  * but is not, by pointer, the heap, which is the only kind of "other" table
  * AM a test can create without shipping a real one.
  *
- * And lion_hooktest_priv_decode(), which feeds pg_lion's decoder of a
+ * And lion_hooktest_priv_decode(), which feeds pg_lion's decoder and check of a
  * LionCount plan's custom_private (src/lion_plan_private.h) lists no planner
  * makes.  It has nothing to do with the hooks: this module is simply the
  * test-only C code the checks already build.
@@ -57,6 +57,8 @@ PG_MODULE_MAGIC;
 
 typedef void (*lion_priv_decode_fn) (List *priv, LionPrivStage stage,
 									 LionCountPriv *out);
+typedef void (*lion_priv_check_fn) (const LionCountPriv *p,
+									bool parallel_aware, int ncustom_plans);
 
 PG_FUNCTION_INFO_V1(lion_hooktest_calls);
 PG_FUNCTION_INFO_V1(lion_hooktest_saw_lion);
@@ -249,10 +251,11 @@ lion_hooktest_heapcopy_handler(PG_FUNCTION_ARGS)
 }
 
 /*
- * pg_lion's decoder of a LionCount plan's custom_private
- * (lion_count_priv_decode(), src/lion_plan_private.h), handed a list a
- * planner of this build would make - one equality clause, a count - with one
- * thing changed, named by `variant`; the number of clauses it decoded.  Every
+ * pg_lion's decoder of a LionCount plan's custom_private, and the rules
+ * between its members (lion_count_priv_decode() and lion_count_priv_check(),
+ * src/lion_plan_private.h), handed a list a planner of this build would make
+ * - one equality clause, a count - with one thing changed, named by
+ * `variant`; the number of clauses it decoded.  Every
  * variant but "plan" and "path" is a list it must refuse: no plan carries
  * one, so this is the only way to see that it does.
  */
@@ -261,6 +264,7 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 {
 	char	   *variant = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	lion_priv_decode_fn decode;
+	lion_priv_check_fn check;
 	LionPrivStage stage = LION_PRIV_STAGE_PLAN;
 	LionCountPriv out;
 	List	   *priv = NIL;
@@ -268,6 +272,9 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 
 	decode = (lion_priv_decode_fn)
 		load_external_function("$libdir/pg_lion", "lion_count_priv_decode",
+							   true, NULL);
+	check = (lion_priv_check_fn)
+		load_external_function("$libdir/pg_lion", "lion_count_priv_check",
 							   true, NULL);
 
 	for (n = 0; n < LION_PRIV_NMEMBERS; n++)
@@ -360,9 +367,16 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 		lfirst(list_nth_cell(priv, LION_PRIV_WAGG)) =
 			list_make3(list_make1_int(1), list_make1_oid(ClassOidIndexId),
 					   list_make1_int(1));
+	else if (strcmp(variant, "aggregate without aggregates") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
+			list_make1_int(LION_TL_WAGG(0));
+	else if (strcmp(variant, "distinct count without its column") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
+			list_make1_int(LION_TL_COUNT_DISTINCT);
 	else
 		elog(ERROR, "unknown variant \"%s\"", variant);
 
 	decode(priv, stage, &out);
+	check(&out, false, 0);
 	PG_RETURN_INT32(out.nclause);
 }
