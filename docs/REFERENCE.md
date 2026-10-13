@@ -295,7 +295,11 @@ or temporary one writes no WAL and is written anywhere), which needs
 development: two extensions that both take it cannot be loaded together, so a production cluster
 should check `pg_get_wal_resource_managers()` and move one of them.  Once an index has been written
 in rmgr mode the library must stay in `shared_preload_libraries` for as long as WAL that mentions it
-may still be replayed - the rule core states for every custom resource manager.
+may still be replayed - the rule core states for every custom resource manager.  WAL written
+under one id replays only under that id, so change `pg_lion.rmgr_id` only after a clean shutdown,
+once every standby and WAL archive consumer has replayed everything written under the old id, and
+restart each server of the cluster with the new one; `pg_upgrade` carries no WAL across, so an
+upgrade may change it freely.
 `lion_index_stats()` reports ONE ROW PER KEY COLUMN (DESIGN.md §24), with a leading `attno`: the
 directory's height, its leaf and internal pages and whether that column is `ordered` (false for a
 key type with no btree opclass, whose entries are then in a complete but arbitrary order), the
