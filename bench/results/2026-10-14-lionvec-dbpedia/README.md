@@ -32,12 +32,18 @@ row a method and filter:
 | `hnsw.json` | HNSW on `embedding::halfvec(1536)`, m 16, ef_construction 64 | 1de7d73 (d498fba) | | 187 s | 450 MB |
 | `lionvec-p678.json` | lionvec, `partitions = 678` (= the default then, 2 sqrt(n)) | 1de7d73 (d498fba) | 678 | 161 s | 210 MB |
 | `lionvec-p2715.json` | lionvec, `partitions = 2715` (8 sqrt(n)) | 1de7d73 (d498fba) | 2,715 | 347 s | 221 MB |
+| `lionvec-p0-default.json` | lionvec, `partitions = 0`, the new default 8 sqrt(n) | e2eda33 | 2,715 | 337 s | 221 MB |
 
 The table is 7.6 MB and its TOAST 900 MB. 1de7d73 is the last commit to `src/` on the
 `claude/lionvec` branch, whose head d498fba these ran on. An index built with `partitions = 0` on
 that code had the same 678 partitions and gave the same numbers, query for query (build 159 s).
 lionvec's builds ran all ten k-means iterations at both sizes. 2715 is `(int) (8 * sqrt(115186))`,
-what the new default chooses, so that the default's run can be compared exactly.
+what the new default chooses, so that the default's run can be compared exactly: e2eda33 made the
+default 8 sqrt(n), and its `partitions = 0` index (`lionvec-p0-default.json`) is the same 2,715
+partitions, the same 231,440,384 bytes, and gave the same recall, partitions probed, pages,
+candidates, refines, fetches, skips and pauses as `lionvec-p2715.json` in all 74 rows, and the same
+plans; the server medians differ by 0.07 ms on average (unfiltered within 0.4 ms; the sort under 3%
+varies from 15 to 22 ms from run to run).
 
 ## Warm, the planner's plans
 
@@ -92,6 +98,9 @@ took 771 pages in 678 partitions (5.6 ms) and 646 in 2,715 (7.2 ms); through the
 
 ## Re-running
 
+From this checkout, with the dev cluster (run as an unprivileged user; `pgdev` here is
+`runuser -u pglion -- ./dev.sh`):
+
     export LION_SOCK=/tmp/lion-sock-a LION_PORT=54329; eval "$(./dev.sh env)"
     python3 bench/vector/knn_dbpedia.py prepare         # once: shards -> .local/dbpedia
     python3 bench/vector/knn_dbpedia.py load            # once: database dbpedia
@@ -100,3 +109,16 @@ took 771 pages in 678 partitions (5.6 ms) and 646 in 2,715 (7.2 ms); through the
     python3 bench/vector/knn_dbpedia.py warm lionvec NAME     # margins 2-16, patience 30 and 120
     python3 bench/vector/knn_dbpedia.py warm hnsw hnsw
     python3 bench/vector/knn_dbpedia.py table bench/results/2026-10-14-lionvec-dbpedia/*.json
+
+Another build of pg_lion, for the same table and truth: install it into the same PostgreSQL,
+restart, rebuild the index (a new format cannot read the old one), and name the checkout so that
+the results record its commit:
+
+    make -C OTHER -j4 WERROR=1 PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
+    make -C OTHER install PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
+    pgdev restart
+    python3 bench/vector/knn_dbpedia.py lionvec 0
+    KNN_SRC=OTHER KNN_OUT=DIR python3 bench/vector/knn_dbpedia.py warm lionvec NAME
+    python3 bench/vector/knn_dbpedia.py table bench/results/2026-10-14-lionvec-dbpedia/lionvec-p0-default.json DIR/NAME.json
+
+`make install && pgdev restart` here puts this build back.
