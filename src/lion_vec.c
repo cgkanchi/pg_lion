@@ -331,7 +331,10 @@ lionvec_refine_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 				 errmsg("lionvec index \"%s\" has a refine item of %u bytes at (%u,%u)",
 						RelationGetRelationName(index), ItemIdGetLength(iid), blk, off)));
 	ref = (LionVecRefine *) PageGetItem(page, iid);
-	return ItemPointerEquals(&ref->tid, tid) ? ref : NULL;
+	/* not ItemPointerEquals(), which asserts against a centroid's TID */
+	return ItemPointerGetBlockNumberNoCheck(&ref->tid) == ItemPointerGetBlockNumberNoCheck(tid) &&
+		ItemPointerGetOffsetNumberNoCheck(&ref->tid) == ItemPointerGetOffsetNumberNoCheck(tid) ?
+		ref : NULL;
 }
 
 /*

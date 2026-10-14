@@ -166,6 +166,8 @@ typedef struct LionVecPart
 /* the TID of a centroid's REFINE item */
 #define LionVecCentTid(tid, partno) \
 	ItemPointerSet((tid), (BlockNumber) (partno), InvalidOffsetNumber)
+/* ... and back: an invalid TID, which the checked accessors assert against */
+#define LionVecCentPartno(tid)	ItemPointerGetBlockNumberNoCheck(tid)
 
 /*
  * The most dimensions an index takes: as many whole words as leave a REFINE
