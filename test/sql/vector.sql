@@ -524,10 +524,14 @@ SET pg_lion.vector_margin = -10;
 SELECT vec_recall('SELECT id FROM vt ORDER BY v <-> vt_vec(77, 40, 0.5) LIMIT 100') < 1 AS "fewer";
 RESET pg_lion.vector_margin;
 
--- spill against none, over two tables of the first 3,000 rows: at the
--- defaults it finds as many of the nearest, and at a margin below zero,
+-- spill against none, over two tables of the first 3,000 rows: run to the
+-- margin it finds as many of the nearest, and at a margin below zero,
 -- which leaves rows in partitions not probed, more - the rows near a
--- partition's edge are in the next one too
+-- partition's edge are in the next one too.  The pause is off: 30 of its
+-- units are 820 of these rows, five of the twenty partitions, and in so
+-- few, each two thirds of a batch of 100, the spilling index's nearest
+-- come early, enter its hundred least upper bounds early, and the pause
+-- then stops it at four partitions on <#> where the other runs to seven
 CREATE TABLE vs (id int, v vector(40));
 INSERT INTO vs SELECT i, vt_vec(-(i % 10) - 1, 40) + vt_vec(i, 40, 0.3)
   FROM generate_series(1, 3000) i;
@@ -546,12 +550,14 @@ LANGUAGE sql AS $$
 	  FROM (SELECT format('(vt_vec(-%s, 40) + vt_vec(%s, 40, 0.3))', s % 10 + 1, s + 9000) AS q
 			  FROM generate_series(1, 20) s) q
 $$;
+SET pg_lion.vector_patience = 0;
 SELECT op, vt_recall_of('vs', op) >= vt_recall_of('vn', op) AS "as many"
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
 SET pg_lion.vector_margin = -2;
 SELECT op, vt_recall_of('vs', op) > vt_recall_of('vn', op) AS "more"
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
 RESET pg_lion.vector_margin;
+RESET pg_lion.vector_patience;
 DROP FUNCTION vt_recall_of(text, text);
 DROP TABLE vs, vn;
 
