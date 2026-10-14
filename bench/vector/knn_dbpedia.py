@@ -43,6 +43,8 @@
 # (default .local/dbpedia), KNN_OUT (default
 # bench/results/2026-10-14-lionvec-dbpedia), KNN_NQ (default 200),
 # KNN_SHARDS (default /mnt/project-files/train-0000[0-2]-of-00026.parquet),
+# KNN_SRC (default this checkout: the one the installed pg_lion was built
+# from, whose commit the results record),
 # KNN_MARGINS (default 2,3,4,6,8,12,16) and KNN_PATIENCE (default 30,120):
 # the pg_lion.vector_margin and pg_lion.vector_patience values warm runs.  The
 # margins go past the default 3 because on these embeddings 3 returns 0.84 of
@@ -60,6 +62,7 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 DSN = os.environ.get('KNN_DSN', 'dbname=dbpedia')
 ADMIN_DSN = os.environ.get('KNN_ADMIN_DSN', 'dbname=postgres')
 CACHE = os.environ.get('KNN_CACHE', os.path.join(REPO, '.local', 'dbpedia'))
+SRC = os.environ.get('KNN_SRC', REPO)
 OUT = os.environ.get('KNN_OUT', os.path.join(REPO, 'bench', 'results', '2026-10-14-lionvec-dbpedia'))
 NQ = int(os.environ.get('KNN_NQ', '200'))
 SHARDS = os.environ.get('KNN_SHARDS', '/mnt/project-files/train-0000[0-2]-of-00026.parquet')
@@ -240,16 +243,18 @@ def build(name, ddl):
 
 
 def provenance():
-    # what the results came from: the checkout's HEAD, the last commit to
-    # change src/ and whether src/ differs from it, and the installed library
-    git = lambda *a: subprocess.run(['git', '-C', REPO] + list(a), capture_output=True,
+    # what the results came from: the checkout's HEAD (KNN_SRC's, where the
+    # installed library was built from another), the last commit to change
+    # src/ and whether src/ differs from it, and the installed library
+    git = lambda *a: subprocess.run(['git', '-C', SRC] + list(a), capture_output=True,
                                     text=True).stdout.strip()
     libdir = subprocess.run(['pg_config', '--pkglibdir'], capture_output=True, text=True).stdout.strip()
     try:
         lib = hashlib.sha256(open(os.path.join(libdir, 'pg_lion.so'), 'rb').read()).hexdigest()[:16]
     except OSError:
         lib = None
-    return dict(head=git('rev-parse', '--short', 'HEAD'), branch=git('rev-parse', '--abbrev-ref', 'HEAD'),
+    return dict(checkout=SRC, head=git('rev-parse', '--short', 'HEAD'),
+                branch=git('rev-parse', '--abbrev-ref', 'HEAD'),
                 src_commit=git('log', '-1', '--format=%h', '--', 'src'),
                 src_dirty=bool(git('status', '--porcelain', '--', 'src')), pg_lion_so_sha256=lib)
 
