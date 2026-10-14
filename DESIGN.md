@@ -20229,7 +20229,7 @@ Format 2 had no copies and no flags in its meta page; this pg_lion refuses an in
 Format 1 (§44 above) had one CODE chain, every row in heap order, and a DIR chain of each CODE
 page's least and greatest TID, by which a filtered scan read only the pages that could hold a
 member. With partitions a filter's members are spread over every partition, the build's order is
-by partition first, and a filtered scan of more than 2,000 members probes partitions as an
+by partition first, and a filtered scan of more than `pg_lion.vector_exact_rows` (2,000) members probes partitions as an
 unfiltered one does, so the directory went; the page's container keys still skip a page that
 holds no member (§44.6).
 
@@ -20591,7 +20591,7 @@ relation as a B-tree's is. The plan differs from §30's in four places:
 - **The set is handed to the scan** after every `index_rescan()` (`lion_vec_restrict()`: its
   container keys, ascending, and its containers). The scan counts the members (a degraded
   container, NULL, as its 64 blocks' share of the table's rows) and then does one of two things:
-  - **No more than `LIONVEC_EXACT_MAX` (2,000) members, none degraded**: it fetches every member
+  - **No more than `pg_lion.vector_exact_rows` (2,000) members, none degraded**: it fetches every member
     from the heap, computes its distance with the operator's function, sorts them (NaN last, then
     by TID) and returns them in order (`lv_exact()`), reading no CODE page. A member not visible,
     or whose vector is NULL, is left for the NULL walk, a cosine zero vector (NaN) for the zero
@@ -20629,7 +20629,7 @@ rows pass and the set costs more than the rows it saves.
 ### 44.7 Costs (lionveccostestimate())
 
 Start-up is the cost of the first row, which is most of a scan's. A restriction of no more than
-2,000 members (§44.6) costs a random page, an index tuple and a row's estimate a member. Otherwise:
+`pg_lion.vector_exact_rows` members (§44.6) costs a random page, an index tuple and a row's estimate a member. Otherwise:
 every centroid's estimate (`LIONVEC_ROW_OPS`, 2 `cpu_operator_cost`: the popcounts and a square
 root); the share of the rows a scan probes; a random page a probed partition and the CODE pages'
 share of the index (by the recorded dimensions, or 1536 before any) read sequentially; `0.1
@@ -20685,6 +20685,16 @@ no ORDER BY costs infinity. Selectivity 1, correlation 0.
   probing fewer partitions and missing more rows. 30 is where the 975,000-row benchmark's tail
   ended, in its `2 sqrt(n)` partitions, where a unit is a partition's rows: at a margin of 3, 30
   and 40 gave the same recall (0.979), 40 a 95th percentile a third longer.
+- `pg_lion.vector_exact_rows` (int, 0 to 100,000,000, default 2,000): how many members a lion filter
+  may admit for the scan to compute every member's distance from the heap, exactly, instead of
+  probing (§44.6); 0 never does. The exact path costs a heap fetch a member - at 1536 dimensions a
+  6 KB vector from TOAST, so 2,000 members are 12 MB - where a probe reads a few hundred to a
+  thousand CODE pages (§44.9) but, under a filter that leaves most partitions empty, many for
+  nothing: in the simulation a 0.1% filter of 975,000 rows probed a fifth of the index for 0.95.
+  The default sits where the two cost about the same on that benchmark; raise it where storage
+  is fast or exactness is wanted, lower it where the vectors are wide and the disk slow. The
+  planner prices both (§44.7), so it may sort the filter's rows itself above the threshold, as
+  it does at 1% on DBpedia (§44.9), which is exact too.
 - `partitions` (reloption, 0 to 1,000,000, default 0): the partitions the build makes; 0 chooses
   by the rows' count, `8 sqrt(n)` above 10,000 rows as `maintenance_work_mem`'s sample allows
   (§44.3; `2 sqrt(n)` until DBpedia, §44.9). Read by the build alone, so a change takes a REINDEX.
@@ -21066,7 +21076,7 @@ times, the model's `C^(1/3)` 1.59; unfiltered it is under half the model's level
 - **vector_filter.sql**: LionOrdered over each metric against the ordinary plan, with
   `pg_lion.vector_margin = 100` and the pause off, for eight filters (equality, range, AND, OR,
   `<>`, a correlated column, a boolean, no rows) and four LIMITs, over 10,000 rows in 50
-  partitions - the filters of under 2,000 members by their exact distances, the others probing;
+  partitions - the filters of up to `pg_lion.vector_exact_rows` members by their exact distances, the others probing;
   far, zero and NULL queries; a prepared statement's generic plan; a correlated subquery
   rescanning the node; a degraded set (400,000 rows of 3 dimensions in 20 partitions, `hash_mem`
   64kB) and its recheck; a filter of 200 members reading less than a quarter of the index blocks

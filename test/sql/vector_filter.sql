@@ -243,9 +243,9 @@ RESET work_mem;
 RESET plan_cache_mode;
 
 -- a few members in every container key.  A scan restricted to no more than
--- 2,000 of them fetches each one's distance from the heap, and reads no
--- CODE page (DESIGN.md §44.6); one restricted to more probes partitions, as
--- an unrestricted scan does.
+-- pg_lion.vector_exact_rows (2,000) of them fetches each one's distance from
+-- the heap, and reads no CODE page (DESIGN.md §44.6); one restricted to more
+-- probes partitions, as an unrestricted scan does.
 CREATE TABLE vfb (id int, s int, v vector(64)) WITH (autovacuum_enabled = off);
 INSERT INTO vfb SELECT i, i % 2000, vf_vec(i, 64) FROM generate_series(1, 40000) i;
 -- pins the old default's count, 2 sqrt(n) = 400, for test time (1,600: 42 s)
@@ -279,10 +279,37 @@ SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 200
 SELECT pg_stat_force_next_flush();
 SELECT pg_stat_clear_snapshot();
 SELECT vfb_blks() AS b2 \gset
+-- the threshold moved: at 0 the 200 members are probed for, as the 4,000
+-- were, and at 5,000 the 4,000 are fetched, as the 200 were; the order is
+-- the same either way
+SET pg_lion.vector_exact_rows = 0;
+SELECT vf_ord('SELECT id, v <-> vf_vec(7, 64) AS d FROM vfb WHERE s < 10
+			   ORDER BY v <-> vf_vec(7, 64) LIMIT 10');
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+SELECT vfb_blks() AS b3 \gset
+SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 10
+					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10) s;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+SELECT vfb_blks() AS b4 \gset
+SET pg_lion.vector_exact_rows = 5000;
+SELECT vf_ord('SELECT id, v <-> vf_vec(7, 64) AS d FROM vfb WHERE s < 200
+			   ORDER BY v <-> vf_vec(7, 64) LIMIT 10');
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+SELECT vfb_blks() AS b5 \gset
+SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 200
+					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10) s;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+SELECT vfb_blks() AS b6 \gset
+RESET pg_lion.vector_exact_rows;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
 SELECT :b1 - :b0 > 0 AS "read some", 4 * (:b1 - :b0) < :b2 - :b1 AS "read few";
+SELECT 4 * (:b1 - :b0) < :b4 - :b3 AS "probed at 0", 4 * (:b6 - :b5) < :b2 - :b1 AS "fetched at 5000";
 DROP FUNCTION vfb_blks();
 
 /*

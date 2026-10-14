@@ -60,7 +60,7 @@
  *
  * NULL rows come last, with NULL distances; before them, in a cosine index,
  * the zero vectors, whose distance is NaN.  A restricted scan (LionOrdered,
- * §44.6) of no more than LIONVEC_EXACT_MAX members computes every member's
+ * §44.6) of no more than pg_lion.vector_exact_rows members computes every member's
  * distance from the heap and returns them in order (lv_exact()); of more,
  * it does all of the above over the members alone.
  *
@@ -1649,7 +1649,7 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 		bool		whole;
 
 		members = lv_members(so, hblocks > 0 ? tuples / hblocks : 0.0, &whole);
-		if (!whole && members <= LIONVEC_EXACT_MAX)
+		if (!whole && members <= lionvec_exact_rows)
 		{
 			lv_exact(scan, so);
 			MemoryContextSwitchTo(old);
