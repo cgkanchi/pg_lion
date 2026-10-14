@@ -5,7 +5,10 @@
 -- sequential scan and sort (the index disabled), and the two answers are
 -- compared: the distances in order, and the rows.  pg_lion.vector_epsilon
 -- is raised for the comparisons, so that no bound failure can make a row
--- come back late (§44.4); the default's own rate is the unit tests'.
+-- come back late (§44.4), and pg_lion.vector_margin, so that every
+-- partition that could hold a nearer row is read; the default epsilon's own
+-- rate is the unit tests', and the default margin's recall is measured at
+-- the end.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
@@ -96,7 +99,8 @@ BEGIN
 				  CASE WHEN used THEN 'index' ELSE 'no index' END,
 				  coalesce(array_length(ad, 1), 0));
 END $$;
--- 3000 rows in ten clusters, five NULL vectors and one of zeros
+-- 3000 rows in ten clusters, five NULL vectors and one of zeros; indexed in
+-- 20 partitions, which a table this small would not be by itself
 CREATE TABLE vt (id int PRIMARY KEY, cat int, v vector(40))
 	WITH (autovacuum_enabled = off);
 INSERT INTO vt
@@ -104,11 +108,12 @@ SELECT i, i % 10, vt_vec(-(i % 10) - 1, 40) + vt_vec(i, 40, 0.3)
   FROM generate_series(1, 3000) i;
 INSERT INTO vt SELECT i, NULL, NULL FROM generate_series(3001, 3005) i;
 INSERT INTO vt VALUES (3006, NULL, array_fill(0, ARRAY[40])::real[]::vector);
-CREATE INDEX vt_l2 ON vt USING lionvec (v);
-CREATE INDEX vt_ip ON vt USING lionvec (v vector_ip_ops);
-CREATE INDEX vt_cos ON vt USING lionvec (v vector_cosine_ops);
+CREATE INDEX vt_l2 ON vt USING lionvec (v) WITH (partitions = 20);
+CREATE INDEX vt_ip ON vt USING lionvec (v vector_ip_ops) WITH (partitions = 20);
+CREATE INDEX vt_cos ON vt USING lionvec (v vector_cosine_ops) WITH (partitions = 20);
 VACUUM (ANALYZE) vt;
 SET pg_lion.vector_epsilon = 6;
+SET pg_lion.vector_margin = 100;
 -- every metric, a query vector in a cluster and between them, any LIMIT
 CREATE TABLE vt_cases AS
 SELECT op, q, k
@@ -220,7 +225,8 @@ SELECT vec_cmp('SELECT id, v <#> vt_vec(12, 40) AS d FROM vt ORDER BY v <#> vt_v
 
 RESET work_mem;
 RESET pg_lion.vector_batch;
--- inserts after the build: a new cluster, far from the mean
+-- inserts after the build: a new cluster, far from the mean, which goes to
+-- the partitions nearest it
 INSERT INTO vt
 SELECT i, 10, vt_vec(-11, 40, 4.0) + vt_vec(i, 40, 0.3)
   FROM generate_series(3007, 3600) i;
@@ -313,7 +319,7 @@ SELECT vec_cmp('SELECT id, v <-> vt_vec(14, 40) AS d FROM vt ORDER BY v <-> vt_v
 (1 row)
 
 DROP INDEX vt_l2;
-CREATE INDEX CONCURRENTLY vt_l2 ON vt USING lionvec (v);
+CREATE INDEX CONCURRENTLY vt_l2 ON vt USING lionvec (v) WITH (partitions = 20);
 SELECT vec_cmp('SELECT id, v <-> vt_vec(15, 40) AS d FROM vt ORDER BY v <-> vt_vec(15, 40) LIMIT 100');
      vec_cmp     
 -----------------
@@ -410,6 +416,80 @@ SELECT vec_cmp('SELECT id, v <-> ''[0.1,0.2,0.3]'' AS d FROM vu ORDER BY v <-> '
  index, 20 rows
 (1 row)
 
+-- more partitions than rows: as many as the rows, one each; and none, of
+-- a table empty at the build, whose rows all go to the chain of rows in no
+-- partition
+DROP INDEX vt2_l2;
+CREATE INDEX vt2_many ON vt2 USING lionvec (v) WITH (partitions = 500);
+INSERT INTO vt2 SELECT * FROM vt WHERE id < 300 OR v IS NULL;
+SELECT vec_cmp('SELECT id, v <-> vt_vec(20, 40) AS d FROM vt2 ORDER BY v <-> vt_vec(20, 40) LIMIT 20');
+    vec_cmp     
+----------------
+ index, 20 rows
+(1 row)
+
+REINDEX INDEX vt2_many;
+SELECT vec_cmp('SELECT id, v <-> vt_vec(20, 40) AS d FROM vt2 ORDER BY v <-> vt_vec(20, 40) LIMIT 20');
+    vec_cmp     
+----------------
+ index, 20 rows
+(1 row)
+
+SELECT vec_cmp('SELECT id, v <-> vt_vec(20, 40) AS d FROM vt2 ORDER BY v <-> vt_vec(20, 40)');
+     vec_cmp     
+-----------------
+ index, 204 rows
+(1 row)
+
+DROP INDEX vt2_many;
+/*
+ * vec_recall() runs q - which returns a column id - through the index and
+ * through a sequential scan and sort, and returns the share of the second's
+ * rows the first has.
+ */
+CREATE FUNCTION vec_recall(q text) RETURNS float8
+LANGUAGE plpgsql AS $$
+DECLARE
+	a int[];
+	b int[];
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_sort', 'off', true);
+	EXECUTE 'SELECT array_agg(id) FROM (' || q || ') s' INTO a;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_sort', 'on', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	EXECUTE 'SELECT array_agg(id) FROM (' || q || ') s' INTO b;
+	PERFORM set_config('enable_indexscan', 'on', true);
+	RETURN (SELECT count(*) FROM unnest(a) x WHERE x = ANY (b))::float8 /
+		greatest(cardinality(b), 1);
+END $$;
+-- the default margin reads the partitions near the query only, and misses
+-- few of its nearest rows; a margin below zero reads fewer, and misses more
+RESET pg_lion.vector_margin;
+SELECT op, avg(vec_recall(format('SELECT id FROM vt ORDER BY v %s %s LIMIT 10',
+								 op, q))) >= 0.9 AS "most of the nearest"
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op),
+	   (SELECT format('(vt_vec(-%s, 40) + vt_vec(%s, 40, 0.3))', s % 10 + 1, s + 9000) AS q
+		  FROM generate_series(1, 20) s) q
+ GROUP BY op ORDER BY op;
+ op  | most of the nearest 
+-----+---------------------
+ <#> | t
+ <-> | t
+ <=> | t
+(3 rows)
+
+SET pg_lion.vector_margin = -10;
+SELECT vec_recall('SELECT id FROM vt ORDER BY v <-> vt_vec(77, 40, 0.5) LIMIT 100') < 1 AS "fewer";
+ fewer 
+-------
+ t
+(1 row)
+
+RESET pg_lion.vector_margin;
 -- what lionvec refuses
 CREATE TABLE vbad (i int, v vector(9000), w vector(3)[]);
 CREATE INDEX ON vbad USING lionvec (i);
@@ -420,10 +500,17 @@ CREATE INDEX ON vbad USING lionvec (w);
 ERROR:  data type vector[] has no default operator class for access method "lionvec"
 CREATE INDEX ON vbad USING lionvec (v, v);
 ERROR:  access method "lionvec" does not support multicolumn indexes
+CREATE INDEX ON vt USING lionvec (v) WITH (partitions = -1);
+ERROR:  value -1 out of bounds for option "partitions"
+CREATE INDEX ON vt USING lionvec (v) WITH (partitions = 1000001);
+ERROR:  value 1000001 out of bounds for option "partitions"
 SET pg_lion.vector_epsilon = 0.5;
 ERROR:  0.5 is outside the valid range for parameter "pg_lion.vector_epsilon" (1 .. 10)
 SET pg_lion.vector_batch = 0;
 ERROR:  0 is outside the valid range for parameter "pg_lion.vector_batch" (1 .. 100000)
+SET pg_lion.vector_margin = 1001;
+ERROR:  1001 is outside the valid range for parameter "pg_lion.vector_margin" (-10 .. 1000)
 DROP TABLE vt, vt2, vt_cases, ve, vu, vbad;
 DROP FUNCTION vec_cmp(text);
+DROP FUNCTION vec_recall(text);
 DROP FUNCTION vt_vec(bigint, int, float8);
