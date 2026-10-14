@@ -22,15 +22,18 @@ CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_
 # share the private header src/lion_funcs.h.
 FUNCS_OBJS = src/lion_funcs.o src/lion_verify.o src/lion_verify_dir.o src/lion_verify_heap.o \
        src/lion_verify_summary.o
+# lionvec, the nearest-neighbour index of pgvector's `vector` (DESIGN.md §44):
+# the AM, its scan, and its arithmetic, which is unit-tested standalone.
+VEC_OBJS = src/lion_vec.o src/lion_vec_scan.o src/lion_vec_math.o
 OBJS = src/lion_container.o src/lion_sparse.o src/lion_positions.o src/lion_wal.o src/lion_waldelta.o $(PAGES_OBJS) src/lion_dir.o src/lion_posting.o src/lion_postree.o src/lion_posbuild.o src/lion_posfilter.o src/lion_bm25.o src/lion_bm25_scan.o src/lion_reader.o \
        src/lion_am.o src/lion_amcost.o src/lion_build.o src/lion_spool.o src/lion_scan.o \
        src/lion_insert.o src/lion_vacuum.o $(FUNCS_OBJS) $(COUNT_OBJS) $(CUSTOMSCAN_OBJS) \
        src/lion_multikey.o src/lion_jsonb.o src/lion_fkjoin.o src/lion_ordered.o src/lion_selfuncs.o \
-       src/lion_costs.o
+       src/lion_costs.o $(VEC_OBJS)
 PGFILEDESC = "pg_lion - roaring bitmap inverted index"
 
-EXTENSION = pg_lion pg_lion_citext
-DATA = pg_lion--0.1.sql pg_lion_citext--0.1.sql
+EXTENSION = pg_lion pg_lion_citext pg_lion_vector
+DATA = pg_lion--0.1.sql pg_lion_citext--0.1.sql pg_lion_vector--0.1.sql
 
 REGRESS = $(patsubst test/sql/%.sql,%,$(sort $(wildcard test/sql/*.sql)))
 REGRESS_OPTS = --inputdir=test --outputdir=test
@@ -52,7 +55,7 @@ ifeq ($(LION_NO_SIMD),1)
 PG_CFLAGS += -DLION_NO_SIMD
 endif
 EXTRA_CLEAN = test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
-              test/unit/waldelta_test test/unit/entry_test \
+              test/unit/waldelta_test test/unit/entry_test test/unit/vec_test \
               test/results test/isolation/results
 
 PG_CONFIG ?= $(if $(wildcard .local/pg/bin/pg_config),.local/pg/bin/pg_config,pg_config)
@@ -67,6 +70,15 @@ INJECTION_POINTS ?= $(if $(wildcard $(shell $(PG_CONFIG) --sharedir)/extension/i
 ifneq ($(INJECTION_POINTS),1)
 ISOLATION := $(filter-out $(INJECTION_SPECS),$(ISOLATION))
 $(info pg_lion: no injection_points module in this installation; skipping isolation specs: $(INJECTION_SPECS))
+endif
+# lionvec's tests (test/sql/vector*.sql) need pgvector installed; where it is
+# missing they are left out, and the run says so; PGVECTOR=1/0 overrides the
+# guess.
+VECTOR_TESTS = $(patsubst test/sql/%.sql,%,$(sort $(wildcard test/sql/vector*.sql)))
+PGVECTOR ?= $(if $(wildcard $(shell $(PG_CONFIG) --sharedir)/extension/vector.control),1,0)
+ifneq ($(PGVECTOR),1)
+REGRESS := $(filter-out $(VECTOR_TESTS),$(REGRESS))
+$(info pg_lion: no pgvector in this installation; skipping tests: $(VECTOR_TESTS))
 endif
 include $(PGXS)
 
@@ -98,7 +110,7 @@ ifeq ($(SANITIZE),1)
 UNIT_CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
 UNIT_LDFLAGS += -fsanitize=address,undefined
 test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
-    test/unit/waldelta_test test/unit/entry_test: .lion-force-unit
+    test/unit/waldelta_test test/unit/entry_test test/unit/vec_test: .lion-force-unit
 .PHONY: .lion-force-unit
 endif
 
@@ -131,15 +143,21 @@ test/unit/waldelta_test: test/unit/waldelta_test.c src/lion_waldelta.c src/lion_
 test/unit/entry_test: test/unit/entry_test.c src/lion_entryfmt.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/entry_test.c $(UNIT_LDFLAGS)
 
+# lionvec's arithmetic (DESIGN.md §44.3 - §44.4): the rotation, the codes, the
+# popcount kernels and how often the estimates' bounds hold.
+test/unit/vec_test: test/unit/vec_test.c src/lion_vec_math.c src/lion_vec_math.h
+	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/vec_test.c src/lion_vec_math.c $(UNIT_LDFLAGS)
+
 .PHONY: unit
 unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
-      test/unit/waldelta_test test/unit/entry_test
+      test/unit/waldelta_test test/unit/entry_test test/unit/vec_test
 	./test/unit/container_test
 	./test/unit/container_test_nosimd
 	./test/unit/sparse_test
 	./test/unit/positions_test
 	./test/unit/waldelta_test
 	./test/unit/entry_test
+	./test/unit/vec_test
 
 # header deps (the PostgreSQL build we compile against was not configured with --enable-depend)
 # (every header lion.h includes, and each of the others' includers; a missing
@@ -157,6 +175,7 @@ src/lion_plan_private.o src/lion_exec_begin.o src/lion_plan_hooks.o \
 $(FUNCS_OBJS): src/lion_funcs.h
 src/lion_build.o src/lion_spool.o: src/lion_spool.h
 src/lion_wal.o src/lion_waldelta.o: src/lion_waldelta.h
+$(VEC_OBJS) src/lion_am.o src/lion_ordered.o: src/lion_vec.h src/lion_vec_math.h
 
 # Crash-recovery and hot-standby tests (test/recovery/README.md).  These need a
 # whole PostgreSQL *installation* to initdb their own private clusters into,

@@ -364,3 +364,51 @@ UPDATE` needs the row's `ctid` and is heap mode too. The cost model chooses betw
 B-tree's own scans and a bitmap scan of the Lion indexes; `pg_lion.enable_ordered_scan` and
 `pg_lion.enable_btree_scan` turn the two forms off, and `enable_indexonlyscan = off` turns the
 index-only mode off.
+
+## Nearest neighbours: lionvec
+
+`CREATE EXTENSION pg_lion_vector` (with pgvector installed) adds `lionvec`, an index that answers
+`ORDER BY embedding <op> $1 LIMIT k` for pgvector's `vector`, with `vector_l2_ops` (`<->`, the
+default), `vector_ip_ops` (`<#>`) or `vector_cosine_ops` (`<=>`), and that a Lion filter restricts
+(DESIGN.md §44):
+
+```sql
+CREATE EXTENSION pg_lion_vector;
+CREATE INDEX items_emb ON items USING lionvec (embedding vector_cosine_ops);
+CREATE INDEX items_cat ON items USING lion (category);
+
+-- the ten nearest: an Index Scan of items_emb with Order By
+SELECT id FROM items ORDER BY embedding <=> $1 LIMIT 10;
+
+-- the ten nearest in category 3: LionOrdered scores only the category's rows
+SELECT id FROM items WHERE category = 3 ORDER BY embedding <=> $1 LIMIT 10;
+```
+
+The second plan reads
+
+```
+ Limit
+   ->  Custom Scan (LionOrdered) on items
+         Ordered By: items_emb
+         Order By: (embedding <=> $1)
+         Lion Cond: (category = 3)
+         Lion Indexes: items_cat
+```
+
+The node builds the Lion set of the `WHERE`, and the vector scan reads the codes of only the
+pages that hold a member and scores only the members, so the `LIMIT` is filled from the matching
+rows whatever their share of the table; `Heap Fetches` in `EXPLAIN ANALYZE` counts the rows the node
+fetched, about `k`. Where nearly every row passes the filter the planner prefers the plain index
+scan with a `Filter`, and for a filter of a few hundred rows a sort of the Lion bitmap scan's rows.
+Between the two it can also choose that sort where the node is faster, because pgvector prices its
+distance functions as nearly free: `SET enable_sort = off` for the query, or a higher `COST` on the
+distance function, steers it back. `pg_lion.enable_ordered_scan = off` takes the node away.
+
+What a scan did is in its `DEBUG1` line (`SET client_min_messages = debug1`): `lionvec scan of
+"items_emb": 1 passes, 412 candidates, 140 refined, 13 fetched, 10 returned, 0 skipped out of
+order, 0 bounds missed` - a pass reads every row's one-bit code, candidates are the rows its bounds
+could not rule out, refined the ones whose 8-bit code was read, fetched the ones whose exact
+distance was computed from the table. A query that wants more rows than `pg_lion.vector_batch`
+makes more passes; a row "skipped out of order" was found after rows farther than it had been
+returned, which costs that row and nothing else. `pg_lion.vector_epsilon` widens or narrows the
+bounds (DESIGN.md §44.8).

@@ -20108,3 +20108,332 @@ pinning the array levels to zero, and leaving out the hashed keys.
   say.
 - **Hashed keys keeping a prefix** (`H` + the first bytes + the hash) would let a prefix find only
   its own hashed keys instead of all of them.
+
+## 44. lionvec: nearest neighbours of pgvector's `vector` (pg_lion_vector; lion_vec.c, lion_vec_scan.c, lion_vec_math.c; 2026-10-14)
+
+The shape is
+
+    SELECT ... FROM t [WHERE <clauses lion indexes answer>] ORDER BY v <-> q LIMIT k
+
+with `<->`, `<#>` or `<=>`, pgvector's L2, negative inner product and cosine distance. pgvector's
+own indexes answer it from a graph (HNSW), whose every hop is a random read and which is fast only
+while the graph - here 3.8 GB for 975,000 1536-dimension rows, as halfvec - is in memory, or from
+k-means lists (IVFFlat), whose recall falls off where a query sits between lists. Under a WHERE both
+filter AFTER the search, so a selective filter leaves a LIMIT short or sends the scan on through
+most of the index. lionvec is a flat index, the shape of lion's own: a compact code of every row,
+read whole, in block order, by every query, and the few rows the code cannot tell apart read in
+full. It needs no graph and no training, holds a 1536-dimension row's first code in 224 bytes (a
+twenty-seventh of the float vector), returns rows in exactly the order of their true distances
+unless a bound of `pg_lion.vector_epsilon` standard deviations fails, and under a WHERE lion
+answers, reads and scores only the rows lion's set holds (§44.6), exactly, at any selectivity.
+
+The codes are RaBitQ's (Gao and Long, SIGMOD 2024): a fixed random rotation makes every
+coordinate of every vector look like an independent Gaussian, so that one bit a dimension - the
+coordinate's sign - estimates an inner product with an error whose distribution is known whatever
+the data, and so a bound on it that holds with a chosen probability. What is lion's here is the
+rest: the bound decides what a scan reads next (§44.4), the further bit-planes and the heap are
+read only for the rows it cannot rule out, and a lion set restricts the whole (§44.6).
+
+### 44.1 Packaging
+
+The access method lives in pg_lion's library, which reads pgvector's on-disk `vector` itself (a
+varlena of an int16 dimension count, two unused bytes and the floats: `LionVecPgVector`) and calls
+pgvector's distance functions only through the operator class, so pg_lion loads, and its tests
+run, without pgvector. A separate extension, `pg_lion_vector` (`requires = 'pg_lion, vector'`),
+creates the AM and three operator classes - `vector_l2_ops` (the default), `vector_ip_ops` and
+`vector_cosine_ops` - each ONE ORDER BY operator, whose strategy number (1, 2, 3) is the index's
+metric; pgvector's objects are named through `@extschema:vector@`. The rest of pg_lion sees four
+functions (lion_vec.h): `lion_vec_index()` and `lion_vec_relation()`, which tell a lionvec index by
+its own routines (`amcostestimate`, `ambeginscan`), not its name, so that an AM of that name another
+handler serves is never taken for one; `lion_vec_restrict()`; and `lion_vec_scan_cost()`. The
+changes to lion's own code are `_PG_init()` calling `lion_vec_init()` (the settings, the 8-bit
+tables, the popcount kernel) and LionOrdered's (§44.6).
+
+A column's dimensions come from its type modifier, or, for `vector` without one, from the first
+vector the build or an insert meets (`lionvec_set_dims()`, under the meta page's lock, so that two
+first inserts agree); a vector of other dimensions is pgvector's own error, `expected 3
+dimensions, not 4`, and a query of other dimensions `different vector dimensions 3 and 2`. At most
+`LIONVEC_MAX_DIM` dimensions, 8128 at 8K pages, as many whole 64-bit words as leave a REFINE item a
+page; pgvector's HNSW and IVFFlat take 2000. Single-column, no INCLUDE, no search operators
+(`amoptionalkey`: a query with no WHERE at all is the point), forward only (`amcanbackward =
+false`: a SCROLL cursor gets a Material node), no bitmap scans, not parallel.
+
+### 44.2 Format (lion_vec.h)
+
+Block 0 is the meta page: magic, format version 1, metric, dims and the padded `dimsp` (a multiple
+of 64), the rotation's seed, the heads and tails of the chains, how many CODE pages the build wrote
+(`nbuilt`), and the build's row count. Every page's special space carries its next block, its type,
+`LIONVEC_PAGE_ID` and, on CODE pages, the least and greatest container key (§2) of the TIDs on it.
+
+- **MEAN**: the indexed rows' mean, rotated, as floats over as many pages as it takes; written by
+  the build and never changed. Absent (`mean_head` invalid) when there were no non-NULL rows.
+- **CODE**: one item a row, 32 bytes of header - TID, flags (`LIONVEC_NULL`, `LIONVEC_ZERO`: a
+  cosine zero vector), `|x|`, `alpha1`, `<x, mean>`, the REFINE item's block and offset, plane 1's
+  popcount - and plane 1, `dimsp / 64` words: 224 bytes at 1536 dimensions, 35 a page. A NULL row
+  or a cosine zero vector is the header alone. The build writes every CODE page last, in one run
+  of blocks in heap order (§44.5), so a pass reads them sequentially and each page covers a narrow
+  range of heap blocks.
+- **DIR**: for each of the `nbuilt` CODE pages the build wrote (blocks `code_head` to `code_head +
+  nbuilt - 1`), the heap block of its first row, as BlockNumbers over as many pages as it takes:
+  2,038 a page, so one page for every 71,000 rows at 1536 dimensions. Every row the build put on
+  page i < nbuilt - 1 lies in the heap blocks [dir[i], dir[i + 1]], and no later row goes there,
+  since inserts append to the last page or after it; so a filtered scan finds the pages that can
+  hold its members by bisection (§44.6). Written after the CODE pages and never changed. The build
+  writes none (`dir_head` invalid, `nbuilt` 0) when its rows did not come in heap order or its CODE
+  pages are not one run of blocks; scans then read every page, as before.
+- **REFINE**: one item a non-NULL row, 16 bytes of header (TID, `alpha8`, `|r|`) and `dimsp` 8-bit
+  codes: 1552 bytes at 1536 dimensions, five a page. Read only for the rows plane 1 cannot rule out.
+
+So an index of n rows of d dimensions is about n (d / 8 + 36) bytes of CODE pages and n (d + 20)
+of REFINE pages - 1.7 GB for the benchmark's 975,000 rows of 1536, of which the 218 MB of CODE pages
+are what a scan reads whole.
+
+### 44.3 Codes (lion_vec_math.c)
+
+- **The rotation**: three rounds, each flipping the signs of a pseudo-random half of the
+  coordinates (`pg_prng` from the meta page's seed: the same on every platform) and applying the
+  normalized Walsh-Hadamard transform; when `dimsp` is not a power of two, two windows of the
+  largest power of two below it, one at each end, overlapping, each after its own signs. Every
+  step is orthogonal, so distances and inner products are unchanged. A vector is padded with zeros
+  to `dimsp`, scaled to unit length first for cosine, and rotated; the rotation's signs and the
+  mean are kept per backend in `rd_amcache` (`lionvec_get_info()`, which hands out a copy, since a
+  relcache invalidation - possible whenever a lock is taken, a TOAST fetch's included - frees it).
+- **Centring**: the stored vector is x = rotated - mean. Any fixed mean is correct (inserts use the
+  build's); a near one makes |x| small and the bounds, which scale with it, tight.
+- **Plane 1**: the sign bits of x, and `alpha1 = <sign(x) / sqrt(dimsp), x / |x|>`, about 0.8.
+- **The 8-bit codes**: `x_i sqrt(dimsp) / |x|`, a standard Gaussian, in uniform steps of 1/32 over
+  [-4, 4), clipped beyond (one coordinate in 16,000); r is the vector of the steps' middles and
+  `alpha8 = <r / |r|, x / |x|>`. Uniform steps beat equal-probability steps by eight times in
+  squared error, those being as wide in the tails as the tails are long.
+- **The query** (`lionvec_query_init()`): rotated and centred as the rows are, giving qc, and for
+  plane 1 quantized to four bits a dimension, uniformly over its own range, held as four bit-planes
+  interleaved with plane 1's words, so that `<sign(x), qc>` is `2 sum_j 2^j popcount(bits & plane_j)`
+  rescaled, less `sum(qc)`. The kernel is chosen once: POPCNT where the CPU has it (x86-64 GCC and
+  clang), the portable one as lion_container.c chooses it otherwise.
+- **The estimate and its error**: `<x, qc>` is estimated as `|x| <c, qc> / (|c| alpha)`, c the
+  code's vector. Its error is the part of x / |x| the code misses, `sqrt(1 - alpha^2)` long and,
+  after the rotation, pointing nowhere in particular, times qc: a Gaussian of standard deviation
+  `|qc| sqrt(1 - alpha^2) / (alpha sqrt(dimsp - 1))`, plus, for plane 1, the query's own rounding,
+  `Delta^2 / 12` a dimension. A bound of epsilon of those either side holds with the Gaussian's
+  probability. The 8-bit codes' deviation is about 1/70 of plane 1's, and their bound is `2 eps`
+  wide (`LIONVEC_EPS8`): still far the tighter, and its failures all but vanish (§44.10).
+- **The key** a scan orders by is the distance up to a constant of the query: `|x|^2 - 2 <x, qc>`
+  for L2, `-<x, mean> - <x, qc>` for inner product and cosine (`lionvec_key_bounds()`); an exact
+  distance d has key `d^2 - |qc|^2` for L2, `d + <mean, q>` for IP and `d + <mean, q> - 1` for cosine
+  (`lionvec_key_exact()`). A bound that overflows to NaN is taken as no bound, (-inf, inf).
+
+### 44.4 The scan (lion_vec_scan.c)
+
+A PASS reads plane 1 of every row and computes each row's key bounds [lo, hi]. It keeps the L
+smallest upper bounds in a max-heap; their largest, tau, is a key at least L rows lie within, so a
+row whose lo exceeds tau cannot be among the next L, and only the rows with `lo <= tau` are kept as
+candidates. The candidates go into a min-heap by lo, beside one entry, REST, at tau, that stands for
+every row the pass left out. The heap is then worked lazily:
+
+- a row known from plane 1 at the top: read its REFINE item and put it back at the lower bound of
+  its 8-bit codes (which replaces plane 1's rather than tightening it: keeping the larger of the
+  two would keep plane 1's failures too);
+- a row known from its codes: fetch it from the heap, compute its distance with the operator's own
+  function on `FormIndexDatum()`'s value (so an expression index computes its expression), and put
+  it back at its exact key;
+- a row known exactly: nothing left in the heap can be nearer; return it, its distance in
+  `xs_orderbyvals` and `xs_recheckorderby = false`;
+- REST: make another pass, for four times as many rows, skipping the rows returned already.
+
+At equal keys the better-known entry comes first (a row known exactly before REST or a bound at its
+key, neither of which can hold a nearer row), then by distance and TID, so ties come out the same
+from run to run. A LIMIT k query thus refines about the rows plane 1 cannot tell from the k-th and
+fetches about k and a few; the first pass gathers `pg_lion.vector_batch` (100) rows' worth.
+
+**Strict order.** When a bound fails, a row turns up after rows farther than it were returned. It
+is skipped (`nskipped` in the DEBUG1 line), so the scan's output is always in order: a failure
+costs recall, never order, and the executor never needs to recheck.
+
+**Memory.** Candidates are capped at `work_mem` (`sizeof(LvItem)` each, never under four batches'
+worth). When a pass reaches the cap it drops the candidates tau has since passed by, and if that is
+not enough, CUTS: the half with the least lower bounds stay, the cut is the least bound of those
+that went, and the rest of the pass keeps only rows below it; REST then stands at the cut. Rows AT
+the cut stay - REST comes out after every row at its key - so a pass over a million equal vectors
+returns `cap / 2` of them rather than none. The next pass's batch is `min(4 L, max(L, cap / 8))`.
+
+**Progress.** A hash keyed by TID keeps what the scan has learnt of each row across passes: its
+codes' bounds once refined, its exact key once fetched, and GONE once returned or found missing.
+A pass starts a row from that, not from plane 1 again. Without it a pass cut short by `work_mem`
+whose kept rows all refined past the cut was made again, the same, for ever - the rows came back
+from plane 1 below the cut, refined past it, and the cut's REST came out first (found by
+vector.sql's `work_mem = 64kB`, `vector_batch = 1` case, 2026-10-14). With it, every pass moves at
+least one row up a level or out, so a scan makes at most three passes a row.
+
+**NULLs and zeros.** NULL rows come last, with NULL distances, in the CODE chain's order; before
+them, in a cosine index, the zero vectors, whose distance is NaN (float8 sorts NaN after every
+number, as the sequential scan's sort does). A NULL query returns every row with a NULL distance; a
+cosine zero query every non-NULL row with NaN, then the NULLs; an index with no vector yet only
+its NULLs. A walk copies a page's TIDs out under the page's lock, so a VACUUM between two calls
+cannot make one come back twice. A scan without an ORDER BY, which the planner never makes (its
+cost is infinite), walks every row.
+
+### 44.5 Concurrency, WAL and VACUUM
+
+- **Insert** (`lionvec_append()`): under the meta page's exclusive lock, which serializes inserts,
+  the REFINE item goes on the REFINE tail and the CODE item on the CODE tail, each extended with a
+  new page when full, all in one generic WAL record (meta, REFINE, CODE, and a new CODE page: four
+  buffers, what a record takes). Scans and VACUUM lock one page at a time and never the meta page
+  with another, so the order meta, REFINE, CODE cannot deadlock against them. A pass follows the
+  chain to its end as it then stands, so it may meet rows inserted since its snapshot; the heap
+  fetch drops them. Every row a scan's snapshot sees had its items appended before that snapshot was
+  taken, so none is missed.
+- **Build**: two heap scans, the first for the mean (its rows normalized for cosine), the second
+  writing REFINE items in place and spooling CODE items to a temporary file, then written as one run
+  of CODE pages and the DIR chain after them; the whole range is WAL-logged at the end
+  (`log_newpage_range()`). Neither scan joins a synchronized scan (`allow_sync = false`), which
+  could start part-way through the heap and hand the rows over out of order; the build checks the
+  order anyway and writes no directory if it was not kept. Not parallel;
+  progress is reported for the second scan. `CREATE INDEX CONCURRENTLY` and `REINDEX` work as for
+  any AM. An unlogged index's init fork is the meta page and one empty CODE page.
+- **VACUUM** (`lionvecbulkdelete()`): walks the CODE chain, removing the dead rows' items
+  (`PageIndexMultiDelete()`), and collects their REFINE locations, in `maintenance_work_mem`, which
+  it then removes a REFINE page at a time in block order, each checked by TID first, with
+  `PageIndexTupleDeleteNoCompact()`: the line pointers stay, so the other rows' CODE items still
+  point right. A crash between the two steps leaves REFINE items nothing points at, which the next
+  VACUUM does not find; they cost space and nothing else. Pages are never recycled.
+- **A scan against VACUUM.** A scan copies what it needs of a CODE item (the REFINE location among
+  it) into its queue and holds no pin. VACUUM may remove the REFINE item before the scan reads it,
+  and an insert may reuse the slot: `lionvec_refine_at()` returns the item only if its TID is the
+  row's, and the scan treats a missing one as a row gone, which it is - VACUUM removes only rows
+  dead to every snapshot. A reused slot with the same TID (the heap reused the TID too) holds a row
+  inserted after the scan's snapshot, which the heap fetch drops. A row the scan returns it has just
+  found visible to its snapshot, so VACUUM cannot have removed it, and the executor's own fetch finds
+  it.
+- **Serializable**: `ampredlocks = false`, so a reader takes a predicate lock on the whole index
+  (`index_beginscan()`), and an insert checks it.
+- **Format checks**: every page's type and id before anything on it is read; every CODE item's
+  length against its flags and `dimsp`; every REFINE item's length; chain cycles
+  (`lionvec_chain_step()`); the meta page's fields. Each is ERRCODE_INDEX_CORRUPTED, never a crash.
+
+### 44.6 Filtered nearest neighbours (LionOrdered, lion_ordered.c)
+
+§30's node walks an ordered index path filtered by lion's TID set. A lionvec index's order by
+distance qualifies as an ordered path when it has one ORDER BY clause, no index clauses, a forward
+direction and is not hypothetical (`lo_knn_path()`), and is paired with each lion access of the
+relation as a B-tree's is. The plan differs from §30's in four places:
+
+- **The set is built at once** (`LO_FLAG_BUILD`), never lazily: the scan needs every member before
+  its first pass. The ORDER BY clause goes in a sixth `custom_exprs` list (`LO_EXPR_ORDERBYS`), and
+  the executor builds its scan key with `ExecIndexBuildScanKeys(isorderby = true)`, its run-time
+  key (a Param query vector, a correlated subquery's) among the node's others, re-evaluated on
+  rescan. EXPLAIN shows it as `Order By`.
+- **The set is handed to the scan** after every `index_rescan()` (`lion_vec_restrict()`: its
+  container keys, ascending, and its containers). The scan turns it into runs of heap blocks (each
+  container's block mask, `lion_container_block_mask()`) and finds the CODE pages of the build's
+  run that can hold one by the DIR chain (§44.2, `lionvec_dir_pages()`: a bisection a run, from
+  where the last ended); a pass reads those, then the run's last page and every page appended
+  after it, skipping any whose key range holds no member. A row on a listed page outside the
+  heap blocks the directory gives it is ERRCODE_INDEX_CORRUPTED: a page the scan skipped might
+  then hold a member too. Every row not a member is skipped before it is estimated; a refine, a
+  fetch and a return happen only for members. Container keys alone were not enough: a key is 64
+  heap blocks, several hundred CODE pages of a dense heap, so a filter of a thousandth of the
+  rows had a member under every key and read every page (§44.9). A degraded set (§30.4, `hash_mem`
+  exceeded) has NULL containers, meaning every TID of that key's blocks; the scan takes them all,
+  and the node rechecks the lion clauses on the heap row, as it does for a B-tree
+  (`Rows Removed by Lion Recheck`).
+- **No fetch-and-sort switch**: the pathkeys are a distance, not columns a sort could take over.
+- **No values from the index**: heap mode always.
+
+The node's early stop - every member met - ends the scan without the pass that would find nothing.
+Since the restricted scan returns members only, a filter of a thousandth of the rows reads plane 1
+of the pages that hold one and computes about k exact distances; a LIMIT is never left short by the
+filter, and the answer is the exact one up to the bounds.
+
+**Cost** (`lo_cost_knn()`): the lion lookups and the set as `lo_cost()` prices them, plus
+`lion_vec_scan_cost()` for the members (§44.7) as start-up; then per member, at worst, a random
+page, an index tuple, a probe and a tuple, its quals and the target. On 20,000 rows of 200
+dimensions the planner chose a sort of the lion bitmap scan's rows for a filter keeping 1% of
+them, the node from 3% to 30%, and the plain lionvec scan with a Filter from 60%, where most rows
+pass and the set costs more than the rows it saves.
+
+### 44.7 Costs (lionveccostestimate())
+
+Start-up is the cost of the first row, which is most of a scan's: the CODE pages read sequentially
+(the index's pages times the CODE items' share of the space, by the recorded dimensions, or 1536
+before any), `0.1 cpu_index_tuple_cost` a row for walking them, `2 cpu_operator_cost` a scored row
+(the popcounts and a square root: `LIONVEC_ROW_OPS`), and a batch's refines and exact distances,
+a random page and an index tuple each. Each further row adds at worst a refine and a fetch. For a
+restricted scan (`lion_vec_scan_cost()`) the pages are the DIR chain and those holding a member, the
+members placed independently, `pages (1 - (1 - frac)^perpage)`; the rows walked are those pages',
+and the scored rows the members. A path with no
+ORDER BY costs infinity. Selectivity 1, correlation 0.
+
+### 44.8 Settings
+
+- `pg_lion.vector_epsilon` (real, 1 to 10, default 3): the bounds' width in standard deviations.
+  Each plane-1 bound fails with the Gaussian's two-sided probability, 0.27% at 3, 0.006% at 4; a
+  failure matters only for a row that belongs in the answer and is found too late, so the rate of
+  queries with a miss is far lower (§44.9). Wider bounds refine and fetch more rows.
+- `pg_lion.vector_batch` (int, 1 to 100000, default 100): rows the first pass gathers candidates
+  for; each further pass gathers four times as many. A query that wants more than the batch makes
+  more passes, each reading every CODE page.
+- `work_mem` bounds a scan's candidates (§44.4).
+
+### 44.9 Measured
+
+MEASURED
+
+### 44.10 Tests
+
+- **test/unit/vec_test.c** (`make unit`, and under ASan and UBSan with `SANITIZE=1`), against the
+  arithmetic alone, with exact-size heap buffers: the 8-bit tables (evenly spaced and symmetric,
+  each code the inverse of its step, extremes, infinities and NaN); the rotation at 64 to 8128
+  dimensions (norms and inner products kept to 1e-5; the same signs from the same seed and others
+  from another; one window and two; a basis vector spread out; rotated coordinates with the
+  variance, kurtosis and tails of a Gaussian); `lionvec_prepare()`
+  (padding, cosine scaling, zero vectors); the encoding (bits, popcount, both alphas, a row at the
+  mean); the query's quantization and planes; both popcount kernels against a reference; the key
+  algebra against true distances; and the bounds' COVERAGE on clustered data at 100, 384 and 1536
+  dimensions for each metric: plane 1 outside 1 sd 30 to 32% of the time (the Gaussian's 31.7%),
+  outside 3 sd 0.16 to 0.29% (0.27%); the codes outside 2 sd about 4% (4.6%) and never outside 6
+  sd, in 24,000 row-query pairs each. A heavy tail would fail it. And `lionvec_dir_pages()`
+  against the definition (page i meets a range when `first[i] <= hi` and `first[i + 1] >= lo`):
+  no pages, one and two, a block repeated over many pages, the largest block numbers, and 20,000
+  random directories with repeats against random ranges, some adjacent, with a canary past `out`.
+- **vector.sql**: every ORDER BY run through the index and through a sequential scan and sort,
+  compared distance by distance and row by row, for each metric, three queries and LIMITs 1 to past
+  the table; no LIMIT, OFFSET, NULL and cosine zero queries and rows; a pass cut by `work_mem` of
+  64kB with a batch of 1 (the livelock of §44.4); inserts of a far cluster, UPDATE, DELETE and
+  VACUUM, a table emptied by DELETE, REINDEX and CREATE INDEX CONCURRENTLY; an expression index and
+  a partial one; a SCROLL cursor fetching backward; an untyped column (dimensions from the first
+  row, pgvector's errors); an unlogged table; and the refusals (another type, too many dimensions,
+  an array, two columns, the settings' ranges).
+- **vector_filter.sql**: LionOrdered over each metric against the ordinary plan, for eight filters
+  (equality, range, AND, OR, `<>`, a correlated column, a boolean, no rows) and four LIMITs; far,
+  zero and NULL queries; a prepared statement's generic plan; a correlated subquery rescanning the
+  node; a degraded set (400,000 rows, `hash_mem` 64kB) and its recheck; the directory (a filter
+  with members in a few heap blocks under every container key walks fewer than a quarter of the
+  index blocks a filter every row passes does, by `pg_stat_get_xact_blocks_fetched()`: 31 against
+  222 when written, where container keys alone read all 222); inserts, deletes and VACUUM under the
+  filter; the node switched off.
+
+### 44.11 Not done
+
+- **Skipping CODE pages without a filter.** Exact pruning of whole pages or clusters by a bound on
+  their distance prunes nothing in high dimensions: on text-embedding-3-large vectors a cluster's
+  radius is about 1, as large as the distances between clusters, so no cluster's bound rules it out.
+  Matryoshka prefixes help only as an approximate key (IVF-style), which would give up the exact
+  order; a `WITH (matryoshka = true)` option for that is left for later.
+- **Parallel scan and build.** A pass is a sequential read a parallel scan would split cleanly.
+- **halfvec, sparsevec, bit.** The codes do not care where the floats came from; each needs an
+  operator class and a reader for its format.
+- **The double heap fetch.** Each returned row is fetched by the scan for its distance and again by
+  the executor; the second is a buffer hit. An index-only distance would need the REFINE item to be
+  exact, which it is not.
+- **REFINE space.** VACUUM leaves REFINE line pointers and frees the space only for the tail page's
+  inserts; a table with much churn grows until REINDEX. A drifting distribution does not make the
+  index wrong - any mean is correct - but loosens the bounds until REINDEX recomputes the mean.
+- **A small `work_mem` with loose bounds** (few dimensions, a large LIMIT) makes many passes, each
+  reading every CODE page; the DEBUG1 line shows them.
+- **The planner underprices a sort by distance.** pgvector's distance functions cost 1 (`procost`),
+  and a 1536-dimension vector is stored out of line, so the planner sees an 18-byte column and a
+  cheap operator: sorting a filter's 97,000 rows by distance looks cheaper than the lionvec scan,
+  and it is chosen at 528 ms over the scan's 132 ms (§44.9). HNSW does not meet this, its cost
+  estimate being tiny. Repricing core's Sort paths whose key is a lionvec distance would be new
+  territory for lion's planner hooks, and is not planned; `enable_sort = off`, or a higher `COST`
+  on pgvector's distance functions, steers the planner to the scan.

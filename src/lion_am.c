@@ -53,6 +53,7 @@
 #include "lion_bm25.h"
 #include "lion_costs.h"
 #include "lion_count.h"
+#include "lion_vec.h"
 
 #if PG_VERSION_NUM >= 180000
 PG_MODULE_MAGIC_EXT(
@@ -449,6 +450,13 @@ _PG_init(void)
 	 * directory has it.
 	 */
 	lion_selfuncs_init();
+
+	/*
+	 * lionvec (DESIGN.md §44): its tables, its popcount kernel, its
+	 * settings and its reloption kind.  The AM itself is created by the
+	 * pg_lion_vector extension, where pgvector is installed.
+	 */
+	lion_vec_init();
 
 	MarkGUCPrefixReserved("pg_lion");
 
