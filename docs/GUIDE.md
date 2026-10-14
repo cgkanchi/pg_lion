@@ -409,7 +409,9 @@ partition it did not read is missed. On 975,000 OpenAI embeddings the defaults r
 true ten nearest, reading 4% of the rows; `SET pg_lion.vector_margin = 2` returns 96% in five
 sixths of the time, and `SET pg_lion.vector_patience = 0`, which reads on to the margin however
 long nothing nearer turns up, 98.4% in 1.8 times the time and a 95th percentile four times as
-long.
+long. The recall a margin gives is the data's: on 115,186 of DBpedia's text-embedding-3-large
+embeddings the same defaults return 84%, and 95% takes `SET pg_lion.vector_margin = 7` (DESIGN.md
+§44.9), so measure it on your own rows against an exact search.
 
 The node builds the Lion set of the `WHERE`, and the vector scan scores only the members in the
 partitions it reads, so the `LIMIT` is filled from the matching rows whatever their share of the

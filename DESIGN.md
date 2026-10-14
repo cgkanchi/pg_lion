@@ -20259,9 +20259,21 @@ holds no member (§44.6).
   generator seeded alike every build, so that the same rows make the same partitions, of as many
   rows as half of `maintenance_work_mem` holds as 8-bit codes (rotated, not centred - the mean is
   not known yet - a percent off the floats, which k-means does not notice), at most 2^20. The
-  number of partitions C is the `partitions` reloption's, or else 1 below 10,000 rows and `2
-  sqrt(n)` above (1,974 for the benchmark's 975,000), at most a sixteenth of the sample, never
-  more than its rows, and 0 for an empty table. Lloyd's k-means then runs over the sample, in the
+  number of partitions C is the `partitions` reloption's, or else 1 below 10,000 rows and `8
+  sqrt(n)` above (`LIONVEC_PARTS_PER_ROOT`: 8,000 for a million rows, 2,715 for DBpedia's
+  115,186), at most a sixteenth of the sample, never more than its rows, and 0 for an empty table.
+  It was `2 sqrt(n)` (1,974 for the benchmark's 975,000) until DBpedia (§44.9): partitions a
+  quarter the size read 1.55 to 1.78 times fewer rows for a recall in the numpy model, and on the
+  index 1.5 times fewer CODE pages for 0.95 of the true ten, which is the direction a billion rows
+  needs (§44.11), though at 115,186 rows no faster. The sixteenth means the default needs a sample
+  of `128 sqrt(n)` rows, 1,540 bytes each at 1536 dimensions, so `maintenance_work_mem` of 2 x 1,540
+  x 128 sqrt(n) bytes: 376 MB for a million rows. The default 64 MB holds 21,788 rows and so caps
+  any table of more than 28,900 such rows at 1,361 partitions (at `2 sqrt(n)`, more than 463,000);
+  1 GB holds 348,617, 44 a partition at a million rows, about the 42 the numpy model trained on
+  with every row; every row of a million takes 2.9 GB. The cap of 2^20 rows (3 GB) leaves k-means
+  fewer than 42 rows a partition above about ten million rows, and the sixteenth then binds at
+  65,536 partitions above 67 million (at `2 sqrt(n)` it bound above a billion), so at a billion
+  rows the default is 65,536 either way. Lloyd's k-means then runs over the sample, in the
   rotated space (which changes no distance), from C distinct sample rows the seed picks, for ten
   iterations or until no row moves; spherical for cosine, whose rows and so centroids are of unit
   length, so that nearest by L2 is nearest by angle too. A row's nearest centroid is found among
@@ -20280,7 +20292,15 @@ holds no member (§44.6).
   product). Both k-means and the assignment cost a plane-1 estimate of every centroid for every
   row, so the build grows as the rows times the partitions, `n^1.5` at the default: 19 minutes for
   the benchmark's 975,000 rows in 1,974 partitions, where format 1 took 98 seconds (§44.9,
-  §44.11).
+  §44.11). DBpedia's 115,186 rows took 159 s in 678 partitions and 347 s in 2,715, about 96 s of
+  it the rest of the build and 0.09 s a partition; at `8 sqrt(n)` the benchmark's 975,000 rows, in
+  7,899, would take about four times its 19 minutes (not measured). Ten iterations are not fewer
+  than four times the partitions want: numpy's spherical k-means over DBpedia's rows moved 0.8% of
+  them in the tenth iteration at 2,715 centroids and 1.9% at 678, and its rows' mean cosine to their
+  centroid was within 0.18% (0.36% at 678) of thirty iterations'. At low dimensions, where plane 1
+  leaves most centroids as candidates (61 of 200 at 64 dimensions), the cost is nearer the rows
+  times the partitions' exact distances: vector_filter.sql's 40,000 rows of 64 dimensions take 42 s
+  in their default 1,600 partitions, 12 s in the 400 of `2 sqrt(n)`.
 
 ### 44.4 The scan (lion_vec_scan.c)
 
@@ -20517,7 +20537,10 @@ default margin and patience, where scans probed 3.9% of the 1,974 partitions unf
 8.9%, 12% and 18% through LionOrdered under filters of 10%, 3%, 1% and 0.3% (the fit gives 3.6%,
 6.8%, 9.3%, 12.5% and 17%). With `pg_lion.vector_patience = 0` it is `LIONVEC_PROBE_SHARE` (0.92)
 `C^(-1/3)` and `s^(-LIONVEC_PROBE_SEL)` (0.2), the benchmark's at a margin of 2 before the pause,
-when a filter narrowed the margin (§44.6); the same margin unnarrowed probes more.
+when a filter narrowed the margin (§44.6); the same margin unnarrowed probes more. On DBpedia's
+text-embedding-3-large rows (§44.9) the share fell from 678 to 2,715 partitions as `C^(-1/3)` says,
+within 25% of the model's level under filters and at under half of it unfiltered, where a margin of
+3 stops early on that data; the constants were left as they are.
 
 Each further row adds a refine and a fetch at worst and a share of the start-up over
 `pg_lion.vector_batch`: the farther rows lie past more partitions, and the planner prices a LIMIT
@@ -20553,7 +20576,11 @@ no ORDER BY costs infinity. Selectivity 1, correlation 0.
   benchmark's tail ended: at a margin of 3, 30 and 40 gave the same recall (0.979), 40 a 95th
   percentile a third longer.
 - `partitions` (reloption, 0 to 1,000,000, default 0): the partitions the build makes; 0 chooses
-  by the rows' count (§44.3). Read by the build alone, so a change takes a REINDEX.
+  by the rows' count, `8 sqrt(n)` above 10,000 rows as `maintenance_work_mem`'s sample allows
+  (§44.3; `2 sqrt(n)` until DBpedia, §44.9). Read by the build alone, so a change takes a REINDEX.
+  `pg_lion.vector_patience` counts partitions' worth of rows, so finer partitions pause after fewer
+  rows: on DBpedia a patience of 30 in 2,715 partitions held the unfiltered recall to 0.966 at any
+  margin, where 120, the rows of 30 in 678 partitions, reached 0.993.
 - `pg_lion.vector_epsilon` (real, 1 to 10, default 4): the bounds' width in standard deviations.
   Each plane-1 bound fails with the Gaussian's two-sided probability, 0.27% at 3, 0.006% at 4; a
   failure matters only for a row that belongs in the answer and is found too late, so the rate of
@@ -20742,6 +20769,46 @@ partitions, P = 20 read 18,142 (48,213) against 23,240 (68,741). Between those t
 read for 0.98 grew as n^0.32 with P = 20 and n^0.64 without - two sizes, so a direction only, but
 the one that matters at a billion rows (§44.11).
 
+**DBpedia.** The method again on a public set of another model's embeddings
+(`bench/vector/knn_dbpedia.py`, `bench/results/2026-10-14-lionvec-dbpedia/`): shards 0-2 of
+Qdrant's `dbpedia-entities-openai3-text-embedding-3-large-1536-1M`, 115,386 text-embedding-3-large
+rows of 1536 dimensions, 200 of them held out as queries (the numpy model's `default_rng(0)`), the
+true ten by cosine among the other 115,186, filters keeping 11,377, 3,472 and 1,204 rows (10%, 3%,
+1%). PostgreSQL 16, pgvector 0.8.7, 4 vCPUs, every relation in 2 GB of shared buffers,
+`maintenance_work_mem` 1 GB (the sample is every row); the server's median over 200 warm queries.
+lionvec is 210 MB in 678 partitions (`2 sqrt(n)`) and 221 MB in 2,715 (`8 sqrt(n)`), built in 159 s
+and 347 s; HNSW 450 MB, 187 s.
+
+The margin does not carry over. At the defaults lionvec returned 0.843 of the true ten unfiltered,
+in 1.1 ms, probing 15 of 678 partitions (88 CODE pages), where ada-002's got 0.979; 0.95 took a
+margin of about 7 (2.4 ms) and 0.98 one of 11 (3.2 ms). HNSW took 1.9 ms for 0.951 at
+`ef_search` 40 and 4.1 ms for 0.979 at 100. The margin a recall needs, in the rows' spread about
+their centroids, is the embeddings' own.
+
+In 2,715 partitions, at the same margin and patience, a scan probed 2.5 times the partitions and
+read three quarters of the CODE pages (37 and 68 at a margin of 3) for 0.835, in 1.4 ms. Along the
+margins, 0.95 took 234 CODE pages against 358 in 678 partitions - 1.5 times fewer, and about 5,700
+rows scored against 11,000, 1.9 times fewer (the numpy model's 1.78) - but 2.9 ms against 2.4:
+each query ranks four times the centroids, and a partition of 42 rows spans two 35-row pages, so
+a probe reads 1.75 pages for 1.2 pages of rows. At a patience of 30 the finer partitions never
+reached 0.98 (0.966 at margins 12 and 16), as the patience counts partitions' worth of rows, now a
+quarter as many; at 120, the rows of 30 in 678 partitions, they did, in 566 pages against 578 and
+4.5 ms against 3.2. At this size the finer partitions buy pages and rows, not time; the default
+changed for the rows a scan reads at a billion (§44.11), where the centroids need an index of their
+own anyway. Under 10% the planner took the plain scan with a `Filter` at both sizes (0.879 and
+0.872 at a margin of 3, 5 to 8 ms); under 3% LionOrdered in 678 partitions (0.917, 5.0 ms) but a
+sort of the lion bitmap scan's 3,472 rows in 2,715 (exact, 20 ms, where LionOrdered took 5.8 ms for
+0.908), its estimate 2,034 against LionOrdered's 2,213, which charges a random page for each
+partition probed, a number that grows as C^(2/3); under 1% a sort of the 1,204 rows (5.3 ms) and
+LionOrdered's exact path (5.6 ms) alike. HNSW's iterative scan took 10.7 ms at 3% (0.953) and 26.7
+ms at 1% (0.959); the planner sorted for it there too.
+
+The share probed at a margin of 3, in 678 and 2,715 partitions: 2.2% and 1.4% unfiltered (§44.7's
+`0.46 C^(-1/3)`: 5.2% and 3.3%), 8.1% and 4.8% through the plain scan at 10% (9.7% and 6.1%), 14.9%
+and 10.3% through LionOrdered at 3% (13.5% and 8.5%). Between the sizes it fell by 1.4 to 1.7
+times, the model's `C^(1/3)` 1.59; unfiltered it is under half the model's level because a margin of
+3 stops this data's scans early, at 0.84 recall. So the constants stay.
+
 ### 44.10 Tests
 
 - **test/unit/vec_test.c** (`make unit`, and under ASan and UBSan with `SANITIZE=1`), against the
@@ -20797,18 +20864,21 @@ the one that matters at a billion rows (§44.11).
 
 - **A billion rows.** Partitions are what make one possible, but three things stand in the way.
   The build's k-means and assignment, and a scan's ranking, cost a plane-1 estimate of every
-  centroid for every row or query: O(n C) and O(C). The default `2 sqrt(n)` keeps the partitions
-  few but lets the rows read grow almost as the rows (§44.9's growth: n^0.91), so a large table
-  wants partitions of a fixed few hundred rows - two million of them for a billion rows, which
-  makes the O(C) steps the whole cost, 2 x 10^15 estimates to build and a 500 MB PART chain a
-  query, unless an index over the centroids (centroids of centroids, or a small graph) ranks them
-  by reading a few thousand. And even then, by the margin alone, the rows read grew as n^0.53 to
-  n^0.61 at a fixed partition size: one to four million rows a query at a billion, 230 MB to 1 GB
-  of CODE pages. With the pause (§44.4) they grew as n^0.32 between the model's two largest sizes,
-  which taken that far is about 260,000 rows, 60 MB of CODE pages, a parallel scan's tens of
-  milliseconds from memory (arithmetic on two sizes, not measured). Spilling rows to a second
-  partition (below) is the other lever on the rows read, and the index over the centroids is
-  still to be built.
+  centroid for every row or query: O(n C) and O(C). The old default, `2 sqrt(n)`, kept the
+  partitions few but let the rows read grow almost as the rows (§44.9's growth: n^0.91). `8
+  sqrt(n)` (§44.3) is four times finer, 125 rows a partition at a million rows, but still grows
+  as the root: 4,000 rows a partition at a billion, and there the sample's cap of 2^20 rows, at
+  16 a partition, holds the default to 65,536 partitions (15,000 rows each) either way, until the
+  cap is raised. A large table wants partitions of a fixed few hundred rows - two million of them
+  for a billion rows, which makes the O(C) steps the whole cost, 2 x 10^15 estimates to build and
+  a 500 MB PART chain a query, unless an index over the centroids (centroids of centroids, or a
+  small graph) ranks them by reading a few thousand. And even then, by the margin alone, the rows
+  read grew as n^0.53 to n^0.61 at a fixed partition size: one to four million rows a query at a
+  billion, 230 MB to 1 GB of CODE pages. With the pause (§44.4) they grew as n^0.32 between the
+  model's two largest sizes, which taken that far is about 260,000 rows, 60 MB of CODE pages, a
+  parallel scan's tens of milliseconds from memory (arithmetic on two sizes, not measured).
+  Spilling rows to a second partition (below) is the other lever on the rows read, and the index
+  over the centroids is still to be built.
 - **Spilling rows to a second partition** (SOAR, Sun and others, NeurIPS 2023): in the simulation
   it saved about a fifth of the rows probed for the same recall, for twice the CODE pages and an
   insert into two chains. Left for when the rest is measured at scale.

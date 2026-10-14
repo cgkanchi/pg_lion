@@ -263,11 +263,15 @@ a cosine index zero vectors just before them, with NaN, as a sort puts them.
     CREATE INDEX ON items USING lionvec (embedding vector_cosine_ops) WITH (partitions = 4000);
 
 `partitions` (0 to 1,000,000) sets how many partitions the build makes; 0, the default, makes one
-for a table of fewer than 10,000 rows and twice the square root of the rows' count for a larger
-(2,000 for a million rows). More partitions make a scan score fewer rows and rank more
-centroids. The build runs k-means over a sample of as many rows as half of `maintenance_work_mem`
-holds (1.5 KB a 1536-dimension row, at most about a million rows), so a larger setting makes
-better partitions and a slower build; the setting takes effect at the next `REINDEX`.
+for a table of fewer than 10,000 rows and eight times the square root of the rows' count for a
+larger (8,000 for a million rows), but never more than a sixteenth of the rows the build samples.
+The build runs k-means over a sample of as many rows as half of `maintenance_work_mem` holds (1.5
+KB a 1536-dimension row, at most about a million rows): the default 64 MB holds about 21,800 rows
+of 1536 dimensions, so at most 1,361 partitions; a million rows need 376 MB for their 8,000, and 1
+GB gives k-means 44 rows a partition. More partitions make a scan score fewer rows and rank more
+centroids, make the build slower (it grows with the rows times the partitions), and make a scan
+pause after fewer rows, as `pg_lion.vector_patience` counts partitions' worth; the setting takes
+effect at the next `REINDEX`.
 
 With a `WHERE` that lion indexes answer, `LionOrdered` builds lion's set of the matching rows and
 the scan reads and scores only those (`Custom Scan (LionOrdered)` with `Order By:` in `EXPLAIN`),
@@ -540,7 +544,10 @@ takes a partition's rows to come, in standard deviations of the rows about their
 one dimension (DESIGN.md §44.4). A scan reads partitions until the next one's centroid, less this,
 lies farther than the rows it has: larger reads more partitions and misses fewer of the nearest
 rows, smaller the reverse (on 975,000 OpenAI embeddings, 2, 3 and 4 returned 96%, 98% and 98.3% of
-the true ten nearest in 6.6, 7.9 and 9.1 ms). A filter through lion uses the same margin.
+the true ten nearest in 6.6, 7.9 and 9.1 ms). The recall a margin gives depends on the embeddings:
+on 115,186 of DBpedia's text-embedding-3-large ones, 3 returned 84% and 95% took about 7, 98%
+about 11 (DESIGN.md §44.9), so measure it on your own data. A filter through lion uses the same
+margin.
 
 `pg_lion.vector_patience` (30, 0 to 1,000,000): how many partitions' worth of rows (of matching
 rows, under a lion filter) a `lionvec` scan scores without finding one nearer than the
@@ -623,7 +630,8 @@ a chain's last page, so a table with heavy churn grows its index until `REINDEX`
 recomputes the partitions and the mean the codes are centred on (rows that have drifted from them
 make scans read more or miss more, never answer out of order). Building a large index runs k-means
 over every sampled row and every partition, and then compares every row with every partition's
-centroid, so it takes minutes for a million rows and grows with the rows times the partitions.
+centroid, so it grows with the rows times the partitions: 19 minutes for a million rows in 2,000
+partitions, and about four times that in the default 8,000.
 Each returned row is fetched from the heap twice, once for its distance and once by the executor.
 A small `work_mem` with a large `LIMIT` makes a scan read its partitions several times (`SET
 client_min_messages = debug1` shows the passes).

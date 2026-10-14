@@ -141,7 +141,7 @@ OpenAI ada-002 embeddings of DBpedia entities (1536 dimensions; Qdrant's
 `dbpedia-openai-1M-1536-angular` set and the first 100 of its test queries), optionally under
 `WHERE u < s`, a uniform random column with a lion index that keeps a share `s` of the rows
 ([script](../bench/vector/knn.py), [results](../bench/results/2026-10-14-lionvec-partitions/)).
-lionvec in its default 1,974 partitions, against pgvector 0.8.6's HNSW on
+lionvec in 1,974 partitions (`2 sqrt(n)`, its default then; now `8 sqrt(n)`), against pgvector 0.8.6's HNSW on
 `embedding::halfvec(1536)` (m 16, ef_construction 64). PostgreSQL 16, 4 vCPUs, 16 GB RAM,
 `shared_buffers` 5 GB, and pgvector's `vector` distance functions at `COST 100`, as lionvec's setup
 asks. Recall is the share of the true ten returned, against an exact numpy search. Both indexes
