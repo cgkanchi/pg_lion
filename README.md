@@ -209,14 +209,17 @@ SELECT id FROM items WHERE category = 3 ORDER BY embedding <=> $1 LIMIT 10;
 `lionvec` keeps one bit per dimension of every row, rotated so that the error of a distance worked
 out from those bits is known, plus an 8-bit code read only when the bits can't decide. A query
 reads the bits of every row in one sequential pass (218 MB for 975,000 1536-dimension OpenAI
-embeddings, against several GB for an HNSW graph that must stay in memory), refines the few rows
-that might make the cut, and computes the last few distances exactly from the table. Rows come
-back in true distance order; a row is missed only when an error bound fails, which
+embeddings, where pgvector's HNSW graph of the same rows is 3.8 GB), refines the few rows that
+might make the cut, and computes the last few distances exactly from the table. Rows come back in
+true distance order; a row is missed only when an error bound fails, which
 `pg_lion.vector_epsilon` makes rare. Under a `WHERE` that lion indexes answer, the scan reads only
-the pages that hold matching rows and scores only those rows, so a filter of 0.1% of the table still returns its exact ten
-nearest, where a graph index's post-filtered scan returns fewer or wrong ones. `vector_l2_ops`
-(`<->`, the default), `vector_ip_ops` (`<#>`) and `vector_cosine_ops` (`<=>`) are supported, up to
-8128 dimensions.
+the pages that hold matching rows and scores only those rows, so a filter of any selectivity gets
+its ten nearest: on those 975,000 embeddings, 31 ms at 1% of the rows (82 ms when the planner sorts
+instead, see Limitations) and 5.5 ms at 0.1%, where HNSW returns fewer than one row at 1%, or 95%
+of the right ones in 47 ms with iterative scans. Without
+a filter HNSW is much faster (4 ms against 96, at 90% recall). `vector_l2_ops` (`<->`, the
+default), `vector_ip_ops` (`<#>`) and `vector_cosine_ops` (`<=>`) are supported, up to 8128
+dimensions. See [BENCHMARKS.md](docs/BENCHMARKS.md#nearest-neighbours-lionvec-against-hnsw).
 
 ## Supported types
 
