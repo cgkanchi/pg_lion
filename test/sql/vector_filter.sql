@@ -327,10 +327,12 @@ SELECT op, avg(vf_recall(format('SELECT id FROM vf WHERE cat <> 5 AND v IS NOT N
  GROUP BY op ORDER BY op;
 
 -- a restricted scan that pauses at once, every partition within its margin
--- and its patience one partition's members: it still fills its LIMIT, in
--- order, from the members it holds and then the partitions after the pause
+-- and its patience one partition's members (a unit is the members of one
+-- of 2 sqrt(9000) partitions, so four of them in 50): it still fills its
+-- LIMIT, in order, from the members it holds and then the partitions after
+-- the pause
 SET pg_lion.vector_margin = 100;
-SET pg_lion.vector_patience = 1;
+SET pg_lion.vector_patience = 4;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;

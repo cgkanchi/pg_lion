@@ -20412,7 +20412,7 @@ rows a query (95th percentile 75,000), where the margin alone needed 57,000 (227
 
 How a pause ends was found by its failures. Ended when the row queue was empty, it returned every
 row the probes had kept below tau, and tau, the L-th least UPPER bound, lies past many more than L
-rows: a restricted scan pausing at once (vector_filter.sql's, a patience of 1) returned 1,255 rows
+rows: a restricted scan pausing at once (vector_filter.sql's, a patience of one partition's members) returned 1,255 rows
 of a LIMIT 2000 over 9,000 members, the other 7,745 skipped as out of order. Ended only once the
 next row lay past tau, it filled the LIMIT but still returned rows far past the L nearest, and a
 LIMIT 1000 on the benchmark got 0.955 of its true rows; ended after L rows too, 0.983, against
