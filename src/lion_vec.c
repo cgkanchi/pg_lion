@@ -2310,6 +2310,13 @@ lionvecbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
+	/*
+	 * Lazy VACUUM hands every pass the same stats when its dead TIDs fill
+	 * memory more than once; this pass counts the rows left afresh, as
+	 * btvacuumscan() does, or reltuples would sum every pass's count
+	 */
+	stats->num_index_tuples = 0;
+
 	lionvec_read_meta(index, &meta);
 	heads = lionvec_chain_heads(index, &meta, &nheads);
 
