@@ -396,15 +396,16 @@ lionvec_info_size(int dimsp)
 static void
 lionvec_info_fix(LionVecInfo *info, bool hasmean)
 {
-	float	   *tail = (float *) ((char *) info + MAXALIGN(sizeof(LionVecInfo)));
+	char	   *tail = (char *) info + MAXALIGN(sizeof(LionVecInfo));
 
 	info->rot.signs = NULL;
 	info->mean = NULL;
 	if (info->dims > 0)
 	{
-		info->rot.signs = tail;
+		info->rot.signs = (float *) tail;
 		if (hasmean)
-			info->mean = tail + lionvec_rotation_nsigns(info->dimsp);
+			info->mean = (float *) (tail + sizeof(float) *
+									lionvec_rotation_nsigns(info->dimsp));
 	}
 }
 
