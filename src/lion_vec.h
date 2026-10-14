@@ -225,12 +225,9 @@ lionvec_chain_step(Relation index, uint64 *visited, BlockNumber *nblocks)
 
 /*
  * Settings.  The margin is in standard deviations of the rows about their
- * centroids (LionVecMetaData's scale); a restriction narrows it by
- * LIONVEC_MARGIN_NARROW for each tenfold it thins the rows by
- * (lion_vec_scan.c, lv_margin()).
+ * centroids (LionVecMetaData's scale; lion_vec_scan.c, lv_margin()).
  */
 #define LIONVEC_MARGIN_DEFAULT	3.0
-#define LIONVEC_MARGIN_NARROW	1.8
 #define LIONVEC_MAX_PARTS		1000000
 
 /*
