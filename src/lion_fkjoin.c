@@ -95,6 +95,36 @@ lion_fkjoin_strip(Node *node)
 }
 
 /*
+ * Is `sjinfo` the anti join core makes of a NOT EXISTS (or of a NOT IN it
+ * proves the same), rather than the one it makes of `LEFT JOIN ... WHERE f.fk
+ * IS NULL`?
+ *
+ * The second always has a relid of its own (ojrelid): the LEFT JOIN's range
+ * table entry, which the parser made of the FROM clause.  The first had none
+ * until PostgreSQL commit 0d6103e ("Give antijoins made from sublinks a
+ * relid", in 19 and back-patched to the minor releases of 16, 17 and 18): it
+ * now gets a join entry of its own too, made by the planner and so not
+ * inFromCl, so that a PlaceHolderVar's qual cannot be pushed into its inner
+ * side.  Nothing above the join can name that entry or a column of the inner
+ * side either way, so the two spellings of a NOT EXISTS are the same join to
+ * the node, on every release before and after the change.
+ */
+static bool
+lion_fkjoin_sublink_anti(PlannerInfo *root, SpecialJoinInfo *sjinfo)
+{
+	RangeTblEntry *rte;
+
+	if (sjinfo->jointype != JOIN_ANTI)
+		return false;
+	if (sjinfo->ojrelid == 0)
+		return true;
+	if (sjinfo->ojrelid >= (Index) root->simple_rel_array_size)
+		return false;
+	rte = root->simple_rte_array[sjinfo->ojrelid];
+	return rte != NULL && rte->rtekind == RTE_JOIN && !rte->inFromCl;
+}
+
+/*
  * Is one side of the join a table this node can take apart?  A plain table or
  * a materialized view, or - for the fact side only (lion_fkjoin_is_parent()) -
  * a partitioned table, whose live leaf partitions the node counts one by one
@@ -487,6 +517,20 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 	dimrels = bms_del_member(bms_copy(joinrel->relids), factrelid);
 	if (leftoj != 0)
 		dimrels = bms_del_member(dimrels, leftoj);
+
+	/*
+	 * The relid of the NOT EXISTS whose inner side is the fact is the join's
+	 * of the fact and the dimension, not the dimension's.  A NOT EXISTS
+	 * inside the dimension keeps its own: the dimension's join rel has it.
+	 */
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+
+		if (sjinfo->ojrelid != 0 &&
+			bms_equal(sjinfo->syn_righthand, fact->relids))
+			dimrels = bms_del_member(dimrels, sjinfo->ojrelid);
+	}
 	dimrels = bms_del_members(dimrels, folded);
 	if (bms_is_empty(dimrels))
 		return false;
@@ -545,7 +589,9 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 	}
 
 	/* ---- the dimension's own table: the one no semi or anti join hides ---- */
-	if (!bms_get_singleton_member(bms_difference(dimrels, hidden), &dimrelid))
+	if (!bms_get_singleton_member(bms_difference(bms_difference(dimrels, hidden),
+												 root->outer_join_rels),
+								  &dimrelid))
 		return false;
 	dim = root->simple_rel_array[dimrelid];
 	if (!lion_fkjoin_rel_ok(root, dim) || lion_fkjoin_is_parent(root, dim))
@@ -772,6 +818,7 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 	int			n = 0;
 	int			i;
 	Index		leftoj = 0;		/* a LEFT JOIN's own relid, or 0 */
+	Relids		tables;			/* joinrel's relids less outer joins' */
 	ListCell   *lc;
 
 	*out = NULL;
@@ -818,8 +865,9 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 	 *
 	 * So semi and anti joins, within the join, or that one LEFT JOIN: an
 	 * anti join made from
-	 * `LEFT JOIN ... WHERE f.fk IS NULL` has a range table entry of its own
-	 * (ojrelid), which the NOT EXISTS form does not, and is left alone.
+	 * `LEFT JOIN ... WHERE f.fk IS NULL` is left alone; the NOT EXISTS one
+	 * is told apart from it by lion_fkjoin_sublink_anti(), and its relid, if
+	 * the release gives it one, is no table of the join.
 	 */
 	foreach(lc, root->join_info_list)
 	{
@@ -843,7 +891,7 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 		}
 		if (sjinfo->jointype != JOIN_SEMI && sjinfo->jointype != JOIN_ANTI)
 			return 0;
-		if (sjinfo->ojrelid != 0)
+		if (sjinfo->ojrelid != 0 && !lion_fkjoin_sublink_anti(root, sjinfo))
 			return 0;
 		if (!bms_is_subset(sjinfo->syn_lefthand, joinrel->relids) ||
 			!bms_is_subset(sjinfo->syn_righthand, joinrel->relids) ||
@@ -851,11 +899,17 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 			return 0;
 	}
 
-	/* ---- every table of the join one the node may take apart ---- */
+	/*
+	 * ---- every table of the join one the node may take apart ----
+	 *
+	 * The tables, that is: an outer join's relid among the join rel's - the
+	 * LEFT JOIN's, or a NOT EXISTS's (lion_fkjoin_sublink_anti()) - is none.
+	 */
+	tables = bms_difference(joinrel->relids, root->outer_join_rels);
 	i = -1;
-	while ((i = bms_next_member(joinrel->relids, i)) >= 0)
+	while ((i = bms_next_member(tables, i)) >= 0)
 	{
-		if (i != (int) leftoj && !lion_fkjoin_member_ok(root, i))
+		if (!lion_fkjoin_member_ok(root, i))
 			return 0;
 	}
 
@@ -881,19 +935,17 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 								bms_num_members(joinrel->relids) *
 								bms_num_members(joinrel->relids));
 	i = -1;
-	while ((i = bms_next_member(joinrel->relids, i)) >= 0)
+	while ((i = bms_next_member(tables, i)) >= 0)
 	{
 		RelOptInfo *fact = root->simple_rel_array[i];
 		Relids		folded = NULL;
 		List	   *filters = NIL;
 		int			j;
 
-		if (i == (int) leftoj)
-			continue;
 		if (leftoj == 0 && lion_fkjoin_rel_ok(root, fact))
 		{
 			j = -1;
-			while ((j = bms_next_member(joinrel->relids, j)) >= 0)
+			while ((j = bms_next_member(tables, j)) >= 0)
 			{
 				LionFkFilter filt;
 
@@ -906,8 +958,7 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 			}
 		}
 
-		if (!bms_is_subset(joinrel->relids,
-						   bms_add_member(bms_copy(folded), i)))
+		if (!bms_is_subset(tables, bms_add_member(bms_copy(folded), i)))
 		{
 			/* a dimension besides them */
 			if (lion_fkjoin_try_fact(root, joinrel, i, leftoj, folded,
@@ -958,10 +1009,10 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
  *
  * What the special join and the join rel must be:
  *
- *	- the special join is this call's own (extra->sjinfo), a semi or anti join
- *	  with no range table entry of its own: an anti join made from `LEFT JOIN
- *	  ... WHERE f.fk IS NULL` has one (ojrelid), and is left alone as the
- *	  upper node leaves it;
+ *	- the special join is this call's own (extra->sjinfo), a semi join or the
+ *	  anti join of a NOT EXISTS (lion_fkjoin_sublink_anti()): an anti join
+ *	  made from `LEFT JOIN ... WHERE f.fk IS NULL` is left alone as the upper
+ *	  node leaves it;
  *	- its minimal and syntactic inner sides are the fact alone, and innerrel is
  *	  the fact: a plain or partitioned table the node may count
  *	  (lion_fkjoin_rel_ok()), with no LATERAL reference and no TABLESAMPLE;
@@ -995,7 +1046,9 @@ lion_fkjoin_recognize_join(PlannerInfo *root, RelOptInfo *joinrel,
 
 	if (jointype != JOIN_SEMI && jointype != JOIN_ANTI)
 		return false;
-	if (sjinfo == NULL || sjinfo->jointype != jointype || sjinfo->ojrelid != 0)
+	if (sjinfo == NULL || sjinfo->jointype != jointype)
+		return false;
+	if (sjinfo->ojrelid != 0 && !lion_fkjoin_sublink_anti(root, sjinfo))
 		return false;
 	if (joinrel->reloptkind != RELOPT_JOINREL || IS_DUMMY_REL(joinrel) ||
 		IS_DUMMY_REL(outerrel))
