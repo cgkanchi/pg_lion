@@ -412,7 +412,8 @@ RESET plan_cache_mode;
 -- an unrestricted scan does.
 CREATE TABLE vfb (id int, s int, v vector(64)) WITH (autovacuum_enabled = off);
 INSERT INTO vfb SELECT i, i % 2000, vf_vec(i, 64) FROM generate_series(1, 40000) i;
-CREATE INDEX vfb_l2 ON vfb USING lionvec (v);
+-- pins the old default's count, 2 sqrt(n) = 400, for test time (1,600: 42 s)
+CREATE INDEX vfb_l2 ON vfb USING lionvec (v) WITH (partitions = 400);
 CREATE INDEX vfb_s ON vfb USING lion (s);
 VACUUM (FREEZE, ANALYZE) vfb;
 SELECT vf_ord('SELECT id, v <-> vf_vec(7, 64) AS d FROM vfb WHERE s < 10
