@@ -250,13 +250,15 @@ lionvec_chain_step(Relation index, uint64 *visited, BlockNumber *nblocks)
 
 /*
  * A scan restricted to this many members or fewer computes every member's
- * distance from the heap rather than probe partitions (DESIGN.md §44.6).
+ * distance from the heap rather than probe partitions (DESIGN.md §44.6):
+ * pg_lion.vector_exact_rows's default.
  */
-#define LIONVEC_EXACT_MAX		2000
+#define LIONVEC_EXACT_DEFAULT	2000
 extern double lionvec_epsilon;
 extern int	lionvec_batch;
 extern double lionvec_margin;
 extern int	lionvec_patience;
+extern int	lionvec_exact_rows;
 
 /* lion_vec.c */
 extern void lion_vec_init(void);

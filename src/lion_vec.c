@@ -77,6 +77,7 @@ double		lionvec_epsilon = 4.0;
 int			lionvec_batch = 100;
 double		lionvec_margin = LIONVEC_MARGIN_DEFAULT;
 int			lionvec_patience = LIONVEC_PATIENCE_DEFAULT;
+int			lionvec_exact_rows = LIONVEC_EXACT_DEFAULT;
 
 static relopt_kind lionvec_relopt_kind;
 
@@ -173,6 +174,19 @@ lion_vec_init(void)
 							"0 never stops.",
 							&lionvec_patience,
 							LIONVEC_PATIENCE_DEFAULT, 0, 1000000,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+	DefineCustomIntVariable("pg_lion.vector_exact_rows",
+							"How many rows a lion filter may admit for a lionvec scan under it to "
+							"compute every one's distance exactly instead of probing partitions.",
+							"A scan restricted to this many rows or fewer reads each one's vector "
+							"from the table and returns the exact order, reading no code page; "
+							"restricted to more, it probes the partitions nearest the query as an "
+							"unfiltered scan does.  Larger makes more filters exact, at a table read "
+							"a row; 0 never does.",
+							&lionvec_exact_rows,
+							LIONVEC_EXACT_DEFAULT, 0, 100000000,
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
@@ -2453,8 +2467,8 @@ lionvec_code_pages(Oid indexoid, double pages, double *perpage,
 
 /*
  * The cost of a scan's first row, which is most of its cost.  Restricted to
- * few enough members, the members' distances from the heap, every one
- * (§44.6).  Otherwise every centroid's estimate, then the partitions a
+ * pg_lion.vector_exact_rows members or fewer, the members' distances from
+ * the heap, every one (§44.6).  Otherwise every centroid's estimate, then the partitions a
  * scan probes, a random read each and their CODE pages in order, plane 1 of
  * their members, and a batch's refines and exact distances, each a page
  * read and a heap fetch.  `members` is how many rows a restriction admits,
@@ -2479,7 +2493,7 @@ lionvec_startup_cost(IndexOptInfo *index, double members, double *codepages)
 
 	get_tablespace_page_costs(index->reltablespace, &spc_random, &spc_seq);
 
-	if (frac < 1.0 && members <= LIONVEC_EXACT_MAX)
+	if (frac < 1.0 && members <= lionvec_exact_rows)
 	{
 		*codepages = 0.0;
 		return Max(members, 1.0) * (spc_random + cpu_index_tuple_cost +

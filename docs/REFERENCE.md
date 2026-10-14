@@ -289,9 +289,9 @@ The build reads it, so a change takes effect at the next `REINDEX`.
 
 With a `WHERE` that lion indexes answer, `LionOrdered` builds lion's set of the matching rows and
 the scan reads and scores only those (`Custom Scan (LionOrdered)` with `Order By:` in `EXPLAIN`),
-so a `LIMIT` is never left short. A set of up to 2,000 rows is answered exactly, from every
-member's distance; a larger one by reading partitions as above, counting its patience in
-matching rows. A filter of most of the table is planned as the plain index scan with a `Filter`,
+so a `LIMIT` is never left short. A set of up to `pg_lion.vector_exact_rows` rows (2,000) is
+answered exactly, from every member's distance; a larger one by reading partitions as above,
+counting its patience in matching rows. A filter of most of the table is planned as the plain index scan with a `Filter`,
 and a very selective one as a sort of the lion bitmap scan's rows.
 
 ## Reloptions
@@ -579,6 +579,14 @@ from the partitions it reads. A query that wants more (a large `LIMIT`, or none)
 partitions again, gathering four times as many each time. `work_mem` bounds how many candidates a
 scan keeps (DESIGN.md §44.4).
 
+`pg_lion.vector_exact_rows` (2,000, 0 to 100,000,000): how many rows a lion filter may admit for a
+`lionvec` scan under it to compute every matching row's distance from the table, exactly, instead
+of reading partitions; 0 never does. The exact path reads each matching row's vector (6 KB from
+TOAST at 1536 dimensions, so 2,000 rows are 12 MB) where a probe reads a few hundred to a thousand
+8 KB code pages, but under a filter that leaves most partitions empty it probes many for nothing.
+Raise it for exact answers under wider filters, at a table read a row; the planner prices both
+paths and may sort the filter's rows itself above it, which is exact too (DESIGN.md §44.6).
+
 `pg_lion.ordered_switch_ratio` (32, 1 to 1,000,000): how many B-tree entries `LionOrdered` walks per
 member it has not met yet before it stops walking, fetches the members left in TID order and sorts
 them (DESIGN.md §30.4, "When the walk is not paying"; `Switched to Fetch and Sort` in `EXPLAIN
@@ -639,7 +647,7 @@ A `lionvec` index (DESIGN.md §44) answers only an `ORDER BY` of its own distanc
 It has no search operators, no bitmap or index-only scans, no INCLUDE columns and no parallel scan
 or build, and indexes a single column of pgvector's `vector` (not `halfvec`, `sparsevec` or `bit`)
 of at most 8128 dimensions. Its results are approximate (`pg_lion.vector_margin`), except under a
-lion filter of up to 2,000 rows. Inserts serialize on the index's meta page and read every
+lion filter of up to `pg_lion.vector_exact_rows` rows. Inserts serialize on the index's meta page and read every
 partition's centroid. VACUUM removes dead rows' codes but reuses their space only for new rows on
 a chain's last page, so a table with heavy churn grows its index until `REINDEX`, which also
 recomputes the partitions and the mean the codes are centred on (rows that have drifted from them
