@@ -225,9 +225,11 @@ about the time pgvector's HNSW takes to return 95% (8.1 ms at `ef_search` 100);
 matching rows, so a filter of any selectivity gets its ten nearest: 24 ms at 1% of the rows (98%
 recall), where HNSW returns fewer than one row, or 95% of the right ones in 37 to 41 ms with
 iterative scans, and a filter of up to 2,000 rows is answered exactly. The index is 1.7 GB to
-HNSW's 3.8 GB, and since a query reads only the partitions it needs, it holds up when memory is
-short: with PostgreSQL held to 1 GB, 19 ms and 100 pages read from disk a query, where HNSW took
-51 ms and 767 pages (and 691 ms and 9,229 pages under the 1% filter, where lionvec read none).
+HNSW's 3.8 GB (1.9 GB as built now, with every row's one-bit code in two partitions, which finds
+more of the nearest rows at each margin: the figures here are from before), and since a query
+reads only the partitions it needs, it holds up when memory is short: with PostgreSQL held to
+1 GB, 19 ms and 100 pages read from disk a query, where HNSW took 51 ms and 767 pages (and 691 ms
+and 9,229 pages under the 1% filter, where lionvec read none).
 `vector_l2_ops` (`<->`, the default), `vector_ip_ops` (`<#>`) and `vector_cosine_ops` (`<=>`) are
 supported, up to 8128 dimensions. See
 [BENCHMARKS.md](docs/BENCHMARKS.md#nearest-neighbours-lionvec-against-hnsw).

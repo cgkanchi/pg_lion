@@ -269,6 +269,19 @@ centroids. The build runs k-means over a sample of as many rows as half of `main
 holds (1.5 KB a 1536-dimension row, at most about a million rows), so a larger setting makes
 better partitions and a slower build; the setting takes effect at the next `REINDEX`.
 
+    CREATE INDEX ON items USING lionvec (embedding vector_cosine_ops) WITH (spill = off);
+
+`spill` (boolean, default `on`) puts each row in a second partition besides its nearest: of the
+eight next nearest centroids, the one SOAR's rule picks, off the line from the row's own centroid
+through the row, so that a query that passes the row's partition by tends to find it in the
+second. A scan then finds more of the nearest rows at the same `pg_lion.vector_margin` (on 115,000
+OpenAI embeddings, 0.92 of the ten nearest at the default margin against 0.84 without), or as
+many at a smaller one, reading fewer partitions; it returns each row once. The cost is a second
+copy of every row's one-bit code: twice the code pages, which are an eighth of a 1536-dimension
+index (1.9 GB rather than 1.7 GB for a million rows), each partition twice as long to read, and an
+insert written to two partitions. With fewer than two partitions there is nothing to spill to.
+The build reads it, so a change takes effect at the next `REINDEX`.
+
 With a `WHERE` that lion indexes answer, `LionOrdered` builds lion's set of the matching rows and
 the scan reads and scores only those (`Custom Scan (LionOrdered)` with `Order By:` in `EXPLAIN`),
 so a `LIMIT` is never left short. A set of up to 2,000 rows is answered exactly, from every
@@ -540,7 +553,8 @@ takes a partition's rows to come, in standard deviations of the rows about their
 one dimension (DESIGN.md §44.4). A scan reads partitions until the next one's centroid, less this,
 lies farther than the rows it has: larger reads more partitions and misses fewer of the nearest
 rows, smaller the reverse (on 975,000 OpenAI embeddings, 2, 3 and 4 returned 96%, 98% and 98.3% of
-the true ten nearest in 6.6, 7.9 and 9.1 ms). A filter through lion uses the same margin.
+the true ten nearest in 6.6, 7.9 and 9.1 ms, from an index built before `spill`, which finds more
+at each margin). A filter through lion uses the same margin.
 
 `pg_lion.vector_patience` (30, 0 to 1,000,000): how many partitions' worth of rows (of matching
 rows, under a lion filter) a `lionvec` scan scores without finding one nearer than the

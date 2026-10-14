@@ -411,6 +411,15 @@ sixths of the time, and `SET pg_lion.vector_patience = 0`, which reads on to the
 long nothing nearer turns up, 98.4% in 1.8 times the time and a 95th percentile four times as
 long.
 
+By default the build also puts each row in a second partition, chosen among its eight next nearest
+so that a query that passes the row's own partition by is likely to read it (`spill`, after SOAR),
+so a scan finds more of the nearest rows at the same margin; it returns each once. That doubles the
+one-bit code pages, an eighth of a 1536-dimension index: those 975,000 embeddings make an index of
+1.9 GB rather than 1.7 GB, and every insert writes to two partitions. On 115,000 OpenAI embeddings
+the default margin returned 92% of the true ten nearest with it and 84% without, and a margin of 3
+with it as many as one of 5 without, reading less than half the partitions. `WITH (spill = off)`
+and a `REINDEX` keep one copy (the figures above and below are from an index without).
+
 The node builds the Lion set of the `WHERE`, and the vector scan scores only the members in the
 partitions it reads, so the `LIMIT` is filled from the matching rows whatever their share of the
 table; `Heap Fetches` in `EXPLAIN ANALYZE` counts the rows the node fetched, about `k`. A set of up
@@ -431,8 +440,8 @@ embeddings, in 1,974 partitions, one query without a filter and then under one k
 rows:
 
 ```
-lionvec scan of "items_lv": 110 partitions probed, 1 passes, 15345 candidates, 631 refined, 10 fetched, 10 returned, 0 skipped out of order, 0 bounds missed, 1745 pages read, 1 pauses
-lionvec scan of "items_lv": 306 partitions probed, 1 passes, 1230 candidates, 46 refined, 11 fetched, 10 returned, 0 skipped out of order, 0 bounds missed, 4843 pages read, 1 pauses
+lionvec scan of "items_lv": 110 partitions probed, 1 passes, 15345 candidates, 631 refined, 10 fetched, 10 returned, 0 skipped out of order, 0 bounds missed, 1745 pages read, 1 pauses, 0 copies skipped
+lionvec scan of "items_lv": 306 partitions probed, 1 passes, 1230 candidates, 46 refined, 11 fetched, 10 returned, 0 skipped out of order, 0 bounds missed, 4843 pages read, 1 pauses, 0 copies skipped
 ```
 
 Partitions probed are the partitions whose rows the scan read; candidates the rows of those (the
@@ -440,7 +449,9 @@ members, under a filter) that plane 1's bounds could not rule out; refined the o
 code was read, fetched the ones whose exact distance was computed from the table; bounds missed
 counts fetched rows that turned out nearer than their lower bound said, and pages read the code
 pages the probes read; pauses counts the times the scan stopped probing because
-`pg_lion.vector_patience` partitions' worth of rows had brought nothing nearer. Without pauses a
+`pg_lion.vector_patience` partitions' worth of rows had brought nothing nearer; copies skipped
+counts the rows met a second time in a pass, in their other partition, in an index that spills
+(none here, the index being built without). Without pauses a
 query whose nearest rows lie far from every centroid reads many partitions for nothing: unfiltered,
 the partitions a query probed had a median of 68, a 95th percentile of 175 and a maximum of 256 with
 pauses, and 150, 837 and 1,664 without. A query that wants more rows than `pg_lion.vector_batch`
