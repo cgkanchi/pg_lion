@@ -20802,20 +20802,22 @@ their centroids, is the embeddings' own.
 In 2,715 partitions, at the same margin and patience, a scan probed 2.5 times the partitions and
 read three quarters of the CODE pages (37 and 68 at a margin of 3) for 0.835, in 1.4 ms. Along the
 margins, 0.95 took 234 CODE pages against 358 in 678 partitions - 1.5 times fewer, and about 5,700
-rows scored against 11,000, 1.9 times fewer (the numpy model's 1.78) - but 2.9 ms against 2.4:
-each query ranks four times the centroids, and a partition of 42 rows spans two 35-row pages, so
-a probe reads 1.75 pages for 1.2 pages of rows. At a patience of 30 the finer partitions never
-reached 0.98 (0.966 at margins 12 and 16), as the patience counts partitions' worth of rows, now a
-quarter as many; at 120, the rows of 30 in 678 partitions, they did, in 566 pages against 578 and
-4.5 ms against 3.2. At this size the finer partitions buy pages and rows, not time; the default
-changed for the rows a scan reads at a billion (§44.11), where the centroids need an index of their
-own anyway. Under 10% the planner took the plain scan with a `Filter` at both sizes (0.879 and
-0.872 at a margin of 3, 5 to 8 ms); under 3% LionOrdered in 678 partitions (0.917, 5.0 ms) but a
-sort of the lion bitmap scan's 3,472 rows in 2,715 (exact, 20 ms, where LionOrdered took 5.8 ms for
-0.908), its estimate 2,034 against LionOrdered's 2,213, which charges a random page for each
-partition probed, a number that grows as C^(2/3); under 1% a sort of the 1,204 rows (5.3 ms) and
-LionOrdered's exact path (5.6 ms) alike. HNSW's iterative scan took 10.7 ms at 3% (0.953) and 26.7
-ms at 1% (0.959); the planner sorted for it there too.
+rows scored against 11,000, 1.9 times fewer (the numpy model's 1.78) - but 2.9 ms against 2.4: each
+query ranks four times the centroids, and a partition of 42 rows spans two 35-row pages, so a probe
+reads 1.75 pages for 1.2 pages of rows. At a patience of 30 the finer partitions never reached 0.98
+(0.966 at margins 12 and 16), as the patience then counted partitions' worth of rows, a quarter as
+many there; at 120, the rows of 30 in 678 partitions, they did, in 566 pages against 578 and 4.5 ms
+against 3.2. Counted since in the rows of `2 sqrt(n)` partitions (§44.4), a patience of 30 on the
+same index gave the 120's recall in every row, and its partitions and pages to within 0.07 a query:
+0.98 in 566 pages, 327 partitions and 4.1 ms. At this size the finer partitions buy pages and rows,
+not time; the default changed for the rows a scan reads at a billion (§44.11), where the centroids
+need an index of their own anyway. Under 10% the planner took the plain scan with a `Filter` at both
+sizes (0.879 and 0.872 at a margin of 3, 5 to 8 ms); under 3% LionOrdered in 678 partitions (0.917,
+5.0 ms) but a sort of the lion bitmap scan's 3,472 rows in 2,715 (exact, 20 ms, where LionOrdered
+took 5.8 ms for 0.908), its estimate 2,034 against LionOrdered's 2,213, which charges a random page
+for each partition probed, a number that grows as C^(2/3); under 1% a sort of the 1,204 rows (5.3
+ms) and LionOrdered's exact path (5.6 ms) alike. HNSW's iterative scan took 10.7 ms at 3% (0.953)
+and 26.7 ms at 1% (0.959); the planner sorted for it there too.
 
 The share probed at a margin of 3, in 678 and 2,715 partitions: 2.2% and 1.4% unfiltered (§44.7's
 `0.46 C^(-1/3)`: 5.2% and 3.3%), 8.1% and 4.8% through the plain scan at 10% (9.7% and 6.1%), 14.9%

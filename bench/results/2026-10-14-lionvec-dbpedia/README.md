@@ -33,6 +33,7 @@ row a method and filter:
 | `lionvec-p678.json` | lionvec, `partitions = 678` (= the default then, 2 sqrt(n)) | 1de7d73 (d498fba) | 678 | 161 s | 210 MB |
 | `lionvec-p2715.json` | lionvec, `partitions = 2715` (8 sqrt(n)) | 1de7d73 (d498fba) | 2,715 | 347 s | 221 MB |
 | `lionvec-p0-default.json` | lionvec, `partitions = 0`, the new default 8 sqrt(n) | e2eda33 | 2,715 | 337 s | 221 MB |
+| `lionvec-p0-unit.json` | the same index, run at 93a5684 (the pause's new unit), patience 30 alone | e2eda33 | 2,715 | 337 s | 221 MB |
 
 The table is 7.6 MB and its TOAST 900 MB. 1de7d73 is the last commit to `src/` on the
 `claude/lionvec` branch, whose head d498fba these ran on. An index built with `partitions = 0` on
@@ -44,6 +45,15 @@ partitions, the same 231,440,384 bytes, and gave the same recall, partitions pro
 candidates, refines, fetches, skips and pauses as `lionvec-p2715.json` in all 74 rows, and the same
 plans; the server medians differ by 0.07 ms on average (unfiltered within 0.4 ms; the sort under 3%
 varies from 15 to 22 ms from run to run).
+
+93a5684 counts `pg_lion.vector_patience` in units of `sqrt(n) / 2` rows, a partition's rows in
+2 sqrt(n) partitions (169.7 here), rather than the index's own partitions' (42.4 in 2,715). Run on
+the same index at a patience of 30 alone, `lionvec-p0-unit.json` reproduces `lionvec-p2715.json`'s
+patience-120 rows: the same recall in all 37, the same partitions probed, pages and pauses in 31,
+and in the other six (unfiltered at margins 12 and 16, the 10% plain scan at 6 to 16) within 0.04
+partitions and 0.07 pages a query, as 30 units are 5,090.9 rows where 120 partitions' worth were
+5,091.1. So 0.98 is reachable at the default again: unfiltered in 566 CODE pages, 327 partitions
+and 4.1 ms (4.5 in the patience-120 run).
 
 ## Warm, the planner's plans
 
@@ -88,6 +98,8 @@ the rows a partition holds (170 and 42):
 | 0.98 | 678, 120 | 916 | 169 | 28,700 | 4.6 |
 | 0.98 | 2,715, 30 | not reached: 0.966 at margins 12 and 16 | | | |
 | 0.98 | 2,715, 120 | 566 | 327 | 13,900 | 4.5 |
+| 0.95 | 2,715, 30 at 93a5684 (`lionvec-p0-unit.json`) | 310 | 177 | 7,500 | 2.7 |
+| 0.98 | 2,715, 30 at 93a5684 | 566 | 327 | 13,900 | 4.1 |
 
 So the finer partitions read 1.5 times fewer CODE pages at 0.95 (1.9 times fewer rows, against the
 numpy model's 1.78) and about as many at 0.98, and are no faster at 115,186 rows: each query ranks
