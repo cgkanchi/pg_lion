@@ -671,6 +671,28 @@ SELECT lion_sp('SELECT n.id FROM lion_sp_n n WHERE n.k NOT IN (SELECT f2.fk FROM
 SELECT lion_sp('SELECT d.pk FROM lion_sp_d d LEFT JOIN lion_sp_f2 f2 ON f2.fk = d.pk AND f2.y = 5 WHERE f2.fk IS NULL');
 -- a PlaceHolderVar among the join rel's rows
 SELECT lion_sp('SELECT v.i, s.pk, s.a0 FROM (VALUES (1), (2)) v(i) LEFT JOIN (SELECT d.pk, d.attr, coalesce(d.attr, 0) AS a0 FROM lion_sp_d d WHERE EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)) s ON s.attr = v.i');
+-- a qual on a PlaceHolderVar above a NOT EXISTS, which core must not push into
+-- the anti join's inner side (PostgreSQL commit 0d6103e gives that anti join a
+-- relid of its own for it): the same rows as core's with the pushdown off.
+-- Only the comparison is shown: a release without that commit gets core's
+-- answer wrong, and lion's must still be the same as core's
+CREATE TEMP TABLE lion_sp_phv (on_rows text[], off_rows text[]);
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+INSERT INTO lion_sp_phv (on_rows) SELECT array_agg(s::text ORDER BY s::text) FROM (
+	SELECT s.* FROM (VALUES (1)) v(z) LEFT JOIN (SELECT 7 AS c, d.pk AS x FROM lion_sp_d d
+		WHERE NOT EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)) s ON true
+	WHERE s.x = s.c) s;
+SET pg_lion.enable_count_pushdown = off;
+UPDATE lion_sp_phv SET off_rows = (SELECT array_agg(s::text ORDER BY s::text) FROM (
+	SELECT s.* FROM (VALUES (1)) v(z) LEFT JOIN (SELECT 7 AS c, d.pk AS x FROM lion_sp_d d
+		WHERE NOT EXISTS (SELECT 1 FROM lion_sp_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)) s ON true
+	WHERE s.x = s.c) s);
+RESET pg_lion.enable_count_pushdown;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+SELECT on_rows IS NOT DISTINCT FROM off_rows AS same FROM lion_sp_phv;
+DROP TABLE lion_sp_phv;
 -- the fact joined outer: a semi join of the fact's rows, which the path does
 -- not emit (the upper node counts them), and the forward IN over the
 -- dimension, which has no lion index on its key

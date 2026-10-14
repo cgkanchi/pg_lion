@@ -9716,11 +9716,20 @@ differently.
   NULL (it joins nothing under a strict operator), when its key has no fk entry, when the test
   finds nothing, and - with no lookup at all - when a fact filter selects nothing. `NOT IN` is not
   an anti join (its NULL semantics differ) and never reaches the node as one; the anti join the
-  planner makes of `LEFT JOIN ... WHERE f.fk IS NULL` carries an outer join's range table entry
-  (`ojrelid`) and is declined.
+  planner makes of `LEFT JOIN ... WHERE f.fk IS NULL` is declined.
+- **Telling the two anti joins apart** (`lion_fkjoin_sublink_anti()`). The `LEFT JOIN ... IS NULL`
+  one carries the LEFT JOIN's range table entry as its relid (`ojrelid`), which the parser made of
+  the FROM clause (`inFromCl`). The NOT EXISTS one had no relid until PostgreSQL commit 0d6103e
+  ("Give antijoins made from sublinks a relid", in 19 and back-patched to the 16, 17 and 18 minor
+  releases), which gives it a join entry the planner makes, not `inFromCl`, so that a qual on a
+  PlaceHolderVar above it is not pushed into its inner side. So a NOT EXISTS is an anti join with no
+  relid or with a relid whose entry is not `inFromCl`, on every release either side of the change,
+  and no version test is involved. Its relid is no table: wherever recognition walks a join rel's
+  relids for tables it skips `root->outer_join_rels`, and the relid of the NOT EXISTS whose inner
+  side is the fact belongs to the join of fact and dimension, not to the dimension.
 
-Recognition (`lion_fkjoin_recognize()`): exactly one SpecialJoinInfo, JOIN_SEMI or JOIN_ANTI, with
-no `ojrelid`, whose minimal sides are one base relation each and equal to its syntactic sides; the
+Recognition (`lion_fkjoin_recognize()`): exactly one SpecialJoinInfo, JOIN_SEMI or JOIN_ANTI (that of
+a NOT EXISTS, above), whose minimal sides are one base relation each and equal to its syntactic sides; the
 fact is its inner (right) side and the dimension its outer side (a semi join is also taken the other
 way round, as "Forward semi joins over a non-unique key" below); the one join clause is found as for
 an inner join, from the equivalence class or joininfo. (Over three tables or more, the other special
@@ -11342,8 +11351,9 @@ node runs core's cheapest path of it, under the query's snapshot, as it runs a t
 **Recognition** (`lion_fkjoin_recognize()`, `lion_fkjoin_try_fact()`), from the SpecialJoinInfos,
 not from the shape of the join tree:
 
-- every special join is a semi or anti join with no range table entry of its own (`ojrelid` 0:
-  an outer join, and an anti join made of `LEFT JOIN ... IS NULL`, decline), inside the join;
+- every special join is a semi join or the anti join of a NOT EXISTS (an outer join, and an anti
+  join made of `LEFT JOIN ... IS NULL`, decline: "Telling the two anti joins apart"), inside the
+  join;
   every table of the join is a base relation with no LATERAL references and no TABLESAMPLE; and,
   as before, no PlaceHolderVar, no pseudoconstant qual and no LATERAL range table entry anywhere;
 - each table of the join is tried as the fact `F` - a plain or partitioned table with no RLS or
@@ -11892,9 +11902,9 @@ plain JOIN_SEMI and JOIN_ANTI are taken, with the fact as innerrel: their rows a
 each at most once, which is what the node emits; the right-hand forms have the fact outer, whose rows
 the node never emits, and the unique-ified ones only repeat what JOIN_SEMI answers. Then:
 
-- the special join is the call's own (`extra->sjinfo`), of the same kind, with no range table entry
-  of its own - the anti join core makes of `LEFT JOIN ... WHERE f.fk IS NULL` has one (`ojrelid`) and
-  is left alone, as the upper node leaves it;
+- the special join is the call's own (`extra->sjinfo`), of the same kind, a semi join or the anti
+  join of a NOT EXISTS - the anti join core makes of `LEFT JOIN ... WHERE f.fk IS NULL` is left
+  alone, as the upper node leaves it;
 - its minimal and its syntactic inner side are the fact alone, and innerrel is the fact: a plain or
   partitioned table with no LATERAL reference and no TABLESAMPLE (`lion_fkjoin_rel_ok()`), whose
   own restrictions are the fact filters - every one answered by posting sets, with a lion index on
