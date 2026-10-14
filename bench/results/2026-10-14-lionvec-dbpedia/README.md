@@ -35,6 +35,7 @@ row a method and filter:
 | `lionvec-p0-default.json` | lionvec, `partitions = 0`, the new default 8 sqrt(n) | e2eda33 | 2,715 | 337 s | 221 MB |
 | `lionvec-p0-unit.json` | the same index, run at 93a5684 (the pause's new unit), patience 30 alone | e2eda33 | 2,715 | 337 s | 221 MB |
 | `lionvec-p0-spill.json` | lionvec, `partitions = 0` and `spill` on: the defaults since, 8 sqrt(n) partitions of format 3, patience 30 alone | 679cfd5 | 2,715 | 356 s | 247 MB |
+| `cold.json` | both indexes cold (`knn_dbpedia.py cold`): the server restarted and the page cache dropped before each query, 7 queries a method | 679cfd5 | 2,715 | | |
 
 The table is 7.6 MB and its TOAST 900 MB. 1de7d73 is the last commit to `src/` on the
 `claude/lionvec` branch, whose head d498fba these ran on. An index built with `partitions = 0` on
@@ -121,6 +122,40 @@ old default, in the same time at 0.95 and 1.3 times longer at 0.98. Under the fi
 0.98 took 455 and 791 pages through the plain scan at 10% (7.0 and 8.9 ms; 589 and not reached in
 678 partitions) and 671 and 1,155 through LionOrdered at 3% (6.0 and 8.3 ms; 771 and 1,210). The
 planner's choices are the finer partitions' above, a sort at 3% among them.
+
+## Cold
+
+PostgreSQL restarted and the page cache dropped before each query, two seconds for the flush to
+settle, then the query once (`knn_dbpedia.py cold`, run as root): the server's execution time
+under EXPLAIN ANALYZE and the pages it read from the kernel, the median of 7 queries. The
+lionvec index is `lionvec-p0-spill.json`'s (2,715 partitions, spill), the HNSW index `hnsw.json`'s;
+the recall in brackets is the warm run's for the same settings. A first pass without the settle
+had stalls of 1 to 47 s on a few reads, the cloud disk's; with it the slowest query of each
+seven was within 1.7 times its median, except where noted.
+
+| Filter | Method | Median ms | Pages read |
+| --- | --- | --- | --- |
+| none | lionvec margin 3 (0.917) | 22 | 478 |
+| none | lionvec margin 7 (0.95) | 50 | 1,314 |
+| none | lionvec margin 12 (0.993) | 61 | 1,378 |
+| none | HNSW ef_search 40 (0.951) | 50 | 926 |
+| none | HNSW ef_search 100 (0.979) | 106 | 1,918 |
+| 3% | lionvec, the planner's plan (a sort of the bitmap scan's rows, exact) | 209 | 5,620 |
+| 3% | lionvec LionOrdered margin 3 (0.967) | 64 | 1,607 |
+| 3% | lionvec LionOrdered margin 7 (0.99) | 92 | 2,285 |
+| 3% | HNSW ef 40 iterative, enable_sort off (0.953) | 293 | 5,365 |
+| 3% | HNSW, the planner's plan (sort, exact) | 218 | 5,620 |
+| 1% | lionvec, the planner's plan (sort, exact) | 96 | 2,720 |
+| 1% | lionvec LionOrdered (the exact path) | 90 | 2,721 |
+| 1% | HNSW ef 40 iterative, enable_sort off (0.959) | 539 | 11,870 |
+
+Unfiltered at 0.95 the two read about the same: lionvec's 1,314 pages are its 2,715-centroid PART
+chain (85 pages) and the partitions' code pages, HNSW's 926 its graph's; at 0.98 lionvec reads
+1,378 pages in 61 ms where HNSW reads 1,918 in 106. Under the filters lionvec reads the matching
+rows' codes and HNSW walks the graph past the rows the filter rejects: 3.3 times fewer pages and
+4.6 times less time at 3%, 4.4 times fewer pages and 6 times less time at 1%, where lionvec's two
+plans are both exact. The planner's sort at 3% reads every matching row's vector from TOAST,
+5,620 pages, 3.5 times LionOrdered's.
 
 ## Re-running
 

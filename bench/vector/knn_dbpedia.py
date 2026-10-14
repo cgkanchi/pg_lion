@@ -37,6 +37,9 @@
 #                                   KNN_OUT/NAME.json with the index's build
 #   knn_dbpedia.py table FILE...     the results as markdown tables, and the
 #                                   pages a recall took, along the margins
+#   knn_dbpedia.py cold             each query alone after a server restart
+#                                   and a dropped page cache (run as root),
+#                                   both indexes, into KNN_OUT/cold.json
 #
 # KNN_DSN (default "dbname=dbpedia", the rest from PGHOST and friends),
 # KNN_ADMIN_DSN (default "dbname=postgres", to create the database), KNN_CACHE
@@ -45,6 +48,8 @@
 # KNN_SHARDS (default /mnt/project-files/train-0000[0-2]-of-00026.parquet),
 # KNN_SRC (default this checkout: the one the installed pg_lion was built
 # from, whose commit the results record),
+# KNN_RESTART (default "./dev.sh restart"): the command cold runs to restart
+# the server, and KNN_COLD_NQ (default 7) the queries each method runs cold.
 # KNN_MARGINS (default 2,3,4,6,8,12,16) and KNN_PATIENCE (default 30): the
 # pg_lion.vector_margin and pg_lion.vector_patience values warm runs.  The
 # margins go past the default 3 because on these embeddings 3 returns 0.84 of
@@ -390,6 +395,73 @@ def warm(kind, name):
     json.dump(dict(meta=meta, results=out), open(os.path.join(OUT, f'{name}.json'), 'w'), indent=1)
 
 
+def cold():
+    # What a query costs when nothing is in memory: PostgreSQL restarted and
+    # the page cache dropped before each one (the restart alone does not
+    # empty the kernel's cache), two seconds for the flush to settle, then
+    # the query once under EXPLAIN (ANALYZE, BUFFERS) for the server's time
+    # and the pages it read from the kernel.  A few methods a filter, at the
+    # recalls the warm runs measured; the median of KNN_COLD_NQ queries, since
+    # a cloud disk's latency varies from read to read.
+    nq = int(os.environ.get('KNN_COLD_NQ', '7'))
+    restart = os.environ.get('KNN_RESTART', './dev.sh restart')
+    X = np.load(os.path.join(CACHE, 'X.npy'), mmap_mode='r')
+    qidx = np.load(os.path.join(CACHE, 'qidx.npy'))
+    Q = np.asarray(X[qidx[:nq]])
+    lo = ['SET enable_sort = off', 'SET enable_indexscan = off']
+    hn = ['SET hnsw.ef_search = 40', 'SET hnsw.iterative_scan = relaxed_order']
+    configs = []
+    for margin in (3, 7, 12):
+        configs.append((1.0, f'lionvec margin={margin}', LION.format(w=where(1.0)),
+                        [f'SET pg_lion.vector_margin = {margin}']))
+    for ef in (40, 100):
+        configs.append((1.0, f'hnsw ef={ef}', HNSW.format(w=where(1.0)), [f'SET hnsw.ef_search = {ef}']))
+    for sel in (0.03, 0.01):
+        configs.append((sel, 'lionvec planner plan', LION.format(w=where(sel)), ['SET pg_lion.vector_margin = 3']))
+        for margin in (3, 7) if sel > 0.01 else (3,):
+            configs.append((sel, f'lionvec margin={margin} LionOrdered', LION.format(w=where(sel)),
+                            [f'SET pg_lion.vector_margin = {margin}'] + lo))
+        configs.append((sel, 'hnsw ef=40 iterative', HNSW.format(w=where(sel)), hn))
+        configs.append((sel, 'hnsw ef=40 iterative enable_sort=off', HNSW.format(w=where(sel)),
+                        hn + ['SET enable_sort = off']))
+    read = re.compile(r'Buffers: shared[^\n]*?read=(\d+)')
+    out = []
+    for sel, name, sql, settings in configs:
+        ms, pages, plan = [], [], None
+        for i in range(nq):
+            subprocess.run(restart, shell=True, check=True, capture_output=True)
+            dropped = subprocess.run(['sh', '-c', 'sync; echo 3 > /proc/sys/vm/drop_caches'],
+                                     capture_output=True).returncode == 0
+            time.sleep(2)
+            for _ in range(50):
+                try:
+                    conn = connect()
+                    break
+                except psycopg.OperationalError:
+                    time.sleep(0.2)
+            cost_distances(conn)
+            for st in settings:
+                conn.execute(st)
+            lines = [r[0] for r in conn.execute('EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, COSTS OFF) ' + sql,
+                                                {'q': lit(Q[i])}).fetchall()]
+            ms.append(float(next(EXEC.search(l).group(1) for l in lines if EXEC.search(l))))
+            g = read.search(next((l for l in lines if 'Buffers:' in l), ''))
+            pages.append(int(g.group(1)) if g else 0)
+            if plan is None:
+                plan = ' / '.join(l.strip()[:60] for l in lines
+                                  if re.search(r'Scan|Sort|Lion|Limit', l) and 'Buffers' not in l)[:200]
+            conn.close()
+        row = dict(name=name, sel=sel, cache_dropped=dropped, median_ms=float(np.median(ms)),
+                   max_ms=float(max(ms)), all_ms=[round(x, 1) for x in ms],
+                   pages_read_median=float(np.median(pages)), all_pages=pages, plan=plan)
+        print(json.dumps(row), flush=True)
+        out.append(row)
+    os.makedirs(OUT, exist_ok=True)
+    json.dump(dict(meta=dict(run=provenance(), queries=nq, restart=restart,
+                             run_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())), results=out),
+              open(os.path.join(OUT, 'cold.json'), 'w'), indent=1)
+
+
 def table(files):
     # the results as markdown: every row, then for each lionvec file and
     # pause, the CODE pages, partitions and time a scan needed for a recall,
@@ -459,8 +531,10 @@ if __name__ == '__main__':
         warm(a[1], a[2])
     elif a[:1] == ['table'] and len(a) > 1:
         table(a[1:])
+    elif a == ['cold']:
+        cold()
     elif a[:1] == ['sizes']:
         sizes()
     else:
         raise SystemExit('usage: knn_dbpedia.py prepare | load | hnsw | lionvec P | '
-                         'warm lionvec|hnsw NAME | table FILE... | sizes')
+                         'warm lionvec|hnsw NAME | table FILE... | sizes | cold')
