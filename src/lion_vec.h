@@ -229,9 +229,17 @@ lionvec_chain_step(Relation index, uint64 *visited, BlockNumber *nblocks)
  * LIONVEC_MARGIN_NARROW for each tenfold it thins the rows by
  * (lion_vec_scan.c, lv_margin()).
  */
-#define LIONVEC_MARGIN_DEFAULT	2.0
-#define LIONVEC_MARGIN_NARROW	1.3
+#define LIONVEC_MARGIN_DEFAULT	3.0
+#define LIONVEC_MARGIN_NARROW	1.8
 #define LIONVEC_MAX_PARTS		1000000
+
+/*
+ * A scan stops probing once it has scored this many partitions' worth of
+ * rows (of members, under a restriction) without one entering its batch's
+ * L least upper bounds, until it has returned the rows it holds
+ * (lion_vec_scan.c, DESIGN.md §44.4).  0 never stops.
+ */
+#define LIONVEC_PATIENCE_DEFAULT 30
 
 /*
  * A scan restricted to this many members or fewer computes every member's
@@ -241,6 +249,7 @@ lionvec_chain_step(Relation index, uint64 *visited, BlockNumber *nblocks)
 extern double lionvec_epsilon;
 extern int	lionvec_batch;
 extern double lionvec_margin;
+extern int	lionvec_patience;
 
 /* lion_vec.c */
 extern void lion_vec_init(void);

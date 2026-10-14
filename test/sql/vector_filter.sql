@@ -7,8 +7,8 @@
 -- through the node (every core scan disabled, so that nothing else can be
 -- chosen) and through the ordinary plan (the node off, everything else
 -- enabled), and the answers are compared: the distances in order, and the
--- rows.  pg_lion.vector_epsilon and pg_lion.vector_margin are raised, as in
--- vector.sql.
+-- rows.  pg_lion.vector_epsilon and pg_lion.vector_margin are raised, and
+-- pg_lion.vector_patience is off, as in vector.sql.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
@@ -19,6 +19,7 @@ SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
 SET pg_lion.vector_epsilon = 6;
 SET pg_lion.vector_margin = 100;
+SET pg_lion.vector_patience = 0;
 
 CREATE FUNCTION vf_vec(seed bigint, n int, scale float8 DEFAULT 1.0)
 RETURNS vector LANGUAGE sql IMMUTABLE AS $$
@@ -310,10 +311,11 @@ BEGIN
 		greatest(cardinality(b), 1);
 END $$;
 
--- the default margin, over a filter that leaves too many members to fetch
--- one by one: the scan probes the partitions near the query, and misses
--- few of its nearest members
+-- the default margin and patience, over a filter that leaves too many
+-- members to fetch one by one: the scan probes the partitions near the
+-- query, and misses few of its nearest members
 RESET pg_lion.vector_margin;
+RESET pg_lion.vector_patience;
 SELECT op, avg(vf_recall(format('SELECT id FROM vf WHERE cat <> 5 AND v IS NOT NULL
 								  ORDER BY v %s vf_vec(-%s, 24) + vf_vec(%s, 24, 0.3)
 								  LIMIT 10', op, s % 10 + 1, s + 20000))) >= 0.9
@@ -321,6 +323,7 @@ SELECT op, avg(vf_recall(format('SELECT id FROM vf WHERE cat <> 5 AND v IS NOT N
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op), generate_series(1, 20) s
  GROUP BY op ORDER BY op;
 SET pg_lion.vector_margin = 100;
+SET pg_lion.vector_patience = 0;
 
 -- inserts after the builds, then deletes and VACUUM
 INSERT INTO vf

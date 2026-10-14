@@ -32,7 +32,13 @@
  * So a LIMIT k query probes the partitions whose centroids, less the
  * margin, lie nearer than its k-th row, refines about the rows plane 1
  * cannot tell from the k-th, and computes the distance of about k + a few.
- * A row whose partition the margin leaves unprobed is missed.  The bounds
+ * A row whose partition the margin leaves unprobed is missed.
+ *	A query whose rows lie far from every centroid finds many centroids
+ * within its k-th row less the margin.  So the scan also pauses: once it
+ * has scored pg_lion.vector_patience partitions' worth of rows (the rows
+ * a partition holds on average) without one entering the L least upper
+ * bounds, it probes no partition until the row queue is empty, and a
+ * REST, which starts a new batch, ends the pause too.  The bounds
  * hold with the probability pg_lion.vector_epsilon sets; a row whose bound
  * fails and turns up after rows farther than it is skipped, so the scan
  * never returns rows out of order.
@@ -193,6 +199,9 @@ typedef struct LvScanOpaque
 	int			batch;			/* L */
 	double		tau;
 	double		cut;			/* lv_cut()'s, or infinity */
+	double		patience;		/* rows scored without one entering hi ... */
+	double		sincerows;		/* ... and since one last did */
+	bool		paused;			/* probing no partition (the header) */
 	lvseen_hash *seen;
 	double		lastdist;		/* of the row returned last */
 
@@ -230,6 +239,7 @@ typedef struct LvScanOpaque
 	int64		nskipped;
 	int64		nmissed;		/* exact keys below the bound they had */
 	int64		npages;			/* CODE pages the probes read */
+	int64		npauses;
 } LvScanOpaque;
 
 /* ----------------------------------------------------------------
@@ -532,10 +542,12 @@ lv_debug_stats(IndexScanDesc scan, LvScanOpaque *so)
 			 INT64_FORMAT " passes, " INT64_FORMAT " candidates, "
 			 INT64_FORMAT " refined, " INT64_FORMAT " fetched, "
 			 INT64_FORMAT " returned, " INT64_FORMAT " skipped out of order, "
-			 INT64_FORMAT " bounds missed, " INT64_FORMAT " pages read",
+			 INT64_FORMAT " bounds missed, " INT64_FORMAT " pages read, "
+			 INT64_FORMAT " pauses",
 			 RelationGetRelationName(scan->indexRelation), so->nprobes,
 			 so->npasses, so->ncands, so->nrefined, so->nfetched,
-			 so->nreturned, so->nskipped, so->nmissed, so->npages);
+			 so->nreturned, so->nskipped, so->nmissed, so->npages,
+			 so->npauses);
 	else if (so->nfetched > 0)
 		elog(DEBUG1, "lionvec scan of \"%s\": " INT64_FORMAT " members fetched, "
 			 INT64_FORMAT " returned",
@@ -543,6 +555,7 @@ lv_debug_stats(IndexScanDesc scan, LvScanOpaque *so)
 			 so->nreturned);
 	so->nprobes = so->npasses = so->ncands = so->nrefined = so->nfetched = 0;
 	so->nreturned = so->nskipped = so->nmissed = so->npages = 0;
+	so->npauses = 0;
 }
 
 void
@@ -573,6 +586,8 @@ lionvecrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys,
 	so->nprobed = 0;
 	so->hi = NULL;
 	so->nhi = so->maxhi = 0;
+	so->sincerows = 0.0;
+	so->paused = false;
 	so->seen = NULL;
 	so->exact = NULL;
 	so->nexact = so->epos = 0;
@@ -1183,6 +1198,7 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head)
 				continue;
 			if (so->restricted && !lv_member(so, &code->tid))
 				continue;
+			so->sincerows += 1.0;
 
 			item.tid = code->tid;
 			item.rblk = code->rblk;
@@ -1226,6 +1242,8 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head)
 				drop = Min(drop, lo);
 				continue;
 			}
+			if (so->nhi < L || hi < so->hi[0])
+				so->sincerows = 0.0;	/* it enters: patience starts over */
 			lv_hi_push(so->hi, &so->nhi, L, hi);
 			if (so->nhi == L)
 				so->tau = so->hi[0];
@@ -1266,6 +1284,11 @@ lv_probe_part(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 	so->probed[so->nprobed++] = so->phead[partno];
 	so->nprobes++;
 	lv_probe(scan, so, so->phead[partno]);
+	if (so->nhi == so->batch && so->sincerows >= so->patience)
+	{
+		so->paused = true;
+		so->npauses++;
+	}
 }
 
 /* Empty the row queue, for probes of L rows. */
@@ -1276,6 +1299,7 @@ lv_reset_rows(LvScanOpaque *so)
 	so->nhi = 0;
 	so->tau = INFINITY;
 	so->cut = INFINITY;
+	so->sincerows = 0.0;
 	if (so->maxhi < so->batch)
 	{
 		so->hi = so->hi == NULL ?
@@ -1300,6 +1324,7 @@ lv_rest(IndexScanDesc scan, LvScanOpaque *so)
 	so->batch = (int) Min((double) so->batch * 4.0,
 						  Max((double) so->batch, (double) cap / 8.0));
 	lv_reset_rows(so);
+	so->paused = false;
 	for (i = 0; i < so->nprobed; i++)
 		lv_probe(scan, so, so->probed[i]);
 }
@@ -1497,6 +1522,9 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 	}
 	so->qnorm = qnorm;
 	so->margin = lv_margin(so, members, tuples);
+	so->patience = lionvec_patience > 0 ?
+		(double) lionvec_patience * Max(tuples / Max(so->meta.nparts, 1), 1.0) :
+		INFINITY;
 
 	so->seen = lvseen_create(so->qcxt, 256, NULL);
 	so->batch = lionvec_batch;
@@ -1560,8 +1588,15 @@ lionvecgettuple(IndexScanDesc scan, ScanDirection dir)
 					}
 					old = MemoryContextSwitchTo(so->qcxt);
 
+					/* a pause ends with the rows it held (the file's header) */
+					if (so->paused && so->rows.n == 0)
+					{
+						so->paused = false;
+						so->sincerows = 0.0;
+					}
+
 					/* a partition, when it comes before every row */
-					if (so->parts.n > 0 &&
+					if (so->parts.n > 0 && !so->paused &&
 						(so->rows.n == 0 ||
 						 so->parts.items[0].key < so->rows.items[0].key))
 					{

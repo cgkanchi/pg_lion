@@ -6,9 +6,10 @@
 -- compared: the distances in order, and the rows.  pg_lion.vector_epsilon
 -- is raised for the comparisons, so that no bound failure can make a row
 -- come back late (§44.4), and pg_lion.vector_margin, so that every
--- partition that could hold a nearer row is read; the default epsilon's own
--- rate is the unit tests', and the default margin's recall is measured at
--- the end.
+-- partition that could hold a nearer row is read, and pg_lion.vector_patience
+-- is off, so that the scan never pauses before it has; the default epsilon's
+-- own rate is the unit tests', and the default margin's and patience's
+-- recall is measured at the end.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
@@ -113,6 +114,7 @@ VACUUM (ANALYZE) vt;
 
 SET pg_lion.vector_epsilon = 6;
 SET pg_lion.vector_margin = 100;
+SET pg_lion.vector_patience = 0;
 
 -- every metric, a query vector in a cluster and between them, any LIMIT
 CREATE TABLE vt_cases AS
@@ -269,9 +271,11 @@ BEGIN
 		greatest(cardinality(b), 1);
 END $$;
 
--- the default margin reads the partitions near the query only, and misses
--- few of its nearest rows; a margin below zero reads fewer, and misses more
+-- the default margin and patience read the partitions near the query only,
+-- and miss few of its nearest rows; a margin below zero reads fewer, and
+-- misses more
 RESET pg_lion.vector_margin;
+RESET pg_lion.vector_patience;
 SELECT op, avg(vec_recall(format('SELECT id FROM vt ORDER BY v %s %s LIMIT 10',
 								 op, q))) >= 0.9 AS "most of the nearest"
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op),
@@ -280,6 +284,22 @@ SELECT op, avg(vec_recall(format('SELECT id FROM vt ORDER BY v %s %s LIMIT 10',
  GROUP BY op ORDER BY op;
 SET pg_lion.vector_margin = -10;
 SELECT vec_recall('SELECT id FROM vt ORDER BY v <-> vt_vec(77, 40, 0.5) LIMIT 100') < 1 AS "fewer";
+RESET pg_lion.vector_margin;
+
+-- a scan that pauses at once, every partition within its margin: it still
+-- fills its LIMIT, in order, from the rows it holds and then the partitions
+-- after the pause
+SET pg_lion.vector_margin = 100;
+SET pg_lion.vector_patience = 1;
+SET enable_seqscan = off;
+SET enable_sort = off;
+SELECT cardinality(a) AS n, a = (SELECT array_agg(x ORDER BY x) FROM unnest(a) x) AS "in order"
+  FROM (SELECT array_agg(d) AS a
+		  FROM (SELECT v <-> vt_vec(77, 40, 0.5) AS d FROM vt
+				 ORDER BY v <-> vt_vec(77, 40, 0.5) LIMIT 300) l) s;
+RESET enable_seqscan;
+RESET enable_sort;
+RESET pg_lion.vector_patience;
 RESET pg_lion.vector_margin;
 
 -- what lionvec refuses
@@ -293,6 +313,7 @@ CREATE INDEX ON vt USING lionvec (v) WITH (partitions = 1000001);
 SET pg_lion.vector_epsilon = 0.5;
 SET pg_lion.vector_batch = 0;
 SET pg_lion.vector_margin = 1001;
+SET pg_lion.vector_patience = -1;
 
 DROP TABLE vt, vt2, vt_cases, ve, vu, vbad;
 DROP FUNCTION vec_cmp(text);

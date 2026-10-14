@@ -35,7 +35,8 @@ HNSW = ("SELECT id FROM items {w} ORDER BY embedding::halfvec(1536) <=> %(q)s::h
 LION = "SELECT id FROM items {w} ORDER BY embedding <=> %(q)s::vector LIMIT 10"
 STATS = re.compile(r'lionvec scan of "[^"]*": (\d+) partitions probed, (\d+) passes, '
                    r'(\d+) candidates, (\d+) refined, (\d+) fetched, (\d+) returned, '
-                   r'(\d+) skipped out of order, (\d+) bounds missed, (\d+) pages read')
+                   r'(\d+) skipped out of order, (\d+) bounds missed, (\d+) pages read'
+                   r'(?:, (\d+) pauses)?')
 EXACT = re.compile(r'lionvec scan of "[^"]*": (\d+) members fetched, (\d+) returned')
 MWM = os.environ.get('KNN_MWM', '1GB')
 
@@ -120,7 +121,7 @@ def run(conn, name, sql, sel, settings, Q, gt, nq):
         for m in stats:
             g = STATS.search(m)
             if g:
-                scans.append([int(x) for x in g.groups()])
+                scans.append([int(x or 0) for x in g.groups()])
             g = EXACT.search(m)
             if g:
                 exact.append(int(g.group(1)))
@@ -136,7 +137,8 @@ def run(conn, name, sql, sel, settings, Q, gt, nq):
         row.update(probes=float(a[:, 0].mean()), passes=float(a[:, 1].mean()),
                    candidates=float(a[:, 2].mean()), refined=float(a[:, 3].mean()),
                    fetched=float(a[:, 4].mean()), skipped=float(a[:, 6].mean()),
-                   missed=float(a[:, 7].mean()), pages=float(a[:, 8].mean()))
+                   missed=float(a[:, 7].mean()), pages=float(a[:, 8].mean()),
+                   pauses=float(a[:, 9].mean()))
     if exact:
         row.update(members_fetched=float(np.mean(exact)))
     conn.remove_notice_handler(handler)
@@ -146,9 +148,9 @@ def run(conn, name, sql, sel, settings, Q, gt, nq):
 
 def methods(sel):
     m = []
-    for margin in (1, 2, 3):
-        m.append((f'lionvec margin={margin}', LION.format(w=where(sel)),
-                  [f'SET pg_lion.vector_margin = {margin}']))
+    for margin, patience in ((2, 30), (3, 30), (4, 30), (3, 0)):
+        m.append((f'lionvec margin={margin} patience={patience}', LION.format(w=where(sel)),
+                  [f'SET pg_lion.vector_margin = {margin}', f'SET pg_lion.vector_patience = {patience}']))
     for ef in (40, 100):
         m.append((f'hnsw ef={ef}', HNSW.format(w=where(sel)), [f'SET hnsw.ef_search = {ef}']))
         if sel < 1.0:
@@ -189,9 +191,9 @@ def cold(nq):
     cost_distances(conn)
     conn.close()
     out = []
-    for name, sql, settings in [m for m in methods(1.0) if m[0] in ('lionvec margin=2', 'hnsw ef=40')] + \
+    for name, sql, settings in [m for m in methods(1.0) if m[0] in ('lionvec margin=3 patience=30', 'hnsw ef=40')] + \
             [m for sel in (0.01, 0.001) for m in methods(sel)
-             if m[0] in ('lionvec margin=2', 'hnsw ef=40 iterative')]:
+             if m[0] in ('lionvec margin=3 patience=30', 'hnsw ef=40 iterative')]:
         ts = []
         for i in range(nq):
             subprocess.run(['pg_ctlcluster'] + CLUSTER.split() + ['restart'], check=True)
@@ -241,8 +243,8 @@ def capped(mb, nq):
     conn.close()
     out = []
     try:
-        for name, sql, settings in [m for m in methods(1.0) if m[0] in ('lionvec margin=2', 'hnsw ef=40')] + \
-                [m for m in methods(0.01) if m[0] in ('lionvec margin=2', 'hnsw ef=40 iterative')]:
+        for name, sql, settings in [m for m in methods(1.0) if m[0] in ('lionvec margin=3 patience=30', 'hnsw ef=40')] + \
+                [m for m in methods(0.01) if m[0] in ('lionvec margin=3 patience=30', 'hnsw ef=40 iterative')]:
             subprocess.run(ctl + ['stop'], check=True)
             subprocess.run(['sh', '-c', 'sync; echo 3 > /proc/sys/vm/drop_caches'], check=True)
             with open(limit, 'w') as f:
