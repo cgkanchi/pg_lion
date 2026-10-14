@@ -20307,18 +20307,23 @@ holds no member (§44.6).
   assignment does already: they are those plane 1 cannot rule out of the nine nearest
   (`lionvec_candidates_n()`, the ninth least upper bound in place of the least; ten or so of 200 at
   320 dimensions and more, as before, a hundred at 64), ranked by their 8-bit codes, the first
-  being the row's partition as before. Two partitions or more give two candidates or more, so a row
-  always has a second; one partition gives no copies, and the build records whether it spilled in
-  the meta page's flags. The build compares the row with the centroids' floats, kept centred
-  alongside their codes; an insert, whose floats are gone, decodes the candidates' 8-bit codes
-  (`lionvec_decode8()`: `|x| alpha8 y / |y|`, y the code's vector, the projection of x on it, an
-  error of `|x| sqrt(1 - alpha8^2)`, about a percent of `|x|`) and chooses among those. Over
-  clustered vectors at 64, 384 and 1536 dimensions (the unit tests, §44.10), SOAR chose a partition
-  other than the second nearest for 25-29% of rows, the cosine squared of the copy's residual with
-  r fell from 0.34-0.38 to 0.26-0.32, and decoded centroids chose as the floats did for 97 to 98%
-  of rows, the rest within a percent of the least cost. The scale counts each row once, from its
-  own partition, so that the margin means what it meant; a partition's spread and longest row are
-  over everything its chain holds, copies included, since §44.4's bound must hold for each of them.
+  being the row's partition as before. Two partitions or more give two candidates or more - every
+  bound having lo <= hi, as it does when the centroids' lengths are numbers no less than zero,
+  which `lionvec_part_at()` checks, so that fewer is corruption - and so a row always has a second;
+  one partition gives no copies, and the build records whether it spilled in the meta page's flags.
+  The build compares the row with the centroids' floats, kept centred alongside their codes; an
+  insert, whose floats are gone, decodes the candidates' 8-bit codes (`lionvec_decode8()`: `|x|
+  alpha8 y / |y|`, y the code's vector, the projection of x on it, an error of `|x| sqrt(1 -
+  alpha8^2)`, about a percent of `|x|`) and chooses among those, reading each candidate's REFINE
+  item once, for its estimate, and keeping its codes. The floats, C dimsp of them, which the
+  k-means held already, are kept to the end of the second scan: 12 MB for the benchmark's 1,974
+  partitions of 1536 dimensions. Over clustered vectors at 64, 384 and 1536 dimensions (the unit
+  tests, §44.10), SOAR chose a partition other than the second nearest for 25-29% of rows, the
+  cosine squared of the copy's residual with r fell from 0.34-0.38 to 0.26-0.32, and decoded
+  centroids chose as the floats did for 97 to 98% of rows, the rest within a percent of the least
+  cost. The scale counts each row once, from its own partition, so that the margin means what it
+  meant; a partition's spread and longest row are over everything its chain holds, copies included,
+  since §44.4's bound must hold for each of them.
 
 ### 44.4 The scan (lion_vec_scan.c)
 
@@ -20438,17 +20443,25 @@ would be refined, fetched or returned twice, and would stand twice among the L l
 making tau too small and the pause too early. So the progress hash also records each row a pass
 ENTERS - whose lower bound is within tau and below the cut, so that it goes into the L least upper
 bounds and the row queue - and the pass's number (`lv_enter()`); the row's other item, met later in
-the same pass, is skipped and counted (`ncopies`, the DEBUG1 line's last field, `N copies skipped`).
-The first met wins: the other has the same bounds, being the same bytes, and tau and the cut only
-fall within a pass, so it could do no more than the first did. A row left out of the pass (`lo >
-tau`) is not entered, and its other item is left out too, for the same reason; the REST that
+the same pass, is skipped and counted (`ncopies`, the DEBUG1 line's last field, `N copies
+skipped`). The first met wins: the other has the same bounds, being the same bytes, and tau and the
+cut only fall within a pass, so it could do no more than the first did. A row left out of the pass
+(`lo > tau`) is not entered, and its other item is left out too, for the same reason; the REST that
 stands for them starts a new pass, in which each row is entered once again. A row returned is GONE
-in every pass. The cost is a hash entry for each row a pass enters rather than each row refined, a
-few tens of bytes, within the row queue's own (which `work_mem` caps). The patience counts items,
-which the probes see, so a partition's worth is twice the rows over the partitions; restricted, it
-is twice the members over the partitions, the members themselves counted once, from the filter. A
-walk (NULL or cosine zero query, or no ORDER BY) reads each partition's chain and skips its
-copies, so that it returns each row once.
+in every pass. A row that leaves the pass unworked - dropped by `lv_shrink()` or a cut, left out on
+the second look at tau after its upper bound went in, or still queued at a REST - is forgotten if
+the hash knows nothing more of it (`lv_forget()`): its other item is then left out as it was, tau
+and the cut only falling within a pass. So the entries that say only that a row entered are the row
+queue's own rows, within its `work_mem` cap, and the rest are the rows refined, fetched or
+returned, as without spill. Kept, they would grow to every row within tau of every pass, orders of
+magnitude past `work_mem` in a deep scan under a small one (a review found it). An assert build
+checks at each REST that none is left. A probe of an index that spills looks every row up, even in
+a pass whose hash was empty when it began, so that a TID a corrupted chain holds twice is skipped
+as a copy rather than returned twice. The patience counts items, which the probes see, so a
+partition's worth is twice the rows over the partitions; restricted, it is twice the members over
+the partitions, the members themselves counted once, from the filter. A walk (NULL or cosine zero
+query, or no ORDER BY) reads each partition's chain and skips its copies, so that it returns each
+row once.
 
 **NULLs and zeros.** NULL rows come last, with NULL distances, from the NULL chain; before them,
 in a cosine index, the zero vectors, whose distance is NaN (float8 sorts NaN after every number,
@@ -20499,15 +20512,18 @@ planner never makes (its cost is infinite), walks every row.
   it then removes a REFINE page at a time in block order, each checked by TID first, with
   `PageIndexTupleDeleteNoCompact()`: the line pointers stay, so the other rows' CODE items still
   point right. A crash between the two steps leaves REFINE items nothing points at, which the next
-  VACUUM does not find; they cost space and nothing else. In an index that spills a dead row's
-  two items go as their chains are walked, and its REFINE location is taken from its primary
-  alone, so that it is removed once; the row is counted once, by its primary, in the rows removed
-  and the index's rows. When the locations fill `maintenance_work_mem` mid-walk they are removed
-  then, and a copy in a chain not walked yet may point a while at a REFINE item gone or reused; a
-  scan that meets it finds no item with its TID and takes the row as gone, which it is. A crash
-  part-way leaves copies of rows whose primaries went; the heap's line pointers stay dead until a
-  VACUUM completes, so the next one removes them. Pages are never recycled; the centroids'
-  REFINE items, which no CODE item names, are never removed.
+  VACUUM does not find; they cost space and nothing else. In an index that spills a dead row's two
+  items go as their chains are walked, and its REFINE location is taken from its primary alone, so
+  that it is removed once; the row is counted once, by its primary, in the rows removed and the
+  index's rows. When the locations fill `maintenance_work_mem` mid-walk they are removed then, and
+  a copy in a chain not walked yet may point a while at a REFINE item gone or reused; a scan that
+  meets it finds no item with its TID and takes the row as gone, which it is. A crash part-way
+  leaves copies of rows whose primaries went; the heap's line pointers stay dead until a VACUUM
+  completes, so the next one removes them. The bulk-delete callback is asked of a copy's TID as of
+  its primary's: twice the lookups in lazy VACUUM's dead-TID store, and twice the TIDs in
+  `validate_index()`'s sort under `CREATE INDEX CONCURRENTLY`, whose merge with the heap skips a
+  TID it has passed, so the duplicate costs a sort entry and nothing else. Pages are never
+  recycled; the centroids' REFINE items, which no CODE item names, are never removed.
 - **A scan against VACUUM.** A scan copies what it needs of a CODE item (the REFINE location among
   it) into its queue and holds no pin. VACUUM may remove the REFINE item before the scan reads it,
   and an insert may reuse the slot: `lionvec_refine_at()` returns the item only if its TID is the
@@ -20521,9 +20537,12 @@ planner never makes (its cost is infinite), walks every row.
 - **Format checks**: every page's type and id before anything on it is read; every CODE item's
   length against its flags and `dimsp`, its flags against each other (a copy is neither NULL nor
   zero), and a copy anywhere but a partition's chain of an index that spills; the meta page's flags
-  (none unknown, and spill only with two partitions or more); every REFINE item's length; every
-  PART item's length, flags and blocks, and the PART chain's numbering against the meta page's
-  count; chain cycles (`lionvec_chain_step()`); the meta page's fields. Each is
+  (none unknown, and spill only with two partitions or more); every REFINE item's length, and a
+  centroid's alpha8 and code length finite; every PART item's length, flags and blocks, its
+  centroid's length, its longest row and its spread finite and not negative and its alpha1 finite
+  (a negative length makes a bound whose lower end lies past its upper, and the ranking of an
+  insert's candidates come up short, which is checked too), and the PART chain's numbering against
+  the meta page's count; chain cycles (`lionvec_chain_step()`); the meta page's fields. Each is
   ERRCODE_INDEX_CORRUPTED, never a crash.
 
 ### 44.6 Filtered nearest neighbours (LionOrdered, lion_ordered.c)
@@ -20920,16 +20939,18 @@ the one that matters at a billion rows (§44.11).
   still returning a LIMIT 300 whole and in order; and the refusals (another type, too many
   dimensions, an array, two columns, the `partitions` and settings' ranges). Spill, its indexes'
   CODE items read off their pages with pageinspect: after the build, inserts, UPDATE, DELETE and
-  VACUUM and REINDEX, every row with a vector has one primary and one copy, on another page (in
-  another partition's chain), naming the same REFINE item; NULL rows and cosine zero vectors one
-  item; no item of a deleted row left after VACUUM, in either chain; the comparisons with a sort
-  above, which spill doubles - each row once, past the table's rows, through a walk, and cut by
-  `work_mem`; 1,200 rows of 30 distinct vectors in 12 partitions, so that every distance is a
-  forty-way tie, at LIMITs that end a tie and with no LIMIT; `spill = off` and a REINDEX, after
-  which no row has a copy and the scans agree, and inserts into it; no copies with no partitions,
-  with one, nor in the REST chain; the recall over twin tables, spilling and not, as many of the
-  ten nearest at the defaults and more at a margin below zero, for each metric; and the
-  reloption's refusals.
+  VACUUM and REINDEX, every row with a vector has one primary and one copy, in another partition's
+  chain (each block placed by following the chains from the PART items' heads), naming the same
+  REFINE item; NULL rows and cosine zero vectors one item; no item of a deleted row left after
+  VACUUM, in either chain, and one REFINE item a row with a vector, by TID, before VACUUM and after
+  it, whose dead rows' items it removed; the comparisons with a sort above, which spill doubles -
+  each row once, past the table's rows, through a walk, and cut by `work_mem`; 1,200 rows of 30
+  distinct vectors in 12 partitions, so that every distance is a forty-way tie, at LIMITs that end
+  a tie and with no LIMIT; `spill = off` and a REINDEX, after which no row has a copy and the scans
+  agree, and inserts into it; no copies with no partitions, with one, nor in the REST chain; two
+  and five partitions, fewer than the nine SOAR ranks, at the build and at inserts; the recall over
+  twin tables, spilling and not, as many of the ten nearest at the defaults and more at a margin
+  below zero, for each metric; and the reloption's refusals.
 - **vector_filter.sql**: LionOrdered over each metric against the ordinary plan, with
   `pg_lion.vector_margin = 100` and the pause off, for eight filters (equality, range, AND, OR,
   `<>`, a correlated column, a boolean, no rows) and four LIMITs, over 10,000 rows in 50

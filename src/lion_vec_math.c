@@ -492,7 +492,7 @@ lionvec_candidates_n(const LionVecCentroids *c, const LionVecQuery *q, int m,
 		if (lo[j] <= thr)
 			cand[n++] = j;
 	}
-	Assert(n >= Min(c->k, m));
+	/* at least min(k, m) unless a bound came out with lo > hi (the header) */
 	return n;
 }
 

@@ -369,7 +369,9 @@ lionvec_refine_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 
 /*
  * A PART item, checked: its length, its centroid's (which always has a
- * vector), and its chain's ends.
+ * vector), its chain's ends, and its numbers - a length or a spread that is
+ * negative or not finite would make a bound whose lower end lies past its
+ * upper.
  */
 LionVecPart *
 lionvec_part_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
@@ -386,7 +388,11 @@ lionvec_part_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 						RelationGetRelationName(index), blk, off)));
 	part = (LionVecPart *) PageGetItem(page, iid);
 	if (part->cent.flags != 0 || !BlockNumberIsValid(part->head) ||
-		!BlockNumberIsValid(part->tail) || !BlockNumberIsValid(part->cent.rblk))
+		!BlockNumberIsValid(part->tail) || !BlockNumberIsValid(part->cent.rblk) ||
+		!(part->cent.norm >= 0.0f) || isinf(part->cent.norm) ||
+		isnan(part->cent.alpha1) || isinf(part->cent.alpha1) ||
+		!(part->maxnorm >= 0.0f) || isinf(part->maxnorm) ||
+		!(part->spread >= 0.0f) || isinf(part->spread))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has a malformed partition at (%u,%u)",
@@ -1124,14 +1130,19 @@ lionvec_build_nearest(LionVecBuildState *bs, const float *xc, float xnorm,
 		bs->ckey[c] = (double) bs->cnorm[j] * bs->cnorm[j] - 2.0 * est;
 	}
 	nr = lionvec_rank(bs->ckey, nc, m, bs->crank);
-	if (nr < 1)
-		elog(ERROR, "lionvec: no centroid near a row");
+
+	/*
+	 * The build's own centroids, every number finite, leave min(k, m)
+	 * candidates or more (lion_vec_math.h), so two or more when spilling,
+	 * which takes two partitions or more.
+	 */
+	if (nr < Min(bs->cents.k, m))
+		elog(ERROR, "lionvec: %d of %d centroids near a row, fewer than %d",
+			 nr, bs->cents.k, Min(bs->cents.k, m));
 	best = bs->cand[bs->crank[0]];
 	*dist2 = Max((double) xnorm * xnorm + bs->ckey[bs->crank[0]], 0.0);
 
-	/* two partitions or more give two candidates or more (lion_vec_math.h) */
-	Assert(!bs->spill || nr >= 2);
-	if (bs->spill && nr >= 2)
+	if (bs->spill)
 	{
 		int			s;
 		int			i;
@@ -1640,7 +1651,8 @@ typedef struct LionVecDest
 
 /*
  * Partition partno's centroid's REFINE item, at (rblk, roff), share-locked
- * in *buf, which the caller releases.  Its loss is corruption.
+ * in *buf, which the caller releases.  Its loss is corruption, as are an
+ * alpha8 or a length of its codes that is not a number.
  */
 static LionVecRefine *
 lionvec_cent_refine(Relation index, BlockNumber rblk, OffsetNumber roff,
@@ -1661,6 +1673,12 @@ lionvec_cent_refine(Relation index, BlockNumber rblk, OffsetNumber roff,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has lost partition %d's centroid",
 						RelationGetRelationName(index), partno)));
+	if (isnan(ref->alpha8) || isinf(ref->alpha8) ||
+		isnan(ref->rnorm8) || isinf(ref->rnorm8))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lionvec index \"%s\" has a malformed centroid of partition %d at (%u,%u)",
+						RelationGetRelationName(index), partno, rblk, roff)));
 	return ref;
 }
 
@@ -1670,8 +1688,9 @@ lionvec_cent_refine(Relation index, BlockNumber rblk, OffsetNumber roff,
  * chain and the candidates' REFINE items.  xc[dimsp] is the row centred.
  * In an index that spills, *dest2 gets the partition of the row's copy:
  * SOAR's choice, as the build makes it, but of centroids decoded from their
- * 8-bit codes (lionvec_decode8()), the build's floats being gone; otherwise
- * its partno is -1.
+ * 8-bit codes (lionvec_decode8()), the build's floats being gone - each
+ * REFINE item read once, its codes kept for that; otherwise its partno is
+ * -1.
  */
 static void
 lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
@@ -1696,6 +1715,9 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 	int		   *cand = palloc(sizeof(int) * k);
 	double	   *key = palloc(sizeof(double) * k);
 	int			rank[LIONVEC_SOAR_CANDS + 1];
+	uint8	   *ccodes = NULL;	/* spilling: [nc][dimsp], the candidates' codes */
+	float	   *calpha8 = NULL;
+	float	   *crnorm8 = NULL;
 	LionVecCentroids cents;
 	LionVecQuery q;
 	BlockNumber blk = meta->part_head;
@@ -1762,6 +1784,13 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 	q.planes = palloc(sizeof(uint64) * nw * LIONVEC_QBITS);
 	lionvec_query_init(&q, LIONVEC_L2, NULL, xc, LIONVEC_ASSIGN_EPS);
 	nc = lionvec_candidates_n(&cents, &q, m, lo, hi, cand);
+	if (spill)
+	{
+		/* each candidate's codes, for SOAR's decoding of the ranked ones */
+		ccodes = palloc(sizeof(uint8) * (Size) nc * dimsp);
+		calpha8 = palloc(sizeof(float) * nc);
+		crnorm8 = palloc(sizeof(float) * nc);
+	}
 	for (c = 0; c < nc; c++)
 	{
 		int			j = cand[c];
@@ -1773,12 +1802,28 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 
 		lionvec_estimate8(&q, ref->codes, norm[j], ref->alpha8, ref->rnorm8,
 						  &est, &err);
+		if (spill)
+		{
+			memcpy(ccodes + (Size) c * dimsp, ref->codes, dimsp);
+			calpha8[c] = ref->alpha8;
+			crnorm8[c] = ref->rnorm8;
+		}
 		UnlockReleaseBuffer(buf);
 		key[c] = (double) norm[j] * norm[j] - 2.0 * est;
 	}
 	nr = lionvec_rank(key, nc, m, rank);
-	if (nr < 1)
-		elog(ERROR, "lionvec: no centroid near a row");
+
+	/*
+	 * Centroids whose numbers lionvec_part_at() and lionvec_cent_refine()
+	 * have checked leave min(k, m) candidates or more (lion_vec_math.h), so
+	 * two or more in an index that spills, which has two partitions or more
+	 * (lionvec_check_meta())
+	 */
+	if (nr < Min(k, m))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lionvec index \"%s\" has malformed centroids: %d of %d near a row, fewer than %d",
+						RelationGetRelationName(index), nr, k, Min(k, m))));
 
 	best = cand[rank[0]];
 	dest->partno = best;
@@ -1791,8 +1836,7 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 	dest2->tail = InvalidBlockNumber;
 	dest2->pblk = InvalidBlockNumber;
 	dest2->poff = InvalidOffsetNumber;
-	Assert(!spill || nr >= 2);
-	if (spill && nr >= 2)
+	if (spill)
 	{
 		float	   *cf = palloc(sizeof(float) * (Size) nr * dimsp);
 		const float *cs[LIONVEC_SOAR_CANDS];
@@ -1801,14 +1845,10 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 
 		for (i = 0; i < nr; i++)
 		{
-			int			j = cand[rank[i]];
-			Buffer		buf;
-			LionVecRefine *ref = lionvec_cent_refine(index, rblk[j], roff[j], j,
-													 dimsp, &buf);
+			int			c8 = rank[i];
 
-			lionvec_decode8(ref->codes, dimsp, norm[j], ref->alpha8, ref->rnorm8,
-							cf + (Size) i * dimsp);
-			UnlockReleaseBuffer(buf);
+			lionvec_decode8(ccodes + (Size) c8 * dimsp, dimsp, norm[cand[c8]],
+							calpha8[c8], crnorm8[c8], cf + (Size) i * dimsp);
 			if (i > 0)
 				cs[i - 1] = cf + (Size) i * dimsp;
 		}

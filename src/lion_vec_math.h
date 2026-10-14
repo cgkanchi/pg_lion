@@ -175,7 +175,10 @@ extern int	lionvec_candidates(const LionVecCentroids *c, const LionVecQuery *q,
 /*
  * ... and the centroids that can be among the m nearest (1 <= m <=
  * LIONVEC_RANK_MAX), those whose lower bound is no more than the m-th least
- * upper bound: at least min(m, k) of them.  m = 1 is lionvec_candidates().
+ * upper bound: at least min(m, k) of them, as every centroid's lo <= hi, or
+ * its bound is none - which holds when each norm is a non-negative number,
+ * and which callers reading centroids from an index check rather than
+ * assume.  m = 1 is lionvec_candidates().
  */
 #define LIONVEC_RANK_MAX		16
 extern int	lionvec_candidates_n(const LionVecCentroids *c, const LionVecQuery *q,

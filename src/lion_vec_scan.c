@@ -1087,7 +1087,7 @@ lv_refine_part(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
  */
 
 static inline uint64
-lv_tidkey(ItemPointer tid)
+lv_tidkey(const ItemPointerData *tid)
 {
 	return ((uint64) ItemPointerGetBlockNumber(tid) << 16) |
 		ItemPointerGetOffsetNumber(tid);
@@ -1102,6 +1102,44 @@ lv_cap(const LvScanOpaque *so)
 	cap = (int) Min((double) work_mem * 1024.0 / sizeof(LvItem),
 					(double) (MaxAllocSize / sizeof(LvItem) / 2));
 	return Max(cap, 4 * so->batch + 64);
+}
+
+/*
+ * A row of an index that spills enters this pass (lv_probe()): its other
+ * item, met later in the pass, is skipped.
+ */
+static void
+lv_enter(LvScanOpaque *so, ItemPointer tid)
+{
+	bool		found;
+	LvSeen	   *s = lvseen_insert(so->seen, lv_tidkey(tid), &found);
+
+	if (!found)
+	{
+		s->level = LV_PLANE1;
+		s->lo = s->hi = s->dist = 0.0;
+	}
+	s->pass = so->pass;
+}
+
+/*
+ * A row that entered this pass leaves it unworked (lv_shrink(), lv_cut(),
+ * lv_probe()'s second look at tau, a REST): forget it, if all the hash
+ * knows of it is that it entered, so that the LV_PLANE1 entries are the
+ * row queue's rows and stay within its cap.  Its other item, if met later
+ * in the pass, is left out as this one was - tau and the cut only fall
+ * within a pass - and a REST's pass enters it afresh.
+ */
+static void
+lv_forget(LvScanOpaque *so, const LvItem *it)
+{
+	LvSeen	   *s;
+
+	if (!so->spill || it->level != LV_PLANE1)
+		return;
+	s = lvseen_lookup(so->seen, lv_tidkey(&it->tid));
+	if (s != NULL && s->level == LV_PLANE1)
+		lvseen_delete_item(so->seen, s);
 }
 
 /*
@@ -1131,6 +1169,8 @@ lv_cut(LvScanOpaque *so, int cap)
 		lv_sift_down(so->rows.items, n, 0);
 	}
 	cut = so->rows.items[0].key;
+	for (i = 0; i < n; i++)
+		lv_forget(so, &so->rows.items[i]);
 	memcpy(so->rows.items, sorted, sizeof(LvItem) * keep);
 	so->rows.n = keep;
 	pfree(sorted);
@@ -1154,7 +1194,10 @@ lv_shrink(LvScanOpaque *so, int cap, double *drop)
 		if (it->key <= so->tau && it->key <= so->cut)
 			so->rows.items[n++] = *it;
 		else
+		{
 			*drop = Min(*drop, it->key);
+			lv_forget(so, it);
+		}
 	}
 	so->rows.n = n;
 	if (n > cap / 2)
@@ -1167,24 +1210,6 @@ lv_shrink(LvScanOpaque *so, int cap, double *drop)
 	}
 	else
 		lv_heapify(&so->rows);
-}
-
-/*
- * A row of an index that spills enters this pass (lv_probe()): its other
- * item, met later in the pass, is skipped.
- */
-static void
-lv_enter(LvScanOpaque *so, ItemPointer tid)
-{
-	bool		found;
-	LvSeen	   *s = lvseen_insert(so->seen, lv_tidkey(tid), &found);
-
-	if (!found)
-	{
-		s->level = LV_PLANE1;
-		s->lo = s->hi = s->dist = 0.0;
-	}
-	s->pass = so->pass;
 }
 
 /*
@@ -1204,8 +1229,12 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head, bool copies)
 	int			cap = lv_cap(so);
 	double		drop = INFINITY;
 
-	/* (no chain holds a TID twice: rows this probe enters cannot recur in it) */
-	bool		anyseen = so->seen->members > 0;
+	/*
+	 * Nothing to look up in an empty hash - a chain holds a TID once - but
+	 * in an index that spills the probe's own entries count, and they catch
+	 * a TID a corrupted chain holds twice, too
+	 */
+	bool		anyseen = so->spill || so->seen->members > 0;
 	uint64		visited = 0;
 	BlockNumber blk = head;
 
@@ -1311,6 +1340,7 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head, bool copies)
 			if (lo > so->tau)
 			{
 				drop = Min(drop, lo);
+				lv_forget(so, &item);
 				continue;
 			}
 			item.key = lo;
@@ -1320,6 +1350,7 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head, bool copies)
 				if (lo >= so->cut)
 				{
 					drop = Min(drop, lo);
+					lv_forget(so, &item);
 					continue;
 				}
 			}
@@ -1386,6 +1417,19 @@ lv_rest(IndexScanDesc scan, LvScanOpaque *so)
 	so->pass++;
 	so->batch = (int) Min((double) so->batch * 4.0,
 						  Max((double) so->batch, (double) cap / 8.0));
+	for (i = 0; i < so->rows.n; i++)
+		lv_forget(so, &so->rows.items[i]);
+#ifdef USE_ASSERT_CHECKING
+	{
+		/* every row the pass entered was worked, or left and was forgotten */
+		lvseen_iterator iter;
+		LvSeen	   *s;
+
+		lvseen_start_iterate(so->seen, &iter);
+		while ((s = lvseen_iterate(so->seen, &iter)) != NULL)
+			Assert(s->level != LV_PLANE1);
+	}
+#endif
 	lv_reset_rows(so);
 	so->paused = false;
 	/* the first chain probed is the REST chain (lv_start()), the rest partitions */
