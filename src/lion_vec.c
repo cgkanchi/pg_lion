@@ -2244,9 +2244,22 @@ lionveccostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
 	get_tablespace_page_costs(index->reltablespace, &spc_random, &spc_seq);
 	*indexStartupCost = lionvec_startup_cost(index, index->tuples, &codepages);
-	/* and every further row: a refine and an exact distance, at worst */
+
+	/*
+	 * Every further batch of pg_lion.vector_batch rows costs as much again as
+	 * the first, and each row at worst a refine and an exact distance.  The
+	 * farther rows lie past more partitions: of 975,000 rows of 1536
+	 * dimensions in 1,974 partitions a scan probed 7.3% of the partitions for
+	 * 10 rows, 23% for 100 and 61% for 1,000 (DESIGN.md §44.7), which this
+	 * comes within a third of from 100 rows on.  The planner prices a LIMIT
+	 * under a Filter as LIMIT / selectivity rows of this, so a plain scan
+	 * that has to walk past the rows a selective filter rejects costs more
+	 * than LionOrdered, which reads the members alone; charged a refine and a
+	 * fetch alone, it tied LionOrdered at 1% and ran 7 times slower.
+	 */
 	*indexTotalCost = *indexStartupCost +
-		Max(index->tuples, 1.0) * (spc_random + cpu_index_tuple_cost);
+		Max(index->tuples, 1.0) * (*indexStartupCost / Max(lionvec_batch, 1) +
+								   spc_random + cpu_index_tuple_cost);
 	*indexPages = codepages;
 }
 
