@@ -20,8 +20,9 @@ bitmap. Many queries can then be answered by combining bitmaps instead of visiti
   ranking;
 - jsonb containment, key existence and jsonpath (`doc @> ...`, `doc ? ...`, `doc @@ ...`).
 
-`pg_lion_vector` adds `lionvec`, a nearest-neighbour index for pgvector's `vector` that stays small
-and filters by lion indexes exactly (see [Nearest neighbours](#nearest-neighbours)).
+`pg_lion_vector` adds `lionvec`, a nearest-neighbour index for pgvector's `vector` that reads a few
+percent of itself a query and fills its `LIMIT` under any lion filter (see
+[Nearest neighbours](#nearest-neighbours)).
 
 On a vacuumed table these counts never touch the heap, so they can be one or two orders of magnitude
 faster than a B-tree or GIN index. They show up in `EXPLAIN` as `Custom Scan (LionCount)`.
@@ -212,19 +213,22 @@ SELECT id FROM items ORDER BY embedding <=> $1 LIMIT 10;
 SELECT id FROM items WHERE category = 3 ORDER BY embedding <=> $1 LIMIT 10;
 ```
 
-`lionvec` keeps one bit per dimension of every row, rotated so that the error of a distance worked
-out from those bits is known, plus an 8-bit code read only when the bits can't decide. A query
-reads the bits of every row in one sequential pass (218 MB for 975,000 1536-dimension OpenAI
-embeddings, where pgvector's HNSW graph of the same rows is 3.8 GB), refines the few rows that
-might make the cut, and computes the last few distances exactly from the table. Rows come back in
-true distance order; a row is missed only when an error bound fails, which
-`pg_lion.vector_epsilon` makes rare. Under a `WHERE` that lion indexes answer, the scan reads only
-the pages that hold matching rows and scores only those rows, so a filter of any selectivity gets
-its ten nearest: on those 975,000 embeddings, 34 ms at 1% of the rows and 6.6 ms at 0.1%, where
-HNSW returns fewer than one row at 1%, or 95% of the right ones in 41 ms with iterative scans.
-Without a filter HNSW is much faster (6.6 ms against 96, at 90% recall). `vector_l2_ops` (`<->`, the
-default), `vector_ip_ops` (`<#>`) and `vector_cosine_ops` (`<=>`) are supported, up to 8128
-dimensions. See [BENCHMARKS.md](docs/BENCHMARKS.md#nearest-neighbours-lionvec-against-hnsw).
+`lionvec` partitions the rows by k-means when it builds, and keeps one bit per dimension of every
+row, rotated so that the error of a distance worked out from those bits is known, plus an 8-bit
+code read only when the bits can't decide. A query ranks the partitions by their centroids, reads
+the bits of the rows in the nearest few, refines the rows that might make the cut, and computes the
+last few distances exactly from the table. Like HNSW's, the answer is approximate: on 975,000
+1536-dimension OpenAI embeddings a query reads 7% of the rows (18 MB) and returns 97% of the true
+ten nearest in 8.5 ms, where pgvector's HNSW returns 95% in 6.6 ms; `pg_lion.vector_margin` trades
+one for the other. Under a `WHERE` that lion indexes answer, the scan scores only the matching rows,
+so a filter of any selectivity gets its ten nearest: 31 ms at 1% of the rows (98% recall), where
+HNSW returns fewer than one row, or 95% of the right ones in 36 ms with iterative scans, and a
+filter of up to 2,000 rows is answered exactly. The index is 1.7 GB to HNSW's 3.8 GB, and since a
+query reads only the partitions it needs, it holds up when memory is short: with PostgreSQL held
+to 1 GB, 17 ms and 94 pages read from disk a query, where HNSW took 52 ms and 766 pages (and 676 ms
+and 9,285 pages under the 1% filter, where lionvec read none). `vector_l2_ops` (`<->`, the default),
+`vector_ip_ops` (`<#>`) and `vector_cosine_ops` (`<=>`) are supported, up to 8128 dimensions. See
+[BENCHMARKS.md](docs/BENCHMARKS.md#nearest-neighbours-lionvec-against-hnsw).
 
 ## Supported types
 
@@ -248,7 +252,7 @@ columns and can be built in parallel on PostgreSQL 17 and later. `pg_lion_vector
   table that is not partitioned, and not in its joins.
 - `lionvec` relies on pgvector's distance functions being costed at 100 (the `ALTER FUNCTION`s
   under [Nearest neighbours](#nearest-neighbours)). At pgvector's own cost of 1, a filter that keeps
-  1% or 10% of a million rows is sorted by distance instead, two to four times slower. The setting is
+  1% or 10% of a million rows is sorted by distance instead, 3 to 17 times slower. The setting is
   not kept by `pg_dump`, and an `ALTER EXTENSION vector UPDATE` may reset it, so run them again
   after either.
 - If the column also has an HNSW index, the planner chooses HNSW for nearly every query, filtered
@@ -257,9 +261,12 @@ columns and can be built in parallel on PostgreSQL 17 and later. `pg_lion_vector
 - jsonb `<@` isn't indexed, and jsonpath (`@?`, `@@`) is always rechecked in the heap. Updating
   an indexed jsonb document writes one entry per path, so it costs more than with GIN's pending
   list.
-- `lionvec` answers only an `ORDER BY` of its distance, builds without parallel workers, and reuses
-  the space of deleted rows only slowly, so a table with heavy churn needs an occasional `REINDEX`.
-  Each row it returns is read from the table twice.
+- `lionvec` answers only an `ORDER BY` of its distance, approximately, as HNSW and IVFFlat do. It
+  builds without parallel workers, and slowly: k-means, then every row compared with every
+  partition's centroid, 19 minutes for 975,000 rows of 1536 dimensions, growing with the rows
+  times the partitions. It reuses the space of deleted rows only slowly and
+  keeps the partitions it was built with, so a table with heavy churn or drift needs an occasional
+  `REINDEX`. Each row it returns is read from the table twice.
 - On a hot standby, indexes using the default (generic) WAL mode recheck every row in counts.
   Preloading the library avoids this.
 - Loading the library changes estimates, and so plans, that have nothing to do with lion: a column

@@ -245,26 +245,35 @@ index access method for pgvector's `vector` type and three operator classes, one
     SELECT id FROM items ORDER BY embedding <=> $1 LIMIT 10;
     SELECT id FROM items WHERE category = 3 AND in_stock ORDER BY embedding <=> $1 LIMIT 10;
 
-The index keeps one bit a dimension of every row, rotated so that its error is known, in a run of
-pages a scan reads whole, and the rest of an 8-bit code beside it; a scan scores every row from the
-bits, refines only the rows their error bound cannot rule out, and computes the distances of the
-last few from the heap with pgvector's own operator. Rows come back in the order of their true
-distances, and the distances are pgvector's. A row is missed only when a bound of
-`pg_lion.vector_epsilon` standard deviations fails for a row that belongs in the answer; a row found
-too late is skipped, never returned out of order. NULL vectors come last with NULL distances, and
-in a cosine index zero vectors just before them, with NaN, as a sort puts them.
+The build partitions the rows by k-means and keeps one bit a dimension of every row, rotated so
+that its error is known, partition by partition, and the rest of an 8-bit code beside it. A scan
+reads the partitions whose centroids are nearest the query, nearest first; it scores their rows
+from the bits, refines only the rows their error bound cannot rule out, and computes the distances
+of the last few from the heap with pgvector's own operator. It stops once the next centroid, less
+`pg_lion.vector_margin`, lies farther than the rows it has, so it reads a few percent of the rows,
+and a row in a partition it did not read is missed: the answer is approximate, as HNSW's and
+IVFFlat's are (at the defaults, 97% of the true ten nearest over 975,000 OpenAI embeddings, where
+HNSW at `ef_search` 100 returns 95%; DESIGN.md §44.9). Rows come back in the order of their true
+distances, and the distances are pgvector's; a row found too late - in a partition read after
+farther rows were returned, or when a bound of `pg_lion.vector_epsilon` standard deviations
+fails - is skipped, never returned out of order. NULL vectors come last with NULL distances, and in
+a cosine index zero vectors just before them, with NaN, as a sort puts them.
+
+    CREATE INDEX ON items USING lionvec (embedding vector_cosine_ops) WITH (partitions = 4000);
+
+`partitions` (0 to 1,000,000) sets how many partitions the build makes; 0, the default, makes one
+for a table of fewer than 10,000 rows and twice the square root of the rows' count for a larger
+(2,000 for a million rows). More partitions make a scan score fewer rows and rank more
+centroids. The build runs k-means over a sample of as many rows as half of `maintenance_work_mem`
+holds (1.5 KB a 1536-dimension row, at most about a million rows), so a larger setting makes
+better partitions and a slower build; the setting takes effect at the next `REINDEX`.
 
 With a `WHERE` that lion indexes answer, `LionOrdered` builds lion's set of the matching rows and
-the scan reads and scores only those (`Custom Scan (LionOrdered)` with `Order By:` in `EXPLAIN`):
-the answer is the exact one at any selectivity, never a short `LIMIT`. A filter of most of the
-table is planned as the plain index scan with a `Filter`, and a very selective one as a sort of the
-lion bitmap scan's rows.
-
-The column's type modifier gives the dimensions, or the first vector indexed does for `vector`
-without one; at most 8128. One column, no INCLUDE, no `WHERE`-only scans (the index answers an
-`ORDER BY` distance and nothing else), forward only (a scrollable cursor materializes), no
-parallel scan or build. Partial and expression indexes work, as do UNLOGGED tables, `CREATE INDEX
-CONCURRENTLY` and `REINDEX`.
+the scan reads and scores only those (`Custom Scan (LionOrdered)` with `Order By:` in `EXPLAIN`),
+so a `LIMIT` is never left short. A set of up to 2,000 rows is answered exactly, from every
+member's distance; a larger one by reading partitions as above, with a margin that narrows the
+fewer rows the filter leaves. A filter of most of the table is planned as the plain index scan
+with a `Filter`, and a very selective one as a sort of the lion bitmap scan's rows.
 
 ## Reloptions
 
@@ -520,15 +529,23 @@ is a generic plan's parameter (priced at its dearest already). PostgreSQL's `ena
 switches above still force a plan either way.
 
 `pg_lion.vector_epsilon` (4, 1 to 10): how wide a `lionvec` scan's error bounds are, in
-standard deviations (DESIGN.md §44.8). A row is missed only when its bound fails and it belongs in
-the answer; at 4, none of 400 benchmark queries over 975,000 OpenAI embeddings missed one, where 3
-missed a row in one query of 100 under a 0.1% filter (DESIGN.md §44.9). A wider bound refines and
-fetches more rows.
+standard deviations (DESIGN.md §44.8). A row of the partitions a scan reads is missed only when its
+bound fails and it belongs in the answer; at 4, no bound failed in 900 benchmark queries over
+975,000 OpenAI embeddings, where 3 lost a row in one query of 100 under a 0.1% filter
+(DESIGN.md §44.9). A wider bound refines and fetches more rows.
 
-`pg_lion.vector_batch` (100, 1 to 100,000): how many rows a `lionvec` scan's first pass gathers
-candidates for. Each further pass reads every row's code again and gathers four times as many, so
-a query that wants many more rows than this (a large `LIMIT`, or none) makes several passes.
-`work_mem` bounds how many candidates a pass keeps (DESIGN.md §44.4).
+`pg_lion.vector_margin` (2, -10 to 1000): how much nearer than its centroid a `lionvec` scan
+takes a partition's rows to come, in standard deviations of the rows about their centroids along
+one dimension (DESIGN.md §44.4). A scan reads partitions until the next one's centroid, less this,
+lies farther than the rows it has: larger reads more partitions and misses fewer of the nearest
+rows, smaller the reverse (on 975,000 OpenAI embeddings, 1, 2 and 3 read 3.8%, 7.3% and 13% of
+the partitions and returned 94%, 97% and 98% of the true ten nearest in 5.3, 8.5 and 14 ms). A filter through lion narrows it by 1.3 for each tenfold
+it thins the rows by, as the nearest matching rows lie farther out (DESIGN.md §44.6).
+
+`pg_lion.vector_batch` (100, 1 to 100,000): how many rows a `lionvec` scan gathers candidates for
+from the partitions it reads. A query that wants more (a large `LIMIT`, or none) reads those
+partitions again, gathering four times as many each time. `work_mem` bounds how many candidates a
+scan keeps (DESIGN.md §44.4).
 
 `pg_lion.ordered_switch_ratio` (32, 1 to 1,000,000): how many B-tree entries `LionOrdered` walks per
 member it has not met yet before it stops walking, fetches the members left in TID order and sorts
@@ -589,23 +606,25 @@ snapshot's (DESIGN.md §9).  Inserts and VACUUM work as usual.
 A `lionvec` index (DESIGN.md §44) answers only an `ORDER BY` of its own distance operator, forward.
 It has no search operators, no bitmap or index-only scans, no INCLUDE columns and no parallel scan
 or build, and indexes a single column of pgvector's `vector` (not `halfvec`, `sparsevec` or `bit`)
-of at most 8128 dimensions. Its results can miss a row only with the probability
-`pg_lion.vector_epsilon` sets. Inserts serialize on the index's meta page. VACUUM removes dead rows'
-codes but reuses their space only for new rows on the last page, so a table with heavy churn grows
-its index until `REINDEX`, which also recomputes the mean the codes are centred on (a mean that has
-drifted makes scans read more, never answer wrong). Each returned row is fetched from the heap
-twice, once for its distance and once by the executor. A small `work_mem` with a large `LIMIT`
-makes a scan read every code several times (`SET client_min_messages = debug1` shows the passes).
+of at most 8128 dimensions. Its results are approximate (`pg_lion.vector_margin`), except under a
+lion filter of up to 2,000 rows. Inserts serialize on the index's meta page and read every
+partition's centroid. VACUUM removes dead rows' codes but reuses their space only for new rows on
+a chain's last page, so a table with heavy churn grows its index until `REINDEX`, which also
+recomputes the partitions and the mean the codes are centred on (rows that have drifted from them
+make scans read more or miss more, never answer out of order). Building a large index runs k-means
+over every sampled row and every partition, and then compares every row with every partition's
+centroid, so it takes minutes for a million rows and grows with the rows times the partitions.
+Each returned row is fetched from the heap twice, once for its distance and once by the executor.
+A small `work_mem` with a large `LIMIT` makes a scan read its partitions several times (`SET
+client_min_messages = debug1` shows the passes).
 pgvector prices its distance functions as nearly free (`COST 1`) and its vectors are stored out of
 line, so under a filter that keeps a large share of the rows (1% or 10% of a million) the planner
-sorts them by distance where the `lionvec` scan is two to four times faster. `lionvec` assumes the three functions its
+sorts them by distance where the `lionvec` scan is 3 to 17 times faster. `lionvec` assumes the three functions its
 operator classes use cost 100 (`ALTER FUNCTION l2_distance(vector, vector) COST 100`, and the
 same for `vector_negative_inner_product(vector, vector)` and `cosine_distance(vector, vector)`),
 which `pg_dump` does not keep and an `ALTER EXTENSION vector UPDATE` may reset; `SET enable_sort =
 off` steers a single query the same way. An HNSW index on the same column is chosen over
 `lionvec` for nearly every query, filtered or not, since pgvector prices its scan as nearly free.
-An index built while rows were not handed over in heap order has no page directory, and its
-filtered scans read every page (`REINDEX` writes one).
 
 With Citus, list `citus` before `pg_lion` in `shared_preload_libraries`: Citus installs
 `set_rel_pathlist_hook` and `set_join_pathlist_hook` without chaining the previous hook, so loaded
