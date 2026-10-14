@@ -6,14 +6,14 @@
    "SET pg_lion.vector_epsilon = 4"
   ],
   "cache_dropped": true,
-  "median_ms": 377.53962199894886,
-  "max_ms": 436.6022960002738,
+  "median_ms": 401.78966500025126,
+  "max_ms": 433.735897000588,
   "all_ms": [
-   383.8,
-   436.6,
-   377.5,
-   335.5,
-   340.8
+   433.7,
+   402.0,
+   401.8,
+   394.8,
+   339.6
   ]
  },
  {
@@ -23,14 +23,14 @@
    "SET hnsw.ef_search = 40"
   ],
   "cache_dropped": true,
-  "median_ms": 103.01883200008888,
-  "max_ms": 110.21026500020525,
+  "median_ms": 101.08645299987984,
+  "max_ms": 123.04733600103646,
   "all_ms": [
-   55.3,
-   110.2,
-   99.7,
-   103.0,
-   105.5
+   67.3,
+   123.0,
+   120.8,
+   101.1,
+   89.0
   ]
  },
  {
@@ -40,32 +40,14 @@
    "SET pg_lion.vector_epsilon = 4"
   ],
   "cache_dropped": true,
-  "median_ms": 1209.085425000012,
-  "max_ms": 1285.9336789988447,
+  "median_ms": 196.26125899958424,
+  "max_ms": 205.28852900133643,
   "all_ms": [
-   1203.3,
-   1261.9,
-   1285.9,
-   1209.1,
-   1136.7
-  ]
- },
- {
-  "name": "lionvec eps=4 sort off",
-  "sql": "SELECT id FROM items WHERE u < 0.01 ORDER BY embedding <=> %",
-  "settings": [
-   "SET pg_lion.vector_epsilon = 4",
-   "SET enable_sort = off"
-  ],
-  "cache_dropped": true,
-  "median_ms": 199.00453400077822,
-  "max_ms": 214.11973699832743,
-  "all_ms": [
-   213.0,
-   199.0,
-   214.1,
-   183.7,
-   197.2
+   173.2,
+   196.3,
+   197.7,
+   205.3,
+   175.2
   ]
  },
  {
@@ -76,14 +58,14 @@
    "SET hnsw.iterative_scan = relaxed_order"
   ],
   "cache_dropped": true,
-  "median_ms": 1207.886475000123,
-  "max_ms": 1513.6736309996195,
+  "median_ms": 1306.5387890001148,
+  "max_ms": 1763.8377539988142,
   "all_ms": [
-   920.3,
-   1212.2,
-   1513.7,
-   1207.9,
-   973.9
+   924.9,
+   1306.5,
+   1763.8,
+   1408.0,
+   1135.9
   ]
  },
  {
@@ -93,32 +75,14 @@
    "SET pg_lion.vector_epsilon = 4"
   ],
   "cache_dropped": true,
-  "median_ms": 102.19250200134411,
-  "max_ms": 122.70897000053083,
+  "median_ms": 112.06798100101878,
+  "max_ms": 148.60386600048514,
   "all_ms": [
-   122.7,
-   93.9,
-   102.2,
-   105.8,
-   101.4
-  ]
- },
- {
-  "name": "lionvec eps=4 sort off",
-  "sql": "SELECT id FROM items WHERE u < 0.001 ORDER BY embedding <=> ",
-  "settings": [
-   "SET pg_lion.vector_epsilon = 4",
-   "SET enable_sort = off"
-  ],
-  "cache_dropped": true,
-  "median_ms": 99.89096500066807,
-  "max_ms": 109.78193200025999,
-  "all_ms": [
-   96.0,
-   109.8,
-   106.9,
-   99.9,
-   86.5
+   135.5,
+   99.2,
+   148.6,
+   108.5,
+   112.1
   ]
  },
  {
@@ -129,14 +93,14 @@
    "SET hnsw.iterative_scan = relaxed_order"
   ],
   "cache_dropped": true,
-  "median_ms": 203.03252499979862,
-  "max_ms": 218.56883200052835,
+  "median_ms": 226.68157200132555,
+  "max_ms": 239.38704399915878,
   "all_ms": [
-   192.4,
-   218.6,
-   190.6,
-   210.9,
-   203.0
+   239.4,
+   208.0,
+   226.8,
+   226.7,
+   225.2
   ]
  }
 ]

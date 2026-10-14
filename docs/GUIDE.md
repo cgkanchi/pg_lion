@@ -374,6 +374,12 @@ default), `vector_ip_ops` (`<#>`) or `vector_cosine_ops` (`<=>`), and that a Lio
 
 ```sql
 CREATE EXTENSION pg_lion_vector;
+-- once per database: pgvector's own cost of 1 makes the planner sort a filter's
+-- rows by distance where the lionvec scan is faster
+ALTER FUNCTION l2_distance(vector, vector) COST 100;
+ALTER FUNCTION vector_negative_inner_product(vector, vector) COST 100;
+ALTER FUNCTION cosine_distance(vector, vector) COST 100;
+
 CREATE INDEX items_emb ON items USING lionvec (embedding vector_cosine_ops);
 CREATE INDEX items_cat ON items USING lion (category);
 
@@ -400,9 +406,13 @@ pages that hold a member and scores only the members, so the `LIMIT` is filled f
 rows whatever their share of the table; `Heap Fetches` in `EXPLAIN ANALYZE` counts the rows the node
 fetched, about `k`. Where nearly every row passes the filter the planner prefers the plain index
 scan with a `Filter`, and for a filter of a few hundred rows a sort of the Lion bitmap scan's rows.
-Between the two it can also choose that sort where the node is faster, because pgvector prices its
-distance functions as nearly free: `SET enable_sort = off` for the query, or a higher `COST` on the
-distance function, steers it back. `pg_lion.enable_ordered_scan = off` takes the node away.
+Between the two it chooses that sort too, where the node is two to four times faster, unless the
+distance functions cost 100 as above (pgvector's vectors are stored out of line, so the planner
+sees a small column and, at a cost of 1, a nearly free function; `pg_dump` does not keep the
+`ALTER FUNCTION`s, so run them again after a restore). `SET enable_sort = off` steers a single
+query the same way. `pg_lion.enable_ordered_scan = off` takes the node away. An HNSW index on the
+same column is chosen over `lionvec` for nearly every query, filtered or not: pgvector prices its
+scan as nearly free.
 
 What a scan did is in its `DEBUG1` line (`SET client_min_messages = debug1`). On 975,000 OpenAI
 embeddings, without a filter and then under one keeping 0.1% of the rows:
