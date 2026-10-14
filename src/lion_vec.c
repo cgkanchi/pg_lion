@@ -769,7 +769,7 @@ lionvec_build_put_refine(LionVecBuildState *bs, LionVecRefine *ref, Size size,
 		bs->refine_tail = BufferGetBlockNumber(bs->rbuf);
 	}
 	page = BufferGetPage(bs->rbuf);
-	*off = PageAddItem(page, (Item) ref, size, InvalidOffsetNumber, false, false);
+	*off = PageAddItemExtended(page, (char *) ref, size, InvalidOffsetNumber, 0);
 	if (*off == InvalidOffsetNumber)
 		elog(ERROR, "lionvec: could not add a refine item of %zu bytes", size);
 	*blk = bs->refine_tail;
@@ -919,8 +919,8 @@ lionvec_build_write_codes(LionVecBuildState *bs, LionVecMeta meta,
 				dir[ndir - 1].hi = Max(dir[ndir - 1].hi, key);
 			}
 		}
-		if (PageAddItem(page, (Item) item, len, InvalidOffsetNumber, false,
-						false) == InvalidOffsetNumber)
+		if (PageAddItemExtended(page, item, len, InvalidOffsetNumber, 0) ==
+			InvalidOffsetNumber)
 			elog(ERROR, "lionvec: could not add an item of %u bytes", len);
 		lionvec_note_key(page, &((LionVecCode *) item)->tid);
 	}
@@ -1230,8 +1230,8 @@ lionvec_append(Relation index, LionVecItems *it, int dimsp)
 										 rnew ? GENERIC_XLOG_FULL_IMAGE : 0);
 		if (rnew)
 			lionvec_init_page(page, LIONVEC_PAGE_REFINE);
-		off = PageAddItem(page, (Item) it->ref, rsize, InvalidOffsetNumber,
-						  false, false);
+		off = PageAddItemExtended(page, (char *) it->ref, rsize,
+								  InvalidOffsetNumber, 0);
 		if (off == InvalidOffsetNumber)
 			elog(ERROR, "lionvec: could not add a refine item of %zu bytes", rsize);
 		it->code->rblk = BufferGetBlockNumber(rbuf);
@@ -1248,8 +1248,8 @@ lionvec_append(Relation index, LionVecItems *it, int dimsp)
 		lionvec_init_page(page, LIONVEC_PAGE_CODE);
 		meta.code_tail = BufferGetBlockNumber(nbuf);
 	}
-	if (PageAddItem(page, (Item) it->code, it->codesize, InvalidOffsetNumber,
-					false, false) == InvalidOffsetNumber)
+	if (PageAddItemExtended(page, (char *) it->code, it->codesize,
+							InvalidOffsetNumber, 0) == InvalidOffsetNumber)
 		elog(ERROR, "lionvec: could not add an item of %zu bytes", it->codesize);
 	lionvec_note_key(page, &it->code->tid);
 
