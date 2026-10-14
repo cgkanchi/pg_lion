@@ -20963,6 +20963,25 @@ for each partition probed, a number that grows as C^(2/3); under 1% a sort of th
 ms) and LionOrdered's exact path (5.6 ms) alike. HNSW's iterative scan took 10.7 ms at 3% (0.953)
 and 26.7 ms at 1% (0.959); the planner sorted for it there too.
 
+**Both** (`lionvec-p0-spill.json`: the defaults since, 2,715 partitions spilling, format 3, a
+patience of 30 in the rows of `2 sqrt(n)` partitions; 356 s, 247 MB). At a margin of 3 the scan
+returned 0.917 of the ten nearest from 35 partitions and 114 CODE pages in 1.6 ms, where the old
+default gave 0.843 from 15 and 88 in 1.1 ms; 0.976 at 6 (111 partitions, 351 pages, 3.2 ms), 0.986
+at 8 and 0.993 at 12 and 16, the finer partitions' ceiling. Along the margins, 0.95 took 203 CODE
+pages, 63 partitions and 2.2 ms against the old default's 358, 65 and 2.4 and the finer partitions
+alone's 310, 177 and 2.7; 0.98 464 pages, 148 partitions and 4.1 ms against 578, 106 and 3.2 and
+566, 327 and 4.1. So the two together read 1.8 times fewer pages at 0.95 and 1.25 times fewer at
+0.98 than the old default (about 7,100 and 16,200 items walked against 11,000 and 18,000 rows), in
+the same time at 0.95 and 1.3 times longer at 0.98: the ranking of four times the centroids is a
+fixed cost each query, and a partition's 84 items span 2.6 pages. The numpy model's 2.7 and 2.5
+times fewer rows counted rows, not pages, and no copies. Under the filters, at 0.95 and 0.98, the
+plain scan at 10% read 455 and 791 pages (7.0 and 8.9 ms) against 589 and none reached (0.969) in
+678 partitions; LionOrdered at 3% 671 and 1,155 (6.0 and 8.3 ms) against 771 and 1,210 (5.6 and
+7.1). The planner's plans are the finer partitions' (above): the plain scan with a `Filter` at 10%
+(0.948 at a margin of 3), a sort of the lion bitmap scan's rows at 3% (exact, 15 to 21 ms, where
+LionOrdered took 7.2 ms for 0.967) and at 1%. HNSW: 0.951 in 1.9 ms at `ef_search` 40, 0.979 in
+4.1 ms at 100.
+
 The share probed at a margin of 3, in 678 and 2,715 partitions: 2.2% and 1.4% unfiltered (§44.7's
 `0.46 C^(-1/3)`: 5.2% and 3.3%), 8.1% and 4.8% through the plain scan at 10% (9.7% and 6.1%), 14.9%
 and 10.3% through LionOrdered at 3% (13.5% and 8.5%). Between the sizes it fell by 1.4 to 1.7
