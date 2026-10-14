@@ -249,19 +249,32 @@ SELECT vf_ord('SELECT id, v <-> vf_vec(7, 64) AS d FROM vfb WHERE s < 10
 			   ORDER BY v <-> vf_vec(7, 64) LIMIT 10');
 SELECT vf_ord('SELECT id, v <-> (SELECT NULL::vector) AS d FROM vfb WHERE s < 10
 			   ORDER BY v <-> (SELECT NULL::vector)');
-BEGIN;
-SET LOCAL enable_seqscan = off;
-SET LOCAL enable_bitmapscan = off;
-SET LOCAL enable_indexscan = off;
-SELECT pg_stat_get_xact_blocks_fetched('vfb_l2'::regclass) AS b0 \gset
+-- (pg_statio_user_indexes, flushed on demand, as in indexscan.sql: the
+-- transaction's own counts are not kept on every version)
+CREATE FUNCTION vfb_blks() RETURNS bigint LANGUAGE sql AS
+$$ SELECT idx_blks_hit + idx_blks_read FROM pg_statio_user_indexes
+	WHERE indexrelname = 'vfb_l2' $$;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+SELECT vfb_blks() AS b0 \gset
 SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 10
 					   ORDER BY v <-> (SELECT NULL::vector)) s;
-SELECT pg_stat_get_xact_blocks_fetched('vfb_l2'::regclass) AS b1 \gset
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+SELECT vfb_blks() AS b1 \gset
 SELECT count(*) FROM (SELECT id FROM vfb WHERE s >= 0
 					   ORDER BY v <-> (SELECT NULL::vector)) s;
-SELECT pg_stat_get_xact_blocks_fetched('vfb_l2'::regclass) AS b2 \gset
-COMMIT;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+SELECT vfb_blks() AS b2 \gset
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
 SELECT :b1 - :b0 > 0 AS "read some", 4 * (:b1 - :b0) < :b2 - :b1 AS "read few";
+DROP FUNCTION vfb_blks();
 
 -- inserts after the builds, then deletes and VACUUM
 INSERT INTO vf
