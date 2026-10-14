@@ -161,12 +161,16 @@ lion_vec_init(void)
 							 NULL, NULL, NULL);
 
 	DefineCustomIntVariable("pg_lion.vector_patience",
-							"How many partitions' worth of rows a lionvec scan scores without finding a "
-							"nearer one before it stops probing.",
-							"A scan that has scored this many partitions' worth of rows (of the members, "
-							"under a lion filter) since one last entered its pg_lion.vector_batch nearest "
-							"stops probing partitions until it has returned the rows it holds.  Smaller "
-							"stops sooner and misses more of the nearest rows; 0 never stops.",
+							"How many units of rows a lionvec scan scores without finding a nearer one "
+							"before it stops probing.",
+							"A unit is the rows an average partition would hold were there 2 sqrt(n) of "
+							"them, n the rows the index was built with: sqrt(n) / 2 rows, or that share "
+							"of the members under a lion filter, whatever the partitions' number, and "
+							"twice that in an index that spills, whose probes see each row twice.  A scan "
+							"that has scored this many units since one last entered its "
+							"pg_lion.vector_batch nearest stops probing partitions until it has returned "
+							"the rows it holds.  Smaller stops sooner and misses more of the nearest rows; "
+							"0 never stops.",
 							&lionvec_patience,
 							LIONVEC_PATIENCE_DEFAULT, 0, 1000000,
 							PGC_USERSET,
@@ -734,6 +738,18 @@ lionvec_note_key(Page page, ItemPointer tid)
 #define LIONVEC_MIN_AUTO_ROWS	10000
 
 /*
+ * The partitions the build chooses by itself, per square root of the rows:
+ * 8 sqrt(n), 8,000 for a million rows, where it was 2 sqrt(n).  Partitions
+ * a quarter the size read 1.55 to 1.78 times fewer rows for the same recall
+ * in the numpy model of DBpedia's text-embedding-3-large rows, and 1.5
+ * times fewer CODE pages for 0.95 of the true ten on an index of 115,186 of
+ * them - no faster there, where ranking four times the centroids costs what
+ * the pages save (DESIGN.md §44.3, §44.9).  The build's time grows with
+ * the partitions.
+ */
+#define LIONVEC_PARTS_PER_ROOT	8.0
+
+/*
  * The CODE items go through a sort by partition, then heap order: a key of
  * the group (a partition, then the rows in no partition, then the NULL rows
  * and zeros) above the row's place in the heap scan.  A row's copy goes in
@@ -912,10 +928,10 @@ lionvec_build_mean_callback(Relation index, ItemPointer tid, Datum *values,
 /*
  * How many partitions the build makes of nrows rows with a vector, sampled
  * sampled: as the index's `partitions` option asks, or else one for a table
- * of fewer than LIONVEC_MIN_AUTO_ROWS of them and twice their square root
- * for a larger (2,000 for a million rows), no more than the sample has
- * LIONVEC_SAMPLE_PER_PART rows for.  Never more than the sample's rows, and
- * none without one.
+ * of fewer than LIONVEC_MIN_AUTO_ROWS of them and LIONVEC_PARTS_PER_ROOT
+ * times their square root for a larger (8,000 for a million rows), no more
+ * than the sample has LIONVEC_SAMPLE_PER_PART rows for.  Never more than the
+ * sample's rows, and none without one.
  */
 static int
 lionvec_partitions(Relation index, double nrows, int sampled)
@@ -930,7 +946,7 @@ lionvec_partitions(Relation index, double nrows, int sampled)
 	else if (nrows < LIONVEC_MIN_AUTO_ROWS)
 		want = 1.0;
 	else
-		want = Min(2.0 * sqrt(nrows),
+		want = Min(LIONVEC_PARTS_PER_ROOT * sqrt(nrows),
 				   Max(1.0, floor((double) sampled / LIONVEC_SAMPLE_PER_PART)));
 	want = Min(want, (double) sampled);
 	return (int) Max(1.0, Min(want, (double) LIONVEC_MAX_PARTS));
