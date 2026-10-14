@@ -728,7 +728,7 @@ lv_exact(IndexScanDesc scan, LvScanOpaque *so)
 			if ((code >> LION_OFFSET_BITS) > MaxBlockNumber)
 				break;
 			lion_code_to_tid(code, &tid);
-			if (!OffsetNumberIsValid(ItemPointerGetOffsetNumber(&tid)))
+			if (!OffsetNumberIsValid(ItemPointerGetOffsetNumberNoCheck(&tid)))
 				continue;
 			if (!lv_fetch_distance(scan, so, &tid, &dist))
 				continue;
@@ -1032,12 +1032,12 @@ lv_refine_part(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has lost partition %u's centroid",
 						RelationGetRelationName(index),
-						ItemPointerGetBlockNumber(&item->tid))));
+						LionVecCentPartno(&item->tid))));
 	lionvec_estimate8(&so->q, ref->codes, item->norm, ref->alpha8,
 					  ref->rnorm8, &est, &err);
 	UnlockReleaseBuffer(buf);
 	lionvec_key_bounds(so->metric, item->norm, item->xm, est, err, &lo, &hi);
-	item->key = lv_part_key(so, lo, ItemPointerGetBlockNumber(&item->tid));
+	item->key = lv_part_key(so, lo, LionVecCentPartno(&item->tid));
 	item->level = LV_CENT8;
 	lv_heap_push(&so->parts, item);
 }
@@ -1257,7 +1257,7 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head)
 static void
 lv_probe_part(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 {
-	BlockNumber partno = ItemPointerGetBlockNumber(&item->tid);
+	BlockNumber partno = LionVecCentPartno(&item->tid);
 
 	Assert(partno < so->meta.nparts);
 	so->probed[so->nprobed++] = so->phead[partno];
