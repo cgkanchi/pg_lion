@@ -45,11 +45,12 @@
 # KNN_SHARDS (default /mnt/project-files/train-0000[0-2]-of-00026.parquet),
 # KNN_SRC (default this checkout: the one the installed pg_lion was built
 # from, whose commit the results record),
-# KNN_MARGINS (default 2,3,4,6,8,12,16) and KNN_PATIENCE (default 30,120):
-# the pg_lion.vector_margin and pg_lion.vector_patience values warm runs.  The
+# KNN_MARGINS (default 2,3,4,6,8,12,16) and KNN_PATIENCE (default 30): the
+# pg_lion.vector_margin and pg_lion.vector_patience values warm runs.  The
 # margins go past the default 3 because on these embeddings 3 returns 0.84 of
-# the true ten, and 0.95 takes about 7; the patiences because 30 counts
-# partitions' worth of rows, a quarter as many in four times the partitions.
+# the true ten, and 0.95 takes about 7.  The first runs took patiences 30 and
+# 120 as well, from when the patience counted partitions' worth of rows, a
+# quarter as many in four times the partitions; it counts sqrt(n) / 2 now.
 import glob, hashlib, json, os, platform, re, subprocess, sys, time
 import numpy as np
 import pyarrow.parquet as pq
@@ -70,7 +71,7 @@ COL = 'text-embedding-3-large-1536-embedding'
 DIM = 1536
 SELS = (1.0, 0.1, 0.03, 0.01)
 MARGINS = [float(x) if '.' in x else int(x) for x in os.environ.get('KNN_MARGINS', '2,3,4,6,8,12,16').split(',')]
-PATIENCE = [int(x) for x in os.environ.get('KNN_PATIENCE', '30,120').split(',')]
+PATIENCE = [int(x) for x in os.environ.get('KNN_PATIENCE', '30').split(',')]
 
 lit = lambda q: '[' + ','.join('%.9g' % x for x in q) + ']'
 HNSW = ("SELECT id FROM dbpedia {w} ORDER BY embedding::halfvec(1536) <=> %(q)s::halfvec(1536) "

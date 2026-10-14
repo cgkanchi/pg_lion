@@ -20356,15 +20356,16 @@ probed had a median of 74, a mean of 143 and a maximum of 1,430 of the 1,974 (§
 ten nearest lie far from every centroid finds many centroids within its tenth row's key less the
 margin, and probes them all, though few hold a row nearer than those it has. So the scan counts the
 rows it scores since one last entered the L least upper bounds, and once those L are in hand and
-the count reaches `pg_lion.vector_patience` (30) partitions' worth of rows - the rows a partition
-holds on average, or under a restriction the members - it PAUSES (`lv_probe_part()`): it takes the
-L as found and probes no partition until it has returned L rows or the next row lies past tau. A
-REST, which starts a batch of four times the rows, ends a pause too. Paused, the scan still
-returns rows in order; a row nearer than those a pause returned, in a partition not probed yet, is
-skipped when it is found, as one the margin leaves till too late is. The pause trades those rows
-against the tail: in the numpy model (vtoy's `patience.py`), at 975,000 rows in 1,950 partitions, a
-patience of 20 partitions reached 0.98 recall reading a mean of 28,000 rows a query (95th
-percentile 75,000), where the margin alone needed 57,000 (227,000).
+the count reaches `pg_lion.vector_patience` (30) units - a unit the rows an average partition would
+hold were there `2 sqrt(n)` of them, n the rows of the build (the meta page's count): `sqrt(n) / 2`
+rows, or under a restriction that share of the members (`lv_patience_unit()`) - it PAUSES
+(`lv_probe_part()`): it takes the L as found and probes no partition until it has returned L rows or
+the next row lies past tau. A REST, which starts a batch of four times the rows, ends a pause too.
+Paused, the scan still returns rows in order; a row nearer than those a pause returned, in a
+partition not probed yet, is skipped when it is found, as one the margin leaves till too late is.
+The pause trades those rows against the tail: in the numpy model (vtoy's `patience.py`), at 975,000
+rows in 1,950 partitions, a patience of 20 partitions reached 0.98 recall reading a mean of 28,000
+rows a query (95th percentile 75,000), where the margin alone needed 57,000 (227,000).
 
 How a pause ends was found by its failures. Ended when the row queue was empty, it returned every
 row the probes had kept below tau, and tau, the L-th least UPPER bound, lies past many more than L
@@ -20374,6 +20375,16 @@ next row lay past tau, it filled the LIMIT but still returned rows far past the 
 LIMIT 1000 on the benchmark got 0.955 of its true rows; ended after L rows too, 0.983, against
 0.980 for a LIMIT 10. Counting a restricted scan's patience in members rather than rows lets a
 filter pause as an unfiltered scan does; counted in rows, a 1% filter never paused.
+
+The unit was the average partition's own rows, the rows or members over the partitions, until
+the default went from `2 sqrt(n)` partitions to `8 sqrt(n)` (§44.3). Then a patience of 30 paused
+after a quarter of the rows, and on DBpedia held the unfiltered recall to 0.966 at any margin in
+2,715 partitions, where 678 reached 0.988 (§44.9). Counted in the rows of `2 sqrt(n)` partitions,
+whatever their number, the pause is where it was at the old default, and the `partitions`
+reloption no longer moves it: 30 in 2,715 partitions now pauses where 120 did. The unit takes n
+from the meta page's rows as of the build rather than from the partitions, and is at least one
+row. The spill branch's format 3, in which each row is in two partitions and the probes count
+items, doubles the unit for the copies.
 
 **Inner product** takes one more step. An L2 row nearer the query than its centroid by its
 offset's projection is so only by that projection less `|x - c|^2 / 2` (`|q - x|^2 = |q - c|^2 -
@@ -20569,18 +20580,21 @@ no ORDER BY costs infinity. Selectivity 1, correlation 0.
   once rows nearer than its centroid by that much are in hand. A filter no longer narrows it
   (§44.6). The default was 2 until the pause; with the pause, 3 took the benchmark's recall from
   0.964 to 0.979 for 1.3 ms (§44.9).
-- `pg_lion.vector_patience` (int, 0 to 1,000,000, default 30): how many partitions' worth of rows
-  (of members, under a lion filter) a scan scores without one entering its L nearest before it
-  pauses (§44.4); 0 never pauses, and then a filter's scan probes far more than the costs assume
-  (§44.7). Smaller pauses sooner, probing fewer partitions and missing more rows. 30 is where the
-  benchmark's tail ended: at a margin of 3, 30 and 40 gave the same recall (0.979), 40 a 95th
-  percentile a third longer.
+- `pg_lion.vector_patience` (int, 0 to 1,000,000, default 30): how many units of rows a scan
+  scores without one entering its L nearest before it pauses (§44.4), a unit `sqrt(n) / 2` rows,
+  n the build's, the rows an average partition would hold in `2 sqrt(n)` partitions - under a
+  lion filter that share of the members - whatever the partitions' number; 0 never pauses, and
+  then a filter's scan probes far more than the costs assume (§44.7). Smaller pauses sooner,
+  probing fewer partitions and missing more rows. 30 is where the 975,000-row benchmark's tail
+  ended, in its `2 sqrt(n)` partitions, where a unit is a partition's rows: at a margin of 3, 30
+  and 40 gave the same recall (0.979), 40 a 95th percentile a third longer.
 - `partitions` (reloption, 0 to 1,000,000, default 0): the partitions the build makes; 0 chooses
   by the rows' count, `8 sqrt(n)` above 10,000 rows as `maintenance_work_mem`'s sample allows
   (§44.3; `2 sqrt(n)` until DBpedia, §44.9). Read by the build alone, so a change takes a REINDEX.
-  `pg_lion.vector_patience` counts partitions' worth of rows, so finer partitions pause after fewer
-  rows: on DBpedia a patience of 30 in 2,715 partitions held the unfiltered recall to 0.966 at any
-  margin, where 120, the rows of 30 in 678 partitions, reached 0.993.
+  It does not move the pause: `pg_lion.vector_patience` counts the rows of `2 sqrt(n)` partitions,
+  not of these (§44.4). When it counted these, on DBpedia a patience of 30 in 2,715 partitions held
+  the unfiltered recall to 0.966 at any margin, where 120, the rows of 30 in 678 partitions,
+  reached 0.993.
 - `pg_lion.vector_epsilon` (real, 1 to 10, default 4): the bounds' width in standard deviations.
   Each plane-1 bound fails with the Gaussian's two-sided probability, 0.27% at 3, 0.006% at 4; a
   failure matters only for a row that belongs in the answer and is found too late, so the rate of

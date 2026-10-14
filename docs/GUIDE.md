@@ -404,12 +404,12 @@ The second plan reads
 Both answers are approximate, as HNSW's are: the index partitions the rows by k-means when it is
 built, and a scan reads the partitions whose centroids are nearest the query, nearest first, until
 the next centroid, less `pg_lion.vector_margin`, lies farther than the rows it has, or until
-`pg_lion.vector_patience` partitions' worth of rows have brought nothing nearer. A row in a
-partition it did not read is missed. On 975,000 OpenAI embeddings the defaults return 98% of the
-true ten nearest, reading 4% of the rows; `SET pg_lion.vector_margin = 2` returns 96% in five
-sixths of the time, and `SET pg_lion.vector_patience = 0`, which reads on to the margin however
-long nothing nearer turns up, 98.4% in 1.8 times the time and a 95th percentile four times as
-long. The recall a margin gives is the data's: on 115,186 of DBpedia's text-embedding-3-large
+`pg_lion.vector_patience` times `sqrt(n) / 2` rows (n the rows at the build) have brought nothing
+nearer. A row in a partition it did not read is missed. On 975,000 OpenAI embeddings the defaults
+return 98% of the true ten nearest, reading 4% of the rows; `SET pg_lion.vector_margin = 2` returns
+96% in five sixths of the time, and `SET pg_lion.vector_patience = 0`, which reads on to the margin
+however long nothing nearer turns up, 98.4% in 1.8 times the time and a 95th percentile four times
+as long. The recall a margin gives is the data's: on 115,186 of DBpedia's text-embedding-3-large
 embeddings the same defaults return 84%, and 95% takes `SET pg_lion.vector_margin = 7` (DESIGN.md
 §44.9), so measure it on your own rows against an exact search.
 
@@ -442,7 +442,7 @@ members, under a filter) that plane 1's bounds could not rule out; refined the o
 code was read, fetched the ones whose exact distance was computed from the table; bounds missed
 counts fetched rows that turned out nearer than their lower bound said, and pages read the code
 pages the probes read; pauses counts the times the scan stopped probing because
-`pg_lion.vector_patience` partitions' worth of rows had brought nothing nearer. Without pauses a
+`pg_lion.vector_patience` times `sqrt(n) / 2` rows had brought nothing nearer. Without pauses a
 query whose nearest rows lie far from every centroid reads many partitions for nothing: unfiltered,
 the partitions a query probed had a median of 68, a 95th percentile of 175 and a maximum of 256 with
 pauses, and 150, 837 and 1,664 without. A query that wants more rows than `pg_lion.vector_batch`

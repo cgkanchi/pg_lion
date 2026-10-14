@@ -158,12 +158,15 @@ lion_vec_init(void)
 							 NULL, NULL, NULL);
 
 	DefineCustomIntVariable("pg_lion.vector_patience",
-							"How many partitions' worth of rows a lionvec scan scores without finding a "
-							"nearer one before it stops probing.",
-							"A scan that has scored this many partitions' worth of rows (of the members, "
-							"under a lion filter) since one last entered its pg_lion.vector_batch nearest "
-							"stops probing partitions until it has returned the rows it holds.  Smaller "
-							"stops sooner and misses more of the nearest rows; 0 never stops.",
+							"How many units of rows a lionvec scan scores without finding a nearer one "
+							"before it stops probing.",
+							"A unit is the rows an average partition would hold were there 2 sqrt(n) of "
+							"them, n the rows the index was built with: sqrt(n) / 2 rows, or that share "
+							"of the members under a lion filter, whatever the partitions' number.  A scan "
+							"that has scored this many units since one last entered its "
+							"pg_lion.vector_batch nearest stops probing partitions until it has returned "
+							"the rows it holds.  Smaller stops sooner and misses more of the nearest rows; "
+							"0 never stops.",
 							&lionvec_patience,
 							LIONVEC_PATIENCE_DEFAULT, 0, 1000000,
 							PGC_USERSET,
