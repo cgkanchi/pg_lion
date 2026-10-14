@@ -200,7 +200,7 @@ With [pgvector](https://github.com/pgvector/pgvector) installed:
 
 ```sql
 CREATE EXTENSION pg_lion_vector;
--- pgvector prices its distances as nearly free, which makes the planner sort a
+-- pgvector prices its distances as nearly free, which can make the planner sort a
 -- filter's rows rather than use lionvec; price them closer to what they cost
 ALTER FUNCTION l2_distance(vector, vector) COST 100;
 ALTER FUNCTION vector_negative_inner_product(vector, vector) COST 100;
@@ -217,17 +217,19 @@ SELECT id FROM items WHERE category = 3 ORDER BY embedding <=> $1 LIMIT 10;
 row, rotated so that the error of a distance worked out from those bits is known, plus an 8-bit
 code read only when the bits can't decide. A query ranks the partitions by their centroids, reads
 the bits of the rows in the nearest few, refines the rows that might make the cut, and computes the
-last few distances exactly from the table. Like HNSW's, the answer is approximate: on 975,000
-1536-dimension OpenAI embeddings a query reads 7% of the rows (18 MB) and returns 97% of the true
-ten nearest in 8.5 ms, where pgvector's HNSW returns 95% in 6.6 ms; `pg_lion.vector_margin` trades
-one for the other. Under a `WHERE` that lion indexes answer, the scan scores only the matching rows,
-so a filter of any selectivity gets its ten nearest: 31 ms at 1% of the rows (98% recall), where
-HNSW returns fewer than one row, or 95% of the right ones in 36 ms with iterative scans, and a
-filter of up to 2,000 rows is answered exactly. The index is 1.7 GB to HNSW's 3.8 GB, and since a
-query reads only the partitions it needs, it holds up when memory is short: with PostgreSQL held
-to 1 GB, 17 ms and 94 pages read from disk a query, where HNSW took 52 ms and 766 pages (and 676 ms
-and 9,285 pages under the 1% filter, where lionvec read none). `vector_l2_ops` (`<->`, the default),
-`vector_ip_ops` (`<#>`) and `vector_cosine_ops` (`<=>`) are supported, up to 8128 dimensions. See
+last few distances exactly from the table, pausing once a few dozen partitions have brought
+nothing nearer. Like HNSW's, the answer is approximate: on 975,000 1536-dimension OpenAI
+embeddings a query reads 4% of the rows (9 MB) and returns 98% of the true ten nearest in 7.9 ms,
+about the time pgvector's HNSW takes to return 95% (8.1 ms at `ef_search` 100);
+`pg_lion.vector_margin` and `pg_lion.vector_patience` trade one for the other. Under a `WHERE` that lion indexes answer, the scan scores only the
+matching rows, so a filter of any selectivity gets its ten nearest: 24 ms at 1% of the rows (98%
+recall), where HNSW returns fewer than one row, or 95% of the right ones in 37 to 41 ms with
+iterative scans, and a filter of up to 2,000 rows is answered exactly. The index is 1.7 GB to
+HNSW's 3.8 GB, and since a query reads only the partitions it needs, it holds up when memory is
+short: with PostgreSQL held to 1 GB, 19 ms and 100 pages read from disk a query, where HNSW took
+51 ms and 767 pages (and 691 ms and 9,229 pages under the 1% filter, where lionvec read none).
+`vector_l2_ops` (`<->`, the default), `vector_ip_ops` (`<#>`) and `vector_cosine_ops` (`<=>`) are
+supported, up to 8128 dimensions. See
 [BENCHMARKS.md](docs/BENCHMARKS.md#nearest-neighbours-lionvec-against-hnsw).
 
 ## Supported types
@@ -250,11 +252,11 @@ columns and can be built in parallel on PostgreSQL 17 and later. `pg_lion_vector
   down when every query term is very common.
 - The count pushdown uses an expression index (for example, lion on `(data->>'key')`) only on a
   table that is not partitioned, and not in its joins.
-- `lionvec` relies on pgvector's distance functions being costed at 100 (the `ALTER FUNCTION`s
-  under [Nearest neighbours](#nearest-neighbours)). At pgvector's own cost of 1, a filter that keeps
-  1% or 10% of a million rows is sorted by distance instead, 3 to 17 times slower. The setting is
-  not kept by `pg_dump`, and an `ALTER EXTENSION vector UPDATE` may reset it, so run them again
-  after either.
+- `lionvec` assumes pgvector's distance functions are costed at 100 (the `ALTER FUNCTION`s under
+  [Nearest neighbours](#nearest-neighbours)). At pgvector's own cost of 1 the planner may sort a
+  filter's rows by distance instead: before scans paused, it did for filters of 1% and 10% of a
+  million rows, 3 to 17 times slower. The setting is not kept by `pg_dump`, and an `ALTER
+  EXTENSION vector UPDATE` may reset it, so run them again after either.
 - If the column also has an HNSW index, the planner chooses HNSW for nearly every query, filtered
   or not, because pgvector prices its scan as nearly free; under a filter it then returns fewer
   rows than the `LIMIT` unless `hnsw.iterative_scan` is on.

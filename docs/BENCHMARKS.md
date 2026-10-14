@@ -147,26 +147,30 @@ lionvec in its default 1,974 partitions, against pgvector 0.8.6's HNSW on
 asks. Recall is the share of the true ten returned, against an exact numpy search. Both indexes
 are approximate.
 
-**Warm** (everything in memory), median of 100 queries and recall:
+**Warm** (everything in memory), median of 100 queries, 95th percentile and recall. lionvec at its
+defaults (margin 3, patience 30), at margins 2 and 4, and with the pause off:
 
-| Filter | lionvec (margin 2, the default) | lionvec, margin 3 | HNSW ef_search 40 | HNSW ef_search 100 |
-| --- | --- | --- | --- | --- |
-| none | 8.5 ms, 0.968 | 14 ms, 0.984 | 4.4 ms, 0.900 | 6.6 ms, 0.954 |
-| 10% | 32 ms, 0.989 | 53 ms, 0.996 | 7.6 ms, 0.931 | 6.7 ms, 0.939 |
-| 1% | 31 ms, 0.979 | 49 ms, 0.993 | 36 ms, 0.947 | 34 ms, 0.950 |
-| 0.1% | 11.5 ms, 1.000 | | 12.5 ms, 0.999 | |
+| Filter | lionvec (defaults) | margin 2 | margin 4 | no pause | HNSW ef_search 40 | HNSW ef_search 100 |
+| --- | --- | --- | --- | --- | --- | --- |
+| none | 7.9 ms (16), 0.979 | 6.6 (15), 0.964 | 9.1 (18), 0.983 | 14 (68), 0.984 | 4.7 (6.5), 0.900 | 8.1 (11), 0.954 |
+| 10% | 13.5 (29), 0.978 | 15 (29), 0.974 | 15 (28), 0.979 | 60 (123), 0.996 | 8.7 (14), 0.931 | 8.0 (15), 0.939 |
+| 1% | 24 (40), 0.981 | 27 (41), 0.981 | 27 (38), 0.981 | 109 (136), 1.000 | 37 (62), 0.947 | 41 (66), 0.950 |
+| 0.1% | 9.9 (11), 1.000 | | | | 13 (18), 0.999 | |
 
 HNSW under a filter uses its iterative scan; without it, it returns 3.9 of the ten rows at 10% and
-0.4 at 1%. At 0.1% the planner sorts the 953 matching rows for either index. lionvec's 95th
-percentile is three to four times its median (37 ms unfiltered), HNSW's about one and a half.
+0.4 at 1%. At 10% the planner chooses lionvec's plain scan with a `Filter`, at 1% `LionOrdered`,
+and at 0.1% a sort of the 953 matching rows, for either index. The pause stops a scan once 30
+partitions' worth of rows have brought nothing nearer; without it a query whose nearest rows lie
+far from every centroid reads hundreds of partitions (a mean of 254 of the 1,974 unfiltered, 77
+with it), and the 95th percentile was five times the median, where with it it is twice.
 
 **Cold** (PostgreSQL restarted and the OS page cache dropped before each query), median of 5:
 
 | Filter | lionvec | HNSW ef_search 40 (iterative under a filter) |
 | --- | --- | --- |
-| none | 197 ms | 104 ms |
-| 1% | 234 ms | 1,258 ms |
-| 0.1% | 236 ms | 222 ms (both: the planner sorts the filter's rows) |
+| none | 85 ms | 118 ms |
+| 1% | 196 ms | 1,254 ms |
+| 0.1% | 210 ms | 251 ms (both: the planner sorts the filter's rows) |
 
 **Memory-capped** (a stream of queries, PostgreSQL and its page cache held to 1 or 2 GB by a
 memory cgroup with `shared_buffers` at 128 MB, the cache filled first), median of 100 and the
@@ -174,10 +178,10 @@ pages each query read from disk:
 
 | Memory | Filter | lionvec | HNSW ef_search 40 (iterative under a filter) |
 | --- | --- | --- | --- |
-| 1 GB | none | 17 ms, 94 pages | 52 ms, 766 pages |
-| 1 GB | 1% | 35 ms, 0 pages | 676 ms, 9,285 pages |
-| 2 GB | none | 16 ms, 41 pages | 41 ms, 671 pages |
-| 2 GB | 1% | 35 ms, 0 pages | 506 ms, 7,867 pages |
+| 1 GB | none | 19 ms, 100 pages | 51 ms, 767 pages |
+| 1 GB | 1% | 28 ms, 0 pages | 691 ms, 9,229 pages |
+| 2 GB | none | 13 ms, 41 pages | 41 ms, 672 pages |
+| 2 GB | 1% | 30 ms, 0 pages | 465 ms, 7,853 pages |
 
 lionvec's working set is the centroids, the one-bit codes of the partitions queries probe, and the
 few rows they refine and fetch; under the 1% filter it never filled the cgroup. HNSW reads 650 to
@@ -185,12 +189,15 @@ few rows they refine and fetch; under the 1% filter it never filled the cgroup. 
 answers a random read in well under a tenth of a millisecond; on slower storage the page counts
 are what to compare.
 
-**Size and build.** lionvec is 1.7 GB, of which an unfiltered query reads about 18 MB of one-bit
+**Size and build.** lionvec is 1.7 GB, of which an unfiltered query reads about 9 MB of one-bit
 codes; HNSW is 3.8 GB. lionvec builds in 19 minutes with the table cached, nearly all of it k-means
 and the assignment of every row to its nearest of the 1,974 centroids.
 
-An earlier, unpartitioned lionvec read every row's one-bit code and returned the exact ten: 96 ms
-unfiltered, 138 ms at 10%, 34 ms at 1% and 6.6 ms at 0.1%, and built in 98 s
+Before the pause, at a margin of 2 narrowed under a filter, lionvec took 8.5 ms unfiltered (0.968),
+32 ms at 10% (0.989), 31 ms at 1% (0.979), 197 ms cold and 17 ms with 1 GB
+([results](../bench/results/2026-10-14-lionvec-partitions/before-pause/)). An earlier,
+unpartitioned lionvec read every row's one-bit code and returned the exact ten: 96 ms unfiltered,
+138 ms at 10%, 34 ms at 1% and 6.6 ms at 0.1%, and built in 98 s
 ([results](../bench/results/2026-10-14-lionvec/)). Times vary between runs by up to a fifth.
 
 ## Size, build and writes (5M rows, all seven indexes)
