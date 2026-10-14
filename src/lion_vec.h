@@ -142,10 +142,12 @@ typedef struct LionVecRefine
 
 /*
  * A partition (DESIGN.md §44.2), an item of the PART chain: where its CODE
- * chain starts and ends, how many rows the build put in it, and the centroid
- * itself, coded as a row is - its plane 1 here and its 8-bit codes in a
- * REFINE item, whose TID is (partno, 0), which no heap row's is.  The build
- * writes the PART chain last; an insert changes only a partition's tail.
+ * chain starts and ends, how many rows the build put in it, how long the
+ * longest is and how far they lie from the centroid (an inner-product scan's
+ * bound, §44.4), and the centroid itself, coded as a row is - its plane 1
+ * here and its 8-bit codes in a REFINE item, whose TID is (partno, 0), which
+ * no heap row's is.  The build writes the PART chain last; an insert changes
+ * only a partition's tail.
  */
 typedef struct LionVecPart
 {
@@ -153,6 +155,8 @@ typedef struct LionVecPart
 	BlockNumber head;			/* its CODE chain */
 	BlockNumber tail;			/* ... whose last page inserts append to */
 	uint32		nrows;			/* rows the build put in it */
+	float4		maxnorm;		/* the largest |x| of those rows */
+	float4		spread;			/* ... and the mean of |x - c|^2, c the centroid */
 	LionVecCode cent;			/* the centroid's plane 1, as a row's */
 } LionVecPart;
 

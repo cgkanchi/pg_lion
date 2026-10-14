@@ -269,4 +269,34 @@ lionvec_key_exact(int metric, double dist, double offset)
 	return metric == LIONVEC_L2 ? dist * dist - offset : dist + offset;
 }
 
+/*
+ * An inner product's lower bound on the keys of a partition's rows, from a
+ * lower bound lo on its centroid c's key, as a scan ranks the partitions
+ * (DESIGN.md §44.4).  Each row x is lifted by one more coordinate,
+ * sqrt(maxnorm2 - |x|^2), maxnorm2 the partition's greatest |x|^2: the rows
+ * then lie at one distance from the origin, and the nearer one lies to the
+ * unit query (q / |q|, 0), the greater its <q, x> (Bachrach and others,
+ * RecSys 2014).  The rows' centroid lies inside that sphere by spread, their
+ * mean |x - c|^2, at squared distance 1 + maxnorm2 - spread - 2 <q / |q|, c>
+ * from the query; the bound is the key of a row margin nearer than that, so
+ * a margin as large as the lifted rows' greatest distance from their
+ * centroid makes it a true bound.  offset and qnorm are the query's offset
+ * and |q|; a zero query, whose every key is the same, gets lo back.
+ */
+static inline double
+lionvec_lift_key(double lo, double offset, double qnorm, double maxnorm2,
+				 double spread, double margin)
+{
+	double		qc;
+	double		d;
+
+	if (isinf(lo) || !(qnorm > 0.0))
+		return lo;
+	qc = -(lo - offset) / qnorm;	/* <q / |q|, c>, at most */
+	d = sqrt(Max(1.0 + maxnorm2 - spread - 2.0 * qc, 0.0)) - margin;
+	if (d < 0.0)
+		d = 0.0;
+	return qnorm * (d * d - 1.0 - maxnorm2) / 2.0 + offset;
+}
+
 #endif							/* LION_VEC_MATH_H */

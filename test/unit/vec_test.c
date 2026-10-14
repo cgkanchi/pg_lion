@@ -20,6 +20,9 @@
  *		bounds ARE the key of the distance computed the obvious way, for each
  *		metric - which is the proof that centring, the mean's terms, cosine's
  *		normalization and the query's offset fit together;
+ *	  - an inner product's partition bound (lionvec_lift_key()): a true bound
+ *		at the lifted rows' radius, for rows of mixed lengths and unit rows,
+ *		and the L2 bound on unit rows;
  *	  - the estimates' error bounds hold as often as the Gaussian says they
  *		should, on clustered data of several sizes: at one standard deviation
  *		about a third of the time, at three almost always.
@@ -1365,6 +1368,156 @@ test_kmeans(void)
 	free(centers);
 }
 
+/* ---------- an inner product's partition bound ---------- */
+
+/*
+ * lionvec_lift_key() against partitions of rows of mixed lengths, and of
+ * unit rows: with a margin of the lifted rows' greatest distance from their
+ * lifted centroid it bounds every row's key, for any query, which is the
+ * triangle inequality there and so the proof that the lift's algebra - the
+ * offset, |q|, the spread - fits; on unit rows it is the L2 bound of the
+ * unit query; it falls as the margin grows, is at most the centroid's key
+ * from a margin of 0, and passes infinities and a zero query through.
+ */
+static void
+test_lift(void)
+{
+	int			dims = 24;
+	int			n = 300;
+	float	   *x = falloc(n * dims);
+	double	   *c = (double *) xmalloc(sizeof(double) * dims);
+	float	   *q = falloc(dims);
+	int			unit;
+
+	cur_phase = "lift";
+	for (unit = 0; unit <= 1; unit++)
+	{
+		int			trial;
+
+		for (trial = 0; trial < 20; trial++)
+		{
+			double		m2 = 0.0;
+			double		c2 = 0.0;
+			double		spread = 0.0;
+			double		h;
+			double		radius = 0.0;
+			double		offset = rnd_gauss();
+			bool		holds = true;
+			bool		matches = true;
+			bool		falls = true;
+			int			i;
+			int			d;
+			int			t;
+
+			/* rows about a centre, of lengths from 0.2 to 3 times its */
+			for (d = 0; d < dims; d++)
+				c[d] = rnd_gauss();
+			for (i = 0; i < n; i++)
+			{
+				double		len = unit ? 0.0 : 0.2 + 2.8 * rnd_unit();
+				double		r2 = 0.0;
+
+				for (d = 0; d < dims; d++)
+				{
+					double		v = (unit ? c[d] : len * c[d]) + 0.4 * rnd_gauss();
+
+					x[i * dims + d] = (float) v;
+					r2 += v * v;
+				}
+				if (unit)
+				{
+					for (d = 0; d < dims; d++)
+						x[i * dims + d] = (float) (x[i * dims + d] / sqrt(r2));
+				}
+			}
+			/* the centroid, the greatest |x|^2, the spread */
+			for (d = 0; d < dims; d++)
+			{
+				c[d] = 0.0;
+				for (i = 0; i < n; i++)
+					c[d] += x[i * dims + d];
+				c[d] /= n;
+				c2 += c[d] * c[d];
+			}
+			for (i = 0; i < n; i++)
+			{
+				double		r2 = dot_ff(x + i * dims, x + i * dims, dims);
+				double		e2 = 0.0;
+
+				m2 = Max(m2, r2);
+				for (d = 0; d < dims; d++)
+					e2 += (x[i * dims + d] - c[d]) * (x[i * dims + d] - c[d]);
+				spread += e2 / n;
+			}
+			/* the lifted centroid (c, h), and the lifted rows' farthest */
+			h = sqrt(Max(m2 - spread - c2, 0.0));
+			for (i = 0; i < n; i++)
+			{
+				double		r2 = dot_ff(x + i * dims, x + i * dims, dims);
+				double		e2 = 0.0;
+				double		lift = sqrt(Max(m2 - r2, 0.0));
+
+				for (d = 0; d < dims; d++)
+					e2 += (x[i * dims + d] - c[d]) * (x[i * dims + d] - c[d]);
+				e2 += (lift - h) * (lift - h);
+				radius = Max(radius, sqrt(e2));
+			}
+
+			for (t = 0; t < 20; t++)
+			{
+				double		scale = 0.1 + 10.0 * rnd_unit();
+				double		qnorm = 0.0;
+				double		qcent = 0.0;
+				double		lo;
+				double		key;
+				double		least = INFINITY;
+
+				for (d = 0; d < dims; d++)
+				{
+					q[d] = (float) (scale * rnd_gauss());
+					qnorm += (double) q[d] * q[d];
+					qcent += q[d] * c[d];
+				}
+				qnorm = sqrt(qnorm);
+				lo = -qcent + offset;
+				key = lionvec_lift_key(lo, offset, qnorm, m2, spread, radius * (1.0 + 1e-9));
+				for (i = 0; i < n; i++)
+					least = Min(least, -dot_ff(q, x + i * dims, dims) + offset);
+				if (key > least + 1e-9 * (1.0 + fabs(least)))
+					holds = false;
+
+				if (unit)
+				{
+					/* the L2 bound of q / |q|: |q / |q| - c| less the margin */
+					double		dc = sqrt(Max(1.0 + c2 - 2.0 * qcent / qnorm, 0.0));
+					double		dm = Max(dc - 0.1, 0.0);
+					double		want = qnorm * (dm * dm - 2.0) / 2.0 + offset;
+
+					if (fabs(lionvec_lift_key(lo, offset, qnorm, m2, spread, 0.1) - want) >
+						1e-6 * (1.0 + fabs(want)))
+						matches = false;
+				}
+
+				if (!(lionvec_lift_key(lo, offset, qnorm, m2, spread, 0.0) <= lo + 1e-12 &&
+					  lionvec_lift_key(lo, offset, qnorm, m2, spread, 0.5) <=
+					  lionvec_lift_key(lo, offset, qnorm, m2, spread, 0.1)))
+					falls = false;
+			}
+			CHECK(holds, unit ? "lift: unit rows beat the bound at their radius" :
+				  "lift: rows of mixed lengths beat the bound at their radius");
+			if (unit)
+				CHECK(matches, "lift: unit rows not bounded as L2 bounds them");
+			CHECK(falls, "lift: the bound does not fall with the margin");
+		}
+	}
+	CHECK(isinf(lionvec_lift_key(-INFINITY, 1.0, 2.0, 1.0, 0.1, 1.0)), "lift: -inf");
+	CHECK(isinf(lionvec_lift_key(INFINITY, 1.0, 2.0, 1.0, 0.1, 1.0)), "lift: inf");
+	CHECK(lionvec_lift_key(0.25, 1.0, 0.0, 1.0, 0.1, 1.0) == 0.25, "lift: a zero query");
+	free(x);
+	free(c);
+	free(q);
+}
+
 /* ---------- odd inputs ---------- */
 
 static void
@@ -1402,6 +1555,7 @@ main(void)
 	test_query();
 	test_kernels();
 	test_bounds_nan();
+	test_lift();
 	test_candidates();
 	test_kmeans();
 	test_coverage();

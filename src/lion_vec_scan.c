@@ -169,6 +169,7 @@ typedef struct LvScanOpaque
 	int			metric;
 	Datum		query;			/* detoasted, in qcxt */
 	LionVecQuery q;
+	double		qnorm;			/* |q| */
 	double		margin;			/* lv_margin() */
 
 	/* the restriction (lion_vec_restrict()) */
@@ -182,6 +183,8 @@ typedef struct LvScanOpaque
 	LvHeap		rows;
 	LvHeap		parts;
 	BlockNumber *phead;			/* [nparts]: each partition's CODE chain */
+	double	   *plift;			/* IP: [nparts][2], each one's maxnorm^2 and
+								 * spread (lv_part_key()) */
 	BlockNumber *probed;		/* the chains probed, in order */
 	int			nprobed;
 	double	   *hi;				/* max-heap of the L least upper bounds */
@@ -565,6 +568,7 @@ lionvecrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys,
 	memset(&so->rows, 0, sizeof(LvHeap));
 	memset(&so->parts, 0, sizeof(LvHeap));
 	so->phead = NULL;
+	so->plift = NULL;
 	so->probed = NULL;
 	so->nprobed = 0;
 	so->hi = NULL;
@@ -884,31 +888,34 @@ lv_walk_next(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid)
  * thousandth: the k-th nearest member lies farther out, and of the few
  * members a partition holds, the chance of one in the margin falls with
  * them.  975,000 rows of 1536 dimensions miss as many of their nearest at
- * each share alike so.  An inner product's distance moves |q| for each unit
- * the row does.
+ * each share alike so.
  */
 static double
-lv_margin(LvScanOpaque *so, double members, double tuples, double qnorm)
+lv_margin(LvScanOpaque *so, double members, double tuples)
 {
 	double		m = lionvec_margin;
 
 	if (so->restricted && tuples > 0.0 && members < tuples)
 		m -= LIONVEC_MARGIN_NARROW *
 			Min(3.0, log10(tuples / Max(members, 1.0)));
-	m *= so->meta.scale;
-	if (so->metric == LIONVEC_IP)
-		m *= qnorm;
-	return m;
+	return m * so->meta.scale;
 }
 
 /*
- * A partition's place in its queue, from a lower bound lo on its centroid's
- * key: the key of a row the margin nearer.  An L2 key is the squared
- * distance less |qc|^2 (lion_vec_math.h), so the margin comes off the
- * distance.
+ * A partition's place in its queue, from a lower bound lo on the key of its
+ * centroid (partition partno's): the key of a row the margin nearer.  An L2
+ * key is the squared distance less |qc|^2 (lion_vec_math.h), so the margin
+ * comes off the distance.  An inner product's comes off the distance in
+ * the space lionvec_lift_key() lifts the partition's rows into, where they
+ * lie at one distance from the origin, so that a partition of unit vectors
+ * is ranked as an L2 index ranks it.  Off <q, c> instead, it left the
+ * answers of rows of mixed lengths - the rows that stick out farthest along
+ * q - beyond the margin: an L2 or cosine row nearer the query than its
+ * centroid pays |x - c|^2 for it, and an inner product's does not (found by
+ * vector_filter.sql's recall test, 2026-10-14).
  */
 static double
-lv_part_key(const LvScanOpaque *so, double lo)
+lv_part_key(const LvScanOpaque *so, double lo, BlockNumber partno)
 {
 	if (isinf(lo))
 		return lo;
@@ -918,6 +925,9 @@ lv_part_key(const LvScanOpaque *so, double lo)
 
 		return (d > 0.0 ? d * d : 0.0) - so->q.offset;
 	}
+	if (so->plift != NULL)
+		return lionvec_lift_key(lo, so->q.offset, so->qnorm, so->plift[2 * partno],
+								so->plift[2 * partno + 1], so->margin);
 	return lo - so->margin;
 }
 
@@ -936,6 +946,8 @@ lv_read_parts(IndexScanDesc scan, LvScanOpaque *so)
 	int			n = 0;
 
 	so->phead = palloc(sizeof(BlockNumber) * Max(k, 1));
+	if (so->metric == LIONVEC_IP)
+		so->plift = palloc(sizeof(double) * 2 * Max(k, 1));
 	lv_heap_grow(&so->parts, Max(k, 1));
 	while (BlockNumberIsValid(blk))
 	{
@@ -966,12 +978,17 @@ lv_read_parts(IndexScanDesc scan, LvScanOpaque *so)
 						 errmsg("lionvec index \"%s\" has partition %u where %d belongs, at (%u,%u)",
 								RelationGetRelationName(index), part->partno, n, blk, off)));
 			so->phead[n] = part->head;
+			if (so->plift != NULL)
+			{
+				so->plift[2 * n] = (double) part->maxnorm * part->maxnorm;
+				so->plift[2 * n + 1] = part->spread;
+			}
 			lionvec_estimate1(&so->q, part->cent.bits, part->cent.popcount,
 							  part->cent.norm, part->cent.alpha1, &est, &err);
 			lionvec_key_bounds(so->metric, part->cent.norm, part->cent.xm,
 							   est, err, &lo, &hi);
 			memset(&item, 0, sizeof(item));
-			item.key = lv_part_key(so, lo);
+			item.key = lv_part_key(so, lo, n);
 			LionVecCentTid(&item.tid, n);
 			item.level = LV_CENT1;
 			item.rblk = part->cent.rblk;
@@ -1020,7 +1037,7 @@ lv_refine_part(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 					  ref->rnorm8, &est, &err);
 	UnlockReleaseBuffer(buf);
 	lionvec_key_bounds(so->metric, item->norm, item->xm, est, err, &lo, &hi);
-	item->key = lv_part_key(so, lo);
+	item->key = lv_part_key(so, lo, ItemPointerGetBlockNumber(&item->tid));
 	item->level = LV_CENT8;
 	lv_heap_push(&so->parts, item);
 }
@@ -1475,7 +1492,8 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 			return;
 		}
 	}
-	so->margin = lv_margin(so, members, tuples, qnorm);
+	so->qnorm = qnorm;
+	so->margin = lv_margin(so, members, tuples);
 
 	so->seen = lvseen_create(so->qcxt, 256, NULL);
 	so->batch = lionvec_batch;
