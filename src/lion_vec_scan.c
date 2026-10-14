@@ -1120,7 +1120,10 @@ lv_shrink(LvScanOpaque *so, int cap, double *drop)
 	so->rows.n = n;
 	if (n > cap / 2)
 	{
-		so->cut = Min(so->cut, lv_cut(so, cap));
+		/* not inside Min(), which would cut a second time */
+		double		cut = lv_cut(so, cap);
+
+		so->cut = Min(so->cut, cut);
 		*drop = Min(*drop, so->cut);
 	}
 	else
