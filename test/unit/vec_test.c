@@ -23,6 +23,11 @@
  *	  - an inner product's partition bound (lionvec_lift_key()): a true bound
  *		at the lifted rows' radius, for rows of mixed lengths and unit rows,
  *		and the L2 bound on unit rows;
+ *	  - spill: the ranking of candidates, the candidates of the m nearest
+ *		centroids, a vector decoded from its 8-bit codes, and SOAR's choice of
+ *		a second partition - its algebra on vectors whose answer is known,
+ *		and on clustered rows the least cost, other than the second-nearest
+ *		for a share of them, and the same from decoded centroids;
  *	  - the estimates' error bounds hold as often as the Gaussian says they
  *		should, on clustered data of several sizes: at one standard deviation
  *		about a third of the time, at three almost always.
@@ -1368,6 +1373,587 @@ test_kmeans(void)
 	free(centers);
 }
 
+/* ---------- spill: ranking, the m nearest's candidates, SOAR ---------- */
+
+/* NaN as infinity, as lionvec_rank() takes it */
+static double
+rank_key(double k)
+{
+	return isnan(k) ? INFINITY : k;
+}
+
+/*
+ * lionvec_rank() against a reference - every place, the m least by a
+ * stable selection - for keys with ties, NaNs and infinities, of every
+ * length up to 40 and every m up to LIONVEC_RANK_MAX.
+ */
+static void
+test_rank(void)
+{
+	double		key[40];
+	int			order[LIONVEC_RANK_MAX];
+	int			ref[40];
+	bool		taken[40];
+	bool		ok = true;
+	int			trial;
+
+	cur_phase = "rank";
+	for (trial = 0; trial < 400; trial++)
+	{
+		int			n = (int) (rnd64() % 41);
+		int			m = (int) (rnd64() % (LIONVEC_RANK_MAX + 1));
+		int			r;
+		int			want = Min(n, m);
+		int			i;
+		int			j;
+
+		for (i = 0; i < n; i++)
+		{
+			uint64		u = rnd64() % 20;
+
+			/* few distinct values, so that ties are common */
+			key[i] = u == 0 ? NAN : u == 1 ? INFINITY : u == 2 ? -INFINITY :
+				(double) (rnd64() % 6);
+		}
+		/* the reference: the least not yet taken, the lowest place among equals */
+		memset(taken, 0, sizeof(taken));
+		for (j = 0; j < want; j++)
+		{
+			int			b = -1;
+
+			for (i = 0; i < n; i++)
+				if (!taken[i] && (b < 0 || rank_key(key[i]) < rank_key(key[b])))
+					b = i;
+			taken[b] = true;
+			ref[j] = b;
+		}
+		r = lionvec_rank(key, n, m, order);
+		ok &= r == want;
+		for (j = 0; j < want && r == want; j++)
+			ok &= order[j] == ref[j];
+	}
+	CHECK(ok, "rank: not the m least, least first, ties to the lower place");
+	CHECK(lionvec_rank(key, 0, 4, order) == 0, "rank of no keys");
+	CHECK(lionvec_rank(key, 5, 0, order) == 0, "rank of none wanted");
+}
+
+/*
+ * lionvec_candidates_n() on clustered centroids: m = 1 is
+ * lionvec_candidates(); the exact m nearest are always candidates at a wide
+ * bound and nearly always at the build's; there are at least m; fewer
+ * centroids than m are all candidates.
+ */
+static void
+test_candidates_n(void)
+{
+	static const int dims[] = {64, 320, 1536};
+	int			di;
+
+	cur_phase = "candidates_n";
+	for (di = 0; di < 3; di++)
+	{
+		int			D = dims[di];
+		int			k = 200;
+		int			T = 20;
+		int			m = LIONVEC_SOAR_CANDS + 1;
+		float	   *centers = falloc(T * D);
+		float	   *cent = falloc(k * D);
+		float	   *x = falloc(D);
+		double	   *lo = (double *) xmalloc(sizeof(double) * k);
+		double	   *hi = (double *) xmalloc(sizeof(double) * k);
+		double	   *lo1 = (double *) xmalloc(sizeof(double) * k);
+		double	   *hi1 = (double *) xmalloc(sizeof(double) * k);
+		int		   *cand = (int *) xmalloc(sizeof(int) * k);
+		int		   *cand1 = (int *) xmalloc(sizeof(int) * k);
+		double	   *dist = (double *) xmalloc(sizeof(double) * k);
+		int			near[LIONVEC_SOAR_CANDS + 1];
+		LionVecQuery q;
+		CentCodes	cc;
+		long		missed_wide = 0;
+		long		missed = 0;
+		long		ncand = 0;
+		bool		same = true;
+		bool		enough = true;
+		int			trial;
+		int			i;
+		int			j;
+
+		query_alloc(&q, D);
+		for (i = 0; i < T * D; i++)
+			centers[i] = (float) rnd_gauss();
+		for (j = 0; j < k; j++)
+			for (i = 0; i < D; i++)
+				cent[(Size) j * D + i] = centers[(Size) (j % T) * D + i] +
+					(float) (rnd_gauss() * 0.4);
+		cent_codes(&cc, cent, k, D, NULL);
+
+		for (trial = 0; trial < 200; trial++)
+		{
+			int			c = (int) (rnd64() % k);
+			int			nc;
+			int			nc1;
+
+			for (i = 0; i < D; i++)
+				x[i] = cent[(Size) c * D + i] + (float) (rnd_gauss() * 0.4);
+			for (j = 0; j < k; j++)
+			{
+				dist[j] = 0.0;
+				for (i = 0; i < D; i++)
+				{
+					double		t = (double) x[i] - cent[(Size) j * D + i];
+
+					dist[j] += t * t;
+				}
+			}
+			CHECK(lionvec_rank(dist, k, m, near) == m, "rank of the distances");
+
+			lionvec_query_init(&q, LIONVEC_L2, NULL, x, 10.0);
+			nc = lionvec_candidates_n(&cc.c, &q, m, lo, hi, cand);
+			enough &= nc >= m;
+			for (j = 0; j < m; j++)
+			{
+				bool		in = false;
+				int			c2;
+
+				for (c2 = 0; c2 < nc; c2++)
+					in |= cand[c2] == near[j];
+				missed_wide += !in;
+			}
+
+			lionvec_query_init(&q, LIONVEC_L2, NULL, x, LIONVEC_ASSIGN_EPS);
+			nc = lionvec_candidates_n(&cc.c, &q, m, lo, hi, cand);
+			ncand += nc;
+			enough &= nc >= m;
+			for (j = 0; j < m; j++)
+			{
+				bool		in = false;
+				int			c2;
+
+				for (c2 = 0; c2 < nc; c2++)
+					in |= cand[c2] == near[j];
+				missed += !in;
+			}
+			nc = lionvec_candidates_n(&cc.c, &q, 1, lo, hi, cand);
+			nc1 = lionvec_candidates(&cc.c, &q, lo1, hi1, cand1);
+			same &= nc == nc1 && memcmp(cand, cand1, sizeof(int) * nc) == 0;
+		}
+		CHECK(same, "candidates_n of 1 is not candidates");
+		CHECK(enough, "fewer candidates than m");
+		CHECK(missed_wide == 0, "one of the m nearest is not a candidate at 10 sd");
+		/* at most one of the 1,800 pairs, as the nearest alone misses one in 200 */
+		CHECK(missed <= 1, "one of the m nearest missed at the build's bounds");
+		/*
+		 * and few: all but the row's own group of k / T at enough dimensions,
+		 * as for the nearest alone (test_candidates())
+		 */
+		CHECK(ncand < 200L * (D >= 320 ? 2 * (k / T) : k * 3 / 4),
+			  "the candidates of the m nearest are most of the centroids");
+		printf("vec_test: dims %4d: %.1f candidates for the %d nearest of %d centroids\n",
+			   D, (double) ncand / 200, m, k);
+
+		/* fewer centroids than m: all of them */
+		cc.c.k = 5;
+		CHECK(lionvec_candidates_n(&cc.c, &q, m, lo, hi, cand) == 5,
+			  "fewer centroids than m are not all candidates");
+		cc.c.k = 0;
+		CHECK(lionvec_candidates_n(&cc.c, &q, m, lo, hi, cand) == 0,
+			  "candidates of no centroids");
+		cent_codes_free(&cc);
+
+		query_free(&q);
+		free(dist);
+		free(cand1);
+		free(cand);
+		free(hi1);
+		free(lo1);
+		free(hi);
+		free(lo);
+		free(x);
+		free(cent);
+		free(centers);
+	}
+}
+
+/*
+ * lionvec_decode8(): the codes' vector scaled to x's projection on it, so
+ * |x - y|^2 = |x|^2 (1 - alpha8^2), about a percent of |x| at any dimension
+ * (the 8-bit steps' rounding, and a clipped coordinate now and then); and
+ * no length, no vector.
+ */
+static void
+test_decode8(void)
+{
+	static const int dims[] = {64, 320, 1536, 8128};
+	int			di;
+
+	cur_phase = "decode8";
+	for (di = 0; di < (int) lengthof(dims); di++)
+	{
+		int			D = dims[di];
+		float	   *x = falloc(D);
+		float	   *xc = falloc(D);
+		float	   *y = falloc(D);
+		float	   *mean = falloc(D);
+		EncBufs		b;
+		bool		exact = true;
+		bool		near = true;
+		bool		proj = true;
+		double		rel = 0.0;
+		int			trial;
+		int			i;
+
+		enc_alloc(&b, D);
+		for (i = 0; i < D; i++)
+			mean[i] = (float) (rnd_gauss() * 0.3);
+		for (trial = 0; trial < 40; trial++)
+		{
+			double		n2;
+			double		e2 = 0.0;
+			double		ye = 0.0;
+
+			for (i = 0; i < D; i++)
+				x[i] = mean[i] + (float) (rnd_gauss() * (0.1 + trial % 4));
+			lionvec_encode(mean, D, x, &b.e);	/* centres x */
+			memcpy(xc, x, sizeof(float) * D);
+			lionvec_decode8(b.codes, D, b.e.norm, b.e.alpha8, b.e.rnorm8, y);
+			n2 = dot_ff(xc, xc, D);
+			for (i = 0; i < D; i++)
+			{
+				double		e = (double) xc[i] - y[i];
+
+				e2 += e * e;
+				ye += e * y[i];
+			}
+			/* float rounding of each coordinate is far below the codes' error */
+			exact &= fabs(e2 - n2 * (1.0 - (double) b.e.alpha8 * b.e.alpha8)) <=
+				1e-3 * n2 * (1.0 - (double) b.e.alpha8 * b.e.alpha8) + 1e-9 * n2;
+			/* a 32nd of a standard deviation a coordinate, and the rare clipped one */
+			near &= e2 <= 0.03 * 0.03 * n2;
+			rel += sqrt(e2 / n2);
+			/* the error is orthogonal to y: y is x's projection */
+			proj &= fabs(ye) <= 1e-4 * n2;
+		}
+		CHECK(exact, "decode8 is not |x|^2 (1 - alpha8^2) from x");
+		CHECK(near, "decode8 is more than 3% of |x| from x");
+		/* (1/32) / sqrt(12) = 0.9% of |x| for uniform rounding */
+		CHECK(rel / 40 < 0.012, "decode8 is on average more than 1.2% of |x| from x");
+		CHECK(proj, "decode8 is not x's projection on the codes' vector");
+
+		/* a row at the mean: codes with no length */
+		memcpy(x, mean, sizeof(float) * D);
+		lionvec_encode(mean, D, x, &b.e);
+		lionvec_decode8(b.codes, D, b.e.norm, b.e.alpha8, b.e.rnorm8, y);
+		{
+			bool		zero = true;
+
+			for (i = 0; i < D; i++)
+				zero &= y[i] == 0.0f;
+			CHECK(zero, "decode8 of a vector at the mean is not zero");
+		}
+		lionvec_decode8(b.codes, D, 1.0f, 1.0f, 0.0f, y);
+		{
+			bool		zero = true;
+
+			for (i = 0; i < D; i++)
+				zero &= y[i] == 0.0f;
+			CHECK(zero, "decode8 of codes of no length is not zero");
+		}
+		enc_free(&b);
+		free(mean);
+		free(y);
+		free(xc);
+		free(x);
+	}
+}
+
+/* SOAR's cost of c, the obvious way: rhat as a vector, then the projection */
+static double
+soar_cost_ref(const float *x, const float *c1, const float *c, int D, double lambda)
+{
+	double	   *rhat = (double *) xmalloc(sizeof(double) * D);
+	double		rn = 0.0;
+	double		d2 = 0.0;
+	double		p = 0.0;
+	int			i;
+
+	for (i = 0; i < D; i++)
+	{
+		rhat[i] = (double) x[i] - c1[i];
+		rn += rhat[i] * rhat[i];
+	}
+	rn = sqrt(rn);
+	for (i = 0; i < D; i++)
+	{
+		double		d = (double) x[i] - c[i];
+
+		if (rn > 0.0)
+			p += rhat[i] / rn * d;
+		d2 += d * d;
+	}
+	free(rhat);
+	return d2 + lambda * p * p;
+}
+
+/*
+ * SOAR's choice on vectors whose answer is known: x at the origin, c1 at
+ * -e0, so that the residual points along e0; a candidate at e0, 1 away and
+ * straight along it, costs 1 + lambda; one at t e1, t away and square to
+ * it, t^2.  So with lambda = 1 the square one wins below t = sqrt(2) and
+ * loses above it, and with lambda = 0 the nearer wins.  Then the cost's
+ * algebra against soar_cost_ref() on random vectors; one candidate, none,
+ * identical ones (the first), a row at c1 (no residual: the nearest), and
+ * a candidate that is not a number.
+ */
+static void
+test_soar_algebra(void)
+{
+	int			D = 64;
+	float	   *x = falloc(D);
+	float	   *c1 = falloc(D);
+	float	   *a = falloc(D);
+	float	   *b = falloc(D);
+	float	   *c = falloc(D);
+	const float *cs[4];
+	bool		ok = true;
+	int			trial;
+	int			i;
+
+	cur_phase = "soar";
+	memset(x, 0, sizeof(float) * D);
+	memset(c1, 0, sizeof(float) * D);
+	memset(a, 0, sizeof(float) * D);
+	memset(b, 0, sizeof(float) * D);
+	c1[0] = -1.0f;
+	a[0] = 1.0f;
+
+	b[1] = 1.4f;
+	cs[0] = a;
+	cs[1] = b;
+	CHECK(fabs(lionvec_soar_cost(x, c1, a, D, 1.0) - 2.0) < 1e-12, "soar: along the residual costs 2");
+	CHECK(fabs(lionvec_soar_cost(x, c1, b, D, 1.0) - 1.4 * 1.4) < 1e-6, "soar: square to it costs t^2");
+	CHECK(fabs(lionvec_soar_cost(x, c1, a, D, 0.5) - 1.5) < 1e-12, "soar: lambda scales the parallel part");
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, 1.0) == 1, "soar: t = 1.4 is not chosen");
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, 0.0) == 0, "soar: lambda 0 is not the nearest");
+	b[1] = 1.42f;
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, 1.0) == 0, "soar: t = 1.42 is chosen");
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, LIONVEC_SOAR_LAMBDA) == 0, "soar: the default lambda is not 1");
+	b[1] = 1.4f;
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, LIONVEC_SOAR_LAMBDA) == 1, "soar: the default lambda is not 1");
+
+	/* the algebra, against the obvious way */
+	for (trial = 0; trial < 200; trial++)
+	{
+		double		lambda = trial % 3 == 0 ? 1.0 : 3.0 * rnd_unit();
+		double		got;
+		double		want;
+
+		for (i = 0; i < D; i++)
+		{
+			x[i] = (float) rnd_gauss();
+			c1[i] = (float) (x[i] + rnd_gauss() * 0.3);
+			c[i] = (float) (x[i] + rnd_gauss() * 0.5);
+		}
+		got = lionvec_soar_cost(x, c1, c, D, lambda);
+		want = soar_cost_ref(x, c1, c, D, lambda);
+		ok &= fabs(got - want) <= 1e-9 * (1.0 + want);
+		/* lambda = 1: |d|^2 (1 + cos^2) of the angle between d and r */
+		if (lambda == 1.0)
+		{
+			double		d2 = 0.0;
+			double		rd = 0.0;
+			double		r2 = 0.0;
+
+			for (i = 0; i < D; i++)
+			{
+				double		d = (double) x[i] - c[i];
+				double		r = (double) x[i] - c1[i];
+
+				d2 += d * d;
+				rd += r * d;
+				r2 += r * r;
+			}
+			ok &= fabs(got - d2 * (1.0 + rd * rd / (r2 * d2))) <= 1e-9 * (1.0 + got);
+		}
+	}
+	CHECK(ok, "soar: the cost is not |d|^2 + lambda <rhat, d>^2");
+
+	/* one candidate, none, identical ones */
+	cs[0] = c;
+	CHECK(lionvec_soar_second(x, c1, cs, 1, D, 1.0) == 0, "soar: one candidate is not chosen");
+	CHECK(lionvec_soar_second(x, c1, cs, 0, D, 1.0) == -1, "soar: no candidates");
+	cs[0] = cs[1] = cs[2] = cs[3] = c;
+	CHECK(lionvec_soar_second(x, c1, cs, 4, D, 1.0) == 0, "soar: identical candidates are not a tie to the first");
+
+	/* a row at c1: no residual, so the nearest */
+	memcpy(c1, x, sizeof(float) * D);
+	for (i = 0; i < D; i++)
+	{
+		a[i] = (float) (x[i] + rnd_gauss() * 0.5);
+		b[i] = (float) (x[i] + rnd_gauss() * 0.2);
+	}
+	cs[0] = a;
+	cs[1] = b;
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, 1.0) == 1, "soar: a row at c1 does not go to the nearest");
+	CHECK(fabs(lionvec_soar_cost(x, c1, a, D, 1.0) - soar_cost_ref(x, c1, a, D, 0.0)) <
+		  1e-9 * (1.0 + soar_cost_ref(x, c1, a, D, 0.0)), "soar: a row at c1 costs |d|^2");
+
+	/* not a number: never chosen over a number, and infinite */
+	a[3] = NAN;
+	cs[0] = a;
+	CHECK(isinf(lionvec_soar_cost(x, c1, a, D, 1.0)), "soar: a NaN cost is not infinite");
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, 1.0) == 1, "soar: a NaN candidate is chosen");
+	cs[1] = a;
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, 1.0) == 0, "soar: all NaN, not the first");
+
+	free(c);
+	free(b);
+	free(a);
+	free(c1);
+	free(x);
+}
+
+/*
+ * SOAR's choice on clustered rows, as the build makes it: each row's
+ * nearest centroid by L2, the next LIONVEC_SOAR_CANDS nearest as the
+ * candidates, nearest first.  The choice has the least cost of them all by
+ * the reference; it differs from the plain second-nearest in a measurable
+ * share of rows, and when it does it lies further off the residual's line;
+ * with lambda 0 it is the second-nearest.  Made as an insert makes it, from
+ * centroids decoded from their 8-bit codes, it is the same for nearly every
+ * row, and otherwise one whose cost is within a percent.
+ */
+static void
+test_soar_clustered(void)
+{
+	static const int dims[] = {64, 384, 1536};
+	int			di;
+
+	cur_phase = "soar clustered";
+	for (di = 0; di < (int) lengthof(dims); di++)
+	{
+		int			D = dims[di];
+		int			k = 120;
+		int			T = 12;
+		int			n = 600;
+		int			m = LIONVEC_SOAR_CANDS + 1;
+		float	   *centers = falloc(T * D);
+		float	   *cent = falloc(k * D);
+		float	   *dec = falloc(k * D);
+		float	   *x = falloc(D);
+		double	   *dist = (double *) xmalloc(sizeof(double) * k);
+		int			near[LIONVEC_SOAR_CANDS + 1];
+		const float *cs[LIONVEC_SOAR_CANDS];
+		const float *ds[LIONVEC_SOAR_CANDS];
+		EncBufs		b;
+		long		differs = 0;
+		long		agree = 0;
+		long		close = 0;
+		double		cos_soar = 0.0;
+		double		cos_plain = 0.0;
+		bool		least = true;
+		bool		plain = true;
+		int			row;
+		int			i;
+		int			j;
+
+		enc_alloc(&b, D);
+		for (i = 0; i < T * D; i++)
+			centers[i] = (float) rnd_gauss();
+		for (j = 0; j < k; j++)
+			for (i = 0; i < D; i++)
+				cent[(Size) j * D + i] = centers[(Size) (j % T) * D + i] +
+					(float) (rnd_gauss() * 0.4);
+		/* the centroids as an insert sees them */
+		for (j = 0; j < k; j++)
+		{
+			memcpy(x, cent + (Size) j * D, sizeof(float) * D);
+			lionvec_encode(NULL, D, x, &b.e);
+			lionvec_decode8(b.codes, D, b.e.norm, b.e.alpha8, b.e.rnorm8, dec + (Size) j * D);
+		}
+
+		for (row = 0; row < n; row++)
+		{
+			int			c = (int) (rnd64() % k);
+			const float *c1;
+			int			s;
+			int			sd;
+			double		best;
+
+			for (i = 0; i < D; i++)
+				x[i] = cent[(Size) c * D + i] + (float) (rnd_gauss() * 0.4);
+			for (j = 0; j < k; j++)
+			{
+				dist[j] = 0.0;
+				for (i = 0; i < D; i++)
+				{
+					double		t = (double) x[i] - cent[(Size) j * D + i];
+
+					dist[j] += t * t;
+				}
+			}
+			(void) lionvec_rank(dist, k, m, near);
+			c1 = cent + (Size) near[0] * D;
+			for (j = 1; j < m; j++)
+			{
+				cs[j - 1] = cent + (Size) near[j] * D;
+				ds[j - 1] = dec + (Size) near[j] * D;
+			}
+			s = lionvec_soar_second(x, c1, cs, m - 1, D, 1.0);
+			plain &= lionvec_soar_second(x, c1, cs, m - 1, D, 0.0) == 0;
+			best = soar_cost_ref(x, c1, cs[s], D, 1.0);
+			for (j = 0; j < m - 1; j++)
+				least &= best <= soar_cost_ref(x, c1, cs[j], D, 1.0) * (1.0 + 1e-9);
+			if (s != 0)
+			{
+				double		r2 = 0.0;
+				double		rp = 0.0;
+				double		rs = 0.0;
+				double		p2 = 0.0;
+				double		s2 = 0.0;
+
+				differs++;
+				for (i = 0; i < D; i++)
+				{
+					double		r = (double) x[i] - c1[i];
+					double		dp = (double) x[i] - cs[0][i];
+					double		ds2 = (double) x[i] - cs[s][i];
+
+					r2 += r * r;
+					rp += r * dp;
+					rs += r * ds2;
+					p2 += dp * dp;
+					s2 += ds2 * ds2;
+				}
+				cos_plain += rp * rp / (r2 * p2);
+				cos_soar += rs * rs / (r2 * s2);
+			}
+
+			/* as an insert chooses: of decoded centroids */
+			sd = lionvec_soar_second(x, dec + (Size) near[0] * D, ds, m - 1, D, 1.0);
+			agree += sd == s;
+			close += sd == s ||
+				soar_cost_ref(x, c1, cs[sd], D, 1.0) <= best * 1.01;
+		}
+		printf("vec_test: dims %4d: SOAR chose other than the second-nearest for %.1f%% of rows "
+			   "(cos^2 to the residual %.3f, against %.3f); decoded centroids agreed on %.1f%%\n",
+			   D, 100.0 * differs / n, cos_soar / Max(differs, 1), cos_plain / Max(differs, 1),
+			   100.0 * agree / n);
+		CHECK(least, "soar: the choice does not have the least cost");
+		CHECK(plain, "soar: lambda 0 is not the second-nearest");
+		CHECK(differs >= n / 10 && differs < n, "soar: the choice is the second-nearest too often, or never");
+		CHECK(cos_soar < cos_plain, "soar: its choices lie no further off the residual than the second-nearest");
+		CHECK(agree >= n * 9 / 10, "soar: decoded centroids choose otherwise too often");
+		CHECK(close == n, "soar: a decoded choice costs more than a percent above the float one");
+
+		enc_free(&b);
+		free(dist);
+		free(x);
+		free(dec);
+		free(cent);
+		free(centers);
+	}
+}
+
 /* ---------- an inner product's partition bound ---------- */
 
 /*
@@ -1558,6 +2144,11 @@ main(void)
 	test_lift();
 	test_candidates();
 	test_kmeans();
+	test_rank();
+	test_candidates_n();
+	test_decode8();
+	test_soar_algebra();
+	test_soar_clustered();
 	test_coverage();
 
 	printf("vec_test: %ld checks, %ld failed\n", nchecks, nfail);

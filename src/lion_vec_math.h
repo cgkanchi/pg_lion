@@ -173,6 +173,57 @@ extern int	lionvec_candidates(const LionVecCentroids *c, const LionVecQuery *q,
 							   double *lo, double *hi, int *cand);
 
 /*
+ * ... and the centroids that can be among the m nearest (1 <= m <=
+ * LIONVEC_RANK_MAX), those whose lower bound is no more than the m-th least
+ * upper bound: at least min(m, k) of them.  m = 1 is lionvec_candidates().
+ */
+#define LIONVEC_RANK_MAX		16
+extern int	lionvec_candidates_n(const LionVecCentroids *c, const LionVecQuery *q,
+								 int m, double *lo, double *hi, int *cand);
+
+/*
+ * The m least of key[0 .. n), as their places in key, least first: into
+ * order[], which must hold min(n, m) of them, and how many that is.  Ties go
+ * to the lower place, and a NaN key counts as infinite.
+ */
+extern int	lionvec_rank(const double *key, int n, int m, int *order);
+
+/*
+ * Spill (DESIGN.md §44.3): an index that spills keeps every row with a
+ * vector in two partitions, its nearest centroid c1's and a second, chosen
+ * by SOAR (Sun and others, NeurIPS 2023): of the LIONVEC_SOAR_CANDS
+ * centroids next nearest after c1, the one that minimizes
+ *
+ *		|x - c|^2 + lambda <r / |r|, x - c>^2,		r = x - c1
+ *
+ * - a centroid near the row, and off the line of its residual r, so that a
+ * query whose nearest rows are the row lies where c1's partition was likely
+ * to be passed by (where the query lies along r beyond the row) finds the
+ * row in the second instead.  lambda = 0 is the plain second-nearest.
+ * lionvec_soar_cost() is that cost of a centroid c, x, c1 and c dimsp
+ * floats alike centred; lionvec_soar_second() the place in cands[0 .. n) of
+ * the one of least cost, ties to the lower place (the nearer, when cands are
+ * nearest first), or -1 when n is 0.  A row at c1 has no residual and costs
+ * |x - c|^2; a cost that is not a number counts as infinite.
+ */
+#define LIONVEC_SOAR_CANDS		8
+#define LIONVEC_SOAR_LAMBDA		1.0
+extern double lionvec_soar_cost(const float *x, const float *c1, const float *c,
+								int dimsp, double lambda);
+extern int	lionvec_soar_second(const float *x, const float *c1,
+								const float *const *cands, int n, int dimsp,
+								double lambda);
+
+/*
+ * A vector from its 8-bit codes, norm (|x|), alpha8 and rnorm8 (|r|), as an
+ * index stores a centroid's: x's projection on r, |x| alpha8 r / |r|, the
+ * nearest vector to x in r's direction, |x| sqrt(1 - alpha8^2) from it.
+ * Zeros for codes with no length.
+ */
+extern void lionvec_decode8(const uint8 *codes, int dimsp, float norm,
+							float alpha8, float rnorm8, float *x);
+
+/*
  * A sample of the rows, for k-means: each one rotated, not centred (the
  * mean is not known when the sample is taken), and held as its 8-bit codes,
  * so that a sample of 1536 dimensions takes 1.5 KB a row, not 6.  Row i is

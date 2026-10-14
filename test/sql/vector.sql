@@ -10,11 +10,17 @@
 -- is off, so that the scan never pauses before it has; the default epsilon's
 -- own rate is the unit tests', and the default margin's and patience's
 -- recall is measured at the end.
+--
+-- Every index spills by default (DESIGN.md §44.3): each row with a vector
+-- is in two partitions, so the comparisons are also of a scan that must
+-- return each row once.  vt_spill() reads the CODE items off the pages to
+-- show where the copies are.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_lion_vector;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
 RESET client_min_messages;
 SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
@@ -97,6 +103,80 @@ BEGIN
 				  coalesce(array_length(ad, 1), 0));
 END $$;
 
+/*
+ * vt_items() reads a lionvec index's CODE items off its pages (pageinspect):
+ * each one's block, its row's TID, its flags - 1 a NULL row, 2 a cosine zero
+ * vector, 4 a row's copy in its second partition (DESIGN.md §44.2) - and the
+ * rest of its bytes.  vt_spill() sums them up with the meta page's format
+ * version and flags (1: the index spills): the rows (the items that are not
+ * copies), the copies, the NULL rows and zeros, and whether every row has
+ * one item of its own and at most one copy, the same but for the flag and on
+ * a page of another chain.  vt_strays() counts the items of rows the table
+ * does not have.  The offsets assume a little-endian server.
+ */
+CREATE FUNCTION vt_u16(p bytea, o int) RETURNS int LANGUAGE sql IMMUTABLE AS
+$$ SELECT get_byte(p, o) | (get_byte(p, o + 1) << 8) $$;
+CREATE FUNCTION vt_items(idx regclass)
+RETURNS TABLE (blk int, row_tid tid, flags int, rest bytea)
+LANGUAGE plpgsql AS $$
+DECLARE
+	bs int := current_setting('block_size')::int;
+	p bytea;
+	b int;
+	i int;
+	lp bigint;
+	o int;
+BEGIN
+	FOR b IN 1 .. pg_relation_size(idx) / bs - 1 LOOP
+		p := get_raw_page(idx::text, b);
+		-- the special space's last two words: the page's type (2, CODE) and lionvec's id
+		CONTINUE WHEN vt_u16(p, bs - 4) <> 2 OR vt_u16(p, bs - 2) <> 65420;
+		FOR i IN 1 .. (vt_u16(p, 12) - 24) / 4 LOOP
+			lp := vt_u16(p, 20 + 4 * i)::bigint | (vt_u16(p, 22 + 4 * i)::bigint << 16);
+			CONTINUE WHEN (lp >> 15) & 3 <> 1;		-- not LP_NORMAL
+			o := (lp & 32767)::int;
+			blk := b;
+			row_tid := format('(%s,%s)', (vt_u16(p, o)::bigint << 16) | vt_u16(p, o + 2),
+							  vt_u16(p, o + 4))::tid;
+			flags := vt_u16(p, o + 6);
+			rest := substr(p, o + 1, 6) || substr(p, o + 9, (lp >> 17)::int - 8);
+			RETURN NEXT;
+		END LOOP;
+	END LOOP;
+END $$;
+CREATE FUNCTION vt_spill(idx regclass) RETURNS text
+LANGUAGE sql AS $$
+	WITH it AS (SELECT * FROM vt_items(idx)),
+	r AS (SELECT row_tid, count(*) FILTER (WHERE flags & 4 = 0) AS own,
+				 count(*) FILTER (WHERE flags & 4 <> 0) AS copies,
+				 count(DISTINCT rest) AS bodies, count(DISTINCT blk) AS pages,
+				 bool_and(flags & 3 = 0) AS vec
+			FROM it GROUP BY row_tid)
+	SELECT format('format %s, flags %s: %s rows, %s copies, %s NULL or zero; %s',
+				  vt_u16(get_raw_page(idx::text, 0), 28),
+				  vt_u16(get_raw_page(idx::text, 0), 34),
+				  (SELECT count(*) FROM it WHERE flags & 4 = 0),
+				  (SELECT count(*) FROM it WHERE flags & 4 <> 0),
+				  (SELECT count(*) FROM it WHERE flags & 3 <> 0),
+				  CASE WHEN (SELECT bool_and(own = 1 AND (copies = 0 OR
+							(copies = 1 AND vec AND bodies = 1 AND pages = 2))) FROM r)
+					   THEN 'each row once, any copy the same on another page'
+					   ELSE 'MALFORMED' END)
+$$;
+CREATE FUNCTION vt_strays(idx regclass) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	n bigint;
+BEGIN
+	EXECUTE format('SELECT count(*) FROM vt_items(%L) WHERE row_tid NOT IN (SELECT ctid FROM %s)',
+				   idx, (SELECT indrelid::regclass FROM pg_index WHERE indexrelid = idx)) INTO n;
+	RETURN n;
+END $$;
+
+-- vt_ids() runs q, which returns a column id, and returns the ids.
+CREATE FUNCTION vt_ids(q text) RETURNS SETOF int
+LANGUAGE plpgsql AS $$ BEGIN RETURN QUERY EXECUTE q; END $$;
+
 -- 3000 rows in ten clusters, five NULL vectors and one of zeros; indexed in
 -- 20 partitions, which a table this small would not be by itself
 CREATE TABLE vt (id int PRIMARY KEY, cat int, v vector(40))
@@ -111,6 +191,11 @@ CREATE INDEX vt_l2 ON vt USING lionvec (v) WITH (partitions = 20);
 CREATE INDEX vt_ip ON vt USING lionvec (v vector_ip_ops) WITH (partitions = 20);
 CREATE INDEX vt_cos ON vt USING lionvec (v vector_cosine_ops) WITH (partitions = 20);
 VACUUM (ANALYZE) vt;
+
+-- each row with a vector in two partitions, its nearest and SOAR's second:
+-- two CODE items naming one REFINE item; NULL rows, and a cosine index's zero
+-- vector, once
+SELECT i AS index, vt_spill(i) FROM unnest('{vt_l2,vt_ip,vt_cos}'::regclass[]) i;
 
 SET pg_lion.vector_epsilon = 6;
 SET pg_lion.vector_margin = 100;
@@ -130,6 +215,40 @@ SELECT op, k, vec_cmp(format('SELECT id, v %s %s AS d FROM vt ORDER BY v %s %s L
 
 -- no LIMIT: every row, the NULL vectors last
 SELECT vec_cmp('SELECT id, v <-> vt_vec(5, 40) AS d FROM vt ORDER BY v <-> vt_vec(5, 40)');
+
+-- each row once, though it is in two partitions: past the table's rows, in
+-- order and by a walk (a NULL query's, and a cosine zero query's)
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_sort = off;
+SELECT op, count(*), count(DISTINCT id)
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op),
+	   LATERAL vt_ids(format('SELECT id FROM vt ORDER BY v %s vt_vec(77, 40, 0.5) LIMIT 5000', op)) id
+ GROUP BY op ORDER BY op;
+SELECT count(*), count(DISTINCT id)
+  FROM (SELECT id FROM vt ORDER BY v <-> (SELECT v FROM vt WHERE id = 3001)) s;
+SELECT count(*), count(DISTINCT id)
+  FROM (SELECT id FROM vt ORDER BY v <=> array_fill(0, ARRAY[40])::real[]::vector) s;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_sort;
+
+-- ties: 1,200 rows of 30 vectors, 40 rows each at every distance, in 12
+-- partitions - each row once, at its distance, at LIMITs that end a tie
+-- (within one, either plan may take any of its rows)
+CREATE TABLE vtt (id int, v vector(40));
+INSERT INTO vtt SELECT i, vt_vec(i % 30, 40) FROM generate_series(1, 1200) i;
+CREATE INDEX vtt_l2 ON vtt USING lionvec (v) WITH (partitions = 12);
+SELECT vt_spill('vtt_l2');
+SELECT k, vec_cmp(format('SELECT id, v <-> vt_vec(3, 40) AS d FROM vtt ORDER BY v <-> vt_vec(3, 40) LIMIT %s', k))
+  FROM (VALUES (40), (80), (600), (1200), (5000)) k(k) ORDER BY k;
+SET enable_seqscan = off;
+SET enable_sort = off;
+SELECT count(*), count(DISTINCT id)
+  FROM (SELECT id FROM vtt ORDER BY v <-> vt_vec(3, 40) LIMIT 5000) s;
+RESET enable_seqscan;
+RESET enable_sort;
+DROP TABLE vtt;
 
 -- a NULL query (a NULL row's: a constant NULL is folded away): every row,
 -- each at a NULL distance
@@ -154,6 +273,7 @@ SET pg_lion.vector_batch = 1;
 SELECT vec_cmp('SELECT id, v <-> vt_vec(11, 40) AS d FROM vt ORDER BY v <-> vt_vec(11, 40) LIMIT 300');
 SET work_mem = '64kB';
 SELECT vec_cmp('SELECT id, v <#> vt_vec(12, 40) AS d FROM vt ORDER BY v <#> vt_vec(12, 40) LIMIT 2000');
+SELECT vec_cmp('SELECT id, v <-> vt_vec(12, 40) AS d FROM vt ORDER BY v <-> vt_vec(12, 40) LIMIT 3006');
 RESET work_mem;
 RESET pg_lion.vector_batch;
 
@@ -162,6 +282,8 @@ RESET pg_lion.vector_batch;
 INSERT INTO vt
 SELECT i, 10, vt_vec(-11, 40, 4.0) + vt_vec(i, 40, 0.3)
   FROM generate_series(3007, 3600) i;
+-- each in two partitions, as the build would put it
+SELECT i AS index, vt_spill(i) FROM unnest('{vt_l2,vt_ip,vt_cos}'::regclass[]) i;
 SELECT op, k, vec_cmp(format('SELECT id, v %s %s AS d FROM vt ORDER BY v %s %s LIMIT %s',
 							 op, q, op, q, k)) AS result
   FROM vt_cases WHERE k IN (10, 3006) ORDER BY op, q, k;
@@ -171,6 +293,9 @@ SELECT vec_cmp('SELECT id, v <-> vt_vec(-11, 40, 4.0) AS d FROM vt ORDER BY v <-
 UPDATE vt SET v = vt_vec(id + 100000, 40) WHERE id % 7 = 0;
 DELETE FROM vt WHERE id % 3 = 0;
 VACUUM vt;
+-- both items of each row gone (and each REFINE item once: VACUUM would
+-- have failed on a second)
+SELECT i AS index, vt_spill(i), vt_strays(i) FROM unnest('{vt_l2,vt_ip,vt_cos}'::regclass[]) i;
 SELECT op, k, vec_cmp(format('SELECT id, v %s %s AS d FROM vt ORDER BY v %s %s LIMIT %s',
 							 op, q, op, q, k)) AS result
   FROM vt_cases WHERE k IN (10, 3006) ORDER BY op, q, k;
@@ -188,7 +313,23 @@ SELECT vec_cmp('SELECT id, v <-> vt_vec(1, 40) AS d FROM vt2 ORDER BY v <-> vt_v
 
 -- REINDEX, and a concurrent build
 REINDEX INDEX vt_l2;
+SELECT vt_spill('vt_l2');
 SELECT vec_cmp('SELECT id, v <-> vt_vec(14, 40) AS d FROM vt ORDER BY v <-> vt_vec(14, 40) LIMIT 100');
+-- spill is the build's: off takes a REINDEX, after which each row is in one
+-- partition, and the scan returns the same
+ALTER INDEX vt_l2 SET (spill = off);
+SELECT vt_spill('vt_l2');
+REINDEX INDEX vt_l2;
+SELECT vt_spill('vt_l2');
+SELECT vec_cmp('SELECT id, v <-> vt_vec(14, 40) AS d FROM vt ORDER BY v <-> vt_vec(14, 40) LIMIT 100');
+INSERT INTO vt SELECT i, 11, vt_vec(i, 40) FROM generate_series(5000, 5049) i;
+SELECT vt_spill('vt_l2');
+SELECT vec_cmp('SELECT id, v <-> vt_vec(14, 40) AS d FROM vt ORDER BY v <-> vt_vec(14, 40) LIMIT 300');
+DELETE FROM vt WHERE id >= 5000;
+VACUUM vt;
+ALTER INDEX vt_l2 RESET (spill);
+REINDEX INDEX vt_l2;
+SELECT vt_spill('vt_l2');
 DROP INDEX vt_l2;
 CREATE INDEX CONCURRENTLY vt_l2 ON vt USING lionvec (v) WITH (partitions = 20);
 SELECT vec_cmp('SELECT id, v <-> vt_vec(15, 40) AS d FROM vt ORDER BY v <-> vt_vec(15, 40) LIMIT 100');
@@ -221,6 +362,8 @@ CREATE INDEX ve_l2 ON ve USING lionvec (v);
 CREATE INDEX ve_ip ON ve USING lionvec (v vector_ip_ops);
 INSERT INTO ve VALUES (1, '[1,2,3]'), (2, '[3,2,1]'), (3, NULL), (4, '[0,0,1]');
 INSERT INTO ve VALUES (5, '[1,2,3,4]');
+-- no partitions, so no second one
+SELECT vt_spill('ve_l2');
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT id FROM ve ORDER BY v <-> '[1,1,2]' LIMIT 2;
 SELECT id, v <-> '[1,1,2]' AS d FROM ve ORDER BY v <-> '[1,1,2]';
@@ -233,6 +376,9 @@ CREATE UNLOGGED TABLE vu (id int, v vector(3));
 CREATE INDEX vu_l2 ON vu USING lionvec (v);
 INSERT INTO vu SELECT i, vt_vec(i, 3) FROM generate_series(1, 200) i;
 SELECT vec_cmp('SELECT id, v <-> ''[0.1,0.2,0.3]'' AS d FROM vu ORDER BY v <-> ''[0.1,0.2,0.3]'' LIMIT 20');
+-- one partition (a table under 10,000 rows): no second one
+REINDEX INDEX vu_l2;
+SELECT vt_spill('vu_l2');
 
 -- more partitions than rows: as many as the rows, one each; and none, of
 -- a table empty at the build, whose rows all go to the chain of rows in no
@@ -240,8 +386,11 @@ SELECT vec_cmp('SELECT id, v <-> ''[0.1,0.2,0.3]'' AS d FROM vu ORDER BY v <-> '
 DROP INDEX vt2_l2;
 CREATE INDEX vt2_many ON vt2 USING lionvec (v) WITH (partitions = 500);
 INSERT INTO vt2 SELECT * FROM vt WHERE id < 300 OR v IS NULL;
+-- the REST chain takes no copies
+SELECT vt_spill('vt2_many');
 SELECT vec_cmp('SELECT id, v <-> vt_vec(20, 40) AS d FROM vt2 ORDER BY v <-> vt_vec(20, 40) LIMIT 20');
 REINDEX INDEX vt2_many;
+SELECT vt_spill('vt2_many');
 SELECT vec_cmp('SELECT id, v <-> vt_vec(20, 40) AS d FROM vt2 ORDER BY v <-> vt_vec(20, 40) LIMIT 20');
 SELECT vec_cmp('SELECT id, v <-> vt_vec(20, 40) AS d FROM vt2 ORDER BY v <-> vt_vec(20, 40)');
 DROP INDEX vt2_many;
@@ -286,6 +435,37 @@ SET pg_lion.vector_margin = -10;
 SELECT vec_recall('SELECT id FROM vt ORDER BY v <-> vt_vec(77, 40, 0.5) LIMIT 100') < 1 AS "fewer";
 RESET pg_lion.vector_margin;
 
+-- spill against none, over two tables of the first 3,000 rows: at the
+-- defaults it finds as many of the nearest, and at a margin below zero,
+-- which leaves rows in partitions not probed, more - the rows near a
+-- partition's edge are in the next one too
+CREATE TABLE vs (id int, v vector(40));
+INSERT INTO vs SELECT i, vt_vec(-(i % 10) - 1, 40) + vt_vec(i, 40, 0.3)
+  FROM generate_series(1, 3000) i;
+CREATE TABLE vn AS SELECT * FROM vs;
+CREATE INDEX vs_l2 ON vs USING lionvec (v) WITH (partitions = 20);
+CREATE INDEX vs_ip ON vs USING lionvec (v vector_ip_ops) WITH (partitions = 20);
+CREATE INDEX vs_cos ON vs USING lionvec (v vector_cosine_ops) WITH (partitions = 20);
+CREATE INDEX vn_l2 ON vn USING lionvec (v) WITH (partitions = 20, spill = off);
+CREATE INDEX vn_ip ON vn USING lionvec (v vector_ip_ops) WITH (partitions = 20, spill = off);
+CREATE INDEX vn_cos ON vn USING lionvec (v vector_cosine_ops) WITH (partitions = 20, spill = off);
+VACUUM ANALYZE vs, vn;
+SELECT vt_spill('vs_l2') AS spill, vt_spill('vn_l2') AS "no spill";
+CREATE FUNCTION vt_recall_of(tbl text, op text) RETURNS float8
+LANGUAGE sql AS $$
+	SELECT avg(vec_recall(format('SELECT id FROM %s ORDER BY v %s %s LIMIT 10', tbl, op, q)))
+	  FROM (SELECT format('(vt_vec(-%s, 40) + vt_vec(%s, 40, 0.3))', s % 10 + 1, s + 9000) AS q
+			  FROM generate_series(1, 20) s) q
+$$;
+SELECT op, vt_recall_of('vs', op) >= vt_recall_of('vn', op) AS "as many"
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
+SET pg_lion.vector_margin = -2;
+SELECT op, vt_recall_of('vs', op) > vt_recall_of('vn', op) AS "more"
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
+RESET pg_lion.vector_margin;
+DROP FUNCTION vt_recall_of(text, text);
+DROP TABLE vs, vn;
+
 -- a scan that pauses at once, every partition within its margin: it still
 -- fills its LIMIT, in order, from the rows it holds and then the partitions
 -- after the pause
@@ -310,6 +490,8 @@ CREATE INDEX ON vbad USING lionvec (w);
 CREATE INDEX ON vbad USING lionvec (v, v);
 CREATE INDEX ON vt USING lionvec (v) WITH (partitions = -1);
 CREATE INDEX ON vt USING lionvec (v) WITH (partitions = 1000001);
+CREATE INDEX ON vt USING lionvec (v) WITH (spill = maybe);
+ALTER INDEX vt_l2 SET (spill = 2);
 SET pg_lion.vector_epsilon = 0.5;
 SET pg_lion.vector_batch = 0;
 SET pg_lion.vector_margin = 1001;
@@ -318,4 +500,9 @@ SET pg_lion.vector_patience = -1;
 DROP TABLE vt, vt2, vt_cases, ve, vu, vbad;
 DROP FUNCTION vec_cmp(text);
 DROP FUNCTION vec_recall(text);
+DROP FUNCTION vt_ids(text);
+DROP FUNCTION vt_strays(regclass);
+DROP FUNCTION vt_spill(regclass);
+DROP FUNCTION vt_items(regclass);
+DROP FUNCTION vt_u16(bytea, int);
 DROP FUNCTION vt_vec(bigint, int, float8);
