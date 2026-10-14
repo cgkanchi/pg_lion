@@ -20982,6 +20982,17 @@ plain scan at 10% read 455 and 791 pages (7.0 and 8.9 ms) against 589 and none r
 LionOrdered took 7.2 ms for 0.967) and at 1%. HNSW: 0.951 in 1.9 ms at `ef_search` 40, 0.979 in
 4.1 ms at 100.
 
+**Cold** (`cold.json`; the server restarted and the page cache dropped before each query, the
+median of 7, the index above and HNSW's). Unfiltered, lionvec at a margin of 3 (0.917) read 478
+pages in 22 ms, at 7 (0.95) 1,314 in 50 ms and at 12 (0.993) 1,378 in 61 ms; HNSW at `ef_search`
+40 (0.951) 926 in 50 ms and at 100 (0.979) 1,918 in 106 ms. Under the 3% filter LionOrdered at a
+margin of 3 (0.967) read 1,607 pages in 64 ms, where HNSW's iterative scan (0.953) read 5,365 in
+293 ms and the planner's sort of the bitmap scan's rows (exact, for either index) 5,620 in 209 to
+218 ms, every matching row's vector from TOAST; under 1% lionvec's exact path read 2,721 in 90 ms,
+HNSW's iterative scan (0.959) 11,870 in 539 ms. So cold, lionvec reads what HNSW reads unfiltered
+and three to four times less under a filter; on the million-row set it was 85 ms against 118
+unfiltered and 196 against 1,254 at 1% (above), not re-measured with spill.
+
 The share probed at a margin of 3, in 678 and 2,715 partitions: 2.2% and 1.4% unfiltered (§44.7's
 `0.46 C^(-1/3)`: 5.2% and 3.3%), 8.1% and 4.8% through the plain scan at 10% (9.7% and 6.1%), 14.9%
 and 10.3% through LionOrdered at 3% (13.5% and 8.5%). Between the sizes it fell by 1.4 to 1.7
