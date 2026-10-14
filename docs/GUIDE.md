@@ -401,31 +401,44 @@ The second plan reads
          Lion Indexes: items_cat
 ```
 
-The node builds the Lion set of the `WHERE`, and the vector scan reads the codes of only the
-pages that hold a member and scores only the members, so the `LIMIT` is filled from the matching
-rows whatever their share of the table; `Heap Fetches` in `EXPLAIN ANALYZE` counts the rows the node
-fetched, about `k`. Where nearly every row passes the filter the planner prefers the plain index
-scan with a `Filter`, and for a filter of a few hundred rows a sort of the Lion bitmap scan's rows.
-Between the two it chooses that sort too, where the node is two to four times faster, unless the
-distance functions cost 100 as above (pgvector's vectors are stored out of line, so the planner
-sees a small column and, at a cost of 1, a nearly free function; `pg_dump` does not keep the
-`ALTER FUNCTION`s, so run them again after a restore). `SET enable_sort = off` steers a single
-query the same way. `pg_lion.enable_ordered_scan = off` takes the node away. An HNSW index on the
-same column is chosen over `lionvec` for nearly every query, filtered or not: pgvector prices its
-scan as nearly free.
+Both answers are approximate, as HNSW's are: the index partitions the rows by k-means when it is
+built, and a scan reads the partitions whose centroids are nearest the query, nearest first, until
+the next centroid, less `pg_lion.vector_margin`, lies farther than the rows it has. A row in a
+partition it did not read is missed. On 975,000 OpenAI embeddings the default margin returns 97%
+of the true ten nearest, reading 7% of the rows; `SET pg_lion.vector_margin = 3` returns 98% in
+1.7 times the time, and 1 returns 94% in two thirds of it.
 
-What a scan did is in its `DEBUG1` line (`SET client_min_messages = debug1`). On 975,000 OpenAI
-embeddings, without a filter and then under one keeping 0.1% of the rows:
+The node builds the Lion set of the `WHERE`, and the vector scan scores only the members in the
+partitions it reads, so the `LIMIT` is filled from the matching rows whatever their share of the
+table; `Heap Fetches` in `EXPLAIN ANALYZE` counts the rows the node fetched, about `k`. A set of up
+to 2,000 rows is answered exactly, from every member's distance; a larger one by reading
+partitions as above, with a margin narrowed for the nearest matching rows lying farther out. Where
+a large share of the rows pass the filter (10% of a million or more, here) the planner prefers the
+plain index scan with a `Filter`, and for a filter of a few thousand rows a sort of the Lion bitmap
+scan's rows. Between the two it chooses that sort too, where the node is several times faster,
+unless the distance functions cost 100 as above (pgvector's vectors are stored out of line, so the
+planner sees a small column and, at a cost of 1, a nearly free function; `pg_dump` does not keep
+the `ALTER FUNCTION`s, so run them again after a restore). `SET enable_sort = off` steers a single query the same way.
+`pg_lion.enable_ordered_scan = off` takes the node away. An HNSW index on the same column is chosen
+over `lionvec` for nearly every query, filtered or not: pgvector prices its scan as nearly free.
+
+What a scan did is in its `DEBUG1` line (`SET client_min_messages = debug1`). On those 975,000
+embeddings, in 1,974 partitions, one query without a filter and then under one keeping 1% of the
+rows (a query probes 143 partitions on average unfiltered, but half of them 74 or fewer and one in
+twenty over 500: a query whose nearest rows lie far from every centroid reads many partitions):
 
 ```
-lionvec scan of "items_lv": 1 passes, 11472 candidates, 35 refined, 10 fetched, 10 returned, 0 skipped out of order, 0 bounds missed, 27858 pages read
-lionvec scan of "items_lv": 1 passes, 947 candidates, 76 refined, 10 fetched, 10 returned, 0 skipped out of order, 0 bounds missed, 965 pages read
+lionvec scan of "items_lv": 146 partitions probed, 1 passes, 11017 candidates, 60 refined, 10 fetched, 10 returned, 0 skipped out of order, 0 bounds missed, 2402 pages read
+lionvec scan of "items_lv": 454 partitions probed, 1 passes, 1108 candidates, 99 refined, 10 fetched, 10 returned, 0 skipped out of order, 0 bounds missed, 6887 pages read
 ```
 
-A pass reads the one-bit codes of every row (of every matching row, under a filter, and only the
-pages that hold one); candidates are the rows its bounds could not rule out, refined the ones
-whose 8-bit code was read, fetched the ones whose exact distance was computed from the table;
-bounds missed counts fetched rows that turned out nearer than their lower bound said, and pages
-read the code pages the passes read. A query that wants more rows than `pg_lion.vector_batch` makes more passes; a row "skipped out of
-order" was found after rows farther than it had been returned, which costs that row and nothing
-else. `pg_lion.vector_epsilon` widens or narrows the bounds (DESIGN.md §44.8).
+Partitions probed are the partitions whose rows the scan read; candidates the rows of those (the
+members, under a filter) that plane 1's bounds could not rule out; refined the ones whose 8-bit
+code was read, fetched the ones whose exact distance was computed from the table; bounds missed
+counts fetched rows that turned out nearer than their lower bound said, and pages read the code
+pages the probes read. A query that wants more rows than `pg_lion.vector_batch` makes more passes,
+each probing again the partitions probed so far; a row "skipped out of order" turned up after rows
+farther than it had been returned (it lay in a partition read later, or its bound failed), which
+costs that row and nothing else. A filter of up to 2,000 rows logs `N members fetched, N returned`
+instead. `pg_lion.vector_margin` reads more partitions or fewer, and `pg_lion.vector_epsilon`
+widens or narrows the bounds (DESIGN.md §44.8).

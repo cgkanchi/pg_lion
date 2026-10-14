@@ -140,28 +140,33 @@ The ten nearest of a query by cosine distance, `ORDER BY embedding <=> $1 LIMIT 
 OpenAI ada-002 embeddings of DBpedia entities (1536 dimensions; Qdrant's
 `dbpedia-openai-1M-1536-angular` set and the first 100 of its test queries), optionally under
 `WHERE u < s`, a uniform random column with a lion index that keeps a share `s` of the rows
-([script](../bench/vector/knn.py), [results](../bench/results/2026-10-14-lionvec/)). Against
-pgvector 0.8.6's HNSW on `embedding::halfvec(1536)` (m 16, ef_construction 64). PostgreSQL 16,
-4 vCPUs, 16 GB RAM, `shared_buffers` 5 GB, and pgvector's `vector` distance functions at
-`COST 100`, as lionvec's setup asks. Recall is the share of the true ten returned, against an
-exact numpy search.
+([script](../bench/vector/knn.py), [results](../bench/results/2026-10-14-lionvec-partitions/)).
+lionvec in its default 1,974 partitions, against pgvector 0.8.6's HNSW on
+`embedding::halfvec(1536)` (m 16, ef_construction 64). PostgreSQL 16, 4 vCPUs, 16 GB RAM,
+`shared_buffers` 5 GB, and pgvector's `vector` distance functions at `COST 100`, as lionvec's setup
+asks. Recall is the share of the true ten returned, against an exact numpy search. Both indexes
+are approximate.
 
-**Warm** (everything in memory), median of 100 queries:
+**Warm** (everything in memory), median of 100 queries and recall:
 
-| Filter | lionvec | HNSW ef_search 40 | HNSW ef_search 40, iterative scan |
-| --- | --- | --- | --- |
-| none | 96 ms, recall 1.000 | 6.6 ms, 0.900 | |
-| 10% | 138 ms, 1.000 | 4.6 ms, 0.393 (3.9 rows returned) | 7.4 ms, 0.931 |
-| 1% | 34 ms, 1.000 | 4.1 ms, 0.038 (0.4 rows returned) | 41 ms, 0.947 |
-| 0.1% | 6.6 ms, 1.000 | 12 ms, 0.999 (the planner sorts the filter's rows) | 11 ms, 0.999 |
+| Filter | lionvec (margin 2, the default) | lionvec, margin 3 | HNSW ef_search 40 | HNSW ef_search 100 |
+| --- | --- | --- | --- | --- |
+| none | 8.5 ms, 0.968 | 14 ms, 0.984 | 4.4 ms, 0.900 | 6.6 ms, 0.954 |
+| 10% | 32 ms, 0.989 | 53 ms, 0.996 | 7.6 ms, 0.931 | 6.7 ms, 0.939 |
+| 1% | 31 ms, 0.979 | 49 ms, 0.993 | 36 ms, 0.947 | 34 ms, 0.950 |
+| 0.1% | 11.5 ms, 1.000 | | 12.5 ms, 0.999 | |
+
+HNSW under a filter uses its iterative scan; without it, it returns 3.9 of the ten rows at 10% and
+0.4 at 1%. At 0.1% the planner sorts the 953 matching rows for either index. lionvec's 95th
+percentile is three to four times its median (37 ms unfiltered), HNSW's about one and a half.
 
 **Cold** (PostgreSQL restarted and the OS page cache dropped before each query), median of 5:
 
 | Filter | lionvec | HNSW ef_search 40 (iterative under a filter) |
 | --- | --- | --- |
-| none | 402 ms | 101 ms |
-| 1% | 196 ms | 1,307 ms |
-| 0.1% | 112 ms | 227 ms (the planner sorts the filter's rows) |
+| none | 197 ms | 104 ms |
+| 1% | 234 ms | 1,258 ms |
+| 0.1% | 236 ms | 222 ms (both: the planner sorts the filter's rows) |
 
 **Memory-capped** (a stream of queries, PostgreSQL and its page cache held to 1 or 2 GB by a
 memory cgroup with `shared_buffers` at 128 MB, the cache filled first), median of 100 and the
@@ -169,27 +174,24 @@ pages each query read from disk:
 
 | Memory | Filter | lionvec | HNSW ef_search 40 (iterative under a filter) |
 | --- | --- | --- | --- |
-| 1 GB | none | 157 ms, 100 pages | 54 ms, 765 pages |
-| 1 GB | 1% | 31 ms, 0 pages | 665 ms, 9,308 pages |
-| 2 GB | none | 161 ms, 25 pages | 39 ms, 672 pages |
-| 2 GB | 1% | 29 ms, 0 pages | 477 ms, 7,824 pages |
+| 1 GB | none | 17 ms, 94 pages | 52 ms, 766 pages |
+| 1 GB | 1% | 35 ms, 0 pages | 676 ms, 9,285 pages |
+| 2 GB | none | 16 ms, 41 pages | 41 ms, 671 pages |
+| 2 GB | 1% | 35 ms, 0 pages | 506 ms, 7,867 pages |
 
-lionvec keeps its one-bit codes in memory and reads only the rows it refines or fetches. HNSW
-reads 650 to 800 random pages a query without a filter and about 8,000 under one. This machine's
-disk answers a random read in well under a tenth of a millisecond, so HNSW stays faster without a
-filter here; on slower storage the page counts are what to compare.
+lionvec's working set is the centroids, the one-bit codes of the partitions queries probe, and the
+few rows they refine and fetch; under the 1% filter it never filled the cgroup. HNSW reads 650 to
+800 random pages a query without a filter and 8,000 to 9,000 under one. This machine's disk
+answers a random read in well under a tenth of a millisecond; on slower storage the page counts
+are what to compare.
 
-**Size and build.** lionvec is 1.7 GB, of which a query reads the 218 MB of one-bit codes; HNSW is
-3.8 GB. lionvec builds in 98 s with the table cached (683 s reading it from disk).
+**Size and build.** lionvec is 1.7 GB, of which an unfiltered query reads about 18 MB of one-bit
+codes; HNSW is 3.8 GB. lionvec builds in 19 minutes with the table cached, nearly all of it k-means
+and the assignment of every row to its nearest of the 1,974 centroids.
 
-lionvec returns the exact ten nearest whatever the filter (a row is missed only when an error bound
-of `pg_lion.vector_epsilon` standard deviations fails, which none did in these 400 queries). HNSW
-is far faster without a filter, at 90% recall (95% at ef_search 100, 7.6 ms). Under a filter its
-graph search returns rows that then fail the filter, so it returns fewer than ten unless
-iterative scans are on, and then still misses one row in twenty. At pgvector's own cost of 1 for
-its distance functions, the planner would sort the rows of the 10% and 1% filters rather than use
-lionvec, two to four times slower (548 and 82 ms in an earlier run). Times vary between runs by up
-to a fifth.
+An earlier, unpartitioned lionvec read every row's one-bit code and returned the exact ten: 96 ms
+unfiltered, 138 ms at 10%, 34 ms at 1% and 6.6 ms at 0.1%, and built in 98 s
+([results](../bench/results/2026-10-14-lionvec/)). Times vary between runs by up to a fifth.
 
 ## Size, build and writes (5M rows, all seven indexes)
 
