@@ -8,7 +8,9 @@
 -- chosen) and through the ordinary plan (the node off, everything else
 -- enabled), and the answers are compared: the distances in order, and the
 -- rows.  pg_lion.vector_epsilon and pg_lion.vector_margin are raised, and
--- pg_lion.vector_patience is off, as in vector.sql.
+-- pg_lion.vector_patience is off, as in vector.sql.  The indexes spill (each
+-- row in two partitions, DESIGN.md §44.3), so every comparison is also of a
+-- restricted scan that must return each member once.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
@@ -345,6 +347,58 @@ RESET enable_indexscan;
 RESET enable_sort;
 SET pg_lion.vector_patience = 0;
 
+/*
+ * vf_unique() runs q - which returns a column id - through the node, and
+ * through the vector scan with a Filter (the node off), and counts the rows
+ * and the distinct ones of each.
+ */
+CREATE FUNCTION vf_unique(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	a text;
+	b text;
+	used boolean := false;
+	ln text;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_sort', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		used := used OR ln ~ 'Custom Scan \(LionOrdered\)';
+	END LOOP;
+	EXECUTE 'SELECT format(''%s rows, %s distinct'', count(*), count(DISTINCT id)) FROM (' ||
+		q || ') s' INTO a;
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	EXECUTE 'SELECT format(''%s rows, %s distinct'', count(*), count(DISTINCT id)) FROM (' ||
+		q || ') s' INTO b;
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_sort', 'on', true);
+	RETURN format('%s: %s; ordinary: %s',
+				  CASE WHEN used THEN 'LionOrdered' ELSE 'no LionOrdered' END, a, b);
+END $$;
+
+-- each member once, though it is in two partitions: under filters that
+-- probe (9,000 and 2,500 members), past the members' count, at the default
+-- margin and patience and at the tests'
+SELECT op, f, vf_unique(format('SELECT id FROM vf WHERE %s ORDER BY v %s vf_vec(4, 24) LIMIT 20000',
+							   f, op)) AS result
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op),
+	   (VALUES ('cat <> 5'), ('tag < 25')) f(f)
+ ORDER BY op, f;
+-- (at the defaults a pause skips the few rows it finds too late, §44.4)
+RESET pg_lion.vector_margin;
+RESET pg_lion.vector_patience;
+SELECT op, vf_unique(format('SELECT id FROM vf WHERE cat <> 5 ORDER BY v %s vf_vec(4, 24) LIMIT 20000',
+							op)) ~ '^LionOrdered: (\d+) rows, \1 distinct; ordinary: (\d+) rows, \2 distinct$'
+	   AS "each once"
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
+SET pg_lion.vector_margin = 100;
+SET pg_lion.vector_patience = 0;
+
 -- inserts after the builds, then deletes and VACUUM
 INSERT INTO vf
 SELECT i, i % 10,
@@ -358,6 +412,9 @@ SELECT op, f, vf_ord(format('SELECT id, v %s vf_vec(4, 24) AS d FROM vf
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op),
 	   (VALUES ('tag = 3'), ('grp IN (3, 11)'), ('cat <> 5')) f(f)
  ORDER BY op, f;
+SELECT op, vf_unique(format('SELECT id FROM vf WHERE cat <> 5 ORDER BY v %s vf_vec(4, 24) LIMIT 20000',
+							op)) AS result
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
 DELETE FROM vf WHERE id % 4 = 0;
 VACUUM vf;
 SELECT op, f, vf_ord(format('SELECT id, v %s vf_vec(4, 24) AS d FROM vf
@@ -366,6 +423,9 @@ SELECT op, f, vf_ord(format('SELECT id, v %s vf_vec(4, 24) AS d FROM vf
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op),
 	   (VALUES ('tag = 3'), ('grp IN (3, 11)'), ('cat <> 5')) f(f)
  ORDER BY op, f;
+SELECT op, vf_unique(format('SELECT id FROM vf WHERE cat <> 5 ORDER BY v %s vf_vec(4, 24) LIMIT 20000',
+							op)) AS result
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
 
 -- off, the node is not offered: the vector scan filters instead (sorts are
 -- off, or sorting the lion scan's rows would be cheaper)
@@ -380,6 +440,7 @@ DEALLOCATE vfp;
 DEALLOCATE vfd;
 DROP TABLE vf, vf_cases, vfn, vfb;
 DROP FUNCTION vf_recall(text);
+DROP FUNCTION vf_unique(text);
 DROP FUNCTION vf_ord(text, text);
 DROP FUNCTION vf_run(text);
 DROP FUNCTION vf_vec(bigint, int, float8);

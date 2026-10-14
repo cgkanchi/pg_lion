@@ -451,30 +451,163 @@ int
 lionvec_candidates(const LionVecCentroids *c, const LionVecQuery *q,
 				   double *lo, double *hi, int *cand)
 {
+	return lionvec_candidates_n(c, q, 1, lo, hi, cand);
+}
+
+int
+lionvec_candidates_n(const LionVecCentroids *c, const LionVecQuery *q, int m,
+					 double *lo, double *hi, int *cand)
+{
 	int			nw = c->dimsp / 64;
-	double		least = INFINITY;
+	double		least[LIONVEC_RANK_MAX];	/* the m least upper bounds, ascending */
+	int			nleast = 0;
+	double		thr;
 	int			n = 0;
 	int			j;
 
 	Assert(c->dimsp == q->dimsp);
+	Assert(m >= 1 && m <= LIONVEC_RANK_MAX);
+	m = Max(1, Min(m, LIONVEC_RANK_MAX));
 	for (j = 0; j < c->k; j++)
 	{
 		double		est;
 		double		err;
+		int			i;
 
 		lionvec_estimate1(q, c->bits + (Size) j * nw, c->popcount[j],
 						  c->norm[j], c->alpha1[j], &est, &err);
 		lionvec_key_bounds(LIONVEC_L2, c->norm[j], 0.0, est, err, &lo[j], &hi[j]);
-		least = Min(least, hi[j]);
+		/* NaN bounds come back infinite, so every comparison here is total */
+		if (nleast == m && !(hi[j] < least[m - 1]))
+			continue;
+		i = nleast < m ? nleast++ : m - 1;
+		for (; i > 0 && least[i - 1] > hi[j]; i--)
+			least[i] = least[i - 1];
+		least[i] = hi[j];
 	}
+	/* fewer centroids than m: every one can be among the m nearest */
+	thr = nleast == m ? least[m - 1] : INFINITY;
 	for (j = 0; j < c->k; j++)
 	{
-		/* NaN bounds come back infinite, so the comparison keeps them */
-		if (lo[j] <= least)
+		if (lo[j] <= thr)
 			cand[n++] = j;
 	}
-	Assert(c->k == 0 || n > 0);
+	Assert(n >= Min(c->k, m));
 	return n;
+}
+
+int
+lionvec_rank(const double *key, int n, int m, int *order)
+{
+	int			r = 0;
+	int			j;
+
+	if (m <= 0)
+		return 0;
+	for (j = 0; j < n; j++)
+	{
+		double		kj = isnan(key[j]) ? INFINITY : key[j];
+		int			i;
+
+		if (r == m)
+		{
+			double		last = isnan(key[order[m - 1]]) ? INFINITY : key[order[m - 1]];
+
+			/* not less than the m-th: ties stay with the lower place */
+			if (!(kj < last))
+				continue;
+			i = m - 1;
+		}
+		else
+			i = r++;
+		for (; i > 0; i--)
+		{
+			double		ki = isnan(key[order[i - 1]]) ? INFINITY : key[order[i - 1]];
+
+			if (!(ki > kj))
+				break;
+			order[i] = order[i - 1];
+		}
+		order[i] = j;
+	}
+	return r;
+}
+
+/* the SOAR cost of c, given r = x - c1 and |r|^2 */
+static double
+lionvec_soar_cost_r(const float *x, const float *c1, double r2, const float *c,
+					int dimsp, double lambda)
+{
+	double		d2 = 0.0;
+	double		rd = 0.0;
+	double		cost;
+	int			i;
+
+	for (i = 0; i < dimsp; i++)
+	{
+		double		d = (double) x[i] - (double) c[i];
+
+		d2 += d * d;
+		rd += ((double) x[i] - (double) c1[i]) * d;
+	}
+	cost = r2 > 0.0 ? d2 + lambda * rd * rd / r2 : d2;
+	return isnan(cost) ? INFINITY : cost;
+}
+
+static double
+lionvec_residual2(const float *x, const float *c1, int dimsp)
+{
+	double		r2 = 0.0;
+	int			i;
+
+	for (i = 0; i < dimsp; i++)
+	{
+		double		r = (double) x[i] - (double) c1[i];
+
+		r2 += r * r;
+	}
+	return r2;
+}
+
+double
+lionvec_soar_cost(const float *x, const float *c1, const float *c, int dimsp,
+				  double lambda)
+{
+	return lionvec_soar_cost_r(x, c1, lionvec_residual2(x, c1, dimsp), c, dimsp,
+							   lambda);
+}
+
+int
+lionvec_soar_second(const float *x, const float *c1, const float *const *cands,
+					int n, int dimsp, double lambda)
+{
+	double		r2 = lionvec_residual2(x, c1, dimsp);
+	double		best = INFINITY;
+	int			besti = -1;
+	int			i;
+
+	for (i = 0; i < n; i++)
+	{
+		double		cost = lionvec_soar_cost_r(x, c1, r2, cands[i], dimsp, lambda);
+
+		if (besti < 0 || cost < best)
+		{
+			besti = i;
+			best = cost;
+		}
+	}
+	return besti;
+}
+
+void
+lionvec_decode8(const uint8 *codes, int dimsp, float norm, float alpha8,
+				float rnorm8, float *x)
+{
+	double		scale = rnorm8 > 0.0f ? (double) norm * alpha8 / rnorm8 : 0.0;
+	int			i;
+
+	for (i = 0; i < dimsp; i++)
+		x[i] = (float) (scale * lionvec_recon8[codes[i]]);
 }
 
 void
