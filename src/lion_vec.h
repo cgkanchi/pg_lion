@@ -5,12 +5,16 @@
  *		`vector` type, shipped beside lion (DESIGN.md section 44).
  *
  *		Every vector is rotated by a fixed random rotation, centred on the
- *		table's mean and quantized into eight nested bit-planes.  The first
- *		plane (one bit per dimension) is all a scan reads for every row; it
- *		gives each row's distance to the query with an error bound that holds
- *		with a chosen probability whatever the data, so only the rows that
- *		bound cannot rule out are refined from the other seven planes, and
- *		only the few those cannot order are compared exactly, from the heap.
+ *		table's mean and quantized into eight nested bit-planes.  The rows
+ *		are partitioned by k-means, and a scan reads the partitions whose
+ *		centroids are nearest the query, nearest first, until the next
+ *		partition's rows are taken to lie beyond the rows it has.  The first
+ *		plane (one bit per dimension) is all a scan reads of a partition's
+ *		rows; it gives each row's distance to the query with an error bound
+ *		that holds with a chosen probability whatever the data, so only the
+ *		rows that bound cannot rule out are refined from the other seven
+ *		planes, and only the few those cannot order are compared exactly,
+ *		from the heap.
  *
  *		The index is created by the pg_lion_vector extension, which needs
  *		pgvector; this library reads pgvector's on-disk format itself and
@@ -44,7 +48,7 @@
  * --------------------------------------------------------------------- */
 
 #define LIONVEC_MAGIC			0x4c56454d	/* "LVEM" */
-#define LIONVEC_VERSION			1
+#define LIONVEC_VERSION			2
 #define LIONVEC_METAPAGE		0
 
 /* The rotation's seed.  Kept in the meta page, so it can change later. */
@@ -55,7 +59,7 @@
 #define LIONVEC_PAGE_MEAN		1
 #define LIONVEC_PAGE_CODE		2
 #define LIONVEC_PAGE_REFINE		3
-#define LIONVEC_PAGE_DIR		4
+#define LIONVEC_PAGE_PART		4
 
 /* Identifies a lionvec page beside other AMs' (as GIN's and GiST's do). */
 #define LIONVEC_PAGE_ID			0xFF8C
@@ -84,12 +88,17 @@ typedef struct LionVecMetaData
 	int32		dimsp;			/* dims padded to a multiple of 64 */
 	uint32		seed;			/* the rotation's */
 	BlockNumber mean_head;		/* InvalidBlockNumber: the mean is zero */
-	BlockNumber code_head;		/* the CODE chain */
-	BlockNumber code_tail;
+	BlockNumber part_head;		/* the PART chain, or InvalidBlockNumber */
+	uint32		nparts;			/* the partitions it holds */
+	BlockNumber rest_head;		/* the CODE chain of rows in no partition */
+	BlockNumber rest_tail;
+	BlockNumber null_head;		/* the CODE chain of NULL rows and cosine zeros */
+	BlockNumber null_tail;
 	BlockNumber refine_tail;	/* where the next REFINE item goes */
-	BlockNumber dir_head;		/* the DIR chain, or InvalidBlockNumber */
-	uint32		nbuilt;			/* CODE pages the DIR chain describes; 0: none */
-	double		ntuples;		/* rows as of the build, for nothing but stats */
+	float4		scale;			/* the rows' standard deviation about their
+								 * centroids along one dimension, as built: the
+								 * unit of pg_lion.vector_margin */
+	double		ntuples;		/* rows as of the build */
 } LionVecMetaData;
 
 typedef LionVecMetaData *LionVecMeta;
@@ -132,17 +141,27 @@ typedef struct LionVecRefine
 #define LIONVEC_REFINE_SIZE(dimsp) (offsetof(LionVecRefine, codes) + (Size) (dimsp))
 
 /*
- * The DIR chain (DESIGN.md §44.2): for each of the nbuilt CODE pages the
- * build wrote - blocks code_head .. code_head + nbuilt - 1, in heap order -
- * the least and greatest TID key of its rows (LionVecDirEntry), over as many
- * pages as it takes.  Every row the build put on page i < nbuilt - 1 lies in
- * [dir[i].lo, dir[i].hi], and no later row goes there (inserts append to the
- * tail, which is page nbuilt - 1 or later), so a scan restricted to a set of
- * rows reads only the pages whose range holds one.
+ * A partition (DESIGN.md §44.2), an item of the PART chain: where its CODE
+ * chain starts and ends, how many rows the build put in it, and the centroid
+ * itself, coded as a row is - its plane 1 here and its 8-bit codes in a
+ * REFINE item, whose TID is (partno, 0), which no heap row's is.  The build
+ * writes the PART chain last; an insert changes only a partition's tail.
  */
-#define LIONVEC_DIR_PER_PAGE \
-	((int) ((BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - \
-			 MAXALIGN(sizeof(LionVecPageOpaqueData))) / sizeof(LionVecDirEntry)))
+typedef struct LionVecPart
+{
+	uint32		partno;			/* its place in the chain, from 0 */
+	BlockNumber head;			/* its CODE chain */
+	BlockNumber tail;			/* ... whose last page inserts append to */
+	uint32		nrows;			/* rows the build put in it */
+	LionVecCode cent;			/* the centroid's plane 1, as a row's */
+} LionVecPart;
+
+#define LIONVEC_PART_SIZE(dimsp) \
+	(offsetof(LionVecPart, cent) + LIONVEC_CODE_SIZE(dimsp))
+
+/* the TID of a centroid's REFINE item */
+#define LionVecCentTid(tid, partno) \
+	ItemPointerSet((tid), (BlockNumber) (partno), InvalidOffsetNumber)
 
 /*
  * The most dimensions an index takes: as many whole words as leave a REFINE
@@ -198,9 +217,24 @@ lionvec_chain_step(Relation index, uint64 *visited, BlockNumber *nblocks)
 	}
 }
 
-/* settings */
+/*
+ * Settings.  The margin is in standard deviations of the rows about their
+ * centroids (LionVecMetaData's scale); a restriction narrows it by
+ * LIONVEC_MARGIN_NARROW for each tenfold it thins the rows by
+ * (lion_vec_scan.c, lv_margin()).
+ */
+#define LIONVEC_MARGIN_DEFAULT	2.0
+#define LIONVEC_MARGIN_NARROW	1.3
+#define LIONVEC_MAX_PARTS		1000000
+
+/*
+ * A scan restricted to this many members or fewer computes every member's
+ * distance from the heap rather than probe partitions (DESIGN.md §44.6).
+ */
+#define LIONVEC_EXACT_MAX		2000
 extern double lionvec_epsilon;
 extern int	lionvec_batch;
+extern double lionvec_margin;
 
 /* lion_vec.c */
 extern void lion_vec_init(void);
@@ -215,8 +249,10 @@ extern LionVecCode *lionvec_code_at(Relation index, Page page, BlockNumber blk,
 extern LionVecRefine *lionvec_refine_at(Relation index, Page page,
 										BlockNumber blk, OffsetNumber off,
 										int dimsp, ItemPointer tid);
-extern LionVecDirEntry *lionvec_read_dir(Relation index,
-										 const LionVecMetaData *meta);
+extern LionVecPart *lionvec_part_at(Relation index, Page page, BlockNumber blk,
+									OffsetNumber off, int dimsp);
+extern BlockNumber *lionvec_chain_heads(Relation index,
+										const LionVecMetaData *meta, int *n);
 
 /* lion_vec_scan.c: the scan callbacks */
 extern IndexScanDesc lionvecbeginscan(Relation index, int nkeys, int norderbys);

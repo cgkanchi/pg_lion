@@ -144,41 +144,86 @@ extern void lionvec_estimate8(const LionVecQuery *q, const uint8 *codes,
 							  double *est, double *err);
 
 /*
- * A heap TID as the directory orders it (DESIGN.md §44.2): block, then
- * offset.
+ * Partitions (DESIGN.md §44.2): k centroids, each coded as a row is, and the
+ * k-means that finds them.  A row belongs to the centroid nearest it by L2;
+ * cosine's centroids are of unit length, as its rows are, so that nearest by
+ * L2 is nearest by angle too.
  */
-#define LIONVEC_TID_KEY(blk, off)	(((uint64) (blk) << 16) | (uint64) (off))
-#define LIONVEC_TID_KEY_BLOCK(k)	((uint32) ((k) >> 16))
+/* the width of the bounds a row's nearest centroids are found by */
+#define LIONVEC_ASSIGN_EPS		4.0
 
-/* A CODE page of the build's run, in the directory: its rows' least and greatest TID keys. */
-typedef struct LionVecDirEntry
+typedef struct LionVecCentroids
 {
-	uint64		lo;
-	uint64		hi;
-} LionVecDirEntry;
+	int			k;
+	int			dimsp;
+	const uint64 *bits;			/* [k][dimsp / 64]: plane 1 */
+	const uint16 *popcount;		/* [k] */
+	const float *norm;			/* [k]: |c|, c centred */
+	const float *alpha1;		/* [k] */
+} LionVecCentroids;
 
 /*
- * Whether dir[0 .. n - 1] is in the order lionvec_dir_mark() relies on:
- * each entry's lo no greater than its hi, and each page's rows in heap
- * blocks no later than the next page's (the block of dir[i].hi at most that
- * of dir[i + 1].lo).  Rows come to the build in heap block order, but not
- * always in offset order within a block (a HOT chain is indexed under its
- * root's offset), so the entries' ranges may overlap within a block.
+ * The centroids that can be the nearest to the row the query q was made from
+ * (lionvec_query_init(), LIONVEC_L2): each one's key bounds into lo[k] and
+ * hi[k], and into cand[k] the indices of those whose lower bound is no more
+ * than the least upper bound, which it returns the number of - at least one
+ * when k is.  The bounds' width is q's.
  */
-extern bool lionvec_dir_check(const LionVecDirEntry *dir, int n);
+extern int	lionvec_candidates(const LionVecCentroids *c, const LionVecQuery *q,
+							   double *lo, double *hi, int *cand);
 
 /*
- * The pages of the build's run a scan restricted to the TID keys [lo[j],
- * hi[j]], j < nranges, must read: page i < npages - 1 holds rows in [dir[i].lo,
- * dir[i].hi] only, and dir is in order (lionvec_dir_check()).  The ranges are
- * ascending and do not overlap, across calls too: *from carries where the
- * last call left off (0 before the first).  Each page that meets a range is
- * set in sel, a bitmap of npages - 1 bits; returns how many were newly set.
- * Page npages - 1, the tail as the build left it, is the caller's.
+ * A sample of the rows, for k-means: each one rotated, not centred (the
+ * mean is not known when the sample is taken), and held as its 8-bit codes,
+ * so that a sample of 1536 dimensions takes 1.5 KB a row, not 6.  Row i is
+ * scale[i] * lionvec_recon8[codes[i * dimsp + j]], j < dimsp.
  */
-extern int	lionvec_dir_mark(const LionVecDirEntry *dir, int npages,
-							 const uint64 *lo, const uint64 *hi, int nranges,
-							 int *from, uint64 *sel);
+typedef struct LionVecSample
+{
+	int			n;
+	int			dimsp;
+	const uint8 *codes;			/* [n][dimsp] */
+	const float *scale;			/* [n]: |x| / |r| */
+} LionVecSample;
+
+extern void lionvec_sample_row(const LionVecSample *s, int i, float *x);
+
+/*
+ * What lionvec_kmeans() works in: the caller's arrays, of the lengths given,
+ * so that it allocates nothing.
+ */
+typedef struct LionVecKmeansWork
+{
+	int		   *count;			/* [k] */
+	int		   *assign;			/* [n] */
+	uint64	   *bits;			/* [k][dimsp / 64] */
+	uint16	   *popcount;		/* [k] */
+	float	   *norm;			/* [k] */
+	float	   *alpha1;			/* [k] */
+	double	   *lo;				/* [k] */
+	double	   *hi;				/* [k] */
+	int		   *cand;			/* [k] */
+	float	   *x;				/* [dimsp] */
+	float	   *y;				/* [dimsp] */
+	uint8	   *codes;			/* [dimsp] */
+	float	   *qc;				/* [dimsp] */
+	uint64	   *planes;			/* [dimsp / 64][LIONVEC_QBITS] */
+} LionVecKmeansWork;
+
+/*
+ * Lloyd's k-means of the sample's n rows into k <= n centroids cent[k][dimsp]
+ * (rotated, not centred), over iters iterations from k distinct rows the
+ * seed picks; unit, the centroids are scaled to unit length after each
+ * (spherical k-means, for cosine).  Each row goes to its nearest centroid by
+ * L2, found among lionvec_candidates() by the exact distance; a centroid
+ * left with no rows takes half of the largest's (FAISS's way).  mean, the
+ * rows' (rotated; NULL: zero), centres the codes the candidates are found
+ * by, which only makes their bounds tighter.  Returns the iterations made:
+ * fewer than iters once an iteration moves no row.
+ */
+extern int	lionvec_kmeans(const LionVecSample *s, int k, int iters, bool unit,
+						   uint64 seed, const float *mean, float *cent,
+						   LionVecKmeansWork *w);
 
 /*
  * The scan orders rows by a KEY that is the distance up to a constant of the

@@ -7,7 +7,8 @@
 -- through the node (every core scan disabled, so that nothing else can be
 -- chosen) and through the ordinary plan (the node off, everything else
 -- enabled), and the answers are compared: the distances in order, and the
--- rows.  pg_lion.vector_epsilon is raised, as in vector.sql.
+-- rows.  pg_lion.vector_epsilon and pg_lion.vector_margin are raised, as in
+-- vector.sql.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
@@ -17,6 +18,7 @@ RESET client_min_messages;
 SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
 SET pg_lion.vector_epsilon = 6;
+SET pg_lion.vector_margin = 100;
 CREATE FUNCTION vf_vec(seed bigint, n int, scale float8 DEFAULT 1.0)
 RETURNS vector LANGUAGE sql IMMUTABLE AS $$
 	SELECT array_agg(((hashint8extended(seed * 1000 + j, 43) % 100000)::float8
@@ -401,17 +403,23 @@ RESET pg_lion.vector_batch;
 RESET hash_mem_multiplier;
 RESET work_mem;
 RESET plan_cache_mode;
--- a few heap blocks in every container key: the scan reads only the CODE
--- pages that hold them, by the build's directory (DESIGN.md §44.2), where
--- the keys alone would leave it every page.  A NULL query walks the CODE
--- pages and reads nothing else, so the index blocks it fetches are those
--- pages, counted against a filter every row passes.
+-- a few members in every container key.  A scan restricted to no more than
+-- 2,000 of them fetches each one's distance from the heap, and reads no
+-- CODE page (DESIGN.md §44.6); one restricted to more probes partitions, as
+-- an unrestricted scan does.
 CREATE TABLE vfb (id int, s int, v vector(64)) WITH (autovacuum_enabled = off);
 INSERT INTO vfb SELECT i, i % 2000, vf_vec(i, 64) FROM generate_series(1, 40000) i;
 CREATE INDEX vfb_l2 ON vfb USING lionvec (v);
 CREATE INDEX vfb_s ON vfb USING lion (s);
 VACUUM (FREEZE, ANALYZE) vfb;
 SELECT vf_ord('SELECT id, v <-> vf_vec(7, 64) AS d FROM vfb WHERE s < 10
+			   ORDER BY v <-> vf_vec(7, 64) LIMIT 10');
+        vf_ord        
+----------------------
+ LionOrdered, 10 rows
+(1 row)
+
+SELECT vf_ord('SELECT id, v <-> vf_vec(7, 64) AS d FROM vfb WHERE s < 200
 			   ORDER BY v <-> vf_vec(7, 64) LIMIT 10');
         vf_ord        
 ----------------------
@@ -447,10 +455,10 @@ SELECT pg_stat_clear_snapshot();
 
 SELECT vfb_blks() AS b0 \gset
 SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 10
-					   ORDER BY v <-> (SELECT NULL::vector)) s;
+					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10) s;
  count 
 -------
-   200
+    10
 (1 row)
 
 SELECT pg_stat_force_next_flush();
@@ -466,11 +474,11 @@ SELECT pg_stat_clear_snapshot();
 (1 row)
 
 SELECT vfb_blks() AS b1 \gset
-SELECT count(*) FROM (SELECT id FROM vfb WHERE s >= 0
-					   ORDER BY v <-> (SELECT NULL::vector)) s;
+SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 200
+					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10) s;
  count 
 -------
- 40000
+    10
 (1 row)
 
 SELECT pg_stat_force_next_flush();
@@ -496,6 +504,52 @@ SELECT :b1 - :b0 > 0 AS "read some", 4 * (:b1 - :b0) < :b2 - :b1 AS "read few";
 (1 row)
 
 DROP FUNCTION vfb_blks();
+/*
+ * vf_recall() runs q - which returns a column id - through the node and
+ * through a sequential scan and sort, and returns the share of the second's
+ * rows the first has.
+ */
+CREATE FUNCTION vf_recall(q text) RETURNS float8
+LANGUAGE plpgsql AS $$
+DECLARE
+	a int[];
+	b int[];
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_tidscan', 'off', true);
+	EXECUTE 'SELECT array_agg(id) FROM (' || q || ') s' INTO a;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_tidscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	EXECUTE 'SELECT array_agg(id) FROM (' || q || ') s' INTO b;
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	RETURN (SELECT count(*) FROM unnest(a) x WHERE x = ANY (b))::float8 /
+		greatest(cardinality(b), 1);
+END $$;
+-- the default margin, over a filter that leaves too many members to fetch
+-- one by one: the scan probes the partitions near the query, and misses
+-- few of its nearest members
+RESET pg_lion.vector_margin;
+SELECT op, avg(vf_recall(format('SELECT id FROM vf WHERE cat <> 5 AND v IS NOT NULL
+								  ORDER BY v %s vf_vec(-%s, 24) + vf_vec(%s, 24, 0.3)
+								  LIMIT 10', op, s % 10 + 1, s + 20000))) >= 0.9
+	   AS "most of the nearest"
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op), generate_series(1, 20) s
+ GROUP BY op ORDER BY op;
+ op  | most of the nearest 
+-----+---------------------
+ <#> | t
+ <-> | t
+ <=> | t
+(3 rows)
+
+SET pg_lion.vector_margin = 100;
 -- inserts after the builds, then deletes and VACUUM
 INSERT INTO vf
 SELECT i, i % 10,
@@ -562,6 +616,7 @@ RESET pg_lion.enable_ordered_scan;
 DEALLOCATE vfp;
 DEALLOCATE vfd;
 DROP TABLE vf, vf_cases, vfn, vfb;
+DROP FUNCTION vf_recall(text);
 DROP FUNCTION vf_ord(text, text);
 DROP FUNCTION vf_run(text);
 DROP FUNCTION vf_vec(bigint, int, float8);

@@ -6,14 +6,16 @@
 # [0, 1) so that `u < sel` keeps a share sel of the rows; Q.npy holds the
 # queries (unit vectors) and S.npy their exact cosine similarity to every row,
 # the ground truth.  The HNSW index is pgvector's on embedding::halfvec(1536)
-# (m = 16, ef_construction = 64), the lionvec one on embedding itself, the
-# filter's a lion index on u.
+# (m = 16, ef_construction = 64), the lionvec one on embedding itself (its
+# partitions found by k-means over as many rows as half of KNN_MWM, 1GB by
+# default, holds), the filter's a lion index on u.
 #
 # pgvector's distance functions are costed at 100, as docs/REFERENCE.md asks
 # of a lionvec installation (the planner otherwise sorts a filter's rows by
 # distance where the scan is faster).
 #
-#   knn.py setup              build the lionvec and lion indexes
+#   knn.py setup              build the lionvec and lion indexes (the
+#                             lionvec one again, if it is there)
 #   knn.py warm NQ            recall and latency, warm, every method and filter
 #   knn.py cold NQ            latency of each query just after a restart
 #   knn.py capped MB NQ       latency and disk reads of a stream of queries
@@ -31,9 +33,11 @@ lit = lambda q: '[' + ','.join('%.8f' % x for x in q) + ']'
 HNSW = ("SELECT id FROM items {w} ORDER BY embedding::halfvec(1536) <=> %(q)s::halfvec(1536) "
         "LIMIT 10")
 LION = "SELECT id FROM items {w} ORDER BY embedding <=> %(q)s::vector LIMIT 10"
-STATS = re.compile(r'lionvec scan of "[^"]*": (\d+) passes, (\d+) candidates, (\d+) refined, '
-                   r'(\d+) fetched, (\d+) returned, (\d+) skipped out of order, '
-                   r'(\d+) bounds missed, (\d+) pages read')
+STATS = re.compile(r'lionvec scan of "[^"]*": (\d+) partitions probed, (\d+) passes, '
+                   r'(\d+) candidates, (\d+) refined, (\d+) fetched, (\d+) returned, '
+                   r'(\d+) skipped out of order, (\d+) bounds missed, (\d+) pages read')
+EXACT = re.compile(r'lionvec scan of "[^"]*": (\d+) members fetched, (\d+) returned')
+MWM = os.environ.get('KNN_MWM', '1GB')
 
 
 DISTANCES = ('l2_distance(vector, vector)', 'vector_negative_inner_product(vector, vector)',
@@ -56,6 +60,8 @@ def setup():
     conn.execute('CREATE EXTENSION IF NOT EXISTS pg_lion')
     conn.execute('CREATE EXTENSION IF NOT EXISTS pg_lion_vector')
     cost_distances(conn)
+    conn.execute(f"SET maintenance_work_mem = '{MWM}'")
+    conn.execute('DROP INDEX IF EXISTS items_lv')
     for name, ddl in [('items_lv', 'CREATE INDEX items_lv ON items USING lionvec (embedding vector_cosine_ops)'),
                       ('items_ul', 'CREATE INDEX items_ul ON items USING lion (u)')]:
         if conn.execute('SELECT to_regclass(%s)', (name,)).fetchone()[0] is None:
@@ -99,7 +105,7 @@ def run(conn, name, sql, sel, settings, Q, gt, nq):
     for s in settings:
         cur.execute(s)
     cur.execute('SET client_min_messages = debug1')
-    rec, ts, nret, scans = [], [], [], []
+    rec, ts, nret, scans, exact = [], [], [], [], []
     for i in range(3):                           # warm the plan and the session
         cur.execute(sql, {'q': lit(Q[150 + i])})
         cur.fetchall()
@@ -115,6 +121,9 @@ def run(conn, name, sql, sel, settings, Q, gt, nq):
             g = STATS.search(m)
             if g:
                 scans.append([int(x) for x in g.groups()])
+            g = EXACT.search(m)
+            if g:
+                exact.append(int(g.group(1)))
     cur.execute('SET client_min_messages = warning')
     cur.execute('EXPLAIN ' + sql, {'q': lit(Q[0])})
     plan = ' / '.join(r[0].strip() for r in cur.fetchall()
@@ -124,10 +133,12 @@ def run(conn, name, sql, sel, settings, Q, gt, nq):
                p95_ms=float(np.percentile(ts, 95)), plan=re.sub(r"'\[[^]]*\]'", "'...'", plan))
     if scans:
         a = np.array(scans)
-        row.update(passes=float(a[:, 0].mean()), candidates=float(a[:, 1].mean()),
-                   refined=float(a[:, 2].mean()), fetched=float(a[:, 3].mean()),
-                   skipped=float(a[:, 5].mean()), missed=float(a[:, 6].mean()),
-                   pages=float(a[:, 7].mean()))
+        row.update(probes=float(a[:, 0].mean()), passes=float(a[:, 1].mean()),
+                   candidates=float(a[:, 2].mean()), refined=float(a[:, 3].mean()),
+                   fetched=float(a[:, 4].mean()), skipped=float(a[:, 6].mean()),
+                   missed=float(a[:, 7].mean()), pages=float(a[:, 8].mean()))
+    if exact:
+        row.update(members_fetched=float(np.mean(exact)))
     conn.remove_notice_handler(handler)
     print(json.dumps(row), flush=True)
     return row
@@ -135,8 +146,9 @@ def run(conn, name, sql, sel, settings, Q, gt, nq):
 
 def methods(sel):
     m = []
-    for eps in (3, 4):
-        m.append((f'lionvec eps={eps}', LION.format(w=where(sel)), [f'SET pg_lion.vector_epsilon = {eps}']))
+    for margin in (1, 2, 3):
+        m.append((f'lionvec margin={margin}', LION.format(w=where(sel)),
+                  [f'SET pg_lion.vector_margin = {margin}']))
     for ef in (40, 100):
         m.append((f'hnsw ef={ef}', HNSW.format(w=where(sel)), [f'SET hnsw.ef_search = {ef}']))
         if sel < 1.0:
@@ -177,9 +189,9 @@ def cold(nq):
     cost_distances(conn)
     conn.close()
     out = []
-    for name, sql, settings in [m for m in methods(1.0) if m[0] in ('lionvec eps=4', 'hnsw ef=40')] + \
+    for name, sql, settings in [m for m in methods(1.0) if m[0] in ('lionvec margin=2', 'hnsw ef=40')] + \
             [m for sel in (0.01, 0.001) for m in methods(sel)
-             if m[0] in ('lionvec eps=4', 'hnsw ef=40 iterative')]:
+             if m[0] in ('lionvec margin=2', 'hnsw ef=40 iterative')]:
         ts = []
         for i in range(nq):
             subprocess.run(['pg_ctlcluster'] + CLUSTER.split() + ['restart'], check=True)
@@ -229,8 +241,8 @@ def capped(mb, nq):
     conn.close()
     out = []
     try:
-        for name, sql, settings in [m for m in methods(1.0) if m[0] in ('lionvec eps=4', 'hnsw ef=40')] + \
-                [m for m in methods(0.01) if m[0] in ('lionvec eps=4', 'hnsw ef=40 iterative')]:
+        for name, sql, settings in [m for m in methods(1.0) if m[0] in ('lionvec margin=2', 'hnsw ef=40')] + \
+                [m for m in methods(0.01) if m[0] in ('lionvec margin=2', 'hnsw ef=40 iterative')]:
             subprocess.run(ctl + ['stop'], check=True)
             subprocess.run(['sh', '-c', 'sync; echo 3 > /proc/sys/vm/drop_caches'], check=True)
             with open(limit, 'w') as f:

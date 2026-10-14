@@ -443,84 +443,246 @@ lionvec_kernel_force(int which)
 #endif
 
 /* ----------------------------------------------------------------
- * The build's run of CODE pages against a set of heap TIDs
+ * Partitions: the nearest centroid, and k-means
  * ----------------------------------------------------------------
  */
 
-bool
-lionvec_dir_check(const LionVecDirEntry *dir, int n)
+int
+lionvec_candidates(const LionVecCentroids *c, const LionVecQuery *q,
+				   double *lo, double *hi, int *cand)
 {
+	int			nw = c->dimsp / 64;
+	double		least = INFINITY;
+	int			n = 0;
+	int			j;
+
+	Assert(c->dimsp == q->dimsp);
+	for (j = 0; j < c->k; j++)
+	{
+		double		est;
+		double		err;
+
+		lionvec_estimate1(q, c->bits + (Size) j * nw, c->popcount[j],
+						  c->norm[j], c->alpha1[j], &est, &err);
+		lionvec_key_bounds(LIONVEC_L2, c->norm[j], 0.0, est, err, &lo[j], &hi[j]);
+		least = Min(least, hi[j]);
+	}
+	for (j = 0; j < c->k; j++)
+	{
+		/* NaN bounds come back infinite, so the comparison keeps them */
+		if (lo[j] <= least)
+			cand[n++] = j;
+	}
+	Assert(c->k == 0 || n > 0);
+	return n;
+}
+
+void
+lionvec_sample_row(const LionVecSample *s, int i, float *x)
+{
+	const uint8 *codes = s->codes + (Size) i * s->dimsp;
+	float		scale = s->scale[i];
+	int			j;
+
+	Assert(i >= 0 && i < s->n);
+	for (j = 0; j < s->dimsp; j++)
+		x[j] = scale * lionvec_recon8[codes[j]];
+}
+
+static double
+lionvec_l2sq(const float *a, const float *b, int n)
+{
+	double		s = 0.0;
 	int			i;
 
 	for (i = 0; i < n; i++)
 	{
-		if (dir[i].lo > dir[i].hi)
-			return false;
-		if (i + 1 < n &&
-			LIONVEC_TID_KEY_BLOCK(dir[i].hi) > LIONVEC_TID_KEY_BLOCK(dir[i + 1].lo))
-			return false;
+		double		d = (double) a[i] - (double) b[i];
+
+		s += d * d;
 	}
-	return true;
+	return s;
 }
 
-/*
- * Page i meets [lo, hi] when dir[i].lo <= hi and dir[i].hi >= lo.  By blocks
- * the pages are in order - the block of dir[i].hi, and of dir[i].lo, never
- * falls from one page to the next - so the pages that can meet a range are a
- * run: from the least page whose rows reach the range's first block (found
- * by galloping, then bisecting, from where the last range's run began) to
- * the last whose rows start no later than its last block.  Each of those is
- * tested by TID key; within a block the pages' ranges may overlap, so a run
- * can set a page before one an earlier run set, which the bitmap allows.
- */
-int
-lionvec_dir_mark(const LionVecDirEntry *dir, int npages, const uint64 *lo,
-				 const uint64 *hi, int nranges, int *from, uint64 *sel)
+static void
+lionvec_unit(float *x, int n)
 {
-	int			last = npages - 1;	/* pages 0 .. last - 1 are ours */
-	int			n = 0;
+	double		n2 = 0.0;
+	int			i;
+
+	for (i = 0; i < n; i++)
+		n2 += (double) x[i] * (double) x[i];
+	if (n2 > 0.0)
+	{
+		double		inv = 1.0 / sqrt(n2);
+
+		for (i = 0; i < n; i++)
+			x[i] = (float) (x[i] * inv);
+	}
+}
+
+/* how far apart the halves of a split centroid start, as FAISS has it */
+#define LIONVEC_SPLIT_EPS		(1.0f / 1024.0f)
+
+int
+lionvec_kmeans(const LionVecSample *s, int k, int iters, bool unit,
+			   uint64 seed, const float *mean, float *cent,
+			   LionVecKmeansWork *w)
+{
+	int			dimsp = s->dimsp;
+	int			nw = dimsp / 64;
+	int			n = s->n;
+	pg_prng_state st;
+	LionVecCentroids cs;
+	LionVecQuery q;
+	int			made = 0;
+	int			i;
 	int			j;
 
-	for (j = 0; j < nranges && *from < last; j++)
+	Assert(dimsp >= 64 && dimsp % 64 == 0);
+	Assert(k >= 1 && k <= n);
+
+	/* k distinct rows to start from: a partial Fisher-Yates shuffle */
+	pg_prng_seed(&st, seed);
+	for (i = 0; i < n; i++)
+		w->assign[i] = i;
+	for (j = 0; j < k; j++)
 	{
-		uint32		blo = LIONVEC_TID_KEY_BLOCK(lo[j]);
-		uint32		bhi = LIONVEC_TID_KEY_BLOCK(hi[j]);
-		int			a = *from;
-		int			b = *from;
-		int			step = 1;
-		int			i;
+		int			r = j + (int) pg_prng_uint64_range(&st, 0, (uint64) (n - 1 - j));
+		int			t = w->assign[j];
 
-		/* gallop to a page reaching blo, or last: every page before a falls short */
-		while (b < last && LIONVEC_TID_KEY_BLOCK(dir[b].hi) < blo)
+		w->assign[j] = w->assign[r];
+		w->assign[r] = t;
+		lionvec_sample_row(s, w->assign[j], cent + (Size) j * dimsp);
+		if (unit)
+			lionvec_unit(cent + (Size) j * dimsp, dimsp);
+	}
+	for (i = 0; i < n; i++)
+		w->assign[i] = -1;
+
+	cs.k = k;
+	cs.dimsp = dimsp;
+	cs.bits = w->bits;
+	cs.popcount = w->popcount;
+	cs.norm = w->norm;
+	cs.alpha1 = w->alpha1;
+	q.dimsp = dimsp;
+	q.qc = w->qc;
+	q.planes = w->planes;
+
+	while (made < iters)
+	{
+		int			moved = 0;
+
+		made++;
+		/* the centroids' codes, which the candidates are found by */
+		for (j = 0; j < k; j++)
 		{
-			a = b + 1;
-			b = (last - b > step) ? b + step : last;
-			step = (step < (1 << 29)) ? step * 2 : step;
+			LionVecEncoded e;
+
+			memcpy(w->x, cent + (Size) j * dimsp, sizeof(float) * dimsp);
+			e.bits = w->bits + (Size) j * nw;
+			e.codes = w->codes;
+			lionvec_encode(mean, dimsp, w->x, &e);
+			w->popcount[j] = e.popcount;
+			w->norm[j] = e.norm;
+			w->alpha1[j] = e.alpha1;
 		}
-		/* the least page in [a, b) reaching blo, or b */
-		while (a < b)
-		{
-			int			mid = a + (b - a) / 2;
 
-			if (LIONVEC_TID_KEY_BLOCK(dir[mid].hi) >= blo)
-				b = mid;
-			else
-				a = mid + 1;
-		}
-		for (i = a; i < last && LIONVEC_TID_KEY_BLOCK(dir[i].lo) <= bhi; i++)
+		/* each row to its nearest */
+		memset(w->count, 0, sizeof(int) * k);
+		for (i = 0; i < n; i++)
 		{
-			uint64		bit = UINT64CONST(1) << (i % 64);
+			int			nc;
+			int			best = -1;
+			double		bestd = INFINITY;
+			int			c;
 
-			if (dir[i].lo <= hi[j] && dir[i].hi >= lo[j] && (sel[i / 64] & bit) == 0)
+			lionvec_sample_row(s, i, w->y);
+			lionvec_query_init(&q, LIONVEC_L2, mean, w->y, LIONVEC_ASSIGN_EPS);
+			nc = lionvec_candidates(&cs, &q, w->lo, w->hi, w->cand);
+			for (c = 0; c < nc; c++)
 			{
-				sel[i / 64] |= bit;
-				n++;
+				double		d = lionvec_l2sq(w->y, cent + (Size) w->cand[c] * dimsp,
+											 dimsp);
+
+				/* in index order, so that ties go the same way every time */
+				if (best < 0 || d < bestd)
+				{
+					best = w->cand[c];
+					bestd = d;
+				}
+			}
+			Assert(best >= 0);
+			if (w->assign[i] != best)
+				moved++;
+			w->assign[i] = best;
+			w->count[best]++;
+		}
+		/* no row moved: the centroids are already their rows' means */
+		if (moved == 0)
+			break;
+
+		/* the means, summed where the centroids were: they are not needed now */
+		for (j = 0; j < k; j++)
+		{
+			if (w->count[j] > 0)
+				memset(cent + (Size) j * dimsp, 0, sizeof(float) * dimsp);
+		}
+		for (i = 0; i < n; i++)
+		{
+			float	   *sum = cent + (Size) w->assign[i] * dimsp;
+			int			d;
+
+			lionvec_sample_row(s, i, w->y);
+			for (d = 0; d < dimsp; d++)
+				sum[d] += w->y[d];
+		}
+		for (j = 0; j < k; j++)
+		{
+			if (w->count[j] > 0)
+			{
+				float		inv = 1.0f / (float) w->count[j];
+				float	   *c = cent + (Size) j * dimsp;
+				int			d;
+
+				for (d = 0; d < dimsp; d++)
+					c[d] *= inv;
 			}
 		}
-		/* the next range starts in blo's block or later */
-		*from = a;
+		for (j = 0; j < k; j++)
+		{
+			int			l = 0;
+			int			m;
+			float	   *cj = cent + (Size) j * dimsp;
+			float	   *cl;
+			int			d;
+
+			if (w->count[j] > 0)
+				continue;
+			/* the largest has two rows or more, as k <= n */
+			for (m = 1; m < k; m++)
+				if (w->count[m] > w->count[l])
+					l = m;
+			Assert(w->count[l] >= 2);
+			cl = cent + (Size) l * dimsp;
+			for (d = 0; d < dimsp; d++)
+			{
+				float		v = cl[d];
+
+				cj[d] = v * (d % 2 == 0 ? 1.0f + LIONVEC_SPLIT_EPS : 1.0f - LIONVEC_SPLIT_EPS);
+				cl[d] = v * (d % 2 == 0 ? 1.0f - LIONVEC_SPLIT_EPS : 1.0f + LIONVEC_SPLIT_EPS);
+			}
+			w->count[j] = w->count[l] / 2;
+			w->count[l] -= w->count[j];
+		}
+		if (unit)
+		{
+			for (j = 0; j < k; j++)
+				lionvec_unit(cent + (Size) j * dimsp, dimsp);
+		}
 	}
-	return n;
+	return made;
 }
 
 /* ----------------------------------------------------------------

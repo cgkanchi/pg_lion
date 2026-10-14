@@ -845,199 +845,524 @@ test_coverage(void)
 	}
 }
 
-/* ---------- the DIR chain's pages ---------- */
+/* ---------- partitions: the nearest centroid, k-means ---------- */
 
-/*
- * A build's directory, made as the build makes it: rows in heap block order,
- * their offsets within a block in any order (a HOT chain is indexed under its
- * root's offset), cut into pages of up to cap rows.  rows[] gets every row's
- * TID key and page[] its page; returns the pages.
- */
-static int
-dir_build(LionVecDirEntry *dir, uint64 *rows, int *page, int nrows, int cap,
-		  uint32 blk0)
+/* k centroids' codes, centred on mean, each array exactly as long as it must be */
+typedef struct CentCodes
 {
-	int			npages = 0;
-	int			onpage = 0;
-	int			r = 0;
-	uint32		blk = blk0;
+	LionVecCentroids c;
+	uint64	   *bits;
+	uint16	   *pop;
+	float	   *norm;
+	float	   *alpha1;
+} CentCodes;
 
-	while (r < nrows)
-	{
-		int			start = r;
-		int			inblk = (int) (rnd64() % 12) + 1;
-		int			k;
-
-		for (k = 1; k <= inblk && r < nrows; k++, r++)
-			rows[r] = LIONVEC_TID_KEY(blk, k);
-		if (rnd64() % 3 == 0)
-		{
-			for (k = r - 1; k > start; k--)
-			{
-				int			o = start + (int) (rnd64() % (uint64) (k - start + 1));
-				uint64		t = rows[k];
-
-				rows[k] = rows[o];
-				rows[o] = t;
-			}
-		}
-		blk += (uint32) (rnd64() % 3 == 0 ? 1 + rnd64() % 5 : 1);
-	}
-	for (r = 0; r < nrows; r++)
-	{
-		/* a page fills to cap rows, or ends early now and then */
-		if (r == 0 || onpage == cap || rnd64() % 8 == 0)
-		{
-			dir[npages].lo = dir[npages].hi = rows[r];
-			npages++;
-			onpage = 0;
-		}
-		else
-		{
-			dir[npages - 1].lo = Min(dir[npages - 1].lo, rows[r]);
-			dir[npages - 1].hi = Max(dir[npages - 1].hi, rows[r]);
-		}
-		onpage++;
-		page[r] = npages - 1;
-	}
-	return npages;
-}
-
-/*
- * lionvec_dir_mark against the definition, the ranges given over several
- * calls: a page is set iff its range meets one, so every row in a range lies
- * on a set page or on the last one.
- */
 static void
-check_dir_mark(const LionVecDirEntry *dir, int npages, const uint64 *lo,
-			   const uint64 *hi, int nranges, const uint64 *rows,
-			   const int *page, int nrows)
+cent_codes(CentCodes *cc, const float *cent, int k, int D, const float *mean)
 {
-	int			nwords = Max((npages - 1 + 63) / 64, 0);
-	uint64	   *sel = (uint64 *) xmalloc(sizeof(uint64) * (nwords + 1));
-	int			from = 0;
-	int			n = 0;
-	int			done = 0;
-	int			got = 0;
-	int			i;
+	float	   *x = falloc(D);
+	uint8	   *codes = (uint8 *) xmalloc(D);
 	int			j;
 
-	memset(sel, 0, sizeof(uint64) * (nwords + 1));
-	sel[nwords] = UINT64CONST(0x5a5a5a5a5a5a5a5a);	/* a canary past sel */
-	while (done < nranges)
+	cc->bits = (uint64 *) xmalloc(sizeof(uint64) * (Size) k * (D / 64));
+	cc->pop = (uint16 *) xmalloc(sizeof(uint16) * k);
+	cc->norm = falloc(k);
+	cc->alpha1 = falloc(k);
+	for (j = 0; j < k; j++)
 	{
-		int			k = (int) (rnd64() % 4) + 1;
+		LionVecEncoded e;
 
-		k = Min(k, nranges - done);
-		n += lionvec_dir_mark(dir, npages, lo + done, hi + done, k, &from, sel);
-		done += k;
+		memcpy(x, cent + (Size) j * D, sizeof(float) * D);
+		e.bits = cc->bits + (Size) j * (D / 64);
+		e.codes = codes;
+		lionvec_encode(mean, D, x, &e);
+		cc->pop[j] = e.popcount;
+		cc->norm[j] = e.norm;
+		cc->alpha1[j] = e.alpha1;
 	}
-	if (nranges == 0)
-		n += lionvec_dir_mark(dir, npages, lo, hi, 0, &from, sel);
-	CHECK(sel[nwords] == UINT64CONST(0x5a5a5a5a5a5a5a5a), "wrote past sel");
-	if (npages >= 1 && (npages - 1) % 64 != 0)
-		CHECK((sel[nwords - 1] >> ((npages - 1) % 64)) == 0, "a page past the last set");
-	for (i = 0; i < npages - 1; i++)
-	{
-		bool		want = false;
-		bool		set = (sel[i / 64] >> (i % 64)) & 1;
-
-		for (j = 0; j < nranges && !want; j++)
-			want = dir[i].lo <= hi[j] && dir[i].hi >= lo[j];
-		CHECK(want == set, want ? "missed a page" : "an extra page");
-		got += set;
-	}
-	CHECK(got == n, "the count is not the pages set");
-	for (i = 0; i < nrows; i++)
-	{
-		bool		in = false;
-
-		for (j = 0; j < nranges && !in; j++)
-			in = rows[i] >= lo[j] && rows[i] <= hi[j];
-		if (in && page[i] < npages - 1)
-			CHECK((sel[page[i] / 64] >> (page[i] % 64)) & 1, "a member's page not set");
-	}
-	free(sel);
+	cc->c.k = k;
+	cc->c.dimsp = D;
+	cc->c.bits = cc->bits;
+	cc->c.popcount = cc->pop;
+	cc->c.norm = cc->norm;
+	cc->c.alpha1 = cc->alpha1;
+	free(codes);
+	free(x);
 }
 
 static void
-test_dir_pages(void)
+cent_codes_free(CentCodes *cc)
 {
-	static LionVecDirEntry dir[400];
-	static uint64 rows[400];
-	static int	page[400];
-	uint64		lo[64];
-	uint64		hi[64];
-	int			trial;
+	free(cc->bits);
+	free(cc->pop);
+	free(cc->norm);
+	free(cc->alpha1);
+}
 
-	cur_phase = "dir";
+/* the centroid nearest x by L2, ties to the lowest index */
+static int
+nearest_exact(const float *x, const float *cent, int k, int D, double *dist)
+{
+	int			best = 0;
+	double		bestd = INFINITY;
+	int			j;
 
-	/* too few pages to list any: the tail is the caller's */
-	dir[0].lo = LIONVEC_TID_KEY(7, 1);
-	dir[0].hi = LIONVEC_TID_KEY(9, 3);
-	dir[1].lo = LIONVEC_TID_KEY(9, 4);
-	dir[1].hi = LIONVEC_TID_KEY(12, 1);
-	lo[0] = 0;
-	hi[0] = PG_UINT64_MAX;
-	check_dir_mark(dir, 0, lo, hi, 1, rows, page, 0);
-	check_dir_mark(dir, 1, lo, hi, 1, rows, page, 0);
-	check_dir_mark(dir, 2, lo, hi, 1, rows, page, 0);	/* page 0 */
-	lo[0] = hi[0] = LIONVEC_TID_KEY(9, 4);
-	check_dir_mark(dir, 2, lo, hi, 1, rows, page, 0);	/* none: page 0 ends at (9,3) */
-	lo[0] = hi[0] = LIONVEC_TID_KEY(9, 3);
-	check_dir_mark(dir, 2, lo, hi, 1, rows, page, 0);	/* page 0, by its last row */
-	lo[0] = LIONVEC_TID_KEY(0, 0);
-	hi[0] = LIONVEC_TID_KEY(7, 0);
-	check_dir_mark(dir, 2, lo, hi, 1, rows, page, 0);	/* none: page 0 starts at (7,1) */
-	check_dir_mark(dir, 2, lo, hi, 0, rows, page, 0);	/* no ranges */
-	CHECK(lionvec_dir_check(dir, 2), "a directory in order");
-
-	/* the far end of the block numbers */
-	dir[0].lo = LIONVEC_TID_KEY(PG_UINT32_MAX - 1, 1);
-	dir[0].hi = LIONVEC_TID_KEY(PG_UINT32_MAX, 2);
-	dir[1].lo = LIONVEC_TID_KEY(PG_UINT32_MAX, 3);
-	dir[1].hi = LIONVEC_TID_KEY(PG_UINT32_MAX, 9);
-	dir[2] = dir[1];
-	lo[0] = LIONVEC_TID_KEY(PG_UINT32_MAX, 0);
-	hi[0] = LIONVEC_TID_KEY(PG_UINT32_MAX, PG_UINT16_MAX);
-	check_dir_mark(dir, 3, lo, hi, 1, rows, page, 0);
-	CHECK(lionvec_dir_check(dir, 3), "the far end in order");
-
-	/* out of order */
-	dir[0].lo = LIONVEC_TID_KEY(5, 2);
-	dir[0].hi = LIONVEC_TID_KEY(5, 1);
-	CHECK(!lionvec_dir_check(dir, 1), "lo above hi");
-	dir[0].lo = LIONVEC_TID_KEY(5, 1);
-	dir[0].hi = LIONVEC_TID_KEY(6, 1);
-	dir[1].lo = LIONVEC_TID_KEY(5, 9);
-	dir[1].hi = LIONVEC_TID_KEY(7, 1);
-	CHECK(!lionvec_dir_check(dir, 2), "a page's blocks before the last's");
-	dir[1].lo = LIONVEC_TID_KEY(6, 0);
-	CHECK(lionvec_dir_check(dir, 2), "pages sharing a block");
-
-	/* at random: builds as the build makes them, ranges of every width */
-	for (trial = 0; trial < 6000; trial++)
+	for (j = 0; j < k; j++)
 	{
-		int			nrows = (int) (rnd64() % 400);
-		int			cap = (int) (rnd64() % 20) + 1;
-		int			npages = dir_build(dir, rows, page, nrows, cap,
-									   (uint32) (rnd64() % 3));
-		int			nranges = (int) (rnd64() % 64);
-		uint64		x = LIONVEC_TID_KEY(rnd64() % 3, rnd64() % 4);
-		uint64		span = LIONVEC_TID_KEY(rnd64() % 8, 0) + rnd64() % 16 + 1;
+		double		d = 0.0;
+		int			i;
+
+		for (i = 0; i < D; i++)
+		{
+			double		t = (double) x[i] - (double) cent[(Size) j * D + i];
+
+			d += t * t;
+		}
+		if (d < bestd)
+		{
+			bestd = d;
+			best = j;
+		}
+	}
+	if (dist != NULL)
+		*dist = bestd;
+	return best;
+}
+
+static void
+test_candidates(void)
+{
+	static const int dims[] = {64, 320, 1536};
+	int			di;
+
+	cur_phase = "candidates";
+	for (di = 0; di < 3; di++)
+	{
+		int			D = dims[di];
+		int			k = 200;
+		int			T = 20;
+		float	   *centers = falloc(T * D);
+		float	   *cent = falloc(k * D);
+		float	   *mean = falloc(D);
+		float	   *x = falloc(D);
+		double	   *lo = (double *) xmalloc(sizeof(double) * k);
+		double	   *hi = (double *) xmalloc(sizeof(double) * k);
+		int		   *cand = (int *) xmalloc(sizeof(int) * k);
+		LionVecQuery q;
+		CentCodes	cc;
+		long		inside = 0;
+		long		outside = 0;
+		long		found = 0;
+		long		trials = 0;
+		long		ncand = 0;
+		int			trial;
+		int			i;
 		int			j;
 
-		CHECK(lionvec_dir_check(dir, npages), "a built directory out of order");
-		for (j = 0; j < nranges; j++)
-		{
-			uint64		w = rnd64() % 4 == 0 ? rnd64() % span : 0;
+		query_alloc(&q, D);
+		/* clustered centroids around T centres, and a mean off the origin */
+		for (i = 0; i < T * D; i++)
+			centers[i] = (float) rnd_gauss();
+		for (i = 0; i < D; i++)
+			mean[i] = (float) (rnd_gauss() * 0.3);
+		for (j = 0; j < k; j++)
+			for (i = 0; i < D; i++)
+				cent[(Size) j * D + i] = centers[(Size) (j % T) * D + i] +
+					(float) (rnd_gauss() * 0.4);
+		cent_codes(&cc, cent, k, D, mean);
 
-			lo[j] = x;
-			hi[j] = x + w;
-			x = hi[j] + 1 + (rnd64() % 2 == 0 ? 0 : rnd64() % span);
+		for (trial = 0; trial < 300; trial++)
+		{
+			int			c = (int) (rnd64() % k);
+			int			nc;
+			int			best;
+			bool		in = false;
+
+			for (i = 0; i < D; i++)
+				x[i] = cent[(Size) c * D + i] + (float) (rnd_gauss() * 0.4);
+			best = nearest_exact(x, cent, k, D, NULL);
+
+			/* wide bounds: the nearest is always a candidate, and every key within its bounds */
+			lionvec_query_init(&q, LIONVEC_L2, mean, x, 10.0);
+			nc = lionvec_candidates(&cc.c, &q, lo, hi, cand);
+			CHECK(nc >= 1 && nc <= k, "no candidate, or too many");
+			for (j = 0; j < nc; j++)
+			{
+				in |= cand[j] == best;
+				if (j > 0)
+					CHECK(cand[j] > cand[j - 1], "candidates out of order");
+			}
+			CHECK(in, "the nearest centroid is not a candidate at 10 standard deviations");
+			for (j = 0; j < k; j++)
+			{
+				/* the key: |c - m|^2 - 2 <c - m, x - m> */
+				double		cm2 = 0.0;
+				double		ip = 0.0;
+				double		key;
+
+				for (i = 0; i < D; i++)
+				{
+					double		cmi = (double) cent[(Size) j * D + i] - mean[i];
+
+					cm2 += cmi * cmi;
+					ip += cmi * ((double) x[i] - mean[i]);
+				}
+				key = cm2 - 2.0 * ip;
+				if (lo[j] - 1e-4 * (1 + fabs(key)) <= key && key <= hi[j] + 1e-4 * (1 + fabs(key)))
+					inside++;
+				else
+					outside++;
+			}
+
+			/* the build's bounds: the nearest is nearly always a candidate */
+			lionvec_query_init(&q, LIONVEC_L2, mean, x, LIONVEC_ASSIGN_EPS);
+			nc = lionvec_candidates(&cc.c, &q, lo, hi, cand);
+			ncand += nc;
+			trials++;
+			for (j = 0; j < nc; j++)
+				found += cand[j] == best;
 		}
-		check_dir_mark(dir, npages, lo, hi, nranges, rows, page, nrows);
+		CHECK(outside == 0, "a centroid's key outside its bounds at 10 standard deviations");
+		CHECK(found >= trials - 1, "the nearest centroid missed at the build's bounds");
+		/*
+		 * and the bounds rule out most centroids, the point of them: all but
+		 * the query's own group of k / T at enough dimensions
+		 */
+		CHECK(ncand < trials * (D >= 320 ? 2 * (k / T) : k / 2),
+			  "the candidates are most of the centroids");
+		printf("vec_test: dims %4d: %.1f candidates of %d centroids\n", D, (double) ncand / trials, k);
+		(void) inside;
+
+		/* no centroids: no candidates */
+		cc.c.k = 0;
+		CHECK(lionvec_candidates(&cc.c, &q, lo, hi, cand) == 0, "candidates of no centroids");
+		cent_codes_free(&cc);
+
+		/* identical centroids: all are candidates */
+		for (j = 1; j < 4; j++)
+			memcpy(cent + (Size) j * D, cent, sizeof(float) * D);
+		cent_codes(&cc, cent, 4, D, mean);
+		for (i = 0; i < D; i++)
+			x[i] = cent[i] + (float) (rnd_gauss() * 0.4);
+		lionvec_query_init(&q, LIONVEC_L2, mean, x, LIONVEC_ASSIGN_EPS);
+		CHECK(lionvec_candidates(&cc.c, &q, lo, hi, cand) == 4,
+			  "identical centroids are not all candidates");
+		cent_codes_free(&cc);
+
+		query_free(&q);
+		free(cand);
+		free(hi);
+		free(lo);
+		free(x);
+		free(mean);
+		free(cent);
+		free(centers);
 	}
+}
+
+/* A sample of n rows as lionvec_kmeans() takes it: 8-bit codes, not centred. */
+typedef struct Sample
+{
+	LionVecSample s;
+	uint8	   *codes;
+	float	   *scale;
+} Sample;
+
+static void
+sample_make(Sample *sm, const float *rows, int n, int D)
+{
+	float	   *x = falloc(D);
+	uint64	   *bits = (uint64 *) xmalloc(sizeof(uint64) * (D / 64));
+	int			i;
+
+	sm->codes = (uint8 *) xmalloc((Size) n * D);
+	sm->scale = falloc(n);
+	for (i = 0; i < n; i++)
+	{
+		LionVecEncoded e;
+
+		memcpy(x, rows + (Size) i * D, sizeof(float) * D);
+		e.bits = bits;
+		e.codes = sm->codes + (Size) i * D;
+		lionvec_encode(NULL, D, x, &e);
+		sm->scale[i] = e.rnorm8 > 0.0f ? e.norm / e.rnorm8 : 0.0f;
+	}
+	sm->s.n = n;
+	sm->s.dimsp = D;
+	sm->s.codes = sm->codes;
+	sm->s.scale = sm->scale;
+	free(bits);
+	free(x);
+}
+
+static void
+sample_free(Sample *sm)
+{
+	free(sm->codes);
+	free(sm->scale);
+}
+
+static void
+kmeans_work(LionVecKmeansWork *w, int n, int k, int D)
+{
+	w->count = (int *) xmalloc(sizeof(int) * k);
+	w->assign = (int *) xmalloc(sizeof(int) * n);
+	w->bits = (uint64 *) xmalloc(sizeof(uint64) * (Size) k * (D / 64));
+	w->popcount = (uint16 *) xmalloc(sizeof(uint16) * k);
+	w->norm = falloc(k);
+	w->alpha1 = falloc(k);
+	w->lo = (double *) xmalloc(sizeof(double) * k);
+	w->hi = (double *) xmalloc(sizeof(double) * k);
+	w->cand = (int *) xmalloc(sizeof(int) * k);
+	w->x = falloc(D);
+	w->y = falloc(D);
+	w->codes = (uint8 *) xmalloc(D);
+	w->qc = falloc(D);
+	w->planes = (uint64 *) xmalloc(sizeof(uint64) * (D / 64) * LIONVEC_QBITS);
+}
+
+static void
+kmeans_work_free(LionVecKmeansWork *w)
+{
+	free(w->count);
+	free(w->assign);
+	free(w->bits);
+	free(w->popcount);
+	free(w->norm);
+	free(w->alpha1);
+	free(w->lo);
+	free(w->hi);
+	free(w->cand);
+	free(w->x);
+	free(w->y);
+	free(w->codes);
+	free(w->qc);
+	free(w->planes);
+}
+
+/* one k-means run, checked for what holds of any: returns the iterations */
+static int
+kmeans_run(const Sample *sm, int k, int iters, bool unit, const float *mean,
+		   float *cent, LionVecKmeansWork *w)
+{
+	int			D = sm->s.dimsp;
+	int			made = lionvec_kmeans(&sm->s, k, iters, unit, 42, mean, cent, w);
+	bool		finite = true;
+	int			j;
+	int			i;
+
+	CHECK(made >= 1 && made <= iters, "iterations made");
+	for (i = 0; i < k * D; i++)
+		finite &= isfinite(cent[i]);
+	CHECK(finite, "a centroid is not finite");
+	for (i = 0; i < sm->s.n; i++)
+		CHECK(w->assign[i] >= 0 && w->assign[i] < k, "a row assigned to no centroid");
+	if (unit)
+	{
+		bool		ok = true;
+
+		for (j = 0; j < k; j++)
+		{
+			double		n2 = dot_ff(cent + (Size) j * D, cent + (Size) j * D, D);
+
+			ok &= fabs(n2 - 1.0) < 1e-4;
+		}
+		CHECK(ok, "a spherical centroid is not of unit length");
+	}
+	return made;
+}
+
+static void
+test_kmeans(void)
+{
+	int			D = 128;
+	int			T = 8;
+	int			per = 100;
+	int			n = T * per;
+	float	   *centers = falloc(T * D);
+	float	   *rows = falloc(n * D);
+	float	   *dec = falloc(n * D);
+	float	   *mean = falloc(D);
+	float	   *cent = falloc(n * D);
+	float	   *cent2 = falloc(n * D);
+	LionVecKmeansWork w;
+	Sample		sm;
+	int			unit;
+	int			i;
+	int			j;
+	int			t;
+
+	cur_phase = "kmeans";
+	for (i = 0; i < T * D; i++)
+		centers[i] = (float) (rnd_gauss() * 2.0);
+
+	for (unit = 0; unit <= 1; unit++)
+	{
+		int			made;
+		bool		ok;
+
+		/* T well-separated clusters, the rows shuffled among them */
+		for (i = 0; i < n; i++)
+		{
+			int			t = i * 7 % T;
+
+			for (j = 0; j < D; j++)
+				rows[(Size) i * D + j] = centers[(Size) t * D + j] + (float) (rnd_gauss() * 0.3);
+			if (unit)
+			{
+				double		n2 = dot_ff(rows + (Size) i * D, rows + (Size) i * D, D);
+
+				for (j = 0; j < D; j++)
+					rows[(Size) i * D + j] = (float) (rows[(Size) i * D + j] / sqrt(n2));
+			}
+		}
+		sample_make(&sm, rows, n, D);
+		for (i = 0; i < n; i++)
+			lionvec_sample_row(&sm.s, i, dec + (Size) i * D);
+		{
+			/* the codes are within a percent of the rows */
+			double		e2 = 0.0;
+			double		r2 = 0.0;
+
+			for (i = 0; i < n * D; i++)
+			{
+				e2 += ((double) dec[i] - rows[i]) * ((double) dec[i] - rows[i]);
+				r2 += (double) rows[i] * rows[i];
+			}
+			CHECK(sqrt(e2 / r2) < 0.01, "a sample's rows are not their codes'");
+		}
+		for (j = 0; j < D; j++)
+		{
+			double		s = 0.0;
+
+			for (i = 0; i < n; i++)
+				s += dec[(Size) i * D + j];
+			mean[j] = (float) (s / n);
+		}
+
+		kmeans_work(&w, n, T, D);
+		made = kmeans_run(&sm, T, 50, unit, mean, cent, &w);
+		CHECK(made < 50, "k-means did not converge on separated clusters");
+
+		/* converged: each row is with the centroid nearest it */
+		ok = true;
+		for (i = 0; i < n; i++)
+			ok &= nearest_exact(dec + (Size) i * D, cent, T, D, NULL) == w.assign[i];
+		CHECK(ok, "a row is not with its nearest centroid");
+
+		/* ... and each centroid is its rows' mean (spherical: scaled to unit length) */
+		ok = true;
+		for (j = 0; j < T; j++)
+		{
+			double		dist = 0.0;
+			double		n2 = 0.0;
+			int			c = 0;
+
+			memset(w.x, 0, sizeof(float) * D);
+			for (i = 0; i < n; i++)
+			{
+				if (w.assign[i] != j)
+					continue;
+				c++;
+				for (t = 0; t < D; t++)
+					w.x[t] += dec[(Size) i * D + t];
+			}
+			for (t = 0; t < D; t++)
+			{
+				w.x[t] /= Max(c, 1);
+				n2 += (double) w.x[t] * w.x[t];
+			}
+			for (t = 0; t < D; t++)
+			{
+				double		m = unit ? w.x[t] / sqrt(n2) : w.x[t];
+
+				dist += (m - cent[(Size) j * D + t]) * (m - cent[(Size) j * D + t]);
+			}
+			ok &= c > 0 && sqrt(dist) < 1e-4;
+		}
+		CHECK(ok, "a centroid is not its rows' mean");
+
+		/* the same seed, the same centroids */
+		memcpy(cent2, cent, sizeof(float) * T * D);
+		kmeans_run(&sm, T, 50, unit, mean, cent, &w);
+		CHECK(memcmp(cent, cent2, sizeof(float) * T * D) == 0, "k-means is not repeatable");
+
+		/* no mean: the same answer, the bounds only looser */
+		kmeans_run(&sm, T, 50, unit, NULL, cent2, &w);
+		ok = true;
+		for (i = 0; i < T * D; i++)
+			ok &= fabs(cent[i] - cent2[i]) < 1e-4;
+		CHECK(ok, "the mean changed k-means' answer");
+		kmeans_work_free(&w);
+
+		/* one centroid: the mean */
+		kmeans_work(&w, n, 1, D);
+		kmeans_run(&sm, 1, 5, false, mean, cent, &w);
+		ok = true;
+		for (j = 0; j < D; j++)
+			ok &= fabs(cent[j] - mean[j]) < 1e-4;
+		CHECK(ok, "one centroid is not the mean");
+		kmeans_work_free(&w);
+
+		/* as many centroids as rows: one each */
+		kmeans_work(&w, 40, 40, D);
+		sm.s.n = 40;
+		made = kmeans_run(&sm, 40, 10, unit, mean, cent, &w);
+		ok = true;
+		for (j = 0; j < 40; j++)
+		{
+			int			c = 0;
+
+			for (i = 0; i < 40; i++)
+				c += w.assign[i] == j;
+			ok &= c == 1;
+		}
+		CHECK(ok, "as many centroids as rows, and not one row each");
+		sm.s.n = n;
+		kmeans_work_free(&w);
+
+		/*
+		 * Eight centroids a cluster: from rows picked at random, as k-means
+		 * starts, every cluster gets one (all but certainly), and then no
+		 * centroid ends with rows of two clusters.  (With as many centroids
+		 * as clusters, two starting rows often share one, which leaves two
+		 * clusters to a centroid: random starts are a local search.)
+		 */
+		kmeans_work(&w, n, 8 * T, D);
+		made = kmeans_run(&sm, 8 * T, 50, unit, mean, cent, &w);
+		ok = true;
+		for (j = 0; j < 8 * T; j++)
+		{
+			int			first = -1;
+
+			for (i = 0; i < n; i++)
+				if (w.assign[i] == j)
+				{
+					if (first < 0)
+						first = i * 7 % T;
+					ok &= i * 7 % T == first;
+				}
+		}
+		CHECK(ok, "a centroid has rows of two separated clusters");
+		kmeans_work_free(&w);
+		sample_free(&sm);
+
+		/* every row the same: k-means ends, and every row is with a centroid */
+		for (i = 0; i < 30; i++)
+			memcpy(rows + (Size) i * D, rows, sizeof(float) * D);
+		sample_make(&sm, rows, 30, D);
+		kmeans_work(&w, 30, 3, D);
+		kmeans_run(&sm, 3, 10, unit, NULL, cent, &w);
+		kmeans_work_free(&w);
+		sample_free(&sm);
+	}
+
+	free(cent2);
+	free(cent);
+	free(mean);
+	free(dec);
+	free(rows);
+	free(centers);
 }
 
 /* ---------- odd inputs ---------- */
@@ -1077,7 +1402,8 @@ main(void)
 	test_query();
 	test_kernels();
 	test_bounds_nan();
-	test_dir_pages();
+	test_candidates();
+	test_kmeans();
 	test_coverage();
 
 	printf("vec_test: %ld checks, %ld failed\n", nchecks, nfail);
