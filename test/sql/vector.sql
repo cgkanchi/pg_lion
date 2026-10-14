@@ -105,29 +105,66 @@ END $$;
 
 /*
  * vt_items() reads a lionvec index's CODE items off its pages (pageinspect):
- * each one's block, its row's TID, its flags - 1 a NULL row, 2 a cosine zero
+ * each one's block, the chain the block is in - its partition's number,
+ * from the PART chain's heads, or -1 for the rows in no partition, -2 for
+ * the NULL rows - its row's TID, its flags - 1 a NULL row, 2 a cosine zero
  * vector, 4 a row's copy in its second partition (DESIGN.md §44.2) - and the
  * rest of its bytes.  vt_spill() sums them up with the meta page's format
  * version and flags (1: the index spills): the rows (the items that are not
  * copies), the copies, the NULL rows and zeros, and whether every row has
- * one item of its own and at most one copy, the same but for the flag and on
- * a page of another chain.  vt_strays() counts the items of rows the table
- * does not have.  The offsets assume a little-endian server.
+ * one item of its own, in a chain, and at most one copy, the same but for
+ * the flag and in another partition's chain.  vt_strays() counts the items
+ * of rows the table does not have.  vt_refines() reads the REFINE items:
+ * the rows' and the centroids' (whose TIDs are (partition, 0)), and whether
+ * the rows' are one for each CODE item of a row with a vector that is not a
+ * copy, by TID.  The offsets assume a little-endian server.
  */
 CREATE FUNCTION vt_u16(p bytea, o int) RETURNS int LANGUAGE sql IMMUTABLE AS
 $$ SELECT get_byte(p, o) | (get_byte(p, o + 1) << 8) $$;
+CREATE FUNCTION vt_u32(p bytea, o int) RETURNS bigint LANGUAGE sql IMMUTABLE AS
+$$ SELECT vt_u16(p, o)::bigint | (vt_u16(p, o + 2)::bigint << 16) $$;
 CREATE FUNCTION vt_items(idx regclass)
-RETURNS TABLE (blk int, row_tid tid, flags int, rest bytea)
+RETURNS TABLE (blk int, chain int, row_tid tid, flags int, rest bytea)
 LANGUAGE plpgsql AS $$
 DECLARE
 	bs int := current_setting('block_size')::int;
+	nb int := pg_relation_size(idx) / current_setting('block_size')::int;
+	chains int[] := array_fill(NULL::int, ARRAY[nb]);
+	m bytea := get_raw_page(idx::text, 0);
 	p bytea;
 	b int;
+	pb bigint;
+	h bigint;
 	i int;
 	lp bigint;
 	o int;
 BEGIN
-	FOR b IN 1 .. pg_relation_size(idx) / bs - 1 LOOP
+	-- the chains' blocks: each partition's from the head in its PART item
+	-- (the meta page's PART head at 52), then the REST and NULL chains' (60, 68)
+	pb := vt_u32(m, 52);
+	WHILE pb <> 4294967295 LOOP
+		p := get_raw_page(idx::text, pb::int);
+		FOR i IN 1 .. (vt_u16(p, 12) - 24) / 4 LOOP
+			lp := vt_u16(p, 20 + 4 * i)::bigint | (vt_u16(p, 22 + 4 * i)::bigint << 16);
+			CONTINUE WHEN (lp >> 15) & 3 <> 1;
+			o := (lp & 32767)::int;
+			h := vt_u32(p, o + 4);
+			WHILE h <> 4294967295 LOOP
+				chains[h + 1] := vt_u32(p, o)::int;
+				h := vt_u32(get_raw_page(idx::text, h::int), bs - 16);
+			END LOOP;
+		END LOOP;
+		pb := vt_u32(p, bs - 16);
+	END LOOP;
+	FOR i IN 1 .. 2 LOOP
+		h := vt_u32(m, 52 + 8 * i);
+		WHILE h <> 4294967295 LOOP
+			chains[h + 1] := -i;
+			h := vt_u32(get_raw_page(idx::text, h::int), bs - 16);
+		END LOOP;
+	END LOOP;
+
+	FOR b IN 1 .. nb - 1 LOOP
 		p := get_raw_page(idx::text, b);
 		-- the special space's last two words: the page's type (2, CODE) and lionvec's id
 		CONTINUE WHEN vt_u16(p, bs - 4) <> 2 OR vt_u16(p, bs - 2) <> 65420;
@@ -136,6 +173,7 @@ BEGIN
 			CONTINUE WHEN (lp >> 15) & 3 <> 1;		-- not LP_NORMAL
 			o := (lp & 32767)::int;
 			blk := b;
+			chain := chains[b + 1];
 			row_tid := format('(%s,%s)', (vt_u16(p, o)::bigint << 16) | vt_u16(p, o + 2),
 							  vt_u16(p, o + 4))::tid;
 			flags := vt_u16(p, o + 6);
@@ -149,7 +187,9 @@ LANGUAGE sql AS $$
 	WITH it AS (SELECT * FROM vt_items(idx)),
 	r AS (SELECT row_tid, count(*) FILTER (WHERE flags & 4 = 0) AS own,
 				 count(*) FILTER (WHERE flags & 4 <> 0) AS copies,
-				 count(DISTINCT rest) AS bodies, count(DISTINCT blk) AS pages,
+				 count(DISTINCT rest) AS bodies, count(DISTINCT chain) AS chains,
+				 bool_and(chain IS NOT NULL) AS chained,
+				 bool_and(flags & 4 = 0 OR chain >= 0) AS in_parts,
 				 bool_and(flags & 3 = 0) AS vec
 			FROM it GROUP BY row_tid)
 	SELECT format('format %s, flags %s: %s rows, %s copies, %s NULL or zero; %s',
@@ -158,11 +198,45 @@ LANGUAGE sql AS $$
 				  (SELECT count(*) FROM it WHERE flags & 4 = 0),
 				  (SELECT count(*) FROM it WHERE flags & 4 <> 0),
 				  (SELECT count(*) FROM it WHERE flags & 3 <> 0),
-				  CASE WHEN (SELECT bool_and(own = 1 AND (copies = 0 OR
-							(copies = 1 AND vec AND bodies = 1 AND pages = 2))) FROM r)
-					   THEN 'each row once, any copy the same on another page'
+				  CASE WHEN (SELECT bool_and(own = 1 AND chained AND (copies = 0 OR
+							(copies = 1 AND vec AND bodies = 1 AND chains = 2 AND in_parts))) FROM r)
+					   THEN 'each row once, any copy the same in another partition'
 					   ELSE 'MALFORMED' END)
 $$;
+CREATE FUNCTION vt_refines(idx regclass) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	bs int := current_setting('block_size')::int;
+	p bytea;
+	b int;
+	i int;
+	lp bigint;
+	o int;
+	tids tid[] := '{}';
+	ncent int := 0;
+	same boolean;
+BEGIN
+	FOR b IN 1 .. pg_relation_size(idx) / bs - 1 LOOP
+		p := get_raw_page(idx::text, b);
+		CONTINUE WHEN vt_u16(p, bs - 4) <> 3 OR vt_u16(p, bs - 2) <> 65420;
+		FOR i IN 1 .. (vt_u16(p, 12) - 24) / 4 LOOP
+			lp := vt_u16(p, 20 + 4 * i)::bigint | (vt_u16(p, 22 + 4 * i)::bigint << 16);
+			CONTINUE WHEN (lp >> 15) & 3 <> 1;
+			o := (lp & 32767)::int;
+			IF vt_u16(p, o + 4) = 0 THEN
+				ncent := ncent + 1;
+			ELSE
+				tids := tids || format('(%s,%s)', (vt_u16(p, o)::bigint << 16) | vt_u16(p, o + 2),
+									   vt_u16(p, o + 4))::tid;
+			END IF;
+		END LOOP;
+	END LOOP;
+	SELECT (SELECT array_agg(t ORDER BY t) FROM unnest(tids) t) IS NOT DISTINCT FROM
+		   (SELECT array_agg(row_tid ORDER BY row_tid) FROM vt_items(idx) WHERE flags = 0)
+	  INTO same;
+	RETURN format('%s rows'' refine items, %s centroids''; %s', cardinality(tids), ncent,
+				  CASE WHEN same THEN 'one a row with a vector' ELSE 'MALFORMED' END);
+END $$;
 CREATE FUNCTION vt_strays(idx regclass) RETURNS bigint
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -292,10 +366,12 @@ SELECT vec_cmp('SELECT id, v <-> vt_vec(-11, 40, 4.0) AS d FROM vt ORDER BY v <-
 -- updates, deletes and VACUUM; then more inserts into what it freed
 UPDATE vt SET v = vt_vec(id + 100000, 40) WHERE id % 7 = 0;
 DELETE FROM vt WHERE id % 3 = 0;
+-- the dead rows' REFINE items are there until VACUUM
+SELECT i AS index, vt_refines(i) FROM unnest('{vt_l2,vt_ip,vt_cos}'::regclass[]) i;
 VACUUM vt;
--- both items of each row gone (and each REFINE item once: VACUUM would
--- have failed on a second)
-SELECT i AS index, vt_spill(i), vt_strays(i) FROM unnest('{vt_l2,vt_ip,vt_cos}'::regclass[]) i;
+-- both CODE items of each dead row gone, and its one REFINE item
+SELECT i AS index, vt_spill(i), vt_strays(i), vt_refines(i)
+  FROM unnest('{vt_l2,vt_ip,vt_cos}'::regclass[]) i;
 SELECT op, k, vec_cmp(format('SELECT id, v %s %s AS d FROM vt ORDER BY v %s %s LIMIT %s',
 							 op, q, op, q, k)) AS result
   FROM vt_cases WHERE k IN (10, 3006) ORDER BY op, q, k;
@@ -394,6 +470,19 @@ SELECT vt_spill('vt2_many');
 SELECT vec_cmp('SELECT id, v <-> vt_vec(20, 40) AS d FROM vt2 ORDER BY v <-> vt_vec(20, 40) LIMIT 20');
 SELECT vec_cmp('SELECT id, v <-> vt_vec(20, 40) AS d FROM vt2 ORDER BY v <-> vt_vec(20, 40)');
 DROP INDEX vt2_many;
+
+-- fewer partitions than the nine nearest SOAR ranks: every centroid a
+-- candidate, at the build and at an insert; of two, the copy goes to the
+-- other
+CREATE INDEX vt2_two ON vt2 USING lionvec (v) WITH (partitions = 2);
+CREATE INDEX vt2_five ON vt2 USING lionvec (v vector_ip_ops) WITH (partitions = 5);
+INSERT INTO vt2
+SELECT i, i % 10, vt_vec(-(i % 10) - 1, 40) + vt_vec(i, 40, 0.3)
+  FROM generate_series(6000, 6099) i;
+SELECT i AS index, vt_spill(i), vt_refines(i) FROM unnest('{vt2_two,vt2_five}'::regclass[]) i;
+SELECT vec_cmp('SELECT id, v <-> vt_vec(21, 40) AS d FROM vt2 ORDER BY v <-> vt_vec(21, 40) LIMIT 60');
+SELECT vec_cmp('SELECT id, v <#> vt_vec(21, 40) AS d FROM vt2 ORDER BY v <#> vt_vec(21, 40)');
+DROP INDEX vt2_two, vt2_five;
 
 /*
  * vec_recall() runs q - which returns a column id - through the index and
@@ -502,7 +591,9 @@ DROP FUNCTION vec_cmp(text);
 DROP FUNCTION vec_recall(text);
 DROP FUNCTION vt_ids(text);
 DROP FUNCTION vt_strays(regclass);
+DROP FUNCTION vt_refines(regclass);
 DROP FUNCTION vt_spill(regclass);
 DROP FUNCTION vt_items(regclass);
+DROP FUNCTION vt_u32(bytea, int);
 DROP FUNCTION vt_u16(bytea, int);
 DROP FUNCTION vt_vec(bigint, int, float8);
