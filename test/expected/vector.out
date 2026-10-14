@@ -30,7 +30,10 @@ SELECT opcname, amvalidate(c.oid)
  * the same on every platform: from hashint8extended(), not random().
  */
 CREATE FUNCTION vt_vec(seed bigint, n int, scale float8 DEFAULT 1.0)
-RETURNS vector LANGUAGE sql IMMUTABLE AS $$
+RETURNS vector LANGUAGE sql IMMUTABLE
+-- an index expression below calls it, and CREATE INDEX runs it under a safe
+-- search_path from PostgreSQL 17 on, where vector would not be found
+SET search_path FROM CURRENT AS $$
 	SELECT array_agg(((hashint8extended(seed * 1000 + j, 42) % 100000)::float8
 					  / 100000.0 * scale)::real ORDER BY j)::vector
 	  FROM generate_series(1, n) j

@@ -104,7 +104,8 @@ BEGIN
 	PERFORM set_config('enable_tidscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
 		IF ln !~ '^\s*(Index Searches|Disabled|Storage|Planning|Execution|Buffers)' THEN
-			RETURN NEXT ln;
+			-- PostgreSQL 18 prints rows with two decimals
+			RETURN NEXT regexp_replace(ln, 'rows=(\d+)\.00 ', 'rows=\1 ', 'g');
 		END IF;
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
@@ -284,12 +285,13 @@ SELECT op, f, vf_ord(format('SELECT id, v %s vf_vec(4, 24) AS d FROM vf
 	   (VALUES ('tag = 3'), ('grp IN (3, 11)'), ('cat <> 5')) f(f)
  ORDER BY op, f;
 
--- off, the node is not offered
+-- off, the node is not offered: the vector scan filters instead (sorts are
+-- off, or sorting the lion scan's rows would be cheaper)
 SET pg_lion.enable_ordered_scan = off;
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_sort = off;
 EXPLAIN (COSTS OFF)
 SELECT id FROM vf WHERE tag = 3 ORDER BY v <-> '[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]' LIMIT 5;
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_sort;
 RESET pg_lion.enable_ordered_scan;
 
 DEALLOCATE vfp;
