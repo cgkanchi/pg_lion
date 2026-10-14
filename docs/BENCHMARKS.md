@@ -156,7 +156,11 @@ an exact numpy search.
 
 **Cold** (PostgreSQL restarted and the OS page cache dropped before each query), median of 5:
 
-COLDTABLE
+| Filter | lionvec | HNSW ef_search 40 (iterative under a filter) |
+| --- | --- | --- |
+| none | 378 ms | 103 ms |
+| 1% | 199 ms | 1,208 ms |
+| 0.1% | 100 ms | 203 ms (the planner sorts the filter's rows) |
 
 **Size and build.** lionvec is 1.7 GB, of which a query reads the 218 MB of one-bit codes; HNSW is
 3.8 GB. lionvec builds in 98 s with the table cached (683 s reading it from disk).
