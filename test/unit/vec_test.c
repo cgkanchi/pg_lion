@@ -847,123 +847,196 @@ test_coverage(void)
 
 /* ---------- the DIR chain's pages ---------- */
 
-/* Page i < npages - 1 meets one of the ranges, by the definition alone. */
-static bool
-dir_meets(const uint32 *first, int i, const uint32 *lo, const uint32 *hi,
-		  int nranges)
+/*
+ * A build's directory, made as the build makes it: rows in heap block order,
+ * their offsets within a block in any order (a HOT chain is indexed under its
+ * root's offset), cut into pages of up to cap rows.  rows[] gets every row's
+ * TID key and page[] its page; returns the pages.
+ */
+static int
+dir_build(LionVecDirEntry *dir, uint64 *rows, int *page, int nrows, int cap,
+		  uint32 blk0)
 {
-	int			j;
+	int			npages = 0;
+	int			onpage = 0;
+	int			r = 0;
+	uint32		blk = blk0;
 
-	for (j = 0; j < nranges; j++)
+	while (r < nrows)
 	{
-		if (first[i] <= hi[j] && first[i + 1] >= lo[j])
-			return true;
+		int			start = r;
+		int			inblk = (int) (rnd64() % 12) + 1;
+		int			k;
+
+		for (k = 1; k <= inblk && r < nrows; k++, r++)
+			rows[r] = LIONVEC_TID_KEY(blk, k);
+		if (rnd64() % 3 == 0)
+		{
+			for (k = r - 1; k > start; k--)
+			{
+				int			o = start + (int) (rnd64() % (uint64) (k - start + 1));
+				uint64		t = rows[k];
+
+				rows[k] = rows[o];
+				rows[o] = t;
+			}
+		}
+		blk += (uint32) (rnd64() % 3 == 0 ? 1 + rnd64() % 5 : 1);
 	}
-	return false;
+	for (r = 0; r < nrows; r++)
+	{
+		/* a page fills to cap rows, or ends early now and then */
+		if (r == 0 || onpage == cap || rnd64() % 8 == 0)
+		{
+			dir[npages].lo = dir[npages].hi = rows[r];
+			npages++;
+			onpage = 0;
+		}
+		else
+		{
+			dir[npages - 1].lo = Min(dir[npages - 1].lo, rows[r]);
+			dir[npages - 1].hi = Max(dir[npages - 1].hi, rows[r]);
+		}
+		onpage++;
+		page[r] = npages - 1;
+	}
+	return npages;
 }
 
-/* lionvec_dir_pages against dir_meets, and out's bounds and order. */
+/*
+ * lionvec_dir_mark against the definition, the ranges given over several
+ * calls: a page is set iff its range meets one, so every row in a range lies
+ * on a set page or on the last one.
+ */
 static void
-check_dir_pages(const uint32 *first, int npages, const uint32 *lo,
-				const uint32 *hi, int nranges)
+check_dir_mark(const LionVecDirEntry *dir, int npages, const uint64 *lo,
+			   const uint64 *hi, int nranges, const uint64 *rows,
+			   const int *page, int nrows)
 {
-	int			cap = Max(npages - 1, 0);
-	int		   *out = (int *) xmalloc(sizeof(int) * (cap + 1));
-	int			n;
-	int			k;
+	int			nwords = Max((npages - 1 + 63) / 64, 0);
+	uint64	   *sel = (uint64 *) xmalloc(sizeof(uint64) * (nwords + 1));
+	int			from = 0;
+	int			n = 0;
+	int			done = 0;
+	int			got = 0;
 	int			i;
+	int			j;
 
-	out[cap] = -12345;			/* a canary just past out's room */
-	n = lionvec_dir_pages(first, npages, lo, hi, nranges, out);
-	CHECK(n >= 0 && n <= cap, "more pages than there is room for");
-	CHECK(out[cap] == -12345, "wrote past out");
-	if (n < 0 || n > cap)
+	memset(sel, 0, sizeof(uint64) * (nwords + 1));
+	sel[nwords] = UINT64CONST(0x5a5a5a5a5a5a5a5a);	/* a canary past sel */
+	while (done < nranges)
 	{
-		free(out);
-		return;
-	}
-	for (k = 1; k < n; k++)
-		CHECK(out[k - 1] < out[k], "pages not ascending or repeated");
-	k = 0;
-	for (i = 0; i < cap; i++)
-	{
-		bool		want = dir_meets(first, i, lo, hi, nranges);
-		bool		got = (k < n && out[k] == i);
+		int			k = (int) (rnd64() % 4) + 1;
 
-		CHECK(want == got, want ? "missed a page" : "an extra page");
-		if (got)
-			k++;
+		k = Min(k, nranges - done);
+		n += lionvec_dir_mark(dir, npages, lo + done, hi + done, k, &from, sel);
+		done += k;
 	}
-	CHECK(k == n, "a page out of range");
-	free(out);
+	if (nranges == 0)
+		n += lionvec_dir_mark(dir, npages, lo, hi, 0, &from, sel);
+	CHECK(sel[nwords] == UINT64CONST(0x5a5a5a5a5a5a5a5a), "wrote past sel");
+	if (npages >= 1 && (npages - 1) % 64 != 0)
+		CHECK((sel[nwords - 1] >> ((npages - 1) % 64)) == 0, "a page past the last set");
+	for (i = 0; i < npages - 1; i++)
+	{
+		bool		want = false;
+		bool		set = (sel[i / 64] >> (i % 64)) & 1;
+
+		for (j = 0; j < nranges && !want; j++)
+			want = dir[i].lo <= hi[j] && dir[i].hi >= lo[j];
+		CHECK(want == set, want ? "missed a page" : "an extra page");
+		got += set;
+	}
+	CHECK(got == n, "the count is not the pages set");
+	for (i = 0; i < nrows; i++)
+	{
+		bool		in = false;
+
+		for (j = 0; j < nranges && !in; j++)
+			in = rows[i] >= lo[j] && rows[i] <= hi[j];
+		if (in && page[i] < npages - 1)
+			CHECK((sel[page[i] / 64] >> (page[i] % 64)) & 1, "a member's page not set");
+	}
+	free(sel);
 }
 
 static void
 test_dir_pages(void)
 {
-	uint32		first[64];
-	uint32		lo[16];
-	uint32		hi[16];
+	static LionVecDirEntry dir[400];
+	static uint64 rows[400];
+	static int	page[400];
+	uint64		lo[64];
+	uint64		hi[64];
 	int			trial;
 
 	cur_phase = "dir";
-	memset(first, 0, sizeof(first));
 
 	/* too few pages to list any: the tail is the caller's */
+	dir[0].lo = LIONVEC_TID_KEY(7, 1);
+	dir[0].hi = LIONVEC_TID_KEY(9, 3);
+	dir[1].lo = LIONVEC_TID_KEY(9, 4);
+	dir[1].hi = LIONVEC_TID_KEY(12, 1);
 	lo[0] = 0;
-	hi[0] = PG_UINT32_MAX;
-	check_dir_pages(first, 0, lo, hi, 1);
-	first[0] = 7;
-	check_dir_pages(first, 1, lo, hi, 1);
-	first[1] = 9;
-	check_dir_pages(first, 2, lo, hi, 1);	/* page 0 */
-	lo[0] = 10;
-	hi[0] = 20;
-	check_dir_pages(first, 2, lo, hi, 1);	/* none: page 0 ends at 9 */
-	lo[0] = 9;
-	hi[0] = 9;
-	check_dir_pages(first, 2, lo, hi, 1);	/* page 0, by its last block */
-	lo[0] = 0;
-	hi[0] = 6;
-	check_dir_pages(first, 2, lo, hi, 1);	/* none: page 0 starts at 7 */
-	check_dir_pages(first, 2, lo, hi, 0);	/* no ranges */
+	hi[0] = PG_UINT64_MAX;
+	check_dir_mark(dir, 0, lo, hi, 1, rows, page, 0);
+	check_dir_mark(dir, 1, lo, hi, 1, rows, page, 0);
+	check_dir_mark(dir, 2, lo, hi, 1, rows, page, 0);	/* page 0 */
+	lo[0] = hi[0] = LIONVEC_TID_KEY(9, 4);
+	check_dir_mark(dir, 2, lo, hi, 1, rows, page, 0);	/* none: page 0 ends at (9,3) */
+	lo[0] = hi[0] = LIONVEC_TID_KEY(9, 3);
+	check_dir_mark(dir, 2, lo, hi, 1, rows, page, 0);	/* page 0, by its last row */
+	lo[0] = LIONVEC_TID_KEY(0, 0);
+	hi[0] = LIONVEC_TID_KEY(7, 0);
+	check_dir_mark(dir, 2, lo, hi, 1, rows, page, 0);	/* none: page 0 starts at (7,1) */
+	check_dir_mark(dir, 2, lo, hi, 0, rows, page, 0);	/* no ranges */
+	CHECK(lionvec_dir_check(dir, 2), "a directory in order");
 
-	/* one heap block over many pages, and the far end of the block numbers */
-	for (trial = 0; trial < 8; trial++)
-		first[trial] = (trial < 3) ? 5 : PG_UINT32_MAX - 1;
-	lo[0] = 5;
-	hi[0] = 5;
-	lo[1] = PG_UINT32_MAX;
-	hi[1] = PG_UINT32_MAX;
-	check_dir_pages(first, 8, lo, hi, 2);
-	lo[0] = PG_UINT32_MAX - 1;
-	hi[0] = PG_UINT32_MAX;
-	check_dir_pages(first, 8, lo, hi, 1);
+	/* the far end of the block numbers */
+	dir[0].lo = LIONVEC_TID_KEY(PG_UINT32_MAX - 1, 1);
+	dir[0].hi = LIONVEC_TID_KEY(PG_UINT32_MAX, 2);
+	dir[1].lo = LIONVEC_TID_KEY(PG_UINT32_MAX, 3);
+	dir[1].hi = LIONVEC_TID_KEY(PG_UINT32_MAX, 9);
+	dir[2] = dir[1];
+	lo[0] = LIONVEC_TID_KEY(PG_UINT32_MAX, 0);
+	hi[0] = LIONVEC_TID_KEY(PG_UINT32_MAX, PG_UINT16_MAX);
+	check_dir_mark(dir, 3, lo, hi, 1, rows, page, 0);
+	CHECK(lionvec_dir_check(dir, 3), "the far end in order");
 
-	/* at random: blocks with repeats, ranges sometimes adjacent */
-	for (trial = 0; trial < 20000; trial++)
+	/* out of order */
+	dir[0].lo = LIONVEC_TID_KEY(5, 2);
+	dir[0].hi = LIONVEC_TID_KEY(5, 1);
+	CHECK(!lionvec_dir_check(dir, 1), "lo above hi");
+	dir[0].lo = LIONVEC_TID_KEY(5, 1);
+	dir[0].hi = LIONVEC_TID_KEY(6, 1);
+	dir[1].lo = LIONVEC_TID_KEY(5, 9);
+	dir[1].hi = LIONVEC_TID_KEY(7, 1);
+	CHECK(!lionvec_dir_check(dir, 2), "a page's blocks before the last's");
+	dir[1].lo = LIONVEC_TID_KEY(6, 0);
+	CHECK(lionvec_dir_check(dir, 2), "pages sharing a block");
+
+	/* at random: builds as the build makes them, ranges of every width */
+	for (trial = 0; trial < 6000; trial++)
 	{
-		int			npages = (int) (rnd64() % 64) + 1;
-		int			span = (int) (rnd64() % 200) + 1;
-		int			nranges = (int) (rnd64() % 16);
-		uint32		b = (uint32) (rnd64() % 4);
-		uint32		x;
-		int			i;
+		int			nrows = (int) (rnd64() % 400);
+		int			cap = (int) (rnd64() % 20) + 1;
+		int			npages = dir_build(dir, rows, page, nrows, cap,
+									   (uint32) (rnd64() % 3));
+		int			nranges = (int) (rnd64() % 64);
+		uint64		x = LIONVEC_TID_KEY(rnd64() % 3, rnd64() % 4);
+		uint64		span = LIONVEC_TID_KEY(rnd64() % 8, 0) + rnd64() % 16 + 1;
 		int			j;
 
-		for (i = 0; i < npages; i++)
-		{
-			b += (uint32) (rnd64() % 3 == 0 ? 0 : rnd64() % (span / 16 + 2));
-			first[i] = b;
-		}
-		x = (uint32) (rnd64() % 8);
+		CHECK(lionvec_dir_check(dir, npages), "a built directory out of order");
 		for (j = 0; j < nranges; j++)
 		{
+			uint64		w = rnd64() % 4 == 0 ? rnd64() % span : 0;
+
 			lo[j] = x;
-			hi[j] = x + (uint32) (rnd64() % (span / 8 + 1));
-			x = hi[j] + 1 + (uint32) (rnd64() % 2 == 0 ? 0 : rnd64() % (span / 4 + 1));
+			hi[j] = x + w;
+			x = hi[j] + 1 + (rnd64() % 2 == 0 ? 0 : rnd64() % span);
 		}
-		check_dir_pages(first, npages, lo, hi, nranges);
+		check_dir_mark(dir, npages, lo, hi, nranges, rows, page, nrows);
 	}
 }
 

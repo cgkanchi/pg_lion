@@ -144,16 +144,41 @@ extern void lionvec_estimate8(const LionVecQuery *q, const uint8 *codes,
 							  double *est, double *err);
 
 /*
- * The pages of the build's run of CODE pages (DESIGN.md §44.2) a scan
- * restricted to the heap blocks [lo[j], hi[j]], j < nranges, must read:
- * first[i] is the heap block of page i's first row, non-decreasing, and page
- * i < npages - 1 holds rows of the blocks [first[i], first[i + 1]] only.  The
- * ranges are ascending and do not overlap.  The indexes of the pages that
- * meet a range, ascending, go to out, which has room for npages - 1; returns
- * how many.  Page npages - 1, the tail as the build left it, is the caller's.
+ * A heap TID as the directory orders it (DESIGN.md §44.2): block, then
+ * offset.
  */
-extern int	lionvec_dir_pages(const uint32 *first, int npages, const uint32 *lo,
-							  const uint32 *hi, int nranges, int *out);
+#define LIONVEC_TID_KEY(blk, off)	(((uint64) (blk) << 16) | (uint64) (off))
+#define LIONVEC_TID_KEY_BLOCK(k)	((uint32) ((k) >> 16))
+
+/* A CODE page of the build's run, in the directory: its rows' least and greatest TID keys. */
+typedef struct LionVecDirEntry
+{
+	uint64		lo;
+	uint64		hi;
+} LionVecDirEntry;
+
+/*
+ * Whether dir[0 .. n - 1] is in the order lionvec_dir_mark() relies on:
+ * each entry's lo no greater than its hi, and each page's rows in heap
+ * blocks no later than the next page's (the block of dir[i].hi at most that
+ * of dir[i + 1].lo).  Rows come to the build in heap block order, but not
+ * always in offset order within a block (a HOT chain is indexed under its
+ * root's offset), so the entries' ranges may overlap within a block.
+ */
+extern bool lionvec_dir_check(const LionVecDirEntry *dir, int n);
+
+/*
+ * The pages of the build's run a scan restricted to the TID keys [lo[j],
+ * hi[j]], j < nranges, must read: page i < npages - 1 holds rows in [dir[i].lo,
+ * dir[i].hi] only, and dir is in order (lionvec_dir_check()).  The ranges are
+ * ascending and do not overlap, across calls too: *from carries where the
+ * last call left off (0 before the first).  Each page that meets a range is
+ * set in sel, a bitmap of npages - 1 bits; returns how many were newly set.
+ * Page npages - 1, the tail as the build left it, is the caller's.
+ */
+extern int	lionvec_dir_mark(const LionVecDirEntry *dir, int npages,
+							 const uint64 *lo, const uint64 *hi, int nranges,
+							 int *from, uint64 *sel);
 
 /*
  * The scan orders rows by a KEY that is the distance up to a constant of the

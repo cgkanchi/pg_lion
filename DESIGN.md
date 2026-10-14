@@ -20174,13 +20174,17 @@ of 64), the rotation's seed, the heads and tails of the chains, how many CODE pa
   of blocks in heap order (§44.5), so a pass reads them sequentially and each page covers a narrow
   range of heap blocks.
 - **DIR**: for each of the `nbuilt` CODE pages the build wrote (blocks `code_head` to `code_head +
-  nbuilt - 1`), the heap block of its first row, as BlockNumbers over as many pages as it takes:
-  2,038 a page, so one page for every 71,000 rows at 1536 dimensions. Every row the build put on
-  page i < nbuilt - 1 lies in the heap blocks [dir[i], dir[i + 1]], and no later row goes there,
-  since inserts append to the last page or after it; so a filtered scan finds the pages that can
-  hold its members by bisection (§44.6). Written after the CODE pages and never changed. The build
-  writes none (`dir_head` invalid, `nbuilt` 0) when its rows did not come in heap order or its CODE
-  pages are not one run of blocks; scans then read every page, as before.
+  nbuilt - 1`), the least and greatest TID of its rows, each as a 64-bit key, block then offset
+  (`LionVecDirEntry`), over as many pages as it takes: 509 a page, so one page for every 17,800
+  rows at 1536 dimensions (55 pages for the benchmark's 975,000). Every row the build put on page
+  i < nbuilt - 1 lies in [dir[i].lo, dir[i].hi], and no later row goes there, since inserts append
+  to the last page or after it; so a filtered scan finds the pages that can hold its members (§44.6).
+  The rows come to the build in heap block order, so by blocks the pages are in order (the block
+  of `dir[i].hi` is at most that of `dir[i + 1].lo`, which `lionvec_read_dir()` checks); within a
+  block they need not be, since a HOT chain is indexed under its root's offset, so two pages'
+  ranges may overlap there. Written after the CODE pages and never changed. The build writes none
+  (`dir_head` invalid, `nbuilt` 0) when its rows did not come in heap block order or its CODE pages
+  are not one run of blocks; scans then read every page.
 - **REFINE**: one item a non-NULL row, 16 bytes of header (TID, `alpha8`, `|r|`) and `dimsp` 8-bit
   codes: 1552 bytes at 1536 dimensions, five a page. Read only for the rows plane 1 cannot rule out.
 
@@ -20323,16 +20327,20 @@ relation as a B-tree's is. The plan differs from §30's in four places:
   key (a Param query vector, a correlated subquery's) among the node's others, re-evaluated on
   rescan. EXPLAIN shows it as `Order By`.
 - **The set is handed to the scan** after every `index_rescan()` (`lion_vec_restrict()`: its
-  container keys, ascending, and its containers). The scan turns it into runs of heap blocks (each
-  container's block mask, `lion_container_block_mask()`) and finds the CODE pages of the build's
-  run that can hold one by the DIR chain (§44.2, `lionvec_dir_pages()`: a bisection a run, from
-  where the last ended); a pass reads those, then the run's last page and every page appended
-  after it, skipping any whose key range holds no member. A row on a listed page outside the
-  heap blocks the directory gives it is ERRCODE_INDEX_CORRUPTED: a page the scan skipped might
-  then hold a member too. Every row not a member is skipped before it is estimated; a refine, a
-  fetch and a return happen only for members. Container keys alone were not enough: a key is 64
-  heap blocks, several hundred CODE pages of a dense heap, so a filter of a thousandth of the
-  rows had a member under every key and read every page (§44.9). A degraded set (§30.4, `hash_mem`
+  container keys, ascending, and its containers). The scan turns each container's members into
+  runs of TID keys (a degraded container: every TID of its key's blocks) and marks the CODE pages
+  of the build's run whose range meets one (§44.2, `lionvec_dir_mark()`: the pages that can meet a
+  run are found by galloping and bisecting by block from where the last run's began, then tested
+  by TID; a bitmap, since within a block a later run can mark an earlier page). A pass reads the
+  marked pages, then the run's last page and every page appended after it, skipping any whose key
+  range holds no member. A row on a marked page outside the range the directory gives it is
+  ERRCODE_INDEX_CORRUPTED: a page the scan skipped might then hold a member too. Every row not a
+  member is skipped before it is estimated; a refine, a fetch and a return happen only for members.
+  Container keys alone were not enough: a key is 64 heap blocks, several hundred CODE pages of a
+  dense heap, so a filter of a thousandth of the rows had a member under every key and read every
+  page. Heap blocks were not enough either: the benchmark's table holds 120 rows a block and a CODE
+  page 35, so at 1% nearly every block has a member and the scan read 76% of the pages; by TID, 30%,
+  the share that holds a member (§44.9). A degraded set (§30.4, `hash_mem`
   exceeded) has NULL containers, meaning every TID of that key's blocks; the scan takes them all,
   and the node rechecks the lion clauses on the heap row, as it does for a B-tree
   (`Rows Removed by Lion Recheck`).
@@ -20391,10 +20399,15 @@ MEASURED
   algebra against true distances; and the bounds' COVERAGE on clustered data at 100, 384 and 1536
   dimensions for each metric: plane 1 outside 1 sd 30 to 32% of the time (the Gaussian's 31.7%),
   outside 3 sd 0.16 to 0.29% (0.27%); the codes outside 2 sd about 4% (4.6%) and never outside 6
-  sd, in 24,000 row-query pairs each. A heavy tail would fail it. And `lionvec_dir_pages()`
-  against the definition (page i meets a range when `first[i] <= hi` and `first[i + 1] >= lo`):
-  no pages, one and two, a block repeated over many pages, the largest block numbers, and 20,000
-  random directories with repeats against random ranges, some adjacent, with a canary past `out`.
+  sd, in 24,000 row-query pairs each. A heavy tail would fail it. And the directory:
+  `lionvec_dir_check()` on directories in and out of order, and `lionvec_dir_mark()` against the
+  definition (page i meets a range when `dir[i].lo <= hi` and `dir[i].hi >= lo`) and against the
+  rows themselves (every row in a range on a marked page): no pages, one and two, the largest block
+  numbers, and 6,000 directories made as a build makes them - blocks in order, offsets within a
+  block sometimes shuffled, pages of random sizes - against random ranges, some adjacent, given
+  over several calls, with a canary past the bitmap. Each of five deliberate faults fails it: the
+  next run begun too late, the gallop skipping a page, the bisection by the wrong key, a run ended
+  a block short, the TID test off by one.
 - **vector.sql**: every ORDER BY run through the index and through a sequential scan and sort,
   compared distance by distance and row by row, for each metric, three queries and LIMITs 1 to past
   the table; no LIMIT, OFFSET, NULL and cosine zero queries and rows; a pass cut by `work_mem` of
@@ -20408,7 +20421,7 @@ MEASURED
   zero and NULL queries; a prepared statement's generic plan; a correlated subquery rescanning the
   node; a degraded set (400,000 rows, `hash_mem` 64kB) and its recheck; the directory (a filter
   with members in a few heap blocks under every container key walks fewer than a quarter of the
-  index blocks a filter every row passes does, by `pg_stat_get_xact_blocks_fetched()`: 31 against
+  index blocks a filter every row passes does, by `pg_stat_get_xact_blocks_fetched()`: 28 against
   222 when written, where container keys alone read all 222); inserts, deletes and VACUUM under the
   filter; the node switched off.
 

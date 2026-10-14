@@ -134,15 +134,15 @@ typedef struct LionVecRefine
 /*
  * The DIR chain (DESIGN.md §44.2): for each of the nbuilt CODE pages the
  * build wrote - blocks code_head .. code_head + nbuilt - 1, in heap order -
- * the heap block of its first row, as a run of BlockNumbers over as many
+ * the least and greatest TID key of its rows (LionVecDirEntry), over as many
  * pages as it takes.  Every row the build put on page i < nbuilt - 1 lies in
- * the heap blocks [dir[i], dir[i + 1]], and no later row goes there (inserts
- * append to the tail, which is page nbuilt - 1 or later), so a scan
- * restricted to a set of rows reads only the pages whose range meets one.
+ * [dir[i].lo, dir[i].hi], and no later row goes there (inserts append to the
+ * tail, which is page nbuilt - 1 or later), so a scan restricted to a set of
+ * rows reads only the pages whose range holds one.
  */
 #define LIONVEC_DIR_PER_PAGE \
 	((int) ((BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - \
-			 MAXALIGN(sizeof(LionVecPageOpaqueData))) / sizeof(BlockNumber)))
+			 MAXALIGN(sizeof(LionVecPageOpaqueData))) / sizeof(LionVecDirEntry)))
 
 /*
  * The most dimensions an index takes: as many whole words as leave a REFINE
@@ -215,8 +215,8 @@ extern LionVecCode *lionvec_code_at(Relation index, Page page, BlockNumber blk,
 extern LionVecRefine *lionvec_refine_at(Relation index, Page page,
 										BlockNumber blk, OffsetNumber off,
 										int dimsp, ItemPointer tid);
-extern BlockNumber *lionvec_read_dir(Relation index,
-									 const LionVecMetaData *meta);
+extern LionVecDirEntry *lionvec_read_dir(Relation index,
+										 const LionVecMetaData *meta);
 
 /* lion_vec_scan.c: the scan callbacks */
 extern IndexScanDesc lionvecbeginscan(Relation index, int nkeys, int norderbys);
