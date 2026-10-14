@@ -20395,7 +20395,8 @@ ground truth is the exact top 10 by cosine, computed in numpy for each query and
 Against pgvector 0.8.6's HNSW on `embedding::halfvec(1536)` (m = 16, ef_construction = 64, as
 pgvector's documentation builds it for 1536 dimensions) - lionvec indexes the `vector` itself.
 PostgreSQL 16, 4 vCPUs (Xeon, 2.8 GHz; AVX-512 but no VPOPCNTDQ, so the POPCNT kernel), 16 GB,
-`shared_buffers` 5 GB, `work_mem` 256 MB, no parallel query. `bench/vector/knn.py`.
+`shared_buffers` 5 GB, `work_mem` 256 MB, no parallel query, and pgvector's three `vector`
+distance functions at `COST 100`, as lionvec's documentation asks (§44.11). `bench/vector/knn.py`.
 
 **Size and build.** lionvec 1,742 MB (218 MB of it the CODE pages a scan reads, 0.4 MB the
 directory), HNSW 3,809 MB, the table 63 MB and its TOAST 7.6 GB. lionvec builds in 98 s with the
@@ -20407,14 +20408,15 @@ share of the true ten returned; "exact" the share of queries that returned all t
 
 | Filter | lionvec (ε = 4) | HNSW, ef_search 40 | HNSW, ef_search 40, iterative |
 | --- | --- | --- | --- |
-| none | 96 ms, recall 1.000, exact 100% | 4.0 ms, 0.900, 52% | - |
-| 10% | 136 ms, 1.000, 100% (planner: Sort, 548 ms) | 4.3 ms, 0.393, 0% (3.9 rows) | 8.4 ms, 0.931, 55% |
-| 1% | 31 ms, 1.000, 100% (planner: Sort, 82 ms) | 3.6 ms, 0.038, 0% (0.4 rows) | 47 ms, 0.947, 59% |
-| 0.1% | 5.5 ms, 1.000, 100% | (planner: Sort of the filter's rows) 13 ms, 0.999 | 13 ms, 0.999 |
+| none | 96 ms, recall 1.000, exact 100% | 6.6 ms, 0.900, 52% | - |
+| 10% | 138 ms, 1.000, 100% | 4.6 ms, 0.393, 0% (3.9 rows) | 7.4 ms, 0.931, 55% |
+| 1% | 34 ms, 1.000, 100% | 4.1 ms, 0.038, 0% (0.4 rows) | 41 ms, 0.947, 59% |
+| 0.1% | 6.6 ms, 1.000, 100% | (planner: Sort of the filter's rows) 12 ms, 0.999 | 11 ms, 0.999 |
 
-At ef_search 100 HNSW reaches 0.954 unfiltered in 6.3 ms, and 0.950 at 1% iterative in 34 ms.
-lionvec's times under a filter are with `enable_sort = off` where the planner would otherwise sort
-the filter's rows (§44.11). The scans read every CODE page unfiltered (27,858), 27,169 at 10%,
+At ef_search 100 HNSW reaches 0.954 unfiltered in 7.6 ms, and 0.950 at 1% iterative in 37 ms.
+Times vary from run to run by up to a fifth: an earlier run, with the same plans and the same
+pages, refines and fetches, timed lionvec at 157, 37 and 6.7 ms under the three filters, and one
+before that, with `enable_sort = off` in place of the costs, at 136, 31 and 5.5 ms. The scans read every CODE page unfiltered (27,858), 27,169 at 10%,
 8,315 at 1% and 965 at 0.1% - the pages holding a member, as the directory promises, 97.5%, 30% and
 3.4% by `1 - (1 - s)^35`. Unfiltered, the pass over plane 1 costs about 90 ns a row; it keeps
 23,000 candidates, of which 122 are refined and 10.5 fetched. At ε = 3, 66 rows are refined, and
@@ -20427,15 +20429,40 @@ filter 56 ms.
 
 | Filter | lionvec (ε = 4) | HNSW, ef_search 40 (iterative under a filter) |
 | --- | --- | --- |
-| none | 378 ms | 103 ms |
-| 1% | 199 ms (planner: Sort, 1,209 ms) | 1,208 ms |
-| 0.1% | 100 ms | 203 ms (planner: Sort of the filter's rows) |
+| none | 402 ms | 101 ms |
+| 1% | 196 ms | 1,307 ms |
+| 0.1% | 112 ms | 227 ms (planner: Sort of the filter's rows) |
 
 Unfiltered, a cold lionvec query is a sequential read of 218 MB of CODE pages, where HNSW reads
 only the part of its graph a search visits, which costs less on this disk. Under a filter the
 graph search goes on (iteratively, to fill the LIMIT) through rows that fail the filter, each
 fetched from the table to test it, where lionvec reads lion's set, the CODE pages that hold a
 member, and about ten rows.
+
+**Memory-capped** - a stream of queries with PostgreSQL in a memory cgroup of 1 or 2 GB (its
+processes, `shared_buffers` of 128 MB, and the page cache its reads fill), which holds lionvec's
+218 MB of CODE pages but not HNSW's 3.8 GB. Each method after a restart with the page cache
+dropped, run with rows of the table as queries until the cgroup is full and for 100 more, then
+timed on the 100 test queries; the median, and the pages a query read from disk (the backend's
+`read_bytes`):
+
+| Memory | Filter | lionvec (ε = 4) | HNSW, ef_search 40 (iterative under a filter) |
+| --- | --- | --- | --- |
+| 1 GB | none | 157 ms, 100 pages | 54 ms, 765 pages |
+| 1 GB | 1% | 31 ms, 0 pages | 665 ms, 9,308 pages |
+| 2 GB | none | 161 ms, 25 pages | 39 ms, 672 pages |
+| 2 GB | 1% | 29 ms, 0 pages | 477 ms, 7,824 pages |
+
+lionvec's CODE pages stay in memory; what it reads from disk are the REFINE items of the rows it
+refines and the vectors of the rows it fetches, scattered over 1.5 GB and 7.6 GB. It is no faster
+at 2 GB, reading a quarter as much, so the rise from 96 ms warm is most likely the CODE pages
+being copied into 128 MB of shared buffers on every pass rather than the disk. HNSW reads 650 to
+800 random pages a query at either size, and goes from 6.6 ms warm to 54 and 39. A random read on
+this machine's disk costs well under a tenth of a millisecond, so HNSW stays the faster
+unfiltered; where one costs a millisecond, the reads alone would come to about 0.75 s a query for
+HNSW and 0.1 s for lionvec (arithmetic, not measured). Under the 1% filter lionvec's working set -
+the members' CODE pages, REFINE items and vectors - fits and it reads nothing, while HNSW's
+iterative search reads 9,300 pages a query of graph and of rows that fail the filter.
 
 ### 44.10 Tests
 
@@ -20472,7 +20499,7 @@ member, and about ten rows.
   zero and NULL queries; a prepared statement's generic plan; a correlated subquery rescanning the
   node; a degraded set (400,000 rows, `hash_mem` 64kB) and its recheck; the directory (a filter
   with members in a few heap blocks under every container key walks fewer than a quarter of the
-  index blocks a filter every row passes does, by `pg_stat_get_xact_blocks_fetched()`: 28 against
+  index blocks a filter every row passes does, by `pg_statio_user_indexes`: 28 against
   222 when written, where container keys alone read all 222); inserts, deletes and VACUUM under the
   filter; the node switched off.
 
@@ -20494,11 +20521,21 @@ member, and about ten rows.
   index wrong - any mean is correct - but loosens the bounds until REINDEX recomputes the mean.
 - **A small `work_mem` with loose bounds** (few dimensions, a large LIMIT) makes many passes, each
   reading every CODE page; the DEBUG1 line shows them.
-- **The planner underprices a sort by distance.** pgvector's distance functions cost 1 (`procost`),
-  and a 1536-dimension vector is stored out of line, so the planner sees an 18-byte column and a
-  cheap operator: sorting a filter's rows by distance looks cheaper than the lionvec scan, and it
-  is chosen at 548 ms over the scan's 136 ms for 97,000 rows, and at 82 ms over 31 for 9,700
-  (§44.9). HNSW does not meet this, its cost estimate being tiny. Repricing core's Sort paths whose key is a lionvec distance would be new
-  territory for lion's planner hooks, and is not planned; `enable_sort = off`, or a higher `COST`
-  on pgvector's distance functions, steers the planner to the scan (`COST 100` on
-  `cosine_distance` did, for the 10% filter).
+- **The planner underprices a sort by distance**, at pgvector's own costs. Its distance functions
+  cost 1 (`procost`), and a 1536-dimension vector is stored out of line, so the planner sees an
+  18-byte column and a cheap operator: sorting a filter's rows by distance looks cheaper than the
+  lionvec scan, and was chosen at 548 ms over the scan's 136 ms for 97,000 rows, at 82 ms over 31
+  for 9,700, and cold at 1,209 ms over 199. Repricing core's Sort paths whose key is a lionvec
+  distance would be new territory for lion's planner hooks, and is not planned. Instead lionvec's
+  documentation has the three functions its operator classes use (`l2_distance`,
+  `vector_negative_inner_product` and `cosine_distance` of `vector`) set to `COST 100` with the
+  extension, and the benchmarks assume it: on the 975,000 rows the planner then takes the scan
+  under the 10%, 1% and 0.1% filters and leaves HNSW's plans (on `halfvec`) as they were. pg_dump
+  does not keep the setting (an extension member's), and a pgvector update may reset it.
+  `enable_sort = off` does the same for one query.
+- **Choosing between lionvec and HNSW.** With both on one column, the planner takes HNSW for
+  nearly every query, as pgvector prices an HNSW scan at almost nothing: on 200,000 random
+  256-dimension rows, about 13 against lionvec's 3,100 unfiltered and 1,300 against 1,650 under a
+  1% filter, where HNSW (without `hnsw.iterative_scan`) then returned none of the ten rows; only a
+  filter of a few hundred rows goes to a sort of lion's rows. lionvec is always exact; nothing
+  switches it to an approximate scan where that would be cheaper (the first item above).

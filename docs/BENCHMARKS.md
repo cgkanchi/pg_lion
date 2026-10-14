@@ -142,36 +142,54 @@ OpenAI ada-002 embeddings of DBpedia entities (1536 dimensions; Qdrant's
 `WHERE u < s`, a uniform random column with a lion index that keeps a share `s` of the rows
 ([script](../bench/vector/knn.py), [results](../bench/results/2026-10-14-lionvec/)). Against
 pgvector 0.8.6's HNSW on `embedding::halfvec(1536)` (m 16, ef_construction 64). PostgreSQL 16,
-4 vCPUs, 16 GB RAM, `shared_buffers` 5 GB. Recall is the share of the true ten returned, against
-an exact numpy search.
+4 vCPUs, 16 GB RAM, `shared_buffers` 5 GB, and pgvector's `vector` distance functions at
+`COST 100`, as lionvec's setup asks. Recall is the share of the true ten returned, against an
+exact numpy search.
 
 **Warm** (everything in memory), median of 100 queries:
 
 | Filter | lionvec | HNSW ef_search 40 | HNSW ef_search 40, iterative scan |
 | --- | --- | --- | --- |
-| none | 96 ms, recall 1.000 | 4.0 ms, 0.900 | |
-| 10% | 136 ms, 1.000 | 4.3 ms, 0.393 (3.9 rows returned) | 8.4 ms, 0.931 |
-| 1% | 31 ms, 1.000 | 3.6 ms, 0.038 (0.4 rows returned) | 47 ms, 0.947 |
-| 0.1% | 5.5 ms, 1.000 | 13 ms, 0.999 (the planner sorts the filter's rows) | 13 ms, 0.999 |
+| none | 96 ms, recall 1.000 | 6.6 ms, 0.900 | |
+| 10% | 138 ms, 1.000 | 4.6 ms, 0.393 (3.9 rows returned) | 7.4 ms, 0.931 |
+| 1% | 34 ms, 1.000 | 4.1 ms, 0.038 (0.4 rows returned) | 41 ms, 0.947 |
+| 0.1% | 6.6 ms, 1.000 | 12 ms, 0.999 (the planner sorts the filter's rows) | 11 ms, 0.999 |
 
 **Cold** (PostgreSQL restarted and the OS page cache dropped before each query), median of 5:
 
 | Filter | lionvec | HNSW ef_search 40 (iterative under a filter) |
 | --- | --- | --- |
-| none | 378 ms | 103 ms |
-| 1% | 199 ms | 1,208 ms |
-| 0.1% | 100 ms | 203 ms (the planner sorts the filter's rows) |
+| none | 402 ms | 101 ms |
+| 1% | 196 ms | 1,307 ms |
+| 0.1% | 112 ms | 227 ms (the planner sorts the filter's rows) |
+
+**Memory-capped** (a stream of queries, PostgreSQL and its page cache held to 1 or 2 GB by a
+memory cgroup with `shared_buffers` at 128 MB, the cache filled first), median of 100 and the
+pages each query read from disk:
+
+| Memory | Filter | lionvec | HNSW ef_search 40 (iterative under a filter) |
+| --- | --- | --- | --- |
+| 1 GB | none | 157 ms, 100 pages | 54 ms, 765 pages |
+| 1 GB | 1% | 31 ms, 0 pages | 665 ms, 9,308 pages |
+| 2 GB | none | 161 ms, 25 pages | 39 ms, 672 pages |
+| 2 GB | 1% | 29 ms, 0 pages | 477 ms, 7,824 pages |
+
+lionvec keeps its one-bit codes in memory and reads only the rows it refines or fetches. HNSW
+reads 650 to 800 random pages a query without a filter and about 8,000 under one. This machine's
+disk answers a random read in well under a tenth of a millisecond, so HNSW stays faster without a
+filter here; on slower storage the page counts are what to compare.
 
 **Size and build.** lionvec is 1.7 GB, of which a query reads the 218 MB of one-bit codes; HNSW is
 3.8 GB. lionvec builds in 98 s with the table cached (683 s reading it from disk).
 
 lionvec returns the exact ten nearest whatever the filter (a row is missed only when an error bound
 of `pg_lion.vector_epsilon` standard deviations fails, which none did in these 400 queries). HNSW
-is far faster without a filter, at 90% recall (95% at ef_search 100, 6.3 ms). Under a filter its
+is far faster without a filter, at 90% recall (95% at ef_search 100, 7.6 ms). Under a filter its
 graph search returns rows that then fail the filter, so it returns fewer than ten unless
-iterative scans are on, and then still misses one row in twenty. Under a 10% or 1% filter the
-planner sorts the matching rows (548 and 82 ms) rather than use lionvec: pgvector prices its
-distance functions as nearly free. The lionvec times above are with `SET enable_sort = off`.
+iterative scans are on, and then still misses one row in twenty. At pgvector's own cost of 1 for
+its distance functions, the planner would sort the rows of the 10% and 1% filters rather than use
+lionvec, two to four times slower (548 and 82 ms in an earlier run). Times vary between runs by up
+to a fifth.
 
 ## Size, build and writes (5M rows, all seven indexes)
 
@@ -212,6 +230,8 @@ every row as `Q.npy` and `S.npy` (see the script's header). Then:
 python3 bench/vector/knn.py setup     # the lionvec and lion indexes
 python3 bench/vector/knn.py warm 100  # needs pg_prewarm
 python3 bench/vector/knn.py cold 5    # restarts the cluster; run as root to drop the page cache
+# as root, with KNN_CGROUP a memory cgroup directory it may use:
+python3 bench/vector/knn.py capped 1024 100   # PostgreSQL held to 1 GB of memory
 ```
 
 The suite runs its own temporary cluster and must run as a non-root user. On a 4-vCPU machine it

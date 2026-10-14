@@ -199,6 +199,12 @@ With [pgvector](https://github.com/pgvector/pgvector) installed:
 
 ```sql
 CREATE EXTENSION pg_lion_vector;
+-- pgvector prices its distances as nearly free, which makes the planner sort a
+-- filter's rows rather than use lionvec; price them closer to what they cost
+ALTER FUNCTION l2_distance(vector, vector) COST 100;
+ALTER FUNCTION vector_negative_inner_product(vector, vector) COST 100;
+ALTER FUNCTION cosine_distance(vector, vector) COST 100;
+
 CREATE INDEX items_embedding ON items USING lionvec (embedding vector_cosine_ops);
 CREATE INDEX items_category  ON items USING lion (category);
 
@@ -214,10 +220,9 @@ might make the cut, and computes the last few distances exactly from the table. 
 true distance order; a row is missed only when an error bound fails, which
 `pg_lion.vector_epsilon` makes rare. Under a `WHERE` that lion indexes answer, the scan reads only
 the pages that hold matching rows and scores only those rows, so a filter of any selectivity gets
-its ten nearest: on those 975,000 embeddings, 31 ms at 1% of the rows (82 ms when the planner sorts
-instead, see Limitations) and 5.5 ms at 0.1%, where HNSW returns fewer than one row at 1%, or 95%
-of the right ones in 47 ms with iterative scans. Without
-a filter HNSW is much faster (4 ms against 96, at 90% recall). `vector_l2_ops` (`<->`, the
+its ten nearest: on those 975,000 embeddings, 34 ms at 1% of the rows and 6.6 ms at 0.1%, where
+HNSW returns fewer than one row at 1%, or 95% of the right ones in 41 ms with iterative scans.
+Without a filter HNSW is much faster (6.6 ms against 96, at 90% recall). `vector_l2_ops` (`<->`, the
 default), `vector_ip_ops` (`<#>`) and `vector_cosine_ops` (`<=>`) are supported, up to 8128
 dimensions. See [BENCHMARKS.md](docs/BENCHMARKS.md#nearest-neighbours-lionvec-against-hnsw).
 
@@ -241,10 +246,14 @@ columns and can be built in parallel on PostgreSQL 17 and later. `pg_lion_vector
   down when every query term is very common.
 - The count pushdown uses an expression index (for example, lion on `(data->>'key')`) only on a
   table that is not partitioned, and not in its joins.
-- With a filter that keeps many rows (a tenth of the table, say), the planner may sort the matching
-  rows by distance rather than use `lionvec`, because pgvector prices its distance functions as
-  nearly free. `SET enable_sort = off`, or a higher `COST` on pgvector's distance functions, steers
-  it back.
+- `lionvec` relies on pgvector's distance functions being costed at 100 (the `ALTER FUNCTION`s
+  under [Nearest neighbours](#nearest-neighbours)). At pgvector's own cost of 1, a filter that keeps
+  1% or 10% of a million rows is sorted by distance instead, two to four times slower. The setting is
+  not kept by `pg_dump`, and an `ALTER EXTENSION vector UPDATE` may reset it, so run them again
+  after either.
+- If the column also has an HNSW index, the planner chooses HNSW for nearly every query, filtered
+  or not, because pgvector prices its scan as nearly free; under a filter it then returns fewer
+  rows than the `LIMIT` unless `hnsw.iterative_scan` is on.
 - jsonb `<@` isn't indexed, and jsonpath (`@?`, `@@`) is always rechecked in the heap. Updating
   an indexed jsonb document writes one entry per path, so it costs more than with GIN's pending
   list.

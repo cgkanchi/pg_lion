@@ -5,9 +5,9 @@
   "recall": 1.0,
   "exact_q": 1.0,
   "returned": 10.0,
-  "median_ms": 90.6473469995035,
-  "p95_ms": 110.73922035038775,
-  "plan": "->  Index Scan using items_lv on items  (cost=34653.50..3984216.00 rows=975000 width=12)",
+  "median_ms": 93.21462950083514,
+  "p95_ms": 120.88252189896593,
+  "plan": "->  Index Scan using items_lv on items  (cost=34653.50..4225528.50 rows=975000 width=12)",
   "passes": 1.0,
   "candidates": 11066.9,
   "refined": 66.45,
@@ -22,9 +22,9 @@
   "recall": 1.0,
   "exact_q": 1.0,
   "returned": 10.0,
-  "median_ms": 96.36161600064952,
-  "p95_ms": 119.60927444924891,
-  "plan": "->  Index Scan using items_lv on items  (cost=34653.50..3984216.00 rows=975000 width=12)",
+  "median_ms": 95.67683400018723,
+  "p95_ms": 124.7270324512101,
+  "plan": "->  Index Scan using items_lv on items  (cost=34653.50..4225528.50 rows=975000 width=12)",
   "passes": 1.0,
   "candidates": 23156.93,
   "refined": 121.66,
@@ -39,8 +39,8 @@
   "recall": 0.9000000000000001,
   "exact_q": 0.52,
   "returned": 10.0,
-  "median_ms": 3.958584999963932,
-  "p95_ms": 5.494559749513428,
+  "median_ms": 6.628346000070451,
+  "p95_ms": 10.695826050687174,
   "plan": "->  Index Scan using items_hnsw on items  (cost=1627.63..2004441.50 rows=975000 width=12)"
  },
  {
@@ -49,8 +49,8 @@
   "recall": 0.9540000000000001,
   "exact_q": 0.71,
   "returned": 10.0,
-  "median_ms": 6.256571499761776,
-  "p95_ms": 9.34259339919663,
+  "median_ms": 7.60435949996463,
+  "p95_ms": 10.714274301153637,
   "plan": "->  Index Scan using items_hnsw on items  (cost=3263.68..2004441.50 rows=975000 width=12)"
  },
  {
@@ -59,9 +59,16 @@
   "recall": 1.0,
   "exact_q": 1.0,
   "returned": 10.0,
-  "median_ms": 548.4283944997514,
-  "p95_ms": 604.2026046500723,
-  "plan": "->  Sort  (cost=13508.07..13751.23 rows=97265 width=12) / Sort Key: ((embedding <=> '[-0.00241461,-0.03197552,-0.02233722,-0.0575076,-0.01986724,0.04040567,-0.01011484,0.00561786,0.00714147,-0.0219345"
+  "median_ms": 135.99871450060164,
+  "p95_ms": 172.86761399982424,
+  "plan": "->  Custom Scan (LionOrdered) on items  (cost=32766.89..447845.28 rows=97265 width=12) / Lion Cond: (u < '0.1'::double precision) / Lion Indexes: items_ul",
+  "passes": 1.0,
+  "candidates": 6043.47,
+  "refined": 58.61,
+  "fetched": 10.38,
+  "skipped": 0.0,
+  "missed": 0.0,
+  "pages": 27169.0
  },
  {
   "name": "lionvec eps=4",
@@ -69,19 +76,9 @@
   "recall": 1.0,
   "exact_q": 1.0,
   "returned": 10.0,
-  "median_ms": 547.48770399965,
-  "p95_ms": 598.7839918492682,
-  "plan": "->  Sort  (cost=13508.07..13751.23 rows=97265 width=12) / Sort Key: ((embedding <=> '[-0.00241461,-0.03197552,-0.02233722,-0.0575076,-0.01986724,0.04040567,-0.01011484,0.00561786,0.00714147,-0.0219345"
- },
- {
-  "name": "lionvec eps=4 sort off",
-  "sel": 0.1,
-  "recall": 1.0,
-  "exact_q": 1.0,
-  "returned": 10.0,
-  "median_ms": 135.59653199990862,
-  "p95_ms": 150.4712760493021,
-  "plan": "->  Custom Scan (LionOrdered) on items  (cost=32766.89..423772.19 rows=97265 width=12) / Lion Cond: (u < '0.1'::double precision) / Lion Indexes: items_ul",
+  "median_ms": 138.10714250030287,
+  "p95_ms": 187.13967195071746,
+  "plan": "->  Custom Scan (LionOrdered) on items  (cost=32766.89..447845.28 rows=97265 width=12) / Lion Cond: (u < '0.1'::double precision) / Lion Indexes: items_ul",
   "passes": 1.0,
   "candidates": 11078.13,
   "refined": 98.6,
@@ -96,8 +93,8 @@
   "recall": 0.39299999999999996,
   "exact_q": 0.0,
   "returned": 3.94,
-  "median_ms": 4.300019500078633,
-  "p95_ms": 6.700162899596762,
+  "median_ms": 4.569022000396217,
+  "p95_ms": 5.577708301007078,
   "plan": "->  Index Scan using items_hnsw on items  (cost=1627.63..2002490.32 rows=97265 width=12)"
  },
  {
@@ -106,8 +103,8 @@
   "recall": 0.931,
   "exact_q": 0.55,
   "returned": 10.0,
-  "median_ms": 8.437680999122676,
-  "p95_ms": 15.689892199861784,
+  "median_ms": 7.39376399997127,
+  "p95_ms": 13.253108699518632,
   "plan": "->  Index Scan using items_hnsw on items  (cost=1627.63..2002490.32 rows=97265 width=12)"
  },
  {
@@ -116,8 +113,8 @@
   "recall": 0.851,
   "exact_q": 0.39,
   "returned": 8.89,
-  "median_ms": 6.747797499883745,
-  "p95_ms": 8.525333050511108,
+  "median_ms": 6.494585999462288,
+  "p95_ms": 9.365418151446647,
   "plan": "->  Index Scan using items_hnsw on items  (cost=3263.68..2002490.32 rows=97265 width=12)"
  },
  {
@@ -126,8 +123,8 @@
   "recall": 0.9390000000000001,
   "exact_q": 0.61,
   "returned": 10.0,
-  "median_ms": 7.535613000982266,
-  "p95_ms": 14.657303949843481,
+  "median_ms": 7.559001499430451,
+  "p95_ms": 13.196850500116852,
   "plan": "->  Index Scan using items_hnsw on items  (cost=3263.68..2002490.32 rows=97265 width=12)"
  },
  {
@@ -136,9 +133,16 @@
   "recall": 1.0,
   "exact_q": 1.0,
   "returned": 10.0,
-  "median_ms": 82.51701100016362,
-  "p95_ms": 104.39466749894562,
-  "plan": "->  Sort  (cost=9064.19..9088.02 rows=9531 width=12) / Sort Key: ((embedding <=> '[-0.00241461,-0.03197552,-0.02233722,-0.0575076,-0.01986724,0.04040567,-0.01011484,0.00561786,0.00714147,-0.02193451,0"
+  "median_ms": 34.233072999995784,
+  "p95_ms": 41.37524340021628,
+  "plan": "->  Custom Scan (LionOrdered) on items  (cost=9651.57..50325.11 rows=9531 width=12) / Lion Cond: (u < '0.01'::double precision) / Lion Indexes: items_ul",
+  "passes": 1.0,
+  "candidates": 2739.24,
+  "refined": 44.89,
+  "fetched": 10.42,
+  "skipped": 0.0,
+  "missed": 0.0,
+  "pages": 8315.0
  },
  {
   "name": "lionvec eps=4",
@@ -146,19 +150,9 @@
   "recall": 1.0,
   "exact_q": 1.0,
   "returned": 10.0,
-  "median_ms": 81.52088350016129,
-  "p95_ms": 101.95804335098728,
-  "plan": "->  Sort  (cost=9064.19..9088.02 rows=9531 width=12) / Sort Key: ((embedding <=> '[-0.00241461,-0.03197552,-0.02233722,-0.0575076,-0.01986724,0.04040567,-0.01011484,0.00561786,0.00714147,-0.02193451,0"
- },
- {
-  "name": "lionvec eps=4 sort off",
-  "sel": 0.01,
-  "recall": 1.0,
-  "exact_q": 1.0,
-  "returned": 10.0,
-  "median_ms": 31.456382499527535,
-  "p95_ms": 36.055182449581466,
-  "plan": "->  Custom Scan (LionOrdered) on items  (cost=9651.57..47966.19 rows=9531 width=12) / Lion Cond: (u < '0.01'::double precision) / Lion Indexes: items_ul",
+  "median_ms": 34.42073350015562,
+  "p95_ms": 44.75879535111744,
+  "plan": "->  Custom Scan (LionOrdered) on items  (cost=9651.57..50325.11 rows=9531 width=12) / Lion Cond: (u < '0.01'::double precision) / Lion Indexes: items_ul",
   "passes": 1.0,
   "candidates": 4156.99,
   "refined": 69.98,
@@ -173,8 +167,8 @@
   "recall": 0.038000000000000006,
   "exact_q": 0.0,
   "returned": 0.38,
-  "median_ms": 3.6340440001367824,
-  "p95_ms": 5.090779399688472,
+  "median_ms": 4.120656000850431,
+  "p95_ms": 5.700323148721509,
   "plan": "->  Index Scan using items_hnsw on items  (cost=1627.63..2002051.66 rows=9531 width=12)"
  },
  {
@@ -183,8 +177,8 @@
   "recall": 0.9470000000000001,
   "exact_q": 0.59,
   "returned": 10.0,
-  "median_ms": 47.02820650072681,
-  "p95_ms": 83.90066305155415,
+  "median_ms": 40.79837849985779,
+  "p95_ms": 68.46681890037871,
   "plan": "->  Index Scan using items_hnsw on items  (cost=1627.63..2002051.66 rows=9531 width=12)"
  },
  {
@@ -193,8 +187,8 @@
   "recall": 0.1,
   "exact_q": 0.0,
   "returned": 1.0,
-  "median_ms": 5.898671000068134,
-  "p95_ms": 7.631723600297845,
+  "median_ms": 7.009139000729192,
+  "p95_ms": 10.442274848992383,
   "plan": "->  Index Scan using items_hnsw on items  (cost=3263.68..2002051.66 rows=9531 width=12)"
  },
  {
@@ -203,8 +197,8 @@
   "recall": 0.95,
   "exact_q": 0.6,
   "returned": 10.0,
-  "median_ms": 34.140010000555776,
-  "p95_ms": 54.196669700013445,
+  "median_ms": 36.74828900057037,
+  "p95_ms": 60.6126877000861,
   "plan": "->  Index Scan using items_hnsw on items  (cost=3263.68..2002051.66 rows=9531 width=12)"
  },
  {
@@ -213,9 +207,9 @@
   "recall": 0.9990000000000001,
   "exact_q": 0.99,
   "returned": 10.0,
-  "median_ms": 6.200698499924329,
-  "p95_ms": 8.302084500246565,
-  "plan": "->  Custom Scan (LionOrdered) on items  (cost=1868.64..5699.70 rows=953 width=12) / Lion Cond: (u < '0.001'::double precision) / Lion Indexes: items_ul",
+  "median_ms": 6.905390499923669,
+  "p95_ms": 9.017367100022964,
+  "plan": "->  Custom Scan (LionOrdered) on items  (cost=1868.64..5935.56 rows=953 width=12) / Lion Cond: (u < '0.001'::double precision) / Lion Indexes: items_ul",
   "passes": 1.0,
   "candidates": 758.71,
   "refined": 39.64,
@@ -230,26 +224,9 @@
   "recall": 1.0,
   "exact_q": 1.0,
   "returned": 10.0,
-  "median_ms": 5.500448000020697,
-  "p95_ms": 6.918667949321389,
-  "plan": "->  Custom Scan (LionOrdered) on items  (cost=1868.64..5699.70 rows=953 width=12) / Lion Cond: (u < '0.001'::double precision) / Lion Indexes: items_ul",
-  "passes": 1.0,
-  "candidates": 862.48,
-  "refined": 58.57,
-  "fetched": 10.47,
-  "skipped": 0.0,
-  "missed": 0.0,
-  "pages": 965.0
- },
- {
-  "name": "lionvec eps=4 sort off",
-  "sel": 0.001,
-  "recall": 1.0,
-  "exact_q": 1.0,
-  "returned": 10.0,
-  "median_ms": 5.741030499848421,
-  "p95_ms": 6.674290399314486,
-  "plan": "->  Custom Scan (LionOrdered) on items  (cost=1868.64..5699.70 rows=953 width=12) / Lion Cond: (u < '0.001'::double precision) / Lion Indexes: items_ul",
+  "median_ms": 6.560119501045847,
+  "p95_ms": 8.479577700563823,
+  "plan": "->  Custom Scan (LionOrdered) on items  (cost=1868.64..5935.56 rows=953 width=12) / Lion Cond: (u < '0.001'::double precision) / Lion Indexes: items_ul",
   "passes": 1.0,
   "candidates": 862.48,
   "refined": 58.57,
@@ -264,8 +241,8 @@
   "recall": 0.9990000000000001,
   "exact_q": 0.99,
   "returned": 10.0,
-  "median_ms": 13.289611999425688,
-  "p95_ms": 18.526368249877123,
+  "median_ms": 12.011398499453207,
+  "p95_ms": 14.601064251019123,
   "plan": "->  Sort  (cost=2760.97..2763.35 rows=953 width=12) / Sort Key: (((embedding)::halfvec(1536) <=> '[-0.0024147034,-0.031982422,-0.022338867,-0.057495117,-0.019866943,0.040405273,-0.010116577,0.00561904"
  },
  {
@@ -274,8 +251,8 @@
   "recall": 0.9990000000000001,
   "exact_q": 0.99,
   "returned": 10.0,
-  "median_ms": 13.37998850067379,
-  "p95_ms": 17.191369250485874,
+  "median_ms": 11.412326000026951,
+  "p95_ms": 15.997601748858868,
   "plan": "->  Sort  (cost=2760.97..2763.35 rows=953 width=12) / Sort Key: (((embedding)::halfvec(1536) <=> '[-0.0024147034,-0.031982422,-0.022338867,-0.057495117,-0.019866943,0.040405273,-0.010116577,0.00561904"
  },
  {
@@ -284,8 +261,8 @@
   "recall": 0.9990000000000001,
   "exact_q": 0.99,
   "returned": 10.0,
-  "median_ms": 13.041684499512485,
-  "p95_ms": 16.54643500123711,
+  "median_ms": 12.408527499246702,
+  "p95_ms": 17.533000699131662,
   "plan": "->  Sort  (cost=2760.97..2763.35 rows=953 width=12) / Sort Key: (((embedding)::halfvec(1536) <=> '[-0.0024147034,-0.031982422,-0.022338867,-0.057495117,-0.019866943,0.040405273,-0.010116577,0.00561904"
  },
  {
@@ -294,8 +271,8 @@
   "recall": 0.9990000000000001,
   "exact_q": 0.99,
   "returned": 10.0,
-  "median_ms": 13.230418499915686,
-  "p95_ms": 19.310553499417438,
+  "median_ms": 11.803251499259204,
+  "p95_ms": 13.398695399337157,
   "plan": "->  Sort  (cost=2760.97..2763.35 rows=953 width=12) / Sort Key: (((embedding)::halfvec(1536) <=> '[-0.0024147034,-0.031982422,-0.022338867,-0.057495117,-0.019866943,0.040405273,-0.010116577,0.00561904"
  }
 ]

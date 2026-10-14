@@ -596,10 +596,14 @@ its index until `REINDEX`, which also recomputes the mean the codes are centred 
 drifted makes scans read more, never answer wrong). Each returned row is fetched from the heap
 twice, once for its distance and once by the executor. A small `work_mem` with a large `LIMIT`
 makes a scan read every code several times (`SET client_min_messages = debug1` shows the passes).
-pgvector prices its distance functions as nearly free and its vectors are stored out of line, so
-under a filter that keeps a large share of the rows the planner may sort them by distance where
-the `lionvec` scan is faster; `SET enable_sort = off`, or a higher `COST` on pgvector's distance
-function (`ALTER FUNCTION cosine_distance(vector, vector) COST 100`, say), steers it to the scan.
+pgvector prices its distance functions as nearly free (`COST 1`) and its vectors are stored out of
+line, so under a filter that keeps a large share of the rows (1% or 10% of a million) the planner
+sorts them by distance where the `lionvec` scan is two to four times faster. `lionvec` assumes the three functions its
+operator classes use cost 100 (`ALTER FUNCTION l2_distance(vector, vector) COST 100`, and the
+same for `vector_negative_inner_product(vector, vector)` and `cosine_distance(vector, vector)`),
+which `pg_dump` does not keep and an `ALTER EXTENSION vector UPDATE` may reset; `SET enable_sort =
+off` steers a single query the same way. An HNSW index on the same column is chosen over
+`lionvec` for nearly every query, filtered or not, since pgvector prices its scan as nearly free.
 An index built while rows were not handed over in heap order has no page directory, and its
 filtered scans read every page (`REINDEX` writes one).
 

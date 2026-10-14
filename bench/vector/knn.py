@@ -9,9 +9,15 @@
 # (m = 16, ef_construction = 64), the lionvec one on embedding itself, the
 # filter's a lion index on u.
 #
+# pgvector's distance functions are costed at 100, as docs/REFERENCE.md asks
+# of a lionvec installation (the planner otherwise sorts a filter's rows by
+# distance where the scan is faster).
+#
 #   knn.py setup              build the lionvec and lion indexes
 #   knn.py warm NQ            recall and latency, warm, every method and filter
 #   knn.py cold NQ            latency of each query just after a restart
+#   knn.py capped MB NQ       latency and disk reads of a stream of queries
+#                             with PostgreSQL held to MB of memory
 import json, os, re, subprocess, sys, time
 import numpy as np
 import psycopg
@@ -30,16 +36,26 @@ STATS = re.compile(r'lionvec scan of "[^"]*": (\d+) passes, (\d+) candidates, (\
                    r'(\d+) bounds missed, (\d+) pages read')
 
 
+DISTANCES = ('l2_distance(vector, vector)', 'vector_negative_inner_product(vector, vector)',
+             'cosine_distance(vector, vector)')
+
+
 def connect():
     conn = psycopg.connect(DSN, autocommit=True, prepare_threshold=None)
     conn.execute("LOAD 'pg_lion'")
     return conn
 
 
+def cost_distances(conn):
+    for f in DISTANCES:
+        conn.execute(f'ALTER FUNCTION {f} COST 100')
+
+
 def setup():
     conn = connect()
     conn.execute('CREATE EXTENSION IF NOT EXISTS pg_lion')
     conn.execute('CREATE EXTENSION IF NOT EXISTS pg_lion_vector')
+    cost_distances(conn)
     for name, ddl in [('items_lv', 'CREATE INDEX items_lv ON items USING lionvec (embedding vector_cosine_ops)'),
                       ('items_ul', 'CREATE INDEX items_ul ON items USING lion (u)')]:
         if conn.execute('SELECT to_regclass(%s)', (name,)).fetchone()[0] is None:
@@ -121,12 +137,6 @@ def methods(sel):
     m = []
     for eps in (3, 4):
         m.append((f'lionvec eps={eps}', LION.format(w=where(sel)), [f'SET pg_lion.vector_epsilon = {eps}']))
-    if sel < 1.0:
-        # the planner underprices a sort by distance (pgvector's functions
-        # cost 1, the vectors are out of line), so it may sort the filter's
-        # rows where the lionvec scan is faster: what the scan alone costs
-        m.append(('lionvec eps=4 sort off', LION.format(w=where(sel)),
-                  ['SET pg_lion.vector_epsilon = 4', 'SET enable_sort = off']))
     for ef in (40, 100):
         m.append((f'hnsw ef={ef}', HNSW.format(w=where(sel)), [f'SET hnsw.ef_search = {ef}']))
         if sel < 1.0:
@@ -140,6 +150,7 @@ def warm(nq):
     Q = np.load(DP + 'Q.npy')
     gt = truth(np.load(DP + 'S.npy', mmap_mode='r'), np.load(DP + 'filter_u.npy'), sels, nq)
     conn = connect()
+    cost_distances(conn)
     # warm means everything a query reads is in memory: the HNSW graph and
     # the heap in shared_buffers, and the lionvec index and the vectors (TOAST),
     # which do not fit beside them, in the page cache
@@ -162,10 +173,13 @@ def cold(nq):
     # each query alone after a restart and, where the kernel lets us, with
     # the page cache dropped: what a query costs when nothing is in memory
     Q = np.load(DP + 'Q.npy')
+    conn = connect()
+    cost_distances(conn)
+    conn.close()
     out = []
     for name, sql, settings in [m for m in methods(1.0) if m[0] in ('lionvec eps=4', 'hnsw ef=40')] + \
             [m for sel in (0.01, 0.001) for m in methods(sel)
-             if m[0] in ('lionvec eps=4', 'lionvec eps=4 sort off', 'hnsw ef=40 iterative')]:
+             if m[0] in ('lionvec eps=4', 'hnsw ef=40 iterative')]:
         ts = []
         for i in range(nq):
             subprocess.run(['pg_ctlcluster'] + CLUSTER.split() + ['restart'], check=True)
@@ -185,6 +199,82 @@ def cold(nq):
     json.dump(out, open(os.environ.get('KNN_OUT', 'knn_cold.json'), 'w'), indent=1)
 
 
+def read_bytes(pid):
+    for line in open(f'/proc/{pid}/io'):
+        if line.startswith('read_bytes:'):
+            return int(line.split()[1])
+
+
+def capped(mb, nq):
+    # a steady stream of queries where memory holds lionvec's CODE pages but
+    # not the HNSW graph: PostgreSQL started inside a memory cgroup of mb MB
+    # (its processes, shared_buffers of 128 MB, and the page cache its reads
+    # fill), the page cache dropped first so that every page is charged to
+    # it.  Each method after its own restart, run with rows of the table as
+    # queries until the cgroup is full and 100 more, then timed on the test
+    # queries; the disk reads are the backend's read_bytes.  KNN_CGROUP is a
+    # memory cgroup directory to use (v1 or v2); run as root.
+    cg = os.environ['KNN_CGROUP']
+    limit = os.path.join(cg, 'memory.max')
+    usage = os.path.join(cg, 'memory.current')
+    if not os.path.exists(limit):
+        limit = os.path.join(cg, 'memory.limit_in_bytes')
+        usage = os.path.join(cg, 'memory.usage_in_bytes')
+    Q = np.load(DP + 'Q.npy')
+    ctl = ['pg_ctlcluster'] + CLUSTER.split()
+    conn = connect()
+    cost_distances(conn)
+    pgdata = conn.execute('SHOW data_directory').fetchone()[0]
+    W = [r[0] for r in conn.execute('SELECT embedding::text FROM items WHERE id % 191 = 7 ORDER BY id LIMIT 5000')]
+    conn.close()
+    out = []
+    try:
+        for name, sql, settings in [m for m in methods(1.0) if m[0] in ('lionvec eps=4', 'hnsw ef=40')] + \
+                [m for m in methods(0.01) if m[0] in ('lionvec eps=4', 'hnsw ef=40 iterative')]:
+            subprocess.run(ctl + ['stop'], check=True)
+            subprocess.run(['sh', '-c', 'sync; echo 3 > /proc/sys/vm/drop_caches'], check=True)
+            with open(limit, 'w') as f:
+                f.write(str(mb << 20))
+            subprocess.run(['sh', '-c', f'echo $$ > {cg}/cgroup.procs && exec ' + ' '.join(ctl) +
+                            ' start -- -o "-c shared_buffers=128MB"'], check=True)
+            pm = int(open(os.path.join(pgdata, 'postmaster.pid')).readline())
+            paths = [line.rstrip('\n').split(':', 2)[2] for line in open(f'/proc/{pm}/cgroup')]
+            if not any(p != '/' and cg.rstrip('/').endswith(p) for p in paths):
+                raise RuntimeError(f'the postmaster is not in {cg}')
+            conn = connect()
+            for st in settings:
+                conn.execute(st)
+            pid = conn.execute('SELECT pg_backend_pid()').fetchone()[0]
+            n = 0
+            while n < len(W) - 100 and int(open(usage).read()) < 0.95 * (mb << 20):
+                conn.execute(sql, {'q': W[n]}).fetchall()
+                n += 1
+            full = int(open(usage).read()) >= 0.95 * (mb << 20)
+            for q in W[n:n + 100]:
+                conn.execute(sql, {'q': q}).fetchall()
+            ts, rd = [], []
+            for i in range(nq):
+                r = read_bytes(pid)
+                t = time.perf_counter()
+                conn.execute(sql, {'q': lit(Q[i])}).fetchall()
+                ts.append((time.perf_counter() - t) * 1e3)
+                rd.append((read_bytes(pid) - r) / 8192)
+            conn.close()
+            row = dict(name=name, sql=sql[:60], settings=settings, memory_mb=mb, warmup=n + 100, filled=full,
+                       median_ms=float(np.median(ts)),
+                       p95_ms=float(np.percentile(ts, 95)), median_pages_read=float(np.median(rd)),
+                       mean_pages_read=float(np.mean(rd)))
+            print(json.dumps(row), flush=True)
+            out.append(row)
+    finally:
+        subprocess.run(ctl + ['stop'], check=False)
+        with open(limit, 'w') as f:
+            f.write('max' if limit.endswith('memory.max') else '-1')
+        subprocess.run(ctl + ['start'], check=True)
+    json.dump(out, open(os.environ.get('KNN_OUT', f'knn_capped_{mb}.json'), 'w'), indent=1)
+
+
 if __name__ == '__main__':
     {'setup': lambda: setup(), 'warm': lambda: warm(int(sys.argv[2])),
-     'cold': lambda: cold(int(sys.argv[2]))}[sys.argv[1]]()
+     'cold': lambda: cold(int(sys.argv[2])),
+     'capped': lambda: capped(int(sys.argv[2]), int(sys.argv[3]))}[sys.argv[1]]()
