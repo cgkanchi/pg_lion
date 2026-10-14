@@ -404,11 +404,18 @@ Between the two it can also choose that sort where the node is faster, because p
 distance functions as nearly free: `SET enable_sort = off` for the query, or a higher `COST` on the
 distance function, steers it back. `pg_lion.enable_ordered_scan = off` takes the node away.
 
-What a scan did is in its `DEBUG1` line (`SET client_min_messages = debug1`): `lionvec scan of
-"items_emb": 1 passes, 412 candidates, 140 refined, 13 fetched, 10 returned, 0 skipped out of
-order, 0 bounds missed` - a pass reads every row's one-bit code, candidates are the rows its bounds
-could not rule out, refined the ones whose 8-bit code was read, fetched the ones whose exact
-distance was computed from the table. A query that wants more rows than `pg_lion.vector_batch`
-makes more passes; a row "skipped out of order" was found after rows farther than it had been
-returned, which costs that row and nothing else. `pg_lion.vector_epsilon` widens or narrows the
-bounds (DESIGN.md §44.8).
+What a scan did is in its `DEBUG1` line (`SET client_min_messages = debug1`). On 975,000 OpenAI
+embeddings, without a filter and then under one keeping 0.1% of the rows:
+
+```
+lionvec scan of "items_lv": 1 passes, 11472 candidates, 35 refined, 10 fetched, 10 returned, 0 skipped out of order, 0 bounds missed, 27858 pages read
+lionvec scan of "items_lv": 1 passes, 947 candidates, 76 refined, 10 fetched, 10 returned, 0 skipped out of order, 0 bounds missed, 965 pages read
+```
+
+A pass reads the one-bit codes of every row (of every matching row, under a filter, and only the
+pages that hold one); candidates are the rows its bounds could not rule out, refined the ones
+whose 8-bit code was read, fetched the ones whose exact distance was computed from the table;
+bounds missed counts fetched rows that turned out nearer than their lower bound said, and pages
+read the code pages the passes read. A query that wants more rows than `pg_lion.vector_batch` makes more passes; a row "skipped out of
+order" was found after rows farther than it had been returned, which costs that row and nothing
+else. `pg_lion.vector_epsilon` widens or narrows the bounds (DESIGN.md §44.8).

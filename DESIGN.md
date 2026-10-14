@@ -20398,7 +20398,7 @@ PostgreSQL 16, 4 vCPUs (Xeon, 2.8 GHz; AVX-512 but no VPOPCNTDQ, so the POPCNT k
 `shared_buffers` 5 GB, `work_mem` 256 MB, no parallel query. `bench/vector/knn.py`.
 
 **Size and build.** lionvec 1,742 MB (218 MB of it the CODE pages a scan reads, 0.4 MB the
-directory), HNSW 3,809 MB, the table 63 MB and its TOAST 6 GB. lionvec builds in 98 s with the
+directory), HNSW 3,809 MB, the table 63 MB and its TOAST 7.6 GB. lionvec builds in 98 s with the
 table in the page cache and took 683 s the first time, reading it from disk; serially, both.
 
 **Warm** - every index, the table and its TOAST in memory (HNSW and the table in shared buffers,
@@ -20423,7 +20423,19 @@ scan then skipped as out of order). Before the directory every filtered scan rea
 the 0.1% filter took 54 ms; with a directory of heap blocks rather than TIDs, 12 ms, and the 1%
 filter 56 ms.
 
-COLD
+**Cold** - PostgreSQL restarted and the page cache dropped before each query; the median of 5:
+
+| Filter | lionvec (ε = 4) | HNSW, ef_search 40 (iterative under a filter) |
+| --- | --- | --- |
+| none | 378 ms | 103 ms |
+| 1% | 199 ms (planner: Sort, 1,209 ms) | 1,208 ms |
+| 0.1% | 100 ms | 203 ms (planner: Sort of the filter's rows) |
+
+Unfiltered, a cold lionvec query is a sequential read of 218 MB of CODE pages, where HNSW reads
+only the part of its graph a search visits, which costs less on this disk. Under a filter the
+graph search goes on (iteratively, to fill the LIMIT) through rows that fail the filter, each
+fetched from the table to test it, where lionvec reads lion's set, the CODE pages that hold a
+member, and about ten rows.
 
 ### 44.10 Tests
 
