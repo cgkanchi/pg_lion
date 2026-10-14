@@ -36,13 +36,14 @@
  *
  * A query whose rows lie far from every centroid finds many centroids
  * within its k-th row less the margin.  So the scan also pauses: once it
- * has scored pg_lion.vector_patience partitions' worth of rows (the rows,
- * or under a restriction the members, a partition holds on average)
- * without one entering the L least upper bounds, it takes those L as found
- * and probes no partition until it has returned L rows or the next row
- * lies past tau; a REST, which starts a new batch, ends a pause too.  A row
- * nearer than those a pause returned, in a partition not probed yet, is
- * skipped when it is found, as is one the margin leaves till too late.
+ * has scored pg_lion.vector_patience units of rows (lv_patience_unit():
+ * the rows, or under a restriction the members, a partition would hold on
+ * average in 2 sqrt(n) partitions) without one entering the L least upper
+ * bounds, it takes those L as found and probes no partition until it has
+ * returned L rows or the next row lies past tau; a REST, which starts a
+ * new batch, ends a pause too.  A row nearer than those a pause returned,
+ * in a partition not probed yet, is skipped when it is found, as is one the
+ * margin leaves till too late.
  * Ended only past tau, an upper bound, a pause returned rows far beyond
  * the L nearest: 0.955 of a LIMIT 1000's true rows, against 0.983 so.
  *
@@ -920,6 +921,25 @@ lv_margin(LvScanOpaque *so)
 }
 
 /*
+ * pg_lion.vector_patience's unit: the rows, or under a restriction the
+ * members, of a scan of `members` that an average partition would hold
+ * were there 2 sqrt(n) of them, n the build's rows - sqrt(n) / 2 rows
+ * unfiltered - and at least one.  It was the average partition's own,
+ * members / nparts, the same at the old default of 2 sqrt(n) partitions;
+ * but then four times the partitions paused after a quarter of the rows,
+ * and on DBpedia's 115,186 rows a patience of 30 in 2,715 partitions held
+ * the recall to 0.966 at any margin, where in 678 it reached 0.988
+ * (DESIGN.md §44.4).  Now the pause does not move with the partitions.
+ */
+static double
+lv_patience_unit(const LvScanOpaque *so, double members)
+{
+	double		parts = Max(2.0 * sqrt(Max(so->meta.ntuples, 0.0)), 1.0);
+
+	return Max(members / parts, 1.0);
+}
+
+/*
  * A partition's place in its queue, from a lower bound lo on the key of its
  * centroid (partition partno's): the key of a row the margin nearer.  An L2
  * key is the squared distance less |qc|^2 (lion_vec_math.h), so the margin
@@ -1527,8 +1547,7 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 	so->qnorm = qnorm;
 	so->margin = lv_margin(so);
 	so->patience = lionvec_patience > 0 ?
-		(double) lionvec_patience * Max(members / Max(so->meta.nparts, 1), 1.0) :
-		INFINITY;
+		(double) lionvec_patience * lv_patience_unit(so, members) : INFINITY;
 
 	so->seen = lvseen_create(so->qcxt, 256, NULL);
 	so->batch = lionvec_batch;

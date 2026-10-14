@@ -245,32 +245,33 @@ index access method for pgvector's `vector` type and three operator classes, one
     SELECT id FROM items ORDER BY embedding <=> $1 LIMIT 10;
     SELECT id FROM items WHERE category = 3 AND in_stock ORDER BY embedding <=> $1 LIMIT 10;
 
-The build partitions the rows by k-means and keeps one bit a dimension of every row, rotated so
-that its error is known, partition by partition, and the rest of an 8-bit code beside it. A scan
-reads the partitions whose centroids are nearest the query, nearest first; it scores their rows
-from the bits, refines only the rows their error bound cannot rule out, and computes the distances
-of the last few from the heap with pgvector's own operator. It stops once the next centroid, less
+The build partitions the rows by k-means and keeps one bit a dimension of every row, rotated so that
+its error is known, partition by partition, and the rest of an 8-bit code beside it. A scan reads
+the partitions whose centroids are nearest the query, nearest first; it scores their rows from the
+bits, refines only the rows their error bound cannot rule out, and computes the distances of the
+last few from the heap with pgvector's own operator. It stops once the next centroid, less
 `pg_lion.vector_margin`, lies farther than the rows it has, and pauses once
-`pg_lion.vector_patience` partitions' worth of rows have brought nothing nearer, so it reads a few
-percent of the rows, and a row in a partition it did not read is missed: the answer is
-approximate, as HNSW's and IVFFlat's are (at the defaults, 98% of the true ten nearest over
-975,000 OpenAI embeddings, where HNSW at `ef_search` 100 returns 95%; DESIGN.md §44.9). Rows come back in the order of their true
-distances, and the distances are pgvector's; a row found too late - in a partition read after
-farther rows were returned, or when a bound of `pg_lion.vector_epsilon` standard deviations
-fails - is skipped, never returned out of order. NULL vectors come last with NULL distances, and in
-a cosine index zero vectors just before them, with NaN, as a sort puts them.
+`pg_lion.vector_patience` times `sqrt(n) / 2` rows (n the rows it was built with) have brought
+nothing nearer, so it reads a few percent of the rows, and a row in a partition it did not read is
+missed: the answer is approximate, as HNSW's and IVFFlat's are (at the defaults, 98% of the true ten
+nearest over 975,000 OpenAI embeddings, where HNSW at `ef_search` 100 returns 95%; DESIGN.md §44.9).
+Rows come back in the order of their true distances, and the distances are pgvector's; a row found
+too late - in a partition read after farther rows were returned, or when a bound of
+`pg_lion.vector_epsilon` standard deviations fails - is skipped, never returned out of order. NULL
+vectors come last with NULL distances, and in a cosine index zero vectors just before them, with
+NaN, as a sort puts them.
 
     CREATE INDEX ON items USING lionvec (embedding vector_cosine_ops) WITH (partitions = 4000);
 
 `partitions` (0 to 1,000,000) sets how many partitions the build makes; 0, the default, makes one
 for a table of fewer than 10,000 rows and eight times the square root of the rows' count for a
 larger (8,000 for a million rows), but never more than a sixteenth of the rows the build samples.
-The build runs k-means over a sample of as many rows as half of `maintenance_work_mem` holds (1.5
-KB a 1536-dimension row, at most about a million rows): the default 64 MB holds about 21,800 rows
-of 1536 dimensions, so at most 1,361 partitions; a million rows need 376 MB for their 8,000, and 1
-GB gives k-means 44 rows a partition. More partitions make a scan score fewer rows and rank more
-centroids, make the build slower (it grows with the rows times the partitions), and make a scan
-pause after fewer rows, as `pg_lion.vector_patience` counts partitions' worth; the setting takes
+The build runs k-means over a sample of as many rows as half of `maintenance_work_mem` holds (1.5 KB
+a 1536-dimension row, at most about a million rows): the default 64 MB holds about 21,800 rows of
+1536 dimensions, so at most 1,361 partitions; a million rows need 376 MB for their 8,000, and 1 GB
+gives k-means 44 rows a partition. More partitions make a scan score fewer rows and rank more
+centroids, and make the build slower (it grows with the rows times the partitions); they leave the
+pause where it was, as `pg_lion.vector_patience` counts rows, not partitions. The setting takes
 effect at the next `REINDEX`.
 
 With a `WHERE` that lion indexes answer, `LionOrdered` builds lion's set of the matching rows and
@@ -549,15 +550,16 @@ on 115,186 of DBpedia's text-embedding-3-large ones, 3 returned 84% and 95% took
 about 11 (DESIGN.md §44.9), so measure it on your own data. A filter through lion uses the same
 margin.
 
-`pg_lion.vector_patience` (30, 0 to 1,000,000): how many partitions' worth of rows (of matching
-rows, under a lion filter) a `lionvec` scan scores without finding one nearer than the
-`pg_lion.vector_batch` it has before it pauses: it stops reading partitions until it has returned
-those rows, and resumes if the query wants more (DESIGN.md §44.4). A query whose nearest rows lie
-far from every centroid would otherwise read many partitions for nothing; on 975,000 OpenAI
-embeddings the pause cut the partitions a query read from 254 to 77 on average and the 95th
-percentile latency from 68 to 16 ms, for half a point of recall (98.4% of the true ten nearest to
-97.9%), and under a 1% filter from 1,511 partitions to 244 and 109 ms to 24, for two points (100%
-to 98.1%). Smaller pauses sooner and misses more; 0 never pauses.
+`pg_lion.vector_patience` (30, 0 to 1,000,000): how many units of `sqrt(n) / 2` rows - n the rows
+the index was built with, so the rows an average partition would hold in `2 sqrt(n)` partitions,
+however many it has; under a lion filter that share of the matching rows - a `lionvec` scan scores
+without finding one nearer than the `pg_lion.vector_batch` it has before it pauses: it stops reading
+partitions until it has returned those rows, and resumes if the query wants more (DESIGN.md §44.4).
+A query whose nearest rows lie far from every centroid would otherwise read many partitions for
+nothing; on 975,000 OpenAI embeddings the pause cut the partitions a query read from 254 to 77 on
+average and the 95th percentile latency from 68 to 16 ms, for half a point of recall (98.4% of the
+true ten nearest to 97.9%), and under a 1% filter from 1,511 partitions to 244 and 109 ms to 24, for
+two points (100% to 98.1%). Smaller pauses sooner and misses more; 0 never pauses.
 
 `pg_lion.vector_batch` (100, 1 to 100,000): how many rows a `lionvec` scan gathers candidates for
 from the partitions it reads. A query that wants more (a large `LIMIT`, or none) reads those
