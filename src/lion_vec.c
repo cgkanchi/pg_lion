@@ -2138,23 +2138,29 @@ lionvecvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
  * C^(-1/3), and, filtered, sel^(-LIONVEC_PROBE_SEL) times as much - the k-th
  * nearest member lies farther out, past more partitions.  The power of C is
  * the simulation's, from 256 to 4,096 partitions of a million rows of 1536
- * dimensions; the constants are the benchmark's, 7.3% of 1,974 partitions
- * at a margin of 2 and 2.6 times as many under a filter of 1% (DESIGN.md
- * §44.9).  An unrestricted scan that pauses (pg_lion.vector_patience) reads
- * LIONVEC_PROBE_PAUSED C^(-1/3) instead: 4.1% of the benchmark's partitions
- * at the default margin of 3.  A restricted one, its members thinned by the
- * filter, does not pause in practice, and its margin is the narrower.
+ * dimensions; the constants are the benchmark's before the pause, 7.3% of
+ * 1,974 partitions at a margin of 2 and 2.6 times as many under a filter
+ * of 1%, where the margin was then narrowed by 2.6 (DESIGN.md §44.9).  A scan that pauses (pg_lion.vector_patience) reads
+ * LIONVEC_PROBE_PAUSED C^(-1/3) and, filtered, sel^(-LIONVEC_PROBE_SEL_PAUSED)
+ * times as much: at the default margin of 3, 3.9% of the benchmark's
+ * partitions unfiltered, and 6.3%, 8.9%, 12% and 18% of them for filters of
+ * 10%, 3%, 1% and 0.3%.
  */
 #define LIONVEC_PROBE_SHARE		0.92
 #define LIONVEC_PROBE_SEL		0.2
-#define LIONVEC_PROBE_PAUSED	0.52
+#define LIONVEC_PROBE_PAUSED	0.46
+#define LIONVEC_PROBE_SEL_PAUSED 0.27
 
 /*
  * What each further batch of pg_lion.vector_batch rows costs, as a share of
  * the first's start-up.  Without pauses the rows lie past ever more
  * partitions (7.3% of them probed for 10 rows, 23% for 100 and 61% for
- * 1,000); a scan that pauses probes 4.1%, 4.6% and 7.0%, the rows it holds
- * when it pauses lasting a batch or more.
+ * 1,000, at a margin of 2).  A scan that pauses probed 4.1%, 4.6% and 50%:
+ * the first batch comes from the rows it holds when it pauses, and the
+ * deeper ones from probing much as without.  LIONVEC_DEEPER_PAUSED prices
+ * the first batches; it keeps a plain scan with a Filter of 3% (333 rows,
+ * 32 ms) ahead of LionOrdered (41 ms), and one of 1% (1,000 rows, 256 ms)
+ * behind it (24 ms), though it prices the 1,000 rows low.
  */
 #define LIONVEC_DEEPER			1.0
 #define LIONVEC_DEEPER_PAUSED	0.06
@@ -2220,8 +2226,9 @@ lionvec_startup_cost(IndexOptInfo *index, double members, double *codepages)
 	}
 
 	share = 1.0;
-	if (nparts >= 1.0 && frac >= 1.0 && lionvec_patience > 0)
-		share = Min(1.0, LIONVEC_PROBE_PAUSED * pow(nparts, -1.0 / 3.0));
+	if (nparts >= 1.0 && lionvec_patience > 0)
+		share = Min(1.0, LIONVEC_PROBE_PAUSED * pow(nparts, -1.0 / 3.0) *
+					pow(Max(frac, 1e-9), -LIONVEC_PROBE_SEL_PAUSED));
 	else if (nparts >= 1.0)
 		share = Min(1.0, LIONVEC_PROBE_SHARE * pow(nparts, -1.0 / 3.0) *
 					pow(Max(frac, 1e-9), -LIONVEC_PROBE_SEL));

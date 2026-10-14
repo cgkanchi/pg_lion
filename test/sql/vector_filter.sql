@@ -322,7 +322,27 @@ SELECT op, avg(vf_recall(format('SELECT id FROM vf WHERE cat <> 5 AND v IS NOT N
 	   AS "most of the nearest"
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op), generate_series(1, 20) s
  GROUP BY op ORDER BY op;
+
+-- a restricted scan that pauses at once, every partition within its margin
+-- and its patience one partition's members: it still fills its LIMIT, in
+-- order, from the members it holds and then the partitions after the pause
 SET pg_lion.vector_margin = 100;
+SET pg_lion.vector_patience = 1;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SET enable_sort = off;
+SELECT count(*) AS "through the node"
+  FROM vf_run('SELECT id FROM vf WHERE cat <> 5 ORDER BY v <-> vf_vec(4, 24) LIMIT 2000') ln
+ WHERE ln ~ 'LionOrdered';
+SELECT cardinality(a) AS n, a = (SELECT array_agg(x ORDER BY x) FROM unnest(a) x) AS "in order"
+  FROM (SELECT array_agg(d) AS a
+		  FROM (SELECT v <-> vf_vec(4, 24) AS d FROM vf WHERE cat <> 5
+				 ORDER BY v <-> vf_vec(4, 24) LIMIT 2000) l) s;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+RESET enable_sort;
 SET pg_lion.vector_patience = 0;
 
 -- inserts after the builds, then deletes and VACUUM

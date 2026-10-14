@@ -33,21 +33,28 @@
  * margin, lie nearer than its k-th row, refines about the rows plane 1
  * cannot tell from the k-th, and computes the distance of about k + a few.
  * A row whose partition the margin leaves unprobed is missed.
- *	A query whose rows lie far from every centroid finds many centroids
+ *
+ * A query whose rows lie far from every centroid finds many centroids
  * within its k-th row less the margin.  So the scan also pauses: once it
- * has scored pg_lion.vector_patience partitions' worth of rows (the rows
- * a partition holds on average) without one entering the L least upper
- * bounds, it probes no partition until the row queue is empty, and a
- * REST, which starts a new batch, ends the pause too.  The bounds
- * hold with the probability pg_lion.vector_epsilon sets; a row whose bound
- * fails and turns up after rows farther than it is skipped, so the scan
- * never returns rows out of order.
+ * has scored pg_lion.vector_patience partitions' worth of rows (the rows,
+ * or under a restriction the members, a partition holds on average)
+ * without one entering the L least upper bounds, it takes those L as found
+ * and probes no partition until it has returned L rows or the next row
+ * lies past tau; a REST, which starts a new batch, ends a pause too.  A row
+ * nearer than those a pause returned, in a partition not probed yet, is
+ * skipped when it is found, as is one the margin leaves till too late.
+ * Ended only past tau, an upper bound, a pause returned rows far beyond
+ * the L nearest: 0.955 of a LIMIT 1000's true rows, against 0.983 so.
+ *
+ * The bounds hold with the probability pg_lion.vector_epsilon sets; a row
+ * whose bound fails and turns up after rows farther than it is skipped, so
+ * the scan never returns rows out of order.
  *
  * NULL rows come last, with NULL distances; before them, in a cosine index,
  * the zero vectors, whose distance is NaN.  A restricted scan (LionOrdered,
  * §44.6) of no more than LIONVEC_EXACT_MAX members computes every member's
  * distance from the heap and returns them in order (lv_exact()); of more,
- * it does all of the above over the members alone, with a narrower margin.
+ * it does all of the above over the members alone.
  *
  *-------------------------------------------------------------------------
  */
@@ -202,6 +209,7 @@ typedef struct LvScanOpaque
 	double		patience;		/* rows scored without one entering hi ... */
 	double		sincerows;		/* ... and since one last did */
 	bool		paused;			/* probing no partition (the header) */
+	int			pauseleft;		/* rows the pause may still return */
 	lvseen_hash *seen;
 	double		lastdist;		/* of the row returned last */
 
@@ -588,6 +596,7 @@ lionvecrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys,
 	so->nhi = so->maxhi = 0;
 	so->sincerows = 0.0;
 	so->paused = false;
+	so->pauseleft = 0;
 	so->seen = NULL;
 	so->exact = NULL;
 	so->nexact = so->epos = 0;
@@ -897,23 +906,17 @@ lv_walk_next(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid)
  * centroid is so by the part of its offset from the centroid that points
  * at the query, whose spread that is; it shrinks with the dimensions, as a
  * partition's rows lie ever more nearly at one distance from the query.
- *
- * A restriction to a share s of the rows narrows the margin by
- * LIONVEC_MARGIN_NARROW for each tenfold that s thins them by, down to a
- * thousandth: the k-th nearest member lies farther out, and of the few
- * members a partition holds, the chance of one in the margin falls with
- * them.  975,000 rows of 1536 dimensions miss as many of their nearest at
- * each share alike so.
+ * A restriction does not change it: its nearest members lie farther out,
+ * past more centroids within the margin, and the pause, counted in
+ * members, ends those probes instead.  Narrowed by 1.8 for each tenfold
+ * the members thinned the rows by, a 1% filter of 975,000 rows of 1536
+ * dimensions read 220 partitions for 0.970 of the ten nearest; not
+ * narrowed, 244 for 0.981 (DESIGN.md §44.6).
  */
 static double
-lv_margin(LvScanOpaque *so, double members, double tuples)
+lv_margin(LvScanOpaque *so)
 {
-	double		m = lionvec_margin;
-
-	if (so->restricted && tuples > 0.0 && members < tuples)
-		m -= LIONVEC_MARGIN_NARROW *
-			Min(3.0, log10(tuples / Max(members, 1.0)));
-	return m * so->meta.scale;
+	return lionvec_margin * so->meta.scale;
 }
 
 /*
@@ -1287,6 +1290,7 @@ lv_probe_part(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 	if (so->nhi == so->batch && so->sincerows >= so->patience)
 	{
 		so->paused = true;
+		so->pauseleft = so->batch;
 		so->npauses++;
 	}
 }
@@ -1521,9 +1525,9 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 		}
 	}
 	so->qnorm = qnorm;
-	so->margin = lv_margin(so, members, tuples);
+	so->margin = lv_margin(so);
 	so->patience = lionvec_patience > 0 ?
-		(double) lionvec_patience * Max(tuples / Max(so->meta.nparts, 1), 1.0) :
+		(double) lionvec_patience * Max(members / Max(so->meta.nparts, 1), 1.0) :
 		INFINITY;
 
 	so->seen = lvseen_create(so->qcxt, 256, NULL);
@@ -1588,8 +1592,10 @@ lionvecgettuple(IndexScanDesc scan, ScanDirection dir)
 					}
 					old = MemoryContextSwitchTo(so->qcxt);
 
-					/* a pause ends with the rows it held (the file's header) */
-					if (so->paused && so->rows.n == 0)
+					/* a pause ends after L rows or past tau (the file's header) */
+					if (so->paused &&
+						(so->rows.n == 0 || so->pauseleft <= 0 ||
+						 so->rows.items[0].key > so->tau))
 					{
 						so->paused = false;
 						so->sincerows = 0.0;
@@ -1631,6 +1637,7 @@ lionvecgettuple(IndexScanDesc scan, ScanDirection dir)
 								continue;
 							}
 							so->lastdist = item.dist;
+							so->pauseleft--;
 							lv_return(scan, so, &item.tid, item.dist);
 							return true;
 					}
