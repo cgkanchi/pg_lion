@@ -233,6 +233,39 @@ start with narrows nothing, nor does one that could start a hashed key once the 
 than 1000 hashed keys. Counts are pushed down with every candidate checked in the heap, but not
 under an OR.
 
+## Nearest neighbours: lionvec (DESIGN.md §44)
+
+`CREATE EXTENSION pg_lion_vector` (it needs pgvector's `vector` and `pg_lion`) adds the `lionvec`
+index access method for pgvector's `vector` type and three operator classes, one per distance:
+
+    CREATE INDEX ON items USING lionvec (embedding);                     -- vector_l2_ops, <->
+    CREATE INDEX ON items USING lionvec (embedding vector_ip_ops);       -- <#>
+    CREATE INDEX ON items USING lionvec (embedding vector_cosine_ops);   -- <=>
+
+    SELECT id FROM items ORDER BY embedding <=> $1 LIMIT 10;
+    SELECT id FROM items WHERE category = 3 AND in_stock ORDER BY embedding <=> $1 LIMIT 10;
+
+The index keeps one bit a dimension of every row, rotated so that its error is known, in a run of
+pages a scan reads whole, and the rest of an 8-bit code beside it; a scan scores every row from the
+bits, refines only the rows their error bound cannot rule out, and computes the distances of the
+last few from the heap with pgvector's own operator. Rows come back in the order of their true
+distances, and the distances are pgvector's. A row is missed only when a bound of
+`pg_lion.vector_epsilon` standard deviations fails for a row that belongs in the answer; a row found
+too late is skipped, never returned out of order. NULL vectors come last with NULL distances, and
+in a cosine index zero vectors just before them, with NaN, as a sort puts them.
+
+With a `WHERE` that lion indexes answer, `LionOrdered` builds lion's set of the matching rows and
+the scan reads and scores only those (`Custom Scan (LionOrdered)` with `Order By:` in `EXPLAIN`):
+the answer is the exact one at any selectivity, never a short `LIMIT`. A filter of most of the
+table is planned as the plain index scan with a `Filter`, and a very selective one as a sort of the
+lion bitmap scan's rows.
+
+The column's type modifier gives the dimensions, or the first vector indexed does for `vector`
+without one; at most 8128. One column, no INCLUDE, no `WHERE`-only scans (the index answers an
+`ORDER BY` distance and nothing else), forward only (a scrollable cursor materializes), no
+parallel scan or build. Partial and expression indexes work, as do UNLOGGED tables, `CREATE INDEX
+CONCURRENTLY` and `REINDEX`.
+
 ## Reloptions
 
 `store_positions` (boolean, default `false`): on a `tsvector` column, also store every lexeme's
@@ -342,6 +375,10 @@ working around a bad choice:
   pages not all-visible, and the planner prices the whole walk against the bitmap scan (DESIGN.md
   §40). EXPLAIN names the index it walks `Index: <index> (index only)`. `enable_indexonlyscan =
   off` takes these walks away too, and the index-only mode of the ordered ones.
+- `pg_lion.enable_ordered_scan` also covers `LionOrdered` over a `lionvec` index's order by
+  distance (`ORDER BY embedding <=> $1`), filtered by a Lion set (DESIGN.md §44.6); EXPLAIN shows
+  the distance as `Order By`. Off, a filtered nearest-neighbour query is the plain `lionvec` index
+  scan with a `Filter`.
 - `pg_lion.enable_lazy_set`: let `LionOrdered` evaluate its Lion set only at the ranges of 64 heap
   blocks its walk reaches, and build it for the whole table only once that has cost what the build
   would (DESIGN.md §30.4, "The set, lazily"). Off, the set is built before the walk starts.
@@ -482,6 +519,15 @@ access method's own scan of a Lion index (both prices Lion's), and to a count wh
 is a generic plan's parameter (priced at its dearest already). PostgreSQL's `enable_*` settings and Lion's
 switches above still force a plan either way.
 
+`pg_lion.vector_epsilon` (EPSDEFAULT, 1 to 10): how wide a `lionvec` scan's error bounds are, in
+standard deviations (DESIGN.md §44.8). A row is missed only when its bound fails and it belongs in
+the answer; EPSRATE. A wider bound refines and fetches more rows.
+
+`pg_lion.vector_batch` (100, 1 to 100,000): how many rows a `lionvec` scan's first pass gathers
+candidates for. Each further pass reads every row's code again and gathers four times as many, so
+a query that wants many more rows than this (a large `LIMIT`, or none) makes several passes.
+`work_mem` bounds how many candidates a pass keeps (DESIGN.md §44.4).
+
 `pg_lion.ordered_switch_ratio` (32, 1 to 1,000,000): how many B-tree entries `LionOrdered` walks per
 member it has not met yet before it stops walking, fetches the members left in TID order and sorts
 them (DESIGN.md §30.4, "When the walk is not paying"; `Switched to Fetch and Sort` in `EXPLAIN
@@ -537,6 +583,23 @@ the setting) does not read lion indexes at all: lion does not detect "snapshot t
 planner prices them out and declines the count pushdown and `LionOrdered`, and a scan or SQL count
 that reaches one anyway fails with an error rather than return a different answer than the
 snapshot's (DESIGN.md §9).  Inserts and VACUUM work as usual.
+
+A `lionvec` index (DESIGN.md §44) answers only an `ORDER BY` of its own distance operator, forward.
+It has no search operators, no bitmap or index-only scans, no INCLUDE columns and no parallel scan
+or build, and indexes a single column of pgvector's `vector` (not `halfvec`, `sparsevec` or `bit`)
+of at most 8128 dimensions. Its results can miss a row only with the probability
+`pg_lion.vector_epsilon` sets. Inserts serialize on the index's meta page. VACUUM removes dead rows'
+codes but reuses their space only for new rows on the last page, so a table with heavy churn grows
+its index until `REINDEX`, which also recomputes the mean the codes are centred on (a mean that has
+drifted makes scans read more, never answer wrong). Each returned row is fetched from the heap
+twice, once for its distance and once by the executor. A small `work_mem` with a large `LIMIT`
+makes a scan read every code several times (`SET client_min_messages = debug1` shows the passes).
+pgvector prices its distance functions as nearly free and its vectors are stored out of line, so
+under a filter that keeps a large share of the rows the planner may sort them by distance where
+the `lionvec` scan is faster; `SET enable_sort = off`, or a higher `COST` on pgvector's distance
+function (`ALTER FUNCTION cosine_distance(vector, vector) COST 100`, say), steers it to the scan.
+An index built while rows were not handed over in heap order has no page directory, and its
+filtered scans read every page (`REINDEX` writes one).
 
 With Citus, list `citus` before `pg_lion` in `shared_preload_libraries`: Citus installs
 `set_rel_pathlist_hook` and `set_join_pathlist_hook` without chaining the previous hook, so loaded
