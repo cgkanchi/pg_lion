@@ -1112,6 +1112,9 @@ lion_fkjoin_dim_volatile(PlannerInfo *root, const LionFkJoin *fj)
 		RangeTblEntry *rte = root->simple_rte_array[i];
 		ListCell   *lc;
 
+		/* a NOT EXISTS's own relid (lion_fkjoin_sublink_anti()) is no table */
+		if (bms_is_member(i, root->outer_join_rels))
+			continue;
 		if (contain_volatile_functions((Node *) r->baserestrictinfo))
 			return true;
 		foreach(lc, r->joininfo)
