@@ -155,7 +155,7 @@ typedef struct LvScanOpaque
 	BlockNumber *rpages;		/* the build's pages that can hold a member */
 	int			nrpages;
 	BlockNumber rtail;			/* the build's last page, then the chain */
-	BlockNumber *dir;			/* the directory (lion_vec.h), for checking */
+	LionVecDirEntry *dir;		/* the directory (lion_vec.h), for checking */
 	uint32		nbuilt;
 
 	/* the queue, and a pass's bookkeeping */
@@ -416,23 +416,25 @@ lv_member(LvScanOpaque *so, ItemPointer tid)
 
 /*
  * The pages of the build's run a restricted scan reads (DESIGN.md §44.6):
- * the member heap blocks, as runs, against the directory.  A NULL container
- * stands for every block of its key.  Without a directory, or with a run of
- * one page, the scan walks the chain as an unrestricted one does.
+ * those the directory says can hold a member.  The members go to
+ * lionvec_dir_mark() a container at a time, as runs of TID keys; a NULL
+ * container stands for every TID of its key's blocks.  Without a
+ * directory, or with a run of one page, the scan walks the chain as an
+ * unrestricted one does.
  */
 static void
 lv_restrict_pages(IndexScanDesc scan, LvScanOpaque *so,
 				  const LionVecMetaData *meta)
 {
-	uint32	   *lo;
-	uint32	   *hi;
-	int			nr = 0;
-	int			maxr = 64;
-	int		   *out;
-	int			n;
+	uint16	   *los;
+	uint64	   *lo;
+	uint64	   *hi;
+	uint64	   *sel;
+	int			nwords;
+	int			from = 0;
+	int			n = 0;
 	int			k;
-	const uint64 all = LION_BLOCKS_PER_CONTAINER == 64 ? PG_UINT64_MAX :
-		(UINT64CONST(1) << LION_BLOCKS_PER_CONTAINER) - 1;
+	int			i;
 
 	so->rlisted = false;
 	if (meta->nbuilt < 2)
@@ -440,52 +442,73 @@ lv_restrict_pages(IndexScanDesc scan, LvScanOpaque *so,
 	so->dir = lionvec_read_dir(scan->indexRelation, meta);
 	so->nbuilt = meta->nbuilt;
 
-	lo = palloc(sizeof(uint32) * maxr);
-	hi = palloc(sizeof(uint32) * maxr);
+	/* a container's members, and as many runs as it can make */
+	los = palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
+	lo = palloc(sizeof(uint64) * LION_CONTAINER_RANGE);
+	hi = palloc(sizeof(uint64) * LION_CONTAINER_RANGE);
+	nwords = (int) ((meta->nbuilt - 1 + 63) / 64);
+	sel = palloc0(sizeof(uint64) * Max(nwords, 1));
 	for (k = 0; k < so->rn; k++)
 	{
-		uint64		mask = so->rconts[k] == NULL ? all :
-			lion_container_block_mask(so->rconts[k]);
 		uint64		base = (uint64) so->rkeys[k] * LION_BLOCKS_PER_CONTAINER;
+		int			nr = 0;
 
 		CHECK_FOR_INTERRUPTS();
-		while (mask != 0)
+		if (base > MaxBlockNumber)
+			break;
+		if (so->rconts[k] == NULL)
 		{
-			int			b = pg_rightmost_one_pos64(mask);
-			uint64		blk = base + b;
+			uint64		last = Min(base + LION_BLOCKS_PER_CONTAINER - 1,
+								   (uint64) MaxBlockNumber);
 
-			mask &= mask - 1;
-			if (blk > MaxBlockNumber)
-				break;
-			if (nr > 0 && (uint64) hi[nr - 1] + 1 == blk)
-			{
-				hi[nr - 1] = (uint32) blk;
-				continue;
-			}
-			if (nr == maxr)
-			{
-				if ((Size) maxr > MaxAllocSize / sizeof(uint32) / 2)
-					elog(ERROR, "lionvec: too many heap blocks in a restriction");
-				maxr *= 2;
-				lo = repalloc(lo, sizeof(uint32) * maxr);
-				hi = repalloc(hi, sizeof(uint32) * maxr);
-			}
-			lo[nr] = hi[nr] = (uint32) blk;
-			nr++;
+			lo[0] = LIONVEC_TID_KEY(base, 0);
+			hi[0] = LIONVEC_TID_KEY(last, PG_UINT16_MAX);
+			nr = 1;
 		}
+		else
+		{
+			uint32		m = lion_container_to_array(so->rconts[k], los);
+			uint32		j;
+
+			for (j = 0; j < m; j++)
+			{
+				uint64		blk = base + (los[j] >> LION_OFFSET_BITS);
+				uint64		key;
+
+				if (blk > MaxBlockNumber)
+					break;
+				key = LIONVEC_TID_KEY(blk, los[j] & LION_MAX_OFFSET);
+				if (nr > 0 && hi[nr - 1] + 1 == key)
+					hi[nr - 1] = key;
+				else if (nr == 0 || hi[nr - 1] < key)
+				{
+					lo[nr] = hi[nr] = key;
+					nr++;
+				}
+				/* else out of order: not a well-formed container */
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("lionvec: a restriction's members are out of order")));
+			}
+		}
+		n += lionvec_dir_mark(so->dir, (int) meta->nbuilt, lo, hi, nr, &from, sel);
 	}
 
-	out = palloc(sizeof(int) * (meta->nbuilt - 1));
-	n = lionvec_dir_pages(so->dir, (int) meta->nbuilt, lo, hi, nr, out);
 	so->rpages = palloc(sizeof(BlockNumber) * Max(n, 1));
-	for (k = 0; k < n; k++)
-		so->rpages[k] = meta->code_head + (BlockNumber) out[k];
-	so->nrpages = n;
+	so->nrpages = 0;
+	for (i = 0; i < (int) meta->nbuilt - 1; i++)
+	{
+		if (sel[i / 64] & (UINT64CONST(1) << (i % 64)))
+			so->rpages[so->nrpages++] = meta->code_head + (BlockNumber) i;
+	}
+	Assert(so->nrpages == n);
 	so->rtail = meta->code_head + meta->nbuilt - 1;
 	so->rlisted = true;
-	pfree(out);
-	pfree(lo);
+	pfree(sel);
 	pfree(hi);
+	pfree(lo);
+	pfree(los);
 }
 
 /* The first CODE page to read. */
@@ -523,15 +546,16 @@ lv_check_listed(IndexScanDesc scan, LvScanOpaque *so, BlockNumber blk,
 				ItemPointer tid)
 {
 	uint32		i = blk - so->code_head;
-	BlockNumber hb = ItemPointerGetBlockNumber(tid);
+	uint64		key = LIONVEC_TID_KEY(ItemPointerGetBlockNumber(tid),
+									  ItemPointerGetOffsetNumber(tid));
 
 	Assert(i + 1 < so->nbuilt);
-	if (hb < so->dir[i] || hb > so->dir[i + 1])
+	if (key < so->dir[i].lo || key > so->dir[i].hi)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("lionvec index \"%s\" has a row of heap block %u at block %u, where its directory says %u to %u",
-						RelationGetRelationName(scan->indexRelation), hb, blk,
-						so->dir[i], so->dir[i + 1])));
+				 errmsg("lionvec index \"%s\" has a row of heap block %u at block %u, outside the range its directory gives",
+						RelationGetRelationName(scan->indexRelation),
+						ItemPointerGetBlockNumber(tid), blk)));
 }
 
 /* ----------------------------------------------------------------

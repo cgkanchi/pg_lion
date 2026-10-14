@@ -445,14 +445,14 @@ lionvec_read_mean(Relation index, BlockNumber blk, float *mean, int dimsp)
 }
 
 /*
- * The DIR chain (lion_vec.h): meta->nbuilt heap blocks, palloc'd, or NULL
- * when the index has none.  A directory that is not in order, or does not
- * fit the relation, is corrupt: a scan would skip pages it must read.
+ * The DIR chain (lion_vec.h): meta->nbuilt entries, palloc'd, or NULL when
+ * the index has none.  A directory that is not in order, or does not fit
+ * the relation, is corrupt: a scan would skip pages it must read.
  */
-BlockNumber *
+LionVecDirEntry *
 lionvec_read_dir(Relation index, const LionVecMetaData *meta)
 {
-	BlockNumber *dir;
+	LionVecDirEntry *dir;
 	BlockNumber blk = meta->dir_head;
 	uint32		done = 0;
 	uint64		visited = 0;
@@ -465,13 +465,12 @@ lionvec_read_dir(Relation index, const LionVecMetaData *meta)
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has a directory of %u pages from block %u, and %u blocks",
 						RelationGetRelationName(index), meta->nbuilt, meta->code_head, nblocks)));
-	dir = palloc(sizeof(BlockNumber) * meta->nbuilt);
+	dir = palloc(sizeof(LionVecDirEntry) * meta->nbuilt);
 	while (done < meta->nbuilt)
 	{
 		Buffer		buf;
 		Page		page;
 		uint32		n = Min(meta->nbuilt - done, (uint32) LIONVEC_DIR_PER_PAGE);
-		uint32		i;
 
 		if (!BlockNumberIsValid(blk))
 			ereport(ERROR,
@@ -484,24 +483,22 @@ lionvec_read_dir(Relation index, const LionVecMetaData *meta)
 		page = BufferGetPage(buf);
 		lionvec_check_page(index, page, blk, LIONVEC_PAGE_DIR);
 		if (((PageHeader) page)->pd_lower !=
-			MAXALIGN(SizeOfPageHeaderData) + sizeof(BlockNumber) * n)
+			MAXALIGN(SizeOfPageHeaderData) + sizeof(LionVecDirEntry) * n)
 			ereport(ERROR,
 					(errcode(ERRCODE_INDEX_CORRUPTED),
 					 errmsg("lionvec index \"%s\" has a malformed directory page at block %u",
 							RelationGetRelationName(index), blk)));
-		memcpy(dir + done, PageGetContents(page), sizeof(BlockNumber) * n);
+		memcpy(dir + done, PageGetContents(page), sizeof(LionVecDirEntry) * n);
 		blk = LionVecPageGetOpaque(page)->next;
 		UnlockReleaseBuffer(buf);
-		for (i = done; i < done + n; i++)
-		{
-			if (i > 0 && dir[i] < dir[i - 1])
-				ereport(ERROR,
-						(errcode(ERRCODE_INDEX_CORRUPTED),
-						 errmsg("lionvec index \"%s\" has a directory out of order at entry %u",
-								RelationGetRelationName(index), i)));
-		}
 		done += n;
+		CHECK_FOR_INTERRUPTS();
 	}
+	if (!lionvec_dir_check(dir, (int) meta->nbuilt))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lionvec index \"%s\" has a directory out of order",
+						RelationGetRelationName(index))));
 	return dir;
 }
 
@@ -842,12 +839,12 @@ lionvec_build_write_mean(Relation index, const float *mean, int dimsp)
 
 /*
  * The CODE pages, from the spool, in one run of blocks: a scan reads them in
- * order, and the operating system's read-ahead with it.  Returns the heap
- * block of each page's first row, *npages of them, for the directory - or
- * NULL when the rows did not come in heap order, or the pages are not one
- * run, and the directory would not hold (lion_vec.h).
+ * order, and the operating system's read-ahead with it.  Returns each
+ * page's least and greatest TID key, *npages of them, for the directory -
+ * or NULL when the rows did not come in heap block order, or the pages are
+ * not one run, and the directory would not hold (lion_vec.h).
  */
-static BlockNumber *
+static LionVecDirEntry *
 lionvec_build_write_codes(LionVecBuildState *bs, LionVecMeta meta,
 						  uint32 *npages)
 {
@@ -856,9 +853,9 @@ lionvec_build_write_codes(LionVecBuildState *bs, LionVecMeta meta,
 	Page		page = NULL;
 	char	   *item = palloc(LIONVEC_CODE_SIZE(LIONVEC_MAX_DIM));
 	uint16		len;
-	BlockNumber *first = NULL;
-	uint32		nfirst = 0;
-	uint32		maxfirst = 0;
+	LionVecDirEntry *dir = NULL;
+	uint32		ndir = 0;
+	uint32		maxdir = 0;
 	bool		run = bs->ordered;
 
 	if (BufFileSeek(bs->spool, 0, 0, SEEK_SET) != 0)
@@ -896,16 +893,31 @@ lionvec_build_write_codes(LionVecBuildState *bs, LionVecMeta meta,
 			lionvec_init_page(page, LIONVEC_PAGE_CODE);
 			meta->code_head = BufferGetBlockNumber(buf);
 		}
-		if (PageGetMaxOffsetNumber(page) == 0 && run)
+		if (run)
 		{
-			/* the page's first row */
-			if (nfirst == maxfirst)
+			ItemPointer tid = &((LionVecCode *) item)->tid;
+			uint64		key = LIONVEC_TID_KEY(ItemPointerGetBlockNumber(tid),
+											  ItemPointerGetOffsetNumber(tid));
+
+			if (PageGetMaxOffsetNumber(page) == 0)
 			{
-				maxfirst = Max(maxfirst * 2, 1024);
-				first = first == NULL ? palloc(sizeof(BlockNumber) * maxfirst) :
-					repalloc(first, sizeof(BlockNumber) * maxfirst);
+				/* the page's first row */
+				if (ndir == maxdir)
+				{
+					if ((Size) maxdir >= MaxAllocSize / sizeof(LionVecDirEntry) / 2)
+						elog(ERROR, "lionvec: too many CODE pages for a directory");
+					maxdir = Max(maxdir * 2, 1024);
+					dir = dir == NULL ? palloc(sizeof(LionVecDirEntry) * maxdir) :
+						repalloc(dir, sizeof(LionVecDirEntry) * maxdir);
+				}
+				dir[ndir].lo = dir[ndir].hi = key;
+				ndir++;
 			}
-			first[nfirst++] = ItemPointerGetBlockNumber(&((LionVecCode *) item)->tid);
+			else
+			{
+				dir[ndir - 1].lo = Min(dir[ndir - 1].lo, key);
+				dir[ndir - 1].hi = Max(dir[ndir - 1].hi, key);
+			}
 		}
 		if (PageAddItem(page, (Item) item, len, InvalidOffsetNumber, false,
 						false) == InvalidOffsetNumber)
@@ -926,20 +938,21 @@ lionvec_build_write_codes(LionVecBuildState *bs, LionVecMeta meta,
 	UnlockReleaseBuffer(buf);
 	pfree(item);
 
-	if (!run || nfirst == 0)
+	if (!run || ndir == 0)
 	{
-		if (first != NULL)
-			pfree(first);
+		if (dir != NULL)
+			pfree(dir);
 		*npages = 0;
 		return NULL;
 	}
-	*npages = nfirst;
-	return first;
+	Assert(lionvec_dir_check(dir, (int) ndir));
+	*npages = ndir;
+	return dir;
 }
 
 /* Write the directory as a chain of DIR pages; returns its head. */
 static BlockNumber
-lionvec_build_write_dir(Relation index, const BlockNumber *first, uint32 n)
+lionvec_build_write_dir(Relation index, const LionVecDirEntry *dir, uint32 n)
 {
 	BlockNumber head = InvalidBlockNumber;
 	Buffer		prev = InvalidBuffer;
@@ -952,8 +965,8 @@ lionvec_build_write_dir(Relation index, const BlockNumber *first, uint32 n)
 		uint32		k = Min(n - done, (uint32) LIONVEC_DIR_PER_PAGE);
 
 		lionvec_init_page(page, LIONVEC_PAGE_DIR);
-		memcpy(PageGetContents(page), first + done, sizeof(BlockNumber) * k);
-		((PageHeader) page)->pd_lower = MAXALIGN(SizeOfPageHeaderData) + sizeof(BlockNumber) * k;
+		memcpy(PageGetContents(page), dir + done, sizeof(LionVecDirEntry) * k);
+		((PageHeader) page)->pd_lower = MAXALIGN(SizeOfPageHeaderData) + sizeof(LionVecDirEntry) * k;
 		done += k;
 		if (BufferIsValid(prev))
 		{
@@ -1069,16 +1082,16 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	}
 	{
 		uint32		nbuilt;
-		BlockNumber *first = lionvec_build_write_codes(&bs, &meta, &nbuilt);
+		LionVecDirEntry *dir = lionvec_build_write_codes(&bs, &meta, &nbuilt);
 
 		BufFileClose(bs.spool);
 		meta.dir_head = InvalidBlockNumber;
 		meta.nbuilt = 0;
-		if (first != NULL)
+		if (dir != NULL)
 		{
-			meta.dir_head = lionvec_build_write_dir(index, first, nbuilt);
+			meta.dir_head = lionvec_build_write_dir(index, dir, nbuilt);
 			meta.nbuilt = nbuilt;
-			pfree(first);
+			pfree(dir);
 		}
 	}
 

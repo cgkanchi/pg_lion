@@ -443,49 +443,82 @@ lionvec_kernel_force(int which)
 #endif
 
 /* ----------------------------------------------------------------
- * The build's run of CODE pages against a set of heap blocks
+ * The build's run of CODE pages against a set of heap TIDs
  * ----------------------------------------------------------------
  */
 
+bool
+lionvec_dir_check(const LionVecDirEntry *dir, int n)
+{
+	int			i;
+
+	for (i = 0; i < n; i++)
+	{
+		if (dir[i].lo > dir[i].hi)
+			return false;
+		if (i + 1 < n &&
+			LIONVEC_TID_KEY_BLOCK(dir[i].hi) > LIONVEC_TID_KEY_BLOCK(dir[i + 1].lo))
+			return false;
+	}
+	return true;
+}
+
 /*
- * Page i < npages - 1 meets [lo, hi] when first[i] <= hi and first[i + 1] >=
- * lo; as first is non-decreasing, those pages are a run, from the least i
- * with first[i + 1] >= lo to the greatest with first[i] <= hi.  Each run is
- * found by bisection from where the last ended, so a few ranges cost a few
- * bisections, and many no more than a merge.
+ * Page i meets [lo, hi] when dir[i].lo <= hi and dir[i].hi >= lo.  By blocks
+ * the pages are in order - the block of dir[i].hi, and of dir[i].lo, never
+ * falls from one page to the next - so the pages that can meet a range are a
+ * run: from the least page whose rows reach the range's first block (found
+ * by galloping, then bisecting, from where the last range's run began) to
+ * the last whose rows start no later than its last block.  Each of those is
+ * tested by TID key; within a block the pages' ranges may overlap, so a run
+ * can set a page before one an earlier run set, which the bitmap allows.
  */
 int
-lionvec_dir_pages(const uint32 *first, int npages, const uint32 *lo,
-				  const uint32 *hi, int nranges, int *out)
+lionvec_dir_mark(const LionVecDirEntry *dir, int npages, const uint64 *lo,
+				 const uint64 *hi, int nranges, int *from, uint64 *sel)
 {
 	int			last = npages - 1;	/* pages 0 .. last - 1 are ours */
-	int			from = 0;
 	int			n = 0;
 	int			j;
 
-	for (j = 0; j < nranges && from < last; j++)
+	for (j = 0; j < nranges && *from < last; j++)
 	{
-		int			a = from;
-		int			b = last;
+		uint32		blo = LIONVEC_TID_KEY_BLOCK(lo[j]);
+		uint32		bhi = LIONVEC_TID_KEY_BLOCK(hi[j]);
+		int			a = *from;
+		int			b = *from;
+		int			step = 1;
 		int			i;
 
-		/* the least i in [from, last) with first[i + 1] >= lo[j], or last */
+		/* gallop to a page reaching blo, or last: every page before a falls short */
+		while (b < last && LIONVEC_TID_KEY_BLOCK(dir[b].hi) < blo)
+		{
+			a = b + 1;
+			b = (last - b > step) ? b + step : last;
+			step = (step < (1 << 29)) ? step * 2 : step;
+		}
+		/* the least page in [a, b) reaching blo, or b */
 		while (a < b)
 		{
 			int			mid = a + (b - a) / 2;
 
-			if (first[mid + 1] >= lo[j])
+			if (LIONVEC_TID_KEY_BLOCK(dir[mid].hi) >= blo)
 				b = mid;
 			else
 				a = mid + 1;
 		}
-		for (i = a; i < last && first[i] <= hi[j]; i++)
+		for (i = a; i < last && LIONVEC_TID_KEY_BLOCK(dir[i].lo) <= bhi; i++)
 		{
-			if (n == 0 || out[n - 1] < i)
-				out[n++] = i;
+			uint64		bit = UINT64CONST(1) << (i % 64);
+
+			if (dir[i].lo <= hi[j] && dir[i].hi >= lo[j] && (sel[i / 64] & bit) == 0)
+			{
+				sel[i / 64] |= bit;
+				n++;
+			}
 		}
-		/* the next range starts at or after this one's end, which page i - 1 may share */
-		from = Max(a, i - 1);
+		/* the next range starts in blo's block or later */
+		*from = a;
 	}
 	return n;
 }
