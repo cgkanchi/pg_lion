@@ -141,7 +141,7 @@ OpenAI ada-002 embeddings of DBpedia entities (1536 dimensions; Qdrant's
 `dbpedia-openai-1M-1536-angular` set and the first 100 of its test queries), optionally under
 `WHERE u < s`, a uniform random column with a lion index that keeps a share `s` of the rows
 ([script](../bench/vector/knn.py), [results](../bench/results/2026-10-14-lionvec-partitions/)).
-lionvec in its default 1,974 partitions, against pgvector 0.8.6's HNSW on
+lionvec in 1,974 partitions (`2 sqrt(n)`, its default then; now `8 sqrt(n)`), against pgvector 0.8.6's HNSW on
 `embedding::halfvec(1536)` (m 16, ef_construction 64). PostgreSQL 16, 4 vCPUs, 16 GB RAM,
 `shared_buffers` 5 GB, and pgvector's `vector` distance functions at `COST 100`, as lionvec's setup
 asks. Recall is the share of the true ten returned, against an exact numpy search. Both indexes
@@ -160,7 +160,7 @@ defaults (margin 3, patience 30), at margins 2 and 4, and with the pause off:
 HNSW under a filter uses its iterative scan; without it, it returns 3.9 of the ten rows at 10% and
 0.4 at 1%. At 10% the planner chooses lionvec's plain scan with a `Filter`, at 1% `LionOrdered`,
 and at 0.1% a sort of the 953 matching rows, for either index. The pause stops a scan once 30
-partitions' worth of rows have brought nothing nearer; without it a query whose nearest rows lie
+times `sqrt(n) / 2` rows, here 30 partitions' worth, have brought nothing nearer; without it a query whose nearest rows lie
 far from every centroid reads hundreds of partitions (a mean of 254 of the 1,974 unfiltered, 77
 with it), and the 95th percentile was five times the median, where with it it is twice.
 

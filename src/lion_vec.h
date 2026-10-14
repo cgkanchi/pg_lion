@@ -239,10 +239,12 @@ lionvec_chain_step(Relation index, uint64 *visited, BlockNumber *nblocks)
 #define LIONVEC_MAX_PARTS		1000000
 
 /*
- * A scan stops probing once it has scored this many partitions' worth of
- * rows (of members, under a restriction) without one entering its batch's
- * L least upper bounds, until it has returned the rows it holds
- * (lion_vec_scan.c, DESIGN.md §44.4).  0 never stops.
+ * A scan stops probing once it has scored this many units of rows without
+ * one entering its batch's L least upper bounds, until it has returned the
+ * rows it holds; a unit is sqrt(n) / 2 rows, n the build's, the rows an
+ * average partition would hold in 2 sqrt(n) partitions, or that share of
+ * the members under a restriction (lion_vec_scan.c, lv_patience_unit();
+ * DESIGN.md §44.4).  0 never stops.
  */
 #define LIONVEC_PATIENCE_DEFAULT 30
 

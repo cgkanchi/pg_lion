@@ -404,12 +404,14 @@ The second plan reads
 Both answers are approximate, as HNSW's are: the index partitions the rows by k-means when it is
 built, and a scan reads the partitions whose centroids are nearest the query, nearest first, until
 the next centroid, less `pg_lion.vector_margin`, lies farther than the rows it has, or until
-`pg_lion.vector_patience` partitions' worth of rows have brought nothing nearer. A row in a
-partition it did not read is missed. On 975,000 OpenAI embeddings the defaults return 98% of the
-true ten nearest, reading 4% of the rows; `SET pg_lion.vector_margin = 2` returns 96% in five
-sixths of the time, and `SET pg_lion.vector_patience = 0`, which reads on to the margin however
-long nothing nearer turns up, 98.4% in 1.8 times the time and a 95th percentile four times as
-long.
+`pg_lion.vector_patience` times `sqrt(n) / 2` rows (n the rows at the build) have brought nothing
+nearer. A row in a partition it did not read is missed. On 975,000 OpenAI embeddings the defaults
+return 98% of the true ten nearest, reading 4% of the rows; `SET pg_lion.vector_margin = 2` returns
+96% in five sixths of the time, and `SET pg_lion.vector_patience = 0`, which reads on to the margin
+however long nothing nearer turns up, 98.4% in 1.8 times the time and a 95th percentile four times
+as long. The recall a margin gives is the data's: on 115,186 of DBpedia's text-embedding-3-large
+embeddings the same defaults return 84%, and 95% takes `SET pg_lion.vector_margin = 7` (DESIGN.md
+§44.9), so measure it on your own rows against an exact search.
 
 By default the build also puts each row in a second partition, chosen among its eight next nearest
 so that a query that passes the row's own partition by is likely to read it (`spill`, after SOAR),
@@ -449,7 +451,7 @@ members, under a filter) that plane 1's bounds could not rule out; refined the o
 code was read, fetched the ones whose exact distance was computed from the table; bounds missed
 counts fetched rows that turned out nearer than their lower bound said, and pages read the code
 pages the probes read; pauses counts the times the scan stopped probing because
-`pg_lion.vector_patience` partitions' worth of rows had brought nothing nearer; copies skipped
+`pg_lion.vector_patience` times `sqrt(n) / 2` rows had brought nothing nearer; copies skipped
 counts the rows met a second time in a pass, in their other partition, in an index that spills
 (none here, the index being built without). Without pauses a
 query whose nearest rows lie far from every centroid reads many partitions for nothing: unfiltered,
