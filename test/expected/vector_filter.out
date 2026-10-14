@@ -113,8 +113,8 @@ BEGIN
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('enable_tidscan', 'on', true);
 END $$;
--- 10,000 rows in ten clusters; grp follows the heap, so that a filter on it
--- leaves whole CODE pages without a member
+-- 10,000 rows in ten clusters, indexed in 50 partitions; grp follows the
+-- heap, so that a filter on it leaves whole CODE pages without a member
 CREATE TABLE vf (
 	id int PRIMARY KEY,
 	cat int,			-- 10 values, the cluster
@@ -134,9 +134,9 @@ SELECT i, i % 10,
 -- NULL vectors and zero vectors, in the filters' way
 UPDATE vf SET v = NULL WHERE id % 211 = 0;
 UPDATE vf SET v = array_fill(0, ARRAY[24])::real[]::vector WHERE id % 503 = 0;
-CREATE INDEX vf_l2 ON vf USING lionvec (v);
-CREATE INDEX vf_ip ON vf USING lionvec (v vector_ip_ops);
-CREATE INDEX vf_cos ON vf USING lionvec (v vector_cosine_ops);
+CREATE INDEX vf_l2 ON vf USING lionvec (v) WITH (partitions = 50);
+CREATE INDEX vf_ip ON vf USING lionvec (v vector_ip_ops) WITH (partitions = 50);
+CREATE INDEX vf_cos ON vf USING lionvec (v vector_cosine_ops) WITH (partitions = 50);
 CREATE INDEX vf_cat ON vf USING lion (cat);
 CREATE INDEX vf_tag ON vf USING lion (tag);
 CREATE INDEX vf_grp ON vf USING lion (grp);
@@ -348,7 +348,9 @@ SELECT vf_ord('SELECT q.id, (SELECT sum(id) FROM (SELECT id FROM vf
 -- a set that outgrows hash_mem at run time degrades to its container keys,
 -- and every member is rechecked (DESIGN.md §30.4): planned at 64MB (a
 -- generic plan keeps it), run at 64kB.  Half of vfn's 400,000 rows, 65 to a
--- page, is 97 containers of about 1 kB each, as ordered.sql's lon is.
+-- page, is 97 containers of about 1 kB each, as ordered.sql's lon is.  (20
+-- partitions: the 1,264 a table this size gets take minutes to build in
+-- three dimensions, where plane 1 rules out few centroids.)
 CREATE TABLE vfn (id int PRIMARY KEY, c2 int, v vector(3), pad text)
 	WITH (autovacuum_enabled = off);
 INSERT INTO vfn
@@ -358,7 +360,7 @@ SELECT i, ((hashint8extended(i::bigint, 11) & 9223372036854775807) % 2)::int,
 			 (hashint8extended(i::bigint, 3) % 1000000) / 1e6]::real[]::vector,
 	   repeat('x', 64)
   FROM generate_series(1, 400000) i;
-CREATE INDEX vfn_l2 ON vfn USING lionvec (v);
+CREATE INDEX vfn_l2 ON vfn USING lionvec (v) WITH (partitions = 20);
 CREATE INDEX vfn_c2 ON vfn USING lion (c2);
 VACUUM (FREEZE, ANALYZE) vfn;
 SET work_mem = '64MB';

@@ -735,6 +735,9 @@ typedef struct LionVecBuildState
 	BlockNumber *crblk;			/* [nparts]: ... and their REFINE items */
 	OffsetNumber *croff;		/* [nparts] */
 	uint32	   *pcount;			/* [nparts]: the rows put in each */
+	float	   *pmaxnorm;		/* [nparts]: the largest |x + m| of those rows */
+	double	   *psumsq;			/* [nparts]: their sum of |x - c|^2 */
+	double		mean2;			/* |m|^2, m the mean */
 	double		sumsq;			/* sum of |x - c|^2, x a row and c its centroid */
 	double		nsq;			/* ... over this many rows */
 	LionVecQuery q;				/* a row, as its nearest centroid is found by */
@@ -990,6 +993,8 @@ lionvec_build_centroids(LionVecBuildState *bs)
 	bs->crblk = palloc(sizeof(BlockNumber) * k);
 	bs->croff = palloc(sizeof(OffsetNumber) * k);
 	bs->pcount = palloc0(sizeof(uint32) * k);
+	bs->pmaxnorm = palloc0(sizeof(float) * k);
+	bs->psumsq = palloc0(sizeof(double) * k);
 	ref = palloc0(rsize);
 	for (j = 0; j < k; j++)
 	{
@@ -1087,11 +1092,17 @@ lionvec_build_callback(Relation index, ItemPointer tid, Datum *values,
 	else
 	{
 		double		dist2;
+		double		norm = it->code->norm;
+		double		raw2;
 
 		group = lionvec_build_nearest(bs, it->x, it->code->norm, &dist2);
 		bs->pcount[group]++;
+		bs->psumsq[group] += dist2;
 		bs->sumsq += dist2;
 		bs->nsq += 1.0;
+		/* |x + m|^2, the row's own norm (a cosine row's 1) */
+		raw2 = norm * norm + 2.0 * it->code->xm + bs->mean2;
+		bs->pmaxnorm[group] = Max(bs->pmaxnorm[group], (float) sqrt(Max(raw2, 0.0)));
 	}
 	if (it->hasref)
 		lionvec_build_put_refine(bs, it->ref, LIONVEC_REFINE_SIZE(bs->info->dimsp),
@@ -1255,6 +1266,9 @@ lionvec_build_write_parts(LionVecBuildState *bs, const BlockNumber *heads,
 		part->head = heads[j];
 		part->tail = tails[j];
 		part->nrows = bs->pcount[j];
+		part->maxnorm = bs->pmaxnorm[j];
+		part->spread = bs->pcount[j] > 0 ?
+			(float4) (bs->psumsq[j] / bs->pcount[j]) : 0.0f;
 		LionVecCentTid(&part->cent.tid, j);
 		part->cent.flags = 0;
 		part->cent.norm = bs->cnorm[j];
@@ -1371,6 +1385,8 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 			for (i = 0; i < dimsp; i++)
 				bs.info->mean[i] = i < bs.dims ? (float) (bs.sum[i] / bs.nsum) : 0.0f;
 			lionvec_rotate(&bs.info->rot, bs.info->mean);
+			for (i = 0; i < dimsp; i++)
+				bs.mean2 += (double) bs.info->mean[i] * bs.info->mean[i];
 		}
 	}
 
@@ -2101,12 +2117,16 @@ lionvecvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 
 /*
  * The share of an index's rows a scan reads before its first row, of C
- * partitions, its rows filtered to a share sel: as measured on a million
- * rows of 1536 dimensions at the default margin (DESIGN.md §44.9), about
- * LIONVEC_PROBE_SHARE C^(-1/3), and, filtered, sel^(-0.3) times as much -
- * the k-th nearest member lies farther out, past more partitions.
+ * partitions, its rows filtered to a share sel: LIONVEC_PROBE_SHARE
+ * C^(-1/3), and, filtered, sel^(-LIONVEC_PROBE_SEL) times as much - the k-th
+ * nearest member lies farther out, past more partitions.  The power of C is
+ * the simulation's, from 256 to 4,096 partitions of a million rows of 1536
+ * dimensions; the constants are the benchmark's at the default margin, 7.3%
+ * of 1,974 partitions unfiltered and 2.6 times as many under a filter of 1%
+ * (DESIGN.md §44.9).
  */
-#define LIONVEC_PROBE_SHARE		0.26
+#define LIONVEC_PROBE_SHARE		0.92
+#define LIONVEC_PROBE_SEL		0.2
 
 /*
  * What the planner needs of the index: the CODE pages' share of its
@@ -2171,7 +2191,7 @@ lionvec_startup_cost(IndexOptInfo *index, double members, double *codepages)
 	share = 1.0;
 	if (nparts >= 1.0)
 		share = Min(1.0, LIONVEC_PROBE_SHARE * pow(nparts, -1.0 / 3.0) *
-					pow(Max(frac, 1e-9), -0.3));
+					pow(Max(frac, 1e-9), -LIONVEC_PROBE_SEL));
 	read = Max(1.0, pages * share);
 	walked = tuples * share;
 	*codepages = read;

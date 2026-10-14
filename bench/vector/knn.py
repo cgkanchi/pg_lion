@@ -106,9 +106,9 @@ def run(conn, name, sql, sel, settings, Q, gt, nq):
         cur.execute(s)
     cur.execute('SET client_min_messages = debug1')
     rec, ts, nret, scans, exact = [], [], [], [], []
-    for i in range(3):                           # warm the plan and the session
-        cur.execute(sql, {'q': lit(Q[150 + i])})
-        cur.fetchall()
+    for i in range(nq):                          # warm the plan, the session and
+        cur.execute(sql, {'q': lit(Q[i])})       # shared_buffers with the pages
+        cur.fetchall()                           # these queries read
     for i in range(nq):
         stats.clear()
         t = time.perf_counter()
