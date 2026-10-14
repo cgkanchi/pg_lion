@@ -20373,10 +20373,13 @@ ORDER BY costs infinity. Selectivity 1, correlation 0.
 
 ### 44.8 Settings
 
-- `pg_lion.vector_epsilon` (real, 1 to 10, default 3): the bounds' width in standard deviations.
+- `pg_lion.vector_epsilon` (real, 1 to 10, default 4): the bounds' width in standard deviations.
   Each plane-1 bound fails with the Gaussian's two-sided probability, 0.27% at 3, 0.006% at 4; a
   failure matters only for a row that belongs in the answer and is found too late, so the rate of
-  queries with a miss is far lower (§44.9). Wider bounds refine and fetch more rows.
+  queries with a miss is far lower. Wider bounds refine and fetch more rows. The default was 3 until
+  the benchmark (§44.9): there one query in 100 under the 0.1% filter lost a row at 3, in each of
+  three runs, and none of 400 at 4, which refines twice the rows for a few percent of the time
+  (87 against 87 ms unfiltered in one run, 96 against 91 in another).
 - `pg_lion.vector_batch` (int, 1 to 100000, default 100): rows the first pass gathers candidates
   for; each further pass gathers four times as many. A query that wants more than the batch makes
   more passes, each reading every CODE page.
@@ -20384,7 +20387,43 @@ ORDER BY costs infinity. Selectivity 1, correlation 0.
 
 ### 44.9 Measured
 
-MEASURED
+**Data.** Qdrant's `dbpedia-openai-1M-1536-angular` set: 975,000 OpenAI ada-002 embeddings of
+DBpedia entities, 1536 dimensions, unit length, in `items(id int, u float8, embedding
+vector(1536))`, and the first 100 of its test queries; `u` is uniform in [0, 1) (seed 42) and
+unrelated to the vectors, so `u < s` keeps a share s of the rows, with a lion index on it. The
+ground truth is the exact top 10 by cosine, computed in numpy for each query and filter.
+Against pgvector 0.8.6's HNSW on `embedding::halfvec(1536)` (m = 16, ef_construction = 64, as
+pgvector's documentation builds it for 1536 dimensions) - lionvec indexes the `vector` itself.
+PostgreSQL 16, 4 vCPUs (Xeon, 2.8 GHz; AVX-512 but no VPOPCNTDQ, so the POPCNT kernel), 16 GB,
+`shared_buffers` 5 GB, `work_mem` 256 MB, no parallel query. `bench/vector/knn.py`.
+
+**Size and build.** lionvec 1,742 MB (218 MB of it the CODE pages a scan reads, 0.4 MB the
+directory), HNSW 3,809 MB, the table 63 MB and its TOAST 6 GB. lionvec builds in 98 s with the
+table in the page cache and took 683 s the first time, reading it from disk; serially, both.
+
+**Warm** - every index, the table and its TOAST in memory (HNSW and the table in shared buffers,
+the rest in the page cache, `pg_prewarm`); the median of 100 queries, LIMIT 10. Recall is the
+share of the true ten returned; "exact" the share of queries that returned all ten.
+
+| Filter | lionvec (ε = 4) | HNSW, ef_search 40 | HNSW, ef_search 40, iterative |
+| --- | --- | --- | --- |
+| none | 96 ms, recall 1.000, exact 100% | 4.0 ms, 0.900, 52% | - |
+| 10% | 136 ms, 1.000, 100% (planner: Sort, 548 ms) | 4.3 ms, 0.393, 0% (3.9 rows) | 8.4 ms, 0.931, 55% |
+| 1% | 31 ms, 1.000, 100% (planner: Sort, 82 ms) | 3.6 ms, 0.038, 0% (0.4 rows) | 47 ms, 0.947, 59% |
+| 0.1% | 5.5 ms, 1.000, 100% | (planner: Sort of the filter's rows) 13 ms, 0.999 | 13 ms, 0.999 |
+
+At ef_search 100 HNSW reaches 0.954 unfiltered in 6.3 ms, and 0.950 at 1% iterative in 34 ms.
+lionvec's times under a filter are with `enable_sort = off` where the planner would otherwise sort
+the filter's rows (§44.11). The scans read every CODE page unfiltered (27,858), 27,169 at 10%,
+8,315 at 1% and 965 at 0.1% - the pages holding a member, as the directory promises, 97.5%, 30% and
+3.4% by `1 - (1 - s)^35`. Unfiltered, the pass over plane 1 costs about 90 ns a row; it keeps
+23,000 candidates, of which 122 are refined and 10.5 fetched. At ε = 3, 66 rows are refined, and
+one query of 100 under the 0.1% filter lost a row (a bound failed for a true neighbour, which the
+scan then skipped as out of order). Before the directory every filtered scan read every page, and
+the 0.1% filter took 54 ms; with a directory of heap blocks rather than TIDs, 12 ms, and the 1%
+filter 56 ms.
+
+COLD
 
 ### 44.10 Tests
 
@@ -20445,8 +20484,9 @@ MEASURED
   reading every CODE page; the DEBUG1 line shows them.
 - **The planner underprices a sort by distance.** pgvector's distance functions cost 1 (`procost`),
   and a 1536-dimension vector is stored out of line, so the planner sees an 18-byte column and a
-  cheap operator: sorting a filter's 97,000 rows by distance looks cheaper than the lionvec scan,
-  and it is chosen at 528 ms over the scan's 132 ms (§44.9). HNSW does not meet this, its cost
-  estimate being tiny. Repricing core's Sort paths whose key is a lionvec distance would be new
+  cheap operator: sorting a filter's rows by distance looks cheaper than the lionvec scan, and it
+  is chosen at 548 ms over the scan's 136 ms for 97,000 rows, and at 82 ms over 31 for 9,700
+  (§44.9). HNSW does not meet this, its cost estimate being tiny. Repricing core's Sort paths whose key is a lionvec distance would be new
   territory for lion's planner hooks, and is not planned; `enable_sort = off`, or a higher `COST`
-  on pgvector's distance functions, steers the planner to the scan.
+  on pgvector's distance functions, steers the planner to the scan (`COST 100` on
+  `cosine_distance` did, for the 10% filter).

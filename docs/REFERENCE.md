@@ -519,9 +519,11 @@ access method's own scan of a Lion index (both prices Lion's), and to a count wh
 is a generic plan's parameter (priced at its dearest already). PostgreSQL's `enable_*` settings and Lion's
 switches above still force a plan either way.
 
-`pg_lion.vector_epsilon` (EPSDEFAULT, 1 to 10): how wide a `lionvec` scan's error bounds are, in
+`pg_lion.vector_epsilon` (4, 1 to 10): how wide a `lionvec` scan's error bounds are, in
 standard deviations (DESIGN.md §44.8). A row is missed only when its bound fails and it belongs in
-the answer; EPSRATE. A wider bound refines and fetches more rows.
+the answer; at 4, none of 400 benchmark queries over 975,000 OpenAI embeddings missed one, where 3
+missed a row in one query of 100 under a 0.1% filter (DESIGN.md §44.9). A wider bound refines and
+fetches more rows.
 
 `pg_lion.vector_batch` (100, 1 to 100,000): how many rows a `lionvec` scan's first pass gathers
 candidates for. Each further pass reads every row's code again and gathers four times as many, so

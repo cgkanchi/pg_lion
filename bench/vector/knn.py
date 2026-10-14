@@ -165,7 +165,7 @@ def cold(nq):
     out = []
     for name, sql, settings in [m for m in methods(1.0) if m[0] in ('lionvec eps=4', 'hnsw ef=40')] + \
             [m for sel in (0.01, 0.001) for m in methods(sel)
-             if m[0] in ('lionvec eps=4', 'hnsw ef=40 iterative')]:
+             if m[0] in ('lionvec eps=4', 'lionvec eps=4 sort off', 'hnsw ef=40 iterative')]:
         ts = []
         for i in range(nq):
             subprocess.run(['pg_ctlcluster'] + CLUSTER.split() + ['restart'], check=True)
@@ -178,7 +178,7 @@ def cold(nq):
             conn.execute(sql, {'q': lit(Q[i])}).fetchall()
             ts.append((time.perf_counter() - t) * 1e3)
             conn.close()
-        row = dict(name=name, sql=sql[:60], cache_dropped=dropped, median_ms=float(np.median(ts)),
+        row = dict(name=name, sql=sql[:60], settings=settings, cache_dropped=dropped, median_ms=float(np.median(ts)),
                    max_ms=float(np.max(ts)), all_ms=[round(x, 1) for x in ts])
         print(json.dumps(row), flush=True)
         out.append(row)

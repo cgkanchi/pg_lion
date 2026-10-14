@@ -134,6 +134,41 @@ With only a few hundred matches, scoring them all is cheaper than lion's ranked 
 planner still picks the walk. Set `pg_lion.enable_bm25_scan = off` for queries you know are this
 selective.
 
+## Nearest neighbours: lionvec against HNSW
+
+The ten nearest of a query by cosine distance, `ORDER BY embedding <=> $1 LIMIT 10`, over 975,000
+OpenAI ada-002 embeddings of DBpedia entities (1536 dimensions; Qdrant's
+`dbpedia-openai-1M-1536-angular` set and the first 100 of its test queries), optionally under
+`WHERE u < s`, a uniform random column with a lion index that keeps a share `s` of the rows
+([script](../bench/vector/knn.py), [results](../bench/results/2026-10-14-lionvec/)). Against
+pgvector 0.8.6's HNSW on `embedding::halfvec(1536)` (m 16, ef_construction 64). PostgreSQL 16,
+4 vCPUs, 16 GB RAM, `shared_buffers` 5 GB. Recall is the share of the true ten returned, against
+an exact numpy search.
+
+**Warm** (everything in memory), median of 100 queries:
+
+| Filter | lionvec | HNSW ef_search 40 | HNSW ef_search 40, iterative scan |
+| --- | --- | --- | --- |
+| none | 96 ms, recall 1.000 | 4.0 ms, 0.900 | |
+| 10% | 136 ms, 1.000 | 4.3 ms, 0.393 (3.9 rows returned) | 8.4 ms, 0.931 |
+| 1% | 31 ms, 1.000 | 3.6 ms, 0.038 (0.4 rows returned) | 47 ms, 0.947 |
+| 0.1% | 5.5 ms, 1.000 | 13 ms, 0.999 (the planner sorts the filter's rows) | 13 ms, 0.999 |
+
+**Cold** (PostgreSQL restarted and the OS page cache dropped before each query), median of 5:
+
+COLDTABLE
+
+**Size and build.** lionvec is 1.7 GB, of which a query reads the 218 MB of one-bit codes; HNSW is
+3.8 GB. lionvec builds in 98 s with the table cached (683 s reading it from disk).
+
+lionvec returns the exact ten nearest whatever the filter (a row is missed only when an error bound
+of `pg_lion.vector_epsilon` standard deviations fails, which none did in these 400 queries). HNSW
+is far faster without a filter, at 90% recall (95% at ef_search 100, 6.3 ms). Under a filter its
+graph search returns rows that then fail the filter, so it returns fewer than ten unless
+iterative scans are on, and then still misses one row in twenty. Under a 10% or 1% filter the
+planner sorts the matching rows (548 and 82 ms) rather than use lionvec: pgvector prices its
+distance functions as nearly free. The lionvec times above are with `SET enable_sort = off`.
+
 ## Size, build and writes (5M rows, all seven indexes)
 
 | | B-tree | GIN | Lion |
@@ -162,6 +197,17 @@ python3 bench/comprehensive/run.py --prefix /path/to/postgresql --preload --outp
 python3 bench/comprehensive/report.py bench/results/my-run      # needs matplotlib
 python3 bench/comprehensive/audit.py bench/results/my-run
 python3 bench/ranking/run.py --dsn 'dbname=rank' --docs 500000 --repeats 9 # needs pg_lion in that database
+```
+
+For the nearest-neighbour benchmark, load the vectors into `items(id int, u float8, embedding
+vector(1536))` with `u` uniform in [0, 1), build pgvector's HNSW index on
+`(embedding::halfvec(1536)) halfvec_cosine_ops`, and save the queries and their exact similarities to
+every row as `Q.npy` and `S.npy` (see the script's header). Then:
+
+```sh
+python3 bench/vector/knn.py setup     # the lionvec and lion indexes
+python3 bench/vector/knn.py warm 100  # needs pg_prewarm
+python3 bench/vector/knn.py cold 5    # restarts the cluster; run as root to drop the page cache
 ```
 
 The suite runs its own temporary cluster and must run as a non-root user. On a 4-vCPU machine it

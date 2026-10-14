@@ -62,7 +62,7 @@
 PG_FUNCTION_INFO_V1(lionvec_handler);
 
 /* pg_lion.vector_epsilon and pg_lion.vector_batch (§44.8) */
-double		lionvec_epsilon = 3.0;
+double		lionvec_epsilon = 4.0;
 int			lionvec_batch = 100;
 
 static relopt_kind lionvec_relopt_kind;
@@ -117,7 +117,7 @@ lion_vec_init(void)
 							 "each bound fails with the Gaussian's probability of this many standard deviations, "
 							 "and wider bounds make the scan read and compare more rows.",
 							 &lionvec_epsilon,
-							 3.0, 1.0, 10.0,
+							 4.0, 1.0, 10.0,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
