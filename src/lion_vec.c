@@ -70,10 +70,11 @@
 
 PG_FUNCTION_INFO_V1(lionvec_handler);
 
-/* pg_lion.vector_epsilon, pg_lion.vector_batch and pg_lion.vector_margin (§44.8) */
+/* pg_lion.vector_epsilon, _batch, _margin and _patience (§44.8) */
 double		lionvec_epsilon = 4.0;
 int			lionvec_batch = 100;
 double		lionvec_margin = LIONVEC_MARGIN_DEFAULT;
+int			lionvec_patience = LIONVEC_PATIENCE_DEFAULT;
 
 static relopt_kind lionvec_relopt_kind;
 
@@ -155,6 +156,19 @@ lion_vec_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pg_lion.vector_patience",
+							"How many partitions' worth of rows a lionvec scan scores without finding a "
+							"nearer one before it stops probing.",
+							"A scan that has scored this many partitions' worth of rows (of the members, "
+							"under a lion filter) since one last entered its pg_lion.vector_batch nearest "
+							"stops probing partitions until it has returned the rows it holds.  Smaller "
+							"stops sooner and misses more of the nearest rows; 0 never stops.",
+							&lionvec_patience,
+							LIONVEC_PATIENCE_DEFAULT, 0, 1000000,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
 
 	add_int_reloption(lionvec_relopt_kind, "partitions",
 					  "Partitions a lionvec index's build makes; 0 chooses by the rows' count",
@@ -2124,12 +2138,26 @@ lionvecvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
  * C^(-1/3), and, filtered, sel^(-LIONVEC_PROBE_SEL) times as much - the k-th
  * nearest member lies farther out, past more partitions.  The power of C is
  * the simulation's, from 256 to 4,096 partitions of a million rows of 1536
- * dimensions; the constants are the benchmark's at the default margin, 7.3%
- * of 1,974 partitions unfiltered and 2.6 times as many under a filter of 1%
- * (DESIGN.md §44.9).
+ * dimensions; the constants are the benchmark's, 7.3% of 1,974 partitions
+ * at a margin of 2 and 2.6 times as many under a filter of 1% (DESIGN.md
+ * §44.9).  An unrestricted scan that pauses (pg_lion.vector_patience) reads
+ * LIONVEC_PROBE_PAUSED C^(-1/3) instead: 4.1% of the benchmark's partitions
+ * at the default margin of 3.  A restricted one, its members thinned by the
+ * filter, does not pause in practice, and its margin is the narrower.
  */
 #define LIONVEC_PROBE_SHARE		0.92
 #define LIONVEC_PROBE_SEL		0.2
+#define LIONVEC_PROBE_PAUSED	0.52
+
+/*
+ * What each further batch of pg_lion.vector_batch rows costs, as a share of
+ * the first's start-up.  Without pauses the rows lie past ever more
+ * partitions (7.3% of them probed for 10 rows, 23% for 100 and 61% for
+ * 1,000); a scan that pauses probes 4.1%, 4.6% and 7.0%, the rows it holds
+ * when it pauses lasting a batch or more.
+ */
+#define LIONVEC_DEEPER			1.0
+#define LIONVEC_DEEPER_PAUSED	0.06
 
 /*
  * What the planner needs of the index: the CODE pages' share of its
@@ -2192,7 +2220,9 @@ lionvec_startup_cost(IndexOptInfo *index, double members, double *codepages)
 	}
 
 	share = 1.0;
-	if (nparts >= 1.0)
+	if (nparts >= 1.0 && frac >= 1.0 && lionvec_patience > 0)
+		share = Min(1.0, LIONVEC_PROBE_PAUSED * pow(nparts, -1.0 / 3.0));
+	else if (nparts >= 1.0)
 		share = Min(1.0, LIONVEC_PROBE_SHARE * pow(nparts, -1.0 / 3.0) *
 					pow(Max(frac, 1e-9), -LIONVEC_PROBE_SEL));
 	read = Max(1.0, pages * share);
@@ -2227,6 +2257,7 @@ lionveccostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 {
 	IndexOptInfo *index = path->indexinfo;
 	double		codepages;
+	double		deeper;
 	double		spc_random;
 	double		spc_seq;
 
@@ -2246,20 +2277,19 @@ lionveccostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	*indexStartupCost = lionvec_startup_cost(index, index->tuples, &codepages);
 
 	/*
-	 * Every further batch of pg_lion.vector_batch rows costs as much again as
-	 * the first, and each row at worst a refine and an exact distance.  The
-	 * farther rows lie past more partitions: of 975,000 rows of 1536
-	 * dimensions in 1,974 partitions a scan probed 7.3% of the partitions for
-	 * 10 rows, 23% for 100 and 61% for 1,000 (DESIGN.md §44.7), which this
-	 * comes within a third of from 100 rows on.  The planner prices a LIMIT
-	 * under a Filter as LIMIT / selectivity rows of this, so a plain scan
-	 * that has to walk past the rows a selective filter rejects costs more
-	 * than LionOrdered, which reads the members alone; charged a refine and a
-	 * fetch alone, it tied LionOrdered at 1% and ran 7 times slower.
+	 * Every further batch of pg_lion.vector_batch rows costs a share of the
+	 * first's start-up (LIONVEC_DEEPER), and each row at worst a refine and
+	 * an exact distance.  The planner prices a LIMIT under a Filter as LIMIT
+	 * / selectivity rows of this, so a plain scan that has to walk past the
+	 * rows a selective filter rejects costs more than LionOrdered, which
+	 * reads the members alone; charged a refine and a fetch alone, a scan
+	 * that did not pause tied LionOrdered at 1% and ran 7 times slower.
 	 */
+	deeper = lionvec_patience > 0 ? LIONVEC_DEEPER_PAUSED : LIONVEC_DEEPER;
 	*indexTotalCost = *indexStartupCost +
-		Max(index->tuples, 1.0) * (*indexStartupCost / Max(lionvec_batch, 1) +
-								   spc_random + cpu_index_tuple_cost);
+		Max(index->tuples, 1.0) *
+		(*indexStartupCost * deeper / Max(lionvec_batch, 1) +
+		 spc_random + cpu_index_tuple_cost);
 	*indexPages = codepages;
 }
 
