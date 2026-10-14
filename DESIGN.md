@@ -20128,21 +20128,31 @@ The shape is
 with `<->`, `<#>` or `<=>`, pgvector's L2, negative inner product and cosine distance. pgvector's
 own indexes answer it from a graph (HNSW), whose every hop is a random read and which is fast only
 while the graph - here 3.8 GB for 975,000 1536-dimension rows, as halfvec - is in memory, or from
-k-means lists (IVFFlat), whose recall falls off where a query sits between lists. Under a WHERE both
-filter AFTER the search, so a selective filter leaves a LIMIT short or sends the scan on through
-most of the index. lionvec is a flat index, the shape of lion's own: a compact code of every row,
-read whole, in block order, by every query, and the few rows the code cannot tell apart read in
-full. It needs no graph and no training, holds a 1536-dimension row's first code in 224 bytes (a
-twenty-seventh of the float vector), returns rows in exactly the order of their true distances
-unless a bound of `pg_lion.vector_epsilon` standard deviations fails, and under a WHERE lion
-answers, reads and scores only the rows lion's set holds (§44.6), exactly, at any selectivity.
+k-means lists (IVFFlat), which hold every row's floats. Under a WHERE both filter AFTER the
+search, so a selective filter leaves a LIMIT short or sends the scan on through most of the index.
+
+lionvec is IVF over compact codes. The build partitions the rows by k-means; a scan reads the
+partitions in the order of their centroids' distance to the query, and of each partition's rows
+only a code of one bit a dimension - 224 bytes a 1536-dimension row, a twenty-seventh of its
+floats - whose error bound decides which few rows are read in full. It stops once the next
+centroid, less a margin, lies farther than the rows it has (§44.4), having read a few percent of
+the rows; among those it returns rows in the exact order of their distances, unless a bound of
+`pg_lion.vector_epsilon` standard deviations fails. Under a WHERE lion answers, it reads and
+scores only the rows lion's set holds, and for a set of up to 2,000 rows computes every member's
+distance outright (§44.6).
 
 The codes are RaBitQ's (Gao and Long, SIGMOD 2024): a fixed random rotation makes every
 coordinate of every vector look like an independent Gaussian, so that one bit a dimension - the
 coordinate's sign - estimates an inner product with an error whose distribution is known whatever
 the data, and so a bound on it that holds with a chosen probability. What is lion's here is the
-rest: the bound decides what a scan reads next (§44.4), the further bit-planes and the heap are
-read only for the rows it cannot rule out, and a lion set restricts the whole (§44.6).
+rest: the bound and the partitions decide what a scan reads next (§44.4), the further bit-planes
+and the heap are read only for the rows it cannot rule out, and a lion set restricts the whole
+(§44.6).
+
+The first format had no partitions: every scan read every row's code, in heap order, and the
+answer was exact (96 ms for the ten nearest of 975,000 rows, §44.9). At the scale this is for, a
+billion rows, that is 224 GB of codes a query. Format 2 (the same day) gave the exactness up for
+partitions; a simulation over the benchmark's vectors chose their number and the margin (§44.9).
 
 ### 44.1 Packaging
 
@@ -20170,39 +20180,48 @@ false`: a SCROLL cursor gets a Material node), no bitmap scans, not parallel.
 
 ### 44.2 Format (lion_vec.h)
 
-Block 0 is the meta page: magic, format version 1, metric, dims and the padded `dimsp` (a multiple
-of 64), the rotation's seed, the heads and tails of the chains, how many CODE pages the build wrote
-(`nbuilt`), and the build's row count. Every page's special space carries its next block, its type,
-`LIONVEC_PAGE_ID` and, on CODE pages, the least and greatest container key (§2) of the TIDs on it.
+Block 0 is the meta page: magic, format version 2, metric, dims and the padded `dimsp` (a multiple
+of 64), the rotation's seed, the MEAN chain's head, the PART chain's head and the partitions'
+number, the heads and tails of the two chains of rows in no partition, the REFINE tail, the
+partitions' SCALE (the rows' standard deviation about their centroids along one dimension, the
+unit of the margin, §44.4) and the build's row count. Every page's special space carries its next
+block, its type, `LIONVEC_PAGE_ID` and, on CODE pages, the least and greatest container key (§2)
+of the TIDs on it.
 
 - **MEAN**: the indexed rows' mean, rotated, as floats over as many pages as it takes; written by
   the build and never changed. Absent (`mean_head` invalid) when there were no non-NULL rows.
+- **PART**: one item a partition (`LionVecPart`), in order: its number, its CODE chain's head and
+  tail, the rows the build put in it, the greatest `|x|` of those rows and their mean `|x - c|^2`
+  (an inner-product scan's bound, §44.4), and its centroid, coded as a row is - its plane 1
+  here, its 8-bit codes in a REFINE item whose TID is (partition, 0), which no heap row's is
+  (`LionVecCentTid()`). 248 bytes at 1536 dimensions, 32 a page: 62 pages for the benchmark's
+  1,974 partitions. Written by the build after the CODE chains; an insert changes only a tail.
 - **CODE**: one item a row, 32 bytes of header - TID, flags (`LIONVEC_NULL`, `LIONVEC_ZERO`: a
   cosine zero vector), `|x|`, `alpha1`, `<x, mean>`, the REFINE item's block and offset, plane 1's
   popcount - and plane 1, `dimsp / 64` words: 224 bytes at 1536 dimensions, 35 a page. A NULL row
-  or a cosine zero vector is the header alone. The build writes every CODE page last, in one run
-  of blocks in heap order (§44.5), so a pass reads them sequentially and each page covers a narrow
-  range of heap blocks.
-- **DIR**: for each of the `nbuilt` CODE pages the build wrote (blocks `code_head` to `code_head +
-  nbuilt - 1`), the least and greatest TID of its rows, each as a 64-bit key, block then offset
-  (`LionVecDirEntry`), over as many pages as it takes: 509 a page, so one page for every 17,800
-  rows at 1536 dimensions (55 pages for the benchmark's 975,000). Every row the build put on page
-  i < nbuilt - 1 lies in [dir[i].lo, dir[i].hi], and no later row goes there, since inserts append
-  to the last page or after it; so a filtered scan finds the pages that can hold its members (§44.6).
-  The rows come to the build in heap block order, so by blocks the pages are in order (the block
-  of `dir[i].hi` is at most that of `dir[i + 1].lo`, which `lionvec_read_dir()` checks); within a
-  block they need not be, since a HOT chain is indexed under its root's offset, so two pages'
-  ranges may overlap there. Written after the CODE pages and never changed. The build writes none
-  (`dir_head` invalid, `nbuilt` 0) when its rows did not come in heap block order or its CODE pages
-  are not one run of blocks; scans then read every page.
-- **REFINE**: one item a non-NULL row, 16 bytes of header (TID, `alpha8`, `|r|`) and `dimsp` 8-bit
-  codes: 1552 bytes at 1536 dimensions, five a page. Read only for the rows plane 1 cannot rule out.
+  or a cosine zero vector is the header alone. A chain a partition, which the build writes in one
+  run of blocks, in heap order (§44.5), so that a probe reads it sequentially and each page covers
+  a narrow range of heap blocks; every partition has a page, even an empty one, for inserts to
+  append to. Then two chains of rows in no partition: the REST chain, of every row of an index
+  built without partitions (an empty table's, §44.3), and the NULL chain, of the NULL rows and the
+  cosine zero vectors, which no distance orders.
+- **REFINE**: one item a non-NULL row or a centroid, 16 bytes of header (TID, `alpha8`, `|r|`) and
+  `dimsp` 8-bit codes: 1552 bytes at 1536 dimensions, five a page. Read only for the rows plane 1
+  cannot rule out and for the centroids a scan comes to.
 
 So an index of n rows of d dimensions is about n (d / 8 + 36) bytes of CODE pages and n (d + 20)
-of REFINE pages - 1.7 GB for the benchmark's 975,000 rows of 1536, of which the 218 MB of CODE pages
-are what a scan reads whole.
+of REFINE pages - 1.7 GB for the benchmark's 975,000 rows of 1536 - and C (d + 1.2 d / 8 + 70) of
+centroids. A scan reads the PART chain, 500 KB there, and the CODE pages of the partitions it
+probes.
 
-### 44.3 Codes (lion_vec_math.c)
+Format 1 (§44 above) had one CODE chain, every row in heap order, and a DIR chain of each CODE
+page's least and greatest TID, by which a filtered scan read only the pages that could hold a
+member. With partitions a filter's members are spread over every partition, the build's order is
+by partition first, and a filtered scan of more than 2,000 members probes partitions as an
+unfiltered one does, so the directory went; the page's container keys still skip a page that
+holds no member (§44.6).
+
+### 44.3 Codes and partitions (lion_vec_math.c)
 
 - **The rotation**: three rounds, each flipping the signs of a pseudo-random half of the
   coordinates (`pg_prng` from the meta page's seed: the same on every platform) and applying the
@@ -20235,81 +20254,165 @@ are what a scan reads whole.
   for L2, `-<x, mean> - <x, qc>` for inner product and cosine (`lionvec_key_bounds()`); an exact
   distance d has key `d^2 - |qc|^2` for L2, `d + <mean, q>` for IP and `d + <mean, q> - 1` for cosine
   (`lionvec_key_exact()`). A bound that overflows to NaN is taken as no bound, (-inf, inf).
+- **Partitions** (`lionvec_build_centroids()`, `lionvec_kmeans()`). The build's first heap scan
+  takes a SAMPLE as it computes the mean: reservoir sampling (Vitter's algorithm R) from a
+  generator seeded alike every build, so that the same rows make the same partitions, of as many
+  rows as half of `maintenance_work_mem` holds as 8-bit codes (rotated, not centred - the mean is
+  not known yet - a percent off the floats, which k-means does not notice), at most 2^20. The
+  number of partitions C is the `partitions` reloption's, or else 1 below 10,000 rows and `2
+  sqrt(n)` above (1,974 for the benchmark's 975,000), at most a sixteenth of the sample, never
+  more than its rows, and 0 for an empty table. Lloyd's k-means then runs over the sample, in the
+  rotated space (which changes no distance), from C distinct sample rows the seed picks, for ten
+  iterations or until no row moves; spherical for cosine, whose rows and so centroids are of unit
+  length, so that nearest by L2 is nearest by angle too. A row's nearest centroid is found among
+  the candidates plane 1 leaves (`lionvec_candidates()`: each centroid coded as a row, a bound of
+  `LIONVEC_ASSIGN_EPS` = 4 standard deviations on its distance, and the centroids whose lower bound
+  is under the least upper bound), by their exact distance; about ten candidates of 200 at 320
+  dimensions and more, so that k-means costs a popcount scan of the centroids a row and a few float
+  distances. A centroid left with no rows takes half of the largest's (FAISS's way). The
+  centroids are then coded as rows are, against the mean.
+- **Assignment.** The build's second scan puts each row in the partition of the centroid nearest
+  it by L2: of the candidates plane 1 leaves, by the centroids' 8-bit codes, whose error is about a
+  seventieth of plane 1's (`lionvec_build_nearest()`); an insert does the same from the PART chain
+  and the candidates' REFINE items (`lionvec_insert_nearest()`). The root of the rows' mean
+  squared distance from their centroids, over the dimensions, is the meta page's scale; each
+  partition's own mean squared distance and its longest row go in its PART item (§44.4's inner
+  product). Both k-means and the assignment cost a plane-1 estimate of every centroid for every
+  row, so the build grows as the rows times the partitions, `n^1.5` at the default: 19 minutes for
+  the benchmark's 975,000 rows in 1,974 partitions, where format 1 took 98 seconds (§44.9,
+  §44.11).
 
 ### 44.4 The scan (lion_vec_scan.c)
 
-A PASS reads plane 1 of every row and computes each row's key bounds [lo, hi]. It keeps the L
-smallest upper bounds in a max-heap; their largest, tau, is a key at least L rows lie within, so a
-row whose lo exceeds tau cannot be among the next L, and only the rows with `lo <= tau` are kept as
-candidates. The candidates go into a min-heap by lo, beside one entry, REST, at tau, that stands for
-every row the pass left out. The heap is then worked lazily:
+Two priority queues. The PARTITION queue holds every partition, by the key (§44.3) its centroid's
+codes bound from below, less the MARGIN: how much nearer than its centroid a partition's rows are
+taken to come. The ROW queue holds rows, by a lower bound on their keys. Whichever queue's least
+entry is less is worked; at equal keys, the row's:
 
-- a row known from plane 1 at the top: read its REFINE item and put it back at the lower bound of
-  its 8-bit codes (which replaces plane 1's rather than tightening it: keeping the larger of the
-  two would keep plane 1's failures too);
+- a partition known from its centroid's plane 1 (every partition starts so, `lv_read_parts()`
+  having read the PART chain): read the centroid's REFINE item and put it back by its 8-bit codes;
+- a partition known from its codes: PROBE it - read its CODE chain and put its rows in the row
+  queue by plane 1's bounds;
+- a row known from plane 1: read its REFINE item and put it back at the lower bound of its 8-bit
+  codes (which replaces plane 1's rather than tightening it: keeping the larger of the two would
+  keep plane 1's failures too);
 - a row known from its codes: fetch it from the heap, compute its distance with the operator's own
   function on `FormIndexDatum()`'s value (so an expression index computes its expression), and put
   it back at its exact key;
-- a row known exactly: nothing left in the heap can be nearer; return it, its distance in
-  `xs_orderbyvals` and `xs_recheckorderby = false`;
-- REST: make another pass, for four times as many rows, skipping the rows returned already.
+- a row known exactly: nothing left in the row queue, nor in a partition whose turn has not come,
+  is taken to be nearer; return it, its distance in `xs_orderbyvals` and `xs_recheckorderby =
+  false`;
+- REST: probe every partition probed so far again, for four times as many rows, skipping the rows
+  returned already.
 
-At equal keys the better-known entry comes first (a row known exactly before REST or a bound at its
-key, neither of which can hold a nearer row), then by distance and TID, so ties come out the same
-from run to run. A LIMIT k query thus refines about the rows plane 1 cannot tell from the k-th and
-fetches about k and a few; the first pass gathers `pg_lion.vector_batch` (100) rows' worth.
+The REST chain is probed first, before either queue is worked: it holds every row of an index built
+without partitions, and nothing otherwise. At equal keys the better-known entry comes first (a row
+known exactly before REST or a bound at its key), then by distance and TID, so ties come out the
+same from run to run.
+
+**Probes.** A probe computes the key bounds [lo, hi] of each of its rows. The scan keeps the L
+smallest upper bounds of the rows probed so far in a max-heap; their largest, tau, is a key at
+least L rows lie within, so a row whose lo exceeds tau cannot be among the next L, and only the
+rows with `lo <= tau` go into the row queue. One REST entry, at the least lo of those left out,
+stands for them. L is `pg_lion.vector_batch` (100) until the first REST, and four times as many
+after each. A LIMIT k query thus probes the partitions whose centroids, less the margin, lie nearer
+than its k-th row, refines about the rows plane 1 cannot tell from the k-th, and fetches about k
+and a few.
+
+**The margin** (`lv_margin()`) is `pg_lion.vector_margin` (2) standard deviations of the rows about
+their centroids along one dimension, the meta page's scale: a row is nearer the query than its
+centroid by the part of its offset from the centroid that points at the query, and that part's
+spread, `|x - c| / sqrt(d)` for a random direction, shrinks with the dimensions as a partition's
+rows come to lie ever more nearly at one distance from any query. For L2, whose key is the squared
+distance less a constant, the margin comes off the distance (`lv_part_key()`); for cosine, off the
+key; for inner product, see below. It is one number for every partition: a constant margin did as
+well as any scaled by a partition's own radius in the simulation (§44.9), as the rows farthest
+toward a query lie about as far out in a small partition as in a large one when one k-means made
+them. A row whose partition's turn does not come before the LIMIT is met is missed; that is the
+scan's approximation, and the margin trades it against the partitions read.
+
+**Inner product** takes one more step. An L2 row nearer the query than its centroid by its
+offset's projection is so only by that projection less `|x - c|^2 / 2` (`|q - x|^2 = |q - c|^2 -
+2 <q - c, x - c> + |x - c|^2`), and a cosine row likewise on the sphere; the margin is calibrated
+against that. An inner product's row gains all of `<q, x - c>`, so a partition of rows of mixed
+lengths keeps its answers - the rows that stick out farthest along q - beyond any such margin:
+vector_filter.sql's ten clusters, of rows 2.4 to 3.3 long, got 0.61 of their ten nearest at
+margins 0 and 2 alike and all of them only at 4. So `lionvec_lift_key()` lifts each partition's
+rows by one more coordinate, `sqrt(M^2 - |x|^2)`, M the partition's greatest `|x|` (its PART
+item's), which puts them at M from the origin, where the nearest to the unit query `(q / |q|, 0)`
+are those of the greatest `<q, x>` (Bachrach and others, RecSys 2014). Their centroid then lies
+inside that sphere by the rows' spread, their mean `|x - c|^2` (the PART item's too), at squared
+distance `1 + M^2 - spread - 2 <q / |q|, c>`, and the margin comes off that distance as off L2's.
+On unit vectors this is L2's ranking for the unit query; on the test's clusters it finds all ten
+from a margin of 1. Each partition's own M, rather than the table's, keeps one long row from
+widening every partition's margin. An insert longer than its partition's M is lifted to no
+height, and its bound is the looser for it until REINDEX. The unit tests check the algebra: at
+a margin of the lifted rows' greatest distance from their lifted centroid, the bound holds for
+every row and query (the triangle inequality there).
 
 **Strict order.** When a bound fails, a row turns up after rows farther than it were returned. It
 is skipped (`nskipped` in the DEBUG1 line), so the scan's output is always in order: a failure
 costs recall, never order, and the executor never needs to recheck.
 
-**Memory.** Candidates are capped at `work_mem` (`sizeof(LvItem)` each, never under four batches'
-worth). When a pass reaches the cap it drops the candidates tau has since passed by, and if that is
-not enough, CUTS: the half with the least lower bounds stay, the cut is the least bound of those
-that went, and the rest of the pass keeps only rows below it; REST then stands at the cut. Rows AT
-the cut stay - REST comes out after every row at its key - so a pass over a million equal vectors
-returns `cap / 2` of them rather than none. The next pass's batch is `min(4 L, max(L, cap / 8))`.
+**Memory.** The row queue is capped at `work_mem` (`sizeof(LvItem)` each, never under four
+batches' worth). When a probe reaches the cap it drops the rows tau has since passed by, and if
+that is not enough, CUTS: the half with the least lower bounds stay, the cut is the least bound of
+those that went, and the probes keep only rows below it until the next REST; a REST at the cut
+stands for the rest. Rows AT the cut stay - REST comes out after every row at its key - so a scan
+of a million equal vectors returns `cap / 2` of them rather than none. After a REST, L is `min(4
+L, max(L, cap / 8))`.
 
-**Progress.** A hash keyed by TID keeps what the scan has learnt of each row across passes: its
+**Progress.** A hash keyed by TID keeps what the scan has learnt of each row across RESTs: its
 codes' bounds once refined, its exact key once fetched, and GONE once returned or found missing.
-A pass starts a row from that, not from plane 1 again. Without it a pass cut short by `work_mem`
+A probe starts a row from that, not from plane 1 again. Without it a pass cut short by `work_mem`
 whose kept rows all refined past the cut was made again, the same, for ever - the rows came back
 from plane 1 below the cut, refined past it, and the cut's REST came out first (found by
-vector.sql's `work_mem = 64kB`, `vector_batch = 1` case, 2026-10-14). With it, every pass moves at
-least one row up a level or out, so a scan makes at most three passes a row.
+vector.sql's `work_mem = 64kB`, `vector_batch = 1` case, 2026-10-14). With it, every REST moves at
+least one row up a level or out.
 
-**NULLs and zeros.** NULL rows come last, with NULL distances, in the CODE chain's order; before
-them, in a cosine index, the zero vectors, whose distance is NaN (float8 sorts NaN after every
-number, as the sequential scan's sort does). A NULL query returns every row with a NULL distance; a
-cosine zero query every non-NULL row with NaN, then the NULLs; an index with no vector yet only
-its NULLs. A walk copies a page's TIDs out under the page's lock, so a VACUUM between two calls
-cannot make one come back twice. A scan without an ORDER BY, which the planner never makes (its
-cost is infinite), walks every row.
+**NULLs and zeros.** NULL rows come last, with NULL distances, from the NULL chain; before them,
+in a cosine index, the zero vectors, whose distance is NaN (float8 sorts NaN after every number,
+as the sequential scan's sort does), from the same chain. A NULL query returns every row of every
+chain with a NULL distance; a cosine zero query every non-NULL row with NaN, then the NULLs; an
+index with no vector yet only its NULLs. A walk copies a page's TIDs out under the page's lock, so
+a VACUUM between two calls cannot make one come back twice. A scan without an ORDER BY, which the
+planner never makes (its cost is infinite), walks every row.
 
 ### 44.5 Concurrency, WAL and VACUUM
 
 - **Insert** (`lionvec_append()`): under the meta page's exclusive lock, which serializes inserts,
-  the REFINE item goes on the REFINE tail and the CODE item on the CODE tail, each extended with a
-  new page when full, all in one generic WAL record (meta, REFINE, CODE, and a new CODE page: four
-  buffers, what a record takes). Scans and VACUUM lock one page at a time and never the meta page
-  with another, so the order meta, REFINE, CODE cannot deadlock against them. A pass follows the
-  chain to its end as it then stands, so it may meet rows inserted since its snapshot; the heap
-  fetch drops them. Every row a scan's snapshot sees had its items appended before that snapshot was
-  taken, so none is missed.
-- **Build**: two heap scans, the first for the mean (its rows normalized for cosine), the second
-  writing REFINE items in place and spooling CODE items to a temporary file, then written as one run
-  of CODE pages and the DIR chain after them; the whole range is WAL-logged at the end
-  (`log_newpage_range()`). Neither scan joins a synchronized scan (`allow_sync = false`), which
-  could start part-way through the heap and hand the rows over out of order; the build checks the
-  order anyway and writes no directory if it was not kept. Not parallel;
-  progress is reported for the second scan. `CREATE INDEX CONCURRENTLY` and `REINDEX` work as for
-  any AM. An unlogged index's init fork is the meta page and one empty CODE page.
-- **VACUUM** (`lionvecbulkdelete()`): walks the CODE chain, removing the dead rows' items
+  the row's partition is found (§44.3), its REFINE item goes on the REFINE tail and its CODE item
+  on its chain's tail - its partition's, the REST chain's in an index without partitions, or the
+  NULL chain's - each extended with a new page when full. Two generic WAL records, as one takes at
+  most four buffers: the REFINE item with the meta page, whose REFINE tail it may move; then the
+  CODE item, its page, any new one, and the PART item or the meta page that holds the chain's tail
+  when the tail moves. A crash between the two leaves a REFINE item nothing points at, which costs
+  its space and nothing else. Scans and VACUUM lock one page at a time and never the meta page
+  with another, so the order meta, REFINE, CODE, PART cannot deadlock against them. A probe follows
+  the chain to its end as it then stands, so it may meet rows inserted since its snapshot; the heap
+  fetch drops them. Every row a scan's snapshot sees had its items appended before that snapshot
+  was taken, so none is missed. An insert reads the whole PART chain, 60 pages for 1,975
+  partitions, and the REFINE items of its candidates.
+- **Build**: two heap scans. The first computes the mean (its rows normalized for cosine) and
+  takes the sample, from which k-means finds the centroids (§44.3), whose REFINE items are the
+  first written. The second writes each row's REFINE item in place and puts its CODE item into a
+  tuplesort (`maintenance_work_mem`) keyed by its group - its partition, then the REST and NULL
+  chains - and its place in the heap scan, from which the CODE chains are written in one run of
+  blocks, each group starting a page; then the PART chain, then the meta page. The whole range is
+  WAL-logged at the end (`log_newpage_range()`). Neither scan joins a synchronized scan
+  (`allow_sync = false`), which could start part-way through the heap: the second must see the
+  rows in heap order, which each partition's CODE pages keep, and the sample is the same from build
+  to build. Not parallel; progress is reported for the second scan. `CREATE INDEX CONCURRENTLY` and
+  `REINDEX` work as for any AM. An unlogged index's init fork is the meta page and empty REST and
+  NULL chains.
+- **VACUUM** (`lionvecbulkdelete()`): walks every CODE chain (`lionvec_chain_heads()`: the
+  partitions' from the PART chain, then REST and NULL), removing the dead rows' items
   (`PageIndexMultiDelete()`), and collects their REFINE locations, in `maintenance_work_mem`, which
   it then removes a REFINE page at a time in block order, each checked by TID first, with
   `PageIndexTupleDeleteNoCompact()`: the line pointers stay, so the other rows' CODE items still
   point right. A crash between the two steps leaves REFINE items nothing points at, which the next
-  VACUUM does not find; they cost space and nothing else. Pages are never recycled.
+  VACUUM does not find; they cost space and nothing else. Pages are never recycled; the centroids'
+  REFINE items, which no CODE item names, are never removed.
 - **A scan against VACUUM.** A scan copies what it needs of a CODE item (the REFINE location among
   it) into its queue and holds no pin. VACUUM may remove the REFINE item before the scan reads it,
   and an insert may reuse the slot: `lionvec_refine_at()` returns the item only if its TID is the
@@ -20317,11 +20420,12 @@ cost is infinite), walks every row.
   dead to every snapshot. A reused slot with the same TID (the heap reused the TID too) holds a row
   inserted after the scan's snapshot, which the heap fetch drops. A row the scan returns it has just
   found visible to its snapshot, so VACUUM cannot have removed it, and the executor's own fetch finds
-  it.
+  it. A centroid's REFINE item missing is corruption.
 - **Serializable**: `ampredlocks = false`, so a reader takes a predicate lock on the whole index
   (`index_beginscan()`), and an insert checks it.
 - **Format checks**: every page's type and id before anything on it is read; every CODE item's
-  length against its flags and `dimsp`; every REFINE item's length; chain cycles
+  length against its flags and `dimsp`; every REFINE item's length; every PART item's length,
+  flags and blocks, and the PART chain's numbering against the meta page's count; chain cycles
   (`lionvec_chain_step()`); the meta page's fields. Each is ERRCODE_INDEX_CORRUPTED, never a crash.
 
 ### 44.6 Filtered nearest neighbours (LionOrdered, lion_ordered.c)
@@ -20332,68 +20436,86 @@ direction and is not hypothetical (`lo_knn_path()`), and is paired with each lio
 relation as a B-tree's is. The plan differs from §30's in four places:
 
 - **The set is built at once** (`LO_FLAG_BUILD`), never lazily: the scan needs every member before
-  its first pass. The ORDER BY clause goes in a sixth `custom_exprs` list (`LO_EXPR_ORDERBYS`), and
+  its first row. The ORDER BY clause goes in a sixth `custom_exprs` list (`LO_EXPR_ORDERBYS`), and
   the executor builds its scan key with `ExecIndexBuildScanKeys(isorderby = true)`, its run-time
   key (a Param query vector, a correlated subquery's) among the node's others, re-evaluated on
   rescan. EXPLAIN shows it as `Order By`.
 - **The set is handed to the scan** after every `index_rescan()` (`lion_vec_restrict()`: its
-  container keys, ascending, and its containers). The scan turns each container's members into
-  runs of TID keys (a degraded container: every TID of its key's blocks) and marks the CODE pages
-  of the build's run whose range meets one (§44.2, `lionvec_dir_mark()`: the pages that can meet a
-  run are found by galloping and bisecting by block from where the last run's began, then tested
-  by TID; a bitmap, since within a block a later run can mark an earlier page). A pass reads the
-  marked pages, then the run's last page and every page appended after it, skipping any whose key
-  range holds no member. A row on a marked page outside the range the directory gives it is
-  ERRCODE_INDEX_CORRUPTED: a page the scan skipped might then hold a member too. Every row not a
-  member is skipped before it is estimated; a refine, a fetch and a return happen only for members.
-  Container keys alone were not enough: a key is 64 heap blocks, several hundred CODE pages of a
-  dense heap, so a filter of a thousandth of the rows had a member under every key and read every
-  page. Heap blocks were not enough either: the benchmark's table holds 120 rows a block and a CODE
-  page 35, so at 1% nearly every block has a member and the scan read 76% of the pages; by TID, 30%,
-  the share that holds a member (§44.9). A degraded set (§30.4, `hash_mem`
-  exceeded) has NULL containers, meaning every TID of that key's blocks; the scan takes them all,
-  and the node rechecks the lion clauses on the heap row, as it does for a B-tree
-  (`Rows Removed by Lion Recheck`).
+  container keys, ascending, and its containers). The scan counts the members (a degraded
+  container, NULL, as its 64 blocks' share of the table's rows) and then does one of two things:
+  - **No more than `LIONVEC_EXACT_MAX` (2,000) members, none degraded**: it fetches every member
+    from the heap, computes its distance with the operator's function, sorts them (NaN last, then
+    by TID) and returns them in order (`lv_exact()`), reading no CODE page. A member not visible,
+    or whose vector is NULL, is left for the NULL walk, a cosine zero vector (NaN) for the zero
+    walk. This is the exact answer, at a heap fetch a member; it replaces probing where the
+    members are so few that most partitions hold none and the nearest member lies past many - in
+    the simulation a 0.1% filter of 975,000 rows needed a fifth of the index probed for 0.95 recall.
+  - **More**: it probes as an unfiltered scan does (§44.4), with the margin narrowed by
+    `LIONVEC_MARGIN_NARROW` (1.3) standard deviations for each tenfold the members thin the rows
+    by, down to a thousandth: the k-th nearest member lies farther out, and of the few members each
+    partition holds, the chance of one within the margin falls with them. In the simulation, the
+    margin a recall needed fell by about that much a tenfold, the same at every recall from 0.95 to
+    0.99. A probe skips a CODE page whose container keys hold no member, and every row not a member
+    before it is estimated; a refine, a fetch and a return happen only for members.
+
+  A degraded set (§30.4, `hash_mem` exceeded) has NULL containers, meaning every TID of that key's
+  blocks; the scan takes them all, and the node rechecks the lion clauses on the heap row, as it
+  does for a B-tree (`Rows Removed by Lion Recheck`).
 - **No fetch-and-sort switch**: the pathkeys are a distance, not columns a sort could take over.
 - **No values from the index**: heap mode always.
 
-The node's early stop - every member met - ends the scan without the pass that would find nothing.
-Since the restricted scan returns members only, a filter of a thousandth of the rows reads plane 1
-of the pages that hold one and computes about k exact distances; a LIMIT is never left short by the
-filter, and the answer is the exact one up to the bounds.
+The node's early stop - every member met - ends the scan without the probes that would find
+nothing. Since the restricted scan returns members only, a LIMIT is never left short by the filter.
 
 **Cost** (`lo_cost_knn()`): the lion lookups and the set as `lo_cost()` prices them, plus
 `lion_vec_scan_cost()` for the members (§44.7) as start-up; then per member, at worst, a random
 page, an index tuple, a probe and a tuple, its quals and the target. On 20,000 rows of 200
-dimensions the planner chose a sort of the lion bitmap scan's rows for a filter keeping 1% of
-them, the node from 3% to 30%, and the plain lionvec scan with a Filter from 60%, where most rows
-pass and the set costs more than the rows it saves.
+dimensions (format 1) the planner chose a sort of the lion bitmap scan's rows for a filter keeping
+1% of them, the node from 3% to 30%, and the plain lionvec scan with a Filter from 60%, where most
+rows pass and the set costs more than the rows it saves.
 
 ### 44.7 Costs (lionveccostestimate())
 
-Start-up is the cost of the first row, which is most of a scan's: the CODE pages read sequentially
-(the index's pages times the CODE items' share of the space, by the recorded dimensions, or 1536
-before any), `0.1 cpu_index_tuple_cost` a row for walking them, `2 cpu_operator_cost` a scored row
-(the popcounts and a square root: `LIONVEC_ROW_OPS`), and a batch's refines and exact distances,
-a random page and an index tuple each. Each further row adds at worst a refine and a fetch. For a
-restricted scan (`lion_vec_scan_cost()`) the pages are the DIR chain and those holding a member, the
-members placed independently, `pages (1 - (1 - frac)^perpage)`; the rows walked are those pages',
-and the scored rows the members. A path with no
-ORDER BY costs infinity. Selectivity 1, correlation 0.
+Start-up is the cost of the first row, which is most of a scan's. A restriction of no more than
+2,000 members (§44.6) costs a random page, an index tuple and a row's estimate a member. Otherwise:
+every centroid's estimate (`LIONVEC_ROW_OPS`, 2 `cpu_operator_cost`: the popcounts and a square
+root); the share of the rows a scan probes, `LIONVEC_PROBE_SHARE` (0.92) `C^(-1/3)` and, under a
+filter keeping a share s, `s^(-LIONVEC_PROBE_SEL)` (0.2) times as much, at most all - the power of C
+the simulation's, the constants the benchmark's at the default margin (§44.9); a random page a
+probed partition and the CODE pages' share of the index (by the recorded dimensions, or 1536 before
+any) read sequentially; `0.1 cpu_index_tuple_cost` a row walked and `LIONVEC_ROW_OPS` a member
+scored; and a batch's refines and exact distances, a random page and an index tuple each. Each
+further row adds a refine and a fetch at worst and a `pg_lion.vector_batch`th of the start-up: the
+farther rows lie past more partitions (a scan of the benchmark's index probed 7.3% of them for 10
+rows, 23% for 100 and 61% for 1,000), and the planner prices a LIMIT under a Filter as LIMIT over
+the filter's selectivity rows of the scan. That is what keeps a plain scan, walking past every row a
+1% filter rejects, from looking as cheap as LionOrdered reading the members alone: charged a refine
+and a fetch a row and no more, the two tied at 1% and the planner's pick ran 7 times slower (202 ms
+to 30). With the charge it picks the plain scan at 30% and 10% (15 and 30 ms, LionOrdered 196 and
+82), LionOrdered at 3% and 1% (40 and 26 ms), and below about 0.3% sorts the bitmap scan's rows.
+A path with no ORDER BY costs infinity. Selectivity 1, correlation 0.
 
 ### 44.8 Settings
 
+- `pg_lion.vector_margin` (real, -10 to 1000, default 2): how much nearer than its centroid a
+  partition's rows are taken to come, in standard deviations of the rows about their centroids
+  along one dimension (§44.4). Larger probes more partitions and misses fewer rows; 100 probes,
+  on any data a test has used, every partition that could hold a nearer row, and the regression
+  tests set it so to compare with a sort. Below zero probes a partition only once rows nearer than
+  its centroid by that much are in hand. A filter narrows it (§44.6).
+- `partitions` (reloption, 0 to 1,000,000, default 0): the partitions the build makes; 0 chooses
+  by the rows' count (§44.3). Read by the build alone, so a change takes a REINDEX.
 - `pg_lion.vector_epsilon` (real, 1 to 10, default 4): the bounds' width in standard deviations.
   Each plane-1 bound fails with the Gaussian's two-sided probability, 0.27% at 3, 0.006% at 4; a
   failure matters only for a row that belongs in the answer and is found too late, so the rate of
   queries with a miss is far lower. Wider bounds refine and fetch more rows. The default was 3 until
-  the benchmark (§44.9): there one query in 100 under the 0.1% filter lost a row at 3, in each of
-  three runs, and none of 400 at 4, which refines twice the rows for a few percent of the time
-  (87 against 87 ms unfiltered in one run, 96 against 91 in another).
-- `pg_lion.vector_batch` (int, 1 to 100000, default 100): rows the first pass gathers candidates
-  for; each further pass gathers four times as many. A query that wants more than the batch makes
-  more passes, each reading every CODE page.
-- `work_mem` bounds a scan's candidates (§44.4).
+  the format-1 benchmark (§44.9): there one query in 100 under the 0.1% filter lost a row at 3, in
+  each of three runs, and none of 400 at 4, which refines twice the rows for a few percent of the
+  time.
+- `pg_lion.vector_batch` (int, 1 to 100000, default 100): rows the probes gather candidates for
+  before REST; each REST gathers four times as many, probing every partition probed so far again.
+- `maintenance_work_mem`: half of it holds the build's sample (§44.3), and the CODE items' sort.
+- `work_mem` bounds a scan's row queue (§44.4).
 
 ### 44.9 Measured
 
@@ -20405,74 +20527,142 @@ ground truth is the exact top 10 by cosine, computed in numpy for each query and
 Against pgvector 0.8.6's HNSW on `embedding::halfvec(1536)` (m = 16, ef_construction = 64, as
 pgvector's documentation builds it for 1536 dimensions) - lionvec indexes the `vector` itself.
 PostgreSQL 16, 4 vCPUs (Xeon, 2.8 GHz; AVX-512 but no VPOPCNTDQ, so the POPCNT kernel), 16 GB,
-`shared_buffers` 5 GB, `work_mem` 256 MB, no parallel query, and pgvector's three `vector`
-distance functions at `COST 100`, as lionvec's documentation asks (§44.11). `bench/vector/knn.py`.
+`shared_buffers` 5 GB, `work_mem` 256 MB, `maintenance_work_mem` 1 GB, no parallel query, and
+pgvector's three `vector` distance functions at `COST 100`, as lionvec's documentation asks
+(§44.11). `bench/vector/knn.py`; the results are in `bench/results/2026-10-14-lionvec-partitions/`.
 
-**Size and build.** lionvec 1,742 MB (218 MB of it the CODE pages a scan reads, 0.4 MB the
-directory), HNSW 3,809 MB, the table 63 MB and its TOAST 7.6 GB. lionvec builds in 98 s with the
-table in the page cache and took 683 s the first time, reading it from disk; serially, both.
+**Size and build.** lionvec 1,752 MB (225 MB of it the 28,810 CODE pages, 0.5 MB the PART chain),
+HNSW 3,809 MB, the table 63 MB and its TOAST 7.6 GB. The default 1,974 partitions, k-means over a
+sample of 348,617 rows (half of `maintenance_work_mem`): `REINDEX` took 18 min 58 s with the table
+in the page cache, where the unpartitioned format took 98 s. Nearly all of it is the O(n C) of §44.3
+- ten k-means iterations over the sample and the assignment of every row, each a plane-1 estimate
+against every centroid and the exact distances of the few it cannot rule out.
 
 **Warm** - every index, the table and its TOAST in memory (HNSW and the table in shared buffers,
-the rest in the page cache, `pg_prewarm`); the median of 100 queries, LIMIT 10. Recall is the
-share of the true ten returned; "exact" the share of queries that returned all ten.
+the rest in the page cache, `pg_prewarm`; each method's queries run once untimed first); the
+median of 100 queries, LIMIT 10, and the 95th percentile. Recall is the share of the true ten
+returned. The plans are the planner's own: the plain lionvec scan with a `Filter` at 10%,
+LionOrdered at 1%, and at 0.1% a sort of the lion bitmap scan's 953 rows, for either index.
 
-| Filter | lionvec (ε = 4) | HNSW, ef_search 40 | HNSW, ef_search 40, iterative |
-| --- | --- | --- | --- |
-| none | 96 ms, recall 1.000, exact 100% | 6.6 ms, 0.900, 52% | - |
-| 10% | 138 ms, 1.000, 100% | 4.6 ms, 0.393, 0% (3.9 rows) | 7.4 ms, 0.931, 55% |
-| 1% | 34 ms, 1.000, 100% | 4.1 ms, 0.038, 0% (0.4 rows) | 41 ms, 0.947, 59% |
-| 0.1% | 6.6 ms, 1.000, 100% | (planner: Sort of the filter's rows) 12 ms, 0.999 | 11 ms, 0.999 |
+| Filter | lionvec, margin 1 | margin 2 (default) | margin 3 | HNSW, ef_search 40 | 100 |
+| --- | --- | --- | --- | --- | --- |
+| none | 5.3 ms (p95 23), 0.939 | 8.5 (37), 0.968 | 14 (55), 0.984 | 4.4 (6.7), 0.900 | 6.6 (9.1), 0.954 |
+| 10% | 21 (67), 0.977 | 32 (96), 0.989 | 53 (108), 0.996 | 7.6 (13), 0.931 | 6.7 (13), 0.939 |
+| 1% | 21 (43), 0.956 | 31 (59), 0.979 | 49 (88), 0.993 | 36 (58), 0.947 | 34 (58), 0.950 |
+| 0.1% | 11.5 (16), 1.000 | | | 12.5 (16), 0.999 | |
 
-At ef_search 100 HNSW reaches 0.954 unfiltered in 7.6 ms, and 0.950 at 1% iterative in 37 ms.
-Times vary from run to run by up to a fifth: an earlier run, with the same plans and the same
-pages, refines and fetches, timed lionvec at 157, 37 and 6.7 ms under the three filters, and one
-before that, with `enable_sort = off` in place of the costs, at 136, 31 and 5.5 ms. The scans read every CODE page unfiltered (27,858), 27,169 at 10%,
-8,315 at 1% and 965 at 0.1% - the pages holding a member, as the directory promises, 97.5%, 30% and
-3.4% by `1 - (1 - s)^35`. Unfiltered, the pass over plane 1 costs about 90 ns a row; it keeps
-23,000 candidates, of which 122 are refined and 10.5 fetched. At ε = 3, 66 rows are refined, and
-one query of 100 under the 0.1% filter lost a row (a bound failed for a true neighbour, which the
-scan then skipped as out of order). Before the directory every filtered scan read every page, and
-the 0.1% filter took 54 ms; with a directory of heap blocks rather than TIDs, 12 ms, and the 1%
-filter 56 ms.
+HNSW under a filter is its iterative scan (`hnsw.iterative_scan = relaxed_order`); without it,
+at ef_search 40, it returned 3.9 of the ten rows at 10% (recall 0.393) and 0.4 at 1% (0.038).
+
+What the scans did, averaged over the 100 queries at margins 1, 2 and 3: unfiltered, 74, 143 and
+254 partitions probed (3.8%, 7.3% and 12.9% of 1,974), 1,141, 2,191 and 3,856 CODE pages read,
+about 125 rows refined and 10.7 fetched; under the 10% filter, through the plain scan, 257, 451 and
+725 partitions, 1,004 refined and 105 fetched (the filter keeps one row in ten of those returned);
+under the 1% filter, through LionOrdered, 193, 369 and 639 partitions (the narrower margin of
+§44.6, over a hundredth of the rows), 66 to 69 refined and 10.6 fetched. No bound failed in the
+900 scans; 0.13 to 1.4 rows a query were skipped out of order, rows of a partition probed after
+farther rows were returned. The unpartitioned format, which read every CODE page of the rows it
+scored and returned the exact ten (no bound failed in 400 queries at ε = 4), took 96 ms
+unfiltered, 138 ms at 10%, 34 ms at 1% and 6.6 ms at 0.1% (reading only the 965 CODE pages that
+held a member, by a page directory this format no longer has). So partitions are 11 times faster
+unfiltered and 4 times at 10%, about even at 1%, and slower at 0.1%, where the planner now sorts
+the members' rows fetched from the heap. The 95th percentile is three to four times the median, as
+the partitions a query probes vary: unfiltered at margin 2, a median of 74, a mean of 143, a 95th
+percentile of 525 and at most 1,430 of the 1,974, and a query's time follows them (correlation
+0.84). A query whose ten nearest lie far from every centroid finds many centroids within its
+tenth row's distance less the margin.
 
 **Cold** - PostgreSQL restarted and the page cache dropped before each query; the median of 5:
 
-| Filter | lionvec (ε = 4) | HNSW, ef_search 40 (iterative under a filter) |
-| --- | --- | --- |
-| none | 402 ms | 101 ms |
-| 1% | 196 ms | 1,307 ms |
-| 0.1% | 112 ms | 227 ms (planner: Sort of the filter's rows) |
+| Filter | lionvec | HNSW, ef_search 40 (iterative under a filter) | unpartitioned |
+| --- | --- | --- | --- |
+| none | 197 ms (30 to 662) | 104 ms | 402 ms |
+| 1% | 234 ms | 1,258 ms | 196 ms |
+| 0.1% | 236 ms (planner: Sort of the filter's rows) | 222 ms (the same) | 112 ms |
 
-Unfiltered, a cold lionvec query is a sequential read of 218 MB of CODE pages, where HNSW reads
-only the part of its graph a search visits, which costs less on this disk. Under a filter the
-graph search goes on (iteratively, to fill the LIMIT) through rows that fail the filter, each
-fetched from the table to test it, where lionvec reads lion's set, the CODE pages that hold a
-member, and about ten rows.
+Unfiltered, a cold query reads the PART chain and the CODE chains of the partitions it probes,
+about 18 MB, where the unpartitioned format read all 218 MB; its time varies with the partitions a
+query needs. Under the 1% filter it reads lion's set and the probed partitions' CODE chains, where
+HNSW's iterative search fetches row after row that fails the filter. At 0.1% the sort fetches 953
+TOASTed vectors.
 
 **Memory-capped** - a stream of queries with PostgreSQL in a memory cgroup of 1 or 2 GB (its
 processes, `shared_buffers` of 128 MB, and the page cache its reads fill), which holds lionvec's
-218 MB of CODE pages but not HNSW's 3.8 GB. Each method after a restart with the page cache
-dropped, run with rows of the table as queries until the cgroup is full and for 100 more, then
-timed on the 100 test queries; the median, and the pages a query read from disk (the backend's
-`read_bytes`):
+CODE pages but not HNSW's 3.8 GB. Each method after a restart with the page cache dropped, run with
+rows of the table as queries until the cgroup is full and for 100 more, then timed on the 100 test
+queries; the median, and the pages a query read from disk (the backend's `read_bytes`):
 
-| Memory | Filter | lionvec (ε = 4) | HNSW, ef_search 40 (iterative under a filter) |
+| Memory | Filter | lionvec | HNSW, ef_search 40 (iterative under a filter) | unpartitioned |
+| --- | --- | --- | --- | --- |
+| 1 GB | none | 17 ms, 94 pages | 52 ms, 766 pages | 157 ms, 100 pages |
+| 1 GB | 1% | 35 ms, 0 pages | 676 ms, 9,285 pages | 31 ms, 0 pages |
+| 2 GB | none | 16 ms, 41 pages | 41 ms, 671 pages | 161 ms, 25 pages |
+| 2 GB | 1% | 35 ms, 0 pages | 506 ms, 7,867 pages | 29 ms, 0 pages |
+
+What lionvec reads from disk are the CODE chains of partitions the stream had not yet probed, and
+the REFINE items and vectors of the rows it refines and fetches; under the 1% filter the stream
+never filled the cgroup (5,000 rows of the table as queries, and the members' working set still
+fit). The unpartitioned format read as few pages but scored every row, and most of its time was most
+likely the CODE pages being copied into 128 MB of shared buffers on every pass, which a scan of 7%
+of them mostly escapes. HNSW reads 650 to 800 random pages a query unfiltered, and 8,000 to 9,000
+under the filter, of graph and of rows that fail it.
+
+**Simulation.** Before the partitions were written, a numpy model of the scan chose their number
+and the margin (vtoy's `ivf.py`, not in the tree): the benchmark's 975,000 vectors, k-means at
+256, 1,024 and 4,096 partitions, the first 100 test queries, partitions taken nearest first by
+their centroids less a margin, and the rows read until the ten nearest (under each filter) were
+in hand. The rows of the partitions read, for 0.95 recall:
+
+| Partitions | none | 10% | 1% | 0.1% |
+| --- | --- | --- | --- | --- |
+| 256 | 50,800 (5.2%) | 51,700 | 90,200 | 272,000 |
+| 1,024 | 27,800 (2.9%) | 31,900 | 67,300 | 207,000 |
+| 4,096 | 16,600 (1.7%) | 20,300 | 46,500 | 160,000 |
+
+The unfiltered share falls about as `C^(-1/3)` (0.26 `C^(-1/3)` is 4.1%, 2.6% and 1.6%), which is
+`LIONVEC_PROBE_SHARE`; a filter keeping a share s reads about `s^(-0.3)` times as many, since its
+nearest matching rows lie farther out. Ordering partitions by centroid less a margin scaled by each
+partition's own radius (its largest or its rms distance to its centroid) read as many rows or more
+at every recall, which is why the margin is one number. Spilling each row to its second-nearest
+partition as well (SOAR's spill, chosen by the residual's angle) read 17% fewer rows at 4,096
+partitions for twice the CODE items; SPANN's (a second partition within 10% or 25% of the
+nearest's distance) read more. The margin a recall needed, in cosine units at 1,024 partitions:
+0.010 for 0.95, 0.025 for 0.98, 0.035 for 0.99 unfiltered, about 0.016 less for each tenfold a
+filter thins the rows, and about the same at 256 and 4,096 partitions; the rows' standard
+deviation about their centroids along one dimension, σ, was 0.0122, so the default margin of 2σ is
+about 0.98 recall.
+
+**Growth.** How the rows a scan reads grow with the table, in the same model (vtoy's `scale.py`):
+random subsets of 60,938 and 243,750 of the 975,000 rows and all of them, k-means at `2 sqrt(n)`
+partitions and at one per 500 rows, the 100 queries' true ten within each subset, and the margin
+that reaches each recall chosen afresh at each size. The rows read, the mean over the queries, and
+in brackets their median and 95th percentile:
+
+| Rows | Partitions | 0.95 recall | 0.98 recall |
 | --- | --- | --- | --- |
-| 1 GB | none | 157 ms, 100 pages | 54 ms, 765 pages |
-| 1 GB | 1% | 31 ms, 0 pages | 665 ms, 9,308 pages |
-| 2 GB | none | 161 ms, 25 pages | 39 ms, 672 pages |
-| 2 GB | 1% | 29 ms, 0 pages | 477 ms, 7,824 pages |
+| 60,938 | 493 (`2 sqrt(n)`) | 2,146 (1,262; 6,495) | 5,907 |
+| 243,750 | 987 | 6,403 (3,518; 18,285) | 16,157 |
+| 975,000 | 1,974 | 27,086 (13,122; 104,816) | 73,589 |
+| 60,938 | 121 (n / 500) | 5,252 (3,480; 15,156) | 10,322 |
+| 243,750 | 487 | 8,584 (4,588; 30,776) | 23,240 |
+| 975,000 | 1,950 | 23,085 (10,934; 74,955) | 56,781 |
 
-lionvec's CODE pages stay in memory; what it reads from disk are the REFINE items of the rows it
-refines and the vectors of the rows it fetches, scattered over 1.5 GB and 7.6 GB. It is no faster
-at 2 GB, reading a quarter as much, so the rise from 96 ms warm is most likely the CODE pages
-being copied into 128 MB of shared buffers on every pass rather than the disk. HNSW reads 650 to
-800 random pages a query at either size, and goes from 6.6 ms warm to 54 and 39. A random read on
-this machine's disk costs well under a tenth of a millisecond, so HNSW stays the faster
-unfiltered; where one costs a millisecond, the reads alone would come to about 0.75 s a query for
-HNSW and 0.1 s for lionvec (arithmetic, not measured). Under the 1% filter lionvec's working set -
-the members' CODE pages, REFINE items and vectors - fits and it reads nothing, while HNSW's
-iterative search reads 9,300 pages a query of graph and of rows that fail the filter.
+At `2 sqrt(n)` the partitions grow as the rows' root and the rows read grow almost as the rows
+(n^0.91 at 0.95 recall): the probed share hardly falls. At 500 rows a partition they grow as n^0.53
+(0.95) and n^0.61 (0.98), the partitions probed as n^0.53 too (10, 17 and 46 at 0.95). Taken that
+far, a billion rows in two million partitions would read about 900,000 rows a query for 0.95 and
+four million for 0.98 - 230 MB and 1 GB of CODE pages at the benchmark index's 242 bytes a row, from
+some 1,900 and 8,000 partitions, against 5.6 and 14 MB at 975,000 rows; three sizes over a
+sixteenfold range do not pin a power down a thousandfold further, so this is a direction, not a
+forecast.
+
+The mean is the tail's: the median query reads less than half the mean and the 95th percentile three
+to four times it, as in the benchmark. Capping the partitions probed cuts the tail for little
+recall. At 975,000 rows in 1,950 partitions, with the margin for 0.98: no cap, 0.981 and a mean of
+56,781 rows (95th percentile 226,626); at most 10% of the partitions, 0.979 and 40,729 (102,971); at
+most 5%, 0.971 and 28,612 (55,643) - more recall than the margin for 0.95 with no cap (about
+0.956, 23,085 and 74,955) at a 95th percentile a quarter lower. At the smaller sizes a cap of 5% or
+10% did the same.
 
 ### 44.10 Tests
 
@@ -20481,46 +20671,67 @@ iterative search reads 9,300 pages a query of graph and of rows that fail the fi
   each code the inverse of its step, extremes, infinities and NaN); the rotation at 64 to 8128
   dimensions (norms and inner products kept to 1e-5; the same signs from the same seed and others
   from another; one window and two; a basis vector spread out; rotated coordinates with the
-  variance, kurtosis and tails of a Gaussian); `lionvec_prepare()`
-  (padding, cosine scaling, zero vectors); the encoding (bits, popcount, both alphas, a row at the
-  mean); the query's quantization and planes; both popcount kernels against a reference; the key
-  algebra against true distances; and the bounds' COVERAGE on clustered data at 100, 384 and 1536
-  dimensions for each metric: plane 1 outside 1 sd 30 to 32% of the time (the Gaussian's 31.7%),
-  outside 3 sd 0.16 to 0.29% (0.27%); the codes outside 2 sd about 4% (4.6%) and never outside 6
-  sd, in 24,000 row-query pairs each. A heavy tail would fail it. And the directory:
-  `lionvec_dir_check()` on directories in and out of order, and `lionvec_dir_mark()` against the
-  definition (page i meets a range when `dir[i].lo <= hi` and `dir[i].hi >= lo`) and against the
-  rows themselves (every row in a range on a marked page): no pages, one and two, the largest block
-  numbers, and 6,000 directories made as a build makes them - blocks in order, offsets within a
-  block sometimes shuffled, pages of random sizes - against random ranges, some adjacent, given
-  over several calls, with a canary past the bitmap. Each of five deliberate faults fails it: the
-  next run begun too late, the gallop skipping a page, the bisection by the wrong key, a run ended
-  a block short, the TID test off by one.
+  variance, kurtosis and tails of a Gaussian); `lionvec_prepare()` (padding, cosine scaling, zero
+  vectors); the encoding (bits, popcount, both alphas, a row at the mean); the query's quantization
+  and planes; both popcount kernels against a reference; the key algebra against true distances; and
+  the bounds' COVERAGE on clustered data at 100, 384 and 1536 dimensions for each metric: plane 1
+  outside 1 sd 30 to 32% of the time (the Gaussian's 31.7%), outside 3 sd 0.16 to 0.29% (0.27%); the
+  codes outside 2 sd about 4% (4.6%) and never outside 6 sd, in 24,000 row-query pairs each. A heavy
+  tail would fail it. The partitions: `lionvec_candidates()` at 64, 320 and 1536 dimensions - at a
+  wide bound the nearest centroid is always a candidate and every key within its bounds, at the
+  build's bound it is missed at most once in 200, and the candidates are few (10 of 200 at 320
+  dimensions and more); no centroids, and identical ones; `lionvec_lift_key()` over partitions of
+  300 rows of 24 dimensions, of mixed lengths and of unit length - at a margin of the lifted rows'
+  greatest distance from their lifted centroid it bounds every row's key for every query, on unit
+  rows it is the L2 bound of the unit query, and it falls as the margin grows; and
+  `lionvec_kmeans()`, plain and spherical - it converges, every row ends with its nearest centroid,
+  every centroid is its rows' (normalized) mean to 1e-4, the same seed gives the same centroids, a
+  zero mean gives the same as none, one centroid is the mean, as many as rows one row each, with
+  eight centroids a cluster none mixes two clusters, and identical rows finish.
 - **vector.sql**: every ORDER BY run through the index and through a sequential scan and sort,
-  compared distance by distance and row by row, for each metric, three queries and LIMITs 1 to past
-  the table; no LIMIT, OFFSET, NULL and cosine zero queries and rows; a pass cut by `work_mem` of
-  64kB with a batch of 1 (the livelock of §44.4); inserts of a far cluster, UPDATE, DELETE and
+  compared distance by distance and row by row, with `pg_lion.vector_margin = 100`, for each metric,
+  three queries and LIMITs 1 to past the table, over 3,000 rows in 20 partitions; no LIMIT, OFFSET,
+  NULL and cosine zero queries and rows; a scan cut by `work_mem` of 64kB with a batch of 1 (the
+  livelock of §44.4); inserts of a far cluster into the partitions nearest it, UPDATE, DELETE and
   VACUUM, a table emptied by DELETE, REINDEX and CREATE INDEX CONCURRENTLY; an expression index and
   a partial one; a SCROLL cursor fetching backward; an untyped column (dimensions from the first
-  row, pgvector's errors); an unlogged table; and the refusals (another type, too many dimensions,
-  an array, two columns, the settings' ranges).
-- **vector_filter.sql**: LionOrdered over each metric against the ordinary plan, for eight filters
-  (equality, range, AND, OR, `<>`, a correlated column, a boolean, no rows) and four LIMITs; far,
-  zero and NULL queries; a prepared statement's generic plan; a correlated subquery rescanning the
-  node; a degraded set (400,000 rows, `hash_mem` 64kB) and its recheck; the directory (a filter
-  with members in a few heap blocks under every container key walks fewer than a quarter of the
-  index blocks a filter every row passes does, by `pg_statio_user_indexes`: 28 against
-  222 when written, where container keys alone read all 222); inserts, deletes and VACUUM under the
-  filter; the node switched off.
+  row, pgvector's errors); an unlogged table; an index built on an empty table, whose inserts go to
+  the REST chain, then rebuilt with more partitions than rows; the default margin's recall (at least
+  0.9 of the ten nearest for each metric, over 20 queries) and a negative margin's (less than all of
+  a hundred between clusters); and the refusals (another type, too many dimensions, an array, two
+  columns, the `partitions` and settings' ranges).
+- **vector_filter.sql**: LionOrdered over each metric against the ordinary plan, with
+  `pg_lion.vector_margin = 100`, for eight filters (equality, range, AND, OR, `<>`, a correlated
+  column, a boolean, no rows) and four LIMITs, over 10,000 rows in 50 partitions - the filters of
+  under 2,000 members by their exact distances, the others probing; far, zero and NULL queries; a
+  prepared statement's generic plan; a correlated subquery rescanning the node; a degraded set
+  (400,000 rows of 3 dimensions in 20 partitions, `hash_mem` 64kB) and its recheck; a filter of 200
+  members reading less than a quarter of the index blocks one of 4,000 does, by
+  `pg_statio_user_indexes`; inserts, deletes and VACUUM under the filter; the default margin's
+  recall for each metric under a filter of 9,000 members (rows of mixed lengths, which an inner
+  product ranked unlifted got 0.6 of, §44.4); the node switched off.
 
 ### 44.11 Not done
 
-- **Skipping CODE pages without a filter.** Exact pruning of whole pages or clusters by a bound on
-  their distance prunes nothing in high dimensions: on text-embedding-3-large vectors a cluster's
-  radius is about 1, as large as the distances between clusters, so no cluster's bound rules it out.
-  Matryoshka prefixes help only as an approximate key (IVF-style), which would give up the exact
-  order; a `WITH (matryoshka = true)` option for that is left for later.
-- **Parallel scan and build.** A pass is a sequential read a parallel scan would split cleanly.
+- **A billion rows.** Partitions are what make one possible, but three things stand in the way.
+  The build's k-means and assignment, and a scan's ranking, cost a plane-1 estimate of every
+  centroid for every row or query: O(n C) and O(C). The default `2 sqrt(n)` keeps the partitions
+  few but lets the rows read grow almost as the rows (§44.9's growth: n^0.91), so a large table
+  wants partitions of a fixed few hundred rows - two million of them for a billion rows, which
+  makes the O(C) steps the whole cost, 2 x 10^15 estimates to build and a 500 MB PART chain a
+  query, unless an index over the centroids (centroids of centroids, or a small graph) ranks them
+  by reading a few thousand. And even then the rows read grew as n^0.53 to n^0.61 at a fixed
+  partition size: about a million rows a query at a billion, 230 MB of CODE pages, which a
+  parallel scan could read in tens of milliseconds from memory but not from disk (arithmetic, not
+  measured). Capping the
+  partitions a query probes trims the tail (§44.9) and is the obvious first step; spilling rows
+  to a second partition (below) and a stopping rule that learns when a query's ten are in hand
+  are the others.
+- **Spilling rows to a second partition** (SOAR, Sun and others, NeurIPS 2023): in the simulation
+  it saved about a fifth of the rows probed for the same recall, for twice the CODE pages and an
+  insert into two chains. Left for when the rest is measured at scale.
+- **Parallel scan and build.** A probe is a sequential read a parallel scan would split cleanly;
+  the build's k-means and assignment are a loop over rows.
 - **halfvec, sparsevec, bit.** The codes do not care where the floats came from; each needs an
   operator class and a reader for its format.
 - **The double heap fetch.** Each returned row is fetched by the scan for its distance and again by
@@ -20528,24 +20739,20 @@ iterative search reads 9,300 pages a query of graph and of rows that fail the fi
   exact, which it is not.
 - **REFINE space.** VACUUM leaves REFINE line pointers and frees the space only for the tail page's
   inserts; a table with much churn grows until REINDEX. A drifting distribution does not make the
-  index wrong - any mean is correct - but loosens the bounds until REINDEX recomputes the mean.
-- **A small `work_mem` with loose bounds** (few dimensions, a large LIMIT) makes many passes, each
-  reading every CODE page; the DEBUG1 line shows them.
+  index wrong - any mean is correct, and an insert goes to the nearest centroid there is - but
+  loosens the bounds and unbalances the partitions until REINDEX recomputes both.
+- **A small `work_mem` with loose bounds** (few dimensions, a large LIMIT) makes many RESTs, each
+  probing again every partition probed so far; the DEBUG1 line shows them.
 - **The planner underprices a sort by distance**, at pgvector's own costs. Its distance functions
   cost 1 (`procost`), and a 1536-dimension vector is stored out of line, so the planner sees an
   18-byte column and a cheap operator: sorting a filter's rows by distance looks cheaper than the
   lionvec scan, and was chosen at 548 ms over the scan's 136 ms for 97,000 rows, at 82 ms over 31
-  for 9,700, and cold at 1,209 ms over 199. Repricing core's Sort paths whose key is a lionvec
-  distance would be new territory for lion's planner hooks, and is not planned. Instead lionvec's
-  documentation has the three functions its operator classes use (`l2_distance`,
+  for 9,700, and cold at 1,209 ms over 199 (format 1). Repricing core's Sort paths whose key is a
+  lionvec distance would be new territory for lion's planner hooks, and is not planned. Instead
+  lionvec's documentation has the three functions its operator classes use (`l2_distance`,
   `vector_negative_inner_product` and `cosine_distance` of `vector`) set to `COST 100` with the
-  extension, and the benchmarks assume it: on the 975,000 rows the planner then takes the scan
-  under the 10%, 1% and 0.1% filters and leaves HNSW's plans (on `halfvec`) as they were. pg_dump
-  does not keep the setting (an extension member's), and a pgvector update may reset it.
-  `enable_sort = off` does the same for one query.
+  extension, and the benchmarks assume it. pg_dump does not keep the setting (an extension
+  member's), and a pgvector update may reset it. `enable_sort = off` does the same for one query.
 - **Choosing between lionvec and HNSW.** With both on one column, the planner takes HNSW for
   nearly every query, as pgvector prices an HNSW scan at almost nothing: on 200,000 random
-  256-dimension rows, about 13 against lionvec's 3,100 unfiltered and 1,300 against 1,650 under a
-  1% filter, where HNSW (without `hnsw.iterative_scan`) then returned none of the ten rows; only a
-  filter of a few hundred rows goes to a sort of lion's rows. lionvec is always exact; nothing
-  switches it to an approximate scan where that would be cheaper (the first item above).
+  256-dimension rows, about 13 against lionvec's 3,100 unfiltered (format 1).
