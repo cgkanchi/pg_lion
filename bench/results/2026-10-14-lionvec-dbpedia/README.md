@@ -34,6 +34,7 @@ row a method and filter:
 | `lionvec-p2715.json` | lionvec, `partitions = 2715` (8 sqrt(n)) | 1de7d73 (d498fba) | 2,715 | 347 s | 221 MB |
 | `lionvec-p0-default.json` | lionvec, `partitions = 0`, the new default 8 sqrt(n) | e2eda33 | 2,715 | 337 s | 221 MB |
 | `lionvec-p0-unit.json` | the same index, run at 93a5684 (the pause's new unit), patience 30 alone | e2eda33 | 2,715 | 337 s | 221 MB |
+| `lionvec-p0-spill.json` | lionvec, `partitions = 0` and `spill` on: the defaults since, 8 sqrt(n) partitions of format 3, patience 30 alone | 679cfd5 | 2,715 | 356 s | 247 MB |
 
 The table is 7.6 MB and its TOAST 900 MB. 1de7d73 is the last commit to `src/` on the
 `claude/lionvec` branch, whose head d498fba these ran on. An index built with `partitions = 0` on
@@ -100,6 +101,8 @@ the rows a partition holds (170 and 42):
 | 0.98 | 2,715, 120 | 566 | 327 | 13,900 | 4.5 |
 | 0.95 | 2,715, 30 at 93a5684 (`lionvec-p0-unit.json`) | 310 | 177 | 7,500 | 2.7 |
 | 0.98 | 2,715, 30 at 93a5684 | 566 | 327 | 13,900 | 4.1 |
+| 0.95 | 2,715 spilling, 30 (`lionvec-p0-spill.json`) | 203 | 63 | 7,100 items | 2.2 |
+| 0.98 | 2,715 spilling, 30 | 464 | 148 | 16,200 items | 4.1 |
 
 So the finer partitions read 1.5 times fewer CODE pages at 0.95 (1.9 times fewer rows, against the
 numpy model's 1.78) and about as many at 0.98, and are no faster at 115,186 rows: each query ranks
@@ -107,6 +110,17 @@ four times the centroids (85 pages of them), and a partition of 42 rows spans tw
 probe reads 1.75 pages for 1.2 pages of rows. Under the filters, through LionOrdered at 3%: 0.95
 took 771 pages in 678 partitions (5.6 ms) and 646 in 2,715 (7.2 ms); through the plain scan at
 10%, 589 (6.7 ms) and, at patience 120, 585 (8.3 ms). `knn_dbpedia.py table` prints all of it.
+
+679cfd5 merges the spill (format 3: each row in a second partition as well, `spill` on by
+default) with the finer default; `lionvec-p0-spill.json` is a `partitions = 0` index built on it
+(2,715 partitions, 356 s, 247 MB), run at a patience of 30. At a margin of 3 it returned 0.917
+unfiltered from 35 partitions and 114 CODE pages in 1.6 ms (678 partitions without spill: 0.843,
+15, 88, 1.1 ms), 0.976 at 6 and 0.993 at 12 and 16. Along the margins, 0.95 took 203 CODE pages and
+63 partitions (2.2 ms) and 0.98 464 and 148 (4.1 ms): 1.8 and 1.25 times fewer pages than the
+old default, in the same time at 0.95 and 1.3 times longer at 0.98. Under the filters, 0.95 and
+0.98 took 455 and 791 pages through the plain scan at 10% (7.0 and 8.9 ms; 589 and not reached in
+678 partitions) and 671 and 1,155 through LionOrdered at 3% (6.0 and 8.3 ms; 771 and 1,210). The
+planner's choices are the finer partitions' above, a sort at 3% among them.
 
 ## Re-running
 
