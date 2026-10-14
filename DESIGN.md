@@ -20319,7 +20319,7 @@ after each. A LIMIT k query thus probes the partitions whose centroids, less the
 than its k-th row, refines about the rows plane 1 cannot tell from the k-th, and fetches about k
 and a few.
 
-**The margin** (`lv_margin()`) is `pg_lion.vector_margin` (2) standard deviations of the rows about
+**The margin** (`lv_margin()`) is `pg_lion.vector_margin` (3) standard deviations of the rows about
 their centroids along one dimension, the meta page's scale: a row is nearer the query than its
 centroid by the part of its offset from the centroid that points at the query, and that part's
 spread, `|x - c| / sqrt(d)` for a random direction, shrinks with the dimensions as a partition's
@@ -20330,6 +20330,30 @@ well as any scaled by a partition's own radius in the simulation (§44.9), as th
 toward a query lie about as far out in a small partition as in a large one when one k-means made
 them. A row whose partition's turn does not come before the LIMIT is met is missed; that is the
 scan's approximation, and the margin trades it against the partitions read.
+
+**The pause.** The margin alone leaves a tail: unfiltered at a margin of 2, the partitions a query
+probed had a median of 74, a mean of 143 and a maximum of 1,430 of the 1,974 (§44.9). A query whose
+ten nearest lie far from every centroid finds many centroids within its tenth row's key less the
+margin, and probes them all, though few hold a row nearer than those it has. So the scan counts the
+rows it scores since one last entered the L least upper bounds, and once those L are in hand and
+the count reaches `pg_lion.vector_patience` (30) partitions' worth of rows - the rows a partition
+holds on average, or under a restriction the members - it PAUSES (`lv_probe_part()`): it takes the
+L as found and probes no partition until it has returned L rows or the next row lies past tau. A
+REST, which starts a batch of four times the rows, ends a pause too. Paused, the scan still
+returns rows in order; a row nearer than those a pause returned, in a partition not probed yet, is
+skipped when it is found, as one the margin leaves till too late is. The pause trades those rows
+against the tail: in the numpy model (vtoy's `patience.py`), at 975,000 rows in 1,950 partitions, a
+patience of 20 partitions reached 0.98 recall reading a mean of 28,000 rows a query (95th
+percentile 75,000), where the margin alone needed 57,000 (227,000).
+
+How a pause ends was found by its failures. Ended when the row queue was empty, it returned every
+row the probes had kept below tau, and tau, the L-th least UPPER bound, lies past many more than L
+rows: a restricted scan pausing at once (vector_filter.sql's, a patience of 1) returned 1,255 rows
+of a LIMIT 2000 over 9,000 members, the other 7,745 skipped as out of order. Ended only once the
+next row lay past tau, it filled the LIMIT but still returned rows far past the L nearest, and a
+LIMIT 1000 on the benchmark got 0.955 of its true rows; ended after L rows too, 0.983, against
+0.980 for a LIMIT 10. Counting a restricted scan's patience in members rather than rows lets a
+filter pause as an unfiltered scan does; counted in rows, a 1% filter never paused.
 
 **Inner product** takes one more step. An L2 row nearer the query than its centroid by its
 offset's projection is so only by that projection less `|x - c|^2 / 2` (`|q - x|^2 = |q - c|^2 -
@@ -20450,13 +20474,17 @@ relation as a B-tree's is. The plan differs from §30's in four places:
     walk. This is the exact answer, at a heap fetch a member; it replaces probing where the
     members are so few that most partitions hold none and the nearest member lies past many - in
     the simulation a 0.1% filter of 975,000 rows needed a fifth of the index probed for 0.95 recall.
-  - **More**: it probes as an unfiltered scan does (§44.4), with the margin narrowed by
-    `LIONVEC_MARGIN_NARROW` (1.3) standard deviations for each tenfold the members thin the rows
-    by, down to a thousandth: the k-th nearest member lies farther out, and of the few members each
-    partition holds, the chance of one within the margin falls with them. In the simulation, the
-    margin a recall needed fell by about that much a tenfold, the same at every recall from 0.95 to
-    0.99. A probe skips a CODE page whose container keys hold no member, and every row not a member
-    before it is estimated; a refine, a fetch and a return happen only for members.
+  - **More**: it probes as an unfiltered scan does (§44.4), at the same margin, its patience
+    counted in members. The k-th nearest member lies farther out, past more centroids within the
+    margin, and the pause ends those probes. Before the pause counted members the margin was
+    narrowed instead, by 1.3 standard deviations for each tenfold the members thinned the rows by
+    (in the simulation the margin a recall needed fell about that much a tenfold) and then 1.8;
+    with the pause, narrowing cost recall and saved no time - on the benchmark, through
+    LionOrdered, narrowed by 1.8, 0.975, 0.974, 0.970 and 0.952 of the ten nearest under filters
+    of 10%, 3%, 1% and 0.3%, and not narrowed 0.981, 0.980, 0.981 and 0.965, in the same time at
+    each (27 ms at 1%). A probe skips a CODE page whose container keys hold no member, and every
+    row not a member before it is estimated; a refine, a fetch and a return happen only for
+    members.
 
   A degraded set (§30.4, `hash_mem` exceeded) has NULL containers, meaning every TID of that key's
   blocks; the scan takes them all, and the node rechecks the lion clauses on the heap row, as it
@@ -20479,30 +20507,51 @@ rows pass and the set costs more than the rows it saves.
 Start-up is the cost of the first row, which is most of a scan's. A restriction of no more than
 2,000 members (§44.6) costs a random page, an index tuple and a row's estimate a member. Otherwise:
 every centroid's estimate (`LIONVEC_ROW_OPS`, 2 `cpu_operator_cost`: the popcounts and a square
-root); the share of the rows a scan probes, `LIONVEC_PROBE_SHARE` (0.92) `C^(-1/3)` and, under a
-filter keeping a share s, `s^(-LIONVEC_PROBE_SEL)` (0.2) times as much, at most all - the power of C
-the simulation's, the constants the benchmark's at the default margin (§44.9); a random page a
-probed partition and the CODE pages' share of the index (by the recorded dimensions, or 1536 before
-any) read sequentially; `0.1 cpu_index_tuple_cost` a row walked and `LIONVEC_ROW_OPS` a member
-scored; and a batch's refines and exact distances, a random page and an index tuple each. Each
-further row adds a refine and a fetch at worst and a `pg_lion.vector_batch`th of the start-up: the
-farther rows lie past more partitions (a scan of the benchmark's index probed 7.3% of them for 10
-rows, 23% for 100 and 61% for 1,000), and the planner prices a LIMIT under a Filter as LIMIT over
-the filter's selectivity rows of the scan. That is what keeps a plain scan, walking past every row a
-1% filter rejects, from looking as cheap as LionOrdered reading the members alone: charged a refine
-and a fetch a row and no more, the two tied at 1% and the planner's pick ran 7 times slower (202 ms
-to 30). With the charge it picks the plain scan at 30% and 10% (15 and 30 ms, LionOrdered 196 and
-82), LionOrdered at 3% and 1% (40 and 26 ms), and below about 0.3% sorts the bitmap scan's rows.
-A path with no ORDER BY costs infinity. Selectivity 1, correlation 0.
+root); the share of the rows a scan probes; a random page a probed partition and the CODE pages'
+share of the index (by the recorded dimensions, or 1536 before any) read sequentially; `0.1
+cpu_index_tuple_cost` a row walked and `LIONVEC_ROW_OPS` a member scored; and a batch's refines and
+exact distances, a random page and an index tuple each. The share probed is `LIONVEC_PROBE_PAUSED`
+(0.46) `C^(-1/3)` and, under a filter keeping a share s, `s^(-LIONVEC_PROBE_SEL_PAUSED)` (0.27)
+times as much, at most all: the power of C the simulation's, the rest the benchmark's at the
+default margin and patience, where scans probed 3.9% of the 1,974 partitions unfiltered and 6.3%,
+8.9%, 12% and 18% through LionOrdered under filters of 10%, 3%, 1% and 0.3% (the fit gives 3.6%,
+6.8%, 9.3%, 12.5% and 17%). With `pg_lion.vector_patience = 0` it is `LIONVEC_PROBE_SHARE` (0.92)
+`C^(-1/3)` and `s^(-LIONVEC_PROBE_SEL)` (0.2), the benchmark's at a margin of 2 before the pause,
+when a filter narrowed the margin (§44.6); the same margin unnarrowed probes more.
+
+Each further row adds a refine and a fetch at worst and a share of the start-up over
+`pg_lion.vector_batch`: the farther rows lie past more partitions, and the planner prices a LIMIT
+under a Filter as LIMIT over the filter's selectivity rows of the scan. Without pauses the share is
+`LIONVEC_DEEPER` (1), a scan of the benchmark's index having probed 7.3% of the partitions for 10
+rows, 23% for 100 and 61% for 1,000 at a margin of 2. With them it is `LIONVEC_DEEPER_PAUSED`
+(0.06): the same scans probed 4.1%, 4.6% and 50%, the first batch coming from the rows a scan holds
+when it pauses and the deeper ones much as without, which one share a batch cannot follow; 0.06
+prices the first batches right. The charge is what keeps a plain scan, walking past every row a 1%
+filter rejects, from looking as cheap as LionOrdered reading the members alone: charged a refine
+and a fetch a row and no more, the two tied at 1% and the planner's pick ran 7 times slower (202
+ms to 30). Before the pause, with the full charge, the planner picked the plain scan at 30% and 10%
+(15 and 30 ms, LionOrdered 196 and 82) and LionOrdered at 3% and 1% (40 and 26 ms). With pauses it
+picks the plain scan down to 3% (9 ms at 30% against LionOrdered's 206, 15 at 10% against 81, 32
+at 3% against 41) and LionOrdered at 1% (24 ms against the plain scan's 256, whose 1,000 rows 0.06
+prices low); at 0.3% and below it sorts the bitmap scan's rows (27 ms, LionOrdered 27). A path with
+no ORDER BY costs infinity. Selectivity 1, correlation 0.
 
 ### 44.8 Settings
 
-- `pg_lion.vector_margin` (real, -10 to 1000, default 2): how much nearer than its centroid a
+- `pg_lion.vector_margin` (real, -10 to 1000, default 3): how much nearer than its centroid a
   partition's rows are taken to come, in standard deviations of the rows about their centroids
   along one dimension (§44.4). Larger probes more partitions and misses fewer rows; 100 probes,
   on any data a test has used, every partition that could hold a nearer row, and the regression
-  tests set it so to compare with a sort. Below zero probes a partition only once rows nearer than
-  its centroid by that much are in hand. A filter narrows it (§44.6).
+  tests set it so, with the pause off, to compare with a sort. Below zero probes a partition only
+  once rows nearer than its centroid by that much are in hand. A filter no longer narrows it
+  (§44.6). The default was 2 until the pause; with the pause, 3 took the benchmark's recall from
+  0.964 to 0.979 for 1.3 ms (§44.9).
+- `pg_lion.vector_patience` (int, 0 to 1,000,000, default 30): how many partitions' worth of rows
+  (of members, under a lion filter) a scan scores without one entering its L nearest before it
+  pauses (§44.4); 0 never pauses, and then a filter's scan probes far more than the costs assume
+  (§44.7). Smaller pauses sooner, probing fewer partitions and missing more rows. 30 is where the
+  benchmark's tail ended: at a margin of 3, 30 and 40 gave the same recall (0.979), 40 a 95th
+  percentile a third longer.
 - `partitions` (reloption, 0 to 1,000,000, default 0): the partitions the build makes; 0 chooses
   by the rows' count (§44.3). Read by the build alone, so a change takes a REINDEX.
 - `pg_lion.vector_epsilon` (real, 1 to 10, default 4): the bounds' width in standard deviations.
@@ -20543,48 +20592,67 @@ the rest in the page cache, `pg_prewarm`; each method's queries run once untimed
 median of 100 queries, LIMIT 10, and the 95th percentile. Recall is the share of the true ten
 returned. The plans are the planner's own: the plain lionvec scan with a `Filter` at 10%,
 LionOrdered at 1%, and at 0.1% a sort of the lion bitmap scan's 953 rows, for either index.
+lionvec at its defaults (margin 3, patience 30), at margins 2 and 4, and with the pause off:
 
-| Filter | lionvec, margin 1 | margin 2 (default) | margin 3 | HNSW, ef_search 40 | 100 |
-| --- | --- | --- | --- | --- | --- |
-| none | 5.3 ms (p95 23), 0.939 | 8.5 (37), 0.968 | 14 (55), 0.984 | 4.4 (6.7), 0.900 | 6.6 (9.1), 0.954 |
-| 10% | 21 (67), 0.977 | 32 (96), 0.989 | 53 (108), 0.996 | 7.6 (13), 0.931 | 6.7 (13), 0.939 |
-| 1% | 21 (43), 0.956 | 31 (59), 0.979 | 49 (88), 0.993 | 36 (58), 0.947 | 34 (58), 0.950 |
-| 0.1% | 11.5 (16), 1.000 | | | 12.5 (16), 0.999 | |
+| Filter | lionvec, defaults | margin 2 | margin 4 | no pause | HNSW, ef_search 40 | 100 |
+| --- | --- | --- | --- | --- | --- | --- |
+| none | 7.9 ms (p95 16), 0.979 | 6.6 (15), 0.964 | 9.1 (18), 0.983 | 14 (68), 0.984 | 4.7 (6.5), 0.900 | 8.1 (11), 0.954 |
+| 10% | 13.5 (29), 0.978 | 15 (29), 0.974 | 15 (28), 0.979 | 60 (123), 0.996 | 8.7 (14), 0.931 | 8.0 (15), 0.939 |
+| 1% | 24 (40), 0.981 | 27 (41), 0.981 | 27 (38), 0.981 | 109 (136), 1.000 | 37 (62), 0.947 | 41 (66), 0.950 |
+| 0.1% | 9.9 (11), 1.000 | | | | 13 (18), 0.999 | |
 
 HNSW under a filter is its iterative scan (`hnsw.iterative_scan = relaxed_order`); without it,
 at ef_search 40, it returned 3.9 of the ten rows at 10% (recall 0.393) and 0.4 at 1% (0.038).
+Times vary between runs: HNSW at ef_search 100 took 6.2, 7.0 and 8.1 ms unfiltered in three, the
+defaults 8.6, 8.4 and 7.9.
 
-What the scans did, averaged over the 100 queries at margins 1, 2 and 3: unfiltered, 74, 143 and
-254 partitions probed (3.8%, 7.3% and 12.9% of 1,974), 1,141, 2,191 and 3,856 CODE pages read,
-about 125 rows refined and 10.7 fetched; under the 10% filter, through the plain scan, 257, 451 and
-725 partitions, 1,004 refined and 105 fetched (the filter keeps one row in ten of those returned);
-under the 1% filter, through LionOrdered, 193, 369 and 639 partitions (the narrower margin of
-§44.6, over a hundredth of the rows), 66 to 69 refined and 10.6 fetched. No bound failed in the
-900 scans; 0.13 to 1.4 rows a query were skipped out of order, rows of a partition probed after
-farther rows were returned. The unpartitioned format, which read every CODE page of the rows it
-scored and returned the exact ten (no bound failed in 400 queries at ε = 4), took 96 ms
-unfiltered, 138 ms at 10%, 34 ms at 1% and 6.6 ms at 0.1% (reading only the 965 CODE pages that
-held a member, by a page directory this format no longer has). So partitions are 11 times faster
-unfiltered and 4 times at 10%, about even at 1%, and slower at 0.1%, where the planner now sorts
-the members' rows fetched from the heap. The 95th percentile is three to four times the median, as
-the partitions a query probes vary: unfiltered at margin 2, a median of 74, a mean of 143, a 95th
-percentile of 525 and at most 1,430 of the 1,974, and a query's time follows them (correlation
-0.84). A query whose ten nearest lie far from every centroid finds many centroids within its
-tenth row's distance less the margin.
+What the scans did, averaged over the 100 queries. Unfiltered, at margins 2, 3 and 4: 65, 77 and
+86 partitions probed (3.3%, 3.9% and 4.3% of 1,974), 993, 1,171 and 1,295 CODE pages read, 0.5 to
+0.8 pauses, about 120 rows refined and 10.5 fetched; with the pause off, 254 partitions and 3,856
+pages. Under the 10% filter, through the plain scan, 99 to 104 partitions, 955 rows refined and 104
+fetched (the filter keeps one row in ten of those returned); with the pause off, 725 partitions.
+Under the 1% filter, through LionOrdered, 244 partitions at every margin - every query paused,
+before the margin would have stopped it - 65 refined and 10.5 fetched; with the pause off, 1,511 of
+the 1,974, why a filter's margin was narrowed before the pause (§44.6). No bound failed; 0 to 0.6
+rows a query were skipped out of order.
+
+The pause is what ends the tail. The partitions a query probed unfiltered: with it, a median of
+68, a 95th percentile of 175 and at most 256; without it, 150, 837 and 1,664, a query's time
+following them (correlation 0.84, at a margin of 2 before the pause). For that it gives up half a
+point of recall unfiltered (0.984 to 0.979) and two under the 1% filter (1.000 to 0.981). A
+patience of 40 gave the same recall as 30 at a margin of 3 (0.979) with a 95th percentile a third
+longer (17.9 ms against 13.5, in an earlier run). By LIMIT, unfiltered over 40 queries: 4.1%, 4.6%
+and 50% of the partitions probed for 10, 100 and 1,000 rows, recall 0.980, 0.975 and 0.983, in
+10.5, 17 and 212 ms; with the pause off, 15%, 39% and 74%, 0.985, 0.997 and 0.999, in 17, 60 and
+219 ms.
+
+Before the pause, at a margin of 2 narrowed by 1.3 a tenfold under a filter
+(`before-pause/`), lionvec took 8.5 ms (p95 37) for 0.968 unfiltered, 32 ms (96) for 0.989 at
+10% and 31 ms (59) for 0.979 at 1%; margins 1 and 3 took 5.3 ms for 0.939 and 14 ms for 0.984
+unfiltered. The unpartitioned format, which read every CODE page of the rows it scored and
+returned the exact ten (no bound failed in 400 queries at ε = 4), took 96 ms unfiltered, 138 ms
+at 10%, 34 ms at 1% and 6.6 ms at 0.1% (reading only the 965 CODE pages that held a member, by a
+page directory this format no longer has). So partitions are 12 times faster unfiltered, 10
+times at 10% and 1.4 times at 1%, and slower at 0.1%, where the planner now sorts the members'
+rows fetched from the heap.
 
 **Cold** - PostgreSQL restarted and the page cache dropped before each query; the median of 5:
 
 | Filter | lionvec | HNSW, ef_search 40 (iterative under a filter) | unpartitioned |
 | --- | --- | --- | --- |
-| none | 197 ms (30 to 662) | 104 ms | 402 ms |
-| 1% | 234 ms | 1,258 ms | 196 ms |
-| 0.1% | 236 ms (planner: Sort of the filter's rows) | 222 ms (the same) | 112 ms |
+| none | 85 ms (49 to 155) | 118 ms | 402 ms |
+| 1% | 196 ms | 1,254 ms | 196 ms |
+| 0.1% | 210 ms (planner: Sort of the filter's rows) | 251 ms (the same) | 112 ms |
 
 Unfiltered, a cold query reads the PART chain and the CODE chains of the partitions it probes,
-about 18 MB, where the unpartitioned format read all 218 MB; its time varies with the partitions a
-query needs. Under the 1% filter it reads lion's set and the probed partitions' CODE chains, where
-HNSW's iterative search fetches row after row that fails the filter. At 0.1% the sort fetches 953
-TOASTed vectors.
+about 9 MB, where the unpartitioned format read all 218 MB; its time varies with the partitions a
+query needs. Cold reads are noisy here: the first run of these five queries, straight after the
+warm benchmark, took 779 ms unfiltered (one query 3.6 s) and HNSW's 1% 1,739 ms, and the next
+76 ms and 1,244 ms. Interleaved, each query after its own restart, twelve queries took a median
+of 89 ms at the defaults and 173 ms at the old ones (a margin of 2, no pause), reading 28 and
+67 MB. Under the 1%
+filter it reads lion's set and the probed partitions' CODE chains, where HNSW's iterative search
+fetches row after row that fails the filter. At 0.1% the sort fetches 953 TOASTed vectors.
 
 **Memory-capped** - a stream of queries with PostgreSQL in a memory cgroup of 1 or 2 GB (its
 processes, `shared_buffers` of 128 MB, and the page cache its reads fill), which holds lionvec's
@@ -20594,18 +20662,19 @@ queries; the median, and the pages a query read from disk (the backend's `read_b
 
 | Memory | Filter | lionvec | HNSW, ef_search 40 (iterative under a filter) | unpartitioned |
 | --- | --- | --- | --- | --- |
-| 1 GB | none | 17 ms, 94 pages | 52 ms, 766 pages | 157 ms, 100 pages |
-| 1 GB | 1% | 35 ms, 0 pages | 676 ms, 9,285 pages | 31 ms, 0 pages |
-| 2 GB | none | 16 ms, 41 pages | 41 ms, 671 pages | 161 ms, 25 pages |
-| 2 GB | 1% | 35 ms, 0 pages | 506 ms, 7,867 pages | 29 ms, 0 pages |
+| 1 GB | none | 19 ms, 100 pages | 51 ms, 767 pages | 157 ms, 100 pages |
+| 1 GB | 1% | 28 ms, 0 pages | 691 ms, 9,229 pages | 31 ms, 0 pages |
+| 2 GB | none | 13 ms, 41 pages | 41 ms, 672 pages | 161 ms, 25 pages |
+| 2 GB | 1% | 30 ms, 0 pages | 465 ms, 7,853 pages | 29 ms, 0 pages |
 
 What lionvec reads from disk are the CODE chains of partitions the stream had not yet probed, and
 the REFINE items and vectors of the rows it refines and fetches; under the 1% filter the stream
 never filled the cgroup (5,000 rows of the table as queries, and the members' working set still
-fit). The unpartitioned format read as few pages but scored every row, and most of its time was most
-likely the CODE pages being copied into 128 MB of shared buffers on every pass, which a scan of 7%
-of them mostly escapes. HNSW reads 650 to 800 random pages a query unfiltered, and 8,000 to 9,000
-under the filter, of graph and of rows that fail it.
+fit). The pause cut the 95th percentile by a third here: 41 ms with 1 GB, 65 ms before it at a
+margin of 2. The unpartitioned format read as few pages but scored every row, and most of its
+time was most likely the CODE pages being copied into 128 MB of shared buffers on every pass,
+which a scan of 4% of them mostly escapes. HNSW reads 650 to 800 random pages a query unfiltered, and 8,000 to
+9,000 under the filter, of graph and of rows that fail it.
 
 **Simulation.** Before the partitions were written, a numpy model of the scan chose their number
 and the margin (vtoy's `ivf.py`, not in the tree): the benchmark's 975,000 vectors, k-means at
@@ -20629,8 +20698,8 @@ partitions for twice the CODE items; SPANN's (a second partition within 10% or 2
 nearest's distance) read more. The margin a recall needed, in cosine units at 1,024 partitions:
 0.010 for 0.95, 0.025 for 0.98, 0.035 for 0.99 unfiltered, about 0.016 less for each tenfold a
 filter thins the rows, and about the same at 256 and 4,096 partitions; the rows' standard
-deviation about their centroids along one dimension, σ, was 0.0122, so the default margin of 2σ is
-about 0.98 recall.
+deviation about their centroids along one dimension, σ, was 0.0122, so a margin of 2σ, the
+default before the pause, is about 0.98 recall.
 
 **Growth.** How the rows a scan reads grow with the table, in the same model (vtoy's `scale.py`):
 random subsets of 60,938 and 243,750 of the 975,000 rows and all of them, k-means at `2 sqrt(n)`
@@ -20664,6 +20733,15 @@ most 5%, 0.971 and 28,612 (55,643) - more recall than the margin for 0.95 with n
 0.956, 23,085 and 74,955) at a 95th percentile a quarter lower. At the smaller sizes a cap of 5% or
 10% did the same.
 
+A pause does better than a cap, and is what the scan does (§44.4). In the same model (vtoy's
+`patience100.py`), the scan stopping once P partitions in a row have put nothing into its 100
+nearest: at 975,000 rows in 1,950 partitions, with the margin for 0.98, P = 20 read a mean of
+28,062 rows (95th percentile 74,986) and P = 40 38,740 (100,481), against 56,781 (226,626) with
+neither, the cap of 5%'s rows at 0.98 recall rather than 0.971; at 243,750 rows in 487
+partitions, P = 20 read 18,142 (48,213) against 23,240 (68,741). Between those two sizes the rows
+read for 0.98 grew as n^0.32 with P = 20 and n^0.64 without - two sizes, so a direction only, but
+the one that matters at a billion rows (§44.11).
+
 ### 44.10 Tests
 
 - **test/unit/vec_test.c** (`make unit`, and under ASan and UBSan with `SANITIZE=1`), against the
@@ -20689,27 +20767,31 @@ most 5%, 0.971 and 28,612 (55,643) - more recall than the margin for 0.95 with n
   zero mean gives the same as none, one centroid is the mean, as many as rows one row each, with
   eight centroids a cluster none mixes two clusters, and identical rows finish.
 - **vector.sql**: every ORDER BY run through the index and through a sequential scan and sort,
-  compared distance by distance and row by row, with `pg_lion.vector_margin = 100`, for each metric,
-  three queries and LIMITs 1 to past the table, over 3,000 rows in 20 partitions; no LIMIT, OFFSET,
+  compared distance by distance and row by row, with `pg_lion.vector_margin = 100` and the pause
+  off, for each metric, three queries and LIMITs 1 to past the table, over 3,000 rows in 20
+  partitions; no LIMIT, OFFSET,
   NULL and cosine zero queries and rows; a scan cut by `work_mem` of 64kB with a batch of 1 (the
   livelock of §44.4); inserts of a far cluster into the partitions nearest it, UPDATE, DELETE and
   VACUUM, a table emptied by DELETE, REINDEX and CREATE INDEX CONCURRENTLY; an expression index and
   a partial one; a SCROLL cursor fetching backward; an untyped column (dimensions from the first
   row, pgvector's errors); an unlogged table; an index built on an empty table, whose inserts go to
   the REST chain, then rebuilt with more partitions than rows; the default margin's recall (at least
-  0.9 of the ten nearest for each metric, over 20 queries) and a negative margin's (less than all of
-  a hundred between clusters); and the refusals (another type, too many dimensions, an array, two
-  columns, the `partitions` and settings' ranges).
+  0.9 of the ten nearest for each metric, over 20 queries, pausing) and a negative margin's (less
+  than all of a hundred between clusters); a scan pausing after every partition (a patience of 1)
+  still returning a LIMIT 300 whole and in order; and the refusals (another type, too many
+  dimensions, an array, two columns, the `partitions` and settings' ranges).
 - **vector_filter.sql**: LionOrdered over each metric against the ordinary plan, with
-  `pg_lion.vector_margin = 100`, for eight filters (equality, range, AND, OR, `<>`, a correlated
-  column, a boolean, no rows) and four LIMITs, over 10,000 rows in 50 partitions - the filters of
-  under 2,000 members by their exact distances, the others probing; far, zero and NULL queries; a
-  prepared statement's generic plan; a correlated subquery rescanning the node; a degraded set
-  (400,000 rows of 3 dimensions in 20 partitions, `hash_mem` 64kB) and its recheck; a filter of 200
-  members reading less than a quarter of the index blocks one of 4,000 does, by
-  `pg_statio_user_indexes`; inserts, deletes and VACUUM under the filter; the default margin's
-  recall for each metric under a filter of 9,000 members (rows of mixed lengths, which an inner
-  product ranked unlifted got 0.6 of, §44.4); the node switched off.
+  `pg_lion.vector_margin = 100` and the pause off, for eight filters (equality, range, AND, OR,
+  `<>`, a correlated column, a boolean, no rows) and four LIMITs, over 10,000 rows in 50
+  partitions - the filters of under 2,000 members by their exact distances, the others probing;
+  far, zero and NULL queries; a prepared statement's generic plan; a correlated subquery
+  rescanning the node; a degraded set (400,000 rows of 3 dimensions in 20 partitions, `hash_mem`
+  64kB) and its recheck; a filter of 200 members reading less than a quarter of the index blocks
+  one of 4,000 does, by `pg_statio_user_indexes`; inserts, deletes and VACUUM under the filter;
+  the default margin's recall for each metric under a filter of 9,000 members (rows of mixed
+  lengths, which an inner product ranked unlifted got 0.6 of, §44.4); a restricted scan pausing
+  at once (a patience of 1) still filling a LIMIT 2000 of its 9,000 members, in order, through the
+  node (the short LIMIT of §44.4); the node switched off.
 
 ### 44.11 Not done
 
@@ -20720,13 +20802,13 @@ most 5%, 0.971 and 28,612 (55,643) - more recall than the margin for 0.95 with n
   wants partitions of a fixed few hundred rows - two million of them for a billion rows, which
   makes the O(C) steps the whole cost, 2 x 10^15 estimates to build and a 500 MB PART chain a
   query, unless an index over the centroids (centroids of centroids, or a small graph) ranks them
-  by reading a few thousand. And even then the rows read grew as n^0.53 to n^0.61 at a fixed
-  partition size: about a million rows a query at a billion, 230 MB of CODE pages, which a
-  parallel scan could read in tens of milliseconds from memory but not from disk (arithmetic, not
-  measured). Capping the
-  partitions a query probes trims the tail (§44.9) and is the obvious first step; spilling rows
-  to a second partition (below) and a stopping rule that learns when a query's ten are in hand
-  are the others.
+  by reading a few thousand. And even then, by the margin alone, the rows read grew as n^0.53 to
+  n^0.61 at a fixed partition size: one to four million rows a query at a billion, 230 MB to 1 GB
+  of CODE pages. With the pause (§44.4) they grew as n^0.32 between the model's two largest sizes,
+  which taken that far is about 260,000 rows, 60 MB of CODE pages, a parallel scan's tens of
+  milliseconds from memory (arithmetic on two sizes, not measured). Spilling rows to a second
+  partition (below) is the other lever on the rows read, and the index over the centroids is
+  still to be built.
 - **Spilling rows to a second partition** (SOAR, Sun and others, NeurIPS 2023): in the simulation
   it saved about a fifth of the rows probed for the same recall, for twice the CODE pages and an
   insert into two chains. Left for when the rest is measured at scale.

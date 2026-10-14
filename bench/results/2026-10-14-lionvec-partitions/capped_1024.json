@@ -1,17 +1,18 @@
 [
  {
-  "name": "lionvec margin=2",
+  "name": "lionvec margin=3 patience=30",
   "sql": "SELECT id FROM items  ORDER BY embedding <=> %(q)s::vector L",
   "settings": [
-   "SET pg_lion.vector_margin = 2"
+   "SET pg_lion.vector_margin = 3",
+   "SET pg_lion.vector_patience = 30"
   ],
   "memory_mb": 1024,
-  "warmup": 865,
+  "warmup": 873,
   "filled": true,
-  "median_ms": 17.416826000498986,
-  "p95_ms": 65.49592114924961,
-  "median_pages_read": 94.0,
-  "mean_pages_read": 120.35
+  "median_ms": 19.27973999954702,
+  "p95_ms": 41.435787898808485,
+  "median_pages_read": 99.5,
+  "mean_pages_read": 117.34
  },
  {
   "name": "hnsw ef=40",
@@ -22,24 +23,25 @@
   "memory_mb": 1024,
   "warmup": 246,
   "filled": true,
-  "median_ms": 52.297358000032546,
-  "p95_ms": 80.08064094929068,
-  "median_pages_read": 766.0,
-  "mean_pages_read": 759.18
+  "median_ms": 50.855772999966575,
+  "p95_ms": 80.49116329921162,
+  "median_pages_read": 767.0,
+  "mean_pages_read": 759.225
  },
  {
-  "name": "lionvec margin=2",
+  "name": "lionvec margin=3 patience=30",
   "sql": "SELECT id FROM items WHERE u < 0.01 ORDER BY embedding <=> %",
   "settings": [
-   "SET pg_lion.vector_margin = 2"
+   "SET pg_lion.vector_margin = 3",
+   "SET pg_lion.vector_patience = 30"
   ],
   "memory_mb": 1024,
   "warmup": 5000,
   "filled": false,
-  "median_ms": 35.21455800091644,
-  "p95_ms": 65.67145275039366,
+  "median_ms": 27.588200499849336,
+  "p95_ms": 39.44153865077169,
   "median_pages_read": 0.0,
-  "mean_pages_read": 0.245
+  "mean_pages_read": 0.21
  },
  {
   "name": "hnsw ef=40 iterative",
@@ -51,9 +53,9 @@
   "memory_mb": 1024,
   "warmup": 112,
   "filled": true,
-  "median_ms": 675.5509804997928,
-  "p95_ms": 1120.700089499951,
-  "median_pages_read": 9285.0,
-  "mean_pages_read": 9866.72
+  "median_ms": 690.4941924995001,
+  "p95_ms": 1231.3870432502881,
+  "median_pages_read": 9228.75,
+  "mean_pages_read": 9852.11
  }
 ]

@@ -1,19 +1,20 @@
 [
  {
-  "name": "lionvec margin=2",
+  "name": "lionvec margin=3 patience=30",
   "sql": "SELECT id FROM items  ORDER BY embedding <=> %(q)s::vector L",
   "settings": [
-   "SET pg_lion.vector_margin = 2"
+   "SET pg_lion.vector_margin = 3",
+   "SET pg_lion.vector_patience = 30"
   ],
   "cache_dropped": true,
-  "median_ms": 197.18986899988522,
-  "max_ms": 662.414166000417,
+  "median_ms": 84.96408800056088,
+  "max_ms": 155.3888750004262,
   "all_ms": [
-   30.3,
-   335.6,
-   662.4,
-   197.2,
-   72.5
+   48.6,
+   155.4,
+   144.1,
+   85.0,
+   58.8
   ]
  },
  {
@@ -23,31 +24,32 @@
    "SET hnsw.ef_search = 40"
   ],
   "cache_dropped": true,
-  "median_ms": 103.5870559999239,
-  "max_ms": 144.2695839996304,
+  "median_ms": 118.14543999935267,
+  "max_ms": 128.1385849997605,
   "all_ms": [
-   66.3,
-   115.6,
-   144.3,
-   103.6,
-   88.3
+   54.5,
+   118.1,
+   128.1,
+   121.3,
+   94.1
   ]
  },
  {
-  "name": "lionvec margin=2",
+  "name": "lionvec margin=3 patience=30",
   "sql": "SELECT id FROM items WHERE u < 0.01 ORDER BY embedding <=> %",
   "settings": [
-   "SET pg_lion.vector_margin = 2"
+   "SET pg_lion.vector_margin = 3",
+   "SET pg_lion.vector_patience = 30"
   ],
   "cache_dropped": true,
-  "median_ms": 234.11340600068797,
-  "max_ms": 585.7423130000825,
+  "median_ms": 195.68661100129248,
+  "max_ms": 306.69672600015474,
   "all_ms": [
-   215.3,
-   306.0,
-   585.7,
-   234.1,
-   168.7
+   208.3,
+   194.0,
+   306.7,
+   195.7,
+   153.9
   ]
  },
  {
@@ -58,31 +60,32 @@
    "SET hnsw.iterative_scan = relaxed_order"
   ],
   "cache_dropped": true,
-  "median_ms": 1257.7752629995302,
-  "max_ms": 1907.2692099998676,
+  "median_ms": 1254.2198629998893,
+  "max_ms": 1689.8485799993068,
   "all_ms": [
-   1012.7,
-   1257.8,
-   1907.3,
-   1298.2,
-   1111.6
+   1093.2,
+   1254.2,
+   1689.8,
+   1237.4,
+   1301.8
   ]
  },
  {
-  "name": "lionvec margin=2",
+  "name": "lionvec margin=3 patience=30",
   "sql": "SELECT id FROM items WHERE u < 0.001 ORDER BY embedding <=> ",
   "settings": [
-   "SET pg_lion.vector_margin = 2"
+   "SET pg_lion.vector_margin = 3",
+   "SET pg_lion.vector_patience = 30"
   ],
   "cache_dropped": true,
-  "median_ms": 236.27831099929608,
-  "max_ms": 249.78794399976323,
+  "median_ms": 210.28244100125448,
+  "max_ms": 260.40543300041463,
   "all_ms": [
-   201.4,
-   246.1,
-   249.8,
-   193.4,
-   236.3
+   206.2,
+   210.3,
+   208.1,
+   239.1,
+   260.4
   ]
  },
  {
@@ -93,14 +96,14 @@
    "SET hnsw.iterative_scan = relaxed_order"
   ],
   "cache_dropped": true,
-  "median_ms": 221.52858299978107,
-  "max_ms": 229.60916399915732,
+  "median_ms": 250.92717400002584,
+  "max_ms": 267.3050419998617,
   "all_ms": [
-   205.3,
-   221.5,
-   221.5,
-   229.6,
-   220.6
+   256.3,
+   250.9,
+   267.3,
+   226.1,
+   198.5
   ]
  }
 ]
