@@ -14,7 +14,8 @@ nearest by cosine among the table's rows (the float4 values it holds, in float64
 filter; no query's tenth and eleventh lie within 2.8e-5 of each other.
 
 **Machine and settings.** PostgreSQL 16.15, pgvector 0.8.7, 4 vCPUs (Intel Xeon @ 2.10GHz,
-AVX-512 with VPOPCNTDQ; lionvec uses its POPCNT kernel), 15 GB RAM, `shared_buffers` 2 GB (which
+AVX-512 with VPOPCNTDQ; lionvec used its POPCNT kernel until 9ffabab, and its AVX-512 set in
+`lionvec-p0-simd.json` and after), 15 GB RAM, `shared_buffers` 2 GB (which
 holds every relation here), `work_mem` 64 MB, `maintenance_work_mem` 1 GB (so the k-means sample
 is every row), no parallel query, `jit` off, pgvector's three `vector` distance functions at
 `COST 100`. Warm: every relation `pg_prewarm`ed into shared buffers, each method's 200 queries run
@@ -35,6 +36,8 @@ row a method and filter:
 | `lionvec-p0-default.json` | lionvec, `partitions = 0`, the new default 8 sqrt(n) | e2eda33 | 2,715 | 337 s | 221 MB |
 | `lionvec-p0-unit.json` | the same index, run at 93a5684 (the pause's new unit), patience 30 alone | e2eda33 | 2,715 | 337 s | 221 MB |
 | `lionvec-p0-spill.json` | lionvec, `partitions = 0` and `spill` on: the defaults since, 8 sqrt(n) partitions of format 3, patience 30 alone | 679cfd5 | 2,715 | 356 s | 247 MB |
+| `lionvec-p0-simd.json` | lionvec, `partitions = 0`, the defaults, rebuilt with the kernels (DESIGN.md §44.3, "Kernels"), patience 30 alone | 9ffabab (d6b723b) | 2,715 | 158 s | 247 MB |
+| `hnsw-rerun.json` | `hnsw.json`'s index run again beside `lionvec-p0-simd.json`, so that the two compare from one sitting | run at d6b723b | | | |
 | `cold.json` | both indexes cold (`knn_dbpedia.py cold`): the server restarted and the page cache dropped before each query, 7 queries a method | 679cfd5 | 2,715 | | |
 
 The table is 7.6 MB and its TOAST 900 MB. 1de7d73 is the last commit to `src/` on the
@@ -104,6 +107,8 @@ the rows a partition holds (170 and 42):
 | 0.98 | 2,715, 30 at 93a5684 | 566 | 327 | 13,900 | 4.1 |
 | 0.95 | 2,715 spilling, 30 (`lionvec-p0-spill.json`) | 203 | 63 | 7,100 items | 2.2 |
 | 0.98 | 2,715 spilling, 30 | 464 | 148 | 16,200 items | 4.1 |
+| 0.95 | 2,715 spilling, 30, the kernels (`lionvec-p0-simd.json`) | 203 | 63 | 7,100 items | 1.6 |
+| 0.98 | 2,715 spilling, 30, the kernels | 464 | 148 | 16,200 items | 2.7 |
 
 So the finer partitions read 1.5 times fewer CODE pages at 0.95 (1.9 times fewer rows, against the
 numpy model's 1.78) and about as many at 0.98, and are no faster at 115,186 rows: each query ranks
@@ -122,6 +127,20 @@ old default, in the same time at 0.95 and 1.3 times longer at 0.98. Under the fi
 0.98 took 455 and 791 pages through the plain scan at 10% (7.0 and 8.9 ms; 589 and not reached in
 678 partitions) and 671 and 1,155 through LionOrdered at 3% (6.0 and 8.3 ms; 771 and 1,210). The
 planner's choices are the finer partitions' above, a sort at 3% among them.
+
+9ffabab gives the arithmetic AVX2 kernels, and plane 1 VPOPCNTDQ's (DESIGN.md §44.3, "Kernels");
+`lionvec-p0-simd.json` is the defaults' index rebuilt with them at d6b723b (2,715 partitions, 158 s,
+247 MB) and `hnsw-rerun.json` the HNSW index run again in the same sitting, so that the two compare
+from one hour of one machine. The kernels change no decision: the same recall, partitions probed,
+pages, candidates, refines, fetches, skips, pauses and plans as `lionvec-p0-spill.json` in every one
+of its 37 rows. Server ms at equal recall, lionvec before and with the kernels, then HNSW:
+unfiltered 0.95 2.2 -> 1.6 against 1.8 (ef 40, 0.951), 0.98 4.1 -> 2.7 against 3.6 (ef 100, 0.979);
+the plain scan at 10% 7.0 -> 5.5 and 8.9 -> 6.8, where HNSW's iterative scan reaches 0.945 in 4.7 ms
+at ef 100 and no further at the ef values run; LionOrdered at 3% 6.0 -> 5.3 and 8.3 -> 6.7 against
+12.4 ms for 0.953 (ef 40, iterative) and 11.6 for 0.957 (ef 100); the exact paths at 1% 5.2 and 5.3
+ms against the planner's sort for HNSW at 7.6 (its iterative scan 25.9 ms for 0.959). At the default
+margin of 3, unfiltered, 0.917 in 1.1 ms (1.6 before). The lionvec index is 247 MB against HNSW's
+450, and built in 158 s against 187.
 
 ## Cold
 
