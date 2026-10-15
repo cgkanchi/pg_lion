@@ -83,6 +83,14 @@ jobs:
           ln -sfn "/usr/lib/postgresql/$PG" .local/pg
           .local/pg/bin/pg_config --version
 
+      # pg_lion_vector's tests need pgvector; without it they are skipped
+      # (Makefile), so a major apt.postgresql.org has no package for yet still
+      # tests everything else.
+      - name: Install pgvector
+        run: |
+          sudo apt-get install -y --no-install-recommends "postgresql-$PG-pgvector" ||
+            echo "::notice::no pgvector package for PostgreSQL $PG; the vector tests are skipped"
+
       - name: Build
         run: make -j4 WERROR=1
 
@@ -200,6 +208,15 @@ jobs:
           ln -sfn "$PGPREFIX" .local/pg
           .local/pg/bin/pg_config --version
 
+      # As in the pgdg jobs: pg_lion_vector's tests run if pgvector builds
+      # against this branch, and are skipped if it does not.
+      - name: Build pgvector
+        continue-on-error: true
+        run: |
+          git clone -q --depth 1 https://github.com/pgvector/pgvector.git "$RUNNER_TEMP/pgvector"
+          make -s -C "$RUNNER_TEMP/pgvector" PG_CONFIG="$PWD/$PG_CONFIG"
+          make -s -C "$RUNNER_TEMP/pgvector" install PG_CONFIG="$PWD/$PG_CONFIG"
+
       - name: Build
         run: make -j4 WERROR=1
 
@@ -296,7 +313,7 @@ jobs:
         run: |
           # PGXN version X.Y.0 is extension version X.Y (DESIGN.md section 23).
           meta=$(sed -n 's/^   "version": "\(.*\)",$/\1/p' META.json)
-          for c in pg_lion pg_lion_citext; do
+          for c in pg_lion pg_lion_citext pg_lion_vector; do
             ctl=$(sed -n "s/^default_version = '\(.*\)'$/\1/p" $c.control)
             test "$ctl.0" = "$meta" || { echo "$c.control default_version $ctl vs META.json $meta"; exit 1; }
             test -f "$c--$ctl.sql"
@@ -307,7 +324,8 @@ jobs:
           sudo mkdir -p /etc/postgresql-common/createcluster.d
           echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/no-main.conf
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y --no-install-recommends "postgresql-$PG" "postgresql-server-dev-$PG"
+          sudo apt-get install -y --no-install-recommends "postgresql-$PG" "postgresql-server-dev-$PG" \
+            "postgresql-$PG-pgvector"
 
       - name: make dist
         run: |

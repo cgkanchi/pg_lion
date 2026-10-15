@@ -1,0 +1,61 @@
+[
+ {
+  "name": "lionvec margin=3 patience=30",
+  "sql": "SELECT id FROM items  ORDER BY embedding <=> %(q)s::vector L",
+  "settings": [
+   "SET pg_lion.vector_margin = 3",
+   "SET pg_lion.vector_patience = 30"
+  ],
+  "memory_mb": 1024,
+  "warmup": 873,
+  "filled": true,
+  "median_ms": 19.27973999954702,
+  "p95_ms": 41.435787898808485,
+  "median_pages_read": 99.5,
+  "mean_pages_read": 117.34
+ },
+ {
+  "name": "hnsw ef=40",
+  "sql": "SELECT id FROM items  ORDER BY embedding::halfvec(1536) <=> ",
+  "settings": [
+   "SET hnsw.ef_search = 40"
+  ],
+  "memory_mb": 1024,
+  "warmup": 246,
+  "filled": true,
+  "median_ms": 50.855772999966575,
+  "p95_ms": 80.49116329921162,
+  "median_pages_read": 767.0,
+  "mean_pages_read": 759.225
+ },
+ {
+  "name": "lionvec margin=3 patience=30",
+  "sql": "SELECT id FROM items WHERE u < 0.01 ORDER BY embedding <=> %",
+  "settings": [
+   "SET pg_lion.vector_margin = 3",
+   "SET pg_lion.vector_patience = 30"
+  ],
+  "memory_mb": 1024,
+  "warmup": 5000,
+  "filled": false,
+  "median_ms": 27.588200499849336,
+  "p95_ms": 39.44153865077169,
+  "median_pages_read": 0.0,
+  "mean_pages_read": 0.21
+ },
+ {
+  "name": "hnsw ef=40 iterative",
+  "sql": "SELECT id FROM items WHERE u < 0.01 ORDER BY embedding::half",
+  "settings": [
+   "SET hnsw.ef_search = 40",
+   "SET hnsw.iterative_scan = relaxed_order"
+  ],
+  "memory_mb": 1024,
+  "warmup": 112,
+  "filled": true,
+  "median_ms": 690.4941924995001,
+  "p95_ms": 1231.3870432502881,
+  "median_pages_read": 9228.75,
+  "mean_pages_read": 9852.11
+ }
+]

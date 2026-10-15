@@ -1,0 +1,59 @@
+[
+ {
+  "name": "lionvec eps=4",
+  "sql": "SELECT id FROM items  ORDER BY embedding <=> %(q)s::vector L",
+  "settings": [
+   "SET pg_lion.vector_epsilon = 4"
+  ],
+  "memory_mb": 1024,
+  "warmup": 908,
+  "filled": true,
+  "median_ms": 156.60834100071952,
+  "p95_ms": 192.06458799935717,
+  "median_pages_read": 99.75,
+  "mean_pages_read": 118.575
+ },
+ {
+  "name": "hnsw ef=40",
+  "sql": "SELECT id FROM items  ORDER BY embedding::halfvec(1536) <=> ",
+  "settings": [
+   "SET hnsw.ef_search = 40"
+  ],
+  "memory_mb": 1024,
+  "warmup": 248,
+  "filled": true,
+  "median_ms": 54.2568629998641,
+  "p95_ms": 85.8517959512028,
+  "median_pages_read": 765.25,
+  "mean_pages_read": 759.2
+ },
+ {
+  "name": "lionvec eps=4",
+  "sql": "SELECT id FROM items WHERE u < 0.01 ORDER BY embedding <=> %",
+  "settings": [
+   "SET pg_lion.vector_epsilon = 4"
+  ],
+  "memory_mb": 1024,
+  "warmup": 5000,
+  "filled": false,
+  "median_ms": 30.87252049954259,
+  "p95_ms": 44.1734589009684,
+  "median_pages_read": 0.0,
+  "mean_pages_read": 0.265
+ },
+ {
+  "name": "hnsw ef=40 iterative",
+  "sql": "SELECT id FROM items WHERE u < 0.01 ORDER BY embedding::half",
+  "settings": [
+   "SET hnsw.ef_search = 40",
+   "SET hnsw.iterative_scan = relaxed_order"
+  ],
+  "memory_mb": 1024,
+  "warmup": 112,
+  "filled": true,
+  "median_ms": 665.4280189995916,
+  "p95_ms": 1122.1229019500242,
+  "median_pages_read": 9307.5,
+  "mean_pages_read": 9850.5
+ }
+]

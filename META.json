@@ -1,7 +1,7 @@
 {
    "name": "pg_lion",
    "abstract": "Roaring-bitmap inverted index access method with count(*) and GROUP BY pushdown",
-   "description": "pg_lion adds the lion index access method: one compressed posting set of roaring-style containers per distinct key, serving bitmap scans for equality, IN lists and NULL tests, and a custom scan that answers count(*) with equality filters and GROUP BY from the posting sets plus the visibility map. pg_lion_citext adds an operator class for citext.",
+   "description": "pg_lion adds the lion index access method: one compressed posting set of roaring-style containers per distinct key, serving bitmap scans for equality, IN lists and NULL tests, and a custom scan that answers count(*) with equality filters and GROUP BY from the posting sets plus the visibility map. pg_lion_citext adds an operator class for citext. pg_lion_vector adds lionvec, a nearest-neighbour index for pgvector's vector type that stays small and reads little, and that filters by lion indexes exactly.",
    "version": "0.1.0",
    "maintainer": "Chinmay Kanchi <cgkanchi@gmail.com>",
    "license": "postgresql",
@@ -17,6 +17,12 @@
          "file": "pg_lion_citext--0.1.sql",
          "docfile": "README.md",
          "version": "0.1.0"
+      },
+      "pg_lion_vector": {
+         "abstract": "lionvec: bit-plane nearest-neighbour index for pgvector (USING lionvec)",
+         "file": "pg_lion_vector--0.1.sql",
+         "docfile": "README.md",
+         "version": "0.1.0"
       }
    },
    "prereqs": {
@@ -25,7 +31,8 @@
             "PostgreSQL": "16.0.0"
          },
          "recommends": {
-            "citext": "0"
+            "citext": "0",
+            "vector": "0"
          }
       },
       "build": {
@@ -41,7 +48,8 @@
             "pg_walinspect": "0"
          },
          "recommends": {
-            "injection_points": "0"
+            "injection_points": "0",
+            "vector": "0"
          }
       }
    },
@@ -64,7 +72,9 @@
       "roaring",
       "inverted index",
       "analytics",
-      "count"
+      "count",
+      "vector",
+      "nearest neighbour"
    ],
    "release_status": "testing",
    "no_index": {

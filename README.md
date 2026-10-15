@@ -20,6 +20,10 @@ bitmap. Many queries can then be answered by combining bitmaps instead of visiti
   ranking;
 - jsonb containment, key existence and jsonpath (`doc @> ...`, `doc ? ...`, `doc @@ ...`).
 
+`pg_lion_vector` adds `lionvec`, a nearest-neighbour index for pgvector's `vector` that reads a few
+percent of itself a query and fills its `LIMIT` under any lion filter (see
+[Nearest neighbours](#nearest-neighbours)).
+
 On a vacuumed table these counts never touch the heap, so they can be one or two orders of magnitude
 faster than a B-tree or GIN index. They show up in `EXPLAIN` as `Custom Scan (LionCount)`.
 
@@ -38,6 +42,7 @@ before 1.0; a release that changes it will say so, and the indexes will need a `
 | Unique constraints, or `ORDER BY col LIMIT n` on a single column | B-tree |
 | Returning many filtered rows in order | A covering B-tree, which lion can filter as it walks it (see below) |
 | Write-heavy tables | Measure first. Lion inserts are slower than B-tree. |
+| Nearest neighbours of pgvector embeddings, especially under a `WHERE` | `lionvec`, from `pg_lion_vector` |
 
 Lion, B-tree and GIN indexes coexist happily. A typical setup keeps B-tree for primary keys and
 ordering and adds lion indexes on the columns your counts and filters use.
@@ -189,12 +194,51 @@ rows that can't make the cut, instead of scoring and sorting every match. `lion_
 returns the same top `k` as `(ctid, score)` pairs, if you'd rather join yourself. Scores are Lucene's
 BM25 (`k1 = 1.2`, `b = 0.75`, both adjustable).
 
+### Nearest neighbours
+
+With [pgvector](https://github.com/pgvector/pgvector) installed:
+
+```sql
+CREATE EXTENSION pg_lion_vector;
+-- pgvector prices its distances as nearly free, which can make the planner sort a
+-- filter's rows rather than use lionvec; price them closer to what they cost
+ALTER FUNCTION l2_distance(vector, vector) COST 100;
+ALTER FUNCTION vector_negative_inner_product(vector, vector) COST 100;
+ALTER FUNCTION cosine_distance(vector, vector) COST 100;
+
+CREATE INDEX items_embedding ON items USING lionvec (embedding vector_cosine_ops);
+CREATE INDEX items_category  ON items USING lion (category);
+
+SELECT id FROM items ORDER BY embedding <=> $1 LIMIT 10;
+SELECT id FROM items WHERE category = 3 ORDER BY embedding <=> $1 LIMIT 10;
+```
+
+`lionvec` partitions the rows by k-means when it builds, and keeps one bit per dimension of every
+row, rotated so that the error of a distance worked out from those bits is known, plus an 8-bit
+code read only when the bits can't decide. A query ranks the partitions by their centroids, reads
+the bits of the rows in the nearest few, refines the rows that might make the cut, and computes the
+last few distances exactly from the table, pausing once a few dozen partitions have brought
+nothing nearer. Like HNSW's, the answer is approximate: on 975,000 1536-dimension OpenAI
+embeddings a query reads 4% of the rows (9 MB) and returns 98% of the true ten nearest in 7.9 ms,
+about the time pgvector's HNSW takes to return 95% (8.1 ms at `ef_search` 100);
+`pg_lion.vector_margin` and `pg_lion.vector_patience` trade one for the other. Under a `WHERE` that lion indexes answer, the scan scores only the
+matching rows, so a filter of any selectivity gets its ten nearest: 24 ms at 1% of the rows (98%
+recall), where HNSW returns fewer than one row, or 95% of the right ones in 37 to 41 ms with
+iterative scans, and a filter of up to 2,000 rows is answered exactly. The index is 1.7 GB to
+HNSW's 3.8 GB, and since a query reads only the partitions it needs, it holds up when memory is
+short: with PostgreSQL held to 1 GB, 19 ms and 100 pages read from disk a query, where HNSW took
+51 ms and 767 pages (and 691 ms and 9,229 pages under the 1% filter, where lionvec read none).
+`vector_l2_ops` (`<->`, the default), `vector_ip_ops` (`<#>`) and `vector_cosine_ops` (`<=>`) are
+supported, up to 8128 dimensions. See
+[BENCHMARKS.md](docs/BENCHMARKS.md#nearest-neighbours-lionvec-against-hnsw).
+
 ## Supported types
 
 Integers, floats, `numeric`, `bool`, `text`/`varchar`, `char(n)`, `bytea`, `uuid`, dates, times,
 timestamps, `interval`, `inet`, `macaddr`, `jsonb` (whole values, or paths with
 `jsonb_contains_ops`), `pg_lsn`, `oid`, enums, any array, and `tsvector`. Install `pg_lion_citext` for case-insensitive `citext`. Indexes can have several
-columns and can be built in parallel on PostgreSQL 17 and later.
+columns and can be built in parallel on PostgreSQL 17 and later. `pg_lion_vector` indexes pgvector's
+`vector` with `lionvec` (one column, built serially).
 
 ## Limitations
 
@@ -208,9 +252,23 @@ columns and can be built in parallel on PostgreSQL 17 and later.
   down when every query term is very common.
 - The count pushdown uses an expression index (for example, lion on `(data->>'key')`) only on a
   table that is not partitioned, and not in its joins.
+- `lionvec` assumes pgvector's distance functions are costed at 100 (the `ALTER FUNCTION`s under
+  [Nearest neighbours](#nearest-neighbours)). At pgvector's own cost of 1 the planner may sort a
+  filter's rows by distance instead: before scans paused, it did for filters of 1% and 10% of a
+  million rows, 3 to 17 times slower. The setting is not kept by `pg_dump`, and an `ALTER
+  EXTENSION vector UPDATE` may reset it, so run them again after either.
+- If the column also has an HNSW index, the planner chooses HNSW for nearly every query, filtered
+  or not, because pgvector prices its scan as nearly free; under a filter it then returns fewer
+  rows than the `LIMIT` unless `hnsw.iterative_scan` is on.
 - jsonb `<@` isn't indexed, and jsonpath (`@?`, `@@`) is always rechecked in the heap. Updating
   an indexed jsonb document writes one entry per path, so it costs more than with GIN's pending
   list.
+- `lionvec` answers only an `ORDER BY` of its distance, approximately, as HNSW and IVFFlat do. It
+  builds without parallel workers, and slowly: k-means, then every row compared with every
+  partition's centroid, 19 minutes for 975,000 rows of 1536 dimensions, growing with the rows
+  times the partitions. It reuses the space of deleted rows only slowly and
+  keeps the partitions it was built with, so a table with heavy churn or drift needs an occasional
+  `REINDEX`. Each row it returns is read from the table twice.
 - On a hot standby, indexes using the default (generic) WAL mode recheck every row in counts.
   Preloading the library avoids this.
 - Loading the library changes estimates, and so plans, that have nothing to do with lion: a column
