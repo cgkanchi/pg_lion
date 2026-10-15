@@ -15,12 +15,12 @@
  *		and norms what their definitions say, a row at the mean all zeros;
  *	  - the query's planes: they quantize it within half a step, and the sum
  *		and variance kept with them are the planes' own;
- *	  - every kernel the build and CPU have (portable, POPCNT, AVX2): plane
- *		1's against a naive count, the sums against their sixteen lanes
- *		added as the header says and the rotation against the portable
- *		one's, to the bit, at every dimsp an index takes and from unaligned
- *		pointers; and end to end, the same rotations, estimates and k-means
- *		as the portable set's;
+ *	  - every kernel the build and CPU have (portable, POPCNT, AVX2,
+ *		AVX-512): plane 1's against a naive count, the sums against their
+ *		sixteen lanes added as the header says and the rotation against the
+ *		portable one's, to the bit, at every dimsp an index takes and from
+ *		unaligned pointers; and end to end, the same rotations, estimates and
+ *		k-means as the portable set's;
  *	  - the key algebra: with the exact inner product and no error, the
  *		bounds ARE the key of the distance computed the obvious way, for each
  *		metric - which is the proof that centring, the mean's terms, cosine's
@@ -611,7 +611,7 @@ naive_dot(const uint64 *bits, const uint64 *planes, int nwords)
 }
 
 static const char *const kernel_names[LIONVEC_KERNELS_MAX + 1] = {
-	"portable", "POPCNT", "AVX2"
+	"portable", "POPCNT", "AVX2", "AVX-512"
 };
 
 /* The most dimensions an index takes at 8K pages (lion_vec.h). */

@@ -154,7 +154,8 @@ extern void lionvec_kernels_init(void);
 #define LIONVEC_KERNELS_PORTABLE	0
 #define LIONVEC_KERNELS_POPCNT		1	/* x86-64: POPCNT for plane 1 */
 #define LIONVEC_KERNELS_AVX2		2	/* x86-64: AVX2 for all */
-#define LIONVEC_KERNELS_MAX			LIONVEC_KERNELS_AVX2
+#define LIONVEC_KERNELS_AVX512		3	/* x86-64: AVX2, plane 1 by VPOPCNTDQ */
+#define LIONVEC_KERNELS_MAX			LIONVEC_KERNELS_AVX512
 #ifdef FRONTEND
 /* the unit test's way to run each set; false if the build or the CPU lacks it */
 extern bool lionvec_kernel_force(int which);

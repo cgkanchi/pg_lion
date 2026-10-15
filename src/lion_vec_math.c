@@ -29,7 +29,8 @@
 
 /*
  * x86-64 GCC and clang build POPCNT and AVX2 kernels beside the portable
- * ones, as lion_container.c does (§3; "Kernels" below).
+ * ones, as lion_container.c does (§3), and, from GCC 8 and clang 8, which
+ * know VPOPCNTDQ, plane 1's with it ("Kernels" below).
  */
 #if !defined(LION_NO_SIMD) && defined(__x86_64__) && \
 	((defined(__clang__) && __clang_major__ >= 6) || \
@@ -37,6 +38,10 @@
 #define LIONVEC_HAVE_X86 1
 #define LIONVEC_TARGET(isa)	__attribute__((target(isa)))
 #include <immintrin.h>
+#if (defined(__clang__) && __clang_major__ >= 8) || \
+	(!defined(__clang__) && __GNUC__ >= 8)
+#define LIONVEC_HAVE_AVX512 1
+#endif
 #endif
 
 /* the portable kernel's popcount, as lion_container.c chooses it */
@@ -421,9 +426,16 @@ lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
  *			planes, each byte's popcount looked up a nibble at a time with
  *			VPSHUFB (Mula, as lion_container.c counts); the sums and the
  *			rotation four doubles or eight floats at a time
+ *	AVX-512	AVX2's, but plane 1 counted with VPOPCNTDQ, a word's four
+ *			planes in one instruction
  *
  * chosen at load (lionvec_kernels_init()) as the CPU allows, best first;
  * __builtin_cpu_supports() also checks that the OS saves the registers.
+ * AVX-512 is taken for VPOPCNTDQ alone (Ice Lake, Zen 4 and on), on
+ * 256-bit vectors: AVX-512BW's VPSHUFB counted plane 1 only a sixth faster
+ * than AVX2's, and the sums eight doubles at a time only a tenth faster,
+ * where a scan waits on the codes' cache lines more than on either, so no
+ * 512-bit instruction runs, for which some cores lower their clock.
  *
  * Every kernel returns what the portable one does, to the bit, so that a
  * scan, a build and an insert decide alike whichever runs.  Plane 1's are
@@ -775,6 +787,28 @@ lionvec_rotate_avx2(const LionVecRotation *rot, float *x)
 	}
 }
 
+#ifdef LIONVEC_HAVE_AVX512
+
+/* ---------- AVX-512 ---------- */
+
+/* AVX2's, with VPOPCNTDQ counting each plane's word whole */
+static LIONVEC_TARGET("avx512f,avx512vl,avx512vpopcntdq") uint32
+lionvec_dot_avx512(const uint64 *bits, const uint64 *planes, int nwords)
+{
+	__m256i		sum = _mm256_setzero_si256();
+	int			w;
+
+	for (w = 0; w < nwords; w++)
+	{
+		__m256i		b = _mm256_set1_epi64x((long long) bits[w]);
+		__m256i		p = _mm256_loadu_si256((const __m256i *) (planes + w * LIONVEC_QBITS));
+
+		sum = _mm256_add_epi64(sum, _mm256_popcnt_epi64(_mm256_and_si256(b, p)));
+	}
+	return lionvec_avx2_weigh(sum);
+}
+
+#endif							/* LIONVEC_HAVE_AVX512 */
 #endif							/* LIONVEC_HAVE_X86 */
 
 /* ---------- the choice ---------- */
@@ -810,6 +844,19 @@ lionvec_kernels_set(int which)
 			l2sq = lionvec_l2sq_avx2;
 			rotate = lionvec_rotate_avx2;
 			break;
+#ifdef LIONVEC_HAVE_AVX512
+		case LIONVEC_KERNELS_AVX512:
+			if (!__builtin_cpu_supports("avx2") ||
+				!__builtin_cpu_supports("avx512f") ||
+				!__builtin_cpu_supports("avx512vl") ||
+				!__builtin_cpu_supports("avx512vpopcntdq"))
+				return false;
+			dot = lionvec_dot_avx512;
+			sum8 = lionvec_sum8_avx2;
+			l2sq = lionvec_l2sq_avx2;
+			rotate = lionvec_rotate_avx2;
+			break;
+#endif
 #endif
 		default:
 			return false;
