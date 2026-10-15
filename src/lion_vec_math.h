@@ -124,15 +124,39 @@ extern void lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
 							   const float *x, double eps);
 
 /*
- * The popcount kernel of plane 1: sum over j of 2^j popcount(bits & plane j),
- * the inner product of the row's sign bits with the quantized query's codes.
+ * The kernels (DESIGN.md §44.3), chosen once by lionvec_kernels_init():
+ *
+ *	lionvec_plane_dot	sum over j of 2^j popcount(bits & plane j), the inner
+ *						product of a row's sign bits with the quantized
+ *						query's codes, over nwords words of each
+ *	lionvec_sum8		sum over i < dimsp of lionvec_recon8[codes[i]] qc[i]
+ *	lionvec_l2sq		sum over i < dimsp of (a[i] - b[i])^2
+ *
+ * and the rotation's, inside lionvec_rotate().  The sums are in double, in
+ * LIONVEC_LANES partial sums - the i-th term into partial i % LIONVEC_LANES
+ * - added up in a fixed order, which every kernel keeps: each returns what
+ * the portable one does, to the bit, as do the rotation's (lion_vec_math.c,
+ * "Kernels").  dimsp is a multiple of 64.
  */
+#define LIONVEC_LANES			16
+
 typedef uint32 (*LionVecDotKernel) (const uint64 *bits, const uint64 *planes,
 									int nwords);
+typedef double (*LionVecSum8Kernel) (const uint8 *codes, const float *qc,
+									 int dimsp);
+typedef double (*LionVecL2Kernel) (const float *a, const float *b, int dimsp);
 extern LionVecDotKernel lionvec_plane_dot;
+extern LionVecSum8Kernel lionvec_sum8;
+extern LionVecL2Kernel lionvec_l2sq;
 extern void lionvec_kernels_init(void);
+
+/* the sets of kernels, as the unit test forces them */
+#define LIONVEC_KERNELS_PORTABLE	0
+#define LIONVEC_KERNELS_POPCNT		1	/* x86-64: POPCNT for plane 1 */
+#define LIONVEC_KERNELS_AVX2		2	/* x86-64: AVX2 for all */
+#define LIONVEC_KERNELS_MAX			LIONVEC_KERNELS_AVX2
 #ifdef FRONTEND
-/* the unit test's way to run each kernel: 0 portable, 1 POPCNT; false if absent */
+/* the unit test's way to run each set; false if the build or the CPU lacks it */
 extern bool lionvec_kernel_force(int which);
 #endif
 

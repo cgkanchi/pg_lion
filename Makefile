@@ -54,8 +54,16 @@ endif
 ifeq ($(LION_NO_SIMD),1)
 PG_CFLAGS += -DLION_NO_SIMD
 endif
+# lionvec's arithmetic is compiled without fused multiply-adds, which GCC
+# and clang would otherwise make of a multiply and an add wherever the target
+# has them - aarch64, an x86-64 baseline such as x86-64-v3 - so that it rounds
+# as written everywhere and its kernels agree to the bit (DESIGN.md §44.3,
+# "Kernels"); the unit tests compile it so too.
+VEC_MATH_CFLAGS = -ffp-contract=off
+src/lion_vec_math.o: override CFLAGS += $(VEC_MATH_CFLAGS)
+src/lion_vec_math.bc: override BITCODE_CFLAGS += $(VEC_MATH_CFLAGS)
 EXTRA_CLEAN = test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
-              test/unit/waldelta_test test/unit/entry_test test/unit/vec_test \
+              test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd \
               test/results test/isolation/results
 
 PG_CONFIG ?= $(if $(wildcard .local/pg/bin/pg_config),.local/pg/bin/pg_config,pg_config)
@@ -110,7 +118,7 @@ ifeq ($(SANITIZE),1)
 UNIT_CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
 UNIT_LDFLAGS += -fsanitize=address,undefined
 test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
-    test/unit/waldelta_test test/unit/entry_test test/unit/vec_test: .lion-force-unit
+    test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd: .lion-force-unit
 .PHONY: .lion-force-unit
 endif
 
@@ -144,13 +152,17 @@ test/unit/entry_test: test/unit/entry_test.c src/lion_entryfmt.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/entry_test.c $(UNIT_LDFLAGS)
 
 # lionvec's arithmetic (DESIGN.md §44.3 - §44.4): the rotation, the codes, the
-# popcount kernels and how often the estimates' bounds hold.
+# kernels and how often the estimates' bounds hold; and the same without the
+# x86-64 kernels, as container_test_nosimd is built.
 test/unit/vec_test: test/unit/vec_test.c src/lion_vec_math.c src/lion_vec_math.h
-	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/vec_test.c src/lion_vec_math.c $(UNIT_LDFLAGS)
+	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) -o $@ test/unit/vec_test.c src/lion_vec_math.c $(UNIT_LDFLAGS)
+
+test/unit/vec_test_nosimd: test/unit/vec_test.c src/lion_vec_math.c src/lion_vec_math.h
+	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) $(UNIT_NOSIMD_CFLAGS) -o $@ test/unit/vec_test.c src/lion_vec_math.c $(UNIT_LDFLAGS)
 
 .PHONY: unit
 unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
-      test/unit/waldelta_test test/unit/entry_test test/unit/vec_test
+      test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd
 	./test/unit/container_test
 	./test/unit/container_test_nosimd
 	./test/unit/sparse_test
@@ -158,6 +170,7 @@ unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_
 	./test/unit/waldelta_test
 	./test/unit/entry_test
 	./test/unit/vec_test
+	./test/unit/vec_test_nosimd
 
 # header deps (the PostgreSQL build we compile against was not configured with --enable-depend)
 # (every header lion.h includes, and each of the others' includers; a missing
