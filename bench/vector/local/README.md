@@ -14,10 +14,17 @@ bench/vector/local/setup.sh      # once: packages, pg_lion, venv, the cluster (a
 bench/vector/local/run.sh        # everything; resumes where it stopped if interrupted
 ```
 
+`setup.sh` uses the PostgreSQL 18 already installed: apt.postgresql.org's
+(`/usr/lib/postgresql/18`) or the one whose `pg_config` is on `PATH`. For a source build elsewhere,
+`PG_CONFIG=/path/to/bin/pg_config bench/vector/local/setup.sh` (and the same `PG_CONFIG` for
+`run.sh`). It adds pgvector and VectorChord to it and leaves its version and its own cluster alone.
+Only with `INSTALL_PG=1` does it install PostgreSQL itself. Stopping your own cluster during the
+run frees its memory (`sudo service postgresql stop`, or `pg_ctl stop` for a source build).
+
 Results land in `bench/results/<date>-dbpedia-local-1000k/`: `lionvec.json` and
-`vchord-l1000.json` (warm),
-`cold.json`, `tables.md` (recall against server time, and the cold table), `machine.txt` (CPU,
-RAM, disk, PostgreSQL settings) and `sizes.txt`. Logs are in `~/lionbench/logs/`.
+`vchord-l1000.json` (warm), `cold.json`, `tables.md` (recall against server time, and the cold
+table), `machine.txt` (CPU, RAM, disk, PostgreSQL settings) and `sizes.txt`. Logs are in
+`~/lionbench/logs/`.
 
 ## Before the first run, under WSL
 
@@ -45,10 +52,11 @@ RAM, disk, PostgreSQL settings) and `sizes.txt`. Logs are in `~/lionbench/logs/`
 
 ## What it does
 
-`setup.sh` installs PostgreSQL 18, its headers and pgvector from apt.postgresql.org (VectorChord
-needs pgvector's types) and VectorChord 1.1.1's `.deb` from its GitHub release (`WITH_DISKANN=1`
-also installs pgvectorscale from Timescale's apt repository). It builds and installs pg_lion from
-this checkout, makes a venv in `~/lionbench/venv`, and creates the benchmark's own cluster in
+`setup.sh` adds pgvector (VectorChord needs its types) and VectorChord 1.1.1 to that PostgreSQL:
+for an apt.postgresql.org install, `postgresql-18-pgvector` and VectorChord's release `.deb`; for
+any other, pgvector 0.8.1 built from source and the `.deb`'s files copied into its directories.
+`WITH_DISKANN=1` also installs pgvectorscale from Timescale's apt repository. It builds and
+installs pg_lion from this checkout, makes a venv in `~/lionbench/venv`, and creates the benchmark's own cluster in
 `~/lionbench/pgdata` (port 55440, socket in `~/lionbench/sock`; it does not touch `dev.sh`'s
 cluster or any system cluster). The cluster takes the project's standing settings
 (`random_page_cost` 1.1, `effective_io_concurrency` and `maintenance_io_concurrency` 200,
