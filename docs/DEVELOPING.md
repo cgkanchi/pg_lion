@@ -26,11 +26,12 @@ and by those specs on the newer majors, not by a test on that major.
                                                           # lionvec's arithmetic; no server
 
 No `-march` is needed for speed: on x86-64, GCC and clang builds carry AVX2 and POPCNT versions of
-the container library's passes over whole bitsets, compiled with target attributes, and pick one at
-run time by what the CPU has; other targets and compilers get a portable one, and `make
-LION_NO_SIMD=1` leaves the x86-64 ones out (DESIGN.md §3, "Whole-bitset kernels").  `make unit` runs
-the container tests against each version the CPU has, and once more built without the x86-64 ones
-(`test/unit/container_test_nosimd`).
+the container library's passes over whole bitsets, and AVX-512 (VPOPCNTDQ), AVX2 and POPCNT ones of
+lionvec's kernels, compiled with target attributes, and pick one at run time by what the CPU has;
+other targets and compilers get a portable one, and `make LION_NO_SIMD=1` leaves the x86-64 ones out
+(DESIGN.md §3, "Whole-bitset kernels"; §44.3, "Kernels").  `make unit` runs the container and
+lionvec tests against each version the CPU has, and once more built without the x86-64 ones
+(`test/unit/container_test_nosimd`, `test/unit/vec_test_nosimd`).
 
 Lion logs through one of two WAL resource managers (DESIGN.md §25), chosen per index at
 CREATE INDEX, so the suite has to pass in both:
@@ -163,6 +164,6 @@ the suite as they are in production.
                             LionOrdered uses to restrict its scan to a lion set
     src/lion_vec_scan.c     its scan: passes over the 1-bit codes, the lazy queue of bounds, refines and
                             exact distances
-    src/lion_vec_math.[ch]  its rotation, bit-plane codes, popcount kernels and error bounds, frontend-safe and
+    src/lion_vec_math.[ch]  its rotation, bit-plane codes, kernels and error bounds, frontend-safe and
                             unit-tested standalone (test/unit/vec_test.c)
     test/sql, test/isolation, test/unit, test/recovery, test/modules
