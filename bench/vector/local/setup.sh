@@ -2,7 +2,11 @@
 # One-time setup on an Ubuntu or Debian machine (WSL2 included): PostgreSQL 18
 # and pgvector from apt.postgresql.org, VectorChord's .deb from its GitHub
 # release, pg_lion built from this checkout, a Python venv, a sudo rule so cold
-# runs can drop the page cache, and the cluster (pg.sh init).  WITH_DISKANN=1
+# runs can drop the page cache, and the cluster (pg.sh init).  A PostgreSQL 18
+# already installed is used as it is (env.sh finds it; PG_CONFIG names one it
+# does not): pgvector and VectorChord go into it, and it is not upgraded, nor
+# is its own cluster touched (the benchmark runs a cluster of its own).
+# WITH_DISKANN=1
 # also installs pgvectorscale from Timescale's apt repository, for
 # KINDS="... diskann".
 # Asks for sudo.  Safe to run again.
@@ -28,28 +32,86 @@ fi
 need=$(( NSHARDS * 60 / 26 + 10 ))
 [ "$free_gb" -lt "$need" ] && warn "about ${need} GB of disk is needed for $NSHARDS shards; ${free_gb} GB free"
 
+# into a directory of the PostgreSQL installation: as this user where it
+# can write there (an install of its own), else with sudo
+as_owner() { local d=$1; shift; if [ -w "$d" ]; then "$@"; else sudo "$@"; fi; }
+
 say "packages"
 sudo apt-get update -q
-sudo apt-get install -y -q curl ca-certificates gnupg lsb-release build-essential python3-venv postgresql-common
-# no auto-created 'main' cluster: the benchmark runs its own
-sudo mkdir -p /etc/postgresql-common/createcluster.d
-echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/lionbench-no-main.conf >/dev/null
-[ -e /etc/apt/sources.list.d/pgdg.list ] || [ -e /etc/apt/sources.list.d/pgdg.sources ] ||
-	sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-sudo apt-get install -y -q "postgresql-$PG_MAJOR" "postgresql-server-dev-$PG_MAJOR" "postgresql-$PG_MAJOR-pgvector"
+sudo apt-get install -y -q curl ca-certificates gnupg lsb-release build-essential git python3-venv postgresql-common
+# APT: PostgreSQL is apt.postgresql.org's (/usr/lib/postgresql/N), so its
+# server-dev and pgvector packages fit it
+APT=0; case "$PG_BIN" in /usr/lib/postgresql/*) APT=1 ;; esac
+if [ -x "$PG_BIN/postgres" ]; then
+	echo "using the PostgreSQL already installed: $("$PG_BIN/postgres" --version) in $PG_BIN"
+	"$PG_BIN/postgres" --version | grep -q "PostgreSQL) $PG_MAJOR\." ||
+		warn "that is not PostgreSQL $PG_MAJOR (PG_MAJOR=$PG_MAJOR); the results record which it was"
+	if [ ! -x "$PG_BIN/pg_config" ] || [ ! -e "$("$PG_BIN/pg_config" --pgxs)" ]; then
+		if [ $APT = 1 ]; then
+			sudo apt-get install -y -q "postgresql-server-dev-$PG_MAJOR"
+		else
+			warn "no pg_config with PGXS in $PG_BIN: install the server headers, or set PG_CONFIG"; exit 1
+		fi
+	fi
+elif [ "${INSTALL_PG:-0}" != 1 ]; then
+	warn "no PostgreSQL $PG_MAJOR found in $PG_BIN or through the pg_config on PATH."
+	warn "  Point at yours with PG_CONFIG=/path/to/bin/pg_config $0,"
+	warn "  or install one from apt.postgresql.org with INSTALL_PG=1 $0."
+	exit 1
+else
+	echo "installing PostgreSQL $PG_MAJOR from apt.postgresql.org"
+	# no auto-created 'main' cluster: the benchmark runs its own
+	sudo mkdir -p /etc/postgresql-common/createcluster.d
+	echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/lionbench-no-main.conf >/dev/null
+	[ -e /etc/apt/sources.list.d/pgdg.list ] || [ -e /etc/apt/sources.list.d/pgdg.sources ] ||
+		sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+	sudo apt-get install -y -q "postgresql-$PG_MAJOR" "postgresql-server-dev-$PG_MAJOR"
+	APT=1
+fi
+PG_CONFIG=$PG_BIN/pg_config
+LIBDIR=$("$PG_CONFIG" --pkglibdir)
+EXTDIR=$("$PG_CONFIG" --sharedir)/extension
+
+say "pgvector"
+if [ -e "$EXTDIR/vector.control" ]; then
+	echo "already installed: $(grep default_version "$EXTDIR/vector.control")"
+elif [ $APT = 1 ]; then
+	sudo apt-get install -y -q "postgresql-$PG_MAJOR-pgvector"
+else
+	# built from source against this installation
+	src=$BENCH_DIR/src/pgvector
+	[ -d "$src" ] || git clone -q --depth 1 --branch "v${PGVECTOR_VERSION:-0.8.1}" https://github.com/pgvector/pgvector "$src"
+	make -C "$src" -j"$(nproc)" PG_CONFIG="$PG_CONFIG" >/dev/null
+	as_owner "$LIBDIR" make -C "$src" install PG_CONFIG="$PG_CONFIG" >/dev/null
+	echo "built and installed pgvector ${PGVECTOR_VERSION:-0.8.1}"
+fi
 
 say "VectorChord $VCHORD_VERSION"
-if [ -e "$("$PG_BIN/pg_config" --pkglibdir)/vchord.so" ]; then
+if [ -e "$LIBDIR/vchord.so" ]; then
 	echo "already installed"
 else
 	deb="postgresql-$PG_MAJOR-vchord_${VCHORD_VERSION}-1_$(dpkg --print-architecture).deb"
 	curl -fL --retry 3 -o "/tmp/$deb" "https://github.com/tensorchord/VectorChord/releases/download/$VCHORD_VERSION/$deb" ||
 		{ warn "could not download $deb (VCHORD_VERSION picks another release)"; exit 1; }
-	sudo apt-get install -y -q "/tmp/$deb"
+	if [ $APT = 1 ]; then
+		sudo apt-get install -y -q "/tmp/$deb"
+	else
+		# the package's files copied into this installation, as the earlier
+		# runs on a source-built 18.6 did (the package itself would pull in
+		# apt's postgresql-18)
+		x=$(mktemp -d)
+		dpkg-deb -x "/tmp/$deb" "$x"
+		sl=; [ -w "$LIBDIR" ] || sl=sudo
+		se=; [ -w "$EXTDIR" ] || se=sudo
+		find "$x" -name 'vchord*.so' -exec $sl cp {} "$LIBDIR/" \;
+		find "$x" -path '*/extension/vchord*' -exec $se cp {} "$EXTDIR/" \;
+		[ -e "$LIBDIR/vchord.so" ] || { warn "$deb held no vchord.so"; exit 1; }
+		echo "copied VectorChord $VCHORD_VERSION into $LIBDIR and $EXTDIR"
+	fi
 fi
 
 say "pgvectorscale (diskann)"
-if [ -e "$("$PG_BIN/pg_config" --sharedir)/extension/vectorscale.control" ]; then
+if [ -e "$EXTDIR/vectorscale.control" ]; then
 	echo "already installed"
 elif [ "${WITH_DISKANN:-0}" != 1 ]; then
 	echo "skipped (WITH_DISKANN=1 to install it)"
@@ -70,8 +132,8 @@ else
 fi
 
 say "pg_lion from $REPO"
-make -C "$REPO" -j"$(nproc)" PG_CONFIG="$PG_BIN/pg_config" >/dev/null
-sudo make -C "$REPO" install PG_CONFIG="$PG_BIN/pg_config" >/dev/null
+make -C "$REPO" -j"$(nproc)" PG_CONFIG="$PG_CONFIG" >/dev/null
+as_owner "$LIBDIR" make -C "$REPO" install PG_CONFIG="$PG_CONFIG" >/dev/null
 echo "installed pg_lion $(git -C "$REPO" rev-parse --short HEAD)"
 
 say "Python"
