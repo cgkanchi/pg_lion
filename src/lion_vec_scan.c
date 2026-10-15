@@ -1607,8 +1607,13 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 		return;
 	}
 
-	v = lionvec_datum_floats(ob->sk_argument, &dim, &tofree);
-	so->query = tofree != NULL ? PointerGetDatum(tofree) : ob->sk_argument;
+	/*
+	 * Detoasted once, for the operator's function at every exact distance;
+	 * a halfvec's floats are converted into an array of their own.  Both
+	 * are in qcxt, which the next rescan resets.
+	 */
+	so->query = PointerGetDatum(PG_DETOAST_DATUM(ob->sk_argument));
+	v = lionvec_datum_floats(so->query, so->info->half, NULL, 0, &dim, &tofree);
 	if (so->info->dims == 0)
 	{
 		/* no vector indexed yet: only NULLs to return */
@@ -1620,8 +1625,8 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 	if (dim != so->info->dims)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
-				 errmsg("different vector dimensions %d and %d",
-						so->info->dims, dim)));
+				 errmsg("different %s dimensions %d and %d",
+						lionvec_type_name(so->info->half), so->info->dims, dim)));
 
 	x = palloc(sizeof(float) * so->info->dimsp);
 	if (!lionvec_prepare(&so->info->rot, so->metric, v, dim, x))

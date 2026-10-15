@@ -2,7 +2,8 @@
  *
  * lion_vec.h
  *		lionvec: a nearest-neighbour index access method for pgvector's
- *		`vector` type, shipped beside lion (DESIGN.md section 44).
+ *		`vector` and `halfvec` types, shipped beside lion (DESIGN.md
+ *		section 44).
  *
  *		Every vector is rotated by a fixed random rotation, centred on the
  *		table's mean and quantized into eight nested bit-planes.  The rows
@@ -194,12 +195,20 @@ typedef struct LionVecPart
 typedef struct LionVecInfo
 {
 	int			metric;
+	bool		half;			/* the column is a halfvec, not a vector */
 	int			dims;			/* 0: no vector indexed yet */
 	int			dimsp;
 	uint32		seed;
 	LionVecRotation rot;		/* its signs follow this struct */
 	float	   *mean;			/* [dimsp], rotated; NULL when zero */
 } LionVecInfo;
+
+/* the column's type, as pgvector's errors name it */
+static inline const char *
+lionvec_type_name(bool half)
+{
+	return half ? "halfvec" : "vector";
+}
 
 /*
  * The container key of a heap TID, as lion's sets are keyed (lion_tid.h),
@@ -263,7 +272,8 @@ extern int	lionvec_exact_rows;
 /* lion_vec.c */
 extern void lion_vec_init(void);
 extern LionVecInfo *lionvec_get_info(Relation index);
-extern const float *lionvec_datum_floats(Datum d, int *dim, Pointer *tofree);
+extern const float *lionvec_datum_floats(Datum d, bool half, float *buf,
+										 int bufdim, int *dim, Pointer *tofree);
 extern void lionvec_check_dims(const LionVecInfo *info, int dim);
 extern void lionvec_read_meta(Relation index, LionVecMetaData *meta);
 extern void lionvec_check_page(Relation index, Page page, BlockNumber blk,

@@ -121,7 +121,9 @@ BUILT = re.compile(r'lionvec index "[^"]*": (\d+) partitions from a sample of (\
                    r'(\d+) k-means iterations')
 EXEC = re.compile(r'Execution Time: ([\d.]+) ms')
 DISTANCES = ('l2_distance(vector, vector)', 'vector_negative_inner_product(vector, vector)',
-             'cosine_distance(vector, vector)')
+             'cosine_distance(vector, vector)',
+             'l2_distance(halfvec, halfvec)', 'halfvec_negative_inner_product(halfvec, halfvec)',
+             'cosine_distance(halfvec, halfvec)')
 
 
 def connect(dsn=DSN):

@@ -29,6 +29,10 @@
  *	  as four more bit-planes, so that the inner product is popcounts of
  *	  ANDs; the rounding adds Delta^2 / 12 to the variance, Delta the step.
  *
+ *	  A vector comes from pgvector's `vector`, whose elements are floats, or
+ *	  its `halfvec`, whose elements are IEEE 754 binary16 halves and are
+ *	  converted to floats as they are read; everything after that is the same.
+ *
  *	  Frontend-safe (c.h and libpgcommon only), so that test/unit/vec_test.c
  *	  can check it without a server.
  *-------------------------------------------------------------------------
@@ -60,6 +64,37 @@
 
 /* dims padded to whole 64-bit words */
 #define LIONVEC_PADDED(dims)	((((dims) + 63) / 64) * 64)
+
+/*
+ * pgvector's `vector` and `halfvec`, as they lay their datums out: a
+ * varlena of a 16-bit dimension count, 16 unused bits and the elements,
+ * floats or halves (IEEE 754 binary16, which lionvec_halves() converts).
+ * pg_lion reads them here rather than linking pgvector, so that pg_lion
+ * itself loads without pgvector.
+ */
+typedef struct LionVecPgVector
+{
+	int32		vl_len_;
+	int16		dim;
+	int16		unused;
+	float		x[FLEXIBLE_ARRAY_MEMBER];
+} LionVecPgVector;
+
+typedef struct LionVecPgHalfVector
+{
+	int32		vl_len_;
+	int16		dim;
+	int16		unused;
+	uint16		x[FLEXIBLE_ARRAY_MEMBER];
+} LionVecPgHalfVector;
+
+/*
+ * The dimension count of a detoasted `vector` datum, or of a `halfvec` one
+ * if half, of len bytes at p, its varlena header included; or -1 if those
+ * bytes cannot be one: fewer than the header, a negative count, or fewer
+ * than the count's elements take.
+ */
+extern int	lionvec_datum_dim(const void *p, Size len, bool half);
 
 typedef struct LionVecRotation
 {
@@ -131,12 +166,15 @@ extern void lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
  *						query's codes, over nwords words of each
  *	lionvec_sum8		sum over i < dimsp of lionvec_recon8[codes[i]] qc[i]
  *	lionvec_l2sq		sum over i < dimsp of (a[i] - b[i])^2
+ *	lionvec_halves		x[i] = the float of the half h[i], i < n: a halfvec's
+ *						elements, exactly, a NaN as the quiet NaN of its
+ *						payload
  *
  * and the rotation's, inside lionvec_rotate().  The sums are in double, in
  * LIONVEC_LANES partial sums - the i-th term into partial i % LIONVEC_LANES
  * - added up in a fixed order, which every kernel keeps: each returns what
- * the portable one does, to the bit, as do the rotation's (lion_vec_math.c,
- * "Kernels").  dimsp is a multiple of 64.
+ * the portable one does, to the bit, as do the rotation's and the halves'
+ * (lion_vec_math.c, "Kernels").  dimsp is a multiple of 64.
  */
 #define LIONVEC_LANES			16
 
@@ -145,20 +183,25 @@ typedef uint32 (*LionVecDotKernel) (const uint64 *bits, const uint64 *planes,
 typedef double (*LionVecSum8Kernel) (const uint8 *codes, const float *qc,
 									 int dimsp);
 typedef double (*LionVecL2Kernel) (const float *a, const float *b, int dimsp);
+typedef void (*LionVecHalfKernel) (const uint16 *h, int n, float *x);
 extern LionVecDotKernel lionvec_plane_dot;
 extern LionVecSum8Kernel lionvec_sum8;
 extern LionVecL2Kernel lionvec_l2sq;
+extern LionVecHalfKernel lionvec_halves;
 extern void lionvec_kernels_init(void);
 
 /* the sets of kernels, as the unit test forces them */
 #define LIONVEC_KERNELS_PORTABLE	0
 #define LIONVEC_KERNELS_POPCNT		1	/* x86-64: POPCNT for plane 1 */
-#define LIONVEC_KERNELS_AVX2		2	/* x86-64: AVX2 for all */
+#define LIONVEC_KERNELS_AVX2		2	/* x86-64: AVX2 for all; halves by
+										 * F16C where the CPU has it */
 #define LIONVEC_KERNELS_AVX512		3	/* x86-64: AVX2, plane 1 by VPOPCNTDQ */
 #define LIONVEC_KERNELS_MAX			LIONVEC_KERNELS_AVX512
 #ifdef FRONTEND
 /* the unit test's way to run each set; false if the build or the CPU lacks it */
 extern bool lionvec_kernel_force(int which);
+/* ... and whether the set it forced converts halves with F16C */
+extern bool lionvec_kernel_f16c(void);
 #endif
 
 extern void lionvec_estimate1(const LionVecQuery *q, const uint64 *bits,

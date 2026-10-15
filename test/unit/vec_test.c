@@ -21,6 +21,12 @@
  *		portable one's, to the bit, at every dimsp an index takes and from
  *		unaligned pointers; and end to end, the same rotations, estimates and
  *		k-means as the portable set's;
+ *	  - a halfvec's halves: the portable conversion of each of the 65,536
+ *		against its value computed in double from its sign, exponent and
+ *		mantissa, a NaN a quiet NaN of its payload; every set's (F16C where
+ *		the CPU has it) against the portable one's to the bit, NaNs
+ *		included, at every length of a tail and every alignment; and the
+ *		bounds a vector or halfvec datum is checked against;
  *	  - the key algebra: with the exact inner product and no error, the
  *		bounds ARE the key of the distance computed the obvious way, for each
  *		metric - which is the proof that centring, the mean's terms, cosine's
@@ -835,6 +841,198 @@ test_kernels(void)
 	 */
 	for (draws = 0; draws < 2 * 107 * 693; draws++)
 		(void) rnd64();
+}
+
+/* ---------- a halfvec's halves, and pgvector's datums ---------- */
+
+/*
+ * The value of the half h, from its fields, in double: what lionvec_halves()
+ * must give, stated apart from it.
+ */
+static double
+half_reference(uint16 h)
+{
+	int			sign = h >> 15;
+	int			e = (h >> 10) & 0x1f;
+	int			m = h & 0x3ff;
+	double		v;
+
+	if (e == 31)
+		v = m == 0 ? INFINITY : NAN;
+	else if (e == 0)
+		v = ldexp((double) m, -24);	/* subnormal: m 2^-10 of 2^-14 */
+	else
+		v = ldexp(1.0 + (double) m / 1024.0, e - 15);
+	return sign ? -v : v;
+}
+
+
+/*
+ * Every half converted: the portable kernel against half_reference(), bit
+ * for bit but any NaN for a NaN, and its NaNs quiet with their payloads;
+ * then every set's kernel against the portable one's, bit for bit, NaNs
+ * included - once over all 65,536 in one array, which F16C converts eight
+ * at a time, and at every length from 0 to 40 from every alignment of
+ * eight, which ends in a tail, into exact-size buffers and no further.
+ */
+static void
+test_halves(void)
+{
+	uint16	   *h = (uint16 *) xmalloc(sizeof(uint16) * 65536);
+	float	   *port = falloc(65536);
+	float	   *x = falloc(65536);
+	bool		ok = true;
+	bool		quiet = true;
+	int			nnan = 0;
+	int			which;
+	int			ran = 0;
+	char		names[160] = "";
+	int			i;
+
+	cur_phase = "halves";
+	for (i = 0; i < 65536; i++)
+		h[i] = (uint16) i;
+
+	lionvec_kernel_force(LIONVEC_KERNELS_PORTABLE);
+	lionvec_halves(h, 65536, port);
+	for (i = 0; i < 65536; i++)
+	{
+		float		r = (float) half_reference(h[i]);
+		uint32		bits;
+
+		memcpy(&bits, &port[i], sizeof(bits));
+		if (isnan(r))
+		{
+			nnan++;
+			ok &= isnan(port[i]);
+			/* the quiet bit, and the payload, at the top of the mantissa */
+			quiet &= bits == (((uint32) (h[i] & 0x8000) << 16) | 0x7fc00000 |
+							  ((uint32) (h[i] & 0x3ff) << 13));
+		}
+		else
+			ok &= memcmp(&r, &port[i], sizeof(float)) == 0;
+	}
+	CHECK(ok, "a half's float is not its value");
+	CHECK(nnan == 2 * 1023, "not every NaN half was taken for one");
+	CHECK(quiet, "a NaN half's float is not the quiet NaN of its payload");
+	CHECK(port[0x0001] == 5.9604644775390625e-8f && port[0x8000] == 0.0f &&
+		  signbit(port[0x8000]) && port[0x7bff] == 65504.0f &&
+		  port[0x0400] == 6.103515625e-5f && port[0x03ff] < port[0x0400] &&
+		  isinf(port[0xfc00]) && port[0xfc00] < 0,
+		  "a landmark half's float");
+
+	for (which = 0; which <= LIONVEC_KERNELS_MAX; which++)
+	{
+		bool		same = true;
+		bool		tails = true;
+		uint32		k = 0;
+		int			off;
+		int			n;
+
+		if (!lionvec_kernel_force(which))
+			continue;
+		ran++;
+		snprintf(names + strlen(names), sizeof(names) - strlen(names), "%s%s%s",
+				 ran > 1 ? ", " : "", kernel_names[which],
+				 lionvec_kernel_f16c() ? " (F16C)" : "");
+
+		memset(x, 0, sizeof(float) * 65536);
+		lionvec_halves(h, 65536, x);
+		same &= memcmp(x, port, sizeof(float) * 65536) == 0;
+
+		for (off = 0; off < 8; off++)
+		{
+			for (n = 0; n <= 40; n++)
+			{
+				uint16	   *src = (uint16 *) xmalloc(sizeof(uint16) * (off + n));
+				float	   *dst = falloc(off + n + 1);
+				const float sentinel = 1234.5f;
+
+				for (i = 0; i < n; i++)
+					src[off + i] = (uint16) ((++k * 0x9E3779B1u) >> 16);
+				dst[off + n] = sentinel;
+				lionvec_halves(src + off, n, dst + off);
+				for (i = 0; i < n; i++)
+					tails &= memcmp(&dst[off + i], &port[src[off + i]], sizeof(float)) == 0;
+				tails &= memcmp(&dst[off + n], &sentinel, sizeof(float)) == 0;
+				free(src);
+				free(dst);
+			}
+		}
+		CHECK(same, "a set converts the halves other than the portable kernel");
+		CHECK(tails, "a set converts a short or unaligned run of halves wrong");
+	}
+	CHECK(ran >= 1, "no kernel ran");
+	printf("vec_test: halves converted by the sets: %s\n", names);
+	lionvec_kernels_init();
+
+	free(x);
+	free(port);
+	free(h);
+}
+
+/*
+ * lionvec_datum_dim(): the bytes a vector or halfvec datum must have - its
+ * header, a count no less than zero, and the count's elements - from
+ * exact-size buffers, so that `make unit SANITIZE=1` would see the count
+ * read from a datum too short to hold it.
+ */
+static int
+datum_dim(Size len, int16 dim, bool half)
+{
+	char	   *p = (char *) xmalloc(len);
+	int			got;
+
+	if (len >= offsetof(LionVecPgVector, x))
+	{
+		LionVecPgVector hdr;
+
+		memset(&hdr, 0, sizeof(hdr));
+		hdr.dim = dim;
+		memcpy(p, &hdr, offsetof(LionVecPgVector, x));
+		memset(p + offsetof(LionVecPgVector, x), 0x3c,
+			   len - offsetof(LionVecPgVector, x));
+	}
+	else
+		memset(p, 0, len);
+	got = lionvec_datum_dim(p, len, half);
+	free(p);
+	return got;
+}
+
+static void
+test_datums(void)
+{
+	bool		ok = true;
+	Size		len;
+
+	cur_phase = "datums";
+	CHECK(offsetof(LionVecPgVector, x) == 8 && offsetof(LionVecPgHalfVector, x) == 8 &&
+		  offsetof(LionVecPgVector, dim) == 4 && offsetof(LionVecPgHalfVector, dim) == 4,
+		  "pgvector's header is not as it lays it out");
+
+	/* shorter than the header: never read */
+	for (len = 0; len < 8; len++)
+		ok &= datum_dim(len, 0, false) == -1 && datum_dim(len, 0, true) == -1;
+	CHECK(ok, "a datum shorter than its header is taken for one");
+
+	CHECK(datum_dim(8, 0, false) == 0 && datum_dim(8, 0, true) == 0,
+		  "a header alone is not a datum of no dimensions");
+	CHECK(datum_dim(8 + 4 * 3, 3, false) == 3 && datum_dim(8 + 4 * 3 - 1, 3, false) == -1 &&
+		  datum_dim(8 + 4 * 3 + 4, 3, false) == 3,
+		  "a vector's length against its count");
+	CHECK(datum_dim(8 + 2 * 3, 3, true) == 3 && datum_dim(8 + 2 * 3 - 1, 3, true) == -1 &&
+		  datum_dim(8 + 2 * 3, 3, false) == -1,
+		  "a halfvec's length against its count");
+	CHECK(datum_dim(8 + 2 * 16000, 16000, true) == 16000 &&
+		  datum_dim(8 + 4 * 16000, 16000, false) == 16000 &&
+		  datum_dim(8 + 4 * 16000 - 1, 16000, false) == -1,
+		  "pgvector's most dimensions");
+	CHECK(datum_dim(64, -1, false) == -1 && datum_dim(64, -1, true) == -1 &&
+		  datum_dim(64, PG_INT16_MIN, true) == -1,
+		  "a negative count is taken");
+	CHECK(datum_dim(64, PG_INT16_MAX, false) == -1 && datum_dim(64, PG_INT16_MAX, true) == -1,
+		  "a count beyond the bytes is taken");
 }
 
 /* ---------- the key algebra, and the bounds' coverage ---------- */
@@ -2453,6 +2651,8 @@ main(void)
 	test_encode();
 	test_query();
 	test_kernels();
+	test_halves();
+	test_datums();
 	test_bounds_nan();
 	test_lift();
 	test_candidates();

@@ -22,8 +22,9 @@ CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_
 # share the private header src/lion_funcs.h.
 FUNCS_OBJS = src/lion_funcs.o src/lion_verify.o src/lion_verify_dir.o src/lion_verify_heap.o \
        src/lion_verify_summary.o
-# lionvec, the nearest-neighbour index of pgvector's `vector` (DESIGN.md §44):
-# the AM, its scan, and its arithmetic, which is unit-tested standalone.
+# lionvec, the nearest-neighbour index of pgvector's `vector` and `halfvec`
+# (DESIGN.md §44): the AM, its scan, and its arithmetic, which is unit-tested
+# standalone.
 VEC_OBJS = src/lion_vec.o src/lion_vec_scan.o src/lion_vec_math.o
 OBJS = src/lion_container.o src/lion_sparse.o src/lion_positions.o src/lion_wal.o src/lion_waldelta.o $(PAGES_OBJS) src/lion_dir.o src/lion_posting.o src/lion_postree.o src/lion_posbuild.o src/lion_posfilter.o src/lion_bm25.o src/lion_bm25_scan.o src/lion_reader.o \
        src/lion_am.o src/lion_amcost.o src/lion_build.o src/lion_spool.o src/lion_scan.o \

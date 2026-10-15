@@ -28,12 +28,15 @@ SET max_parallel_workers_per_gather = 0;
 SELECT opcname, amvalidate(c.oid)
   FROM pg_opclass c JOIN pg_am a ON a.oid = c.opcmethod
  WHERE a.amname = 'lionvec' ORDER BY opcname;
-      opcname      | amvalidate 
--------------------+------------
- vector_cosine_ops | t
- vector_ip_ops     | t
- vector_l2_ops     | t
-(3 rows)
+      opcname       | amvalidate 
+--------------------+------------
+ halfvec_cosine_ops | t
+ halfvec_ip_ops     | t
+ halfvec_l2_ops     | t
+ vector_cosine_ops  | t
+ vector_ip_ops      | t
+ vector_l2_ops      | t
+(6 rows)
 
 /*
  * vt_vec() is a pseudo-random vector of n coordinates in (-scale, scale),

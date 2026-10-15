@@ -20164,16 +20164,40 @@ The access method lives in pg_lion's library, which reads pgvector's on-disk `ve
 varlena of an int16 dimension count, two unused bytes and the floats: `LionVecPgVector`) and calls
 pgvector's distance functions only through the operator class, so pg_lion loads, and its tests
 run, without pgvector. A separate extension, `pg_lion_vector` (`requires = 'pg_lion, vector'`),
-creates the AM and three operator classes - `vector_l2_ops` (the default), `vector_ip_ops` and
-`vector_cosine_ops` - each ONE ORDER BY operator, whose strategy number (1, 2, 3) is the index's
-metric; pgvector's objects are named through `@extschema:vector@`. The rest of pg_lion sees four
-functions (lion_vec.h): `lion_vec_index()` and `lion_vec_relation()`, which tell a lionvec index by
-its own routines (`amcostestimate`, `ambeginscan`), not its name, so that an AM of that name another
-handler serves is never taken for one; `lion_vec_restrict()`; and `lion_vec_scan_cost()`. The
-changes to lion's own code are `_PG_init()` calling `lion_vec_init()` (the settings, the 8-bit
-tables, the kernels) and LionOrdered's (§44.6).
+creates the AM and three operator classes for `vector` - `vector_l2_ops` (the default),
+`vector_ip_ops` and `vector_cosine_ops` - each ONE ORDER BY operator, whose strategy number (1,
+2, 3) is the index's metric; pgvector's objects are named through `@extschema:vector@`. The rest of
+pg_lion sees four functions (lion_vec.h): `lion_vec_index()` and `lion_vec_relation()`, which tell
+a lionvec index by its own routines (`amcostestimate`, `ambeginscan`), not its name, so that an AM
+of that name another handler serves is never taken for one; `lion_vec_restrict()`; and
+`lion_vec_scan_cost()`. The changes to lion's own code are `_PG_init()` calling `lion_vec_init()`
+(the settings, the 8-bit tables, the kernels) and LionOrdered's (§44.6).
 
-A column's dimensions come from its type modifier, or, for `vector` without one, from the first
+`halfvec` (2026-10-15; pgvector 0.7 and on: the same 8-byte header, then IEEE 754 binary16
+halves) has the same three, `halfvec_l2_ops` (its default), `halfvec_ip_ops` and
+`halfvec_cosine_ops`, over pgvector's `l2_distance`, `halfvec_negative_inner_product` and
+`cosine_distance` of `halfvec`. The format does not change: the codes, the 8-bit codes and the
+centroids are made from floats whatever the column holds, so a halfvec column's index is the size
+of a vector column's, while the column is half its size. An index knows its type from its operator
+class's input type, `rd_opcintype[0]`: a halfvec when that type is NAMED `halfvec` in `pg_type` (by
+the syscache, for pgvector's OIDs differ from database to database), a vector otherwise. It is
+looked up once an index open and kept in `LionVecInfo.half`, before `rd_amcache` is set, for the
+lookup may take a lock whose invalidation would free the cache; the build looks it up too, before
+there is a meta page. One reader turns either datum into floats, `lionvec_datum_floats()`: it
+detoasts it and checks its length (`lionvec_datum_dim()`: the header, a count not below zero and
+that many floats or halves, or `ERRCODE_DATA_CORRUPTED`), and returns a vector's floats where
+they lie, or converts a halfvec's into the caller's array - the build's and an insert's, of the
+index's dimensions - or, without one, a palloc'd one. A scan converts its query once a rescan; its
+exact distances are pgvector's own functions of the datums (the ORDER BY operator's), so a row
+read from the heap is never converted. The conversion is exact, every half being a float
+(`lionvec_halves`, a kernel like the others, §44.3): the portable one assembles the float's
+bits - the exponent rebiased, a subnormal normalized at its leading one, infinities kept and a
+NaN made the quiet NaN of its payload - without a loop or a table, and F16C's VCVTPH2PS converts
+eight halves at a time to the same bits. The errors name the type: `different halfvec dimensions
+3 and 2`, and pgvector's `expected 3 dimensions, not 4` and `halfvec must have at least 1
+dimension`.
+
+A column's dimensions come from its type modifier, or, for a type without one, from the first
 vector the build or an insert meets (`lionvec_set_dims()`, under the meta page's lock, so that two
 first inserts agree); a vector of other dimensions is pgvector's own error, `expected 3
 dimensions, not 4`, and a query of other dimensions `different vector dimensions 3 and 2`. At most
@@ -20349,13 +20373,17 @@ holds no member (§44.6).
   their arithmetic on: plane 1's popcounts against the query's planes, for each of a query's
   centroids and each row a probe reads, and in k-means for each centroid for each sample row each
   iteration; the 8-bit codes' sum `<r, qc>`, for each centroid and row refined; k-means' exact
-  distances (`lionvec_l2sq`); and the rotation. Each has a portable kernel and, from x86-64 GCC 5
+  distances (`lionvec_l2sq`); the rotation; and a halfvec's conversion (§44.1), once a row a build
+  or an insert reads and once a query. Each has a portable kernel and, from x86-64 GCC 5
   and clang 6, kernels compiled with `__attribute__((target))`, of which the best set the CPU runs
   is chosen at load, as lion_container.c chooses its own (§3): **POPCNT**, plane 1 a word at a
   time; **AVX2**, plane 1 a word's four planes in one vector against the row's word broadcast,
   each byte counted with VPSHUFB and the bytes summed by VPSADBW every 31 words, the sums four
   doubles at a time in four vectors, and the rotation's signs and butterflies eight floats at a
-  time, the strides under 8 by permutes inside a vector; and **AVX-512**, AVX2's with plane 1
+  time, the strides under 8 by permutes inside a vector, and where the CPU has F16C, which its own
+  `__builtin_cpu_supports("f16c")` checks (a name GCC knows from 11 and clang from 18; before
+  them, as in the JIT's bitcode an older clang compiles, the portable conversion stays), a
+  halfvec's halves eight at a time by VCVTPH2PS; and **AVX-512**, AVX2's with plane 1
   counted by VPOPCNTDQ (Ice Lake, Zen 4 and on; GCC and clang from 8), a word's four planes in one
   instruction on a 256-bit vector. AVX-512 is taken for VPOPCNTDQ alone: AVX-512BW's VPSHUFB
   counted plane 1 only a sixth faster than AVX2's, and the 8-bit sum eight doubles at a time less
@@ -20374,7 +20402,9 @@ holds no member (§44.6).
   with `-ffp-contract=off`, for GCC and clang would otherwise fuse a multiply and an add wherever
   the target has fused multiply-adds (aarch64, x86-64-v3, `-march=native`) and round `l2sq`'s
   terms once where the other kernels round them twice. The rotation's butterflies are the portable ones' additions and subtractions, of the same
-  operands. The unit tests force each set (§44.10).
+  operands. The halves' conversion is exact either way; VCVTPH2PS, which MXCSR's DAZ and FTZ do not
+  touch, keeps a subnormal half and makes a NaN the quiet NaN of its payload, as the portable one
+  does. The unit tests force each set (§44.10).
   `lionvec_query_init()` keeps its sums in locals and builds each word's four planes in registers,
   without a branch: adding into the query's own fields, which every store to qc and the planes
   might overwrite, and a branch on each bit of each code, which the CPU cannot predict, made it 45
@@ -21092,8 +21122,13 @@ medians of three and two), the same index.
   partial sums added in the header's order and the rotation against the portable one's, all to the
   bit, at every dimsp from 64 to 8128, from unaligned pointers, over inputs of every scale, denormals
   and signed zeros, and end to end the same rotations, estimates and k-means as the portable set's
-  (`test/unit/vec_test_nosimd` is the same program built with `-DLION_NO_SIMD`); the key algebra
-  against true distances; and
+  (`test/unit/vec_test_nosimd` is the same program built with `-DLION_NO_SIMD`); the halves'
+  conversion, the portable one against a reference computed in double from each half's fields,
+  over all 65,536 halves (2,046 NaNs, each quiet with its payload), and each set's against the
+  portable one's to the bit, over all of them and at every length 0 to 40 from offsets 0 to 7,
+  with nothing written past the end; `lionvec_datum_dim()`'s bounds for both types (shorter than
+  the header, a header alone, a byte short of the count's elements, negative counts); the key
+  algebra against true distances; and
   the bounds' COVERAGE on clustered data at 100, 384 and 1536 dimensions for each metric: plane 1
   outside 1 sd 30 to 32% of the time (the Gaussian's 31.7%), outside 3 sd 0.16 to 0.29% (0.27%); the
   codes outside 2 sd about 4% (4.6%) and never outside 6 sd, in 24,000 row-query pairs each. A heavy
@@ -21162,6 +21197,15 @@ medians of three and two), the same index.
   node (the short LIMIT of §44.4); the node switched off. Spill: LionOrdered returns each member
   once and the same rows as the ordinary plan, every member of two filters for each metric, at
   the margin of 100 and at the defaults, before and after DELETE and VACUUM under the filter.
+- **vector_half.sql**: the three `halfvec` operator classes, and `amvalidate`; each ORDER BY through
+  the index and through a sort, as vector.sql's, with the margin of 100 and the pause off, for
+  each metric over 3,000 `halfvec(40)` rows in 20 partitions, three queries and LIMITs 1 to past
+  the table, generic plans whose query is a Param, NULL and cosine zero queries and rows, and a
+  query of other dimensions; inserts of a far cluster after the build; LionOrdered against the
+  ordinary plan under lion indexes' filters for each metric, probing and exact
+  (`pg_lion.vector_exact_rows` at 5,000 and 0, by the DEBUG1 line); an expression index casting a
+  `vector` column to `halfvec`; an untyped column (dimensions from the first row, pgvector's
+  errors); and the refusals (too many dimensions, an array).
 
 ### 44.11 Not done
 
@@ -21184,8 +21228,8 @@ medians of three and two), the same index.
   index over the centroids is still to be built.
 - **Parallel scan and build.** A probe is a sequential read a parallel scan would split cleanly;
   the build's k-means and assignment are a loop over rows.
-- **halfvec, sparsevec, bit.** The codes do not care where the floats came from; each needs an
-  operator class and a reader for its format.
+- **sparsevec, bit.** The codes do not care where the floats came from; each needs an operator
+  class and a reader for its format, as halfvec has (§44.1).
 - **The double heap fetch.** Each returned row is fetched by the scan for its distance and again by
   the executor; the second is a buffer hit. An index-only distance would need the REFINE item to be
   exact, which it is not.
@@ -21201,10 +21245,12 @@ medians of three and two), the same index.
   lionvec scan, and was chosen at 548 ms over the scan's 136 ms for 97,000 rows, at 82 ms over 31
   for 9,700, and cold at 1,209 ms over 199 (format 1). Repricing core's Sort paths whose key is a
   lionvec distance would be new territory for lion's planner hooks, and is not planned. Instead
-  lionvec's documentation has the three functions its operator classes use (`l2_distance`,
-  `vector_negative_inner_product` and `cosine_distance` of `vector`) set to `COST 100` with the
-  extension, and the benchmarks assume it. pg_dump does not keep the setting (an extension
-  member's), and a pgvector update may reset it. `enable_sort = off` does the same for one query.
+  lionvec's documentation has the functions its operator classes use (`l2_distance`,
+  `vector_negative_inner_product` and `cosine_distance` of `vector`, and `l2_distance`,
+  `halfvec_negative_inner_product` and `cosine_distance` of `halfvec` for a halfvec column) set
+  to `COST 100` with the extension, and the benchmarks assume it. pg_dump does not keep the
+  setting (an extension member's), and a pgvector update may reset it. `enable_sort = off` does
+  the same for one query.
 - **Choosing between lionvec and HNSW.** With both on one column, the planner takes HNSW for
   nearly every query, as pgvector prices an HNSW scan at almost nothing: on 200,000 random
   256-dimension rows, about 13 against lionvec's 3,100 unfiltered (format 1).

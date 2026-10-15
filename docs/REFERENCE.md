@@ -235,12 +235,22 @@ under an OR.
 
 ## Nearest neighbours: lionvec (DESIGN.md §44)
 
-`CREATE EXTENSION pg_lion_vector` (it needs pgvector's `vector` and `pg_lion`) adds the `lionvec`
-index access method for pgvector's `vector` type and three operator classes, one per distance:
+`CREATE EXTENSION pg_lion_vector` (it needs pgvector 0.7 or later and `pg_lion`) adds the `lionvec`
+index access method for pgvector's `vector` and `halfvec` types and three operator classes for
+each, one per distance:
 
     CREATE INDEX ON items USING lionvec (embedding);                     -- vector_l2_ops, <->
     CREATE INDEX ON items USING lionvec (embedding vector_ip_ops);       -- <#>
     CREATE INDEX ON items USING lionvec (embedding vector_cosine_ops);   -- <=>
+
+and, on a `halfvec` column, `halfvec_l2_ops` (the default, `<->`), `halfvec_ip_ops` (`<#>`) and
+`halfvec_cosine_ops` (`<=>`), whose query is a `halfvec` too. A `halfvec`'s elements, IEEE 754
+half-precision floats, are read as floats, so its index is the same as a `vector` column's, and
+its distances are pgvector's `halfvec` ones. An expression index of a `vector` column cast to
+`halfvec` serves an `ORDER BY` of the same cast:
+
+    CREATE INDEX ON items USING lionvec ((embedding::halfvec(1536)) halfvec_cosine_ops);
+    SELECT id FROM items ORDER BY embedding::halfvec(1536) <=> $1::halfvec(1536) LIMIT 10;
 
     SELECT id FROM items ORDER BY embedding <=> $1 LIMIT 10;
     SELECT id FROM items WHERE category = 3 AND in_stock ORDER BY embedding <=> $1 LIMIT 10;
@@ -582,8 +592,9 @@ scan keeps (DESIGN.md §44.4).
 `pg_lion.vector_exact_rows` (2,000, 0 to 100,000,000): how many rows a lion filter may admit for a
 `lionvec` scan under it to compute every matching row's distance from the table, exactly, instead
 of reading partitions; 0 never does. The exact path reads each matching row's vector (6 KB from
-TOAST at 1536 dimensions, so 2,000 rows are 12 MB) where a probe reads a few hundred to a thousand
-8 KB code pages, but under a filter that leaves most partitions empty it probes many for nothing.
+TOAST at 1536 dimensions, 3 KB as a `halfvec`, so 2,000 rows are 12 MB or 6 MB) where a probe
+reads a few hundred to a thousand 8 KB code pages, but under a filter that leaves most partitions
+empty it probes many for nothing.
 Raise it for exact answers under wider filters, at a table read a row; the planner prices both
 paths and may sort the filter's rows itself above it, which is exact too (DESIGN.md §44.6).
 
@@ -645,8 +656,8 @@ snapshot's (DESIGN.md §9).  Inserts and VACUUM work as usual.
 
 A `lionvec` index (DESIGN.md §44) answers only an `ORDER BY` of its own distance operator, forward.
 It has no search operators, no bitmap or index-only scans, no INCLUDE columns and no parallel scan
-or build, and indexes a single column of pgvector's `vector` (not `halfvec`, `sparsevec` or `bit`)
-of at most 8128 dimensions. Its results are approximate (`pg_lion.vector_margin`), except under a
+or build, and indexes a single column of pgvector's `vector` or `halfvec` (not `sparsevec` or
+`bit`) of at most 8128 dimensions. Its results are approximate (`pg_lion.vector_margin`), except under a
 lion filter of up to `pg_lion.vector_exact_rows` rows. Inserts serialize on the index's meta page and read every
 partition's centroid. VACUUM removes dead rows' codes but reuses their space only for new rows on
 a chain's last page, so a table with heavy churn grows its index until `REINDEX`, which also
@@ -664,7 +675,9 @@ where the `lionvec` scan is faster: on a million rows it did, for filters of 1% 
 times slower, until scans paused (`pg_lion.vector_patience`). `lionvec` assumes the three
 functions its operator classes use cost 100 (`ALTER FUNCTION l2_distance(vector, vector) COST
 100`, and the same for `vector_negative_inner_product(vector, vector)` and `cosine_distance(vector,
-vector)`), which `pg_dump` does not keep and an `ALTER EXTENSION vector UPDATE` may reset; `SET
+vector)`, and for a `halfvec` column `l2_distance(halfvec, halfvec)`,
+`halfvec_negative_inner_product(halfvec, halfvec)` and `cosine_distance(halfvec, halfvec)`), which
+`pg_dump` does not keep and an `ALTER EXTENSION vector UPDATE` may reset; `SET
 enable_sort = off` steers a single query the same way. An HNSW index on the same column is chosen
 over `lionvec` for nearly every query, filtered or not, since pgvector prices its scan as nearly
 free.
