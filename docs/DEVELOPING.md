@@ -26,11 +26,12 @@ and by those specs on the newer majors, not by a test on that major.
                                                           # lionvec's arithmetic; no server
 
 No `-march` is needed for speed: on x86-64, GCC and clang builds carry AVX2 and POPCNT versions of
-the container library's passes over whole bitsets, compiled with target attributes, and pick one at
-run time by what the CPU has; other targets and compilers get a portable one, and `make
-LION_NO_SIMD=1` leaves the x86-64 ones out (DESIGN.md §3, "Whole-bitset kernels").  `make unit` runs
-the container tests against each version the CPU has, and once more built without the x86-64 ones
-(`test/unit/container_test_nosimd`).
+the container library's passes over whole bitsets, and AVX-512 (VPOPCNTDQ), AVX2 and POPCNT ones of
+lionvec's kernels, compiled with target attributes, and pick one at run time by what the CPU has;
+other targets and compilers get a portable one, and `make LION_NO_SIMD=1` leaves the x86-64 ones out
+(DESIGN.md §3, "Whole-bitset kernels"; §44.3, "Kernels").  `make unit` runs the container and
+lionvec tests against each version the CPU has, and once more built without the x86-64 ones
+(`test/unit/container_test_nosimd`, `test/unit/vec_test_nosimd`).
 
 Lion logs through one of two WAL resource managers (DESIGN.md §25), chosen per index at
 CREATE INDEX, so the suite has to pass in both:
@@ -60,10 +61,11 @@ replay, so turning it on for a primary that never replays proves nothing.
   `pg_walinspect` `walrecords` fails, and most files use `citext`.  `installcheck` checks for
   all four before it starts and stops with one message if any is missing.  The PGDG packages
   (`postgresql-N`) include contrib; a source build needs `make -C contrib install`.
-- **pgvector** for `vector.sql` and `vector_filter.sql`, lionvec's files (DESIGN.md §44): the
-  PGDG package `postgresql-N-pgvector`, or a build of github.com/pgvector/pgvector against the same
-  `pg_config`.  Where it is missing those two files are skipped and the run says so (`PGVECTOR=1`
-  forces them; `PGVECTOR=0` skips them).  pg_lion itself builds and loads without it.
+- **pgvector** 0.7 or later (for `halfvec`) for `vector.sql`, `vector_filter.sql` and
+  `vector_half.sql`, lionvec's files (DESIGN.md §44): the PGDG package `postgresql-N-pgvector`, or
+  a build of github.com/pgvector/pgvector against the same `pg_config`.  Where it is missing those
+  files are skipped and the run says so (`PGVECTOR=1` forces them; `PGVECTOR=0` skips them).
+  pg_lion itself builds and loads without it.
 - **Session settings** the expected plans assume (`work_mem`, `maintenance_work_mem`, no parallel
   workers, no JIT) are passed to every connection the suite makes through `PGOPTIONS`
   (`LION_TEST_OPTIONS` in the Makefile), so a cluster other than `./dev.sh`'s gives the same plans.
@@ -158,11 +160,11 @@ the suite as they are in production.
                             values from the index tuples when it covers the query) or of a lion column's order
     src/lion_multikey.c     array_ops/tsvector_ops: GIN-style extraction and tsquery key trees
     src/lion_jsonb.c        jsonb_contains_ops: path keys for jsonb @>, ?, ?|, ?&, @? and @@
-    src/lion_vec.[ch]       lionvec, the nearest-neighbour AM of pgvector's vector (created by the pg_lion_vector
-                            extension): pages, build, inserts, VACUUM, costs, handler; lion_vec.h is what
-                            LionOrdered uses to restrict its scan to a lion set
+    src/lion_vec.[ch]       lionvec, the nearest-neighbour AM of pgvector's vector and halfvec (created by
+                            the pg_lion_vector extension): pages, build, inserts, VACUUM, costs, handler;
+                            lion_vec.h is what LionOrdered uses to restrict its scan to a lion set
     src/lion_vec_scan.c     its scan: passes over the 1-bit codes, the lazy queue of bounds, refines and
                             exact distances
-    src/lion_vec_math.[ch]  its rotation, bit-plane codes, popcount kernels and error bounds, frontend-safe and
+    src/lion_vec_math.[ch]  its rotation, bit-plane codes, kernels and error bounds, frontend-safe and
                             unit-tested standalone (test/unit/vec_test.c)
     test/sql, test/isolation, test/unit, test/recovery, test/modules

@@ -36,13 +36,14 @@
  *
  * A query whose rows lie far from every centroid finds many centroids
  * within its k-th row less the margin.  So the scan also pauses: once it
- * has scored pg_lion.vector_patience partitions' worth of rows (the rows,
- * or under a restriction the members, a partition holds on average)
- * without one entering the L least upper bounds, it takes those L as found
- * and probes no partition until it has returned L rows or the next row
- * lies past tau; a REST, which starts a new batch, ends a pause too.  A row
- * nearer than those a pause returned, in a partition not probed yet, is
- * skipped when it is found, as is one the margin leaves till too late.
+ * has scored pg_lion.vector_patience units of rows (lv_patience_unit():
+ * the rows, or under a restriction the members, a partition would hold on
+ * average in 2 sqrt(n) partitions) without one entering the L least upper
+ * bounds, it takes those L as found and probes no partition until it has
+ * returned L rows or the next row lies past tau; a REST, which starts a
+ * new batch, ends a pause too.  A row nearer than those a pause returned,
+ * in a partition not probed yet, is skipped when it is found, as is one the
+ * margin leaves till too late.
  * Ended only past tau, an upper bound, a pause returned rows far beyond
  * the L nearest: 0.955 of a LIMIT 1000's true rows, against 0.983 so.
  *
@@ -50,9 +51,16 @@
  * whose bound fails and turns up after rows farther than it is skipped, so
  * the scan never returns rows out of order.
  *
+ * In an index that spills, every row with a vector has two items, in two
+ * partitions' chains (DESIGN.md §44.3).  The first a pass meets enters it -
+ * the row queue, and the L least upper bounds - and the progress hash
+ * records the pass; the other, met later in the same pass, is skipped
+ * (counted as a copy skipped).  A REST starts a new pass, which enters each
+ * row once again.  A walk returns no copy.
+ *
  * NULL rows come last, with NULL distances; before them, in a cosine index,
  * the zero vectors, whose distance is NaN.  A restricted scan (LionOrdered,
- * §44.6) of no more than LIONVEC_EXACT_MAX members computes every member's
+ * §44.6) of no more than pg_lion.vector_exact_rows members computes every member's
  * distance from the heap and returns them in order (lv_exact()); of more,
  * it does all of the above over the members alone.
  *
@@ -119,7 +127,9 @@ typedef struct LvHeap
  * (lv_cut()) whose rows all refine past the cut would be made again, the
  * same, for ever: the rows would come back from plane 1 below the cut, be
  * refined past it, and the cut's REST come out first.  With it, every pass
- * moves at least one row up a level, or out.
+ * moves at least one row up a level, or out.  In an index that spills, it
+ * also has every row a pass entered, at LV_PLANE1 if no more is known, and
+ * the pass that last did, so that the row's other item is skipped in it.
  */
 #define LV_GONE		0			/* returned already, or not there */
 
@@ -127,7 +137,8 @@ typedef struct LvSeen
 {
 	uint64		key;
 	char		status;			/* simplehash's */
-	uint8		level;			/* LV_CODES8, LV_EXACT, or LV_GONE */
+	uint8		level;			/* LV_PLANE1, LV_CODES8, LV_EXACT, or LV_GONE */
+	uint32		pass;			/* the pass that last entered it (spilling) */
 	double		lo;				/* the key's bounds; LV_EXACT: the key */
 	double		hi;
 	double		dist;			/* LV_EXACT: the distance */
@@ -175,6 +186,7 @@ typedef struct LvScanOpaque
 	MemoryContext qcxt;			/* a rescan's, reset by the next */
 	LvPhase		phase;
 	LionVecMetaData meta;		/* as the scan started */
+	bool		spill;			/* LIONVEC_META_SPILL: rows have copies */
 	BlockNumber nblocks;		/* the index's, for lionvec_chain_step() */
 
 	/* the query */
@@ -210,6 +222,7 @@ typedef struct LvScanOpaque
 	double		sincerows;		/* ... and since one last did */
 	bool		paused;			/* probing no partition (the header) */
 	int			pauseleft;		/* rows the pause may still return */
+	uint32		pass;			/* from 1; a REST starts the next */
 	lvseen_hash *seen;
 	double		lastdist;		/* of the row returned last */
 
@@ -248,6 +261,7 @@ typedef struct LvScanOpaque
 	int64		nmissed;		/* exact keys below the bound they had */
 	int64		npages;			/* CODE pages the probes read */
 	int64		npauses;
+	int64		ncopies;		/* items skipped, their row entered this pass */
 } LvScanOpaque;
 
 /* ----------------------------------------------------------------
@@ -551,11 +565,11 @@ lv_debug_stats(IndexScanDesc scan, LvScanOpaque *so)
 			 INT64_FORMAT " refined, " INT64_FORMAT " fetched, "
 			 INT64_FORMAT " returned, " INT64_FORMAT " skipped out of order, "
 			 INT64_FORMAT " bounds missed, " INT64_FORMAT " pages read, "
-			 INT64_FORMAT " pauses",
+			 INT64_FORMAT " pauses, " INT64_FORMAT " copies skipped",
 			 RelationGetRelationName(scan->indexRelation), so->nprobes,
 			 so->npasses, so->ncands, so->nrefined, so->nfetched,
 			 so->nreturned, so->nskipped, so->nmissed, so->npages,
-			 so->npauses);
+			 so->npauses, so->ncopies);
 	else if (so->nfetched > 0)
 		elog(DEBUG1, "lionvec scan of \"%s\": " INT64_FORMAT " members fetched, "
 			 INT64_FORMAT " returned",
@@ -563,7 +577,7 @@ lv_debug_stats(IndexScanDesc scan, LvScanOpaque *so)
 			 so->nreturned);
 	so->nprobes = so->npasses = so->ncands = so->nrefined = so->nfetched = 0;
 	so->nreturned = so->nskipped = so->nmissed = so->npages = 0;
-	so->npauses = 0;
+	so->npauses = so->ncopies = 0;
 }
 
 void
@@ -822,6 +836,9 @@ lv_next_phase(IndexScanDesc scan, LvScanOpaque *so)
 static bool
 lv_walk_wants(LvWalk walk, uint16 flags)
 {
+	/* a row's copy: the row comes from its own item */
+	if (flags & LIONVEC_SPILL)
+		return false;
 	switch (walk)
 	{
 		case LV_WALK_ZERO:
@@ -872,11 +889,16 @@ lv_walk_next(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid)
 		so->wn = so->wpos = 0;
 		if (!so->restricted || lv_page_has_member(so, op->minkey, op->maxkey))
 		{
+			/* copies are in partitions' chains, which lionvec_chain_heads() gives first */
+			bool		copies = so->spill &&
+				(so->walk == LV_WALK_ALL || so->walk == LV_WALK_NONNULL) &&
+				so->wchain - 1 < (int) so->meta.nparts;
+
 			maxoff = PageGetMaxOffsetNumber(page);
 			for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
 			{
 				LionVecCode *code = lionvec_code_at(index, page, so->wblk, off,
-													so->meta.dimsp);
+													so->meta.dimsp, copies);
 
 				if (!lv_walk_wants(so->walk, code->flags))
 					continue;
@@ -917,6 +939,30 @@ static double
 lv_margin(LvScanOpaque *so)
 {
 	return lionvec_margin * so->meta.scale;
+}
+
+/*
+ * pg_lion.vector_patience's unit: the rows, or under a restriction the
+ * members, of a scan of `members` that an average partition would hold
+ * were there 2 sqrt(n) of them, n the build's rows - sqrt(n) / 2 rows
+ * unfiltered - and at least one.  It was the average partition's own,
+ * members / nparts, the same at the old default of 2 sqrt(n) partitions;
+ * but then four times the partitions paused after a quarter of the rows,
+ * and on DBpedia's 115,186 rows a patience of 30 in 2,715 partitions held
+ * the recall to 0.966 at any margin, where in 678 it reached 0.988
+ * (DESIGN.md §44.4).  Now the pause does not move with the partitions.
+ * The unit is of items as the probes count them: in an index that spills
+ * (§44.10), each row is in two partitions, so a partition holds twice the
+ * items.
+ */
+static double
+lv_patience_unit(const LvScanOpaque *so, double members)
+{
+	double		parts = Max(2.0 * sqrt(Max(so->meta.ntuples, 0.0)), 1.0);
+
+	if (so->spill)
+		members *= 2.0;
+	return Max(members / parts, 1.0);
 }
 
 /*
@@ -1066,7 +1112,7 @@ lv_refine_part(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
  */
 
 static inline uint64
-lv_tidkey(ItemPointer tid)
+lv_tidkey(const ItemPointerData *tid)
 {
 	return ((uint64) ItemPointerGetBlockNumber(tid) << 16) |
 		ItemPointerGetOffsetNumber(tid);
@@ -1081,6 +1127,44 @@ lv_cap(const LvScanOpaque *so)
 	cap = (int) Min((double) work_mem * 1024.0 / sizeof(LvItem),
 					(double) (MaxAllocSize / sizeof(LvItem) / 2));
 	return Max(cap, 4 * so->batch + 64);
+}
+
+/*
+ * A row of an index that spills enters this pass (lv_probe()): its other
+ * item, met later in the pass, is skipped.
+ */
+static void
+lv_enter(LvScanOpaque *so, ItemPointer tid)
+{
+	bool		found;
+	LvSeen	   *s = lvseen_insert(so->seen, lv_tidkey(tid), &found);
+
+	if (!found)
+	{
+		s->level = LV_PLANE1;
+		s->lo = s->hi = s->dist = 0.0;
+	}
+	s->pass = so->pass;
+}
+
+/*
+ * A row that entered this pass leaves it unworked (lv_shrink(), lv_cut(),
+ * lv_probe()'s second look at tau, a REST): forget it, if all the hash
+ * knows of it is that it entered, so that the LV_PLANE1 entries are the
+ * row queue's rows and stay within its cap.  Its other item, if met later
+ * in the pass, is left out as this one was - tau and the cut only fall
+ * within a pass - and a REST's pass enters it afresh.
+ */
+static void
+lv_forget(LvScanOpaque *so, const LvItem *it)
+{
+	LvSeen	   *s;
+
+	if (!so->spill || it->level != LV_PLANE1)
+		return;
+	s = lvseen_lookup(so->seen, lv_tidkey(&it->tid));
+	if (s != NULL && s->level == LV_PLANE1)
+		lvseen_delete_item(so->seen, s);
 }
 
 /*
@@ -1110,6 +1194,8 @@ lv_cut(LvScanOpaque *so, int cap)
 		lv_sift_down(so->rows.items, n, 0);
 	}
 	cut = so->rows.items[0].key;
+	for (i = 0; i < n; i++)
+		lv_forget(so, &so->rows.items[i]);
 	memcpy(so->rows.items, sorted, sizeof(LvItem) * keep);
 	so->rows.n = keep;
 	pfree(sorted);
@@ -1133,7 +1219,10 @@ lv_shrink(LvScanOpaque *so, int cap, double *drop)
 		if (it->key <= so->tau && it->key <= so->cut)
 			so->rows.items[n++] = *it;
 		else
+		{
 			*drop = Min(*drop, it->key);
+			lv_forget(so, it);
+		}
 	}
 	so->rows.n = n;
 	if (n > cap / 2)
@@ -1152,17 +1241,25 @@ lv_shrink(LvScanOpaque *so, int cap, double *drop)
  * Probe the CODE chain from head: each row by plane 1's bounds, or by what
  * the scan has learnt of it, into the row queue if its lower bound is
  * within tau and below the cut, and the least bound of those left out to
- * a REST.
+ * a REST.  copies says whether the chain may hold rows' copies (a
+ * partition's, of an index that spills); a row this pass has entered
+ * already, from its other item, is skipped.
  */
 static void
-lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head)
+lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head, bool copies)
 {
 	Relation	index = scan->indexRelation;
 	int			dimsp = so->info->dimsp;
 	int			L = so->batch;
 	int			cap = lv_cap(so);
 	double		drop = INFINITY;
-	bool		anyseen = so->seen->members > 0;
+
+	/*
+	 * Nothing to look up in an empty hash - a chain holds a TID once - but
+	 * in an index that spills the probe's own entries count, and they catch
+	 * a TID a corrupted chain holds twice, too
+	 */
+	bool		anyseen = so->spill || so->seen->members > 0;
 	uint64		visited = 0;
 	BlockNumber blk = head;
 
@@ -1192,7 +1289,8 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head)
 		maxoff = PageGetMaxOffsetNumber(page);
 		for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
 		{
-			LionVecCode *code = lionvec_code_at(index, page, blk, off, dimsp);
+			LionVecCode *code = lionvec_code_at(index, page, blk, off, dimsp,
+												copies);
 			LvItem		item;
 			double		lo;
 			double		hi;
@@ -1216,7 +1314,13 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head)
 
 				if (s != NULL && s->level == LV_GONE)
 					continue;
-				if (s != NULL)
+				if (s != NULL && so->spill && s->pass == so->pass)
+				{
+					/* its other item entered it: the first met wins */
+					so->ncopies++;
+					continue;
+				}
+				if (s != NULL && s->level != LV_PLANE1)
 				{
 					item.level = s->level;
 					item.dist = s->dist;
@@ -1245,6 +1349,14 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head)
 				drop = Min(drop, lo);
 				continue;
 			}
+
+			/*
+			 * It enters the pass.  Its other item, if met later in it, has
+			 * the same bounds, and tau and the cut only fall within a pass,
+			 * so that item could do no more than this one does now.
+			 */
+			if (so->spill)
+				lv_enter(so, &code->tid);
 			if (so->nhi < L || hi < so->hi[0])
 				so->sincerows = 0.0;	/* it enters: patience starts over */
 			lv_hi_push(so->hi, &so->nhi, L, hi);
@@ -1253,6 +1365,7 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head)
 			if (lo > so->tau)
 			{
 				drop = Min(drop, lo);
+				lv_forget(so, &item);
 				continue;
 			}
 			item.key = lo;
@@ -1262,6 +1375,7 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head)
 				if (lo >= so->cut)
 				{
 					drop = Min(drop, lo);
+					lv_forget(so, &item);
 					continue;
 				}
 			}
@@ -1286,7 +1400,7 @@ lv_probe_part(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 	Assert(partno < so->meta.nparts);
 	so->probed[so->nprobed++] = so->phead[partno];
 	so->nprobes++;
-	lv_probe(scan, so, so->phead[partno]);
+	lv_probe(scan, so, so->phead[partno], so->spill);
 	if (so->nhi == so->batch && so->sincerows >= so->patience)
 	{
 		so->paused = true;
@@ -1325,12 +1439,27 @@ lv_rest(IndexScanDesc scan, LvScanOpaque *so)
 	int			i;
 
 	so->npasses++;
+	so->pass++;
 	so->batch = (int) Min((double) so->batch * 4.0,
 						  Max((double) so->batch, (double) cap / 8.0));
+	for (i = 0; i < so->rows.n; i++)
+		lv_forget(so, &so->rows.items[i]);
+#ifdef USE_ASSERT_CHECKING
+	{
+		/* every row the pass entered was worked, or left and was forgotten */
+		lvseen_iterator iter;
+		LvSeen	   *s;
+
+		lvseen_start_iterate(so->seen, &iter);
+		while ((s = lvseen_iterate(so->seen, &iter)) != NULL)
+			Assert(s->level != LV_PLANE1);
+	}
+#endif
 	lv_reset_rows(so);
 	so->paused = false;
+	/* the first chain probed is the REST chain (lv_start()), the rest partitions */
 	for (i = 0; i < so->nprobed; i++)
-		lv_probe(scan, so, so->probed[i]);
+		lv_probe(scan, so, so->probed[i], so->spill && i > 0);
 }
 
 /* ----------------------------------------------------------------
@@ -1345,6 +1474,8 @@ lv_remember(LvScanOpaque *so, ItemPointer tid, uint8 level, double lo,
 	bool		found;
 	LvSeen	   *s = lvseen_insert(so->seen, lv_tidkey(tid), &found);
 
+	if (!found)
+		s->pass = so->pass;
 	s->level = level;
 	s->lo = lo;
 	s->hi = hi;
@@ -1453,6 +1584,7 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 	so->info = lionvec_get_info(index);
 	so->metric = so->info->metric;
 	lionvec_read_meta(index, &so->meta);
+	so->spill = (so->meta.flags & LIONVEC_META_SPILL) != 0;
 	so->nblocks = RelationGetNumberOfBlocks(index);
 	so->lastdist = -INFINITY;
 
@@ -1475,8 +1607,13 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 		return;
 	}
 
-	v = lionvec_datum_floats(ob->sk_argument, &dim, &tofree);
-	so->query = tofree != NULL ? PointerGetDatum(tofree) : ob->sk_argument;
+	/*
+	 * Detoasted once, for the operator's function at every exact distance;
+	 * a halfvec's floats are converted into an array of their own.  Both
+	 * are in qcxt, which the next rescan resets.
+	 */
+	so->query = PointerGetDatum(PG_DETOAST_DATUM(ob->sk_argument));
+	v = lionvec_datum_floats(so->query, so->info->half, NULL, 0, &dim, &tofree);
 	if (so->info->dims == 0)
 	{
 		/* no vector indexed yet: only NULLs to return */
@@ -1488,8 +1625,8 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 	if (dim != so->info->dims)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
-				 errmsg("different vector dimensions %d and %d",
-						so->info->dims, dim)));
+				 errmsg("different %s dimensions %d and %d",
+						lionvec_type_name(so->info->half), so->info->dims, dim)));
 
 	x = palloc(sizeof(float) * so->info->dimsp);
 	if (!lionvec_prepare(&so->info->rot, so->metric, v, dim, x))
@@ -1517,7 +1654,7 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 		bool		whole;
 
 		members = lv_members(so, hblocks > 0 ? tuples / hblocks : 0.0, &whole);
-		if (!whole && members <= LIONVEC_EXACT_MAX)
+		if (!whole && members <= lionvec_exact_rows)
 		{
 			lv_exact(scan, so);
 			MemoryContextSwitchTo(old);
@@ -1526,9 +1663,9 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 	}
 	so->qnorm = qnorm;
 	so->margin = lv_margin(so);
+
 	so->patience = lionvec_patience > 0 ?
-		(double) lionvec_patience * Max(members / Max(so->meta.nparts, 1), 1.0) :
-		INFINITY;
+		(double) lionvec_patience * lv_patience_unit(so, members) : INFINITY;
 
 	so->seen = lvseen_create(so->qcxt, 256, NULL);
 	so->batch = lionvec_batch;
@@ -1539,7 +1676,8 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 	so->probed = palloc(sizeof(BlockNumber) * ((Size) so->meta.nparts + 1));
 	so->probed[so->nprobed++] = so->meta.rest_head;
 	so->npasses++;
-	lv_probe(scan, so, so->meta.rest_head);
+	so->pass = 1;
+	lv_probe(scan, so, so->meta.rest_head, false);
 	so->phase = LV_NORMAL;
 	MemoryContextSwitchTo(old);
 }

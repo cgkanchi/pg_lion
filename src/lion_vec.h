@@ -2,7 +2,8 @@
  *
  * lion_vec.h
  *		lionvec: a nearest-neighbour index access method for pgvector's
- *		`vector` type, shipped beside lion (DESIGN.md section 44).
+ *		`vector` and `halfvec` types, shipped beside lion (DESIGN.md
+ *		section 44).
  *
  *		Every vector is rotated by a fixed random rotation, centred on the
  *		table's mean and quantized into eight nested bit-planes.  The rows
@@ -48,7 +49,7 @@
  * --------------------------------------------------------------------- */
 
 #define LIONVEC_MAGIC			0x4c56454d	/* "LVEM" */
-#define LIONVEC_VERSION			2
+#define LIONVEC_VERSION			3
 #define LIONVEC_METAPAGE		0
 
 /* The rotation's seed.  Kept in the meta page, so it can change later. */
@@ -78,12 +79,15 @@ typedef LionVecPageOpaqueData *LionVecPageOpaque;
 #define LionVecPageGetOpaque(page) \
 	((LionVecPageOpaque) PageGetSpecialPointer(page))
 
+/* LionVecMetaData's flags */
+#define LIONVEC_META_SPILL		0x0001	/* rows spill to a second partition */
+
 typedef struct LionVecMetaData
 {
 	uint32		magic;
 	uint32		version;
 	uint16		metric;			/* LIONVEC_L2 / _IP / _COSINE */
-	uint16		flags;
+	uint16		flags;			/* LIONVEC_META_*: as built */
 	int32		dims;			/* 0: no vector seen yet */
 	int32		dimsp;			/* dims padded to a multiple of 64 */
 	uint32		seed;			/* the rotation's */
@@ -107,10 +111,14 @@ typedef LionVecMetaData *LionVecMeta;
 
 /*
  * A row's first plane: what every scan reads.  NULL rows and the zero vectors
- * of a cosine index carry the header alone.
+ * of a cosine index carry the header alone.  In an index that spills
+ * (LIONVEC_META_SPILL), every other row has a second item, its copy, in a
+ * second partition's chain: the same in every field, the REFINE item's place
+ * included, but for LIONVEC_SPILL (DESIGN.md §44.3).
  */
 #define LIONVEC_NULL			0x0001	/* the column is NULL */
 #define LIONVEC_ZERO			0x0002	/* cosine: a zero vector, distance NaN */
+#define LIONVEC_SPILL			0x0004	/* a row's copy in its second partition */
 
 typedef struct LionVecCode
 {
@@ -142,20 +150,21 @@ typedef struct LionVecRefine
 
 /*
  * A partition (DESIGN.md §44.2), an item of the PART chain: where its CODE
- * chain starts and ends, how many rows the build put in it, how long the
- * longest is and how far they lie from the centroid (an inner-product scan's
- * bound, §44.4), and the centroid itself, coded as a row is - its plane 1
- * here and its 8-bit codes in a REFINE item, whose TID is (partno, 0), which
- * no heap row's is.  The build writes the PART chain last; an insert changes
- * only a partition's tail.
+ * chain starts and ends, how many items the build put in it (its rows, and
+ * other rows' copies), how long the longest of their rows is and how far
+ * they lie from the centroid (an inner-product scan's bound, §44.4), and the
+ * centroid itself, coded as a row is - its plane 1 here and its 8-bit codes
+ * in a REFINE item, whose TID is (partno, 0), which no heap row's is.  The
+ * build writes the PART chain last; an insert changes only a partition's
+ * tail.
  */
 typedef struct LionVecPart
 {
 	uint32		partno;			/* its place in the chain, from 0 */
 	BlockNumber head;			/* its CODE chain */
 	BlockNumber tail;			/* ... whose last page inserts append to */
-	uint32		nrows;			/* rows the build put in it */
-	float4		maxnorm;		/* the largest |x| of those rows */
+	uint32		nrows;			/* items the build put in it, copies included */
+	float4		maxnorm;		/* the largest |x| of their rows */
 	float4		spread;			/* ... and the mean of |x - c|^2, c the centroid */
 	LionVecCode cent;			/* the centroid's plane 1, as a row's */
 } LionVecPart;
@@ -186,12 +195,20 @@ typedef struct LionVecPart
 typedef struct LionVecInfo
 {
 	int			metric;
+	bool		half;			/* the column is a halfvec, not a vector */
 	int			dims;			/* 0: no vector indexed yet */
 	int			dimsp;
 	uint32		seed;
 	LionVecRotation rot;		/* its signs follow this struct */
 	float	   *mean;			/* [dimsp], rotated; NULL when zero */
 } LionVecInfo;
+
+/* the column's type, as pgvector's errors name it */
+static inline const char *
+lionvec_type_name(bool half)
+{
+	return half ? "halfvec" : "vector";
+}
 
 /*
  * The container key of a heap TID, as lion's sets are keyed (lion_tid.h),
@@ -231,33 +248,38 @@ lionvec_chain_step(Relation index, uint64 *visited, BlockNumber *nblocks)
 #define LIONVEC_MAX_PARTS		1000000
 
 /*
- * A scan stops probing once it has scored this many partitions' worth of
- * rows (of members, under a restriction) without one entering its batch's
- * L least upper bounds, until it has returned the rows it holds
- * (lion_vec_scan.c, DESIGN.md §44.4).  0 never stops.
+ * A scan stops probing once it has scored this many units of rows without
+ * one entering its batch's L least upper bounds, until it has returned the
+ * rows it holds; a unit is sqrt(n) / 2 rows, n the build's, the rows an
+ * average partition would hold in 2 sqrt(n) partitions, or that share of
+ * the members under a restriction (lion_vec_scan.c, lv_patience_unit();
+ * DESIGN.md §44.4).  0 never stops.
  */
 #define LIONVEC_PATIENCE_DEFAULT 30
 
 /*
  * A scan restricted to this many members or fewer computes every member's
- * distance from the heap rather than probe partitions (DESIGN.md §44.6).
+ * distance from the heap rather than probe partitions (DESIGN.md §44.6):
+ * pg_lion.vector_exact_rows's default.
  */
-#define LIONVEC_EXACT_MAX		2000
+#define LIONVEC_EXACT_DEFAULT	2000
 extern double lionvec_epsilon;
 extern int	lionvec_batch;
 extern double lionvec_margin;
 extern int	lionvec_patience;
+extern int	lionvec_exact_rows;
 
 /* lion_vec.c */
 extern void lion_vec_init(void);
 extern LionVecInfo *lionvec_get_info(Relation index);
-extern const float *lionvec_datum_floats(Datum d, int *dim, Pointer *tofree);
+extern const float *lionvec_datum_floats(Datum d, bool half, float *buf,
+										 int bufdim, int *dim, Pointer *tofree);
 extern void lionvec_check_dims(const LionVecInfo *info, int dim);
 extern void lionvec_read_meta(Relation index, LionVecMetaData *meta);
 extern void lionvec_check_page(Relation index, Page page, BlockNumber blk,
 							   uint16 type);
 extern LionVecCode *lionvec_code_at(Relation index, Page page, BlockNumber blk,
-									OffsetNumber off, int dimsp);
+									OffsetNumber off, int dimsp, bool copies);
 extern LionVecRefine *lionvec_refine_at(Relation index, Page page,
 										BlockNumber blk, OffsetNumber off,
 										int dimsp, ItemPointer tid);

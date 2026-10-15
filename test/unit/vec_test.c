@@ -15,7 +15,18 @@
  *		and norms what their definitions say, a row at the mean all zeros;
  *	  - the query's planes: they quantize it within half a step, and the sum
  *		and variance kept with them are the planes' own;
- *	  - every popcount kernel against a naive count;
+ *	  - every kernel the build and CPU have (portable, POPCNT, AVX2,
+ *		AVX-512): plane 1's against a naive count, the sums against their
+ *		sixteen lanes added as the header says and the rotation against the
+ *		portable one's, to the bit, at every dimsp an index takes and from
+ *		unaligned pointers; and end to end, the same rotations, estimates and
+ *		k-means as the portable set's;
+ *	  - a halfvec's halves: the portable conversion of each of the 65,536
+ *		against its value computed in double from its sign, exponent and
+ *		mantissa, a NaN a quiet NaN of its payload; every set's (F16C where
+ *		the CPU has it) against the portable one's to the bit, NaNs
+ *		included, at every length of a tail and every alignment; and the
+ *		bounds a vector or halfvec datum is checked against;
  *	  - the key algebra: with the exact inner product and no error, the
  *		bounds ARE the key of the distance computed the obvious way, for each
  *		metric - which is the proof that centring, the mean's terms, cosine's
@@ -23,6 +34,11 @@
  *	  - an inner product's partition bound (lionvec_lift_key()): a true bound
  *		at the lifted rows' radius, for rows of mixed lengths and unit rows,
  *		and the L2 bound on unit rows;
+ *	  - spill: the ranking of candidates, the candidates of the m nearest
+ *		centroids, a vector decoded from its 8-bit codes, and SOAR's choice of
+ *		a second partition - its algebra on vectors whose answer is known,
+ *		and on clustered rows the least cost, other than the second-nearest
+ *		for a share of them, and the same from decoded centroids;
  *	  - the estimates' error bounds hold as often as the Gaussian says they
  *		should, on clustered data of several sizes: at one standard deviation
  *		about a third of the time, at three almost always.
@@ -71,6 +87,22 @@ rnd64(void)
 	rng_state ^= rng_state >> 7;
 	rng_state ^= rng_state << 17;
 	return rng_state;
+}
+
+/*
+ * The kernel tests draw from a generator of their own, swapped in and out,
+ * so that what the tests after them draw does not depend on which kernels
+ * the build and the CPU have.
+ */
+static uint64 kernel_rng_state = 0x2545F4914F6CDD1DULL;
+
+static void
+swap_rng(void)
+{
+	uint64		t = rng_state;
+
+	rng_state = kernel_rng_state;
+	kernel_rng_state = t;
 }
 
 /* uniform in (0, 1) */
@@ -566,7 +598,7 @@ test_query(void)
 	free(x);
 }
 
-/* ---------- the popcount kernels ---------- */
+/* ---------- the kernels ---------- */
 
 static uint32
 naive_dot(const uint64 *bits, const uint64 *planes, int nwords)
@@ -584,51 +616,423 @@ naive_dot(const uint64 *bits, const uint64 *planes, int nwords)
 	return s;
 }
 
+static const char *const kernel_names[LIONVEC_KERNELS_MAX + 1] = {
+	"portable", "POPCNT", "AVX2", "AVX-512"
+};
+
+/* The most dimensions an index takes at 8K pages (lion_vec.h). */
+#define TEST_MAX_DIMSP		8128
+
+/*
+ * What the sums' kernels must return, to the bit, stated apart from them:
+ * the i-th term into partial i % 16, and the partials added up as the
+ * header says.  serial is the plain sum in order, which it must be near.
+ */
+static double
+lanes_reference(const double *terms, int n, double *serial)
+{
+	double		p[LIONVEC_LANES] = {0};
+	double		u[4];
+	int			i;
+
+	*serial = 0.0;
+	for (i = 0; i < n; i++)
+	{
+		p[i % LIONVEC_LANES] += terms[i];
+		*serial += terms[i];
+	}
+	for (i = 0; i < 4; i++)
+		u[i] = (p[i] + p[i + 8]) + (p[i + 4] + p[i + 12]);
+	return (u[0] + u[2]) + (u[1] + u[3]);
+}
+
+/*
+ * A float of a kind: Gaussian, tiny, denormal, huge, zero, or of any scale
+ * from 2^-40 to 2^40 - which makes a sum's rounding depend on the order it
+ * is added in, as sums of terms of one scale often do not.
+ */
+#define RND_KINDS	6
+static float
+rnd_float(int kind)
+{
+	switch (kind % RND_KINDS)
+	{
+		case 0:
+			return (float) rnd_gauss();
+		case 1:
+			return (float) (rnd_gauss() * 1e-3);
+		case 2:
+			return (float) (rnd_gauss() * 1e-41);	/* denormal */
+		case 3:
+			return (float) (rnd_gauss() * 1e18);
+		case 4:
+			return (rnd64() & 1) ? 0.0f : -0.0f;
+		default:
+			return (float) ldexp(rnd_gauss(), (int) (rnd64() % 81) - 40);
+	}
+}
+
+/*
+ * Every kernel the build and CPU have, against a reference: plane 1's
+ * against a bit-at-a-time count; the sums against lanes_reference(), to
+ * the bit; the rotation against the portable kernel's, to the bit.  At
+ * every dimsp an index takes, from pointers at every alignment the
+ * kernels' loads could straddle.
+ */
 static void
 test_kernels(void)
 {
 	int			which;
 	int			ran = 0;
+	char		names[128] = "";
+	long		draws;
 
 	cur_phase = "kernels";
-	for (which = 0; which <= 1; which++)
+	swap_rng();
+
+	/* the 8-bit sums compute recon8[c] rather than load it: it must be exact */
+	{
+		bool		ok = true;
+		int			k;
+
+		for (k = 0; k < 256; k++)
+			ok &= (double) lionvec_recon8[k] ==
+				(double) k * (1.0 / LIONVEC_STEPS8) + (-LIONVEC_CLIP8 + 0.5 / LIONVEC_STEPS8);
+		CHECK(ok, "recon8[c] is not c / 32 - 4 + 1/64 exactly");
+	}
+
+	for (which = 0; which <= LIONVEC_KERNELS_MAX; which++)
 	{
 		int			nwords;
+		int			D;
+		bool		dot_ok = true;
+		bool		sum8_ok = true;
+		bool		l2_ok = true;
+		bool		l2_near = true;
+		bool		sum8_near = true;
+		bool		rot_ok = true;
 
 		if (!lionvec_kernel_force(which))
-			continue;
-		ran++;
-		for (nwords = 1; nwords <= 127; nwords += (nwords < 8 ? 1 : 13))
 		{
-			uint64	   *bits = (uint64 *) xmalloc(sizeof(uint64) * nwords);
-			uint64	   *planes = (uint64 *) xmalloc(sizeof(uint64) * nwords * LIONVEC_QBITS);
+			printf("vec_test: no %s kernels in this build or on this CPU\n",
+				   kernel_names[which]);
+			continue;
+		}
+		ran++;
+		snprintf(names + strlen(names), sizeof(names) - strlen(names), "%s%s",
+				 ran > 1 ? ", " : "", kernel_names[which]);
+
+		/* plane 1, at every word count an index takes, one word off alignment */
+		for (nwords = 1; nwords <= TEST_MAX_DIMSP / 64; nwords++)
+		{
+			uint64	   *bitsbuf = (uint64 *) xmalloc(sizeof(uint64) * (nwords + 1));
+			uint64	   *planesbuf = (uint64 *) xmalloc(sizeof(uint64) * (nwords * LIONVEC_QBITS + 1));
 			int			trial;
 			int			i;
-			bool		ok = true;
 
-			for (trial = 0; trial < 20; trial++)
+			for (trial = 0; trial < 4; trial++)
 			{
+				uint64	   *bits = bitsbuf + trial % 2;
+				uint64	   *planes = planesbuf + trial / 2;
+
 				for (i = 0; i < nwords; i++)
 					bits[i] = rnd64() & (trial % 3 == 0 ? rnd64() : ~UINT64CONST(0));
 				for (i = 0; i < nwords * LIONVEC_QBITS; i++)
 					planes[i] = rnd64();
-				ok &= lionvec_plane_dot(bits, planes, nwords) == naive_dot(bits, planes, nwords);
+				dot_ok &= lionvec_plane_dot(bits, planes, nwords) == naive_dot(bits, planes, nwords);
 			}
 			/* everything set: the largest sum a kernel adds up */
 			for (i = 0; i < nwords; i++)
-				bits[i] = ~UINT64CONST(0);
+				bitsbuf[i] = ~UINT64CONST(0);
 			for (i = 0; i < nwords * LIONVEC_QBITS; i++)
-				planes[i] = ~UINT64CONST(0);
-			ok &= lionvec_plane_dot(bits, planes, nwords) == (uint32) (nwords * 64 * 15);
-			CHECK(ok, which == 0 ? "portable kernel differs from the naive count" :
-				  "POPCNT kernel differs from the naive count");
-			free(bits);
-			free(planes);
+				planesbuf[i] = ~UINT64CONST(0);
+			dot_ok &= lionvec_plane_dot(bitsbuf, planesbuf, nwords) == (uint32) (nwords * 64 * 15);
+			free(bitsbuf);
+			free(planesbuf);
 		}
+
+		/* the sums and the rotation, at every dimsp */
+		for (D = 64; D <= TEST_MAX_DIMSP; D += 64)
+		{
+			int			off = (D / 64) % 32;	/* bytes off a 32-byte boundary */
+			int			foff = (D / 64) % 8;	/* floats off it */
+			uint8	   *codesbuf = (uint8 *) xmalloc(D + 31);
+			float	   *qcbuf = falloc(D + 7);
+			float	   *bbuf = falloc(D + 7);
+			double	   *terms = (double *) xmalloc(sizeof(double) * D);
+			uint8	   *codes = codesbuf + off;
+			float	   *qc = qcbuf + foff;
+			float	   *b = bbuf + (7 - foff);
+			int			kind = D / 64;
+			double		ref;
+			double		serial;
+			double		got;
+			int			i;
+
+			for (i = 0; i < D; i++)
+			{
+				codes[i] = kind % 4 == 0 ? 0 : kind % 4 == 1 ? 255 : (uint8) rnd64();
+				/* mostly of any scale; some of one kind; some mixed */
+				qc[i] = rnd_float(kind % 3 == 0 ? (int) (rnd64() % RND_KINDS) :
+								  kind % 3 == 1 ? kind : RND_KINDS - 1);
+				b[i] = rnd_float(kind % 4 == 0 ? (int) (rnd64() % RND_KINDS) :
+								 kind % 4 == 1 ? kind + 1 : RND_KINDS - 1);
+			}
+
+			for (i = 0; i < D; i++)
+				terms[i] = (double) lionvec_recon8[codes[i]] * (double) qc[i];
+			ref = lanes_reference(terms, D, &serial);
+			got = lionvec_sum8(codes, qc, D);
+			sum8_ok &= memcmp(&got, &ref, sizeof(double)) == 0;
+			sum8_near &= fabs(got - serial) <= 1e-12 * (fabs(serial) + 1e-300) ||
+				fabs(got - serial) <= 1e-9 * sqrt(dot_ff(qc, qc, D));
+
+			for (i = 0; i < D; i++)
+			{
+				double		d = (double) qc[i] - (double) b[i];
+
+				terms[i] = d * d;
+			}
+			ref = lanes_reference(terms, D, &serial);
+			got = lionvec_l2sq(qc, b, D);
+			l2_ok &= memcmp(&got, &ref, sizeof(double)) == 0;
+			l2_near &= fabs(got - serial) <= 1e-12 * serial;
+
+			/* the rotation, against the portable kernel's on the same vector */
+			{
+				LionVecRotation rot;
+				float	   *x = qcbuf + (7 - foff);
+				float	   *y = falloc(D);
+
+				make_rotation(&rot, D, (uint32) D);
+				for (i = 0; i < D; i++)
+					x[i] = (float) rnd_gauss() * (i % 5 == 0 ? 1e-30f : 1.0f);
+				memcpy(y, x, sizeof(float) * D);
+				lionvec_rotate(&rot, x);
+				lionvec_kernel_force(LIONVEC_KERNELS_PORTABLE);
+				lionvec_rotate(&rot, y);
+				lionvec_kernel_force(which);
+				rot_ok &= memcmp(x, y, sizeof(float) * D) == 0;
+				free(y);
+				free(rot.signs);
+			}
+			free(codesbuf);
+			free(qcbuf);
+			free(bbuf);
+			free(terms);
+		}
+		CHECK(dot_ok, "a plane-1 kernel differs from the naive count");
+		CHECK(sum8_ok, "an 8-bit sum differs from the lanes' sum");
+		CHECK(sum8_near, "an 8-bit sum is not near the plain sum");
+		CHECK(l2_ok, "an l2sq differs from the lanes' sum");
+		CHECK(l2_near, "an l2sq is not near the plain sum");
+		CHECK(rot_ok, "a rotation differs from the portable one");
 	}
 	CHECK(ran >= 1, "no kernel ran");
-	printf("vec_test: %d popcount kernel(s) tested\n", ran);
+	printf("vec_test: kernels tested: %s\n", names);
 	lionvec_kernels_init();
+	swap_rng();
+
+	/*
+	 * The statistical checks after this test are calibrated on the numbers
+	 * they have always drawn: pass over as many as it drew from the shared
+	 * generator before it had its own - 107 a word, for 693 words, for each
+	 * of two kernels.
+	 */
+	for (draws = 0; draws < 2 * 107 * 693; draws++)
+		(void) rnd64();
+}
+
+/* ---------- a halfvec's halves, and pgvector's datums ---------- */
+
+/*
+ * The value of the half h, from its fields, in double: what lionvec_halves()
+ * must give, stated apart from it.
+ */
+static double
+half_reference(uint16 h)
+{
+	int			sign = h >> 15;
+	int			e = (h >> 10) & 0x1f;
+	int			m = h & 0x3ff;
+	double		v;
+
+	if (e == 31)
+		v = m == 0 ? INFINITY : NAN;
+	else if (e == 0)
+		v = ldexp((double) m, -24);	/* subnormal: m 2^-10 of 2^-14 */
+	else
+		v = ldexp(1.0 + (double) m / 1024.0, e - 15);
+	return sign ? -v : v;
+}
+
+
+/*
+ * Every half converted: the portable kernel against half_reference(), bit
+ * for bit but any NaN for a NaN, and its NaNs quiet with their payloads;
+ * then every set's kernel against the portable one's, bit for bit, NaNs
+ * included - once over all 65,536 in one array, which F16C converts eight
+ * at a time, and at every length from 0 to 40 from every alignment of
+ * eight, which ends in a tail, into exact-size buffers and no further.
+ */
+static void
+test_halves(void)
+{
+	uint16	   *h = (uint16 *) xmalloc(sizeof(uint16) * 65536);
+	float	   *port = falloc(65536);
+	float	   *x = falloc(65536);
+	bool		ok = true;
+	bool		quiet = true;
+	int			nnan = 0;
+	int			which;
+	int			ran = 0;
+	char		names[160] = "";
+	int			i;
+
+	cur_phase = "halves";
+	for (i = 0; i < 65536; i++)
+		h[i] = (uint16) i;
+
+	lionvec_kernel_force(LIONVEC_KERNELS_PORTABLE);
+	lionvec_halves(h, 65536, port);
+	for (i = 0; i < 65536; i++)
+	{
+		float		r = (float) half_reference(h[i]);
+		uint32		bits;
+
+		memcpy(&bits, &port[i], sizeof(bits));
+		if (isnan(r))
+		{
+			nnan++;
+			ok &= isnan(port[i]);
+			/* the quiet bit, and the payload, at the top of the mantissa */
+			quiet &= bits == (((uint32) (h[i] & 0x8000) << 16) | 0x7fc00000 |
+							  ((uint32) (h[i] & 0x3ff) << 13));
+		}
+		else
+			ok &= memcmp(&r, &port[i], sizeof(float)) == 0;
+	}
+	CHECK(ok, "a half's float is not its value");
+	CHECK(nnan == 2 * 1023, "not every NaN half was taken for one");
+	CHECK(quiet, "a NaN half's float is not the quiet NaN of its payload");
+	CHECK(port[0x0001] == 5.9604644775390625e-8f && port[0x8000] == 0.0f &&
+		  signbit(port[0x8000]) && port[0x7bff] == 65504.0f &&
+		  port[0x0400] == 6.103515625e-5f && port[0x03ff] < port[0x0400] &&
+		  isinf(port[0xfc00]) && port[0xfc00] < 0,
+		  "a landmark half's float");
+
+	for (which = 0; which <= LIONVEC_KERNELS_MAX; which++)
+	{
+		bool		same = true;
+		bool		tails = true;
+		uint32		k = 0;
+		int			off;
+		int			n;
+
+		if (!lionvec_kernel_force(which))
+			continue;
+		ran++;
+		snprintf(names + strlen(names), sizeof(names) - strlen(names), "%s%s%s",
+				 ran > 1 ? ", " : "", kernel_names[which],
+				 lionvec_kernel_f16c() ? " (F16C)" : "");
+
+		memset(x, 0, sizeof(float) * 65536);
+		lionvec_halves(h, 65536, x);
+		same &= memcmp(x, port, sizeof(float) * 65536) == 0;
+
+		for (off = 0; off < 8; off++)
+		{
+			for (n = 0; n <= 40; n++)
+			{
+				uint16	   *src = (uint16 *) xmalloc(sizeof(uint16) * (off + n));
+				float	   *dst = falloc(off + n + 1);
+				const float sentinel = 1234.5f;
+
+				for (i = 0; i < n; i++)
+					src[off + i] = (uint16) ((++k * 0x9E3779B1u) >> 16);
+				dst[off + n] = sentinel;
+				lionvec_halves(src + off, n, dst + off);
+				for (i = 0; i < n; i++)
+					tails &= memcmp(&dst[off + i], &port[src[off + i]], sizeof(float)) == 0;
+				tails &= memcmp(&dst[off + n], &sentinel, sizeof(float)) == 0;
+				free(src);
+				free(dst);
+			}
+		}
+		CHECK(same, "a set converts the halves other than the portable kernel");
+		CHECK(tails, "a set converts a short or unaligned run of halves wrong");
+	}
+	CHECK(ran >= 1, "no kernel ran");
+	printf("vec_test: halves converted by the sets: %s\n", names);
+	lionvec_kernels_init();
+
+	free(x);
+	free(port);
+	free(h);
+}
+
+/*
+ * lionvec_datum_dim(): the bytes a vector or halfvec datum must have - its
+ * header, a count no less than zero, and the count's elements - from
+ * exact-size buffers, so that `make unit SANITIZE=1` would see the count
+ * read from a datum too short to hold it.
+ */
+static int
+datum_dim(Size len, int16 dim, bool half)
+{
+	char	   *p = (char *) xmalloc(len);
+	int			got;
+
+	if (len >= offsetof(LionVecPgVector, x))
+	{
+		LionVecPgVector hdr;
+
+		memset(&hdr, 0, sizeof(hdr));
+		hdr.dim = dim;
+		memcpy(p, &hdr, offsetof(LionVecPgVector, x));
+		memset(p + offsetof(LionVecPgVector, x), 0x3c,
+			   len - offsetof(LionVecPgVector, x));
+	}
+	else
+		memset(p, 0, len);
+	got = lionvec_datum_dim(p, len, half);
+	free(p);
+	return got;
+}
+
+static void
+test_datums(void)
+{
+	bool		ok = true;
+	Size		len;
+
+	cur_phase = "datums";
+	CHECK(offsetof(LionVecPgVector, x) == 8 && offsetof(LionVecPgHalfVector, x) == 8 &&
+		  offsetof(LionVecPgVector, dim) == 4 && offsetof(LionVecPgHalfVector, dim) == 4,
+		  "pgvector's header is not as it lays it out");
+
+	/* shorter than the header: never read */
+	for (len = 0; len < 8; len++)
+		ok &= datum_dim(len, 0, false) == -1 && datum_dim(len, 0, true) == -1;
+	CHECK(ok, "a datum shorter than its header is taken for one");
+
+	CHECK(datum_dim(8, 0, false) == 0 && datum_dim(8, 0, true) == 0,
+		  "a header alone is not a datum of no dimensions");
+	CHECK(datum_dim(8 + 4 * 3, 3, false) == 3 && datum_dim(8 + 4 * 3 - 1, 3, false) == -1 &&
+		  datum_dim(8 + 4 * 3 + 4, 3, false) == 3,
+		  "a vector's length against its count");
+	CHECK(datum_dim(8 + 2 * 3, 3, true) == 3 && datum_dim(8 + 2 * 3 - 1, 3, true) == -1 &&
+		  datum_dim(8 + 2 * 3, 3, false) == -1,
+		  "a halfvec's length against its count");
+	CHECK(datum_dim(8 + 2 * 16000, 16000, true) == 16000 &&
+		  datum_dim(8 + 4 * 16000, 16000, false) == 16000 &&
+		  datum_dim(8 + 4 * 16000 - 1, 16000, false) == -1,
+		  "pgvector's most dimensions");
+	CHECK(datum_dim(64, -1, false) == -1 && datum_dim(64, -1, true) == -1 &&
+		  datum_dim(64, PG_INT16_MIN, true) == -1,
+		  "a negative count is taken");
+	CHECK(datum_dim(64, PG_INT16_MAX, false) == -1 && datum_dim(64, PG_INT16_MAX, true) == -1,
+		  "a count beyond the bytes is taken");
 }
 
 /* ---------- the key algebra, and the bounds' coverage ---------- */
@@ -1368,6 +1772,699 @@ test_kmeans(void)
 	free(centers);
 }
 
+/*
+ * Each set of kernels, end to end: the same query planes, estimates,
+ * candidates and k-means as the portable set's, to the bit, on clustered
+ * rows - what makes a scan or a build decide alike on any CPU.
+ */
+static void
+test_kernels_agree(void)
+{
+	int			D = 320;
+	int			T = 6;
+	int			n = 600;
+	int			k = 24;
+	float	   *rows = falloc(n * D);
+	float	   *centers = falloc(T * D);
+	float	   *mean = falloc(D);
+	float	   *cent0 = falloc(k * D);
+	float	   *cent = falloc(k * D);
+	int		   *assign0 = (int *) xmalloc(sizeof(int) * n);
+	double	   *est0 = (double *) xmalloc(sizeof(double) * 4 * n);
+	double	   *est = (double *) xmalloc(sizeof(double) * 4 * n);
+	float	   *x = falloc(D);
+	float	   *xc = falloc(D);
+	float	   *rot0 = falloc(n * D);
+	LionVecRotation rot;
+	LionVecKmeansWork w;
+	Sample		sm;
+	EncBufs		b;
+	LionVecQuery q;
+	int			which;
+	int			i;
+	int			j;
+
+	cur_phase = "kernels agree";
+	swap_rng();
+	for (i = 0; i < T * D; i++)
+		centers[i] = (float) rnd_gauss();
+	for (i = 0; i < n; i++)
+		for (j = 0; j < D; j++)
+			rows[(Size) i * D + j] = centers[(Size) (i % T) * D + j] + (float) (0.4 * rnd_gauss());
+	for (j = 0; j < D; j++)
+	{
+		double		s = 0.0;
+
+		for (i = 0; i < n; i++)
+			s += rows[(Size) i * D + j];
+		mean[j] = (float) (s / n);
+	}
+	make_rotation(&rot, D, 99);
+	enc_alloc(&b, D);
+	query_alloc(&q, D);
+	sample_make(&sm, rows, n, D);
+	kmeans_work(&w, n, k, D);
+
+	for (which = 0; which <= LIONVEC_KERNELS_MAX; which++)
+	{
+		bool		same = true;
+
+		if (!lionvec_kernel_force(which))
+			continue;
+		/* rotate, encode against the mean, estimate against row 0's query */
+		lionvec_prepare(&rot, LIONVEC_COSINE, rows, D, x);
+		lionvec_query_init(&q, LIONVEC_COSINE, mean, x, 3.0);
+		for (i = 0; i < n; i++)
+		{
+			float	   *xi = which == 0 ? rot0 + (Size) i * D : x;
+
+			lionvec_prepare(&rot, LIONVEC_COSINE, rows + (Size) i * D, D, xi);
+			if (which > 0)
+				same &= memcmp(xi, rot0 + (Size) i * D, sizeof(float) * D) == 0;
+			memcpy(xc, xi, sizeof(float) * D);
+			lionvec_encode(mean, D, xc, &b.e);
+			lionvec_estimate1(&q, b.e.bits, b.e.popcount, b.e.norm, b.e.alpha1,
+							  &est[4 * i], &est[4 * i + 1]);
+			lionvec_estimate8(&q, b.e.codes, b.e.norm, b.e.alpha8, b.e.rnorm8,
+							  &est[4 * i + 2], &est[4 * i + 3]);
+		}
+		lionvec_kmeans(&sm.s, k, 10, true, 7, mean, cent, &w);
+		if (which == 0)
+		{
+			memcpy(est0, est, sizeof(double) * 4 * n);
+			memcpy(cent0, cent, sizeof(float) * k * D);
+			memcpy(assign0, w.assign, sizeof(int) * n);
+			continue;
+		}
+		CHECK(same, "a kernel set rotates other than the portable one");
+		CHECK(memcmp(est, est0, sizeof(double) * 4 * n) == 0,
+			  "a kernel set estimates other than the portable one");
+		CHECK(memcmp(cent, cent0, sizeof(float) * k * D) == 0 &&
+			  memcmp(w.assign, assign0, sizeof(int) * n) == 0,
+			  "a kernel set's k-means differs from the portable one's");
+	}
+	lionvec_kernels_init();
+	swap_rng();
+
+	kmeans_work_free(&w);
+	sample_free(&sm);
+	query_free(&q);
+	enc_free(&b);
+	free(rot.signs);
+	free(rot0);
+	free(xc);
+	free(x);
+	free(est);
+	free(est0);
+	free(assign0);
+	free(cent);
+	free(cent0);
+	free(mean);
+	free(centers);
+	free(rows);
+}
+
+/* ---------- spill: ranking, the m nearest's candidates, SOAR ---------- */
+
+/* NaN as infinity, as lionvec_rank() takes it */
+static double
+rank_key(double k)
+{
+	return isnan(k) ? INFINITY : k;
+}
+
+/*
+ * lionvec_rank() against a reference - every place, the m least by a
+ * stable selection - for keys with ties, NaNs and infinities, of every
+ * length up to 40 and every m up to LIONVEC_RANK_MAX.
+ */
+static void
+test_rank(void)
+{
+	double		key[40];
+	int			order[LIONVEC_RANK_MAX];
+	int			ref[40];
+	bool		taken[40];
+	bool		ok = true;
+	int			trial;
+
+	cur_phase = "rank";
+	for (trial = 0; trial < 400; trial++)
+	{
+		int			n = (int) (rnd64() % 41);
+		int			m = (int) (rnd64() % (LIONVEC_RANK_MAX + 1));
+		int			r;
+		int			want = Min(n, m);
+		int			i;
+		int			j;
+
+		for (i = 0; i < n; i++)
+		{
+			uint64		u = rnd64() % 20;
+
+			/* few distinct values, so that ties are common */
+			key[i] = u == 0 ? NAN : u == 1 ? INFINITY : u == 2 ? -INFINITY :
+				(double) (rnd64() % 6);
+		}
+		/* the reference: the least not yet taken, the lowest place among equals */
+		memset(taken, 0, sizeof(taken));
+		for (j = 0; j < want; j++)
+		{
+			int			b = -1;
+
+			for (i = 0; i < n; i++)
+				if (!taken[i] && (b < 0 || rank_key(key[i]) < rank_key(key[b])))
+					b = i;
+			taken[b] = true;
+			ref[j] = b;
+		}
+		r = lionvec_rank(key, n, m, order);
+		ok &= r == want;
+		for (j = 0; j < want && r == want; j++)
+			ok &= order[j] == ref[j];
+	}
+	CHECK(ok, "rank: not the m least, least first, ties to the lower place");
+	CHECK(lionvec_rank(key, 0, 4, order) == 0, "rank of no keys");
+	CHECK(lionvec_rank(key, 5, 0, order) == 0, "rank of none wanted");
+}
+
+/*
+ * lionvec_candidates_n() on clustered centroids: m = 1 is
+ * lionvec_candidates(); the exact m nearest are always candidates at a wide
+ * bound and nearly always at the build's; there are at least m; fewer
+ * centroids than m are all candidates.
+ */
+static void
+test_candidates_n(void)
+{
+	static const int dims[] = {64, 320, 1536};
+	int			di;
+
+	cur_phase = "candidates_n";
+	for (di = 0; di < 3; di++)
+	{
+		int			D = dims[di];
+		int			k = 200;
+		int			T = 20;
+		int			m = LIONVEC_SOAR_CANDS + 1;
+		float	   *centers = falloc(T * D);
+		float	   *cent = falloc(k * D);
+		float	   *x = falloc(D);
+		double	   *lo = (double *) xmalloc(sizeof(double) * k);
+		double	   *hi = (double *) xmalloc(sizeof(double) * k);
+		double	   *lo1 = (double *) xmalloc(sizeof(double) * k);
+		double	   *hi1 = (double *) xmalloc(sizeof(double) * k);
+		int		   *cand = (int *) xmalloc(sizeof(int) * k);
+		int		   *cand1 = (int *) xmalloc(sizeof(int) * k);
+		double	   *dist = (double *) xmalloc(sizeof(double) * k);
+		int			near[LIONVEC_SOAR_CANDS + 1];
+		LionVecQuery q;
+		CentCodes	cc;
+		long		missed_wide = 0;
+		long		missed = 0;
+		long		ncand = 0;
+		bool		same = true;
+		bool		enough = true;
+		int			trial;
+		int			i;
+		int			j;
+
+		query_alloc(&q, D);
+		for (i = 0; i < T * D; i++)
+			centers[i] = (float) rnd_gauss();
+		for (j = 0; j < k; j++)
+			for (i = 0; i < D; i++)
+				cent[(Size) j * D + i] = centers[(Size) (j % T) * D + i] +
+					(float) (rnd_gauss() * 0.4);
+		cent_codes(&cc, cent, k, D, NULL);
+
+		for (trial = 0; trial < 200; trial++)
+		{
+			int			c = (int) (rnd64() % k);
+			int			nc;
+			int			nc1;
+
+			for (i = 0; i < D; i++)
+				x[i] = cent[(Size) c * D + i] + (float) (rnd_gauss() * 0.4);
+			for (j = 0; j < k; j++)
+			{
+				dist[j] = 0.0;
+				for (i = 0; i < D; i++)
+				{
+					double		t = (double) x[i] - cent[(Size) j * D + i];
+
+					dist[j] += t * t;
+				}
+			}
+			CHECK(lionvec_rank(dist, k, m, near) == m, "rank of the distances");
+
+			lionvec_query_init(&q, LIONVEC_L2, NULL, x, 10.0);
+			nc = lionvec_candidates_n(&cc.c, &q, m, lo, hi, cand);
+			enough &= nc >= m;
+			for (j = 0; j < m; j++)
+			{
+				bool		in = false;
+				int			c2;
+
+				for (c2 = 0; c2 < nc; c2++)
+					in |= cand[c2] == near[j];
+				missed_wide += !in;
+			}
+
+			lionvec_query_init(&q, LIONVEC_L2, NULL, x, LIONVEC_ASSIGN_EPS);
+			nc = lionvec_candidates_n(&cc.c, &q, m, lo, hi, cand);
+			ncand += nc;
+			enough &= nc >= m;
+			for (j = 0; j < m; j++)
+			{
+				bool		in = false;
+				int			c2;
+
+				for (c2 = 0; c2 < nc; c2++)
+					in |= cand[c2] == near[j];
+				missed += !in;
+			}
+			nc = lionvec_candidates_n(&cc.c, &q, 1, lo, hi, cand);
+			nc1 = lionvec_candidates(&cc.c, &q, lo1, hi1, cand1);
+			same &= nc == nc1 && memcmp(cand, cand1, sizeof(int) * nc) == 0;
+		}
+		CHECK(same, "candidates_n of 1 is not candidates");
+		CHECK(enough, "fewer candidates than m");
+		CHECK(missed_wide == 0, "one of the m nearest is not a candidate at 10 sd");
+		/* at most one of the 1,800 pairs, as the nearest alone misses one in 200 */
+		CHECK(missed <= 1, "one of the m nearest missed at the build's bounds");
+		/*
+		 * and few: all but the row's own group of k / T at enough dimensions,
+		 * as for the nearest alone (test_candidates())
+		 */
+		CHECK(ncand < 200L * (D >= 320 ? 2 * (k / T) : k * 3 / 4),
+			  "the candidates of the m nearest are most of the centroids");
+		printf("vec_test: dims %4d: %.1f candidates for the %d nearest of %d centroids\n",
+			   D, (double) ncand / 200, m, k);
+
+		/* fewer centroids than m: all of them */
+		cc.c.k = 5;
+		CHECK(lionvec_candidates_n(&cc.c, &q, m, lo, hi, cand) == 5,
+			  "fewer centroids than m are not all candidates");
+		cc.c.k = 0;
+		CHECK(lionvec_candidates_n(&cc.c, &q, m, lo, hi, cand) == 0,
+			  "candidates of no centroids");
+		cent_codes_free(&cc);
+
+		query_free(&q);
+		free(dist);
+		free(cand1);
+		free(cand);
+		free(hi1);
+		free(lo1);
+		free(hi);
+		free(lo);
+		free(x);
+		free(cent);
+		free(centers);
+	}
+}
+
+/*
+ * lionvec_decode8(): the codes' vector scaled to x's projection on it, so
+ * |x - y|^2 = |x|^2 (1 - alpha8^2), about a percent of |x| at any dimension
+ * (the 8-bit steps' rounding, and a clipped coordinate now and then); and
+ * no length, no vector.
+ */
+static void
+test_decode8(void)
+{
+	static const int dims[] = {64, 320, 1536, 8128};
+	int			di;
+
+	cur_phase = "decode8";
+	for (di = 0; di < (int) lengthof(dims); di++)
+	{
+		int			D = dims[di];
+		float	   *x = falloc(D);
+		float	   *xc = falloc(D);
+		float	   *y = falloc(D);
+		float	   *mean = falloc(D);
+		EncBufs		b;
+		bool		exact = true;
+		bool		near = true;
+		bool		proj = true;
+		double		rel = 0.0;
+		int			trial;
+		int			i;
+
+		enc_alloc(&b, D);
+		for (i = 0; i < D; i++)
+			mean[i] = (float) (rnd_gauss() * 0.3);
+		for (trial = 0; trial < 40; trial++)
+		{
+			double		n2;
+			double		e2 = 0.0;
+			double		ye = 0.0;
+
+			for (i = 0; i < D; i++)
+				x[i] = mean[i] + (float) (rnd_gauss() * (0.1 + trial % 4));
+			lionvec_encode(mean, D, x, &b.e);	/* centres x */
+			memcpy(xc, x, sizeof(float) * D);
+			lionvec_decode8(b.codes, D, b.e.norm, b.e.alpha8, b.e.rnorm8, y);
+			n2 = dot_ff(xc, xc, D);
+			for (i = 0; i < D; i++)
+			{
+				double		e = (double) xc[i] - y[i];
+
+				e2 += e * e;
+				ye += e * y[i];
+			}
+			/* float rounding of each coordinate is far below the codes' error */
+			exact &= fabs(e2 - n2 * (1.0 - (double) b.e.alpha8 * b.e.alpha8)) <=
+				1e-3 * n2 * (1.0 - (double) b.e.alpha8 * b.e.alpha8) + 1e-9 * n2;
+			/* a 32nd of a standard deviation a coordinate, and the rare clipped one */
+			near &= e2 <= 0.03 * 0.03 * n2;
+			rel += sqrt(e2 / n2);
+			/* the error is orthogonal to y: y is x's projection */
+			proj &= fabs(ye) <= 1e-4 * n2;
+		}
+		CHECK(exact, "decode8 is not |x|^2 (1 - alpha8^2) from x");
+		CHECK(near, "decode8 is more than 3% of |x| from x");
+		/* (1/32) / sqrt(12) = 0.9% of |x| for uniform rounding */
+		CHECK(rel / 40 < 0.012, "decode8 is on average more than 1.2% of |x| from x");
+		CHECK(proj, "decode8 is not x's projection on the codes' vector");
+
+		/* a row at the mean: codes with no length */
+		memcpy(x, mean, sizeof(float) * D);
+		lionvec_encode(mean, D, x, &b.e);
+		lionvec_decode8(b.codes, D, b.e.norm, b.e.alpha8, b.e.rnorm8, y);
+		{
+			bool		zero = true;
+
+			for (i = 0; i < D; i++)
+				zero &= y[i] == 0.0f;
+			CHECK(zero, "decode8 of a vector at the mean is not zero");
+		}
+		lionvec_decode8(b.codes, D, 1.0f, 1.0f, 0.0f, y);
+		{
+			bool		zero = true;
+
+			for (i = 0; i < D; i++)
+				zero &= y[i] == 0.0f;
+			CHECK(zero, "decode8 of codes of no length is not zero");
+		}
+		enc_free(&b);
+		free(mean);
+		free(y);
+		free(xc);
+		free(x);
+	}
+}
+
+/* SOAR's cost of c, the obvious way: rhat as a vector, then the projection */
+static double
+soar_cost_ref(const float *x, const float *c1, const float *c, int D, double lambda)
+{
+	double	   *rhat = (double *) xmalloc(sizeof(double) * D);
+	double		rn = 0.0;
+	double		d2 = 0.0;
+	double		p = 0.0;
+	int			i;
+
+	for (i = 0; i < D; i++)
+	{
+		rhat[i] = (double) x[i] - c1[i];
+		rn += rhat[i] * rhat[i];
+	}
+	rn = sqrt(rn);
+	for (i = 0; i < D; i++)
+	{
+		double		d = (double) x[i] - c[i];
+
+		if (rn > 0.0)
+			p += rhat[i] / rn * d;
+		d2 += d * d;
+	}
+	free(rhat);
+	return d2 + lambda * p * p;
+}
+
+/*
+ * SOAR's choice on vectors whose answer is known: x at the origin, c1 at
+ * -e0, so that the residual points along e0; a candidate at e0, 1 away and
+ * straight along it, costs 1 + lambda; one at t e1, t away and square to
+ * it, t^2.  So with lambda = 1 the square one wins below t = sqrt(2) and
+ * loses above it, and with lambda = 0 the nearer wins.  Then the cost's
+ * algebra against soar_cost_ref() on random vectors; one candidate, none,
+ * identical ones (the first), a row at c1 (no residual: the nearest), and
+ * a candidate that is not a number.
+ */
+static void
+test_soar_algebra(void)
+{
+	int			D = 64;
+	float	   *x = falloc(D);
+	float	   *c1 = falloc(D);
+	float	   *a = falloc(D);
+	float	   *b = falloc(D);
+	float	   *c = falloc(D);
+	const float *cs[4];
+	bool		ok = true;
+	int			trial;
+	int			i;
+
+	cur_phase = "soar";
+	memset(x, 0, sizeof(float) * D);
+	memset(c1, 0, sizeof(float) * D);
+	memset(a, 0, sizeof(float) * D);
+	memset(b, 0, sizeof(float) * D);
+	c1[0] = -1.0f;
+	a[0] = 1.0f;
+
+	b[1] = 1.4f;
+	cs[0] = a;
+	cs[1] = b;
+	CHECK(fabs(lionvec_soar_cost(x, c1, a, D, 1.0) - 2.0) < 1e-12, "soar: along the residual costs 2");
+	CHECK(fabs(lionvec_soar_cost(x, c1, b, D, 1.0) - 1.4 * 1.4) < 1e-6, "soar: square to it costs t^2");
+	CHECK(fabs(lionvec_soar_cost(x, c1, a, D, 0.5) - 1.5) < 1e-12, "soar: lambda scales the parallel part");
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, 1.0) == 1, "soar: t = 1.4 is not chosen");
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, 0.0) == 0, "soar: lambda 0 is not the nearest");
+	b[1] = 1.42f;
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, 1.0) == 0, "soar: t = 1.42 is chosen");
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, LIONVEC_SOAR_LAMBDA) == 0, "soar: the default lambda is not 1");
+	b[1] = 1.4f;
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, LIONVEC_SOAR_LAMBDA) == 1, "soar: the default lambda is not 1");
+
+	/* the algebra, against the obvious way */
+	for (trial = 0; trial < 200; trial++)
+	{
+		double		lambda = trial % 3 == 0 ? 1.0 : 3.0 * rnd_unit();
+		double		got;
+		double		want;
+
+		for (i = 0; i < D; i++)
+		{
+			x[i] = (float) rnd_gauss();
+			c1[i] = (float) (x[i] + rnd_gauss() * 0.3);
+			c[i] = (float) (x[i] + rnd_gauss() * 0.5);
+		}
+		got = lionvec_soar_cost(x, c1, c, D, lambda);
+		want = soar_cost_ref(x, c1, c, D, lambda);
+		ok &= fabs(got - want) <= 1e-9 * (1.0 + want);
+		/* lambda = 1: |d|^2 (1 + cos^2) of the angle between d and r */
+		if (lambda == 1.0)
+		{
+			double		d2 = 0.0;
+			double		rd = 0.0;
+			double		r2 = 0.0;
+
+			for (i = 0; i < D; i++)
+			{
+				double		d = (double) x[i] - c[i];
+				double		r = (double) x[i] - c1[i];
+
+				d2 += d * d;
+				rd += r * d;
+				r2 += r * r;
+			}
+			ok &= fabs(got - d2 * (1.0 + rd * rd / (r2 * d2))) <= 1e-9 * (1.0 + got);
+		}
+	}
+	CHECK(ok, "soar: the cost is not |d|^2 + lambda <rhat, d>^2");
+
+	/* one candidate, none, identical ones */
+	cs[0] = c;
+	CHECK(lionvec_soar_second(x, c1, cs, 1, D, 1.0) == 0, "soar: one candidate is not chosen");
+	CHECK(lionvec_soar_second(x, c1, cs, 0, D, 1.0) == -1, "soar: no candidates");
+	cs[0] = cs[1] = cs[2] = cs[3] = c;
+	CHECK(lionvec_soar_second(x, c1, cs, 4, D, 1.0) == 0, "soar: identical candidates are not a tie to the first");
+
+	/* a row at c1: no residual, so the nearest */
+	memcpy(c1, x, sizeof(float) * D);
+	for (i = 0; i < D; i++)
+	{
+		a[i] = (float) (x[i] + rnd_gauss() * 0.5);
+		b[i] = (float) (x[i] + rnd_gauss() * 0.2);
+	}
+	cs[0] = a;
+	cs[1] = b;
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, 1.0) == 1, "soar: a row at c1 does not go to the nearest");
+	CHECK(fabs(lionvec_soar_cost(x, c1, a, D, 1.0) - soar_cost_ref(x, c1, a, D, 0.0)) <
+		  1e-9 * (1.0 + soar_cost_ref(x, c1, a, D, 0.0)), "soar: a row at c1 costs |d|^2");
+
+	/* not a number: never chosen over a number, and infinite */
+	a[3] = NAN;
+	cs[0] = a;
+	CHECK(isinf(lionvec_soar_cost(x, c1, a, D, 1.0)), "soar: a NaN cost is not infinite");
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, 1.0) == 1, "soar: a NaN candidate is chosen");
+	cs[1] = a;
+	CHECK(lionvec_soar_second(x, c1, cs, 2, D, 1.0) == 0, "soar: all NaN, not the first");
+
+	free(c);
+	free(b);
+	free(a);
+	free(c1);
+	free(x);
+}
+
+/*
+ * SOAR's choice on clustered rows, as the build makes it: each row's
+ * nearest centroid by L2, the next LIONVEC_SOAR_CANDS nearest as the
+ * candidates, nearest first.  The choice has the least cost of them all by
+ * the reference; it differs from the plain second-nearest in a measurable
+ * share of rows, and when it does it lies further off the residual's line;
+ * with lambda 0 it is the second-nearest.  Made as an insert makes it, from
+ * centroids decoded from their 8-bit codes, it is the same for nearly every
+ * row, and otherwise one whose cost is within a percent.
+ */
+static void
+test_soar_clustered(void)
+{
+	static const int dims[] = {64, 384, 1536};
+	int			di;
+
+	cur_phase = "soar clustered";
+	for (di = 0; di < (int) lengthof(dims); di++)
+	{
+		int			D = dims[di];
+		int			k = 120;
+		int			T = 12;
+		int			n = 600;
+		int			m = LIONVEC_SOAR_CANDS + 1;
+		float	   *centers = falloc(T * D);
+		float	   *cent = falloc(k * D);
+		float	   *dec = falloc(k * D);
+		float	   *x = falloc(D);
+		double	   *dist = (double *) xmalloc(sizeof(double) * k);
+		int			near[LIONVEC_SOAR_CANDS + 1];
+		const float *cs[LIONVEC_SOAR_CANDS];
+		const float *ds[LIONVEC_SOAR_CANDS];
+		EncBufs		b;
+		long		differs = 0;
+		long		agree = 0;
+		long		close = 0;
+		double		cos_soar = 0.0;
+		double		cos_plain = 0.0;
+		bool		least = true;
+		bool		plain = true;
+		int			row;
+		int			i;
+		int			j;
+
+		enc_alloc(&b, D);
+		for (i = 0; i < T * D; i++)
+			centers[i] = (float) rnd_gauss();
+		for (j = 0; j < k; j++)
+			for (i = 0; i < D; i++)
+				cent[(Size) j * D + i] = centers[(Size) (j % T) * D + i] +
+					(float) (rnd_gauss() * 0.4);
+		/* the centroids as an insert sees them */
+		for (j = 0; j < k; j++)
+		{
+			memcpy(x, cent + (Size) j * D, sizeof(float) * D);
+			lionvec_encode(NULL, D, x, &b.e);
+			lionvec_decode8(b.codes, D, b.e.norm, b.e.alpha8, b.e.rnorm8, dec + (Size) j * D);
+		}
+
+		for (row = 0; row < n; row++)
+		{
+			int			c = (int) (rnd64() % k);
+			const float *c1;
+			int			s;
+			int			sd;
+			double		best;
+
+			for (i = 0; i < D; i++)
+				x[i] = cent[(Size) c * D + i] + (float) (rnd_gauss() * 0.4);
+			for (j = 0; j < k; j++)
+			{
+				dist[j] = 0.0;
+				for (i = 0; i < D; i++)
+				{
+					double		t = (double) x[i] - cent[(Size) j * D + i];
+
+					dist[j] += t * t;
+				}
+			}
+			(void) lionvec_rank(dist, k, m, near);
+			c1 = cent + (Size) near[0] * D;
+			for (j = 1; j < m; j++)
+			{
+				cs[j - 1] = cent + (Size) near[j] * D;
+				ds[j - 1] = dec + (Size) near[j] * D;
+			}
+			s = lionvec_soar_second(x, c1, cs, m - 1, D, 1.0);
+			plain &= lionvec_soar_second(x, c1, cs, m - 1, D, 0.0) == 0;
+			best = soar_cost_ref(x, c1, cs[s], D, 1.0);
+			for (j = 0; j < m - 1; j++)
+				least &= best <= soar_cost_ref(x, c1, cs[j], D, 1.0) * (1.0 + 1e-9);
+			if (s != 0)
+			{
+				double		r2 = 0.0;
+				double		rp = 0.0;
+				double		rs = 0.0;
+				double		p2 = 0.0;
+				double		s2 = 0.0;
+
+				differs++;
+				for (i = 0; i < D; i++)
+				{
+					double		r = (double) x[i] - c1[i];
+					double		dp = (double) x[i] - cs[0][i];
+					double		ds2 = (double) x[i] - cs[s][i];
+
+					r2 += r * r;
+					rp += r * dp;
+					rs += r * ds2;
+					p2 += dp * dp;
+					s2 += ds2 * ds2;
+				}
+				cos_plain += rp * rp / (r2 * p2);
+				cos_soar += rs * rs / (r2 * s2);
+			}
+
+			/* as an insert chooses: of decoded centroids */
+			sd = lionvec_soar_second(x, dec + (Size) near[0] * D, ds, m - 1, D, 1.0);
+			agree += sd == s;
+			close += sd == s ||
+				soar_cost_ref(x, c1, cs[sd], D, 1.0) <= best * 1.01;
+		}
+		printf("vec_test: dims %4d: SOAR chose other than the second-nearest for %.1f%% of rows "
+			   "(cos^2 to the residual %.3f, against %.3f); decoded centroids agreed on %.1f%%\n",
+			   D, 100.0 * differs / n, cos_soar / Max(differs, 1), cos_plain / Max(differs, 1),
+			   100.0 * agree / n);
+		CHECK(least, "soar: the choice does not have the least cost");
+		CHECK(plain, "soar: lambda 0 is not the second-nearest");
+		CHECK(differs >= n / 10 && differs < n, "soar: the choice is the second-nearest too often, or never");
+		CHECK(cos_soar < cos_plain, "soar: its choices lie no further off the residual than the second-nearest");
+		CHECK(agree >= n * 9 / 10, "soar: decoded centroids choose otherwise too often");
+		CHECK(close == n, "soar: a decoded choice costs more than a percent above the float one");
+
+		enc_free(&b);
+		free(dist);
+		free(x);
+		free(dec);
+		free(cent);
+		free(centers);
+	}
+}
+
 /* ---------- an inner product's partition bound ---------- */
 
 /*
@@ -1554,10 +2651,18 @@ main(void)
 	test_encode();
 	test_query();
 	test_kernels();
+	test_halves();
+	test_datums();
 	test_bounds_nan();
 	test_lift();
 	test_candidates();
 	test_kmeans();
+	test_kernels_agree();
+	test_rank();
+	test_candidates_n();
+	test_decode8();
+	test_soar_algebra();
+	test_soar_clustered();
 	test_coverage();
 
 	printf("vec_test: %ld checks, %ld failed\n", nchecks, nfail);

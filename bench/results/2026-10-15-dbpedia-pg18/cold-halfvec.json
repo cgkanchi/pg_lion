@@ -1,0 +1,235 @@
+{
+ "meta": {
+  "run": {
+   "checkout": "/home/claude/pg_lion-simd",
+   "head": "98af320",
+   "branch": "HEAD",
+   "src_commit": "98af320",
+   "src_dirty": false,
+   "pg_lion_so_sha256": "c05133b4dd79f48f"
+  },
+  "table": "dbpedia_h",
+  "column": "halfvec(1536)",
+  "queries": 7,
+  "restart": "runuser -u pglion -- env LION_SOCK=/tmp/lion-sock-d LION_PORT=55435 /home/claude/pg_lion-simd/dev.sh restart",
+  "run_at": "2026-10-15T18:32:14Z"
+ },
+ "results": [
+  {
+   "name": "lionvec margin=3",
+   "sel": 1.0,
+   "cache_dropped": true,
+   "median_ms": 25.843,
+   "max_ms": 42.834,
+   "all_ms": [
+    16.2,
+    6.9,
+    22.3,
+    25.8,
+    42.8,
+    30.8,
+    28.0
+   ],
+   "pages_read_median": 472.0,
+   "all_pages": [
+    326,
+    180,
+    472,
+    430,
+    667,
+    504,
+    526
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_h_lv on dbpedia_h (actual rows="
+  },
+  {
+   "name": "lionvec margin=7",
+   "sel": 1.0,
+   "cache_dropped": true,
+   "median_ms": 56.41,
+   "max_ms": 75.447,
+   "all_ms": [
+    26.2,
+    17.0,
+    70.1,
+    40.8,
+    75.4,
+    56.4,
+    74.7
+   ],
+   "pages_read_median": 1229.0,
+   "all_pages": [
+    515,
+    324,
+    1306,
+    782,
+    1487,
+    1364,
+    1229
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_h_lv on dbpedia_h (actual rows="
+  },
+  {
+   "name": "lionvec margin=12",
+   "sel": 1.0,
+   "cache_dropped": true,
+   "median_ms": 69.342,
+   "max_ms": 91.211,
+   "all_ms": [
+    68.7,
+    73.4,
+    91.2,
+    69.3,
+    71.4,
+    61.0,
+    57.5
+   ],
+   "pages_read_median": 1291.0,
+   "all_pages": [
+    1233,
+    1283,
+    1921,
+    1291,
+    1487,
+    1358,
+    1229
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_h_lv on dbpedia_h (actual rows="
+  },
+  {
+   "name": "lionvec planner plan",
+   "sel": 0.03,
+   "cache_dropped": true,
+   "median_ms": 273.094,
+   "max_ms": 313.015,
+   "all_ms": [
+    235.7,
+    92.4,
+    231.3,
+    295.2,
+    274.0,
+    313.0,
+    273.1
+   ],
+   "pages_read_median": 4698.0,
+   "all_pages": [
+    4299,
+    1599,
+    5762,
+    3858,
+    4989,
+    4698,
+    5112
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_h_lv on dbpedia_h (actual rows="
+  },
+  {
+   "name": "lionvec margin=3 LionOrdered",
+   "sel": 0.03,
+   "cache_dropped": true,
+   "median_ms": 77.846,
+   "max_ms": 111.841,
+   "all_ms": [
+    64.6,
+    22.2,
+    85.3,
+    53.6,
+    111.8,
+    77.8,
+    91.3
+   ],
+   "pages_read_median": 1599.0,
+   "all_pages": [
+    1346,
+    559,
+    1835,
+    1108,
+    2069,
+    1599,
+    1963
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Custom Scan (LionOrdered) on dbpedia_h (actual rows=10.0 / Lion Cond: (u < '0.03'::double precision) / Lion Indexes: dbpedia_h_u / Lion Set Hits: 10 / Lion Set:"
+  },
+  {
+   "name": "lionvec margin=7 LionOrdered",
+   "sel": 0.03,
+   "cache_dropped": true,
+   "median_ms": 116.908,
+   "max_ms": 144.437,
+   "all_ms": [
+    127.6,
+    91.9,
+    110.8,
+    144.4,
+    144.3,
+    115.1,
+    116.9
+   ],
+   "pages_read_median": 2542.0,
+   "all_pages": [
+    2956,
+    1985,
+    2542,
+    2704,
+    2925,
+    2484,
+    2245
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Custom Scan (LionOrdered) on dbpedia_h (actual rows=10.0 / Lion Cond: (u < '0.03'::double precision) / Lion Indexes: dbpedia_h_u / Lion Set Hits: 10 / Lion Set:"
+  },
+  {
+   "name": "lionvec planner plan",
+   "sel": 0.01,
+   "cache_dropped": true,
+   "median_ms": 94.074,
+   "max_ms": 94.615,
+   "all_ms": [
+    90.7,
+    94.6,
+    90.3,
+    94.1,
+    94.2,
+    93.2,
+    94.1
+   ],
+   "pages_read_median": 2469.0,
+   "all_pages": [
+    2469,
+    2469,
+    2469,
+    2469,
+    2469,
+    2469,
+    2469
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Sort (actual rows=10.00 loops=1) / Sort Key: ((embedding <=> '[0.022201538,-0.03253174,-0.00213 / Sort Method: top-N heapsort  Memory: 25kB / ->  Bitmap Heap Sc"
+  },
+  {
+   "name": "lionvec margin=3 LionOrdered",
+   "sel": 0.01,
+   "cache_dropped": true,
+   "median_ms": 92.688,
+   "max_ms": 106.291,
+   "all_ms": [
+    92.7,
+    93.1,
+    106.3,
+    90.9,
+    98.1,
+    88.7,
+    84.6
+   ],
+   "pages_read_median": 2470.0,
+   "all_pages": [
+    2470,
+    2470,
+    2470,
+    2470,
+    2470,
+    2470,
+    2470
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Custom Scan (LionOrdered) on dbpedia_h (actual rows=10.0 / Lion Cond: (u < '0.01'::double precision) / Lion Indexes: dbpedia_h_u / Lion Set Hits: 10 / Lion Set:"
+  }
+ ]
+}

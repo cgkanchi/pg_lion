@@ -27,12 +27,27 @@
 #define pg_always_inline pg_attribute_always_inline
 #endif
 
-/* x86-64 GCC and clang build a POPCNT kernel beside the portable one (§3) */
+/*
+ * x86-64 GCC and clang build POPCNT and AVX2 kernels beside the portable
+ * ones, as lion_container.c does (§3); from GCC 8 and clang 8, which know
+ * VPOPCNTDQ, plane 1's with it; and from GCC 11 and clang 18, whose
+ * __builtin_cpu_supports() knows F16C, the halves' with it ("Kernels"
+ * below).
+ */
 #if !defined(LION_NO_SIMD) && defined(__x86_64__) && \
 	((defined(__clang__) && __clang_major__ >= 6) || \
 	 (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 5))
-#define LIONVEC_HAVE_POPCNT 1
+#define LIONVEC_HAVE_X86 1
 #define LIONVEC_TARGET(isa)	__attribute__((target(isa)))
+#include <immintrin.h>
+#if (defined(__clang__) && __clang_major__ >= 8) || \
+	(!defined(__clang__) && __GNUC__ >= 8)
+#define LIONVEC_HAVE_AVX512 1
+#endif
+#if (defined(__clang__) && __clang_major__ >= 18) || \
+	(!defined(__clang__) && __GNUC__ >= 11)
+#define LIONVEC_HAVE_F16C 1
+#endif
 #endif
 
 /* the portable kernel's popcount, as lion_container.c chooses it */
@@ -83,6 +98,26 @@ lionvec_code8(float z)
 	if (t >= 255.0f)
 		return 255;
 	return (uint8) t;
+}
+
+/* ----------------------------------------------------------------
+ * pgvector's datums
+ * ----------------------------------------------------------------
+ */
+
+int
+lionvec_datum_dim(const void *p, Size len, bool half)
+{
+	const LionVecPgVector *vec = (const LionVecPgVector *) p;
+	Size		elem = half ? sizeof(uint16) : sizeof(float);
+
+	StaticAssertStmt(offsetof(LionVecPgVector, x) ==
+					 offsetof(LionVecPgHalfVector, x),
+					 "a vector's header is a halfvec's");
+	if (len < offsetof(LionVecPgVector, x) || vec->dim < 0 ||
+		len < offsetof(LionVecPgVector, x) + elem * (Size) vec->dim)
+		return -1;
+	return vec->dim;
 }
 
 /* ----------------------------------------------------------------
@@ -163,9 +198,8 @@ lionvec_fwht(float *x, int n)
 		x[i] *= scale;
 }
 
-/* Rotate x[0 .. dimsp) in place. */
-void
-lionvec_rotate(const LionVecRotation *rot, float *x)
+static void
+lionvec_rotate_portable(const LionVecRotation *rot, float *x)
 {
 	int			r;
 	int			w;
@@ -182,6 +216,17 @@ lionvec_rotate(const LionVecRotation *rot, float *x)
 			lionvec_fwht(x + rot->win[w], rot->block);
 		}
 	}
+}
+
+/* the rotation's kernel ("Kernels" below) */
+static void (*lionvec_rotate_kernel) (const LionVecRotation *rot, float *x) =
+	lionvec_rotate_portable;
+
+/* Rotate x[0 .. dimsp) in place. */
+void
+lionvec_rotate(const LionVecRotation *rot, float *x)
+{
+	lionvec_rotate_kernel(rot, x);
 }
 
 /*
@@ -303,6 +348,14 @@ lionvec_encode(const float *mean, int dimsp, float *x, LionVecEncoded *e)
  * set.  The quantization is uniform over qc's own range, rounded to the
  * nearest step; its variance in an estimate is what its errors actually are,
  * |e|^2 / dimsp, taken over a row's signs as if they were coin flips.
+ *
+ * The sums are kept in locals and each word of the planes is assembled in
+ * registers, its bits set without a branch: the build runs this for every
+ * sample row in every iteration of k-means, and accumulating into q's own
+ * fields, which the compiler must assume the stores to qc and planes may
+ * overwrite, and a branch on each bit of each code, which the CPU cannot
+ * predict, made it 16% of the build (45 us a row at 1536 dimensions, 12
+ * now).  The arithmetic is the same, in the same order.
  */
 void
 lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
@@ -314,39 +367,61 @@ lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
 	double		mx = -INFINITY;
 	double		mq = 0.0;
 	double		e2 = 0.0;
+	double		qnorm2 = 0.0;
+	double		qsum = 0.0;
+	double		qlo;
+	double		qdelta;
 	int			i;
+	int			w;
 
 	Assert(dimsp >= 64 && dimsp % 64 == 0);
-	q->qnorm2 = 0.0;
 	for (i = 0; i < dimsp; i++)
 	{
 		double		m = mean != NULL ? mean[i] : 0.0;
+		float		c = (float) (x[i] - m);
 
-		q->qc[i] = (float) (x[i] - m);
+		q->qc[i] = c;
 		mq += m * x[i];
-		q->qnorm2 += (double) q->qc[i] * (double) q->qc[i];
-		mn = Min(mn, (double) q->qc[i]);
-		mx = Max(mx, (double) q->qc[i]);
+		qnorm2 += (double) c * (double) c;
+		mn = Min(mn, (double) c);
+		mx = Max(mx, (double) c);
 	}
 
-	q->qlo = mn;
-	q->qdelta = mx > mn ? (mx - mn) / levels : 1.0;
-	q->qsum = 0.0;
-	memset(q->planes, 0, sizeof(uint64) * (dimsp / 64) * LIONVEC_QBITS);
-	for (i = 0; i < dimsp; i++)
+	qlo = mn;
+	qdelta = mx > mn ? (mx - mn) / levels : 1.0;
+	StaticAssertStmt(LIONVEC_QBITS == 4, "the planes are assembled four at a time");
+	for (w = 0; w < dimsp / 64; w++)
 	{
-		double		t = (q->qc[i] - q->qlo) / q->qdelta + 0.5;
-		int			u = t >= levels ? levels : (t > 0.0 ? (int) t : 0);
-		double		qq = q->qlo + q->qdelta * u;
-		int			j;
+		uint64		p0 = 0;
+		uint64		p1 = 0;
+		uint64		p2 = 0;
+		uint64		p3 = 0;
+		int			b;
 
-		for (j = 0; j < LIONVEC_QBITS; j++)
-			if (u & (1 << j))
-				q->planes[(i / 64) * LIONVEC_QBITS + j] |= UINT64CONST(1) << (i % 64);
-		q->qsum += qq;
-		e2 += (q->qc[i] - qq) * (q->qc[i] - qq);
+		for (b = 0; b < 64; b++)
+		{
+			double		c = q->qc[w * 64 + b];
+			double		t = (c - qlo) / qdelta + 0.5;
+			int			u = t >= levels ? levels : (t > 0.0 ? (int) t : 0);
+			double		qq = qlo + qdelta * u;
+
+			p0 |= (uint64) (u & 1) << b;
+			p1 |= (uint64) ((u >> 1) & 1) << b;
+			p2 |= (uint64) ((u >> 2) & 1) << b;
+			p3 |= (uint64) ((u >> 3) & 1) << b;
+			qsum += qq;
+			e2 += (c - qq) * (c - qq);
+		}
+		q->planes[w * LIONVEC_QBITS] = p0;
+		q->planes[w * LIONVEC_QBITS + 1] = p1;
+		q->planes[w * LIONVEC_QBITS + 2] = p2;
+		q->planes[w * LIONVEC_QBITS + 3] = p3;
 	}
 
+	q->qnorm2 = qnorm2;
+	q->qlo = qlo;
+	q->qdelta = qdelta;
+	q->qsum = qsum;
 	q->var1 = q->qnorm2 / (dimsp - 1);
 	q->varq = e2 / dimsp;
 	q->eps = eps;
@@ -359,9 +434,59 @@ lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
 }
 
 /* ----------------------------------------------------------------
- * Plane 1 against the query's planes
+ * Kernels
+ *
+ * What a scan and a build spend their arithmetic on, at 1536 dimensions
+ * (DESIGN.md §44.3, "Kernels"): plane 1's popcounts against the query's
+ * planes, for every centroid of every query and every row a probe reads,
+ * and, in k-means, every centroid for every sample row in every iteration;
+ * the 8-bit codes' sum, for every centroid and row a scan refines; the
+ * exact distances of k-means' candidates; and the rotation and, of a
+ * halfvec, the conversion of its halves to floats, each once a query and
+ * twice a row built.  Each has a portable kernel and, on x86-64, ones
+ * compiled with __attribute__((target)) for what the CPU has, so that the
+ * extension builds with the default -march and runs on any x86-64:
+ *
+ *	POPCNT	plane 1 a word at a time with the POPCNT instruction; the rest
+ *			portable
+ *	AVX2	plane 1 32 bytes at a time, the row's word against its four
+ *			planes, each byte's popcount looked up a nibble at a time with
+ *			VPSHUFB (Mula, as lion_container.c counts); the sums and the
+ *			rotation four doubles or eight floats at a time; and, where the
+ *			CPU has F16C as well, which AVX2 does not imply, the halves
+ *			eight at a time with VCVTPH2PS
+ *	AVX-512	AVX2's, but plane 1 counted with VPOPCNTDQ, a word's four
+ *			planes in one instruction
+ *
+ * chosen at load (lionvec_kernels_init()) as the CPU allows, best first;
+ * __builtin_cpu_supports() also checks that the OS saves the registers.
+ * AVX-512 is taken for VPOPCNTDQ alone (Ice Lake, Zen 4 and on), on
+ * 256-bit vectors: AVX-512BW's VPSHUFB counted plane 1 only a sixth faster
+ * than AVX2's, and the sums eight doubles at a time only a tenth faster,
+ * where a scan waits on the codes' cache lines more than on either, so no
+ * 512-bit instruction runs, for which some cores lower their clock.
+ *
+ * Every kernel returns what the portable one does, to the bit, so that a
+ * scan, a build and an insert decide alike whichever runs.  Plane 1's are
+ * integer counts.  The sums are in double, of terms each kernel computes
+ * with the same operations - the 8-bit codes' products are exact, a code's
+ * reconstruction being a float and a float's product with a float a double
+ * - added in LIONVEC_LANES partial sums, the i-th term into partial i %
+ * LIONVEC_LANES, and those in a fixed tree (lionvec_lanes_sum()): the
+ * portable kernels add in that order too.  The file is compiled with
+ * -ffp-contract=off (the Makefile), for GCC and clang would otherwise fuse
+ * a multiply and an add into one rounding wherever the target has fused
+ * multiply-adds - the portable kernels built for aarch64 or x86-64-v3 -
+ * and l2sq's terms, unlike the 8-bit codes', are not exact.  The
+ * rotation's butterflies are the portable ones' additions and subtractions,
+ * of the same operands, in the same order for each coordinate.  The halves'
+ * conversion is exact, every half being a float, and VCVTPH2PS makes a NaN
+ * the quiet NaN of its payload, as the portable kernel does, whatever
+ * MXCSR's DAZ and FTZ say.
  * ----------------------------------------------------------------
  */
+
+/* ---------- portable ---------- */
 
 static pg_always_inline uint32
 lionvec_dot_words(const uint64 *bits, const uint64 *planes, int nwords,
@@ -379,7 +504,7 @@ lionvec_dot_words(const uint64 *bits, const uint64 *planes, int nwords,
 		uint64		b = bits[w];
 		const uint64 *p = planes + w * LIONVEC_QBITS;
 
-#ifdef LIONVEC_HAVE_POPCNT
+#ifdef LIONVEC_HAVE_X86
 		if (hw)
 		{
 			s0 += (uint32) __builtin_popcountll(b & p[0]);
@@ -403,42 +528,491 @@ lionvec_dot_portable(const uint64 *bits, const uint64 *planes, int nwords)
 	return lionvec_dot_words(bits, planes, nwords, false);
 }
 
-#ifdef LIONVEC_HAVE_POPCNT
+/*
+ * The partial sums p[0 .. LIONVEC_LANES) added up: (p_l + p_l+8) + (p_l+4 +
+ * p_l+12) for each l < 4, then (u_0 + u_2) + (u_1 + u_3) of those - the
+ * tree the vector kernels fold their lanes in.
+ */
+static inline double
+lionvec_lanes_sum(const double *p)
+{
+	double		u[4];
+	int			l;
+
+	StaticAssertStmt(LIONVEC_LANES == 16, "the tree is of sixteen lanes");
+	for (l = 0; l < 4; l++)
+		u[l] = (p[l] + p[l + 8]) + (p[l + 4] + p[l + 12]);
+	return (u[0] + u[2]) + (u[1] + u[3]);
+}
+
+/*
+ * Code c's reconstruction, lionvec_recon8[c], computed: c / 32 is exact, and
+ * so is the sum, a multiple of 1/64 under 4 (the unit test checks every
+ * code), so that it is the same double whether a multiply and an add or a
+ * fused multiply-add computes it, as is its product with a float.  The
+ * kernels compute rather than look up, which vectorizes.
+ */
+#define LIONVEC_RECON8(c) \
+	((double) (c) * (1.0 / LIONVEC_STEPS8) + (-LIONVEC_CLIP8 + 0.5 / LIONVEC_STEPS8))
+
+/*
+ * The portable sums index each run of LIONVEC_LANES from its own pointer:
+ * under PostgreSQL's -fwrapv, i + l might wrap, and GCC then loads the
+ * run's terms one by one as if gathered, at twice the time.
+ */
+static double
+lionvec_sum8_portable(const uint8 *codes, const float *qc, int dimsp)
+{
+	double		p[LIONVEC_LANES] = {0};
+	int			i;
+	int			l;
+
+	Assert(dimsp % LIONVEC_LANES == 0);
+	for (i = 0; i < dimsp; i += LIONVEC_LANES)
+	{
+		const uint8 *c = codes + i;
+		const float *q = qc + i;
+
+		for (l = 0; l < LIONVEC_LANES; l++)
+			p[l] += LIONVEC_RECON8(c[l]) * (double) q[l];
+	}
+	return lionvec_lanes_sum(p);
+}
+
+static double
+lionvec_l2sq_portable(const float *a, const float *b, int dimsp)
+{
+	double		p[LIONVEC_LANES] = {0};
+	int			i;
+	int			l;
+
+	Assert(dimsp % LIONVEC_LANES == 0);
+	for (i = 0; i < dimsp; i += LIONVEC_LANES)
+	{
+		const float *x = a + i;
+		const float *y = b + i;
+
+		for (l = 0; l < LIONVEC_LANES; l++)
+		{
+			double		d = (double) x[l] - (double) y[l];
+
+			p[l] += d * d;
+		}
+	}
+	return lionvec_lanes_sum(p);
+}
+
+/*
+ * The float of the half h, exactly, from its bits alone, so that no mode of
+ * the FPU can change it: a normal's exponent rebiased from 15 to 127; a
+ * subnormal, m 2^-24, normalized - m's leading bit, at bit lead, shifted to
+ * bit 23, where adding it carries into the exponent, of lead - 24; a zero
+ * signed; and infinity, or a NaN made quiet with its payload kept, at the
+ * float's exponent of all ones.
+ */
+static inline float
+lionvec_half_float(uint16 h)
+{
+	uint32		em = h & 0x7fff;	/* the exponent and mantissa */
+	uint32		bits;
+	float		f;
+
+	if (em >= 0x7c00)
+		bits = 0x7f800000 | ((em & 0x3ff) << 13) | (em > 0x7c00 ? 0x00400000 : 0);
+	else if (em >= 0x0400)
+		bits = (em << 13) + ((uint32) (127 - 15) << 23);
+	else if (em != 0)
+	{
+		int			lead = pg_leftmost_one_pos32(em);	/* 0 .. 9 */
+
+		bits = ((uint32) (lead - 24 + 127 - 1) << 23) + (em << (23 - lead));
+	}
+	else
+		bits = 0;
+	bits |= (uint32) (h & 0x8000) << 16;
+	memcpy(&f, &bits, sizeof(f));
+	return f;
+}
+
+static void
+lionvec_halves_portable(const uint16 *h, int n, float *x)
+{
+	int			i;
+
+	for (i = 0; i < n; i++)
+		x[i] = lionvec_half_float(h[i]);
+}
+
+#ifdef LIONVEC_HAVE_X86
+
+/* ---------- POPCNT ---------- */
+
 static LIONVEC_TARGET("popcnt") uint32
 lionvec_dot_popcnt(const uint64 *bits, const uint64 *planes, int nwords)
 {
 	return lionvec_dot_words(bits, planes, nwords, true);
 }
-#endif
+
+/* ---------- AVX2 ---------- */
+
+/* The popcount of each byte of v, 0 .. 8: two nibbles looked up (Mula). */
+static pg_always_inline LIONVEC_TARGET("avx2") __m256i
+lionvec_avx2_byte_counts(__m256i v)
+{
+	const __m256i lut = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3,
+										 1, 2, 2, 3, 2, 3, 3, 4,
+										 0, 1, 1, 2, 1, 2, 2, 3,
+										 1, 2, 2, 3, 2, 3, 3, 4);
+	const __m256i nibble = _mm256_set1_epi8(0x0f);
+	__m256i		lo = _mm256_and_si256(v, nibble);
+	__m256i		hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), nibble);
+
+	return _mm256_add_epi8(_mm256_shuffle_epi8(lut, lo),
+						   _mm256_shuffle_epi8(lut, hi));
+}
+
+/* the plane sums in the four lanes of v, weighed: s0 + 2 s1 + 4 s2 + 8 s3 */
+static pg_always_inline LIONVEC_TARGET("avx2") uint32
+lionvec_avx2_weigh(__m256i v)
+{
+	uint64		s[4];
+
+	_mm256_storeu_si256((__m256i *) s, v);
+	return (uint32) (s[0] + 2 * s[1] + 4 * s[2] + 8 * s[3]);
+}
+
+/*
+ * A word's four planes are one vector, the planes being interleaved by
+ * word: the row's word broadcast, ANDed with them and counted a byte at a
+ * time, lane j counting plane j.  The byte counts add up over 31 words at
+ * most, 248 a byte, before VPSADBW sums each lane's bytes.
+ */
+#define LIONVEC_AVX2_RUN		31
+
+static LIONVEC_TARGET("avx2") uint32
+lionvec_dot_avx2(const uint64 *bits, const uint64 *planes, int nwords)
+{
+	__m256i		sum = _mm256_setzero_si256();
+	int			w = 0;
+
+	while (w < nwords)
+	{
+		int			end = Min(nwords, w + LIONVEC_AVX2_RUN);
+		__m256i		counts = _mm256_setzero_si256();
+
+		for (; w < end; w++)
+		{
+			__m256i		b = _mm256_set1_epi64x((long long) bits[w]);
+			__m256i		p = _mm256_loadu_si256((const __m256i *) (planes + w * LIONVEC_QBITS));
+
+			counts = _mm256_add_epi8(counts,
+									 lionvec_avx2_byte_counts(_mm256_and_si256(b, p)));
+		}
+		sum = _mm256_add_epi64(sum, _mm256_sad_epu8(counts, _mm256_setzero_si256()));
+	}
+	return lionvec_avx2_weigh(sum);
+}
+
+/* 16 partial sums in four vectors, added up as lionvec_lanes_sum() does */
+static pg_always_inline LIONVEC_TARGET("avx2") double
+lionvec_avx2_fold(__m256d p0, __m256d p4, __m256d p8, __m256d p12)
+{
+	__m256d		u = _mm256_add_pd(_mm256_add_pd(p0, p8), _mm256_add_pd(p4, p12));
+	__m128d		v = _mm_add_pd(_mm256_castpd256_pd128(u),
+							   _mm256_extractf128_pd(u, 1));
+
+	return _mm_cvtsd_f64(_mm_add_sd(v, _mm_unpackhi_pd(v, v)));
+}
+
+/*
+ * Terms i .. i + 3 of the 8-bit codes' sum: the codes' reconstructions,
+ * -4 + (c + 1/2) / 32, computed as lionvec_recon8[] holds them (exactly:
+ * the unit test checks it), times qc's.
+ */
+static pg_always_inline LIONVEC_TARGET("avx2") __m256d
+lionvec_avx2_terms8(const uint8 *codes, const float *qc)
+{
+	const __m256d step = _mm256_set1_pd(1.0 / LIONVEC_STEPS8);
+	const __m256d first = _mm256_set1_pd(-LIONVEC_CLIP8 + 0.5 / LIONVEC_STEPS8);
+	int32		four;
+	__m256d		r;
+
+	memcpy(&four, codes, sizeof(four));
+	r = _mm256_cvtepi32_pd(_mm_cvtepu8_epi32(_mm_cvtsi32_si128(four)));
+	r = _mm256_add_pd(_mm256_mul_pd(r, step), first);
+	return _mm256_mul_pd(r, _mm256_cvtps_pd(_mm_loadu_ps(qc)));
+}
+
+static LIONVEC_TARGET("avx2") double
+lionvec_sum8_avx2(const uint8 *codes, const float *qc, int dimsp)
+{
+	__m256d		p0 = _mm256_setzero_pd();
+	__m256d		p4 = _mm256_setzero_pd();
+	__m256d		p8 = _mm256_setzero_pd();
+	__m256d		p12 = _mm256_setzero_pd();
+	int			i;
+
+	Assert(dimsp % LIONVEC_LANES == 0);
+	for (i = 0; i < dimsp; i += LIONVEC_LANES)
+	{
+		p0 = _mm256_add_pd(p0, lionvec_avx2_terms8(codes + i, qc + i));
+		p4 = _mm256_add_pd(p4, lionvec_avx2_terms8(codes + i + 4, qc + i + 4));
+		p8 = _mm256_add_pd(p8, lionvec_avx2_terms8(codes + i + 8, qc + i + 8));
+		p12 = _mm256_add_pd(p12, lionvec_avx2_terms8(codes + i + 12, qc + i + 12));
+	}
+	return lionvec_avx2_fold(p0, p4, p8, p12);
+}
+
+/* terms i .. i + 3 of l2sq */
+static pg_always_inline LIONVEC_TARGET("avx2") __m256d
+lionvec_avx2_terms_l2(const float *a, const float *b)
+{
+	__m256d		d = _mm256_sub_pd(_mm256_cvtps_pd(_mm_loadu_ps(a)),
+								  _mm256_cvtps_pd(_mm_loadu_ps(b)));
+
+	return _mm256_mul_pd(d, d);
+}
+
+static LIONVEC_TARGET("avx2") double
+lionvec_l2sq_avx2(const float *a, const float *b, int dimsp)
+{
+	__m256d		p0 = _mm256_setzero_pd();
+	__m256d		p4 = _mm256_setzero_pd();
+	__m256d		p8 = _mm256_setzero_pd();
+	__m256d		p12 = _mm256_setzero_pd();
+	int			i;
+
+	Assert(dimsp % LIONVEC_LANES == 0);
+	for (i = 0; i < dimsp; i += LIONVEC_LANES)
+	{
+		p0 = _mm256_add_pd(p0, lionvec_avx2_terms_l2(a + i, b + i));
+		p4 = _mm256_add_pd(p4, lionvec_avx2_terms_l2(a + i + 4, b + i + 4));
+		p8 = _mm256_add_pd(p8, lionvec_avx2_terms_l2(a + i + 8, b + i + 8));
+		p12 = _mm256_add_pd(p12, lionvec_avx2_terms_l2(a + i + 12, b + i + 12));
+	}
+	return lionvec_avx2_fold(p0, p4, p8, p12);
+}
+
+/*
+ * lionvec_fwht() eight floats at a time: the butterflies of strides 1, 2
+ * and 4 inside each run of eight, by swapping the run's halves, pairs or
+ * neighbours and taking a + b where the portable loop does and a - b where
+ * it does (the swapped vector less the run); then those of 8 and up
+ * between runs, and the scale.  n is a power of two, 64 or more.
+ */
+static LIONVEC_TARGET("avx2") void
+lionvec_fwht_avx2(float *x, int n)
+{
+	const __m256 scale = _mm256_set1_ps((float) (1.0 / sqrt((double) n)));
+	int			h;
+	int			i;
+	int			j;
+
+	for (i = 0; i < n; i += 8)
+	{
+		__m256		v = _mm256_loadu_ps(x + i);
+		__m256		s;
+
+		s = _mm256_permute_ps(v, 0xB1); /* 1 0 3 2 */
+		v = _mm256_blend_ps(_mm256_add_ps(v, s), _mm256_sub_ps(s, v), 0xAA);
+		s = _mm256_permute_ps(v, 0x4E); /* 2 3 0 1 */
+		v = _mm256_blend_ps(_mm256_add_ps(v, s), _mm256_sub_ps(s, v), 0xCC);
+		s = _mm256_permute2f128_ps(v, v, 0x01); /* 4 5 6 7 0 1 2 3 */
+		v = _mm256_blend_ps(_mm256_add_ps(v, s), _mm256_sub_ps(s, v), 0xF0);
+		_mm256_storeu_ps(x + i, v);
+	}
+	for (h = 8; h < n; h *= 2)
+	{
+		for (i = 0; i < n; i += 2 * h)
+		{
+			for (j = i; j < i + h; j += 8)
+			{
+				__m256		a = _mm256_loadu_ps(x + j);
+				__m256		b = _mm256_loadu_ps(x + j + h);
+
+				_mm256_storeu_ps(x + j, _mm256_add_ps(a, b));
+				_mm256_storeu_ps(x + j + h, _mm256_sub_ps(a, b));
+			}
+		}
+	}
+	for (i = 0; i < n; i += 8)
+		_mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), scale));
+}
+
+static LIONVEC_TARGET("avx2") void
+lionvec_rotate_avx2(const LionVecRotation *rot, float *x)
+{
+	int			r;
+	int			w;
+	int			i;
+	const float *s = rot->signs;
+
+	for (r = 0; r < LIONVEC_ROUNDS; r++)
+	{
+		for (w = 0; w < rot->nwin; w++)
+		{
+			for (i = 0; i < rot->dimsp; i += 8)
+				_mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i),
+													  _mm256_loadu_ps(s + i)));
+			s += rot->dimsp;
+			lionvec_fwht_avx2(x + rot->win[w], rot->block);
+		}
+	}
+}
+
+#ifdef LIONVEC_HAVE_F16C
+
+/* ---------- F16C ---------- */
+
+/* The halves eight at a time, the last n % 8 from a vector padded with zeros. */
+static LIONVEC_TARGET("avx2,f16c") void
+lionvec_halves_f16c(const uint16 *h, int n, float *x)
+{
+	int			i;
+
+	for (i = 0; i + 8 <= n; i += 8)
+		_mm256_storeu_ps(x + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (h + i))));
+	if (i < n)
+	{
+		uint16		last[8] = {0};
+		float		out[8];
+
+		memcpy(last, h + i, sizeof(uint16) * (n - i));
+		_mm256_storeu_ps(out, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) last)));
+		memcpy(x + i, out, sizeof(float) * (n - i));
+	}
+}
+
+#endif							/* LIONVEC_HAVE_F16C */
+
+#ifdef LIONVEC_HAVE_AVX512
+
+/* ---------- AVX-512 ---------- */
+
+/* AVX2's, with VPOPCNTDQ counting each plane's word whole */
+static LIONVEC_TARGET("avx512f,avx512vl,avx512vpopcntdq") uint32
+lionvec_dot_avx512(const uint64 *bits, const uint64 *planes, int nwords)
+{
+	__m256i		sum = _mm256_setzero_si256();
+	int			w;
+
+	for (w = 0; w < nwords; w++)
+	{
+		__m256i		b = _mm256_set1_epi64x((long long) bits[w]);
+		__m256i		p = _mm256_loadu_si256((const __m256i *) (planes + w * LIONVEC_QBITS));
+
+		sum = _mm256_add_epi64(sum, _mm256_popcnt_epi64(_mm256_and_si256(b, p)));
+	}
+	return lionvec_avx2_weigh(sum);
+}
+
+#endif							/* LIONVEC_HAVE_AVX512 */
+#endif							/* LIONVEC_HAVE_X86 */
+
+/* ---------- the choice ---------- */
 
 LionVecDotKernel lionvec_plane_dot = lionvec_dot_portable;
+LionVecSum8Kernel lionvec_sum8 = lionvec_sum8_portable;
+LionVecL2Kernel lionvec_l2sq = lionvec_l2sq_portable;
+LionVecHalfKernel lionvec_halves = lionvec_halves_portable;
 
+/*
+ * Use the set which, if the build has it and the CPU runs it.  The AVX2
+ * and AVX-512 sets convert halves with F16C where the CPU has that too, and
+ * portably where it does not.
+ */
+static bool
+lionvec_kernels_set(int which)
+{
+	LionVecDotKernel dot = lionvec_dot_portable;
+	LionVecSum8Kernel sum8 = lionvec_sum8_portable;
+	LionVecL2Kernel l2sq = lionvec_l2sq_portable;
+	LionVecHalfKernel halves = lionvec_halves_portable;
+	void		(*rotate) (const LionVecRotation *rot, float *x) = lionvec_rotate_portable;
+
+	switch (which)
+	{
+		case LIONVEC_KERNELS_PORTABLE:
+			break;
+#ifdef LIONVEC_HAVE_X86
+		case LIONVEC_KERNELS_POPCNT:
+			if (!__builtin_cpu_supports("popcnt"))
+				return false;
+			dot = lionvec_dot_popcnt;
+			break;
+		case LIONVEC_KERNELS_AVX2:
+			if (!__builtin_cpu_supports("avx2"))
+				return false;
+			dot = lionvec_dot_avx2;
+			sum8 = lionvec_sum8_avx2;
+			l2sq = lionvec_l2sq_avx2;
+			rotate = lionvec_rotate_avx2;
+#ifdef LIONVEC_HAVE_F16C
+			if (__builtin_cpu_supports("f16c"))
+				halves = lionvec_halves_f16c;
+#endif
+			break;
+#ifdef LIONVEC_HAVE_AVX512
+		case LIONVEC_KERNELS_AVX512:
+			if (!__builtin_cpu_supports("avx2") ||
+				!__builtin_cpu_supports("avx512f") ||
+				!__builtin_cpu_supports("avx512vl") ||
+				!__builtin_cpu_supports("avx512vpopcntdq"))
+				return false;
+			dot = lionvec_dot_avx512;
+			sum8 = lionvec_sum8_avx2;
+			l2sq = lionvec_l2sq_avx2;
+			rotate = lionvec_rotate_avx2;
+#ifdef LIONVEC_HAVE_F16C
+			if (__builtin_cpu_supports("f16c"))
+				halves = lionvec_halves_f16c;
+#endif
+			break;
+#endif
+#endif
+		default:
+			return false;
+	}
+	lionvec_plane_dot = dot;
+	lionvec_sum8 = sum8;
+	lionvec_l2sq = l2sq;
+	lionvec_halves = halves;
+	lionvec_rotate_kernel = rotate;
+	return true;
+}
+
+/* The best set: called once at load, before any vector is rotated. */
 void
 lionvec_kernels_init(void)
 {
-#ifdef LIONVEC_HAVE_POPCNT
-	if (__builtin_cpu_supports("popcnt"))
-		lionvec_plane_dot = lionvec_dot_popcnt;
+	int			which;
+
+#ifdef LIONVEC_HAVE_X86
+	/* a no-op after libgcc's constructor, which has run by any first call */
+	__builtin_cpu_init();
 #endif
+	for (which = LIONVEC_KERNELS_MAX; which > LIONVEC_KERNELS_PORTABLE; which--)
+	{
+		if (lionvec_kernels_set(which))
+			return;
+	}
+	lionvec_kernels_set(LIONVEC_KERNELS_PORTABLE);
 }
 
 #ifdef FRONTEND
 bool
 lionvec_kernel_force(int which)
 {
-	if (which == 0)
-	{
-		lionvec_plane_dot = lionvec_dot_portable;
-		return true;
-	}
-#ifdef LIONVEC_HAVE_POPCNT
-	if (which == 1 && __builtin_cpu_supports("popcnt"))
-	{
-		lionvec_plane_dot = lionvec_dot_popcnt;
-		return true;
-	}
+#ifdef LIONVEC_HAVE_X86
+	__builtin_cpu_init();
 #endif
-	return false;
+	return lionvec_kernels_set(which);
+}
+
+bool
+lionvec_kernel_f16c(void)
+{
+	return lionvec_halves != lionvec_halves_portable;
 }
 #endif
 
@@ -451,30 +1025,163 @@ int
 lionvec_candidates(const LionVecCentroids *c, const LionVecQuery *q,
 				   double *lo, double *hi, int *cand)
 {
+	return lionvec_candidates_n(c, q, 1, lo, hi, cand);
+}
+
+int
+lionvec_candidates_n(const LionVecCentroids *c, const LionVecQuery *q, int m,
+					 double *lo, double *hi, int *cand)
+{
 	int			nw = c->dimsp / 64;
-	double		least = INFINITY;
+	double		least[LIONVEC_RANK_MAX];	/* the m least upper bounds, ascending */
+	int			nleast = 0;
+	double		thr;
 	int			n = 0;
 	int			j;
 
 	Assert(c->dimsp == q->dimsp);
+	Assert(m >= 1 && m <= LIONVEC_RANK_MAX);
+	m = Max(1, Min(m, LIONVEC_RANK_MAX));
 	for (j = 0; j < c->k; j++)
 	{
 		double		est;
 		double		err;
+		int			i;
 
 		lionvec_estimate1(q, c->bits + (Size) j * nw, c->popcount[j],
 						  c->norm[j], c->alpha1[j], &est, &err);
 		lionvec_key_bounds(LIONVEC_L2, c->norm[j], 0.0, est, err, &lo[j], &hi[j]);
-		least = Min(least, hi[j]);
+		/* NaN bounds come back infinite, so every comparison here is total */
+		if (nleast == m && !(hi[j] < least[m - 1]))
+			continue;
+		i = nleast < m ? nleast++ : m - 1;
+		for (; i > 0 && least[i - 1] > hi[j]; i--)
+			least[i] = least[i - 1];
+		least[i] = hi[j];
 	}
+	/* fewer centroids than m: every one can be among the m nearest */
+	thr = nleast == m ? least[m - 1] : INFINITY;
 	for (j = 0; j < c->k; j++)
 	{
-		/* NaN bounds come back infinite, so the comparison keeps them */
-		if (lo[j] <= least)
+		if (lo[j] <= thr)
 			cand[n++] = j;
 	}
-	Assert(c->k == 0 || n > 0);
+	/* at least min(k, m) unless a bound came out with lo > hi (the header) */
 	return n;
+}
+
+int
+lionvec_rank(const double *key, int n, int m, int *order)
+{
+	int			r = 0;
+	int			j;
+
+	if (m <= 0)
+		return 0;
+	for (j = 0; j < n; j++)
+	{
+		double		kj = isnan(key[j]) ? INFINITY : key[j];
+		int			i;
+
+		if (r == m)
+		{
+			double		last = isnan(key[order[m - 1]]) ? INFINITY : key[order[m - 1]];
+
+			/* not less than the m-th: ties stay with the lower place */
+			if (!(kj < last))
+				continue;
+			i = m - 1;
+		}
+		else
+			i = r++;
+		for (; i > 0; i--)
+		{
+			double		ki = isnan(key[order[i - 1]]) ? INFINITY : key[order[i - 1]];
+
+			if (!(ki > kj))
+				break;
+			order[i] = order[i - 1];
+		}
+		order[i] = j;
+	}
+	return r;
+}
+
+/* the SOAR cost of c, given r = x - c1 and |r|^2 */
+static double
+lionvec_soar_cost_r(const float *x, const float *c1, double r2, const float *c,
+					int dimsp, double lambda)
+{
+	double		d2 = 0.0;
+	double		rd = 0.0;
+	double		cost;
+	int			i;
+
+	for (i = 0; i < dimsp; i++)
+	{
+		double		d = (double) x[i] - (double) c[i];
+
+		d2 += d * d;
+		rd += ((double) x[i] - (double) c1[i]) * d;
+	}
+	cost = r2 > 0.0 ? d2 + lambda * rd * rd / r2 : d2;
+	return isnan(cost) ? INFINITY : cost;
+}
+
+static double
+lionvec_residual2(const float *x, const float *c1, int dimsp)
+{
+	double		r2 = 0.0;
+	int			i;
+
+	for (i = 0; i < dimsp; i++)
+	{
+		double		r = (double) x[i] - (double) c1[i];
+
+		r2 += r * r;
+	}
+	return r2;
+}
+
+double
+lionvec_soar_cost(const float *x, const float *c1, const float *c, int dimsp,
+				  double lambda)
+{
+	return lionvec_soar_cost_r(x, c1, lionvec_residual2(x, c1, dimsp), c, dimsp,
+							   lambda);
+}
+
+int
+lionvec_soar_second(const float *x, const float *c1, const float *const *cands,
+					int n, int dimsp, double lambda)
+{
+	double		r2 = lionvec_residual2(x, c1, dimsp);
+	double		best = INFINITY;
+	int			besti = -1;
+	int			i;
+
+	for (i = 0; i < n; i++)
+	{
+		double		cost = lionvec_soar_cost_r(x, c1, r2, cands[i], dimsp, lambda);
+
+		if (besti < 0 || cost < best)
+		{
+			besti = i;
+			best = cost;
+		}
+	}
+	return besti;
+}
+
+void
+lionvec_decode8(const uint8 *codes, int dimsp, float norm, float alpha8,
+				float rnorm8, float *x)
+{
+	double		scale = rnorm8 > 0.0f ? (double) norm * alpha8 / rnorm8 : 0.0;
+	int			i;
+
+	for (i = 0; i < dimsp; i++)
+		x[i] = (float) (scale * lionvec_recon8[codes[i]]);
 }
 
 void
@@ -487,21 +1194,6 @@ lionvec_sample_row(const LionVecSample *s, int i, float *x)
 	Assert(i >= 0 && i < s->n);
 	for (j = 0; j < s->dimsp; j++)
 		x[j] = scale * lionvec_recon8[codes[j]];
-}
-
-static double
-lionvec_l2sq(const float *a, const float *b, int n)
-{
-	double		s = 0.0;
-	int			i;
-
-	for (i = 0; i < n; i++)
-	{
-		double		d = (double) a[i] - (double) b[i];
-
-		s += d * d;
-	}
-	return s;
 }
 
 static void
@@ -714,13 +1406,10 @@ void
 lionvec_estimate8(const LionVecQuery *q, const uint8 *codes, float norm,
 				  float alpha8, float rnorm8, double *est, double *err)
 {
-	double		s = 0.0;
+	double		s = lionvec_sum8(codes, q->qc, q->dimsp);
 	double		a = Max((double) alpha8, 1e-6);
 	double		miss = Max(1.0 - a * a, 0.0);
-	int			i;
 
-	for (i = 0; i < q->dimsp; i++)
-		s += (double) lionvec_recon8[codes[i]] * (double) q->qc[i];
 	*est = rnorm8 > 0.0f ? norm * s / (rnorm8 * a) : 0.0;
 	*err = LIONVEC_EPS8(q->eps) * norm / a * sqrt(q->var1 * miss);
 }
