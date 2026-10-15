@@ -1,0 +1,800 @@
+{
+ "meta": {
+  "run": {
+   "checkout": "/home/claude/pg_lion-simd",
+   "head": "9acb71a",
+   "branch": "HEAD",
+   "src_commit": "9ffabab",
+   "src_dirty": false,
+   "pg_lion_so_sha256": "b8056bb69b232280"
+  },
+  "queries": 7,
+  "restart": "runuser -u pglion -- env LION_SOCK=/tmp/lion-sock-d LION_PORT=55435 /home/claude/pg_lion-simd/dev.sh restart",
+  "run_at": "2026-10-15T07:34:00Z"
+ },
+ "results": [
+  {
+   "name": "lionvec margin=3",
+   "sel": 1.0,
+   "cache_dropped": true,
+   "median_ms": 24.92,
+   "max_ms": 39.183,
+   "all_ms": [
+    21.7,
+    7.6,
+    23.6,
+    39.2,
+    33.0,
+    24.9,
+    26.1
+   ],
+   "pages_read_median": 478.0,
+   "all_pages": [
+    299,
+    183,
+    478,
+    424,
+    662,
+    512,
+    528
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_lv on dbpedia (actual rows=10.0"
+  },
+  {
+   "name": "lionvec margin=7",
+   "sel": 1.0,
+   "cache_dropped": true,
+   "median_ms": 52.344,
+   "max_ms": 78.425,
+   "all_ms": [
+    26.3,
+    15.5,
+    52.3,
+    31.1,
+    78.4,
+    70.7,
+    62.5
+   ],
+   "pages_read_median": 1314.0,
+   "all_pages": [
+    522,
+    332,
+    1314,
+    785,
+    1655,
+    1376,
+    1373
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_lv on dbpedia (actual rows=10.0"
+  },
+  {
+   "name": "lionvec margin=12",
+   "sel": 1.0,
+   "cache_dropped": true,
+   "median_ms": 69.309,
+   "max_ms": 86.054,
+   "all_ms": [
+    70.4,
+    75.5,
+    61.2,
+    69.3,
+    86.1,
+    56.5,
+    64.7
+   ],
+   "pages_read_median": 1378.0,
+   "all_pages": [
+    1305,
+    1306,
+    1542,
+    1288,
+    1655,
+    1378,
+    1390
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_lv on dbpedia (actual rows=10.0"
+  },
+  {
+   "name": "hnsw ef=40",
+   "sel": 1.0,
+   "cache_dropped": true,
+   "median_ms": 53.717,
+   "max_ms": 70.784,
+   "all_ms": [
+    43.2,
+    39.4,
+    53.7,
+    64.1,
+    70.8,
+    45.4,
+    56.8
+   ],
+   "pages_read_median": 977.0,
+   "all_pages": [
+    977,
+    701,
+    863,
+    1017,
+    1094,
+    892,
+    982
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_hnsw on dbpedia (actual rows=10"
+  },
+  {
+   "name": "hnsw ef=100",
+   "sel": 1.0,
+   "cache_dropped": true,
+   "median_ms": 107.659,
+   "max_ms": 142.036,
+   "all_ms": [
+    109.2,
+    95.0,
+    88.2,
+    111.2,
+    142.0,
+    88.7,
+    107.7
+   ],
+   "pages_read_median": 1936.0,
+   "all_pages": [
+    1947,
+    1552,
+    1908,
+    1936,
+    2391,
+    1797,
+    1971
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_hnsw on dbpedia (actual rows=10"
+  },
+  {
+   "name": "vchord probes=40",
+   "sel": 1.0,
+   "cache_dropped": true,
+   "median_ms": 43.79,
+   "max_ms": 51.724,
+   "all_ms": [
+    41.2,
+    51.7,
+    45.1,
+    43.8,
+    39.5,
+    35.8,
+    49.4
+   ],
+   "pages_read_median": 914.0,
+   "all_pages": [
+    827,
+    875,
+    918,
+    916,
+    942,
+    885,
+    914
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_vchord on dbpedia (actual rows="
+  },
+  {
+   "name": "vchord probes=80",
+   "sel": 1.0,
+   "cache_dropped": true,
+   "median_ms": 73.052,
+   "max_ms": 99.167,
+   "all_ms": [
+    76.0,
+    73.1,
+    99.2,
+    76.0,
+    65.5,
+    60.1,
+    71.3
+   ],
+   "pages_read_median": 1521.0,
+   "all_pages": [
+    1369,
+    1517,
+    1521,
+    1525,
+    1577,
+    1514,
+    1531
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_vchord on dbpedia (actual rows="
+  },
+  {
+   "name": "vchord probes=160",
+   "sel": 1.0,
+   "cache_dropped": true,
+   "median_ms": 126.278,
+   "max_ms": 151.836,
+   "all_ms": [
+    150.1,
+    103.6,
+    121.2,
+    126.3,
+    114.1,
+    130.4,
+    151.8
+   ],
+   "pages_read_median": 2690.0,
+   "all_pages": [
+    2537,
+    2690,
+    2703,
+    2706,
+    2654,
+    2636,
+    2762
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_vchord on dbpedia (actual rows="
+  },
+  {
+   "name": "diskann list=10",
+   "sel": 1.0,
+   "cache_dropped": true,
+   "median_ms": 128.768,
+   "max_ms": 153.472,
+   "all_ms": [
+    128.8,
+    112.7,
+    94.1,
+    147.4,
+    153.5,
+    123.6,
+    128.8
+   ],
+   "pages_read_median": 2238.0,
+   "all_pages": [
+    2168,
+    1967,
+    2309,
+    2238,
+    2416,
+    2280,
+    2221
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_diskann on dbpedia (actual rows"
+  },
+  {
+   "name": "diskann list=200",
+   "sel": 1.0,
+   "cache_dropped": true,
+   "median_ms": 285.082,
+   "max_ms": 503.931,
+   "all_ms": [
+    285.1,
+    269.3,
+    503.9,
+    284.7,
+    300.0,
+    278.8,
+    291.3
+   ],
+   "pages_read_median": 4996.0,
+   "all_pages": [
+    4996,
+    4392,
+    5169,
+    4668,
+    5514,
+    4847,
+    5051
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_diskann on dbpedia (actual rows"
+  },
+  {
+   "name": "lionvec planner plan",
+   "sel": 0.03,
+   "cache_dropped": true,
+   "median_ms": 276.395,
+   "max_ms": 332.139,
+   "all_ms": [
+    227.1,
+    71.2,
+    332.1,
+    165.6,
+    276.4,
+    302.6,
+    293.2
+   ],
+   "pages_read_median": 4732.0,
+   "all_pages": [
+    4405,
+    1604,
+    5797,
+    3938,
+    5002,
+    4732,
+    5008
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_lv on dbpedia (actual rows=10.0"
+  },
+  {
+   "name": "lionvec margin=3 LionOrdered",
+   "sel": 0.03,
+   "cache_dropped": true,
+   "median_ms": 76.02,
+   "max_ms": 110.599,
+   "all_ms": [
+    76.0,
+    31.4,
+    88.8,
+    60.8,
+    110.6,
+    71.9,
+    90.2
+   ],
+   "pages_read_median": 1607.0,
+   "all_pages": [
+    1332,
+    561,
+    1833,
+    1124,
+    2056,
+    1607,
+    1964
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Custom Scan (LionOrdered) on dbpedia (actual rows=10.00  / Lion Cond: (u < '0.03'::double precision) / Lion Indexes: dbpedia_u / Lion Set Hits: 10 / Lion Set: 1"
+  },
+  {
+   "name": "lionvec margin=7 LionOrdered",
+   "sel": 0.03,
+   "cache_dropped": true,
+   "median_ms": 120.799,
+   "max_ms": 129.056,
+   "all_ms": [
+    97.0,
+    103.3,
+    120.8,
+    121.0,
+    129.1,
+    124.4,
+    93.5
+   ],
+   "pages_read_median": 2285.0,
+   "all_pages": [
+    2285,
+    1995,
+    2550,
+    2247,
+    2897,
+    2955,
+    2246
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Custom Scan (LionOrdered) on dbpedia (actual rows=10.00  / Lion Cond: (u < '0.03'::double precision) / Lion Indexes: dbpedia_u / Lion Set Hits: 10 / Lion Set: 1"
+  },
+  {
+   "name": "hnsw ef=40 iterative",
+   "sel": 0.03,
+   "cache_dropped": true,
+   "median_ms": 324.815,
+   "max_ms": 417.976,
+   "all_ms": [
+    395.9,
+    94.0,
+    418.0,
+    357.8,
+    269.5,
+    281.9,
+    324.8
+   ],
+   "pages_read_median": 5381.0,
+   "all_pages": [
+    6343,
+    1783,
+    6444,
+    5756,
+    4997,
+    4797,
+    5381
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_hnsw on dbpedia (actual rows=10"
+  },
+  {
+   "name": "hnsw ef=40 iterative enable_sort=off",
+   "sel": 0.03,
+   "cache_dropped": true,
+   "median_ms": 299.033,
+   "max_ms": 329.172,
+   "all_ms": [
+    329.2,
+    114.5,
+    303.1,
+    324.5,
+    275.4,
+    273.5,
+    299.0
+   ],
+   "pages_read_median": 5381.0,
+   "all_pages": [
+    6343,
+    1783,
+    6444,
+    5756,
+    4997,
+    4797,
+    5381
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_hnsw on dbpedia (actual rows=10"
+  },
+  {
+   "name": "vchord probes=40 prefilter",
+   "sel": 0.03,
+   "cache_dropped": true,
+   "median_ms": 96.31,
+   "max_ms": 105.125,
+   "all_ms": [
+    97.0,
+    80.2,
+    105.1,
+    95.8,
+    96.3,
+    92.1,
+    97.1
+   ],
+   "pages_read_median": 1864.0,
+   "all_pages": [
+    1793,
+    1825,
+    1872,
+    1864,
+    1880,
+    1815,
+    1869
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_vchord on dbpedia (actual rows="
+  },
+  {
+   "name": "vchord probes=80 prefilter",
+   "sel": 0.03,
+   "cache_dropped": true,
+   "median_ms": 123.778,
+   "max_ms": 147.028,
+   "all_ms": [
+    107.1,
+    118.5,
+    123.1,
+    128.2,
+    142.6,
+    147.0,
+    123.8
+   ],
+   "pages_read_median": 2473.0,
+   "all_pages": [
+    2336,
+    2468,
+    2476,
+    2473,
+    2512,
+    2444,
+    2485
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_vchord on dbpedia (actual rows="
+  },
+  {
+   "name": "vchord probes=160 prefilter",
+   "sel": 0.03,
+   "cache_dropped": true,
+   "median_ms": 171.613,
+   "max_ms": 199.6,
+   "all_ms": [
+    159.3,
+    185.5,
+    199.6,
+    171.6,
+    196.2,
+    159.4,
+    167.9
+   ],
+   "pages_read_median": 3640.0,
+   "all_pages": [
+    3504,
+    3640,
+    3658,
+    3654,
+    3590,
+    3567,
+    3716
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_vchord on dbpedia (actual rows="
+  },
+  {
+   "name": "diskann list=10 enable_sort=off",
+   "sel": 0.03,
+   "cache_dropped": true,
+   "median_ms": 425.067,
+   "max_ms": 504.87,
+   "all_ms": [
+    342.0,
+    279.8,
+    504.9,
+    425.1,
+    437.6,
+    463.2,
+    419.2
+   ],
+   "pages_read_median": 6933.0,
+   "all_pages": [
+    7128,
+    4605,
+    8263,
+    6303,
+    7491,
+    6430,
+    6933
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_diskann on dbpedia (actual rows"
+  },
+  {
+   "name": "diskann list=200 enable_sort=off",
+   "sel": 0.03,
+   "cache_dropped": true,
+   "median_ms": 486.666,
+   "max_ms": 563.285,
+   "all_ms": [
+    501.4,
+    408.8,
+    563.3,
+    377.3,
+    536.9,
+    486.7,
+    461.2
+   ],
+   "pages_read_median": 8102.0,
+   "all_pages": [
+    8196,
+    6158,
+    9003,
+    7436,
+    8610,
+    7585,
+    8102
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_diskann on dbpedia (actual rows"
+  },
+  {
+   "name": "lionvec planner plan",
+   "sel": 0.01,
+   "cache_dropped": true,
+   "median_ms": 112.282,
+   "max_ms": 133.48,
+   "all_ms": [
+    97.5,
+    90.5,
+    112.3,
+    112.9,
+    93.1,
+    133.5,
+    117.1
+   ],
+   "pages_read_median": 2720.0,
+   "all_pages": [
+    2720,
+    2720,
+    2720,
+    2720,
+    2720,
+    2720,
+    2720
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Sort (actual rows=10.00 loops=1) / Sort Key: ((embedding <=> '[0.022196699,-0.032517813,-0.0021 / Sort Method: top-N heapsort  Memory: 25kB / ->  Bitmap Heap Sc"
+  },
+  {
+   "name": "lionvec margin=3 LionOrdered",
+   "sel": 0.01,
+   "cache_dropped": true,
+   "median_ms": 100.562,
+   "max_ms": 118.238,
+   "all_ms": [
+    105.9,
+    107.9,
+    100.6,
+    98.1,
+    96.9,
+    118.2,
+    86.9
+   ],
+   "pages_read_median": 2721.0,
+   "all_pages": [
+    2721,
+    2721,
+    2721,
+    2721,
+    2721,
+    2721,
+    2721
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Custom Scan (LionOrdered) on dbpedia (actual rows=10.00  / Lion Cond: (u < '0.01'::double precision) / Lion Indexes: dbpedia_u / Lion Set Hits: 10 / Lion Set: 1"
+  },
+  {
+   "name": "hnsw ef=40 iterative",
+   "sel": 0.01,
+   "cache_dropped": true,
+   "median_ms": 109.224,
+   "max_ms": 123.71,
+   "all_ms": [
+    123.7,
+    94.9,
+    85.2,
+    111.3,
+    109.8,
+    109.2,
+    92.3
+   ],
+   "pages_read_median": 2720.0,
+   "all_pages": [
+    2720,
+    2720,
+    2720,
+    2720,
+    2720,
+    2720,
+    2720
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Sort (actual rows=10.00 loops=1) / Sort Key: (((embedding)::halfvec(1536) <=> '[0.022201538,-0. / Sort Method: top-N heapsort  Memory: 25kB / ->  Bitmap Heap Sc"
+  },
+  {
+   "name": "hnsw ef=40 iterative enable_sort=off",
+   "sel": 0.01,
+   "cache_dropped": true,
+   "median_ms": 639.492,
+   "max_ms": 786.907,
+   "all_ms": [
+    517.3,
+    320.8,
+    747.7,
+    663.9,
+    446.3,
+    786.9,
+    639.5
+   ],
+   "pages_read_median": 11861.0,
+   "all_pages": [
+    9408,
+    4709,
+    11911,
+    12477,
+    8059,
+    13401,
+    11861
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_hnsw on dbpedia (actual rows=10"
+  },
+  {
+   "name": "vchord probes=40 prefilter",
+   "sel": 0.01,
+   "cache_dropped": true,
+   "median_ms": 100.084,
+   "max_ms": 122.575,
+   "all_ms": [
+    120.2,
+    103.3,
+    122.6,
+    99.9,
+    100.1,
+    81.8,
+    95.1
+   ],
+   "pages_read_median": 1799.0,
+   "all_pages": [
+    1677,
+    1756,
+    1799,
+    1806,
+    1817,
+    1741,
+    1803
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_vchord on dbpedia (actual rows="
+  },
+  {
+   "name": "vchord probes=80 prefilter",
+   "sel": 0.01,
+   "cache_dropped": true,
+   "median_ms": 129.631,
+   "max_ms": 164.974,
+   "all_ms": [
+    126.1,
+    127.4,
+    129.6,
+    125.8,
+    155.7,
+    165.0,
+    139.9
+   ],
+   "pages_read_median": 2475.0,
+   "all_pages": [
+    2324,
+    2476,
+    2469,
+    2483,
+    2507,
+    2452,
+    2475
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_vchord on dbpedia (actual rows="
+  },
+  {
+   "name": "vchord probes=160 prefilter",
+   "sel": 0.01,
+   "cache_dropped": true,
+   "median_ms": 186.687,
+   "max_ms": 219.567,
+   "all_ms": [
+    219.6,
+    206.6,
+    197.9,
+    186.7,
+    160.1,
+    181.0,
+    175.4
+   ],
+   "pages_read_median": 3642.0,
+   "all_pages": [
+    3493,
+    3642,
+    3653,
+    3664,
+    3584,
+    3579,
+    3708
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_vchord on dbpedia (actual rows="
+  },
+  {
+   "name": "diskann list=10 enable_sort=off",
+   "sel": 0.01,
+   "cache_dropped": true,
+   "median_ms": 564.287,
+   "max_ms": 660.42,
+   "all_ms": [
+    564.3,
+    429.6,
+    566.3,
+    518.3,
+    523.9,
+    660.4,
+    577.6
+   ],
+   "pages_read_median": 9272.0,
+   "all_pages": [
+    8849,
+    6990,
+    10475,
+    10598,
+    8086,
+    11024,
+    9272
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_diskann on dbpedia (actual rows"
+  },
+  {
+   "name": "diskann list=200 enable_sort=off",
+   "sel": 0.01,
+   "cache_dropped": true,
+   "median_ms": 595.48,
+   "max_ms": 632.454,
+   "all_ms": [
+    594.9,
+    433.7,
+    595.5,
+    632.5,
+    514.8,
+    624.1,
+    632.1
+   ],
+   "pages_read_median": 9873.0,
+   "all_pages": [
+    9442,
+    8029,
+    10811,
+    10926,
+    9022,
+    11287,
+    9873
+   ],
+   "plan": "Limit (actual rows=10.00 loops=1) / ->  Index Scan using dbpedia_diskann on dbpedia (actual rows"
+  }
+ ]
+}
