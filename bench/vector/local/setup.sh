@@ -1,9 +1,10 @@
 #!/bin/bash
 # One-time setup on an Ubuntu or Debian machine (WSL2 included): PostgreSQL 18
 # and pgvector from apt.postgresql.org, VectorChord's .deb from its GitHub
-# release, pgvectorscale from Timescale's apt repository (optional: diskann is
-# skipped if it fails), pg_lion built from this checkout, a Python venv, a
-# sudo rule so cold runs can drop the page cache, and the cluster (pg.sh init).
+# release, pg_lion built from this checkout, a Python venv, a sudo rule so cold
+# runs can drop the page cache, and the cluster (pg.sh init).  WITH_DISKANN=1
+# also installs pgvectorscale from Timescale's apt repository, for
+# KINDS="... diskann".
 # Asks for sudo.  Safe to run again.
 set -euo pipefail
 . "$(dirname "$0")/env.sh"
@@ -42,18 +43,16 @@ if [ -e "$("$PG_BIN/pg_config" --pkglibdir)/vchord.so" ]; then
 	echo "already installed"
 else
 	deb="postgresql-$PG_MAJOR-vchord_${VCHORD_VERSION}-1_$(dpkg --print-architecture).deb"
-	if curl -fL --retry 3 -o "/tmp/$deb" "https://github.com/tensorchord/VectorChord/releases/download/$VCHORD_VERSION/$deb"; then
-		sudo apt-get install -y -q "/tmp/$deb" || warn "VectorChord did not install; its runs are skipped"
-	else
-		warn "could not download $deb; VectorChord's runs are skipped"
-	fi
+	curl -fL --retry 3 -o "/tmp/$deb" "https://github.com/tensorchord/VectorChord/releases/download/$VCHORD_VERSION/$deb" ||
+		{ warn "could not download $deb (VCHORD_VERSION picks another release)"; exit 1; }
+	sudo apt-get install -y -q "/tmp/$deb"
 fi
 
 say "pgvectorscale (diskann)"
 if [ -e "$("$PG_BIN/pg_config" --sharedir)/extension/vectorscale.control" ]; then
 	echo "already installed"
-elif [ "${SKIP_DISKANN:-0}" = 1 ]; then
-	echo "skipped (SKIP_DISKANN=1)"
+elif [ "${WITH_DISKANN:-0}" != 1 ]; then
+	echo "skipped (WITH_DISKANN=1 to install it)"
 else
 	# Timescale's apt repository, set up by hand rather than through its
 	# curl-to-bash script
@@ -65,7 +64,7 @@ else
 	   sudo apt-get update -q && sudo apt-get install -y -q "pgvectorscale-postgresql-$PG_MAJOR"; then
 		:
 	else
-		warn "pgvectorscale did not install; diskann's runs are skipped (SKIP_DISKANN=1 to not try)"
+		warn "pgvectorscale did not install; diskann cannot run"
 		sudo rm -f /etc/apt/sources.list.d/timescaledb.list
 	fi
 fi

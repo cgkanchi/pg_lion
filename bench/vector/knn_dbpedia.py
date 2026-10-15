@@ -385,8 +385,12 @@ def sizes(conn=None):
     return out
 
 
-def build(name, ddl):
+def build(name, ddl, extension=None):
     conn = connect()
+    if extension:
+        # vchord (VectorChord) or vectorscale (diskann), which load() does
+        # not create
+        conn.execute(f'CREATE EXTENSION IF NOT EXISTS {extension} CASCADE')
     cost_distances(conn)
     notes = []
     conn.add_notice_handler(lambda d: notes.append(d.message_primary))
@@ -680,6 +684,7 @@ def cold(name='cold'):
     filtered_margins = picked.get(('lionvec', 0.03), filtered_margins)
     efs = picked.get(('hnsw', 1.0), efs)
     filtered_ef = picked.get(('hnsw', 0.03), (filtered_ef,))[0]
+    filtered_probes = probes or picked.get(('vchord', 0.03), picked.get(('vchord', 1.0), ()))
     probes = probes or picked.get(('vchord', 1.0), ())
     lists = lists or picked.get(('diskann', 1.0), ())
     hn = [f'SET hnsw.ef_search = {filtered_ef}', 'SET hnsw.iterative_scan = relaxed_order']
@@ -703,7 +708,7 @@ def cold(name='cold'):
         configs.append(('hnsw', sel, f'hnsw ef={filtered_ef} iterative', sql('hnsw', sel), hn))
         configs.append(('hnsw', sel, f'hnsw ef={filtered_ef} iterative enable_sort=off', sql('hnsw', sel),
                         hn + ['SET enable_sort = off']))
-        for p in probes:
+        for p in filtered_probes:
             configs.append(('vchord', sel, f'vchord probes={p} prefilter', sql('vchord', sel),
                             [f"SET vchordrq.probes = '{p}'", 'SET vchordrq.prefilter = on', 'SET enable_sort = off']))
         for l in lists:
@@ -756,23 +761,27 @@ def cold(name='cold'):
 
 def cold_settings(d):
     # From the warm results in directory d (lionvec.json, hnsw.json,
-    # vchord.json, diskann.json, those there are): for each kind, the
-    # smallest setting it swept that reached a mean recall of 0.95, and of
-    # 0.98 (the largest swept where none did), unfiltered and, for lionvec's
-    # LionOrdered and HNSW's iterative scan, at the 3% filter; a sorted tuple
-    # of the distinct settings, keyed (kind, sel).
+    # vchord.json or vchord-l*.json, diskann.json, those there are): for each
+    # kind, the smallest setting it swept that reached a mean recall of 0.95,
+    # and of 0.98 (the largest swept where none did), unfiltered and, for
+    # lionvec's LionOrdered, HNSW's iterative scan and VectorChord's
+    # prefilter, at the 3% filter; a sorted tuple of the distinct settings,
+    # keyed (kind, sel).
     pats = {('lionvec', 1.0): r'lionvec margin=([\d.]+) patience=\d+',
             ('lionvec', 0.03): r'lionvec margin=([\d.]+) patience=\d+ LionOrdered',
             ('hnsw', 1.0): r'hnsw ef=(\d+)',
             ('hnsw', 0.03): r'hnsw ef=(\d+) iterative enable_sort=off',
             ('vchord', 1.0): r'vchord probes=(\d+)',
+            ('vchord', 0.03): r'vchord probes=(\d+) prefilter',
             ('diskann', 1.0): r'diskann list=(\d+) rescore=\d+'}
     out = {}
     for (kind, sel), pat in pats.items():
-        try:
-            rs = json.load(open(os.path.join(d, f'{kind}.json')))['results']
-        except OSError:
+        # KIND.json, or the newest KIND-*.json (vchord-l1000.json)
+        fs = glob.glob(os.path.join(d, f'{kind}.json')) or \
+            sorted(glob.glob(os.path.join(d, f'{kind}-*.json')), key=os.path.getmtime)[-1:]
+        if not fs:
             continue
+        rs = json.load(open(fs[0]))['results']
         pts = sorted((float(g.group(1)), r['recall']) for r in rs if r['sel'] == sel
                      for g in [re.fullmatch(pat, r['name'])] if g)
         if not pts:
@@ -896,10 +905,10 @@ if __name__ == '__main__':
         lists = '[]' if int(a[1]) == 0 else f'[{int(a[1])}]'
         build(INDEXES['vchord'], f'CREATE INDEX {INDEXES["vchord"]} ON {TABLE} USING vchordrq '
               f'(embedding {opclass()}) WITH (options = $$\nresidual_quantization = false\n'
-              f'[build.internal]\nlists = {lists}\nspherical_centroids = true\n$$)')
+              f'[build.internal]\nlists = {lists}\nspherical_centroids = true\n$$)', 'vchord')
     elif a == ['diskann']:
         build(INDEXES['diskann'], f'CREATE INDEX {INDEXES["diskann"]} ON {TABLE} USING diskann '
-              f'(embedding {opclass()})')
+              f'(embedding {opclass()})', 'vectorscale')
     elif a[:1] == ['warm'] and len(a) == 3 and a[1] in INDEXES:
         warm(a[1], a[2])
     elif a[:1] == ['exact'] and len(a) == 2:
