@@ -1,9 +1,10 @@
 /*-------------------------------------------------------------------------
  *
  * lion_vec.c
- *		lionvec, the nearest-neighbour index of pgvector's `vector`: its
- *		handler, settings, pages, build, inserts, VACUUM and costs.  The scan
- *		is lion_vec_scan.c, the arithmetic lion_vec_math.c (DESIGN.md §44).
+ *		lionvec, the nearest-neighbour index of pgvector's `vector` and
+ *		`halfvec`: its handler, settings, pages, build, inserts, VACUUM and
+ *		costs.  The scan is lion_vec_scan.c, the arithmetic lion_vec_math.c
+ *		(DESIGN.md §44).
  *
  * The index is chains of pages under a meta page:
  *
@@ -15,16 +16,18 @@
  *	CODE	one item a row: its TID, plane 1 and the numbers its estimate
  *			needs; a chain of them a partition, which the build writes in one
  *			run of blocks, in heap order, so that a scan reads a partition in
- *			block order.  Two more chains hold the rows in no partition: the
- *			NULL rows and cosine's zero vectors, and, in an index built with
- *			no partitions, every other row.
+ *			block order.  An index that spills (the `spill` option) has a
+ *			second item, a copy, of every row with a vector, in the chain of
+ *			a second partition SOAR chooses.  Two more chains hold the rows in
+ *			no partition: the NULL rows and cosine's zero vectors, and, in an
+ *			index built with no partitions, every other row.
  *	REFINE	one item a row with a vector, and one a centroid: its 8-bit
  *			codes, which only the rows plane 1 cannot rule out are read for
  *
- * Inserts append to a partition's tail, serialized by the meta page's lock.
- * VACUUM removes CODE items, which nothing points at, and then their REFINE
- * items, which a scan finds through the CODE item it copied and checks by
- * TID.
+ * Inserts append to a partition's tail (and a copy to a second's),
+ * serialized by the meta page's lock.  VACUUM removes CODE items, which
+ * nothing points at, and then their REFINE items, which a scan finds through
+ * the CODE item it copied and checks by TID.
  *
  *-------------------------------------------------------------------------
  */
@@ -45,7 +48,7 @@
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator_d.h"
-#include "catalog/pg_type_d.h"
+#include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/vacuum.h"
 #include "common/pg_prng.h"
@@ -75,6 +78,7 @@ double		lionvec_epsilon = 4.0;
 int			lionvec_batch = 100;
 double		lionvec_margin = LIONVEC_MARGIN_DEFAULT;
 int			lionvec_patience = LIONVEC_PATIENCE_DEFAULT;
+int			lionvec_exact_rows = LIONVEC_EXACT_DEFAULT;
 
 static relopt_kind lionvec_relopt_kind;
 
@@ -88,20 +92,8 @@ typedef struct LionVecOptions
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int			partitions;		/* 0: by the rows' count (lionvec_partitions()) */
+	bool		spill;			/* a copy of each row in a second partition */
 } LionVecOptions;
-
-/*
- * pgvector's `vector`, as it lays it out: a varlena of a 16-bit dimension
- * count, 16 unused bits and the floats.  pg_lion reads it here rather than
- * linking pgvector, so that pg_lion itself loads without pgvector.
- */
-typedef struct LionVecPgVector
-{
-	int32		vl_len_;
-	int16		dim;
-	int16		unused;
-	float		x[FLEXIBLE_ARRAY_MEMBER];
-} LionVecPgVector;
 
 StaticAssertDecl(LIONVEC_CODE_HDRSZ == 32,
 				 "lionvec: the CODE item header is four words");
@@ -158,14 +150,31 @@ lion_vec_init(void)
 							 NULL, NULL, NULL);
 
 	DefineCustomIntVariable("pg_lion.vector_patience",
-							"How many partitions' worth of rows a lionvec scan scores without finding a "
-							"nearer one before it stops probing.",
-							"A scan that has scored this many partitions' worth of rows (of the members, "
-							"under a lion filter) since one last entered its pg_lion.vector_batch nearest "
-							"stops probing partitions until it has returned the rows it holds.  Smaller "
-							"stops sooner and misses more of the nearest rows; 0 never stops.",
+							"How many units of rows a lionvec scan scores without finding a nearer one "
+							"before it stops probing.",
+							"A unit is the rows an average partition would hold were there 2 sqrt(n) of "
+							"them, n the rows the index was built with: sqrt(n) / 2 rows, or that share "
+							"of the members under a lion filter, whatever the partitions' number, and "
+							"twice that in an index that spills, whose probes see each row twice.  A scan "
+							"that has scored this many units since one last entered its "
+							"pg_lion.vector_batch nearest stops probing partitions until it has returned "
+							"the rows it holds.  Smaller stops sooner and misses more of the nearest rows; "
+							"0 never stops.",
 							&lionvec_patience,
 							LIONVEC_PATIENCE_DEFAULT, 0, 1000000,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+	DefineCustomIntVariable("pg_lion.vector_exact_rows",
+							"How many rows a lion filter may admit for a lionvec scan under it to "
+							"compute every one's distance exactly instead of probing partitions.",
+							"A scan restricted to this many rows or fewer reads each one's vector "
+							"from the table and returns the exact order, reading no code page; "
+							"restricted to more, it probes the partitions nearest the query as an "
+							"unfiltered scan does.  Larger makes more filters exact, at a table read "
+							"a row; 0 never does.",
+							&lionvec_exact_rows,
+							LIONVEC_EXACT_DEFAULT, 0, 100000000,
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
@@ -174,6 +183,10 @@ lion_vec_init(void)
 					  "Partitions a lionvec index's build makes; 0 chooses by the rows' count",
 					  0, 0, LIONVEC_MAX_PARTS,
 					  AccessExclusiveLock);
+
+	add_bool_reloption(lionvec_relopt_kind, "spill",
+					   "Whether a lionvec index's build stores each row in a second partition too",
+					   true, AccessExclusiveLock);
 }
 
 bool
@@ -189,25 +202,64 @@ lion_vec_relation(Relation index)
  */
 
 /*
- * The floats of a `vector` datum and their count; *tofree is the detoasted
- * copy to pfree, or NULL.
+ * Whether the index's column is pgvector's `halfvec` rather than its
+ * `vector` (DESIGN.md §44.1): by the name of its operator class's input
+ * type, as pg_lion knows neither type's OID.  The query an index's scan is
+ * given is of that type too, as both sides of its operator are.
+ */
+static bool
+lionvec_index_half(Relation index)
+{
+	Oid			type = index->rd_opcintype[0];
+	HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
+	bool		half;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for type %u", type);
+	half = strcmp(NameStr(((Form_pg_type) GETSTRUCT(tup))->typname), "halfvec") == 0;
+	ReleaseSysCache(tup);
+	return half;
+}
+
+/*
+ * The floats of a `vector` datum, or of a `halfvec` one if half, and their
+ * count.  A vector's are its own, and *tofree is the detoasted copy to
+ * pfree, or NULL.  A halfvec's are converted into buf, if it holds bufdim
+ * floats and they fit, or else into an array palloc'd here, which *tofree
+ * is then; its detoasted copy is freed here.  Either way the caller pfrees
+ * *tofree, if not NULL, when done with the floats.
  */
 const float *
-lionvec_datum_floats(Datum d, int *dim, Pointer *tofree)
+lionvec_datum_floats(Datum d, bool half, float *buf, int bufdim, int *dim,
+					 Pointer *tofree)
 {
 	struct varlena *raw = (struct varlena *) DatumGetPointer(d);
 	struct varlena *v = pg_detoast_datum(raw);
-	LionVecPgVector *vec = (LionVecPgVector *) v;
 	Size		len = VARSIZE(v);
+	int			n = lionvec_datum_dim(v, len, half);
 
-	*tofree = v != raw ? (Pointer) v : NULL;
-	if (len < offsetof(LionVecPgVector, x) || vec->dim < 0 ||
-		len < offsetof(LionVecPgVector, x) + sizeof(float) * (Size) vec->dim)
+	if (n < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("lionvec was given a malformed vector of %zu bytes", len)));
-	*dim = vec->dim;
-	return vec->x;
+				 errmsg("lionvec was given a malformed %s of %zu bytes",
+						lionvec_type_name(half), len)));
+	*dim = n;
+	if (!half)
+	{
+		*tofree = v != raw ? (Pointer) v : NULL;
+		return ((LionVecPgVector *) v)->x;
+	}
+
+	*tofree = NULL;
+	if (buf == NULL || n > bufdim)
+	{
+		buf = palloc(sizeof(float) * Max(n, 1));
+		*tofree = (Pointer) buf;
+	}
+	lionvec_halves(((LionVecPgHalfVector *) v)->x, n, buf);
+	if (v != raw)
+		pfree(v);
+	return buf;
 }
 
 /* pgvector's own error, so a query reads the same with or without the index */
@@ -221,12 +273,13 @@ lionvec_check_dims(const LionVecInfo *info, int dim)
 }
 
 static void
-lionvec_check_max_dims(int dims)
+lionvec_check_max_dims(int dims, bool half)
 {
 	if (dims < 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
-				 errmsg("vector must have at least 1 dimension")));
+				 errmsg("%s must have at least 1 dimension",
+						lionvec_type_name(half))));
 	if (dims > LIONVEC_MAX_DIM)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -294,10 +347,12 @@ lionvec_check_page(Relation index, Page page, BlockNumber blk, uint16 type)
 /*
  * A CODE item, checked against the length a row of its kind has: NULL rows
  * and cosine zero vectors carry the header alone, every other row its plane.
+ * copies says whether the chain may hold a row's copy (LIONVEC_SPILL): it is
+ * a partition's, of an index that spills.  A copy is of a row with a vector.
  */
 LionVecCode *
 lionvec_code_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
-				int dimsp)
+				int dimsp, bool copies)
 {
 	ItemId		iid = PageGetItemId(page, off);
 	LionVecCode *code;
@@ -310,7 +365,9 @@ lionvec_code_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 						RelationGetRelationName(index), blk, off)));
 	code = (LionVecCode *) PageGetItem(page, iid);
 	len = ItemIdGetLength(iid);
-	if ((code->flags & ~(LIONVEC_NULL | LIONVEC_ZERO)) != 0 ||
+	if ((code->flags & ~(LIONVEC_NULL | LIONVEC_ZERO | LIONVEC_SPILL)) != 0 ||
+		((code->flags & LIONVEC_SPILL) != 0 &&
+		 (code->flags & (LIONVEC_NULL | LIONVEC_ZERO)) != 0) ||
 		((code->flags & (LIONVEC_NULL | LIONVEC_ZERO)) != 0 ?
 		 len != LIONVEC_CODE_HDRSZ :
 		 (dimsp <= 0 || len != LIONVEC_CODE_SIZE(dimsp))))
@@ -318,6 +375,11 @@ lionvec_code_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has an item of %zu bytes and flags 0x%x at (%u,%u)",
 						RelationGetRelationName(index), len, code->flags, blk, off)));
+	if ((code->flags & LIONVEC_SPILL) != 0 && !copies)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lionvec index \"%s\" has a row's copy where none belongs, at (%u,%u)",
+						RelationGetRelationName(index), blk, off)));
 	return code;
 }
 
@@ -353,7 +415,9 @@ lionvec_refine_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 
 /*
  * A PART item, checked: its length, its centroid's (which always has a
- * vector), and its chain's ends.
+ * vector), its chain's ends, and its numbers - a length or a spread that is
+ * negative or not finite would make a bound whose lower end lies past its
+ * upper.
  */
 LionVecPart *
 lionvec_part_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
@@ -370,7 +434,11 @@ lionvec_part_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 						RelationGetRelationName(index), blk, off)));
 	part = (LionVecPart *) PageGetItem(page, iid);
 	if (part->cent.flags != 0 || !BlockNumberIsValid(part->head) ||
-		!BlockNumberIsValid(part->tail) || !BlockNumberIsValid(part->cent.rblk))
+		!BlockNumberIsValid(part->tail) || !BlockNumberIsValid(part->cent.rblk) ||
+		!(part->cent.norm >= 0.0f) || isinf(part->cent.norm) ||
+		isnan(part->cent.alpha1) || isinf(part->cent.alpha1) ||
+		!(part->maxnorm >= 0.0f) || isinf(part->maxnorm) ||
+		!(part->spread >= 0.0f) || isinf(part->spread))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has a malformed partition at (%u,%u)",
@@ -402,7 +470,9 @@ lionvec_check_meta(Relation index, Page page)
 		!BlockNumberIsValid(meta->null_head) || !BlockNumberIsValid(meta->null_tail) ||
 		(meta->nparts > 0) != BlockNumberIsValid(meta->part_head) ||
 		meta->nparts > LIONVEC_MAX_PARTS ||
-		(meta->nparts > 0 && meta->dims == 0))
+		(meta->nparts > 0 && meta->dims == 0) ||
+		(meta->flags & ~LIONVEC_META_SPILL) != 0 ||
+		((meta->flags & LIONVEC_META_SPILL) != 0 && meta->nparts < 2))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has a malformed meta page",
@@ -523,11 +593,12 @@ lionvec_read_mean(Relation index, BlockNumber blk, float *mean, int dimsp)
 }
 
 /*
- * The rotation and mean of the index, as a palloc'd copy the caller owns.
- * The backend keeps one in rd_amcache, made again when the meta page says
- * something else; a copy is returned rather than that one because a relcache
- * invalidation, which can arrive whenever a lock is taken (a TOAST fetch's
- * included), frees it.
+ * The rotation and mean of the index, and its column's type, as a palloc'd
+ * copy the caller owns.  The backend keeps one in rd_amcache, made again
+ * when the meta page says something else; a copy is returned rather than
+ * that one because a relcache invalidation, which can arrive whenever a lock
+ * is taken (a TOAST fetch's included), frees it.  The type is looked up
+ * while rd_amcache is empty, for the lookup may take a lock.
  */
 LionVecInfo *
 lionvec_get_info(Relation index)
@@ -541,14 +612,18 @@ lionvec_get_info(Relation index)
 	if (cached == NULL || cached->dims != meta.dims ||
 		cached->metric != meta.metric || cached->seed != meta.seed)
 	{
+		bool		half;
+
 		if (cached != NULL)
 		{
 			index->rd_amcache = NULL;
 			pfree(cached);
 		}
+		half = lionvec_index_half(index);
 		size = lionvec_info_size(meta.dimsp);
 		cached = MemoryContextAllocZero(index->rd_indexcxt, size);
 		cached->metric = meta.metric;
+		cached->half = half;
 		cached->dims = meta.dims;
 		cached->dimsp = meta.dimsp;
 		cached->seed = meta.seed;
@@ -576,13 +651,13 @@ lionvec_get_info(Relation index)
  * it (§44.2): under the meta page's lock, so that two first inserts agree.
  */
 static void
-lionvec_set_dims(Relation index, int dims)
+lionvec_set_dims(Relation index, int dims, bool half)
 {
 	Buffer		buf;
 	Page		page;
 	LionVecMeta meta;
 
-	lionvec_check_max_dims(dims);
+	lionvec_check_max_dims(dims, half);
 	buf = ReadBuffer(index, LIONVEC_METAPAGE);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	page = BufferGetPage(buf);
@@ -612,14 +687,20 @@ typedef struct LionVecItems
 	LionVecRefine *ref;			/* LIONVEC_REFINE_SIZE(dimsp) bytes */
 	bool		hasref;
 	float	   *x;				/* [dimsp] */
+	float	   *h;				/* [hdim]: a halfvec's floats, or NULL */
+	int			hdim;
 } LionVecItems;
 
 static void
-lionvec_items_alloc(LionVecItems *it, int dimsp)
+lionvec_items_alloc(LionVecItems *it, const LionVecInfo *info)
 {
+	int			dimsp = info->dimsp;
+
 	it->code = palloc0(LIONVEC_CODE_SIZE(Max(dimsp, 64)));
 	it->ref = palloc0(LIONVEC_REFINE_SIZE(Max(dimsp, 64)));
 	it->x = palloc(sizeof(float) * Max(dimsp, 64));
+	it->hdim = info->half ? info->dims : 0;
+	it->h = it->hdim > 0 ? palloc(sizeof(float) * it->hdim) : NULL;
 }
 
 /*
@@ -649,7 +730,8 @@ lionvec_items_fill(const LionVecInfo *info, LionVecItems *it, ItemPointer tid,
 	{
 		Pointer		tofree;
 		int			dim;
-		const float *v = lionvec_datum_floats(value, &dim, &tofree);
+		const float *v = lionvec_datum_floats(value, info->half, it->h,
+											  it->hdim, &dim, &tofree);
 		bool		nonzero;
 
 		lionvec_check_dims(info, dim);
@@ -710,9 +792,23 @@ lionvec_note_key(Page page, ItemPointer tid)
 #define LIONVEC_MIN_AUTO_ROWS	10000
 
 /*
+ * The partitions the build chooses by itself, per square root of the rows:
+ * 8 sqrt(n), 8,000 for a million rows, where it was 2 sqrt(n).  Partitions
+ * a quarter the size read 1.55 to 1.78 times fewer rows for the same recall
+ * in the numpy model of DBpedia's text-embedding-3-large rows, and 1.5
+ * times fewer CODE pages for 0.95 of the true ten on an index of 115,186 of
+ * them - no faster there, where ranking four times the centroids costs what
+ * the pages save (DESIGN.md §44.3, §44.9).  The build's time grows with
+ * the partitions.
+ */
+#define LIONVEC_PARTS_PER_ROOT	8.0
+
+/*
  * The CODE items go through a sort by partition, then heap order: a key of
  * the group (a partition, then the rows in no partition, then the NULL rows
- * and zeros) above the row's place in the heap scan.
+ * and zeros) above the row's place in the heap scan.  A row's copy goes in
+ * at the same place in its second partition's group, so that the sort holds
+ * two items a row of an index that spills.
  */
 #define LIONVEC_SEQ_BITS		40
 #define LIONVEC_SORT_KEY(group, seq) \
@@ -726,8 +822,10 @@ typedef struct LionVecBuildState
 {
 	Relation	index;
 	int			metric;
+	bool		half;			/* the column is a halfvec */
 	int			dims;
 	/* the first pass: the mean, and a sample (lionvec_build_sample()) */
+	float	   *hbuf;			/* [dims]: a halfvec row's floats */
 	double	   *sum;			/* [dims] */
 	double		nsum;			/* rows with a vector (cosine: a nonzero one) */
 	LionVecRotation srot;
@@ -740,6 +838,11 @@ typedef struct LionVecBuildState
 	LionVecInfo *info;
 	LionVecItems items;
 	int			nparts;
+	bool		spill;			/* a copy of each row in a second partition */
+	float	   *cent;			/* spilling: [nparts][dimsp], the centroids, centred */
+	double	   *ckey;			/* [nparts]: the candidates' keys */
+	int			crank[LIONVEC_SOAR_CANDS + 1];	/* ... the least of them */
+	const float *csoar[LIONVEC_SOAR_CANDS]; /* ... and SOAR's candidates */
 	LionVecCentroids cents;		/* the centroids' plane 1 ... */
 	uint64	   *cbits;			/* [nparts][dimsp / 64] */
 	uint16	   *cpop;			/* [nparts] */
@@ -751,11 +854,11 @@ typedef struct LionVecBuildState
 	float	   *crnorm8;		/* [nparts] */
 	BlockNumber *crblk;			/* [nparts]: ... and their REFINE items */
 	OffsetNumber *croff;		/* [nparts] */
-	uint32	   *pcount;			/* [nparts]: the rows put in each */
-	float	   *pmaxnorm;		/* [nparts]: the largest |x + m| of those rows */
+	uint32	   *pcount;			/* [nparts]: the items put in each, copies too */
+	float	   *pmaxnorm;		/* [nparts]: the largest |x + m| of their rows */
 	double	   *psumsq;			/* [nparts]: their sum of |x - c|^2 */
 	double		mean2;			/* |m|^2, m the mean */
-	double		sumsq;			/* sum of |x - c|^2, x a row and c its centroid */
+	double		sumsq;			/* sum of |x - c|^2, x a row and c its nearest */
 	double		nsq;			/* ... over this many rows */
 	LionVecQuery q;				/* a row, as its nearest centroid is found by */
 	double	   *lo;				/* [nparts] */
@@ -847,11 +950,14 @@ lionvec_build_mean_callback(Relation index, ItemPointer tid, Datum *values,
 	if (isnull[0])
 		return;
 	old = MemoryContextSwitchTo(bs->tmpcxt);
-	v = lionvec_datum_floats(values[0], &dim, &tofree);
+	v = lionvec_datum_floats(values[0], bs->half, bs->hbuf,
+							 bs->hbuf != NULL ? bs->dims : 0, &dim, &tofree);
 	if (bs->dims == 0)
 	{
-		lionvec_check_max_dims(dim);
+		lionvec_check_max_dims(dim, bs->half);
 		bs->dims = dim;
+		if (bs->half)
+			bs->hbuf = MemoryContextAlloc(bs->buildcxt, sizeof(float) * dim);
 	}
 	if (dim != bs->dims)
 		ereport(ERROR,
@@ -881,10 +987,10 @@ lionvec_build_mean_callback(Relation index, ItemPointer tid, Datum *values,
 /*
  * How many partitions the build makes of nrows rows with a vector, sampled
  * sampled: as the index's `partitions` option asks, or else one for a table
- * of fewer than LIONVEC_MIN_AUTO_ROWS of them and twice their square root
- * for a larger (2,000 for a million rows), no more than the sample has
- * LIONVEC_SAMPLE_PER_PART rows for.  Never more than the sample's rows, and
- * none without one.
+ * of fewer than LIONVEC_MIN_AUTO_ROWS of them and LIONVEC_PARTS_PER_ROOT
+ * times their square root for a larger (8,000 for a million rows), no more
+ * than the sample has LIONVEC_SAMPLE_PER_PART rows for.  Never more than the
+ * sample's rows, and none without one.
  */
 static int
 lionvec_partitions(Relation index, double nrows, int sampled)
@@ -899,7 +1005,7 @@ lionvec_partitions(Relation index, double nrows, int sampled)
 	else if (nrows < LIONVEC_MIN_AUTO_ROWS)
 		want = 1.0;
 	else
-		want = Min(2.0 * sqrt(nrows),
+		want = Min(LIONVEC_PARTS_PER_ROOT * sqrt(nrows),
 				   Max(1.0, floor((double) sampled / LIONVEC_SAMPLE_PER_PART)));
 	want = Min(want, (double) sampled);
 	return (int) Max(1.0, Min(want, (double) LIONVEC_MAX_PARTS));
@@ -937,7 +1043,9 @@ lionvec_build_put_refine(LionVecBuildState *bs, LionVecRefine *ref, Size size,
  * changes no distance), spherical for cosine, whose rows are of unit length;
  * then each centroid coded as a row is, its 8-bit codes in a REFINE item
  * and its plane 1 kept for the PART chain and for finding each row's
- * nearest (lionvec_build_nearest()).  The sample is freed.
+ * nearest (lionvec_build_nearest()).  An index that spills keeps the
+ * centroids' floats too, centred as the rows are, for SOAR's choice of a
+ * row's second partition.  The sample is freed.
  */
 static void
 lionvec_build_centroids(LionVecBuildState *bs)
@@ -1021,6 +1129,8 @@ lionvec_build_centroids(LionVecBuildState *bs)
 		e.bits = bs->cbits + (Size) j * nw;
 		e.codes = bs->ccodes + (Size) j * dimsp;
 		lionvec_encode(bs->info->mean, dimsp, w.x, &e);
+		if (bs->spill)
+			memcpy(cent + (Size) j * dimsp, w.x, sizeof(float) * dimsp);	/* centred */
 		bs->cpop[j] = e.popcount;
 		bs->cnorm[j] = e.norm;
 		bs->calpha1[j] = e.alpha1;
@@ -1036,7 +1146,10 @@ lionvec_build_centroids(LionVecBuildState *bs)
 	}
 	pfree(ref);
 	pfree(w.x);
-	pfree(cent);
+	if (bs->spill)
+		bs->cent = cent;
+	else
+		pfree(cent);
 
 	bs->cents.k = k;
 	bs->cents.dimsp = dimsp;
@@ -1050,6 +1163,7 @@ lionvec_build_centroids(LionVecBuildState *bs)
 	bs->lo = palloc(sizeof(double) * k);
 	bs->hi = palloc(sizeof(double) * k);
 	bs->cand = palloc(sizeof(int) * k);
+	bs->ckey = palloc(sizeof(double) * k);
 }
 
 /*
@@ -1057,39 +1171,82 @@ lionvec_build_centroids(LionVecBuildState *bs)
  * xnorm: the centroid nearest it by L2, among the candidates plane 1 leaves
  * (lionvec_candidates()) by their 8-bit codes, whose error is a seventieth
  * of plane 1's.  *dist2 is the row's squared distance from it.
+ *
+ * An index that spills takes the candidates that can be among the
+ * LIONVEC_SOAR_CANDS + 1 nearest instead, ranks them by their codes, and
+ * gives the nearest's partition and, in *second, SOAR's choice among the
+ * next (lionvec_soar_second(), DESIGN.md §44.3), by the centroids' floats;
+ * *dist2b is the row's squared distance from that one.  Otherwise *second
+ * is -1.
  */
 static int
 lionvec_build_nearest(LionVecBuildState *bs, const float *xc, float xnorm,
-					  double *dist2)
+					  double *dist2, int *second, double *dist2b)
 {
 	int			dimsp = bs->info->dimsp;
+	int			m = bs->spill ? LIONVEC_SOAR_CANDS + 1 : 1;
 	int			nc;
-	int			best = -1;
-	double		bestkey = INFINITY;
+	int			nr;
+	int			best;
 	int			c;
 
+	*second = -1;
+	*dist2b = 0.0;
 	lionvec_query_init(&bs->q, LIONVEC_L2, NULL, xc, LIONVEC_ASSIGN_EPS);
-	nc = lionvec_candidates(&bs->cents, &bs->q, bs->lo, bs->hi, bs->cand);
+	nc = lionvec_candidates_n(&bs->cents, &bs->q, m, bs->lo, bs->hi, bs->cand);
 	for (c = 0; c < nc; c++)
 	{
 		int			j = bs->cand[c];
 		double		est;
 		double		err;
-		double		key;
 
 		lionvec_estimate8(&bs->q, bs->ccodes + (Size) j * dimsp, bs->cnorm[j],
 						  bs->calpha8[j], bs->crnorm8[j], &est, &err);
-		key = (double) bs->cnorm[j] * bs->cnorm[j] - 2.0 * est;
-		if (best < 0 || key < bestkey)
-		{
-			best = j;
-			bestkey = key;
-		}
+		bs->ckey[c] = (double) bs->cnorm[j] * bs->cnorm[j] - 2.0 * est;
 	}
-	if (best < 0)
-		elog(ERROR, "lionvec: no centroid near a row");
-	*dist2 = Max((double) xnorm * xnorm + bestkey, 0.0);
+	nr = lionvec_rank(bs->ckey, nc, m, bs->crank);
+
+	/*
+	 * The build's own centroids, every number finite, leave min(k, m)
+	 * candidates or more (lion_vec_math.h), so two or more when spilling,
+	 * which takes two partitions or more.
+	 */
+	if (nr < Min(bs->cents.k, m))
+		elog(ERROR, "lionvec: %d of %d centroids near a row, fewer than %d",
+			 nr, bs->cents.k, Min(bs->cents.k, m));
+	best = bs->cand[bs->crank[0]];
+	*dist2 = Max((double) xnorm * xnorm + bs->ckey[bs->crank[0]], 0.0);
+
+	if (bs->spill)
+	{
+		int			s;
+		int			i;
+
+		for (i = 1; i < nr; i++)
+			bs->csoar[i - 1] = bs->cent + (Size) bs->cand[bs->crank[i]] * dimsp;
+		s = lionvec_soar_second(xc, bs->cent + (Size) best * dimsp, bs->csoar,
+								nr - 1, dimsp, LIONVEC_SOAR_LAMBDA);
+		Assert(s >= 0 && s < nr - 1);
+		*second = bs->cand[bs->crank[s + 1]];
+		*dist2b = Max((double) xnorm * xnorm + bs->ckey[bs->crank[s + 1]], 0.0);
+	}
 	return best;
+}
+
+/* An item into the sort, in group's chain, at the row's place in the heap. */
+static void
+lionvec_build_put_code(LionVecBuildState *bs, uint32 group, const LionVecCode *code,
+					   Size size)
+{
+	SET_VARSIZE(bs->sortitem, VARHDRSZ + size);
+	memcpy(VARDATA(bs->sortitem), code, size);
+	ExecClearTuple(bs->inslot);
+	bs->inslot->tts_values[0] = Int64GetDatum(LIONVEC_SORT_KEY(group, (uint64) bs->indtuples));
+	bs->inslot->tts_isnull[0] = false;
+	bs->inslot->tts_values[1] = PointerGetDatum(bs->sortitem);
+	bs->inslot->tts_isnull[1] = false;
+	ExecStoreVirtualTuple(bs->inslot);
+	tuplesort_puttupleslot(bs->sort, bs->inslot);
 }
 
 static void
@@ -1100,6 +1257,7 @@ lionvec_build_callback(Relation index, ItemPointer tid, Datum *values,
 	LionVecItems *it = &bs->items;
 	MemoryContext old = MemoryContextSwitchTo(bs->tmpcxt);
 	uint32		group;
+	int			second = -1;
 
 	lionvec_items_fill(bs->info, it, tid, values[0], isnull[0]);
 	if (!it->hasref)
@@ -1109,17 +1267,26 @@ lionvec_build_callback(Relation index, ItemPointer tid, Datum *values,
 	else
 	{
 		double		dist2;
+		double		dist2b;
 		double		norm = it->code->norm;
-		double		raw2;
+		float		raw;
 
-		group = lionvec_build_nearest(bs, it->x, it->code->norm, &dist2);
+		group = lionvec_build_nearest(bs, it->x, it->code->norm, &dist2,
+									  &second, &dist2b);
+		/* |x + m|, the row's own norm (a cosine row's 1) */
+		raw = (float) sqrt(Max(norm * norm + 2.0 * it->code->xm + bs->mean2, 0.0));
 		bs->pcount[group]++;
 		bs->psumsq[group] += dist2;
+		bs->pmaxnorm[group] = Max(bs->pmaxnorm[group], raw);
+		/* the scale (the margin's unit) is of rows about their nearest */
 		bs->sumsq += dist2;
 		bs->nsq += 1.0;
-		/* |x + m|^2, the row's own norm (a cosine row's 1) */
-		raw2 = norm * norm + 2.0 * it->code->xm + bs->mean2;
-		bs->pmaxnorm[group] = Max(bs->pmaxnorm[group], (float) sqrt(Max(raw2, 0.0)));
+		if (second >= 0)
+		{
+			bs->pcount[second]++;
+			bs->psumsq[second] += dist2b;
+			bs->pmaxnorm[second] = Max(bs->pmaxnorm[second], raw);
+		}
 	}
 	if (it->hasref)
 		lionvec_build_put_refine(bs, it->ref, LIONVEC_REFINE_SIZE(bs->info->dimsp),
@@ -1127,15 +1294,14 @@ lionvec_build_callback(Relation index, ItemPointer tid, Datum *values,
 
 	if (bs->indtuples >= (double) (UINT64CONST(1) << LIONVEC_SEQ_BITS))
 		elog(ERROR, "lionvec: too many rows to build an index of");
-	SET_VARSIZE(bs->sortitem, VARHDRSZ + it->codesize);
-	memcpy(VARDATA(bs->sortitem), it->code, it->codesize);
-	ExecClearTuple(bs->inslot);
-	bs->inslot->tts_values[0] = Int64GetDatum(LIONVEC_SORT_KEY(group, (uint64) bs->indtuples));
-	bs->inslot->tts_isnull[0] = false;
-	bs->inslot->tts_values[1] = PointerGetDatum(bs->sortitem);
-	bs->inslot->tts_isnull[1] = false;
-	ExecStoreVirtualTuple(bs->inslot);
-	tuplesort_puttupleslot(bs->sort, bs->inslot);
+	lionvec_build_put_code(bs, group, it->code, it->codesize);
+	if (second >= 0)
+	{
+		/* the copy: the same item, pointing at the same REFINE item */
+		it->code->flags |= LIONVEC_SPILL;
+		lionvec_build_put_code(bs, (uint32) second, it->code, it->codesize);
+		it->code->flags &= ~LIONVEC_SPILL;
+	}
 	bs->indtuples += 1;
 
 	MemoryContextSwitchTo(old);
@@ -1327,13 +1493,13 @@ lionvec_build_write_parts(LionVecBuildState *bs, const BlockNumber *heads,
 
 /* The dimensions the column's type modifier fixes, or 0. */
 static int
-lionvec_typmod_dims(Relation index)
+lionvec_typmod_dims(Relation index, bool half)
 {
 	int32		typmod = TupleDescAttr(RelationGetDescr(index), 0)->atttypmod;
 
 	if (typmod > 0)
 	{
-		lionvec_check_max_dims(typmod);
+		lionvec_check_max_dims(typmod, half);
 		return typmod;
 	}
 	return 0;
@@ -1357,7 +1523,10 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	memset(&bs, 0, sizeof(bs));
 	bs.index = index;
 	bs.metric = lionvec_index_metric(index);
-	bs.dims = lionvec_typmod_dims(index);
+	bs.half = lionvec_index_half(index);
+	bs.dims = lionvec_typmod_dims(index, bs.half);
+	if (bs.half && bs.dims > 0)
+		bs.hbuf = palloc(sizeof(float) * bs.dims);
 	bs.rbuf = InvalidBuffer;
 	bs.refine_tail = InvalidBlockNumber;
 	bs.buildcxt = CurrentMemoryContext;
@@ -1388,6 +1557,7 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 		bs.info = palloc0(size);
 		bs.info->metric = bs.metric;
+		bs.info->half = bs.half;
 		bs.info->dims = bs.dims;
 		bs.info->dimsp = dimsp;
 		bs.info->seed = LIONVEC_SEED;
@@ -1413,8 +1583,10 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		meta.mean_head = lionvec_build_write_mean(index, bs.info->mean,
 												  bs.info->dimsp);
 
-	/* the partitions */
+	/* the partitions, and whether rows spill to a second (two at least) */
 	bs.nparts = bs.dims > 0 ? lionvec_partitions(index, bs.nsum, bs.sn) : 0;
+	bs.spill = bs.nparts >= 2 &&
+		(index->rd_options == NULL || ((LionVecOptions *) index->rd_options)->spill);
 	if (bs.nparts > 0)
 		lionvec_build_centroids(&bs);
 	else if (bs.scodes != NULL)
@@ -1443,7 +1615,7 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 									   TUPLESORT_NONE);
 		bs.sortitem = palloc(VARHDRSZ + LIONVEC_CODE_SIZE(Max(bs.info->dimsp, 64)));
 	}
-	lionvec_items_alloc(&bs.items, bs.info->dimsp);
+	lionvec_items_alloc(&bs.items, bs.info);
 	reltuples = table_index_build_scan(heap, index, indexInfo, false, true,
 									   lionvec_build_callback, &bs, NULL);
 	if (BufferIsValid(bs.rbuf))
@@ -1471,6 +1643,7 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 		m->dims = bs.info->dims;
 		m->dimsp = bs.info->dimsp;
+		m->flags = bs.spill ? LIONVEC_META_SPILL : 0;
 		m->mean_head = meta.mean_head;
 		m->part_head = meta.part_head;
 		m->nparts = (uint32) bs.nparts;
@@ -1506,7 +1679,7 @@ static void
 lionvecbuildempty(Relation index)
 {
 	int			metric = lionvec_index_metric(index);
-	int			dims = lionvec_typmod_dims(index);
+	int			dims = lionvec_typmod_dims(index, lionvec_index_half(index));
 	Buffer		metabuf;
 	Buffer		rest;
 	Buffer		nulls;
@@ -1546,7 +1719,7 @@ lionvecbuildempty(Relation index)
  * ----------------------------------------------------------------
  */
 
-/* Where an inserted row's CODE item goes. */
+/* Where an inserted row's CODE item, or its copy, goes. */
 typedef struct LionVecDest
 {
 	BlockNumber tail;			/* the last page of its chain */
@@ -1556,17 +1729,57 @@ typedef struct LionVecDest
 } LionVecDest;
 
 /*
+ * Partition partno's centroid's REFINE item, at (rblk, roff), share-locked
+ * in *buf, which the caller releases.  Its loss is corruption, as are an
+ * alpha8 or a length of its codes that is not a number.
+ */
+static LionVecRefine *
+lionvec_cent_refine(Relation index, BlockNumber rblk, OffsetNumber roff,
+					int partno, int dimsp, Buffer *buf)
+{
+	Page		page;
+	ItemPointerData tid;
+	LionVecRefine *ref;
+
+	*buf = ReadBuffer(index, rblk);
+	LockBuffer(*buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(*buf);
+	lionvec_check_page(index, page, rblk, LIONVEC_PAGE_REFINE);
+	LionVecCentTid(&tid, partno);
+	ref = lionvec_refine_at(index, page, rblk, roff, dimsp, &tid);
+	if (ref == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lionvec index \"%s\" has lost partition %d's centroid",
+						RelationGetRelationName(index), partno)));
+	if (isnan(ref->alpha8) || isinf(ref->alpha8) ||
+		isnan(ref->rnorm8) || isinf(ref->rnorm8))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lionvec index \"%s\" has a malformed centroid of partition %d at (%u,%u)",
+						RelationGetRelationName(index), partno, rblk, roff)));
+	return ref;
+}
+
+/*
  * The partition of a row with a vector (DESIGN.md §44.2): the centroid
  * nearest it, as the build finds it (lionvec_build_nearest()), from the PART
  * chain and the candidates' REFINE items.  xc[dimsp] is the row centred.
+ * In an index that spills, *dest2 gets the partition of the row's copy:
+ * SOAR's choice, as the build makes it, but of centroids decoded from their
+ * 8-bit codes (lionvec_decode8()), the build's floats being gone - each
+ * REFINE item read once, its codes kept for that; otherwise its partno is
+ * -1.
  */
 static void
 lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
-					   const float *xc, LionVecDest *dest)
+					   const float *xc, LionVecDest *dest, LionVecDest *dest2)
 {
 	int			dimsp = meta->dimsp;
 	int			nw = dimsp / 64;
 	int			k = (int) meta->nparts;
+	bool		spill = (meta->flags & LIONVEC_META_SPILL) != 0;
+	int			m = spill ? LIONVEC_SOAR_CANDS + 1 : 1;
 	uint64	   *bits = palloc(sizeof(uint64) * (Size) k * nw);
 	uint16	   *pop = palloc(sizeof(uint16) * k);
 	float	   *norm = palloc(sizeof(float) * k);
@@ -1579,6 +1792,11 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 	double	   *lo = palloc(sizeof(double) * k);
 	double	   *hi = palloc(sizeof(double) * k);
 	int		   *cand = palloc(sizeof(int) * k);
+	double	   *key = palloc(sizeof(double) * k);
+	int			rank[LIONVEC_SOAR_CANDS + 1];
+	uint8	   *ccodes = NULL;	/* spilling: [nc][dimsp], the candidates' codes */
+	float	   *calpha8 = NULL;
+	float	   *crnorm8 = NULL;
 	LionVecCentroids cents;
 	LionVecQuery q;
 	BlockNumber blk = meta->part_head;
@@ -1586,8 +1804,8 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 	uint64		visited = 0;
 	int			n = 0;
 	int			nc;
-	int			best = -1;
-	double		bestkey = INFINITY;
+	int			nr;
+	int			best;
 	int			c;
 
 	/* every centroid's plane 1 */
@@ -1633,7 +1851,7 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 				 errmsg("lionvec index \"%s\" has %d partitions, and its meta page says %d",
 						RelationGetRelationName(index), n, k)));
 
-	/* the candidates, and of them the nearest by its 8-bit codes */
+	/* the candidates, ranked by their 8-bit codes */
 	cents.k = k;
 	cents.dimsp = dimsp;
 	cents.bits = bits;
@@ -1644,71 +1862,193 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 	q.qc = palloc(sizeof(float) * dimsp);
 	q.planes = palloc(sizeof(uint64) * nw * LIONVEC_QBITS);
 	lionvec_query_init(&q, LIONVEC_L2, NULL, xc, LIONVEC_ASSIGN_EPS);
-	nc = lionvec_candidates(&cents, &q, lo, hi, cand);
+	nc = lionvec_candidates_n(&cents, &q, m, lo, hi, cand);
+	if (spill)
+	{
+		/* each candidate's codes, for SOAR's decoding of the ranked ones */
+		ccodes = palloc(sizeof(uint8) * (Size) nc * dimsp);
+		calpha8 = palloc(sizeof(float) * nc);
+		crnorm8 = palloc(sizeof(float) * nc);
+	}
 	for (c = 0; c < nc; c++)
 	{
 		int			j = cand[c];
-		Buffer		buf = ReadBuffer(index, rblk[j]);
-		Page		page;
-		ItemPointerData tid;
-		LionVecRefine *ref;
+		Buffer		buf;
+		LionVecRefine *ref = lionvec_cent_refine(index, rblk[j], roff[j], j,
+												 dimsp, &buf);
 		double		est;
 		double		err;
-		double		key;
 
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		lionvec_check_page(index, page, rblk[j], LIONVEC_PAGE_REFINE);
-		LionVecCentTid(&tid, j);
-		ref = lionvec_refine_at(index, page, rblk[j], roff[j], dimsp, &tid);
-		if (ref == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_INDEX_CORRUPTED),
-					 errmsg("lionvec index \"%s\" has lost partition %d's centroid",
-							RelationGetRelationName(index), j)));
 		lionvec_estimate8(&q, ref->codes, norm[j], ref->alpha8, ref->rnorm8,
 						  &est, &err);
-		UnlockReleaseBuffer(buf);
-		key = (double) norm[j] * norm[j] - 2.0 * est;
-		if (best < 0 || key < bestkey)
+		if (spill)
 		{
-			best = j;
-			bestkey = key;
+			memcpy(ccodes + (Size) c * dimsp, ref->codes, dimsp);
+			calpha8[c] = ref->alpha8;
+			crnorm8[c] = ref->rnorm8;
 		}
+		UnlockReleaseBuffer(buf);
+		key[c] = (double) norm[j] * norm[j] - 2.0 * est;
 	}
-	if (best < 0)
-		elog(ERROR, "lionvec: no centroid near a row");
+	nr = lionvec_rank(key, nc, m, rank);
 
+	/*
+	 * Centroids whose numbers lionvec_part_at() and lionvec_cent_refine()
+	 * have checked leave min(k, m) candidates or more (lion_vec_math.h), so
+	 * two or more in an index that spills, which has two partitions or more
+	 * (lionvec_check_meta())
+	 */
+	if (nr < Min(k, m))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lionvec index \"%s\" has malformed centroids: %d of %d near a row, fewer than %d",
+						RelationGetRelationName(index), nr, k, Min(k, m))));
+
+	best = cand[rank[0]];
 	dest->partno = best;
 	dest->tail = tails[best];
 	dest->pblk = pblk[best];
 	dest->poff = poff[best];
+
+	/* the copy's: SOAR's, of the nearest's next (lionvec_build_nearest()) */
+	dest2->partno = -1;
+	dest2->tail = InvalidBlockNumber;
+	dest2->pblk = InvalidBlockNumber;
+	dest2->poff = InvalidOffsetNumber;
+	if (spill)
+	{
+		float	   *cf = palloc(sizeof(float) * (Size) nr * dimsp);
+		const float *cs[LIONVEC_SOAR_CANDS];
+		int			s;
+		int			i;
+
+		for (i = 0; i < nr; i++)
+		{
+			int			c8 = rank[i];
+
+			lionvec_decode8(ccodes + (Size) c8 * dimsp, dimsp, norm[cand[c8]],
+							calpha8[c8], crnorm8[c8], cf + (Size) i * dimsp);
+			if (i > 0)
+				cs[i - 1] = cf + (Size) i * dimsp;
+		}
+		s = lionvec_soar_second(xc, cf, cs, nr - 1, dimsp, LIONVEC_SOAR_LAMBDA);
+		Assert(s >= 0 && s < nr - 1);
+		best = cand[rank[s + 1]];
+		dest2->partno = best;
+		dest2->tail = tails[best];
+		dest2->pblk = pblk[best];
+		dest2->poff = poff[best];
+	}
+}
+
+/*
+ * Append a CODE item to the tail of dest's chain, extended by a new page
+ * when the tail is full: one WAL record of the tail page, any new one, and,
+ * when the tail moves, the PART item or the meta page that holds it -
+ * metabuf, which the caller holds exclusively locked; nullchain says which
+ * of the meta page's chains a dest of no partition is.  The pages are locked
+ * in that order and released before it returns.
+ */
+static void
+lionvec_append_code(Relation index, Buffer metabuf, int dimsp,
+					const LionVecCode *code, Size codesize,
+					const LionVecDest *dest, bool nullchain)
+{
+	Buffer		cbuf;
+	Buffer		nbuf = InvalidBuffer;
+	Buffer		pbuf = InvalidBuffer;
+	Page		page;
+	GenericXLogState *state;
+
+	cbuf = ReadBuffer(index, dest->tail);
+	LockBuffer(cbuf, BUFFER_LOCK_EXCLUSIVE);
+	lionvec_check_page(index, BufferGetPage(cbuf), dest->tail, LIONVEC_PAGE_CODE);
+	if (BlockNumberIsValid(LionVecPageGetOpaque(BufferGetPage(cbuf))->next))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lionvec index \"%s\" has a chain whose tail at block %u goes on",
+						RelationGetRelationName(index), dest->tail)));
+	if (PageGetFreeSpace(BufferGetPage(cbuf)) < MAXALIGN(codesize))
+		nbuf = lionvec_new_buffer(index, MAIN_FORKNUM);
+	if (dest->partno >= 0 && BufferIsValid(nbuf))
+	{
+		pbuf = ReadBuffer(index, dest->pblk);
+		LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
+		lionvec_check_page(index, BufferGetPage(pbuf), dest->pblk, LIONVEC_PAGE_PART);
+	}
+
+	state = GenericXLogStart(index);
+	page = GenericXLogRegisterBuffer(state, cbuf, 0);
+	if (BufferIsValid(nbuf))
+	{
+		LionVecPageGetOpaque(page)->next = BufferGetBlockNumber(nbuf);
+		page = GenericXLogRegisterBuffer(state, nbuf, GENERIC_XLOG_FULL_IMAGE);
+		lionvec_init_page(page, LIONVEC_PAGE_CODE);
+	}
+	if (PageAddItemExtended(page, (char *) code, codesize,
+							InvalidOffsetNumber, 0) == InvalidOffsetNumber)
+		elog(ERROR, "lionvec: could not add an item of %zu bytes", codesize);
+	lionvec_note_key(page, (ItemPointer) &code->tid);
+
+	if (BufferIsValid(pbuf))
+	{
+		LionVecPart *part = lionvec_part_at(index, BufferGetPage(pbuf), dest->pblk,
+											dest->poff, dimsp);
+
+		if (part->partno != (uint32) dest->partno || part->tail != dest->tail)
+			elog(ERROR, "lionvec: partition %d of index \"%s\" changed under an insert",
+				 dest->partno, RelationGetRelationName(index));
+		page = GenericXLogRegisterBuffer(state, pbuf, 0);
+		part = (LionVecPart *) PageGetItem(page, PageGetItemId(page, dest->poff));
+		part->tail = BufferGetBlockNumber(nbuf);
+	}
+	else if (BufferIsValid(nbuf))
+	{
+		LionVecMeta m;
+
+		page = GenericXLogRegisterBuffer(state, metabuf, 0);
+		m = LionVecPageGetMeta(page);
+		if (nullchain)
+			m->null_tail = BufferGetBlockNumber(nbuf);
+		else
+			m->rest_tail = BufferGetBlockNumber(nbuf);
+	}
+	GenericXLogFinish(state);
+
+	if (BufferIsValid(pbuf))
+		UnlockReleaseBuffer(pbuf);
+	if (BufferIsValid(nbuf))
+		UnlockReleaseBuffer(nbuf);
+	UnlockReleaseBuffer(cbuf);
 }
 
 /*
  * Append a row's items: its REFINE item, and its CODE item to the tail of
  * its chain - its partition's, or that of the rows in no partition, or that
- * of the NULL rows.  The meta page's lock is held throughout, which
+ * of the NULL rows - and, in an index that spills, its copy to the tail of
+ * its second partition's.  The meta page's lock is held throughout, which
  * serializes inserts; VACUUM and scans lock one page at a time and never the
- * meta page with another, so the order meta, REFINE, CODE, PART cannot
- * deadlock against them.  Two WAL records, as a GenericXLog record takes at
- * most four buffers: the REFINE item with the meta page, whose refine_tail
- * it may move; then the CODE item, its page and any new one, and the PART
- * item or the meta page, whichever holds the chain's tail, when the tail
- * moves.  A crash between the two leaves a REFINE item nothing points at,
- * which costs its space and nothing else.
+ * meta page with another, so the order meta, REFINE, CODE, PART, then the
+ * copy's CODE and PART, each released before the next record's are taken,
+ * cannot deadlock against them.  A WAL record a step, as a GenericXLog
+ * record takes at most four buffers: the REFINE item with the meta page,
+ * whose refine_tail it may move; then the CODE item, its page and any new
+ * one, and the PART item or the meta page, whichever holds the chain's tail,
+ * when the tail moves; then the copy, as the CODE item.  A crash after the
+ * first leaves a REFINE item nothing points at, which costs its space and
+ * nothing else; one after the second, a row without its copy, which a scan
+ * still finds in its nearest partition, and misses only when it would have
+ * found it through the copy.
  */
 static void
 lionvec_append(Relation index, const LionVecInfo *info, LionVecItems *it)
 {
 	int			dimsp = info->dimsp;
 	Buffer		metabuf;
-	Buffer		cbuf;
-	Buffer		nbuf = InvalidBuffer;
-	Buffer		pbuf = InvalidBuffer;
 	Page		page;
 	LionVecMetaData meta;
 	LionVecDest dest;
+	LionVecDest dest2;
 	GenericXLogState *state;
 
 	metabuf = ReadBuffer(index, LIONVEC_METAPAGE);
@@ -1722,12 +2062,13 @@ lionvec_append(Relation index, const LionVecInfo *info, LionVecItems *it)
 	dest.partno = -1;
 	dest.pblk = InvalidBlockNumber;
 	dest.poff = InvalidOffsetNumber;
+	dest2.partno = -1;
 	if (!it->hasref)
 		dest.tail = meta.null_tail;
 	else if (meta.nparts == 0)
 		dest.tail = meta.rest_tail;
 	else
-		lionvec_insert_nearest(index, &meta, it->x, &dest);
+		lionvec_insert_nearest(index, &meta, it->x, &dest, &dest2);
 
 	/* the REFINE item */
 	if (it->hasref)
@@ -1774,67 +2115,17 @@ lionvec_append(Relation index, const LionVecInfo *info, LionVecItems *it)
 		UnlockReleaseBuffer(rbuf);
 	}
 
-	/* the CODE item */
-	cbuf = ReadBuffer(index, dest.tail);
-	LockBuffer(cbuf, BUFFER_LOCK_EXCLUSIVE);
-	lionvec_check_page(index, BufferGetPage(cbuf), dest.tail, LIONVEC_PAGE_CODE);
-	if (BlockNumberIsValid(LionVecPageGetOpaque(BufferGetPage(cbuf))->next))
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("lionvec index \"%s\" has a chain whose tail at block %u goes on",
-						RelationGetRelationName(index), dest.tail)));
-	if (PageGetFreeSpace(BufferGetPage(cbuf)) < MAXALIGN(it->codesize))
-		nbuf = lionvec_new_buffer(index, MAIN_FORKNUM);
-	if (dest.partno >= 0 && BufferIsValid(nbuf))
+	/* the CODE item, and its copy: the same, pointing at the same REFINE item */
+	lionvec_append_code(index, metabuf, dimsp, it->code, it->codesize, &dest,
+						!it->hasref);
+	if (dest2.partno >= 0)
 	{
-		pbuf = ReadBuffer(index, dest.pblk);
-		LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
-		lionvec_check_page(index, BufferGetPage(pbuf), dest.pblk, LIONVEC_PAGE_PART);
+		Assert(it->hasref && dest2.partno != dest.partno);
+		it->code->flags |= LIONVEC_SPILL;
+		lionvec_append_code(index, metabuf, dimsp, it->code, it->codesize,
+							&dest2, false);
+		it->code->flags &= ~LIONVEC_SPILL;
 	}
-
-	state = GenericXLogStart(index);
-	page = GenericXLogRegisterBuffer(state, cbuf, 0);
-	if (BufferIsValid(nbuf))
-	{
-		LionVecPageGetOpaque(page)->next = BufferGetBlockNumber(nbuf);
-		page = GenericXLogRegisterBuffer(state, nbuf, GENERIC_XLOG_FULL_IMAGE);
-		lionvec_init_page(page, LIONVEC_PAGE_CODE);
-	}
-	if (PageAddItemExtended(page, (char *) it->code, it->codesize,
-							InvalidOffsetNumber, 0) == InvalidOffsetNumber)
-		elog(ERROR, "lionvec: could not add an item of %zu bytes", it->codesize);
-	lionvec_note_key(page, &it->code->tid);
-
-	if (BufferIsValid(pbuf))
-	{
-		LionVecPart *part = lionvec_part_at(index, BufferGetPage(pbuf), dest.pblk,
-											dest.poff, dimsp);
-
-		if (part->partno != (uint32) dest.partno || part->tail != dest.tail)
-			elog(ERROR, "lionvec: partition %d of index \"%s\" changed under an insert",
-				 dest.partno, RelationGetRelationName(index));
-		page = GenericXLogRegisterBuffer(state, pbuf, 0);
-		part = (LionVecPart *) PageGetItem(page, PageGetItemId(page, dest.poff));
-		part->tail = BufferGetBlockNumber(nbuf);
-	}
-	else if (BufferIsValid(nbuf))
-	{
-		LionVecMeta m;
-
-		page = GenericXLogRegisterBuffer(state, metabuf, 0);
-		m = LionVecPageGetMeta(page);
-		if (it->hasref)
-			m->rest_tail = BufferGetBlockNumber(nbuf);
-		else
-			m->null_tail = BufferGetBlockNumber(nbuf);
-	}
-	GenericXLogFinish(state);
-
-	if (BufferIsValid(pbuf))
-		UnlockReleaseBuffer(pbuf);
-	if (BufferIsValid(nbuf))
-		UnlockReleaseBuffer(nbuf);
-	UnlockReleaseBuffer(cbuf);
 	UnlockReleaseBuffer(metabuf);
 }
 
@@ -1855,12 +2146,13 @@ lionvecinsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		Pointer		tofree;
 		int			dim;
 
-		(void) lionvec_datum_floats(values[0], &dim, &tofree);
-		lionvec_set_dims(index, dim);
+		(void) lionvec_datum_floats(values[0], info->half, NULL, 0, &dim,
+									&tofree);
+		lionvec_set_dims(index, dim, info->half);
 		info = lionvec_get_info(index);
 	}
 
-	lionvec_items_alloc(&it, info->dimsp);
+	lionvec_items_alloc(&it, info);
 	lionvec_items_fill(info, &it, ht_ctid, values[0], isnull[0]);
 
 	/* a serializable reader holds the index's relation lock (§44.5) */
@@ -1951,6 +2243,7 @@ typedef struct LionVecVacuum
 	IndexBulkDeleteCallback callback;
 	void	   *callback_state;
 	int			dimsp;
+	bool		spill;			/* the index spills (LIONVEC_META_SPILL) */
 	LionVecRefineRef *refs;		/* the REFINE items to remove, flushed when full */
 	int			nrefs;
 	int			maxrefs;
@@ -1958,9 +2251,15 @@ typedef struct LionVecVacuum
 	BlockNumber nblocks;
 } LionVecVacuum;
 
-/* Remove the dead rows of one CODE chain. */
+/*
+ * Remove the dead rows of one CODE chain, partition says whether it is a
+ * partition's.  A row that spills has an item in two chains, and each goes
+ * as its chain is walked; its REFINE item, which both point at, is taken
+ * from the primary alone, so that it is removed once, and the row is
+ * counted once, by its primary.
+ */
 static void
-lionvec_vacuum_chain(LionVecVacuum *vs, BlockNumber blk)
+lionvec_vacuum_chain(LionVecVacuum *vs, BlockNumber blk, bool partition)
 {
 	Relation	index = vs->info->index;
 
@@ -1984,12 +2283,16 @@ lionvec_vacuum_chain(LionVecVacuum *vs, BlockNumber blk)
 		maxoff = PageGetMaxOffsetNumber(page);
 		for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
 		{
-			LionVecCode *code = lionvec_code_at(index, page, blk, off, vs->dimsp);
+			LionVecCode *code = lionvec_code_at(index, page, blk, off, vs->dimsp,
+												vs->spill && partition);
+			bool		copy = (code->flags & LIONVEC_SPILL) != 0;
 
 			if (vs->callback(&code->tid, vs->callback_state))
 			{
 				dels[ndel++] = off;
-				if (BlockNumberIsValid(code->rblk))
+				if (!copy)
+					vs->stats->tuples_removed += 1;
+				if (!copy && BlockNumberIsValid(code->rblk))
 				{
 					vs->refs[vs->nrefs].blk = code->rblk;
 					vs->refs[vs->nrefs].off = code->roff;
@@ -1997,7 +2300,7 @@ lionvec_vacuum_chain(LionVecVacuum *vs, BlockNumber blk)
 					vs->nrefs++;
 				}
 			}
-			else
+			else if (!copy)
 				vs->stats->num_index_tuples += 1;
 		}
 		if (ndel > 0)
@@ -2007,7 +2310,6 @@ lionvec_vacuum_chain(LionVecVacuum *vs, BlockNumber blk)
 			page = GenericXLogRegisterBuffer(state, buf, 0);
 			PageIndexMultiDelete(page, dels, ndel);
 			GenericXLogFinish(state);
-			vs->stats->tuples_removed += ndel;
 		}
 		next = LionVecPageGetOpaque(BufferGetPage(buf))->next;
 		UnlockReleaseBuffer(buf);
@@ -2088,6 +2390,13 @@ lionvecbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
+	/*
+	 * Lazy VACUUM hands every pass the same stats when its dead TIDs fill
+	 * memory more than once; this pass counts the rows left afresh, as
+	 * btvacuumscan() does, or reltuples would sum every pass's count
+	 */
+	stats->num_index_tuples = 0;
+
 	lionvec_read_meta(index, &meta);
 	heads = lionvec_chain_heads(index, &meta, &nheads);
 
@@ -2097,6 +2406,7 @@ lionvecbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	vs.callback = callback;
 	vs.callback_state = callback_state;
 	vs.dimsp = meta.dimsp;
+	vs.spill = (meta.flags & LIONVEC_META_SPILL) != 0;
 	vs.nblocks = RelationGetNumberOfBlocks(index);
 	/* the REFINE items to remove, in maintenance_work_mem */
 	vs.maxrefs = (int) Min((Size) maintenance_work_mem * 1024 / sizeof(LionVecRefineRef),
@@ -2104,8 +2414,9 @@ lionvecbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	vs.maxrefs = Max(vs.maxrefs, 2 * MaxOffsetNumber);
 	vs.refs = palloc(sizeof(LionVecRefineRef) * vs.maxrefs);
 
+	/* the partitions' chains first (lionvec_chain_heads()), then REST and NULL */
 	for (i = 0; i < nheads; i++)
-		lionvec_vacuum_chain(&vs, heads[i]);
+		lionvec_vacuum_chain(&vs, heads[i], i < (int) meta.nparts);
 	lionvec_vacuum_refines(index, vs.refs, vs.nrefs, vs.dimsp, info->strategy);
 	pfree(vs.refs);
 	pfree(heads);
@@ -2166,13 +2477,25 @@ lionvecvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 #define LIONVEC_DEEPER_PAUSED	0.06
 
 /*
+ * An index that spills (§44.3) holds two CODE items a row: its CODE pages
+ * are twice as many and each partition twice as long.  At the same margin
+ * a scan of it probes LIONVEC_SPILL_PROBES as many partitions as one
+ * without, its nearest rows coming sooner: 91% to 94% of them at margins 0
+ * to 4 over 115,000 OpenAI embeddings (DESIGN.md §44.9).  That is one data
+ * set, not a model.  What spill buys is recall at a given margin, which the
+ * costs do not see.
+ */
+#define LIONVEC_SPILL_PROBES	0.93
+
+/*
  * What the planner needs of the index: the CODE pages' share of its
  * `pages` pages, by the dimensions the meta page records (or 1536 if none
- * yet), how many rows a CODE page holds, and the partitions.
+ * yet), how many rows a CODE page holds, the partitions, and the CODE items
+ * a row has - two if the build spilled (the meta page's flags), else one.
  */
 static double
 lionvec_code_pages(Oid indexoid, double pages, double *perpage,
-				   double *nparts)
+				   double *nparts, double *items)
 {
 	Relation	index = index_open(indexoid, NoLock);
 	LionVecMetaData meta;
@@ -2183,18 +2506,19 @@ lionvec_code_pages(Oid indexoid, double pages, double *perpage,
 	lionvec_read_meta(index, &meta);
 	index_close(index, NoLock);
 	*nparts = meta.nparts;
+	*items = (meta.flags & LIONVEC_META_SPILL) != 0 ? 2.0 : 1.0;
 	dimsp = meta.dims > 0 ? meta.dimsp : 1536;
 	code = MAXALIGN(LIONVEC_CODE_SIZE(dimsp)) + sizeof(ItemIdData);
 	ref = MAXALIGN(LIONVEC_REFINE_SIZE(dimsp)) + sizeof(ItemIdData);
 	*perpage = Max(1.0, floor((BLCKSZ - SizeOfPageHeaderData -
 							   MAXALIGN(sizeof(LionVecPageOpaqueData))) / code));
-	return Max(1.0, ceil(pages * code / (code + ref)));
+	return Max(1.0, ceil(pages * *items * code / (*items * code + ref)));
 }
 
 /*
  * The cost of a scan's first row, which is most of its cost.  Restricted to
- * few enough members, the members' distances from the heap, every one
- * (§44.6).  Otherwise every centroid's estimate, then the partitions a
+ * pg_lion.vector_exact_rows members or fewer, the members' distances from
+ * the heap, every one (§44.6).  Otherwise every centroid's estimate, then the partitions a
  * scan probes, a random read each and their CODE pages in order, plane 1 of
  * their members, and a batch's refines and exact distances, each a page
  * read and a heap fetch.  `members` is how many rows a restriction admits,
@@ -2206,8 +2530,9 @@ lionvec_startup_cost(IndexOptInfo *index, double members, double *codepages)
 	double		tuples = Max(index->tuples, 1.0);
 	double		perpage;
 	double		nparts;
+	double		items;
 	double		pages = lionvec_code_pages(index->indexoid, index->pages, &perpage,
-										   &nparts);
+										   &nparts, &items);
 	double		frac = Min(1.0, Max(members, 0.0) / tuples);
 	double		share;
 	double		read;
@@ -2218,7 +2543,7 @@ lionvec_startup_cost(IndexOptInfo *index, double members, double *codepages)
 
 	get_tablespace_page_costs(index->reltablespace, &spc_random, &spc_seq);
 
-	if (frac < 1.0 && members <= LIONVEC_EXACT_MAX)
+	if (frac < 1.0 && members <= lionvec_exact_rows)
 	{
 		*codepages = 0.0;
 		return Max(members, 1.0) * (spc_random + cpu_index_tuple_cost +
@@ -2232,8 +2557,10 @@ lionvec_startup_cost(IndexOptInfo *index, double members, double *codepages)
 	else if (nparts >= 1.0)
 		share = Min(1.0, LIONVEC_PROBE_SHARE * pow(nparts, -1.0 / 3.0) *
 					pow(Max(frac, 1e-9), -LIONVEC_PROBE_SEL));
+	if (items > 1.0)
+		share = Min(1.0, share * LIONVEC_SPILL_PROBES);
 	read = Max(1.0, pages * share);
-	walked = tuples * share;
+	walked = tuples * items * share;
 	*codepages = read;
 	return nparts * LIONVEC_ROW_OPS * cpu_operator_cost +
 		Max(1.0, nparts * share) * spc_random + read * spc_seq +
@@ -2310,6 +2637,7 @@ lionvecoptions(Datum reloptions, bool validate)
 {
 	static const relopt_parse_elt tab[] = {
 		{"partitions", RELOPT_TYPE_INT, offsetof(LionVecOptions, partitions)},
+		{"spill", RELOPT_TYPE_BOOL, offsetof(LionVecOptions, spill)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,

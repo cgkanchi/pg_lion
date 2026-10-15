@@ -1,4 +1,4 @@
-comment = 'lionvec: a nearest-neighbour index for pgvector''s vector type, filtered by lion indexes'
+comment = 'lionvec: a nearest-neighbour index for pgvector''s vector and halfvec types, filtered by lion indexes'
 default_version = '0.1'
 relocatable = true
 requires = 'pg_lion, vector'

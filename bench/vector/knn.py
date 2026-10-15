@@ -36,7 +36,7 @@ LION = "SELECT id FROM items {w} ORDER BY embedding <=> %(q)s::vector LIMIT 10"
 STATS = re.compile(r'lionvec scan of "[^"]*": (\d+) partitions probed, (\d+) passes, '
                    r'(\d+) candidates, (\d+) refined, (\d+) fetched, (\d+) returned, '
                    r'(\d+) skipped out of order, (\d+) bounds missed, (\d+) pages read'
-                   r'(?:, (\d+) pauses)?')
+                   r'(?:, (\d+) pauses)?(?:, (\d+) copies skipped)?')
 EXACT = re.compile(r'lionvec scan of "[^"]*": (\d+) members fetched, (\d+) returned')
 MWM = os.environ.get('KNN_MWM', '1GB')
 
@@ -138,7 +138,7 @@ def run(conn, name, sql, sel, settings, Q, gt, nq):
                    candidates=float(a[:, 2].mean()), refined=float(a[:, 3].mean()),
                    fetched=float(a[:, 4].mean()), skipped=float(a[:, 6].mean()),
                    missed=float(a[:, 7].mean()), pages=float(a[:, 8].mean()),
-                   pauses=float(a[:, 9].mean()))
+                   pauses=float(a[:, 9].mean()), copies=float(a[:, 10].mean()))
     if exact:
         row.update(members_fetched=float(np.mean(exact)))
     conn.remove_notice_handler(handler)

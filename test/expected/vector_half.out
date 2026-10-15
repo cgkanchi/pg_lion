@@ -1,0 +1,622 @@
+-- lionvec over pgvector's halfvec (DESIGN.md §44.1): the same index on a
+-- column whose elements are IEEE 754 binary16 halves, which lionvec reads
+-- as floats; the index knows its column's type from its operator class's,
+-- and the scan's query is of that type too.
+--
+-- As in vector.sql, every ORDER BY is run through the index (the
+-- sequential scan and the sort disabled) and through a sequential scan and
+-- sort (the index disabled), and the two answers are compared: the
+-- distances in order, and the rows; and as in vector_filter.sql, a filtered
+-- one through LionOrdered and through the ordinary plan.
+-- pg_lion.vector_epsilon and pg_lion.vector_margin are raised, and
+-- pg_lion.vector_patience is off, so that the index's answers are the exact
+-- ones.  The distances are pgvector's own functions' of halfvec.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_lion_vector;
+RESET client_min_messages;
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+-- halfvec's operator classes: one a metric, L2 the default, each one ORDER
+-- BY operator of halfvec's own, and each valid
+SELECT c.opcname, c.opcdefault, o.amopstrategy, o.amopopr::regoperator,
+	   amvalidate(c.oid)
+  FROM pg_opclass c
+  JOIN pg_am a ON a.oid = c.opcmethod
+  JOIN pg_amop o ON o.amopfamily = c.opcfamily
+ WHERE a.amname = 'lionvec' AND c.opcintype = 'halfvec'::regtype
+ ORDER BY o.amopstrategy;
+      opcname       | opcdefault | amopstrategy |       amopopr        | amvalidate 
+--------------------+------------+--------------+----------------------+------------
+ halfvec_l2_ops     | t          |            1 | <->(halfvec,halfvec) | t
+ halfvec_ip_ops     | f          |            2 | <#>(halfvec,halfvec) | t
+ halfvec_cosine_ops | f          |            3 | <=>(halfvec,halfvec) | t
+(3 rows)
+
+/*
+ * hv_vec() is a pseudo-random halfvec of n coordinates in (-scale, scale),
+ * the same on every platform (from hashint8extended(), as vector.sql's
+ * vt_vec()), each coordinate rounded to a half.
+ */
+CREATE FUNCTION hv_vec(seed bigint, n int, scale float8 DEFAULT 1.0)
+RETURNS halfvec LANGUAGE sql IMMUTABLE
+-- an index expression below calls it, and CREATE INDEX runs it under a safe
+-- search_path from PostgreSQL 17 on, where halfvec would not be found
+SET search_path FROM CURRENT AS $$
+	SELECT array_agg(((hashint8extended(seed * 1000 + j, 44) % 100000)::float8
+					  / 100000.0 * scale)::real ORDER BY j)::halfvec
+	  FROM generate_series(1, n) j
+$$;
+/*
+ * hv_cmp() runs q - which returns columns id and d, ORDER BY d - through
+ * the index and through a sequential scan and sort, and compares the
+ * distances in order (to 4 places), then the rows with a distance, sorted
+ * (rows of equal distance may come in either order), then the count of rows
+ * without one (NULL vectors: any of them may come).  It says whether the
+ * first plan really was an index scan.  (vector.sql's vec_cmp().)
+ */
+CREATE FUNCTION hv_cmp(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	r record;
+	used boolean := false;
+	ad text[] := '{}';
+	bd text[] := '{}';
+	ai int[] := '{}';
+	bi int[] := '{}';
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_sort', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Index Scan using' THEN
+			used := true;
+		END IF;
+	END LOOP;
+	FOR r IN EXECUTE q LOOP
+		ad := ad || coalesce(round(r.d::numeric, 4)::text, 'NULL');
+		IF r.d IS NOT NULL THEN
+			ai := ai || r.id;
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_sort', 'on', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	FOR r IN EXECUTE q LOOP
+		bd := bd || coalesce(round(r.d::numeric, 4)::text, 'NULL');
+		IF r.d IS NOT NULL THEN
+			bi := bi || r.id;
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_indexscan', 'on', true);
+
+	IF ad IS DISTINCT FROM bd THEN
+		RETURN format('MISMATCH: %s rows through the index, %s by the sort; distances %s / %s',
+					  coalesce(array_length(ad, 1), 0), coalesce(array_length(bd, 1), 0),
+					  ad[1:3], bd[1:3]);
+	END IF;
+	IF (SELECT array_agg(x ORDER BY x) FROM unnest(ai) x) IS DISTINCT FROM
+	   (SELECT array_agg(x ORDER BY x) FROM unnest(bi) x) THEN
+		RETURN format('MISMATCH: other rows at the same distances');
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN used THEN 'index' ELSE 'no index' END,
+				  coalesce(array_length(ad, 1), 0));
+END $$;
+/*
+ * hv_ord() runs q - which returns columns id and d, ORDER BY d - through
+ * LionOrdered and through the ordinary plan, and compares them as hv_cmp()
+ * does; and says whether the first plan really was the node.
+ * (vector_filter.sql's vf_ord().)
+ */
+CREATE FUNCTION hv_ord(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	r record;
+	used boolean := false;
+	ad text[] := '{}';
+	bd text[] := '{}';
+	ai int[] := '{}';
+	bi int[] := '{}';
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_tidscan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionOrdered\)' THEN
+			used := true;
+		END IF;
+	END LOOP;
+	FOR r IN EXECUTE q LOOP
+		ad := ad || coalesce(round(r.d::numeric, 4)::text, 'NULL');
+		IF r.d IS NOT NULL THEN
+			ai := ai || r.id;
+		END IF;
+	END LOOP;
+
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('enable_tidscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	FOR r IN EXECUTE q LOOP
+		bd := bd || coalesce(round(r.d::numeric, 4)::text, 'NULL');
+		IF r.d IS NOT NULL THEN
+			bi := bi || r.id;
+		END IF;
+	END LOOP;
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
+
+	IF ad IS DISTINCT FROM bd THEN
+		RETURN format('MISMATCH: %s rows through the node, %s ordinary; distances %s / %s',
+					  coalesce(array_length(ad, 1), 0), coalesce(array_length(bd, 1), 0),
+					  ad[1:3], bd[1:3]);
+	END IF;
+	IF (SELECT array_agg(x ORDER BY x) FROM unnest(ai) x) IS DISTINCT FROM
+	   (SELECT array_agg(x ORDER BY x) FROM unnest(bi) x) THEN
+		RETURN 'MISMATCH: other rows at the same distances';
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN used THEN 'LionOrdered' ELSE 'no LionOrdered' END,
+				  coalesce(array_length(ad, 1), 0));
+END $$;
+-- 3000 rows in ten clusters, five NULL vectors and one of zeros, indexed in
+-- 20 partitions in each operator class; and lion indexes on two scalar
+-- columns, cat (10 values, the cluster) and tag (100, independent of it)
+CREATE TABLE hv (id int PRIMARY KEY, cat int, tag int, v halfvec(40))
+	WITH (autovacuum_enabled = off);
+INSERT INTO hv
+SELECT i, i % 10, ((hashint8extended(i::bigint, 7) & 9223372036854775807) % 100)::int,
+	   hv_vec(-(i % 10) - 1, 40) + hv_vec(i, 40, 0.3)
+  FROM generate_series(1, 3000) i;
+INSERT INTO hv SELECT i, NULL, NULL, NULL FROM generate_series(3001, 3005) i;
+INSERT INTO hv VALUES (3006, NULL, NULL, array_fill(0, ARRAY[40])::real[]::halfvec);
+CREATE INDEX hv_l2 ON hv USING lionvec (v) WITH (partitions = 20);
+CREATE INDEX hv_ip ON hv USING lionvec (v halfvec_ip_ops) WITH (partitions = 20);
+CREATE INDEX hv_cos ON hv USING lionvec (v halfvec_cosine_ops) WITH (partitions = 20);
+CREATE INDEX hv_cat ON hv USING lion (cat);
+CREATE INDEX hv_tag ON hv USING lion (tag);
+VACUUM (FREEZE, ANALYZE) hv;
+SELECT r.relname AS index, a.amname, c.opcname
+  FROM pg_index i
+  JOIN pg_class r ON r.oid = i.indexrelid
+  JOIN pg_am a ON a.oid = r.relam
+  JOIN pg_opclass c ON c.oid = i.indclass[0]
+ WHERE i.indrelid = 'hv'::regclass ORDER BY r.relname;
+  index  | amname  |      opcname       
+---------+---------+--------------------
+ hv_cat  | lion    | int4_ops
+ hv_cos  | lionvec | halfvec_cosine_ops
+ hv_ip   | lionvec | halfvec_ip_ops
+ hv_l2   | lionvec | halfvec_l2_ops
+ hv_pkey | btree   | int4_ops
+ hv_tag  | lion    | int4_ops
+(6 rows)
+
+SET pg_lion.vector_epsilon = 6;
+SET pg_lion.vector_margin = 100;
+SET pg_lion.vector_patience = 0;
+-- the five nearest row 7, for each metric, through the index (a generic
+-- plan, whose query is a Param) and by the sort: the row itself first (but
+-- for the inner product, which ranks by length too), then its cluster's,
+-- at distances apart
+SELECT v AS q7 FROM hv WHERE id = 7 \gset
+PREPARE hv_l2q(halfvec) AS
+	SELECT id, round((v <-> $1)::numeric, 4) AS d FROM hv ORDER BY v <-> $1 LIMIT 5;
+PREPARE hv_ipq(halfvec) AS
+	SELECT id, round((v <#> $1)::numeric, 4) AS d FROM hv ORDER BY v <#> $1 LIMIT 5;
+PREPARE hv_cosq(halfvec) AS
+	SELECT id, round((v <=> $1)::numeric, 4) AS d FROM hv ORDER BY v <=> $1 LIMIT 5;
+SET plan_cache_mode = force_generic_plan;
+SET enable_seqscan = off;
+SET enable_sort = off;
+EXPLAIN (COSTS OFF) EXECUTE hv_l2q(:'q7');
+             QUERY PLAN             
+------------------------------------
+ Limit
+   ->  Index Scan using hv_l2 on hv
+         Order By: (v <-> $1)
+(3 rows)
+
+EXPLAIN (COSTS OFF) EXECUTE hv_ipq(:'q7');
+             QUERY PLAN             
+------------------------------------
+ Limit
+   ->  Index Scan using hv_ip on hv
+         Order By: (v <#> $1)
+(3 rows)
+
+EXPLAIN (COSTS OFF) EXECUTE hv_cosq(:'q7');
+             QUERY PLAN              
+-------------------------------------
+ Limit
+   ->  Index Scan using hv_cos on hv
+         Order By: (v <=> $1)
+(3 rows)
+
+EXECUTE hv_l2q(:'q7');
+  id  |   d    
+------+--------
+    7 | 0.0000
+  577 | 1.0759
+ 2247 | 1.1076
+  947 | 1.1697
+ 1877 | 1.1877
+(5 rows)
+
+EXECUTE hv_ipq(:'q7');
+  id  |    d     
+------+----------
+ 1257 | -15.2675
+  487 | -15.0838
+  787 | -15.0278
+ 1407 | -14.9593
+ 2467 | -14.9484
+(5 rows)
+
+EXECUTE hv_cosq(:'q7');
+  id  |   d    
+------+--------
+    7 | 0.0000
+  577 | 0.0397
+ 2247 | 0.0433
+ 1877 | 0.0441
+ 1197 | 0.0444
+(5 rows)
+
+RESET enable_seqscan;
+RESET enable_sort;
+RESET plan_cache_mode;
+DEALLOCATE hv_l2q;
+DEALLOCATE hv_ipq;
+DEALLOCATE hv_cosq;
+SET enable_indexscan = off;
+SELECT id, round((v <-> :'q7')::numeric, 4) AS d FROM hv ORDER BY v <-> :'q7' LIMIT 5;
+  id  |   d    
+------+--------
+    7 | 0.0000
+  577 | 1.0759
+ 2247 | 1.1076
+  947 | 1.1697
+ 1877 | 1.1877
+(5 rows)
+
+SELECT id, round((v <#> :'q7')::numeric, 4) AS d FROM hv ORDER BY v <#> :'q7' LIMIT 5;
+  id  |    d     
+------+----------
+ 1257 | -15.2675
+  487 | -15.0838
+  787 | -15.0278
+ 1407 | -14.9593
+ 2467 | -14.9484
+(5 rows)
+
+SELECT id, round((v <=> :'q7')::numeric, 4) AS d FROM hv ORDER BY v <=> :'q7' LIMIT 5;
+  id  |   d    
+------+--------
+    7 | 0.0000
+  577 | 0.0397
+ 2247 | 0.0433
+ 1877 | 0.0441
+ 1197 | 0.0444
+(5 rows)
+
+RESET enable_indexscan;
+-- every metric, a query in a cluster, at one's edge and between them, at
+-- any LIMIT: the same distances and rows as the sort's
+CREATE TABLE hv_cases AS
+SELECT op, q, k
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op),
+	   (VALUES ('(SELECT v FROM hv WHERE id = 7)'),
+			   ('(SELECT v FROM hv WHERE id = 2999)'),
+			   ('hv_vec(77, 40, 0.5)')) q(q),
+	   (VALUES (1), (10), (100), (3006)) k(k);
+SELECT op, q, k, hv_cmp(format('SELECT id, v %s %s AS d FROM hv ORDER BY v %s %s LIMIT %s',
+							   op, q, op, q, k)) AS result
+  FROM hv_cases ORDER BY op, q, k;
+ op  |                 q                  |  k   |      result      
+-----+------------------------------------+------+------------------
+ <#> | (SELECT v FROM hv WHERE id = 2999) |    1 | index, 1 rows
+ <#> | (SELECT v FROM hv WHERE id = 2999) |   10 | index, 10 rows
+ <#> | (SELECT v FROM hv WHERE id = 2999) |  100 | index, 100 rows
+ <#> | (SELECT v FROM hv WHERE id = 2999) | 3006 | index, 3006 rows
+ <#> | (SELECT v FROM hv WHERE id = 7)    |    1 | index, 1 rows
+ <#> | (SELECT v FROM hv WHERE id = 7)    |   10 | index, 10 rows
+ <#> | (SELECT v FROM hv WHERE id = 7)    |  100 | index, 100 rows
+ <#> | (SELECT v FROM hv WHERE id = 7)    | 3006 | index, 3006 rows
+ <#> | hv_vec(77, 40, 0.5)                |    1 | index, 1 rows
+ <#> | hv_vec(77, 40, 0.5)                |   10 | index, 10 rows
+ <#> | hv_vec(77, 40, 0.5)                |  100 | index, 100 rows
+ <#> | hv_vec(77, 40, 0.5)                | 3006 | index, 3006 rows
+ <-> | (SELECT v FROM hv WHERE id = 2999) |    1 | index, 1 rows
+ <-> | (SELECT v FROM hv WHERE id = 2999) |   10 | index, 10 rows
+ <-> | (SELECT v FROM hv WHERE id = 2999) |  100 | index, 100 rows
+ <-> | (SELECT v FROM hv WHERE id = 2999) | 3006 | index, 3006 rows
+ <-> | (SELECT v FROM hv WHERE id = 7)    |    1 | index, 1 rows
+ <-> | (SELECT v FROM hv WHERE id = 7)    |   10 | index, 10 rows
+ <-> | (SELECT v FROM hv WHERE id = 7)    |  100 | index, 100 rows
+ <-> | (SELECT v FROM hv WHERE id = 7)    | 3006 | index, 3006 rows
+ <-> | hv_vec(77, 40, 0.5)                |    1 | index, 1 rows
+ <-> | hv_vec(77, 40, 0.5)                |   10 | index, 10 rows
+ <-> | hv_vec(77, 40, 0.5)                |  100 | index, 100 rows
+ <-> | hv_vec(77, 40, 0.5)                | 3006 | index, 3006 rows
+ <=> | (SELECT v FROM hv WHERE id = 2999) |    1 | index, 1 rows
+ <=> | (SELECT v FROM hv WHERE id = 2999) |   10 | index, 10 rows
+ <=> | (SELECT v FROM hv WHERE id = 2999) |  100 | index, 100 rows
+ <=> | (SELECT v FROM hv WHERE id = 2999) | 3006 | index, 3006 rows
+ <=> | (SELECT v FROM hv WHERE id = 7)    |    1 | index, 1 rows
+ <=> | (SELECT v FROM hv WHERE id = 7)    |   10 | index, 10 rows
+ <=> | (SELECT v FROM hv WHERE id = 7)    |  100 | index, 100 rows
+ <=> | (SELECT v FROM hv WHERE id = 7)    | 3006 | index, 3006 rows
+ <=> | hv_vec(77, 40, 0.5)                |    1 | index, 1 rows
+ <=> | hv_vec(77, 40, 0.5)                |   10 | index, 10 rows
+ <=> | hv_vec(77, 40, 0.5)                |  100 | index, 100 rows
+ <=> | hv_vec(77, 40, 0.5)                | 3006 | index, 3006 rows
+(36 rows)
+
+-- a NULL query (a NULL row's): every row, at a NULL distance; the cosine of
+-- the zero vector, NaN, after every number and before NULL
+SELECT hv_cmp('SELECT id, v <-> (SELECT v FROM hv WHERE id = 3001) AS d FROM hv
+			   ORDER BY v <-> (SELECT v FROM hv WHERE id = 3001) LIMIT 10');
+     hv_cmp     
+----------------
+ index, 10 rows
+(1 row)
+
+SELECT hv_cmp('SELECT id, v <=> hv_vec(9, 40) AS d FROM hv ORDER BY v <=> hv_vec(9, 40) OFFSET 2995');
+     hv_cmp     
+----------------
+ index, 11 rows
+(1 row)
+
+SELECT hv_cmp(format('SELECT id, v <=> %L::halfvec AS d FROM hv ORDER BY v <=> %L::halfvec',
+					 array_fill(0, ARRAY[40])::real[]::halfvec,
+					 array_fill(0, ARRAY[40])::real[]::halfvec));
+      hv_cmp      
+------------------
+ index, 3006 rows
+(1 row)
+
+-- a query of other dimensions is pgvector's error, through the index or not
+SET enable_seqscan = off;
+SELECT id FROM hv ORDER BY v <-> '[1,2,3]' LIMIT 1;
+ERROR:  different halfvec dimensions 40 and 3
+RESET enable_seqscan;
+SET enable_indexscan = off;
+SELECT id FROM hv ORDER BY v <-> '[1,2,3]' LIMIT 1;
+ERROR:  different halfvec dimensions 40 and 3
+RESET enable_indexscan;
+-- inserts after the build: a new cluster, far from the others, which goes
+-- to the partitions nearest it; its rows are the nearest its centre has
+INSERT INTO hv
+SELECT i, 10, ((hashint8extended(i::bigint, 7) & 9223372036854775807) % 100)::int,
+	   hv_vec(-11, 40, 4.0) + hv_vec(i, 40, 0.3)
+  FROM generate_series(3007, 3600) i;
+SELECT op, k, hv_cmp(format('SELECT id, v %s %s AS d FROM hv ORDER BY v %s %s LIMIT %s',
+							op, q, op, q, k)) AS result
+  FROM hv_cases WHERE k IN (10, 3006) ORDER BY op, q, k;
+ op  |  k   |      result      
+-----+------+------------------
+ <#> |   10 | index, 10 rows
+ <#> | 3006 | index, 3006 rows
+ <#> |   10 | index, 10 rows
+ <#> | 3006 | index, 3006 rows
+ <#> |   10 | index, 10 rows
+ <#> | 3006 | index, 3006 rows
+ <-> |   10 | index, 10 rows
+ <-> | 3006 | index, 3006 rows
+ <-> |   10 | index, 10 rows
+ <-> | 3006 | index, 3006 rows
+ <-> |   10 | index, 10 rows
+ <-> | 3006 | index, 3006 rows
+ <=> |   10 | index, 10 rows
+ <=> | 3006 | index, 3006 rows
+ <=> |   10 | index, 10 rows
+ <=> | 3006 | index, 3006 rows
+ <=> |   10 | index, 10 rows
+ <=> | 3006 | index, 3006 rows
+(18 rows)
+
+SELECT hv_cmp('SELECT id, v <-> hv_vec(-11, 40, 4.0) AS d FROM hv ORDER BY v <-> hv_vec(-11, 40, 4.0) LIMIT 50');
+     hv_cmp     
+----------------
+ index, 50 rows
+(1 row)
+
+SET enable_seqscan = off;
+SET enable_sort = off;
+SELECT count(*) AS nearest, min(id), max(id)
+  FROM (SELECT id FROM hv ORDER BY v <-> hv_vec(-11, 40, 4.0) LIMIT 50) s;
+ nearest | min  | max  
+---------+------+------
+      50 | 3009 | 3580
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_sort;
+-- filtered through LionOrdered, which hands lion's set of the WHERE to the
+-- vector scan (DESIGN.md §44.6): a filter of more members than
+-- pg_lion.vector_exact_rows (2,000) probes partitions, one of fewer
+-- computes every member's distance from the table
+PREPARE hv_f(int, halfvec) AS
+	SELECT id FROM hv WHERE tag = $1 ORDER BY v <=> $2 LIMIT 10;
+SET plan_cache_mode = force_generic_plan;
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+EXPLAIN (COSTS OFF) EXECUTE hv_f(3, :'q7');
+              QUERY PLAN               
+---------------------------------------
+ Limit
+   ->  Custom Scan (LionOrdered) on hv
+         Ordered By: hv_cos
+         Order By: (v <=> $2)
+         Lion Cond: (tag = $1)
+         Lion Indexes: hv_tag
+(6 rows)
+
+RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET plan_cache_mode;
+DEALLOCATE hv_f;
+SELECT op, f, k,
+	   hv_ord(format('SELECT id, v %s hv_vec(4, 40) AS d FROM hv WHERE %s
+					  ORDER BY v %s hv_vec(4, 40) %s', op, f, op, k)) AS result
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op),
+	   (VALUES ('cat <> 5'), ('tag = 3'), ('cat IN (1, 2) AND tag < 50'),
+			   ('tag = 1000')) f(f),
+	   (VALUES ('LIMIT 10'), ('')) k(k)
+ ORDER BY op, f, k;
+ op  |             f              |    k     |         result         
+-----+----------------------------+----------+------------------------
+ <#> | cat <> 5                   |          | LionOrdered, 3294 rows
+ <#> | cat <> 5                   | LIMIT 10 | LionOrdered, 10 rows
+ <#> | cat IN (1, 2) AND tag < 50 |          | LionOrdered, 298 rows
+ <#> | cat IN (1, 2) AND tag < 50 | LIMIT 10 | LionOrdered, 10 rows
+ <#> | tag = 1000                 |          | LionOrdered, 0 rows
+ <#> | tag = 1000                 | LIMIT 10 | LionOrdered, 0 rows
+ <#> | tag = 3                    |          | LionOrdered, 38 rows
+ <#> | tag = 3                    | LIMIT 10 | LionOrdered, 10 rows
+ <-> | cat <> 5                   |          | LionOrdered, 3294 rows
+ <-> | cat <> 5                   | LIMIT 10 | LionOrdered, 10 rows
+ <-> | cat IN (1, 2) AND tag < 50 |          | LionOrdered, 298 rows
+ <-> | cat IN (1, 2) AND tag < 50 | LIMIT 10 | LionOrdered, 10 rows
+ <-> | tag = 1000                 |          | LionOrdered, 0 rows
+ <-> | tag = 1000                 | LIMIT 10 | LionOrdered, 0 rows
+ <-> | tag = 3                    |          | LionOrdered, 38 rows
+ <-> | tag = 3                    | LIMIT 10 | LionOrdered, 10 rows
+ <=> | cat <> 5                   |          | LionOrdered, 3294 rows
+ <=> | cat <> 5                   | LIMIT 10 | LionOrdered, 10 rows
+ <=> | cat IN (1, 2) AND tag < 50 |          | LionOrdered, 298 rows
+ <=> | cat IN (1, 2) AND tag < 50 | LIMIT 10 | LionOrdered, 10 rows
+ <=> | tag = 1000                 |          | LionOrdered, 0 rows
+ <=> | tag = 1000                 | LIMIT 10 | LionOrdered, 0 rows
+ <=> | tag = 3                    |          | LionOrdered, 38 rows
+ <=> | tag = 3                    | LIMIT 10 | LionOrdered, 10 rows
+(24 rows)
+
+-- the exact path: the scan's DEBUG1 line says it fetched every member, and
+-- read no partition; at pg_lion.vector_exact_rows = 0 the same filter
+-- probes, and at 5,000 a filter of 3,294 members is exact; the order is
+-- the same either way
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET client_min_messages = debug1;
+SELECT id FROM hv WHERE tag = 3 ORDER BY v <-> hv_vec(4, 40) LIMIT 3;
+DEBUG:  lionvec scan of "hv_l2": 38 members fetched, 3 returned
+  id  
+------
+ 1627
+ 1537
+ 1302
+(3 rows)
+
+RESET client_min_messages;
+RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+SET pg_lion.vector_exact_rows = 0;
+SELECT op, hv_ord(format('SELECT id, v %s hv_vec(4, 40) AS d FROM hv WHERE tag = 3
+						  ORDER BY v %s hv_vec(4, 40) LIMIT 10', op, op)) AS result
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
+ op  |        result        
+-----+----------------------
+ <#> | LionOrdered, 10 rows
+ <-> | LionOrdered, 10 rows
+ <=> | LionOrdered, 10 rows
+(3 rows)
+
+SET pg_lion.vector_exact_rows = 5000;
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET client_min_messages = debug1;
+SELECT count(*) FROM (SELECT id FROM hv WHERE cat <> 5
+					   ORDER BY v <=> hv_vec(4, 40) LIMIT 10) s;
+DEBUG:  lionvec scan of "hv_cos": 3294 members fetched, 10 returned
+ count 
+-------
+    10
+(1 row)
+
+RESET client_min_messages;
+RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+SELECT op, hv_ord(format('SELECT id, v %s hv_vec(4, 40) AS d FROM hv WHERE cat <> 5
+						  ORDER BY v %s hv_vec(4, 40) LIMIT 10', op, op)) AS result
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
+ op  |        result        
+-----+----------------------
+ <#> | LionOrdered, 10 rows
+ <-> | LionOrdered, 10 rows
+ <=> | LionOrdered, 10 rows
+(3 rows)
+
+RESET pg_lion.vector_exact_rows;
+-- an expression index of a vector column as halfvec: the index's type is
+-- its operator class's, halfvec, and the exact distances are of the
+-- expression, computed from the table's vectors
+CREATE TABLE hvx (id int, v vector(40));
+INSERT INTO hvx SELECT id, v::vector FROM hv WHERE id <= 2000;
+CREATE INDEX hvx_cos ON hvx USING lionvec ((v::halfvec(40)) halfvec_cosine_ops)
+	WITH (partitions = 10);
+SELECT hv_cmp('SELECT id, v::halfvec(40) <=> hv_vec(5, 40) AS d FROM hvx
+			   ORDER BY v::halfvec(40) <=> hv_vec(5, 40) LIMIT 20');
+     hv_cmp     
+----------------
+ index, 20 rows
+(1 row)
+
+-- a table empty at the build, whose column has no dimensions: the first
+-- row sets them, and a row of others is pgvector's error
+CREATE TABLE hve (id int, v halfvec);
+CREATE INDEX hve_l2 ON hve USING lionvec (v);
+CREATE INDEX hve_ip ON hve USING lionvec (v halfvec_ip_ops);
+INSERT INTO hve VALUES (1, '[1,2,3]'), (2, '[3,2,1]'), (3, NULL), (4, '[0,0,1]'),
+	(5, '[0.5,0.25,-0.125]');
+INSERT INTO hve VALUES (6, '[1,2,3,4]');
+ERROR:  expected 3 dimensions, not 4
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM hve ORDER BY v <-> '[1,1,2]' LIMIT 2;
+                  QUERY PLAN                  
+----------------------------------------------
+ Limit
+   ->  Index Scan using hve_l2 on hve
+         Order By: (v <-> '[1,1,2]'::halfvec)
+(3 rows)
+
+SELECT id, v <-> '[1,1,2]' AS d FROM hve ORDER BY v <-> '[1,1,2]';
+ id |         d          
+----+--------------------
+  1 | 1.4142135623730951
+  4 | 1.7320508075688772
+  5 | 2.3082731640774234
+  2 |  2.449489742783178
+  3 |                   
+(5 rows)
+
+SELECT id, v <#> '[1,1,2]' AS d FROM hve ORDER BY v <#> '[1,1,2]';
+ id |  d   
+----+------
+  1 |   -9
+  2 |   -7
+  4 |   -2
+  5 | -0.5
+  3 |     
+(5 rows)
+
+SELECT id FROM hve ORDER BY v <-> '[1,1]';
+ERROR:  different halfvec dimensions 3 and 2
+RESET enable_seqscan;
+-- what lionvec refuses of halfvec: too many dimensions, an array
+CREATE TABLE hvbad (v halfvec(9000), w halfvec(3)[]);
+CREATE INDEX ON hvbad USING lionvec (v);
+ERROR:  column cannot have more than 8128 dimensions for lionvec index
+CREATE INDEX ON hvbad USING lionvec (w);
+ERROR:  data type halfvec[] has no default operator class for access method "lionvec"
+RESET pg_lion.vector_patience;
+RESET pg_lion.vector_margin;
+RESET pg_lion.vector_epsilon;
+DROP TABLE hv, hv_cases, hvx, hve, hvbad;
+DROP FUNCTION hv_ord(text);
+DROP FUNCTION hv_cmp(text);
+DROP FUNCTION hv_vec(bigint, int, float8);

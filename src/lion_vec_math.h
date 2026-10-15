@@ -29,6 +29,10 @@
  *	  as four more bit-planes, so that the inner product is popcounts of
  *	  ANDs; the rounding adds Delta^2 / 12 to the variance, Delta the step.
  *
+ *	  A vector comes from pgvector's `vector`, whose elements are floats, or
+ *	  its `halfvec`, whose elements are IEEE 754 binary16 halves and are
+ *	  converted to floats as they are read; everything after that is the same.
+ *
  *	  Frontend-safe (c.h and libpgcommon only), so that test/unit/vec_test.c
  *	  can check it without a server.
  *-------------------------------------------------------------------------
@@ -60,6 +64,37 @@
 
 /* dims padded to whole 64-bit words */
 #define LIONVEC_PADDED(dims)	((((dims) + 63) / 64) * 64)
+
+/*
+ * pgvector's `vector` and `halfvec`, as they lay their datums out: a
+ * varlena of a 16-bit dimension count, 16 unused bits and the elements,
+ * floats or halves (IEEE 754 binary16, which lionvec_halves() converts).
+ * pg_lion reads them here rather than linking pgvector, so that pg_lion
+ * itself loads without pgvector.
+ */
+typedef struct LionVecPgVector
+{
+	int32		vl_len_;
+	int16		dim;
+	int16		unused;
+	float		x[FLEXIBLE_ARRAY_MEMBER];
+} LionVecPgVector;
+
+typedef struct LionVecPgHalfVector
+{
+	int32		vl_len_;
+	int16		dim;
+	int16		unused;
+	uint16		x[FLEXIBLE_ARRAY_MEMBER];
+} LionVecPgHalfVector;
+
+/*
+ * The dimension count of a detoasted `vector` datum, or of a `halfvec` one
+ * if half, of len bytes at p, its varlena header included; or -1 if those
+ * bytes cannot be one: fewer than the header, a negative count, or fewer
+ * than the count's elements take.
+ */
+extern int	lionvec_datum_dim(const void *p, Size len, bool half);
 
 typedef struct LionVecRotation
 {
@@ -124,16 +159,49 @@ extern void lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
 							   const float *x, double eps);
 
 /*
- * The popcount kernel of plane 1: sum over j of 2^j popcount(bits & plane j),
- * the inner product of the row's sign bits with the quantized query's codes.
+ * The kernels (DESIGN.md §44.3), chosen once by lionvec_kernels_init():
+ *
+ *	lionvec_plane_dot	sum over j of 2^j popcount(bits & plane j), the inner
+ *						product of a row's sign bits with the quantized
+ *						query's codes, over nwords words of each
+ *	lionvec_sum8		sum over i < dimsp of lionvec_recon8[codes[i]] qc[i]
+ *	lionvec_l2sq		sum over i < dimsp of (a[i] - b[i])^2
+ *	lionvec_halves		x[i] = the float of the half h[i], i < n: a halfvec's
+ *						elements, exactly, a NaN as the quiet NaN of its
+ *						payload
+ *
+ * and the rotation's, inside lionvec_rotate().  The sums are in double, in
+ * LIONVEC_LANES partial sums - the i-th term into partial i % LIONVEC_LANES
+ * - added up in a fixed order, which every kernel keeps: each returns what
+ * the portable one does, to the bit, as do the rotation's and the halves'
+ * (lion_vec_math.c, "Kernels").  dimsp is a multiple of 64.
  */
+#define LIONVEC_LANES			16
+
 typedef uint32 (*LionVecDotKernel) (const uint64 *bits, const uint64 *planes,
 									int nwords);
+typedef double (*LionVecSum8Kernel) (const uint8 *codes, const float *qc,
+									 int dimsp);
+typedef double (*LionVecL2Kernel) (const float *a, const float *b, int dimsp);
+typedef void (*LionVecHalfKernel) (const uint16 *h, int n, float *x);
 extern LionVecDotKernel lionvec_plane_dot;
+extern LionVecSum8Kernel lionvec_sum8;
+extern LionVecL2Kernel lionvec_l2sq;
+extern LionVecHalfKernel lionvec_halves;
 extern void lionvec_kernels_init(void);
+
+/* the sets of kernels, as the unit test forces them */
+#define LIONVEC_KERNELS_PORTABLE	0
+#define LIONVEC_KERNELS_POPCNT		1	/* x86-64: POPCNT for plane 1 */
+#define LIONVEC_KERNELS_AVX2		2	/* x86-64: AVX2 for all; halves by
+										 * F16C where the CPU has it */
+#define LIONVEC_KERNELS_AVX512		3	/* x86-64: AVX2, plane 1 by VPOPCNTDQ */
+#define LIONVEC_KERNELS_MAX			LIONVEC_KERNELS_AVX512
 #ifdef FRONTEND
-/* the unit test's way to run each kernel: 0 portable, 1 POPCNT; false if absent */
+/* the unit test's way to run each set; false if the build or the CPU lacks it */
 extern bool lionvec_kernel_force(int which);
+/* ... and whether the set it forced converts halves with F16C */
+extern bool lionvec_kernel_f16c(void);
 #endif
 
 extern void lionvec_estimate1(const LionVecQuery *q, const uint64 *bits,
@@ -171,6 +239,60 @@ typedef struct LionVecCentroids
  */
 extern int	lionvec_candidates(const LionVecCentroids *c, const LionVecQuery *q,
 							   double *lo, double *hi, int *cand);
+
+/*
+ * ... and the centroids that can be among the m nearest (1 <= m <=
+ * LIONVEC_RANK_MAX), those whose lower bound is no more than the m-th least
+ * upper bound: at least min(m, k) of them, as every centroid's lo <= hi, or
+ * its bound is none - which holds when each norm is a non-negative number,
+ * and which callers reading centroids from an index check rather than
+ * assume.  m = 1 is lionvec_candidates().
+ */
+#define LIONVEC_RANK_MAX		16
+extern int	lionvec_candidates_n(const LionVecCentroids *c, const LionVecQuery *q,
+								 int m, double *lo, double *hi, int *cand);
+
+/*
+ * The m least of key[0 .. n), as their places in key, least first: into
+ * order[], which must hold min(n, m) of them, and how many that is.  Ties go
+ * to the lower place, and a NaN key counts as infinite.
+ */
+extern int	lionvec_rank(const double *key, int n, int m, int *order);
+
+/*
+ * Spill (DESIGN.md §44.3): an index that spills keeps every row with a
+ * vector in two partitions, its nearest centroid c1's and a second, chosen
+ * by SOAR (Sun and others, NeurIPS 2023): of the LIONVEC_SOAR_CANDS
+ * centroids next nearest after c1, the one that minimizes
+ *
+ *		|x - c|^2 + lambda <r / |r|, x - c>^2,		r = x - c1
+ *
+ * - a centroid near the row, and off the line of its residual r, so that a
+ * query whose nearest rows are the row lies where c1's partition was likely
+ * to be passed by (where the query lies along r beyond the row) finds the
+ * row in the second instead.  lambda = 0 is the plain second-nearest.
+ * lionvec_soar_cost() is that cost of a centroid c, x, c1 and c dimsp
+ * floats alike centred; lionvec_soar_second() the place in cands[0 .. n) of
+ * the one of least cost, ties to the lower place (the nearer, when cands are
+ * nearest first), or -1 when n is 0.  A row at c1 has no residual and costs
+ * |x - c|^2; a cost that is not a number counts as infinite.
+ */
+#define LIONVEC_SOAR_CANDS		8
+#define LIONVEC_SOAR_LAMBDA		1.0
+extern double lionvec_soar_cost(const float *x, const float *c1, const float *c,
+								int dimsp, double lambda);
+extern int	lionvec_soar_second(const float *x, const float *c1,
+								const float *const *cands, int n, int dimsp,
+								double lambda);
+
+/*
+ * A vector from its 8-bit codes, norm (|x|), alpha8 and rnorm8 (|r|), as an
+ * index stores a centroid's: x's projection on r, |x| alpha8 r / |r|, the
+ * nearest vector to x in r's direction, |x| sqrt(1 - alpha8^2) from it.
+ * Zeros for codes with no length.
+ */
+extern void lionvec_decode8(const uint8 *codes, int dimsp, float norm,
+							float alpha8, float rnorm8, float *x);
 
 /*
  * A sample of the rows, for k-means: each one rotated, not centred (the
