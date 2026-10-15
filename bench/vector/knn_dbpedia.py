@@ -56,7 +56,11 @@
 # KNN_ADMIN_DSN (default "dbname=postgres", to create the database), KNN_CACHE
 # (default .local/dbpedia), KNN_OUT (default
 # bench/results/2026-10-14-lionvec-dbpedia), KNN_NQ (default 200),
-# KNN_SHARDS (default /mnt/project-files/train-0000[0-2]-of-00026.parquet),
+# KNN_SHARDS (default /mnt/project-files/train-0000[0-2]-of-00026.parquet)
+# and KNN_NSHARDS (default 3): the shards' glob and how many it must match (26
+# for the whole million; bench/vector/local/ runs it on a workstation),
+# KNN_PREWARM (default buffer; read, none): what a warm or exact run
+# prewarms, and where (prewarm()),
 # KNN_TABLE (default dbpedia): the table the builds and runs are of, dbpedia or
 # its halfvec(1536) copy dbpedia_h (`halfvec`); its indexes are named
 # TABLE_lv, TABLE_hnsw, TABLE_vchord and TABLE_diskann, in the column's own
@@ -64,7 +68,9 @@
 # KNN_SRC (default this checkout: the one the installed pg_lion was built
 # from, whose commit the results record),
 # KNN_RESTART (default "./dev.sh restart"): the command cold runs to restart
-# the server, and KNN_COLD_NQ (default 7) the queries each method runs cold.
+# the server, KNN_DROP (default "sync; echo 3 > /proc/sys/vm/drop_caches")
+# the command that empties the kernel's page cache, and KNN_COLD_NQ (default
+# 7) the queries each method runs cold.
 # KNN_MARGINS (default 2,3,4,6,8,12,16) and KNN_PATIENCE (default 30): the
 # pg_lion.vector_margin and pg_lion.vector_patience values warm runs.  The
 # margins go past the default 3 because on these embeddings 3 returns 0.84 of
@@ -78,7 +84,9 @@
 # 50): diskann.query_search_list_size and diskann.query_rescore for a diskann
 # run.  KNN_COLD_VCHORD and KNN_COLD_DISKANN (default none): the probes and
 # search list sizes cold runs; KNN_COLD_KINDS (default all four) the kinds
-# it runs at all.
+# it runs at all; KNN_COLD_FROM (default none) a directory of warm results
+# from which a cold run takes each kind's settings, those that reached 0.95
+# and 0.98 there (cold_settings()), in place of the 115k runs' own.
 #
 # diskann answers an arbitrary WHERE by filtering what its scan streams out;
 # its index-side filtering takes a smallint[] labels column named in the
@@ -107,6 +115,8 @@ SRC = os.environ.get('KNN_SRC', REPO)
 OUT = os.environ.get('KNN_OUT', os.path.join(REPO, 'bench', 'results', '2026-10-14-lionvec-dbpedia'))
 NQ = int(os.environ.get('KNN_NQ', '200'))
 SHARDS = os.environ.get('KNN_SHARDS', '/mnt/project-files/train-0000[0-2]-of-00026.parquet')
+NSHARDS = int(os.environ.get('KNN_NSHARDS', '3'))
+PREWARM = os.environ.get('KNN_PREWARM', 'buffer')
 COL = 'text-embedding-3-large-1536-embedding'
 DIM = 1536
 SELS = (1.0, 0.1, 0.03, 0.01)
@@ -183,6 +193,26 @@ def restore_indexes(conn, others):
         conn.execute("UPDATE pg_index SET indisvalid = true WHERE indexrelid = %s::regclass", (o,))
 
 
+def prewarm(conn, idx):
+    # Every relation a run reads into shared_buffers (KNN_PREWARM=buffer, the
+    # default: 2 GB holds them all at 115k rows), or, where shared_buffers
+    # cannot hold them (a million rows' TOAST is 8 GB), the index into
+    # shared_buffers and the table and its TOAST into the kernel's page cache
+    # only (KNN_PREWARM=read); none prewarms nothing.  The warm-up pass over
+    # the queries follows either way.
+    if PREWARM == 'none':
+        return
+    big = 'buffer' if PREWARM == 'buffer' else 'read'
+    toast = f"(SELECT reltoastrelid FROM pg_class WHERE relname = '{TABLE}')"
+    for q in [f"SELECT pg_prewarm('{TABLE}', '{big}')", f"SELECT pg_prewarm('{TABLE}_pkey')",
+              f"SELECT pg_prewarm('{TABLE}_u')", f"SELECT pg_prewarm('{idx}')",
+              f"SELECT pg_prewarm({toast}, '{big}')",
+              f"SELECT pg_prewarm(indexrelid) FROM pg_index WHERE indrelid = {toast}"]:
+        t = time.perf_counter()
+        n = conn.execute(q).fetchone()[0]
+        print(f'{q}: {n} pages, {time.perf_counter() - t:.1f} s', flush=True)
+
+
 def where(sel):
     return '' if sel >= 1.0 else f'WHERE u < {sel}'
 
@@ -217,18 +247,53 @@ def sql(kind, sel):
 
 
 def read_shards():
+    # the shards, in sorted filename order, written straight into X.npy in
+    # the cache (memory-mapped), so that the whole set (6 GB at 1M rows) is
+    # never held twice
     files = sorted(glob.glob(SHARDS))
-    if len(files) != 3:
-        raise SystemExit(f'expected 3 shards matching {SHARDS}, found {files}')
-    parts = []
+    if len(files) != NSHARDS:
+        raise SystemExit(f'expected {NSHARDS} shards matching {SHARDS}, found {files}')
+    n = sum(pq.ParquetFile(f).metadata.num_rows for f in files)
+    os.makedirs(CACHE, exist_ok=True)
+    X = np.lib.format.open_memmap(os.path.join(CACHE, 'X.npy'), mode='w+', dtype=np.float32, shape=(n, DIM))
+    at = 0
     for f in files:
         col = pq.read_table(f, columns=[COL]).column(COL).combine_chunks()
         lens = np.diff(col.offsets.to_numpy())
         if not (lens == DIM).all():
             raise SystemExit(f'{f}: a vector of other than {DIM} dimensions')
-        parts.append(col.flatten().to_numpy().astype(np.float32).reshape(-1, DIM))
-        print(f'{f}: {parts[-1].shape[0]} rows', flush=True)
-    return files, np.concatenate(parts)
+        part = col.flatten().to_numpy().astype(np.float32).reshape(-1, DIM)
+        X[at:at + len(part)] = part
+        at += len(part)
+        print(f'{f}: {len(part)} rows', flush=True)
+        del col, part
+    assert at == n
+    X.flush()
+    return files, X
+
+
+def similarities(X, rows, Q):
+    # the cosine of each of rows with each query, in float64, a chunk at a
+    # time: (len(rows), len(Q)), 1.6 GB at 1M rows and 200 queries
+    Qd = np.asarray(Q, np.float64)
+    Qd /= np.linalg.norm(Qd, axis=1, keepdims=True)
+    S = np.empty((len(rows), len(Q)))
+    for lo in range(0, len(rows), 20000):
+        Xd = np.asarray(X[rows[lo:lo + 20000]]).astype(np.float64)
+        Xd /= np.linalg.norm(Xd, axis=1, keepdims=True)
+        S[lo:lo + 20000] = Xd @ Qd.T
+    return S
+
+
+def top10(ids, s):
+    # the ten greatest of s, ties by id: the 64 greatest and every row tied
+    # with the 64th, then those sorted (a full lexsort of a million rows a
+    # query is slow, and the answer is the same)
+    if len(s) > 64:
+        cut = np.partition(s, len(s) - 64)[len(s) - 64]
+        m = s >= cut
+        ids, s = ids[m], s[m]
+    return ids[np.lexsort((ids, -s))[:10]]
 
 
 def prepare():
@@ -241,25 +306,17 @@ def prepare():
     keep = np.ones(N, bool)
     keep[qidx] = False
     rows = np.flatnonzero(keep)
-    Xd = X.astype(np.float64)
-    Xd /= np.linalg.norm(Xd, axis=1, keepdims=True)
-    Q = Xd[qidx]
+    S = similarities(X, rows, X[qidx])
     gt = {}
-    S = np.empty((len(rows), NQ))
-    for lo in range(0, len(rows), 20000):
-        S[lo:lo + 20000] = Xd[rows[lo:lo + 20000]] @ Q.T
     for sel in SELS:
         m = u[rows] < sel
         ids, Ss = rows[m], S[m]
         top = np.empty((NQ, 10), np.int64)
         for i in range(NQ):
             # the greatest similarity first, ties by id
-            o = np.lexsort((ids, -Ss[:, i]))[:10]
-            top[i] = ids[o]
+            top[i] = top10(ids, np.ascontiguousarray(Ss[:, i]))
         gt[str(sel)] = top
         print(f'u < {sel}: {m.sum()} rows', flush=True)
-    os.makedirs(CACHE, exist_ok=True)
-    np.save(os.path.join(CACHE, 'X.npy'), X)
     np.save(os.path.join(CACHE, 'qidx.npy'), qidx)
     np.save(os.path.join(CACHE, 'u.npy'), u)
     np.savez(os.path.join(CACHE, 'truth.npz'), **gt)
@@ -512,22 +569,16 @@ def warm(kind, name):
     idx = INDEXES[kind]
     conn = connect()
     cost_distances(conn)
-    # warm: every relation in shared_buffers (2 GB holds them all here),
-    # each method's queries run once untimed first
-    for q in [f"SELECT pg_prewarm('{TABLE}')", f"SELECT pg_prewarm('{TABLE}_pkey')",
-              f"SELECT pg_prewarm('{TABLE}_u')", f"SELECT pg_prewarm('{idx}')",
-              f"SELECT pg_prewarm(reltoastrelid) FROM pg_class WHERE relname = '{TABLE}'",
-              "SELECT pg_prewarm(indexrelid) FROM pg_index WHERE indrelid = "
-              f"(SELECT reltoastrelid FROM pg_class WHERE relname = '{TABLE}')"]:
-        t = time.perf_counter()
-        n = conn.execute(q).fetchone()[0]
-        print(f'{q}: {n} pages, {time.perf_counter() - t:.1f} s', flush=True)
+    # warm: the relations prewarmed (prewarm()), each method's queries run
+    # once untimed first
+    prewarm(conn, idx)
     try:
         built = json.load(open(os.path.join(CACHE, f'{idx}.build.json')))
     except OSError:
         built = None
     meta = dict(name=name, index=idx, table=TABLE, column=coltype(), build=built, run=provenance(),
                 run_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), queries=len(Q),
+                prewarm=PREWARM,
                 settings=show(conn, 'shared_buffers', 'work_mem', 'maintenance_work_mem', 'jit',
                               'max_parallel_workers_per_gather', 'max_parallel_maintenance_workers',
                               'random_page_cost', 'effective_io_concurrency', 'effective_cache_size',
@@ -565,17 +616,11 @@ def exact(name):
     keep = np.ones(X.shape[0], bool)
     keep[qidx] = False
     rows = np.flatnonzero(keep)
-    Qd = Q.astype(np.float64)
-    Qd /= np.linalg.norm(Qd, axis=1, keepdims=True)
-    S = np.empty((len(rows), len(Q)))
-    for lo in range(0, len(rows), 20000):
-        Xd = np.asarray(X[rows[lo:lo + 20000]]).astype(np.float64)
-        Xd /= np.linalg.norm(Xd, axis=1, keepdims=True)
-        S[lo:lo + 20000] = Xd @ Qd.T
+    S = similarities(X, rows, Q)
     for sel in (0.3, 0.1):
         m = u[rows] < sel
         ids, Ss = rows[m], S[m]
-        top = np.array([ids[np.lexsort((ids, -Ss[:, i]))[:10]] for i in range(len(Q))])
+        top = np.array([top10(ids, np.ascontiguousarray(Ss[:, i])) for i in range(len(Q))])
         if str(sel) in truth:                    # the cached truth, computed the same way
             assert (np.sort(top, 1) == np.sort(truth[str(sel)][:len(Q)], 1)).all()
         truth[str(sel)] = top
@@ -583,14 +628,11 @@ def exact(name):
     idx = INDEXES['lionvec']
     conn = connect()
     cost_distances(conn)
-    for q in [f"SELECT pg_prewarm('{TABLE}')", f"SELECT pg_prewarm('{TABLE}_pkey')",
-              f"SELECT pg_prewarm('{TABLE}_u')", f"SELECT pg_prewarm('{idx}')",
-              f"SELECT pg_prewarm(reltoastrelid) FROM pg_class WHERE relname = '{TABLE}'",
-              "SELECT pg_prewarm(indexrelid) FROM pg_index WHERE indrelid = "
-              f"(SELECT reltoastrelid FROM pg_class WHERE relname = '{TABLE}')"]:
-        conn.execute(q)
+    prewarm(conn, idx)
     lo = ['SET enable_sort = off', 'SET enable_indexscan = off']
-    configs = [('exact LionOrdered', ['SET pg_lion.vector_exact_rows = 200000'] + lo),
+    # every filter's members, up to 30% of the rows, on the exact path
+    every = max(200000, len(rows))
+    configs = [('exact LionOrdered', [f'SET pg_lion.vector_exact_rows = {every}'] + lo),
                ('planner exact sort', ['SET pg_lion.enable_ordered_scan = off', 'SET enable_indexscan = off']),
                ('LionOrdered margin=3', ['SET pg_lion.vector_margin = 3', 'SET pg_lion.vector_exact_rows = 0'] + lo),
                ('planner plan margin=3', ['SET pg_lion.vector_margin = 3'])]
@@ -621,19 +663,31 @@ def cold(name='cold'):
     # a cloud disk's latency varies from read to read.
     nq = int(os.environ.get('KNN_COLD_NQ', '7'))
     restart = os.environ.get('KNN_RESTART', './dev.sh restart')
+    drop = os.environ.get('KNN_DROP', 'sync; echo 3 > /proc/sys/vm/drop_caches')
     X = np.load(os.path.join(CACHE, 'X.npy'), mmap_mode='r')
     qidx = np.load(os.path.join(CACHE, 'qidx.npy'))
     Q = np.asarray(X[qidx[:nq]])
     lo = ['SET enable_sort = off', 'SET enable_indexscan = off']
-    hn = ['SET hnsw.ef_search = 40', 'SET hnsw.iterative_scan = relaxed_order']
     probes = [int(x) for x in os.environ.get('KNN_COLD_VCHORD', '').split(',') if x]
     lists = [int(x) for x in os.environ.get('KNN_COLD_DISKANN', '').split(',') if x]
     kinds = os.environ.get('KNN_COLD_KINDS', 'lionvec,hnsw,vchord,diskann').split(',')
+    # the settings each kind runs cold: those of the 115k runs, or with
+    # KNN_COLD_FROM (a directory of warm results) the smallest each warm run
+    # swept that reached a recall of 0.95 and of 0.98 (cold_settings())
+    margins, filtered_margins, efs, filtered_ef = (3, 7, 12), (3, 7), (40, 100), 40
+    picked = cold_settings(os.environ['KNN_COLD_FROM']) if os.environ.get('KNN_COLD_FROM') else {}
+    margins = picked.get(('lionvec', 1.0), margins)
+    filtered_margins = picked.get(('lionvec', 0.03), filtered_margins)
+    efs = picked.get(('hnsw', 1.0), efs)
+    filtered_ef = picked.get(('hnsw', 0.03), (filtered_ef,))[0]
+    probes = probes or picked.get(('vchord', 1.0), ())
+    lists = lists or picked.get(('diskann', 1.0), ())
+    hn = [f'SET hnsw.ef_search = {filtered_ef}', 'SET hnsw.iterative_scan = relaxed_order']
     configs = []
-    for margin in (3, 7, 12):
+    for margin in margins:
         configs.append(('lionvec', 1.0, f'lionvec margin={margin}', sql('lionvec', 1.0),
                         [f'SET pg_lion.vector_margin = {margin}']))
-    for ef in (40, 100):
+    for ef in efs:
         configs.append(('hnsw', 1.0, f'hnsw ef={ef}', sql('hnsw', 1.0), [f'SET hnsw.ef_search = {ef}']))
     for p in probes:
         configs.append(('vchord', 1.0, f'vchord probes={p}', sql('vchord', 1.0), [f"SET vchordrq.probes = '{p}'"]))
@@ -643,11 +697,11 @@ def cold(name='cold'):
     for sel in (0.03, 0.01):
         configs.append(('lionvec', sel, 'lionvec planner plan', sql('lionvec', sel),
                         ['SET pg_lion.vector_margin = 3']))
-        for margin in (3, 7) if sel > 0.01 else (3,):
+        for margin in filtered_margins if sel > 0.01 else (3,):
             configs.append(('lionvec', sel, f'lionvec margin={margin} LionOrdered', sql('lionvec', sel),
                             [f'SET pg_lion.vector_margin = {margin}'] + lo))
-        configs.append(('hnsw', sel, 'hnsw ef=40 iterative', sql('hnsw', sel), hn))
-        configs.append(('hnsw', sel, 'hnsw ef=40 iterative enable_sort=off', sql('hnsw', sel),
+        configs.append(('hnsw', sel, f'hnsw ef={filtered_ef} iterative', sql('hnsw', sel), hn))
+        configs.append(('hnsw', sel, f'hnsw ef={filtered_ef} iterative enable_sort=off', sql('hnsw', sel),
                         hn + ['SET enable_sort = off']))
         for p in probes:
             configs.append(('vchord', sel, f'vchord probes={p} prefilter', sql('vchord', sel),
@@ -665,8 +719,7 @@ def cold(name='cold'):
         conn.close()
         for i in range(nq):
             subprocess.run(restart, shell=True, check=True, capture_output=True)
-            dropped = subprocess.run(['sh', '-c', 'sync; echo 3 > /proc/sys/vm/drop_caches'],
-                                     capture_output=True).returncode == 0
+            dropped = subprocess.run(['sh', '-c', drop], capture_output=True).returncode == 0
             time.sleep(2)
             for _ in range(50):
                 try:
@@ -696,8 +749,40 @@ def cold(name='cold'):
         out.append(row)
     os.makedirs(OUT, exist_ok=True)
     json.dump(dict(meta=dict(run=provenance(), table=TABLE, column=coltype(), queries=nq, restart=restart,
+                             drop=drop, picked_from=os.environ.get('KNN_COLD_FROM'),
                              run_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())), results=out),
               open(os.path.join(OUT, f'{name}.json'), 'w'), indent=1)
+
+
+def cold_settings(d):
+    # From the warm results in directory d (lionvec.json, hnsw.json,
+    # vchord.json, diskann.json, those there are): for each kind, the
+    # smallest setting it swept that reached a mean recall of 0.95, and of
+    # 0.98 (the largest swept where none did), unfiltered and, for lionvec's
+    # LionOrdered and HNSW's iterative scan, at the 3% filter; a sorted tuple
+    # of the distinct settings, keyed (kind, sel).
+    pats = {('lionvec', 1.0): r'lionvec margin=([\d.]+) patience=\d+',
+            ('lionvec', 0.03): r'lionvec margin=([\d.]+) patience=\d+ LionOrdered',
+            ('hnsw', 1.0): r'hnsw ef=(\d+)',
+            ('hnsw', 0.03): r'hnsw ef=(\d+) iterative enable_sort=off',
+            ('vchord', 1.0): r'vchord probes=(\d+)',
+            ('diskann', 1.0): r'diskann list=(\d+) rescore=\d+'}
+    out = {}
+    for (kind, sel), pat in pats.items():
+        try:
+            rs = json.load(open(os.path.join(d, f'{kind}.json')))['results']
+        except OSError:
+            continue
+        pts = sorted((float(g.group(1)), r['recall']) for r in rs if r['sel'] == sel
+                     for g in [re.fullmatch(pat, r['name'])] if g)
+        if not pts:
+            continue
+        pick = set()
+        for target in (0.95, 0.98):
+            pick.add(next((v for v, rec in pts if rec >= target), pts[-1][0]))
+        out[(kind, sel)] = tuple(int(v) if v == int(v) else v for v in sorted(pick))
+        print(f'cold {kind} at {sel:g}: {out[(kind, sel)]}', flush=True)
+    return out
 
 
 def table(files):
