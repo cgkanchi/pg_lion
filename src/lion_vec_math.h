@@ -348,6 +348,35 @@ extern int	lionvec_kmeans(const LionVecSample *s, int k, int iters, bool unit,
 						   LionVecKmeansWork *w);
 
 /*
+ * lionvec_kmeans()'s steps, for a build that shares an iteration's rows
+ * between processes (DESIGN.md §44.12): it is start(), then until iters are
+ * made or assign() moves no row, codes(), assign() over every row and
+ * update().  Each row's assignment depends on the centroids alone, and
+ * update() sums the rows in their order, so that the centroids come out the
+ * same however assign()'s rows are shared out.
+ *
+ * start: the k rows the seed picks into cent, unit length when unit, and
+ * every assign[n] -1.  codes: the centroids' plane 1 into w's bits,
+ * popcount, norm and alpha1, centred by mean (w->x and w->codes its
+ * scratch).  assign: rows [from, to) each to its nearest centroid, into
+ * assign[]; returns how many moved.  It reads w's bits, popcount, norm and
+ * alpha1, and works in its lo, hi, cand, y, qc and planes, none of which
+ * another assign() may be using at the same time.  update: each centroid
+ * the mean of its rows (w->count, w->y its scratch), an empty one half of
+ * the largest's, unit length when unit.
+ */
+extern void lionvec_kmeans_start(const LionVecSample *s, int k, bool unit,
+								 uint64 seed, float *cent, int *assign);
+extern void lionvec_kmeans_codes(int k, int dimsp, const float *mean,
+								 const float *cent, LionVecKmeansWork *w);
+extern int	lionvec_kmeans_assign(const LionVecSample *s, int from, int to,
+								  int k, const float *mean, const float *cent,
+								  int *assign, LionVecKmeansWork *w);
+extern void lionvec_kmeans_update(const LionVecSample *s, int k, bool unit,
+								  const int *assign, float *cent,
+								  LionVecKmeansWork *w);
+
+/*
  * The scan orders rows by a KEY that is the distance up to a constant of the
  * query: what changes from row to row of an estimate of <x, qc>.
  *
