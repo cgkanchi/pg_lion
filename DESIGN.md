@@ -261,9 +261,11 @@ it, AMD's Zen 4 runs it as two 256-bit halves, and outside L1 a pass waits on th
 the popcount - with the operands cycling through 2 MB the AVX2 kernel is within a tenth of the POPCNT
 one - so a fourth implementation to test would buy little beyond a hot L1. (`pg_popcount()` itself
 uses VPOPCNTDQ where it finds it, from PostgreSQL 17 on, and the portable kernel on x86 counts
-through it.) Every implementation gives the same counts and writes the same words, so the same
-representations are chosen and plans do not change (the golden plans of the regression suite are
-identical).
+through it.) lionvec's plane-1 kernel is the case this leaves out - a query's four bit-planes, 768
+bytes at 1536 dimensions, stay in L1 while every centroid's and row's sign bits pass them - and
+takes VPOPCNTDQ where the CPU has it, on 256-bit vectors (§44.3, "Kernels"). Every implementation
+gives the same counts and writes the same words, so the same representations are chosen and plans
+do not change (the golden plans of the regression suite are identical).
 
 Measured through the library (a harness beside it; Xeon at 2.8 GHz with AVX2 and no VPOPCNTDQ, gcc
 -O2, PostgreSQL 16's libpgcommon; one pair of bitsets of 30% and 50% density in L1 / 256 pairs, 2
@@ -20169,7 +20171,7 @@ functions (lion_vec.h): `lion_vec_index()` and `lion_vec_relation()`, which tell
 its own routines (`amcostestimate`, `ambeginscan`), not its name, so that an AM of that name another
 handler serves is never taken for one; `lion_vec_restrict()`; and `lion_vec_scan_cost()`. The
 changes to lion's own code are `_PG_init()` calling `lion_vec_init()` (the settings, the 8-bit
-tables, the popcount kernel) and LionOrdered's (§44.6).
+tables, the kernels) and LionOrdered's (§44.6).
 
 A column's dimensions come from its type modifier, or, for `vector` without one, from the first
 vector the build or an insert meets (`lionvec_set_dims()`, under the meta page's lock, so that two
@@ -20253,8 +20255,7 @@ holds no member (§44.6).
 - **The query** (`lionvec_query_init()`): rotated and centred as the rows are, giving qc, and for
   plane 1 quantized to four bits a dimension, uniformly over its own range, held as four bit-planes
   interleaved with plane 1's words, so that `<sign(x), qc>` is `2 sum_j 2^j popcount(bits & plane_j)`
-  rescaled, less `sum(qc)`. The kernel is chosen once: POPCNT where the CPU has it (x86-64 GCC and
-  clang), the portable one as lion_container.c chooses it otherwise.
+  rescaled, less `sum(qc)` (the kernels below).
 - **The estimate and its error**: `<x, qc>` is estimated as `|x| <c, qc> / (|c| alpha)`, c the
   code's vector. Its error is the part of x / |x| the code misses, `sqrt(1 - alpha^2)` long and,
   after the rotation, pointing nowhere in particular, times qc: a Gaussian of standard deviation
@@ -20344,6 +20345,40 @@ holds no member (§44.6).
   cost. The scale counts each row once, from its own partition, so that the margin means what it
   meant; a partition's spread and longest row are over everything its chain holds, copies included,
   since §44.4's bound must hold for each of them.
+- **Kernels** (`lionvec_kernels_init()`, from `lion_vec_init()`). What a scan and a build spend
+  their arithmetic on: plane 1's popcounts against the query's planes, for each of a query's
+  centroids and each row a probe reads, and in k-means for each centroid for each sample row each
+  iteration; the 8-bit codes' sum `<r, qc>`, for each centroid and row refined; k-means' exact
+  distances (`lionvec_l2sq`); and the rotation. Each has a portable kernel and, from x86-64 GCC 5
+  and clang 6, kernels compiled with `__attribute__((target))`, of which the best set the CPU runs
+  is chosen at load, as lion_container.c chooses its own (§3): **POPCNT**, plane 1 a word at a
+  time; **AVX2**, plane 1 a word's four planes in one vector against the row's word broadcast,
+  each byte counted with VPSHUFB and the bytes summed by VPSADBW every 31 words, the sums four
+  doubles at a time in four vectors, and the rotation's signs and butterflies eight floats at a
+  time, the strides under 8 by permutes inside a vector; and **AVX-512**, AVX2's with plane 1
+  counted by VPOPCNTDQ (Ice Lake, Zen 4 and on; GCC and clang from 8), a word's four planes in one
+  instruction on a 256-bit vector. AVX-512 is taken for VPOPCNTDQ alone: AVX-512BW's VPSHUFB
+  counted plane 1 only a sixth faster than AVX2's, and the 8-bit sum eight doubles at a time less
+  than a tenth faster in cache, where a scan waits on the codes' cache lines more (§44.9,
+  "Kernels"), so no 512-bit instruction runs, for which some cores lower their clock. `make
+  LION_NO_SIMD=1` builds the portable set alone.
+  Every set returns what the portable one does, to the bit, so that on any CPU a scan refines the
+  same rows and probes the same partitions, a build makes the same partitions and an insert picks
+  the same one. Plane 1's are integer counts. The sums are in double, of terms each kernel
+  computes with the same operations - a code's reconstruction `-4 + (c + 1/2) / 32` is computed
+  rather than looked up, which vectorizes, and is exact, a multiple of 1/64 under 4, as is its
+  product with a float - into 16 partial sums (`LIONVEC_LANES`), the i-th term into partial i mod
+  16, added in a fixed tree (`lionvec_lanes_sum()`); the portable kernels add so too, which moved
+  their rounding from the plain sum's by an ulp or so: DBpedia's index, rebuilt, gave the same
+  recall, partitions, candidates and pages as before at every setting. lion_vec_math.c is compiled
+  with `-ffp-contract=off`, for GCC and clang would otherwise fuse a multiply and an add wherever
+  the target has fused multiply-adds (aarch64, x86-64-v3, `-march=native`) and round `l2sq`'s
+  terms once where the other kernels round them twice. The rotation's butterflies are the portable ones' additions and subtractions, of the same
+  operands. The unit tests force each set (§44.10).
+  `lionvec_query_init()` keeps its sums in locals and builds each word's four planes in registers,
+  without a branch: adding into the query's own fields, which every store to qc and the planes
+  might overwrite, and a branch on each bit of each code, which the CPU cannot predict, made it 45
+  us a row at 1536 dimensions, 16% of a build; it takes 12, and gives the same planes to the bit.
 
 ### 44.4 The scan (lion_vec_scan.c)
 
@@ -21009,6 +21044,40 @@ and 10.3% through LionOrdered at 3% (13.5% and 8.5%). Between the sizes it fell 
 times, the model's `C^(1/3)` 1.59; unfiltered it is under half the model's level because a margin of
 3 stops this data's scans early, at 0.84 recall. So the constants stay.
 
+**Kernels** (2026-10-15; the index above, on the same machine, whose Xeon has AVX-512 with
+VPOPCNTDQ, so the AVX-512 set, §44.3). Timed by section with `rdtsc` (its own cost taken off), a
+warm query at a margin of 3 spent 35% of its time in the arithmetic before them: plane 1's
+estimates of the 2,715 centroids and 2,914 rows 15%, the 8-bit sums of 123 centroids and 88 rows
+18% (1.8 us a call), the rotation and the query's planes 4%; the rest was the walk of 36
+partitions' CODE pages around those estimates (28%), the PART chain's ranking (13%), the 11 heap
+fetches with their exact distances (6%), the executor (7%) and the scan's queues. At a margin of 7
+the arithmetic was 32% (the walk 47%); under LionOrdered at 3% 19% at either margin, most of it
+the 8-bit sums of 800 and 1,600 centroids, the executor's filter a quarter at a margin of 3. The
+build spent 59% of k-means in the candidates (plane 1 against every centroid), 24% in their exact
+distances and 16% in the query's planes. Per call at 1536 dimensions, the library in a harness
+(gcc -O2, the median of six), ns:
+
+| call | before | POPCNT | AVX2 | AVX-512 |
+|---|---|---|---|---|
+| `lionvec_estimate1()` (plane 1) | 60 | 58 | 38 | 27 |
+| `lionvec_estimate8()` (the 8-bit sum) | 1,170 | 1,055 | 386 | AVX2's |
+| `lionvec_l2sq` | 1,100 | 955 | 270 | AVX2's |
+| `lionvec_rotate()`, us | 35.0 | 34.1 | 6.2 | AVX2's |
+
+"Before" is the POPCNT kernel and the plain sums (its `l2sq`, a static function, timed as a copy);
+the portable set is POPCNT's with plane 1 counted without the instruction (164 ns); the query's
+planes took 46 us before and take 12 with any set. End to end, the median execution time of the
+200 queries, the median of eight runs alternating the builds, before and after: unfiltered 1.52
+-> 1.18 ms at a margin of 3 (0.917) and 3.73 -> 2.98 at 7 (0.980); the plain scan at 10% 6.46 ->
+5.29 and 9.38 -> 7.31; LionOrdered at 10% 7.74 -> 7.12 and 11.04 -> 10.01, at 3% 7.03 -> 6.21
+(0.967) and 11.97 -> 10.54 (0.994); the exact path at 1% and the planner's sorts as before. Recall,
+partitions, candidates and pages were the same at every setting. The arithmetic is now 21% of the
+query at a margin of 3 and 10 to 11% under LionOrdered at 3%: in a scan a centroid's or row's 8-bit
+estimate takes 0.6 to 1.3 us, against 0.39 in cache, waiting on its codes' 24 cache lines -
+prefetching them took a third off a sum out of cache in a harness (1,083 -> 675 ns), not done -
+and plane 1's estimates are 7% inside a walk of 42 to 66%. The build took 148 s against 348 (the
+medians of three and two), the same index.
+
 ### 44.10 Tests
 
 - **test/unit/vec_test.c** (`make unit`, and under ASan and UBSan with `SANITIZE=1`), against the
@@ -21018,7 +21087,13 @@ times, the model's `C^(1/3)` 1.59; unfiltered it is under half the model's level
   from another; one window and two; a basis vector spread out; rotated coordinates with the
   variance, kurtosis and tails of a Gaussian); `lionvec_prepare()` (padding, cosine scaling, zero
   vectors); the encoding (bits, popcount, both alphas, a row at the mean); the query's quantization
-  and planes; both popcount kernels against a reference; the key algebra against true distances; and
+  and planes; every set of kernels the build and CPU have, forced in turn (§44.3, "Kernels"): plane
+  1 against a bit-at-a-time count at 1 to 127 words, the 8-bit sum and `l2sq` against their sixteen
+  partial sums added in the header's order and the rotation against the portable one's, all to the
+  bit, at every dimsp from 64 to 8128, from unaligned pointers, over inputs of every scale, denormals
+  and signed zeros, and end to end the same rotations, estimates and k-means as the portable set's
+  (`test/unit/vec_test_nosimd` is the same program built with `-DLION_NO_SIMD`); the key algebra
+  against true distances; and
   the bounds' COVERAGE on clustered data at 100, 384 and 1536 dimensions for each metric: plane 1
   outside 1 sd 30 to 32% of the time (the Gaussian's 31.7%), outside 3 sd 0.16 to 0.29% (0.27%); the
   codes outside 2 sd about 4% (4.6%) and never outside 6 sd, in 24,000 row-query pairs each. A heavy
