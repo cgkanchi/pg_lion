@@ -15,7 +15,12 @@
  *		and norms what their definitions say, a row at the mean all zeros;
  *	  - the query's planes: they quantize it within half a step, and the sum
  *		and variance kept with them are the planes' own;
- *	  - every popcount kernel against a naive count;
+ *	  - every kernel the build and CPU have (portable, POPCNT, AVX2): plane
+ *		1's against a naive count, the sums against their sixteen lanes
+ *		added as the header says and the rotation against the portable
+ *		one's, to the bit, at every dimsp an index takes and from unaligned
+ *		pointers; and end to end, the same rotations, estimates and k-means
+ *		as the portable set's;
  *	  - the key algebra: with the exact inner product and no error, the
  *		bounds ARE the key of the distance computed the obvious way, for each
  *		metric - which is the proof that centring, the mean's terms, cosine's
@@ -76,6 +81,22 @@ rnd64(void)
 	rng_state ^= rng_state >> 7;
 	rng_state ^= rng_state << 17;
 	return rng_state;
+}
+
+/*
+ * The kernel tests draw from a generator of their own, swapped in and out,
+ * so that what the tests after them draw does not depend on which kernels
+ * the build and the CPU have.
+ */
+static uint64 kernel_rng_state = 0x2545F4914F6CDD1DULL;
+
+static void
+swap_rng(void)
+{
+	uint64		t = rng_state;
+
+	rng_state = kernel_rng_state;
+	kernel_rng_state = t;
 }
 
 /* uniform in (0, 1) */
@@ -571,7 +592,7 @@ test_query(void)
 	free(x);
 }
 
-/* ---------- the popcount kernels ---------- */
+/* ---------- the kernels ---------- */
 
 static uint32
 naive_dot(const uint64 *bits, const uint64 *planes, int nwords)
@@ -589,51 +610,231 @@ naive_dot(const uint64 *bits, const uint64 *planes, int nwords)
 	return s;
 }
 
+static const char *const kernel_names[LIONVEC_KERNELS_MAX + 1] = {
+	"portable", "POPCNT", "AVX2"
+};
+
+/* The most dimensions an index takes at 8K pages (lion_vec.h). */
+#define TEST_MAX_DIMSP		8128
+
+/*
+ * What the sums' kernels must return, to the bit, stated apart from them:
+ * the i-th term into partial i % 16, and the partials added up as the
+ * header says.  serial is the plain sum in order, which it must be near.
+ */
+static double
+lanes_reference(const double *terms, int n, double *serial)
+{
+	double		p[LIONVEC_LANES] = {0};
+	double		u[4];
+	int			i;
+
+	*serial = 0.0;
+	for (i = 0; i < n; i++)
+	{
+		p[i % LIONVEC_LANES] += terms[i];
+		*serial += terms[i];
+	}
+	for (i = 0; i < 4; i++)
+		u[i] = (p[i] + p[i + 8]) + (p[i + 4] + p[i + 12]);
+	return (u[0] + u[2]) + (u[1] + u[3]);
+}
+
+/*
+ * A float of a kind: Gaussian, tiny, denormal, huge, zero, or of any scale
+ * from 2^-40 to 2^40 - which makes a sum's rounding depend on the order it
+ * is added in, as sums of terms of one scale often do not.
+ */
+#define RND_KINDS	6
+static float
+rnd_float(int kind)
+{
+	switch (kind % RND_KINDS)
+	{
+		case 0:
+			return (float) rnd_gauss();
+		case 1:
+			return (float) (rnd_gauss() * 1e-3);
+		case 2:
+			return (float) (rnd_gauss() * 1e-41);	/* denormal */
+		case 3:
+			return (float) (rnd_gauss() * 1e18);
+		case 4:
+			return (rnd64() & 1) ? 0.0f : -0.0f;
+		default:
+			return (float) ldexp(rnd_gauss(), (int) (rnd64() % 81) - 40);
+	}
+}
+
+/*
+ * Every kernel the build and CPU have, against a reference: plane 1's
+ * against a bit-at-a-time count; the sums against lanes_reference(), to
+ * the bit; the rotation against the portable kernel's, to the bit.  At
+ * every dimsp an index takes, from pointers at every alignment the
+ * kernels' loads could straddle.
+ */
 static void
 test_kernels(void)
 {
 	int			which;
 	int			ran = 0;
+	char		names[128] = "";
+	long		draws;
 
 	cur_phase = "kernels";
-	for (which = 0; which <= 1; which++)
+	swap_rng();
+
+	/* the 8-bit sums compute recon8[c] rather than load it: it must be exact */
+	{
+		bool		ok = true;
+		int			k;
+
+		for (k = 0; k < 256; k++)
+			ok &= (double) lionvec_recon8[k] ==
+				(double) k * (1.0 / LIONVEC_STEPS8) + (-LIONVEC_CLIP8 + 0.5 / LIONVEC_STEPS8);
+		CHECK(ok, "recon8[c] is not c / 32 - 4 + 1/64 exactly");
+	}
+
+	for (which = 0; which <= LIONVEC_KERNELS_MAX; which++)
 	{
 		int			nwords;
+		int			D;
+		bool		dot_ok = true;
+		bool		sum8_ok = true;
+		bool		l2_ok = true;
+		bool		l2_near = true;
+		bool		sum8_near = true;
+		bool		rot_ok = true;
 
 		if (!lionvec_kernel_force(which))
-			continue;
-		ran++;
-		for (nwords = 1; nwords <= 127; nwords += (nwords < 8 ? 1 : 13))
 		{
-			uint64	   *bits = (uint64 *) xmalloc(sizeof(uint64) * nwords);
-			uint64	   *planes = (uint64 *) xmalloc(sizeof(uint64) * nwords * LIONVEC_QBITS);
+			printf("vec_test: no %s kernels in this build or on this CPU\n",
+				   kernel_names[which]);
+			continue;
+		}
+		ran++;
+		snprintf(names + strlen(names), sizeof(names) - strlen(names), "%s%s",
+				 ran > 1 ? ", " : "", kernel_names[which]);
+
+		/* plane 1, at every word count an index takes, one word off alignment */
+		for (nwords = 1; nwords <= TEST_MAX_DIMSP / 64; nwords++)
+		{
+			uint64	   *bitsbuf = (uint64 *) xmalloc(sizeof(uint64) * (nwords + 1));
+			uint64	   *planesbuf = (uint64 *) xmalloc(sizeof(uint64) * (nwords * LIONVEC_QBITS + 1));
 			int			trial;
 			int			i;
-			bool		ok = true;
 
-			for (trial = 0; trial < 20; trial++)
+			for (trial = 0; trial < 4; trial++)
 			{
+				uint64	   *bits = bitsbuf + trial % 2;
+				uint64	   *planes = planesbuf + trial / 2;
+
 				for (i = 0; i < nwords; i++)
 					bits[i] = rnd64() & (trial % 3 == 0 ? rnd64() : ~UINT64CONST(0));
 				for (i = 0; i < nwords * LIONVEC_QBITS; i++)
 					planes[i] = rnd64();
-				ok &= lionvec_plane_dot(bits, planes, nwords) == naive_dot(bits, planes, nwords);
+				dot_ok &= lionvec_plane_dot(bits, planes, nwords) == naive_dot(bits, planes, nwords);
 			}
 			/* everything set: the largest sum a kernel adds up */
 			for (i = 0; i < nwords; i++)
-				bits[i] = ~UINT64CONST(0);
+				bitsbuf[i] = ~UINT64CONST(0);
 			for (i = 0; i < nwords * LIONVEC_QBITS; i++)
-				planes[i] = ~UINT64CONST(0);
-			ok &= lionvec_plane_dot(bits, planes, nwords) == (uint32) (nwords * 64 * 15);
-			CHECK(ok, which == 0 ? "portable kernel differs from the naive count" :
-				  "POPCNT kernel differs from the naive count");
-			free(bits);
-			free(planes);
+				planesbuf[i] = ~UINT64CONST(0);
+			dot_ok &= lionvec_plane_dot(bitsbuf, planesbuf, nwords) == (uint32) (nwords * 64 * 15);
+			free(bitsbuf);
+			free(planesbuf);
 		}
+
+		/* the sums and the rotation, at every dimsp */
+		for (D = 64; D <= TEST_MAX_DIMSP; D += 64)
+		{
+			int			off = (D / 64) % 32;	/* bytes off a 32-byte boundary */
+			int			foff = (D / 64) % 8;	/* floats off it */
+			uint8	   *codesbuf = (uint8 *) xmalloc(D + 31);
+			float	   *qcbuf = falloc(D + 7);
+			float	   *bbuf = falloc(D + 7);
+			double	   *terms = (double *) xmalloc(sizeof(double) * D);
+			uint8	   *codes = codesbuf + off;
+			float	   *qc = qcbuf + foff;
+			float	   *b = bbuf + (7 - foff);
+			int			kind = D / 64;
+			double		ref;
+			double		serial;
+			double		got;
+			int			i;
+
+			for (i = 0; i < D; i++)
+			{
+				codes[i] = kind % 4 == 0 ? 0 : kind % 4 == 1 ? 255 : (uint8) rnd64();
+				/* mostly of any scale; some of one kind; some mixed */
+				qc[i] = rnd_float(kind % 3 == 0 ? (int) (rnd64() % RND_KINDS) :
+								  kind % 3 == 1 ? kind : RND_KINDS - 1);
+				b[i] = rnd_float(kind % 4 == 0 ? (int) (rnd64() % RND_KINDS) :
+								 kind % 4 == 1 ? kind + 1 : RND_KINDS - 1);
+			}
+
+			for (i = 0; i < D; i++)
+				terms[i] = (double) lionvec_recon8[codes[i]] * (double) qc[i];
+			ref = lanes_reference(terms, D, &serial);
+			got = lionvec_sum8(codes, qc, D);
+			sum8_ok &= memcmp(&got, &ref, sizeof(double)) == 0;
+			sum8_near &= fabs(got - serial) <= 1e-12 * (fabs(serial) + 1e-300) ||
+				fabs(got - serial) <= 1e-9 * sqrt(dot_ff(qc, qc, D));
+
+			for (i = 0; i < D; i++)
+			{
+				double		d = (double) qc[i] - (double) b[i];
+
+				terms[i] = d * d;
+			}
+			ref = lanes_reference(terms, D, &serial);
+			got = lionvec_l2sq(qc, b, D);
+			l2_ok &= memcmp(&got, &ref, sizeof(double)) == 0;
+			l2_near &= fabs(got - serial) <= 1e-12 * serial;
+
+			/* the rotation, against the portable kernel's on the same vector */
+			{
+				LionVecRotation rot;
+				float	   *x = qcbuf + (7 - foff);
+				float	   *y = falloc(D);
+
+				make_rotation(&rot, D, (uint32) D);
+				for (i = 0; i < D; i++)
+					x[i] = (float) rnd_gauss() * (i % 5 == 0 ? 1e-30f : 1.0f);
+				memcpy(y, x, sizeof(float) * D);
+				lionvec_rotate(&rot, x);
+				lionvec_kernel_force(LIONVEC_KERNELS_PORTABLE);
+				lionvec_rotate(&rot, y);
+				lionvec_kernel_force(which);
+				rot_ok &= memcmp(x, y, sizeof(float) * D) == 0;
+				free(y);
+				free(rot.signs);
+			}
+			free(codesbuf);
+			free(qcbuf);
+			free(bbuf);
+			free(terms);
+		}
+		CHECK(dot_ok, "a plane-1 kernel differs from the naive count");
+		CHECK(sum8_ok, "an 8-bit sum differs from the lanes' sum");
+		CHECK(sum8_near, "an 8-bit sum is not near the plain sum");
+		CHECK(l2_ok, "an l2sq differs from the lanes' sum");
+		CHECK(l2_near, "an l2sq is not near the plain sum");
+		CHECK(rot_ok, "a rotation differs from the portable one");
 	}
 	CHECK(ran >= 1, "no kernel ran");
-	printf("vec_test: %d popcount kernel(s) tested\n", ran);
+	printf("vec_test: kernels tested: %s\n", names);
 	lionvec_kernels_init();
+	swap_rng();
+
+	/*
+	 * The statistical checks after this test are calibrated on the numbers
+	 * they have always drawn: pass over as many as it drew from the shared
+	 * generator before it had its own - 107 a word, for 693 words, for each
+	 * of two kernels.
+	 */
+	for (draws = 0; draws < 2 * 107 * 693; draws++)
+		(void) rnd64();
 }
 
 /* ---------- the key algebra, and the bounds' coverage ---------- */
@@ -1371,6 +1572,118 @@ test_kmeans(void)
 	free(dec);
 	free(rows);
 	free(centers);
+}
+
+/*
+ * Each set of kernels, end to end: the same query planes, estimates,
+ * candidates and k-means as the portable set's, to the bit, on clustered
+ * rows - what makes a scan or a build decide alike on any CPU.
+ */
+static void
+test_kernels_agree(void)
+{
+	int			D = 320;
+	int			T = 6;
+	int			n = 600;
+	int			k = 24;
+	float	   *rows = falloc(n * D);
+	float	   *centers = falloc(T * D);
+	float	   *mean = falloc(D);
+	float	   *cent0 = falloc(k * D);
+	float	   *cent = falloc(k * D);
+	int		   *assign0 = (int *) xmalloc(sizeof(int) * n);
+	double	   *est0 = (double *) xmalloc(sizeof(double) * 4 * n);
+	double	   *est = (double *) xmalloc(sizeof(double) * 4 * n);
+	float	   *x = falloc(D);
+	float	   *xc = falloc(D);
+	float	   *rot0 = falloc(n * D);
+	LionVecRotation rot;
+	LionVecKmeansWork w;
+	Sample		sm;
+	EncBufs		b;
+	LionVecQuery q;
+	int			which;
+	int			i;
+	int			j;
+
+	cur_phase = "kernels agree";
+	swap_rng();
+	for (i = 0; i < T * D; i++)
+		centers[i] = (float) rnd_gauss();
+	for (i = 0; i < n; i++)
+		for (j = 0; j < D; j++)
+			rows[(Size) i * D + j] = centers[(Size) (i % T) * D + j] + (float) (0.4 * rnd_gauss());
+	for (j = 0; j < D; j++)
+	{
+		double		s = 0.0;
+
+		for (i = 0; i < n; i++)
+			s += rows[(Size) i * D + j];
+		mean[j] = (float) (s / n);
+	}
+	make_rotation(&rot, D, 99);
+	enc_alloc(&b, D);
+	query_alloc(&q, D);
+	sample_make(&sm, rows, n, D);
+	kmeans_work(&w, n, k, D);
+
+	for (which = 0; which <= LIONVEC_KERNELS_MAX; which++)
+	{
+		bool		same = true;
+
+		if (!lionvec_kernel_force(which))
+			continue;
+		/* rotate, encode against the mean, estimate against row 0's query */
+		lionvec_prepare(&rot, LIONVEC_COSINE, rows, D, x);
+		lionvec_query_init(&q, LIONVEC_COSINE, mean, x, 3.0);
+		for (i = 0; i < n; i++)
+		{
+			float	   *xi = which == 0 ? rot0 + (Size) i * D : x;
+
+			lionvec_prepare(&rot, LIONVEC_COSINE, rows + (Size) i * D, D, xi);
+			if (which > 0)
+				same &= memcmp(xi, rot0 + (Size) i * D, sizeof(float) * D) == 0;
+			memcpy(xc, xi, sizeof(float) * D);
+			lionvec_encode(mean, D, xc, &b.e);
+			lionvec_estimate1(&q, b.e.bits, b.e.popcount, b.e.norm, b.e.alpha1,
+							  &est[4 * i], &est[4 * i + 1]);
+			lionvec_estimate8(&q, b.e.codes, b.e.norm, b.e.alpha8, b.e.rnorm8,
+							  &est[4 * i + 2], &est[4 * i + 3]);
+		}
+		lionvec_kmeans(&sm.s, k, 10, true, 7, mean, cent, &w);
+		if (which == 0)
+		{
+			memcpy(est0, est, sizeof(double) * 4 * n);
+			memcpy(cent0, cent, sizeof(float) * k * D);
+			memcpy(assign0, w.assign, sizeof(int) * n);
+			continue;
+		}
+		CHECK(same, "a kernel set rotates other than the portable one");
+		CHECK(memcmp(est, est0, sizeof(double) * 4 * n) == 0,
+			  "a kernel set estimates other than the portable one");
+		CHECK(memcmp(cent, cent0, sizeof(float) * k * D) == 0 &&
+			  memcmp(w.assign, assign0, sizeof(int) * n) == 0,
+			  "a kernel set's k-means differs from the portable one's");
+	}
+	lionvec_kernels_init();
+	swap_rng();
+
+	kmeans_work_free(&w);
+	sample_free(&sm);
+	query_free(&q);
+	enc_free(&b);
+	free(rot.signs);
+	free(rot0);
+	free(xc);
+	free(x);
+	free(est);
+	free(est0);
+	free(assign0);
+	free(cent);
+	free(cent0);
+	free(mean);
+	free(centers);
+	free(rows);
 }
 
 /* ---------- spill: ranking, the m nearest's candidates, SOAR ---------- */
@@ -2144,6 +2457,7 @@ main(void)
 	test_lift();
 	test_candidates();
 	test_kmeans();
+	test_kernels_agree();
 	test_rank();
 	test_candidates_n();
 	test_decode8();

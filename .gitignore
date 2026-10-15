@@ -14,6 +14,7 @@ test/unit/positions_test
 test/unit/waldelta_test
 test/unit/entry_test
 test/unit/vec_test
+test/unit/vec_test_nosimd
 __pycache__/
 *.pyc
 .deps/
