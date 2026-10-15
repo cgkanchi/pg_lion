@@ -1,11 +1,13 @@
 #!/bin/bash
 # The DBpedia benchmark (knn_dbpedia.py) end to end on this machine: fetch the
-# shards, prepare the queries and the truth, load, build the four indexes, run
-# each warm, run them cold, and write the tables.  Each step leaves a marker
-# in $BENCH_DIR/state, so a run that stops resumes where it stopped; delete a
-# marker (or the state directory) to redo a step.
-#   run.sh                 every step
-#   STEPS="warm-lionvec cold table" run.sh    just those
+# shards, prepare the queries and the truth, load, build the indexes, run each
+# warm, run them cold, and write the tables.  lionvec against VectorChord by
+# default; KINDS="lionvec vchord hnsw diskann" adds the other two.  Each step
+# leaves a marker in $BENCH_DIR/state, so a run that stops resumes where it
+# stopped; delete a marker (or the state directory) to redo a step.
+#   run.sh                              every step
+#   STEPS="warm cold table" run.sh      just those (of fetch prepare load
+#                                       build warm cold table)
 # Results: bench/results/<date>-dbpedia-local-<rows>/ in this checkout.
 set -euo pipefail
 . "$(dirname "$0")/env.sh"
@@ -20,7 +22,10 @@ if [ -s "$STATE/out" ]; then OUT=$(cat "$STATE/out"); else
 	OUT=$REPO/bench/results/$(date -u +%F)-dbpedia-local-$(( ROWS / 1000 ))k
 	echo "$OUT" > "$STATE/out"
 fi
-LISTS=${LISTS:-$("$PY" -c "print(round($ROWS ** 0.5))")}   # VectorChord's lists: sqrt(n), as 339 at 115k
+# VectorChord's lists: sqrt(n), 1,000 at 1M (339 at 115k, the better of the
+# two counts tried there); LISTS=4000 run.sh STEPS="build warm cold table"
+# afterwards adds another count (the build replaces the index)
+LISTS=${LISTS:-$("$PY" -c "print(round($ROWS ** 0.5))")}
 
 export KNN_DSN="dbname=dbpedia" KNN_ADMIN_DSN="dbname=postgres"
 export KNN_CACHE=$BENCH_DIR/cache KNN_OUT=$OUT KNN_SRC=$REPO
@@ -33,10 +38,11 @@ export KNN_DROP=${KNN_DROP:-"sudo -n /usr/local/sbin/lionbench-drop-caches"}
 export KNN_COLD_FROM=$OUT
 # wider sweeps than at 115k, since a million rows need more for a recall
 export KNN_MARGINS=${KNN_MARGINS:-2,3,4,6,8,12,16,24,32}
-export KNN_EF=${KNN_EF:-20,40,70,100,200,400,800}
 export KNN_PROBES=${KNN_PROBES:-10,20,40,80,160,320,640}
+export KNN_EF=${KNN_EF:-20,40,70,100,200,400,800}
 
-STEPS=${STEPS:-"fetch prepare load lionvec hnsw vchord diskann warm-lionvec warm-hnsw warm-vchord warm-diskann cold table"}
+STEPS=${STEPS:-"fetch prepare load build warm cold table"}
+read -r -a KINDS <<< "${KINDS:-lionvec vchord}"
 
 has_ext() {   # is the extension installed?
 	[ -n "$(psql -XAtq -d postgres -c "SELECT 1 FROM pg_available_extensions WHERE name = '$1'")" ]
@@ -74,29 +80,41 @@ machine() {
 
 "$LOCAL/pg.sh" status >/dev/null 2>&1 || "$LOCAL/pg.sh" start
 machine
-KINDS=(lionvec hnsw)
-has_ext vchord && KINDS+=(vchord) || echo "VectorChord is not installed: its steps are skipped"
-has_ext vectorscale && KINDS+=(diskann) || echo "pgvectorscale is not installed: diskann's steps are skipped"
+for k in "${KINDS[@]}"; do
+	case $k in
+	  lionvec | hnsw) ;;
+	  vchord)  has_ext vchord || { echo "VectorChord is not installed: run setup.sh"; exit 1; } ;;
+	  diskann) has_ext vectorscale || { echo "pgvectorscale is not installed: WITH_DISKANN=1 setup.sh"; exit 1; } ;;
+	  *) echo "unknown kind $k (lionvec, vchord, hnsw, diskann)"; exit 1 ;;
+	esac
+done
 want() { [[ " $STEPS " == *" $1 "* ]]; }
-kind_ok() { [[ " ${KINDS[*]} " == *" $1 "* ]]; }
+# a warm run's result file: VectorChord's carries its list count, so that a
+# second run with another LISTS lands beside the first
+name() { [ "$1" = vchord ] && echo "vchord-l$LISTS" || echo "$1"; }
 
 want fetch   && step fetch "$PY" "$LOCAL/fetch.py" "$BENCH_DIR/shards" "$NSHARDS"
 want prepare && step prepare $KNN prepare
 want load    && step load $KNN load
-want lionvec && step lionvec $KNN lionvec 0
-want hnsw    && step hnsw $KNN hnsw
-want vchord  && kind_ok vchord && step vchord $KNN vchord "$LISTS"
-want diskann && kind_ok diskann && step diskann $KNN diskann
-for k in "${KINDS[@]}"; do
-	want "warm-$k" && step "warm-$k" $KNN warm "$k" "$k"
-done
+if want build; then
+	for k in "${KINDS[@]}"; do
+		case $k in
+		  lionvec) step build-lionvec $KNN lionvec 0 ;;
+		  vchord)  step "build-vchord-l$LISTS" $KNN vchord "$LISTS" ;;
+		  *)       step "build-$k" $KNN "$k" ;;
+		esac
+	done
+fi
+if want warm; then
+	for k in "${KINDS[@]}"; do step "warm-$(name "$k")" $KNN warm "$k" "$(name "$k")"; done
+fi
 if want cold; then
 	sh -c "$KNN_DROP" || { echo "cannot drop the page cache ($KNN_DROP): run setup.sh"; exit 1; }
 	export KNN_COLD_KINDS=$(IFS=,; echo "${KINDS[*]}")
 	step cold $KNN cold cold
 fi
 if want table; then
-	files=(); for k in "${KINDS[@]}"; do [ -e "$OUT/$k.json" ] && files+=("$OUT/$k.json"); done
+	files=(); for f in "$OUT"/*.json; do [ "$(basename "$f")" != cold.json ] && files+=("$f"); done
 	( cd "$REPO" && $KNN table "${files[@]}" ) > "$OUT/tables.md"
 	[ -e "$OUT/cold.json" ] && "$PY" - "$OUT/cold.json" >> "$OUT/tables.md" <<'PY'
 import json, sys
