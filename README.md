@@ -20,8 +20,8 @@ bitmap. Many queries can then be answered by combining bitmaps instead of visiti
   ranking;
 - jsonb containment, key existence and jsonpath (`doc @> ...`, `doc ? ...`, `doc @@ ...`).
 
-`pg_lion_vector` adds `lionvec`, a nearest-neighbour index for pgvector's `vector` that reads a few
-percent of itself a query and fills its `LIMIT` under any lion filter (see
+`pg_lion_vector` adds `lionvec`, a nearest-neighbour index for pgvector's `vector` and `halfvec`
+that reads a few percent of itself a query and fills its `LIMIT` under any lion filter (see
 [Nearest neighbours](#nearest-neighbours)).
 
 On a vacuumed table these counts never touch the heap, so they can be one or two orders of magnitude
@@ -196,7 +196,7 @@ BM25 (`k1 = 1.2`, `b = 0.75`, both adjustable).
 
 ### Nearest neighbours
 
-With [pgvector](https://github.com/pgvector/pgvector) installed:
+With [pgvector](https://github.com/pgvector/pgvector) 0.7 or later installed:
 
 ```sql
 CREATE EXTENSION pg_lion_vector;
@@ -205,6 +205,10 @@ CREATE EXTENSION pg_lion_vector;
 ALTER FUNCTION l2_distance(vector, vector) COST 100;
 ALTER FUNCTION vector_negative_inner_product(vector, vector) COST 100;
 ALTER FUNCTION cosine_distance(vector, vector) COST 100;
+-- and halfvec's, if you index halfvec columns
+ALTER FUNCTION l2_distance(halfvec, halfvec) COST 100;
+ALTER FUNCTION halfvec_negative_inner_product(halfvec, halfvec) COST 100;
+ALTER FUNCTION cosine_distance(halfvec, halfvec) COST 100;
 
 CREATE INDEX items_embedding ON items USING lionvec (embedding vector_cosine_ops);
 CREATE INDEX items_category  ON items USING lion (category);
@@ -231,7 +235,8 @@ reads only the partitions it needs, it holds up when memory is short: with Postg
 1 GB, 19 ms and 100 pages read from disk a query, where HNSW took 51 ms and 767 pages (and 691 ms
 and 9,229 pages under the 1% filter, where lionvec read none).
 `vector_l2_ops` (`<->`, the default), `vector_ip_ops` (`<#>`) and `vector_cosine_ops` (`<=>`) are
-supported, up to 8128 dimensions. See
+supported, and for a `halfvec` column `halfvec_l2_ops` (the default), `halfvec_ip_ops` and
+`halfvec_cosine_ops`, up to 8128 dimensions. See
 [BENCHMARKS.md](docs/BENCHMARKS.md#nearest-neighbours-lionvec-against-hnsw).
 
 ## Supported types
@@ -240,7 +245,7 @@ Integers, floats, `numeric`, `bool`, `text`/`varchar`, `char(n)`, `bytea`, `uuid
 timestamps, `interval`, `inet`, `macaddr`, `jsonb` (whole values, or paths with
 `jsonb_contains_ops`), `pg_lsn`, `oid`, enums, any array, and `tsvector`. Install `pg_lion_citext` for case-insensitive `citext`. Indexes can have several
 columns and can be built in parallel on PostgreSQL 17 and later. `pg_lion_vector` indexes pgvector's
-`vector` with `lionvec` (one column, built serially).
+`vector` and `halfvec` with `lionvec` (one column, built serially).
 
 ## Limitations
 

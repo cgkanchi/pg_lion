@@ -369,8 +369,11 @@ index-only mode off.
 
 `CREATE EXTENSION pg_lion_vector` (with pgvector installed) adds `lionvec`, an index that answers
 `ORDER BY embedding <op> $1 LIMIT k` for pgvector's `vector`, with `vector_l2_ops` (`<->`, the
-default), `vector_ip_ops` (`<#>`) or `vector_cosine_ops` (`<=>`), and that a Lion filter restricts
-(DESIGN.md §44):
+default), `vector_ip_ops` (`<#>`) or `vector_cosine_ops` (`<=>`), and for its `halfvec`, with
+`halfvec_l2_ops` (the default), `halfvec_ip_ops` or `halfvec_cosine_ops`, and that a Lion filter
+restricts (DESIGN.md §44). A `halfvec` column's index is the same as a `vector` column's - its
+halves are read as floats and coded as a vector's - so it is no smaller, while the column itself,
+and what an exact distance reads of it from the table, takes half the space.
 
 ```sql
 CREATE EXTENSION pg_lion_vector;
@@ -379,6 +382,10 @@ CREATE EXTENSION pg_lion_vector;
 ALTER FUNCTION l2_distance(vector, vector) COST 100;
 ALTER FUNCTION vector_negative_inner_product(vector, vector) COST 100;
 ALTER FUNCTION cosine_distance(vector, vector) COST 100;
+-- and halfvec's, if you index halfvec columns
+ALTER FUNCTION l2_distance(halfvec, halfvec) COST 100;
+ALTER FUNCTION halfvec_negative_inner_product(halfvec, halfvec) COST 100;
+ALTER FUNCTION cosine_distance(halfvec, halfvec) COST 100;
 
 CREATE INDEX items_emb ON items USING lionvec (embedding vector_cosine_ops);
 CREATE INDEX items_cat ON items USING lion (category);

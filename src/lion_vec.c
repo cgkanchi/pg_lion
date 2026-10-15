@@ -1,9 +1,10 @@
 /*-------------------------------------------------------------------------
  *
  * lion_vec.c
- *		lionvec, the nearest-neighbour index of pgvector's `vector`: its
- *		handler, settings, pages, build, inserts, VACUUM and costs.  The scan
- *		is lion_vec_scan.c, the arithmetic lion_vec_math.c (DESIGN.md §44).
+ *		lionvec, the nearest-neighbour index of pgvector's `vector` and
+ *		`halfvec`: its handler, settings, pages, build, inserts, VACUUM and
+ *		costs.  The scan is lion_vec_scan.c, the arithmetic lion_vec_math.c
+ *		(DESIGN.md §44).
  *
  * The index is chains of pages under a meta page:
  *
@@ -47,7 +48,7 @@
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator_d.h"
-#include "catalog/pg_type_d.h"
+#include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/vacuum.h"
 #include "common/pg_prng.h"
@@ -93,19 +94,6 @@ typedef struct LionVecOptions
 	int			partitions;		/* 0: by the rows' count (lionvec_partitions()) */
 	bool		spill;			/* a copy of each row in a second partition */
 } LionVecOptions;
-
-/*
- * pgvector's `vector`, as it lays it out: a varlena of a 16-bit dimension
- * count, 16 unused bits and the floats.  pg_lion reads it here rather than
- * linking pgvector, so that pg_lion itself loads without pgvector.
- */
-typedef struct LionVecPgVector
-{
-	int32		vl_len_;
-	int16		dim;
-	int16		unused;
-	float		x[FLEXIBLE_ARRAY_MEMBER];
-} LionVecPgVector;
 
 StaticAssertDecl(LIONVEC_CODE_HDRSZ == 32,
 				 "lionvec: the CODE item header is four words");
@@ -214,25 +202,64 @@ lion_vec_relation(Relation index)
  */
 
 /*
- * The floats of a `vector` datum and their count; *tofree is the detoasted
- * copy to pfree, or NULL.
+ * Whether the index's column is pgvector's `halfvec` rather than its
+ * `vector` (DESIGN.md §44.1): by the name of its operator class's input
+ * type, as pg_lion knows neither type's OID.  The query an index's scan is
+ * given is of that type too, as both sides of its operator are.
+ */
+static bool
+lionvec_index_half(Relation index)
+{
+	Oid			type = index->rd_opcintype[0];
+	HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
+	bool		half;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for type %u", type);
+	half = strcmp(NameStr(((Form_pg_type) GETSTRUCT(tup))->typname), "halfvec") == 0;
+	ReleaseSysCache(tup);
+	return half;
+}
+
+/*
+ * The floats of a `vector` datum, or of a `halfvec` one if half, and their
+ * count.  A vector's are its own, and *tofree is the detoasted copy to
+ * pfree, or NULL.  A halfvec's are converted into buf, if it holds bufdim
+ * floats and they fit, or else into an array palloc'd here, which *tofree
+ * is then; its detoasted copy is freed here.  Either way the caller pfrees
+ * *tofree, if not NULL, when done with the floats.
  */
 const float *
-lionvec_datum_floats(Datum d, int *dim, Pointer *tofree)
+lionvec_datum_floats(Datum d, bool half, float *buf, int bufdim, int *dim,
+					 Pointer *tofree)
 {
 	struct varlena *raw = (struct varlena *) DatumGetPointer(d);
 	struct varlena *v = pg_detoast_datum(raw);
-	LionVecPgVector *vec = (LionVecPgVector *) v;
 	Size		len = VARSIZE(v);
+	int			n = lionvec_datum_dim(v, len, half);
 
-	*tofree = v != raw ? (Pointer) v : NULL;
-	if (len < offsetof(LionVecPgVector, x) || vec->dim < 0 ||
-		len < offsetof(LionVecPgVector, x) + sizeof(float) * (Size) vec->dim)
+	if (n < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("lionvec was given a malformed vector of %zu bytes", len)));
-	*dim = vec->dim;
-	return vec->x;
+				 errmsg("lionvec was given a malformed %s of %zu bytes",
+						lionvec_type_name(half), len)));
+	*dim = n;
+	if (!half)
+	{
+		*tofree = v != raw ? (Pointer) v : NULL;
+		return ((LionVecPgVector *) v)->x;
+	}
+
+	*tofree = NULL;
+	if (buf == NULL || n > bufdim)
+	{
+		buf = palloc(sizeof(float) * Max(n, 1));
+		*tofree = (Pointer) buf;
+	}
+	lionvec_halves(((LionVecPgHalfVector *) v)->x, n, buf);
+	if (v != raw)
+		pfree(v);
+	return buf;
 }
 
 /* pgvector's own error, so a query reads the same with or without the index */
@@ -246,12 +273,13 @@ lionvec_check_dims(const LionVecInfo *info, int dim)
 }
 
 static void
-lionvec_check_max_dims(int dims)
+lionvec_check_max_dims(int dims, bool half)
 {
 	if (dims < 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
-				 errmsg("vector must have at least 1 dimension")));
+				 errmsg("%s must have at least 1 dimension",
+						lionvec_type_name(half))));
 	if (dims > LIONVEC_MAX_DIM)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -565,11 +593,12 @@ lionvec_read_mean(Relation index, BlockNumber blk, float *mean, int dimsp)
 }
 
 /*
- * The rotation and mean of the index, as a palloc'd copy the caller owns.
- * The backend keeps one in rd_amcache, made again when the meta page says
- * something else; a copy is returned rather than that one because a relcache
- * invalidation, which can arrive whenever a lock is taken (a TOAST fetch's
- * included), frees it.
+ * The rotation and mean of the index, and its column's type, as a palloc'd
+ * copy the caller owns.  The backend keeps one in rd_amcache, made again
+ * when the meta page says something else; a copy is returned rather than
+ * that one because a relcache invalidation, which can arrive whenever a lock
+ * is taken (a TOAST fetch's included), frees it.  The type is looked up
+ * while rd_amcache is empty, for the lookup may take a lock.
  */
 LionVecInfo *
 lionvec_get_info(Relation index)
@@ -583,14 +612,18 @@ lionvec_get_info(Relation index)
 	if (cached == NULL || cached->dims != meta.dims ||
 		cached->metric != meta.metric || cached->seed != meta.seed)
 	{
+		bool		half;
+
 		if (cached != NULL)
 		{
 			index->rd_amcache = NULL;
 			pfree(cached);
 		}
+		half = lionvec_index_half(index);
 		size = lionvec_info_size(meta.dimsp);
 		cached = MemoryContextAllocZero(index->rd_indexcxt, size);
 		cached->metric = meta.metric;
+		cached->half = half;
 		cached->dims = meta.dims;
 		cached->dimsp = meta.dimsp;
 		cached->seed = meta.seed;
@@ -618,13 +651,13 @@ lionvec_get_info(Relation index)
  * it (§44.2): under the meta page's lock, so that two first inserts agree.
  */
 static void
-lionvec_set_dims(Relation index, int dims)
+lionvec_set_dims(Relation index, int dims, bool half)
 {
 	Buffer		buf;
 	Page		page;
 	LionVecMeta meta;
 
-	lionvec_check_max_dims(dims);
+	lionvec_check_max_dims(dims, half);
 	buf = ReadBuffer(index, LIONVEC_METAPAGE);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	page = BufferGetPage(buf);
@@ -654,14 +687,20 @@ typedef struct LionVecItems
 	LionVecRefine *ref;			/* LIONVEC_REFINE_SIZE(dimsp) bytes */
 	bool		hasref;
 	float	   *x;				/* [dimsp] */
+	float	   *h;				/* [hdim]: a halfvec's floats, or NULL */
+	int			hdim;
 } LionVecItems;
 
 static void
-lionvec_items_alloc(LionVecItems *it, int dimsp)
+lionvec_items_alloc(LionVecItems *it, const LionVecInfo *info)
 {
+	int			dimsp = info->dimsp;
+
 	it->code = palloc0(LIONVEC_CODE_SIZE(Max(dimsp, 64)));
 	it->ref = palloc0(LIONVEC_REFINE_SIZE(Max(dimsp, 64)));
 	it->x = palloc(sizeof(float) * Max(dimsp, 64));
+	it->hdim = info->half ? info->dims : 0;
+	it->h = it->hdim > 0 ? palloc(sizeof(float) * it->hdim) : NULL;
 }
 
 /*
@@ -691,7 +730,8 @@ lionvec_items_fill(const LionVecInfo *info, LionVecItems *it, ItemPointer tid,
 	{
 		Pointer		tofree;
 		int			dim;
-		const float *v = lionvec_datum_floats(value, &dim, &tofree);
+		const float *v = lionvec_datum_floats(value, info->half, it->h,
+											  it->hdim, &dim, &tofree);
 		bool		nonzero;
 
 		lionvec_check_dims(info, dim);
@@ -782,8 +822,10 @@ typedef struct LionVecBuildState
 {
 	Relation	index;
 	int			metric;
+	bool		half;			/* the column is a halfvec */
 	int			dims;
 	/* the first pass: the mean, and a sample (lionvec_build_sample()) */
+	float	   *hbuf;			/* [dims]: a halfvec row's floats */
 	double	   *sum;			/* [dims] */
 	double		nsum;			/* rows with a vector (cosine: a nonzero one) */
 	LionVecRotation srot;
@@ -908,11 +950,14 @@ lionvec_build_mean_callback(Relation index, ItemPointer tid, Datum *values,
 	if (isnull[0])
 		return;
 	old = MemoryContextSwitchTo(bs->tmpcxt);
-	v = lionvec_datum_floats(values[0], &dim, &tofree);
+	v = lionvec_datum_floats(values[0], bs->half, bs->hbuf,
+							 bs->hbuf != NULL ? bs->dims : 0, &dim, &tofree);
 	if (bs->dims == 0)
 	{
-		lionvec_check_max_dims(dim);
+		lionvec_check_max_dims(dim, bs->half);
 		bs->dims = dim;
+		if (bs->half)
+			bs->hbuf = MemoryContextAlloc(bs->buildcxt, sizeof(float) * dim);
 	}
 	if (dim != bs->dims)
 		ereport(ERROR,
@@ -1448,13 +1493,13 @@ lionvec_build_write_parts(LionVecBuildState *bs, const BlockNumber *heads,
 
 /* The dimensions the column's type modifier fixes, or 0. */
 static int
-lionvec_typmod_dims(Relation index)
+lionvec_typmod_dims(Relation index, bool half)
 {
 	int32		typmod = TupleDescAttr(RelationGetDescr(index), 0)->atttypmod;
 
 	if (typmod > 0)
 	{
-		lionvec_check_max_dims(typmod);
+		lionvec_check_max_dims(typmod, half);
 		return typmod;
 	}
 	return 0;
@@ -1478,7 +1523,10 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	memset(&bs, 0, sizeof(bs));
 	bs.index = index;
 	bs.metric = lionvec_index_metric(index);
-	bs.dims = lionvec_typmod_dims(index);
+	bs.half = lionvec_index_half(index);
+	bs.dims = lionvec_typmod_dims(index, bs.half);
+	if (bs.half && bs.dims > 0)
+		bs.hbuf = palloc(sizeof(float) * bs.dims);
 	bs.rbuf = InvalidBuffer;
 	bs.refine_tail = InvalidBlockNumber;
 	bs.buildcxt = CurrentMemoryContext;
@@ -1509,6 +1557,7 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 		bs.info = palloc0(size);
 		bs.info->metric = bs.metric;
+		bs.info->half = bs.half;
 		bs.info->dims = bs.dims;
 		bs.info->dimsp = dimsp;
 		bs.info->seed = LIONVEC_SEED;
@@ -1566,7 +1615,7 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 									   TUPLESORT_NONE);
 		bs.sortitem = palloc(VARHDRSZ + LIONVEC_CODE_SIZE(Max(bs.info->dimsp, 64)));
 	}
-	lionvec_items_alloc(&bs.items, bs.info->dimsp);
+	lionvec_items_alloc(&bs.items, bs.info);
 	reltuples = table_index_build_scan(heap, index, indexInfo, false, true,
 									   lionvec_build_callback, &bs, NULL);
 	if (BufferIsValid(bs.rbuf))
@@ -1630,7 +1679,7 @@ static void
 lionvecbuildempty(Relation index)
 {
 	int			metric = lionvec_index_metric(index);
-	int			dims = lionvec_typmod_dims(index);
+	int			dims = lionvec_typmod_dims(index, lionvec_index_half(index));
 	Buffer		metabuf;
 	Buffer		rest;
 	Buffer		nulls;
@@ -2097,12 +2146,13 @@ lionvecinsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		Pointer		tofree;
 		int			dim;
 
-		(void) lionvec_datum_floats(values[0], &dim, &tofree);
-		lionvec_set_dims(index, dim);
+		(void) lionvec_datum_floats(values[0], info->half, NULL, 0, &dim,
+									&tofree);
+		lionvec_set_dims(index, dim, info->half);
 		info = lionvec_get_info(index);
 	}
 
-	lionvec_items_alloc(&it, info->dimsp);
+	lionvec_items_alloc(&it, info);
 	lionvec_items_fill(info, &it, ht_ctid, values[0], isnull[0]);
 
 	/* a serializable reader holds the index's relation lock (§44.5) */

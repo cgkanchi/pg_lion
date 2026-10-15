@@ -29,8 +29,10 @@
 
 /*
  * x86-64 GCC and clang build POPCNT and AVX2 kernels beside the portable
- * ones, as lion_container.c does (§3), and, from GCC 8 and clang 8, which
- * know VPOPCNTDQ, plane 1's with it ("Kernels" below).
+ * ones, as lion_container.c does (§3); from GCC 8 and clang 8, which know
+ * VPOPCNTDQ, plane 1's with it; and from GCC 11 and clang 18, whose
+ * __builtin_cpu_supports() knows F16C, the halves' with it ("Kernels"
+ * below).
  */
 #if !defined(LION_NO_SIMD) && defined(__x86_64__) && \
 	((defined(__clang__) && __clang_major__ >= 6) || \
@@ -41,6 +43,10 @@
 #if (defined(__clang__) && __clang_major__ >= 8) || \
 	(!defined(__clang__) && __GNUC__ >= 8)
 #define LIONVEC_HAVE_AVX512 1
+#endif
+#if (defined(__clang__) && __clang_major__ >= 18) || \
+	(!defined(__clang__) && __GNUC__ >= 11)
+#define LIONVEC_HAVE_F16C 1
 #endif
 #endif
 
@@ -92,6 +98,26 @@ lionvec_code8(float z)
 	if (t >= 255.0f)
 		return 255;
 	return (uint8) t;
+}
+
+/* ----------------------------------------------------------------
+ * pgvector's datums
+ * ----------------------------------------------------------------
+ */
+
+int
+lionvec_datum_dim(const void *p, Size len, bool half)
+{
+	const LionVecPgVector *vec = (const LionVecPgVector *) p;
+	Size		elem = half ? sizeof(uint16) : sizeof(float);
+
+	StaticAssertStmt(offsetof(LionVecPgVector, x) ==
+					 offsetof(LionVecPgHalfVector, x),
+					 "a vector's header is a halfvec's");
+	if (len < offsetof(LionVecPgVector, x) || vec->dim < 0 ||
+		len < offsetof(LionVecPgVector, x) + elem * (Size) vec->dim)
+		return -1;
+	return vec->dim;
 }
 
 /* ----------------------------------------------------------------
@@ -415,8 +441,9 @@ lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
  * planes, for every centroid of every query and every row a probe reads,
  * and, in k-means, every centroid for every sample row in every iteration;
  * the 8-bit codes' sum, for every centroid and row a scan refines; the
- * exact distances of k-means' candidates; and the rotation, once a query
- * and twice a row built.  Each has a portable kernel and, on x86-64, ones
+ * exact distances of k-means' candidates; and the rotation and, of a
+ * halfvec, the conversion of its halves to floats, each once a query and
+ * twice a row built.  Each has a portable kernel and, on x86-64, ones
  * compiled with __attribute__((target)) for what the CPU has, so that the
  * extension builds with the default -march and runs on any x86-64:
  *
@@ -425,7 +452,9 @@ lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
  *	AVX2	plane 1 32 bytes at a time, the row's word against its four
  *			planes, each byte's popcount looked up a nibble at a time with
  *			VPSHUFB (Mula, as lion_container.c counts); the sums and the
- *			rotation four doubles or eight floats at a time
+ *			rotation four doubles or eight floats at a time; and, where the
+ *			CPU has F16C as well, which AVX2 does not imply, the halves
+ *			eight at a time with VCVTPH2PS
  *	AVX-512	AVX2's, but plane 1 counted with VPOPCNTDQ, a word's four
  *			planes in one instruction
  *
@@ -450,7 +479,10 @@ lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
  * multiply-adds - the portable kernels built for aarch64 or x86-64-v3 -
  * and l2sq's terms, unlike the 8-bit codes', are not exact.  The
  * rotation's butterflies are the portable ones' additions and subtractions,
- * of the same operands, in the same order for each coordinate.
+ * of the same operands, in the same order for each coordinate.  The halves'
+ * conversion is exact, every half being a float, and VCVTPH2PS makes a NaN
+ * the quiet NaN of its payload, as the portable kernel does, whatever
+ * MXCSR's DAZ and FTZ say.
  * ----------------------------------------------------------------
  */
 
@@ -568,6 +600,47 @@ lionvec_l2sq_portable(const float *a, const float *b, int dimsp)
 		}
 	}
 	return lionvec_lanes_sum(p);
+}
+
+/*
+ * The float of the half h, exactly, from its bits alone, so that no mode of
+ * the FPU can change it: a normal's exponent rebiased from 15 to 127; a
+ * subnormal, m 2^-24, normalized - m's leading bit, at bit lead, shifted to
+ * bit 23, where adding it carries into the exponent, of lead - 24; a zero
+ * signed; and infinity, or a NaN made quiet with its payload kept, at the
+ * float's exponent of all ones.
+ */
+static inline float
+lionvec_half_float(uint16 h)
+{
+	uint32		em = h & 0x7fff;	/* the exponent and mantissa */
+	uint32		bits;
+	float		f;
+
+	if (em >= 0x7c00)
+		bits = 0x7f800000 | ((em & 0x3ff) << 13) | (em > 0x7c00 ? 0x00400000 : 0);
+	else if (em >= 0x0400)
+		bits = (em << 13) + ((uint32) (127 - 15) << 23);
+	else if (em != 0)
+	{
+		int			lead = pg_leftmost_one_pos32(em);	/* 0 .. 9 */
+
+		bits = ((uint32) (lead - 24 + 127 - 1) << 23) + (em << (23 - lead));
+	}
+	else
+		bits = 0;
+	bits |= (uint32) (h & 0x8000) << 16;
+	memcpy(&f, &bits, sizeof(f));
+	return f;
+}
+
+static void
+lionvec_halves_portable(const uint16 *h, int n, float *x)
+{
+	int			i;
+
+	for (i = 0; i < n; i++)
+		x[i] = lionvec_half_float(h[i]);
 }
 
 #ifdef LIONVEC_HAVE_X86
@@ -787,6 +860,31 @@ lionvec_rotate_avx2(const LionVecRotation *rot, float *x)
 	}
 }
 
+#ifdef LIONVEC_HAVE_F16C
+
+/* ---------- F16C ---------- */
+
+/* The halves eight at a time, the last n % 8 from a vector padded with zeros. */
+static LIONVEC_TARGET("avx2,f16c") void
+lionvec_halves_f16c(const uint16 *h, int n, float *x)
+{
+	int			i;
+
+	for (i = 0; i + 8 <= n; i += 8)
+		_mm256_storeu_ps(x + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (h + i))));
+	if (i < n)
+	{
+		uint16		last[8] = {0};
+		float		out[8];
+
+		memcpy(last, h + i, sizeof(uint16) * (n - i));
+		_mm256_storeu_ps(out, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) last)));
+		memcpy(x + i, out, sizeof(float) * (n - i));
+	}
+}
+
+#endif							/* LIONVEC_HAVE_F16C */
+
 #ifdef LIONVEC_HAVE_AVX512
 
 /* ---------- AVX-512 ---------- */
@@ -816,14 +914,20 @@ lionvec_dot_avx512(const uint64 *bits, const uint64 *planes, int nwords)
 LionVecDotKernel lionvec_plane_dot = lionvec_dot_portable;
 LionVecSum8Kernel lionvec_sum8 = lionvec_sum8_portable;
 LionVecL2Kernel lionvec_l2sq = lionvec_l2sq_portable;
+LionVecHalfKernel lionvec_halves = lionvec_halves_portable;
 
-/* Use the set which, if the build has it and the CPU runs it. */
+/*
+ * Use the set which, if the build has it and the CPU runs it.  The AVX2
+ * and AVX-512 sets convert halves with F16C where the CPU has that too, and
+ * portably where it does not.
+ */
 static bool
 lionvec_kernels_set(int which)
 {
 	LionVecDotKernel dot = lionvec_dot_portable;
 	LionVecSum8Kernel sum8 = lionvec_sum8_portable;
 	LionVecL2Kernel l2sq = lionvec_l2sq_portable;
+	LionVecHalfKernel halves = lionvec_halves_portable;
 	void		(*rotate) (const LionVecRotation *rot, float *x) = lionvec_rotate_portable;
 
 	switch (which)
@@ -843,6 +947,10 @@ lionvec_kernels_set(int which)
 			sum8 = lionvec_sum8_avx2;
 			l2sq = lionvec_l2sq_avx2;
 			rotate = lionvec_rotate_avx2;
+#ifdef LIONVEC_HAVE_F16C
+			if (__builtin_cpu_supports("f16c"))
+				halves = lionvec_halves_f16c;
+#endif
 			break;
 #ifdef LIONVEC_HAVE_AVX512
 		case LIONVEC_KERNELS_AVX512:
@@ -855,6 +963,10 @@ lionvec_kernels_set(int which)
 			sum8 = lionvec_sum8_avx2;
 			l2sq = lionvec_l2sq_avx2;
 			rotate = lionvec_rotate_avx2;
+#ifdef LIONVEC_HAVE_F16C
+			if (__builtin_cpu_supports("f16c"))
+				halves = lionvec_halves_f16c;
+#endif
 			break;
 #endif
 #endif
@@ -864,6 +976,7 @@ lionvec_kernels_set(int which)
 	lionvec_plane_dot = dot;
 	lionvec_sum8 = sum8;
 	lionvec_l2sq = l2sq;
+	lionvec_halves = halves;
 	lionvec_rotate_kernel = rotate;
 	return true;
 }
@@ -894,6 +1007,12 @@ lionvec_kernel_force(int which)
 	__builtin_cpu_init();
 #endif
 	return lionvec_kernels_set(which);
+}
+
+bool
+lionvec_kernel_f16c(void)
+{
+	return lionvec_halves != lionvec_halves_portable;
 }
 #endif
 
