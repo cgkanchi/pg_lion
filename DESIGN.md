@@ -20195,7 +20195,11 @@ bits - the exponent rebiased, a subnormal normalized at its leading one, infinit
 NaN made the quiet NaN of its payload - without a loop or a table, and F16C's VCVTPH2PS converts
 eight halves at a time to the same bits. The errors name the type: `different halfvec dimensions
 3 and 2`, and pgvector's `expected 3 dimensions, not 4` and `halfvec must have at least 1
-dimension`.
+dimension`. Measured on DBpedia (bench/results/2026-10-15-dbpedia-pg18/, "halfvec"): a halfvec
+column's index probes the same partitions, reads the same pages and returns the same recall as the
+`vector` column's; the exact path is 13 to 26% faster warm (4.6 against 5.5 us a member, half the
+TOAST chunks) and reads 9% fewer pages cold, not half, because a 3 KB halfvec still takes a TOAST
+page of its own for each of the scattered rows a narrow filter admits.
 
 A column's dimensions come from its type modifier, or, for a type without one, from the first
 vector the build or an insert meets (`lionvec_set_dims()`, under the meta page's lock, so that two
