@@ -1,0 +1,106 @@
+[
+ {
+  "name": "lionvec margin=2",
+  "sql": "SELECT id FROM items  ORDER BY embedding <=> %(q)s::vector L",
+  "settings": [
+   "SET pg_lion.vector_margin = 2"
+  ],
+  "cache_dropped": true,
+  "median_ms": 197.18986899988522,
+  "max_ms": 662.414166000417,
+  "all_ms": [
+   30.3,
+   335.6,
+   662.4,
+   197.2,
+   72.5
+  ]
+ },
+ {
+  "name": "hnsw ef=40",
+  "sql": "SELECT id FROM items  ORDER BY embedding::halfvec(1536) <=> ",
+  "settings": [
+   "SET hnsw.ef_search = 40"
+  ],
+  "cache_dropped": true,
+  "median_ms": 103.5870559999239,
+  "max_ms": 144.2695839996304,
+  "all_ms": [
+   66.3,
+   115.6,
+   144.3,
+   103.6,
+   88.3
+  ]
+ },
+ {
+  "name": "lionvec margin=2",
+  "sql": "SELECT id FROM items WHERE u < 0.01 ORDER BY embedding <=> %",
+  "settings": [
+   "SET pg_lion.vector_margin = 2"
+  ],
+  "cache_dropped": true,
+  "median_ms": 234.11340600068797,
+  "max_ms": 585.7423130000825,
+  "all_ms": [
+   215.3,
+   306.0,
+   585.7,
+   234.1,
+   168.7
+  ]
+ },
+ {
+  "name": "hnsw ef=40 iterative",
+  "sql": "SELECT id FROM items WHERE u < 0.01 ORDER BY embedding::half",
+  "settings": [
+   "SET hnsw.ef_search = 40",
+   "SET hnsw.iterative_scan = relaxed_order"
+  ],
+  "cache_dropped": true,
+  "median_ms": 1257.7752629995302,
+  "max_ms": 1907.2692099998676,
+  "all_ms": [
+   1012.7,
+   1257.8,
+   1907.3,
+   1298.2,
+   1111.6
+  ]
+ },
+ {
+  "name": "lionvec margin=2",
+  "sql": "SELECT id FROM items WHERE u < 0.001 ORDER BY embedding <=> ",
+  "settings": [
+   "SET pg_lion.vector_margin = 2"
+  ],
+  "cache_dropped": true,
+  "median_ms": 236.27831099929608,
+  "max_ms": 249.78794399976323,
+  "all_ms": [
+   201.4,
+   246.1,
+   249.8,
+   193.4,
+   236.3
+  ]
+ },
+ {
+  "name": "hnsw ef=40 iterative",
+  "sql": "SELECT id FROM items WHERE u < 0.001 ORDER BY embedding::hal",
+  "settings": [
+   "SET hnsw.ef_search = 40",
+   "SET hnsw.iterative_scan = relaxed_order"
+  ],
+  "cache_dropped": true,
+  "median_ms": 221.52858299978107,
+  "max_ms": 229.60916399915732,
+  "all_ms": [
+   205.3,
+   221.5,
+   221.5,
+   229.6,
+   220.6
+  ]
+ }
+]

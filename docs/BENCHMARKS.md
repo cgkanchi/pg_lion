@@ -134,6 +134,72 @@ With only a few hundred matches, scoring them all is cheaper than lion's ranked 
 planner still picks the walk. Set `pg_lion.enable_bm25_scan = off` for queries you know are this
 selective.
 
+## Nearest neighbours: lionvec against HNSW
+
+The ten nearest of a query by cosine distance, `ORDER BY embedding <=> $1 LIMIT 10`, over 975,000
+OpenAI ada-002 embeddings of DBpedia entities (1536 dimensions; Qdrant's
+`dbpedia-openai-1M-1536-angular` set and the first 100 of its test queries), optionally under
+`WHERE u < s`, a uniform random column with a lion index that keeps a share `s` of the rows
+([script](../bench/vector/knn.py), [results](../bench/results/2026-10-14-lionvec-partitions/)).
+lionvec in its default 1,974 partitions, against pgvector 0.8.6's HNSW on
+`embedding::halfvec(1536)` (m 16, ef_construction 64). PostgreSQL 16, 4 vCPUs, 16 GB RAM,
+`shared_buffers` 5 GB, and pgvector's `vector` distance functions at `COST 100`, as lionvec's setup
+asks. Recall is the share of the true ten returned, against an exact numpy search. Both indexes
+are approximate.
+
+**Warm** (everything in memory), median of 100 queries, 95th percentile and recall. lionvec at its
+defaults (margin 3, patience 30), at margins 2 and 4, and with the pause off:
+
+| Filter | lionvec (defaults) | margin 2 | margin 4 | no pause | HNSW ef_search 40 | HNSW ef_search 100 |
+| --- | --- | --- | --- | --- | --- | --- |
+| none | 7.9 ms (16), 0.979 | 6.6 (15), 0.964 | 9.1 (18), 0.983 | 14 (68), 0.984 | 4.7 (6.5), 0.900 | 8.1 (11), 0.954 |
+| 10% | 13.5 (29), 0.978 | 15 (29), 0.974 | 15 (28), 0.979 | 60 (123), 0.996 | 8.7 (14), 0.931 | 8.0 (15), 0.939 |
+| 1% | 24 (40), 0.981 | 27 (41), 0.981 | 27 (38), 0.981 | 109 (136), 1.000 | 37 (62), 0.947 | 41 (66), 0.950 |
+| 0.1% | 9.9 (11), 1.000 | | | | 13 (18), 0.999 | |
+
+HNSW under a filter uses its iterative scan; without it, it returns 3.9 of the ten rows at 10% and
+0.4 at 1%. At 10% the planner chooses lionvec's plain scan with a `Filter`, at 1% `LionOrdered`,
+and at 0.1% a sort of the 953 matching rows, for either index. The pause stops a scan once 30
+partitions' worth of rows have brought nothing nearer; without it a query whose nearest rows lie
+far from every centroid reads hundreds of partitions (a mean of 254 of the 1,974 unfiltered, 77
+with it), and the 95th percentile was five times the median, where with it it is twice.
+
+**Cold** (PostgreSQL restarted and the OS page cache dropped before each query), median of 5:
+
+| Filter | lionvec | HNSW ef_search 40 (iterative under a filter) |
+| --- | --- | --- |
+| none | 85 ms | 118 ms |
+| 1% | 196 ms | 1,254 ms |
+| 0.1% | 210 ms | 251 ms (both: the planner sorts the filter's rows) |
+
+**Memory-capped** (a stream of queries, PostgreSQL and its page cache held to 1 or 2 GB by a
+memory cgroup with `shared_buffers` at 128 MB, the cache filled first), median of 100 and the
+pages each query read from disk:
+
+| Memory | Filter | lionvec | HNSW ef_search 40 (iterative under a filter) |
+| --- | --- | --- | --- |
+| 1 GB | none | 19 ms, 100 pages | 51 ms, 767 pages |
+| 1 GB | 1% | 28 ms, 0 pages | 691 ms, 9,229 pages |
+| 2 GB | none | 13 ms, 41 pages | 41 ms, 672 pages |
+| 2 GB | 1% | 30 ms, 0 pages | 465 ms, 7,853 pages |
+
+lionvec's working set is the centroids, the one-bit codes of the partitions queries probe, and the
+few rows they refine and fetch; under the 1% filter it never filled the cgroup. HNSW reads 650 to
+800 random pages a query without a filter and 8,000 to 9,000 under one. This machine's disk
+answers a random read in well under a tenth of a millisecond; on slower storage the page counts
+are what to compare.
+
+**Size and build.** lionvec is 1.7 GB, of which an unfiltered query reads about 9 MB of one-bit
+codes; HNSW is 3.8 GB. lionvec builds in 19 minutes with the table cached, nearly all of it k-means
+and the assignment of every row to its nearest of the 1,974 centroids.
+
+Before the pause, at a margin of 2 narrowed under a filter, lionvec took 8.5 ms unfiltered (0.968),
+32 ms at 10% (0.989), 31 ms at 1% (0.979), 197 ms cold and 17 ms with 1 GB
+([results](../bench/results/2026-10-14-lionvec-partitions/before-pause/)). An earlier,
+unpartitioned lionvec read every row's one-bit code and returned the exact ten: 96 ms unfiltered,
+138 ms at 10%, 34 ms at 1% and 6.6 ms at 0.1%, and built in 98 s
+([results](../bench/results/2026-10-14-lionvec/)). Times vary between runs by up to a fifth.
+
 ## Size, build and writes (5M rows, all seven indexes)
 
 | | B-tree | GIN | Lion |
@@ -162,6 +228,19 @@ python3 bench/comprehensive/run.py --prefix /path/to/postgresql --preload --outp
 python3 bench/comprehensive/report.py bench/results/my-run      # needs matplotlib
 python3 bench/comprehensive/audit.py bench/results/my-run
 python3 bench/ranking/run.py --dsn 'dbname=rank' --docs 500000 --repeats 9 # needs pg_lion in that database
+```
+
+For the nearest-neighbour benchmark, load the vectors into `items(id int, u float8, embedding
+vector(1536))` with `u` uniform in [0, 1), build pgvector's HNSW index on
+`(embedding::halfvec(1536)) halfvec_cosine_ops`, and save the queries and their exact similarities to
+every row as `Q.npy` and `S.npy` (see the script's header). Then:
+
+```sh
+python3 bench/vector/knn.py setup     # the lionvec and lion indexes
+python3 bench/vector/knn.py warm 100  # needs pg_prewarm
+python3 bench/vector/knn.py cold 5    # restarts the cluster; run as root to drop the page cache
+# as root, with KNN_CGROUP a memory cgroup directory it may use:
+python3 bench/vector/knn.py capped 1024 100   # PostgreSQL held to 1 GB of memory
 ```
 
 The suite runs its own temporary cluster and must run as a non-root user. On a 4-vCPU machine it

@@ -17,6 +17,11 @@
  *		column no btree orders (DESIGN.md §30.11); the lion side is then the
  *		other clauses' set, or nothing at all.
  *
+ *		The ordered side may also be a lionvec index's order by distance from
+ *		a vector (ORDER BY v <-> q, lion_vec.c, DESIGN.md §44.6): the set is
+ *		built, and handed to the vector scan, which then reads and scores
+ *		only its members.
+ *
  *		When the btree returns every column the node must produce, the row's
  *		values come from the index tuple and the heap is visited only for
  *		pages the visibility map does not call all-visible, as core's Index
@@ -94,6 +99,7 @@
 #include "lion_count.h"
 #include "lion_costs.h"
 #include "lion_customscan.h"
+#include "lion_vec.h"
 
 /* GUCs, and the hook this file chains (all installed by lion_ordered_init). */
 bool		lion_enable_ordered_scan = true;
@@ -132,7 +138,7 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *					range's, times the relation's tuples), for the switch's
  *					density gate (§40.4)
  *
- * and custom_exprs holds five lists:
+ * and custom_exprs holds six lists:
  *
  *	LO_EXPR_LIONQUALS	every leaf's index quals, key on the left, in leaf
  *						order (heap Vars; the executor substitutes INDEX_VAR)
@@ -145,6 +151,8 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *						walked column alone that the first visible row of an
  *						entry decides for the whole entry (implicit AND; §30.11,
  *						"A filter on the walked column"); NIL otherwise
+ *	LO_EXPR_ORDERBYS	a lionvec index's order (LO_FLAG_KNN): its one ORDER BY
+ *						clause, key on the left, likewise; NIL otherwise
  */
 #define LO_PRIV_MAGIC		0x4c4f5244	/* "LORD" */
 #define LO_PRIV_SHAPE		0
@@ -258,7 +266,8 @@ static const char *const lo_lazy_why_names[LO_LAZY_NWHY] = {
 #define LO_EXPR_LIONQUAL	2
 #define LO_EXPR_ORDORIG		3
 #define LO_EXPR_VALUEQUAL	4
-#define LO_EXPR_NLISTS		5
+#define LO_EXPR_ORDERBYS	5
+#define LO_EXPR_NLISTS		6
 
 #define LO_NODE_LEAF		0
 #define LO_NODE_AND			1
@@ -269,6 +278,7 @@ static const char *const lo_lazy_why_names[LO_LAZY_NWHY] = {
 #define LO_FLAG_INDEXONLY	0x0004	/* the values come from the btree (§40) */
 #define LO_FLAG_HEAPRECHECK	0x0008	/* the lion recheck reads the heap tuple */
 #define LO_FLAG_BUILD		0x0010	/* the set built at once, never lazily */
+#define LO_FLAG_KNN			0x0020	/* the order is a lionvec index's (§44.6) */
 
 /*
  * The plan's custom_private as a C struct: lo_priv_decode() is its one
@@ -587,6 +597,15 @@ typedef struct LionOrderedState
 	IndexScanDesc scan;
 	bool		started;		/* the walk is positioned for this scan */
 	bool		done;
+
+	/*
+	 * ... or a lionvec index's order by distance (DESIGN.md §44.6): its
+	 * ORDER BY key, whose run-time value is among ortkeys, and the set
+	 * handed to its scan after every rescan.
+	 */
+	bool		knn;
+	ScanKey		obkeys;
+	int			nobkeys;
 
 	/*
 	 * ... or a lion column's walk (DESIGN.md §30.11): the column, where its
@@ -1311,6 +1330,68 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	startup += qcost.startup + rel->reltarget->cost.startup;
 	run += fetched * (cpu_tuple_cost + qcost.per_tuple) +
 		rows * rel->reltarget->cost.per_tuple;
+
+	*startup_p = startup;
+	*total_p = startup + run;
+}
+
+/*
+ * Is this a lionvec index's order by distance (DESIGN.md §44.6), which the
+ * node can walk over a lion set: one ORDER BY clause, no index clause (the
+ * index has no search operator), forward - the one direction its scan has.
+ */
+static bool
+lo_knn_path(IndexPath *ipath)
+{
+	return lion_vec_index(ipath->indexinfo) &&
+		list_length(ipath->indexorderbys) == 1 &&
+		list_length(ipath->indexorderbycols) == 1 &&
+		ipath->indexclauses == NIL &&
+		!ScanDirectionIsBackward(ipath->indexscandir);
+}
+
+/*
+ * The cost of the node over a lionvec index's order (DESIGN.md §44.6): the
+ * set, built as lo_cost() prices it; the vector scan restricted to its
+ * members, which reads plane 1 of the CODE pages that hold one before its
+ * first row (lion_vec_scan_cost()); and then, for every member it returns,
+ * at worst a refine and the heap fetch of its exact distance, and the
+ * node's own fetch of that row - from the page the scan has just read - its
+ * set probe and its quals.
+ */
+static void
+lo_cost_knn(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
+			List *residual, double rows, Cost *startup_p, Cost *total_p,
+			double *setbytes)
+{
+	Cost		lioncost;
+	Selectivity sel;
+	double		tuples = Max(rel->tuples, 1.0);
+	double		pages = Max((double) rel->pages, 1.0);
+	double		members;
+	double		ncont;
+	double		spc_random;
+	double		spc_seq;
+	QualCost	qcost;
+	Cost		startup;
+	Cost		run;
+
+	cost_bitmap_tree_node(lion, &lioncost, &sel);
+	members = clamp_row_est(sel * tuples);
+	ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
+	*setbytes = ncont * (LION_CONTAINER_HDRSZ + LO_ENTRY_BYTES) +
+		Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES);
+
+	startup = lioncost + ncont * cpu_operator_cost +
+		lion_vec_scan_cost(ord->indexinfo, members);
+
+	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
+	run = members * (spc_random + cpu_index_tuple_cost + cpu_operator_cost +
+					 cpu_tuple_cost);
+
+	cost_qual_eval(&qcost, residual, root);
+	startup += qcost.startup + rel->reltarget->cost.startup;
+	run += members * qcost.per_tuple + rows * rel->reltarget->cost.per_tuple;
 
 	*startup_p = startup;
 	*total_p = startup + run;
@@ -2111,8 +2192,14 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			/*
 			 * A btree: the early stop and the fetch-and-sort switch rest on
 			 * its returning each heap TID once per scan, in the order its
-			 * pathkeys claim (DESIGN.md §30.4).
+			 * pathkeys claim (DESIGN.md §30.4).  Or a lionvec index's order
+			 * by distance (§44.6), which returns each member once.
 			 */
+			if (lo_knn_path(ipath) && !ipath->indexinfo->hypothetical)
+			{
+				ordpaths = lappend(ordpaths, ipath);
+				continue;
+			}
 			if (ipath->indexorderbys != NIL ||
 				ipath->indexinfo->relam != BTREE_AM_OID ||
 				ipath->indexinfo->hypothetical)
@@ -2201,6 +2288,18 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			Cost		startup;
 			Cost		total;
 			double		setbytes;
+
+			if (lo_knn_path(ord))
+			{
+				/* a lionvec index returns no values: heap mode (§44.6) */
+				lo_cost_knn(root, rel, ord, lion, residual, rows,
+							&startup, &total, &setbytes);
+				if (setbytes > (double) limit)
+					continue;
+				lo_add_path(rel, &lo_path_methods, ord->path.pathkeys,
+							list_make3(ord, lion, NIL), rows, startup, total);
+				continue;
+			}
 
 			/* the values from the index tuple when the btree has them (§40) */
 			indexonly = lo_index_only(ord->indexinfo,
@@ -2432,6 +2531,7 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *ordorig = NIL;
 	List	   *vrinfos = NIL;
 	List	   *iocols = NIL;
+	List	   *orderbys = NIL;
 	double		expected = 0.0;
 	int			dir;
 	int			flags = 0;
@@ -2471,6 +2571,20 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		ordoid = ord->indexinfo->indexoid;
 		dir = (int) ord->indexscandir;
 		expected = ord->indexselectivity * rel->tuples;
+
+		/*
+		 * A lionvec index's order (DESIGN.md §44.6): its ORDER BY clause, and
+		 * the set built at once, for the scan to be restricted to.
+		 */
+		if (lo_knn_path(ord))
+		{
+			if (linitial_int(ord->indexorderbycols) != 0)
+				elog(ERROR, "LionOrdered: a lionvec order on column %d",
+					 linitial_int(ord->indexorderbycols));
+			orderbys = ord->indexorderbys;
+			dir = (int) ForwardScanDirection;
+			flags |= LO_FLAG_KNN | LO_FLAG_BUILD;
+		}
 	}
 	else
 	{
@@ -2561,6 +2675,7 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->custom_scan_tlist = NIL;
 	cscan->custom_exprs = list_make5(lionquals, ordquals, lionqual, ordorig,
 									 extract_actual_clauses(vrinfos, false));
+	cscan->custom_exprs = lappend(cscan->custom_exprs, orderbys);
 	priv.ordoid = ordoid;
 	priv.dir = dir;
 	priv.flags = flags;
@@ -3598,6 +3713,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	List	   *leafoids;
 	List	   *lionquals;
 	List	   *ordquals;
+	List	   *orderbys;
 	List	   *fixed = NIL;
 	ListCell   *pos;
 	int			leafno = 0;
@@ -3615,6 +3731,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->lionwalk = (priv.flags & LO_FLAG_LIONWALK) != 0;
 	st->indexonly = (priv.flags & LO_FLAG_INDEXONLY) != 0;
 	st->lionheaprecheck = (priv.flags & LO_FLAG_HEAPRECHECK) != 0;
+	st->knn = (priv.flags & LO_FLAG_KNN) != 0;
 	st->vmbuffer = InvalidBuffer;
 	st->walknulls = priv.nulls;
 	st->walkattno = priv.walkattno;
@@ -3624,6 +3741,12 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	ordquals = (List *) list_nth(cscan->custom_exprs, LO_EXPR_ORDQUALS);
 	if (list_length(priv.ordcols) != list_length(ordquals))
 		elog(ERROR, "LionOrdered: malformed ordered index quals");
+	orderbys = (List *) list_nth(cscan->custom_exprs, LO_EXPR_ORDERBYS);
+	if (st->knn ?
+		(list_length(orderbys) != 1 || st->lionwalk || st->indexonly ||
+		 !ScanDirectionIsForward(st->dir) || tree == NIL) :
+		orderbys != NIL)
+		elog(ERROR, "LionOrdered: malformed order by distance");
 
 	/*
 	 * What the node evaluates in place of the ordinary plan, initialised - and
@@ -3715,6 +3838,23 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	ExecIndexBuildScanKeys(&node->ss.ps, st->ordidx, fixed, false,
 						   &st->okeys, &st->nokeys,
 						   &st->ortkeys, &st->nortkeys, NULL, NULL);
+	if (st->knn)
+	{
+		/*
+		 * A lionvec index's order (DESIGN.md §44.6): the index checked to be
+		 * one - its scan is handed the set, which only lionvec takes - and
+		 * its ORDER BY key, a run-time key among the btree's kind when the
+		 * query vector is a Param, as an Index Scan builds them.
+		 */
+		if (!lion_vec_relation(st->ordidx))
+			elog(ERROR, "LionOrdered: \"%s\" is not a lionvec index",
+				 RelationGetRelationName(st->ordidx));
+		ExecIndexBuildScanKeys(&node->ss.ps, st->ordidx,
+							   list_make1(lo_fix_qual((Expr *) linitial(orderbys),
+													  0)),
+							   true, &st->obkeys, &st->nobkeys,
+							   &st->ortkeys, &st->nortkeys, NULL, NULL);
+	}
 	if (st->indexonly)
 	{
 		/*
@@ -3787,7 +3927,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->lionparams = pull_paramids((Expr *) lionquals);
 
 	/* the set evaluated lazily, when every leaf's keys can be sought (§30.4) */
-	st->lazyok = lion_enable_lazy_set &&
+	st->lazyok = lion_enable_lazy_set && !st->knn &&
 		(priv.flags & LO_FLAG_BUILD) == 0 && lo_lazy_ok(st);
 	if (st->lazyok)
 	{
@@ -4034,22 +4174,36 @@ lo_start_walk(LionOrderedState *st)
 #if PG_VERSION_NUM >= 200000
 		st->scan = index_beginscan(st->css.ss.ss_currentRelation, st->ordidx,
 								   false, estate->es_snapshot, NULL,
-								   st->nokeys, 0, SO_NONE);
+								   st->nokeys, st->nobkeys, SO_NONE);
 #elif PG_VERSION_NUM >= 190000
 		st->scan = index_beginscan(st->css.ss.ss_currentRelation, st->ordidx,
 								   estate->es_snapshot, NULL,
-								   st->nokeys, 0, SO_NONE);
+								   st->nokeys, st->nobkeys, SO_NONE);
 #elif PG_VERSION_NUM >= 180000
 		st->scan = index_beginscan(st->css.ss.ss_currentRelation, st->ordidx,
-								   estate->es_snapshot, NULL, st->nokeys, 0);
+								   estate->es_snapshot, NULL, st->nokeys,
+								   st->nobkeys);
 #else
 		st->scan = index_beginscan(st->css.ss.ss_currentRelation, st->ordidx,
-								   estate->es_snapshot, st->nokeys, 0);
+								   estate->es_snapshot, st->nokeys,
+								   st->nobkeys);
 #endif
 		/* index-only mode reads the index tuples (§40.4), as core's does */
 		st->scan->xs_want_itup = st->indexonly;
 	}
-	index_rescan(st->scan, st->okeys, st->nokeys, NULL, 0);
+	index_rescan(st->scan, st->okeys, st->nokeys, st->obkeys, st->nobkeys);
+
+	/*
+	 * A lionvec scan reads and scores only the set's members (§44.6); every
+	 * rescan forgets the restriction, and a rebuilt set has moved.
+	 */
+	if (st->knn)
+	{
+		if (st->set == NULL)
+			elog(ERROR, "LionOrdered: a lionvec order without its set");
+		lion_vec_restrict(st->scan, st->set->n, st->set->keys,
+						  st->set->conts);
+	}
 	st->scans++;
 	st->started = true;
 	st->done = false;
@@ -4683,6 +4837,9 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 
 	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs, LO_EXPR_ORDORIG),
 					"Index Cond", ancestors, es);
+	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs,
+											LO_EXPR_ORDERBYS),
+					"Order By", ancestors, es);
 	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs, LO_EXPR_LIONQUAL),
 					"Lion Cond", ancestors, es);
 	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs,
