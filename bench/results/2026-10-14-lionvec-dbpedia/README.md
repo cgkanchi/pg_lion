@@ -1,4 +1,4 @@
-# lionvec and HNSW on DBpedia, text-embedding-3-large (2026-10-14)
+# lionvec, HNSW, VectorChord and pgvectorscale on DBpedia, text-embedding-3-large (2026-10-14)
 
 `bench/vector/knn_dbpedia.py`, DESIGN.md §44.9 ("DBpedia").
 
@@ -13,7 +13,8 @@ unrelated to the vectors: 11,377 rows at 10%, 3,472 at 3%, 1,204 at 1%. The trut
 nearest by cosine among the table's rows (the float4 values it holds, in float64), under each
 filter; no query's tenth and eleventh lie within 2.8e-5 of each other.
 
-**Machine and settings.** PostgreSQL 16.15, pgvector 0.8.7, 4 vCPUs (Intel Xeon @ 2.10GHz,
+**Machine and settings.** PostgreSQL 16.15, pgvector 0.8.7 (and from 2026-10-15 VectorChord 1.1.1
+and pgvectorscale 0.9.1, their PGDG packages), 4 vCPUs (Intel Xeon @ 2.10GHz,
 AVX-512 with VPOPCNTDQ; lionvec used its POPCNT kernel until 9ffabab, and its AVX-512 set in
 `lionvec-p0-simd.json` and after), 15 GB RAM, `shared_buffers` 2 GB (which
 holds every relation here), `work_mem` 64 MB, `maintenance_work_mem` 1 GB (so the k-means sample
@@ -38,6 +39,11 @@ row a method and filter:
 | `lionvec-p0-spill.json` | lionvec, `partitions = 0` and `spill` on: the defaults since, 8 sqrt(n) partitions of format 3, patience 30 alone | 679cfd5 | 2,715 | 356 s | 247 MB |
 | `lionvec-p0-simd.json` | lionvec, `partitions = 0`, the defaults, rebuilt with the kernels (DESIGN.md §44.3, "Kernels"), patience 30 alone | 9ffabab (d6b723b) | 2,715 | 158 s | 247 MB |
 | `hnsw-rerun.json` | `hnsw.json`'s index run again beside `lionvec-p0-simd.json`, so that the two compare from one sitting | run at d6b723b | | | |
+| `lionvec-p0-simd-again.json` | `lionvec-p0-simd.json`'s index run again on 2026-10-15 at 05:52 UTC, the sitting of the four files below | run at 71b3e96 | 2,715 | | |
+| `hnsw-sweep.json` | `hnsw.json`'s index at `hnsw.ef_search` 20, 40, 70, 100, 200 and 400 | run at 71b3e96 | | | |
+| `vchord-l1357.json` | VectorChord `vchordrq`, 1,357 lists (4 sqrt(n)), probes 10 to 1,357 | run at 71b3e96 | 1,357 lists | 50 s | 975 MB |
+| `vchord-l339.json` | VectorChord `vchordrq`, 339 lists (sqrt(n)), probes 10 to 320 | run at 71b3e96 | 339 lists | 22 s | 939 MB |
+| `diskann.json` | pgvectorscale `diskann`, its defaults, search list 10 to 400 | run at 71b3e96 | | 300 s | 75 MB |
 | `cold.json` | both indexes cold (`knn_dbpedia.py cold`): the server restarted and the page cache dropped before each query, 7 queries a method | 679cfd5 | 2,715 | | |
 
 The table is 7.6 MB and its TOAST 900 MB. 1de7d73 is the last commit to `src/` on the
@@ -142,6 +148,55 @@ ms against the planner's sort for HNSW at 7.6 (its iterative scan 25.9 ms for 0.
 margin of 3, unfiltered, 0.917 in 1.1 ms (1.6 before). The lionvec index is 247 MB against HNSW's
 450, and built in 158 s against 187.
 
+## VectorChord and pgvectorscale
+
+VectorChord 1.1.1 (`vchordrq`: RaBitQ codes in IVF lists, every vector kept in the index as well for
+the rerank) and pgvectorscale 0.9.1 (`diskann`: a Vamana graph over SBQ codes, the heap's vectors for
+the rescore), installed from their PGDG packages into the same cluster (`shared_preload_libraries =
+'vchord.so'`), their indexes on `embedding` beside lionvec's. The planner would choose among three
+indexes on one column by cost, so a run marks the other two invalid in `pg_index` for its duration
+(`only_index()` in the driver) and restores them after. VectorChord was built as its documentation
+recommends for cosine (`residual_quantization = false`, `spherical_centroids = true`) at two list
+counts, 1,357 (4 sqrt(n); `vchord-l1357.json`, 975 MB, 50 s, though a first build of the same DDL
+took 141 s) and 339 (sqrt(n); `vchord-l339.json`, 939 MB, 22 s), and run at `vchordrq.probes` 10 to
+320 (to 1,357 for the first). Under a filter each probe count ran three ways: the planner's plan,
+`enable_sort = off`, and `vchordrq.prefilter = on` with it, which checks each candidate's filter at
+its heap tuple before the rerank and is the fastest of the three, so the table takes it. pgvectorscale's
+`diskann` was built with its defaults (`num_neighbors` 50, `search_list_size` 100; 300 s, 75 MB) and
+run at `diskann.query_search_list_size` 10 to 400, `diskann.query_rescore` 50. It answers an
+arbitrary WHERE by filtering what its scan streams out; its index-side filtering takes a `smallint[]`
+labels column named in the index, so the filter has to be known as a label when the index is built,
+and that variant was left out (2026-10-15). Both packages' binaries carry SIMD (vchord dispatches
+AVX-512 with VPOPCNTDQ, pgvectorscale AVX2 and FMA), as lionvec does since 9ffabab.
+
+Server ms at equal recall (0.95 / 0.98), interpolated along each method's own setting (the margin,
+ef, probes, the search list size; `knn_dbpedia.py table`), from one sitting, 05:52 to 06:34 UTC on
+2026-10-15. The machine ran about a tenth slower then than in the 02:09 sitting of
+`lionvec-p0-simd.json` and `hnsw-rerun.json`, for lionvec and HNSW alike (unfiltered 0.95: 1.6 ->
+1.8 and 1.8 -> 2.0 ms), so `lionvec-p0-simd-again.json` is lionvec's index run again in this one:
+
+| Filter | lionvec | HNSW | VectorChord, 339 lists | VectorChord, 1,357 lists | diskann |
+| --- | --- | --- | --- | --- | --- |
+| none | 1.8 / 3.4 | 2.0 / 4.2 | 1.4 / 2.5 | 1.5 / 3.1 | 3.1 at 0.965 (list 10, the smallest run) / 6.3 |
+| 10% | 6.2 / 7.6 (the plain scan) | 5.6 / 13.0 (iterative, enable_sort off) | 2.3 / 3.7 | 3.3 / 4.7 | 0.818 at most |
+| 3% | 6.0 / 8.8 (LionOrdered) | 10.3 at 0.951 (ef 20, iterative), 0.965 at most | 3.4 / 6.3 | 4.9 / 7.0 | 0.745 at most |
+| 1% | 5.5, exact | the planner's sort, exact, 8 to 10 ms; iterative 0.964 at most | 7.9 / 9.1 | 7.1 / 10.2 | 0.705 at most |
+
+So at 115,186 rows VectorChord's 339-list index is ahead of lionvec warm at both recalls unfiltered
+(1.3 times) and under the 10% and 3% filters (2.7 and 1.8 times at 0.95), and lionvec is ahead at 1%
+(exact in 5.5 ms against 7.9 ms for 0.95), with a 247 MB index against 939 (about 700 MB of
+VectorChord's is the vectors it keeps for the rerank; lionvec reads them from the heap). HNSW's
+iterative scan reaches 0.98 at 10% at ef 387 (13.0 ms) and stays at 0.965 and 0.964 at 3% and 1%
+through ef 400. diskann's streaming post-filter caps at 0.82, 0.75 and 0.70 whatever the list size,
+and unfiltered it is the slowest of the four at both recalls. Builds, single-threaded as everything
+here ran (`max_parallel_maintenance_workers` 0; lionvec's build and scan are not parallel, the other
+three can build in parallel): lionvec 158 s, HNSW 187, VectorChord 22 and 50, diskann 300.
+
+The planner's knobs were the stock ones throughout (`random_page_cost` 4, `effective_io_concurrency`
+1, `effective_cache_size` 4 GB). At `random_page_cost` 1.1 the plan at 3% becomes the plain lionvec
+scan with a `Filter` rather than the sort of the bitmap scan's rows, and still not LionOrdered; 1%
+keeps the sort and 10% is unchanged.
+
 ## Cold
 
 PostgreSQL restarted and the page cache dropped before each query, two seconds for the flush to
@@ -188,6 +243,10 @@ From this checkout, with the dev cluster (run as an unprivileged user; `pgdev` h
     python3 bench/vector/knn_dbpedia.py lionvec 0       # (re)build at the default
     python3 bench/vector/knn_dbpedia.py warm lionvec NAME     # margins 2-16, patience 30 and 120
     python3 bench/vector/knn_dbpedia.py warm hnsw hnsw
+    python3 bench/vector/knn_dbpedia.py vchord 339      # VectorChord, 339 lists (needs vchord.so preloaded)
+    python3 bench/vector/knn_dbpedia.py diskann         # pgvectorscale, its defaults
+    python3 bench/vector/knn_dbpedia.py warm vchord vchord-l339
+    python3 bench/vector/knn_dbpedia.py warm diskann diskann
     python3 bench/vector/knn_dbpedia.py table bench/results/2026-10-14-lionvec-dbpedia/*.json
 
 Another build of pg_lion, for the same table and truth: install it into the same PostgreSQL,

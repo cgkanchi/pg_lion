@@ -31,7 +31,12 @@
 #   knn_dbpedia.py hnsw             build the HNSW index (again, if it is there)
 #   knn_dbpedia.py lionvec P        build the lionvec index with partitions = P
 #                                   (again, if it is there)
-#   knn_dbpedia.py warm lionvec|hnsw NAME
+#   knn_dbpedia.py vchord L         build VectorChord's vchordrq index with
+#                                   lists = [L] (0: no lists), cosine, spherical
+#                                   centroids; needs the vchord extension
+#   knn_dbpedia.py diskann          build pgvectorscale's diskann index at its
+#                                   defaults; needs the vectorscale extension
+#   knn_dbpedia.py warm lionvec|hnsw|vchord|diskann NAME
 #                                   recall and latency, warm, of each method of
 #                                   that index and each filter, into
 #                                   KNN_OUT/NAME.json with the index's build
@@ -56,6 +61,24 @@
 # the true ten, and 0.95 takes about 7.  The first runs took patiences 30 and
 # 120 as well, from when the patience counted partitions' worth of rows, a
 # quarter as many in four times the partitions; it counts sqrt(n) / 2 now.
+# KNN_EF (default 20,40,70,100,200,400): the hnsw.ef_search values an hnsw
+# run sweeps (the first runs took 40 and 100).  KNN_PROBES (default
+# 10,20,40,80,160,320): the vchordrq.probes values a vchord run sweeps;
+# KNN_SEARCH_LIST (default 10,20,30,50,100,200,400) and KNN_RESCORE (default
+# 50): diskann.query_search_list_size and diskann.query_rescore for a diskann
+# run.  KNN_COLD_VCHORD and KNN_COLD_DISKANN (default none): the probes and
+# search list sizes cold runs.
+#
+# diskann answers an arbitrary WHERE by filtering what its scan streams out;
+# its index-side filtering takes a smallint[] labels column named in the
+# index, so the filter has to be known as a label when the index is built,
+# and the runs here do not use it (a decision of 2026-10-15).
+#
+# lionvec, vchordrq and diskann index the same column, and the planner would
+# choose among them by cost, so a run marks the other two invalid in pg_index
+# for its duration (only_index(); the planner ignores an invalid index, as it
+# does one a failed CREATE INDEX CONCURRENTLY left) and restores them after.
+# That is a catalog write by the superuser, for the dev cluster this runs on.
 import glob, hashlib, json, os, platform, re, subprocess, sys, time
 import numpy as np
 import pyarrow.parquet as pq
@@ -77,6 +100,13 @@ DIM = 1536
 SELS = (1.0, 0.1, 0.03, 0.01)
 MARGINS = [float(x) if '.' in x else int(x) for x in os.environ.get('KNN_MARGINS', '2,3,4,6,8,12,16').split(',')]
 PATIENCE = [int(x) for x in os.environ.get('KNN_PATIENCE', '30').split(',')]
+EFS = [int(x) for x in os.environ.get('KNN_EF', '20,40,70,100,200,400').split(',')]
+PROBES = [int(x) for x in os.environ.get('KNN_PROBES', '10,20,40,80,160,320').split(',')]
+SEARCH_LIST = [int(x) for x in os.environ.get('KNN_SEARCH_LIST', '10,20,30,50,100,200,400').split(',')]
+RESCORE = [int(x) for x in os.environ.get('KNN_RESCORE', '50').split(',')]
+INDEXES = {'lionvec': 'dbpedia_lv', 'hnsw': 'dbpedia_hnsw', 'vchord': 'dbpedia_vchord',
+           'diskann': 'dbpedia_diskann'}
+ON_EMBEDDING = ('dbpedia_lv', 'dbpedia_vchord', 'dbpedia_diskann')    # the three on the column itself
 
 lit = lambda q: '[' + ','.join('%.9g' % x for x in q) + ']'
 HNSW = ("SELECT id FROM dbpedia {w} ORDER BY embedding::halfvec(1536) <=> %(q)s::halfvec(1536) "
@@ -105,8 +135,43 @@ def cost_distances(conn):
         conn.execute(f'ALTER FUNCTION {f} COST 100')
 
 
+def show(conn, *names):
+    # the settings a run records, those the server has (io_method is 18's)
+    out = {}
+    for n in names:
+        r = conn.execute("SELECT setting FROM pg_settings WHERE name = %s", (n,)).fetchone()
+        if r:
+            out[n] = r[0]
+    return out
+
+
+def only_index(conn, idx):
+    # The other indexes on the embedding column, marked invalid so that the
+    # planner can only take idx (see the head of the file); returns them for
+    # restore_indexes().
+    others = [r[0] for r in conn.execute(
+        "SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+        "WHERE i.indrelid = 'dbpedia'::regclass AND i.indisvalid AND c.relname = ANY(%s)",
+        ([o for o in ON_EMBEDDING if o != idx],))]
+    for o in others:
+        conn.execute("UPDATE pg_index SET indisvalid = false WHERE indexrelid = %s::regclass", (o,))
+    if others:
+        print(f'marked invalid for this run: {", ".join(others)}', flush=True)
+    return others
+
+
+def restore_indexes(conn, others):
+    for o in others:
+        conn.execute("UPDATE pg_index SET indisvalid = true WHERE indexrelid = %s::regclass", (o,))
+
+
 def where(sel):
     return '' if sel >= 1.0 else f'WHERE u < {sel}'
+
+
+def sql(kind, sel):
+    # a kind's query under a filter (HNSW's is over halfvec)
+    return (HNSW if kind == 'hnsw' else LION).format(w=where(sel))
 
 
 def read_shards():
@@ -213,7 +278,8 @@ def sizes(conn=None):
     out = {}
     for name, size in conn.execute(
             "SELECT c.relname, pg_relation_size(c.oid) FROM pg_class c "
-            "WHERE c.relname IN ('dbpedia', 'dbpedia_pkey', 'dbpedia_u', 'dbpedia_lv', 'dbpedia_hnsw') "
+            "WHERE c.relname IN ('dbpedia', 'dbpedia_pkey', 'dbpedia_u', 'dbpedia_lv', 'dbpedia_hnsw', "
+            "'dbpedia_vchord', 'dbpedia_diskann') "
             "UNION ALL SELECT 'dbpedia (TOAST)', pg_relation_size(reltoastrelid) FROM pg_class "
             "WHERE relname = 'dbpedia' ORDER BY 1"):
         out[name] = int(size)
@@ -339,21 +405,44 @@ def methods(kind, sel):
                 st = [f'SET pg_lion.vector_margin = {margin}', f'SET pg_lion.vector_patience = {patience}']
                 if sel <= 0.01 and margin != 3:
                     continue        # every member's distance: no margin, no pause
-                m.append((f'lionvec margin={margin} patience={patience}', LION.format(w=where(sel)), st))
+                m.append((f'lionvec margin={margin} patience={patience}', sql(kind, sel), st))
                 if sel < 1.0:
-                    m.append((f'lionvec margin={margin} patience={patience} LionOrdered',
-                              LION.format(w=where(sel)),
+                    m.append((f'lionvec margin={margin} patience={patience} LionOrdered', sql(kind, sel),
                               st + ['SET enable_sort = off', 'SET enable_indexscan = off']))
-    else:
-        for ef in (40, 100):
+    elif kind == 'hnsw':
+        for ef in EFS:
             s = [f'SET hnsw.ef_search = {ef}']
             if sel < 1.0:
                 s.append('SET hnsw.iterative_scan = relaxed_order')
-                m.append((f'hnsw ef={ef} iterative', HNSW.format(w=where(sel)), s))
-                m.append((f'hnsw ef={ef} iterative enable_sort=off', HNSW.format(w=where(sel)),
+                m.append((f'hnsw ef={ef} iterative', sql(kind, sel), s))
+                m.append((f'hnsw ef={ef} iterative enable_sort=off', sql(kind, sel),
                           s + ['SET enable_sort = off']))
             else:
-                m.append((f'hnsw ef={ef}', HNSW.format(w=where(sel)), s))
+                m.append((f'hnsw ef={ef}', sql(kind, sel), s))
+    elif kind == 'vchord':
+        # VectorChord's vchordrq: probes lists a query scans; under a filter
+        # the planner's plan, the index's scan with vchordrq.prefilter, which
+        # checks each candidate's filter at its heap tuple before the rerank,
+        # and without it, the filter applied to what the scan returns
+        for probes in PROBES:
+            s = [f"SET vchordrq.probes = '{probes}'"]
+            m.append((f'vchord probes={probes}', sql(kind, sel), s))
+            if sel < 1.0:
+                m.append((f'vchord probes={probes} prefilter', sql(kind, sel),
+                          s + ['SET vchordrq.prefilter = on', 'SET enable_sort = off']))
+                m.append((f'vchord probes={probes} enable_sort=off', sql(kind, sel),
+                          s + ['SET enable_sort = off']))
+    else:
+        # pgvectorscale's diskann: the search list size and the rescored
+        # count; under a filter its streaming scan with the filter applied to
+        # what it returns (its index-side filtering takes a labels column)
+        for rescore in RESCORE:
+            for size in SEARCH_LIST:
+                s = [f'SET diskann.query_search_list_size = {size}', f'SET diskann.query_rescore = {rescore}']
+                name = f'diskann list={size} rescore={rescore}'
+                m.append((name, sql(kind, sel), s))
+                if sel < 1.0:
+                    m.append((name + ' enable_sort=off', sql(kind, sel), s + ['SET enable_sort = off']))
     return m
 
 
@@ -362,35 +451,42 @@ def warm(kind, name):
     qidx = np.load(os.path.join(CACHE, 'qidx.npy'))
     Q = np.asarray(X[qidx[:NQ]])
     truth = np.load(os.path.join(CACHE, 'truth.npz'))
-    idx = 'dbpedia_lv' if kind == 'lionvec' else 'dbpedia_hnsw'
+    idx = INDEXES[kind]
     conn = connect()
     cost_distances(conn)
     # warm: every relation in shared_buffers (2 GB holds them all here),
     # each method's queries run once untimed first
-    for sql in ["SELECT pg_prewarm('dbpedia')", "SELECT pg_prewarm('dbpedia_pkey')",
-                "SELECT pg_prewarm('dbpedia_u')", f"SELECT pg_prewarm('{idx}')",
-                "SELECT pg_prewarm(reltoastrelid) FROM pg_class WHERE relname = 'dbpedia'",
-                "SELECT pg_prewarm(indexrelid) FROM pg_index WHERE indrelid = "
-                "(SELECT reltoastrelid FROM pg_class WHERE relname = 'dbpedia')"]:
+    for q in ["SELECT pg_prewarm('dbpedia')", "SELECT pg_prewarm('dbpedia_pkey')",
+              "SELECT pg_prewarm('dbpedia_u')", f"SELECT pg_prewarm('{idx}')",
+              "SELECT pg_prewarm(reltoastrelid) FROM pg_class WHERE relname = 'dbpedia'",
+              "SELECT pg_prewarm(indexrelid) FROM pg_index WHERE indrelid = "
+              "(SELECT reltoastrelid FROM pg_class WHERE relname = 'dbpedia')"]:
         t = time.perf_counter()
-        n = conn.execute(sql).fetchone()[0]
-        print(f'{sql}: {n} pages, {time.perf_counter() - t:.1f} s', flush=True)
+        n = conn.execute(q).fetchone()[0]
+        print(f'{q}: {n} pages, {time.perf_counter() - t:.1f} s', flush=True)
     try:
         built = json.load(open(os.path.join(CACHE, f'{idx}.build.json')))
     except OSError:
         built = None
     meta = dict(name=name, index=idx, build=built, run=provenance(),
                 run_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), queries=len(Q),
-                settings={s: conn.execute(f'SHOW {s}').fetchone()[0] for s in
-                          ('shared_buffers', 'work_mem', 'maintenance_work_mem', 'jit',
-                           'max_parallel_workers_per_gather', 'server_version')},
+                settings=show(conn, 'shared_buffers', 'work_mem', 'maintenance_work_mem', 'jit',
+                              'max_parallel_workers_per_gather', 'max_parallel_maintenance_workers',
+                              'random_page_cost', 'effective_io_concurrency', 'effective_cache_size',
+                              'io_method', 'server_version'),
                 pgvector=conn.execute("SELECT extversion FROM pg_extension WHERE extname = 'vector'").fetchone()[0],
+                extensions=dict(conn.execute("SELECT extname, extversion FROM pg_extension WHERE extname IN "
+                                             "('vector', 'pg_lion_vector', 'vchord', 'vectorscale')").fetchall()),
                 sizes=sizes(conn), machine=dict(cpus=os.cpu_count(), cpu=cpu_model(),
                                                 kernel=platform.release()))
     out = []
-    for sel in SELS:
-        for mname, sql, settings in methods(kind, sel):
-            out.append(run(conn, mname, sql, sel, settings, Q, truth[str(sel)]))
+    others = only_index(conn, idx)
+    try:
+        for sel in SELS:
+            for mname, query, settings in methods(kind, sel):
+                out.append(run(conn, mname, query, sel, settings, Q, truth[str(sel)]))
+    finally:
+        restore_indexes(conn, others)
     os.makedirs(OUT, exist_ok=True)
     json.dump(dict(meta=meta, results=out), open(os.path.join(OUT, f'{name}.json'), 'w'), indent=1)
 
@@ -410,24 +506,41 @@ def cold():
     Q = np.asarray(X[qidx[:nq]])
     lo = ['SET enable_sort = off', 'SET enable_indexscan = off']
     hn = ['SET hnsw.ef_search = 40', 'SET hnsw.iterative_scan = relaxed_order']
+    probes = [int(x) for x in os.environ.get('KNN_COLD_VCHORD', '').split(',') if x]
+    lists = [int(x) for x in os.environ.get('KNN_COLD_DISKANN', '').split(',') if x]
     configs = []
     for margin in (3, 7, 12):
-        configs.append((1.0, f'lionvec margin={margin}', LION.format(w=where(1.0)),
+        configs.append(('lionvec', 1.0, f'lionvec margin={margin}', sql('lionvec', 1.0),
                         [f'SET pg_lion.vector_margin = {margin}']))
     for ef in (40, 100):
-        configs.append((1.0, f'hnsw ef={ef}', HNSW.format(w=where(1.0)), [f'SET hnsw.ef_search = {ef}']))
+        configs.append(('hnsw', 1.0, f'hnsw ef={ef}', sql('hnsw', 1.0), [f'SET hnsw.ef_search = {ef}']))
+    for p in probes:
+        configs.append(('vchord', 1.0, f'vchord probes={p}', sql('vchord', 1.0), [f"SET vchordrq.probes = '{p}'"]))
+    for l in lists:
+        configs.append(('diskann', 1.0, f'diskann list={l}', sql('diskann', 1.0),
+                        [f'SET diskann.query_search_list_size = {l}']))
     for sel in (0.03, 0.01):
-        configs.append((sel, 'lionvec planner plan', LION.format(w=where(sel)), ['SET pg_lion.vector_margin = 3']))
+        configs.append(('lionvec', sel, 'lionvec planner plan', sql('lionvec', sel),
+                        ['SET pg_lion.vector_margin = 3']))
         for margin in (3, 7) if sel > 0.01 else (3,):
-            configs.append((sel, f'lionvec margin={margin} LionOrdered', LION.format(w=where(sel)),
+            configs.append(('lionvec', sel, f'lionvec margin={margin} LionOrdered', sql('lionvec', sel),
                             [f'SET pg_lion.vector_margin = {margin}'] + lo))
-        configs.append((sel, 'hnsw ef=40 iterative', HNSW.format(w=where(sel)), hn))
-        configs.append((sel, 'hnsw ef=40 iterative enable_sort=off', HNSW.format(w=where(sel)),
+        configs.append(('hnsw', sel, 'hnsw ef=40 iterative', sql('hnsw', sel), hn))
+        configs.append(('hnsw', sel, 'hnsw ef=40 iterative enable_sort=off', sql('hnsw', sel),
                         hn + ['SET enable_sort = off']))
+        for p in probes:
+            configs.append(('vchord', sel, f'vchord probes={p} prefilter', sql('vchord', sel),
+                            [f"SET vchordrq.probes = '{p}'", 'SET vchordrq.prefilter = on', 'SET enable_sort = off']))
+        for l in lists:
+            configs.append(('diskann', sel, f'diskann list={l} enable_sort=off', sql('diskann', sel),
+                            [f'SET diskann.query_search_list_size = {l}', 'SET enable_sort = off']))
     read = re.compile(r'Buffers: shared[^\n]*?read=(\d+)')
     out = []
-    for sel, name, sql, settings in configs:
+    for kind, sel, name, query, settings in configs:
         ms, pages, plan = [], [], None
+        conn = connect()
+        others = only_index(conn, INDEXES[kind])     # persists across the restarts
+        conn.close()
         for i in range(nq):
             subprocess.run(restart, shell=True, check=True, capture_output=True)
             dropped = subprocess.run(['sh', '-c', 'sync; echo 3 > /proc/sys/vm/drop_caches'],
@@ -442,7 +555,7 @@ def cold():
             cost_distances(conn)
             for st in settings:
                 conn.execute(st)
-            lines = [r[0] for r in conn.execute('EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, COSTS OFF) ' + sql,
+            lines = [r[0] for r in conn.execute('EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, COSTS OFF) ' + query,
                                                 {'q': lit(Q[i])}).fetchall()]
             ms.append(float(next(EXEC.search(l).group(1) for l in lines if EXEC.search(l))))
             g = read.search(next((l for l in lines if 'Buffers:' in l), ''))
@@ -451,6 +564,9 @@ def cold():
                 plan = ' / '.join(l.strip()[:60] for l in lines
                                   if re.search(r'Scan|Sort|Lion|Limit', l) and 'Buffers' not in l)[:200]
             conn.close()
+        conn = connect()
+        restore_indexes(conn, others)
+        conn.close()
         row = dict(name=name, sel=sel, cache_dropped=dropped, median_ms=float(np.median(ms)),
                    max_ms=float(max(ms)), all_ms=[round(x, 1) for x in ms],
                    pages_read_median=float(np.median(pages)), all_pages=pages, plan=plan)
@@ -506,6 +622,43 @@ def table(files):
                         v = [a + w * (b - a) for a, b in zip(v0, v1)]
                         print(f'| {name} | {sel:g} | {path.strip() or "planner"} | {patience} | {target} '
                               f'| {v[0]:.0f} | {v[1]:.0f} | {v[2]:.1f} |')
+    # the other kinds: the server time a recall took, interpolated along the
+    # setting a method sweeps (ef, probes, the search list size), the rows of
+    # one method differing in that number alone
+    print()
+    print('| file | filter | method | recall | server ms | setting |')
+    print('| --- | --- | --- | --- | --- | --- |')
+    for name, d in data.items():
+        fams = {}
+        for r in d['results']:
+            g = re.search(r'=(\d+)', r['name'])
+            if r['name'].startswith('lionvec') or not g:
+                continue
+            fam = r['name'][:g.start(1)] + '*' + r['name'][g.end(1):]
+            plan = 'Sort' if 'Sort' in r['plan'] else 'scan'
+            fams.setdefault((r['sel'], fam), []).append((int(g.group(1)), r['recall'], r['exec_median_ms'], plan))
+        for (sel, fam), pts in sorted(fams.items(), key=lambda kv: (-kv[0][0], kv[0][1])):
+            pts.sort()
+            if len(pts) < 2:
+                continue
+            for target in (0.95, 0.98):
+                if pts[0][1] >= target:
+                    # the smallest setting swept is already there: its own row
+                    print(f'| {name} | {sel:g} | {fam} | {target} | {pts[0][2]:.1f} | {pts[0][0]} ({pts[0][1]:.3f}) |')
+                    continue
+                hit = next(((a, b) for a, b in zip(pts, pts[1:]) if a[1] <= target <= b[1]), None)
+                if hit is None:
+                    print(f'| {name} | {sel:g} | {fam} | {target} | not reached (best {max(p[1] for p in pts):.3f}) | |')
+                    continue
+                (p0, r0, t0, pl0), (p1, r1, t1, pl1) = hit
+                if pl0 != pl1:
+                    # the planner's plan changes between the two settings: no
+                    # line to interpolate along
+                    print(f'| {name} | {sel:g} | {fam} | {target} | plan changes between {p0} ({r0:.3f}, {t0:.1f} ms, '
+                          f'{pl0}) and {p1} ({r1:.3f}, {t1:.1f} ms, {pl1}) | |')
+                    continue
+                w = (target - r0) / (r1 - r0) if r1 > r0 else 0.0
+                print(f'| {name} | {sel:g} | {fam} | {target} | {t0 + w * (t1 - t0):.1f} | {p0 + w * (p1 - p0):.0f} |')
 
 
 def cpu_model():
@@ -527,7 +680,17 @@ if __name__ == '__main__':
     elif a[:1] == ['lionvec'] and len(a) == 2:
         build('dbpedia_lv', 'CREATE INDEX dbpedia_lv ON dbpedia USING lionvec '
               f'(embedding vector_cosine_ops) WITH (partitions = {int(a[1])})')
-    elif a[:1] == ['warm'] and len(a) == 3 and a[1] in ('lionvec', 'hnsw'):
+    elif a[:1] == ['vchord'] and len(a) == 2:
+        # VectorChord's recommendation for cosine: no residual quantization,
+        # spherical centroids; lists = [] clusters nothing (one list)
+        lists = '[]' if int(a[1]) == 0 else f'[{int(a[1])}]'
+        build('dbpedia_vchord', 'CREATE INDEX dbpedia_vchord ON dbpedia USING vchordrq '
+              '(embedding vector_cosine_ops) WITH (options = $$\nresidual_quantization = false\n'
+              f'[build.internal]\nlists = {lists}\nspherical_centroids = true\n$$)')
+    elif a == ['diskann']:
+        build('dbpedia_diskann', 'CREATE INDEX dbpedia_diskann ON dbpedia USING diskann '
+              '(embedding vector_cosine_ops)')
+    elif a[:1] == ['warm'] and len(a) == 3 and a[1] in INDEXES:
         warm(a[1], a[2])
     elif a[:1] == ['table'] and len(a) > 1:
         table(a[1:])
@@ -536,5 +699,5 @@ if __name__ == '__main__':
     elif a[:1] == ['sizes']:
         sizes()
     else:
-        raise SystemExit('usage: knn_dbpedia.py prepare | load | hnsw | lionvec P | '
-                         'warm lionvec|hnsw NAME | table FILE... | sizes | cold')
+        raise SystemExit('usage: knn_dbpedia.py prepare | load | hnsw | lionvec P | vchord L | diskann | '
+                         'warm lionvec|hnsw|vchord|diskann NAME | table FILE... | sizes | cold')
