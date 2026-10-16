@@ -93,6 +93,7 @@ int			lionvec_batch = 100;
 double		lionvec_margin = LIONVEC_MARGIN_DEFAULT;
 int			lionvec_patience = LIONVEC_PATIENCE_DEFAULT;
 int			lionvec_exact_rows = LIONVEC_EXACT_DEFAULT;
+double		lionvec_exact_per_part = LIONVEC_EXACT_PER_PART_DEFAULT;
 int			lionvec_overflow = LIONVEC_OVERFLOW_ERROR;
 
 static const struct config_enum_entry lionvec_overflow_options[] = {
@@ -189,16 +190,32 @@ lion_vec_init(void)
 	DefineCustomIntVariable("pg_lion.vector_exact_rows",
 							"How many rows a lion filter may admit for a lionvec scan under it to "
 							"compute every one's distance exactly instead of probing partitions.",
-							"A scan restricted to this many rows or fewer reads each one's vector "
-							"from the table and returns the exact order, reading no code page; "
-							"restricted to more, it probes the partitions nearest the query as an "
-							"unfiltered scan does.  Larger makes more filters exact, at a table read "
-							"a row; 0 never does.",
+							"A scan restricted to this many rows or fewer, or to no more than "
+							"pg_lion.vector_exact_per_partition rows a partition of the index, reads "
+							"each one's vector from the table and returns the exact order, reading no "
+							"code page; restricted to more, it probes the partitions nearest the query "
+							"as an unfiltered scan does.  Larger makes more filters exact, at a table "
+							"read a row; 0 leaves the choice to pg_lion.vector_exact_per_partition.",
 							&lionvec_exact_rows,
 							LIONVEC_EXACT_DEFAULT, 0, 100000000,
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
+	DefineCustomRealVariable("pg_lion.vector_exact_per_partition",
+							 "How many rows a lion filter may admit for each of a lionvec index's "
+							 "partitions, on average, for a scan under it to compute every one's "
+							 "distance exactly instead of probing partitions.",
+							 "Where the filter's rows are this few a partition, a probe reads a "
+							 "partition's code pages for about one of them, and reading each one's "
+							 "vector from the table costs less; a scan restricted to more rows than "
+							 "this and pg_lion.vector_exact_rows allow probes.  Larger makes more "
+							 "filters exact, at a table read a row; 0 leaves the choice to "
+							 "pg_lion.vector_exact_rows.",
+							 &lionvec_exact_per_part,
+							 LIONVEC_EXACT_PER_PART_DEFAULT, 0.0, LIONVEC_EXACT_PER_PART_MAX,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 	DefineCustomEnumVariable("pg_lion.vector_overflow",
 							 "What a lionvec scan does when what it knows of its rows outgrows hash_mem.",
 							 "A scan with no LIMIT, or a large one, over rows its codes cannot tell apart "
@@ -220,6 +237,40 @@ lion_vec_init(void)
 	add_bool_reloption(lionvec_relopt_kind, "spill",
 					   "Whether a lionvec index's build stores each row in a second partition too",
 					   true, AccessExclusiveLock);
+}
+
+/*
+ * The most members a restriction may have for a scan of an index of nparts
+ * partitions to compute every member's distance from the heap instead of
+ * probing (lion_vec_scan.c, lv_exact(); DESIGN.md §44.6), which the scan
+ * and its cost both ask, so that the planner prices what the scan does:
+ * pg_lion.vector_exact_rows, or pg_lion.vector_exact_per_partition members
+ * a partition if that is more.  The exact path costs a heap fetch a member,
+ * whatever the partitions.  A probe reads a partition's CODE pages for the
+ * members among them, and where those are about one a partition it reads a
+ * page or two for each, and probes hundreds of partitions before the
+ * pause, counted in members, comes.  So the members a partition decide,
+ * not their number: on DBpedia's 115,186 rows in 2,715 partitions, warm,
+ * the 3% filter's 3,472 members, 1.28 a partition, took 7.8 ms exact for
+ * all ten nearest and 9.9 ms probed for 0.977, and the 10% filter's
+ * 11,377, 4.2 a partition, 26 ms exact and 10.2 ms probed for 0.974; at a
+ * million rows in 7,999 partitions the 1% filter's 10,063, 1.26 a
+ * partition, took 11 ms exact and 13 to 20 ms probed for 0.956 to 0.98
+ * (the maintainer's measurement).  Warm the two crossed at two to three
+ * members a partition; the default ratio, 1.5, keeps below that for the
+ * cold cost, a random heap read a member (183 ms exact against 67 probed
+ * at that 3%).  The floor, 2,000, is about where the cold costs crossed
+ * whatever the partitions, and all an index of few partitions has (§44.8,
+ * §44.9).  Either at 0 leaves the other to decide.
+ */
+double
+lionvec_exact_limit(double nparts)
+{
+	double		perpart = 0.0;
+
+	if (nparts > 0.0 && lionvec_exact_per_part > 0.0)
+		perpart = lionvec_exact_per_part * nparts;
+	return Max((double) lionvec_exact_rows, perpart);
 }
 
 bool
@@ -3523,12 +3574,16 @@ lionvec_code_pages(Oid indexoid, double pages, double *perpage,
 
 /*
  * The cost of a scan's first row, which is most of its cost.  Restricted to
- * pg_lion.vector_exact_rows members or fewer, the members' distances from
- * the heap, every one (§44.6).  Otherwise every centroid's estimate, then the partitions a
- * scan probes, a random read each and their CODE pages in order, plane 1 of
- * their members, and a batch's refines and exact distances, each a page
- * read and a heap fetch.  `members` is how many rows a restriction admits,
- * or the index's rows.
+ * no more members than lionvec_exact_limit() allows - by the same partition
+ * count the scan reads from the meta page, so that the two agree - the
+ * members' distances from the heap, every one, a random page each, which
+ * is what a cold scan pays (§44.6; priced so, at 1.3 members a partition
+ * the plain scan with a Filter, priced low under a selective filter, can
+ * come out cheaper than either exact plan, §44.7).  Otherwise every
+ * centroid's estimate, then the partitions a scan probes, a random read
+ * each and their CODE pages in order, plane 1 of their members, and a
+ * batch's refines and exact distances, each a page read and a heap fetch.
+ * `members` is how many rows a restriction admits, or the index's rows.
  */
 static Cost
 lionvec_startup_cost(IndexOptInfo *index, double members, double *codepages)
@@ -3549,7 +3604,7 @@ lionvec_startup_cost(IndexOptInfo *index, double members, double *codepages)
 
 	get_tablespace_page_costs(index->reltablespace, &spc_random, &spc_seq);
 
-	if (frac < 1.0 && members <= lionvec_exact_rows)
+	if (frac < 1.0 && members <= lionvec_exact_limit(nparts))
 	{
 		*codepages = 0.0;
 		return Max(members, 1.0) * (spc_random + cpu_index_tuple_cost +

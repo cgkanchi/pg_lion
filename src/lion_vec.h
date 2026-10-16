@@ -268,9 +268,20 @@ lionvec_chain_step(Relation index, uint64 *visited, BlockNumber *nblocks)
 /*
  * A scan restricted to this many members or fewer computes every member's
  * distance from the heap rather than probe partitions (DESIGN.md §44.6):
- * pg_lion.vector_exact_rows's default.
+ * pg_lion.vector_exact_rows's default, the floor of lionvec_exact_limit().
  */
 #define LIONVEC_EXACT_DEFAULT	2000
+
+/*
+ * ... and so does one restricted to no more than this many members a
+ * partition, on average, if that is more: how thinly the members spread
+ * over the partitions is what decides between the two, a probe reading a
+ * partition's CODE pages for the few members among them (lion_vec.c,
+ * lionvec_exact_limit(); DESIGN.md §44.6).  The default of
+ * pg_lion.vector_exact_per_partition, and the most it may be, a bound only.
+ */
+#define LIONVEC_EXACT_PER_PART_DEFAULT	1.5
+#define LIONVEC_EXACT_PER_PART_MAX		1000000.0
 
 /*
  * What a scan does when what it knows of its rows outgrows hash_mem
@@ -288,6 +299,7 @@ extern int	lionvec_batch;
 extern double lionvec_margin;
 extern int	lionvec_patience;
 extern int	lionvec_exact_rows;
+extern double lionvec_exact_per_part;
 extern int	lionvec_overflow;
 
 /*
@@ -304,6 +316,7 @@ lionvec_distance_type_ok(Oid type)
 
 /* lion_vec.c */
 extern void lion_vec_init(void);
+extern double lionvec_exact_limit(double nparts);
 extern LionVecInfo *lionvec_get_info(Relation index);
 extern const float *lionvec_datum_floats(Datum d, bool half, float *buf,
 										 int bufdim, int *dim, Pointer *tofree);

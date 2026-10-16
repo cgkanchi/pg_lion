@@ -451,8 +451,9 @@ builds alone.
 The node builds the Lion set of the `WHERE`, and the vector scan scores only the members in the
 partitions it reads, so the `LIMIT` is filled from the matching rows whatever their share of the
 table; `Heap Fetches` in `EXPLAIN ANALYZE` counts the rows the node fetched, about `k`. A set of up
-to `pg_lion.vector_exact_rows` rows (2,000) is answered exactly, from every member's distance; a
-larger one by reading
+to `pg_lion.vector_exact_rows` rows (2,000), or to `pg_lion.vector_exact_per_partition` (1.5) rows
+for each of the index's partitions if that is more, is answered exactly, from every member's
+distance; a larger one by reading
 partitions as above, its patience counted in matching rows. Where a large share of the rows pass
 the filter (3% of a million or more, here) the planner prefers the plain index scan with a
 `Filter`, and for a filter of a few thousand rows a sort of the Lion bitmap scan's rows. With the
@@ -486,6 +487,7 @@ the partitions a query probed had a median of 68, a 95th percentile of 175 and a
 pauses, and 150, 837 and 1,664 without. A query that wants more rows than `pg_lion.vector_batch`
 makes more passes, each probing again the partitions probed so far; a row "skipped out of order"
 turned up after rows farther than it had been returned (it lay in a partition read later, or its
-bound failed), which costs that row and nothing else. A filter of up to `pg_lion.vector_exact_rows`
-rows logs `N members fetched, N returned` instead. `pg_lion.vector_margin` and `pg_lion.vector_patience` read more partitions or fewer, and
+bound failed), which costs that row and nothing else. A filter answered exactly
+(`pg_lion.vector_exact_rows`, `pg_lion.vector_exact_per_partition`) logs `N members fetched, N
+returned` instead. `pg_lion.vector_margin` and `pg_lion.vector_patience` read more partitions or fewer, and
 `pg_lion.vector_epsilon` widens or narrows the bounds (DESIGN.md §44.8).

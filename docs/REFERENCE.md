@@ -299,9 +299,10 @@ The build reads it, so a change takes effect at the next `REINDEX`.
 
 With a `WHERE` that lion indexes answer, `LionOrdered` builds lion's set of the matching rows and
 the scan reads and scores only those (`Custom Scan (LionOrdered)` with `Order By:` in `EXPLAIN`),
-so a `LIMIT` is never left short. A set of up to `pg_lion.vector_exact_rows` rows (2,000) is
-answered exactly, from every member's distance; a larger one by reading partitions as above,
-counting its patience in matching rows. A filter of most of the table is planned as the plain index scan with a `Filter`,
+so a `LIMIT` is never left short. A set of up to `pg_lion.vector_exact_rows` rows (2,000), or of
+up to `pg_lion.vector_exact_per_partition` (1.5) rows for each of the index's partitions if that
+is more, is answered exactly, from every member's distance; a larger one by reading partitions as
+above, counting its patience in matching rows. A filter of most of the table is planned as the plain index scan with a `Filter`,
 and a very selective one as a sort of the lion bitmap scan's rows.
 
 ## Reloptions
@@ -591,12 +592,24 @@ scan keeps (DESIGN.md §44.4).
 
 `pg_lion.vector_exact_rows` (2,000, 0 to 100,000,000): how many rows a lion filter may admit for a
 `lionvec` scan under it to compute every matching row's distance from the table, exactly, instead
-of reading partitions; 0 never does. The exact path reads each matching row's vector (6 KB from
-TOAST at 1536 dimensions, 3 KB as a `halfvec`, so 2,000 rows are 12 MB or 6 MB) where a probe
-reads a few hundred to a thousand 8 KB code pages, but under a filter that leaves most partitions
-empty it probes many for nothing.
+of reading partitions, whatever the index's partitions; 0 leaves it to
+`pg_lion.vector_exact_per_partition`. The exact path reads each matching row's vector (6 KB at
+1536 dimensions, 3 KB as a `halfvec`, so 2,000 rows are 12 MB or 6 MB, a page each when the
+vectors are in TOAST or alone on their heap page) where a probe reads a few hundred to a thousand
+8 KB code pages, but under a filter that leaves most partitions empty it probes many for nothing.
 Raise it for exact answers under wider filters, at a table read a row; the planner prices both
 paths and may sort the filter's rows itself above it, which is exact too (DESIGN.md §44.6).
+
+`pg_lion.vector_exact_per_partition` (1.5, 0 to 1,000,000): the same, counted in rows for each of
+the index's partitions: a filter of no more than this many rows a partition, on average, is
+answered exactly too, however many rows that is - 12,000 at a million rows in the 8,000 partitions
+the build makes, 4,072 at 115,000 in 2,715. Where a filter's rows are this thin, each partition
+read finds about one of them, and reading them all from the table is faster, warm, than reading
+partitions for 0.98 of the ten nearest; from about three rows a partition reading partitions is
+faster (DESIGN.md §44.9). Cold, the exact path is a random table read a row, and the planner
+prices it so: where the exact path would take a filter, `LionOrdered` may lose to the plain index
+scan with a `Filter` (DESIGN.md §44.7). 0 leaves the choice to `pg_lion.vector_exact_rows`; the
+larger of the two counts.
 
 `pg_lion.vector_overflow` (`error`, or `stop`): what a `lionvec` scan does when what it knows of
 its rows outgrows `hash_mem` (`work_mem` times `hash_mem_multiplier`), which only a scan with no
@@ -664,7 +677,7 @@ A `lionvec` index (DESIGN.md §44) answers only an `ORDER BY` of its own distanc
 It has no search operators, no bitmap or index-only scans, no INCLUDE columns and no parallel scan,
 and indexes a single column of pgvector's `vector` or `halfvec` (not `sparsevec` or
 `bit`) of at most 8128 dimensions. Its results are approximate (`pg_lion.vector_margin`), except under a
-lion filter of up to `pg_lion.vector_exact_rows` rows. Inserts serialize on the index's meta page and read every
+lion filter of up to `pg_lion.vector_exact_rows` rows, or `pg_lion.vector_exact_per_partition` a partition. Inserts serialize on the index's meta page and read every
 partition's centroid. VACUUM removes dead rows' codes but reuses their space only for new rows on
 a chain's last page, so a table with heavy churn grows its index until `REINDEX`, which also
 recomputes the partitions and the mean the codes are centred on (rows that have drifted from them
