@@ -247,6 +247,81 @@ BEGIN
 	RETURN n;
 END $$;
 
+/*
+ * vt_regions() reads the REGION chain of an index of 64 partitions or more
+ * (DESIGN.md §44.2) from the meta page's head (at 96) and count (100): each
+ * item's number, its run of partitions - the first and how many - and where
+ * the run's first PART item is (block and offset); and whether they number
+ * from 0 up, the runs follow one another and cover the meta page's
+ * partitions (56), and each run's PART item is its first partition's (a
+ * REGION page's type is 5, a PART page's 4).  vt_placed() compares where
+ * inserts put the rows of an index's table whose ids are past off with
+ * where the build put the rows whose vectors they copy (id - off): how many
+ * are in the same partition, and how many of their copies too.
+ */
+CREATE FUNCTION vt_regions(idx regclass) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	bs int := current_setting('block_size')::int;
+	m bytea := get_raw_page(idx::text, 0);
+	nparts bigint := vt_u32(m, 56);
+	rb bigint := vt_u32(m, 96);
+	p bytea;
+	q bytea;
+	i int;
+	lp bigint;
+	o int;
+	n int := 0;
+	total bigint := 0;
+	cnt bigint;
+	ok boolean := true;
+BEGIN
+	WHILE rb <> 4294967295 LOOP
+		p := get_raw_page(idx::text, rb::int);
+		ok := ok AND vt_u16(p, bs - 4) = 5;
+		FOR i IN 1 .. (vt_u16(p, 12) - 24) / 4 LOOP
+			lp := vt_u16(p, 20 + 4 * i)::bigint | (vt_u16(p, 22 + 4 * i)::bigint << 16);
+			CONTINUE WHEN (lp >> 15) & 3 <> 1;
+			o := (lp & 32767)::int;
+			cnt := vt_u32(p, o + 8);
+			ok := ok AND vt_u32(p, o) = n AND vt_u32(p, o + 4) = total;
+			IF cnt = 0 THEN
+				ok := ok AND vt_u32(p, o + 12) = 4294967295;
+			ELSE
+				q := get_raw_page(idx::text, vt_u32(p, o + 12)::int);
+				lp := vt_u16(q, 20 + 4 * vt_u16(p, o + 16))::bigint |
+					(vt_u16(q, 22 + 4 * vt_u16(p, o + 16))::bigint << 16);
+				ok := ok AND vt_u16(q, bs - 4) = 4 AND vt_u32(q, (lp & 32767)::int) = total;
+			END IF;
+			total := total + cnt;
+			n := n + 1;
+		END LOOP;
+		rb := vt_u32(p, bs - 16);
+	END LOOP;
+	ok := ok AND n = vt_u32(m, 100) AND (n = 0 OR total = nparts);
+	RETURN format('format %s: %s partitions in %s regions; %s', vt_u16(m, 28), nparts, n,
+				  CASE WHEN NOT ok THEN 'MALFORMED'
+					   WHEN n = 0 THEN 'no REGION chain'
+					   ELSE 'runs in order, each at its first PART item' END);
+END $$;
+CREATE FUNCTION vt_placed(idx regclass, off int)
+RETURNS TABLE ("rows" bigint, "same partition" bigint, "same copy's" bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+	RETURN QUERY EXECUTE format($q$
+		WITH it AS (SELECT row_tid, chain, flags & 4 <> 0 AS copy FROM vt_items(%L)),
+		t AS (SELECT id, ctid FROM %s)
+		SELECT count(*), count(*) FILTER (WHERE a.chain = b.chain),
+			   count(*) FILTER (WHERE ac.chain = bc.chain)
+		  FROM t n JOIN t o ON o.id = n.id - %s
+		  JOIN it a ON a.row_tid = n.ctid AND NOT a.copy
+		  JOIN it b ON b.row_tid = o.ctid AND NOT b.copy
+		  LEFT JOIN it ac ON ac.row_tid = n.ctid AND ac.copy
+		  LEFT JOIN it bc ON bc.row_tid = o.ctid AND bc.copy
+		 WHERE n.id > %s$q$,
+		idx, (SELECT indrelid::regclass FROM pg_index WHERE indexrelid = idx), off, off);
+END $$;
+
 -- vt_ids() runs q, which returns a column id, and returns the ids.
 CREATE FUNCTION vt_ids(q text) RETURNS SETOF int
 LANGUAGE plpgsql AS $$ BEGIN RETURN QUERY EXECUTE q; END $$;
@@ -524,6 +599,36 @@ SELECT vec_cmp('SELECT id, v <-> vt_vec(21, 40) AS d FROM vt2 ORDER BY v <-> vt_
 SELECT vec_cmp('SELECT id, v <#> vt_vec(21, 40) AS d FROM vt2 ORDER BY v <#> vt_vec(21, 40)');
 DROP INDEX vt2_two, vt2_five;
 
+-- regions (DESIGN.md §44.3): an index of fewer than 64 partitions, one
+-- partition included, has none; of 100, ceil(sqrt(100)) = 10, the
+-- partitions numbered region by region, so that each region's are a run of
+-- the PART chain
+SELECT i AS index, vt_regions(i) FROM unnest('{vt_l2,vt_ip,vt_cos,vu_l2}'::regclass[]) i;
+CREATE TABLE vr (id int PRIMARY KEY, v vector(40)) WITH (autovacuum_enabled = off);
+INSERT INTO vr
+SELECT i, vt_vec(-(i % 25) - 1, 40) + vt_vec(i, 40, 0.3)
+  FROM generate_series(1, 6400) i;
+CREATE INDEX vr_l2 ON vr USING lionvec (v) WITH (partitions = 100);
+CREATE INDEX vr_ip ON vr USING lionvec (v vector_ip_ops) WITH (partitions = 100);
+CREATE INDEX vr_cos ON vr USING lionvec (v vector_cosine_ops) WITH (partitions = 100);
+SELECT i AS index, vt_regions(i), vt_spill(i), vt_refines(i)
+  FROM unnest('{vr_l2,vr_ip,vr_cos}'::regclass[]) i;
+-- an insert reads the REGION chain and the runs of the regions nearest the
+-- row alone, and puts it where the build put a row of the same vector -
+-- its copy too, but for the few whose SOAR choice the centroids decoded
+-- from their codes (all an insert has of them) turn
+INSERT INTO vr SELECT id + 100000, v FROM vr WHERE id <= 1000;
+SELECT i AS index, p."rows", p."same partition" = p."rows" AS "the build's partition",
+	   p."same copy's" >= p."rows" * 0.9 AS "the build's copy's, mostly"
+  FROM unnest('{vr_l2,vr_ip,vr_cos}'::regclass[]) i, LATERAL vt_placed(i, 100000) p;
+SELECT op, q, k, vec_cmp(format('SELECT id, v %s %s AS d FROM vr ORDER BY v %s %s LIMIT %s',
+								op, q, op, q, k)) AS result
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op),
+	   (VALUES ('vt_vec(-3, 40)'), ('vt_vec(23, 40, 2.0)')) c(q),
+	   (VALUES (10), (300)) l(k)
+ ORDER BY op, q, k;
+DROP TABLE vr;
+
 /*
  * vec_recall() runs q - which returns a column id - through the index and
  * through a sequential scan and sort, and returns the share of the second's
@@ -688,7 +793,7 @@ CREATE INDEX ON vbad USING lionvec (v);
 CREATE INDEX ON vbad USING lionvec (w);
 CREATE INDEX ON vbad USING lionvec (v, v);
 CREATE INDEX ON vt USING lionvec (v) WITH (partitions = -1);
-CREATE INDEX ON vt USING lionvec (v) WITH (partitions = 65537);
+CREATE INDEX ON vt USING lionvec (v) WITH (partitions = 262145);
 CREATE INDEX ON vt USING lionvec (v) WITH (spill = maybe);
 ALTER INDEX vt_l2 SET (spill = 2);
 SET pg_lion.vector_epsilon = 0.5;
@@ -700,6 +805,8 @@ DROP TABLE vt, vt2, vt_cases, ve, vu, vbad;
 DROP FUNCTION vec_cmp(text);
 DROP FUNCTION vec_recall(text);
 DROP FUNCTION vt_ids(text);
+DROP FUNCTION vt_placed(regclass, int);
+DROP FUNCTION vt_regions(regclass);
 DROP FUNCTION vt_strays(regclass);
 DROP FUNCTION vt_refines(regclass);
 DROP FUNCTION vt_spill(regclass);

@@ -429,9 +429,11 @@ the default margin returned 92% of the true ten nearest with it and 84% without,
 with it as many as one of 5 without, reading less than half the partitions. `WITH (spill = off)`
 and a `REINDEX` keep one copy (the figures above and below are from an index without).
 
-Building the index runs k-means over a sample of the rows and then compares every row with every
-centroid, so it takes time in proportion to the rows times the partitions. Both steps run in
-parallel for a table of 10,000 rows or more, or one with a `parallel_workers` setting, in up to
+Building the index runs k-means over a sample of the rows and then finds every row's partition,
+comparing each row with the centroids of the groups of partitions (regions) and then of the
+partitions in the regions nearest it, so it takes time in proportion to the rows times the square
+root of the partitions. Both steps run in parallel for a table of 10,000 rows or more, or one
+with a `parallel_workers` setting, in up to
 `max_parallel_maintenance_workers` workers (2 by default) besides the building backend; for a
 large table raise it, and `maintenance_work_mem`, which holds the sample k-means runs on:
 
@@ -441,8 +443,9 @@ SET max_parallel_maintenance_workers = 7;  -- eight processes, within max_parall
 CREATE INDEX items_emb ON items USING lionvec (embedding vector_cosine_ops);
 ```
 
-115,186 rows of 1536 dimensions took 125 to 134 s alone and 38 s with three workers on four
-cores, and a scan answers the same through either index (DESIGN.md §44.12). A parallel build keeps
+115,386 rows of 1536 dimensions in 2,717 partitions took 108 s alone and 36 s with three workers
+on four cores (292 s and 85 s before the regions), and a scan answers the same through either
+index (DESIGN.md §44.12). A parallel build keeps
 its sample of the rows, up to half of `maintenance_work_mem`, in shared memory: in Docker, whose
 `/dev/shm` is 64 MB unless `--shm-size` says otherwise, give it at least that much, or the build
 stops with "could not resize shared memory segment"; `SET max_parallel_maintenance_workers = 0`

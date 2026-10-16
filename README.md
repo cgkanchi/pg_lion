@@ -274,10 +274,12 @@ columns and can be built in parallel on PostgreSQL 17 and later. `pg_lion_vector
 - jsonb `<@` isn't indexed, and jsonpath (`@?`, `@@`) is always rechecked in the heap. Updating
   an indexed jsonb document writes one entry per path, so it costs more than with GIN's pending
   list.
-- `lionvec` answers only an `ORDER BY` of its distance, approximately, as HNSW and IVFFlat do. It
-  builds without parallel workers, and slowly: k-means, then every row compared with every
-  partition's centroid, 19 minutes for 975,000 rows of 1536 dimensions, growing with the rows
-  times the partitions. It reuses the space of deleted rows only slowly and
+- `lionvec` answers only an `ORDER BY` of its distance, approximately, as HNSW and IVFFlat do. Its
+  build is arithmetic: k-means, then every row compared with the centroids of the groups of
+  partitions (regions) and of the partitions in the regions nearest it, so it grows with the rows
+  times the square root of the partitions: 115,386 rows of 1536 dimensions in 2,717 partitions
+  took 108 s alone and 36 s with three parallel workers (292 s and 85 s comparing every row with
+  every centroid). It reuses the space of deleted rows only slowly and
   keeps the partitions it was built with, so a table with heavy churn or drift needs an occasional
   `REINDEX`. Each row it returns is read from the table twice.
 - On a hot standby, indexes using the default (generic) WAL mode recheck every row in counts.
