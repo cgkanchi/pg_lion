@@ -1547,6 +1547,57 @@ kmeans_work_free(LionVecKmeansWork *w)
 	free(w->planes);
 }
 
+/*
+ * k-means as a parallel build runs it (lion_vec.c, DESIGN.md §44.12): its
+ * steps, each iteration's rows assigned a chunk of the given size at a time,
+ * the chunks taken last first and alternately by two "processes", each with
+ * scratch of its own, sharing the centroids' codes.  Returns the iterations.
+ */
+static int
+kmeans_by_chunks(const Sample *sm, int k, int iters, bool unit, const float *mean,
+				 float *cent, LionVecKmeansWork *w, int chunk)
+{
+	LionVecKmeansWork w2 = *w;
+	int			n = sm->s.n;
+	int			D = sm->s.dimsp;
+	int			nchunks = (n + chunk - 1) / chunk;
+	int			made = 0;
+
+	w2.lo = (double *) xmalloc(sizeof(double) * k);
+	w2.hi = (double *) xmalloc(sizeof(double) * k);
+	w2.cand = (int *) xmalloc(sizeof(int) * k);
+	w2.x = falloc(D);
+	w2.y = falloc(D);
+	w2.codes = (uint8 *) xmalloc(D);
+	w2.qc = falloc(D);
+	w2.planes = (uint64 *) xmalloc(sizeof(uint64) * (D / 64) * LIONVEC_QBITS);
+	lionvec_kmeans_start(&sm->s, k, unit, 42, cent, w->assign);
+	while (made < iters)
+	{
+		int			moved = 0;
+		int			c;
+
+		made++;
+		lionvec_kmeans_codes(k, D, mean, cent, w);
+		for (c = nchunks - 1; c >= 0; c--)
+			moved += lionvec_kmeans_assign(&sm->s, c * chunk, Min((c + 1) * chunk, n),
+										   k, mean, cent, w->assign,
+										   c % 2 == 0 ? w : &w2);
+		if (moved == 0)
+			break;
+		lionvec_kmeans_update(&sm->s, k, unit, w->assign, cent, w);
+	}
+	free(w2.lo);
+	free(w2.hi);
+	free(w2.cand);
+	free(w2.x);
+	free(w2.y);
+	free(w2.codes);
+	free(w2.qc);
+	free(w2.planes);
+	return made;
+}
+
 /* one k-means run, checked for what holds of any: returns the iterations */
 static int
 kmeans_run(const Sample *sm, int k, int iters, bool unit, const float *mean,
@@ -1693,6 +1744,42 @@ test_kmeans(void)
 		memcpy(cent2, cent, sizeof(float) * T * D);
 		kmeans_run(&sm, T, 50, unit, mean, cent, &w);
 		CHECK(memcmp(cent, cent2, sizeof(float) * T * D) == 0, "k-means is not repeatable");
+
+		/*
+		 * ... however its rows are shared out: a parallel build's k-means, to
+		 * the bit, the assignment too, in chunks of 1, 7 and 32 rows and in
+		 * one, with eight centroids a cluster (empty ones split) and with T
+		 */
+		{
+			int		   *assign0 = (int *) xmalloc(sizeof(int) * n);
+			int			chunks[4] = {1, 7, 32, n};
+			int			kk;
+
+			for (kk = T; kk <= 8 * T; kk += 7 * T)
+			{
+				int			c;
+				int			made0;
+
+				kmeans_work_free(&w);
+				kmeans_work(&w, n, kk, D);
+				made0 = lionvec_kmeans(&sm.s, kk, 10, unit, 42, mean, cent2, &w);
+				memcpy(assign0, w.assign, sizeof(int) * n);
+				for (c = 0; c < 4; c++)
+				{
+					int			made1 = kmeans_by_chunks(&sm, kk, 10, unit, mean, cent,
+														 &w, chunks[c]);
+
+					CHECK(made1 == made0 &&
+						  memcmp(cent, cent2, sizeof(float) * kk * D) == 0 &&
+						  memcmp(w.assign, assign0, sizeof(int) * n) == 0,
+						  "k-means by chunks is not k-means");
+				}
+			}
+			free(assign0);
+			kmeans_work_free(&w);
+			kmeans_work(&w, n, T, D);
+			kmeans_run(&sm, T, 50, unit, mean, cent, &w);
+		}
 
 		/* no mean: the same answer, the bounds only looser */
 		kmeans_run(&sm, T, 50, unit, NULL, cent2, &w);

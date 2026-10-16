@@ -245,7 +245,7 @@ Integers, floats, `numeric`, `bool`, `text`/`varchar`, `char(n)`, `bytea`, `uuid
 timestamps, `interval`, `inet`, `macaddr`, `jsonb` (whole values, or paths with
 `jsonb_contains_ops`), `pg_lsn`, `oid`, enums, any array, and `tsvector`. Install `pg_lion_citext` for case-insensitive `citext`. Indexes can have several
 columns and can be built in parallel on PostgreSQL 17 and later. `pg_lion_vector` indexes pgvector's
-`vector` and `halfvec` with `lionvec` (one column, built serially).
+`vector` and `halfvec` with `lionvec` (one column, built in parallel from PostgreSQL 16).
 
 ## Limitations
 
