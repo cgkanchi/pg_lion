@@ -20336,7 +20336,8 @@ holds no member (§44.6).
   distances. A centroid left with no rows takes half of the largest's (FAISS's way). The
   centroids are then coded as rows are, against the mean. Every loop of it - the centroids'
   coding, the assignment, the means, the splits - checks for interrupts once an item
-  (`LIONVEC_CHECK_INTERRUPTS()`, nothing in the unit tests' build), so that a cancel,
+  (`LIONVEC_CHECK_INTERRUPTS()` in `lionvec_kmeans_codes()`, `_assign()` and `_update()`, the
+  steps a parallel build's leader and workers run too, §44.12; nothing in the unit tests' build), so that a cancel,
   `statement_timeout` or shutdown ends a build in k-means within one item's work. Until a review
   found it (2026-10-15) none did, and a build was deaf to all three until k-means ended: days at the
   `partitions` reloption's old ceiling of a million. Measured on 500,000 rows of 16 dimensions,
@@ -20346,8 +20347,8 @@ holds no member (§44.6).
   partitions (below) and so costs as much as an iteration of k-means over every row, was deaf too,
   for another reason found measuring the first: the build kept the REFINE page it was filling
   locked from row to row, and a content lock holds off interrupts. It now keeps the page pinned
-  and locks it only to add an item (`lionvec_build_put_refine()`); no other backend reads the
-  index yet. Measured on 200,000 rows of 256 dimensions, 1,800 partitions, `maintenance_work_mem`
+  and locks it only to add an item (`lionvec_build_put_refine()`, as a parallel build's workers do,
+  §44.12); no other backend reads the index yet. Measured on 200,000 rows of 256 dimensions, 1,800 partitions, `maintenance_work_mem`
   64 MB (k-means about 8 minutes): a cancel early in the second scan took 78 s before, the scan's
   whole length (the build 569 s), and 0.013 s after.
 - **Assignment.** The build's second scan puts each row in the partition of the centroid nearest
