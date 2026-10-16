@@ -283,12 +283,31 @@ typedef enum LionVecOverflow
 	LIONVEC_OVERFLOW_STOP		/* return no more rows, with a NOTICE */
 } LionVecOverflow;
 
+/*
+ * What the planner does with a lionvec scan that a Filter would follow
+ * (lion_ordered.c, lion_ordered_set_rel_pathlist(); DESIGN.md §44.6,
+ * "Post-filtering"): pg_lion.vector_postfilter's values.  The scan's pause
+ * and its order frontier move on the rows it returns, and a Filter above it
+ * rejects most of those, so such a plan finds other rows than LionOrdered,
+ * whose scan returns members only, at the same margin and patience.
+ */
+typedef enum LionVecPostfilter
+{
+	LIONVEC_POSTFILTER_EXACT,	/* no such plan: LionOrdered, or an exact one
+								 * (the default) */
+	LIONVEC_POSTFILTER_ERROR,	/* ... and a query left without LionOrdered
+								 * fails at plan time */
+	LIONVEC_POSTFILTER_ALLOW	/* the plain scan and its Filter compete on
+								 * cost, as before 2026-10-16 */
+} LionVecPostfilter;
+
 extern double lionvec_epsilon;
 extern int	lionvec_batch;
 extern double lionvec_margin;
 extern int	lionvec_patience;
 extern int	lionvec_exact_rows;
 extern int	lionvec_overflow;
+extern int	lionvec_postfilter;
 
 /*
  * What an ORDER BY operator of lionvec's returns: pgvector's all return
