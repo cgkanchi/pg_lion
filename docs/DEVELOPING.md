@@ -61,10 +61,10 @@ replay, so turning it on for a primary that never replays proves nothing.
   `pg_walinspect` `walrecords` fails, and most files use `citext`.  `installcheck` checks for
   all four before it starts and stops with one message if any is missing.  The PGDG packages
   (`postgresql-N`) include contrib; a source build needs `make -C contrib install`.
-- **pgvector** 0.7 or later (for `halfvec`) for `vector.sql`, `vector_filter.sql` and
-  `vector_half.sql`, lionvec's files (DESIGN.md §44): the PGDG package `postgresql-N-pgvector`, or
-  a build of github.com/pgvector/pgvector against the same `pg_config`.  Where it is missing those
-  files are skipped and the run says so (`PGVECTOR=1` forces them; `PGVECTOR=0` skips them).
+- **pgvector** 0.7 or later (for `halfvec`) for `vector.sql`, `vector_filter.sql`,
+  `vector_half.sql` and the `lionvec_*` isolation specs, lionvec's files (DESIGN.md §44): the PGDG
+  package `postgresql-N-pgvector`, or a build of github.com/pgvector/pgvector against the same
+  `pg_config`.  Where it is missing those files are skipped and the run says so (`PGVECTOR=1` forces them; `PGVECTOR=0` skips them).
   pg_lion itself builds and loads without it.
 - **Session settings** the expected plans assume (`work_mem`, `maintenance_work_mem`, no parallel
   workers, no JIT) are passed to every connection the suite makes through `PGOPTIONS`

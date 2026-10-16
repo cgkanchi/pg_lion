@@ -20173,6 +20173,16 @@ of that name another handler serves is never taken for one; `lion_vec_restrict()
 `lion_vec_scan_cost()`. The changes to lion's own code are `_PG_init()` calling `lion_vec_init()`
 (the settings, the 8-bit tables, the kernels) and LionOrdered's (§44.6).
 
+An operator class of one's own is checked as far as lionvec reads through it. Its input type must
+be NAMED `vector` or `halfvec`, of length -1 (`lionvec_type_ok()`): the reader below takes every
+datum for a varlena of pgvector's layout, and a class over `int` had it detoast an integer as a
+pointer, a crash (a review found it, 2026-10-15). The index's open refuses any other type, and
+`amvalidate` reports the class. Its ORDER BY operator must return `float8` or `float4`
+(`lionvec_distance_type_ok()`), as `amvalidate` reports and a scan's start checks; the scan reads
+each distance, and hands it back in `xs_orderbyvals`, in the operator's own type, as core's
+`index_store_float8_orderby_distances()` does. Until that review a `float4` operator's distances
+were read, and returned, as `float8`.
+
 `halfvec` (2026-10-15; pgvector 0.7 and on: the same 8-byte header, then IEEE 754 binary16
 halves) has the same three, `halfvec_l2_ops` (its default), `halfvec_ip_ops` and
 `halfvec_cosine_ops`, over pgvector's `l2_distance`, `halfvec_negative_inner_product` and
@@ -20324,11 +20334,35 @@ holds no member (§44.6).
   is under the least upper bound), by their exact distance; about ten candidates of 200 at 320
   dimensions and more, so that k-means costs a popcount scan of the centroids a row and a few float
   distances. A centroid left with no rows takes half of the largest's (FAISS's way). The
-  centroids are then coded as rows are, against the mean.
+  centroids are then coded as rows are, against the mean. Every loop of it - the centroids'
+  coding, the assignment, the means, the splits - checks for interrupts once an item
+  (`LIONVEC_CHECK_INTERRUPTS()`, nothing in the unit tests' build), so that a cancel,
+  `statement_timeout` or shutdown ends a build in k-means within one item's work. Until a review
+  found it (2026-10-15) none did, and a build was deaf to all three until k-means ended: days at the
+  `partitions` reloption's old ceiling of a million. Measured on 500,000 rows of 16 dimensions,
+  `maintenance_work_mem` 1 GB, 60,000 partitions (the heap scans take 8 s): before, the build ran
+  on past 150 s of a 60 s `statement_timeout` and a cancel, and took `kill -9`; after, it stops at
+  10.02 s of a 10 s one and 60.01 s of a 60 s one. The second heap scan, which finds each row's
+  partitions (below) and so costs as much as an iteration of k-means over every row, was deaf too,
+  for another reason found measuring the first: the build kept the REFINE page it was filling
+  locked from row to row, and a content lock holds off interrupts. It now keeps the page pinned
+  and locks it only to add an item (`lionvec_build_put_refine()`); no other backend reads the
+  index yet. Measured on 200,000 rows of 256 dimensions, 1,800 partitions, `maintenance_work_mem`
+  64 MB (k-means about 8 minutes): a cancel early in the second scan took 78 s before, the scan's
+  whole length (the build 569 s), and 0.013 s after.
 - **Assignment.** The build's second scan puts each row in the partition of the centroid nearest
   it by L2: of the candidates plane 1 leaves, by the centroids' 8-bit codes, whose error is about a
   seventieth of plane 1's (`lionvec_build_nearest()`); an insert does the same from the PART chain
-  and the candidates' REFINE items (`lionvec_insert_nearest()`). The root of the rows' mean
+  and the candidates' REFINE items (`lionvec_insert_nearest()`). An insert keeps, as it reads the
+  PART chain, only the partitions plane 1 cannot rule out so far (`lionvec_cands_add()`, the
+  streaming form of `lionvec_candidates_n()`: the m least upper bounds met, and every partition
+  whose lower bound is under the m-th), and drops those the bound has since passed whenever they
+  fill an array that starts at 64 and doubles only when more than half stay: 40 bytes a candidate,
+  where it kept every partition's codes and bounds, about 250 bytes a partition at 1536 dimensions,
+  16 MB an insert at 65,536 partitions and 192 MB at the reloption's old ceiling (a review found
+  it, 2026-10-15). The candidates are the batch function's, as the unit tests check; an insert's
+  memory at 1536 dimensions went from 539 KB to 224 KB at 1,250 partitions and from 1.54 MB to 359
+  KB at 5,000 (356 and 364 KB at 125). The root of the rows' mean
   squared distance from their centroids, over the dimensions, is the meta page's scale; each
   partition's own mean squared distance and its longest row go in its PART item (§44.4's inner
   product). Both k-means and the assignment cost a plane-1 estimate of every centroid for every
@@ -20564,6 +20598,67 @@ the partitions, the members themselves counted once, from the filter. A walk (NU
 query, or no ORDER BY) reads each partition's chain and skips its copies, so that it returns each
 row once.
 
+**The hash's bound** (2026-10-15, after a review found the hash unbounded). The GONE entries stay
+for the scan's life, so the hash grew with every row returned: a scan with no LIMIT over a hundred
+million rows would hold gigabytes, past any `work_mem`, and fail in palloc where a sort would
+spill. It is now held to `hash_mem`, as a hash join's table is: as many entries as the largest of
+simplehash's power-of-two arrays within it holds below its fill of 0.9 (`lv_seen_most()`), 48
+bytes each; the PLANE1 entries, the row queue's own, come with its cap and are counted apart.
+When an entry would not fit, `lv_seen_evict()` walks the hash, in three tiers:
+
+- the entries a probe no longer needs: those of rows whose PLANE-1 upper bound, kept in the entry
+  (`hi1`, carried in the queue's items from the probe), lies below the key of the row returned
+  last. The scan's order is strict, so no such row can be returned again, and from that walk on a
+  probe drops a row whose upper bound lies below that key, as the hash would have - and a refine
+  or a fetch one whose codes or distance put it there, which the hash then keeps. Nothing is
+  lost: the probe tells those rows by plane 1 alone, as it first read them. (A row whose plane-1
+  bound fails so, not yet returned, is lost, as one the margin leaves till too late is.) This is
+  the review's own suggestion made exact: the rows returned are dropped as the scan moves past
+  them, as far as plane 1 can tell them from the rest.
+- if that freed less than a quarter of the hash, the rows behind the last that plane 1 cannot
+  tell: returned at a lesser distance, or known by their codes or distance to lie nearer. A probe
+  meets them again and refines (or fetches) them once more, to find them behind again;
+- and if that is still less than a quarter, what it knows of the rows ahead (CODES8, EXACT).
+
+The second and third lose knowledge, and bring back the livelock that knowledge prevents (above):
+so after four passes that lost knowledge since the scan was last done with a row, it stops
+(`lv_may_probe()`); passes that lose nothing in between do not reset that count, since they may
+only win back what the last one lost (vector.sql's scan at 64 kB made 65,000 passes for 20 rows
+when they did). A walk is allowed once a quarter of what the hash may hold has come in since the
+last, which pays for it; when none is, or a walk frees no room, a row's codes or distance are not
+kept, and a row returned must be, so the scan stops after it. In an index that spills, an entry
+lost also lets the row's other item enter its pass, so that the queue may hold the row twice;
+whichever comes out second finds the row returned, or behind, and is dropped. A scan that cannot
+go on fails the query by default, `lionvec scan of "i" outgrew hash_mem after N rows`, an ERROR
+whose HINT names `work_mem`, `hash_mem_multiplier`, a sort, a LIMIT and
+`pg_lion.vector_overflow` (§44.8). Set to `stop`, that ends the scan instead: it returns no more
+rows and raises a NOTICE, `lionvec scan of "i" stopped after N rows, what it knew of its rows
+having outgrown hash_mem`; what it returned is in order, each row once, the nearest it found.
+The ERROR is the default (chosen 2026-10-16) so that a query that asked for every row never gets
+fewer without failing; pgvector's iterative scans end without a word. The DEBUG1 line
+counts the walks and those that lost knowledge. How far a scan gets depends on how well plane 1
+tells rows apart, so on the dimensions and the data. Measured with `stop`, no LIMIT, `work_mem`
+4 MB and so `hash_mem` 8 MB (117,964 entries) unless said, one row of the table as the query:
+
+- 3,006 rows of 40 dimensions (vector.sql's), at 128 kB and `hash_mem_multiplier` 1 (1,843
+  entries): every row, in order, the first tier alone making room.
+- 2,000,000 rows of 16 dimensions, where plane 1 tells rows apart worst: before, every row, the
+  scan's memory 165 MB, 81 s; after, it stops after 31,250 rows, 30 MB, 2.4 s; at 16 MB after
+  88,212; at 64 MB every row, 241 MB (its queue's cap and the hash both grow with it), 33 s.
+- 200,000 rows of 256 dimensions in 100 clusters of 2,000, uniform noise about each centre, so
+  that the other 198,000 rows lie at distances within a few percent of each other, inside plane
+  1's bound: before, 199,994 rows (6 out of order), 25 MB, 1.9 s, each row refined once; after,
+  it stops after 14,912 rows, 18 MB, 2.0 s, having refined 604,286 (five walks, each losing
+  knowledge); at 8 MB every row as before, 36 MB, 2.1 s, no walk. The rows a scan must know of at
+  once to return the next is the table here, and the hash holds 59% of it.
+
+A LIMIT of 10 or 1,000 over the last, 200 queries, costs what it did before (2.8 and 5.3 ms a
+query either way, within the noise of runs). pgvector's iterative scans bound theirs the same
+way, and tighter: HNSW's ends, without a word, at `hnsw.max_scan_tuples` (20,000) rows or
+`work_mem` times `hnsw.scan_mem_multiplier` (1). The bound is read once, as the scan starts
+(`seenmost`), so that `lv_remember()` costs no more than it did: a new entry with room is one
+insert, and only a full hash looks a row up first.
+
 **NULLs and zeros.** NULL rows come last, with NULL distances, from the NULL chain; before them,
 in a cosine index, the zero vectors, whose distance is NaN (float8 sorts NaN after every number,
 as the sequential scan's sort does), from the same chain. A NULL query returns every row of every
@@ -20768,7 +20863,12 @@ no ORDER BY costs infinity. Selectivity 1, correlation 0.
   is fast or exactness is wanted, lower it where the vectors are wide and the disk slow. The
   planner prices both (§44.7), so it may sort the filter's rows itself above the threshold, as
   it does at 1% on DBpedia (§44.9), which is exact too.
-- `partitions` (reloption, 0 to 1,000,000, default 0): the partitions the build makes; 0 chooses
+- `pg_lion.vector_overflow` (enum, `error` or `stop`, default `error`): what a scan does when what
+  it knows of its rows outgrows `hash_mem` (§44.4, "The hash's bound"): fail the query, or end
+  the scan at the rows it returned, with a NOTICE. Only a scan with no LIMIT, or a large one,
+  over rows plane 1 cannot tell apart gets there.
+- `partitions` (reloption, 0 to 65,536, default 0; 1,000,000 until a review found the build at a
+  million partitions days long and uncancellable): the partitions the build makes; 0 chooses
   by the rows' count, `8 sqrt(n)` above 10,000 rows as `maintenance_work_mem`'s sample allows
   (§44.3; `2 sqrt(n)` until DBpedia, §44.9). Read by the build alone, so a change takes a REINDEX.
   It does not move the pause: `pg_lion.vector_patience` counts the rows of `2 sqrt(n)` partitions,
@@ -21160,7 +21260,9 @@ medians of three and two), the same index.
   `lionvec_rank()` against a sort, with ties, NaN and infinities; `lionvec_candidates_n()` for the
   nine nearest at 64, 320 and 1536 dimensions - for one the same as `lionvec_candidates()`, at a
   wide bound every one of the nine a candidate, at the build's bound one missed at most once in
-  200, and still few (10 of 200 at 320 dimensions and more, 107 at 64); `lionvec_decode8()` at 64 to
+  200, and still few (10 of 200 at 320 dimensions and more, 107 at 64), and the same from the
+  streaming form an insert keeps (`lionvec_cands_add()`, with the insert's pruning) for one and for
+  nine; `lionvec_decode8()` at 64 to
   8128 dimensions - its error `|x|^2 (1 - alpha8^2)` to 1e-3, at most 3% of `|x|` and 1.2% on
   average, orthogonal to the decoded vector; `lionvec_soar_second()`'s algebra on a constructed
   case whose answer flips where the arithmetic says (a candidate along the residual against one
@@ -21183,7 +21285,14 @@ medians of three and two), the same index.
   0.9 of the ten nearest for each metric, over 20 queries, pausing) and a negative margin's (less
   than all of a hundred between clusters); a scan pausing after every partition (a patience of 1)
   still returning a LIMIT 300 whole and in order; and the refusals (another type, too many
-  dimensions, an array, two columns, the `partitions` and settings' ranges). Spill, its indexes'
+  dimensions, an array, two columns, the `partitions` and settings' ranges, an operator class over
+  `int` - `amvalidate` false, CREATE INDEX an error - and one whose operator returns `integer`,
+  which `amvalidate` reports and a scan refuses); an operator class whose operator returns
+  `float4`, valid, its scans' distances `float4` and the operator's own; the progress hash held to
+  `hash_mem` (§44.4): a scan with no LIMIT at 128 kB, whose hash holds 1,843 entries for 3,001
+  rows, returning every row as a sort does, and at a `work_mem` of 64 kB failing with its ERROR,
+  or, with `pg_lion.vector_overflow` set to `stop`, stopping with its NOTICE, what it returned the
+  sort's first rows; the setting refuses any other value. Spill, its indexes'
   CODE items read off their pages with pageinspect: after the build, inserts, UPDATE, DELETE and
   VACUUM and REINDEX, every row with a vector has one primary and one copy, in another partition's
   chain (each block placed by following the chains from the PART items' heads), naming the same
@@ -21211,6 +21320,18 @@ medians of three and two), the same index.
   node (the short LIMIT of §44.4); the node switched off. Spill: LionOrdered returns each member
   once and the same rows as the ordinary plan, every member of two filters for each metric, at
   the margin of 100 and at the defaults, before and after DELETE and VACUUM under the filter.
+- **test/isolation/lionvec_insert_window.spec** (an injection point build, PostgreSQL 17 and on;
+  2026-10-15, after a review found lionvec's concurrency untested): an insert parked after its
+  REFINE record (`lionvec-insert-refined`), and after its CODE record before its copy's
+  (`lionvec-insert-coded`), against a cursor opened before it, which drains while it is parked and
+  returns exactly a sort's rows under its snapshot, each once; a scan started while it is parked,
+  which waits for the meta page (`(*)`, a buffer lock) and then sees none of its rows; and a scan of
+  the whole index afterwards, every row once. **lionvec_vacuum_scan.spec**: 2,500 of 3,000 rows
+  deleted, VACUUM in two flushes of its REFINE locations (`maintenance_work_mem` 64 kB), then 2,500
+  inserts into the REFINE slots and heap TIDs it freed, against a cursor parked after five rows with
+  REFINE locations in its queue and against a scan parked between two pages of a chain
+  (`lionvec-probe-page`); each returns exactly a sort's rows under its snapshot, each once, and the
+  whole index afterwards every row once.
 - **vector_half.sql**: the three `halfvec` operator classes, and `amvalidate`; each ORDER BY through
   the index and through a sort, as vector.sql's, with the margin of 100 and the pause off, for
   each metric over 3,000 `halfvec(40)` rows in 20 partitions, three queries and LIMITs 1 to past
