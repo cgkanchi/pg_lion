@@ -1383,7 +1383,7 @@ lionvec_build_centroids(LionVecBuildState *bs, const LionVecSample *sample)
 	else
 		made = lionvec_kmeans(sample, k, LIONVEC_KMEANS_ITERS,
 							  bs->metric == LIONVEC_COSINE, (uint64) LIONVEC_SEED,
-							  bs->info->mean, bs->a.cent, &w);
+							  bs->info->mean, bs->a.cent, &w, NULL, NULL);
 	elog(DEBUG1, "lionvec index \"%s\": %d partitions from a sample of %d rows, %d k-means iterations",
 		 RelationGetRelationName(bs->index), k, sample->n, made);
 
@@ -2019,7 +2019,7 @@ lionvec_kmeans_share(LionVecBuildShared *shared, const LionVecSample *s,
 		to = Min(from + LIONVEC_KMEANS_CHUNK, (uint32) s->n);
 		CHECK_FOR_INTERRUPTS();
 		moved = lionvec_kmeans_assign(s, (int) from, (int) to, k, mean, cent,
-									  assign, w);
+									  assign, w, NULL);
 
 		SpinLockAcquire(&shared->mutex);
 		shared->kdone += (int) (to - from);

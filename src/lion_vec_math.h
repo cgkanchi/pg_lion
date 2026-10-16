@@ -253,6 +253,17 @@ extern int	lionvec_candidates_n(const LionVecCentroids *c, const LionVecQuery *q
 								 int m, double *lo, double *hi, int *cand);
 
 /*
+ * ... and among the n centroids idx[0 .. n) alone (lionvec_route()): the
+ * candidates lionvec_candidates_n() would find were those the only
+ * centroids, in idx's order - their bounds into lo[i] and hi[i] by their
+ * places in idx, and into cand the centroids themselves.  idx NULL is every
+ * centroid, n being c->k, which is lionvec_candidates_n().
+ */
+extern int	lionvec_candidates_among(const LionVecCentroids *c, const int *idx,
+									 int n, const LionVecQuery *q, int m,
+									 double *lo, double *hi, int *cand);
+
+/*
  * lionvec_candidates_n() a centroid at a time, for a caller that reads the
  * centroids from pages and would rather not hold all k of them (an insert,
  * lion_vec.c): begin with m, add each centroid in turn - its bounds into *lo
@@ -334,6 +345,107 @@ typedef struct LionVecSample
 extern void lionvec_sample_row(const LionVecSample *s, int i, float *x);
 
 /*
+ * The sample k-means is given (lion_vec.c, DESIGN.md §44.3) is at most a
+ * fixed number of rows a partition of the reservoir's, which may hold many
+ * more: m of the slots [0, n), 0 <= m <= n, chosen uniformly at random by a
+ * partial Fisher-Yates shuffle from a pg_prng seeded with seed, into
+ * slot[0 .. m) in ascending order - so that the rows they name, moved down
+ * in place, keep the reservoir's order, which k-means' update sums them in.
+ * slot must hold n; past m it is scratch.
+ */
+extern void lionvec_subsample(int n, int m, uint64 seed, uint32 *slot);
+
+/*
+ * Regions (DESIGN.md §44.3): the build's k centroids, when there are
+ * LIONVEC_REGION_MIN of them or more, gathered by k-means over the centroids
+ * into lionvec_region_count(k) regions, about sqrt(k), so that the centroid
+ * nearest a row is looked for among the centroids of the regions nearest it
+ * alone (lionvec_route()): an estimate of each region's centroid and of the
+ * beam regions' sqrt(k) members each, not of all k, so that a row costs
+ * (beam + 1) sqrt(k) estimates, not k.  k-means' iterations find each
+ * sample row's centroid so, the centroids regrouped at the start of each;
+ * and so do the build's second pass and inserts, by the regions of the
+ * final centroids, which the index keeps (its REGION chain).  A row whose
+ * nearest centroid is in none of its beam's regions goes to the nearest
+ * that is, where a scan finds it later.  Scans rank every centroid still:
+ * ranked through the regions, the partitions near a query came out in an
+ * order that read a third more rows for the same recall in the simulation.
+ *
+ * The beams are constants, not a share of the regions, as they must be for
+ * that cost to hold: on DBpedia (DESIGN.md §44.9) five regions found the
+ * nearest centroid exact assignment did for 98.8% of the rows in 53
+ * regions and 99.5% in 100, where four found it for 98.3% in 53; a
+ * spilling build's nine nearest, of which SOAR picks the copy's partition,
+ * lie farther out and take sixteen (the copy's partition for 99.5% of the
+ * rows in 27 regions, 98.6% in 53 and 97.9% in 100, where five gave 88% in
+ * 100 and thirteen 96.95%).  k-means wants the nearest alone; the second
+ * pass of a build that spills, once over the rows, and an insert into one,
+ * the nine.
+ */
+#define LIONVEC_REGION_MIN		64	/* the fewest centroids put in regions */
+#define LIONVEC_REGION_ITERS	5	/* k-means' iterations over the centroids */
+#define LIONVEC_BEAM			5	/* regions a row's nearest is looked for in */
+#define LIONVEC_BEAM_SOAR		16	/* ... and its LIONVEC_SOAR_CANDS + 1 nearest */
+/* the seed of the regions' k-means, from that of the rows' */
+#define LIONVEC_REGION_SEED(seed)	((seed) + 1)
+
+/* the regions of k centroids: none below LIONVEC_REGION_MIN, else ceil(sqrt(k)) */
+static inline int
+lionvec_region_count(int k)
+{
+	int			n;
+
+	if (k < LIONVEC_REGION_MIN)
+		return 0;
+	n = (int) ceil(sqrt((double) k));
+	return n < k ? n : k;
+}
+
+/*
+ * ... and how many of n a row is routed to, for its m nearest centroids:
+ * LIONVEC_BEAM for the nearest alone, LIONVEC_BEAM_SOAR for more, never more
+ * than there are.  The build and an insert ask with the same n and m, and so
+ * look in the same regions.
+ */
+static inline int
+lionvec_region_beam(int n, int m)
+{
+	int			beam = m > 1 ? LIONVEC_BEAM_SOAR : LIONVEC_BEAM;
+
+	return beam < n ? beam : n;
+}
+
+/*
+ * k centroids in n regions: region g's centroid, rotated and coded as a row
+ * is, centred on the rows' mean - plane 1 alone - and its members,
+ * member[first[g]] .. member[first[g + 1] - 1], ascending; a region may have
+ * none.  A row is routed to beam of them (lionvec_region_beam(n)).  The
+ * arrays are the caller's: a parallel build's are in shared memory, by
+ * which every process routes alike.
+ */
+typedef struct LionVecRegions
+{
+	int			n;				/* regions; 0: none */
+	int			k;				/* the centroids they gather */
+	int			dimsp;
+	uint64	   *bits;			/* [n][dimsp / 64]: their centroids' plane 1 */
+	uint16	   *popcount;		/* [n] */
+	float	   *norm;			/* [n] */
+	float	   *alpha1;			/* [n] */
+	int		   *first;			/* [n + 1] */
+	int		   *member;			/* [k] */
+} LionVecRegions;
+
+/* What lionvec_route() works in, a process's own, for n regions of k centroids. */
+typedef struct LionVecRoute
+{
+	double	   *key;			/* [n]: each region's key for the row */
+	int		   *order;			/* [n] */
+	int		   *pick;			/* [n]: the regions it looks in */
+	int		   *idx;			/* [k]: ... and their members */
+} LionVecRoute;
+
+/*
  * What lionvec_kmeans() works in: the caller's arrays, of the lengths given,
  * so that it allocates nothing.
  */
@@ -353,14 +465,63 @@ typedef struct LionVecKmeansWork
 	uint8	   *codes;			/* [dimsp] */
 	float	   *qc;				/* [dimsp] */
 	uint64	   *planes;			/* [dimsp / 64][LIONVEC_QBITS] */
+	LionVecRoute route;			/* with regions: each row's routing; else unused */
 } LionVecKmeansWork;
+
+/*
+ * A region's key for the row q was made from (LIONVEC_L2): plane 1's
+ * estimate of the squared distance of the region's centroid (bits,
+ * popcount, norm and alpha1) from the row, less |x|^2, which is the same
+ * for every region; infinite when that is not a number.
+ */
+extern double lionvec_region_key(const LionVecQuery *q, const uint64 *bits,
+								 uint16 popcount, float norm, float alpha1);
+
+/*
+ * The regions a row looks in, of n of keys key[n] and members first[g] ..
+ * first[g + 1] - 1: the beam nearest it that have members, least key first,
+ * ties to the lower region (lionvec_rank()), and then more, nearer first,
+ * until they have need members between them or none are left - so that a
+ * spilling build's m nearest are there to be ranked however the centroids
+ * fell into regions.  Into pick[], ascending, so that their members come in
+ * the centroids' order; returns how many.  order[] is scratch; both hold n.
+ */
+extern int	lionvec_regions_pick(const double *key, const int *first, int n,
+								 int beam, int need, int *order, int *pick);
+
+/*
+ * The candidates that can be among the m nearest of the row q was made from
+ * among the members of its regions (lionvec_regions_pick(), need m;
+ * lionvec_candidates_among()), into cand, and their bounds into lo and hi
+ * by their places among those members; returns their number.  rt is scratch
+ * for r's regions and centroids.
+ */
+extern int	lionvec_route(const LionVecRegions *r, const LionVecCentroids *c,
+						  const LionVecQuery *q, int m, LionVecRoute *rt,
+						  double *lo, double *hi, int *cand);
+
+/*
+ * What lionvec_regions_make() works in, for k centroids and n regions: the
+ * k-means over the centroids, their 8-bit codes its sample, and the regions'
+ * centroids it finds.
+ */
+typedef struct LionVecRegionMaker
+{
+	LionVecKmeansWork w;		/* for k rows and n centroids; no route */
+	uint8	   *codes;			/* [k][dimsp] */
+	float	   *scale;			/* [k] */
+	float	   *cent;			/* [n][dimsp]: rotated, not centred */
+} LionVecRegionMaker;
 
 /*
  * Lloyd's k-means of the sample's n rows into k <= n centroids cent[k][dimsp]
  * (rotated, not centred), over iters iterations from k distinct rows the
  * seed picks; unit, the centroids are scaled to unit length after each
  * (spherical k-means, for cosine).  Each row goes to its nearest centroid by
- * L2, found among lionvec_candidates() by the exact distance; a centroid
+ * L2, found among lionvec_candidates() by the exact distance - or, given
+ * regions r of the k centroids (and mk to make them in), among
+ * lionvec_route()'s, the centroids regrouped (lionvec_regions_make(),
+ * LIONVEC_REGION_SEED(seed)) at the start of each iteration; a centroid
  * left with no rows takes half of the largest's (FAISS's way).  mean, the
  * rows' (rotated; NULL: zero), centres the codes the candidates are found
  * by, which only makes their bounds tighter.  Returns the iterations made:
@@ -368,23 +529,39 @@ typedef struct LionVecKmeansWork
  */
 extern int	lionvec_kmeans(const LionVecSample *s, int k, int iters, bool unit,
 						   uint64 seed, const float *mean, float *cent,
-						   LionVecKmeansWork *w);
+						   LionVecKmeansWork *w, LionVecRegions *r,
+						   LionVecRegionMaker *mk);
+
+/*
+ * Gather the r->k centroids cent[k][dimsp] (rotated, not centred) into r->n
+ * <= k regions: Lloyd's k-means of the centroids, coded to 8 bits as a
+ * sample's rows are, LIONVEC_REGION_ITERS iterations from the centroids the
+ * seed picks, spherical when unit; then each centroid into the region whose
+ * centroid is nearest it after the last update (as lionvec_kmeans_assign()
+ * finds a row's), and the regions' centroids coded against mean.  The same
+ * centroids and seed make the same regions, to the bit.
+ */
+extern void lionvec_regions_make(LionVecRegions *r, const float *cent,
+								 bool unit, uint64 seed, const float *mean,
+								 LionVecRegionMaker *mk);
 
 /*
  * lionvec_kmeans()'s steps, for a build that shares an iteration's rows
  * between processes (DESIGN.md §44.12): it is start(), then until iters are
- * made or assign() moves no row, codes(), assign() over every row and
- * update().  Each row's assignment depends on the centroids alone, and
- * update() sums the rows in their order, so that the centroids come out the
- * same however assign()'s rows are shared out.
+ * made or assign() moves no row, codes(), with regions
+ * lionvec_regions_make(), assign() over every row and update().  Each row's
+ * assignment depends on the centroids (and their regions, made of them)
+ * alone, and update() sums the rows in their order, so that the centroids
+ * come out the same however assign()'s rows are shared out.
  *
  * start: the k rows the seed picks into cent, unit length when unit, and
  * every assign[n] -1.  codes: the centroids' plane 1 into w's bits,
  * popcount, norm and alpha1, centred by mean (w->x and w->codes its
  * scratch).  assign: rows [from, to) each to its nearest centroid, into
- * assign[]; returns how many moved.  It reads w's bits, popcount, norm and
- * alpha1, and works in its lo, hi, cand, y, qc and planes, none of which
- * another assign() may be using at the same time.  update: each centroid
+ * assign[], routed through the regions r unless r is NULL; returns how many
+ * moved.  It reads w's bits, popcount, norm and alpha1 and r, and works in
+ * w's lo, hi, cand, y, qc, planes and route, none of which another assign()
+ * may be using at the same time.  update: each centroid
  * the mean of its rows (w->count, w->y its scratch), an empty one half of
  * the largest's, unit length when unit.
  */
@@ -394,7 +571,8 @@ extern void lionvec_kmeans_codes(int k, int dimsp, const float *mean,
 								 const float *cent, LionVecKmeansWork *w);
 extern int	lionvec_kmeans_assign(const LionVecSample *s, int from, int to,
 								  int k, const float *mean, const float *cent,
-								  int *assign, LionVecKmeansWork *w);
+								  int *assign, LionVecKmeansWork *w,
+								  const LionVecRegions *r);
 extern void lionvec_kmeans_update(const LionVecSample *s, int k, bool unit,
 								  const int *assign, float *cent,
 								  LionVecKmeansWork *w);
