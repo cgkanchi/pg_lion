@@ -588,7 +588,9 @@ true ten nearest to 97.9%), and under a 1% filter from 1,511 partitions to 244 a
 two points (100% to 98.1%). Smaller pauses sooner and misses more; 0 never pauses.
 
 `pg_lion.vector_batch` (100, 1 to 100,000): how many rows a `lionvec` scan gathers candidates for
-from the partitions it reads. A query that wants more (a large `LIMIT`, or none) reads those
+from the partitions it reads; under a lion filter, the query's `LIMIT` (and `OFFSET`) instead when
+the planner knows it and it is more, up to an eighth of the candidates `work_mem` holds. A query
+that wants more (a `LIMIT` past that, one the planner does not know, or none) reads those
 partitions again, gathering four times as many each time. `work_mem` bounds how many candidates a
 scan keeps (DESIGN.md §44.4).
 

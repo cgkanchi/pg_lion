@@ -2627,11 +2627,12 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			 * one not constant at planning (a generic plan's Param), or one
 			 * that does not reach the scan (grouping, aggregates, DISTINCT,
 			 * window functions or set-returning functions above it); a
-			 * subquery's root has its own.  The vector
-			 * scan pauses at no tier below them (§44.4).  It is where to
-			 * pause, not a bound: a scan asked for more rows - a residual
-			 * filter or a join above it taking fewer than it returns -
-			 * returns more.
+			 * subquery's root has its own.  The vector scan pauses at no
+			 * tier below them, and gathers them in a pass when they are
+			 * more than pg_lion.vector_batch (§44.4).  It is where to pause
+			 * and what to gather, not a bound: a scan asked for more rows -
+			 * a residual filter or a join above it taking fewer than it
+			 * returns - returns more.
 			 */
 			if (root->limit_tuples > 0)
 				limit = root->limit_tuples >= (double) PG_INT64_MAX ?
@@ -4285,8 +4286,8 @@ lo_start_walk(LionOrderedState *st)
 
 	/*
 	 * A lionvec scan reads and scores only the set's members (§44.6), and
-	 * pauses by the rows the LIMIT takes (§44.4); every rescan forgets both,
-	 * and a rebuilt set has moved.
+	 * pauses and gathers by the rows the LIMIT takes (§44.4); every rescan
+	 * forgets both, and a rebuilt set has moved.
 	 */
 	if (st->knn)
 	{
