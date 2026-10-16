@@ -577,14 +577,14 @@ SHOW pg_lion.vector_overflow;
 (1 row)
 
 SELECT count(*) FROM (SELECT id, v <-> vt_vec(13, 40) AS d FROM vt ORDER BY v <-> vt_vec(13, 40)) s;
-ERROR:  lionvec scan of "vt_l2" outgrew hash_mem after 7 rows
+ERROR:  lionvec scan of "vt_l2" outgrew hash_mem after 38 rows
 -- pg_lion.vector_overflow = stop ends the scan there instead, with a
 -- NOTICE: what it returned is the start of the sort's order, each row once
 SET pg_lion.vector_overflow = stop;
 CREATE TEMP TABLE vt_cut AS
 SELECT row_number() OVER () AS n, id, d
   FROM (SELECT id, v <-> vt_vec(13, 40) AS d FROM vt ORDER BY v <-> vt_vec(13, 40)) s;
-NOTICE:  lionvec scan of "vt_l2" stopped after 7 rows, what it knew of its rows having outgrown hash_mem
+NOTICE:  lionvec scan of "vt_l2" stopped after 38 rows, what it knew of its rows having outgrown hash_mem
 RESET enable_seqscan;
 RESET enable_sort;
 SELECT count(*) < 3006 AS stopped, count(*) > 0 AS "some rows",

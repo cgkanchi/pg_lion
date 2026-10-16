@@ -985,7 +985,8 @@ lionvec_note_key(Page page, ItemPointer tid)
 
 /*
  * The most rows the reservoir holds, whatever maintenance_work_mem does: 64
- * a partition at LIONVEC_MAX_PARTS, half the cut below.  It holds rows x
+ * a partition at LIONVEC_MAX_PARTS, half of what k-means is given a
+ * partition at most (LIONVEC_SAMPLE_PER_PART_MAX).  It holds rows x
  * (dimsp + 4) bytes, 1,540 a row at 1536 dimensions, so 25.8 GB at this cap,
  * which a maintenance_work_mem of 52 GB reaches; it starts at
  * LIONVEC_SAMPLE_FIRST rows and doubles as it fills, so that a small table's
@@ -1003,20 +1004,13 @@ lionvec_note_key(Page page, ItemPointer tid)
 #define LIONVEC_MIN_AUTO_ROWS	10000
 
 /*
- * The most sample rows a partition k-means is given (DESIGN.md §44.3).  The
- * reservoir keeps what half of maintenance_work_mem holds, and the
- * partitions are chosen from all of it; a sample of more than this many a
- * partition is then cut to this many, a uniformly random choice of its rows
- * kept in the reservoir's order (lionvec_build_subsample()).  An iteration of
- * k-means costs its rows, and past some rows a partition more of them move
- * its centroids less than its iterations do: FAISS warns below 39 and cuts
- * above 256.  On DBpedia's 115,386 rows in 679 partitions a cut to 64 lost
- * a hundredth of the true ten at a margin of 3 (0.899 over three draws,
- * against 0.909 from every row), and to 128 none (0.917).
+ * The reservoir keeps what half of maintenance_work_mem holds, and the
+ * partitions are chosen from all of it; k-means is then given
+ * lionvec_kmeans_rows() of it (lion_vec_math.h, DESIGN.md §44.3), a
+ * uniformly random choice of its rows kept in the reservoir's order
+ * (lionvec_build_subsample()), from this seed (the reservoir's is
+ * LIONVEC_SEED, the regions' one past it).
  */
-#define LIONVEC_SAMPLE_PER_PART_MAX	128
-
-/* the cut's seed (the reservoir's is LIONVEC_SEED, the regions' one past it) */
 #define LIONVEC_SEED_SUBSAMPLE	((uint64) LIONVEC_SEED + 2)
 
 /*
@@ -1334,7 +1328,7 @@ lionvec_build_mean_callback(Relation index, ItemPointer tid, Datum *values,
 }
 
 /*
- * Cut the sample to m < sn rows (LIONVEC_SAMPLE_PER_PART_MAX): a uniformly
+ * Cut the sample to m < sn rows (lionvec_kmeans_rows()): a uniformly
  * random m of its slots (lionvec_subsample(), from a seed of its own, so
  * that a build of the same rows keeps the same), each moved down in place,
  * so that they keep the reservoir's order, and the arrays shrunk to them -
@@ -2969,6 +2963,7 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	instr_time	t;
 	double		secs[4] = {0};
 	int			nprocs = 1;
+	int			kmrows;
 
 	if (RelationGetNumberOfBlocks(index) != 0)
 		elog(ERROR, "index \"%s\" already contains data",
@@ -3033,14 +3028,14 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.nparts = bs.dims > 0 ? lionvec_partitions(index, bs.nsum, bs.sn) : 0;
 
 	/*
-	 * ... and k-means' sample, LIONVEC_SAMPLE_PER_PART_MAX rows a partition
-	 * of the rows drawn at most (DESIGN.md §44.3), before a parallel build
-	 * copies it to shared memory
+	 * ... and k-means' sample: the rows drawn, cut to what k-means is given
+	 * of them (lionvec_kmeans_rows(), DESIGN.md §44.3) before a parallel
+	 * build copies it to shared memory
 	 */
 	bs.sdrawn = bs.sn;
-	if (bs.nparts > 0 &&
-		(int64) bs.sn > (int64) LIONVEC_SAMPLE_PER_PART_MAX * bs.nparts)
-		lionvec_build_subsample(&bs, LIONVEC_SAMPLE_PER_PART_MAX * bs.nparts);
+	kmrows = lionvec_kmeans_rows(bs.sn, bs.nparts);
+	if (kmrows < bs.sn)
+		lionvec_build_subsample(&bs, kmrows);
 	bs.spill = bs.nparts >= 2 &&
 		(index->rd_options == NULL || ((LionVecOptions *) index->rd_options)->spill);
 	INSTR_TIME_SET_CURRENT(t);

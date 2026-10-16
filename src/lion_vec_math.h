@@ -356,6 +356,37 @@ extern void lionvec_sample_row(const LionVecSample *s, int i, float *x);
 extern void lionvec_subsample(int n, int m, uint64 seed, uint32 *slot);
 
 /*
+ * How many rows of a reservoir of sn k-means is given, for nparts
+ * partitions (DESIGN.md §44.3): LIONVEC_SAMPLE_PER_PART_MAX a partition at
+ * most - an iteration costs its rows, and past some rows a partition more
+ * of them move the centroids less than the iterations do (FAISS warns below
+ * 39 and cuts above 256; on DBpedia's 115,386 rows in 679 partitions a cut
+ * to 64 lost a hundredth of the true ten at a margin of 3, 0.899 over three
+ * draws against 0.909 from every row, and 128 none, 0.917) - but never
+ * fewer than LIONVEC_SAMPLE_MIN, so that a table of fewer rows than that
+ * is built from every row it sampled, whatever its partitions, as it was
+ * before the cut: k-means over that many rows is seconds at most, and the
+ * regression tests' expected outputs (the partitions a query probes, the
+ * pages it reads) rest on small tables' centroids.  At the default
+ * 8 sqrt(n) partitions the cut is 1,024 sqrt(n) rows, past the floor from
+ * 4,096 rows and every row up to a million, so the floor changes nothing
+ * there; it holds where the partitions reloption is set low on a larger
+ * table.  The cut is sn when there is none, as with no partitions.
+ */
+#define LIONVEC_SAMPLE_PER_PART_MAX	128
+#define LIONVEC_SAMPLE_MIN			65536
+
+static inline int
+lionvec_kmeans_rows(int sn, int nparts)
+{
+	int64		m = (int64) LIONVEC_SAMPLE_PER_PART_MAX * nparts;
+
+	if (m < LIONVEC_SAMPLE_MIN)
+		m = LIONVEC_SAMPLE_MIN;
+	return m < sn ? (int) m : sn;
+}
+
+/*
  * Regions (DESIGN.md §44.3): the build's k centroids, when there are
  * LIONVEC_REGION_MIN of them or more, gathered by k-means over the centroids
  * into lionvec_region_count(k) regions, about sqrt(k), so that the centroid

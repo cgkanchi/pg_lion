@@ -151,8 +151,8 @@ END $$;
 --    index: each metric, spilling or not, one partition, a halfvec
 --    expression, and 100 partitions in ten regions, whose k-means is routed
 --    through regions remade at each iteration by the leader, and whose
---    second pass is too (DESIGN.md §44.3).  The forty partitions' k-means
---    is given 128 rows a partition, 5,120 of the sample's 5,940.
+--    second pass is too (DESIGN.md §44.3).  No sample here is cut: k-means
+--    is given every row of a table below LIONVEC_SAMPLE_MIN rows.
 --    parallel_workers fixes the worker count, whatever the table's size
 --    (lionvec_build_workers()).
 -- ---------------------------------------------------------------------
@@ -220,7 +220,7 @@ SET client_min_messages = debug1;
 SET max_parallel_maintenance_workers = 2;
 REINDEX INDEX pv_l2;
 DEBUG:  building index "pv_l2" on table "pv" with request for 2 parallel workers
-DEBUG:  lionvec index "pv_l2": 40 partitions from a sample of 5120 rows (5940 drawn), 10 k-means iterations
+DEBUG:  lionvec index "pv_l2": 40 partitions from a sample of 5940 rows, 10 k-means iterations
 DEBUG:  lionvec index "pv_l2": built in parallel
 REINDEX INDEX pv_reg;
 DEBUG:  building index "pv_reg" on table "pv" with request for 2 parallel workers
@@ -229,7 +229,7 @@ DEBUG:  lionvec index "pv_reg": built in parallel
 SET max_parallel_maintenance_workers = 0;
 REINDEX INDEX pv_l2;
 DEBUG:  building index "pv_l2" on table "pv" serially
-DEBUG:  lionvec index "pv_l2": 40 partitions from a sample of 5120 rows (5940 drawn), 10 k-means iterations
+DEBUG:  lionvec index "pv_l2": 40 partitions from a sample of 5940 rows, 10 k-means iterations
 DEBUG:  lionvec index "pv_l2": built serially
 REINDEX INDEX pv_reg;
 DEBUG:  building index "pv_reg" on table "pv" serially
@@ -265,14 +265,14 @@ SET max_parallel_maintenance_workers = 2;
 SET client_min_messages = debug1;
 REINDEX INDEX pa_l2;
 DEBUG:  building index "pa_l2" on table "pa" serially
-DEBUG:  lionvec index "pa_l2": 20 partitions from a sample of 2560 rows (10000 drawn), 10 k-means iterations
+DEBUG:  lionvec index "pa_l2": 20 partitions from a sample of 10000 rows, 10 k-means iterations
 DEBUG:  lionvec index "pa_l2": built in parallel
 -- the least maintenance_work_mem, where each process's sort spills to
 -- disk: still in parallel, and the same index as a serial build's
 SET maintenance_work_mem = '1MB';
 REINDEX INDEX pa_l2;
 DEBUG:  building index "pa_l2" on table "pa" serially
-DEBUG:  lionvec index "pa_l2": 20 partitions from a sample of 2560 rows (7710 drawn), 10 k-means iterations
+DEBUG:  lionvec index "pa_l2": 20 partitions from a sample of 7710 rows, 10 k-means iterations
 DEBUG:  lionvec index "pa_l2": built in parallel
 SET client_min_messages = warning;
 CREATE TABLE pa_serial AS SELECT * FROM pv_build('pa_l2', 0);
@@ -290,7 +290,7 @@ VACUUM pa;
 SET client_min_messages = debug1;
 REINDEX INDEX pa_l2;
 DEBUG:  building index "pa_l2" on table "pa" serially
-DEBUG:  lionvec index "pa_l2": 20 partitions from a sample of 2560 rows (9999 drawn), 10 k-means iterations
+DEBUG:  lionvec index "pa_l2": 20 partitions from a sample of 9999 rows, 10 k-means iterations
 DEBUG:  lionvec index "pa_l2": built serially
 SET client_min_messages = warning;
 INSERT INTO pa VALUES (1, pv_vec(1, 8));
@@ -300,15 +300,15 @@ AS $$ BEGIN RETURN i > 0; END $$;
 SET client_min_messages = debug1;
 CREATE INDEX pa_half ON pa USING lionvec ((v::halfvec(8)) halfvec_l2_ops) WITH (partitions = 20);
 DEBUG:  building index "pa_half" on table "pa" serially
-DEBUG:  lionvec index "pa_half": 20 partitions from a sample of 2560 rows (10000 drawn), 10 k-means iterations
+DEBUG:  lionvec index "pa_half": 20 partitions from a sample of 10000 rows, 10 k-means iterations
 DEBUG:  lionvec index "pa_half": built in parallel
 CREATE INDEX pa_safe ON pa USING lionvec (v) WITH (partitions = 20) WHERE id > 0;
 DEBUG:  building index "pa_safe" on table "pa" serially
-DEBUG:  lionvec index "pa_safe": 20 partitions from a sample of 2560 rows (10000 drawn), 10 k-means iterations
+DEBUG:  lionvec index "pa_safe": 20 partitions from a sample of 10000 rows, 10 k-means iterations
 DEBUG:  lionvec index "pa_safe": built in parallel
 CREATE INDEX pa_unsafe ON pa USING lionvec (v) WITH (partitions = 20) WHERE pv_unsafe(id);
 DEBUG:  building index "pa_unsafe" on table "pa" serially
-DEBUG:  lionvec index "pa_unsafe": 20 partitions from a sample of 2560 rows (10000 drawn), 10 k-means iterations
+DEBUG:  lionvec index "pa_unsafe": 20 partitions from a sample of 10000 rows, 10 k-means iterations
 DEBUG:  lionvec index "pa_unsafe": built serially
 SET client_min_messages = warning;
 CREATE TEMP TABLE pt (id int, v vector(8)) WITH (parallel_workers = 2);
@@ -325,6 +325,61 @@ DEBUG:  building index "pn_l2" on table "pn" with request for 2 parallel workers
 DEBUG:  lionvec index "pn_l2": built serially
 SET client_min_messages = warning;
 RESET max_parallel_maintenance_workers;
-DROP TABLE pv, pv_serial, pv_parallel, pv_near, pv_cic_parallel, pa, pa_serial, pt, pn;
+-- ---------------------------------------------------------------------
+-- 3. The sample's cut (DESIGN.md §44.3): a table of more than
+--    LIONVEC_SAMPLE_MIN rows in few partitions has its k-means given 65,536
+--    of the rows it sampled, cut before a parallel build shares the sample,
+--    and the same 65,536 either way: the meta page and the PART items - the
+--    centroids, and each partition's count, spread and longest row - are a
+--    serial build's.  (pv_index()'s CODE digest would take minutes over
+--    140,000 items, so pv_parts() stops at the PART chain.)
+-- ---------------------------------------------------------------------
+CREATE FUNCTION pv_parts(idx regclass) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	bs int := current_setting('block_size')::int;
+	m bytea := get_raw_page(idx::text, 0);
+	p bytea;
+	it bytea;
+	acc bytea[] := '{}';
+	pb bigint := pv_u32(m, 52);
+BEGIN
+	WHILE pb <> 4294967295 LOOP
+		p := get_raw_page(idx::text, pb::int);
+		FOR it IN SELECT pv_items(p) LOOP
+			acc := acc || (substr(it, 1, 4) || substr(it, 13));
+		END LOOP;
+		pb := pv_u32(p, bs - 16);
+	END LOOP;
+	RETURN md5(substr(m, 25, 28) || substr(m, 57, 4) || substr(m, 81, 16) || substr(m, 101, 4)) ||
+		   md5(array_to_string(array(SELECT encode(x, 'hex') FROM unnest(acc) x), '/'));
+END $$;
+CREATE TABLE pc (id int, v vector(8)) WITH (parallel_workers = 2);
+INSERT INTO pc SELECT i, pv_vec(i, 8) FROM generate_series(1, 70000) i;
+SET max_parallel_maintenance_workers = 2;
+SET client_min_messages = debug1;
+CREATE INDEX pc_l2 ON pc USING lionvec (v) WITH (partitions = 20);
+DEBUG:  building index "pc_l2" on table "pc" with request for 2 parallel workers
+DEBUG:  lionvec index "pc_l2": 20 partitions from a sample of 65536 rows (70000 drawn), 10 k-means iterations
+DEBUG:  lionvec index "pc_l2": built in parallel
+SET client_min_messages = warning;
+CREATE TABLE pc_parallel AS SELECT pv_parts('pc_l2') AS parts;
+SET max_parallel_maintenance_workers = 0;
+SET client_min_messages = debug1;
+REINDEX INDEX pc_l2;
+DEBUG:  building index "pc_l2" on table "pc" serially
+DEBUG:  lionvec index "pc_l2": 20 partitions from a sample of 65536 rows (70000 drawn), 10 k-means iterations
+DEBUG:  lionvec index "pc_l2": built serially
+SET client_min_messages = warning;
+RESET max_parallel_maintenance_workers;
+SELECT p.parts = pv_parts('pc_l2') AS "meta page and partitions the same" FROM pc_parallel p;
+ meta page and partitions the same 
+-----------------------------------
+ t
+(1 row)
+
+DROP TABLE pv, pv_serial, pv_parallel, pv_near, pv_cic_parallel, pa, pa_serial, pt, pn,
+	pc, pc_parallel;
 DROP FUNCTION pv_unsafe(int), pv_vec(bigint, int), pv_u16(bytea, int), pv_u32(bytea, int),
-	pv_items(bytea), pv_index(regclass), pv_build(regclass, int), pv_nearest(text);
+	pv_items(bytea), pv_index(regclass), pv_build(regclass, int), pv_nearest(text),
+	pv_parts(regclass);
