@@ -301,8 +301,18 @@ With a `WHERE` that lion indexes answer, `LionOrdered` builds lion's set of the 
 the scan reads and scores only those (`Custom Scan (LionOrdered)` with `Order By:` in `EXPLAIN`),
 so a `LIMIT` is never left short. A set of up to `pg_lion.vector_exact_rows` rows (2,000) is
 answered exactly, from every member's distance; a larger one by reading partitions as above,
-counting its patience in matching rows. A filter of most of the table is planned as the plain index scan with a `Filter`,
-and a very selective one as a sort of the lion bitmap scan's rows.
+counting its patience in matching rows. A very selective filter, or one a sort answers more
+cheaply, is planned as a sort of the lion bitmap scan's rows, which is exact. A `WHERE` clause no
+lion index answers - a column without one, `id > 0`, `embedding IS NOT NULL` - is never applied to
+the rows the `lionvec` scan returns: the scan pauses and skips late rows by the rows it returns,
+not by those a `Filter` keeps, so the answer would depend on the plan (DESIGN.md §44.6,
+"Post-filtering"). By default such a query is planned exactly, as a sort of the filter's rows
+(`pg_lion.vector_postfilter`, below); for an approximate answer, filter the nearest rows of a
+subquery, which the planner never pushes a clause into past its `LIMIT`:
+
+    SELECT id FROM (SELECT id, note, embedding <=> $1 AS d FROM items WHERE category = 3
+                    ORDER BY d LIMIT 1000) s
+     WHERE note LIKE 'a%' ORDER BY d LIMIT 10;
 
 ## Reloptions
 
@@ -415,7 +425,8 @@ working around a bad choice:
   off` takes these walks away too, and the index-only mode of the ordered ones.
 - `pg_lion.enable_ordered_scan` also covers `LionOrdered` over a `lionvec` index's order by
   distance (`ORDER BY embedding <=> $1`), filtered by a Lion set (DESIGN.md §44.6); EXPLAIN shows
-  the distance as `Order By`. Off, a filtered nearest-neighbour query is the plain `lionvec` index
+  the distance as `Order By`. Off, a filtered nearest-neighbour query is sorted exactly, or fails
+  under `pg_lion.vector_postfilter = error`; only under `allow` is it the plain `lionvec` index
   scan with a `Filter`.
 - `pg_lion.enable_lazy_set`: let `LionOrdered` evaluate its Lion set only at the ranges of 64 heap
   blocks its walk reaches, and build it for the whole table only once that has cost what the build
@@ -604,6 +615,22 @@ its rows outgrows `hash_mem` (`work_mem` times `hash_mem_multiplier`), which onl
 `stop` ends the scan with a NOTICE, the rows it returned being in order, each once, and the
 nearest it found (DESIGN.md §44.4).
 
+`pg_lion.vector_postfilter` (`exact`, `error` or `allow`): whether a plan may apply a `WHERE`
+clause to the rows a `lionvec` scan returns, after the scan (DESIGN.md §44.6, "Post-filtering").
+Such a scan stops and skips rows by the rows it returns, most of which the filter then rejects, so
+it finds other rows than `LionOrdered`'s scan of the matching rows alone at the same
+`pg_lion.vector_margin` and `pg_lion.vector_patience`: the plan would decide the answer. `exact`,
+the default: no plan does; a filter lion indexes answer goes through `LionOrdered`, and any other
+is planned exactly, as a sort of the filter's rows (`WHERE id = 5 ORDER BY embedding <=> $1 LIMIT
+1` reads the one row by the primary key and sorts it). `error`: the same, but a query whose
+`lionvec` order would be filtered and that `LionOrdered` cannot answer fails when it is planned,
+`EXPLAIN` included, naming the clauses no lion index answers and suggesting the subquery form
+above. `allow`: the plain scan with a `Filter`, and `LionOrdered` with one, are plans like any
+other, chosen by cost, as before 2026-10-16. `pg_lion.enable_ordered_scan = off` does not
+re-admit the plain scan: under `exact` the query is then sorted, and under `error` it fails. A
+clause the planner tests once (`WHERE $1`, `WHERE current_user = 'app'`), and one a partial
+`lionvec` index's predicate implies, is no filter of the scan's rows.
+
 `pg_lion.ordered_switch_ratio` (32, 1 to 1,000,000): how many B-tree entries `LionOrdered` walks per
 member it has not met yet before it stops walking, fetches the members left in TID order and sorts
 them (DESIGN.md §30.4, "When the walk is not paying"; `Switched to Fetch and Sort` in `EXPLAIN
@@ -664,7 +691,9 @@ A `lionvec` index (DESIGN.md §44) answers only an `ORDER BY` of its own distanc
 It has no search operators, no bitmap or index-only scans, no INCLUDE columns and no parallel scan,
 and indexes a single column of pgvector's `vector` or `halfvec` (not `sparsevec` or
 `bit`) of at most 8128 dimensions. Its results are approximate (`pg_lion.vector_margin`), except under a
-lion filter of up to `pg_lion.vector_exact_rows` rows. Inserts serialize on the index's meta page and read every
+lion filter of up to `pg_lion.vector_exact_rows` rows, and under a filter no lion index answers,
+which by default is a sort of the filter's rows (`pg_lion.vector_postfilter`): exact, and as slow
+as reading every matching row. Inserts serialize on the index's meta page and read every
 partition's centroid. VACUUM removes dead rows' codes but reuses their space only for new rows on
 a chain's last page, so a table with heavy churn grows its index until `REINDEX`, which also
 recomputes the partitions and the mean the codes are centred on (rows that have drifted from them

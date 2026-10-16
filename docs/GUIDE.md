@@ -453,16 +453,32 @@ partitions it reads, so the `LIMIT` is filled from the matching rows whatever th
 table; `Heap Fetches` in `EXPLAIN ANALYZE` counts the rows the node fetched, about `k`. A set of up
 to `pg_lion.vector_exact_rows` rows (2,000) is answered exactly, from every member's distance; a
 larger one by reading
-partitions as above, its patience counted in matching rows. Where a large share of the rows pass
-the filter (3% of a million or more, here) the planner prefers the plain index scan with a
-`Filter`, and for a filter of a few thousand rows a sort of the Lion bitmap scan's rows. With the
-distance functions left at pgvector's cost of 1 it may choose that sort between the two as well,
-where the node is several times faster (pgvector's vectors are stored out of line, so the planner
-sees a small column and a nearly free function); it did on the benchmark until scans paused, and
-the `ALTER FUNCTION`s above keep it from doing so. `pg_dump` does not keep them, so run them again
+partitions as above, its patience counted in matching rows. For a filter of a few thousand rows
+the planner prefers a sort of the Lion bitmap scan's rows, which is exact. With the distance
+functions left at pgvector's cost of 1 it may choose that sort for larger filters as well, where
+the node is several times faster (pgvector's vectors are stored out of line, so the planner sees a
+small column and a nearly free function); it did on the benchmark until scans paused, and the
+`ALTER FUNCTION`s above keep it from doing so. `pg_dump` does not keep them, so run them again
 after a restore; `SET enable_sort = off` steers a single query the same way.
-`pg_lion.enable_ordered_scan = off` takes the node away. An HNSW index on the same column is chosen
-over `lionvec` for nearly every query, filtered or not: pgvector prices its scan as nearly free.
+
+A `WHERE` clause no Lion index answers is never applied to the rows the `lionvec` scan returns: the
+scan pauses, and skips rows it finds too late, by the rows it has returned, so filtering them
+afterwards would find other rows than the node does at the same settings, and the plan would decide
+the answer (DESIGN.md §44.6, "Post-filtering"). Such a query is sorted instead, exactly, which reads
+every row that passes the filter; for an approximate answer, filter the nearest rows of a subquery
+(the planner does not push the outer `WHERE` past its `LIMIT`):
+
+```sql
+SELECT id FROM (SELECT id, title, embedding <=> $1 AS d FROM items WHERE category = 3
+                ORDER BY d LIMIT 1000) s
+ WHERE title LIKE 'A%' ORDER BY d LIMIT 10;
+```
+
+`SET pg_lion.vector_postfilter = error` makes such a query fail instead of being sorted, with that
+suggestion, and `allow` plans as before this rule, the scan with a `Filter` among the plans.
+`pg_lion.enable_ordered_scan = off` takes the node away, and a filtered query is then sorted. An
+HNSW index on the same column is chosen over `lionvec` for nearly every query, filtered or not:
+pgvector prices its scan as nearly free.
 
 What a scan did is in its `DEBUG1` line (`SET client_min_messages = debug1`). On those 975,000
 embeddings, in 1,974 partitions, one query without a filter and then under one keeping 1% of the
