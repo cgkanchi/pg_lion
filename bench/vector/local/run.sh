@@ -30,8 +30,8 @@ LISTS=${LISTS:-$("$PY" -c "print(round($ROWS ** 0.5))")}
 export KNN_DSN="dbname=dbpedia" KNN_ADMIN_DSN="dbname=postgres"
 export KNN_CACHE=$BENCH_DIR/cache KNN_OUT=$OUT KNN_SRC=$REPO
 export KNN_SHARDS="$BENCH_DIR/shards/train-*-of-*.parquet" KNN_NSHARDS=$NSHARDS
-# past ~200k rows the table's TOAST no longer fits shared_buffers: the index
-# goes there, the table and TOAST into the kernel's cache
+# past ~200k rows the table's vectors no longer fit shared_buffers: the index
+# goes there, the table (and TOAST) into the kernel's cache
 [ "$ROWS" -gt 200000 ] && export KNN_PREWARM=${KNN_PREWARM:-read}
 export KNN_RESTART="$LOCAL/pg.sh restart"
 export KNN_DROP=${KNN_DROP:-"sudo -n /usr/local/sbin/lionbench-drop-caches"}
