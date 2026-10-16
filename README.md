@@ -249,11 +249,14 @@ Integers, floats, `numeric`, `bool`, `text`/`varchar`, `char(n)`, `bytea`, `uuid
 timestamps, `interval`, `inet`, `macaddr`, `jsonb` (whole values, or paths with
 `jsonb_contains_ops`), `pg_lsn`, `oid`, enums, any array, and `tsvector`. Install `pg_lion_citext` for case-insensitive `citext`. Indexes can have several
 columns and can be built in parallel on PostgreSQL 17 and later. `pg_lion_vector` indexes pgvector's
-`vector` and `halfvec` with `lionvec` (one column, built in parallel from PostgreSQL 16).
+`vector` and `halfvec` with `lionvec` (one column, built in parallel from PostgreSQL 16; its scans
+can run in parallel too, and ask for the pages they will read before reading them, which cut a
+cold scan's wait on the disk by a third to a half on 115,000 embeddings).
 
 ## Limitations
 
-- No `ORDER BY` from the index itself, no unique indexes, no `INCLUDE` columns, no parallel scans.
+- No `ORDER BY` from the index itself, no unique indexes, no `INCLUDE` columns, no parallel scans
+  (of lion's own indexes: a `lionvec` scan can run in parallel).
   Use a covering B-tree for ordered or row-returning queries, as shown above.
 - Inserts are about 1.5× slower than B-tree.
 - A plain `ORDER BY col LIMIT n` on one column is faster with a B-tree.
@@ -281,7 +284,9 @@ columns and can be built in parallel on PostgreSQL 17 and later. `pg_lion_vector
   took 108 s alone and 36 s with three parallel workers (292 s and 85 s comparing every row with
   every centroid). It reuses the space of deleted rows only slowly and
   keeps the partitions it was built with, so a table with heavy churn or drift needs an occasional
-  `REINDEX`. Each row it returns is read from the table twice.
+  `REINDEX`. Each row it returns is read from the table twice. Its scan runs in parallel only once
+  `parallel_setup_cost` is lowered, and on 115,000 rows it was then 4 to 8 times slower than
+  alone, each process probing about as much as one scan does; a filtered query stays serial.
 - On a hot standby, indexes using the default (generic) WAL mode recheck every row in counts.
   Preloading the library avoids this.
 - Loading the library changes estimates, and so plans, that have nothing to do with lion: a column

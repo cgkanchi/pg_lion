@@ -322,6 +322,21 @@ subquery, which the planner never pushes a clause into past its `LIMIT`:
                     ORDER BY d LIMIT 1000) s
      WHERE note LIKE 'a%' ORDER BY d LIMIT 10;
 
+An unfiltered order can be scanned in parallel (DESIGN.md §44.4, "A parallel scan"): `Gather Merge`
+over `Parallel Index Scan using <lionvec index>`, each process - the workers, and the leader unless
+`parallel_leader_participation` is off - probing the partitions it claims first, running the scan's
+margin and pause on its own rows and returning them in order of distance, and Gather Merge merging
+the orders; each row comes from one process, once, even in an index that spills. Every process
+ranks all the centroids, and the planner prices a partial path so: that ranking in full, the rest
+of the start-up and every row over core's parallel divisor (DESIGN.md §44.7). The workers are
+core's: from the code pages a scan reads (`min_parallel_index_scan_size`) and the table pages its
+rows are fetched from (`min_parallel_table_scan_size`), or the table's `parallel_workers`, up to
+`max_parallel_workers_per_gather`; at the default `parallel_setup_cost` the serial scan is cheaper,
+and on DBpedia's 115,386 rows the serial scan was 4 to 8 times faster than the parallel ones.
+Under `pg_lion.vector_postfilter` `exact` or `error` a partial path that a `Filter` would follow is
+removed as the serial one is, and `LionOrdered` is never parallel, so a filtered query runs in one
+process; under `allow` the parallel scan with a `Filter` is a plan like the serial one.
+
 ## Reloptions
 
 `store_positions` (boolean, default `false`): on a `tsvector` column, also store every lexeme's
@@ -656,6 +671,18 @@ re-admit the plain scan: under `exact` the query is then sorted, and under `erro
 clause the planner tests once (`WHERE $1`, `WHERE current_user = 'app'`), and one a partial
 `lionvec` index's predicate implies, is no filter of the scan's rows.
 
+`pg_lion.vector_prefetch` (`on`): whether a `lionvec` scan asks for the pages it will read next
+before it reads them (DESIGN.md §44.4, "Prefetch"): the rest of a partition's code pages, laid one
+after another by the build, the refine pages and table rows at the front of its queues, and an exact
+answer's matching rows, as many ahead as the tablespace's `effective_io_concurrency`, up to 64 (0
+asks for none). The table's rows are asked for only when its access method is heap's and its
+vectors lie in its pages (`STORAGE PLAIN` or `MAIN`, or at most 506 dimensions, 1,012 as
+`halfvec`). The rows returned are the same either way. Cold it cut a scan's wait on the disk by a
+third to a half on 115,386 embeddings, and an exact answer's over vectors kept in the table by five
+sixths (DESIGN.md §44.9); with everything in shared buffers it costs 4 to 9%, the lookups of pages
+already there. Each scan's `DEBUG1` line names the pages it asked for and how many were not in
+shared buffers.
+
 `pg_lion.ordered_switch_ratio` (32, 1 to 1,000,000): how many B-tree entries `LionOrdered` walks per
 member it has not met yet before it stops walking, fetches the members left in TID order and sorts
 them (DESIGN.md §30.4, "When the walk is not paying"; `Switched to Fetch and Sort` in `EXPLAIN
@@ -713,9 +740,9 @@ that reaches one anyway fails with an error rather than return a different answe
 snapshot's (DESIGN.md §9).  Inserts and VACUUM work as usual.
 
 A `lionvec` index (DESIGN.md §44) answers only an `ORDER BY` of its own distance operator, forward.
-It has no search operators, no bitmap or index-only scans, no INCLUDE columns and no parallel scan,
-and indexes a single column of pgvector's `vector` or `halfvec` (not `sparsevec` or
-`bit`) of at most 8128 dimensions. Its results are approximate (`pg_lion.vector_margin`), except under a
+It has no search operators, no bitmap or index-only scans and no INCLUDE columns, scans in
+parallel only without a filter (above), and indexes a single column of pgvector's `vector` or
+`halfvec` (not `sparsevec` or `bit`) of at most 8128 dimensions. Its results are approximate (`pg_lion.vector_margin`), except under a
 lion filter of up to `pg_lion.vector_exact_rows` rows, or `pg_lion.vector_exact_per_partition` a
 partition, and under a filter no lion index answers, which by default is a sort of the filter's
 rows (`pg_lion.vector_postfilter`): exact, and as slow as reading every matching row. Inserts
