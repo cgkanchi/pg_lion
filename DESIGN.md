@@ -20665,7 +20665,10 @@ as the sequential scan's sort does), from the same chain. A NULL query returns e
 chain with a NULL distance; a cosine zero query every non-NULL row with NaN, then the NULLs; an
 index with no vector yet only its NULLs. A walk copies a page's TIDs out under the page's lock, so
 a VACUUM between two calls cannot make one come back twice. A scan without an ORDER BY, which the
-planner never makes (its cost is infinite), walks every row.
+planner never makes (its cost is infinite, and from PostgreSQL 18, which weighs disabled nodes
+before costs, it carries two disabled nodes, as pgvector's do: without them it beat a sequential scan
+disabled by `enable_seqscan = off`, and a count(*) failed as an index-only scan, found by the
+insert spec of §44.10), walks every row.
 
 ### 44.5 Concurrency, WAL and VACUUM
 

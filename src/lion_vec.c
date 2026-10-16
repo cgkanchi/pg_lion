@@ -3610,6 +3610,17 @@ lionveccostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		*indexStartupCost = get_float8_infinity();
 		*indexTotalCost = get_float8_infinity();
 		*indexPages = index->pages;
+#if PG_VERSION_NUM >= 180000
+
+		/*
+		 * From 18 the planner weighs disabled nodes before costs, so with
+		 * enable_seqscan off a disabled sequential scan lost to this path,
+		 * infinite or not, and a count(*) became an index-only scan that
+		 * failed ("no data returned for index-only scan").  More disabled
+		 * nodes than a disabled scan has keep it out, as pgvector's do.
+		 */
+		path->path.disabled_nodes += 2;
+#endif
 		return;
 	}
 
