@@ -68,10 +68,12 @@
 #include "storage/predicate.h"
 #include "storage/spin.h"
 #include "tcop/tcopprot.h"
+#include "utils/builtins.h"
 #include "utils/float.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
 #include "utils/snapmgr.h"
@@ -85,12 +87,19 @@
 
 PG_FUNCTION_INFO_V1(lionvec_handler);
 
-/* pg_lion.vector_epsilon, _batch, _margin and _patience (§44.8) */
+/* pg_lion.vector_epsilon, _batch, _margin, _patience, ... (§44.8) */
 double		lionvec_epsilon = 4.0;
 int			lionvec_batch = 100;
 double		lionvec_margin = LIONVEC_MARGIN_DEFAULT;
 int			lionvec_patience = LIONVEC_PATIENCE_DEFAULT;
 int			lionvec_exact_rows = LIONVEC_EXACT_DEFAULT;
+int			lionvec_overflow = LIONVEC_OVERFLOW_ERROR;
+
+static const struct config_enum_entry lionvec_overflow_options[] = {
+	{"error", LIONVEC_OVERFLOW_ERROR, false},
+	{"stop", LIONVEC_OVERFLOW_STOP, false},
+	{NULL, 0, false}
+};
 
 static relopt_kind lionvec_relopt_kind;
 
@@ -190,6 +199,18 @@ lion_vec_init(void)
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
+	DefineCustomEnumVariable("pg_lion.vector_overflow",
+							 "What a lionvec scan does when what it knows of its rows outgrows hash_mem.",
+							 "A scan with no LIMIT, or a large one, over rows its codes cannot tell apart "
+							 "may need to know of more rows at once than hash_mem holds.  error fails the "
+							 "query; stop returns no more rows, with a NOTICE, those returned being in "
+							 "order, each once, and the nearest the scan found.",
+							 &lionvec_overflow,
+							 LIONVEC_OVERFLOW_ERROR,
+							 lionvec_overflow_options,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 
 	add_int_reloption(lionvec_relopt_kind, "partitions",
 					  "Partitions a lionvec index's build makes; 0 chooses by the rows' count",
@@ -214,22 +235,46 @@ lion_vec_relation(Relation index)
  */
 
 /*
- * Whether the index's column is pgvector's `halfvec` rather than its
- * `vector` (DESIGN.md §44.1): by the name of its operator class's input
- * type, as pg_lion knows neither type's OID.  The query an index's scan is
- * given is of that type too, as both sides of its operator are.
+ * Whether a type is pgvector's `vector` or its `halfvec` (DESIGN.md §44.1):
+ * by its name, as pg_lion knows neither type's OID, and its being a varlena,
+ * which every read of a row or a query takes it for - a hand-made operator
+ * class over another type would otherwise have lionvec detoast an int as a
+ * pointer.  *half says which.
+ */
+static bool
+lionvec_type_ok(Oid type, bool *half)
+{
+	HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
+	Form_pg_type form;
+	bool		ok;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for type %u", type);
+	form = (Form_pg_type) GETSTRUCT(tup);
+	*half = strcmp(NameStr(form->typname), "halfvec") == 0;
+	ok = (*half || strcmp(NameStr(form->typname), "vector") == 0) &&
+		form->typlen == -1 && !form->typbyval;
+	ReleaseSysCache(tup);
+	return ok;
+}
+
+/*
+ * Whether the index's column is a `halfvec` rather than a `vector`: by its
+ * operator class's input type.  The query an index's scan is given is of
+ * that type too, as both sides of its operator are.  Any other type is
+ * refused, before a row or a query of it is read.
  */
 static bool
 lionvec_index_half(Relation index)
 {
 	Oid			type = index->rd_opcintype[0];
-	HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
 	bool		half;
 
-	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "cache lookup failed for type %u", type);
-	half = strcmp(NameStr(((Form_pg_type) GETSTRUCT(tup))->typname), "halfvec") == 0;
-	ReleaseSysCache(tup);
+	if (!lionvec_type_ok(type, &half))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("lionvec index \"%s\" is of type %s, and lionvec indexes pgvector's vector and halfvec",
+						RelationGetRelationName(index), format_type_be(type))));
 	return half;
 }
 
@@ -2672,6 +2717,22 @@ lionvec_cent_refine(Relation index, BlockNumber rblk, OffsetNumber roff,
 }
 
 /*
+ * A centroid an insert may choose (lionvec_insert_nearest()): what it needs
+ * of the centroid's PART item once the PART chain has been read past it.
+ */
+typedef struct LionVecInsCand
+{
+	int			partno;
+	double		lo;				/* its key's lower bound, for the pruning */
+	float		norm;
+	BlockNumber rblk;			/* its REFINE item */
+	OffsetNumber roff;
+	BlockNumber pblk;			/* its PART item */
+	OffsetNumber poff;
+	BlockNumber tail;			/* its chain's last page */
+} LionVecInsCand;
+
+/*
  * The partition of a row with a vector (DESIGN.md §44.2): the centroid
  * nearest it, as the build finds it (lionvec_build_nearest()), from the PART
  * chain and the candidates' REFINE items.  xc[dimsp] is the row centred.
@@ -2680,6 +2741,13 @@ lionvec_cent_refine(Relation index, BlockNumber rblk, OffsetNumber roff,
  * 8-bit codes (lionvec_decode8()), the build's floats being gone - each
  * REFINE item read once, its codes kept for that; otherwise its partno is
  * -1.
+ *
+ * The PART chain is read a centroid at a time (lionvec_cands_add()), and
+ * only the centroids that can still be candidates are kept, 40 bytes each,
+ * pruned as the threshold falls - not every centroid's plane 1 and nine
+ * arrays besides, which at 1536 dimensions were 250 bytes a partition, 16 MB
+ * a row at 65,536 partitions.  The candidates and their order are the same
+ * (lion_vec_math.h).
  */
 static void
 lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
@@ -2690,35 +2758,32 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 	int			k = (int) meta->nparts;
 	bool		spill = (meta->flags & LIONVEC_META_SPILL) != 0;
 	int			m = spill ? LIONVEC_SOAR_CANDS + 1 : 1;
-	uint64	   *bits = palloc(sizeof(uint64) * (Size) k * nw);
-	uint16	   *pop = palloc(sizeof(uint16) * k);
-	float	   *norm = palloc(sizeof(float) * k);
-	float	   *alpha1 = palloc(sizeof(float) * k);
-	BlockNumber *rblk = palloc(sizeof(BlockNumber) * k);
-	OffsetNumber *roff = palloc(sizeof(OffsetNumber) * k);
-	BlockNumber *pblk = palloc(sizeof(BlockNumber) * k);
-	OffsetNumber *poff = palloc(sizeof(OffsetNumber) * k);
-	BlockNumber *tails = palloc(sizeof(BlockNumber) * k);
-	double	   *lo = palloc(sizeof(double) * k);
-	double	   *hi = palloc(sizeof(double) * k);
-	int		   *cand = palloc(sizeof(int) * k);
-	double	   *key = palloc(sizeof(double) * k);
+	int			maxc = 64;
+	LionVecInsCand *cands = palloc(sizeof(LionVecInsCand) * maxc);
+	double	   *key;
 	int			rank[LIONVEC_SOAR_CANDS + 1];
 	uint8	   *ccodes = NULL;	/* spilling: [nc][dimsp], the candidates' codes */
 	float	   *calpha8 = NULL;
 	float	   *crnorm8 = NULL;
-	LionVecCentroids cents;
+	LionVecCandScan cs;
 	LionVecQuery q;
 	BlockNumber blk = meta->part_head;
 	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
 	uint64		visited = 0;
+	double		thr;
 	int			n = 0;
-	int			nc;
+	int			nc = 0;
 	int			nr;
-	int			best;
 	int			c;
+	int			i;
 
-	/* every centroid's plane 1 */
+	q.dimsp = dimsp;
+	q.qc = palloc(sizeof(float) * dimsp);
+	q.planes = palloc(sizeof(uint64) * nw * LIONVEC_QBITS);
+	lionvec_query_init(&q, LIONVEC_L2, NULL, xc, LIONVEC_ASSIGN_EPS);
+	lionvec_cands_begin(&cs, m);
+
+	/* every centroid's plane 1, keeping those that can still be candidates */
 	while (BlockNumberIsValid(blk))
 	{
 		Buffer		buf;
@@ -2726,6 +2791,7 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 		OffsetNumber off;
 		OffsetNumber maxoff;
 
+		CHECK_FOR_INTERRUPTS();
 		lionvec_chain_step(index, &visited, &nblocks);
 		buf = ReadBuffer(index, blk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -2735,21 +2801,46 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 		for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
 		{
 			LionVecPart *part = lionvec_part_at(index, page, blk, off, dimsp);
+			LionVecInsCand *cd;
+			double		lo;
+			double		hi;
 
 			if (n >= k || part->partno != (uint32) n)
 				ereport(ERROR,
 						(errcode(ERRCODE_INDEX_CORRUPTED),
 						 errmsg("lionvec index \"%s\" has partition %u where %d belongs, at (%u,%u)",
 								RelationGetRelationName(index), part->partno, n, blk, off)));
-			memcpy(bits + (Size) n * nw, part->cent.bits, sizeof(uint64) * nw);
-			pop[n] = part->cent.popcount;
-			norm[n] = part->cent.norm;
-			alpha1[n] = part->cent.alpha1;
-			rblk[n] = part->cent.rblk;
-			roff[n] = part->cent.roff;
-			pblk[n] = blk;
-			poff[n] = off;
-			tails[n] = part->tail;
+			if (!lionvec_cands_add(&cs, &q, part->cent.bits, part->cent.popcount,
+								   part->cent.norm, part->cent.alpha1, &lo, &hi))
+			{
+				n++;
+				continue;
+			}
+			if (nc == maxc)
+			{
+				/* drop those the threshold has passed since; grow if not enough */
+				int			kept = 0;
+
+				thr = lionvec_cands_threshold(&cs);
+				for (c = 0; c < nc; c++)
+					if (cands[c].lo <= thr)
+						cands[kept++] = cands[c];
+				nc = kept;
+				if (nc > maxc / 2)
+				{
+					maxc *= 2;
+					cands = repalloc(cands, sizeof(LionVecInsCand) * maxc);
+				}
+			}
+			cd = &cands[nc++];
+			cd->partno = n;
+			cd->lo = lo;
+			cd->norm = part->cent.norm;
+			cd->rblk = part->cent.rblk;
+			cd->roff = part->cent.roff;
+			cd->pblk = blk;
+			cd->poff = off;
+			cd->tail = part->tail;
 			n++;
 		}
 		blk = LionVecPageGetOpaque(page)->next;
@@ -2761,35 +2852,33 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 				 errmsg("lionvec index \"%s\" has %d partitions, and its meta page says %d",
 						RelationGetRelationName(index), n, k)));
 
-	/* the candidates, ranked by their 8-bit codes */
-	cents.k = k;
-	cents.dimsp = dimsp;
-	cents.bits = bits;
-	cents.popcount = pop;
-	cents.norm = norm;
-	cents.alpha1 = alpha1;
-	q.dimsp = dimsp;
-	q.qc = palloc(sizeof(float) * dimsp);
-	q.planes = palloc(sizeof(uint64) * nw * LIONVEC_QBITS);
-	lionvec_query_init(&q, LIONVEC_L2, NULL, xc, LIONVEC_ASSIGN_EPS);
-	nc = lionvec_candidates_n(&cents, &q, m, lo, hi, cand);
+	/* the candidates: those within the threshold at the end, in order */
+	thr = lionvec_cands_threshold(&cs);
+	i = 0;
+	for (c = 0; c < nc; c++)
+		if (cands[c].lo <= thr)
+			cands[i++] = cands[c];
+	nc = i;
+
+	/* ... ranked by their 8-bit codes */
+	key = palloc(sizeof(double) * Max(nc, 1));
 	if (spill)
 	{
 		/* each candidate's codes, for SOAR's decoding of the ranked ones */
-		ccodes = palloc(sizeof(uint8) * (Size) nc * dimsp);
-		calpha8 = palloc(sizeof(float) * nc);
-		crnorm8 = palloc(sizeof(float) * nc);
+		ccodes = palloc(sizeof(uint8) * (Size) Max(nc, 1) * dimsp);
+		calpha8 = palloc(sizeof(float) * Max(nc, 1));
+		crnorm8 = palloc(sizeof(float) * Max(nc, 1));
 	}
 	for (c = 0; c < nc; c++)
 	{
-		int			j = cand[c];
+		LionVecInsCand *cd = &cands[c];
 		Buffer		buf;
-		LionVecRefine *ref = lionvec_cent_refine(index, rblk[j], roff[j], j,
-												 dimsp, &buf);
+		LionVecRefine *ref = lionvec_cent_refine(index, cd->rblk, cd->roff,
+												 cd->partno, dimsp, &buf);
 		double		est;
 		double		err;
 
-		lionvec_estimate8(&q, ref->codes, norm[j], ref->alpha8, ref->rnorm8,
+		lionvec_estimate8(&q, ref->codes, cd->norm, ref->alpha8, ref->rnorm8,
 						  &est, &err);
 		if (spill)
 		{
@@ -2798,7 +2887,7 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 			crnorm8[c] = ref->rnorm8;
 		}
 		UnlockReleaseBuffer(buf);
-		key[c] = (double) norm[j] * norm[j] - 2.0 * est;
+		key[c] = (double) cd->norm * cd->norm - 2.0 * est;
 	}
 	nr = lionvec_rank(key, nc, m, rank);
 
@@ -2814,11 +2903,14 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 				 errmsg("lionvec index \"%s\" has malformed centroids: %d of %d near a row, fewer than %d",
 						RelationGetRelationName(index), nr, k, Min(k, m))));
 
-	best = cand[rank[0]];
-	dest->partno = best;
-	dest->tail = tails[best];
-	dest->pblk = pblk[best];
-	dest->poff = poff[best];
+	{
+		LionVecInsCand *cd = &cands[rank[0]];
+
+		dest->partno = cd->partno;
+		dest->tail = cd->tail;
+		dest->pblk = cd->pblk;
+		dest->poff = cd->poff;
+	}
 
 	/* the copy's: SOAR's, of the nearest's next (lionvec_build_nearest()) */
 	dest2->partno = -1;
@@ -2828,26 +2920,26 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 	if (spill)
 	{
 		float	   *cf = palloc(sizeof(float) * (Size) nr * dimsp);
-		const float *cs[LIONVEC_SOAR_CANDS];
+		const float *cfs[LIONVEC_SOAR_CANDS];
+		LionVecInsCand *cd;
 		int			s;
-		int			i;
 
 		for (i = 0; i < nr; i++)
 		{
 			int			c8 = rank[i];
 
-			lionvec_decode8(ccodes + (Size) c8 * dimsp, dimsp, norm[cand[c8]],
+			lionvec_decode8(ccodes + (Size) c8 * dimsp, dimsp, cands[c8].norm,
 							calpha8[c8], crnorm8[c8], cf + (Size) i * dimsp);
 			if (i > 0)
-				cs[i - 1] = cf + (Size) i * dimsp;
+				cfs[i - 1] = cf + (Size) i * dimsp;
 		}
-		s = lionvec_soar_second(xc, cf, cs, nr - 1, dimsp, LIONVEC_SOAR_LAMBDA);
+		s = lionvec_soar_second(xc, cf, cfs, nr - 1, dimsp, LIONVEC_SOAR_LAMBDA);
 		Assert(s >= 0 && s < nr - 1);
-		best = cand[rank[s + 1]];
-		dest2->partno = best;
-		dest2->tail = tails[best];
-		dest2->pblk = pblk[best];
-		dest2->poff = poff[best];
+		cd = &cands[rank[s + 1]];
+		dest2->partno = cd->partno;
+		dest2->tail = cd->tail;
+		dest2->pblk = cd->pblk;
+		dest2->poff = cd->poff;
 	}
 }
 
@@ -3023,6 +3115,8 @@ lionvec_append(Relation index, const LionVecInfo *info, LionVecItems *it)
 		}
 		GenericXLogFinish(state);
 		UnlockReleaseBuffer(rbuf);
+		/* the REFINE item is in, and no CODE item points at it yet */
+		LION_INJECTION_POINT("lionvec-insert-refined");
 	}
 
 	/* the CODE item, and its copy: the same, pointing at the same REFINE item */
@@ -3031,6 +3125,8 @@ lionvec_append(Relation index, const LionVecInfo *info, LionVecItems *it)
 	if (dest2.partno >= 0)
 	{
 		Assert(it->hasref && dest2.partno != dest.partno);
+		/* the row is in its nearest partition, and not yet in its second */
+		LION_INJECTION_POINT("lionvec-insert-coded");
 		it->code->flags |= LIONVEC_SPILL;
 		lionvec_append_code(index, metabuf, dimsp, it->code, it->codesize,
 							&dest2, false);
@@ -3583,6 +3679,19 @@ lionvecvalidate(Oid opclassoid)
 	opcintype = classform->opcintype;
 	opclassname = NameStr(classform->opcname);
 
+	{
+		bool		half;
+
+		if (!lionvec_type_ok(opcintype, &half))
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("lionvec operator class \"%s\" is over type %s, and lionvec indexes pgvector's vector and halfvec",
+							opclassname, format_type_be(opcintype))));
+			result = false;
+		}
+	}
+
 	proclist = SearchSysCacheList1(AMPROCNUM, ObjectIdGetDatum(opfamilyoid));
 	if (proclist->n_members > 0)
 	{
@@ -3604,12 +3713,14 @@ lionvecvalidate(Oid opclassoid)
 			oprform->amoppurpose != AMOP_ORDER ||
 			oprform->amoplefttype != opcintype ||
 			oprform->amoprighttype != opcintype ||
-			oprform->amopsortfamily == InvalidOid)
+			oprform->amopsortfamily == InvalidOid ||
+			!lionvec_distance_type_ok(get_op_rettype(oprform->amopopr)))
 		{
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("lionvec operator class \"%s\" has operator %u of strategy %d, and lionvec takes one ORDER BY operator of strategy 1, 2 or 3 over its input type",
-							opclassname, oprform->amopopr, oprform->amopstrategy)));
+					 errmsg("lionvec operator class \"%s\" has operator %s of strategy %d, and lionvec takes one ORDER BY operator of strategy 1, 2 or 3 over its input type, returning float8 or float4",
+							opclassname, format_operator(oprform->amopopr),
+							oprform->amopstrategy)));
 			result = false;
 		}
 		nops++;

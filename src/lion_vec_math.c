@@ -11,6 +11,7 @@
  */
 #ifndef FRONTEND
 #include "postgres.h"
+#include "miscadmin.h"
 #else
 #include "c.h"
 #endif
@@ -1028,39 +1029,61 @@ lionvec_candidates(const LionVecCentroids *c, const LionVecQuery *q,
 	return lionvec_candidates_n(c, q, 1, lo, hi, cand);
 }
 
+void
+lionvec_cands_begin(LionVecCandScan *cs, int m)
+{
+	Assert(m >= 1 && m <= LIONVEC_RANK_MAX);
+	cs->m = Max(1, Min(m, LIONVEC_RANK_MAX));
+	cs->nleast = 0;
+}
+
+bool
+lionvec_cands_add(LionVecCandScan *cs, const LionVecQuery *q,
+				  const uint64 *bits, uint16 popcount, float norm,
+				  float alpha1, double *lo, double *hi)
+{
+	int			m = cs->m;
+	double		est;
+	double		err;
+	int			i;
+
+	lionvec_estimate1(q, bits, popcount, norm, alpha1, &est, &err);
+	lionvec_key_bounds(LIONVEC_L2, norm, 0.0, est, err, lo, hi);
+	/* NaN bounds come back infinite, so every comparison here is total */
+	if (cs->nleast < m || *hi < cs->least[m - 1])
+	{
+		i = cs->nleast < m ? cs->nleast++ : m - 1;
+		for (; i > 0 && cs->least[i - 1] > *hi; i--)
+			cs->least[i] = cs->least[i - 1];
+		cs->least[i] = *hi;
+	}
+	return *lo <= lionvec_cands_threshold(cs);
+}
+
+double
+lionvec_cands_threshold(const LionVecCandScan *cs)
+{
+	/* fewer centroids than m: every one can be among the m nearest */
+	return cs->nleast == cs->m ? cs->least[cs->m - 1] : INFINITY;
+}
+
 int
 lionvec_candidates_n(const LionVecCentroids *c, const LionVecQuery *q, int m,
 					 double *lo, double *hi, int *cand)
 {
 	int			nw = c->dimsp / 64;
-	double		least[LIONVEC_RANK_MAX];	/* the m least upper bounds, ascending */
-	int			nleast = 0;
+	LionVecCandScan cs;
 	double		thr;
 	int			n = 0;
 	int			j;
 
 	Assert(c->dimsp == q->dimsp);
-	Assert(m >= 1 && m <= LIONVEC_RANK_MAX);
-	m = Max(1, Min(m, LIONVEC_RANK_MAX));
+	lionvec_cands_begin(&cs, m);
 	for (j = 0; j < c->k; j++)
-	{
-		double		est;
-		double		err;
-		int			i;
-
-		lionvec_estimate1(q, c->bits + (Size) j * nw, c->popcount[j],
-						  c->norm[j], c->alpha1[j], &est, &err);
-		lionvec_key_bounds(LIONVEC_L2, c->norm[j], 0.0, est, err, &lo[j], &hi[j]);
-		/* NaN bounds come back infinite, so every comparison here is total */
-		if (nleast == m && !(hi[j] < least[m - 1]))
-			continue;
-		i = nleast < m ? nleast++ : m - 1;
-		for (; i > 0 && least[i - 1] > hi[j]; i--)
-			least[i] = least[i - 1];
-		least[i] = hi[j];
-	}
-	/* fewer centroids than m: every one can be among the m nearest */
-	thr = nleast == m ? least[m - 1] : INFINITY;
+		(void) lionvec_cands_add(&cs, q, c->bits + (Size) j * nw,
+								 c->popcount[j], c->norm[j], c->alpha1[j],
+								 &lo[j], &hi[j]);
+	thr = lionvec_cands_threshold(&cs);
 	for (j = 0; j < c->k; j++)
 	{
 		if (lo[j] <= thr)
@@ -1213,6 +1236,18 @@ lionvec_unit(float *x, int n)
 	}
 }
 
+/*
+ * k-means is O(n k) an iteration over up to 2^20 sample rows and 65,536
+ * centroids: a cancel, a statement_timeout or a shutdown must reach it in
+ * the loops over rows and over centroids, not after the build.  The unit
+ * tests have no interrupts to check.
+ */
+#ifndef FRONTEND
+#define LIONVEC_CHECK_INTERRUPTS()	CHECK_FOR_INTERRUPTS()
+#else
+#define LIONVEC_CHECK_INTERRUPTS()	((void) 0)
+#endif
+
 /* how far apart the halves of a split centroid start, as FAISS has it */
 #define LIONVEC_SPLIT_EPS		(1.0f / 1024.0f)
 
@@ -1259,6 +1294,7 @@ lionvec_kmeans_codes(int k, int dimsp, const float *mean, const float *cent,
 	{
 		LionVecEncoded e;
 
+		LIONVEC_CHECK_INTERRUPTS();
 		memcpy(w->x, cent + (Size) j * dimsp, sizeof(float) * dimsp);
 		e.bits = w->bits + (Size) j * nw;
 		e.codes = w->codes;
@@ -1298,6 +1334,7 @@ lionvec_kmeans_assign(const LionVecSample *s, int from, int to, int k,
 		double		bestd = INFINITY;
 		int			c;
 
+		LIONVEC_CHECK_INTERRUPTS();
 		lionvec_sample_row(s, i, w->y);
 		lionvec_query_init(&q, LIONVEC_L2, mean, w->y, LIONVEC_ASSIGN_EPS);
 		nc = lionvec_candidates(&cs, &q, w->lo, w->hi, w->cand);
@@ -1348,6 +1385,7 @@ lionvec_kmeans_update(const LionVecSample *s, int k, bool unit,
 		float	   *sum = cent + (Size) assign[i] * dimsp;
 		int			d;
 
+		LIONVEC_CHECK_INTERRUPTS();
 		lionvec_sample_row(s, i, w->y);
 		for (d = 0; d < dimsp; d++)
 			sum[d] += w->y[d];
@@ -1374,6 +1412,7 @@ lionvec_kmeans_update(const LionVecSample *s, int k, bool unit,
 
 		if (w->count[j] > 0)
 			continue;
+		LIONVEC_CHECK_INTERRUPTS();
 		/* the largest has two rows or more, as k <= n */
 		for (m = 1; m < k; m++)
 			if (w->count[m] > w->count[l])
