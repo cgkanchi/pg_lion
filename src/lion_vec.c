@@ -95,10 +95,18 @@ int			lionvec_patience = LIONVEC_PATIENCE_DEFAULT;
 int			lionvec_exact_rows = LIONVEC_EXACT_DEFAULT;
 double		lionvec_exact_per_part = LIONVEC_EXACT_PER_PART_DEFAULT;
 int			lionvec_overflow = LIONVEC_OVERFLOW_ERROR;
+int			lionvec_postfilter = LIONVEC_POSTFILTER_EXACT;
 
 static const struct config_enum_entry lionvec_overflow_options[] = {
 	{"error", LIONVEC_OVERFLOW_ERROR, false},
 	{"stop", LIONVEC_OVERFLOW_STOP, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry lionvec_postfilter_options[] = {
+	{"exact", LIONVEC_POSTFILTER_EXACT, false},
+	{"error", LIONVEC_POSTFILTER_ERROR, false},
+	{"allow", LIONVEC_POSTFILTER_ALLOW, false},
 	{NULL, 0, false}
 };
 
@@ -216,6 +224,33 @@ lion_vec_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §44.6, "Post-filtering": a lionvec scan under a Filter
+	 * pauses and orders on the rows it returns, most of which the Filter
+	 * rejects, so it finds other rows than the restricted scan LionOrdered
+	 * runs at the same margin and patience (on 1M rows under a 1% filter at
+	 * a margin of 8, 0.993 of the true ten for 29,075 pages against 0.980
+	 * for 3,483).  The plan must not decide the answer, so by default no
+	 * plan filters a lionvec scan's rows: lion_ordered.c takes the plain
+	 * scan out of a restricted relation's paths.
+	 */
+	DefineCustomEnumVariable("pg_lion.vector_postfilter",
+							 "What the planner does with a lionvec scan whose rows a filter would test "
+							 "after the scan returns them.",
+							 "A filter lion indexes answer restricts the scan through LionOrdered.  Any other "
+							 "would reject rows the scan has returned, and those rows decide where it stops "
+							 "and which rows it skips, so the answer would depend on the plan.  exact plans "
+							 "such a query exactly instead, by a sort of the filter's rows; error fails it, "
+							 "and suggests a subquery that filters an unfiltered scan's first rows; allow "
+							 "keeps the filtered scan as a plan to choose by cost.",
+							 &lionvec_postfilter,
+							 LIONVEC_POSTFILTER_EXACT,
+							 lionvec_postfilter_options,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomEnumVariable("pg_lion.vector_overflow",
 							 "What a lionvec scan does when what it knows of its rows outgrows hash_mem.",
 							 "A scan with no LIMIT, or a large one, over rows its codes cannot tell apart "
