@@ -2341,8 +2341,8 @@ lo_rinfos_in(List *a, List *b)
  * most rows makes a set costly to build.
  *
  * NULL when an access in cands answers every clause already, or when some
- * clause no lion access answers; *left is then those clauses, which a plan
- * must filter.
+ * clause no lion access answers (or, which should not happen, their AND
+ * leaves one); *left is then those clauses, which a plan must filter.
  */
 static Path *
 lo_knn_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
@@ -2422,11 +2422,20 @@ lo_knn_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
 	best = (Path *) create_bitmap_and_path(root, rel, quals);
 
 	/*
-	 * Its residual is no larger than any of theirs: a clause one access's
-	 * qual implies, the conjunction of all of theirs implies too.
+	 * Its residual should be none, being no larger than any of theirs: a
+	 * clause one access's qual implies, the conjunction of all of theirs
+	 * implies too.  Were predicate_implied_by() to prove less of the
+	 * conjunction than of its parts, the clauses it leaves are left as a
+	 * clause no access answers is: the query loses LionOrdered over the
+	 * order, which is better than failing it.
 	 */
-	if (lo_lion_residual(rel, best) != NIL)
-		elog(ERROR, "LionOrdered: the lion side ANDed for a lionvec order leaves a clause");
+	rest = lo_lion_residual(rel, best);
+	Assert(rest == NIL);
+	if (rest != NIL)
+	{
+		*left = rest;
+		return NULL;
+	}
 	return best;
 }
 
