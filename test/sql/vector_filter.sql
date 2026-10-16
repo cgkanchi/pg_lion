@@ -346,7 +346,7 @@ END $$;
 -- query, and misses few of its nearest members
 RESET pg_lion.vector_margin;
 RESET pg_lion.vector_patience;
-SELECT op, avg(vf_recall(format('SELECT id FROM vf WHERE cat <> 5 AND v IS NOT NULL
+SELECT op, avg(vf_recall(format('SELECT id FROM vf WHERE cat <> 5
 								  ORDER BY v %s vf_vec(-%s, 24) + vf_vec(%s, 24, 0.3)
 								  LIMIT 10', op, s % 10 + 1, s + 20000))) >= 0.9
 	   AS "most of the nearest"
@@ -379,8 +379,10 @@ SET pg_lion.vector_patience = 0;
 
 /*
  * vf_unique() runs q - which returns a column id - through the node, and
- * through the vector scan with a Filter (the node off), and counts the rows
- * and the distinct ones of each.
+ * through the vector scan with a Filter (the node off, and
+ * pg_lion.vector_postfilter = allow, without which no plan filters a lionvec
+ * scan's rows: DESIGN.md §44.6, "Post-filtering"), and counts the rows and
+ * the distinct ones of each.
  */
 CREATE FUNCTION vf_unique(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -389,6 +391,7 @@ DECLARE
 	b text;
 	used boolean := false;
 	ln text;
+	postfilter text := current_setting('pg_lion.vector_postfilter');
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
@@ -401,8 +404,10 @@ BEGIN
 		q || ') s' INTO a;
 	PERFORM set_config('enable_indexscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	PERFORM set_config('pg_lion.vector_postfilter', 'allow', true);
 	EXECUTE 'SELECT format(''%s rows, %s distinct'', count(*), count(DISTINCT id)) FROM (' ||
 		q || ') s' INTO b;
+	PERFORM set_config('pg_lion.vector_postfilter', postfilter, true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
@@ -457,14 +462,19 @@ SELECT op, vf_unique(format('SELECT id FROM vf WHERE cat <> 5 ORDER BY v %s vf_v
 							op)) AS result
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
 
--- off, the node is not offered: the vector scan filters instead (sorts are
--- off, or sorting the lion scan's rows would be cheaper)
+-- off, the node is not offered, and no plan filters the vector scan's rows
+-- either (pg_lion.vector_postfilter, DESIGN.md §44.6, "Post-filtering"): the
+-- filter's rows are sorted, exactly.  Under allow the vector scan filters
+-- instead (sorts are off, or sorting the lion scan's rows would be cheaper).
 SET pg_lion.enable_ordered_scan = off;
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_sort = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM vf WHERE tag = 3 ORDER BY v <-> '[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]' LIMIT 5;
+SET pg_lion.vector_postfilter = allow; SET enable_sort = off;
 EXPLAIN (COSTS OFF)
 SELECT id FROM vf WHERE tag = 3 ORDER BY v <-> '[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]' LIMIT 5;
 RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_sort;
-RESET pg_lion.enable_ordered_scan;
+RESET pg_lion.vector_postfilter; RESET pg_lion.enable_ordered_scan;
 
 DEALLOCATE vfp;
 DEALLOCATE vfd;
