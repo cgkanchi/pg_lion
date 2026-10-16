@@ -364,7 +364,10 @@ def load():
             cp.write((-1).to_bytes(2, 'big', signed=True))
     print(f'loaded {len(rows)} rows in {time.perf_counter() - t:.0f} s', flush=True)
     t = time.perf_counter()
-    conn.execute('CREATE INDEX dbpedia_u ON dbpedia USING lion (u)')
+    # u is unique, so a range over it is a walk of as many keys as rows;
+    # summaries (DESIGN.md §32) make it a few buckets' sets: LionOrdered's set
+    # of a 10% filter at 1M rows took 45 ms without them and 3 ms with
+    conn.execute('CREATE INDEX dbpedia_u ON dbpedia USING lion (u) WITH (summaries = auto)')
     print(f'dbpedia_u: built in {time.perf_counter() - t:.1f} s', flush=True)
     conn.execute('VACUUM ANALYZE dbpedia')
     # a spot check: the vectors read back as written
@@ -430,7 +433,7 @@ def halfvec():
     conn.execute('DROP TABLE IF EXISTS dbpedia_h')
     conn.execute('CREATE TABLE dbpedia_h (id int PRIMARY KEY, u float8, embedding halfvec(1536))')
     conn.execute('INSERT INTO dbpedia_h SELECT id, u, embedding::halfvec(1536) FROM dbpedia ORDER BY id')
-    conn.execute('CREATE INDEX dbpedia_h_u ON dbpedia_h USING lion (u)')
+    conn.execute('CREATE INDEX dbpedia_h_u ON dbpedia_h USING lion (u) WITH (summaries = auto)')
     conn.execute('VACUUM ANALYZE dbpedia_h')
     n = conn.execute('SELECT count(*) FROM dbpedia_h').fetchone()[0]
     print(f'dbpedia_h: {n} rows in {time.perf_counter() - t:.1f} s', flush=True)

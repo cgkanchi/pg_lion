@@ -71,7 +71,7 @@ stops and opens psql on it.
 | --- | --- |
 | `fetch` | the first `NSHARDS` shards (default all 26) from Hugging Face, resumable |
 | `prepare` | 200 held-out queries and the exact top ten under each filter (float64, chunked) |
-| `load` | the table, binary COPY, and the lion index on the filter column |
+| `load` | the table, binary COPY, and the lion index on the filter column, with summaries (`summaries = auto`): the filter column is unique, and a range over it otherwise walks a key per row |
 | `build` | lionvec with the build's own partition count (8 sqrt(n), spill on); VectorChord with sqrt(n) lists (1,000), spherical centroids, no residual quantization, as at 115k |
 | `warm` | each index's sweep under every filter, warm: lionvec margins 2 to 32, through the planner's plan and LionOrdered; VectorChord probes 10 to 640, with and without `vchordrq.prefilter` |
 | `cold` | restart and drop the cache before each query, 7 queries a method, at the settings the warm runs found reach 0.95 and 0.98 (unfiltered, and at 3% for LionOrdered and the prefilter) |
@@ -84,6 +84,10 @@ step then measures the new one; move `cold.json` aside first to keep both). Ever
 variable of `knn_dbpedia.py` can be set. The warm runs prewarm the index into `shared_buffers` and the table
 and its TOAST into the kernel's cache (`KNN_PREWARM=read`), since 8 GB of TOAST does not fit
 `shared_buffers`, then run every query once untimed before timing it.
+
+**A database loaded before the summaries** has its filter index without them; rebuild it rather
+than reload: `pg.sh psql -d dbpedia -c 'DROP INDEX dbpedia_u' -c 'CREATE INDEX dbpedia_u ON dbpedia
+USING lion (u) WITH (summaries = auto)' -c 'ANALYZE dbpedia'`.
 
 **Smaller runs.** `NSHARDS=8 run.sh` takes 8 shards (about 308k rows) and finishes in a fraction
 of the time; `NSHARDS=3` reproduces the 115k set of the earlier results. Use a separate
