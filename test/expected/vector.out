@@ -1002,10 +1002,23 @@ SELECT cardinality(a) AS n, a = (SELECT array_agg(x ORDER BY x) FROM unnest(a) x
  300 | t
 (1 row)
 
+RESET pg_lion.vector_margin;
+-- ... and at a margin the patience does not grow with, it pauses at each
+-- tier - ten rows, twenty, forty, eighty, then L's hundred - and in the
+-- REST's batch after them: its rows still come in order, each once
+SELECT cardinality(a) AS n, (SELECT count(DISTINCT x) FROM unnest(i) x) AS ids,
+	   a = (SELECT array_agg(x ORDER BY x) FROM unnest(a) x) AS "in order"
+  FROM (SELECT array_agg(d) AS a, array_agg(id) AS i
+		  FROM (SELECT id, v <-> vt_vec(77, 40, 0.5) AS d FROM vt
+				 ORDER BY v <-> vt_vec(77, 40, 0.5) LIMIT 300) l) s;
+  n  | ids | in order 
+-----+-----+----------
+ 300 | 300 | t
+(1 row)
+
 RESET enable_seqscan;
 RESET enable_sort;
 RESET pg_lion.vector_patience;
-RESET pg_lion.vector_margin;
 -- an operator class of one's own, whose operator returns float4: the scan
 -- reads the operator's distances, and hands them back, as float4
 CREATE FUNCTION vt_l2_f4(vector, vector) RETURNS float4
