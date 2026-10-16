@@ -228,7 +228,8 @@ about the time pgvector's HNSW takes to return 95% (8.1 ms at `ef_search` 100);
 `pg_lion.vector_margin` and `pg_lion.vector_patience` trade one for the other. Under a `WHERE` that lion indexes answer, the scan scores only the
 matching rows, so a filter of any selectivity gets its ten nearest: 24 ms at 1% of the rows (98%
 recall), where HNSW returns fewer than one row, or 95% of the right ones in 37 to 41 ms with
-iterative scans, and a filter of up to 2,000 rows (`pg_lion.vector_exact_rows`) is answered exactly.
+iterative scans, and a filter of up to 2,000 rows (`pg_lion.vector_exact_rows`), or of up to 1.5
+rows a partition (`pg_lion.vector_exact_per_partition`), is answered exactly.
 A range over a column of many distinct values, a timestamp or a price, is a walk of every key it
 covers unless the column's lion index keeps summaries (`WITH (summaries = auto)`): at 10% of a
 million unique values, 45 ms before the first row without them and 3 ms with. The index is 1.7 GB to
