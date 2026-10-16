@@ -50,7 +50,7 @@
  * --------------------------------------------------------------------- */
 
 #define LIONVEC_MAGIC			0x4c56454d	/* "LVEM" */
-#define LIONVEC_VERSION			3
+#define LIONVEC_VERSION			4
 #define LIONVEC_METAPAGE		0
 
 /* The rotation's seed.  Kept in the meta page, so it can change later. */
@@ -62,6 +62,7 @@
 #define LIONVEC_PAGE_CODE		2
 #define LIONVEC_PAGE_REFINE		3
 #define LIONVEC_PAGE_PART		4
+#define LIONVEC_PAGE_REGION		5
 
 /* Identifies a lionvec page beside other AMs' (as GIN's and GiST's do). */
 #define LIONVEC_PAGE_ID			0xFF8C
@@ -104,6 +105,8 @@ typedef struct LionVecMetaData
 								 * centroids along one dimension, as built: the
 								 * unit of pg_lion.vector_margin */
 	double		ntuples;		/* rows as of the build */
+	BlockNumber region_head;	/* the REGION chain, or InvalidBlockNumber */
+	uint32		nregions;		/* the regions it holds; 0: none (§44.3) */
 } LionVecMetaData;
 
 typedef LionVecMetaData *LionVecMeta;
@@ -172,6 +175,32 @@ typedef struct LionVecPart
 
 #define LIONVEC_PART_SIZE(dimsp) \
 	(offsetof(LionVecPart, cent) + LIONVEC_CODE_SIZE(dimsp))
+
+/*
+ * A region (DESIGN.md §44.2, §44.3), an item of the REGION chain of an index
+ * of LIONVEC_REGION_MIN partitions or more: the partitions first .. first +
+ * nparts - 1, whose PART items follow one another along the PART chain from
+ * (pblk, poff), and their centroids' centroid, coded as a row is - plane 1
+ * alone, its TID and REFINE item invalid.  An insert looks for a row's
+ * partition among those of the regions nearest it (lionvec_route()), as the
+ * build did.  A region with no partitions has no PART item to point at.
+ * The build writes the REGION chain after the PART chain, and nothing
+ * changes it after.
+ */
+typedef struct LionVecRegion
+{
+	uint32		regno;			/* its place in the chain, from 0 */
+	uint32		first;			/* its first partition */
+	uint32		nparts;			/* ... and how many, in order */
+	BlockNumber pblk;			/* the first one's PART item, or invalid */
+	OffsetNumber poff;
+	uint16		pad1;
+	uint32		pad2;
+	LionVecCode cent;			/* the centroids' centroid, plane 1 */
+} LionVecRegion;
+
+#define LIONVEC_REGION_SIZE(dimsp) \
+	(offsetof(LionVecRegion, cent) + LIONVEC_CODE_SIZE(dimsp))
 
 /* the TID of a centroid's REFINE item */
 #define LionVecCentTid(tid, partno) \
@@ -248,12 +277,16 @@ lionvec_chain_step(Relation index, uint64 *visited, BlockNumber *nblocks)
 #define LIONVEC_MARGIN_DEFAULT	3.0
 /*
  * The most partitions an index has, as the `partitions` option asks or the
- * build chooses: 2^16, which the build's own choice never passes (its sample
- * of at most 2^20 rows, at 16 a partition; lion_vec.c).  k-means costs O(n k)
- * an iteration and an insert reads every centroid, so more is a build of
- * days and an index whose inserts crawl - which the option no longer offers.
+ * build chooses: 2^18, what 8 sqrt(n) comes to at 2^30 rows, a little past a
+ * billion, where the build's own choice stops growing (lion_vec.c; its
+ * sample of at most 2^24 rows, at 16 a partition at the least, would allow
+ * 2^20).  With regions (DESIGN.md §44.3) k-means and the second pass cost
+ * about sqrt(C) estimates a row, not C, and an insert reads the sqrt(C)
+ * regions and its beam's partitions, so that this many is a long build and
+ * not an impossible one.  No partition's number is held in fewer than 32
+ * bits.
  */
-#define LIONVEC_MAX_PARTS		65536
+#define LIONVEC_MAX_PARTS		262144
 
 /*
  * A scan stops probing once it has scored this many units of rows without
@@ -350,6 +383,9 @@ extern LionVecRefine *lionvec_refine_at(Relation index, Page page,
 										int dimsp, ItemPointer tid);
 extern LionVecPart *lionvec_part_at(Relation index, Page page, BlockNumber blk,
 									OffsetNumber off, int dimsp);
+extern LionVecRegion *lionvec_region_at(Relation index, Page page,
+										BlockNumber blk, OffsetNumber off,
+										int dimsp);
 extern BlockNumber *lionvec_chain_heads(Relation index,
 										const LionVecMetaData *meta, int *n);
 

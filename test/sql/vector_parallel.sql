@@ -36,7 +36,8 @@ $$;
  * but for where the chains after the REFINE pages are and the REFINE page
  * inserts append to (a parallel build's processes each leave one partly
  * filled); the PART items in order, but for
- * where their CODE chains start and end; each chain's CODE items in order -
+ * where their CODE chains start and end; the REGION items in order, but for
+ * the block of their first PART item; each chain's CODE items in order -
  * every partition's, then the rows' in no partition, then the NULL rows' -
  * but for where their REFINE items are; and the REFINE items, as a set.  The
  * offsets assume a little-endian server.
@@ -57,7 +58,7 @@ BEGIN
 	END LOOP;
 END $$;
 CREATE FUNCTION pv_index(idx regclass)
-RETURNS TABLE (meta text, parts text, codes text, refines text)
+RETURNS TABLE (meta text, parts text, regions text, codes text, refines text)
 LANGUAGE plpgsql AS $$
 DECLARE
 	bs int := current_setting('block_size')::int;
@@ -71,9 +72,10 @@ DECLARE
 	h bigint;
 BEGIN
 	-- the meta page's contents, from 24, but for the blocks of the PART,
-	-- REST and NULL chains (28, 36 to 51) and refine_tail (52), which follow
-	-- the REFINE pages
-	meta := md5(substr(m, 25, 28) || substr(m, 57, 4) || substr(m, 81, 16));
+	-- REST and NULL chains (28, 36 to 51), refine_tail (52) and the REGION
+	-- chain's (72), which follow the REFINE pages; nregions (76) is kept
+	meta := md5(substr(m, 25, 28) || substr(m, 57, 4) || substr(m, 81, 16) ||
+				substr(m, 101, 4));
 	-- the PART chain (its head at 28): partno, then head and tail, skipped
 	pb := pv_u32(m, 52);
 	WHILE pb <> 4294967295 LOOP
@@ -85,6 +87,17 @@ BEGIN
 		pb := pv_u32(p, bs - 16);
 	END LOOP;
 	parts := md5(array_to_string(array(SELECT encode(x, 'hex') FROM unnest(acc) x), '/'));
+	-- the REGION chain (its head at 72): pblk, at 12 to 15 in an item, skipped
+	acc := '{}';
+	pb := pv_u32(m, 96);
+	WHILE pb <> 4294967295 LOOP
+		p := get_raw_page(idx::text, pb::int);
+		FOR it IN SELECT pv_items(p) LOOP
+			acc := acc || (substr(it, 1, 12) || substr(it, 17));
+		END LOOP;
+		pb := pv_u32(p, bs - 16);
+	END LOOP;
+	regions := md5(array_to_string(array(SELECT encode(x, 'hex') FROM unnest(acc) x), '/'));
 	-- the CODE chains, then the REST and NULL chains' (36, 44): rblk and roff,
 	-- at 20 to 25 in an item, skipped
 	acc := '{}';
@@ -111,7 +124,7 @@ END $$;
 
 -- REINDEX idx with workers allowed, and read it
 CREATE FUNCTION pv_build(idx regclass, workers int)
-RETURNS TABLE (meta text, parts text, codes text, refines text)
+RETURNS TABLE (meta text, parts text, regions text, codes text, refines text)
 LANGUAGE plpgsql AS $$
 BEGIN
 	PERFORM set_config('max_parallel_maintenance_workers', workers::text, true);
@@ -141,8 +154,12 @@ END $$;
 -- 1. Every kind of row - partitioned, NULL, a cosine zero, deleted, and
 --    HOT-updated (indexed under its chain's root TID) - and every kind of
 --    index: each metric, spilling or not, one partition, a halfvec
---    expression.  parallel_workers fixes the worker count, whatever the
---    table's size (lionvec_build_workers()).
+--    expression, and 100 partitions in ten regions, whose k-means is routed
+--    through regions remade at each iteration by the leader, and whose
+--    second pass is too (DESIGN.md §44.3).  The forty partitions' k-means
+--    is given 128 rows a partition, 5,120 of the sample's 5,940.
+--    parallel_workers fixes the worker count, whatever the table's size
+--    (lionvec_build_workers()).
 -- ---------------------------------------------------------------------
 
 CREATE TABLE pv (id int, v vector(24), w text) WITH (parallel_workers = 2);
@@ -158,18 +175,24 @@ CREATE INDEX pv_cos ON pv USING lionvec (v vector_cosine_ops) WITH (partitions =
 CREATE INDEX pv_nospill ON pv USING lionvec (v) WITH (partitions = 40, spill = off);
 CREATE INDEX pv_one ON pv USING lionvec (v) WITH (partitions = 1);
 CREATE INDEX pv_half ON pv USING lionvec ((v::halfvec(24)) halfvec_l2_ops) WITH (partitions = 40);
+CREATE INDEX pv_reg ON pv USING lionvec (v) WITH (partitions = 100);
+CREATE INDEX pv_regcos ON pv USING lionvec (v vector_cosine_ops) WITH (partitions = 100);
 
 CREATE TABLE pv_serial AS
-SELECT i AS idx, b.* FROM unnest('{pv_l2,pv_ip,pv_cos,pv_nospill,pv_one,pv_half}'::regclass[]) i,
+SELECT i AS idx, b.* FROM unnest('{pv_l2,pv_ip,pv_cos,pv_nospill,pv_one,pv_half,pv_reg,pv_regcos}'::regclass[]) i,
 	   LATERAL pv_build(i, 0) b;
 CREATE TABLE pv_near AS
 SELECT op, pv_nearest(op) AS ids FROM unnest('{<->,<#>,<=>}'::text[]) op;
 CREATE TABLE pv_parallel AS
-SELECT i AS idx, b.* FROM unnest('{pv_l2,pv_ip,pv_cos,pv_nospill,pv_one,pv_half}'::regclass[]) i,
+SELECT i AS idx, b.* FROM unnest('{pv_l2,pv_ip,pv_cos,pv_nospill,pv_one,pv_half,pv_reg,pv_regcos}'::regclass[]) i,
 	   LATERAL pv_build(i, 2) b;
 SELECT s.idx AS index, s.meta = p.meta AS meta, s.parts = p.parts AS parts,
-	   s.codes = p.codes AS codes, s.refines = p.refines AS refines
+	   s.regions = p.regions AS regions, s.codes = p.codes AS codes,
+	   s.refines = p.refines AS refines
   FROM pv_serial s JOIN pv_parallel p ON p.idx = s.idx ORDER BY s.idx::text;
+-- the regions are there, and only where there are 64 partitions or more
+SELECT i AS index, pv_u32(get_raw_page(i::text, 0), 100) AS regions
+  FROM unnest('{pv_l2,pv_one,pv_reg,pv_regcos}'::regclass[]) i;
 -- and the indexes answer as they did
 DROP INDEX pv_half;
 SELECT n.op, pv_nearest(n.op) = n.ids AS same FROM pv_near n ORDER BY n.op;
@@ -178,8 +201,10 @@ SELECT n.op, pv_nearest(n.op) = n.ids AS same FROM pv_near n ORDER BY n.op;
 SET client_min_messages = debug1;
 SET max_parallel_maintenance_workers = 2;
 REINDEX INDEX pv_l2;
+REINDEX INDEX pv_reg;
 SET max_parallel_maintenance_workers = 0;
 REINDEX INDEX pv_l2;
+REINDEX INDEX pv_reg;
 RESET max_parallel_maintenance_workers;
 SET client_min_messages = warning;
 
@@ -188,8 +213,8 @@ SET max_parallel_maintenance_workers = 2;
 CREATE INDEX CONCURRENTLY pv_cic ON pv USING lionvec (v) WITH (partitions = 40);
 RESET max_parallel_maintenance_workers;
 CREATE TABLE pv_cic_parallel AS SELECT * FROM pv_index('pv_cic');
-SELECT p.meta = s.meta AS meta, p.parts = s.parts AS parts, p.codes = s.codes AS codes,
-	   p.refines = s.refines AS refines
+SELECT p.meta = s.meta AS meta, p.parts = s.parts AS parts, p.regions = s.regions AS regions,
+	   p.codes = s.codes AS codes, p.refines = s.refines AS refines
   FROM pv_cic_parallel p, pv_build('pv_cic', 0) s;
 
 -- ---------------------------------------------------------------------
@@ -213,8 +238,8 @@ SET maintenance_work_mem = '1MB';
 REINDEX INDEX pa_l2;
 SET client_min_messages = warning;
 CREATE TABLE pa_serial AS SELECT * FROM pv_build('pa_l2', 0);
-SELECT p.meta = s.meta AS meta, p.parts = s.parts AS parts, p.codes = s.codes AS codes,
-	   p.refines = s.refines AS refines
+SELECT p.meta = s.meta AS meta, p.parts = s.parts AS parts, p.regions = s.regions AS regions,
+	   p.codes = s.codes AS codes, p.refines = s.refines AS refines
   FROM pv_build('pa_l2', 2) p, pa_serial s;
 RESET maintenance_work_mem;
 DELETE FROM pa WHERE id = 1;

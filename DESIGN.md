@@ -20232,12 +20232,14 @@ parallel (§44.12).
 
 ### 44.2 Format (lion_vec.h)
 
-Block 0 is the meta page: magic, format version 3, metric, flags (`LIONVEC_META_SPILL`: the build
+Block 0 is the meta page: magic, format version 4, metric, flags (`LIONVEC_META_SPILL`: the build
 spilled, §44.3), dims and the padded `dimsp` (a multiple of 64), the rotation's seed, the MEAN
 chain's head, the PART chain's head and the partitions' number, the heads and tails of the two
 chains of rows in no partition, the REFINE tail, the partitions' SCALE (the rows' standard
-deviation about their centroids along one dimension, the unit of the margin, §44.4) and the
-build's row count. Every page's special space carries its next
+deviation about their centroids along one dimension, the unit of the margin, §44.4), the
+build's row count, and the REGION chain's head and the regions' number, appended in format 4 so
+that every earlier field keeps its offset (`lionvec_check_meta()` holds `nregions > 0` to a valid
+head, and to no more than the partitions). Every page's special space carries its next
 block, its type, `LIONVEC_PAGE_ID` and, on CODE pages, the least and greatest container key (§2)
 of the TIDs on it.
 
@@ -20250,7 +20252,24 @@ of the TIDs on it.
   - its plane 1 here, its 8-bit codes in a REFINE item whose TID is (partition, 0), which no heap
   row's is (`LionVecCentTid()`). 248 bytes at 1536 dimensions, 32 a page: 62 pages for the
   benchmark's 1,974 partitions. Written by the build after the CODE chains; an insert changes
-  only a tail.
+  only a tail. In an index of regions (below) the partitions are numbered region by region, so
+  that each region's are one run of the chain.
+- **REGION** (format 4): in an index of `LIONVEC_REGION_MIN` (64) partitions or more, one item a
+  region of the centroids (`LionVecRegion`, §44.3), in order: its number, its run of partitions -
+  the first and how many - the block and offset of the run's first PART item, and the region's
+  centroid coded as a row is, plane 1 alone (its TID and REFINE item invalid, its `<x, mean>`
+  zero): 248 bytes at 1536 dimensions, 32 a page, two pages for DBpedia's 53 regions and 16 for
+  the 512 of `LIONVEC_MAX_PARTS`. A region k-means left without partitions is kept, with no run
+  and no PART item, so that the count is always `ceil(sqrt(C))` and the beam an insert takes of
+  them the build's. Written by the build after the PART chain, never changed. An insert reads
+  the chain and then only the runs of the regions it picks; it checks that the regions number
+  from 0, that their runs follow one another and cover the partitions, and that each PART item
+  of a run is that run's next partition, reading on along the PART chain from the item the region
+  names (`lionvec_insert_read_regions()`, `_read_run()`), and any of it amiss is an
+  `ERRCODE_INDEX_CORRUPTED` error, as every item's length, place and line pointer are checked
+  against its page (`lionvec_item_ok()`). An index of fewer partitions, one or none included,
+  has no REGION chain (an invalid head, `nregions` 0), and an insert reads the whole PART chain.
+  A scan reads no REGION page (§44.3, "Regions").
 - **CODE**: one item a row, 32 bytes of header - TID, flags (`LIONVEC_NULL`, `LIONVEC_ZERO`: a
   cosine zero vector, `LIONVEC_SPILL`: a copy), `|x|`, `alpha1`, `<x, mean>`, the REFINE item's
   block and offset, plane 1's popcount - and plane 1, `dimsp / 64` words: 224 bytes at 1536
@@ -20273,8 +20292,11 @@ without spill (225 MB of it CODE pages), 1.9 GB with it - and C (d + 1.2 d / 8 +
 centroids. A scan reads the PART chain, 500 KB there, and the CODE pages of the partitions it
 probes, each twice as long when the index spills.
 
-Format 2 had no copies and no flags in its meta page; this pg_lion refuses an index of format 2
-(`lionvec_check_meta()`: REINDEX it), as the extension had no release to migrate from.
+Format 3 had no REGION chain, and its partitions were numbered as k-means left them; this pg_lion
+refuses it as it refuses format 2 (`lionvec_check_meta()`: "has format version 3 ... REINDEX
+it"): its meta page ends before the REGION fields, whose zeros would name block 0 as the REGION
+chain's head, and the extension has no release to migrate from. Format 2 had no copies and no
+flags in its meta page.
 
 Format 1 (§44 above) had one CODE chain, every row in heap order, and a DIR chain of each CODE
 page's least and greatest TID, by which a filtered scan read only the pages that could hold a
@@ -20319,7 +20341,8 @@ page that holds no member (§44.6).
   takes a SAMPLE as it computes the mean: reservoir sampling (Vitter's algorithm R) from a
   generator seeded alike every build, so that the same rows make the same partitions, of as many
   rows as half of `maintenance_work_mem` holds as 8-bit codes (rotated, not centred - the mean is
-  not known yet - a percent off the floats, which k-means does not notice), at most 2^20. The
+  not known yet - a percent off the floats, which k-means does not notice), at most 2^24
+  (`LIONVEC_SAMPLE_MAX`; 2^20 until the regions, below). The
   number of partitions C is the `partitions` reloption's, or else 1 below 10,000 rows and `8
   sqrt(n)` above (`LIONVEC_PARTS_PER_ROOT`: 8,000 for a million rows, 2,715 for DBpedia's
   115,186), at most a sixteenth of the sample, never more than its rows, and 0 for an empty table.
@@ -20331,10 +20354,33 @@ page that holds no member (§44.6).
   x 128 sqrt(n) bytes: 376 MB for a million rows. The default 64 MB holds 21,788 rows and so caps
   any table of more than 28,900 such rows at 1,361 partitions (at `2 sqrt(n)`, more than 463,000);
   1 GB holds 348,617, 44 a partition at a million rows, about the 42 the numpy model trained on
-  with every row; every row of a million takes 2.9 GB. The cap of 2^20 rows (3 GB) leaves k-means
-  fewer than 42 rows a partition above about ten million rows, and the sixteenth then binds at
-  65,536 partitions above 67 million (at `2 sqrt(n)` it bound above a billion), so at a billion
-  rows the default is 65,536 either way. Lloyd's k-means then runs over the sample, in the
+  with every row; every row of a million takes 2.9 GB. A sample row is `dimsp + 4` bytes (its
+  codes and its scale), so the cap of 2^24 rows is 25.8 GB at 1536 dimensions, reached at a
+  `maintenance_work_mem` of 52 GB; it is 64 rows a partition at `LIONVEC_MAX_PARTS` (262,144, §44.8),
+  and the sixteenth binds only past 2^20 partitions, so the default is `8 sqrt(n)` up to that
+  ceiling, which it reaches at 1.07 billion rows. A billion rows want 252,982 partitions, at least
+  4.05 million sample rows (6.2 GB, a `maintenance_work_mem` of 12.5 GB) to be given them, and
+  the cap's 2^24, 66 a partition, with 52 GB. (The cap was 2^20 rows, 3 GB, and the ceiling 65,536
+  partitions, which then held every table of more than 67 million rows - a billion's 15,000 rows a
+  partition.) **k-means' share** of the sample is at most 128 rows a partition
+  (`LIONVEC_SAMPLE_PER_PART_MAX`): when the reservoir holds more, the partitions are still counted
+  from all of it, and k-means is given a uniformly random 128 C of its rows (`lionvec_subsample()`:
+  a partial Fisher-Yates shuffle of the slots from a seed of its own, `LIONVEC_SEED_SUBSAMPLE`,
+  the slots kept sorted and the rows moved down in place, so that they keep the reservoir's order,
+  in which k-means' update sums them, and the build is the same every time), before k-means and
+  before a parallel build copies the sample into shared memory, which then holds those rows alone
+  (`lionvec_build_subsample()`). An iteration costs its rows, and past some rows a partition more
+  of them move the centroids less than their iterations do (FAISS warns below 39 and cuts at
+  256). 64 was too few: on DBpedia in 679 partitions, where 64 a partition keep 43,456 of the
+  115,386 rows and 128 keep 86,912, the margin of 3 found 0.891, 0.900 and 0.906 of the true ten
+  over three draws (seeds of the cut) at 64, against 0.909 with every row, and 0.916, 0.920 and
+  0.915 at 128; at 8 both were within the draws' spread of every row's 0.984 (0.980 to 0.982 at
+  64, 0.981 to 0.985 at 128), and in 1,358 partitions 64 gave 0.918 and 0.979 against 0.917 and
+  0.982. At the default `8 sqrt(n)` the cut is 1,024 `sqrt(n)` rows, every row up to a million,
+  so it falls only on a larger table whose sample holds more: none at a `maintenance_work_mem` of 1
+  GB (348,617 rows at 1536 dimensions), and at 52 GB's 2^24, the rows of a table of between a
+  million and 268 million rows past 1,024 `sqrt(n)`; or on fewer partitions than the default.
+  Lloyd's k-means then runs over the sample, in the
   rotated space (which changes no distance), from C distinct sample rows the seed picks, for ten
   iterations or until no row moves; spherical for cosine, whose rows and so centroids are of unit
   length, so that nearest by L2 is nearest by angle too. A row's nearest centroid is found among
@@ -20342,7 +20388,8 @@ page that holds no member (§44.6).
   `LIONVEC_ASSIGN_EPS` = 4 standard deviations on its distance, and the centroids whose lower bound
   is under the least upper bound), by their exact distance; about ten candidates of 200 at 320
   dimensions and more, so that k-means costs a popcount scan of the centroids a row and a few float
-  distances. A centroid left with no rows takes half of the largest's (FAISS's way). The
+  distances - of the centroids of the row's regions alone at 64 partitions or more (below,
+  "Regions"). A centroid left with no rows takes half of the largest's (FAISS's way). The
   centroids are then coded as rows are, against the mean. Every loop of it - the centroids'
   coding, the assignment, the means, the splits - checks for interrupts once an item
   (`LIONVEC_CHECK_INTERRUPTS()` in `lionvec_kmeans_codes()`, `_assign()` and `_update()`, the
@@ -20376,17 +20423,70 @@ page that holds no member (§44.6).
   squared distance from their centroids, over the dimensions, is the meta page's scale; each
   partition's own mean squared distance and its longest row go in its PART item (§44.4's inner
   product). Both k-means and the assignment cost a plane-1 estimate of every centroid for every
-  row, so the build grows as the rows times the partitions, `n^1.5` at the default: 19 minutes for
+  row, so the build grew as the rows times the partitions, `n^1.5` at the default: 19 minutes for
   the benchmark's 975,000 rows in 1,974 partitions, where format 1 took 98 seconds (§44.9,
   §44.11). DBpedia's 115,186 rows took 159 s in 678 partitions and 347 s in 2,715, about 96 s of
   it the rest of the build and 0.09 s a partition; at `8 sqrt(n)` the benchmark's 975,000 rows, in
-  7,899, would take about four times its 19 minutes (not measured). Ten iterations are not fewer
+  7,899, would take about four times its 19 minutes (not measured), and 86 minutes for a million
+  rows in 8,000 were measured on another machine. Regions (below) make it `(beam + 1) sqrt(C)`
+  estimates a row rather than C, and the second pass, a spilling build's, `(16 + 1) sqrt(C)`.
+  Ten iterations are not fewer
   than four times the partitions want: numpy's spherical k-means over DBpedia's rows moved 0.8% of
   them in the tenth iteration at 2,715 centroids and 1.9% at 678, and its rows' mean cosine to their
   centroid was within 0.18% (0.36% at 678) of thirty iterations'. At low dimensions, where plane 1
   leaves most centroids as candidates (61 of 200 at 64 dimensions), the cost is nearer the rows
   times the partitions' exact distances: vector_filter.sql's 40,000 rows of 64 dimensions take 42 s
   in their default 1,600 partitions, 12 s in the 400 of `2 sqrt(n)`.
+- **Regions** (`lionvec_regions_make()`, `lionvec_route()`, format 4, 2026-10-16). C centroids,
+  when there are `LIONVEC_REGION_MIN` (64) or more, are gathered into G = `ceil(sqrt(C))` regions
+  (`lionvec_region_count()`: 53 for DBpedia's 2,715 or 2,717, 512 at `LIONVEC_MAX_PARTS`) by
+  k-means over the centroids - their 8-bit codes the sample, as the rows' are, `LIONVEC_REGION_ITERS` (5)
+  iterations from G of them the seed picks (`LIONVEC_REGION_SEED`, one past the rows'), spherical
+  for cosine as the rows' k-means is - and then each centroid into the region whose centroid is
+  nearest it after the last update, found as k-means finds a row's. Its members are listed in
+  ascending order (a counting sort, `first[]` and `member[]`); a region left with no members is
+  kept, so that G is a function of C alone. A row is routed (`lionvec_route()`) by a plane-1
+  estimate of its squared distance from each region's centroid, coded against the rows' mean as a
+  row is (`lionvec_region_key()`); the `beam` nearest with members are taken, least key first, ties
+  to the lower region, and then the next nearest until they hold the m centroids the row wants
+  (`lionvec_regions_pick()`), sorted ascending, so that their members come in the centroids'
+  order. Its candidates are then found among those members alone, by the rule over every centroid
+  (`lionvec_candidates_among()`, `lionvec_candidates_n()`'s over a list of indices), and its
+  nearest, and SOAR's second, among them as before. A row costs G + beam C / G estimates, about
+  `(beam + 1) sqrt(C)`, where it cost C: some 310 rather than 2,717 in DBpedia's k-means and 870
+  in its second pass, more where the regions are uneven (theirs held 16 to 141 centroids, whose
+  squares summed to 65 a centroid where 53 even regions' would have to 51). The candidates
+  include every centroid the full rule makes one that is in the beam's regions, but not only
+  those: the m-th least upper bound among fewer centroids may be larger, which admits more (the
+  unit tests count it as a rate). A row whose nearest centroid lies in no
+  region of its beam goes to the nearest that does; the partition's spread and longest row, which
+  the scan's bounds come from, are of the rows it holds, so a scan finds it there all the same,
+  as it would a row placed by a centroid that moved.
+  - **Where.** In k-means, each iteration's centroids are regrouped before its rows are assigned
+    (`lionvec_kmeans()`, and a parallel build's leader before it posts the iteration, §44.12),
+    from the same seed each time, so that the same rows make the same centroids and regions; the
+    update is unchanged. For the second pass the final centroids are regrouped once and the
+    partitions RENUMBERED region by region (`lionvec_build_renumber()`: the centroids, their codes,
+    floats and plane 1 permuted in place, the regions' members rewritten as runs), so that each
+    region's partitions are one run of the PART chain, which its REGION item names (§44.2); the
+    renumbering changes no centroid, and the build routes by the renumbered regions, so a row's
+    candidates come in ascending partition order whether the build or an insert finds them. An
+    insert reads the REGION chain, keys every region, takes the build's beam (the same G and m)
+    and reads those regions' runs alone (`lionvec_insert_read_regions()`); vector.sql checks that
+    copies of rows inserted afterwards go to the originals' partitions and spill partitions. A
+    scan reads no REGION page and ranks every centroid, as before: in the simulation that chose
+    the regions, ranking partitions through their regions read a third more rows for a recall.
+  - **The beam** is a constant, by what it is asked for: `LIONVEC_BEAM` (5) regions for a row's
+    nearest alone (k-means, and the second pass and inserts of an index that does not spill),
+    `LIONVEC_BEAM_SOAR` (16) for its nine nearest (`LIONVEC_SOAR_CANDS` + 1: the second pass of
+    an index that spills, and its inserts), never more than G (`lionvec_region_beam()`). A share
+    of G, as the first design had it (`ceil(G / 12)`, at least 4), would let a row's cost grow as
+    C, and the measurements did not ask for one: on DBpedia (§44.9, "Regions") 5 found the
+    partition exact assignment would have for 98.8% of the rows in 53 regions and 99.5% in 100,
+    and 16 the copy's for 99.5% in 27, 98.6% in 53 and 97.9% in 100, at a recall within the
+    sample's own spread of exact assignment's. A row's copy wants the larger beam: SOAR picks it
+    from the nine nearest, which lie farther out, and 5 found it for 88% of the rows in 100
+    regions, 13 for 96.95%.
 - **Spill** (`lionvec_soar_second()`, the `spill` reloption, on by default). A row's true
   neighbours lie mostly in its own partition, but a row near the edge of its partition has
   neighbours in the next one too, and a query near such a row may probe one and not the other. An
@@ -21089,10 +21189,20 @@ unfiltered scan's deeper batches, and the plain scan under `allow`.
   away, not the rule: under `exact` or `error` a filtered query then gets an exact plan, or the
   error. A pseudoconstant clause, tested once by a gating Result, and one a partial lionvec
   index's predicate implies are no filter here.
-- `partitions` (reloption, 0 to 65,536, default 0; 1,000,000 until a review found the build at a
-  million partitions days long and uncancellable): the partitions the build makes; 0 chooses
-  by the rows' count, `8 sqrt(n)` above 10,000 rows as `maintenance_work_mem`'s sample allows
-  (§44.3; `2 sqrt(n)` until DBpedia, §44.9). Read by the build alone, so a change takes a REINDEX.
+- `partitions` (reloption, 0 to 262,144, default 0; 1,000,000 until a review found the build at a
+  million partitions days long and uncancellable, then 65,536 until the regions, §44.3): the
+  partitions the build makes; 0 chooses by the rows' count, `8 sqrt(n)` above 10,000 rows as
+  `maintenance_work_mem`'s sample allows (§44.3; `2 sqrt(n)` until DBpedia, §44.9). 262,144
+  (`LIONVEC_MAX_PARTS`, 2^18) is what `8 sqrt(n)` gives at 1.07 billion rows. A partition number
+  is an `int` everywhere, never 16 bits, and the sort's group (`LIONVEC_SORT_GROUP`, an int4)
+  holds it with room for the two groups after the partitions. The build's arrays of the
+  partitions (`lionvec_build_arrays()`) are outside `maintenance_work_mem`, in the parallel
+  context's shared memory for a parallel build: the centroids' floats, C `dimsp` x 4 bytes, the
+  8-bit codes and plane 1 in C (`dimsp` + `dimsp` / 8) bytes, a few words a partition more, the
+  sample's assignment, 4 bytes a row, and the regions' arrays: 2.1 GB at 262,144 partitions of
+  1536 dimensions, 1.6 GB of it the floats (403 MB at 65,536); the leader's region k-means works
+  in another C `dimsp` bytes of codes, 403 MB there, and an insert in its candidates alone (§44.3).
+  Read by the build alone, so a change takes a REINDEX.
   It does not move the pause: `pg_lion.vector_patience` counts the rows of `2 sqrt(n)` partitions,
   not of these (§44.4). When it counted these, on DBpedia a patience of 30 in 2,715 partitions held
   the unfiltered recall to 0.966 at any margin, where 120, the rows of 30 in 678 partitions,
@@ -21118,7 +21228,12 @@ unfiltered scan's deeper batches, and the plain scan under `allow`.
   and one below it.
 - `maintenance_work_mem`: half of it holds the build's sample (§44.3), and the CODE items' sort,
   two items a row when the index spills; a parallel build divides the sort's share among its
-  processes, as core's builds do, and holds the sample once, in shared memory (§44.12).
+  processes, as core's builds do, and holds the sample once, in shared memory (§44.12). A sample
+  row takes `dimsp + 4` bytes, 1,540 at 1536 dimensions, so the default partitions want 2 x 1,540
+  x 16 `8 sqrt(n)` bytes, 376 MB at a million rows and 12.5 GB at a billion, and k-means is given
+  at most 128 a partition of it, 1.6 GB of sample at a million rows' 8,000 partitions (so 3.2 GB is
+  the most a million rows can use); the reservoir stops at 2^24 rows, 25.8 GB, which 52 GB
+  reaches. A parallel build's shared memory holds the sample after the cut, and the arrays above.
 - `max_parallel_maintenance_workers` (core's, default 2) and the table's `parallel_workers`: the
   workers a build asks for, whatever the heap's size or `maintenance_work_mem` (§44.12).
 - `work_mem` bounds a scan's row queue (§44.4).
@@ -21272,6 +21387,67 @@ partition beyond. Recall at
 each margin is lower here than on the benchmark's set (0.84 without spill at the default, against
 0.98): other embeddings, and an eighth of the rows. What this measures is the one setting against
 the other; the benchmark's million rows spilling are still to be measured.
+
+**Regions** (format 4, §44.3; 2026-10-16). The same 115,386 rows, every one of them indexed (so
+the default is 2,717 partitions, in 53 regions), the same 200 query rows each kept out of its own
+answer; cosine, spilling; PostgreSQL 18 (an assert build), 4 cores shared with other work,
+`maintenance_work_mem` 2 GB, the table cached; recall of the true ten, the median and 95th
+percentile of the 200 queries' times, after a pass to warm. Main, the build before the change,
+ran on one cluster, the rest on a second of the same build and settings, where the change with
+the regions and the cut switched off for the measurement ("every centroid") built main's index
+again: the same recall, 0.913 and 0.9865, in 287.9 s against 291.6.
+
+| 2,717 partitions | Main | Regions |
+|---|---|---|
+| Build, serial | 291.6 s | 108.2 s |
+| Build, 3 workers and the leader | 84.9 s | 35.9 s |
+| Size | 247.1 MB | 246.9 MB |
+| Margin 3: recall, median, p95 | 0.913, 3.2 ms, 6.2 ms | 0.919, 3.3 ms, 6.5 ms |
+| Margin 8 | 0.9865, 6.6 ms, 10.7 ms | 0.9845, 7.1 ms, 11.4 ms |
+
+The parallel build's index answered as the serial one's (the same recall at both margins). In
+679 partitions (27 regions), where the cut to 128 a partition keeps 86,912 of the rows, and in
+10,000 (100 regions, no cut):
+
+| | Every centroid, every row | Regions, and the cut |
+|---|---|---|
+| 679: build serial, 3 workers | 108.0 s, - | 62.7 s, 23.2 s |
+| 679: margin 3, margin 8 | 0.909, 0.984 | 0.913, 0.980 |
+| 10,000: build serial, 3 workers | -, 248.7 s | -, 65.0 s |
+| 10,000: margin 3, margin 8 | 0.9285, 0.992 | 0.932, 0.989 |
+
+The recall moves by as much from one draw of the sample to another: without regions, at 679
+partitions, three draws of the cut to 128 gave 0.916, 0.920 and 0.915 at a margin of 3 and 0.981,
+0.982 and 0.985 at 8, and the regions' k-means makes other centroids as another draw does. The
+assignment's MATCH, the share of the rows whose partition (and, spilling, whose copy's partition)
+the routed second pass chose as exact assignment over the same final centroids would, measures the
+routing alone. With one beam for both passes, in 53 regions:
+
+| Beam | Partition | Copy's partition | Margin 3 | Margin 8 |
+|---|---|---|---|---|
+| 2 | 94.8% | 67.9% | 0.8965 | 0.974 |
+| 3 | 97.1% | 78.2% | 0.908 | 0.980 |
+| 4 | 98.3% | 84.3% | 0.9115 | 0.983 |
+| 6 | 99.1% | 90.5% | 0.911 | 0.984 |
+| 8 | 99.5% | 93.7% | 0.9165 | 0.9825 |
+| exact | 100% | 100% | 0.913 | 0.9865 |
+
+A spilling row's copy wants more: SOAR picks it from the nine nearest, which lie farther out. With
+k-means' beam at 5, the second pass's at 10, 13, 16 and 20 matched 99.78, 99.89, 99.94 and
+99.97% of the partitions and 96.2, 97.8, 98.6 and 99.2% of the copies' in 53 regions (recall
+0.9205 to 0.919 at 3, 0.985 to 0.9845 at 8: k-means' centroids decide it); 13 and 16 matched
+96.95 and 97.9% of the copies' in 100 regions, and 7 and 10 93.1 and 96.6% in 27. Sixteen is the
+least that held 97% at all three. With k-means routed at 5 and the second pass exact, the recall
+was 0.9195 and 0.9845, and with k-means exact and the second pass at 5, 0.9095 and 0.984: neither
+pass's routing moves it past the draws' spread. K-means' own beam, the second pass's at 16: 3 and
+4 gave 0.914 and 0.9145 at a margin of 3 and 0.9815 at 8, half a hundredth under exact
+assignment's 0.9865, and 5 gave 0.919 and 0.9845 (4 gave 0.914 and 0.9825 in 679 partitions,
+against 0.909 and 0.984), so 5 is the least within 0.003 of it at both margins. The regions' own
+k-means: 2, 5 and 10 iterations matched 98.6, 98.8 and 98.9% of the partitions at a beam of 5,
+and 86.8, 88.1 and 88.4% of the copies' partitions, for 0.9145, 0.916 and 0.9135 at a margin of 3
+and 0.981, 0.985 and 0.982 at 8; the regions held 16 to 141 centroids of 2,717 (6
+to 58 of 679, 4 to 287 of 10,000), none empty. Build times with the match measured include an
+exact assignment of every row besides, and are not given.
 
 **Simulation.** Before the partitions were written, a numpy model of the scan chose their number
 and the margin (vtoy's `ivf.py`, not in the tree): the benchmark's 975,000 vectors, k-means at
@@ -21552,6 +21728,21 @@ the exact path's price sends it to the plain scan with a `Filter` (§44.7).
   plain second nearest, that SOAR differs from it for between a tenth of the rows and all
   (25-29%), that the copies' residuals point less along r than the plain second's, and that decoded
   centroids choose as the floats do for at least 90% of rows (97%), the rest within 1% of the cost.
+  The cut and the regions (§44.3): `lionvec_subsample()` from 0 to 100,003 slots, m distinct and
+  ascending, every slot when m is all of them, the same from the same seed and another from
+  another, and each slot as often as the rest over 8,000 seeds; `lionvec_candidates_among()` the
+  same as `lionvec_candidates_n()` over the listed centroids taken alone, and over all of them;
+  and over 40 clusters at 128 dimensions in 600 centroids, 25 regions - the count (none below 64),
+  the beam never more than the regions and never less for nine than for one,
+  `lionvec_regions_pick()` against a reference over 2,000 sets of keys with empty regions, ties,
+  NaN and infinities, the members a partition of the centroids, ascending in each region, at least
+  99% of the centroids in the region nearest them, the same regions from the same seed and, after
+  renumbering, the same centroids routed in the same order; a row's routed candidates the beam's
+  members' and among them every exact candidate there, exact candidates for at least 97% of rows
+  (100%), its routed nearest the exact one for at least 97% (100%), and no empty region picked; and
+  k-means routed, by chunks of 1, 32 and all against `lionvec_kmeans()` with regions, to the bit,
+  regions included, the same again from the same seed, without regions the exact k-means, and its
+  cost within 2% of the exact one's (1.0000).
 - **vector.sql**: every ORDER BY run through the index and through a sequential scan and sort,
   compared distance by distance and row by row, with `pg_lion.vector_margin = 100` and the pause
   off, for each metric, three queries and LIMITs 1 to past the table, over 3,000 rows in 20
@@ -21585,7 +21776,13 @@ the exact path's price sends it to the plain scan with a `Filter` (§44.7).
   agree, and inserts into it; no copies with no partitions, with one, nor in the REST chain; two
   and five partitions, fewer than the nine SOAR ranks, at the build and at inserts; the recall over
   twin tables, spilling and not, as many of the ten nearest at the defaults and more at a margin
-  below zero, for each metric; and the reloption's refusals.
+  below zero, for each metric; and the reloption's refusals. Regions: every index's meta page and
+  REGION chain read off its pages (`vt_regions()`: format 4, the regions' count `ceil(sqrt(C))`,
+  numbered from 0, their runs covering the partitions in order, each naming its run's first PART
+  item), none below 64 partitions; 6,400 rows in 100 partitions for each metric, then 1,000
+  copies of rows inserted, every copy in its original's partition and at least 90% in its copy's
+  partition too (`vt_placed()`; SOAR's choice from decoded centroids is not the build's from
+  floats for every row, §44.3), and the comparisons with a sort over them.
 - **vector_filter.sql**: LionOrdered over each metric against the ordinary plan, with
   `pg_lion.vector_margin = 100` and the pause off, for eight filters (equality, range, AND, OR,
   `<>`, a correlated column, a boolean, no rows) and four LIMITs, over 10,000 rows in 50
@@ -21659,10 +21856,13 @@ the exact path's price sends it to the plain scan with a `Filter` (§44.7).
   errors); and the refusals (too many dimensions, an array).
 - **vector_parallel.sql**: the parallel build against the serial one (§44.12), each index built
   both ways and read off its pages with pageinspect into digests - the meta page's counts, scale,
-  flags and mean, the PART items but for their chains' blocks, each CODE chain's items in order but
+  flags, regions and mean, the PART items but for their chains' blocks, the REGION items but for
+  their PART items' blocks, each CODE chain's items in order but
   for their REFINE locations, and the set of REFINE items - which must match, and the nearest rows
-  the same through either, for each metric, spilling and not, one partition and a `halfvec`
-  expression, over 6,000 rows with NULLs, a cosine zero, deleted rows and HOT chains, with the
+  the same through either, for each metric, spilling and not, one partition, a `halfvec`
+  expression and 100 partitions in 10 regions (L2 and cosine; the 40 partitions' k-means given 128
+  rows a partition of the 5,940 drawn, so the cut is made before the sample is shared),
+  over 6,000 rows with NULLs, a cosine zero, deleted rows and HOT chains, with the
   table's `parallel_workers` at 2; `CREATE INDEX CONCURRENTLY` in parallel against a serial build;
   and the count of workers by the DEBUG1 lines: 10,000 rows in parallel without `parallel_workers`,
   at the default `maintenance_work_mem` and at 1 MB, where every process's sort spills to disk
@@ -21673,16 +21873,30 @@ the exact path's price sends it to the plain scan with a `Filter` (§44.7).
 
 ### 44.11 Not done
 
-- **A billion rows.** Partitions are what make one possible, but three things stand in the way.
+- **A billion rows.** Partitions are what make one possible, and three things stood in the way.
   The build's k-means and assignment, and a scan's ranking, cost a plane-1 estimate of every
-  centroid for every row or query: O(n C) and O(C). The old default, `2 sqrt(n)`, kept the
+  centroid for every row or query: O(n C) and O(C); and the sample's cap of 2^20 rows, at 16 a
+  partition, with the reloption's ceiling, held the default to 65,536 partitions (15,000 rows
+  each at a billion). The build's are the regions' now (§44.3): O(n sqrt(C)), each row routed
+  through about sqrt(C) region centroids and the members of 5 regions in k-means, 16 in a
+  spilling second pass; and the cap is 2^24 rows and the ceiling 262,144 partitions, so that a
+  billion rows get the default `8 sqrt(n)`, 252,982 partitions of 3,950 rows, given the
+  `maintenance_work_mem` (12.5 GB at 1536 dimensions for the sixteen a partition the default
+  needs, 52 GB for the cap's 66, §44.8). At 503 regions of some 503 centroids that build is,
+  by arithmetic (not measured), 16.8 million sample rows x 10 iterations x about 3,000 estimates
+  for k-means, 5 x 10^11, and a billion rows x about 8,550 for the second pass, 8.6 x 10^12, where
+  every centroid for every row was 4.2 x 10^13 and 2.5 x 10^14. DBpedia's 53 regions save less
+  (2,717 estimates a row, against some 310 and 870), and its build went from 292 s to 108 s
+  serially (§44.9). The old default, `2 sqrt(n)`, kept the
   partitions few but let the rows read grow almost as the rows (§44.9's growth: n^0.91). `8
   sqrt(n)` (§44.3) is four times finer, 125 rows a partition at a million rows, but still grows
-  as the root: 4,000 rows a partition at a billion, and there the sample's cap of 2^20 rows, at
-  16 a partition, holds the default to 65,536 partitions (15,000 rows each) either way, until the
-  cap is raised. A large table wants partitions of a fixed few hundred rows - two million of them
-  for a billion rows, which makes the O(C) steps the whole cost, 2 x 10^15 estimates to build and
-  a 500 MB PART chain a query, unless an index over the centroids (centroids of centroids, or a
+  as the root: 4,000 rows a partition at a billion. The scan's step is still O(C): it ranks every
+  centroid, a 65 MB PART chain a query at 262,144 partitions, where routing it through the
+  regions read a third more rows for a recall in the simulation (§44.3). A large table wants
+  partitions of a fixed few hundred rows - two million of them
+  for a billion rows, which makes the scan's O(C) the whole cost, a 500 MB PART chain a query,
+  and a build of 2.4 x 10^13 estimates even through 1,415 regions, unless an index over the
+  centroids that a scan can use as well (regions with a better order than their centroids', or a
   small graph) ranks them by reading a few thousand. And even then, by the margin alone, the rows
   read grew as n^0.53 to n^0.61 at a fixed partition size: one to four million rows a query at a
   billion, 230 MB to 1 GB of CODE pages. With the pause (§44.4) they grew as n^0.32 between the
@@ -21731,6 +21945,15 @@ out among processes. With 3 workers and the leader the same build took 37.8 s: t
 shared steps ran 3.8 and 3.7 times as fast on four processes. It runs on PostgreSQL 16
 as well, counting its own workers rather than waiting for core's (below).
 
+The regions (§44.3, 2026-10-16) cut the arithmetic of both shared steps, and the parallel build
+keeps its share of what is left: on a 4-core machine shared with other work, where the build
+before them took 291.6 s serially and 84.9 s with 3 workers (115,386 rows in 2,717 partitions),
+it took 108.2 s and 35.9 s, 3.0 times as fast with the workers (§44.9, "Regions"). What the
+leader does alone each iteration is the regions' k-means: C centroids into `sqrt(C)` regions, 5
+iterations at C `sqrt(C)` estimates each, some tens of milliseconds here and, by arithmetic,
+7 x 10^8 estimates at `LIONVEC_MAX_PARTS`, where an iteration over the 2^24 rows the sample can
+hold is 5 x 10^10 shared among the processes.
+
 - **The phases.** The first pass, the mean and the sample, stays serial: reservoir sampling draws
   the same rows only when it meets them in the same order, and it is a fiftieth of the time. With
   the partitions known, the leader sets up a parallel context (`lionvec_begin_parallel()`, the
@@ -21742,8 +21965,10 @@ as well, counting its own workers rather than waiting for core's (below).
   every worker, and kept in local memory by a serial build), a shared tuplesort, and the workers'
   WAL and buffer usage, which the leader adds to its own. It then posts the workers work, under a
   spinlock and a condition variable, and takes part in each itself:
-  - KMEANS, each iteration: the leader codes the centroids (C rows, a moment) and posts the
-    iteration; every process takes the sample's rows 32 at a time (`LIONVEC_KMEANS_CHUNK`) from an
+  - KMEANS, each iteration: the leader codes the centroids (C rows, a moment), regroups them into
+    their regions when there are 64 or more (`lionvec_regions_make()`, into the region arrays
+    `LionVecBuildArrays` holds in shared memory beside the centroids', §44.3, "Regions") and
+    posts the iteration; every process takes the sample's rows 32 at a time (`LIONVEC_KMEANS_CHUNK`) from an
     atomic counter, assigns each its nearest centroid in the shared assignment and counts the rows
     that moved; the leader waits for the last row, then moves the centroids to their rows' means,
     alone. The counter's high 32 bits are the iteration's, so that a process still finishing the
@@ -21751,14 +21976,21 @@ as well, counting its own workers rather than waiting for core's (below).
   - SCAN, once: the second pass over the parallel heap scan. Each process puts its rows' CODE items
     into its own run of the shared sort, with `maintenance_work_mem` divided among them as core's
     builds divide it, and their REFINE items on REFINE pages it extends the index by for itself;
-    the leader merges the runs and writes the CODE chains, the PART chain and the meta page, as a
-    serial build does, ends the workers, and WAL-logs the index.
+    the leader merges the runs and writes the CODE chains, the PART chain, the REGION chain and
+    the meta page, as a serial build does, ends the workers, and WAL-logs the index. Before it
+    posts the pass the leader has made the final centroids' regions and renumbered the partitions
+    region by region in the shared arrays, so that every process routes each row through the
+    same regions, by the same numbers, as a serial build's second pass does.
 - **A serial build's index.** lionvec_kmeans() is its steps run in a loop
-  (`lionvec_kmeans_start()`, `_codes()`, `_assign()` over a range of rows, `_update()`): a row's
-  assignment depends on the centroids and the row alone, and the update sums the rows in the
+  (`lionvec_kmeans_start()`, `_codes()`, with regions `lionvec_regions_make()`, `_assign()` over
+  a range of rows, `_update()`): a row's assignment depends on the centroids, their regions and
+  the row alone, the regions are made by one process (the leader, as a serial build makes them:
+  the same k-means of the centroids from the same seed), and the update sums the rows in the
   sample's order in one process, so the centroids come out of a parallel build to the bit as out of
-  a serial one, however the rows were shared out (the unit tests, §44.10). A row's partitions, its
-  own and its copy's, depend on the centroids alone. The CODE items' sort was keyed by the group
+  a serial one, however the rows were shared out (the unit tests, §44.10, which route by chunks in
+  two "processes" with scratch of their own; vector_parallel.sql's 100-partition indexes, whose
+  meta page, PART and REGION items match a serial build's). A row's partitions, its
+  own and its copy's, depend on the centroids and their regions alone. The CODE items' sort was keyed by the group
   and a count in scan order; it is keyed by the group and the TID now, so the merged runs come out
   in the order a serial build's scan made, and the partitions' counts, spreads and longest rows, and
   the meta page's scale, which the scan callback summed, are summed as the CODE chains are written,
