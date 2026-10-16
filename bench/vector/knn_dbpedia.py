@@ -122,6 +122,9 @@ DIM = 1536
 SELS = (1.0, 0.1, 0.03, 0.01)
 MARGINS = [float(x) if '.' in x else int(x) for x in os.environ.get('KNN_MARGINS', '2,3,4,6,8,12,16').split(',')]
 PATIENCE = [int(x) for x in os.environ.get('KNN_PATIENCE', '30').split(',')]
+# pg_lion.vector_exact_rows (LIONVEC_EXACT_DEFAULT): a filter admitting more
+# rows than this probes, so a warm run sweeps its margins (1% of a million)
+EXACT_ROWS = int(os.environ.get('KNN_EXACT_ROWS', '2000'))
 EFS = [int(x) for x in os.environ.get('KNN_EF', '20,40,70,100,200,400').split(',')]
 PROBES = [int(x) for x in os.environ.get('KNN_PROBES', '10,20,40,80,160,320').split(',')]
 SEARCH_LIST = [int(x) for x in os.environ.get('KNN_SEARCH_LIST', '10,20,30,50,100,200,400').split(',')]
@@ -511,6 +514,14 @@ def run(conn, name, sql, sel, settings, Q, gt):
     return row
 
 
+def members(sel):
+    # how many rows the filter u < sel admits (prepare()'s info.json)
+    try:
+        return json.load(open(os.path.join(CACHE, 'info.json')))['members'][str(sel)]
+    except (OSError, KeyError):
+        return None
+
+
 def methods(kind, sel):
     m = []
     # The planner's own plans, and the index's own paths too, since under a
@@ -522,7 +533,8 @@ def methods(kind, sel):
         for patience in PATIENCE:
             for margin in MARGINS:
                 st = [f'SET pg_lion.vector_margin = {margin}', f'SET pg_lion.vector_patience = {patience}']
-                if sel <= 0.01 and margin != 3:
+                n = members(sel)
+                if sel <= 0.01 and margin != 3 and (n is None or n <= EXACT_ROWS):
                     continue        # every member's distance: no margin, no pause
                 m.append((f'lionvec margin={margin} patience={patience}', sql(kind, sel), st))
                 if sel < 1.0:
