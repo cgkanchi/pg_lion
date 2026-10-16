@@ -137,6 +137,11 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *					to visit (the ordered index's selectivity, or the walked
  *					range's, times the relation's tuples), for the switch's
  *					density gate (§40.4)
+ *	LO_PRIV_LIMIT	an int8 Const: a lionvec order's (LO_FLAG_KNN), the rows
+ *					its query level's LIMIT takes, OFFSET included, which the
+ *					vector scan pauses by (lion_vec_scan_limit(), DESIGN.md
+ *					§44.4, §44.6); -1 when the planner did not know them,
+ *					and for every other plan
  *
  * and custom_exprs holds six lists:
  *
@@ -164,7 +169,8 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 #define LO_PRIV_SORT		6
 #define LO_PRIV_IOCOLS		7
 #define LO_PRIV_EXPECTED	8
-#define LO_PRIV_NMEMBERS	9
+#define LO_PRIV_LIMIT		9
+#define LO_PRIV_NMEMBERS	10
 
 /*
  * The fetch-and-sort switch (DESIGN.md §30.4, "When the walk is not paying"):
@@ -305,6 +311,7 @@ typedef struct LoPriv
 	bool	   *nullsfirst;
 	List	   *iocols;			/* IOCOLS: IntList, NIL in heap mode */
 	double		expected;		/* EXPECTED */
+	int64		limit;			/* LIMIT: positive, or -1 */
 } LoPriv;
 
 /*
@@ -419,6 +426,15 @@ lo_priv_decode(List *priv, LoPriv *out)
 		c->constisnull)
 		elog(ERROR, "LionOrdered: malformed expected walk");
 	out->expected = DatumGetFloat8(c->constvalue);
+
+	c = (Const *) list_nth(priv, LO_PRIV_LIMIT);
+	if (c == NULL || !IsA(c, Const) || c->consttype != INT8OID ||
+		c->constisnull)
+		elog(ERROR, "LionOrdered: malformed LIMIT");
+	out->limit = DatumGetInt64(c->constvalue);
+	if (out->limit != -1 &&
+		(out->limit <= 0 || (out->flags & LO_FLAG_KNN) == 0))
+		elog(ERROR, "LionOrdered: malformed LIMIT " INT64_FORMAT, out->limit);
 }
 
 /* lo_priv_encode() without its check */
@@ -457,6 +473,9 @@ lo_priv_build(const LoPriv *p)
 	priv = lappend(priv, p->iocols);
 	priv = lappend(priv, makeConst(FLOAT8OID, -1, InvalidOid, sizeof(float8),
 								   Float8GetDatum(p->expected),
+								   false, FLOAT8PASSBYVAL));
+	priv = lappend(priv, makeConst(INT8OID, -1, InvalidOid, sizeof(int64),
+								   Int64GetDatum(p->limit),
 								   false, FLOAT8PASSBYVAL));
 	return priv;
 }
@@ -621,6 +640,7 @@ typedef struct LionOrderedState
 	bool		knn;
 	ScanKey		obkeys;
 	int			nobkeys;
+	int64		knnlimit;		/* the rows its LIMIT takes, or -1 */
 
 	/*
 	 * ... or a lion column's walk (DESIGN.md §30.11): the column, where its
@@ -2548,6 +2568,7 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *iocols = NIL;
 	List	   *orderbys = NIL;
 	double		expected = 0.0;
+	int64		limit = -1;
 	int			dir;
 	int			flags = 0;
 	int			nulls = LION_ORDER_NULLS_NONE;
@@ -2599,6 +2620,22 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			orderbys = ord->indexorderbys;
 			dir = (int) ForwardScanDirection;
 			flags |= LO_FLAG_KNN | LO_FLAG_BUILD;
+
+			/*
+			 * The rows its query level's LIMIT takes, OFFSET included, when
+			 * the planner knows them: root->limit_tuples, -1 for no LIMIT,
+			 * one not constant at planning (a generic plan's Param), or one
+			 * that does not reach the scan (grouping, aggregates, DISTINCT,
+			 * window functions or set-returning functions above it); a
+			 * subquery's root has its own.  The vector
+			 * scan pauses at no tier below them (§44.4).  It is where to
+			 * pause, not a bound: a scan asked for more rows - a residual
+			 * filter or a join above it taking fewer than it returns -
+			 * returns more.
+			 */
+			if (root->limit_tuples > 0)
+				limit = root->limit_tuples >= (double) PG_INT64_MAX ?
+					PG_INT64_MAX : (int64) ceil(root->limit_tuples);
 		}
 	}
 	else
@@ -2702,6 +2739,7 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	lo_sort_keys(rel, best_path->path.pathkeys, &priv);
 	priv.iocols = iocols;
 	priv.expected = expected;
+	priv.limit = limit;
 	cscan->custom_private = lo_priv_encode(&priv);
 	cscan->methods = (best_path->methods == &lo_btree_path_methods) ?
 		&lo_btree_scan_methods : &lo_scan_methods;
@@ -3783,6 +3821,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->indexonly = (priv.flags & LO_FLAG_INDEXONLY) != 0;
 	st->lionheaprecheck = (priv.flags & LO_FLAG_HEAPRECHECK) != 0;
 	st->knn = (priv.flags & LO_FLAG_KNN) != 0;
+	st->knnlimit = priv.limit;
 	st->vmbuffer = InvalidBuffer;
 	st->walknulls = priv.nulls;
 	st->walkattno = priv.walkattno;
@@ -4245,8 +4284,9 @@ lo_start_walk(LionOrderedState *st)
 	index_rescan(st->scan, st->okeys, st->nokeys, st->obkeys, st->nobkeys);
 
 	/*
-	 * A lionvec scan reads and scores only the set's members (§44.6); every
-	 * rescan forgets the restriction, and a rebuilt set has moved.
+	 * A lionvec scan reads and scores only the set's members (§44.6), and
+	 * pauses by the rows the LIMIT takes (§44.4); every rescan forgets both,
+	 * and a rebuilt set has moved.
 	 */
 	if (st->knn)
 	{
@@ -4254,6 +4294,7 @@ lo_start_walk(LionOrderedState *st)
 			elog(ERROR, "LionOrdered: a lionvec order without its set");
 		lion_vec_restrict(st->scan, st->set->n, st->set->keys,
 						  st->set->conts);
+		lion_vec_scan_limit(st->scan, st->knnlimit);
 	}
 	st->scans++;
 	st->started = true;

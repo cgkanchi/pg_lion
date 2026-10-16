@@ -576,8 +576,11 @@ so measure it on your own data. A filter through lion uses the same margin.
 `pg_lion.vector_patience` (30, 0 to 1,000,000): how many units of `sqrt(n) / 2` rows - n the rows
 the index was built with, so the rows an average partition would hold in `2 sqrt(n)` partitions,
 however many it has; under a lion filter that share of the matching rows - a `lionvec` scan scores
-without finding one nearer than the `pg_lion.vector_batch` it has before it pauses: it stops reading
-partitions until it has returned those rows, and resumes if the query wants more (DESIGN.md §44.4).
+without finding one nearer than the rows it is after before it pauses: the nearest 10, 20, 40 and
+so on up to `pg_lion.vector_batch`, the least past the rows it has returned, and under a lion
+filter none fewer than the query's `LIMIT` (and `OFFSET`) when the planner knows it. Paused, it
+stops reading partitions until it has returned those rows, and resumes if the query wants more
+(DESIGN.md §44.4).
 A query whose nearest rows lie far from every centroid would otherwise read many partitions for
 nothing; on 975,000 OpenAI embeddings the pause cut the partitions a query read from 254 to 77 on
 average and the 95th percentile latency from 68 to 16 ms, for half a point of recall (98.4% of the

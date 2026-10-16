@@ -56,6 +56,15 @@
  * a margin of 8 probed 200 partitions a query at the median and 401 at the
  * 95th percentile for 0.986 of the ten nearest; by tiers, 159 and 254 for
  * 0.985 (DESIGN.md §44.4).
+ * A pause on a tier below the query's LIMIT ends by count, and probing
+ * resumes for the rest, to skip what it then finds nearer than the rows
+ * returned: a LIMIT 100 paused at 10, 20, 40, 80 and 100, and under a 3%
+ * filter at a margin of 8 got 0.9884 of its hundred nearest.  So a scan
+ * told the rows its query takes (lion_vec_scan_limit(): LionOrdered's, from
+ * the planner's LIMIT and OFFSET) keeps no tier below them; that LIMIT 100
+ * pauses on L alone and gets 0.9940, probing the same partitions, and a
+ * LIMIT 10 is as it was.  The plain scan, which core's Index Scan runs and
+ * no plan reaches, keeps every tier (DESIGN.md §44.4, "A known LIMIT").
  *
  * The bounds hold with the probability pg_lion.vector_epsilon sets; a row
  * whose bound fails and turns up after rows farther than it is skipped, so
@@ -199,6 +208,8 @@ typedef enum LvWalk
  * rows a pass has probed, K = LV_TIER_MIN, twice that and so on below L,
  * and when the last row entered them.  L's own are hi and hiat.  The least
  * K is a LIMIT 10's, the commonest; a smaller LIMIT pauses where it does.
+ * A scan told its LIMIT (lion_vec_scan_limit()) keeps only the tiers of K
+ * at or past it, and none under a LIMIT of L or more, which pauses on L.
  */
 #define LV_TIER_MIN		10
 #define LV_MAX_TIERS	32				/* K doubles from 10 past any int L */
@@ -228,6 +239,8 @@ typedef struct LvScanOpaque
 	LionVecQuery q;
 	double		qnorm;			/* |q| */
 	double		margin;			/* lv_margin() */
+	int64		limit;			/* rows it takes, -1 if not known
+								 * (lion_vec_scan_limit()) */
 
 	/* the restriction (lion_vec_restrict()) */
 	bool		restricted;
@@ -501,6 +514,27 @@ lion_vec_restrict(IndexScanDesc scan, int n, const uint32 *keys,
 	so->rpos = 0;
 }
 
+/*
+ * The rows the scan's query will take from it, when the planner knew them
+ * (lion_vec.h): lv_reset_rows() makes no tier below them.  Like the
+ * restriction, it is given after every rescan, which forgets it.
+ */
+void
+lion_vec_scan_limit(IndexScanDesc scan, int64 rows)
+{
+	LvScanOpaque *so;
+
+	if (!lion_vec_relation(scan->indexRelation))
+		elog(ERROR, "lionvec: \"%s\" is not a lionvec index",
+			 RelationGetRelationName(scan->indexRelation));
+	so = (LvScanOpaque *) scan->opaque;
+	if (so->phase != LV_START)
+		elog(ERROR, "lionvec: a scan is given its LIMIT after it has started");
+	if (rows != -1 && rows <= 0)
+		elog(ERROR, "lionvec: malformed LIMIT " INT64_FORMAT, rows);
+	so->limit = rows;
+}
+
 /* The first key at or after ckey, or rn. */
 static int
 lv_key_search(const LvScanOpaque *so, uint32 ckey)
@@ -598,6 +632,7 @@ lionvecbeginscan(Relation index, int nkeys, int norderbys)
 	so->qcxt = AllocSetContextCreate(cxt, "lionvec query",
 									 ALLOCSET_DEFAULT_SIZES);
 	so->phase = LV_START;
+	so->limit = -1;
 	so->wtids = MemoryContextAlloc(cxt, sizeof(ItemPointerData) * MaxOffsetNumber);
 	scan->opaque = so;
 	if (norderbys > 0)
@@ -654,6 +689,7 @@ lionvecrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys,
 	MemoryContextReset(so->qcxt);
 	so->phase = LV_START;
 	so->info = NULL;
+	so->limit = -1;
 	so->restricted = false;
 	so->rn = 0;
 	so->rkeys = NULL;
@@ -1720,6 +1756,9 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head, bool copies)
  * Is a pause due (the file's header)?  The tier of the next row - the
  * least K past the rows the pass has returned, or L - is full and has
  * taken no row in pg_lion.vector_patience units of rows.  Sets pausetier.
+ * The tiers are those lv_reset_rows() made, ascending: under a LIMIT the
+ * least may be past LV_TIER_MIN, and under one of L or more there are
+ * none, and the tier is L's.
  */
 static bool
 lv_pause_due(LvScanOpaque *so)
@@ -1745,6 +1784,8 @@ lv_pause_due(LvScanOpaque *so)
 static double
 lv_pause_tau(const LvScanOpaque *so)
 {
+	Assert(so->pausetier < so->ntiers);
+	Assert(so->pausetier < 0 || so->tiers[so->pausetier].n > 0);
 	return so->pausetier >= 0 ? so->tiers[so->pausetier].h[0] : so->tau;
 }
 
@@ -1788,17 +1829,31 @@ lv_reset_rows(LvScanOpaque *so)
 		so->maxhi = so->batch;
 	}
 
-	/* the tiers below L; a tier's K is the same in every batch */
+	/*
+	 * The tiers below L, and none below the rows the query takes when the
+	 * planner knew them (so->limit; the file's header): a pause on such a
+	 * tier would end by count before the query had its rows.  The least
+	 * stays LV_TIER_MIN, so a LIMIT of 1 to 10 keeps every tier.  The
+	 * limit is the scan's, so the first tier's K, and with it every
+	 * tier's, is the same in every batch, and a tier's heap, allocated by
+	 * the first, holds its K in each.  (k stays below L, an int, so it
+	 * cannot overflow on the way to a limit past every tier.)
+	 */
 	so->ntiers = 0;
 	for (k = LV_TIER_MIN; k < so->batch && so->ntiers < LV_MAX_TIERS; k *= 2)
 	{
 		LvTier	   *tier = &so->tiers[so->ntiers];
 
+		if (so->limit > 0 && k < so->limit)
+			continue;
 		if (so->ntiers >= so->ntieralloc)
 		{
 			tier->h = MemoryContextAlloc(so->qcxt, sizeof(double) * k);
 			so->ntieralloc++;
 		}
+		else if (tier->k != (int) k)
+			elog(ERROR, "lionvec: tier %d is of %d rows and its heap of %d",
+				 so->ntiers, (int) k, tier->k);
 		tier->k = (int) k;
 		tier->n = 0;
 		tier->at = 0.0;

@@ -348,6 +348,16 @@ extern void lion_vec_restrict(IndexScanDesc scan, int n, const uint32 *keys,
 							  LionContainer *const *conts);
 
 /*
+ * ... and tell it, likewise after its rescan and before its first tuple,
+ * how many rows its query will take from it, when the planner knew: the
+ * LIMIT, OFFSET included, of the query level it is in (§44.4, "A known
+ * LIMIT"; §44.6).  The scan then pauses at no tier below that.  -1, as a
+ * rescan leaves it, is not known.  A hint about where to pause, never a
+ * bound on the rows returned: a scan asked for more returns more.
+ */
+extern void lion_vec_scan_limit(IndexScanDesc scan, int64 rows);
+
+/*
  * ... and what a scan of it restricted to `members` of its `tuples` rows
  * costs before its first row, for the planner (§44.7).
  */

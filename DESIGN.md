@@ -20552,6 +20552,36 @@ the ten nearest at the default margin to 0.939; with twice the unit, 0.961, prob
 at the median against 530. At each recall a filter now probes fewer partitions than it did: 0.9925
 at 1% for 820 against 908, 0.9935 at 10% for 360 against 448.
 
+**A known LIMIT** (2026-10-16). A pause on a tier ends once it has returned that tier's K rows,
+and probing resumes for the rows the query still wants; a member it then finds, in a partition not
+probed yet, nearer than rows already returned is skipped. A LIMIT 10 is stopped by its Limit at
+the first pause and loses nothing so; a LIMIT 100 paused at 10, 20, 40, 80 and L's 100 in turn,
+each pause ending by count, and lost what it found after each (the ten "returned at the first
+tier's pause" above). Through LionOrdered on DBpedia's 115,186 rows (`vector_exact_rows = 0`, so
+that the 1% filter probes too), at a patience of 30, a LIMIT 100 found 0.9884 of its hundred
+nearest under a 3% filter at a margin of 8, against 0.9997 never pausing, and 0.9845 against
+0.9999 under 1%; and at that margin it returned the plain scan's rows (an Index Scan with a
+Filter) for 24 to 58% of the queries (vector-toy's characterization of 2026-10-16, its mechanism
+C). A smaller LIMIT was
+to pause where it does, not a larger one at every tier on its way. So LionOrdered hands the scan
+the rows its query level's LIMIT takes, OFFSET included, when the planner knows them (§44.6,
+`lion_vec_scan_limit()`), and the scan keeps no tier below them (`lv_reset_rows()`): a LIMIT 100
+at the default L has none and pauses on L alone, whose rows the LIMIT takes whole, as before the
+tiers; a LIMIT 50 first pauses at 80; a LIMIT of 1 to 10 keeps every tier, `LV_TIER_MIN` being the
+least. On the same 200 queries (`bench/results/2026-10-16-lionvec-limit`) a LIMIT 100 at a
+patience of 30 now pauses once a query rather than five times, skips 0.01 rows a query where it
+skipped up to 0.97, and finds 0.9942, 0.9940 and 0.9941 of its hundred nearest at a margin of 8
+under 10%, 3% and 1% (0.9913, 0.9884 and 0.9845 before), 0.9982 to 0.9988 at 16 (0.9963 to
+0.9974) and 0.9679 to 0.9823 at 3 (0.9677 to 0.9727), probing the same partitions and reading the
+same pages to within three, in the same time. With the pause off nothing changes, and a LIMIT 10
+is the same row for row and count for count at every filter, margin and patience measured. What is
+left of the gap to the pause off is the members in partitions the pause leaves unprobed, the
+pause's trade; at 3% and a margin of 8 LionOrdered now returns the plain scan's rows for 57% of
+the queries (39% before), the plain scan probing twice the partitions for 0.9987. A LIMIT the
+scan is not told keeps every tier: none, a generic plan's Param, one under grouping, aggregates,
+DISTINCT or a window, and every LIMIT of the plain scan, which core's Index Scan runs and no plan
+data reaches - a filter lion cannot index, or none, whose LIMIT 100 is the 0.9908 above.
+
 The patience grows with the margin past twice its default (`lv_patience_scale()`: by `margin / 6`
 at the default). A larger margin asks for more of the nearest rows, and a patience that stayed put
 held the recall to what the scan had found by then: 0.9935 of the ten nearest at any margin from 12
@@ -20795,7 +20825,13 @@ relation as a B-tree's is. The plan differs from §30's in four places:
   key (a Param query vector, a correlated subquery's) among the node's others, re-evaluated on
   rescan. EXPLAIN shows it as `Order By`.
 - **The set is handed to the scan** after every `index_rescan()` (`lion_vec_restrict()`: its
-  container keys, ascending, and its containers). The scan counts the members (a degraded
+  container keys, ascending, and its containers), and with it the rows the query takes
+  (`lion_vec_scan_limit()`): `root->limit_tuples` as the plan recorded it (`LO_PRIV_LIMIT`), the
+  LIMIT of the node's query level and its OFFSET, or -1 where the planner did not know them - no
+  LIMIT, a generic plan's Param, grouping, aggregates, DISTINCT or a window above it. The scan
+  keeps no tier of its pause below them (§44.4, "A known LIMIT"). They say where to pause, not
+  how many rows to return: a residual filter or a join that takes fewer rows than the scan returns
+  gets more, from probing resumed. The scan counts the members (a degraded
   container, NULL, as its 64 blocks' share of the table's rows) and then does one of two things:
   - **No more than `pg_lion.vector_exact_rows` (2,000) members, none degraded**: it fetches every member
     from the heap, computes its distance with the operator's function, sorts them (NaN last, then
@@ -21361,6 +21397,16 @@ medians of three and two), the same index.
   node (the short LIMIT of §44.4); the node switched off. Spill: LionOrdered returns each member
   once and the same rows as the ordinary plan, every member of two filters for each metric, at
   the margin of 100 and at the defaults, before and after DELETE and VACUUM under the filter.
+- **vector_limit.sql** (2026-10-16): the restricted scan told its query's LIMIT (§44.4, "A known
+  LIMIT"), over vector_filter.sql's 10,000 rows in 50 partitions at the margin of 100, where every
+  partition comes before every row, and a patience of one unit, so that each tier pauses as soon
+  as it stalls; each query through the node, with the scan's DEBUG1 line, and against a sort. A
+  LIMIT 100 under filters of 9,000 and 3,000 members pauses once, on L, skips nothing and returns
+  the hundred nearest, where the tiers paused five times and lost 27 and 26 of them; so do LIMIT
+  10 OFFSET 90 and a custom plan's `LIMIT $1`; a LIMIT 50 pauses once, at 80, and returns its
+  fifty nearest (23 with the tiers); LIMITs 10 and 5 are as they were, a pause at ten each; a
+  generic plan's `LIMIT $1`, which the planner does not know, keeps every tier and loses the 27
+  as before; and a subquery's own LIMIT under an aggregate.
 - **test/isolation/lionvec_insert_window.spec** (an injection point build, PostgreSQL 17 and on;
   2026-10-15, after a review found lionvec's concurrency untested): an insert parked after its
   REFINE record (`lionvec-insert-refined`), and after its CODE record before its copy's
