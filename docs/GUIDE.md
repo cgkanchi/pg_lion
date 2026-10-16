@@ -536,9 +536,9 @@ ALTER TABLE items ALTER embedding SET STORAGE PLAIN;  -- new rows; existing ones
 ```
 
 With the vectors in the table so, a 1% filter answered exactly, from every matching row's vector,
-took 33 ms cold rather than 71. In shared buffers prefetch costs a few percent (2.39 ms rather than
-2.29 at the default margin, 5.5 rather than 5.1 at 8); `SET pg_lion.vector_prefetch = off` where the
-index and the table stay there.
+took 33 ms cold rather than 71. In shared buffers prefetch costs about 2% (2.33 ms rather than
+2.29 at the default margin, 5.0 rather than 4.9 at 8): a scan whose asks keep finding their pages
+there mostly stops asking. `SET pg_lion.vector_prefetch = off` turns it off altogether.
 
 An unfiltered `ORDER BY embedding <=> $1 LIMIT k` can run in parallel: a Gather Merge over a
 Parallel Index Scan, each process probing the partitions it reaches first and returning their rows

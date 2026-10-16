@@ -277,14 +277,31 @@ typedef struct LvShared
 #define LV_REST_CHAIN		PG_UINT32_MAX
 
 /*
- * Prefetch (DESIGN.md §44.4, "Prefetch"): blocks a scan has asked for of a
- * relation lately, the last one of LV_PF_SLOTS slots by its hash, so that
- * the entries of a queue whose items share a page - five centroids' REFINE
- * items to a page at 1536 dimensions - ask for it once; a block that loses
- * its slot is asked for again, which costs a lookup in shared buffers.
+ * Prefetch (DESIGN.md §44.4, "Prefetch"): what a scan knows of its asks of a
+ * relation.  The blocks it has asked for lately, the last one of LV_PF_SLOTS
+ * slots by its hash, so that the entries of a queue whose items share a page
+ * - five centroids' REFINE items to a page at 1536 dimensions - ask for it
+ * once; a block that loses its slot is asked for again, which costs a
+ * lookup in shared buffers.  And whether asking pays: each ask of a page
+ * that is in shared buffers already is that lookup for nothing, 4 to 9% of
+ * a warm DBpedia scan, so after LV_PF_WARM asks in a row that found their
+ * page there the scan lets the next LV_PF_DORMANT asks pass unasked, and
+ * then asks again - a cold relation is asked for all along, a warm one a
+ * ninth as often, and one warm in parts loses at most that many asks at a
+ * time.  The PART chain does not count (lv_read_parts()): every scan reads
+ * it, so it is warm whatever else is.
  */
 #define LV_PF_SLOTS			128			/* a power of two */
 #define LV_PF_TOP(dist)		(4 * (dist) + 1)	/* the queue's top looked at */
+#define LV_PF_WARM			32
+#define LV_PF_DORMANT		256
+
+typedef struct LvPrefetch
+{
+	BlockNumber seen[LV_PF_SLOTS];	/* blocks asked for lately */
+	int			warm;			/* asks in a row that found their page */
+	int			dormant;		/* asks to let pass */
+} LvPrefetch;
 
 typedef struct LvScanOpaque
 {
@@ -388,8 +405,8 @@ typedef struct LvScanOpaque
 	int		   *pfsel;			/* [LIONVEC_PREFETCH_MAX]: lionvec_least()'s */
 	uint64		wpfnext;		/* a walk's next page to ask for ... */
 	uint64		wpfend;			/* ... and the block it stops at */
-	BlockNumber ipfseen[LV_PF_SLOTS];	/* index blocks asked for lately */
-	BlockNumber hpfseen[LV_PF_SLOTS];	/* heap blocks */
+	LvPrefetch	ipfs;			/* the index's asks */
+	LvPrefetch	hpfs;			/* the heap's */
 
 	/* a parallel scan (DESIGN.md §44.4, "A parallel scan"); NULL: serial */
 	LvShared   *shared;
@@ -558,28 +575,52 @@ lv_pause_tau(const LvScanOpaque *so)
 /*
  * Ask the kernel for a block a read will want soon: PrefetchBuffer(), which
  * pins nothing and is posix_fadvise() under it, read by an I/O worker or
- * io_uring alike from 18 on.  seen, if given, is the relation's table of
- * blocks asked for lately (LV_PF_SLOTS), which a block in it skips.  The
+ * io_uring alike from 18 on.  pf is what the scan knows of its asks of the
+ * relation (LvPrefetch): while it is dormant the ask is let pass, and with
+ * once a block in its table of blocks asked for lately is skipped.  The
  * caller keeps blk below the relation's size as it read it: past the last
  * segment md.c would fail rather than ignore it.
  */
 static void
-lv_prefetch(LvScanOpaque *so, Relation rel, BlockNumber blk, BlockNumber *seen)
+lv_prefetch(LvScanOpaque *so, Relation rel, BlockNumber blk, LvPrefetch *pf,
+			bool once)
 {
 	PrefetchBufferResult r;
 
-	if (seen != NULL)
+	if (pf->dormant > 0)
+	{
+		pf->dormant--;
+		return;
+	}
+	if (once)
 	{
 		uint32		slot = murmurhash32(blk) & (LV_PF_SLOTS - 1);
 
-		if (seen[slot] == blk)
+		if (pf->seen[slot] == blk)
 			return;
-		seen[slot] = blk;
+		pf->seen[slot] = blk;
 	}
 	r = PrefetchBuffer(rel, MAIN_FORKNUM, blk);
 	so->nprefetch++;
 	if (r.initiated_io)
+	{
 		so->nprefread++;
+		pf->warm = 0;
+	}
+	else if (++pf->warm >= LV_PF_WARM)
+	{
+		pf->warm = 0;
+		pf->dormant = LV_PF_DORMANT;
+	}
+}
+
+/* Forget what a relation's asks found: the next asks are made (LvPrefetch). */
+static void
+lv_prefetch_reset(LvPrefetch *pf)
+{
+	memset(pf->seen, 0xFF, sizeof(pf->seen));
+	pf->warm = 0;
+	pf->dormant = 0;
 }
 
 /*
@@ -593,7 +634,7 @@ lv_prefetch_run(LvScanOpaque *so, Relation index, uint64 *next, uint64 end)
 	if (end > so->nblocks)
 		end = so->nblocks;
 	for (; *next < end; (*next)++)
-		lv_prefetch(so, index, (BlockNumber) *next, NULL);
+		lv_prefetch(so, index, (BlockNumber) *next, &so->ipfs, false);
 }
 
 /* The heap block of a row, as its exact distance will read it. */
@@ -604,7 +645,7 @@ lv_prefetch_heap(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid)
 
 	/* a row inserted since the scan counted the blocks is left to its read */
 	if (blk < so->hblocks)
-		lv_prefetch(so, scan->heapRelation, blk, so->hpfseen);
+		lv_prefetch(so, scan->heapRelation, blk, &so->hpfs, true);
 }
 
 /*
@@ -669,7 +710,7 @@ lv_prefetch_queue(IndexScanDesc scan, LvScanOpaque *so, LvHeap *h,
 		if (fetch)
 			lv_prefetch_heap(scan, so, (ItemPointer) &it->tid);
 		else if (it->rblk < so->nblocks)
-			lv_prefetch(so, scan->indexRelation, it->rblk, so->ipfseen);
+			lv_prefetch(so, scan->indexRelation, it->rblk, &so->ipfs, true);
 	}
 	return m;
 }
@@ -1698,6 +1739,9 @@ lv_read_parts(IndexScanDesc scan, LvScanOpaque *so)
 				 errmsg("lionvec index \"%s\" has %d partitions, and its meta page says %d",
 						RelationGetRelationName(index), n, k)));
 	lv_heapify(&so->parts);
+	/* the PART chain is warm whatever else is: it says nothing (LvPrefetch) */
+	so->ipfs.warm = 0;
+	so->ipfs.dormant = 0;
 	so->cpfdue = 1;
 	lv_prefetch_due(scan, so, &so->cpfdue, &so->parts, LV_CENT1, false);
 }
@@ -2633,8 +2677,8 @@ lv_start_prefetch(IndexScanDesc scan, LvScanOpaque *so)
 
 	so->ipf = so->hpf = 0;
 	so->perpage = lionvec_page_items(LIONVEC_CODE_SIZE(Max(so->meta.dimsp, 64)));
-	memset(so->ipfseen, 0xFF, sizeof(so->ipfseen));
-	memset(so->hpfseen, 0xFF, sizeof(so->hpfseen));
+	lv_prefetch_reset(&so->ipfs);
+	lv_prefetch_reset(&so->hpfs);
 	if (!lionvec_prefetch)
 		return;
 	so->ipf = Min(get_tablespace_io_concurrency(index->rd_rel->reltablespace),

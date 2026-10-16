@@ -679,9 +679,9 @@ asks for none). The table's rows are asked for only when its access method is he
 vectors lie in its pages (`STORAGE PLAIN` or `MAIN`, or at most 506 dimensions, 1,012 as
 `halfvec`). The rows returned are the same either way. Cold it cut a scan's wait on the disk by a
 third to a half on 115,386 embeddings, and an exact answer's over vectors kept in the table by five
-sixths (DESIGN.md §44.9); with everything in shared buffers it costs 4 to 9%, the lookups of pages
-already there. Each scan's `DEBUG1` line names the pages it asked for and how many were not in
-shared buffers.
+sixths (DESIGN.md §44.9); with everything in shared buffers it costs about 2%: after 32 asks in a
+row found their page there, a scan lets the next 256 pass unasked, then asks again. Each scan's
+`DEBUG1` line names the pages it asked for and how many were not in shared buffers.
 
 `pg_lion.ordered_switch_ratio` (32, 1 to 1,000,000): how many B-tree entries `LionOrdered` walks per
 member it has not met yet before it stops walking, fetches the members left in TID order and sorts

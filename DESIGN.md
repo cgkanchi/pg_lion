@@ -20908,9 +20908,15 @@ Measured (§44.9, "Prefetch and parallel scans"): cold, each query alone after a
 page cache dropped, a serial scan at a margin of 3 took 17.4 ms against 21.2 without (its wait on
 reads, by `track_io_timing`, 11.4 ms against 17.7, for 410 pages from the kernel), at a margin of
 8 32.4 against 49.4 (20.6 against 41.9, for 972 pages), and the exact path over vectors kept in
-the heap, under a 1% filter, 33.5 against 70.6 (11.0 against 64.8, for 1,213 pages); warm, every
-page in shared buffers, it costs a few percent, 2.39 ms against 2.29 at a margin of 3 and 5.51
-against 5.06 at 8, the lookups of pages that are there already and the looks into the queues.
+the heap, under a 1% filter, 33.5 against 70.6 (11.0 against 64.8, for 1,213 pages). Warm, every
+page in shared buffers, an ask is a lookup of a page that is there already, 4 to 9% of a scan when
+every page was asked for (2.39 ms against 2.29 at a margin of 3, 5.51 against 5.06 at 8). So the
+scan watches what its asks of each relation find (`LvPrefetch`): after `LV_PF_WARM` (32) asks in a
+row that found their page in shared buffers it lets the next `LV_PF_DORMANT` (256) asks pass
+unasked, then asks again. A cold relation is asked for all along, a warm one a ninth as often
+(a margin-8 scan asks for 65 pages rather than 880), and one warm in parts loses at most 256 asks
+at a time; the PART chain, which every scan reads and so is warm whatever else is, does not count.
+Warm it then costs about 2%: 2.33 ms against 2.29 at a margin of 3 and 4.99 against 4.91 at 8.
 
 **A parallel scan** (2026-10-16). `amcanparallel`: an unfiltered `ORDER BY` of the distance may be
 a Parallel Index Scan under a Gather Merge (§44.7 prices it; a filtered one stays serial, below).
@@ -21356,9 +21362,9 @@ could have lost to; LionOrdered's paths are serial.
   an `effective_io_concurrency` of 0 asks for none either way. The rows a scan returns, and their
   order, are the same on or off. On DBpedia (§44.9), each query alone cold, it took a serial scan
   at a margin of 8 from 49.4 ms to 32.4 and the exact path over vectors kept in the heap from 70.6 ms
-  to 33.5 under a 1% filter; warm, every page in shared buffers, it cost 4 to 9% (2.29 to 2.39 ms
-  at a margin of 3, 5.06 to 5.51 at 8), the lookups
-  of pages already there. Off where the index and the heap stay in shared buffers.
+  to 33.5 under a 1% filter; warm, every page in shared buffers, it costs about 2% (2.29 to 2.33 ms
+  at a margin of 3, 4.91 to 4.99 at 8): a scan whose asks keep finding their pages in shared
+  buffers mostly stops asking (§44.4, "Prefetch"). Off where that is not worth having.
 - core's `max_parallel_workers_per_gather`, `parallel_setup_cost`, `parallel_tuple_cost`,
   `min_parallel_index_scan_size`, `min_parallel_table_scan_size` and the table's
   `parallel_workers`: whether an unfiltered scan runs in parallel, and in how many processes
@@ -21955,10 +21961,13 @@ its wait on reads fell by five sixths, its time by half: the rest is the reads' 
 fadvise calls, one a page. Warm there it took 2.62 against 2.80 ms at 1%, 8.20 against 8.89 at 3%,
 11.52 against 10.89 probing at 10% and 1.28 against 1.28 unfiltered (the server's medians).
 Warm on `dbp`, paired (six rounds of the 200 queries, off and on in turn, the median of the
-rounds' client medians): a serial scan at a margin of 3 took 2.29 ms against 2.39 with prefetch,
-at 8 5.06 against 5.51, two participants at 3 11.98 against 11.71: 4 and 9% serially, the
-lookups in shared buffers of pages already there and the looks into the queues, and in parallel
-less than the noise.
+rounds' client medians): with every page asked for, a serial scan at a margin of 3 took 2.29 ms
+against 2.39 with prefetch, at 8 5.06 against 5.51, two participants at 3 11.98 against 11.71: 4
+and 9% serially, the lookups in shared buffers of pages already there and the looks into the
+queues, and in parallel less than the noise. Asking no more once the asks keep finding their pages
+there (§44.4, "Prefetch": dormant for 256 asks after 32 found), the same rounds gave 2.29 against
+2.33 at a margin of 3, 4.91 against 4.99 at 8 and 10.67 against 10.81 with two participants: about
+2%, a margin-8 scan asking for 65 pages rather than 880.
 
 ### 44.10 Tests
 
