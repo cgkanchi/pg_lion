@@ -1,0 +1,262 @@
+Parsed test spec with 4 sessions
+
+starting permutation: s1_open s2_park_refined s3_begin s2_insert s1_drain s3_new s4_wake_refined s3_commit s1_check s3_whole
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_open: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	DECLARE c CURSOR FOR SELECT id FROM lvi ORDER BY v <-> lvi_vec(-7, 0.5);
+	SELECT lvi_take('c', 5);
+
+lvi_take
+--------
+       5
+(1 row)
+
+step s2_park_refined: SELECT injection_points_attach('lionvec-insert-refined', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s3_begin: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	SELECT count(*) AS rows FROM lvi;
+
+rows
+----
+2000
+(1 row)
+
+step s2_insert: 
+	INSERT INTO lvi
+	SELECT 3000 + i, lvi_vec(-1, 0.1) + lvi_vec(9000 + i, 0.05)
+	  FROM generate_series(1, 50) i;
+ <waiting ...>
+step s1_drain: SELECT lvi_take('c', NULL);
+lvi_take
+--------
+    1995
+(1 row)
+
+step s3_new: 
+	SELECT count(*) FILTER (WHERE id > 3000) AS new_rows
+	  FROM (SELECT id FROM lvi ORDER BY v <-> lvi_vec(-1, 0.1) LIMIT 60) s;
+ <waiting ...>
+step s4_wake_refined: 
+	SELECT injection_points_detach('lionvec-insert-refined');
+	SELECT injection_points_wakeup('lionvec-insert-refined');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s2_insert: <... completed>
+step s3_new: <... completed>
+new_rows
+--------
+       0
+(1 row)
+
+step s3_commit: COMMIT;
+step s1_check: 
+	SET LOCAL enable_seqscan = on;
+	SET LOCAL enable_sort = on;
+	SET LOCAL enable_indexscan = off;
+	SELECT count(*) AS rows, count(DISTINCT g.id) AS distinct_rows,
+		   count(*) = count(*) FILTER (WHERE g.id = s.id) AS sort_order
+	  FROM lvi_got g
+	  JOIN (SELECT row_number() OVER (ORDER BY v <-> lvi_vec(-7, 0.5), id) AS n, id
+			  FROM lvi) s USING (n);
+	COMMIT;
+
+rows|distinct_rows|sort_order
+----+-------------+----------
+2000|         2000|t         
+(1 row)
+
+step s3_whole: 
+	SELECT count(*) AS rows, count(DISTINCT id) AS distinct_rows
+	  FROM (SELECT id FROM lvi ORDER BY v <-> lvi_vec(5, 0.7)) s;
+
+rows|distinct_rows
+----+-------------
+2050|         2050
+(1 row)
+
+
+starting permutation: s1_open s2_park_coded s2_insert s1_drain s4_wake_coded s2_done s1_check s3_new s3_whole
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_open: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	DECLARE c CURSOR FOR SELECT id FROM lvi ORDER BY v <-> lvi_vec(-7, 0.5);
+	SELECT lvi_take('c', 5);
+
+lvi_take
+--------
+       5
+(1 row)
+
+step s2_park_coded: SELECT injection_points_attach('lionvec-insert-coded', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s2_insert: 
+	INSERT INTO lvi
+	SELECT 3000 + i, lvi_vec(-1, 0.1) + lvi_vec(9000 + i, 0.05)
+	  FROM generate_series(1, 50) i;
+ <waiting ...>
+step s1_drain: SELECT lvi_take('c', NULL);
+lvi_take
+--------
+    1995
+(1 row)
+
+step s4_wake_coded: 
+	SELECT injection_points_detach('lionvec-insert-coded');
+	SELECT injection_points_wakeup('lionvec-insert-coded');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s2_insert: <... completed>
+step s2_done: 
+step s1_check: 
+	SET LOCAL enable_seqscan = on;
+	SET LOCAL enable_sort = on;
+	SET LOCAL enable_indexscan = off;
+	SELECT count(*) AS rows, count(DISTINCT g.id) AS distinct_rows,
+		   count(*) = count(*) FILTER (WHERE g.id = s.id) AS sort_order
+	  FROM lvi_got g
+	  JOIN (SELECT row_number() OVER (ORDER BY v <-> lvi_vec(-7, 0.5), id) AS n, id
+			  FROM lvi) s USING (n);
+	COMMIT;
+
+rows|distinct_rows|sort_order
+----+-------------+----------
+2000|         2000|t         
+(1 row)
+
+step s3_new: 
+	SELECT count(*) FILTER (WHERE id > 3000) AS new_rows
+	  FROM (SELECT id FROM lvi ORDER BY v <-> lvi_vec(-1, 0.1) LIMIT 60) s;
+
+new_rows
+--------
+      50
+(1 row)
+
+step s3_whole: 
+	SELECT count(*) AS rows, count(DISTINCT id) AS distinct_rows
+	  FROM (SELECT id FROM lvi ORDER BY v <-> lvi_vec(5, 0.7)) s;
+
+rows|distinct_rows
+----+-------------
+2050|         2050
+(1 row)
+
+
+starting permutation: s1_begin s2_park_coded s2_insert s1_declare s4_wake_coded s1_drain s1_check s3_whole
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_begin: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	SELECT count(*) AS rows FROM lvi;
+
+rows
+----
+2000
+(1 row)
+
+step s2_park_coded: SELECT injection_points_attach('lionvec-insert-coded', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s2_insert: 
+	INSERT INTO lvi
+	SELECT 3000 + i, lvi_vec(-1, 0.1) + lvi_vec(9000 + i, 0.05)
+	  FROM generate_series(1, 50) i;
+ <waiting ...>
+step s1_declare: 
+	DECLARE c CURSOR FOR SELECT id FROM lvi ORDER BY v <-> lvi_vec(-7, 0.5);
+	SELECT lvi_take('c', 5);
+ <waiting ...>
+step s4_wake_coded: 
+	SELECT injection_points_detach('lionvec-insert-coded');
+	SELECT injection_points_wakeup('lionvec-insert-coded');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s2_insert: <... completed>
+step s1_declare: <... completed>
+lvi_take
+--------
+       5
+(1 row)
+
+step s1_drain: SELECT lvi_take('c', NULL);
+lvi_take
+--------
+    1995
+(1 row)
+
+step s1_check: 
+	SET LOCAL enable_seqscan = on;
+	SET LOCAL enable_sort = on;
+	SET LOCAL enable_indexscan = off;
+	SELECT count(*) AS rows, count(DISTINCT g.id) AS distinct_rows,
+		   count(*) = count(*) FILTER (WHERE g.id = s.id) AS sort_order
+	  FROM lvi_got g
+	  JOIN (SELECT row_number() OVER (ORDER BY v <-> lvi_vec(-7, 0.5), id) AS n, id
+			  FROM lvi) s USING (n);
+	COMMIT;
+
+rows|distinct_rows|sort_order
+----+-------------+----------
+2000|         2000|t         
+(1 row)
+
+step s3_whole: 
+	SELECT count(*) AS rows, count(DISTINCT id) AS distinct_rows
+	  FROM (SELECT id FROM lvi ORDER BY v <-> lvi_vec(5, 0.7)) s;
+
+rows|distinct_rows
+----+-------------
+2050|         2050
+(1 row)
+

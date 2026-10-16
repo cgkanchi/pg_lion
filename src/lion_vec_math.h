@@ -253,6 +253,29 @@ extern int	lionvec_candidates_n(const LionVecCentroids *c, const LionVecQuery *q
 								 int m, double *lo, double *hi, int *cand);
 
 /*
+ * lionvec_candidates_n() a centroid at a time, for a caller that reads the
+ * centroids from pages and would rather not hold all k of them (an insert,
+ * lion_vec.c): begin with m, add each centroid in turn - its bounds into *lo
+ * and *hi, and whether it can still be a candidate, its lower bound being no
+ * more than the m-th least upper bound so far - and at the end keep those
+ * whose lower bound is no more than the threshold.  The threshold only
+ * falls, so a centroid add() turns down is never a candidate; the end's set
+ * and order are lionvec_candidates_n()'s, which is built of the same calls.
+ */
+typedef struct LionVecCandScan
+{
+	int			m;
+	int			nleast;
+	double		least[LIONVEC_RANK_MAX];	/* the m least upper bounds, ascending */
+} LionVecCandScan;
+
+extern void lionvec_cands_begin(LionVecCandScan *cs, int m);
+extern bool lionvec_cands_add(LionVecCandScan *cs, const LionVecQuery *q,
+							  const uint64 *bits, uint16 popcount, float norm,
+							  float alpha1, double *lo, double *hi);
+extern double lionvec_cands_threshold(const LionVecCandScan *cs);
+
+/*
  * The m least of key[0 .. n), as their places in key, least first: into
  * order[], which must hold min(n, m) of them, and how many that is.  Ties go
  * to the lower place, and a NaN key counts as infinite.

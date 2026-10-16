@@ -1,0 +1,1 @@
+../lionvec_vacuum_scan.spec
