@@ -340,6 +340,9 @@ SELECT vec_cmp(format('SELECT id, v <=> %L::vector AS d FROM vt ORDER BY v <=> %
 -- a query of other dimensions is pgvector's error
 SET enable_seqscan = off;
 SELECT id FROM vt ORDER BY v <-> '[1,2,3]' LIMIT 1;
+-- with no ORDER BY the index is never scanned, even with sequential scans
+-- off (from 18 it was, as an index-only scan, which failed)
+SELECT count(*) FROM vt;
 RESET enable_seqscan;
 
 -- the scan as it goes on past a pass: a batch of one, and passes cut to

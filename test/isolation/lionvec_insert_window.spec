@@ -16,11 +16,18 @@
 # rows must be exactly those of a sort under the same snapshot, each once -
 # the parked insert's row, met in one chain and not yet the other, is not
 # visible to it either way.  A scan that starts while the insert is parked
-# waits for the meta page (a buffer lock, which isolationtester cannot see:
-# hence the (*) marker) and runs once the insert is done, under the
-# snapshot it took before, which sees none of the insert's rows.  Afterwards
-# every row is returned once by a scan of the whole index, and the new rows
-# come first for a query at their cluster.
+# waits for the meta page, which its planning reads too (a buffer lock,
+# which isolationtester cannot see: hence the (*) markers), and runs once
+# the insert is done.  Its transaction took its snapshot before the insert
+# began (REPEATABLE READ: one taken as the query starts could be taken
+# before the insert commits or after), so it sees none of the insert's
+# rows.  Afterwards every row is returned once by a scan of the whole index,
+# and the new rows come first for a query at their cluster.
+#
+# The markers naming s2_insert, and the empty steps, fix the order in which
+# the steps a wakeup frees are reported, which would otherwise race the next
+# step: the insert's end first, then a step that waited on it, then the
+# next step.
 #
 # pg_lion.vector_margin and vector_patience make the scans read every
 # partition that could hold a nearer row, so that the comparisons are exact
@@ -96,6 +103,15 @@ step s1_open	{
 	DECLARE c CURSOR FOR SELECT id FROM lvi ORDER BY v <-> lvi_vec(-7, 0.5);
 	SELECT lvi_take('c', 5);
 }
+# The same, its snapshot taken first and the cursor opened later.
+step s1_begin	{
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	SELECT count(*) AS rows FROM lvi;
+}
+step s1_declare	{
+	DECLARE c CURSOR FOR SELECT id FROM lvi ORDER BY v <-> lvi_vec(-7, 0.5);
+	SELECT lvi_take('c', 5);
+}
 step s1_drain	{ SELECT lvi_take('c', NULL); }
 # The rows the cursor returned against a sort under the same snapshot: as
 # many, each once, in the sort's order.
@@ -124,6 +140,9 @@ step s2_insert	{
 	SELECT 3000 + i, lvi_vec(-1, 0.1) + lvi_vec(9000 + i, 0.05)
 	  FROM generate_series(1, 50) i;
 }
+# Nothing: run after a wakeup, it waits for the insert to end, so that the
+# next step starts only then (the isolation README's empty step).
+step s2_done	{ }
 
 # Scans afresh.
 session s3
@@ -135,8 +154,14 @@ setup
 	SET enable_seqscan = off;
 	SET enable_sort = off;
 }
-# Started while the insert holds the meta page, it waits for it; started
-# after, it finds the new rows.
+# A snapshot from before the insert.
+step s3_begin	{
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	SELECT count(*) AS rows FROM lvi;
+}
+# Started while the insert holds the meta page, it waits for it, and in
+# s3_begin's transaction finds none of the new rows; started after the
+# insert, on its own, it finds them.
 step s3_new	{
 	SELECT count(*) FILTER (WHERE id > 3000) AS new_rows
 	  FROM (SELECT id FROM lvi ORDER BY v <-> lvi_vec(-1, 0.1) LIMIT 60) s;
@@ -146,6 +171,7 @@ step s3_whole	{
 	SELECT count(*) AS rows, count(DISTINCT id) AS distinct_rows
 	  FROM (SELECT id FROM lvi ORDER BY v <-> lvi_vec(5, 0.7)) s;
 }
+step s3_commit	{ COMMIT; }
 
 # Wakes s2.
 session s4
@@ -159,11 +185,11 @@ step s4_wake_coded	{
 }
 
 # Parked with the REFINE item in: the open cursor drains, a new scan waits.
-permutation s1_open s2_park_refined s2_insert s1_drain s3_new(*) s4_wake_refined s1_check s3_whole
+permutation s1_open s2_park_refined s3_begin s2_insert s1_drain s3_new(*, s2_insert) s4_wake_refined s3_commit s1_check s3_whole
 
 # Parked with the row in its nearest partition and not yet its second.
-permutation s1_open s2_park_coded s2_insert s1_drain s4_wake_coded s1_check s3_new s3_whole
+permutation s1_open s2_park_coded s2_insert s1_drain s4_wake_coded s2_done s1_check s3_new s3_whole
 
-# The cursor opened while the insert is parked sees the index as it then
-# stands, and returns no row of it.
-permutation s2_park_coded s2_insert s1_open(*) s4_wake_coded s1_drain s1_check s3_whole
+# The cursor opened while the insert is parked waits for it, reads the index
+# as the insert left it, and returns no row of it.
+permutation s1_begin s2_park_coded s2_insert s1_declare(*, s2_insert) s4_wake_coded s1_drain s1_check s3_whole

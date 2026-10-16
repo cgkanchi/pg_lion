@@ -1,6 +1,6 @@
 Parsed test spec with 4 sessions
 
-starting permutation: s1_open s2_park_refined s2_insert s1_drain s3_new s4_wake_refined s1_check s3_whole
+starting permutation: s1_open s2_park_refined s3_begin s2_insert s1_drain s3_new s4_wake_refined s3_commit s1_check s3_whole
 injection_points_set_local
 --------------------------
                           
@@ -20,6 +20,15 @@ step s2_park_refined: SELECT injection_points_attach('lionvec-insert-refined', '
 injection_points_attach
 -----------------------
                        
+(1 row)
+
+step s3_begin: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	SELECT count(*) AS rows FROM lvi;
+
+rows
+----
+2000
 (1 row)
 
 step s2_insert: 
@@ -58,6 +67,7 @@ new_rows
        0
 (1 row)
 
+step s3_commit: COMMIT;
 step s1_check: 
 	SET LOCAL enable_seqscan = on;
 	SET LOCAL enable_sort = on;
@@ -84,7 +94,7 @@ rows|distinct_rows
 (1 row)
 
 
-starting permutation: s1_open s2_park_coded s2_insert s1_drain s4_wake_coded s1_check s3_new s3_whole
+starting permutation: s1_open s2_park_coded s2_insert s1_drain s4_wake_coded s2_done s1_check s3_new s3_whole
 injection_points_set_local
 --------------------------
                           
@@ -132,6 +142,7 @@ injection_points_wakeup
 (1 row)
 
 step s2_insert: <... completed>
+step s2_done: 
 step s1_check: 
 	SET LOCAL enable_seqscan = on;
 	SET LOCAL enable_sort = on;
@@ -167,10 +178,19 @@ rows|distinct_rows
 (1 row)
 
 
-starting permutation: s2_park_coded s2_insert s1_open s4_wake_coded s1_drain s1_check s3_whole
+starting permutation: s1_begin s2_park_coded s2_insert s1_declare s4_wake_coded s1_drain s1_check s3_whole
 injection_points_set_local
 --------------------------
                           
+(1 row)
+
+step s1_begin: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	SELECT count(*) AS rows FROM lvi;
+
+rows
+----
+2000
 (1 row)
 
 step s2_park_coded: SELECT injection_points_attach('lionvec-insert-coded', 'wait');
@@ -184,8 +204,7 @@ step s2_insert:
 	SELECT 3000 + i, lvi_vec(-1, 0.1) + lvi_vec(9000 + i, 0.05)
 	  FROM generate_series(1, 50) i;
  <waiting ...>
-step s1_open: 
-	BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_declare: 
 	DECLARE c CURSOR FOR SELECT id FROM lvi ORDER BY v <-> lvi_vec(-7, 0.5);
 	SELECT lvi_take('c', 5);
  <waiting ...>
@@ -204,7 +223,7 @@ injection_points_wakeup
 (1 row)
 
 step s2_insert: <... completed>
-step s1_open: <... completed>
+step s1_declare: <... completed>
 lvi_take
 --------
        5
