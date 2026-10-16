@@ -15715,10 +15715,12 @@ than overruns (§30.4).
   or batch by batch - one PIECE per container key each entry or batch touches, so a range over
   400,000 distinct values brings 400,000 one-TID pieces for 34 keys - and its pieces are sorted and
   those of equal keys ORed, through one bitset image per key, whenever the directory is full (from
-  1,024 entries on; it doubles only if it is still more than half full afterwards), before their
-  bytes would degrade the set (once there are at least as many pieces as merged entries), and when
-  the source is complete. A BitmapAnd is the container-wise AND of its children's sets, a BitmapOr
-  their OR; a leaf that selects nothing is an empty set. No lossy page exists anywhere in this:
+  1,024 entries on; it then doubles until it has room for 32 pieces an entry the merge left, or its
+  slots alone would take `hash_mem`), before their bytes would degrade the set (once there are at
+  least as many pieces as merged entries), and when the source is complete. A merge sorts only the
+  pieces since the last one, by key and slot packed into a word, and merges them with the entries
+  that one left, which are in order. A BitmapAnd is the container-wise AND of its children's sets,
+  a BitmapOr their OR; a leaf that selects nothing is an empty set. No lossy page exists anywhere in this:
   every member is a TID some entry held (§29.6).
   *(Fixed 2026-09-25, second review: the pieces were merged only once the source was complete, and
   pairwise. Every piece kept a directory entry and a container copy until then, so a set whose
@@ -15728,6 +15730,13 @@ than overruns (§30.4).
   memory alloc request size" past 2^27 pieces; ORing the pieces pairwise cost a pass over the
   growing container per piece, 4.2 s to build the set of a 250,000-value range that the lion bitmap
   scan reads in 0.2 s, now 0.33 s.)*
+  *(Fixed 2026-10-16, the million-row vector benchmark: the directory still doubled only while it
+  stayed more than half full after a merge, so a merge came every few hundred pieces, each one
+  rewriting every key - a range over 100,000 of a million unique values, 223 keys, merged every 800
+  pieces - and sorted every slot through a comparator that read the keys. That was half of
+  LionOrdered's 130 ms before its first row under that filter; the set now takes 45 ms, as long as
+  the lion bitmap scan of the same range takes to walk its 100,000 entries. A column whose ranges
+  span that many keys wants summaries (§32): the set then takes 3 ms.)*
 - **Exact, or rechecked.** The set is EXACT when every leaf's `lion_source_exact()` is true, no
   lion index clause was lossy and the set did not degrade. Then every member satisfies the
   `lionqual` and nothing is rechecked; otherwise every fetched member is tested against the
@@ -15737,8 +15746,8 @@ than overruns (§30.4).
   frees every container and keeps only their KEYS - "every TID of these 64 heap blocks may be a
   member" -, marks itself inexact, and carries on that way. Memory is then 16 bytes per container
   key, at most one per 64 heap blocks (and, while a WALK or LIST leaf is being read, its unmerged
-  pieces: fewer than three per key, or 1,024, above); the answer stays exact because every
-  fetched member is now rechecked; the node walks on as a slower filter.
+  pieces: up to 32 a key, as long as their slots fit in `hash_mem`, or 1,024, above); the answer
+  stays exact because every fetched member is now rechecked; the node walks on as a slower filter.
 - **The set, lazily** (2026-09-30). Building the set reads every container of every leaf's
   sets, over the whole table, before the walk hands out its first TID - and a `LIMIT` walk that
   finds its rows in the first few hundred container keys needs the set at those keys only. When
