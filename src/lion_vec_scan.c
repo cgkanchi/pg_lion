@@ -35,17 +35,27 @@
  * A row whose partition the margin leaves unprobed is missed.
  *
  * A query whose rows lie far from every centroid finds many centroids
- * within its k-th row less the margin.  So the scan also pauses: once it
- * has scored pg_lion.vector_patience units of rows (lv_patience_unit():
- * the rows, or under a restriction the members, a partition would hold on
- * average in 2 sqrt(n) partitions) without one entering the L least upper
- * bounds, it takes those L as found and probes no partition until it has
- * returned L rows or the next row lies past tau; a REST, which starts a
- * new batch, ends a pause too.  A row nearer than those a pause returned,
+ * within its k-th row less the margin.  So the scan also pauses.  It keeps,
+ * besides the L least upper bounds, the K least for K = LV_TIER_MIN, twice
+ * that and so on below L - the tiers - and the next row's tier is the least
+ * K past the rows the pass has returned, or L.  Once that tier is full and
+ * the scan has scored pg_lion.vector_patience units of rows
+ * (lv_patience_unit(): the rows, or under a restriction twice the members,
+ * a partition would hold on average in 2 sqrt(n) partitions; more past
+ * twice the default margin, lv_patience_scale()) without one entering it,
+ * it takes those K as found and probes no partition until it has returned
+ * them or the next row lies past the K-th upper bound; a REST, which starts
+ * a new batch, ends a pause too.  Then the next tier's count, kept all
+ * along, decides the next pause.  A row nearer than those a pause returned,
  * in a partition not probed yet, is skipped when it is found, as is one the
  * margin leaves till too late.
  * Ended only past tau, an upper bound, a pause returned rows far beyond
  * the L nearest: 0.955 of a LIMIT 1000's true rows, against 0.983 so.
+ * Counted against L alone, a LIMIT 10 went on probing while rows entered
+ * the 100 nearest, which it would never return: on DBpedia's 115,186 rows
+ * a margin of 8 probed 200 partitions a query at the median and 401 at the
+ * 95th percentile for 0.986 of the ten nearest; by tiers, 159 and 254 for
+ * 0.985 (DESIGN.md §44.4).
  *
  * The bounds hold with the probability pg_lion.vector_epsilon sets; a row
  * whose bound fails and turns up after rows farther than it is skipped, so
@@ -184,6 +194,23 @@ typedef enum LvWalk
 	LV_WALK_ALL					/* every row: NULL (a NULL query, or none) */
 } LvWalk;
 
+/*
+ * A tier of the pause (the file's header): the K least upper bounds of the
+ * rows a pass has probed, K = LV_TIER_MIN, twice that and so on below L,
+ * and when the last row entered them.  L's own are hi and hiat.  The least
+ * K is a LIMIT 10's, the commonest; a smaller LIMIT pauses where it does.
+ */
+#define LV_TIER_MIN		10
+#define LV_MAX_TIERS	32				/* K doubles from 10 past any int L */
+
+typedef struct LvTier
+{
+	int			k;
+	int			n;
+	double	   *h;				/* max-heap, [k] */
+	double		at;				/* scored when one last entered */
+} LvTier;
+
 typedef struct LvScanOpaque
 {
 	MemoryContext cxt;			/* the scan's */
@@ -223,9 +250,15 @@ typedef struct LvScanOpaque
 	int			batch;			/* L */
 	double		tau;
 	double		cut;			/* lv_cut()'s, or infinity */
-	double		patience;		/* rows scored without one entering hi ... */
-	double		sincerows;		/* ... and since one last did */
+	double		patience;		/* rows scored without one entering a tier */
+	double		scored;			/* rows the pass has scored ... */
+	double		hiat;			/* ... when one last entered hi */
+	LvTier		tiers[LV_MAX_TIERS];	/* the smaller tiers (the header) */
+	int			ntiers;			/* this batch's, below L */
+	int			ntieralloc;		/* tiers with heaps */
+	int			passret;		/* rows the pass has returned */
 	bool		paused;			/* probing no partition (the header) */
+	int			pausetier;		/* the tier that paused, -1 for L's */
 	int			pauseleft;		/* rows the pause may still return */
 	uint32		pass;			/* from 1; a REST starts the next */
 	lvseen_hash *seen;
@@ -633,8 +666,11 @@ lionvecrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys,
 	so->nprobed = 0;
 	so->hi = NULL;
 	so->nhi = so->maxhi = 0;
-	so->sincerows = 0.0;
+	so->scored = so->hiat = 0.0;
+	so->ntiers = so->ntieralloc = 0;
+	so->passret = 0;
 	so->paused = false;
+	so->pausetier = -1;
 	so->pauseleft = 0;
 	so->seen = NULL;
 	so->seenmost = 0.0;
@@ -989,8 +1025,14 @@ lv_margin(LvScanOpaque *so)
  * (DESIGN.md §44.4).  Now the pause does not move with the partitions.
  * The unit is of items as the probes count them: in an index that spills
  * (§44.10), each row is in two partitions, so a partition holds twice the
- * items.
+ * items.  Under a restriction it is twice the members': with the tiers
+ * (the file's header) a LIMIT 10 under a filter pauses at its ten, not at
+ * L's 100, and members come a few to a partition, so the same patience
+ * took DBpedia's 1% filter from 0.969 of the ten nearest to 0.939 at the
+ * default margin; twice it, 0.961, with 368 partitions probed against 530.
  */
+#define LV_PATIENCE_RESTRICTED	2.0
+
 static double
 lv_patience_unit(const LvScanOpaque *so, double members)
 {
@@ -998,7 +1040,26 @@ lv_patience_unit(const LvScanOpaque *so, double members)
 
 	if (so->spill)
 		members *= 2.0;
+	if (so->restricted)
+		members *= LV_PATIENCE_RESTRICTED;
 	return Max(members / parts, 1.0);
+}
+
+/*
+ * The patience grows with pg_lion.vector_margin past LV_PATIENCE_MARGINS
+ * times the default margin, in step with it: a larger margin asks for more
+ * of the nearest rows, and a pause that stayed put held the recall to what
+ * it had found by then - on DBpedia's 115,186 rows 0.9935 of the ten
+ * nearest at any margin from 12 before the tiers, and 0.9865 with them,
+ * where in step a margin of 24 finds 0.9975 (DESIGN.md §44.4).  Below that
+ * margin the margin stops a scan first, and the patience its tail.
+ */
+#define LV_PATIENCE_MARGINS		2.0
+
+static double
+lv_patience_scale(void)
+{
+	return Max(lionvec_margin / (LV_PATIENCE_MARGINS * LIONVEC_MARGIN_DEFAULT), 1.0);
 }
 
 /*
@@ -1534,7 +1595,7 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head, bool copies)
 				continue;
 			if (so->restricted && !lv_member(so, &code->tid))
 				continue;
-			so->sincerows += 1.0;
+			so->scored += 1.0;
 
 			item.tid = code->tid;
 			item.rblk = code->rblk;
@@ -1601,7 +1662,25 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head, bool copies)
 			if (so->spill)
 				lv_enter(so, &code->tid);
 			if (so->nhi < L || hi < so->hi[0])
-				so->sincerows = 0.0;	/* it enters: patience starts over */
+			{
+				int			t;
+
+				/*
+				 * It enters: patience starts over, for L and for each tier
+				 * it enters - a tier full and no nearer than it leaves the
+				 * smaller ones, full too, no nearer either
+				 */
+				so->hiat = so->scored;
+				for (t = so->ntiers - 1; t >= 0; t--)
+				{
+					LvTier	   *tier = &so->tiers[t];
+
+					if (tier->n == tier->k && hi >= tier->h[0])
+						break;
+					tier->at = so->scored;
+					lv_hi_push(tier->h, &tier->n, tier->k, hi);
+				}
+			}
 			lv_hi_push(so->hi, &so->nhi, L, hi);
 			if (so->nhi == L)
 				so->tau = so->hi[0];
@@ -1637,6 +1716,38 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head, bool copies)
 		lv_push_rest(so, drop);
 }
 
+/*
+ * Is a pause due (the file's header)?  The tier of the next row - the
+ * least K past the rows the pass has returned, or L - is full and has
+ * taken no row in pg_lion.vector_patience units of rows.  Sets pausetier.
+ */
+static bool
+lv_pause_due(LvScanOpaque *so)
+{
+	int			t;
+
+	for (t = 0; t < so->ntiers; t++)
+	{
+		LvTier	   *tier = &so->tiers[t];
+
+		if (tier->k > so->passret)
+		{
+			so->pausetier = t;
+			return tier->n == tier->k &&
+				so->scored - tier->at >= so->patience;
+		}
+	}
+	so->pausetier = -1;
+	return so->nhi == so->batch && so->scored - so->hiat >= so->patience;
+}
+
+/* The upper bound past which the pause's rows are all returned. */
+static double
+lv_pause_tau(const LvScanOpaque *so)
+{
+	return so->pausetier >= 0 ? so->tiers[so->pausetier].h[0] : so->tau;
+}
+
 /* Probe a partition from the queue, and remember it for a REST's. */
 static void
 lv_probe_part(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
@@ -1647,10 +1758,12 @@ lv_probe_part(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 	so->probed[so->nprobed++] = so->phead[partno];
 	so->nprobes++;
 	lv_probe(scan, so, so->phead[partno], so->spill);
-	if (so->nhi == so->batch && so->sincerows >= so->patience)
+	if (lv_pause_due(so))
 	{
+		int			k = so->pausetier >= 0 ? so->tiers[so->pausetier].k : so->batch;
+
 		so->paused = true;
-		so->pauseleft = so->batch;
+		so->pauseleft = k > so->passret ? k - so->passret : k;
 		so->npauses++;
 	}
 }
@@ -1659,17 +1772,37 @@ lv_probe_part(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 static void
 lv_reset_rows(LvScanOpaque *so)
 {
+	int64		k;
+
 	so->rows.n = 0;
 	so->nhi = 0;
 	so->tau = INFINITY;
 	so->cut = INFINITY;
-	so->sincerows = 0.0;
+	so->scored = so->hiat = 0.0;
+	so->passret = 0;
 	if (so->maxhi < so->batch)
 	{
 		so->hi = so->hi == NULL ?
 			MemoryContextAlloc(so->qcxt, sizeof(double) * so->batch) :
 			repalloc(so->hi, sizeof(double) * so->batch);
 		so->maxhi = so->batch;
+	}
+
+	/* the tiers below L; a tier's K is the same in every batch */
+	so->ntiers = 0;
+	for (k = LV_TIER_MIN; k < so->batch && so->ntiers < LV_MAX_TIERS; k *= 2)
+	{
+		LvTier	   *tier = &so->tiers[so->ntiers];
+
+		if (so->ntiers >= so->ntieralloc)
+		{
+			tier->h = MemoryContextAlloc(so->qcxt, sizeof(double) * k);
+			so->ntieralloc++;
+		}
+		tier->k = (int) k;
+		tier->n = 0;
+		tier->at = 0.0;
+		so->ntiers++;
 	}
 }
 
@@ -1980,7 +2113,8 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 	so->margin = lv_margin(so);
 
 	so->patience = lionvec_patience > 0 ?
-		(double) lionvec_patience * lv_patience_unit(so, members) : INFINITY;
+		(double) lionvec_patience * lv_patience_unit(so, members) *
+		lv_patience_scale() : INFINITY;
 
 	so->seen = lvseen_create(so->qcxt, 256, NULL);
 	so->seenmost = lv_seen_most();
@@ -2061,10 +2195,14 @@ lionvecgettuple(IndexScanDesc scan, ScanDirection dir)
 					/* a pause ends after L rows or past tau (the file's header) */
 					if (so->paused &&
 						(so->rows.n == 0 || so->pauseleft <= 0 ||
-						 so->rows.items[0].key > so->tau))
+						 so->rows.items[0].key > lv_pause_tau(so)))
 					{
+						/* patience starts over, for the tier that paused */
 						so->paused = false;
-						so->sincerows = 0.0;
+						if (so->pausetier >= 0)
+							so->tiers[so->pausetier].at = so->scored;
+						else
+							so->hiat = so->scored;
 					}
 
 					/* a partition, when it comes before every row */
@@ -2125,6 +2263,7 @@ lionvecgettuple(IndexScanDesc scan, ScanDirection dir)
 							so->lastdist = item.dist;
 							so->lastkey = item.key;
 							so->pauseleft--;
+							so->passret++;
 							lv_return(scan, so, &item.tid, item.dist);
 							return true;
 					}

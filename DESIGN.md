@@ -20512,12 +20512,16 @@ scan's approximation, and the margin trades it against the partitions read.
 probed had a median of 74, a mean of 143 and a maximum of 1,430 of the 1,974 (§44.9). A query whose
 ten nearest lie far from every centroid finds many centroids within its tenth row's key less the
 margin, and probes them all, though few hold a row nearer than those it has. So the scan counts the
-rows it scores since one last entered the L least upper bounds, and once those L are in hand and
-the count reaches `pg_lion.vector_patience` (30) units - a unit the rows an average partition would
-hold were there `2 sqrt(n)` of them, n the rows of the build (the meta page's count): `sqrt(n) / 2`
-rows, or under a restriction that share of the members (`lv_patience_unit()`) - it PAUSES
-(`lv_probe_part()`): it takes the L as found and probes no partition until it has returned L rows or
-the next row lies past tau. A REST, which starts a batch of four times the rows, ends a pause too.
+rows it scores since one last entered the least upper bounds of the rows it is after, and once
+those are in hand and the count reaches `pg_lion.vector_patience` (30) units - a unit the rows an
+average partition would hold were there `2 sqrt(n)` of them, n the rows of the build (the meta
+page's count): `sqrt(n) / 2` rows, or under a restriction twice that share of the members
+(`lv_patience_unit()`) - it PAUSES (`lv_probe_part()`). The rows it is after are a TIER: besides
+the L least upper bounds it keeps the K least for K = 10, 20, 40 and so on below L (`LvTier`), and
+the next row's tier is the least K past the rows the pass has returned, or L. Paused on a tier, it
+takes those K as found and probes no partition until it has returned them or the next row lies past
+the K-th upper bound; then the next tier, whose count has run all along, decides the next pause. A
+REST, which starts a batch of four times the rows, ends a pause too.
 Paused, the scan still returns rows in order; a row nearer than those a pause returned, in a
 partition not probed yet, is skipped when it is found, as one the margin leaves till too late is.
 The pause trades those rows against the tail: in the numpy model (vtoy's `patience.py`), at 975,000
@@ -20532,6 +20536,27 @@ next row lay past tau, it filled the LIMIT but still returned rows far past the 
 LIMIT 1000 on the benchmark got 0.955 of its true rows; ended after L rows too, 0.983, against
 0.980 for a LIMIT 10. Counting a restricted scan's patience in members rather than rows lets a
 filter pause as an unfiltered scan does; counted in rows, a 1% filter never paused.
+
+The tiers came from the local million-row benchmark (2026-10-16), where a query's 95th percentile
+took three to four times its median. Counted against L alone (`pg_lion.vector_batch`, 100), a LIMIT
+10 went on probing while rows entered the 100 nearest, which it would never return. On DBpedia's
+115,186 rows, LIMIT 10 at a margin of 8: 200 partitions at the median and 401 at the 95th
+percentile for 0.986 of the ten nearest (4.8 and 9.2 ms); by tiers, 159 and 254 for 0.985 (3.8 and
+5.7 ms). A smaller L instead (`vector_batch = 10`) did as well for a LIMIT 10 and cost a LIMIT 100
+2.5 times as much, its RESTs reading every chain again; by tiers a LIMIT 100 pauses at its own
+100, as it did, but returns its first ten at the first tier's pause and loses a row it finds later
+that belonged among them: 0.9908 at a margin of 8 for 336 partitions, against 0.9900 for 273. A
+filter's members come a few to a partition, and a tier of ten fills and stalls sooner than one of
+100: with the same unit, DBpedia's 1% filter, probed (`vector_exact_rows = 0`), fell from 0.969 of
+the ten nearest at the default margin to 0.939; with twice the unit, 0.961, probing 368 partitions
+at the median against 530. At each recall a filter now probes fewer partitions than it did: 0.9925
+at 1% for 820 against 908, 0.9935 at 10% for 360 against 448.
+
+The patience grows with the margin past twice its default (`lv_patience_scale()`: by `margin / 6`
+at the default). A larger margin asks for more of the nearest rows, and a patience that stayed put
+held the recall to what the scan had found by then: 0.9935 of the ten nearest at any margin from 12
+(0.9865 with the tiers). In step, the margin alone reaches 0.9975 at 24 (0.999 of a LIMIT 100's at
+32); up to twice the default the margin stops a scan first, and the patience only its tail.
 
 The unit was the average partition's own rows, the rows or members over the partitions, until
 the default went from `2 sqrt(n)` partitions to `8 sqrt(n)` (§44.3). Then a patience of 30 paused
@@ -20859,9 +20884,10 @@ no ORDER BY costs infinity. Selectivity 1, correlation 0.
   (§44.6). The default was 2 until the pause; with the pause, 3 took the benchmark's recall from
   0.964 to 0.979 for 1.3 ms (§44.9).
 - `pg_lion.vector_patience` (int, 0 to 1,000,000, default 30): how many units of rows a scan
-  scores without one entering its L nearest before it pauses (§44.4), a unit `sqrt(n) / 2` rows,
-  n the build's, the rows an average partition would hold in `2 sqrt(n)` partitions - under a
-  lion filter that share of the members - whatever the partitions' number; 0 never pauses, and
+  scores without one entering the nearest rows it is after (its tier, §44.4) before it pauses, a
+  unit `sqrt(n) / 2` rows, n the build's, the rows an average partition would hold in `2 sqrt(n)`
+  partitions - under a lion filter twice that share of the members - whatever the partitions'
+  number, and `margin / 6` times as many past a margin of 6; 0 never pauses, and
   then a filter's scan probes far more than the costs assume (§44.7). Smaller pauses sooner,
   probing fewer partitions and missing more rows. 30 is where the 975,000-row benchmark's tail
   ended, in its `2 sqrt(n)` partitions, where a unit is a partition's rows: at a margin of 3, 30
@@ -20903,6 +20929,8 @@ no ORDER BY costs infinity. Selectivity 1, correlation 0.
   time.
 - `pg_lion.vector_batch` (int, 1 to 100000, default 100): rows the probes gather candidates for
   before REST; each REST gathers four times as many, probing every partition probed so far again.
+  It no longer sets where a LIMIT 10 pauses (the tiers do, §44.4), so it need not follow the
+  LIMIT.
 - `maintenance_work_mem`: half of it holds the build's sample (§44.3), and the CODE items' sort,
   two items a row when the index spills; a parallel build divides the sort's share among its
   processes, as core's builds do, and holds the sample once, in shared memory (§44.12).
