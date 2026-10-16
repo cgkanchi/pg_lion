@@ -901,12 +901,21 @@ def table(files):
             for path in ('', ' LionOrdered'):
                 for patience in sorted({int(re.search(r'patience=(\d+)', r['name']).group(1))
                                         for r in d['results'] if 'patience=' in r['name']}):
-                    pts = sorted((r['recall'], r['pages'], r['probes'], r['exec_median_ms'])
-                                 for r in d['results'] if r['sel'] == sel and 'pages' in r
-                                 and re.fullmatch(rf'lionvec margin=[\d.]+ patience={patience}{path}', r['name']))
+                    rs = [(float(g.group(1)), r) for r in d['results'] if r['sel'] == sel and 'pages' in r
+                          for g in [re.fullmatch(rf'lionvec margin=([\d.]+) patience={patience}{path}', r['name'])]
+                          if g]
+                    pts = sorted((r['recall'], r['pages'], r['probes'], r['exec_median_ms']) for _, r in rs)
                     if len(pts) < 2:
                         continue
                     for target in (0.95, 0.98):
+                        if pts[0][0] >= target:
+                            # every margin swept is already there, the least
+                            # too: its own row, not an interpolation
+                            m, r = min(rs, key=lambda mr: mr[0])
+                            print(f'| {name} | {sel:g} | {path.strip() or "planner"} | {patience} | {target} '
+                                  f'(margin {m:g}: {r["recall"]:.3f}) | {r["pages"]:.0f} | {r["probes"]:.0f} '
+                                  f'| {r["exec_median_ms"]:.1f} |')
+                            continue
                         hit = next(((a, b) for a, b in zip(pts, pts[1:]) if a[0] <= target <= b[0]), None)
                         if hit is None:
                             print(f'| {name} | {sel:g} | {path.strip() or "planner"} | {patience} | {target} '
