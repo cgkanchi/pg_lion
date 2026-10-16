@@ -297,14 +297,16 @@ SELECT op, f, k,
 
 -- the exact path: the scan's DEBUG1 line says it fetched every member, and
 -- read no partition; at pg_lion.vector_exact_rows = 0 the same filter
--- probes, and at 5,000 a filter of 3,294 members is exact; the order is
--- the same either way
+-- probes (pg_lion.vector_exact_per_partition 0 too: its 38 members are 1.9
+-- a partition of the 20, near its 1.5), and at 5,000 a filter of 3,294
+-- members is exact; the order is the same either way
 SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
 SET client_min_messages = debug1;
 SELECT id FROM hv WHERE tag = 3 ORDER BY v <-> hv_vec(4, 40) LIMIT 3;
 RESET client_min_messages;
 RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
 SET pg_lion.vector_exact_rows = 0;
+SET pg_lion.vector_exact_per_partition = 0;
 SELECT op, hv_ord(format('SELECT id, v %s hv_vec(4, 40) AS d FROM hv WHERE tag = 3
 						  ORDER BY v %s hv_vec(4, 40) LIMIT 10', op, op)) AS result
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
@@ -319,6 +321,7 @@ SELECT op, hv_ord(format('SELECT id, v %s hv_vec(4, 40) AS d FROM hv WHERE cat <
 						  ORDER BY v %s hv_vec(4, 40) LIMIT 10', op, op)) AS result
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
 RESET pg_lion.vector_exact_rows;
+RESET pg_lion.vector_exact_per_partition;
 
 -- an expression index of a vector column as halfvec: the index's type is
 -- its operator class's, halfvec, and the exact distances are of the

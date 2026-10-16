@@ -20149,8 +20149,8 @@ floats - whose error bound decides which few rows are read in full. It stops onc
 centroid, less a margin, lies farther than the rows it has (§44.4), having read a few percent of
 the rows; among those it returns rows in the exact order of their distances, unless a bound of
 `pg_lion.vector_epsilon` standard deviations fails. Under a WHERE lion answers, it reads and
-scores only the rows lion's set holds, and for a set of up to 2,000 rows computes every member's
-distance outright (§44.6).
+scores only the rows lion's set holds, and for a set of up to 2,000 rows, or of up to 1.5 a
+partition, computes every member's distance outright (§44.6).
 
 The codes are RaBitQ's (Gao and Long, SIGMOD 2024): a fixed random rotation makes every
 coordinate of every vector look like an independent Gaussian, so that one bit a dimension - the
@@ -20278,10 +20278,10 @@ Format 2 had no copies and no flags in its meta page; this pg_lion refuses an in
 
 Format 1 (§44 above) had one CODE chain, every row in heap order, and a DIR chain of each CODE
 page's least and greatest TID, by which a filtered scan read only the pages that could hold a
-member. With partitions a filter's members are spread over every partition, the build's order is
-by partition first, and a filtered scan of more than `pg_lion.vector_exact_rows` (2,000) members probes partitions as an
-unfiltered one does, so the directory went; the page's container keys still skip a page that
-holds no member (§44.6).
+member. With partitions a filter's members are spread over every partition, the build's order is by
+partition first, and a filtered scan of more members than the exact path takes (§44.6) probes
+partitions as an unfiltered one does, so the directory went; the page's container keys still skip a
+page that holds no member (§44.6).
 
 ### 44.3 Codes and partitions (lion_vec_math.c)
 
@@ -20491,10 +20491,10 @@ same from run to run.
 smallest upper bounds of the rows probed so far in a max-heap; their largest, tau, is a key at
 least L rows lie within, so a row whose lo exceeds tau cannot be among the next L, and only the
 rows with `lo <= tau` go into the row queue. One REST entry, at the least lo of those left out,
-stands for them. L is `pg_lion.vector_batch` (100) until the first REST, and four times as many
-after each. A LIMIT k query thus probes the partitions whose centroids, less the margin, lie nearer
-than its k-th row, refines about the rows plane 1 cannot tell from the k-th, and fetches about k
-and a few.
+stands for them. L is `pg_lion.vector_batch` (100), or the LIMIT the scan is told when that is
+more ("A known LIMIT" below), until the first REST, and four times as many after each. A LIMIT k
+query thus probes the partitions whose centroids, less the margin, lie nearer than its k-th row,
+refines about the rows plane 1 cannot tell from the k-th, and fetches about k and a few.
 
 **The margin** (`lv_margin()`) is `pg_lion.vector_margin` (3) standard deviations of the rows about
 their centroids along one dimension, the meta page's scale: a row is nearer the query than its
@@ -20551,6 +20551,49 @@ filter's members come a few to a partition, and a tier of ten fills and stalls s
 the ten nearest at the default margin to 0.939; with twice the unit, 0.961, probing 368 partitions
 at the median against 530. At each recall a filter now probes fewer partitions than it did: 0.9925
 at 1% for 820 against 908, 0.9935 at 10% for 360 against 448.
+
+**A known LIMIT** (2026-10-16). A pause on a tier ends once it has returned that tier's K rows,
+and probing resumes for the rows the query still wants; a member it then finds, in a partition not
+probed yet, nearer than rows already returned is skipped. A LIMIT 10 is stopped by its Limit at
+the first pause and loses nothing so; a LIMIT 100 paused at 10, 20, 40, 80 and L's 100 in turn,
+each pause ending by count, and lost what it found after each (the ten "returned at the first
+tier's pause" above). Through LionOrdered on DBpedia's 115,186 rows (`vector_exact_rows = 0`, so
+that the 1% filter probes too), at a patience of 30, a LIMIT 100 found 0.9884 of its hundred
+nearest under a 3% filter at a margin of 8, against 0.9997 never pausing, and 0.9845 against
+0.9999 under 1%; and at that margin it returned the plain scan's rows (an Index Scan with a
+Filter) for 24 to 58% of the queries. A smaller LIMIT was to pause where it does, not a larger
+one at every tier on its way. So LionOrdered hands the scan
+the rows its query level's LIMIT takes, OFFSET included, when the planner knows them (§44.6,
+`lion_vec_scan_limit()`), and the scan keeps no tier below them (`lv_reset_rows()`): a LIMIT 100
+at the default L has none and pauses on L alone, whose rows the LIMIT takes whole, as before the
+tiers; a LIMIT 50 first pauses at 80; a LIMIT of 1 to 10 keeps every tier, `LV_TIER_MIN` being the
+least. On the same 200 queries (`bench/results/2026-10-16-lionvec-limit`) a LIMIT 100 at a
+patience of 30 now pauses once a query rather than five times, skips 0.01 rows a query where it
+skipped up to 0.97, and finds 0.9942, 0.9940 and 0.9941 of its hundred nearest at a margin of 8
+under 10%, 3% and 1% (0.9913, 0.9884 and 0.9845 before), 0.9982 to 0.9988 at 16 (0.9963 to
+0.9974) and 0.9679 to 0.9823 at 3 (0.9677 to 0.9727), probing the same partitions and reading the
+same pages to within three, in the same time. With the pause off nothing changes, and a LIMIT 10
+is the same row for row and count for count at every filter, margin and patience measured. What is
+left of the gap to the pause off is the members in partitions the pause leaves unprobed, the
+pause's trade; at 3% and a margin of 8 LionOrdered now returns the plain scan's rows for 57% of
+the queries (39% before), the plain scan probing twice the partitions for 0.9987. A LIMIT the
+scan is not told keeps every tier: none, a generic plan's Param, one under grouping, aggregates,
+DISTINCT or a window, and every LIMIT of the plain scan, which core's Index Scan runs and no plan
+data reaches - a filter lion cannot index, or none, whose LIMIT 100 is the 0.9908 above.
+
+A LIMIT past L paused on L by count all the same, then found the rest in further passes, each REST
+probing every chain probed so far again for four times the rows: at a patience of 30 a LIMIT 1000
+under 10% and 3% filters made 2.5 and 2.75 passes a query, read 11,800 to 21,800 CODE pages and
+found 0.9840 to 0.9998 of its thousand nearest at margins of 3 to 16 (0.9838 to 0.9997 with every
+tier). So a scan told its LIMIT makes it L when it is more (`lv_start()`), up to an eighth of the
+rows `work_mem` holds, where REST stops growing L too (`lv_cap()`; about 10,900 rows at the default
+4 MB, past which it RESTs as before): the LIMIT 1000 makes one pass and pauses at most on its
+thousand, reads 5,300 to 7,900 pages and finds 0.9863 to 1.0000 - at a margin of 8, 0.9997 under
+10% and 0.9999 under 3% (0.9987 and 0.9983) from 6,816 and 7,793 pages (19,251 and 21,729), in 75
+and 67 ms (142 and 137). With the pause off it returns the same rows, every query, from 2.2 to 2.8
+times fewer pages. LIMITs of 10 and 100 are untouched, L being 100 already; and L at most an
+eighth of `work_mem`'s rows keeps the queue's bound `work_mem`'s (`lv_cap()` is never under four
+L's).
 
 The patience grows with the margin past twice its default (`lv_patience_scale()`: by `margin / 6`
 at the default). A larger margin asks for more of the nearest rows, and a patience that stayed put
@@ -20795,15 +20838,25 @@ relation as a B-tree's is. The plan differs from §30's in four places:
   key (a Param query vector, a correlated subquery's) among the node's others, re-evaluated on
   rescan. EXPLAIN shows it as `Order By`.
 - **The set is handed to the scan** after every `index_rescan()` (`lion_vec_restrict()`: its
-  container keys, ascending, and its containers). The scan counts the members (a degraded
+  container keys, ascending, and its containers), and with it the rows the query takes
+  (`lion_vec_scan_limit()`): `root->limit_tuples` as the plan recorded it (`LO_PRIV_LIMIT`), the
+  LIMIT of the node's query level and its OFFSET, or -1 where the planner did not know them - no
+  LIMIT, a generic plan's Param, grouping, aggregates, DISTINCT or a window above it. The scan
+  keeps no tier of its pause below them, and makes them L when they are more, to an eighth of
+  `work_mem`'s rows (§44.4, "A known LIMIT"). They say where to pause and what to gather, not how
+  many rows to return: a residual filter or a join that takes fewer rows than the scan returns
+  gets more, from probing resumed, and REST. The scan counts the members (a degraded
   container, NULL, as its 64 blocks' share of the table's rows) and then does one of two things:
-  - **No more than `pg_lion.vector_exact_rows` (2,000) members, none degraded**: it fetches every member
+  - **No more than `pg_lion.vector_exact_rows` (2,000) members, or than
+    `pg_lion.vector_exact_per_partition` (1.5) a partition if that is more, none degraded**
+    (`lionvec_exact_limit()`): it fetches every member
     from the heap, computes its distance with the operator's function, sorts them (NaN last, then
     by TID) and returns them in order (`lv_exact()`), reading no CODE page. A member not visible,
     or whose vector is NULL, is left for the NULL walk, a cosine zero vector (NaN) for the zero
     walk. This is the exact answer, at a heap fetch a member; it replaces probing where the
-    members are so few that most partitions hold none and the nearest member lies past many - in
-    the simulation a 0.1% filter of 975,000 rows needed a fifth of the index probed for 0.95 recall.
+    members are so thin over the partitions that most partitions hold none or one and the nearest
+    member lies past many - in the simulation a 0.1% filter of 975,000 rows needed a fifth of the
+    index probed for 0.95 recall.
   - **More**: it probes as an unfiltered scan does (§44.4), at the same margin, its patience
     counted in members. The k-th nearest member lies farther out, past more centroids within the
     margin, and the pause ends those probes. Before the pause counted members the margin was
@@ -20821,6 +20874,25 @@ relation as a B-tree's is. The plan differs from §30's in four places:
   does for a B-tree (`Rows Removed by Lion Recheck`).
 - **No fetch-and-sort switch**: the pathkeys are a distance, not columns a sort could take over.
 - **No values from the index**: heap mode always.
+
+**Which path** (`lionvec_exact_limit()`, 2026-10-16). The exact path costs a heap fetch and a
+distance a member, as many as the members whatever the index. Probing costs partitions and CODE
+pages: the k-th nearest member lies past more centroids the thinner the members, and a probe reads a
+partition's CODE pages - skipping those whose container keys hold no member - for the members among
+them, so where they are about one a partition each probe reads a page or two for one member, and the
+pause, counted in members, comes late. What decides is the members a partition, which a count of
+members does not follow from one index to another. With a flat 2,000, a million rows' 1% filter
+(10,063 members in 7,999 partitions, 1.26 a partition) probed for 0.956 to 0.98 of the ten nearest
+in 13 to 20 ms, where every member's distance took 11 ms for all ten; raised to the 12,000 that
+takes it, the count would have made DBpedia's 10% filter exact too (11,377 members in 2,715
+partitions, 4.2 a partition: 26 ms, against 8.5 to 13 ms probed for 0.956 to 0.994). Warm, the two
+crossed at two to three members a partition on both data sets; cold, the exact path is a random heap
+read a member, and on DBpedia's 115,186 rows crossed at 1,200 to 1,800 members, under one a
+partition (§44.9). So the scan computes every member's distance when the members are no more than
+`pg_lion.vector_exact_rows` (2,000: near where the cold costs crossed, whatever the partitions) or
+`pg_lion.vector_exact_per_partition` (1.5, below the warm crossing) times the partitions, whichever
+is more, and the cost (§44.7) asks the same of the same meta page, so that the planner prices the
+path the scan will take.
 
 The node's early stop - every member met - ends the scan without the probes that would find
 nothing. Since the restricted scan returns members only, a LIMIT is never left short by the filter.
@@ -20883,8 +20955,9 @@ lionvec query is sorted, or under `error` fails.
 
 ### 44.7 Costs (lionveccostestimate())
 
-Start-up is the cost of the first row, which is most of a scan's. A restriction of no more than
-`pg_lion.vector_exact_rows` members (§44.6) costs a random page, an index tuple and a row's estimate a member. Otherwise:
+Start-up is the cost of the first row, which is most of a scan's. A restriction the exact path takes
+(§44.6: `lionvec_exact_limit()` of the meta page's partitions, as the scan asks it) costs a random
+page, an index tuple and a row's estimate a member. Otherwise:
 every centroid's estimate (`LIONVEC_ROW_OPS`, 2 `cpu_operator_cost`: the popcounts and a square
 root); the share of the rows a scan probes; a random page a probed partition and the CODE pages'
 share of the index (by the recorded dimensions, or 1536 before any) read sequentially; `0.1
@@ -20922,6 +20995,20 @@ at 3% against 41) and LionOrdered at 1% (24 ms against the plain scan's 256, who
 prices low); at 0.3% and below it sorts the bitmap scan's rows (27 ms, LionOrdered 27). A path with
 no ORDER BY costs infinity. Selectivity 1, correlation 0.
 
+The exact path priced at a random page a member is the price of its cold run, a random heap read a
+member (§44.9), and four to six times the probes' at the filters
+`pg_lion.vector_exact_per_partition` newly sends down it (3.6 and 5.7 times below). The plain scan
+with a `Filter`, priced low under a selective filter (LIMIT / selectivity rows at 0.06 of a batch's
+start-up each, above; the million-row follow-up's problem 1), then comes out cheapest: on DBpedia's
+115,186 rows in 2,715 partitions (§44.9), at 2% and 3% the planner's estimate was 5,248 and 3,954
+for the plain scan, 9,183 and 13,829 for LionOrdered's exact path, 8,735 and 12,800 for the sort of
+the bitmap scan's rows, where LionOrdered probing had been 2,552 and 2,426 - so its plan there went
+from LionOrdered probing (warm, 0.964 of the ten nearest in 8.7 and 9.0 ms at the default margin) to
+the plain scan (0.960 in 16.9 ms, 0.957 in 10.8 ms), where LionOrdered, forced, is exact in 4.2 and
+7.8 ms and the sort exact in 2.9 and 4.6. The cost follows the scan, as it must for the planner to
+compare what will run; what is wrong is the plain scan's price, which the follow-up's problem 1 is
+to fix. Until then `enable_indexscan = off` with `enable_sort = off` takes LionOrdered, and
+`enable_indexscan = off` alone the sort, both exact there.
 **2026-10-16**: under a restriction the plain scan is no longer a candidate (§44.6,
 "Post-filtering"), so the comparison of it with LionOrdered that this charge decides arises only
 under `pg_lion.vector_postfilter = allow`. On the 1M-row DBpedia set, at `random_page_cost` 1.1,
@@ -20953,14 +21040,39 @@ unfiltered scan's deeper batches, and the plain scan under `allow`.
   and 40 gave the same recall (0.979), 40 a 95th percentile a third longer.
 - `pg_lion.vector_exact_rows` (int, 0 to 100,000,000, default 2,000): how many members a lion filter
   may admit for the scan to compute every member's distance from the heap, exactly, instead of
-  probing (§44.6); 0 never does. The exact path costs a heap fetch a member - at 1536 dimensions a
-  6 KB vector from TOAST, so 2,000 members are 12 MB - where a probe reads a few hundred to a
-  thousand CODE pages (§44.9) but, under a filter that leaves most partitions empty, many for
-  nothing: in the simulation a 0.1% filter of 975,000 rows probed a fifth of the index for 0.95.
-  The default sits where the two cost about the same on that benchmark; raise it where storage
-  is fast or exactness is wanted, lower it where the vectors are wide and the disk slow. The
-  planner prices both (§44.7), so it may sort the filter's rows itself above the threshold, as
-  it does at 1% on DBpedia (§44.9), which is exact too.
+  probing (§44.6), whatever the partitions; 0 leaves the choice to
+  `pg_lion.vector_exact_per_partition`. The exact path costs a heap fetch a member - at 1536
+  dimensions a 6 KB vector, a page of its own in TOAST or inline, so 2,000 members are 12 MB - where
+  a probe reads a few hundred to a thousand CODE pages (§44.9) but, under a filter that leaves most
+  partitions empty, many for nothing: in the simulation a 0.1% filter of 975,000 rows probed a fifth
+  of the index for 0.95. It is the floor under the ratio below, which matters in an index of fewer
+  than 1,334 partitions, where 1.5 a partition is under 2,000: a probe's fixed costs (every centroid
+  ranked, a thousand pages or more however thin the filter) are most of a scan there, and on
+  DBpedia's 115,186 rows the probes took 7.4 ms for 0.953 of a 0.3% filter's ten nearest (345
+  members, 0.13 a partition, 1,584 pages), the exact path 0.5 ms for all ten (§44.9). The default
+  sat where the two cost about the same on the 975,000-row benchmark, and stays where they cost
+  about the same cold, whatever the partitions: on DBpedia, a random heap read a member at 50 to 60
+  us each, 1,204 members took 75 ms exact against 99 ms probed for 0.98, and 3,472 183 against 67.
+  Raise it where storage is fast or exactness is wanted, lower it where the vectors are wide and the
+  disk slow. The planner prices both (§44.7), so it may sort the filter's rows itself instead, as it
+  does at 1% on DBpedia (§44.9), which is exact too.
+- `pg_lion.vector_exact_per_partition` (real, 0 to 1,000,000, default 1.5): the members a lion
+  filter may admit for each of the index's partitions, on average, for the scan to compute every
+  member's distance instead of probing, however many members that is; the larger of it times the
+  partitions and `pg_lion.vector_exact_rows` is the bound (`lionvec_exact_limit()`, which the scan
+  and its cost both ask). 0 leaves the choice to `pg_lion.vector_exact_rows`. What decides between
+  the two paths is how thinly the members spread (§44.6): at one or two a partition a probe finds
+  about one member for the CODE pages it reads, and the pause, counted in members, comes late, while
+  the exact path's heap fetches are as many as the members whatever the partitions. A flat count
+  misfires across sizes: 10,063 members at a million rows, 1.26 a partition of 7,999, are faster
+  exact; 11,377 at 115,186 rows, 4.2 a partition of 2,715, are faster probed. 1.5 sits below where
+  the two crossed warm on both data sets, at two to three a partition (§44.9), for the exact path's
+  cost cold, a random heap read a member where the probes read CODE chains a partition at a time: at
+  1.28 a partition on DBpedia (its 3% filter) the exact path was 1.3 times faster warm than the
+  probes for 0.98, and 2.7 times slower cold. It takes up to 12,000 members in a million rows' 7,999
+  partitions (1% is 10,063) and 4,072 in the 115,186 rows' 2,715 (3% is 3,472), and leaves 3% of the
+  million and 5% of the 115,186 to the probes. Raise it where the heap is in memory and exact
+  answers are worth a few milliseconds more; lower it, or set it to 0, where cold reads dominate.
 - `pg_lion.vector_overflow` (enum, `error` or `stop`, default `error`): what a scan does when what
   it knows of its rows outgrows `hash_mem` (§44.4, "The hash's bound"): fail the query, or end
   the scan at the rows it returned, with a NOTICE. Only a scan with no LIMIT, or a large one,
@@ -21000,8 +21112,10 @@ unfiltered scan's deeper batches, and the plain scan under `allow`.
   time.
 - `pg_lion.vector_batch` (int, 1 to 100000, default 100): rows the probes gather candidates for
   before REST; each REST gathers four times as many, probing every partition probed so far again.
-  It no longer sets where a LIMIT 10 pauses (the tiers do, §44.4), so it need not follow the
-  LIMIT.
+  It no longer sets where a LIMIT 10 pauses (the tiers do, §44.4), and a LIMIT past it that
+  LionOrdered knows is L in its place, to an eighth of `work_mem`'s rows (§44.4, "A known LIMIT"),
+  so it need not follow the LIMIT: it is L for the plain scan, a LIMIT the planner does not know,
+  and one below it.
 - `maintenance_work_mem`: half of it holds the build's sample (§44.3), and the CODE items' sort,
   two items a row when the index spills; a parallel build divides the sort's share among its
   processes, as core's builds do, and holds the sample once, in shared memory (§44.12).
@@ -21331,6 +21445,60 @@ prefetching them took a third off a sum out of cache in a harness (1,083 -> 675 
 and plane 1's estimates are 7% inside a walk of 42 to 66%. The build took 148 s against 348 (the
 medians of three and two), the same index.
 
+**The exact path or the probes, by members a partition** (2026-10-16; `knn_dbpedia.py exact` with
+`KNN_EXACT_SELS` and `KNN_EXACT_MARGINS`, on main's build at 1c85107). DBpedia's 115,186 rows as
+above, the vectors inline (`KNN_INLINE`: a row a heap page), the index of 2,715 partitions spilling,
+every relation in 2 GB of shared buffers; 200 queries, LIMIT 10, through LionOrdered
+(`enable_sort` and `enable_indexscan` off), its exact path with `pg_lion.vector_exact_rows` past
+every filter, its probes with it at 0 and the default patience. The server's median time, the
+median of three runs' (two other builds shared the 4 cores), and the 95th percentile; recall and
+pages, the same in every run. Probed at the default margin, at the margin nearest 0.98 of the ten
+nearest and the one nearest 0.99:
+
+| Filter | Members | A partition | Exact path | Probed, margin 3 | ... about 0.98 | ... about 0.99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0.3% | 345 | 0.13 | 0.5 ms (p95 0.7) | 0.9530, 1,584 pages, 7.4 ms (12.4) | 0.9825 (12), 2,597, 10.9 (18.0) | 0.9890 (16), 3,219, 13.7 (21.1) |
+| 1% | 1,204 | 0.44 | 2.0 (2.7) | 0.9610, 1,172, 8.6 (13.2) | 0.9795 (8), 1,511, 10.0 (15.5) | 0.9925 (16), 2,644, 15.2 (23.6) |
+| 2% | 2,288 | 0.84 | 4.2 (5.9) | 0.9640, 955, 8.2 (12.1) | 0.9795 (6), 1,100, 9.3 (14.3) | 0.9940 (12), 1,918, 12.9 (19.3) |
+| 3% | 3,472 | 1.28 | 7.8 (9.4) | 0.9640, 790, 9.1 (14.0) | 0.9770 (4), 944, 9.9 (13.9) | 0.9895 (8), 1,319, 12.4 (18.4) |
+| 5% | 5,760 | 2.12 | 8.9 (13.1) | 0.9610, 621, 7.5 (11.5) | 0.9750 (4), 803, 8.9 (12.9) | 0.9915 (8), 1,258, 11.0 (16.8) |
+| 7% | 8,001 | 2.95 | 19.2 (24.4) | 0.9575, 521, 8.9 (12.6) | 0.9765 (4), 691, 10.8 (15.9) | 0.9880 (6), 926, 11.1 (16.7) |
+| 10% | 11,377 | 4.19 | 26.4 (33.4) | 0.9560, 433, 8.5 (12.6) | 0.9740 (4), 593, 10.2 (14.7) | 0.9870 (6), 848, 11.5 (16.3) |
+
+The exact path's time follows the members, 1.5 to 2.4 us each (a heap page in shared buffers and a
+distance); the probes' hardly moves with the filter, 9 to 11 ms for 0.98, because the thinner the
+members the more partitions they probe and pages they read for them - 1,584 pages at 0.3% against
+433 at 10% for about 0.955. The two crossed warm at about two members a partition (5%: 8.9 ms
+exact against 8.9 for 0.975), and at three (7%) the probes took 10.8 ms to the exact path's 19.2.
+The planner's own exact plan, a sort of the lion bitmap scan's rows by distance, took 0.4, 1.5,
+2.9, 4.6, 6.9, 17.5 and 24.7 ms: the same rows, read a page at a time by the bitmap heap scan,
+without LionOrdered's set and a fetch a member through the index's scan.
+
+Cold - the server restarted and the page cache dropped before each query, the median of seven, the
+pages read from the kernel (`EXPLAIN (ANALYZE, BUFFERS)`): the exact path read a heap page a member,
+in 23 ms at 0.3% (346 pages), 75 ms at 1% (1,209), 183 ms at 3% (3,492) and 692 ms at 10% (11,402,
+89 MB), 50 to 60 us a page; the probes, at the margins nearest 0.98 above, 99 ms at 1% (1,907
+pages, margin 8), 67 ms at 3% (1,724, margin 4) and 71 ms at 10% (1,361, margin 4). Cold the two
+crossed at 1,200 to 1,800 members, whatever the partitions.
+
+At a million rows (the maintainer's measurement, 2026-10-15/16, `bench/results/followup-1m/`
+FOLLOWUP.md, problem 4: 999,800 rows of the same embeddings in 7,999 partitions, vectors inline,
+PostgreSQL 18 on a Ryzen 7 5700X3D): under 1%, 10,063 members, 1.26 a partition, a sort of the lion
+index scan's rows - every member's distance, what the exact path computes - took about 11 ms warm
+for all ten, where LionOrdered probed for 0.956 in about 13 ms and 0.98 in 19.6; under 3%, about
+30,000 members, 3.75 a partition, LionOrdered took 21 and 28 ms for 0.95 and 0.98, where the exact
+path, at the 1% filter's rate a member, would take about 33. Cold, LionOrdered took 331 ms at 1%
+(a margin of 3); the exact path's 10,063 random heap reads (80 MB) were not measured, and their
+cost was accepted.
+
+Hence `pg_lion.vector_exact_per_partition` = 1.5 (§44.8): below the warm crossing of two to three
+a partition at both sizes, so that 3% of the 115,186 rows (1.28) and 1% of the million (1.26) are
+exact - for all ten, 1.3 and 1.8 times faster warm than the probes for 0.98, at the cold price
+above - and 5% of the 115,186 (2.12) and 3% of the million (3.75) are probed. And
+`pg_lion.vector_exact_rows` stays 2,000, near the cold crossing, for an index whose partitions are
+too few for the ratio to say. Through the planner it does not show yet at 2% and 3% here, where
+the exact path's price sends it to the plain scan with a `Filter` (§44.7).
+
 ### 44.10 Tests
 
 - **test/unit/vec_test.c** (`make unit`, and under ASan and UBSan with `SANITIZE=1`), against the
@@ -21425,10 +21593,30 @@ medians of three and two), the same index.
   far, zero and NULL queries; a prepared statement's generic plan; a correlated subquery
   rescanning the node; a degraded set (400,000 rows of 3 dimensions in 20 partitions, `hash_mem`
   64kB) and its recheck; a filter of 200 members reading less than a quarter of the index blocks
-  one of 4,000 does, by `pg_statio_user_indexes`; inserts, deletes and VACUUM under the filter;
+  one of 4,000 does, by `pg_statio_user_indexes`, and each threshold moving it, by the DEBUG1 line
+  and the blocks: `pg_lion.vector_exact_per_partition` alone (`pg_lion.vector_exact_rows` 0) has
+  the 200, half a member a partition of 400, exact at its default and probing at 0, and the 4,000,
+  ten a partition, exact at 10 and probing at 9.99, in the same order either way; LionOrdered's
+  start-up priced under it as under `pg_lion.vector_exact_rows`, not as the probes; the setting's
+  range; inserts, deletes and VACUUM under the filter;
   the default margin's recall for each metric under a filter of 9,000 members (rows of mixed
   lengths, which an inner product ranked unlifted got 0.6 of, §44.4); a restricted scan pausing
   at once (a patience of 1) still filling a LIMIT 2000 of its 9,000 members, in order, through the
+  node (the short LIMIT of §44.4); the node switched off. Spill: LionOrdered returns each member
+  once and the same rows as the ordinary plan, every member of two filters for each metric, at
+  the margin of 100 and at the defaults, before and after DELETE and VACUUM under the filter.
+- **vector_limit.sql** (2026-10-16): the restricted scan told its query's LIMIT (§44.4, "A known
+  LIMIT"), over vector_filter.sql's 10,000 rows in 50 partitions at the margin of 100, where every
+  partition comes before every row, and a patience of one unit, so that each tier pauses as soon
+  as it stalls; each query through the node, with the scan's DEBUG1 line, and against a sort. A
+  LIMIT 100 under filters of 9,000 and 3,000 members pauses once, on L, skips nothing and returns
+  the hundred nearest, where the tiers paused five times and lost 27 and 26 of them; so do LIMIT
+  10 OFFSET 90 and a custom plan's `LIMIT $1`; a LIMIT 50 pauses once, at 80, and returns its
+  fifty nearest (23 with the tiers); LIMITs 10 and 5 are as they were, a pause at ten each; a
+  generic plan's `LIMIT $1`, which the planner does not know, keeps every tier and loses the 27
+  as before; a subquery's own LIMIT under an aggregate; and a LIMIT 300, L in its place, which
+  pauses once on its 300 having probed 33 partitions (with L at 100, twice, having probed all 50),
+  and at a `work_mem` of 64 kB, where L is 170, overflows the queue and RESTs as it did.
   node (the short LIMIT of §44.4); the node switched off, the filter's rows sorted, and under
   `pg_lion.vector_postfilter = allow` the vector scan with a Filter. Spill: LionOrdered returns each
   member once and the same rows as the ordinary plan (the vector scan with a Filter, under
@@ -21465,7 +21653,8 @@ medians of three and two), the same index.
   the table, generic plans whose query is a Param, NULL and cosine zero queries and rows, and a
   query of other dimensions; inserts of a far cluster after the build; LionOrdered against the
   ordinary plan under lion indexes' filters for each metric, probing and exact
-  (`pg_lion.vector_exact_rows` at 5,000 and 0, by the DEBUG1 line); an expression index casting a
+  (`pg_lion.vector_exact_rows` at 5,000 and 0, `pg_lion.vector_exact_per_partition` 0, by the DEBUG1
+  line); an expression index casting a
   `vector` column to `halfvec`; an untyped column (dimensions from the first row, pgvector's
   errors); and the refusals (too many dimensions, an array).
 - **vector_parallel.sql**: the parallel build against the serial one (§44.12), each index built
