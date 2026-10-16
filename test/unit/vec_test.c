@@ -41,7 +41,10 @@
  *		for a share of them, and the same from decoded centroids;
  *	  - the estimates' error bounds hold as often as the Gaussian says they
  *		should, on clustered data of several sizes: at one standard deviation
- *		about a third of the time, at three almost always.
+ *		about a third of the time, at three almost always;
+ *	  - prefetch: the items a CODE page holds and the pages a chain of them
+ *		takes, the window a reader asks for, and the least keys of a queue's
+ *		top by a heap, lionvec_rank()'s set.
  *
  *	  Every array is an exact-size heap allocation, which `make unit
  *	  SANITIZE=1` checks to the byte.  Exit status is 0 only if every check
@@ -3593,6 +3596,117 @@ test_regions(void)
 	free(rows);
 }
 
+/* for qsort(): ints ascending */
+static int
+int_cmp(const void *a, const void *b)
+{
+	int			x = *(const int *) a;
+	int			y = *(const int *) b;
+
+	return x < y ? -1 : x > y;
+}
+
+/*
+ * Prefetch's arithmetic (DESIGN.md §44.4, "Prefetch"): the items a CODE
+ * page holds - 35 of 1536 dimensions, the page's 8,152 bytes of room over
+ * 224-byte items and their line pointers - and the pages a chain of so
+ * many items takes, one for none and never wrapping; the window a reader
+ * asks for, bounded by its distance, its run's end and the relation, and
+ * empty past it, at block numbers next to 2^32; and lionvec_least() against
+ * lionvec_rank(), the same set of places for keys with ties, NaNs and
+ * infinities, of lengths up to 300 and every m up to past them, each kept
+ * key no later than every key left out.
+ */
+static void
+test_prefetch(void)
+{
+	bool		ok = true;
+	int			trial;
+
+	cur_phase = "prefetch";
+	CHECK(lionvec_items_per_page(8152, 228) == 35 &&
+		  lionvec_items_per_page(8152, 8152) == 1 &&
+		  lionvec_items_per_page(100, 228) == 1 &&
+		  lionvec_items_per_page(100, 0) == 1 &&
+		  lionvec_items_per_page(8152, 4 + 8) == 679,
+		  "items a page: the room over an item, at least one");
+	CHECK(lionvec_chain_pages(0, 35) == 1 && lionvec_chain_pages(1, 35) == 1 &&
+		  lionvec_chain_pages(35, 35) == 1 && lionvec_chain_pages(36, 35) == 2 &&
+		  lionvec_chain_pages(84, 35) == 3 && lionvec_chain_pages(70, 35) == 2 &&
+		  lionvec_chain_pages(5, 0) == 5 && lionvec_chain_pages(5, -3) == 5 &&
+		  lionvec_chain_pages(PG_UINT32_MAX, 1) == PG_UINT32_MAX &&
+		  lionvec_chain_pages(PG_UINT32_MAX, 35) == 122713352,
+		  "chain pages: the items over a page's, rounded up, at least one");
+	CHECK(lionvec_prefetch_end(10, 4, 100) == 15 &&
+		  lionvec_prefetch_end(10, 4, 13) == 13 &&
+		  lionvec_prefetch_end(10, 4, 11) == 11 &&
+		  lionvec_prefetch_end(10, 4, 5) == 11 &&
+		  lionvec_prefetch_end(10, 0, 100) == 11 &&
+		  lionvec_prefetch_end(10, -7, 100) == 11 &&
+		  lionvec_prefetch_end(0, 64, 1) == 1,
+		  "prefetch window: dist pages after blk, short of end, never before blk + 1");
+	CHECK(lionvec_prefetch_end(0xFFFFFFFEu, 64, 0xFFFFFFFFu) == 0xFFFFFFFFu &&
+		  lionvec_prefetch_end(0xFFFFFFFDu, 1, (uint64) PG_UINT32_MAX + 1) == 0xFFFFFFFFu &&
+		  lionvec_prefetch_end(0xFFFFFFFFu, 64, 0xFFFFFFFFu) == (uint64) PG_UINT32_MAX + 1,
+		  "prefetch window: no block number wraps");
+
+	for (trial = 0; trial < 2000; trial++)
+	{
+		int			n = (int) (rnd64() % 301);
+		int			m = (int) (rnd64() % 80);
+		int			want = Min(n, m);
+		double	   *key = (double *) xmalloc(sizeof(double) * Max(n, 1));
+		int		   *idx = (int *) xmalloc(sizeof(int) * Max(want, 1));
+		int		   *ref = (int *) xmalloc(sizeof(int) * Max(want, 1));
+		bool	   *in = (bool *) xmalloc(sizeof(bool) * Max(n, 1));
+		int			r;
+		int			i;
+		int			j;
+
+		for (i = 0; i < n; i++)
+		{
+			uint64		u = rnd64() % 20;
+
+			key[i] = u == 0 ? NAN : u == 1 ? INFINITY : u == 2 ? -INFINITY :
+				(double) (rnd64() % 9);
+		}
+		r = lionvec_least(key, n, m, idx);
+		ok &= r == want && lionvec_rank(key, n, m, ref) == want;
+		if (r == want)
+		{
+			qsort(idx, r, sizeof(int), int_cmp);
+			qsort(ref, r, sizeof(int), int_cmp);
+			for (j = 0; j < r; j++)
+				ok &= idx[j] == ref[j] && (j == 0 || idx[j] > idx[j - 1]);
+			memset(in, 0, sizeof(bool) * Max(n, 1));
+			for (j = 0; j < r; j++)
+				in[idx[j]] = true;
+			for (j = 0; j < r; j++)
+				for (i = 0; i < n; i++)
+				{
+					double		kj = isnan(key[idx[j]]) ? INFINITY : key[idx[j]];
+					double		ki = isnan(key[i]) ? INFINITY : key[i];
+
+					if (!in[i])
+						ok &= kj < ki || (kj == ki && idx[j] < i);
+				}
+		}
+		free(in);
+		free(ref);
+		free(idx);
+		free(key);
+	}
+	CHECK(ok, "least: lionvec_rank()'s set, each kept key before every key left out");
+	CHECK(lionvec_least(NULL, 0, 4, NULL) == 0, "least of no keys");
+	{
+		double		k1[3] = {2.0, 1.0, 3.0};
+		int			i1[1];
+
+		CHECK(lionvec_least(k1, 3, 0, i1) == 0, "least of none wanted");
+		CHECK(lionvec_least(k1, 3, 1, i1) == 1 && i1[0] == 1, "least of one wanted");
+	}
+}
+
 int
 main(void)
 {
@@ -3622,6 +3736,7 @@ main(void)
 	test_subsample();
 	test_candidates_among();
 	test_regions();
+	test_prefetch();
 
 	printf("vec_test: %ld checks, %ld failed\n", nchecks, nfail);
 	return nfail == 0 ? 0 : 1;
