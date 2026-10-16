@@ -42,7 +42,7 @@ table), `machine.txt` (CPU, RAM, disk, PostgreSQL settings) and `sizes.txt`. Log
 - **Disk.** Keep the checkout and `BENCH_DIR` (default `~/lionbench`) on the Linux filesystem;
   `/mnt/c` is 9p and an order of magnitude slower, and `setup.sh` refuses it. The run needs about
   40 GB at 1M rows: 9.5 GB of shards, 6 GB of the shards as a numpy array, 8 GB of table (each
-  1536-d vector takes its own 8 KB TOAST page), indexes of about 2 GB (lionvec) and 8 GB
+  1536-d vector takes its own 8 KB page, inline or in TOAST), indexes of about 2 GB (lionvec) and 8 GB
   (VectorChord keeps every vector for its rerank), and WAL. WSL's virtual disk grows to fit and
   does not shrink afterwards.
 - **Cold runs.** `setup.sh` installs `/usr/local/sbin/lionbench-drop-caches` and a sudo rule for
@@ -68,7 +68,7 @@ stops and opens psql on it.
 Builds run in parallel, the same for both indexes: `KNN_BUILD_WORKERS`, by default half the CPU
 threads and at most 8 (8 on a 5700X3D), is each build's `max_parallel_maintenance_workers`, the
 table's `parallel_workers` while it builds (VectorChord takes core's count of workers, which
-goes by the table's main fork, and TOAST holds the vectors), and VectorChord's k-means
+goes by the table's main fork), and VectorChord's k-means
 `build_threads`. `KNN_BUILD_WORKERS=0` builds serially, as the 115k results and the first 1M run
 did.
 
@@ -78,7 +78,7 @@ did.
 | --- | --- |
 | `fetch` | the first `NSHARDS` shards (default all 26) from Hugging Face, resumable |
 | `prepare` | 200 held-out queries and the exact top ten under each filter (float64, chunked) |
-| `load` | the table, binary COPY, and the lion index on the filter column, with summaries (`summaries = auto`): the filter column is unique, and a range over it otherwise walks a key per row |
+| `load` | the table, binary COPY, with each vector inline in its heap row (`toast_tuple_target = 8160`; `KNN_INLINE=0` keeps them in TOAST), and the lion index on the filter column, with summaries (`summaries = auto`): the filter column is unique, and a range over it otherwise walks a key per row |
 | `build` | lionvec with the build's own partition count (8 sqrt(n), spill on); VectorChord with sqrt(n) lists (1,000), spherical centroids, no residual quantization, as at 115k; each with `KNN_BUILD_WORKERS` workers |
 | `warm` | each index's sweep under every filter, warm: lionvec margins 2 to 32, through the planner's plan and LionOrdered; VectorChord probes 10 to 640, with and without `vchordrq.prefilter` |
 | `cold` | restart and drop the cache before each query, 7 queries a method, at the settings the warm runs found reach 0.95 and 0.98 (unfiltered, and at 3% for LionOrdered and the prefilter) |
@@ -89,12 +89,16 @@ did.
 run.sh` afterwards rebuilds its index and writes `vchord-l4000.json` beside the first (the cold
 step then measures the new one; move `cold.json` aside first to keep both). Every `KNN_*`
 variable of `knn_dbpedia.py` can be set. The warm runs prewarm the index into `shared_buffers` and the table
-and its TOAST into the kernel's cache (`KNN_PREWARM=read`), since 8 GB of TOAST does not fit
-`shared_buffers`, then run every query once untimed before timing it.
+(and its TOAST, under `KNN_INLINE=0`) into the kernel's cache (`KNN_PREWARM=read`), since its 8 GB
+do not fit `shared_buffers`, then run every query once untimed before timing it.
 
-**A database loaded before the summaries** has its filter index without them; rebuild it rather
-than reload: `pg.sh psql -d dbpedia -c 'DROP INDEX dbpedia_u' -c 'CREATE INDEX dbpedia_u ON dbpedia
-USING lion (u) WITH (summaries = auto)' -c 'ANALYZE dbpedia'`.
+**A database loaded before 2026-10-16** has its vectors in TOAST and its filter index without
+summaries. Reload it: `rm ~/lionbench/state/{load,build-*,warm-*,cold}.done`, then `run.sh` (the
+shards and the truth are kept). Inline storage leaves lionvec as it was and makes VectorChord's
+prefilter read a heap page a candidate rather than one for about 120: at 115k rows, cold, its 3%
+query went from 60 to 113 ms. To keep the TOAST layout and only add the summaries, rebuild the
+filter index instead: `pg.sh psql -d dbpedia -c 'DROP INDEX dbpedia_u' -c 'CREATE INDEX dbpedia_u
+ON dbpedia USING lion (u) WITH (summaries = auto)' -c 'ANALYZE dbpedia'`.
 
 **Smaller runs.** `NSHARDS=8 run.sh` takes 8 shards (about 308k rows) and finishes in a fraction
 of the time; `NSHARDS=3` reproduces the 115k set of the earlier results. Use a separate

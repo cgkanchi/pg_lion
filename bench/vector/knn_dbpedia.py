@@ -92,9 +92,18 @@
 # session's max_parallel_maintenance_workers, the table's parallel_workers,
 # and VectorChord's k-means threads (build_threads).  The table's setting is
 # for the builds that take core's count of workers, which goes by the
-# table's main fork: TOAST holds the vectors, so at 115k rows that fork is
-# under min_parallel_table_scan_size and gets none.  VectorChord on 115k
-# rows, 4 cores: 21 s serial, 19 s with 4 workers, 12 s with 4 threads too.
+# table's main fork: where TOAST holds the vectors (KNN_INLINE=0), at 115k
+# rows that fork is under min_parallel_table_scan_size and gets none.
+# VectorChord on 115k rows, 4 cores: 21 s serial, 19 s with 4 workers, 12 s
+# with 4 threads too.
+# KNN_INLINE (default 1): the tables are loaded with toast_tuple_target =
+# 8160, so that each vector stays in its heap row (one row a page) rather
+# than in TOAST (Chinmay's call, 2026-10-16); 0 loads them as the results
+# before 2026-10-16 did.  At 115k rows, cold, inline left lionvec as it was
+# (24 / 62 ms unfiltered / at 3%, against 22 / 64 in TOAST) and cost
+# VectorChord's prefilter at 3% 60 -> 113 ms (1,209 -> 2,305 pages): the
+# prefilter reads each candidate's heap row for u, some 120 rows a page
+# under TOAST and one inline.
 #
 # diskann answers an arbitrary WHERE by filtering what its scan streams out;
 # its index-side filtering takes a smallint[] labels column named in the
@@ -126,6 +135,8 @@ SHARDS = os.environ.get('KNN_SHARDS', '/mnt/project-files/train-0000[0-2]-of-000
 NSHARDS = int(os.environ.get('KNN_NSHARDS', '3'))
 PREWARM = os.environ.get('KNN_PREWARM', 'buffer')
 BUILD_WORKERS = int(os.environ['KNN_BUILD_WORKERS']) if os.environ.get('KNN_BUILD_WORKERS') else None
+INLINE = os.environ.get('KNN_INLINE', '1') == '1'
+STORAGE = ' WITH (toast_tuple_target = 8160)' if INLINE else ''
 COL = 'text-embedding-3-large-1536-embedding'
 DIM = 1536
 SELS = (1.0, 0.1, 0.03, 0.01)
@@ -175,6 +186,11 @@ def cost_distances(conn):
         conn.execute(f'ALTER FUNCTION {f} COST 100')
 
 
+def table_options(conn):
+    # the table's storage parameters: toast_tuple_target under KNN_INLINE
+    return conn.execute('SELECT reloptions FROM pg_class WHERE oid = %s::regclass', (TABLE,)).fetchone()[0]
+
+
 def show(conn, *names):
     # the settings a run records, those the server has (io_method is 18's)
     out = {}
@@ -208,10 +224,10 @@ def restore_indexes(conn, others):
 def prewarm(conn, idx):
     # Every relation a run reads into shared_buffers (KNN_PREWARM=buffer, the
     # default: 2 GB holds them all at 115k rows), or, where shared_buffers
-    # cannot hold them (a million rows' TOAST is 8 GB), the index into
-    # shared_buffers and the table and its TOAST into the kernel's page cache
-    # only (KNN_PREWARM=read); none prewarms nothing.  The warm-up pass over
-    # the queries follows either way.
+    # cannot hold them (a million rows' vectors are 8 GB, inline or in TOAST),
+    # the index into shared_buffers and the table and its TOAST into the
+    # kernel's page cache only (KNN_PREWARM=read); none prewarms nothing.
+    # The warm-up pass over the queries follows either way.
     if PREWARM == 'none':
         return
     big = 'buffer' if PREWARM == 'buffer' else 'read'
@@ -355,7 +371,7 @@ def load():
     conn.execute("LOAD 'pg_lion'")
     cost_distances(conn)
     conn.execute('DROP TABLE IF EXISTS dbpedia')
-    conn.execute('CREATE TABLE dbpedia (id int PRIMARY KEY, u float8, embedding vector(1536))')
+    conn.execute(f'CREATE TABLE dbpedia (id int PRIMARY KEY, u float8, embedding vector(1536)){STORAGE}')
     # binary COPY: per row 3 fields; vector's binary form is int16 dims, int16
     # unused, then the float4s, all big-endian
     rec = np.dtype([('nf', '>i2'), ('l1', '>i4'), ('id', '>i4'), ('l2', '>i4'), ('u', '>f8'),
@@ -449,7 +465,7 @@ def halfvec():
     conn = connect()
     t = time.perf_counter()
     conn.execute('DROP TABLE IF EXISTS dbpedia_h')
-    conn.execute('CREATE TABLE dbpedia_h (id int PRIMARY KEY, u float8, embedding halfvec(1536))')
+    conn.execute(f'CREATE TABLE dbpedia_h (id int PRIMARY KEY, u float8, embedding halfvec(1536)){STORAGE}')
     conn.execute('INSERT INTO dbpedia_h SELECT id, u, embedding::halfvec(1536) FROM dbpedia ORDER BY id')
     conn.execute('CREATE INDEX dbpedia_h_u ON dbpedia_h USING lion (u) WITH (summaries = auto)')
     conn.execute('VACUUM ANALYZE dbpedia_h')
@@ -615,7 +631,7 @@ def warm(kind, name):
         built = None
     meta = dict(name=name, index=idx, table=TABLE, column=coltype(), build=built, run=provenance(),
                 run_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), queries=len(Q),
-                prewarm=PREWARM,
+                prewarm=PREWARM, table_options=table_options(conn),
                 settings=show(conn, 'shared_buffers', 'work_mem', 'maintenance_work_mem', 'jit',
                               'max_parallel_workers_per_gather', 'max_parallel_maintenance_workers',
                               'random_page_cost', 'effective_io_concurrency', 'effective_cache_size',
@@ -749,6 +765,9 @@ def cold(name='cold'):
                             [f'SET diskann.query_search_list_size = {l}', 'SET enable_sort = off']))
     configs = [c for c in configs if c[0] in kinds]
     read = re.compile(r'Buffers: shared[^\n]*?read=(\d+)')
+    conn = connect()
+    topts = table_options(conn)
+    conn.close()
     out = []
     for kind, sel, mname, query, settings in configs:
         ms, pages, plan = [], [], None
@@ -786,7 +805,7 @@ def cold(name='cold'):
         print(json.dumps(row), flush=True)
         out.append(row)
     os.makedirs(OUT, exist_ok=True)
-    json.dump(dict(meta=dict(run=provenance(), table=TABLE, column=coltype(), queries=nq, restart=restart,
+    json.dump(dict(meta=dict(run=provenance(), table=TABLE, table_options=topts, column=coltype(), queries=nq, restart=restart,
                              drop=drop, picked_from=os.environ.get('KNN_COLD_FROM'),
                              run_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())), results=out),
               open(os.path.join(OUT, f'{name}.json'), 'w'), indent=1)
