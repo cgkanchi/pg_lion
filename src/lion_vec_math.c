@@ -1144,6 +1144,60 @@ lionvec_rank(const double *key, int n, int m, int *order)
 	return r;
 }
 
+/* place a of key comes after place b: by key, a NaN as infinite, then place */
+static inline bool
+lionvec_least_after(const double *key, int a, int b)
+{
+	double		ka = isnan(key[a]) ? INFINITY : key[a];
+	double		kb = isnan(key[b]) ? INFINITY : key[b];
+
+	return ka > kb || (ka == kb && a > b);
+}
+
+int
+lionvec_least(const double *key, int n, int m, int *idx)
+{
+	int			r = 0;
+	int			j;
+
+	if (m <= 0)
+		return 0;
+	for (j = 0; j < n; j++)
+	{
+		int			i;
+
+		if (r < m)
+		{
+			/* up the max-heap from the end */
+			for (i = r++; i > 0 && lionvec_least_after(key, j, idx[(i - 1) / 2]);
+				 i = (i - 1) / 2)
+				idx[i] = idx[(i - 1) / 2];
+			idx[i] = j;
+			continue;
+		}
+		/* not before the greatest kept, a later place: it stays out */
+		if (lionvec_least_after(key, j, idx[0]))
+			continue;
+		/* down from the root */
+		i = 0;
+		for (;;)
+		{
+			int			c = 2 * i + 1;
+
+			if (c >= r)
+				break;
+			if (c + 1 < r && lionvec_least_after(key, idx[c + 1], idx[c]))
+				c++;
+			if (!lionvec_least_after(key, idx[c], j))
+				break;
+			idx[i] = idx[c];
+			i = c;
+		}
+		idx[i] = j;
+	}
+	return r;
+}
+
 /* the SOAR cost of c, given r = x - c1 and |r|^2 */
 static double
 lionvec_soar_cost_r(const float *x, const float *c1, double r2, const float *c,
