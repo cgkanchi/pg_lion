@@ -3,7 +3,8 @@
 --
 -- LionOrdered tells the vector scan how many rows the LIMIT of its query
 -- level takes, OFFSET included, when the planner knows: the scan then keeps
--- no tier of the pause below that.  A pause on a smaller tier ends once it
+-- no tier of the pause below that, and gathers that many in a pass when it
+-- is more than pg_lion.vector_batch.  A pause on a smaller tier ends once it
 -- has returned that tier's rows, and probing resumes for the rows the LIMIT
 -- still wants; a member it then finds nearer than those returned is skipped
 -- out of order.  At pg_lion.vector_margin = 100 every partition comes before
@@ -97,6 +98,17 @@ SELECT vl_run('SELECT id FROM vl WHERE cat <> 5 ORDER BY v <-> vl_vec(77, 24) LI
 -- a LIMIT 50 keeps the tier of 80 alone, and pauses there once (with every
 -- tier, four times, returning 23 of its fifty nearest)
 SELECT vl_run('SELECT id FROM vl WHERE cat <> 5 ORDER BY v <-> vl_vec(77, 24) LIMIT 50');
+-- a LIMIT past L is L in its place: a LIMIT 300 pauses once, on its 300,
+-- having probed 33 partitions and read 90 pages (with L at 100, it paused
+-- on L and again past it, having probed all 50 and read 137)
+SELECT vl_run('SELECT id FROM vl WHERE cat <> 5 ORDER BY v <-> vl_vec(77, 24) LIMIT 300');
+-- ... up to an eighth of the rows work_mem holds, 170 at 64 kB, where the
+-- queue overflows and RESTs as it did (the same line with L at 100)
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 16;
+SELECT vl_run('SELECT id FROM vl WHERE cat <> 5 ORDER BY v <-> vl_vec(77, 24) LIMIT 300');
+RESET work_mem;
+RESET hash_mem_multiplier;
 
 -- a LIMIT 10 pauses on its ten as it did, and LIMITs of 1 to 9 keep every
 -- tier too (LV_TIER_MIN is the least): the same lines as before the LIMIT

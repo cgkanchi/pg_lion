@@ -20491,10 +20491,10 @@ same from run to run.
 smallest upper bounds of the rows probed so far in a max-heap; their largest, tau, is a key at
 least L rows lie within, so a row whose lo exceeds tau cannot be among the next L, and only the
 rows with `lo <= tau` go into the row queue. One REST entry, at the least lo of those left out,
-stands for them. L is `pg_lion.vector_batch` (100) until the first REST, and four times as many
-after each. A LIMIT k query thus probes the partitions whose centroids, less the margin, lie nearer
-than its k-th row, refines about the rows plane 1 cannot tell from the k-th, and fetches about k
-and a few.
+stands for them. L is `pg_lion.vector_batch` (100), or the LIMIT the scan is told when that is
+more ("A known LIMIT" below), until the first REST, and four times as many after each. A LIMIT k
+query thus probes the partitions whose centroids, less the margin, lie nearer than its k-th row,
+refines about the rows plane 1 cannot tell from the k-th, and fetches about k and a few.
 
 **The margin** (`lv_margin()`) is `pg_lion.vector_margin` (3) standard deviations of the rows about
 their centroids along one dimension, the meta page's scale: a row is nearer the query than its
@@ -20581,6 +20581,20 @@ the queries (39% before), the plain scan probing twice the partitions for 0.9987
 scan is not told keeps every tier: none, a generic plan's Param, one under grouping, aggregates,
 DISTINCT or a window, and every LIMIT of the plain scan, which core's Index Scan runs and no plan
 data reaches - a filter lion cannot index, or none, whose LIMIT 100 is the 0.9908 above.
+
+A LIMIT past L paused on L by count all the same, then found the rest in further passes, each REST
+probing every chain probed so far again for four times the rows: at a patience of 30 a LIMIT 1000
+under 10% and 3% filters made 2.5 and 2.75 passes a query, read 11,800 to 21,800 CODE pages and
+found 0.9840 to 0.9998 of its thousand nearest at margins of 3 to 16 (0.9838 to 0.9997 with every
+tier). So a scan told its LIMIT makes it L when it is more (`lv_start()`), up to an eighth of the
+rows `work_mem` holds, where REST stops growing L too (`lv_cap()`; about 10,900 rows at the default
+4 MB, past which it RESTs as before): the LIMIT 1000 makes one pass and pauses at most on its
+thousand, reads 5,300 to 7,900 pages and finds 0.9863 to 1.0000 - at a margin of 8, 0.9997 under
+10% and 0.9999 under 3% (0.9987 and 0.9983) from 6,816 and 7,793 pages (19,251 and 21,729), in 75
+and 67 ms (142 and 137). With the pause off it returns the same rows, every query, from 2.2 to 2.8
+times fewer pages. LIMITs of 10 and 100 are untouched, L being 100 already; and L at most an
+eighth of `work_mem`'s rows keeps the queue's bound `work_mem`'s (`lv_cap()` is never under four
+L's).
 
 The patience grows with the margin past twice its default (`lv_patience_scale()`: by `margin / 6`
 at the default). A larger margin asks for more of the nearest rows, and a patience that stayed put
@@ -20829,9 +20843,10 @@ relation as a B-tree's is. The plan differs from §30's in four places:
   (`lion_vec_scan_limit()`): `root->limit_tuples` as the plan recorded it (`LO_PRIV_LIMIT`), the
   LIMIT of the node's query level and its OFFSET, or -1 where the planner did not know them - no
   LIMIT, a generic plan's Param, grouping, aggregates, DISTINCT or a window above it. The scan
-  keeps no tier of its pause below them (§44.4, "A known LIMIT"). They say where to pause, not
-  how many rows to return: a residual filter or a join that takes fewer rows than the scan returns
-  gets more, from probing resumed. The scan counts the members (a degraded
+  keeps no tier of its pause below them, and makes them L when they are more, to an eighth of
+  `work_mem`'s rows (§44.4, "A known LIMIT"). They say where to pause and what to gather, not how
+  many rows to return: a residual filter or a join that takes fewer rows than the scan returns
+  gets more, from probing resumed, and REST. The scan counts the members (a degraded
   container, NULL, as its 64 blocks' share of the table's rows) and then does one of two things:
   - **No more than `pg_lion.vector_exact_rows` (2,000) members, none degraded**: it fetches every member
     from the heap, computes its distance with the operator's function, sorts them (NaN last, then
@@ -20965,8 +20980,10 @@ no ORDER BY costs infinity. Selectivity 1, correlation 0.
   time.
 - `pg_lion.vector_batch` (int, 1 to 100000, default 100): rows the probes gather candidates for
   before REST; each REST gathers four times as many, probing every partition probed so far again.
-  It no longer sets where a LIMIT 10 pauses (the tiers do, §44.4), so it need not follow the
-  LIMIT.
+  It no longer sets where a LIMIT 10 pauses (the tiers do, §44.4), and a LIMIT past it that
+  LionOrdered knows is L in its place, to an eighth of `work_mem`'s rows (§44.4, "A known LIMIT"),
+  so it need not follow the LIMIT: it is L for the plain scan, a LIMIT the planner does not know,
+  and one below it.
 - `maintenance_work_mem`: half of it holds the build's sample (§44.3), and the CODE items' sort,
   two items a row when the index spills; a parallel build divides the sort's share among its
   processes, as core's builds do, and holds the sample once, in shared memory (§44.12).
@@ -21406,7 +21423,9 @@ medians of three and two), the same index.
   10 OFFSET 90 and a custom plan's `LIMIT $1`; a LIMIT 50 pauses once, at 80, and returns its
   fifty nearest (23 with the tiers); LIMITs 10 and 5 are as they were, a pause at ten each; a
   generic plan's `LIMIT $1`, which the planner does not know, keeps every tier and loses the 27
-  as before; and a subquery's own LIMIT under an aggregate.
+  as before; a subquery's own LIMIT under an aggregate; and a LIMIT 300, L in its place, which
+  pauses once on its 300 having probed 33 partitions (with L at 100, twice, having probed all 50),
+  and at a `work_mem` of 64 kB, where L is 170, overflows the queue and RESTs as it did.
 - **test/isolation/lionvec_insert_window.spec** (an injection point build, PostgreSQL 17 and on;
   2026-10-15, after a review found lionvec's concurrency untested): an insert parked after its
   REFINE record (`lionvec-insert-refined`), and after its CODE record before its copy's

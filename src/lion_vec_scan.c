@@ -63,8 +63,11 @@
  * told the rows its query takes (lion_vec_scan_limit(): LionOrdered's, from
  * the planner's LIMIT and OFFSET) keeps no tier below them; that LIMIT 100
  * pauses on L alone and gets 0.9940, probing the same partitions, and a
- * LIMIT 10 is as it was.  The plain scan, which core's Index Scan runs and
- * no plan reaches, keeps every tier (DESIGN.md §44.4, "A known LIMIT").
+ * LIMIT 10 is as it was.  And L is no fewer than those rows, to an eighth
+ * of work_mem's (lv_start()): a LIMIT 1000, which made two or three passes
+ * of L = 100, makes one, reading a third to a half of the pages.  The
+ * plain scan, which core's Index Scan runs and no plan reaches, keeps
+ * every tier and L (DESIGN.md §44.4, "A known LIMIT").
  *
  * The bounds hold with the probability pg_lion.vector_epsilon sets; a row
  * whose bound fails and turns up after rows farther than it is skipped, so
@@ -209,7 +212,8 @@ typedef enum LvWalk
  * and when the last row entered them.  L's own are hi and hiat.  The least
  * K is a LIMIT 10's, the commonest; a smaller LIMIT pauses where it does.
  * A scan told its LIMIT (lion_vec_scan_limit()) keeps only the tiers of K
- * at or past it, and none under a LIMIT of L or more, which pauses on L.
+ * at or past it, and none under a LIMIT of L or more, which pauses on L
+ * (and L is then the LIMIT, lv_start()).
  */
 #define LV_TIER_MIN		10
 #define LV_MAX_TIERS	32				/* K doubles from 10 past any int L */
@@ -2173,7 +2177,25 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 
 	so->seen = lvseen_create(so->qcxt, 256, NULL);
 	so->seenmost = lv_seen_most();
+
+	/*
+	 * L: pg_lion.vector_batch, or the rows the query takes when the scan was
+	 * told them and they are more, to an eighth of the rows work_mem holds,
+	 * where REST stops growing it too (lv_rest()).  A LIMIT past L found its
+	 * rows in batches of L, each REST probing every chain again for four
+	 * times as many, and paused on L by count: on DBpedia's 115,186 rows a
+	 * LIMIT 1000 under a 3% or 10% filter made 2.5 to 2.75 passes and read
+	 * 11,800 to 21,800 pages a query for 0.9840 to 0.9998 of its rows at a
+	 * patience of 30.  In one pass it reads 5,300 to 7,900 for 0.9863 to
+	 * 1.0000, in a half to two thirds of the time, and with the pause off
+	 * returns the same rows (DESIGN.md §44.4, "A known LIMIT").  A query
+	 * that wants more than it said, a join's or a filter's above, makes a
+	 * REST as before.
+	 */
 	so->batch = lionvec_batch;
+	if (so->limit > so->batch)
+		so->batch = (int) Min(so->limit,
+							  (int64) Max(so->batch, lv_cap(so) / 8));
 	lv_reset_rows(so);
 	lv_read_parts(scan, so);
 
