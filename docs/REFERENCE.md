@@ -299,6 +299,11 @@ The build reads it, so a change takes effect at the next `REINDEX`.
 
 With a `WHERE` that lion indexes answer, `LionOrdered` builds lion's set of the matching rows and
 the scan reads and scores only those (`Custom Scan (LionOrdered)` with `Order By:` in `EXPLAIN`),
+so a `LIMIT` is never left short. A set of up to `pg_lion.vector_exact_rows` rows (2,000), or of
+up to `pg_lion.vector_exact_per_partition` (1.5) rows for each of the index's partitions if that
+is more, is answered exactly, from every member's distance; a larger one by reading partitions as
+above, counting its patience in matching rows. A filter of most of the table is planned as the plain index scan with a `Filter`,
+and a very selective one as a sort of the lion bitmap scan's rows.
 so a `LIMIT` is never left short. A set of up to `pg_lion.vector_exact_rows` rows (2,000) is
 answered exactly, from every member's distance; a larger one by reading partitions as above,
 counting its patience in matching rows. A very selective filter, or one a sort answers more
@@ -587,8 +592,11 @@ so measure it on your own data. A filter through lion uses the same margin.
 `pg_lion.vector_patience` (30, 0 to 1,000,000): how many units of `sqrt(n) / 2` rows - n the rows
 the index was built with, so the rows an average partition would hold in `2 sqrt(n)` partitions,
 however many it has; under a lion filter that share of the matching rows - a `lionvec` scan scores
-without finding one nearer than the `pg_lion.vector_batch` it has before it pauses: it stops reading
-partitions until it has returned those rows, and resumes if the query wants more (DESIGN.md §44.4).
+without finding one nearer than the rows it is after before it pauses: the nearest 10, 20, 40 and
+so on up to `pg_lion.vector_batch`, the least past the rows it has returned, and under a lion
+filter none fewer than the query's `LIMIT` (and `OFFSET`) when the planner knows it. Paused, it
+stops reading partitions until it has returned those rows, and resumes if the query wants more
+(DESIGN.md §44.4).
 A query whose nearest rows lie far from every centroid would otherwise read many partitions for
 nothing; on 975,000 OpenAI embeddings the pause cut the partitions a query read from 254 to 77 on
 average and the 95th percentile latency from 68 to 16 ms, for half a point of recall (98.4% of the
@@ -596,18 +604,32 @@ true ten nearest to 97.9%), and under a 1% filter from 1,511 partitions to 244 a
 two points (100% to 98.1%). Smaller pauses sooner and misses more; 0 never pauses.
 
 `pg_lion.vector_batch` (100, 1 to 100,000): how many rows a `lionvec` scan gathers candidates for
-from the partitions it reads. A query that wants more (a large `LIMIT`, or none) reads those
+from the partitions it reads; under a lion filter, the query's `LIMIT` (and `OFFSET`) instead when
+the planner knows it and it is more, up to an eighth of the candidates `work_mem` holds. A query
+that wants more (a `LIMIT` past that, one the planner does not know, or none) reads those
 partitions again, gathering four times as many each time. `work_mem` bounds how many candidates a
 scan keeps (DESIGN.md §44.4).
 
 `pg_lion.vector_exact_rows` (2,000, 0 to 100,000,000): how many rows a lion filter may admit for a
 `lionvec` scan under it to compute every matching row's distance from the table, exactly, instead
-of reading partitions; 0 never does. The exact path reads each matching row's vector (6 KB from
-TOAST at 1536 dimensions, 3 KB as a `halfvec`, so 2,000 rows are 12 MB or 6 MB) where a probe
-reads a few hundred to a thousand 8 KB code pages, but under a filter that leaves most partitions
-empty it probes many for nothing.
+of reading partitions, whatever the index's partitions; 0 leaves it to
+`pg_lion.vector_exact_per_partition`. The exact path reads each matching row's vector (6 KB at
+1536 dimensions, 3 KB as a `halfvec`, so 2,000 rows are 12 MB or 6 MB, a page each when the
+vectors are in TOAST or alone on their heap page) where a probe reads a few hundred to a thousand
+8 KB code pages, but under a filter that leaves most partitions empty it probes many for nothing.
 Raise it for exact answers under wider filters, at a table read a row; the planner prices both
 paths and may sort the filter's rows itself above it, which is exact too (DESIGN.md §44.6).
+
+`pg_lion.vector_exact_per_partition` (1.5, 0 to 1,000,000): the same, counted in rows for each of
+the index's partitions: a filter of no more than this many rows a partition, on average, is
+answered exactly too, however many rows that is - 12,000 at a million rows in the 8,000 partitions
+the build makes, 4,072 at 115,000 in 2,715. Where a filter's rows are this thin, each partition
+read finds about one of them, and reading them all from the table is faster, warm, than reading
+partitions for 0.98 of the ten nearest; from about three rows a partition reading partitions is
+faster (DESIGN.md §44.9). Cold, the exact path is a random table read a row, and the planner
+prices it so: where the exact path would take a filter, `LionOrdered` may lose to the plain index
+scan with a `Filter` (DESIGN.md §44.7). 0 leaves the choice to `pg_lion.vector_exact_rows`; the
+larger of the two counts.
 
 `pg_lion.vector_overflow` (`error`, or `stop`): what a `lionvec` scan does when what it knows of
 its rows outgrows `hash_mem` (`work_mem` times `hash_mem_multiplier`), which only a scan with no
@@ -691,6 +713,7 @@ A `lionvec` index (DESIGN.md §44) answers only an `ORDER BY` of its own distanc
 It has no search operators, no bitmap or index-only scans, no INCLUDE columns and no parallel scan,
 and indexes a single column of pgvector's `vector` or `halfvec` (not `sparsevec` or
 `bit`) of at most 8128 dimensions. Its results are approximate (`pg_lion.vector_margin`), except under a
+lion filter of up to `pg_lion.vector_exact_rows` rows, or `pg_lion.vector_exact_per_partition` a partition. Inserts serialize on the index's meta page and read every
 lion filter of up to `pg_lion.vector_exact_rows` rows, and under a filter no lion index answers,
 which by default is a sort of the filter's rows (`pg_lion.vector_postfilter`): exact, and as slow
 as reading every matching row. Inserts serialize on the index's meta page and read every
