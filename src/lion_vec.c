@@ -102,6 +102,7 @@ int			lionvec_exact_rows = LIONVEC_EXACT_DEFAULT;
 double		lionvec_exact_per_part = LIONVEC_EXACT_PER_PART_DEFAULT;
 int			lionvec_overflow = LIONVEC_OVERFLOW_ERROR;
 int			lionvec_postfilter = LIONVEC_POSTFILTER_EXACT;
+bool		lionvec_prefetch = true;
 
 static const struct config_enum_entry lionvec_overflow_options[] = {
 	{"error", LIONVEC_OVERFLOW_ERROR, false},
@@ -255,6 +256,26 @@ lion_vec_init(void)
 							 &lionvec_postfilter,
 							 LIONVEC_POSTFILTER_EXACT,
 							 lionvec_postfilter_options,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §44.4, "Prefetch": a cold scan waits on one page read at a
+	 * time, its probes' CODE chains, refines and heap fetches each a read the
+	 * next cannot start before; asked for ahead by effective_io_concurrency
+	 * pages, the kernel reads them meanwhile.  It changes no row returned,
+	 * nor their order: a hint, never a read.
+	 */
+	DefineCustomBoolVariable("pg_lion.vector_prefetch",
+							 "Whether a lionvec scan asks for the pages it will read ahead of reading them.",
+							 "A scan reads its partitions' code pages in runs the build wrote, and refines "
+							 "and fetches rows from the top of its queue; with this on it asks the kernel "
+							 "for the next of those pages, as many as the tablespace's "
+							 "effective_io_concurrency, up to 64 at a time, so that a cold scan does not "
+							 "wait on one read at a time.  The rows returned are the same either way.",
+							 &lionvec_prefetch,
+							 true,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
@@ -4253,6 +4274,20 @@ lionvecvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 #define LIONVEC_SPILL_PROBES	0.93
 
 /*
+ * How many items of itemsz bytes a lionvec page holds, their line pointers
+ * included, as PageAddItem() fills it: 35 CODE items at 1536 dimensions.
+ * The planner's count, and a scan's, of the pages the build wrote a chain
+ * in (lion_vec_scan.c, lv_probe(); DESIGN.md §44.4, "Prefetch").
+ */
+int
+lionvec_page_items(Size itemsz)
+{
+	return lionvec_items_per_page(BLCKSZ - SizeOfPageHeaderData -
+								  MAXALIGN(sizeof(LionVecPageOpaqueData)),
+								  MAXALIGN(itemsz) + sizeof(ItemIdData));
+}
+
+/*
  * What the planner needs of the index: the CODE pages' share of its
  * `pages` pages, by the dimensions the meta page records (or 1536 if none
  * yet), how many rows a CODE page holds, the partitions, and the CODE items
@@ -4275,8 +4310,7 @@ lionvec_code_pages(Oid indexoid, double pages, double *perpage,
 	dimsp = meta.dims > 0 ? meta.dimsp : 1536;
 	code = MAXALIGN(LIONVEC_CODE_SIZE(dimsp)) + sizeof(ItemIdData);
 	ref = MAXALIGN(LIONVEC_REFINE_SIZE(dimsp)) + sizeof(ItemIdData);
-	*perpage = Max(1.0, floor((BLCKSZ - SizeOfPageHeaderData -
-							   MAXALIGN(sizeof(LionVecPageOpaqueData))) / code));
+	*perpage = lionvec_page_items(LIONVEC_CODE_SIZE(dimsp));
 	return Max(1.0, ceil(pages * *items * code / (*items * code + ref)));
 }
 
@@ -4292,9 +4326,12 @@ lionvec_code_pages(Oid indexoid, double pages, double *perpage,
  * each and their CODE pages in order, plane 1 of their members, and a
  * batch's refines and exact distances, each a page read and a heap fetch.
  * `members` is how many rows a restriction admits, or the index's rows.
+ * *ranking is the centroids' part, which every participant of a parallel
+ * scan pays (lion_vec_parallel_cost()); none for the members alone.
  */
 static Cost
-lionvec_startup_cost(IndexOptInfo *index, double members, double *codepages)
+lionvec_startup_cost(IndexOptInfo *index, double members, double *codepages,
+					 Cost *ranking)
 {
 	double		tuples = Max(index->tuples, 1.0);
 	double		perpage;
@@ -4315,6 +4352,7 @@ lionvec_startup_cost(IndexOptInfo *index, double members, double *codepages)
 	if (frac < 1.0 && members <= lionvec_exact_limit(nparts))
 	{
 		*codepages = 0.0;
+		*ranking = 0.0;
 		return Max(members, 1.0) * (spc_random + cpu_index_tuple_cost +
 									LIONVEC_ROW_OPS * cpu_operator_cost);
 	}
@@ -4331,7 +4369,8 @@ lionvec_startup_cost(IndexOptInfo *index, double members, double *codepages)
 	read = Max(1.0, pages * share);
 	walked = tuples * items * share;
 	*codepages = read;
-	return nparts * LIONVEC_ROW_OPS * cpu_operator_cost +
+	*ranking = nparts * LIONVEC_ROW_OPS * cpu_operator_cost;
+	return *ranking +
 		Max(1.0, nparts * share) * spc_random + read * spc_seq +
 		walked * cpu_index_tuple_cost * 0.1 +
 		walked * frac * LIONVEC_ROW_OPS * cpu_operator_cost +
@@ -4348,8 +4387,91 @@ Cost
 lion_vec_scan_cost(IndexOptInfo *index, double members)
 {
 	double		codepages;
+	Cost		ranking;
 
-	return lionvec_startup_cost(index, members, &codepages);
+	return lionvec_startup_cost(index, members, &codepages, &ranking);
+}
+
+/*
+ * The cost of a scan of path's order: its first row's (*startup, of which
+ * *ranking is the centroids'), every row's (*total) and the CODE pages it
+ * reads (*pages).
+ *
+ * Every further batch of pg_lion.vector_batch rows costs a share of the
+ * first's start-up (LIONVEC_DEEPER), and each row at worst a refine and
+ * an exact distance.  The planner prices a LIMIT under a Filter as LIMIT
+ * / selectivity rows of this, so a plain scan that has to walk past the
+ * rows a selective filter rejects costs more than LionOrdered, which
+ * reads the members alone; charged a refine and a fetch alone, a scan
+ * that did not pause tied LionOrdered at 1% and ran 7 times slower.
+ */
+static void
+lionvec_order_cost(IndexPath *path, Cost *startup, Cost *total,
+				   Cost *ranking, double *pages)
+{
+	IndexOptInfo *index = path->indexinfo;
+	double		deeper;
+	double		spc_random;
+	double		spc_seq;
+
+	get_tablespace_page_costs(index->reltablespace, &spc_random, &spc_seq);
+	*startup = lionvec_startup_cost(index, index->tuples, pages, ranking);
+	deeper = lionvec_patience > 0 ? LIONVEC_DEEPER_PAUSED : LIONVEC_DEEPER;
+	*total = *startup +
+		Max(index->tuples, 1.0) *
+		(*startup * deeper / Max(lionvec_batch, 1) +
+		 spc_random + cpu_index_tuple_cost);
+}
+
+/*
+ * costsize.c's get_parallel_divisor(), which is static: the workers, and
+ * the leader's share while it takes part - 1 less 0.3 a worker, none from
+ * four workers on.
+ */
+static double
+lionvec_parallel_divisor(Path *path)
+{
+	double		divisor = path->parallel_workers;
+
+	if (parallel_leader_participation)
+	{
+		double		leader = 1.0 - 0.3 * path->parallel_workers;
+
+		if (leader > 0)
+			divisor += leader;
+	}
+	return Max(divisor, 1.0);
+}
+
+/*
+ * A partial path's cost (DESIGN.md §44.7, "A parallel scan"): its
+ * participants split the partitions (lion_vec_scan.c, lv_claim()), so the
+ * probes' share of the start-up and the rows' part after it divide among
+ * them; the centroids' ranking each pays in full.  cost_index() calls
+ * lionveccostestimate() before it sets parallel_workers and divides only
+ * its own CPU part, so lion_ordered_set_rel_pathlist() calls this on the
+ * partial paths that come out of it.
+ */
+void
+lion_vec_parallel_cost(IndexPath *path)
+{
+	Cost		startup;
+	Cost		total;
+	Cost		ranking;
+	Cost		pstartup;
+	Cost		ptotal;
+	double		pages;
+	double		divisor;
+
+	if (path->path.parallel_workers <= 0 || path->indexorderbys == NIL ||
+		!lion_vec_index(path->indexinfo))
+		return;
+	lionvec_order_cost(path, &startup, &total, &ranking, &pages);
+	divisor = lionvec_parallel_divisor(&path->path);
+	pstartup = ranking + (startup - ranking) / divisor;
+	ptotal = pstartup + (total - startup) / divisor;
+	path->path.startup_cost -= startup - pstartup;
+	path->path.total_cost -= total - ptotal;
 }
 
 static void
@@ -4359,10 +4481,7 @@ lionveccostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 					double *indexPages)
 {
 	IndexOptInfo *index = path->indexinfo;
-	double		codepages;
-	double		deeper;
-	double		spc_random;
-	double		spc_seq;
+	Cost		ranking;
 
 	*indexSelectivity = 1.0;
 	*indexCorrelation = 0.0;
@@ -4387,24 +4506,14 @@ lionveccostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		return;
 	}
 
-	get_tablespace_page_costs(index->reltablespace, &spc_random, &spc_seq);
-	*indexStartupCost = lionvec_startup_cost(index, index->tuples, &codepages);
-
 	/*
-	 * Every further batch of pg_lion.vector_batch rows costs a share of the
-	 * first's start-up (LIONVEC_DEEPER), and each row at worst a refine and
-	 * an exact distance.  The planner prices a LIMIT under a Filter as LIMIT
-	 * / selectivity rows of this, so a plain scan that has to walk past the
-	 * rows a selective filter rejects costs more than LionOrdered, which
-	 * reads the members alone; charged a refine and a fetch alone, a scan
-	 * that did not pause tied LionOrdered at 1% and ran 7 times slower.
+	 * *indexPages, the CODE pages a scan reads, is what a partial path's
+	 * workers are counted from (compute_parallel_worker(), against
+	 * min_parallel_index_scan_size), unless the table's parallel_workers
+	 * says how many; its cost is lion_vec_parallel_cost()'s.
 	 */
-	deeper = lionvec_patience > 0 ? LIONVEC_DEEPER_PAUSED : LIONVEC_DEEPER;
-	*indexTotalCost = *indexStartupCost +
-		Max(index->tuples, 1.0) *
-		(*indexStartupCost * deeper / Max(lionvec_batch, 1) +
-		 spc_random + cpu_index_tuple_cost);
-	*indexPages = codepages;
+	lionvec_order_cost(path, indexStartupCost, indexTotalCost, &ranking,
+					   indexPages);
 }
 
 /* ----------------------------------------------------------------
@@ -4540,7 +4649,12 @@ lionvec_handler(PG_FUNCTION_ARGS)
 		.amclusterable = false,
 		/* a reader takes a relation lock on the index (index_beginscan()) */
 		.ampredlocks = false,
-		.amcanparallel = false,
+		/*
+		 * each participant runs the whole scan over the partitions it claims
+		 * first (lion_vec_scan.c, lv_claim(); DESIGN.md §44.4, "A parallel
+		 * scan"), and Gather Merge merges their orders
+		 */
+		.amcanparallel = true,
 #if PG_VERSION_NUM >= 170000
 		/*
 		 * by lionvec's own count of workers, not the one core then makes
@@ -4579,9 +4693,9 @@ lionvec_handler(PG_FUNCTION_ARGS)
 		.amendscan = lionvecendscan,
 		.ammarkpos = NULL,
 		.amrestrpos = NULL,
-		.amestimateparallelscan = NULL,
-		.aminitparallelscan = NULL,
-		.amparallelrescan = NULL,
+		.amestimateparallelscan = lionvecestimateparallelscan,
+		.aminitparallelscan = lionvecinitparallelscan,
+		.amparallelrescan = lionvecparallelrescan,
 #if PG_VERSION_NUM >= 180000
 		.amtranslatestrategy = NULL,
 		.amtranslatecmptype = NULL,

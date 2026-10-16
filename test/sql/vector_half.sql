@@ -301,6 +301,8 @@ SELECT op, f, k,
 -- a partition of the 20, near its 1.5), and at 5,000 a filter of 3,294
 -- members is exact; the order is the same either way
 SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+-- (with no prefetch, whose counts the line would add: vector_scan_parallel)
+SET pg_lion.vector_prefetch = off;
 SET client_min_messages = debug1;
 SELECT id FROM hv WHERE tag = 3 ORDER BY v <-> hv_vec(4, 40) LIMIT 3;
 RESET client_min_messages;
@@ -316,6 +318,7 @@ SET client_min_messages = debug1;
 SELECT count(*) FROM (SELECT id FROM hv WHERE cat <> 5
 					   ORDER BY v <=> hv_vec(4, 40) LIMIT 10) s;
 RESET client_min_messages;
+RESET pg_lion.vector_prefetch;
 RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
 SELECT op, hv_ord(format('SELECT id, v %s hv_vec(4, 40) AS d FROM hv WHERE cat <> 5
 						  ORDER BY v %s hv_vec(4, 40) LIMIT 10', op, op)) AS result

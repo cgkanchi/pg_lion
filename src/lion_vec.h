@@ -345,6 +345,15 @@ typedef enum LionVecPostfilter
 								 * cost, as before 2026-10-16 */
 } LionVecPostfilter;
 
+/*
+ * The most pages a scan asks for ahead of its reads, at each place it reads
+ * from, whatever effective_io_concurrency says (lion_vec_scan.c,
+ * lv_start_prefetch(); DESIGN.md §44.4, "Prefetch"): at 200 a look ahead
+ * into the row queue would otherwise ask for hundreds of pages at a time,
+ * most of which the scan never reads.
+ */
+#define LIONVEC_PREFETCH_MAX	64
+
 extern double lionvec_epsilon;
 extern int	lionvec_batch;
 extern double lionvec_margin;
@@ -353,6 +362,7 @@ extern int	lionvec_exact_rows;
 extern double lionvec_exact_per_part;
 extern int	lionvec_overflow;
 extern int	lionvec_postfilter;
+extern bool lionvec_prefetch;
 
 /*
  * What an ORDER BY operator of lionvec's returns: pgvector's all return
@@ -388,6 +398,7 @@ extern LionVecRegion *lionvec_region_at(Relation index, Page page,
 										int dimsp);
 extern BlockNumber *lionvec_chain_heads(Relation index,
 										const LionVecMetaData *meta, int *n);
+extern int	lionvec_page_items(Size itemsz);
 
 /* lion_vec_scan.c: the scan callbacks */
 extern IndexScanDesc lionvecbeginscan(Relation index, int nkeys, int norderbys);
@@ -395,6 +406,17 @@ extern void lionvecrescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 						  ScanKey orderbys, int norderbys);
 extern bool lionvecgettuple(IndexScanDesc scan, ScanDirection dir);
 extern void lionvecendscan(IndexScanDesc scan);
+
+/* ... and a parallel scan's (DESIGN.md §44.4, "A parallel scan") */
+#if PG_VERSION_NUM >= 180000
+extern Size lionvecestimateparallelscan(Relation index, int nkeys, int norderbys);
+#elif PG_VERSION_NUM >= 170000
+extern Size lionvecestimateparallelscan(int nkeys, int norderbys);
+#else
+extern Size lionvecestimateparallelscan(void);
+#endif
+extern void lionvecinitparallelscan(void *target);
+extern void lionvecparallelrescan(IndexScanDesc scan);
 
 /*
  * For LionOrdered (DESIGN.md §44.6): is this a lionvec index - asked of the
@@ -432,5 +454,13 @@ extern void lion_vec_scan_limit(IndexScanDesc scan, int64 rows);
  * costs before its first row, for the planner (§44.7).
  */
 extern Cost lion_vec_scan_cost(IndexOptInfo *index, double members);
+
+/*
+ * ... and the price of a partial path of a lionvec order, which core gives
+ * its workers only after amcostestimate has priced it as a serial scan: its
+ * probes and its rows divided among the processes (§44.7), called by
+ * LionOrdered's set_rel_pathlist_hook for each such path.
+ */
+extern void lion_vec_parallel_cost(IndexPath *path);
 
 #endif							/* LION_VEC_H */
