@@ -1,0 +1,136 @@
+-- A restricted scan's pauses and its query's LIMIT (DESIGN.md §44.4, "A
+-- known LIMIT"; §44.6).
+--
+-- LionOrdered tells the vector scan how many rows the LIMIT of its query
+-- level takes, OFFSET included, when the planner knows: the scan then keeps
+-- no tier of the pause below that.  A pause on a smaller tier ends once it
+-- has returned that tier's rows, and probing resumes for the rows the LIMIT
+-- still wants; a member it then finds nearer than those returned is skipped
+-- out of order.  At pg_lion.vector_margin = 100 every partition comes before
+-- every row, so a scan that does not pause returns the exact answer, and at
+-- a patience of one unit each tier pauses as soon as it is full and stalls.
+-- Each query runs through the node, its DEBUG1 line counting the pauses and
+-- the rows skipped, and through a sort, whose rows it is compared with.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_lion_vector;
+RESET client_min_messages;
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+
+CREATE FUNCTION vl_vec(seed bigint, n int, scale float8 DEFAULT 1.0)
+RETURNS vector LANGUAGE sql IMMUTABLE AS $$
+	SELECT array_agg(((hashint8extended(seed * 1000 + j, 43) % 100000)::float8
+					  / 100000.0 * scale)::real ORDER BY j)::vector
+	  FROM generate_series(1, n) j
+$$;
+
+/*
+ * vl_run() runs q - which returns a column id - through the node, with the
+ * vector scan's DEBUG1 line, and through a sequential scan and sort, and
+ * says how many of the sort's rows the node returned.  A prepared
+ * statement's cached plan does not change with the settings, so for one the
+ * sort's rows come from the query it stands for.
+ */
+CREATE FUNCTION vl_run(q text, ordinary text DEFAULT NULL) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	a int[] := '{}';
+	b int[] := '{}';
+	r record;
+	ln text;
+	used boolean := false;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_sort', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		used := used OR ln ~ 'Custom Scan \(LionOrdered\)';
+	END LOOP;
+	PERFORM set_config('client_min_messages', 'debug1', true);
+	FOR r IN EXECUTE q LOOP
+		a := a || r.id;
+	END LOOP;
+	PERFORM set_config('client_min_messages', 'notice', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_sort', 'on', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	FOR r IN EXECUTE coalesce(ordinary, q) LOOP
+		b := b || r.id;
+	END LOOP;
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	RETURN format('%s: %s rows, %s of the nearest',
+				  CASE WHEN used THEN 'LionOrdered' ELSE 'no LionOrdered' END,
+				  cardinality(a),
+				  (SELECT count(*) FROM unnest(a) x WHERE x = ANY (b)));
+END $$;
+
+-- 10,000 rows in ten clusters, indexed in 50 partitions (vector_filter.sql's)
+CREATE TABLE vl (id int PRIMARY KEY, cat int, tag int, v vector(24))
+	WITH (autovacuum_enabled = off);
+INSERT INTO vl
+SELECT i, i % 10,
+	   ((hashint8extended(i::bigint, 7) & 9223372036854775807) % 100)::int,
+	   vl_vec(-(i % 10) - 1, 24) + vl_vec(i, 24, 0.3)
+  FROM generate_series(1, 10000) i;
+CREATE INDEX vl_l2 ON vl USING lionvec (v) WITH (partitions = 50);
+CREATE INDEX vl_cat ON vl USING lion (cat);
+CREATE INDEX vl_tag ON vl USING lion (tag);
+VACUUM (FREEZE, ANALYZE) vl;
+
+SET pg_lion.vector_margin = 100;
+SET pg_lion.vector_patience = 1;
+
+-- a LIMIT 100 over 9,000 members, and over 3,000, pauses on L's hundred
+-- alone, which the LIMIT takes whole: nothing is skipped, and it returns the
+-- hundred nearest (with every tier it paused five times, skipped 27 and 26
+-- rows and returned 73 and 74 of them)
+SELECT vl_run('SELECT id FROM vl WHERE cat <> 5 ORDER BY v <-> vl_vec(77, 24) LIMIT 100');
+SELECT vl_run('SELECT id FROM vl WHERE tag < 30 ORDER BY v <-> vl_vec(4, 24) LIMIT 100');
+-- an OFFSET counts: 90 rows skipped and 10 returned are a hundred taken
+SELECT vl_run('SELECT id FROM vl WHERE cat <> 5 ORDER BY v <-> vl_vec(77, 24) LIMIT 10 OFFSET 90');
+-- a LIMIT 50 keeps the tier of 80 alone, and pauses there once (with every
+-- tier, four times, returning 23 of its fifty nearest)
+SELECT vl_run('SELECT id FROM vl WHERE cat <> 5 ORDER BY v <-> vl_vec(77, 24) LIMIT 50');
+
+-- a LIMIT 10 pauses on its ten as it did, and LIMITs of 1 to 9 keep every
+-- tier too (LV_TIER_MIN is the least): the same lines as before the LIMIT
+-- was told, a patience of one unit finding few of the ten nearest
+SELECT vl_run('SELECT id FROM vl WHERE cat <> 5 ORDER BY v <-> vl_vec(77, 24) LIMIT 10');
+SELECT vl_run('SELECT id FROM vl WHERE cat <> 5 ORDER BY v <-> vl_vec(77, 24) LIMIT 5');
+
+-- a LIMIT the planner does not know - a generic plan's Param - keeps every
+-- tier: the LIMIT 100 pauses at ten, twenty, forty, eighty and a hundred,
+-- each pause ends by count, and rows found after are skipped
+PREPARE vlp(int) AS
+	SELECT id FROM vl WHERE cat <> 5 ORDER BY v <-> vl_vec(77, 24) LIMIT $1;
+SET plan_cache_mode = force_generic_plan;
+SELECT vl_run('EXECUTE vlp(100)',
+			  'SELECT id FROM vl WHERE cat <> 5 ORDER BY v <-> vl_vec(77, 24) LIMIT 100');
+-- ... and a custom plan knows it
+SET plan_cache_mode = force_custom_plan;
+SELECT vl_run('EXECUTE vlp(100)',
+			  'SELECT id FROM vl WHERE cat <> 5 ORDER BY v <-> vl_vec(77, 24) LIMIT 100');
+RESET plan_cache_mode;
+DEALLOCATE vlp;
+
+-- a subquery's own LIMIT, under an aggregate that has none
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_sort = off;
+SET client_min_messages = debug1;
+SELECT count(*), count(DISTINCT id)
+  FROM (SELECT id FROM vl WHERE cat <> 5 ORDER BY v <-> vl_vec(77, 24) LIMIT 100) s;
+RESET client_min_messages;
+RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_sort;
+
+RESET pg_lion.vector_margin;
+RESET pg_lion.vector_patience;
+DROP TABLE vl;
+DROP FUNCTION vl_run(text, text);
+DROP FUNCTION vl_vec(bigint, int, float8);
