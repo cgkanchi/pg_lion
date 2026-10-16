@@ -1547,15 +1547,38 @@ kmeans_work_free(LionVecKmeansWork *w)
 	free(w->planes);
 }
 
+/* lionvec_route()'s scratch, for n regions of k centroids */
+static void
+route_alloc(LionVecRoute *rt, int n, int k)
+{
+	rt->key = (double *) xmalloc(sizeof(double) * Max(n, 1));
+	rt->order = (int *) xmalloc(sizeof(int) * Max(n, 1));
+	rt->pick = (int *) xmalloc(sizeof(int) * Max(n, 1));
+	rt->idx = (int *) xmalloc(sizeof(int) * Max(k, 1));
+}
+
+static void
+route_free(LionVecRoute *rt)
+{
+	free(rt->key);
+	free(rt->order);
+	free(rt->pick);
+	free(rt->idx);
+}
+
 /*
  * k-means as a parallel build runs it (lion_vec.c, DESIGN.md §44.12): its
  * steps, each iteration's rows assigned a chunk of the given size at a time,
  * the chunks taken last first and alternately by two "processes", each with
- * scratch of its own, sharing the centroids' codes.  Returns the iterations.
+ * scratch of its own, sharing the centroids' codes - and, given regions r,
+ * routed through them, regrouped by the "leader" at the start of each
+ * iteration, each process routing in scratch of its own.  Returns the
+ * iterations.
  */
 static int
 kmeans_by_chunks(const Sample *sm, int k, int iters, bool unit, const float *mean,
-				 float *cent, LionVecKmeansWork *w, int chunk)
+				 float *cent, LionVecKmeansWork *w, int chunk, LionVecRegions *r,
+				 LionVecRegionMaker *mk)
 {
 	LionVecKmeansWork w2 = *w;
 	int			n = sm->s.n;
@@ -1563,6 +1586,8 @@ kmeans_by_chunks(const Sample *sm, int k, int iters, bool unit, const float *mea
 	int			nchunks = (n + chunk - 1) / chunk;
 	int			made = 0;
 
+	if (r != NULL)
+		route_alloc(&w2.route, r->n, k);
 	w2.lo = (double *) xmalloc(sizeof(double) * k);
 	w2.hi = (double *) xmalloc(sizeof(double) * k);
 	w2.cand = (int *) xmalloc(sizeof(int) * k);
@@ -1579,14 +1604,18 @@ kmeans_by_chunks(const Sample *sm, int k, int iters, bool unit, const float *mea
 
 		made++;
 		lionvec_kmeans_codes(k, D, mean, cent, w);
+		if (r != NULL)
+			lionvec_regions_make(r, cent, unit, LIONVEC_REGION_SEED(42), mean, mk);
 		for (c = nchunks - 1; c >= 0; c--)
 			moved += lionvec_kmeans_assign(&sm->s, c * chunk, Min((c + 1) * chunk, n),
 										   k, mean, cent, w->assign,
-										   c % 2 == 0 ? w : &w2);
+										   c % 2 == 0 ? w : &w2, r);
 		if (moved == 0)
 			break;
 		lionvec_kmeans_update(&sm->s, k, unit, w->assign, cent, w);
 	}
+	if (r != NULL)
+		route_free(&w2.route);
 	free(w2.lo);
 	free(w2.hi);
 	free(w2.cand);
@@ -1604,7 +1633,7 @@ kmeans_run(const Sample *sm, int k, int iters, bool unit, const float *mean,
 		   float *cent, LionVecKmeansWork *w)
 {
 	int			D = sm->s.dimsp;
-	int			made = lionvec_kmeans(&sm->s, k, iters, unit, 42, mean, cent, w);
+	int			made = lionvec_kmeans(&sm->s, k, iters, unit, 42, mean, cent, w, NULL, NULL);
 	bool		finite = true;
 	int			j;
 	int			i;
@@ -1762,12 +1791,12 @@ test_kmeans(void)
 
 				kmeans_work_free(&w);
 				kmeans_work(&w, n, kk, D);
-				made0 = lionvec_kmeans(&sm.s, kk, 10, unit, 42, mean, cent2, &w);
+				made0 = lionvec_kmeans(&sm.s, kk, 10, unit, 42, mean, cent2, &w, NULL, NULL);
 				memcpy(assign0, w.assign, sizeof(int) * n);
 				for (c = 0; c < 4; c++)
 				{
 					int			made1 = kmeans_by_chunks(&sm, kk, 10, unit, mean, cent,
-														 &w, chunks[c]);
+														 &w, chunks[c], NULL, NULL);
 
 					CHECK(made1 == made0 &&
 						  memcmp(cent, cent2, sizeof(float) * kk * D) == 0 &&
@@ -1935,7 +1964,7 @@ test_kernels_agree(void)
 			lionvec_estimate8(&q, b.e.codes, b.e.norm, b.e.alpha8, b.e.rnorm8,
 							  &est[4 * i + 2], &est[4 * i + 3]);
 		}
-		lionvec_kmeans(&sm.s, k, 10, true, 7, mean, cent, &w);
+		lionvec_kmeans(&sm.s, k, 10, true, 7, mean, cent, &w, NULL, NULL);
 		if (which == 0)
 		{
 			memcpy(est0, est, sizeof(double) * 4 * n);
@@ -2801,6 +2830,755 @@ test_bounds_nan(void)
 	CHECK(lionvec_key_exact(LIONVEC_COSINE, 0.5, -0.25) == 0.25, "cosine key");
 }
 
+/* ---------- the sample's cut, and the centroids' regions ---------- */
+
+/*
+ * lionvec_subsample(): exactly m of the n slots, ascending - so distinct,
+ * and the rows they name moved down in the reservoir's order - the same from
+ * the same seed and another from another, every slot when m is n, and each
+ * slot as often as any other.
+ */
+static void
+test_subsample(void)
+{
+	static const int ns[] = {0, 1, 2, 10, 1000, 100003};
+	uint32	   *slot = (uint32 *) xmalloc(sizeof(uint32) * 100003);
+	uint32	   *slot2 = (uint32 *) xmalloc(sizeof(uint32) * 100003);
+	long		count[20];
+	bool		ordered = true;
+	bool		same = true;
+	bool		differ = true;
+	bool		all = true;
+	bool		even = true;
+	int			ni;
+	int			s;
+	int			i;
+
+	cur_phase = "subsample";
+	for (ni = 0; ni < (int) lengthof(ns); ni++)
+	{
+		int			n = ns[ni];
+		int			ms[6];
+		int			mi;
+
+		ms[0] = 0;
+		ms[1] = Min(1, n);
+		ms[2] = n / 3;
+		ms[3] = n / 2;
+		ms[4] = Max(n - 1, 0);
+		ms[5] = n;
+		for (mi = 0; mi < 6; mi++)
+		{
+			int			m = ms[mi];
+
+			lionvec_subsample(n, m, 7, slot);
+			for (i = 0; i < m; i++)
+				ordered &= slot[i] < (uint32) n && (i == 0 || slot[i - 1] < slot[i]);
+			if (m == n)
+				for (i = 0; i < m; i++)
+					all &= slot[i] == (uint32) i;
+			lionvec_subsample(n, m, 7, slot2);
+			same &= memcmp(slot, slot2, sizeof(uint32) * m) == 0;
+			if (m >= 10 && n - m >= 10)
+			{
+				lionvec_subsample(n, m, 8, slot2);
+				differ &= memcmp(slot, slot2, sizeof(uint32) * m) != 0;
+			}
+		}
+	}
+	CHECK(ordered, "the cut is not m distinct slots in ascending order");
+	CHECK(all, "a cut of every slot is not every slot");
+	CHECK(same, "the cut is not repeatable");
+	CHECK(differ, "another seed made the same cut");
+
+	/* 5 of 20 from 8,000 seeds: 2,000 draws a slot, give or take 39 */
+	memset(count, 0, sizeof(count));
+	for (s = 0; s < 8000; s++)
+	{
+		lionvec_subsample(20, 5, (uint64) s * 0x9E3779B97F4A7C15ULL, slot);
+		for (i = 0; i < 5; i++)
+			count[slot[i]]++;
+	}
+	for (i = 0; i < 20; i++)
+		even &= labs(count[i] - 2000) < 200;
+	CHECK(even, "a slot is drawn more often than another");
+	free(slot2);
+	free(slot);
+}
+
+/* k centroids' codes, of which sub holds those idx[0 .. n) names, in that order */
+static void
+cent_codes_sub(CentCodes *sub, const CentCodes *cc, const int *idx, int n)
+{
+	int			nw = cc->c.dimsp / 64;
+	int			i;
+
+	for (i = 0; i < n; i++)
+	{
+		int			j = idx[i];
+
+		memcpy(sub->bits + (Size) i * nw, cc->bits + (Size) j * nw,
+			   sizeof(uint64) * nw);
+		sub->pop[i] = cc->pop[j];
+		sub->norm[i] = cc->norm[j];
+		sub->alpha1[i] = cc->alpha1[j];
+	}
+	sub->c.k = n;
+	sub->c.dimsp = cc->c.dimsp;
+	sub->c.bits = sub->bits;
+	sub->c.popcount = sub->pop;
+	sub->c.norm = sub->norm;
+	sub->c.alpha1 = sub->alpha1;
+}
+
+/*
+ * lionvec_candidates_among(): over the centroids idx names, in any order,
+ * the candidates and bounds lionvec_candidates_n() finds among those
+ * centroids alone - the bounds by their places in idx, the candidates by
+ * their numbers - and with no idx, candidates_n's own.
+ */
+static void
+test_candidates_among(void)
+{
+	static const int dims[] = {64, 320};
+	int			di;
+
+	cur_phase = "candidates_among";
+	for (di = 0; di < (int) lengthof(dims); di++)
+	{
+		int			D = dims[di];
+		int			k = 300;
+		int			T = 20;
+		float	   *centers = falloc(T * D);
+		float	   *cent = falloc(k * D);
+		float	   *x = falloc(D);
+		double	   *lo = (double *) xmalloc(sizeof(double) * k);
+		double	   *hi = (double *) xmalloc(sizeof(double) * k);
+		double	   *lo1 = (double *) xmalloc(sizeof(double) * k);
+		double	   *hi1 = (double *) xmalloc(sizeof(double) * k);
+		int		   *cand = (int *) xmalloc(sizeof(int) * k);
+		int		   *cand1 = (int *) xmalloc(sizeof(int) * k);
+		int		   *idx = (int *) xmalloc(sizeof(int) * k);
+		uint32	   *slot = (uint32 *) xmalloc(sizeof(uint32) * k);
+		LionVecQuery q;
+		CentCodes	cc;
+		CentCodes	sub;
+		bool		same = true;
+		bool		whole = true;
+		int			trial;
+		int			i;
+		int			j;
+
+		query_alloc(&q, D);
+		for (i = 0; i < T * D; i++)
+			centers[i] = (float) rnd_gauss();
+		for (j = 0; j < k; j++)
+			for (i = 0; i < D; i++)
+				cent[(Size) j * D + i] = centers[(Size) (j % T) * D + i] +
+					(float) (rnd_gauss() * 0.4);
+		cent_codes(&cc, cent, k, D, NULL);
+		cent_codes(&sub, cent, k, D, NULL);
+
+		for (trial = 0; trial < 200; trial++)
+		{
+			int			c = (int) (rnd64() % k);
+			int			n = 1 + (int) (rnd64() % k);
+			int			m = trial % 2 == 0 ? 1 : LIONVEC_SOAR_CANDS + 1;
+			int			nc;
+			int			nc1;
+
+			for (i = 0; i < D; i++)
+				x[i] = cent[(Size) c * D + i] + (float) (rnd_gauss() * 0.4);
+			lionvec_query_init(&q, LIONVEC_L2, NULL, x, LIONVEC_ASSIGN_EPS);
+
+			/* n of them, ascending as a route's are, or shuffled */
+			lionvec_subsample(k, n, (uint64) trial, slot);
+			for (i = 0; i < n; i++)
+				idx[i] = (int) slot[i];
+			if (trial % 4 >= 2)
+				for (i = n - 1; i > 0; i--)
+				{
+					int			r = (int) (rnd64() % (i + 1));
+					int			t = idx[i];
+
+					idx[i] = idx[r];
+					idx[r] = t;
+				}
+			cent_codes_sub(&sub, &cc, idx, n);
+			nc = lionvec_candidates_among(&cc.c, idx, n, &q, m, lo, hi, cand);
+			nc1 = lionvec_candidates_n(&sub.c, &q, m, lo1, hi1, cand1);
+			same &= nc == nc1 &&
+				memcmp(lo, lo1, sizeof(double) * n) == 0 &&
+				memcmp(hi, hi1, sizeof(double) * n) == 0;
+			for (i = 0; i < Min(nc, nc1); i++)
+				same &= cand[i] == idx[cand1[i]];
+
+			/* no idx: every centroid, as candidates_n */
+			nc = lionvec_candidates_among(&cc.c, NULL, k, &q, m, lo, hi, cand);
+			nc1 = lionvec_candidates_n(&cc.c, &q, m, lo1, hi1, cand1);
+			whole &= nc == nc1 && memcmp(cand, cand1, sizeof(int) * nc) == 0 &&
+				memcmp(lo, lo1, sizeof(double) * k) == 0;
+		}
+		CHECK(same, "candidates among some centroids are not candidates_n of those alone");
+		CHECK(whole, "candidates among every centroid are not candidates_n's");
+
+		cent_codes_free(&sub);
+		cent_codes_free(&cc);
+		query_free(&q);
+		free(slot);
+		free(idx);
+		free(cand1);
+		free(cand);
+		free(hi1);
+		free(lo1);
+		free(hi);
+		free(lo);
+		free(x);
+		free(cent);
+		free(centers);
+	}
+}
+
+/* regions of k centroids, and what lionvec_regions_make() works in */
+typedef struct RegionBufs
+{
+	LionVecRegions r;
+	LionVecRegionMaker mk;
+} RegionBufs;
+
+static void
+region_bufs(RegionBufs *b, int k, int D)
+{
+	int			n = lionvec_region_count(k);
+
+	memset(b, 0, sizeof(*b));
+	b->r.n = n;
+	b->r.k = k;
+	b->r.dimsp = D;
+	b->r.bits = (uint64 *) xmalloc(sizeof(uint64) * (Size) n * (D / 64));
+	b->r.popcount = (uint16 *) xmalloc(sizeof(uint16) * n);
+	b->r.norm = falloc(n);
+	b->r.alpha1 = falloc(n);
+	b->r.first = (int *) xmalloc(sizeof(int) * (n + 1));
+	b->r.member = (int *) xmalloc(sizeof(int) * k);
+	/* k-means of k rows, the centroids, into n */
+	kmeans_work(&b->mk.w, k, n, D);
+	b->mk.codes = (uint8 *) xmalloc((Size) k * D);
+	b->mk.scale = falloc(k);
+	b->mk.cent = falloc(n * D);
+}
+
+static void
+region_bufs_free(RegionBufs *b)
+{
+	free(b->r.bits);
+	free(b->r.popcount);
+	free(b->r.norm);
+	free(b->r.alpha1);
+	free(b->r.first);
+	free(b->r.member);
+	kmeans_work_free(&b->mk.w);
+	free(b->mk.codes);
+	free(b->mk.scale);
+	free(b->mk.cent);
+}
+
+/* the regions are the same, to the bit */
+static bool
+regions_same(const LionVecRegions *a, const LionVecRegions *b)
+{
+	return a->n == b->n && a->k == b->k &&
+		memcmp(a->first, b->first, sizeof(int) * (a->n + 1)) == 0 &&
+		memcmp(a->member, b->member, sizeof(int) * a->k) == 0 &&
+		memcmp(a->bits, b->bits, sizeof(uint64) * (Size) a->n * (a->dimsp / 64)) == 0 &&
+		memcmp(a->popcount, b->popcount, sizeof(uint16) * a->n) == 0 &&
+		memcmp(a->norm, b->norm, sizeof(float) * a->n) == 0 &&
+		memcmp(a->alpha1, b->alpha1, sizeof(float) * a->n) == 0;
+}
+
+/*
+ * lionvec_regions_pick()'s answer the obvious way: the regions with members
+ * by key, ties to the lower, NaN as infinite; the first beam, then more
+ * while they hold fewer than need; ascending.
+ */
+static int
+pick_reference(const double *key, const int *first, int n, int beam, int need,
+			   int *pick)
+{
+	int		   *by = (int *) xmalloc(sizeof(int) * n);
+	int			nb = 0;
+	int			got = 0;
+	int			members = 0;
+	int			g;
+	int			i;
+
+	for (g = 0; g < n; g++)
+	{
+		double		kg = isnan(key[g]) ? INFINITY : key[g];
+
+		if (first[g + 1] == first[g])
+			continue;
+		for (i = nb; i > 0; i--)
+		{
+			int			h = by[i - 1];
+			double		kh = isnan(key[h]) ? INFINITY : key[h];
+
+			if (!(kh > kg))
+				break;
+			by[i] = by[i - 1];
+		}
+		by[i] = g;
+		nb++;
+	}
+	for (i = 0; i < nb && (got < beam || members < need); i++)
+	{
+		pick[got++] = by[i];
+		members += first[by[i] + 1] - first[by[i]];
+	}
+	free(by);
+	/* ascending */
+	for (i = 1; i < got; i++)
+	{
+		int			v = pick[i];
+		int			j = i;
+
+		for (; j > 0 && pick[j - 1] > v; j--)
+			pick[j] = pick[j - 1];
+		pick[j] = v;
+	}
+	return got;
+}
+
+/*
+ * The regions' counts; lionvec_regions_pick() against the obvious way, with
+ * empty regions, ties and keys that are not numbers; then, over centroids
+ * k-means made of clustered rows: lionvec_regions_make()'s members
+ * partition the centroids, each region's ascending, each centroid in the
+ * region nearest it (as the build routes), the same regions every time; the
+ * partitions numbered region by region (lion_vec.c) are each region's run
+ * and route every row as before, so that an insert reading the runs finds
+ * what the build did; a route's candidates are among its regions' members
+ * and hold every exact candidate there is among them; and the nearest
+ * centroid a route finds is the nearest of all for 97% of rows or more.
+ */
+static void
+test_regions(void)
+{
+	int			D = 128;
+	int			T = 40;
+	int			nrows = 12000;
+	int			nq = 3000;
+	int			k = 600;
+	float	   *rows = falloc(nrows * D);
+	float	   *queries = falloc(nq * D);
+	float	   *dec = falloc(nrows * D);
+	float	   *mean = falloc(D);
+	float	   *cent = falloc(k * D);
+	float	   *cent2 = falloc(k * D);
+	float	   *y = falloc(D);
+	double	   *lo = (double *) xmalloc(sizeof(double) * k);
+	double	   *hi = (double *) xmalloc(sizeof(double) * k);
+	int		   *cand = (int *) xmalloc(sizeof(int) * k);
+	int		   *cand2 = (int *) xmalloc(sizeof(int) * k);
+	int		   *ecand = (int *) xmalloc(sizeof(int) * k);
+	bool	   *inpick = (bool *) xmalloc(sizeof(bool) * k);
+	bool	   *seen = (bool *) xmalloc(sizeof(bool) * k);
+	int		   *ident = (int *) xmalloc(sizeof(int) * k);
+	LionVecKmeansWork w;
+	LionVecRoute rt;
+	LionVecQuery q;
+	CentCodes	cc;
+	CentCodes	cc2;
+	RegionBufs	rb;
+	RegionBufs	rb2;
+	LionVecRegions rn;
+	Sample		sm;
+	bool		ok;
+	int			n;
+	int			g;
+	int			i;
+	int			j;
+
+	cur_phase = "regions";
+
+	/* the counts: none below LIONVEC_REGION_MIN, then ceil(sqrt(k)) */
+	CHECK(lionvec_region_count(0) == 0 && lionvec_region_count(1) == 0 &&
+		  lionvec_region_count(LIONVEC_REGION_MIN - 1) == 0,
+		  "regions of fewer than LIONVEC_REGION_MIN centroids");
+	CHECK(lionvec_region_count(64) == 8 && lionvec_region_count(65) == 9 &&
+		  lionvec_region_count(2717) == 53 && lionvec_region_count(262144) == 512,
+		  "the regions of k centroids are not ceil(sqrt(k))");
+	ok = true;
+	for (n = 1; n <= 1000; n++)
+	{
+		int			m;
+
+		for (m = 1; m <= LIONVEC_SOAR_CANDS + 1; m += LIONVEC_SOAR_CANDS)
+		{
+			int			b = lionvec_region_beam(n, m);
+
+			ok &= b >= 1 && b <= n &&
+				(n == 1 || b >= lionvec_region_beam(n - 1, m)) &&
+				b >= lionvec_region_beam(n, 1);
+		}
+	}
+	CHECK(ok, "a beam of none, of more regions than there are, shrinking, or narrower for more nearest");
+
+	/* the pick, against the obvious way */
+	{
+		int			nr = 30;
+		double	   *key = (double *) xmalloc(sizeof(double) * nr);
+		int		   *first = (int *) xmalloc(sizeof(int) * (nr + 1));
+		int		   *order = (int *) xmalloc(sizeof(int) * nr);
+		int		   *pick = (int *) xmalloc(sizeof(int) * nr);
+		int		   *pick2 = (int *) xmalloc(sizeof(int) * nr);
+		bool		same = true;
+		int			trial;
+
+		for (trial = 0; trial < 2000; trial++)
+		{
+			int			beam = 1 + (int) (rnd64() % 8);
+			int			need = (int) (rnd64() % 40);
+			int			total;
+			int			np;
+			int			np2;
+
+			first[0] = 0;
+			for (g = 0; g < nr; g++)
+			{
+				/* a third empty; keys from few values, so that they tie */
+				int			c = rnd64() % 3 == 0 ? 0 : 1 + (int) (rnd64() % 4);
+				int			kind = (int) (rnd64() % 10);
+
+				first[g + 1] = first[g] + c;
+				key[g] = kind == 0 ? NAN : kind == 1 ? INFINITY :
+					(double) (rnd64() % 6);
+			}
+			total = first[nr];
+			np = lionvec_regions_pick(key, first, nr, beam, need, order, pick);
+			np2 = pick_reference(key, first, nr, beam, need, pick2);
+			same &= np == np2 && memcmp(pick, pick2, sizeof(int) * np) == 0;
+			/* need more than they all have: all of them */
+			if (trial % 10 == 0)
+			{
+				int			nonempty = 0;
+
+				for (g = 0; g < nr; g++)
+					nonempty += first[g + 1] > first[g];
+				np = lionvec_regions_pick(key, first, nr, beam, total + 1, order, pick);
+				same &= np == nonempty;
+			}
+		}
+		CHECK(same, "the regions picked are not the nearest with members");
+		free(pick2);
+		free(pick);
+		free(order);
+		free(first);
+		free(key);
+	}
+
+	/* centroids as a build makes them: exact k-means of clustered rows */
+	make_clusters(rows, nrows, queries, nq, D, T);
+	sample_make(&sm, rows, nrows, D);
+	for (i = 0; i < nrows; i++)
+		lionvec_sample_row(&sm.s, i, dec + (Size) i * D);
+	for (j = 0; j < D; j++)
+	{
+		double		s = 0.0;
+
+		for (i = 0; i < nrows; i++)
+			s += dec[(Size) i * D + j];
+		mean[j] = (float) (s / nrows);
+	}
+	kmeans_work(&w, nrows, k, D);
+	(void) lionvec_kmeans(&sm.s, k, 5, false, 42, mean, cent, &w, NULL, NULL);
+	kmeans_work_free(&w);
+
+	/* the regions: a partition of the centroids, each in its nearest */
+	region_bufs(&rb, k, D);
+	region_bufs(&rb2, k, D);
+	n = rb.r.n;
+	CHECK(n == 25, "600 centroids are not in 25 regions");
+	lionvec_regions_make(&rb.r, cent, false, 43, mean, &rb.mk);
+	ok = rb.r.first[0] == 0 && rb.r.first[n] == k;
+	memset(seen, 0, sizeof(bool) * k);
+	for (g = 0; g < n; g++)
+	{
+		ok &= rb.r.first[g + 1] >= rb.r.first[g];
+		for (i = rb.r.first[g]; i < rb.r.first[g + 1]; i++)
+		{
+			int			c = rb.r.member[i];
+
+			ok &= c >= 0 && c < k && !seen[c];
+			if (c >= 0 && c < k)
+				seen[c] = true;
+			ok &= i == rb.r.first[g] || rb.r.member[i - 1] < c;
+		}
+	}
+	CHECK(ok, "the regions' members are not the centroids, each once, ascending");
+	{
+		int			near = 0;
+
+		for (g = 0; g < n; g++)
+			for (i = rb.r.first[g]; i < rb.r.first[g + 1]; i++)
+			{
+				int			c = rb.r.member[i];
+
+				/* the centroid as k-means of the centroids has it: its codes */
+				lionvec_sample_row(&(LionVecSample)
+								   {k, D, rb.mk.codes, rb.mk.scale}, c, y);
+				near += nearest_exact(y, rb.mk.cent, n, D, NULL) == g;
+			}
+		CHECK(near >= k * 99 / 100, "a centroid is not in the region nearest it");
+	}
+	lionvec_regions_make(&rb2.r, cent, false, 43, mean, &rb2.mk);
+	CHECK(regions_same(&rb.r, &rb2.r), "the same centroids made other regions");
+
+	/*
+	 * Numbered region by region: partition j is centroid member[j], so
+	 * region g's are the run first[g] .. first[g + 1] - 1, and its members
+	 * the identity; routing through them finds the same centroids, in the
+	 * same order, under their new numbers.
+	 */
+	for (j = 0; j < k; j++)
+	{
+		memcpy(cent2 + (Size) j * D, cent + (Size) rb.r.member[j] * D,
+			   sizeof(float) * D);
+		ident[j] = j;
+	}
+	rn = rb.r;
+	rn.member = ident;
+	cent_codes(&cc, cent, k, D, mean);
+	cent_codes(&cc2, cent2, k, D, mean);
+	route_alloc(&rt, n, k);
+	query_alloc(&q, D);
+	{
+		int			m;
+		bool		renumbered = true;
+		bool		among = true;
+		long		subset = 0;
+		long		match = 0;
+		long		nc_route = 0;
+		long		nc_exact = 0;
+
+		for (m = 1; m <= LIONVEC_SOAR_CANDS + 1; m += LIONVEC_SOAR_CANDS)
+		{
+			for (i = 0; i < nq; i++)
+			{
+				const float *x = queries + (Size) i * D;
+				int			nc;
+				int			nc2;
+				int			ne;
+				int			np;
+				int			best = -1;
+				double		bestd = INFINITY;
+				bool		sub = true;
+				int			c;
+
+				lionvec_query_init(&q, LIONVEC_L2, mean, x, LIONVEC_ASSIGN_EPS);
+				nc = lionvec_route(&rb.r, &cc.c, &q, m, &rt, lo, hi, cand);
+				np = lionvec_regions_pick(rt.key, rb.r.first, n, lionvec_region_beam(n, m), m,
+										  rt.order, rt.pick);
+				memset(inpick, 0, sizeof(bool) * k);
+				for (g = 0; g < np; g++)
+					for (j = rb.r.first[rt.pick[g]]; j < rb.r.first[rt.pick[g] + 1]; j++)
+						inpick[rb.r.member[j]] = true;
+				among &= nc >= Min(m, k);
+
+				/* renumbered: the same centroids, the same order */
+				nc2 = lionvec_route(&rn, &cc2.c, &q, m, &rt, lo, hi, cand2);
+				renumbered &= nc2 == nc;
+				for (c = 0; c < Min(nc, nc2); c++)
+					renumbered &= rb.r.member[cand2[c]] == cand[c] &&
+						(c == 0 || cand2[c - 1] < cand2[c]);
+
+				/*
+				 * the exact candidates among the regions' members are routed
+				 * ones, and the routed ones members; all of them exact ones
+				 * unless the beam missed one of the m nearest
+				 */
+				ne = lionvec_candidates_n(&cc.c, &q, m, lo, hi, ecand);
+				memset(seen, 0, sizeof(bool) * k);
+				for (c = 0; c < nc; c++)
+				{
+					among &= inpick[cand[c]];
+					seen[cand[c]] = true;
+				}
+				for (c = 0; c < ne; c++)
+					among &= !inpick[ecand[c]] || seen[ecand[c]];
+				memset(seen, 0, sizeof(bool) * k);
+				for (c = 0; c < ne; c++)
+					seen[ecand[c]] = true;
+				for (c = 0; c < nc; c++)
+					sub &= seen[cand[c]];
+				subset += sub;
+				nc_route += nc;
+				nc_exact += ne;
+
+				/* the nearest, by the exact distance, as k-means assigns */
+				for (c = 0; c < nc; c++)
+				{
+					double		d = 0.0;
+
+					for (j = 0; j < D; j++)
+					{
+						double		t = (double) x[j] - cent[(Size) cand[c] * D + j];
+
+						d += t * t;
+					}
+					if (best < 0 || d < bestd)
+					{
+						best = cand[c];
+						bestd = d;
+					}
+				}
+				if (m == 1)
+					match += best == nearest_exact(x, cent, k, D, NULL);
+			}
+		}
+		CHECK(renumbered, "numbered region by region, a row is routed elsewhere");
+		CHECK(among, "a route's candidates are not its regions' exact ones");
+		CHECK(subset >= 2L * nq * 97 / 100,
+			  "a route's candidates are not the exact candidates for 97% of rows");
+		CHECK(match >= (long) nq * 97 / 100,
+			  "a route's nearest is not the nearest for 97% of rows");
+		printf("vec_test: regions: %d of %d centroids, beam %d: the nearest for %.2f%% of rows, "
+			   "candidates exact ones for %.2f%%, %.1f routed and %.1f exact candidates a row\n",
+			   n, k, lionvec_region_beam(n, 1), 100.0 * match / nq, 100.0 * subset / (2 * nq),
+			   (double) nc_route / (2 * nq), (double) nc_exact / (2 * nq));
+	}
+
+	/* an empty region: never picked, and the route still finds m */
+	{
+		LionVecRegions re = rb.r;
+		int		   *first = (int *) xmalloc(sizeof(int) * (n + 1));
+		bool		fine = true;
+
+		/* region 0's members given to region 1 */
+		memcpy(first, rb.r.first, sizeof(int) * (n + 1));
+		first[1] = 0;
+		re.first = first;
+		for (i = 0; i < 200; i++)
+		{
+			int			nc;
+			int			np;
+			int			c;
+
+			lionvec_query_init(&q, LIONVEC_L2, mean, queries + (Size) i * D,
+							   LIONVEC_ASSIGN_EPS);
+			nc = lionvec_route(&re, &cc.c, &q, LIONVEC_SOAR_CANDS + 1, &rt, lo, hi,
+							   cand);
+			np = lionvec_regions_pick(rt.key, first, n, lionvec_region_beam(n, LIONVEC_SOAR_CANDS + 1),
+									  LIONVEC_SOAR_CANDS + 1, rt.order, rt.pick);
+			fine &= nc >= LIONVEC_SOAR_CANDS + 1;
+			for (c = 0; c < np; c++)
+				fine &= rt.pick[c] != 0;
+		}
+		CHECK(fine, "an empty region picked, or too few candidates");
+		free(first);
+	}
+
+	/*
+	 * k-means routed through regions: by chunks, in two "processes", the
+	 * same to the bit, the regions too; repeatable; and as good as exact
+	 * k-means, by the rows' squared distances from their centroids
+	 */
+	{
+		LionVecKmeansWork w2;
+		int		   *assign0 = (int *) xmalloc(sizeof(int) * nrows);
+		int			chunks[3] = {1, 32, nrows};
+		int			unit;
+
+		for (unit = 0; unit <= 1; unit++)
+		{
+			int			made0;
+			int			c;
+			double		cost[2] = {0.0, 0.0};
+			int			pass;
+
+			kmeans_work(&w, nrows, k, D);
+			route_alloc(&w.route, n, k);
+			made0 = lionvec_kmeans(&sm.s, k, 6, unit, 42, mean, cent2, &w, &rb.r,
+								   &rb.mk);
+			memcpy(assign0, w.assign, sizeof(int) * nrows);
+			for (c = 0; c < 3; c++)
+			{
+				int			made1 = kmeans_by_chunks(&sm, k, 6, unit, mean, cent, &w,
+													 chunks[c], &rb2.r, &rb2.mk);
+
+				CHECK(made1 == made0 &&
+					  memcmp(cent, cent2, sizeof(float) * k * D) == 0 &&
+					  memcmp(w.assign, assign0, sizeof(int) * nrows) == 0 &&
+					  regions_same(&rb.r, &rb2.r),
+					  "routed k-means by chunks is not routed k-means");
+			}
+			(void) lionvec_kmeans(&sm.s, k, 6, unit, 42, mean, cent, &w, &rb.r,
+								  &rb.mk);
+			CHECK(memcmp(cent, cent2, sizeof(float) * k * D) == 0,
+				  "routed k-means is not repeatable");
+
+			/* no regions (fewer than LIONVEC_REGION_MIN): exact k-means */
+			{
+				LionVecRegions none = rb.r;
+
+				none.n = 0;
+				(void) lionvec_kmeans(&sm.s, k, 6, unit, 42, mean, cent, &w, &none,
+									  &rb.mk);
+				memcpy(cent2, cent, sizeof(float) * k * D);
+				(void) lionvec_kmeans(&sm.s, k, 6, unit, 42, mean, cent, &w, NULL,
+									  NULL);
+				CHECK(memcmp(cent, cent2, sizeof(float) * k * D) == 0,
+					  "k-means with no regions is not exact k-means");
+			}
+
+			/* the cost of each: exact, then routed */
+			for (pass = 0; pass < 2; pass++)
+			{
+				(void) lionvec_kmeans(&sm.s, k, 6, unit, 42, mean, cent, &w,
+									  pass == 0 ? NULL : &rb.r,
+									  pass == 0 ? NULL : &rb.mk);
+				for (i = 0; i < nrows; i++)
+				{
+					double		d;
+
+					(void) nearest_exact(dec + (Size) i * D, cent, k, D, &d);
+					cost[pass] += d;
+				}
+			}
+			CHECK(cost[1] <= cost[0] * 1.02, "routed k-means is worse than exact k-means");
+			printf("vec_test: regions: k-means%s of %d rows into %d: routed %.4f of exact's cost\n",
+				   unit ? " (spherical)" : "", nrows, k, cost[1] / cost[0]);
+			route_free(&w.route);
+			kmeans_work_free(&w);
+		}
+		(void) w2;
+		free(assign0);
+	}
+
+	query_free(&q);
+	route_free(&rt);
+	cent_codes_free(&cc2);
+	cent_codes_free(&cc);
+	region_bufs_free(&rb2);
+	region_bufs_free(&rb);
+	sample_free(&sm);
+	free(ident);
+	free(seen);
+	free(inpick);
+	free(ecand);
+	free(cand2);
+	free(cand);
+	free(hi);
+	free(lo);
+	free(y);
+	free(cent2);
+	free(cent);
+	free(mean);
+	free(dec);
+	free(queries);
+	free(rows);
+}
+
 int
 main(void)
 {
@@ -2826,6 +3604,10 @@ main(void)
 	test_soar_algebra();
 	test_soar_clustered();
 	test_coverage();
+	/* last, so that the others' rows are what they were before these */
+	test_subsample();
+	test_candidates_among();
+	test_regions();
 
 	printf("vec_test: %ld checks, %ld failed\n", nchecks, nfail);
 	return nfail == 0 ? 0 : 1;
