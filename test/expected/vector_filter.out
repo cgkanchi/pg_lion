@@ -618,6 +618,8 @@ SET pg_lion.vector_exact_rows = 0;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
+-- (with no prefetch, whose counts the line would add: vector_scan_parallel)
+SET pg_lion.vector_prefetch = off;
 SET client_min_messages = debug1;
 SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 10
 					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10) s;
@@ -637,6 +639,7 @@ DEBUG:  lionvec scan of "vfb_l2": 4000 members fetched, 10 returned
 (1 row)
 
 RESET client_min_messages;
+RESET pg_lion.vector_prefetch;
 SELECT pg_stat_force_next_flush();
  pg_stat_force_next_flush 
 --------------------------

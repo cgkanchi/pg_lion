@@ -328,6 +328,8 @@ SET pg_lion.vector_exact_rows = 0;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
+-- (with no prefetch, whose counts the line would add: vector_scan_parallel)
+SET pg_lion.vector_prefetch = off;
 SET client_min_messages = debug1;
 SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 10
 					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10) s;
@@ -335,6 +337,7 @@ SET pg_lion.vector_exact_per_partition = 10;
 SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 200
 					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10) s;
 RESET client_min_messages;
+RESET pg_lion.vector_prefetch;
 SELECT pg_stat_force_next_flush();
 SELECT pg_stat_clear_snapshot();
 SELECT vfb_blks() AS b7 \gset

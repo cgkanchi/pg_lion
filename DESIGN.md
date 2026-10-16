@@ -20227,8 +20227,9 @@ dimensions, not 4`, and a query of other dimensions `different vector dimensions
 `LIONVEC_MAX_DIM` dimensions, 8128 at 8K pages, as many whole 64-bit words as leave a REFINE item a
 page; pgvector's HNSW and IVFFlat take 2000. Single-column, no INCLUDE, no search operators
 (`amoptionalkey`: a query with no WHERE at all is the point), forward only (`amcanbackward =
-false`: a SCROLL cursor gets a Material node), no bitmap scans, no parallel scan; built in
-parallel (§44.12).
+false`: a SCROLL cursor gets a Material node), no bitmap scans. Scanned in parallel
+(`amcanparallel`, with `amestimateparallelscan`, `aminitparallelscan` and `amparallelrescan`:
+§44.4, "A parallel scan") and built in parallel (§44.12).
 
 ### 44.2 Format (lion_vec.h)
 
@@ -20856,6 +20857,137 @@ before costs, it carries two disabled nodes, as pgvector's do: without them it b
 disabled by `enable_seqscan = off`, and a count(*) failed as an index-only scan, found by the
 insert spec of §44.10), walks every row.
 
+**Prefetch** (2026-10-16). A cold scan waits on its reads one at a time: a probe reads a
+partition's CODE chain a page after another, a refine a REFINE page, an exact distance a heap page
+and its vector's TOAST pages, and none starts before the one before it is in. While
+`pg_lion.vector_prefetch` is on (§44.8) the scan asks for the pages it will read next before it
+reads them, through `PrefetchBuffer()`: as many ahead as the relation's tablespace's
+`effective_io_concurrency`, to `LIONVEC_PREFETCH_MAX` (64), `so->ipf` pages of the index and
+`so->hpf` of the heap, 0 asking for none (`lv_start_prefetch()`). `PrefetchBuffer()` pins nothing
+and is `posix_fadvise()` under it on 16 to 19 alike, whatever 18's `io_method`: the kernel reads
+the pages into its cache meanwhile, and the scan's `ReadBuffer()` finds them there. It is a hint,
+never a read, so the rows a scan returns and their order are the same with it on or off, and so is
+every count of the DEBUG1 line but the two it adds, `N pages prefetched (M not in shared
+buffers)`, M the pages `PrefetchBuffer()` did not find in shared buffers, which the kernel may
+still hold. It asks for:
+
+- the rest of a chain the build wrote. The build writes each partition's CODE chain in blocks one
+  after another, and its PART item counts its items, so its first `lionvec_chain_pages()` pages at
+  `lionvec_page_items()` items a page (`so->pnrows`, kept by `lv_read_parts()` beside the heads)
+  lie from its head on: reading block b of that run a probe asks for those to b + dist
+  (`lionvec_prefetch_end()`), and once a page's next is not b + 1 for no more of the chain, the
+  pages inserts appended lying a page here and there. The PART chain, which every scan reads
+  whole, likewise, its pages counted from the partitions', and a walk's chains for as long as each
+  runs on block after block; not a probe's of the REST chain, whose length nothing records.
+- the queues' next pages: the REFINE pages of the centroids at the top of the partition queue
+  (`LV_CENT1`) and of the rows at the top of the row queue (`LV_PLANE1`), and the heap blocks of the
+  rows whose exact distances come next (`LV_CODES8`). Of a queue's first `LV_PF_TOP(dist)` = 4 dist
+  + 1 entries, which hold its least (a binary heap's first levels), the dist least at the level
+  (`lionvec_least()`), after `lv_read_parts()`, after each probe, and again once half as many
+  entries at that level as the last look chose have come out, so that what was asked for stays
+  about dist ahead (`lv_prefetch_due()`). Of the row queue only the rows the scan works before its
+  next probe, keyed below the next partition's key or the end of a pause if later
+  (`lv_prefetch_bound()`): a look at the least 64 rows after every probe asked for 2,941 REFINE
+  pages of a DBpedia scan that refined 97 rows. An entry asks once at a level (`pf`, cleared when it
+  moves on), however many looks find it near the top, and a table of the 128 blocks of each
+  relation last asked for, by hash, keeps a page that several entries share - five centroids'
+  REFINE items to a page at 1536 dimensions - from being asked for again.
+- the exact path's members (`lv_exact()`), in TID order, each one's heap block dist members
+  before its fetch, a block's members asking once.
+
+The heap is asked for only when it is the heap access method's, whose TIDs name its blocks, and
+its vectors lie in its pages (`lv_vector_inline()`): stored `PLAIN` or `MAIN`, or small enough,
+within `TOAST_TUPLE_THRESHOLD` (2,032 bytes at 8K pages: 506 dimensions of `vector`, 1,012 of
+`halfvec`). Past it pgvector's `EXTERNAL` storage puts a vector in TOAST, which a fetch reaches
+through the TOAST index, the heap page the least of what it reads; asked for alone, on DBpedia's
+1536 dimensions, the heap pages bought nothing, the exact path cold taking 113 ms a query under
+the 1% filter against 109 without. Reading a toasted vector's chunks ahead needs its TOAST
+pointer, from the heap tuple, first (§44.11).
+
+Measured (§44.9, "Prefetch and parallel scans"): cold, each query alone after a restart with the
+page cache dropped, a serial scan at a margin of 3 took 17.4 ms against 21.2 without (its wait on
+reads, by `track_io_timing`, 11.4 ms against 17.7, for 410 pages from the kernel), at a margin of
+8 32.4 against 49.4 (20.6 against 41.9, for 972 pages), and the exact path over vectors kept in
+the heap, under a 1% filter, 33.5 against 70.6 (11.0 against 64.8, for 1,213 pages). Warm, every
+page in shared buffers, an ask is a lookup of a page that is there already, 4 to 9% of a scan when
+every page was asked for (2.39 ms against 2.29 at a margin of 3, 5.51 against 5.06 at 8). So the
+scan watches what its asks of each relation find (`LvPrefetch`): after `LV_PF_WARM` (32) asks in a
+row that found their page in shared buffers it lets the next `LV_PF_DORMANT` (256) asks pass
+unasked, then asks again. A cold relation is asked for all along, a warm one a ninth as often
+(a margin-8 scan asks for 65 pages rather than 880), and one warm in parts loses at most 256 asks
+at a time; the PART chain, which every scan reads and so is warm whatever else is, does not count.
+Warm it then costs about 2%: 2.33 ms against 2.29 at a margin of 3 and 4.99 against 4.91 at 8.
+
+**A parallel scan** (2026-10-16). `amcanparallel`: an unfiltered `ORDER BY` of the distance may be
+a Parallel Index Scan under a Gather Merge (§44.7 prices it; a filtered one stays serial, below).
+Each participant - every worker, and the leader unless `parallel_leader_participation` is off -
+runs the whole scan above on its own: it reads the meta page and the PART chain, ranks every
+centroid, and keeps its own queues, tau, tiers, pause and progress hash, returning its rows in the
+order of their distances, each with its distance in `xs_orderbyvals`, which Gather Merge merges
+into one order. What the participants share is whose each chain is. `LvShared`, in the area core
+gives the access method after the `ParallelIndexScanDesc` (at `ps_offset`, `ps_offset_am` from 18),
+holds a claim bit a chain - partition p's bit p, then the REST chain's and the NULL chain's - and a
+participant probes a partition only if its `pg_atomic_fetch_or_u32()` found the bit clear
+(`lv_claim()`, in `lv_probe_part()`), and drops one another has claimed as it comes out of its
+queue (`lv_claimed()`), before reading the centroid's REFINE item, counting it neither among its
+probes nor in `so->probed`. The bits are `LIONVEC_MAX_PARTS` + 2, 32 KB, the most `check_meta()`
+allows, as before 18 the estimate cannot see the index. So each partition is probed by one
+participant and each of its rows returned by that one, in that one's order, and the merged order is
+in distance as the serial scan's is: a row leaves its participant when nothing in that
+participant's queues, nor in a partition it may still claim, is nearer by the bounds, and the other
+participants' rows reach Gather Merge in their own order. The REST chain is the first participant's
+to reach `lv_start()`, and a REST pass probes again the chains its participant probed, for four
+times the rows. The walks claim chain by chain the same way (`lv_walk_claim()`), so a walk through
+the index returns every row once; the NULL chain is claimed once a scan, by the first walk to reach
+it, and that participant walks both its zero vectors and its NULLs, whose NaN and NULL distances
+sort after every other participant's rows. `amparallelrescan`, which core calls with no worker
+running, clears the area. A restricted scan (LionOrdered's, §44.6) is never parallel, which
+`lv_start()` asserts: LionOrdered's paths are not partial, and under `pg_lion.vector_postfilter`
+`exact` or `error` a partial path that a Filter would follow is removed as the serial one is
+(§44.7).
+
+In an index that spills (§44.3) a row's two items lie in two partitions, which two participants
+may claim, each then finding the row. So `LvShared` holds the rows returned as well, an
+open-addressed set of 32,768 TIDs (256 KB), each slot set once by a compare-and-swap from zero:
+the participant that records a row first returns it and the other drops it (`lv_take_row()`; `rows
+another returned` in its DEBUG1 line, 3 to 7 a query on DBpedia). A row that finds none of its 32
+slots free nor its own is returned through its own item and not its copy - one partition holds a
+row's own item, and one participant that partition - so it never comes out twice, whatever the
+set holds, and is missed only where no participant probes its own partition.
+
+The stop rules stay each participant's own, over the partitions it claimed and the rows it found.
+A row's place in its participant's order needs nothing else, and a bound shared between the
+participants - the least tau of all, so that one stops where another's rows already lie nearer
+than its next partition, as the serial scan stops on all of its rows - would put a heap of upper
+bounds that every probe updates between them, and make one participant's pause hang on the
+others' rows. The hope was that each participant, scoring about a share of the rows and finding a
+share of the nearest, would pause where the serial scan does in its own count, so that together
+they probe about what it probes. They do not: its rows are its own partitions' and so lie
+farther, which carries the margin farther down the order, and the patience is a count of rows,
+which a participant scores at the serial scan's rate. On DBpedia at a margin of 3 each of two
+participants probed 29 partitions and each of four 33, where the serial scan probed 36, so
+together 1.6 and 3.7 times its partitions - and they found more of the nearest rows for it, 0.935
+and 0.9515 of the ten nearest against 0.919. To that recall the serial scan, at a wider margin,
+probes 1.24 times fewer partitions than two participants (at a margin of about 3.7) and 2.0
+times fewer than four (4.6), and as many times fewer CODE pages; at a margin of 8 two
+participants' 0.994 cost 1.03 times the serial scan's partitions for it (at about 15), and four's
+0.996 lies past the serial scan's best measured (0.9945 at 16, from 382 partitions to their 791).
+That is the ratio a shared bound would win back, which §44.11 leaves to it.
+
+The executor runs the workers ahead of the leader. A worker does not wait to be asked: it runs
+its scan and puts each row in its tuple queue until the queue is full or the leader ends the
+query, while Gather Merge waits first for a row from every participant and then takes the least
+of their heads. So under a LIMIT 10 the participants together returned 17.3 rows a query with two
+participants and 36.8 with four, against the serial scan's 11 (the query's own row is filtered
+out), and computed 24.3 and 54.2 exact distances against 11.8: the executor's model, not the
+scan's, which cannot know how many rows the leader will take. And the first row waits for the
+slowest participant's first, each having ranked every centroid and probed to its own rules, and
+for the workers' start, about 10 ms a query here: warm, under `EXPLAIN (ANALYZE, VERBOSE)`, the
+Gather Merge's first row came at a median of 12.1 ms with one worker and 14.7 with three, where
+each worker's own first row came 1.6 and 2.1 ms into its scan and the serial scan's 0.6 ms into
+its (an assert-enabled build, pg_lion preloaded, pgvector loaded by each worker). The parallel
+scans took 5 and 8 times as long as the serial one (§44.9).
+
 ### 44.5 Concurrency, WAL and VACUUM
 
 - **Insert** (`lionvec_append()`): under the meta page's exclusive lock, which serializes inserts,
@@ -21127,6 +21259,33 @@ further hundred rows, measured at 115,000 rows, not 0.06 of one); there the filt
 LionOrdered's or a sort's with no constant changed. `LIONVEC_DEEPER_PAUSED` still prices an
 unfiltered scan's deeper batches, and the plain scan under `allow`.
 
+**A parallel scan** (2026-10-16; §44.4). `cost_index()` asks `lionveccostestimate()` for the
+index's cost before it counts the path's workers, and of the result divides only its own CPU part
+by the parallel divisor, so a partial path came out at about the serial scan's price.
+`lion_ordered_set_rel_pathlist()`, the `set_rel_pathlist_hook`, which runs before core makes its
+Gather paths, takes each partial lionvec path out of the relation's partial paths and offers it
+again (`lo_knn_partial()`, so that `add_partial_path()` orders and prunes them by the cost they now
+have) at `lion_vec_parallel_cost()`'s: the ranking of every centroid, `nparts` x
+`LIONVEC_ROW_OPS` x `cpu_operator_cost`, which every participant pays, in full; the rest of the
+start-up and every row after it over the divisor - costsize.c's `get_parallel_divisor()`, which
+is static there and so copied (`lionvec_parallel_divisor()`): the workers, and while the leader
+takes part 1 less 0.3 a worker, none from four workers on. On DBpedia's 2,717 partitions at
+`random_page_cost` 1.1 the serial start-up is 584.79, of which the ranking is 2,717 x 2 x 0.0025 =
+13.585: with two workers (a divisor of 2.4) a partial path starts at 13.585 + 571.205 / 2.4 =
+251.59, with three (3.1) at 197.84, as EXPLAIN shows. Gather Merge adds `parallel_setup_cost`
+(1,000) and `parallel_tuple_cost` (0.1) a row, so at the default costs no parallel scan of this
+index is chosen, its setup alone costing more than the serial scan's start-up - and rightly, the
+parallel scans having run 4 to 8 times slower (§44.9). The workers are core's,
+`compute_parallel_worker()`'s: from `*indexPages`, which is the CODE pages a scan reads, against
+`min_parallel_index_scan_size` (512 kB), and from the heap pages the rows' fetches would read,
+against `min_parallel_table_scan_size` (8 MB) - DBpedia's heap is 768 pages, its vectors in TOAST,
+and gets none without lowering it - unless the table's `parallel_workers` says how many, and at
+most `max_parallel_workers_per_gather`. Under `pg_lion.vector_postfilter` `exact` or `error`
+`lo_knn_take()` removes a partial path that a Filter would follow as it removes the serial one
+(§44.6, "Post-filtering": a Gather Merge over a Parallel Index Scan with a Filter is the same
+post-filter), with nothing to bring back for it, a partial sequential scan having no pathkeys it
+could have lost to; LionOrdered's paths are serial.
+
 ### 44.8 Settings
 
 - `pg_lion.vector_margin` (real, -10 to 1000, default 3): how much nearer than its centroid a
@@ -21197,6 +21356,20 @@ unfiltered scan's deeper batches, and the plain scan under `allow`.
   away, not the rule: under `exact` or `error` a filtered query then gets an exact plan, or the
   error. A pseudoconstant clause, tested once by a gating Result, and one a partial lionvec
   index's predicate implies are no filter here.
+- `pg_lion.vector_prefetch` (boolean, default on; 2026-10-16): whether a scan asks for the pages
+  it will read next before reading them (§44.4, "Prefetch"), as many ahead as the tablespace's
+  `effective_io_concurrency` (a query's setting; `maintenance_io_concurrency` is not read), to 64;
+  an `effective_io_concurrency` of 0 asks for none either way. The rows a scan returns, and their
+  order, are the same on or off. On DBpedia (§44.9), each query alone cold, it took a serial scan
+  at a margin of 8 from 49.4 ms to 32.4 and the exact path over vectors kept in the heap from 70.6 ms
+  to 33.5 under a 1% filter; warm, every page in shared buffers, it costs about 2% (2.29 to 2.33 ms
+  at a margin of 3, 4.91 to 4.99 at 8): a scan whose asks keep finding their pages in shared
+  buffers mostly stops asking (§44.4, "Prefetch"). Off where that is not worth having.
+- core's `max_parallel_workers_per_gather`, `parallel_setup_cost`, `parallel_tuple_cost`,
+  `min_parallel_index_scan_size`, `min_parallel_table_scan_size` and the table's
+  `parallel_workers`: whether an unfiltered scan runs in parallel, and in how many processes
+  (§44.7, "A parallel scan"). At the defaults it does not: the setup costs more than a serial
+  scan's start-up.
 - `partitions` (reloption, 0 to 262,144, default 0; 1,000,000 until a review found the build at a
   million partitions days long and uncancellable, then 65,536 until the regions, §44.3): the
   partitions the build makes; 0 chooses by the rows' count, `8 sqrt(n)` above 10,000 rows as
@@ -21684,6 +21857,118 @@ above - and 5% of the 115,186 (2.12) and 3% of the million (3.75) are probed. An
 too few for the ratio to say. Through the planner it does not show yet at 2% and 3% here, where
 the exact path's price sends it to the plain scan with a `Filter` (§44.7).
 
+**Prefetch and parallel scans** (2026-10-16; §44.4, "Prefetch" and "A parallel scan"). DBpedia's
+115,386 rows as above in `dbp(id, v vector(1536))`, the cosine index of 2,717 partitions spilling
+(format 4, 247 MB; its heap 768 pages, the vectors in TOAST); the 200 queries are rows of the table,
+each kept out of its own answer by `WHERE id <> q` under `pg_lion.vector_postfilter = allow`, a
+Filter over the scan, the truth the numpy ten nearest of the others. PostgreSQL 18.6 built with
+assertions, pgvector 0.8.7, 4 vCPUs, 15 GB, `shared_buffers` 3 GB, `work_mem` 64 MB,
+`effective_io_concurrency` 200 (so 64 pages ahead), `io_method` worker, `random_page_cost` 1.1,
+`max_parallel_workers` 4; the disk a virtio device, about 55 us a page read cold. LIMIT 10;
+participants 1 (serial), 2 (a worker and the leader) and 4 (three and the leader), the parallel
+plans forced by `parallel_setup_cost`, `parallel_tuple_cost`, `min_parallel_index_scan_size` and
+`min_parallel_table_scan_size` at 0. Warm: `pg_prewarm` of the index and the table, a first pass
+under `EXPLAIN (ANALYZE, BUFFERS)` (the pages, shared hit and read, workers' included), a second
+timed by the client, the median and 95th percentile of the 200, with the scans' DEBUG1 lines on
+(the partitions probed, CODE pages read, rows returned and fetched and pages prefetched, summed over
+a query's participants):
+
+| Margin | Participants | Recall | Prefetch off, ms (p95) | on | Partitions | CODE pages | Pages | Returned, fetched | Prefetched |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 3 | 1 | 0.919 | 2.18 (4.37) | 2.39 (4.89) | 35.7 | 116 | 519 | 11.0, 11.8 | 325 |
+| 3 | 2 | 0.935 | 11.07 (15.12) | 11.62 (17.03) | 58.3 | 188 | 1,072 | 17.3, 24.3 | 666 |
+| 3 | 4 | 0.9515 | 17.09 (25.00) | 16.21 (22.01) | 131.7 | 418 | 2,756 | 36.8, 54.2 | 1,712 |
+| 8 | 1 | 0.9845 | 4.94 (7.70) | 5.20 (8.56) | 163.4 | 510 | 1,291 | 11.0, 11.5 | 880 |
+| 8 | 2 | 0.994 | 20.12 (30.52) | 21.52 (36.48) | 373.4 | 1,141 | 3,110 | 18.2, 23.3 | 2,143 |
+| 8 | 4 | 0.996 | 24.67 (35.46) | 27.28 (40.08) | 790.6 | 2,365 | 8,299 | 37.9, 48.6 | 5,738 |
+
+The counts are prefetch off's; on, the serial scans' are the same to the row, and the parallel
+ones' within 3% (0.9535 and 0.9955 of the ten nearest at four), which participant claims a
+partition first changing from run to run. None of the pages prefetched warm was missing from
+shared buffers. The serial scan at other margins, warm, for the recall a parallel scan returns:
+
+| Margin | 4 | 5 | 6 | 10 | 12 | 16 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Recall | 0.9425 | 0.958 | 0.973 | 0.990 | 0.992 | 0.9945 |
+| Partitions | 52.4 | 74.6 | 98.2 | 231.4 | 289.0 | 382.2 |
+| CODE pages | 169 | 239 | 311 | 717 | 891 | 1,171 |
+| Pages | 623 | 757 | 900 | 1,681 | 2,003 | 2,505 |
+| ms | 2.76 | 2.58 | 3.61 | 6.25 | 7.02 | 8.26 |
+
+Interpolated to the recall of each parallel scan at a margin of 3, the serial scan probes 47.1
+partitions for two participants' 0.935 and 65.3 for four's 0.9515 (margins of about 3.7 and 4.6),
+so the parallel scans probe 1.24 and 2.0 times as many and read as many times the CODE pages, and
+1.8 and 3.9 times the pages in all, each participant reading the PART chain and its centroids'
+REFINE pages for itself; at a margin of 8 two participants' 0.994 is 1.03 times the serial scan's
+partitions at about 15 (1.29 times its pages), and four's 0.996 lies past the serial scan's best
+measured, 0.9945 at 16 from 382 partitions to their 791. In time the parallel scans lose
+everywhere: 4.3 and 6.4 times the serial scan's at the same recall at a margin of 3, 2.5 times
+two participants' at 8. Each participant ranks all 2,717 centroids and probes to its own stop,
+Gather Merge waits for the slowest one's first row, and the workers are started for each query,
+about 10 ms before their first row (§44.4).
+
+The planner, at its default costs with `max_parallel_workers_per_gather` 3: the serial scan,
+584.79..599.57 for the LIMIT, also with `min_parallel_table_scan_size` 0 (without which the
+768-page heap gets no workers); with `parallel_setup_cost` 0 as well, a Gather Merge of two
+workers, 251.61, and of three with the tuple cost and `min_parallel_index_scan_size` 0 too,
+197.88 (§44.7's arithmetic). So at the default costs it never picks the parallel scan, which is
+what the times say.
+
+Cold, one pass over the 200 queries after a restart with the page cache dropped (the server's
+time under `EXPLAIN (ANALYZE, BUFFERS)` with `track_io_timing`, its mean, and the pages read from
+the kernel): nearly every query after the first few found the PART chain and most centroids in
+shared buffers, so this is a warm scan's time plus its own partitions' reads. Serially at a margin
+of 3, 115 pages read, 8.54 ms against 7.27 with prefetch (its wait 6.4 ms against 4.4); at 8, 124
+pages, 9.78 against 9.42 (5.23 against 4.41). In parallel, 151 to 204 pages, 20.2 against 18.8
+(two at 3), 20.2 against 20.0 (four at 3), 30.0 against 27.7 and 32.2 against 31.6 (two and four
+at 8). Each query alone cold, the server restarted and the page cache dropped before each (12
+queries, prefetch off and then on for one query and on and then off for the next, paired; the
+server's mean, the wait on reads by `track_io_timing`, and the paired difference with its
+standard error):
+
+| Each query alone, cold | Pages read | Prefetch off, ms | on | Wait, off | on | Off less on | On faster |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| serial, margin 3 | 410 | 21.2 | 17.4 | 17.7 | 11.4 | 3.8 +- 1.2 | 9 of 12 |
+| serial, margin 8 | 972 | 49.4 | 32.4 | 41.9 | 20.6 | 17.0 +- 4.1 | 10 of 12 |
+| two participants, margin 3 | 591 | 37.2 | 28.3 | 28.4 | 15.5 | 8.8 +- 2.0 | 11 of 12 |
+| LionOrdered, 10% (below) | 922 | 44.5 | 37.0 | 33.3 | 20.6 | 7.5 +- 2.2 | 10 of 12 |
+
+Seven queries each, unpaired, gave the rest: four participants at a margin of 3, 41.5 ms either
+way; two and four at 8, 74.0 against 69.1 and 86.1 against 74.6. Cold too the parallel scans are
+slower than the serial one, reading 1.4 to 3.1 times its pages from the kernel.
+
+Under filters, through LionOrdered, on a copy of the rows (`dbpf`: the 115,186 other than the
+queries, `u` uniform in [0, 1) by `default_rng(42)`, a lion index on it, its own lionvec index of
+2,715 partitions, 247 MB; the truth by numpy among each filter's rows), serially, at the default
+margin. At 10% (11,377 rows) the planner's plan is LionOrdered, probing: 0.954 of the ten nearest,
+141.6 partitions, 447 CODE pages, warm 9.58 ms against 8.80 with prefetch (732 pages asked for);
+each query alone cold, 44.5 against 37.0 (above). At 3% and 1%
+(3,472 and 1,204 rows) the planner sorts the lion bitmap scan's rows, exact, 27.5 and 9.0 ms warm;
+LionOrdered, forced, takes the exact path, 27.1 and 8.4 ms warm, and asks for nothing, the vectors
+being in TOAST - its cold times, 263 against 256 ms at 3% and 97 against 111 at 1%, are the noise
+of seven cold queries. The same copy with its vectors in the heap (`dbpi`, `STORAGE PLAIN`, a row a
+page, 900 MB and its own index), each query alone cold, ten queries paired as above:
+
+| LionOrdered | Pages read | Prefetch off, ms | on | Wait on reads, off | on |
+| --- | --- | --- | --- | --- | --- |
+| exact, 1% | 1,213 | 70.6 | 33.5 | 64.8 | 11.0 |
+| exact, 3% | 3,493 | 208.3 | 103.0 | 194.9 | 36.9 |
+| probed, 10% | 844 | 44.9 | 36.1 | 30.8 | 17.7 |
+| unfiltered (index scan) | 344 | 15.1 | 12.2 | 12.6 | 7.2 |
+
+The same rows either way. The exact path asks for each member's heap page 64 members ahead, and
+its wait on reads fell by five sixths, its time by half: the rest is the reads' own CPU and the
+fadvise calls, one a page. Warm there it took 2.62 against 2.80 ms at 1%, 8.20 against 8.89 at 3%,
+11.52 against 10.89 probing at 10% and 1.28 against 1.28 unfiltered (the server's medians).
+Warm on `dbp`, paired (six rounds of the 200 queries, off and on in turn, the median of the
+rounds' client medians): with every page asked for, a serial scan at a margin of 3 took 2.29 ms
+against 2.39 with prefetch, at 8 5.06 against 5.51, two participants at 3 11.98 against 11.71: 4
+and 9% serially, the lookups in shared buffers of pages already there and the looks into the
+queues, and in parallel less than the noise. Asking no more once the asks keep finding their pages
+there (§44.4, "Prefetch": dormant for 256 asks after 32 found), the same rounds gave 2.29 against
+2.33 at a margin of 3, 4.91 against 4.99 at 8 and 10.67 against 10.81 with two participants: about
+2%, a margin-8 scan asking for 65 pages rather than 880.
+
 ### 44.10 Tests
 
 - **test/unit/vec_test.c** (`make unit`, and under ASan and UBSan with `SANITIZE=1`), against the
@@ -21751,7 +22036,12 @@ the exact path's price sends it to the plain scan with a `Filter` (§44.7).
   (100%), its routed nearest the exact one for at least 97% (100%), and no empty region picked; and
   k-means routed, by chunks of 1, 32 and all against `lionvec_kmeans()` with regions, to the bit,
   regions included, the same again from the same seed, without regions the exact k-means, and its
-  cost within 2% of the exact one's (1.0000).
+  cost within 2% of the exact one's (1.0000). Prefetch (§44.4): `lionvec_items_per_page()` and
+  `lionvec_chain_pages()` at their edges (no room, no items, a page's worth and one more, 2^32 - 1
+  items), `lionvec_prefetch_end()`'s window - dist pages after the block, short of the run's end,
+  never before the next block, and no block number wrapping at 2^32 - and `lionvec_least()`
+  against `lionvec_rank()`'s set over 2,000 sets of keys with ties, NaN and infinities, each key
+  kept before every key left out.
 - **vector.sql**: every ORDER BY run through the index and through a sequential scan and sort,
   compared distance by distance and row by row, with `pg_lion.vector_margin = 100` and the pause
   off, for each metric, three queries and LIMITs 1 to past the table, over 3,000 rows in 20
@@ -21882,6 +22172,26 @@ the exact path's price sends it to the plain scan with a `Filter` (§44.7).
   meta page and PART items - the centroids, counts, spreads and longest rows - a serial build's.
   On PostgreSQL 16, whose core says "serially" of every build but btree's, the
   expected output is vector_parallel_1.out.
+- **vector_scan_parallel.sql** (2026-10-16): the parallel scan (§44.4, "A parallel scan"), forced
+  (no setup or tuple cost, no least sizes, the table's `parallel_workers` at 2) and shown with the
+  sequential and bitmap scans and the sort disabled, over 3,000 rows of 24 dimensions in ten
+  clusters, NULL vectors and a zero vector among them, in 20 partitions for each metric, spilling:
+  the plans, a Gather Merge over a Parallel Index Scan of the operator's index; at the margin of
+  100 with the pause off, each metric's distances in order and rows against a sort's (`ps_cmp()`,
+  run whole by `EXECUTE`, as a PL/pgSQL loop over a query never runs in parallel), near a cluster
+  and far from all, at LIMITs 1, 10 and 300 and none, with the leader taking part and not; a NULL
+  query's walk and a cosine zero query's, every row once, and the order's tail - the farthest
+  rows, the zero vector, the NULLs; a Gather Merge on a nested loop's inner side, run twice
+  (`amparallelrescan`), the nearest three each time; an index that does not spill; `halfvec`;
+  filters under `pg_lion.vector_postfilter = exact`, through LionOrdered or a sort and never a
+  Parallel Index Scan with a Filter, and under `allow` that plan, each with the sort's rows; the
+  prefetch off and `effective_io_concurrency` 0, the same rows in parallel, and serially at the
+  defaults through pauses, passes and LionOrdered's restricted scans, exact and probed; and at the
+  defaults in parallel, each participant stopping by its own rules, the share of the ten nearest
+  over 20 queries for each metric at least 0.9 and within 0.1 of the serial scan's. How many
+  workers start is the server's, and nothing shown depends on it. vector_filter.sql,
+  vector_half.sql and vector_limit.sql turn the prefetch off around their DEBUG1 lines, whose
+  prefetch counts depend on what shared buffers hold.
 
 ### 44.11 Not done
 
@@ -21916,8 +22226,22 @@ the exact path's price sends it to the plain scan with a `Filter` (§44.7).
   parallel scan's tens of milliseconds from memory (arithmetic on two sizes, not measured).
   Spill (§44.3) is the other lever on the rows read, measured so far at 115,000 rows (§44.9); the
   index over the centroids is still to be built.
-- **Parallel scan.** A probe is a sequential read a parallel scan would split cleanly. (The build
-  is parallel, §44.12.)
+- **What the parallel scan leaves** (§44.4, "A parallel scan"; 2026-10-16). LionOrdered stays
+  serial: its lion set is one process's, and a parallel restricted scan would need the set shared
+  or built in each participant, and a partial path of the node. The stop rules are each
+  participant's own: on DBpedia two and four participants together probed 1.6 and 3.7 times the
+  serial scan's partitions at a margin of 3, 1.24 and 2.0 times what the serial scan probes for
+  the recall they returned, and two 1.03 times at a margin of 8 (§44.9). A bound shared through
+  the parallel area - the participants' least tau, or their tiers' - would win that back, as might
+  a participant's patience counted in its share of the rows; it is worth its shared state only
+  where the probes, not the workers' start and Gather Merge's wait for every participant's first
+  row, are what a parallel scan pays, which on DBpedia they were not. And `PrefetchBuffer()` is a
+  hint the kernel takes in its own time, a `posix_fadvise()` a page: from 17 a read stream
+  (`read_stream_begin_relation()`), with 18's asynchronous I/O under it, would read the chains'
+  and the queues' pages into shared buffers itself, several blocks a read, and hand the scan its
+  buffers pinned - a callback yielding the blocks the prefetch names, on 17 and later, beside
+  this for 16. A vector in TOAST is not read ahead at all: its chunks are found through the TOAST
+  index from the heap tuple's pointer, which a prefetch would have to read first.
 - **sparsevec, bit.** The codes do not care where the floats came from; each needs an operator
   class and a reader for its format, as halfvec has (§44.1).
 - **The double heap fetch.** Each returned row is fetched by the scan for its distance and again by
