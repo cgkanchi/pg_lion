@@ -273,14 +273,16 @@ NaN, as a sort puts them.
 
     CREATE INDEX ON items USING lionvec (embedding vector_cosine_ops) WITH (partitions = 4000);
 
-`partitions` (0 to 65,536) sets how many partitions the build makes; 0, the default, makes one
+`partitions` (0 to 262,144) sets how many partitions the build makes; 0, the default, makes one
 for a table of fewer than 10,000 rows and eight times the square root of the rows' count for a
 larger (8,000 for a million rows), but never more than a sixteenth of the rows the build samples.
-The build runs k-means over a sample of as many rows as half of `maintenance_work_mem` holds (1.5 KB
-a 1536-dimension row, at most about a million rows): the default 64 MB holds about 21,800 rows of
-1536 dimensions, so at most 1,361 partitions; a million rows need 376 MB for their 8,000, and 1 GB
-gives k-means 44 rows a partition. More partitions make a scan score fewer rows and rank more
-centroids, and make the build slower (it grows with the rows times the partitions); they leave the
+The build samples as many rows as half of `maintenance_work_mem` holds (1.5 KB a 1536-dimension
+row, at most 16.8 million rows, 25.8 GB) and runs k-means over at most 128 of them a partition: the
+default 64 MB holds about 21,800 rows of 1536 dimensions, so at most 1,361 partitions; a million
+rows need 376 MB for their 8,000, 1 GB gives k-means 44 rows a partition and 3.2 GB the 128, and a
+billion rows' 252,982 need 12.5 GB. More partitions make a scan score fewer rows and rank more
+centroids, and make the build slower (it grows with the rows times the square root of the
+partitions); they leave the
 pause where it was, as `pg_lion.vector_patience` counts rows, not partitions. The setting takes
 effect at the next `REINDEX`.
 
@@ -713,21 +715,24 @@ A `lionvec` index (DESIGN.md §44) answers only an `ORDER BY` of its own distanc
 It has no search operators, no bitmap or index-only scans, no INCLUDE columns and no parallel scan,
 and indexes a single column of pgvector's `vector` or `halfvec` (not `sparsevec` or
 `bit`) of at most 8128 dimensions. Its results are approximate (`pg_lion.vector_margin`), except under a
-lion filter of up to `pg_lion.vector_exact_rows` rows, or `pg_lion.vector_exact_per_partition` a partition. Inserts serialize on the index's meta page and read every
-lion filter of up to `pg_lion.vector_exact_rows` rows, and under a filter no lion index answers,
-which by default is a sort of the filter's rows (`pg_lion.vector_postfilter`): exact, and as slow
-as reading every matching row. Inserts serialize on the index's meta page and read every
-partition's centroid. VACUUM removes dead rows' codes but reuses their space only for new rows on
+lion filter of up to `pg_lion.vector_exact_rows` rows, or `pg_lion.vector_exact_per_partition` a
+partition, and under a filter no lion index answers, which by default is a sort of the filter's
+rows (`pg_lion.vector_postfilter`): exact, and as slow as reading every matching row. Inserts
+serialize on the index's meta page and read every partition's centroid, or with 64 partitions or
+more the centroids of the partitions' regions and of the partitions in the regions nearest the row
+(16 of them, 5 with `spill = off`). VACUUM removes dead rows' codes but reuses their space only for new rows on
 a chain's last page, so a table with heavy churn grows its index until `REINDEX`, which also
 recomputes the partitions and the mean the codes are centred on (rows that have drifted from them
 make scans read more or miss more, never answer out of order). Building a large index runs k-means
-over every sampled row and every partition, and then compares every row with every partition's
-centroid, so it grows with the rows times the partitions: 19 minutes for a million rows in 2,000
-partitions, and about four times that in the default 8,000. Both steps are shared among
-`max_parallel_maintenance_workers` workers and the build's own process, from PostgreSQL 16, for a
-table of 10,000 rows or more or one whose `parallel_workers` is set (DESIGN.md §44.12): 115,186
-rows of 1536 dimensions in 2,715 partitions built in 125 to 134 s serially and 38 s with three
-workers on four cores. A parallel build holds its sample, up to half of `maintenance_work_mem`,
+over the sampled rows, and then finds every row's partition; both compare a row with the centroids
+of the partitions' regions, about the square root of the partitions' number, and then with those
+of the partitions in the regions nearest it (5 in k-means, 16 for a row and its spill copy), so
+the build grows with the rows times the square root of the partitions (DESIGN.md §44.3). Both
+steps are shared among `max_parallel_maintenance_workers` workers and the build's own process,
+from PostgreSQL 16, for a table of 10,000 rows or more or one whose `parallel_workers` is set
+(DESIGN.md §44.12): 115,386 rows of 1536 dimensions in 2,717 partitions built in 108 s serially
+and 36 s with three workers on four cores, where comparing each row with every centroid took
+292 s and 85 s. A parallel build holds its sample, up to half of `maintenance_work_mem`,
 and the centroids in dynamic shared memory, which Docker limits to 64 MB unless given
 `--shm-size`.
 Each returned row is fetched from the heap twice, once for its distance and once by the executor.
