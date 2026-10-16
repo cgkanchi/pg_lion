@@ -443,8 +443,18 @@ SELECT vec_cmp(format('SELECT id, v <=> %L::vector AS d FROM vt ORDER BY v <=> %
 SET enable_seqscan = off;
 SELECT id FROM vt ORDER BY v <-> '[1,2,3]' LIMIT 1;
 ERROR:  different vector dimensions 40 and 3
+-- with no ORDER BY the index is never scanned, even with sequential scans
+-- off (from 18 it was, as an index-only scan, which failed)
+SELECT count(*) FROM vt;
+ count 
+-------
+  3006
+(1 row)
+
 RESET enable_seqscan;
--- the scan as it goes on past a pass: a batch of one, and passes cut to work_mem
+-- the scan as it goes on past a pass: a batch of one, and passes cut to
+-- work_mem (with room in the progress hash, which hash_mem bounds, for every
+-- row: the next test is the hash's)
 SET pg_lion.vector_batch = 1;
 SELECT vec_cmp('SELECT id, v <-> vt_vec(11, 40) AS d FROM vt ORDER BY v <-> vt_vec(11, 40) LIMIT 300');
      vec_cmp     
@@ -453,6 +463,7 @@ SELECT vec_cmp('SELECT id, v <-> vt_vec(11, 40) AS d FROM vt ORDER BY v <-> vt_v
 (1 row)
 
 SET work_mem = '64kB';
+SET hash_mem_multiplier = 64;
 SELECT vec_cmp('SELECT id, v <#> vt_vec(12, 40) AS d FROM vt ORDER BY v <#> vt_vec(12, 40) LIMIT 2000');
      vec_cmp      
 ------------------
@@ -465,8 +476,59 @@ SELECT vec_cmp('SELECT id, v <-> vt_vec(12, 40) AS d FROM vt ORDER BY v <-> vt_v
  index, 3006 rows
 (1 row)
 
+RESET hash_mem_multiplier;
 RESET work_mem;
 RESET pg_lion.vector_batch;
+-- a scan with no LIMIT whose rows outgrow the progress hash's hash_mem
+-- (128 kB: 1,843 entries, for 3,001 rows) drops what it no longer needs,
+-- and what it can work out again, and returns every row, in order
+SET work_mem = '128kB';
+SET hash_mem_multiplier = 1;
+SELECT vec_cmp('SELECT id, v <-> vt_vec(13, 40) AS d FROM vt ORDER BY v <-> vt_vec(13, 40)');
+     vec_cmp      
+------------------
+ index, 3006 rows
+(1 row)
+
+-- with a work_mem of 64 kB, whose shorter passes need more of the hash, it
+-- cannot go on without growing past hash_mem: by default, an ERROR
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 2;
+SET enable_seqscan = off;
+SET enable_sort = off;
+SHOW pg_lion.vector_overflow;
+ pg_lion.vector_overflow 
+-------------------------
+ error
+(1 row)
+
+SELECT count(*) FROM (SELECT id, v <-> vt_vec(13, 40) AS d FROM vt ORDER BY v <-> vt_vec(13, 40)) s;
+ERROR:  lionvec scan of "vt_l2" outgrew hash_mem after 38 rows
+-- pg_lion.vector_overflow = stop ends the scan there instead, with a
+-- NOTICE: what it returned is the start of the sort's order, each row once
+SET pg_lion.vector_overflow = stop;
+CREATE TEMP TABLE vt_cut AS
+SELECT row_number() OVER () AS n, id, d
+  FROM (SELECT id, v <-> vt_vec(13, 40) AS d FROM vt ORDER BY v <-> vt_vec(13, 40)) s;
+NOTICE:  lionvec scan of "vt_l2" stopped after 38 rows, what it knew of its rows having outgrown hash_mem
+RESET enable_seqscan;
+RESET enable_sort;
+SELECT count(*) < 3006 AS stopped, count(*) > 0 AS "some rows",
+	   count(*) = count(*) FILTER (WHERE c.id = s.id) AS "the sort's first rows"
+  FROM vt_cut c
+  JOIN (SELECT row_number() OVER (ORDER BY v <-> vt_vec(13, 40), id) AS n, id
+		  FROM vt WHERE v IS NOT NULL) s USING (n);
+ stopped | some rows | the sort's first rows 
+---------+-----------+-----------------------
+ t       | t         | t
+(1 row)
+
+DROP TABLE vt_cut;
+RESET pg_lion.vector_overflow;
+SET pg_lion.vector_overflow = 'grow';
+ERROR:  invalid value for parameter "pg_lion.vector_overflow": "grow"
+RESET hash_mem_multiplier;
+RESET work_mem;
 -- inserts after the build: a new cluster, far from the mean, which goes to
 -- the partitions nearest it
 INSERT INTO vt
@@ -944,10 +1006,93 @@ RESET enable_seqscan;
 RESET enable_sort;
 RESET pg_lion.vector_patience;
 RESET pg_lion.vector_margin;
+-- an operator class of one's own, whose operator returns float4: the scan
+-- reads the operator's distances, and hands them back, as float4
+CREATE FUNCTION vt_l2_f4(vector, vector) RETURNS float4
+LANGUAGE sql IMMUTABLE STRICT SET search_path FROM CURRENT
+AS $$ SELECT l2_distance($1, $2)::float4 $$;
+CREATE OPERATOR <%%> (LEFTARG = vector, RIGHTARG = vector,
+					   FUNCTION = vt_l2_f4, COMMUTATOR = <%%>);
+CREATE OPERATOR CLASS vt_l2_f4_ops FOR TYPE vector USING lionvec AS
+	OPERATOR 1 <%%> (vector, vector) FOR ORDER BY float_ops;
+SELECT amvalidate(oid) FROM pg_opclass WHERE opcname = 'vt_l2_f4_ops';
+ amvalidate 
+------------
+ t
+(1 row)
+
+CREATE INDEX vt_f4 ON vt USING lionvec (v vt_l2_f4_ops) WITH (partitions = 20);
+SELECT vec_cmp('SELECT id, v <%%> vt_vec(14, 40) AS d FROM vt ORDER BY v <%%> vt_vec(14, 40) LIMIT 50');
+    vec_cmp     
+----------------
+ index, 50 rows
+(1 row)
+
+SET enable_seqscan = off;
+SET enable_sort = off;
+SELECT pg_typeof(d), d = (v <%%> vt_vec(14, 40)) AS "the operator's"
+  FROM (SELECT v, v <%%> vt_vec(14, 40) AS d FROM vt
+		 ORDER BY v <%%> vt_vec(14, 40) LIMIT 1) s;
+ pg_typeof | the operator's 
+-----------+----------------
+ real      | t
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_sort;
+DROP INDEX vt_f4;
 -- what lionvec refuses
 CREATE TABLE vbad (i int, v vector(9000), w vector(3)[]);
 CREATE INDEX ON vbad USING lionvec (i);
 ERROR:  data type integer has no default operator class for access method "lionvec"
+-- an operator class over another type, which every read of a row or a
+-- query would take for a vector: refused before any is read
+CREATE FUNCTION vbad_dist(int, int) RETURNS float8 LANGUAGE sql IMMUTABLE
+AS $$ SELECT abs($1 - $2)::float8 $$;
+CREATE OPERATOR <^^> (LEFTARG = int, RIGHTARG = int, FUNCTION = vbad_dist);
+CREATE OPERATOR CLASS vbad_int_ops FOR TYPE int USING lionvec AS
+	OPERATOR 1 <^^> (int, int) FOR ORDER BY float_ops;
+SELECT amvalidate(oid) FROM pg_opclass WHERE opcname = 'vbad_int_ops';
+INFO:  lionvec operator class "vbad_int_ops" is over type integer, and lionvec indexes pgvector's vector and halfvec
+ amvalidate 
+------------
+ f
+(1 row)
+
+INSERT INTO vbad (i) VALUES (1), (2);
+CREATE INDEX ON vbad USING lionvec (i vbad_int_ops);
+ERROR:  lionvec index "vbad_i_idx" is of type integer, and lionvec indexes pgvector's vector and halfvec
+-- ... and one whose operator returns neither float8 nor float4
+CREATE FUNCTION vt_l2_int(vector, vector) RETURNS int
+LANGUAGE sql IMMUTABLE STRICT SET search_path FROM CURRENT
+AS $$ SELECT l2_distance($1, $2)::int $$;
+CREATE OPERATOR <||> (LEFTARG = vector, RIGHTARG = vector, FUNCTION = vt_l2_int);
+CREATE OPERATOR CLASS vt_l2_int_ops FOR TYPE vector USING lionvec AS
+	OPERATOR 1 <||> (vector, vector) FOR ORDER BY integer_ops;
+SELECT amvalidate(oid) FROM pg_opclass WHERE opcname = 'vt_l2_int_ops';
+INFO:  lionvec operator class "vt_l2_int_ops" has operator <||>(vector,vector) of strategy 1, and lionvec takes one ORDER BY operator of strategy 1, 2 or 3 over its input type, returning float8 or float4
+ amvalidate 
+------------
+ f
+(1 row)
+
+CREATE INDEX vt_int ON vt USING lionvec (v vt_l2_int_ops) WITH (partitions = 20);
+SET enable_seqscan = off;
+SET enable_sort = off;
+SELECT id FROM vt ORDER BY v <||> vt_vec(14, 40) LIMIT 1;
+ERROR:  lionvec index "vt_int" is ordered by an operator returning integer, and lionvec orders by float8 or float4
+RESET enable_seqscan;
+RESET enable_sort;
+DROP INDEX vt_int;
+DROP OPERATOR FAMILY vt_l2_int_ops USING lionvec;
+DROP OPERATOR <||> (vector, vector);
+DROP FUNCTION vt_l2_int(vector, vector);
+DROP OPERATOR FAMILY vbad_int_ops USING lionvec;
+DROP OPERATOR <^^> (int, int);
+DROP FUNCTION vbad_dist(int, int);
+DROP OPERATOR FAMILY vt_l2_f4_ops USING lionvec;
+DROP OPERATOR <%%> (vector, vector);
+DROP FUNCTION vt_l2_f4(vector, vector);
 CREATE INDEX ON vbad USING lionvec (v);
 ERROR:  column cannot have more than 8128 dimensions for lionvec index
 CREATE INDEX ON vbad USING lionvec (w);
@@ -956,8 +1101,8 @@ CREATE INDEX ON vbad USING lionvec (v, v);
 ERROR:  access method "lionvec" does not support multicolumn indexes
 CREATE INDEX ON vt USING lionvec (v) WITH (partitions = -1);
 ERROR:  value -1 out of bounds for option "partitions"
-CREATE INDEX ON vt USING lionvec (v) WITH (partitions = 1000001);
-ERROR:  value 1000001 out of bounds for option "partitions"
+CREATE INDEX ON vt USING lionvec (v) WITH (partitions = 65537);
+ERROR:  value 65537 out of bounds for option "partitions"
 CREATE INDEX ON vt USING lionvec (v) WITH (spill = maybe);
 ERROR:  invalid value for boolean option "spill": maybe
 ALTER INDEX vt_l2 SET (spill = 2);

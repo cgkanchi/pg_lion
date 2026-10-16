@@ -36,6 +36,7 @@
 
 #include "access/genam.h"
 #include "access/relscan.h"
+#include "catalog/pg_type_d.h"
 #include "storage/bufmgr.h"
 #include "nodes/pathnodes.h"
 #include "storage/bufpage.h"
@@ -245,7 +246,14 @@ lionvec_chain_step(Relation index, uint64 *visited, BlockNumber *nblocks)
  * centroids (LionVecMetaData's scale; lion_vec_scan.c, lv_margin()).
  */
 #define LIONVEC_MARGIN_DEFAULT	3.0
-#define LIONVEC_MAX_PARTS		1000000
+/*
+ * The most partitions an index has, as the `partitions` option asks or the
+ * build chooses: 2^16, which the build's own choice never passes (its sample
+ * of at most 2^20 rows, at 16 a partition; lion_vec.c).  k-means costs O(n k)
+ * an iteration and an insert reads every centroid, so more is a build of
+ * days and an index whose inserts crawl - which the option no longer offers.
+ */
+#define LIONVEC_MAX_PARTS		65536
 
 /*
  * A scan stops probing once it has scored this many units of rows without
@@ -263,11 +271,36 @@ lionvec_chain_step(Relation index, uint64 *visited, BlockNumber *nblocks)
  * pg_lion.vector_exact_rows's default.
  */
 #define LIONVEC_EXACT_DEFAULT	2000
+
+/*
+ * What a scan does when what it knows of its rows outgrows hash_mem
+ * (lion_vec_scan.c, lv_seen_stop(); DESIGN.md §44.4):
+ * pg_lion.vector_overflow's values.
+ */
+typedef enum LionVecOverflow
+{
+	LIONVEC_OVERFLOW_ERROR,		/* fail the query (the default) */
+	LIONVEC_OVERFLOW_STOP		/* return no more rows, with a NOTICE */
+} LionVecOverflow;
+
 extern double lionvec_epsilon;
 extern int	lionvec_batch;
 extern double lionvec_margin;
 extern int	lionvec_patience;
 extern int	lionvec_exact_rows;
+extern int	lionvec_overflow;
+
+/*
+ * What an ORDER BY operator of lionvec's returns: pgvector's all return
+ * float8, and a hand-made class's may return float4, which the scan reads
+ * and hands back as such (index_store_float8_orderby_distances() is core's
+ * way); nothing else orders.
+ */
+static inline bool
+lionvec_distance_type_ok(Oid type)
+{
+	return type == FLOAT8OID || type == FLOAT4OID;
+}
 
 /* lion_vec.c */
 extern void lion_vec_init(void);
