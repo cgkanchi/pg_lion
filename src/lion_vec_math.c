@@ -11,6 +11,7 @@
  */
 #ifndef FRONTEND
 #include "postgres.h"
+#include "miscadmin.h"
 #else
 #include "c.h"
 #endif
@@ -1028,39 +1029,61 @@ lionvec_candidates(const LionVecCentroids *c, const LionVecQuery *q,
 	return lionvec_candidates_n(c, q, 1, lo, hi, cand);
 }
 
+void
+lionvec_cands_begin(LionVecCandScan *cs, int m)
+{
+	Assert(m >= 1 && m <= LIONVEC_RANK_MAX);
+	cs->m = Max(1, Min(m, LIONVEC_RANK_MAX));
+	cs->nleast = 0;
+}
+
+bool
+lionvec_cands_add(LionVecCandScan *cs, const LionVecQuery *q,
+				  const uint64 *bits, uint16 popcount, float norm,
+				  float alpha1, double *lo, double *hi)
+{
+	int			m = cs->m;
+	double		est;
+	double		err;
+	int			i;
+
+	lionvec_estimate1(q, bits, popcount, norm, alpha1, &est, &err);
+	lionvec_key_bounds(LIONVEC_L2, norm, 0.0, est, err, lo, hi);
+	/* NaN bounds come back infinite, so every comparison here is total */
+	if (cs->nleast < m || *hi < cs->least[m - 1])
+	{
+		i = cs->nleast < m ? cs->nleast++ : m - 1;
+		for (; i > 0 && cs->least[i - 1] > *hi; i--)
+			cs->least[i] = cs->least[i - 1];
+		cs->least[i] = *hi;
+	}
+	return *lo <= lionvec_cands_threshold(cs);
+}
+
+double
+lionvec_cands_threshold(const LionVecCandScan *cs)
+{
+	/* fewer centroids than m: every one can be among the m nearest */
+	return cs->nleast == cs->m ? cs->least[cs->m - 1] : INFINITY;
+}
+
 int
 lionvec_candidates_n(const LionVecCentroids *c, const LionVecQuery *q, int m,
 					 double *lo, double *hi, int *cand)
 {
 	int			nw = c->dimsp / 64;
-	double		least[LIONVEC_RANK_MAX];	/* the m least upper bounds, ascending */
-	int			nleast = 0;
+	LionVecCandScan cs;
 	double		thr;
 	int			n = 0;
 	int			j;
 
 	Assert(c->dimsp == q->dimsp);
-	Assert(m >= 1 && m <= LIONVEC_RANK_MAX);
-	m = Max(1, Min(m, LIONVEC_RANK_MAX));
+	lionvec_cands_begin(&cs, m);
 	for (j = 0; j < c->k; j++)
-	{
-		double		est;
-		double		err;
-		int			i;
-
-		lionvec_estimate1(q, c->bits + (Size) j * nw, c->popcount[j],
-						  c->norm[j], c->alpha1[j], &est, &err);
-		lionvec_key_bounds(LIONVEC_L2, c->norm[j], 0.0, est, err, &lo[j], &hi[j]);
-		/* NaN bounds come back infinite, so every comparison here is total */
-		if (nleast == m && !(hi[j] < least[m - 1]))
-			continue;
-		i = nleast < m ? nleast++ : m - 1;
-		for (; i > 0 && least[i - 1] > hi[j]; i--)
-			least[i] = least[i - 1];
-		least[i] = hi[j];
-	}
-	/* fewer centroids than m: every one can be among the m nearest */
-	thr = nleast == m ? least[m - 1] : INFINITY;
+		(void) lionvec_cands_add(&cs, q, c->bits + (Size) j * nw,
+								 c->popcount[j], c->norm[j], c->alpha1[j],
+								 &lo[j], &hi[j]);
+	thr = lionvec_cands_threshold(&cs);
 	for (j = 0; j < c->k; j++)
 	{
 		if (lo[j] <= thr)
@@ -1213,21 +1236,28 @@ lionvec_unit(float *x, int n)
 	}
 }
 
+/*
+ * k-means is O(n k) an iteration over up to 2^20 sample rows and 65,536
+ * centroids: a cancel, a statement_timeout or a shutdown must reach it in
+ * the loops over rows and over centroids, not after the build.  The unit
+ * tests have no interrupts to check.
+ */
+#ifndef FRONTEND
+#define LIONVEC_CHECK_INTERRUPTS()	CHECK_FOR_INTERRUPTS()
+#else
+#define LIONVEC_CHECK_INTERRUPTS()	((void) 0)
+#endif
+
 /* how far apart the halves of a split centroid start, as FAISS has it */
 #define LIONVEC_SPLIT_EPS		(1.0f / 1024.0f)
 
-int
-lionvec_kmeans(const LionVecSample *s, int k, int iters, bool unit,
-			   uint64 seed, const float *mean, float *cent,
-			   LionVecKmeansWork *w)
+void
+lionvec_kmeans_start(const LionVecSample *s, int k, bool unit, uint64 seed,
+					 float *cent, int *assign)
 {
 	int			dimsp = s->dimsp;
-	int			nw = dimsp / 64;
 	int			n = s->n;
 	pg_prng_state st;
-	LionVecCentroids cs;
-	LionVecQuery q;
-	int			made = 0;
 	int			i;
 	int			j;
 
@@ -1237,21 +1267,56 @@ lionvec_kmeans(const LionVecSample *s, int k, int iters, bool unit,
 	/* k distinct rows to start from: a partial Fisher-Yates shuffle */
 	pg_prng_seed(&st, seed);
 	for (i = 0; i < n; i++)
-		w->assign[i] = i;
+		assign[i] = i;
 	for (j = 0; j < k; j++)
 	{
 		int			r = j + (int) pg_prng_uint64_range(&st, 0, (uint64) (n - 1 - j));
-		int			t = w->assign[j];
+		int			t = assign[j];
 
-		w->assign[j] = w->assign[r];
-		w->assign[r] = t;
-		lionvec_sample_row(s, w->assign[j], cent + (Size) j * dimsp);
+		assign[j] = assign[r];
+		assign[r] = t;
+		lionvec_sample_row(s, assign[j], cent + (Size) j * dimsp);
 		if (unit)
 			lionvec_unit(cent + (Size) j * dimsp, dimsp);
 	}
 	for (i = 0; i < n; i++)
-		w->assign[i] = -1;
+		assign[i] = -1;
+}
 
+void
+lionvec_kmeans_codes(int k, int dimsp, const float *mean, const float *cent,
+					 LionVecKmeansWork *w)
+{
+	int			nw = dimsp / 64;
+	int			j;
+
+	for (j = 0; j < k; j++)
+	{
+		LionVecEncoded e;
+
+		LIONVEC_CHECK_INTERRUPTS();
+		memcpy(w->x, cent + (Size) j * dimsp, sizeof(float) * dimsp);
+		e.bits = w->bits + (Size) j * nw;
+		e.codes = w->codes;
+		lionvec_encode(mean, dimsp, w->x, &e);
+		w->popcount[j] = e.popcount;
+		w->norm[j] = e.norm;
+		w->alpha1[j] = e.alpha1;
+	}
+}
+
+int
+lionvec_kmeans_assign(const LionVecSample *s, int from, int to, int k,
+					  const float *mean, const float *cent, int *assign,
+					  LionVecKmeansWork *w)
+{
+	int			dimsp = s->dimsp;
+	LionVecCentroids cs;
+	LionVecQuery q;
+	int			moved = 0;
+	int			i;
+
+	Assert(from >= 0 && from <= to && to <= s->n);
 	cs.k = k;
 	cs.dimsp = dimsp;
 	cs.bits = w->bits;
@@ -1262,117 +1327,132 @@ lionvec_kmeans(const LionVecSample *s, int k, int iters, bool unit,
 	q.qc = w->qc;
 	q.planes = w->planes;
 
+	for (i = from; i < to; i++)
+	{
+		int			nc;
+		int			best = -1;
+		double		bestd = INFINITY;
+		int			c;
+
+		LIONVEC_CHECK_INTERRUPTS();
+		lionvec_sample_row(s, i, w->y);
+		lionvec_query_init(&q, LIONVEC_L2, mean, w->y, LIONVEC_ASSIGN_EPS);
+		nc = lionvec_candidates(&cs, &q, w->lo, w->hi, w->cand);
+		for (c = 0; c < nc; c++)
+		{
+			double		d = lionvec_l2sq(w->y, cent + (Size) w->cand[c] * dimsp,
+										 dimsp);
+
+			/* in index order, so that ties go the same way every time */
+			if (best < 0 || d < bestd)
+			{
+				best = w->cand[c];
+				bestd = d;
+			}
+		}
+		Assert(best >= 0);
+		if (assign[i] != best)
+			moved++;
+		assign[i] = best;
+	}
+	return moved;
+}
+
+void
+lionvec_kmeans_update(const LionVecSample *s, int k, bool unit,
+					  const int *assign, float *cent, LionVecKmeansWork *w)
+{
+	int			dimsp = s->dimsp;
+	int			n = s->n;
+	int			i;
+	int			j;
+
+	memset(w->count, 0, sizeof(int) * k);
+	for (i = 0; i < n; i++)
+	{
+		Assert(assign[i] >= 0 && assign[i] < k);
+		w->count[assign[i]]++;
+	}
+
+	/* the means, summed where the centroids were: they are not needed now */
+	for (j = 0; j < k; j++)
+	{
+		if (w->count[j] > 0)
+			memset(cent + (Size) j * dimsp, 0, sizeof(float) * dimsp);
+	}
+	for (i = 0; i < n; i++)
+	{
+		float	   *sum = cent + (Size) assign[i] * dimsp;
+		int			d;
+
+		LIONVEC_CHECK_INTERRUPTS();
+		lionvec_sample_row(s, i, w->y);
+		for (d = 0; d < dimsp; d++)
+			sum[d] += w->y[d];
+	}
+	for (j = 0; j < k; j++)
+	{
+		if (w->count[j] > 0)
+		{
+			float		inv = 1.0f / (float) w->count[j];
+			float	   *c = cent + (Size) j * dimsp;
+			int			d;
+
+			for (d = 0; d < dimsp; d++)
+				c[d] *= inv;
+		}
+	}
+	for (j = 0; j < k; j++)
+	{
+		int			l = 0;
+		int			m;
+		float	   *cj = cent + (Size) j * dimsp;
+		float	   *cl;
+		int			d;
+
+		if (w->count[j] > 0)
+			continue;
+		LIONVEC_CHECK_INTERRUPTS();
+		/* the largest has two rows or more, as k <= n */
+		for (m = 1; m < k; m++)
+			if (w->count[m] > w->count[l])
+				l = m;
+		Assert(w->count[l] >= 2);
+		cl = cent + (Size) l * dimsp;
+		for (d = 0; d < dimsp; d++)
+		{
+			float		v = cl[d];
+
+			cj[d] = v * (d % 2 == 0 ? 1.0f + LIONVEC_SPLIT_EPS : 1.0f - LIONVEC_SPLIT_EPS);
+			cl[d] = v * (d % 2 == 0 ? 1.0f - LIONVEC_SPLIT_EPS : 1.0f + LIONVEC_SPLIT_EPS);
+		}
+		w->count[j] = w->count[l] / 2;
+		w->count[l] -= w->count[j];
+	}
+	if (unit)
+	{
+		for (j = 0; j < k; j++)
+			lionvec_unit(cent + (Size) j * dimsp, dimsp);
+	}
+}
+
+int
+lionvec_kmeans(const LionVecSample *s, int k, int iters, bool unit,
+			   uint64 seed, const float *mean, float *cent,
+			   LionVecKmeansWork *w)
+{
+	int			made = 0;
+
+	lionvec_kmeans_start(s, k, unit, seed, cent, w->assign);
 	while (made < iters)
 	{
-		int			moved = 0;
-
 		made++;
 		/* the centroids' codes, which the candidates are found by */
-		for (j = 0; j < k; j++)
-		{
-			LionVecEncoded e;
-
-			memcpy(w->x, cent + (Size) j * dimsp, sizeof(float) * dimsp);
-			e.bits = w->bits + (Size) j * nw;
-			e.codes = w->codes;
-			lionvec_encode(mean, dimsp, w->x, &e);
-			w->popcount[j] = e.popcount;
-			w->norm[j] = e.norm;
-			w->alpha1[j] = e.alpha1;
-		}
-
-		/* each row to its nearest */
-		memset(w->count, 0, sizeof(int) * k);
-		for (i = 0; i < n; i++)
-		{
-			int			nc;
-			int			best = -1;
-			double		bestd = INFINITY;
-			int			c;
-
-			lionvec_sample_row(s, i, w->y);
-			lionvec_query_init(&q, LIONVEC_L2, mean, w->y, LIONVEC_ASSIGN_EPS);
-			nc = lionvec_candidates(&cs, &q, w->lo, w->hi, w->cand);
-			for (c = 0; c < nc; c++)
-			{
-				double		d = lionvec_l2sq(w->y, cent + (Size) w->cand[c] * dimsp,
-											 dimsp);
-
-				/* in index order, so that ties go the same way every time */
-				if (best < 0 || d < bestd)
-				{
-					best = w->cand[c];
-					bestd = d;
-				}
-			}
-			Assert(best >= 0);
-			if (w->assign[i] != best)
-				moved++;
-			w->assign[i] = best;
-			w->count[best]++;
-		}
-		/* no row moved: the centroids are already their rows' means */
-		if (moved == 0)
+		lionvec_kmeans_codes(k, s->dimsp, mean, cent, w);
+		/* each row to its nearest; none moved: they are already its means */
+		if (lionvec_kmeans_assign(s, 0, s->n, k, mean, cent, w->assign, w) == 0)
 			break;
-
-		/* the means, summed where the centroids were: they are not needed now */
-		for (j = 0; j < k; j++)
-		{
-			if (w->count[j] > 0)
-				memset(cent + (Size) j * dimsp, 0, sizeof(float) * dimsp);
-		}
-		for (i = 0; i < n; i++)
-		{
-			float	   *sum = cent + (Size) w->assign[i] * dimsp;
-			int			d;
-
-			lionvec_sample_row(s, i, w->y);
-			for (d = 0; d < dimsp; d++)
-				sum[d] += w->y[d];
-		}
-		for (j = 0; j < k; j++)
-		{
-			if (w->count[j] > 0)
-			{
-				float		inv = 1.0f / (float) w->count[j];
-				float	   *c = cent + (Size) j * dimsp;
-				int			d;
-
-				for (d = 0; d < dimsp; d++)
-					c[d] *= inv;
-			}
-		}
-		for (j = 0; j < k; j++)
-		{
-			int			l = 0;
-			int			m;
-			float	   *cj = cent + (Size) j * dimsp;
-			float	   *cl;
-			int			d;
-
-			if (w->count[j] > 0)
-				continue;
-			/* the largest has two rows or more, as k <= n */
-			for (m = 1; m < k; m++)
-				if (w->count[m] > w->count[l])
-					l = m;
-			Assert(w->count[l] >= 2);
-			cl = cent + (Size) l * dimsp;
-			for (d = 0; d < dimsp; d++)
-			{
-				float		v = cl[d];
-
-				cj[d] = v * (d % 2 == 0 ? 1.0f + LIONVEC_SPLIT_EPS : 1.0f - LIONVEC_SPLIT_EPS);
-				cl[d] = v * (d % 2 == 0 ? 1.0f - LIONVEC_SPLIT_EPS : 1.0f + LIONVEC_SPLIT_EPS);
-			}
-			w->count[j] = w->count[l] / 2;
-			w->count[l] -= w->count[j];
-		}
-		if (unit)
-		{
-			for (j = 0; j < k; j++)
-				lionvec_unit(cent + (Size) j * dimsp, dimsp);
-		}
+		lionvec_kmeans_update(s, k, unit, w->assign, cent, w);
 	}
 	return made;
 }

@@ -1547,6 +1547,57 @@ kmeans_work_free(LionVecKmeansWork *w)
 	free(w->planes);
 }
 
+/*
+ * k-means as a parallel build runs it (lion_vec.c, DESIGN.md §44.12): its
+ * steps, each iteration's rows assigned a chunk of the given size at a time,
+ * the chunks taken last first and alternately by two "processes", each with
+ * scratch of its own, sharing the centroids' codes.  Returns the iterations.
+ */
+static int
+kmeans_by_chunks(const Sample *sm, int k, int iters, bool unit, const float *mean,
+				 float *cent, LionVecKmeansWork *w, int chunk)
+{
+	LionVecKmeansWork w2 = *w;
+	int			n = sm->s.n;
+	int			D = sm->s.dimsp;
+	int			nchunks = (n + chunk - 1) / chunk;
+	int			made = 0;
+
+	w2.lo = (double *) xmalloc(sizeof(double) * k);
+	w2.hi = (double *) xmalloc(sizeof(double) * k);
+	w2.cand = (int *) xmalloc(sizeof(int) * k);
+	w2.x = falloc(D);
+	w2.y = falloc(D);
+	w2.codes = (uint8 *) xmalloc(D);
+	w2.qc = falloc(D);
+	w2.planes = (uint64 *) xmalloc(sizeof(uint64) * (D / 64) * LIONVEC_QBITS);
+	lionvec_kmeans_start(&sm->s, k, unit, 42, cent, w->assign);
+	while (made < iters)
+	{
+		int			moved = 0;
+		int			c;
+
+		made++;
+		lionvec_kmeans_codes(k, D, mean, cent, w);
+		for (c = nchunks - 1; c >= 0; c--)
+			moved += lionvec_kmeans_assign(&sm->s, c * chunk, Min((c + 1) * chunk, n),
+										   k, mean, cent, w->assign,
+										   c % 2 == 0 ? w : &w2);
+		if (moved == 0)
+			break;
+		lionvec_kmeans_update(&sm->s, k, unit, w->assign, cent, w);
+	}
+	free(w2.lo);
+	free(w2.hi);
+	free(w2.cand);
+	free(w2.x);
+	free(w2.y);
+	free(w2.codes);
+	free(w2.qc);
+	free(w2.planes);
+	return made;
+}
+
 /* one k-means run, checked for what holds of any: returns the iterations */
 static int
 kmeans_run(const Sample *sm, int k, int iters, bool unit, const float *mean,
@@ -1693,6 +1744,42 @@ test_kmeans(void)
 		memcpy(cent2, cent, sizeof(float) * T * D);
 		kmeans_run(&sm, T, 50, unit, mean, cent, &w);
 		CHECK(memcmp(cent, cent2, sizeof(float) * T * D) == 0, "k-means is not repeatable");
+
+		/*
+		 * ... however its rows are shared out: a parallel build's k-means, to
+		 * the bit, the assignment too, in chunks of 1, 7 and 32 rows and in
+		 * one, with eight centroids a cluster (empty ones split) and with T
+		 */
+		{
+			int		   *assign0 = (int *) xmalloc(sizeof(int) * n);
+			int			chunks[4] = {1, 7, 32, n};
+			int			kk;
+
+			for (kk = T; kk <= 8 * T; kk += 7 * T)
+			{
+				int			c;
+				int			made0;
+
+				kmeans_work_free(&w);
+				kmeans_work(&w, n, kk, D);
+				made0 = lionvec_kmeans(&sm.s, kk, 10, unit, 42, mean, cent2, &w);
+				memcpy(assign0, w.assign, sizeof(int) * n);
+				for (c = 0; c < 4; c++)
+				{
+					int			made1 = kmeans_by_chunks(&sm, kk, 10, unit, mean, cent,
+														 &w, chunks[c]);
+
+					CHECK(made1 == made0 &&
+						  memcmp(cent, cent2, sizeof(float) * kk * D) == 0 &&
+						  memcmp(w.assign, assign0, sizeof(int) * n) == 0,
+						  "k-means by chunks is not k-means");
+				}
+			}
+			free(assign0);
+			kmeans_work_free(&w);
+			kmeans_work(&w, n, T, D);
+			kmeans_run(&sm, T, 50, unit, mean, cent, &w);
+		}
 
 		/* no mean: the same answer, the bounds only looser */
 		kmeans_run(&sm, T, 50, unit, NULL, cent2, &w);
@@ -1949,6 +2036,66 @@ test_rank(void)
 }
 
 /*
+ * The candidates as an insert finds them (lion_vec.c,
+ * lionvec_insert_nearest()): a centroid at a time through
+ * lionvec_cands_add(), keeping at most maxc - pruning by the threshold
+ * so far when full, and growing only when that frees less than half - then
+ * those within the final threshold.  Into cand[], in order; returns their
+ * number, and *peak the most it kept at once.
+ */
+static int
+stream_candidates(const LionVecCentroids *c, const LionVecQuery *q, int m,
+				  int maxc, int *cand, int *peak)
+{
+	int			nw = c->dimsp / 64;
+	int		   *kept = (int *) xmalloc(sizeof(int) * Max(c->k, 1));
+	double	   *keptlo = (double *) xmalloc(sizeof(double) * Max(c->k, 1));
+	LionVecCandScan cs;
+	double		thr;
+	int			nc = 0;
+	int			n = 0;
+	int			i;
+	int			j;
+
+	*peak = 0;
+	lionvec_cands_begin(&cs, m);
+	for (j = 0; j < c->k; j++)
+	{
+		double		lo;
+		double		hi;
+
+		if (!lionvec_cands_add(&cs, q, c->bits + (Size) j * nw, c->popcount[j],
+							   c->norm[j], c->alpha1[j], &lo, &hi))
+			continue;
+		if (nc == maxc)
+		{
+			int			k2 = 0;
+
+			thr = lionvec_cands_threshold(&cs);
+			for (i = 0; i < nc; i++)
+				if (keptlo[i] <= thr)
+				{
+					kept[k2] = kept[i];
+					keptlo[k2++] = keptlo[i];
+				}
+			nc = k2;
+			if (nc > maxc / 2)
+				maxc *= 2;
+		}
+		kept[nc] = j;
+		keptlo[nc++] = lo;
+		*peak = Max(*peak, nc);
+	}
+	thr = lionvec_cands_threshold(&cs);
+	for (i = 0; i < nc; i++)
+		if (keptlo[i] <= thr)
+			cand[n++] = kept[i];
+	free(keptlo);
+	free(kept);
+	return n;
+}
+
+/*
  * lionvec_candidates_n() on clustered centroids: m = 1 is
  * lionvec_candidates(); the exact m nearest are always candidates at a wide
  * bound and nearly always at the build's; there are at least m; fewer
@@ -1984,6 +2131,8 @@ test_candidates_n(void)
 		long		missed = 0;
 		long		ncand = 0;
 		bool		same = true;
+		bool		streamed = true;
+		int			maxpeak = 0;
 		bool		enough = true;
 		int			trial;
 		int			i;
@@ -2044,11 +2193,24 @@ test_candidates_n(void)
 					in |= cand[c2] == near[j];
 				missed += !in;
 			}
+			/* an insert's, a centroid at a time: the same, in the same order */
+			for (j = 1; j <= m; j += m - 1)
+			{
+				int			peak;
+
+				nc = lionvec_candidates_n(&cc.c, &q, j, lo, hi, cand);
+				nc1 = stream_candidates(&cc.c, &q, j, 4, cand1, &peak);
+				streamed &= nc == nc1 && memcmp(cand, cand1, sizeof(int) * nc) == 0;
+				maxpeak = Max(maxpeak, peak);
+			}
 			nc = lionvec_candidates_n(&cc.c, &q, 1, lo, hi, cand);
 			nc1 = lionvec_candidates(&cc.c, &q, lo1, hi1, cand1);
 			same &= nc == nc1 && memcmp(cand, cand1, sizeof(int) * nc) == 0;
 		}
 		CHECK(same, "candidates_n of 1 is not candidates");
+		CHECK(streamed, "the candidates a centroid at a time are not candidates_n's");
+		printf("vec_test: dims %4d: a centroid at a time kept at most %d of %d\n",
+			   D, maxpeak, k);
 		CHECK(enough, "fewer candidates than m");
 		CHECK(missed_wide == 0, "one of the m nearest is not a candidate at 10 sd");
 		/* at most one of the 1,800 pairs, as the nearest alone misses one in 200 */
