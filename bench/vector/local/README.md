@@ -60,10 +60,17 @@ installs pg_lion from this checkout, makes a venv in `~/lionbench/venv`, and cre
 `~/lionbench/pgdata` (port 55440, socket in `~/lionbench/sock`; it does not touch `dev.sh`'s
 cluster or any system cluster). The cluster takes the project's standing settings
 (`random_page_cost` 1.1, `effective_io_concurrency` and `maintenance_io_concurrency` 200,
-`effective_cache_size` 10 GB, `io_method` worker, no parallel query or build, `jit` and `fsync`
+`effective_cache_size` 10 GB, `io_method` worker, no parallel query, `jit` and `fsync`
 off), with `shared_buffers` a quarter of RAM and `maintenance_work_mem` 35%, each at most 8 GB
 (enough for HNSW's 3.5 GB graph, if it is added). `pg.sh` starts,
 stops and opens psql on it.
+
+Builds run in parallel, the same for both indexes: `KNN_BUILD_WORKERS`, by default half the CPU
+threads and at most 8 (8 on a 5700X3D), is each build's `max_parallel_maintenance_workers`, the
+table's `parallel_workers` while it builds (VectorChord takes core's count of workers, which
+goes by the table's main fork, and TOAST holds the vectors), and VectorChord's k-means
+`build_threads`. `KNN_BUILD_WORKERS=0` builds serially, as the 115k results and the first 1M run
+did.
 
 `run.sh` runs these steps, each once (a marker in `~/lionbench/state`; delete it to redo one):
 
@@ -72,7 +79,7 @@ stops and opens psql on it.
 | `fetch` | the first `NSHARDS` shards (default all 26) from Hugging Face, resumable |
 | `prepare` | 200 held-out queries and the exact top ten under each filter (float64, chunked) |
 | `load` | the table, binary COPY, and the lion index on the filter column, with summaries (`summaries = auto`): the filter column is unique, and a range over it otherwise walks a key per row |
-| `build` | lionvec with the build's own partition count (8 sqrt(n), spill on); VectorChord with sqrt(n) lists (1,000), spherical centroids, no residual quantization, as at 115k |
+| `build` | lionvec with the build's own partition count (8 sqrt(n), spill on); VectorChord with sqrt(n) lists (1,000), spherical centroids, no residual quantization, as at 115k; each with `KNN_BUILD_WORKERS` workers |
 | `warm` | each index's sweep under every filter, warm: lionvec margins 2 to 32, through the planner's plan and LionOrdered; VectorChord probes 10 to 640, with and without `vchordrq.prefilter` |
 | `cold` | restart and drop the cache before each query, 7 queries a method, at the settings the warm runs found reach 0.95 and 0.98 (unfiltered, and at 3% for LionOrdered and the prefilter) |
 | `table` | `tables.md` |
@@ -94,7 +101,8 @@ of the time; `NSHARDS=3` reproduces the 115k set of the earlier results. Use a s
 `BENCH_DIR` for each size, or clear `~/lionbench/state` and drop the database
 (`pg.sh psql -c 'DROP DATABASE dbpedia'`) and `~/lionbench/cache` between sizes.
 
-**How long.** Not measured at 1M rows. Scaled from the 115k builds on a 4-vCPU Xeon (lionvec
-161 s, VectorChord 22 s, both single-process), expect roughly 40 to 70 minutes for lionvec's
-build and 10 for VectorChord's, plus about an hour of warm sweeps and 20 minutes cold: two to
-three hours in all, after the 9.5 GB download.
+**How long.** Built serially at 1M rows on a 5700X3D (2026-10-15), lionvec took 86 minutes
+(its k-means sampled every row for 7,999 partitions) and VectorChord 3. In parallel neither is
+measured at 1M yet; at 115k on 4 cores lionvec's build went from 125-134 s to 38 s with 4
+workers, and VectorChord's from 21 s to 12 s (4 workers and 4 threads). Then about an hour of warm sweeps and 20 minutes
+cold, after the 9.5 GB download.

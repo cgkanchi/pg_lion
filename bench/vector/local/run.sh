@@ -39,6 +39,9 @@ export KNN_COLD_FROM=$OUT
 # wider sweeps than at 115k, since a million rows need more for a recall
 export KNN_MARGINS=${KNN_MARGINS:-2,3,4,6,8,12,16,24,32}
 export KNN_PROBES=${KNN_PROBES:-10,20,40,80,160,320,640}
+# parallel builds, the same for every kind (knn_dbpedia.py): half the CPU
+# threads, at most 8; KNN_BUILD_WORKERS=0 builds serially, as at 115k
+export KNN_BUILD_WORKERS=${KNN_BUILD_WORKERS:-$(( $(nproc) / 2 > 8 ? 8 : $(nproc) / 2 ))}
 export KNN_EF=${KNN_EF:-20,40,70,100,200,400,800}
 
 STEPS=${STEPS:-"fetch prepare load build warm cold table"}
@@ -74,6 +77,7 @@ machine() {
 		echo "disk: $(df -h --output=source,fstype,size "$BENCH_DIR" | tail -1)"
 		echo "postgres: $(postgres --version)"
 		echo "pg_lion: $(git -C "$REPO" rev-parse --short HEAD)"
+		echo "build workers: $KNN_BUILD_WORKERS"
 		echo "settings:"; grep -A40 '^# lionbench' "$PGDATA_DIR/postgresql.conf" | sed 's/^/  /'
 	} > "$OUT/machine.txt"
 }

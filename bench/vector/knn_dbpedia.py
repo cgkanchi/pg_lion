@@ -87,6 +87,14 @@
 # it runs at all; KNN_COLD_FROM (default none) a directory of warm results
 # from which a cold run takes each kind's settings, those that reached 0.95
 # and 0.98 there (cold_settings()), in place of the 115k runs' own.
+# KNN_BUILD_WORKERS (default none: the server's settings, 0 in the standing
+# benchmarks): the parallel workers every kind's build asks for alike - the
+# session's max_parallel_maintenance_workers, the table's parallel_workers,
+# and VectorChord's k-means threads (build_threads).  The table's setting is
+# for the builds that take core's count of workers, which goes by the
+# table's main fork: TOAST holds the vectors, so at 115k rows that fork is
+# under min_parallel_table_scan_size and gets none.  VectorChord on 115k
+# rows, 4 cores: 21 s serial, 19 s with 4 workers, 12 s with 4 threads too.
 #
 # diskann answers an arbitrary WHERE by filtering what its scan streams out;
 # its index-side filtering takes a smallint[] labels column named in the
@@ -117,6 +125,7 @@ NQ = int(os.environ.get('KNN_NQ', '200'))
 SHARDS = os.environ.get('KNN_SHARDS', '/mnt/project-files/train-0000[0-2]-of-00026.parquet')
 NSHARDS = int(os.environ.get('KNN_NSHARDS', '3'))
 PREWARM = os.environ.get('KNN_PREWARM', 'buffer')
+BUILD_WORKERS = int(os.environ['KNN_BUILD_WORKERS']) if os.environ.get('KNN_BUILD_WORKERS') else None
 COL = 'text-embedding-3-large-1536-embedding'
 DIM = 1536
 SELS = (1.0, 0.1, 0.03, 0.01)
@@ -401,13 +410,22 @@ def build(name, ddl, extension=None):
     notes = []
     conn.add_notice_handler(lambda d: notes.append(d.message_primary))
     conn.execute(f'DROP INDEX IF EXISTS {name}')
+    if BUILD_WORKERS is not None:
+        conn.execute(f'SET max_parallel_maintenance_workers = {BUILD_WORKERS}')
+        conn.execute(f'ALTER TABLE {TABLE} SET (parallel_workers = {BUILD_WORKERS})')
     conn.execute('SET client_min_messages = debug1')
-    t = time.perf_counter()
-    conn.execute(ddl)
-    secs = time.perf_counter() - t
+    try:
+        t = time.perf_counter()
+        conn.execute(ddl)
+        secs = time.perf_counter() - t
+    finally:
+        if BUILD_WORKERS is not None:
+            conn.execute(f'ALTER TABLE {TABLE} RESET (parallel_workers)')
     conn.execute('SET client_min_messages = warning')
     info = dict(index=name, ddl=ddl, build_s=round(secs, 1),
                 maintenance_work_mem=conn.execute('SHOW maintenance_work_mem').fetchone()[0],
+                max_parallel_maintenance_workers=int(
+                    conn.execute('SHOW max_parallel_maintenance_workers').fetchone()[0]),
                 size_bytes=int(conn.execute('SELECT pg_relation_size(%s::regclass)',
                                             (name,)).fetchone()[0]),
                 built_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), **provenance())
@@ -918,9 +936,10 @@ if __name__ == '__main__':
         # VectorChord's recommendation for cosine: no residual quantization,
         # spherical centroids; lists = [] clusters nothing (one list)
         lists = '[]' if int(a[1]) == 0 else f'[{int(a[1])}]'
+        threads = f'build_threads = {max(BUILD_WORKERS, 1)}\n' if BUILD_WORKERS is not None else ''
         build(INDEXES['vchord'], f'CREATE INDEX {INDEXES["vchord"]} ON {TABLE} USING vchordrq '
               f'(embedding {opclass()}) WITH (options = $$\nresidual_quantization = false\n'
-              f'[build.internal]\nlists = {lists}\nspherical_centroids = true\n$$)', 'vchord')
+              f'[build.internal]\nlists = {lists}\nspherical_centroids = true\n{threads}$$)', 'vchord')
     elif a == ['diskann']:
         build(INDEXES['diskann'], f'CREATE INDEX {INDEXES["diskann"]} ON {TABLE} USING diskann '
               f'(embedding {opclass()})', 'vectorscale')
