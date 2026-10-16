@@ -211,9 +211,11 @@ SELECT p.meta = s.meta AS meta, p.parts = s.parts AS parts, p.codes = s.codes AS
 
 -- ---------------------------------------------------------------------
 -- 2. Without parallel_workers: a table of 10,000 rows with a vector or
---    more asks for max_parallel_maintenance_workers, no more than leave
---    each process 32MB of maintenance_work_mem; a smaller one, a temporary
---    table and a table of NULL rows build serially.
+--    more asks for max_parallel_maintenance_workers, whatever
+--    maintenance_work_mem, and so does an expression or partial index
+--    whose expressions and predicate are parallel safe; a smaller table,
+--    a temporary table, a table of NULL rows and an index whose predicate
+--    is parallel unsafe build serially.
 -- ---------------------------------------------------------------------
 CREATE TABLE pa (id int, v vector(8));
 INSERT INTO pa SELECT i, pv_vec(i, 8) FROM generate_series(1, 10000) i;
@@ -224,13 +226,24 @@ REINDEX INDEX pa_l2;
 DEBUG:  building index "pa_l2" on table "pa" serially
 DEBUG:  lionvec index "pa_l2": 20 partitions from a sample of 10000 rows, 10 k-means iterations
 DEBUG:  lionvec index "pa_l2": built in parallel
-SET maintenance_work_mem = '32MB';
+-- the least maintenance_work_mem, where each process's sort spills to
+-- disk: still in parallel, and the same index as a serial build's
+SET maintenance_work_mem = '1MB';
 REINDEX INDEX pa_l2;
 DEBUG:  building index "pa_l2" on table "pa" serially
-DEBUG:  lionvec index "pa_l2": 20 partitions from a sample of 10000 rows, 10 k-means iterations
-DEBUG:  lionvec index "pa_l2": built serially
-RESET maintenance_work_mem;
+DEBUG:  lionvec index "pa_l2": 20 partitions from a sample of 7710 rows, 10 k-means iterations
+DEBUG:  lionvec index "pa_l2": built in parallel
 SET client_min_messages = warning;
+CREATE TABLE pa_serial AS SELECT * FROM pv_build('pa_l2', 0);
+SELECT p.meta = s.meta AS meta, p.parts = s.parts AS parts, p.codes = s.codes AS codes,
+	   p.refines = s.refines AS refines
+  FROM pv_build('pa_l2', 2) p, pa_serial s;
+ meta | parts | codes | refines 
+------+-------+-------+---------
+ t    | t     | t     | t
+(1 row)
+
+RESET maintenance_work_mem;
 DELETE FROM pa WHERE id = 1;
 VACUUM pa;
 SET client_min_messages = debug1;
@@ -238,6 +251,24 @@ REINDEX INDEX pa_l2;
 DEBUG:  building index "pa_l2" on table "pa" serially
 DEBUG:  lionvec index "pa_l2": 20 partitions from a sample of 9999 rows, 10 k-means iterations
 DEBUG:  lionvec index "pa_l2": built serially
+SET client_min_messages = warning;
+INSERT INTO pa VALUES (1, pv_vec(1, 8));
+-- expressions and predicates, parallel safe and not
+CREATE FUNCTION pv_unsafe(i int) RETURNS bool LANGUAGE plpgsql IMMUTABLE PARALLEL UNSAFE
+AS $$ BEGIN RETURN i > 0; END $$;
+SET client_min_messages = debug1;
+CREATE INDEX pa_half ON pa USING lionvec ((v::halfvec(8)) halfvec_l2_ops) WITH (partitions = 20);
+DEBUG:  building index "pa_half" on table "pa" serially
+DEBUG:  lionvec index "pa_half": 20 partitions from a sample of 10000 rows, 10 k-means iterations
+DEBUG:  lionvec index "pa_half": built in parallel
+CREATE INDEX pa_safe ON pa USING lionvec (v) WITH (partitions = 20) WHERE id > 0;
+DEBUG:  building index "pa_safe" on table "pa" serially
+DEBUG:  lionvec index "pa_safe": 20 partitions from a sample of 10000 rows, 10 k-means iterations
+DEBUG:  lionvec index "pa_safe": built in parallel
+CREATE INDEX pa_unsafe ON pa USING lionvec (v) WITH (partitions = 20) WHERE pv_unsafe(id);
+DEBUG:  building index "pa_unsafe" on table "pa" serially
+DEBUG:  lionvec index "pa_unsafe": 20 partitions from a sample of 10000 rows, 10 k-means iterations
+DEBUG:  lionvec index "pa_unsafe": built serially
 SET client_min_messages = warning;
 CREATE TEMP TABLE pt (id int, v vector(8)) WITH (parallel_workers = 2);
 INSERT INTO pt SELECT i, pv_vec(i, 8) FROM generate_series(1, 2000) i;
@@ -253,6 +284,6 @@ DEBUG:  building index "pn_l2" on table "pn" serially
 DEBUG:  lionvec index "pn_l2": built serially
 SET client_min_messages = warning;
 RESET max_parallel_maintenance_workers;
-DROP TABLE pv, pv_serial, pv_parallel, pv_near, pv_cic_parallel, pa, pt, pn;
-DROP FUNCTION pv_vec(bigint, int), pv_u16(bytea, int), pv_u32(bytea, int),
+DROP TABLE pv, pv_serial, pv_parallel, pv_near, pv_cic_parallel, pa, pa_serial, pt, pn;
+DROP FUNCTION pv_unsafe(int), pv_vec(bigint, int), pv_u16(bytea, int), pv_u32(bytea, int),
 	pv_items(bytea), pv_index(regclass), pv_build(regclass, int), pv_nearest(text);
