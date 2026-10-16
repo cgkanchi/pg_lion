@@ -2591,18 +2591,30 @@ lv_rerank(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
  */
 
 /*
- * Whether a row's vector lies in its heap page, as far as its size tells: past
- * TOAST_TUPLE_THRESHOLD - 506 dimensions of vector, 1,012 of halfvec, at 8K
- * pages - the heap moves it to TOAST, which a fetch reaches through the TOAST
- * index, so that the heap page is the least of what it reads.  Asked for
- * alone, on DBpedia's 1536 dimensions the heap pages bought nothing: the exact
- * path cold took 113 ms a query under a 1% filter against 109 without.
+ * Whether a row's vector lies in its heap page, so that a fetch reads the
+ * block its TID names and little else: the column's storage keeps it there
+ * (PLAIN, or MAIN, which moves a value out only when its row outgrows the
+ * page), or its size does - past TOAST_TUPLE_THRESHOLD, 506 dimensions of
+ * vector and 1,012 of halfvec at 8K pages, EXTERNAL (pgvector's) and
+ * EXTENDED move it to TOAST, which a fetch reaches through the TOAST index,
+ * the heap page the least of what it reads.  An expression's vector is
+ * judged by its size alone.  Asked for alone, on DBpedia's 1536 dimensions
+ * in TOAST the heap pages bought nothing: the exact path cold took 113 ms a
+ * query under a 1% filter against 109 without (DESIGN.md §44.4, "Prefetch").
  */
 static bool
-lv_vector_inline(const LvScanOpaque *so)
+lv_vector_inline(const LvScanOpaque *so, Relation index, Relation heap)
 {
+	AttrNumber	attno = index->rd_index->indkey.values[0];
 	Size		sz = 8 + (Size) so->info->dims * (so->info->half ? 2 : 4);
 
+	if (attno > 0 && attno <= RelationGetDescr(heap)->natts)
+	{
+		char		storage = TupleDescAttr(RelationGetDescr(heap), attno - 1)->attstorage;
+
+		if (storage == TYPSTORAGE_PLAIN || storage == TYPSTORAGE_MAIN)
+			return true;
+	}
 	return sz <= TOAST_TUPLE_THRESHOLD;
 }
 
@@ -2628,7 +2640,7 @@ lv_start_prefetch(IndexScanDesc scan, LvScanOpaque *so)
 	so->ipf = Min(get_tablespace_io_concurrency(index->rd_rel->reltablespace),
 				  LIONVEC_PREFETCH_MAX);
 	if (heap != NULL && heap->rd_tableam == GetHeapamTableAmRoutine() &&
-		lv_vector_inline(so))
+		lv_vector_inline(so, index, heap))
 	{
 		so->hpf = Min(get_tablespace_io_concurrency(heap->rd_rel->reltablespace),
 					  LIONVEC_PREFETCH_MAX);
