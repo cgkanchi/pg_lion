@@ -510,6 +510,21 @@ typedef struct LionTidSet
  */
 #define LO_MERGE_MIN		1024
 
+/*
+ * After a merge the directory has room for this many pieces for each entry
+ * the merge left, doubling until it does: a merge costs about as much for
+ * each key it rewrites as for this many pieces (lo_set_push()).
+ */
+#define LO_MERGE_ROOM		32
+
+/* the pieces' slots by key, then slot: (key << 32 | slot) (lo_set_finish()) */
+#define ST_SORT lo_sort_slots
+#define ST_ELEMENT_TYPE uint64
+#define ST_COMPARE(a, b) ((int) (*(a) > *(b)) - (int) (*(a) < *(b)))
+#define ST_SCOPE static
+#define ST_DEFINE
+#include "lib/sort_template.h"
+
 /* ---------------------------------------------------------------------
  * Executor state
  * --------------------------------------------------------------------- */
@@ -2775,10 +2790,18 @@ static void lo_set_finish(LionOrderedState *st, LionTidSet *set);
  * form was a hundredth of hash_mem, and once degraded its directory went on
  * growing one entry per piece, past any bound (52 MB at a 1 MB hash_mem for a
  * range over 4M values; 2026-09-25 second review).  The pieces are merged
- * whenever the directory is full - it doubles only if it is still more than
- * half full after that - and before their bytes would degrade the set, once
- * there are at least as many pieces as merged entries (each merge then pays
- * for itself); only a set whose merged form does not fit degrades (§30.4).
+ * whenever the directory is full - it then doubles until it has room for
+ * LO_MERGE_ROOM pieces an entry the merge left, or its slots alone would
+ * take hash_mem - and before their bytes would degrade the set, once there
+ * are at least as many pieces as merged entries; only a set whose merged
+ * form does not fit degrades (§30.4).
+ *
+ * A merge rewrites every key a piece came for - a bitset image of each - and
+ * the pieces of a range come for nearly every key.  The directory used to
+ * double only while it stayed more than half full, which kept a merge to as
+ * many pieces as keys: a range over 100,000 of a million unique values, 223
+ * keys, merged every 800 pieces, and the merges were half of LionOrdered's
+ * 130 ms before its first row (2026-10-16).
  */
 static void
 lo_set_push(LionOrderedState *st, LionTidSet *set, uint32 ckey,
@@ -2788,14 +2811,26 @@ lo_set_push(LionOrderedState *st, LionTidSet *set, uint32 ckey,
 
 	if (set->n == set->cap)
 	{
+		int			cap = set->cap;
+		bool		merged = false;
+
 		if (!set->sorted && set->cap >= LO_MERGE_MIN)
-			lo_set_finish(st, set);
-		if (set->n > set->cap / 2)
 		{
-			set->cap *= 2;
-			set->keys = (uint32 *) repalloc(set->keys, sizeof(uint32) * set->cap);
+			lo_set_finish(st, set);
+			merged = true;
+		}
+		while (set->n > cap / 2 ||
+			   (merged &&
+				(double) (cap - set->n) < (double) LO_MERGE_ROOM * set->n &&
+				(double) cap * 2.0 * LO_ENTRY_BYTES <= (double) st->limit))
+			cap *= 2;
+		if (cap != set->cap)
+		{
+			set->cap = cap;
+			set->keys = (uint32 *) repalloc_huge(set->keys,
+												 sizeof(uint32) * set->cap);
 			set->conts = (LionContainer **)
-				repalloc(set->conts, sizeof(LionContainer *) * set->cap);
+				repalloc_huge(set->conts, sizeof(LionContainer *) * set->cap);
 		}
 	}
 	if (size > 0 && !set->sorted &&
@@ -2825,18 +2860,6 @@ lo_set_push(LionOrderedState *st, LionTidSet *set, uint32 ckey,
 	set->n++;
 }
 
-static int
-lo_cmp_slot(const void *a, const void *b, void *arg)
-{
-	const uint32 *keys = (const uint32 *) arg;
-	uint32		ka = keys[*(const int *) a];
-	uint32		kb = keys[*(const int *) b];
-
-	if (ka != kb)
-		return (ka < kb) ? -1 : 1;
-	return (*(const int *) a < *(const int *) b) ? -1 : 1;
-}
-
 /*
  * A WALK or LIST source's containers came entry by entry (§29.3): sort them
  * by key and OR the containers of equal keys into one - when the source is
@@ -2845,15 +2868,24 @@ lo_cmp_slot(const void *a, const void *b, void *arg)
  * ORing them pairwise cost a pass over the growing container per piece, 4.2 s
  * for a range over 250,000 distinct values against 0.2 s for the lion bitmap
  * scan of the same range (2026-09-25 second review).
+ *
+ * The entries the last merge left, [0, nmerged), are in order already: only
+ * the pieces after them are sorted, by key and slot packed into a word, and
+ * the two runs merged.  A sort of every slot through a comparator that read
+ * the keys was most of what a merge cost (2026-10-16).
  */
 static void
 lo_set_finish(LionOrderedState *st, LionTidSet *set)
 {
 	int		   *order;
+	uint64	   *packed;
 	uint32	   *keys;
 	LionContainer **conts;
 	uint64	   *img;
 	LionContainer *out;
+	int			npieces;
+	int			a;
+	int			b;
 	int			n = 0;
 	int			i;
 
@@ -2864,14 +2896,33 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 		return;
 	}
 
-	order = (int *) MemoryContextAlloc(st->buildcxt, sizeof(int) * set->n);
-	for (i = 0; i < set->n; i++)
-		order[i] = i;
-	qsort_arg(order, set->n, sizeof(int), lo_cmp_slot, set->keys);
+	Assert(set->nmerged >= 0 && set->nmerged <= set->n);
+	npieces = set->n - set->nmerged;
+	packed = (uint64 *) MemoryContextAllocHuge(st->buildcxt,
+											   sizeof(uint64) * Max(npieces, 1));
+	for (i = 0; i < npieces; i++)
+		packed[i] = ((uint64) set->keys[set->nmerged + i] << 32) |
+			(uint64) (uint32) (set->nmerged + i);
+	lo_sort_slots(packed, npieces);
 
-	keys = (uint32 *) MemoryContextAlloc(st->setcxt, sizeof(uint32) * set->cap);
+	/* the merged entries before the pieces at an equal key, as by slot */
+	order = (int *) MemoryContextAllocHuge(st->buildcxt, sizeof(int) * set->n);
+	a = 0;
+	b = 0;
+	for (i = 0; i < set->n; i++)
+	{
+		if (b >= npieces ||
+			(a < set->nmerged && set->keys[a] <= (uint32) (packed[b] >> 32)))
+			order[i] = a++;
+		else
+			order[i] = (int) (uint32) packed[b++];
+	}
+	pfree(packed);
+
+	keys = (uint32 *) MemoryContextAllocHuge(st->setcxt,
+											 sizeof(uint32) * set->cap);
 	conts = (LionContainer **)
-		MemoryContextAlloc(st->setcxt, sizeof(LionContainer *) * set->cap);
+		MemoryContextAllocHuge(st->setcxt, sizeof(LionContainer *) * set->cap);
 	img = (uint64 *) MemoryContextAlloc(st->buildcxt, LION_BITSET_BYTES);
 	out = (LionContainer *) MemoryContextAlloc(st->buildcxt,
 											   LION_CONTAINER_MAX_SIZE);
