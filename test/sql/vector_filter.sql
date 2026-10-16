@@ -243,9 +243,12 @@ RESET work_mem;
 RESET plan_cache_mode;
 
 -- a few members in every container key.  A scan restricted to no more than
--- pg_lion.vector_exact_rows (2,000) of them fetches each one's distance from
--- the heap, and reads no CODE page (DESIGN.md §44.6); one restricted to more
--- probes partitions, as an unrestricted scan does.
+-- pg_lion.vector_exact_rows (2,000) of them, or than
+-- pg_lion.vector_exact_per_partition (1.5) a partition if that is more,
+-- fetches each one's distance from the heap, and reads no CODE page
+-- (DESIGN.md §44.6); one restricted to more probes partitions, as an
+-- unrestricted scan does.  Here the 2,000 decide: 1.5 of the 400 partitions
+-- is 600.
 CREATE TABLE vfb (id int, s int, v vector(64)) WITH (autovacuum_enabled = off);
 INSERT INTO vfb SELECT i, i % 2000, vf_vec(i, 64) FROM generate_series(1, 40000) i;
 -- pins the old default's count, 2 sqrt(n) = 400, for test time (1,600: 42 s)
@@ -281,8 +284,10 @@ SELECT pg_stat_clear_snapshot();
 SELECT vfb_blks() AS b2 \gset
 -- the threshold moved: at 0 the 200 members are probed for, as the 4,000
 -- were, and at 5,000 the 4,000 are fetched, as the 200 were; the order is
--- the same either way
+-- the same either way.  (pg_lion.vector_exact_per_partition is 0 as well,
+-- or its 1.5 a partition would keep the 200, half a partition, exact.)
 SET pg_lion.vector_exact_rows = 0;
+SET pg_lion.vector_exact_per_partition = 0;
 SELECT vf_ord('SELECT id, v <-> vf_vec(7, 64) AS d FROM vfb WHERE s < 10
 			   ORDER BY v <-> vf_vec(7, 64) LIMIT 10');
 SELECT pg_stat_force_next_flush();
@@ -305,11 +310,90 @@ SELECT pg_stat_force_next_flush();
 SELECT pg_stat_clear_snapshot();
 SELECT vfb_blks() AS b6 \gset
 RESET pg_lion.vector_exact_rows;
+RESET pg_lion.vector_exact_per_partition;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
 SELECT :b1 - :b0 > 0 AS "read some", 4 * (:b1 - :b0) < :b2 - :b1 AS "read few";
 SELECT 4 * (:b1 - :b0) < :b4 - :b3 AS "probed at 0", 4 * (:b6 - :b5) < :b2 - :b1 AS "fetched at 5000";
+
+-- pg_lion.vector_exact_per_partition alone (pg_lion.vector_exact_rows 0):
+-- what decides is the members a partition, not their number (DESIGN.md
+-- §44.6).  At the default, 1.5, the 200 members, half a partition, are
+-- fetched; at 0 they are probed for.  The 4,000, ten a partition, are
+-- fetched at 10, the bound itself, and probed for at 9.99.  The scan's
+-- DEBUG1 line says when it fetched every member, and the index blocks a
+-- scan read when it probed; the order is the same either way.
+SET pg_lion.vector_exact_rows = 0;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = off;
+SET client_min_messages = debug1;
+SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 10
+					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10) s;
+SET pg_lion.vector_exact_per_partition = 10;
+SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 200
+					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10) s;
+RESET client_min_messages;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+SELECT vfb_blks() AS b7 \gset
+SET pg_lion.vector_exact_per_partition = 9.99;
+SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 200
+					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10) s;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+SELECT vfb_blks() AS b8 \gset
+SET pg_lion.vector_exact_per_partition = 0;
+SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 10
+					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10) s;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_clear_snapshot();
+SELECT vfb_blks() AS b9 \gset
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+SELECT 4 * (:b1 - :b0) < :b8 - :b7 AS "probed at 9.99", 4 * (:b1 - :b0) < :b9 - :b8 AS "probed at 0";
+SET pg_lion.vector_exact_per_partition = 10;
+SELECT vf_ord('SELECT id, v <-> vf_vec(7, 64) AS d FROM vfb WHERE s < 200
+			   ORDER BY v <-> vf_vec(7, 64) LIMIT 10');
+SET pg_lion.vector_exact_per_partition = 9.99;
+SELECT vf_ord('SELECT id, v <-> vf_vec(7, 64) AS d FROM vfb WHERE s < 200
+			   ORDER BY v <-> vf_vec(7, 64) LIMIT 10');
+-- and the planner prices what the scan will do, from the same partition
+-- count: the node's start-up at 20 a partition (8,000, past the 4,000 it
+-- expects) is the exact path's, as pg_lion.vector_exact_rows = 5,000 prices
+-- it, not the probes' (both thresholds 0)
+CREATE FUNCTION vfb_startup() RETURNS float8 LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN SELECT id FROM vfb WHERE s < 200
+					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10' LOOP
+		IF ln ~ 'Custom Scan \(LionOrdered\)' THEN
+			RETURN substring(ln from 'cost=([0-9]+\.[0-9]+)\.\.')::float8;
+		END IF;
+	END LOOP;
+	RETURN NULL;
+END $$;
+SET pg_lion.vector_exact_per_partition = 20;
+SELECT vfb_startup() AS c0 \gset
+SET pg_lion.vector_exact_per_partition = 0;
+SET pg_lion.vector_exact_rows = 5000;
+SELECT vfb_startup() AS c1 \gset
+SET pg_lion.vector_exact_rows = 0;
+SELECT vfb_startup() AS c2 \gset
+SELECT :c0 = :c1 AS "priced exact", :c0 <> :c2 AS "not as probes";
+RESET pg_lion.vector_exact_rows;
+RESET pg_lion.vector_exact_per_partition;
+-- the setting's range
+SET pg_lion.vector_exact_per_partition = -1;
+SET pg_lion.vector_exact_per_partition = 1000001;
+SHOW pg_lion.vector_exact_per_partition;
+DROP FUNCTION vfb_startup();
 DROP FUNCTION vfb_blks();
 
 /*
@@ -346,7 +430,7 @@ END $$;
 -- query, and misses few of its nearest members
 RESET pg_lion.vector_margin;
 RESET pg_lion.vector_patience;
-SELECT op, avg(vf_recall(format('SELECT id FROM vf WHERE cat <> 5 AND v IS NOT NULL
+SELECT op, avg(vf_recall(format('SELECT id FROM vf WHERE cat <> 5
 								  ORDER BY v %s vf_vec(-%s, 24) + vf_vec(%s, 24, 0.3)
 								  LIMIT 10', op, s % 10 + 1, s + 20000))) >= 0.9
 	   AS "most of the nearest"
@@ -379,8 +463,10 @@ SET pg_lion.vector_patience = 0;
 
 /*
  * vf_unique() runs q - which returns a column id - through the node, and
- * through the vector scan with a Filter (the node off), and counts the rows
- * and the distinct ones of each.
+ * through the vector scan with a Filter (the node off, and
+ * pg_lion.vector_postfilter = allow, without which no plan filters a lionvec
+ * scan's rows: DESIGN.md §44.6, "Post-filtering"), and counts the rows and
+ * the distinct ones of each.
  */
 CREATE FUNCTION vf_unique(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -389,6 +475,7 @@ DECLARE
 	b text;
 	used boolean := false;
 	ln text;
+	postfilter text := current_setting('pg_lion.vector_postfilter');
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
@@ -401,8 +488,10 @@ BEGIN
 		q || ') s' INTO a;
 	PERFORM set_config('enable_indexscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	PERFORM set_config('pg_lion.vector_postfilter', 'allow', true);
 	EXECUTE 'SELECT format(''%s rows, %s distinct'', count(*), count(DISTINCT id)) FROM (' ||
 		q || ') s' INTO b;
+	PERFORM set_config('pg_lion.vector_postfilter', postfilter, true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
@@ -457,14 +546,19 @@ SELECT op, vf_unique(format('SELECT id FROM vf WHERE cat <> 5 ORDER BY v %s vf_v
 							op)) AS result
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
 
--- off, the node is not offered: the vector scan filters instead (sorts are
--- off, or sorting the lion scan's rows would be cheaper)
+-- off, the node is not offered, and no plan filters the vector scan's rows
+-- either (pg_lion.vector_postfilter, DESIGN.md §44.6, "Post-filtering"): the
+-- filter's rows are sorted, exactly.  Under allow the vector scan filters
+-- instead (sorts are off, or sorting the lion scan's rows would be cheaper).
 SET pg_lion.enable_ordered_scan = off;
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_sort = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM vf WHERE tag = 3 ORDER BY v <-> '[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]' LIMIT 5;
+SET pg_lion.vector_postfilter = allow; SET enable_sort = off;
 EXPLAIN (COSTS OFF)
 SELECT id FROM vf WHERE tag = 3 ORDER BY v <-> '[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]' LIMIT 5;
 RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_sort;
-RESET pg_lion.enable_ordered_scan;
+RESET pg_lion.vector_postfilter; RESET pg_lion.enable_ordered_scan;
 
 DEALLOCATE vfp;
 DEALLOCATE vfd;
