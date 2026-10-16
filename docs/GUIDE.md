@@ -519,3 +519,56 @@ bound failed), which costs that row and nothing else. A filter answered exactly
 (`pg_lion.vector_exact_rows`, `pg_lion.vector_exact_per_partition`) logs `N members fetched, N
 returned` instead. `pg_lion.vector_margin` and `pg_lion.vector_patience` read more partitions or fewer, and
 `pg_lion.vector_epsilon` widens or narrows the bounds (DESIGN.md §44.8).
+
+A scan asks for the pages it will read next before it reads them - the rest of a partition's code
+pages, which the build wrote one after another, the refine pages and table rows at the front of its
+queues, and under a small filter every matching row - as many ahead as the tablespace's
+`effective_io_concurrency`, up to 64 (`pg_lion.vector_prefetch`, on by default; DESIGN.md §44.4,
+"Prefetch"). It never changes an answer. It matters when the index is not in memory: on DBpedia's
+115,386 embeddings, each query alone after a restart with the page cache dropped, a scan at
+`pg_lion.vector_margin = 8` took 32 ms rather than 49, and at the default margin 17 rather than 21.
+Table rows are asked for only where their vectors lie in the table's pages: pgvector stores a
+vector of more than 506 dimensions (a `halfvec` of more than 1,012) in TOAST, which reading the
+row's page ahead does not reach, unless the column is set so:
+
+```sql
+ALTER TABLE items ALTER embedding SET STORAGE PLAIN;  -- new rows; existing ones once rewritten
+```
+
+With the vectors in the table so, a 1% filter answered exactly, from every matching row's vector,
+took 33 ms cold rather than 71. In shared buffers prefetch costs about 2% (2.33 ms rather than
+2.29 at the default margin, 5.0 rather than 4.9 at 8): a scan whose asks keep finding their pages
+there mostly stops asking. `SET pg_lion.vector_prefetch = off` turns it off altogether.
+
+An unfiltered `ORDER BY embedding <=> $1 LIMIT k` can run in parallel: a Gather Merge over a
+Parallel Index Scan, each process probing the partitions it reaches first and returning their rows
+nearest first, merged into one order (DESIGN.md §44.4, "A parallel scan"). At the planner's default
+costs it stays serial - `parallel_setup_cost` (1000) is more than a serial scan's start-up - and a
+table whose heap is under `min_parallel_table_scan_size` (8 MB, as it is when the vectors are in
+TOAST) is planned no workers unless its `parallel_workers` is set:
+
+```sql
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 10;
+ALTER TABLE items SET (parallel_workers = 2);   -- or lower min_parallel_table_scan_size
+
+EXPLAIN (COSTS OFF) SELECT id FROM items ORDER BY embedding <=> $1 LIMIT 10;
+--  Limit
+--    ->  Gather Merge
+--          Workers Planned: 2
+--          ->  Parallel Index Scan using items_emb on items
+--                Order By: (embedding <=> $1)
+```
+
+It was not faster on any query measured. Each process ranks every centroid and probes until its
+own margin and patience stop it, so two processes probe about 1.6 times the partitions one does and
+four 3.7 times, finding a little more of the nearest rows for it (on DBpedia at the default margin,
+93.5% and 95% of the true ten against 92%); Gather Merge waits for every process's first row, the
+workers take about 10 ms to start, and they run on into their queues after the `LIMIT` has its
+rows. On DBpedia in memory the serial scan took 2.4 ms and the parallel ones 12 and 16; each
+query alone cold, 17 ms and 28 with two processes. A filtered query stays serial: `LionOrdered`,
+which a filter that lion indexes answer goes through, has no parallel plan, and under `pg_lion.vector_postfilter = exact`
+(the default) no plan filters a parallel scan's rows either; under `allow` a parallel scan with a
+`Filter` is among the plans. Each process sends its own `DEBUG1` line, ending with the partitions
+another process probed and, in an index that spills, the rows another returned; with prefetch, the
+pages it asked for and how many of them were not in shared buffers.

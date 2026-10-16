@@ -609,6 +609,60 @@ extern void lionvec_kmeans_update(const LionVecSample *s, int k, bool unit,
 								  LionVecKmeansWork *w);
 
 /*
+ * Prefetch (DESIGN.md §44.4, "Prefetch"): what a scan reads next, asked of
+ * the kernel ahead of the read, a page at a time.
+ *
+ * A partition's CODE chain as the build wrote it is a run of consecutive
+ * blocks, its first page and as many more as its items fill, perpage a page
+ * (lionvec_items_per_page() of the page's room and an item with its line
+ * pointer): lionvec_chain_pages() of the items its PART item counts, at
+ * least the one page every chain starts with.  A probe asks for the pages
+ * after the one it reads, up to dist of them and no further than that run
+ * (lionvec_prefetch_end()); pages inserts added later lie elsewhere.
+ */
+static inline int
+lionvec_items_per_page(Size room, Size itemsz)
+{
+	Size		n = itemsz > 0 ? room / itemsz : 0;
+
+	return n < 1 ? 1 : (n > (Size) PG_INT32_MAX ? PG_INT32_MAX : (int) n);
+}
+
+static inline uint32
+lionvec_chain_pages(uint32 nitems, int perpage)
+{
+	if (perpage < 1)
+		perpage = 1;
+	return nitems == 0 ? 1 : (nitems - 1) / (uint32) perpage + 1;
+}
+
+/*
+ * ... the block past the last a reader of blk asks for: up to dist pages
+ * after it, none at or past end (the run's end, or the relation's), and
+ * never one before blk + 1 - so blk + 1 when there is nothing to ask for.
+ * In 64 bits, so that no block number wraps.
+ */
+static inline uint64
+lionvec_prefetch_end(uint64 blk, int dist, uint64 end)
+{
+	uint64		e = blk + 1 + (uint64) (dist > 0 ? dist : 0);
+
+	if (e > end)
+		e = end;
+	return e < blk + 1 ? blk + 1 : e;
+}
+
+/*
+ * The m least of key[0 .. n), as their places in key, into idx[], which
+ * must hold min(n, m) of them, and how many that is: lionvec_rank()'s set,
+ * in no particular order, by a heap of m rather than an insertion sort, so
+ * in O(n log m) - what a scan asks of its queue's top every few rows, to
+ * prefetch the pages the next of them will read.  Ties go to the lower
+ * place, and a NaN key counts as infinite.
+ */
+extern int	lionvec_least(const double *key, int n, int m, int *idx);
+
+/*
  * The scan orders rows by a KEY that is the distance up to a constant of the
  * query: what changes from row to row of an estimate of <x, qc>.
  *

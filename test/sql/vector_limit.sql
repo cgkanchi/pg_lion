@@ -20,6 +20,9 @@ CREATE EXTENSION IF NOT EXISTS pg_lion_vector;
 RESET client_min_messages;
 SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
+-- the scans' DEBUG1 lines below, with no prefetch, whose counts they would
+-- add (which vector_scan_parallel tests)
+SET pg_lion.vector_prefetch = off;
 
 CREATE FUNCTION vl_vec(seed bigint, n int, scale float8 DEFAULT 1.0)
 RETURNS vector LANGUAGE sql IMMUTABLE AS $$
