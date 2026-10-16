@@ -655,8 +655,8 @@ that reaches one anyway fails with an error rather than return a different answe
 snapshot's (DESIGN.md §9).  Inserts and VACUUM work as usual.
 
 A `lionvec` index (DESIGN.md §44) answers only an `ORDER BY` of its own distance operator, forward.
-It has no search operators, no bitmap or index-only scans, no INCLUDE columns and no parallel scan
-or build, and indexes a single column of pgvector's `vector` or `halfvec` (not `sparsevec` or
+It has no search operators, no bitmap or index-only scans, no INCLUDE columns and no parallel scan,
+and indexes a single column of pgvector's `vector` or `halfvec` (not `sparsevec` or
 `bit`) of at most 8128 dimensions. Its results are approximate (`pg_lion.vector_margin`), except under a
 lion filter of up to `pg_lion.vector_exact_rows` rows. Inserts serialize on the index's meta page and read every
 partition's centroid. VACUUM removes dead rows' codes but reuses their space only for new rows on
@@ -665,7 +665,13 @@ recomputes the partitions and the mean the codes are centred on (rows that have 
 make scans read more or miss more, never answer out of order). Building a large index runs k-means
 over every sampled row and every partition, and then compares every row with every partition's
 centroid, so it grows with the rows times the partitions: 19 minutes for a million rows in 2,000
-partitions, and about four times that in the default 8,000.
+partitions, and about four times that in the default 8,000. Both steps are shared among
+`max_parallel_maintenance_workers` workers and the build's own process, from PostgreSQL 16, for a
+table of 10,000 rows or more or one whose `parallel_workers` is set (DESIGN.md §44.12): 115,186
+rows of 1536 dimensions in 2,715 partitions built in 125 to 134 s serially and 38 s with three
+workers on four cores. A parallel build holds its sample, up to half of `maintenance_work_mem`,
+and the centroids in dynamic shared memory, which Docker limits to 64 MB unless given
+`--shm-size`.
 Each returned row is fetched from the heap twice, once for its distance and once by the executor.
 A small `work_mem` with a large `LIMIT` makes a scan read its partitions several times (`SET
 client_min_messages = debug1` shows the passes).

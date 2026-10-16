@@ -37,9 +37,11 @@
 
 #include "access/amapi.h"
 #include "access/amvalidate.h"
+#include "access/parallel.h"
 #include "access/generic_xlog.h"
 #include "access/htup_details.h"
 #include "access/reloptions.h"
+#include "access/table.h"
 #include "access/tableam.h"
 #include "access/tupdesc.h"
 #include "access/xloginsert.h"
@@ -52,21 +54,31 @@
 #include "commands/defrem.h"
 #include "commands/vacuum.h"
 #include "common/pg_prng.h"
+#include "executor/instrument.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
+#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
+#include "pgstat.h"
+#include "port/atomics.h"
+#include "portability/instr_time.h"
 #include "storage/bufmgr.h"
+#include "storage/condition_variable.h"
 #include "storage/predicate.h"
+#include "storage/spin.h"
+#include "tcop/tcopprot.h"
 #include "utils/float.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
+#include "utils/snapmgr.h"
 #include "utils/spccache.h"
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
+#include "utils/wait_event.h"
 
 #include "lion_compat.h"
 #include "lion_vec.h"
@@ -804,19 +816,50 @@ lionvec_note_key(Page page, ItemPointer tid)
 #define LIONVEC_PARTS_PER_ROOT	8.0
 
 /*
- * The CODE items go through a sort by partition, then heap order: a key of
- * the group (a partition, then the rows in no partition, then the NULL rows
- * and zeros) above the row's place in the heap scan.  A row's copy goes in
- * at the same place in its second partition's group, so that the sort holds
- * two items a row of an index that spills.
+ * The CODE items go through a sort by group - a partition, then the rows in
+ * no partition, then the NULL rows and zeros - and then by the row's TID,
+ * its place in the heap: the order a serial scan delivers the rows in, and
+ * one a parallel build's, shared out among processes, comes back to.  A
+ * row's copy goes in under the same TID in its second partition's group.
+ * Each item carries the row's squared distance from its partition's
+ * centroid, which the partitions' figures are summed from as the items come
+ * out of the sort (lionvec_build_write_codes()): in the same order however
+ * the rows were shared out.  The columns of the sort's tuples:
  */
-#define LIONVEC_SEQ_BITS		40
-#define LIONVEC_SORT_KEY(group, seq) \
-	((int64) (((uint64) (group) << LIONVEC_SEQ_BITS) | (uint64) (seq)))
-#define LIONVEC_SORT_GROUP(key) ((uint32) ((uint64) (key) >> LIONVEC_SEQ_BITS))
+#define LIONVEC_SORT_GROUP		1	/* int4 */
+#define LIONVEC_SORT_TID		2	/* int8: the block above the offset */
+#define LIONVEC_SORT_DIST2		3	/* float8 */
+#define LIONVEC_SORT_ITEM		4	/* text: the CODE item's bytes */
+#define LIONVEC_SORT_NATTS		4
 
-StaticAssertDecl(LIONVEC_MAX_PARTS + 2 < (1 << (63 - LIONVEC_SEQ_BITS)),
-				 "lionvec: a partition's number fits the sort key");
+StaticAssertDecl(LIONVEC_MAX_PARTS + 2 < PG_INT32_MAX,
+				 "lionvec: a group's number fits the sort's int4");
+
+/*
+ * What k-means and the second pass share among a parallel build's
+ * processes (DESIGN.md §44.12), and what a serial build keeps in the same
+ * arrays, so that both run the same code over them: k-means' centroids and
+ * its assignment of the sample, then the partitions' centroids - plane 1,
+ * which k-means' iterations use for theirs too, their 8-bit codes and,
+ * spilling, their floats - and the rows' mean.
+ */
+typedef struct LionVecBuildArrays
+{
+	float	   *cent;			/* [nparts][dimsp]: k-means' centroids, then
+								 * (spilling) the partitions', centred */
+	uint64	   *cbits;			/* [nparts][dimsp / 64]: plane 1 */
+	uint16	   *cpop;			/* [nparts] */
+	float	   *cnorm;			/* [nparts] */
+	float	   *calpha1;		/* [nparts] */
+	float	   *cxm;			/* [nparts] */
+	uint8	   *ccodes;			/* [nparts][dimsp]: the 8-bit codes */
+	float	   *calpha8;		/* [nparts] */
+	float	   *crnorm8;		/* [nparts] */
+	int		   *assign;			/* [sn]: k-means' partition of each sample row */
+	float	   *mean;			/* [dimsp]: the rows' mean, rotated */
+} LionVecBuildArrays;
+
+typedef struct LionVecBuildLeader LionVecBuildLeader;
 
 typedef struct LionVecBuildState
 {
@@ -834,43 +877,37 @@ typedef struct LionVecBuildState
 	int			smax;
 	int			sn;
 	pg_prng_state sprng;
-	/* the second: the items */
+	/* the partitions */
 	LionVecInfo *info;
-	LionVecItems items;
 	int			nparts;
 	bool		spill;			/* a copy of each row in a second partition */
-	float	   *cent;			/* spilling: [nparts][dimsp], the centroids, centred */
-	double	   *ckey;			/* [nparts]: the candidates' keys */
-	int			crank[LIONVEC_SOAR_CANDS + 1];	/* ... the least of them */
-	const float *csoar[LIONVEC_SOAR_CANDS]; /* ... and SOAR's candidates */
-	LionVecCentroids cents;		/* the centroids' plane 1 ... */
-	uint64	   *cbits;			/* [nparts][dimsp / 64] */
-	uint16	   *cpop;			/* [nparts] */
-	float	   *cnorm;			/* [nparts] */
-	float	   *calpha1;		/* [nparts] */
-	float	   *cxm;			/* [nparts] */
-	uint8	   *ccodes;			/* [nparts][dimsp]: ... their 8-bit codes */
-	float	   *calpha8;		/* [nparts] */
-	float	   *crnorm8;		/* [nparts] */
-	BlockNumber *crblk;			/* [nparts]: ... and their REFINE items */
-	OffsetNumber *croff;		/* [nparts] */
-	uint32	   *pcount;			/* [nparts]: the items put in each, copies too */
-	float	   *pmaxnorm;		/* [nparts]: the largest |x + m| of their rows */
-	double	   *psumsq;			/* [nparts]: their sum of |x - c|^2 */
+	LionVecBuildArrays a;
+	LionVecCentroids cents;		/* the centroids' plane 1, from a */
 	double		mean2;			/* |m|^2, m the mean */
-	double		sumsq;			/* sum of |x - c|^2, x a row and c its nearest */
-	double		nsq;			/* ... over this many rows */
+	BlockNumber *crblk;			/* [nparts]: the centroids' REFINE items */
+	OffsetNumber *croff;		/* [nparts] */
+	/* the second pass: the items, each row's from its nearest centroids */
+	LionVecItems items;
 	LionVecQuery q;				/* a row, as its nearest centroid is found by */
 	double	   *lo;				/* [nparts] */
 	double	   *hi;				/* [nparts] */
 	int		   *cand;			/* [nparts] */
+	double	   *ckey;			/* [nparts]: the candidates' keys */
+	int			crank[LIONVEC_SOAR_CANDS + 1];	/* ... the least of them */
+	const float *csoar[LIONVEC_SOAR_CANDS]; /* ... and SOAR's candidates */
 	Buffer		rbuf;			/* the REFINE page being filled */
 	BlockNumber refine_tail;
-	Tuplesortstate *sort;		/* the CODE items, by LIONVEC_SORT_KEY() */
+	Tuplesortstate *sort;		/* the CODE items in, by LIONVEC_SORT_* */
 	TupleTableSlot *inslot;
-	TupleTableSlot *outslot;
 	text	   *sortitem;		/* [LIONVEC_CODE_SIZE(dimsp) + VARHDRSZ] */
 	double		indtuples;
+	/* summed from the sort's output (lionvec_build_write_codes()) */
+	uint32	   *pcount;			/* [nparts]: the items put in each, copies too */
+	float	   *pmaxnorm;		/* [nparts]: the largest |x + m| of their rows */
+	double	   *psumsq;			/* [nparts]: their sum of |x - c|^2 */
+	double		sumsq;			/* sum of |x - c|^2, x a row and c its nearest */
+	double		nsq;			/* ... over this many rows */
+	LionVecBuildLeader *leader; /* a parallel build's, in its leader */
 	MemoryContext buildcxt;		/* what lasts the build */
 	MemoryContext tmpcxt;		/* reset after each row */
 } LionVecBuildState;
@@ -879,6 +916,66 @@ static Buffer
 lionvec_new_buffer(Relation index, ForkNumber fork)
 {
 	return ExtendBufferedRel(BMR_REL(index), fork, NULL, EB_LOCK_FIRST);
+}
+
+/*
+ * Lay a's arrays out from base, for nparts partitions of dimsp dimensions
+ * and a sample of sn rows, each MAXALIGNed; returns the bytes they take.
+ * With base NULL only the bytes are counted, and a is not touched.  The
+ * sizes are checked for overflow (add_size(), mul_size()).
+ */
+static Size
+lionvec_build_arrays(char *base, int nparts, int sn, int dimsp,
+					 LionVecBuildArrays *a)
+{
+	Size		off = 0;
+	Size		k = (Size) nparts;
+
+#define LIONVEC_PLACE(field, type, count) \
+	do { \
+		if (base != NULL) \
+			a->field = (type *) (base + off); \
+		off = add_size(off, MAXALIGN(mul_size(sizeof(type), (count)))); \
+	} while (0)
+
+	Assert(nparts >= 1 && sn >= nparts && dimsp >= 64 && dimsp % 64 == 0);
+	LIONVEC_PLACE(cent, float, mul_size(k, dimsp));
+	LIONVEC_PLACE(cbits, uint64, mul_size(k, dimsp / 64));
+	LIONVEC_PLACE(cpop, uint16, k);
+	LIONVEC_PLACE(cnorm, float, k);
+	LIONVEC_PLACE(calpha1, float, k);
+	LIONVEC_PLACE(cxm, float, k);
+	LIONVEC_PLACE(ccodes, uint8, mul_size(k, dimsp));
+	LIONVEC_PLACE(calpha8, float, k);
+	LIONVEC_PLACE(crnorm8, float, k);
+	LIONVEC_PLACE(assign, int, (Size) sn);
+	LIONVEC_PLACE(mean, float, (Size) dimsp);
+#undef LIONVEC_PLACE
+	return off;
+}
+
+/*
+ * The rotation, and the mean rotated, as the build's processes each keep
+ * them: of dims dimensions, a metric's and half's, and with the mean of
+ * mean[dimsp] when it is not NULL.
+ */
+static LionVecInfo *
+lionvec_build_info(int metric, bool half, int dims, const float *mean)
+{
+	int			dimsp = LIONVEC_PADDED(dims);
+	LionVecInfo *info = palloc0(lionvec_info_size(dimsp));
+
+	info->metric = metric;
+	info->half = half;
+	info->dims = dims;
+	info->dimsp = dimsp;
+	info->seed = LIONVEC_SEED;
+	lionvec_info_fix(info, mean != NULL);
+	if (dims > 0)
+		lionvec_rotation_init(&info->rot, dimsp, LIONVEC_SEED, info->rot.signs);
+	if (info->mean != NULL)
+		memcpy(info->mean, mean, sizeof(float) * dimsp);
+	return info;
 }
 
 /*
@@ -1011,19 +1108,28 @@ lionvec_partitions(Relation index, double nrows, int sampled)
 	return (int) Max(1.0, Min(want, (double) LIONVEC_MAX_PARTS));
 }
 
-/* Put a REFINE item on the page being filled, or a new one. */
+/*
+ * Put a REFINE item on the page being filled, or a new one.  The page stays
+ * pinned between items but is locked only while one goes in: a content
+ * lock holds off interrupts, and the build's rows are read between items -
+ * so that a cancel, or in a parallel build a worker's error reaching the
+ * leader or the leader's ending a worker, is seen at the next row.  Nothing
+ * else reads the index's pages while it is being built.
+ */
 static void
 lionvec_build_put_refine(LionVecBuildState *bs, LionVecRefine *ref, Size size,
 						 BlockNumber *blk, OffsetNumber *off)
 {
 	Page		page;
 
-	if (BufferIsValid(bs->rbuf) &&
-		PageGetFreeSpace(BufferGetPage(bs->rbuf)) < MAXALIGN(size))
+	if (BufferIsValid(bs->rbuf))
 	{
-		MarkBufferDirty(bs->rbuf);
-		UnlockReleaseBuffer(bs->rbuf);
-		bs->rbuf = InvalidBuffer;
+		LockBuffer(bs->rbuf, BUFFER_LOCK_EXCLUSIVE);
+		if (PageGetFreeSpace(BufferGetPage(bs->rbuf)) < MAXALIGN(size))
+		{
+			UnlockReleaseBuffer(bs->rbuf);
+			bs->rbuf = InvalidBuffer;
+		}
 	}
 	if (!BufferIsValid(bs->rbuf))
 	{
@@ -1036,107 +1142,140 @@ lionvec_build_put_refine(LionVecBuildState *bs, LionVecRefine *ref, Size size,
 	if (*off == InvalidOffsetNumber)
 		elog(ERROR, "lionvec: could not add a refine item of %zu bytes", size);
 	*blk = bs->refine_tail;
+	MarkBufferDirty(bs->rbuf);
+	LockBuffer(bs->rbuf, BUFFER_LOCK_UNLOCK);
+}
+
+/* Let go of the REFINE page being filled, if there is one. */
+static void
+lionvec_build_end_refine(LionVecBuildState *bs)
+{
+	if (BufferIsValid(bs->rbuf))
+	{
+		ReleaseBuffer(bs->rbuf);
+		bs->rbuf = InvalidBuffer;
+	}
 }
 
 /*
- * The partitions: k-means over the sample, in the rotated space (which
- * changes no distance), spherical for cosine, whose rows are of unit length;
- * then each centroid coded as a row is, its 8-bit codes in a REFINE item
- * and its plane 1 kept for the PART chain and for finding each row's
- * nearest (lionvec_build_nearest()).  An index that spills keeps the
- * centroids' floats too, centred as the rows are, for SOAR's choice of a
- * row's second partition.  The sample is freed.
+ * Point bs at the arrays of a and the partitions' count it was laid out
+ * for, and give it what the second pass works in.
  */
 static void
-lionvec_build_centroids(LionVecBuildState *bs)
+lionvec_build_use_arrays(LionVecBuildState *bs)
+{
+	int			k = bs->nparts;
+	int			dimsp = bs->info->dimsp;
+
+	bs->cents.k = k;
+	bs->cents.dimsp = dimsp;
+	bs->cents.bits = bs->a.cbits;
+	bs->cents.popcount = bs->a.cpop;
+	bs->cents.norm = bs->a.cnorm;
+	bs->cents.alpha1 = bs->a.calpha1;
+	bs->q.dimsp = dimsp;
+	bs->q.qc = palloc(sizeof(float) * dimsp);
+	bs->q.planes = palloc(sizeof(uint64) * (dimsp / 64) * LIONVEC_QBITS);
+	bs->lo = palloc(sizeof(double) * k);
+	bs->hi = palloc(sizeof(double) * k);
+	bs->cand = palloc(sizeof(int) * k);
+	bs->ckey = palloc(sizeof(double) * k);
+}
+
+/* What lionvec_kmeans() works in, its centroids' plane 1 in bs->a. */
+static void
+lionvec_build_kmeans_work(LionVecBuildState *bs, LionVecKmeansWork *w)
+{
+	int			k = bs->nparts;
+	int			dimsp = bs->info->dimsp;
+
+	memset(w, 0, sizeof(*w));
+	w->count = palloc(sizeof(int) * k);
+	w->assign = bs->a.assign;
+	w->bits = bs->a.cbits;
+	w->popcount = bs->a.cpop;
+	w->norm = bs->a.cnorm;
+	w->alpha1 = bs->a.calpha1;
+	w->lo = palloc(sizeof(double) * k);
+	w->hi = palloc(sizeof(double) * k);
+	w->cand = palloc(sizeof(int) * k);
+	w->x = palloc(sizeof(float) * dimsp);
+	w->y = palloc(sizeof(float) * dimsp);
+	w->codes = palloc(dimsp);
+	w->qc = palloc(sizeof(float) * dimsp);
+	w->planes = palloc(sizeof(uint64) * (dimsp / 64) * LIONVEC_QBITS);
+}
+
+static void
+lionvec_build_kmeans_work_free(LionVecKmeansWork *w)
+{
+	pfree(w->count);
+	pfree(w->lo);
+	pfree(w->hi);
+	pfree(w->cand);
+	pfree(w->x);
+	pfree(w->y);
+	pfree(w->codes);
+	pfree(w->qc);
+	pfree(w->planes);
+}
+
+static int	lionvec_parallel_kmeans(LionVecBuildState *bs, const LionVecSample *s,
+									LionVecKmeansWork *w);
+
+/*
+ * The partitions: k-means over the sample, in the rotated space (which
+ * changes no distance), spherical for cosine, whose rows are of unit length
+ * - its iterations' rows shared out among a parallel build's processes
+ * (lionvec_parallel_kmeans()) - then each centroid coded as a row is, its
+ * 8-bit codes in a REFINE item and its plane 1 kept for the PART chain and
+ * for finding each row's nearest (lionvec_build_nearest()).  An index that
+ * spills keeps the centroids' floats too, centred as the rows are, for
+ * SOAR's choice of a row's second partition.
+ */
+static void
+lionvec_build_centroids(LionVecBuildState *bs, const LionVecSample *sample)
 {
 	int			k = bs->nparts;
 	int			dimsp = bs->info->dimsp;
 	int			nw = dimsp / 64;
-	LionVecSample sample;
 	LionVecKmeansWork w;
-	float	   *cent;
 	LionVecRefine *ref;
 	Size		rsize = LIONVEC_REFINE_SIZE(dimsp);
 	int			made;
 	int			j;
 
-	Assert(k >= 1 && k <= bs->sn);
-	sample.n = bs->sn;
-	sample.dimsp = dimsp;
-	sample.codes = bs->scodes;
-	sample.scale = bs->sscale;
-
-	cent = MemoryContextAllocHuge(CurrentMemoryContext, sizeof(float) * (Size) k * dimsp);
-	w.count = palloc(sizeof(int) * k);
-	w.assign = palloc(sizeof(int) * bs->sn);
-	w.bits = MemoryContextAllocHuge(CurrentMemoryContext, sizeof(uint64) * (Size) k * nw);
-	w.popcount = palloc(sizeof(uint16) * k);
-	w.norm = palloc(sizeof(float) * k);
-	w.alpha1 = palloc(sizeof(float) * k);
-	w.lo = palloc(sizeof(double) * k);
-	w.hi = palloc(sizeof(double) * k);
-	w.cand = palloc(sizeof(int) * k);
-	w.x = palloc(sizeof(float) * dimsp);
-	w.y = palloc(sizeof(float) * dimsp);
-	w.codes = palloc(dimsp);
-	w.qc = palloc(sizeof(float) * dimsp);
-	w.planes = palloc(sizeof(uint64) * nw * LIONVEC_QBITS);
-
-	made = lionvec_kmeans(&sample, k, LIONVEC_KMEANS_ITERS,
-						  bs->metric == LIONVEC_COSINE, (uint64) LIONVEC_SEED,
-						  bs->info->mean, cent, &w);
+	Assert(k >= 1 && k <= sample->n);
+	lionvec_build_kmeans_work(bs, &w);
+	if (bs->leader != NULL)
+		made = lionvec_parallel_kmeans(bs, sample, &w);
+	else
+		made = lionvec_kmeans(sample, k, LIONVEC_KMEANS_ITERS,
+							  bs->metric == LIONVEC_COSINE, (uint64) LIONVEC_SEED,
+							  bs->info->mean, bs->a.cent, &w);
 	elog(DEBUG1, "lionvec index \"%s\": %d partitions from a sample of %d rows, %d k-means iterations",
-		 RelationGetRelationName(bs->index), k, bs->sn, made);
+		 RelationGetRelationName(bs->index), k, sample->n, made);
 
-	pfree(w.count);
-	pfree(w.assign);
-	pfree(w.bits);
-	pfree(w.popcount);
-	pfree(w.norm);
-	pfree(w.alpha1);
-	pfree(w.lo);
-	pfree(w.hi);
-	pfree(w.cand);
-	pfree(w.y);
-	pfree(w.codes);
-	pfree(w.qc);
-	pfree(w.planes);
-	pfree(bs->scodes);
-	pfree(bs->sscale);
-	bs->scodes = NULL;
-	bs->sscale = NULL;
-
-	bs->cbits = MemoryContextAllocHuge(CurrentMemoryContext, sizeof(uint64) * (Size) k * nw);
-	bs->cpop = palloc(sizeof(uint16) * k);
-	bs->cnorm = palloc(sizeof(float) * k);
-	bs->calpha1 = palloc(sizeof(float) * k);
-	bs->cxm = palloc(sizeof(float) * k);
-	bs->ccodes = MemoryContextAllocHuge(CurrentMemoryContext, (Size) k * dimsp);
-	bs->calpha8 = palloc(sizeof(float) * k);
-	bs->crnorm8 = palloc(sizeof(float) * k);
 	bs->crblk = palloc(sizeof(BlockNumber) * k);
 	bs->croff = palloc(sizeof(OffsetNumber) * k);
-	bs->pcount = palloc0(sizeof(uint32) * k);
-	bs->pmaxnorm = palloc0(sizeof(float) * k);
-	bs->psumsq = palloc0(sizeof(double) * k);
 	ref = palloc0(rsize);
 	for (j = 0; j < k; j++)
 	{
 		LionVecEncoded e;
+		float	   *c = bs->a.cent + (Size) j * dimsp;
 
-		memcpy(w.x, cent + (Size) j * dimsp, sizeof(float) * dimsp);
-		e.bits = bs->cbits + (Size) j * nw;
-		e.codes = bs->ccodes + (Size) j * dimsp;
+		memcpy(w.x, c, sizeof(float) * dimsp);
+		e.bits = bs->a.cbits + (Size) j * nw;
+		e.codes = bs->a.ccodes + (Size) j * dimsp;
 		lionvec_encode(bs->info->mean, dimsp, w.x, &e);
 		if (bs->spill)
-			memcpy(cent + (Size) j * dimsp, w.x, sizeof(float) * dimsp);	/* centred */
-		bs->cpop[j] = e.popcount;
-		bs->cnorm[j] = e.norm;
-		bs->calpha1[j] = e.alpha1;
-		bs->cxm[j] = e.xm;
-		bs->calpha8[j] = e.alpha8;
-		bs->crnorm8[j] = e.rnorm8;
+			memcpy(c, w.x, sizeof(float) * dimsp);	/* centred */
+		bs->a.cpop[j] = e.popcount;
+		bs->a.cnorm[j] = e.norm;
+		bs->a.calpha1[j] = e.alpha1;
+		bs->a.cxm[j] = e.xm;
+		bs->a.calpha8[j] = e.alpha8;
+		bs->a.crnorm8[j] = e.rnorm8;
 
 		LionVecCentTid(&ref->tid, j);
 		ref->alpha8 = e.alpha8;
@@ -1145,25 +1284,7 @@ lionvec_build_centroids(LionVecBuildState *bs)
 		lionvec_build_put_refine(bs, ref, rsize, &bs->crblk[j], &bs->croff[j]);
 	}
 	pfree(ref);
-	pfree(w.x);
-	if (bs->spill)
-		bs->cent = cent;
-	else
-		pfree(cent);
-
-	bs->cents.k = k;
-	bs->cents.dimsp = dimsp;
-	bs->cents.bits = bs->cbits;
-	bs->cents.popcount = bs->cpop;
-	bs->cents.norm = bs->cnorm;
-	bs->cents.alpha1 = bs->calpha1;
-	bs->q.dimsp = dimsp;
-	bs->q.qc = palloc(sizeof(float) * dimsp);
-	bs->q.planes = palloc(sizeof(uint64) * nw * LIONVEC_QBITS);
-	bs->lo = palloc(sizeof(double) * k);
-	bs->hi = palloc(sizeof(double) * k);
-	bs->cand = palloc(sizeof(int) * k);
-	bs->ckey = palloc(sizeof(double) * k);
+	lionvec_build_kmeans_work_free(&w);
 }
 
 /*
@@ -1200,9 +1321,9 @@ lionvec_build_nearest(LionVecBuildState *bs, const float *xc, float xnorm,
 		double		est;
 		double		err;
 
-		lionvec_estimate8(&bs->q, bs->ccodes + (Size) j * dimsp, bs->cnorm[j],
-						  bs->calpha8[j], bs->crnorm8[j], &est, &err);
-		bs->ckey[c] = (double) bs->cnorm[j] * bs->cnorm[j] - 2.0 * est;
+		lionvec_estimate8(&bs->q, bs->a.ccodes + (Size) j * dimsp, bs->a.cnorm[j],
+						  bs->a.calpha8[j], bs->a.crnorm8[j], &est, &err);
+		bs->ckey[c] = (double) bs->a.cnorm[j] * bs->a.cnorm[j] - 2.0 * est;
 	}
 	nr = lionvec_rank(bs->ckey, nc, m, bs->crank);
 
@@ -1223,8 +1344,8 @@ lionvec_build_nearest(LionVecBuildState *bs, const float *xc, float xnorm,
 		int			i;
 
 		for (i = 1; i < nr; i++)
-			bs->csoar[i - 1] = bs->cent + (Size) bs->cand[bs->crank[i]] * dimsp;
-		s = lionvec_soar_second(xc, bs->cent + (Size) best * dimsp, bs->csoar,
+			bs->csoar[i - 1] = bs->a.cent + (Size) bs->cand[bs->crank[i]] * dimsp;
+		s = lionvec_soar_second(xc, bs->a.cent + (Size) best * dimsp, bs->csoar,
 								nr - 1, dimsp, LIONVEC_SOAR_LAMBDA);
 		Assert(s >= 0 && s < nr - 1);
 		*second = bs->cand[bs->crank[s + 1]];
@@ -1233,18 +1354,68 @@ lionvec_build_nearest(LionVecBuildState *bs, const float *xc, float xnorm,
 	return best;
 }
 
-/* An item into the sort, in group's chain, at the row's place in the heap. */
+/* The sort's tuples (LIONVEC_SORT_*). */
+static TupleDesc
+lionvec_build_sort_desc(void)
+{
+	TupleDesc	desc = CreateTemplateTupleDesc(LIONVEC_SORT_NATTS);
+
+	TupleDescInitBuiltinEntry(desc, (AttrNumber) LIONVEC_SORT_GROUP, "grp", INT4OID, -1, 0);
+	TupleDescInitBuiltinEntry(desc, (AttrNumber) LIONVEC_SORT_TID, "tid", INT8OID, -1, 0);
+	/* float8 is not among TupleDescInitBuiltinEntry()'s types */
+	TupleDescInitEntry(desc, (AttrNumber) LIONVEC_SORT_DIST2, "dist2", FLOAT8OID, -1, 0);
+	TupleDescInitBuiltinEntry(desc, (AttrNumber) LIONVEC_SORT_ITEM, "item", TEXTOID, -1, 0);
+	TupleDescFinalize(desc);
+	return desc;
+}
+
+/*
+ * A sort of the sort's tuples by group, then TID, of memkb kilobytes: a
+ * serial build's, or with coordinate a parallel build's, a participant's own
+ * or the leader's over them all.
+ */
+static Tuplesortstate *
+lionvec_build_sort_begin(TupleDesc desc, int memkb, SortCoordinate coordinate)
+{
+	AttrNumber	cols[2] = {LIONVEC_SORT_GROUP, LIONVEC_SORT_TID};
+	Oid			ops[2] = {Int4LessOperator, Int8LessOperator};
+	Oid			colls[2] = {InvalidOid, InvalidOid};
+	bool		nullsfirst[2] = {false, false};
+
+	return tuplesort_begin_heap(desc, 2, cols, ops, colls, nullsfirst, memkb,
+								coordinate, TUPLESORT_NONE);
+}
+
+/* Ready bs for the second pass, its items into a sort of memkb kilobytes. */
+static void
+lionvec_build_rows_begin(LionVecBuildState *bs, int memkb,
+						 SortCoordinate coordinate)
+{
+	TupleDesc	desc = lionvec_build_sort_desc();
+
+	bs->inslot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	bs->sort = lionvec_build_sort_begin(desc, memkb, coordinate);
+	bs->sortitem = palloc(VARHDRSZ + LIONVEC_CODE_SIZE(Max(bs->info->dimsp, 64)));
+	lionvec_items_alloc(&bs->items, bs->info);
+}
+
+/* An item into the sort, in group's chain, its row's distance dist2. */
 static void
 lionvec_build_put_code(LionVecBuildState *bs, uint32 group, const LionVecCode *code,
-					   Size size)
+					   Size size, double dist2)
 {
+	BlockNumber blk = ItemPointerGetBlockNumberNoCheck(&code->tid);
+	OffsetNumber off = ItemPointerGetOffsetNumberNoCheck(&code->tid);
+
 	SET_VARSIZE(bs->sortitem, VARHDRSZ + size);
 	memcpy(VARDATA(bs->sortitem), code, size);
 	ExecClearTuple(bs->inslot);
-	bs->inslot->tts_values[0] = Int64GetDatum(LIONVEC_SORT_KEY(group, (uint64) bs->indtuples));
-	bs->inslot->tts_isnull[0] = false;
-	bs->inslot->tts_values[1] = PointerGetDatum(bs->sortitem);
-	bs->inslot->tts_isnull[1] = false;
+	bs->inslot->tts_values[LIONVEC_SORT_GROUP - 1] = Int32GetDatum((int32) group);
+	bs->inslot->tts_values[LIONVEC_SORT_TID - 1] =
+		Int64GetDatum((int64) (((uint64) blk << 16) | off));
+	bs->inslot->tts_values[LIONVEC_SORT_DIST2 - 1] = Float8GetDatum(dist2);
+	bs->inslot->tts_values[LIONVEC_SORT_ITEM - 1] = PointerGetDatum(bs->sortitem);
+	memset(bs->inslot->tts_isnull, 0, sizeof(bool) * LIONVEC_SORT_NATTS);
 	ExecStoreVirtualTuple(bs->inslot);
 	tuplesort_puttupleslot(bs->sort, bs->inslot);
 }
@@ -1258,6 +1429,8 @@ lionvec_build_callback(Relation index, ItemPointer tid, Datum *values,
 	MemoryContext old = MemoryContextSwitchTo(bs->tmpcxt);
 	uint32		group;
 	int			second = -1;
+	double		dist2 = 0.0;
+	double		dist2b = 0.0;
 
 	lionvec_items_fill(bs->info, it, tid, values[0], isnull[0]);
 	if (!it->hasref)
@@ -1265,41 +1438,18 @@ lionvec_build_callback(Relation index, ItemPointer tid, Datum *values,
 	else if (bs->nparts == 0)
 		group = 0;				/* the rows in no partition */
 	else
-	{
-		double		dist2;
-		double		dist2b;
-		double		norm = it->code->norm;
-		float		raw;
-
 		group = lionvec_build_nearest(bs, it->x, it->code->norm, &dist2,
 									  &second, &dist2b);
-		/* |x + m|, the row's own norm (a cosine row's 1) */
-		raw = (float) sqrt(Max(norm * norm + 2.0 * it->code->xm + bs->mean2, 0.0));
-		bs->pcount[group]++;
-		bs->psumsq[group] += dist2;
-		bs->pmaxnorm[group] = Max(bs->pmaxnorm[group], raw);
-		/* the scale (the margin's unit) is of rows about their nearest */
-		bs->sumsq += dist2;
-		bs->nsq += 1.0;
-		if (second >= 0)
-		{
-			bs->pcount[second]++;
-			bs->psumsq[second] += dist2b;
-			bs->pmaxnorm[second] = Max(bs->pmaxnorm[second], raw);
-		}
-	}
 	if (it->hasref)
 		lionvec_build_put_refine(bs, it->ref, LIONVEC_REFINE_SIZE(bs->info->dimsp),
 								 &it->code->rblk, &it->code->roff);
 
-	if (bs->indtuples >= (double) (UINT64CONST(1) << LIONVEC_SEQ_BITS))
-		elog(ERROR, "lionvec: too many rows to build an index of");
-	lionvec_build_put_code(bs, group, it->code, it->codesize);
+	lionvec_build_put_code(bs, group, it->code, it->codesize, dist2);
 	if (second >= 0)
 	{
 		/* the copy: the same item, pointing at the same REFINE item */
 		it->code->flags |= LIONVEC_SPILL;
-		lionvec_build_put_code(bs, (uint32) second, it->code, it->codesize);
+		lionvec_build_put_code(bs, (uint32) second, it->code, it->codesize, dist2b);
 		it->code->flags &= ~LIONVEC_SPILL;
 	}
 	bs->indtuples += 1;
@@ -1345,27 +1495,42 @@ lionvec_build_write_mean(Relation index, const float *mean, int dimsp)
 }
 
 /*
- * The CODE chains, from the sort: each group's items in heap order, on
- * pages of its own, the groups one after another in one run of blocks -
+ * The CODE chains, from the sort, sorted: each group's items in heap order,
+ * on pages of its own, the groups one after another in one run of blocks -
  * every partition, even an empty one, at least a page, for inserts to
  * append to; then the chain of rows in no partition, then that of the NULL
  * rows and zeros.  heads[] and tails[] get each group's ends, ngroups =
- * nparts + 2 of them.
+ * nparts + 2 of them.  The partitions' figures are summed as their items
+ * come: their items, the largest |x + m| of their rows and the sum of
+ * their squared distances from the centroid, and for the rows' own items
+ * (not the copies) that sum over every partition.
  */
 static void
-lionvec_build_write_codes(LionVecBuildState *bs, BlockNumber *heads,
-						  BlockNumber *tails)
+lionvec_build_write_codes(LionVecBuildState *bs, Tuplesortstate *sort,
+						  BlockNumber *heads, BlockNumber *tails)
 {
 	Relation	index = bs->index;
 	uint32		ngroups = (uint32) bs->nparts + 2;
 	uint32		group = 0;
 	Buffer		buf = InvalidBuffer;
 	Page		page = NULL;
-	char	   *item = palloc(LIONVEC_CODE_SIZE(Max(bs->info->dimsp, 64)));
+	Size		maxlen = LIONVEC_CODE_SIZE(Max(bs->info->dimsp, 64));
+	char	   *item = palloc(maxlen);
+	TupleTableSlot *slot = MakeSingleTupleTableSlot(lionvec_build_sort_desc(),
+													&TTSOpsMinimalTuple);
+	int64		last = -1;
 	bool		more;
 
-	tuplesort_performsort(bs->sort);
-	more = tuplesort_gettupleslot(bs->sort, true, false, bs->outslot, NULL);
+	if (bs->nparts > 0)
+	{
+		bs->pcount = palloc0(sizeof(uint32) * bs->nparts);
+		bs->pmaxnorm = palloc0(sizeof(float) * bs->nparts);
+		bs->psumsq = palloc0(sizeof(double) * bs->nparts);
+	}
+	bs->sumsq = 0.0;
+	bs->nsq = 0.0;
+
+	more = tuplesort_gettupleslot(sort, true, false, slot, NULL);
 	for (group = 0; group < ngroups; group++)
 	{
 		/* the group's first page */
@@ -1380,25 +1545,52 @@ lionvec_build_write_codes(LionVecBuildState *bs, BlockNumber *heads,
 		page = BufferGetPage(buf);
 		lionvec_init_page(page, LIONVEC_PAGE_CODE);
 		heads[group] = tails[group] = BufferGetBlockNumber(buf);
+		last = -1;
 
 		while (more)
 		{
 			bool		isnull;
-			int64		key = DatumGetInt64(slot_getattr(bs->outslot, 1, &isnull));
+			int32		g = DatumGetInt32(slot_getattr(slot, LIONVEC_SORT_GROUP, &isnull));
+			int64		key;
+			double		dist2;
 			Datum		d;
 			Size		len;
+			LionVecCode *code = (LionVecCode *) item;
 
-			if (LIONVEC_SORT_GROUP(key) < group)
+			if (g < 0 || (uint32) g < group)
 				elog(ERROR, "lionvec: the build's sort is out of order");
-			if (LIONVEC_SORT_GROUP(key) > group)
+			if ((uint32) g > group)
 				break;
 			CHECK_FOR_INTERRUPTS();
-			d = slot_getattr(bs->outslot, 2, &isnull);
+			key = DatumGetInt64(slot_getattr(slot, LIONVEC_SORT_TID, &isnull));
+			if (key < last)
+				elog(ERROR, "lionvec: the build's sort is out of order");
+			last = key;
+			dist2 = DatumGetFloat8(slot_getattr(slot, LIONVEC_SORT_DIST2, &isnull));
+			d = slot_getattr(slot, LIONVEC_SORT_ITEM, &isnull);
 			len = VARSIZE_ANY_EXHDR(DatumGetPointer(d));
-			if (len < LIONVEC_CODE_HDRSZ || len > LIONVEC_CODE_SIZE(Max(bs->info->dimsp, 64)))
+			if (len < LIONVEC_CODE_HDRSZ || len > maxlen)
 				elog(ERROR, "lionvec: the build's sort has an item of %zu bytes", len);
 			/* aligned, as the TID is read from it */
 			memcpy(item, VARDATA_ANY(DatumGetPointer(d)), len);
+
+			if (group < (uint32) bs->nparts)
+			{
+				/* |x + m|, the row's own norm (a cosine row's 1) */
+				double		norm = code->norm;
+				float		raw = (float) sqrt(Max(norm * norm + 2.0 * code->xm +
+												   bs->mean2, 0.0));
+
+				bs->pcount[group]++;
+				bs->psumsq[group] += dist2;
+				bs->pmaxnorm[group] = Max(bs->pmaxnorm[group], raw);
+				/* the scale (the margin's unit) is of rows about their nearest */
+				if ((code->flags & LIONVEC_SPILL) == 0)
+				{
+					bs->sumsq += dist2;
+					bs->nsq += 1.0;
+				}
+			}
 
 			if (PageGetFreeSpace(page) < MAXALIGN(len))
 			{
@@ -1414,14 +1606,15 @@ lionvec_build_write_codes(LionVecBuildState *bs, BlockNumber *heads,
 			if (PageAddItemExtended(page, item, len, InvalidOffsetNumber, 0) ==
 				InvalidOffsetNumber)
 				elog(ERROR, "lionvec: could not add an item of %zu bytes", len);
-			lionvec_note_key(page, &((LionVecCode *) item)->tid);
-			more = tuplesort_gettupleslot(bs->sort, true, false, bs->outslot, NULL);
+			lionvec_note_key(page, &code->tid);
+			more = tuplesort_gettupleslot(sort, true, false, slot, NULL);
 		}
 	}
 	if (more)
 		elog(ERROR, "lionvec: the build's sort has an item past the last group");
 	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
+	ExecDropSingleTupleTableSlot(slot);
 	pfree(item);
 }
 
@@ -1454,13 +1647,13 @@ lionvec_build_write_parts(LionVecBuildState *bs, const BlockNumber *heads,
 			(float4) (bs->psumsq[j] / bs->pcount[j]) : 0.0f;
 		LionVecCentTid(&part->cent.tid, j);
 		part->cent.flags = 0;
-		part->cent.norm = bs->cnorm[j];
-		part->cent.alpha1 = bs->calpha1[j];
-		part->cent.xm = bs->cxm[j];
+		part->cent.norm = bs->a.cnorm[j];
+		part->cent.alpha1 = bs->a.calpha1[j];
+		part->cent.xm = bs->a.cxm[j];
 		part->cent.rblk = bs->crblk[j];
 		part->cent.roff = bs->croff[j];
-		part->cent.popcount = bs->cpop[j];
-		memcpy(part->cent.bits, bs->cbits + (Size) j * nw, sizeof(uint64) * nw);
+		part->cent.popcount = bs->a.cpop[j];
+		memcpy(part->cent.bits, bs->a.cbits + (Size) j * nw, sizeof(uint64) * nw);
 
 		if (!BufferIsValid(buf) || PageGetFreeSpace(page) < MAXALIGN(size))
 		{
@@ -1505,6 +1698,680 @@ lionvec_typmod_dims(Relation index, bool half)
 	return 0;
 }
 
+/* ----------------------------------------------------------------
+ * Parallel build (DESIGN.md §44.12)
+ *
+ * What a build costs is arithmetic: k-means' iterations and the second
+ * pass each find the nearest of the centroids for every row, by a plane-1
+ * estimate of each.  The first pass, the mean and the sample, is a fiftieth
+ * of the time and stays serial: the sample it draws must be the same
+ * whatever order the rows come in.  Then the leader sets up shared memory -
+ * the sample, the arrays of LionVecBuildArrays, a parallel heap scan and a
+ * shared sort - launches the workers, and posts them work, which the
+ * leader takes part in:
+ *
+ *	KMEANS	each of k-means' iterations: the leader codes the centroids and
+ *			posts the iteration; every process takes the sample's rows a
+ *			LIONVEC_KMEANS_CHUNK at a time, and assigns them
+ *			(lionvec_kmeans_assign()); the leader waits for every row, then
+ *			moves the centroids to their rows' means (lionvec_kmeans_update(),
+ *			serially, in the sample's order).  Each row's assignment depends
+ *			on the centroids alone, so the centroids come out as a serial
+ *			build's do, to the bit, however the rows were shared out.
+ *	SCAN	the second pass, over a parallel heap scan: every process puts
+ *			each row's CODE items into a sort of its own, and its REFINE
+ *			item on pages of its own; the leader merges the sorts and writes
+ *			the CODE chains, the PART chain and the meta page, as a serial
+ *			build does.
+ *
+ * The index a parallel build makes is a serial build's but for where the
+ * rows' REFINE items lie, which only their CODE items point at.
+ * ---------------------------------------------------------------- */
+
+#define PARALLEL_KEY_LIONVEC_SHARED		UINT64CONST(0xC200000000000001)
+#define PARALLEL_KEY_LIONVEC_ARRAYS		UINT64CONST(0xC200000000000002)
+#define PARALLEL_KEY_LIONVEC_SAMPLE		UINT64CONST(0xC200000000000003)
+#define PARALLEL_KEY_LIONVEC_SORT		UINT64CONST(0xC200000000000004)
+#define PARALLEL_KEY_LIONVEC_QUERY		UINT64CONST(0xC200000000000005)
+#define PARALLEL_KEY_LIONVEC_WAL		UINT64CONST(0xC200000000000006)
+#define PARALLEL_KEY_LIONVEC_BUFFERS	UINT64CONST(0xC200000000000007)
+
+/* the sample's rows a process takes at a time in k-means */
+#define LIONVEC_KMEANS_CHUNK	32
+
+/* what the leader posts */
+#define LIONVEC_PHASE_NONE		0
+#define LIONVEC_PHASE_KMEANS	1
+#define LIONVEC_PHASE_SCAN		2
+
+typedef struct LionVecBuildShared
+{
+	/* Set by the leader before any worker starts. */
+	Oid			heaprelid;
+	Oid			indexrelid;
+	bool		isconcurrent;
+	uint64		queryid;
+	int			nrequested;		/* workers asked for, plus the leader */
+	int			metric;
+	bool		half;
+	int			dims;
+	bool		hasmean;
+	int			nparts;
+	bool		spill;
+	int			sn;				/* the sample's rows */
+
+	/* The leader's posts, under mutex; workcv is signalled at each. */
+	slock_t		mutex;
+	ConditionVariable workcv;
+	int			phase;			/* LIONVEC_PHASE_* */
+	uint32		generation;		/* one more at each post */
+
+	/*
+	 * KMEANS: the next sample row to take, below the generation it is of, so
+	 * that a process still in the last iteration takes none of this one's;
+	 * the rows assigned and how many moved, under mutex.  donecv is
+	 * signalled when the last row is.
+	 */
+	pg_atomic_uint64 next;
+	int			kdone;
+	int			kmoved;
+	ConditionVariable donecv;
+
+	/* SCAN: each process reports here, under mutex, when its sort is done */
+	int			nparticipantsdone;
+	double		reltuples;
+	double		indtuples;
+	bool		brokenhotchain;
+	BlockNumber refine_tail;	/* the last REFINE page any of them filled */
+
+	/*
+	 * ParallelTableScanDescData follows, BUFFERALIGNed as shm_toc_allocate()
+	 * aligns: a table AM's scan descriptor may need that.
+	 */
+} LionVecBuildShared;
+
+#define ParallelTableScanFromLionVecBuildShared(shared) \
+	((ParallelTableScanDesc) ((char *) (shared) + BUFFERALIGN(sizeof(LionVecBuildShared))))
+
+struct LionVecBuildLeader
+{
+	ParallelContext *pcxt;
+	int			nparticipants;	/* workers launched, plus the leader */
+	LionVecBuildShared *shared;
+	Sharedsort *sharedsort;
+	Snapshot	snapshot;
+	WalUsage   *walusage;
+	BufferUsage *bufferusage;
+};
+
+extern PGDLLEXPORT void lionvec_parallel_build_main(dsm_segment *seg,
+													shm_toc *toc);
+
+/*
+ * Whether the index's expressions and predicate are parallel safe: the
+ * check plan_create_index_workers() makes of them before it sizes a build
+ * by the heap.  is_parallel_safe() walks them for a function that is not,
+ * and needs no more of a planner than this, there being no Params.
+ */
+static bool
+lionvec_build_parallel_safe(Relation index)
+{
+	PlannerInfo *root = makeNode(PlannerInfo);
+
+	root->glob = makeNode(PlannerGlobal);
+	return is_parallel_safe(root, (Node *) RelationGetIndexExpressions(index)) &&
+		is_parallel_safe(root, (Node *) RelationGetIndexPredicate(index));
+}
+
+/*
+ * The workers a build asks for, of nrows rows with a vector:
+ * max_parallel_maintenance_workers, or the table's own `parallel_workers`
+ * when it sets it, at most max_parallel_maintenance_workers, as for core's
+ * builds.  Core also sizes a build by the heap's main fork, which holds no
+ * vector of more than about 500 dimensions - pgvector's are stored out of
+ * line, in the TOAST table - so that DBpedia's 115,186 rows of 1536
+ * dimensions, a main fork of 7.6MB, under min_parallel_table_scan_size,
+ * would get none; and by maintenance_work_mem, 32MB a process.  A
+ * lionvec build's cost is arithmetic over the rows, whatever their bytes,
+ * and what a process holds of maintenance_work_mem is its share of the
+ * sort, which spills, the sample being shared: so neither applies.  None
+ * below LIONVEC_MIN_AUTO_ROWS rows unless `parallel_workers` is set (one
+ * partition by default, and quick), nor for an index whose expressions or
+ * predicate are not parallel safe, in a temporary table, which workers
+ * cannot read, or outside a postmaster.
+ */
+static int
+lionvec_build_workers(Relation heap, Relation index, double nrows)
+{
+	int			workers;
+
+	if (!IsUnderPostmaster || IsInParallelMode() ||
+		max_parallel_maintenance_workers <= 0 ||
+		heap->rd_rel->relpersistence == RELPERSISTENCE_TEMP ||
+		!lionvec_build_parallel_safe(index))
+		return 0;
+	workers = RelationGetParallelWorkers(heap, -1);
+	if (workers >= 0)
+		return Min(workers, max_parallel_maintenance_workers);
+	if (nrows < LIONVEC_MIN_AUTO_ROWS)
+		return 0;
+	return max_parallel_maintenance_workers;
+}
+
+/*
+ * A process's share of an iteration of k-means, generation gen: the
+ * sample's rows, LIONVEC_KMEANS_CHUNK at a time, until there are none left
+ * of this iteration.
+ */
+static void
+lionvec_kmeans_share(LionVecBuildShared *shared, const LionVecSample *s,
+					 int k, const float *mean, const float *cent, int *assign,
+					 LionVecKmeansWork *w, uint32 gen)
+{
+	for (;;)
+	{
+		uint64		v = pg_atomic_read_u64(&shared->next);
+		uint32		from;
+		uint32		to;
+		int			moved;
+		bool		last;
+
+		for (;;)
+		{
+			if ((uint32) (v >> 32) != gen || (uint32) v >= (uint32) s->n)
+				return;
+			if (pg_atomic_compare_exchange_u64(&shared->next, &v,
+											   v + LIONVEC_KMEANS_CHUNK))
+				break;
+		}
+		from = (uint32) v;
+		to = Min(from + LIONVEC_KMEANS_CHUNK, (uint32) s->n);
+		CHECK_FOR_INTERRUPTS();
+		moved = lionvec_kmeans_assign(s, (int) from, (int) to, k, mean, cent,
+									  assign, w);
+
+		SpinLockAcquire(&shared->mutex);
+		shared->kdone += (int) (to - from);
+		shared->kmoved += moved;
+		last = shared->kdone == s->n;
+		SpinLockRelease(&shared->mutex);
+		if (last)
+			ConditionVariableSignal(&shared->donecv);
+	}
+}
+
+/* The leader: post phase to the workers, a new generation of it. */
+static uint32
+lionvec_parallel_post(LionVecBuildShared *shared, int phase)
+{
+	uint32		gen;
+
+	SpinLockAcquire(&shared->mutex);
+	gen = ++shared->generation;
+	shared->phase = phase;
+	if (phase == LIONVEC_PHASE_KMEANS)
+	{
+		shared->kdone = 0;
+		shared->kmoved = 0;
+		pg_atomic_write_u64(&shared->next, (uint64) gen << 32);
+	}
+	SpinLockRelease(&shared->mutex);
+	ConditionVariableBroadcast(&shared->workcv);
+	return gen;
+}
+
+/*
+ * A worker: wait for the leader's next post after generation *seen, and
+ * return its phase.
+ */
+static int
+lionvec_parallel_wait(LionVecBuildShared *shared, uint32 *seen)
+{
+	int			phase;
+
+	for (;;)
+	{
+		SpinLockAcquire(&shared->mutex);
+		phase = shared->phase;
+		if (shared->generation != *seen)
+		{
+			*seen = shared->generation;
+			SpinLockRelease(&shared->mutex);
+			break;
+		}
+		SpinLockRelease(&shared->mutex);
+		ConditionVariableSleep(&shared->workcv,
+							   WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
+	}
+	ConditionVariableCancelSleep();
+	return phase;
+}
+
+/*
+ * The leader's k-means: lionvec_kmeans(), each iteration's rows shared out
+ * (lionvec_kmeans_share()) among the workers and the leader.
+ */
+static int
+lionvec_parallel_kmeans(LionVecBuildState *bs, const LionVecSample *s,
+						LionVecKmeansWork *w)
+{
+	LionVecBuildShared *shared = bs->leader->shared;
+	int			k = bs->nparts;
+	bool		unit = bs->metric == LIONVEC_COSINE;
+	const float *mean = bs->info->mean;
+	int			made = 0;
+
+	lionvec_kmeans_start(s, k, unit, (uint64) LIONVEC_SEED, bs->a.cent, bs->a.assign);
+	while (made < LIONVEC_KMEANS_ITERS)
+	{
+		uint32		gen;
+		int			moved;
+
+		made++;
+		/* the centroids' codes, which the candidates are found by */
+		lionvec_kmeans_codes(k, s->dimsp, mean, bs->a.cent, w);
+		gen = lionvec_parallel_post(shared, LIONVEC_PHASE_KMEANS);
+		lionvec_kmeans_share(shared, s, k, mean, bs->a.cent, bs->a.assign, w, gen);
+		for (;;)
+		{
+			bool		done;
+
+			SpinLockAcquire(&shared->mutex);
+			done = shared->kdone == s->n;
+			moved = shared->kmoved;
+			SpinLockRelease(&shared->mutex);
+			if (done)
+				break;
+			ConditionVariableSleep(&shared->donecv,
+								   WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
+		}
+		ConditionVariableCancelSleep();
+		/* no row moved: the centroids are already their rows' means */
+		if (moved == 0)
+			break;
+		lionvec_kmeans_update(s, k, unit, bs->a.assign, bs->a.cent, w);
+	}
+	return made;
+}
+
+/*
+ * A process's share of the second pass, the leader's included: its share of
+ * the heap's rows into a sort of its own, then reported.
+ */
+static void
+lionvec_parallel_rows(LionVecBuildState *bs, LionVecBuildShared *shared,
+					  Sharedsort *sharedsort, Relation heap, int memkb,
+					  bool progress)
+{
+	SortCoordinate coordinate = palloc0(sizeof(SortCoordinateData));
+	IndexInfo  *indexInfo = BuildIndexInfo(bs->index);
+	TableScanDesc scan;
+	double		reltuples;
+
+	coordinate->isWorker = true;
+	coordinate->nParticipants = -1;
+	coordinate->sharedsort = sharedsort;
+	lionvec_build_rows_begin(bs, memkb, coordinate);
+
+	indexInfo->ii_Concurrent = shared->isconcurrent;
+	scan = lion_table_beginscan_parallel(heap,
+										 ParallelTableScanFromLionVecBuildShared(shared));
+	reltuples = table_index_build_scan(heap, bs->index, indexInfo, true, progress,
+									   lionvec_build_callback, bs, scan);
+	lionvec_build_end_refine(bs);
+	tuplesort_performsort(bs->sort);
+
+	SpinLockAcquire(&shared->mutex);
+	shared->nparticipantsdone++;
+	shared->reltuples += reltuples;
+	shared->indtuples += bs->indtuples;
+	if (indexInfo->ii_BrokenHotChain)
+		shared->brokenhotchain = true;
+	if (BlockNumberIsValid(bs->refine_tail) &&
+		(!BlockNumberIsValid(shared->refine_tail) ||
+		 bs->refine_tail > shared->refine_tail))
+		shared->refine_tail = bs->refine_tail;
+	SpinLockRelease(&shared->mutex);
+	ConditionVariableSignal(&shared->donecv);
+
+	tuplesort_end(bs->sort);
+	bs->sort = NULL;
+	ExecDropSingleTupleTableSlot(bs->inslot);
+	bs->inslot = NULL;
+}
+
+static void
+lionvec_end_parallel(LionVecBuildLeader *leader)
+{
+	int			i;
+
+	WaitForParallelWorkersToFinish(leader->pcxt);
+	for (i = 0; i < leader->pcxt->nworkers_launched; i++)
+		InstrAccumParallelQuery(&leader->bufferusage[i], &leader->walusage[i]);
+	if (LION_IS_MVCC_LIKE(leader->snapshot))
+		UnregisterSnapshot(leader->snapshot);
+	DestroyParallelContext(leader->pcxt);
+	ExitParallelMode();
+}
+
+/*
+ * Set up a parallel build of request workers once the first pass is done
+ * and the partitions known, and launch them: the shared memory, the sample
+ * copied into it, and bs's arrays laid out in it.  bs->leader is set only
+ * when at least one worker was launched; otherwise everything is undone and
+ * the caller builds serially.
+ */
+static void
+lionvec_begin_parallel(LionVecBuildState *bs, Relation heap, bool isconcurrent,
+					   int request)
+{
+	Relation	index = bs->index;
+	int			dimsp = bs->info->dimsp;
+	LionVecBuildLeader *leader;
+	ParallelContext *pcxt;
+	Snapshot	snapshot;
+	Size		estshared;
+	Size		estarrays;
+	Size		estsample;
+	Size		estsort;
+	LionVecBuildShared *shared;
+	LionVecBuildArrays a;
+	char	   *arrays;
+	char	   *sample;
+	int			querylen = 0;
+
+	Assert(request > 0 && bs->nparts >= 1 && bs->sn >= bs->nparts);
+	EnterParallelMode();
+	pcxt = CreateParallelContext("pg_lion", "lionvec_parallel_build_main",
+								 request);
+
+	/*
+	 * A normal build reads with SnapshotAny and decides what to index itself
+	 * (RECENTLY_DEAD rows included); a concurrent one indexes what an MVCC
+	 * snapshot sees.
+	 */
+	snapshot = isconcurrent ? RegisterSnapshot(GetTransactionSnapshot()) :
+		SnapshotAny;
+
+	estshared = add_size(BUFFERALIGN(sizeof(LionVecBuildShared)),
+						 table_parallelscan_estimate(heap, snapshot));
+	estarrays = lionvec_build_arrays(NULL, bs->nparts, bs->sn, dimsp, NULL);
+	estsample = add_size(MAXALIGN(mul_size((Size) bs->sn, dimsp)),
+						 mul_size((Size) bs->sn, sizeof(float)));
+	estsort = tuplesort_estimate_shared(request + 1);
+	shm_toc_estimate_chunk(&pcxt->estimator, estshared);
+	shm_toc_estimate_chunk(&pcxt->estimator, estarrays);
+	shm_toc_estimate_chunk(&pcxt->estimator, estsample);
+	shm_toc_estimate_chunk(&pcxt->estimator, estsort);
+	shm_toc_estimate_keys(&pcxt->estimator, 4);
+	shm_toc_estimate_chunk(&pcxt->estimator,
+						   mul_size(sizeof(WalUsage), pcxt->nworkers));
+	shm_toc_estimate_chunk(&pcxt->estimator,
+						   mul_size(sizeof(BufferUsage), pcxt->nworkers));
+	shm_toc_estimate_keys(&pcxt->estimator, 2);
+	if (debug_query_string)
+	{
+		querylen = strlen(debug_query_string);
+		shm_toc_estimate_chunk(&pcxt->estimator, querylen + 1);
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+	}
+
+	InitializeParallelDSM(pcxt);
+	if (pcxt->seg == NULL)
+	{
+		if (LION_IS_MVCC_LIKE(snapshot))
+			UnregisterSnapshot(snapshot);
+		DestroyParallelContext(pcxt);
+		ExitParallelMode();
+		return;
+	}
+
+	shared = (LionVecBuildShared *) shm_toc_allocate(pcxt->toc, estshared);
+	memset(shared, 0, BUFFERALIGN(sizeof(LionVecBuildShared)));
+	shared->heaprelid = RelationGetRelid(heap);
+	shared->indexrelid = RelationGetRelid(index);
+	shared->isconcurrent = isconcurrent;
+	shared->queryid = pgstat_get_my_query_id();
+	shared->nrequested = request + 1;
+	shared->metric = bs->metric;
+	shared->half = bs->half;
+	shared->dims = bs->dims;
+	shared->hasmean = bs->info->mean != NULL;
+	shared->nparts = bs->nparts;
+	shared->spill = bs->spill;
+	shared->sn = bs->sn;
+	SpinLockInit(&shared->mutex);
+	ConditionVariableInit(&shared->workcv);
+	ConditionVariableInit(&shared->donecv);
+	shared->phase = LIONVEC_PHASE_NONE;
+	shared->generation = 0;
+	pg_atomic_init_u64(&shared->next, 0);
+	shared->refine_tail = InvalidBlockNumber;
+	table_parallelscan_initialize(heap,
+								  ParallelTableScanFromLionVecBuildShared(shared),
+								  snapshot);
+	/* start at the first block, as a serial build's scans do */
+	ParallelTableScanFromLionVecBuildShared(shared)->phs_syncscan = false;
+	shm_toc_insert(pcxt->toc, PARALLEL_KEY_LIONVEC_SHARED, shared);
+
+	/*
+	 * The arrays, with the mean, which a worker reads as it starts; the
+	 * sample is copied in once workers are known to have been launched, as
+	 * no worker reads it before the leader's first post.
+	 */
+	arrays = shm_toc_allocate(pcxt->toc, estarrays);
+	memset(arrays, 0, estarrays);
+	(void) lionvec_build_arrays(arrays, bs->nparts, bs->sn, dimsp, &a);
+	if (bs->info->mean != NULL)
+		memcpy(a.mean, bs->info->mean, sizeof(float) * dimsp);
+	shm_toc_insert(pcxt->toc, PARALLEL_KEY_LIONVEC_ARRAYS, arrays);
+	sample = shm_toc_allocate(pcxt->toc, estsample);
+	shm_toc_insert(pcxt->toc, PARALLEL_KEY_LIONVEC_SAMPLE, sample);
+
+	leader = palloc0(sizeof(LionVecBuildLeader));
+	leader->sharedsort = (Sharedsort *) shm_toc_allocate(pcxt->toc, estsort);
+	tuplesort_initialize_shared(leader->sharedsort, request + 1, pcxt->seg);
+	shm_toc_insert(pcxt->toc, PARALLEL_KEY_LIONVEC_SORT, leader->sharedsort);
+
+	if (debug_query_string)
+	{
+		char	   *sharedquery = shm_toc_allocate(pcxt->toc, querylen + 1);
+
+		memcpy(sharedquery, debug_query_string, querylen + 1);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_LIONVEC_QUERY, sharedquery);
+	}
+	leader->walusage = shm_toc_allocate(pcxt->toc,
+										mul_size(sizeof(WalUsage), pcxt->nworkers));
+	shm_toc_insert(pcxt->toc, PARALLEL_KEY_LIONVEC_WAL, leader->walusage);
+	leader->bufferusage = shm_toc_allocate(pcxt->toc,
+										   mul_size(sizeof(BufferUsage), pcxt->nworkers));
+	shm_toc_insert(pcxt->toc, PARALLEL_KEY_LIONVEC_BUFFERS, leader->bufferusage);
+
+	LaunchParallelWorkers(pcxt);
+	leader->pcxt = pcxt;
+	leader->nparticipants = pcxt->nworkers_launched + 1;
+	leader->shared = shared;
+	leader->snapshot = snapshot;
+	if (pcxt->nworkers_launched == 0)
+	{
+		lionvec_end_parallel(leader);
+		pfree(leader);
+		return;
+	}
+
+	/* the sample, which bs gives up for the copy, and the arrays */
+	memcpy(sample, bs->scodes, (Size) bs->sn * dimsp);
+	memcpy(sample + MAXALIGN((Size) bs->sn * dimsp), bs->sscale,
+		   sizeof(float) * bs->sn);
+	pfree(bs->scodes);
+	pfree(bs->sscale);
+	bs->scodes = (uint8 *) sample;
+	bs->sscale = (float *) (sample + MAXALIGN((Size) bs->sn * dimsp));
+	bs->a = a;
+
+	/* a worker that failed to start cannot leave the leader waiting */
+	WaitForParallelWorkersToAttach(pcxt);
+	bs->leader = leader;
+}
+
+/*
+ * The leader's second pass: its share, then every other process's sort
+ * done.  Returns the heap tuples the scan saw, and bs->indtuples the rows
+ * indexed; *sort is the sort over them all, to read the items from.
+ */
+static double
+lionvec_parallel_heapscan(LionVecBuildState *bs, Relation heap,
+						  bool *brokenhotchain, Tuplesortstate **sort)
+{
+	LionVecBuildLeader *leader = bs->leader;
+	LionVecBuildShared *shared = leader->shared;
+	SortCoordinate coordinate;
+	double		reltuples;
+
+	(void) lionvec_parallel_post(shared, LIONVEC_PHASE_SCAN);
+	lionvec_parallel_rows(bs, shared, leader->sharedsort, heap,
+						  maintenance_work_mem / leader->nparticipants, true);
+	for (;;)
+	{
+		SpinLockAcquire(&shared->mutex);
+		if (shared->nparticipantsdone == leader->nparticipants)
+		{
+			reltuples = shared->reltuples;
+			bs->indtuples = shared->indtuples;
+			bs->refine_tail = shared->refine_tail;
+			if (shared->brokenhotchain)
+				*brokenhotchain = true;
+			SpinLockRelease(&shared->mutex);
+			break;
+		}
+		SpinLockRelease(&shared->mutex);
+		ConditionVariableSleep(&shared->donecv,
+							   WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
+	}
+	ConditionVariableCancelSleep();
+
+	coordinate = palloc0(sizeof(SortCoordinateData));
+	coordinate->isWorker = false;
+	coordinate->nParticipants = leader->nparticipants;
+	coordinate->sharedsort = leader->sharedsort;
+	*sort = lionvec_build_sort_begin(lionvec_build_sort_desc(),
+									 maintenance_work_mem, coordinate);
+	return reltuples;
+}
+
+/*
+ * A parallel worker (PostgreSQL's ParallelWorkerMain() calls it by name):
+ * the leader's state, rebuilt from shared memory, and then its posts until
+ * the second pass, its last.
+ */
+void
+lionvec_parallel_build_main(dsm_segment *seg, shm_toc *toc)
+{
+	LionVecBuildShared *shared;
+	Sharedsort *sharedsort;
+	char	   *arrays;
+	char	   *sample;
+	LionVecBuildState bs;
+	LionVecSample s;
+	LionVecKmeansWork w;
+	Relation	heap;
+	Relation	index;
+	LOCKMODE	heaplock;
+	LOCKMODE	indexlock;
+	WalUsage   *walusage;
+	BufferUsage *bufferusage;
+	int			dimsp;
+	uint32		seen = 0;
+
+	debug_query_string = shm_toc_lookup(toc, PARALLEL_KEY_LIONVEC_QUERY, true);
+	pgstat_report_activity(STATE_RUNNING, debug_query_string);
+
+	shared = shm_toc_lookup(toc, PARALLEL_KEY_LIONVEC_SHARED, false);
+	arrays = shm_toc_lookup(toc, PARALLEL_KEY_LIONVEC_ARRAYS, false);
+	sample = shm_toc_lookup(toc, PARALLEL_KEY_LIONVEC_SAMPLE, false);
+	sharedsort = shm_toc_lookup(toc, PARALLEL_KEY_LIONVEC_SORT, false);
+
+	/* the lock modes index.c took for the leader */
+	if (!shared->isconcurrent)
+	{
+		heaplock = ShareLock;
+		indexlock = AccessExclusiveLock;
+	}
+	else
+	{
+		heaplock = ShareUpdateExclusiveLock;
+		indexlock = RowExclusiveLock;
+	}
+
+	pgstat_report_query_id(shared->queryid, false);
+	heap = table_open(shared->heaprelid, heaplock);
+	index = index_open(shared->indexrelid, indexlock);
+	tuplesort_attach_shared(sharedsort, seg);
+	InstrStartParallelQuery();
+
+	memset(&bs, 0, sizeof(bs));
+	bs.index = index;
+	bs.metric = shared->metric;
+	bs.half = shared->half;
+	bs.dims = shared->dims;
+	bs.nparts = shared->nparts;
+	bs.spill = shared->spill;
+	bs.sn = shared->sn;
+	bs.rbuf = InvalidBuffer;
+	bs.refine_tail = InvalidBlockNumber;
+	bs.buildcxt = CurrentMemoryContext;
+	bs.tmpcxt = AllocSetContextCreate(CurrentMemoryContext,
+									  "lionvec build row",
+									  ALLOCSET_DEFAULT_SIZES);
+	dimsp = LIONVEC_PADDED(bs.dims);
+	if (bs.dims <= 0 || bs.nparts < 1 || bs.sn < bs.nparts)
+		elog(ERROR, "lionvec: a parallel build of %d dimensions, %d partitions and %d sample rows",
+			 bs.dims, bs.nparts, bs.sn);
+	(void) lionvec_build_arrays(arrays, bs.nparts, bs.sn, dimsp, &bs.a);
+	bs.info = lionvec_build_info(bs.metric, bs.half, bs.dims,
+								 shared->hasmean ? bs.a.mean : NULL);
+	if (bs.info->mean != NULL)
+	{
+		int			i;
+
+		for (i = 0; i < dimsp; i++)
+			bs.mean2 += (double) bs.info->mean[i] * bs.info->mean[i];
+	}
+	lionvec_build_use_arrays(&bs);
+
+	s.n = bs.sn;
+	s.dimsp = dimsp;
+	s.codes = (const uint8 *) sample;
+	s.scale = (const float *) (sample + MAXALIGN((Size) bs.sn * dimsp));
+	lionvec_build_kmeans_work(&bs, &w);
+
+	for (;;)
+	{
+		int			phase = lionvec_parallel_wait(shared, &seen);
+
+		if (phase == LIONVEC_PHASE_KMEANS)
+			lionvec_kmeans_share(shared, &s, bs.nparts, bs.info->mean, bs.a.cent,
+								 bs.a.assign, &w, seen);
+		else if (phase == LIONVEC_PHASE_SCAN)
+		{
+			lionvec_parallel_rows(&bs, shared, sharedsort, heap,
+								  maintenance_work_mem / shared->nrequested,
+								  false);
+			break;
+		}
+		else
+			elog(ERROR, "lionvec: a parallel build's phase %d", phase);
+	}
+
+	bufferusage = shm_toc_lookup(toc, PARALLEL_KEY_LIONVEC_BUFFERS, false);
+	walusage = shm_toc_lookup(toc, PARALLEL_KEY_LIONVEC_WAL, false);
+	InstrEndParallelQuery(&bufferusage[ParallelWorkerNumber],
+						  &walusage[ParallelWorkerNumber]);
+
+	index_close(index, indexlock);
+	table_close(heap, heaplock);
+}
+
 static IndexBuildResult *
 lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
@@ -1515,6 +2382,11 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	double		reltuples;
 	BlockNumber *heads;
 	BlockNumber *tails;
+	Tuplesortstate *sort;
+	instr_time	start;
+	instr_time	t;
+	double		secs[4] = {0};
+	int			nprocs = 1;
 
 	if (RelationGetNumberOfBlocks(index) != 0)
 		elog(ERROR, "index \"%s\" already contains data",
@@ -1542,40 +2414,32 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	UnlockReleaseBuffer(metabuf);
 
 	/*
-	 * pass 1: the mean and the sample.  Neither pass joins a synchronized
-	 * scan, which could start part-way through the heap: the second must see
-	 * the rows in heap order, which each partition's CODE pages keep, and
-	 * the sample is the same from build to build.
+	 * pass 1: the mean and the sample.  It does not join a synchronized
+	 * scan, which could start part-way through the heap, so that the sample
+	 * is the same from build to build; nor does the second, whose items are
+	 * sorted back into heap order (by TID) whatever order it reads them in.
 	 */
+	INSTR_TIME_SET_CURRENT(start);
 	table_index_build_scan(heap, index, indexInfo, false, false,
 						   lionvec_build_mean_callback, &bs, NULL);
 
 	/* the rotation, and the mean rotated, in this backend's memory */
+	if (bs.nsum > 0 && bs.dims > 0)
 	{
 		int			dimsp = LIONVEC_PADDED(bs.dims);
-		Size		size = lionvec_info_size(dimsp);
+		float	   *mean = palloc0(sizeof(float) * dimsp);
+		int			i;
 
-		bs.info = palloc0(size);
-		bs.info->metric = bs.metric;
-		bs.info->half = bs.half;
-		bs.info->dims = bs.dims;
-		bs.info->dimsp = dimsp;
-		bs.info->seed = LIONVEC_SEED;
-		lionvec_info_fix(bs.info, bs.nsum > 0);
-		if (bs.dims > 0)
-			lionvec_rotation_init(&bs.info->rot, dimsp, LIONVEC_SEED,
-								  bs.info->rot.signs);
-		if (bs.info->mean != NULL)
-		{
-			int			i;
-
-			for (i = 0; i < dimsp; i++)
-				bs.info->mean[i] = i < bs.dims ? (float) (bs.sum[i] / bs.nsum) : 0.0f;
-			lionvec_rotate(&bs.info->rot, bs.info->mean);
-			for (i = 0; i < dimsp; i++)
-				bs.mean2 += (double) bs.info->mean[i] * bs.info->mean[i];
-		}
+		for (i = 0; i < bs.dims; i++)
+			mean[i] = (float) (bs.sum[i] / bs.nsum);
+		bs.info = lionvec_build_info(bs.metric, bs.half, bs.dims, mean);
+		pfree(mean);
+		lionvec_rotate(&bs.info->rot, bs.info->mean);
+		for (i = 0; i < dimsp; i++)
+			bs.mean2 += (double) bs.info->mean[i] * bs.info->mean[i];
 	}
+	else
+		bs.info = lionvec_build_info(bs.metric, bs.half, bs.dims, NULL);
 
 	memset(&meta, 0, sizeof(meta));
 	meta.mean_head = InvalidBlockNumber;
@@ -1587,53 +2451,86 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.nparts = bs.dims > 0 ? lionvec_partitions(index, bs.nsum, bs.sn) : 0;
 	bs.spill = bs.nparts >= 2 &&
 		(index->rd_options == NULL || ((LionVecOptions *) index->rd_options)->spill);
+	INSTR_TIME_SET_CURRENT(t);
+	INSTR_TIME_SUBTRACT(t, start);
+	secs[0] = INSTR_TIME_GET_DOUBLE(t);
+	INSTR_TIME_SET_CURRENT(start);
 	if (bs.nparts > 0)
-		lionvec_build_centroids(&bs);
-	else if (bs.scodes != NULL)
+	{
+		int			request = lionvec_build_workers(heap, index, bs.nsum);
+		LionVecSample sample;
+
+		if (request > 0)
+			lionvec_begin_parallel(&bs, heap, indexInfo->ii_Concurrent, request);
+		if (bs.leader == NULL && bs.a.cent == NULL)
+		{
+			/* serial: the same arrays, in this backend's memory */
+			Size		size = lionvec_build_arrays(NULL, bs.nparts, bs.sn,
+													bs.info->dimsp, NULL);
+			char	   *arrays = MemoryContextAllocExtended(bs.buildcxt, size,
+															MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
+
+			(void) lionvec_build_arrays(arrays, bs.nparts, bs.sn, bs.info->dimsp,
+										&bs.a);
+			if (bs.info->mean != NULL)
+				memcpy(bs.a.mean, bs.info->mean, sizeof(float) * bs.info->dimsp);
+		}
+		lionvec_build_use_arrays(&bs);
+		sample.n = bs.sn;
+		sample.dimsp = bs.info->dimsp;
+		sample.codes = bs.scodes;
+		sample.scale = bs.sscale;
+		lionvec_build_centroids(&bs, &sample);
+	}
+	/* the sample is not needed now (a parallel build's is shared memory) */
+	if (bs.leader == NULL && bs.scodes != NULL)
 	{
 		pfree(bs.scodes);
 		pfree(bs.sscale);
-		bs.scodes = NULL;
-		bs.sscale = NULL;
 	}
+	bs.scodes = NULL;
+	bs.sscale = NULL;
+	INSTR_TIME_SET_CURRENT(t);
+	INSTR_TIME_SUBTRACT(t, start);
+	secs[1] = INSTR_TIME_GET_DOUBLE(t);
 
 	/* pass 2: the REFINE items in place, the CODE items to the sort */
+	INSTR_TIME_SET_CURRENT(start);
+	if (bs.leader != NULL)
+		reltuples = lionvec_parallel_heapscan(&bs, heap,
+											  &indexInfo->ii_BrokenHotChain,
+											  &sort);
+	else
 	{
-		TupleDesc	desc = CreateTemplateTupleDesc(2);
-		AttrNumber	sortcol = 1;
-		Oid			sortop = Int8LessOperator;
-		Oid			sortcoll = InvalidOid;
-		bool		nullsfirst = false;
-
-		TupleDescInitBuiltinEntry(desc, (AttrNumber) 1, "key", INT8OID, -1, 0);
-		TupleDescInitBuiltinEntry(desc, (AttrNumber) 2, "item", TEXTOID, -1, 0);
-		TupleDescFinalize(desc);
-		bs.inslot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
-		bs.outslot = MakeSingleTupleTableSlot(desc, &TTSOpsMinimalTuple);
-		bs.sort = tuplesort_begin_heap(desc, 1, &sortcol, &sortop, &sortcoll,
-									   &nullsfirst, maintenance_work_mem, NULL,
-									   TUPLESORT_NONE);
-		bs.sortitem = palloc(VARHDRSZ + LIONVEC_CODE_SIZE(Max(bs.info->dimsp, 64)));
+		lionvec_build_rows_begin(&bs, maintenance_work_mem, NULL);
+		reltuples = table_index_build_scan(heap, index, indexInfo, false, true,
+										   lionvec_build_callback, &bs, NULL);
+		lionvec_build_end_refine(&bs);
+		sort = bs.sort;
+		ExecDropSingleTupleTableSlot(bs.inslot);
+		bs.inslot = NULL;
 	}
-	lionvec_items_alloc(&bs.items, bs.info);
-	reltuples = table_index_build_scan(heap, index, indexInfo, false, true,
-									   lionvec_build_callback, &bs, NULL);
-	if (BufferIsValid(bs.rbuf))
-	{
-		MarkBufferDirty(bs.rbuf);
-		UnlockReleaseBuffer(bs.rbuf);
-	}
+	INSTR_TIME_SET_CURRENT(t);
+	INSTR_TIME_SUBTRACT(t, start);
+	secs[2] = INSTR_TIME_GET_DOUBLE(t);
 
+	INSTR_TIME_SET_CURRENT(start);
 	heads = palloc(sizeof(BlockNumber) * (bs.nparts + 2));
 	tails = palloc(sizeof(BlockNumber) * (bs.nparts + 2));
-	lionvec_build_write_codes(&bs, heads, tails);
-	tuplesort_end(bs.sort);
-	ExecDropSingleTupleTableSlot(bs.inslot);
-	ExecDropSingleTupleTableSlot(bs.outslot);
-
+	tuplesort_performsort(sort);
+	lionvec_build_write_codes(&bs, sort, heads, tails);
+	tuplesort_end(sort);
 	meta.part_head = InvalidBlockNumber;
 	if (bs.nparts > 0)
 		meta.part_head = lionvec_build_write_parts(&bs, heads, tails);
+	/* the arrays a parallel build's centroids are in go with its memory */
+	if (bs.leader != NULL)
+	{
+		nprocs = bs.leader->nparticipants;
+		lionvec_end_parallel(bs.leader);
+		bs.leader = NULL;
+		memset(&bs.a, 0, sizeof(bs.a));
+	}
 
 	/* the meta page */
 	metabuf = ReadBuffer(index, LIONVEC_METAPAGE);
@@ -1662,6 +2559,19 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	if (RelationNeedsWAL(index))
 		log_newpage_range(index, MAIN_FORKNUM, 0,
 						  RelationGetNumberOfBlocks(index), true);
+	INSTR_TIME_SET_CURRENT(t);
+	INSTR_TIME_SUBTRACT(t, start);
+	secs[3] = INSTR_TIME_GET_DOUBLE(t);
+	if (nprocs > 1)
+		elog(DEBUG1, "lionvec index \"%s\": built in parallel",
+			 RelationGetRelationName(index));
+	else
+		elog(DEBUG1, "lionvec index \"%s\": built serially",
+			 RelationGetRelationName(index));
+	elog(DEBUG2, "lionvec index \"%s\": %.0f rows in %.1f s by %d process%s: the first pass %.1f s, k-means %.1f s, the second pass %.1f s, writing %.1f s",
+		 RelationGetRelationName(index), bs.indtuples,
+		 secs[0] + secs[1] + secs[2] + secs[3], nprocs, nprocs == 1 ? "" : "es",
+		 secs[0], secs[1], secs[2], secs[3]);
 
 	MemoryContextDelete(bs.tmpcxt);
 
@@ -2747,7 +3657,11 @@ lionvec_handler(PG_FUNCTION_ARGS)
 		.ampredlocks = false,
 		.amcanparallel = false,
 #if PG_VERSION_NUM >= 170000
-		.amcanbuildparallel = false,
+		/*
+		 * by lionvec's own count of workers, not the one core then makes
+		 * (lionvec_build_workers(), DESIGN.md §44.12), and on 16 as well
+		 */
+		.amcanbuildparallel = true,
 #endif
 		.amcaninclude = false,
 		.amusemaintenanceworkmem = false,
