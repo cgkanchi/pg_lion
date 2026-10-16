@@ -82,9 +82,11 @@
  *
  * NULL rows come last, with NULL distances; before them, in a cosine index,
  * the zero vectors, whose distance is NaN.  A restricted scan (LionOrdered,
- * §44.6) of no more than pg_lion.vector_exact_rows members computes every member's
- * distance from the heap and returns them in order (lv_exact()); of more,
- * it does all of the above over the members alone.
+ * §44.6) of no more than pg_lion.vector_exact_rows members, or
+ * pg_lion.vector_exact_per_partition members a partition if that is more
+ * (lionvec_exact_limit()), computes every member's distance from the heap
+ * and returns them in order (lv_exact()); of more, it does all of the above
+ * over the members alone.
  *
  *-------------------------------------------------------------------------
  */
@@ -2160,8 +2162,14 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 		BlockNumber hblocks = RelationGetNumberOfBlocks(scan->heapRelation);
 		bool		whole;
 
+		/*
+		 * Few members, or few a partition (lionvec_exact_limit(), which the
+		 * planner's cost asks of the same meta page's count): every one's
+		 * distance from the heap.  A NULL container's blocks are counted,
+		 * not known, so a degraded set always probes.
+		 */
 		members = lv_members(so, hblocks > 0 ? tuples / hblocks : 0.0, &whole);
-		if (!whole && members <= lionvec_exact_rows)
+		if (!whole && members <= lionvec_exact_limit((double) so->meta.nparts))
 		{
 			lv_exact(scan, so);
 			MemoryContextSwitchTo(old);

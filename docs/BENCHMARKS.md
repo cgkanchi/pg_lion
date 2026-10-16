@@ -161,8 +161,10 @@ defaults (margin 3, patience 30), at margins 2 and 4, and with the pause off:
 | 0.1% | 9.9 (11), 1.000 | | | | 13 (18), 0.999 | |
 
 HNSW under a filter uses its iterative scan; without it, it returns 3.9 of the ten rows at 10% and
-0.4 at 1%. At 10% the planner chooses lionvec's plain scan with a `Filter`, at 1% `LionOrdered`,
-and at 0.1% a sort of the 953 matching rows, for either index. The pause stops a scan once 30
+0.4 at 1%. At 10% the planner chose lionvec's plain scan with a `Filter`, at 1% `LionOrdered`,
+and at 0.1% a sort of the 953 matching rows, for either index (since 2026-10-16 the plain scan with
+a `Filter` is a plan only under `pg_lion.vector_postfilter = allow`, DESIGN.md §44.6).
+The pause stops a scan once 30
 times `sqrt(n) / 2` rows, here 30 partitions' worth, have brought nothing nearer; without it a query whose nearest rows lie
 far from every centroid reads hundreds of partitions (a mean of 254 of the 1,974 unfiltered, 77
 with it), and the 95th percentile was five times the median, where with it it is twice.
