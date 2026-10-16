@@ -46,11 +46,14 @@ if [ -x "$PG_BIN/postgres" ]; then
 	echo "using the PostgreSQL already installed: $("$PG_BIN/postgres" --version) in $PG_BIN"
 	"$PG_BIN/postgres" --version | grep -q "PostgreSQL) $PG_MAJOR\." ||
 		warn "that is not PostgreSQL $PG_MAJOR (PG_MAJOR=$PG_MAJOR); the results record which it was"
-	if [ ! -x "$PG_BIN/pg_config" ] || [ ! -e "$("$PG_BIN/pg_config" --pgxs)" ]; then
+	# apt's postgresql-N carries pgxs.mk but not the server headers, which
+	# are postgresql-server-dev-N's
+	if [ ! -x "$PG_BIN/pg_config" ] || [ ! -e "$("$PG_BIN/pg_config" --pgxs)" ] ||
+	   [ ! -e "$("$PG_BIN/pg_config" --includedir-server)/postgres.h" ]; then
 		if [ $APT = 1 ]; then
 			sudo apt-get install -y -q "postgresql-server-dev-$PG_MAJOR"
 		else
-			warn "no pg_config with PGXS in $PG_BIN: install the server headers, or set PG_CONFIG"; exit 1
+			warn "no pg_config with PGXS and the server headers in $PG_BIN: install them, or set PG_CONFIG"; exit 1
 		fi
 	fi
 elif [ "${INSTALL_PG:-0}" != 1 ]; then
