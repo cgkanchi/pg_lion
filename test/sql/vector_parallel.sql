@@ -156,8 +156,8 @@ END $$;
 --    index: each metric, spilling or not, one partition, a halfvec
 --    expression, and 100 partitions in ten regions, whose k-means is routed
 --    through regions remade at each iteration by the leader, and whose
---    second pass is too (DESIGN.md §44.3).  The forty partitions' k-means
---    is given 128 rows a partition, 5,120 of the sample's 5,940.
+--    second pass is too (DESIGN.md §44.3).  No sample here is cut: k-means
+--    is given every row of a table below LIONVEC_SAMPLE_MIN rows.
 --    parallel_workers fixes the worker count, whatever the table's size
 --    (lionvec_build_workers()).
 -- ---------------------------------------------------------------------
@@ -268,6 +268,52 @@ CREATE INDEX pn_l2 ON pn USING lionvec (v) WITH (partitions = 20);
 SET client_min_messages = warning;
 RESET max_parallel_maintenance_workers;
 
-DROP TABLE pv, pv_serial, pv_parallel, pv_near, pv_cic_parallel, pa, pa_serial, pt, pn;
+-- ---------------------------------------------------------------------
+-- 3. The sample's cut (DESIGN.md §44.3): a table of more than
+--    LIONVEC_SAMPLE_MIN rows in few partitions has its k-means given 65,536
+--    of the rows it sampled, cut before a parallel build shares the sample,
+--    and the same 65,536 either way: the meta page and the PART items - the
+--    centroids, and each partition's count, spread and longest row - are a
+--    serial build's.  (pv_index()'s CODE digest would take minutes over
+--    140,000 items, so pv_parts() stops at the PART chain.)
+-- ---------------------------------------------------------------------
+
+CREATE FUNCTION pv_parts(idx regclass) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	bs int := current_setting('block_size')::int;
+	m bytea := get_raw_page(idx::text, 0);
+	p bytea;
+	it bytea;
+	acc bytea[] := '{}';
+	pb bigint := pv_u32(m, 52);
+BEGIN
+	WHILE pb <> 4294967295 LOOP
+		p := get_raw_page(idx::text, pb::int);
+		FOR it IN SELECT pv_items(p) LOOP
+			acc := acc || (substr(it, 1, 4) || substr(it, 13));
+		END LOOP;
+		pb := pv_u32(p, bs - 16);
+	END LOOP;
+	RETURN md5(substr(m, 25, 28) || substr(m, 57, 4) || substr(m, 81, 16) || substr(m, 101, 4)) ||
+		   md5(array_to_string(array(SELECT encode(x, 'hex') FROM unnest(acc) x), '/'));
+END $$;
+CREATE TABLE pc (id int, v vector(8)) WITH (parallel_workers = 2);
+INSERT INTO pc SELECT i, pv_vec(i, 8) FROM generate_series(1, 70000) i;
+SET max_parallel_maintenance_workers = 2;
+SET client_min_messages = debug1;
+CREATE INDEX pc_l2 ON pc USING lionvec (v) WITH (partitions = 20);
+SET client_min_messages = warning;
+CREATE TABLE pc_parallel AS SELECT pv_parts('pc_l2') AS parts;
+SET max_parallel_maintenance_workers = 0;
+SET client_min_messages = debug1;
+REINDEX INDEX pc_l2;
+SET client_min_messages = warning;
+RESET max_parallel_maintenance_workers;
+SELECT p.parts = pv_parts('pc_l2') AS "meta page and partitions the same" FROM pc_parallel p;
+
+DROP TABLE pv, pv_serial, pv_parallel, pv_near, pv_cic_parallel, pa, pa_serial, pt, pn,
+	pc, pc_parallel;
 DROP FUNCTION pv_unsafe(int), pv_vec(bigint, int), pv_u16(bytea, int), pv_u32(bytea, int),
-	pv_items(bytea), pv_index(regclass), pv_build(regclass, int), pv_nearest(text);
+	pv_items(bytea), pv_index(regclass), pv_build(regclass, int), pv_nearest(text),
+	pv_parts(regclass);

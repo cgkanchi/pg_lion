@@ -277,7 +277,8 @@ NaN, as a sort puts them.
 for a table of fewer than 10,000 rows and eight times the square root of the rows' count for a
 larger (8,000 for a million rows), but never more than a sixteenth of the rows the build samples.
 The build samples as many rows as half of `maintenance_work_mem` holds (1.5 KB a 1536-dimension
-row, at most 16.8 million rows, 25.8 GB) and runs k-means over at most 128 of them a partition: the
+row, at most 16.8 million rows, 25.8 GB) and runs k-means over at most 128 of them a partition
+(never fewer than 65,536 rows): the
 default 64 MB holds about 21,800 rows of 1536 dimensions, so at most 1,361 partitions; a million
 rows need 376 MB for their 8,000, 1 GB gives k-means 44 rows a partition and 3.2 GB the 128, and a
 billion rows' 252,982 need 12.5 GB. More partitions make a scan score fewer rows and rank more

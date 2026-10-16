@@ -20363,9 +20363,11 @@ page that holds no member (§44.6).
   the cap's 2^24, 66 a partition, with 52 GB. (The cap was 2^20 rows, 3 GB, and the ceiling 65,536
   partitions, which then held every table of more than 67 million rows - a billion's 15,000 rows a
   partition.) **k-means' share** of the sample is at most 128 rows a partition
-  (`LIONVEC_SAMPLE_PER_PART_MAX`): when the reservoir holds more, the partitions are still counted
-  from all of it, and k-means is given a uniformly random 128 C of its rows (`lionvec_subsample()`:
-  a partial Fisher-Yates shuffle of the slots from a seed of its own, `LIONVEC_SEED_SUBSAMPLE`,
+  (`LIONVEC_SAMPLE_PER_PART_MAX`) and never fewer than 65,536 rows (`LIONVEC_SAMPLE_MIN`;
+  `lionvec_kmeans_rows()`): when the reservoir holds more than that, the partitions are still
+  counted from all of it, and k-means is given a uniformly random 128 C of its rows, or 65,536,
+  whichever is more (`lionvec_subsample()`: a partial Fisher-Yates shuffle of the slots from a
+  seed of its own, `LIONVEC_SEED_SUBSAMPLE`,
   the slots kept sorted and the rows moved down in place, so that they keep the reservoir's order,
   in which k-means' update sums them, and the build is the same every time), before k-means and
   before a parallel build copies the sample into shared memory, which then holds those rows alone
@@ -20376,10 +20378,16 @@ page that holds no member (§44.6).
   over three draws (seeds of the cut) at 64, against 0.909 with every row, and 0.916, 0.920 and
   0.915 at 128; at 8 both were within the draws' spread of every row's 0.984 (0.980 to 0.982 at
   64, 0.981 to 0.985 at 128), and in 1,358 partitions 64 gave 0.918 and 0.979 against 0.917 and
-  0.982. At the default `8 sqrt(n)` the cut is 1,024 `sqrt(n)` rows, every row up to a million,
-  so it falls only on a larger table whose sample holds more: none at a `maintenance_work_mem` of 1
-  GB (348,617 rows at 1536 dimensions), and at 52 GB's 2^24, the rows of a table of between a
-  million and 268 million rows past 1,024 `sqrt(n)`; or on fewer partitions than the default.
+  0.982. At the default `8 sqrt(n)` the cut is 1,024 `sqrt(n)` rows, past the floor from 4,096
+  rows and every row up to a million, so it falls only on a larger table whose sample holds more:
+  none at a `maintenance_work_mem` of 1 GB (348,617 rows at 1536 dimensions), and at 52 GB's 2^24,
+  the rows of a table of between a million and 268 million rows past 1,024 `sqrt(n)`; or on fewer
+  partitions than the default, on a table of more than 65,536 rows. The floor is for the tables
+  below it: k-means over 65,536 rows is seconds at most, so a cut saves little there, and such a
+  table is then built from every row it sampled whatever its partitions, as it was before the cut,
+  which the regression tests' expected outputs - the partitions a query probes, the pages it
+  reads, for tables of 3,000 to 10,000 rows in 20 to 50 partitions - rest on (vector_filter.sql's
+  400,000 rows in 20 partitions are cut, to 65,536).
   Lloyd's k-means then runs over the sample, in the
   rotated space (which changes no distance), from C distinct sample rows the seed picks, for ten
   iterations or until no row moves; spherical for cosine, whose rows and so centroids are of unit
@@ -21231,9 +21239,10 @@ unfiltered scan's deeper batches, and the plain scan under `allow`.
   processes, as core's builds do, and holds the sample once, in shared memory (§44.12). A sample
   row takes `dimsp + 4` bytes, 1,540 at 1536 dimensions, so the default partitions want 2 x 1,540
   x 16 `8 sqrt(n)` bytes, 376 MB at a million rows and 12.5 GB at a billion, and k-means is given
-  at most 128 a partition of it, 1.6 GB of sample at a million rows' 8,000 partitions (so 3.2 GB is
-  the most a million rows can use); the reservoir stops at 2^24 rows, 25.8 GB, which 52 GB
-  reaches. A parallel build's shared memory holds the sample after the cut, and the arrays above.
+  at most 128 a partition of it, never fewer than 65,536 rows (§44.3), 1.6 GB of sample at a
+  million rows' 8,000 partitions (so 3.2 GB is the most a million rows can use); the reservoir
+  stops at 2^24 rows, 25.8 GB, which 52 GB reaches. A parallel build's shared memory holds the
+  sample after the cut, and the arrays above.
 - `max_parallel_maintenance_workers` (core's, default 2) and the table's `parallel_workers`: the
   workers a build asks for, whatever the heap's size or `maintenance_work_mem` (§44.12).
 - `work_mem` bounds a scan's row queue (§44.4).
@@ -21860,15 +21869,18 @@ the exact path's price sends it to the plain scan with a `Filter` (§44.7).
   their PART items' blocks, each CODE chain's items in order but
   for their REFINE locations, and the set of REFINE items - which must match, and the nearest rows
   the same through either, for each metric, spilling and not, one partition, a `halfvec`
-  expression and 100 partitions in 10 regions (L2 and cosine; the 40 partitions' k-means given 128
-  rows a partition of the 5,940 drawn, so the cut is made before the sample is shared),
+  expression and 100 partitions in 10 regions (L2 and cosine; no sample here is cut, every table
+  being below `LIONVEC_SAMPLE_MIN` rows),
   over 6,000 rows with NULLs, a cosine zero, deleted rows and HOT chains, with the
   table's `parallel_workers` at 2; `CREATE INDEX CONCURRENTLY` in parallel against a serial build;
   and the count of workers by the DEBUG1 lines: 10,000 rows in parallel without `parallel_workers`,
   at the default `maintenance_work_mem` and at 1 MB, where every process's sort spills to disk
   (and the index is still a serial build's), an expression index and a parallel-safe partial one
   in parallel, and serially at 9,999 rows, in a temporary table, over NULL rows alone and under a
-  parallel-unsafe predicate. On PostgreSQL 16, whose core says "serially" of every build but btree's, the
+  parallel-unsafe predicate; and the cut (§44.3): 70,000 rows in 20 partitions, whose k-means is
+  given 65,536 of them (the DEBUG1 line says so) before a parallel build shares the sample, the
+  meta page and PART items - the centroids, counts, spreads and longest rows - a serial build's.
+  On PostgreSQL 16, whose core says "serially" of every build but btree's, the
   expected output is vector_parallel_1.out.
 
 ### 44.11 Not done

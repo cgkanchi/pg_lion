@@ -2836,7 +2836,8 @@ test_bounds_nan(void)
  * lionvec_subsample(): exactly m of the n slots, ascending - so distinct,
  * and the rows they name moved down in the reservoir's order - the same from
  * the same seed and another from another, every slot when m is n, and each
- * slot as often as any other.
+ * slot as often as any other.  And lionvec_kmeans_rows(), the m a build
+ * cuts to: 128 a partition, never under the floor, never over the rows.
  */
 static void
 test_subsample(void)
@@ -2902,6 +2903,19 @@ test_subsample(void)
 	for (i = 0; i < 20; i++)
 		even &= labs(count[i] - 2000) < 200;
 	CHECK(even, "a slot is drawn more often than another");
+
+	CHECK(lionvec_kmeans_rows(0, 0) == 0 && lionvec_kmeans_rows(10, 0) == 10 &&
+		  lionvec_kmeans_rows(10, 10) == 10 &&
+		  lionvec_kmeans_rows(LIONVEC_SAMPLE_MIN, 1) == LIONVEC_SAMPLE_MIN &&
+		  lionvec_kmeans_rows(LIONVEC_SAMPLE_MIN + 1, 1) == LIONVEC_SAMPLE_MIN &&
+		  lionvec_kmeans_rows(1000000, 100) == LIONVEC_SAMPLE_MIN &&
+		  lionvec_kmeans_rows(1000000, 512) == LIONVEC_SAMPLE_MIN &&
+		  lionvec_kmeans_rows(1000000, 513) == 513 * LIONVEC_SAMPLE_PER_PART_MAX &&
+		  lionvec_kmeans_rows(1000000, 1000) == 128000 &&
+		  lionvec_kmeans_rows(100000, 1000) == 100000 &&
+		  lionvec_kmeans_rows(1 << 24, 262144) == 1 << 24 &&
+		  lionvec_kmeans_rows(1 << 24, 100000) == 12800000,
+		  "the rows k-means is given are not 128 a partition, the floor at least, the rows at most");
 	free(slot2);
 	free(slot);
 }
