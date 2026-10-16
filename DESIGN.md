@@ -20561,9 +20561,8 @@ tier's pause" above). Through LionOrdered on DBpedia's 115,186 rows (`vector_exa
 that the 1% filter probes too), at a patience of 30, a LIMIT 100 found 0.9884 of its hundred
 nearest under a 3% filter at a margin of 8, against 0.9997 never pausing, and 0.9845 against
 0.9999 under 1%; and at that margin it returned the plain scan's rows (an Index Scan with a
-Filter) for 24 to 58% of the queries (vector-toy's characterization of 2026-10-16, its mechanism
-C). A smaller LIMIT was
-to pause where it does, not a larger one at every tier on its way. So LionOrdered hands the scan
+Filter) for 24 to 58% of the queries. A smaller LIMIT was to pause where it does, not a larger
+one at every tier on its way. So LionOrdered hands the scan
 the rows its query level's LIMIT takes, OFFSET included, when the planner knows them (§44.6,
 `lion_vec_scan_limit()`), and the scan keeps no tier below them (`lv_reset_rows()`): a LIMIT 100
 at the default L has none and pauses on L alone, whose rows the LIMIT takes whole, as before the
