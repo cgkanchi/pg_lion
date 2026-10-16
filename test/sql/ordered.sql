@@ -530,6 +530,31 @@ RESET hash_mem_multiplier;
 RESET work_mem;
 DROP TABLE lwalk;
 
+--     The pieces of a range over many container keys, in no key order: a
+--     merge sorts only the pieces since the last one and merges them with
+--     the entries that one left (lo_set_finish()), and the directory grows
+--     to room for 32 pieces an entry (lo_set_push()), at the default
+--     hash_mem and at 64 kB.  Merged every few hundred pieces, each merge
+--     rewriting every key, the set of a range over 100,000 of a million
+--     unique values took 130 ms (2026-10-16).
+CREATE TABLE lwalk2 (id int PRIMARY KEY, u int, k int)
+  WITH (autovacuum_enabled = off, fillfactor = 10);
+INSERT INTO lwalk2 SELECT i, (i::bigint * 7919 % 30011)::int, (i::bigint * 104729 % 30013)::int
+  FROM generate_series(1, 30000) i;
+CREATE INDEX lwalk2_k ON lwalk2 (k, id);
+CREATE INDEX lwalk2_u ON lwalk2 USING lion (u);
+VACUUM (FREEZE, ANALYZE) lwalk2;
+SELECT pg_relation_size('lwalk2') / 8192 / 64 AS keys;
+SELECT lion_ord('SELECT id, k FROM lwalk2 WHERE u BETWEEN 1 AND 25000 ORDER BY k, id');
+SELECT * FROM lion_ord_run('SELECT id FROM lwalk2 WHERE u BETWEEN 1 AND 25000 ORDER BY k, id LIMIT 5');
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT lion_ord('SELECT id, k FROM lwalk2 WHERE u BETWEEN 1 AND 25000 ORDER BY k, id');
+SELECT * FROM lion_ord_run('SELECT id FROM lwalk2 WHERE u BETWEEN 1 AND 25000 ORDER BY k, id LIMIT 5');
+RESET hash_mem_multiplier;
+RESET work_mem;
+DROP TABLE lwalk2;
+
 -- 17. A clause the btree and a lion index both answer is priced once
 --     (DESIGN.md §30.3): the walk of (g, k) under g = 5 meets only g = 5
 --     entries, every one a member, so the node is a plain index scan plus

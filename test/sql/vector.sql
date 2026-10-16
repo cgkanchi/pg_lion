@@ -340,16 +340,56 @@ SELECT vec_cmp(format('SELECT id, v <=> %L::vector AS d FROM vt ORDER BY v <=> %
 -- a query of other dimensions is pgvector's error
 SET enable_seqscan = off;
 SELECT id FROM vt ORDER BY v <-> '[1,2,3]' LIMIT 1;
+-- with no ORDER BY the index is never scanned, even with sequential scans
+-- off (from 18 it was, as an index-only scan, which failed)
+SELECT count(*) FROM vt;
 RESET enable_seqscan;
 
--- the scan as it goes on past a pass: a batch of one, and passes cut to work_mem
+-- the scan as it goes on past a pass: a batch of one, and passes cut to
+-- work_mem (with room in the progress hash, which hash_mem bounds, for every
+-- row: the next test is the hash's)
 SET pg_lion.vector_batch = 1;
 SELECT vec_cmp('SELECT id, v <-> vt_vec(11, 40) AS d FROM vt ORDER BY v <-> vt_vec(11, 40) LIMIT 300');
 SET work_mem = '64kB';
+SET hash_mem_multiplier = 64;
 SELECT vec_cmp('SELECT id, v <#> vt_vec(12, 40) AS d FROM vt ORDER BY v <#> vt_vec(12, 40) LIMIT 2000');
 SELECT vec_cmp('SELECT id, v <-> vt_vec(12, 40) AS d FROM vt ORDER BY v <-> vt_vec(12, 40) LIMIT 3006');
+RESET hash_mem_multiplier;
 RESET work_mem;
 RESET pg_lion.vector_batch;
+
+-- a scan with no LIMIT whose rows outgrow the progress hash's hash_mem
+-- (128 kB: 1,843 entries, for 3,001 rows) drops what it no longer needs,
+-- and what it can work out again, and returns every row, in order
+SET work_mem = '128kB';
+SET hash_mem_multiplier = 1;
+SELECT vec_cmp('SELECT id, v <-> vt_vec(13, 40) AS d FROM vt ORDER BY v <-> vt_vec(13, 40)');
+-- with a work_mem of 64 kB, whose shorter passes need more of the hash, it
+-- cannot go on without growing past hash_mem: by default, an ERROR
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 2;
+SET enable_seqscan = off;
+SET enable_sort = off;
+SHOW pg_lion.vector_overflow;
+SELECT count(*) FROM (SELECT id, v <-> vt_vec(13, 40) AS d FROM vt ORDER BY v <-> vt_vec(13, 40)) s;
+-- pg_lion.vector_overflow = stop ends the scan there instead, with a
+-- NOTICE: what it returned is the start of the sort's order, each row once
+SET pg_lion.vector_overflow = stop;
+CREATE TEMP TABLE vt_cut AS
+SELECT row_number() OVER () AS n, id, d
+  FROM (SELECT id, v <-> vt_vec(13, 40) AS d FROM vt ORDER BY v <-> vt_vec(13, 40)) s;
+RESET enable_seqscan;
+RESET enable_sort;
+SELECT count(*) < 3006 AS stopped, count(*) > 0 AS "some rows",
+	   count(*) = count(*) FILTER (WHERE c.id = s.id) AS "the sort's first rows"
+  FROM vt_cut c
+  JOIN (SELECT row_number() OVER (ORDER BY v <-> vt_vec(13, 40), id) AS n, id
+		  FROM vt WHERE v IS NOT NULL) s USING (n);
+DROP TABLE vt_cut;
+RESET pg_lion.vector_overflow;
+SET pg_lion.vector_overflow = 'grow';
+RESET hash_mem_multiplier;
+RESET work_mem;
 
 -- inserts after the build: a new cluster, far from the mean, which goes to
 -- the partitions nearest it
@@ -572,19 +612,83 @@ SELECT cardinality(a) AS n, a = (SELECT array_agg(x ORDER BY x) FROM unnest(a) x
   FROM (SELECT array_agg(d) AS a
 		  FROM (SELECT v <-> vt_vec(77, 40, 0.5) AS d FROM vt
 				 ORDER BY v <-> vt_vec(77, 40, 0.5) LIMIT 300) l) s;
+RESET pg_lion.vector_margin;
+
+-- ... and at a margin the patience does not grow with, it pauses at each
+-- tier - ten rows, twenty, forty, eighty, then L's hundred - and in the
+-- REST's batch after them: its rows still come in order, each once
+SELECT cardinality(a) AS n, (SELECT count(DISTINCT x) FROM unnest(i) x) AS ids,
+	   a = (SELECT array_agg(x ORDER BY x) FROM unnest(a) x) AS "in order"
+  FROM (SELECT array_agg(d) AS a, array_agg(id) AS i
+		  FROM (SELECT id, v <-> vt_vec(77, 40, 0.5) AS d FROM vt
+				 ORDER BY v <-> vt_vec(77, 40, 0.5) LIMIT 300) l) s;
 RESET enable_seqscan;
 RESET enable_sort;
 RESET pg_lion.vector_patience;
-RESET pg_lion.vector_margin;
+
+-- an operator class of one's own, whose operator returns float4: the scan
+-- reads the operator's distances, and hands them back, as float4
+CREATE FUNCTION vt_l2_f4(vector, vector) RETURNS float4
+LANGUAGE sql IMMUTABLE STRICT SET search_path FROM CURRENT
+AS $$ SELECT l2_distance($1, $2)::float4 $$;
+CREATE OPERATOR <%%> (LEFTARG = vector, RIGHTARG = vector,
+					   FUNCTION = vt_l2_f4, COMMUTATOR = <%%>);
+CREATE OPERATOR CLASS vt_l2_f4_ops FOR TYPE vector USING lionvec AS
+	OPERATOR 1 <%%> (vector, vector) FOR ORDER BY float_ops;
+SELECT amvalidate(oid) FROM pg_opclass WHERE opcname = 'vt_l2_f4_ops';
+CREATE INDEX vt_f4 ON vt USING lionvec (v vt_l2_f4_ops) WITH (partitions = 20);
+SELECT vec_cmp('SELECT id, v <%%> vt_vec(14, 40) AS d FROM vt ORDER BY v <%%> vt_vec(14, 40) LIMIT 50');
+SET enable_seqscan = off;
+SET enable_sort = off;
+SELECT pg_typeof(d), d = (v <%%> vt_vec(14, 40)) AS "the operator's"
+  FROM (SELECT v, v <%%> vt_vec(14, 40) AS d FROM vt
+		 ORDER BY v <%%> vt_vec(14, 40) LIMIT 1) s;
+RESET enable_seqscan;
+RESET enable_sort;
+DROP INDEX vt_f4;
 
 -- what lionvec refuses
 CREATE TABLE vbad (i int, v vector(9000), w vector(3)[]);
 CREATE INDEX ON vbad USING lionvec (i);
+-- an operator class over another type, which every read of a row or a
+-- query would take for a vector: refused before any is read
+CREATE FUNCTION vbad_dist(int, int) RETURNS float8 LANGUAGE sql IMMUTABLE
+AS $$ SELECT abs($1 - $2)::float8 $$;
+CREATE OPERATOR <^^> (LEFTARG = int, RIGHTARG = int, FUNCTION = vbad_dist);
+CREATE OPERATOR CLASS vbad_int_ops FOR TYPE int USING lionvec AS
+	OPERATOR 1 <^^> (int, int) FOR ORDER BY float_ops;
+SELECT amvalidate(oid) FROM pg_opclass WHERE opcname = 'vbad_int_ops';
+INSERT INTO vbad (i) VALUES (1), (2);
+CREATE INDEX ON vbad USING lionvec (i vbad_int_ops);
+-- ... and one whose operator returns neither float8 nor float4
+CREATE FUNCTION vt_l2_int(vector, vector) RETURNS int
+LANGUAGE sql IMMUTABLE STRICT SET search_path FROM CURRENT
+AS $$ SELECT l2_distance($1, $2)::int $$;
+CREATE OPERATOR <||> (LEFTARG = vector, RIGHTARG = vector, FUNCTION = vt_l2_int);
+CREATE OPERATOR CLASS vt_l2_int_ops FOR TYPE vector USING lionvec AS
+	OPERATOR 1 <||> (vector, vector) FOR ORDER BY integer_ops;
+SELECT amvalidate(oid) FROM pg_opclass WHERE opcname = 'vt_l2_int_ops';
+CREATE INDEX vt_int ON vt USING lionvec (v vt_l2_int_ops) WITH (partitions = 20);
+SET enable_seqscan = off;
+SET enable_sort = off;
+SELECT id FROM vt ORDER BY v <||> vt_vec(14, 40) LIMIT 1;
+RESET enable_seqscan;
+RESET enable_sort;
+DROP INDEX vt_int;
+DROP OPERATOR FAMILY vt_l2_int_ops USING lionvec;
+DROP OPERATOR <||> (vector, vector);
+DROP FUNCTION vt_l2_int(vector, vector);
+DROP OPERATOR FAMILY vbad_int_ops USING lionvec;
+DROP OPERATOR <^^> (int, int);
+DROP FUNCTION vbad_dist(int, int);
+DROP OPERATOR FAMILY vt_l2_f4_ops USING lionvec;
+DROP OPERATOR <%%> (vector, vector);
+DROP FUNCTION vt_l2_f4(vector, vector);
 CREATE INDEX ON vbad USING lionvec (v);
 CREATE INDEX ON vbad USING lionvec (w);
 CREATE INDEX ON vbad USING lionvec (v, v);
 CREATE INDEX ON vt USING lionvec (v) WITH (partitions = -1);
-CREATE INDEX ON vt USING lionvec (v) WITH (partitions = 1000001);
+CREATE INDEX ON vt USING lionvec (v) WITH (partitions = 65537);
 CREATE INDEX ON vt USING lionvec (v) WITH (spill = maybe);
 ALTER INDEX vt_l2 SET (spill = 2);
 SET pg_lion.vector_epsilon = 0.5;

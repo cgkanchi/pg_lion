@@ -273,7 +273,7 @@ NaN, as a sort puts them.
 
     CREATE INDEX ON items USING lionvec (embedding vector_cosine_ops) WITH (partitions = 4000);
 
-`partitions` (0 to 1,000,000) sets how many partitions the build makes; 0, the default, makes one
+`partitions` (0 to 65,536) sets how many partitions the build makes; 0, the default, makes one
 for a table of fewer than 10,000 rows and eight times the square root of the rows' count for a
 larger (8,000 for a million rows), but never more than a sixteenth of the rows the build samples.
 The build runs k-means over a sample of as many rows as half of `maintenance_work_mem` holds (1.5 KB
@@ -598,6 +598,12 @@ empty it probes many for nothing.
 Raise it for exact answers under wider filters, at a table read a row; the planner prices both
 paths and may sort the filter's rows itself above it, which is exact too (DESIGN.md §44.6).
 
+`pg_lion.vector_overflow` (`error`, or `stop`): what a `lionvec` scan does when what it knows of
+its rows outgrows `hash_mem` (`work_mem` times `hash_mem_multiplier`), which only a scan with no
+`LIMIT`, or a large one, over rows its codes cannot tell apart reaches. `error` fails the query;
+`stop` ends the scan with a NOTICE, the rows it returned being in order, each once, and the
+nearest it found (DESIGN.md §44.4).
+
 `pg_lion.ordered_switch_ratio` (32, 1 to 1,000,000): how many B-tree entries `LionOrdered` walks per
 member it has not met yet before it stops walking, fetches the members left in TID order and sorts
 them (DESIGN.md §30.4, "When the walk is not paying"; `Switched to Fetch and Sort` in `EXPLAIN
@@ -655,8 +661,8 @@ that reaches one anyway fails with an error rather than return a different answe
 snapshot's (DESIGN.md §9).  Inserts and VACUUM work as usual.
 
 A `lionvec` index (DESIGN.md §44) answers only an `ORDER BY` of its own distance operator, forward.
-It has no search operators, no bitmap or index-only scans, no INCLUDE columns and no parallel scan
-or build, and indexes a single column of pgvector's `vector` or `halfvec` (not `sparsevec` or
+It has no search operators, no bitmap or index-only scans, no INCLUDE columns and no parallel scan,
+and indexes a single column of pgvector's `vector` or `halfvec` (not `sparsevec` or
 `bit`) of at most 8128 dimensions. Its results are approximate (`pg_lion.vector_margin`), except under a
 lion filter of up to `pg_lion.vector_exact_rows` rows. Inserts serialize on the index's meta page and read every
 partition's centroid. VACUUM removes dead rows' codes but reuses their space only for new rows on
@@ -665,10 +671,24 @@ recomputes the partitions and the mean the codes are centred on (rows that have 
 make scans read more or miss more, never answer out of order). Building a large index runs k-means
 over every sampled row and every partition, and then compares every row with every partition's
 centroid, so it grows with the rows times the partitions: 19 minutes for a million rows in 2,000
-partitions, and about four times that in the default 8,000.
+partitions, and about four times that in the default 8,000. Both steps are shared among
+`max_parallel_maintenance_workers` workers and the build's own process, from PostgreSQL 16, for a
+table of 10,000 rows or more or one whose `parallel_workers` is set (DESIGN.md §44.12): 115,186
+rows of 1536 dimensions in 2,715 partitions built in 125 to 134 s serially and 38 s with three
+workers on four cores. A parallel build holds its sample, up to half of `maintenance_work_mem`,
+and the centroids in dynamic shared memory, which Docker limits to 64 MB unless given
+`--shm-size`.
 Each returned row is fetched from the heap twice, once for its distance and once by the executor.
 A small `work_mem` with a large `LIMIT` makes a scan read its partitions several times (`SET
-client_min_messages = debug1` shows the passes).
+client_min_messages = debug1` shows the passes). What a scan remembers of the rows it has read is
+held to `hash_mem` (`work_mem` times `hash_mem_multiplier`), as a hash join's table is: past it,
+the scan forgets first the rows it can tell from their codes alone, then rows it can work out
+again. A scan with no `LIMIT` (or a large one) over rows whose codes cannot tell them apart from
+those it returned may still outgrow it; it then fails the query (`ERROR: lionvec scan of
+"items_embedding_idx" outgrew hash_mem after 52000 rows`), or, with `pg_lion.vector_overflow` set
+to `stop`, returns no more rows, with a NOTICE; what it returned is then in order, each row once.
+Raise `work_mem` or `hash_mem_multiplier`, add a `LIMIT`, or let such a query sort (`SET
+enable_indexscan = off`), which spills to disk.
 pgvector prices its distance functions as nearly free (`COST 1`) and its vectors are stored out of
 line, so under a filter that keeps a large share of the rows the planner may sort them by distance
 where the `lionvec` scan is faster: on a million rows it did, for filters of 1% and 10%, 3 to 17

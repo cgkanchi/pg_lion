@@ -80,14 +80,16 @@ ifneq ($(INJECTION_POINTS),1)
 ISOLATION := $(filter-out $(INJECTION_SPECS),$(ISOLATION))
 $(info pg_lion: no injection_points module in this installation; skipping isolation specs: $(INJECTION_SPECS))
 endif
-# lionvec's tests (test/sql/vector*.sql) need pgvector installed; where it is
-# missing they are left out, and the run says so; PGVECTOR=1/0 overrides the
-# guess.
+# lionvec's tests (test/sql/vector*.sql, test/isolation/lionvec_*.spec) need
+# pgvector installed; where it is missing they are left out, and the run says
+# so; PGVECTOR=1/0 overrides the guess.
 VECTOR_TESTS = $(patsubst test/sql/%.sql,%,$(sort $(wildcard test/sql/vector*.sql)))
+VECTOR_SPECS = $(patsubst test/isolation/%.spec,%,$(sort $(wildcard test/isolation/lionvec_*.spec)))
 PGVECTOR ?= $(if $(wildcard $(shell $(PG_CONFIG) --sharedir)/extension/vector.control),1,0)
 ifneq ($(PGVECTOR),1)
 REGRESS := $(filter-out $(VECTOR_TESTS),$(REGRESS))
-$(info pg_lion: no pgvector in this installation; skipping tests: $(VECTOR_TESTS))
+ISOLATION := $(filter-out $(VECTOR_SPECS),$(ISOLATION))
+$(info pg_lion: no pgvector in this installation; skipping tests: $(VECTOR_TESTS) $(VECTOR_SPECS))
 endif
 include $(PGXS)
 

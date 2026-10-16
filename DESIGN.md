@@ -15715,10 +15715,12 @@ than overruns (§30.4).
   or batch by batch - one PIECE per container key each entry or batch touches, so a range over
   400,000 distinct values brings 400,000 one-TID pieces for 34 keys - and its pieces are sorted and
   those of equal keys ORed, through one bitset image per key, whenever the directory is full (from
-  1,024 entries on; it doubles only if it is still more than half full afterwards), before their
-  bytes would degrade the set (once there are at least as many pieces as merged entries), and when
-  the source is complete. A BitmapAnd is the container-wise AND of its children's sets, a BitmapOr
-  their OR; a leaf that selects nothing is an empty set. No lossy page exists anywhere in this:
+  1,024 entries on; it then doubles until it has room for 32 pieces an entry the merge left, or its
+  slots alone would take `hash_mem`), before their bytes would degrade the set (once there are at
+  least as many pieces as merged entries), and when the source is complete. A merge sorts only the
+  pieces since the last one, by key and slot packed into a word, and merges them with the entries
+  that one left, which are in order. A BitmapAnd is the container-wise AND of its children's sets,
+  a BitmapOr their OR; a leaf that selects nothing is an empty set. No lossy page exists anywhere in this:
   every member is a TID some entry held (§29.6).
   *(Fixed 2026-09-25, second review: the pieces were merged only once the source was complete, and
   pairwise. Every piece kept a directory entry and a container copy until then, so a set whose
@@ -15728,6 +15730,13 @@ than overruns (§30.4).
   memory alloc request size" past 2^27 pieces; ORing the pieces pairwise cost a pass over the
   growing container per piece, 4.2 s to build the set of a 250,000-value range that the lion bitmap
   scan reads in 0.2 s, now 0.33 s.)*
+  *(Fixed 2026-10-16, the million-row vector benchmark: the directory still doubled only while it
+  stayed more than half full after a merge, so a merge came every few hundred pieces, each one
+  rewriting every key - a range over 100,000 of a million unique values, 223 keys, merged every 800
+  pieces - and sorted every slot through a comparator that read the keys. That was half of
+  LionOrdered's 130 ms before its first row under that filter; the set now takes 45 ms, as long as
+  the lion bitmap scan of the same range takes to walk its 100,000 entries. A column whose ranges
+  span that many keys wants summaries (§32): the set then takes 3 ms.)*
 - **Exact, or rechecked.** The set is EXACT when every leaf's `lion_source_exact()` is true, no
   lion index clause was lossy and the set did not degrade. Then every member satisfies the
   `lionqual` and nothing is rechecked; otherwise every fetched member is tested against the
@@ -15737,8 +15746,8 @@ than overruns (§30.4).
   frees every container and keeps only their KEYS - "every TID of these 64 heap blocks may be a
   member" -, marks itself inexact, and carries on that way. Memory is then 16 bytes per container
   key, at most one per 64 heap blocks (and, while a WALK or LIST leaf is being read, its unmerged
-  pieces: fewer than three per key, or 1,024, above); the answer stays exact because every
-  fetched member is now rechecked; the node walks on as a slower filter.
+  pieces: up to 32 a key, as long as their slots fit in `hash_mem`, or 1,024, above); the answer
+  stays exact because every fetched member is now rechecked; the node walks on as a slower filter.
 - **The set, lazily** (2026-09-30). Building the set reads every container of every leaf's
   sets, over the whole table, before the walk hands out its first TID - and a `LIMIT` walk that
   finds its rows in the first few hundred container keys needs the set at those keys only. When
@@ -20173,6 +20182,16 @@ of that name another handler serves is never taken for one; `lion_vec_restrict()
 `lion_vec_scan_cost()`. The changes to lion's own code are `_PG_init()` calling `lion_vec_init()`
 (the settings, the 8-bit tables, the kernels) and LionOrdered's (§44.6).
 
+An operator class of one's own is checked as far as lionvec reads through it. Its input type must
+be NAMED `vector` or `halfvec`, of length -1 (`lionvec_type_ok()`): the reader below takes every
+datum for a varlena of pgvector's layout, and a class over `int` had it detoast an integer as a
+pointer, a crash (a review found it, 2026-10-15). The index's open refuses any other type, and
+`amvalidate` reports the class. Its ORDER BY operator must return `float8` or `float4`
+(`lionvec_distance_type_ok()`), as `amvalidate` reports and a scan's start checks; the scan reads
+each distance, and hands it back in `xs_orderbyvals`, in the operator's own type, as core's
+`index_store_float8_orderby_distances()` does. Until that review a `float4` operator's distances
+were read, and returned, as `float8`.
+
 `halfvec` (2026-10-15; pgvector 0.7 and on: the same 8-byte header, then IEEE 754 binary16
 halves) has the same three, `halfvec_l2_ops` (its default), `halfvec_ip_ops` and
 `halfvec_cosine_ops`, over pgvector's `l2_distance`, `halfvec_negative_inner_product` and
@@ -20208,7 +20227,8 @@ dimensions, not 4`, and a query of other dimensions `different vector dimensions
 `LIONVEC_MAX_DIM` dimensions, 8128 at 8K pages, as many whole 64-bit words as leave a REFINE item a
 page; pgvector's HNSW and IVFFlat take 2000. Single-column, no INCLUDE, no search operators
 (`amoptionalkey`: a query with no WHERE at all is the point), forward only (`amcanbackward =
-false`: a SCROLL cursor gets a Material node), no bitmap scans, not parallel.
+false`: a SCROLL cursor gets a Material node), no bitmap scans, no parallel scan; built in
+parallel (§44.12).
 
 ### 44.2 Format (lion_vec.h)
 
@@ -20323,11 +20343,36 @@ holds no member (§44.6).
   is under the least upper bound), by their exact distance; about ten candidates of 200 at 320
   dimensions and more, so that k-means costs a popcount scan of the centroids a row and a few float
   distances. A centroid left with no rows takes half of the largest's (FAISS's way). The
-  centroids are then coded as rows are, against the mean.
+  centroids are then coded as rows are, against the mean. Every loop of it - the centroids'
+  coding, the assignment, the means, the splits - checks for interrupts once an item
+  (`LIONVEC_CHECK_INTERRUPTS()` in `lionvec_kmeans_codes()`, `_assign()` and `_update()`, the
+  steps a parallel build's leader and workers run too, §44.12; nothing in the unit tests' build), so that a cancel,
+  `statement_timeout` or shutdown ends a build in k-means within one item's work. Until a review
+  found it (2026-10-15) none did, and a build was deaf to all three until k-means ended: days at the
+  `partitions` reloption's old ceiling of a million. Measured on 500,000 rows of 16 dimensions,
+  `maintenance_work_mem` 1 GB, 60,000 partitions (the heap scans take 8 s): before, the build ran
+  on past 150 s of a 60 s `statement_timeout` and a cancel, and took `kill -9`; after, it stops at
+  10.02 s of a 10 s one and 60.01 s of a 60 s one. The second heap scan, which finds each row's
+  partitions (below) and so costs as much as an iteration of k-means over every row, was deaf too,
+  for another reason found measuring the first: the build kept the REFINE page it was filling
+  locked from row to row, and a content lock holds off interrupts. It now keeps the page pinned
+  and locks it only to add an item (`lionvec_build_put_refine()`, as a parallel build's workers do,
+  §44.12); no other backend reads the index yet. Measured on 200,000 rows of 256 dimensions, 1,800 partitions, `maintenance_work_mem`
+  64 MB (k-means about 8 minutes): a cancel early in the second scan took 78 s before, the scan's
+  whole length (the build 569 s), and 0.013 s after.
 - **Assignment.** The build's second scan puts each row in the partition of the centroid nearest
   it by L2: of the candidates plane 1 leaves, by the centroids' 8-bit codes, whose error is about a
   seventieth of plane 1's (`lionvec_build_nearest()`); an insert does the same from the PART chain
-  and the candidates' REFINE items (`lionvec_insert_nearest()`). The root of the rows' mean
+  and the candidates' REFINE items (`lionvec_insert_nearest()`). An insert keeps, as it reads the
+  PART chain, only the partitions plane 1 cannot rule out so far (`lionvec_cands_add()`, the
+  streaming form of `lionvec_candidates_n()`: the m least upper bounds met, and every partition
+  whose lower bound is under the m-th), and drops those the bound has since passed whenever they
+  fill an array that starts at 64 and doubles only when more than half stay: 40 bytes a candidate,
+  where it kept every partition's codes and bounds, about 250 bytes a partition at 1536 dimensions,
+  16 MB an insert at 65,536 partitions and 192 MB at the reloption's old ceiling (a review found
+  it, 2026-10-15). The candidates are the batch function's, as the unit tests check; an insert's
+  memory at 1536 dimensions went from 539 KB to 224 KB at 1,250 partitions and from 1.54 MB to 359
+  KB at 5,000 (356 and 364 KB at 125). The root of the rows' mean
   squared distance from their centroids, over the dimensions, is the meta page's scale; each
   partition's own mean squared distance and its longest row go in its PART item (§44.4's inner
   product). Both k-means and the assignment cost a plane-1 estimate of every centroid for every
@@ -20467,12 +20512,16 @@ scan's approximation, and the margin trades it against the partitions read.
 probed had a median of 74, a mean of 143 and a maximum of 1,430 of the 1,974 (§44.9). A query whose
 ten nearest lie far from every centroid finds many centroids within its tenth row's key less the
 margin, and probes them all, though few hold a row nearer than those it has. So the scan counts the
-rows it scores since one last entered the L least upper bounds, and once those L are in hand and
-the count reaches `pg_lion.vector_patience` (30) units - a unit the rows an average partition would
-hold were there `2 sqrt(n)` of them, n the rows of the build (the meta page's count): `sqrt(n) / 2`
-rows, or under a restriction that share of the members (`lv_patience_unit()`) - it PAUSES
-(`lv_probe_part()`): it takes the L as found and probes no partition until it has returned L rows or
-the next row lies past tau. A REST, which starts a batch of four times the rows, ends a pause too.
+rows it scores since one last entered the least upper bounds of the rows it is after, and once
+those are in hand and the count reaches `pg_lion.vector_patience` (30) units - a unit the rows an
+average partition would hold were there `2 sqrt(n)` of them, n the rows of the build (the meta
+page's count): `sqrt(n) / 2` rows, or under a restriction twice that share of the members
+(`lv_patience_unit()`) - it PAUSES (`lv_probe_part()`). The rows it is after are a TIER: besides
+the L least upper bounds it keeps the K least for K = 10, 20, 40 and so on below L (`LvTier`), and
+the next row's tier is the least K past the rows the pass has returned, or L. Paused on a tier, it
+takes those K as found and probes no partition until it has returned them or the next row lies past
+the K-th upper bound; then the next tier, whose count has run all along, decides the next pause. A
+REST, which starts a batch of four times the rows, ends a pause too.
 Paused, the scan still returns rows in order; a row nearer than those a pause returned, in a
 partition not probed yet, is skipped when it is found, as one the margin leaves till too late is.
 The pause trades those rows against the tail: in the numpy model (vtoy's `patience.py`), at 975,000
@@ -20487,6 +20536,27 @@ next row lay past tau, it filled the LIMIT but still returned rows far past the 
 LIMIT 1000 on the benchmark got 0.955 of its true rows; ended after L rows too, 0.983, against
 0.980 for a LIMIT 10. Counting a restricted scan's patience in members rather than rows lets a
 filter pause as an unfiltered scan does; counted in rows, a 1% filter never paused.
+
+The tiers came from the local million-row benchmark (2026-10-16), where a query's 95th percentile
+took three to four times its median. Counted against L alone (`pg_lion.vector_batch`, 100), a LIMIT
+10 went on probing while rows entered the 100 nearest, which it would never return. On DBpedia's
+115,186 rows, LIMIT 10 at a margin of 8: 200 partitions at the median and 401 at the 95th
+percentile for 0.986 of the ten nearest (4.8 and 9.2 ms); by tiers, 159 and 254 for 0.985 (3.8 and
+5.7 ms). A smaller L instead (`vector_batch = 10`) did as well for a LIMIT 10 and cost a LIMIT 100
+2.5 times as much, its RESTs reading every chain again; by tiers a LIMIT 100 pauses at its own
+100, as it did, but returns its first ten at the first tier's pause and loses a row it finds later
+that belonged among them: 0.9908 at a margin of 8 for 336 partitions, against 0.9900 for 273. A
+filter's members come a few to a partition, and a tier of ten fills and stalls sooner than one of
+100: with the same unit, DBpedia's 1% filter, probed (`vector_exact_rows = 0`), fell from 0.969 of
+the ten nearest at the default margin to 0.939; with twice the unit, 0.961, probing 368 partitions
+at the median against 530. At each recall a filter now probes fewer partitions than it did: 0.9925
+at 1% for 820 against 908, 0.9935 at 10% for 360 against 448.
+
+The patience grows with the margin past twice its default (`lv_patience_scale()`: by `margin / 6`
+at the default). A larger margin asks for more of the nearest rows, and a patience that stayed put
+held the recall to what the scan had found by then: 0.9935 of the ten nearest at any margin from 12
+(0.9865 with the tiers). In step, the margin alone reaches 0.9975 at 24 (0.999 of a LIMIT 100's at
+32); up to twice the default the margin stops a scan first, and the patience only its tail.
 
 The unit was the average partition's own rows, the rows or members over the partitions, until
 the default went from `2 sqrt(n)` partitions to `8 sqrt(n)` (§44.3). Then a patience of 30 paused
@@ -20563,13 +20633,77 @@ the partitions, the members themselves counted once, from the filter. A walk (NU
 query, or no ORDER BY) reads each partition's chain and skips its copies, so that it returns each
 row once.
 
+**The hash's bound** (2026-10-15, after a review found the hash unbounded). The GONE entries stay
+for the scan's life, so the hash grew with every row returned: a scan with no LIMIT over a hundred
+million rows would hold gigabytes, past any `work_mem`, and fail in palloc where a sort would
+spill. It is now held to `hash_mem`, as a hash join's table is: as many entries as the largest of
+simplehash's power-of-two arrays within it holds below its fill of 0.9 (`lv_seen_most()`), 48
+bytes each; the PLANE1 entries, the row queue's own, come with its cap and are counted apart.
+When an entry would not fit, `lv_seen_evict()` walks the hash, in three tiers:
+
+- the entries a probe no longer needs: those of rows whose PLANE-1 upper bound, kept in the entry
+  (`hi1`, carried in the queue's items from the probe), lies below the key of the row returned
+  last. The scan's order is strict, so no such row can be returned again, and from that walk on a
+  probe drops a row whose upper bound lies below that key, as the hash would have - and a refine
+  or a fetch one whose codes or distance put it there, which the hash then keeps. Nothing is
+  lost: the probe tells those rows by plane 1 alone, as it first read them. (A row whose plane-1
+  bound fails so, not yet returned, is lost, as one the margin leaves till too late is.) This is
+  the review's own suggestion made exact: the rows returned are dropped as the scan moves past
+  them, as far as plane 1 can tell them from the rest.
+- if that freed less than a quarter of the hash, the rows behind the last that plane 1 cannot
+  tell: returned at a lesser distance, or known by their codes or distance to lie nearer. A probe
+  meets them again and refines (or fetches) them once more, to find them behind again;
+- and if that is still less than a quarter, what it knows of the rows ahead (CODES8, EXACT).
+
+The second and third lose knowledge, and bring back the livelock that knowledge prevents (above):
+so after four passes that lost knowledge since the scan was last done with a row, it stops
+(`lv_may_probe()`); passes that lose nothing in between do not reset that count, since they may
+only win back what the last one lost (vector.sql's scan at 64 kB made 65,000 passes for 20 rows
+when they did). A walk is allowed once a quarter of what the hash may hold has come in since the
+last, which pays for it; when none is, or a walk frees no room, a row's codes or distance are not
+kept, and a row returned must be, so the scan stops after it. In an index that spills, an entry
+lost also lets the row's other item enter its pass, so that the queue may hold the row twice;
+whichever comes out second finds the row returned, or behind, and is dropped. A scan that cannot
+go on fails the query by default, `lionvec scan of "i" outgrew hash_mem after N rows`, an ERROR
+whose HINT names `work_mem`, `hash_mem_multiplier`, a sort, a LIMIT and
+`pg_lion.vector_overflow` (§44.8). Set to `stop`, that ends the scan instead: it returns no more
+rows and raises a NOTICE, `lionvec scan of "i" stopped after N rows, what it knew of its rows
+having outgrown hash_mem`; what it returned is in order, each row once, the nearest it found.
+The ERROR is the default (chosen 2026-10-16) so that a query that asked for every row never gets
+fewer without failing; pgvector's iterative scans end without a word. The DEBUG1 line
+counts the walks and those that lost knowledge. How far a scan gets depends on how well plane 1
+tells rows apart, so on the dimensions and the data. Measured with `stop`, no LIMIT, `work_mem`
+4 MB and so `hash_mem` 8 MB (117,964 entries) unless said, one row of the table as the query:
+
+- 3,006 rows of 40 dimensions (vector.sql's), at 128 kB and `hash_mem_multiplier` 1 (1,843
+  entries): every row, in order, the first tier alone making room.
+- 2,000,000 rows of 16 dimensions, where plane 1 tells rows apart worst: before, every row, the
+  scan's memory 165 MB, 81 s; after, it stops after 31,250 rows, 30 MB, 2.4 s; at 16 MB after
+  88,212; at 64 MB every row, 241 MB (its queue's cap and the hash both grow with it), 33 s.
+- 200,000 rows of 256 dimensions in 100 clusters of 2,000, uniform noise about each centre, so
+  that the other 198,000 rows lie at distances within a few percent of each other, inside plane
+  1's bound: before, 199,994 rows (6 out of order), 25 MB, 1.9 s, each row refined once; after,
+  it stops after 14,912 rows, 18 MB, 2.0 s, having refined 604,286 (five walks, each losing
+  knowledge); at 8 MB every row as before, 36 MB, 2.1 s, no walk. The rows a scan must know of at
+  once to return the next is the table here, and the hash holds 59% of it.
+
+A LIMIT of 10 or 1,000 over the last, 200 queries, costs what it did before (2.8 and 5.3 ms a
+query either way, within the noise of runs). pgvector's iterative scans bound theirs the same
+way, and tighter: HNSW's ends, without a word, at `hnsw.max_scan_tuples` (20,000) rows or
+`work_mem` times `hnsw.scan_mem_multiplier` (1). The bound is read once, as the scan starts
+(`seenmost`), so that `lv_remember()` costs no more than it did: a new entry with room is one
+insert, and only a full hash looks a row up first.
+
 **NULLs and zeros.** NULL rows come last, with NULL distances, from the NULL chain; before them,
 in a cosine index, the zero vectors, whose distance is NaN (float8 sorts NaN after every number,
 as the sequential scan's sort does), from the same chain. A NULL query returns every row of every
 chain with a NULL distance; a cosine zero query every non-NULL row with NaN, then the NULLs; an
 index with no vector yet only its NULLs. A walk copies a page's TIDs out under the page's lock, so
 a VACUUM between two calls cannot make one come back twice. A scan without an ORDER BY, which the
-planner never makes (its cost is infinite), walks every row.
+planner never makes (its cost is infinite, and from PostgreSQL 18, which weighs disabled nodes
+before costs, it carries two disabled nodes, as pgvector's do: without them it beat a sequential scan
+disabled by `enable_seqscan = off`, and a count(*) failed as an index-only scan, found by the
+insert spec of §44.10), walks every row.
 
 ### 44.5 Concurrency, WAL and VACUUM
 
@@ -20595,15 +20729,18 @@ planner never makes (its cost is infinite), walks every row.
   takes the sample, from which k-means finds the centroids (§44.3), whose REFINE items are the
   first written. The second writes each row's REFINE item in place and puts its CODE item into a
   tuplesort (`maintenance_work_mem`) keyed by its group - its partition, then the REST and NULL
-  chains - and its place in the heap scan, from which the CODE chains are written in one run of
-  blocks, each group starting a page; then the PART chain, then the meta page. In an index that
+  chains - and its TID, from which the CODE chains are written in one run of blocks, each group
+  starting a page, and each partition's count, spread and longest row summed in that order; then
+  the PART chain, then the meta page. In an index that
   spills the sort holds two items a row, the copy under its second partition's group, so it is
   twice the size and spills to disk at half the rows; the meta page's row count counts each row
   once, the PART items' counts every item. The whole range is
   WAL-logged at the end (`log_newpage_range()`). Neither scan joins a synchronized scan
-  (`allow_sync = false`), which could start part-way through the heap: the second must see the
-  rows in heap order, which each partition's CODE pages keep, and the sample is the same from build
-  to build. Not parallel; progress is reported for the second scan. `CREATE INDEX CONCURRENTLY` and
+  (`allow_sync = false`), which could start part-way through the heap: the sample must be the same
+  from build to build, and the second scan's REFINE items then lie in heap order, as each
+  partition's CODE items do whatever order the rows came in, being sorted by TID. Built in
+  parallel from PostgreSQL 16 (§44.12); progress is reported for the second scan. `CREATE INDEX
+  CONCURRENTLY` and
   `REINDEX` work as for any AM. An unlogged index's init fork is the meta page and empty REST and
   NULL chains.
 - **VACUUM** (`lionvecbulkdelete()`): walks every CODE chain (`lionvec_chain_heads()`: the
@@ -20747,9 +20884,10 @@ no ORDER BY costs infinity. Selectivity 1, correlation 0.
   (§44.6). The default was 2 until the pause; with the pause, 3 took the benchmark's recall from
   0.964 to 0.979 for 1.3 ms (§44.9).
 - `pg_lion.vector_patience` (int, 0 to 1,000,000, default 30): how many units of rows a scan
-  scores without one entering its L nearest before it pauses (§44.4), a unit `sqrt(n) / 2` rows,
-  n the build's, the rows an average partition would hold in `2 sqrt(n)` partitions - under a
-  lion filter that share of the members - whatever the partitions' number; 0 never pauses, and
+  scores without one entering the nearest rows it is after (its tier, §44.4) before it pauses, a
+  unit `sqrt(n) / 2` rows, n the build's, the rows an average partition would hold in `2 sqrt(n)`
+  partitions - under a lion filter twice that share of the members - whatever the partitions'
+  number, and `margin / 6` times as many past a margin of 6; 0 never pauses, and
   then a filter's scan probes far more than the costs assume (§44.7). Smaller pauses sooner,
   probing fewer partitions and missing more rows. 30 is where the 975,000-row benchmark's tail
   ended, in its `2 sqrt(n)` partitions, where a unit is a partition's rows: at a margin of 3, 30
@@ -20764,7 +20902,12 @@ no ORDER BY costs infinity. Selectivity 1, correlation 0.
   is fast or exactness is wanted, lower it where the vectors are wide and the disk slow. The
   planner prices both (§44.7), so it may sort the filter's rows itself above the threshold, as
   it does at 1% on DBpedia (§44.9), which is exact too.
-- `partitions` (reloption, 0 to 1,000,000, default 0): the partitions the build makes; 0 chooses
+- `pg_lion.vector_overflow` (enum, `error` or `stop`, default `error`): what a scan does when what
+  it knows of its rows outgrows `hash_mem` (§44.4, "The hash's bound"): fail the query, or end
+  the scan at the rows it returned, with a NOTICE. Only a scan with no LIMIT, or a large one,
+  over rows plane 1 cannot tell apart gets there.
+- `partitions` (reloption, 0 to 65,536, default 0; 1,000,000 until a review found the build at a
+  million partitions days long and uncancellable): the partitions the build makes; 0 chooses
   by the rows' count, `8 sqrt(n)` above 10,000 rows as `maintenance_work_mem`'s sample allows
   (§44.3; `2 sqrt(n)` until DBpedia, §44.9). Read by the build alone, so a change takes a REINDEX.
   It does not move the pause: `pg_lion.vector_patience` counts the rows of `2 sqrt(n)` partitions,
@@ -20786,8 +20929,13 @@ no ORDER BY costs infinity. Selectivity 1, correlation 0.
   time.
 - `pg_lion.vector_batch` (int, 1 to 100000, default 100): rows the probes gather candidates for
   before REST; each REST gathers four times as many, probing every partition probed so far again.
+  It no longer sets where a LIMIT 10 pauses (the tiers do, §44.4), so it need not follow the
+  LIMIT.
 - `maintenance_work_mem`: half of it holds the build's sample (§44.3), and the CODE items' sort,
-  two items a row when the index spills.
+  two items a row when the index spills; a parallel build divides the sort's share among its
+  processes, as core's builds do, and holds the sample once, in shared memory (§44.12).
+- `max_parallel_maintenance_workers` (core's, default 2) and the table's `parallel_workers`: the
+  workers a build asks for, whatever the heap's size or `maintenance_work_mem` (§44.12).
 - `work_mem` bounds a scan's row queue (§44.4).
 
 ### 44.9 Measured
@@ -21146,11 +21294,16 @@ medians of three and two), the same index.
   `lionvec_kmeans()`, plain and spherical - it converges, every row ends with its nearest centroid,
   every centroid is its rows' (normalized) mean to 1e-4, the same seed gives the same centroids, a
   zero mean gives the same as none, one centroid is the mean, as many as rows one row each, with
-  eight centroids a cluster none mixes two clusters, and identical rows finish. Spill:
+  eight centroids a cluster none mixes two clusters, and identical rows finish; and its steps
+  (§44.12), each iteration's rows assigned in chunks of 1, 7, 32 and all, the chunks taken last
+  first and alternating between two scratch areas, giving its centroids, assignment and iterations
+  to the bit, for as many centroids as clusters and eight times as many. Spill:
   `lionvec_rank()` against a sort, with ties, NaN and infinities; `lionvec_candidates_n()` for the
   nine nearest at 64, 320 and 1536 dimensions - for one the same as `lionvec_candidates()`, at a
   wide bound every one of the nine a candidate, at the build's bound one missed at most once in
-  200, and still few (10 of 200 at 320 dimensions and more, 107 at 64); `lionvec_decode8()` at 64 to
+  200, and still few (10 of 200 at 320 dimensions and more, 107 at 64), and the same from the
+  streaming form an insert keeps (`lionvec_cands_add()`, with the insert's pruning) for one and for
+  nine; `lionvec_decode8()` at 64 to
   8128 dimensions - its error `|x|^2 (1 - alpha8^2)` to 1e-3, at most 3% of `|x|` and 1.2% on
   average, orthogonal to the decoded vector; `lionvec_soar_second()`'s algebra on a constructed
   case whose answer flips where the arithmetic says (a candidate along the residual against one
@@ -21173,7 +21326,14 @@ medians of three and two), the same index.
   0.9 of the ten nearest for each metric, over 20 queries, pausing) and a negative margin's (less
   than all of a hundred between clusters); a scan pausing after every partition (a patience of 1)
   still returning a LIMIT 300 whole and in order; and the refusals (another type, too many
-  dimensions, an array, two columns, the `partitions` and settings' ranges). Spill, its indexes'
+  dimensions, an array, two columns, the `partitions` and settings' ranges, an operator class over
+  `int` - `amvalidate` false, CREATE INDEX an error - and one whose operator returns `integer`,
+  which `amvalidate` reports and a scan refuses); an operator class whose operator returns
+  `float4`, valid, its scans' distances `float4` and the operator's own; the progress hash held to
+  `hash_mem` (§44.4): a scan with no LIMIT at 128 kB, whose hash holds 1,843 entries for 3,001
+  rows, returning every row as a sort does, and at a `work_mem` of 64 kB failing with its ERROR,
+  or, with `pg_lion.vector_overflow` set to `stop`, stopping with its NOTICE, what it returned the
+  sort's first rows; the setting refuses any other value. Spill, its indexes'
   CODE items read off their pages with pageinspect: after the build, inserts, UPDATE, DELETE and
   VACUUM and REINDEX, every row with a vector has one primary and one copy, in another partition's
   chain (each block placed by following the chains from the PART items' heads), naming the same
@@ -21201,6 +21361,18 @@ medians of three and two), the same index.
   node (the short LIMIT of §44.4); the node switched off. Spill: LionOrdered returns each member
   once and the same rows as the ordinary plan, every member of two filters for each metric, at
   the margin of 100 and at the defaults, before and after DELETE and VACUUM under the filter.
+- **test/isolation/lionvec_insert_window.spec** (an injection point build, PostgreSQL 17 and on;
+  2026-10-15, after a review found lionvec's concurrency untested): an insert parked after its
+  REFINE record (`lionvec-insert-refined`), and after its CODE record before its copy's
+  (`lionvec-insert-coded`), against a cursor opened before it, which drains while it is parked and
+  returns exactly a sort's rows under its snapshot, each once; a scan started while it is parked,
+  which waits for the meta page (`(*)`, a buffer lock) and then sees none of its rows; and a scan of
+  the whole index afterwards, every row once. **lionvec_vacuum_scan.spec**: 2,500 of 3,000 rows
+  deleted, VACUUM in two flushes of its REFINE locations (`maintenance_work_mem` 64 kB), then 2,500
+  inserts into the REFINE slots and heap TIDs it freed, against a cursor parked after five rows with
+  REFINE locations in its queue and against a scan parked between two pages of a chain
+  (`lionvec-probe-page`); each returns exactly a sort's rows under its snapshot, each once, and the
+  whole index afterwards every row once.
 - **vector_half.sql**: the three `halfvec` operator classes, and `amvalidate`; each ORDER BY through
   the index and through a sort, as vector.sql's, with the margin of 100 and the pause off, for
   each metric over 3,000 `halfvec(40)` rows in 20 partitions, three queries and LIMITs 1 to past
@@ -21210,6 +21382,19 @@ medians of three and two), the same index.
   (`pg_lion.vector_exact_rows` at 5,000 and 0, by the DEBUG1 line); an expression index casting a
   `vector` column to `halfvec`; an untyped column (dimensions from the first row, pgvector's
   errors); and the refusals (too many dimensions, an array).
+- **vector_parallel.sql**: the parallel build against the serial one (§44.12), each index built
+  both ways and read off its pages with pageinspect into digests - the meta page's counts, scale,
+  flags and mean, the PART items but for their chains' blocks, each CODE chain's items in order but
+  for their REFINE locations, and the set of REFINE items - which must match, and the nearest rows
+  the same through either, for each metric, spilling and not, one partition and a `halfvec`
+  expression, over 6,000 rows with NULLs, a cosine zero, deleted rows and HOT chains, with the
+  table's `parallel_workers` at 2; `CREATE INDEX CONCURRENTLY` in parallel against a serial build;
+  and the count of workers by the DEBUG1 lines: 10,000 rows in parallel without `parallel_workers`,
+  at the default `maintenance_work_mem` and at 1 MB, where every process's sort spills to disk
+  (and the index is still a serial build's), an expression index and a parallel-safe partial one
+  in parallel, and serially at 9,999 rows, in a temporary table, over NULL rows alone and under a
+  parallel-unsafe predicate. On PostgreSQL 16, whose core says "serially" of every build but btree's, the
+  expected output is vector_parallel_1.out.
 
 ### 44.11 Not done
 
@@ -21230,8 +21415,8 @@ medians of three and two), the same index.
   parallel scan's tens of milliseconds from memory (arithmetic on two sizes, not measured).
   Spill (§44.3) is the other lever on the rows read, measured so far at 115,000 rows (§44.9); the
   index over the centroids is still to be built.
-- **Parallel scan and build.** A probe is a sequential read a parallel scan would split cleanly;
-  the build's k-means and assignment are a loop over rows.
+- **Parallel scan.** A probe is a sequential read a parallel scan would split cleanly. (The build
+  is parallel, §44.12.)
 - **sparsevec, bit.** The codes do not care where the floats came from; each needs an operator
   class and a reader for its format, as halfvec has (§44.1).
 - **The double heap fetch.** Each returned row is fetched by the scan for its distance and again by
@@ -21258,3 +21443,87 @@ medians of three and two), the same index.
 - **Choosing between lionvec and HNSW.** With both on one column, the planner takes HNSW for
   nearly every query, as pgvector prices an HNSW scan at almost nothing: on 200,000 random
   256-dimension rows, about 13 against lionvec's 3,100 unfiltered (format 1).
+
+### 44.12 Parallel build (lion_vec.c, lion_vec_math.c; 2026-10-15)
+
+A build's time is arithmetic, not reading: DBpedia's 115,186 rows of 1536 dimensions, in 2,715
+partitions, took 134.2 s serially (PostgreSQL 18, 4 cores, the table cached) - the first pass
+2.8 s, k-means 108.0 s, the second pass 23.1 s, the sort and the writing 0.4 s; another run took
+124.8 s, the machine being shared. Both k-means' iterations and the second pass find, for each row
+on its own, the nearest of the centroids by a plane-1 estimate of each (§44.3), so both are shared
+out among processes. With 3 workers and the leader the same build took 37.8 s: the first pass
+3.0 s, k-means 28.3 s, the second pass 6.2 s, the writing 0.4 s (38.2 s in another run); the
+shared steps ran 3.8 and 3.7 times as fast on four processes. It runs on PostgreSQL 16
+as well, counting its own workers rather than waiting for core's (below).
+
+- **The phases.** The first pass, the mean and the sample, stays serial: reservoir sampling draws
+  the same rows only when it meets them in the same order, and it is a fiftieth of the time. With
+  the partitions known, the leader sets up a parallel context (`lionvec_begin_parallel()`, the
+  workers' entry `lionvec_parallel_build_main()`): a shared struct with a parallel heap scan from
+  the first block (as a serial build's scans, `allow_sync = false`, §44.5), the sample, copied
+  into it and the leader's own copy freed, so that it is held once, the arrays k-means and the
+  assignment work in (`LionVecBuildArrays`: the centroids, their plane 1 and 8-bit codes, their
+  floats, the sample's assignment and the mean, laid out by one function in the leader and in
+  every worker, and kept in local memory by a serial build), a shared tuplesort, and the workers'
+  WAL and buffer usage, which the leader adds to its own. It then posts the workers work, under a
+  spinlock and a condition variable, and takes part in each itself:
+  - KMEANS, each iteration: the leader codes the centroids (C rows, a moment) and posts the
+    iteration; every process takes the sample's rows 32 at a time (`LIONVEC_KMEANS_CHUNK`) from an
+    atomic counter, assigns each its nearest centroid in the shared assignment and counts the rows
+    that moved; the leader waits for the last row, then moves the centroids to their rows' means,
+    alone. The counter's high 32 bits are the iteration's, so that a process still finishing the
+    last iteration takes none of this one's rows, and its compare-and-swap never runs past the end.
+  - SCAN, once: the second pass over the parallel heap scan. Each process puts its rows' CODE items
+    into its own run of the shared sort, with `maintenance_work_mem` divided among them as core's
+    builds divide it, and their REFINE items on REFINE pages it extends the index by for itself;
+    the leader merges the runs and writes the CODE chains, the PART chain and the meta page, as a
+    serial build does, ends the workers, and WAL-logs the index.
+- **A serial build's index.** lionvec_kmeans() is its steps run in a loop
+  (`lionvec_kmeans_start()`, `_codes()`, `_assign()` over a range of rows, `_update()`): a row's
+  assignment depends on the centroids and the row alone, and the update sums the rows in the
+  sample's order in one process, so the centroids come out of a parallel build to the bit as out of
+  a serial one, however the rows were shared out (the unit tests, §44.10). A row's partitions, its
+  own and its copy's, depend on the centroids alone. The CODE items' sort was keyed by the group
+  and a count in scan order; it is keyed by the group and the TID now, so the merged runs come out
+  in the order a serial build's scan made, and the partitions' counts, spreads and longest rows, and
+  the meta page's scale, which the scan callback summed, are summed as the CODE chains are written,
+  in the sort's order, so that the floating sums do not depend on which process met which row. What
+  differs is where the rows' REFINE items lie: each process fills pages of its own, so their blocks,
+  the REFINE locations in the CODE items, and the chains' blocks, laid after the REFINE pages, are
+  not a serial build's. A scan reads the same codes in the same order either way, and gives the same
+  answers: DBpedia's 200 queries returned the same ten rows through either at margins of 3 and 8.
+- **How many workers** (`lionvec_build_workers()`): `max_parallel_maintenance_workers`, or the
+  table's `parallel_workers` when it sets it, at most `max_parallel_maintenance_workers`, as for
+  core's builds. Core's count (`plan_create_index_workers()`) would also size a build by the heap's
+  main fork and by `maintenance_work_mem`. pgvector stores a vector of more than about 500
+  dimensions out of line, in the TOAST table: DBpedia's main fork is 7.6 MB, under
+  `min_parallel_table_scan_size`, and core gives its 115,186 rows none, though the build's cost is
+  arithmetic over the rows, whatever their bytes. And core keeps 32 MB of `maintenance_work_mem` a
+  process, which at the default 64 MB allows one worker, for its sorts; a lionvec build's processes
+  share the sample, and each holds only its share of the sort, which spills (at 1 MB,
+  vector_parallel.sql). So lionvec counts its own, and core's goes unused. (pgvector's HNSW build
+  asks for `max_parallel_maintenance_workers` whatever the size too, but only once core's count is
+  more than none.) None below 10,000 rows with a vector unless `parallel_workers` is set
+  (`LIONVEC_MIN_AUTO_ROWS`, below which a build is one partition by default and quick); none for an
+  index whose expressions or predicate are not parallel safe (`lionvec_build_parallel_safe()`,
+  `is_parallel_safe()` as core asks it), for a temporary table, which workers cannot read, or with
+  no partitions. 17's `amcanbuildparallel` is set, as the build is parallel; core then counts
+  workers for its DEBUG1 line alone, and on 16, which counts only for btree, the build is parallel
+  all the same. Either way core's line may say "serially" of a build lionvec's next line says it
+  "built in parallel". If no worker starts, the leader undoes the parallel setup and builds
+  serially.
+- **Shared memory.** The sample, up to half of `maintenance_work_mem` (§44.3; 177 MB for DBpedia),
+  and the arrays (the centroids' floats and codes, 22 MB there) are in the parallel context's DSM
+  segment, sized before the workers start. Where `/dev/shm` is small - Docker's 64 MB unless
+  `--shm-size` raises it - creating the segment fails, and so does the build, as pgvector's
+  parallel HNSW build does, whose documentation says the same; the guide says it, and that
+  `max_parallel_maintenance_workers = 0` builds serially. The sort's runs are in temporary files,
+  as core's are.
+- **Locks and cancel.** A worker opens the heap and index with the locks `index_build()` took for
+  the leader, `ShareLock` and `AccessExclusiveLock`, or for `CREATE INDEX CONCURRENTLY`
+  `ShareUpdateExclusiveLock` and `RowExclusiveLock`, and scans with the leader's snapshot - an MVCC
+  one under CONCURRENTLY, else `SnapshotAny`, as `table_index_build_scan()` wants. The second pass
+  used to hold its REFINE page's content lock from one row to the next; an LWLock holds off
+  interrupts, so a cancel waited for the page to fill, and a worker's for the leader, whose
+  condition-variable wait is where a worker's error reaches it. Each row's REFINE item now locks
+  the page for itself, which costs nothing measurable, and a serial build's cancel is as prompt.
