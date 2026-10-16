@@ -43,8 +43,8 @@
 #                                   that index and each filter, into
 #                                   KNN_OUT/NAME.json with the index's build
 #   knn_dbpedia.py exact NAME        the exact path and its alternatives under
-#                                   filters of 1, 3, 10 and 30%, warm, into
-#                                   KNN_OUT/NAME.json
+#                                   filters of 1, 3, 10 and 30% (KNN_EXACT_SELS),
+#                                   warm, into KNN_OUT/NAME.json
 #   knn_dbpedia.py table FILE...     the results as markdown tables, and the
 #                                   pages a recall took, along the margins
 #   knn_dbpedia.py cold [NAME]      each query alone after a server restart
@@ -71,6 +71,9 @@
 # the server, KNN_DROP (default "sync; echo 3 > /proc/sys/vm/drop_caches")
 # the command that empties the kernel's page cache, and KNN_COLD_NQ (default
 # 7) the queries each method runs cold.
+# KNN_EXACT_SELS (default 0.01,0.03,0.1,0.3) and KNN_EXACT_MARGINS (default
+# 3): the filters an exact run measures, and the margins LionOrdered probes
+# them at there.
 # KNN_MARGINS (default 2,3,4,6,8,12,16) and KNN_PATIENCE (default 30): the
 # pg_lion.vector_margin and pg_lion.vector_patience values warm runs.  The
 # margins go past the default 3 because on these embeddings 3 returns 0.84 of
@@ -199,6 +202,12 @@ def show(conn, *names):
         if r:
             out[n] = r[0]
     return out
+
+
+def has_setting(conn, name):
+    # whether the server knows a setting: pg_lion reserves its prefix, so
+    # SET of one an older build lacks is an error
+    return conn.execute("SELECT 1 FROM pg_settings WHERE name = %s", (name,)).fetchone() is not None
 
 
 def only_index(conn, idx):
@@ -657,10 +666,16 @@ def exact(name):
     # What an exact answer costs under a filter, against the approximate one:
     # LionOrdered's exact path (pg_lion.vector_exact_rows raised to take every
     # filter here), the planner's own exact plan (a sort of the filter's rows,
-    # LionOrdered off), LionOrdered probing at the default margin (the exact
-    # path off), and the planner's plan at the default margin; at filters of
-    # 1, 3, 10 and 30%.  The truth at 30% is computed here, as prepare()
-    # computes the others'.  Warm, as warm() measures.
+    # LionOrdered off), LionOrdered probing at each of KNN_EXACT_MARGINS (the
+    # exact path off), and the planner's plan at the default margin; at the
+    # filters KNN_EXACT_SELS.  The truth of a filter prepare() did not cache
+    # (30%, 0.3%) is computed here as prepare() computes the others', and
+    # 10%'s again, as a check.  Each row has the filter's members and their
+    # number a partition of the build's (its .build.json), which
+    # pg_lion.vector_exact_per_partition compares (DESIGN.md §44.6).  Warm,
+    # as warm() measures.
+    sels = [float(x) for x in os.environ.get('KNN_EXACT_SELS', '0.01,0.03,0.1,0.3').split(',')]
+    margins = [float(x) if '.' in x else int(x) for x in os.environ.get('KNN_EXACT_MARGINS', '3').split(',')]
     X = np.load(os.path.join(CACHE, 'X.npy'), mmap_mode='r')
     qidx = np.load(os.path.join(CACHE, 'qidx.npy'))
     u = np.load(os.path.join(CACHE, 'u.npy'))
@@ -670,7 +685,7 @@ def exact(name):
     keep[qidx] = False
     rows = np.flatnonzero(keep)
     S = similarities(X, rows, Q)
-    for sel in (0.3, 0.1):
+    for sel in sorted({s for s in sels if str(s) not in truth} | {0.1}, reverse=True):
         m = u[rows] < sel
         ids, Ss = rows[m], S[m]
         top = np.array([top10(ids, np.ascontiguousarray(Ss[:, i])) for i in range(len(Q))])
@@ -679,27 +694,39 @@ def exact(name):
         truth[str(sel)] = top
     del S
     idx = INDEXES['lionvec']
+    try:
+        nparts = json.load(open(os.path.join(CACHE, f'{idx}.build.json'))).get('partitions')
+    except OSError:
+        nparts = None
     conn = connect()
     cost_distances(conn)
     prewarm(conn, idx)
     lo = ['SET enable_sort = off', 'SET enable_indexscan = off']
-    # every filter's members, up to 30% of the rows, on the exact path
+    # every filter's members, up to 30% of the rows, on the exact path; and
+    # none, by either threshold (a build without the second has the first)
     every = max(200000, len(rows))
-    configs = [('exact LionOrdered', [f'SET pg_lion.vector_exact_rows = {every}'] + lo),
-               ('planner exact sort', ['SET pg_lion.enable_ordered_scan = off', 'SET enable_indexscan = off']),
-               ('LionOrdered margin=3', ['SET pg_lion.vector_margin = 3', 'SET pg_lion.vector_exact_rows = 0'] + lo),
-               ('planner plan margin=3', ['SET pg_lion.vector_margin = 3'])]
-    meta = dict(name=name, table=TABLE, column=coltype(), index=idx, run=provenance(),
+    off = ['SET pg_lion.vector_exact_rows = 0'] + \
+        (['SET pg_lion.vector_exact_per_partition = 0']
+         if has_setting(conn, 'pg_lion.vector_exact_per_partition') else [])
+    configs = ([('exact LionOrdered', [f'SET pg_lion.vector_exact_rows = {every}'] + lo),
+                ('planner exact sort', ['SET pg_lion.enable_ordered_scan = off', 'SET enable_indexscan = off'])] +
+               [(f'LionOrdered margin={mg}', [f'SET pg_lion.vector_margin = {mg}'] + off + lo) for mg in margins] +
+               [('planner plan margin=3', ['SET pg_lion.vector_margin = 3'])])
+    meta = dict(name=name, table=TABLE, column=coltype(), index=idx, partitions=nparts, run=provenance(),
                 run_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), queries=len(Q),
                 settings=show(conn, 'shared_buffers', 'work_mem', 'random_page_cost', 'effective_io_concurrency',
-                              'max_parallel_workers_per_gather', 'io_method', 'server_version'),
+                              'max_parallel_workers_per_gather', 'io_method', 'server_version',
+                              'pg_lion.vector_exact_rows', 'pg_lion.vector_exact_per_partition'),
                 sizes=sizes(conn))
     out = []
     others = only_index(conn, idx)
     try:
-        for sel in (0.01, 0.03, 0.1, 0.3):
+        for sel in sels:
+            n = int((u[rows] < sel).sum())
             for mname, settings in configs:
-                out.append(run(conn, mname, sql('lionvec', sel), sel, settings, Q, truth[str(sel)]))
+                r = run(conn, mname, sql('lionvec', sel), sel, settings, Q, truth[str(sel)])
+                r.update(members=n, members_per_partition=n / nparts if nparts else None)
+                out.append(r)
     finally:
         restore_indexes(conn, others)
     os.makedirs(OUT, exist_ok=True)
