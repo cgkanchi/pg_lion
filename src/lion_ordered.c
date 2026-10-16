@@ -2262,6 +2262,13 @@ lo_knn_filter(IndexPath *ipath)
  * offers it, so that the relation has an unparameterized path whatever the
  * order had beaten: one cheaper in total, with its pathkeys, dominates a
  * path that has none when no LIMIT makes start-up count.
+ *
+ * A partial path of a lionvec order (a Parallel Index Scan, DESIGN.md
+ * §44.4, "A parallel scan") is the serial one's in parallel, and goes by
+ * the same rule: a Filter over it, under Gather Merge, would be the same
+ * post-filter.  It goes from the partial path list alone - LionOrdered is
+ * serial and walks the serial paths - and needs nothing brought back, a
+ * partial sequential scan having no pathkeys it could have lost to.
  */
 static void
 lo_knn_take(PlannerInfo *root, RelOptInfo *rel, LoKnn *knn)
@@ -2281,21 +2288,18 @@ lo_knn_take(PlannerInfo *root, RelOptInfo *rel, LoKnn *knn)
 			knn->taken = lappend(knn->taken, ipath);
 	}
 
-	/*
-	 * No partial path scans a lionvec index (its amcanparallel is false),
-	 * and if one did it would be taken as well.
-	 */
 	foreach(lc, rel->partial_pathlist)
 	{
 		Path	   *p = (Path *) lfirst(lc);
+		IndexPath  *ipath;
 
-		if (IsA(p, IndexPath) &&
-			lion_vec_index(((IndexPath *) p)->indexinfo))
-		{
-			Assert(false);
+		if (!IsA(p, IndexPath))
+			continue;
+		ipath = (IndexPath *) p;
+		if (lo_knn_path(ipath) && !ipath->indexinfo->hypothetical &&
+			lo_knn_filter(ipath) != NIL)
 			rel->partial_pathlist =
 				foreach_delete_current(rel->partial_pathlist, lc);
-		}
 	}
 
 	if (knn->taken == NIL)
@@ -2305,7 +2309,47 @@ lo_knn_take(PlannerInfo *root, RelOptInfo *rel, LoKnn *knn)
 	add_path(rel, create_seqscan_path(root, rel, rel->lateral_relids, 0));
 }
 
-/* Is a lionvec order no Filter follows still among the relation's paths? */
+/*
+ * The partial paths of a lionvec order at their parallel cost
+ * (lion_vec_parallel_cost(), which cost_index() could not ask for: it
+ * prices the index before it counts the workers), each taken out and
+ * offered again as lion_plain_set_rel_pathlist() reprices a plain path,
+ * so that add_partial_path() orders and prunes them by the cost they now
+ * have.
+ */
+static void
+lo_knn_partial(RelOptInfo *rel)
+{
+	List	   *repriced = NIL;
+	ListCell   *lc;
+
+	foreach(lc, rel->partial_pathlist)
+	{
+		Path	   *p = (Path *) lfirst(lc);
+
+		if (IsA(p, IndexPath) && p->parallel_workers > 0 &&
+			lion_vec_index(((IndexPath *) p)->indexinfo))
+		{
+			repriced = lappend(repriced, p);
+			rel->partial_pathlist =
+				foreach_delete_current(rel->partial_pathlist, lc);
+		}
+	}
+	foreach(lc, repriced)
+	{
+		IndexPath  *ipath = (IndexPath *) lfirst(lc);
+
+		lion_vec_parallel_cost(ipath);
+		add_partial_path(rel, (Path *) ipath);
+	}
+	list_free(repriced);
+}
+
+/*
+ * Is a lionvec order no Filter follows still among the relation's paths?
+ * The serial ones alone: a partial path no Filter follows has the serial
+ * path of the same index and clauses beside it.
+ */
 static bool
 lo_knn_kept(RelOptInfo *rel)
 {
@@ -2914,7 +2958,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
  * away, not the rule: such a query then gets an exact plan, or the error.
  * Under error a relation whose lionvec order had to go, with no LionOrdered
  * over it and no other lionvec order left (a partial index's, whose
- * predicate implies every clause), fails the query here.
+ * predicate implies every clause), fails the query here.  The partial paths
+ * of the orders left then get their parallel cost (lo_knn_partial()).
  */
 static void
 lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
@@ -2929,6 +2974,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	knn.why = LO_KNN_NONE;
 	if (lionvec_postfilter != LIONVEC_POSTFILTER_ALLOW)
 		lo_knn_take(root, rel, &knn);
+	lo_knn_partial(rel);
 	lo_set_rel_pathlist(root, rel, rte, &knn);
 	if (knn.taken != NIL && knn.offered == 0 &&
 		lionvec_postfilter == LIONVEC_POSTFILTER_ERROR && !lo_knn_kept(rel))
