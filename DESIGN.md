@@ -20794,7 +20794,7 @@ no ORDER BY costs infinity. Selectivity 1, correlation 0.
   two items a row when the index spills; a parallel build divides the sort's share among its
   processes, as core's builds do, and holds the sample once, in shared memory (§44.12).
 - `max_parallel_maintenance_workers` (core's, default 2) and the table's `parallel_workers`: the
-  workers a build asks for (§44.12).
+  workers a build asks for, whatever the heap's size or `maintenance_work_mem` (§44.12).
 - `work_mem` bounds a scan's row queue (§44.4).
 
 ### 44.9 Measured
@@ -21228,8 +21228,10 @@ medians of three and two), the same index.
   expression, over 6,000 rows with NULLs, a cosine zero, deleted rows and HOT chains, with the
   table's `parallel_workers` at 2; `CREATE INDEX CONCURRENTLY` in parallel against a serial build;
   and the count of workers by the DEBUG1 lines: 10,000 rows in parallel without `parallel_workers`,
-  serially at 32MB of `maintenance_work_mem` and at 9,999 rows, in a temporary table and over
-  NULL rows alone. On PostgreSQL 16, whose core says "serially" of every build but btree's, the
+  at the default `maintenance_work_mem` and at 1 MB, where every process's sort spills to disk
+  (and the index is still a serial build's), an expression index and a parallel-safe partial one
+  in parallel, and serially at 9,999 rows, in a temporary table, over NULL rows alone and under a
+  parallel-unsafe predicate. On PostgreSQL 16, whose core says "serially" of every build but btree's, the
   expected output is vector_parallel_1.out.
 
 ### 44.11 Not done
@@ -21328,23 +21330,26 @@ as well, counting its own workers rather than waiting for core's (below).
   the REFINE locations in the CODE items, and the chains' blocks, laid after the REFINE pages, are
   not a serial build's. A scan reads the same codes in the same order either way, and gives the same
   answers: DBpedia's 200 queries returned the same ten rows through either at margins of 3 and 8.
-- **How many workers** (`lionvec_build_workers()`). Core counts a build's workers by the heap's main
-  fork (`plan_create_index_workers()`), and pgvector stores a vector of more than about 500
+- **How many workers** (`lionvec_build_workers()`): `max_parallel_maintenance_workers`, or the
+  table's `parallel_workers` when it sets it, at most `max_parallel_maintenance_workers`, as for
+  core's builds. Core's count (`plan_create_index_workers()`) would also size a build by the heap's
+  main fork and by `maintenance_work_mem`. pgvector stores a vector of more than about 500
   dimensions out of line, in the TOAST table: DBpedia's main fork is 7.6 MB, under
-  `min_parallel_table_scan_size`, and core gives its 115,186 rows none. The build's cost is
-  arithmetic over the rows, whatever their bytes, so lionvec counts its own: the table's
-  `parallel_workers` alone if set, at most `max_parallel_maintenance_workers`; otherwise none under
-  10,000 rows with a vector (`LIONVEC_MIN_AUTO_ROWS`, below which a build is one partition and
-  quick), and above it `max_parallel_maintenance_workers`, no more than leave each process 32 MB of
-  `maintenance_work_mem`, core's rule. (pgvector's HNSW build also asks for
-  `max_parallel_maintenance_workers` whatever the size, but only once core's count is more than
-  none.) An expression or partial index takes core's count, whose checks that the expression and
-  predicate are parallel safe this would otherwise have to repeat; on 16 that is
-  `plan_create_index_workers()` called directly. None for a temporary table, which workers cannot
-  read, or with no partitions. 17's `amcanbuildparallel` is set, so that core counts workers for an
-  expression or partial index; on 16, which counts only for btree, the build is parallel all the
-  same, and core's DEBUG1 line says "serially" of it, followed by lionvec's "built in parallel".
-  If no worker starts, the leader undoes the parallel setup and builds serially.
+  `min_parallel_table_scan_size`, and core gives its 115,186 rows none, though the build's cost is
+  arithmetic over the rows, whatever their bytes. And core keeps 32 MB of `maintenance_work_mem` a
+  process, which at the default 64 MB allows one worker, for its sorts; a lionvec build's processes
+  share the sample, and each holds only its share of the sort, which spills (at 1 MB,
+  vector_parallel.sql). So lionvec counts its own, and core's goes unused. (pgvector's HNSW build
+  asks for `max_parallel_maintenance_workers` whatever the size too, but only once core's count is
+  more than none.) None below 10,000 rows with a vector unless `parallel_workers` is set
+  (`LIONVEC_MIN_AUTO_ROWS`, below which a build is one partition by default and quick); none for an
+  index whose expressions or predicate are not parallel safe (`lionvec_build_parallel_safe()`,
+  `is_parallel_safe()` as core asks it), for a temporary table, which workers cannot read, or with
+  no partitions. 17's `amcanbuildparallel` is set, as the build is parallel; core then counts
+  workers for its DEBUG1 line alone, and on 16, which counts only for btree, the build is parallel
+  all the same. Either way core's line may say "serially" of a build lionvec's next line says it
+  "built in parallel". If no worker starts, the leader undoes the parallel setup and builds
+  serially.
 - **Shared memory.** The sample, up to half of `maintenance_work_mem` (§44.3; 177 MB for DBpedia),
   and the arrays (the centroids' floats and codes, 22 MB there) are in the parallel context's DSM
   segment, sized before the workers start. Where `/dev/shm` is small - Docker's 64 MB unless

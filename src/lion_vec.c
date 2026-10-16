@@ -57,6 +57,7 @@
 #include "executor/instrument.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
+#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "pgstat.h"
@@ -1807,51 +1808,54 @@ extern PGDLLEXPORT void lionvec_parallel_build_main(dsm_segment *seg,
 													shm_toc *toc);
 
 /*
- * The workers a build asks for, of nrows rows with a vector.  A table's own
- * `parallel_workers` decides alone, as it does for core's builds, at most
- * max_parallel_maintenance_workers.  Otherwise core sizes a build by the
- * heap's main fork, which holds no vector of more than about 500
- * dimensions - pgvector's are stored out of line, in the TOAST table - so
- * that DBpedia's 115,186 rows of 1536 dimensions, a main fork of 7.6MB,
- * under min_parallel_table_scan_size, get none.  The build's cost is
- * arithmetic over the rows in any case: a build of LIONVEC_MIN_AUTO_ROWS
- * rows or more asks for max_parallel_maintenance_workers, no more than
- * leave each process 32MB of maintenance_work_mem (core's rule).
- * (pgvector's HNSW build asks for max_parallel_maintenance_workers too,
- * once core's count is more than none.)  An index of an expression, or a
- * partial one, takes core's count, which checks that they are parallel
- * safe.  None in a temporary table, which workers cannot read, nor
- * outside a postmaster.
+ * Whether the index's expressions and predicate are parallel safe: the
+ * check plan_create_index_workers() makes of them before it sizes a build
+ * by the heap.  is_parallel_safe() walks them for a function that is not,
+ * and needs no more of a planner than this, there being no Params.
+ */
+static bool
+lionvec_build_parallel_safe(Relation index)
+{
+	PlannerInfo *root = makeNode(PlannerInfo);
+
+	root->glob = makeNode(PlannerGlobal);
+	return is_parallel_safe(root, (Node *) RelationGetIndexExpressions(index)) &&
+		is_parallel_safe(root, (Node *) RelationGetIndexPredicate(index));
+}
+
+/*
+ * The workers a build asks for, of nrows rows with a vector:
+ * max_parallel_maintenance_workers, or the table's own `parallel_workers`
+ * when it sets it, at most max_parallel_maintenance_workers, as for core's
+ * builds.  Core also sizes a build by the heap's main fork, which holds no
+ * vector of more than about 500 dimensions - pgvector's are stored out of
+ * line, in the TOAST table - so that DBpedia's 115,186 rows of 1536
+ * dimensions, a main fork of 7.6MB, under min_parallel_table_scan_size,
+ * would get none; and by maintenance_work_mem, 32MB a process.  A
+ * lionvec build's cost is arithmetic over the rows, whatever their bytes,
+ * and what a process holds of maintenance_work_mem is its share of the
+ * sort, which spills, the sample being shared: so neither applies.  None
+ * below LIONVEC_MIN_AUTO_ROWS rows unless `parallel_workers` is set (one
+ * partition by default, and quick), nor for an index whose expressions or
+ * predicate are not parallel safe, in a temporary table, which workers
+ * cannot read, or outside a postmaster.
  */
 static int
-lionvec_build_workers(Relation heap, Relation index, IndexInfo *indexInfo,
-					  double nrows)
+lionvec_build_workers(Relation heap, Relation index, double nrows)
 {
 	int			workers;
 
 	if (!IsUnderPostmaster || IsInParallelMode() ||
 		max_parallel_maintenance_workers <= 0 ||
-		heap->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+		heap->rd_rel->relpersistence == RELPERSISTENCE_TEMP ||
+		!lionvec_build_parallel_safe(index))
 		return 0;
-	if (RelationGetIndexExpressions(index) != NIL ||
-		RelationGetIndexPredicate(index) != NIL)
-	{
-#if PG_VERSION_NUM >= 170000
-		return indexInfo->ii_ParallelWorkers;
-#else
-		return plan_create_index_workers(RelationGetRelid(heap),
-										 RelationGetRelid(index));
-#endif
-	}
 	workers = RelationGetParallelWorkers(heap, -1);
 	if (workers >= 0)
 		return Min(workers, max_parallel_maintenance_workers);
 	if (nrows < LIONVEC_MIN_AUTO_ROWS)
 		return 0;
-	workers = max_parallel_maintenance_workers;
-	while (workers > 0 && maintenance_work_mem / (workers + 1) < 32 * 1024)
-		workers--;
-	return workers;
+	return max_parallel_maintenance_workers;
 }
 
 /*
@@ -2453,8 +2457,7 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	INSTR_TIME_SET_CURRENT(start);
 	if (bs.nparts > 0)
 	{
-		int			request = lionvec_build_workers(heap, index, indexInfo,
-													bs.nsum);
+		int			request = lionvec_build_workers(heap, index, bs.nsum);
 		LionVecSample sample;
 
 		if (request > 0)
@@ -3655,9 +3658,8 @@ lionvec_handler(PG_FUNCTION_ARGS)
 		.amcanparallel = false,
 #if PG_VERSION_NUM >= 170000
 		/*
-		 * core then counts the workers, which an expression or partial index
-		 * takes; others, and every index on 16, take lionvec's own count
-		 * (lionvec_build_workers(), DESIGN.md §44.12)
+		 * by lionvec's own count of workers, not the one core then makes
+		 * (lionvec_build_workers(), DESIGN.md §44.12), and on 16 as well
 		 */
 		.amcanbuildparallel = true,
 #endif

@@ -432,8 +432,8 @@ and a `REINDEX` keep one copy (the figures above and below are from an index wit
 Building the index runs k-means over a sample of the rows and then compares every row with every
 centroid, so it takes time in proportion to the rows times the partitions. Both steps run in
 parallel for a table of 10,000 rows or more, or one with a `parallel_workers` setting, in up to
-`max_parallel_maintenance_workers` workers (2 by default) besides the building backend, each
-needing 32 MB of `maintenance_work_mem`; for a large table raise both:
+`max_parallel_maintenance_workers` workers (2 by default) besides the building backend; for a
+large table raise it, and `maintenance_work_mem`, which holds the sample k-means runs on:
 
 ```sql
 SET maintenance_work_mem = '4GB';

@@ -194,9 +194,11 @@ SELECT p.meta = s.meta AS meta, p.parts = s.parts AS parts, p.codes = s.codes AS
 
 -- ---------------------------------------------------------------------
 -- 2. Without parallel_workers: a table of 10,000 rows with a vector or
---    more asks for max_parallel_maintenance_workers, no more than leave
---    each process 32MB of maintenance_work_mem; a smaller one, a temporary
---    table and a table of NULL rows build serially.
+--    more asks for max_parallel_maintenance_workers, whatever
+--    maintenance_work_mem, and so does an expression or partial index
+--    whose expressions and predicate are parallel safe; a smaller table,
+--    a temporary table, a table of NULL rows and an index whose predicate
+--    is parallel unsafe build serially.
 -- ---------------------------------------------------------------------
 
 CREATE TABLE pa (id int, v vector(8));
@@ -205,14 +207,30 @@ CREATE INDEX pa_l2 ON pa USING lionvec (v) WITH (partitions = 20);
 SET max_parallel_maintenance_workers = 2;
 SET client_min_messages = debug1;
 REINDEX INDEX pa_l2;
-SET maintenance_work_mem = '32MB';
+-- the least maintenance_work_mem, where each process's sort spills to
+-- disk: still in parallel, and the same index as a serial build's
+SET maintenance_work_mem = '1MB';
 REINDEX INDEX pa_l2;
-RESET maintenance_work_mem;
 SET client_min_messages = warning;
+CREATE TABLE pa_serial AS SELECT * FROM pv_build('pa_l2', 0);
+SELECT p.meta = s.meta AS meta, p.parts = s.parts AS parts, p.codes = s.codes AS codes,
+	   p.refines = s.refines AS refines
+  FROM pv_build('pa_l2', 2) p, pa_serial s;
+RESET maintenance_work_mem;
 DELETE FROM pa WHERE id = 1;
 VACUUM pa;
 SET client_min_messages = debug1;
 REINDEX INDEX pa_l2;
+SET client_min_messages = warning;
+INSERT INTO pa VALUES (1, pv_vec(1, 8));
+
+-- expressions and predicates, parallel safe and not
+CREATE FUNCTION pv_unsafe(i int) RETURNS bool LANGUAGE plpgsql IMMUTABLE PARALLEL UNSAFE
+AS $$ BEGIN RETURN i > 0; END $$;
+SET client_min_messages = debug1;
+CREATE INDEX pa_half ON pa USING lionvec ((v::halfvec(8)) halfvec_l2_ops) WITH (partitions = 20);
+CREATE INDEX pa_safe ON pa USING lionvec (v) WITH (partitions = 20) WHERE id > 0;
+CREATE INDEX pa_unsafe ON pa USING lionvec (v) WITH (partitions = 20) WHERE pv_unsafe(id);
 SET client_min_messages = warning;
 
 CREATE TEMP TABLE pt (id int, v vector(8)) WITH (parallel_workers = 2);
@@ -225,6 +243,6 @@ CREATE INDEX pn_l2 ON pn USING lionvec (v) WITH (partitions = 20);
 SET client_min_messages = warning;
 RESET max_parallel_maintenance_workers;
 
-DROP TABLE pv, pv_serial, pv_parallel, pv_near, pv_cic_parallel, pa, pt, pn;
-DROP FUNCTION pv_vec(bigint, int), pv_u16(bytea, int), pv_u32(bytea, int),
+DROP TABLE pv, pv_serial, pv_parallel, pv_near, pv_cic_parallel, pa, pa_serial, pt, pn;
+DROP FUNCTION pv_unsafe(int), pv_vec(bigint, int), pv_u16(bytea, int), pv_u32(bytea, int),
 	pv_items(bytea), pv_index(regclass), pv_build(regclass, int), pv_nearest(text);
