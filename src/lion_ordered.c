@@ -550,13 +550,63 @@ typedef struct LionTidSet
  */
 #define LO_MERGE_DIRECT_MAX	((uint32) LION_WIDTH_ARRAY_CARD(1))
 
-/* the pieces' slots by key, then slot: (key << 32 | slot) (lo_set_finish()) */
-#define ST_SORT lo_sort_slots
-#define ST_ELEMENT_TYPE uint64
-#define ST_COMPARE(a, b) ((int) (*(a) > *(b)) - (int) (*(a) < *(b)))
-#define ST_SCOPE static
-#define ST_DEFINE
-#include "lib/sort_template.h"
+/*
+ * The pieces' slots sorted by key, then slot - (key << 32 | slot), each
+ * value distinct - for lo_set_finish(): src[0 .. n - 1] are merged, a pair of
+ * ascending runs at a time, into dst and back, until one run is left, and
+ * the buffer that holds it is returned (src or dst).  A source hands its
+ * pieces out entry by entry or bucket by bucket, each in ascending key, so
+ * they come as a few long runs - one a summary bucket or entry that
+ * contributed, 4 at u < 0.1 on DBpedia's 115,000 rows, 25 at u < 1.0 - and
+ * this takes a pass or a few; a run of one or two pieces, a range over
+ * unique values, costs a merge sort.  A quicksort of the slots
+ * (sort_template.h) took 180 us for 6,000 pieces in 4 runs, where this takes
+ * 17, 2.4 ms for 45,000 in 25 against 0.34, and 174 us against 109 for runs
+ * of two (2026-10-17): it was 4.7% of the u < 0.1 query, the most of a merge
+ * once the keys were merged member by member.
+ */
+static uint64 *
+lo_merge_slots(uint64 *src, uint64 *dst, int n)
+{
+	for (;;)
+	{
+		int			s = 0;
+		int			m = 1;
+
+		while (m < n && src[m] > src[m - 1])
+			m++;
+		if (m >= n)
+			return src;
+		while (s < n)
+		{
+			int			e = (m < n) ? m + 1 : m;
+			int			a = s;
+			int			b = m;
+			int			d = s;
+
+			/* the run [s, m) and the one after it, [m, e) */
+			while (e < n && src[e] > src[e - 1])
+				e++;
+			while (a < m && b < e)
+				dst[d++] = (src[b] < src[a]) ? src[b++] : src[a++];
+			while (a < m)
+				dst[d++] = src[a++];
+			while (b < e)
+				dst[d++] = src[b++];
+
+			s = e;
+			m = (s < n) ? s + 1 : s;
+			while (m < n && src[m] > src[m - 1])
+				m++;
+		}
+		{
+			uint64	   *swap = src;
+
+			src = dst;
+			dst = swap;
+		}
+	}
+}
 
 /* ---------------------------------------------------------------------
  * Executor state
@@ -3445,9 +3495,9 @@ lo_set_push(LionOrderedState *st, LionTidSet *set, uint32 ckey,
  * scan of the same range (2026-09-25 second review).
  *
  * The entries the last merge left, [0, nmerged), are in order already: only
- * the pieces after them are sorted, by key and slot packed into a word, and
- * the two runs merged.  A sort of every slot through a comparator that read
- * the keys was most of what a merge cost (2026-10-16).
+ * the pieces after them are sorted, by key and slot packed into a word
+ * (lo_merge_slots()), and the two runs merged.  A sort of every slot through
+ * a comparator that read the keys was most of what a merge cost (2026-10-16).
  *
  * A key whose pieces hold LO_MERGE_DIRECT_MAX members or fewer together is
  * merged member by member instead (lion_container_or_merge()), which is what
@@ -3469,6 +3519,8 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 {
 	int		   *order;
 	uint64	   *packed;
+	uint64	   *spare;
+	uint64	   *sorted;
 	uint32	   *keys;
 	LionContainer **conts;
 	const LionContainer **group;
@@ -3491,10 +3543,12 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 	npieces = set->n - set->nmerged;
 	packed = (uint64 *) MemoryContextAllocHuge(st->buildcxt,
 											   sizeof(uint64) * Max(npieces, 1));
+	spare = (uint64 *) MemoryContextAllocHuge(st->buildcxt,
+											  sizeof(uint64) * Max(npieces, 1));
 	for (i = 0; i < npieces; i++)
 		packed[i] = ((uint64) set->keys[set->nmerged + i] << 32) |
 			(uint64) (uint32) (set->nmerged + i);
-	lo_sort_slots(packed, npieces);
+	sorted = lo_merge_slots(packed, spare, npieces);
 
 	/* the merged entries before the pieces at an equal key, as by slot */
 	order = (int *) MemoryContextAllocHuge(st->buildcxt, sizeof(int) * set->n);
@@ -3503,12 +3557,13 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 	for (i = 0; i < set->n; i++)
 	{
 		if (b >= npieces ||
-			(a < set->nmerged && set->keys[a] <= (uint32) (packed[b] >> 32)))
+			(a < set->nmerged && set->keys[a] <= (uint32) (sorted[b] >> 32)))
 			order[i] = a++;
 		else
-			order[i] = (int) (uint32) packed[b++];
+			order[i] = (int) (uint32) sorted[b++];
 	}
 	pfree(packed);
+	pfree(spare);
 
 	keys = (uint32 *) MemoryContextAllocHuge(st->setcxt,
 											 sizeof(uint32) * set->cap);
