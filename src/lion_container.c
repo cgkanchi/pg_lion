@@ -2955,6 +2955,129 @@ lion_container_add_many(LionContainer *acc, const uint16 *vals, uint32 n,
 	return acc->cardinality;
 }
 
+/* Set lo in lion_container_or_merge()'s two-level bitmap: the first member of a word assigns it. */
+static pg_always_inline void
+merge_set(uint64 *w, uint64 *seen, uint32 lo)
+{
+	uint32		word = lo >> 6;
+	uint64		bit = UINT64CONST(1) << (lo & 63);
+	uint64		wbit = UINT64CONST(1) << (word & 63);
+
+	if (seen[word >> 6] & wbit)
+		w[word] |= bit;
+	else
+	{
+		seen[word >> 6] |= wbit;
+		w[word] = bit;
+	}
+}
+
+/*
+ * dest = c[0] OR ... OR c[n - 1], optimized, by merging their members: each
+ * container's members are set in a two-level bitmap - the image's words, and a summary of
+ * a bit for each of its 512 words - and read back out in order, which drops
+ * the repeats and sorts them without a comparison, and the ARRAY that leaves
+ * is optimized.  Only the words a member falls in are written or read: the
+ * first member a word gets assigns it, so the image is never cleared, and
+ * the summary's 8 words are all that is.  An image of the whole key costs a
+ * 4 KB clear, a pass to OR each container in and the passes of optimize()
+ * over the 4 KB of a BITSET, whatever the members, and for the few members a
+ * summary's pieces bring to one key that was nearly all of what LionOrdered's
+ * set build cost (DESIGN.md §30.4, "Merging the pieces").  A merge sort of
+ * the extracted runs came first, and lost to the image from a few hundred
+ * members on at 4 to 25 containers, the comparisons being unpredictable:
+ * 2.8 us against 1.5 for 25 containers of 128 members together, where this
+ * takes 0.6 (2026-10-17).
+ *
+ * optimize()'s choice is a function of the members alone, so dest comes out
+ * byte for byte what an image of the same containers, turned into a
+ * container (lion_bits_to_container()), makes.
+ *
+ * Returns false, and leaves dest's contents unspecified, when the containers
+ * yield more than LION_ARRAY_MAX_CARD values together, repeats counted: the
+ * caller then takes the image.  The callers check the containers' summed
+ * cardinality first, but a damaged one's header may claim fewer members than
+ * its payload yields, so the extraction is bounded by the room left and not
+ * by what the headers say; the values extract() hands out are masked into
+ * range, and one that comes out of order is sorted with the rest, so what
+ * comes out is a well-formed container of what extract() took from each.
+ * dest (capacity LION_CONTAINER_MAX_SIZE) must not overlap any of c; the c's
+ * may come off pages.
+ */
+bool
+lion_container_or_merge(const LionContainer *const *c, uint32 n, uint32 ckey,
+						LionContainer *dest)
+{
+	uint64		w[LION_BITSET_WORDS];	/* only words seen[] names are set */
+	uint64		seen[LION_BITSET_WORDS / 64];
+	uint16	   *out = array_mdata(dest);
+	uint32		total = 0;
+	uint32		card = 0;
+	uint32		i;
+	uint32		j;
+
+	lion_container_init(dest, ckey);
+	memset(seen, 0, sizeof(seen));
+	for (i = 0; i < n; i++)
+	{
+		uint32		room = LION_ARRAY_MAX_CARD - total;
+		uint32		got;
+
+		if (c[i]->type == LION_CT_ARRAY)
+		{
+			/*
+			 * Straight from the payload: extracting into a buffer first
+			 * copied a few members with a memcpy() of a variable length
+			 * and read them back masked four at a time, a store-forwarding
+			 * stall for each container, which made the merge of 25 ARRAYs
+			 * of 5 members slower than an image of them (1.25 us against
+			 * 1.4; 0.3 this way, 2026-10-17).
+			 */
+			const uint16 *arr = array_cdata(c[i]);
+
+			got = array_card(c[i]);
+			if (got > room)
+				return false;
+			for (j = 0; j < got; j++)
+				merge_set(w, seen, (uint32) arr[j] & LION_LO_MASK);
+		}
+		else
+		{
+			/* a RUN or a bitmap: extracted into the payload, read from there */
+			got = container_extract(c[i], out, room);
+			if (got > room)
+				return false;
+			for (j = 0; j < got; j++)
+				merge_set(w, seen, (uint32) out[j] & LION_LO_MASK);
+		}
+		total += got;
+	}
+
+	/* read back in order: no more values than were set, at most 2048 */
+	for (i = 0; i < lengthof(seen); i++)
+	{
+		uint64		words = seen[i];
+
+		while (words != 0)
+		{
+			uint32		word = (i << 6) + (uint32) pg_rightmost_one_pos64(words);
+			uint64		cur = w[word];
+
+			words &= words - 1;
+			while (cur != 0)
+			{
+				out[card++] = (uint16) ((word << 6) +
+										(uint32) pg_rightmost_one_pos64(cur));
+				cur &= cur - 1;
+			}
+		}
+	}
+	Assert(card <= total && card <= LION_ARRAY_MAX_CARD);
+	dest->cardinality = (uint16) card;
+	lion_container_optimize(dest);
+	return true;
+}
+
 /*
  * Which of the values sorted[0 .. n - 1] c holds: bit j of marks, which has
  * (n + 63) / 64 words, is set for every j whose value is a member of c, and
