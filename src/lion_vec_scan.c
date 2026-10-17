@@ -1886,9 +1886,13 @@ lv_list_end(LvExactRead *x, LionReadaheadCounts *counts)
 	}
 }
 
-/* The member of so->exact[0 .. n), in TID order, at tid; -1 if none. */
+/* how lv_exact_places() reads a LOC page's entries */
+#define LV_LOC_SORTED	1		/* the build's, in TID order: searched */
+#define LV_LOC_WALK		2		/* an insert's: read whole */
+
+/* The first member of so->exact[0 .. n), in TID order, at tid or past it. */
 static int
-lv_exact_find(const LvScanOpaque *so, int n, ItemPointer tid)
+lv_exact_lower(const LvScanOpaque *so, int n, ItemPointer tid)
 {
 	int			a = 0;
 	int			b = n;
@@ -1896,16 +1900,117 @@ lv_exact_find(const LvScanOpaque *so, int n, ItemPointer tid)
 	while (a < b)
 	{
 		int			m = a + (b - a) / 2;
-		int			c = ItemPointerCompare((ItemPointer) &so->exact[m].tid, tid);
 
-		if (c == 0)
-			return m;
-		if (c < 0)
+		if (ItemPointerCompare((ItemPointer) &so->exact[m].tid, tid) < 0)
 			a = m + 1;
 		else
 			b = m;
 	}
-	return -1;
+	return a;
+}
+
+/* The member at tid; -1 if none. */
+static int
+lv_exact_find(const LvScanOpaque *so, int n, ItemPointer tid)
+{
+	int			m = lv_exact_lower(so, n, tid);
+
+	return m < n && ItemPointerEquals(&so->exact[m].tid, tid) ? m : -1;
+}
+
+/*
+ * A LOC entry for member m: the member's, copied, unless another entry
+ * already named it differently - then neither.
+ */
+static void
+lv_exact_note(const LionVecLoc **ent, bool *twice, int m,
+			  const LionVecLoc *loc)
+{
+	Size		len = LIONVEC_LOC_SIZE(loc->nruns);
+
+	if (twice[m])
+		return;
+	if (ent[m] == NULL)
+	{
+		LionVecLoc *copy = palloc(len);
+
+		memcpy(copy, loc, len);
+		ent[m] = copy;
+	}
+	else if (ent[m]->nruns != loc->nruns || memcmp(ent[m], loc, len) != 0)
+	{
+		ent[m] = NULL;
+		twice[m] = true;
+	}
+}
+
+/*
+ * The entries of a LOC page the build wrote, in TID order: each member
+ * between its first entry's TID and its last's looked up by binary search,
+ * and the entries at its TID noted, so that a page is read for its few
+ * members, not whole.  An entry out of order, which only corruption
+ * leaves, can hide one; that member is read from the heap.
+ */
+static void
+lv_exact_page_sorted(Relation index, const LvScanOpaque *so, int n,
+					 Page page, BlockNumber blk, const LionVecLoc **ent,
+					 bool *twice)
+{
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+	ItemPointerData last;
+	int			m;
+
+	if (maxoff < FirstOffsetNumber)
+		return;
+	last = lionvec_loc_at(index, page, blk, maxoff, so->tnchunks)->tid;
+	m = lv_exact_lower(so, n,
+					   &lionvec_loc_at(index, page, blk, FirstOffsetNumber,
+									   so->tnchunks)->tid);
+	for (; m < n && ItemPointerCompare(&so->exact[m].tid, &last) <= 0; m++)
+	{
+		OffsetNumber a = FirstOffsetNumber;
+		OffsetNumber b = maxoff + 1;
+
+		while (a < b)
+		{
+			OffsetNumber mid = a + (b - a) / 2;
+			LionVecLoc *loc = lionvec_loc_at(index, page, blk, mid,
+											 so->tnchunks);
+
+			if (ItemPointerCompare(&loc->tid, &so->exact[m].tid) < 0)
+				a = mid + 1;
+			else
+				b = mid;
+		}
+		for (; a <= maxoff; a++)
+		{
+			LionVecLoc *loc = lionvec_loc_at(index, page, blk, a,
+											 so->tnchunks);
+
+			if (!ItemPointerEquals(&loc->tid, &so->exact[m].tid))
+				break;
+			lv_exact_note(ent, twice, m, loc);
+		}
+	}
+}
+
+/* The place of blk in sel[0 .. n), sorted; -1 if none. */
+static int
+lv_block_find(const BlockNumber *sel, int n, BlockNumber blk)
+{
+	int			a = 0;
+	int			b = n;
+
+	while (a < b)
+	{
+		int			m = a + (b - a) / 2;
+
+		if (sel[m] < blk)
+			a = m + 1;
+		else
+			b = m;
+	}
+	return a < n && sel[a] == blk ? a : -1;
 }
 
 /* the members read by place, by their first chunk's place */
@@ -1934,12 +2039,13 @@ lv_place_ord_cmp(const void *a, const void *b)
  * The exact path's members read by their places in TOAST (DESIGN.md §44.13,
  * "The exact path"), so->exact[0 .. n) in TID order.  The LOCDIR whole,
  * and of its LOC pages those whose range of heap blocks holds a member's
- * (lionvec_loc_select()), in block order through a list; each page's
- * entries looked up among the members by TID, a member that two entries
- * name differently taking neither.  Then the members with an entry, by
- * their first chunk's place, each run's block named in turn to one list
- * over the TOAST relation (a block repeated in a row once), each member's
- * chunks read from their pages and checked (lionvec_place_run()), its
+ * (lionvec_loc_select()), in block order through a list; a page of the
+ * build's searched for its members (lv_exact_page_sorted()), an insert's
+ * read whole, each entry looked up among the members by TID; a member that
+ * two entries name differently takes neither.  Then the members with an
+ * entry, by their first chunk's place, each run's block named in turn to
+ * one list over the TOAST relation (a block repeated in a row once), each
+ * member's chunks read from their pages and checked (lionvec_place_run()), its
  * vector assembled and its header checked (lv_value_ok()), and its
  * distance computed: the member is then LV_X_PLACED, with its value's id
  * for the check before it is returned (lv_check_placed()), or LV_X_DROP, a
@@ -1964,6 +2070,8 @@ lv_exact_places(IndexScanDesc scan, LvScanOpaque *so, int n)
 	uint32	   *dhi;
 	BlockNumber *sel;
 	int			nsel;
+	uint8	   *how;			/* [nsel]: LV_LOC_SORTED or LV_LOC_WALK */
+	int			nbuilt;
 	const LionVecLoc **ent;		/* [n]: a member's entry, or NULL */
 	bool	   *twice;			/* [n]: named by two entries that differ */
 	LvPlaceOrd *ord;
@@ -2016,6 +2124,22 @@ lv_exact_places(IndexScanDesc scan, LvScanOpaque *so, int n)
 							RelationGetRelationName(index), sel[i])));
 	}
 
+	/*
+	 * Which of them only the build's LOCDIR items name, their entries in TID
+	 * order: those the scan searches (LV_LOC_SORTED); a page an insert's
+	 * item names too, it reads whole (LV_LOC_WALK).
+	 */
+	how = palloc0(sizeof(uint8) * Max(nsel, 1));
+	nbuilt = (int) Min(so->meta.loc_built, (uint32) ndir);
+	for (i = 0; i < ndir; i++)
+	{
+		int			k = lv_block_find(sel, nsel, dir[i].blk);
+
+		if (k >= 0)
+			how[k] = i < nbuilt && how[k] != LV_LOC_WALK ?
+				LV_LOC_SORTED : LV_LOC_WALK;
+	}
+
 	/* their entries, by member */
 	ent = palloc0(sizeof(LionVecLoc *) * n);
 	twice = palloc0(sizeof(bool) * n);
@@ -2035,27 +2159,20 @@ lv_exact_places(IndexScanDesc scan, LvScanOpaque *so, int n)
 		page = BufferGetPage(buf);
 		lionvec_check_page(index, page, sel[i], LIONVEC_PAGE_LOC);
 		so->nlocpages++;
-		maxoff = PageGetMaxOffsetNumber(page);
-		for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
+		if (how[i] == LV_LOC_SORTED)
+			lv_exact_page_sorted(index, so, n, page, sel[i], ent, twice);
+		else
 		{
-			LionVecLoc *loc = lionvec_loc_at(index, page, sel[i], off,
-											 so->tnchunks);
-			int			m = lv_exact_find(so, n, &loc->tid);
-			Size		len = LIONVEC_LOC_SIZE(loc->nruns);
-
-			if (m < 0 || twice[m])
-				continue;
-			if (ent[m] == NULL)
+			maxoff = PageGetMaxOffsetNumber(page);
+			for (off = FirstOffsetNumber; off <= maxoff;
+				 off = OffsetNumberNext(off))
 			{
-				LionVecLoc *copy = palloc(len);
+				LionVecLoc *loc = lionvec_loc_at(index, page, sel[i], off,
+												 so->tnchunks);
+				int			m = lv_exact_find(so, n, &loc->tid);
 
-				memcpy(copy, loc, len);
-				ent[m] = copy;
-			}
-			else if (ent[m]->nruns != loc->nruns || memcmp(ent[m], loc, len) != 0)
-			{
-				ent[m] = NULL;
-				twice[m] = true;
+				if (m >= 0)
+					lv_exact_note(ent, twice, m, loc);
 			}
 		}
 		UnlockReleaseBuffer(buf);
