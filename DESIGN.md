@@ -20338,11 +20338,9 @@ without spill (225 MB of it CODE pages), 1.9 GB with it - and C (d + 1.2 d / 8 +
 centroids. A scan reads the PART chain, 500 KB there, and the CODE pages of the partitions it
 probes, each twice as long when the index spills.
 
-Format 4 had no locator and no REFINE slots, and is read as an index without them until a REINDEX
-(§44.13, "Format 5, and an index of format 4"). Format 3 had no REGION chain, and its partitions
-were numbered as k-means left them; this pg_lion refuses it as it refuses format 2
-(`lionvec_check_meta()`: "has format version 3 ... REINDEX it"): its meta page ends before the
-REGION fields, whose zeros would name block 0 as the REGION chain's head, and the extension has no
+Format 4 had no locator and no REFINE slots. Format 3 had no REGION chain, and its partitions
+were numbered as k-means left them. This pg_lion refuses both as it refuses format 2
+(`lionvec_check_meta()`: "has format version 4 ... REINDEX it"), since the extension has no
 release to migrate from. Format 2 had no copies and no flags in its meta page.
 
 Format 1 (§44 above) had one CODE chain, every row in heap order, and a DIR chain of each CODE
@@ -23208,19 +23206,12 @@ the snapshot sees whose vector is in TOAST has an entry of its value, where its 
 item's place is its row's entry's), and the exact and probing paths' rows, order and distances with
 direct reads on and off and a sort's.
 
-#### Format 5, and an index of format 4
+#### Format 5
 
 The meta page's fields are appended, every earlier one at its offset, the page types are new, and
-the REFINE item's slot is past its codes, its `nloc` in the former pad. A format-4 index has no
-locator, its REFINE items no slot, and none of the new fields (the bytes past its `pd_lower`, 104,
-are the zeros `PageInit()` left). So this pg_lion reads it as an index without a locator
-(`LIONVEC_VERSION_NOLOC`; `lionvec_meta_copy()` turns its missing fields into "none") - its scans,
-inserts and VACUUMs exactly as before, and every write of its meta page touches only fields format
-4 has - rather than refuse it as format 3 was refused (whose meta page meant other things); REINDEX
-makes it format 5, with a locator if its vectors may lie in TOAST. Refusing it would have asked
-every user of a toasted table to REINDEX for nothing they would notice but the speed
-(`vector_toast_corrupt.sql` makes a meta page format 4's, then scans, inserts, VACUUMs and
-REINDEXes the index).
+the REFINE item's slot is past its codes, its `nloc` in the former pad. A format-4 index is refused
+with the REINDEX hint, as format 3 is: there is no release to migrate from
+(`vector_toast_corrupt.sql` makes a meta page format 4's, and a REINDEX brings it back).
 
 #### Measured
 
@@ -23316,7 +23307,7 @@ cold, on the inline table - may be worth raising for toasted tables.
   page lacks, naming a value no row stores: each falls back; a LOC entry naming another row's value
   and place: the return-time check's `ERRCODE_INDEX_CORRUPTED`; an entry that is not one (flags,
   runs miscounted): `ERRCODE_INDEX_CORRUPTED`; a REFINE item's place wrong: the rerank falls back;
-  naming another value: the error; and a format-4 index, read, kept up, vacuumed and REINDEXed.
+  naming another value: the error; and a format-4 index, refused until a REINDEX.
 - Isolation, `lionvec_toast_scan.spec`: an exact-path scan parked at `lionvec-exact-located` while
   rows are deleted, the TOAST relation vacuumed alone and new rows take the freed places, its rows
   compared with a sort under the same snapshot and its lock on the TOAST relation shown held to its
