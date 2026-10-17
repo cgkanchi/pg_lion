@@ -7,7 +7,11 @@
  *	  (PrefetchBuffer()) and reading each when it comes, on 16 or wherever
  *	  a stream is not wanted; or by reading each when it comes and asking
  *	  for nothing.  The reader says which blocks it expects and reads them
- *	  as it would with ReadBuffer(), whichever of the three it is.
+ *	  as it would with ReadBuffer(), whichever of the three it is.  A reader
+ *	  that knows its whole list and reads it in order - the exact path's
+ *	  heap blocks - needs no prediction: from 17 it reads it through a plain
+ *	  read stream over the list (lion_readahead_begin_list()), and asks and
+ *	  reads as above where it does not stream.
  *-------------------------------------------------------------------------
  */
 #ifndef LION_READAHEAD_H
@@ -67,6 +71,13 @@ extern void lion_ask(LionAsk *a, Relation rel, BlockNumber blk, bool once);
 /* The refill a LION_READAHEAD_STREAM readahead calls (LionRingOps.refill). */
 typedef bool (*LionReadaheadRefill) (void *arg);
 
+/*
+ * The next block of a list a reader knows whole and reads in its order
+ * (lion_readahead_begin_list()), InvalidBlockNumber past its end.  It runs
+ * inside the read stream's callback: it must not read, wait or fail.
+ */
+typedef BlockNumber (*LionReadaheadNext) (void *arg);
+
 typedef struct LionReadahead LionReadahead;
 
 /* What a readahead has done since its counts were last taken. */
@@ -83,11 +94,16 @@ extern LionReadahead *lion_readahead_begin(Relation rel, int mode, int pins,
 										   LionAsk *ask,
 										   LionReadaheadRefill refill,
 										   void *refill_arg);
+extern LionReadahead *lion_readahead_begin_list(Relation rel, int mode,
+												LionReadaheadNext next,
+												void *next_arg);
+extern Buffer lion_readahead_next(LionReadahead *s);
 extern int	lion_readahead_mode(const LionReadahead *s);
 extern bool lion_readahead_ask(LionReadahead *s, BlockNumber blk, bool urgent,
 							   bool once);
 extern Buffer lion_readahead_read(LionReadahead *s, BlockNumber blk);
-extern bool lion_readahead_tracks(const LionReadahead *s, BlockNumber blk);
+extern bool lion_readahead_dormant(const LionReadahead *s);
+extern void lion_readahead_awaken(LionReadahead *s);
 extern int	lion_readahead_depth(const LionReadahead *s);
 extern void lion_readahead_counts(LionReadahead *s, LionReadaheadCounts *c);
 extern void lion_readahead_reset(LionReadahead *s);
