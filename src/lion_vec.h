@@ -362,7 +362,7 @@ extern int	lionvec_exact_rows;
 extern double lionvec_exact_per_part;
 extern int	lionvec_overflow;
 extern int	lionvec_postfilter;
-extern bool lionvec_prefetch;
+extern int	lionvec_prefetch;	/* LION_READAHEAD_* (lion_readahead.h) */
 
 /*
  * What an ORDER BY operator of lionvec's returns: pgvector's all return

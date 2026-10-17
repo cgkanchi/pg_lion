@@ -20857,19 +20857,20 @@ before costs, it carries two disabled nodes, as pgvector's do: without them it b
 disabled by `enable_seqscan = off`, and a count(*) failed as an index-only scan, found by the
 insert spec of §44.10), walks every row.
 
-**Prefetch** (2026-10-16). A cold scan waits on its reads one at a time: a probe reads a
-partition's CODE chain a page after another, a refine a REFINE page, an exact distance a heap page
-and its vector's TOAST pages, and none starts before the one before it is in. While
-`pg_lion.vector_prefetch` is on (§44.8) the scan asks for the pages it will read next before it
-reads them, through `PrefetchBuffer()`: as many ahead as the relation's tablespace's
-`effective_io_concurrency`, to `LIONVEC_PREFETCH_MAX` (64), `so->ipf` pages of the index and
-`so->hpf` of the heap, 0 asking for none (`lv_start_prefetch()`). `PrefetchBuffer()` pins nothing
-and is `posix_fadvise()` under it on 16 to 19 alike, whatever 18's `io_method`: the kernel reads
-the pages into its cache meanwhile, and the scan's `ReadBuffer()` finds them there. It is a hint,
-never a read, so the rows a scan returns and their order are the same with it on or off, and so is
-every count of the DEBUG1 line but the two it adds, `N pages prefetched (M not in shared
-buffers)`, M the pages `PrefetchBuffer()` did not find in shared buffers, which the kernel may
-still hold. It asks for:
+**Prefetch** (2026-10-16). A cold scan waits on its reads one at a time: a probe reads a partition's
+CODE chain a page after another, a refine a REFINE page, an exact distance a heap page and its
+vector's TOAST pages, and none starts before the one before it is in. While
+`pg_lion.vector_prefetch` is `fadvise` (§44.8: the default on 16, and what its `on` was until
+2026-10-17; from 17 the scan reads through streams instead, "Read streams" below) the scan asks for
+the pages it will read next before it reads them, through `PrefetchBuffer()`: as many ahead as the
+relation's tablespace's `effective_io_concurrency`, to `LIONVEC_PREFETCH_MAX` (64), `so->ipf` pages
+of the index and `so->hpf` of the heap, 0 asking for none (`lv_start_prefetch()`).
+`PrefetchBuffer()` pins nothing and is `posix_fadvise()` under it on 16 to 19 alike, whatever 18's
+`io_method`: the kernel reads the pages into its cache meanwhile, and the scan's `ReadBuffer()`
+finds them there. It is a hint, never a read, so the rows a scan returns and their order are the
+same with it on or off, and so is every count of the DEBUG1 line but the two it adds,
+`N pages prefetched (M not in shared buffers)`, M the pages `PrefetchBuffer()` did not find in
+shared buffers, which the kernel may still hold. It asks for:
 
 - the rest of a chain the build wrote. The build writes each partition's CODE chain in blocks one
   after another, and its PART item counts its items, so its first `lionvec_chain_pages()` pages at
@@ -20911,17 +20912,99 @@ pointer, from the heap tuple, first (§44.11).
 
 Measured (§44.9, "Prefetch and parallel scans"): cold, each query alone after a restart with the
 page cache dropped, a serial scan at a margin of 3 took 17.4 ms against 21.2 without (its wait on
-reads, by `track_io_timing`, 11.4 ms against 17.7, for 410 pages from the kernel), at a margin of
-8 32.4 against 49.4 (20.6 against 41.9, for 972 pages), and the exact path over vectors kept in
-the heap, under a 1% filter, 33.5 against 70.6 (11.0 against 64.8, for 1,213 pages). Warm, every
-page in shared buffers, an ask is a lookup of a page that is there already, 4 to 9% of a scan when
-every page was asked for (2.39 ms against 2.29 at a margin of 3, 5.51 against 5.06 at 8). So the
-scan watches what its asks of each relation find (`LvPrefetch`): after `LV_PF_WARM` (32) asks in a
-row that found their page in shared buffers it lets the next `LV_PF_DORMANT` (256) asks pass
-unasked, then asks again. A cold relation is asked for all along, a warm one a ninth as often
-(a margin-8 scan asks for 65 pages rather than 880), and one warm in parts loses at most 256 asks
-at a time; the PART chain, which every scan reads and so is warm whatever else is, does not count.
-Warm it then costs about 2%: 2.33 ms against 2.29 at a margin of 3 and 4.99 against 4.91 at 8.
+reads, by `track_io_timing`, 11.4 ms against 17.7, for 410 pages from the kernel), at a margin of 8
+32.4 against 49.4 (20.6 against 41.9, for 972 pages), and the exact path over vectors kept in the
+heap, under a 1% filter, 33.5 against 70.6 (11.0 against 64.8, for 1,213 pages). Warm, every page in
+shared buffers, an ask is a lookup of a page that is there already, 4 to 9% of a scan when every
+page was asked for (2.39 ms against 2.29 at a margin of 3, 5.51 against 5.06 at 8). So the scan
+watches what its asks of each relation find (`LionAsk`, lion_readahead.h): after `LION_ASK_WARM`
+(32) asks in a row that found their page in shared buffers it lets the next `LION_ASK_DORMANT` (256)
+asks pass unasked, then asks again. A cold relation is asked for all along, a warm one a ninth as
+often (a margin-8 scan asks for 65 pages rather than 880), and one warm in parts loses at most 256
+asks at a time; the PART chain, which every scan reads and so is warm whatever else is, does not
+count. Warm it then costs about 2%: 2.33 ms against 2.29 at a margin of 3 and 4.99 against 4.91 at
+8.
+
+**Read streams** (2026-10-17; lion_readahead.c, lion_readahead_ring.c). From PostgreSQL 17 a scan
+reads the pages it expects through core's read stream (`read_stream_begin_relation()`) instead of
+asking the kernel for them: `pg_lion.vector_prefetch = stream`, the default there (§44.8). The
+stream reads them into shared buffers itself - adjacent blocks in one read of up to
+`io_combine_limit`, on 18 by an I/O worker or io_uring as `io_method` says, under `io_method = sync`
+and on 17 by `preadv()` after `posix_fadvise()` advice - and hands the scan each buffer pinned, so a
+page read ahead lands in shared buffers rather than the kernel's cache, and is looked up once.
+Core's stream, as 17's and 18's read_stream.c have it, reads only the blocks its callback names, in
+the order named, and calls the callback only from `read_stream_next_buffer()`, as its consumer
+pulls: it looks ahead to a distance that starts at one block (a full I/O's, `io_combine_limit`,
+under `READ_STREAM_FULL`), doubles each time the consumer waits on a read and falls by one at each
+block found in shared buffers; once the callback names no block the stream gives nothing more until
+`read_stream_reset()`, which starts it again from one block ahead. It cannot be paused, and it
+starts no read before its consumer's first pull. A scan's reads fit that only in part. It knows the
+run of the chain it is reading, and in a REST pass the chains it will probe; past those it predicts
+- the REFINE pages at the top of its queues, the next partition's chain - and reads out of the order
+it predicted, some pages never, some it never predicted, as its queues reorder under the rows and
+partitions coming in.
+
+`lion_readahead.c` sits between, through a ring of the blocks the reader expects
+(`lion_readahead_ring.c`, frontend-safe, unit-tested against a model of core's stream in
+test/unit/readahead_test.c). The reader pushes a block, urgent - the rest of the run it is reading -
+or predicted; the stream's callback takes urgent blocks first, then predicted ones, then what the
+reader's refill pushes when it is asked for a block and none is pending, and with nothing names
+none, which ends the stream. A read takes its block from wherever it is: held, pulled from the
+stream already by a read of a later block, its pin handed over; given to the stream, which is pulled
+up to it, the blocks before it held for their own reads; pending, moved to the front, and the stream
+started again if it had ended - once it holds nothing, which a restart releases; tracked nowhere,
+read apart (`ReadBuffer()`), unless the stream is idle with blocks pending, which the read then sets
+going. Held and given blocks are pins, at most the ring's limit: a block given when the ring is full
+pushes out the oldest held one, released unread, and with every pin a given one the callback names
+none. A stream that ended is begun anew with `READ_STREAM_FULL`, a full I/O ahead, if it read
+anything in since it last started, and reset, which costs less, if it found every block in shared
+buffers (`lion_readahead_op_restart()`). And a stream rests as the asks do, seeing its reads rather
+than guessing from `PrefetchBuffer()`: after `LION_ASK_WARM` (32) reads in a row that read nothing
+in, it pushes nothing and refills nothing for the next `LION_ASK_DORMANT` (256) reads, which are
+`ReadBuffer()`'s, or until one reads a block in (`lion_readahead_dormant()`), and the scan skips its
+looks into the queues meanwhile. A reader that knows its whole list in order needs none of that:
+`lion_readahead_begin_list()` is a plain stream over it, from a full I/O ahead, holding as many pins
+as core's own limits allow (`GetPinLimit()`), as a bitmap heap scan's does. Where a stream is not
+wanted, or on 16, the same calls ask the kernel (`lion_ask()`) and read with `ReadBuffer()`, or only
+read: the fallback for lion's readers as for lionvec's. Every pin is the current resource owner's,
+so an error releases them with its transaction, subtransaction or portal.
+
+A lionvec scan has three streams of the index, in its own context, kept from one rescan to the next
+and reset - every pin released, every block forgotten - at each rescan, at each change of phase (the
+walks after the queues) and when it stops (`lv_readahead_reset()`): `so->chains`, the PART chain,
+each probe's run of its chain, pushed urgent `so->ipf` pages ahead, its first page too
+(`lv_run_start()`), REST's chains and the walks'; `so->crefs`, the centroids' REFINE pages; and
+`so->rrefs`, the rows'. Each holds up to twice `so->ipf` pins, at least `LION_READAHEAD_MIN_PINS`
+(4), and no more than an `LV_RA_SHARE`th (an eighth) of the backend's fair share of shared buffers
+(`lion_pin_fair_share()`: `GetPinLimit()` on 18, the same arithmetic on 17), reading half its pins
+ahead; a pool that leaves a stream fewer than 4 has the scan ask the kernel instead. The queues'
+looks (`lv_prefetch_queue()`) push their pages in the order of their keys, which is the order a
+stream reads them in, and a stream that wants a page with none pending looks into its queue at once
+(`lv_crefs_refill()`, `lv_rrefs_refill()`), rather than once half the last look is read, so that it
+does not end. Between REST passes the chains' refill predicts the partitions to probe next
+(`lv_chains_refill()`): of the partition queue's top, the least centroid known by its 8-bit codes
+whose chain was not pushed yet, a chain at a time to `so->ipf` pages ahead, one another process has
+claimed passed over. A chain it predicts and the scan does not probe - its LIMIT met, a centroid
+refined after coming first - is read for nothing and released unread; without the prediction each
+probe's stream ended with its run and started again from one block, and cold scans took 1.3 to 2.3
+times as long (§44.9).
+
+The heap's pages are another matter. The rows' heap blocks for their exact distances (`LV_CODES8`)
+are asked of the kernel in every mode (`lv_prefetch_heap()`): a stream's pins on them would stay
+from one `amgettuple()` call to the next, between which the executor runs anything, and the fetch
+prunes a page only when its own pin is the backend's only one (`heap_page_prune_opt()`,
+`ConditionalLockBufferForCleanup()`), which a stream's would not be. The exact path reads its heap
+blocks inside one call (`lv_exact()`): there a list stream over the members' blocks, each block
+taken from it at its first member and its pin dropped before the fetch pins it again, and the stream
+ended before the call returns. The index's streams do hold pins between calls - the pages they read
+ahead - which nothing waits on: lionvec's VACUUM takes no cleanup lock and never recycles a page
+(§44.5), its WAL is generic WAL, whose redo on a standby takes none either, and the scan holds no
+lock between calls. A parallel scan's participants each have their own. The DEBUG1 line names what
+the streams did: `N pages streamed (M read in), A read apart, W streamed unread, R restarts` - the
+reads they served and the pages of those they read into shared buffers, the reads no stream was
+given (unpredicted, or made while resting), the pages they read ahead and released unread, and the
+times one ended and started again - and the heap's asks as
+`H heap pages prefetched (X not in shared buffers)`. On 16, `stream` is accepted and is `fadvise`.
 
 **A parallel scan** (2026-10-16). `amcanparallel`: an unfiltered `ORDER BY` of the distance may be
 a Parallel Index Scan under a Gather Merge (§44.7 prices it; a filtered one stays serial, below).
@@ -21050,7 +21133,9 @@ scans took 5 and 8 times as long as the serial one (§44.9).
   TID it has passed, so the duplicate costs a sort entry and nothing else. Pages are never
   recycled; the centroids' REFINE items, which no CODE item names, are never removed.
 - **A scan against VACUUM.** A scan copies what it needs of a CODE item (the REFINE location among
-  it) into its queue and holds no pin. VACUUM may remove the REFINE item before the scan reads it,
+  it) into its queue and holds no lock between rows; through read streams (§44.4, "Read streams")
+  it holds pins of the index pages they read ahead, which VACUUM, taking no cleanup lock, does not
+  wait for, and never one of the heap's. VACUUM may remove the REFINE item before the scan reads it,
   and an insert may reuse the slot: `lionvec_refine_at()` returns the item only if its TID is the
   row's, and the scan treats a missing one as a row gone, which it is - VACUUM removes only rows
   dead to every snapshot. A reused slot with the same TID (the heap reused the TID too) holds a row

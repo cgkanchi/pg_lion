@@ -13,8 +13,8 @@
 -- that could hold a nearer row, so the rows and their order are the sort's;
 -- at the defaults each participant stops by its own rules, and the share of
 -- the nearest rows found is compared with the serial scan's.
--- pg_lion.vector_prefetch, and effective_io_concurrency = 0, change no row
--- a scan returns.
+-- pg_lion.vector_prefetch, each way, and effective_io_concurrency = 0,
+-- change no row a scan returns (vector_stream.sql compares them at length).
 \set VERBOSITY terse
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
@@ -307,8 +307,13 @@ SELECT ps_cmp('SELECT id, v <-> ps_vec(4, 24) AS d FROM ps WHERE id % 7 = 1
 RESET pg_lion.enable_ordered_scan;
 RESET pg_lion.vector_postfilter;
 
--- prefetch, and none: the same rows, in parallel at this margin ...
+-- reads ahead each way, and none: the same rows, in parallel at this
+-- margin ...
 SET pg_lion.vector_prefetch = off;
+SELECT op, ps_cmp(format('SELECT id, v %s ps_vec(4, 24) AS d FROM ps
+						  ORDER BY v %s ps_vec(4, 24) LIMIT 100', op, op)) AS result
+  FROM (VALUES ('<->'), ('<=>')) o(op) ORDER BY op;
+SET pg_lion.vector_prefetch = fadvise;
 SELECT op, ps_cmp(format('SELECT id, v %s ps_vec(4, 24) AS d FROM ps
 						  ORDER BY v %s ps_vec(4, 24) LIMIT 100', op, op)) AS result
   FROM (VALUES ('<->'), ('<=>')) o(op) ORDER BY op;
@@ -332,17 +337,21 @@ DECLARE
 	a int[] := ps_ids(q);
 	b int[];
 	c int[];
+	d int[];
 	saved text[] := ARRAY[current_setting('pg_lion.vector_prefetch'),
 						  current_setting('effective_io_concurrency')];
 BEGIN
 	PERFORM set_config('pg_lion.vector_prefetch', 'off', true);
 	b := ps_ids(q);
+	PERFORM set_config('pg_lion.vector_prefetch', 'fadvise', true);
+	d := ps_ids(q);
 	PERFORM set_config('pg_lion.vector_prefetch', saved[1], true);
 	PERFORM set_config('effective_io_concurrency', '0', true);
 	c := ps_ids(q);
 	PERFORM set_config('effective_io_concurrency', saved[2], true);
 	RETURN format('%s rows, %s', cardinality(a),
-				  CASE WHEN a = b AND a = c THEN 'the same with no prefetch'
+				  CASE WHEN a = b AND a = c AND a = d
+				  THEN 'the same asking the kernel, and with no prefetch'
 				  ELSE 'MISMATCH' END);
 END $$;
 CREATE TABLE ps_serial (q text);
@@ -367,8 +376,8 @@ DROP FUNCTION ps_same(text);
 -- 600 dimensions, 2,408 bytes, goes to TOAST at the defaults and stays in
 -- its row under a target of 8160, where, the threshold alone deciding (as
 -- until 2026-10-17), its pages were not asked for either.  A filter's exact
--- path asks for each member's block, one a member here, every one in shared
--- buffers; the DEBUG1 line counts the asks.
+-- path asks the kernel for each member's block, one a member here, every
+-- one in shared buffers; the DEBUG1 line counts the asks.
 CREATE TABLE ps_wide (id int PRIMARY KEY, cat int, v vector(600))
 	WITH (toast_tuple_target = 8160, autovacuum_enabled = off);
 CREATE TABLE ps_toast (id int PRIMARY KEY, cat int, v vector(600))
@@ -381,7 +390,7 @@ CREATE INDEX ps_wide_cat ON ps_wide USING lion (cat);
 CREATE INDEX ps_wide_v ON ps_wide USING lionvec (v vector_l2_ops) WITH (partitions = 4);
 CREATE INDEX ps_toast_cat ON ps_toast USING lion (cat);
 CREATE INDEX ps_toast_v ON ps_toast USING lionvec (v vector_l2_ops) WITH (partitions = 4);
-SET pg_lion.vector_prefetch = on;
+SET pg_lion.vector_prefetch = fadvise;
 SET client_min_messages = debug1;
 SELECT count(*) FROM (SELECT id FROM ps_wide WHERE cat = 1
 					   ORDER BY v <-> ps_vec(7, 600) LIMIT 5) s;
