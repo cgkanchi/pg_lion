@@ -41,6 +41,7 @@
 #include "nodes/pathnodes.h"
 #include "storage/bufpage.h"
 #include "utils/relcache.h"
+#include "varatt.h"
 
 #include "lion_container.h"
 #include "lion_vec_math.h"
@@ -501,9 +502,15 @@ extern int	lionvec_page_items(Size itemsz);
 /*
  * lion_vec_loc.c: the locator (DESIGN.md §44.13).  A heap's TOAST relation,
  * open for an index's lookups of its values' chunks, and the build's writer
- * of LOC and LOCDIR pages.
+ * of LOC and LOCDIR pages.  An entry's value is one of a TOAST pointer of a
+ * 4-byte id: PostgreSQL 20's varatt_external_oid, before it struct
+ * varatt_external.
  */
-struct varatt_external;
+#if PG_VERSION_NUM >= 200000
+typedef varatt_external_oid LionToastPointer;
+#else
+typedef struct varatt_external LionToastPointer;
+#endif
 
 typedef struct LionVecToast
 {
@@ -533,15 +540,15 @@ extern bool lionvec_toast_open(LionVecToast *t, Relation heap, int dims,
 							   bool half);
 extern void lionvec_toast_close(LionVecToast *t);
 extern bool lionvec_toast_value(const LionVecToast *t, Datum d,
-								struct varatt_external *ptr);
+								LionToastPointer *ptr);
 extern bool lionvec_toast_ptr_ok(const LionVecToast *t,
-								 const struct varatt_external *ptr);
+								 const LionToastPointer *ptr);
 extern bool lionvec_toast_locate(LionVecToast *t,
-								 const struct varatt_external *ptr,
+								 const LionToastPointer *ptr,
 								 char *data, LionVecLoc *loc);
 extern bool lionvec_stored_pointer(Relation heap, ItemPointer tid,
 								   AttrNumber attno,
-								   struct varatt_external *ptr);
+								   LionToastPointer *ptr);
 extern bool lionvec_place_run(Relation toastrel, Snapshot tsnap, Buffer buf,
 							  const LionVecLocRun *run, Oid valueid, int seq0,
 							  int64 extsize, char *data);

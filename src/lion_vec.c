@@ -2119,7 +2119,7 @@ lionvec_build_locator_plan(LionVecBuildState *bs, Relation heap)
 	if (bs->locmay && bs->dims > 0)
 	{
 		int			nchunks = lionvec_toast_nchunks(lionvec_toast_extsize(bs->dims, bs->half),
-													TOAST_MAX_CHUNK_SIZE);
+													LION_TOAST_MAX_CHUNK_SIZE);
 		int			runs = lionvec_refloc_runs(nchunks);
 		Size		room = BLCKSZ - MAXALIGN(SizeOfPageHeaderData) -
 			MAXALIGN(sizeof(LionVecPageOpaqueData));
@@ -2258,7 +2258,7 @@ lionvec_build_callback(Relation index, ItemPointer tid, Datum *values,
 	double		dist2 = 0.0;
 	double		dist2b = 0.0;
 	Datum		value = values[0];
-	struct varatt_external ptr;
+	LionToastPointer ptr;
 
 	/*
 	 * A row whose vector lies in TOAST as an entry's must (§44.13): its
@@ -4476,7 +4476,7 @@ lionvec_insert_locate(Relation index, Relation heap, const LionVecInfo *info,
 {
 	AttrNumber	attno = index->rd_index->indkey.values[0];
 	LionVecToast t;
-	struct varatt_external ptr;
+	LionToastPointer ptr;
 	struct varlena *v;
 	char	   *data;
 
@@ -4813,7 +4813,7 @@ lionvecbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	{
 		bool		half = lionvec_index_half(index);
 		int			nchunks = lionvec_toast_nchunks(lionvec_toast_extsize(meta.dims, half),
-													TOAST_MAX_CHUNK_SIZE);
+													LION_TOAST_MAX_CHUNK_SIZE);
 
 		lionvec_vacuum_locs(index, &meta, nchunks, callback, callback_state,
 							info->strategy);

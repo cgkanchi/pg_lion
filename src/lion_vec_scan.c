@@ -1652,9 +1652,9 @@ lv_check_pointer(IndexScanDesc scan, LvScanOpaque *so, Oid valueid)
 
 	if (attno > 0)
 		d = slot_getattr(so->slot, attno, &isnull);
-	if (!isnull && VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(d)))
+	if (!isnull && lion_toast_ondisk_oid(DatumGetPointer(d)))
 	{
-		struct varatt_external ptr;
+		LionToastPointer ptr;
 
 		memset(&ptr, 0, sizeof(ptr));
 		VARATT_EXTERNAL_GET_POINTER(ptr, DatumGetPointer(d));
@@ -1723,7 +1723,7 @@ lv_start_toast(IndexScanDesc scan, LvScanOpaque *so)
 		!IsMVCCSnapshot(scan->xs_snapshot))
 		return;
 	extsize = lionvec_toast_extsize(so->info->dims, so->info->half);
-	nchunks = lionvec_toast_nchunks(extsize, TOAST_MAX_CHUNK_SIZE);
+	nchunks = lionvec_toast_nchunks(extsize, LION_TOAST_MAX_CHUNK_SIZE);
 	if (nchunks < 1 || nchunks > LIONVEC_LOC_MAXRUNS)
 		return;
 

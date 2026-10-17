@@ -65,8 +65,8 @@ StaticAssertDecl(sizeof(LionVecLocDir) == 12,
  * Open the TOAST relation of heap and its indexes, for an index of dims
  * dimensions (half: of halfvec), whose values have a locator entry when
  * stored in TOAST as extsize bytes, uncompressed; false, with nothing
- * opened, if the heap has no TOAST relation or its values would take more
- * chunks than an entry holds.  Locked as a detoast locks them, until the
+ * opened, if the heap has no TOAST relation, its TOAST relation's ids are
+ * not OIDs, or its values would take more chunks than an entry holds.  Locked as a detoast locks them, until the
  * transaction ends; what it allocates is in the caller's memory context,
  * which must last until lionvec_toast_close().
  */
@@ -77,13 +77,20 @@ lionvec_toast_open(LionVecToast *t, Relation heap, int dims, bool half)
 	if (heap == NULL || dims <= 0 || !OidIsValid(heap->rd_rel->reltoastrelid))
 		return false;
 	t->extsize = lionvec_toast_extsize(dims, half);
-	t->nchunks = lionvec_toast_nchunks(t->extsize, TOAST_MAX_CHUNK_SIZE);
+	t->nchunks = lionvec_toast_nchunks(t->extsize, LION_TOAST_MAX_CHUNK_SIZE);
 	if (t->nchunks < 1 || t->nchunks > LIONVEC_LOC_MAXRUNS)
 		return false;
 	t->dims = dims;
 	t->half = half;
 	t->toastrelid = heap->rd_rel->reltoastrelid;
 	t->toastrel = table_open(t->toastrelid, AccessShareLock);
+	/* PostgreSQL 20's TOAST relations of 8-byte ids have no entries */
+	if (TupleDescAttr(RelationGetDescr(t->toastrel), 0)->atttypid != OIDOID)
+	{
+		table_close(t->toastrel, NoLock);
+		memset(t, 0, sizeof(*t));
+		return false;
+	}
 	t->valid = toast_open_indexes(t->toastrel, AccessShareLock, &t->idxs,
 								  &t->nidx);
 	return true;
@@ -107,11 +114,11 @@ lionvec_toast_close(LionVecToast *t)
  * always was.
  */
 bool
-lionvec_toast_value(const LionVecToast *t, Datum d, struct varatt_external *ptr)
+lionvec_toast_value(const LionVecToast *t, Datum d, LionToastPointer *ptr)
 {
 	struct varlena *v = (struct varlena *) DatumGetPointer(d);
 
-	if (t->toastrel == NULL || !VARATT_IS_EXTERNAL_ONDISK(v))
+	if (t->toastrel == NULL || !lion_toast_ondisk_oid(v))
 		return false;
 	VARATT_EXTERNAL_GET_POINTER(*ptr, v);
 	return lionvec_toast_ptr_ok(t, ptr);
@@ -123,11 +130,11 @@ lionvec_toast_value(const LionVecToast *t, Datum d, struct varatt_external *ptr)
  * dimensions' length
  */
 bool
-lionvec_toast_ptr_ok(const LionVecToast *t, const struct varatt_external *ptr)
+lionvec_toast_ptr_ok(const LionVecToast *t, const LionToastPointer *ptr)
 {
 	return t->toastrel != NULL &&
 		ptr->va_toastrelid == t->toastrelid &&
-		(int64) VARATT_EXTERNAL_GET_EXTSIZE(*ptr) == t->extsize &&
+		(int64) LION_TOAST_EXTSIZE(*ptr) == t->extsize &&
 		(int64) ptr->va_rawsize == t->extsize + VARHDRSZ;
 }
 
@@ -179,7 +186,7 @@ lionvec_chunk(HeapTuple tup, TupleDesc desc, Oid *valueid, int32 *seq,
 /*
  * A value's chunks, found through the TOAST index as heap_fetch_toast_slice()
  * finds them - under the TOAST snapshot, in chunk_seq order, every one of
- * 0 to nchunks - 1 once, each TOAST_MAX_CHUNK_SIZE but the last - copied into
+ * 0 to nchunks - 1 once, each LION_TOAST_MAX_CHUNK_SIZE but the last - copied into
  * data (extsize bytes; NULL for none), and their places, as runs, into loc
  * with the value's id (loc->tid is the caller's).  False if anything is not
  * so, or the places take more runs than the value has chunks: the row then
@@ -187,7 +194,7 @@ lionvec_chunk(HeapTuple tup, TupleDesc desc, Oid *valueid, int32 *seq,
  * raises whatever error is due.
  */
 bool
-lionvec_toast_locate(LionVecToast *t, const struct varatt_external *ptr,
+lionvec_toast_locate(LionVecToast *t, const LionToastPointer *ptr,
 					 char *data, LionVecLoc *loc)
 {
 	TupleDesc	desc = RelationGetDescr(t->toastrel);
@@ -215,7 +222,7 @@ lionvec_toast_locate(LionVecToast *t, const struct varatt_external *ptr,
 		if (expected >= t->nchunks ||
 			!lionvec_chunk(ttup, desc, &id, &seq, &cdata, &csize) ||
 			id != ptr->va_valueid || seq != expected ||
-			csize != lionvec_toast_chunk_size(t->extsize, TOAST_MAX_CHUNK_SIZE, seq) ||
+			csize != lionvec_toast_chunk_size(t->extsize, LION_TOAST_MAX_CHUNK_SIZE, seq) ||
 			!ItemPointerIsValid(&ttup->t_self))
 		{
 			ok = false;
@@ -224,7 +231,7 @@ lionvec_toast_locate(LionVecToast *t, const struct varatt_external *ptr,
 		blks[seq] = ItemPointerGetBlockNumber(&ttup->t_self);
 		offs[seq] = ItemPointerGetOffsetNumber(&ttup->t_self);
 		if (data != NULL)
-			memcpy(data + (Size) seq * TOAST_MAX_CHUNK_SIZE, cdata, csize);
+			memcpy(data + (Size) seq * LION_TOAST_MAX_CHUNK_SIZE, cdata, csize);
 		expected++;
 	}
 	systable_endscan_ordered(scan);
@@ -251,7 +258,7 @@ lionvec_toast_locate(LionVecToast *t, const struct varatt_external *ptr,
  */
 bool
 lionvec_stored_pointer(Relation heap, ItemPointer tid, AttrNumber attno,
-					   struct varatt_external *ptr)
+					   LionToastPointer *ptr)
 {
 	Buffer		buf;
 	Page		page;
@@ -280,7 +287,7 @@ lionvec_stored_pointer(Relation heap, ItemPointer tid, AttrNumber attno,
 				Datum		d = heap_getattr(&tup, attno, RelationGetDescr(heap),
 											 &isnull);
 
-				if (!isnull && VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(d)))
+				if (!isnull && lion_toast_ondisk_oid(DatumGetPointer(d)))
 				{
 					VARATT_EXTERNAL_GET_POINTER(*ptr, DatumGetPointer(d));
 					found = true;
@@ -315,7 +322,7 @@ lionvec_place_run(Relation toastrel, Snapshot tsnap, Buffer buf,
 	Page		page = BufferGetPage(buf);
 	TupleDesc	desc = RelationGetDescr(toastrel);
 	OffsetNumber maxoff;
-	int			nchunks = lionvec_toast_nchunks(extsize, TOAST_MAX_CHUNK_SIZE);
+	int			nchunks = lionvec_toast_nchunks(extsize, LION_TOAST_MAX_CHUNK_SIZE);
 	int			j;
 
 	if (PageIsNew(page) || PageGetSpecialSize(page) != 0)
@@ -345,9 +352,9 @@ lionvec_place_run(Relation toastrel, Snapshot tsnap, Buffer buf,
 			!HeapTupleSatisfiesVisibility(&tup, tsnap, buf) ||
 			!lionvec_chunk(&tup, desc, &id, &cseq, &cdata, &csize) ||
 			id != valueid || cseq != seq ||
-			csize != lionvec_toast_chunk_size(extsize, TOAST_MAX_CHUNK_SIZE, seq))
+			csize != lionvec_toast_chunk_size(extsize, LION_TOAST_MAX_CHUNK_SIZE, seq))
 			return false;
-		memcpy(data + (Size) seq * TOAST_MAX_CHUNK_SIZE, cdata, csize);
+		memcpy(data + (Size) seq * LION_TOAST_MAX_CHUNK_SIZE, cdata, csize);
 	}
 	return true;
 }
@@ -363,7 +370,7 @@ lionvec_place_read(Relation toastrel, Snapshot tsnap, BlockNumber nblocks,
 				   Oid valueid, const LionVecLocRun *runs, int nruns,
 				   int64 extsize, char *data)
 {
-	int			nchunks = lionvec_toast_nchunks(extsize, TOAST_MAX_CHUNK_SIZE);
+	int			nchunks = lionvec_toast_nchunks(extsize, LION_TOAST_MAX_CHUNK_SIZE);
 	int			seq = 0;
 	int			i;
 

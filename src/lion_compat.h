@@ -408,6 +408,25 @@ lion_toast_snapshot(SnapshotData *data)
 #endif
 
 /*
+ * TOAST pointers of a 4-byte value id, the only kind lionvec's locator holds
+ * (DESIGN.md §44.13; LionToastPointer, lion_vec.h).  PostgreSQL 20 adds
+ * TOAST relations of 8-byte ids (the toast_value_type reloption): the chunk
+ * size depends on the id's type, the external size is read from va_extinfo,
+ * and a pointer tagged VARTAG_ONDISK_OID8 is no value the locator can hold.
+ * The macros need access/heaptoast.h and varatt.h where they are used.
+ */
+#if PG_VERSION_NUM >= 200000
+#define LION_TOAST_MAX_CHUNK_SIZE	TOAST_OID_MAX_CHUNK_SIZE
+#define LION_TOAST_EXTSIZE(p)		VARATT_EXTINFO_GET_EXTSIZE((p).va_extinfo)
+#define lion_toast_ondisk_oid(attr) \
+	(VARATT_IS_EXTERNAL_ONDISK(attr) && VARTAG_EXTERNAL(attr) == VARTAG_ONDISK_OID)
+#else
+#define LION_TOAST_MAX_CHUNK_SIZE	TOAST_MAX_CHUNK_SIZE
+#define LION_TOAST_EXTSIZE(p)		VARATT_EXTERNAL_GET_EXTSIZE(p)
+#define lion_toast_ondisk_oid(attr)	VARATT_IS_EXTERNAL_ONDISK(attr)
+#endif
+
+/*
  * pg_noreturn (PostgreSQL 18), written before the declaration.  Before it
  * there was pg_attribute_noreturn(), which is GCC's attribute where there is
  * one, and that may stand before the declaration too.
