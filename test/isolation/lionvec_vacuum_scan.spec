@@ -2,10 +2,12 @@
 # (DESIGN.md §44.5, "A scan against VACUUM").
 #
 # A scan copies what it needs of a CODE item - the row's TID and where its
-# REFINE item is - into its queue and holds no pin.  VACUUM removes dead
-# rows' CODE items (PageIndexMultiDelete(), which moves the items left on a
-# page) and then their REFINE items, whose slots an insert may take again,
-# as the heap may the TIDs.  The scan must take a REFINE item that is gone,
+# REFINE item is - into its queue and holds no lock; at most the pins of
+# pages its read streams read ahead (DESIGN.md §44.4, "Read streams"), the
+# default from PostgreSQL 17, which VACUUM, taking no cleanup lock, does not
+# wait for.  VACUUM removes dead rows' CODE items (PageIndexMultiDelete(),
+# which moves the items left on a page) and then their REFINE items, whose
+# slots an insert may take again, as the heap may the TIDs.  The scan must take a REFINE item that is gone,
 # or is another row's, as its row gone, follow its chains as they stand, and
 # return exactly the rows of its snapshot, each once.
 #
@@ -19,8 +21,9 @@
 #    rows with the rest of its queue holding REFINE locations;
 #  * lionvec-probe-page, between two pages of a chain in the middle of a
 #    probe: the pages ahead are compacted and the chain's tail extended
-#    while the scan stands on it.  The VACUUM step does not wait for the
-#    parked scan, which holds no pin.
+#    while the scan stands on it, its stream holding pins of the next ones.
+#    The VACUUM step does not wait for the parked scan, which holds no
+#    lock.
 #
 # The rows a scan returns are compared with a sort under the same snapshot.
 # pg_lion.vector_margin and vector_patience make it read every partition

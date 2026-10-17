@@ -683,17 +683,30 @@ re-admit the plain scan: under `exact` the query is then sorted, and under `erro
 clause the planner tests once (`WHERE $1`, `WHERE current_user = 'app'`), and one a partial
 `lionvec` index's predicate implies, is no filter of the scan's rows.
 
-`pg_lion.vector_prefetch` (`on`): whether a `lionvec` scan asks for the pages it will read next
-before it reads them (DESIGN.md §44.4, "Prefetch"): the rest of a partition's code pages, laid one
-after another by the build, the refine pages and table rows at the front of its queues, and an exact
-answer's matching rows, as many ahead as the tablespace's `effective_io_concurrency`, up to 64 (0
-asks for none). The table's rows are asked for only when its access method is heap's and its
-vectors lie in its pages (`STORAGE PLAIN` or `MAIN`, or at most 506 dimensions, 1,012 as
-`halfvec`). The rows returned are the same either way. Cold it cut a scan's wait on the disk by a
-third to a half on 115,386 embeddings, and an exact answer's over vectors kept in the table by five
-sixths (DESIGN.md §44.9); with everything in shared buffers it costs about 2%: after 32 asks in a
-row found their page there, a scan lets the next 256 pass unasked, then asks again. Each scan's
-`DEBUG1` line names the pages it asked for and how many were not in shared buffers.
+`pg_lion.vector_prefetch` (`off`, `fadvise` or `stream`; `stream` from PostgreSQL 17, `fadvise` on
+16): how a `lionvec` scan reads ahead the pages it will read next (DESIGN.md §44.4, "Prefetch" and
+"Read streams"): the rest of a partition's code pages, laid one after another by the build, the
+partitions it expects to probe next, the refine pages and table rows at the front of its queues, and
+an exact answer's matching rows, as many ahead as the tablespace's `effective_io_concurrency`, up to
+64 (0 reads none ahead). `stream` reads them into shared buffers through PostgreSQL's read streams,
+several pages a read, on 18 as `io_method` says; `fadvise` asks the kernel for them
+(`PrefetchBuffer()`), the only way on 16, where `stream` means `fadvise`; `off` reads each when it
+comes. The table's rows are read ahead only when its access method is heap's and its vectors lie in
+its pages (`STORAGE PLAIN` or `MAIN`, or at most 506 dimensions, 1,012 as `halfvec`, or within the
+table's `toast_tuple_target` where that is larger) - an exact answer's through a stream under
+`stream`, the rows whose exact distances a scan computes by asking the kernel under either: a vector
+in TOAST is not read ahead under any setting. The rows returned, and their order, are the same under
+all three. `on` and `off`, from when it was a boolean, still work, `on` being the default. On
+115,186 embeddings (DESIGN.md §44.9), each query alone with its pages on the disk, `stream` took a
+scan at a margin of 8 from 48 ms asking the kernel to 43 (67 reading as it went), a 1% filter's from
+83 to 62, and an exact answer's from 59 to 53. With the index's pages in the operating system's
+cache and not in shared buffers, though, `stream` costs up to 40% more than `fadvise` under 18's
+`io_method` `worker` or `io_uring`, which hand each read to another process or thread; `fadvise`
+suits an index that lives there. With everything in shared buffers `stream` costs 2 to 11% and
+`fadvise` under 5%: after 32 reads in a row found their page there, a scan stops reading ahead for
+the next 256, then starts again. Each scan's `DEBUG1` line names what its streams read
+(`N pages streamed (M read in), A read apart, W streamed unread, R restarts`), or the pages it asked
+for and how many were not in shared buffers.
 
 `pg_lion.ordered_switch_ratio` (32, 1 to 1,000,000): how many B-tree entries `LionOrdered` walks per
 member it has not met yet before it stops walking, fetches the members left in TID order and sorts

@@ -89,6 +89,7 @@
 #include "utils/wait_event.h"
 
 #include "lion_compat.h"
+#include "lion_readahead.h"
 #include "lion_vec.h"
 
 PG_FUNCTION_INFO_V1(lionvec_handler);
@@ -102,11 +103,36 @@ int			lionvec_exact_rows = LIONVEC_EXACT_DEFAULT;
 double		lionvec_exact_per_part = LIONVEC_EXACT_PER_PART_DEFAULT;
 int			lionvec_overflow = LIONVEC_OVERFLOW_ERROR;
 int			lionvec_postfilter = LIONVEC_POSTFILTER_EXACT;
-bool		lionvec_prefetch = true;
+int			lionvec_prefetch = LION_READAHEAD_DEFAULT;
 
 static const struct config_enum_entry lionvec_overflow_options[] = {
 	{"error", LIONVEC_OVERFLOW_ERROR, false},
 	{"stop", LIONVEC_OVERFLOW_STOP, false},
+	{NULL, 0, false}
+};
+
+/*
+ * pg_lion.vector_prefetch's (lion_readahead.h): stream where the server has
+ * read streams, and on 16, which has none, a name for fadvise, so that one
+ * setting serves every major; and on and off as the boolean it was until
+ * 2026-10-17 took them, on the default.  The value a name stands for is what
+ * SHOW prints, by the first entry that has it: on 16 fadvise for stream.
+ */
+static const struct config_enum_entry lionvec_prefetch_options[] = {
+	{"off", LION_READAHEAD_OFF, false},
+	{"fadvise", LION_READAHEAD_FADVISE, false},
+#if PG_VERSION_NUM >= 170000
+	{"stream", LION_READAHEAD_STREAM, false},
+#else
+	{"stream", LION_READAHEAD_FADVISE, true},
+#endif
+	{"on", LION_READAHEAD_DEFAULT, true},
+	{"true", LION_READAHEAD_DEFAULT, true},
+	{"yes", LION_READAHEAD_DEFAULT, true},
+	{"1", LION_READAHEAD_DEFAULT, true},
+	{"false", LION_READAHEAD_OFF, true},
+	{"no", LION_READAHEAD_OFF, true},
+	{"0", LION_READAHEAD_OFF, true},
 	{NULL, 0, false}
 };
 
@@ -261,21 +287,24 @@ lion_vec_init(void)
 							 NULL, NULL, NULL);
 
 	/*
-	 * DESIGN.md §44.4, "Prefetch": a cold scan waits on one page read at a
-	 * time, its probes' CODE chains, refines and heap fetches each a read the
-	 * next cannot start before; asked for ahead by effective_io_concurrency
-	 * pages, the kernel reads them meanwhile.  It changes no row returned,
-	 * nor their order: a hint, never a read.
+	 * DESIGN.md §44.4, "Prefetch" and "Read streams": a cold scan waits on
+	 * one page read at a time, its probes' CODE chains, refines and heap
+	 * fetches each a read the next cannot start before; read ahead by
+	 * effective_io_concurrency pages, through a read stream or by asking the
+	 * kernel, they come in meanwhile.  It changes no row returned, nor their
+	 * order: which pages come first, never which are read.
 	 */
-	DefineCustomBoolVariable("pg_lion.vector_prefetch",
-							 "Whether a lionvec scan asks for the pages it will read ahead of reading them.",
+	DefineCustomEnumVariable("pg_lion.vector_prefetch",
+							 "How a lionvec scan reads ahead the pages it will read next.",
 							 "A scan reads its partitions' code pages in runs the build wrote, and refines "
-							 "and fetches rows from the top of its queue; with this on it asks the kernel "
-							 "for the next of those pages, as many as the tablespace's "
-							 "effective_io_concurrency, up to 64 at a time, so that a cold scan does not "
-							 "wait on one read at a time.  The rows returned are the same either way.",
+							 "and fetches rows from the top of its queue.  stream reads the next of those "
+							 "pages through a read stream (PostgreSQL 17 and later), fadvise asks the kernel "
+							 "for them (PrefetchBuffer), off reads each when it comes; as many ahead as the "
+							 "tablespace's effective_io_concurrency, up to 64.  The rows returned are the "
+							 "same whichever it is.",
 							 &lionvec_prefetch,
-							 true,
+							 LION_READAHEAD_DEFAULT,
+							 lionvec_prefetch_options,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
