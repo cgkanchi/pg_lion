@@ -7684,14 +7684,12 @@ every scan shape against a sequential scan on an enum column, a list longer than
     installcheck-rmgr through `./dev.sh` with `LION_SOCK`/`LION_PORT`. Checked with actionlint
     1.7.7 and shellcheck 0.10; it runs on every push and pull request.
   - `pg_upgrade`: works across majors, and found a preload bug (§23 addendum below).
-  - The WAL resource manager id (2026-10-17): 170 is reserved for pg_lion on
-    https://wiki.postgresql.org/wiki/CustomWALResourceManagers and is now `pg_lion.rmgr_id`'s
-    default (`LION_RMGR_ID`, `src/lion_wal.h`), replacing `RM_EXPERIMENTAL_ID` (128), the id core
-    sets aside for development. The GUC stays so a site can move out of a collision. The rule for
-    changing it (WAL written under one id replays only under that id, so only after a clean
-    shutdown with every standby and archive consumer caught up; pg_upgrade carries no WAL, so an
-    upgrade may change it freely) is in docs/REFERENCE.md under `wal_mode`, with what that means
-    for a cluster that ran a development build on 128.
+  - The WAL resource manager id: 170, reserved for pg_lion on
+    https://wiki.postgresql.org/wiki/CustomWALResourceManagers, is `pg_lion.rmgr_id`'s default
+    (`LION_RMGR_ID`, `src/lion_wal.h`). The GUC stays so a site can move out of a collision. The
+    rule for changing it (WAL written under one id replays only under that id, so only after a
+    clean shutdown with every standby and archive consumer caught up; pg_upgrade carries no WAL, so
+    an upgrade may change it freely) is in docs/REFERENCE.md under `wal_mode`.
   Remaining:
   - Publishing: a PGXN account and upload of the zip, and a README install section (`pgxn
     install pg_lion --testing` while `release_status` is testing, which is what the client needs
@@ -7815,8 +7813,8 @@ case beyond the two load orders. No chaining bug was found.
 `test/modules/lion_hooktest`, a test-only module that chains the same hook, counts its calls,
 notes whether a LionCount path was already in the grouped rel when the previous hook returned
 (which tells which of the two hooks was installed first), registers a resource manager of its
-own when preloaded (id 128, `RM_EXPERIMENTAL_ID`, by default; pg_lion's default was 128 too until
-it took its reserved 170) and reserves its own GUC prefix.
+own when preloaded (id 128, `RM_EXPERIMENTAL_ID`, by default; pg_lion's is its reserved 170) and
+reserves its own GUC prefix.
 Against the dev cluster, restarted with the options on pg_ctl's command line:
 
 - nothing preloaded, lion_hooktest LOADed and pg_lion then loaded on first use, by the planner in
@@ -8728,10 +8726,9 @@ defined in the same guarded block, because core refuses to define a
 postmaster-level GUC after startup (pg_stat_statements returns from `_PG_init()`
 at exactly this point and for exactly this reason). Default 170
 (`LION_RMGR_ID`), the id reserved for pg_lion on the wiki page the core
-documentation names; until 2026-10-17 it was 128, `RM_EXPERIMENTAL_ID`, the id
-the project reserves for development. The GUC stays - the list is only a
-convention, and the point of a reserved range is that a site can move out of a
-collision - and `pg_get_wal_resource_managers()` is where to look. Once an index has been
+documentation names. The GUC stays - the list is only a convention, and the
+point of a reserved range is that a site can move out of a collision - and
+`pg_get_wal_resource_managers()` is where to look. Once an index has been
 written in rmgr mode the library must stay preloaded for as long as WAL that
 mentions it may be replayed, which is the rule core states for every custom
 resource manager.

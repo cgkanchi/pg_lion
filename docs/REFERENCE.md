@@ -416,11 +416,7 @@ that mentions it may still be replayed - the rule core states for every custom r
 WAL written under one id replays only under that id, so change `pg_lion.rmgr_id` only after a clean
 shutdown, once every standby and WAL archive consumer has replayed everything written under the old
 id, and restart each server of the cluster with the new one; `pg_upgrade` carries no WAL across, so
-an upgrade may change it freely.  Builds before 2026-10-17 defaulted to 128 (`RM_EXPERIMENTAL_ID`,
-the id the PostgreSQL project reserves for development): a cluster that wrote rmgr-mode indexes
-with one of them either sets `pg_lion.rmgr_id = 128` to keep that id, or follows the rule above to
-move to 170 - a standby or a restore from an archive that meets WAL from before the move needs 128
-until it has replayed past it.
+an upgrade may change it freely.
 `lion_index_stats()` reports ONE ROW PER KEY COLUMN (DESIGN.md §24), with a leading `attno`: the
 directory's height, its leaf and internal pages and whether that column is `ordered` (false for a
 key type with no btree opclass, whose entries are then in a complete but arbitrary order), the
