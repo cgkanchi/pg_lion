@@ -286,9 +286,9 @@ cold scan's wait on the disk by a third to a half on 115,000 embeddings).
   took 108 s alone and 36 s with three parallel workers (292 s and 85 s comparing every row with
   every centroid). It reuses the space of deleted rows only slowly and
   keeps the partitions it was built with, so a table with heavy churn or drift needs an occasional
-  `REINDEX`. Each row it returns is read from the table twice. Its scan runs in parallel only once
-  `parallel_setup_cost` is lowered, and on 115,000 rows it was then 4 to 8 times slower than
-  alone, each process probing about as much as one scan does; a filtered query stays serial.
+  `REINDEX`. Each row it returns is read from the table twice. Its scan runs in parallel only with
+  `pg_lion.vector_parallel_scan` on (off by default) and `parallel_setup_cost` lowered, and on
+  115,000 rows it was then 4 to 8 times slower than alone, each process probing about as much as one scan does; a filtered query stays serial.
 - On a hot standby, indexes using the default (generic) WAL mode recheck every row in counts.
   Preloading the library avoids this.
 - Loading the library changes estimates, and so plans, that have nothing to do with lion: a column

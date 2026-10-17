@@ -207,6 +207,12 @@ SET pg_lion.vector_epsilon = 6;
 SET pg_lion.vector_margin = 100;
 SET pg_lion.vector_patience = 0;
 
+-- pg_lion.vector_parallel_scan is off by default: even with parallel plans
+-- free, the index is scanned serially
+SHOW pg_lion.vector_parallel_scan;
+SELECT * FROM ps_plan('SELECT id FROM ps ORDER BY v <-> ps_vec(4, 24) LIMIT 10');
+SET pg_lion.vector_parallel_scan = on;
+
 -- the plan: a Gather Merge over a Parallel Index Scan of the operator's index
 SELECT * FROM ps_plan('SELECT id FROM ps ORDER BY v <-> ps_vec(4, 24) LIMIT 10');
 SELECT * FROM ps_plan('SELECT id, v <#> ps_vec(4, 24) AS d FROM ps ORDER BY v <#> ps_vec(4, 24) LIMIT 10');
@@ -374,6 +380,7 @@ SELECT op, avg(ps_recall(format('SELECT id FROM ps ORDER BY v %s %s LIMIT 10', o
 		  FROM generate_series(1, 20) s) c
  GROUP BY op ORDER BY op;
 
+RESET pg_lion.vector_parallel_scan;
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;

@@ -363,6 +363,7 @@ extern double lionvec_exact_per_part;
 extern int	lionvec_overflow;
 extern int	lionvec_postfilter;
 extern bool lionvec_prefetch;
+extern bool lionvec_parallel_scan;
 
 /*
  * What an ORDER BY operator of lionvec's returns: pgvector's all return
