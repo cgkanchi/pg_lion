@@ -1,6 +1,6 @@
 Parsed test spec with 3 sessions
 
-starting permutation: s1_park s1_scan s2_delete s2_vacuum_toast s2_insert s3_wake s2_toast_lock s1_check_exact s2_toast_lock s3_whole
+starting permutation: s1_park s1_scan s2_delete s2_vacuum_toast s2_insert s3_wake s1_got s2_toast_lock s1_check_exact s2_toast_lock s3_whole
 injection_points_set_local
 --------------------------
                           
@@ -43,6 +43,12 @@ injection_points_wakeup
 
 step s1_scan: <... completed>
 s1: DEBUG:  lionvec scan of "lvt_v": 30 members fetched, 60 returned, 60 read by place (4 locator pages, 30 not), 60 checked
+step s1_got: SELECT count(*) AS got FROM lvt_got;
+got
+---
+ 60
+(1 row)
+
 step s2_toast_lock: 
 	SELECT mode, granted FROM pg_locks
 	 WHERE locktype = 'relation' AND pid <> pg_backend_pid()
