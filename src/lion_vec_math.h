@@ -663,6 +663,15 @@ lionvec_prefetch_end(uint64 blk, int dist, uint64 end)
 extern int	lionvec_least(const double *key, int n, int m, int *idx);
 
 /*
+ * lionvec_least()'s m places, idx[0 .. m), put in lionvec_rank()'s order:
+ * least key first, a NaN as infinite, ties by place.  An insertion sort, for
+ * the few a look into a queue keeps (LIONVEC_PREFETCH_MAX at most): the
+ * order a read stream is given their pages in (DESIGN.md §44.4, "Read
+ * streams").
+ */
+extern void lionvec_least_order(const double *key, int *idx, int m);
+
+/*
  * The scan orders rows by a KEY that is the distance up to a constant of the
  * query: what changes from row to row of an estimate of <x, qc>.
  *
