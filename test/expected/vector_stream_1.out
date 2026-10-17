@@ -464,6 +464,89 @@ SELECT q, rs_halves(q) AS result FROM rs_q
 (8 rows)
 
 /*
+ * A list that rests with more blocks in its stream than a rest lasts: the
+ * exact path over 900 members, each on a heap page of its own (rs_list's
+ * fill factor), the lowest 480 pages evicted and the rest in shared
+ * buffers.  The list's stream runs ahead over the cold blocks as far as
+ * effective_io_concurrency lets it, io_combine_limit pages a read, and the
+ * warm ones then rest it with all that still to hand out: the scan takes
+ * those first, through as many rests and wakings as they last, in order,
+ * then the list's next blocks.  Each effective_io_concurrency from 14 to 80,
+ * by 2, ends the stream's backlog at another point of a rest or of the
+ * reads between two: with dev.sh's 2 GB of shared buffers, between two at
+ * 16, 17, 34 and 35 on 18 and from 69 to 76 on 17, where the scan once
+ * took the backlog's end, which the rest had made, for the list's.
+ * rs_list_rests() says whether the rows are those read with no stream
+ * every time.  Where the server's pin limit (shared_buffers over the
+ * backends) keeps a stream under 256 blocks, it tests less and says the
+ * same.
+ */
+CREATE TABLE rs_list (id int PRIMARY KEY, cat int, v vector(24), pad text)
+	WITH (autovacuum_enabled = off, fillfactor = 10);
+ALTER TABLE rs_list ALTER pad SET STORAGE PLAIN;
+INSERT INTO rs_list
+SELECT i, (i % 4 = 0)::int, rs_vec(i + 7000, 24), repeat('x', 600)
+  FROM generate_series(1, 1200) i;
+CREATE INDEX rs_list_cat ON rs_list USING lion (cat);
+CREATE INDEX rs_list_l2 ON rs_list USING lionvec (v vector_l2_ops)
+	WITH (partitions = 4);
+ANALYZE rs_list;
+SELECT pg_relation_size('rs_list') / current_setting('block_size')::int AS rs_list_pages;
+ rs_list_pages 
+---------------
+          1200
+(1 row)
+
+CREATE FUNCTION rs_evict_below(rel regclass, upto bigint) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+	IF current_setting('server_version_num')::int >= 170000 THEN
+		PERFORM pg_buffercache_evict(b.bufferid)
+		   FROM pg_buffercache b
+		  WHERE b.reldatabase = (SELECT oid FROM pg_database
+								  WHERE datname = current_database())
+			AND b.relfilenode = pg_relation_filenode(rel)
+			AND b.relforknumber = 0
+			AND b.relblocknumber < upto;
+	END IF;
+END $$;
+CREATE FUNCTION rs_list_rests(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	first int[];
+	a int[];
+	runs int := 0;
+	bad text := '';
+	saved text := current_setting('pg_lion.vector_prefetch');
+	saved_eic text := current_setting('effective_io_concurrency');
+BEGIN
+	PERFORM set_config('pg_lion.vector_prefetch', 'off', true);
+	first := rs_ids(q);
+	PERFORM set_config('pg_lion.vector_prefetch', 'stream', true);
+	FOR e IN 14..80 BY 2 LOOP
+		PERFORM set_config('effective_io_concurrency', e::text, true);
+		PERFORM rs_ids(q);
+		PERFORM rs_evict_below('rs_list', 480);
+		a := rs_ids(q);
+		runs := runs + 1;
+		IF a IS DISTINCT FROM first THEN
+			bad := bad || ' ' || e;
+		END IF;
+	END LOOP;
+	PERFORM set_config('effective_io_concurrency', saved_eic, true);
+	PERFORM set_config('pg_lion.vector_prefetch', saved, true);
+	RETURN format('%s rows, %s runs, %s', coalesce(cardinality(first), 0), runs,
+				  CASE WHEN bad = '' THEN 'the same each time'
+				  ELSE 'MISMATCH at effective_io_concurrency' || bad END);
+END $$;
+SELECT rs_list_rests('SELECT id FROM rs_list WHERE cat = 0
+					   ORDER BY v <-> rs_vec(22, 24) LIMIT 10') AS result;
+                result                
+--------------------------------------
+ 10 rows, 34 runs, the same each time
+(1 row)
+
+/*
  * rs_boom() raises an error at its nth call of a statement: a scan's nth
  * row, which the scan has read ahead of.  rs_fail() runs q - its rows put
  * through rs_boom() - under each way of reading ahead, in a subtransaction
@@ -599,8 +682,9 @@ SET pg_lion.vector_prefetch = sideways;
 ERROR:  invalid value for parameter "pg_lion.vector_prefetch": "sideways"
 RESET pg_lion.vector_prefetch;
 -- What each way read, on the exact path with every page in shared buffers:
--- through a stream every block of the members' (17 and later), asking the
--- kernel, 32 asks before they fall dormant (vector_stream_1.out on 16,
+-- through a stream (17 and later) 32 of the members' blocks before the list
+-- rests, the next 256 read by the scan alone, and so on by turns; asking
+-- the kernel, 32 asks before they fall dormant (vector_stream_1.out on 16,
 -- where stream is fadvise)
 SELECT count(*) FROM (SELECT id FROM rs WHERE tag = 3
 					   ORDER BY v <-> rs_vec(7, 24) LIMIT 10) s;
@@ -639,8 +723,8 @@ DEBUG:  lionvec scan of "rs_l2": 445 members fetched, 10 returned
 
 RESET client_min_messages;
 RESET pg_lion.vector_prefetch;
-DROP TABLE rs, rs_rest, rs_q;
+DROP TABLE rs, rs_rest, rs_q, rs_list;
 DROP FUNCTION rs_vec(bigint, int, float8), rs_evict(), rs_ids(text),
 	rs_each(text, text), rs_same(text), rs_cursor(text), rs_grow(text),
 	rs_boom(int, int), rs_fail(text), rs_evict_half(boolean),
-	rs_halves(text);
+	rs_halves(text), rs_evict_below(regclass, bigint), rs_list_rests(text);

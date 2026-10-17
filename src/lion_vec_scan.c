@@ -1523,7 +1523,8 @@ lv_exact_next(void *arg)
  * §44.4, "Prefetch" and "Read streams"): asking the kernel, each one's
  * so->hpf members before its fetch, the members of a block asking once;
  * through a stream over the list of their blocks, each block taken from
- * the stream at its first member and its pin dropped at once - the fetch
+ * the stream at its first member, pinned unless the list rests
+ * (lion_readahead_next()), and its pin dropped at once - the fetch
  * pins it again, and prunes it only with no other pin of this backend on
  * it (ConditionalLockBufferForCleanup()) - and the stream ended before the
  * scan returns, so that it keeps no heap page pinned.  Then their
@@ -1584,7 +1585,14 @@ lv_exact(IndexScanDesc scan, LvScanOpaque *so)
 			BlockNumber blk = ItemPointerGetBlockNumberNoCheck(&so->exact[i].tid);
 
 			if (blk != last && blk < so->hblocks)
+			{
+				/*
+				 * in TID order, each block once: the stream never holds a
+				 * second pin of the block the fetch prunes
+				 */
+				Assert(x.n == 0 || blk > x.blks[x.n - 1]);
 				x.blks[x.n++] = blk;
+			}
 			last = blk;
 		}
 		x.ra = lion_readahead_begin_list(scan->heapRelation,
@@ -1610,15 +1618,21 @@ lv_exact(IndexScanDesc scan, LvScanOpaque *so)
 
 			if (blk != last && blk < so->hblocks)
 			{
-				Buffer		buf = lion_readahead_next(x.ra);
+				BlockNumber got;
+				Buffer		buf;
 
-				/* the list's next, which the stream returns in order */
+				/*
+				 * the list's next, which the stream returns in order, pinned
+				 * unless the list rests
+				 */
 				xb++;
-				if (xb >= x.n || x.blks[xb] != blk || !BufferIsValid(buf) ||
-					BufferGetBlockNumber(buf) != blk)
+				if (!lion_readahead_next(x.ra, &got, &buf) || xb >= x.n ||
+					x.blks[xb] != blk || got != blk ||
+					(BufferIsValid(buf) && BufferGetBlockNumber(buf) != blk))
 					elog(ERROR, "lionvec: the read stream of \"%s\" lost its place at block %u",
 						 RelationGetRelationName(scan->heapRelation), blk);
-				ReleaseBuffer(buf);
+				if (BufferIsValid(buf))
+					ReleaseBuffer(buf);
 			}
 			last = blk;
 		}
