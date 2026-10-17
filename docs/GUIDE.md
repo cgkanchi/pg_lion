@@ -531,9 +531,15 @@ buffers (`stream`, the default there); on 16, or under `fadvise`, it asks the ke
 never changes an answer. It matters when the index is not in memory: on DBpedia's 115,186
 embeddings under PostgreSQL 18, each query alone after a restart with the page cache dropped, a
 scan at `pg_lion.vector_margin = 8` took 43 ms streaming, 48 asking the kernel and 67 with neither.
-Table rows are read ahead only where their vectors lie in the table's pages: pgvector stores a
-vector of more than 506 dimensions (a `halfvec` of more than 1,012) in TOAST, which no setting reads
-ahead, unless the column or the table is set so:
+pgvector stores a vector of more than 506 dimensions (a `halfvec` of more than 1,012) in TOAST
+unless the column or the table says otherwise, and a vector there is read through its row's table
+page and the TOAST index, a read each that only the one before it can name. So an index of such
+vectors keeps where each one's chunks lie (DESIGN.md §44.13) and reads them there, every chunk
+checked, through a read stream for an exact answer (`pg_lion.vector_toast_direct`, on by default;
+the answer is the same either way): on DBpedia's embeddings in TOAST a 1% filter answered exactly
+took 68 ms cold, where reading each vector through its table page and the TOAST index took
+180. An index built before 2026-10-17 knows no places until a `REINDEX`. The vectors can also
+be kept in the table, which an exact answer reads ahead through its rows' pages:
 
 ```sql
 ALTER TABLE items ALTER embedding SET STORAGE PLAIN;  -- new rows; existing ones once rewritten

@@ -1,0 +1,159 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_park s1_scan s2_delete s2_vacuum_toast s2_insert s3_wake s1_got s2_toast_lock s1_check_exact s2_toast_lock s3_whole
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_park: SELECT injection_points_attach('lionvec-exact-located', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_scan: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	SET LOCAL enable_indexscan = off;
+	SET LOCAL client_min_messages = debug1;
+	INSERT INTO lvt_got (id)
+	SELECT id FROM (SELECT id FROM lvt WHERE cat = 3 ORDER BY v <-> lvt_vec(-3, 0.2)) s;
+	RESET client_min_messages;
+ <waiting ...>
+step s2_delete: DELETE FROM lvt WHERE id % 7 = 0;
+step s2_vacuum_toast: VACUUM (PROCESS_MAIN false) lvt;
+step s2_insert: 
+	INSERT INTO lvt
+	SELECT 5000 + i, 3, lvt_vec(-3, 0.2) + lvt_vec(7000 + i, 0.05)
+	  FROM generate_series(1, 300) i;
+
+step s3_wake: 
+	SELECT injection_points_detach('lionvec-exact-located');
+	SELECT injection_points_wakeup('lionvec-exact-located');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_scan: <... completed>
+s1: DEBUG:  lionvec scan of "lvt_v": 30 members fetched, 60 returned, 60 read by place (4 locator pages, 30 not), 60 checked
+step s1_got: SELECT count(*) AS got FROM lvt_got;
+got
+---
+ 60
+(1 row)
+
+step s2_toast_lock: 
+	SELECT mode, granted FROM pg_locks
+	 WHERE locktype = 'relation' AND pid <> pg_backend_pid()
+	   AND relation = (SELECT reltoastrelid FROM pg_class WHERE oid = 'lvt'::regclass);
+
+mode           |granted
+---------------+-------
+AccessShareLock|t      
+(1 row)
+
+step s1_check_exact: 
+	SET LOCAL enable_seqscan = on;
+	SET LOCAL enable_sort = on;
+	SET LOCAL enable_indexscan = off;
+	SET LOCAL pg_lion.enable_ordered_scan = off;
+	SET LOCAL pg_lion.vector_postfilter = exact;
+	SELECT count(*) AS rows, count(DISTINCT g.id) AS distinct_rows,
+		   count(*) = count(*) FILTER (WHERE g.id = s.id) AS sort_order,
+		   count(*) FILTER (WHERE g.id % 7 = 0) AS deleted_since
+	  FROM lvt_got g
+	  JOIN (SELECT row_number() OVER (ORDER BY v <-> lvt_vec(-3, 0.2), id) AS n, id
+			  FROM lvt WHERE cat = 3) s USING (n);
+	COMMIT;
+
+rows|distinct_rows|sort_order|deleted_since
+----+-------------+----------+-------------
+  60|           60|t         |            8
+(1 row)
+
+step s2_toast_lock: 
+	SELECT mode, granted FROM pg_locks
+	 WHERE locktype = 'relation' AND pid <> pg_backend_pid()
+	   AND relation = (SELECT reltoastrelid FROM pg_class WHERE oid = 'lvt'::regclass);
+
+mode|granted
+----+-------
+(0 rows)
+
+step s3_whole: 
+	SELECT count(*) AS rows, count(DISTINCT id) AS distinct_rows,
+		   count(*) FILTER (WHERE id > 5000) AS new_rows
+	  FROM (SELECT id FROM lvt ORDER BY v <-> lvt_vec(-3, 0.2)) s;
+
+rows|distinct_rows|new_rows
+----+-------------+--------
+ 814|          814|     300
+(1 row)
+
+
+starting permutation: s1_open s2_delete s2_vacuum s2_insert s1_drain s1_check s3_whole
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_open: 
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	SET LOCAL client_min_messages = debug1;
+	DECLARE c CURSOR FOR SELECT id FROM lvt ORDER BY v <-> lvt_vec(-3, 0.2);
+	SELECT lvt_take('c', 5);
+
+lvt_take
+--------
+       5
+(1 row)
+
+step s2_delete: DELETE FROM lvt WHERE id % 7 = 0;
+step s2_vacuum: VACUUM lvt;
+step s2_insert: 
+	INSERT INTO lvt
+	SELECT 5000 + i, 3, lvt_vec(-3, 0.2) + lvt_vec(7000 + i, 0.05)
+	  FROM generate_series(1, 300) i;
+
+step s1_drain: SELECT lvt_take('c', NULL);
+lvt_take
+--------
+     595
+(1 row)
+
+step s1_check: 
+	SET LOCAL enable_seqscan = on;
+	SET LOCAL enable_sort = on;
+	SET LOCAL enable_indexscan = off;
+	SELECT count(*) AS rows, count(DISTINCT g.id) AS distinct_rows,
+		   count(*) = count(*) FILTER (WHERE g.id = s.id) AS sort_order,
+		   count(*) FILTER (WHERE g.id % 7 = 0) AS deleted_since
+	  FROM lvt_got g
+	  JOIN (SELECT row_number() OVER (ORDER BY v <-> lvt_vec(-3, 0.2), id) AS n, id
+			  FROM lvt) s USING (n);
+	COMMIT;
+
+s1: DEBUG:  lionvec scan of "lvt_v": 4 partitions probed, 2 passes, 979 candidates, 698 refined, 698 fetched, 600 returned, 0 skipped out of order, 0 bounds missed, 74 pages read, 0 pauses, 979 copies skipped, 600 read by place (0 locator pages, 0 not), 604 checked
+s1: DEBUG:  lionvec scan of "lvt_v": 698 members fetched, 600 returned, 600 read by place (0 locator pages, 0 not), 604 checked
+rows|distinct_rows|sort_order|deleted_since
+----+-------------+----------+-------------
+ 600|          600|t         |           86
+(1 row)
+
+step s3_whole: 
+	SELECT count(*) AS rows, count(DISTINCT id) AS distinct_rows,
+		   count(*) FILTER (WHERE id > 5000) AS new_rows
+	  FROM (SELECT id FROM lvt ORDER BY v <-> lvt_vec(-3, 0.2)) s;
+
+rows|distinct_rows|new_rows
+----+-------------+--------
+ 814|          814|     300
+(1 row)
+

@@ -1,0 +1,1 @@
+../lionvec_toast_scan.spec
