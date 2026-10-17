@@ -4,10 +4,11 @@
 -- returns; a Filter above it rejects most of those afterwards, so the plain
 -- scan with a Filter and LionOrdered's restricted scan answer the same query
 -- with different rows at the same margin and patience.  The plan must not
--- decide the answer.  At the default, exact, a filter lion indexes answer
--- goes through LionOrdered, and any other gets an exact plan (a sort of the
--- filter's rows); error fails such a query at plan time instead, and allow
--- lets the plain scan with its Filter compete, as before.
+-- decide the answer.  Under exact and under error, the default, a filter
+-- lion indexes answer goes through LionOrdered; any other fails at plan time
+-- under error, with a hint that names the subquery and the settings, and
+-- under exact gets an exact plan (a sort of the filter's rows); allow lets
+-- the plain scan with its Filter compete, as before.
 --
 -- The plans are shown with the sequential and bitmap scans and the sort
 -- disabled, which leaves the plain scan with its Filter the cheapest plan
@@ -141,17 +142,18 @@ CREATE INDEX pf_l2 ON pf USING lionvec (v) WITH (partitions = 20);
 CREATE INDEX pf_cat ON pf USING lion (cat);
 CREATE INDEX pf_tag ON pf USING lion (tag);
 VACUUM (FREEZE, ANALYZE) pf;
--- the default, shown once an index has loaded the library (CREATE EXTENSION
--- IF NOT EXISTS does not, where an earlier test created it)
+-- the default, error, shown once an index has loaded the library (CREATE
+-- EXTENSION IF NOT EXISTS does not, where an earlier test created it)
 SHOW pg_lion.vector_postfilter;
 
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_sort = off;
 
--- exact, the default.  A filter lion indexes answer: LionOrdered; for two
--- columns, over a set of both, though a bitmap scan would filter the less
--- selective one instead (DESIGN.md §44.6, "Post-filtering")
+-- exact.  A filter lion indexes answer: LionOrdered; for two columns, over a
+-- set of both, though a bitmap scan would filter the less selective one
+-- instead (DESIGN.md §44.6, "Post-filtering")
+SET pg_lion.vector_postfilter = exact;
 SELECT * FROM pf_plan('SELECT id FROM pf WHERE cat = 3 ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
 SELECT * FROM pf_plan('SELECT id FROM pf WHERE cat IN (1, 2) AND tag < 50
 					   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
@@ -191,9 +193,10 @@ SELECT pf_cmp('SELECT id, v <-> pf_vec(4, 24) AS d FROM pf WHERE cat = 3
 			   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
 RESET pg_lion.enable_ordered_scan;
 
--- error: a query whose lionvec order would be filtered fails at plan time,
--- EXPLAIN included, and says how to write it
-SET pg_lion.vector_postfilter = error;
+-- error, the default: a query whose lionvec order would be filtered fails at
+-- plan time, EXPLAIN included, and says how to write it, and how to have
+-- the exact plan or the filtered scan instead
+RESET pg_lion.vector_postfilter;
 \set VERBOSITY default
 EXPLAIN (COSTS OFF)
 SELECT id FROM pf WHERE note = 'n1' ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
@@ -202,12 +205,26 @@ SET pg_lion.enable_ordered_scan = off;
 SELECT id FROM pf WHERE cat = 3 ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
 RESET pg_lion.enable_ordered_scan;
 \set VERBOSITY terse
+-- a key, and the vector column's own test, are filters like any other
 SELECT id FROM pf WHERE id = 5 ORDER BY v <-> pf_vec(4, 24) LIMIT 1;
--- a filter lion answers is LionOrdered's, and no filter is no error
+SELECT id FROM pf WHERE v IS NOT NULL ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
+-- a filter lion answers is LionOrdered's, and no filter is no error, nor
+-- one the planner tests once - a generic plan's Param too
 SELECT * FROM pf_plan('SELECT id FROM pf WHERE cat = 3 ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
 SELECT pf_cmp('SELECT id, v <-> pf_vec(4, 24) AS d FROM pf WHERE cat IN (1, 2) AND tag < 50
 			   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
 SELECT pf_cmp('SELECT id, v <-> pf_vec(4, 24) AS d FROM pf ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
+SELECT pf_cmp('SELECT id, v <-> pf_vec(4, 24) AS d FROM pf WHERE current_user IS NOT NULL
+			   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
+PREPARE pf_once(bool) AS SELECT id FROM pf WHERE $1 ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
+SET plan_cache_mode = force_generic_plan;
+SELECT * FROM pf_plan('EXECUTE pf_once(true)');
+RESET plan_cache_mode;
+DEALLOCATE pf_once;
+-- error is the default's value
+SET pg_lion.vector_postfilter = error;
+SELECT id FROM pf WHERE note = 'n1' ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
+RESET pg_lion.vector_postfilter;
 -- the subquery the hint suggests: the nearest 1,000 rows of the scan
 -- (restricted by the clauses lion answers, or not at all), then the other
 -- clauses; the planner never pushes a clause below a LIMIT
@@ -229,19 +246,30 @@ CREATE INDEX pf_n1 ON pf USING lionvec (v) WITH (partitions = 4) WHERE note = 'n
 SELECT * FROM pf_plan('SELECT id FROM pf WHERE note = ''n1'' ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
 SELECT pf_cmp('SELECT id, v <-> pf_vec(4, 24) AS d FROM pf WHERE note = ''n1''
 			   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
+-- with a clause more, which lion answers, the partial index's scan would be
+-- filtered, and LionOrdered, whose set must answer every clause, the
+-- predicate's too, is not offered: the error names that clause
+\set VERBOSITY default
 SELECT id FROM pf WHERE note = 'n1' AND tag < 50 ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
+\set VERBOSITY terse
 DROP INDEX pf_n1;
 
 -- row-level security: LionOrdered does not scan such a table (DESIGN.md
--- §30.1), and the policy's clause is a filter
+-- §30.1), and the policy's clause is a filter, so under the default even a
+-- query with no WHERE fails, and the subquery the hint suggests elsewhere
+-- does too: the policy filters its scan as well.  The table's owner, whom
+-- the policy does not apply to, is not filtered.
 CREATE ROLE pf_reader;
 GRANT SELECT ON pf TO pf_reader;
 ALTER TABLE pf ENABLE ROW LEVEL SECURITY;
 CREATE POLICY pf_not5 ON pf FOR SELECT USING (cat <> 5);
+SELECT * FROM pf_plan('SELECT id FROM pf ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
 SET ROLE pf_reader;
 \set VERBOSITY default
 SELECT id FROM pf ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
 \set VERBOSITY terse
+SELECT id FROM (SELECT id, note, v <-> pf_vec(4, 24) AS d FROM pf ORDER BY d LIMIT 1000) s
+ WHERE note = 'n1' ORDER BY d LIMIT 10;
 SET pg_lion.vector_postfilter = exact;
 SELECT * FROM pf_plan('SELECT id FROM pf ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
 SELECT count(*) AS rows, count(*) FILTER (WHERE cat = 5) AS cat5
