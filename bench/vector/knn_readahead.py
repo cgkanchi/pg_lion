@@ -31,9 +31,12 @@
 #   knn_readahead.py table FILE...   the results as markdown tables
 #
 # KNN_RA_CONFIGS (default main:main:on,off:branch:off,fadvise:branch:fadvise,
-# stream:branch:stream): label:library:pg_lion.vector_prefetch, each library
-# KNN_RA_SO_DIR/LIBRARY.so (default .local/so), copied over KNN_RA_INSTALL
-# (default pg_config's pkglibdir/pg_lion.so) before the restart that loads it.
+# stream:branch:stream): label:library:pg_lion.vector_prefetch[:direct], each
+# library KNN_RA_SO_DIR/LIBRARY.so (default .local/so), copied over
+# KNN_RA_INSTALL (default pg_config's pkglibdir/pg_lion.so) before the
+# restart that loads it; direct, where given, pg_lion.vector_toast_direct
+# (DESIGN.md §44.13: on reads the vectors in TOAST by their places, off as
+# before).
 # KNN_RA_STATES (default device,os,warm), KNN_RA_KINDS (default
 # u3,u8,f10,f3,f1,x1,x3; KINDS below), KNN_RA_NQ (default 10) queries a kind,
 # KNN_RA_WARM_REPS (default 3).  KNN_RESTART (default "./dev.sh restart") and
@@ -63,6 +66,8 @@ STREAMED = re.compile(r'(\d+) pages streamed \((\d+) read in\), (\d+) read apart
                       r'(?:, (\d+) restarts)?'
                       r'(?:, (\d+) heap pages prefetched \((\d+) not in shared buffers\))?')
 ASKED = re.compile(r'(\d+) pages prefetched \((\d+) not in shared buffers\)')
+PLACED = re.compile(r'(\d+) read by place \((\d+) locator pages, (\d+) not\), (\d+) checked'
+                    r'(?:, (\d+) TOAST pages prefetched \((\d+) not in shared buffers\))?')
 READ = re.compile(r'Buffers: shared[^\n]*?read=(\d+)')
 HIT = re.compile(r'Buffers: shared hit=(\d+)')
 IOWAIT = re.compile(r'I/O Timings: shared read=([\d.]+)')
@@ -73,9 +78,16 @@ def configs():
     spec = os.environ.get('KNN_RA_CONFIGS',
                           'main:main:on,off:branch:off,fadvise:branch:fadvise,stream:branch:stream')
     for c in spec.split(','):
-        label, lib, mode = c.split(':')
-        out.append(dict(label=label, lib=lib, mode=mode))
+        f = c.split(':')
+        out.append(dict(label=f[0], lib=f[1], mode=f[2], direct=f[3] if len(f) > 3 else None))
     return out
+
+
+def apply(conn, cfg):
+    # a configuration's settings, in a session of its library
+    conn.execute(f"SET pg_lion.vector_prefetch = {cfg['mode']}")
+    if cfg.get('direct'):
+        conn.execute(f"SET pg_lion.vector_toast_direct = {cfg['direct']}")
 
 
 SO_DIR = os.environ.get('KNN_RA_SO_DIR', os.path.join(K.REPO, '.local', 'so'))
@@ -115,16 +127,21 @@ def restart(lib, drop):
 
 
 def os_cache(conn):
-    # every relation the queries read, into the kernel's page cache
-    for rel in ('dbpedia', 'dbpedia_pkey', 'dbpedia_u', 'dbpedia_lv'):
+    # every relation the queries read, into the kernel's page cache: the
+    # table's, and its TOAST relation and that one's index
+    t = K.TABLE
+    for rel in (t, f'{t}_pkey', f'{t}_u', K.INDEXES['lionvec']):
         conn.execute(f"SELECT pg_prewarm('{rel}', 'read')")
+    toast = f"(SELECT reltoastrelid FROM pg_class WHERE relname = '{t}')"
+    conn.execute(f"SELECT pg_prewarm({toast}, 'read') WHERE {toast} <> 0")
+    conn.execute(f"SELECT pg_prewarm(indexrelid, 'read') FROM pg_index WHERE indrelid = {toast}")
 
 
 def prepare_session(conn, cfg, kind):
     sel, settings = KINDS[kind]
     K.cost_distances(conn)
     conn.execute('SET track_io_timing = on')
-    conn.execute(f"SET pg_lion.vector_prefetch = {cfg['mode']}")
+    apply(conn, cfg)
     for s in settings:
         conn.execute(s)
     return K.sql('lionvec', sel)
@@ -177,6 +194,11 @@ def measure(conn, query, q):
         g = K.EXACT.search(m)
         if g and 'partitions probed' not in m:
             row['members_fetched'] = int(g.group(1))
+        g = PLACED.search(m)
+        if g:
+            row.update(placed=int(g.group(1)), loc_pages=int(g.group(2)), place_failed=int(g.group(3)),
+                       checked=int(g.group(4)), toast_asked=int(g.group(5) or 0),
+                       toast_asked_missing=int(g.group(6) or 0))
     return row
 
 
@@ -187,7 +209,8 @@ def answer(conn, query, q):
 def summarize(rows, gt, kind):
     out = dict(n=len(rows))
     for k in ('ms', 'dev_kb', 'read', 'hit', 'io_ms', 'probes', 'pages', 'streamed', 'stream_read_in', 'apart',
-              'unread', 'restarts', 'heap_asked', 'heap_asked_missing', 'asked', 'asked_missing', 'members_fetched'):
+              'unread', 'restarts', 'heap_asked', 'heap_asked_missing', 'asked', 'asked_missing', 'members_fetched',
+              'placed', 'loc_pages', 'place_failed', 'checked', 'toast_asked', 'toast_asked_missing'):
         v = [r[k] for r in rows if k in r]
         if v:
             out[k + '_median'] = float(np.median(v))
@@ -261,17 +284,17 @@ def main(name):
                         K.prewarm(conn, K.INDEXES['lionvec'])
                         query = prepare_session(conn, group[0], kind)
                         for c in group:
-                            conn.execute(f"SET pg_lion.vector_prefetch = {c['mode']}")
+                            apply(conn, c)
                             for qi in range(nq):
                                 answer(conn, query, Q[qi])
                         for qi in range(nq):
                             rs = {c['label']: [] for c in group}
                             for _ in range(reps):
                                 for c in group:
-                                    conn.execute(f"SET pg_lion.vector_prefetch = {c['mode']}")
+                                    apply(conn, c)
                                     rs[c['label']].append(measure(conn, query, Q[qi]))
                             for c in group:
-                                conn.execute(f"SET pg_lion.vector_prefetch = {c['mode']}")
+                                apply(conn, c)
                                 r = dict(rs[c['label']][0])
                                 for k in ('ms', 'io_ms', 'read', 'dev_kb'):
                                     r[k] = float(np.median([x[k] for x in rs[c['label']]]))
