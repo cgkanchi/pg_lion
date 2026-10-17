@@ -327,6 +327,13 @@ extern bool lion_rmgr_registered(void);
 /* Register it; called from _PG_init while preloading (DESIGN.md §25). */
 extern void lion_wal_init(void);
 
+/*
+ * The WAL resource manager id reserved for pg_lion on the list the core
+ * documentation names (https://wiki.postgresql.org/wiki/CustomWALResourceManagers),
+ * and pg_lion.rmgr_id's default.
+ */
+#define LION_RMGR_ID			170
+
 /* The GUC behind pg_lion.rmgr_id, exposed for the stats/verify surface. */
 extern PGDLLIMPORT int lion_rmgr_id;
 
