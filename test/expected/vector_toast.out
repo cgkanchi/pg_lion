@@ -1074,6 +1074,9 @@ DROP TABLE tth;
 --    the column was PLAIN), vectors in TOAST - only those have an entry
 -- ---------------------------------------------------------------------
 CREATE TABLE ttm (id int, cat int, v vector(1536)) WITH (autovacuum_enabled = off);
+-- pglz whatever the server's default_toast_compression (lz4 on 19 built with
+-- it): lz4 also compresses rows 231 to 240, two copies of a half
+ALTER TABLE ttm ALTER COLUMN v SET COMPRESSION pglz;
 INSERT INTO ttm SELECT i, i % 20, tt_vec(i, 1536) FROM generate_series(1, 200) i;
 INSERT INTO ttm SELECT i, i % 20, NULL FROM generate_series(201, 210) i;
 INSERT INTO ttm SELECT i, i % 20, array_fill(0, ARRAY[1536])::real[]::vector
