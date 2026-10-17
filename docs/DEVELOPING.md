@@ -23,7 +23,8 @@ and by those specs on the newer majors, not by a test on that major.
     eval "$(./dev.sh env)"
     make PG_CONFIG=.local/pg/bin/pg_config installcheck   # regress files + isolation specs
     make unit PG_CONFIG=.local/pg/bin/pg_config           # containers, segments, positions, entry layout,
-                                                          # lionvec's arithmetic; no server
+                                                          # lionvec's arithmetic, the read stream ring;
+                                                          # no server
 
 No `-march` is needed for speed: on x86-64, GCC and clang builds carry AVX2 and POPCNT versions of
 the container library's passes over whole bitsets, and AVX-512 (VPOPCNTDQ), AVX2 and POPCNT ones of
@@ -167,4 +168,8 @@ the suite as they are in production.
                             exact distances
     src/lion_vec_math.[ch]  its rotation, bit-plane codes, kernels and error bounds, frontend-safe and
                             unit-tested standalone (test/unit/vec_test.c)
+    src/lion_readahead.[ch] reading a relation's blocks in an order its reader predicts: a read stream
+                            over the blocks it pushes (17 and later), asks of the kernel, or plain reads
+    src/lion_readahead_ring.[ch]  the read stream's bookkeeping: blocks pushed, given, held; frontend-safe
+                            and unit-tested standalone (test/unit/readahead_test.c)
     test/sql, test/isolation, test/unit, test/recovery, test/modules
