@@ -26,11 +26,15 @@ FUNCS_OBJS = src/lion_funcs.o src/lion_verify.o src/lion_verify_dir.o src/lion_v
 # (DESIGN.md §44): the AM, its scan, and its arithmetic, which is unit-tested
 # standalone.
 VEC_OBJS = src/lion_vec.o src/lion_vec_scan.o src/lion_vec_math.o
+# Reading a relation's blocks in an order its reader predicts: a read stream
+# over them from 17 on, asks of the kernel before (DESIGN.md §44.4, "Read
+# streams"); the ring's bookkeeping is unit-tested standalone.
+READAHEAD_OBJS = src/lion_readahead.o src/lion_readahead_ring.o
 OBJS = src/lion_container.o src/lion_sparse.o src/lion_positions.o src/lion_wal.o src/lion_waldelta.o $(PAGES_OBJS) src/lion_dir.o src/lion_posting.o src/lion_postree.o src/lion_posbuild.o src/lion_posfilter.o src/lion_bm25.o src/lion_bm25_scan.o src/lion_reader.o \
        src/lion_am.o src/lion_amcost.o src/lion_build.o src/lion_spool.o src/lion_scan.o \
        src/lion_insert.o src/lion_vacuum.o $(FUNCS_OBJS) $(COUNT_OBJS) $(CUSTOMSCAN_OBJS) \
        src/lion_multikey.o src/lion_jsonb.o src/lion_fkjoin.o src/lion_ordered.o src/lion_selfuncs.o \
-       src/lion_costs.o $(VEC_OBJS)
+       src/lion_costs.o $(VEC_OBJS) $(READAHEAD_OBJS)
 PGFILEDESC = "pg_lion - roaring bitmap inverted index"
 
 EXTENSION = pg_lion pg_lion_citext pg_lion_vector
@@ -65,7 +69,7 @@ src/lion_vec_math.o: override CFLAGS += $(VEC_MATH_CFLAGS)
 src/lion_vec_math.bc: override BITCODE_CFLAGS += $(VEC_MATH_CFLAGS)
 EXTRA_CLEAN = test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
               test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd \
-              test/results test/isolation/results
+              test/unit/readahead_test test/results test/isolation/results
 
 PG_CONFIG ?= $(if $(wildcard .local/pg/bin/pg_config),.local/pg/bin/pg_config,pg_config)
 PGXS := $(shell $(PG_CONFIG) --pgxs)
@@ -121,7 +125,8 @@ ifeq ($(SANITIZE),1)
 UNIT_CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
 UNIT_LDFLAGS += -fsanitize=address,undefined
 test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
-    test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd: .lion-force-unit
+    test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd \
+    test/unit/readahead_test: .lion-force-unit
 .PHONY: .lion-force-unit
 endif
 
@@ -163,9 +168,15 @@ test/unit/vec_test: test/unit/vec_test.c src/lion_vec_math.c src/lion_vec_math.h
 test/unit/vec_test_nosimd: test/unit/vec_test.c src/lion_vec_math.c src/lion_vec_math.h
 	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) $(UNIT_NOSIMD_CFLAGS) -o $@ test/unit/vec_test.c src/lion_vec_math.c $(UNIT_LDFLAGS)
 
+# The read stream ring's bookkeeping (DESIGN.md §44.4, "Read streams"),
+# against a model of core's read stream.
+test/unit/readahead_test: test/unit/readahead_test.c src/lion_readahead_ring.c src/lion_readahead_ring.h
+	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/readahead_test.c src/lion_readahead_ring.c $(UNIT_LDFLAGS)
+
 .PHONY: unit
 unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
-      test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd
+      test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd \
+      test/unit/readahead_test
 	./test/unit/container_test
 	./test/unit/container_test_nosimd
 	./test/unit/sparse_test
@@ -174,6 +185,7 @@ unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_
 	./test/unit/entry_test
 	./test/unit/vec_test
 	./test/unit/vec_test_nosimd
+	./test/unit/readahead_test
 
 # header deps (the PostgreSQL build we compile against was not configured with --enable-depend)
 # (every header lion.h includes, and each of the others' includers; a missing
@@ -192,6 +204,7 @@ $(FUNCS_OBJS): src/lion_funcs.h
 src/lion_build.o src/lion_spool.o: src/lion_spool.h
 src/lion_wal.o src/lion_waldelta.o: src/lion_waldelta.h
 $(VEC_OBJS) src/lion_am.o src/lion_ordered.o: src/lion_vec.h src/lion_vec_math.h
+$(READAHEAD_OBJS) src/lion_vec.o src/lion_vec_scan.o: src/lion_readahead.h src/lion_readahead_ring.h
 
 # Crash-recovery and hot-standby tests (test/recovery/README.md).  These need a
 # whole PostgreSQL *installation* to initdb their own private clusters into,

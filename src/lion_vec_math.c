@@ -1198,6 +1198,22 @@ lionvec_least(const double *key, int n, int m, int *idx)
 	return r;
 }
 
+void
+lionvec_least_order(const double *key, int *idx, int m)
+{
+	int			i;
+
+	for (i = 1; i < m; i++)
+	{
+		int			x = idx[i];
+		int			j;
+
+		for (j = i; j > 0 && lionvec_least_after(key, idx[j - 1], x); j--)
+			idx[j] = idx[j - 1];
+		idx[j] = x;
+	}
+}
+
 /* the SOAR cost of c, given r = x - c1 and |r|^2 */
 static double
 lionvec_soar_cost_r(const float *x, const float *c1, double r2, const float *c,
