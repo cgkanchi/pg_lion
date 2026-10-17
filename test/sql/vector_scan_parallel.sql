@@ -91,10 +91,12 @@ $$;
 
 /*
  * ps_cmp() runs q as planned under the settings in force, and as a sort (no
- * index scan, no parallel plan), and compares the distances in order, then
- * the rows with a distance (rows of equal distance may come in either order,
- * and from either participant), then the count of the rest (NULL vectors);
- * and says how the first plan scanned the vectors (ps_how()).  A row two
+ * index scan, no parallel plan, and pg_lion.vector_postfilter exact, which
+ * sorts a filter LionOrdered does not answer where the default, error, would
+ * fail the query), and compares the distances in order, then the rows with
+ * a distance (rows of equal distance may come in either order, and from
+ * either participant), then the count of the rest (NULL vectors); and says
+ * how the first plan scanned the vectors (ps_how()).  A row two
  * participants both returned would be a mismatch.
  */
 CREATE FUNCTION ps_cmp(q text) RETURNS text
@@ -110,7 +112,8 @@ DECLARE
 						  current_setting('enable_bitmapscan'),
 						  current_setting('enable_indexscan'),
 						  current_setting('enable_sort'),
-						  current_setting('max_parallel_workers_per_gather')];
+						  current_setting('max_parallel_workers_per_gather'),
+						  current_setting('pg_lion.vector_postfilter')];
 BEGIN
 	EXECUTE w INTO ad, ai;
 	PERFORM set_config('enable_seqscan', 'on', true);
@@ -118,12 +121,14 @@ BEGIN
 	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('enable_sort', 'on', true);
 	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+	PERFORM set_config('pg_lion.vector_postfilter', 'exact', true);
 	EXECUTE w INTO bd, bi;
 	PERFORM set_config('enable_seqscan', saved[1], true);
 	PERFORM set_config('enable_bitmapscan', saved[2], true);
 	PERFORM set_config('enable_indexscan', saved[3], true);
 	PERFORM set_config('enable_sort', saved[4], true);
 	PERFORM set_config('max_parallel_workers_per_gather', saved[5], true);
+	PERFORM set_config('pg_lion.vector_postfilter', saved[6], true);
 
 	IF ad IS DISTINCT FROM bd THEN
 		RETURN format('MISMATCH: %s rows, %s by the sort; distances %s / %s',
@@ -207,6 +212,12 @@ SET pg_lion.vector_epsilon = 6;
 SET pg_lion.vector_margin = 100;
 SET pg_lion.vector_patience = 0;
 
+-- pg_lion.vector_parallel_scan is off by default: even with parallel plans
+-- free, the index is scanned serially
+SHOW pg_lion.vector_parallel_scan;
+SELECT * FROM ps_plan('SELECT id FROM ps ORDER BY v <-> ps_vec(4, 24) LIMIT 10');
+SET pg_lion.vector_parallel_scan = on;
+
 -- the plan: a Gather Merge over a Parallel Index Scan of the operator's index
 SELECT * FROM ps_plan('SELECT id FROM ps ORDER BY v <-> ps_vec(4, 24) LIMIT 10');
 SELECT * FROM ps_plan('SELECT id, v <#> ps_vec(4, 24) AS d FROM ps ORDER BY v <#> ps_vec(4, 24) LIMIT 10');
@@ -288,11 +299,14 @@ SELECT op, k, ps_cmp(format('SELECT id, v %s ps_vec(4, 24)::halfvec AS d FROM ps
  ORDER BY op, k;
 DROP TABLE psh;
 
--- a filter.  Under pg_lion.vector_postfilter = exact, the default, no plan
--- filters the parallel scan's rows any more than the serial scan's: a
--- filter lion answers goes through LionOrdered, which is serial, and any
--- other gets a sort of its rows; their answers are the sort's
+-- a filter.  Under pg_lion.vector_postfilter error, the default, and exact
+-- no plan filters the parallel scan's rows any more than the serial scan's:
+-- a filter lion answers goes through LionOrdered, which is serial, and any
+-- other fails, the parallel scan being no way round it, or under exact gets
+-- a sort of its rows; their answers are the sort's
 SELECT * FROM ps_plan('SELECT id FROM ps WHERE cat = 3 ORDER BY v <-> ps_vec(4, 24) LIMIT 10');
+SELECT ps_how('SELECT id FROM ps WHERE id % 7 = 1 ORDER BY v <-> ps_vec(4, 24) LIMIT 10') AS plan;
+SET pg_lion.vector_postfilter = exact;
 SELECT ps_how('SELECT id FROM ps WHERE id % 7 = 1 ORDER BY v <-> ps_vec(4, 24) LIMIT 10') AS plan;
 SELECT f, ps_cmp(format('SELECT id, v <-> ps_vec(4, 24) AS d FROM ps WHERE %s
 						 ORDER BY v <-> ps_vec(4, 24) LIMIT 10', f)) AS result
@@ -416,6 +430,7 @@ SELECT op, avg(ps_recall(format('SELECT id FROM ps ORDER BY v %s %s LIMIT 10', o
 		  FROM generate_series(1, 20) s) c
  GROUP BY op ORDER BY op;
 
+RESET pg_lion.vector_parallel_scan;
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;

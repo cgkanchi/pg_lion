@@ -272,6 +272,7 @@ SELECT count(*) AS rows_after FROM rs;
 
 -- a parallel scan, at that margin, where the rows are the sort's whichever
 -- participant probes what
+SET pg_lion.vector_parallel_scan = on;
 SET max_parallel_workers_per_gather = 2;
 SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
@@ -288,6 +289,7 @@ RESET min_parallel_index_scan_size;
 RESET parallel_tuple_cost;
 RESET parallel_setup_cost;
 SET max_parallel_workers_per_gather = 0;
+RESET pg_lion.vector_parallel_scan;
 RESET pg_lion.vector_epsilon;
 RESET pg_lion.vector_patience;
 RESET pg_lion.vector_margin;
