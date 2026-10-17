@@ -529,10 +529,11 @@ queues, and under a small filter every matching row - as many ahead as the table
 `pg_lion.vector_margin = 8` took 32 ms rather than 49, and at the default margin 17 rather than 21.
 Table rows are asked for only where their vectors lie in the table's pages: pgvector stores a
 vector of more than 506 dimensions (a `halfvec` of more than 1,012) in TOAST, which reading the
-row's page ahead does not reach, unless the column is set so:
+row's page ahead does not reach, unless the column or the table is set so:
 
 ```sql
 ALTER TABLE items ALTER embedding SET STORAGE PLAIN;  -- new rows; existing ones once rewritten
+ALTER TABLE items SET (toast_tuple_target = 8160);    -- the same: rows up to 8160 bytes stay whole
 ```
 
 With the vectors in the table so, a 1% filter answered exactly, from every matching row's vector,
