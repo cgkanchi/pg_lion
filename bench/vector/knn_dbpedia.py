@@ -708,8 +708,14 @@ def exact(name):
     off = ['SET pg_lion.vector_exact_rows = 0'] + \
         (['SET pg_lion.vector_exact_per_partition = 0']
          if has_setting(conn, 'pg_lion.vector_exact_per_partition') else [])
+    # the planner's sort of the filter's rows, which without LionOrdered is
+    # an error unless pg_lion.vector_postfilter is exact (the default before
+    # 2026-10-17, and a build without the setting's only way)
+    sort = ['SET pg_lion.enable_ordered_scan = off', 'SET enable_indexscan = off'] + \
+        (['SET pg_lion.vector_postfilter = exact']
+         if has_setting(conn, 'pg_lion.vector_postfilter') else [])
     configs = ([('exact LionOrdered', [f'SET pg_lion.vector_exact_rows = {every}'] + lo),
-                ('planner exact sort', ['SET pg_lion.enable_ordered_scan = off', 'SET enable_indexscan = off'])] +
+                ('planner exact sort', sort)] +
                [(f'LionOrdered margin={mg}', [f'SET pg_lion.vector_margin = {mg}'] + off + lo) for mg in margins] +
                [('planner plan margin=3', ['SET pg_lion.vector_margin = 3'])])
     meta = dict(name=name, table=TABLE, column=coltype(), index=idx, partitions=nparts, run=provenance(),

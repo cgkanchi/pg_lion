@@ -33,10 +33,11 @@ $$;
 
 /*
  * vl_run() runs q - which returns a column id - through the node, with the
- * vector scan's DEBUG1 line, and through a sequential scan and sort, and
- * says how many of the sort's rows the node returned.  A prepared
- * statement's cached plan does not change with the settings, so for one the
- * sort's rows come from the query it stands for.
+ * vector scan's DEBUG1 line, and through a sequential scan and sort (the
+ * node off, and pg_lion.vector_postfilter exact), and says how many of the
+ * sort's rows the node returned.  A prepared statement's cached plan does
+ * not change with the settings, so for one the sort's rows come from the
+ * query it stands for.
  */
 CREATE FUNCTION vl_run(q text, ordinary text DEFAULT NULL) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -46,6 +47,7 @@ DECLARE
 	r record;
 	ln text;
 	used boolean := false;
+	postfilter text := current_setting('pg_lion.vector_postfilter');
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
@@ -62,9 +64,11 @@ BEGIN
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_sort', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	PERFORM set_config('pg_lion.vector_postfilter', 'exact', true);
 	FOR r IN EXECUTE coalesce(ordinary, q) LOOP
 		b := b || r.id;
 	END LOOP;
+	PERFORM set_config('pg_lion.vector_postfilter', postfilter, true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);

@@ -458,30 +458,21 @@ partitions it reads, so the `LIMIT` is filled from the matching rows whatever th
 table; `Heap Fetches` in `EXPLAIN ANALYZE` counts the rows the node fetched, about `k`. A set of up
 to `pg_lion.vector_exact_rows` rows (2,000), or to `pg_lion.vector_exact_per_partition` (1.5) rows
 for each of the index's partitions if that is more, is answered exactly, from every member's
-distance; a larger one by reading
-partitions as above, its patience counted in matching rows. Where a large share of the rows pass
-the filter (3% of a million or more, here) the planner prefers the plain index scan with a
-`Filter`, and for a filter of a few thousand rows a sort of the Lion bitmap scan's rows. With the
-distance functions left at pgvector's cost of 1 it may choose that sort between the two as well,
-where the node is several times faster (pgvector's vectors are stored out of line, so the planner
-sees a small column and a nearly free function); it did on the benchmark until scans paused, and
-the `ALTER FUNCTION`s above keep it from doing so. `pg_dump` does not keep them, so run them again
-to `pg_lion.vector_exact_rows` rows (2,000) is answered exactly, from every member's distance; a
-larger one by reading
-partitions as above, its patience counted in matching rows. For a filter of a few thousand rows
-the planner prefers a sort of the Lion bitmap scan's rows, which is exact. With the distance
-functions left at pgvector's cost of 1 it may choose that sort for larger filters as well, where
-the node is several times faster (pgvector's vectors are stored out of line, so the planner sees a
-small column and a nearly free function); it did on the benchmark until scans paused, and the
-`ALTER FUNCTION`s above keep it from doing so. `pg_dump` does not keep them, so run them again
-after a restore; `SET enable_sort = off` steers a single query the same way.
+distance; a larger one by reading partitions as above, its patience counted in matching rows. For
+a filter of a few thousand rows the planner prefers a sort of the Lion bitmap scan's rows, which is
+exact. With the distance functions left at pgvector's cost of 1 it may choose that sort for larger
+filters as well, where the node is several times faster (pgvector's vectors are stored out of line,
+so the planner sees a small column and a nearly free function); it did on the benchmark until
+scans paused, and the `ALTER FUNCTION`s above keep it from doing so. `pg_dump` does not keep them,
+so run them again after a restore; `SET enable_sort = off` steers a single query the same way.
 
 A `WHERE` clause no Lion index answers is never applied to the rows the `lionvec` scan returns: the
 scan pauses, and skips rows it finds too late, by the rows it has returned, so filtering them
 afterwards would find other rows than the node does at the same settings, and the plan would decide
-the answer (DESIGN.md §44.6, "Post-filtering"). Such a query is sorted instead, exactly, which reads
-every row that passes the filter; for an approximate answer, filter the nearest rows of a subquery
-(the planner does not push the outer `WHERE` past its `LIMIT`):
+the answer (DESIGN.md §44.6, "Post-filtering"). By default such a query fails when it is planned,
+`EXPLAIN` included, with an error that names the clauses no Lion index answers and suggests asking
+for the approximate answer in so many words: filter the nearest rows of a subquery (the planner
+does not push the outer `WHERE` past its `LIMIT`):
 
 ```sql
 SELECT id FROM (SELECT id, title, embedding <=> $1 AS d FROM items WHERE category = 3
@@ -489,11 +480,20 @@ SELECT id FROM (SELECT id, title, embedding <=> $1 AS d FROM items WHERE categor
  WHERE title LIKE 'A%' ORDER BY d LIMIT 10;
 ```
 
-`SET pg_lion.vector_postfilter = error` makes such a query fail instead of being sorted, with that
-suggestion, and `allow` plans as before this rule, the scan with a `Filter` among the plans.
-`pg_lion.enable_ordered_scan = off` takes the node away, and a filtered query is then sorted. An
-HNSW index on the same column is chosen over `lionvec` for nearly every query, filtered or not:
-pgvector prices its scan as nearly free.
+Every clause counts, `id = 5` as much as `title LIKE 'A%'`; only one the planner tests once
+(`WHERE $1`, `WHERE current_user = 'app'`), one a partial `lionvec` index's predicate implies, and
+one of the vector column alone (`embedding IS NOT NULL`, a distance bound
+`embedding <=> $1 < 0.3`), is no filter. The last filters the scan's rows, harmlessly: the NULL
+vectors come last in its order, and a bound rejects rows by the distance it orders them by, so the
+rows before them are the same. A bound few rows pass leaves the `LIMIT` unfilled, and the scan then
+reads to its end. `SET pg_lion.vector_postfilter = exact` plans a filtered query exactly instead, as a sort of the rows that pass the filter, which reads every one of them
+(`WHERE id = 5 ORDER BY embedding <=> $1 LIMIT 1` sorts the one row the primary key finds), and
+`allow` plans as before this rule, the scan with a `Filter` among the plans. `lionvec` does not
+support row-level security: it builds no index on a table that has it enabled, or on a partition of
+one, and a query such an index could order fails, whoever runs it. `pg_lion.enable_ordered_scan = off`
+takes the node away, and a filtered query then fails, or under `exact` is sorted. An HNSW index on
+the same column is chosen over `lionvec` for nearly every query, filtered or not: pgvector prices
+its scan as nearly free.
 
 What a scan did is in its `DEBUG1` line (`SET client_min_messages = debug1`). On those 975,000
 embeddings, in 1,974 partitions, one query without a filter and then under one keeping 1% of the
@@ -522,25 +522,34 @@ bound failed), which costs that row and nothing else. A filter answered exactly
 returned` instead. `pg_lion.vector_margin` and `pg_lion.vector_patience` read more partitions or fewer, and
 `pg_lion.vector_epsilon` widens or narrows the bounds (DESIGN.md §44.8).
 
-A scan asks for the pages it will read next before it reads them - the rest of a partition's code
-pages, which the build wrote one after another, the refine pages and table rows at the front of its
-queues, and under a small filter every matching row - as many ahead as the tablespace's
-`effective_io_concurrency`, up to 64 (`pg_lion.vector_prefetch`, on by default; DESIGN.md §44.4,
-"Prefetch"). It never changes an answer. It matters when the index is not in memory: on DBpedia's
-115,386 embeddings, each query alone after a restart with the page cache dropped, a scan at
-`pg_lion.vector_margin = 8` took 32 ms rather than 49, and at the default margin 17 rather than 21.
-Table rows are asked for only where their vectors lie in the table's pages: pgvector stores a
-vector of more than 506 dimensions (a `halfvec` of more than 1,012) in TOAST, which reading the
-row's page ahead does not reach, unless the column is set so:
+A scan reads ahead the pages it will read next - the rest of a partition's code pages, which the
+build wrote one after another, the partitions it expects to probe next, the refine pages and table
+rows at the front of its queues, and under a small filter every matching row - as many ahead as the
+tablespace's `effective_io_concurrency`, up to 64 (`pg_lion.vector_prefetch`; DESIGN.md §44.4,
+"Prefetch" and "Read streams"). From PostgreSQL 17 it reads them through read streams into shared
+buffers (`stream`, the default there); on 16, or under `fadvise`, it asks the kernel for them. It
+never changes an answer. It matters when the index is not in memory: on DBpedia's 115,186
+embeddings under PostgreSQL 18, each query alone after a restart with the page cache dropped, a
+scan at `pg_lion.vector_margin = 8` took 43 ms streaming, 48 asking the kernel and 67 with neither.
+Table rows are read ahead only where their vectors lie in the table's pages: pgvector stores a
+vector of more than 506 dimensions (a `halfvec` of more than 1,012) in TOAST, which no setting reads
+ahead, unless the column or the table is set so:
 
 ```sql
 ALTER TABLE items ALTER embedding SET STORAGE PLAIN;  -- new rows; existing ones once rewritten
+ALTER TABLE items SET (toast_tuple_target = 8160);    -- the same: rows up to 8160 bytes stay whole
 ```
 
 With the vectors in the table so, a 1% filter answered exactly, from every matching row's vector,
-took 33 ms cold rather than 71. In shared buffers prefetch costs about 2% (2.33 ms rather than
-2.29 at the default margin, 5.0 rather than 4.9 at 8): a scan whose asks keep finding their pages
-there mostly stops asking. `SET pg_lion.vector_prefetch = off` turns it off altogether.
+took 53 ms cold streaming, 59 asking the kernel and 108 with neither. Streaming costs more where the
+pages come from the operating system's cache rather than the disk: PostgreSQL 18 hands each streamed
+read to an I/O worker (`io_method = worker`, the default) or a kernel thread (`io_uring`), where
+reading one page at a time copies it in the backend, and a scan whose index the operating system
+holds but shared buffers do not took up to 40% longer streaming than asking the kernel, and an exact
+answer under `io_uring` up to twice as long. Set `pg_lion.vector_prefetch = fadvise` for an index
+that lives there. In shared buffers streaming costs 2 to 11% and asking the kernel under 5%: a scan
+whose reads keep finding their pages there mostly stops reading ahead.
+`SET pg_lion.vector_prefetch = off` turns it off altogether.
 
 With `pg_lion.vector_parallel_scan` on (it is off by default), an unfiltered `ORDER BY embedding
 <=> $1 LIMIT k` can run in parallel: a Gather Merge over a Parallel Index Scan, each process probing
@@ -570,8 +579,9 @@ four 3.7 times, finding a little more of the nearest rows for it (on DBpedia at 
 workers take about 10 ms to start, and they run on into their queues after the `LIMIT` has its
 rows. On DBpedia in memory the serial scan took 2.4 ms and the parallel ones 12 and 16; each
 query alone cold, 17 ms and 28 with two processes. A filtered query stays serial: `LionOrdered`,
-which a filter that lion indexes answer goes through, has no parallel plan, and under `pg_lion.vector_postfilter = exact`
-(the default) no plan filters a parallel scan's rows either; under `allow` a parallel scan with a
-`Filter` is among the plans. Each process sends its own `DEBUG1` line, ending with the partitions
-another process probed and, in an index that spills, the rows another returned; with prefetch, the
-pages it asked for and how many of them were not in shared buffers.
+which a filter that lion indexes answer goes through, has no parallel plan, and under
+`pg_lion.vector_postfilter` `error`, the default, or `exact` no plan filters a parallel scan's rows
+either; under `allow` a parallel scan with a `Filter` is among the plans. Each process sends its
+own `DEBUG1` line, ending with the partitions another process probed and, in an index that spills,
+the rows another returned; reading ahead, what its streams read, or the pages it asked for and how
+many of them were not in shared buffers.

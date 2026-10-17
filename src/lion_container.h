@@ -425,6 +425,20 @@ extern uint32 lion_container_mark_members(const LionContainer *c,
 										  uint64 *marks);
 
 /*
+ * dest = c[0] OR ... OR c[n - 1] of one container key, optimized, by merging
+ * their members instead of ORing them into a bitset image (LionOrdered's
+ * merge of a key's pieces, DESIGN.md §30.4, "Merging the pieces"): what the
+ * image would have made, byte for byte, without the image's fixed 4 KB
+ * passes.  Returns false, with dest unspecified, when the containers yield
+ * more than LION_ARRAY_MAX_CARD values together, repeats counted, which only
+ * the header of a damaged one can hide from a caller that summed their
+ * cardinalities.  dest (capacity LION_CONTAINER_MAX_SIZE) overlaps none of
+ * c, which may come off pages and are taken as iterate() takes them.
+ */
+extern bool lion_container_or_merge(const LionContainer *const *c, uint32 n,
+									uint32 ckey, LionContainer *dest);
+
+/*
  * Which of the LION_BLOCKS_PER_CONTAINER heap blocks the container covers
  * hold a member: bit b for the block of lo values b << LION_OFFSET_BITS ..
  * ((b + 1) << LION_OFFSET_BITS) - 1, which is the count engine's

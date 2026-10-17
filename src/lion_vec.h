@@ -337,10 +337,9 @@ typedef enum LionVecOverflow
  */
 typedef enum LionVecPostfilter
 {
-	LIONVEC_POSTFILTER_EXACT,	/* no such plan: LionOrdered, or an exact one
-								 * (the default) */
+	LIONVEC_POSTFILTER_EXACT,	/* no such plan: LionOrdered, or an exact one */
 	LIONVEC_POSTFILTER_ERROR,	/* ... and a query left without LionOrdered
-								 * fails at plan time */
+								 * fails at plan time (the default) */
 	LIONVEC_POSTFILTER_ALLOW	/* the plain scan and its Filter compete on
 								 * cost, as before 2026-10-16 */
 } LionVecPostfilter;
@@ -362,7 +361,7 @@ extern int	lionvec_exact_rows;
 extern double lionvec_exact_per_part;
 extern int	lionvec_overflow;
 extern int	lionvec_postfilter;
-extern bool lionvec_prefetch;
+extern int	lionvec_prefetch;	/* LION_READAHEAD_* (lion_readahead.h) */
 extern bool lionvec_parallel_scan;
 
 /*
@@ -379,6 +378,7 @@ lionvec_distance_type_ok(Oid type)
 
 /* lion_vec.c */
 extern void lion_vec_init(void);
+extern void lionvec_refuse_rls(Oid relid, const char *index);
 extern double lionvec_exact_limit(double nparts);
 extern LionVecInfo *lionvec_get_info(Relation index);
 extern const float *lionvec_datum_floats(Datum d, bool half, float *buf,
