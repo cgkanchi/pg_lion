@@ -2144,10 +2144,10 @@ lion_build_index_state(Relation index, LionIndexState *ix, MemoryContext cxt)
 	meta.container_bits = LION_CONTAINER_BITS;
 	meta.inline_limit = inline_limit;
 	meta.root = InvalidBlockNumber;
-	if (opts != NULL && opts->store_positions)
+	if (opts == NULL || opts->store_positions != LION_POSOPT_OFF)
 		meta.order_flags |= LION_META_POSITIONS;
 	lion_fill_index_state(index, ix, &meta, cxt);
-	lion_check_store_positions(index, ix);
+	lion_settle_store_positions(index, ix);
 
 	return inline_limit;
 }

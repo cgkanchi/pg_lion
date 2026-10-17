@@ -5332,9 +5332,16 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     rechecks unless an element has a prefix lexeme.  The count takes a multi-key operator over a
     literal array (`tsv @@ ANY`) as the OR of one clause per element
     (`lion_multikey_any_as_or()`, §19), so an element the sets only bound is decided from the
-    positions there as under any OR.  An index stores them when built `WITH (store_positions = true)` over a column whose opclass has
-    support function 5 (`tsvector_ops`); the build records that on the meta page (`LION_META_POSITIONS`
-    in `order_flags`), so `ALTER INDEX` changes nothing until a `REINDEX` (docs/REFERENCE.md, "Reloptions").
+    positions there as under any OR.  An index stores them for every key column whose opclass has
+    support function 5 (`tsvector_ops`) unless it is built `WITH (store_positions = off)`: the
+    reloption is an enum, `auto` (the default), `on` or `off`, with `true` and `false` kept as `on`
+    and `off` from when it was a boolean defaulting to off.  `auto` is GIN's choice - a tsvector
+    index keeps its positions without being asked, at about twice the size, so that phrases,
+    weights, NOTs and BM25 are answered from it - and an index with no such column builds without
+    them, where `on` is an ERROR (`lion_settle_store_positions()`).  The build records what it did
+    on the meta page (`LION_META_POSITIONS` in `order_flags`, set only on an index that has a
+    column storing them; no format change), so `ALTER INDEX` changes nothing until a `REINDEX`
+    (docs/REFERENCE.md, "Reloptions").
 
 ### Ranking: BM25 from the index (2026-10-07)
 
@@ -19925,6 +19932,10 @@ differences printed; what declines; and EXECUTE on a function an expression call
 
 A multi-key opclass (§17) for jsonb that answers `@>`, `?`, `?|` and `?&` with the rows a
 sequential scan and GIN return, from the posting sets alone wherever the keys make that exact.
+It is the DEFAULT for jsonb, as GIN's `jsonb_ops` is GIN's: `USING lion (doc)` is this class.
+Lion's own `jsonb_ops` - whole documents under `=` and the ranges, btree's meaning of the name -
+is kept beside it, not the default, for an index that answers `=`, the ranges and
+`count(DISTINCT doc)`, which a multi-key column cannot (§17).
 Strategies 11 .. 14 are its operators; it names its own extractValue and extractQuery
 (`lion_jsonb_extract_value()`, `lion_jsonb_extract_query()`), which take lion's strategy numbers
 (`lion_gin_strategy()` passes them through). STORAGE is bytea with `byteacmp` as the ordering, so

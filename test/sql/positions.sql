@@ -466,14 +466,17 @@ END $$;
 DROP FUNCTION pos_or_count(text);
 DROP TABLE pos_grouped, pos_dim;
 
--- store_positions is off by default, read at build time only and recorded
--- on the meta page: ALTER INDEX changes nothing until a REINDEX.
+-- store_positions is "auto" by default (below), and read at build time only
+-- and recorded on the meta page: ALTER INDEX changes nothing until a
+-- REINDEX.  An explicit "on" (or true) on an index none of whose columns can
+-- store positions is an ERROR.
 CREATE TABLE pos_opt (id int, d tsvector) WITH (autovacuum_enabled = off);
 INSERT INTO pos_opt
 SELECT i, to_tsvector('simple', 'a b c ' || (i % 7)) FROM generate_series(1, 500) i;
-CREATE INDEX pos_opt_d ON pos_opt USING lion (d);
+CREATE INDEX pos_opt_d ON pos_opt USING lion (d) WITH (store_positions = off);
 SELECT count(*) FROM lion_debug_key_positions('pos_opt_d', 'a');
 CREATE INDEX pos_opt_id ON pos_opt USING lion (id) WITH (store_positions = true);
+CREATE INDEX pos_opt_id ON pos_opt USING lion (id) WITH (store_positions = on);
 ALTER INDEX pos_opt_d SET (store_positions = true);
 INSERT INTO pos_opt VALUES (501, to_tsvector('simple', 'a b'));
 SELECT count(*) FROM lion_debug_key_positions('pos_opt_d', 'a');
@@ -493,8 +496,114 @@ SELECT count(*) FROM lion_debug_key_positions('pos_opt_d', 'a');
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM pos_opt WHERE d @@ 'a <-> b' OR d @@ 'b <-> c';
 SELECT count(*) FROM pos_opt WHERE d @@ 'a <-> b' OR d @@ 'b <-> c';
+-- RESET is the default, "auto", which the next REINDEX stores them under
+ALTER INDEX pos_opt_d RESET (store_positions);
+SELECT count(*) FROM lion_debug_key_positions('pos_opt_d', 'a');
+REINDEX INDEX pos_opt_d;
+SELECT count(*) FROM lion_debug_key_positions('pos_opt_d', 'a');
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM pos_opt WHERE d @@ 'a <-> b' OR d @@ 'b <-> c';
+SELECT count(*) FROM pos_opt WHERE d @@ 'a <-> b' OR d @@ 'b <-> c';
 RESET enable_seqscan;
 DROP TABLE pos_opt;
+
+-- The default, store_positions = auto: positions for an index with a key
+-- column whose opclass can store them (support function 5, tsvector_ops),
+-- as GIN keeps them, and none, with no ERROR, for an index without one.
+-- The meta page records what the build did: LION_META_POSITIONS is 2 in
+-- order_flags, at +36 past the 24-byte page header (narrow.sql reads the
+-- same word), and of an unlogged index's init fork, which ambuildempty
+-- writes, as much as of its main fork.
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+CREATE FUNCTION pos_meta(idx regclass, fork text) RETURNS text LANGUAGE sql AS $$
+	SELECT CASE WHEN get_byte(p, 60) & 2 <> 0 THEN 'positions' ELSE 'none' END
+	  FROM get_raw_page(idx::text, fork, 0) p
+$$;
+CREATE TABLE pos_def (id int, d tsvector) WITH (autovacuum_enabled = off);
+INSERT INTO pos_def
+SELECT i, setweight(to_tsvector('simple', 'w' || (i % 7)),
+					CASE WHEN i % 5 = 0 THEN 'A' ELSE 'D' END::"char") ||
+		  to_tsvector('simple', 'x' || (i % 11) || ' common')
+  FROM generate_series(1, 7000) i;
+CREATE INDEX pos_def_d ON pos_def USING lion (d);
+CREATE INDEX pos_def_auto ON pos_def USING lion (d) WITH (store_positions = auto);
+CREATE INDEX pos_def_on ON pos_def USING lion (d) WITH (store_positions = on);
+CREATE INDEX pos_def_bare ON pos_def USING lion (d) WITH (store_positions);
+CREATE INDEX pos_def_off ON pos_def USING lion (d) WITH (store_positions = off);
+CREATE INDEX pos_def_false ON pos_def USING lion (d) WITH (store_positions = false);
+CREATE INDEX pos_def_id ON pos_def USING lion (id);
+CREATE INDEX pos_def_id_auto ON pos_def USING lion (id) WITH (store_positions = auto);
+CREATE INDEX pos_def_id_off ON pos_def USING lion (id) WITH (store_positions = off);
+CREATE INDEX pos_def_id_d ON pos_def USING lion (id, d);
+CREATE INDEX pos_def_bad ON pos_def USING lion (d) WITH (store_positions = maybe);
+SELECT c.relname, c.reloptions, pos_meta(c.oid, 'main') AS meta
+  FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+ WHERE i.indrelid = 'pos_def'::regclass ORDER BY 1;
+SELECT count(*) FROM lion_debug_key_positions('pos_def_d', 'common');
+SELECT lion_index_verify(c.oid, true)
+  FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+ WHERE i.indrelid = 'pos_def'::regclass ORDER BY c.relname;
+CREATE UNLOGGED TABLE pos_unl (id int, d tsvector);
+CREATE INDEX pos_unl_d ON pos_unl USING lion (d);
+CREATE INDEX pos_unl_d_off ON pos_unl USING lion (d) WITH (store_positions = off);
+CREATE INDEX pos_unl_id ON pos_unl USING lion (id);
+CREATE INDEX pos_unl_id_d ON pos_unl USING lion (id, d);
+CREATE INDEX pos_unl_id_on ON pos_unl USING lion (id) WITH (store_positions = on);
+SELECT c.relname, pos_meta(c.oid, 'main') AS main, pos_meta(c.oid, 'init') AS init
+  FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+ WHERE i.indrelid = 'pos_unl'::regclass ORDER BY 1;
+DROP TABLE pos_unl;
+-- BM25 needs nothing named: the default index ranks, one WITH
+-- (store_positions = off) cannot
+DROP INDEX pos_def_auto, pos_def_on, pos_def_bare, pos_def_false,
+		   pos_def_id, pos_def_id_auto, pos_def_id_off, pos_def_id_d;
+VACUUM (FREEZE, ANALYZE) pos_def;
+SELECT count(*) AS ranked FROM lion_bm25('pos_def_d', 'w1 | x1', 10);
+SELECT count(*) FROM lion_bm25('pos_def_off', 'w1 | x1', 10);
+-- With only the default index on the table, a phrase, a weight and a NOT
+-- are answered from it without the heap: the bitmap heap scan rechecks
+-- nothing, and the count takes its rows from the positions.  The index
+-- WITH (store_positions = off), alone, rechecks them in the heap.
+CREATE FUNCTION pos_def_explain(q tsquery) RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	SET LOCAL enable_seqscan = off;
+	SET LOCAL enable_indexscan = off;
+	FOR l IN EXECUTE format('EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) '
+							'SELECT id FROM pos_def WHERE d @@ %L', q) LOOP
+		IF l ~ '(Scan|Removed by Index Recheck)' THEN
+			RETURN NEXT regexp_replace(l, ' \(actual .*\)$', '');
+		END IF;
+	END LOOP;
+	SET LOCAL enable_bitmapscan = off;
+	SET LOCAL enable_indexscan = on;
+	FOR l IN EXECUTE format('EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) '
+							'SELECT count(*) FROM pos_def WHERE d @@ %L', q) LOOP
+		IF l ~ '(Custom Scan|Lion Indexes|Heap TIDs Rechecked|Position|Removed)' THEN
+			RETURN NEXT regexp_replace(l, ' \(actual .*\)$', '');
+		END IF;
+	END LOOP;
+END $$;
+CREATE TEMP TABLE pos_def_q (q tsquery);
+INSERT INTO pos_def_q VALUES ('w1 <-> x1'), ('x1 <-> w1'), ('w1:A'), ('w1 & !x1');
+DROP INDEX pos_def_off;
+SELECT q, pos_def_explain(q) FROM pos_def_q;
+SET enable_seqscan = off;
+CREATE TEMP TABLE pos_def_n AS
+SELECT q::text, (SELECT count(*) FROM pos_def WHERE d @@ q) AS by_positions FROM pos_def_q;
+DROP INDEX pos_def_d;
+CREATE INDEX pos_def_off ON pos_def USING lion (d) WITH (store_positions = off);
+SELECT q, pos_def_explain(q) FROM pos_def_q;
+-- the same rows either way, and a sequential scan's
+SELECT q, n.by_positions,
+	   (SELECT count(*) FROM pos_def WHERE d @@ q::tsquery) AS by_recheck,
+	   (SELECT count(*) FROM pos_def WHERE (d::text || '')::tsvector @@ q::tsquery) AS heap
+  FROM pos_def_n n ORDER BY 1;
+RESET enable_seqscan;
+DROP FUNCTION pos_def_explain(tsquery);
+DROP FUNCTION pos_meta(regclass, text);
+DROP TABLE pos_def;
 
 DROP TABLE pos_docs CASCADE;
 DROP FUNCTION lion_debug_key_positions(regclass, text);
