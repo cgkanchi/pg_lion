@@ -522,25 +522,34 @@ bound failed), which costs that row and nothing else. A filter answered exactly
 returned` instead. `pg_lion.vector_margin` and `pg_lion.vector_patience` read more partitions or fewer, and
 `pg_lion.vector_epsilon` widens or narrows the bounds (DESIGN.md §44.8).
 
-A scan asks for the pages it will read next before it reads them - the rest of a partition's code
-pages, which the build wrote one after another, the refine pages and table rows at the front of its
-queues, and under a small filter every matching row - as many ahead as the tablespace's
-`effective_io_concurrency`, up to 64 (`pg_lion.vector_prefetch`, on by default; DESIGN.md §44.4,
-"Prefetch"). It never changes an answer. It matters when the index is not in memory: on DBpedia's
-115,386 embeddings, each query alone after a restart with the page cache dropped, a scan at
-`pg_lion.vector_margin = 8` took 32 ms rather than 49, and at the default margin 17 rather than 21.
-Table rows are asked for only where their vectors lie in the table's pages: pgvector stores a
-vector of more than 506 dimensions (a `halfvec` of more than 1,012) in TOAST, which reading the
-row's page ahead does not reach, unless the column is set so:
+A scan reads ahead the pages it will read next - the rest of a partition's code pages, which the
+build wrote one after another, the partitions it expects to probe next, the refine pages and table
+rows at the front of its queues, and under a small filter every matching row - as many ahead as the
+tablespace's `effective_io_concurrency`, up to 64 (`pg_lion.vector_prefetch`; DESIGN.md §44.4,
+"Prefetch" and "Read streams"). From PostgreSQL 17 it reads them through read streams into shared
+buffers (`stream`, the default there); on 16, or under `fadvise`, it asks the kernel for them. It
+never changes an answer. It matters when the index is not in memory: on DBpedia's 115,186
+embeddings under PostgreSQL 18, each query alone after a restart with the page cache dropped, a
+scan at `pg_lion.vector_margin = 8` took 43 ms streaming, 48 asking the kernel and 67 with neither.
+Table rows are read ahead only where their vectors lie in the table's pages: pgvector stores a
+vector of more than 506 dimensions (a `halfvec` of more than 1,012) in TOAST, which no setting reads
+ahead, unless the column or the table is set so:
 
 ```sql
 ALTER TABLE items ALTER embedding SET STORAGE PLAIN;  -- new rows; existing ones once rewritten
+ALTER TABLE items SET (toast_tuple_target = 8160);    -- the same: rows up to 8160 bytes stay whole
 ```
 
 With the vectors in the table so, a 1% filter answered exactly, from every matching row's vector,
-took 33 ms cold rather than 71. In shared buffers prefetch costs about 2% (2.33 ms rather than
-2.29 at the default margin, 5.0 rather than 4.9 at 8): a scan whose asks keep finding their pages
-there mostly stops asking. `SET pg_lion.vector_prefetch = off` turns it off altogether.
+took 53 ms cold streaming, 59 asking the kernel and 108 with neither. Streaming costs more where the
+pages come from the operating system's cache rather than the disk: PostgreSQL 18 hands each streamed
+read to an I/O worker (`io_method = worker`, the default) or a kernel thread (`io_uring`), where
+reading one page at a time copies it in the backend, and a scan whose index the operating system
+holds but shared buffers do not took up to 40% longer streaming than asking the kernel, and an exact
+answer under `io_uring` up to twice as long. Set `pg_lion.vector_prefetch = fadvise` for an index
+that lives there. In shared buffers streaming costs 2 to 11% and asking the kernel under 5%: a scan
+whose reads keep finding their pages there mostly stops reading ahead.
+`SET pg_lion.vector_prefetch = off` turns it off altogether.
 
 An unfiltered `ORDER BY embedding <=> $1 LIMIT k` can run in parallel: a Gather Merge over a
 Parallel Index Scan, each process probing the partitions it reaches first and returning their rows
@@ -572,5 +581,5 @@ query alone cold, 17 ms and 28 with two processes. A filtered query stays serial
 which a filter that lion indexes answer goes through, has no parallel plan, and under `pg_lion.vector_postfilter = exact`
 (the default) no plan filters a parallel scan's rows either; under `allow` a parallel scan with a
 `Filter` is among the plans. Each process sends its own `DEBUG1` line, ending with the partitions
-another process probed and, in an index that spills, the rows another returned; with prefetch, the
-pages it asked for and how many of them were not in shared buffers.
+another process probed and, in an index that spills, the rows another returned; reading ahead, what
+its streams read, or the pages it asked for and how many of them were not in shared buffers.
