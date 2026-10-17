@@ -4,10 +4,14 @@
 -- returns; a Filter above it rejects most of those afterwards, so the plain
 -- scan with a Filter and LionOrdered's restricted scan answer the same query
 -- with different rows at the same margin and patience.  The plan must not
--- decide the answer.  At the default, exact, a filter lion indexes answer
--- goes through LionOrdered, and any other gets an exact plan (a sort of the
--- filter's rows); error fails such a query at plan time instead, and allow
--- lets the plain scan with its Filter compete, as before.
+-- decide the answer.  Under exact and under error, the default, a filter
+-- lion indexes answer goes through LionOrdered; any other fails at plan time
+-- under error, with a hint that names the subquery and the settings, and
+-- under exact gets an exact plan (a sort of the filter's rows); allow lets
+-- the plain scan with its Filter compete, as before.  A clause of the vector
+-- column alone (v IS NOT NULL, a distance bound) is the scan's own, and
+-- filters its rows under every setting.  A table with row-level security
+-- lionvec refuses.
 --
 -- The plans are shown with the sequential and bitmap scans and the sort
 -- disabled, which leaves the plain scan with its Filter the cheapest plan
@@ -141,17 +145,18 @@ CREATE INDEX pf_l2 ON pf USING lionvec (v) WITH (partitions = 20);
 CREATE INDEX pf_cat ON pf USING lion (cat);
 CREATE INDEX pf_tag ON pf USING lion (tag);
 VACUUM (FREEZE, ANALYZE) pf;
--- the default, shown once an index has loaded the library (CREATE EXTENSION
--- IF NOT EXISTS does not, where an earlier test created it)
+-- the default, error, shown once an index has loaded the library (CREATE
+-- EXTENSION IF NOT EXISTS does not, where an earlier test created it)
 SHOW pg_lion.vector_postfilter;
 
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_sort = off;
 
--- exact, the default.  A filter lion indexes answer: LionOrdered; for two
--- columns, over a set of both, though a bitmap scan would filter the less
--- selective one instead (DESIGN.md §44.6, "Post-filtering")
+-- exact.  A filter lion indexes answer: LionOrdered; for two columns, over a
+-- set of both, though a bitmap scan would filter the less selective one
+-- instead (DESIGN.md §44.6, "Post-filtering")
+SET pg_lion.vector_postfilter = exact;
 SELECT * FROM pf_plan('SELECT id FROM pf WHERE cat = 3 ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
 SELECT * FROM pf_plan('SELECT id FROM pf WHERE cat IN (1, 2) AND tag < 50
 					   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
@@ -164,8 +169,17 @@ SELECT * FROM pf_plan('SELECT id FROM pf WHERE cat = 3 AND note = ''n1''
 					   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
 -- a key: the one row, sorted
 SELECT * FROM pf_plan('SELECT id FROM pf WHERE id = 5 ORDER BY v <-> pf_vec(4, 24) LIMIT 1');
--- the vector column's own test is a filter like any other
+-- the vector column's own clauses filter the scan's rows: the NULL vectors
+-- come last in its order and a distance bound rejects its farther rows, so
+-- the rows before them are the same - the plain scan's Filter, and with a
+-- clause lion answers beside them LionOrdered's
 SELECT * FROM pf_plan('SELECT id FROM pf WHERE v IS NOT NULL ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
+SELECT * FROM pf_plan('SELECT id FROM pf WHERE v <-> pf_vec(4, 24) < 3 ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
+SELECT * FROM pf_plan('SELECT id FROM pf WHERE cat = 3 AND v IS NOT NULL
+					   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
+-- ... and beside a clause no lion index answers, the sort
+SELECT * FROM pf_plan('SELECT id FROM pf WHERE note = ''n1'' AND v IS NOT NULL
+					   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
 -- no filter, or one a gating Result tests once: the lionvec scan
 SELECT * FROM pf_plan('SELECT id FROM pf ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
 SELECT * FROM pf_plan('SELECT id FROM pf WHERE current_user IS NOT NULL
@@ -182,7 +196,9 @@ INSERT INTO pf_cases VALUES
 	('cat = 3', 'LIMIT 10'), ('cat = 3', ''), ('cat IN (1, 2) AND tag < 50', 'LIMIT 10'),
 	('tag = 7 OR cat = 4', 'LIMIT 10'), ('note = ''n1''', 'LIMIT 10'),
 	('cat = 3 AND note = ''n1''', 'LIMIT 10'), ('cat = 3 AND note = ''n1''', ''),
-	('id = 5', 'LIMIT 1'), ('v IS NOT NULL', 'LIMIT 10'), ('true', 'LIMIT 10');
+	('id = 5', 'LIMIT 1'), ('v IS NOT NULL', 'LIMIT 10'), ('true', 'LIMIT 10'),
+	('v IS NOT NULL', ''), ('v <-> pf_vec(4, 24) < 3', 'LIMIT 10'),
+	('v <-> pf_vec(4, 24) < 2.9', 'LIMIT 10'), ('cat = 3 AND v IS NOT NULL', 'LIMIT 10');
 SELECT f, k, pf_cmp(format('SELECT id, v <-> pf_vec(4, 24) AS d FROM pf WHERE %s
 							ORDER BY v <-> pf_vec(4, 24) %s', f, k)) AS result
   FROM pf_cases ORDER BY f, k;
@@ -191,9 +207,10 @@ SELECT pf_cmp('SELECT id, v <-> pf_vec(4, 24) AS d FROM pf WHERE cat = 3
 			   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
 RESET pg_lion.enable_ordered_scan;
 
--- error: a query whose lionvec order would be filtered fails at plan time,
--- EXPLAIN included, and says how to write it
-SET pg_lion.vector_postfilter = error;
+-- error, the default: a query whose lionvec order would be filtered fails at
+-- plan time, EXPLAIN included, and says how to write it, and how to have
+-- the exact plan or the filtered scan instead
+RESET pg_lion.vector_postfilter;
 \set VERBOSITY default
 EXPLAIN (COSTS OFF)
 SELECT id FROM pf WHERE note = 'n1' ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
@@ -202,12 +219,36 @@ SET pg_lion.enable_ordered_scan = off;
 SELECT id FROM pf WHERE cat = 3 ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
 RESET pg_lion.enable_ordered_scan;
 \set VERBOSITY terse
+-- a key is a filter like any other, and so is a clause no lion index
+-- answers beside the vector column's own
 SELECT id FROM pf WHERE id = 5 ORDER BY v <-> pf_vec(4, 24) LIMIT 1;
--- a filter lion answers is LionOrdered's, and no filter is no error
+SELECT id FROM pf WHERE note = 'n1' AND v IS NOT NULL ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
+-- a filter lion answers is LionOrdered's, and no filter is no error, nor
+-- one the planner tests once - a generic plan's Param too - nor the vector
+-- column's own clauses, alone or beside one lion answers
 SELECT * FROM pf_plan('SELECT id FROM pf WHERE cat = 3 ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
+SELECT pf_cmp('SELECT id, v <-> pf_vec(4, 24) AS d FROM pf WHERE v IS NOT NULL
+			   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
+SELECT pf_cmp('SELECT id, v <-> pf_vec(4, 24) AS d FROM pf WHERE v <-> pf_vec(4, 24) < 3
+			   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
+SELECT pf_cmp('SELECT id, d FROM (SELECT id, v <-> pf_vec(4, 24) AS d FROM pf) s
+			   WHERE d < 3 ORDER BY d LIMIT 10');
+SELECT pf_cmp('SELECT id, v <-> pf_vec(4, 24) AS d FROM pf WHERE cat = 3 AND v IS NOT NULL
+			   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
 SELECT pf_cmp('SELECT id, v <-> pf_vec(4, 24) AS d FROM pf WHERE cat IN (1, 2) AND tag < 50
 			   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
 SELECT pf_cmp('SELECT id, v <-> pf_vec(4, 24) AS d FROM pf ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
+SELECT pf_cmp('SELECT id, v <-> pf_vec(4, 24) AS d FROM pf WHERE current_user IS NOT NULL
+			   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
+PREPARE pf_once(bool) AS SELECT id FROM pf WHERE $1 ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
+SET plan_cache_mode = force_generic_plan;
+SELECT * FROM pf_plan('EXECUTE pf_once(true)');
+RESET plan_cache_mode;
+DEALLOCATE pf_once;
+-- error is the default's value
+SET pg_lion.vector_postfilter = error;
+SELECT id FROM pf WHERE note = 'n1' ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
+RESET pg_lion.vector_postfilter;
 -- the subquery the hint suggests: the nearest 1,000 rows of the scan
 -- (restricted by the clauses lion answers, or not at all), then the other
 -- clauses; the planner never pushes a clause below a LIMIT
@@ -229,28 +270,48 @@ CREATE INDEX pf_n1 ON pf USING lionvec (v) WITH (partitions = 4) WHERE note = 'n
 SELECT * FROM pf_plan('SELECT id FROM pf WHERE note = ''n1'' ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
 SELECT pf_cmp('SELECT id, v <-> pf_vec(4, 24) AS d FROM pf WHERE note = ''n1''
 			   ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
+-- with a clause more, which lion answers, the partial index's scan would be
+-- filtered, and LionOrdered, whose set must answer every clause, the
+-- predicate's too, is not offered: the error names that clause
+\set VERBOSITY default
 SELECT id FROM pf WHERE note = 'n1' AND tag < 50 ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
+\set VERBOSITY terse
 DROP INDEX pf_n1;
 
--- row-level security: LionOrdered does not scan such a table (DESIGN.md
--- §30.1), and the policy's clause is a filter
-CREATE ROLE pf_reader;
-GRANT SELECT ON pf TO pf_reader;
+-- row-level security: lionvec refuses such a table (DESIGN.md §44.6,
+-- "Row-level security").  A query its index could order fails at plan time,
+-- the owner's too, whom no policy filters, with or without a WHERE and under
+-- every pg_lion.vector_postfilter; any other query of the table is planned
+-- as ever.  No lionvec index is built on such a table, nor on a partition of
+-- one; with row-level security off again, the index is used again.
 ALTER TABLE pf ENABLE ROW LEVEL SECURITY;
 CREATE POLICY pf_not5 ON pf FOR SELECT USING (cat <> 5);
-SET ROLE pf_reader;
 \set VERBOSITY default
 SELECT id FROM pf ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
 \set VERBOSITY terse
+EXPLAIN (COSTS OFF) SELECT id FROM pf WHERE cat = 3 ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
 SET pg_lion.vector_postfilter = exact;
-SELECT * FROM pf_plan('SELECT id FROM pf ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
-SELECT count(*) AS rows, count(*) FILTER (WHERE cat = 5) AS cat5
-  FROM (SELECT id, cat FROM pf ORDER BY v <-> pf_vec(4, 24) LIMIT 10) s;
-RESET ROLE;
+SELECT id FROM pf ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
+SET pg_lion.vector_postfilter = allow;
+SELECT id FROM pf ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
+RESET pg_lion.vector_postfilter;
+SELECT count(*) FROM pf WHERE cat = 3;
+REINDEX INDEX pf_l2;
+CREATE INDEX pf_l2_more ON pf USING lionvec (v);
 DROP POLICY pf_not5 ON pf;
 ALTER TABLE pf DISABLE ROW LEVEL SECURITY;
-REVOKE SELECT ON pf FROM pf_reader;
-DROP ROLE pf_reader;
+SELECT * FROM pf_plan('SELECT id FROM pf ORDER BY v <-> pf_vec(4, 24) LIMIT 10');
+CREATE TABLE pf_parts (id int, v vector(24)) PARTITION BY RANGE (id);
+CREATE TABLE pf_part1 PARTITION OF pf_parts FOR VALUES FROM (0) TO (1000);
+INSERT INTO pf_parts SELECT id, v FROM pf WHERE id < 1000;
+CREATE INDEX pf_parts_l2 ON pf_parts USING lionvec (v) WITH (partitions = 4);
+ALTER TABLE pf_parts ENABLE ROW LEVEL SECURITY;
+\set VERBOSITY default
+SELECT id FROM pf_parts ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
+\set VERBOSITY terse
+SELECT id FROM pf_part1 ORDER BY v <-> pf_vec(4, 24) LIMIT 10;
+CREATE INDEX ON pf_part1 USING lionvec (v);
+DROP TABLE pf_parts;
 
 -- allow: the lionvec scan with a Filter is a plan again, the cheapest here,
 -- and LionOrdered may filter its members

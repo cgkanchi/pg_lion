@@ -21059,7 +21059,9 @@ given (unpredicted, or made while resting), the pages they read ahead and releas
 times one ended and started again - and the heap's asks as
 `H heap pages prefetched (X not in shared buffers)`. On 16, `stream` is accepted and is `fadvise`.
 
-**A parallel scan** (2026-10-16). `amcanparallel`: an unfiltered `ORDER BY` of the distance may be
+**A parallel scan** (2026-10-16). `amcanparallel`: with `pg_lion.vector_parallel_scan` on (off by
+default since 2026-10-17, the measurements below finding it slower everywhere; off, `lo_knn_partial()`
+drops a lionvec order's partial paths), an unfiltered `ORDER BY` of the distance may be
 a Parallel Index Scan under a Gather Merge (§44.7 prices it; a filtered one stays serial, below).
 Each participant - every worker, and the leader unless `parallel_leader_participation` is off -
 runs the whole scan above on its own: it reads the meta page and the PART chain, ranks every
@@ -21302,25 +21304,29 @@ returned 0.993 of the true ten for 29,075 pages and 17.6 pauses a query, LionOrd
 members it skipped behind a frontier that non-members had moved (21 a query against 0.1). Same
 settings, other rows: the plan decided the answer, which it must not.
 
-So a lionvec order a Filter would follow is not a plan (`pg_lion.vector_postfilter`, §44.8, at its
-default `exact`). LionOrdered's `set_rel_pathlist_hook` takes it out of the relation's path list
-before core's `set_cheapest()` (`lo_knn_take()`) whenever the relation has a clause the scan would
-leave to its Filter: a restriction clause that is not pseudoconstant (a gating Result tests those
-once) and, for a partial index, not implied by its predicate - such an index, whose predicate
-implies every clause, stays the filter's order. Core's sequential scan, which a cheaper order may
-have made `add_path()` discard, is offered again. The node still walks the order, and over a lion
-side only if that side answers every clause: the node's own Filter would reject members the scan
-had returned just as the plain scan's does. Core's lion accesses are a bitmap scan's, which leaves
-an index whose bitmap costs more than the rows it saves to the heap scan's Filter
-(`choose_bitmap_and()`: `tag < 50` beside `cat IN (1, 2)`), so when none of them answers every
-clause the node ANDs the access answering most of the clauses left, among core's and each lion
-index's alone, until one does (`lo_knn_cover()`), and the price decides as for any lion side. A
-filter lion indexes answer thus always goes through LionOrdered (unless `pg_lion.enable_ordered_scan`
-is off, or the set would not fit `hash_mem`); any other is planned exactly, by a sort of the
-filter's rows over a sequential, bitmap or B-tree scan (`WHERE id = 5 ORDER BY v <-> q LIMIT 1`
-sorts the one row the primary key finds), and under `error` fails at plan time, EXPLAIN included,
-naming the clauses no lion index answers. The approximate answer is then asked for in so many
-words:
+So a lionvec order a Filter would follow is not a plan (`pg_lion.vector_postfilter`, §44.8, at
+`error`, its default since 2026-10-17, or `exact`). LionOrdered's `set_rel_pathlist_hook` takes it
+out of the relation's path list before core's `set_cheapest()` (`lo_knn_take()`) whenever the
+relation has a clause the scan would leave to its Filter: a restriction clause that is not
+pseudoconstant (a gating Result tests those once), for a partial index not implied by its
+predicate - such an index, whose predicate implies every clause, stays the filter's order - and
+not the index's own (`lo_knn_own()`, 2026-10-17): a clause of the columns the index's key reads
+alone, the vector's (`v IS NOT NULL`, a distance bound `v <-> q < 0.5`), rejects the NULL vectors
+the scan returns last, or rows by the distance it returns them in, and so leaves the rows before
+them as they were; it filters the scan's rows under every setting. Core's sequential scan, which a
+cheaper order may have made `add_path()` discard, is offered again. The node still walks the order,
+and over a lion side only if that side answers every clause but the index's own: the node's own
+Filter would reject members the scan had returned just as the plain scan's does. Core's lion
+accesses are a bitmap scan's, which leaves an index whose bitmap costs more than the rows it saves
+to the heap scan's Filter (`choose_bitmap_and()`: `tag < 50` beside `cat IN (1, 2)`), so when none
+of them answers every clause the node ANDs the access answering most of the clauses left, among
+core's and each lion index's alone, until one does (`lo_knn_cover()`), and the price decides as for
+any lion side. A filter lion indexes answer thus always goes through LionOrdered (unless
+`pg_lion.enable_ordered_scan` is off, or the set would not fit `hash_mem`); any other fails at plan
+time under `error`, EXPLAIN included, naming the clauses no lion index answers, and under `exact` is
+planned exactly, by a sort of the filter's rows over a sequential, bitmap or B-tree scan
+(`WHERE id = 5 ORDER BY v <-> q LIMIT 1` sorts the one row the primary key finds). The approximate
+answer is then asked for in so many words:
 
     SELECT ... FROM (SELECT ..., embedding <=> $1 AS d FROM t [WHERE <clauses lion answers>]
                      ORDER BY d LIMIT 1000) s
@@ -21332,9 +21338,41 @@ the plain scan with a Filter and LionOrdered with one compete on cost, which is 
 chose from 60% above and at 10% and 3% in §44.7 and §44.9. What the rule does not reach: a set
 that degrades at run time (`hash_mem`) or a lossy lion clause has its rows rechecked by the node,
 which filters members the scan returned; a join's clause filters an ordered scan of one side
-(a nested loop over it) and is no restriction of that relation; and row-level security's policy
-is a restriction like any other, so on such a table, which the node does not scan (§30.1), a
-lionvec query is sorted, or under `error` fails.
+(a nested loop over it) and is no restriction of that relation; and a distance bound few rows pass
+leaves a LIMIT unfilled, so the scan reads on to its end, as pgvector's do.
+
+**Row-level security (2026-10-17).** lionvec refuses it. A policy is a restriction no lion index
+answers, on a table the node does not scan (§30.1), so under `error` every lionvec query of a role a
+policy filters would fail, with a `WHERE` or without, and so would the subquery, whose scan the
+policy filters too. `lionvec_refuse_rls()` builds no lionvec index on a table with row-level
+security enabled, or on a partition of one, and fails at plan time, under every
+`pg_lion.vector_postfilter` and for the owner too, a query that a lionvec index of such a table
+could order; any other query of the table is planned as ever. A table that inherits from one with
+row-level security (`INHERITS`, not a partition) is not looked at: under `error` the parent's
+policies fail a lionvec query of the child through the parent, as any filter LionOrdered cannot
+take does.
+
+**The default, `error` (2026-10-17).** `exact` was the default for a day; from 2026-10-17 it is
+`error`, so that a query whose filter lion cannot answer says which answer it wants: the
+subquery's approximate one, or `exact`'s sort, which reads every row that passes the filter. What
+the default fails, by `lo_knn_take()`'s rule unchanged, is every lionvec order under a restriction
+clause no lion index answers and no partial lionvec index's predicate implies, however cheap the
+exact plan: a key's `id = 5` (or `id = $1` in a generic plan); a volatile clause
+(`random() < 0.1`); a correlated outer column's clause in a LATERAL subquery (`note = q.note`); a
+plain view's WHERE; in a partition, the parent's clause on the partition key, which every row of
+the partition passes (core keeps it as the partition's Filter); and on PostgreSQL 16, `IS NOT NULL`
+on a NOT NULL column other than the vector, which 17 and later drop when planning. A partial
+lionvec index whose predicate implies one clause is no way round another that lion answers:
+LionOrdered's set must answer every clause, the predicate's too, so
+`WHERE note = 'n1' AND tag < 50` over an index `WHERE note = 'n1'` and a lion index on `tag` fails,
+the error naming `note = 'n1'`. What it does not fail: no WHERE; a pseudoconstant one (`WHERE $1`,
+`WHERE current_user = 'app'`); a WHERE proven false; the vector column's own clauses
+(`v IS NOT NULL`, a distance bound), alone, through the plain scan's Filter, or beside a filter lion
+answers, through LionOrdered's (2026-10-17: they failed for a few hours before); a filter lion indexes answer (through
+LionOrdered, which a generic plan's `cat = $1` and a LATERAL subquery's `cat = q.cat` reach too); a
+join's clause; a filter of a CTE or of a security-barrier view's subquery (the order is then above
+it, a sort); and a lionvec order an HNSW index's path has already beaten in `add_path()`, which is
+then the plan, with its Filter, as pgvector's.
 
 ### 44.7 Costs (lionveccostestimate())
 
@@ -21487,18 +21525,21 @@ could have lost to; LionOrdered's paths are serial.
   it knows of its rows outgrows `hash_mem` (§44.4, "The hash's bound"): fail the query, or end
   the scan at the rows it returned, with a NOTICE. Only a scan with no LIMIT, or a large one,
   over rows plane 1 cannot tell apart gets there.
-- `pg_lion.vector_postfilter` (enum, `exact`, `error` or `allow`, default `exact`; 2026-10-16):
-  whether a plan may apply a filter to the rows a lionvec scan returns (§44.6, "Post-filtering").
-  `exact`: no plan does; a filter lion indexes answer goes through LionOrdered, over a set that
-  answers every clause, and any other is planned exactly, a sort of the filter's rows. `error`: the
-  same, but a query whose lionvec order would be filtered and that no LionOrdered path answers
-  fails at plan time, EXPLAIN too, naming the clauses no lion index answers and suggesting the
-  subquery that filters an unfiltered or lion-filtered scan's first rows. `allow`: the plain scan
-  with a Filter, and LionOrdered with one, are plans chosen by cost, as before; for comparing
-  plans and for §44.9's earlier measurements. `pg_lion.enable_ordered_scan = off` takes LionOrdered
-  away, not the rule: under `exact` or `error` a filtered query then gets an exact plan, or the
-  error. A pseudoconstant clause, tested once by a gating Result, and one a partial lionvec
-  index's predicate implies are no filter here.
+- `pg_lion.vector_postfilter` (enum, `error`, `exact` or `allow`, default `error`; 2026-10-16, the
+  default `exact` until 2026-10-17): whether a plan may apply a filter to the rows a lionvec scan
+  returns (§44.6, "Post-filtering"). `error`: no plan does; a filter lion indexes answer goes
+  through LionOrdered, over a set that answers every clause, and a query whose lionvec order would
+  be filtered and that no LionOrdered path answers fails at plan time, EXPLAIN too, naming the
+  clauses no lion index answers, and hinting at the subquery that filters an unfiltered or
+  lion-filtered scan's first rows and at `exact` and `allow`. `exact`: the same, but such a query is
+  planned exactly, a sort of the filter's rows. `allow`: the plain scan with a Filter, and
+  LionOrdered with one, are plans chosen by cost, as before; for comparing plans and for §44.9's
+  earlier measurements. `pg_lion.enable_ordered_scan = off` takes LionOrdered away, not the rule:
+  under `error` or `exact` a filtered query then gets the error, or an exact plan. A pseudoconstant
+  clause, tested once by a gating Result, one a partial lionvec index's predicate implies, and the
+  index's own, of the vector column alone (`v IS NOT NULL`, a distance bound; 2026-10-17), are no
+  filter here. A table with row-level security lionvec refuses under every value (§44.6,
+  "Row-level security").
 - `pg_lion.vector_prefetch` (enum, `off`, `fadvise` or `stream`, default `stream` from 17 and
   `fadvise` on 16; 2026-10-17, a boolean from 2026-10-16, whose `on`, the default, and `off` it
   still takes): how a scan reads ahead the pages it will read next (§44.4, "Prefetch" and "Read
@@ -21527,9 +21568,12 @@ could have lost to; LionOrdered's paths are serial.
   rather than through the heap tuple and the TOAST index. The rows returned, their order and their
   distances are the same either way, which the tests compare; inserts keep the places up whatever it
   says. Off is the way back should a place ever be wrong in a way the checks miss.
+- `pg_lion.vector_parallel_scan` (boolean, default off, 2026-10-17): whether a lionvec order gets
+  partial paths at all (§44.4, "A parallel scan"); off because the parallel scan was slower than
+  the serial one on every query measured.
 - core's `max_parallel_workers_per_gather`, `parallel_setup_cost`, `parallel_tuple_cost`,
   `min_parallel_index_scan_size`, `min_parallel_table_scan_size` and the table's
-  `parallel_workers`: whether an unfiltered scan runs in parallel, and in how many processes
+  `parallel_workers`: with `pg_lion.vector_parallel_scan` on, whether an unfiltered scan runs in parallel, and in how many processes
   (§44.7, "A parallel scan"). At the defaults it does not: the setup costs more than a serial
   scan's start-up.
 - `partitions` (reloption, 0 to 262,144, default 0; 1,000,000 until a review found the build at a
@@ -22382,9 +22426,14 @@ faster from the disk and the same warm, and the inline table's queries took main
   the default margin's recall for each metric under a filter of 9,000 members (rows of mixed
   lengths, which an inner product ranked unlifted got 0.6 of, §44.4); a restricted scan pausing
   at once (a patience of 1) still filling a LIMIT 2000 of its 9,000 members, in order, through the
-  node (the short LIMIT of §44.4); the node switched off. Spill: LionOrdered returns each member
-  once and the same rows as the ordinary plan, every member of two filters for each metric, at
-  the margin of 100 and at the defaults, before and after DELETE and VACUUM under the filter.
+  node (the short LIMIT of §44.4); the node switched off, the query failing under the default
+  `pg_lion.vector_postfilter`, the filter's rows sorted under `exact`, and under `allow` the vector
+  scan with a Filter. Spill: LionOrdered returns each member once and the same rows as the
+  ordinary plan (the vector scan with a Filter, under `allow`), every member of two filters for
+  each metric, at the margin of 100 and at the defaults, before and after DELETE and VACUUM under
+  the filter. The ordinary plan is the node off under `exact` (since 2026-10-17, when the default
+  `error` would fail it), a sort of the filter's rows; so it is in vector_half.sql and
+  vector_limit.sql.
 - **vector_limit.sql** (2026-10-16): the restricted scan told its query's LIMIT (§44.4, "A known
   LIMIT"), over vector_filter.sql's 10,000 rows in 50 partitions at the margin of 100, where every
   partition comes before every row, and a patience of one unit, so that each tier pauses as soon
@@ -22397,24 +22446,30 @@ faster from the disk and the same warm, and the inline table's queries took main
   as before; a subquery's own LIMIT under an aggregate; and a LIMIT 300, L in its place, which
   pauses once on its 300 having probed 33 partitions (with L at 100, twice, having probed all 50),
   and at a `work_mem` of 64 kB, where L is 170, overflows the queue and RESTs as it did.
-  node (the short LIMIT of §44.4); the node switched off, the filter's rows sorted, and under
-  `pg_lion.vector_postfilter = allow` the vector scan with a Filter. Spill: LionOrdered returns each
-  member once and the same rows as the ordinary plan (the vector scan with a Filter, under
-  `allow`), every member of two filters for each metric, at the margin of 100 and at the defaults,
-  before and after DELETE and VACUUM under the filter.
 - **vector_postfilter.sql** (2026-10-16): `pg_lion.vector_postfilter` (§44.6, "Post-filtering"),
   each plan shown with the sequential and bitmap scans and the sort disabled, which leaves the
   vector scan with a Filter the cheapest where it is a plan, and each query's rows compared with a
-  sort's, at the margin of 100 and no pause, over 4,000 rows in 20 partitions. At `exact`: a lion
-  filter through LionOrdered, two lion columns over one set where a bitmap scan would filter one;
-  a filter no lion index answers, alone, beside a lion one, a primary key's and `v IS NOT NULL`,
-  sorted; no filter, and a pseudoconstant one, the vector scan; LionOrdered off, sorted. At
-  `error`: the errors, EXPLAIN's too, for a filter lion does not answer, a mixed one, a lion one
-  with LionOrdered off; a lion filter's LionOrdered; the suggested subquery, restricted and not,
-  with the same rows as a sort; a partial lionvec index whose predicate implies the filter, its
-  scan, and with a clause more, the error; row-level security, the error and at `exact` a sort
-  within the policy. At `allow`: the vector scan with a Filter, LionOrdered with one, and their
-  rows the sort's.
+  sort's, at the margin of 100 and no pause, over 4,000 rows in 20 partitions. SHOW, the default
+  `error` (2026-10-17). At `exact`: a lion filter through LionOrdered, two lion columns over one
+  set where a bitmap scan would filter one; a filter no lion index answers, alone, beside a lion
+  one, and a primary key's, sorted; the vector column's own clauses (2026-10-17), `v IS NOT NULL`
+  and a distance bound, the vector scan with a Filter, beside a lion filter LionOrdered with one,
+  and beside a filter no lion index answers, sorted; no filter, and a pseudoconstant one, the
+  vector scan; LionOrdered off, sorted; all with the sort's rows, distance bounds that fill the
+  LIMIT and that do not among them. At the default, `error`: the errors, EXPLAIN's too, with the
+  hint naming the subquery and the settings, for a filter lion does not answer, a mixed one, a
+  lion one with LionOrdered off, a primary key's, and `v IS NOT NULL` beside a filter lion does
+  not answer; the same with `error` set; a lion filter's LionOrdered; no filter, a pseudoconstant
+  one, a generic plan's `WHERE $1`, and the vector column's own clauses, alone, beside a lion
+  filter and pushed into a subquery as `d < 3`, with the sort's rows; the suggested subquery,
+  restricted and not, with the same rows as a sort; a partial lionvec index whose predicate
+  implies the filter, its scan, and with a clause more, which lion answers, the error naming the
+  predicate's clause. Row-level security (2026-10-17): with it enabled, the owner's query fails
+  under `error`, `exact` and `allow`, EXPLAIN's too, a query lionvec cannot order still runs, and
+  REINDEX and CREATE INDEX fail; with it disabled, the vector scan again; a partitioned table's
+  index built, then the parent's row-level security enabled, a query of the parent and one of the
+  partition failing, and a new index on the partition refused. At `allow`: the vector scan with a
+  Filter, LionOrdered with one, and their rows the sort's.
 - **test/isolation/lionvec_insert_window.spec** (an injection point build, PostgreSQL 17 and on;
   2026-10-15, after a review found lionvec's concurrency untested): an insert parked after its
   REFINE record (`lionvec-insert-refined`), and after its CODE record before its copy's
@@ -22467,10 +22522,11 @@ faster from the disk and the same warm, and the inline table's queries took main
   query's walk and a cosine zero query's, every row once, and the order's tail - the farthest rows,
   the zero vector, the NULLs; a Gather Merge on a nested loop's inner side, run twice
   (`amparallelrescan`), the nearest three each time; an index that does not spill; `halfvec`;
-  filters under `pg_lion.vector_postfilter = exact`, through LionOrdered or a sort and never a
-  Parallel Index Scan with a Filter, and under `allow` that plan, each with the sort's rows; reading
-  ahead off, asking the kernel and through streams, and `effective_io_concurrency` 0, the same rows
-  in parallel, and serially at the defaults through pauses, passes and LionOrdered's restricted
+  filters at the default `pg_lion.vector_postfilter`, `error`, the one no lion index answers
+  failing though a parallel scan is a path, and under `exact`, through LionOrdered or a sort and
+  never a Parallel Index Scan with a Filter, and under `allow` that plan, each with the sort's rows
+  (`ps_cmp()`'s sort under `exact`); reading ahead off, asking the kernel and through streams, and
+  `effective_io_concurrency` 0, the same rows in parallel, and serially at the defaults through pauses, passes and LionOrdered's restricted
   scans, exact and probed; and at the defaults in parallel, each participant stopping by its own
   rules, the share of the ten nearest over 20 queries for each metric at least 0.9 and within 0.1 of
   the serial scan's. How many workers start is the server's, and nothing shown depends on it.
@@ -22486,7 +22542,7 @@ faster from the disk and the same warm, and the inline table's queries took main
   batch of 100, and of 20), the NULL and zero walks, LionOrdered's exact path and, with it off, its
   probes, the REST chain, a nested loop's rescans, at `effective_io_concurrency` 8, 1 and 0; cursors
   fetching a row at a time and scrolling; a cursor whose index grows by 3,000 rows between fetches;
-  a parallel scan; chains inserts appended to; half of each relation evicted, the upper and then the
+  a parallel scan (`pg_lion.vector_parallel_scan` on); chains inserts appended to; half of each relation evicted, the upper and then the
   lower, so that within a scan the streams rest and wake and the asks fall dormant and ask again; an
   exact path over 900 members a heap page each, the lower 480 pages evicted, at every even
   `effective_io_concurrency` from 14 to 80, so that the list's stream rests with more blocks in it

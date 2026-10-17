@@ -587,6 +587,9 @@ SELECT row_number() OVER () AS n, id, d
 NOTICE:  lionvec scan of "vt_l2" stopped after 38 rows, what it knew of its rows having outgrown hash_mem
 RESET enable_seqscan;
 RESET enable_sort;
+-- the reference is the sort's order: exact, whatever plan PostgreSQL would
+-- pick for the window (on 17+ it can be the lionvec scan)
+SET enable_indexscan = off;
 SELECT count(*) < 3006 AS stopped, count(*) > 0 AS "some rows",
 	   count(*) = count(*) FILTER (WHERE c.id = s.id) AS "the sort's first rows"
   FROM vt_cut c
@@ -597,6 +600,7 @@ SELECT count(*) < 3006 AS stopped, count(*) > 0 AS "some rows",
  t       | t         | t
 (1 row)
 
+RESET enable_indexscan;
 DROP TABLE vt_cut;
 RESET pg_lion.vector_overflow;
 SET pg_lion.vector_overflow = 'grow';
