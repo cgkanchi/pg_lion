@@ -20273,16 +20273,16 @@ false`: a SCROLL cursor gets a Material node), no bitmap scans. Scanned in paral
 
 ### 44.2 Format (lion_vec.h)
 
-Block 0 is the meta page: magic, format version 4, metric, flags (`LIONVEC_META_SPILL`: the build
-spilled, §44.3), dims and the padded `dimsp` (a multiple of 64), the rotation's seed, the MEAN
-chain's head, the PART chain's head and the partitions' number, the heads and tails of the two
-chains of rows in no partition, the REFINE tail, the partitions' SCALE (the rows' standard
-deviation about their centroids along one dimension, the unit of the margin, §44.4), the
-build's row count, and the REGION chain's head and the regions' number, appended in format 4 so
-that every earlier field keeps its offset (`lionvec_check_meta()` holds `nregions > 0` to a valid
-head, and to no more than the partitions). Every page's special space carries its next
-block, its type, `LIONVEC_PAGE_ID` and, on CODE pages, the least and greatest container key (§2)
-of the TIDs on it.
+Block 0 is the meta page: magic, format version 5, metric, flags (`LIONVEC_META_SPILL`: the build
+spilled, §44.3; `LIONVEC_META_LOCATOR`: it keeps a locator, §44.13), dims and the padded `dimsp` (a
+multiple of 64), the rotation's seed, the MEAN chain's head, the PART chain's head and the
+partitions' number, the heads and tails of the two chains of rows in no partition, the REFINE tail,
+the partitions' SCALE (the rows' standard deviation about their centroids along one dimension, the
+unit of the margin, §44.4), the build's row count, and the REGION chain's head and the regions'
+number, appended in format 4 so that every earlier field keeps its offset (`lionvec_check_meta()`
+holds `nregions > 0` to a valid head, and to no more than the partitions), and the locator's fields,
+appended in format 5 (§44.13). Every page's special space carries its next block, its type,
+`LIONVEC_PAGE_ID` and, on CODE pages, the least and greatest container key (§2) of the TIDs on it.
 
 - **MEAN**: the indexed rows' mean, rotated, as floats over as many pages as it takes; written by
   the build and never changed. Absent (`mean_head` invalid) when there were no non-NULL rows.
@@ -20323,9 +20323,14 @@ of the TIDs on it.
   append to. Then two chains of rows in no partition: the REST chain, of every row of an index
   built without partitions (an empty table's, §44.3), and the NULL chain, of the NULL rows and the
   cosine zero vectors, which no distance orders.
-- **REFINE**: one item a non-NULL row or a centroid, 16 bytes of header (TID, `alpha8`, `|r|`) and
-  `dimsp` 8-bit codes: 1552 bytes at 1536 dimensions, five a page. Read only for the rows plane 1
-  cannot rule out and for the centroids a scan comes to.
+- **REFINE**: one item a non-NULL row or a centroid, 16 bytes of header (TID, `nloc`, `alpha8`,
+  `|r|`) and `dimsp` 8-bit codes: 1552 bytes at 1536 dimensions, five a page. Read only for the rows
+  plane 1 cannot rule out and for the centroids a scan comes to. In an index that keeps a locator
+  over vectors wide enough, every item ends with a slot for its row's place in TOAST (§44.13), 20
+  bytes at 1536 dimensions, five a page still.
+- **LOC** and **LOCDIR** (format 5): in an index whose vectors may lie in TOAST, an entry a row
+  whose vector does - its TID, its value's id and its chunks' places - in heap order, and a
+  directory of those pages (§44.13).
 
 So an index of n rows of d dimensions is about n (d / 8 + 36) bytes of CODE pages, twice that when
 it spills, and n (d + 20) of REFINE pages - 1.7 GB for the benchmark's 975,000 rows of 1536
@@ -20333,11 +20338,12 @@ without spill (225 MB of it CODE pages), 1.9 GB with it - and C (d + 1.2 d / 8 +
 centroids. A scan reads the PART chain, 500 KB there, and the CODE pages of the partitions it
 probes, each twice as long when the index spills.
 
-Format 3 had no REGION chain, and its partitions were numbered as k-means left them; this pg_lion
-refuses it as it refuses format 2 (`lionvec_check_meta()`: "has format version 3 ... REINDEX
-it"): its meta page ends before the REGION fields, whose zeros would name block 0 as the REGION
-chain's head, and the extension has no release to migrate from. Format 2 had no copies and no
-flags in its meta page.
+Format 4 had no locator and no REFINE slots, and is read as an index without them until a REINDEX
+(§44.13, "Format 5, and an index of format 4"). Format 3 had no REGION chain, and its partitions
+were numbered as k-means left them; this pg_lion refuses it as it refuses format 2
+(`lionvec_check_meta()`: "has format version 3 ... REINDEX it"): its meta page ends before the
+REGION fields, whose zeros would name block 0 as the REGION chain's head, and the extension has no
+release to migrate from. Format 2 had no copies and no flags in its meta page.
 
 Format 1 (§44 above) had one CODE chain, every row in heap order, and a DIR chain of each CODE
 page's least and greatest TID, by which a filtered scan read only the pages that could hold a
@@ -20948,7 +20954,9 @@ the threshold alone decided, so a table loaded under a raised target - the DBped
 page the least of what it reads; asked for alone, on DBpedia's
 1536 dimensions, the heap pages bought nothing, the exact path cold taking 113 ms a query under
 the 1% filter against 109 without. Reading a toasted vector's chunks ahead needs its TOAST
-pointer, from the heap tuple, first (§44.11).
+pointer, from the heap tuple, first, or the chunks' places kept in the index, which an index of
+vectors that may lie in TOAST keeps (§44.13): its exact path streams them, and its rerank asks for
+a row's first chunk page with its heap page.
 
 Measured (§44.9, "Prefetch and parallel scans"): cold, each query alone after a restart with the
 page cache dropped, a serial scan at a margin of 3 took 17.4 ms against 21.2 without (its wait on
@@ -21513,6 +21521,12 @@ could have lost to; LionOrdered's paths are serial.
   `fadvise` within 5%. So `stream` where the index is read from the disk; `fadvise` where it lives
   in the kernel's cache and not in shared buffers, under `io_uring` above all; `off` where it lives
   in shared buffers.
+- `pg_lion.vector_toast_direct` (boolean, default on; 2026-10-17): whether a scan of an index that
+  keeps a locator reads vectors in TOAST by their chunks' places (§44.13) - the exact path's
+  members through the locator, the rerank's rows through their REFINE items - every chunk checked,
+  rather than through the heap tuple and the TOAST index. The rows returned, their order and their
+  distances are the same either way, which the tests compare; inserts keep the places up whatever it
+  says. Off is the way back should a place ever be wrong in a way the checks miss.
 - core's `max_parallel_workers_per_gather`, `parallel_setup_cost`, `parallel_tuple_cost`,
   `min_parallel_index_scan_size`, `min_parallel_table_scan_size` and the table's
   `parallel_workers`: whether an unfiltered scan runs in parallel, and in how many processes
@@ -22217,6 +22231,13 @@ exact path at 1% read its 2,717 pages - the members' heap pages, the TOAST index
 one at a time under every setting, 157 to 168 ms, 135 to 146 of them waiting on reads, where the
 inline table's, streamed, took 53; warm it took 11.2 ms against 4.6, detoasting 1,204 vectors.
 
+**Vectors in TOAST read by place** (2026-10-17; §44.13, "Measured";
+bench/results/2026-10-17-lionvec-toast-direct/): the same `dbpedia_toast`, its index REINDEXed as
+format 5, under `pg_lion.vector_toast_direct` off and on. The exact path from the disk took 68.3 ms
+at 1% against 179.7, reading 1,631 pages against 2,717 and waiting 12.7 ms against 152.7, and 158.6
+at 3% against 457.2; warm 7.9 against 14.1 and 16.4 against 31.8. The probing kinds were 6 to 7%
+faster from the disk and the same warm, and the inline table's queries took main's time.
+
 ### 44.10 Tests
 
 - **test/unit/vec_test.c** (`make unit`, and under ASan and UBSan with `SANITIZE=1`), against the
@@ -22476,6 +22497,9 @@ inline table's, streamed, took 53; warm it took 11.2 ms against 4.6, detoasting 
   the boolean's spellings, and its default; and the DEBUG1 line of a warm exact path each way, the
   list stream resting by turns. On 16 the expected output is vector_stream_1.out, `stream` there
   being `fadvise`.
+- **vector_toast.sql**, **vector_toast_corrupt.sql**, **test/isolation/lionvec_toast_scan.spec**
+  and test/recovery's phase 5 (2026-10-17): vectors in TOAST read by their chunks' places, and
+  every history and damage that can make a place wrong (§44.13, "Tests").
 
 ### 44.11 Not done
 
@@ -22532,10 +22556,12 @@ inline table's, streamed, took 53; warm it took 11.2 ms against 4.6, detoasting 
   pages and streamed (§44.9), while the index's streams gained what they gain inline. Reading the
   chunks ahead wants the heap tuples first - a stream over the members' heap blocks whose reader, a
   block ahead, reads their TOAST pointers and names the chunks' TOAST index pages and then their
-  pages to a second stream - or the chunks' TIDs kept beside the index's own items. The rows' heap
-  pages for their exact distances are asked of the kernel under `stream` too, a stream's pins being
-  unwelcome between `amgettuple()` calls (§44.4); a scan asked for 0 to 26 of them a query on
-  DBpedia, fetching 10 or 11 rows for their distances, too few for a stream to be worth its pins.
+  pages to a second stream - or the chunks' TIDs kept beside the index's own items, which §44.13
+  built (2026-10-17): the locator for the exact path, a REFINE item's place for the rerank. The
+  rows' heap pages for their exact distances are asked of the kernel under `stream` too, a stream's
+  pins being unwelcome between `amgettuple()` calls (§44.4); a scan asked for 0 to 26 of them a
+  query on DBpedia, fetching 10 or 11 rows for their distances, too few for a stream to be worth its
+  pins.
   The executor's fetch of a returned row is a buffer hit, the scan having fetched it for its
   distance just before, so nothing is read ahead for it. From the kernel's cache a stream costs more
   than `ReadBuffer()` under 18's `worker` and `io_uring` (§44.8), core handing each read to an I/O
@@ -22673,3 +22699,593 @@ hold is 5 x 10^10 shared among the processes.
   interrupts, so a cancel waited for the page to fill, and a worker's for the leader, whose
   condition-variable wait is where a worker's error reaches it. Each row's REFINE item now locks
   the page for itself, which costs nothing measurable, and a serial build's cancel is as prompt.
+
+### 44.13 Vectors in TOAST: reading them by their chunks' places (the locator; format 5, 2026-10-17)
+
+pgvector stores a `vector` of more than 506 dimensions (a `halfvec` of more than 1,012) in TOAST
+unless the column or the table says otherwise (§44.4, "Prefetch"), so most tables of real
+embeddings keep theirs there. A fetch of such a vector reads the row's heap page for its TOAST
+pointer, descends the TOAST index on `(chunk_id, chunk_seq)` for its chunks, and reads their
+pages: three random reads where an inline vector costs one, none of which can be named before the
+one before it is in, so neither the asks nor the streams read them ahead (§44.11, "What reading
+ahead leaves"). The exact path (§44.6) pays that a member: on DBpedia's 115,186 rows so stored
+(`dbpedia_toast`, §44.9) the 1% filter's 1,204 members cost 158 ms from the disk (157 to 168 under
+every setting, §44.11), 2,717 pages read one at a time - 708 heap pages, about 800 of the TOAST
+index's 1,273 and 1,204 of chunks - and 11.4 ms warm, against 53 and 4.6 to 4.9 with the vectors
+in the heap's pages and streamed. A probing scan fetches a dozen rows or so, each the same three
+reads.
+
+So an index whose vectors may lie in TOAST keeps where each row's chunks lie - the TOAST
+relation's block and line pointer of each, as RUNS (below) - in two places: in a map from heap TID
+to those places, the LOCATOR, which the exact path reads in heap order beside its members, and then
+each member's chunks directly, a page a vector in the usual case, through a read stream over blocks
+it knows whole; and, where the vectors leave room, in each row's REFINE item, which the probing
+path's rerank has just read when it comes to fetch the row, and which then names the row's chunks'
+page beside its heap page. A place is only ever a hint: every chunk read there is checked to be the
+chunk it should be, anything else sends that row down the heap path, and a row read so is returned
+only once its heap tuple, fetched under the scan's snapshot, shows the same value.
+
+**What the prototype was worth** (before it was built: a throwaway C function outside the
+repository, on the benchmark cluster - PostgreSQL 18.6 release, `io_method = worker`, 3 workers,
+§44.9's settings; the 10 queries of `knn_readahead.py`'s `x1` and, for 5 of them, `x3`; the
+medians). From the disk (the server restarted and the page cache dropped before each query) and
+warm (every relation in shared buffers, 3 runs a query): `x1` as it ran, under EXPLAIN (ANALYZE,
+BUFFERS); and the members' vectors read by their chunks' places (from `pg_column_toast_chunk_id()`
+and the TOAST table's `ctid`s, computed beforehand), each chunk checked as `heap_fetch_toast_slice()`
+checks it, the distances computed with pgvector's `cosine_distance()`, after a 400-page relation
+read in order standing for the locator, and the ten nearest rows' heap tuples fetched and their
+TOAST pointers compared with the values read. Every configuration returned the ten rows `x1` did.
+`p` the pages read, `w` the wait on them (`track_io_timing`):
+
+| | 1% (1,204 members), disk | warm | 3% (3,472 members), disk | warm |
+| --- | --- | --- | --- | --- |
+| the exact path then | 158.3 ms, 2,717 p, 137.6 w | 11.41 | 427.2 ms, 5,620 p, 370.7 w | 29.09 |
+| by place, read one at a time | 124.1 ms, 1,614 p, 118.3 w | 3.98 | 336.4 ms, 3,882 p, 321.6 w | 11.58 |
+| by place, asked of the kernel 64 ahead | 80.3 ms, 1,614 p, 28.9 w | 4.15 | | |
+| by place, through read streams | 55.2 ms, 1,614 p, 10.1 w | 3.97 | 141.5 ms, 3,882 p, 13.4 w | 11.83 |
+| the same function, heap fetch and detoast | 189.0 ms, 2,712 p, 158.2 w | 11.17 | 461.6 ms, 5,600 p, 379.2 w | 37.03 |
+| ... the heap blocks streamed | 184.2 ms, 2,712 p, 146.4 w | 11.27 | | |
+| inline, streamed (`mx-worker-3.json`) | 53.3 ms | 4.9 | 151.6 ms | 12.6 |
+
+Streaming the members' heap blocks alone bought nothing (184 against 189 ms), as §44.4 found asking
+for them; reading by place, streamed, made the toasted table's exact path as fast as the inline
+table's. What the built scan does is under "Measured", below.
+
+**Where a value's chunks lie.** A chunk holds `TOAST_MAX_CHUNK_SIZE` (1,996) bytes at 8K pages and
+a page holds four, so a 1536-dimension vector (6,148 bytes) is three chunks and 160 bytes, four
+tuples, which `toast_save_datum()` inserts one after another, each where the last went if it fits.
+In `dbpedia_toast`, bulk loaded, every one of the 115,186 values has its four chunks on one page
+of its own, at line pointers 1 to 4, and the TOAST blocks follow the heap's TIDs (correlation
+0.99999), so the members' chunks come in ascending blocks. Elsewhere (a scratch cluster, 2,000 to
+6,000 random rows each): 768 dimensions and `halfvec(1536)`, two chunks, all on one page; 1024
+dimensions, three chunks (4,100 bytes), two values in three on one page and the third across two;
+3072 dimensions, seven chunks, every value across two pages or three; 1536 dimensions from four
+concurrent inserters, 70 to 74% on one page in one run of line pointers, 25 to 30% across two
+pages, under 1% in three runs; and after half of 6,000 rows deleted at random and a VACUUM, the
+3,000 values inserted into the holes all on one page each. So a value's place is a list of RUNS -
+a block, a first line pointer, and how many chunks follow at consecutive line pointers - one in the
+common case, two for a value across pages (`LionVecLocRun`, `lionvec_loc_runs()`, lion_vec_math.h,
+which merges the consecutive line pointers of a block and nothing else).
+
+#### What is stored where
+
+- **The locator: the exact path's.** Its members come from a lion set, as heap TIDs in heap order,
+  never from the index's items, so their places must be found by heap TID. One entry a row whose
+  vector lies in TOAST, on pages of their own (below), read in heap order beside the sorted
+  members - streamed, and only the pages whose heap blocks hold a member.
+- **The REFINE item's place: the rerank's.** A row a probe reranks has had its REFINE item read
+  just before, so a place there costs the rerank no read, and its TOAST page can be asked for with
+  its heap page (§44.4, "Prefetch"). Every REFINE item of an index that keeps them ends with a slot
+  (`LionVecRefineLoc`): the value's id and `refloc_runs` runs, `min(n, ceil(n / 4) + 1)` for a value
+  of n chunks - 2 at 768, 1024 and 1536 dimensions and for `halfvec(1536)`, 3 at 3072 - of which the
+  item's `nloc` (the header's former pad) are in use: 20 or 28 bytes, which leave every one of those
+  widths its REFINE items a page (10, 7, 5 and 2). A centroid's item, and a row's whose vector has
+  no place or whose place takes more runs than the slot holds (a 1536-dimension value across three
+  pages), has `nloc` 0, and is reranked from the heap as before; every REFINE item of the index is
+  then one size. Built in the same format as the locator, so that one REINDEX brings both.
+- **Not in the CODE items.** Every probe reads every CODE item of a partition for a dozen fetches:
+  12 to 20 bytes more an item would be 5 to 9% more CODE pages read by every scan, for a saving on
+  a few rows.
+- **Not the REFINE item's place in the locator, yet.** An exact path that bounded its members by
+  their 8-bit codes and fetched only those that could make the top k would want each member's
+  REFINE item, and the locator could carry its place (6 bytes). But a REFINE page holds five items
+  and a 1% filter's members are scattered one to a page, the same count as their TOAST pages, so
+  it pays only for wider vectors or with codes in the locator itself. An entry carries a flags
+  byte, 0 now and checked so, so that a later format can add the place under a flag.
+
+#### The format (format 5)
+
+- **LOC pages** (`LIONVEC_PAGE_LOC`, 6): one item an entry (`LionVecLoc`): the heap TID; the
+  number of runs (1 to the value's chunks); flags (0); the value's `va_valueid`; then the runs
+  (`BlockNumber blk`, `OffsetNumber off`, `uint16 n`). 12 bytes and 8 a run: 24 with its MAXALIGN
+  and 28 with its line pointer for one run, 291 a page; 36 for two runs, 226 a page. The value's
+  length is not kept: an entry is made only for an uncompressed value of exactly the length the
+  index's dimensions give (`8 + 4 dims` bytes for a `vector`, `8 + 2 dims` for a `halfvec`,
+  `va_extsize` four less), so the chunks' number and lengths follow from `dims`, as core's checks
+  have them (`lionvec_toast_extsize()`, `_nchunks()`, `_chunk_size()`). The special space's `minkey`
+  and `maxkey` are the least and greatest heap BLOCK of the page's entries, not container keys as
+  on CODE pages.
+- **LOCDIR pages** (`LIONVEC_PAGE_LOCDIR`, 7): one item a LOC page (`LionVecLocDir`: its block and
+  the least and greatest heap block it has held an entry for), 12 bytes, 407 a page: one page for
+  DBpedia, 9 for a million rows. The build's items come first, in heap order with disjoint ranges,
+  filling `loc_bpages` pages from `loc_head` - consecutive blocks, which the build writes one after
+  another - the STATIC LEVEL, `loc_built` items. On the same chain after them (on the static
+  level's last page, and the pages after it) come the item of the LOC page the build leaves empty
+  for inserts to append to (`lo` invalid and `hi` 0: no range yet), and those of the pages inserts
+  add. Each LOCDIR page's special space holds the least and greatest heap block of its items'
+  ranges. VACUUM narrows no range (below), so a range holds every entry the page has, and perhaps
+  fewer.
+- **REFINE items** end with the slot above in an index whose meta page gives `refloc_runs`, and
+  their length is checked against it (`lionvec_refine_at()`: the item exactly `16 + dimsp + 4 + 8
+  refloc_runs` bytes, `nloc` at most `refloc_runs`).
+- **The meta page** appends, after `nregions` (format 4's last field, ending at byte 104): `loc_head`
+  and `loc_dtail`, the LOCDIR chain's head and tail; `loc_tail`, the LOC page inserts append to;
+  `toastrelid`, the heap's TOAST relation as the build found it; `loc_built` and `loc_bpages`, the
+  static level's items and pages; `loc_root`, a level over the static one, `InvalidBlockNumber` and
+  not read (below); `refloc_runs`, 0 when the REFINE items have no slot. `pd_lower` is 136. A flag,
+  `LIONVEC_META_LOCATOR` (2), says the index keeps a locator, and `lionvec_check_meta()` holds the
+  fields to it: all of the blocks valid with it, none without.
+
+**A second level.** This version reads the LOCDIR whole on every exact-path query: one page for
+DBpedia, 9 for a million rows (72 KB), 85 for ten million - and for a billion rows of 1536
+dimensions in TOAST, 3.44 million LOC pages (27 GB) under 8,450 LOCDIR pages, 66 MB read for a
+query whose members' entries lie on a few hundred LOC pages. Past some tens of millions of rows a
+query should read only the LOCDIR pages whose ranges hold its members' blocks, and the static level
+is laid out so that a later version can, with no change of format: its items are in heap order
+with disjoint ranges, on `loc_bpages` consecutive blocks from `loc_head`, each page's special space
+holding its items' least and greatest heap block, and `loc_built` says where it ends. So a later
+version may
+
+- search it: a binary search of the static level's pages by their special spaces, about
+  `log2(loc_bpages)` reads (13 at a billion rows) for the first member's block, then onward through
+  the members' sorted blocks, the pages they need and those a search passes; or
+- write a level over it at build time: an item a static page (its block and its range), 21 pages
+  of 407 for a billion rows' 8,450, named by `loc_root`.
+
+Either reads, of the static level, only the pages whose ranges hold a member's block, and then the
+items after `loc_built` - the tail's and the inserts' - whole, as this version does (they are
+bounded by the inserts since the build, and by the append area's re-sort if it is built, below).
+Neither changes a byte this version writes or a rule by which it reads: an index this version
+built is searched as it is, `loc_root` left invalid; one a later version built with a root this
+version reads whole, as it reads its own, since it never reads `loc_root` (nor checks it), the
+root's pages lie on no chain it walks (scans and VACUUM walk the LOCDIR chain from `loc_head`, and
+the LOC pages its items name), and inserts append past the static level, which neither a root nor
+a search ever has to follow. The static level stays right as long as the index does: inserts never
+touch its items, and VACUUM empties its pages' entries but narrows no range.
+
+**Which rows have an entry**: those whose stored vector is on disk in TOAST
+(`VARATT_IS_EXTERNAL_ONDISK`), uncompressed (`VARATT_EXTERNAL_IS_COMPRESSED` false, so `EXTENDED`
+storage's pglz or lz4 values have none), of exactly the dimensions' length, in the heap's own TOAST
+relation (`va_toastrelid`), and whose chunks the TOAST index finds as `heap_fetch_toast_slice()`
+would - `chunk_seq` 0 to n - 1 once each, each `TOAST_MAX_CHUNK_SIZE` but the last - in at most n
+runs (`lionvec_toast_value()`, `_ptr_ok()`, `_locate()`, lion_vec_loc.c). A NULL, a vector inline,
+compressed, or anything else has no entry, and is read as it always was.
+
+**Which indexes keep a locator** (`lionvec_build_locator_plan()`): an index of a plain column (not an
+expression, whose values the build computes and no TOAST relation holds) of a heap-AM table that has
+a TOAST relation, whose vectors may lie there - its storage `EXTERNAL` or `EXTENDED`, and its
+vector past the larger of `TOAST_TUPLE_THRESHOLD` and the table's `toast_tuple_target`
+(`lionvec_vector_inline()`, §44.4's rule, moved to lion_vec.c to share) - or whose build met a row
+whose vector did all the same (its REFINE items then without a slot). Of those, the REFINE items
+carry their rows' places when the dimensions are known before the build's second pass and an item
+with its slot fits a page. An index built over no rows (an empty table's, and `ambuildempty()`, an
+unlogged table's init fork) decides by the plan alone, `dims` 0 taken to be past any threshold, and
+writes an empty LOC page and LOCDIR page; its REFINE items have no slot, the dimensions being
+unknown. Decided by the build, recorded in the meta page's flag, and kept until REINDEX. **An index
+whose vectors lie inline - the DBpedia benchmark's own table, any table under `toast_tuple_target =
+8160`, any column `PLAIN` or `MAIN`, any `vector` of 506 dimensions or fewer - keeps none: no page,
+no work at insert, build or VACUUM, and the scan tests one flag.** A table that later toasts some of
+its vectors (other wide columns can push even a short vector out) reads those rows as before.
+
+#### The exact path (`lv_exact()`, `lv_exact_places()`)
+
+When the scan starts (`lv_start_toast()`) it reads by place if the index keeps a locator,
+`pg_lion.vector_toast_direct` is on (§44.8; off reads every row as before, which the tests compare
+against), the heap is heap-AM and its TOAST relation the meta page's `toastrelid`, the dimensions
+are known, the snapshot is an MVCC one, and (on 16) `old_snapshot_threshold` is off (below). It
+opens the TOAST relation once, with `AccessShareLock` as a detoast takes it - held to the end of
+the transaction, which keeps the relation from being rewritten (`VACUUM FULL`) or truncated under
+the scan - and counts its blocks then: a place at or past that count is never read. Then:
+
+1. The members, from the lion set, in TID order, as before.
+2. The LOCDIR chain, whole (`lionvec_locdir_read()`), and of its items those whose range holds a
+   member's heap block (`lionvec_loc_select()`: each item's range against the members' sorted,
+   distinct blocks by a binary search); those LOC pages, in block order, through a list stream over
+   the index (§44.4, "Read streams"; asked of the kernel or read plainly under `fadvise` and `off`,
+   and on 16). A page of the static level only, its entries in TID order, is searched: each member
+   between its first entry's TID and its last's found by a binary search of its entries
+   (`lv_exact_page_sorted()`), about 9 of 291 read; a page an insert's item names, its entries in
+   the order they came, is read whole, each entry looked up among the members by TID. An entry
+   read is checked as every item is (`lionvec_loc_at()`: its length against its runs, its runs
+   against the value's chunks and a page's line pointers, its TID and value id valid, its flags 0;
+   `ERRCODE_INDEX_CORRUPTED` if not). A member met by two entries that differ takes neither. An
+   entry out of order on a static page, which only damage leaves, can hide a member's from the
+   search; that member is read from the heap. At 1% of DBpedia the 1,204 members' entries lie on
+   all 394 LOC pages, 3 or so a page: reading each of the 115,186 entries and looking it up among
+   the members cost a warm query 4 ms more than the search, 11.4 against 7.2 in one session.
+3. The injection point `lionvec-exact-located`, where the isolation spec parks a scan.
+4. The members with an entry, by their first chunk's place: one list stream over the TOAST
+   relation (as far ahead as its tablespace's `effective_io_concurrency`, to 64) naming each run's
+   block in turn (a block repeated in a row once), each member's chunks read from their pages under
+   a share lock and checked (`lionvec_place_run()`, below), the vector assembled in one buffer, its
+   header checked (`lv_value_ok()`: `lionvec_datum_dim()` the index's dimensions, its unused field
+   zero), and its distance computed with the operator's function on that datum - the same bytes
+   the heap fetch would have handed it. A member whose chunks fail any check joins the rest; a
+   cosine zero vector, its distance NaN, is left to the zero walk, as the heap path leaves it.
+5. The rest - no entry, a place past the end, or a failed check - as before: the heap fetch, its
+   visibility, the detoast, their heap blocks streamed.
+6. Every distance sorted as before (NaN last, then TID), and returned in order. A member read by
+   place has had no heap fetch, so before it is returned the scan fetches its heap tuple under the
+   scan's snapshot (the RETURN-TIME CHECK, `lv_check_placed()`): not visible, it is passed over, as
+   the heap fetch passes it over; visible, its vector's TOAST pointer must name the value read
+   (`va_valueid`, `va_toastrelid`; `lv_check_pointer()`), and if it does not the index has named
+   another value for a live row, which no history below allows: `ERRCODE_INDEX_CORRUPTED`, never a
+   wrong answer. The executor's own fetch of the row is then a buffer hit; the rows of a LIMIT 10
+   cost ten heap reads, which the executor would make anyway.
+
+The streams end before `lv_exact()` returns, so no TOAST or LOC page is pinned between
+`amgettuple()` calls. Once more than half of a scan's reads by place have failed, after 64 of them
+(a TOAST relation rewritten on its own, below), the scan reads by place no more (`lv_place_ok()`):
+such a scan pays for 64 reads at most. The DEBUG1 line adds `N read by place (L locator pages, F
+not), C checked`. Memory: an entry a member, the LOCDIR's items (12 bytes a LOC page), one vector.
+
+**The checks of a chunk** (`lionvec_place_run()`) are `heap_fetch_toast_slice()`'s, each a fallback
+where core raises an error, and those a place read directly needs besides: the page a heap page
+(initialized, no special space); the line pointer within it and `LP_NORMAL`; its tuple visible to
+the TOAST snapshot (`HeapTupleSatisfiesVisibility()` under `get_toast_snapshot()` from 18,
+`init_toast_snapshot()` on 16 and 17, through lion_compat.h's `lion_toast_snapshot()`), as the TOAST
+index's own fetch of it would require - a TOAST tuple is never updated, so the tuple at the line
+pointer is the chunk, with no HOT chain to follow; a TOAST tuple's three columns, within the
+tuple's own bytes; its `chunk_id` the entry's value id; its `chunk_seq` the one the run's place in
+the entry says; `chunk_data` not NULL, not compressed or external (a plain or short varlena); and
+its length `TOAST_MAX_CHUNK_SIZE`, or the remainder for the last. `HeapTupleSatisfiesVisibility()`
+is heapam's, as core's own TOAST fetch is; master's move of index fetches into the table AM leaves
+it.
+
+#### The probing path's rerank (`lv_rerank_placed()`)
+
+`lv_refine()` reads a row's REFINE item for its 8-bit codes; in an index whose items have a slot, a
+row whose slot is in use is marked (`tp`) with the first block of its place (in the item's union
+with plane 1's `<x, mean>`, which is done with by then). When the row comes near the top of the row
+queue for its exact distance, `lv_prefetch_queue()` asks for its heap block, as before, and for that
+TOAST block, both of the kernel (`PrefetchBuffer()`), under every `vector_prefetch` but `off`, as
+many ahead as the larger of the two relations' tablespaces' `effective_io_concurrency`: a stream's
+pins between `amgettuple()` calls are unwelcome, as for the heap pages (§44.4). The DEBUG1 line
+adds `N TOAST pages prefetched (M not in shared buffers)`. Then, at the rerank: the REFINE item
+read again for its slot (its page read a moment before; `lionvec_refine_at()` checks the TID, so an
+item VACUUM removed and an insert reused gives none); the heap tuple fetched under the snapshot -
+not visible, the row is done, and costs no TOAST read; visible, `lv_check_pointer()` holds its value
+to the slot's, `ERRCODE_INDEX_CORRUPTED` otherwise; then the value read by its runs a block at a
+time (`lionvec_place_read()`, every block within the count), its chunks checked as above and its
+header by `lv_value_ok()`, and its distance computed. A read that fails detoasts the fetched row's
+vector, as the heap path does, and counts toward `lv_place_ok()`. The heap fetch comes first, unlike
+the exact path's, because every row the rerank reads needs its heap tuple anyway - its exact
+distance decides whether it is returned, and most of a probe's dozen are - so the check costs
+nothing more there, and what reading by place saves is the TOAST index's descent, a random read
+that no ask could start before the heap page was in.
+
+#### Why a place that checks is the right chunk
+
+Two facts of core's, and one of the index's:
+
+- **A visible row's value is present, where it was put.** A row's chunks are deleted only by the
+  transaction that deletes the row or changes its vector, and removed only once that transaction is
+  older than every snapshot's xmin; a scan that sees the row holds an xmin before it. A standby
+  replays the removal only after cancelling, or waiting out, every query whose snapshot could see
+  the row (`ResolveRecoveryConflictWithSnapshot()`), as it does for any heap tuple. A chunk tuple is
+  never updated, and while it is there nothing moves it from its line pointer or gives the line
+  pointer to another: pruning and defragmenting keep line pointers, and VACUUM frees one only once
+  its tuple is gone. Only a rewrite of the TOAST relation on its own moves chunks (below), which the
+  scan's lock holds off while it runs. So for a row the scan sees, the places its entry was made
+  with hold its value's chunks, which pass every check.
+- **A value id names one value among the chunks that can pass.** `toast_save_datum()` takes a new
+  value's id from `GetNewOidWithIndex()`, which refuses an OID for which the TOAST index finds any
+  tuple under `SnapshotAny` - dead, uncommitted or aborted alike ("SnapshotToast considers dead rows
+  as active indefinitely", as catalog.c says) - and a value's chunks are in the TOAST index from
+  their inserts until VACUUM has removed them, so no two values whose inserters committed or are
+  running share an id. Core's own detoast depends on this, taking every tuple the index finds for
+  the id under `SnapshotToast`, which passes every tuple whose inserter is not known to have
+  aborted (`HeapTupleSatisfiesToast()`). So after a rewrite, which copies only those values'
+  chunks, a chunk that checks is the one core's detoast of that value would return, wherever it now
+  lies. A chunk an aborted inserter left behind passes `SnapshotToast` until its abort is hinted,
+  and its id can be given out again after the OIDs wrap; but its row is not visible to any
+  snapshot, which the return-time check finds, and no entry made later can take a present value's
+  id.
+- **An entry names its row's value.** It is written from the row's own stored datum - the build's
+  from the tuple it scans, an insert's from the tuple the heap stored at its TID (below) - and that
+  value is never changed in place: TOAST values are immutable; a HOT update cannot touch an indexed
+  column and carries the same pointer (`toast_tuple_init()` keeps an unchanged external value's
+  reference, and `heap_attr_equals()` compares the raw datums, so a HOT update's vector is the same
+  pointer, `SET embedding = embedding` included); a non-HOT update makes a new TID with an entry of
+  its own. The entry leaves with its TID: VACUUM removes it in the same `ambulkdelete()` as the
+  row's CODE items, before the heap marks the TID unused, so a TID reused for another row never
+  finds the old row's entry (a crash part-way leaves the TID LP_DEAD until a VACUUM completes, as
+  for every index).
+
+So a row the scan sees, read by place, has exactly the distance its heap fetch would give it, or
+falls back. A row it does not see may read another value's bytes at a place that checks - its
+value removed and its id given to a new one, which then happens to lie there - and is passed over
+by the return-time check before it is returned; its distance only placed it in the sort. The
+checks of the vector's header keep such bytes from reaching the operator's function as a vector of
+other dimensions, which pgvector's functions would refuse with an error; they raise none for two
+vectors of the same dimensions, whatever their floats. Through each history (each tested where
+named, in `vector_toast.sql` unless said):
+
+- **An UPDATE of another column**, HOT (the root TID keeps its entry, and every version the same
+  pointer) or not (a new TID, a new entry, the same value); **`SET embedding = embedding`**, the
+  same pointer, HOT; **an UPDATE that changes the vector**, a new value at a new TID, the old one's
+  chunks deleted by it; **a DELETE and the rows inserted again**; **an INSERT ... SELECT** from the
+  table itself, which the heap stores anew under new value ids. Each followed by the exact path and
+  the probing path, direct reads on and off, the same rows, order and distances, no error.
+- **An insert rolled back**: its rows are in the index and the locator and their chunks in TOAST,
+  passing `SnapshotToast` until their inserter's abort is hinted; read by place, each is passed
+  over by the return-time check, and once hinted, each read fails and falls back to a heap row
+  that is not there (both in `vector_toast.sql`).
+- **Pruning and defragmenting a TOAST page** (`heap_page_prune_opt()`, `PageRepairFragmentation()`)
+  move tuples' bytes within the page and keep their line pointers; the place still names the
+  tuple. A pruned chunk is LP_DEAD and fails the check. Both need a cleanup lock, which the
+  reader's pin and share lock hold off while it copies a chunk.
+- **VACUUM of the TOAST relation reusing line pointers** (`VACUUM (PROCESS_MAIN false)`, and
+  autovacuum, which processes a TOAST table on its own: the common way an entry goes stale): a
+  value whose row is dead is removed, its line pointers made unused and given to the next chunks
+  inserted on that page, while the heap row and its index entries stay. The new tuple's `chunk_id`
+  differs - or, its id given out again since, is that value's, whose row is not the scan's - and the
+  row is dead either way. Tested with rows inserted into the space after, and in the isolation spec
+  with a scan parked between its entries and its chunks.
+- **VACUUM FULL or CLUSTER of the table**, and every ALTER TABLE that rewrites it (a column's type,
+  `SET ACCESS METHOD`, `SET LOGGED`/`UNLOGGED`, a volatile default) write a new heap and TOAST
+  relation and rebuild every index (`reindex_relation()`), the locator with it. `ALTER TABLE ...
+  SET TABLESPACE` copies both block for block, every place kept (not tested). `SET STORAGE`, `SET
+  COMPRESSION` and `SET (toast_tuple_target)` move no stored value; the rows they store otherwise
+  later go as before (`SET STORAGE PLAIN` is tested).
+- **VACUUM FULL of the TOAST relation alone** (`VACUUM FULL pg_toast.pg_toast_N`, which a superuser
+  may run) rewrites its chunks to new places and keeps their value ids and the heap: every place
+  may be stale, and each read by place either checks - the same value's chunk, by the second fact -
+  or falls back. The scan stops trying after its first 64 (above); a REINDEX makes the locator
+  whole. The meta page's `toastrelid` does not see it (the relation keeps its OID), nor would its
+  relfilenode, which `SET TABLESPACE` changes too, with every place kept. Tested, and on a standby
+  (test/recovery, phase 5).
+- **REINDEX** builds the locator anew; `REINDEX` of the TOAST index moves no chunk.
+- **pg_upgrade** keeps relfilenodes (15 on), TOAST relations' OIDs, the value ids in the pointers,
+  and every TID, and refuses a cluster of another `TOAST_MAX_CHUNK_SIZE` (pg_control): the
+  locator stays right, as the index's other pages do.
+- **Standbys** replay the locator's generic WAL to the same pages, and the conflict rule above
+  keeps a query from seeing a removal its snapshot could see; a stale place on a standby is stale as
+  on the primary (test/recovery, phase 5).
+- **OID wraparound of value ids**: the second fact; an id repeats only for a value no longer
+  present, or for an aborted inserter's chunk whose row no snapshot sees.
+- **A speculative insertion** that lost (`INSERT ... ON CONFLICT`) leaves an index entry, a
+  locator entry among them, and chunks whose xmin is made invalid, which `SnapshotToast` refuses:
+  the read falls back, and the heap fetch finds the row dead.
+- **CREATE INDEX CONCURRENTLY**: the build as below, and `validate_index()`'s inserts, whose TID is
+  a HOT chain's root that a later version may follow with another value: such a row has no entry
+  (`lionvec_stored_pointer()` takes only a tuple that ends its chain, as an insert's does).
+- **`old_snapshot_threshold`** (16 only; 17 removed it): a TOAST value a snapshot older than the
+  threshold sees may be removed, and core's fetch then fails with "snapshot too old" on the TOAST
+  index's pages, which a read by place does not read. On 16 with it set, the scan does not read by
+  place.
+- **Serializable transactions**: a member read by place and not returned has no heap fetch, and so
+  no SIREAD lock on its tuple, where the heap fetch takes one. lionvec takes a predicate lock on the
+  whole index (`ampredlocks = false`, §44.5), which every insert into it checks, and a change of a
+  member's vector is a non-HOT update and so an insert into the index; a delete of a member not
+  returned does not change what the query returned. A row returned is fetched, and locked, by the
+  return-time check, and a row the rerank reads by place is fetched before it is read. No isolation
+  spec shows it (an open question below).
+
+#### Build (and parallel build)
+
+The build's callback has the row's stored datum (`FormIndexDatum()` over the tuple the scan read),
+a TOAST pointer for a toasted vector. For a row that qualifies, `lionvec_toast_locate()` scans the
+TOAST index for its value id as `heap_fetch_toast_slice()` does (`toast_open_indexes()`, the valid
+index, `systable_beginscan_ordered()` under the TOAST snapshot), takes each chunk tuple's `t_self`
+with its checks, and makes the runs; the entry goes into the build's sort as one more group, after
+the NULL chain's (`LIONVEC_SORT_LOC_GROUP`, nparts + 2), keyed by its TID, and its place into the
+row's REFINE item's slot when it fits. The rows' vectors are detoasted as before (one more descent
+of the TOAST index a row, its pages just read). After the CODE chains the build writes the group's
+entries to LOC pages in heap order, one run of blocks, each page's range in its special space
+(`lionvec_loc_writer_*()`); then the empty LOC page inserts append to; then the LOCDIR, an item a
+page, the static level first; the meta page records them, `loc_built`, `loc_bpages`, `toastrelid`,
+`refloc_runs` and the flag. `log_newpage_range()` covers them with the rest. A parallel build's
+workers do the same into the shared sort (each opening the TOAST relation and its indexes with
+`AccessShareLock`, as a detoast does), and the leader's merge writes them in heap order: the
+locator comes out of a parallel build as out of a serial one, page for page (tested). Rows the
+build passes over as dead have no entry; RECENTLY_DEAD and in-progress ones do, their values being
+present. DEBUG1 says `a locator of N rows in TOAST, its refine items with their places` (or
+`without places`).
+
+#### Inserts
+
+An executor's insert hands `aminsert()` the vector before TOAST took it (`heap_insert()` toasts a
+copy, and the slot keeps the original), and an `INSERT ... SELECT` of another row's vector hands it
+that row's pointer while the heap detoasts it and stores it anew under another id. So an index that
+keeps a locator reads the row's tuple at `ht_ctid` - just written by this transaction, its page in
+shared buffers, under a share lock - for the pointer the heap stored (`lionvec_stored_pointer()`;
+the tuple must be `LP_NORMAL` and the end of its chain), finds its chunks through the TOAST index
+as the build does, and compares their bytes with the value it was handed, detoasted: the same, or
+no entry (`lionvec_insert_locate()`). All of that before the meta page is locked. Under the meta
+page's lock, the REFINE item (with the place in its slot), the CODE item and its copy go in as
+before, then the injection point `lionvec-insert-unlocated`, then the entry
+(`lionvec_loc_append()`): on the tail LOC page, the tail's LOCDIR item - the last of the chain -
+widened to its heap block, one generic WAL record of the two pages; when the tail is full, a new LOC
+page with the entry, its LOCDIR item on the chain's last page, and the meta page naming it the tail,
+in one record; and when that LOCDIR page is full too, a new one after it, in the same record: four
+pages at most, which a generic WAL record takes. A crash before the entry's record leaves a row
+without an entry, which reads as before; the entry is the last thing written, so it never names a
+row whose items are not in (test/recovery, phase 5, crashes an insert parked there).
+
+**The append area.** Inserts append in arrival order, not heap order, so a page they fill covers
+the heap blocks they landed in: a narrow range for a table that grows at its end, a wide one under
+updates that move rows (a non-HOT update is an insert at a new TID, its vector the same value) or
+inserts into space VACUUM freed. A query reads every LOC page whose range holds a member's block,
+so a wide range is read by most queries. The cost is bounded by the inserts since the build: an
+update of 10% of DBpedia's rows would be 40 LOC pages more a query, a millisecond or two from the
+disk. A re-sort by VACUUM - the pages inserts added, but the tail, gathered once they are more than
+a few and their ranges overlap, sorted by TID and written back over the same pages in order, their
+LOCDIR items narrowed - is not built (an open question below).
+
+#### VACUUM
+
+`lionvecbulkdelete()` walks the LOC pages after the CODE chains (`lionvec_vacuum_locs()`: the LOCDIR
+items sorted by block, each LOC page under an exclusive lock), removing the entries of dead TIDs
+(`PageIndexMultiDelete()`, a generic WAL record a page that loses any), the bulk-delete callback
+asked once a row more. It narrows no range: a reader passing a page over by a range that is too
+wide loses nothing, but one too narrow would miss entries an insert adds while it runs, and nothing
+gains by the work. Pages are never recycled (§44.5): a page emptied stays in the LOCDIR, and an
+insert reuses no free space but the tail's, as CODE and REFINE pages do until REINDEX (§44.11,
+"REFINE space"). A crash part-way leaves entries of TIDs still LP_DEAD, which the next VACUUM
+removes. A REFINE item, and its slot, goes when the CODE items that point at it do, as before, so a
+crash part-way can leave a REFINE item no CODE item points at; nothing reads it (§44.5).
+
+#### WAL
+
+Generic WAL, as every write of lionvec's, in both of lion's modes: lionvec writes no record of the
+custom resource manager's, which `installcheck-rmgr` runs it under all the same. The recovery
+harness's phase 5 (test/recovery/README.md) builds a table of 768-dimension vectors in TOAST,
+runs a write load of inserts, updates HOT and not, of the vector and of other columns, deletes,
+rollbacks and `INSERT ... SELECT`, beside VACUUMs of the table and of its TOAST relation alone,
+under `wal_consistency_checking = 'generic'`; kills the server three times in the middle of it, the
+last with a VACUUM in flight, and once with an insert parked at `lionvec-insert-unlocated`; and
+after each recovery, and on a hot standby under the same load and after a `VACUUM FULL` of the
+TOAST relation alone, reads the locator off the pages with `pageinspect` and checks it against the
+heap and the TOAST relation (no entry names a value other than its TID's tuple stores; every row
+the snapshot sees whose vector is in TOAST has an entry of its value, where its chunks are; a REFINE
+item's place is its row's entry's), and the exact and probing paths' rows, order and distances with
+direct reads on and off and a sort's.
+
+#### Format 5, and an index of format 4
+
+The meta page's fields are appended, every earlier one at its offset, the page types are new, and
+the REFINE item's slot is past its codes, its `nloc` in the former pad. A format-4 index has no
+locator, its REFINE items no slot, and none of the new fields (the bytes past its `pd_lower`, 104,
+are the zeros `PageInit()` left). So this pg_lion reads it as an index without a locator
+(`LIONVEC_VERSION_NOLOC`; `lionvec_meta_copy()` turns its missing fields into "none") - its scans,
+inserts and VACUUMs exactly as before, and every write of its meta page touches only fields format
+4 has - rather than refuse it as format 3 was refused (whose meta page meant other things); REINDEX
+makes it format 5, with a locator if its vectors may lie in TOAST. Refusing it would have asked
+every user of a toasted table to REINDEX for nothing they would notice but the speed
+(`vector_toast_corrupt.sql` makes a meta page format 4's, then scans, inserts, VACUUMs and
+REINDEXes the index).
+
+#### Measured
+
+`bench/results/2026-10-17-lionvec-toast-direct/`: `knn_readahead.py` on `dbpedia_toast` (above;
+the heap 7.6 MB, its TOAST 900 MB), its index REINDEXed by this version - format 5, a locator and
+REFINE places - under `pg_lion.vector_toast_direct` off and on, on the prototype's cluster and
+settings (§44.9; `io_method = worker`, 3 workers); the 10 queries of each kind from the disk (the
+server restarted and the page cache dropped before each query) and warm (every relation in shared
+buffers, 5 runs a query). The median ms, `off / on`, and in brackets the median of each query's on
+over its off:
+
+| Query | Disk | Warm |
+| --- | --- | --- |
+| unfiltered, margin 3 | 30.5 / 27.2 (0.94) | 2.6 / 2.6 (0.96) |
+| unfiltered, margin 8 | 53.7 / 44.8 (0.93) | 6.2 / 6.3 (0.99) |
+| 3%, probed | 70.8 / 63.9 (0.93) | 10.2 / 10.0 (0.99) |
+| 1%, exact | 179.7 / 68.3 (0.38) | 14.1 / 7.9 (0.55) |
+| 3%, exact | 457.2 / 158.6 (0.34) | 31.8 / 16.4 (0.52) |
+
+The exact path at 1% read 1,631 pages where it had read 2,717 - the LOCDIR page, 394 LOC pages (the
+members' entries lie on all but two of the 396), the 1,204 vectors' pages, the 10 rows' heap pages
+and 22 of the TOAST index's (below) - and waited 12.7 ms on them, not 152.7; at 3% 3,915 pages, not
+5,620, and 12.2 ms of waiting, not 395.9: within 12 ms of the inline table's exact path at 1% (56.2
+ms the same morning, its rows' heap pages streamed) and level with it at 3% (158.3), and within 13
+and 17 ms of the prototype's (55.2 and 141.5, a 400-page stand-in for the locator, no entry
+checked). Warm, the exact path took a little over half its time (7.9 ms against 14.1, and 16.4
+against 31.8; inline 4.3 and 11.5, the prototype 4.0 and 11.6, its members given it): the TOAST
+index's descents saved, a page a vector, every chunk still checked.
+
+The probing kinds read each row they rerank by its REFINE item's place - 10 a query, none failing,
+the return-time check finding each row's value its own - asking the kernel for the chunks' page
+beside the row's heap page where they ask for the heap's (1 and 16 asks at margins 3 and 8): 6 to 7%
+faster from the disk, query by query, but no fewer pages read (429 against 430 at a margin of 3).
+The query's own projection detoasts each row returned, through the TOAST index, after the scan,
+whichever way the scan read it: the plan's index scan computes `embedding <=> q` for the `ORDER
+BY`'s column, which no index scan can hand it (below, "Open questions"). That costs the exact path
+too: the 10 rows' TOAST index descents, 22 of its 1,631 pages. Warm, the probing kinds took the same
+time (0.96 to 0.99). Every query returned the same rows in the same order under both settings, with
+the recall the inline table's.
+
+On the inline table (`dbpedia`, whose index keeps no locator, read by this version and by main at
+1be037c) the queries took main's time: from the disk each query's over main's 0.90 to 1.07 by
+kind (the medians; `inline-worker-3.json`), and warm, in eight sessions taking turns between the
+two libraries, 0.97 to 1.00 (quartiles 0.95 to 1.06; `inline-warm-alternating.json`). Runs of one
+session a library had made it look 0.79 to 1.59, by which library ran first.
+
+#### Costs
+
+- **Size**: an entry of 28 bytes a row with its vector in TOAST (36 across two pages), about 0.45%
+  of a 1536-dimension vector's 6.2 KB of TOAST; the LOCDIR 0.25% of that; the REFINE slot no page
+  at the widths above. On DBpedia, REINDEXed: 396 LOC pages of entries, the inserts' empty tail
+  and one LOCDIR page, 3,260,416 bytes - 1.26% of the 258,949,120 the index took as format 4 -
+  and the REFINE pages the same 23,581, five items a page with their 20-byte slots as without.
+- **Build**: a TOAST index lookup a row, its pages just read by the detoast; the sort holds a
+  tuple more a row, of 20 to 30 bytes, beside its CODE item's 224 at 1536 dimensions. DBpedia's
+  serial REINDEX took 131.0 s, main's 137.1 (one run each): the lookups are lost in the build.
+- **Insert**: a heap page, a TOAST index descent and the chunks' pages, all in shared buffers, the
+  value compared, and one generic WAL record of the LOC tail's and the LOCDIR page's changes.
+  Measured (`knn_toast_insert.py`: 5,000 rows of DBpedia's by `INSERT ... SELECT` into 20,000
+  under a fresh index, its vectors in TOAST): 121 bytes more WAL a row, the REFINE slot's 20 among
+  them (50.79 MB against main's 50.19, +1.2%), and 2,275 ms against 2,211 (medians of 8, taking
+  turns; each pair's ratio 0.83 to 1.13, their median 1.00), the spread of the runs wider than the
+  difference. `pg_lion.vector_toast_direct` does not change what an insert does: an index keeps
+  its locator up whatever the setting.
+- **VACUUM**: the LOC pages walked and the callback asked once a row more.
+- **The exact path**: the LOCDIR, the LOC pages with members, and a TOAST page a vector, streamed,
+  and a heap page a row returned; memory as above.
+- **The rerank**: the REFINE item read again (a buffer hit), and the TOAST index descent saved.
+- **Inline tables: nothing** - no locator, and one flag tested by the scan; measured, main's time
+  (above).
+
+The cost model (§44.7) prices the exact path at a random page a member, which a vector read by
+place is; it priced the toasted table's two to three pages a member as one before. Nothing in it
+changes, and `pg_lion.vector_exact_rows` - set where the exact path and probing cost the same
+cold, on the inline table - may be worth raising for toasted tables.
+
+#### Tests
+
+- Regression, `vector_toast.sql`: a table of 1536-dimension vectors in TOAST, some NULL - the
+  build's locator checked entry by entry against the heap and the TOAST relation (`tt_check()`,
+  reading LOC and REFINE pages with `pageinspect`), what the scans read with every page in shared
+  buffers (the DEBUG1 counts), and every `vector_prefetch` the same rows; then each of the
+  histories above, each followed by the exact path and the probing path with direct reads on and
+  off, compared row for row, order and distance (`tt_cmp()`), none raising an error; the TOAST
+  relation vacuumed alone and rewritten alone, the fallbacks counted; VACUUM, and REINDEX making
+  every place right again. Then 768, 1024 and 3072 dimensions and a `halfvec(1536)`, values in one
+  run, across two pages and across three, a REFINE slot of three runs; rows of every kind under
+  cosine (NULLs, zero vectors, compressed, inline, in TOAST) and an expression index (no locator);
+  a parallel build's locator the same as a serial one's, page for page; indexes that keep none (short
+  vectors, `toast_tuple_target`), and an unlogged table's init fork.
+- Regression, `vector_toast_corrupt.sql` (17 on, `pg_buffercache_evict()`): pages damaged on disk -
+  a LOC entry's run past the TOAST relation's end, on another value's page, at a line pointer the
+  page lacks, naming a value no row stores: each falls back; a LOC entry naming another row's value
+  and place: the return-time check's `ERRCODE_INDEX_CORRUPTED`; an entry that is not one (flags,
+  runs miscounted): `ERRCODE_INDEX_CORRUPTED`; a REFINE item's place wrong: the rerank falls back;
+  naming another value: the error; and a format-4 index, read, kept up, vacuumed and REINDEXed.
+- Isolation, `lionvec_toast_scan.spec`: an exact-path scan parked at `lionvec-exact-located` while
+  rows are deleted, the TOAST relation vacuumed alone and new rows take the freed places, its rows
+  compared with a sort under the same snapshot and its lock on the TOAST relation shown held to its
+  transaction's end; and a probing cursor parked with places queued while the table is vacuumed
+  and its REFINE items, heap TIDs and TOAST space are taken again.
+- Recovery: phase 5, above.
+- Unit (`test/unit/vec_test.c`): the chunks a vector takes at each width and their sizes, the runs a
+  REFINE slot holds, runs made from chunk places against a model, a run list's checks, and the LOC
+  pages chosen for a scan's members against a brute-force model.
+
+#### Open questions
+
+- The append area's re-sort (above): now, or once an update-heavy measurement asks for it?
+- The second level (above): a binary search of the static level or a level over it, and from how
+  many rows - neither needs a format change.
+- Serializable: a member read by place and not returned takes no tuple SIREAD lock; the index-wide
+  predicate lock covers a change of its vector (an insert into the index), and a delete changes
+  nothing the query returned. Argued, not shown: a spec of a serializable pair would show the
+  read-write conflict still found.
+- An option not to keep a locator (a reloption read by the build), for a table whose vectors lie in
+  TOAST but whose queries never take the exact path - the locator then costs its pages and inserts
+  their entries for nothing but the rerank.
+- The rows returned are detoasted once more by the query's projection: the index scan's target list
+  computes `embedding <=> q` for the `ORDER BY`, which the executor never takes from
+  `xs_orderbyvals` (only a recheck reads them). Ten rows a query, a TOAST index descent each and its
+  chunk page, after the scan - 22 of the exact path's 1,631 pages from the disk, whose chunk pages
+  it has just read. The scan has every one of the values in hand; handing them to the projection
+  would need the planner's help (a target list naming the scan's distance), not the index's.
