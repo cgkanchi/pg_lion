@@ -329,7 +329,7 @@ and the bound rejecting rows by the distance they come in):
                     ORDER BY d LIMIT 1000) s
      WHERE note LIKE 'a%' ORDER BY d LIMIT 10;
 
-An unfiltered order can be scanned in parallel (DESIGN.md §44.4, "A parallel scan"): `Gather Merge`
+With `pg_lion.vector_parallel_scan` on (below; off by default), an unfiltered order can be scanned in parallel (DESIGN.md §44.4, "A parallel scan"): `Gather Merge`
 over `Parallel Index Scan using <lionvec index>`, each process - the workers, and the leader unless
 `parallel_leader_participation` is off - probing the partitions it claims first, running the scan's
 margin and pause on its own rows and returning them in order of distance, and Gather Merge merging
@@ -686,6 +686,11 @@ fails, and under `exact` it is sorted. A clause the planner tests once (`WHERE $
 of the scan's rows, and one of the vector column alone (`embedding IS NOT NULL`, a distance bound)
 filters them under every value; any other is a filter, a key's `id = 5` too. A table with
 row-level security `lionvec` refuses under every value (below).
+
+`pg_lion.vector_parallel_scan` (`off`): whether the planner may scan a `lionvec` index in parallel
+(above, and DESIGN.md §44.4, "A parallel scan"). Off, a `lionvec` order gets no partial path at all,
+whatever core's parallel settings say: on every query measured the parallel scan was slower than
+the serial one.
 
 `pg_lion.vector_prefetch` (`off`, `fadvise` or `stream`; `stream` from PostgreSQL 17, `fadvise` on
 16): how a `lionvec` scan reads ahead the pages it will read next (DESIGN.md §44.4, "Prefetch" and

@@ -105,6 +105,7 @@ double		lionvec_exact_per_part = LIONVEC_EXACT_PER_PART_DEFAULT;
 int			lionvec_overflow = LIONVEC_OVERFLOW_ERROR;
 int			lionvec_postfilter = LIONVEC_POSTFILTER_ERROR;
 int			lionvec_prefetch = LION_READAHEAD_DEFAULT;
+bool		lionvec_parallel_scan = false;
 
 static const struct config_enum_entry lionvec_overflow_options[] = {
 	{"error", LIONVEC_OVERFLOW_ERROR, false},
@@ -312,6 +313,23 @@ lion_vec_init(void)
 							 &lionvec_prefetch,
 							 LION_READAHEAD_DEFAULT,
 							 lionvec_prefetch_options,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §44.4, "A parallel scan": correct, but slower than the serial
+	 * scan on every query measured (each participant probes about as much as
+	 * one scan does, and Gather Merge waits on the slowest), so its partial
+	 * paths are offered only when asked for (lo_knn_partial()).
+	 */
+	DefineCustomBoolVariable("pg_lion.vector_parallel_scan",
+							 "Whether the planner may scan a lionvec index in parallel.",
+							 "Off by default: every participant of a parallel scan ranks all the "
+							 "centroids and probes until its own margin and pause stop it, so on the "
+							 "queries measured the parallel scan was slower than the serial one.",
+							 &lionvec_parallel_scan,
+							 false,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
