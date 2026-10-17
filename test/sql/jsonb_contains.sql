@@ -225,7 +225,10 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM jz_d WHERE doc @> '{"k0": 1}';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM jz_d WHERE doc ? 'k1';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM jz_d WHERE doc @? '$.k0 ? (@ == 1)';
 EXPLAIN (COSTS OFF) SELECT id FROM jz_d WHERE doc @> '{"k0": 1}';
+-- left to the seq scan (not disabled, whose EXPLAIN differs on PG 18+)
+RESET enable_seqscan;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM jz_d WHERE doc = '{"k0": 1}';
+SET enable_seqscan = off;
 CREATE INDEX jz_d_e ON jz_d USING lion (doc jsonb_ops);
 SELECT i.indexrelid::regclass AS idx, c.opcname
   FROM pg_index i JOIN pg_opclass c ON c.oid = i.indclass[0]
