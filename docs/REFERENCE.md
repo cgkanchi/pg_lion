@@ -330,7 +330,7 @@ subquery, which the planner never pushes a clause into past its `LIMIT`:
                     ORDER BY d LIMIT 1000) s
      WHERE note LIKE 'a%' ORDER BY d LIMIT 10;
 
-An unfiltered order can be scanned in parallel (DESIGN.md §44.4, "A parallel scan"): `Gather Merge`
+With `pg_lion.vector_parallel_scan` on (below; off by default), an unfiltered order can be scanned in parallel (DESIGN.md §44.4, "A parallel scan"): `Gather Merge`
 over `Parallel Index Scan using <lionvec index>`, each process - the workers, and the leader unless
 `parallel_leader_participation` is off - probing the partitions it claims first, running the scan's
 margin and pause on its own rows and returning them in order of distance, and Gather Merge merging
@@ -682,6 +682,11 @@ other, chosen by cost, as before 2026-10-16. `pg_lion.enable_ordered_scan = off`
 re-admit the plain scan: under `exact` the query is then sorted, and under `error` it fails. A
 clause the planner tests once (`WHERE $1`, `WHERE current_user = 'app'`), and one a partial
 `lionvec` index's predicate implies, is no filter of the scan's rows.
+
+`pg_lion.vector_parallel_scan` (`off`): whether the planner may scan a `lionvec` index in parallel
+(above, and DESIGN.md §44.4, "A parallel scan"). Off, a `lionvec` order gets no partial path at all,
+whatever core's parallel settings say: on every query measured the parallel scan was slower than
+the serial one.
 
 `pg_lion.vector_prefetch` (`on`): whether a `lionvec` scan asks for the pages it will read next
 before it reads them (DESIGN.md §44.4, "Prefetch"): the rest of a partition's code pages, laid one

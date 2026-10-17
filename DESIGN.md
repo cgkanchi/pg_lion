@@ -20929,7 +20929,9 @@ unasked, then asks again. A cold relation is asked for all along, a warm one a n
 at a time; the PART chain, which every scan reads and so is warm whatever else is, does not count.
 Warm it then costs about 2%: 2.33 ms against 2.29 at a margin of 3 and 4.99 against 4.91 at 8.
 
-**A parallel scan** (2026-10-16). `amcanparallel`: an unfiltered `ORDER BY` of the distance may be
+**A parallel scan** (2026-10-16). `amcanparallel`: with `pg_lion.vector_parallel_scan` on (off by
+default since 2026-10-17, the measurements below finding it slower everywhere; off, `lo_knn_partial()`
+drops a lionvec order's partial paths), an unfiltered `ORDER BY` of the distance may be
 a Parallel Index Scan under a Gather Merge (§44.7 prices it; a filtered one stays serial, below).
 Each participant - every worker, and the leader unless `parallel_leader_participation` is off -
 runs the whole scan above on its own: it reads the meta page and the PART chain, ranks every
@@ -21376,9 +21378,12 @@ could have lost to; LionOrdered's paths are serial.
   to 33.5 under a 1% filter; warm, every page in shared buffers, it costs about 2% (2.29 to 2.33 ms
   at a margin of 3, 4.91 to 4.99 at 8): a scan whose asks keep finding their pages in shared
   buffers mostly stops asking (§44.4, "Prefetch"). Off where that is not worth having.
+- `pg_lion.vector_parallel_scan` (boolean, default off, 2026-10-17): whether a lionvec order gets
+  partial paths at all (§44.4, "A parallel scan"); off because the parallel scan was slower than
+  the serial one on every query measured.
 - core's `max_parallel_workers_per_gather`, `parallel_setup_cost`, `parallel_tuple_cost`,
   `min_parallel_index_scan_size`, `min_parallel_table_scan_size` and the table's
-  `parallel_workers`: whether an unfiltered scan runs in parallel, and in how many processes
+  `parallel_workers`: with `pg_lion.vector_parallel_scan` on, whether an unfiltered scan runs in parallel, and in how many processes
   (§44.7, "A parallel scan"). At the defaults it does not: the setup costs more than a serial
   scan's start-up.
 - `partitions` (reloption, 0 to 262,144, default 0; 1,000,000 until a review found the build at a

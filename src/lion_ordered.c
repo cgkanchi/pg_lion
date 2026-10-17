@@ -2315,7 +2315,8 @@ lo_knn_take(PlannerInfo *root, RelOptInfo *rel, LoKnn *knn)
  * prices the index before it counts the workers), each taken out and
  * offered again as lion_plain_set_rel_pathlist() reprices a plain path,
  * so that add_partial_path() orders and prunes them by the cost they now
- * have.
+ * have; or, unless pg_lion.vector_parallel_scan is on, taken out and not
+ * offered again.
  */
 static void
 lo_knn_partial(RelOptInfo *rel)
@@ -2339,6 +2340,8 @@ lo_knn_partial(RelOptInfo *rel)
 	{
 		IndexPath  *ipath = (IndexPath *) lfirst(lc);
 
+		if (!lionvec_parallel_scan)
+			continue;
 		lion_vec_parallel_cost(ipath);
 		add_partial_path(rel, (Path *) ipath);
 	}

@@ -542,14 +542,15 @@ took 33 ms cold rather than 71. In shared buffers prefetch costs about 2% (2.33 
 2.29 at the default margin, 5.0 rather than 4.9 at 8): a scan whose asks keep finding their pages
 there mostly stops asking. `SET pg_lion.vector_prefetch = off` turns it off altogether.
 
-An unfiltered `ORDER BY embedding <=> $1 LIMIT k` can run in parallel: a Gather Merge over a
-Parallel Index Scan, each process probing the partitions it reaches first and returning their rows
-nearest first, merged into one order (DESIGN.md §44.4, "A parallel scan"). At the planner's default
-costs it stays serial - `parallel_setup_cost` (1000) is more than a serial scan's start-up - and a
+With `pg_lion.vector_parallel_scan` on (it is off by default), an unfiltered `ORDER BY embedding
+<=> $1 LIMIT k` can run in parallel: a Gather Merge over a Parallel Index Scan, each process probing
+the partitions it reaches first and returning their rows nearest first, merged into one order
+(DESIGN.md §44.4, "A parallel scan"). Even then, at the planner's default costs it stays serial - `parallel_setup_cost` (1000) is more than a serial scan's start-up - and a
 table whose heap is under `min_parallel_table_scan_size` (8 MB, as it is when the vectors are in
 TOAST) is planned no workers unless its `parallel_workers` is set:
 
 ```sql
+SET pg_lion.vector_parallel_scan = on;
 SET max_parallel_workers_per_gather = 2;
 SET parallel_setup_cost = 10;
 ALTER TABLE items SET (parallel_workers = 2);   -- or lower min_parallel_table_scan_size
