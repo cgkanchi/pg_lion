@@ -315,13 +315,15 @@ up to `pg_lion.vector_exact_per_partition` (1.5) rows for each of the index's pa
 is more, is answered exactly, from every member's distance; a larger one by reading partitions as
 above, counting its patience in matching rows. A very selective filter, or one a sort answers more
 cheaply, is planned as a sort of the lion bitmap scan's rows, which is exact. A `WHERE` clause no
-lion index answers - a column without one, `id > 0`, `embedding IS NOT NULL` - is never applied to
-the rows the `lionvec` scan returns: the scan pauses and skips late rows by the rows it returns,
+lion index answers - a column without one, `id > 0` - is never applied to the rows the `lionvec`
+scan returns: the scan pauses and skips late rows by the rows it returns,
 not by those a `Filter` keeps, so the answer would depend on the plan (DESIGN.md §44.6,
 "Post-filtering"). By default such a query fails when it is planned (`pg_lion.vector_postfilter`,
 below, whose `exact` plans it as a sort of the filter's rows instead); for an approximate answer,
 filter the nearest rows of a subquery, which the planner never pushes a clause into past its
-`LIMIT`:
+`LIMIT` (a clause of the vector column alone, `embedding IS NOT NULL` or a distance bound such as
+`embedding <=> $1 < 0.3`, is the exception: it filters the scan's rows, NULL vectors coming last
+and the bound rejecting rows by the distance they come in):
 
     SELECT id FROM (SELECT id, note, embedding <=> $1 AS d FROM items WHERE category = 3
                     ORDER BY d LIMIT 1000) s
@@ -681,10 +683,9 @@ the one row by the primary key and sorts it). `allow`: the plain scan with a `Fi
 `pg_lion.enable_ordered_scan = off` does not re-admit the plain scan: under `error` the query then
 fails, and under `exact` it is sorted. A clause the planner tests once (`WHERE $1`,
 `WHERE current_user = 'app'`), and one a partial `lionvec` index's predicate implies, is no filter
-of the scan's rows; any other is, a key's `id = 5` and `embedding IS NOT NULL` too, and so is a
-row-level security policy, on a table `LionOrdered` does not read: there every `lionvec` query of a
-role the policies apply to fails under `error`, with or without a `WHERE`, and the subquery would
-too, so give such a role `exact` (`ALTER ROLE app SET pg_lion.vector_postfilter = exact`).
+of the scan's rows, and one of the vector column alone (`embedding IS NOT NULL`, a distance bound)
+filters them under every value; any other is a filter, a key's `id = 5` too. A table with
+row-level security `lionvec` refuses under every value (below).
 
 `pg_lion.vector_prefetch` (`off`, `fadvise` or `stream`; `stream` from PostgreSQL 17, `fadvise` on
 16): how a `lionvec` scan reads ahead the pages it will read next (DESIGN.md §44.4, "Prefetch" and
@@ -775,8 +776,9 @@ parallel only without a filter (above), and indexes a single column of pgvector'
 lion filter of up to `pg_lion.vector_exact_rows` rows, or `pg_lion.vector_exact_per_partition` a
 partition. A filter no lion index answers fails by default, and under
 `pg_lion.vector_postfilter = exact` is a sort of the filter's rows: exact, and as slow as reading
-every matching row; on a table with row-level security every query of a role its policies apply to
-is such a query. Inserts
+every matching row. It does not support row-level security: no `lionvec` index is built on a table
+that has it enabled, or on a partition of one, and a query such an index could order fails when it
+is planned, whoever runs it, until row-level security is disabled. Inserts
 serialize on the index's meta page and read every partition's centroid, or with 64 partitions or
 more the centroids of the partitions' regions and of the partitions in the regions nearest the row
 (16 of them, 5 with `spill = off`). VACUUM removes dead rows' codes but reuses their space only for new rows on

@@ -377,6 +377,7 @@ lionvec_distance_type_ok(Oid type)
 
 /* lion_vec.c */
 extern void lion_vec_init(void);
+extern void lionvec_refuse_rls(Oid relid, const char *index);
 extern double lionvec_exact_limit(double nparts);
 extern LionVecInfo *lionvec_get_info(Relation index);
 extern const float *lionvec_datum_floats(Datum d, bool half, float *buf,
