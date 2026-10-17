@@ -15721,12 +15721,27 @@ than overruns (§30.4).
   key (`lion_source_sorted()`); a WALK (a range) or a LIST (a long IN list) arrives entry by entry
   or batch by batch - one PIECE per container key each entry or batch touches, so a range over
   400,000 distinct values brings 400,000 one-TID pieces for 34 keys - and its pieces are sorted and
-  those of equal keys ORed, through one bitset image per key, whenever the directory is full (from
+  those of equal keys ORed (**merging the pieces**, below) whenever the directory is full (from
   1,024 entries on; it then doubles until it has room for 32 pieces an entry the merge left, or its
   slots alone would take `hash_mem`), before their bytes would degrade the set (once there are at
   least as many pieces as merged entries), and when the source is complete. A merge sorts only the
   pieces since the last one, by key and slot packed into a word, and merges them with the entries
-  that one left, which are in order. A BitmapAnd is the container-wise AND of its children's sets,
+  that one left, which are in order. The sort is a merge of the ascending runs the pieces already
+  lie in (`lo_merge_slots()`): a source hands them out entry by entry or bucket by bucket, each in
+  key order, so a summary's few buckets make a few long runs, which take a pass or two, and a range
+  over unique values, runs of a piece or two, costs a merge sort.
+  **Merging the pieces.** The pieces of a key that hold `LO_MERGE_DIRECT_MAX` members or fewer
+  together - `LION_WIDTH_ARRAY_CARD(1)`, 256 at 8K, an ARRAY as large as the narrowest NARROW, so
+  that the union is always an ARRAY or a RUN - are merged member by member
+  (`lion_container_or_merge()`): each piece's members are set in a two-level bitmap, the words of an
+  image of the key and a summary bit for each word, and read back in order, which sorts them and
+  drops the repeats without a comparison, and the ARRAY that leaves is optimized. Only the words a
+  member falls in are touched - the first member of a word assigns it - so nothing of 4 KB is
+  cleared or scanned, and the result is byte for byte the container the image makes, since
+  `lion_container_optimize()`'s choice is a function of the members alone. A key of more members,
+  or one whose pieces yield more than `LION_ARRAY_MAX_CARD` values (a damaged header), is ORed
+  into one bitset image and turned into a container (`lion_bits_to_container()`).
+  A BitmapAnd is the container-wise AND of its children's sets,
   a BitmapOr their OR; a leaf that selects nothing is an empty set. No lossy page exists anywhere in this:
   every member is a TID some entry held (§29.6).
   *(Fixed 2026-09-25, second review: the pieces were merged only once the source was complete, and
@@ -15744,6 +15759,20 @@ than overruns (§30.4).
   LionOrdered's 130 ms before its first row under that filter; the set now takes 45 ms, as long as
   the lion bitmap scan of the same range takes to walk its 100,000 entries. A column whose ranges
   span that many keys wants summaries (§32): the set then takes 3 ms.)*
+  *(Fixed 2026-10-17, DBpedia's 115,000 vectors of one row a heap page, a lionvec KNN under a lion
+  filter through `summaries = auto`: every key's pieces went through the image, 8 KB of passes - the
+  clear, the count, the runs and the members of `lion_container_optimize()` over the 4 KB of a
+  BITSET - whatever the key held. A summary's buckets and entries each cover every block of a
+  column spread evenly over the table, so `u < 0.1` brought 3.5 pieces of 6.5 members to each of
+  1,800 keys and `u < 1.0` 25 pieces of 64, and the set build was 52% of a 9.7 ms query at
+  `u < 0.1` - its merges 36% - and 80% of 14.6 ms at `u < 1.0`, against 2.1 ms for the unfiltered
+  lionvec scan: a cost of the keys, a heap block in 64, not of the members, which a million rows
+  read as a fixed 35-45 ms. Merged member by member, 3 pieces of 6 take 40 ns against the image's
+  1.2 us, and 25 of 64 0.2 us against 1.4; the queries took 9.5 -> 6.6 ms at `u < 0.1`, 9.6 -> 6.7
+  at `u < 0.3` and 14.3 -> 11.6 at `u < 1.0`, with the same rows. That left the sort of the
+  slots, a quicksort, the largest part of a merge: 16% of the query at `u < 1.0`, whose 45,000
+  pieces come in 25 runs, which the quicksort took 2.4 ms over and a merge of the runs takes 0.34
+  (measured apart); the query then took 9.1 ms, and the set build 69% of it.)*
 - **Exact, or rechecked.** The set is EXACT when every leaf's `lion_source_exact()` is true, no
   lion index clause was lossy and the set did not degrade. Then every member satisfies the
   `lionqual` and nothing is rechecked; otherwise every fetched member is tested against the
