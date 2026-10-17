@@ -2955,6 +2955,23 @@ lion_container_add_many(LionContainer *acc, const uint16 *vals, uint32 n,
 	return acc->cardinality;
 }
 
+/* Set lo in lion_container_or_merge()'s two-level bitmap: the first member of a word assigns it. */
+static pg_always_inline void
+merge_set(uint64 *w, uint64 *seen, uint32 lo)
+{
+	uint32		word = lo >> 6;
+	uint64		bit = UINT64CONST(1) << (lo & 63);
+	uint64		wbit = UINT64CONST(1) << (word & 63);
+
+	if (seen[word >> 6] & wbit)
+		w[word] |= bit;
+	else
+	{
+		seen[word >> 6] |= wbit;
+		w[word] = bit;
+	}
+}
+
 /*
  * dest = c[0] OR ... OR c[n - 1], optimized, by merging their members: each
  * container's members are set in a two-level bitmap - the image's words, and a summary of
@@ -2987,23 +3004,6 @@ lion_container_add_many(LionContainer *acc, const uint16 *vals, uint32 n,
  * dest (capacity LION_CONTAINER_MAX_SIZE) must not overlap any of c; the c's
  * may come off pages.
  */
-/* Set lo in or_merge()'s two-level bitmap: the first member of a word assigns it. */
-static pg_always_inline void
-merge_set(uint64 *w, uint64 *seen, uint32 lo)
-{
-	uint32		word = lo >> 6;
-	uint64		bit = UINT64CONST(1) << (lo & 63);
-	uint64		wbit = UINT64CONST(1) << (word & 63);
-
-	if (seen[word >> 6] & wbit)
-		w[word] |= bit;
-	else
-	{
-		seen[word >> 6] |= wbit;
-		w[word] = bit;
-	}
-}
-
 bool
 lion_container_or_merge(const LionContainer *const *c, uint32 n, uint32 ckey,
 						LionContainer *dest)
