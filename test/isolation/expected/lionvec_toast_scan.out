@@ -58,6 +58,7 @@ step s1_check_exact:
 	SET LOCAL enable_sort = on;
 	SET LOCAL enable_indexscan = off;
 	SET LOCAL pg_lion.enable_ordered_scan = off;
+	SET LOCAL pg_lion.vector_postfilter = exact;
 	SELECT count(*) AS rows, count(DISTINCT g.id) AS distinct_rows,
 		   count(*) = count(*) FILTER (WHERE g.id = s.id) AS sort_order,
 		   count(*) FILTER (WHERE g.id % 7 = 0) AS deleted_since
