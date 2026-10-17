@@ -380,7 +380,14 @@ lion_meta_record_order(LionMetaPageData *meta, LionIndexState *ix)
 	int			i;
 
 	meta->order_flags |= LION_META_ORDER_RECORDED;
-	/* ... and whether it stored positions, which ix was filled with (§17) */
+
+	/*
+	 * ... and whether it stored positions, which ix says once
+	 * lion_settle_store_positions() has settled "auto" (§17): taken from ix,
+	 * not added to what the image says, because buildempty's image is the
+	 * one ix was filled from and still asks for them.
+	 */
+	meta->order_flags &= ~LION_META_POSITIONS;
 	meta->order_flags |= ix->meta.order_flags & LION_META_POSITIONS;
 	meta->ordered_cols = 0;
 	for (i = 0; i < ix->ncolumns; i++)

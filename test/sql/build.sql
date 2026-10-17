@@ -78,9 +78,11 @@ SELECT count(*) > 1000 AS has_heap_only_tuples
 	   heap_page_items(get_raw_page('lion_build', b::int))
  WHERE (t_infomask2 & 32768) <> 0;		-- HEAP_ONLY_TUPLE
 
+-- Without positions (positions.sql builds them): the shape check of section 5
+-- counts a tsvector column's lexemes, and positions add a row-length key.
 CREATE INDEX lion_build_all ON lion_build
-	USING lion (mood, flag, n, t, ts, ia, ta, tv, u);
-CREATE INDEX lion_build_tv ON lion_build USING lion (tv);
+	USING lion (mood, flag, n, t, ts, ia, ta, tv, u) WITH (store_positions = off);
+CREATE INDEX lion_build_tv ON lion_build USING lion (tv) WITH (store_positions = off);
 CREATE INDEX lion_build_part ON lion_build USING lion (n, t) WHERE flag;
 CREATE INDEX lion_build_expr ON lion_build USING lion ((n % 10), lower(t));
 

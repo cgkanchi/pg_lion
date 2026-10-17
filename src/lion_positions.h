@@ -1,8 +1,8 @@
 /*-------------------------------------------------------------------------
  * lion_positions.h
  *	  Position chunks for pg_lion: the per-row word positions of a lexeme,
- *	  stored beside its posting set in an index built WITH
- *	  (store_positions = true).
+ *	  stored beside its posting set in an index whose build stored them
+ *	  (store_positions = auto, the default, or on).
  *
  *	  A chunk is a sixth kind of item (LION_CT_POSITIONS).  It shares the
  *	  8-byte LionContainer header, and it never appears among the items of a

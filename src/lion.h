@@ -544,10 +544,11 @@ typedef struct LionMetaPageData
 /*
  * The build stored word positions (DESIGN.md §17, "Stored positions") for
  * every key column whose opclass can extract them (support function 5): the
- * `store_positions` reloption at build time.  It shares order_flags because
- * the reserved words are spent; an index written before it has the bit clear,
- * which is exactly "no positions".  ALTER INDEX changes nothing until a
- * REINDEX.
+ * `store_positions` reloption at build time, with "auto" settled by the
+ * columns (LION_POSOPT_AUTO), so that the bit is set only on an index that
+ * has such a column.  It shares order_flags because the reserved words are
+ * spent; an index written before it has the bit clear, which is exactly "no
+ * positions".  ALTER INDEX changes nothing until a REINDEX.
  */
 #define LION_META_POSITIONS			0x0002
 
@@ -848,7 +849,7 @@ typedef struct LionOptions
 	int			wal_mode;		/* LION_WALOPT_*, DESIGN.md §25 */
 	int			summaries;		/* LION_SUMOPT_*, DESIGN.md §32 */
 	int			summary_tids;	/* TIDs a summary bucket takes (§32) */
-	bool		store_positions;	/* positions at build time (§17) */
+	int			store_positions;	/* LION_POSOPT_*, DESIGN.md §17 */
 } LionOptions;
 
 /*
@@ -913,6 +914,22 @@ typedef struct LionOptions
 #define LION_SLACKOPT_ON		1
 #define LION_SLACKOPT_OFF		2
 #define LION_DEFAULT_BUILD_SLACK	LION_SLACKOPT_OFF
+
+/*
+ * The `store_positions` reloption (DESIGN.md §17, "Stored positions").  AUTO
+ * is the default and stores them for every key column whose opclass can
+ * (support function 5: tsvector_ops), and builds an index with no such column
+ * without them, as GIN keeps a tsvector's positions without being asked.  ON
+ * asks for them, and is an ERROR on an index none of whose columns can store
+ * them; OFF builds without them.  "true" and "false" are ON and OFF, so that
+ * the spellings of the boolean the option once was - a bare WITH
+ * (store_positions) among them, which core hands over as "true" - still
+ * work.  Read at build time only: what the build did is recorded on the meta
+ * page (LION_META_POSITIONS).
+ */
+#define LION_POSOPT_AUTO		0
+#define LION_POSOPT_ON			1
+#define LION_POSOPT_OFF			2
 
 #define LION_DEFAULT_MAX_ENTRIES		0
 
@@ -2533,8 +2550,7 @@ extern void lion_posfilter_end(LionPosFilter *pf);
 extern LionKeyNode *lion_posfilter_keynode(Relation index, LionState *col,
 										   Datum query, StrategyNumber strategy,
 										   LionKeyNode *child);
-extern void lion_check_store_positions(Relation index,
-									   const LionIndexState *ix);
+extern void lion_settle_store_positions(Relation index, LionIndexState *ix);
 extern bool lion_query_posexact(Oid opfamily, Oid lefttype, Oid opno,
 								Datum query, Oid collation);
 

@@ -305,7 +305,9 @@ exactly and under the caller's snapshot, and with a `k` it counts only the keys 
 k largest; `filter` is the search's `WHERE` clause, answered from the Lion indexes alone:
 
 ```sql
--- beside docs_tags_lion above, and a grp int column
+-- beside docs_tags_lion above, and a grp int column; a tsvector index stores
+-- its words' positions by default, for phrases and ranking, at about twice
+-- the size (WITH (store_positions = off) leaves them out)
 CREATE INDEX docs_tsv_lion ON docs USING lion (tsv);
 CREATE INDEX docs_grp_lion ON docs USING lion (grp);
 

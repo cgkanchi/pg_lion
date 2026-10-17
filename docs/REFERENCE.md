@@ -7,7 +7,7 @@ SQL functions, key types, multi-key operators, index options, settings and known
 Ordinary SQL is the interface - the planner uses the index and the `LionCount` pushdown on its own -
 and these functions are for testing, diagnostics and the occasional direct count:
 
-    lion_bm25(idx, query, k [, k1, b])              the k best rows by BM25, best first (store_positions indexes)
+    lion_bm25(idx, query, k [, k1, b])              the k best rows by BM25, best first (an index with positions)
     lion_bm25_score(tsv, query, idx [, k1, b])      one row's BM25 score; ORDER BY it for the LionBm25 scan
     lion_index_count(idx, key)                      count(*) WHERE col = key, through one index
     lion_index_count(idx1, key1, idx2, key2)        ... AND col2 = key2, two indexes on one table
@@ -108,9 +108,10 @@ count functions' are, after deletes and updates VACUUM has not yet cleaned up in
 One default operator class per type, reusing the hash access method's hash functions: integers
 (`int2/int4/int8`, one family with cross-type equality), `float4/float8`, `numeric`, `bool`, `"char"`,
 `name`, `text` (and `varchar` through it), `char(n)`, `bytea`, `uuid`, `date`, `time`, `timetz`,
-`timestamp`, `timestamptz`, `interval`, `macaddr`, `inet`, `jsonb`, `pg_lsn`, `xid`, `cid`, `tid`,
-`oid`, and any enum. Case-insensitive text: `CREATE EXTENSION pg_lion_citext` (requires
-`citext`) adds `citext_ops`. Domains resolve to their base type. Keys over 2000 bytes are rejected.
+`timestamp`, `timestamptz`, `interval`, `macaddr`, `inet`, `pg_lsn`, `xid`, `cid`, `tid`,
+`oid`, and any enum. `jsonb` has `jsonb_ops` for whole documents too, but it is not the default:
+`jsonb_contains_ops` is (see "jsonb containment" below). Case-insensitive text: `CREATE EXTENSION
+pg_lion_citext` (requires `citext`) adds `citext_ops`. Domains resolve to their base type. Keys over 2000 bytes are rejected.
 
 ## Multi-key columns: arrays and tsvector (DESIGN.md §17)
 
@@ -118,7 +119,7 @@ One default operator class per type, reusing the hash access method's hash funct
 extraction functions, and answer
 
     CREATE INDEX ON doc USING lion (tags);       -- text[], int[], ...
-    CREATE INDEX ON doc USING lion (tsv);        -- tsvector
+    CREATE INDEX ON doc USING lion (tsv);        -- tsvector, with positions
 
     tags @> '{a,b}'    the intersection of the elements' posting sets, exact
     tags && '{a,b}'    their union, exact
@@ -131,19 +132,20 @@ select together (DESIGN.md §5, SCAN step 5).
 `count(*)` over `@>`, `&&` and an AND/OR tsquery is pushed down like any other clause, and can be
 combined with a `GROUP BY` on a scalar roaring column.
 
-An index built `WITH (store_positions = true)` also stores every lexeme's positions and weights per row, so phrases (`a <-> b`,
-`a <3> b`), weights (`a:A`) and NOTs (`a & !b`, `a <-> !b`) are answered exactly from the index:
-bitmap and index scans need no recheck, and counts skip the heap on all-visible pages, under a
-`GROUP BY`, `count(DISTINCT)` or the FK-side join too, under an OR, and for `@@ ANY (array)`
-in scans. It costs about three bytes per lexeme and
-row on top of a plain lion index, more than doubling it, so it is off by default.
+A `tsvector` index also stores every lexeme's positions and weights per row, as GIN does, unless it
+is built `WITH (store_positions = off)`, so phrases (`a <-> b`, `a <3> b`), weights (`a:A`) and NOTs
+(`a & !b`, `a <-> !b`) are answered exactly from the index: bitmap and index scans need no recheck,
+and counts skip the heap on all-visible pages, under a `GROUP BY`, `count(DISTINCT)` or the FK-side
+join too, under an OR, and for `@@ ANY (array)` in scans. It costs about three bytes per lexeme and
+row on top of a lion index without them, more than doubling it; an index that never sees a phrase,
+a weight or a NOT, and is not used for ranking, can leave them out:
 
-    CREATE INDEX ON doc USING lion (tsv) WITH (store_positions = true);
+    CREATE INDEX ON doc USING lion (tsv) WITH (store_positions = off);
 
-Such an index also ranks. `lion_bm25(index, query, k [, k1, b])` returns the `k` rows with the
-highest BM25 score for the query's lexemes, best first, scored entirely from the index (term
-frequencies, document frequencies and each row's length, which the index keeps under its own key);
-the heap is read only to check that the rows returned are visible. Join on `ctid` for the rows:
+An index with positions also ranks. `lion_bm25(index, query, k [, k1, b])` returns the `k` rows
+with the highest BM25 score for the query's lexemes, best first, scored entirely from the index
+(term frequencies, document frequencies and each row's length, which the index keeps under its own
+key); the heap is read only to check that the rows returned are visible. Join on `ctid` for the rows:
 
     SELECT d.*, s.score
       FROM lion_bm25('doc_tsv_idx', to_tsquery('english', 'cat | dog'), 10) s
@@ -203,11 +205,11 @@ and a custom plan of the literal to the pushdown. Such a query is not taken unde
 
 ## jsonb containment, existence and jsonpath (DESIGN.md §42, §43)
 
-`jsonb_contains_ops` (not the default; the default `jsonb_ops` indexes whole documents for `=`)
-indexes a document under one key per path to a scalar (with the scalar), one per object or array
-below the root, the root's type, and one per top-level key, string element or string scalar:
+`jsonb_contains_ops`, the default for `jsonb` as GIN's containment class is GIN's, indexes a
+document under one key per path to a scalar (with the scalar), one per object or array below the
+root, the root's type, and one per top-level key, string element or string scalar:
 
-    CREATE INDEX ON docs USING lion (doc jsonb_contains_ops);
+    CREATE INDEX ON docs USING lion (doc);       -- or (doc jsonb_contains_ops)
 
     doc @> '{"a": {"b": 1}}'   the AND of the query's paths, exact
     doc @> '{"a": [{"b": 1, "c": 2}]}'   the AND, rechecked: an array element with two or more
@@ -232,6 +234,12 @@ nothing. A path stops at `.*`, `.**` or an item method. A path's prefix that mor
 start with narrows nothing, nor does one that could start a hashed key once the index has more
 than 1000 hashed keys. Counts are pushed down with every candidate checked in the heap, but not
 under an OR.
+
+Lion's `jsonb_ops`, which is not the default, indexes whole documents instead, under the btree
+meaning of `jsonb_ops`: `=`, `<>`, the ranges and `count(DISTINCT doc)`. Name it for those, alone
+or beside a `jsonb_contains_ops` index on the same column:
+
+    CREATE INDEX ON docs USING lion (doc jsonb_ops);
 
 ## Nearest neighbours: lionvec (DESIGN.md §44)
 
@@ -339,9 +347,13 @@ process; under `allow` the parallel scan with a `Filter` is a plan like the seri
 
 ## Reloptions
 
-`store_positions` (boolean, default `false`): on a `tsvector` column, also store every lexeme's
-positions and weights, so phrase, weight and NOT queries are answered from the index and BM25
-ranking works (see "Multi-key columns" above). Read at build time, like `summaries`.
+`store_positions` (`auto` | `on` | `off`, default `auto`; `true` and `false` are `on` and `off`): on
+a `tsvector` column, also store every lexeme's positions and weights, so phrase, weight and NOT
+queries are answered from the index and BM25 ranking works (see "Multi-key columns" above), at
+about twice the index's size. `auto` stores them when a key column's operator class can
+(`tsvector_ops`) and builds an index with no such column without them; `on` on such an index is an
+error; `off` leaves them out. Read at build time, like `summaries`: `ALTER INDEX ... SET` changes
+nothing until a `REINDEX`.
 `fillfactor` (10 .. 100, default 90): how full the build packs a directory leaf.
 `posting_fillfactor` (10 .. 100, default 90): how full the build packs a posting-tree leaf, the
 container pages a key's posting set lives on once it outgrows its entry (DESIGN.md §22). At 100 a
@@ -731,8 +743,9 @@ primary key - as the `count(col)` it equals: `count(*)` where the column is NOT 
 it has a lion index (a single-column, immediate, non-partial btree index under the `DISTINCT`'s
 collation; on a partitioned table, one on the parent, and then only without a `GROUP BY`). `IN`
 lists of more than 1000 values are left to the ordinary plan, a multi-key index can never drive a
-`GROUP BY` or a sum-over-all-entries count (its entries are keys, not row values), and the cost
-model inherits the
+`GROUP BY` or a sum-over-all-entries count (its entries are keys, not row values; `USING lion (doc)`
+on `jsonb` is one, and `doc jsonb_ops` the index for `=` and `count(DISTINCT doc)` on whole
+documents), and the cost model inherits the
 stale `relallvisible` blind spot of index-only scans.
 On a hot standby a GENERIC-mode index's count paths recheck every candidate TID in the heap instead
 of trusting the visibility map, because generic WAL replay does not take the cleanup locks the pin

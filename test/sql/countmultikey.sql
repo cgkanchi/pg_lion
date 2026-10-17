@@ -161,7 +161,7 @@ CREATE INDEX lion_mk_g ON lion_mk_t USING lion (g);
 CREATE INDEX lion_mk_n ON lion_mk_t USING lion (n);
 CREATE INDEX lion_mk_tags ON lion_mk_t USING lion (tags);
 CREATE INDEX lion_mk_nums ON lion_mk_t USING lion (nums);
-CREATE INDEX lion_mk_tsv ON lion_mk_t USING lion (tsv);
+CREATE INDEX lion_mk_tsv ON lion_mk_t USING lion (tsv) WITH (store_positions = false);
 VACUUM (FREEZE, ANALYZE) lion_mk_t;
 
 -- ---- 1. a generic plan's parameter, of every shape ------------------------
@@ -416,7 +416,7 @@ SELECT abs(hashint4(i)) % 3000 + 1, i % 10,
 CREATE INDEX lion_mk_pf_fk ON lion_mk_pf USING lion (fk);
 CREATE INDEX lion_mk_pf_x ON lion_mk_pf USING lion (x);
 CREATE INDEX lion_mk_pf_tags ON lion_mk_pf USING lion (tags);
-CREATE INDEX lion_mk_pf_tsv ON lion_mk_pf USING lion (tsv);
+CREATE INDEX lion_mk_pf_tsv ON lion_mk_pf USING lion (tsv) WITH (store_positions = false);
 VACUUM (FREEZE, ANALYZE) lion_mk_pd, lion_mk_pf;
 
 /*
