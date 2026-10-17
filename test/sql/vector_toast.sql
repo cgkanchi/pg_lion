@@ -34,8 +34,6 @@ SET pg_lion.vector_epsilon = 6;
 SET pg_lion.vector_margin = 100;
 SET pg_lion.vector_patience = 0;
 
-SHOW pg_lion.vector_toast_direct;
-
 -- a pseudo-random vector of n coordinates in (-scale, scale), the same on
 -- every platform
 CREATE FUNCTION tt_vec(seed bigint, n int, scale float8 DEFAULT 1.0)
@@ -397,6 +395,8 @@ INSERT INTO tt SELECT i, i % 20, 'a', NULL FROM generate_series(601, 610) i;
 CREATE INDEX tt_cat ON tt USING lion (cat);
 CREATE INDEX tt_v ON tt USING lionvec (v) WITH (partitions = 4);
 ANALYZE tt;
+-- the setting, on by default (its library loaded by now)
+SHOW pg_lion.vector_toast_direct;
 SELECT tt_meta('tt_v');
 SELECT tt_pages('tt_v', 6) AS loc_pages, tt_pages('tt_v', 7) AS locdir_pages;
 SELECT tt_check('tt_v');
@@ -411,17 +411,25 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 SET enable_sort = off;
-SET client_min_messages = debug1;
-SELECT count(*) FROM (SELECT id FROM tt WHERE cat = 3 ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
-SET pg_lion.vector_toast_direct = off;
-SELECT count(*) FROM (SELECT id FROM tt WHERE cat = 3 ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
-RESET pg_lion.vector_toast_direct;
+-- each query prepared, and run once, at the settings it is planned under,
+-- so that its DEBUG1 runs parse and plan nothing: what a parse looks up
+-- can grow a catalog cache, whose rehash DEBUG1 reports too
+PREPARE tt_x AS SELECT count(*) FROM (SELECT id FROM tt WHERE cat = 3 ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
+EXECUTE tt_x;
 RESET enable_indexscan;
-SELECT count(*) FROM (SELECT id FROM tt ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
+PREPARE tt_p AS SELECT count(*) FROM (SELECT id FROM tt ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
+EXECUTE tt_p;
+SET client_min_messages = debug1;
+EXECUTE tt_x;
 SET pg_lion.vector_toast_direct = off;
-SELECT count(*) FROM (SELECT id FROM tt ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
+EXECUTE tt_x;
+RESET pg_lion.vector_toast_direct;
+EXECUTE tt_p;
+SET pg_lion.vector_toast_direct = off;
+EXECUTE tt_p;
 RESET pg_lion.vector_toast_direct;
 RESET client_min_messages;
+DEALLOCATE tt_p;
 RESET pg_lion.vector_prefetch;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
@@ -486,8 +494,9 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 SET enable_sort = off;
+EXECUTE tt_x;
 SET client_min_messages = debug1;
-SELECT count(*) FROM (SELECT id FROM tt WHERE cat = 3 ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
+EXECUTE tt_x;
 RESET client_min_messages;
 RESET enable_indexscan;
 
@@ -497,9 +506,11 @@ RESET enable_indexscan;
 SELECT reltoastrelid::regclass AS tt_toast FROM pg_class WHERE oid = 'tt'::regclass \gset
 SELECT count(*) > 0 AS "chunks" FROM :tt_toast;
 SET enable_indexscan = off;
+EXECUTE tt_x;
 SET client_min_messages = debug1;
-SELECT count(*) FROM (SELECT id FROM tt WHERE cat = 3 ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
+EXECUTE tt_x;
 RESET client_min_messages;
+DEALLOCATE tt_x;
 RESET pg_lion.vector_prefetch;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
@@ -536,9 +547,12 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 SET enable_sort = off;
+PREPARE tt_c AS SELECT count(*) FROM (SELECT id FROM tt WHERE cat IN (1, 2, 3, 4, 5) ORDER BY v <-> tt_vec(-1, 1536)) s;
+EXECUTE tt_c;
 SET client_min_messages = debug1;
-SELECT count(*) FROM (SELECT id FROM tt WHERE cat IN (1, 2, 3, 4, 5) ORDER BY v <-> tt_vec(-1, 1536)) s;
+EXECUTE tt_c;
 RESET client_min_messages;
+DEALLOCATE tt_c;
 RESET pg_lion.vector_prefetch;
 RESET enable_seqscan;
 RESET enable_bitmapscan;

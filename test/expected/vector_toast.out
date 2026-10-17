@@ -33,12 +33,6 @@ SET max_parallel_maintenance_workers = 0;
 SET pg_lion.vector_epsilon = 6;
 SET pg_lion.vector_margin = 100;
 SET pg_lion.vector_patience = 0;
-SHOW pg_lion.vector_toast_direct;
- pg_lion.vector_toast_direct 
------------------------------
- on
-(1 row)
-
 -- a pseudo-random vector of n coordinates in (-scale, scale), the same on
 -- every platform
 CREATE FUNCTION tt_vec(seed bigint, n int, scale float8 DEFAULT 1.0)
@@ -391,6 +385,13 @@ INSERT INTO tt SELECT i, i % 20, 'a', NULL FROM generate_series(601, 610) i;
 CREATE INDEX tt_cat ON tt USING lion (cat);
 CREATE INDEX tt_v ON tt USING lionvec (v) WITH (partitions = 4);
 ANALYZE tt;
+-- the setting, on by default (its library loaded by now)
+SHOW pg_lion.vector_toast_direct;
+ pg_lion.vector_toast_direct 
+-----------------------------
+ on
+(1 row)
+
 SELECT tt_meta('tt_v');
                             tt_meta                            
 ---------------------------------------------------------------
@@ -437,8 +438,26 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 SET enable_sort = off;
+-- each query prepared, and run once, at the settings it is planned under,
+-- so that its DEBUG1 runs parse and plan nothing: what a parse looks up
+-- can grow a catalog cache, whose rehash DEBUG1 reports too
+PREPARE tt_x AS SELECT count(*) FROM (SELECT id FROM tt WHERE cat = 3 ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
+EXECUTE tt_x;
+ count 
+-------
+    10
+(1 row)
+
+RESET enable_indexscan;
+PREPARE tt_p AS SELECT count(*) FROM (SELECT id FROM tt ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
+EXECUTE tt_p;
+ count 
+-------
+    10
+(1 row)
+
 SET client_min_messages = debug1;
-SELECT count(*) FROM (SELECT id FROM tt WHERE cat = 3 ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
+EXECUTE tt_x;
 DEBUG:  lionvec scan of "tt_v": 1 members fetched, 10 returned, 30 read by place (3 locator pages, 0 not), 10 checked
  count 
 -------
@@ -446,7 +465,7 @@ DEBUG:  lionvec scan of "tt_v": 1 members fetched, 10 returned, 30 read by place
 (1 row)
 
 SET pg_lion.vector_toast_direct = off;
-SELECT count(*) FROM (SELECT id FROM tt WHERE cat = 3 ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
+EXECUTE tt_x;
 DEBUG:  lionvec scan of "tt_v": 31 members fetched, 10 returned
  count 
 -------
@@ -454,8 +473,7 @@ DEBUG:  lionvec scan of "tt_v": 31 members fetched, 10 returned
 (1 row)
 
 RESET pg_lion.vector_toast_direct;
-RESET enable_indexscan;
-SELECT count(*) FROM (SELECT id FROM tt ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
+EXECUTE tt_p;
 DEBUG:  lionvec scan of "tt_v": 4 partitions probed, 1 passes, 600 candidates, 533 refined, 15 fetched, 10 returned, 0 skipped out of order, 0 bounds missed, 36 pages read, 0 pauses, 600 copies skipped, 15 read by place (0 locator pages, 0 not), 15 checked
 DEBUG:  lionvec scan of "tt_v": 15 members fetched, 10 returned, 15 read by place (0 locator pages, 0 not), 15 checked
  count 
@@ -464,7 +482,7 @@ DEBUG:  lionvec scan of "tt_v": 15 members fetched, 10 returned, 15 read by plac
 (1 row)
 
 SET pg_lion.vector_toast_direct = off;
-SELECT count(*) FROM (SELECT id FROM tt ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
+EXECUTE tt_p;
 DEBUG:  lionvec scan of "tt_v": 4 partitions probed, 1 passes, 600 candidates, 533 refined, 15 fetched, 10 returned, 0 skipped out of order, 0 bounds missed, 36 pages read, 0 pauses, 600 copies skipped
 DEBUG:  lionvec scan of "tt_v": 15 members fetched, 10 returned
  count 
@@ -474,6 +492,7 @@ DEBUG:  lionvec scan of "tt_v": 15 members fetched, 10 returned
 
 RESET pg_lion.vector_toast_direct;
 RESET client_min_messages;
+DEALLOCATE tt_p;
 RESET pg_lion.vector_prefetch;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
@@ -666,8 +685,14 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 SET enable_sort = off;
+EXECUTE tt_x;
+ count 
+-------
+    10
+(1 row)
+
 SET client_min_messages = debug1;
-SELECT count(*) FROM (SELECT id FROM tt WHERE cat = 3 ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
+EXECUTE tt_x;
 DEBUG:  lionvec scan of "tt_v": 1 members fetched, 10 returned, 56 read by place (4 locator pages, 0 not), 32 checked
  count 
 -------
@@ -687,8 +712,14 @@ SELECT count(*) > 0 AS "chunks" FROM :tt_toast;
 (1 row)
 
 SET enable_indexscan = off;
+EXECUTE tt_x;
+ count 
+-------
+    10
+(1 row)
+
 SET client_min_messages = debug1;
-SELECT count(*) FROM (SELECT id FROM tt WHERE cat = 3 ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
+EXECUTE tt_x;
 DEBUG:  lionvec scan of "tt_v": 21 members fetched, 10 returned, 36 read by place (4 locator pages, 20 not), 12 checked
  count 
 -------
@@ -696,6 +727,7 @@ DEBUG:  lionvec scan of "tt_v": 21 members fetched, 10 returned, 36 read by plac
 (1 row)
 
 RESET client_min_messages;
+DEALLOCATE tt_x;
 RESET pg_lion.vector_prefetch;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
@@ -801,8 +833,15 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 SET enable_sort = off;
+PREPARE tt_c AS SELECT count(*) FROM (SELECT id FROM tt WHERE cat IN (1, 2, 3, 4, 5) ORDER BY v <-> tt_vec(-1, 1536)) s;
+EXECUTE tt_c;
+ count 
+-------
+   161
+(1 row)
+
 SET client_min_messages = debug1;
-SELECT count(*) FROM (SELECT id FROM tt WHERE cat IN (1, 2, 3, 4, 5) ORDER BY v <-> tt_vec(-1, 1536)) s;
+EXECUTE tt_c;
 DEBUG:  lionvec scan of "tt_v": 227 members fetched, 162 returned, 10 read by place (5 locator pages, 54 not), 10 checked
  count 
 -------
@@ -810,6 +849,7 @@ DEBUG:  lionvec scan of "tt_v": 227 members fetched, 162 returned, 10 read by pl
 (1 row)
 
 RESET client_min_messages;
+DEALLOCATE tt_c;
 RESET pg_lion.vector_prefetch;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
