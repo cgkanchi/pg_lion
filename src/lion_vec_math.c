@@ -1214,6 +1214,108 @@ lionvec_least_order(const double *key, int *idx, int m)
 	}
 }
 
+/* ----------------------------------------------------------------
+ * Vectors in TOAST: the places of a value's chunks (DESIGN.md §44.13)
+ * ----------------------------------------------------------------
+ */
+
+int
+lionvec_loc_runs(const uint32 *blks, const uint16 *offs, int n,
+				 LionVecLocRun *runs, int maxruns)
+{
+	int			r = 0;
+	int			i;
+
+	if (n <= 0 || maxruns <= 0)
+		return -1;
+	for (i = 0; i < n; i++)
+	{
+		/* the next line pointer of the same block goes on the run */
+		if (r > 0 && runs[r - 1].blk == blks[i] &&
+			(uint32) runs[r - 1].off + runs[r - 1].n == offs[i] &&
+			runs[r - 1].n < PG_UINT16_MAX)
+		{
+			runs[r - 1].n++;
+			continue;
+		}
+		if (r >= maxruns)
+			return -1;
+		runs[r].blk = blks[i];
+		runs[r].off = offs[i];
+		runs[r].n = 1;
+		r++;
+	}
+	return r;
+}
+
+bool
+lionvec_loc_runs_ok(const LionVecLocRun *runs, int nruns, int nchunks,
+					int maxoff)
+{
+	int64		sum = 0;
+	int			i;
+
+	if (nruns < 1 || nruns > nchunks || nchunks < 1)
+		return false;
+	for (i = 0; i < nruns; i++)
+	{
+		if (runs[i].blk == PG_UINT32_MAX || runs[i].n < 1 || runs[i].off < 1 ||
+			(int) runs[i].off + (int) runs[i].n - 1 > maxoff)
+			return false;
+		sum += runs[i].n;
+	}
+	return sum == nchunks;
+}
+
+/* Whether one of the nm sorted blocks lies in [lo, hi]: the first at lo or past. */
+static bool
+lionvec_blocks_hit(const uint32 *mblks, int nm, uint32 lo, uint32 hi)
+{
+	int			a = 0;
+	int			b = nm;
+
+	if (lo > hi)
+		return false;
+	while (a < b)
+	{
+		int			m = a + (b - a) / 2;
+
+		if (mblks[m] < lo)
+			a = m + 1;
+		else
+			b = m;
+	}
+	return a < nm && mblks[a] <= hi;
+}
+
+static int
+lionvec_u32_cmp(const void *a, const void *b)
+{
+	uint32		x = *(const uint32 *) a;
+	uint32		y = *(const uint32 *) b;
+
+	return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+int
+lionvec_loc_select(const uint32 *page, const uint32 *lo, const uint32 *hi,
+				   int n, const uint32 *mblks, int nm, uint32 *out)
+{
+	int			k = 0;
+	int			i;
+	int			j;
+
+	for (i = 0; i < n; i++)
+		if (lionvec_blocks_hit(mblks, nm, lo[i], hi[i]))
+			out[k++] = page[i];
+	/* the build's come in order; the inserts' after, and a page may repeat */
+	qsort(out, k, sizeof(uint32), lionvec_u32_cmp);
+	for (i = j = 0; i < k; i++)
+		if (j == 0 || out[j - 1] != out[i])
+			out[j++] = out[i];
+	return j;
+}
+
 /* the SOAR cost of c, given r = x - c1 and |r|^2 */
 static double
 lionvec_soar_cost_r(const float *x, const float *c1, double r2, const float *c,

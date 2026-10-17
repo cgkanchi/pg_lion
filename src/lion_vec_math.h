@@ -672,6 +672,94 @@ extern int	lionvec_least(const double *key, int n, int m, int *idx);
 extern void lionvec_least_order(const double *key, int *idx, int m);
 
 /*
+ * Vectors in TOAST (DESIGN.md §44.13): where a value's chunks lie.
+ *
+ * The heap stores a vector of extsize = lionvec_toast_extsize() bytes - its
+ * varlena less the 4-byte header - in TOAST, uncompressed, as nchunks =
+ * lionvec_toast_nchunks() chunk tuples of chunksize bytes (core's
+ * TOAST_MAX_CHUNK_SIZE), the last holding the rest, chunk_seq 0 to nchunks -
+ * 1.  Their places are a list of RUNS: a block of the TOAST relation, a line
+ * pointer, and how many chunks lie at it and the line pointers after it, in
+ * chunk_seq order, one run in the common case (lionvec_loc_runs()).  The
+ * scan reads a value by its runs, chunk_seq counted along them, and checks
+ * every chunk it reads; these only make and check the runs, and choose the
+ * LOC pages whose heap blocks a scan's members fall in.
+ */
+typedef struct LionVecLocRun
+{
+	uint32		blk;			/* the TOAST relation's block */
+	uint16		off;			/* the first chunk's line pointer */
+	uint16		n;				/* chunks at off, off + 1, ..., in order */
+} LionVecLocRun;
+
+/* the most runs a LOC entry holds: chunks of the widest vector, and more */
+#define LIONVEC_LOC_MAXRUNS		32
+
+/* a vector's or halfvec's bytes in TOAST: its 4-byte count and its elements */
+static inline int64
+lionvec_toast_extsize(int dims, bool half)
+{
+	return 4 + (int64) dims * (half ? 2 : 4);
+}
+
+/* ... the chunks they take, of chunksize bytes but the last */
+static inline int
+lionvec_toast_nchunks(int64 extsize, int chunksize)
+{
+	return extsize <= 0 || chunksize <= 0 ? 0 :
+		(int) ((extsize + chunksize - 1) / chunksize);
+}
+
+/* ... and chunk seq's size: chunksize, the last the rest */
+static inline int
+lionvec_toast_chunk_size(int64 extsize, int chunksize, int seq)
+{
+	int			n = lionvec_toast_nchunks(extsize, chunksize);
+
+	return seq < n - 1 ? chunksize : (int) (extsize - (int64) (n - 1) * chunksize);
+}
+
+/*
+ * The runs a REFINE item's slot holds (DESIGN.md §44.13, "The REFINE
+ * item's place"): every run of a value of up to two chunks, and about a run
+ * every four chunks past that, plus one - a value on one page, or across
+ * two, and most of those three concurrent inserters left; fixed by the
+ * index's dimensions, so that every REFINE item of an index has one size.
+ */
+static inline int
+lionvec_refloc_runs(int nchunks)
+{
+	int			r = (nchunks + 3) / 4 + 1;
+
+	return nchunks < r ? nchunks : r;
+}
+
+/*
+ * The runs of n chunks at (blks[i], offs[i]), chunk_seq i, into runs[], and
+ * how many; -1 if they take more than maxruns, or n is not positive.
+ */
+extern int	lionvec_loc_runs(const uint32 *blks, const uint16 *offs, int n,
+							 LionVecLocRun *runs, int maxruns);
+
+/*
+ * Whether runs[0 .. nruns) can be the places of a value of nchunks chunks: a
+ * run or more, each of a valid block (not 0xFFFFFFFF) and at least one chunk
+ * at line pointers 1 to maxoff, nchunks in all.
+ */
+extern bool lionvec_loc_runs_ok(const LionVecLocRun *runs, int nruns,
+								int nchunks, int maxoff);
+
+/*
+ * The LOC pages a scan reads: of the n LOCDIR items, page[i] holding
+ * entries of heap blocks lo[i] to hi[i] (none when lo[i] > hi[i]), those
+ * holding one of the nm blocks mblks[], sorted and distinct, into out[] in
+ * block order, each once; returns how many.
+ */
+extern int	lionvec_loc_select(const uint32 *page, const uint32 *lo,
+							   const uint32 *hi, int n, const uint32 *mblks,
+							   int nm, uint32 *out);
+
+/*
  * The scan orders rows by a KEY that is the distance up to a constant of the
  * query: what changes from row to row of an estimate of <x, qc>.
  *
