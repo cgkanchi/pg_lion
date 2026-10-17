@@ -110,6 +110,9 @@ step s1_scan	{
 	SELECT id FROM (SELECT id FROM lvt WHERE cat = 3 ORDER BY v <-> lvt_vec(-3, 0.2)) s;
 	RESET client_min_messages;
 }
+# The scan's rows, once it has returned them all: a step of s1's, so that
+# the steps after it start only once the scan is done (it touches no TOAST).
+step s1_got	{ SELECT count(*) AS got FROM lvt_got; }
 step s1_check_exact	{
 	SET LOCAL enable_seqscan = on;
 	SET LOCAL enable_sort = on;
@@ -191,7 +194,7 @@ step s3_whole	{
 # the dead rows' chunks vacuumed away and their places taken by new rows;
 # the scan holds the TOAST relation against a rewrite to its end, and lets
 # it go then.
-permutation s1_park s1_scan s2_delete s2_vacuum_toast s2_insert s3_wake s2_toast_lock s1_check_exact s2_toast_lock s3_whole
+permutation s1_park s1_scan s2_delete s2_vacuum_toast s2_insert s3_wake s1_got s2_toast_lock s1_check_exact s2_toast_lock s3_whole
 
 # A cursor of the probed path parked with places queued: rows deleted, the
 # table vacuumed, its REFINE items, heap TIDs and TOAST space taken again.
