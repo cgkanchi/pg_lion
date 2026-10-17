@@ -49,8 +49,10 @@ the control files and the library are there, and says so if the tree's
 
 Phases 1b-1e, 1g and 3 need the `injection_points` extension. On a server without
 it they are skipped - the log and the summary say which - and phases 1, 1f,
-2 and 4 still run; `--phases "1 1f 2 4"` asks for exactly those (CI does, on
-the packaged 16-19 servers). `INJECTION_POINTS=1` in the environment turns every
+2, 4 and 5 still run, phase 5 without its one case that parks an insert;
+`--phases "1 1f 2 4 5"` asks for exactly those (CI does, on the packaged 16-19
+servers). Phase 5 needs pgvector and `pageinspect`, and is skipped, with a
+line in the summary, without them. `INJECTION_POINTS=1` in the environment turns every
 such skip into a failure, so a server that should have injection points and
 does not cannot end in "ALL RECOVERY AND HOT-STANDBY CHECKS PASSED" having run
 none of those phases; CI's source-build jobs set it.
@@ -88,6 +90,8 @@ it. `make clean` removes the directory.
 | `schema.sql` | the fixture and every check, as read-only SQL functions |
 | `writer.sql` | the pgbench script the crashes interrupt |
 | `standby_rr.sql` | the standby side of the recovery-conflict test |
+| `lionvec.sql` | phase 5's fixture and checks: a lionvec index over vectors in TOAST |
+| `lionvec_writer.sql` | the pgbench script phase 5's crashes interrupt |
 
 The checks live in the database rather than in the shell because they have to
 run unchanged on the primary, on a hot standby and on a promoted standby, and
@@ -287,6 +291,35 @@ caught up, verify() with heapallindexed and every key's count must agree with
 the primary. Before the fix the phase failed in both modes within seconds of
 the load starting, with the startup process and both verify() backends
 waiting on `LWLock/BufferContent`.
+
+**Phase 5, lionvec's locator of vectors in TOAST** (DESIGN.md §44.13). A
+lionvec index over vectors stored in TOAST keeps, for each row, where its
+value's chunks lie: LOC entries in heap order under a LOCDIR, and the same
+place in the row's REFINE item. The build writes them through
+`log_newpage_range()`; an insert appends its row's entry in a generic WAL
+record of its own, after its REFINE and CODE items, under the meta page's
+lock; VACUUM removes the entries of the rows it removes. `lionvec.sql` builds
+`lv_rec` (3,000 rows of `vector(768)`, two chunks each, and NULLs) and
+`lv_rec_check()`, which reads the locator off the index's pages with
+`pageinspect` and checks it against the heap - every tuple, whatever its
+visibility - and the TOAST relation: no entry names another value than the
+tuple at its TID stores; every row the snapshot sees whose vector is in TOAST
+has an entry of its value, placed where its chunks are; a REFINE item's place
+is its row's entry's; and queries by the exact path and by probing return the
+same rows, order and distances with `pg_lion.vector_toast_direct` on and off,
+and a sort's distances. Three rounds of `lionvec_writer.sql` (inserts, updates
+HOT and not, of the vector and of other columns, deletes, rollbacks,
+`INSERT ... SELECT`) beside VACUUMs of the table and of its TOAST relation
+alone, killed as phase 1 kills, the last with a VACUUM in flight, each checked
+after the restart and again after a VACUUM. The writers set
+`wal_consistency_checking = 'generic'`, so each recovery compares every page
+their records touched with the page the primary had. Then an insert parked at
+`lionvec-insert-unlocated` - its items in, its entry not - is cut by a crash:
+its row comes back aborted, with its REFINE item and without an entry, and the
+checks pass before and after the VACUUM that removes it. Last, a hot standby
+of its own under the same load must pass the same checks with the primary's
+numbers, and again after a `VACUUM FULL` of the TOAST relation alone has made
+every place stale.
 
 ## What is not covered
 
