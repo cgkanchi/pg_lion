@@ -388,6 +388,26 @@ extern void smgr_bulk_finish(BulkWriteState *bulkstate);
 #endif
 
 /*
+ * The snapshot a TOAST value's chunks are read under, as core's detoast reads
+ * them (lionvec's locator, DESIGN.md §44.13): 18's get_toast_snapshot()
+ * returns its own; 16 and 17 fill in the caller's (init_toast_snapshot()),
+ * which must outlive the reads.  Either needs a registered or active
+ * snapshot, as any detoast does.
+ */
+#include "access/toast_internals.h"
+
+#if PG_VERSION_NUM >= 180000
+#define lion_toast_snapshot(data)	((void) (data), get_toast_snapshot())
+#else
+static inline Snapshot
+lion_toast_snapshot(SnapshotData *data)
+{
+	init_toast_snapshot(data);
+	return data;
+}
+#endif
+
+/*
  * pg_noreturn (PostgreSQL 18), written before the declaration.  Before it
  * there was pg_attribute_noreturn(), which is GCC's attribute where there is
  * one, and that may stand before the declaration too.

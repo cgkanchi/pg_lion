@@ -377,7 +377,10 @@ DROP FUNCTION ps_same(text);
 -- its row under a target of 8160, where, the threshold alone deciding (as
 -- until 2026-10-17), its pages were not asked for either.  A filter's exact
 -- path asks the kernel for each member's block, one a member here, every
--- one in shared buffers; the DEBUG1 line counts the asks.
+-- one in shared buffers; the DEBUG1 line counts the asks.  In TOAST, the
+-- members' vectors are read by their chunks' places instead (DESIGN.md
+-- §44.13), the TOAST pages asked for, and the heap's read only for the rows
+-- returned, to check them.
 CREATE TABLE ps_wide (id int PRIMARY KEY, cat int, v vector(600))
 	WITH (toast_tuple_target = 8160, autovacuum_enabled = off);
 CREATE TABLE ps_toast (id int PRIMARY KEY, cat int, v vector(600))
