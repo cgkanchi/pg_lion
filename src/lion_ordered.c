@@ -2282,13 +2282,56 @@ lo_knn_why(LoKnn *knn, LoKnnWhy why)
 }
 
 /*
+ * Is the clause one of the lionvec index's own, which reads no column of the
+ * relation but those the index's key does - the vector's (`v IS NOT NULL`, a
+ * distance bound `v <-> $1 < 0.5`)?  Such a clause may filter the rows the
+ * scan returns under every pg_lion.vector_postfilter (DESIGN.md §44.6,
+ * "Post-filtering"): it rejects NULL vectors, which the scan returns last, or
+ * rows by their distance, which the scan returns in order, so it leaves the
+ * rows the scan finds before it as they were.  A clause of another relation's
+ * columns too (a parameterized path's join clause) is no such clause.
+ */
+static bool
+lo_knn_own(IndexOptInfo *idx, RestrictInfo *rinfo)
+{
+	Bitmapset  *keyattrs = NULL;
+	Bitmapset  *attrs = NULL;
+	int			i;
+
+	if (!bms_equal(rinfo->clause_relids, idx->rel->relids))
+		return false;
+	for (i = 0; i < idx->nkeycolumns; i++)
+		if (idx->indexkeys[i] != 0)
+			keyattrs = bms_add_member(keyattrs, idx->indexkeys[i] -
+									  FirstLowInvalidHeapAttributeNumber);
+	pull_varattnos((Node *) idx->indexprs, idx->rel->relid, &keyattrs);
+	pull_varattnos((Node *) rinfo->clause, idx->rel->relid, &attrs);
+	return !bms_is_empty(attrs) && bms_is_subset(attrs, keyattrs);
+}
+
+/* The clauses of rinfos but the lionvec index's own (lo_knn_own()). */
+static List *
+lo_knn_others(List *rinfos, IndexOptInfo *idx)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	foreach(lc, rinfos)
+		if (!lo_knn_own(idx, lfirst_node(RestrictInfo, lc)))
+			result = lappend(result, lfirst(lc));
+	return result;
+}
+
+/*
  * The clauses a plain scan of a lionvec order would leave to its Filter, as
  * create_indexscan_plan() makes its qpqual: the restriction clauses the
  * index is given (indrestrictinfo, which for a partial index leaves out the
  * ones its predicate implies, check_index_predicates()) and a parameterized
  * path's join clauses, less the pseudoconstant ones a gating Result tests
- * once.  The order has no index clauses (lo_knn_path()), so nothing else
- * comes off.  NIL: the scan returns every row the query keeps.
+ * once and the index's own (lo_knn_own()), which may filter its rows.  The
+ * order has no index clauses (lo_knn_path()), so nothing else comes off.
+ * NIL: the scan returns every row the query keeps, or every row but those
+ * its own clauses reject.
  */
 static List *
 lo_knn_filter(IndexPath *ipath)
@@ -2304,7 +2347,7 @@ lo_knn_filter(IndexPath *ipath)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
-		if (!rinfo->pseudoconstant)
+		if (!rinfo->pseudoconstant && !lo_knn_own(ipath->indexinfo, rinfo))
 			result = lappend(result, rinfo);
 	}
 	return result;
@@ -2409,6 +2452,28 @@ lo_knn_partial(RelOptInfo *rel)
 }
 
 /*
+ * A lionvec order among the relation's paths, serial or partial, or NULL: a
+ * plan could order its rows by that index.
+ */
+static IndexPath *
+lo_knn_first(RelOptInfo *rel)
+{
+	List	   *lists[2] = {rel->pathlist, rel->partial_pathlist};
+	ListCell   *lc;
+
+	for (int i = 0; i < 2; i++)
+		foreach(lc, lists[i])
+		{
+			Path	   *p = (Path *) lfirst(lc);
+
+			if (IsA(p, IndexPath) && lo_knn_path((IndexPath *) p) &&
+				!((IndexPath *) p)->indexinfo->hypothetical)
+				return (IndexPath *) p;
+		}
+	return NULL;
+}
+
+/*
  * Is a lionvec order no Filter follows still among the relation's paths?
  * The serial ones alone: a partial path no Filter follows has the serial
  * path of the same index and clauses beside it.
@@ -2467,13 +2532,16 @@ lo_rinfos_in(List *a, List *b)
  * price decides as for any lion side (lo_cost_knn()): a clause that keeps
  * most rows makes a set costly to build.
  *
+ * The clauses of the lionvec index vidx's own (lo_knn_own()) need no
+ * answer: the node's Filter may apply them.
+ *
  * NULL when an access in cands answers every clause already, or when some
  * clause no lion access answers (or, which should not happen, their AND
  * leaves one); *left is then those clauses, which a plan must filter.
  */
 static Path *
 lo_knn_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
-			 Oid lionam, List **left)
+			 Oid lionam, IndexOptInfo *vidx, List **left)
 {
 	List	   *pool = NIL;
 	List	   *residuals = NIL;
@@ -2488,8 +2556,12 @@ lo_knn_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
 	foreach(lc, rel->baserestrictinfo)
 		if (!lfirst_node(RestrictInfo, lc)->pseudoconstant)
 			rest = lappend(rest, lfirst(lc));
+	rest = lo_knn_others(rest, vidx);
+	if (rest == NIL)
+		return NULL;			/* the scan's own clauses alone */
 	foreach(lc, cands)
-		if (lo_lion_residual(rel, (Path *) lfirst(lc)) == NIL)
+		if (lo_knn_others(lo_lion_residual(rel, (Path *) lfirst(lc)),
+						  vidx) == NIL)
 			return NULL;		/* the pairing has it already */
 
 	/* core's accesses, and each lion index's alone */
@@ -2556,7 +2628,7 @@ lo_knn_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
 	 * clause no access answers is: the query loses LionOrdered over the
 	 * order, which is better than failing it.
 	 */
-	rest = lo_lion_residual(rel, best);
+	rest = lo_knn_others(lo_lion_residual(rel, best), vidx);
 	Assert(rest == NIL);
 	if (rest != NIL)
 	{
@@ -2573,10 +2645,11 @@ lo_knn_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
  * not only of the Filter the taken order would have: LionOrdered walks an
  * order only over a set that answers every clause, so one a partial lionvec
  * index's predicate implies - no Filter of that index's scan - still keeps
- * the node from that order when no lion index answers it.
+ * the node from that order when no lion index answers it.  The lionvec index
+ * vidx's own clauses (lo_knn_own()) are none of them.
  */
 static List *
-lo_knn_unanswered(PlannerInfo *root, RelOptInfo *rel)
+lo_knn_unanswered(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *vidx)
 {
 	Oid			lionam = lion_get_am_oid();
 	List	   *lionidx = NIL;
@@ -2587,6 +2660,7 @@ lo_knn_unanswered(PlannerInfo *root, RelOptInfo *rel)
 	foreach(lc, rel->baserestrictinfo)
 		if (!lfirst_node(RestrictInfo, lc)->pseudoconstant)
 			rest = lappend(rest, lfirst(lc));
+	rest = lo_knn_others(rest, vidx);
 	if (!OidIsValid(lionam))
 		return rest;
 	foreach(lc, rel->indexlist)
@@ -2600,7 +2674,7 @@ lo_knn_unanswered(PlannerInfo *root, RelOptInfo *rel)
 		return rest;
 	(void) lo_knn_cover(root, rel, lo_lion_accesses(root, rel, lionidx, NIL,
 													lionam),
-						lionidx, lionam, &left);
+						lionidx, lionam, vidx, &left);
 	return left;
 }
 
@@ -2612,29 +2686,26 @@ lo_knn_unanswered(PlannerInfo *root, RelOptInfo *rel)
  * order would be filtered after its scan, and no LionOrdered path restricts
  * the scan instead.  At plan time, so that EXPLAIN says so too.  The hint is
  * the subquery that filters the first rows of a scan no Filter follows, and
- * the settings that plan the query exactly or filter the scan's rows; under
- * row-level security the settings alone, the policies filtering the
- * subquery's scan too.
+ * the settings that plan the query exactly or filter the scan's rows.
+ * (Row-level security, whose policies would filter the subquery's scan too,
+ * lionvec refuses before: lionvec_refuse_rls().)
  */
 static void
 lo_knn_error(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			 LoKnn *knn)
 {
 	IndexPath  *ipath = linitial_node(IndexPath, knn->taken);
-	List	   *unanswered = lo_knn_unanswered(root, rel);
+	List	   *unanswered = lo_knn_unanswered(root, rel, ipath->indexinfo);
 	const char *index = get_rel_name(ipath->indexinfo->indexoid);
 	const char *table = get_rel_name(rte->relid);
-	bool		rls;
 	StringInfoData clauses;
 	ListCell   *lc;
 
-	/* row-level security, which lo_rel_ok() refuses (§30.1) */
-	rls = rte->securityQuals != NIL && knn->why == LO_KNN_RELATION;
 	if (table == NULL)
 		table = rte->eref->aliasname;
 
 	initStringInfo(&clauses);
-	foreach(lc, rls ? NIL : unanswered)
+	foreach(lc, unanswered)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
@@ -2657,9 +2728,6 @@ lo_knn_error(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("lionvec index \"%s\" would apply the filter after its nearest-neighbour scan",
 					index != NULL ? index : "?"),
-			 rls ?
-			 errdetail("Row-level security applies to \"%s\", and LionOrdered, which restricts the scan to the rows that pass a filter, does not scan such a table.",
-					   table) :
 			 unanswered != NIL ?
 			 errdetail("No lion index of \"%s\" answers %s, so LionOrdered cannot restrict the scan to the rows that pass it.",
 					   table, clauses.data) :
@@ -2671,9 +2739,6 @@ lo_knn_error(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			 errdetail("Lion's set of the rows that pass the filter would not fit in hash_mem (work_mem times hash_mem_multiplier), so LionOrdered cannot restrict the scan to them.") :
 			 errdetail("LionOrdered, which restricts the scan to the rows that pass a filter, does not scan \"%s\" in this query.",
 					   table),
-			 rls ?
-			 errhint("The policies would filter a subquery's scan of \"%s\" as well.  For an exact answer, a sort of the rows that pass the filter, set pg_lion.vector_postfilter to exact; to filter the rows the scan returns, set it to allow.",
-					 table) :
 			 errhint("Filter the first rows of a nearest-neighbour subquery instead, which makes the approximation explicit: SELECT ... FROM (SELECT ..., <distance> AS d FROM %s [WHERE <clauses lion indexes answer>] ORDER BY d LIMIT 1000) s WHERE <the other clauses> ORDER BY d LIMIT 10.  For an exact answer, a sort of the rows that pass the filter, set pg_lion.vector_postfilter to exact; to filter the rows the scan returns, set it to allow.",
 					 table)));
 }
@@ -2854,7 +2919,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 
 			if (!lo_knn_path((IndexPath *) lfirst(lc)))
 				continue;
-			cover = lo_knn_cover(root, rel, cands, lionidx, lionam, &left);
+			cover = lo_knn_cover(root, rel, cands, lionidx, lionam,
+								 ((IndexPath *) lfirst(lc))->indexinfo, &left);
 			if (cover != NULL)
 				knncands = lappend(list_copy(cands), cover);
 			break;
@@ -2883,13 +2949,13 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			if (lo_knn_path(ord))
 			{
 				/*
-				 * Only over a set that answers every clause, unless
-				 * pg_lion.vector_postfilter is allow: the node's own Filter
-				 * would reject members the scan has returned, which ends its
-				 * pause and moves its frontier as the plain scan's Filter
-				 * does (§44.6, "Post-filtering").
+				 * Only over a set that answers every clause but the index's
+				 * own (lo_knn_own()), unless pg_lion.vector_postfilter is
+				 * allow: the node's own Filter would reject members the scan
+				 * has returned, which ends its pause and moves its frontier
+				 * as the plain scan's Filter does (§44.6, "Post-filtering").
 				 */
-				if (residual != NIL &&
+				if (lo_knn_others(residual, ord->indexinfo) != NIL &&
 					lionvec_postfilter != LIONVEC_POSTFILTER_ALLOW)
 					continue;
 				/* a lionvec index returns no values: heap mode (§44.6) */
@@ -3038,15 +3104,25 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
  * no LionOrdered over it and no other lionvec order left (a partial index's,
  * whose predicate implies every clause), fails the query here.  The partial
  * paths of the orders left then get their parallel cost (lo_knn_partial()).
+ * Before all that, under every setting, a lionvec order of a table with
+ * row-level security fails the query (lionvec_refuse_rls()).
  */
 static void
 lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 							  RangeTblEntry *rte)
 {
 	LoKnn		knn;
+	IndexPath  *first;
 
 	if (lion_prev_set_rel_pathlist_hook != NULL)
 		lion_prev_set_rel_pathlist_hook(root, rel, rti, rte);
+
+	if (rte->rtekind == RTE_RELATION && (first = lo_knn_first(rel)) != NULL)
+	{
+		const char *index = get_rel_name(first->indexinfo->indexoid);
+
+		lionvec_refuse_rls(rte->relid, index != NULL ? index : "?");
+	}
 
 	memset(&knn, 0, sizeof(knn));
 	knn.why = LO_KNN_NONE;

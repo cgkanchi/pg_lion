@@ -52,6 +52,7 @@
 #include "access/tupdesc.h"
 #include "access/xloginsert.h"
 #include "catalog/index.h"
+#include "catalog/partition.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_opclass.h"
@@ -282,7 +283,9 @@ lion_vec_init(void)
 							 "default, fails such a query when it is planned, and suggests a subquery that "
 							 "filters an unfiltered scan's first rows; exact plans it exactly instead, by a "
 							 "sort of the filter's rows; allow keeps the filtered scan as a plan to choose "
-							 "by cost.",
+							 "by cost.  A clause of the vector column alone (IS NOT NULL, a distance "
+							 "bound) leaves the scan's first rows as they are, and filters its rows "
+							 "under every value.",
 							 &lionvec_postfilter,
 							 LIONVEC_POSTFILTER_ERROR,
 							 lionvec_postfilter_options,
@@ -3002,6 +3005,50 @@ lionvec_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 	table_close(heap, heaplock);
 }
 
+/*
+ * lionvec refuses a table with row-level security enabled, or a partition of
+ * one that has it (DESIGN.md §44.6, "Row-level security"): the policies are a
+ * filter no lion index answers and LionOrdered does not apply, so under
+ * pg_lion.vector_postfilter's default every query a policy applies to would
+ * fail, with a WHERE or without.  lionvecbuild() builds no index on such a
+ * table, and the planner fails a query whose order the index could give
+ * (lion_ordered.c, lion_ordered_set_rel_pathlist()), the owner's too; any
+ * other query of the table is planned as ever.
+ */
+void
+lionvec_refuse_rls(Oid relid, const char *index)
+{
+	List	   *rels = list_make1_oid(relid);
+	ListCell   *lc;
+
+	if (get_rel_relispartition(relid))
+		rels = list_concat(rels, get_partition_ancestors(relid));
+	foreach(lc, rels)
+	{
+		Oid			rel = lfirst_oid(lc);
+		HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(rel));
+		bool		rls;
+
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for relation %u", rel);
+		rls = ((Form_pg_class) GETSTRUCT(tup))->relrowsecurity;
+		ReleaseSysCache(tup);
+		if (!rls)
+			continue;
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("lionvec does not support row-level security"),
+				 rel == relid ?
+				 errdetail("Index \"%s\" is on table \"%s\", which has row-level security enabled.",
+						   index, get_rel_name(relid)) :
+				 errdetail("Index \"%s\" is on table \"%s\", a partition of \"%s\", which has row-level security enabled.",
+						   index, get_rel_name(relid), get_rel_name(rel)),
+				 errhint("Disable row-level security on \"%s\", or index its vectors with another access method.",
+						 get_rel_name(rel))));
+	}
+	list_free(rels);
+}
+
 static IndexBuildResult *
 lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
@@ -3022,6 +3069,7 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	if (RelationGetNumberOfBlocks(index) != 0)
 		elog(ERROR, "index \"%s\" already contains data",
 			 RelationGetRelationName(index));
+	lionvec_refuse_rls(RelationGetRelid(heap), RelationGetRelationName(index));
 
 	memset(&bs, 0, sizeof(bs));
 	bs.index = index;

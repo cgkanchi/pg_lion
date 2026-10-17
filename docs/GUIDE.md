@@ -480,16 +480,17 @@ SELECT id FROM (SELECT id, title, embedding <=> $1 AS d FROM items WHERE categor
  WHERE title LIKE 'A%' ORDER BY d LIMIT 10;
 ```
 
-Every clause counts, `id = 5` and `embedding IS NOT NULL` as much as `title LIKE 'A%'`; only one
-the planner tests once (`WHERE $1`, `WHERE current_user = 'app'`), and one a partial `lionvec`
-index's predicate implies, is no filter. `SET pg_lion.vector_postfilter = exact` plans such a query
-exactly instead, as a sort of the rows that pass the filter, which reads every one of them
+Every clause counts, `id = 5` as much as `title LIKE 'A%'`; only one the planner tests once
+(`WHERE $1`, `WHERE current_user = 'app'`), one a partial `lionvec` index's predicate implies, and
+one of the vector column alone (`embedding IS NOT NULL`, a distance bound
+`embedding <=> $1 < 0.3`), is no filter. The last filters the scan's rows, harmlessly: the NULL
+vectors come last in its order, and a bound rejects rows by the distance it orders them by, so the
+rows before them are the same. A bound few rows pass leaves the `LIMIT` unfilled, and the scan then
+reads to its end. `SET pg_lion.vector_postfilter = exact` plans a filtered query exactly instead, as a sort of the rows that pass the filter, which reads every one of them
 (`WHERE id = 5 ORDER BY embedding <=> $1 LIMIT 1` sorts the one row the primary key finds), and
-`allow` plans as before this rule, the scan with a `Filter` among the plans. On a table with
-row-level security every `lionvec` query of a role its policies apply to fails by default, with a
-`WHERE` or without: the policies are a filter, the node does not read such a table, and they
-filter the subquery's scan as well, so give such a role `exact`
-(`ALTER ROLE app SET pg_lion.vector_postfilter = exact`). `pg_lion.enable_ordered_scan = off`
+`allow` plans as before this rule, the scan with a `Filter` among the plans. `lionvec` does not
+support row-level security: it builds no index on a table that has it enabled, or on a partition of
+one, and a query such an index could order fails, whoever runs it. `pg_lion.enable_ordered_scan = off`
 takes the node away, and a filtered query then fails, or under `exact` is sorted. An HNSW index on
 the same column is chosen over `lionvec` for nearly every query, filtered or not: pgvector prices
 its scan as nearly free.

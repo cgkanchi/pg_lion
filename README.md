@@ -233,11 +233,13 @@ matching rows, so a filter of any selectivity gets its ten nearest: 24 ms at 1% 
 recall), where HNSW returns fewer than one row, or 95% of the right ones in 37 to 41 ms with
 iterative scans, and a filter of up to 2,000 rows (`pg_lion.vector_exact_rows`), or of up to 1.5
 rows a partition (`pg_lion.vector_exact_per_partition`), is answered exactly.
-A `WHERE` that no lion index answers - a column without one, `id = 5`, `embedding IS NOT NULL` -
-is an error by default, rather than a filter of the rows the scan returns, which would let the plan
-decide which rows come back: the error suggests filtering the nearest rows of a subquery instead,
+A `WHERE` that no lion index answers - a column without one, `id = 5` - is an error by default,
+rather than a filter of the rows the scan returns, which would let the plan decide which rows come
+back: the error suggests filtering the nearest rows of a subquery instead,
 and `SET pg_lion.vector_postfilter = exact` sorts the matching rows by distance, exactly, which
-reads every one of them ([REFERENCE.md](docs/REFERENCE.md#settings)).
+reads every one of them ([REFERENCE.md](docs/REFERENCE.md#settings)). A clause of the vector
+column alone, `embedding IS NOT NULL` or a distance bound, is no such filter: it filters the scan's
+rows.
 A range over a column of many distinct values, a timestamp or a price, is a walk of every key it
 covers unless the column's lion index keeps summaries (`WITH (summaries = auto)`): at 10% of a
 million unique values, 45 ms before the first row without them and 3 ms with. The index is 1.7 GB to
@@ -282,10 +284,10 @@ cold scan's wait on the disk by a third to a half on 115,000 embeddings).
   or not, because pgvector prices its scan as nearly free; under a filter it then returns fewer
   rows than the `LIMIT` unless `hnsw.iterative_scan` is on.
 - A `lionvec` query under a `WHERE` that no lion index answers fails by default
-  (`pg_lion.vector_postfilter`), and so does every `lionvec` query on a table with row-level
-  security for a role its policies apply to, with or without a `WHERE`: a policy is a filter, and
-  lion's filtered scan does not read such a table. `SET pg_lion.vector_postfilter = exact` (or
-  `ALTER ROLE ... SET`) plans them as an exact sort instead.
+  (`pg_lion.vector_postfilter`); `SET pg_lion.vector_postfilter = exact` plans it as an exact sort
+  instead.
+- `lionvec` does not support row-level security: it builds no index on a table that has it
+  enabled, or on a partition of one, and a query such an index could order fails.
 - jsonb `<@` isn't indexed, and jsonpath (`@?`, `@@`) is always rechecked in the heap. Updating
   an indexed jsonb document writes one entry per path, so it costs more than with GIN's pending
   list.
