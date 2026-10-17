@@ -94,8 +94,10 @@
 
 #include <math.h>
 
+#include "access/detoast.h"
 #include "access/heaptoast.h"
 #include "access/relscan.h"
+#include "access/table.h"
 #include "access/tableam.h"
 #include "catalog/index.h"
 #include "common/hashfn.h"
@@ -140,11 +142,20 @@ typedef struct LvItem
 	bool		copy;			/* a row's: met by its copy (LIONVEC_SPILL) */
 	bool		pf;				/* the page its level reads next asked for
 								 * (lv_prefetch_queue()) */
+	bool		tp;				/* LV_CODES8: its REFINE item has its vector's
+								 * place in TOAST, whose first block is tblk
+								 * (DESIGN.md §44.13) */
 	OffsetNumber roff;
 	BlockNumber rblk;
 	float4		norm;
-	float4		xm;
+	union
+	{
+		float4		xm;			/* to LV_PLANE1 */
+		BlockNumber tblk;		/* LV_CODES8, tp: as above */
+	}			u;
 } LvItem;
+
+StaticAssertDecl(sizeof(LvItem) == 48, "lionvec: a queue entry is six words");
 
 /* a binary min-heap of them */
 typedef struct LvHeap
@@ -190,11 +201,22 @@ typedef struct LvSeen
 #define SH_DEFINE
 #include "lib/simplehash.h"
 
-/* a member of a small restriction, with its distance (lv_exact()) */
+/*
+ * a member of a small restriction, with its distance (lv_exact()): from the
+ * heap, or read by its place in TOAST (DESIGN.md §44.13), its value's id
+ * then kept for the check before it is returned (lv_check_placed())
+ */
+#define LV_X_HEAP		0		/* not read yet, or from the heap */
+#define LV_X_PLACED		1		/* read by place, checked when returned */
+#define LV_X_DROP		2		/* read by place, a cosine zero vector: the
+								 * zero walk's, as the heap path leaves it */
+
 typedef struct LvExact
 {
 	double		dist;
 	ItemPointerData tid;
+	uint8		how;			/* LV_X_* */
+	Oid			valueid;		/* LV_X_PLACED */
 } LvExact;
 
 typedef enum LvPhase
@@ -430,6 +452,28 @@ typedef struct LvScanOpaque
 	IndexInfo  *indexInfo;
 	EState	   *estate;
 
+	/*
+	 * Vectors in TOAST read by their places (DESIGN.md §44.13,
+	 * lv_start_toast()): by the exact path from the locator, by the rerank
+	 * from the REFINE items' slots, each checked as it is read and against
+	 * the heap before it is returned
+	 */
+	bool		tdirect;		/* the exact path reads by place */
+	int			tref;			/* the rerank reads by place: the REFINE
+								 * items' runs, or 0 */
+	Relation	toastrel;		/* the heap's TOAST relation, kept open from
+								 * the first scan that reads it to the end */
+	BlockNumber tnblocks;		/* ... its blocks, counted as each scan starts */
+	Snapshot	tsnap;			/* the TOAST snapshot ... */
+	SnapshotData tsnapdata;		/* ... on 16 and 17 this */
+	int64		textsize;		/* a value's bytes in TOAST */
+	int			tnchunks;		/* ... and its chunks */
+	struct varlena *tvalue;		/* a value read so, VARHDRSZ + textsize */
+	int			ttried;			/* reads by place this scan, and ... */
+	int			tfailed;		/* ... of them those that fell back */
+	int			tpf;			/* TOAST pages ahead (as hpf), 0 for none */
+	LionAsk		task;			/* the TOAST relation's asks */
+
 	/* for DEBUG1 */
 	int64		nprobes;
 	int64		npasses;
@@ -444,6 +488,10 @@ typedef struct LvScanOpaque
 	int64		ncopies;		/* items skipped, their row entered this pass */
 	int64		nclaimed;		/* partitions another process probed */
 	int64		ntaken;			/* rows another process returned */
+	int64		nplaced;		/* rows read by place (§44.13) ... */
+	int64		nplacefail;		/* ... and reads by place that fell back */
+	int64		nlocpages;		/* LOC pages read */
+	int64		nchecked;		/* rows read by place checked at return */
 } LvScanOpaque;
 
 /* ----------------------------------------------------------------
@@ -647,21 +695,23 @@ lv_prefetch_bound(const LvScanOpaque *so)
  * Look ahead into a queue: of its top LV_PF_TOP(dist) entries, which hold
  * its least (a binary heap's first levels), the dist least of those at
  * level, whose pages ask to be read next - a REFINE item's, a row's or a
- * centroid's, or, fetch, a row's heap block - and, of the rows' queue, only
- * those the scan works before its next probe (lv_prefetch_bound()).  dist is
- * the relation's (so->ipf, so->hpf).  An entry asks once at its level (pf),
- * however many looks find it near the top.  A stream is given them in the
- * order of their keys, which is the order the scan reads them in unless a
- * probe puts rows before them; the kernel is asked in lionvec_least()'s.
- * Returns how many it chose: the caller looks again after half as many such
- * entries have come out, so that what it asked for stays about dist ahead
+ * centroid's, or, fetch, a row's heap block, and the first TOAST block of a
+ * row its REFINE item placed (tp, DESIGN.md §44.13) - and, of the rows'
+ * queue, only those the scan works before its next probe
+ * (lv_prefetch_bound()).  dist is the relation's (so->ipf, so->hpf, and
+ * so->tpf for rows placed).  An entry asks once at its level (pf), however
+ * many looks find it near the top.  A stream is given them in the order of
+ * their keys, which is the order the scan reads them in unless a probe puts
+ * rows before them; the kernel is asked in lionvec_least()'s.  Returns how
+ * many it chose: the caller looks again after half as many such entries
+ * have come out, so that what it asked for stays about dist ahead
  * (lv_prefetch_due()).
  */
 static int
 lv_prefetch_queue(IndexScanDesc scan, LvScanOpaque *so, LvHeap *h,
 				  uint8 level, bool fetch)
 {
-	int			dist = fetch ? so->hpf : so->ipf;
+	int			dist = fetch ? Max(so->hpf, so->tref > 0 ? so->tpf : 0) : so->ipf;
 	double		bound = h == &so->rows ? lv_prefetch_bound(so) : INFINITY;
 	LionReadahead *ra = h == &so->rows ? so->rrefs : so->crefs;
 	int			top;
@@ -694,8 +744,18 @@ lv_prefetch_queue(IndexScanDesc scan, LvScanOpaque *so, LvHeap *h,
 		if (it->pf)
 			continue;
 		it->pf = true;
-		if (fetch)
+		if (fetch && it->tp && so->tpf > 0)
+		{
+			/* its heap block, for the check, and its vector's first page */
 			lv_prefetch_heap(scan, so, (ItemPointer) &it->tid);
+			if (it->u.tblk < so->tnblocks)
+				lion_ask(&so->task, so->toastrel, it->u.tblk, true);
+		}
+		else if (fetch)
+		{
+			if (so->hpf > 0)
+				lv_prefetch_heap(scan, so, (ItemPointer) &it->tid);
+		}
 		else if (it->rblk < so->nblocks)
 			(void) lion_readahead_ask(ra, it->rblk, false, true);
 	}
@@ -1247,12 +1307,15 @@ lionvecbeginscan(Relation index, int nkeys, int norderbys)
  * and the scan never read - and the heap's pages asked for, which no stream
  * reads (lv_prefetch_heap()).  A parallel scan's process names the
  * partitions others probed and the rows others returned, each process
- * sending its own line ("A parallel scan").
+ * sending its own line ("A parallel scan").  A scan that read vectors by
+ * their places in TOAST (DESIGN.md §44.13) names how many, the LOC pages it
+ * read for them, the reads that fell back to the heap, and the TOAST pages
+ * it asked for.
  */
 static void
 lv_debug_stats(IndexScanDesc scan, LvScanOpaque *so)
 {
-	char		more[320];
+	char		more[640];
 	bool		streamed = so->rmode == LION_READAHEAD_STREAM;
 
 	more[0] = '\0';
@@ -1281,6 +1344,17 @@ lv_debug_stats(IndexScanDesc scan, LvScanOpaque *so)
 				 ", " INT64_FORMAT " partitions another process probed, "
 				 INT64_FORMAT " rows another returned",
 				 so->nclaimed, so->ntaken);
+	if (so->nplaced > 0 || so->nplacefail > 0 || so->nlocpages > 0)
+		snprintf(more + strlen(more), sizeof(more) - strlen(more),
+				 ", " INT64_FORMAT " read by place (" INT64_FORMAT
+				 " locator pages, " INT64_FORMAT " not), " INT64_FORMAT
+				 " checked",
+				 so->nplaced, so->nlocpages, so->nplacefail, so->nchecked);
+	if (so->task.nasked > 0)
+		snprintf(more + strlen(more), sizeof(more) - strlen(more),
+				 ", " INT64_FORMAT " TOAST pages prefetched (" INT64_FORMAT
+				 " not in shared buffers)",
+				 so->task.nasked, so->task.nmissing);
 	if (so->npasses > 0)
 		elog(DEBUG1, "lionvec scan of \"%s\": " INT64_FORMAT " partitions probed, "
 			 INT64_FORMAT " passes, " INT64_FORMAT " candidates, "
@@ -1297,7 +1371,7 @@ lv_debug_stats(IndexScanDesc scan, LvScanOpaque *so)
 			 INT64_FORMAT " times, " INT64_FORMAT " of them losing knowledge",
 			 RelationGetRelationName(scan->indexRelation), so->nwalks,
 			 so->nevictions);
-	else if (so->nfetched > 0)
+	else if (so->nfetched > 0 || so->nplaced > 0 || so->nplacefail > 0)
 		elog(DEBUG1, "lionvec scan of \"%s\": " INT64_FORMAT " members fetched, "
 			 INT64_FORMAT " returned%s",
 			 RelationGetRelationName(scan->indexRelation), so->nfetched,
@@ -1306,8 +1380,10 @@ lv_debug_stats(IndexScanDesc scan, LvScanOpaque *so)
 	so->nreturned = so->nskipped = so->nmissed = so->npages = 0;
 	so->npauses = so->ncopies = 0;
 	so->nclaimed = so->ntaken = 0;
+	so->nplaced = so->nplacefail = so->nlocpages = so->nchecked = 0;
 	so->iask.nasked = so->iask.nmissing = 0;
 	so->hask.nasked = so->hask.nmissing = 0;
+	so->task.nasked = so->task.nmissing = 0;
 	memset(&so->rcounts, 0, sizeof(so->rcounts));
 }
 
@@ -1371,6 +1447,10 @@ lionvecrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys,
 	so->restpf = 0;
 	so->shared = NULL;
 	so->nullasked = so->nullmine = false;
+	so->tdirect = false;
+	so->tref = 0;
+	so->tpf = 0;
+	so->ttried = so->tfailed = 0;
 }
 
 void
@@ -1389,6 +1469,8 @@ lionvecendscan(IndexScanDesc scan)
 #endif
 	if (so->estate != NULL)
 		FreeExecutorState(so->estate);
+	if (so->toastrel != NULL)
+		table_close(so->toastrel, NoLock);
 	MemoryContextDelete(so->cxt);
 	scan->opaque = NULL;
 }
@@ -1398,59 +1480,69 @@ lionvecendscan(IndexScanDesc scan)
  * ----------------------------------------------------------------
  */
 
+/* What the heap side of an exact distance keeps from one row to the next. */
+static void
+lv_heap_setup(IndexScanDesc scan, LvScanOpaque *so)
+{
+	Relation	heap = scan->heapRelation;
+	MemoryContext old;
+
+	if (heap == NULL)
+		elog(ERROR, "lionvec: an ordered scan needs its table");
+	if (so->slot != NULL)
+		return;
+	old = MemoryContextSwitchTo(so->cxt);
+	so->slot = table_slot_create(heap, NULL);
+#if PG_VERSION_NUM >= 200000
+#elif PG_VERSION_NUM >= 190000
+	so->fetch = table_index_fetch_begin(heap, SO_NONE);
+#else
+	so->fetch = table_index_fetch_begin(heap);
+#endif
+	so->indexInfo = BuildIndexInfo(scan->indexRelation);
+	so->estate = CreateExecutorState();
+	MemoryContextSwitchTo(old);
+}
+
 /*
- * The distance of the row from the heap, with the operator's own function,
- * so that it is exactly the distance the query's ORDER BY computes; false if
- * no version of the row is visible to the scan's snapshot.  Every version of
- * a HOT chain has the same vector, as the index's column is not one a HOT
- * update can change.
+ * The version of the row at tid visible to the scan's snapshot, into
+ * so->slot; false if there is none.  The caller clears the slot.
  */
 static bool
-lv_fetch_distance(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid,
-				  double *dist)
+lv_heap_fetch(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid)
 {
 	Relation	heap = scan->heapRelation;
 	ItemPointerData htid = *tid;
 	bool		all_dead = false;
-	bool		found;
+
+	lv_heap_setup(scan, so);
+#if PG_VERSION_NUM >= 200000
+	return table_fetch_tid(heap, &htid, scan->xs_snapshot, &all_dead) &&
+		table_tuple_fetch_row_version(heap, &htid, scan->xs_snapshot, so->slot);
+#else
+	{
+		bool		call_again = false;
+
+		(void) heap;
+		return table_index_fetch_tuple(so->fetch, &htid, scan->xs_snapshot,
+									   so->slot, &call_again, &all_dead);
+	}
+#endif
+}
+
+/*
+ * The distance of the row in so->slot, with the operator's own function;
+ * false if its vector is NULL.  Clears the slot.
+ */
+static bool
+lv_slot_distance(IndexScanDesc scan, LvScanOpaque *so, double *dist)
+{
 	Datum		values[INDEX_MAX_KEYS];
 	Datum		d;
 	bool		isnull[INDEX_MAX_KEYS];
 	ScanKey		ob = &scan->orderByData[0];
 	ExprContext *econtext;
 	MemoryContext old;
-
-	if (heap == NULL)
-		elog(ERROR, "lionvec: an ordered scan needs its table");
-	if (so->slot == NULL)
-	{
-		old = MemoryContextSwitchTo(so->cxt);
-		so->slot = table_slot_create(heap, NULL);
-#if PG_VERSION_NUM >= 200000
-#elif PG_VERSION_NUM >= 190000
-		so->fetch = table_index_fetch_begin(heap, SO_NONE);
-#else
-		so->fetch = table_index_fetch_begin(heap);
-#endif
-		so->indexInfo = BuildIndexInfo(scan->indexRelation);
-		so->estate = CreateExecutorState();
-		MemoryContextSwitchTo(old);
-	}
-
-#if PG_VERSION_NUM >= 200000
-	found = table_fetch_tid(heap, &htid, scan->xs_snapshot, &all_dead) &&
-		table_tuple_fetch_row_version(heap, &htid, scan->xs_snapshot, so->slot);
-#else
-	{
-		bool		call_again = false;
-
-		found = table_index_fetch_tuple(so->fetch, &htid, scan->xs_snapshot,
-										so->slot, &call_again, &all_dead);
-	}
-#endif
-	so->nfetched++;
-	if (!found)
-		return false;
 
 	econtext = GetPerTupleExprContext(so->estate);
 	ResetExprContext(econtext);
@@ -1469,6 +1561,211 @@ lv_fetch_distance(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid,
 	MemoryContextSwitchTo(old);
 	ExecClearTuple(so->slot);
 	return true;
+}
+
+/*
+ * The distance of the row from the heap, with the operator's own function,
+ * so that it is exactly the distance the query's ORDER BY computes; false if
+ * no version of the row is visible to the scan's snapshot.  Every version of
+ * a HOT chain has the same vector, as the index's column is not one a HOT
+ * update can change.
+ */
+static bool
+lv_fetch_distance(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid,
+				  double *dist)
+{
+	bool		found = lv_heap_fetch(scan, so, tid);
+
+	so->nfetched++;
+	if (!found)
+		return false;
+	return lv_slot_distance(scan, so, dist);
+}
+
+/* ----------------------------------------------------------------
+ * Vectors in TOAST read by their places (DESIGN.md §44.13)
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * Whether the scan reads by place still: not once more than half of 64
+ * reads or more have failed - a TOAST relation rewritten on its own, every
+ * place stale - so that such a scan pays for 64 at most.
+ */
+static inline bool
+lv_place_ok(const LvScanOpaque *so)
+{
+	return so->ttried < 64 || 2 * so->tfailed <= so->ttried;
+}
+
+/*
+ * The value read into so->tvalue has the header a vector of the index's
+ * dimensions has (lionvec_datum_dim(), and its unused field 0): bytes of
+ * another value, read where a dead row's value was, never reach the
+ * operator's function as a vector of other dimensions, which would raise
+ * an error.
+ */
+static bool
+lv_value_ok(const LvScanOpaque *so)
+{
+	const LionVecPgVector *v = (const LionVecPgVector *) so->tvalue;
+
+	return lionvec_datum_dim(so->tvalue, VARSIZE(so->tvalue),
+							 so->info->half) == so->info->dims &&
+		v->unused == 0;
+}
+
+/* ... and its distance, with the operator's own function */
+static double
+lv_value_distance(IndexScanDesc scan, LvScanOpaque *so)
+{
+	ScanKey		ob = &scan->orderByData[0];
+	ExprContext *econtext = GetPerTupleExprContext(so->estate);
+	MemoryContext old;
+	Datum		d;
+	double		dist;
+
+	ResetExprContext(econtext);
+	old = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+	d = FunctionCall2Coll(&ob->sk_func, ob->sk_collation,
+						  PointerGetDatum(so->tvalue), so->query);
+	dist = so->dist4 ? (double) DatumGetFloat4(d) : DatumGetFloat8(d);
+	MemoryContextSwitchTo(old);
+	return dist;
+}
+
+/*
+ * The check of a row read by place, its version visible to the scan in
+ * so->slot (lv_heap_fetch()): its vector must be the value read, valueid
+ * in the heap's TOAST relation.  A row the scan sees keeps its value where
+ * the index found it (DESIGN.md §44.13, "Why a place that checks is the
+ * right chunk"), and every version of it the same value, so anything else
+ * is an index that names another value for a live row:
+ * ERRCODE_INDEX_CORRUPTED, never a wrong distance.
+ */
+static void
+lv_check_pointer(IndexScanDesc scan, LvScanOpaque *so, Oid valueid)
+{
+	AttrNumber	attno = so->indexInfo->ii_IndexAttrNumbers[0];
+	bool		isnull = true;
+	Datum		d = (Datum) 0;
+
+	if (attno > 0)
+		d = slot_getattr(so->slot, attno, &isnull);
+	if (!isnull && VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(d)))
+	{
+		struct varatt_external ptr;
+
+		memset(&ptr, 0, sizeof(ptr));
+		VARATT_EXTERNAL_GET_POINTER(ptr, DatumGetPointer(d));
+		if (ptr.va_valueid == valueid &&
+			ptr.va_toastrelid == RelationGetRelid(so->toastrel))
+			return;
+	}
+	ereport(ERROR,
+			(errcode(ERRCODE_INDEX_CORRUPTED),
+			 errmsg("lionvec index \"%s\" places the vector of the row at (%u,%u) in TOAST value %u, and the row stores another",
+					RelationGetRelationName(scan->indexRelation),
+					ItemPointerGetBlockNumber(&so->slot->tts_tid),
+					ItemPointerGetOffsetNumber(&so->slot->tts_tid), valueid)));
+}
+
+/*
+ * The return-time check of an exact path's member read by place: false if
+ * no version of the row is visible to the scan, which passes it over as
+ * the heap path would have; ERRCODE_INDEX_CORRUPTED if one is and stores
+ * another value (lv_check_pointer()).
+ */
+static bool
+lv_check_placed(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid,
+				Oid valueid)
+{
+	so->nchecked++;
+	if (!lv_heap_fetch(scan, so, tid))
+		return false;
+	lv_check_pointer(scan, so, valueid);
+	ExecClearTuple(so->slot);
+	return true;
+}
+
+/*
+ * Whether this scan reads vectors by their places in TOAST (DESIGN.md
+ * §44.13): an index that keeps a locator, pg_lion.vector_toast_direct on,
+ * a heap of the heap access method whose TOAST relation is the one the
+ * index was built over, a regular MVCC snapshot, and, on 16, no
+ * old_snapshot_threshold, under which a value an old snapshot sees may be
+ * gone with no error to say so from a read by place.  Then the exact path
+ * reads its members so, from the locator (lv_exact_places()), and the
+ * rerank, in an index whose REFINE items hold places, the rows it reranks
+ * (lv_rerank_placed()).  The TOAST relation is opened once, locked as a
+ * detoast locks it, which keeps it from being truncated or rewritten while
+ * the transaction lasts, so its blocks counted now bound every place read.
+ */
+static void
+lv_start_toast(IndexScanDesc scan, LvScanOpaque *so)
+{
+	Relation	heap = scan->heapRelation;
+	int64		extsize;
+	int			nchunks;
+
+	so->tdirect = false;
+	so->tref = 0;
+	so->tpf = 0;
+	so->ttried = so->tfailed = 0;
+	lion_ask_reset(&so->task);
+	if (!lionvec_toast_direct ||
+		(so->meta.flags & LIONVEC_META_LOCATOR) == 0 ||
+		heap == NULL || heap->rd_tableam != GetHeapamTableAmRoutine() ||
+		!OidIsValid(heap->rd_rel->reltoastrelid) ||
+		heap->rd_rel->reltoastrelid != so->meta.toastrelid ||
+		so->info->dims <= 0 || so->meta.dims != so->info->dims ||
+		lion_old_snapshot_threshold_active() ||
+		!IsMVCCSnapshot(scan->xs_snapshot))
+		return;
+	extsize = lionvec_toast_extsize(so->info->dims, so->info->half);
+	nchunks = lionvec_toast_nchunks(extsize, TOAST_MAX_CHUNK_SIZE);
+	if (nchunks < 1 || nchunks > LIONVEC_LOC_MAXRUNS)
+		return;
+
+	if (so->toastrel != NULL &&
+		RelationGetRelid(so->toastrel) != so->meta.toastrelid)
+	{
+		table_close(so->toastrel, NoLock);
+		so->toastrel = NULL;
+	}
+	if (so->toastrel == NULL)
+		so->toastrel = table_open(so->meta.toastrelid, AccessShareLock);
+	if (so->tvalue == NULL || so->textsize != extsize)
+	{
+		if (so->tvalue != NULL)
+			pfree(so->tvalue);
+		so->tvalue = MemoryContextAlloc(so->cxt, VARHDRSZ + extsize);
+	}
+	SET_VARSIZE(so->tvalue, VARHDRSZ + extsize);
+	so->textsize = extsize;
+	so->tnchunks = nchunks;
+	so->tsnap = lion_toast_snapshot(&so->tsnapdata);
+	so->tnblocks = RelationGetNumberOfBlocks(so->toastrel);
+	lv_heap_setup(scan, so);
+	so->tdirect = true;
+	so->tref = so->meta.refloc_runs;
+
+	/* its pages ahead, as the heap's (lv_start_prefetch()) */
+	if (so->rmode != LION_READAHEAD_OFF)
+		so->tpf = Max(Min(get_tablespace_io_concurrency(so->toastrel->rd_rel->reltablespace),
+						  LIONVEC_PREFETCH_MAX), 0);
+	if (so->tref > 0 && so->tpf > 0)
+	{
+		/* the rerank asks for the heap block of each row it places */
+		if (so->hpf <= 0)
+			so->hblocks = RelationGetNumberOfBlocks(heap);
+		if (so->pfkey == NULL)
+		{
+			so->pfkey = palloc(sizeof(double) * LV_PF_TOP(LIONVEC_PREFETCH_MAX));
+			so->pfat = palloc(sizeof(int) * LV_PF_TOP(LIONVEC_PREFETCH_MAX));
+			so->pfsel = palloc(sizeof(int) * LIONVEC_PREFETCH_MAX);
+		}
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -1491,9 +1788,12 @@ lv_exact_cmp(const void *a, const void *b)
 }
 
 /*
- * The exact path's heap blocks through a read stream (lv_exact()): the
- * members' blocks in their order, a block that members one after another
- * share once, and those the scan counted (so->hblocks) only.
+ * A list of blocks the exact path reads in its order (lv_exact()): the
+ * members' heap blocks, a block that members one after another share
+ * once, and those the scan counted (so->hblocks) only, through a read
+ * stream; and the LOC pages and TOAST blocks of the members read by place
+ * (lv_exact_places()), through a stream, or asked of the kernel dist
+ * ahead, or read as they come (lv_list_begin()).
  */
 typedef struct LvExactRead
 {
@@ -1501,6 +1801,12 @@ typedef struct LvExactRead
 	BlockNumber *blks;
 	int			n;
 	int			next;			/* the next to name to the stream */
+	Relation	rel;			/* lv_list_*(): the relation ... */
+	LionAsk    *ask;			/* ... its asks, dist ahead, when not
+								 * streamed; or NULL */
+	int			dist;
+	int			pos;			/* the next to read */
+	int			asked;			/* the next to ask for */
 } LvExactRead;
 
 /* LionReadaheadNext; inside the stream's callback, it reads nothing */
@@ -1514,21 +1820,362 @@ lv_exact_next(void *arg)
 }
 
 /*
- * The members' distances from the heap, sorted: what probing would cost,
- * and more, when a restriction admits so few rows that most partitions
- * hold none, and the nearest member lies past many.  A member that is not
- * visible, or whose vector is NULL, is left for the NULL walk; a cosine
- * zero vector, whose distance is NaN, for the zero walk.  The members are
- * listed first, in TID order, and their heap blocks read ahead (DESIGN.md
- * §44.4, "Prefetch" and "Read streams"): asking the kernel, each one's
- * so->hpf members before its fetch, the members of a block asking once;
- * through a stream over the list of their blocks, each block taken from
- * the stream at its first member, pinned unless the list rests
- * (lion_readahead_next()), and its pin dropped at once - the fetch
- * pins it again, and prunes it only with no other pin of this backend on
- * it (ConditionalLockBufferForCleanup()) - and the stream ended before the
- * scan returns, so that it keeps no heap page pinned.  Then their
- * distances, over the list.
+ * Read the n blocks blks[] of rel in order: through a list stream when the
+ * scan streams (mode) and reads dist > 0 ahead, else asking the kernel dist
+ * ahead through ask, else as they come.
+ */
+static void
+lv_list_begin(LvExactRead *x, Relation rel, BlockNumber *blks, int n,
+			  int mode, int dist, LionAsk *ask)
+{
+	memset(x, 0, sizeof(*x));
+	x->rel = rel;
+	x->blks = blks;
+	x->n = n;
+	if (n <= 0 || dist <= 0 || mode == LION_READAHEAD_OFF)
+		return;
+	if (mode == LION_READAHEAD_STREAM)
+		x->ra = lion_readahead_begin_list(rel, LION_READAHEAD_STREAM,
+										  lv_exact_next, x);
+	if (x->ra == NULL)
+	{
+		x->ask = ask;
+		x->dist = dist;
+	}
+}
+
+/* The list's next block, which must be blk: pinned, not locked. */
+static Buffer
+lv_list_read(LvExactRead *x, BlockNumber blk)
+{
+	Buffer		buf = InvalidBuffer;
+
+	if (x->pos >= x->n || x->blks[x->pos] != blk)
+		elog(ERROR, "lionvec: a list read of \"%s\" lost its place at block %u",
+			 RelationGetRelationName(x->rel), blk);
+	if (x->ra != NULL)
+	{
+		BlockNumber got;
+
+		if (!lion_readahead_next(x->ra, &got, &buf) || got != blk ||
+			(BufferIsValid(buf) && BufferGetBlockNumber(buf) != blk))
+			elog(ERROR, "lionvec: the read stream of \"%s\" lost its place at block %u",
+				 RelationGetRelationName(x->rel), blk);
+	}
+	else if (x->ask != NULL)
+	{
+		for (; x->asked < x->n && x->asked <= x->pos + x->dist; x->asked++)
+			if (x->asked > x->pos)
+				lion_ask(x->ask, x->rel, x->blks[x->asked], true);
+	}
+	x->pos++;
+	if (!BufferIsValid(buf))
+		buf = ReadBuffer(x->rel, blk);
+	return buf;
+}
+
+/* Done with the list, read whole or not: its stream's pins released. */
+static void
+lv_list_end(LvExactRead *x, LionReadaheadCounts *counts)
+{
+	if (x->ra != NULL)
+	{
+		lion_readahead_counts(x->ra, counts);
+		lion_readahead_end(x->ra);
+		x->ra = NULL;
+	}
+}
+
+/* The member of so->exact[0 .. n), in TID order, at tid; -1 if none. */
+static int
+lv_exact_find(const LvScanOpaque *so, int n, ItemPointer tid)
+{
+	int			a = 0;
+	int			b = n;
+
+	while (a < b)
+	{
+		int			m = a + (b - a) / 2;
+		int			c = ItemPointerCompare((ItemPointer) &so->exact[m].tid, tid);
+
+		if (c == 0)
+			return m;
+		if (c < 0)
+			a = m + 1;
+		else
+			b = m;
+	}
+	return -1;
+}
+
+/* the members read by place, by their first chunk's place */
+typedef struct LvPlaceOrd
+{
+	BlockNumber blk;
+	OffsetNumber off;
+	int			member;
+	const LionVecLoc *loc;
+} LvPlaceOrd;
+
+static int
+lv_place_ord_cmp(const void *a, const void *b)
+{
+	const LvPlaceOrd *x = (const LvPlaceOrd *) a;
+	const LvPlaceOrd *y = (const LvPlaceOrd *) b;
+
+	if (x->blk != y->blk)
+		return x->blk < y->blk ? -1 : 1;
+	if (x->off != y->off)
+		return x->off < y->off ? -1 : 1;
+	return x->member < y->member ? -1 : (x->member > y->member ? 1 : 0);
+}
+
+/*
+ * The exact path's members read by their places in TOAST (DESIGN.md §44.13,
+ * "The exact path"), so->exact[0 .. n) in TID order.  The LOCDIR whole,
+ * and of its LOC pages those whose range of heap blocks holds a member's
+ * (lionvec_loc_select()), in block order through a list; each page's
+ * entries looked up among the members by TID, a member that two entries
+ * name differently taking neither.  Then the members with an entry, by
+ * their first chunk's place, each run's block named in turn to one list
+ * over the TOAST relation (a block repeated in a row once), each member's
+ * chunks read from their pages and checked (lionvec_place_run()), its
+ * vector assembled and its header checked (lv_value_ok()), and its
+ * distance computed: the member is then LV_X_PLACED, with its value's id
+ * for the check before it is returned (lv_check_placed()), or LV_X_DROP, a
+ * cosine zero vector, which the zero walk returns.  Any other member stays
+ * LV_X_HEAP, for the heap; so does every one past the point where the scan
+ * stops reading by place (lv_place_ok()).  The lists end before it
+ * returns, so that no page stays pinned.
+ */
+static void
+lv_exact_places(IndexScanDesc scan, LvScanOpaque *so, int n)
+{
+	Relation	index = scan->indexRelation;
+	Relation	toastrel = so->toastrel;
+	MemoryContext cxt;
+	MemoryContext old;
+	LionVecLocDir *dir;
+	int			ndir;
+	uint32	   *mblks;
+	int			nm = 0;
+	uint32	   *dpage;
+	uint32	   *dlo;
+	uint32	   *dhi;
+	BlockNumber *sel;
+	int			nsel;
+	const LionVecLoc **ent;		/* [n]: a member's entry, or NULL */
+	bool	   *twice;			/* [n]: named by two entries that differ */
+	LvPlaceOrd *ord;
+	int			nord = 0;
+	BlockNumber *tblks;
+	int			nt = 0;
+	LvExactRead x;
+	Buffer		cur = InvalidBuffer;
+	BlockNumber curblk = InvalidBlockNumber;
+	int			i;
+
+	Assert(so->tdirect && toastrel != NULL);
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "lionvec places",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cxt);
+
+	/* the members' heap blocks, in order, each once */
+	mblks = palloc(sizeof(uint32) * n);
+	for (i = 0; i < n; i++)
+	{
+		BlockNumber blk = ItemPointerGetBlockNumberNoCheck(&so->exact[i].tid);
+
+		Assert(i == 0 || ItemPointerCompare(&so->exact[i - 1].tid,
+											&so->exact[i].tid) < 0);
+		if (nm == 0 || mblks[nm - 1] != blk)
+			mblks[nm++] = blk;
+	}
+
+	/* the LOC pages that may hold their entries */
+	dir = lionvec_locdir_read(index, &so->meta, &ndir);
+	dpage = palloc(sizeof(uint32) * Max(ndir, 1));
+	dlo = palloc(sizeof(uint32) * Max(ndir, 1));
+	dhi = palloc(sizeof(uint32) * Max(ndir, 1));
+	sel = palloc(sizeof(BlockNumber) * Max(ndir, 1));
+	for (i = 0; i < ndir; i++)
+	{
+		dpage[i] = dir[i].blk;
+		dlo[i] = dir[i].lo;
+		dhi[i] = dir[i].hi;
+	}
+	nsel = lionvec_loc_select(dpage, dlo, dhi, ndir, mblks, nm, sel);
+	for (i = 0; i < nsel; i++)
+	{
+		if (sel[i] >= so->nblocks)
+			so->nblocks = RelationGetNumberOfBlocks(index);
+		if (sel[i] >= so->nblocks || sel[i] == LIONVEC_METAPAGE)
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lionvec index \"%s\" has a locator page at block %u, past its end",
+							RelationGetRelationName(index), sel[i])));
+	}
+
+	/* their entries, by member */
+	ent = palloc0(sizeof(LionVecLoc *) * n);
+	twice = palloc0(sizeof(bool) * n);
+	lv_list_begin(&x, index, sel, nsel,
+				  so->ipf > 0 ? so->rmode : LION_READAHEAD_OFF, so->ipf,
+				  &so->iask);
+	for (i = 0; i < nsel; i++)
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber off;
+		OffsetNumber maxoff;
+
+		CHECK_FOR_INTERRUPTS();
+		buf = lv_list_read(&x, sel[i]);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		lionvec_check_page(index, page, sel[i], LIONVEC_PAGE_LOC);
+		so->nlocpages++;
+		maxoff = PageGetMaxOffsetNumber(page);
+		for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
+		{
+			LionVecLoc *loc = lionvec_loc_at(index, page, sel[i], off,
+											 so->tnchunks);
+			int			m = lv_exact_find(so, n, &loc->tid);
+			Size		len = LIONVEC_LOC_SIZE(loc->nruns);
+
+			if (m < 0 || twice[m])
+				continue;
+			if (ent[m] == NULL)
+			{
+				LionVecLoc *copy = palloc(len);
+
+				memcpy(copy, loc, len);
+				ent[m] = copy;
+			}
+			else if (ent[m]->nruns != loc->nruns || memcmp(ent[m], loc, len) != 0)
+			{
+				ent[m] = NULL;
+				twice[m] = true;
+			}
+		}
+		UnlockReleaseBuffer(buf);
+	}
+	lv_list_end(&x, &so->rcounts);
+	/* the entries read, and no chunk yet: a test parks the scan here */
+	LION_INJECTION_POINT("lionvec-exact-located");
+
+	/* the members with an entry, by their first chunk's place */
+	ord = palloc(sizeof(LvPlaceOrd) * Max(n, 1));
+	for (i = 0; i < n; i++)
+	{
+		const LionVecLoc *loc = ent[i];
+		bool		inside = loc != NULL;
+		int			r;
+
+		for (r = 0; inside && r < loc->nruns; r++)
+			inside = loc->runs[r].blk < so->tnblocks;
+		if (!inside)
+			continue;			/* a place past the end: the heap's */
+		ord[nord].blk = loc->runs[0].blk;
+		ord[nord].off = loc->runs[0].off;
+		ord[nord].member = i;
+		ord[nord].loc = loc;
+		nord++;
+	}
+	qsort(ord, nord, sizeof(LvPlaceOrd), lv_place_ord_cmp);
+	tblks = palloc(sizeof(BlockNumber) * Max(nord * so->tnchunks, 1));
+	for (i = 0; i < nord; i++)
+	{
+		int			r;
+
+		for (r = 0; r < ord[i].loc->nruns; r++)
+		{
+			BlockNumber blk = ord[i].loc->runs[r].blk;
+
+			if (nt == 0 || tblks[nt - 1] != blk)
+				tblks[nt++] = blk;
+		}
+	}
+
+	/* their chunks, from their pages */
+	lv_list_begin(&x, toastrel, tblks, nt,
+				  so->tpf > 0 ? so->rmode : LION_READAHEAD_OFF, so->tpf,
+				  &so->task);
+	for (i = 0; i < nord && lv_place_ok(so); i++)
+	{
+		const LionVecLoc *loc = ord[i].loc;
+		LvExact    *e = &so->exact[ord[i].member];
+		bool		ok = true;
+		int			seq = 0;
+		int			r;
+		double		dist;
+
+		CHECK_FOR_INTERRUPTS();
+		for (r = 0; r < loc->nruns; r++)
+		{
+			const LionVecLocRun *run = &loc->runs[r];
+
+			/* every block named is read, the member's checks failed or not */
+			if (run->blk != curblk)
+			{
+				if (BufferIsValid(cur))
+					ReleaseBuffer(cur);
+				cur = lv_list_read(&x, run->blk);
+				curblk = run->blk;
+			}
+			if (ok)
+			{
+				LockBuffer(cur, BUFFER_LOCK_SHARE);
+				ok = lionvec_place_run(toastrel, so->tsnap, cur, run,
+									   loc->valueid, seq, so->textsize,
+									   VARDATA(so->tvalue));
+				LockBuffer(cur, BUFFER_LOCK_UNLOCK);
+			}
+			seq += run->n;
+		}
+		so->ttried++;
+		if (!ok || seq != so->tnchunks || !lv_value_ok(so))
+		{
+			so->tfailed++;
+			so->nplacefail++;
+			continue;
+		}
+		so->nplaced++;
+		dist = lv_value_distance(scan, so);
+		if (isnan(dist) && so->metric == LIONVEC_COSINE)
+		{
+			e->how = LV_X_DROP;
+			continue;
+		}
+		e->how = LV_X_PLACED;
+		e->dist = dist;
+		e->valueid = loc->valueid;
+	}
+	if (BufferIsValid(cur))
+		ReleaseBuffer(cur);
+	lv_list_end(&x, &so->rcounts);
+
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+}
+
+/*
+ * The members' distances, sorted: what probing would cost, and more, when
+ * a restriction admits so few rows that most partitions hold none, and the
+ * nearest member lies past many.  A member that is not visible, or whose
+ * vector is NULL, is left for the NULL walk; a cosine zero vector, whose
+ * distance is NaN, for the zero walk.  The members are listed first, in
+ * TID order.  Those whose vectors lie in TOAST are read by their places
+ * there when the scan does (lv_exact_places()), and the rest from the
+ * heap, their heap blocks read ahead (DESIGN.md §44.4, "Prefetch" and
+ * "Read streams"): asking the kernel, each one's so->hpf members before
+ * its fetch, the members of a block asking once; through a stream over the
+ * list of their blocks, each block taken from the stream at its first
+ * member, pinned unless the list rests (lion_readahead_next()), and its
+ * pin dropped at once - the fetch pins it again, and prunes it only with
+ * no other pin of this backend on it (ConditionalLockBufferForCleanup()) -
+ * and the stream ended before the scan returns, so that it keeps no heap
+ * page pinned.  Then their distances, over the list.
  */
 static void
 lv_exact(IndexScanDesc scan, LvScanOpaque *so)
@@ -1571,10 +2218,15 @@ lv_exact(IndexScanDesc scan, LvScanOpaque *so)
 			}
 			so->exact[n].dist = 0.0;
 			so->exact[n].tid = tid;
+			so->exact[n].how = LV_X_HEAP;
+			so->exact[n].valueid = InvalidOid;
 			n++;
 		}
 	}
 	pfree(los);
+
+	if (so->tdirect && n > 0)
+		lv_exact_places(scan, so, n);
 
 	memset(&x, 0, sizeof(x));
 	if (so->hpf > 0 && so->rmode == LION_READAHEAD_STREAM)
@@ -1584,6 +2236,8 @@ lv_exact(IndexScanDesc scan, LvScanOpaque *so)
 		{
 			BlockNumber blk = ItemPointerGetBlockNumberNoCheck(&so->exact[i].tid);
 
+			if (so->exact[i].how != LV_X_HEAP)
+				continue;
 			if (blk != last && blk < so->hblocks)
 			{
 				/*
@@ -1604,7 +2258,8 @@ lv_exact(IndexScanDesc scan, LvScanOpaque *so)
 	else
 	{
 		for (i = 0; i < Min(n, so->hpf); i++)
-			lv_prefetch_heap(scan, so, &so->exact[i].tid);
+			if (so->exact[i].how == LV_X_HEAP)
+				lv_prefetch_heap(scan, so, &so->exact[i].tid);
 	}
 	for (i = 0; i < n; i++)
 	{
@@ -1612,6 +2267,14 @@ lv_exact(IndexScanDesc scan, LvScanOpaque *so)
 		double		dist;
 
 		CHECK_FOR_INTERRUPTS();
+		if (so->exact[i].how == LV_X_DROP)
+			continue;
+		if (so->exact[i].how == LV_X_PLACED)
+		{
+			/* kept in place, its check due when it is returned */
+			so->exact[so->nexact++] = so->exact[i];
+			continue;
+		}
 		if (x.ra != NULL)
 		{
 			BlockNumber blk = ItemPointerGetBlockNumberNoCheck(&tid);
@@ -1636,7 +2299,8 @@ lv_exact(IndexScanDesc scan, LvScanOpaque *so)
 			}
 			last = blk;
 		}
-		else if (so->hpf > 0 && i + so->hpf < n)
+		else if (so->hpf > 0 && i + so->hpf < n &&
+				 so->exact[i + so->hpf].how == LV_X_HEAP)
 			lv_prefetch_heap(scan, so, &so->exact[i + so->hpf].tid);
 		if (!lv_fetch_distance(scan, so, &tid, &dist))
 			continue;
@@ -1645,6 +2309,8 @@ lv_exact(IndexScanDesc scan, LvScanOpaque *so)
 		/* kept in place, behind the members still to fetch */
 		so->exact[so->nexact].dist = dist;
 		so->exact[so->nexact].tid = tid;
+		so->exact[so->nexact].how = LV_X_HEAP;
+		so->exact[so->nexact].valueid = InvalidOid;
 		so->nexact++;
 	}
 	if (x.ra != NULL)
@@ -2019,7 +2685,7 @@ lv_read_parts(IndexScanDesc scan, LvScanOpaque *so)
 			item.rblk = part->cent.rblk;
 			item.roff = part->cent.roff;
 			item.norm = part->cent.norm;
-			item.xm = part->cent.xm;
+			item.u.xm = part->cent.xm;
 			so->parts.items[so->parts.n++] = item;
 			n++;
 		}
@@ -2064,7 +2730,7 @@ lv_refine_part(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 	page = BufferGetPage(buf);
 	lionvec_check_page(index, page, item->rblk, LIONVEC_PAGE_REFINE);
 	ref = lionvec_refine_at(index, page, item->rblk, item->roff,
-							so->info->dimsp, &item->tid);
+							so->info->dimsp, so->meta.refloc_runs, &item->tid);
 	if (ref == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -2074,7 +2740,7 @@ lv_refine_part(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 	lionvec_estimate8(&so->q, ref->codes, item->norm, ref->alpha8,
 					  ref->rnorm8, &est, &err);
 	UnlockReleaseBuffer(buf);
-	lionvec_key_bounds(so->metric, item->norm, item->xm, est, err, &lo, &hi);
+	lionvec_key_bounds(so->metric, item->norm, item->u.xm, est, err, &lo, &hi);
 	item->key = lv_part_key(so, lo, LionVecCentPartno(&item->tid));
 	item->level = LV_CENT8;
 	item->pf = false;
@@ -2489,11 +3155,12 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head, bool copies,
 			item.rblk = code->rblk;
 			item.roff = code->roff;
 			item.norm = code->norm;
-			item.xm = code->xm;
+			item.u.xm = code->xm;
 			item.dist = 0.0;
 			item.level = LV_PLANE1;
 			item.copy = (code->flags & LIONVEC_SPILL) != 0;
 			item.pf = false;
+			item.tp = false;
 			if (anyseen)
 			{
 				LvSeen	   *s = lvseen_lookup(so->seen, lv_tidkey(&code->tid));
@@ -2513,6 +3180,12 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head, bool copies,
 					item.hi1 = s->hi1;
 					lo = s->lo;
 					hi = s->hi;
+					if (item.level == LV_CODES8 && so->tref > 0)
+					{
+						/* its REFINE item may place it; its block unknown */
+						item.tp = true;
+						item.u.tblk = InvalidBlockNumber;
+					}
 				}
 			}
 			if (item.level == LV_PLANE1)
@@ -2865,6 +3538,8 @@ lv_refine(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 	double		err;
 	double		lo;
 	double		hi;
+	BlockNumber tblk = InvalidBlockNumber;
+	bool		tp = false;
 
 	lv_prefetch_due(scan, so, &so->rpfdue, &so->rows, LV_PLANE1, false);
 	buf = lion_readahead_read(so->rrefs, item->rblk);
@@ -2872,7 +3547,7 @@ lv_refine(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 	page = BufferGetPage(buf);
 	lionvec_check_page(index, page, item->rblk, LIONVEC_PAGE_REFINE);
 	ref = lionvec_refine_at(index, page, item->rblk, item->roff,
-							so->info->dimsp, &item->tid);
+							so->info->dimsp, so->meta.refloc_runs, &item->tid);
 	if (ref == NULL)
 	{
 		/* VACUUM has removed the row since the probe read it (§44.5) */
@@ -2882,6 +3557,12 @@ lv_refine(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 	}
 	lionvec_estimate8(&so->q, ref->codes, item->norm, ref->alpha8,
 					  ref->rnorm8, &est, &err);
+	if (so->tref > 0 && ref->nloc > 0)
+	{
+		/* its vector's place in TOAST, whose first page the rerank asks for */
+		tp = true;
+		tblk = LionVecRefineGetLoc(ref, so->info->dimsp)->runs[0].blk;
+	}
 	UnlockReleaseBuffer(buf);
 	so->nrefined++;
 
@@ -2890,10 +3571,12 @@ lv_refine(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 	 * the better by two orders of magnitude, and keeping the larger of the
 	 * two would keep plane 1's failures too.
 	 */
-	lionvec_key_bounds(so->metric, item->norm, item->xm, est, err, &lo, &hi);
+	lionvec_key_bounds(so->metric, item->norm, item->u.xm, est, err, &lo, &hi);
 	item->key = lo;
 	item->level = LV_CODES8;
 	item->pf = false;
+	item->tp = tp;
+	item->u.tblk = tblk;		/* plane 1's xm is done with */
 	lv_remember(so, &item->tid, LV_CODES8, lo, hi, 0.0, item->hi1);
 	if (so->behind && hi < so->lastkey)
 		return;					/* behind the row returned last; the hash says so */
@@ -2901,22 +3584,98 @@ lv_refine(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 }
 
 /*
+ * A row placed by its REFINE item (tp), its exact distance read by place
+ * (DESIGN.md §44.13, "The REFINE item's place"): 1 with *dist, 0 if no
+ * version of it is visible to the scan or its vector is NULL, -1 to read
+ * it from the heap instead - no place in its REFINE item, the item gone
+ * (VACUUM, §44.5), or the scan no longer reading by place.  Its REFINE
+ * item, read a moment ago by lv_refine(), is read again for the place; the
+ * row is fetched from the heap first, for the check that comes before an
+ * exact path's member is returned (lv_check_placed()) - a row the scan
+ * does not see costs no TOAST read - and then its vector read from its
+ * chunks' pages, which lv_prefetch_queue() asked for with its heap block,
+ * and checked, where a failure detoasts the fetched row's vector as the
+ * heap path does.
+ */
+static int
+lv_rerank_placed(IndexScanDesc scan, LvScanOpaque *so, LvItem *item,
+				 double *dist)
+{
+	Relation	index = scan->indexRelation;
+	int			dimsp = so->info->dimsp;
+	Buffer		buf;
+	Page		page;
+	LionVecRefine *ref;
+	LionVecLocRun runs[LIONVEC_LOC_MAXRUNS];
+	int			nruns = 0;
+	Oid			valueid = InvalidOid;
+	bool		ok;
+
+	if (!lv_place_ok(so) || item->rblk >= so->nblocks)
+		return -1;
+	buf = ReadBuffer(index, item->rblk);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	lionvec_check_page(index, page, item->rblk, LIONVEC_PAGE_REFINE);
+	ref = lionvec_refine_at(index, page, item->rblk, item->roff, dimsp,
+							so->meta.refloc_runs, &item->tid);
+	if (ref != NULL && ref->nloc > 0 && ref->nloc <= LIONVEC_LOC_MAXRUNS)
+	{
+		LionVecRefineLoc *rl = LionVecRefineGetLoc(ref, dimsp);
+
+		nruns = ref->nloc;
+		valueid = rl->valueid;
+		memcpy(runs, rl->runs, sizeof(LionVecLocRun) * nruns);
+	}
+	UnlockReleaseBuffer(buf);
+	if (nruns == 0)
+		return -1;
+
+	so->nchecked++;
+	so->nfetched++;
+	if (!lv_heap_fetch(scan, so, &item->tid))
+		return 0;
+	lv_check_pointer(scan, so, valueid);
+	ok = lionvec_place_read(so->toastrel, so->tsnap, so->tnblocks, valueid,
+							runs, nruns, so->textsize, VARDATA(so->tvalue)) &&
+		lv_value_ok(so);
+	so->ttried++;
+	if (!ok)
+	{
+		so->tfailed++;
+		so->nplacefail++;
+		return lv_slot_distance(scan, so, dist) ? 1 : 0;
+	}
+	ExecClearTuple(so->slot);
+	so->nplaced++;
+	*dist = lv_value_distance(scan, so);
+	return 1;
+}
+
+/*
  * A row by its exact distance, back into the queue; first, every so often,
- * the heap blocks of the rows to fetch next.
+ * the heap blocks of the rows to fetch next, and the TOAST blocks of those
+ * placed.
  */
 static void
 lv_rerank(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 {
 	double		dist;
+	int			got = -1;
 
 	lv_prefetch_due(scan, so, &so->fpfdue, &so->rows, LV_CODES8, true);
-	if (!lv_fetch_distance(scan, so, &item->tid, &dist))
+	if (item->tp && so->tref > 0)
+		got = lv_rerank_placed(scan, so, item, &dist);
+	if (got < 0)
+		got = lv_fetch_distance(scan, so, &item->tid, &dist) ? 1 : 0;
+	if (got == 0)
 	{
 		lv_mark_done(so, item);
 		return;
 	}
 	item->level = LV_EXACT;
 	item->pf = false;
+	item->tp = false;
 	item->dist = dist;
 	{
 		double		bound = item->key;
@@ -2938,45 +3697,6 @@ lv_rerank(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
  * Starting: the query
  * ----------------------------------------------------------------
  */
-
-/*
- * Whether a row's vector lies in its heap page, so that a fetch reads the
- * block its TID names and little else: the column's storage keeps it there
- * (PLAIN, or MAIN, which moves a value out only when its row outgrows the
- * page), or its size does.  The heap moves a row's EXTERNAL (pgvector's)
- * and EXTENDED values to TOAST, which a fetch reaches through the TOAST
- * index, the heap page the least of what it reads, only once the row is
- * past TOAST_TUPLE_THRESHOLD, and then only until it is within the table's
- * toast_tuple_target (TOAST_TUPLE_TARGET, the same 2,032 bytes at 8K pages,
- * unless the table sets it): a vector within the larger of the two stays,
- * 506 dimensions of vector and 1,012 of halfvec at the defaults, all 2,000
- * a vector index takes under toast_tuple_target = 8160, which the DBpedia
- * benchmark loads its rows with (bench/vector/knn_dbpedia.py, KNN_INLINE).
- * Judged by the threshold alone, as it was until 2026-10-17, those rows
- * were taken to be in TOAST and their pages were never asked for.  The rest
- * of a row counts too, which this leaves out: a vector just within may
- * still go.  An expression's vector is judged by its size alone.  Asked for
- * alone, on DBpedia's 1536 dimensions in TOAST the heap pages bought
- * nothing: the exact path cold took 113 ms a query under a 1% filter
- * against 109 without (DESIGN.md §44.4, "Prefetch").
- */
-static bool
-lv_vector_inline(const LvScanOpaque *so, Relation index, Relation heap)
-{
-	AttrNumber	attno = index->rd_index->indkey.values[0];
-	Size		sz = 8 + (Size) so->info->dims * (so->info->half ? 2 : 4);
-	int			target = RelationGetToastTupleTarget(heap, (int) TOAST_TUPLE_TARGET);
-	Size		within = Max((Size) TOAST_TUPLE_THRESHOLD, (Size) target);
-
-	if (attno > 0 && attno <= RelationGetDescr(heap)->natts)
-	{
-		char		storage = TupleDescAttr(RelationGetDescr(heap), attno - 1)->attstorage;
-
-		if (storage == TYPSTORAGE_PLAIN || storage == TYPSTORAGE_MAIN)
-			return true;
-	}
-	return sz <= within;
-}
 
 /*
  * The index's three readaheads (lion_readahead.h), as the scan reads now:
@@ -3021,7 +3741,7 @@ lv_readahead_begin(IndexScanDesc scan, LvScanOpaque *so, int mode, int pins)
  * streams"): each relation's tablespace's effective_io_concurrency pages, to
  * LIONVEC_PREFETCH_MAX, while pg_lion.vector_prefetch is not off; the
  * heap's only if it is the heap access method's, whose TIDs name its blocks,
- * and its vectors are not in TOAST (lv_vector_inline()).  0 reads nothing
+ * and its vectors are not in TOAST (lionvec_vector_inline()).  0 reads nothing
  * ahead.  Through streams, each holds twice its relation's pages ahead in
  * pins, and at least LION_READAHEAD_MIN_PINS - those it reads ahead, and
  * those a read out of their order pulled from it first - to an
@@ -3048,7 +3768,7 @@ lv_start_prefetch(IndexScanDesc scan, LvScanOpaque *so)
 		so->ipf = Min(get_tablespace_io_concurrency(index->rd_rel->reltablespace),
 					  LIONVEC_PREFETCH_MAX);
 		if (heap != NULL && heap->rd_tableam == GetHeapamTableAmRoutine() &&
-			lv_vector_inline(so, index, heap))
+			lionvec_vector_inline(index, heap, so->info->dims, so->info->half))
 		{
 			so->hpf = Min(get_tablespace_io_concurrency(heap->rd_rel->reltablespace),
 						  LIONVEC_PREFETCH_MAX);
@@ -3181,6 +3901,7 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 	so->q.qc = palloc(sizeof(float) * so->info->dimsp);
 	so->q.planes = palloc0(sizeof(uint64) * (so->info->dimsp / 64) * LIONVEC_QBITS);
 	lionvec_query_init(&so->q, so->metric, so->info->mean, x, lionvec_epsilon);
+	lv_start_toast(scan, so);
 
 	/* how many rows the scan is of */
 	tuples = index->rd_rel->reltuples > 0 ? index->rd_rel->reltuples :
@@ -3401,15 +4122,22 @@ lionvecgettuple(IndexScanDesc scan, ScanDirection dir)
 				break;
 
 			case LV_LIST:
-				if (so->epos >= so->nexact)
 				{
-					lv_next_phase(scan, so);
-					break;
+					LvExact    *e;
+
+					if (so->epos >= so->nexact)
+					{
+						lv_next_phase(scan, so);
+						break;
+					}
+					e = &so->exact[so->epos++];
+					/* read by place: returned only if the scan sees the row */
+					if (e->how == LV_X_PLACED &&
+						!lv_check_placed(scan, so, &e->tid, e->valueid))
+						break;
+					lv_return(scan, so, &e->tid, e->dist);
+					return true;
 				}
-				lv_return(scan, so, &so->exact[so->epos].tid,
-						  so->exact[so->epos].dist);
-				so->epos++;
-				return true;
 
 			case LV_WALK:
 				{

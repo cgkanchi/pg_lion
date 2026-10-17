@@ -166,6 +166,8 @@ the suite as they are in production.
                             lion_vec.h is what LionOrdered uses to restrict its scan to a lion set
     src/lion_vec_scan.c     its scan: passes over the 1-bit codes, the lazy queue of bounds, refines and
                             exact distances
+    src/lion_vec_loc.c      its locator: where vectors in TOAST lie, so that the scan reads them from their
+                            chunks' pages directly - the lookups, the checked reads, LOC and LOCDIR pages
     src/lion_vec_math.[ch]  its rotation, bit-plane codes, kernels and error bounds, frontend-safe and
                             unit-tested standalone (test/unit/vec_test.c)
     src/lion_readahead.[ch] reading a relation's blocks in an order its reader predicts: a read stream
