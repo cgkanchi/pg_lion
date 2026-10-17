@@ -472,7 +472,7 @@ SELECT i, i % 9,
 							 ' w' || (i % 23))
 	   END
 FROM generate_series(1, 6000) i;
-CREATE INDEX lion_mc_ts_i ON lion_mc_ts USING lion (g, tsv);
+CREATE INDEX lion_mc_ts_i ON lion_mc_ts USING lion (g, tsv) WITH (store_positions = false);
 VACUUM (FREEZE, ANALYZE) lion_mc_ts;
 SELECT attno, ordered, entries, null_tids, empty_tids
   FROM lion_index_stats('lion_mc_ts_i');

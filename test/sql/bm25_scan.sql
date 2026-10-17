@@ -201,7 +201,7 @@ DROP TABLE bs_cur;
 -- errors
 SELECT lion_bm25_score(d, 'w1:*', 'bs_docs_d') FROM bs_docs LIMIT 1;
 SELECT lion_bm25_score(d, 'w1', 'bs_docs_d', -1) FROM bs_docs LIMIT 1;
-CREATE INDEX bs_docs_plain ON bs_docs USING lion (d);
+CREATE INDEX bs_docs_plain ON bs_docs USING lion (d) WITH (store_positions = false);
 SELECT lion_bm25_score(d, 'w1', 'bs_docs_plain') FROM bs_docs LIMIT 1;
 
 DROP TABLE bs_docs;

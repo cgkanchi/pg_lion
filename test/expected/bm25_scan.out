@@ -355,7 +355,7 @@ SELECT lion_bm25_score(d, 'w1:*', 'bs_docs_d') FROM bs_docs LIMIT 1;
 ERROR:  lion_bm25 cannot rank a prefix lexeme
 SELECT lion_bm25_score(d, 'w1', 'bs_docs_d', -1) FROM bs_docs LIMIT 1;
 ERROR:  k1 must be at least 0 and b between 0 and 1
-CREATE INDEX bs_docs_plain ON bs_docs USING lion (d);
+CREATE INDEX bs_docs_plain ON bs_docs USING lion (d) WITH (store_positions = false);
 SELECT lion_bm25_score(d, 'w1', 'bs_docs_plain') FROM bs_docs LIMIT 1;
 ERROR:  lion index "bs_docs_plain" does not store positions
 DROP TABLE bs_docs;
