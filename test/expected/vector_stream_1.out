@@ -1,0 +1,646 @@
+-- lionvec's reads ahead (DESIGN.md §44.4, "Prefetch" and "Read streams"):
+-- pg_lion.vector_prefetch = off reads each page as it comes, fadvise asks
+-- the kernel for the next ones (PrefetchBuffer()), stream reads them through
+-- a read stream, PostgreSQL 17 and later (on 16 a name for fadvise).  They
+-- change which pages come in first, never which are read, nor what a scan
+-- returns: every query here runs under each of the three, once with the
+-- tables' and indexes' pages evicted from shared buffers where the server
+-- can (pg_buffercache_evict(), 17 and later), so that what is read ahead is
+-- read, and once with all of them there, where the kernel's asks fall
+-- dormant (LionAsk) and a stream rests, and the six answers - the rows and
+-- their order - are compared; some, too, with half of each relation
+-- evicted, warm pages and cold ones by turns.  The queries take the scan
+-- through every place it reads ahead: probes of CODE chains, refines of
+-- centroids and of rows, REST passes, the walks of the NULL chain and of
+-- every chain, the exact path's heap blocks, an index that spills, a REST
+-- chain, chains inserts appended to, rescans, cursors, a parallel scan, an
+-- index that grows under an open scan, and scans that fail part-way,
+-- holding what they read ahead.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_lion_vector;
+CREATE EXTENSION IF NOT EXISTS pg_buffercache;
+RESET client_min_messages;
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+-- each major's own default differs (1 before 18, 16 from it)
+SET effective_io_concurrency = 8;
+CREATE FUNCTION rs_vec(seed bigint, n int, scale float8 DEFAULT 1.0)
+RETURNS vector LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+	SELECT array_agg(((hashint8extended(seed * 1000 + j, 45) % 100000)::float8
+					  / 100000.0 * scale)::real ORDER BY j)::vector
+	  FROM generate_series(1, n) j
+$$;
+-- 6,000 rows of 24 dimensions in 8 partitions, five CODE pages or so to a
+-- partition's chain; a fifth of them in each category, one in a hundred
+-- under each tag, one in 50 NULL and one in 200 a zero vector
+CREATE TABLE rs (id int PRIMARY KEY, cat int, tag int, v vector(24))
+	WITH (autovacuum_enabled = off);
+INSERT INTO rs
+SELECT i, i % 5, i % 100,
+	   CASE WHEN i % 50 = 0 THEN NULL
+			WHEN i % 200 = 7 THEN array_fill(0, ARRAY[24])::vector
+			ELSE rs_vec(i, 24) END
+  FROM generate_series(1, 6000) i;
+CREATE INDEX rs_cat ON rs USING lion (cat);
+CREATE INDEX rs_tag ON rs USING lion (tag);
+CREATE INDEX rs_l2 ON rs USING lionvec (v vector_l2_ops) WITH (partitions = 8);
+CREATE INDEX rs_cos ON rs USING lionvec (v vector_cosine_ops)
+	WITH (partitions = 8, spill = on);
+-- every row in the REST chain: the index was built on no rows
+CREATE TABLE rs_rest (id int PRIMARY KEY, v vector(24))
+	WITH (autovacuum_enabled = off);
+CREATE INDEX rs_rest_l2 ON rs_rest USING lionvec (v vector_l2_ops);
+INSERT INTO rs_rest SELECT i, rs_vec(-i, 24) FROM generate_series(1, 2000) i;
+ANALYZE rs, rs_rest;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_sort = off;
+/*
+ * rs_evict() drops every page of the rs tables and their indexes from
+ * shared buffers, writing out the dirty ones; before 17, which has no way
+ * to, it does nothing, and the answers are compared all the same.
+ */
+CREATE FUNCTION rs_evict() RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+	IF current_setting('server_version_num')::int >= 170000 THEN
+		PERFORM pg_buffercache_evict(b.bufferid)
+		   FROM pg_buffercache b
+		  WHERE b.reldatabase = (SELECT oid FROM pg_database
+								  WHERE datname = current_database())
+			AND b.relfilenode IN (SELECT pg_relation_filenode(c.oid)
+									FROM pg_class c
+								   WHERE c.relname ~ '^rs_?' AND c.relkind IN ('r', 'i'));
+	END IF;
+END $$;
+/* rs_ids() is q's ids - a column id - in the order q returns them. */
+CREATE FUNCTION rs_ids(q text) RETURNS int[]
+LANGUAGE plpgsql AS $$
+DECLARE
+	a int[];
+BEGIN
+	EXECUTE format('SELECT array_agg(id ORDER BY n)
+					  FROM (SELECT id, row_number() OVER () AS n FROM (%s) q) s', q) INTO a;
+	RETURN a;
+END $$;
+/*
+ * rs_each() runs f(q) - which returns int[] - under each way of reading
+ * ahead, first with the pages evicted and then with them in shared
+ * buffers, and says how many ids the first returned and whether the six
+ * answers are the same, ids and order.
+ */
+CREATE FUNCTION rs_each(f text, q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	m text;
+	a int[];
+	first int[];
+	got boolean := false;
+	bad text := '';
+	saved text := current_setting('pg_lion.vector_prefetch');
+BEGIN
+	FOREACH m IN ARRAY ARRAY['off', 'fadvise', 'stream'] LOOP
+		PERFORM set_config('pg_lion.vector_prefetch', m, true);
+		FOR i IN 1..2 LOOP
+			IF i = 1 THEN
+				PERFORM rs_evict();
+			END IF;
+			EXECUTE format('SELECT %s($1)', f) INTO a USING q;
+			IF NOT got THEN
+				first := a;
+				got := true;
+			ELSIF a IS DISTINCT FROM first THEN
+				bad := bad || format(' %s%s', m, CASE WHEN i = 1 THEN ' (evicted)' ELSE '' END);
+			END IF;
+		END LOOP;
+	END LOOP;
+	PERFORM set_config('pg_lion.vector_prefetch', saved, true);
+	RETURN format('%s rows, %s', coalesce(cardinality(first), 0),
+				  CASE WHEN bad = '' THEN 'the same each way'
+				  ELSE 'MISMATCH under' || bad END);
+END $$;
+CREATE FUNCTION rs_same(q text) RETURNS text
+LANGUAGE sql AS $$ SELECT rs_each('rs_ids', q) $$;
+CREATE TABLE rs_q (q text);
+INSERT INTO rs_q VALUES
+	-- probes, refines, exact distances
+	('SELECT id FROM rs ORDER BY v <-> rs_vec(1, 24) LIMIT 10'),
+	('SELECT id FROM rs ORDER BY v <=> rs_vec(2, 24) LIMIT 10'),
+	('SELECT id FROM rs ORDER BY v <-> rs_vec(3, 24, 2.0) OFFSET 40 LIMIT 20'),
+	-- REST passes: a plain scan's L is pg_lion.vector_batch, 100
+	('SELECT id FROM rs ORDER BY v <-> rs_vec(4, 24) LIMIT 300'),
+	-- every row: the queues, then the zero vectors' and the NULLs' walks
+	('SELECT id FROM rs ORDER BY v <=> rs_vec(5, 24)'),
+	('SELECT id FROM rs ORDER BY v <-> rs_vec(6, 24)'),
+	-- a zero query, NaN to every vector: the walk of every chain
+	('SELECT id FROM rs ORDER BY v <=> array_fill(0, ARRAY[24])::vector LIMIT 500'),
+	-- a NULL query: every row, NULL distances
+	('SELECT id FROM rs ORDER BY v <-> NULL::vector LIMIT 500'),
+	-- LionOrdered, few members: the exact path's heap reads
+	('SELECT id FROM rs WHERE tag = 3 ORDER BY v <-> rs_vec(7, 24) LIMIT 10'),
+	('SELECT id FROM rs WHERE cat = 1 ORDER BY v <=> rs_vec(8, 24) LIMIT 10'),
+	('SELECT id FROM rs WHERE tag IN (3, 4, 5) ORDER BY v <-> rs_vec(9, 24)'),
+	-- the REST chain alone
+	('SELECT id FROM rs_rest ORDER BY v <-> rs_vec(10, 24) LIMIT 10'),
+	('SELECT id FROM rs_rest ORDER BY v <-> rs_vec(11, 24) LIMIT 150'),
+	-- rescans: a nested loop's inner scan, each outer row a query of its own
+	('SELECT x.id FROM generate_series(1, 6) s,
+			LATERAL (SELECT id FROM rs ORDER BY v <-> rs_vec(s, 24) LIMIT 5) x'),
+	('SELECT x.id FROM generate_series(1, 6) s,
+			LATERAL (SELECT id FROM rs WHERE cat = s % 5
+					  ORDER BY v <=> rs_vec(s + 20, 24) LIMIT 5) x');
+SELECT q, rs_same(q) AS result FROM rs_q ORDER BY q;
+                                             q                                              |            result            
+--------------------------------------------------------------------------------------------+------------------------------
+ SELECT id FROM rs ORDER BY v <-> NULL::vector LIMIT 500                                    | 500 rows, the same each way
+ SELECT id FROM rs ORDER BY v <-> rs_vec(1, 24) LIMIT 10                                    | 10 rows, the same each way
+ SELECT id FROM rs ORDER BY v <-> rs_vec(3, 24, 2.0) OFFSET 40 LIMIT 20                     | 20 rows, the same each way
+ SELECT id FROM rs ORDER BY v <-> rs_vec(4, 24) LIMIT 300                                   | 300 rows, the same each way
+ SELECT id FROM rs ORDER BY v <-> rs_vec(6, 24)                                             | 6000 rows, the same each way
+ SELECT id FROM rs ORDER BY v <=> array_fill(0, ARRAY[24])::vector LIMIT 500                | 500 rows, the same each way
+ SELECT id FROM rs ORDER BY v <=> rs_vec(2, 24) LIMIT 10                                    | 10 rows, the same each way
+ SELECT id FROM rs ORDER BY v <=> rs_vec(5, 24)                                             | 6000 rows, the same each way
+ SELECT id FROM rs WHERE cat = 1 ORDER BY v <=> rs_vec(8, 24) LIMIT 10                      | 10 rows, the same each way
+ SELECT id FROM rs WHERE tag = 3 ORDER BY v <-> rs_vec(7, 24) LIMIT 10                      | 10 rows, the same each way
+ SELECT id FROM rs WHERE tag IN (3, 4, 5) ORDER BY v <-> rs_vec(9, 24)                      | 180 rows, the same each way
+ SELECT id FROM rs_rest ORDER BY v <-> rs_vec(10, 24) LIMIT 10                              | 10 rows, the same each way
+ SELECT id FROM rs_rest ORDER BY v <-> rs_vec(11, 24) LIMIT 150                             | 150 rows, the same each way
+ SELECT x.id FROM generate_series(1, 6) s,                                                 +| 30 rows, the same each way
+                         LATERAL (SELECT id FROM rs ORDER BY v <-> rs_vec(s, 24) LIMIT 5) x | 
+ SELECT x.id FROM generate_series(1, 6) s,                                                 +| 30 rows, the same each way
+                         LATERAL (SELECT id FROM rs WHERE cat = s % 5                      +| 
+                                           ORDER BY v <=> rs_vec(s + 20, 24) LIMIT 5) x     | 
+(15 rows)
+
+-- the filters probed, not exact: their chains, read for the members
+SET pg_lion.vector_exact_rows = 0;
+SET pg_lion.vector_exact_per_partition = 0;
+SELECT q, rs_same(q) AS result FROM rs_q WHERE q ~ 'WHERE' ORDER BY q;
+                                           q                                            |           result            
+----------------------------------------------------------------------------------------+-----------------------------
+ SELECT id FROM rs WHERE cat = 1 ORDER BY v <=> rs_vec(8, 24) LIMIT 10                  | 10 rows, the same each way
+ SELECT id FROM rs WHERE tag = 3 ORDER BY v <-> rs_vec(7, 24) LIMIT 10                  | 10 rows, the same each way
+ SELECT id FROM rs WHERE tag IN (3, 4, 5) ORDER BY v <-> rs_vec(9, 24)                  | 180 rows, the same each way
+ SELECT x.id FROM generate_series(1, 6) s,                                             +| 30 rows, the same each way
+                         LATERAL (SELECT id FROM rs WHERE cat = s % 5                  +| 
+                                           ORDER BY v <=> rs_vec(s + 20, 24) LIMIT 5) x | 
+(4 rows)
+
+RESET pg_lion.vector_exact_rows;
+RESET pg_lion.vector_exact_per_partition;
+-- many REST passes, a batch of 20 rows each
+SET pg_lion.vector_batch = 20;
+SELECT q, rs_same(q) AS result FROM rs_q WHERE q ~ 'LIMIT (10|300)$' ORDER BY q;
+                                   q                                   |           result            
+-----------------------------------------------------------------------+-----------------------------
+ SELECT id FROM rs ORDER BY v <-> rs_vec(1, 24) LIMIT 10               | 10 rows, the same each way
+ SELECT id FROM rs ORDER BY v <-> rs_vec(4, 24) LIMIT 300              | 300 rows, the same each way
+ SELECT id FROM rs ORDER BY v <=> rs_vec(2, 24) LIMIT 10               | 10 rows, the same each way
+ SELECT id FROM rs WHERE cat = 1 ORDER BY v <=> rs_vec(8, 24) LIMIT 10 | 10 rows, the same each way
+ SELECT id FROM rs WHERE tag = 3 ORDER BY v <-> rs_vec(7, 24) LIMIT 10 | 10 rows, the same each way
+ SELECT id FROM rs_rest ORDER BY v <-> rs_vec(10, 24) LIMIT 10         | 10 rows, the same each way
+(6 rows)
+
+RESET pg_lion.vector_batch;
+-- one page ahead, and none: the stream's least, and no stream
+SET effective_io_concurrency = 1;
+SELECT q, rs_same(q) AS result FROM rs_q WHERE q ~ 'LIMIT (10|300)$' ORDER BY q;
+                                   q                                   |           result            
+-----------------------------------------------------------------------+-----------------------------
+ SELECT id FROM rs ORDER BY v <-> rs_vec(1, 24) LIMIT 10               | 10 rows, the same each way
+ SELECT id FROM rs ORDER BY v <-> rs_vec(4, 24) LIMIT 300              | 300 rows, the same each way
+ SELECT id FROM rs ORDER BY v <=> rs_vec(2, 24) LIMIT 10               | 10 rows, the same each way
+ SELECT id FROM rs WHERE cat = 1 ORDER BY v <=> rs_vec(8, 24) LIMIT 10 | 10 rows, the same each way
+ SELECT id FROM rs WHERE tag = 3 ORDER BY v <-> rs_vec(7, 24) LIMIT 10 | 10 rows, the same each way
+ SELECT id FROM rs_rest ORDER BY v <-> rs_vec(10, 24) LIMIT 10         | 10 rows, the same each way
+(6 rows)
+
+SET effective_io_concurrency = 0;
+SELECT q, rs_same(q) AS result FROM rs_q WHERE q ~ 'LIMIT (10|300)$' ORDER BY q;
+                                   q                                   |           result            
+-----------------------------------------------------------------------+-----------------------------
+ SELECT id FROM rs ORDER BY v <-> rs_vec(1, 24) LIMIT 10               | 10 rows, the same each way
+ SELECT id FROM rs ORDER BY v <-> rs_vec(4, 24) LIMIT 300              | 300 rows, the same each way
+ SELECT id FROM rs ORDER BY v <=> rs_vec(2, 24) LIMIT 10               | 10 rows, the same each way
+ SELECT id FROM rs WHERE cat = 1 ORDER BY v <=> rs_vec(8, 24) LIMIT 10 | 10 rows, the same each way
+ SELECT id FROM rs WHERE tag = 3 ORDER BY v <-> rs_vec(7, 24) LIMIT 10 | 10 rows, the same each way
+ SELECT id FROM rs_rest ORDER BY v <-> rs_vec(10, 24) LIMIT 10         | 10 rows, the same each way
+(6 rows)
+
+SET effective_io_concurrency = 8;
+/*
+ * rs_cursor() fetches q's rows through a cursor, a few at a time - the scan
+ * holding what it read ahead from one fetch to the next - and, scrollable,
+ * moves back and forth over them: core materializes what lionvec, which
+ * scans forward only, returned.
+ */
+CREATE FUNCTION rs_cursor(q text) RETURNS int[]
+LANGUAGE plpgsql AS $$
+DECLARE
+	c refcursor;
+	r record;
+	got int[] := '{}';
+BEGIN
+	OPEN c NO SCROLL FOR EXECUTE q;
+	FOR i IN 1..40 LOOP
+		FETCH c INTO r;
+		EXIT WHEN NOT FOUND;
+		got := got || r.id;
+	END LOOP;
+	CLOSE c;
+	OPEN c SCROLL FOR EXECUTE q;
+	FETCH ABSOLUTE 12 FROM c INTO r;
+	got := got || r.id;
+	FETCH PRIOR FROM c INTO r;
+	got := got || r.id;
+	FETCH RELATIVE 9 FROM c INTO r;
+	got := got || r.id;
+	FETCH FIRST FROM c INTO r;
+	got := got || r.id;
+	LOOP
+		FETCH c INTO r;
+		EXIT WHEN NOT FOUND;
+		got := got || r.id;
+	END LOOP;
+	CLOSE c;
+	RETURN got;
+END $$;
+SELECT q, rs_each('rs_cursor', q) AS result
+  FROM (VALUES ('SELECT id FROM rs ORDER BY v <-> rs_vec(12, 24) LIMIT 60'),
+			   ('SELECT id FROM rs WHERE cat = 2 ORDER BY v <-> rs_vec(13, 24) LIMIT 60'),
+			   ('SELECT id FROM rs ORDER BY v <=> rs_vec(14, 24)')) v(q)
+ ORDER BY q;
+                                   q                                    |            result            
+------------------------------------------------------------------------+------------------------------
+ SELECT id FROM rs ORDER BY v <-> rs_vec(12, 24) LIMIT 60               | 103 rows, the same each way
+ SELECT id FROM rs ORDER BY v <=> rs_vec(14, 24)                        | 6042 rows, the same each way
+ SELECT id FROM rs WHERE cat = 2 ORDER BY v <-> rs_vec(13, 24) LIMIT 60 | 103 rows, the same each way
+(3 rows)
+
+/*
+ * rs_grow() fetches q's first rows through a cursor, then inserts 3,000
+ * rows - the indexes' chains grow, a page here and there past the blocks
+ * the scan counted as it started - and fetches the rest: the rows of the
+ * scan's snapshot, which the new rows are not of.  The inserts are rolled
+ * back, by the exception, for the next run; their items stay in the index,
+ * dead, and the next run's scan meets them.  So that what they change of a
+ * scan's course does not change its rows, the scans here find every row
+ * that could be nearer (vector_scan_parallel.sql).
+ */
+CREATE FUNCTION rs_grow(q text) RETURNS int[]
+LANGUAGE plpgsql AS $$
+DECLARE
+	c refcursor;
+	r record;
+	got int[] := '{}';
+BEGIN
+	BEGIN
+		OPEN c NO SCROLL FOR EXECUTE q;
+		FOR i IN 1..10 LOOP
+			FETCH c INTO r;
+			got := got || r.id;
+		END LOOP;
+		INSERT INTO rs
+		SELECT 100000 + i, i % 5, i % 100, rs_vec(1, 24) + rs_vec(-i, 24, 0.01)
+		  FROM generate_series(1, 3000) i;
+		LOOP
+			FETCH c INTO r;
+			EXIT WHEN NOT FOUND;
+			got := got || r.id;
+		END LOOP;
+		CLOSE c;
+		RAISE EXCEPTION 'rs_grow: roll back';
+	EXCEPTION WHEN raise_exception THEN
+		NULL;
+	END;
+	RETURN got;
+END $$;
+SET pg_lion.vector_margin = 100;
+SET pg_lion.vector_patience = 0;
+SET pg_lion.vector_epsilon = 6;
+SELECT q, rs_each('rs_grow', q) AS result
+  FROM (VALUES ('SELECT id FROM rs ORDER BY v <-> rs_vec(1, 24) LIMIT 400'),
+			   ('SELECT id FROM rs ORDER BY v <=> rs_vec(1, 24)')) v(q)
+ ORDER BY q;
+                            q                             |            result            
+----------------------------------------------------------+------------------------------
+ SELECT id FROM rs ORDER BY v <-> rs_vec(1, 24) LIMIT 400 | 400 rows, the same each way
+ SELECT id FROM rs ORDER BY v <=> rs_vec(1, 24)           | 6000 rows, the same each way
+(2 rows)
+
+SELECT count(*) AS rows_after FROM rs;
+ rows_after 
+------------
+       6000
+(1 row)
+
+-- a parallel scan, at that margin, where the rows are the sort's whichever
+-- participant probes what
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_index_scan_size = 0;
+SET min_parallel_table_scan_size = 0;
+ALTER TABLE rs SET (parallel_workers = 2);
+SELECT q, rs_same(q) AS result
+  FROM (VALUES ('SELECT id FROM rs ORDER BY v <-> rs_vec(15, 24) LIMIT 50'),
+			   ('SELECT id FROM rs ORDER BY v <=> rs_vec(16, 24) LIMIT 50')) v(q)
+ ORDER BY q;
+                            q                             |           result           
+----------------------------------------------------------+----------------------------
+ SELECT id FROM rs ORDER BY v <-> rs_vec(15, 24) LIMIT 50 | 50 rows, the same each way
+ SELECT id FROM rs ORDER BY v <=> rs_vec(16, 24) LIMIT 50 | 50 rows, the same each way
+(2 rows)
+
+ALTER TABLE rs RESET (parallel_workers);
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET parallel_tuple_cost;
+RESET parallel_setup_cost;
+SET max_parallel_workers_per_gather = 0;
+RESET pg_lion.vector_epsilon;
+RESET pg_lion.vector_patience;
+RESET pg_lion.vector_margin;
+-- chains inserts appended to: a page here and there past each run the
+-- build wrote, which no read ahead reaches
+INSERT INTO rs
+SELECT 200000 + i, i % 5, i % 100, rs_vec(-i, 24, 1.5)
+  FROM generate_series(1, 2500) i;
+SELECT q, rs_same(q) AS result FROM rs_q WHERE q !~ 'rs_rest' ORDER BY q;
+                                             q                                              |            result            
+--------------------------------------------------------------------------------------------+------------------------------
+ SELECT id FROM rs ORDER BY v <-> NULL::vector LIMIT 500                                    | 500 rows, the same each way
+ SELECT id FROM rs ORDER BY v <-> rs_vec(1, 24) LIMIT 10                                    | 10 rows, the same each way
+ SELECT id FROM rs ORDER BY v <-> rs_vec(3, 24, 2.0) OFFSET 40 LIMIT 20                     | 20 rows, the same each way
+ SELECT id FROM rs ORDER BY v <-> rs_vec(4, 24) LIMIT 300                                   | 300 rows, the same each way
+ SELECT id FROM rs ORDER BY v <-> rs_vec(6, 24)                                             | 8499 rows, the same each way
+ SELECT id FROM rs ORDER BY v <=> array_fill(0, ARRAY[24])::vector LIMIT 500                | 500 rows, the same each way
+ SELECT id FROM rs ORDER BY v <=> rs_vec(2, 24) LIMIT 10                                    | 10 rows, the same each way
+ SELECT id FROM rs ORDER BY v <=> rs_vec(5, 24)                                             | 8500 rows, the same each way
+ SELECT id FROM rs WHERE cat = 1 ORDER BY v <=> rs_vec(8, 24) LIMIT 10                      | 10 rows, the same each way
+ SELECT id FROM rs WHERE tag = 3 ORDER BY v <-> rs_vec(7, 24) LIMIT 10                      | 10 rows, the same each way
+ SELECT id FROM rs WHERE tag IN (3, 4, 5) ORDER BY v <-> rs_vec(9, 24)                      | 255 rows, the same each way
+ SELECT x.id FROM generate_series(1, 6) s,                                                 +| 30 rows, the same each way
+                         LATERAL (SELECT id FROM rs ORDER BY v <-> rs_vec(s, 24) LIMIT 5) x | 
+ SELECT x.id FROM generate_series(1, 6) s,                                                 +| 30 rows, the same each way
+                         LATERAL (SELECT id FROM rs WHERE cat = s % 5                      +| 
+                                           ORDER BY v <=> rs_vec(s + 20, 24) LIMIT 5) x     | 
+(13 rows)
+
+/*
+ * rs_halves() runs q with every page in shared buffers, then with the upper
+ * half of each rs relation's blocks evicted, and then the lower half, under
+ * each way of reading ahead: a scan reads warm pages and cold ones by
+ * turns, so that a stream that rests among the warm ones (DESIGN.md §44.4,
+ * "Read streams") wakes at a cold one, and asks of the kernel that fell
+ * dormant ask again.  It says whether the answers are q's every time.
+ */
+CREATE FUNCTION rs_evict_half(upper boolean) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+	nodes oid[];
+	halves bigint[];
+BEGIN
+	IF current_setting('server_version_num')::int >= 170000 THEN
+		SELECT array_agg(pg_relation_filenode(c.oid) ORDER BY c.oid),
+			   array_agg(pg_relation_size(c.oid) /
+						 current_setting('block_size')::int / 2 ORDER BY c.oid)
+		  INTO nodes, halves
+		  FROM pg_class c
+		 WHERE c.relname ~ '^rs_?' AND c.relkind IN ('r', 'i');
+		PERFORM pg_buffercache_evict(b.bufferid)
+		   FROM pg_buffercache b
+		  WHERE b.reldatabase = (SELECT oid FROM pg_database
+								  WHERE datname = current_database())
+			AND b.relfilenode = ANY (nodes)
+			AND (b.relblocknumber >=
+				 halves[array_position(nodes, b.relfilenode)]) = upper;
+	END IF;
+END $$;
+CREATE FUNCTION rs_halves(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	m text;
+	u boolean;
+	a int[];
+	first int[];
+	bad text := '';
+	saved text := current_setting('pg_lion.vector_prefetch');
+BEGIN
+	first := rs_ids(q);
+	FOREACH m IN ARRAY ARRAY['off', 'fadvise', 'stream'] LOOP
+		PERFORM set_config('pg_lion.vector_prefetch', m, true);
+		FOREACH u IN ARRAY ARRAY[true, false] LOOP
+			PERFORM rs_ids(q);
+			PERFORM rs_evict_half(u);
+			a := rs_ids(q);
+			IF a IS DISTINCT FROM first THEN
+				bad := bad || format(' %s (%s half evicted)', m,
+									 CASE WHEN u THEN 'upper' ELSE 'lower' END);
+			END IF;
+		END LOOP;
+	END LOOP;
+	PERFORM set_config('pg_lion.vector_prefetch', saved, true);
+	RETURN format('%s rows, %s', coalesce(cardinality(first), 0),
+				  CASE WHEN bad = '' THEN 'the same each way'
+				  ELSE 'MISMATCH under' || bad END);
+END $$;
+SELECT q, rs_halves(q) AS result FROM rs_q
+ WHERE (q ~ 'LIMIT (10|300|500)$' OR q ~ 'tag IN') AND q !~ 'rs_rest'
+ ORDER BY q;
+                                      q                                      |           result            
+-----------------------------------------------------------------------------+-----------------------------
+ SELECT id FROM rs ORDER BY v <-> NULL::vector LIMIT 500                     | 500 rows, the same each way
+ SELECT id FROM rs ORDER BY v <-> rs_vec(1, 24) LIMIT 10                     | 10 rows, the same each way
+ SELECT id FROM rs ORDER BY v <-> rs_vec(4, 24) LIMIT 300                    | 300 rows, the same each way
+ SELECT id FROM rs ORDER BY v <=> array_fill(0, ARRAY[24])::vector LIMIT 500 | 500 rows, the same each way
+ SELECT id FROM rs ORDER BY v <=> rs_vec(2, 24) LIMIT 10                     | 10 rows, the same each way
+ SELECT id FROM rs WHERE cat = 1 ORDER BY v <=> rs_vec(8, 24) LIMIT 10       | 10 rows, the same each way
+ SELECT id FROM rs WHERE tag = 3 ORDER BY v <-> rs_vec(7, 24) LIMIT 10       | 10 rows, the same each way
+ SELECT id FROM rs WHERE tag IN (3, 4, 5) ORDER BY v <-> rs_vec(9, 24)       | 255 rows, the same each way
+(8 rows)
+
+/*
+ * rs_boom() raises an error at its nth call of a statement: a scan's nth
+ * row, which the scan has read ahead of.  rs_fail() runs q - its rows put
+ * through rs_boom() - under each way of reading ahead, in a subtransaction
+ * that the error ends: whatever the streams held goes with it, and the
+ * statements after it read as before.
+ */
+CREATE FUNCTION rs_boom(id int, n int) RETURNS int
+LANGUAGE plpgsql AS $$
+DECLARE
+	k int := coalesce(nullif(current_setting('rs.calls', true), ''), '0')::int + 1;
+BEGIN
+	PERFORM set_config('rs.calls', k::text, true);
+	IF k >= n THEN
+		RAISE EXCEPTION 'rs_boom: row %', k;
+	END IF;
+	RETURN id;
+END $$;
+CREATE FUNCTION rs_fail(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	m text;
+	out text := '';
+	saved text := current_setting('pg_lion.vector_prefetch');
+BEGIN
+	FOREACH m IN ARRAY ARRAY['off', 'fadvise', 'stream'] LOOP
+		PERFORM set_config('pg_lion.vector_prefetch', m, true);
+		PERFORM rs_evict();
+		PERFORM set_config('rs.calls', '0', true);
+		BEGIN
+			EXECUTE format('SELECT count(rs_boom(id, 25)) FROM (%s) q', q);
+			out := out || ' ' || m || ': no error';
+		EXCEPTION WHEN raise_exception THEN
+			out := out || ' ' || m || ': ' || SQLERRM;
+		END;
+	END LOOP;
+	PERFORM set_config('pg_lion.vector_prefetch', saved, true);
+	RETURN out;
+END $$;
+SELECT q, rs_fail(q) AS result
+  FROM (VALUES ('SELECT id FROM rs ORDER BY v <-> rs_vec(17, 24) LIMIT 100'),
+			   ('SELECT id FROM rs WHERE tag IN (3, 4, 5) ORDER BY v <-> rs_vec(18, 24)'),
+			   ('SELECT id FROM rs ORDER BY v <=> rs_vec(19, 24)')) v(q)
+ ORDER BY q;
+                                   q                                    |                                 result                                 
+------------------------------------------------------------------------+------------------------------------------------------------------------
+ SELECT id FROM rs ORDER BY v <-> rs_vec(17, 24) LIMIT 100              |  off: rs_boom: row 25 fadvise: rs_boom: row 25 stream: rs_boom: row 25
+ SELECT id FROM rs ORDER BY v <=> rs_vec(19, 24)                        |  off: rs_boom: row 25 fadvise: rs_boom: row 25 stream: rs_boom: row 25
+ SELECT id FROM rs WHERE tag IN (3, 4, 5) ORDER BY v <-> rs_vec(18, 24) |  off: rs_boom: row 25 fadvise: rs_boom: row 25 stream: rs_boom: row 25
+(3 rows)
+
+-- and at the top level, the error ending the statement and its transaction
+SET pg_lion.vector_prefetch = stream;
+SELECT set_config('rs.calls', '0', false) IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT rs_boom(id, 25) FROM rs ORDER BY v <-> rs_vec(20, 24) LIMIT 100;
+ERROR:  rs_boom: row 25
+BEGIN;
+DECLARE c1 NO SCROLL CURSOR FOR SELECT id FROM rs ORDER BY v <-> rs_vec(21, 24);
+FETCH 5 FROM c1;
+  id  
+------
+   21
+ 1188
+ 2805
+ 1060
+ 3965
+(5 rows)
+
+SELECT 1 / 0;
+ERROR:  division by zero
+ROLLBACK;
+RESET pg_lion.vector_prefetch;
+SELECT rs_same('SELECT id FROM rs ORDER BY v <-> rs_vec(20, 24) LIMIT 100') AS after_errors;
+        after_errors         
+-----------------------------
+ 100 rows, the same each way
+(1 row)
+
+-- the setting: its names, and the boolean it was; by default stream where
+-- there are read streams, and fadvise on 16
+SELECT current_setting('pg_lion.vector_prefetch') =
+	   CASE WHEN current_setting('server_version_num')::int >= 170000
+			THEN 'stream' ELSE 'fadvise' END AS "the default";
+ the default 
+-------------
+ t
+(1 row)
+
+SET pg_lion.vector_prefetch = off;
+SHOW pg_lion.vector_prefetch;
+ pg_lion.vector_prefetch 
+-------------------------
+ off
+(1 row)
+
+SET pg_lion.vector_prefetch = fadvise;
+SHOW pg_lion.vector_prefetch;
+ pg_lion.vector_prefetch 
+-------------------------
+ fadvise
+(1 row)
+
+SET pg_lion.vector_prefetch = false;
+SHOW pg_lion.vector_prefetch;
+ pg_lion.vector_prefetch 
+-------------------------
+ off
+(1 row)
+
+SET pg_lion.vector_prefetch = on;
+SELECT current_setting('pg_lion.vector_prefetch') =
+	   CASE WHEN current_setting('server_version_num')::int >= 170000
+			THEN 'stream' ELSE 'fadvise' END AS "on is the default";
+ on is the default 
+-------------------
+ t
+(1 row)
+
+SET pg_lion.vector_prefetch = stream;
+SELECT current_setting('pg_lion.vector_prefetch') =
+	   CASE WHEN current_setting('server_version_num')::int >= 170000
+			THEN 'stream' ELSE 'fadvise' END AS "stream where there are streams";
+ stream where there are streams 
+--------------------------------
+ t
+(1 row)
+
+SET pg_lion.vector_prefetch = sideways;
+ERROR:  invalid value for parameter "pg_lion.vector_prefetch": "sideways"
+RESET pg_lion.vector_prefetch;
+-- What each way read, on the exact path with every page in shared buffers:
+-- through a stream every block of the members' (17 and later), asking the
+-- kernel, 32 asks before they fall dormant (vector_stream_1.out on 16,
+-- where stream is fadvise)
+SELECT count(*) FROM (SELECT id FROM rs WHERE tag = 3
+					   ORDER BY v <-> rs_vec(7, 24) LIMIT 10) s;
+ count 
+-------
+    10
+(1 row)
+
+SET client_min_messages = debug1;
+SET pg_lion.vector_prefetch = stream;
+SELECT count(*) FROM (SELECT id FROM rs WHERE tag = 3
+					   ORDER BY v <-> rs_vec(7, 24) LIMIT 10) s;
+DEBUG:  lionvec scan of "rs_l2": 445 members fetched, 10 returned, 64 pages prefetched (0 not in shared buffers)
+ count 
+-------
+    10
+(1 row)
+
+SET pg_lion.vector_prefetch = fadvise;
+SELECT count(*) FROM (SELECT id FROM rs WHERE tag = 3
+					   ORDER BY v <-> rs_vec(7, 24) LIMIT 10) s;
+DEBUG:  lionvec scan of "rs_l2": 445 members fetched, 10 returned, 64 pages prefetched (0 not in shared buffers)
+ count 
+-------
+    10
+(1 row)
+
+SET pg_lion.vector_prefetch = off;
+SELECT count(*) FROM (SELECT id FROM rs WHERE tag = 3
+					   ORDER BY v <-> rs_vec(7, 24) LIMIT 10) s;
+DEBUG:  lionvec scan of "rs_l2": 445 members fetched, 10 returned
+ count 
+-------
+    10
+(1 row)
+
+RESET client_min_messages;
+RESET pg_lion.vector_prefetch;
+DROP TABLE rs, rs_rest, rs_q;
+DROP FUNCTION rs_vec(bigint, int, float8), rs_evict(), rs_ids(text),
+	rs_each(text, text), rs_same(text), rs_cursor(text), rs_grow(text),
+	rs_boom(int, int), rs_fail(text), rs_evict_half(boolean),
+	rs_halves(text);

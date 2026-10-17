@@ -113,6 +113,7 @@
 #include "utils/spccache.h"
 
 #include "lion_compat.h"
+#include "lion_readahead.h"
 #include "lion_vec.h"
 
 /* what an entry of the row queue knows of its row */
@@ -277,31 +278,28 @@ typedef struct LvShared
 #define LV_REST_CHAIN		PG_UINT32_MAX
 
 /*
- * Prefetch (DESIGN.md §44.4, "Prefetch"): what a scan knows of its asks of a
- * relation.  The blocks it has asked for lately, the last one of LV_PF_SLOTS
- * slots by its hash, so that the entries of a queue whose items share a page
- * - five centroids' REFINE items to a page at 1536 dimensions - ask for it
- * once; a block that loses its slot is asked for again, which costs a
- * lookup in shared buffers.  And whether asking pays: each ask of a page
- * that is in shared buffers already is that lookup for nothing, 4 to 9% of
- * a warm DBpedia scan, so after LV_PF_WARM asks in a row that found their
- * page there the scan lets the next LV_PF_DORMANT asks pass unasked, and
- * then asks again - a cold relation is asked for all along, a warm one a
- * ninth as often, and one warm in parts loses at most that many asks at a
- * time.  The PART chain does not count (lv_read_parts()): every scan reads
- * it, so it is warm whatever else is.
+ * Reading ahead (DESIGN.md §44.4, "Prefetch" and "Read streams"): how much
+ * of a queue's top a look ahead into it reads (lv_prefetch_queue()).  What a
+ * scan knows of its asks of each relation is a LionAsk (lion_readahead.h):
+ * the blocks it has asked for lately, so that the entries of a queue whose
+ * items share a page - five centroids' REFINE items to a page at 1536
+ * dimensions - ask for it once, and whether asking pays, an ask of a page
+ * in shared buffers already being a lookup for nothing, 4 to 9% of a warm
+ * DBpedia scan: after 32 asks in a row that found their page there the next
+ * 256 pass unasked.  A stream rests likewise, seeing its own reads
+ * (lion_readahead_dormant()).  The PART chain does not count
+ * (lv_read_parts()): every scan reads it, so it is warm whatever else is.
  */
-#define LV_PF_SLOTS			128			/* a power of two */
 #define LV_PF_TOP(dist)		(4 * (dist) + 1)	/* the queue's top looked at */
-#define LV_PF_WARM			32
-#define LV_PF_DORMANT		256
 
-typedef struct LvPrefetch
-{
-	BlockNumber seen[LV_PF_SLOTS];	/* blocks asked for lately */
-	int			warm;			/* asks in a row that found their page */
-	int			dormant;		/* asks to let pass */
-} LvPrefetch;
+/*
+ * A scan's read stream holds in pins twice the pages it reads ahead
+ * (lv_start_prefetch()), and no more than this part of its backend's fair
+ * share of shared_buffers (lion_pin_fair_share()), its three streams of the
+ * index three such parts: a pool that leaves a stream fewer than
+ * LION_READAHEAD_MIN_PINS has the scan ask the kernel instead.
+ */
+#define LV_RA_SHARE			8
 
 typedef struct LvScanOpaque
 {
@@ -405,8 +403,19 @@ typedef struct LvScanOpaque
 	int		   *pfsel;			/* [LIONVEC_PREFETCH_MAX]: lionvec_least()'s */
 	uint64		wpfnext;		/* a walk's next page to ask for ... */
 	uint64		wpfend;			/* ... and the block it stops at */
-	LvPrefetch	ipfs;			/* the index's asks */
-	LvPrefetch	hpfs;			/* the heap's */
+	int			rmode;			/* LION_READAHEAD_*, pg_lion.vector_prefetch
+								 * as the scan started */
+	LionAsk		iask;			/* the index's asks of the kernel */
+	LionAsk		hask;			/* the heap's */
+	LionReadahead *chains;		/* the index's reads of its chains ... */
+	LionReadahead *crefs;		/* ... of centroids' REFINE pages ... */
+	LionReadahead *rrefs;		/* ... and of rows', in so->cxt, kept from
+								 * scan to scan while their mode and pins
+								 * stay (lv_readahead_begin()) */
+	int			rpins;			/* ... their pins */
+	bool		inrest;			/* lv_rest() is probing so->probed ... */
+	int			restpf;			/* ... and its next chain to read ahead */
+	LionReadaheadCounts rcounts;	/* the streams', for DEBUG1 */
 
 	/* a parallel scan (DESIGN.md §44.4, "A parallel scan"); NULL: serial */
 	LvShared   *shared;
@@ -433,8 +442,6 @@ typedef struct LvScanOpaque
 	int64		npages;			/* CODE pages the probes read */
 	int64		npauses;
 	int64		ncopies;		/* items skipped, their row entered this pass */
-	int64		nprefetch;		/* pages asked for ahead (PrefetchBuffer()) */
-	int64		nprefread;		/* ... that were not in shared buffers */
 	int64		nclaimed;		/* partitions another process probed */
 	int64		ntaken;			/* rows another process returned */
 } LvScanOpaque;
@@ -568,76 +575,46 @@ lv_pause_tau(const LvScanOpaque *so)
 }
 
 /* ----------------------------------------------------------------
- * Prefetch (DESIGN.md §44.4, "Prefetch")
+ * Reading ahead (DESIGN.md §44.4, "Prefetch" and "Read streams")
  * ----------------------------------------------------------------
  */
 
+static bool lv_claimed(const LvScanOpaque *so, uint32 bit);
+
 /*
- * Ask the kernel for a block a read will want soon: PrefetchBuffer(), which
- * pins nothing and is posix_fadvise() under it, read by an I/O worker or
- * io_uring alike from 18 on.  pf is what the scan knows of its asks of the
- * relation (LvPrefetch): while it is dormant the ask is let pass, and with
- * once a block in its table of blocks asked for lately is skipped.  The
- * caller keeps blk below the relation's size as it read it: past the last
- * segment md.c would fail rather than ignore it.
+ * Where a run of a chain is read ahead from, its first page blk being read
+ * now: through a stream every page of it comes from the stream, the first
+ * too; asking the kernel, the first is read as it is asked for, and the
+ * asks start after it.
  */
-static void
-lv_prefetch(LvScanOpaque *so, Relation rel, BlockNumber blk, LvPrefetch *pf,
-			bool once)
+static inline uint64
+lv_run_start(const LvScanOpaque *so, BlockNumber blk)
 {
-	PrefetchBufferResult r;
-
-	if (pf->dormant > 0)
-	{
-		pf->dormant--;
-		return;
-	}
-	if (once)
-	{
-		uint32		slot = murmurhash32(blk) & (LV_PF_SLOTS - 1);
-
-		if (pf->seen[slot] == blk)
-			return;
-		pf->seen[slot] = blk;
-	}
-	r = PrefetchBuffer(rel, MAIN_FORKNUM, blk);
-	so->nprefetch++;
-	if (r.initiated_io)
-	{
-		so->nprefread++;
-		pf->warm = 0;
-	}
-	else if (++pf->warm >= LV_PF_WARM)
-	{
-		pf->warm = 0;
-		pf->dormant = LV_PF_DORMANT;
-	}
-}
-
-/* Forget what a relation's asks found: the next asks are made (LvPrefetch). */
-static void
-lv_prefetch_reset(LvPrefetch *pf)
-{
-	memset(pf->seen, 0xFF, sizeof(pf->seen));
-	pf->warm = 0;
-	pf->dormant = 0;
+	return (uint64) blk +
+		(lion_readahead_mode(so->chains) == LION_READAHEAD_STREAM ? 0 : 1);
 }
 
 /*
  * The pages of the index from *next up to end (lionvec_prefetch_end()),
  * none past the blocks it had when last counted: a run of a chain the build
- * wrote, ahead of its reader.
+ * wrote, ahead of its reader - urgent to a stream, which the reader is in
+ * the middle of.
  */
 static void
-lv_prefetch_run(LvScanOpaque *so, Relation index, uint64 *next, uint64 end)
+lv_prefetch_run(LvScanOpaque *so, uint64 *next, uint64 end)
 {
 	if (end > so->nblocks)
 		end = so->nblocks;
 	for (; *next < end; (*next)++)
-		lv_prefetch(so, index, (BlockNumber) *next, &so->ipfs, false);
+		(void) lion_readahead_ask(so->chains, (BlockNumber) *next, true, false);
 }
 
-/* The heap block of a row, as its exact distance will read it. */
+/*
+ * The heap block of a row, as its exact distance will read it: asked of the
+ * kernel whichever way the index is read, a stream's pins on heap pages not
+ * being kept from one row returned to the next (DESIGN.md §44.4, "Read
+ * streams").
+ */
 static void
 lv_prefetch_heap(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid)
 {
@@ -645,7 +622,7 @@ lv_prefetch_heap(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid)
 
 	/* a row inserted since the scan counted the blocks is left to its read */
 	if (blk < so->hblocks)
-		lv_prefetch(so, scan->heapRelation, blk, &so->hpfs, true);
+		lion_ask(&so->hask, scan->heapRelation, blk, true);
 }
 
 /*
@@ -673,9 +650,12 @@ lv_prefetch_bound(const LvScanOpaque *so)
  * centroid's, or, fetch, a row's heap block - and, of the rows' queue, only
  * those the scan works before its next probe (lv_prefetch_bound()).  dist is
  * the relation's (so->ipf, so->hpf).  An entry asks once at its level (pf),
- * however many looks find it near the top.  Returns how many it chose: the
- * caller looks again after half as many such entries have come out, so that
- * what it asked for stays about dist ahead (lv_prefetch_due()).
+ * however many looks find it near the top.  A stream is given them in the
+ * order of their keys, which is the order the scan reads them in unless a
+ * probe puts rows before them; the kernel is asked in lionvec_least()'s.
+ * Returns how many it chose: the caller looks again after half as many such
+ * entries have come out, so that what it asked for stays about dist ahead
+ * (lv_prefetch_due()).
  */
 static int
 lv_prefetch_queue(IndexScanDesc scan, LvScanOpaque *so, LvHeap *h,
@@ -683,12 +663,16 @@ lv_prefetch_queue(IndexScanDesc scan, LvScanOpaque *so, LvHeap *h,
 {
 	int			dist = fetch ? so->hpf : so->ipf;
 	double		bound = h == &so->rows ? lv_prefetch_bound(so) : INFINITY;
+	LionReadahead *ra = h == &so->rows ? so->rrefs : so->crefs;
 	int			top;
 	int			n = 0;
 	int			m;
 	int			i;
 
 	if (dist <= 0)
+		return 0;
+	/* a resting stream takes nothing: no look (lion_readahead_dormant()) */
+	if (!fetch && lion_readahead_dormant(ra))
 		return 0;
 	Assert(dist <= LIONVEC_PREFETCH_MAX && so->pfkey != NULL);
 	top = Min(h->n, LV_PF_TOP(dist));
@@ -700,6 +684,25 @@ lv_prefetch_queue(IndexScanDesc scan, LvScanOpaque *so, LvHeap *h,
 		so->pfat[n++] = i;
 	}
 	m = lionvec_least(so->pfkey, n, dist, so->pfsel);
+	if (!fetch && lion_readahead_mode(ra) == LION_READAHEAD_STREAM)
+	{
+		/* by key, and at equal keys by place: m is at most dist, 64 */
+		for (i = 1; i < m; i++)
+		{
+			int			sel = so->pfsel[i];
+			int			j = i;
+
+			while (j > 0 &&
+				   (so->pfkey[so->pfsel[j - 1]] > so->pfkey[sel] ||
+					(so->pfkey[so->pfsel[j - 1]] == so->pfkey[sel] &&
+					 so->pfsel[j - 1] > sel)))
+			{
+				so->pfsel[j] = so->pfsel[j - 1];
+				j--;
+			}
+			so->pfsel[j] = sel;
+		}
+	}
 	for (i = 0; i < m; i++)
 	{
 		LvItem	   *it = &h->items[so->pfat[so->pfsel[i]]];
@@ -710,7 +713,7 @@ lv_prefetch_queue(IndexScanDesc scan, LvScanOpaque *so, LvHeap *h,
 		if (fetch)
 			lv_prefetch_heap(scan, so, (ItemPointer) &it->tid);
 		else if (it->rblk < so->nblocks)
-			lv_prefetch(so, scan->indexRelation, it->rblk, &so->ipfs, true);
+			(void) lion_readahead_ask(ra, it->rblk, false, true);
 	}
 	return m;
 }
@@ -723,6 +726,184 @@ lv_prefetch_due(IndexScanDesc scan, LvScanOpaque *so, int *due,
 	if (--(*due) > 0)
 		return;
 	*due = Max(1, lv_prefetch_queue(scan, so, h, level, fetch) / 2);
+}
+
+/*
+ * The REFINE pages' refills (LionReadaheadRefill): a stream that wants a
+ * page and has none pending looks into its queue at once, rather than once
+ * the look it was given is half read (lv_prefetch_due()), so that it does
+ * not run dry and end - core's stream, once its callback names no block,
+ * reads no further until it is reset, and then from one page ahead.  Inside
+ * the stream's callback: they take entries from memory and read nothing.
+ */
+static bool
+lv_refs_refill(IndexScanDesc scan, LionReadahead *ra, LvHeap *h, uint8 level)
+{
+	LvScanOpaque *so = (LvScanOpaque *) scan->opaque;
+	int			before;
+
+	if (so->phase != LV_NORMAL)
+		return false;
+	before = lion_readahead_depth(ra);
+	(void) lv_prefetch_queue(scan, so, h, level, false);
+	return lion_readahead_depth(ra) > before;
+}
+
+static bool
+lv_crefs_refill(void *arg)
+{
+	IndexScanDesc scan = (IndexScanDesc) arg;
+	LvScanOpaque *so = (LvScanOpaque *) scan->opaque;
+
+	return lv_refs_refill(scan, so->crefs, &so->parts, LV_CENT1);
+}
+
+static bool
+lv_rrefs_refill(void *arg)
+{
+	IndexScanDesc scan = (IndexScanDesc) arg;
+	LvScanOpaque *so = (LvScanOpaque *) scan->opaque;
+
+	return lv_refs_refill(scan, so->rrefs, &so->rows, LV_PLANE1);
+}
+
+/*
+ * A chain's first pages, from head, into the chains' stream as predicted:
+ * the run the build wrote (pages long, 0 when not known: then the head
+ * alone), to depth pages ahead of the reads in all.  True if any went in.
+ */
+static bool
+lv_predict_chain(LvScanOpaque *so, BlockNumber head, uint32 pages, int depth)
+{
+	uint64		end = (uint64) head + Max(pages, 1);
+	uint64		b;
+	bool		pushed = false;
+
+	if (!BlockNumberIsValid(head))
+		return false;
+	end = Min(end, (uint64) so->nblocks);
+	for (b = head; b < end && lion_readahead_depth(so->chains) < depth; b++)
+		pushed |= lion_readahead_ask(so->chains, (BlockNumber) b, false, false);
+	return pushed;
+}
+
+/*
+ * The chains' refill (LionReadaheadRefill), when the stream wants a page and
+ * the run being read is all given: the chains the scan will probe next.
+ * Inside a REST (lv_rest()) those are known, so->probed in order; between
+ * them, the next partition is the partition queue's least, which a centroid
+ * refined later may still come before: of its top, the least centroid
+ * known from its codes (LV_CENT8) whose chain is not asked for yet (pf),
+ * one another process has claimed passed over.  Not while paused, nor
+ * outside the queues' phase - the PART chain, the walks.  Up to so->ipf
+ * pages ahead, a chain at a time: a chain the scan does not probe after
+ * all, its LIMIT met or a centroid coming first, is read for nothing, and
+ * released unread.  Inside the stream's callback: it reads nothing.
+ */
+static bool
+lv_chains_refill(void *arg)
+{
+	LvScanOpaque *so = (LvScanOpaque *) arg;
+	int			depth = so->ipf;
+
+	if (so->phase != LV_NORMAL || depth <= 0)
+		return false;
+	if (so->inrest)
+	{
+		while (so->restpf < so->nprobed &&
+			   lion_readahead_depth(so->chains) < depth)
+		{
+			uint32		p = so->probed[so->restpf++];
+			bool		pushed;
+
+			if (p == LV_REST_CHAIN)
+				pushed = lv_predict_chain(so, so->meta.rest_head, 0, depth);
+			else
+			{
+				Assert(p < so->meta.nparts);
+				pushed = lv_predict_chain(so, so->phead[p],
+										  lionvec_chain_pages(so->pnrows[p],
+															  so->perpage),
+										  depth);
+			}
+			if (pushed)
+				return true;
+		}
+		return false;
+	}
+	while (!so->paused && lion_readahead_depth(so->chains) < depth)
+	{
+		int			top = Min(so->parts.n, LV_PF_TOP(depth));
+		LvItem	   *best = NULL;
+		BlockNumber partno;
+		int			i;
+
+		for (i = 0; i < top; i++)
+		{
+			LvItem	   *it = &so->parts.items[i];
+
+			if (it->level == LV_CENT8 && !it->pf &&
+				(best == NULL || lv_before(it, best)))
+				best = it;
+		}
+		if (best == NULL)
+			return false;
+		best->pf = true;
+		partno = LionVecCentPartno(&best->tid);
+		Assert(partno < so->meta.nparts);
+		if (lv_claimed(so, partno))
+			continue;
+		if (lv_predict_chain(so, so->phead[partno],
+							 lionvec_chain_pages(so->pnrows[partno],
+												 so->perpage),
+							 depth))
+			return true;
+	}
+	return false;
+}
+
+/* What the streams did, into the scan's counts. */
+static void
+lv_readahead_counts(LvScanOpaque *so)
+{
+	if (so->chains != NULL)
+		lion_readahead_counts(so->chains, &so->rcounts);
+	if (so->crefs != NULL)
+		lion_readahead_counts(so->crefs, &so->rcounts);
+	if (so->rrefs != NULL)
+		lion_readahead_counts(so->rrefs, &so->rcounts);
+}
+
+/*
+ * The scan is done with the index's pages for now - a rescan, a walk after
+ * the queues, the end: what its streams read ahead is released (counted as
+ * unread), and the pages pending forgotten.
+ */
+static void
+lv_readahead_reset(LvScanOpaque *so)
+{
+	lv_readahead_counts(so);
+	if (so->chains != NULL)
+		lion_readahead_reset(so->chains);
+	if (so->crefs != NULL)
+		lion_readahead_reset(so->crefs);
+	if (so->rrefs != NULL)
+		lion_readahead_reset(so->rrefs);
+	so->inrest = false;
+}
+
+/* ... and for good: endscan, or a scan that reads otherwise now */
+static void
+lv_readahead_end(LvScanOpaque *so)
+{
+	lv_readahead_reset(so);
+	if (so->chains != NULL)
+		lion_readahead_end(so->chains);
+	if (so->crefs != NULL)
+		lion_readahead_end(so->crefs);
+	if (so->rrefs != NULL)
+		lion_readahead_end(so->rrefs);
+	so->chains = so->crefs = so->rrefs = NULL;
 }
 
 /* ----------------------------------------------------------------
@@ -1073,22 +1254,44 @@ lionvecbeginscan(Relation index, int nkeys, int norderbys)
 }
 
 /*
- * The scan's counts, at DEBUG1, when a rescan or the end forgets them.  The
- * pages it prefetched, and those of them not in shared buffers, are named
- * when it prefetched at all (DESIGN.md §44.4, "Prefetch"), and a parallel
- * scan's process names the partitions others probed and the rows others
- * returned, each process sending its own line ("A parallel scan").
+ * The scan's counts, at DEBUG1, when a rescan or the end forgets them.  How
+ * it read ahead is named when it did (DESIGN.md §44.4, "Prefetch" and "Read
+ * streams"): asking the kernel, the pages it asked for and those of them
+ * not in shared buffers; through streams, the index's pages the streams
+ * served and those of them read in, from outside shared buffers, the pages
+ * read apart, which no stream was given, and those the streams read ahead
+ * and the scan never read - and the heap's pages asked for, which no stream
+ * reads (lv_prefetch_heap()).  A parallel scan's process names the
+ * partitions others probed and the rows others returned, each process
+ * sending its own line ("A parallel scan").
  */
 static void
 lv_debug_stats(IndexScanDesc scan, LvScanOpaque *so)
 {
-	char		more[160];
+	char		more[320];
+	bool		streamed = so->rmode == LION_READAHEAD_STREAM;
 
 	more[0] = '\0';
-	if (so->ipf > 0 || so->hpf > 0)
+	lv_readahead_counts(so);
+	if (streamed && (so->ipf > 0 || so->hpf > 0))
+	{
+		snprintf(more, sizeof(more), ", " INT64_FORMAT " pages streamed ("
+				 INT64_FORMAT " read in), " INT64_FORMAT " read apart, "
+				 INT64_FORMAT " streamed unread, " INT64_FORMAT " restarts",
+				 so->rcounts.nstreamed, so->rcounts.nread,
+				 so->rcounts.napart, so->rcounts.nwasted,
+				 so->rcounts.nrestarts);
+		if (so->hask.nasked > 0)
+			snprintf(more + strlen(more), sizeof(more) - strlen(more),
+					 ", " INT64_FORMAT " heap pages prefetched ("
+					 INT64_FORMAT " not in shared buffers)",
+					 so->hask.nasked, so->hask.nmissing);
+	}
+	else if (so->ipf > 0 || so->hpf > 0)
 		snprintf(more, sizeof(more), ", " INT64_FORMAT " pages prefetched ("
 				 INT64_FORMAT " not in shared buffers)",
-				 so->nprefetch, so->nprefread);
+				 so->iask.nasked + so->hask.nasked,
+				 so->iask.nmissing + so->hask.nmissing);
 	if (so->shared != NULL)
 		snprintf(more + strlen(more), sizeof(more) - strlen(more),
 				 ", " INT64_FORMAT " partitions another process probed, "
@@ -1118,7 +1321,10 @@ lv_debug_stats(IndexScanDesc scan, LvScanOpaque *so)
 	so->nprobes = so->npasses = so->ncands = so->nrefined = so->nfetched = 0;
 	so->nreturned = so->nskipped = so->nmissed = so->npages = 0;
 	so->npauses = so->ncopies = 0;
-	so->nprefetch = so->nprefread = so->nclaimed = so->ntaken = 0;
+	so->nclaimed = so->ntaken = 0;
+	so->iask.nasked = so->iask.nmissing = 0;
+	so->hask.nasked = so->hask.nmissing = 0;
+	memset(&so->rcounts, 0, sizeof(so->rcounts));
 }
 
 void
@@ -1127,6 +1333,8 @@ lionvecrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys,
 {
 	LvScanOpaque *so = (LvScanOpaque *) scan->opaque;
 
+	/* what the streams read ahead for the last scan, released first */
+	lv_readahead_reset(so);
 	lv_debug_stats(scan, so);
 	if (keys && scan->numberOfKeys > 0)
 		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
@@ -1176,6 +1384,7 @@ lionvecrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys,
 	so->ipf = so->hpf = 0;
 	so->pfkey = NULL;
 	so->pfat = so->pfsel = NULL;
+	so->restpf = 0;
 	so->shared = NULL;
 	so->nullasked = so->nullmine = false;
 }
@@ -1185,7 +1394,9 @@ lionvecendscan(IndexScanDesc scan)
 {
 	LvScanOpaque *so = (LvScanOpaque *) scan->opaque;
 
+	lv_readahead_reset(so);
 	lv_debug_stats(scan, so);
+	lv_readahead_end(so);
 	if (so->slot != NULL)
 		ExecDropSingleTupleTableSlot(so->slot);
 #if PG_VERSION_NUM < 200000
@@ -1296,14 +1507,43 @@ lv_exact_cmp(const void *a, const void *b)
 }
 
 /*
+ * The exact path's heap blocks through a read stream (lv_exact()): the
+ * members' blocks in their order, a block that members one after another
+ * share once, and those the scan counted (so->hblocks) only.
+ */
+typedef struct LvExactRead
+{
+	LionReadahead *ra;
+	BlockNumber *blks;
+	int			n;
+	int			next;			/* the next to name to the stream */
+} LvExactRead;
+
+/* LionReadaheadNext; inside the stream's callback, it reads nothing */
+static BlockNumber
+lv_exact_next(void *arg)
+{
+	LvExactRead *x = (LvExactRead *) arg;
+
+	Assert(x->next >= 0 && x->next <= x->n);
+	return x->next < x->n ? x->blks[x->next++] : InvalidBlockNumber;
+}
+
+/*
  * The members' distances from the heap, sorted: what probing would cost,
  * and more, when a restriction admits so few rows that most partitions
  * hold none, and the nearest member lies past many.  A member that is not
  * visible, or whose vector is NULL, is left for the NULL walk; a cosine
  * zero vector, whose distance is NaN, for the zero walk.  The members are
- * listed first, in TID order, and each one's heap block is asked for so->hpf
- * members before its fetch (DESIGN.md §44.4, "Prefetch"), the members of a
- * block asking once; then their distances, over the list.
+ * listed first, in TID order, and their heap blocks read ahead (DESIGN.md
+ * §44.4, "Prefetch" and "Read streams"): asking the kernel, each one's
+ * so->hpf members before its fetch, the members of a block asking once;
+ * through a stream over the list of their blocks, each block taken from
+ * the stream at its first member and its pin dropped at once - the fetch
+ * pins it again, and prunes it only with no other pin of this backend on
+ * it (ConditionalLockBufferForCleanup()) - and the stream ended before the
+ * scan returns, so that it keeps no heap page pinned.  Then their
+ * distances, over the list.
  */
 static void
 lv_exact(IndexScanDesc scan, LvScanOpaque *so)
@@ -1313,6 +1553,9 @@ lv_exact(IndexScanDesc scan, LvScanOpaque *so)
 	int			n = 0;
 	int			i;
 	int			k;
+	LvExactRead x;
+	BlockNumber last = InvalidBlockNumber;
+	int			xb = -1;		/* the member's block's place in x.blks */
 
 	so->exact = palloc(sizeof(LvExact) * max);
 	so->nexact = 0;
@@ -1348,15 +1591,54 @@ lv_exact(IndexScanDesc scan, LvScanOpaque *so)
 	}
 	pfree(los);
 
-	for (i = 0; i < Min(n, so->hpf); i++)
-		lv_prefetch_heap(scan, so, &so->exact[i].tid);
+	memset(&x, 0, sizeof(x));
+	if (so->hpf > 0 && so->rmode == LION_READAHEAD_STREAM)
+	{
+		x.blks = palloc(sizeof(BlockNumber) * Max(n, 1));
+		for (i = 0; i < n; i++)
+		{
+			BlockNumber blk = ItemPointerGetBlockNumberNoCheck(&so->exact[i].tid);
+
+			if (blk != last && blk < so->hblocks)
+				x.blks[x.n++] = blk;
+			last = blk;
+		}
+		x.ra = lion_readahead_begin_list(scan->heapRelation,
+										 LION_READAHEAD_STREAM,
+										 lv_exact_next, &x);
+		Assert(x.ra != NULL);
+		last = InvalidBlockNumber;
+	}
+	else
+	{
+		for (i = 0; i < Min(n, so->hpf); i++)
+			lv_prefetch_heap(scan, so, &so->exact[i].tid);
+	}
 	for (i = 0; i < n; i++)
 	{
 		ItemPointerData tid = so->exact[i].tid;
 		double		dist;
 
 		CHECK_FOR_INTERRUPTS();
-		if (so->hpf > 0 && i + so->hpf < n)
+		if (x.ra != NULL)
+		{
+			BlockNumber blk = ItemPointerGetBlockNumberNoCheck(&tid);
+
+			if (blk != last && blk < so->hblocks)
+			{
+				Buffer		buf = lion_readahead_next(x.ra);
+
+				/* the list's next, which the stream returns in order */
+				xb++;
+				if (xb >= x.n || x.blks[xb] != blk || !BufferIsValid(buf) ||
+					BufferGetBlockNumber(buf) != blk)
+					elog(ERROR, "lionvec: the read stream of \"%s\" lost its place at block %u",
+						 RelationGetRelationName(scan->heapRelation), blk);
+				ReleaseBuffer(buf);
+			}
+			last = blk;
+		}
+		else if (so->hpf > 0 && i + so->hpf < n)
 			lv_prefetch_heap(scan, so, &so->exact[i + so->hpf].tid);
 		if (!lv_fetch_distance(scan, so, &tid, &dist))
 			continue;
@@ -1366,6 +1648,15 @@ lv_exact(IndexScanDesc scan, LvScanOpaque *so)
 		so->exact[so->nexact].dist = dist;
 		so->exact[so->nexact].tid = tid;
 		so->nexact++;
+	}
+	if (x.ra != NULL)
+	{
+		/* every block read: the stream holds nothing it read ahead */
+		Assert(xb == x.n - 1 && x.next == x.n);
+		Assert(lion_readahead_depth(x.ra) == 0);
+		lion_readahead_counts(x.ra, &so->rcounts);
+		lion_readahead_end(x.ra);
+		pfree(x.blks);
 	}
 	qsort(so->exact, so->nexact, sizeof(LvExact), lv_exact_cmp);
 	so->epos = 0;
@@ -1433,11 +1724,16 @@ lv_walk_claim(LvScanOpaque *so, int c)
 	return so->nullmine;
 }
 
-/* What follows the queue, or a walk: the zero vectors, the NULLs, the end. */
+/*
+ * What follows the queue, or a walk: the zero vectors, the NULLs, the end.
+ * What the streams read ahead for the phase that ends is released.
+ */
 static void
 lv_next_phase(IndexScanDesc scan, LvScanOpaque *so)
 {
 	bool		ordered = so->phase == LV_NORMAL || so->phase == LV_LIST;
+
+	lv_readahead_reset(so);
 
 	if (ordered && so->metric == LIONVEC_COSINE)
 		lv_start_walk(scan, so, LV_WALK_ZERO);
@@ -1499,16 +1795,17 @@ lv_walk_next(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid)
 				continue;		/* another process walks it */
 			so->wblk = so->wheads[c];
 			/* a chain the build wrote runs on in consecutive blocks */
-			so->wpfnext = (uint64) so->wblk + 1;
+			so->wpfnext = BlockNumberIsValid(so->wblk) ?
+				lv_run_start(so, so->wblk) : 0;
 			so->wpfend = so->nblocks;
 			continue;
 		}
 		CHECK_FOR_INTERRUPTS();
 		lionvec_chain_step(index, &so->wvisited, &so->nblocks);
 		if (so->ipf > 0)
-			lv_prefetch_run(so, index, &so->wpfnext,
+			lv_prefetch_run(so, &so->wpfnext,
 							lionvec_prefetch_end(so->wblk, so->ipf, so->wpfend));
-		buf = ReadBuffer(index, so->wblk);
+		buf = lion_readahead_read(so->chains, so->wblk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		lionvec_check_page(index, page, so->wblk, LIONVEC_PAGE_CODE);
@@ -1666,7 +1963,7 @@ lv_read_parts(IndexScanDesc scan, LvScanOpaque *so)
 	BlockNumber blk = so->meta.part_head;
 	uint64		visited = 0;
 	int			n = 0;
-	uint64		pfnext = (uint64) blk + 1;
+	uint64		pfnext = lv_run_start(so, blk);
 	uint64		pfend = (uint64) blk +
 		lionvec_chain_pages((uint32) k, lionvec_page_items(LIONVEC_PART_SIZE(dimsp)));
 
@@ -1685,9 +1982,9 @@ lv_read_parts(IndexScanDesc scan, LvScanOpaque *so)
 		CHECK_FOR_INTERRUPTS();
 		lionvec_chain_step(index, &visited, &so->nblocks);
 		if (so->ipf > 0)
-			lv_prefetch_run(so, index, &pfnext,
+			lv_prefetch_run(so, &pfnext,
 							lionvec_prefetch_end(blk, so->ipf, pfend));
-		buf = ReadBuffer(index, blk);
+		buf = lion_readahead_read(so->chains, blk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		lionvec_check_page(index, page, blk, LIONVEC_PAGE_PART);
@@ -1739,9 +2036,10 @@ lv_read_parts(IndexScanDesc scan, LvScanOpaque *so)
 				 errmsg("lionvec index \"%s\" has %d partitions, and its meta page says %d",
 						RelationGetRelationName(index), n, k)));
 	lv_heapify(&so->parts);
-	/* the PART chain is warm whatever else is: it says nothing (LvPrefetch) */
-	so->ipfs.warm = 0;
-	so->ipfs.dormant = 0;
+	/* the PART chain is warm whatever else is: it says nothing (LionAsk) */
+	so->iask.warm = 0;
+	so->iask.dormant = 0;
+	lion_readahead_awaken(so->chains);
 	so->cpfdue = 1;
 	lv_prefetch_due(scan, so, &so->cpfdue, &so->parts, LV_CENT1, false);
 }
@@ -1763,7 +2061,7 @@ lv_refine_part(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 	double		hi;
 
 	lv_prefetch_due(scan, so, &so->cpfdue, &so->parts, LV_CENT1, false);
-	buf = ReadBuffer(index, item->rblk);
+	buf = lion_readahead_read(so->crefs, item->rblk);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	lionvec_check_page(index, page, item->rblk, LIONVEC_PAGE_REFINE);
@@ -1994,6 +2292,7 @@ lv_seen_stop(IndexScanDesc scan, LvScanOpaque *so)
 				 errhint("Raise work_mem or hash_mem_multiplier, let the query sort its rows (enable_indexscan = off) or LIMIT them, "
 						 "or set pg_lion.vector_overflow = stop to have the scan end at the rows it returned.")));
 	so->phase = LV_DONE;
+	lv_readahead_reset(so);
 }
 
 /*
@@ -2142,7 +2441,7 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head, bool copies,
 	bool		anyseen = so->spill || so->seen->members > 0;
 	uint64		visited = 0;
 	BlockNumber blk = head;
-	uint64		pfnext = (uint64) head + 1;
+	uint64		pfnext = lv_run_start(so, head);
 	uint64		pfend = BlockNumberIsValid(head) ? (uint64) head + pages : 0;
 
 	while (BlockNumberIsValid(blk))
@@ -2156,9 +2455,9 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head, bool copies,
 		CHECK_FOR_INTERRUPTS();
 		lionvec_chain_step(index, &visited, &so->nblocks);
 		if (so->ipf > 0 && pfend > 0)
-			lv_prefetch_run(so, index, &pfnext,
+			lv_prefetch_run(so, &pfnext,
 							lionvec_prefetch_end(blk, so->ipf, pfend));
-		buf = ReadBuffer(index, blk);
+		buf = lion_readahead_read(so->chains, blk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		lionvec_check_page(index, page, blk, LIONVEC_PAGE_CODE);
@@ -2299,7 +2598,7 @@ lv_probe(IndexScanDesc scan, LvScanOpaque *so, BlockNumber head, bool copies,
 		}
 		blk = op->next;
 		UnlockReleaseBuffer(buf);
-		/* between two pages of a chain, holding nothing (§44.5) */
+		/* between two pages of a chain, holding no lock (§44.5) */
 		if (BlockNumberIsValid(blk))
 			LION_INJECTION_POINT("lionvec-probe-page");
 	}
@@ -2455,17 +2754,25 @@ lv_rest(IndexScanDesc scan, LvScanOpaque *so)
 #endif
 	lv_reset_rows(so);
 	so->paused = false;
-	/* the chains this process probed: the REST chain's rows have no copies */
+
+	/*
+	 * the chains this process probed: the REST chain's rows have no copies;
+	 * a stream reads the chains after each one ahead (lv_chains_refill())
+	 */
+	so->inrest = true;
+	so->restpf = 0;
 	for (i = 0; i < so->nprobed; i++)
 	{
 		uint32		p = so->probed[i];
 
+		so->restpf = Max(so->restpf, i + 1);
 		if (p == LV_REST_CHAIN)
 			lv_probe(scan, so, so->meta.rest_head, false, 0);
 		else
 			lv_probe(scan, so, so->phead[p], so->spill,
 					 lionvec_chain_pages(so->pnrows[p], so->perpage));
 	}
+	so->inrest = false;
 }
 
 /* ----------------------------------------------------------------
@@ -2562,7 +2869,7 @@ lv_refine(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 	double		hi;
 
 	lv_prefetch_due(scan, so, &so->rpfdue, &so->rows, LV_PLANE1, false);
-	buf = ReadBuffer(index, item->rblk);
+	buf = lion_readahead_read(so->rrefs, item->rblk);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	lionvec_check_page(index, page, item->rblk, LIONVEC_PAGE_REFINE);
@@ -2674,35 +2981,102 @@ lv_vector_inline(const LvScanOpaque *so, Relation index, Relation heap)
 }
 
 /*
- * How far ahead the scan reads (DESIGN.md §44.4, "Prefetch"): each
- * relation's tablespace's effective_io_concurrency pages, to
- * LIONVEC_PREFETCH_MAX, while pg_lion.vector_prefetch is on; the heap's only
- * if it is the heap access method's, whose TIDs name its blocks, and its
- * vectors are not in TOAST (lv_vector_inline()).  0 asks for nothing.
+ * The index's three readaheads (lion_readahead.h), as the scan reads now:
+ * mode, or plain reads where it reads nothing ahead (so->ipf of 0), and as
+ * many pins each.  They are the scan's, in its own context, kept from one
+ * rescan to the next while the mode and pins stay, so that a nested loop's
+ * inner scan does not begin three read streams a row; lv_readahead_reset()
+ * leaves each holding nothing.  The heap's stream, the exact path's alone,
+ * is lv_exact()'s.
+ */
+static void
+lv_readahead_begin(IndexScanDesc scan, LvScanOpaque *so, int mode, int pins)
+{
+	Relation	index = scan->indexRelation;
+	MemoryContext old;
+
+	if (so->ipf <= 0)
+		mode = LION_READAHEAD_OFF;
+	if (so->chains != NULL &&
+		lion_readahead_mode(so->chains) == mode && so->rpins == pins)
+	{
+		/* what the last query's reads found says nothing of this one's */
+		lion_readahead_awaken(so->chains);
+		lion_readahead_awaken(so->crefs);
+		lion_readahead_awaken(so->rrefs);
+		return;
+	}
+	lv_readahead_end(so);
+	old = MemoryContextSwitchTo(so->cxt);
+	so->chains = lion_readahead_begin(index, mode, pins, &so->iask,
+									  lv_chains_refill, so);
+	so->crefs = lion_readahead_begin(index, mode, pins, &so->iask,
+									 lv_crefs_refill, scan);
+	so->rrefs = lion_readahead_begin(index, mode, pins, &so->iask,
+									 lv_rrefs_refill, scan);
+	so->rpins = pins;
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * How far ahead the scan reads (DESIGN.md §44.4, "Prefetch" and "Read
+ * streams"): each relation's tablespace's effective_io_concurrency pages, to
+ * LIONVEC_PREFETCH_MAX, while pg_lion.vector_prefetch is not off; the
+ * heap's only if it is the heap access method's, whose TIDs name its blocks,
+ * and its vectors are not in TOAST (lv_vector_inline()).  0 reads nothing
+ * ahead.  Through streams, each holds twice its relation's pages ahead in
+ * pins, and at least LION_READAHEAD_MIN_PINS - those it reads ahead, and
+ * those a read out of their order pulled from it first - to an
+ * LV_RA_SHARE'th of the backend's fair share of shared_buffers, reading
+ * half as many pages ahead where that is less; with fewer than
+ * LION_READAHEAD_MIN_PINS, and on 16, the scan asks the kernel instead.
  */
 static void
 lv_start_prefetch(IndexScanDesc scan, LvScanOpaque *so)
 {
 	Relation	index = scan->indexRelation;
 	Relation	heap = scan->heapRelation;
+	int			pins = 0;
 
 	so->ipf = so->hpf = 0;
 	so->perpage = lionvec_page_items(LIONVEC_CODE_SIZE(Max(so->meta.dimsp, 64)));
-	lv_prefetch_reset(&so->ipfs);
-	lv_prefetch_reset(&so->hpfs);
-	if (!lionvec_prefetch)
-		return;
-	so->ipf = Min(get_tablespace_io_concurrency(index->rd_rel->reltablespace),
-				  LIONVEC_PREFETCH_MAX);
-	if (heap != NULL && heap->rd_tableam == GetHeapamTableAmRoutine() &&
-		lv_vector_inline(so, index, heap))
+	lion_ask_reset(&so->iask);
+	lion_ask_reset(&so->hask);
+	so->inrest = false;
+	so->restpf = 0;
+	so->rmode = lionvec_prefetch;
+	if (so->rmode != LION_READAHEAD_OFF)
 	{
-		so->hpf = Min(get_tablespace_io_concurrency(heap->rd_rel->reltablespace),
+		so->ipf = Min(get_tablespace_io_concurrency(index->rd_rel->reltablespace),
 					  LIONVEC_PREFETCH_MAX);
-		so->hblocks = so->hpf > 0 ? RelationGetNumberOfBlocks(heap) : 0;
+		if (heap != NULL && heap->rd_tableam == GetHeapamTableAmRoutine() &&
+			lv_vector_inline(so, index, heap))
+		{
+			so->hpf = Min(get_tablespace_io_concurrency(heap->rd_rel->reltablespace),
+						  LIONVEC_PREFETCH_MAX);
+			so->hblocks = so->hpf > 0 ? RelationGetNumberOfBlocks(heap) : 0;
+		}
+		so->ipf = Max(so->ipf, 0);
+		so->hpf = Max(so->hpf, 0);
 	}
-	so->ipf = Max(so->ipf, 0);
-	so->hpf = Max(so->hpf, 0);
+#if PG_VERSION_NUM < 170000
+	if (so->rmode == LION_READAHEAD_STREAM)
+		so->rmode = LION_READAHEAD_FADVISE;
+#endif
+	if (so->rmode == LION_READAHEAD_STREAM)
+	{
+		pins = (int) Min((uint32) Max(2 * Max(so->ipf, so->hpf),
+									  LION_READAHEAD_MIN_PINS),
+						 lion_pin_fair_share() / LV_RA_SHARE);
+		if (pins < LION_READAHEAD_MIN_PINS)
+			so->rmode = LION_READAHEAD_FADVISE;
+		else
+		{
+			so->ipf = Min(so->ipf, pins / 2);
+			so->hpf = Min(so->hpf, pins / 2);
+		}
+	}
+	lv_readahead_begin(scan, so, so->rmode, pins);
 	if (so->ipf > 0 || so->hpf > 0)
 	{
 		so->pfkey = palloc(sizeof(double) * LV_PF_TOP(LIONVEC_PREFETCH_MAX));
