@@ -22064,6 +22064,106 @@ there (§44.4, "Prefetch": dormant for 256 asks after 32 found), the same rounds
 2.33 at a margin of 3, 4.91 against 4.99 at 8 and 10.67 against 10.81 with two participants: about
 2%, a margin-8 scan asking for 65 pages rather than 880.
 
+**Read streams** (2026-10-17; §44.4, "Read streams"; bench/results/2026-10-17-lionvec-read-streams/,
+`knn_readahead.py`). DBpedia's 115,186 rows as `knn_dbpedia.py load` makes them, each vector in its
+row (`toast_tuple_target = 8160`, a row a heap page, 900 MB), the cosine index of 2,715 partitions
+spilling (247 MB), the first 10 of the 200 queries; PostgreSQL 18.6 built without assertions, 4
+vCPUs, 15 GB, `shared_buffers` 2 GB, `effective_io_concurrency` 200 (64 pages ahead),
+`io_combine_limit` 16, the disk a virtio device. Each query under `pg_lion.vector_prefetch` `off`,
+`fadvise` and `stream`, and under main at 64e7443 (`on`, which is `fadvise` but asked for no heap
+page of this table, its raised `toast_tuple_target` not counted until a9a27c5), in three states:
+`device`, the server restarted and the page cache dropped before each query, the configurations
+taking turns query by query; `os`, the server restarted before each query with every relation in the
+page cache; `warm`, every relation in shared buffers, the configurations of one build taking turns
+in one session. The kinds: unfiltered at margins 3 and 8; LionOrdered probing under filters of 10, 3
+and 1% (the exact path off); its exact path under 1 and 3% (1,204 and 3,472 members). Every query
+returned the same rows in the same order in every configuration, state and `io_method`. The server's
+median ms over the 10 queries, and in brackets each query's `stream` time over its `fadvise` time,
+the median of those ratios (`off` is `io_method = worker`'s; it reads nothing ahead, and plain
+`ReadBuffer()` reads in the backend under every method):
+
+| Device | off | worker (3): fadvise, stream | sync: fadvise, stream | io_uring: fadvise, stream |
+| --- | --- | --- | --- | --- |
+| margin 3 | 25.3 | 20.9, 21.9 (1.12) | 20.8, 18.8 (0.94) | 19.1, 20.3 (1.04) |
+| margin 8 | 67.2 | 47.6, 43.2 (0.93) | 48.1, 41.0 (0.79) | 46.4, 39.8 (0.86) |
+| 10%, probed | 58.0 | 58.1, 46.8 (0.94) | 51.5, 41.7 (0.87) | 51.6, 47.9 (0.85) |
+| 3%, probed | 95.9 | 72.9, 57.9 (0.79) | 76.9, 61.6 (0.79) | 76.0, 68.1 (0.87) |
+| 1%, probed | 100.9 | 82.8, 62.0 (0.80) | 93.0, 72.2 (0.81) | 88.2, 72.9 (0.85) |
+| 1%, exact | 108.3 | 58.9, 53.3 (0.90) | 56.1, 67.2 (1.17) | 64.9, 43.8 (0.66) |
+| 3%, exact | 318.3 | 172.8, 151.6 (0.88) | 168.1, 158.2 (0.93) | 168.3, 111.8 (0.65) |
+
+From the disk the streams are the faster on 18 of the 21, by 6 to 35% query by query; about even at
+a margin of 3 (0.94 to 1.12), whose scan probes 29 partitions and reads 346 pages, too few for
+reading ahead to pay much either way; and slower on the exact path at 1% under `sync`, where a
+stream's reads are the backend's own `preadv()` after `posix_fadvise()` advice, much as `fadvise`'s
+are (67.2 ms against 56.1). The exact path, a list known whole, gains most, its wait on reads all
+but gone (under `worker` 3.5 ms against 19.3 at 1% and 5.6 against 54.4 at 3%): under io_uring its
+3,472 heap pages took 112 ms against 168 asking the kernel and 318 with neither. Main's `on` asked
+for the index's pages as `fadvise` does and for none of the heap's, so its exact path took `off`'s
+time (115.5 ms at 1%). The streams read more pages: 402 against 346 at a margin of 3, 996 against
+861 at 8 and 1,708 against 1,500 at 1% - chains the refill predicted that the scan did not probe,
+its LIMIT met or a centroid coming first, released unread (64, 228 and 677 a query) - and the disk
+read 4 to 19% more on the index's kinds (11.1 MB against 9.7 at a margin of 8 under `worker`). A
+scan's streams ended and started again 35 to 72 times a query, each time a stream had nothing left
+to read and the scan then read a page it had pushed.
+
+With every page in the kernel's cache and none in shared buffers, a read is a copy of 8 kB, and
+handing it to another thread costs more than it: under `io_method = worker` an I/O worker reads
+every page a stream reads, and under io_uring PostgreSQL submits a buffered read with `IOSQE_ASYNC`
+once more than four are in flight (method_io_uring.c), so the kernel's io-wq threads copy it;
+`ReadBuffer()` copies it in the backend under every method.
+
+| OS cache | off | worker (3): fadvise, stream | sync: fadvise, stream | io_uring: fadvise, stream |
+| --- | --- | --- | --- | --- |
+| margin 3 | 6.3 | 6.4, 11.5 (1.40) | 7.3, 7.1 (1.02) | 8.2, 8.9 (1.31) |
+| margin 8 | 18.2 | 17.9, 21.7 (1.18) | 19.8, 18.5 (1.11) | 16.9, 18.9 (1.22) |
+| 10%, probed | 20.2 | 23.8, 23.6 (1.00) | 19.5, 21.5 (1.08) | 19.8, 30.4 (1.23) |
+| 3%, probed | 28.0 | 26.1, 29.8 (1.10) | 28.3, 30.8 (1.14) | 27.0, 31.1 (1.19) |
+| 1%, probed | 29.2 | 28.4, 26.5 (1.05) | 31.0, 31.1 (1.02) | 27.6, 36.4 (1.10) |
+| 1%, exact | 18.4 | 19.1, 8.6 (0.44) | 19.8, 21.6 (1.10) | 22.3, 34.0 (1.54) |
+| 3%, exact | 52.5 | 55.1, 23.2 (0.45) | 56.6, 61.4 (1.07) | 55.8, 107.9 (1.96) |
+
+So from the kernel's cache the streams cost: 0 to 40% on the index's pages, whose reads a scan
+mostly waits on one at a time, and on the exact path one and a half to twice the time under
+io_uring, every copy a thread's hop, where under `worker` its many reads in flight, copied by three
+workers at once, took half the time. Sixteen workers (`io_workers = 16`, `off`, `fadvise` and
+`stream` only) read the disk faster still - the exact path 37.2 ms at 1% against 61.9 asking the
+kernel, 99.5 at 3% against 170.0, a margin of 8 37.1 against 45.4 - and the kernel's cache slower,
+sixteen processes on four CPUs: 10.9 ms against 6.2 at a margin of 3 (1.72), the exact path 1.17
+times `fadvise`'s.
+
+Warm, every page in shared buffers, each query against itself under the same build's `off` in one
+session (`warm-rest3.json`, 20 queries, 5 runs each): `fadvise` 0.98 to 1.05, `stream` 1.02 to 1.11
+(1.11 at a margin of 3, 1.07 at 8, 1.02 to 1.05 filtered and on the exact path); and a build whose
+streams did not rest (r3, the ring's stream ever pushed and refilled, the list ever streamed), 1.06
+to 1.15 against its own `off` (1.15 at a margin of 3, 1.13 at 8, 1.11 and 1.15 at 3 and 1%). The
+rest roughly halves what a warm stream costs, as dormancy did the asks' (§44.4, "Prefetch"), so it
+stays, for the streams too: of a warm margin-8 scan's 1,098 reads, 341 come from its streams and 758
+are read apart, and of the exact path's 1,204 blocks at 1%, 165 come from its list's stream. The
+matrices' warm runs, a session for each build and the configurations taking turns, agree: `stream`
+over `fadvise` 0.93 to 1.04 under each method.
+
+What the parts are worth, from smaller runs (5 queries, `io_method = worker`, device): without
+predicting the next partitions' chains (`nopred`), each probe's stream ended with its run and
+started again from one block, and a scan took 68.4 ms at a margin of 8 against 42.8, 146.9 at 1%
+against 62.8, 65.5 at 10% against 49.6 and 31.7 at a margin of 3 against 19.3 (`ab-restart.json`); a
+stream that ended reset rather than begun anew from a full I/O ahead (`r2`) took 62.7 ms at 10% and
+25.4 at a margin of 3 against 49.6 and 19.3, and the same at 8 and at 1%. The exact path through the
+ring, before the list stream, took 65.9 ms at 1% (its wait 45.4 ms), through a list stream 50.9
+(3.2) and asking the kernel 57.8 (18.1); at 3% 163.8, 132.2 and 166.0 (`ab-list.json`); a list
+stream without `READ_STREAM_FULL`, which starts one block ahead, 53.7 and 146.4.
+
+The vectors in TOAST (`toast-worker-3.json`): pgvector keeps a `vector` of more than 506 dimensions
+there unless told otherwise, so most tables of real embeddings do. The same rows loaded with
+`KNN_INLINE=0` into another database - the heap 7.6 MB, its TOAST 900 MB - with an index of their
+own (2,715 partitions, 247 MB), under `io_method = worker`, from the disk and warm. Nothing reads a
+toasted vector ahead (§44.4, "Prefetch"; §44.11). The index's streams gained what they gained
+inline: a margin-8 scan took 43.0 ms streaming, 47.7 asking the kernel and 57.9 reading as it went,
+a 3% filter's probing 67.4, 81.2 and 97.4, a margin of 3 about even (29.5, 26.3 and 28.7). The
+exact path at 1% read its 2,717 pages - the members' heap pages, the TOAST index's and the chunks -
+one at a time under every setting, 157 to 168 ms, 135 to 146 of them waiting on reads, where the
+inline table's, streamed, took 53; warm it took 11.2 ms against 4.6, detoasting 1,204 vectors.
+
 ### 44.10 Tests
 
 - **test/unit/vec_test.c** (`make unit`, and under ASan and UBSan with `SANITIZE=1`), against the
