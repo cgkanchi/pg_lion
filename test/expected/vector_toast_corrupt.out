@@ -244,8 +244,18 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 SET enable_sort = off;
+-- prepared, and run once, at the settings above, so that its DEBUG1 run
+-- parses and plans nothing: what a parse looks up can grow a catalog
+-- cache, whose rehash DEBUG1 reports too
+PREPARE tc_scan AS SELECT count(*) FROM (SELECT id FROM tc WHERE cat = 3 ORDER BY v <-> tc_vec(13, 1536)) s;
+EXECUTE tc_scan;
+ count 
+-------
+    20
+(1 row)
+
 SET client_min_messages = debug1;
-SELECT count(*) FROM (SELECT id FROM tc WHERE cat = 3 ORDER BY v <-> tc_vec(13, 1536)) s;
+EXECUTE tc_scan;
 DEBUG:  lionvec scan of "tc_v": 1 members fetched, 20 returned, 19 read by place (1 locator pages, 0 not), 19 checked
  count 
 -------
@@ -253,6 +263,7 @@ DEBUG:  lionvec scan of "tc_v": 1 members fetched, 20 returned, 19 read by place
 (1 row)
 
 RESET client_min_messages;
+DEALLOCATE tc_scan;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
@@ -283,8 +294,15 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
 SET enable_sort = off;
+PREPARE tc_scan AS SELECT count(*) FROM (SELECT id FROM tc WHERE cat = 3 ORDER BY v <-> tc_vec(13, 1536)) s;
+EXECUTE tc_scan;
+ count 
+-------
+    20
+(1 row)
+
 SET client_min_messages = debug1;
-SELECT count(*) FROM (SELECT id FROM tc WHERE cat = 3 ORDER BY v <-> tc_vec(13, 1536)) s;
+EXECUTE tc_scan;
 DEBUG:  lionvec scan of "tc_v": 1 members fetched, 20 returned, 19 read by place (1 locator pages, 1 not), 19 checked
  count 
 -------
@@ -292,6 +310,7 @@ DEBUG:  lionvec scan of "tc_v": 1 members fetched, 20 returned, 19 read by place
 (1 row)
 
 RESET client_min_messages;
+DEALLOCATE tc_scan;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
@@ -437,8 +456,15 @@ SELECT tc_cmp(:'qp', false) AS probed;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_sort = off;
+PREPARE tc_scan AS SELECT count(*) FROM (SELECT id FROM tc ORDER BY v <-> tc_vec(13, 1536) LIMIT 1) s;
+EXECUTE tc_scan;
+ count 
+-------
+     1
+(1 row)
+
 SET client_min_messages = debug1;
-SELECT count(*) FROM (SELECT id FROM tc ORDER BY v <-> tc_vec(13, 1536) LIMIT 1) s;
+EXECUTE tc_scan;
 DEBUG:  lionvec scan of "tc_v": 1 partitions probed, 1 passes, 200 candidates, 1 refined, 1 fetched, 1 returned, 0 skipped out of order, 0 bounds missed, 7 pages read, 0 pauses, 0 copies skipped, 0 read by place (0 locator pages, 1 not), 1 checked
 DEBUG:  lionvec scan of "tc_v": 1 members fetched, 1 returned, 0 read by place (0 locator pages, 1 not), 1 checked
  count 
@@ -447,6 +473,7 @@ DEBUG:  lionvec scan of "tc_v": 1 members fetched, 1 returned, 0 read by place (
 (1 row)
 
 RESET client_min_messages;
+DEALLOCATE tc_scan;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_sort;
