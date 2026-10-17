@@ -1,0 +1,242 @@
+{
+ "base": 20000,
+ "n": 5000,
+ "reps": 5,
+ "configs": [
+  [
+   "main",
+   "main"
+  ],
+  [
+   "on",
+   "branch",
+   "on"
+  ],
+  [
+   "off",
+   "branch",
+   "off"
+  ]
+ ],
+ "summary": {
+  "main": {
+   "ms_median": 2274.0,
+   "ms_all": [
+    2346.2,
+    2769.8,
+    2274.0,
+    2070.4,
+    2118.6
+   ],
+   "wal_median": 50183592,
+   "build_s_median": 19.66
+  },
+  "on": {
+   "ms_median": 2595.9,
+   "ms_all": [
+    2878.3,
+    2343.5,
+    2747.6,
+    2595.9,
+    2139.1
+   ],
+   "wal_median": 50788352,
+   "build_s_median": 19.83
+  },
+  "off": {
+   "ms_median": 2351.4,
+   "ms_all": [
+    2620.2,
+    2351.4,
+    2297.2,
+    2551.7,
+    2250.1
+   ],
+   "wal_median": 50788320,
+   "build_s_median": 19.33
+  }
+ },
+ "rows": [
+  {
+   "config": "main",
+   "lib": "main",
+   "direct": null,
+   "ms": 2346.2,
+   "wal_bytes": 50185112,
+   "build_s": 19.66,
+   "version": 4,
+   "flags": 1,
+   "index_bytes": 59244544,
+   "rep": 0
+  },
+  {
+   "config": "on",
+   "lib": "branch",
+   "direct": "on",
+   "ms": 2878.3,
+   "wal_bytes": 50793128,
+   "build_s": 19.83,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 0
+  },
+  {
+   "config": "off",
+   "lib": "branch",
+   "direct": "off",
+   "ms": 2620.2,
+   "wal_bytes": 50788616,
+   "build_s": 19.33,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 0
+  },
+  {
+   "config": "off",
+   "lib": "branch",
+   "direct": "off",
+   "ms": 2351.4,
+   "wal_bytes": 50781360,
+   "build_s": 19.5,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 1
+  },
+  {
+   "config": "on",
+   "lib": "branch",
+   "direct": "on",
+   "ms": 2343.5,
+   "wal_bytes": 50787936,
+   "build_s": 19.24,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 1
+  },
+  {
+   "config": "main",
+   "lib": "main",
+   "direct": null,
+   "ms": 2769.8,
+   "wal_bytes": 50183592,
+   "build_s": 20.4,
+   "version": 4,
+   "flags": 1,
+   "index_bytes": 59244544,
+   "rep": 1
+  },
+  {
+   "config": "main",
+   "lib": "main",
+   "direct": null,
+   "ms": 2274.0,
+   "wal_bytes": 50183944,
+   "build_s": 19.5,
+   "version": 4,
+   "flags": 1,
+   "index_bytes": 59244544,
+   "rep": 2
+  },
+  {
+   "config": "on",
+   "lib": "branch",
+   "direct": "on",
+   "ms": 2747.6,
+   "wal_bytes": 50787616,
+   "build_s": 21.37,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 2
+  },
+  {
+   "config": "off",
+   "lib": "branch",
+   "direct": "off",
+   "ms": 2297.2,
+   "wal_bytes": 50787968,
+   "build_s": 19.37,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 2
+  },
+  {
+   "config": "off",
+   "lib": "branch",
+   "direct": "off",
+   "ms": 2551.7,
+   "wal_bytes": 50788320,
+   "build_s": 19.28,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 3
+  },
+  {
+   "config": "on",
+   "lib": "branch",
+   "direct": "on",
+   "ms": 2595.9,
+   "wal_bytes": 50788648,
+   "build_s": 20.17,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 3
+  },
+  {
+   "config": "main",
+   "lib": "main",
+   "direct": null,
+   "ms": 2070.4,
+   "wal_bytes": 50182952,
+   "build_s": 20.34,
+   "version": 4,
+   "flags": 1,
+   "index_bytes": 59244544,
+   "rep": 3
+  },
+  {
+   "config": "main",
+   "lib": "main",
+   "direct": null,
+   "ms": 2118.6,
+   "wal_bytes": 50183304,
+   "build_s": 19.48,
+   "version": 4,
+   "flags": 1,
+   "index_bytes": 59244544,
+   "rep": 4
+  },
+  {
+   "config": "on",
+   "lib": "branch",
+   "direct": "on",
+   "ms": 2139.1,
+   "wal_bytes": 50788352,
+   "build_s": 19.01,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 4
+  },
+  {
+   "config": "off",
+   "lib": "branch",
+   "direct": "off",
+   "ms": 2250.1,
+   "wal_bytes": 50788680,
+   "build_s": 18.6,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 4
+  }
+ ],
+ "run_at": "2026-10-17T08:25:05Z"
+}
