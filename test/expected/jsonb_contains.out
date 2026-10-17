@@ -261,20 +261,159 @@ EXPLAIN (COSTS OFF) SELECT id FROM jz_l WHERE doc @> '{"k0": 1}';
 (4 rows)
 
 RESET enable_seqscan;
--- the opclass validates, and is not the default for jsonb
+-- the opclass validates, and is the default for jsonb, as GIN's containment
+-- class is GIN's; lion's jsonb_ops, whole documents under `=`, is not
 SELECT amvalidate(oid) FROM pg_opclass WHERE opcname = 'jsonb_contains_ops';
  amvalidate 
 ------------
  t
 (1 row)
 
-SELECT opcdefault FROM pg_opclass c JOIN pg_am a ON a.oid = c.opcmethod
- WHERE a.amname = 'lion' AND c.opcname = 'jsonb_contains_ops';
- opcdefault 
-------------
- f
+SELECT c.opcname, c.opcdefault FROM pg_opclass c JOIN pg_am a ON a.oid = c.opcmethod
+ WHERE a.amname = 'lion' AND c.opcintype = 'jsonb'::regtype ORDER BY 1;
+      opcname       | opcdefault 
+--------------------+------------
+ jsonb_contains_ops | t
+ jsonb_ops          | f
+(2 rows)
+
+-- An index that names no class is jsonb_contains_ops, and answers `@>`, `?`
+-- and jsonpath from the index, but not `=` on whole documents or a
+-- count(DISTINCT) of them, which a multi-key column cannot; jsonb_ops, named,
+-- still does, and a GROUP BY doc is answered as before.  (Without the three
+-- documents above whose whole value is a key longer than 2000 bytes, which
+-- jsonb_ops refuses.)
+CREATE TABLE jz_d AS SELECT * FROM jz WHERE id < 9100;
+CREATE INDEX jz_d_i ON jz_d USING lion (doc);
+VACUUM (FREEZE, ANALYZE) jz_d;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM jz_d WHERE doc @> '{"k0": 1}';
+                     QUERY PLAN                     
+----------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: jz_d_i (doc @> '{"k0": 1}'::jsonb)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM jz_d WHERE doc ? 'k1';
+                QUERY PLAN                 
+-------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: jz_d_i (doc ? 'k1'::text)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM jz_d WHERE doc @? '$.k0 ? (@ == 1)';
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: jz_d_i (doc @? '$."k0"?(@ == 1)'::jsonpath)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM jz_d WHERE doc @> '{"k0": 1}';
+                   QUERY PLAN                    
+-------------------------------------------------
+ Bitmap Heap Scan on jz_d
+   Recheck Cond: (doc @> '{"k0": 1}'::jsonb)
+   ->  Bitmap Index Scan on jz_d_i
+         Index Cond: (doc @> '{"k0": 1}'::jsonb)
+(4 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM jz_d WHERE doc = '{"k0": 1}';
+                 QUERY PLAN                 
+--------------------------------------------
+ Aggregate
+   ->  Seq Scan on jz_d
+         Filter: (doc = '{"k0": 1}'::jsonb)
+(3 rows)
+
+CREATE INDEX jz_d_e ON jz_d USING lion (doc jsonb_ops);
+SELECT i.indexrelid::regclass AS idx, c.opcname
+  FROM pg_index i JOIN pg_opclass c ON c.oid = i.indclass[0]
+ WHERE i.indrelid = 'jz_d'::regclass ORDER BY 1;
+  idx   |      opcname       
+--------+--------------------
+ jz_d_i | jsonb_contains_ops
+ jz_d_e | jsonb_ops
+(2 rows)
+
+VACUUM (ANALYZE) jz_d;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM jz_d WHERE doc = '{"k0": 1}';
+                    QUERY PLAN                     
+---------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: jz_d_e (doc = '{"k0": 1}'::jsonb)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT doc) FROM jz_d;
+          QUERY PLAN          
+------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: jz_d_e (doc)
+   Distinct Key: doc
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM jz_d WHERE doc @> '{"k0": 1}';
+                     QUERY PLAN                     
+----------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: jz_d_i (doc @> '{"k0": 1}'::jsonb)
+(2 rows)
+
+RESET enable_seqscan;
+-- and what they answer is a sequential scan's
+CREATE FUNCTION jz_d_same(cond text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE a int[]; b int[]; c int; d int;
+BEGIN
+	EXECUTE 'SELECT coalesce(array_agg(id ORDER BY id), ''{}'') FROM jz WHERE id < 9100 AND ' || cond INTO a;
+	EXECUTE 'SELECT count(*) FROM jz WHERE id < 9100 AND ' || cond INTO c;
+	PERFORM set_config('enable_seqscan', 'off', true);
+	EXECUTE 'SELECT coalesce(array_agg(id ORDER BY id), ''{}'') FROM jz_d WHERE ' || cond INTO b;
+	EXECUTE 'SELECT count(*) FROM jz_d WHERE ' || cond INTO d;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	RETURN a = b AND c = d AND c = cardinality(a);
+END $$;
+SELECT cond, jz_d_same(cond) AS same FROM (VALUES
+	($$doc @> '{"k0": 1}'$$), ($$doc ? 'k1'$$), ($$doc ?| '{k2,s0}'$$),
+	($$doc @? '$.k0 ? (@ == 1)'$$), ($$doc @@ '$.k1 == "s0"'$$),
+	($$doc = '{"k0": 1}'$$), ($$doc = '"s0"'$$)) v(cond);
+           cond           | same 
+--------------------------+------
+ doc @> '{"k0": 1}'       | t
+ doc ? 'k1'               | t
+ doc ?| '{k2,s0}'         | t
+ doc @? '$.k0 ? (@ == 1)' | t
+ doc @@ '$.k1 == "s0"'    | t
+ doc = '{"k0": 1}'        | t
+ doc = '"s0"'             | t
+(7 rows)
+
+SET enable_seqscan = off;
+SELECT count(*) AS groups_differing FROM (
+	(SELECT doc, count(*) FROM jz_d GROUP BY doc
+	 EXCEPT ALL SELECT doc, count(*) FROM jz WHERE id < 9100 GROUP BY doc)
+	UNION ALL
+	(SELECT doc, count(*) FROM jz WHERE id < 9100 GROUP BY doc
+	 EXCEPT ALL SELECT doc, count(*) FROM jz_d GROUP BY doc)) x;
+ groups_differing 
+------------------
+                0
 (1 row)
 
+SELECT (SELECT count(DISTINCT doc) FROM jz_d) =
+	   (SELECT count(DISTINCT doc) FROM jz WHERE id < 9100) AS same_distinct;
+ same_distinct 
+---------------
+ t
+(1 row)
+
+RESET enable_seqscan;
+SELECT lion_index_verify('jz_d_i', true), lion_index_verify('jz_d_e', true);
+ lion_index_verify | lion_index_verify 
+-------------------+-------------------
+                   | 
+(1 row)
+
+DROP TABLE jz_d;
+DROP FUNCTION jz_d_same(text);
 DROP TABLE jz, jz_g, jz_gp, jz_l;
 DROP FUNCTION jz_run(int);
 DROP FUNCTION jz_any(text);

@@ -4,7 +4,9 @@
 -- text keys.  A tsquery of AND and OR over plain lexemes becomes a boolean
 -- tree over those keys and is answered exactly; NOT, phrase search, prefixes
 -- and weights need positions or ranges the index does not have, and fall back
--- to scanning every indexed row with a recheck.
+-- to scanning every indexed row with a recheck.  The indexes here are built
+-- WITH (store_positions = false) to keep it so: positions.sql tests what a
+-- tsvector index stores by default.
 --
 -- Every query is run through the index and through a forced sequential scan
 -- and the two results compared as multisets.
@@ -95,7 +97,7 @@ INSERT INTO lion_ts (id, grp, body) VALUES (-1, 1, NULL);
 UPDATE lion_ts SET tsv = to_tsvector('english', coalesce(body, ''))
  WHERE body IS NOT NULL;
 
-CREATE INDEX lion_ts_tsv ON lion_ts USING lion (tsv);
+CREATE INDEX lion_ts_tsv ON lion_ts USING lion (tsv) WITH (store_positions = false);
 CREATE INDEX lion_ts_grp ON lion_ts USING lion (grp);
 VACUUM (FREEZE, ANALYZE) lion_ts;
 
@@ -262,7 +264,7 @@ SELECT lion_index_verify('lion_ts_tsv', true);
  */
 CREATE TABLE lion_ts_empty (id int NOT NULL, tsv tsvector);
 CREATE INDEX lion_ts_empty_tsv ON lion_ts_empty USING lion (tsv)
-	WITH (inline_limit = 64);
+	WITH (inline_limit = 64, store_positions = false);
 INSERT INTO lion_ts_empty
 SELECT i, CASE WHEN i % 2 = 0 THEN to_tsvector('simple', '')
 			   ELSE to_tsvector('simple', 'onlyword') END
@@ -310,7 +312,7 @@ SELECT i, to_tsvector('simple',
 					  'common w' || (i % 20) || ' w' || (i % 400) ||
 					  ' rare' || i || ' endword')
   FROM generate_series(1, 20000) i;
-CREATE INDEX lion_tsc_tsv ON lion_tsc USING lion (tsv);
+CREATE INDEX lion_tsc_tsv ON lion_tsc USING lion (tsv) WITH (store_positions = false);
 VACUUM (FREEZE, ANALYZE) lion_tsc;
 -- exact: one lexeme, an AND and an OR over lexemes
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lion_tsc WHERE tsv @@ 'rare500'::tsquery;
@@ -363,7 +365,7 @@ INSERT INTO lion_ts_many
 SELECT to_tsvector('simple', 'lex' || i || ' lex' || (i + 1))
   FROM generate_series(1, 3000) i;
 CREATE INDEX lion_ts_many_tsv ON lion_ts_many USING lion (tsv)
-	WITH (max_entries = 500);
+	WITH (max_entries = 500, store_positions = false);
 SELECT entries > 500 FROM lion_index_stats('lion_ts_many_tsv');
 SELECT lion_index_verify('lion_ts_many_tsv', true);
 

@@ -799,9 +799,9 @@ lion_op_roaring_strategy(Oid opno, Oid *opfamily, Oid *lefttype)
 
 /*
  * Does key column col of idx store positions (DESIGN.md §17)?  Its opclass
- * has support function 5 and the index was built with store_positions = true,
- * which only its meta page knows (LION_META_POSITIONS) - the reloption may
- * have been changed by ALTER INDEX since.
+ * has support function 5 and the build stored them (store_positions = auto,
+ * the default, or on), which only its meta page knows (LION_META_POSITIONS)
+ * - the reloption may have been changed by ALTER INDEX since.
  */
 bool
 lion_index_stores_positions(IndexOptInfo *idx, AttrNumber col)

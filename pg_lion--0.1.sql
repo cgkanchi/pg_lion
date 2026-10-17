@@ -383,7 +383,15 @@ CREATE OPERATOR CLASS inet_ops DEFAULT FOR TYPE inet USING lion AS
 	FUNCTION	1	hashinet(inet),
 	FUNCTION	4	network_cmp(inet, inet);
 
-CREATE OPERATOR CLASS jsonb_ops DEFAULT FOR TYPE jsonb USING lion AS
+/*
+ * Whole jsonb documents under `=` and the ranges, which is btree's meaning of
+ * jsonb_ops.  Not the default: jsonb_contains_ops below is, as GIN's
+ * containment class is GIN's default.  Name it to have `=`, the ranges or
+ * count(DISTINCT doc) answered by the index:
+ *
+ *   CREATE INDEX ON docs USING lion (doc jsonb_ops);
+ */
+CREATE OPERATOR CLASS jsonb_ops FOR TYPE jsonb USING lion AS
 	OPERATOR	1	= (jsonb, jsonb),
 	OPERATOR	6	< (jsonb, jsonb),
 	OPERATOR	7	<= (jsonb, jsonb),
@@ -477,11 +485,11 @@ CREATE OPERATOR CLASS array_ops DEFAULT FOR TYPE anyarray USING lion AS
 
 /*
  * Support function 5 hands the index every lexeme's positions and weights
- * beside its key.  An index stores them only when it is built WITH
- * (store_positions = true) (DESIGN.md §17, "Stored positions"): a phrase, a
- * weight and `a & !b` are then answered exactly from the index - no heap
- * recheck in a scan, and none on an all-visible page in a count - for about
- * three bytes per lexeme and row more.
+ * beside its key, and an index stores them unless it is built WITH
+ * (store_positions = off) (DESIGN.md §17, "Stored positions"): a phrase, a
+ * weight and `a & !b` are answered exactly from the index - no heap recheck
+ * in a scan, and none on an all-visible page in a count - for about three
+ * bytes per lexeme and row more.
  */
 CREATE FUNCTION lion_tsvector_positions(tsvector, internal) RETURNS internal
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
@@ -500,17 +508,18 @@ CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING lion AS
  * one key per path to each of its scalars (with the scalar), per container,
  * and per top-level key, so that `@>`, `?`, `?|` and `?&` are answered from
  * the index, and jsonpath `@?` and `@@` (§43) narrowed by it and rechecked.
- * Keys are bytea and compare bytewise.  Not the default: the default
- * jsonb_ops indexes whole documents for `=`.
+ * Keys are bytea and compare bytewise.  The default for jsonb, as GIN's
+ * jsonb_ops is GIN's: `USING lion (doc)` is this class, and jsonb_ops above
+ * is the one to name for whole documents under `=`.
  *
- *   CREATE INDEX ON docs USING lion (doc jsonb_contains_ops);
+ *   CREATE INDEX ON docs USING lion (doc);
  */
 CREATE FUNCTION lion_jsonb_extract_value(jsonb, internal, internal)
 	RETURNS internal AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 CREATE FUNCTION lion_jsonb_extract_query(jsonb, internal, int2, internal, internal, internal, internal)
 	RETURNS internal AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 
-SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS jsonb_contains_ops FOR TYPE jsonb USING lion AS
+SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS jsonb_contains_ops DEFAULT FOR TYPE jsonb USING lion AS
 	OPERATOR	11	@> (jsonb, jsonb),
 	OPERATOR	12	? (jsonb, text),
 	OPERATOR	13	?| (jsonb, text[]),
@@ -526,7 +535,8 @@ SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS jsonb_contains_ops FOR T
 /*
  * BM25 ranking (lion_bm25.c, DESIGN.md §17 "Ranking"): the k rows with the
  * highest Okapi BM25 score for the query's lexemes, best first, scored from
- * an index built WITH (store_positions = true).  Join on ctid for the rows:
+ * an index that stores positions (a tsvector column's, by default).  Join on
+ * ctid for the rows:
  *
  *   SELECT d.*, s.score
  *     FROM lion_bm25('doc_tsv_idx', to_tsquery('english', 'cat & dog'), 10) s
