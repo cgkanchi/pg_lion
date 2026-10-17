@@ -13,8 +13,8 @@
 -- that could hold a nearer row, so the rows and their order are the sort's;
 -- at the defaults each participant stops by its own rules, and the share of
 -- the nearest rows found is compared with the serial scan's.
--- pg_lion.vector_prefetch, and effective_io_concurrency = 0, change no row
--- a scan returns.
+-- pg_lion.vector_prefetch, each way, and effective_io_concurrency = 0,
+-- change no row a scan returns (vector_stream.sql compares them at length).
 \set VERBOSITY terse
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
@@ -86,10 +86,12 @@ CREATE FUNCTION ps_rows(q text) RETURNS text LANGUAGE sql IMMUTABLE AS $$
 $$;
 /*
  * ps_cmp() runs q as planned under the settings in force, and as a sort (no
- * index scan, no parallel plan), and compares the distances in order, then
- * the rows with a distance (rows of equal distance may come in either order,
- * and from either participant), then the count of the rest (NULL vectors);
- * and says how the first plan scanned the vectors (ps_how()).  A row two
+ * index scan, no parallel plan, and pg_lion.vector_postfilter exact, which
+ * sorts a filter LionOrdered does not answer where the default, error, would
+ * fail the query), and compares the distances in order, then the rows with
+ * a distance (rows of equal distance may come in either order, and from
+ * either participant), then the count of the rest (NULL vectors); and says
+ * how the first plan scanned the vectors (ps_how()).  A row two
  * participants both returned would be a mismatch.
  */
 CREATE FUNCTION ps_cmp(q text) RETURNS text
@@ -105,7 +107,8 @@ DECLARE
 						  current_setting('enable_bitmapscan'),
 						  current_setting('enable_indexscan'),
 						  current_setting('enable_sort'),
-						  current_setting('max_parallel_workers_per_gather')];
+						  current_setting('max_parallel_workers_per_gather'),
+						  current_setting('pg_lion.vector_postfilter')];
 BEGIN
 	EXECUTE w INTO ad, ai;
 	PERFORM set_config('enable_seqscan', 'on', true);
@@ -113,12 +116,14 @@ BEGIN
 	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('enable_sort', 'on', true);
 	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+	PERFORM set_config('pg_lion.vector_postfilter', 'exact', true);
 	EXECUTE w INTO bd, bi;
 	PERFORM set_config('enable_seqscan', saved[1], true);
 	PERFORM set_config('enable_bitmapscan', saved[2], true);
 	PERFORM set_config('enable_indexscan', saved[3], true);
 	PERFORM set_config('enable_sort', saved[4], true);
 	PERFORM set_config('max_parallel_workers_per_gather', saved[5], true);
+	PERFORM set_config('pg_lion.vector_postfilter', saved[6], true);
 
 	IF ad IS DISTINCT FROM bd THEN
 		RETURN format('MISMATCH: %s rows, %s by the sort; distances %s / %s',
@@ -430,10 +435,11 @@ SELECT op, k, ps_cmp(format('SELECT id, v %s ps_vec(4, 24)::halfvec AS d FROM ps
 (4 rows)
 
 DROP TABLE psh;
--- a filter.  Under pg_lion.vector_postfilter = exact, the default, no plan
--- filters the parallel scan's rows any more than the serial scan's: a
--- filter lion answers goes through LionOrdered, which is serial, and any
--- other gets a sort of its rows; their answers are the sort's
+-- a filter.  Under pg_lion.vector_postfilter error, the default, and exact
+-- no plan filters the parallel scan's rows any more than the serial scan's:
+-- a filter lion answers goes through LionOrdered, which is serial, and any
+-- other fails, the parallel scan being no way round it, or under exact gets
+-- a sort of its rows; their answers are the sort's
 SELECT * FROM ps_plan('SELECT id FROM ps WHERE cat = 3 ORDER BY v <-> ps_vec(4, 24) LIMIT 10');
                 ps_plan                
 ---------------------------------------
@@ -445,6 +451,9 @@ SELECT * FROM ps_plan('SELECT id FROM ps WHERE cat = 3 ORDER BY v <-> ps_vec(4, 
          Lion Indexes: ps_cat
 (6 rows)
 
+SELECT ps_how('SELECT id FROM ps WHERE id % 7 = 1 ORDER BY v <-> ps_vec(4, 24) LIMIT 10') AS plan;
+ERROR:  lionvec index "ps_l2" would apply the filter after its nearest-neighbour scan
+SET pg_lion.vector_postfilter = exact;
 SELECT ps_how('SELECT id FROM ps WHERE id % 7 = 1 ORDER BY v <-> ps_vec(4, 24) LIMIT 10') AS plan;
   plan  
 --------
@@ -484,8 +493,19 @@ SELECT ps_cmp('SELECT id, v <-> ps_vec(4, 24) AS d FROM ps WHERE id % 7 = 1
 
 RESET pg_lion.enable_ordered_scan;
 RESET pg_lion.vector_postfilter;
--- prefetch, and none: the same rows, in parallel at this margin ...
+-- reads ahead each way, and none: the same rows, in parallel at this
+-- margin ...
 SET pg_lion.vector_prefetch = off;
+SELECT op, ps_cmp(format('SELECT id, v %s ps_vec(4, 24) AS d FROM ps
+						  ORDER BY v %s ps_vec(4, 24) LIMIT 100', op, op)) AS result
+  FROM (VALUES ('<->'), ('<=>')) o(op) ORDER BY op;
+ op  |                         result                         
+-----+--------------------------------------------------------
+ <-> | Gather Merge, Parallel Index Scan: the sort's 100 rows
+ <=> | Gather Merge, Parallel Index Scan: the sort's 100 rows
+(2 rows)
+
+SET pg_lion.vector_prefetch = fadvise;
 SELECT op, ps_cmp(format('SELECT id, v %s ps_vec(4, 24) AS d FROM ps
 						  ORDER BY v %s ps_vec(4, 24) LIMIT 100', op, op)) AS result
   FROM (VALUES ('<->'), ('<=>')) o(op) ORDER BY op;
@@ -520,17 +540,21 @@ DECLARE
 	a int[] := ps_ids(q);
 	b int[];
 	c int[];
+	d int[];
 	saved text[] := ARRAY[current_setting('pg_lion.vector_prefetch'),
 						  current_setting('effective_io_concurrency')];
 BEGIN
 	PERFORM set_config('pg_lion.vector_prefetch', 'off', true);
 	b := ps_ids(q);
+	PERFORM set_config('pg_lion.vector_prefetch', 'fadvise', true);
+	d := ps_ids(q);
 	PERFORM set_config('pg_lion.vector_prefetch', saved[1], true);
 	PERFORM set_config('effective_io_concurrency', '0', true);
 	c := ps_ids(q);
 	PERFORM set_config('effective_io_concurrency', saved[2], true);
 	RETURN format('%s rows, %s', cardinality(a),
-				  CASE WHEN a = b AND a = c THEN 'the same with no prefetch'
+				  CASE WHEN a = b AND a = c AND a = d
+				  THEN 'the same asking the kernel, and with no prefetch'
 				  ELSE 'MISMATCH' END);
 END $$;
 CREATE TABLE ps_serial (q text);
@@ -541,28 +565,75 @@ INSERT INTO ps_serial VALUES
 	('SELECT id FROM ps WHERE cat = 3 ORDER BY v <-> ps_vec(4, 24) LIMIT 10'),
 	('SELECT id FROM ps WHERE cat IN (1, 2, 3, 4, 5, 6) ORDER BY v <=> ps_vec(4, 24) LIMIT 10');
 SELECT q, ps_same(q) AS result FROM ps_serial ORDER BY q;
-                                            q                                            |               result                
------------------------------------------------------------------------------------------+-------------------------------------
- SELECT id FROM ps ORDER BY v <#> ps_vec(5, 24) LIMIT 700                                | 700 rows, the same with no prefetch
- SELECT id FROM ps ORDER BY v <-> ps_vec(4, 24) LIMIT 10                                 | 10 rows, the same with no prefetch
- SELECT id FROM ps ORDER BY v <=> ps_vec(-3, 24, 3.0) LIMIT 10                           | 10 rows, the same with no prefetch
- SELECT id FROM ps WHERE cat = 3 ORDER BY v <-> ps_vec(4, 24) LIMIT 10                   | 10 rows, the same with no prefetch
- SELECT id FROM ps WHERE cat IN (1, 2, 3, 4, 5, 6) ORDER BY v <=> ps_vec(4, 24) LIMIT 10 | 10 rows, the same with no prefetch
+                                            q                                            |                           result                           
+-----------------------------------------------------------------------------------------+------------------------------------------------------------
+ SELECT id FROM ps ORDER BY v <#> ps_vec(5, 24) LIMIT 700                                | 700 rows, the same asking the kernel, and with no prefetch
+ SELECT id FROM ps ORDER BY v <-> ps_vec(4, 24) LIMIT 10                                 | 10 rows, the same asking the kernel, and with no prefetch
+ SELECT id FROM ps ORDER BY v <=> ps_vec(-3, 24, 3.0) LIMIT 10                           | 10 rows, the same asking the kernel, and with no prefetch
+ SELECT id FROM ps WHERE cat = 3 ORDER BY v <-> ps_vec(4, 24) LIMIT 10                   | 10 rows, the same asking the kernel, and with no prefetch
+ SELECT id FROM ps WHERE cat IN (1, 2, 3, 4, 5, 6) ORDER BY v <=> ps_vec(4, 24) LIMIT 10 | 10 rows, the same asking the kernel, and with no prefetch
 (5 rows)
 
 SET pg_lion.vector_exact_rows = 0;
 SET pg_lion.vector_exact_per_partition = 0;
 SELECT q, ps_same(q) AS result FROM ps_serial WHERE q ~ 'WHERE' ORDER BY q;
-                                            q                                            |               result               
------------------------------------------------------------------------------------------+------------------------------------
- SELECT id FROM ps WHERE cat = 3 ORDER BY v <-> ps_vec(4, 24) LIMIT 10                   | 10 rows, the same with no prefetch
- SELECT id FROM ps WHERE cat IN (1, 2, 3, 4, 5, 6) ORDER BY v <=> ps_vec(4, 24) LIMIT 10 | 10 rows, the same with no prefetch
+                                            q                                            |                          result                           
+-----------------------------------------------------------------------------------------+-----------------------------------------------------------
+ SELECT id FROM ps WHERE cat = 3 ORDER BY v <-> ps_vec(4, 24) LIMIT 10                   | 10 rows, the same asking the kernel, and with no prefetch
+ SELECT id FROM ps WHERE cat IN (1, 2, 3, 4, 5, 6) ORDER BY v <=> ps_vec(4, 24) LIMIT 10 | 10 rows, the same asking the kernel, and with no prefetch
 (2 rows)
 
 RESET pg_lion.vector_exact_rows;
 RESET pg_lion.vector_exact_per_partition;
 DROP TABLE ps_serial;
 DROP FUNCTION ps_same(text);
+-- The heap's pages are asked for ahead only where its rows hold their
+-- vectors (lv_vector_inline()): stored PLAIN or MAIN, or within the larger
+-- of TOAST_TUPLE_THRESHOLD and the table's toast_tuple_target.  A vector of
+-- 600 dimensions, 2,408 bytes, goes to TOAST at the defaults and stays in
+-- its row under a target of 8160, where, the threshold alone deciding (as
+-- until 2026-10-17), its pages were not asked for either.  A filter's exact
+-- path asks the kernel for each member's block, one a member here, every
+-- one in shared buffers; the DEBUG1 line counts the asks.
+CREATE TABLE ps_wide (id int PRIMARY KEY, cat int, v vector(600))
+	WITH (toast_tuple_target = 8160, autovacuum_enabled = off);
+CREATE TABLE ps_toast (id int PRIMARY KEY, cat int, v vector(600))
+	WITH (autovacuum_enabled = off);
+INSERT INTO ps_wide SELECT i, i % 3, ps_vec(i, 600) FROM generate_series(1, 60) i;
+INSERT INTO ps_toast SELECT * FROM ps_wide;
+SELECT relname, pg_relation_size(reltoastrelid) > 0 AS "in TOAST"
+  FROM pg_class WHERE relname IN ('ps_wide', 'ps_toast') ORDER BY relname;
+ relname  | in TOAST 
+----------+----------
+ ps_toast | t
+ ps_wide  | f
+(2 rows)
+
+CREATE INDEX ps_wide_cat ON ps_wide USING lion (cat);
+CREATE INDEX ps_wide_v ON ps_wide USING lionvec (v vector_l2_ops) WITH (partitions = 4);
+CREATE INDEX ps_toast_cat ON ps_toast USING lion (cat);
+CREATE INDEX ps_toast_v ON ps_toast USING lionvec (v vector_l2_ops) WITH (partitions = 4);
+SET pg_lion.vector_prefetch = fadvise;
+SET client_min_messages = debug1;
+SELECT count(*) FROM (SELECT id FROM ps_wide WHERE cat = 1
+					   ORDER BY v <-> ps_vec(7, 600) LIMIT 5) s;
+DEBUG:  lionvec scan of "ps_wide_v": 20 members fetched, 5 returned, 20 pages prefetched (0 not in shared buffers)
+ count 
+-------
+     5
+(1 row)
+
+SELECT count(*) FROM (SELECT id FROM ps_toast WHERE cat = 1
+					   ORDER BY v <-> ps_vec(7, 600) LIMIT 5) s;
+DEBUG:  lionvec scan of "ps_toast_v": 20 members fetched, 5 returned, 0 pages prefetched (0 not in shared buffers)
+ count 
+-------
+     5
+(1 row)
+
+RESET client_min_messages;
+RESET pg_lion.vector_prefetch;
+DROP TABLE ps_wide, ps_toast;
 -- at the defaults in parallel, each participant stops by its own rules:
 -- about the serial scan's share of the ten nearest
 SET max_parallel_workers_per_gather = 2;

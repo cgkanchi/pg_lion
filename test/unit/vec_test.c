@@ -3615,12 +3615,14 @@ int_cmp(const void *a, const void *b)
  * empty past it, at block numbers next to 2^32; and lionvec_least() against
  * lionvec_rank(), the same set of places for keys with ties, NaNs and
  * infinities, of lengths up to 300 and every m up to past them, each kept
- * key no later than every key left out.
+ * key no later than every key left out, and put in order by
+ * lionvec_least_order(), lionvec_rank()'s order.
  */
 static void
 test_prefetch(void)
 {
 	bool		ok = true;
+	bool		okord = true;
 	int			trial;
 
 	cur_phase = "prefetch";
@@ -3674,6 +3676,14 @@ test_prefetch(void)
 		ok &= r == want && lionvec_rank(key, n, m, ref) == want;
 		if (r == want)
 		{
+			int		   *ord = (int *) xmalloc(sizeof(int) * Max(r, 1));
+
+			/* ordered, lionvec_rank()'s order to the place */
+			memcpy(ord, idx, sizeof(int) * r);
+			lionvec_least_order(key, ord, r);
+			for (j = 0; j < r; j++)
+				okord &= ord[j] == ref[j];
+			free(ord);
 			qsort(idx, r, sizeof(int), int_cmp);
 			qsort(ref, r, sizeof(int), int_cmp);
 			for (j = 0; j < r; j++)
@@ -3697,6 +3707,18 @@ test_prefetch(void)
 		free(key);
 	}
 	CHECK(ok, "least: lionvec_rank()'s set, each kept key before every key left out");
+	CHECK(okord, "least, ordered: lionvec_rank()'s order, ties by place, NaN last");
+	{
+		double		k2[6] = {3.0, NAN, 1.0, 3.0, -INFINITY, 1.0};
+		int			i2[6] = {5, 3, 1, 0, 4, 2};
+
+		lionvec_least_order(k2, i2, 6);
+		CHECK(i2[0] == 4 && i2[1] == 2 && i2[2] == 5 && i2[3] == 0 && i2[4] == 3 &&
+			  i2[5] == 1, "least, ordered: by key, ties by place, NaN last");
+		lionvec_least_order(k2, i2, 0);
+		lionvec_least_order(k2, i2, 1);
+		CHECK(i2[0] == 4, "least, ordered: none and one left as they are");
+	}
 	CHECK(lionvec_least(NULL, 0, 4, NULL) == 0, "least of no keys");
 	{
 		double		k1[3] = {2.0, 1.0, 3.0};

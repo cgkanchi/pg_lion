@@ -52,6 +52,7 @@
 #include "access/tupdesc.h"
 #include "access/xloginsert.h"
 #include "catalog/index.h"
+#include "catalog/partition.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_opclass.h"
@@ -89,6 +90,7 @@
 #include "utils/wait_event.h"
 
 #include "lion_compat.h"
+#include "lion_readahead.h"
 #include "lion_vec.h"
 
 PG_FUNCTION_INFO_V1(lionvec_handler);
@@ -101,13 +103,38 @@ int			lionvec_patience = LIONVEC_PATIENCE_DEFAULT;
 int			lionvec_exact_rows = LIONVEC_EXACT_DEFAULT;
 double		lionvec_exact_per_part = LIONVEC_EXACT_PER_PART_DEFAULT;
 int			lionvec_overflow = LIONVEC_OVERFLOW_ERROR;
-int			lionvec_postfilter = LIONVEC_POSTFILTER_EXACT;
-bool		lionvec_prefetch = true;
+int			lionvec_postfilter = LIONVEC_POSTFILTER_ERROR;
+int			lionvec_prefetch = LION_READAHEAD_DEFAULT;
 bool		lionvec_parallel_scan = false;
 
 static const struct config_enum_entry lionvec_overflow_options[] = {
 	{"error", LIONVEC_OVERFLOW_ERROR, false},
 	{"stop", LIONVEC_OVERFLOW_STOP, false},
+	{NULL, 0, false}
+};
+
+/*
+ * pg_lion.vector_prefetch's (lion_readahead.h): stream where the server has
+ * read streams, and on 16, which has none, a name for fadvise, so that one
+ * setting serves every major; and on and off as the boolean it was until
+ * 2026-10-17 took them, on the default.  The value a name stands for is what
+ * SHOW prints, by the first entry that has it: on 16 fadvise for stream.
+ */
+static const struct config_enum_entry lionvec_prefetch_options[] = {
+	{"off", LION_READAHEAD_OFF, false},
+	{"fadvise", LION_READAHEAD_FADVISE, false},
+#if PG_VERSION_NUM >= 170000
+	{"stream", LION_READAHEAD_STREAM, false},
+#else
+	{"stream", LION_READAHEAD_FADVISE, true},
+#endif
+	{"on", LION_READAHEAD_DEFAULT, true},
+	{"true", LION_READAHEAD_DEFAULT, true},
+	{"yes", LION_READAHEAD_DEFAULT, true},
+	{"1", LION_READAHEAD_DEFAULT, true},
+	{"false", LION_READAHEAD_OFF, true},
+	{"no", LION_READAHEAD_OFF, true},
+	{"0", LION_READAHEAD_OFF, true},
 	{NULL, 0, false}
 };
 
@@ -243,40 +270,49 @@ lion_vec_init(void)
 	 * a margin of 8, 0.993 of the true ten for 29,075 pages against 0.980
 	 * for 3,483).  The plan must not decide the answer, so by default no
 	 * plan filters a lionvec scan's rows: lion_ordered.c takes the plain
-	 * scan out of a restricted relation's paths.
+	 * scan out of a restricted relation's paths, and a query LionOrdered
+	 * cannot answer then fails at plan time (error, the default since
+	 * 2026-10-17), its hint the subquery that makes the approximation
+	 * explicit; exact plans such a query exactly instead.
 	 */
 	DefineCustomEnumVariable("pg_lion.vector_postfilter",
 							 "What the planner does with a lionvec scan whose rows a filter would test "
 							 "after the scan returns them.",
 							 "A filter lion indexes answer restricts the scan through LionOrdered.  Any other "
 							 "would reject rows the scan has returned, and those rows decide where it stops "
-							 "and which rows it skips, so the answer would depend on the plan.  exact plans "
-							 "such a query exactly instead, by a sort of the filter's rows; error fails it, "
-							 "and suggests a subquery that filters an unfiltered scan's first rows; allow "
-							 "keeps the filtered scan as a plan to choose by cost.",
+							 "and which rows it skips, so the answer would depend on the plan.  error, the "
+							 "default, fails such a query when it is planned, and suggests a subquery that "
+							 "filters an unfiltered scan's first rows; exact plans it exactly instead, by a "
+							 "sort of the filter's rows; allow keeps the filtered scan as a plan to choose "
+							 "by cost.  A clause of the vector column alone (IS NOT NULL, a distance "
+							 "bound) leaves the scan's first rows as they are, and filters its rows "
+							 "under every value.",
 							 &lionvec_postfilter,
-							 LIONVEC_POSTFILTER_EXACT,
+							 LIONVEC_POSTFILTER_ERROR,
 							 lionvec_postfilter_options,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
 
 	/*
-	 * DESIGN.md §44.4, "Prefetch": a cold scan waits on one page read at a
-	 * time, its probes' CODE chains, refines and heap fetches each a read the
-	 * next cannot start before; asked for ahead by effective_io_concurrency
-	 * pages, the kernel reads them meanwhile.  It changes no row returned,
-	 * nor their order: a hint, never a read.
+	 * DESIGN.md §44.4, "Prefetch" and "Read streams": a cold scan waits on
+	 * one page read at a time, its probes' CODE chains, refines and heap
+	 * fetches each a read the next cannot start before; read ahead by
+	 * effective_io_concurrency pages, through a read stream or by asking the
+	 * kernel, they come in meanwhile.  It changes no row returned, nor their
+	 * order: which pages come first, never which are read.
 	 */
-	DefineCustomBoolVariable("pg_lion.vector_prefetch",
-							 "Whether a lionvec scan asks for the pages it will read ahead of reading them.",
+	DefineCustomEnumVariable("pg_lion.vector_prefetch",
+							 "How a lionvec scan reads ahead the pages it will read next.",
 							 "A scan reads its partitions' code pages in runs the build wrote, and refines "
-							 "and fetches rows from the top of its queue; with this on it asks the kernel "
-							 "for the next of those pages, as many as the tablespace's "
-							 "effective_io_concurrency, up to 64 at a time, so that a cold scan does not "
-							 "wait on one read at a time.  The rows returned are the same either way.",
+							 "and fetches rows from the top of its queue.  stream reads the next of those "
+							 "pages through a read stream (PostgreSQL 17 and later), fadvise asks the kernel "
+							 "for them (PrefetchBuffer), off reads each when it comes; as many ahead as the "
+							 "tablespace's effective_io_concurrency, up to 64.  The rows returned are the "
+							 "same whichever it is.",
 							 &lionvec_prefetch,
-							 true,
+							 LION_READAHEAD_DEFAULT,
+							 lionvec_prefetch_options,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
@@ -2987,6 +3023,50 @@ lionvec_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 	table_close(heap, heaplock);
 }
 
+/*
+ * lionvec refuses a table with row-level security enabled, or a partition of
+ * one that has it (DESIGN.md §44.6, "Row-level security"): the policies are a
+ * filter no lion index answers and LionOrdered does not apply, so under
+ * pg_lion.vector_postfilter's default every query a policy applies to would
+ * fail, with a WHERE or without.  lionvecbuild() builds no index on such a
+ * table, and the planner fails a query whose order the index could give
+ * (lion_ordered.c, lion_ordered_set_rel_pathlist()), the owner's too; any
+ * other query of the table is planned as ever.
+ */
+void
+lionvec_refuse_rls(Oid relid, const char *index)
+{
+	List	   *rels = list_make1_oid(relid);
+	ListCell   *lc;
+
+	if (get_rel_relispartition(relid))
+		rels = list_concat(rels, get_partition_ancestors(relid));
+	foreach(lc, rels)
+	{
+		Oid			rel = lfirst_oid(lc);
+		HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(rel));
+		bool		rls;
+
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for relation %u", rel);
+		rls = ((Form_pg_class) GETSTRUCT(tup))->relrowsecurity;
+		ReleaseSysCache(tup);
+		if (!rls)
+			continue;
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("lionvec does not support row-level security"),
+				 rel == relid ?
+				 errdetail("Index \"%s\" is on table \"%s\", which has row-level security enabled.",
+						   index, get_rel_name(relid)) :
+				 errdetail("Index \"%s\" is on table \"%s\", a partition of \"%s\", which has row-level security enabled.",
+						   index, get_rel_name(relid), get_rel_name(rel)),
+				 errhint("Disable row-level security on \"%s\", or index its vectors with another access method.",
+						 get_rel_name(rel))));
+	}
+	list_free(rels);
+}
+
 static IndexBuildResult *
 lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
@@ -3007,6 +3087,7 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	if (RelationGetNumberOfBlocks(index) != 0)
 		elog(ERROR, "index \"%s\" already contains data",
 			 RelationGetRelationName(index));
+	lionvec_refuse_rls(RelationGetRelid(heap), RelationGetRelationName(index));
 
 	memset(&bs, 0, sizeof(bs));
 	bs.index = index;

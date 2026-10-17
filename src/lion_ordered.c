@@ -537,13 +537,76 @@ typedef struct LionTidSet
  */
 #define LO_MERGE_ROOM		32
 
-/* the pieces' slots by key, then slot: (key << 32 | slot) (lo_set_finish()) */
-#define ST_SORT lo_sort_slots
-#define ST_ELEMENT_TYPE uint64
-#define ST_COMPARE(a, b) ((int) (*(a) > *(b)) - (int) (*(a) < *(b)))
-#define ST_SCOPE static
-#define ST_DEFINE
-#include "lib/sort_template.h"
+/*
+ * A key's pieces are merged member by member, not through a bitset image,
+ * when they hold this many members or fewer together (lo_set_finish()):
+ * LION_WIDTH_ARRAY_CARD(1), 256 at 8K, an ARRAY as large as the narrowest
+ * NARROW, so that what the merge leaves is always an ARRAY or a RUN.  Below
+ * it the merge won at every shape measured, 2 to 64 pieces of members in any
+ * block at any offset: 0.9 us against the image's 1.6 for 4 pieces of 256
+ * together, at the worst, and from 30 times faster for a few members.  Past
+ * it a union the image makes a NARROW of had to become one from the merge's
+ * ARRAY, which took 2.5 to 10 us against the image's 1 to 3 (2026-10-17).
+ */
+#define LO_MERGE_DIRECT_MAX	((uint32) LION_WIDTH_ARRAY_CARD(1))
+
+/*
+ * The pieces' slots sorted by key, then slot - (key << 32 | slot), each
+ * value distinct - for lo_set_finish(): src[0 .. n - 1] are merged, a pair of
+ * ascending runs at a time, into dst and back, until one run is left, and
+ * the buffer that holds it is returned (src or dst).  A source hands its
+ * pieces out entry by entry or bucket by bucket, each in ascending key, so
+ * they come as a few long runs - one a summary bucket or entry that
+ * contributed, 4 at u < 0.1 on DBpedia's 115,000 rows, 25 at u < 1.0 - and
+ * this takes a pass or a few; a run of one or two pieces, a range over
+ * unique values, costs a merge sort.  A quicksort of the slots
+ * (sort_template.h) took 180 us for 6,000 pieces in 4 runs, where this takes
+ * 17, 2.4 ms for 45,000 in 25 against 0.34, and 174 us against 109 for runs
+ * of two (2026-10-17): it was 4.7% of the u < 0.1 query, the most of a merge
+ * once the keys were merged member by member.
+ */
+static uint64 *
+lo_merge_slots(uint64 *src, uint64 *dst, int n)
+{
+	for (;;)
+	{
+		int			s = 0;
+		int			m = 1;
+
+		while (m < n && src[m] > src[m - 1])
+			m++;
+		if (m >= n)
+			return src;
+		while (s < n)
+		{
+			int			e = (m < n) ? m + 1 : m;
+			int			a = s;
+			int			b = m;
+			int			d = s;
+
+			/* the run [s, m) and the one after it, [m, e) */
+			while (e < n && src[e] > src[e - 1])
+				e++;
+			while (a < m && b < e)
+				dst[d++] = (src[b] < src[a]) ? src[b++] : src[a++];
+			while (a < m)
+				dst[d++] = src[a++];
+			while (b < e)
+				dst[d++] = src[b++];
+
+			s = e;
+			m = (s < n) ? s + 1 : s;
+			while (m < n && src[m] > src[m - 1])
+				m++;
+		}
+		{
+			uint64	   *swap = src;
+
+			src = dst;
+			dst = swap;
+		}
+	}
+}
 
 /* ---------------------------------------------------------------------
  * Executor state
@@ -2185,9 +2248,9 @@ lo_add_path(RelOptInfo *rel, const CustomPathMethods *methods, List *pathkeys,
  * relation the query restricts has no plain lionvec order among its paths
  * (lo_knn_take()), and its LionOrdered over that order only when lion's set
  * answers every clause - the node's own Filter would post-filter the members
- * the same way.  What is left is exact (a sort of the filter's rows, say), or
- * under error, an error at plan time that suggests the subquery that makes
- * the approximation explicit.
+ * the same way.  What is left is, under error (the default), an error at
+ * plan time that suggests the subquery that makes the approximation
+ * explicit, or under exact an exact plan (a sort of the filter's rows, say).
  * --------------------------------------------------------------------- */
 
 /* Why a lionvec order got no LionOrdered path, for error's message. */
@@ -2219,13 +2282,56 @@ lo_knn_why(LoKnn *knn, LoKnnWhy why)
 }
 
 /*
+ * Is the clause one of the lionvec index's own, which reads no column of the
+ * relation but those the index's key does - the vector's (`v IS NOT NULL`, a
+ * distance bound `v <-> $1 < 0.5`)?  Such a clause may filter the rows the
+ * scan returns under every pg_lion.vector_postfilter (DESIGN.md §44.6,
+ * "Post-filtering"): it rejects NULL vectors, which the scan returns last, or
+ * rows by their distance, which the scan returns in order, so it leaves the
+ * rows the scan finds before it as they were.  A clause of another relation's
+ * columns too (a parameterized path's join clause) is no such clause.
+ */
+static bool
+lo_knn_own(IndexOptInfo *idx, RestrictInfo *rinfo)
+{
+	Bitmapset  *keyattrs = NULL;
+	Bitmapset  *attrs = NULL;
+	int			i;
+
+	if (!bms_equal(rinfo->clause_relids, idx->rel->relids))
+		return false;
+	for (i = 0; i < idx->nkeycolumns; i++)
+		if (idx->indexkeys[i] != 0)
+			keyattrs = bms_add_member(keyattrs, idx->indexkeys[i] -
+									  FirstLowInvalidHeapAttributeNumber);
+	pull_varattnos((Node *) idx->indexprs, idx->rel->relid, &keyattrs);
+	pull_varattnos((Node *) rinfo->clause, idx->rel->relid, &attrs);
+	return !bms_is_empty(attrs) && bms_is_subset(attrs, keyattrs);
+}
+
+/* The clauses of rinfos but the lionvec index's own (lo_knn_own()). */
+static List *
+lo_knn_others(List *rinfos, IndexOptInfo *idx)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	foreach(lc, rinfos)
+		if (!lo_knn_own(idx, lfirst_node(RestrictInfo, lc)))
+			result = lappend(result, lfirst(lc));
+	return result;
+}
+
+/*
  * The clauses a plain scan of a lionvec order would leave to its Filter, as
  * create_indexscan_plan() makes its qpqual: the restriction clauses the
  * index is given (indrestrictinfo, which for a partial index leaves out the
  * ones its predicate implies, check_index_predicates()) and a parameterized
  * path's join clauses, less the pseudoconstant ones a gating Result tests
- * once.  The order has no index clauses (lo_knn_path()), so nothing else
- * comes off.  NIL: the scan returns every row the query keeps.
+ * once and the index's own (lo_knn_own()), which may filter its rows.  The
+ * order has no index clauses (lo_knn_path()), so nothing else comes off.
+ * NIL: the scan returns every row the query keeps, or every row but those
+ * its own clauses reject.
  */
 static List *
 lo_knn_filter(IndexPath *ipath)
@@ -2241,7 +2347,7 @@ lo_knn_filter(IndexPath *ipath)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
-		if (!rinfo->pseudoconstant)
+		if (!rinfo->pseudoconstant && !lo_knn_own(ipath->indexinfo, rinfo))
 			result = lappend(result, rinfo);
 	}
 	return result;
@@ -2349,6 +2455,28 @@ lo_knn_partial(RelOptInfo *rel)
 }
 
 /*
+ * A lionvec order among the relation's paths, serial or partial, or NULL: a
+ * plan could order its rows by that index.
+ */
+static IndexPath *
+lo_knn_first(RelOptInfo *rel)
+{
+	List	   *lists[2] = {rel->pathlist, rel->partial_pathlist};
+	ListCell   *lc;
+
+	for (int i = 0; i < 2; i++)
+		foreach(lc, lists[i])
+		{
+			Path	   *p = (Path *) lfirst(lc);
+
+			if (IsA(p, IndexPath) && lo_knn_path((IndexPath *) p) &&
+				!((IndexPath *) p)->indexinfo->hypothetical)
+				return (IndexPath *) p;
+		}
+	return NULL;
+}
+
+/*
  * Is a lionvec order no Filter follows still among the relation's paths?
  * The serial ones alone: a partial path no Filter follows has the serial
  * path of the same index and clauses beside it.
@@ -2407,13 +2535,16 @@ lo_rinfos_in(List *a, List *b)
  * price decides as for any lion side (lo_cost_knn()): a clause that keeps
  * most rows makes a set costly to build.
  *
+ * The clauses of the lionvec index vidx's own (lo_knn_own()) need no
+ * answer: the node's Filter may apply them.
+ *
  * NULL when an access in cands answers every clause already, or when some
  * clause no lion access answers (or, which should not happen, their AND
  * leaves one); *left is then those clauses, which a plan must filter.
  */
 static Path *
 lo_knn_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
-			 Oid lionam, List **left)
+			 Oid lionam, IndexOptInfo *vidx, List **left)
 {
 	List	   *pool = NIL;
 	List	   *residuals = NIL;
@@ -2428,8 +2559,12 @@ lo_knn_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
 	foreach(lc, rel->baserestrictinfo)
 		if (!lfirst_node(RestrictInfo, lc)->pseudoconstant)
 			rest = lappend(rest, lfirst(lc));
+	rest = lo_knn_others(rest, vidx);
+	if (rest == NIL)
+		return NULL;			/* the scan's own clauses alone */
 	foreach(lc, cands)
-		if (lo_lion_residual(rel, (Path *) lfirst(lc)) == NIL)
+		if (lo_knn_others(lo_lion_residual(rel, (Path *) lfirst(lc)),
+						  vidx) == NIL)
 			return NULL;		/* the pairing has it already */
 
 	/* core's accesses, and each lion index's alone */
@@ -2496,7 +2631,7 @@ lo_knn_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
 	 * clause no access answers is: the query loses LionOrdered over the
 	 * order, which is better than failing it.
 	 */
-	rest = lo_lion_residual(rel, best);
+	rest = lo_knn_others(lo_lion_residual(rel, best), vidx);
 	Assert(rest == NIL);
 	if (rest != NIL)
 	{
@@ -2507,20 +2642,30 @@ lo_knn_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
 }
 
 /*
- * The clauses of `filter` no lion access of rel answers, for error's
- * message: what lo_knn_cover() cannot cover - all of them when the
- * relation has no lion index.
+ * The restriction clauses of rel no lion access answers, for error's
+ * message: what lo_knn_cover() cannot cover - every one but the
+ * pseudoconstant ones when the relation has no lion index.  Of all of them,
+ * not only of the Filter the taken order would have: LionOrdered walks an
+ * order only over a set that answers every clause, so one a partial lionvec
+ * index's predicate implies - no Filter of that index's scan - still keeps
+ * the node from that order when no lion index answers it.  The lionvec index
+ * vidx's own clauses (lo_knn_own()) are none of them.
  */
 static List *
-lo_knn_unanswered(PlannerInfo *root, RelOptInfo *rel, List *filter)
+lo_knn_unanswered(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *vidx)
 {
 	Oid			lionam = lion_get_am_oid();
 	List	   *lionidx = NIL;
+	List	   *rest = NIL;
 	List	   *left;
 	ListCell   *lc;
 
+	foreach(lc, rel->baserestrictinfo)
+		if (!lfirst_node(RestrictInfo, lc)->pseudoconstant)
+			rest = lappend(rest, lfirst(lc));
+	rest = lo_knn_others(rest, vidx);
 	if (!OidIsValid(lionam))
-		return filter;
+		return rest;
 	foreach(lc, rel->indexlist)
 	{
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
@@ -2529,40 +2674,41 @@ lo_knn_unanswered(PlannerInfo *root, RelOptInfo *rel, List *filter)
 			lionidx = lappend(lionidx, idx);
 	}
 	if (lionidx == NIL)
-		return filter;
+		return rest;
 	(void) lo_knn_cover(root, rel, lo_lion_accesses(root, rel, lionidx, NIL,
 													lionam),
-						lionidx, lionam, &left);
-	return lo_rinfos_in(filter, left);
+						lionidx, lionam, vidx, &left);
+	return left;
 }
 
 /* At most this many bytes of the clauses in error's message. */
 #define LO_KNN_CLAUSES_TEXT		512
 
 /*
- * pg_lion.vector_postfilter = error: the relation's lionvec order would be
- * filtered after its scan, and no LionOrdered path restricts the scan
- * instead.  At plan time, so that EXPLAIN says so too.
+ * pg_lion.vector_postfilter = error, the default: the relation's lionvec
+ * order would be filtered after its scan, and no LionOrdered path restricts
+ * the scan instead.  At plan time, so that EXPLAIN says so too.  The hint is
+ * the subquery that filters the first rows of a scan no Filter follows, and
+ * the settings that plan the query exactly or filter the scan's rows.
+ * (Row-level security, whose policies would filter the subquery's scan too,
+ * lionvec refuses before: lionvec_refuse_rls().)
  */
 static void
 lo_knn_error(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			 LoKnn *knn)
 {
 	IndexPath  *ipath = linitial_node(IndexPath, knn->taken);
-	List	   *unanswered = lo_knn_unanswered(root, rel, lo_knn_filter(ipath));
+	List	   *unanswered = lo_knn_unanswered(root, rel, ipath->indexinfo);
 	const char *index = get_rel_name(ipath->indexinfo->indexoid);
 	const char *table = get_rel_name(rte->relid);
-	bool		rls;
 	StringInfoData clauses;
 	ListCell   *lc;
 
-	/* row-level security, which lo_rel_ok() refuses (§30.1) */
-	rls = rte->securityQuals != NIL && knn->why == LO_KNN_RELATION;
 	if (table == NULL)
 		table = rte->eref->aliasname;
 
 	initStringInfo(&clauses);
-	foreach(lc, rls ? NIL : unanswered)
+	foreach(lc, unanswered)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
@@ -2585,9 +2731,6 @@ lo_knn_error(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("lionvec index \"%s\" would apply the filter after its nearest-neighbour scan",
 					index != NULL ? index : "?"),
-			 rls ?
-			 errdetail("Row-level security applies to \"%s\", and LionOrdered, which restricts the scan to the rows that pass a filter, does not scan such a table.",
-					   table) :
 			 unanswered != NIL ?
 			 errdetail("No lion index of \"%s\" answers %s, so LionOrdered cannot restrict the scan to the rows that pass it.",
 					   table, clauses.data) :
@@ -2599,7 +2742,7 @@ lo_knn_error(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			 errdetail("Lion's set of the rows that pass the filter would not fit in hash_mem (work_mem times hash_mem_multiplier), so LionOrdered cannot restrict the scan to them.") :
 			 errdetail("LionOrdered, which restricts the scan to the rows that pass a filter, does not scan \"%s\" in this query.",
 					   table),
-			 errhint("Filter the first rows of a nearest-neighbour subquery instead, which makes the approximation explicit: SELECT ... FROM (SELECT ..., <distance> AS d FROM %s [WHERE <clauses lion indexes answer>] ORDER BY d LIMIT 1000) s WHERE <the other clauses> ORDER BY d LIMIT 10.  pg_lion.vector_postfilter = exact plans the query exactly instead, and allow filters the rows the scan returns.",
+			 errhint("Filter the first rows of a nearest-neighbour subquery instead, which makes the approximation explicit: SELECT ... FROM (SELECT ..., <distance> AS d FROM %s [WHERE <clauses lion indexes answer>] ORDER BY d LIMIT 1000) s WHERE <the other clauses> ORDER BY d LIMIT 10.  For an exact answer, a sort of the rows that pass the filter, set pg_lion.vector_postfilter to exact; to filter the rows the scan returns, set it to allow.",
 					 table)));
 }
 
@@ -2779,7 +2922,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 
 			if (!lo_knn_path((IndexPath *) lfirst(lc)))
 				continue;
-			cover = lo_knn_cover(root, rel, cands, lionidx, lionam, &left);
+			cover = lo_knn_cover(root, rel, cands, lionidx, lionam,
+								 ((IndexPath *) lfirst(lc))->indexinfo, &left);
 			if (cover != NULL)
 				knncands = lappend(list_copy(cands), cover);
 			break;
@@ -2808,13 +2952,13 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			if (lo_knn_path(ord))
 			{
 				/*
-				 * Only over a set that answers every clause, unless
-				 * pg_lion.vector_postfilter is allow: the node's own Filter
-				 * would reject members the scan has returned, which ends its
-				 * pause and moves its frontier as the plain scan's Filter
-				 * does (§44.6, "Post-filtering").
+				 * Only over a set that answers every clause but the index's
+				 * own (lo_knn_own()), unless pg_lion.vector_postfilter is
+				 * allow: the node's own Filter would reject members the scan
+				 * has returned, which ends its pause and moves its frontier
+				 * as the plain scan's Filter does (§44.6, "Post-filtering").
 				 */
-				if (residual != NIL &&
+				if (lo_knn_others(residual, ord->indexinfo) != NIL &&
 					lionvec_postfilter != LIONVEC_POSTFILTER_ALLOW)
 					continue;
 				/* a lionvec index returns no values: heap mode (§44.6) */
@@ -2959,19 +3103,29 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
  * order that a Filter would follow (lo_knn_take(); DESIGN.md §44.6,
  * "Post-filtering").  pg_lion.enable_ordered_scan = off takes LionOrdered
  * away, not the rule: such a query then gets an exact plan, or the error.
- * Under error a relation whose lionvec order had to go, with no LionOrdered
- * over it and no other lionvec order left (a partial index's, whose
- * predicate implies every clause), fails the query here.  The partial paths
- * of the orders left then get their parallel cost (lo_knn_partial()).
+ * Under error, the default, a relation whose lionvec order had to go, with
+ * no LionOrdered over it and no other lionvec order left (a partial index's,
+ * whose predicate implies every clause), fails the query here.  The partial
+ * paths of the orders left then get their parallel cost (lo_knn_partial()).
+ * Before all that, under every setting, a lionvec order of a table with
+ * row-level security fails the query (lionvec_refuse_rls()).
  */
 static void
 lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 							  RangeTblEntry *rte)
 {
 	LoKnn		knn;
+	IndexPath  *first;
 
 	if (lion_prev_set_rel_pathlist_hook != NULL)
 		lion_prev_set_rel_pathlist_hook(root, rel, rti, rte);
+
+	if (rte->rtekind == RTE_RELATION && (first = lo_knn_first(rel)) != NULL)
+	{
+		const char *index = get_rel_name(first->indexinfo->indexoid);
+
+		lionvec_refuse_rls(rte->relid, index != NULL ? index : "?");
+	}
 
 	memset(&knn, 0, sizeof(knn));
 	knn.why = LO_KNN_NONE;
@@ -3435,17 +3589,35 @@ lo_set_push(LionOrderedState *st, LionTidSet *set, uint32 ckey,
  * scan of the same range (2026-09-25 second review).
  *
  * The entries the last merge left, [0, nmerged), are in order already: only
- * the pieces after them are sorted, by key and slot packed into a word, and
- * the two runs merged.  A sort of every slot through a comparator that read
- * the keys was most of what a merge cost (2026-10-16).
+ * the pieces after them are sorted, by key and slot packed into a word
+ * (lo_merge_slots()), and the two runs merged.  A sort of every slot through
+ * a comparator that read the keys was most of what a merge cost (2026-10-16).
+ *
+ * A key whose pieces hold LO_MERGE_DIRECT_MAX members or fewer together is
+ * merged member by member instead (lion_container_or_merge()), which is what
+ * the image would have made, byte for byte.  A summary's buckets and entries
+ * each cover every heap block of a column spread evenly over the table, so a
+ * filter brings a few pieces of a few members to every container key: 3.5
+ * pieces of 6.5 members at u < 0.1 on DBpedia's 115,000 rows of one row a
+ * heap page, 1,800 keys, and at u < 1.0 25 pieces of 64.  The image cost
+ * 8 KB of passes a key whatever it held - a 4 KB clear, then the count, the
+ * runs and the members of optimize() over the 4 KB of a BITSET - and the
+ * merges were 36% of a 9.7 ms query at u < 0.1, a cost of the keys, not of
+ * the members (2026-10-17).  The merge of the members costs 40 ns for 3
+ * pieces of 6 members against the image's 1.2 us, and 0.2 us for 25 of 64
+ * against 1.4; the query took 9.5 -> 6.6 ms at u < 0.1, and 14.3 -> 11.6 at
+ * u < 1.0.
  */
 static void
 lo_set_finish(LionOrderedState *st, LionTidSet *set)
 {
 	int		   *order;
 	uint64	   *packed;
+	uint64	   *spare;
+	uint64	   *sorted;
 	uint32	   *keys;
 	LionContainer **conts;
+	const LionContainer **group;
 	uint64	   *img;
 	LionContainer *out;
 	int			npieces;
@@ -3465,10 +3637,12 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 	npieces = set->n - set->nmerged;
 	packed = (uint64 *) MemoryContextAllocHuge(st->buildcxt,
 											   sizeof(uint64) * Max(npieces, 1));
+	spare = (uint64 *) MemoryContextAllocHuge(st->buildcxt,
+											  sizeof(uint64) * Max(npieces, 1));
 	for (i = 0; i < npieces; i++)
 		packed[i] = ((uint64) set->keys[set->nmerged + i] << 32) |
 			(uint64) (uint32) (set->nmerged + i);
-	lo_sort_slots(packed, npieces);
+	sorted = lo_merge_slots(packed, spare, npieces);
 
 	/* the merged entries before the pieces at an equal key, as by slot */
 	order = (int *) MemoryContextAllocHuge(st->buildcxt, sizeof(int) * set->n);
@@ -3477,17 +3651,21 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 	for (i = 0; i < set->n; i++)
 	{
 		if (b >= npieces ||
-			(a < set->nmerged && set->keys[a] <= (uint32) (packed[b] >> 32)))
+			(a < set->nmerged && set->keys[a] <= (uint32) (sorted[b] >> 32)))
 			order[i] = a++;
 		else
-			order[i] = (int) (uint32) packed[b++];
+			order[i] = (int) (uint32) sorted[b++];
 	}
 	pfree(packed);
+	pfree(spare);
 
 	keys = (uint32 *) MemoryContextAllocHuge(st->setcxt,
 											 sizeof(uint32) * set->cap);
 	conts = (LionContainer **)
 		MemoryContextAllocHuge(st->setcxt, sizeof(LionContainer *) * set->cap);
+	group = (const LionContainer **)
+		MemoryContextAllocHuge(st->buildcxt,
+							   sizeof(LionContainer *) * set->n);
 	img = (uint64 *) MemoryContextAlloc(st->buildcxt, LION_BITSET_BYTES);
 	out = (LionContainer *) MemoryContextAlloc(st->buildcxt,
 											   LION_CONTAINER_MAX_SIZE);
@@ -3509,12 +3687,25 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 		else
 		{
 			int			m;
+			uint32		members = 0;
 			Size		size;
 
-			memset(img, 0, LION_BITSET_BYTES);
-			for (m = i; m < j; m++)
-				lion_container_or_into_bitset(set->conts[order[m]], img);
-			lion_bits_to_container(img, key, out);
+			/* summed only until past the bound: a key may have many pieces */
+			for (m = i; m < j && members <= LO_MERGE_DIRECT_MAX; m++)
+				members += set->conts[order[m]]->cardinality;
+			if (members <= LO_MERGE_DIRECT_MAX)
+			{
+				for (m = i; m < j; m++)
+					group[m - i] = set->conts[order[m]];
+			}
+			if (members > LO_MERGE_DIRECT_MAX ||
+				!lion_container_or_merge(group, (uint32) (j - i), key, out))
+			{
+				memset(img, 0, LION_BITSET_BYTES);
+				for (m = i; m < j; m++)
+					lion_container_or_into_bitset(set->conts[order[m]], img);
+				lion_bits_to_container(img, key, out);
+			}
 			size = lion_container_size(out);
 			conts[n] = (LionContainer *) MemoryContextAlloc(st->setcxt, size);
 			memcpy(conts[n], out, size);
@@ -3538,6 +3729,7 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 	pfree(set->keys);
 	pfree(set->conts);
 	pfree(order);
+	pfree(group);
 	pfree(img);
 	pfree(out);
 	set->keys = keys;
