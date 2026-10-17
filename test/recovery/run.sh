@@ -2545,7 +2545,7 @@ phase5() {
 		GENERIC_TOTAL=$((GENERIC_TOTAL + ${ev#* }))
 		run_check "phase 5 round $it post-recovery" psql_p "select * from lv_rec_check(true, false)"
 		ck=$NCHECKS
-		psql_p -c "VACUUM lv_rec" >>"$RUNLOG" 2>&1
+		psql_p -c "VACUUM (INDEX_CLEANUP ON) lv_rec" >>"$RUNLOG" 2>&1
 		run_check "phase 5 round $it post-vacuum" psql_p "select * from lv_rec_check(true, true)"
 		nrows=$(psql_p -tAc "select count(*) from lv_rec")
 		log "phase 5 round $it: crash=$style index_wal_replayed=${ev#* } rows=$nrows checks=$((ck + NCHECKS))"
@@ -2575,7 +2575,7 @@ phase5() {
 		ev=$(recovery_evidence "$off") || exit 1
 		run_check "phase 5 unlocated" psql_p "select * from lv_rec_unlocated(-1000)"
 		run_check "phase 5 unlocated, the rest" psql_p "select * from lv_rec_check(true, false)"
-		psql_p -c "VACUUM lv_rec" >>"$RUNLOG" 2>&1
+		psql_p -c "VACUUM (INDEX_CLEANUP ON) lv_rec" >>"$RUNLOG" 2>&1
 		run_check "phase 5 unlocated, vacuumed" psql_p "select * from lv_rec_check(true, true)"
 		log "phase 5: the insert parked before its entry came back aborted, without it, and the scans passed it over"
 		SUMMARY+=("phase5 unlocated    an insert cut before its LOC entry: its row aborted, the scans the same")
