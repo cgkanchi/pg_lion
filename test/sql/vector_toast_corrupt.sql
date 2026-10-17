@@ -2,8 +2,8 @@
 -- wrong is a read that fails its checks, and the scan reads that row from
 -- the heap, as it would have without one; only an entry that would make the
 -- scan return another row's vector, or one that is not an entry at all, is
--- an ERROR.  And a format-4 index, from before the locator, is read, kept
--- up and vacuumed as one without a locator, until a REINDEX.
+-- an ERROR.  And a format-4 index, from before the locator, is refused
+-- until a REINDEX.
 --
 -- As in corrupt.sql, the pages are damaged ON DISK, under the server: each
 -- case writes the index out and drops its pages from the buffer pool
@@ -349,36 +349,18 @@ SELECT tc_cmp(:'qe', true) AS exact, tc_cmp(:'qp', false) AS probed;
 DROP TABLE tc;
 
 -- ---------- 9. a format-4 index ----------
--- built over vectors in their rows (PLAIN): no locator, and its REFINE
--- items no places; its meta page then made format 4's, which ends before
--- the locator's fields (pd_lower 104, from 136)
-CREATE TABLE tc4 (id int, cat int, v vector(1536)) WITH (autovacuum_enabled = off);
-ALTER TABLE tc4 ALTER COLUMN v SET STORAGE PLAIN;
-INSERT INTO tc4 SELECT i, i % 10, tc_vec(i, 1536) FROM generate_series(1, 100) i;
-CREATE INDEX tc4_cat ON tc4 USING lion (cat);
+-- from before the locator: refused with the REINDEX hint, as format 3 is
+CREATE TABLE tc4 (id int, v vector(1536)) WITH (autovacuum_enabled = off);
+INSERT INTO tc4 SELECT i, tc_vec(i, 1536) FROM generate_series(1, 100) i;
 CREATE INDEX tc4_v ON tc4 USING lionvec (v) WITH (partitions = 2);
 ANALYZE tc4;
-SELECT tc_meta('tc4_v');
+SET enable_seqscan = off;
 SELECT tc_evict('tc4_v');
 SELECT tc_poke('tc4_v', 0, 28, tc_le16(4));
-SELECT tc_poke('tc4_v', 0, 12, tc_le16(104));
-SELECT tc_poke('tc4_v', 0, 104, '\x0000000000000000000000000000000000000000000000000000000000000000'::bytea);
-SELECT tc_meta('tc4_v');
--- vectors in TOAST from now on, which the index does not locate
-ALTER TABLE tc4 ALTER COLUMN v SET STORAGE EXTERNAL;
-INSERT INTO tc4 SELECT i, i % 10, tc_vec(i, 1536) FROM generate_series(101, 200) i;
-SELECT tc_cmp('SELECT id, v <-> tc_vec(113, 1536) AS d FROM tc4 WHERE cat = 3 ORDER BY v <-> tc_vec(113, 1536)', true) AS exact,
-	   tc_cmp('SELECT id, v <-> tc_vec(113, 1536) AS d FROM tc4 ORDER BY v <-> tc_vec(113, 1536) LIMIT 10', false) AS probed;
-DELETE FROM tc4 WHERE id % 3 = 0;
-VACUUM tc4;
-SELECT tc_meta('tc4_v');
-SELECT tc_cmp('SELECT id, v <-> tc_vec(113, 1536) AS d FROM tc4 WHERE cat = 3 ORDER BY v <-> tc_vec(113, 1536)', true) AS exact,
-	   tc_cmp('SELECT id, v <-> tc_vec(113, 1536) AS d FROM tc4 ORDER BY v <-> tc_vec(113, 1536) LIMIT 10', false) AS probed;
--- a REINDEX writes format 5, and a locator of the rows in TOAST
+SELECT id FROM tc4 ORDER BY v <-> tc_vec(13, 1536) LIMIT 1;
 REINDEX INDEX tc4_v;
-SELECT tc_meta('tc4_v');
-SELECT tc_cmp('SELECT id, v <-> tc_vec(113, 1536) AS d FROM tc4 WHERE cat = 3 ORDER BY v <-> tc_vec(113, 1536)', true) AS exact,
-	   tc_cmp('SELECT id, v <-> tc_vec(113, 1536) AS d FROM tc4 ORDER BY v <-> tc_vec(113, 1536) LIMIT 10', false) AS probed;
+SELECT id FROM tc4 ORDER BY v <-> tc_vec(13, 1536) LIMIT 1;
+RESET enable_seqscan;
 DROP TABLE tc4;
 
 RESET pg_lion.vector_prefetch;

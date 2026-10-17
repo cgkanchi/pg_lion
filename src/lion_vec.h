@@ -54,14 +54,6 @@
 #define LIONVEC_VERSION			5
 #define LIONVEC_METAPAGE		0
 
-/*
- * The format before the locator (DESIGN.md §44.13), which this reads as an
- * index without one: its meta page ends at nregions, the bytes past it the
- * zeros PageInit() left, which lionvec_meta_copy() turns into "no locator".
- * REINDEX writes the current format.
- */
-#define LIONVEC_VERSION_NOLOC	4
-
 /* The rotation's seed.  Kept in the meta page, so it can change later. */
 #define LIONVEC_SEED			0x6c696f6e	/* "lion" */
 

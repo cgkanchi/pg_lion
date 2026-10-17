@@ -790,11 +790,7 @@ lionvec_region_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 	return reg;
 }
 
-/*
- * The meta page checked: this format, or the one before the locator
- * (LIONVEC_VERSION_NOLOC), whose fields past nregions are not read - use
- * lionvec_meta_copy(), which reads them as an index without a locator.
- */
+/* The meta page checked. */
 static void
 lionvec_check_meta(Relation index, Page page)
 {
@@ -806,7 +802,7 @@ lionvec_check_meta(Relation index, Page page)
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a lionvec index",
 						RelationGetRelationName(index))));
-	if (meta->version != LIONVEC_VERSION && meta->version != LIONVEC_VERSION_NOLOC)
+	if (meta->version != LIONVEC_VERSION)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has format version %u, and this pg_lion reads version %d",
@@ -817,20 +813,19 @@ lionvec_check_meta(Relation index, Page page)
 	 * loc_root is not read (§44.13, "A second level"), and a later format
 	 * may set it.
 	 */
-	if (meta->version == LIONVEC_VERSION &&
-		((meta->flags & LIONVEC_META_LOCATOR) != 0 ?
-		 (!BlockNumberIsValid(meta->loc_head) ||
-		  !BlockNumberIsValid(meta->loc_dtail) ||
-		  !BlockNumberIsValid(meta->loc_tail) ||
-		  !OidIsValid(meta->toastrelid) ||
-		  meta->loc_bpages > meta->loc_built ||
-		  (meta->loc_built > 0) != (meta->loc_bpages > 0) ||
-		  meta->refloc_runs > LIONVEC_LOC_MAXRUNS ||
-		  (meta->refloc_runs > 0 && meta->dims == 0)) :
-		 (BlockNumberIsValid(meta->loc_head) ||
-		  BlockNumberIsValid(meta->loc_dtail) ||
-		  BlockNumberIsValid(meta->loc_tail) ||
-		  meta->refloc_runs != 0)))
+	if ((meta->flags & LIONVEC_META_LOCATOR) != 0 ?
+		(!BlockNumberIsValid(meta->loc_head) ||
+		 !BlockNumberIsValid(meta->loc_dtail) ||
+		 !BlockNumberIsValid(meta->loc_tail) ||
+		 !OidIsValid(meta->toastrelid) ||
+		 meta->loc_bpages > meta->loc_built ||
+		 (meta->loc_built > 0) != (meta->loc_bpages > 0) ||
+		 meta->refloc_runs > LIONVEC_LOC_MAXRUNS ||
+		 (meta->refloc_runs > 0 && meta->dims == 0)) :
+		(BlockNumberIsValid(meta->loc_head) ||
+		 BlockNumberIsValid(meta->loc_dtail) ||
+		 BlockNumberIsValid(meta->loc_tail) ||
+		 meta->refloc_runs != 0))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has a malformed meta page",
@@ -846,8 +841,6 @@ lionvec_check_meta(Relation index, Page page)
 		meta->nregions > meta->nparts ||
 		(meta->nparts > 0 && meta->dims == 0) ||
 		(meta->flags & ~(LIONVEC_META_SPILL | LIONVEC_META_LOCATOR)) != 0 ||
-		(meta->version == LIONVEC_VERSION_NOLOC &&
-		 (meta->flags & LIONVEC_META_LOCATOR) != 0) ||
 		((meta->flags & LIONVEC_META_SPILL) != 0 && meta->nparts < 2))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -855,30 +848,12 @@ lionvec_check_meta(Relation index, Page page)
 						RelationGetRelationName(index))));
 }
 
-/*
- * A copy of the meta page, checked, the caller holding a lock on it.  A
- * format-4 index's is read as one without a locator, whose REFINE items
- * carry no place: the fields it lacks read as such, and the rest as they
- * are, so that its scans, inserts and VACUUMs go as they did.
- */
+/* A copy of the meta page, checked, the caller holding a lock on it. */
 void
 lionvec_meta_copy(Relation index, Page page, LionVecMetaData *meta)
 {
 	lionvec_check_meta(index, page);
 	*meta = *LionVecPageGetMeta(page);
-	if (meta->version == LIONVEC_VERSION_NOLOC)
-	{
-		meta->flags &= ~LIONVEC_META_LOCATOR;
-		meta->loc_head = InvalidBlockNumber;
-		meta->loc_dtail = InvalidBlockNumber;
-		meta->loc_tail = InvalidBlockNumber;
-		meta->toastrelid = InvalidOid;
-		meta->loc_built = 0;
-		meta->loc_bpages = 0;
-		meta->loc_root = InvalidBlockNumber;
-		meta->refloc_runs = 0;
-		meta->loc_pad = 0;
-	}
 }
 
 /* A copy of the meta page, read under a share lock. */

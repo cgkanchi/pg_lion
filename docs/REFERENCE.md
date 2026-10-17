@@ -318,8 +318,7 @@ the TOAST index (`pg_lion.vector_toast_direct`, below), checking every chunk and
 the answer is the same. On DBpedia's 115,186 embeddings in TOAST an exact answer over 1% of the rows
 took 68 ms from the disk where it had taken 180, and 8 ms warm where it had taken 14; a probing
 scan, which reads only the rows it reranks so, 6 to 7% less from the disk. An index whose vectors
-lie in their rows keeps none and costs nothing more. An index built before format 5 (2026-10-17) is
-read, kept up and vacuumed as before, without places, until a `REINDEX`.
+lie in their rows keeps none and costs nothing more.
 
 With a `WHERE` that lion indexes answer, `LionOrdered` builds lion's set of the matching rows and
 the scan reads and scores only those (`Custom Scan (LionOrdered)` with `Order By:` in `EXPLAIN`),
