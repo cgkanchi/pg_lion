@@ -21051,7 +21051,9 @@ given (unpredicted, or made while resting), the pages they read ahead and releas
 times one ended and started again - and the heap's asks as
 `H heap pages prefetched (X not in shared buffers)`. On 16, `stream` is accepted and is `fadvise`.
 
-**A parallel scan** (2026-10-16). `amcanparallel`: an unfiltered `ORDER BY` of the distance may be
+**A parallel scan** (2026-10-16). `amcanparallel`: with `pg_lion.vector_parallel_scan` on (off by
+default since 2026-10-17, the measurements below finding it slower everywhere; off, `lo_knn_partial()`
+drops a lionvec order's partial paths), an unfiltered `ORDER BY` of the distance may be
 a Parallel Index Scan under a Gather Merge (§44.7 prices it; a filtered one stays serial, below).
 Each participant - every worker, and the leader unless `parallel_leader_participation` is off -
 runs the whole scan above on its own: it reads the meta page and the PART chain, ranks every
@@ -21552,9 +21554,12 @@ could have lost to; LionOrdered's paths are serial.
   `fadvise` within 5%. So `stream` where the index is read from the disk; `fadvise` where it lives
   in the kernel's cache and not in shared buffers, under `io_uring` above all; `off` where it lives
   in shared buffers.
+- `pg_lion.vector_parallel_scan` (boolean, default off, 2026-10-17): whether a lionvec order gets
+  partial paths at all (§44.4, "A parallel scan"); off because the parallel scan was slower than
+  the serial one on every query measured.
 - core's `max_parallel_workers_per_gather`, `parallel_setup_cost`, `parallel_tuple_cost`,
   `min_parallel_index_scan_size`, `min_parallel_table_scan_size` and the table's
-  `parallel_workers`: whether an unfiltered scan runs in parallel, and in how many processes
+  `parallel_workers`: with `pg_lion.vector_parallel_scan` on, whether an unfiltered scan runs in parallel, and in how many processes
   (§44.7, "A parallel scan"). At the defaults it does not: the setup costs more than a serial
   scan's start-up.
 - `partitions` (reloption, 0 to 262,144, default 0; 1,000,000 until a review found the build at a
@@ -22516,7 +22521,7 @@ inline table's, streamed, took 53; warm it took 11.2 ms against 4.6, detoasting 
   batch of 100, and of 20), the NULL and zero walks, LionOrdered's exact path and, with it off, its
   probes, the REST chain, a nested loop's rescans, at `effective_io_concurrency` 8, 1 and 0; cursors
   fetching a row at a time and scrolling; a cursor whose index grows by 3,000 rows between fetches;
-  a parallel scan; chains inserts appended to; half of each relation evicted, the upper and then the
+  a parallel scan (`pg_lion.vector_parallel_scan` on); chains inserts appended to; half of each relation evicted, the upper and then the
   lower, so that within a scan the streams rest and wake and the asks fall dormant and ask again; an
   exact path over 900 members a heap page each, the lower 480 pages evicted, at every even
   `effective_io_concurrency` from 14 to 80, so that the list's stream rests with more blocks in it
