@@ -142,7 +142,7 @@ lionvec_chunk(HeapTuple tup, TupleDesc desc, Oid *valueid, int32 *seq,
 			  char **data, int32 *size)
 {
 	bool		isnull;
-	Pointer		chunk;
+	char	   *chunk;
 	char	   *end = (char *) tup->t_data + tup->t_len;
 
 	if (tup->t_len < SizeofHeapTupleHeader ||
@@ -152,8 +152,8 @@ lionvec_chunk(HeapTuple tup, TupleDesc desc, Oid *valueid, int32 *seq,
 		return false;
 	*valueid = DatumGetObjectId(fastgetattr(tup, 1, desc, &isnull));
 	*seq = DatumGetInt32(fastgetattr(tup, 2, desc, &isnull));
-	chunk = DatumGetPointer(fastgetattr(tup, 3, desc, &isnull));
-	if (chunk < (Pointer) tup->t_data || chunk >= end)
+	chunk = (char *) DatumGetPointer(fastgetattr(tup, 3, desc, &isnull));
+	if (chunk < (char *) tup->t_data || chunk >= end)
 		return false;
 	if (!VARATT_IS_EXTENDED(chunk))
 	{
