@@ -132,7 +132,8 @@ jobs:
       # 1, 1f, 2 and 4 (crash recovery under load, a VACUUM on a server
       # without the resource manager, a hot standby that replays everything
       # the primary writes, and its promotion, and lion_index_verify() on a
-      # standby beside replay) in both WAL modes, with
+      # standby beside replay), and 5 (lionvec's TOAST locator, where
+      # pgvector is installed), in both WAL modes, with
       # wal_consistency_checking, as the source jobs run them.  Phases 1b-1e,
       # 1g and 3 park a backend on an injection point, which the packaged
       # servers cannot.  The extension is already in the packaged prefix
@@ -141,12 +142,12 @@ jobs:
       - name: Crash recovery and standby replay (custom resource manager, consistency checked)
         run: |
           RECOVERY_SKIP_INSTALL=1 ./test/recovery/run.sh --prefix "/usr/lib/postgresql/$PG" \
-            --phases "1 1f 2 4" --mode rmgr --conf "wal_consistency_checking = 'pg_lion'"
+            --phases "1 1f 2 4 5" --mode rmgr --conf "wal_consistency_checking = 'pg_lion'"
 
       - name: Crash recovery and standby replay (generic WAL, consistency checked)
         run: |
           RECOVERY_SKIP_INSTALL=1 ./test/recovery/run.sh --prefix "/usr/lib/postgresql/$PG" \
-            --phases "1 1f 2 4" --conf "wal_consistency_checking = 'generic'"
+            --phases "1 1f 2 4 5" --conf "wal_consistency_checking = 'generic'"
 
       - name: Show regression diffs
         if: failure()

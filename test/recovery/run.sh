@@ -23,9 +23,10 @@
 #              Phase 2 then expects the standby to TRUST the visibility map,
 #              which is the property §25 buys.
 #   --phases   which phases to run, e.g. "3" or "2 3" (default: all of
-#              "1 1b 1c 1d 1e 1f 1g 2 3 4").  For development, and for a server
-#              without injection points, which can run only "1 1f 2 4" (CI's
-#              packaged-server jobs do); `make recovery-check` always runs
+#              "1 1b 1c 1d 1e 1f 1g 2 3 4 5").  For development, and for a
+#              server without injection points, which can run only "1 1f 2 4
+#              5" (CI's packaged-server jobs do; phase 5 then leaves out its
+#              one case that needs them); `make recovery-check` always runs
 #              everything.
 #   --conf     an extra postgresql.conf line for the primary (repeatable),
 #              appended last so it wins.  This is how
@@ -96,6 +97,13 @@
 #            directory leaf while it locked posting pages, which replay locks
 #            the other way round, and the two deadlocked for good.
 #
+#   Phase 5  lionvec's locator of vectors in TOAST (DESIGN.md §44.13): crash
+#            rounds under a write load of its own, an insert cut between its
+#            items and its LOC entry, and a hot standby, each checked by
+#            lionvec.sql's lv_rec_check() - the locator against the heap and
+#            the TOAST relation, and the scans' rows read by place against
+#            the heap's and a sort's.  Needs pgvector; skipped without it.
+#
 # See test/recovery/README.md for what is deliberately not covered.
 #
 # The cluster discipline is bench/lib.sh's: a private socket directory and port
@@ -124,7 +132,7 @@ REQUIRE_INJECTION=${INJECTION_POINTS:-0}
 ITERS=8
 KEEP=0
 MODE=generic
-PHASES="1 1b 1c 1d 1e 1f 1g 2 3 4"
+PHASES="1 1b 1c 1d 1e 1f 1g 2 3 4 5"
 EXTRA_CONF=()
 
 # Set by make_private_dirs(), which the main section calls once the arguments
@@ -2449,6 +2457,162 @@ phase4() {
 	psql_p -c "DROP TABLE sv" >>"$RUNLOG" 2>&1
 }
 
+# ---------------------------------------------------------------- phase 5
+
+# lionvec's locator (DESIGN.md §44.13) through crash recovery and on a hot
+# standby.  An index over vectors in TOAST keeps, for each row, where its
+# value's chunks lie - LOC entries in heap order under a LOCDIR, and the same
+# place in the row's REFINE item - written by the build (log_newpage_range()),
+# by every insert (generic WAL, after the row's REFINE and CODE items, under
+# the meta page's lock) and removed by VACUUM.  None of it may come back
+# wrong: a committed row's entry must be there, name its value and its
+# places, and a scan must read the same rows by place as from the heap.
+#
+#  * Three rounds of a mixed write load (lionvec_writer.sql: inserts,
+#    updates HOT and not, of the vector and of other columns, DELETEs,
+#    rollbacks, INSERT ... SELECT) beside a loop of VACUUMs, of the table
+#    and of its TOAST relation alone, killed as phase 1 kills it, the last
+#    with a VACUUM in flight; each restart must have replayed generic WAL,
+#    and lv_rec_check() (lionvec.sql) passes before and after a VACUUM.  The
+#    writers set wal_consistency_checking = 'generic', so every record they
+#    write carries the page as the primary had it, and recovery compares.
+#  * A crash with an insert parked between its CODE items and its LOC entry
+#    (lionvec-insert-unlocated, injection points only): its row comes back
+#    aborted, with its items and without its entry, which the scans pass
+#    over until VACUUM removes them.
+#  * A hot standby of the result, under the same load: lv_rec_check() on the
+#    standby, its answers the primary's, and after a VACUUM FULL of the
+#    TOAST relation alone - every place stale, the scans falling back - the
+#    same again.
+start_lv_vacuum_loop() {
+	(
+		n=0
+		while :; do
+			if [ $((n % 2)) = 0 ]; then w="VACUUM lv_rec"; else w="VACUUM (PROCESS_MAIN false) lv_rec"; fi
+			"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres \
+				-d "$DBNAME" -c "SET wal_consistency_checking = 'generic'" -c "$w" >/dev/null 2>&1 || true
+			n=$((n + 1))
+			command sleep 0.5
+		done
+	) &
+	VACLOOP=$!
+}
+
+lv_writer() {
+	PGOPTIONS="-c synchronous_commit=on -c wal_consistency_checking=generic" \
+		"$PGBIN/pgbench" -n -T "$1" -c 4 -j 2 -f "$HERE/lionvec_writer.sql" \
+		-h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres "$DBNAME" \
+		>>"$RUNLOG" 2>&1 || die "phase 5: the lionvec writer failed (see $RUNLOG)"
+}
+
+phase5() {
+	local it style off ev nrows ck pid i probe_p probe_s
+	log ""
+	log "=== phase 5: lionvec's TOAST locator through crash recovery and a hot standby ==="
+	if [ "$(psql_p -tAc "select count(*) from pg_available_extensions where name in ('vector', 'pageinspect')" 2>>"$RUNLOG" || true)" != 2 ]; then
+		log "phase 5 skipped: this server has no pgvector or no pageinspect"
+		SUMMARY+=("phase5              skipped (no pgvector or no pageinspect)")
+		return 0
+	fi
+	psql_p -f "$HERE/lionvec.sql" >>"$RUNLOG" 2>&1 || die "phase 5: lionvec.sql failed (see $RUNLOG)"
+	psql_p -c "CHECKPOINT" >>"$RUNLOG" 2>&1
+	run_check "phase 5 baseline" psql_p "select * from lv_rec_check(true, true)"
+	log "phase 5 baseline: $NCHECKS checks ok"
+
+	for it in 1 2 3; do
+		if [ $((it % 2)) -eq 1 ]; then style=immediate; else style=kill9; fi
+		[ "$it" = 3 ] || start_lv_vacuum_loop
+		lv_writer 2
+		stop_vacuum_loop
+		off=$(stat -c %s "$PRIMARY_LOG")
+		if [ "$it" = 3 ]; then
+			"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres -d "$DBNAME" \
+				-c "SET wal_consistency_checking = 'generic'" -c "VACUUM (VERBOSE) lv_rec" >>"$RUNLOG" 2>&1 &
+			VACPID=$!
+			nap 0.3
+		fi
+		"crash_$style"
+		if [ "$it" = 3 ]; then
+			wait "$VACPID" 2>/dev/null || true
+			VACPID=""
+		fi
+		start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+		verify_node psql_p "$PRIMARY_DATA"
+		ev=$(recovery_evidence "$off") || exit 1
+		case ${ev#* } in
+			''|*[!0-9]*) die "phase 5 round $it: unreadable recovery evidence: '$ev'" ;;
+		esac
+		GENERIC_TOTAL=$((GENERIC_TOTAL + ${ev#* }))
+		run_check "phase 5 round $it post-recovery" psql_p "select * from lv_rec_check(true, false)"
+		ck=$NCHECKS
+		psql_p -c "VACUUM lv_rec" >>"$RUNLOG" 2>&1
+		run_check "phase 5 round $it post-vacuum" psql_p "select * from lv_rec_check(true, true)"
+		nrows=$(psql_p -tAc "select count(*) from lv_rec")
+		log "phase 5 round $it: crash=$style index_wal_replayed=${ev#* } rows=$nrows checks=$((ck + NCHECKS))"
+		SUMMARY+=("phase5 round $it      crash=$style index_wal_replayed=${ev#* } rows=$nrows checks=$((ck + NCHECKS))")
+	done
+
+	# The insert parked between its items and its entry, and the crash.
+	if [ "$(psql_p -tAc "select count(*) from pg_available_extensions where name = 'injection_points'" 2>>"$RUNLOG" || true)" = 1 ]; then
+		psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1
+		"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres -d "$DBNAME" \
+			-c "SELECT injection_points_set_local()" \
+			-c "SELECT injection_points_attach('lionvec-insert-unlocated', 'wait')" \
+			-c "INSERT INTO lv_rec VALUES (-1000, 3, 'p', lv_rec_vec(-1000))" >>"$RUNLOG" 2>&1 &
+		pid=$!
+		wait_true psql_p "select count(*) > 0 from pg_stat_activity where wait_event = 'lionvec-insert-unlocated'" \
+			60 "the insert to park at lionvec-insert-unlocated"
+		# A commit after it flushes its records, so that replay brings back
+		# its items (into another table: the parked insert holds lv_rec_v's
+		# meta page).
+		psql_p -c "SET synchronous_commit = on" -c "CREATE TABLE lv_rec_flush (i int)" >>"$RUNLOG" 2>&1 ||
+			die "phase 5: the flushing commit failed"
+		off=$(stat -c %s "$PRIMARY_LOG")
+		crash_immediate
+		wait "$pid" 2>/dev/null || true
+		start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+		verify_node psql_p "$PRIMARY_DATA"
+		ev=$(recovery_evidence "$off") || exit 1
+		run_check "phase 5 unlocated" psql_p "select * from lv_rec_unlocated(-1000)"
+		run_check "phase 5 unlocated, the rest" psql_p "select * from lv_rec_check(true, false)"
+		psql_p -c "VACUUM lv_rec" >>"$RUNLOG" 2>&1
+		run_check "phase 5 unlocated, vacuumed" psql_p "select * from lv_rec_check(true, true)"
+		log "phase 5: the insert parked before its entry came back aborted, without it, and the scans passed it over"
+		SUMMARY+=("phase5 unlocated    an insert cut before its LOC entry: its row aborted, the scans the same")
+	else
+		no_injection_points "phase 5 (the unlocated insert)" "phase5 unlocated    skipped (no injection points)"
+	fi
+
+	# A hot standby of its own, under the same load.
+	stop_hard "$STANDBY_DATA"
+	rm -rf "$STANDBY_DATA"
+	basebackup_standby
+	lv_writer 2
+	psql_p -c "SET wal_consistency_checking = 'generic'" -c "VACUUM (PROCESS_MAIN false) lv_rec" >>"$RUNLOG" 2>&1
+	lv_writer 1
+	wait_catchup
+	run_check "phase 5 standby" psql_s "select * from lv_rec_check(true, false)"
+	ck=$NCHECKS
+	probe_p=$BASE/lv_probe_primary.txt
+	probe_s=$BASE/lv_probe_standby.txt
+	psql_p -tAc "select * from lv_rec_check(true, false)" >"$probe_p"
+	psql_s -tAc "select * from lv_rec_check(true, false)" >"$probe_s"
+	diff -u "$probe_p" "$probe_s" >>"$RUNLOG" 2>&1 ||
+		die "phase 5: the standby's checks do not read as the primary's (see $RUNLOG)"
+	# Every place stale: the TOAST relation rewritten on its own.
+	psql_p -c "SET wal_consistency_checking = 'generic'" \
+		-c "VACUUM FULL $(psql_p -tAc "select reltoastrelid::regclass from pg_class where oid = 'lv_rec'::regclass")" \
+		>>"$RUNLOG" 2>&1 || die "phase 5: VACUUM FULL of the TOAST relation failed"
+	lv_writer 1
+	wait_catchup
+	run_check "phase 5 standby, TOAST rewritten" psql_s "select * from lv_rec_check(false, false)"
+	run_check "phase 5 primary, TOAST rewritten" psql_p "select * from lv_rec_check(false, false)"
+	stop_hard "$STANDBY_DATA"
+	log "phase 5 standby: $ck checks ok, the primary's answers, and the same after the TOAST relation's rewrite"
+	SUMMARY+=("phase5 standby      $ck checks ok in recovery, and after a rewrite of the TOAST relation")
+	psql_p -c "DROP TABLE IF EXISTS lv_rec, lv_rec_flush" >>"$RUNLOG" 2>&1
+}
+
 # ---------------------------------------------------------------- main
 
 mkdir -p "$LOGDIR"
@@ -2497,6 +2661,7 @@ want_phase 1g && phase1g
 want_phase 2 && phase2
 want_phase 3 && phase3
 want_phase 4 && phase4
+want_phase 5 && phase5
 
 END=$(now_ms)
 NWARN=$(wc -l <"$BASE/warnings.txt")
