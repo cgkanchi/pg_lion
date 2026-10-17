@@ -37,8 +37,8 @@ before 1.0; a release that changes it will say so, and the indexes will need a `
 | --- | --- |
 | Dashboards, facet counts, `GROUP BY` over large tables | **Lion.** This is what it is for. |
 | Range counts on a column with many distinct values (timestamps, ids) | Lion `WITH (summaries = auto)` |
-| Array membership and full-text search, especially counts | Lion. Add `store_positions = true` for phrases and ranking. |
-| jsonb `@>`, `?` and jsonpath filters, especially counts | Lion with `jsonb_contains_ops` |
+| Array membership and full-text search, especially counts | Lion. Phrases and ranking come from the index too. |
+| jsonb `@>`, `?` and jsonpath filters, especially counts | Lion |
 | Unique constraints, or `ORDER BY col LIMIT n` on a single column | B-tree |
 | Returning many filtered rows in order | A covering B-tree, which lion can filter as it walks it (see below) |
 | Write-heavy tables | Measure first. Lion inserts are slower than B-tree. |
@@ -137,8 +137,8 @@ B-tree, so the heap is read only for pages that aren't all-visible.
 ### Arrays and full-text search
 
 ```sql
-CREATE INDEX docs_tags ON docs USING lion (tags);                                   -- any array
-CREATE INDEX docs_tsv  ON docs USING lion (tsv) WITH (store_positions = true);      -- tsvector
+CREATE INDEX docs_tags ON docs USING lion (tags);    -- any array
+CREATE INDEX docs_tsv  ON docs USING lion (tsv);     -- tsvector
 
 SELECT count(*) FROM docs WHERE tags @> '{postgres,index}';
 SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('english', 'roaring & bitmap');
@@ -148,29 +148,32 @@ SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('english', 'roaring <-> bitmap
 Lion uses PostgreSQL's own operators and types, and returns exactly the rows a sequential scan or a
 GIN index would. A fuzz test in CI checks this against both.
 
-AND/OR queries are answered from the index alone. Phrases (`<->`), weights (`:A`) and NOT need
-`store_positions = true`. Without it they still work, but each candidate row is rechecked in the
-heap, as GIN does. Storing positions roughly doubles the index size. A prefix (`foo:*`) is answered
-from the index too, as the OR of the indexed words that start with `foo`, unless it matches more than
-1000 words; then lion rechecks rows, and GIN is faster.
+AND/OR queries are answered from the index alone, and so are phrases (`<->`), weights (`:A`) and
+NOT, because a `tsvector` index stores every word's positions by default. Storing positions roughly
+doubles the index size; `WITH (store_positions = off)` leaves them out, and then phrases, weights
+and NOT still work, but each candidate row is rechecked in the heap, as GIN does. A prefix
+(`foo:*`) is answered from the index too, as the OR of the indexed words that start with `foo`,
+unless it matches more than 1000 words; then lion rechecks rows, and GIN is faster.
 
 ### jsonb
 
 ```sql
-CREATE INDEX docs_doc ON docs USING lion (doc jsonb_contains_ops);
+CREATE INDEX docs_doc ON docs USING lion (doc);
 
 SELECT count(*) FROM docs WHERE doc @> '{"status": "active", "tags": ["sale"]}';
 SELECT count(*) FROM docs WHERE doc ? 'discount' AND doc ?| '{eu,uk}';
 SELECT count(*) FROM docs WHERE doc @@ '$.items[*].sku == "A1"';
 ```
 
-`jsonb_contains_ops` indexes every path to a value in the document, with the value, so `@>`, `?`,
-`?|` and `?&` are answered from the index alone, with the same rows as a sequential scan or GIN.
+The default operator class for `jsonb`, `jsonb_contains_ops`, indexes every path to a value in the
+document, with the value, so `@>`, `?`, `?|` and `?&` are answered from the index alone, with the
+same rows as a sequential scan or GIN.
 The one exception is a query whose array element has two or more fields
 (`{"items": [{"sku": "A", "qty": 2}]}`): the index finds the documents with both, and each one is
 rechecked in the heap to see that they sit in the same element, as GIN does for every `@>`.
 The index is about the size of GIN's `jsonb_ops`. To filter or group on a known field, an
-expression index such as `USING lion ((doc->>'status'))` is smaller.
+expression index such as `USING lion ((doc->>'status'))` is smaller. To compare whole documents
+with `=` or count the distinct ones, name lion's `jsonb_ops`: `USING lion (doc jsonb_ops)`.
 
 jsonpath `@?` and `@@` use the same index, and like GIN, lion rechecks every row it finds in the
 heap. The index narrows the rows on each `path == value` and on each path that must exist. A path
@@ -179,7 +182,7 @@ requires the path to exist. A path with more than 1000 distinct values under it 
 
 ### Ranking with BM25
 
-An index with `store_positions = true` can also rank:
+A `tsvector` index can also rank, from the positions it stores:
 
 ```sql
 SELECT id, title, lion_bm25_score(tsv, q, 'docs_tsv') AS score
@@ -246,8 +249,7 @@ supported, and for a `halfvec` column `halfvec_l2_ops` (the default), `halfvec_i
 ## Supported types
 
 Integers, floats, `numeric`, `bool`, `text`/`varchar`, `char(n)`, `bytea`, `uuid`, dates, times,
-timestamps, `interval`, `inet`, `macaddr`, `jsonb` (whole values, or paths with
-`jsonb_contains_ops`), `pg_lsn`, `oid`, enums, any array, and `tsvector`. Install `pg_lion_citext` for case-insensitive `citext`. Indexes can have several
+timestamps, `interval`, `inet`, `macaddr`, `jsonb` (paths, or whole values with `jsonb_ops`), `pg_lsn`, `oid`, enums, any array, and `tsvector`. Install `pg_lion_citext` for case-insensitive `citext`. Indexes can have several
 columns and can be built in parallel on PostgreSQL 17 and later. `pg_lion_vector` indexes pgvector's
 `vector` and `halfvec` with `lionvec` (one column, built in parallel from PostgreSQL 16; its scans
 can run in parallel too, and ask for the pages they will read before reading them, which cut a

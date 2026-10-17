@@ -108,7 +108,7 @@ SELECT bm_same('w1 | zz3150', '{w1,zz3150}', 40);
 SELECT * FROM lion_bm25('bm_docs_d', 'w1:*', 10);
 SELECT * FROM lion_bm25('bm_docs_d', 'w1', -1);
 SELECT * FROM lion_bm25('bm_docs_d', 'w1', 10, -1);
-CREATE INDEX bm_docs_plain ON bm_docs USING lion (d);
+CREATE INDEX bm_docs_plain ON bm_docs USING lion (d) WITH (store_positions = false);
 SELECT * FROM lion_bm25('bm_docs_plain', 'w1', 10);
 CREATE INDEX bm_docs_btree ON bm_docs (id);
 SELECT * FROM lion_bm25('bm_docs_btree', 'w1', 10);

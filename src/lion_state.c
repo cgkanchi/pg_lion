@@ -436,8 +436,8 @@ lion_fill_column_state(Relation index, LionState *state, AttrNumber attno,
 					   cxt);
 
 		/*
-		 * Stored positions (§17): support proc 5, in an index built with
-		 * store_positions = true, which the meta page records.
+		 * Stored positions (§17): support proc 5, in an index whose build
+		 * stored them, which the meta page records.
 		 */
 		state->positions =
 			(state->ix->meta.order_flags & LION_META_POSITIONS) != 0 &&
@@ -804,12 +804,18 @@ lion_fill_index_state(Relation index, LionIndexState *ix,
 }
 
 /*
- * store_positions = true on an index none of whose columns can store them is
- * a mistake worth saying so about, at build time.
+ * Settle the `store_positions` reloption at build time (§17), once ix has
+ * been filled from a meta page image that asks for positions unless the
+ * option is "off".  A column that can store them then has
+ * LionState.positions set, and an index with one keeps the meta flag.  One
+ * with none clears it, so that the meta page records what the build did:
+ * that is "auto", the default, on an index of no tsvector column.  But
+ * store_positions = on on such an index is a mistake worth saying so about.
  */
 void
-lion_check_store_positions(Relation index, const LionIndexState *ix)
+lion_settle_store_positions(Relation index, LionIndexState *ix)
 {
+	LionOptions *opts = (LionOptions *) index->rd_options;
 	int			i;
 
 	if ((ix->meta.order_flags & LION_META_POSITIONS) == 0)
@@ -817,6 +823,11 @@ lion_check_store_positions(Relation index, const LionIndexState *ix)
 	for (i = 0; i < ix->ncolumns; i++)
 		if (ix->cols[i].positions)
 			return;
+	if (opts == NULL || opts->store_positions != LION_POSOPT_ON)
+	{
+		ix->meta.order_flags &= ~LION_META_POSITIONS;
+		return;
+	}
 	ereport(ERROR,
 			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 			 errmsg("store_positions needs a key column whose operator class can store positions"),
