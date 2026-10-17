@@ -20940,7 +20940,7 @@ block found in shared buffers; once the callback names no block the stream gives
 `read_stream_reset()`, which starts it again from one block ahead. It cannot be paused, and it
 starts no read before its consumer's first pull. A scan's reads fit that only in part. It knows the
 run of the chain it is reading, and in a REST pass the chains it will probe; past those it predicts
-- the REFINE pages at the top of its queues, the next partition's chain - and reads out of the order
+(the REFINE pages at the top of its queues, the next partition's chain) and reads out of the order
 it predicted, some pages never, some it never predicted, as its queues reorder under the rows and
 partitions coming in.
 
@@ -21451,15 +21451,28 @@ could have lost to; LionOrdered's paths are serial.
   away, not the rule: under `exact` or `error` a filtered query then gets an exact plan, or the
   error. A pseudoconstant clause, tested once by a gating Result, and one a partial lionvec
   index's predicate implies are no filter here.
-- `pg_lion.vector_prefetch` (boolean, default on; 2026-10-16): whether a scan asks for the pages
-  it will read next before reading them (§44.4, "Prefetch"), as many ahead as the tablespace's
-  `effective_io_concurrency` (a query's setting; `maintenance_io_concurrency` is not read), to 64;
-  an `effective_io_concurrency` of 0 asks for none either way. The rows a scan returns, and their
-  order, are the same on or off. On DBpedia (§44.9), each query alone cold, it took a serial scan
-  at a margin of 8 from 49.4 ms to 32.4 and the exact path over vectors kept in the heap from 70.6 ms
-  to 33.5 under a 1% filter; warm, every page in shared buffers, it costs about 2% (2.29 to 2.33 ms
-  at a margin of 3, 4.91 to 4.99 at 8): a scan whose asks keep finding their pages in shared
-  buffers mostly stops asking (§44.4, "Prefetch"). Off where that is not worth having.
+- `pg_lion.vector_prefetch` (enum, `off`, `fadvise` or `stream`, default `stream` from 17 and
+  `fadvise` on 16; 2026-10-17, a boolean from 2026-10-16, whose `on`, the default, and `off` it
+  still takes): how a scan reads ahead the pages it will read next (§44.4, "Prefetch" and "Read
+  streams"), as many ahead as the tablespace's `effective_io_concurrency` (a query's setting;
+  `maintenance_io_concurrency` is not read), to 64; an `effective_io_concurrency` of 0 reads none
+  ahead whatever it says. `stream` reads the index's pages, and the exact path's heap pages, through
+  read streams into shared buffers; `fadvise` asks the kernel for them (`PrefetchBuffer()`), as `on`
+  did; `off` reads each when it comes. On 16, which has no read streams, `stream` is `fadvise`, and
+  `SHOW` says so. The rows' heap pages for their exact distances are asked of the kernel under
+  `fadvise` and `stream` alike. The rows a scan returns, and their order, are the same under all
+  three. On DBpedia (§44.9, "Read streams"), each query alone with its pages on the disk, under 18's
+  `io_method = worker`, `stream` took a margin-8 scan to 43.2 ms against `fadvise`'s 47.6 and
+  `off`'s 67.2, a 1% filter's probing to 62.0 against 82.8 and 100.9, and the exact path under it to
+  53.3 against 58.9 and 108.3; a margin-3 scan, 346 pages, about even. With its pages in the
+  kernel's cache, though, a stream's read is an I/O worker's or, under `io_uring`, a kernel
+  thread's, where `ReadBuffer()` copies the page itself: `stream` cost 0 to 40% more than `fadvise`
+  on the index's pages under `worker` and `io_uring` and 2 to 14% under `sync`, and on the exact
+  path half the time under `worker`'s default 3 workers (1.17 times under 16) and one and a half to
+  twice under `io_uring`. Warm, every page in shared buffers, `stream` costs 2 to 11% over `off` and
+  `fadvise` within 5%. So `stream` where the index is read from the disk; `fadvise` where it lives
+  in the kernel's cache and not in shared buffers, under `io_uring` above all; `off` where it lives
+  in shared buffers.
 - core's `max_parallel_workers_per_gather`, `parallel_setup_cost`, `parallel_tuple_cost`,
   `min_parallel_index_scan_size`, `min_parallel_table_scan_size` and the table's
   `parallel_workers`: whether an unfiltered scan runs in parallel, and in how many processes
@@ -22236,7 +22249,22 @@ inline table's, streamed, took 53; warm it took 11.2 ms against 4.6, detoasting 
   items), `lionvec_prefetch_end()`'s window - dist pages after the block, short of the run's end,
   never before the next block, and no block number wrapping at 2^32 - and `lionvec_least()`
   against `lionvec_rank()`'s set over 2,000 sets of keys with ties, NaN and infinities, each key
-  kept before every key left out.
+  kept before every key left out, and `lionvec_least_order()` putting it in `lionvec_rank()`'s
+  order, the order a read stream is given the pages in (§44.4, "Read streams").
+- **test/unit/readahead_test.c** (`make unit`, and under ASan and UBSan with `SANITIZE=1`;
+  2026-10-17): the ring between a reader's predictions and core's read stream
+  (lion_readahead_ring.c, §44.4, "Read streams"), driven through its ops against a model of core's
+  stream - the blocks its callback named, pinned in that order and handed out one a pull, a
+  distance that doubles when a read waits and shrinks when it does not, the callback asked only
+  during a pull, a block now and then taken back unstarted (`read_stream_unget_block()`), and an
+  end once the callback names no block, until a reset - with every buffer a pin the model counts,
+  so that a pin taken twice, released twice or left behind shows: every read a pin of its block,
+  held, given, pending or not tracked; a list read in its order, and one fed by refill, through
+  the stream alone; urgent blocks before predicted ones; pins never past the limit, a full ring
+  releasing its oldest held block, and a stream with every pin given ending and starting again at a
+  later read, only once it holds nothing; a clear releasing every pin; a stream handing back the
+  wrong block, or none, reported; and random pushes, reads, refills and clears at several limits,
+  `lion_ring_check()` after every step and every block given read or released unread.
 - **vector.sql**: every ORDER BY run through the index and through a sequential scan and sort,
   compared distance by distance and row by row, with `pg_lion.vector_margin = 100` and the pause
   off, for each metric, three queries and LIMITs 1 to past the table, over 3,000 rows in 20
@@ -22371,22 +22399,43 @@ inline table's, streamed, took 53; warm it took 11.2 ms against 4.6, detoasting 
   (no setup or tuple cost, no least sizes, the table's `parallel_workers` at 2) and shown with the
   sequential and bitmap scans and the sort disabled, over 3,000 rows of 24 dimensions in ten
   clusters, NULL vectors and a zero vector among them, in 20 partitions for each metric, spilling:
-  the plans, a Gather Merge over a Parallel Index Scan of the operator's index; at the margin of
-  100 with the pause off, each metric's distances in order and rows against a sort's (`ps_cmp()`,
-  run whole by `EXECUTE`, as a PL/pgSQL loop over a query never runs in parallel), near a cluster
-  and far from all, at LIMITs 1, 10 and 300 and none, with the leader taking part and not; a NULL
-  query's walk and a cosine zero query's, every row once, and the order's tail - the farthest
-  rows, the zero vector, the NULLs; a Gather Merge on a nested loop's inner side, run twice
+  the plans, a Gather Merge over a Parallel Index Scan of the operator's index; at the margin of 100
+  with the pause off, each metric's distances in order and rows against a sort's (`ps_cmp()`, run
+  whole by `EXECUTE`, as a PL/pgSQL loop over a query never runs in parallel), near a cluster and
+  far from all, at LIMITs 1, 10 and 300 and none, with the leader taking part and not; a NULL
+  query's walk and a cosine zero query's, every row once, and the order's tail - the farthest rows,
+  the zero vector, the NULLs; a Gather Merge on a nested loop's inner side, run twice
   (`amparallelrescan`), the nearest three each time; an index that does not spill; `halfvec`;
   filters under `pg_lion.vector_postfilter = exact`, through LionOrdered or a sort and never a
-  Parallel Index Scan with a Filter, and under `allow` that plan, each with the sort's rows; the
-  prefetch off and `effective_io_concurrency` 0, the same rows in parallel, and serially at the
-  defaults through pauses, passes and LionOrdered's restricted scans, exact and probed; and at the
-  defaults in parallel, each participant stopping by its own rules, the share of the ten nearest
-  over 20 queries for each metric at least 0.9 and within 0.1 of the serial scan's. How many
-  workers start is the server's, and nothing shown depends on it. vector_filter.sql,
-  vector_half.sql and vector_limit.sql turn the prefetch off around their DEBUG1 lines, whose
-  prefetch counts depend on what shared buffers hold.
+  Parallel Index Scan with a Filter, and under `allow` that plan, each with the sort's rows; reading
+  ahead off, asking the kernel and through streams, and `effective_io_concurrency` 0, the same rows
+  in parallel, and serially at the defaults through pauses, passes and LionOrdered's restricted
+  scans, exact and probed; and at the defaults in parallel, each participant stopping by its own
+  rules, the share of the ten nearest over 20 queries for each metric at least 0.9 and within 0.1 of
+  the serial scan's. How many workers start is the server's, and nothing shown depends on it.
+  vector_filter.sql, vector_half.sql and vector_limit.sql turn the prefetch off around their DEBUG1
+  lines, whose prefetch counts depend on what shared buffers hold.
+- **vector_stream.sql** (2026-10-17): the three ways of reading ahead (§44.4, "Prefetch" and "Read
+  streams") against each other, the rows and their order, over 6,000 rows of 24 dimensions in 8
+  partitions - a fifth in each category, one in a hundred under each tag, NULL and zero vectors
+  among them - an L2 index and a spilling cosine one, and a table whose rows are all in its REST
+  chain. Each query runs under `off`, `fadvise` and `stream`, first with the tables' and indexes'
+  pages evicted from shared buffers (`pg_buffercache_evict()`, 17 and later; on 16 they stay) and
+  then warm, where the asks fall dormant and the streams rest: probes and refines, REST passes (a
+  batch of 100, and of 20), the NULL and zero walks, LionOrdered's exact path and, with it off, its
+  probes, the REST chain, a nested loop's rescans, at `effective_io_concurrency` 8, 1 and 0; cursors
+  fetching a row at a time and scrolling; a cursor whose index grows by 3,000 rows between fetches;
+  a parallel scan; chains inserts appended to; half of each relation evicted, the upper and then the
+  lower, so that within a scan the streams rest and wake and the asks fall dormant and ask again; an
+  exact path over 900 members a heap page each, the lower 480 pages evicted, at every even
+  `effective_io_concurrency` from 14 to 80, so that the list's stream rests with more blocks in it
+  than a rest lasts and the last of them comes out at many points of a rest and of the reads between
+  two (where, at 16 and 34 on 18 and 70 to 76 on 17, the scan once took the end of a backlog that
+  the rest had ended for the end of the list, and failed); scans that fail part-way, in a
+  subtransaction, at the top level and in a cursor, and the same rows after; the setting's names and
+  the boolean's spellings, and its default; and the DEBUG1 line of a warm exact path each way, the
+  list stream resting by turns. On 16 the expected output is vector_stream_1.out, `stream` there
+  being `fadvise`.
 
 ### 44.11 Not done
 
@@ -22430,13 +22479,32 @@ inline table's, streamed, took 53; warm it took 11.2 ms against 4.6, detoasting 
   the parallel area - the participants' least tau, or their tiers' - would win that back, as might
   a participant's patience counted in its share of the rows; it is worth its shared state only
   where the probes, not the workers' start and Gather Merge's wait for every participant's first
-  row, are what a parallel scan pays, which on DBpedia they were not. And `PrefetchBuffer()` is a
-  hint the kernel takes in its own time, a `posix_fadvise()` a page: from 17 a read stream
-  (`read_stream_begin_relation()`), with 18's asynchronous I/O under it, would read the chains'
-  and the queues' pages into shared buffers itself, several blocks a read, and hand the scan its
-  buffers pinned - a callback yielding the blocks the prefetch names, on 17 and later, beside
-  this for 16. A vector in TOAST is not read ahead at all: its chunks are found through the TOAST
-  index from the heap tuple's pointer, which a prefetch would have to read first.
+  row, are what a parallel scan pays, which on DBpedia they were not. (The read stream this item
+  once proposed in place of `PrefetchBuffer()` is §44.4's "Read streams", 2026-10-17; what it
+  leaves is the next item.)
+- **What reading ahead leaves** (§44.4, "Prefetch" and "Read streams"; 2026-10-17). A vector in
+  TOAST is not read ahead at all, by the asks or the streams: its chunks are found through the TOAST
+  index from the heap tuple's pointer, which reading them ahead would have to read first, a heap
+  page and an index descent a row before its chunks could be named; pgvector stores a `vector` of
+  more than 506 dimensions there unless its column says otherwise, so most tables of real embeddings
+  read their exact distances' chunks one after another: on DBpedia so stored the exact path at 1%
+  took 157 to 168 ms from the disk under every setting, against 53 with the vectors in the heap's
+  pages and streamed (§44.9), while the index's streams gained what they gain inline. Reading the
+  chunks ahead wants the heap tuples first - a stream over the members' heap blocks whose reader, a
+  block ahead, reads their TOAST pointers and names the chunks' TOAST index pages and then their
+  pages to a second stream - or the chunks' TIDs kept beside the index's own items. The rows' heap
+  pages for their exact distances are asked of the kernel under `stream` too, a stream's pins being
+  unwelcome between `amgettuple()` calls (§44.4); a scan asked for 0 to 26 of them a query on
+  DBpedia, fetching 10 or 11 rows for their distances, too few for a stream to be worth its pins.
+  The executor's fetch of a returned row is a buffer hit, the scan having fetched it for its
+  distance just before, so nothing is read ahead for it. From the kernel's cache a stream costs more
+  than `ReadBuffer()` under 18's `worker` and `io_uring` (§44.8), core handing each read to an I/O
+  worker or a kernel thread; a default by `io_method`, or a stream that stays away while its
+  relation's reads are quick, is left. And lion's own readers do not stream: `lion_count`'s heap
+  recheck reads its sorted blocks a `ReadBuffer()` at a time where it does not stream already, and a
+  lion set's leaf walk asks for one right-link ahead. A list stream (`lion_readahead_begin_list()`)
+  fits the first, a ring (`lion_readahead_begin()`) the second; the exact path's list stream, from
+  the disk, took its 3,472 heap pages in 112 to 152 ms against 168 to 173 asking the kernel (§44.9).
 - **sparsevec, bit.** The codes do not care where the floats came from; each needs an operator
   class and a reader for its format, as halfvec has (§44.1).
 - **The double heap fetch.** Each returned row is fetched by the scan for its distance and again by
