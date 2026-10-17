@@ -2185,9 +2185,9 @@ lo_add_path(RelOptInfo *rel, const CustomPathMethods *methods, List *pathkeys,
  * relation the query restricts has no plain lionvec order among its paths
  * (lo_knn_take()), and its LionOrdered over that order only when lion's set
  * answers every clause - the node's own Filter would post-filter the members
- * the same way.  What is left is exact (a sort of the filter's rows, say), or
- * under error, an error at plan time that suggests the subquery that makes
- * the approximation explicit.
+ * the same way.  What is left is, under error (the default), an error at
+ * plan time that suggests the subquery that makes the approximation
+ * explicit, or under exact an exact plan (a sort of the filter's rows, say).
  * --------------------------------------------------------------------- */
 
 /* Why a lionvec order got no LionOrdered path, for error's message. */
@@ -2504,20 +2504,28 @@ lo_knn_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
 }
 
 /*
- * The clauses of `filter` no lion access of rel answers, for error's
- * message: what lo_knn_cover() cannot cover - all of them when the
- * relation has no lion index.
+ * The restriction clauses of rel no lion access answers, for error's
+ * message: what lo_knn_cover() cannot cover - every one but the
+ * pseudoconstant ones when the relation has no lion index.  Of all of them,
+ * not only of the Filter the taken order would have: LionOrdered walks an
+ * order only over a set that answers every clause, so one a partial lionvec
+ * index's predicate implies - no Filter of that index's scan - still keeps
+ * the node from that order when no lion index answers it.
  */
 static List *
-lo_knn_unanswered(PlannerInfo *root, RelOptInfo *rel, List *filter)
+lo_knn_unanswered(PlannerInfo *root, RelOptInfo *rel)
 {
 	Oid			lionam = lion_get_am_oid();
 	List	   *lionidx = NIL;
+	List	   *rest = NIL;
 	List	   *left;
 	ListCell   *lc;
 
+	foreach(lc, rel->baserestrictinfo)
+		if (!lfirst_node(RestrictInfo, lc)->pseudoconstant)
+			rest = lappend(rest, lfirst(lc));
 	if (!OidIsValid(lionam))
-		return filter;
+		return rest;
 	foreach(lc, rel->indexlist)
 	{
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
@@ -2526,27 +2534,31 @@ lo_knn_unanswered(PlannerInfo *root, RelOptInfo *rel, List *filter)
 			lionidx = lappend(lionidx, idx);
 	}
 	if (lionidx == NIL)
-		return filter;
+		return rest;
 	(void) lo_knn_cover(root, rel, lo_lion_accesses(root, rel, lionidx, NIL,
 													lionam),
 						lionidx, lionam, &left);
-	return lo_rinfos_in(filter, left);
+	return left;
 }
 
 /* At most this many bytes of the clauses in error's message. */
 #define LO_KNN_CLAUSES_TEXT		512
 
 /*
- * pg_lion.vector_postfilter = error: the relation's lionvec order would be
- * filtered after its scan, and no LionOrdered path restricts the scan
- * instead.  At plan time, so that EXPLAIN says so too.
+ * pg_lion.vector_postfilter = error, the default: the relation's lionvec
+ * order would be filtered after its scan, and no LionOrdered path restricts
+ * the scan instead.  At plan time, so that EXPLAIN says so too.  The hint is
+ * the subquery that filters the first rows of a scan no Filter follows, and
+ * the settings that plan the query exactly or filter the scan's rows; under
+ * row-level security the settings alone, the policies filtering the
+ * subquery's scan too.
  */
 static void
 lo_knn_error(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			 LoKnn *knn)
 {
 	IndexPath  *ipath = linitial_node(IndexPath, knn->taken);
-	List	   *unanswered = lo_knn_unanswered(root, rel, lo_knn_filter(ipath));
+	List	   *unanswered = lo_knn_unanswered(root, rel);
 	const char *index = get_rel_name(ipath->indexinfo->indexoid);
 	const char *table = get_rel_name(rte->relid);
 	bool		rls;
@@ -2596,7 +2608,10 @@ lo_knn_error(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			 errdetail("Lion's set of the rows that pass the filter would not fit in hash_mem (work_mem times hash_mem_multiplier), so LionOrdered cannot restrict the scan to them.") :
 			 errdetail("LionOrdered, which restricts the scan to the rows that pass a filter, does not scan \"%s\" in this query.",
 					   table),
-			 errhint("Filter the first rows of a nearest-neighbour subquery instead, which makes the approximation explicit: SELECT ... FROM (SELECT ..., <distance> AS d FROM %s [WHERE <clauses lion indexes answer>] ORDER BY d LIMIT 1000) s WHERE <the other clauses> ORDER BY d LIMIT 10.  pg_lion.vector_postfilter = exact plans the query exactly instead, and allow filters the rows the scan returns.",
+			 rls ?
+			 errhint("The policies would filter a subquery's scan of \"%s\" as well.  For an exact answer, a sort of the rows that pass the filter, set pg_lion.vector_postfilter to exact; to filter the rows the scan returns, set it to allow.",
+					 table) :
+			 errhint("Filter the first rows of a nearest-neighbour subquery instead, which makes the approximation explicit: SELECT ... FROM (SELECT ..., <distance> AS d FROM %s [WHERE <clauses lion indexes answer>] ORDER BY d LIMIT 1000) s WHERE <the other clauses> ORDER BY d LIMIT 10.  For an exact answer, a sort of the rows that pass the filter, set pg_lion.vector_postfilter to exact; to filter the rows the scan returns, set it to allow.",
 					 table)));
 }
 
@@ -2956,10 +2971,10 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
  * order that a Filter would follow (lo_knn_take(); DESIGN.md §44.6,
  * "Post-filtering").  pg_lion.enable_ordered_scan = off takes LionOrdered
  * away, not the rule: such a query then gets an exact plan, or the error.
- * Under error a relation whose lionvec order had to go, with no LionOrdered
- * over it and no other lionvec order left (a partial index's, whose
- * predicate implies every clause), fails the query here.  The partial paths
- * of the orders left then get their parallel cost (lo_knn_partial()).
+ * Under error, the default, a relation whose lionvec order had to go, with
+ * no LionOrdered over it and no other lionvec order left (a partial index's,
+ * whose predicate implies every clause), fails the query here.  The partial
+ * paths of the orders left then get their parallel cost (lo_knn_partial()).
  */
 static void
 lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,

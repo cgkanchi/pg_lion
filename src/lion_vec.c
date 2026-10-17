@@ -101,7 +101,7 @@ int			lionvec_patience = LIONVEC_PATIENCE_DEFAULT;
 int			lionvec_exact_rows = LIONVEC_EXACT_DEFAULT;
 double		lionvec_exact_per_part = LIONVEC_EXACT_PER_PART_DEFAULT;
 int			lionvec_overflow = LIONVEC_OVERFLOW_ERROR;
-int			lionvec_postfilter = LIONVEC_POSTFILTER_EXACT;
+int			lionvec_postfilter = LIONVEC_POSTFILTER_ERROR;
 bool		lionvec_prefetch = true;
 
 static const struct config_enum_entry lionvec_overflow_options[] = {
@@ -242,19 +242,23 @@ lion_vec_init(void)
 	 * a margin of 8, 0.993 of the true ten for 29,075 pages against 0.980
 	 * for 3,483).  The plan must not decide the answer, so by default no
 	 * plan filters a lionvec scan's rows: lion_ordered.c takes the plain
-	 * scan out of a restricted relation's paths.
+	 * scan out of a restricted relation's paths, and a query LionOrdered
+	 * cannot answer then fails at plan time (error, the default since
+	 * 2026-10-17), its hint the subquery that makes the approximation
+	 * explicit; exact plans such a query exactly instead.
 	 */
 	DefineCustomEnumVariable("pg_lion.vector_postfilter",
 							 "What the planner does with a lionvec scan whose rows a filter would test "
 							 "after the scan returns them.",
 							 "A filter lion indexes answer restricts the scan through LionOrdered.  Any other "
 							 "would reject rows the scan has returned, and those rows decide where it stops "
-							 "and which rows it skips, so the answer would depend on the plan.  exact plans "
-							 "such a query exactly instead, by a sort of the filter's rows; error fails it, "
-							 "and suggests a subquery that filters an unfiltered scan's first rows; allow "
-							 "keeps the filtered scan as a plan to choose by cost.",
+							 "and which rows it skips, so the answer would depend on the plan.  error, the "
+							 "default, fails such a query when it is planned, and suggests a subquery that "
+							 "filters an unfiltered scan's first rows; exact plans it exactly instead, by a "
+							 "sort of the filter's rows; allow keeps the filtered scan as a plan to choose "
+							 "by cost.",
 							 &lionvec_postfilter,
-							 LIONVEC_POSTFILTER_EXACT,
+							 LIONVEC_POSTFILTER_ERROR,
 							 lionvec_postfilter_options,
 							 PGC_USERSET,
 							 0,
