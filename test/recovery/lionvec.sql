@@ -271,6 +271,10 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_indexscan', (how = 'probed')::text, true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', (how = 'exact')::text, true);
+	-- the sort's filtered queries are exact; a lionvec scan they would filter
+	-- is otherwise an error (pg_lion.vector_postfilter)
+	PERFORM set_config('pg_lion.vector_postfilter',
+					   CASE how WHEN 'sort' THEN 'exact' ELSE 'error' END, true);
 	ids := '{}';
 	ds := '{}';
 	FOR r IN EXECUTE q LOOP
