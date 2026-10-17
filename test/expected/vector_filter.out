@@ -6,8 +6,10 @@
 -- scan, which reads and scores only its members.  Every query below is run
 -- through the node (every core scan disabled, so that nothing else can be
 -- chosen) and through the ordinary plan (the node off, everything else
--- enabled), and the answers are compared: the distances in order, and the
--- rows.  pg_lion.vector_epsilon and pg_lion.vector_margin are raised, and
+-- enabled, and pg_lion.vector_postfilter exact, under which that plan is a
+-- sort of the filter's rows where the default, error, fails the query), and
+-- the answers are compared: the distances in order, and the rows.
+-- pg_lion.vector_epsilon and pg_lion.vector_margin are raised, and
 -- pg_lion.vector_patience is off, as in vector.sql.  The indexes spill (each
 -- row in two partitions, DESIGN.md §44.3), so every comparison is also of a
 -- restricted scan that must return each member once.
@@ -30,10 +32,12 @@ RETURNS vector LANGUAGE sql IMMUTABLE AS $$
 $$;
 /*
  * vf_ord() runs q - which returns columns id and d, ORDER BY d - through the
- * node and through the ordinary plan, and compares them as vector.sql's
- * vec_cmp() does; and says whether the first plan really was the node.  A
- * prepared statement's cached plan does not change with the settings, so
- * for one the ordinary answer comes from the query it stands for.
+ * node and through the ordinary plan (the node off, and
+ * pg_lion.vector_postfilter exact: a sort of the filter's rows), and
+ * compares them as vector.sql's vec_cmp() does; and says whether the first
+ * plan really was the node.  A prepared statement's cached plan does not
+ * change with the settings, so for one the ordinary answer comes from the
+ * query it stands for.
  */
 CREATE FUNCTION vf_ord(q text, ordinary text DEFAULT NULL) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -45,6 +49,7 @@ DECLARE
 	bd text[] := '{}';
 	ai int[] := '{}';
 	bi int[] := '{}';
+	postfilter text := current_setting('pg_lion.vector_postfilter');
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
@@ -69,12 +74,14 @@ BEGIN
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('enable_tidscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	PERFORM set_config('pg_lion.vector_postfilter', 'exact', true);
 	FOR r IN EXECUTE coalesce(ordinary, q) LOOP
 		bd := bd || coalesce(round(r.d::numeric, 4)::text, 'NULL');
 		IF r.d IS NOT NULL THEN
 			bi := bi || r.id;
 		END IF;
 	END LOOP;
+	PERFORM set_config('pg_lion.vector_postfilter', postfilter, true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
 
 	IF ad IS DISTINCT FROM bd THEN
@@ -769,7 +776,8 @@ DROP FUNCTION vfb_startup();
 DROP FUNCTION vfb_blks();
 /*
  * vf_recall() runs q - which returns a column id - through the node and
- * through a sequential scan and sort, and returns the share of the second's
+ * through a sequential scan and sort (the node off, and
+ * pg_lion.vector_postfilter exact), and returns the share of the second's
  * rows the first has.
  */
 CREATE FUNCTION vf_recall(q text) RETURNS float8
@@ -777,6 +785,7 @@ LANGUAGE plpgsql AS $$
 DECLARE
 	a int[];
 	b int[];
+	postfilter text := current_setting('pg_lion.vector_postfilter');
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
@@ -788,7 +797,9 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_tidscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	PERFORM set_config('pg_lion.vector_postfilter', 'exact', true);
 	EXECUTE 'SELECT array_agg(id) FROM (' || q || ') s' INTO b;
+	PERFORM set_config('pg_lion.vector_postfilter', postfilter, true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
@@ -986,11 +997,16 @@ SELECT op, vf_unique(format('SELECT id FROM vf WHERE cat <> 5 ORDER BY v %s vf_v
 (3 rows)
 
 -- off, the node is not offered, and no plan filters the vector scan's rows
--- either (pg_lion.vector_postfilter, DESIGN.md §44.6, "Post-filtering"): the
--- filter's rows are sorted, exactly.  Under allow the vector scan filters
--- instead (sorts are off, or sorting the lion scan's rows would be cheaper).
+-- either (pg_lion.vector_postfilter, DESIGN.md §44.6, "Post-filtering"): by
+-- default the query fails, and under exact the filter's rows are sorted,
+-- exactly.  Under allow the vector scan filters instead (sorts are off, or
+-- sorting the lion scan's rows would be cheaper).
 SET pg_lion.enable_ordered_scan = off;
 SET enable_seqscan = off; SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM vf WHERE tag = 3 ORDER BY v <-> '[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]' LIMIT 5;
+ERROR:  lionvec index "vf_l2" would apply the filter after its nearest-neighbour scan
+SET pg_lion.vector_postfilter = exact;
 EXPLAIN (COSTS OFF)
 SELECT id FROM vf WHERE tag = 3 ORDER BY v <-> '[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]' LIMIT 5;
                                        QUERY PLAN                                        

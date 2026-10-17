@@ -109,9 +109,10 @@ BEGIN
 END $$;
 /*
  * hv_ord() runs q - which returns columns id and d, ORDER BY d - through
- * LionOrdered and through the ordinary plan, and compares them as hv_cmp()
- * does; and says whether the first plan really was the node.
- * (vector_filter.sql's vf_ord().)
+ * LionOrdered and through the ordinary plan (the node off, and
+ * pg_lion.vector_postfilter exact: a sort of the filter's rows), and
+ * compares them as hv_cmp() does; and says whether the first plan really
+ * was the node.  (vector_filter.sql's vf_ord().)
  */
 CREATE FUNCTION hv_ord(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -123,6 +124,7 @@ DECLARE
 	bd text[] := '{}';
 	ai int[] := '{}';
 	bi int[] := '{}';
+	postfilter text := current_setting('pg_lion.vector_postfilter');
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
@@ -147,12 +149,14 @@ BEGIN
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('enable_tidscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	PERFORM set_config('pg_lion.vector_postfilter', 'exact', true);
 	FOR r IN EXECUTE q LOOP
 		bd := bd || coalesce(round(r.d::numeric, 4)::text, 'NULL');
 		IF r.d IS NOT NULL THEN
 			bi := bi || r.id;
 		END IF;
 	END LOOP;
+	PERFORM set_config('pg_lion.vector_postfilter', postfilter, true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
 
 	IF ad IS DISTINCT FROM bd THEN
