@@ -684,25 +684,9 @@ lv_prefetch_queue(IndexScanDesc scan, LvScanOpaque *so, LvHeap *h,
 		so->pfat[n++] = i;
 	}
 	m = lionvec_least(so->pfkey, n, dist, so->pfsel);
+	/* to a stream by key, at equal keys by place: m is at most dist, 64 */
 	if (!fetch && lion_readahead_mode(ra) == LION_READAHEAD_STREAM)
-	{
-		/* by key, and at equal keys by place: m is at most dist, 64 */
-		for (i = 1; i < m; i++)
-		{
-			int			sel = so->pfsel[i];
-			int			j = i;
-
-			while (j > 0 &&
-				   (so->pfkey[so->pfsel[j - 1]] > so->pfkey[sel] ||
-					(so->pfkey[so->pfsel[j - 1]] == so->pfkey[sel] &&
-					 so->pfsel[j - 1] > sel)))
-			{
-				so->pfsel[j] = so->pfsel[j - 1];
-				j--;
-			}
-			so->pfsel[j] = sel;
-		}
-	}
+		lionvec_least_order(so->pfkey, so->pfsel, m);
 	for (i = 0; i < m; i++)
 	{
 		LvItem	   *it = &h->items[so->pfat[so->pfsel[i]]];
