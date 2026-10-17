@@ -537,6 +537,19 @@ typedef struct LionTidSet
  */
 #define LO_MERGE_ROOM		32
 
+/*
+ * A key's pieces are merged member by member, not through a bitset image,
+ * when they hold this many members or fewer together (lo_set_finish()):
+ * LION_WIDTH_ARRAY_CARD(1), 256 at 8K, an ARRAY as large as the narrowest
+ * NARROW, so that what the merge leaves is always an ARRAY or a RUN.  Below
+ * it the merge won at every shape measured, 2 to 64 pieces of members in any
+ * block at any offset: 0.9 us against the image's 1.6 for 4 pieces of 256
+ * together, at the worst, and from 30 times faster for a few members.  Past
+ * it a union the image makes a NARROW of had to become one from the merge's
+ * ARRAY, which took 2.5 to 10 us against the image's 1 to 3 (2026-10-17).
+ */
+#define LO_MERGE_DIRECT_MAX	((uint32) LION_WIDTH_ARRAY_CARD(1))
+
 /* the pieces' slots by key, then slot: (key << 32 | slot) (lo_set_finish()) */
 #define ST_SORT lo_sort_slots
 #define ST_ELEMENT_TYPE uint64
@@ -3435,6 +3448,21 @@ lo_set_push(LionOrderedState *st, LionTidSet *set, uint32 ckey,
  * the pieces after them are sorted, by key and slot packed into a word, and
  * the two runs merged.  A sort of every slot through a comparator that read
  * the keys was most of what a merge cost (2026-10-16).
+ *
+ * A key whose pieces hold LO_MERGE_DIRECT_MAX members or fewer together is
+ * merged member by member instead (lion_container_or_merge()), which is what
+ * the image would have made, byte for byte.  A summary's buckets and entries
+ * each cover every heap block of a column spread evenly over the table, so a
+ * filter brings a few pieces of a few members to every container key: 3.5
+ * pieces of 6.5 members at u < 0.1 on DBpedia's 115,000 rows of one row a
+ * heap page, 1,800 keys, and at u < 1.0 25 pieces of 64.  The image cost
+ * 8 KB of passes a key whatever it held - a 4 KB clear, then the count, the
+ * runs and the members of optimize() over the 4 KB of a BITSET - and the
+ * merges were 36% of a 9.7 ms query at u < 0.1, a cost of the keys, not of
+ * the members (2026-10-17).  The merge of the members costs 40 ns for 3
+ * pieces of 6 members against the image's 1.2 us, and 0.2 us for 25 of 64
+ * against 1.4; the query took 9.5 -> 6.6 ms at u < 0.1, and 14.3 -> 11.6 at
+ * u < 1.0.
  */
 static void
 lo_set_finish(LionOrderedState *st, LionTidSet *set)
@@ -3443,6 +3471,7 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 	uint64	   *packed;
 	uint32	   *keys;
 	LionContainer **conts;
+	const LionContainer **group;
 	uint64	   *img;
 	LionContainer *out;
 	int			npieces;
@@ -3485,6 +3514,9 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 											 sizeof(uint32) * set->cap);
 	conts = (LionContainer **)
 		MemoryContextAllocHuge(st->setcxt, sizeof(LionContainer *) * set->cap);
+	group = (const LionContainer **)
+		MemoryContextAllocHuge(st->buildcxt,
+							   sizeof(LionContainer *) * set->n);
 	img = (uint64 *) MemoryContextAlloc(st->buildcxt, LION_BITSET_BYTES);
 	out = (LionContainer *) MemoryContextAlloc(st->buildcxt,
 											   LION_CONTAINER_MAX_SIZE);
@@ -3506,12 +3538,25 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 		else
 		{
 			int			m;
+			uint32		members = 0;
 			Size		size;
 
-			memset(img, 0, LION_BITSET_BYTES);
-			for (m = i; m < j; m++)
-				lion_container_or_into_bitset(set->conts[order[m]], img);
-			lion_bits_to_container(img, key, out);
+			/* summed only until past the bound: a key may have many pieces */
+			for (m = i; m < j && members <= LO_MERGE_DIRECT_MAX; m++)
+				members += set->conts[order[m]]->cardinality;
+			if (members <= LO_MERGE_DIRECT_MAX)
+			{
+				for (m = i; m < j; m++)
+					group[m - i] = set->conts[order[m]];
+			}
+			if (members > LO_MERGE_DIRECT_MAX ||
+				!lion_container_or_merge(group, (uint32) (j - i), key, out))
+			{
+				memset(img, 0, LION_BITSET_BYTES);
+				for (m = i; m < j; m++)
+					lion_container_or_into_bitset(set->conts[order[m]], img);
+				lion_bits_to_container(img, key, out);
+			}
 			size = lion_container_size(out);
 			conts[n] = (LionContainer *) MemoryContextAlloc(st->setcxt, size);
 			memcpy(conts[n], out, size);
@@ -3535,6 +3580,7 @@ lo_set_finish(LionOrderedState *st, LionTidSet *set)
 	pfree(set->keys);
 	pfree(set->conts);
 	pfree(order);
+	pfree(group);
 	pfree(img);
 	pfree(out);
 	set->keys = keys;
