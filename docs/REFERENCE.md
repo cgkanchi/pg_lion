@@ -405,17 +405,18 @@ be READ on any server but can only be WRITTEN where the resource manager is regi
 or temporary one writes no WAL and is written anywhere), which needs
 
     shared_preload_libraries = 'pg_lion'      # and a restart
-    # optional: pg_lion.rmgr_id = 128         # the id to register under
+    # optional: pg_lion.rmgr_id = 170         # the id to register under
 
-`pg_lion.rmgr_id` defaults to 128, `RM_EXPERIMENTAL_ID`, the id the PostgreSQL project reserves for
-development: two extensions that both take it cannot be loaded together, so a production cluster
-should check `pg_get_wal_resource_managers()` and move one of them.  Once an index has been written
-in rmgr mode the library must stay in `shared_preload_libraries` for as long as WAL that mentions it
-may still be replayed - the rule core states for every custom resource manager.  WAL written
-under one id replays only under that id, so change `pg_lion.rmgr_id` only after a clean shutdown,
-once every standby and WAL archive consumer has replayed everything written under the old id, and
-restart each server of the cluster with the new one; `pg_upgrade` carries no WAL across, so an
-upgrade may change it freely.
+`pg_lion.rmgr_id` defaults to 170, the id reserved for pg_lion on the
+[list of custom resource managers](https://wiki.postgresql.org/wiki/CustomWALResourceManagers#List_of_Custom_Rmgrs).
+Two extensions that take the same id cannot be loaded together, so change it only to move out of
+such a collision; `pg_get_wal_resource_managers()` shows what is registered.  Once an index has
+been written in rmgr mode the library must stay in `shared_preload_libraries` for as long as WAL
+that mentions it may still be replayed - the rule core states for every custom resource manager.
+WAL written under one id replays only under that id, so change `pg_lion.rmgr_id` only after a clean
+shutdown, once every standby and WAL archive consumer has replayed everything written under the old
+id, and restart each server of the cluster with the new one; `pg_upgrade` carries no WAL across, so
+an upgrade may change it freely.
 `lion_index_stats()` reports ONE ROW PER KEY COLUMN (DESIGN.md §24), with a leading `attno`: the
 directory's height, its leaf and internal pages and whether that column is `ordered` (false for a
 key type with no btree opclass, whose entries are then in a complete but arbitrary order), the

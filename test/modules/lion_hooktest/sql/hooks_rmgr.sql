@@ -1,8 +1,7 @@
--- Both libraries preloaded, each with a custom WAL resource manager, under
--- different ids (test/hook-check.sh starts the server with
--- pg_lion.rmgr_id = 129; lion_hooktest keeps the development id 128 that is
--- also pg_lion's default).  The collision itself is a startup failure, which
--- the script checks from the server log.
+-- Both libraries preloaded, each with a custom WAL resource manager on its
+-- default id: pg_lion's reserved 170 and lion_hooktest's development id 128
+-- (RM_EXPERIMENTAL_ID).  The collision itself is a startup failure, which
+-- test/hook-check.sh checks from the server log.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 SET synchronous_commit = on;

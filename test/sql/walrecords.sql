@@ -13,7 +13,7 @@
  * installcheck-rmgr`).  pg_regress accepts either.
  *
  * pg_waldump cannot name these records - it does not load the module, so it
- * prints the resource manager as "custom128" and the record type as UNKNOWN -
+ * prints the resource manager as "custom170" and the record type as UNKNOWN -
  * which is why this uses pg_walinspect, which runs in the backend, where
  * rm_identify() and rm_desc() are ours.
  */
