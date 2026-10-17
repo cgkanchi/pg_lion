@@ -20964,10 +20964,15 @@ in, it pushes nothing and refills nothing for the next `LION_ASK_DORMANT` (256) 
 `ReadBuffer()`'s, or until one reads a block in (`lion_readahead_dormant()`), and the scan skips its
 looks into the queues meanwhile. A reader that knows its whole list in order needs none of that:
 `lion_readahead_begin_list()` is a plain stream over it, from a full I/O ahead, holding as many pins
-as core's own limits allow (`GetPinLimit()`), as a bitmap heap scan's does. Where a stream is not
-wanted, or on 16, the same calls ask the kernel (`lion_ask()`) and read with `ReadBuffer()`, or only
-read: the fallback for lion's readers as for lionvec's. Every pin is the current resource owner's,
-so an error releases them with its transaction, subtransaction or portal.
+as core's own limits allow (`GetPinLimit()`), as a bitmap heap scan's does. It rests too, blind as
+the asks are: after 32 blocks in a row it read nothing in for, its callback names none, the stream
+ends once it has handed out what it was named - however many rests that lasts, a stream far ahead
+holding hundreds - and the reads left of the rest are the reader's own (`lion_readahead_next()`
+returns those blocks unpinned), after which the stream is reset and goes on from the list's next
+block - a warm block it hands out being a lookup and a pin that the reader's own read repeats. Where
+a stream is not wanted, or on 16, the same calls ask the kernel (`lion_ask()`) and read with
+`ReadBuffer()`, or only read: the fallback for lion's readers as for lionvec's. Every pin is the
+current resource owner's, so an error releases them with its transaction, subtransaction or portal.
 
 A lionvec scan has three streams of the index, in its own context, kept from one rescan to the next
 and reset - every pin released, every block forgotten - at each rescan, at each change of phase (the

@@ -73,8 +73,10 @@ typedef bool (*LionReadaheadRefill) (void *arg);
 
 /*
  * The next block of a list a reader knows whole and reads in its order
- * (lion_readahead_begin_list()), InvalidBlockNumber past its end.  It runs
- * inside the read stream's callback: it must not read, wait or fail.
+ * (lion_readahead_begin_list()), InvalidBlockNumber past its end, and at
+ * every call after.  It runs inside the read stream's callback, or, while
+ * the list rests, inside lion_readahead_next(): it must not read, wait or
+ * fail.
  */
 typedef BlockNumber (*LionReadaheadNext) (void *arg);
 
@@ -97,7 +99,8 @@ extern LionReadahead *lion_readahead_begin(Relation rel, int mode, int pins,
 extern LionReadahead *lion_readahead_begin_list(Relation rel, int mode,
 												LionReadaheadNext next,
 												void *next_arg);
-extern Buffer lion_readahead_next(LionReadahead *s);
+extern bool lion_readahead_next(LionReadahead *s, BlockNumber *blk,
+								Buffer *buf);
 extern int	lion_readahead_mode(const LionReadahead *s);
 extern bool lion_readahead_ask(LionReadahead *s, BlockNumber blk, bool urgent,
 							   bool once);
