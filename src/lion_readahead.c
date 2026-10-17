@@ -9,14 +9,17 @@
  * A LionReadahead of LION_READAHEAD_STREAM binds a LionRing
  * (lion_readahead_ring.c) to core's read stream: the stream's callback takes
  * the ring's next block, and the ring pulls the stream's buffers, restarts
- * it and reads apart through the ops below.  Every pin it holds - the
- * stream's, and the ring's held buffers - is the current resource owner's
- * like any other, so an error releases them with the transaction or the
- * portal it ends; a reader that goes on ends or resets it
- * (lion_readahead_end(), lion_readahead_reset()) before it stops, as an
- * index scan does at endscan and rescan.  The callback only takes a block from memory, or has the
- * reader's refill push more from its own queues, so it never blocks, and
- * from 18 the stream may batch its I/O (READ_STREAM_USE_BATCHING).
+ * it and reads apart through the ops below.  One over a list the reader
+ * knows whole (lion_readahead_begin_list()) has no ring: its callback is
+ * the reader's next block, and its reads take the stream's buffers in
+ * order.  Every pin either holds - the stream's, and the ring's held
+ * buffers - is the current resource owner's like any other, so an error
+ * releases them with the transaction or the portal it ends; a reader that
+ * goes on ends or resets it (lion_readahead_end(), lion_readahead_reset())
+ * before it stops, as an index scan does at endscan and rescan.  The
+ * callback only takes a block from memory, or has the reader's refill or
+ * next take one from its own queues or list, so it never blocks, and from
+ * 18 the stream may batch its I/O (READ_STREAM_USE_BATCHING).
  *
  *-------------------------------------------------------------------------
  */
@@ -36,6 +39,7 @@
 
 struct LionReadahead
 {
+	MemoryContext cxt;			/* where it lives, and its stream */
 	Relation	rel;
 	int			mode;			/* LION_READAHEAD_* as it reads, which may be
 								 * less than asked (lion_readahead_begin()) */
@@ -44,13 +48,23 @@ struct LionReadahead
 	bool		ownask;			/* ... made for this one alone */
 	LionReadaheadRefill refill;
 	void	   *refill_arg;
+	LionReadaheadNext next;		/* a list's (lion_readahead_begin_list()),
+								 * which has no ring */
+	void	   *next_arg;
 #if PG_VERSION_NUM >= 170000
 	ReadStream *stream;			/* LION_READAHEAD_STREAM */
 #endif
 	LionRing	ring;
 	void	   *ringmem;
 	int64		nread;			/* blocks its reads brought in */
-	LionReadaheadCounts taken;	/* the ring's counts as last taken */
+	int64		nreadall;		/* ... all told, and when its stream last
+								 * started */
+	int64		nreadstart;
+	int			warm;			/* reads in a row that read nothing in */
+	int			dormant;		/* reads to make without pushing */
+	int64		nlisted;		/* a list's blocks named to the stream ... */
+	int64		nreturned;		/* ... and handed to the reader */
+	LionReadaheadCounts taken;	/* the counts as last taken */
 };
 
 /* ----------------------------------------------------------------
@@ -150,12 +164,46 @@ lion_readahead_op_next(void *arg)
 	return (LionRingBuf) read_stream_next_buffer(s->stream, NULL);
 }
 
+/*
+ * A ring's stream, as far ahead at its start as for a whole relation
+ * (READ_STREAM_FULL): a full I/O's blocks, io_combine_limit, rather than
+ * one, since what the reader pushed it will mostly read.
+ */
+static ReadStream *
+lion_readahead_ring_stream(LionReadahead *s)
+{
+	return read_stream_begin_relation(LION_READAHEAD_FLAGS | READ_STREAM_FULL,
+									  NULL, s->rel, MAIN_FORKNUM,
+									  lion_readahead_cb, s, 0);
+}
+
+/*
+ * The ring's stream, started over (LionRingOps.restart).  Core's reset
+ * starts it from one block ahead, and its distance doubles only as the
+ * reader waits on its reads: so a stream that read anything in since it
+ * last started, which is cold, is begun anew, from a full I/O ahead; one
+ * that found every block in shared buffers is reset, which costs less.
+ */
 static void
 lion_readahead_op_restart(void *arg)
 {
 	LionReadahead *s = (LionReadahead *) arg;
 
-	read_stream_reset(s->stream);
+	if (s->nreadall > s->nreadstart)
+	{
+		ReadStream *old = s->stream;
+		MemoryContext oldcxt;
+
+		/* in the readahead's context, not the reader's of the moment */
+		s->stream = NULL;
+		read_stream_end(old);
+		oldcxt = MemoryContextSwitchTo(s->cxt);
+		s->stream = lion_readahead_ring_stream(s);
+		MemoryContextSwitchTo(oldcxt);
+	}
+	else
+		read_stream_reset(s->stream);
+	s->nreadstart = s->nreadall;
 }
 
 static LionRingBuf
@@ -183,7 +231,7 @@ lion_readahead_op_refill(void *arg)
 {
 	LionReadahead *s = (LionReadahead *) arg;
 
-	return s->refill != NULL && s->refill(s->refill_arg);
+	return s->refill != NULL && s->dormant == 0 && s->refill(s->refill_arg);
 }
 
 static void
@@ -193,6 +241,19 @@ lion_readahead_op_fail(void *arg, const char *what)
 
 	elog(ERROR, "lion read stream of \"%s\": %s",
 		 RelationGetRelationName(s->rel), what);
+}
+
+/* A list's callback: the reader's next block, counted. */
+static BlockNumber
+lion_readahead_list_cb(ReadStream *stream, void *callback_private_data,
+					   void *per_buffer_data)
+{
+	LionReadahead *s = (LionReadahead *) callback_private_data;
+	BlockNumber blk = s->next(s->next_arg);
+
+	if (BlockNumberIsValid(blk))
+		s->nlisted++;
+	return blk;
 }
 
 static const LionRingOps lion_readahead_ops = {
@@ -249,6 +310,7 @@ lion_readahead_begin(Relation rel, int mode, int pins, LionAsk *ask,
 
 	Assert(mode == LION_READAHEAD_OFF || mode == LION_READAHEAD_FADVISE ||
 		   mode == LION_READAHEAD_STREAM);
+	s->cxt = CurrentMemoryContext;
 	s->rel = rel;
 	s->refill = refill;
 	s->refill_arg = refill_arg;
@@ -273,12 +335,75 @@ lion_readahead_begin(Relation rel, int mode, int pins, LionAsk *ask,
 		s->ringmem = palloc(lion_ring_memsize(pins, pins));
 		lion_ring_init(&s->ring, pins, pins, s->ringmem,
 					   &lion_readahead_ops, s);
-		s->stream = read_stream_begin_relation(LION_READAHEAD_FLAGS, NULL, rel,
-											   MAIN_FORKNUM, lion_readahead_cb,
-											   s, 0);
+		s->stream = lion_readahead_ring_stream(s);
 	}
 #endif
 	return s;
+}
+
+/*
+ * A plain read stream over a list the reader knows whole and reads in
+ * order, every block of it once (DESIGN.md §44.4, "Read streams"): next
+ * names each, inside the stream's callback, and lion_readahead_next()
+ * returns them pinned in that order.  Core's stream keeps as many pins as
+ * its own limits allow (GetPinLimit()), as it does for a bitmap heap scan,
+ * and starts as far ahead as it would for a whole relation
+ * (READ_STREAM_FULL), the reader to read every block named.  Only for
+ * LION_READAHEAD_STREAM, from 17: otherwise NULL, and the reader asks and
+ * reads as the mode says (lion_ask(), ReadBuffer()).
+ */
+LionReadahead *
+lion_readahead_begin_list(Relation rel, int mode, LionReadaheadNext next,
+						  void *next_arg)
+{
+#if PG_VERSION_NUM >= 170000
+	LionReadahead *s;
+
+	Assert(next != NULL);
+	if (mode != LION_READAHEAD_STREAM)
+		return NULL;
+	s = palloc0(sizeof(LionReadahead));
+	s->cxt = CurrentMemoryContext;
+	s->rel = rel;
+	s->mode = mode;
+	s->next = next;
+	s->next_arg = next_arg;
+	s->stream = read_stream_begin_relation(LION_READAHEAD_FLAGS |
+										   READ_STREAM_FULL, NULL, rel,
+										   MAIN_FORKNUM,
+										   lion_readahead_list_cb, s, 0);
+	return s;
+#else
+	return NULL;
+#endif
+}
+
+/*
+ * The list's next block, pinned and not locked; InvalidBuffer past its
+ * end.
+ */
+Buffer
+lion_readahead_next(LionReadahead *s)
+{
+#if PG_VERSION_NUM >= 170000
+	int64		before;
+	Buffer		buf;
+
+	if (s->next == NULL || s->stream == NULL)
+		elog(ERROR, "lion read stream of \"%s\" has no list",
+			 RelationGetRelationName(s->rel));
+	before = lion_readahead_blks_read();
+	buf = read_stream_next_buffer(s->stream, NULL);
+	s->nread += lion_readahead_blks_read() - before;
+	if (BufferIsValid(buf))
+		s->nreturned++;
+	Assert(s->nreturned <= s->nlisted);
+	return buf;
+#else
+	elog(ERROR, "lion read stream of \"%s\" has no list",
+		 RelationGetRelationName(s->rel));
+	return InvalidBuffer;
+#endif
 }
 
 /* How it reads: the mode asked of lion_readahead_begin(), or less. */
@@ -302,6 +427,7 @@ lion_readahead_ask(LionReadahead *s, BlockNumber blk, bool urgent, bool once)
 	bool		taken = false;
 
 	Assert(BlockNumberIsValid(blk));
+	Assert(s->next == NULL);
 	switch (s->mode)
 	{
 		case LION_READAHEAD_FADVISE:
@@ -309,6 +435,8 @@ lion_readahead_ask(LionReadahead *s, BlockNumber blk, bool urgent, bool once)
 			taken = true;
 			break;
 		case LION_READAHEAD_STREAM:
+			if (s->dormant > 0)
+				break;
 			taken = lion_ring_push(&s->ring, blk, urgent);
 			lion_readahead_check(s);
 			break;
@@ -323,31 +451,70 @@ lion_readahead_read(LionReadahead *s, BlockNumber blk)
 	int64		before;
 	Buffer		buf;
 
+	Assert(s->next == NULL);
 	if (s->mode != LION_READAHEAD_STREAM)
 		return ReadBuffer(s->rel, blk);
 	before = lion_readahead_blks_read();
 	buf = (Buffer) lion_ring_read(&s->ring, blk);
-	s->nread += lion_readahead_blks_read() - before;
+	before = lion_readahead_blks_read() - before;
+	s->nread += before;
+	s->nreadall += before;
+	if (before > 0)
+		s->warm = s->dormant = 0;
+	else if (s->dormant > 0)
+		s->dormant--;
+	else if (++s->warm >= LION_ASK_WARM)
+	{
+		s->warm = 0;
+		s->dormant = LION_ASK_DORMANT;
+	}
 	lion_readahead_check(s);
 	Assert(BufferIsValid(buf) && BufferGetBlockNumber(buf) == blk);
 	return buf;
 }
 
-/* Whether a read of blk would come from the stream. */
+/*
+ * Whether a stream is resting (LION_READAHEAD_STREAM over a ring): its
+ * last LION_ASK_WARM reads in a row read nothing in, every block they
+ * wanted in shared buffers already, so for the next LION_ASK_DORMANT reads,
+ * or until one reads a block in, nothing is pushed and nothing refilled,
+ * and a read of a block the stream does not hold is ReadBuffer()'s - a warm
+ * stream's bookkeeping and the reader's looks into its queues being work
+ * for nothing.  The reader may skip its looks meanwhile.  Asks of the
+ * kernel have their own rest (lion_ask()), which sees only whether
+ * PrefetchBuffer() found the page; a stream sees its reads.
+ */
 bool
-lion_readahead_tracks(const LionReadahead *s, BlockNumber blk)
+lion_readahead_dormant(const LionReadahead *s)
 {
-	return s->mode == LION_READAHEAD_STREAM && lion_ring_tracks(&s->ring, blk);
+	return s->mode == LION_READAHEAD_STREAM && s->next == NULL &&
+		s->dormant > 0;
+}
+
+/* Forget how warm its reads were: a reader's pages that are always warm. */
+void
+lion_readahead_awaken(LionReadahead *s)
+{
+	s->warm = s->dormant = 0;
 }
 
 /* Blocks pushed or given and not read: how far ahead the stream reaches. */
 int
 lion_readahead_depth(const LionReadahead *s)
 {
-	return s->mode == LION_READAHEAD_STREAM ? lion_ring_ahead(&s->ring) : 0;
+	if (s->mode != LION_READAHEAD_STREAM)
+		return 0;
+	if (s->next != NULL)
+		return (int) (s->nlisted - s->nreturned);
+	return lion_ring_ahead(&s->ring);
 }
 
-/* What it has done since the counts were last taken, into c (added). */
+/*
+ * What it has done since the counts were last taken, into c (added).  A
+ * list's blocks named to the stream and not read yet count as released
+ * unread, which they are once it ends: so the counts taken when the reader
+ * is done, as they should be, hold what its end will release.
+ */
 void
 lion_readahead_counts(LionReadahead *s, LionReadaheadCounts *c)
 {
@@ -355,6 +522,18 @@ lion_readahead_counts(LionReadahead *s, LionReadaheadCounts *c)
 
 	if (s->mode != LION_READAHEAD_STREAM)
 		return;
+	if (s->next != NULL)
+	{
+		int64		ahead = s->nlisted - s->nreturned;
+
+		c->nstreamed += s->nreturned - s->taken.nstreamed;
+		c->nwasted += ahead - s->taken.nwasted;
+		c->nread += s->nread;
+		s->taken.nstreamed = s->nreturned;
+		s->taken.nwasted = ahead;
+		s->nread = 0;
+		return;
+	}
 	c->nstreamed += (int64) r->nstreamed - s->taken.nstreamed;
 	c->napart += (int64) r->napart - s->taken.napart;
 	c->nwasted += (int64) r->nwasted - s->taken.nwasted;
@@ -376,6 +555,19 @@ lion_readahead_reset(LionReadahead *s)
 {
 	if (s->mode != LION_READAHEAD_STREAM)
 		return;
+	if (s->next != NULL)
+	{
+		/*
+		 * A list's: what the stream read ahead is dropped, counted unread,
+		 * and the list goes on past it.
+		 */
+#if PG_VERSION_NUM >= 170000
+		read_stream_reset(s->stream);
+#endif
+		s->taken.nwasted -= s->nlisted - s->nreturned;
+		s->nlisted = s->nreturned;
+		return;
+	}
 	lion_ring_clear(&s->ring);
 	lion_readahead_check(s);
 }
@@ -384,6 +576,8 @@ lion_readahead_reset(LionReadahead *s)
 void
 lion_readahead_end(LionReadahead *s)
 {
+	/* the stream reset, not begun anew only to be ended */
+	s->nreadstart = s->nreadall;
 	lion_readahead_reset(s);
 #if PG_VERSION_NUM >= 170000
 	if (s->stream != NULL)

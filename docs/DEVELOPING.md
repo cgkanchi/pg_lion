@@ -169,7 +169,8 @@ the suite as they are in production.
     src/lion_vec_math.[ch]  its rotation, bit-plane codes, kernels and error bounds, frontend-safe and
                             unit-tested standalone (test/unit/vec_test.c)
     src/lion_readahead.[ch] reading a relation's blocks in an order its reader predicts: a read stream
-                            over the blocks it pushes (17 and later), asks of the kernel, or plain reads
+                            over the blocks it pushes, or over a list it knows whole (17 and later), asks
+                            of the kernel, or plain reads
     src/lion_readahead_ring.[ch]  the read stream's bookkeeping: blocks pushed, given, held; frontend-safe
                             and unit-tested standalone (test/unit/readahead_test.c)
     test/sql, test/isolation, test/unit, test/recovery, test/modules
