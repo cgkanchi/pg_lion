@@ -361,6 +361,36 @@ RESET pg_lion.vector_exact_per_partition;
 DROP TABLE ps_serial;
 DROP FUNCTION ps_same(text);
 
+-- The heap's pages are asked for ahead only where its rows hold their
+-- vectors (lv_vector_inline()): stored PLAIN or MAIN, or within the larger
+-- of TOAST_TUPLE_THRESHOLD and the table's toast_tuple_target.  A vector of
+-- 600 dimensions, 2,408 bytes, goes to TOAST at the defaults and stays in
+-- its row under a target of 8160, where, the threshold alone deciding (as
+-- until 2026-10-17), its pages were not asked for either.  A filter's exact
+-- path asks for each member's block, one a member here, every one in shared
+-- buffers; the DEBUG1 line counts the asks.
+CREATE TABLE ps_wide (id int PRIMARY KEY, cat int, v vector(600))
+	WITH (toast_tuple_target = 8160, autovacuum_enabled = off);
+CREATE TABLE ps_toast (id int PRIMARY KEY, cat int, v vector(600))
+	WITH (autovacuum_enabled = off);
+INSERT INTO ps_wide SELECT i, i % 3, ps_vec(i, 600) FROM generate_series(1, 60) i;
+INSERT INTO ps_toast SELECT * FROM ps_wide;
+SELECT relname, pg_relation_size(reltoastrelid) > 0 AS "in TOAST"
+  FROM pg_class WHERE relname IN ('ps_wide', 'ps_toast') ORDER BY relname;
+CREATE INDEX ps_wide_cat ON ps_wide USING lion (cat);
+CREATE INDEX ps_wide_v ON ps_wide USING lionvec (v vector_l2_ops) WITH (partitions = 4);
+CREATE INDEX ps_toast_cat ON ps_toast USING lion (cat);
+CREATE INDEX ps_toast_v ON ps_toast USING lionvec (v vector_l2_ops) WITH (partitions = 4);
+SET pg_lion.vector_prefetch = on;
+SET client_min_messages = debug1;
+SELECT count(*) FROM (SELECT id FROM ps_wide WHERE cat = 1
+					   ORDER BY v <-> ps_vec(7, 600) LIMIT 5) s;
+SELECT count(*) FROM (SELECT id FROM ps_toast WHERE cat = 1
+					   ORDER BY v <-> ps_vec(7, 600) LIMIT 5) s;
+RESET client_min_messages;
+RESET pg_lion.vector_prefetch;
+DROP TABLE ps_wide, ps_toast;
+
 -- at the defaults in parallel, each participant stops by its own rules:
 -- about the serial scan's share of the ten nearest
 SET max_parallel_workers_per_gather = 2;

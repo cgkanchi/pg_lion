@@ -20897,9 +20897,14 @@ still hold. It asks for:
 
 The heap is asked for only when it is the heap access method's, whose TIDs name its blocks, and
 its vectors lie in its pages (`lv_vector_inline()`): stored `PLAIN` or `MAIN`, or small enough,
-within `TOAST_TUPLE_THRESHOLD` (2,032 bytes at 8K pages: 506 dimensions of `vector`, 1,012 of
-`halfvec`). Past it pgvector's `EXTERNAL` storage puts a vector in TOAST, which a fetch reaches
-through the TOAST index, the heap page the least of what it reads; asked for alone, on DBpedia's
+within the larger of `TOAST_TUPLE_THRESHOLD` and the table's `toast_tuple_target` (both 2,032 bytes
+at 8K pages unless the table sets the target: 506 dimensions of `vector`, 1,012 of `halfvec`; under
+`toast_tuple_target = 8160`, every vector an index takes). The heap moves a row's values to TOAST
+only once the row is past the threshold, and only until it is within the target. Until 2026-10-17
+the threshold alone decided, so a table loaded under a raised target - the DBpedia benchmark's,
+`KNN_INLINE` - had its vectors in its pages and none of them asked for. Past both pgvector's
+`EXTERNAL` storage puts a vector in TOAST, which a fetch reaches through the TOAST index, the heap
+page the least of what it reads; asked for alone, on DBpedia's
 1536 dimensions, the heap pages bought nothing, the exact path cold taking 113 ms a query under
 the 1% filter against 109 without. Reading a toasted vector's chunks ahead needs its TOAST
 pointer, from the heap tuple, first (§44.11).

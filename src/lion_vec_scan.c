@@ -2638,19 +2638,30 @@ lv_rerank(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
  * Whether a row's vector lies in its heap page, so that a fetch reads the
  * block its TID names and little else: the column's storage keeps it there
  * (PLAIN, or MAIN, which moves a value out only when its row outgrows the
- * page), or its size does - past TOAST_TUPLE_THRESHOLD, 506 dimensions of
- * vector and 1,012 of halfvec at 8K pages, EXTERNAL (pgvector's) and
- * EXTENDED move it to TOAST, which a fetch reaches through the TOAST index,
- * the heap page the least of what it reads.  An expression's vector is
- * judged by its size alone.  Asked for alone, on DBpedia's 1536 dimensions
- * in TOAST the heap pages bought nothing: the exact path cold took 113 ms a
- * query under a 1% filter against 109 without (DESIGN.md §44.4, "Prefetch").
+ * page), or its size does.  The heap moves a row's EXTERNAL (pgvector's)
+ * and EXTENDED values to TOAST, which a fetch reaches through the TOAST
+ * index, the heap page the least of what it reads, only once the row is
+ * past TOAST_TUPLE_THRESHOLD, and then only until it is within the table's
+ * toast_tuple_target (TOAST_TUPLE_TARGET, the same 2,032 bytes at 8K pages,
+ * unless the table sets it): a vector within the larger of the two stays,
+ * 506 dimensions of vector and 1,012 of halfvec at the defaults, all 2,000
+ * a vector index takes under toast_tuple_target = 8160, which the DBpedia
+ * benchmark loads its rows with (bench/vector/knn_dbpedia.py, KNN_INLINE).
+ * Judged by the threshold alone, as it was until 2026-10-17, those rows
+ * were taken to be in TOAST and their pages were never asked for.  The rest
+ * of a row counts too, which this leaves out: a vector just within may
+ * still go.  An expression's vector is judged by its size alone.  Asked for
+ * alone, on DBpedia's 1536 dimensions in TOAST the heap pages bought
+ * nothing: the exact path cold took 113 ms a query under a 1% filter
+ * against 109 without (DESIGN.md §44.4, "Prefetch").
  */
 static bool
 lv_vector_inline(const LvScanOpaque *so, Relation index, Relation heap)
 {
 	AttrNumber	attno = index->rd_index->indkey.values[0];
 	Size		sz = 8 + (Size) so->info->dims * (so->info->half ? 2 : 4);
+	int			target = RelationGetToastTupleTarget(heap, (int) TOAST_TUPLE_TARGET);
+	Size		within = Max((Size) TOAST_TUPLE_THRESHOLD, (Size) target);
 
 	if (attno > 0 && attno <= RelationGetDescr(heap)->natts)
 	{
@@ -2659,7 +2670,7 @@ lv_vector_inline(const LvScanOpaque *so, Relation index, Relation heap)
 		if (storage == TYPSTORAGE_PLAIN || storage == TYPSTORAGE_MAIN)
 			return true;
 	}
-	return sz <= TOAST_TUPLE_THRESHOLD;
+	return sz <= within;
 }
 
 /*
