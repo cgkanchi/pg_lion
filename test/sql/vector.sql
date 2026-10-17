@@ -455,11 +455,15 @@ SELECT row_number() OVER () AS n, id, d
   FROM (SELECT id, v <-> vt_vec(13, 40) AS d FROM vt ORDER BY v <-> vt_vec(13, 40)) s;
 RESET enable_seqscan;
 RESET enable_sort;
+-- the reference is the sort's order: exact, whatever plan PostgreSQL picks
+-- for the window (on 17+ it chose the lionvec scan, which v IS NOT NULL filters)
+SET pg_lion.vector_postfilter = exact;
 SELECT count(*) < 3006 AS stopped, count(*) > 0 AS "some rows",
 	   count(*) = count(*) FILTER (WHERE c.id = s.id) AS "the sort's first rows"
   FROM vt_cut c
   JOIN (SELECT row_number() OVER (ORDER BY v <-> vt_vec(13, 40), id) AS n, id
 		  FROM vt WHERE v IS NOT NULL) s USING (n);
+RESET pg_lion.vector_postfilter;
 DROP TABLE vt_cut;
 RESET pg_lion.vector_overflow;
 SET pg_lion.vector_overflow = 'grow';
