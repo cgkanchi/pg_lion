@@ -403,7 +403,7 @@ lion_bm25_column(Relation index, LionIndexState *ix)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("lion index \"%s\" does not store positions",
 						RelationGetRelationName(index)),
-				 errhint("Build it WITH (store_positions = true).")));
+				 errhint("Build it on a tsvector column without store_positions = off.")));
 	return found;
 }
 

@@ -221,7 +221,7 @@ SELECT * FROM lion_bm25('bm_docs_d', 'w1', -1);
 ERROR:  k must not be negative
 SELECT * FROM lion_bm25('bm_docs_d', 'w1', 10, -1);
 ERROR:  k1 must be at least 0 and b between 0 and 1
-CREATE INDEX bm_docs_plain ON bm_docs USING lion (d);
+CREATE INDEX bm_docs_plain ON bm_docs USING lion (d) WITH (store_positions = false);
 SELECT * FROM lion_bm25('bm_docs_plain', 'w1', 10);
 ERROR:  lion index "bm_docs_plain" does not store positions
 CREATE INDEX bm_docs_btree ON bm_docs (id);

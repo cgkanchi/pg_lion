@@ -174,7 +174,7 @@ CREATE INDEX lis_n ON lis USING lion (n);
 CREATE INDEX lis_t ON lis USING lion (t);
 CREATE INDEX lis_ci ON lis USING lion (ci);
 CREATE INDEX lis_tags ON lis USING lion (tags);
-CREATE INDEX lis_tsv ON lis USING lion (tsv);
+CREATE INDEX lis_tsv ON lis USING lion (tsv) WITH (store_positions = false);
 CREATE INDEX lis_gk ON lis USING lion (g, kk);
 CREATE INDEX lis_part ON lis USING lion (g) WHERE flag;
 CREATE INDEX lis_tpart ON lis USING lion (tags) WHERE flag2;

@@ -93,7 +93,7 @@ static const relopt_parse_elt lion_relopt_tab[] = {
 	{"wal_mode", RELOPT_TYPE_ENUM, offsetof(LionOptions, wal_mode)},
 	{"summaries", RELOPT_TYPE_ENUM, offsetof(LionOptions, summaries)},
 	{"summary_tids", RELOPT_TYPE_INT, offsetof(LionOptions, summary_tids)},
-	{"store_positions", RELOPT_TYPE_BOOL, offsetof(LionOptions, store_positions)}
+	{"store_positions", RELOPT_TYPE_ENUM, offsetof(LionOptions, store_positions)}
 };
 
 /* DESIGN.md §32: which key columns a build gives summary posting sets. */
@@ -109,6 +109,19 @@ static relopt_enum_elt_def lion_wal_mode_options[] = {
 	{"auto", LION_WALOPT_AUTO},
 	{"generic", LION_WALOPT_GENERIC},
 	{"rmgr", LION_WALOPT_RMGR},
+	{(const char *) NULL}
+};
+
+/*
+ * DESIGN.md §17: whether a build stores word positions.  "true" and "false"
+ * keep the option's boolean spellings, which it had before "auto".
+ */
+static relopt_enum_elt_def lion_store_positions_options[] = {
+	{"auto", LION_POSOPT_AUTO},
+	{"on", LION_POSOPT_ON},
+	{"off", LION_POSOPT_OFF},
+	{"true", LION_POSOPT_ON},
+	{"false", LION_POSOPT_OFF},
 	{(const char *) NULL}
 };
 
@@ -215,14 +228,19 @@ _PG_init(void)
 					  AccessExclusiveLock);
 
 	/*
-	 * DESIGN.md §17, "Stored positions".  Off by default: positions more than
-	 * double a tsvector index and answer only phrases, weights and `a & !b`.
-	 * Read at build time only and recorded on the meta page
-	 * (LION_META_POSITIONS), so it is REINDEX that adds or drops them.
+	 * DESIGN.md §17, "Stored positions".  "auto" by default: a tsvector
+	 * column stores them, as GIN keeps them, so that phrases, weights,
+	 * `a & !b` and BM25 are answered from the index without being asked
+	 * for; an index with no such column builds without them and without an
+	 * ERROR, which only "on" asked of it earns.  Positions roughly double a
+	 * tsvector index, which "off" saves.  Read at build time only and
+	 * recorded on the meta page (LION_META_POSITIONS), so it is REINDEX that
+	 * adds or drops them.
 	 */
-	add_bool_reloption(lion_relopt_kind, "store_positions",
+	add_enum_reloption(lion_relopt_kind, "store_positions",
 					   "Store word positions for phrase, weight and NOT queries",
-					   false,
+					   lion_store_positions_options, LION_POSOPT_AUTO,
+					   "Valid values are \"auto\", \"on\", \"off\", \"true\" and \"false\".",
 					   AccessExclusiveLock);
 
 	/*
@@ -1121,10 +1139,10 @@ lionbuildempty(Relation index)
 	 * the catalog, with a state no meta page has recorded anything in yet.
 	 */
 	memset(&meta, 0, sizeof(meta));
-	if (opts != NULL && opts->store_positions)
+	if (opts == NULL || opts->store_positions != LION_POSOPT_OFF)
 		meta.order_flags |= LION_META_POSITIONS;
 	lion_fill_index_state(index, &ix, &meta, CurrentMemoryContext);
-	lion_check_store_positions(index, &ix);
+	lion_settle_store_positions(index, &ix);
 	lion_meta_record_order(&meta, &ix);	/* not in the critical section */
 
 	/*

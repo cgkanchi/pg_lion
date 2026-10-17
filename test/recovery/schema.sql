@@ -231,9 +231,12 @@ LANGUAGE sql IMMUTABLE AS $$
 	   'select coalesce(sum(greatest(1, cardinality(u))), 0) from '
 	   '(select array(select distinct e from unnest(arr) x(e) where e is not null) u '
 	   'from lion_rec) s'),
+	  /* ... and, as it stores positions (store_positions = auto, the
+	   * default, DESIGN.md §17), one more under the length key for a row
+	   * with a lexeme. */
 	  ('lion_rec_tsv',
-	   'select coalesce(sum(greatest(1, coalesce(array_length(tsvector_to_array(tsv), 1), 0))), 0) '
-	   'from lion_rec')
+	   'select coalesce(sum(greatest(1, n) + (n > 0)::int), 0) '
+	   'from (select coalesce(array_length(tsvector_to_array(tsv), 1), 0) n from lion_rec) s')
 $$;
 
 /*

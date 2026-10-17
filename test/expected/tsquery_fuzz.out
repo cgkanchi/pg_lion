@@ -27,7 +27,7 @@ FROM (SELECT i, (SELECT coalesce(string_agg(format('w%s:%s%s', (random()*9)::int
 				 WHERE i > 0)::tsvector AS d
 	  FROM generate_series(1, 4000) i) s;
 CREATE TABLE fz_g AS SELECT * FROM fz; CREATE INDEX ON fz_g USING gin (tsv);
-CREATE TABLE fz_l AS SELECT * FROM fz; CREATE INDEX ON fz_l USING lion (tsv);
+CREATE TABLE fz_l AS SELECT * FROM fz; CREATE INDEX ON fz_l USING lion (tsv) WITH (store_positions = false);
 CREATE TABLE fz_lp AS SELECT * FROM fz; CREATE INDEX fz_lp_i ON fz_lp USING lion (tsv) WITH (store_positions = true);
 VACUUM ANALYZE fz, fz_g, fz_l, fz_lp;
 CREATE FUNCTION fz_q(depth int) RETURNS text LANGUAGE plpgsql AS $$

@@ -4178,6 +4178,319 @@ test_mark_members(void)
 }
 
 /* ----------------------------------------------------------------
+ *		the union of a key's pieces, merged (DESIGN.md §30.4)
+ *
+ * or_merge() against the reference and against the image it replaces in
+ * LionOrdered's set build - the pieces ORed into a bitset image which is
+ * then turned into a container, as lion_bits_to_container() does: the same
+ * members, and byte for byte the same container, for pieces of every
+ * representation, overlapping, repeated and empty, up to the
+ * LION_ARRAY_MAX_CARD values it takes; false past that, and for a damaged
+ * piece whose header hides that its payload yields more.
+ * ----------------------------------------------------------------
+ */
+
+#define OM_MAXP 64
+
+static CBuf om_piece[OM_MAXP];
+static CBuf om_image;
+static uint64 om_img[LION_BITSET_WORDS];
+
+/*
+ * A piece of about m members (m > 0) in representation t, unoptimized, as a
+ * source may hand one out: an ARRAY; a RUN of runs of up to 8; a BITSET or a
+ * NARROW of width k of those few members.  r gets its members.
+ */
+static void
+om_gen_piece(Ref *r, CBuf *b, LionContainerType t, uint32 m)
+{
+	switch (t)
+	{
+		case LION_CT_RUN:
+			ref_init(r);
+			while (r->card < m)
+			{
+				uint32		len = Min(1 + rng_below(8), m - r->card);
+				uint32		start = rng_below(LION_CONTAINER_RANGE - len);
+				uint32		j;
+
+				for (j = 0; j < len; j++)
+					(void) ref_add(r, start + j);
+			}
+			build_run_direct(b, r);
+			break;
+		case LION_CT_BITSET:
+			gen_random(r, m);
+			build_by_append(b, r);
+			lion_container_to_bitset(&b->c);
+			break;
+		case LION_CT_NARROW:
+			gen_narrow(r, m, rand_width());
+			build_narrow_direct(b, r, 0);
+			break;
+		default:
+			gen_random(r, m);
+			build_by_append(b, r);
+			break;
+	}
+}
+
+/* The image's union of c[0 .. n - 1] into out: lion_bits_to_container()'s steps. */
+static void
+om_image_union(const LionContainer *const *c, uint32 n, CBuf *out)
+{
+	uint32		card;
+	uint32		i;
+
+	memset(om_img, 0, sizeof(om_img));
+	for (i = 0; i < n; i++)
+		lion_container_or_into_bitset(c[i], om_img);
+	card = lion_container_image_cardinality(om_img);
+	lion_container_init(&out->c, TEST_CKEY);
+	if (card == 0)
+		return;
+	lion_container_to_bitset(&out->c);
+	memcpy(LION_BITSET_DATA(&out->c), om_img, LION_BITSET_BYTES);
+	out->c.cardinality = (uint16) card;
+	lion_container_optimize(&out->c);
+}
+
+/*
+ * or_merge() of om_piece[0 .. n - 1], whose union ref_r holds: it must
+ * succeed, agree with the reference and be the image's container byte for
+ * byte.  buf_d is filled with garbage first: nothing of it may survive.
+ */
+static void
+om_check(uint32 n, const char *what)
+{
+	const LionContainer *ps[OM_MAXP] = {NULL};
+	uint32		i;
+	bool		ok;
+
+	for (i = 0; i < n; i++)
+		ps[i] = &om_piece[i].c;
+	memset(&buf_d, 0x5A, sizeof(buf_d));
+	ok = lion_container_or_merge(ps, n, TEST_CKEY, &buf_d.c);
+	CHECK(ok, what);
+	if (!ok)
+		return;
+	verify_full(&buf_d.c, &ref_r);
+	om_image_union(ps, n, &om_image);
+	CHECK(lion_container_size(&buf_d.c) == lion_container_size(&om_image.c) &&
+		  memcmp(&buf_d.c, &om_image.c, lion_container_size(&om_image.c)) == 0,
+		  "or_merge() makes the image's container byte for byte");
+}
+
+static void
+test_or_merge(void)
+{
+	const LionContainer *ps[OM_MAXP];
+	uint32		k;
+	uint32		i;
+	uint32		t;
+	static const LionContainerType types[] =
+	{LION_CT_ARRAY, LION_CT_RUN, LION_CT_BITSET, LION_CT_NARROW};
+
+	rng_seed(UINT64CONST(0x5EED4004));
+
+	phase("or_merge(): no pieces, empty pieces, one piece");
+	ref_init(&ref_r);
+	om_check(0, "no pieces: an empty ARRAY");
+	CHECK(buf_d.c.type == LION_CT_ARRAY && buf_d.c.cardinality == 0,
+		  "no pieces leave an empty ARRAY");
+	for (i = 0; i < 3; i++)
+		lion_container_init(&om_piece[i].c, TEST_CKEY);
+	om_check(3, "three empty pieces");
+	for (t = 0; t < lengthof(types); t++)
+	{
+		/* one piece of each representation, alone and between empty ones */
+		om_gen_piece(&ref_r, &om_piece[1], types[t], 1 + rng_below(200));
+		lion_container_init(&om_piece[0].c, TEST_CKEY);
+		lion_container_init(&om_piece[2].c, TEST_CKEY);
+		om_check(3, "one piece between empty ones");
+		om_piece[0] = om_piece[1];
+		om_check(1, "a single piece");
+	}
+
+	phase("or_merge(): overlapping and repeated pieces");
+	for (k = 0; k < 20; k++)
+	{
+		/* b shares about half of a's members; a then comes again */
+		gen_random(&ref_a, 1 + rng_below(300));
+		build_by_append(&om_piece[0], &ref_a);
+		ref_init(&ref_b);
+		for (i = 0; i < LION_CONTAINER_RANGE; i++)
+			if (ref_a.m[i] && rng_below(2) == 0)
+				(void) ref_add(&ref_b, i);
+		for (i = 0; i < 50; i++)
+			(void) ref_add(&ref_b, rng_below(LION_CONTAINER_RANGE));
+		build_by_append(&om_piece[1], &ref_b);
+		if (k % 2)
+			lion_container_optimize(&om_piece[1].c);	/* a RUN, now and then */
+		om_piece[2] = om_piece[0];
+		om_piece[3] = om_piece[1];
+		ref_init(&ref_r);
+		ref_union_into(&ref_r, &ref_a);
+		ref_union_into(&ref_r, &ref_b);
+		om_check(4, "overlapping and repeated pieces");
+	}
+
+	phase("or_merge(): LION_ARRAY_MAX_CARD values together, and one more");
+	for (k = 0; k < 6; k++)
+	{
+		/* 8 ARRAYs of 256, overlapping when k is odd: 2048 values */
+		ref_init(&ref_r);
+		for (i = 0; i < 8; i++)
+		{
+			if (k % 2 == 1 && i % 2 == 1)
+			{
+				/* the piece before again: repeats, counted as values */
+				om_piece[i] = om_piece[i - 1];
+				continue;
+			}
+			om_gen_piece(&ref_a, &om_piece[i], types[k % 2 ? 0 : (i % 4)], 256);
+			ref_union_into(&ref_r, &ref_a);
+		}
+		for (i = 0; i < 8; i++)
+			CHECK(om_piece[i].c.cardinality == 256, "pieces of 256 members");
+		om_check(8, "2048 values together are merged");
+
+		/* one member more, in a piece of its own: refused */
+		lion_container_init(&om_piece[8].c, TEST_CKEY);
+		(void) lion_container_add(&om_piece[8].c, (uint16) rng_below(LION_CONTAINER_RANGE));
+		for (i = 0; i < 9; i++)
+			ps[i] = &om_piece[i].c;
+		CHECK(!lion_container_or_merge(ps, 9, TEST_CKEY, &buf_d.c),
+			  "2049 values together are refused, repeats counted");
+	}
+
+	/*
+	 * LionOrdered merges the pieces of up to LION_WIDTH_ARRAY_CARD(1)
+	 * members this way (LO_MERGE_DIRECT_MAX): that many leave an ARRAY or a
+	 * RUN, one more spread over every block and offset a NARROW - which
+	 * or_merge() makes too, as the image does.
+	 */
+	phase("or_merge(): LION_WIDTH_ARRAY_CARD(1) members, and one more");
+	for (k = 0; k < 8; k++)
+	{
+		uint32		total = LION_WIDTH_ARRAY_CARD(1) + (k % 2);
+		uint32		np = 1 + rng_below(16);
+
+		/* members no two adjacent, at offsets below 64, dealt to np pieces */
+		gen_narrow_sparse(&ref_r, total, 1);
+		for (i = 0; i < np; i++)
+			lion_container_init(&om_piece[i].c, TEST_CKEY);
+		for (i = 0, t = 0; i < LION_CONTAINER_RANGE; i++)
+			if (ref_r.m[i])
+				lion_container_append_sorted(&om_piece[t++ % np].c, (uint16) i);
+		om_check(np, "the threshold's members are merged");
+		CHECK(buf_d.c.type == ((k % 2) ? LION_CT_NARROW : LION_CT_ARRAY),
+			  "256 members leave an ARRAY, 257 at offsets below 64 a NARROW");
+	}
+
+	phase("or_merge(): ARRAYs, RUNs, BITSETs and NARROWs mixed, at random");
+	for (k = 0; k < 2000; k++)
+	{
+		uint32		np = 1 + rng_below(k < 1000 ? 8 : OM_MAXP);
+		uint32		budget = (k % 3 == 0) ? 64 : (k % 3 == 1) ? 600 : 2600;
+		uint32		values = 0;
+		bool		ok;
+
+		ref_init(&ref_r);
+		for (i = 0; i < np; i++)
+		{
+			uint32		m = rng_below(budget / np + 1);
+
+			if (m == 0)
+				lion_container_init(&om_piece[i].c, TEST_CKEY);
+			else
+			{
+				om_gen_piece(&ref_a, &om_piece[i], types[rng_below(4)], m);
+				ref_union_into(&ref_r, &ref_a);
+			}
+			values += om_piece[i].c.cardinality;
+			ps[i] = &om_piece[i].c;
+		}
+		if (values <= LION_ARRAY_MAX_CARD)
+			om_check(np, "a mix of pieces within LION_ARRAY_MAX_CARD is merged");
+		else
+		{
+			ok = lion_container_or_merge(ps, np, TEST_CKEY, &buf_d.c);
+			CHECK(!ok, "a mix of more than LION_ARRAY_MAX_CARD values is refused");
+		}
+	}
+
+	/*
+	 * Damaged pieces, in exact buffers: a header that claims fewer members
+	 * than the payload yields cannot carry the merge past its 2048 values,
+	 * and an ARRAY's members out of order, repeated or past the range come
+	 * out a well-formed ARRAY of the members as iterate() masks them.
+	 */
+	phase("or_merge(): damaged pieces");
+	{
+		LionRun    *runs;
+		uint16	   *arr;
+
+		/* a RUN that claims 2 members and holds 3000 */
+		lion_container_init(dmg_a, TEST_CKEY);
+		dmg_a->type = LION_CT_RUN;
+		LION_RUN_NRUNS(dmg_a) = 1;
+		runs = LION_RUN_DATA(dmg_a);
+		runs[0].start = 100;
+		runs[0].len_minus_1 = 2999;
+		dmg_a->cardinality = 2;
+		ps[0] = dmg_a;
+		CHECK(!lion_container_or_merge(ps, 1, TEST_CKEY, dmg_dst),
+			  "a RUN hiding 3000 members is refused");
+		CHECK(guard_ok(dmg_dst, LION_CONTAINER_MAX_SIZE), "... inside dest");
+
+		/* a BITSET that claims 1 member and holds 4000 */
+		lion_container_init(dmg_b, TEST_CKEY);
+		lion_container_to_bitset(dmg_b);
+		memset(LION_BITSET_DATA(dmg_b), 0, LION_BITSET_BYTES);
+		for (i = 0; i < 4000; i++)
+			LION_BITSET_DATA(dmg_b)[i >> 6] |= UINT64CONST(1) << (i & 63);
+		dmg_b->cardinality = 1;
+		ps[0] = dmg_b;
+		CHECK(!lion_container_or_merge(ps, 1, TEST_CKEY, dmg_dst),
+			  "a BITSET hiding 4000 members is refused");
+		CHECK(guard_ok(dmg_dst, LION_CONTAINER_MAX_SIZE), "... inside dest");
+
+		/* an ARRAY whose members are out of order, repeated, past the range */
+		lion_container_init(dmg_a, TEST_CKEY);
+		arr = LION_ARRAY_DATA(dmg_a);
+		memset(arr, 0, LION_BITSET_BYTES);
+		ref_init(&ref_r);
+		for (i = 0; i < 300; i++)
+		{
+			uint32		v = rng_below(2 * LION_CONTAINER_RANGE);
+
+			if (i > 0 && rng_below(5) == 0)
+				v = arr[i - 1];
+			arr[i] = (uint16) v;
+			(void) ref_add(&ref_r, v & (LION_CONTAINER_RANGE - 1));
+		}
+		dmg_a->cardinality = 300;
+		ps[0] = dmg_a;
+		om_gen_piece(&ref_a, &om_piece[0], LION_CT_RUN, 40);
+		ref_union_into(&ref_r, &ref_a);
+		ps[1] = &om_piece[0].c;
+		CHECK(lion_container_or_merge(ps, 2, TEST_CKEY, dmg_dst),
+			  "an ARRAY out of order is merged");
+		CHECK(guard_ok(dmg_dst, LION_CONTAINER_MAX_SIZE), "... inside dest");
+		verify_full(dmg_dst, &ref_r);
+
+		/* an ARRAY whose header claims past LION_ARRAY_MAX_CARD: clamped, refused with more */
+		dmg_a->cardinality = LION_ARRAY_MAX_CARD + 100;
+		ps[0] = dmg_a;
+		ps[1] = &om_piece[0].c;
+		CHECK(!lion_container_or_merge(ps, 2, TEST_CKEY, dmg_dst),
+			  "an ARRAY claiming more than LION_ARRAY_MAX_CARD members, and another, are refused");
+		CHECK(guard_ok(dmg_dst, LION_CONTAINER_MAX_SIZE), "... inside dest");
+	}
+}
+
+/* ----------------------------------------------------------------
  *		the AND of a few members with a union (DESIGN.md §29.11)
  *
  * and_union_raw() against the reference: a AND (b[0] OR ... OR b[nb-1]),
@@ -6485,6 +6798,7 @@ main(void)
 	test_or_inplace();
 	test_add_many();
 	test_mark_members();
+	test_or_merge();
 	test_and_union();
 	test_tree_probe();
 	test_bitset_kernels();
