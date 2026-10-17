@@ -15,8 +15,9 @@
  *	- set_rel_pathlist_hook, the same way for the LionOrdered path pg_lion
  *	  adds to a base rel (DESIGN.md §30);
  *	- when preloaded, a custom WAL resource manager under the id in
- *	  lion_hooktest.rmgr_id, RM_EXPERIMENTAL_ID by default - pg_lion's own
- *	  default, so that the collision is the default case;
+ *	  lion_hooktest.rmgr_id, RM_EXPERIMENTAL_ID by default (pg_lion's own
+ *	  is its reserved 170; test/hook-check.sh moves this one onto it for
+ *	  the collision);
  *	- a GUC prefix of its own, reserved the way pg_lion reserves "pg_lion";
  *	- object_access_hook, refusing the execution of the one function named by
  *	  OID in lion_hooktest.deny_execute, as a security module such as sepgsql
