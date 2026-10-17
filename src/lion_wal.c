@@ -58,16 +58,16 @@
 /*
  * The rmid of pg_lion.rmgr_id, which is what this server registered us under
  * when lion_rmgr_is_registered is true - and only then.  Without the preload
- * the GUC is never defined and this keeps its initial value, 128, which is
- * NOT an id this server knows: a record inserted under it cannot be replayed
- * ("resource manager with ID 128 not registered" stops crash recovery and
- * every standby).  So nothing may call XLogInsert() with it unless
- * lion_rmgr_is_registered says so: lion_wal_begin() refuses to open an
- * rmgr-mode record without it, and the standby barrier never collects one
+ * the GUC is never defined and this keeps its initial value, LION_RMGR_ID
+ * (170), which is NOT an id this server knows: a record inserted under it
+ * cannot be replayed ("resource manager with ID 170 not registered" stops
+ * crash recovery and every standby).  So nothing may call XLogInsert() with
+ * it unless lion_rmgr_is_registered says so: lion_wal_begin() refuses to open
+ * an rmgr-mode record without it, and the standby barrier never collects one
  * (lion_wal_visit()).  The initial value stays the GUC's boot value because
  * that is what the GUC machinery expects the variable to hold.
  */
-int			lion_rmgr_id = RM_EXPERIMENTAL_ID;
+int			lion_rmgr_id = LION_RMGR_ID;
 static bool lion_rmgr_is_registered = false;
 
 /* ---------------------------------------------------------------------
@@ -320,7 +320,7 @@ lion_wal_visit(Relation index, BlockNumber blk)
 	 * resource manager (2026-09-25 review).  The list used to be collected
 	 * all the same, and once it outgrew pg_lion.vacuum_barrier_ranges it
 	 * went out in a VACUUM_VISIT record under an id this server does not
-	 * know: pg_waldump showed custom128 records of an UNKNOWN type after a
+	 * know: pg_waldump showed custom records of an UNKNOWN type after a
 	 * VACUUM of a partial index that removed nothing, and crash recovery or
 	 * a standby stops with a FATAL at such a record.  Visiting a page changes
 	 * nothing, so it is not refused the way a write is (lion_wal_begin());
@@ -1654,12 +1654,12 @@ static const RmgrData lion_rmgr = {
  * any later call, because a record whose manager is not loaded cannot be
  * replayed.
  *
- * The id comes from a GUC because 128 (RM_EXPERIMENTAL_ID) is the id the
- * PostgreSQL project reserves for development, and two extensions that both
- * take it cannot be loaded together.  A release of this extension has to
- * either reserve an id on the wiki page the core documentation names
- * (https://wiki.postgresql.org/wiki/CustomWALResourceManagers) or keep the
- * GUC and document it; the GUC stays either way, because the whole point of
+ * The default, LION_RMGR_ID (170), is the id reserved for pg_lion on the
+ * wiki page the core documentation names
+ * (https://wiki.postgresql.org/wiki/CustomWALResourceManagers).  It comes
+ * from a GUC all the same, because the list is only a convention: an
+ * extension that never put itself on it, or one in development on 128
+ * (RM_EXPERIMENTAL_ID), can still want the same id, and the whole point of
  * a reserved range is that a site can move out of a collision.
  *
  * Once an index in this cluster has been written in rmgr mode, the library
@@ -1700,9 +1700,9 @@ lion_wal_init(void)
 
 	DefineCustomIntVariable("pg_lion.rmgr_id",
 							"WAL resource manager id pg_lion registers under.",
-							"Only read while the library is preloaded. The default, 128, is the id reserved for development; a cluster that loads two extensions wanting it has to move one of them.",
+							"Only read while the library is preloaded. The default, 170, is the id reserved for pg_lion; change it only to move out of a collision with another extension, after a clean shutdown.",
 							&lion_rmgr_id,
-							RM_EXPERIMENTAL_ID,
+							LION_RMGR_ID,
 							RM_MIN_CUSTOM_ID, RM_MAX_CUSTOM_ID,
 							PGC_POSTMASTER,
 							0,

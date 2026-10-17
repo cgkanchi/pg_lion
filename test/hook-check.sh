@@ -23,10 +23,11 @@
 #      after - and every custom node under an object access hook that refuses
 #      the function it stands in for (sql/exec_hook.sql);
 #   2. shared_preload_libraries = 'pg_lion,lion_hooktest' (the other hook
-#      outermost) and 'lion_hooktest,pg_lion' (pg_lion's outermost), with
-#      pg_lion.rmgr_id moved to 129 so the two resource managers coexist;
-#   3. both resource managers on the default id 128: the server must refuse
-#      to start, and say why;
+#      outermost) and 'lion_hooktest,pg_lion' (pg_lion's outermost), each
+#      resource manager on its default id (pg_lion's reserved 170,
+#      lion_hooktest's development 128), so the two coexist;
+#   3. lion_hooktest.rmgr_id moved onto pg_lion's 170, another extension
+#      taking pg_lion's id: the server must refuse to start, and say why;
 #   4. shared_buffers = 128kB, sixteen buffers, fewer than one per
 #      connection: the counts of test/modules/lion_hooktest/sql/pinpool.sql,
 #      whose pin budgets used to have floors of their own and ran such a pool
@@ -125,13 +126,13 @@ run "no preload, lion_hooktest LOADed first" hooks_setup hooks_lion_outer
 run "no preload, pg_lion loaded first" hooks_setup hooks_hooktest_outer
 
 # ---- 2. both preloaded, both orders ----------------------------------------
-if start_with "-c shared_preload_libraries=pg_lion,lion_hooktest -c pg_lion.rmgr_id=129"; then
+if start_with "-c shared_preload_libraries=pg_lion,lion_hooktest"; then
 	run "preload pg_lion,lion_hooktest" hooks_setup hooks_hooktest_outer hooks_rmgr
 	full "preload pg_lion,lion_hooktest"
 else
 	FAILED="$FAILED [preload pg_lion,lion_hooktest: server did not start]"
 fi
-if start_with "-c shared_preload_libraries=lion_hooktest,pg_lion -c pg_lion.rmgr_id=129"; then
+if start_with "-c shared_preload_libraries=lion_hooktest,pg_lion"; then
 	run "preload lion_hooktest,pg_lion" hooks_setup hooks_lion_outer hooks_rmgr
 	full "preload lion_hooktest,pg_lion"
 else
@@ -139,12 +140,12 @@ else
 fi
 
 # ---- 3. both resource managers on the same id ------------------------------
-echo "== preload pg_lion,lion_hooktest, both on resource manager id 128"
+echo "== preload pg_lion,lion_hooktest, both on resource manager id 170"
 before=$(wc -c < "$LOG")
-if start_with "-c shared_preload_libraries=pg_lion,lion_hooktest"; then
+if start_with "-c shared_preload_libraries=pg_lion,lion_hooktest -c lion_hooktest.rmgr_id=170"; then
 	FAILED="$FAILED [rmgr id collision: the server started]"
 elif tail -c +"$((before + 1))" "$LOG" |
-		grep -q 'failed to register custom resource manager "lion_hooktest" with ID 128'; then
+		grep -q 'failed to register custom resource manager "lion_hooktest" with ID 170'; then
 	echo "   refused, as it must be: $(tail -c +"$((before + 1))" "$LOG" | grep -m1 -A1 'failed to register' | tr '\n' ' ')"
 else
 	FAILED="$FAILED [rmgr id collision: no registration error in $LOG]"
