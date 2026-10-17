@@ -15719,7 +15719,10 @@ than overruns (§30.4).
   slots alone would take `hash_mem`), before their bytes would degrade the set (once there are at
   least as many pieces as merged entries), and when the source is complete. A merge sorts only the
   pieces since the last one, by key and slot packed into a word, and merges them with the entries
-  that one left, which are in order.
+  that one left, which are in order. The sort is a merge of the ascending runs the pieces already
+  lie in (`lo_merge_slots()`): a source hands them out entry by entry or bucket by bucket, each in
+  key order, so a summary's few buckets make a few long runs, which take a pass or two, and a range
+  over unique values, runs of a piece or two, costs a merge sort.
   **Merging the pieces.** The pieces of a key that hold `LO_MERGE_DIRECT_MAX` members or fewer
   together - `LION_WIDTH_ARRAY_CARD(1)`, 256 at 8K, an ARRAY as large as the narrowest NARROW, so
   that the union is always an ARRAY or a RUN - are merged member by member
@@ -15759,7 +15762,10 @@ than overruns (§30.4).
   lionvec scan: a cost of the keys, a heap block in 64, not of the members, which a million rows
   read as a fixed 35-45 ms. Merged member by member, 3 pieces of 6 take 40 ns against the image's
   1.2 us, and 25 of 64 0.2 us against 1.4; the queries took 9.5 -> 6.6 ms at `u < 0.1`, 9.6 -> 6.7
-  at `u < 0.3` and 14.3 -> 11.6 at `u < 1.0`, with the same rows.)*
+  at `u < 0.3` and 14.3 -> 11.6 at `u < 1.0`, with the same rows. That left the sort of the
+  slots, a quicksort, the largest part of a merge: 16% of the query at `u < 1.0`, whose 45,000
+  pieces come in 25 runs, which the quicksort took 2.4 ms over and a merge of the runs takes 0.34
+  (measured apart); the query then took 9.1 ms, and the set build 69% of it.)*
 - **Exact, or rechecked.** The set is EXACT when every leaf's `lion_source_exact()` is true, no
   lion index clause was lossy and the set did not degrade. Then every member satisfies the
   `lionqual` and nothing is rechecked; otherwise every fetched member is tested against the
