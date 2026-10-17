@@ -45,6 +45,7 @@
 #include "access/amvalidate.h"
 #include "access/parallel.h"
 #include "access/generic_xlog.h"
+#include "access/heaptoast.h"
 #include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/table.h"
@@ -88,6 +89,7 @@
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
 #include "utils/wait_event.h"
+#include "varatt.h"
 
 #include "lion_compat.h"
 #include "lion_readahead.h"
@@ -105,6 +107,7 @@ double		lionvec_exact_per_part = LIONVEC_EXACT_PER_PART_DEFAULT;
 int			lionvec_overflow = LIONVEC_OVERFLOW_ERROR;
 int			lionvec_postfilter = LIONVEC_POSTFILTER_ERROR;
 int			lionvec_prefetch = LION_READAHEAD_DEFAULT;
+bool		lionvec_toast_direct = true;
 bool		lionvec_parallel_scan = false;
 
 static const struct config_enum_entry lionvec_overflow_options[] = {
@@ -318,6 +321,26 @@ lion_vec_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §44.13: a vector in TOAST read from its chunks' pages, by
+	 * the places the index keeps, instead of through the heap page and the
+	 * TOAST index; every place checked, and a row read so returned only once
+	 * its heap tuple shows the same value.  Off reads every row as before,
+	 * which the regression tests compare against.
+	 */
+	DefineCustomBoolVariable("pg_lion.vector_toast_direct",
+							 "Whether a lionvec scan reads a vector stored in TOAST from its chunks' "
+							 "pages, by the places its index keeps.",
+							 "An index of vectors that may lie in TOAST keeps where each row's chunks are; "
+							 "a scan then reads a row's vector there, checking every chunk, rather than "
+							 "through the row's heap page and the TOAST index.  The rows returned are the "
+							 "same either way.",
+							 &lionvec_toast_direct,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
 	 * DESIGN.md §44.4, "A parallel scan": correct, but slower than the serial
 	 * scan on every query measured (each participant probes about as much as
 	 * one scan does, and Gather Merge waits on the slowest), so its partial
@@ -488,6 +511,47 @@ lionvec_datum_floats(Datum d, bool half, float *buf, int bufdim, int *dim,
 	return buf;
 }
 
+/*
+ * Whether a row's vector lies in its heap page, so that a fetch reads the
+ * block its TID names and little else: the column's storage keeps it there
+ * (PLAIN, or MAIN, which moves a value out only when its row outgrows the
+ * page), or its size does - dims dimensions of a vector, or of a halfvec if
+ * half; 0 when not yet known, which this takes to be past any threshold.
+ * The heap moves a row's EXTERNAL (pgvector's) and EXTENDED values to TOAST,
+ * which a fetch reaches through the TOAST index, the heap page the least of
+ * what it reads, only once the row is past TOAST_TUPLE_THRESHOLD, and then
+ * only until it is within the table's toast_tuple_target
+ * (TOAST_TUPLE_TARGET, the same 2,032 bytes at 8K pages, unless the table
+ * sets it): a vector within the larger of the two stays, 506 dimensions of
+ * vector and 1,012 of halfvec at the defaults, all 2,000 a vector index
+ * takes under toast_tuple_target = 8160, which the DBpedia benchmark loads
+ * its rows with (bench/vector/knn_dbpedia.py, KNN_INLINE).  Judged by the
+ * threshold alone, as it was until 2026-10-17, those rows were taken to be
+ * in TOAST and their pages were never asked for.  The rest of a row counts
+ * too, which this leaves out: a vector just within may still go.  An
+ * expression's vector is judged by its size alone.  The scan asks for heap
+ * pages ahead only where this holds (lion_vec_scan.c, lv_start_prefetch();
+ * DESIGN.md §44.4, "Prefetch"), and the build keeps a locator only where it
+ * does not, or where it met a row in TOAST all the same (§44.13).
+ */
+bool
+lionvec_vector_inline(Relation index, Relation heap, int dims, bool half)
+{
+	AttrNumber	attno = index->rd_index->indkey.values[0];
+	Size		sz = 8 + (Size) dims * (half ? 2 : 4);
+	int			target = RelationGetToastTupleTarget(heap, (int) TOAST_TUPLE_TARGET);
+	Size		within = Max((Size) TOAST_TUPLE_THRESHOLD, (Size) target);
+
+	if (attno > 0 && attno <= RelationGetDescr(heap)->natts)
+	{
+		char		storage = TupleDescAttr(RelationGetDescr(heap), attno - 1)->attstorage;
+
+		if (storage == TYPSTORAGE_PLAIN || storage == TYPSTORAGE_MAIN)
+			return true;
+	}
+	return dims > 0 && sz <= within;
+}
+
 /* pgvector's own error, so a query reads the same with or without the index */
 void
 lionvec_check_dims(const LionVecInfo *info, int dim)
@@ -536,7 +600,7 @@ lionvec_index_metric(Relation index)
  * ----------------------------------------------------------------
  */
 
-static void
+void
 lionvec_init_page(Page page, uint16 type)
 {
 	LionVecPageOpaque op;
@@ -613,11 +677,13 @@ lionvec_code_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
  * The REFINE item of the row tid at (blk, off), or NULL when it is not there
  * any more: VACUUM removed it, and the slot may hold another row's since
  * (§44.5).  A row VACUUM removes is dead to every snapshot, so a scan that
- * finds it gone loses nothing.
+ * finds it gone loses nothing.  reflocruns is the meta page's: the runs of
+ * the TOAST place every REFINE item of the index ends with, 0 for none
+ * (§44.13), of which an item uses no more.
  */
 LionVecRefine *
 lionvec_refine_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
-				  int dimsp, ItemPointer tid)
+				  int dimsp, int reflocruns, ItemPointer tid)
 {
 	ItemId		iid;
 	LionVecRefine *ref;
@@ -627,12 +693,17 @@ lionvec_refine_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 	iid = PageGetItemId(page, off);
 	if (!ItemIdIsNormal(iid))
 		return NULL;
-	if (ItemIdGetLength(iid) != LIONVEC_REFINE_SIZE(dimsp))
+	if (ItemIdGetLength(iid) != LIONVEC_REFINE_ITEM_SIZE(dimsp, reflocruns))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has a refine item of %u bytes at (%u,%u)",
 						RelationGetRelationName(index), ItemIdGetLength(iid), blk, off)));
 	ref = (LionVecRefine *) PageGetItem(page, iid);
+	if (ref->nloc > reflocruns)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lionvec index \"%s\" has a refine item of %u places at (%u,%u)",
+						RelationGetRelationName(index), ref->nloc, blk, off)));
 	/* not ItemPointerEquals(), which asserts against a centroid's TID */
 	return ItemPointerGetBlockNumberNoCheck(&ref->tid) == ItemPointerGetBlockNumberNoCheck(tid) &&
 		ItemPointerGetOffsetNumberNoCheck(&ref->tid) == ItemPointerGetOffsetNumberNoCheck(tid) ?
@@ -719,6 +790,7 @@ lionvec_region_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 	return reg;
 }
 
+/* The meta page checked. */
 static void
 lionvec_check_meta(Relation index, Page page)
 {
@@ -736,6 +808,28 @@ lionvec_check_meta(Relation index, Page page)
 				 errmsg("lionvec index \"%s\" has format version %u, and this pg_lion reads version %d",
 						RelationGetRelationName(index), meta->version, LIONVEC_VERSION),
 				 errhint("REINDEX it.")));
+	/*
+	 * The locator's fields: all of them with the flag, none without.
+	 * loc_root is not read (§44.13, "A second level"), and a later format
+	 * may set it.
+	 */
+	if ((meta->flags & LIONVEC_META_LOCATOR) != 0 ?
+		(!BlockNumberIsValid(meta->loc_head) ||
+		 !BlockNumberIsValid(meta->loc_dtail) ||
+		 !BlockNumberIsValid(meta->loc_tail) ||
+		 !OidIsValid(meta->toastrelid) ||
+		 meta->loc_bpages > meta->loc_built ||
+		 (meta->loc_built > 0) != (meta->loc_bpages > 0) ||
+		 meta->refloc_runs > LIONVEC_LOC_MAXRUNS ||
+		 (meta->refloc_runs > 0 && meta->dims == 0)) :
+		(BlockNumberIsValid(meta->loc_head) ||
+		 BlockNumberIsValid(meta->loc_dtail) ||
+		 BlockNumberIsValid(meta->loc_tail) ||
+		 meta->refloc_runs != 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lionvec index \"%s\" has a malformed meta page",
+						RelationGetRelationName(index))));
 	if (meta->metric < 1 || meta->metric > LIONVEC_NSTRATEGIES ||
 		meta->dims < 0 || meta->dims > LIONVEC_MAX_DIM ||
 		meta->dimsp != LIONVEC_PADDED(meta->dims) ||
@@ -746,7 +840,7 @@ lionvec_check_meta(Relation index, Page page)
 		(meta->nregions > 0) != BlockNumberIsValid(meta->region_head) ||
 		meta->nregions > meta->nparts ||
 		(meta->nparts > 0 && meta->dims == 0) ||
-		(meta->flags & ~LIONVEC_META_SPILL) != 0 ||
+		(meta->flags & ~(LIONVEC_META_SPILL | LIONVEC_META_LOCATOR)) != 0 ||
 		((meta->flags & LIONVEC_META_SPILL) != 0 && meta->nparts < 2))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -754,17 +848,22 @@ lionvec_check_meta(Relation index, Page page)
 						RelationGetRelationName(index))));
 }
 
+/* A copy of the meta page, checked, the caller holding a lock on it. */
+void
+lionvec_meta_copy(Relation index, Page page, LionVecMetaData *meta)
+{
+	lionvec_check_meta(index, page);
+	*meta = *LionVecPageGetMeta(page);
+}
+
 /* A copy of the meta page, read under a share lock. */
 void
 lionvec_read_meta(Relation index, LionVecMetaData *meta)
 {
 	Buffer		buf = ReadBuffer(index, LIONVEC_METAPAGE);
-	Page		page;
 
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page = BufferGetPage(buf);
-	lionvec_check_meta(index, page);
-	*meta = *LionVecPageGetMeta(page);
+	lionvec_meta_copy(index, BufferGetPage(buf), meta);
 	UnlockReleaseBuffer(buf);
 }
 
@@ -792,6 +891,11 @@ lionvec_init_meta(Page page, int metric, int dims)
 	meta->refine_tail = InvalidBlockNumber;
 	meta->region_head = InvalidBlockNumber;
 	meta->nregions = 0;
+	meta->loc_head = InvalidBlockNumber;
+	meta->loc_dtail = InvalidBlockNumber;
+	meta->loc_tail = InvalidBlockNumber;
+	meta->toastrelid = InvalidOid;
+	meta->loc_root = InvalidBlockNumber;
 	((PageHeader) page)->pd_lower =
 		((char *) meta + sizeof(LionVecMetaData)) - (char *) page;
 }
@@ -887,7 +991,10 @@ lionvec_get_info(Relation index)
 
 	lionvec_read_meta(index, &meta);
 	if (cached == NULL || cached->dims != meta.dims ||
-		cached->metric != meta.metric || cached->seed != meta.seed)
+		cached->metric != meta.metric || cached->seed != meta.seed ||
+		cached->locator != ((meta.flags & LIONVEC_META_LOCATOR) != 0) ||
+		cached->reflocruns != meta.refloc_runs ||
+		cached->toastrelid != meta.toastrelid)
 	{
 		bool		half;
 
@@ -904,6 +1011,9 @@ lionvec_get_info(Relation index)
 		cached->dims = meta.dims;
 		cached->dimsp = meta.dimsp;
 		cached->seed = meta.seed;
+		cached->locator = (meta.flags & LIONVEC_META_LOCATOR) != 0;
+		cached->reflocruns = meta.refloc_runs;
+		cached->toastrelid = meta.toastrelid;
 		lionvec_info_fix(cached, BlockNumberIsValid(meta.mean_head));
 		if (cached->dims > 0)
 		{
@@ -961,8 +1071,12 @@ typedef struct LionVecItems
 {
 	LionVecCode *code;			/* LIONVEC_CODE_SIZE(dimsp) bytes */
 	Size		codesize;
-	LionVecRefine *ref;			/* LIONVEC_REFINE_SIZE(dimsp) bytes */
+	LionVecRefine *ref;			/* refsize bytes */
+	Size		refsize;		/* LIONVEC_REFINE_ITEM_SIZE(dimsp, reflocruns) */
+	int			reflocruns;		/* the index's (LionVecInfo) */
 	bool		hasref;
+	LionVecLoc *loc;			/* its locator entry, if hasloc (§44.13) */
+	bool		hasloc;
 	float	   *x;				/* [dimsp] */
 	float	   *h;				/* [hdim]: a halfvec's floats, or NULL */
 	int			hdim;
@@ -974,7 +1088,11 @@ lionvec_items_alloc(LionVecItems *it, const LionVecInfo *info)
 	int			dimsp = info->dimsp;
 
 	it->code = palloc0(LIONVEC_CODE_SIZE(Max(dimsp, 64)));
-	it->ref = palloc0(LIONVEC_REFINE_SIZE(Max(dimsp, 64)));
+	it->reflocruns = info->reflocruns;
+	it->refsize = LIONVEC_REFINE_ITEM_SIZE(dimsp, it->reflocruns);
+	it->ref = palloc0(LIONVEC_REFINE_ITEM_SIZE(Max(dimsp, 64), it->reflocruns));
+	it->loc = palloc0(LIONVEC_LOC_SIZE(LIONVEC_LOC_MAXRUNS));
+	it->hasloc = false;
 	it->x = palloc(sizeof(float) * Max(dimsp, 64));
 	it->hdim = info->half ? info->dims : 0;
 	it->h = it->hdim > 0 ? palloc(sizeof(float) * it->hdim) : NULL;
@@ -1034,10 +1152,33 @@ lionvec_items_fill(const LionVecInfo *info, LionVecItems *it, ItemPointer tid,
 	it->codesize = LIONVEC_CODE_SIZE(info->dimsp);
 
 	it->ref->tid = *tid;
-	it->ref->pad = 0;
+	it->ref->nloc = 0;
 	it->ref->alpha8 = e.alpha8;
 	it->ref->rnorm8 = e.rnorm8;
+	if (it->reflocruns > 0)
+		memset(LionVecRefineGetLoc(it->ref, info->dimsp), 0,
+			   LIONVEC_REFLOC_SIZE(it->reflocruns));
 	it->hasref = true;
+}
+
+/*
+ * The row's place in TOAST, it->loc, into its REFINE item's slot, in an
+ * index whose REFINE items have one and when its runs fit (§44.13); a row
+ * whose place does not fit, or that has none, keeps an empty slot, and its
+ * rerank reads it as it always did.
+ */
+static void
+lionvec_items_place(LionVecItems *it, int dimsp)
+{
+	LionVecRefineLoc *rl;
+
+	if (!it->hasref || it->reflocruns == 0 || !it->hasloc ||
+		it->loc->nruns > it->reflocruns)
+		return;
+	rl = LionVecRefineGetLoc(it->ref, dimsp);
+	rl->valueid = it->loc->valueid;
+	memcpy(rl->runs, it->loc->runs, sizeof(LionVecLocRun) * it->loc->nruns);
+	it->ref->nloc = it->loc->nruns;
 }
 
 static void
@@ -1117,7 +1258,14 @@ lionvec_note_key(Page page, ItemPointer tid)
 #define LIONVEC_SORT_ITEM		4	/* text: the CODE item's bytes */
 #define LIONVEC_SORT_NATTS		4
 
-StaticAssertDecl(LIONVEC_MAX_PARTS + 2 < PG_INT32_MAX,
+/*
+ * ... and after every chain's group, the locator's entries (§44.13), its
+ * ITEM a LionVecLoc, keyed by TID too, so that its LOC pages come out of a
+ * serial build and a parallel one alike, in heap order.
+ */
+#define LIONVEC_SORT_LOC_GROUP(nparts)	((uint32) (nparts) + 2)
+
+StaticAssertDecl(LIONVEC_MAX_PARTS + 3 < PG_INT32_MAX,
 				 "lionvec: a group's number fits the sort's int4");
 
 /*
@@ -1197,7 +1345,7 @@ typedef struct LionVecBuildState
 	BlockNumber refine_tail;
 	Tuplesortstate *sort;		/* the CODE items in, by LIONVEC_SORT_* */
 	TupleTableSlot *inslot;
-	text	   *sortitem;		/* [LIONVEC_CODE_SIZE(dimsp) + VARHDRSZ] */
+	text	   *sortitem;		/* [VARHDRSZ + lionvec_build_item_max()] */
 	double		indtuples;
 	/* summed from the sort's output (lionvec_build_write_codes()) */
 	uint32	   *pcount;			/* [nparts]: the items put in each, copies too */
@@ -1207,12 +1355,21 @@ typedef struct LionVecBuildState
 	double		nsq;			/* ... over this many rows */
 	BlockNumber *ppblk;			/* [nparts], with regions: each one's PART item */
 	OffsetNumber *ppoff;		/* [nparts] */
+	/* the locator (§44.13; lionvec_build_locator_plan()) */
+	bool		locmay;			/* its vectors may lie in TOAST: keep one */
+	bool		lookup;			/* look rows up in TOAST, a heap table's plain
+								 * column with a TOAST relation */
+	int			reflocruns;		/* runs a REFINE item's place holds, or 0 */
+	LionVecToast toast;			/* the heap's TOAST relation, as rows are read */
+	bool		keeploc;		/* ... as the build ends: it keeps one */
+	LionVecMetaData locmeta;	/* ... and where (lionvec_loc_writer_end()) */
+	double		nlocs;			/* entries written */
 	LionVecBuildLeader *leader; /* a parallel build's, in its leader */
 	MemoryContext buildcxt;		/* what lasts the build */
 	MemoryContext tmpcxt;		/* reset after each row */
 } LionVecBuildState;
 
-static Buffer
+Buffer
 lionvec_new_buffer(Relation index, ForkNumber fork)
 {
 	return ExtendBufferedRel(BMR_REL(index), fork, NULL, EB_LOCK_FIRST);
@@ -1762,7 +1919,7 @@ lionvec_build_centroids(LionVecBuildState *bs, const LionVecSample *sample)
 	LionVecKmeansWork w;
 	LionVecRegionMaker mk;
 	LionVecRefine *ref;
-	Size		rsize = LIONVEC_REFINE_SIZE(dimsp);
+	Size		rsize = LIONVEC_REFINE_ITEM_SIZE(dimsp, bs->reflocruns);
 	int			made;
 	int			j;
 	char		regs[32] = "";
@@ -1908,6 +2065,47 @@ lionvec_build_nearest(LionVecBuildState *bs, const float *xc, float xnorm,
 	return best;
 }
 
+/*
+ * Whether the index keeps a locator (DESIGN.md §44.13), as far as the build
+ * can tell before its second pass, its dimensions known (or 0, none yet):
+ * an index of a plain column - not an expression, whose values the build
+ * computes and no TOAST relation holds - of a heap table with a TOAST
+ * relation, whose vectors may lie there (lionvec_vector_inline() says not).
+ * Of those, its REFINE items carry their rows' places when the dimensions
+ * are known and an item with its place fits a page, every REFINE item of
+ * the index then one size, the centroids' too.  The second pass looks up
+ * the rows of any plain column of a heap table with a TOAST relation: a
+ * build that meets one in TOAST all the same keeps a locator
+ * (lionvec_build_write_codes()), its REFINE items without places.  An
+ * index whose vectors lie inline - and no row of which does not - keeps
+ * none: no page, and no work at insert or VACUUM.
+ */
+static void
+lionvec_build_locator_plan(LionVecBuildState *bs, Relation heap)
+{
+	Relation	index = bs->index;
+	AttrNumber	attno = index->rd_index->indkey.values[0];
+
+	bs->lookup = attno > 0 && heap->rd_tableam == GetHeapamTableAmRoutine() &&
+		OidIsValid(heap->rd_rel->reltoastrelid);
+	bs->locmay = bs->lookup &&
+		!lionvec_vector_inline(index, heap, bs->dims, bs->half);
+	bs->reflocruns = 0;
+	if (bs->locmay && bs->dims > 0)
+	{
+		int			nchunks = lionvec_toast_nchunks(lionvec_toast_extsize(bs->dims, bs->half),
+													LION_TOAST_MAX_CHUNK_SIZE);
+		int			runs = lionvec_refloc_runs(nchunks);
+		Size		room = BLCKSZ - MAXALIGN(SizeOfPageHeaderData) -
+			MAXALIGN(sizeof(LionVecPageOpaqueData));
+
+		if (nchunks <= LIONVEC_LOC_MAXRUNS &&
+			MAXALIGN(LIONVEC_REFINE_ITEM_SIZE(LIONVEC_PADDED(bs->dims), runs)) +
+			sizeof(ItemIdData) <= room)
+			bs->reflocruns = runs;
+	}
+}
+
 /* The sort's tuples (LIONVEC_SORT_*). */
 static TupleDesc
 lionvec_build_sort_desc(void)
@@ -1940,17 +2138,66 @@ lionvec_build_sort_begin(TupleDesc desc, int memkb, SortCoordinate coordinate)
 								coordinate, TUPLESORT_NONE);
 }
 
-/* Ready bs for the second pass, its items into a sort of memkb kilobytes. */
+/* The most bytes an item of the sort's takes: a CODE item, or a LOC entry. */
+static Size
+lionvec_build_item_max(int dimsp)
+{
+	return Max(LIONVEC_CODE_SIZE(Max(dimsp, 64)),
+			   LIONVEC_LOC_SIZE(LIONVEC_LOC_MAXRUNS));
+}
+
+/*
+ * Ready bs for the second pass, its items into a sort of memkb kilobytes,
+ * and the heap's TOAST relation open for its rows' places, where the plan
+ * says to look them up (lionvec_build_locator_plan()) - every process of a
+ * parallel build its own.
+ */
 static void
-lionvec_build_rows_begin(LionVecBuildState *bs, int memkb,
+lionvec_build_rows_begin(LionVecBuildState *bs, Relation heap, int memkb,
 						 SortCoordinate coordinate)
 {
 	TupleDesc	desc = lionvec_build_sort_desc();
 
 	bs->inslot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
 	bs->sort = lionvec_build_sort_begin(desc, memkb, coordinate);
-	bs->sortitem = palloc(VARHDRSZ + LIONVEC_CODE_SIZE(Max(bs->info->dimsp, 64)));
+	bs->sortitem = palloc(VARHDRSZ + lionvec_build_item_max(bs->info->dimsp));
+	bs->info->reflocruns = bs->reflocruns;
 	lionvec_items_alloc(&bs->items, bs->info);
+	memset(&bs->toast, 0, sizeof(bs->toast));
+	if (bs->lookup && bs->info->dims > 0)
+		(void) lionvec_toast_open(&bs->toast, heap, bs->info->dims, bs->half);
+}
+
+/* ... and done with the TOAST relation. */
+static void
+lionvec_build_rows_end(LionVecBuildState *bs)
+{
+	lionvec_toast_close(&bs->toast);
+}
+
+/*
+ * A row's locator entry into the sort, after every chain's group, by its
+ * TID (§44.13): the build's LOC pages come out in heap order.
+ */
+static void
+lionvec_build_put_loc(LionVecBuildState *bs, const LionVecLoc *loc)
+{
+	BlockNumber blk = ItemPointerGetBlockNumber(&loc->tid);
+	OffsetNumber off = ItemPointerGetOffsetNumber(&loc->tid);
+	Size		size = LIONVEC_LOC_SIZE(loc->nruns);
+
+	SET_VARSIZE(bs->sortitem, VARHDRSZ + size);
+	memcpy(VARDATA(bs->sortitem), loc, size);
+	ExecClearTuple(bs->inslot);
+	bs->inslot->tts_values[LIONVEC_SORT_GROUP - 1] =
+		Int32GetDatum((int32) LIONVEC_SORT_LOC_GROUP(bs->nparts));
+	bs->inslot->tts_values[LIONVEC_SORT_TID - 1] =
+		Int64GetDatum((int64) (((uint64) blk << 16) | off));
+	bs->inslot->tts_values[LIONVEC_SORT_DIST2 - 1] = Float8GetDatum(0.0);
+	bs->inslot->tts_values[LIONVEC_SORT_ITEM - 1] = PointerGetDatum(bs->sortitem);
+	memset(bs->inslot->tts_isnull, 0, sizeof(bool) * LIONVEC_SORT_NATTS);
+	ExecStoreVirtualTuple(bs->inslot);
+	tuplesort_puttupleslot(bs->sort, bs->inslot);
 }
 
 /* An item into the sort, in group's chain, its row's distance dist2. */
@@ -1985,8 +2232,33 @@ lionvec_build_callback(Relation index, ItemPointer tid, Datum *values,
 	int			second = -1;
 	double		dist2 = 0.0;
 	double		dist2b = 0.0;
+	Datum		value = values[0];
+	LionToastPointer ptr;
 
-	lionvec_items_fill(bs->info, it, tid, values[0], isnull[0]);
+	/*
+	 * A row whose vector lies in TOAST as an entry's must (§44.13): its
+	 * chunks found through the TOAST index as a detoast finds them, and the
+	 * vector assembled from them - the bytes the index encodes, so that
+	 * the entry names exactly what the codes were made of - with their
+	 * places.  Anything irregular leaves the row without an entry, its
+	 * vector detoasted as always.
+	 */
+	it->hasloc = false;
+	if (!isnull[0] && bs->toast.toastrel != NULL &&
+		lionvec_toast_value(&bs->toast, value, &ptr))
+	{
+		struct varlena *v = palloc(VARHDRSZ + bs->toast.extsize);
+
+		if (lionvec_toast_locate(&bs->toast, &ptr, VARDATA(v), it->loc))
+		{
+			SET_VARSIZE(v, VARHDRSZ + bs->toast.extsize);
+			value = PointerGetDatum(v);
+			it->loc->tid = *tid;
+			it->hasloc = true;
+		}
+	}
+
+	lionvec_items_fill(bs->info, it, tid, value, isnull[0]);
 	if (!it->hasref)
 		group = bs->nparts + 1;		/* a NULL row or a zero */
 	else if (bs->nparts == 0)
@@ -1995,8 +2267,11 @@ lionvec_build_callback(Relation index, ItemPointer tid, Datum *values,
 		group = lionvec_build_nearest(bs, it->x, it->code->norm, &dist2,
 									  &second, &dist2b);
 	if (it->hasref)
-		lionvec_build_put_refine(bs, it->ref, LIONVEC_REFINE_SIZE(bs->info->dimsp),
+	{
+		lionvec_items_place(it, bs->info->dimsp);
+		lionvec_build_put_refine(bs, it->ref, it->refsize,
 								 &it->code->rblk, &it->code->roff);
+	}
 
 	lionvec_build_put_code(bs, group, it->code, it->codesize, dist2);
 	if (second >= 0)
@@ -2006,6 +2281,8 @@ lionvec_build_callback(Relation index, ItemPointer tid, Datum *values,
 		lionvec_build_put_code(bs, (uint32) second, it->code, it->codesize, dist2b);
 		it->code->flags &= ~LIONVEC_SPILL;
 	}
+	if (it->hasloc)
+		lionvec_build_put_loc(bs, it->loc);
 	bs->indtuples += 1;
 
 	MemoryContextSwitchTo(old);
@@ -2164,10 +2441,56 @@ lionvec_build_write_codes(LionVecBuildState *bs, Tuplesortstate *sort,
 			more = tuplesort_gettupleslot(sort, true, false, slot, NULL);
 		}
 	}
-	if (more)
-		elog(ERROR, "lionvec: the build's sort has an item past the last group");
 	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
+
+	/*
+	 * The locator (§44.13): kept where the plan said, or where the second
+	 * pass met a row in TOAST all the same - whose entries follow the chains'
+	 * - written in heap order, then the LOCDIR.
+	 */
+	bs->keeploc = bs->locmay;
+	if (more)
+	{
+		bool		isnull;
+		int32		g = DatumGetInt32(slot_getattr(slot, LIONVEC_SORT_GROUP, &isnull));
+
+		if (g < 0 || (uint32) g != LIONVEC_SORT_LOC_GROUP(bs->nparts))
+			elog(ERROR, "lionvec: the build's sort has an item past the last group");
+		bs->keeploc = true;
+	}
+	if (bs->keeploc)
+	{
+		LionVecLocWriter w;
+		Size		locmax = LIONVEC_LOC_SIZE(LIONVEC_LOC_MAXRUNS);
+		LionVecLoc *loc = palloc(locmax);
+
+		lionvec_loc_writer_begin(&w, index);
+		while (more)
+		{
+			bool		isnull;
+			int32		g = DatumGetInt32(slot_getattr(slot, LIONVEC_SORT_GROUP, &isnull));
+			Datum		d;
+			Size		len;
+
+			if (g < 0 || (uint32) g != LIONVEC_SORT_LOC_GROUP(bs->nparts))
+				elog(ERROR, "lionvec: the build's sort has an item past the last group");
+			CHECK_FOR_INTERRUPTS();
+			d = slot_getattr(slot, LIONVEC_SORT_ITEM, &isnull);
+			len = VARSIZE_ANY_EXHDR(DatumGetPointer(d));
+			if (len < LIONVEC_LOC_SIZE(1) || len > locmax)
+				elog(ERROR, "lionvec: the build's sort has a locator entry of %zu bytes", len);
+			memcpy(loc, VARDATA_ANY(DatumGetPointer(d)), len);
+			if (len != LIONVEC_LOC_SIZE(loc->nruns))
+				elog(ERROR, "lionvec: the build's sort has a locator entry of %zu bytes", len);
+			lionvec_loc_writer_put(&w, loc);
+			more = tuplesort_gettupleslot(sort, true, false, slot, NULL);
+		}
+		bs->nlocs = w.nentries;
+		memset(&bs->locmeta, 0, sizeof(bs->locmeta));
+		lionvec_loc_writer_end(&w, &bs->locmeta);
+		pfree(loc);
+	}
 	ExecDropSingleTupleTableSlot(slot);
 	pfree(item);
 }
@@ -2400,6 +2723,9 @@ typedef struct LionVecBuildShared
 	int			nparts;
 	bool		spill;
 	int			sn;				/* the sample's rows */
+	bool		lookup;			/* the locator's plan (§44.13) */
+	bool		locmay;
+	int			reflocruns;
 
 	/* The leader's posts, under mutex; workcv is signalled at each. */
 	slock_t		mutex;
@@ -2661,7 +2987,7 @@ lionvec_parallel_rows(LionVecBuildState *bs, LionVecBuildShared *shared,
 	coordinate->isWorker = true;
 	coordinate->nParticipants = -1;
 	coordinate->sharedsort = sharedsort;
-	lionvec_build_rows_begin(bs, memkb, coordinate);
+	lionvec_build_rows_begin(bs, heap, memkb, coordinate);
 
 	indexInfo->ii_Concurrent = shared->isconcurrent;
 	scan = lion_table_beginscan_parallel(heap,
@@ -2669,6 +2995,7 @@ lionvec_parallel_rows(LionVecBuildState *bs, LionVecBuildShared *shared,
 	reltuples = table_index_build_scan(heap, bs->index, indexInfo, true, progress,
 									   lionvec_build_callback, bs, scan);
 	lionvec_build_end_refine(bs);
+	lionvec_build_rows_end(bs);
 	tuplesort_performsort(bs->sort);
 
 	SpinLockAcquire(&shared->mutex);
@@ -2790,6 +3117,9 @@ lionvec_begin_parallel(LionVecBuildState *bs, Relation heap, bool isconcurrent,
 	shared->nparts = bs->nparts;
 	shared->spill = bs->spill;
 	shared->sn = bs->sn;
+	shared->lookup = bs->lookup;
+	shared->locmay = bs->locmay;
+	shared->reflocruns = bs->reflocruns;
 	SpinLockInit(&shared->mutex);
 	ConditionVariableInit(&shared->workcv);
 	ConditionVariableInit(&shared->donecv);
@@ -2967,6 +3297,9 @@ lionvec_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 	bs.nparts = shared->nparts;
 	bs.spill = shared->spill;
 	bs.sn = shared->sn;
+	bs.lookup = shared->lookup;
+	bs.locmay = shared->locmay;
+	bs.reflocruns = shared->reflocruns;
 	bs.rbuf = InvalidBuffer;
 	bs.refine_tail = InvalidBlockNumber;
 	bs.buildcxt = CurrentMemoryContext;
@@ -3138,6 +3471,10 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	else
 		bs.info = lionvec_build_info(bs.metric, bs.half, bs.dims, NULL);
 
+	/* whether it keeps a locator, before any REFINE item is written (§44.13) */
+	lionvec_build_locator_plan(&bs, heap);
+	bs.info->reflocruns = bs.reflocruns;
+
 	memset(&meta, 0, sizeof(meta));
 	meta.mean_head = InvalidBlockNumber;
 	if (bs.info->mean != NULL)
@@ -3209,10 +3546,11 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 											  &sort);
 	else
 	{
-		lionvec_build_rows_begin(&bs, maintenance_work_mem, NULL);
+		lionvec_build_rows_begin(&bs, heap, maintenance_work_mem, NULL);
 		reltuples = table_index_build_scan(heap, index, indexInfo, false, true,
 										   lionvec_build_callback, &bs, NULL);
 		lionvec_build_end_refine(&bs);
+		lionvec_build_rows_end(&bs);
 		sort = bs.sort;
 		ExecDropSingleTupleTableSlot(bs.inslot);
 		bs.inslot = NULL;
@@ -3272,6 +3610,20 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		m->ntuples = bs.indtuples;
 		m->region_head = meta.region_head;
 		m->nregions = meta.nregions;
+		if (bs.keeploc)
+		{
+			m->flags |= LIONVEC_META_LOCATOR;
+			m->loc_head = bs.locmeta.loc_head;
+			m->loc_dtail = bs.locmeta.loc_dtail;
+			m->loc_tail = bs.locmeta.loc_tail;
+			m->toastrelid = heap->rd_rel->reltoastrelid;
+			m->loc_built = bs.locmeta.loc_built;
+			m->loc_bpages = bs.locmeta.loc_bpages;
+			m->loc_root = InvalidBlockNumber;
+			m->refloc_runs = (uint16) bs.reflocruns;
+		}
+		else if (bs.reflocruns > 0)
+			elog(ERROR, "lionvec: a build that put places in its refine items keeps no locator");
 	}
 	MarkBufferDirty(metabuf);
 	UnlockReleaseBuffer(metabuf);
@@ -3288,6 +3640,10 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	else
 		elog(DEBUG1, "lionvec index \"%s\": built serially",
 			 RelationGetRelationName(index));
+	if (bs.keeploc)
+		elog(DEBUG1, "lionvec index \"%s\": a locator of %.0f rows in TOAST, its refine items %s",
+			 RelationGetRelationName(index), bs.nlocs,
+			 bs.reflocruns > 0 ? "with their places" : "without places");
 	elog(DEBUG2, "lionvec index \"%s\": %.0f rows in %.1f s by %d process%s: the first pass %.1f s, k-means %.1f s, the second pass %.1f s, writing %.1f s",
 		 RelationGetRelationName(index), bs.indtuples,
 		 secs[0] + secs[1] + secs[2] + secs[3], nprocs, nprocs == 1 ? "" : "es",
@@ -3303,17 +3659,35 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 /*
  * An unlogged index's init fork: the meta page and the empty chains of rows
- * in no partition and of NULL rows.
+ * in no partition and of NULL rows; and, for an index whose vectors may lie
+ * in TOAST (lionvec_build_locator_plan(), by the rule alone: the table is
+ * empty when the init fork is used), the locator's first LOC page and its
+ * LOCDIR page, whose one item names it, empty.
  */
 static void
 lionvecbuildempty(Relation index)
 {
 	int			metric = lionvec_index_metric(index);
-	int			dims = lionvec_typmod_dims(index, lionvec_index_half(index));
+	bool		half = lionvec_index_half(index);
+	int			dims = lionvec_typmod_dims(index, half);
+	LionVecBuildState plan;
+	Relation	heap;
+	Oid			toastrelid;
 	Buffer		metabuf;
 	Buffer		rest;
 	Buffer		nulls;
+	Buffer		loc = InvalidBuffer;
+	Buffer		locdir = InvalidBuffer;
 	LionVecMeta meta;
+
+	memset(&plan, 0, sizeof(plan));
+	plan.index = index;
+	plan.dims = dims;
+	plan.half = half;
+	heap = table_open(index->rd_index->indrelid, AccessShareLock);
+	lionvec_build_locator_plan(&plan, heap);
+	toastrelid = heap->rd_rel->reltoastrelid;
+	table_close(heap, AccessShareLock);
 
 	metabuf = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
 								EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
@@ -3322,6 +3696,23 @@ lionvecbuildempty(Relation index)
 							 EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
 	nulls = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
 							  EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
+	if (plan.locmay)
+	{
+		LionVecLocDir d;
+
+		loc = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
+								EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
+		locdir = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
+								   EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
+		lionvec_init_page(BufferGetPage(loc), LIONVEC_PAGE_LOC);
+		lionvec_init_page(BufferGetPage(locdir), LIONVEC_PAGE_LOCDIR);
+		d.blk = BufferGetBlockNumber(loc);
+		d.lo = InvalidBlockNumber;
+		d.hi = 0;
+		if (PageAddItemExtended(BufferGetPage(locdir), &d, sizeof(d),
+								InvalidOffsetNumber, 0) == InvalidOffsetNumber)
+			elog(ERROR, "lionvec: could not add a locator directory item");
+	}
 
 	START_CRIT_SECTION();
 	lionvec_init_page(BufferGetPage(rest), LIONVEC_PAGE_CODE);
@@ -3330,15 +3721,35 @@ lionvecbuildempty(Relation index)
 	lionvec_init_page(BufferGetPage(nulls), LIONVEC_PAGE_CODE);
 	MarkBufferDirty(nulls);
 	log_newpage_buffer(nulls, true);
+	if (plan.locmay)
+	{
+		MarkBufferDirty(loc);
+		log_newpage_buffer(loc, true);
+		MarkBufferDirty(locdir);
+		log_newpage_buffer(locdir, true);
+	}
 
 	lionvec_init_meta(BufferGetPage(metabuf), metric, dims);
 	meta = LionVecPageGetMeta(BufferGetPage(metabuf));
 	meta->rest_head = meta->rest_tail = BufferGetBlockNumber(rest);
 	meta->null_head = meta->null_tail = BufferGetBlockNumber(nulls);
+	if (plan.locmay)
+	{
+		meta->flags |= LIONVEC_META_LOCATOR;
+		meta->loc_head = meta->loc_dtail = BufferGetBlockNumber(locdir);
+		meta->loc_tail = BufferGetBlockNumber(loc);
+		meta->toastrelid = toastrelid;
+		meta->refloc_runs = (uint16) plan.reflocruns;
+	}
 	MarkBufferDirty(metabuf);
 	log_newpage_buffer(metabuf, true);
 	END_CRIT_SECTION();
 
+	if (plan.locmay)
+	{
+		UnlockReleaseBuffer(locdir);
+		UnlockReleaseBuffer(loc);
+	}
 	UnlockReleaseBuffer(nulls);
 	UnlockReleaseBuffer(rest);
 	UnlockReleaseBuffer(metabuf);
@@ -3365,7 +3776,7 @@ typedef struct LionVecDest
  */
 static LionVecRefine *
 lionvec_cent_refine(Relation index, BlockNumber rblk, OffsetNumber roff,
-					int partno, int dimsp, Buffer *buf)
+					int partno, int dimsp, int reflocruns, Buffer *buf)
 {
 	Page		page;
 	ItemPointerData tid;
@@ -3376,7 +3787,7 @@ lionvec_cent_refine(Relation index, BlockNumber rblk, OffsetNumber roff,
 	page = BufferGetPage(*buf);
 	lionvec_check_page(index, page, rblk, LIONVEC_PAGE_REFINE);
 	LionVecCentTid(&tid, partno);
-	ref = lionvec_refine_at(index, page, rblk, roff, dimsp, &tid);
+	ref = lionvec_refine_at(index, page, rblk, roff, dimsp, reflocruns, &tid);
 	if (ref == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -3753,7 +4164,8 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 		LionVecInsCand *cd = &cands[c];
 		Buffer		buf;
 		LionVecRefine *ref = lionvec_cent_refine(index, cd->rblk, cd->roff,
-												 cd->partno, dimsp, &buf);
+												 cd->partno, dimsp,
+												 meta->refloc_runs, &buf);
 		double		est;
 		double		err;
 
@@ -3919,7 +4331,10 @@ lionvec_append_code(Relation index, Buffer metabuf, int dimsp,
  * first leaves a REFINE item nothing points at, which costs its space and
  * nothing else; one after the second, a row without its copy, which a scan
  * still finds in its nearest partition, and misses only when it would have
- * found it through the copy.
+ * found it through the copy.  In an index that keeps a locator, a row whose
+ * vector lies in TOAST then has its entry appended (lionvec_loc_append(),
+ * §44.13), last, so that an entry never names a row whose items are not
+ * in: a crash before it leaves a row without one, read as it always was.
  */
 static void
 lionvec_append(Relation index, const LionVecInfo *info, LionVecItems *it)
@@ -3934,10 +4349,12 @@ lionvec_append(Relation index, const LionVecInfo *info, LionVecItems *it)
 
 	metabuf = ReadBuffer(index, LIONVEC_METAPAGE);
 	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-	lionvec_check_meta(index, BufferGetPage(metabuf));
-	meta = *LionVecPageGetMeta(BufferGetPage(metabuf));
+	lionvec_meta_copy(index, BufferGetPage(metabuf), &meta);
 	if (it->hasref && meta.dimsp != dimsp)
 		elog(ERROR, "lionvec: index \"%s\" changed dimensions under an insert",
+			 RelationGetRelationName(index));
+	if (meta.refloc_runs != it->reflocruns)
+		elog(ERROR, "lionvec: index \"%s\" changed its refine items under an insert",
 			 RelationGetRelationName(index));
 
 	dest.partno = -1;
@@ -3956,7 +4373,7 @@ lionvec_append(Relation index, const LionVecInfo *info, LionVecItems *it)
 	{
 		Buffer		rbuf = InvalidBuffer;
 		bool		rnew = false;
-		Size		rsize = LIONVEC_REFINE_SIZE(dimsp);
+		Size		rsize = it->refsize;
 		OffsetNumber off;
 
 		if (BlockNumberIsValid(meta.refine_tail))
@@ -4011,7 +4428,55 @@ lionvec_append(Relation index, const LionVecInfo *info, LionVecItems *it)
 							&dest2, false);
 		it->code->flags &= ~LIONVEC_SPILL;
 	}
+	if (it->hasloc && (meta.flags & LIONVEC_META_LOCATOR) != 0)
+	{
+		/* the row's items are in, and its locator entry is not yet */
+		LION_INJECTION_POINT("lionvec-insert-unlocated");
+		lionvec_loc_append(index, metabuf, &meta, it->loc);
+	}
 	UnlockReleaseBuffer(metabuf);
+}
+
+/*
+ * An inserted row's locator entry (§44.13), in an index that keeps one: the
+ * TOAST pointer of the tuple the heap stored at tid (lionvec_stored_pointer()),
+ * its chunks found through the TOAST index, and their bytes the very bytes
+ * the index is given, value - which comes back detoasted, for the caller to
+ * encode.  A row whose stored vector is not in TOAST as an entry's must be,
+ * or whose chunks do not hold exactly value, has none.
+ */
+static void
+lionvec_insert_locate(Relation index, Relation heap, const LionVecInfo *info,
+					  ItemPointer tid, Datum *value, LionVecItems *it)
+{
+	AttrNumber	attno = index->rd_index->indkey.values[0];
+	LionVecToast t;
+	LionToastPointer ptr;
+	struct varlena *v;
+	char	   *data;
+
+	it->hasloc = false;
+	if (!info->locator || attno <= 0 || heap == NULL ||
+		heap->rd_tableam != GetHeapamTableAmRoutine() ||
+		heap->rd_rel->reltoastrelid != info->toastrelid ||
+		!lionvec_toast_open(&t, heap, info->dims, info->half))
+		return;
+	if (lionvec_stored_pointer(heap, tid, attno, &ptr) &&
+		lionvec_toast_ptr_ok(&t, &ptr))
+	{
+		v = pg_detoast_datum((struct varlena *) DatumGetPointer(*value));
+		*value = PointerGetDatum(v);
+		data = palloc(t.extsize);
+		if ((int64) VARSIZE(v) == VARHDRSZ + t.extsize &&
+			lionvec_toast_locate(&t, &ptr, data, it->loc) &&
+			memcmp(data, VARDATA(v), t.extsize) == 0)
+		{
+			it->loc->tid = *tid;
+			it->hasloc = true;
+		}
+		pfree(data);
+	}
+	lionvec_toast_close(&t);
 }
 
 static bool
@@ -4025,6 +4490,7 @@ lionvecinsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 	MemoryContext old = MemoryContextSwitchTo(cxt);
 	LionVecInfo *info = lionvec_get_info(index);
 	LionVecItems it;
+	Datum		value;
 
 	if (!isnull[0] && info->dims == 0)
 	{
@@ -4038,7 +4504,11 @@ lionvecinsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 	}
 
 	lionvec_items_alloc(&it, info);
-	lionvec_items_fill(info, &it, ht_ctid, values[0], isnull[0]);
+	value = values[0];
+	if (!isnull[0])
+		lionvec_insert_locate(index, heapRel, info, ht_ctid, &value, &it);
+	lionvec_items_fill(info, &it, ht_ctid, value, isnull[0]);
+	lionvec_items_place(&it, info->dimsp);
 
 	/* a serializable reader holds the index's relation lock (§44.5) */
 	CheckForSerializableConflictIn(index, NULL, InvalidBlockNumber);
@@ -4083,7 +4553,7 @@ lionvec_ref_cmp(const void *a, const void *b)
  */
 static void
 lionvec_vacuum_refines(Relation index, LionVecRefineRef *refs, int nrefs,
-					   int dimsp, BufferAccessStrategy strategy)
+					   int dimsp, int reflocruns, BufferAccessStrategy strategy)
 {
 	int			i = 0;
 
@@ -4107,7 +4577,7 @@ lionvec_vacuum_refines(Relation index, LionVecRefineRef *refs, int nrefs,
 		for (; i < nrefs && refs[i].blk == blk; i++)
 		{
 			if (lionvec_refine_at(index, page, blk, refs[i].off, dimsp,
-								  &refs[i].tid) == NULL)
+								  reflocruns, &refs[i].tid) == NULL)
 				continue;
 			PageIndexTupleDeleteNoCompact(page, refs[i].off);
 			ndel++;
@@ -4128,6 +4598,7 @@ typedef struct LionVecVacuum
 	IndexBulkDeleteCallback callback;
 	void	   *callback_state;
 	int			dimsp;
+	int			reflocruns;		/* its REFINE items' places' runs (§44.13) */
 	bool		spill;			/* the index spills (LIONVEC_META_SPILL) */
 	LionVecRefineRef *refs;		/* the REFINE items to remove, flushed when full */
 	int			nrefs;
@@ -4203,7 +4674,7 @@ lionvec_vacuum_chain(LionVecVacuum *vs, BlockNumber blk, bool partition)
 		if (vs->nrefs > vs->maxrefs - MaxOffsetNumber)
 		{
 			lionvec_vacuum_refines(index, vs->refs, vs->nrefs, vs->dimsp,
-								   vs->info->strategy);
+								   vs->reflocruns, vs->info->strategy);
 			vs->nrefs = 0;
 		}
 		blk = next;
@@ -4291,6 +4762,7 @@ lionvecbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	vs.callback = callback;
 	vs.callback_state = callback_state;
 	vs.dimsp = meta.dimsp;
+	vs.reflocruns = meta.refloc_runs;
 	vs.spill = (meta.flags & LIONVEC_META_SPILL) != 0;
 	vs.nblocks = RelationGetNumberOfBlocks(index);
 	/* the REFINE items to remove, in maintenance_work_mem */
@@ -4302,9 +4774,25 @@ lionvecbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	/* the partitions' chains first (lionvec_chain_heads()), then REST and NULL */
 	for (i = 0; i < nheads; i++)
 		lionvec_vacuum_chain(&vs, heads[i], i < (int) meta.nparts);
-	lionvec_vacuum_refines(index, vs.refs, vs.nrefs, vs.dimsp, info->strategy);
+	lionvec_vacuum_refines(index, vs.refs, vs.nrefs, vs.dimsp, vs.reflocruns,
+						   info->strategy);
 	pfree(vs.refs);
 	pfree(heads);
+
+	/*
+	 * ... and the locator's entries of the same rows, before the heap gives
+	 * their TIDs to others (§44.13).  Entries are made only once the
+	 * dimensions are known, which then never change.
+	 */
+	if ((meta.flags & LIONVEC_META_LOCATOR) != 0 && meta.dims > 0)
+	{
+		bool		half = lionvec_index_half(index);
+		int			nchunks = lionvec_toast_nchunks(lionvec_toast_extsize(meta.dims, half),
+													LION_TOAST_MAX_CHUNK_SIZE);
+
+		lionvec_vacuum_locs(index, &meta, nchunks, callback, callback_state,
+							info->strategy);
+	}
 
 	stats->num_pages = RelationGetNumberOfBlocks(index);
 	return stats;
@@ -4408,7 +4896,11 @@ lionvec_code_pages(Oid indexoid, double pages, double *perpage,
 	*items = (meta.flags & LIONVEC_META_SPILL) != 0 ? 2.0 : 1.0;
 	dimsp = meta.dims > 0 ? meta.dimsp : 1536;
 	code = MAXALIGN(LIONVEC_CODE_SIZE(dimsp)) + sizeof(ItemIdData);
-	ref = MAXALIGN(LIONVEC_REFINE_SIZE(dimsp)) + sizeof(ItemIdData);
+	ref = MAXALIGN(LIONVEC_REFINE_ITEM_SIZE(dimsp, meta.refloc_runs)) +
+		sizeof(ItemIdData);
+	/* a locator's entry a row, of one run in the common case (§44.13) */
+	if ((meta.flags & LIONVEC_META_LOCATOR) != 0)
+		ref += MAXALIGN(LIONVEC_LOC_SIZE(1)) + sizeof(ItemIdData);
 	*perpage = lionvec_page_items(LIONVEC_CODE_SIZE(dimsp));
 	return Max(1.0, ceil(pages * *items * code / (*items * code + ref)));
 }

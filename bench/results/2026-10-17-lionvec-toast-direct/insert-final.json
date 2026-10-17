@@ -1,0 +1,243 @@
+{
+ "base": 20000,
+ "n": 5000,
+ "reps": 8,
+ "configs": [
+  [
+   "main",
+   "main"
+  ],
+  [
+   "on",
+   "branch",
+   "on"
+  ]
+ ],
+ "summary": {
+  "main": {
+   "ms_median": 2210.95,
+   "ms_all": [
+    2321.9,
+    2175.0,
+    2144.0,
+    2350.6,
+    2133.6,
+    2112.5,
+    2825.3,
+    2246.9
+   ],
+   "wal_median": 50185184.0,
+   "build_s_median": 19.015
+  },
+  "on": {
+   "ms_median": 2274.95,
+   "ms_all": [
+    2247.6,
+    2457.3,
+    2142.5,
+    2287.2,
+    2370.9,
+    2205.5,
+    2332.2,
+    2262.7
+   ],
+   "wal_median": 50788432.0,
+   "build_s_median": 19.31
+  }
+ },
+ "rows": [
+  {
+   "config": "main",
+   "lib": "main",
+   "direct": null,
+   "ms": 2321.9,
+   "wal_bytes": 50186984,
+   "build_s": 18.97,
+   "version": 4,
+   "flags": 1,
+   "index_bytes": 59244544,
+   "rep": 0
+  },
+  {
+   "config": "on",
+   "lib": "branch",
+   "direct": "on",
+   "ms": 2247.6,
+   "wal_bytes": 50794968,
+   "build_s": 19.98,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 0
+  },
+  {
+   "config": "on",
+   "lib": "branch",
+   "direct": "on",
+   "ms": 2457.3,
+   "wal_bytes": 50788384,
+   "build_s": 20.24,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 1
+  },
+  {
+   "config": "main",
+   "lib": "main",
+   "direct": null,
+   "ms": 2175.0,
+   "wal_bytes": 50190176,
+   "build_s": 18.91,
+   "version": 4,
+   "flags": 1,
+   "index_bytes": 59244544,
+   "rep": 1
+  },
+  {
+   "config": "main",
+   "lib": "main",
+   "direct": null,
+   "ms": 2144.0,
+   "wal_bytes": 50183016,
+   "build_s": 18.78,
+   "version": 4,
+   "flags": 1,
+   "index_bytes": 59244544,
+   "rep": 2
+  },
+  {
+   "config": "on",
+   "lib": "branch",
+   "direct": "on",
+   "ms": 2142.5,
+   "wal_bytes": 50792088,
+   "build_s": 19.23,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 2
+  },
+  {
+   "config": "on",
+   "lib": "branch",
+   "direct": "on",
+   "ms": 2287.2,
+   "wal_bytes": 50788416,
+   "build_s": 18.8,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 3
+  },
+  {
+   "config": "main",
+   "lib": "main",
+   "direct": null,
+   "ms": 2350.6,
+   "wal_bytes": 50184072,
+   "build_s": 19.47,
+   "version": 4,
+   "flags": 1,
+   "index_bytes": 59244544,
+   "rep": 3
+  },
+  {
+   "config": "main",
+   "lib": "main",
+   "direct": null,
+   "ms": 2133.6,
+   "wal_bytes": 50183048,
+   "build_s": 18.78,
+   "version": 4,
+   "flags": 1,
+   "index_bytes": 59244544,
+   "rep": 4
+  },
+  {
+   "config": "on",
+   "lib": "branch",
+   "direct": "on",
+   "ms": 2370.9,
+   "wal_bytes": 50788072,
+   "build_s": 18.64,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 4
+  },
+  {
+   "config": "on",
+   "lib": "branch",
+   "direct": "on",
+   "ms": 2205.5,
+   "wal_bytes": 50788448,
+   "build_s": 19.33,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 5
+  },
+  {
+   "config": "main",
+   "lib": "main",
+   "direct": null,
+   "ms": 2112.5,
+   "wal_bytes": 50191064,
+   "build_s": 19.82,
+   "version": 4,
+   "flags": 1,
+   "index_bytes": 59244544,
+   "rep": 5
+  },
+  {
+   "config": "main",
+   "lib": "main",
+   "direct": null,
+   "ms": 2825.3,
+   "wal_bytes": 50186296,
+   "build_s": 19.06,
+   "version": 4,
+   "flags": 1,
+   "index_bytes": 59244544,
+   "rep": 6
+  },
+  {
+   "config": "on",
+   "lib": "branch",
+   "direct": "on",
+   "ms": 2332.2,
+   "wal_bytes": 50788128,
+   "build_s": 20.22,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 6
+  },
+  {
+   "config": "on",
+   "lib": "branch",
+   "direct": "on",
+   "ms": 2262.7,
+   "wal_bytes": 50788480,
+   "build_s": 19.29,
+   "version": 5,
+   "flags": 3,
+   "index_bytes": 59965440,
+   "rep": 7
+  },
+  {
+   "config": "main",
+   "lib": "main",
+   "direct": null,
+   "ms": 2246.9,
+   "wal_bytes": 50180664,
+   "build_s": 19.26,
+   "version": 4,
+   "flags": 1,
+   "index_bytes": 59244544,
+   "rep": 7
+  }
+ ],
+ "run_at": "2026-10-17T08:42:52Z"
+}

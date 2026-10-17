@@ -44,7 +44,10 @@
  *		about a third of the time, at three almost always;
  *	  - prefetch: the items a CODE page holds and the pages a chain of them
  *		takes, the window a reader asks for, and the least keys of a queue's
- *		top by a heap, lionvec_rank()'s set.
+ *		top by a heap, lionvec_rank()'s set;
+ *	  - the locator (vectors in TOAST): the chunks a vector takes, the runs
+ *		made of their places and their checks, and the LOC pages a scan's
+ *		members choose, against models.
  *
  *	  Every array is an exact-size heap allocation, which `make unit
  *	  SANITIZE=1` checks to the byte.  Exit status is 0 only if every check
@@ -3729,6 +3732,168 @@ test_prefetch(void)
 	}
 }
 
+/*
+ * The locator's arithmetic (DESIGN.md §44.13): a vector's bytes in TOAST and
+ * the chunks they take at 8K pages' 1,996 bytes - 2 at 768 dimensions and
+ * halfvec(1536), 3 at 1024, 4 at 1536, 7 at 3072 - and each chunk's size;
+ * the runs a REFINE item's slot holds; runs made from chunk places, merging
+ * the consecutive line pointers of a block and nothing else, against a
+ * model, refused past maxruns; a run list's checks; and the LOC pages
+ * chosen for a scan's members, against a brute-force model over random
+ * ranges, empty ones and repeated pages among them.
+ */
+static void
+test_locator(void)
+{
+	bool		ok = true;
+	int			trial;
+
+	cur_phase = "locator";
+	CHECK(lionvec_toast_extsize(1536, false) == 6148 &&
+		  lionvec_toast_extsize(1536, true) == 3076 &&
+		  lionvec_toast_nchunks(6148, 1996) == 4 &&
+		  lionvec_toast_nchunks(lionvec_toast_extsize(768, false), 1996) == 2 &&
+		  lionvec_toast_nchunks(lionvec_toast_extsize(1024, false), 1996) == 3 &&
+		  lionvec_toast_nchunks(lionvec_toast_extsize(3072, false), 1996) == 7 &&
+		  lionvec_toast_nchunks(lionvec_toast_extsize(1536, true), 1996) == 2 &&
+		  lionvec_toast_nchunks(1996, 1996) == 1 &&
+		  lionvec_toast_nchunks(1997, 1996) == 2 &&
+		  lionvec_toast_nchunks(0, 1996) == 0,
+		  "toast: a vector's bytes and chunks");
+	CHECK(lionvec_toast_chunk_size(6148, 1996, 0) == 1996 &&
+		  lionvec_toast_chunk_size(6148, 1996, 2) == 1996 &&
+		  lionvec_toast_chunk_size(6148, 1996, 3) == 160 &&
+		  lionvec_toast_chunk_size(3992, 1996, 1) == 1996 &&
+		  lionvec_toast_chunk_size(100, 1996, 0) == 100,
+		  "toast: each chunk's size, the last the rest");
+	CHECK(lionvec_refloc_runs(1) == 1 && lionvec_refloc_runs(2) == 2 &&
+		  lionvec_refloc_runs(3) == 2 && lionvec_refloc_runs(4) == 2 &&
+		  lionvec_refloc_runs(7) == 3 && lionvec_refloc_runs(17) == 6,
+		  "refine slot: runs by chunks");
+
+	for (trial = 0; trial < 3000; trial++)
+	{
+		int			n = 1 + (int) (rnd64() % 20);
+		int			maxruns = 1 + (int) (rnd64() % 22);
+		uint32		blks[20];
+		uint16		offs[20];
+		LionVecLocRun runs[24];
+		int			model = 0;
+		int			r;
+		int			i;
+		int			seq;
+
+		blks[0] = (uint32) (rnd64() % 4);
+		offs[0] = (uint16) (1 + rnd64() % 6);
+		for (i = 1; i < n; i++)
+		{
+			uint64		u = rnd64() % 4;
+
+			/* the next line pointer, a gap, a new block, or the same block back */
+			blks[i] = u == 2 ? blks[i - 1] + 1 : blks[i - 1];
+			offs[i] = u == 0 ? offs[i - 1] + 1 : u == 1 ? offs[i - 1] + 2 :
+				u == 2 ? 1 : offs[i - 1] - (offs[i - 1] > 1 ? 1 : 0);
+		}
+		for (i = 0; i < n; i++)
+			if (i == 0 || blks[i] != blks[i - 1] || offs[i] != offs[i - 1] + 1)
+				model++;
+		r = lionvec_loc_runs(blks, offs, n, runs, maxruns);
+		if (model > maxruns)
+		{
+			ok &= r == -1;
+			continue;
+		}
+		ok &= r == model;
+		if (r != model)
+			continue;
+		/* the chunks back, in order, from the runs */
+		seq = 0;
+		for (i = 0; i < r; i++)
+		{
+			int			j;
+
+			for (j = 0; j < runs[i].n; j++, seq++)
+				ok &= seq < n && runs[i].blk == blks[seq] && runs[i].off + j == offs[seq];
+		}
+		ok &= seq == n;
+		ok &= lionvec_loc_runs_ok(runs, r, n, 291);
+	}
+	CHECK(ok, "runs: consecutive line pointers of a block merged, the chunks back in order");
+	CHECK(lionvec_loc_runs(NULL, NULL, 0, NULL, 4) == -1, "runs: none of no chunks");
+	{
+		LionVecLocRun r1[2] = {{7, 1, 3}, {8, 1, 1}};
+		LionVecLocRun bad[1] = {{7, 0, 4}};
+		LionVecLocRun inv[1] = {{PG_UINT32_MAX, 1, 4}};
+		LionVecLocRun far[1] = {{7, 290, 4}};
+
+		CHECK(lionvec_loc_runs_ok(r1, 2, 4, 291) &&
+			  !lionvec_loc_runs_ok(r1, 2, 5, 291) &&
+			  !lionvec_loc_runs_ok(r1, 2, 3, 291) &&
+			  !lionvec_loc_runs_ok(r1, 0, 4, 291) &&
+			  !lionvec_loc_runs_ok(r1, 2, 1, 291) &&
+			  !lionvec_loc_runs_ok(bad, 1, 4, 291) &&
+			  !lionvec_loc_runs_ok(inv, 1, 4, 291) &&
+			  !lionvec_loc_runs_ok(far, 1, 4, 291) &&
+			  lionvec_loc_runs_ok(far, 1, 4, 293),
+			  "runs: the chunks' count, line pointers and blocks checked");
+	}
+
+	ok = true;
+	for (trial = 0; trial < 2000; trial++)
+	{
+		int			n = (int) (rnd64() % 40);
+		int			nm = (int) (rnd64() % 30);
+		uint32		page[40];
+		uint32		lo[40];
+		uint32		hi[40];
+		uint32		mblks[30];
+		uint32		out[40];
+		bool		want[64];
+		int			k;
+		int			got;
+		int			i;
+		int			j;
+
+		for (i = 0; i < n; i++)
+		{
+			page[i] = (uint32) (rnd64() % 64);
+			lo[i] = (uint32) (rnd64() % 200);
+			/* now and then an empty range, its lo past its hi */
+			hi[i] = rnd64() % 5 == 0 && lo[i] > 0 ? lo[i] - 1 :
+				lo[i] + (uint32) (rnd64() % 30);
+			if (rnd64() % 9 == 0)
+			{
+				lo[i] = PG_UINT32_MAX;	/* an empty page's: no block yet */
+				hi[i] = 0;
+			}
+		}
+		k = 0;
+		for (j = 0; j < nm; j++)
+		{
+			uint32		b = (uint32) (rnd64() % 230);
+
+			mblks[k++] = b;
+		}
+		qsort(mblks, k, sizeof(uint32), int_cmp);
+		for (i = j = 0; i < k; i++)
+			if (j == 0 || mblks[j - 1] != mblks[i])
+				mblks[j++] = mblks[i];
+		nm = j;
+		memset(want, 0, sizeof(want));
+		for (i = 0; i < n; i++)
+			for (j = 0; j < nm; j++)
+				if (lo[i] <= hi[i] && mblks[j] >= lo[i] && mblks[j] <= hi[i])
+					want[page[i]] = true;
+		got = lionvec_loc_select(page, lo, hi, n, mblks, nm, out);
+		k = 0;
+		for (i = 0; i < 64; i++)
+			if (want[i])
+				ok &= k < got && out[k++] == (uint32) i;
+		ok &= k == got;
+	}
+	CHECK(ok, "select: the pages whose ranges hold a member's block, in order, once");
+}
+
 int
 main(void)
 {
@@ -3759,6 +3924,7 @@ main(void)
 	test_candidates_among();
 	test_regions();
 	test_prefetch();
+	test_locator();
 
 	printf("vec_test: %ld checks, %ld failed\n", nchecks, nfail);
 	return nfail == 0 ? 0 : 1;

@@ -308,6 +308,18 @@ index (1.9 GB rather than 1.7 GB for a million rows), each partition twice as lo
 insert written to two partitions. With fewer than two partitions there is nothing to spill to.
 The build reads it, so a change takes effect at the next `REINDEX`.
 
+An index whose vectors may lie in TOAST - pgvector's `vector` of more than 506 dimensions, or
+`halfvec` of more than 1,012, unless the column is `PLAIN` or `MAIN` or the table's
+`toast_tuple_target` keeps its rows whole - keeps where each row's vector lies there (DESIGN.md
+§44.13): the TOAST relation's block and line pointer of its chunks, on pages of their own, the
+LOCATOR, in heap order (28 bytes a row, 1.3% of a 1536-dimension index), and beside each row's 8-bit
+codes. A scan reads such a vector from its chunks' page rather than through the row's table page and
+the TOAST index (`pg_lion.vector_toast_direct`, below), checking every chunk and then the row, so
+the answer is the same. On DBpedia's 115,186 embeddings in TOAST an exact answer over 1% of the rows
+took 68 ms from the disk where it had taken 180, and 8 ms warm where it had taken 14; a probing
+scan, which reads only the rows it reranks so, 6 to 7% less from the disk. An index whose vectors
+lie in their rows keeps none and costs nothing more.
+
 With a `WHERE` that lion indexes answer, `LionOrdered` builds lion's set of the matching rows and
 the scan reads and scores only those (`Custom Scan (LionOrdered)` with `Order By:` in `EXPLAIN`),
 so a `LIMIT` is never left short. A set of up to `pg_lion.vector_exact_rows` rows (2,000), or of
@@ -704,19 +716,40 @@ several pages a read, on 18 as `io_method` says; `fadvise` asks the kernel for t
 comes. The table's rows are read ahead only when its access method is heap's and its vectors lie in
 its pages (`STORAGE PLAIN` or `MAIN`, or at most 506 dimensions, 1,012 as `halfvec`, or within the
 table's `toast_tuple_target` where that is larger) - an exact answer's through a stream under
-`stream`, the rows whose exact distances a scan computes by asking the kernel under either: a vector
-in TOAST is not read ahead under any setting. The rows returned, and their order, are the same under
-all three. `on` and `off`, from when it was a boolean, still work, `on` being the default. On
-115,186 embeddings (DESIGN.md §44.9), each query alone with its pages on the disk, `stream` took a
-scan at a margin of 8 from 48 ms asking the kernel to 43 (67 reading as it went), a 1% filter's from
-83 to 62, and an exact answer's from 59 to 53. With the index's pages in the operating system's
-cache and not in shared buffers, though, `stream` costs up to 40% more than `fadvise` under 18's
-`io_method` `worker` or `io_uring`, which hand each read to another process or thread; `fadvise`
-suits an index that lives there. With everything in shared buffers `stream` costs 2 to 11% and
-`fadvise` under 5%: after 32 reads in a row found their page there, a scan stops reading ahead for
-the next 256, then starts again. Each scan's `DEBUG1` line names what its streams read
-(`N pages streamed (M read in), A read apart, W streamed unread, R restarts`), or the pages it asked
-for and how many were not in shared buffers.
+`stream`, the rows whose exact distances a scan computes by asking the kernel under either. A vector
+in TOAST is read ahead only where its index knows its place (`pg_lion.vector_toast_direct`, below):
+an exact answer's chunks through a stream under `stream`, a reranked row's first chunk page by
+asking the kernel under either. The rows returned, and their order, are the same under all three.
+`on` and `off`, from when it was a boolean, still work, `on` being the default. On 115,186
+embeddings (DESIGN.md §44.9), each query alone with its pages on the disk, `stream` took a scan at a
+margin of 8 from 48 ms asking the kernel to 43 (67 reading as it went), a 1% filter's from 83 to 62,
+and an exact answer's from 59 to 53. With the index's pages in the operating system's cache and not
+in shared buffers, though, `stream` costs up to 40% more than `fadvise` under 18's `io_method`
+`worker` or `io_uring`, which hand each read to another process or thread; `fadvise` suits an index
+that lives there. With everything in shared buffers `stream` costs 2 to 11% and `fadvise` under 5%:
+after 32 reads in a row found their page there, a scan stops reading ahead for the next 256, then
+starts again. Each scan's `DEBUG1` line names what its streams read (`N pages streamed (M read in),
+A read apart, W streamed unread, R restarts`), or the pages it asked for and how many were not in
+shared buffers.
+
+`pg_lion.vector_toast_direct` (boolean, `on`): whether a `lionvec` scan reads a vector stored in
+TOAST from its chunks' pages, by the places its index keeps (above, and DESIGN.md §44.13), rather
+than through the row's table page and the TOAST index. An exact answer (`pg_lion.vector_exact_rows`)
+then reads its matching rows' vectors through one read stream over their chunks' pages, and a
+probing scan reads each row it computes the exact distance of from its table page and its chunks'
+page, asked for together, with no TOAST index descent between. The rows returned, their order and
+their distances are the same either way: each chunk read by place is checked to be the one its
+value's id and sequence call for, and falls back to the table when it is not; a row read so is
+returned only once its table row, fetched under the query's snapshot, stores the same value, and an
+index that names another value for a live row is an `ERRCODE_INDEX_CORRUPTED` error, never an
+answer. A scan whose reads by place mostly fail - its TOAST table rewritten on its own (`VACUUM FULL
+pg_toast.pg_toast_N`) since the index was built - stops trying after 64; a `REINDEX` makes every
+place right again. Only an index that keeps places is read so, over a heap table, under an MVCC
+snapshot, and on 16 not under `old_snapshot_threshold`. Inserts keep the places up whatever the
+setting. Each scan's `DEBUG1` line adds `N read by place (L locator pages, F not), C checked` - the
+vectors read by place, the locator pages read for them, the reads that fell back, the rows checked
+against the table - and the TOAST pages it asked the kernel for ahead. Off, every vector is read
+through its table row and the TOAST index, as before; it is there to compare.
 
 `pg_lion.ordered_switch_ratio` (32, 1 to 1,000,000): how many B-tree entries `LionOrdered` walks per
 member it has not met yet before it stops walking, fetches the members left in TID order and sorts

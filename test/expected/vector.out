@@ -348,9 +348,9 @@ VACUUM (ANALYZE) vt;
 SELECT i AS index, vt_spill(i) FROM unnest('{vt_l2,vt_ip,vt_cos}'::regclass[]) i;
  index  |                                                     vt_spill                                                     
 --------+------------------------------------------------------------------------------------------------------------------
- vt_l2  | format 4, flags 1: 3006 rows, 3001 copies, 5 NULL or zero; each row once, any copy the same in another partition
- vt_ip  | format 4, flags 1: 3006 rows, 3001 copies, 5 NULL or zero; each row once, any copy the same in another partition
- vt_cos | format 4, flags 1: 3006 rows, 3000 copies, 6 NULL or zero; each row once, any copy the same in another partition
+ vt_l2  | format 5, flags 1: 3006 rows, 3001 copies, 5 NULL or zero; each row once, any copy the same in another partition
+ vt_ip  | format 5, flags 1: 3006 rows, 3001 copies, 5 NULL or zero; each row once, any copy the same in another partition
+ vt_cos | format 5, flags 1: 3006 rows, 3000 copies, 6 NULL or zero; each row once, any copy the same in another partition
 (3 rows)
 
 SET pg_lion.vector_epsilon = 6;
@@ -456,7 +456,7 @@ CREATE INDEX vtt_l2 ON vtt USING lionvec (v) WITH (partitions = 12);
 SELECT vt_spill('vtt_l2');
                                                      vt_spill                                                     
 ------------------------------------------------------------------------------------------------------------------
- format 4, flags 1: 1200 rows, 1200 copies, 0 NULL or zero; each row once, any copy the same in another partition
+ format 5, flags 1: 1200 rows, 1200 copies, 0 NULL or zero; each row once, any copy the same in another partition
 (1 row)
 
 SELECT k, vec_cmp(format('SELECT id, v <-> vt_vec(3, 40) AS d FROM vtt ORDER BY v <-> vt_vec(3, 40) LIMIT %s', k))
@@ -616,9 +616,9 @@ SELECT i, 10, vt_vec(-11, 40, 4.0) + vt_vec(i, 40, 0.3)
 SELECT i AS index, vt_spill(i) FROM unnest('{vt_l2,vt_ip,vt_cos}'::regclass[]) i;
  index  |                                                     vt_spill                                                     
 --------+------------------------------------------------------------------------------------------------------------------
- vt_l2  | format 4, flags 1: 3600 rows, 3595 copies, 5 NULL or zero; each row once, any copy the same in another partition
- vt_ip  | format 4, flags 1: 3600 rows, 3595 copies, 5 NULL or zero; each row once, any copy the same in another partition
- vt_cos | format 4, flags 1: 3600 rows, 3594 copies, 6 NULL or zero; each row once, any copy the same in another partition
+ vt_l2  | format 5, flags 1: 3600 rows, 3595 copies, 5 NULL or zero; each row once, any copy the same in another partition
+ vt_ip  | format 5, flags 1: 3600 rows, 3595 copies, 5 NULL or zero; each row once, any copy the same in another partition
+ vt_cos | format 5, flags 1: 3600 rows, 3594 copies, 6 NULL or zero; each row once, any copy the same in another partition
 (3 rows)
 
 SELECT op, k, vec_cmp(format('SELECT id, v %s %s AS d FROM vt ORDER BY v %s %s LIMIT %s',
@@ -670,9 +670,9 @@ SELECT i AS index, vt_spill(i), vt_strays(i), vt_refines(i)
   FROM unnest('{vt_l2,vt_ip,vt_cos}'::regclass[]) i;
  index  |                                                     vt_spill                                                     | vt_strays |                           vt_refines                            
 --------+------------------------------------------------------------------------------------------------------------------+-----------+-----------------------------------------------------------------
- vt_l2  | format 4, flags 1: 2400 rows, 2396 copies, 4 NULL or zero; each row once, any copy the same in another partition |         0 | 2396 rows' refine items, 20 centroids'; one a row with a vector
- vt_ip  | format 4, flags 1: 2400 rows, 2396 copies, 4 NULL or zero; each row once, any copy the same in another partition |         0 | 2396 rows' refine items, 20 centroids'; one a row with a vector
- vt_cos | format 4, flags 1: 2400 rows, 2396 copies, 4 NULL or zero; each row once, any copy the same in another partition |         0 | 2396 rows' refine items, 20 centroids'; one a row with a vector
+ vt_l2  | format 5, flags 1: 2400 rows, 2396 copies, 4 NULL or zero; each row once, any copy the same in another partition |         0 | 2396 rows' refine items, 20 centroids'; one a row with a vector
+ vt_ip  | format 5, flags 1: 2400 rows, 2396 copies, 4 NULL or zero; each row once, any copy the same in another partition |         0 | 2396 rows' refine items, 20 centroids'; one a row with a vector
+ vt_cos | format 5, flags 1: 2400 rows, 2396 copies, 4 NULL or zero; each row once, any copy the same in another partition |         0 | 2396 rows' refine items, 20 centroids'; one a row with a vector
 (3 rows)
 
 SELECT op, k, vec_cmp(format('SELECT id, v %s %s AS d FROM vt ORDER BY v %s %s LIMIT %s',
@@ -725,7 +725,7 @@ REINDEX INDEX vt_l2;
 SELECT vt_spill('vt_l2');
                                                      vt_spill                                                     
 ------------------------------------------------------------------------------------------------------------------
- format 4, flags 1: 2901 rows, 2897 copies, 4 NULL or zero; each row once, any copy the same in another partition
+ format 5, flags 1: 2901 rows, 2897 copies, 4 NULL or zero; each row once, any copy the same in another partition
 (1 row)
 
 SELECT vec_cmp('SELECT id, v <-> vt_vec(14, 40) AS d FROM vt ORDER BY v <-> vt_vec(14, 40) LIMIT 100');
@@ -740,14 +740,14 @@ ALTER INDEX vt_l2 SET (spill = off);
 SELECT vt_spill('vt_l2');
                                                      vt_spill                                                     
 ------------------------------------------------------------------------------------------------------------------
- format 4, flags 1: 2901 rows, 2897 copies, 4 NULL or zero; each row once, any copy the same in another partition
+ format 5, flags 1: 2901 rows, 2897 copies, 4 NULL or zero; each row once, any copy the same in another partition
 (1 row)
 
 REINDEX INDEX vt_l2;
 SELECT vt_spill('vt_l2');
                                                    vt_spill                                                    
 ---------------------------------------------------------------------------------------------------------------
- format 4, flags 0: 2901 rows, 0 copies, 4 NULL or zero; each row once, any copy the same in another partition
+ format 5, flags 0: 2901 rows, 0 copies, 4 NULL or zero; each row once, any copy the same in another partition
 (1 row)
 
 SELECT vec_cmp('SELECT id, v <-> vt_vec(14, 40) AS d FROM vt ORDER BY v <-> vt_vec(14, 40) LIMIT 100');
@@ -760,7 +760,7 @@ INSERT INTO vt SELECT i, 11, vt_vec(i, 40) FROM generate_series(5000, 5049) i;
 SELECT vt_spill('vt_l2');
                                                    vt_spill                                                    
 ---------------------------------------------------------------------------------------------------------------
- format 4, flags 0: 2951 rows, 0 copies, 4 NULL or zero; each row once, any copy the same in another partition
+ format 5, flags 0: 2951 rows, 0 copies, 4 NULL or zero; each row once, any copy the same in another partition
 (1 row)
 
 SELECT vec_cmp('SELECT id, v <-> vt_vec(14, 40) AS d FROM vt ORDER BY v <-> vt_vec(14, 40) LIMIT 300');
@@ -776,7 +776,7 @@ REINDEX INDEX vt_l2;
 SELECT vt_spill('vt_l2');
                                                      vt_spill                                                     
 ------------------------------------------------------------------------------------------------------------------
- format 4, flags 1: 2901 rows, 2897 copies, 4 NULL or zero; each row once, any copy the same in another partition
+ format 5, flags 1: 2901 rows, 2897 copies, 4 NULL or zero; each row once, any copy the same in another partition
 (1 row)
 
 DROP INDEX vt_l2;
@@ -841,7 +841,7 @@ ERROR:  expected 3 dimensions, not 4
 SELECT vt_spill('ve_l2');
                                                   vt_spill                                                  
 ------------------------------------------------------------------------------------------------------------
- format 4, flags 0: 4 rows, 0 copies, 1 NULL or zero; each row once, any copy the same in another partition
+ format 5, flags 2: 4 rows, 0 copies, 1 NULL or zero; each row once, any copy the same in another partition
 (1 row)
 
 SET enable_seqscan = off;
@@ -889,7 +889,7 @@ REINDEX INDEX vu_l2;
 SELECT vt_spill('vu_l2');
                                                    vt_spill                                                   
 --------------------------------------------------------------------------------------------------------------
- format 4, flags 0: 200 rows, 0 copies, 0 NULL or zero; each row once, any copy the same in another partition
+ format 5, flags 0: 200 rows, 0 copies, 0 NULL or zero; each row once, any copy the same in another partition
 (1 row)
 
 -- more partitions than rows: as many as the rows, one each; and none, of
@@ -902,7 +902,7 @@ INSERT INTO vt2 SELECT * FROM vt WHERE id < 300 OR v IS NULL;
 SELECT vt_spill('vt2_many');
                                                    vt_spill                                                   
 --------------------------------------------------------------------------------------------------------------
- format 4, flags 0: 204 rows, 0 copies, 4 NULL or zero; each row once, any copy the same in another partition
+ format 5, flags 0: 204 rows, 0 copies, 4 NULL or zero; each row once, any copy the same in another partition
 (1 row)
 
 SELECT vec_cmp('SELECT id, v <-> vt_vec(20, 40) AS d FROM vt2 ORDER BY v <-> vt_vec(20, 40) LIMIT 20');
@@ -915,7 +915,7 @@ REINDEX INDEX vt2_many;
 SELECT vt_spill('vt2_many');
                                                     vt_spill                                                    
 ----------------------------------------------------------------------------------------------------------------
- format 4, flags 1: 204 rows, 200 copies, 4 NULL or zero; each row once, any copy the same in another partition
+ format 5, flags 1: 204 rows, 200 copies, 4 NULL or zero; each row once, any copy the same in another partition
 (1 row)
 
 SELECT vec_cmp('SELECT id, v <-> vt_vec(20, 40) AS d FROM vt2 ORDER BY v <-> vt_vec(20, 40) LIMIT 20');
@@ -942,8 +942,8 @@ SELECT i, i % 10, vt_vec(-(i % 10) - 1, 40) + vt_vec(i, 40, 0.3)
 SELECT i AS index, vt_spill(i), vt_refines(i) FROM unnest('{vt2_two,vt2_five}'::regclass[]) i;
   index   |                                                    vt_spill                                                    |                          vt_refines                           
 ----------+----------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------
- vt2_two  | format 4, flags 1: 304 rows, 300 copies, 4 NULL or zero; each row once, any copy the same in another partition | 300 rows' refine items, 2 centroids'; one a row with a vector
- vt2_five | format 4, flags 1: 304 rows, 300 copies, 4 NULL or zero; each row once, any copy the same in another partition | 300 rows' refine items, 5 centroids'; one a row with a vector
+ vt2_two  | format 5, flags 1: 304 rows, 300 copies, 4 NULL or zero; each row once, any copy the same in another partition | 300 rows' refine items, 2 centroids'; one a row with a vector
+ vt2_five | format 5, flags 1: 304 rows, 300 copies, 4 NULL or zero; each row once, any copy the same in another partition | 300 rows' refine items, 5 centroids'; one a row with a vector
 (2 rows)
 
 SELECT vec_cmp('SELECT id, v <-> vt_vec(21, 40) AS d FROM vt2 ORDER BY v <-> vt_vec(21, 40) LIMIT 60');
@@ -966,10 +966,10 @@ DROP INDEX vt2_two, vt2_five;
 SELECT i AS index, vt_regions(i) FROM unnest('{vt_l2,vt_ip,vt_cos,vu_l2}'::regclass[]) i;
  index  |                      vt_regions                       
 --------+-------------------------------------------------------
- vt_l2  | format 4: 20 partitions in 0 regions; no REGION chain
- vt_ip  | format 4: 20 partitions in 0 regions; no REGION chain
- vt_cos | format 4: 20 partitions in 0 regions; no REGION chain
- vu_l2  | format 4: 1 partitions in 0 regions; no REGION chain
+ vt_l2  | format 5: 20 partitions in 0 regions; no REGION chain
+ vt_ip  | format 5: 20 partitions in 0 regions; no REGION chain
+ vt_cos | format 5: 20 partitions in 0 regions; no REGION chain
+ vu_l2  | format 5: 1 partitions in 0 regions; no REGION chain
 (4 rows)
 
 CREATE TABLE vr (id int PRIMARY KEY, v vector(40)) WITH (autovacuum_enabled = off);
@@ -983,9 +983,9 @@ SELECT i AS index, vt_regions(i), vt_spill(i), vt_refines(i)
   FROM unnest('{vr_l2,vr_ip,vr_cos}'::regclass[]) i;
  index  |                                     vt_regions                                     |                                                     vt_spill                                                     |                            vt_refines                            
 --------+------------------------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------------+------------------------------------------------------------------
- vr_l2  | format 4: 100 partitions in 10 regions; runs in order, each at its first PART item | format 4, flags 1: 6400 rows, 6400 copies, 0 NULL or zero; each row once, any copy the same in another partition | 6400 rows' refine items, 100 centroids'; one a row with a vector
- vr_ip  | format 4: 100 partitions in 10 regions; runs in order, each at its first PART item | format 4, flags 1: 6400 rows, 6400 copies, 0 NULL or zero; each row once, any copy the same in another partition | 6400 rows' refine items, 100 centroids'; one a row with a vector
- vr_cos | format 4: 100 partitions in 10 regions; runs in order, each at its first PART item | format 4, flags 1: 6400 rows, 6400 copies, 0 NULL or zero; each row once, any copy the same in another partition | 6400 rows' refine items, 100 centroids'; one a row with a vector
+ vr_l2  | format 5: 100 partitions in 10 regions; runs in order, each at its first PART item | format 5, flags 1: 6400 rows, 6400 copies, 0 NULL or zero; each row once, any copy the same in another partition | 6400 rows' refine items, 100 centroids'; one a row with a vector
+ vr_ip  | format 5: 100 partitions in 10 regions; runs in order, each at its first PART item | format 5, flags 1: 6400 rows, 6400 copies, 0 NULL or zero; each row once, any copy the same in another partition | 6400 rows' refine items, 100 centroids'; one a row with a vector
+ vr_cos | format 5: 100 partitions in 10 regions; runs in order, each at its first PART item | format 5, flags 1: 6400 rows, 6400 copies, 0 NULL or zero; each row once, any copy the same in another partition | 6400 rows' refine items, 100 centroids'; one a row with a vector
 (3 rows)
 
 -- an insert reads the REGION chain and the runs of the regions nearest the
@@ -1098,7 +1098,7 @@ VACUUM ANALYZE vs, vn;
 SELECT vt_spill('vs_l2') AS spill, vt_spill('vn_l2') AS "no spill";
                                                       spill                                                       |                                                   no spill                                                    
 ------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------
- format 4, flags 1: 3000 rows, 3000 copies, 0 NULL or zero; each row once, any copy the same in another partition | format 4, flags 0: 3000 rows, 0 copies, 0 NULL or zero; each row once, any copy the same in another partition
+ format 5, flags 1: 3000 rows, 3000 copies, 0 NULL or zero; each row once, any copy the same in another partition | format 5, flags 0: 3000 rows, 0 copies, 0 NULL or zero; each row once, any copy the same in another partition
 (1 row)
 
 CREATE FUNCTION vt_recall_of(tbl text, op text) RETURNS float8

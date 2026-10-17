@@ -25,7 +25,7 @@ FUNCS_OBJS = src/lion_funcs.o src/lion_verify.o src/lion_verify_dir.o src/lion_v
 # lionvec, the nearest-neighbour index of pgvector's `vector` and `halfvec`
 # (DESIGN.md §44): the AM, its scan, and its arithmetic, which is unit-tested
 # standalone.
-VEC_OBJS = src/lion_vec.o src/lion_vec_scan.o src/lion_vec_math.o
+VEC_OBJS = src/lion_vec.o src/lion_vec_scan.o src/lion_vec_loc.o src/lion_vec_math.o
 # Reading a relation's blocks in an order its reader predicts: a read stream
 # over them from 17 on, asks of the kernel before (DESIGN.md §44.4, "Read
 # streams"); the ring's bookkeeping is unit-tested standalone.
