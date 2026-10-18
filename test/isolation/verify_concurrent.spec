@@ -235,7 +235,12 @@ step s2_push_q		{
 	  FROM generate_series(1, 40000) i;
 }
 step s2_free_p		{ DELETE FROM vp WHERE k = 1; }
-step s2_vacuum_p	{ VACUUM vp; }
+# FREEZE, so that VACUUM waits for a heap page someone else has pinned: an
+# aggressive VACUUM must freeze its tuples, where a plain one goes past it and
+# leaves its dead rows.  A posting tree is freed only once its whole set is
+# empty, so one such page keeps all of k = 1's: a checkpoint writing a page
+# out left 33 of its rows behind and nothing freed (REL_19_STABLE, 2026-10-18).
+step s2_vacuum_p	{ VACUUM (FREEZE) vp; }
 step s2_xid			{ SELECT pg_current_xact_id() IS NOT NULL AS took_an_xid; }
 step s2_vacuum_c	{ VACUUM vc; }
 step s2_lock		{ BEGIN; LOCK TABLE vc IN ACCESS EXCLUSIVE MODE; }

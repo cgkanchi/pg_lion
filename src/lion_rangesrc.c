@@ -415,8 +415,8 @@ lion_range_union_cmp(const void *a, const void *b)
 
 /*
  * One window of a range's union (above): walk the range and keep what its
- * sets hold at the window's keys.  nsets and nsummaries, when given, say what
- * the walk read.
+ * sets hold at the window's keys.  What the walk read is added to nsets and
+ * nsummaries, when they are given.
  */
 static void
 lion_range_union_walk(Relation index, AttrNumber attno, LionRange *range,
@@ -437,7 +437,7 @@ lion_range_union_walk(Relation index, AttrNumber attno, LionRange *range,
 		CHECK_FOR_INTERRUPTS();
 	}
 	if (nsummaries != NULL)
-		*nsummaries = es.nsummaries;
+		*nsummaries += es.nsummaries;
 	lion_entry_scan_end(&es);
 }
 
@@ -507,6 +507,24 @@ lion_range_collect(Relation index, AttrNumber attno, LionRange *range,
 				   Size maxbytes, bool spill, LionPostingSet *out, Size *held,
 				   bool *spilled, int64 *nsets, int64 *nsummaries)
 {
+	return lion_ranges_collect(index, attno, &range, 1, maxbytes, spill, out,
+							   held, spilled, nsets, nsummaries);
+}
+
+/*
+ * The same for the UNION of several ranges of one column - the ranges of
+ * `col < ANY (array)` on a column that cannot order the elements, one an
+ * element (DESIGN.md §28) - as one set, in maxbytes all told: every window is
+ * a walk of each range into the one union, so the ranges share the window's
+ * memory and a spill's one file.  (A set collected for each range, each in
+ * maxbytes, was an array's worth of window memories, 2026-10-18 review.)
+ */
+bool
+lion_ranges_collect(Relation index, AttrNumber attno, LionRange **ranges,
+					int nranges, Size maxbytes, bool spill, LionPostingSet *out,
+					Size *held, bool *spilled, int64 *nsets,
+					int64 *nsummaries)
+{
 	LionRangeUnion u;
 	LionSpill	sp;
 	HASHCTL		ctl;
@@ -518,6 +536,7 @@ lion_range_collect(Relation index, AttrNumber attno, LionRange *range,
 	bool		windowed = false;
 	long		n;
 	long		i;
+	int			r;
 
 	memset(out, 0, sizeof(LionPostingSet));
 	out->pinbuf = InvalidBuffer;
@@ -565,10 +584,11 @@ lion_range_collect(Relation index, AttrNumber attno, LionRange *range,
 		u.byckey = hash_create("lion range union", 256, &ctl,
 							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
-		/* the first window's walk is the one that says what the range read */
-		lion_range_union_walk(index, attno, range, &u,
-							  windowed ? NULL : nsets,
-							  windowed ? NULL : nsummaries);
+		/* the first window's walks are the ones that say what the ranges read */
+		for (r = 0; r < nranges && !u.failed; r++)
+			lion_range_union_walk(index, attno, ranges[r], &u,
+								  windowed ? NULL : nsets,
+								  windowed ? NULL : nsummaries);
 
 		if (u.failed)
 		{
