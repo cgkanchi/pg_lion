@@ -21591,6 +21591,24 @@ further hundred rows, measured at 115,000 rows, not 0.06 of one); there the filt
 LionOrdered's or a sort's with no constant changed. `LIONVEC_DEEPER_PAUSED` still prices an
 unfiltered scan's deeper batches, and the plain scan under `allow`.
 
+**The set's pieces** (2026-10-18). Until then `lo_cost_knn()` priced the set as `lo_cost()` does for
+a B-tree's walk (§30.3): the lion access's own cost - a summary entry a bucket - and
+`cpu_operator_cost` a container key, nothing a member, so the 50M-row benchmark's 10% set, 1,220
+summary entries and 260,417 keys built in 845 ms, cost 650. Both now add the pieces the set copies,
+sorts and ORs (`lo_set_pieces()`): each leaf's source hands the set a container for each entry it
+reads at each container key that entry's rows reach, so they cost
+
+    min(members, entries x keys) x LO_PROBE_TUPLES x cpu_tuple_cost
+
+with `entries` from `lion_cost_path_entries()` (lion_amcost.c, summed over a BitmapAnd's or
+BitmapOr's leaves): for a key column's range, `lion_cost_ranges_entries()`'s - a summary a bucket it
+covers whole, and the keys at its ends, or without summaries every key between its bounds; for an
+equality list longer than a batch (`lion_scan_list_batch()`), a LIST source, its elements; else one;
+a leaf's most of any column. `LO_PROBE_TUPLES` (2) `cpu_tuple_cost`s is the walk's 170 ns an entry,
+which the 50M build's 5M pieces came to (845 ms); at 5M rows the same filter's 500,000 members took
+44 to 48 ms, 1.36 members a piece, 90 ns a member. A 10% equality on a column the heap is ordered by
+brings a piece a key; a range over a unique column a piece a member.
+
 **A parallel scan** (2026-10-16; §44.4). `cost_index()` asks `lionveccostestimate()` for the
 index's cost before it counts the path's workers, and of the result divides only its own CPU part
 by the parallel divisor, so a partial path came out at about the serial scan's price.

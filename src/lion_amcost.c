@@ -726,6 +726,76 @@ lion_cost_ranges_entries(PlannerInfo *root, IndexPath *path, int c,
 }
 
 /*
+ * How many entries a lion IndexPath's lookups hand their answer out by
+ * (DESIGN.md §30.3, §44.7), for LionOrdered's price of its set
+ * (lion_ordered.c, lo_set_pieces()): a source hands out a container for
+ * each entry it reads at each container key that entry's rows reach (§29.3,
+ * lion_source_next()), and the set copies, sorts and ORs every one of them.
+ * A column's range walks lion_cost_ranges_entries()'s entries - one summary
+ * for every bucket it covers whole and the keys at its two ends, or, without
+ * summaries, every key between its bounds, a key a row on a unique column; a
+ * list longer than a batch (lion_scan_list_batch()) is a LIST source, an
+ * entry for each value; an equality, a shorter list or `IS NULL` is a set
+ * tree, one container a key: one entry.  A leaf's columns are ANDed key by
+ * key, so its entries are the most of any column's.
+ */
+double
+lion_cost_path_entries(PlannerInfo *root, IndexPath *path)
+{
+	IndexOptInfo *index = path->indexinfo;
+	double		most = 1.0;
+	int			c;
+
+	for (c = 0; c < index->nkeycolumns; c++)
+	{
+		List	   *ranges = lion_cost_col_ranges(path, c);
+		double		entries = 1.0;
+
+		if (ranges != NIL)
+		{
+			Selectivity sel = clauselist_selectivity(root, ranges,
+													 index->rel->relid,
+													 JOIN_INNER, NULL);
+
+			entries = lion_cost_ranges_entries(root, path, c, ranges, sel);
+			list_free(ranges);
+		}
+		else
+		{
+			LionCostCol cc;
+			ListCell   *lc;
+
+			lion_cost_col_quals(path, c, &cc);
+			foreach(lc, cc.sets)
+			{
+				Node	   *cl = (Node *) lfirst_node(RestrictInfo, lc)->clause;
+				ScalarArrayOpExpr *saop;
+				Node	   *array;
+				double		n;
+
+				if (!IsA(cl, ScalarArrayOpExpr))
+					continue;
+				saop = (ScalarArrayOpExpr *) cl;
+				if (get_op_opfamily_strategy(saop->opno, index->opfamily[c]) !=
+					LION_STRAT_EQUAL)
+					continue;
+				array = (Node *) lsecond(saop->args);
+#if PG_VERSION_NUM >= 170000
+				n = estimate_array_length(root, array);
+#else
+				n = estimate_array_length(array);
+#endif
+				if (n > lion_scan_list_batch())
+					entries = Max(entries, n);
+			}
+			lion_cost_col_free(&cc);
+		}
+		most = Max(most, entries);
+	}
+	return most;
+}
+
+/*
  * What the ENTRIES of the range walks of this path cost (DESIGN.md §28), on
  * top of the pages and the postings genericcostestimate() prorates by the
  * selectivity.
