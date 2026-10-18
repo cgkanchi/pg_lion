@@ -475,6 +475,8 @@ extern Buffer lionvec_new_buffer(Relation index, ForkNumber fork);
 extern void lionvec_init_page(Page page, uint16 type);
 extern bool lionvec_vector_inline(Relation index, Relation heap, int dims,
 								  bool half);
+extern bool lionvec_reads_placed(Relation heap, const LionVecMetaData *meta,
+								 int dims, bool half);
 extern void lionvec_check_page(Relation index, Page page, BlockNumber blk,
 							   uint16 type);
 extern Buffer lionvec_insert_readbuf(Relation index, BlockNumber blk);
