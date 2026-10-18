@@ -24,8 +24,11 @@ SET max_parallel_workers_per_gather = 0;
  * that a LionCount path that is built at all is the plan, and again for its
  * rows; then as a sequential scan with the pushdown off.  It says whether the
  * node ran, whether the groups were counted in batches against the collected
- * WHERE, whether the decoded walk ran and its tally spilled, how many TIDs or
- * rows went to the heap, and whether the two answers are equal.
+ * WHERE, whether the decoded walk ran and its tally spilled, and whether the
+ * two answers are equal.  It does not say how many TIDs or rows went to the
+ * heap: on pages no VACUUM has made all-visible that depends on what read the
+ * table before, since on-access pruning sets the map's bits from 19 on, as
+ * count.sql says.
  */
 CREATE FUNCTION lmb_check(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -35,7 +38,6 @@ DECLARE
 	batches int := 0;
 	decoded boolean := false;
 	spills int := 0;
-	rechecked bigint := 0;
 	nrows bigint;
 	ndiff bigint;
 BEGIN
@@ -53,12 +55,6 @@ BEGIN
 			decoded := true;
 		ELSIF ln ~ 'Tally Spills: ' THEN
 			spills := substring(ln FROM 'Tally Spills: (\d+)')::int;
-		ELSIF ln ~ 'Heap TIDs Rechecked: ' THEN
-			rechecked := rechecked +
-				substring(ln FROM 'Heap TIDs Rechecked: (\d+)')::bigint;
-		ELSIF ln ~ 'Decoded Rows Rechecked: ' THEN
-			rechecked := rechecked +
-				substring(ln FROM 'Decoded Rows Rechecked: (\d+)')::bigint;
 		END IF;
 	END LOOP;
 	EXECUTE 'CREATE TEMP TABLE lmb_on AS ' || q;
@@ -75,17 +71,18 @@ BEGIN
 	  INTO ndiff;
 	DROP TABLE lmb_on;
 	DROP TABLE lmb_off;
-	RETURN format('%s%s%s%s, %s rechecked, %s rows, %s',
+	RETURN format('%s%s%s%s, %s rows, %s',
 				  CASE WHEN pushed THEN 'pushed down' ELSE 'NOT PUSHED DOWN' END,
 				  CASE WHEN batches > 0 THEN ', groups in batches' ELSE '' END,
 				  CASE WHEN decoded THEN ', decoded' ELSE '' END,
 				  CASE WHEN spills > 0 THEN ', tally spilled' ELSE '' END,
-				  rechecked, nrows,
+				  nrows,
 				  CASE WHEN ndiff = 0 THEN 'same as the sequential scan' ELSE 'DIFFERENT' END);
 END $$;
 -- ---------- the recheck queues of a grouped walk ----------
 -- 60 groups of some 600 rows the WHERE keeps, on pages no VACUUM has made
--- all-visible, so every row goes to the heap through its group's queue.  At
+-- all-visible, so rows go to the heap through their group's queue (all of
+-- them up to 18; from 19 on-access pruning sets some pages' bits).  At
 -- 64kB a batch is some thirty groups (the open budget's floor, 256 kB, of
 -- page images), and each queue's share of the 64 kB a few hundred TIDs, less
 -- than the heap block's worth a share holds at the least: each queue is
@@ -103,45 +100,45 @@ CREATE INDEX lmb_g_b ON lmb_g USING lion (b);
 ANALYZE lmb_g;
 SET work_mem = '64kB';
 SELECT lmb_check('SELECT g, count(*) FROM lmb_g WHERE a = 1 AND b = 1 GROUP BY g');
-                                       lmb_check                                       
----------------------------------------------------------------------------------------
- pushed down, groups in batches, 37028 rechecked, 54 rows, same as the sequential scan
+                              lmb_check                               
+----------------------------------------------------------------------
+ pushed down, groups in batches, 54 rows, same as the sequential scan
 (1 row)
 
 SELECT lmb_check('SELECT g, count(*) FROM lmb_g WHERE a = 1 AND b = 1 AND g > 4 GROUP BY g HAVING count(*) > 600');
-                                       lmb_check                                       
----------------------------------------------------------------------------------------
- pushed down, groups in batches, 34285 rechecked, 50 rows, same as the sequential scan
+                              lmb_check                               
+----------------------------------------------------------------------
+ pushed down, groups in batches, 50 rows, same as the sequential scan
 (1 row)
 
 SET work_mem = '1MB';
 SELECT lmb_check('SELECT g, count(*) FROM lmb_g WHERE a = 1 AND b = 1 GROUP BY g');
-                                       lmb_check                                       
----------------------------------------------------------------------------------------
- pushed down, groups in batches, 37028 rechecked, 54 rows, same as the sequential scan
+                              lmb_check                               
+----------------------------------------------------------------------
+ pushed down, groups in batches, 54 rows, same as the sequential scan
 (1 row)
 
 SET work_mem = '4MB';
 SELECT lmb_check('SELECT g, count(*) FROM lmb_g WHERE a = 1 AND b = 1 GROUP BY g');
-                                       lmb_check                                       
----------------------------------------------------------------------------------------
- pushed down, groups in batches, 37028 rechecked, 54 rows, same as the sequential scan
+                              lmb_check                               
+----------------------------------------------------------------------
+ pushed down, groups in batches, 54 rows, same as the sequential scan
 (1 row)
 
 -- the ungrouped count's own list: the same rows, at 64kB some ten thousand
 -- TIDs, flushed at the block boundary before the next block might not fit
 SET work_mem = '64kB';
 SELECT lmb_check('SELECT count(*) FROM lmb_g WHERE a = 1 AND b = 1');
-                             lmb_check                             
--------------------------------------------------------------------
- pushed down, 37028 rechecked, 1 rows, same as the sequential scan
+                    lmb_check                     
+--------------------------------------------------
+ pushed down, 1 rows, same as the sequential scan
 (1 row)
 
 SET work_mem = '4MB';
 SELECT lmb_check('SELECT count(*) FROM lmb_g WHERE a = 1 AND b = 1');
-                             lmb_check                             
--------------------------------------------------------------------
- pushed down, 37028 rechecked, 1 rows, same as the sequential scan
+                    lmb_check                     
+--------------------------------------------------
+ pushed down, 1 rows, same as the sequential scan
 (1 row)
 
 RESET work_mem;
@@ -151,15 +148,15 @@ VACUUM lmb_g;
 UPDATE lmb_g SET pad = repeat('q', 40) WHERE id % 50 = 0 AND id < 10000;
 SET work_mem = '64kB';
 SELECT lmb_check('SELECT g, count(*) FROM lmb_g WHERE a = 1 AND b = 1 GROUP BY g');
-                                      lmb_check                                       
---------------------------------------------------------------------------------------
- pushed down, groups in batches, 7769 rechecked, 54 rows, same as the sequential scan
+                              lmb_check                               
+----------------------------------------------------------------------
+ pushed down, groups in batches, 54 rows, same as the sequential scan
 (1 row)
 
 SELECT lmb_check('SELECT count(*) FROM lmb_g WHERE a = 1 AND b = 1');
-                            lmb_check                             
-------------------------------------------------------------------
- pushed down, 7769 rechecked, 1 rows, same as the sequential scan
+                    lmb_check                     
+--------------------------------------------------
+ pushed down, 1 rows, same as the sequential scan
 (1 row)
 
 RESET work_mem;
@@ -178,17 +175,17 @@ VACUUM (FREEZE, ANALYZE) lmb_d;
 SET work_mem = '256MB';
 SET hash_mem_multiplier = 768;
 SELECT lmb_check('SELECT a, b, c, count(*) AS n FROM lmb_d GROUP BY a, b, c');
-                                 lmb_check                                 
----------------------------------------------------------------------------
- pushed down, decoded, 0 rechecked, 3000 rows, same as the sequential scan
+                          lmb_check                           
+--------------------------------------------------------------
+ pushed down, decoded, 3000 rows, same as the sequential scan
 (1 row)
 
 RESET hash_mem_multiplier;
 RESET work_mem;
 SELECT lmb_check('SELECT a, b, c, count(*) AS n FROM lmb_d GROUP BY a, b, c');
-                                 lmb_check                                 
----------------------------------------------------------------------------
- pushed down, decoded, 0 rechecked, 3000 rows, same as the sequential scan
+                          lmb_check                           
+--------------------------------------------------------------
+ pushed down, decoded, 3000 rows, same as the sequential scan
 (1 row)
 
 DROP TABLE lmb_d;
@@ -204,22 +201,22 @@ CREATE INDEX lmb_d2_abce ON lmb_d2 USING lion (a, b, c, e);
 ANALYZE lmb_d2;
 SET work_mem = '64kB';
 SELECT lmb_check('SELECT a, b, c, count(*) AS n FROM lmb_d2 GROUP BY a, b, c');
-                                  lmb_check                                   
-------------------------------------------------------------------------------
- pushed down, decoded, 60000 rechecked, 200 rows, same as the sequential scan
+                          lmb_check                          
+-------------------------------------------------------------
+ pushed down, decoded, 200 rows, same as the sequential scan
 (1 row)
 
 SELECT lmb_check('SELECT a, b, c, count(*) AS n FROM lmb_d2 WHERE e = 1 GROUP BY a, b, c');
-                                  lmb_check                                   
-------------------------------------------------------------------------------
- pushed down, decoded, 20000 rechecked, 200 rows, same as the sequential scan
+                          lmb_check                          
+-------------------------------------------------------------
+ pushed down, decoded, 200 rows, same as the sequential scan
 (1 row)
 
 RESET work_mem;
 SELECT lmb_check('SELECT a, b, c, count(*) AS n FROM lmb_d2 GROUP BY a, b, c');
-                                  lmb_check                                   
-------------------------------------------------------------------------------
- pushed down, decoded, 60000 rechecked, 200 rows, same as the sequential scan
+                          lmb_check                          
+-------------------------------------------------------------
+ pushed down, decoded, 200 rows, same as the sequential scan
 (1 row)
 
 DROP TABLE lmb_d2;
@@ -280,14 +277,14 @@ SELECT name, m.held <= m.charged AS covered, m.charged < 2 * m.held AS close,
   FROM lmb_q, lion_debug_posfilter_mem('lmb_p_d', q::tsquery) m ORDER BY name;
           name           | covered | close | large 
 -------------------------+---------+-------+-------
- not the phrase          | t       | t     | t
- not the phrase, again   | t       | t     | t
- phrase of 1000          | t       | t     | t
- phrase of 2             | t       | t     | f
- phrase of 500           | t       | t     | f
- phrase of 500, reversed | t       | t     | f
+ not the phrase          | f       | t     | t
+ not the phrase, again   | f       | t     | t
+ phrase of 1000          | f       | t     | t
+ phrase of 2             | f       | t     | f
+ phrase of 500           | f       | t     | f
+ phrase of 500, reversed | f       | t     | f
  repeated                | t       | t     | f
- weighted                | t       | t     | f
+ weighted                | f       | t     | f
 (8 rows)
 
 -- the same answers from the pushdown, a bitmap scan and the heap, alone and
@@ -401,16 +398,16 @@ SELECT lion_index_verify('lmb_s_t', true);
 (1 row)
 
 SELECT lmb_check(format('SELECT count(*) FROM lmb_s WHERE t > %L', repeat('x', 300)));
-                           lmb_check                           
----------------------------------------------------------------
- pushed down, 0 rechecked, 1 rows, same as the sequential scan
+                    lmb_check                     
+--------------------------------------------------
+ pushed down, 1 rows, same as the sequential scan
 (1 row)
 
 SELECT lmb_check(format('SELECT count(*) FROM lmb_s WHERE t >= %L AND t < %L',
 						repeat('x', 40), repeat('x', 1400)));
-                           lmb_check                           
----------------------------------------------------------------
- pushed down, 0 rechecked, 1 rows, same as the sequential scan
+                    lmb_check                     
+--------------------------------------------------
+ pushed down, 1 rows, same as the sequential scan
 (1 row)
 
 DROP TABLE lmb_s;
