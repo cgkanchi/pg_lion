@@ -1,0 +1,336 @@
+-- Damage a writer's record would have carried on with: an ERROR before the
+-- record opens, never a PANIC or a rewrite of the damage (DESIGN.md §3,
+-- 2026-09-29, and §25).
+--
+-- 1. An entry flagged both INLINE and CHAIN, at the length a CHAIN entry of
+--    its key has, which lion_page_entry_fetch() took for a whole CHAIN entry:
+--    the insert of its key sent it down the INLINE path, which rewrote it in
+--    a record, damage and all.
+-- 2. A directory leaf whose pd_lower is inside the page header, which the
+--    buffer manager lets in and PageAddItemExtended() PANICs on, in either
+--    WAL mode: the insert of a new key added its entry to the leaf without
+--    a look at the header (lion_page_check_header()).
+-- 3. The same of a posting leaf, which the insert of a row of its key
+--    added a new item to.
+--
+-- The pages are damaged ON DISK, and read back from there by moving the index
+-- to another tablespace: ALTER INDEX ... SET TABLESPACE writes out what is
+-- dirty in the buffer pool and then copies the FILE, and the copy has no page
+-- in the buffer pool yet.  So, unlike the other corrupt*.sql files, which drop
+-- the pages with pg_buffercache_evict(), this one runs on PostgreSQL 16 too.
+-- The tablespace is an in-place one (allow_in_place_tablespaces, a developer
+-- option).  The byte offsets assume a little-endian server, as the page
+-- checksum's does.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+-- left behind by a run that stopped part-way
+DROP TABLESPACE IF EXISTS lion_dr_ts;
+RESET client_min_messages;
+SET statement_timeout = '60s';
+SET allow_in_place_tablespaces = on;
+CREATE TABLESPACE lion_dr_ts LOCATION '';
+RESET allow_in_place_tablespaces;
+-- A little-endian uint32 at byte off of a bytea, and one as four bytes.
+CREATE FUNCTION lion_dr_u32(f bytea, off int) RETURNS bigint
+LANGUAGE sql IMMUTABLE AS $$
+	SELECT get_byte(f, off)::bigint | (get_byte(f, off + 1)::bigint << 8) |
+		   (get_byte(f, off + 2)::bigint << 16) | (get_byte(f, off + 3)::bigint << 24)
+$$;
+CREATE FUNCTION lion_dr_le32(v bigint) RETURNS bytea
+LANGUAGE sql IMMUTABLE AS $$
+	SELECT set_byte(set_byte(set_byte(set_byte('\x00000000'::bytea,
+		0, (v & 255)::int), 1, ((v >> 8) & 255)::int),
+		2, ((v >> 16) & 255)::int), 3, ((v >> 24) & 255)::int)
+$$;
+-- Block blk of an index's main fork, read from the file.
+CREATE FUNCTION lion_dr_block(idx regclass, blk bigint) RETURNS bytea
+LANGUAGE sql AS $$
+	SELECT pg_read_binary_file(pg_relation_filepath(idx),
+							   blk * current_setting('block_size')::int,
+							   current_setting('block_size')::int)
+$$;
+-- Line pointer off of a page: lp_off is its low 15 bits, lp_len its top 15.
+CREATE FUNCTION lion_dr_item(page bytea, off int) RETURNS int
+LANGUAGE sql IMMUTABLE AS $$
+	SELECT (lion_dr_u32(page, 24 + 4 * (off - 1)) & 32767)::int
+$$;
+CREATE FUNCTION lion_dr_lplen(page bytea, off int) RETURNS int
+LANGUAGE sql IMMUTABLE AS $$
+	SELECT (lion_dr_u32(page, 24 + 4 * (off - 1)) >> 17)::int
+$$;
+-- Write an index out, so that its file is what the buffer pool holds.
+CREATE FUNCTION lion_dr_flush(idx regclass) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+	CHECKPOINT;
+END $$;
+-- Overwrite bytes at byte pos of block blk of the file, with the page's new
+-- checksum (data checksums are on by default from PostgreSQL 18;
+-- pd_checksum is the uint16 at byte 8 of the page).
+CREATE FUNCTION lion_dr_poke(idx regclass, blk bigint, pos int, bytes bytea)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+	path text := pg_relation_filepath(idx);
+	bs int := current_setting('block_size')::int;
+	f bytea := pg_read_binary_file(path);
+	page bytea;
+	ck int;
+	lo oid;
+BEGIN
+	page := substring(f FROM (blk * bs)::int + 1 FOR bs);
+	page := overlay(page PLACING bytes FROM pos + 1);
+	ck := page_checksum(page, blk::int)::int & 65535;
+	page := overlay(page PLACING set_byte(set_byte('\x0000'::bytea, 0, ck & 255), 1, ck >> 8)
+					FROM 9);
+	f := overlay(f PLACING page FROM (blk * bs)::int + 1);
+	lo := lo_from_bytea(0, f);
+	PERFORM lo_export(lo, path);
+	PERFORM lo_unlink(lo);
+END $$;
+-- Give line pointer off of block blk the length len, keeping its offset.
+CREATE FUNCTION lion_dr_set_lplen(idx regclass, blk bigint, off int, len int)
+RETURNS void LANGUAGE sql AS $$
+	SELECT lion_dr_poke(idx, blk, 24 + 4 * (off - 1),
+						lion_dr_le32((lion_dr_u32(lion_dr_block(idx, blk),
+												  24 + 4 * (off - 1)) & 131071) |
+									 (len::bigint << 17)))
+$$;
+-- Have the server read the index from its file: move it to the other
+-- tablespace, which copies the file as it is.
+CREATE FUNCTION lion_dr_reread(idx regclass) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE format('ALTER INDEX %s SET TABLESPACE %I', idx,
+				   CASE WHEN (SELECT reltablespace FROM pg_class WHERE oid = idx) = 0
+						THEN 'lion_dr_ts' ELSE 'pg_default' END);
+END $$;
+-- Run a statement; report its SQLSTATE and its message with the numbers out.
+CREATE FUNCTION lion_dr_try(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'ok';
+EXCEPTION WHEN OTHERS THEN
+	RETURN SQLSTATE || ': ' || regexp_replace(SQLERRM, '[0-9]+', 'N', 'g');
+END $$;
+SET enable_seqscan = off;
+CREATE TABLE lion_dr (k int NOT NULL);
+-- ---------- 1. an entry flagged both INLINE and CHAIN ----------
+-- Key 5 is every other row of 40: an ARRAY of 20 members in an INLINE entry
+-- on the index's one leaf (block 1), which is its 12-byte header, the key
+-- and the payload.  A CHAIN entry of an int4 key is its 28-byte header and
+-- the key, 32 bytes: that is the length its line pointer is given, the key
+-- is written where a CHAIN entry has it, and CHAIN (2) is added to its flags
+-- (bytes 0 and 1).
+INSERT INTO lion_dr SELECT CASE WHEN i % 2 = 0 THEN 5 ELSE 6 END FROM generate_series(1, 40) i;
+CREATE INDEX lion_dr_i ON lion_dr USING lion (k);
+SELECT lion_dr_flush('lion_dr_i');
+ lion_dr_flush 
+---------------
+ 
+(1 row)
+
+SELECT o AS lion_dr_off
+  FROM lion_dr_block('lion_dr_i', 1) p, generate_series(1, 2) o
+ WHERE substring(p FROM lion_dr_item(p, o) + 13 FOR 4) = lion_dr_le32(5) \gset
+SELECT get_byte(p, lion_dr_item(p, :lion_dr_off)) AS flags,
+	   lion_dr_lplen(p, :lion_dr_off) >= 32 AS holds_32
+  FROM lion_dr_block('lion_dr_i', 1) p;
+ flags | holds_32 
+-------+----------
+     1 | t
+(1 row)
+
+SELECT lion_dr_poke('lion_dr_i', 1, lion_dr_item(lion_dr_block('lion_dr_i', 1), :lion_dr_off),
+					'\x0300'::bytea);
+ lion_dr_poke 
+--------------
+ 
+(1 row)
+
+SELECT lion_dr_poke('lion_dr_i', 1, lion_dr_item(lion_dr_block('lion_dr_i', 1), :lion_dr_off) + 28,
+					lion_dr_le32(5));
+ lion_dr_poke 
+--------------
+ 
+(1 row)
+
+SELECT lion_dr_set_lplen('lion_dr_i', 1, :lion_dr_off, 32);
+ lion_dr_set_lplen 
+-------------------
+ 
+(1 row)
+
+SELECT lion_dr_reread('lion_dr_i');
+ lion_dr_reread 
+----------------
+ 
+(1 row)
+
+SELECT lion_dr_try('INSERT INTO lion_dr VALUES (5)');
+                                                lion_dr_try                                                
+-----------------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_dr_i": entry N on block N has flags NxN, expected exactly one of INLINE and CHAIN
+(1 row)
+
+-- and the entry is as it was
+SELECT lion_dr_flush('lion_dr_i');
+ lion_dr_flush 
+---------------
+ 
+(1 row)
+
+SELECT get_byte(p, lion_dr_item(p, :lion_dr_off)) AS flags,
+	   lion_dr_lplen(p, :lion_dr_off) AS lp_len
+  FROM lion_dr_block('lion_dr_i', 1) p;
+ flags | lp_len 
+-------+--------
+     3 |     32
+(1 row)
+
+SELECT lion_dr_try($$SELECT lion_index_verify('lion_dr_i')$$);
+                                                lion_dr_try                                                
+-----------------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_dr_i": entry N on block N has flags NxN, expected exactly one of INLINE and CHAIN
+(1 row)
+
+DROP INDEX lion_dr_i;
+TRUNCATE lion_dr;
+-- ---------- 2. a leaf whose pd_lower is inside the page header ----------
+-- The index of an empty table is its meta page and one leaf, block 1, with
+-- no items.  The leaf's pd_lower (bytes 12 and 13) made 0 is a header the
+-- buffer manager reads in - it checks pd_lower against pd_upper, not against
+-- the header - and the leaf then reads as one with no items and all the room
+-- an insert could want.  The insert of a first key added its entry to it
+-- inside the record, where PageAddItemExtended() PANICked.
+CREATE INDEX lion_dr_i ON lion_dr USING lion (k);
+SELECT lion_dr_flush('lion_dr_i');
+ lion_dr_flush 
+---------------
+ 
+(1 row)
+
+SELECT get_byte(p, 12) | (get_byte(p, 13) << 8) AS pd_lower
+  FROM lion_dr_block('lion_dr_i', 1) p;
+ pd_lower 
+----------
+       24
+(1 row)
+
+SELECT lion_dr_poke('lion_dr_i', 1, 12, '\x0000'::bytea);
+ lion_dr_poke 
+--------------
+ 
+(1 row)
+
+SELECT lion_dr_reread('lion_dr_i');
+ lion_dr_reread 
+----------------
+ 
+(1 row)
+
+SELECT lion_dr_try('SELECT count(*) FROM lion_dr WHERE k = 5');
+ lion_dr_try 
+-------------
+ ok
+(1 row)
+
+SELECT lion_dr_try('INSERT INTO lion_dr VALUES (5)');
+                                          lion_dr_try                                           
+------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_dr_i": block N has a corrupt page header (lower N, upper N, special N)
+(1 row)
+
+SELECT lion_dr_try($$SELECT lion_index_verify('lion_dr_i')$$);
+                                         lion_dr_try                                          
+----------------------------------------------------------------------------------------------
+ XX002: lion index "lion_dr_i": block N has a page header with lower N, upper N and special N
+(1 row)
+
+DROP INDEX lion_dr_i;
+-- ---------- 3. a posting leaf whose pd_lower is inside the page header ----------
+-- Key 7 is every 16th row of 64 heap blocks: a CHAIN entry (inline_limit 64)
+-- whose posting set is one leaf, the root, holding one ARRAY container.
+-- With its pd_lower made 0 the leaf reads as one with no items, and the next
+-- row of the key starts a sparse segment there: the insert added it inside
+-- its record, where PageAddItemExtended() PANICked.
+INSERT INTO lion_dr
+	SELECT CASE WHEN i % 16 = 0 THEN 7 ELSE 1 END FROM generate_series(0, 14464 - 1) i;
+CREATE INDEX lion_dr_i ON lion_dr USING lion (k) WITH (inline_limit = 64);
+SELECT lion_dr_flush('lion_dr_i');
+ lion_dr_flush 
+---------------
+ 
+(1 row)
+
+SELECT lion_index_posting_root('lion_dr_i', 7) AS lion_dr_root \gset
+SELECT get_byte(p, 12) | (get_byte(p, 13) << 8) > 24 AS has_items
+  FROM lion_dr_block('lion_dr_i', :lion_dr_root) p;
+ has_items 
+-----------
+ t
+(1 row)
+
+SELECT lion_dr_poke('lion_dr_i', :lion_dr_root, 12, '\x0000'::bytea);
+ lion_dr_poke 
+--------------
+ 
+(1 row)
+
+SELECT lion_dr_reread('lion_dr_i');
+ lion_dr_reread 
+----------------
+ 
+(1 row)
+
+SELECT lion_dr_try('INSERT INTO lion_dr VALUES (7)');
+                                          lion_dr_try                                           
+------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_dr_i": block N has a corrupt page header (lower N, upper N, special N)
+(1 row)
+
+SELECT lion_dr_try($$SELECT lion_index_verify('lion_dr_i')$$);
+                                         lion_dr_try                                          
+----------------------------------------------------------------------------------------------
+ XX002: lion index "lion_dr_i": block N has a page header with lower N, upper N and special N
+(1 row)
+
+DROP INDEX lion_dr_i;
+TRUNCATE lion_dr;
+-- ---------- an undamaged index still works ----------
+INSERT INTO lion_dr SELECT i % 10 FROM generate_series(1, 100) i;
+CREATE INDEX lion_dr_i ON lion_dr USING lion (k);
+SELECT lion_dr_reread('lion_dr_i');
+ lion_dr_reread 
+----------------
+ 
+(1 row)
+
+INSERT INTO lion_dr VALUES (5);
+SELECT count(*) FROM lion_dr WHERE k = 5;
+ count 
+-------
+    11
+(1 row)
+
+SELECT lion_index_verify('lion_dr_i');
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+RESET enable_seqscan;
+RESET statement_timeout;
+DROP TABLE lion_dr;
+DROP FUNCTION lion_dr_try(text);
+DROP FUNCTION lion_dr_reread(regclass);
+DROP FUNCTION lion_dr_set_lplen(regclass, bigint, int, int);
+DROP FUNCTION lion_dr_poke(regclass, bigint, int, bytea);
+DROP FUNCTION lion_dr_flush(regclass);
+DROP FUNCTION lion_dr_lplen(bytea, int);
+DROP FUNCTION lion_dr_item(bytea, int);
+DROP FUNCTION lion_dr_block(regclass, bigint);
+DROP FUNCTION lion_dr_le32(bigint);
+DROP FUNCTION lion_dr_u32(bytea, int);
+DROP TABLESPACE lion_dr_ts;
