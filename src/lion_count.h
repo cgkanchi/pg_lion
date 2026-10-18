@@ -971,6 +971,17 @@ extern bool lion_range_collect(Relation index, AttrNumber attno,
 							   int64 *nsummaries);
 
 /*
+ * The same for the union of nranges ranges of one column, as one set within
+ * maxbytes all told, every window a walk of each (`col < ANY (array)` on a
+ * column that cannot order the elements, DESIGN.md §28).
+ */
+extern bool lion_ranges_collect(Relation index, AttrNumber attno,
+								struct LionRange **ranges, int nranges,
+								Size maxbytes, bool spill, LionPostingSet *out,
+								Size *held, bool *spilled, int64 *nsets,
+								int64 *nsummaries);
+
+/*
  * A summed range PROBED at the rows of the other sources F (DESIGN.md §32,
  * "Summed ranges: dense and probed"): F is collected once, every set a walk
  * of the range hands out is read only at F's container keys and marked

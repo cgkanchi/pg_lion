@@ -4003,7 +4003,10 @@ Neither half of that may be done by walking all k sub-cursors, because k is up t
   and lets the next value descend again, because a content lock holds interrupts off and the check
   the walk used to make under it did nothing. (A lookup that steps right with lock COUPLING - the
   insert path's run of one prefix - holds a lock at every moment and cannot check; its run is one
-  prefix's collisions.)
+  prefix's collisions.) So do the scan's own passes over such an array (2026-10-18 review): the
+  ordered walk's sort of a list's values (`lion_order_points()`, every 65536 comparisons, as the
+  lookup's sort), and the searches for the widest element of `k < ANY (array)` and for two distinct
+  elements of `k <> ANY (array)`, every thousand elements.
 
 **Cost.** A list is priced per element and not per clause (§10's `lion_cost_count_rel()`): one
 bucket page each - but read in ascending block order, so at `lion_heap_page_cost()`'s interpolated
@@ -4150,9 +4153,10 @@ The pins dropped are pins that carried no interlock; a pin too many never made a
 **What is still per value.** The located sets themselves: a `LionPostingSet`, its INLINE payload
 copy and a tree node, about 200 bytes a value, which is what the executor spends on the array
 anyway (a 30000-value list costs 7.8 MB of VmHWM with the pushdown off, 15.6 MB with it on at
-work_mem 4MB, 499 MB before) - except in a plain count, which locates a long list a batch at a
-time (below). And the query's own text: a multi-key AND of 1000 CHAIN keys (the extraction's cap)
-still holds 1000 page images, 8 MB, though past the pin budget only one child's pins.
+work_mem 4MB, 499 MB before) - except in a plain count and a bitmap scan, which locate a long list
+a batch at a time (below). And the query's own text: a multi-key AND of 1000 CHAIN keys (the
+extraction's cap) still holds 1000 page images, 8 MB, though past the pin budget only one child's
+pins.
 
 #### A list too long to locate at once (2026-09-28 review)
 
@@ -4188,6 +4192,29 @@ size" where the ordinary plan answers. Two things now:
   pieces. `test/sql/countany_long.sql` checks it against the query's own answer across the batch
   boundaries, with repeats, NULLs, other element types and citext's equal-but-not-identical keys,
   and at nine million elements.
+- **So does a bitmap scan of several quals** (`lion_emit_columns()`, and `lion_emit_intersect()`
+  beside a range; 2026-10-18 review), which had been left out the same way. The multicolumn scan of
+  `k = ANY ($1) AND x = 1` reserved room for every value's set in one plain allocation, 120 bytes a
+  set: "invalid memory alloc request size 1080000360" at nine million values, where the scan of the
+  list on its own (`lion_emit_array()`, a value at a time) and the ordinary plan answer. Below that it
+  held some 250 bytes a value outside work_mem - on the regression suite's PostgreSQL 16 server, at
+  work_mem 4MB, 84 MB of VmHWM for 300,000 values and 246 MB for a million, now 10 MB and 21.5 MB, in
+  0.71 s for the million where it took 1.0 to 1.1. The longest of the scan's lists longer than
+  `lion_array_batch_size()` is sorted, its byte-for-byte repeats dropped and cut where the hash
+  changes, as the count does it (`lion_scan_list_begin()`, `lion_scan_list_locate()`, which the plain
+  scan's LIST takes its batches from too, §29.4), and each batch is located, its union ANDed with the
+  other quals' trees and walked into the caller's bitmap - beside a range, as a stream of its own,
+  window by window through the range walks - and released before the next is located
+  (`lion_bitmap_list_batch()`). A bitmap is a set, so the batches' answers make the list's:
+  `(B_1 ∪ ... ∪ B_m) ∩ R = ∪_j (B_j ∩ R)`, disjoint or not (they are). Each batch reads the other
+  trees again, as each of the count's batches does; a list within the batch is located whole, as
+  before. A second long list is held whole, as the count's are, and so is a multi-key `op ANY
+  (array)` - in a huge allocation now (`lion_sets_reserve()`), as are the sets the planner's
+  intersection probe and the facets' filter locate for a scan key through the same code
+  (`lion_scankey_sets()`). `test/sql/scanlist.sql` checks the scans against the heap's answer across
+  the batch boundaries, with repeats, NULLs, values without an entry, two lists, a multi-key column, a
+  range and two beside the list, on a dirty heap and past nine million elements, and the VmHWM of the
+  300,000 values.
 - **Every other shape holds the list whole, in a huge allocation**, so that it answers at any length
   the array itself can have instead of failing at nine million values. A GROUP BY, a count(DISTINCT)
   and an FK-side join count the list many times over - batching it would locate it again for every
@@ -13185,7 +13212,12 @@ true, and neither is `ANY` of NULLs and falses); an empty or all-NULL array sele
 near-equal bounds over a million-row unique column emitted ten million TIDs, 1.4 s against 20 ms
 (2026-09-24 review). One walk now emits the 432,200 matching rows once, at the cost of the single
 widest bound, 108 ms on the assert build.)* `lioncostestimate()` charges such a column the entries
-of that one walk, as it does a plain range.
+of that one walk, as it does a plain range. The array's length is a parameter's, without a cap: the
+search for the widest element answers a cancel every thousand elements, and beside other columns
+(`lion_scan_col_ranges()`, below and §29.3) the scan makes the one range it walks. *(Until
+2026-10-18 it made room for a range per element and used the first, 48 bytes each: "invalid memory
+alloc request size 1104000048" at 23 million elements, where the ordinary plan answers. A column
+without the comparison still holds a range per element, in a huge allocation.)*
 
 On a MULTICOLUMN index (§24) a range column cannot be a node of the set tree - its answer is a union
 of an unbounded number of entries - so its WALK is intersected with the other columns' answer a
@@ -13209,7 +13241,16 @@ container at a time (`lion_emit_intersect()`), exactly:
 - With nothing beside the ranges that the sets can express, the first range column is COLLECTED
   into a set of its own (`lion_range_collect()`, summaries and all, into a temporary file past the
   window's memory, §32) and stands for the other columns; a range left on its own is walked straight
-  into the bitmap, rechecked for the qual that was dropped.
+  into the bitmap, rechecked for the qual that was dropped. A column that cannot order the elements
+  of `col < ANY (array)` has a range per element, and their union is collected as the one set
+  (`lion_ranges_collect()`): every window of the collection walks each range into the one union, so
+  the ranges share the window's memory and a spill's one file. *(Until 2026-10-18 each range was a
+  set of its own, collected in all of the window's memory and ORed in the tree: as many windows'
+  memory as the array had elements, and a temporary file for each that spilled.)*
+- A long IN list among the other columns' quals is located a batch at a time (§15, "A list too
+  long to locate at once"): each batch's union, ANDed with the other trees, is a stream of its own,
+  taken window by window through the range walks into the same bitmap. The walks are made again for
+  every batch.
 
 A selective answer of the other columns is one window, and each range one walk - with summaries a
 walk of the range's buckets. The result goes into the caller's bitmap, which a BitmapOr above may
@@ -14000,20 +14041,25 @@ of this section missed: a located set with the cursor that reads it takes ~20 kB
 1.37 GB to return ten rows (2026-09-24 review). The bitmap path never had it: `lion_emit_array()`
 looks its values up one at a time. So a list longer than a BATCH - `max(32, work_mem / 32 kB)`
 values, a batch's cursors near 60% of `work_mem` (below) - is the LIST shape: its values are sorted
-once into lookup order (`lion_probe_sort()`: the probe's comparison, then the hash), and located
-and streamed a batch at a time, the previous batch's sets and pins gone before the next is located
-(the §11 order). A batch is cut only where the HASH changes, and every value of one equality class
-compares equal and hashes alike, so the class's values sit next to each other and never straddle
-two batches: no entry is located twice, and since distinct entries of a scalar column are
-disjoint, no TID is returned twice - citext's `'Alice'` and `'alice'` included. What stays is the
+once into lookup order (`lion_probe_sort()`: the probe's comparison, then the hash), its
+byte-for-byte repeats dropped (`lion_probe_sort_unique()`), and located and streamed a batch at a
+time, the previous batch's sets and pins gone before the next is located (the §11 order). A batch is
+cut only where the HASH changes, and every value of one equality class compares equal and hashes
+alike, so the class's values sit next to each other and never straddle two batches: no entry is
+located twice, and since distinct entries of a scalar column are disjoint, no TID is returned
+twice - citext's `'Alice'` and `'alice'` included. *(The repeats were kept until 2026-10-18: one
+value repeated a million times is one class, and ran its batch on to a million sets' room, as the
+count's batches did before they dropped them. The cutting is now one piece of code,
+`lion_scan_list_locate()`, which the bitmap scan's batches use as well, §15.)* What stays is the
 list itself, sorted: 12 bytes per value next to the executor's own array. The heap is visited in
 physical order within a batch and restarts per batch, which is what a btree scan of the same list
 does per value. No new cost term: with batches the plain scan's work is linear in the list, like
 the bitmap's, and a list that is a Param - the reviewed case - has no length the planner could
 price anyway. Not covered: a multi-key column's `op ANY (array of queries)` still extracts every
-query up front (per query, not per row; arrays of queries are rare), and the BITMAP path's
-multicolumn intersection (`lion_emit_columns()`) still locates a list whole, as it always has - but
-since §15's "Bounded cursors" it walks it within work_mem, as a windowed union, and keeps no pin.
+query up front (per query, not per row; arrays of queries are rare). The BITMAP path's
+intersections (`lion_emit_columns()`, `lion_emit_intersect()`) located a list whole, as they always
+had, until 2026-10-18; they now take a list longer than the count's batch a batch at a time too
+(§15, "A list too long to locate at once").
 The same section sized a cursor's staging buffer by its entry's payload, so the ~20 kB per set above
 is what a CHAIN set's cursor (a page image) still comes near and an INLINE one no longer does.
 
