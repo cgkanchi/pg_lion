@@ -10357,7 +10357,10 @@ rescans of the Gather each run's.
 **Cost.** The child's total cost and the sort's are the node's startup: `LION_FKJOIN_SORT_COMPARE_COST`
 (a quarter of a `cpu_operator_cost`) a comparison, N log2 N of them, and `LION_FKJOIN_SORT_KEY_COST`
 (6) a key for putting it in, taking it out and comparing it with the previous distinct key, plus one
-merge pass past `work_mem`. Measured: 0.108 us a key to put in and sort 40,000 or 199,000 keys, and
+merge pass past `work_mem` - which the sort's own bytes decide: three words a key and, for a key
+passed by reference, the key at its column's width (`lion_fkjoin_sort_cost()`; until the
+2026-10-18 review the child's whole row width, and a copy of every key, which priced a sort that
+fits in memory as spilling - an overcharge only). Measured: 0.108 us a key to put in and sort 40,000 or 199,000 keys, and
 0.023 us to take them out and compare them - about 13 `cpu_operator_cost` a key at the 250 units a
 millisecond the node's other terms run at. `cost_sort()` charges 36 a key at 200,000, three times
 the time the sort takes (while `cost_agg()` charges core's hashed unique-ification one a row), and it
