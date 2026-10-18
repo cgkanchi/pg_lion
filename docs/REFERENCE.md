@@ -325,8 +325,10 @@ the scan reads and scores only those (`Custom Scan (LionOrdered)` with `Order By
 so a `LIMIT` is never left short. A set of up to `pg_lion.vector_exact_rows` rows (2,000), or of
 up to `pg_lion.vector_exact_per_partition` (1.5) rows for each of the index's partitions if that
 is more, is answered exactly, from every member's distance; a larger one by reading partitions as
-above, counting its patience in matching rows. A very selective filter, or one a sort answers more
-cheaply, is planned as a sort of the lion bitmap scan's rows, which is exact. Under a wide filter,
+above, counting its patience in matching rows. The exact answer is priced as the planner prices a
+sort of the lion bitmap scan's rows, which is exact too, and the cheaper is planned: with the
+vectors in TOAST, which the node reads by their places, the node; with them in the rows, where the
+two read the same pages, either (DESIGN.md §44.7, "Exact path pricing"). Under a wide filter,
 where building the set costs more than the rows it saves (about 170 ns a matching row, 845 ms for
 5 million), `LionOrdered` builds none: the scan reads partitions as an unfiltered one does and tests
 the `WHERE` on the table row of each row it fetches for its exact distance, dropping one that fails,
@@ -681,11 +683,11 @@ answered exactly too, however many rows that is - 12,000 at a million rows in th
 the build makes, 4,072 at 115,000 in 2,715. Where a filter's rows are this thin, each partition
 read finds about one of them, and reading them all from the table is faster, warm, than reading
 partitions for 0.98 of the ten nearest; from about three rows a partition reading partitions is
-faster (DESIGN.md §44.9). Cold, the exact path is a random table read a row, and the planner
-prices it so: where the exact path would take a filter, `LionOrdered` may lose to a sort of the
-filter's rows, or under `pg_lion.vector_postfilter = allow` to the plain index scan with a `Filter`
-(DESIGN.md §44.7). 0 leaves the choice to `pg_lion.vector_exact_rows`; the larger of the two
-counts.
+faster (DESIGN.md §44.9). Cold, the exact path is a random read a row, and the planner prices it
+as it prices a sort of the filter's rows, which reads the same rows: where the exact path would take
+a filter, `LionOrdered` may lose to that sort, or under `pg_lion.vector_postfilter = allow` to the
+plain index scan with a `Filter` (DESIGN.md §44.7, "Exact path pricing"). 0 leaves the choice to
+`pg_lion.vector_exact_rows`; the larger of the two counts.
 
 `pg_lion.vector_overflow` (`error`, or `stop`): what a `lionvec` scan does when what it knows of
 its rows outgrows `hash_mem` (`work_mem` times `hash_mem_multiplier`), which only a scan with no
