@@ -1746,11 +1746,14 @@ lion_insert_one(Relation index, Relation heaprel, LionState *state, Datum key,
 							 movedright, key, reservedflag, hash, ckey, lo, pm);
 	else
 	{
-		LionEntryTuple *entry;
-
-		entry = (LionEntryTuple *) PageGetItem(BufferGetPage(leafbuf),
-											  PageGetItemId(BufferGetPage(leafbuf),
-															entryoff));
+		/*
+		 * The flags only pick the path: each of the two takes the entry
+		 * through lion_page_entry_fetch() before it reads or writes a byte
+		 * of it, which refuses one that is not exactly one of INLINE and
+		 * CHAIN.
+		 */
+		LionEntryTuple *entry = lion_page_entry(BufferGetPage(leafbuf),
+												entryoff);
 
 		if ((entry->flags & LION_ENTRY_INLINE) != 0)
 			lion_insert_inline(index, heaprel, state, leafbuf, entryoff, ckey,

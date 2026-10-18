@@ -1937,9 +1937,13 @@ extern LionContainer *lion_page_item_fetch(Relation index, Page page,
  * space and no two overlapping (lion_page_check_items(), before items are
  * deleted, moved to another page or rewritten); the item at off alone in the
  * bytes the page allots it (lion_page_check_alone(), before it is overwritten
- * or deleted in place); and the directory entry at off a whole one, of the
- * size a CHAIN entry has to have (lion_page_entry_fetch()).
+ * or deleted in place); the directory entry at off a whole one, exactly one
+ * of INLINE and CHAIN, and of the size a CHAIN entry has to have
+ * (lion_page_entry_fetch()); and the page header within the bounds
+ * PageAddItemExtended() PANICs outside of (lion_page_check_header(), before
+ * an item is added to a page nothing else has checked).
  */
+extern void lion_page_check_header(Relation index, Page page, BlockNumber blkno);
 extern void lion_page_check_items(Relation index, Page page, BlockNumber blkno);
 extern void lion_page_check_alone(Relation index, Page page, BlockNumber blkno,
 								  OffsetNumber off);

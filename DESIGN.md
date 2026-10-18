@@ -226,6 +226,20 @@ in-place insert, a replacement and VACUUM's delete), and the directory entry a r
 whole one, of exactly its size when it is a CHAIN entry (`lion_page_entry_fetch()`). Each is an
 ERROR (INDEX_CORRUPTED), and verify() reports an overlap too. `test/sql/corrupt_items.sql`.
 
+The 2026-10-18 review's damaged pages added two checks to that list. The entry a record rewrites
+is exactly one of INLINE and CHAIN (`lion_page_entry_fetch()`, verify()'s rule): every writer
+picks its path by those flags while the header form follows CHAIN alone, so an entry flagged both,
+at a CHAIN entry's length, passed every check, went down the INLINE path of an insert of its key
+and was rewritten, damage and all, in a record. And a page a record only ADDS an item to has its
+header checked first (`lion_page_check_header()`, before the add of a directory entry, of a
+posting leaf's item and of a posting downlink): `PageAddItemExtended()` answers a header it finds
+damaged with a PANIC of its own, in either WAL mode, and the buffer manager's check of a page it
+reads (`PageIsVerifiedExtended()`) lets in a `pd_lower` below the end of the header - one of the
+things it PANICs on - with which the page reads as one with no items and room to spare.
+`test/sql/corrupt_records.sql`, which damages the file and has the server read it back by moving
+the index to another tablespace (`ALTER INDEX ... SET TABLESPACE` copies the FILE, after writing
+out only what is dirty), and so runs on PostgreSQL 16 as well.
+
 **Whole-bitset kernels** (2026-09-30). Every pass over all 512 words of a BITSET that counts what it
 sees is one call of a fused kernel (lion_container.c, "whole-bitset kernels"), which reads the
 operands, writes the result if the operation has one and counts, in the same pass:
@@ -8314,7 +8328,8 @@ page in shared buffers that no record describes. Everything fallible therefore
 has to happen BEFORE the record opens - which includes looking at the line
 pointers the record is going to move, overwrite or delete items by (§3,
 2026-09-29: `lion_page_check_items()`, `lion_page_check_alone()`,
-`lion_page_entry_fetch()`). Three consequences, all of them
+`lion_page_entry_fetch()`), and the header of a page it only adds an item to
+(§3, 2026-10-18: `lion_page_check_header()`). Three consequences, all of them
 deviations from what this section assumed:
 
 - `lion_new_buffer_xl()` is gone. Allocating a page is split into

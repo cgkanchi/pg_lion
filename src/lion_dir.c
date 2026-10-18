@@ -1430,6 +1430,19 @@ lion_dir_place(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 	}
 	else if (PageGetFreeSpace(page) >= MAXALIGN(size))
 	{
+		/*
+		 * PageAddItemExtended() answers a page header it finds damaged with
+		 * a PANIC of its own, in either WAL mode - and a leaf whose pd_lower
+		 * is below the end of the header gets past the buffer manager's
+		 * check of the page it reads, reads as a leaf with no items, and
+		 * has all the room an insert could ask for.  So the header is
+		 * checked here, before the record; nothing else has looked at it
+		 * (lion_page_check_header()).  With it in bounds, and the room and
+		 * the offset - the binary search's, at most one past the last item
+		 * - checked under the exclusive lock, the add cannot fail, and the
+		 * ERROR below is the "can't happen" of DESIGN.md §25.
+		 */
+		lion_page_check_header(index, page, BufferGetBlockNumber(buf));
 		xstate = lion_wal_begin(index);
 		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 		if (PageAddItemExtended(p, (char *) item, size, off, 0) ==
