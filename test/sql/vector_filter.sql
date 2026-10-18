@@ -360,13 +360,15 @@ SELECT vf_ord('SELECT q.id, (SELECT sum(id) FROM (SELECT id FROM vf
 									WHERE cat = q.cat AND tag <> q.tag
 									ORDER BY v <-> q.v LIMIT 5) s)::float8 AS d
 				 FROM vf q WHERE q.id BETWEEN 100 AND 140 ORDER BY q.id');
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+-- (the sort off, not the scans: a scan switched off is the outer side's
+-- only plan, and 18 says so under it)
+SET enable_sort = off;
 EXPLAIN (COSTS OFF)
 SELECT q.id, s.id FROM vf q,
 	   LATERAL (SELECT id FROM vf WHERE cat = q.cat AND tag < 50
 				ORDER BY v <-> q.v LIMIT 3) s
  WHERE q.id IN (101, 102, 103);
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_sort;
 SELECT vf_ord('SELECT q.id * 100000 + s.id AS id, s.d FROM vf q,
 					  LATERAL (SELECT id, v <-> q.v AS d FROM vf
 								WHERE cat = q.cat AND tag < 50
