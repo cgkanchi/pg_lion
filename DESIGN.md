@@ -3961,7 +3961,10 @@ Neither half of that may be done by walking all k sub-cursors, because k is up t
   and lets the next value descend again, because a content lock holds interrupts off and the check
   the walk used to make under it did nothing. (A lookup that steps right with lock COUPLING - the
   insert path's run of one prefix - holds a lock at every moment and cannot check; its run is one
-  prefix's collisions.)
+  prefix's collisions.) So do the scan's own passes over such an array (2026-10-18 review): the
+  ordered walk's sort of a list's values (`lion_order_points()`, every 65536 comparisons, as the
+  lookup's sort), and the searches for the widest element of `k < ANY (array)` and for two distinct
+  elements of `k <> ANY (array)`, every thousand elements.
 
 **Cost.** A list is priced per element and not per clause (§10's `lion_cost_count_rel()`): one
 bucket page each - but read in ascending block order, so at `lion_heap_page_cost()`'s interpolated
@@ -13137,9 +13140,9 @@ true, and neither is `ANY` of NULLs and falses); an empty or all-NULL array sele
 near-equal bounds over a million-row unique column emitted ten million TIDs, 1.4 s against 20 ms
 (2026-09-24 review). One walk now emits the 432,200 matching rows once, at the cost of the single
 widest bound, 108 ms on the assert build.)* `lioncostestimate()` charges such a column the entries
-of that one walk, as it does a plain range. The array's length is a parameter's, without a cap, and
-beside other columns (`lion_scan_col_ranges()`, below and §29.3) the scan makes the one range it
-walks. *(Until
+of that one walk, as it does a plain range. The array's length is a parameter's, without a cap: the
+search for the widest element answers a cancel every thousand elements, and beside other columns
+(`lion_scan_col_ranges()`, below and §29.3) the scan makes the one range it walks. *(Until
 2026-10-18 it made room for a range per element and used the first, 48 bytes each: "invalid memory
 alloc request size 1104000048" at 23 million elements, where the ordinary plan answers. A column
 without the comparison still holds a range per element, in a huge allocation.)*
