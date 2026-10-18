@@ -16712,14 +16712,17 @@ more. A bucket's codes are collected in an array, which switches to an INT8 tupl
 of `maintenance_work_mem` past an eighth (one key of a column with few keys can be most of the
 table), freeing the array; the spool leaves the summaries that quarter of its budget (§24
 "Build"). A closed bucket is sorted, run through a collecting builder into the same items a
-posting set is made of, and put aside in a temporary BufFile after a header naming its key. A
-full bucket is closed when the NEXT key arrives (`lion_sum_key_begin()`), not when it fills, so that
-when the column's values are done (`lion_sum_finish()`) there is always a last bucket, and it is
-closed as the SUMLAST whatever its size - a column with rows always has its open bucket (one that
-filled exactly at the last key used to be closed as a regular summary, and the column had none);
-`auto` decides, and the file is replayed through ordinary builders into entries written after the
-column's values - which is where they sort. The build's DEBUG1 line reports the buckets per column
-and whether they were kept.
+posting set is made of, and put aside in a temporary BufFile after a header naming its key; the
+array's sort (a `sort_template.h` sort that checks for interrupts as it partitions, not `qsort()`)
+and both loops over the codes answer a cancel, the loops every 64K codes as the pass's own loop
+does (`lion_sum_close_bucket()`, since the 2026-10-18 review: a bucket of millions of codes had
+no check at all). A full bucket is closed when the NEXT key arrives (`lion_sum_key_begin()`), not
+when it fills, so that when the column's values are done (`lion_sum_finish()`) there is always a
+last bucket, and it is closed as the SUMLAST whatever its size - a column with rows always has
+its open bucket (one that filled exactly at the last key used to be closed as a regular summary,
+and the column had none); `auto` decides, and the file is replayed through ordinary builders into
+entries written after the column's values - which is where they sort. The build's DEBUG1 line
+reports the buckets per column and whether they were kept.
 
 ### Insert (lion_insert.c)
 
