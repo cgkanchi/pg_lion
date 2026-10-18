@@ -659,15 +659,22 @@ lion_index_posting_root(PG_FUNCTION_ARGS)
 						1, RelationGetRelationName(index))));
 
 	/*
-	 * The key is looked up as one of the column's own values.  For a class
-	 * declared on a polymorphic type (enum_ops is FOR TYPE anyenum) that is a
-	 * value of the column's actual type, which the class's input type does
-	 * not name: a domain over the enum is its enum, a different enum is not
-	 * (lion_type_is_column() in lion_set.c makes the same test).
+	 * The key is looked up as one of the column's own values, hashed and
+	 * compared by the column's own functions, so it has to have the column's
+	 * representation: a value of the class's input type, or of the column's
+	 * actual type (a varchar column of text_ops; for a class declared on a
+	 * polymorphic type, enum_ops being FOR TYPE anyenum, the one type the
+	 * class's input type does not name), or of a domain over either - all
+	 * of them BASE types compared, as the count functions take a key
+	 * (lion_type_is_column() in lion_set.c, lion_count_key_type() in
+	 * lion_count_sql.c).  A different enum is still refused.  So is a key of
+	 * another type the family compares, int8 on an int4 column, which the
+	 * count functions resolve through a cross-type probe this lookup of one
+	 * stored key has no use for.
 	 */
-	if (OidIsValid(keytype) && keytype != index->rd_opcintype[0] &&
-		!(IsPolymorphicType(index->rd_opcintype[0]) &&
-		  getBaseType(keytype) == getBaseType(state->typid)))
+	if (OidIsValid(keytype) &&
+		getBaseType(keytype) != index->rd_opcintype[0] &&
+		getBaseType(keytype) != getBaseType(state->typid))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 				 errmsg("type %s cannot be compared with index \"%s\"",

@@ -1907,7 +1907,10 @@ Planner integration
     nothing to this column, is not. GROUP BY an enum, the value-representation rule, the FK-side
     join (§27) on an enum key and EXPLAIN needed nothing more. `lion_index_posting_root()` made the
     same mistake (`keytype != opcintype`) and refused every enum key; it takes the column's enum,
-    or a domain over it, now.
+    or a domain over it, now - and, since the 2026-10-18 review, a domain over any key column's
+    type and a value of the column's own type (a varchar on a varchar column of `text_ops`), the
+    keys the count functions take that have the column's representation; a cross-type key (int8
+    on int4), which the counts resolve through a probe, it still refuses.
   - Collations follow the planner's IndexCollMatchesExprColl() rule: a collation-sensitive clause
     (OpExpr/ScalarArrayOpExpr inputcollid valid) or grouping column may only use an index whose
     indexcollations[i] - of the KEY COLUMN that indexes the clause's column (§24) - equals that
