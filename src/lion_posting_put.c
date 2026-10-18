@@ -277,8 +277,21 @@ lion_tree_put_items_locked(Relation index, Relation heaprel, Buffer buf,
 
 	if (have >= want)
 	{
-		LionWalState *xstate = lion_wal_begin(index);
-		Page		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
+		LionWalState *xstate;
+		Page		p;
+
+		/*
+		 * The items go in inside the record, and PageAddItemExtended()
+		 * PANICs on a page header it finds damaged, which the buffer
+		 * manager lets in when pd_lower is below the end of the header
+		 * (lion_page_check_header()).  The page of an item that is replaced
+		 * has had its header checked with the item; one that only gains
+		 * items has it checked here.
+		 */
+		if (!replace)
+			lion_page_check_header(index, page, BufferGetBlockNumber(buf));
+		xstate = lion_wal_begin(index);
+		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 
 		if (replace)
 		{
