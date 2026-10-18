@@ -1294,6 +1294,48 @@ lo_lion_adds(Path *lion, List *ordclauses)
 	return false;
 }
 
+/* The entries the leaves of a lion access read (lion_cost_path_entries()). */
+static double
+lo_lion_entries(PlannerInfo *root, Path *lion)
+{
+	double		entries = 0.0;
+	ListCell   *lc;
+
+	if (IsA(lion, IndexPath))
+		return lion_cost_path_entries(root, (IndexPath *) lion);
+	foreach(lc, IsA(lion, BitmapAndPath) ?
+			((BitmapAndPath *) lion)->bitmapquals :
+			castNode(BitmapOrPath, lion)->bitmapquals)
+		entries += lo_lion_entries(root, (Path *) lfirst(lc));
+	return entries;
+}
+
+/*
+ * What copying the lion side's answer into the set costs, beyond its
+ * lookups and a cpu_operator_cost a container key (DESIGN.md §30.3, §44.7):
+ * each leaf's source hands the set a container for each entry it reads at
+ * each container key that entry's rows reach, and each is copied
+ * (lo_set_push()) and then sorted by key and ORed into the set
+ * (lo_set_finish()).  A range over a unique column brings about a piece a
+ * member: its summaries' buckets each hold rows from nearly every key of the
+ * heap.  So the pieces are min(members, entries x keys) - a 10% equality on
+ * a column the heap is ordered by brings a piece a key, the same filter as a
+ * range over a unique column one a member - each at LO_PROBE_TUPLES
+ * cpu_tuple_costs, the walk's 170 ns an entry: at 50M rows a 10% range on a
+ * unique double with summaries built 5M pieces in 845 ms, 170 ns each; at
+ * 5M rows the same filter's 500,000 members, 1.36 a piece, took 44 to 48
+ * ms, 90 ns a member.  Before 2026-10-18 nothing was charged for them, and
+ * that 10% filter's set at 50M rows was priced as its 1,220 summary entries
+ * and 260,417 keys alone: 650 for 845 ms.
+ */
+static Cost
+lo_set_pieces(PlannerInfo *root, Path *lion, double members, double ncont)
+{
+	double		pieces = Min(members, lo_lion_entries(root, lion) * ncont);
+
+	return pieces * LO_PROBE_TUPLES * cpu_tuple_cost;
+}
+
 /*
  * The price of one (ordered path, lion access) pair (DESIGN.md §30.3), and the
  * size its set is expected to have.  rows is what the node returns, as lion's
@@ -1333,7 +1375,8 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES);
 
 	/* the lookups, and the copy of their answer into the set */
-	startup = lioncost + ncont * cpu_operator_cost;
+	startup = lioncost + ncont * cpu_operator_cost +
+		lo_set_pieces(root, lion, members, ncont);
 
 	/* the walk: the ordered index's own cost, and the probe of each entry */
 	walked = clamp_row_est(ord->indexselectivity * tuples);
@@ -1482,6 +1525,7 @@ lo_cost_knn(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES);
 
 	startup = lioncost + ncont * cpu_operator_cost +
+		lo_set_pieces(root, lion, members, ncont) +
 		lion_vec_scan_cost(ord->indexinfo, members);
 
 	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
