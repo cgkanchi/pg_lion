@@ -2001,6 +2001,13 @@ lionvec_build_centroids(LionVecBuildState *bs, const LionVecSample *sample)
 		lionvec_build_region_maker_free(&mk);
 	}
 
+	/*
+	 * Each centroid coded and its REFINE item put, checking for interrupts
+	 * once a centroid as every loop of k-means does (DESIGN.md §44.3): at
+	 * LIONVEC_MAX_PARTS partitions of many dimensions this is seconds.  The
+	 * REFINE page is locked only while an item goes in, so nothing is locked
+	 * at the check.
+	 */
 	bs->crblk = palloc(sizeof(BlockNumber) * k);
 	bs->croff = palloc(sizeof(OffsetNumber) * k);
 	ref = palloc0(rsize);
@@ -2009,6 +2016,7 @@ lionvec_build_centroids(LionVecBuildState *bs, const LionVecSample *sample)
 		LionVecEncoded e;
 		float	   *c = bs->a.cent + (Size) j * dimsp;
 
+		CHECK_FOR_INTERRUPTS();
 		memcpy(w.x, c, sizeof(float) * dimsp);
 		e.bits = bs->a.cbits + (Size) j * nw;
 		e.codes = bs->a.ccodes + (Size) j * dimsp;

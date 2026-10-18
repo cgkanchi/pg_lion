@@ -507,6 +507,14 @@ lion_posting_search_ext(Relation index, Relation heaprel, uint32 hash,
  * tree never has an unfinished split - its splits post no downlink - so a
  * flagged leaf, like a right link to anything but a leaf of the set, is
  * damage.
+ *
+ * The walk does not check for interrupts, and neither do the other walks of
+ * a flat tree (lion_posting_flat_count(), lion_posting_promote()): a writer
+ * holds a leaf of the chain at every step, and the key's directory leaf
+ * besides (rule 2), and a held content lock holds interrupts off, so a
+ * check would do nothing.  What ends one round a cycle of damaged links is
+ * its bound (lion.h); the count and the promotion are also bounded by the
+ * chain's limit and by what one page can link.
  */
 static Buffer
 lion_posting_flat_route(Relation index, BlockNumber head, Buffer buf,
